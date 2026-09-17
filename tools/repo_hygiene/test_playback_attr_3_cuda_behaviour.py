@@ -974,6 +974,9 @@ JOB_TEMPLATES = (
     ROOT / "tools" / "profiling" / "ultramagnus" / "playback-attr-3-cuda-dll-job.ps1",
     ROOT / "tools" / "profiling" / "bachelor" / "playback-attr-3-cuda-stage-job.ps1",
     ROOT / "tools" / "profiling" / "bachelor" / "playback-attr-3-cuda-job.ps1",
+    # Every emitted job that runs unattended on a measurement host is scanned, including the
+    # fixture stager: a template added without this line would run unscanned.
+    ROOT / "tools" / "profiling" / "bachelor" / "attr3-stage-fixture-job.ps1",
 )
 
 
