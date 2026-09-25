@@ -1417,7 +1417,7 @@ void GpuDisplayWindow::paintGL()
             else
             {
                 // GL reads bottom-up; QImage rows are top-down.
-                m_captureReadbackImage = grabbed.mirrored(false, true);
+                m_captureReadbackImage = grabbed.flipped(Qt::Vertical);
                 m_captureReadbackSucceeded = true;
                 m_captureReadbackError.clear();
             }

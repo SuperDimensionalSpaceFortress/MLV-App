@@ -125,23 +125,57 @@ full one, and both `gpuTexNrDisplayLutOnlyShStateBypass`'s inputs are still ANDe
    produces a wrong-color image (the incident that policy exists to prevent), while a
    contrast/S-H/vibrance miss produces a still-correct, merely flatter image.
 
-## Cost measured / not measured this round
+## Cost measured / not measured (round 2 update)
 
-- **Measured (local, this box)**: the fast CPU-side approximate blur refresh
-  (`RenderFrameThread.cpp:4121-4191`, `gpuTexNrFastShDebayerMs` + `gpuTexNrFastShRefreshMs`
-  telemetry, already existed pre-round) was **already being paid** even before this fix in some
-  configurations (whenever `gpuTexNrFastShFrameStateEligible` was true and the display-only
-  bypass was NOT the active gate) — this round does not change that cost, only whether its
-  *result* reaches the screen.
-- **Not measured this round**: (a) the new per-frame `shadowsHighlightsBlur` texture upload cost
-  (`gpuPreviewProcessingUpdateShadowsHighlightsBlurTexture`, a full `width*height*4*uint16`
-  `glTexImage`-equivalent upload every present call) — this box has no GL backend at all
-  (`QOpenGLContext creation failed` even with `MLVAPP_GPU_PREVIEW_ALLOW_SOFTWARE=1`; see
-  `tests/pipeline/test_gpu_preview_processing.cpp`'s `DisplayShader*MatchesCpuReference` tests,
-  which SKIP for that reason, consistent with every other pre-existing GPU-offscreen test in the
-  suite); (b) the two new signature-cached curve-texture rebuilds (cheap relative to the 5
-  existing ones — same 256x256 R32F class — but not measured on hardware this round). The
-  benchmark handoff (`bench-plan.md`) asks the bachelor run to capture both.
+**Correction to round 1's framing**: `gpuTexNrDisplayLutOnlyShStateBypass`'s own enabling flag,
+`gpuPlaybackReconDisplayLutOnlySkipShadowsHighlightsFrameStateEnabled()` (`RenderFrameThread.cpp:578`),
+defaults **on** (enabled unless `MLVAPP_GPU_TEX_NR_DISPLAY_LUT_ONLY_SKIP_SH_STATE=0` is set). Combined
+with round 1's hardcoded-false gate, `gpuTexNrFastShFrameStateEligible` was **false by default before
+this round's fix** — the CPU-side blur refresh below was NOT being paid on this specific CUDA
+texture-present fast path pre-round in the default configuration (only when that env var was
+explicitly overridden). Round 1's "already being paid… in some configurations" undersold how new
+this cost is for the common case; corrected here.
+
+Round 2 now has a working local GL backend (round 1 reported none — `platform/qt/GpuDisplayWindow.cpp`
+had been built against a stray Qt 5.15.2 kit rather than the project's pinned Qt 6.10.2 + MinGW 13.1,
+which is why offscreen GL context creation failed; see `docs/10-build-windows.md`), so both halves of
+round 1's "not measured" gap now have local numbers, added by
+`GpuPreviewProcessing.DisplayShaderFastPathFrameCostBudget`
+(`tests/pipeline/test_gpu_preview_processing.cpp`):
+
+- **CPU fast S/H refresh (trustworthy, host-independent)** — `debayerBasicU16` +
+  `processingRefreshShadowsHighlightsBlurFromRgb16` at this fixture's real 1808x2268 size, run through
+  the *exact* preview-mode state `RenderFrameThread.cpp:4152-4178` sets around this call
+  (`processingSetPlaybackPreviewMode(1)`, aggressive-preview off by default, scale factor 1). That
+  state matters: at scale 1 with preview mode on and aggressive preview mode off,
+  `processing_standard_x1_shadows_highlights_quarterres_enabled()` (`raw_processing.c:264-286`)
+  engages the existing quarter-resolution RBF blur path instead of full-resolution — measuring without
+  it first (a mistake caught and corrected this round) gave misleadingly high numbers (p90 up to
+  ~87 ms combined) that did not reflect what production actually runs.
+  - 16 threads (`hardware_concurrency()`, this host): combined debayer+refresh **p50 22.4 ms / p90
+    25.0 ms** — 56% / 63% of a 40 ms budget.
+  - 1 thread (this test binary's own forced-single-threaded determinism mode — a worst-case bound,
+    not what real playback uses): combined **p50 29.1 ms / p90 41.9 ms** — 73% / 105% of budget.
+  - Verdict: material (56-105% of the whole frame budget for one CPU stage, before any GPU work) but
+    **not an obvious throughput halving** at realistic thread counts, because the existing
+    quarter-resolution downsample path already keeps it there once invoked correctly. No code change
+    made this round: the mitigation this item asked for ("keep the fast path fast") is already in
+    place and already engaged by the call site; what was missing was measurement proving that, not a
+    missing optimization. DISCLOSED-OPEN for a follow-up round: the single-threaded worst case exceeds
+    budget at p90 — worth an explicit low-thread-count fallback (e.g. auto-engaging aggressive preview
+    mode under contention) if the bachelor run or a low-core-count host shows it materializing.
+- **Blur-texture-upload / display-shader-draw (NOT trustworthy as absolute numbers)** — measured via
+  the public `gpuPreviewProcessingApplyDisplayGpuOffscreen()` entry point in a loop: **p50 363 ms / p90
+  415 ms per call**, renderer `llvmpipe (LLVM 5.0.1, 256 bits)` (software). Two reasons these are not
+  usable as real per-frame GPU cost: (a) this box has no hardware GL, only Mesa's software rasterizer,
+  which is not representative of the owner's real GPU by orders of magnitude; (b) unlike the live
+  `GpuDisplayWindow`/`GpuDisplayViewport` presenters, this public entry point creates a fresh GL
+  context, shader program and full 7-texture LUT set on *every* call instead of reusing the
+  signature-cached ones the live path keeps across frames, so even on real hardware this number would
+  overstate steady-state per-frame cost. No lower-overhead public surface exists to benchmark against
+  without exposing more of `GpuPreviewProcessing.cpp`'s internals, which this round did not do.
+  Real per-frame GPU numbers need the bachelor bench (`bench-plan.md`) on actual hardware, which is
+  exactly what item 5 exists for — this box cannot produce a trustworthy substitute for that.
 
 ## DISCLOSED-OPEN (round-1 v2.1 contract: no silent drop)
 
