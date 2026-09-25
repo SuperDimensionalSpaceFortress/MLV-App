@@ -367,6 +367,8 @@ double llrpGetLastFocusPixelsMilliseconds(void);
 double llrpGetLastBadPixelsMilliseconds(void);
 double llrpGetLastPatternNoiseMilliseconds(void);
 double llrpGetLastPreDualIsoFixMilliseconds(void);
+int llrpGetLastPreDualIsoFixCompleted(void);
+void llrpResetLastPreDualIsoFixTelemetry(void);
 double llrpGetLastDualIsoMilliseconds(void);
 double llrpGetLastChromaSmoothMilliseconds(void);
 void llrpGetLastDualIsoFull20bitTiming(dualiso_full20bit_timing_t * timing);

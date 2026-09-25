@@ -69,6 +69,13 @@ static MLV_THREAD_LOCAL double g_llrawproc_last_focus_pixels_ms = 0.0;
 static MLV_THREAD_LOCAL double g_llrawproc_last_bad_pixels_ms = 0.0;
 static MLV_THREAD_LOCAL double g_llrawproc_last_pattern_noise_ms = 0.0;
 static MLV_THREAD_LOCAL double g_llrawproc_last_pre_dualiso_fix_ms = 0.0;
+/* PROD-TELEMETRY-DURATION-AS-PROOF-3: thread-local companion to the ms value
+ * above, read by production telemetry so a fast pass that completes within
+ * one fallback-clock tick isn't misreported as "did not run". Thread-local
+ * (like the ms field it mirrors) so it never races the processed8-prefetch
+ * worker thread, which renders through this same code on the same shared
+ * mlvObject concurrently with the foreground thread. */
+static MLV_THREAD_LOCAL int g_llrawproc_last_pre_dualiso_fix_completed = 0;
 static MLV_THREAD_LOCAL double g_llrawproc_last_dual_iso_ms = 0.0;
 static MLV_THREAD_LOCAL double g_llrawproc_last_chroma_smooth_ms = 0.0;
 static MLV_THREAD_LOCAL dualiso_full20bit_timing_t g_llrawproc_last_dual_iso_full20bit_timing = {0};
@@ -3179,6 +3186,7 @@ void applyLLRawProcObjectWorker(mlvObject_t * video,
     g_llrawproc_last_bad_pixels_ms = 0.0;
     g_llrawproc_last_pattern_noise_ms = 0.0;
     g_llrawproc_last_pre_dualiso_fix_ms = 0.0;
+    g_llrawproc_last_pre_dualiso_fix_completed = 0;
     g_llrawproc_last_dual_iso_ms = 0.0;
     g_llrawproc_last_chroma_smooth_ms = 0.0;
     llrawproc_reset_dual_iso_full20bit_timing();
@@ -3585,6 +3593,7 @@ void applyLLRawProcObjectWorker(mlvObject_t * video,
     {
         g_llrawproc_last_pre_dualiso_fix_ms = (mlv_stage_timing_now() - apply_start) * 1000.0;
         g_llrawproc_last_total_ms = g_llrawproc_last_pre_dualiso_fix_ms;
+        g_llrawproc_last_pre_dualiso_fix_completed = 1;
         if (shared)
         {
             shared->playback_pre_dualiso_fix_ms = g_llrawproc_last_pre_dualiso_fix_ms;
@@ -5003,6 +5012,25 @@ double llrpGetLastPatternNoiseMilliseconds(void)
 double llrpGetLastPreDualIsoFixMilliseconds(void)
 {
     return g_llrawproc_last_pre_dualiso_fix_ms;
+}
+
+int llrpGetLastPreDualIsoFixCompleted(void)
+{
+    return g_llrawproc_last_pre_dualiso_fix_completed;
+}
+
+/* PROD-TELEMETRY-DURATION-AS-PROOF-3: mlv_render_scaled_rgb16_v2 and
+ * mlv_render_scaled_rgb16_from_raw (video_mlv.c) can render a frame via the
+ * phase4b scaled-buffer path (applyLLRawProcObject_with_dims), which never
+ * touches these thread-local statics -- so without an explicit reset at
+ * each of those functions' per-frame entry points, a frame that does NOT
+ * run the isolated pre-dualiso fix this call would still read the
+ * completed flag (and ms value) left behind by an earlier frame on the
+ * same render thread. */
+void llrpResetLastPreDualIsoFixTelemetry(void)
+{
+    g_llrawproc_last_pre_dualiso_fix_ms = 0.0;
+    g_llrawproc_last_pre_dualiso_fix_completed = 0;
 }
 
 double llrpGetLastDualIsoMilliseconds(void)

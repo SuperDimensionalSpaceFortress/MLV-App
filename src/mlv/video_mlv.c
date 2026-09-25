@@ -5192,6 +5192,14 @@ static int mlv_render_scaled_rgb16_v2(mlvObject_t * video,
     g_mlv_phase4bv2_last_fallback_reason = "none";
 
     if (!video || !outputFrame || scaleFactor <= 1) return 0;
+    /* PROD-TELEMETRY-DURATION-AS-PROOF-3: thread-local only (see
+     * llrpResetLastPreDualIsoFixTelemetry) -- NOT video->llrawproc's shared
+     * playback_pre_dualiso_fix_ms/completed fields, which the concurrent
+     * processed8-prefetch worker thread also renders through this same
+     * per-frame entry point and writes on its own schedule; resetting the
+     * shared fields here raced that worker's own set-to-1 and intermittently
+     * clobbered it back to stale-looking zero. */
+    llrpResetLastPreDualIsoFixTelemetry();
     if (mlv_phase4bv2_disabled_via_env())
     {
         mlv_phase4bv2_log_rejection("MLVAPP_DISABLE_PHASE4BV2 set");
@@ -5711,6 +5719,7 @@ static int mlv_render_scaled_rgb16_from_raw(mlvObject_t * video,
         video->llrawproc->playback_pre_dualiso_fix_ms = 0.0;
         video->llrawproc->playback_pre_dualiso_fix_completed = 0;
     }
+    llrpResetLastPreDualIsoFixTelemetry();
 
     g_mlv_phase4bv2_path_taken = 0;
     g_mlv_phase4bv3_y_crop_rows = 0;
@@ -5844,6 +5853,7 @@ static int mlv_render_scaled_rgb16_from_raw(mlvObject_t * video,
                 video->llrawproc->playback_pre_dualiso_fix_ms = 0.0;
                 video->llrawproc->playback_pre_dualiso_fix_completed = 0;
             }
+            llrpResetLastPreDualIsoFixTelemetry();
 
             if (x4FullResFixesActive && !receiptCompatible)
             {
