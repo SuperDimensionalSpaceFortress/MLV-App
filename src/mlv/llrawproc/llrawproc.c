@@ -3092,6 +3092,7 @@ llrawprocObject_t * initLLRawProcObject()
     llrawproc->diso_frblending = 1;
     llrawproc->diso_playback_force_disable_alias_map = 0;
     llrawproc->playback_pre_dualiso_fix_ms = 0.0;
+    llrawproc->playback_pre_dualiso_fix_completed = 0;
     llrawproc->dark_frame = 0;
 
     llrawproc->dark_frame_filename = NULL;
@@ -3587,6 +3588,7 @@ void applyLLRawProcObjectWorker(mlvObject_t * video,
         if (shared)
         {
             shared->playback_pre_dualiso_fix_ms = g_llrawproc_last_pre_dualiso_fix_ms;
+            shared->playback_pre_dualiso_fix_completed = 1;
         }
         if (using_stack_worker) llrawproc_free_worker_state(worker);
         return;

@@ -5709,6 +5709,7 @@ static int mlv_render_scaled_rgb16_from_raw(mlvObject_t * video,
     if (video->llrawproc)
     {
         video->llrawproc->playback_pre_dualiso_fix_ms = 0.0;
+        video->llrawproc->playback_pre_dualiso_fix_completed = 0;
     }
 
     g_mlv_phase4bv2_path_taken = 0;
@@ -5841,6 +5842,7 @@ static int mlv_render_scaled_rgb16_from_raw(mlvObject_t * video,
             if (video->llrawproc)
             {
                 video->llrawproc->playback_pre_dualiso_fix_ms = 0.0;
+                video->llrawproc->playback_pre_dualiso_fix_completed = 0;
             }
 
             if (x4FullResFixesActive && !receiptCompatible)

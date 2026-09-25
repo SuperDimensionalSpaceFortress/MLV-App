@@ -10111,7 +10111,10 @@ TEST(DualIsoPipeline, Phase4B_DualIsoScaleFourFullResFixesDefaultsOnWhenUnset)
     ASSERT_EQ(3, mlv_phase4bv2_last_path_taken());
     ASSERT_EQ(std::string("none"),
               std::string(mlv_phase4bv2_last_fallback_reason()));
-    ASSERT_TRUE(fixture.video()->llrawproc->playback_pre_dualiso_fix_ms > 0.0);
+    // Proof the pre-dual-ISO fix pass ran is the completed flag, not elapsed ms > 0: on the 1 ms omp_get_wtime
+    // fallback a real, fast pass reads 0.0 (PROD-TELEMETRY-DURATION-AS-PROOF-2).
+    ASSERT_EQ(1, fixture.video()->llrawproc->playback_pre_dualiso_fix_completed);
+    ASSERT_TRUE(fixture.video()->llrawproc->playback_pre_dualiso_fix_ms >= 0.0);
     ASSERT_TRUE(std::any_of(got.begin(), got.end(), [](uint8_t v) { return v != 0; }));
 }
 
