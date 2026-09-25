@@ -229,7 +229,26 @@ param(
     # hunk small while UM-CUDA-BENCH-VENUE-1 also edits this file.
     [switch]$ContactSheet,
     [ValidateRange(1, 60)]
-    [int]$ContactSheetFrames = 6
+    [int]$ContactSheetFrames = 6,
+
+    # CUDA-PLAYBACK-PRESENT-CADENCE-1 round 2 discriminating legs. HEAVY (default, unchanged
+    # behavior for every existing caller) keeps every diagnostic env var PLAYBACK-ATTR-3-CUDA
+    # has always set. LIGHT drops the four per-frame GUI-thread diagnostic sources that are not
+    # needed for THIS job's own pass/fail gating or for the gpu_window swap counters/summary --
+    # MLVAPP_PLAYBACK_SMOKE_TIMELINE_TELEMETRY, MLVAPP_PLAYBACK_DETAILED_TIMELINE_TELEMETRY,
+    # MLVAPP_STAGE_TIMING, MLVAPP_PERF_FIELD_LOG -- and additionally sets
+    # MLVAPP_PLAYBACK_SMOKE_TELEMETRY_DISABLE_FRAME_LOG=1 (platform/qt/GpuDisplayWindow.cpp's
+    # swapTelemetryPerEventLogEnabled() / MainWindow.cpp's m_playbackSmokeFrameLogEnabled) to
+    # suppress the per-frame/per-swap/per-superseded-frame qInfo() lines those two files gate on
+    # MLVAPP_PLAYBACK_SMOKE_TELEMETRY alone. MLVAPP_PLAYBACK_SMOKE_TELEMETRY=1 and
+    # MLVAPP_GPU_PLAYBACK_RECON_ELIGIBILITY_DIAG=1 stay ON in BOTH arms: the former still drives
+    # every counter behind playback_smoke.gate/playback_smoke.gpu_window_swaps regardless of the
+    # new flag, and the latter's own eligibility line is what Get-AttrCudaEligibilityVerdict
+    # requires to avoid failing this job closed at BACKEND_NOT_AVAILABLE (exit 15) -- it is no
+    # longer a per-frame cost either way, since MainWindow.cpp now dedupes it against its last
+    # emitted value and a stable CUDA session logs it once.
+    [ValidateSet('HEAVY', 'LIGHT')]
+    [string]$TelemetryArm = 'HEAVY'
 )
 
 $ErrorActionPreference = 'Stop'
@@ -1302,16 +1321,30 @@ New-Item -ItemType Directory -Path $legOut -Force | Out-Null
 $resultPath = Join-Path $legOut 'result.json'
 $presentMonPath = Join-Path $legOut 'presentmon.csv'
 $smoke = Join-Path $smokeRunnerClosureDir $SmokeRunnerName
+$telemetryArmEnvs = if ($TelemetryArm -eq 'LIGHT') {
+    # Only what MLVAPP_GPU_PLAYBACK_RECON_ELIGIBILITY_DIAG and the gpu_window swap
+    # counters/summary need, plus the opt-out that suppresses the per-frame/per-swap/
+    # per-superseded-frame qInfo() lines MLVAPP_PLAYBACK_SMOKE_TELEMETRY alone still gates.
+    @(
+        'MLVAPP_PLAYBACK_SMOKE_TELEMETRY=1',
+        'MLVAPP_PLAYBACK_SMOKE_TELEMETRY_DISABLE_FRAME_LOG=1',
+        'MLVAPP_GPU_PLAYBACK_RECON_ELIGIBILITY_DIAG=1'
+    )
+} else {
+    @(
+        'MLVAPP_PLAYBACK_SMOKE_TELEMETRY=1',
+        'MLVAPP_PLAYBACK_SMOKE_TIMELINE_TELEMETRY=1',
+        'MLVAPP_PLAYBACK_DETAILED_TIMELINE_TELEMETRY=1',
+        'MLVAPP_GPU_PLAYBACK_RECON_ELIGIBILITY_DIAG=1',
+        'MLVAPP_STAGE_TIMING=1',
+        'MLVAPP_PERF_FIELD_LOG=1'
+    )
+}
 $envs = @(
     'MLVAPP_PLAYBACK_QUALITY_MODE=phase3_hq',
     'MLVAPP_PLAYBACK_AGGRESSIVE_PREVIEW=0',
-    'MLVAPP_PLAYBACK_PREVIEW_MODE=sharp_smooth',
-    'MLVAPP_PLAYBACK_SMOKE_TELEMETRY=1',
-    'MLVAPP_PLAYBACK_SMOKE_TIMELINE_TELEMETRY=1',
-    'MLVAPP_PLAYBACK_DETAILED_TIMELINE_TELEMETRY=1',
-    'MLVAPP_GPU_PLAYBACK_RECON_ELIGIBILITY_DIAG=1',
-    'MLVAPP_STAGE_TIMING=1',
-    'MLVAPP_PERF_FIELD_LOG=1',
+    'MLVAPP_PLAYBACK_PREVIEW_MODE=sharp_smooth'
+) + $telemetryArmEnvs + @(
     'MLVAPP_PLAYBACK_PHASE3_UNATTENDED=1',
     'MLVAPP_GPU_PLAYBACK_RECON=1',
     'MLVAPP_GPU_PLAYBACK_RECON_BACKEND=cuda',
@@ -1926,6 +1959,10 @@ $provenance = [ordered]@{
     # A rehearsal is carried by the provenance sidecar too: a reader who consults only this file
     # must still be told that these numbers are a plumbing proof (sol, PR #137 r1).
     fixtureRehearsal = $FixtureRehearsal
+    # CUDA-PLAYBACK-PRESENT-CADENCE-1 round 2: which telemetry arm this leg ran, so a reader of
+    # provenance.json alone (never cross-referencing the launch command) can still tell a LIGHT
+    # counters-only leg apart from a HEAVY fully-verbose one.
+    telemetryArm = $TelemetryArm
 }
 Save-Json $provenance (Join-Path $Pub 'provenance.json')
 
@@ -1941,6 +1978,7 @@ $manifest = [ordered]@{
     fixtureRehearsal = $FixtureRehearsal
     # CUDA-PERF-DISPLAY-WAKE-1: the wake attempt made before MLVApp launched for this leg.
     displayWake = $displayWake
+    telemetryArm = $TelemetryArm
     # A rehearsal cites no consent receipt: the fixtures are repository bytes, and recording the
     # owner-footage receipt here would be misleading provenance (sol, PR #137 r2 minor).
     consentReceipt = $(if ($FixtureRehearsal) { $null } else { $ConsentReceiptFileName })

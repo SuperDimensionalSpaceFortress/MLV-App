@@ -322,3 +322,58 @@ TEST(GpuWindowSwapWiring, PlaybackSmokeSummaryLineIncludesSupersededCounts)
         QStringLiteral(".arg( static_cast<qulonglong>( swapSnapshot.summary.lastSupersededBySerial ) )")));
 }
 
+// Round 2 (CUDA-PLAYBACK-PRESENT-CADENCE-1): counters-only mode. A new opt-out flag
+// suppresses only the per-swap/per-superseded-frame qInfo() lines, never the counting
+// that feeds the one-shot session summary above.
+
+TEST(GpuWindowSwapWiring, PerEventLogHelperDefaultsEnabledAndIsAnOptOutFlag)
+{
+    const QString source = readRepoFile(QStringLiteral("platform/qt/GpuDisplayWindow.cpp"));
+    const int functionAt = source.indexOf(QStringLiteral("bool swapTelemetryPerEventLogEnabled()"));
+    ASSERT_TRUE(functionAt >= 0);
+    const QString body = source.mid(functionAt, 300);
+    // Opt-out shape: a "disabled" bool read from the env var, negated on return -- unset
+    // (windowEnvFlagEnabled("") is false) means disabled=false means the helper returns
+    // true, i.e. legacy fully-verbose behavior by default.
+    ASSERT_TRUE(body.contains(QStringLiteral(
+        "windowEnvFlagEnabled( qgetenv( \"MLVAPP_PLAYBACK_SMOKE_TELEMETRY_DISABLE_FRAME_LOG\" ) );")));
+    ASSERT_TRUE(body.contains(QStringLiteral("return !disabled;")));
+}
+
+TEST(GpuWindowSwapWiring, NoteRealSwapCountsBeforeAndOutsideThePerEventLogGate)
+{
+    const QString source = readRepoFile(QStringLiteral("platform/qt/GpuDisplayWindow.cpp"));
+    const int functionAt = source.indexOf(QStringLiteral("void GpuDisplayWindow::noteRealSwap()"));
+    ASSERT_TRUE(functionAt >= 0);
+    const int nextFunctionAt = source.indexOf(
+        QStringLiteral("void GpuDisplayWindow::noteSupersededBeforePaint("), functionAt);
+    ASSERT_TRUE(nextFunctionAt > functionAt);
+    const QString body = source.mid(functionAt, nextFunctionAt - functionAt);
+
+    const int countAt = body.indexOf(QStringLiteral("++m_swapTelemetryCounters.swapCount"));
+    const int gateAt = body.indexOf(QStringLiteral("if ( swapTelemetryPerEventLogEnabled() )"));
+    const int logAt = body.indexOf(QStringLiteral("gpu_window.swap session=%1"));
+    ASSERT_TRUE(countAt >= 0);
+    ASSERT_TRUE(gateAt > countAt);
+    ASSERT_TRUE(logAt > gateAt);
+}
+
+TEST(GpuWindowSwapWiring, NoteSupersededBeforePaintCountsBeforeAndOutsideThePerEventLogGate)
+{
+    const QString source = readRepoFile(QStringLiteral("platform/qt/GpuDisplayWindow.cpp"));
+    const int functionAt = source.indexOf(
+        QStringLiteral("void GpuDisplayWindow::noteSupersededBeforePaint(quint64 supersedingSerial)"));
+    ASSERT_TRUE(functionAt >= 0);
+    const int nextFunctionAt = source.indexOf(
+        QStringLiteral("bool GpuDisplayWindow::installInPreview("), functionAt);
+    ASSERT_TRUE(nextFunctionAt > functionAt);
+    const QString body = source.mid(functionAt, nextFunctionAt - functionAt);
+
+    const int countAt = body.indexOf(QStringLiteral("++m_swapTelemetryCounters.supersededCount;"));
+    const int gateAt = body.indexOf(QStringLiteral("if ( swapTelemetryPerEventLogEnabled() )"));
+    const int logAt = body.indexOf(QStringLiteral("gpu_window.present_fate session=%1"));
+    ASSERT_TRUE(countAt >= 0);
+    ASSERT_TRUE(gateAt > countAt);
+    ASSERT_TRUE(logAt > gateAt);
+}
+

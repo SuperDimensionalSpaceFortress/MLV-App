@@ -168,6 +168,15 @@ pwsh -NoProfile -File tools\profiling\bachelor\playback-attr-3-cuda-job.ps1 `
     -ClipId <owner id, e.g. M16-1243> -OutFile <staging-dir>\<jobId>.job.ps1
 ```
 
+**`-TelemetryArm`** (CUDA-PLAYBACK-PRESENT-CADENCE-1 round 2) selects `HEAVY` (default, every
+diagnostic env var this job has always set) or `LIGHT` (drops the per-frame GUI-thread diagnostic
+sources -- timeline/detailed-timeline telemetry, stage timing, perf field log -- and sets
+`MLVAPP_PLAYBACK_SMOKE_TELEMETRY_DISABLE_FRAME_LOG=1` to also suppress the per-frame/per-swap/
+per-superseded-frame `qInfo()` lines `MLVAPP_PLAYBACK_SMOKE_TELEMETRY` alone still gates -- while
+keeping the gpu_window swap counters and the `playback_smoke.gpu_window_swaps` summary line, and
+keeping this job's own `BACKEND_NOT_AVAILABLE` eligibility gate, unaffected). Recorded in both
+`provenance.json` and `evidence-manifest.json` as `telemetryArm`.
+
 **`-BuildManifestSha256` is mandatory, and the hub passes the sha the assembler printed**
 (`MANIFEST_SHA256=` on its `RESULT=ASSEMBLE_OK` line, echoed by the staging generator as
 `buildManifestSha256`). The Bachelor cache is mutable and the job does not own it: without this

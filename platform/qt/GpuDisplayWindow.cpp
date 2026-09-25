@@ -63,6 +63,22 @@ bool swapTelemetryEnabled()
     return enabled;
 }
 
+// CUDA-PLAYBACK-PRESENT-CADENCE-1 round 2: counters-only mode. swapTelemetryEnabled()
+// still gates all counting (m_swapTelemetryCounters updates, session tracking) -- this
+// flag only suppresses the per-swap/per-superseded-frame qInfo() calls below, which are
+// synchronous GUI-thread log I/O and were shown (hub forensics) to run at several lines
+// per frame during CUDA playback. Opt-out, not opt-in (mirrors MLVAPP_F3_DISABLE_CUT_RANGE_REPAIR
+// in MainWindow.cpp): unset/false means the legacy fully-verbose behavior is unchanged, so
+// existing HEAVY-arm callers and round 1's tests need no update. The one-shot
+// playback_smoke.gpu_window_swaps summary line (MainWindow::finishPlaybackSmokeTelemetry)
+// is unaffected either way -- it always reflects the counters this flag never touches.
+bool swapTelemetryPerEventLogEnabled()
+{
+    static const bool disabled =
+        windowEnvFlagEnabled( qgetenv( "MLVAPP_PLAYBACK_SMOKE_TELEMETRY_DISABLE_FRAME_LOG" ) );
+    return !disabled;
+}
+
 /* GLSL 1.20 passthrough -- works in the NVIDIA compatibility context a QOpenGLWindow
  * gets by default, no LUT/Bayer uniforms. Milestone 1 displays the already-final CPU
  * RGBA frame; the shared GpuPreviewProcessing shader (zebras/LUTs/Bayer) comes with the
@@ -204,16 +220,19 @@ void GpuDisplayWindow::noteRealSwap()
     m_swapTelemetryCounters.lastSwapQpcMs = qpcMs;
     m_swapTelemetryCounters.lastSwapUtc = utc;
 
-    qInfo().noquote()
-        << QStringLiteral(
-               "gpu_window.swap session=%1 serial=%2 qpc_ms=%3 utc=%4 "
-               "presented_serial=%5 presented_serial_valid=%6" )
-               .arg( static_cast<qulonglong>( g_swapTelemetrySessionId ) )
-               .arg( static_cast<qulonglong>( record.swapSerial ) )
-               .arg( record.qpcMs, 0, 'f', 3 )
-               .arg( utc )
-               .arg( static_cast<qulonglong>( record.presentedSerial ) )
-               .arg( record.presentedSerialValid ? 1 : 0 );
+    if ( swapTelemetryPerEventLogEnabled() )
+    {
+        qInfo().noquote()
+            << QStringLiteral(
+                   "gpu_window.swap session=%1 serial=%2 qpc_ms=%3 utc=%4 "
+                   "presented_serial=%5 presented_serial_valid=%6" )
+                   .arg( static_cast<qulonglong>( g_swapTelemetrySessionId ) )
+                   .arg( static_cast<qulonglong>( record.swapSerial ) )
+                   .arg( record.qpcMs, 0, 'f', 3 )
+                   .arg( utc )
+                   .arg( static_cast<qulonglong>( record.presentedSerial ) )
+                   .arg( record.presentedSerialValid ? 1 : 0 );
+    }
 }
 
 void GpuDisplayWindow::noteSupersededBeforePaint(quint64 supersedingSerial)
@@ -237,13 +256,16 @@ void GpuDisplayWindow::noteSupersededBeforePaint(quint64 supersedingSerial)
     m_swapTelemetryCounters.lastSupersededSerial = m_pendingPresentationSerial;
     m_swapTelemetryCounters.lastSupersededBySerial = supersedingSerial;
 
-    qInfo().noquote()
-        << QStringLiteral(
-               "gpu_window.present_fate session=%1 fate=superseded_before_paint "
-               "superseded_serial=%2 superseded_by_serial=%3" )
-               .arg( static_cast<qulonglong>( g_swapTelemetrySessionId ) )
-               .arg( static_cast<qulonglong>( m_pendingPresentationSerial ) )
-               .arg( static_cast<qulonglong>( supersedingSerial ) );
+    if ( swapTelemetryPerEventLogEnabled() )
+    {
+        qInfo().noquote()
+            << QStringLiteral(
+                   "gpu_window.present_fate session=%1 fate=superseded_before_paint "
+                   "superseded_serial=%2 superseded_by_serial=%3" )
+                   .arg( static_cast<qulonglong>( g_swapTelemetrySessionId ) )
+                   .arg( static_cast<qulonglong>( m_pendingPresentationSerial ) )
+                   .arg( static_cast<qulonglong>( supersedingSerial ) );
+    }
 }
 
 bool GpuDisplayWindow::installInPreview(QGraphicsView *view)
