@@ -553,7 +553,11 @@ TEST(ClipGolden, TinyDualIsoHeadlessPlaybackProfileProducesJson)
     ASSERT_TRUE(metadata.value(QStringLiteral("scope")).toString() == QStringLiteral("none"));
     ASSERT_TRUE(!metadata.value(QStringLiteral("window_visible")).toBool());
     ASSERT_TRUE(!metadata.value(QStringLiteral("wait_for_paint")).toBool());
-    ASSERT_TRUE(metadata.value(QStringLiteral("average_latency_ms")).toDouble() > 0.0);
+    /* PROD-TELEMETRY-DURATION-AS-PROOF-3: "ran" is proved above by
+     * measured_frames == 2 (an explicit run counter), not by this duration
+     * reading positive -- a fast real run on a coarse fallback clock can
+     * still read 0.0 ms. */
+    ASSERT_TRUE(metadata.value(QStringLiteral("average_latency_ms")).toDouble() >= 0.0);
     ASSERT_TRUE(metadata.value(QStringLiteral("measurement_model")).toString().contains(QStringLiteral("frameReady")));
     ASSERT_TRUE(metadata.value(QStringLiteral("playback_policy_active")).toBool());
     ASSERT_TRUE(metadata.value(QStringLiteral("playback_debayer_request")).toString()
@@ -598,7 +602,9 @@ TEST(ClipGolden, TinyDualIsoHeadlessPlaybackProfileProducesJson)
     ASSERT_TRUE(!metadata.value(QStringLiteral("play_start_preroll_eligible")).toBool());
     ASSERT_TRUE(!metadata.value(QStringLiteral("play_start_preroll_disabled_by_environment")).toBool());
     ASSERT_TRUE(metadata.value(QStringLiteral("play_to_first_frame_measured")).toBool());
-    ASSERT_TRUE(metadata.value(QStringLiteral("play_to_first_frame_ms")).toDouble() > 0.0);
+    /* PROD-TELEMETRY-DURATION-AS-PROOF-3: "ran" is proved by the measured
+     * flag above, not by this duration reading positive. */
+    ASSERT_TRUE(metadata.value(QStringLiteral("play_to_first_frame_ms")).toDouble() >= 0.0);
     const QJsonObject first_frame = frames.at(0).toObject();
     ASSERT_TRUE(!first_frame.value(QStringLiteral("raw_uint16_lj92_pred6_split_active")).toBool());
     ASSERT_TRUE(!first_frame.value(QStringLiteral("raw_uint16_lj92_pred6_split_requested")).toBool());
@@ -620,11 +626,14 @@ TEST(ClipGolden, TinyDualIsoHeadlessPlaybackProfileProducesJson)
     ASSERT_TRUE(first_frame.value(QStringLiteral("raw_uint16_lj92_pred1_fast_path_predictor_ms")).toDouble() >= 0.0);
     ASSERT_TRUE(first_frame.value(QStringLiteral("raw_uint16_lj92_pred1_fast_path_other_ms")).toDouble() >= 0.0);
 
-    bool saw_preview_rowscale_timing = false;
     for (const QJsonValue & value : frames) {
         ASSERT_TRUE(value.isObject());
         const QJsonObject sample = value.toObject();
-        ASSERT_TRUE(sample.value(QStringLiteral("latency_ms")).toDouble() > 0.0);
+        /* PROD-TELEMETRY-DURATION-AS-PROOF-3: "ran" is proved by
+         * measured_frames == 2 and measurement_model containing "frameReady"
+         * (asserted once above at the metadata level), not by this per-frame
+         * duration reading positive. */
+        ASSERT_TRUE(sample.value(QStringLiteral("latency_ms")).toDouble() >= 0.0);
         ASSERT_TRUE(sample.contains(QStringLiteral("engine_latency_ms")));
         ASSERT_TRUE(sample.contains(QStringLiteral("presentation_overhead_ms")));
         ASSERT_TRUE(sample.contains(QStringLiteral("draw_frame_ready_queue_ms")));
@@ -889,15 +898,20 @@ TEST(ClipGolden, TinyDualIsoHeadlessPlaybackProfileProducesJson)
                     >= sample.value(QStringLiteral("processing_core_levels_ms")).toDouble());
         ASSERT_TRUE(sample.value(QStringLiteral("render_thread_total_ms")).toDouble()
                     >= sample.value(QStringLiteral("render_thread_work_ms")).toDouble());
-        saw_preview_rowscale_timing = saw_preview_rowscale_timing
-            || sample.value(QStringLiteral("dual_iso_preview_rowscale_ms")).toDouble() > 0.0;
         ASSERT_TRUE(sample.contains(QStringLiteral("playback_processing_subset_active")));
         ASSERT_TRUE(!sample.value(QStringLiteral("playback_processing_subset_active")).toBool());
         ASSERT_TRUE(sample.contains(QStringLiteral("gpu16_preview_active")));
         ASSERT_TRUE(sample.contains(QStringLiteral("gpu_preview_processing_active")));
         ASSERT_TRUE(sample.contains(QStringLiteral("gpu_bilinear_debayer_active")));
     }
-    ASSERT_TRUE(saw_preview_rowscale_timing);
+    /* PROD-TELEMETRY-DURATION-AS-PROOF-3: the preview rowscale pass ran on
+     * every frame of this run -- proved structurally by
+     * dual_iso_mode_effective == 2 and dual_iso_preview_runtime_active
+     * (asserted above at the metadata level; diso_check is always 0 on this
+     * live call site, so dualiso.c's diso_get_preview() always reaches the
+     * unconditional rowscale write) -- not by latching a positive elapsed-ms
+     * reading across frames, which a fast real pass can miss on a coarse
+     * fallback clock. */
 
     ASSERT_TRUE(QFileInfo::exists(stage_log));
 }
@@ -1991,7 +2005,9 @@ TEST(ClipGolden, TinyDualIsoHeadlessPlaybackProfileAmazeCachedDebayerProducesJso
     ASSERT_TRUE(metadata.value(QStringLiteral("play_start_preroll_eligible")).toBool());
     ASSERT_TRUE(!metadata.value(QStringLiteral("play_start_preroll_disabled_by_environment")).toBool());
     ASSERT_TRUE(metadata.value(QStringLiteral("play_to_first_frame_measured")).toBool());
-    ASSERT_TRUE(metadata.value(QStringLiteral("play_to_first_frame_ms")).toDouble() > 0.0);
+    /* PROD-TELEMETRY-DURATION-AS-PROOF-3: "ran" is proved by the measured
+     * flag above, not by this duration reading positive. */
+    ASSERT_TRUE(metadata.value(QStringLiteral("play_to_first_frame_ms")).toDouble() >= 0.0);
 }
 
 TEST(ClipGolden, TinyDualIsoHeadlessPlaybackProfileAmazeCachedCanDisablePlayStartPrerollViaEnvironment)
@@ -2053,7 +2069,9 @@ TEST(ClipGolden, TinyDualIsoHeadlessPlaybackProfileAmazeCachedCanDisablePlayStar
     ASSERT_TRUE(metadata.value(QStringLiteral("play_start_preroll_eligible")).toBool());
     ASSERT_TRUE(metadata.value(QStringLiteral("play_start_preroll_disabled_by_environment")).toBool());
     ASSERT_TRUE(metadata.value(QStringLiteral("play_to_first_frame_measured")).toBool());
-    ASSERT_TRUE(metadata.value(QStringLiteral("play_to_first_frame_ms")).toDouble() > 0.0);
+    /* PROD-TELEMETRY-DURATION-AS-PROOF-3: "ran" is proved by the measured
+     * flag above, not by this duration reading positive. */
+    ASSERT_TRUE(metadata.value(QStringLiteral("play_to_first_frame_ms")).toDouble() >= 0.0);
 }
 
 TEST(ClipGolden, TinyDualIsoHeadlessPlaybackProfileCanEnableLj92Pred6SplitViaEnvironment)
@@ -2582,7 +2600,9 @@ TEST(ClipGolden, TinyDualIsoHeadlessPlaybackProfilePred1FastPathMeasurementProdu
     ASSERT_TRUE(fast_path_active);
     ASSERT_TRUE(measurement_active);
     ASSERT_TRUE(measurement_active == fast_path_active);
-    ASSERT_TRUE(first_frame.value(QStringLiteral("raw_uint16_lj92_pred1_fast_path_total_ms")).toDouble() > 0.0);
+    /* PROD-TELEMETRY-DURATION-AS-PROOF-3: "ran" is proved by fast_path_active
+     * and measurement_active above, not by this duration reading positive. */
+    ASSERT_TRUE(first_frame.value(QStringLiteral("raw_uint16_lj92_pred1_fast_path_total_ms")).toDouble() >= 0.0);
     ASSERT_TRUE(first_frame.value(QStringLiteral("raw_uint16_lj92_pred1_fast_path_bitstream_ms")).toDouble() >= 0.0);
     ASSERT_TRUE(first_frame.value(QStringLiteral("raw_uint16_lj92_pred1_fast_path_predictor_ms")).toDouble() >= 0.0);
     ASSERT_TRUE(first_frame.value(QStringLiteral("raw_uint16_lj92_pred1_fast_path_other_ms")).toDouble() >= 0.0);
