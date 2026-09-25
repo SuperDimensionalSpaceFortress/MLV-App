@@ -25,6 +25,18 @@ struct GpuWindowSwapTelemetryCounters
     double maxGapMs = 0.0;
     quint64 maxGapBeforeSerial = 0;
     quint64 maxGapAfterSerial = 0;
+    // Fate telemetry (CUDA-PLAYBACK-PRESENT-CADENCE-1): a submitted frame is "superseded
+    // before paint" when a NEWER present call overwrites the window's single pending slot
+    // (m_pendingPresentationSerial) before paintGL() ever drew it -- the window holds
+    // exactly one pending frame, not a queue, so every submission that is not the most
+    // recent one at the moment Qt actually paints is silently lost by construction. This
+    // was previously invisible: only the swap count and the app's own upstream
+    // frames_presented counter existed, and their difference had to be inferred
+    // out-of-band (see docs/cuda-playback-present-cadence.md). Counted only while a
+    // playback-smoke session is active, mirroring noteRealSwap()'s own gating.
+    quint64 supersededCount = 0;
+    quint64 lastSupersededSerial = 0;
+    quint64 lastSupersededBySerial = 0;
 };
 
 /*! \brief Derived, report-ready swap-cadence numbers for one playback smoke session's
@@ -45,6 +57,10 @@ struct GpuWindowSwapTelemetrySummary
     double tailGapMs = 0.0;
     QString firstSwapUtc;
     QString lastSwapUtc;
+    // See GpuWindowSwapTelemetryCounters::supersededCount.
+    quint64 supersededCount = 0;
+    quint64 lastSupersededSerial = 0;
+    quint64 lastSupersededBySerial = 0;
 };
 
 /*! \brief What GpuDisplayWindow::swapTelemetrySnapshot() hands back to a caller (e.g. the
@@ -77,6 +93,9 @@ public:
         summary.maxGapAfterSerial = counters.maxGapAfterSerial;
         summary.firstSwapUtc = counters.firstSwapUtc;
         summary.lastSwapUtc = counters.lastSwapUtc;
+        summary.supersededCount = counters.supersededCount;
+        summary.lastSupersededSerial = counters.lastSupersededSerial;
+        summary.lastSupersededBySerial = counters.lastSupersededBySerial;
 
         // fps is over (swapCount - 1) intervals spanning [firstSwapQpcMs, lastSwapQpcMs];
         // a single swap (or two swaps whose QPC timestamps happen to collide at clock

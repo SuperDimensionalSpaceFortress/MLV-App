@@ -216,6 +216,36 @@ void GpuDisplayWindow::noteRealSwap()
                .arg( record.presentedSerialValid ? 1 : 0 );
 }
 
+void GpuDisplayWindow::noteSupersededBeforePaint(quint64 supersedingSerial)
+{
+    if ( !swapTelemetryEnabled() ) return;
+    // Closed session (past the gate, or no session begun yet): mirrors noteRealSwap()'s
+    // own gating, so a submission made outside a playback-smoke session (e.g. a single
+    // scrub/edit present after the gate) is never attributed to a finished session.
+    if ( !g_swapTelemetrySessionActive ) return;
+    // The window holds exactly one pending frame (m_pendingPresentationSerial), not a
+    // queue: a submission only overwrites something lost if that pending slot (a) came
+    // from a route that supplied a real serial, and (b) has not yet been promoted by a
+    // real paintGL() draw (m_texturePresentationActive, set true by paintGL() and false
+    // again by every submit -- see the header doc comment on grabPresentedFramebufferIfActive
+    // and paintGL() itself). Neither condition holds on the very first submission of a
+    // session (m_pendingPresentationSerialValid is still false), so frame 1 is correctly
+    // never counted as superseding anything.
+    if ( !m_pendingPresentationSerialValid || m_texturePresentationActive ) return;
+
+    ++m_swapTelemetryCounters.supersededCount;
+    m_swapTelemetryCounters.lastSupersededSerial = m_pendingPresentationSerial;
+    m_swapTelemetryCounters.lastSupersededBySerial = supersedingSerial;
+
+    qInfo().noquote()
+        << QStringLiteral(
+               "gpu_window.present_fate session=%1 fate=superseded_before_paint "
+               "superseded_serial=%2 superseded_by_serial=%3" )
+               .arg( static_cast<qulonglong>( g_swapTelemetrySessionId ) )
+               .arg( static_cast<qulonglong>( m_pendingPresentationSerial ) )
+               .arg( static_cast<qulonglong>( supersedingSerial ) );
+}
+
 bool GpuDisplayWindow::installInPreview(QGraphicsView *view)
 {
     if ( !view || !isRequestedByEnvironment() ) return false;
@@ -446,6 +476,7 @@ void GpuDisplayWindow::setPresentedImage(const QImage &image,
                                          const QSize &displaySize,
                                          quint64 presentationSerial)
 {
+    if ( swapTelemetryEnabled() ) noteSupersededBeforePaint(presentationSerial);
     const QSize previousDisplaySize(m_pendingDisplayWidth,
                                     m_pendingDisplayHeight);
     const QSize previousImageSize = m_pendingImage.size();
@@ -835,6 +866,7 @@ bool GpuDisplayWindow::setPresentedGpuPlaybackReconAmazePostWbTexture(
     }
 
     const double postStartMs = elapsedMs();
+    if ( swapTelemetryEnabled() ) noteSupersededBeforePaint(presentationSerial);
     m_pendingImage = QImage();
     m_pendingTextureWidth = texWidth;
     m_pendingTextureHeight = texHeight;

@@ -27012,7 +27012,8 @@ void MainWindow::finishPlaybackSmokeTelemetry( const char *reason )
                    "telemetry_enabled=%3 swaps=%4 swap_fps=%5 max_gap_ms=%6 "
                    "max_gap_before_serial=%7 max_gap_after_serial=%8 frames_presented=%9 "
                    "swaps_minus_frames_presented=%10 head_gap_ms=%11 tail_gap_ms=%12 "
-                   "first_swap_utc=%13 last_swap_utc=%14" )
+                   "first_swap_utc=%13 last_swap_utc=%14 superseded_before_paint=%15 "
+                   "last_superseded_serial=%16 last_superseded_by_serial=%17" )
                    .arg( static_cast<qulonglong>( swapSnapshot.sessionId ) )
                    .arg( bool01( swapSnapshot.windowActive ) )
                    .arg( bool01( swapSnapshot.telemetryEnabled ) )
@@ -27027,7 +27028,10 @@ void MainWindow::finishPlaybackSmokeTelemetry( const char *reason )
                    .arg( swapSnapshot.summary.headGapMs, 0, 'f', 3 )
                    .arg( swapSnapshot.summary.tailGapMs, 0, 'f', 3 )
                    .arg( swapSnapshot.summary.firstSwapUtc )
-                   .arg( swapSnapshot.summary.lastSwapUtc );
+                   .arg( swapSnapshot.summary.lastSwapUtc )
+                   .arg( static_cast<qulonglong>( swapSnapshot.summary.supersededCount ) )
+                   .arg( static_cast<qulonglong>( swapSnapshot.summary.lastSupersededSerial ) )
+                   .arg( static_cast<qulonglong>( swapSnapshot.summary.lastSupersededBySerial ) );
     }
 
     // CUDA-PLAYBACK-CONTACT-SHEET-1 r1d (sol HARDENING): cleared LAST, after every summary

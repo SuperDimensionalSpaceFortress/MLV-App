@@ -132,3 +132,56 @@ TEST(GpuWindowSwapTelemetryPolicy, FirstAndLastSwapUtcPassThroughUnchanged)
     ASSERT_EQ(std::string("2026-09-25T11:00:00.000Z"), summary.firstSwapUtc.toStdString());
     ASSERT_EQ(std::string("2026-09-25T11:00:05.000Z"), summary.lastSwapUtc.toStdString());
 }
+
+// Fate telemetry (CUDA-PLAYBACK-PRESENT-CADENCE-1): superseded-before-paint counts, mirroring
+// the same pure-math/counters-vs-summary split the swap-cadence fields above already use.
+
+TEST(GpuWindowSwapTelemetryPolicy, NoSupersededFramesReportsZeroCountAndZeroSerials)
+{
+    GpuWindowSwapTelemetryCounters counters;
+    counters.swapCount = 156;
+
+    const GpuWindowSwapTelemetrySummary summary =
+        GpuWindowSwapTelemetryPolicy::summarize(counters);
+
+    ASSERT_EQ(static_cast<quint64>(0), summary.supersededCount);
+    ASSERT_EQ(static_cast<quint64>(0), summary.lastSupersededSerial);
+    ASSERT_EQ(static_cast<quint64>(0), summary.lastSupersededBySerial);
+}
+
+TEST(GpuWindowSwapTelemetryPolicy, SupersededCountAndLastSerialsPassThroughUnchanged)
+{
+    // Modeled on the gpu1b leg from docs/cuda-playback-present-cadence.md: 229 swaps,
+    // 777 superseded-before-paint between them, most recent supersession serial 1009
+    // overwritten by serial 1010 (the one that went on to swap).
+    GpuWindowSwapTelemetryCounters counters;
+    counters.swapCount = 229;
+    counters.supersededCount = 777;
+    counters.lastSupersededSerial = 1009;
+    counters.lastSupersededBySerial = 1010;
+
+    const GpuWindowSwapTelemetrySummary summary =
+        GpuWindowSwapTelemetryPolicy::summarize(counters);
+
+    ASSERT_EQ(static_cast<quint64>(777), summary.supersededCount);
+    ASSERT_EQ(static_cast<quint64>(1009), summary.lastSupersededSerial);
+    ASSERT_EQ(static_cast<quint64>(1010), summary.lastSupersededBySerial);
+}
+
+TEST(GpuWindowSwapTelemetryPolicy, SupersededCountIsIndependentOfSwapFpsArithmetic)
+{
+    // A leg with heavy supersession must not perturb the unrelated swap_fps/gap math --
+    // the two are accumulated and reported independently (guards against a future change
+    // that folds supersededCount into the same running total as swapCount by mistake).
+    GpuWindowSwapTelemetryCounters counters;
+    counters.swapCount = 61;
+    counters.firstSwapQpcMs = 0.0;
+    counters.lastSwapQpcMs = 1000.0;
+    counters.supersededCount = 5000;
+
+    const GpuWindowSwapTelemetrySummary summary =
+        GpuWindowSwapTelemetryPolicy::summarize(counters);
+
+    ASSERT_NEAR(60.0, summary.swapFps, 0.01);
+    ASSERT_EQ(static_cast<quint64>(5000), summary.supersededCount);
+}

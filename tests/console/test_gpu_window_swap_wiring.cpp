@@ -230,3 +230,95 @@ TEST(GpuWindowSwapWiring, GuiTestsLinkTheOpenMpRuntimeTheSwapClockNeeds)
     ASSERT_TRUE(pro.contains(QStringLiteral("win32: LIBS += -llibgomp-1")));
 }
 
+// Fate telemetry (CUDA-PLAYBACK-PRESENT-CADENCE-1): superseded-before-paint wiring. See
+// docs/cuda-playback-present-cadence.md for why this, not GUI-thread work on a named
+// component or swap-chain recreation, accounts for the gap between frames produced and
+// frames shown.
+
+TEST(GpuWindowSwapWiring, HeaderDeclaresTheFateTelemetryMethod)
+{
+    const QString header = readRepoFile(QStringLiteral("platform/qt/GpuDisplayWindow.h"));
+    ASSERT_TRUE(header.contains(QStringLiteral("void noteSupersededBeforePaint(quint64 supersedingSerial);")));
+}
+
+TEST(GpuWindowSwapWiring, BothPresentRoutesCallTheFateTelemetryBeforeMutatingPendingState)
+{
+    const QString source = readRepoFile(QStringLiteral("platform/qt/GpuDisplayWindow.cpp"));
+
+    // QImage route: called at the top of setPresentedImage(), before m_pendingImage etc.
+    // are touched.
+    const int setImageAt = source.indexOf(QStringLiteral("void GpuDisplayWindow::setPresentedImage("));
+    const int setImageNoteAt = source.indexOf(
+        QStringLiteral("if ( swapTelemetryEnabled() ) noteSupersededBeforePaint(presentationSerial);"),
+        setImageAt);
+    const int setImagePendingWriteAt = source.indexOf(
+        QStringLiteral("m_pendingImage = image.format()"), setImageAt);
+    ASSERT_TRUE(setImageAt >= 0);
+    ASSERT_TRUE(setImageNoteAt > setImageAt);
+    ASSERT_TRUE(setImagePendingWriteAt > setImageNoteAt);
+
+    // GPU-recon-texture route: called right before the post-success pending-state mutation
+    // block (every earlier `fail()` return leaves pending state untouched, so this call must
+    // sit AFTER those, not at the function's own top).
+    const int setTexAt = source.indexOf(
+        QStringLiteral("bool GpuDisplayWindow::setPresentedGpuPlaybackReconAmazePostWbTexture("));
+    const int setTexNoteAt = source.indexOf(
+        QStringLiteral("if ( swapTelemetryEnabled() ) noteSupersededBeforePaint(presentationSerial);"),
+        setTexAt);
+    const int setTexPendingWriteAt = source.indexOf(
+        QStringLiteral("m_pendingImage = QImage();"), setTexAt);
+    ASSERT_TRUE(setTexAt >= 0);
+    ASSERT_TRUE(setTexNoteAt > setTexAt);
+    ASSERT_TRUE(setTexPendingWriteAt > setTexNoteAt);
+}
+
+TEST(GpuWindowSwapWiring, FateTelemetryGatesOnBothTelemetryEnabledAndSessionActive)
+{
+    const QString source = readRepoFile(QStringLiteral("platform/qt/GpuDisplayWindow.cpp"));
+    const int functionAt = source.indexOf(
+        QStringLiteral("void GpuDisplayWindow::noteSupersededBeforePaint(quint64 supersedingSerial)"));
+    ASSERT_TRUE(functionAt >= 0);
+    const int nextFunctionAt = source.indexOf(
+        QStringLiteral("bool GpuDisplayWindow::installInPreview("), functionAt);
+    ASSERT_TRUE(nextFunctionAt > functionAt);
+    const QString body = source.mid(functionAt, nextFunctionAt - functionAt);
+
+    const int enabledGateAt = body.indexOf(QStringLiteral("if ( !swapTelemetryEnabled() ) return;"));
+    const int activeGateAt = body.indexOf(QStringLiteral("if ( !g_swapTelemetrySessionActive ) return;"));
+    const int pendingValidGateAt = body.indexOf(
+        QStringLiteral("if ( !m_pendingPresentationSerialValid || m_texturePresentationActive ) return;"));
+    ASSERT_TRUE(enabledGateAt >= 0);
+    ASSERT_TRUE(activeGateAt > enabledGateAt);
+    ASSERT_TRUE(pendingValidGateAt > activeGateAt);
+}
+
+TEST(GpuWindowSwapWiring, FateTelemetryLogLineCarriesBothSerials)
+{
+    const QString source = readRepoFile(QStringLiteral("platform/qt/GpuDisplayWindow.cpp"));
+    ASSERT_TRUE(source.contains(QStringLiteral("gpu_window.present_fate session=%1 fate=superseded_before_paint")));
+    ASSERT_TRUE(source.contains(QStringLiteral("superseded_serial=%2 superseded_by_serial=%3")));
+}
+
+TEST(GpuWindowSwapWiring, SupersededCountsAreResetWithTheRestOfTheCountersAtSessionBegin)
+{
+    // resetSwapTelemetry() resets the whole GpuWindowSwapTelemetryCounters struct in one
+    // assignment, so a new field there is reset for free -- pinned so a future refactor that
+    // starts resetting individual fields cannot silently drop this one.
+    const QString source = readRepoFile(QStringLiteral("platform/qt/GpuDisplayWindow.cpp"));
+    ASSERT_TRUE(source.contains(QStringLiteral("win->m_swapTelemetryCounters = GpuWindowSwapTelemetryCounters();")));
+}
+
+TEST(GpuWindowSwapWiring, PlaybackSmokeSummaryLineIncludesSupersededCounts)
+{
+    const QString source = readRepoFile(QStringLiteral("platform/qt/MainWindow.cpp"));
+    const int lineAt = source.indexOf(QStringLiteral("playback_smoke.gpu_window_swaps"));
+    ASSERT_TRUE(lineAt >= 0);
+    ASSERT_TRUE(source.contains(QStringLiteral("superseded_before_paint=%15")));
+    ASSERT_TRUE(source.contains(
+        QStringLiteral(".arg( static_cast<qulonglong>( swapSnapshot.summary.supersededCount ) )")));
+    ASSERT_TRUE(source.contains(
+        QStringLiteral(".arg( static_cast<qulonglong>( swapSnapshot.summary.lastSupersededSerial ) )")));
+    ASSERT_TRUE(source.contains(
+        QStringLiteral(".arg( static_cast<qulonglong>( swapSnapshot.summary.lastSupersededBySerial ) )")));
+}
+
