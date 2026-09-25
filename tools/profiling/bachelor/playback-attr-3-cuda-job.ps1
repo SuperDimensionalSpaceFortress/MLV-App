@@ -691,6 +691,7 @@ $ContactSheetEnabled = __CONTACT_SHEET_ENABLED__
 $ContactSheetFrameCount = __CONTACT_SHEET_FRAME_COUNT__
 $ContactSheetComposerPyBase64 = '__CONTACT_SHEET_COMPOSER_PY_BASE64__'
 $ContactSheetComposerSha256 = '__CONTACT_SHEET_COMPOSER_SHA256__'
+$TelemetryArm = '__TELEMETRY_ARM__'
 $Root = '__AGENT_ROOT__'
 $Cache = Join-Path $Root 'cache'
 $Stamp = Get-Date -Format 'yyyyMMdd-HHmmss'
@@ -973,7 +974,7 @@ function Get-MeasuredSmokeSessionId([string]$RawLog) {
     throw 'no playback_smoke.summary line found in the MLVApp log'
 }
 
-function Get-FrameRows([string]$RawLog, [string]$MeasuredSessionId) {
+function Get-FrameRows([string]$RawLog, [string]$MeasuredSessionId, [switch]$AllowFewRows) {
     $rows = [System.Collections.Generic.List[object]]::new()
     $keys = @(
         'prep_region_setup_ms', 'prep_region_gpu_ms', 'prep_region_image_ms',
@@ -1003,7 +1004,18 @@ function Get-FrameRows([string]$RawLog, [string]$MeasuredSessionId) {
             [void]$rows.Add([pscustomobject]$row)
         }
     }
-    if ($rows.Count -lt 10) { throw "only $($rows.Count) high-resolution frame rows; require >=10" }
+    # CUDA-PLAYBACK-PRESENT-CADENCE-1 round 2: the LIGHT telemetry arm sets
+    # MLVAPP_PLAYBACK_SMOKE_TELEMETRY_DISABLE_FRAME_LOG=1, which deliberately suppresses the
+    # source of these rows (platform/qt/MainWindow.cpp's playback_smoke.frame line) in exchange
+    # for far less GUI-thread log I/O during the very measurement this round exists to take. Zero
+    # rows is therefore EXPECTED and not a defect for that arm -- $AllowFewRows lets the caller
+    # say so explicitly, rather than this function guessing from an env var of its own. $rows is
+    # never used for this job's own pass/fail gating (that comes from playback_smoke.gpu_summary
+    # and PresentMon, both unconditional one-shot lines) -- only for the optional prep_region_*
+    # percentile stats and probe-timeline.csv, both empty for a LIGHT leg by design.
+    if ($rows.Count -lt 10 -and -not $AllowFewRows) {
+        throw "only $($rows.Count) high-resolution frame rows; require >=10"
+    }
     return @($rows)
 }
 
@@ -1614,7 +1626,7 @@ try {
 $logPath = $runLog.path
 $rawLog = [IO.File]::ReadAllText($logPath)
 $measuredSmokeSessionId = Get-MeasuredSmokeSessionId $rawLog
-$rows = Get-FrameRows $rawLog $measuredSmokeSessionId
+$rows = Get-FrameRows $rawLog $measuredSmokeSessionId -AllowFewRows:($TelemetryArm -eq 'LIGHT')
 $rows | Export-Csv -LiteralPath (Join-Path $legOut 'probe-timeline.csv') -NoTypeInformation
 
 # CUDA-PERF-DISPLAY-IDENTITY-HARNESS-1/2: publish the smoke artifacts BEFORE any PresentMon
@@ -2241,6 +2253,7 @@ $text = Expand-AttrCudaTemplate -Template $template -Tokens ([ordered]@{
     CONTACT_SHEET_FRAME_COUNT = $contactSheetFrameCountLiteral
     CONTACT_SHEET_COMPOSER_PY_BASE64 = $contactSheetComposerPyBase64
     CONTACT_SHEET_COMPOSER_SHA256 = $contactSheetComposerSha256ForTemplate
+    TELEMETRY_ARM = $TelemetryArm
     EMBEDDED_FUNCTIONS = $embeddedFunctions
 })
 
