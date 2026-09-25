@@ -1510,6 +1510,12 @@ bool GpuDisplayViewport::setPresentedGpuPlaybackReconAmazePostWbTexture(
 
     setPresentationOptions(options);
     updateProcessingTexturesIfNeeded();
+    // CUDA-PLAYBACK-LOOK-PARITY-1: refresh the per-frame shadows/highlights blur
+    // texture every present call, same as GpuDisplayWindow -- its content changes
+    // every frame, unlike the signature-cached LUTs above. A miss is a soft
+    // degrade (previewApplyShadowsHighlights bound false for this frame).
+    gpuPreviewProcessingUpdateShadowsHighlightsBlurTexture(
+        m_lutSet, previewProcessing, width, height );
 
     // FAIL CLOSED (GPU-TEXNR-S1-DARK-GREEN-1 round 3, sol major): the options-usable
     // check above only proves the LUT *source bytes* were big enough to attempt an

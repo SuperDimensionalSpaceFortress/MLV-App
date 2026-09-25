@@ -1337,6 +1337,9 @@ QByteArray gpuPreviewProcessingDisplayFragmentShaderSource(void)
         "uniform sampler2D matrixLutG;\n"
         "uniform sampler2D matrixLutB;\n"
         "uniform sampler2D gammaLut;\n"
+        "uniform sampler2D inLoopContrastCurve;\n"
+        "uniform sampler2D shadowsHighlightsBlurTexture;\n"
+        "uniform sampler2D shadowsHighlightsCurve;\n"
         "uniform vec2 textureSize;\n"
         "uniform int frameTextureMode;\n"
         "uniform int samplingMode;\n"
@@ -1350,6 +1353,11 @@ QByteArray gpuPreviewProcessingDisplayFragmentShaderSource(void)
         "uniform vec3 previewProperWbRow1;\n"
         "uniform vec3 previewProperWbRow2;\n"
         "uniform vec3 previewRgbToY;\n"
+        "uniform float previewApplyInLoopContrast;\n"
+        "uniform float previewApplyShadowsHighlights;\n"
+        "uniform float previewShadowsHighlightsCurveIndexMask;\n"
+        "uniform float previewApplyVibrance;\n"
+        "uniform float previewVibrance;\n"
         "varying vec2 vTexCoord;\n"
         "float cubicWeight(float x)\n"
         "{\n"
@@ -1454,6 +1462,18 @@ QByteArray gpuPreviewProcessingDisplayFragmentShaderSource(void)
         "    vec2 uv = (vec2(x, y) + vec2(0.5)) / vec2(256.0, 256.0);\n"
         "    return texture2D(lut, uv).r;\n"
         "}\n"
+        "float sampleContrastCurve(sampler2D curve, float idx)\n"
+        "{\n"
+        "    float i = clamp(idx, 0.0, 65535.0);\n"
+        "    float x = mod(i, 256.0);\n"
+        "    float y = floor(i / 256.0);\n"
+        "    vec2 uv = (vec2(x, y) + vec2(0.5)) / vec2(256.0, 256.0);\n"
+        "    return texture2D(curve, uv).r;\n"
+        "}\n"
+        "vec3 truncToZero(vec3 v)\n"
+        "{\n"
+        "    return sign(v) * floor(abs(v));\n"
+        "}\n"
         "float reinhardTonemap(float x)\n"
         "{\n"
         "    return (x < 0.0) ? x : x / (1.0 + x);\n"
@@ -1474,6 +1494,39 @@ QByteArray gpuPreviewProcessingDisplayFragmentShaderSource(void)
         "    }\n"
         "    vec3 leveled = vec3(sampleU16Lut(levelsLut, color.r), sampleU16Lut(levelsLut, color.g), sampleU16Lut(levelsLut, color.b));\n"
         "    vec3 matrixApplied = vec3(sampleU16Lut(matrixLutR, leveled.r), sampleU16Lut(matrixLutG, leveled.g), sampleU16Lut(matrixLutB, leveled.b));\n"
+        "    float shadowsHighlightsF = 1.0;\n"
+        "    if (previewApplyShadowsHighlights > 0.5)\n"
+        "    {\n"
+        /* CUDA-PLAYBACK-LOOK-PARITY-1: this display shader's vTexCoord is NOT
+         * y-flipped for the already-debayered recon texture (frameTextureMode
+         * == 0 samples frameTexture at vTexCoord directly, see sampleFrame
+         * above / GpuDisplayWindow's quad comment) -- unlike the subset
+         * shader's `1.0 - vTexCoord.y` convention. The blur texture is
+         * uploaded in the same row-major raster order as the recon frame
+         * data it was computed from, so it is sampled the same (unflipped)
+         * way here to stay pixel-aligned with the frame this shader samples. */
+        "        vec2 shfc = vTexCoord * textureSize;\n"
+        "        vec3 shBlur = floor(texture2D(shadowsHighlightsBlurTexture, (floor(shfc) + vec2(0.5)) / textureSize).rgb * 65535.0 + 0.5);\n"
+        "        float shBval = shBlur.r;\n"
+        "        if (previewShadowsHighlightsCurveIndexMask <= 0.5)\n"
+        "        {\n"
+        "            float shR = floor(sampleU16Lut(matrixLutR, shBlur.r / 65535.0) * 65535.0 + 0.5);\n"
+        "            float shG = floor(sampleU16Lut(matrixLutG, shBlur.g / 65535.0) * 65535.0 + 0.5);\n"
+        "            float shB = floor(sampleU16Lut(matrixLutB, shBlur.b / 65535.0) * 65535.0 + 0.5);\n"
+        "            shBval = floor((shR * 4.0 + shG * 11.0 + shB) / 16.0);\n"
+        "        }\n"
+        "        shadowsHighlightsF = sampleContrastCurve(shadowsHighlightsCurve, shBval);\n"
+        "    }\n"
+        "    if (previewApplyInLoopContrast > 0.5)\n"
+        "    {\n"
+        "        vec3 m16 = floor(matrixApplied * 65535.0 + 0.5);\n"
+        "        float cval = floor((m16.r * 4.0 + m16.g * 11.0 + m16.b) / 16.0);\n"
+        "        matrixApplied *= sampleContrastCurve(inLoopContrastCurve, cval);\n"
+        "    }\n"
+        "    if (previewApplyShadowsHighlights > 0.5)\n"
+        "    {\n"
+        "        matrixApplied *= shadowsHighlightsF;\n"
+        "    }\n"
         "    if (previewUseCameraMatrix > 0.5)\n"
         "    {\n"
         "        vec3 wbApplied = vec3(dot(previewProperWbRow0, matrixApplied), dot(previewProperWbRow1, matrixApplied), dot(previewProperWbRow2, matrixApplied));\n"
@@ -1496,7 +1549,27 @@ QByteArray gpuPreviewProcessingDisplayFragmentShaderSource(void)
         "        matrixApplied = wbApplied;\n"
         "    }\n"
         "    matrixApplied = clamp(matrixApplied, 0.0, 1.0);\n"
-        "    return vec3(sampleU16Lut(gammaLut, matrixApplied.r), sampleU16Lut(gammaLut, matrixApplied.g), sampleU16Lut(gammaLut, matrixApplied.b));\n"
+        "    vec3 result = vec3(sampleU16Lut(gammaLut, matrixApplied.r), sampleU16Lut(gammaLut, matrixApplied.g), sampleU16Lut(gammaLut, matrixApplied.b));\n"
+        "    if (previewApplyVibrance > 0.5)\n"
+        "    {\n"
+        "        vec3 vv = result * 65535.0;\n"
+        "        float vibY = floor((vv.r * 4.0 + vv.g * 11.0 + vv.b) / 16.0);\n"
+        "        vec3 vpix0 = truncToZero((vv - vec3(vibY)) * previewVibrance) + vec3(vibY);\n"
+        "        if (previewVibrance > 1.0)\n"
+        "        {\n"
+        "            float vbig = max(max(vv.r, vv.g), vv.b);\n"
+        "            float vsmall = min(min(vv.r, vv.g), vv.b);\n"
+        "            float vs = (vbig > 0.0) ? (vbig - vsmall) / vbig : 0.0;\n"
+        "            vs = 2.0 * vs / (vs * vs + 1.0);\n"
+        "            vs = min(vs, 1.0);\n"
+        "            result = clamp(vv * vs + vpix0 * (1.0 - vs), 0.0, 65535.0) / 65535.0;\n"
+        "        }\n"
+        "        else\n"
+        "        {\n"
+        "            result = clamp(vpix0, 0.0, 65535.0) / 65535.0;\n"
+        "        }\n"
+        "    }\n"
+        "    return result;\n"
         "}\n"
         "vec4 applyDisplayProcessing(vec4 color)\n"
         "{\n"
@@ -2074,13 +2147,25 @@ void gpuPreviewProcessingDestroyLutTextureSet(GpuPreviewProcessingLutTextureSet 
     delete set.matrixG;
     delete set.matrixB;
     delete set.gamma;
+    delete set.contrastCurve;
+    delete set.shadowsHighlightsCurve;
     set.levels = nullptr;
     set.matrixR = nullptr;
     set.matrixG = nullptr;
     set.matrixB = nullptr;
     set.gamma = nullptr;
+    set.contrastCurve = nullptr;
+    set.shadowsHighlightsCurve = nullptr;
     set.signature = 0;
     set.signatureValid = false;
+    /* The blur texture is per-frame content, tracked independently of
+     * signature -- destroyed here too since the whole set (and its GL
+     * context ownership) is going away. */
+    delete set.shadowsHighlightsBlur;
+    set.shadowsHighlightsBlur = nullptr;
+    set.shadowsHighlightsBlurWidth = 0;
+    set.shadowsHighlightsBlurHeight = 0;
+    set.shadowsHighlightsBlurReady = false;
 }
 
 void gpuPreviewProcessingUpdateLutTextureSet(GpuPreviewProcessingLutTextureSet & set,
@@ -2093,7 +2178,8 @@ void gpuPreviewProcessingUpdateLutTextureSet(GpuPreviewProcessingLutTextureSet &
     }
     if ( set.signatureValid
       && set.signature == config.signature
-      && set.levels && set.matrixR && set.matrixG && set.matrixB && set.gamma )
+      && set.levels && set.matrixR && set.matrixG && set.matrixB && set.gamma
+      && set.contrastCurve && set.shadowsHighlightsCurve )
     {
         return;
     }
@@ -2112,19 +2198,35 @@ void gpuPreviewProcessingUpdateLutTextureSet(GpuPreviewProcessingLutTextureSet &
     const QByteArray matrixGBytes = gpuPreviewProcessingPackLookupTextureRgba16(config.matrixLutG);
     const QByteArray matrixBBytes = gpuPreviewProcessingPackLookupTextureRgba16(config.matrixLutB);
     const QByteArray gammaBytes = gpuPreviewProcessingPackLookupTextureRgba16(config.gammaLut);
+    /* Neutral (all-1.0 / all-0.0-with-index-mask-off) curves when the
+     * corresponding stage is off, matching packContrastCurveR32F's own
+     * neutral-fill behavior in the subset offscreen path, so the shader's
+     * previewApplyInLoopContrast/previewApplyShadowsHighlights gate -- not
+     * stale curve content -- is what actually decides whether these stages
+     * do anything. */
+    const QByteArray contrastCurveBytes = packContrastCurveR32F(
+        config.applyInLoopContrast ? config.inLoopContrastCurve : QByteArray());
+    const QByteArray shadowsHighlightsCurveBytes = packContrastCurveR32F(
+        config.applyShadowsHighlights ? config.shadowsHighlightsCurve : QByteArray());
 
     set.levels = gpuPreviewProcessingCreateOrResizeLookupTexture(set.levels, kLutTextureEdge, kLutTextureEdge);
     set.matrixR = gpuPreviewProcessingCreateOrResizeLookupTexture(set.matrixR, kLutTextureEdge, kLutTextureEdge);
     set.matrixG = gpuPreviewProcessingCreateOrResizeLookupTexture(set.matrixG, kLutTextureEdge, kLutTextureEdge);
     set.matrixB = gpuPreviewProcessingCreateOrResizeLookupTexture(set.matrixB, kLutTextureEdge, kLutTextureEdge);
     set.gamma = gpuPreviewProcessingCreateOrResizeLookupTexture(set.gamma, kLutTextureEdge, kLutTextureEdge);
+    delete set.contrastCurve;
+    set.contrastCurve = createContrastCurveTexture();
+    delete set.shadowsHighlightsCurve;
+    set.shadowsHighlightsCurve = createContrastCurveTexture();
 
     // FAIL CLOSED (GPU-TEXNR-S1-DARK-GREEN-1 round 2): a real GL allocation failure
     // (lost/recreated context, out of memory) now surfaces as a null member above
     // instead of a stale/half-built set silently being stamped ready. Destroy
     // whatever did get created and leave signatureValid false so the next call
     // retries from scratch rather than presenting with a subset of LUTs bound.
-    if ( !set.levels || !set.matrixR || !set.matrixG || !set.matrixB || !set.gamma )
+    if ( !set.levels || !set.matrixR || !set.matrixG || !set.matrixB || !set.gamma
+      || !previewProcessingTextureIsReady(set.contrastCurve)
+      || !previewProcessingTextureIsReady(set.shadowsHighlightsCurve) )
     {
         gpuPreviewProcessingDestroyLutTextureSet(set);
         return;
@@ -2167,6 +2269,8 @@ void gpuPreviewProcessingUpdateLutTextureSet(GpuPreviewProcessingLutTextureSet &
     set.matrixG->setData(QOpenGLTexture::RGBA, QOpenGLTexture::UInt16, matrixGBytes.constData());
     set.matrixB->setData(QOpenGLTexture::RGBA, QOpenGLTexture::UInt16, matrixBBytes.constData());
     set.gamma->setData(QOpenGLTexture::RGBA, QOpenGLTexture::UInt16, gammaBytes.constData());
+    set.contrastCurve->setData(QOpenGLTexture::Red, QOpenGLTexture::Float32, contrastCurveBytes.constData());
+    set.shadowsHighlightsCurve->setData(QOpenGLTexture::Red, QOpenGLTexture::Float32, shadowsHighlightsCurveBytes.constData());
 
     const GLenum uploadError = gl ? gl->glGetError() : GL_NO_ERROR;
     if ( !gl || uploadError != GL_NO_ERROR )
@@ -2198,6 +2302,81 @@ bool gpuPreviewProcessingReconTexturePresentationRefused(
     const GpuPreviewProcessingConfig & config)
 {
     return presentingReconTexture && !gpuPreviewProcessingLutTextureSetReady(set, config);
+}
+
+bool gpuPreviewProcessingUpdateShadowsHighlightsBlurTexture(
+    GpuPreviewProcessingLutTextureSet & set,
+    const GpuPreviewProcessingConfig & config,
+    int width,
+    int height)
+{
+    if ( !config.enabled || !config.applyShadowsHighlights || width <= 0 || height <= 0
+      || !gpuPreviewProcessingHasShadowsHighlightsFrameState(config, width, height) )
+    {
+        set.shadowsHighlightsBlurReady = false;
+        return false;
+    }
+
+    auto failClosed = [&]() -> bool
+    {
+        delete set.shadowsHighlightsBlur;
+        set.shadowsHighlightsBlur = nullptr;
+        set.shadowsHighlightsBlurWidth = 0;
+        set.shadowsHighlightsBlurHeight = 0;
+        set.shadowsHighlightsBlurReady = false;
+        return false;
+    };
+
+    if ( !set.shadowsHighlightsBlur
+      || !set.shadowsHighlightsBlur->isCreated()
+      || set.shadowsHighlightsBlurWidth != width
+      || set.shadowsHighlightsBlurHeight != height )
+    {
+        delete set.shadowsHighlightsBlur;
+        set.shadowsHighlightsBlur = createFrameTexture(width, height);
+        set.shadowsHighlightsBlurWidth = width;
+        set.shadowsHighlightsBlurHeight = height;
+    }
+    if ( !previewProcessingTextureIsReady(set.shadowsHighlightsBlur) )
+    {
+        return failClosed();
+    }
+
+    const QByteArray packed = packRgb16Texture(
+        reinterpret_cast<const uint16_t *>(config.shadowsHighlightsBlur.constData()),
+        width * height);
+
+    // Same FAIL CLOSED discipline as gpuPreviewProcessingUpdateLutTextureSet
+    // (GPU-TEXNR-S1-DARK-GREEN-1): drain any stale GL error before the upload
+    // so it is never misattributed, then confirm the upload actually
+    // succeeded rather than trusting setData()'s void return.
+    QOpenGLContext * currentContext = QOpenGLContext::currentContext();
+    QOpenGLFunctions * gl = currentContext ? currentContext->functions() : nullptr;
+    if ( gl )
+    {
+        constexpr GLenum kGlContextLost = 0x0507;
+        int drainIterations = 0;
+        GLenum drainedError = GL_NO_ERROR;
+        while ( drainIterations < 16 && (drainedError = gl->glGetError()) != GL_NO_ERROR )
+        {
+            if ( drainedError == kGlContextLost )
+            {
+                return failClosed();
+            }
+            ++drainIterations;
+        }
+    }
+
+    set.shadowsHighlightsBlur->setData(QOpenGLTexture::RGBA, QOpenGLTexture::UInt16, packed.constData());
+
+    const GLenum uploadError = gl ? gl->glGetError() : GL_NO_ERROR;
+    if ( !gl || uploadError != GL_NO_ERROR )
+    {
+        return failClosed();
+    }
+
+    set.shadowsHighlightsBlurReady = true;
+    return true;
 }
 
 void gpuPreviewProcessingBindDisplayUniformsAndTextures(
@@ -2252,6 +2431,42 @@ void gpuPreviewProcessingBindDisplayUniformsAndTextures(
         program->setUniformValue("gammaLut", 5);
         lutSet.gamma->bind(5);
     }
+
+    // CUDA-PLAYBACK-LOOK-PARITY-1: contrast+pivot and shadows/highlights.
+    // Each stage's previewApply* gate is bound false whenever its own
+    // texture is not ready (independently of the core 5 LUTs via lutsReady),
+    // so a contrast-curve or blur-upload failure disables just that one
+    // look-parity stage rather than refusing the whole recon presentation --
+    // the caller is expected to record the drop via telemetry (round-1 v2.1:
+    // no silent drop).
+    const bool contrastReady = lutsReady && previewProcessingTextureIsReady(lutSet.contrastCurve);
+    program->setUniformValue("previewApplyInLoopContrast",
+                             (contrastReady && config.applyInLoopContrast) ? 1.0f : 0.0f);
+    if ( contrastReady )
+    {
+        program->setUniformValue("inLoopContrastCurve", 6);
+        lutSet.contrastCurve->bind(6);
+    }
+
+    const bool shadowsHighlightsReady =
+        lutsReady
+        && previewProcessingTextureIsReady(lutSet.shadowsHighlightsCurve)
+        && lutSet.shadowsHighlightsBlurReady
+        && previewProcessingTextureIsReady(lutSet.shadowsHighlightsBlur);
+    program->setUniformValue("previewApplyShadowsHighlights",
+                             (shadowsHighlightsReady && config.applyShadowsHighlights) ? 1.0f : 0.0f);
+    program->setUniformValue("previewShadowsHighlightsCurveIndexMask",
+                             config.shadowsHighlightsCurveIndexMask ? 1.0f : 0.0f);
+    if ( shadowsHighlightsReady )
+    {
+        program->setUniformValue("shadowsHighlightsCurve", 7);
+        lutSet.shadowsHighlightsCurve->bind(7);
+        program->setUniformValue("shadowsHighlightsBlurTexture", 8);
+        lutSet.shadowsHighlightsBlur->bind(8);
+    }
+
+    program->setUniformValue("previewApplyVibrance", config.applyVibrance ? 1.0f : 0.0f);
+    program->setUniformValue("previewVibrance", config.vibrance);
 }
 
 void gpuPreviewProcessingReleaseDisplayTextures(const GpuPreviewProcessingLutTextureSet & lutSet,
@@ -2262,6 +2477,18 @@ void gpuPreviewProcessingReleaseDisplayTextures(const GpuPreviewProcessingLutTex
     if ( lutsReady && lutSet.matrixG ) lutSet.matrixG->release();
     if ( lutsReady && lutSet.matrixB ) lutSet.matrixB->release();
     if ( lutsReady && lutSet.gamma ) lutSet.gamma->release();
+    if ( lutsReady && previewProcessingTextureIsReady(lutSet.contrastCurve) )
+    {
+        lutSet.contrastCurve->release();
+    }
+    if ( lutsReady
+      && previewProcessingTextureIsReady(lutSet.shadowsHighlightsCurve)
+      && lutSet.shadowsHighlightsBlurReady
+      && previewProcessingTextureIsReady(lutSet.shadowsHighlightsBlur) )
+    {
+        lutSet.shadowsHighlightsCurve->release();
+        lutSet.shadowsHighlightsBlur->release();
+    }
 }
 
 bool gpuPreviewProcessingRendererIsSoftware(const QString & rendererDescription)
@@ -2749,11 +2976,15 @@ bool gpuPreviewProcessingNeedsShadowsHighlightsFrameState(
 bool gpuPreviewProcessingDisplayShaderUsesShadowsHighlightsFrameState(
     const GpuPreviewProcessingConfig & config)
 {
-    /* The live display shader currently applies only the display LUT family
-     * (levels, matrix/WB, gamma). Spatial S/H frame-state is consumed by the
-     * offscreen/subset shader, not by display presentation. */
-    Q_UNUSED(config);
-    return false;
+    /* CUDA-PLAYBACK-LOOK-PARITY-1: the live display shader now also applies
+     * shadows/highlights (gpuPreviewProcessingDisplayFragmentShaderSource's
+     * shadowsHighlightsBlurTexture/shadowsHighlightsCurve branch), consuming
+     * the same per-frame blur frame-state as the offscreen/subset shader via
+     * gpuPreviewProcessingUpdateShadowsHighlightsBlurTexture. This is what
+     * gates RenderFrameThread's gpuTexNrDisplayLutOnlyShStateBypass -- true
+     * here means the fast S/H frame-state refresh actually runs and its
+     * result reaches the presenter instead of being silently skipped. */
+    return config.enabled && config.applyShadowsHighlights;
 }
 
 bool gpuPreviewProcessingHasShadowsHighlightsFrameState(
@@ -2937,6 +3168,168 @@ static bool applySharpenPostPassGpu(uint16_t * img, int width, int height,
 static bool applyMedianPostPassGpu(uint16_t * img, int width, int height,
                                    int window, int strength,
                                    QString * reason, QString * rendererDescription);
+
+/* CUDA-PLAYBACK-LOOK-PARITY-1: offscreen GPU render through the shared
+ * production DISPLAY shader/binding path (gpuPreviewProcessingEnsureDisplayProgram
+ * + gpuPreviewProcessingUpdateLutTextureSet + gpuPreviewProcessingUpdateShadowsHighlightsBlurTexture
+ * + gpuPreviewProcessingBindDisplayUniformsAndTextures), the exact functions
+ * GpuDisplayWindow/GpuDisplayViewport call every paint for the live CUDA
+ * texture-present fast path -- a parity test through this function exercises
+ * the real binding code, not a re-derived copy of it. inputRgb16 is the
+ * already-debayered "post-WB-undo" frame (frameTextureMode = 0), matching
+ * what that live path presents.
+ *
+ * Uses a quad with screen-top -> texcoord v=0 (GpuDisplayWindow::paintGL's own
+ * `verts`), NOT the generic kQuadVertices the subset offscreen helper below
+ * uses (screen-top -> v=1, compensated by that shader's own in-GLSL
+ * `1.0 - vTexCoord.y` flip). The display shader does NOT flip in-GLSL
+ * (frameTextureMode==0 samples frameTexture at vTexCoord directly, matching
+ * production), so this function's quad must supply the flip instead, or a
+ * readback compared row-for-row against the CPU reference would come out
+ * upside down for a reason that has nothing to do with shader correctness. */
+bool gpuPreviewProcessingApplyDisplayGpuOffscreen(const GpuPreviewProcessingConfig & config,
+                                                  const uint16_t * inputRgb16,
+                                                  uint16_t * outputRgb16,
+                                                  int width,
+                                                  int height,
+                                                  QString * reason,
+                                                  QString * rendererDescription)
+{
+    static constexpr GLfloat kDisplayQuadVertices[16] = {
+        -1.0f,  1.0f, 0.0f, 0.0f,
+         1.0f,  1.0f, 1.0f, 0.0f,
+        -1.0f, -1.0f, 0.0f, 1.0f,
+         1.0f, -1.0f, 1.0f, 1.0f,
+    };
+
+    auto fail = [&](const QString & why) -> bool
+    {
+        if ( reason ) *reason = why;
+        return false;
+    };
+
+    if ( !inputRgb16 || !outputRgb16 || width <= 0 || height <= 0 )
+    {
+        return fail(QStringLiteral(
+            "display preview-processing GPU offscreen input/output buffers are invalid"));
+    }
+
+    if ( !config.enabled )
+    {
+        const int pixelCount = width * height;
+        if ( inputRgb16 != outputRgb16 )
+        {
+            std::memcpy(outputRgb16, inputRgb16,
+                        static_cast<size_t>(pixelCount) * 3u * sizeof(uint16_t));
+        }
+        if ( reason ) reason->clear();
+        return true;
+    }
+
+    QOffscreenSurface surface;
+    QOpenGLContext context;
+    QOpenGLFunctions * glFunctions = nullptr;
+    if ( !makePreviewProcessingContextCurrent(&surface, &context, &glFunctions,
+                                              reason, rendererDescription) )
+    {
+        return false;
+    }
+
+    QOpenGLFramebufferObjectFormat fboFormat;
+    fboFormat.setAttachment(QOpenGLFramebufferObject::NoAttachment);
+    fboFormat.setTextureTarget(GL_TEXTURE_2D);
+    fboFormat.setInternalTextureFormat(GL_RGBA16);
+    QOpenGLFramebufferObject fbo(width, height, fboFormat);
+    if ( !fbo.isValid() )
+    {
+        context.doneCurrent();
+        return fail(QStringLiteral("offscreen display framebuffer creation failed"));
+    }
+
+    QOpenGLShaderProgram * program = nullptr;
+    if ( !gpuPreviewProcessingEnsureDisplayProgram(program, nullptr) || !program )
+    {
+        context.doneCurrent();
+        return fail(QStringLiteral("offscreen display shader setup failed"));
+    }
+
+    GpuPreviewProcessingLutTextureSet lutSet;
+    gpuPreviewProcessingUpdateLutTextureSet(lutSet, config);
+    const bool lutsReady = gpuPreviewProcessingLutTextureSetReady(lutSet, config);
+    if ( !lutsReady )
+    {
+        gpuPreviewProcessingDestroyLutTextureSet(lutSet);
+        delete program;
+        context.doneCurrent();
+        return fail(QStringLiteral("offscreen display LUT texture upload failed"));
+    }
+    gpuPreviewProcessingUpdateShadowsHighlightsBlurTexture(lutSet, config, width, height);
+
+    QOpenGLTexture * frameTexture = createFrameTexture(width, height);
+    if ( !previewProcessingTextureIsReady(frameTexture) )
+    {
+        delete frameTexture;
+        gpuPreviewProcessingDestroyLutTextureSet(lutSet);
+        delete program;
+        context.doneCurrent();
+        return fail(QStringLiteral("offscreen display frame texture creation failed"));
+    }
+    const QByteArray packedFrame = packRgb16Texture(inputRgb16, width * height);
+    frameTexture->setData(QOpenGLTexture::RGBA, QOpenGLTexture::UInt16, packedFrame.constData());
+
+    if ( !fbo.bind() )
+    {
+        delete frameTexture;
+        gpuPreviewProcessingDestroyLutTextureSet(lutSet);
+        delete program;
+        context.doneCurrent();
+        return fail(QStringLiteral("offscreen display framebuffer bind failed"));
+    }
+    glFunctions->glViewport(0, 0, width, height);
+    glFunctions->glDisable(GL_DEPTH_TEST);
+    glFunctions->glDisable(GL_BLEND);
+    glFunctions->glClearColor(0.0f, 0.0f, 0.0f, 1.0f);
+    glFunctions->glClear(GL_COLOR_BUFFER_BIT);
+
+    program->bind();
+    frameTexture->bind(0);
+    program->setUniformValue("frameTexture", 0);
+
+    GpuPreviewProcessingDisplayUniforms uniforms;
+    uniforms.textureSize = QVector2D(static_cast<float>(width), static_cast<float>(height));
+    uniforms.frameTextureMode = 0;
+    uniforms.samplingMode = 0;
+    uniforms.zebraEnabled = false;
+    gpuPreviewProcessingBindDisplayUniformsAndTextures(program, config, lutSet, uniforms, lutsReady);
+
+    const int posLoc = program->attributeLocation("position");
+    const int texLoc = program->attributeLocation("texCoord");
+    program->enableAttributeArray(posLoc);
+    program->enableAttributeArray(texLoc);
+    program->setAttributeArray(posLoc, GL_FLOAT, kDisplayQuadVertices, 2, 4 * sizeof(GLfloat));
+    program->setAttributeArray(texLoc, GL_FLOAT, kDisplayQuadVertices + 2, 2, 4 * sizeof(GLfloat));
+    glFunctions->glDrawArrays(GL_TRIANGLE_STRIP, 0, 4);
+    glFunctions->glFinish();
+
+    QByteArray readback(static_cast<int>(width * height * 4u * sizeof(uint16_t)), Qt::Uninitialized);
+    glFunctions->glReadPixels(0, 0, width, height, GL_RGBA, GL_UNSIGNED_SHORT, readback.data());
+    unpackRgb16Readback(readback, outputRgb16, width, height);
+
+    program->disableAttributeArray(posLoc);
+    program->disableAttributeArray(texLoc);
+    frameTexture->release();
+    gpuPreviewProcessingReleaseDisplayTextures(lutSet, lutsReady);
+    program->release();
+    fbo.release();
+
+    delete frameTexture;
+    gpuPreviewProcessingDestroyLutTextureSet(lutSet);
+    delete program;
+    context.doneCurrent();
+
+    if ( reason ) reason->clear();
+    return true;
+}
 
 bool gpuPreviewProcessingApplyGpuOffscreen(const GpuPreviewProcessingConfig & config,
                                            const uint16_t * inputRgb16,

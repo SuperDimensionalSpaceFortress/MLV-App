@@ -138,6 +138,18 @@ bool gpuPreviewProcessingApplyGpuOffscreen(const GpuPreviewProcessingConfig & co
                                            int height,
                                            QString * reason = nullptr,
                                            QString * rendererDescription = nullptr);
+/* CUDA-PLAYBACK-LOOK-PARITY-1: same contract as
+ * gpuPreviewProcessingApplyGpuOffscreen, but renders through the DISPLAY
+ * shader (gpuPreviewProcessingDisplayFragmentShaderSource) via the exact
+ * production binding functions GpuDisplayWindow/GpuDisplayViewport use, for
+ * parity tests against the live CUDA texture-present fast path. */
+bool gpuPreviewProcessingApplyDisplayGpuOffscreen(const GpuPreviewProcessingConfig & config,
+                                                  const uint16_t * inputRgb16,
+                                                  uint16_t * outputRgb16,
+                                                  int width,
+                                                  int height,
+                                                  QString * reason = nullptr,
+                                                  QString * rendererDescription = nullptr);
 
 /* Shared shader-program setup + LUT texture set (levels + R/G/B matrix + gamma) for
  * the preview-processing DISPLAY fragment shader
@@ -154,8 +166,22 @@ struct GpuPreviewProcessingLutTextureSet
     QOpenGLTexture * matrixG = nullptr;
     QOpenGLTexture * matrixB = nullptr;
     QOpenGLTexture * gamma = nullptr;
+    /* CUDA-PLAYBACK-LOOK-PARITY-1: contrast+pivot and shadows/highlights curve
+     * LUTs for the live DISPLAY shader. Signature-cached like the five above
+     * (rebuilt only when config.signature changes). */
+    QOpenGLTexture * contrastCurve = nullptr;
+    QOpenGLTexture * shadowsHighlightsCurve = nullptr;
     uint64_t signature = 0;
     bool signatureValid = false;
+    /* The shadows/highlights BLUR texture is per-FRAME content (the spatial
+     * low-pass of the current frame), not per-settings-signature, so it is
+     * tracked and re-uploaded separately every frame by
+     * gpuPreviewProcessingUpdateShadowsHighlightsBlurTexture -- never gated by
+     * `signature`/`signatureValid` above. */
+    QOpenGLTexture * shadowsHighlightsBlur = nullptr;
+    int shadowsHighlightsBlurWidth = 0;
+    int shadowsHighlightsBlurHeight = 0;
+    bool shadowsHighlightsBlurReady = false;
 };
 
 /* Per-presenter display knobs for gpuPreviewProcessingBindDisplayUniformsAndTextures,
@@ -187,6 +213,21 @@ void gpuPreviewProcessingUpdateLutTextureSet(GpuPreviewProcessingLutTextureSet &
                                              const GpuPreviewProcessingConfig & config);
 bool gpuPreviewProcessingLutTextureSetReady(const GpuPreviewProcessingLutTextureSet & set,
                                             const GpuPreviewProcessingConfig & config);
+/* CUDA-PLAYBACK-LOOK-PARITY-1: uploads/refreshes the per-frame shadows/
+ * highlights blur texture (set.shadowsHighlightsBlur) from
+ * config.shadowsHighlightsBlur, sized width x height. Unlike the signature-
+ * cached LUTs above, this runs unconditionally every call when
+ * config.applyShadowsHighlights is true, because the blur content changes
+ * every frame during playback. No-ops (leaves shadowsHighlightsBlurReady
+ * false) when S/H is not requested or the frame-state bytes do not match
+ * width*height*3 uint16 -- the caller then binds previewApplyShadowsHighlights
+ * = 0 for this frame and must record the drop via telemetry (round-1 v2.1
+ * disclosed-open contract: no silent drop). Safe to call every paint. */
+bool gpuPreviewProcessingUpdateShadowsHighlightsBlurTexture(
+    GpuPreviewProcessingLutTextureSet & set,
+    const GpuPreviewProcessingConfig & config,
+    int width,
+    int height);
 /* Single production decision for whether a presenter must refuse to draw a GPU-recon/
  * AMaZE texture (post-WB-undo linear camera RGB) this paint, rather than ever letting it
  * fall through to the shared shader's previewProcessingEnabled=0 passthrough-equivalent
