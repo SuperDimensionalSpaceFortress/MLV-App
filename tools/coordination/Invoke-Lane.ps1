@@ -612,6 +612,7 @@ if ($ReasoningEffort) { $cfg.effort = $ReasoningEffort }
 $RequestedModel = if ($cfg.engine -eq 'claude') { $cfg.model } else { $cfg.tier }
 $PinnedByOverride = [bool]$ModelOverride
 $ResolvedModel = 'unknown'
+$AuxiliaryModels = @()
 
 # ATOMIC SLOT RESERVATION. The previous form was
 #     while (Test-Path <candidate>) { $n++ }
@@ -1251,23 +1252,52 @@ if ($cfg.engine -eq 'claude') {
         if ($j.PSObject.Properties.Name -contains 'num_turns') { $numTurns = [int]$j.num_turns }
         # LANE-MODEL-CURRENCY-1: `--model opus`/`fable`/`sonnet` is a FLOATING ALIAS -- what
         # actually ran is only knowable from the child's own JSON, never assumed from the
-        # alias string. `modelUsage` is an object keyed by the model id the run actually used,
-        # each value carrying its own `canonicalModel`; multiple keys are possible (a fallback
-        # mid-run), so every key's canonicalModel is joined, never just the first. Left as
-        # 'unknown' (never overwritten with the requested alias) when the field is absent or
-        # empty -- a died-before-emitting-JSON run must never claim a model it cannot prove ran.
-        if ($j.PSObject.Properties.Name -contains 'modelUsage' -and $null -ne $j.modelUsage) {
-            $modelUsageNames = @($j.modelUsage.PSObject.Properties.Name)
-            if ($modelUsageNames.Count -gt 0) {
-                $canonicalModels = @($modelUsageNames | ForEach-Object {
-                    $entry = $j.modelUsage.$_
-                    if ($null -ne $entry -and $entry.PSObject.Properties.Name -contains 'canonicalModel' -and $entry.canonicalModel) {
-                        [string]$entry.canonicalModel
+        # alias string. `modelUsage` is AGGREGATE usage: it can carry auxiliary/tool-call
+        # entries (e.g. a haiku sub-call) alongside the lane's own model, and sol's pre-review
+        # proved treating every key as equally authoritative lets an auxiliary model's id (or,
+        # worse, a raw un-proven key) overwrite the lane's real identity. So only the entry
+        # whose canonicalModel belongs to the REQUESTED ALIAS'S FAMILY (a canonicalModel of the
+        # form `claude-<alias>-...`, e.g. `claude-sonnet-5` for alias 'sonnet') is ever recorded
+        # as resolvedModel; every other entry is aggregated separately into auxiliaryModels,
+        # never into resolvedModel. resolvedModel stays 'unknown' (never a raw modelUsage key,
+        # never the requested alias copied over) when no entry of that family is present or the
+        # matching entry has no canonicalModel -- a died-before-emitting-JSON run, or a run that
+        # silently fell back to a different family entirely, must never claim a model it cannot
+        # prove ran as the requested one.
+        # Property-existence checks below use the `.PSObject.Properties[name]` INDEXER, never
+        # `.PSObject.Properties.Name -contains name` -- under this file's own `Set-StrictMode
+        # -Version Latest` (line 127), PowerShell's multi-value member enumeration over an
+        # EMPTY PSMemberInfoCollection throws "The property 'Name' cannot be found on this
+        # object" instead of returning an empty list. A modelUsage entry commonly IS an empty
+        # JSON object (`{}`, no canonicalModel yet recorded), so that idiom would silently
+        # abort this entire try block via the catch below, discarding costUsd/numTurns/result
+        # along with the model identity -- a strictly worse failure than the one this fix
+        # exists to close. The indexer form returns $null for a missing property on any
+        # collection, empty or not, so it is safe unconditionally.
+        $modelUsageProp = $j.PSObject.Properties['modelUsage']
+        if ($null -ne $modelUsageProp -and $null -ne $modelUsageProp.Value) {
+            $modelUsageProps = @($modelUsageProp.Value.PSObject.Properties)
+            if ($modelUsageProps.Count -gt 0) {
+                $modelUsageNames = @($modelUsageProps.Name)
+                $familyPattern = '^claude-' + [regex]::Escape($RequestedModel) + '-'
+                $familyCanonicals = @()
+                $auxiliaryEntries = @()
+                foreach ($name in $modelUsageNames) {
+                    $entry = $modelUsageProp.Value.$name
+                    $canonicalProp = if ($null -ne $entry) { $entry.PSObject.Properties['canonicalModel'] } else { $null }
+                    $canonical = $null
+                    if ($null -ne $canonicalProp -and $canonicalProp.Value) { $canonical = [string]$canonicalProp.Value }
+                    if ($canonical -and ($canonical -match $familyPattern)) {
+                        $familyCanonicals += $canonical
+                    } elseif ($canonical) {
+                        $auxiliaryEntries += $canonical
                     } else {
-                        $_
+                        $auxiliaryEntries += $name
                     }
-                } | Select-Object -Unique)
-                if ($canonicalModels.Count -gt 0) { $ResolvedModel = ($canonicalModels -join ',') }
+                }
+                $familyCanonicals = @($familyCanonicals | Select-Object -Unique)
+                if ($familyCanonicals.Count -gt 0) { $ResolvedModel = ($familyCanonicals -join ',') }
+                $AuxiliaryModels = @($auxiliaryEntries | Select-Object -Unique)
             }
         }
         if ($j.PSObject.Properties.Name -contains 'usage' -and $null -ne $j.usage) {
@@ -1599,11 +1629,15 @@ $receipt = [ordered]@{
     role         = $cfg.role
     engine       = $cfg.engine
     # LANE-MODEL-CURRENCY-1: requestedModel is the table's alias/tier (the lane's
-    # identity); resolvedModel is what actually ran -- a codex tier's resolved slug, or a
-    # claude alias's canonicalModel(s) as its own JSON output reported them -- and stays
-    # 'unknown' (never the requested string copied over) when that cannot be determined.
+    # identity); resolvedModel is what actually ran -- a codex tier's resolved slug, or,
+    # for a claude lane, the canonicalModel(s) of the modelUsage entry matching the
+    # requested alias's family -- and stays 'unknown' (never the requested string copied
+    # over, never a raw modelUsage key) when that cannot be determined. auxiliaryModels
+    # carries every OTHER modelUsage entry (auxiliary/tool-call models, e.g. haiku) that
+    # was seen but never counted as the lane's own identity.
     requestedModel   = $RequestedModel
     resolvedModel    = $ResolvedModel
+    auxiliaryModels  = $AuxiliaryModels
     pinnedByOverride = $PinnedByOverride
     effort       = $cfg.effort
     card         = $Card

@@ -39,7 +39,7 @@ def resolve(tier, cache_path):
     try:
         with open(cache_path, "r", encoding="utf-8") as handle:
             data = json.load(handle)
-    except (OSError, json.JSONDecodeError) as exc:
+    except (OSError, json.JSONDecodeError, UnicodeDecodeError) as exc:
         return None, "cache-unreadable:%s" % exc
     models = data.get("models") if isinstance(data, dict) else None
     if not isinstance(models, list):

@@ -57,8 +57,9 @@ LANE-MODEL-CURRENCY-1's.
 
 - The hub dispatches; it does not do. A coordinator's own mutations are receipted like a lane's.
 - Fallback: a Fable usage-limit refusal routes the same prompt to Opus high. The runner's refusal
-  classifier detects the limit; the automatic re-route is packet LANE-FALLBACK-1 (add `max` to the
-  effort set and a fallback map beside the lane table in `tools/coordination/Invoke-Lane.ps1`).
+  classifier detects the limit; the automatic re-route is packet LANE-FALLBACK-1 (a fallback map
+  beside the lane table in `tools/coordination/Invoke-Lane.ps1`, every row staying at `high` effort
+  per LANE-MODEL-CURRENCY-1 -- never `max`/`xhigh`).
 - Cross-family review is preferred, and required only for guard, merge, commit and
   ratification-path changes. The normative list of those paths is the hook's own fixed set,
   `CONTROL_HASHES_BASE` plus `EXECUTION_CONTROL_HASH_TABLE` in

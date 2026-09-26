@@ -48,6 +48,19 @@ class ResolveCodexTierUnitTests(unittest.TestCase):
         self.assertIsNone(resolved)
         self.assertTrue(error.startswith("cache-unreadable:"))
 
+    # sol pre-review (LANE-MODEL-CURRENCY-1 round 1a): a mocked open() raising
+    # UnicodeDecodeError escaped resolve() because only OSError and json.JSONDecodeError
+    # were caught, breaking this function's documented one-typed-error contract. A cache
+    # written with invalid UTF-8 bytes exercises the real decode path (no mock), proving
+    # this fails closed through the same "cache-unreadable:" channel as any other
+    # unreadable cache, instead of raising an uncaught traceback.
+    def test_fails_closed_on_non_utf8_cache(self):
+        cache = Path(self._tmp()) / "models_cache.json"
+        cache.write_bytes(b"\xff\xfe\x00invalid-utf8")
+        resolved, error = resolve_codex_tier.resolve("sol", str(cache))
+        self.assertIsNone(resolved)
+        self.assertTrue(error.startswith("cache-unreadable:"))
+
     def test_fails_closed_on_empty_models_list(self):
         cache = Path(self._tmp()) / "models_cache.json"
         _write_cache(cache, [])
@@ -98,6 +111,18 @@ class ResolveCodexTierCliTests(unittest.TestCase):
         payload = json.loads(result.stdout)
         self.assertFalse(payload["ok"])
         self.assertTrue(payload["error"].startswith("cache-not-found:"))
+
+    def test_cli_fail_closed_exit_nonzero_on_non_utf8_cache(self):
+        cache = Path(self._tmp()) / "models_cache.json"
+        cache.write_bytes(b"\xff\xfe\x00invalid-utf8")
+        result = subprocess.run(
+            [sys.executable, str(SCRIPT), "--tier", "sol", "--cache", str(cache)],
+            capture_output=True, text=True, timeout=15,
+        )
+        self.assertNotEqual(result.returncode, 0)
+        payload = json.loads(result.stdout)
+        self.assertFalse(payload["ok"])
+        self.assertTrue(payload["error"].startswith("cache-unreadable:"))
 
 
 if __name__ == "__main__":

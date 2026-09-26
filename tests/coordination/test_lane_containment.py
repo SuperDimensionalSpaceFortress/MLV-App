@@ -174,7 +174,13 @@ if($env:MLV_FIXTURE_MODE -ne 'normal'){
 $text=[Console]::In.ReadToEnd()
 $text|Set-Content -Encoding utf8NoBOM $env:MLV_FIXTURE_PROMPT
 if($env:MLV_FIXTURE_MODE -ne 'normal'){Start-Sleep -Seconds 60}
+# LANE-MODEL-CURRENCY-1: lets a test substitute the child's own JSON result (e.g. to add a
+# modelUsage block) without touching the fixed default every other test still relies on.
+if($env:MLV_FIXTURE_RESULT_JSON){
+  [Console]::Out.Write((Get-Content -LiteralPath $env:MLV_FIXTURE_RESULT_JSON -Raw))
+} else {
 [Console]::Out.Write('{"type":"result","subtype":"success","is_error":false,"terminal_reason":"completed","result":"fixture-result","total_cost_usd":0,"num_turns":1}')
+}
 [Console]::Error.Write('fixture-err')
 exit 0
 ''',encoding="ascii")
@@ -187,7 +193,7 @@ exit 0
             except Exception: pass
 
 
-def prepare(tree, mode, assignment_failure=False, editing=False, allowed_tools="", lane="sonnet", mutation=None, allow_bulk_reads=False):
+def prepare(tree, mode, assignment_failure=False, editing=False, allowed_tools="", lane="sonnet", mutation=None, allow_bulk_reads=False, result_json=None):
     root=tree["root"]; script=root/"Invoke-Lane.ps1"
     text=CANDIDATE.read_text(encoding="utf-8")
     text=text.replace("$CLAUDE_EXE = Join-Path $env:APPDATA 'npm\\claude.cmd'", "$CLAUDE_EXE = '"+str(tree['shim']).replace("'","''")+"'")
@@ -204,6 +210,8 @@ def prepare(tree, mode, assignment_failure=False, editing=False, allowed_tools="
         rec=root/".claude-state"/"coordination"/"dual-lane"/"receipts"/"0.05-hook-enforced.json"; rec.parent.mkdir(parents=True)
         rec.write_text(json.dumps({"hookSha256":hashlib.sha256(hook.read_bytes()).hexdigest()}),encoding="utf-8")
     run=root/"run"; run.mkdir()
+    if result_json is not None:
+        result_json_path=root/"result.json"; result_json_path.write_text(result_json,encoding="utf-8")
     env=os.environ.copy(); env.update({
       "MLV_BOARD_ROOT":str(root),"MLV_FIXTURE_MODE":mode,
       "MLV_FIXTURE_CHILD":str(root/"child.json"),"MLV_FIXTURE_GRAND":str(root/"grand.json"),
@@ -219,6 +227,8 @@ def prepare(tree, mode, assignment_failure=False, editing=False, allowed_tools="
       # the exec-form hook registration (command=$PYTHON_EXE, args=[hook copy]) has no shell to
       # resolve, classify, or fall back between.
       "MLV_LANE_PYTHON_EXE":sys.executable})
+    if result_json is not None:
+        env["MLV_FIXTURE_RESULT_JSON"]=str(result_json_path)
     cmd=[PWSH,"-NoLogo","-NoProfile","-NonInteractive","-ExecutionPolicy","Bypass","-File",str(script),"-Lane",lane,"-Prompt","fixture prompt","-WorkDir",str(root),"-RunDir",str(run),"-TimeoutSec","3" if mode=="timeout" else "30","-Card","FIXTURE","-ReasoningEffort","low"]
     if editing: cmd += ["-AllowEdits","-AllowedTools",allowed_tools]
     if allow_bulk_reads: cmd += ["-AllowBulkReads"]
@@ -256,6 +266,7 @@ def test_read_only_argv_json_stdin_and_tool_denial(fixture_tree):
     # fixture's child JSON carries no modelUsage field, so nothing proves what actually ran.
     assert q["requestedModel"]=="sonnet"
     assert q["resolvedModel"]=="unknown"
+    assert q["auxiliaryModels"]==[]
     assert q["pinnedByOverride"] is False
     # LANE-NO-BACKGROUND-END-TURN-1 round 2 (hub ruling): NA-3 prohibits assigning ANY
     # CLAUDE_CODE_* variable, so the round-1 CLAUDE_CODE_DISABLE_BACKGROUND_TASKS child-env
@@ -264,6 +275,61 @@ def test_read_only_argv_json_stdin_and_tool_denial(fixture_tree):
     # behavior.
     assert (fixture_tree["root"]/"bgtasks.txt").read_text(encoding="utf-8-sig").strip()==""
     assert "backgroundTasks" not in q["authority"]
+
+
+_RESULT_JSON_PREFIX = '{"type":"result","subtype":"success","is_error":false,"terminal_reason":"completed","result":"fixture-result","total_cost_usd":0,"num_turns":1,"modelUsage":'
+
+
+# LANE-MODEL-CURRENCY-1 round 1b (sol blocker fix): modelUsage is AGGREGATE usage and can
+# carry an auxiliary/tool-call model (e.g. haiku) beside the lane's own model. Only the
+# entry whose canonicalModel belongs to the REQUESTED ALIAS'S FAMILY may ever become
+# resolvedModel; every other entry must land in auxiliaryModels instead, never overwrite
+# or get joined into resolvedModel.
+def test_resolved_model_ignores_an_auxiliary_model_beside_the_lane_model(fixture_tree):
+    result_json = _RESULT_JSON_PREFIX + json.dumps({
+        "claude-haiku-4-5-20251001": {"canonicalModel": "claude-haiku-4-5-20251001"},
+        "sonnet": {"canonicalModel": "claude-sonnet-5"},
+    }) + "}"
+    cmd,env,receipt=prepare(fixture_tree,"normal",result_json=result_json)
+    r=subprocess.run(cmd,env=env,text=True,capture_output=True,timeout=20)
+    assert r.returncode==0,(r.stdout,r.stderr)
+    q=json.loads(receipt.read_text(encoding="utf-8"))
+    assert q["requestedModel"]=="sonnet"
+    assert q["resolvedModel"]=="claude-sonnet-5"
+    assert q["auxiliaryModels"]==["claude-haiku-4-5-20251001"]
+
+
+# No modelUsage entry's canonicalModel belongs to the requested alias's family (a run that
+# silently fell back to a wholly different family) -- resolvedModel must stay 'unknown',
+# never the requested alias, never a raw modelUsage key, and never the auxiliary entry's id.
+def test_resolved_model_is_unknown_when_the_requested_family_is_absent(fixture_tree):
+    result_json = _RESULT_JSON_PREFIX + json.dumps({
+        "claude-haiku-4-5-20251001": {"canonicalModel": "claude-haiku-4-5-20251001"},
+    }) + "}"
+    cmd,env,receipt=prepare(fixture_tree,"normal",result_json=result_json)
+    r=subprocess.run(cmd,env=env,text=True,capture_output=True,timeout=20)
+    assert r.returncode==0,(r.stdout,r.stderr)
+    q=json.loads(receipt.read_text(encoding="utf-8"))
+    assert q["requestedModel"]=="sonnet"
+    assert q["resolvedModel"]=="unknown"
+    assert q["auxiliaryModels"]==["claude-haiku-4-5-20251001"]
+
+
+# The matching family entry exists (keyed 'sonnet') but carries no canonicalModel -- the
+# blocker sol found copies the raw key ('sonnet') into resolvedModel in this case, which is
+# indistinguishable from the requested alias itself proving nothing. resolvedModel must stay
+# 'unknown' and the raw key must land in auxiliaryModels, never in resolvedModel.
+def test_resolved_model_is_unknown_when_canonical_model_is_missing(fixture_tree):
+    result_json = _RESULT_JSON_PREFIX + json.dumps({
+        "sonnet": {},
+    }) + "}"
+    cmd,env,receipt=prepare(fixture_tree,"normal",result_json=result_json)
+    r=subprocess.run(cmd,env=env,text=True,capture_output=True,timeout=20)
+    assert r.returncode==0,(r.stdout,r.stderr)
+    q=json.loads(receipt.read_text(encoding="utf-8"))
+    assert q["requestedModel"]=="sonnet"
+    assert q["resolvedModel"]=="unknown"
+    assert q["auxiliaryModels"]==["sonnet"]
 
 
 # LANE-NO-BACKGROUND-END-TURN-1 round 6 (swarm ruling): --disallowedTools cannot reach

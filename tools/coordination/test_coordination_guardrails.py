@@ -1460,7 +1460,7 @@ def test_astra_reuses_the_engine_generic_codex_argv_branch_verbatim():
     """No lane-specific branch exists or is needed: the codex argv-build block keys off
     $cfg.engine/$cfg.model/$cfg.effort/$sandbox, all resolved from the SAME table row lookup
     every other codex lane goes through -- so astra gets `-s read-only` (the $AllowEdits-false
-    default, since astra is never granted edits) and `-c model_reasoning_effort="xhigh"` by
+    default, since astra is never granted edits) and `-c model_reasoning_effort="high"` by
     construction, the same way sol/luna already do, without a new conditional to test."""
     body = LANE_RUNNER.read_text(encoding="utf-8")
     start = body.index("} else {\n    $exe  = $CODEX_EXE")
