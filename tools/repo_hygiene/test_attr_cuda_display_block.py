@@ -233,6 +233,97 @@ class WindowsDisplayInventoryRealExecutionTests(_ProbeCase):
 
 
 @requires_pwsh
+class TemplateDisplayBlockExecutionTests(_ProbeCase):
+    """Executes the job template's own Build-AttrCudaDisplayBlock and
+    Get-AttrCudaDisplayResultTail functions (extracted verbatim from the generator's source, not
+    reimplemented) end to end, proving the RESULT-line field FORMAT itself --
+    "DISPLAY=<name> RES=<w>x<h>@<hz> DEGRADED=<0|1|unknown> PREVIEW=<w>x<h>" -- not just that the
+    call sites exist."""
+
+    def setUp(self) -> None:
+        super().setUp()
+        text = JOB_SCRIPT.read_text(encoding="utf-8").replace("\r\n", "\n")
+        build_at = text.index("function Build-AttrCudaDisplayBlock")
+        tail_at = text.index("function Get-AttrCudaDisplayResultTail")
+        tail_end = text.index("\n\nforeach ($item in @(", tail_at)
+        self.functions = text[build_at:tail_end]
+
+    def run_probe(self, body: str) -> subprocess.CompletedProcess:
+        return self.run_snippet(self.functions + "\n" + body)
+
+    def test_full_happy_path_produces_the_documented_result_tail(self) -> None:
+        proc = self.run_probe(
+            "$inv = [pscustomobject]@{ collected = $true; devices = @(); error = $null }\n"
+            "$appSel = [pscustomobject]@{\n"
+            "    screensCollected = $true\n"
+            "    screens = @([ordered]@{ name='X'; physicalWidth=3840; physicalHeight=2160; refreshHz=60.0 })\n"
+            "    screensError = $null\n"
+            "    target = [ordered]@{ name='X'; reason='max_physical_pixels'; candidates=2; fallback=$false }\n"
+            "    targetError = $null\n"
+            "    placement = [ordered]@{ mode='fullscreen'; previewWidth=3840; previewHeight=2160 }\n"
+            "    placementError = $null\n"
+            "}\n"
+            "$block = Build-AttrCudaDisplayBlock -WindowsInventory $inv -Venue 'ultra-magnus' "
+            "-ExpectedWidth 3840 -ExpectedHeight 2160 -AppSelection $appSel\n"
+            "Write-Host (Get-AttrCudaDisplayResultTail $block)\n"
+        )
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        self.assertIn("DISPLAY=X RES=3840x2160@60 DEGRADED=0 PREVIEW=3840x2160", proc.stdout)
+
+    def test_degraded_fallback_produces_degraded_one(self) -> None:
+        proc = self.run_probe(
+            "$inv = [pscustomobject]@{ collected = $true; devices = @(); error = $null }\n"
+            "$appSel = [pscustomobject]@{\n"
+            "    screensCollected = $true\n"
+            "    screens = @([ordered]@{ name='X'; physicalWidth=2560; physicalHeight=1440; refreshHz=60.0 })\n"
+            "    screensError = $null\n"
+            "    target = [ordered]@{ name='X'; reason='max_physical_pixels'; candidates=1; fallback=$true }\n"
+            "    targetError = $null\n"
+            "    placement = [ordered]@{ mode='windowed'; previewWidth=2560; previewHeight=1440 }\n"
+            "    placementError = $null\n"
+            "}\n"
+            "$block = Build-AttrCudaDisplayBlock -WindowsInventory $inv -Venue 'ultra-magnus' "
+            "-ExpectedWidth 3840 -ExpectedHeight 2160 -AppSelection $appSel\n"
+            "Write-Host (Get-AttrCudaDisplayResultTail $block)\n"
+            "Write-Host \"FALLBACK=$($block.selectionFallback)\"\n"
+        )
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        self.assertIn("DISPLAY=X RES=2560x1440@60 DEGRADED=1 PREVIEW=2560x1440", proc.stdout)
+        self.assertIn("FALLBACK=True", proc.stdout)
+
+    def test_before_the_smoke_log_is_available_every_field_reads_unknown(self) -> None:
+        proc = self.run_probe(
+            "$inv = [pscustomobject]@{ collected = $true; devices = @(); error = $null }\n"
+            "$block = Build-AttrCudaDisplayBlock -WindowsInventory $inv -Venue 'ultra-magnus' "
+            "-ExpectedWidth 3840 -ExpectedHeight 2160 -AppSelection $null\n"
+            "Write-Host (Get-AttrCudaDisplayResultTail $block)\n"
+        )
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        self.assertIn("DISPLAY=unknown RES=unknown DEGRADED=unknown PREVIEW=unknown", proc.stdout)
+
+    def test_bachelor_venue_with_no_expectation_reads_degraded_unknown_never_zero(self) -> None:
+        proc = self.run_probe(
+            "$inv = [pscustomobject]@{ collected = $true; devices = @(); error = $null }\n"
+            "$appSel = [pscustomobject]@{\n"
+            "    screensCollected = $true\n"
+            "    screens = @([ordered]@{ name='X'; physicalWidth=1920; physicalHeight=1080; refreshHz=144.0 })\n"
+            "    screensError = $null\n"
+            "    target = [ordered]@{ name='X'; reason='max_physical_pixels'; candidates=1; fallback=$false }\n"
+            "    targetError = $null\n"
+            "    placement = [ordered]@{ mode='fullscreen'; previewWidth=1920; previewHeight=1080 }\n"
+            "    placementError = $null\n"
+            "}\n"
+            "$block = Build-AttrCudaDisplayBlock -WindowsInventory $inv -Venue 'bachelor' "
+            "-ExpectedWidth $null -ExpectedHeight $null -AppSelection $appSel\n"
+            "Write-Host (Get-AttrCudaDisplayResultTail $block)\n"
+            "Write-Host \"EXPECTED_NULL=$($null -eq $block.expected)\"\n"
+        )
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        self.assertIn("DISPLAY=X RES=1920x1080@144 DEGRADED=unknown PREVIEW=1920x1080", proc.stdout)
+        self.assertIn("EXPECTED_NULL=True", proc.stdout)
+
+
+@requires_pwsh
 class JobTemplateDisplayBlockWiringTests(unittest.TestCase):
     """Text-level pin on playback-attr-3-cuda-job.ps1's embedded template: the display block is
     captured before the CPU-quiescence measurement, recomputed once the smoke log is available,
