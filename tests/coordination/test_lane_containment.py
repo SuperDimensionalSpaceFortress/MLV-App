@@ -212,6 +212,8 @@ def prepare(tree, mode, assignment_failure=False, editing=False, allowed_tools="
     run=root/"run"; run.mkdir()
     if result_json is not None:
         result_json_path=root/"result.json"; result_json_path.write_text(result_json,encoding="utf-8")
+    default_codex_models_cache=root/"codex-models-cache.default.json"
+    write_codex_models_cache(default_codex_models_cache)
     env=os.environ.copy(); env.update({
       "MLV_BOARD_ROOT":str(root),"MLV_FIXTURE_MODE":mode,
       "MLV_FIXTURE_CHILD":str(root/"child.json"),"MLV_FIXTURE_GRAND":str(root/"grand.json"),
@@ -226,13 +228,35 @@ def prepare(tree, mode, assignment_failure=False, editing=False, allowed_tools="
       # PATH at all. Round 13: this is the ONLY executable the background gate resolves at all --
       # the exec-form hook registration (command=$PYTHON_EXE, args=[hook copy]) has no shell to
       # resolve, classify, or fall back between.
-      "MLV_LANE_PYTHON_EXE":sys.executable})
+      "MLV_LANE_PYTHON_EXE":sys.executable,
+      # LANE-MODEL-CURRENCY-1 round 1c: pinned to a fixture cache this process writes itself
+      # (see write_codex_models_cache above), never the real ~/.codex/models_cache.json -- a
+      # hosted CI runner has no such file, so every codex-lane test must be hermetic to it. A
+      # test exercising the fail-closed path overrides this entry after prepare() returns.
+      "MLV_CODEX_MODELS_CACHE":str(default_codex_models_cache)})
     if result_json is not None:
         env["MLV_FIXTURE_RESULT_JSON"]=str(result_json_path)
     cmd=[PWSH,"-NoLogo","-NoProfile","-NonInteractive","-ExecutionPolicy","Bypass","-File",str(script),"-Lane",lane,"-Prompt","fixture prompt","-WorkDir",str(root),"-RunDir",str(run),"-TimeoutSec","3" if mode=="timeout" else "30","-Card","FIXTURE","-ReasoningEffort","low"]
     if editing: cmd += ["-AllowEdits","-AllowedTools",allowed_tools]
     if allow_bulk_reads: cmd += ["-AllowBulkReads"]
     return cmd,env,run/(lane+"-001.receipt.json")
+
+
+# LANE-MODEL-CURRENCY-1 round 1c (hosted-CI hermeticity fix): every codex-lane launch now
+# resolves its tier through resolve-codex-tier.py, which reads ~/.codex/models_cache.json by
+# default -- a file that exists on a dev box (so these tests passed locally) but not on a
+# hosted CI runner, where the tier resolution correctly fails closed and the launch never
+# reaches the point any of these tests actually assert on. prepare() writes this fixture cache
+# and points MLV_CODEX_MODELS_CACHE at it for every test, hermetically, regardless of what the
+# real environment does or does not have -- a test that wants to exercise the fail-closed path
+# instead overrides the env entry afterward (see test_codex_tier_resolution_fails_closed_when_
+# the_cache_is_unavailable and test_codex_lane_resolves_tier_to_the_highest_version_slug_in_the_
+# cache, both of which already do this).
+DEFAULT_CODEX_MODELS_CACHE_SLUGS = ("gpt-6-sol", "gpt-6-luna", "gpt-6-astra")
+
+
+def write_codex_models_cache(path, slugs=DEFAULT_CODEX_MODELS_CACHE_SLUGS):
+    path.write_text(json.dumps({"models": [{"slug": slug} for slug in slugs]}), encoding="utf-8")
 
 
 def settings_path_for(receipt):
