@@ -2365,6 +2365,71 @@ if ($ExerciseClipLifecycleStress) {
     }
 }
 
+# UM-DISPLAY-SELECT-AND-LOG-1 round 1c (sol pre-review BLOCKER 1): this leg's own display
+# identity/mode, from the app's OWN gui_smoke.window_placement/display_screen lines --
+# independent of any downstream comparison, published on EVERY result.json so
+# compare-release-gui-smoke-ab.ps1 (or any other consumer) can refuse to treat two
+# differently-displayed legs as comparable. identityUnknownReason is the third state (a
+# legacy binary that predates presentation_screen=, or a missing/malformed line) -- never
+# folded into a guessed identity, never folded into verified=true.
+$displayScreenLines = @($recentLines | Where-Object { $_ -like "*gui_smoke.display_screen *" })
+$windowPlacementLine = $recentLines | Where-Object { $_ -like "*gui_smoke.window_placement *" } | Select-Object -Last 1
+$displayIdentityUnknownReason = $null
+$displayBlock = $null
+if (-not $windowPlacementLine) {
+    $displayIdentityUnknownReason = "no gui_smoke.window_placement line found in the recent log window"
+} else {
+    $placementMatch = [regex]::Match($windowPlacementLine,
+        'mode=(?<mode>\w+) screen="(?<name>[^"]*)" verified=(?<verified>[01]) ' +
+        'window=(?<wx>-?\d+),(?<wy>-?\d+) (?<ww>\d+)x(?<wh>\d+) preview=(?<pw>\d+)x(?<ph>\d+)' +
+        '(?: target_screen="(?<targetScreen>[^"]*)" presentation_screen="(?<presentationScreen>[^"]*)" ' +
+        'presentation_physical=(?<ppw>\d+)x(?<pph>\d+))?')
+    if (-not $placementMatch.Success) {
+        $displayIdentityUnknownReason = "gui_smoke.window_placement line did not match the expected shape"
+    } elseif (-not $placementMatch.Groups['presentationScreen'].Success) {
+        $displayIdentityUnknownReason = "legacy binary: window_placement predates presentation_screen= (verified/mode/preview still known but identity is not)"
+    } else {
+        $presentationName = $placementMatch.Groups['presentationScreen'].Value
+        $screenMatch = $displayScreenLines | Where-Object {
+            [regex]::Match($_, [regex]::Escape('name="' + $presentationName + '"')).Success
+        } | Select-Object -Last 1
+        $refreshHzRounded = $null
+        $dpr = $null
+        if ($screenMatch) {
+            $refreshMatch = [regex]::Match($screenMatch, 'refresh_hz=(?<r>[0-9.]+)')
+            $dprMatch = [regex]::Match($screenMatch, 'dpr=(?<d>[0-9.]+)')
+            if ($refreshMatch.Success) { $refreshHzRounded = [Math]::Round([double]$refreshMatch.Groups['r'].Value) }
+            if ($dprMatch.Success) { $dpr = [double]$dprMatch.Groups['d'].Value }
+        }
+        $displayBlock = [pscustomobject]@{
+            presentationScreenName = $presentationName
+            physicalWidth = [int]$placementMatch.Groups['ppw'].Value
+            physicalHeight = [int]$placementMatch.Groups['pph'].Value
+            refreshHzRounded = $refreshHzRounded
+            dpr = $dpr
+            windowMode = $placementMatch.Groups['mode'].Value
+            previewWidth = [int]$placementMatch.Groups['pw'].Value
+            previewHeight = [int]$placementMatch.Groups['ph'].Value
+            verified = ($placementMatch.Groups['verified'].Value -eq '1')
+            identityUnknownReason = $null
+        }
+    }
+}
+if ($null -eq $displayBlock) {
+    $displayBlock = [pscustomobject]@{
+        presentationScreenName = $null
+        physicalWidth = $null
+        physicalHeight = $null
+        refreshHzRounded = $null
+        dpr = $null
+        windowMode = $null
+        previewWidth = $null
+        previewHeight = $null
+        verified = $false
+        identityUnknownReason = $displayIdentityUnknownReason
+    }
+}
+
 $result = [pscustomobject]@{
     schema = "mlvapp-gui-smoke-result.v2"
     capturedAtUtc = $endUtc.ToString("o")
@@ -2373,6 +2438,7 @@ $result = [pscustomobject]@{
     clipPath = $inputPath
     inputBindings = $launchInputBindings
     outputPath = $outputPath
+    display = $displayBlock
     evidence = [pscustomobject]@{
         runNonce = $runNonce
         inputs = $captureInputBindings
