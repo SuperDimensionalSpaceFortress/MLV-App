@@ -179,6 +179,13 @@ public:
         // (deterministic size) on the chosen target display instead of going full screen --
         // see MainWindow::runGuiPlaybackSmoke() and choosePlaybackSmokeDisplayTarget().
         bool windowed = false;
+        // UM-DISPLAY-SELECT-AND-LOG-1 round 1c (measured topology, project-memory
+        // um-display-topology-lg-tv-denon-fallback-20260926.md): a per-venue name substring
+        // (case-insensitive, matched against name/model/manufacturer), used ONLY as a
+        // tie-break among the candidates already tied for the most physical pixels -- real
+        // resolution always wins first. Empty means no preference (the pre-round-1c rule:
+        // max physical pixels, then refresh, then primary).
+        QString displayPreferSubstring;
     };
 
     int runHeadlessPlaybackProfile(const PlaybackProfileOptions & options);
@@ -1431,9 +1438,15 @@ private:
     // (ties -> higher refresh rate, then primary), and move the window there before any
     // fullscreen request or windowed maximize. See runGuiPlaybackSmoke(), the only caller.
     void logPlaybackSmokeDisplayInventory( void ) const;
+    // UM-DISPLAY-SELECT-AND-LOG-1 round 1c: -PreferSubstring (case-insensitive, matched
+    // against name/model/manufacturer) tie-breaks ONLY among the candidates already tied for
+    // the most physical pixels -- real resolution always wins first. Empty means no
+    // preference (the pre-round-1c rule unchanged: max physical pixels, refresh, primary).
     QScreen *choosePlaybackSmokeDisplayTarget( bool *outFallback,
                                                int *outCandidateCount,
-                                               QString *outReason ) const;
+                                               QString *outReason,
+                                               const QString &preferSubstring = QString(),
+                                               QString *outPreferredStatus = nullptr ) const;
     void movePlaybackSmokeWindowToScreen( QScreen *target );
     bool placePlaybackSmokeWindowWindowed( QScreen *target,
                                            QRect *outGeometry,

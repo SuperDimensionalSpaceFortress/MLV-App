@@ -84,6 +84,19 @@ static QString bool01( bool value )
     return value ? QStringLiteral("1") : QStringLiteral("0");
 }
 
+// UM-DISPLAY-SELECT-AND-LOG-1 round 1c (measured topology, project-memory
+// um-display-topology-lg-tv-denon-fallback-20260926.md): case-insensitive match against
+// name/model/manufacturer, in that order -- the field that matched is returned (for logging
+// which one it was), never guessed. An empty substring or a null screen never matches.
+static QString playbackSmokeDisplayPreferenceMatchedField( QScreen *screen, const QString &preferSubstring )
+{
+    if( !screen || preferSubstring.isEmpty() ) return QString();
+    if( screen->name().contains( preferSubstring, Qt::CaseInsensitive ) ) return QStringLiteral("name");
+    if( screen->model().contains( preferSubstring, Qt::CaseInsensitive ) ) return QStringLiteral("model");
+    if( screen->manufacturer().contains( preferSubstring, Qt::CaseInsensitive ) ) return QStringLiteral("manufacturer");
+    return QString();
+}
+
 static QString fingerprintDisplayValue( const QJsonObject &fingerprint,
                                         const QString &key )
 {
@@ -8906,15 +8919,23 @@ int MainWindow::runGuiPlaybackSmoke(const GuiPlaybackSmokeOptions & options)
     bool displayFallback = false;
     int displayCandidateCount = 0;
     QString displayTargetReason;
+    QString displayPreferredStatus;
     QScreen *displayTarget =
-        choosePlaybackSmokeDisplayTarget( &displayFallback, &displayCandidateCount, &displayTargetReason );
+        choosePlaybackSmokeDisplayTarget( &displayFallback, &displayCandidateCount, &displayTargetReason,
+                                           options.displayPreferSubstring, &displayPreferredStatus );
+    // UM-DISPLAY-SELECT-AND-LOG-1 round 1c: preferred=/preferred_matched= appended after
+    // fallback=, never inserted -- recorded, never gated (a Denon leg, real 4K just not the
+    // preferred one, is still a valid measurement; see choosePlaybackSmokeDisplayTarget()).
     qInfo().noquote()
         << QStringLiteral(
-               "gui_smoke.display_target screen=\"%1\" reason=%2 candidates=%3 fallback=%4" )
+               "gui_smoke.display_target screen=\"%1\" reason=%2 candidates=%3 fallback=%4 "
+               "preferred=\"%5\" preferred_matched=%6" )
                .arg( displayTarget ? displayTarget->name() : QStringLiteral("none") )
                .arg( displayTargetReason )
                .arg( displayCandidateCount )
-               .arg( bool01( displayFallback ) );
+               .arg( bool01( displayFallback ) )
+               .arg( options.displayPreferSubstring )
+               .arg( displayPreferredStatus );
 
     struct PlaybackSmokeGeometryGuard
     {
@@ -22827,7 +22848,9 @@ void MainWindow::logPlaybackSmokeDisplayInventory( void ) const
 // still gets an accurate signal.
 QScreen *MainWindow::choosePlaybackSmokeDisplayTarget( bool *outFallback,
                                                        int *outCandidateCount,
-                                                       QString *outReason ) const
+                                                       QString *outReason,
+                                                       const QString &preferSubstring,
+                                                       QString *outPreferredStatus ) const
 {
     const QList<QScreen *> screens = QGuiApplication::screens();
     QScreen * const primary = QGuiApplication::primaryScreen();
@@ -22839,6 +22862,7 @@ QScreen *MainWindow::choosePlaybackSmokeDisplayTarget( bool *outFallback,
     qint64 bestPixels = -1;
     double bestRefresh = -1.0;
     bool bestIsPrimary = false;
+    bool bestIsPreferred = false;
     QString reason = QStringLiteral("no_screens");
 
     for( QScreen *s : screens )
@@ -22851,6 +22875,12 @@ QScreen *MainWindow::choosePlaybackSmokeDisplayTarget( bool *outFallback,
             * static_cast<qint64>( qRound( geo.height() * dpr ) );
         const double refresh = s->refreshRate();
         const bool isPrimaryScreen = ( s == primary );
+        // UM-DISPLAY-SELECT-AND-LOG-1 round 1c: a per-venue preference is a TIE-BREAK among
+        // the candidates already tied for the most physical pixels -- checked BEFORE refresh
+        // (order: max pixels, then preferred, then refresh, then primary), never instead of
+        // the pixel comparison, so a preferred display with fewer pixels never wins over the
+        // real resolution.
+        const bool isPreferred = !playbackSmokeDisplayPreferenceMatchedField( s, preferSubstring ).isEmpty();
 
         bool better = false;
         QString candidateReason;
@@ -22861,12 +22891,17 @@ QScreen *MainWindow::choosePlaybackSmokeDisplayTarget( bool *outFallback,
         }
         else if( pixels == bestPixels )
         {
-            if( refresh > bestRefresh )
+            if( isPreferred && !bestIsPreferred )
+            {
+                better = true;
+                candidateReason = QStringLiteral("max_physical_pixels_tie_preferred");
+            }
+            else if( isPreferred == bestIsPreferred && refresh > bestRefresh )
             {
                 better = true;
                 candidateReason = QStringLiteral("max_physical_pixels_tie_refresh");
             }
-            else if( refresh == bestRefresh && isPrimaryScreen && !bestIsPrimary )
+            else if( isPreferred == bestIsPreferred && refresh == bestRefresh && isPrimaryScreen && !bestIsPrimary )
             {
                 better = true;
                 candidateReason = QStringLiteral("max_physical_pixels_tie_primary");
@@ -22879,6 +22914,7 @@ QScreen *MainWindow::choosePlaybackSmokeDisplayTarget( bool *outFallback,
             bestPixels = pixels;
             bestRefresh = refresh;
             bestIsPrimary = isPrimaryScreen;
+            bestIsPreferred = isPreferred;
             reason = candidateReason;
         }
     }
@@ -22889,7 +22925,45 @@ QScreen *MainWindow::choosePlaybackSmokeDisplayTarget( bool *outFallback,
     if( outReason ) *outReason = reason;
     if( outFallback )
     {
+        // UM-DISPLAY-SELECT-AND-LOG-1 round 1c (opus design-review hardening item 5): this
+        // reads 1 on every nominal UM run once a non-primary preferred display (the ASUS
+        // PA329C) is chosen -- expected, not a fault, since "differs from primary" was always
+        // this flag's definition, never renamed to moved_from_start/primary_chosen this round.
         *outFallback = best && ( ( best != startScreen ) || ( best != primary ) );
+    }
+    if( outPreferredStatus )
+    {
+        // Recorded, never gated: the owner "accepts the ASUS for now", and a Denon leg (real
+        // 4K, just not the preferred one) is still valid -- this reports what happened, it
+        // never fails a leg. 'none' (no preference configured), 'absent' (configured but no
+        // screen matched), 'matched' (matched AND it is the chosen target), or 'not_max' (a
+        // screen matched but a higher-pixel screen won -- real resolution always wins first).
+        if( preferSubstring.isEmpty() )
+        {
+            *outPreferredStatus = QStringLiteral("none");
+        }
+        else
+        {
+            QScreen *preferredCandidate = nullptr;
+            qint64 preferredCandidatePixels = -1;
+            for( QScreen *s : screens )
+            {
+                if( !s || playbackSmokeDisplayPreferenceMatchedField( s, preferSubstring ).isEmpty() ) continue;
+                const QRect geo = s->geometry();
+                const double dpr = s->devicePixelRatio();
+                const qint64 pixels =
+                    static_cast<qint64>( qRound( geo.width() * dpr ) )
+                    * static_cast<qint64>( qRound( geo.height() * dpr ) );
+                if( !preferredCandidate || pixels > preferredCandidatePixels )
+                {
+                    preferredCandidate = s;
+                    preferredCandidatePixels = pixels;
+                }
+            }
+            if( !preferredCandidate ) *outPreferredStatus = QStringLiteral("absent");
+            else if( preferredCandidate == best ) *outPreferredStatus = QStringLiteral("matched");
+            else *outPreferredStatus = QStringLiteral("not_max");
+        }
     }
     return best;
 }

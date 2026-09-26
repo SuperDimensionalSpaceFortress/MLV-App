@@ -60,6 +60,16 @@ TEST(GuiSmokeDisplaySelectWiring, MainDeclaresTheWindowedFlagAndWiresItToOptions
     ASSERT_TRUE(source.contains(QStringLiteral("options.windowed = parser.isSet(windowedOpt);")));
 }
 
+TEST(GuiSmokeDisplaySelectWiring, MainDeclaresTheDisplayPreferOptionAndWiresItToOptions)
+{
+    // UM-DISPLAY-SELECT-AND-LOG-1 round 1c (measured topology): a per-venue name substring,
+    // forwarded to choosePlaybackSmokeDisplayTarget() as a tie-break only.
+    const QString source = readRepoFile(QStringLiteral("platform/qt/main.cpp"));
+    ASSERT_TRUE(source.contains(QStringLiteral("QStringLiteral(\"display-prefer\"),")));
+    ASSERT_TRUE(source.contains(QStringLiteral(
+        "options.displayPreferSubstring = parser.value(displayPreferOpt);")));
+}
+
 TEST(GuiSmokeDisplaySelectWiring, InventoryLogsEveryScreenWithIdentityGeometryAndPrimary)
 {
     const QString source = readRepoFile(QStringLiteral("platform/qt/MainWindow.cpp"));
@@ -102,6 +112,46 @@ TEST(GuiSmokeDisplaySelectWiring, TargetChoosesMaxPhysicalPixelsTieRefreshThenPr
     ASSERT_TRUE(body.contains(
         QStringLiteral("*outFallback = best && ( ( best != startScreen ) || ( best != primary ) );")));
     ASSERT_TRUE(body.contains(QStringLiteral("if( outCandidateCount ) *outCandidateCount = screens.size();")));
+
+    // UM-DISPLAY-SELECT-AND-LOG-1 round 1c: the preferred tie-break sits between the pixel
+    // comparison and the refresh tie-break -- max pixels, then preferred, then refresh, then
+    // primary -- so a preferred display with fewer pixels can never win over real resolution.
+    const int preferredTieAt = body.indexOf(
+        QStringLiteral("if( isPreferred && !bestIsPreferred )"), tieAt);
+    ASSERT_TRUE(preferredTieAt > tieAt);
+    ASSERT_TRUE(refreshTieAt > preferredTieAt);
+    ASSERT_TRUE(body.contains(QStringLiteral(
+        "isPreferred == bestIsPreferred && refresh > bestRefresh")));
+    ASSERT_TRUE(body.contains(QStringLiteral(
+        "isPreferred == bestIsPreferred && refresh == bestRefresh && isPrimaryScreen && !bestIsPrimary")));
+}
+
+TEST(GuiSmokeDisplaySelectWiring, PreferredDisplayMatchesNameModelOrManufacturerCaseInsensitively)
+{
+    const QString source = readRepoFile(QStringLiteral("platform/qt/MainWindow.cpp"));
+    const int fnAt = source.indexOf(QStringLiteral(
+        "static QString playbackSmokeDisplayPreferenceMatchedField("));
+    ASSERT_TRUE(fnAt >= 0);
+    const QString tail = source.mid(fnAt, 700);
+    ASSERT_TRUE(tail.contains(QStringLiteral("screen->name().contains( preferSubstring, Qt::CaseInsensitive )")));
+    ASSERT_TRUE(tail.contains(QStringLiteral("screen->model().contains( preferSubstring, Qt::CaseInsensitive )")));
+    ASSERT_TRUE(tail.contains(QStringLiteral("screen->manufacturer().contains( preferSubstring, Qt::CaseInsensitive )")));
+}
+
+TEST(GuiSmokeDisplaySelectWiring, DisplayTargetLineCarriesThePreferredFieldsAppendedAfterFallback)
+{
+    const QString source = readRepoFile(QStringLiteral("platform/qt/MainWindow.cpp"));
+    const QString smokeBody = functionBody(source,
+        QStringLiteral("int MainWindow::runGuiPlaybackSmoke(const GuiPlaybackSmokeOptions & options)"),
+        QStringLiteral("void MainWindow::importNewMlv(QString fileName)"));
+    ASSERT_FALSE(smokeBody.isEmpty());
+    ASSERT_TRUE(smokeBody.contains(QStringLiteral(
+        "gui_smoke.display_target screen=\\\"%1\\\" reason=%2 candidates=%3 fallback=%4 ")));
+    ASSERT_TRUE(smokeBody.contains(QStringLiteral(
+        "preferred=\\\"%5\\\" preferred_matched=%6")));
+    ASSERT_TRUE(smokeBody.contains(QStringLiteral(
+        "choosePlaybackSmokeDisplayTarget( &displayFallback, &displayCandidateCount, &displayTargetReason,\n"
+        "                                           options.displayPreferSubstring, &displayPreferredStatus );")));
 }
 
 TEST(GuiSmokeDisplaySelectWiring, PlacementMovesToTargetBeforeFullscreenOrMaximize)
