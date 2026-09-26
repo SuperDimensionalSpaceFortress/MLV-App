@@ -1417,14 +1417,43 @@ def test_receipt_effort_field_already_records_the_same_resolved_value_that_is_ap
 def test_fable_lane_resolves_to_high_effort_by_default():
     # Binding fleet owner ruling, 2026-09-08: Fable spends tokens only on important complex
     # reviews and runs at high effort by default (agents/orchestration-tiering.md).
+    # LANE-MODEL-CURRENCY-1 (2026-09-26): the pinned id `claude-fable-5` is replaced by the
+    # floating CLI alias `fable`, so the row can never go stale the way a pinned id would.
     body = LANE_RUNNER.read_text(encoding="utf-8")
-    assert "fable  = @{ engine = 'claude'; model = 'claude-fable-5'; effort = 'high';" in body
+    assert "fable  = @{ engine = 'claude'; model = 'fable';  effort = 'high';" in body
 
 
-def test_astra_lane_row_is_a_read_only_xhigh_codex_judgement_lane():
+def test_astra_lane_row_is_a_read_only_high_effort_codex_judgement_lane():
+    # LANE-MODEL-CURRENCY-1 (owner ruling 2026-09-26): astra's earlier 'xhigh' effort and
+    # pinned `gpt-6-astra` id are both superseded -- every lane, astra included, now runs at
+    # 'high' effort (never max/xhigh), and a codex row names a TIER ('astra'), resolved to the
+    # current highest-version slug at launch by Resolve-CodexModelTier, never a pinned slug.
     body = LANE_RUNNER.read_text(encoding="utf-8")
-    assert "astra  = @{ engine = 'codex';  model = 'gpt-6-astra';    effort = 'xhigh';  role = 'judgement-design-arbiter' }" in body
+    assert "astra  = @{ engine = 'codex';  tier = 'astra';   effort = 'high'; role = 'design-arbiter' }" in body
     assert "ValidateSet('opus', 'sonnet', 'fable', 'sol', 'luna', 'astra')" in body
+
+
+def test_lanes_table_pins_no_model_id_and_every_effort_is_high():
+    # LANE-MODEL-CURRENCY-1: the defect class this card closes is a version written down
+    # somewhere going stale. Every claude row's `model` must be a bare CLI alias (never a
+    # `claude-*` id), every codex row must name a `tier` (never a `gpt-*` id), and every row's
+    # effort must be exactly 'high' -- never max/xhigh, per the owner's ruling.
+    body = LANE_RUNNER.read_text(encoding="utf-8")
+    lanes_block = body[body.index("$LANES = @{"):body.index("# Absolute launcher paths")]
+    lane_lines = [ln for ln in lanes_block.splitlines() if "engine = " in ln]
+    assert len(lane_lines) == 6, "expected six lane rows (opus, sonnet, fable, sol, luna, astra)"
+    for line in lane_lines:
+        assert not re.search(r"model = 'claude-[a-z0-9.-]+'", line), (
+            "a claude-engine row pins a versioned model id instead of a floating alias: %s" % line
+        )
+        assert not re.search(r"'gpt-[0-9]", line), (
+            "a codex-engine row pins a versioned model slug instead of a tier: %s" % line
+        )
+        assert "effort = 'high'" in line, "every lane row must resolve to 'high' effort: %s" % line
+        if "engine = 'claude'" in line:
+            assert "model = '" in line and "tier = " not in line
+        else:
+            assert "tier = '" in line and "model = " not in line
 
 
 def test_astra_reuses_the_engine_generic_codex_argv_branch_verbatim():

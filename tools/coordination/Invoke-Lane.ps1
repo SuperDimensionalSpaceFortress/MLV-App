@@ -79,6 +79,13 @@ param(
     [ValidateSet('', 'low', 'medium', 'high')]
     [string]$ReasoningEffort = '',
 
+    # LANE-MODEL-CURRENCY-1: an explicit escape hatch that bypasses the normal model
+    # resolution (a claude alias floating with the CLI, or a codex tier resolved at
+    # launch from the current models cache) and launches this EXACT model id instead.
+    # Recorded in the receipt as `pinnedByOverride` so a reader can never mistake an
+    # overridden run for the fleet's own currency-preserving resolution.
+    [string]$ModelOverride = '',
+
     # Let the lane read the bulk coordination files. OFF by default.
     # MEASURED 2026-09-03: three unattended fable lanes cost USD 22-25 EACH, every one
     # burning ~970,000 cache-creation tokens - almost exactly the 1.6 MB coordination
@@ -123,13 +130,24 @@ Set-StrictMode -Version Latest
 # Engine, model and effort per lane. This table IS the topology; there is no
 # other place a lane's model is decided, so a lane cannot silently drift onto
 # the wrong tier the way a registry field could.
+#
+# LANE-MODEL-CURRENCY-1 (owner ruling 2026-09-26: always the latest model per tier, at
+# HIGH effort -- never max/xhigh): no row here names a pinned model id. A claude-engine
+# row's `model` is a CLI ALIAS ('opus'/'sonnet'/'fable') -- the alias floats with the
+# claude CLI itself (verified 2026-09-26: `--model opus` resolved to canonicalModel
+# `claude-opus-5-5`, `--model fable` to `claude-fable-5-1`), so a superseded pinned id
+# (`claude-opus-5`, `claude-fable-5`, ...) can never sit here going stale. A codex-engine
+# row's `tier` is resolved to the current highest-version slug AT LAUNCH by
+# Resolve-CodexModelTier (below), which reads live from ~/.codex/models_cache.json --
+# Codex has no floating alias, so this is the equivalent resolution step. Every effort is
+# 'high': the owner's ruling is high for every lane, sonnet included, never max/xhigh.
 $LANES = @{
-    opus   = @{ engine = 'claude'; model = 'opus';           effort = 'high';   role = 'orchestrator' }
-    sonnet = @{ engine = 'claude'; model = 'sonnet';         effort = '';       role = 'implementer' }
-    fable  = @{ engine = 'claude'; model = 'claude-fable-5'; effort = 'high';   role = 'review-guidance-planning' }
-    sol    = @{ engine = 'codex';  model = 'gpt-5.6-sol';    effort = 'high';   role = 'adversarial-verifier' }
-    luna   = @{ engine = 'codex';  model = 'gpt-5.6-luna';   effort = 'high';   role = 'breadth-recon' }
-    astra  = @{ engine = 'codex';  model = 'gpt-6-astra';    effort = 'xhigh';  role = 'judgement-design-arbiter' }
+    opus   = @{ engine = 'claude'; model = 'opus';   effort = 'high'; role = 'orchestrator' }
+    sonnet = @{ engine = 'claude'; model = 'sonnet'; effort = 'high'; role = 'implementer' }
+    fable  = @{ engine = 'claude'; model = 'fable';  effort = 'high'; role = 'review-guidance-planning' }
+    sol    = @{ engine = 'codex';  tier = 'sol';     effort = 'high'; role = 'adversarial-verifier' }
+    luna   = @{ engine = 'codex';  tier = 'luna';    effort = 'high'; role = 'breadth-recon' }
+    astra  = @{ engine = 'codex';  tier = 'astra';   effort = 'high'; role = 'design-arbiter' }
 }
 
 # Absolute launcher paths. NEITHER is on the Git Bash PATH on this host, and a
@@ -196,6 +214,41 @@ $PYTHON_EXE_RESOLUTION = Resolve-LaneExecutable -OverrideEnvName 'MLV_LANE_PYTHO
     -KnownLocations @('C:/Users/obabalola/AppData/Local/Python/bin/python.exe')
 $PYTHON_EXE = $PYTHON_EXE_RESOLUTION.Path
 $LANE_NO_BACKGROUND_HOOK = Join-Path $PSScriptRoot 'lane-no-background.py'
+$RESOLVE_CODEX_TIER_SCRIPT = Join-Path $PSScriptRoot 'resolve-codex-tier.py'
+
+# LANE-MODEL-CURRENCY-1: resolves a codex-engine lane's TIER (e.g. 'sol') to the current
+# highest-version slug via resolve-codex-tier.py, which reads live from
+# ~/.codex/models_cache.json (overridable for tests via MLV_CODEX_MODELS_CACHE). FAILS
+# CLOSED -- throws, never returns a guess -- when the interpreter is unresolved, the
+# script cannot be invoked, its output does not parse, or it reports "ok": false (no
+# cache, or no exact tier match). The caller's own top-level try/catch turns that throw
+# into a well-formed 'failed' receipt naming this exact reason, the same pattern the
+# background-gate self-test above already uses.
+function Resolve-CodexModelTier {
+    param(
+        [Parameter(Mandatory = $true)][string]$Tier,
+        [Parameter(Mandatory = $true)][string]$PythonExe
+    )
+    $resolverArgs = @($RESOLVE_CODEX_TIER_SCRIPT, '--tier', $Tier)
+    if ($env:MLV_CODEX_MODELS_CACHE) { $resolverArgs += @('--cache', $env:MLV_CODEX_MODELS_CACHE) }
+    try {
+        $resolverOutput = & $PythonExe @resolverArgs 2>&1
+        $resolverExit = $LASTEXITCODE
+    } catch {
+        throw "codex-tier-resolution-failed: interpreter invocation threw for tier '$Tier': $($_.Exception.Message)"
+    }
+    $resolverOutputText = ($resolverOutput -join "`n")
+    try {
+        $resolverParsed = $resolverOutputText | ConvertFrom-Json
+    } catch {
+        throw "codex-tier-resolution-failed: unparseable resolver output for tier '$Tier' (exit $resolverExit): $resolverOutputText"
+    }
+    if ($resolverExit -ne 0 -or -not $resolverParsed.ok) {
+        $resolverError = if ($resolverParsed.PSObject.Properties.Name -contains 'error') { $resolverParsed.error } else { 'unknown' }
+        throw "codex-tier-resolution-failed: tier '$Tier' did not resolve: $resolverError"
+    }
+    return [string]$resolverParsed.resolvedModel
+}
 
 # Every tool that either fans out to another agent (Agent, Task, Workflow, TaskCreate) or
 # promises a LATER turn a headless lane cannot receive (Monitor, ScheduleWakeup, CronCreate,
@@ -548,6 +601,18 @@ $RunDir = (Resolve-Path -LiteralPath $RunDir).Path
 $cfg = $LANES[$Lane].Clone()
 if ($ReasoningEffort) { $cfg.effort = $ReasoningEffort }
 
+# ---------------------------------------------------------------- model identity (LANE-MODEL-CURRENCY-1)
+# requestedModel is the lane's IDENTITY as authored in the table: an alias for a claude
+# lane, a tier for a codex lane. Recorded even when -ModelOverride bypasses the normal
+# resolution below, so a receipt always shows what was ASKED for beside what actually
+# ran. resolvedModel starts 'unknown' -- a third state, never the requested string
+# copied over -- and is filled in per engine below: a codex lane fills it the instant
+# its tier resolves (or its override is accepted); a claude lane fills it only after the
+# child exits, from the canonicalModel(s) its own JSON output reports it actually ran as.
+$RequestedModel = if ($cfg.engine -eq 'claude') { $cfg.model } else { $cfg.tier }
+$PinnedByOverride = [bool]$ModelOverride
+$ResolvedModel = 'unknown'
+
 # ATOMIC SLOT RESERVATION. The previous form was
 #     while (Test-Path <candidate>) { $n++ }
 # which is CHECK-THEN-ACT: two lanes launched concurrently into the same run dir
@@ -709,7 +774,8 @@ Write-Utf8NoBom $promptPath $Prompt
 # and a '!' in them, and string-built command lines have mis-split here before.
 if ($cfg.engine -eq 'claude') {
     $exe  = $CLAUDE_EXE
-    $argv = @('-p', '--model', $cfg.model, '--output-format', 'json', '--add-dir', $WorkDir)
+    $claudeLaunchModel = if ($ModelOverride) { $ModelOverride } else { $cfg.model }
+    $argv = @('-p', '--model', $claudeLaunchModel, '--output-format', 'json', '--add-dir', $WorkDir)
     if ($ExtraReadDir) { $argv += @('--add-dir', $ExtraReadDir) }
     if ($MaxTurns -gt 0) { $argv += @('--max-turns', [string]$MaxTurns) }
     # Settings file written to the RUN DIR so the grant is auditable beside the receipt that
@@ -936,11 +1002,24 @@ if ($cfg.engine -eq 'claude') {
 } else {
     $exe  = $CODEX_EXE
     $sandbox = if ($AllowEdits) { 'workspace-write' } else { 'read-only' }
+    # LANE-MODEL-CURRENCY-1: the table names a TIER, never a pinned slug, so it is
+    # resolved to the current highest-version model HERE, at launch -- fail closed
+    # (throws) rather than falling back to a guess. -ModelOverride bypasses this
+    # resolution entirely for an explicit, auditable pin (recorded as pinnedByOverride).
+    $codexLaunchModel = if ($ModelOverride) {
+        $ModelOverride
+    } else {
+        if (-not $PYTHON_EXE) {
+            throw "codex-tier-resolution-failed: no Python interpreter resolved ($($PYTHON_EXE_RESOLUTION.Source)) to resolve tier '$($cfg.tier)'."
+        }
+        Resolve-CodexModelTier -Tier $cfg.tier -PythonExe $PYTHON_EXE
+    }
+    $ResolvedModel = $codexLaunchModel
     # -s and -c are set EXPLICITLY per call. ~/.codex/config.toml carries
     # approval_policy=never + sandbox_mode=danger-full-access globally, which is
     # fine for a watched interactive session and NOT fine for automated fan-out.
     $argv = @('exec',
-              '-m', $cfg.model,
+              '-m', $codexLaunchModel,
               '-c', ("model_reasoning_effort=`"{0}`"" -f $cfg.effort),
               '-s', $sandbox,
               '-C', $WorkDir,
@@ -1170,6 +1249,27 @@ if ($cfg.engine -eq 'claude') {
             $costUsd = [double]$j.total_cost_usd
         }
         if ($j.PSObject.Properties.Name -contains 'num_turns') { $numTurns = [int]$j.num_turns }
+        # LANE-MODEL-CURRENCY-1: `--model opus`/`fable`/`sonnet` is a FLOATING ALIAS -- what
+        # actually ran is only knowable from the child's own JSON, never assumed from the
+        # alias string. `modelUsage` is an object keyed by the model id the run actually used,
+        # each value carrying its own `canonicalModel`; multiple keys are possible (a fallback
+        # mid-run), so every key's canonicalModel is joined, never just the first. Left as
+        # 'unknown' (never overwritten with the requested alias) when the field is absent or
+        # empty -- a died-before-emitting-JSON run must never claim a model it cannot prove ran.
+        if ($j.PSObject.Properties.Name -contains 'modelUsage' -and $null -ne $j.modelUsage) {
+            $modelUsageNames = @($j.modelUsage.PSObject.Properties.Name)
+            if ($modelUsageNames.Count -gt 0) {
+                $canonicalModels = @($modelUsageNames | ForEach-Object {
+                    $entry = $j.modelUsage.$_
+                    if ($null -ne $entry -and $entry.PSObject.Properties.Name -contains 'canonicalModel' -and $entry.canonicalModel) {
+                        [string]$entry.canonicalModel
+                    } else {
+                        $_
+                    }
+                } | Select-Object -Unique)
+                if ($canonicalModels.Count -gt 0) { $ResolvedModel = ($canonicalModels -join ',') }
+            }
+        }
         if ($j.PSObject.Properties.Name -contains 'usage' -and $null -ne $j.usage) {
             if ($j.usage.PSObject.Properties.Name -contains 'cache_creation_input_tokens') {
                 $cacheCreateTokens = [int64]$j.usage.cache_creation_input_tokens
@@ -1498,7 +1598,13 @@ $receipt = [ordered]@{
     lane         = $Lane
     role         = $cfg.role
     engine       = $cfg.engine
-    model        = $cfg.model
+    # LANE-MODEL-CURRENCY-1: requestedModel is the table's alias/tier (the lane's
+    # identity); resolvedModel is what actually ran -- a codex tier's resolved slug, or a
+    # claude alias's canonicalModel(s) as its own JSON output reported them -- and stays
+    # 'unknown' (never the requested string copied over) when that cannot be determined.
+    requestedModel   = $RequestedModel
+    resolvedModel    = $ResolvedModel
+    pinnedByOverride = $PinnedByOverride
     effort       = $cfg.effort
     card         = $Card
     workDir      = $WorkDir
@@ -1566,8 +1672,8 @@ try {
 
 }   # end finally - the receipt is now written on EVERY exit path
 
-Write-Host ("[{0}] {1}/{2} effort={3} exit={4} {5}s cost={6} -> {7}" -f `
-    $Lane, $cfg.engine, $cfg.model, $cfg.effort, $exitCode, $receipt.durationSec,
+Write-Host ("[{0}] {1}/{2}->{3} effort={4} exit={5} {6}s cost={7} -> {8}" -f `
+    $Lane, $cfg.engine, $RequestedModel, $ResolvedModel, $cfg.effort, $exitCode, $receipt.durationSec,
     $(if ($null -ne $costUsd) { 'USD ' + ([math]::Round($costUsd,2)) } else { 'unreported' }),
     $rcptPath)
 

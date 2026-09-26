@@ -198,6 +198,7 @@ def prepare(tree, mode, assignment_failure=False, editing=False, allowed_tools="
     script.write_text(text,encoding="utf-8")
     (root/"lane-provider-refusal.ps1").write_bytes((ROOT/"tools"/"coordination"/"lane-provider-refusal.ps1").read_bytes())
     (root/"lane-no-background.py").write_bytes((ROOT/"tools"/"coordination"/"lane-no-background.py").read_bytes())
+    (root/"resolve-codex-tier.py").write_bytes((ROOT/"tools"/"coordination"/"resolve-codex-tier.py").read_bytes())
     if editing:
         hook=root/"tools"/"hooks"/"mlv-never-authorized.py"; hook.parent.mkdir(parents=True); hook.write_text("# fixture hook\n",encoding="ascii")
         rec=root/".claude-state"/"coordination"/"dual-lane"/"receipts"/"0.05-hook-enforced.json"; rec.parent.mkdir(parents=True)
@@ -250,6 +251,12 @@ def test_read_only_argv_json_stdin_and_tool_denial(fixture_tree):
     assert q["outputBytes"]>0 and q["spend"]["costUsd"]==0
     assert q["effort"]=="low"
     assert (fixture_tree["root"]/"effort.txt").read_text(encoding="utf-8-sig").strip()=="low"
+    # LANE-MODEL-CURRENCY-1: requestedModel is the table alias ('sonnet'); resolvedModel stays
+    # the third state 'unknown' -- never the requested string copied over -- because this
+    # fixture's child JSON carries no modelUsage field, so nothing proves what actually ran.
+    assert q["requestedModel"]=="sonnet"
+    assert q["resolvedModel"]=="unknown"
+    assert q["pinnedByOverride"] is False
     # LANE-NO-BACKGROUND-END-TURN-1 round 2 (hub ruling): NA-3 prohibits assigning ANY
     # CLAUDE_CODE_* variable, so the round-1 CLAUDE_CODE_DISABLE_BACKGROUND_TASKS child-env
     # flag was removed rather than narrowed. Assert it never reaches the child and never
@@ -337,6 +344,64 @@ def test_editing_settings_json_also_wires_lane_no_background_hook(fixture_tree):
     assert q["authority"]["backgroundGateForm"]=="exec"
     assert q["authority"]["backgroundGateHookArgs"]==hook_entry["args"]
     assert hook_entry["command"]==q["authority"]["backgroundGateInterpreterPath"]
+
+
+def test_codex_lane_resolves_tier_to_the_highest_version_slug_in_the_cache(fixture_tree):
+    # LANE-MODEL-CURRENCY-1: the table names a TIER ('sol'), never a pinned slug. A fixture
+    # cache (MLV_CODEX_MODELS_CACHE override, never the real ~/.codex/models_cache.json) makes
+    # this hermetic: it proves the launch resolves the tier to the CACHE's highest version, not
+    # that it merely passes the tier name straight through to `-m`.
+    cache=fixture_tree["root"]/"models_cache.json"
+    cache.write_text(json.dumps({"models":[{"slug":"gpt-5.6-sol"},{"slug":"gpt-6-sol"},{"slug":"gpt-6-solar"}]}),encoding="utf-8")
+    cmd,env,receipt=prepare(fixture_tree,"normal",lane="sol")
+    env=dict(env); env["MLV_CODEX_MODELS_CACHE"]=str(cache)
+    r=subprocess.run(cmd,env=env,text=True,capture_output=True,timeout=20)
+    assert r.returncode==0,(r.stdout,r.stderr)
+    argv=json.loads((fixture_tree["root"]/"args.json").read_text(encoding="utf-8-sig"))
+    assert argv[argv.index("-m")+1]=="gpt-6-sol"
+    q=json.loads(receipt.read_text(encoding="utf-8"))
+    assert q["requestedModel"]=="sol"
+    assert q["resolvedModel"]=="gpt-6-sol"
+    assert q["pinnedByOverride"] is False
+
+
+def test_model_override_bypasses_tier_resolution_and_is_recorded(fixture_tree):
+    cmd,env,receipt=prepare(fixture_tree,"normal",lane="luna")
+    cmd=cmd+["-ModelOverride","gpt-9-luna-pinned-for-test"]
+    r=subprocess.run(cmd,env=env,text=True,capture_output=True,timeout=20)
+    assert r.returncode==0,(r.stdout,r.stderr)
+    argv=json.loads((fixture_tree["root"]/"args.json").read_text(encoding="utf-8-sig"))
+    assert argv[argv.index("-m")+1]=="gpt-9-luna-pinned-for-test"
+    q=json.loads(receipt.read_text(encoding="utf-8"))
+    assert q["requestedModel"]=="luna"
+    assert q["resolvedModel"]=="gpt-9-luna-pinned-for-test"
+    assert q["pinnedByOverride"] is True
+
+
+def test_model_override_on_a_claude_lane_bypasses_the_alias(fixture_tree):
+    cmd,env,receipt=prepare(fixture_tree,"normal",lane="sonnet")
+    cmd=cmd+["-ModelOverride","claude-sonnet-5-pinned-for-test"]
+    r=subprocess.run(cmd,env=env,text=True,capture_output=True,timeout=20)
+    assert r.returncode==0,(r.stdout,r.stderr)
+    argv=json.loads((fixture_tree["root"]/"args.json").read_text(encoding="utf-8-sig"))
+    assert argv[argv.index("--model")+1]=="claude-sonnet-5-pinned-for-test"
+    q=json.loads(receipt.read_text(encoding="utf-8"))
+    assert q["requestedModel"]=="sonnet"
+    assert q["pinnedByOverride"] is True
+
+
+def test_codex_tier_resolution_fails_closed_when_the_cache_is_unavailable(fixture_tree):
+    # No fixture cache exists at this path, so resolution must refuse the launch entirely
+    # (a 'failed' receipt naming the reason) rather than pass the bare tier name to `-m`,
+    # which codex would silently reject or mis-launch.
+    cmd,env,receipt=prepare(fixture_tree,"normal",lane="sol")
+    env=dict(env); env["MLV_CODEX_MODELS_CACHE"]=str(fixture_tree["root"]/"no-such-cache.json")
+    r=subprocess.run(cmd,env=env,text=True,capture_output=True,timeout=20)
+    assert r.returncode!=0,(r.stdout,r.stderr)
+    q=json.loads(receipt.read_text(encoding="utf-8"))
+    assert q["state"]=="failed"
+    assert "codex-tier-resolution-failed" in (q["failure"] or "")
+    assert q["resolvedModel"]=="unknown"
 
 
 def test_codex_lane_gets_no_settings_file_or_flag(fixture_tree):
