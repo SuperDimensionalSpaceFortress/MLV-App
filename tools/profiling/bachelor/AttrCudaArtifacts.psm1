@@ -2229,6 +2229,138 @@ function Get-AttrCudaPresentMonDisplayReport {
     }
 }
 
+function Get-AttrCudaQuiescenceSample {
+    <#
+    .SYNOPSIS
+    One venue-quiescence sample: BOTH the legacy Win32_Processor.LoadPercentage (utility, kept
+    for continuity) and the \Processor(_Total)\% Processor Time counter (busy TIME, the gating
+    metric) -- never only the first.
+    .DESCRIPTION
+    UM-DISPLAY-SELECT-AND-LOG-1 round 2b. LoadPercentage is frequency-scaled processor UTILITY,
+    not busy time: a hub probe on Ultra-Magnus (2026-09-26T15:51Z, same ~26s window) read
+    LoadPercentage at 73/82/83 while \Processor(_Total)\% Processor Time read 21.4/43.2/37 on the
+    same i9-13900KS -- turbo inflates the former, so gating on it refused three legs at 58-83%
+    while actual busy time was ~15-40%. Both are still recorded (utilityPercent is diagnostic
+    context, never the gate), but timePercent is the one a caller compares to a threshold.
+    .OUTPUTS
+    [pscustomobject] with utilityPercent (double, $null if Win32_Processor could not be read),
+    timePercent (double, $null if the counter could not be read) and timePercentError (the
+    exception's bare type name, sanitized, when timePercent is $null; $null otherwise). Third
+    state, never folded into either number: a caller that finds timePercent -eq $null must treat
+    the whole sample as UNKNOWN, never as "0% busy".
+    #>
+    [CmdletBinding()]
+    param()
+
+    $utilityPercent = $null
+    try {
+        $utilityPercent = [double](Get-CimInstance Win32_Processor -ErrorAction Stop |
+            Measure-Object -Property LoadPercentage -Average).Average
+    } catch {
+        $utilityPercent = $null
+    }
+
+    $timePercent = $null
+    $timePercentError = $null
+    try {
+        $counter = Get-Counter -Counter '\Processor(_Total)\% Processor Time' -ErrorAction Stop
+        $timePercent = [double]$counter.CounterSamples[0].CookedValue
+    } catch {
+        $timePercent = $null
+        $timePercentError = $_.Exception.GetType().Name
+    }
+
+    [pscustomobject]@{
+        utilityPercent = $utilityPercent
+        timePercent = $timePercent
+        timePercentError = $timePercentError
+    }
+}
+
+function Get-AttrCudaProcessCpuSnapshot {
+    <#
+    .SYNOPSIS
+    {Id, Name, cpuSeconds} for every readable process right now, for Get-AttrCudaTopCpuProcesses.
+    .DESCRIPTION
+    A process that disappears, or whose CPU time is momentarily unreadable, is dropped from the
+    snapshot rather than failing the whole collection -- this is evidentiary (which process was
+    busy), never the gate itself, so a single throwing process must not take the sample down.
+    #>
+    [CmdletBinding()]
+    param()
+
+    $rows = @()
+    try {
+        $procs = Get-Process -ErrorAction Stop
+    } catch {
+        return $rows
+    }
+    foreach ($p in $procs) {
+        try {
+            if ($null -eq $p.TotalProcessorTime) { continue }
+            $rows += [pscustomobject]@{
+                id = $p.Id
+                name = $p.Name
+                cpuSeconds = $p.TotalProcessorTime.TotalSeconds
+            }
+        } catch {
+            continue
+        }
+    }
+    $rows
+}
+
+function Get-AttrCudaTopCpuProcesses {
+    <#
+    .SYNOPSIS
+    Top -Count processes by CPU-SECONDS CONSUMED between two Get-AttrCudaProcessCpuSnapshot calls
+    (never a point-in-time percentage), published as venue-quiescence evidence on both the pass
+    and refusal paths.
+    .DESCRIPTION
+    UM-DISPLAY-SELECT-AND-LOG-1 round 2b: the hub probe that found LoadPercentage's turbo-
+    inflation also found vmware-vmx (the board VM, which runs OTHER projects' builds) as the top
+    CPU consumer over the same window -- callers are expected to annotate that name specially
+    (see -VmProcessName), but this function itself makes no policy decision, only the ranking.
+    A process present in only one snapshot (started or exited mid-window) contributes nothing --
+    matched by Id, so PID reuse across the window cannot merge two different processes' time.
+    .OUTPUTS
+    Up to -Count [pscustomobject] rows, each {name, pid, cpuSeconds, note}, sorted by cpuSeconds
+    descending. note is $null except for -VmProcessName's exact name match (case-insensitive).
+    #>
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $true)]
+        [AllowEmptyCollection()]
+        [object[]]$Before,
+
+        [Parameter(Mandatory = $true)]
+        [AllowEmptyCollection()]
+        [object[]]$After,
+
+        [int]$Count = 10,
+
+        [string]$VmProcessName = 'vmware-vmx'
+    )
+
+    $beforeById = @{}
+    foreach ($p in $Before) { $beforeById[[int]$p.id] = $p }
+
+    $deltas = @()
+    foreach ($p in $After) {
+        $prior = $beforeById[[int]$p.id]
+        if ($null -eq $prior) { continue }
+        $delta = [double]$p.cpuSeconds - [double]$prior.cpuSeconds
+        if ($delta -le 0) { continue }
+        $deltas += [pscustomobject]@{
+            name = $p.name
+            pid = $p.id
+            cpuSeconds = [math]::Round($delta, 3)
+            note = $(if ($p.name -ieq $VmProcessName) { 'board VM (other projects can build here)' } else { $null })
+        }
+    }
+    $deltas | Sort-Object -Property cpuSeconds -Descending | Select-Object -First $Count
+}
+
 Export-ModuleMember -Function `
     Get-AttrCudaArtifactNames, `
     New-AttrCudaBuildInfoHeader, `
@@ -2268,4 +2400,7 @@ Export-ModuleMember -Function `
     Resolve-AttrCudaSmokeRunLog, `
     Get-AttrCudaLastEligibilityLine, `
     Get-AttrCudaEligibilityVerdict, `
-    Get-AttrCudaPresentMonDisplayReport
+    Get-AttrCudaPresentMonDisplayReport, `
+    Get-AttrCudaQuiescenceSample, `
+    Get-AttrCudaProcessCpuSnapshot, `
+    Get-AttrCudaTopCpuProcesses

@@ -457,7 +457,14 @@ $embeddedFunctions = Get-AttrCudaEmbeddedFunctionSource -Name @(
     # parses, clips to the playback window, groups by (ProcessID, SwapChainAddress), and returns a
     # typed PRESENTMON_UNAVAILABLE/DISPLAY_ASLEEP refusal instead of an uncaught throw. See its own
     # header in AttrCudaArtifacts.psm1.
-    'Get-AttrCudaPresentMonDisplayReport'
+    'Get-AttrCudaPresentMonDisplayReport',
+    # UM-DISPLAY-SELECT-AND-LOG-1 round 2b: the venue-quiescence gate now reads busy TIME
+    # (\Processor(_Total)\% Processor Time), not frequency-scaled utility (LoadPercentage),
+    # and publishes the top CPU-seconds consumers as evidence on both the pass and refusal
+    # paths. See these functions' own headers in AttrCudaArtifacts.psm1.
+    'Get-AttrCudaQuiescenceSample',
+    'Get-AttrCudaProcessCpuSnapshot',
+    'Get-AttrCudaTopCpuProcesses'
 )
 # ATTR3-FOOTAGE-BIND-1 PR-B round 4b: the private verified-part directory (one hard link per
 # verified part, under a neutral name derived from its index, so nothing downstream -- the smoke
@@ -1035,27 +1042,59 @@ reg add "HKCU\Software\magiclantern.MLVApp\MLVApp\Playback" /v PreviewMode /t RE
 reg add "HKCU\Software\magiclantern.MLVApp\MLVApp\Playback" /v ScaleFactorOverride /t REG_DWORD /d 0 /f | Out-Null
 reg add "HKCU\Software\magiclantern.MLVApp\MLVApp\Playback" /v PreviewResolution /t REG_DWORD /d 0 /f | Out-Null
 
-$loads = @()
+# UM-DISPLAY-SELECT-AND-LOG-1 round 2b: LoadPercentage is frequency-scaled processor UTILITY,
+# not busy time -- a hub probe on Ultra-Magnus (2026-09-26T15:51Z, same ~26s window) read
+# LoadPercentage at 73/82/83 while \Processor(_Total)\% Processor Time read 21.4/43.2/37 on the
+# same i9-13900KS, so gating on utility alone refused three legs at 58-83% while real busy time
+# was ~15-40%. The gate below reads TIME; utility is still recorded for continuity, never for the
+# decision. Both metrics and the top 10 CPU-seconds consumers are published in summary.json on
+# BOTH this refusal path and the pass path (see the cpuQuiescence block in the evidence
+# manifest written further down).
+$cpuProcessBefore = Get-AttrCudaProcessCpuSnapshot
+$cpuUtilitySamples = @()
+$cpuTimeSamples = @()
+$cpuTimeUnknownReason = $null
 for ($i = 0; $i -lt 3; $i++) {
-    $loads += [double](Get-CimInstance Win32_Processor | Measure-Object -Property LoadPercentage -Average).Average
+    $sample = Get-AttrCudaQuiescenceSample
+    $cpuUtilitySamples += $sample.utilityPercent
+    if ($null -eq $sample.timePercent) {
+        if ($null -eq $cpuTimeUnknownReason) { $cpuTimeUnknownReason = $sample.timePercentError }
+    } else {
+        $cpuTimeSamples += $sample.timePercent
+    }
     if ($i -lt 2) { Start-Sleep -Seconds 12 }
 }
-$avgLoad = Get-Mean $loads
-if ($avgLoad -gt 20.0) {
+$cpuProcessAfter = Get-AttrCudaProcessCpuSnapshot
+$topCpuProcesses = @(Get-AttrCudaTopCpuProcesses -Before $cpuProcessBefore -After $cpuProcessAfter -Count 10)
+
+$avgUtility = Get-Mean ($cpuUtilitySamples | Where-Object { $null -ne $_ })
+# Third state: a sample count short of every requested reading (one or more counter reads
+# failed) makes the WHOLE gate unknown and REFUSES -- never averaged over whatever did read,
+# which would silently treat "could not measure" as "measured low".
+$cpuTimeUnknown = $cpuTimeSamples.Count -lt 3
+$avgTime = if ($cpuTimeUnknown) { $null } else { Get-Mean $cpuTimeSamples }
+$cpuThresholdPercent = 20.0
+if ($cpuTimeUnknown -or $avgTime -gt $cpuThresholdPercent) {
     $venue = [ordered]@{
         schema='playback-attr-3-cuda-venue.v1'
         result='VENUE_NOT_QUIESCENT'
         fixtureRehearsal=$FixtureRehearsal
-        cpuSamples=$loads
-        cpuMean=$avgLoad
-        cpuThresholdPercent=20.0
+        cpuUtilitySamples=$cpuUtilitySamples
+        cpuUtilityMean=$avgUtility
+        cpuTimeSamples=$cpuTimeSamples
+        cpuTimeMean=$avgTime
+        cpuTimeUnknown=$cpuTimeUnknown
+        cpuTimeUnknownReason=$cpuTimeUnknownReason
+        cpuThresholdPercent=$cpuThresholdPercent
+        topCpuProcesses=$topCpuProcesses
         sourceCommit=$SourceCommit
         clipId=$ClipId
         executableSha256=$cacheExeSha
         artifactRoot=$Pub
     }
     Save-Json $venue (Join-Path $Pub 'summary.json')
-    Write-Output "RESULT=VENUE_NOT_QUIESCENT CPU_MEAN=$avgLoad ARTIFACTS=$Pub"
+    $cpuTimeField = if ($cpuTimeUnknown) { 'unknown' } else { $avgTime }
+    Write-Output "RESULT=VENUE_NOT_QUIESCENT CPU_TIME=$cpuTimeField CPU_UTILITY=$avgUtility ARTIFACTS=$Pub"
     exit 12
 }
 
@@ -1488,7 +1527,14 @@ $manifest = [ordered]@{
         clockBracket=$displayReport.clockBracket
     }
     environmentBoundary = [ordered]@{ jobTempDir=$Scratch; allChildrenInheritJobTemp=$true }
-    cpuQuiescence = [ordered]@{ samples=$loads; meanPercent=$avgLoad; thresholdPercent=20.0; pass=($avgLoad -le 20.0) }
+    # Round 2b: recorded on this PASS path too, not only on a VENUE_NOT_QUIESCENT refusal.
+    cpuQuiescence = [ordered]@{
+        utilitySamples=$cpuUtilitySamples; utilityMeanPercent=$avgUtility
+        timeSamples=$cpuTimeSamples; timeMeanPercent=$avgTime; timeUnknown=$cpuTimeUnknown
+        thresholdPercent=$cpuThresholdPercent
+        pass=(-not $cpuTimeUnknown -and $avgTime -le $cpuThresholdPercent)
+        topCpuProcesses=$topCpuProcesses
+    }
     frameRows = $rows.Count
     smokeRunLog = [ordered]@{ path=$runLog.path; sha256=$runLog.sha256; bytes=$runLog.bytes; runNonce=$runLog.runNonce; source=$runLog.source }
     diagnostics = $diagnostics
@@ -1515,6 +1561,7 @@ Save-Json ([ordered]@{
     presentMonSamples = $pmRows.Count
     presentMonSelectedChain = $displayReport.selectedChain
     clockBracket = $displayReport.clockBracket
+    cpuQuiescence = $manifest.cpuQuiescence
     diagnostics = $diagnostics
     artifactRoot = $Pub
 }) (Join-Path $Pub 'summary.json')
@@ -1524,7 +1571,8 @@ Save-Json ([ordered]@{ schema='playback-attr-3-cuda-artifact-index.v1'; artifact
 # outbox result.json carries stdout and nothing else, so a reader who never opens an artifact
 # still cannot mistake a rehearsal for a measurement.
 $resultVerb = if ($FixtureRehearsal) { 'FIXTURE_REHEARSAL_CAPTURED' } else { 'MEASUREMENT_CAPTURED' }
-Write-Output "RESULT=$resultVerb FIXTURE_REHEARSAL=$FixtureRehearsal SOURCE=$SourceCommit CLIP=$ClipId ROWS=$($rows.Count) GPU_FRAMES=$gpuFramesTotal CPU_FRAMES=$($gpuSummary.cpuFrames) PRESENTMON_SAMPLES=$($pmRows.Count) ARTIFACTS=$Pub"
+$cpuTimeResultField = if ($cpuTimeUnknown) { 'unknown' } else { $avgTime }
+Write-Output "RESULT=$resultVerb FIXTURE_REHEARSAL=$FixtureRehearsal SOURCE=$SourceCommit CLIP=$ClipId ROWS=$($rows.Count) GPU_FRAMES=$gpuFramesTotal CPU_FRAMES=$($gpuSummary.cpuFrames) PRESENTMON_SAMPLES=$($pmRows.Count) CPU_TIME=$cpuTimeResultField CPU_UTILITY=$avgUtility ARTIFACTS=$Pub"
 exit 0
 } finally {
     if ($OwnerClipDir) {
