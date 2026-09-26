@@ -232,6 +232,43 @@ class GuiSmokeDisplaySelectionParsingTests(_ProbeCase):
         self.assertIn("TE=no gui_smoke.display_target line found", proc.stdout)
         self.assertIn("PE=no gui_smoke.window_placement line found", proc.stdout)
 
+    def test_window_placement_parses_the_appended_target_and_presentation_fields(self) -> None:
+        # UM-DISPLAY-SELECT-AND-LOG-1 round 1c (sol BLOCKER 3): the appended fields report the
+        # ACTUAL presentation screen separately from the intended target.
+        log_path = self._write_log(
+            'gui_smoke.window_placement mode=fullscreen screen="\\\\.\\DISPLAY1" verified=0 '
+            'window=0,0 3840x2160 preview=3840x2160 target_screen="\\\\.\\DISPLAY1" '
+            'presentation_screen="\\\\.\\DISPLAY2" presentation_physical=2560x1440\n'
+        )
+        proc = self.run_snippet(
+            f"$log = [IO.File]::ReadAllText('{log_path}')\n"
+            "$sel = Get-AttrCudaGuiSmokeDisplaySelection -LogText $log\n"
+            "Write-Host \"TARGET_SCREEN=$($sel.placement.targetScreenName) "
+            "PRESENTATION_SCREEN=$($sel.placement.presentationScreenName) "
+            "PW=$($sel.placement.presentationPhysicalWidth) PH=$($sel.placement.presentationPhysicalHeight)\"\n"
+        )
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        self.assertIn(
+            r"TARGET_SCREEN=\\.\DISPLAY1 PRESENTATION_SCREEN=\\.\DISPLAY2 PW=2560 PH=1440",
+            proc.stdout,
+        )
+
+    def test_window_placement_without_the_appended_fields_reads_them_as_null_never_guessed(self) -> None:
+        # A legacy log line (predates round 1c) must still parse on its pre-existing fields.
+        log_path = self._write_log(SAMPLE_LOG_4K)
+        proc = self.run_snippet(
+            f"$log = [IO.File]::ReadAllText('{log_path}')\n"
+            "$sel = Get-AttrCudaGuiSmokeDisplaySelection -LogText $log\n"
+            "Write-Host \"TARGET_SCREEN_NULL=$($null -eq $sel.placement.targetScreenName) "
+            "PRESENTATION_SCREEN_NULL=$($null -eq $sel.placement.presentationScreenName) "
+            "MODE=$($sel.placement.mode) VERIFIED=$($sel.placement.verified)\"\n"
+        )
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        self.assertIn(
+            "TARGET_SCREEN_NULL=True PRESENTATION_SCREEN_NULL=True MODE=fullscreen VERIFIED=True",
+            proc.stdout,
+        )
+
     def test_a_log_with_screens_but_no_target_line_reports_target_unknown_not_the_first_screen(self) -> None:
         # A build that logs the inventory but never reaches the target-selection line (e.g. it
         # threw first) must never be silently treated as "chose the first screen".
@@ -392,6 +429,86 @@ class TemplateDisplayBlockExecutionTests(_ProbeCase):
         )
         self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
         self.assertIn("DEGRADED=unknown", proc.stdout)
+
+    def test_a_rejected_move_reports_the_actual_presentation_screen_not_the_intended_target(self) -> None:
+        # UM-DISPLAY-SELECT-AND-LOG-1 round 1c (sol BLOCKER 3 job-side gap / opus design-review
+        # item 3): a rejected move leaves target and presentation different (verified=0) --
+        # DISPLAY=/RES=/DEGRADED= must report where playback actually ran (the Denon fallback,
+        # 2560x1440), never the intended 4K target, or sol's blocker moves one layer down into
+        # this job.
+        proc = self.run_probe(
+            "$inv = [pscustomobject]@{ collected = $true; devices = @([pscustomobject]@{ "
+            "deviceName='\\\\.\\DISPLAY2'; modeCollected=$true; width=2560; height=1440 }); error = $null }\n"
+            "$appSel = [pscustomobject]@{\n"
+            "    screensCollected = $true\n"
+            "    screens = @(\n"
+            "        [ordered]@{ name='TARGET'; physicalWidth=3840; physicalHeight=2160; refreshHz=60.0 },\n"
+            "        [ordered]@{ name='PRESENTED'; physicalWidth=2560; physicalHeight=1440; refreshHz=60.0 }\n"
+            "    )\n"
+            "    screensError = $null\n"
+            "    target = [ordered]@{ name='TARGET'; reason='max_physical_pixels'; candidates=2; fallback=$false }\n"
+            "    targetError = $null\n"
+            "    placement = [ordered]@{ mode='fullscreen'; previewWidth=2560; previewHeight=1440; "
+            "verified=$false; targetScreenName='TARGET'; presentationScreenName='PRESENTED'; "
+            "presentationPhysicalWidth=2560; presentationPhysicalHeight=1440 }\n"
+            "    placementError = $null\n"
+            "}\n"
+            "$block = Build-AttrCudaDisplayBlock -WindowsInventory $inv -Venue 'ultra-magnus' "
+            "-ExpectedWidth 3840 -ExpectedHeight 2160 -AppSelection $appSel\n"
+            "Write-Host (Get-AttrCudaDisplayResultTail $block)\n"
+            "Write-Host \"TARGET_NAME=$($block.target.name) PRESENTATION_NAME=$($block.presentation.name) "
+            "PLACEMENT_VERIFIED=$($block.placementVerified)\"\n"
+        )
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        self.assertIn("DISPLAY=PRESENTED RES=2560x1440@60 DEGRADED=1 PREVIEW=2560x1440", proc.stdout)
+        self.assertIn("TARGET_NAME=TARGET PRESENTATION_NAME=PRESENTED PLACEMENT_VERIFIED=False", proc.stdout)
+
+    def test_a_verified_move_reports_the_same_presentation_as_target(self) -> None:
+        proc = self.run_probe(
+            "$inv = [pscustomobject]@{ collected = $true; devices = @([pscustomobject]@{ "
+            "deviceName='\\\\.\\DISPLAY1'; modeCollected=$true; width=3840; height=2160 }); error = $null }\n"
+            "$appSel = [pscustomobject]@{\n"
+            "    screensCollected = $true\n"
+            "    screens = @([ordered]@{ name='X'; physicalWidth=3840; physicalHeight=2160; refreshHz=60.0 })\n"
+            "    screensError = $null\n"
+            "    target = [ordered]@{ name='X'; reason='max_physical_pixels'; candidates=1; fallback=$false }\n"
+            "    targetError = $null\n"
+            "    placement = [ordered]@{ mode='fullscreen'; previewWidth=3840; previewHeight=2160; "
+            "verified=$true; targetScreenName='X'; presentationScreenName='X'; "
+            "presentationPhysicalWidth=3840; presentationPhysicalHeight=2160 }\n"
+            "    placementError = $null\n"
+            "}\n"
+            "$block = Build-AttrCudaDisplayBlock -WindowsInventory $inv -Venue 'ultra-magnus' "
+            "-ExpectedWidth 3840 -ExpectedHeight 2160 -AppSelection $appSel\n"
+            "Write-Host (Get-AttrCudaDisplayResultTail $block)\n"
+        )
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        self.assertIn("DISPLAY=X RES=3840x2160@60 DEGRADED=0 PREVIEW=3840x2160", proc.stdout)
+
+    def test_a_legacy_placement_with_no_presentation_field_falls_back_to_the_target(self) -> None:
+        # Pre-round-1c behavior preserved for a legacy binary/log that never logged
+        # presentation_screen=.
+        proc = self.run_probe(
+            "$inv = [pscustomobject]@{ collected = $true; devices = @([pscustomobject]@{ "
+            "deviceName='\\\\.\\DISPLAY1'; modeCollected=$true; width=3840; height=2160 }); error = $null }\n"
+            "$appSel = [pscustomobject]@{\n"
+            "    screensCollected = $true\n"
+            "    screens = @([ordered]@{ name='X'; physicalWidth=3840; physicalHeight=2160; refreshHz=60.0 })\n"
+            "    screensError = $null\n"
+            "    target = [ordered]@{ name='X'; reason='max_physical_pixels'; candidates=1; fallback=$false }\n"
+            "    targetError = $null\n"
+            "    placement = [ordered]@{ mode='fullscreen'; previewWidth=3840; previewHeight=2160 }\n"
+            "    placementError = $null\n"
+            "}\n"
+            "$block = Build-AttrCudaDisplayBlock -WindowsInventory $inv -Venue 'ultra-magnus' "
+            "-ExpectedWidth 3840 -ExpectedHeight 2160 -AppSelection $appSel\n"
+            "Write-Host (Get-AttrCudaDisplayResultTail $block)\n"
+            "Write-Host \"PRESENTATION_NULL=$($null -eq $block.presentation) "
+            "REASON=$($block.presentationUnknownReason)\"\n"
+        )
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        self.assertIn("DISPLAY=X RES=3840x2160@60 DEGRADED=0 PREVIEW=3840x2160", proc.stdout)
+        self.assertIn("PRESENTATION_NULL=True", proc.stdout)
 
     def test_before_the_smoke_log_is_available_every_field_reads_unknown(self) -> None:
         proc = self.run_probe(

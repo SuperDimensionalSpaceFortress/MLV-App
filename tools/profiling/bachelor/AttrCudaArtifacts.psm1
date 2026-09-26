@@ -2620,7 +2620,13 @@ function Get-AttrCudaGuiSmokeDisplaySelection {
     serial,geometryX,geometryY,width,height,physicalWidth,physicalHeight,devicePixelRatio,
     refreshHz,primary}); screensError; target ({name,reason,candidates,fallback} or $null);
     targetError; placement ({mode,screenName,verified,windowX,windowY,windowWidth,windowHeight,
-    previewWidth,previewHeight} or $null); placementError }.
+    previewWidth,previewHeight,targetScreenName,presentationScreenName,
+    presentationPhysicalWidth,presentationPhysicalHeight} or $null); placementError }.
+    UM-DISPLAY-SELECT-AND-LOG-1 round 1c (sol BLOCKER 3): targetScreenName/presentationScreenName/
+    presentationPhysical* are appended fields on the window_placement line (MainWindow.cpp) --
+    all four read $null on a legacy log line that predates them (the regex's trailing group is
+    optional), never guessed from screenName, which stays the INTENDED target's name for
+    back-compat with every caller/test that predates this round.
     #>
     [CmdletBinding()]
     param(
@@ -2712,9 +2718,16 @@ function Get-AttrCudaGuiSmokeDisplaySelection {
         if ($null -eq $placementLine) {
             $result.placementError = 'no gui_smoke.window_placement line found in the smoke log'
         } else {
+            # UM-DISPLAY-SELECT-AND-LOG-1 round 1c (sol BLOCKER 3): the trailing group is
+            # OPTIONAL -- a legacy log line that predates target_screen=/presentation_screen=/
+            # presentation_physical= (an older "before" binary in an A/B, or a log this parser
+            # has not been told about yet) still matches on its pre-existing fields, with all
+            # four new captures reading $null, never guessed.
             $m = [regex]::Match($placementLine,
                 'mode=(?<mode>\w+) screen="(?<name>[^"]*)" verified=(?<verified>[01]) ' +
-                'window=(?<wx>-?\d+),(?<wy>-?\d+) (?<ww>\d+)x(?<wh>\d+) preview=(?<pw>\d+)x(?<ph>\d+)')
+                'window=(?<wx>-?\d+),(?<wy>-?\d+) (?<ww>\d+)x(?<wh>\d+) preview=(?<pw>\d+)x(?<ph>\d+)' +
+                '(?: target_screen="(?<targetScreen>[^"]*)" presentation_screen="(?<presentationScreen>[^"]*)" ' +
+                'presentation_physical=(?<ppw>\d+)x(?<pph>\d+))?')
             if (-not $m.Success) {
                 $result.placementError = 'gui_smoke.window_placement line did not match the expected shape'
             } else {
@@ -2728,6 +2741,10 @@ function Get-AttrCudaGuiSmokeDisplaySelection {
                     windowHeight = [int]$m.Groups['wh'].Value
                     previewWidth = [int]$m.Groups['pw'].Value
                     previewHeight = [int]$m.Groups['ph'].Value
+                    targetScreenName = $(if ($m.Groups['targetScreen'].Success) { $m.Groups['targetScreen'].Value } else { $null })
+                    presentationScreenName = $(if ($m.Groups['presentationScreen'].Success) { $m.Groups['presentationScreen'].Value } else { $null })
+                    presentationPhysicalWidth = $(if ($m.Groups['ppw'].Success) { [int]$m.Groups['ppw'].Value } else { $null })
+                    presentationPhysicalHeight = $(if ($m.Groups['pph'].Success) { [int]$m.Groups['pph'].Value } else { $null })
                 }
             }
         }

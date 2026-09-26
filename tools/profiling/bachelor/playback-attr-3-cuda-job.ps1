@@ -852,6 +852,38 @@ function Build-AttrCudaDisplayBlock {
         $targetUnknownReason = $targetError
     }
 
+    # UM-DISPLAY-SELECT-AND-LOG-1 round 1c (sol BLOCKER 3 job-side gap / opus design-review
+    # item 3): the ACTUAL presentation screen -- MainWindow.cpp's own re-verified
+    # this->screen(), never the merely-intended target -- is what a leg was really
+    # benchmarked on. A rejected move (this topology has two same-size 4K outputs, so size
+    # alone cannot tell them apart) leaves target/presentation different; publishing only the
+    # target here would be sol's blocker moved one layer down into this job. $null on a
+    # legacy log line that predates the presentation_screen= field (never guessed).
+    $presentationName = if ($placement) { $placement.presentationScreenName } else { $null }
+    $presentationPhysical = $null
+    if ($null -ne $presentationName) {
+        $presentationPhysical = $screens | Where-Object { $_.name -eq $presentationName } | Select-Object -First 1
+    }
+    $presentationBlock = $null
+    $presentationUnknownReason = $null
+    if ($null -ne $presentationPhysical) {
+        $presentationBlock = [ordered]@{
+            name = $presentationName
+            width = $presentationPhysical.physicalWidth
+            height = $presentationPhysical.physicalHeight
+            refreshHz = $presentationPhysical.refreshHz
+        }
+    } elseif ($null -ne $presentationName) {
+        $presentationUnknownReason = 'no gui_smoke.display_screen line matched the presentation screen name'
+    } elseif ($appKnown) {
+        $presentationUnknownReason = 'smoke log has no presentation_screen field (legacy binary, or window_placement did not match)'
+    } else {
+        $presentationUnknownReason = 'smoke log not yet available'
+    }
+    # The value actually measured against -- presentation when knowable, else the intended
+    # target (the pre-round-1c behavior, kept as the fallback for a legacy binary/log).
+    $effectiveBlock = if ($presentationBlock) { $presentationBlock } else { $targetBlock }
+
     # UM-DISPLAY-SELECT-AND-LOG-1 round 1c (sol BLOCKER 2 / opus design-review hardening): the
     # verdict must be blind to the app's own report the moment the INDEPENDENT Windows-API
     # inventory it is meant to be cross-checked against cannot itself be trusted -- collected=
@@ -859,8 +891,8 @@ function Build-AttrCudaDisplayBlock {
     # plausible in the headless/Session-0 contexts this fleet has hit before).
     $windowsAnyModeCollected = [bool]($WindowsInventory.devices | Where-Object { $_.modeCollected } | Select-Object -First 1)
     $degraded = Get-AttrCudaDisplayDegradedState `
-        -TargetWidth $(if ($targetBlock) { $targetBlock.width } else { $null }) `
-        -TargetHeight $(if ($targetBlock) { $targetBlock.height } else { $null }) `
+        -TargetWidth $(if ($effectiveBlock) { $effectiveBlock.width } else { $null }) `
+        -TargetHeight $(if ($effectiveBlock) { $effectiveBlock.height } else { $null }) `
         -ExpectedWidth $ExpectedWidth -ExpectedHeight $ExpectedHeight `
         -WindowsCollected ([bool]$WindowsInventory.collected) -WindowsAnyModeCollected $windowsAnyModeCollected
 
@@ -875,6 +907,9 @@ function Build-AttrCudaDisplayBlock {
         targetSelectionReason = $(if ($targetInfo) { $targetInfo.reason } else { $null })
         targetCandidates = $(if ($targetInfo) { $targetInfo.candidates } else { $null })
         targetUnknownReason = $targetUnknownReason
+        presentation = $presentationBlock
+        presentationUnknownReason = $presentationUnknownReason
+        placementVerified = $(if ($placement) { $placement.verified } else { 'unknown' })
         selectionFallback = $(if ($targetInfo) { $targetInfo.fallback } else { 'unknown' })
         mode = $(if ($placement) { $placement.mode } else { 'unknown' })
         preview = $(if ($placement) { [ordered]@{ width = $placement.previewWidth; height = $placement.previewHeight } } else { $null })
@@ -891,9 +926,14 @@ function Get-AttrCudaDisplayResultTail([object]$DisplayBlock) {
     # RESULT= line from the point the display block is fully known onward (once the smoke log has
     # been parsed). Third state (item e): a $null target/preview reads 'unknown', never a guessed
     # value and never folded into a passing/zero reading.
-    $displayName = if ($DisplayBlock.target) { $DisplayBlock.target.name } else { 'unknown' }
-    $res = if ($DisplayBlock.target) {
-        "$($DisplayBlock.target.width)x$($DisplayBlock.target.height)@$($DisplayBlock.target.refreshHz)"
+    # Round 1c (sol BLOCKER 3 job-side gap): DISPLAY=/RES= report the ACTUAL presentation
+    # screen once known, falling back to the intended target only when presentation is not
+    # knowable (a legacy binary/log) -- never the reverse, which is exactly the failure sol
+    # flagged: a rejected move whose RESULT line still named the 4K target.
+    $effective = if ($DisplayBlock.presentation) { $DisplayBlock.presentation } else { $DisplayBlock.target }
+    $displayName = if ($effective) { $effective.name } else { 'unknown' }
+    $res = if ($effective) {
+        "$($effective.width)x$($effective.height)@$($effective.refreshHz)"
     } else { 'unknown' }
     $degradedField =
         if ($DisplayBlock.displayDegraded -eq $true) { '1' }
