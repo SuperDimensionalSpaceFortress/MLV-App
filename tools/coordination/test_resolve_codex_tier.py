@@ -75,6 +75,28 @@ class ResolveCodexTierUnitTests(unittest.TestCase):
         self.assertIsNone(resolved)
         self.assertEqual(error, "cache-malformed:no-models-list")
 
+    # CODEX-OVERSIZED-VERSION-TOKEN-1 (sol hardening): SLUG_RE has no length cap on the version
+    # digits, but CPython's int() conversion refuses a decimal string past its configured digit
+    # limit (ValueError, default ~4300 digits) as a DoS guard -- a real-world stand-in is a
+    # corrupted or adversarial models_cache.json entry. This must be skipped as a non-candidate,
+    # never crash resolve() with an uncaught ValueError, whether or not a valid candidate exists
+    # alongside it.
+    def test_skips_a_candidate_whose_version_token_exceeds_the_int_conversion_limit(self):
+        cache = Path(self._tmp()) / "models_cache.json"
+        oversized = "gpt-" + ("9" * 5000) + "-sol"
+        _write_cache(cache, [oversized, "gpt-6-sol", "gpt-5-sol"])
+        resolved, error = resolve_codex_tier.resolve("sol", str(cache))
+        self.assertIsNone(error)
+        self.assertEqual(resolved, "gpt-6-sol")
+
+    def test_fails_closed_when_only_candidate_has_an_oversized_version_token(self):
+        cache = Path(self._tmp()) / "models_cache.json"
+        oversized = "gpt-" + ("9" * 5000) + "-sol"
+        _write_cache(cache, [oversized])
+        resolved, error = resolve_codex_tier.resolve("sol", str(cache))
+        self.assertIsNone(resolved)
+        self.assertEqual(error, "no-tier-match:sol")
+
     def _tmp(self):
         import tempfile
         d = tempfile.mkdtemp(prefix="resolve-codex-tier-")
@@ -111,6 +133,19 @@ class ResolveCodexTierCliTests(unittest.TestCase):
         payload = json.loads(result.stdout)
         self.assertFalse(payload["ok"])
         self.assertTrue(payload["error"].startswith("cache-not-found:"))
+
+    def test_cli_skips_oversized_version_token_and_still_emits_one_json_object(self):
+        cache = Path(self._tmp()) / "models_cache.json"
+        oversized = "gpt-" + ("9" * 5000) + "-sol"
+        _write_cache(cache, [oversized, "gpt-6-sol"])
+        result = subprocess.run(
+            [sys.executable, str(SCRIPT), "--tier", "sol", "--cache", str(cache)],
+            capture_output=True, text=True, timeout=15,
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        payload = json.loads(result.stdout)
+        self.assertTrue(payload["ok"])
+        self.assertEqual(payload["resolvedModel"], "gpt-6-sol")
 
     def test_cli_fail_closed_exit_nonzero_on_non_utf8_cache(self):
         cache = Path(self._tmp()) / "models_cache.json"

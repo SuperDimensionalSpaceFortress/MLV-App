@@ -52,7 +52,18 @@ def resolve(tier, cache_path):
         match = SLUG_RE.match(slug)
         if not match or match.group("tier") != tier:
             continue
-        candidates.append((_parse_version(match.group("version")), slug))
+        # CODEX-OVERSIZED-VERSION-TOKEN-1 (sol hardening): SLUG_RE has no length limit on the
+        # version digits, but CPython's int() conversion refuses a decimal string beyond its
+        # configured digit limit (ValueError, default ~4300 digits) as a DoS guard. A cache
+        # entry with a version token that long is semantically malformed either way, so it is
+        # skipped as a non-candidate -- the same treatment as a slug that fails SLUG_RE entirely
+        # -- rather than raising past resolve()'s callers and breaking the one-JSON-object
+        # failure contract every other malformed-cache path here already keeps.
+        try:
+            version = _parse_version(match.group("version"))
+        except ValueError:
+            continue
+        candidates.append((version, slug))
     if not candidates:
         return None, "no-tier-match:%s" % tier
     candidates.sort(key=lambda pair: pair[0])

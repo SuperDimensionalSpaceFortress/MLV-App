@@ -494,6 +494,77 @@ def test_codex_tier_resolution_fails_closed_when_the_cache_is_unavailable(fixtur
     assert q["resolvedModel"]=="unknown"
 
 
+# LANE-MODEL-CURRENCY-1 round 2 (sol blocker 2): resolvedModel must never be assigned before the
+# child is proven to have run. Tier resolution succeeds (selectedModel gets recorded), but
+# Process.Start is made to throw in place of an unstartable codex executable -- the exact
+# repro sol gave: "CODEX_EXE is missing or unstartable ... Process.Start then throws".
+def test_codex_start_failure_leaves_resolved_model_unknown_with_selected_model_recorded(fixture_tree):
+    def mutation(text):
+        old = ("} else {\n"
+               "    $psi.FileName = $exe\n"
+               "    foreach ($a in $argv) { [void]$psi.ArgumentList.Add($a) }\n"
+               "    $proc = [Diagnostics.Process]::Start($psi)\n"
+               "}")
+        assert old in text, "codex Process.Start block text has moved; update this fixture mutation"
+        new = ("} else {\n"
+               "    $psi.FileName = $exe\n"
+               "    foreach ($a in $argv) { [void]$psi.ArgumentList.Add($a) }\n"
+               "    throw [ComponentModel.Win32Exception]::new(2, 'fixture-codex-start-failure')\n"
+               "}")
+        return text.replace(old, new)
+    cmd,env,receipt=prepare(fixture_tree,"normal",lane="sol",mutation=mutation)
+    r=subprocess.run(cmd,env=env,text=True,capture_output=True,timeout=20)
+    assert r.returncode!=0,(r.stdout,r.stderr)
+    q=json.loads(receipt.read_text(encoding="utf-8"))
+    assert q["state"]=="failed"
+    assert q["requestedModel"]=="sol"
+    assert q["selectedModel"]=="gpt-6-sol", "the pre-launch choice must still be recorded"
+    assert q["resolvedModel"]=="unknown", "a model that never ran must never be named resolvedModel"
+
+
+# CODEX-RESOLVER-UNTYPED-EDGE-1 (fable hardening): a resolver that emits well-formed JSON
+# lacking an 'ok' key (e.g. a corrupted resolve-codex-tier.py) must still fail closed through
+# the SAME typed 'codex-tier-resolution-failed' token as an ordinary ok:false result, not a raw
+# StrictMode PropertyNotFoundException message.
+def test_codex_resolver_degenerate_json_without_ok_field_fails_closed_with_typed_token(fixture_tree):
+    cmd,env,receipt=prepare(fixture_tree,"normal",lane="sol")
+    resolver=fixture_tree["root"]/"resolve-codex-tier.py"
+    resolver.write_text("import json\nprint(json.dumps({}))\n", encoding="utf-8")
+    r=subprocess.run(cmd,env=env,text=True,capture_output=True,timeout=20)
+    assert r.returncode!=0,(r.stdout,r.stderr)
+    q=json.loads(receipt.read_text(encoding="utf-8"))
+    assert q["state"]=="failed"
+    assert "codex-tier-resolution-failed" in (q["failure"] or "")
+    assert q["resolvedModel"]=="unknown"
+
+
+# LANE-MODEL-CURRENCY-1 round 2 (sol blocker 1): a REAL lane launch (an unmodified
+# $CLAUDE_EXE/$CODEX_EXE, i.e. equal to the launcher's own $REAL_CLAUDE_EXE/$REAL_CODEX_EXE
+# twin) must refuse any effort other than 'high'. prepare() always replaces $CLAUDE_EXE/
+# $CODEX_EXE with a disposable shim (so no test can ever launch a real model), so this test
+# additionally points $REAL_CLAUDE_EXE at that SAME shim path -- the only way to make
+# $ConfiguredExeForLane -eq $RealExeForLane true without ever touching a real CLI -- to prove
+# the refusal fires for what the launcher considers a real launch, while every other test in
+# this file (which never touches $REAL_CLAUDE_EXE) proves the refusal is skipped for the
+# fixture's own provably-fake path.
+def test_real_lane_launch_refuses_non_high_effort(fixture_tree):
+    def mutation(text):
+        old = "$REAL_CLAUDE_EXE = Join-Path $env:APPDATA 'npm\\claude.cmd'"
+        assert old in text, "REAL_CLAUDE_EXE declaration has moved; update this fixture mutation"
+        shim_literal = str(fixture_tree["shim"]).replace("'", "''")
+        return text.replace(old, "$REAL_CLAUDE_EXE = '" + shim_literal + "'")
+    cmd,env,receipt=prepare(fixture_tree,"normal",lane="sonnet",mutation=mutation)
+    r=subprocess.run(cmd,env=env,text=True,capture_output=True,timeout=20)
+    assert r.returncode!=0,(r.stdout,r.stderr)
+    q=json.loads(receipt.read_text(encoding="utf-8"))
+    assert q["state"]=="failed"
+    assert "lane-effort-must-be-high" in (q["failure"] or "")
+    # Refused before the dispatch ledger row is ever written, so a refused launch is never
+    # counted as an attempt.
+    assert q["dispatchLedger"]["state"] is None
+    assert q["dispatchLedger"]["reservationId"] is None
+
+
 def test_codex_lane_gets_no_settings_file_or_flag(fixture_tree):
     cmd,env,receipt=prepare(fixture_tree,"normal",lane="sol")
     r=subprocess.run(cmd,env=env,text=True,capture_output=True,timeout=20)

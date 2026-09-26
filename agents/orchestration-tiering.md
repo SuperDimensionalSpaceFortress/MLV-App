@@ -23,13 +23,13 @@ own output, or the resolver, proved actually ran), never a copy of one for the o
 
 | tier | model | effort | does | never does |
 |---|---|---|---|---|
-| judgement | Fable (`fable` alias row in `tools/coordination/Invoke-Lane.ps1`, or a Fable chat session) | high by default (`tools/coordination/Invoke-Lane.ps1`'s `fable` row); a lower effort is an explicit per-call `-ReasoningEffort` override, never the default, and an explicit override always wins over this table | consequential reviews, design, doctrine-fold decisions, one hard adjudication per packet | implement, ratification loops, routine cards, the hub loop |
+| judgement | Fable (`fable` alias row in `tools/coordination/Invoke-Lane.ps1`, or a Fable chat session) | high, and only high (LANE-MODEL-CURRENCY-1 round 2: `Invoke-Lane.ps1` now refuses with a typed `lane-effort-must-be-high` failure receipt before ever starting a real lane at any other effort) | consequential reviews, design, doctrine-fold decisions, one hard adjudication per packet | implement, ratification loops, routine cards, the hub loop |
 | judgement, cross-family | Codex Astra (`astra` tier row in `tools/coordination/Invoke-Lane.ps1`, resolved to the current highest-version `gpt-*-astra` slug at launch) | high (LANE-MODEL-CURRENCY-1 superseded the earlier xhigh choice: every lane, astra included, runs at high, never max/xhigh) | one pre-implementation design pass per substantive packet; one arbiter seat when consequential verdicts conflict; one doctrine seam when a packet exposes a reusable policy defect | anything routine; a loop, heartbeat, cadence wake, recon, or edit; the `solVerdictPath` key; astra is deliberately absent from `Invoke-Workstream.ps1` and `Invoke-WorkstreamLoop.ps1`'s own `-Lane` lists, so nothing on a timer can reach this tier. Reachable and measured: codex-cli 0.154.0, `xhigh` accepted via `%APPDATA%\npm\codex.cmd`, probed 2026-09-15T23:16Z (superseding the earlier 0.147.0 unreachable finding); effort itself is now high, per LANE-MODEL-CURRENCY-1. |
 | hub | Opus | high | derive board, pick ONE packet, dispatch ONE editing lane in an isolated worktree, verify the receipt, refresh the checkpoint, reconcile queue rows through the verified writer | edit product source, build, run probes itself |
-| adjudication swarm | Opus, three briefs (against the default; what outranks it; post-mortem and evidence binding) | low | any blocker or "what next"; a new class of owner grant or a trust-boundary design | ruling on procedure alone (Haiku with script-first pre-filtering is admitted for that) |
-| reviewer | Sol (`sol` tier row in `tools/coordination/Invoke-Lane.ps1`, resolved to the current highest-version `gpt-*-sol` slug at launch) | low for PR review, high for design ratification | final PR review bound to the exact head; adversarial verification | editing; sole authority on a contract claim |
+| adjudication swarm | Opus, three briefs (against the default; what outranks it; post-mortem and evidence binding) | high (LANE-MODEL-CURRENCY-1 round 2: no real lane, this swarm included, can run below high) | any blocker or "what next"; a new class of owner grant or a trust-boundary design | ruling on procedure alone (Haiku with script-first pre-filtering is admitted for that) |
+| reviewer | Sol (`sol` tier row in `tools/coordination/Invoke-Lane.ps1`, resolved to the current highest-version `gpt-*-sol` slug at launch) | high, and only high (LANE-MODEL-CURRENCY-1 round 2 retired the earlier low-for-PR-review carve-out) | final PR review bound to the exact head; adversarial verification | editing; sole authority on a contract claim |
 | implementer | Sonnet | high (LANE-MODEL-CURRENCY-1: every lane, sonnet included, now high by default in the table, never max/xhigh) | one packet, one worktree, one review subject | the canonical checkout; widening scope |
-| recon | Luna (`luna` tier row in `tools/coordination/Invoke-Lane.ps1`, resolved to the current highest-version `gpt-*-luna` slug at launch) | low | read-only shards, doctrine folds, evidence audits | editing |
+| recon | Luna (`luna` tier row in `tools/coordination/Invoke-Lane.ps1`, resolved to the current highest-version `gpt-*-luna` slug at launch) | high, and only high (LANE-MODEL-CURRENCY-1 round 2 retired the earlier low-recon carve-out) | read-only shards, doctrine folds, evidence audits | editing |
 | status | Haiku (Desktop chat session from `.claude-state/continuity/HAIKU-STATUS-PASTE.md`) | n/a | read heartbeat, receipts, PR list; report | adjudicate, mutate, dispatch, answer "what next" |
 
 ## Precedence against error-remediation.md
@@ -47,11 +47,16 @@ cost, Opus rules on it.
 
 The lane table in `tools/coordination/Invoke-Lane.ps1` hard-codes every row at high effort
 (LANE-MODEL-CURRENCY-1, 2026-09-26: sonnet and astra joined Luna and Sol at high, and the
-table admits no other effort value); the per-call `-ReasoningEffort low` override is how the
-low-effort rows above are dispatched today (receipts since 2026-09-06 show Luna low and Sol
-low runs). Changing which rows get a `-ReasoningEffort` override at dispatch time is packet
-AUD-MODEL-ADAPTER's concern, not this document; the table's own per-row defaults are
-LANE-MODEL-CURRENCY-1's.
+table admits no other effort value). LANE-MODEL-CURRENCY-1 round 2 (owner ruling, 2026-09-26:
+"every lane runs at high effort") closed the one remaining way to launch below that: the
+`-ReasoningEffort` parameter itself still parses `low`/`medium` (unchanged, so existing
+guardrail tests keep pinning its `ValidateSet`), but `Invoke-Lane.ps1` now refuses to start any
+REAL lane at anything other than `high` -- a typed `lane-effort-must-be-high` failure, a normal
+`failed` receipt, non-zero exit, before any provider process starts. The historical low-effort
+Luna/Sol receipts cited in earlier revisions of this paragraph predate that enforcement and are
+no longer a live dispatch pattern; the only surviving non-high `-ReasoningEffort` invocations are
+inside the containment test fixture, which replaces the launcher's own `$CLAUDE_EXE`/`$CODEX_EXE`
+with a disposable shim and so can never reach a real model regardless of the value passed.
 
 ## Rules that carry
 

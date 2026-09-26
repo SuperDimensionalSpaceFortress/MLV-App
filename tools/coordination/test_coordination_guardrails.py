@@ -1491,6 +1491,74 @@ def test_xhigh_effort_is_never_assigned_to_a_claude_engine_table_row():
     )
 
 
+def test_a_real_lane_launch_refuses_any_effort_other_than_high():
+    """LANE-MODEL-CURRENCY-1 round 2 (sol blocker 1, owner ruling 2026-09-26): -ReasoningEffort's
+    ValidateSet above still syntactically admits 'low'/'medium' (existing containment fixture
+    tests rely on that to prove the override mechanically reaches the child), but a REAL launch
+    -- $CLAUDE_EXE/$CODEX_EXE unmodified from their own $REAL_CLAUDE_EXE/$REAL_CODEX_EXE twins --
+    must now refuse before ever starting a provider process. This pins the refusal's source
+    shape; tests/coordination/test_lane_containment.py::test_real_lane_launch_refuses_non_high_effort
+    proves it end-to-end against a fixture-forced 'real' launch."""
+    body = LANE_RUNNER.read_text(encoding="utf-8")
+    assert "$REAL_CLAUDE_EXE = Join-Path $env:APPDATA 'npm\\claude.cmd'" in body
+    assert "$REAL_CODEX_EXE  = Join-Path $env:APPDATA 'npm\\codex.cmd'" in body
+    assert "$ConfiguredExeForLane -eq $RealExeForLane -and $cfg.effort -ne 'high'" in body, (
+        "the refusal must be scoped to a launch whose exe was never replaced away from the real one"
+    )
+    assert 'lane-effort-must-be-high' in body
+    # The actual throw is deferred into the main try (so a refusal still yields a normal
+    # 'failed' receipt and non-zero exit), and must fire before the dispatch ledger row and
+    # before any argv/process-start code for either engine.
+    i_refusal_computed = body.index("$LaneEffortMustBeHighRefusal = ")
+    i_throw = body.index("if ($LaneEffortMustBeHighRefusal) { throw $LaneEffortMustBeHighRefusal }")
+    i_ledger = body.index("DISPATCH LEDGER ROW")
+    i_claude_argv = body.index("if ($cfg.engine -eq 'claude') {\n    $exe  = $CLAUDE_EXE")
+    assert i_refusal_computed < i_throw < i_ledger < i_claude_argv
+
+
+def test_codex_selected_model_is_recorded_before_resolved_model_is_ever_proven():
+    """LANE-MODEL-CURRENCY-1 round 2 (sol blocker 2): the pre-launch model choice is recorded
+    as selectedModel, never resolvedModel, until the child is proven to have run. Pins that
+    $ResolvedModel is no longer assigned in the codex tier-resolution block (the exact defect
+    sol's repro exercised: Process.Start throwing after the old code had already set
+    resolvedModel), and that the receipt exposes selectedModel as its own field."""
+    body = LANE_RUNNER.read_text(encoding="utf-8")
+    assert "$SelectedModel = $codexLaunchModel" in body
+    assert "$SelectedModel = $claudeLaunchModel" in body
+    assert "$ResolvedModel = $codexLaunchModel" not in body, (
+        "resolvedModel must never be assigned from the pre-launch choice before Process.Start"
+    )
+    assert "selectedModel    = $SelectedModel" in body
+    # resolvedModel is filled in for codex only after exit, gated on a clean, non-timed-out,
+    # non-empty-output completion -- the minimum evidence bar the card sets.
+    i_codex_resolved = body.index("if (-not $timedOut -and $exitCode -eq 0 -and -not [string]::IsNullOrWhiteSpace($final)) {\n        $ResolvedModel = $SelectedModel\n    }")
+    i_wait_for_exit = body.index("$exitCode = if ($timedOut) { -1 } else { $proc.ExitCode }")
+    assert i_wait_for_exit < i_codex_resolved, (
+        "the exit code must be known (the child proven to have run) before resolvedModel can be filled in"
+    )
+
+
+def test_resolve_codex_model_tier_ok_check_uses_the_strictmode_safe_indexer():
+    """CODEX-RESOLVER-UNTYPED-EDGE-1 (fable hardening): the ok-check and error extraction must
+    use the `.PSObject.Properties[name]` indexer -- the same idiom this file's own modelUsage
+    comment (see test above referencing 'PSObject.Properties[' usage) documents as safe
+    unconditionally -- never bare `.ok` dot access or `.PSObject.Properties.Name -contains`,
+    both of which throw under this file's `Set-StrictMode -Version Latest` on a resolver result
+    that is valid JSON but lacks the expected shape (e.g. '{}' or JSON without 'ok')."""
+    body = LANE_RUNNER.read_text(encoding="utf-8")
+    fn_start = body.index("function Resolve-CodexModelTier")
+    fn_end = body.index("\n}\n", fn_start)
+    fn_body = body[fn_start:fn_end]
+    assert "$resolverParsed.PSObject.Properties['ok']" in fn_body
+    assert "$resolverParsed.PSObject.Properties['error']" in fn_body
+    assert "-not $resolverParsed.ok" not in fn_body, (
+        "bare dot access on a possibly-absent 'ok' property throws under Set-StrictMode Latest"
+    )
+    assert "$resolverParsed.PSObject.Properties.Name -contains" not in fn_body, (
+        "enumerating .Name over a zero-property PSMemberInfoCollection throws under Set-StrictMode Latest"
+    )
+
+
 def test_astra_is_absent_from_the_timer_reachable_lane_lists():
     """Structural 'the top tier never runs a heartbeat': Invoke-Workstream.ps1 and
     Invoke-WorkstreamLoop.ps1 own SEPARATE -Lane ValidateSets and are explicitly out of scope

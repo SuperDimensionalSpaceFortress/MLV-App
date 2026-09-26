@@ -155,6 +155,18 @@ $LANES = @{
 $CLAUDE_EXE = Join-Path $env:APPDATA 'npm\claude.cmd'
 $CODEX_EXE  = Join-Path $env:APPDATA 'npm\codex.cmd'
 
+# LANE-MODEL-CURRENCY-1 round 2 (sol blocker 1): the REAL absolute launcher paths, named and
+# computed separately from $CLAUDE_EXE/$CODEX_EXE above so the effort-must-be-high enforcement
+# below can tell an actual CLI launch apart from the containment fixture, which reaches this
+# launcher ONLY by text-replacing the two exact lines above with a disposable shim path
+# (tests/coordination/test_lane_containment.py's prepare()). That substitution can never touch
+# these two lines -- different text, never matched by the fixture's literal string replace -- so
+# $REAL_CLAUDE_EXE/$REAL_CODEX_EXE always hold the genuine npm-cmd path even inside a
+# fixture-patched copy of this script, and a launch whose $CLAUDE_EXE/$CODEX_EXE no longer equals
+# its own $REAL_* twin is thereby proven incapable of ever reaching the real CLI.
+$REAL_CLAUDE_EXE = Join-Path $env:APPDATA 'npm\claude.cmd'
+$REAL_CODEX_EXE  = Join-Path $env:APPDATA 'npm\codex.cmd'
+
 # LANE-NO-BACKGROUND-END-TURN-1 round 13 (hub ruling): rounds 8-12 each closed one hole in
 # proving that whichever bash.exe/powershell.exe this launcher self-tested was the SAME
 # executable Claude Code's own, undocumented shell auto-detection would spawn for a SHELL-FORM
@@ -243,9 +255,26 @@ function Resolve-CodexModelTier {
     } catch {
         throw "codex-tier-resolution-failed: unparseable resolver output for tier '$Tier' (exit $resolverExit): $resolverOutputText"
     }
-    if ($resolverExit -ne 0 -or -not $resolverParsed.ok) {
-        $resolverError = if ($resolverParsed.PSObject.Properties.Name -contains 'error') { $resolverParsed.error } else { 'unknown' }
-        throw "codex-tier-resolution-failed: tier '$Tier' did not resolve: $resolverError"
+    # CODEX-RESOLVER-UNTYPED-EDGE-1 (fable hardening): the ok-check and error extraction live
+    # INSIDE this try, and use the `.PSObject.Properties[name]` INDEXER -- never bare dot access
+    # (`$resolverParsed.ok`, which throws PropertyNotFoundException under this file's own
+    # `Set-StrictMode -Version Latest` when the resolver emits valid JSON that simply lacks an
+    # `ok` key, e.g. a corrupted resolve-codex-tier.py) and never `.PSObject.Properties.Name
+    # -contains name` (which throws enumerating an EMPTY PSMemberInfoCollection, e.g. `{}` -- the
+    # exact hazard this file's own modelUsage comment above already documents and works around).
+    # Both degenerate shapes now fail closed through the SAME typed 'codex-tier-resolution-failed'
+    # token as an ordinary ok:false result, instead of leaking a raw StrictMode exception message.
+    try {
+        $okProp = $resolverParsed.PSObject.Properties['ok']
+        $resolverOk = ($null -ne $okProp) -and [bool]$okProp.Value
+        if ($resolverExit -ne 0 -or -not $resolverOk) {
+            $errorProp = $resolverParsed.PSObject.Properties['error']
+            $resolverError = if ($null -ne $errorProp) { $errorProp.Value } else { 'unknown' }
+            throw "codex-tier-resolution-failed: tier '$Tier' did not resolve: $resolverError"
+        }
+    } catch {
+        if ($_.Exception.Message -like 'codex-tier-resolution-failed:*') { throw }
+        throw "codex-tier-resolution-failed: tier '$Tier' produced a malformed resolver result: $($_.Exception.Message)"
     }
     return [string]$resolverParsed.resolvedModel
 }
@@ -613,6 +642,32 @@ $RequestedModel = if ($cfg.engine -eq 'claude') { $cfg.model } else { $cfg.tier 
 $PinnedByOverride = [bool]$ModelOverride
 $ResolvedModel = 'unknown'
 $AuxiliaryModels = @()
+# LANE-MODEL-CURRENCY-1 round 2 (sol blocker 2): selectedModel is the PRE-LAUNCH choice (the
+# exact `--model`/`-m` argument value) -- filled in per engine below, the instant that choice is
+# made, never mistaken for proof the child ran. resolvedModel is filled in ONLY from evidence
+# gathered after the child is known to have run (a codex lane: after WaitForExit, from a clean
+# exit that produced real output; a claude lane: from its own JSON modelUsage, unchanged from
+# above). A launch that never starts (Process.Start throws) still leaves selectedModel recorded,
+# so a reader can always see what was ASKED to start, but resolvedModel stays 'unknown' -- never
+# copied from selectedModel before the child is proven to have run.
+$SelectedModel = $null
+
+# LANE-MODEL-CURRENCY-1 round 2 (sol blocker 1): owner ruling 2026-09-26 is that EVERY lane runs
+# at high effort. $cfg.effort is already the fully-resolved effective value at this point (table
+# default, then any -ReasoningEffort override just above), so this is the one place that can
+# refuse a non-high value before it ever reaches a real provider process. The refusal is skipped
+# only when $CLAUDE_EXE/$CODEX_EXE no longer equal their own $REAL_* twins declared beside them --
+# the one way that happens is the containment fixture's text-replace of those two lines with a
+# disposable shim (tests/coordination/test_lane_containment.py's prepare()), which by
+# construction can never reach a real model regardless of what effort value is requested. The
+# actual `throw` is deferred to just inside the main try below, so a refusal still produces a
+# normal 'failed' receipt and non-zero exit rather than a silent pre-reservation script error.
+$RealExeForLane = if ($cfg.engine -eq 'claude') { $REAL_CLAUDE_EXE } else { $REAL_CODEX_EXE }
+$ConfiguredExeForLane = if ($cfg.engine -eq 'claude') { $CLAUDE_EXE } else { $CODEX_EXE }
+$LaneEffortMustBeHighRefusal = $null
+if ($ConfiguredExeForLane -eq $RealExeForLane -and $cfg.effort -ne 'high') {
+    $LaneEffortMustBeHighRefusal = "lane-effort-must-be-high: a real lane may only run at 'high' effort (owner ruling 2026-09-26); refusing effort '$($cfg.effort)' for lane '$Lane'."
+}
 
 # ATOMIC SLOT RESERVATION. The previous form was
 #     while (Test-Path <candidate>) { $n++ }
@@ -744,6 +799,12 @@ $cacheCreateTokens = $null; $cacheReadTokens = $null; $outputTokens = $null
 
 try {
 
+# LANE-MODEL-CURRENCY-1 round 2 (sol blocker 1): thrown here, first thing inside the main try --
+# after the receipt slot is reserved (so this refusal gets a normal 'failed' receipt and non-zero
+# exit, not a silent pre-reservation script error) but before the dispatch ledger row or any
+# provider process, so a refused launch is never counted as an attempt.
+if ($LaneEffortMustBeHighRefusal) { throw $LaneEffortMustBeHighRefusal }
+
 # DISPATCH LEDGER ROW (plan 0.6: version-enforced all-venue accounting). Written after the receipt
 # slot exists, so the row can name it, and before any provider process starts. A direct launch
 # writes 'reserved' and counts toward the product-ratio guard's rate; a launch that
@@ -776,6 +837,10 @@ Write-Utf8NoBom $promptPath $Prompt
 if ($cfg.engine -eq 'claude') {
     $exe  = $CLAUDE_EXE
     $claudeLaunchModel = if ($ModelOverride) { $ModelOverride } else { $cfg.model }
+    # LANE-MODEL-CURRENCY-1 round 2: the pre-launch choice, same discipline as the codex branch
+    # below -- resolvedModel is still filled in only from the child's own modelUsage, never copied
+    # from this.
+    $SelectedModel = $claudeLaunchModel
     $argv = @('-p', '--model', $claudeLaunchModel, '--output-format', 'json', '--add-dir', $WorkDir)
     if ($ExtraReadDir) { $argv += @('--add-dir', $ExtraReadDir) }
     if ($MaxTurns -gt 0) { $argv += @('--max-turns', [string]$MaxTurns) }
@@ -1015,7 +1080,14 @@ if ($cfg.engine -eq 'claude') {
         }
         Resolve-CodexModelTier -Tier $cfg.tier -PythonExe $PYTHON_EXE
     }
-    $ResolvedModel = $codexLaunchModel
+    # LANE-MODEL-CURRENCY-1 round 2 (sol blocker 2): this is the PRE-LAUNCH choice, recorded as
+    # selectedModel -- NOT resolvedModel. The previous code assigned this straight to
+    # resolvedModel here, before Process.Start below, so a missing/unstartable codex executable
+    # (Process.Start throws) produced a 'failed' receipt that still named this slug as
+    # resolvedModel -- a model that never ran. resolvedModel is now filled in only after the
+    # child is proven to have run (see the harvest section below), and stays 'unknown' on any
+    # start failure.
+    $SelectedModel = $codexLaunchModel
     # -s and -c are set EXPLICITLY per call. ~/.codex/config.toml carries
     # approval_policy=never + sandbox_mode=danger-full-access globally, which is
     # fine for a watched interactive session and NOT fine for automated fan-out.
@@ -1327,6 +1399,15 @@ if ($cfg.engine -eq 'claude') {
     if ([string]::IsNullOrWhiteSpace($final)) { $final = $stderrText }
     if ($null -eq $final) { $final = '' }
     if ($timedOut) { Write-Utf8NoBom $lastPath $final }
+    # LANE-MODEL-CURRENCY-1 round 2 (sol blocker 2): resolvedModel is proof, not intent. codex
+    # exec emits no modelUsage-style attestation the way claude's own JSON does, so the bar here
+    # is the card's stated minimum: a clean exit (never timed out, exit 0) that produced real
+    # output FROM THIS INVOCATION -- never merely that a host process existed. A kill, crash, or
+    # non-zero exit leaves resolvedModel 'unknown' with selectedModel still recorded above, same
+    # discipline as the claude branch's family-matched modelUsage check.
+    if (-not $timedOut -and $exitCode -eq 0 -and -not [string]::IsNullOrWhiteSpace($final)) {
+        $ResolvedModel = $SelectedModel
+    }
 }
 
 }
@@ -1634,8 +1715,12 @@ $receipt = [ordered]@{
     # requested alias's family -- and stays 'unknown' (never the requested string copied
     # over, never a raw modelUsage key) when that cannot be determined. auxiliaryModels
     # carries every OTHER modelUsage entry (auxiliary/tool-call models, e.g. haiku) that
-    # was seen but never counted as the lane's own identity.
+    # was seen but never counted as the lane's own identity. selectedModel (round 2) is the
+    # PRE-LAUNCH choice -- the exact --model/-m argument value -- recorded even when the child
+    # never started, so a start failure is never silently unrecorded; it is never a substitute
+    # for resolvedModel's proof.
     requestedModel   = $RequestedModel
+    selectedModel    = $SelectedModel
     resolvedModel    = $ResolvedModel
     auxiliaryModels  = $AuxiliaryModels
     pinnedByOverride = $PinnedByOverride
