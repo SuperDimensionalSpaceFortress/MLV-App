@@ -464,7 +464,15 @@ $embeddedFunctions = Get-AttrCudaEmbeddedFunctionSource -Name @(
     # paths. See these functions' own headers in AttrCudaArtifacts.psm1.
     'Get-AttrCudaQuiescenceSample',
     'Get-AttrCudaProcessCpuSnapshot',
-    'Get-AttrCudaTopCpuProcesses'
+    'Get-AttrCudaTopCpuProcesses',
+    # UM-DISPLAY-SELECT-AND-LOG-1 item 2: the Windows-API display inventory, the venue/expected-
+    # resolution classifier, the three-state degraded verdict, and the parser for the app's own
+    # gui_smoke.display_screen/display_target/window_placement lines. See these functions' own
+    # headers in AttrCudaArtifacts.psm1.
+    'Get-AttrCudaWindowsDisplayInventory',
+    'Get-AttrCudaMeasurementVenue',
+    'Get-AttrCudaDisplayDegradedState',
+    'Get-AttrCudaGuiSmokeDisplaySelection'
 )
 # ATTR3-FOOTAGE-BIND-1 PR-B round 4b: the private verified-part directory (one hard link per
 # verified part, under a neutral name derived from its index, so nothing downstream -- the smoke
@@ -798,6 +806,96 @@ function Get-LastGpuSummary([string]$RawLog) {
     }
 }
 
+function Build-AttrCudaDisplayBlock {
+    # UM-DISPLAY-SELECT-AND-LOG-1 item 2c: assembles the `display` block published into every
+    # summary.json/evidence-manifest.json this leg writes from leg start onward. -AppSelection is
+    # $null before the smoke log is available -- windowsDisplays is already known and published,
+    # while appScreens/target/mode/preview are 'unknown'/$null with their own reason, never
+    # defaulted or folded into "not degraded" (item 3/e).
+    param(
+        [Parameter(Mandatory = $true)] $WindowsInventory,
+        [Parameter(Mandatory = $true)] [string]$Venue,
+        $ExpectedWidth,
+        $ExpectedHeight,
+        $AppSelection
+    )
+
+    $appKnown = ($null -ne $AppSelection)
+    $screensCollected = ($appKnown -and $AppSelection.screensCollected)
+    $screens = if ($screensCollected) { $AppSelection.screens } else { @() }
+    $screensError = if ($appKnown) { $AppSelection.screensError } else { 'smoke log not yet available' }
+    $targetInfo = if ($appKnown) { $AppSelection.target } else { $null }
+    $targetError = if ($appKnown) { $AppSelection.targetError } else { 'smoke log not yet available' }
+    $placement = if ($appKnown) { $AppSelection.placement } else { $null }
+    $placementError = if ($appKnown) { $AppSelection.placementError } else { 'smoke log not yet available' }
+
+    # Cross-references the app's own chosen screen NAME (gui_smoke.display_target) against its
+    # own per-screen inventory (gui_smoke.display_screen) for that screen's physical width/height/
+    # refresh -- both lines come from the app, never from the independent Windows-API inventory,
+    # so a name mismatch between Qt and Win32 device naming can never produce a wrong target size.
+    $targetPhysical = $null
+    if ($null -ne $targetInfo) {
+        $targetPhysical = $screens | Where-Object { $_.name -eq $targetInfo.name } | Select-Object -First 1
+    }
+    $targetBlock = $null
+    $targetUnknownReason = $null
+    if ($null -ne $targetPhysical) {
+        $targetBlock = [ordered]@{
+            name = $targetInfo.name
+            width = $targetPhysical.physicalWidth
+            height = $targetPhysical.physicalHeight
+            refreshHz = $targetPhysical.refreshHz
+        }
+    } elseif ($null -ne $targetInfo) {
+        $targetUnknownReason = 'no gui_smoke.display_screen line matched the chosen target name'
+    } else {
+        $targetUnknownReason = $targetError
+    }
+
+    $degraded = Get-AttrCudaDisplayDegradedState `
+        -TargetWidth $(if ($targetBlock) { $targetBlock.width } else { $null }) `
+        -TargetHeight $(if ($targetBlock) { $targetBlock.height } else { $null }) `
+        -ExpectedWidth $ExpectedWidth -ExpectedHeight $ExpectedHeight
+
+    [ordered]@{
+        windowsDisplaysCollected = [bool]$WindowsInventory.collected
+        windowsDisplays = $WindowsInventory.devices
+        windowsDisplaysError = $WindowsInventory.error
+        appScreensCollected = $screensCollected
+        appScreens = $screens
+        appScreensError = $screensError
+        target = $targetBlock
+        targetSelectionReason = $(if ($targetInfo) { $targetInfo.reason } else { $null })
+        targetCandidates = $(if ($targetInfo) { $targetInfo.candidates } else { $null })
+        targetUnknownReason = $targetUnknownReason
+        selectionFallback = $(if ($targetInfo) { $targetInfo.fallback } else { 'unknown' })
+        mode = $(if ($placement) { $placement.mode } else { 'unknown' })
+        preview = $(if ($placement) { [ordered]@{ width = $placement.previewWidth; height = $placement.previewHeight } } else { $null })
+        previewUnknownReason = $(if ($null -eq $placement) { $placementError } else { $null })
+        venue = $Venue
+        expected = $(if ($null -ne $ExpectedWidth -and $null -ne $ExpectedHeight) { [ordered]@{ width = $ExpectedWidth; height = $ExpectedHeight } } else { $null })
+        displayDegraded = $degraded
+    }
+}
+
+function Get-AttrCudaDisplayResultTail([object]$DisplayBlock) {
+    # UM-DISPLAY-SELECT-AND-LOG-1 item 2d: the shared RESULT-line tail --
+    # "DISPLAY=<name> RES=<w>x<h>@<hz> DEGRADED=<0|1|unknown> PREVIEW=<w>x<h>" -- appended to every
+    # RESULT= line from the point the display block is fully known onward (once the smoke log has
+    # been parsed). Third state (item e): a $null target/preview reads 'unknown', never a guessed
+    # value and never folded into a passing/zero reading.
+    $displayName = if ($DisplayBlock.target) { $DisplayBlock.target.name } else { 'unknown' }
+    $res = if ($DisplayBlock.target) {
+        "$($DisplayBlock.target.width)x$($DisplayBlock.target.height)@$($DisplayBlock.target.refreshHz)"
+    } else { 'unknown' }
+    $degradedField =
+        if ($DisplayBlock.displayDegraded -eq $true) { '1' }
+        elseif ($DisplayBlock.displayDegraded -eq $false) { '0' }
+        else { 'unknown' }
+    $previewField = if ($DisplayBlock.preview) { "$($DisplayBlock.preview.width)x$($DisplayBlock.preview.height)" } else { 'unknown' }
+    "DISPLAY=$displayName RES=$res DEGRADED=$degradedField PREVIEW=$previewField"
+}
+
 foreach ($item in @(
     @{ path=(Join-Path $Cache $PresentMonName); sha=$PresentMonSha }
 )) {
@@ -1042,6 +1140,26 @@ reg add "HKCU\Software\magiclantern.MLVApp\MLVApp\Playback" /v PreviewMode /t RE
 reg add "HKCU\Software\magiclantern.MLVApp\MLVApp\Playback" /v ScaleFactorOverride /t REG_DWORD /d 0 /f | Out-Null
 reg add "HKCU\Software\magiclantern.MLVApp\MLVApp\Playback" /v PreviewResolution /t REG_DWORD /d 0 /f | Out-Null
 
+# UM-DISPLAY-SELECT-AND-LOG-1 item 2/2a: the Windows view of every active display, captured before
+# any measurement (the CPU quiescence sample below, then the smoke run) -- independent of Qt, and
+# published in every summary.json this leg writes from here on, including a refusal that never
+# reaches the smoke run. $measurementVenue/-Expected* are resolved here too: only 'ultra-magnus'
+# carries a known expected resolution (Get-AttrCudaMeasurementVenue's own header explains why
+# Bachelor does not).
+$windowsDisplayInventory = Get-AttrCudaWindowsDisplayInventory
+$measurementVenue = Get-AttrCudaMeasurementVenue
+$expectedDisplayWidth = $null
+$expectedDisplayHeight = $null
+if ($measurementVenue -eq 'ultra-magnus') {
+    $expectedDisplayWidth = 3840
+    $expectedDisplayHeight = 2160
+}
+# -AppSelection $null until the smoke log is parsed further down -- appScreens/target/mode/
+# preview read 'unknown' with their own reason until then (Build-AttrCudaDisplayBlock's header).
+$displayBlock = Build-AttrCudaDisplayBlock -WindowsInventory $windowsDisplayInventory `
+    -Venue $measurementVenue -ExpectedWidth $expectedDisplayWidth -ExpectedHeight $expectedDisplayHeight `
+    -AppSelection $null
+
 # UM-DISPLAY-SELECT-AND-LOG-1 round 2b: LoadPercentage is frequency-scaled processor UTILITY,
 # not busy time -- a hub probe on Ultra-Magnus (2026-09-26T15:51Z, same ~26s window) read
 # LoadPercentage at 73/82/83 while \Processor(_Total)\% Processor Time read 21.4/43.2/37 on the
@@ -1087,6 +1205,7 @@ if ($cpuTimeUnknown -or $avgTime -gt $cpuThresholdPercent) {
         cpuTimeUnknownReason=$cpuTimeUnknownReason
         cpuThresholdPercent=$cpuThresholdPercent
         topCpuProcesses=$topCpuProcesses
+        display=$displayBlock
         sourceCommit=$SourceCommit
         clipId=$ClipId
         executableSha256=$cacheExeSha
@@ -1232,6 +1351,7 @@ if ($null -ne $smokeLaunchException -or $smokeRc -ne 0 -or -not (Test-Path -Lite
         presentMonConfirmedExited=$presentMonStop.confirmedExited
         presentMonKillError=$presentMonStop.killError
         presentMonWaitError=$presentMonStop.waitError
+        display=$displayBlock
         sourceCommit=$SourceCommit; clipId=$ClipId; artifactRoot=$Pub
     }
     Save-Json $smokeFailure (Join-Path $Pub 'summary.json')
@@ -1280,6 +1400,7 @@ try {
         presentMonConfirmedExited=$presentMonStop.confirmedExited
         presentMonKillError=$presentMonStop.killError
         presentMonWaitError=$presentMonStop.waitError
+        display=$displayBlock
         sourceCommit=$SourceCommit; clipId=$ClipId; artifactRoot=$Pub
     }
     Save-Json $unavailable (Join-Path $Pub 'summary.json')
@@ -1288,6 +1409,15 @@ try {
 }
 $logPath = $runLog.path
 $rawLog = [IO.File]::ReadAllText($logPath)
+# UM-DISPLAY-SELECT-AND-LOG-1 item 2b: the app's own gui_smoke.display_screen/display_target/
+# window_placement lines are only ever knowable once the smoke log itself is in hand -- recomputed
+# here, once, and reused for every summary.json/evidence-manifest.json/RESULT line from this point
+# to the end of the leg (item 2c/2d). A parse failure (missing line, unexpected shape) is the
+# function's own third state -- 'unknown' with a reason -- never folded into "not degraded".
+$appDisplaySelection = Get-AttrCudaGuiSmokeDisplaySelection -LogText $rawLog
+$displayBlock = Build-AttrCudaDisplayBlock -WindowsInventory $windowsDisplayInventory `
+    -Venue $measurementVenue -ExpectedWidth $expectedDisplayWidth -ExpectedHeight $expectedDisplayHeight `
+    -AppSelection $appDisplaySelection
 $rows = Get-FrameRows $rawLog
 $rows | Export-Csv -LiteralPath (Join-Path $legOut 'probe-timeline.csv') -NoTypeInformation
 
@@ -1346,10 +1476,11 @@ if ($null -ne $presentMonWaitError) {
         reason=$presentMonWaitError
         chains=@()
         presentMonCaptureStartUtc=$presentMonCaptureStartUtc.ToString('o')
+        display=$displayBlock
         sourceCommit=$SourceCommit; clipId=$ClipId; artifactRoot=$Pub
     }
     Save-Json $displayFailure (Join-Path $Pub 'summary.json')
-    Write-Output "RESULT=PRESENTMON_UNAVAILABLE REASON=`"$presentMonWaitError`" ARTIFACTS=$Pub"
+    Write-Output "RESULT=PRESENTMON_UNAVAILABLE REASON=`"$presentMonWaitError`" $(Get-AttrCudaDisplayResultTail $displayBlock) ARTIFACTS=$Pub"
     exit 23
 }
 
@@ -1376,10 +1507,10 @@ if (-not $verdict.admitted) {
     $refusal = [ordered]@{
         schema='playback-attr-3-cuda-venue.v1'; result='BACKEND_NOT_AVAILABLE'
         fixtureRehearsal=$FixtureRehearsal
-        diagnostics=$diagnostics; sourceCommit=$SourceCommit; clipId=$ClipId; artifactRoot=$Pub
+        diagnostics=$diagnostics; display=$displayBlock; sourceCommit=$SourceCommit; clipId=$ClipId; artifactRoot=$Pub
     }
     Save-Json $refusal (Join-Path $Pub 'summary.json')
-    Write-Output "RESULT=BACKEND_NOT_AVAILABLE CUDA_BACKEND_AVAILABLE=$($verdict.cudaBackendAvailable) R16_AVAILABLE=$($verdict.r16Available) R16_REASON=`"$($verdict.r16Reason)`" ARTIFACTS=$Pub"
+    Write-Output "RESULT=BACKEND_NOT_AVAILABLE CUDA_BACKEND_AVAILABLE=$($verdict.cudaBackendAvailable) R16_AVAILABLE=$($verdict.r16Available) R16_REASON=`"$($verdict.r16Reason)`" $(Get-AttrCudaDisplayResultTail $displayBlock) ARTIFACTS=$Pub"
     exit $verdict.exitCode
 }
 
@@ -1392,20 +1523,20 @@ if ($gpuFramesTotal -le 0) {
     $fallback = [ordered]@{
         schema='playback-attr-3-cuda-venue.v1'; result='GPU_RECON_FRAMES_ZERO'
         fixtureRehearsal=$FixtureRehearsal
-        gpuSummary=$gpuSummary; sourceCommit=$SourceCommit; clipId=$ClipId; artifactRoot=$Pub
+        gpuSummary=$gpuSummary; display=$displayBlock; sourceCommit=$SourceCommit; clipId=$ClipId; artifactRoot=$Pub
     }
     Save-Json $fallback (Join-Path $Pub 'summary.json')
-    Write-Output "RESULT=GPU_RECON_FRAMES_ZERO ARTIFACTS=$Pub"
+    Write-Output "RESULT=GPU_RECON_FRAMES_ZERO $(Get-AttrCudaDisplayResultTail $displayBlock) ARTIFACTS=$Pub"
     exit 13
 }
 if ($gpuSummary.cpuFrames -gt 0) {
     $fallback = [ordered]@{
         schema='playback-attr-3-cuda-venue.v1'; result='CPU_FALLBACK_DETECTED'
         fixtureRehearsal=$FixtureRehearsal
-        gpuSummary=$gpuSummary; sourceCommit=$SourceCommit; clipId=$ClipId; artifactRoot=$Pub
+        gpuSummary=$gpuSummary; display=$displayBlock; sourceCommit=$SourceCommit; clipId=$ClipId; artifactRoot=$Pub
     }
     Save-Json $fallback (Join-Path $Pub 'summary.json')
-    Write-Output "RESULT=CPU_FALLBACK_DETECTED CPU_FRAMES=$($gpuSummary.cpuFrames) ARTIFACTS=$Pub"
+    Write-Output "RESULT=CPU_FALLBACK_DETECTED CPU_FRAMES=$($gpuSummary.cpuFrames) $(Get-AttrCudaDisplayResultTail $displayBlock) ARTIFACTS=$Pub"
     exit 14
 }
 
@@ -1454,10 +1585,11 @@ if ($displayReport.status -ne 'OK') {
         chains=$displayReport.chains
         presentMonCaptureStartUtc=$presentMonCaptureStartUtc.ToString('o')
         clockBracket=$displayReport.clockBracket
+        display=$displayBlock
         sourceCommit=$SourceCommit; clipId=$ClipId; artifactRoot=$Pub
     }
     Save-Json $displayFailure (Join-Path $Pub 'summary.json')
-    Write-Output "RESULT=$($displayReport.status) REASON=`"$($displayReport.reason)`" ARTIFACTS=$Pub"
+    Write-Output "RESULT=$($displayReport.status) REASON=`"$($displayReport.reason)`" $(Get-AttrCudaDisplayResultTail $displayBlock) ARTIFACTS=$Pub"
     $displayExitCode = if ($displayReport.status -eq 'DISPLAY_ASLEEP') { 24 } else { 23 }
     exit $displayExitCode
 }
@@ -1543,6 +1675,7 @@ $manifest = [ordered]@{
     regions = $stats
     presentMonStats = $pmStats
     provenance = $provenance
+    display = $displayBlock
     artifactRoot = $Pub
     capturedUtc = (Get-Date).ToUniversalTime().ToString('o')
 }
@@ -1563,6 +1696,7 @@ Save-Json ([ordered]@{
     clockBracket = $displayReport.clockBracket
     cpuQuiescence = $manifest.cpuQuiescence
     diagnostics = $diagnostics
+    display = $displayBlock
     artifactRoot = $Pub
 }) (Join-Path $Pub 'summary.json')
 $files = Get-ChildItem -LiteralPath $Pub -Recurse -File | ForEach-Object { [ordered]@{ path=$_.FullName.Substring($Pub.Length + 1); sha256=(Get-Sha $_.FullName); bytes=$_.Length } }
@@ -1572,7 +1706,7 @@ Save-Json ([ordered]@{ schema='playback-attr-3-cuda-artifact-index.v1'; artifact
 # still cannot mistake a rehearsal for a measurement.
 $resultVerb = if ($FixtureRehearsal) { 'FIXTURE_REHEARSAL_CAPTURED' } else { 'MEASUREMENT_CAPTURED' }
 $cpuTimeResultField = if ($cpuTimeUnknown) { 'unknown' } else { $avgTime }
-Write-Output "RESULT=$resultVerb FIXTURE_REHEARSAL=$FixtureRehearsal SOURCE=$SourceCommit CLIP=$ClipId ROWS=$($rows.Count) GPU_FRAMES=$gpuFramesTotal CPU_FRAMES=$($gpuSummary.cpuFrames) PRESENTMON_SAMPLES=$($pmRows.Count) CPU_TIME=$cpuTimeResultField CPU_UTILITY=$avgUtility ARTIFACTS=$Pub"
+Write-Output "RESULT=$resultVerb FIXTURE_REHEARSAL=$FixtureRehearsal SOURCE=$SourceCommit CLIP=$ClipId ROWS=$($rows.Count) GPU_FRAMES=$gpuFramesTotal CPU_FRAMES=$($gpuSummary.cpuFrames) PRESENTMON_SAMPLES=$($pmRows.Count) CPU_TIME=$cpuTimeResultField CPU_UTILITY=$avgUtility $(Get-AttrCudaDisplayResultTail $displayBlock) ARTIFACTS=$Pub"
 exit 0
 } finally {
     if ($OwnerClipDir) {

@@ -1,0 +1,364 @@
+"""Behavioural tests for UM-DISPLAY-SELECT-AND-LOG-1 item 2's `display` block.
+
+WHY. A UM number must never be presented without knowing the identity and mode of the display it
+was benchmarked on (see .claude-state/project-memory/
+um-display-topology-lg-tv-denon-fallback-20260926.md): Ultra-Magnus's primary is an LG TV through
+a Denon AVR that falls back to a DEGRADED resolution when the TV is off. playback-attr-3-cuda-job.ps1
+captures the Windows-API display inventory independently of Qt (Get-AttrCudaWindowsDisplayInventory),
+parses the app's own gui_smoke.display_screen/display_target/window_placement lines
+(Get-AttrCudaGuiSmokeDisplaySelection), classifies the venue (Get-AttrCudaMeasurementVenue) and
+computes a three-state degraded verdict (Get-AttrCudaDisplayDegradedState) -- all in
+AttrCudaArtifacts.psm1, embedded verbatim into the job like every other shared function (see
+test_playback_attr_3_cuda_behaviour.py's EmbeddedFunctionContractTests).
+
+These tests EXECUTE the real module functions (Import-Module, not a reimplementation).
+"""
+
+from __future__ import annotations
+
+import shutil
+import subprocess
+import tempfile
+import unittest
+from pathlib import Path
+
+ROOT = Path(__file__).resolve().parents[2]
+MODULE = ROOT / "tools" / "profiling" / "bachelor" / "AttrCudaArtifacts.psm1"
+JOB_SCRIPT = ROOT / "tools" / "profiling" / "bachelor" / "playback-attr-3-cuda-job.ps1"
+
+PWSH = shutil.which("pwsh")
+requires_pwsh = unittest.skipIf(PWSH is None, "pwsh is not on PATH")
+
+SAMPLE_LOG_4K = (
+    'gui_smoke.display_screen index=0 name="\\\\.\\DISPLAY1" manufacturer="LG" model="TV" '
+    'serial="" geometry=0,0 3840x2160 physical=3840x2160 dpr=1.00 refresh_hz=60.000 primary=1\n'
+    'gui_smoke.display_screen index=1 name="\\\\.\\DISPLAY2" manufacturer="Dell" model="U2720Q" '
+    'serial="ABC123" geometry=3840,0 2560x1440 physical=2560x1440 dpr=1.00 refresh_hz=59.951 primary=0\n'
+    'gui_smoke.display_target screen="\\\\.\\DISPLAY1" reason=max_physical_pixels candidates=2 fallback=0\n'
+    'gui_smoke.window_placement mode=fullscreen screen="\\\\.\\DISPLAY1" verified=1 window=0,0 '
+    '3840x2160 preview=3840x2160\n'
+)
+
+SAMPLE_LOG_DEGRADED_FALLBACK = (
+    # TV off: the AVR's headless fallback is the only attached display, and it is what gets chosen
+    # -- fallback=1, one candidate, a resolution below the 4K expectation.
+    'gui_smoke.display_screen index=0 name="\\\\.\\DISPLAY1" manufacturer="Denon" model="AVR" '
+    'serial="" geometry=0,0 2560x1440 physical=2560x1440 dpr=1.00 refresh_hz=60.000 primary=1\n'
+    'gui_smoke.display_target screen="\\\\.\\DISPLAY1" reason=max_physical_pixels candidates=1 fallback=1\n'
+    'gui_smoke.window_placement mode=windowed screen="\\\\.\\DISPLAY1" verified=1 window=0,0 '
+    '2560x1440 preview=2560x1440\n'
+)
+
+
+class _ProbeCase(unittest.TestCase):
+    def setUp(self) -> None:
+        self._tmp = tempfile.TemporaryDirectory(prefix="attr3-display-block-")
+        self.addCleanup(self._tmp.cleanup)
+        self.tmp = Path(self._tmp.name)
+
+    def run_snippet(self, body: str) -> subprocess.CompletedProcess:
+        script = self.tmp / "probe.ps1"
+        script.write_text(
+            "$ErrorActionPreference = 'Stop'\n"
+            f"Import-Module '{MODULE}' -Force\n" + body,
+            encoding="utf-8",
+        )
+        return subprocess.run(
+            [PWSH, "-NoLogo", "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass",
+             "-File", str(script)],
+            capture_output=True, text=True,
+        )
+
+
+@requires_pwsh
+class MeasurementVenueTests(_ProbeCase):
+    """Get-AttrCudaMeasurementVenue: only an ultra-magnus-named host carries an expectation."""
+
+    def test_ultra_magnus_hostname_classifies_as_ultra_magnus(self) -> None:
+        proc = self.run_snippet(
+            "Write-Host (Get-AttrCudaMeasurementVenue -ComputerName 'ULTRA-MAGNUS')\n"
+        )
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        self.assertIn("ultra-magnus", proc.stdout)
+
+    def test_hyphen_insensitive_and_case_insensitive_match(self) -> None:
+        proc = self.run_snippet(
+            "Write-Host (Get-AttrCudaMeasurementVenue -ComputerName 'ultramagnus')\n"
+        )
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        self.assertIn("ultra-magnus", proc.stdout)
+
+    def test_bachelor_hostname_classifies_as_bachelor(self) -> None:
+        proc = self.run_snippet(
+            "Write-Host (Get-AttrCudaMeasurementVenue -ComputerName 'BACHELOR01')\n"
+        )
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        self.assertIn("bachelor", proc.stdout)
+
+    def test_an_unrecognized_hostname_defaults_to_bachelor_never_asserts_an_expectation(self) -> None:
+        proc = self.run_snippet(
+            "Write-Host (Get-AttrCudaMeasurementVenue -ComputerName 'SOME-OTHER-BOX')\n"
+        )
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        self.assertIn("bachelor", proc.stdout)
+
+
+@requires_pwsh
+class DisplayDegradedStateTests(_ProbeCase):
+    """Get-AttrCudaDisplayDegradedState: the three states pinned in the UM-DISPLAY-SELECT-AND-LOG-1
+    round 1 brief -- a below-expectation target, an at-expectation target, and unreadable."""
+
+    def test_below_expectation_target_is_degraded(self) -> None:
+        proc = self.run_snippet(
+            "$r = Get-AttrCudaDisplayDegradedState -TargetWidth 2560 -TargetHeight 1440 "
+            "-ExpectedWidth 3840 -ExpectedHeight 2160\nWrite-Host \"R=$r\"\n"
+        )
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        self.assertIn("R=True", proc.stdout)
+
+    def test_at_expectation_target_is_not_degraded(self) -> None:
+        proc = self.run_snippet(
+            "$r = Get-AttrCudaDisplayDegradedState -TargetWidth 3840 -TargetHeight 2160 "
+            "-ExpectedWidth 3840 -ExpectedHeight 2160\nWrite-Host \"R=$r\"\n"
+        )
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        self.assertIn("R=False", proc.stdout)
+
+    def test_an_unreadable_target_is_the_third_unknown_state_not_false(self) -> None:
+        proc = self.run_snippet(
+            "$r = Get-AttrCudaDisplayDegradedState -TargetWidth $null -TargetHeight $null "
+            "-ExpectedWidth 3840 -ExpectedHeight 2160\nWrite-Host \"R=$r\"\n"
+        )
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        self.assertIn("R=unknown", proc.stdout)
+
+    def test_no_expectation_for_this_venue_is_unknown_never_folded_into_not_degraded(self) -> None:
+        # Bachelor (or any host with no pinned expected resolution): record only, assert nothing.
+        proc = self.run_snippet(
+            "$r = Get-AttrCudaDisplayDegradedState -TargetWidth 1920 -TargetHeight 1080 "
+            "-ExpectedWidth $null -ExpectedHeight $null\nWrite-Host \"R=$r\"\n"
+        )
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        self.assertIn("R=unknown", proc.stdout)
+        self.assertNotIn("R=False", proc.stdout)
+
+
+@requires_pwsh
+class GuiSmokeDisplaySelectionParsingTests(_ProbeCase):
+    """Get-AttrCudaGuiSmokeDisplaySelection: parses the app's own log lines, third-state on
+    absence, never guesses a value that was not actually logged."""
+
+    def _write_log(self, text: str) -> Path:
+        path = self.tmp / "smoke-run.log"
+        path.write_text(text, encoding="utf-8")
+        return path
+
+    def test_full_happy_path_log_parses_every_field(self) -> None:
+        log_path = self._write_log(SAMPLE_LOG_4K)
+        proc = self.run_snippet(
+            f"$log = [IO.File]::ReadAllText('{log_path}')\n"
+            "$sel = Get-AttrCudaGuiSmokeDisplaySelection -LogText $log\n"
+            "Write-Host \"SCREENS=$($sel.screensCollected) COUNT=$($sel.screens.Count)\"\n"
+            "Write-Host \"TARGET_NAME=$($sel.target.name) FALLBACK=$($sel.target.fallback) "
+            "REASON=$($sel.target.reason) CANDIDATES=$($sel.target.candidates)\"\n"
+            "Write-Host \"MODE=$($sel.placement.mode) PW=$($sel.placement.previewWidth) "
+            "PH=$($sel.placement.previewHeight)\"\n"
+            "$target = $sel.screens | Where-Object { $_.name -eq $sel.target.name }\n"
+            "Write-Host \"TARGET_PHYSICAL=$($target.physicalWidth)x$($target.physicalHeight)"
+            "@$($target.refreshHz)\"\n"
+        )
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        self.assertIn("SCREENS=True COUNT=2", proc.stdout)
+        self.assertIn(r"TARGET_NAME=\\.\DISPLAY1 FALLBACK=False REASON=max_physical_pixels CANDIDATES=2",
+                      proc.stdout)
+        self.assertIn("MODE=fullscreen PW=3840 PH=2160", proc.stdout)
+        self.assertIn("TARGET_PHYSICAL=3840x2160@60", proc.stdout)
+
+    def test_degraded_fallback_log_parses_the_fallback_flag_and_single_candidate(self) -> None:
+        log_path = self._write_log(SAMPLE_LOG_DEGRADED_FALLBACK)
+        proc = self.run_snippet(
+            f"$log = [IO.File]::ReadAllText('{log_path}')\n"
+            "$sel = Get-AttrCudaGuiSmokeDisplaySelection -LogText $log\n"
+            "Write-Host \"FALLBACK=$($sel.target.fallback) CANDIDATES=$($sel.target.candidates) "
+            "MODE=$($sel.placement.mode)\"\n"
+        )
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        self.assertIn("FALLBACK=True CANDIDATES=1 MODE=windowed", proc.stdout)
+
+    def test_an_empty_log_is_the_third_unknown_state_with_a_reason_for_all_three_lines(self) -> None:
+        proc = self.run_snippet(
+            "$sel = Get-AttrCudaGuiSmokeDisplaySelection -LogText ''\n"
+            "Write-Host \"SCREENS=$($sel.screensCollected) TARGET=$($null -eq $sel.target) "
+            "PLACEMENT=$($null -eq $sel.placement)\"\n"
+            "Write-Host \"SE=$($sel.screensError) TE=$($sel.targetError) PE=$($sel.placementError)\"\n"
+        )
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        self.assertIn("SCREENS=False TARGET=True PLACEMENT=True", proc.stdout)
+        self.assertIn("SE=no gui_smoke.display_screen lines found", proc.stdout)
+        self.assertIn("TE=no gui_smoke.display_target line found", proc.stdout)
+        self.assertIn("PE=no gui_smoke.window_placement line found", proc.stdout)
+
+    def test_a_log_with_screens_but_no_target_line_reports_target_unknown_not_the_first_screen(self) -> None:
+        # A build that logs the inventory but never reaches the target-selection line (e.g. it
+        # threw first) must never be silently treated as "chose the first screen".
+        log_path = self._write_log(
+            'gui_smoke.display_screen index=0 name="\\\\.\\DISPLAY1" manufacturer="" model="" '
+            'serial="" geometry=0,0 1920x1080 physical=1920x1080 dpr=1.00 refresh_hz=60.000 primary=1\n'
+        )
+        proc = self.run_snippet(
+            f"$log = [IO.File]::ReadAllText('{log_path}')\n"
+            "$sel = Get-AttrCudaGuiSmokeDisplaySelection -LogText $log\n"
+            "Write-Host \"SCREENS=$($sel.screensCollected) TARGET_NULL=$($null -eq $sel.target)\"\n"
+        )
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        self.assertIn("SCREENS=True TARGET_NULL=True", proc.stdout)
+
+
+@requires_pwsh
+class WindowsDisplayInventoryRealExecutionTests(_ProbeCase):
+    """Get-AttrCudaWindowsDisplayInventory: a real-execution smoke test, mirroring
+    ProcessCpuSnapshotTests' pattern in test_attr_cuda_cpu_quiescence.py. Hub-smoke-tested on
+    Ultra-Magnus hardware separately (collected=True, \\\\.\\DISPLAY1 3840x2400); this only proves
+    the function runs cleanly and returns the documented shape on whatever host runs the test."""
+
+    def test_real_inventory_collects_and_has_the_documented_shape(self) -> None:
+        proc = self.run_snippet(
+            "$inv = Get-AttrCudaWindowsDisplayInventory\n"
+            "Write-Host \"COLLECTED=$($inv.collected) HAS_DEVICES_PROP=$($null -ne $inv.PSObject.Properties['devices'])\"\n"
+        )
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        self.assertIn("HAS_DEVICES_PROP=True", proc.stdout)
+        # collected is a real boolean either way (third state on failure is $false, never $null).
+        self.assertRegex(proc.stdout, r"COLLECTED=(True|False)")
+
+
+@requires_pwsh
+class JobTemplateDisplayBlockWiringTests(unittest.TestCase):
+    """Text-level pin on playback-attr-3-cuda-job.ps1's embedded template: the display block is
+    captured before the CPU-quiescence measurement, recomputed once the smoke log is available,
+    and published on every summary.json / the evidence manifest from leg start onward -- including
+    every refusal path. RESULT-line DISPLAY=/RES=/DEGRADED=/PREVIEW= fields appear only from the
+    point the app's own info is knowable (after the smoke log is parsed), never on an earlier
+    refusal whose RESULT= text is pinned unchanged by test_attr_cuda_cpu_quiescence.py."""
+
+    def setUp(self) -> None:
+        self.source = JOB_SCRIPT.read_text(encoding="utf-8").replace("\r\n", "\n")
+        start = self.source.index("$template = @'")
+        end = self.source.index("\n'@", start)
+        self.template = self.source[start:end]
+
+    def test_the_four_new_functions_are_embedded_and_called_after_the_placeholder(self) -> None:
+        placeholder_at = self.source.index("__EMBEDDED_FUNCTIONS__")
+        for name in (
+            "Get-AttrCudaWindowsDisplayInventory",
+            "Get-AttrCudaMeasurementVenue",
+            "Get-AttrCudaDisplayDegradedState",
+            "Get-AttrCudaGuiSmokeDisplaySelection",
+        ):
+            with self.subTest(function=name):
+                self.assertIn(f"'{name}'", self.source[:placeholder_at])
+                self.assertGreater(self.template.find(name), -1)
+
+    def test_windows_inventory_and_venue_are_captured_before_the_quiescence_sample(self) -> None:
+        inventory_at = self.template.index("$windowsDisplayInventory = Get-AttrCudaWindowsDisplayInventory")
+        venue_at = self.template.index("$measurementVenue = Get-AttrCudaMeasurementVenue")
+        first_display_block_at = self.template.index("$displayBlock = Build-AttrCudaDisplayBlock", inventory_at)
+        quiescence_sample_at = self.template.index("$cpuProcessBefore = Get-AttrCudaProcessCpuSnapshot")
+        self.assertGreater(venue_at, inventory_at)
+        self.assertGreater(first_display_block_at, venue_at)
+        self.assertGreater(quiescence_sample_at, first_display_block_at)
+
+    def test_only_ultra_magnus_venue_gets_an_expected_resolution(self) -> None:
+        venue_at = self.template.index("$measurementVenue = Get-AttrCudaMeasurementVenue")
+        tail = self.template[venue_at:venue_at + 400]
+        self.assertIn("if ($measurementVenue -eq 'ultra-magnus') {", tail)
+        self.assertIn("$expectedDisplayWidth = 3840", tail)
+        self.assertIn("$expectedDisplayHeight = 2160", tail)
+
+    def test_app_selection_is_reparsed_once_the_smoke_log_is_available(self) -> None:
+        raw_log_at = self.template.index("$rawLog = [IO.File]::ReadAllText($logPath)")
+        reparse_at = self.template.index(
+            "$appDisplaySelection = Get-AttrCudaGuiSmokeDisplaySelection -LogText $rawLog", raw_log_at)
+        rebuild_at = self.template.index("$displayBlock = Build-AttrCudaDisplayBlock", reparse_at)
+        get_frame_rows_at = self.template.index("$rows = Get-FrameRows $rawLog")
+        self.assertGreater(reparse_at, raw_log_at)
+        self.assertGreater(rebuild_at, reparse_at)
+        # Reparsed BEFORE frame rows are pulled, so a display-parsing failure can never be masked
+        # by a later frame-row failure that would exit first.
+        self.assertGreater(get_frame_rows_at, rebuild_at)
+
+    def test_display_block_is_published_on_every_refusal_path_including_before_the_smoke_log(self) -> None:
+        anchors = (
+            "result='VENUE_NOT_QUIESCENT'",
+            "result='SMOKE_RUN_FAILED'",
+            "result='SMOKE_LOG_UNAVAILABLE'",
+            "result='PRESENTMON_UNAVAILABLE'",
+            "result='BACKEND_NOT_AVAILABLE'",
+            "result='GPU_RECON_FRAMES_ZERO'",
+            "result='CPU_FALLBACK_DETECTED'",
+        )
+        for anchor in anchors:
+            with self.subTest(anchor=anchor):
+                at = self.template.index(anchor)
+                tail = self.template[at:at + 700]
+                self.assertIn("display=$displayBlock", tail)
+
+    def test_display_block_is_published_on_the_presentmon_display_report_failure_path(self) -> None:
+        at = self.template.index("result=$displayReport.status")
+        tail = self.template[at:at + 500]
+        self.assertIn("display=$displayBlock", tail)
+
+    def test_display_block_is_published_in_the_evidence_manifest_and_success_summary(self) -> None:
+        manifest_at = self.template.index("$manifest = [ordered]@{")
+        manifest_end = self.template.index("Save-Json $manifest", manifest_at)
+        self.assertIn("display = $displayBlock", self.template[manifest_at:manifest_end])
+
+        summary_at = self.template.index("result = $(if ($FixtureRehearsal)")
+        summary_end = self.template.index("(Join-Path $Pub 'summary.json')", summary_at)
+        self.assertIn("display = $displayBlock", self.template[summary_at:summary_end])
+
+    def test_result_lines_carry_the_display_tail_from_the_point_it_is_known_onward(self) -> None:
+        for anchor in (
+            'Write-Output "RESULT=PRESENTMON_UNAVAILABLE',
+            'Write-Output "RESULT=BACKEND_NOT_AVAILABLE',
+            'Write-Output "RESULT=GPU_RECON_FRAMES_ZERO',
+            'Write-Output "RESULT=CPU_FALLBACK_DETECTED',
+            'Write-Output "RESULT=$($displayReport.status)',
+        ):
+            with self.subTest(anchor=anchor):
+                at = self.template.index(anchor)
+                line_end = self.template.index("\n", at)
+                self.assertIn("Get-AttrCudaDisplayResultTail $displayBlock", self.template[at:line_end])
+        # The final success RESULT line also carries it.
+        final_at = self.template.index('Write-Output "RESULT=$resultVerb')
+        final_end = self.template.index("\n", final_at)
+        self.assertIn("Get-AttrCudaDisplayResultTail $displayBlock", self.template[final_at:final_end])
+
+    def test_earlier_refusal_result_lines_are_unchanged_by_this_round(self) -> None:
+        # These three RESULT= lines are pinned verbatim by test_attr_cuda_cpu_quiescence.py /
+        # existing owner-footage tests -- the display tail must NOT be added to them, since the
+        # app's own display info is not knowable before the smoke log is parsed.
+        self.assertIn(
+            'Write-Output "RESULT=VENUE_NOT_QUIESCENT CPU_TIME=$cpuTimeField CPU_UTILITY=$avgUtility ARTIFACTS=$Pub"',
+            self.template,
+        )
+        smoke_run_failed_at = self.template.index('Write-Output "RESULT=SMOKE_RUN_FAILED')
+        smoke_run_failed_end = self.template.index("\n", smoke_run_failed_at)
+        self.assertNotIn("Get-AttrCudaDisplayResultTail", self.template[smoke_run_failed_at:smoke_run_failed_end])
+
+        smoke_log_at = self.template.index('Write-Output "RESULT=SMOKE_LOG_UNAVAILABLE')
+        smoke_log_end = self.template.index("\n", smoke_log_at)
+        self.assertNotIn("Get-AttrCudaDisplayResultTail", self.template[smoke_log_at:smoke_log_end])
+
+    def test_build_display_block_never_folds_missing_target_into_not_degraded(self) -> None:
+        build_at = self.template.index("function Build-AttrCudaDisplayBlock")
+        build_end = self.template.index("\nfunction Get-AttrCudaDisplayResultTail", build_at)
+        body = self.template[build_at:build_end]
+        self.assertIn("Get-AttrCudaDisplayDegradedState", body)
+        # The result field's own third state is used unmodified -- no local override that could
+        # collapse 'unknown' into $false.
+        self.assertIn("displayDegraded = $degraded", body)
+
+
+if __name__ == "__main__":
+    unittest.main()

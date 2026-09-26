@@ -2522,6 +2522,185 @@ function Get-AttrCudaWindowsDisplayInventory {
     [pscustomobject]$result
 }
 
+function Get-AttrCudaMeasurementVenue {
+    <#
+    .SYNOPSIS
+    Which display-expectation venue this leg is running in -- UM-DISPLAY-SELECT-AND-LOG-1 item 2.
+    .DESCRIPTION
+    Only 'ultra-magnus' carries a known expected resolution (the owner's LG-TV/Denon-AVR rig,
+    4K when the TV is on -- see .claude-state/project-memory/
+    um-display-topology-lg-tv-denon-fallback-20260926.md). No display resolution for any other
+    host (Bachelor included) is pinned anywhere in this repo, so every other name -- Bachelor's
+    own included -- returns 'bachelor': record the display identity and mode, assert nothing.
+    -ComputerName defaults to $env:COMPUTERNAME (the real host at run time); a caller overrides it
+    to test the classification without touching the process environment.
+    .OUTPUTS
+    'ultra-magnus' or 'bachelor' (string).
+    #>
+    [CmdletBinding()]
+    param([string]$ComputerName = $env:COMPUTERNAME)
+
+    if ($ComputerName -and $ComputerName -match '(?i)ultra.?magnus') { return 'ultra-magnus' }
+    return 'bachelor'
+}
+
+function Get-AttrCudaDisplayDegradedState {
+    <#
+    .SYNOPSIS
+    Three-state degraded verdict for the chosen display target vs this venue's expectation.
+    .DESCRIPTION
+    UM-DISPLAY-SELECT-AND-LOG-1 item 3: a leg on a degraded display is RECORDED, never gated, but
+    it must never be silently reported as "not degraded" when it is really "cannot tell". Returns
+    'unknown' (string) whenever a verdict cannot be asserted either way -- no expected resolution
+    for this venue (ExpectedWidth/Height $null, e.g. Bachelor), or the target's own width/height
+    could not be read -- and only then compares. Never averages or guesses through a $null.
+    .OUTPUTS
+    'unknown', or a [bool] (true = degraded: target narrower or shorter than expected).
+    #>
+    [CmdletBinding()]
+    param($TargetWidth, $TargetHeight, $ExpectedWidth, $ExpectedHeight)
+
+    if ($null -eq $ExpectedWidth -or $null -eq $ExpectedHeight) { return 'unknown' }
+    if ($null -eq $TargetWidth -or $null -eq $TargetHeight) { return 'unknown' }
+    return [bool]($TargetWidth -lt $ExpectedWidth -or $TargetHeight -lt $ExpectedHeight)
+}
+
+function Get-AttrCudaGuiSmokeDisplaySelection {
+    <#
+    .SYNOPSIS
+    Parses the app's own gui_smoke.display_screen / display_target / window_placement lines
+    (MainWindow.cpp, UM-DISPLAY-SELECT-AND-LOG-1 items 1/1b) out of a smoke run's raw log text.
+    .DESCRIPTION
+    Independent of Get-AttrCudaWindowsDisplayInventory's Windows-API view: this is what the APP
+    itself reported choosing and presenting on. Every one of the three lines is optional in the
+    parse -- an older build or a run that never reached that log statement leaves the
+    corresponding field $null with its own *Error reason, never guessed or defaulted. The LAST
+    matching line wins for display_target/window_placement (each is logged at most once per run,
+    but "last" is still the correct rule if a future caller ever logs it more than once);
+    display_screen is logged once per attached QScreen, so every matching line is kept.
+    .OUTPUTS
+    [pscustomobject] { screensCollected (bool); screens (array of {index,name,manufacturer,model,
+    serial,geometryX,geometryY,width,height,physicalWidth,physicalHeight,devicePixelRatio,
+    refreshHz,primary}); screensError; target ({name,reason,candidates,fallback} or $null);
+    targetError; placement ({mode,screenName,verified,windowX,windowY,windowWidth,windowHeight,
+    previewWidth,previewHeight} or $null); placementError }.
+    #>
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $true)]
+        [AllowEmptyString()]
+        [string]$LogText
+    )
+
+    $result = [ordered]@{
+        screensCollected = $false
+        screens = @()
+        screensError = $null
+        target = $null
+        targetError = $null
+        placement = $null
+        placementError = $null
+    }
+
+    $lines = @($LogText -split "`r?`n")
+
+    try {
+        $screens = New-Object System.Collections.Generic.List[object]
+        $screenPattern = 'gui_smoke\.display_screen index=(?<index>\d+) name="(?<name>[^"]*)" ' +
+            'manufacturer="(?<manufacturer>[^"]*)" model="(?<model>[^"]*)" serial="(?<serial>[^"]*)" ' +
+            'geometry=(?<gx>-?\d+),(?<gy>-?\d+) (?<gw>\d+)x(?<gh>\d+) physical=(?<pw>\d+)x(?<ph>\d+) ' +
+            'dpr=(?<dpr>[0-9.]+) refresh_hz=(?<refresh>[0-9.]+) primary=(?<primary>[01])'
+        foreach ($line in $lines) {
+            $m = [regex]::Match($line, $screenPattern)
+            if (-not $m.Success) { continue }
+            $screens.Add([ordered]@{
+                index = [int]$m.Groups['index'].Value
+                name = $m.Groups['name'].Value
+                manufacturer = $m.Groups['manufacturer'].Value
+                model = $m.Groups['model'].Value
+                serial = $m.Groups['serial'].Value
+                geometryX = [int]$m.Groups['gx'].Value
+                geometryY = [int]$m.Groups['gy'].Value
+                width = [int]$m.Groups['gw'].Value
+                height = [int]$m.Groups['gh'].Value
+                physicalWidth = [int]$m.Groups['pw'].Value
+                physicalHeight = [int]$m.Groups['ph'].Value
+                devicePixelRatio = [double]$m.Groups['dpr'].Value
+                refreshHz = [double]$m.Groups['refresh'].Value
+                primary = ($m.Groups['primary'].Value -eq '1')
+            })
+        }
+        if ($screens.Count -gt 0) {
+            $result.screensCollected = $true
+            $result.screens = $screens.ToArray()
+        } else {
+            $result.screensError = 'no gui_smoke.display_screen lines found in the smoke log'
+        }
+    } catch {
+        $result.screensCollected = $false
+        $result.screens = @()
+        $result.screensError = $_.Exception.GetType().Name
+    }
+
+    try {
+        $targetLine = $null
+        foreach ($line in $lines) {
+            if ($line -match 'gui_smoke\.display_target ') { $targetLine = $line }
+        }
+        if ($null -eq $targetLine) {
+            $result.targetError = 'no gui_smoke.display_target line found in the smoke log'
+        } else {
+            $m = [regex]::Match($targetLine,
+                'screen="(?<name>[^"]*)" reason=(?<reason>\S+) candidates=(?<candidates>\d+) fallback=(?<fallback>[01])')
+            if (-not $m.Success) {
+                $result.targetError = 'gui_smoke.display_target line did not match the expected shape'
+            } else {
+                $result.target = [ordered]@{
+                    name = $m.Groups['name'].Value
+                    reason = $m.Groups['reason'].Value
+                    candidates = [int]$m.Groups['candidates'].Value
+                    fallback = ($m.Groups['fallback'].Value -eq '1')
+                }
+            }
+        }
+    } catch {
+        $result.targetError = $_.Exception.GetType().Name
+    }
+
+    try {
+        $placementLine = $null
+        foreach ($line in $lines) {
+            if ($line -match 'gui_smoke\.window_placement ') { $placementLine = $line }
+        }
+        if ($null -eq $placementLine) {
+            $result.placementError = 'no gui_smoke.window_placement line found in the smoke log'
+        } else {
+            $m = [regex]::Match($placementLine,
+                'mode=(?<mode>\w+) screen="(?<name>[^"]*)" verified=(?<verified>[01]) ' +
+                'window=(?<wx>-?\d+),(?<wy>-?\d+) (?<ww>\d+)x(?<wh>\d+) preview=(?<pw>\d+)x(?<ph>\d+)')
+            if (-not $m.Success) {
+                $result.placementError = 'gui_smoke.window_placement line did not match the expected shape'
+            } else {
+                $result.placement = [ordered]@{
+                    mode = $m.Groups['mode'].Value
+                    screenName = $m.Groups['name'].Value
+                    verified = ($m.Groups['verified'].Value -eq '1')
+                    windowX = [int]$m.Groups['wx'].Value
+                    windowY = [int]$m.Groups['wy'].Value
+                    windowWidth = [int]$m.Groups['ww'].Value
+                    windowHeight = [int]$m.Groups['wh'].Value
+                    previewWidth = [int]$m.Groups['pw'].Value
+                    previewHeight = [int]$m.Groups['ph'].Value
+                }
+            }
+        }
+    } catch {
+        $result.placementError = $_.Exception.GetType().Name
+    }
+
+    [pscustomobject]$result
+}
+
 Export-ModuleMember -Function `
     Get-AttrCudaArtifactNames, `
     New-AttrCudaBuildInfoHeader, `
@@ -2565,4 +2744,7 @@ Export-ModuleMember -Function `
     Get-AttrCudaQuiescenceSample, `
     Get-AttrCudaProcessCpuSnapshot, `
     Get-AttrCudaTopCpuProcesses, `
-    Get-AttrCudaWindowsDisplayInventory
+    Get-AttrCudaWindowsDisplayInventory, `
+    Get-AttrCudaMeasurementVenue, `
+    Get-AttrCudaDisplayDegradedState, `
+    Get-AttrCudaGuiSmokeDisplaySelection
