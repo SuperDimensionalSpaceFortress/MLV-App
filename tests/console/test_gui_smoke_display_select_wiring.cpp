@@ -148,7 +148,7 @@ TEST(GuiSmokeDisplaySelectWiring, RunGuiPlaybackSmokePlacesBeforeForegroundAndFu
     const int placeWindowedAt = smokeBody.indexOf(
         QStringLiteral("placePlaybackSmokeWindowWindowed("), branchAt);
     const int enterFullscreenAt = smokeBody.indexOf(
-        QStringLiteral("fullscreenVerified = enterPlaybackSmokeFullscreen();"), branchAt);
+        QStringLiteral("fullscreenVerified = enterPlaybackSmokeFullscreen( displayTarget );"), branchAt);
 
     ASSERT_TRUE(windowedFlagAt >= 0);
     ASSERT_TRUE(inventoryAt > windowedFlagAt);
@@ -228,7 +228,13 @@ TEST(GuiSmokeDisplaySelectWiring, DisplayTargetAndWindowPlacementLinesAreLoggedF
         "gui_smoke.window_placement mode=windowed screen=\\\"%1\\\" verified=%2 ")));
     ASSERT_TRUE(smokeBody.contains(QStringLiteral(
         "gui_smoke.window_placement mode=fullscreen screen=\\\"%1\\\" verified=%2 ")));
-    ASSERT_TRUE(smokeBody.contains(QStringLiteral("window=%3,%4 %5x%6 preview=%7x%8")));
+    ASSERT_TRUE(smokeBody.contains(QStringLiteral("window=%3,%4 %5x%6 preview=%7x%8 target_screen=\\\"%9\\\" ")));
+    // UM-DISPLAY-SELECT-AND-LOG-1 round 1c (sol pre-review BLOCKER 3 / opus design-review item
+    // 3): appended after preview=, never inserted -- the ACTUAL presentation screen (queried
+    // fresh after placement/fullscreen settles), never the possibly-wrong screen the window
+    // started on.
+    ASSERT_TRUE(smokeBody.contains(QStringLiteral(
+        "presentation_screen=\\\"%10\\\" presentation_physical=%11x%12")));
 }
 
 TEST(GuiSmokeDisplaySelectWiring, FullscreenRequestLineCarriesTheTargetScreenName)
@@ -237,8 +243,15 @@ TEST(GuiSmokeDisplaySelectWiring, FullscreenRequestLineCarriesTheTargetScreenNam
     const int lineAt = source.indexOf(QStringLiteral(
         "gui_smoke.fullscreen_request requested=1 verified=%1 screen=%2x%3 "));
     ASSERT_TRUE(lineAt >= 0);
-    const QString tail = source.mid(lineAt, 700);
+    const QString tail = source.mid(lineAt, 900);
     ASSERT_TRUE(tail.contains(QStringLiteral("target_screen=\\\"%9\\\"")));
+    // UM-DISPLAY-SELECT-AND-LOG-1 round 1c (sol pre-review BLOCKER 3): target_screen is the
+    // CHOSEN target's own name (never the possibly-wrong screen the window actually ended up
+    // on), while presentation_screen/presentation_physical -- appended after it, never
+    // inserted -- report the screen actually verified against on every settle pass.
     ASSERT_TRUE(tail.contains(QStringLiteral(
-        ".arg( fullscreenScreen ? fullscreenScreen->name() : QStringLiteral(\"none\") );")));
+        "presentation_screen=\\\"%10\\\" presentation_physical=%11x%12")));
+    ASSERT_TRUE(tail.contains(QStringLiteral(".arg( target->name() )")));
+    ASSERT_TRUE(tail.contains(QStringLiteral(
+        ".arg( presentationScreen ? presentationScreen->name() : QStringLiteral(\"none\") )")));
 }

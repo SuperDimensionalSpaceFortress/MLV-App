@@ -1419,8 +1419,10 @@ private:
     // --gui-smoke-playback only (CUDA-PERF-PLAYBACK-FULLSCREEN-1): enters/leaves full
     // screen via the existing actionFullscreen toggle (unhidden for normal use since
     // CUDA-PLAYBACK-FULLSCREEN-UI-1) for the measured interval; never called from normal
-    // (non-smoke) startup. See MainWindow::runGuiPlaybackSmoke().
-    bool enterPlaybackSmokeFullscreen( void );
+    // (non-smoke) startup. See MainWindow::runGuiPlaybackSmoke(). UM-DISPLAY-SELECT-AND-LOG-1
+    // round 1c (sol BLOCKER 3): takes the CHOSEN target screen and re-verifies this->screen()
+    // == target on every settle pass -- a null target is a typed failure, never a vacuous pass.
+    bool enterPlaybackSmokeFullscreen( QScreen *target );
     void leavePlaybackSmokeFullscreen( void );
     QSize playbackSmokeViewportSize( void ) const;
     // UM-DISPLAY-SELECT-AND-LOG-1 (--gui-smoke-playback only): a GUI smoke leg must never

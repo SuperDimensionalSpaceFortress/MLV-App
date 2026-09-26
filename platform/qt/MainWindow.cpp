@@ -8949,14 +8949,29 @@ int MainWindow::runGuiPlaybackSmoke(const GuiPlaybackSmokeOptions & options)
     QRect windowedGeometry;
     QSize windowedPreviewSize;
     bool fullscreenVerified = true;
+    // UM-DISPLAY-SELECT-AND-LOG-1 round 1c (sol BLOCKER 3 / opus design-review item 3): the
+    // ACTUAL presentation screen -- not the intended target -- is what a leg was really
+    // benchmarked on, so it is queried fresh (this->screen(), after placement/fullscreen
+    // settle) and logged as its own field, appended after preview= (never inserted), rather
+    // than folded into "screen=" (which stays the intended target, for back-compat with the
+    // existing parser and its pinned tests).
+    auto presentationPhysicalSize = [&]( QScreen *s ) -> QSize
+    {
+        if( !s ) return QSize( 0, 0 );
+        const double dpr = s->devicePixelRatio();
+        return QSize( qRound( s->geometry().width() * dpr ), qRound( s->geometry().height() * dpr ) );
+    };
     if( windowedSmoke )
     {
         fullscreenVerified =
             placePlaybackSmokeWindowWindowed( displayTarget, &windowedGeometry, &windowedPreviewSize );
+        QScreen *presentationScreen = this->screen();
+        const QSize presentationPhysical = presentationPhysicalSize( presentationScreen );
         qInfo().noquote()
             << QStringLiteral(
                    "gui_smoke.window_placement mode=windowed screen=\"%1\" verified=%2 "
-                   "window=%3,%4 %5x%6 preview=%7x%8" )
+                   "window=%3,%4 %5x%6 preview=%7x%8 target_screen=\"%9\" "
+                   "presentation_screen=\"%10\" presentation_physical=%11x%12" )
                    .arg( displayTarget ? displayTarget->name() : QStringLiteral("none") )
                    .arg( bool01( fullscreenVerified ) )
                    .arg( windowedGeometry.x() )
@@ -8964,15 +8979,22 @@ int MainWindow::runGuiPlaybackSmoke(const GuiPlaybackSmokeOptions & options)
                    .arg( windowedGeometry.width() )
                    .arg( windowedGeometry.height() )
                    .arg( windowedPreviewSize.width() )
-                   .arg( windowedPreviewSize.height() );
+                   .arg( windowedPreviewSize.height() )
+                   .arg( displayTarget ? displayTarget->name() : QStringLiteral("none") )
+                   .arg( presentationScreen ? presentationScreen->name() : QStringLiteral("none") )
+                   .arg( presentationPhysical.width() )
+                   .arg( presentationPhysical.height() );
     }
     else
     {
-        fullscreenVerified = enterPlaybackSmokeFullscreen();
+        fullscreenVerified = enterPlaybackSmokeFullscreen( displayTarget );
+        QScreen *presentationScreen = this->screen();
+        const QSize presentationPhysical = presentationPhysicalSize( presentationScreen );
         qInfo().noquote()
             << QStringLiteral(
                    "gui_smoke.window_placement mode=fullscreen screen=\"%1\" verified=%2 "
-                   "window=%3,%4 %5x%6 preview=%7x%8" )
+                   "window=%3,%4 %5x%6 preview=%7x%8 target_screen=\"%9\" "
+                   "presentation_screen=\"%10\" presentation_physical=%11x%12" )
                    .arg( displayTarget ? displayTarget->name() : QStringLiteral("none") )
                    .arg( bool01( fullscreenVerified ) )
                    .arg( geometry().x() )
@@ -8980,7 +9002,11 @@ int MainWindow::runGuiPlaybackSmoke(const GuiPlaybackSmokeOptions & options)
                    .arg( geometry().width() )
                    .arg( geometry().height() )
                    .arg( playbackSmokeViewportSize().width() )
-                   .arg( playbackSmokeViewportSize().height() );
+                   .arg( playbackSmokeViewportSize().height() )
+                   .arg( displayTarget ? displayTarget->name() : QStringLiteral("none") )
+                   .arg( presentationScreen ? presentationScreen->name() : QStringLiteral("none") )
+                   .arg( presentationPhysical.width() )
+                   .arg( presentationPhysical.height() );
     }
     // Entering full screen hides chrome and re-lays-out the window -- re-verify (and, if
     // it slipped, re-establish) OS foreground now rather than trusting the pre-fullscreen
@@ -22890,7 +22916,16 @@ bool MainWindow::placePlaybackSmokeWindowWindowed( QScreen *target,
                                                    QRect *outGeometry,
                                                    QSize *outPreviewSize )
 {
-    if( !target ) target = QGuiApplication::primaryScreen();
+    // UM-DISPLAY-SELECT-AND-LOG-1 round 1c (opus design-review item 3): a null target is a
+    // typed failure, not a vacuous pass onto whatever screen the window already happens to be
+    // on -- choosePlaybackSmokeDisplayTarget() only returns null when QGuiApplication::screens()
+    // is itself empty, so this is defensive fail-closed, never a real fallback path.
+    if( !target )
+    {
+        if( outGeometry ) *outGeometry = geometry();
+        if( outPreviewSize ) *outPreviewSize = playbackSmokeViewportSize();
+        return false;
+    }
     movePlaybackSmokeWindowToScreen( target );
     showMaximized();
 
@@ -22918,35 +22953,63 @@ bool MainWindow::placePlaybackSmokeWindowWindowed( QScreen *target,
 // sizing in computeDisplaySceneGeometry() (which already branches on
 // ui->actionFullscreen->isChecked() to size from the window's own screen) apply exactly as
 // they would for a user-triggered toggle.
-bool MainWindow::enterPlaybackSmokeFullscreen( void )
+bool MainWindow::enterPlaybackSmokeFullscreen( QScreen *target )
 {
+    // UM-DISPLAY-SELECT-AND-LOG-1 round 1c (sol pre-review BLOCKER 3 / opus design-review
+    // item 3): a null target is a typed failure, not a vacuous pass -- previously this
+    // function took no target at all and simply trusted this->screen() (captured ONCE,
+    // before the settle loop) as ground truth for both what to verify against AND what to
+    // report as "target_screen". A move the OS/window manager silently ignored (this
+    // topology has TWO same-size 4K outputs -- the Denon path and the ASUS monitor -- so
+    // size alone cannot distinguish a rejected move) would then verify=true and report the
+    // intended target's name, while playback actually ran on the wrong screen.
+    if( !target )
+    {
+        qInfo().noquote()
+            << QStringLiteral(
+                   "gui_smoke.fullscreen_request requested=1 verified=0 screen=0x0 "
+                   "window=%1x%2 gpu_viewport=0x0 dpr=%3 target_screen=\"none\" "
+                   "presentation_screen=\"none\" presentation_physical=0x0" )
+                   .arg( size().width() )
+                   .arg( size().height() )
+                   .arg( devicePixelRatioF(), 0, 'f', 2 );
+        return false;
+    }
+
     if( !ui->actionFullscreen->isChecked() )
     {
         ui->actionFullscreen->trigger();
     }
 
-    // Matches computeDisplaySceneGeometry()'s screen choice: the window's own screen, not
-    // always primary -- showFullScreen() goes fullscreen wherever the window already is.
-    QScreen *fullscreenScreen = this->screen();
-    if( !fullscreenScreen ) fullscreenScreen = QApplication::primaryScreen();
-    const QSize screenSize = fullscreenScreen ? fullscreenScreen->size() : QSize();
+    const QSize targetSize = target->size();
 
     // Bounded, event-driven wait: showFullScreen() is asynchronous under the window
     // manager, and when the experimental GL viewport path is active the GPU display
     // window's own container resize is a further layout pass on top of that -- both need
-    // to settle before the geometry checked below is meaningful.
+    // to settle before the geometry checked below is meaningful. this->screen() is
+    // re-queried and re-compared against the CHOSEN target on every pass, not captured
+    // once before the loop -- the failure this closes is a rejected move that never shows
+    // up in isFullScreen()/size() alone.
+    QScreen *presentationScreen = this->screen();
     bool mainVerified = false;
     QSize gpuViewport( 0, 0 ); // stays 0x0 (not -1x-1) when the GPU display path is never active
     bool gpuVerified = true; // vacuously true when the GPU display path is not active
     for( int attempt = 0; attempt < 200; ++attempt )
     {
         qApp->processEvents( QEventLoop::AllEvents );
-        mainVerified = isFullScreen() && screenSize.isValid() && size() == screenSize;
+        presentationScreen = this->screen();
+        const bool onTarget = ( presentationScreen == target );
+        mainVerified = isFullScreen() && onTarget && targetSize.isValid() && size() == targetSize;
 
         if( GpuDisplayWindow::isActive() )
         {
             gpuViewport = GpuDisplayWindow::displaySize();
-            gpuVerified = screenSize.isValid() && gpuViewport == screenSize;
+            gpuVerified = targetSize.isValid() && gpuViewport == targetSize;
+        }
+        else
+        {
+            gpuViewport = QSize( 0, 0 );
+            gpuVerified = true;
         }
 
         if( mainVerified && gpuVerified ) break;
@@ -22954,19 +23017,29 @@ bool MainWindow::enterPlaybackSmokeFullscreen( void )
     }
 
     const bool verified = mainVerified && gpuVerified;
+    if( !presentationScreen ) presentationScreen = QApplication::primaryScreen();
+    const double presentationDpr = presentationScreen ? presentationScreen->devicePixelRatio() : 1.0;
+    const QSize presentationPhysical = presentationScreen
+        ? QSize( qRound( presentationScreen->geometry().width() * presentationDpr ),
+                 qRound( presentationScreen->geometry().height() * presentationDpr ) )
+        : QSize( 0, 0 );
     qInfo().noquote()
         << QStringLiteral(
                "gui_smoke.fullscreen_request requested=1 verified=%1 screen=%2x%3 "
-               "window=%4x%5 gpu_viewport=%6x%7 dpr=%8 target_screen=\"%9\"" )
+               "window=%4x%5 gpu_viewport=%6x%7 dpr=%8 target_screen=\"%9\" "
+               "presentation_screen=\"%10\" presentation_physical=%11x%12" )
                .arg( bool01( verified ) )
-               .arg( screenSize.width() )
-               .arg( screenSize.height() )
+               .arg( targetSize.width() )
+               .arg( targetSize.height() )
                .arg( size().width() )
                .arg( size().height() )
                .arg( gpuViewport.width() )
                .arg( gpuViewport.height() )
                .arg( devicePixelRatioF(), 0, 'f', 2 )
-               .arg( fullscreenScreen ? fullscreenScreen->name() : QStringLiteral("none") );
+               .arg( target->name() )
+               .arg( presentationScreen ? presentationScreen->name() : QStringLiteral("none") )
+               .arg( presentationPhysical.width() )
+               .arg( presentationPhysical.height() );
     return verified;
 }
 
