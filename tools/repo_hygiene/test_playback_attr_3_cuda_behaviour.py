@@ -4134,6 +4134,13 @@ class EmbeddedFunctionContractTests(_PwshCase):
             "Publish-AttrCudaFileMove",
             "New-AttrCudaDirectory",
             "Remove-AttrCudaTree",
+            # UM-DISPLAY-SELECT-AND-LOG-1 round 2b/2: venue-quiescence (CPU busy time, not
+            # utility) and the Windows display inventory, both embedded verbatim like every
+            # other shared function.
+            "Get-AttrCudaQuiescenceSample",
+            "Get-AttrCudaProcessCpuSnapshot",
+            "Get-AttrCudaTopCpuProcesses",
+            "Get-AttrCudaWindowsDisplayInventory",
         ),
     }
 

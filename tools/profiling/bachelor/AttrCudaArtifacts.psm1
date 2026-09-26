@@ -2361,6 +2361,167 @@ function Get-AttrCudaTopCpuProcesses {
     $deltas | Sort-Object -Property cpuSeconds -Descending | Select-Object -First $Count
 }
 
+function Get-AttrCudaWindowsDisplayInventory {
+    <#
+    .SYNOPSIS
+    The Windows view of every active display, independent of Qt: EnumDisplayDevices (adapter
+    name, adapter string, monitor friendly name, primary flag) and EnumDisplaySettings's CURRENT
+    mode (width, height, refresh, bits) for each one -- UM-DISPLAY-SELECT-AND-LOG-1 item 2.
+    .DESCRIPTION
+    Ultra-Magnus's primary display is an LG TV through a Denon AVR, both at 4K when on; when the
+    TV is off the primary falls back to the Denon's headless output at a DEGRADED resolution
+    (evidence: a 2026-09-26 probe recorded "2x 2560x1440"). This is the ground truth a caller
+    compares the app's own QScreen inventory against, so a leg that silently benchmarked the
+    degraded fallback is provable independent of what the app itself reported.
+    Read-only: never calls ChangeDisplaySettings or any SPI_SET* -- enumeration only.
+    .OUTPUTS
+    [pscustomobject] { collected (bool); devices (array of {deviceName, adapterString,
+    monitorName, isPrimary, modeCollected, width, height, refreshHz, bitsPerPixel}); error (the
+    exception's bare type name, sanitized, when collected is $false) }. Third state: collected
+    -eq $false means NOTHING here is trustworthy -- a caller must treat the whole inventory as
+    unknown, never as "zero displays". A single adapter's mode failing to read (modeCollected
+    -eq $false) does not fail the rest of the inventory -- that adapter's width/height/refreshHz/
+    bitsPerPixel are $null, its own third state.
+    #>
+    [CmdletBinding()]
+    param()
+
+    $result = [ordered]@{ collected = $false; devices = @(); error = $null }
+    try {
+        if (-not ("AttrCudaNativeDisplay" -as [type])) {
+            Add-Type -TypeDefinition @"
+                using System;
+                using System.Runtime.InteropServices;
+
+                [StructLayout(LayoutKind.Sequential, CharSet = CharSet.Unicode)]
+                public struct AttrCudaDisplayDevice
+                {
+                    public int cb;
+                    [MarshalAs(UnmanagedType.ByValTStr, SizeConst = 32)]
+                    public string DeviceName;
+                    [MarshalAs(UnmanagedType.ByValTStr, SizeConst = 128)]
+                    public string DeviceString;
+                    public int StateFlags;
+                    [MarshalAs(UnmanagedType.ByValTStr, SizeConst = 128)]
+                    public string DeviceID;
+                    [MarshalAs(UnmanagedType.ByValTStr, SizeConst = 128)]
+                    public string DeviceKey;
+                }
+
+                [StructLayout(LayoutKind.Sequential, CharSet = CharSet.Unicode)]
+                public struct AttrCudaDevMode
+                {
+                    [MarshalAs(UnmanagedType.ByValTStr, SizeConst = 32)]
+                    public string dmDeviceName;
+                    public short dmSpecVersion;
+                    public short dmDriverVersion;
+                    public short dmSize;
+                    public short dmDriverExtra;
+                    public int dmFields;
+                    public int dmPositionX;
+                    public int dmPositionY;
+                    public int dmDisplayOrientation;
+                    public int dmDisplayFixedOutput;
+                    public short dmColor;
+                    public short dmDuplex;
+                    public short dmYResolution;
+                    public short dmTTOption;
+                    public short dmCollate;
+                    [MarshalAs(UnmanagedType.ByValTStr, SizeConst = 32)]
+                    public string dmFormName;
+                    public short dmLogPixels;
+                    public int dmBitsPerPel;
+                    public int dmPelsWidth;
+                    public int dmPelsHeight;
+                    public int dmDisplayFlags;
+                    public int dmDisplayFrequency;
+                    public int dmICMMethod;
+                    public int dmICMIntent;
+                    public int dmMediaType;
+                    public int dmDitherType;
+                    public int dmReserved1;
+                    public int dmReserved2;
+                    public int dmPanningWidth;
+                    public int dmPanningHeight;
+                }
+
+                public static class AttrCudaNativeDisplay
+                {
+                    // Two overloads, deliberately: PowerShell's $null binds to a P/Invoke
+                    // 'string' parameter as an EMPTY string, not a true NULL pointer -- and
+                    // EnumDisplayDevices treats lpDevice="" as "no such adapter" (returns
+                    // false immediately), not as "enumerate adapters" (lpDevice=NULL). The
+                    // adapter-enumeration call below always passes IntPtr.Zero through the
+                    // first overload; every other call passes a real device name string
+                    // through the second.
+                    [DllImport("user32.dll", EntryPoint = "EnumDisplayDevicesW", SetLastError = true)]
+                    public static extern bool EnumDisplayDevices(IntPtr lpDevice, uint iDevNum, ref AttrCudaDisplayDevice lpDisplayDevice, uint dwFlags);
+
+                    [DllImport("user32.dll", EntryPoint = "EnumDisplayDevicesW", SetLastError = true, CharSet = CharSet.Unicode)]
+                    public static extern bool EnumDisplayDevicesNamed(string lpDevice, uint iDevNum, ref AttrCudaDisplayDevice lpDisplayDevice, uint dwFlags);
+
+                    [DllImport("user32.dll", EntryPoint = "EnumDisplaySettingsW", SetLastError = true, CharSet = CharSet.Unicode)]
+                    public static extern bool EnumDisplaySettings(string lpszDeviceName, int iModeNum, ref AttrCudaDevMode lpDevMode);
+                }
+"@
+        }
+
+        # ATTACHED_TO_DESKTOP = 0x1, PRIMARY_DEVICE = 0x4 -- read-only enumeration flags, not
+        # ChangeDisplaySettings/SPI_SET* (this function never mutates display state).
+        $attachedFlag = 0x1
+        $primaryFlag = 0x4
+        $currentSettingsMode = -1
+        $devices = New-Object System.Collections.Generic.List[object]
+        $adapterIndex = 0
+        while ($true) {
+            $adapter = New-Object AttrCudaDisplayDevice
+            $adapter.cb = [System.Runtime.InteropServices.Marshal]::SizeOf($adapter)
+            $adapterOk = [AttrCudaNativeDisplay]::EnumDisplayDevices([IntPtr]::Zero, $adapterIndex, [ref]$adapter, 0)
+            if (-not $adapterOk) { break }
+            $adapterIndex++
+            if (($adapter.StateFlags -band $attachedFlag) -eq 0) { continue }
+
+            $monitorName = $null
+            $monitor = New-Object AttrCudaDisplayDevice
+            $monitor.cb = [System.Runtime.InteropServices.Marshal]::SizeOf($monitor)
+            if ([AttrCudaNativeDisplay]::EnumDisplayDevicesNamed($adapter.DeviceName, 0, [ref]$monitor, 0)) {
+                if (-not [string]::IsNullOrWhiteSpace($monitor.DeviceString)) {
+                    $monitorName = $monitor.DeviceString
+                }
+            }
+
+            $mode = New-Object AttrCudaDevMode
+            $mode.dmSize = [System.Runtime.InteropServices.Marshal]::SizeOf($mode)
+            $modeOk = [AttrCudaNativeDisplay]::EnumDisplaySettings($adapter.DeviceName, $currentSettingsMode, [ref]$mode)
+
+            $devices.Add([pscustomobject]@{
+                deviceName = $adapter.DeviceName
+                adapterString = $adapter.DeviceString
+                monitorName = $monitorName
+                isPrimary = (($adapter.StateFlags -band $primaryFlag) -ne 0)
+                modeCollected = $modeOk
+                width = $(if ($modeOk) { $mode.dmPelsWidth } else { $null })
+                height = $(if ($modeOk) { $mode.dmPelsHeight } else { $null })
+                refreshHz = $(if ($modeOk) { $mode.dmDisplayFrequency } else { $null })
+                bitsPerPixel = $(if ($modeOk) { $mode.dmBitsPerPel } else { $null })
+            })
+        }
+
+        $result.collected = $true
+        # .ToArray(), never @($devices): wrapping a List[object] directly in the array
+        # subexpression operator throws "Argument types do not match" -- measured on both
+        # Windows PowerShell 5.1 and pwsh 7 in this environment -- so the List's own ToArray()
+        # is used instead of relying on @()'s enumeration of a generic List.
+        $result.devices = $devices.ToArray()
+    } catch {
+        $result.collected = $false
+        $result.devices = @()
+        $result.error = $_.Exception.GetType().Name
+    }
+
+    [pscustomobject]$result
+}
+
 Export-ModuleMember -Function `
     Get-AttrCudaArtifactNames, `
     New-AttrCudaBuildInfoHeader, `
@@ -2403,4 +2564,5 @@ Export-ModuleMember -Function `
     Get-AttrCudaPresentMonDisplayReport, `
     Get-AttrCudaQuiescenceSample, `
     Get-AttrCudaProcessCpuSnapshot, `
-    Get-AttrCudaTopCpuProcesses
+    Get-AttrCudaTopCpuProcesses, `
+    Get-AttrCudaWindowsDisplayInventory
