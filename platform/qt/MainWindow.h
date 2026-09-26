@@ -62,6 +62,7 @@ class MainWindow;
 
 class QAction;
 class QElapsedTimer;
+class QScreen;
 
 class MainWindow : public QMainWindow
 {
@@ -174,6 +175,10 @@ public:
         QString stressSwitchInputPath;
         int stressSwitchAtMs = 1000;
         int stressSeekFrame = 8;
+        // UM-DISPLAY-SELECT-AND-LOG-1: when true, the smoke session is placed and maximized
+        // (deterministic size) on the chosen target display instead of going full screen --
+        // see MainWindow::runGuiPlaybackSmoke() and choosePlaybackSmokeDisplayTarget().
+        bool windowed = false;
     };
 
     int runHeadlessPlaybackProfile(const PlaybackProfileOptions & options);
@@ -1418,6 +1423,19 @@ private:
     bool enterPlaybackSmokeFullscreen( void );
     void leavePlaybackSmokeFullscreen( void );
     QSize playbackSmokeViewportSize( void ) const;
+    // UM-DISPLAY-SELECT-AND-LOG-1 (--gui-smoke-playback only): a GUI smoke leg must never
+    // silently benchmark whatever screen the window's persisted geometry happened to leave
+    // it on -- log every attached QScreen, choose the one with the most physical pixels
+    // (ties -> higher refresh rate, then primary), and move the window there before any
+    // fullscreen request or windowed maximize. See runGuiPlaybackSmoke(), the only caller.
+    void logPlaybackSmokeDisplayInventory( void ) const;
+    QScreen *choosePlaybackSmokeDisplayTarget( bool *outFallback,
+                                               int *outCandidateCount,
+                                               QString *outReason ) const;
+    void movePlaybackSmokeWindowToScreen( QScreen *target );
+    bool placePlaybackSmokeWindowWindowed( QScreen *target,
+                                           QRect *outGeometry,
+                                           QSize *outPreviewSize );
     void onPlaybackSmokeApplicationStateChanged( Qt::ApplicationState state );
     void enqueuePlaybackPrepTask( const PlaybackPrepTask &task );
     void invalidatePlaybackPrepForDisplayChange( const char *reason );

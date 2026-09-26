@@ -141,12 +141,16 @@ TEST(PlaybackSmokeFullscreenWiring, OrderIsForegroundThenFullscreenThenReverifie
 TEST(PlaybackSmokeFullscreenWiring, GuardRestoresOnEveryPathIncludingEarlyReturns)
 {
     const QString source = readRepoFile(QStringLiteral("platform/qt/MainWindow.cpp"));
+    // UM-DISPLAY-SELECT-AND-LOG-1 round 1b: the guard gained an `active` flag so a windowed
+    // leg's teardown (never having entered full screen) does not call
+    // leavePlaybackSmokeFullscreen() at all.
     ASSERT_TRUE(source.contains(QStringLiteral(
         "struct PlaybackSmokeFullscreenGuard\n"
         "    {\n"
         "        MainWindow *window;\n"
-        "        ~PlaybackSmokeFullscreenGuard() { if( window ) window->leavePlaybackSmokeFullscreen(); }\n"
-        "    } playbackSmokeFullscreenGuard{ this };")));
+        "        bool active;\n"
+        "        ~PlaybackSmokeFullscreenGuard() { if( window && active ) window->leavePlaybackSmokeFullscreen(); }\n"
+        "    } playbackSmokeFullscreenGuard{ this, !windowedSmoke };")));
 
     // At least one early-return error path exists textually AFTER the guard is
     // constructed within runGuiPlaybackSmoke() -- proving there is something for the
@@ -292,13 +296,19 @@ TEST(PlaybackSmokeFullscreenWiring, UnverifiedFullscreenFailsClosedBeforeTheTrig
         QStringLiteral("void MainWindow::importNewMlv(QString fileName)"));
     ASSERT_FALSE(smokeBody.isEmpty());
 
+    // UM-DISPLAY-SELECT-AND-LOG-1 round 1b: enterPlaybackSmokeFullscreen() is now one
+    // branch of a windowed/fullscreen choice (the windowed branch calls
+    // placePlaybackSmokeWindowWindowed() instead), but the non-windowed branch still
+    // assigns fullscreenVerified from it, with no other call site.
     ASSERT_TRUE(smokeBody.contains(
-        QStringLiteral("const bool fullscreenVerified = enterPlaybackSmokeFullscreen();")));
+        QStringLiteral("fullscreenVerified = enterPlaybackSmokeFullscreen();")));
 
     const int checkAt = smokeBody.indexOf(QStringLiteral("if( !fullscreenVerified )"));
     ASSERT_TRUE(checkAt >= 0);
     const int failCallAt = smokeBody.indexOf(
-        QStringLiteral("logFullscreenSmokeFailure( \"fullscreen_not_verified\" )"), checkAt);
+        QStringLiteral(
+            "windowedSmoke ? \"windowed_placement_not_verified\" : \"fullscreen_not_verified\""),
+        checkAt);
     // Search for the trigger from the check onward -- an earlier, unrelated
     // ui->actionPlay->trigger() exists upstream (Look Assist auto-warmup settle).
     const int triggerAt = smokeBody.indexOf(QStringLiteral("ui->actionPlay->trigger();"), checkAt);
@@ -333,8 +343,12 @@ TEST(PlaybackSmokeFullscreenWiring, FullscreenLossMidSessionFailsClosedAfterTheD
     ASSERT_TRUE(playedMsAt > loopAt);
     // CUDA-PLAYBACK-FULLSCREEN-UI-2: the gate now also fails on a nonzero lost count, not
     // just the final-state isFullScreen() check -- see the dedicated latch tests below.
+    // UM-DISPLAY-SELECT-AND-LOG-1 round 1b: the gate is now skipped entirely for a
+    // windowed leg, which never enters full screen in the first place.
     const int gateAt = smokeBody.indexOf(
-        QStringLiteral("if( !isFullScreen() || m_playbackSmokeFullscreenLostCount > 0 )"), playedMsAt);
+        QStringLiteral(
+            "if( !windowedSmoke && ( !isFullScreen() || m_playbackSmokeFullscreenLostCount > 0 ) )"),
+        playedMsAt);
     ASSERT_TRUE(gateAt > playedMsAt);
     const int gateFailCallAt = smokeBody.indexOf(
         QStringLiteral("logFullscreenSmokeFailure( \"fullscreen_lost_mid_session\" )"), gateAt);
@@ -439,7 +453,9 @@ TEST(PlaybackSmokeFullscreenWiring, LatchIsDisarmedAtLoopExitBeforeTheGateCheckA
     const int disarmAt = smokeBody.indexOf(
         QStringLiteral("m_playbackSmokeFullscreenLossLatchArmed = false;"), playedMsAt);
     const int gateAt = smokeBody.indexOf(
-        QStringLiteral("if( !isFullScreen() || m_playbackSmokeFullscreenLostCount > 0 )"), disarmAt);
+        QStringLiteral(
+            "if( !windowedSmoke && ( !isFullScreen() || m_playbackSmokeFullscreenLostCount > 0 ) )"),
+        disarmAt);
 
     ASSERT_TRUE(loopAt >= 0);
     ASSERT_TRUE(playedMsAt > loopAt);
@@ -465,9 +481,11 @@ TEST(PlaybackSmokeFullscreenWiring, GateFailsClosedOnLostCountEvenWhenFinalState
     // The point-sample isFullScreen() check alone is no longer sufficient: a genuinely
     // full-screen final state with a nonzero lost count must still fail.
     ASSERT_TRUE(smokeBody.contains(
-        QStringLiteral("if( !isFullScreen() || m_playbackSmokeFullscreenLostCount > 0 )")));
+        QStringLiteral(
+            "if( !windowedSmoke && ( !isFullScreen() || m_playbackSmokeFullscreenLostCount > 0 ) )")));
     const int gateAt = smokeBody.indexOf(
-        QStringLiteral("if( !isFullScreen() || m_playbackSmokeFullscreenLostCount > 0 )"));
+        QStringLiteral(
+            "if( !windowedSmoke && ( !isFullScreen() || m_playbackSmokeFullscreenLostCount > 0 ) )"));
     const int failCallAt = smokeBody.indexOf(
         QStringLiteral("logFullscreenSmokeFailure( \"fullscreen_lost_mid_session\" )"), gateAt);
     ASSERT_TRUE(failCallAt > gateAt);

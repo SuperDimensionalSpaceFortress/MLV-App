@@ -1301,6 +1301,11 @@ static int runGuiPlaybackSmoke(QApplication &app)
         QStringLiteral("Loop the clip so a short clip plays continuously for the whole --seconds window (default: play once then stop)."));
     parser.addOption(loopPlaybackOpt);
 
+    const QCommandLineOption windowedOpt(
+        QStringLiteral("windowed"),
+        QStringLiteral("Place the window on the chosen target display and maximize it there instead of going full screen (default: full screen)."));
+    parser.addOption(windowedOpt);
+
     const QCommandLineOption exerciseClipLifecycleStressOpt(
         QStringLiteral("exercise-clip-lifecycle-stress"),
         QStringLiteral("During GUI smoke playback, seek, switch clips, close/unload, and reopen to validate clip lifecycle handoff."));
@@ -1575,6 +1580,7 @@ static int runGuiPlaybackSmoke(QApplication &app)
     options.forcePlaybackDebayer = parser.isSet(playbackDebayerOpt);
     options.disableLookAssist = parser.isSet(noLookAssistOpt);
     options.loopPlayback = parser.isSet(loopPlaybackOpt);
+    options.windowed = parser.isSet(windowedOpt);
     options.zebras = parser.isSet(zebrasOpt);
     options.forceZebras = parser.isSet(zebrasOpt) || parser.isSet(noZebrasOpt);
     options.dropFrame = dropFrameMode == QStringLiteral("on");
