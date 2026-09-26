@@ -2693,8 +2693,12 @@ function Get-AttrCudaGuiSmokeDisplaySelection {
         if ($null -eq $targetLine) {
             $result.targetError = 'no gui_smoke.display_target line found in the smoke log'
         } else {
+            # UM-DISPLAY-SELECT-AND-LOG-1 round 1c: preferred=/preferred_matched= are appended
+            # fields (optional group -- a legacy log line that predates them still matches on
+            # its pre-existing fields, both reading $null, never guessed).
             $m = [regex]::Match($targetLine,
-                'screen="(?<name>[^"]*)" reason=(?<reason>\S+) candidates=(?<candidates>\d+) fallback=(?<fallback>[01])')
+                'screen="(?<name>[^"]*)" reason=(?<reason>\S+) candidates=(?<candidates>\d+) fallback=(?<fallback>[01])' +
+                '(?: preferred="(?<preferred>[^"]*)" preferred_matched=(?<preferredMatched>\S+))?')
             if (-not $m.Success) {
                 $result.targetError = 'gui_smoke.display_target line did not match the expected shape'
             } else {
@@ -2703,6 +2707,8 @@ function Get-AttrCudaGuiSmokeDisplaySelection {
                     reason = $m.Groups['reason'].Value
                     candidates = [int]$m.Groups['candidates'].Value
                     fallback = ($m.Groups['fallback'].Value -eq '1')
+                    preferred = $(if ($m.Groups['preferred'].Success) { $m.Groups['preferred'].Value } else { $null })
+                    preferredMatched = $(if ($m.Groups['preferredMatched'].Success) { $m.Groups['preferredMatched'].Value } else { $null })
                 }
             }
         }

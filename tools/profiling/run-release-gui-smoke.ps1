@@ -78,6 +78,12 @@ param(
     [switch]$DetectPlaybackArtifacts,
     [switch]$ArtifactCadenceAdvisory,
     [switch]$LegacyGuiSmokeOptions,
+    # UM-DISPLAY-SELECT-AND-LOG-1 round 1c: a per-venue name substring, forwarded to the app's
+    # own --display-prefer only when non-empty, not under -LegacyGuiSmokeOptions, AND the
+    # target binary's own --help lists the option (feature-probed -- an older "before" binary
+    # in an A/B does not register it, and QCommandLineParser::process() rejects an unknown
+    # option outright, which would kill that leg rather than just skip the preference).
+    [string]$DisplayPrefer = "",
     [switch]$AllowZeroPresentedFrames,
     [switch]$LaunchOnlyProbe,
     [ValidateRange(0.0, 1.0)]
@@ -1301,6 +1307,21 @@ if ($GpuAmazeTexturePresent) {
 }
 if ($DisableLookAssist -and -not $LegacyGuiSmokeOptions) {
     $arguments += "--no-look-assist"
+}
+if (-not [string]::IsNullOrWhiteSpace($DisplayPrefer) -and -not $LegacyGuiSmokeOptions) {
+    # UM-DISPLAY-SELECT-AND-LOG-1 round 1c (opus design-review item 5): --help lists every
+    # option QCommandLineParser registered, so a binary that predates --display-prefer is
+    # detected here and simply never gets the flag, instead of failing to launch at all.
+    $displayPreferSupported = $false
+    try {
+        $helpOutput = (& $exe --help 2>&1 | Out-String)
+        $displayPreferSupported = $helpOutput -match '(?m)^\s*--display-prefer\b'
+    } catch {
+        $displayPreferSupported = $false
+    }
+    if ($displayPreferSupported) {
+        $arguments += "--display-prefer=$DisplayPrefer"
+    }
 }
 if ($ExerciseClipLifecycleStress) {
     $arguments += "--exercise-clip-lifecycle-stress"

@@ -911,6 +911,10 @@ function Build-AttrCudaDisplayBlock {
         presentationUnknownReason = $presentationUnknownReason
         placementVerified = $(if ($placement) { $placement.verified } else { 'unknown' })
         selectionFallback = $(if ($targetInfo) { $targetInfo.fallback } else { 'unknown' })
+        # UM-DISPLAY-SELECT-AND-LOG-1 round 1c: recorded, never gated -- a Denon leg (real 4K,
+        # just not the preferred ASUS PA329C) is still a valid measurement.
+        preferredSubstring = $(if ($targetInfo) { $targetInfo.preferred } else { $null })
+        preferredMatched = $(if ($targetInfo -and $targetInfo.preferredMatched) { $targetInfo.preferredMatched } else { 'unknown' })
         mode = $(if ($placement) { $placement.mode } else { 'unknown' })
         preview = $(if ($placement) { [ordered]@{ width = $placement.previewWidth; height = $placement.previewHeight } } else { $null })
         previewUnknownReason = $(if ($null -eq $placement) { $placementError } else { $null })
@@ -940,7 +944,10 @@ function Get-AttrCudaDisplayResultTail([object]$DisplayBlock) {
         elseif ($DisplayBlock.displayDegraded -eq $false) { '0' }
         else { 'unknown' }
     $previewField = if ($DisplayBlock.preview) { "$($DisplayBlock.preview.width)x$($DisplayBlock.preview.height)" } else { 'unknown' }
-    "DISPLAY=$displayName RES=$res DEGRADED=$degradedField PREVIEW=$previewField"
+    # UM-DISPLAY-SELECT-AND-LOG-1 round 1c: recorded, never gated -- matched|absent|not_max|none,
+    # or 'unknown' when the app never logged it (a legacy binary/log).
+    $preferredField = if ($DisplayBlock.preferredMatched) { $DisplayBlock.preferredMatched } else { 'unknown' }
+    "DISPLAY=$displayName RES=$res DEGRADED=$degradedField PREVIEW=$previewField PREFERRED=$preferredField"
 }
 
 foreach ($item in @(
@@ -1197,9 +1204,13 @@ $windowsDisplayInventory = Get-AttrCudaWindowsDisplayInventory
 $measurementVenue = Get-AttrCudaMeasurementVenue
 $expectedDisplayWidth = $null
 $expectedDisplayHeight = $null
+# UM-DISPLAY-SELECT-AND-LOG-1 round 1c (measured topology): kept next to the expected
+# resolution in this one venue table. Tie-break only -- real resolution always wins first.
+$displayPreferSubstring = ''
 if ($measurementVenue -eq 'ultra-magnus') {
     $expectedDisplayWidth = 3840
     $expectedDisplayHeight = 2160
+    $displayPreferSubstring = 'PA329C'
 }
 # -AppSelection $null until the smoke log is parsed further down -- appScreens/target/mode/
 # preview read 'unknown' with their own reason until then (Build-AttrCudaDisplayBlock's header).
@@ -1308,6 +1319,12 @@ $envs = @(
 $envList = "'" + ($envs -join "','") + "'"
 function ConvertTo-PsSingleQuoted([string]$Value) { "'" + $Value.Replace("'", "''") + "'" }
 $cmd = "& $(ConvertTo-PsSingleQuoted $smoke) -ExePath $(ConvertTo-PsSingleQuoted $exePath) -Input $(ConvertTo-PsSingleQuoted $clipPath) -Output $(ConvertTo-PsSingleQuoted $resultPath) -Seconds 40 -StartFrame 0 -SettleMs 2500 -ScaleFactor 4 -UsePersistedPlaybackSettings -RequireLookAssist:`$false -Scope none -FrameTelemetry -PreserveExperimentalEnvironment -ExtraEnvironment @($envList)"
+if (-not [string]::IsNullOrWhiteSpace($displayPreferSubstring)) {
+    # UM-DISPLAY-SELECT-AND-LOG-1 round 1c: the runner itself feature-probes the target
+    # binary's --help before forwarding -display-prefer to it, so a legacy "before" binary in
+    # an A/B is never killed by an unrecognized option.
+    $cmd += " -DisplayPrefer $(ConvertTo-PsSingleQuoted $displayPreferSubstring)"
+}
 # CUDA-PERF-DISPLAY-IDENTITY-HARNESS-1/2/3 (sol BLOCKER 2 / fable HARDENING, direction corrected
 # HARNESS-3): PresentMon's own TimeInMs=0 origin is its internal trace-session start, which lands
 # somewhere between process creation and Start-PresentMonCapture returning (it blocks up to 3s to

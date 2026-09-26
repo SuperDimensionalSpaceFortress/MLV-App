@@ -232,6 +232,30 @@ class GuiSmokeDisplaySelectionParsingTests(_ProbeCase):
         self.assertIn("TE=no gui_smoke.display_target line found", proc.stdout)
         self.assertIn("PE=no gui_smoke.window_placement line found", proc.stdout)
 
+    def test_display_target_parses_the_appended_preferred_fields(self) -> None:
+        log_path = self._write_log(
+            'gui_smoke.display_target screen="\\\\.\\DISPLAY2" reason=max_physical_pixels_tie_preferred '
+            'candidates=2 fallback=1 preferred="PA329C" preferred_matched=matched\n'
+        )
+        proc = self.run_snippet(
+            f"$log = [IO.File]::ReadAllText('{log_path}')\n"
+            "$sel = Get-AttrCudaGuiSmokeDisplaySelection -LogText $log\n"
+            "Write-Host \"PREFERRED=$($sel.target.preferred) MATCHED=$($sel.target.preferredMatched)\"\n"
+        )
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        self.assertIn("PREFERRED=PA329C MATCHED=matched", proc.stdout)
+
+    def test_display_target_without_the_appended_preferred_fields_reads_them_as_null(self) -> None:
+        log_path = self._write_log(SAMPLE_LOG_4K)
+        proc = self.run_snippet(
+            f"$log = [IO.File]::ReadAllText('{log_path}')\n"
+            "$sel = Get-AttrCudaGuiSmokeDisplaySelection -LogText $log\n"
+            "Write-Host \"PREFERRED_NULL=$($null -eq $sel.target.preferred) "
+            "MATCHED_NULL=$($null -eq $sel.target.preferredMatched)\"\n"
+        )
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        self.assertIn("PREFERRED_NULL=True MATCHED_NULL=True", proc.stdout)
+
     def test_window_placement_parses_the_appended_target_and_presentation_fields(self) -> None:
         # UM-DISPLAY-SELECT-AND-LOG-1 round 1c (sol BLOCKER 3): the appended fields report the
         # ACTUAL presentation screen separately from the intended target.
@@ -341,6 +365,30 @@ class TemplateDisplayBlockExecutionTests(_ProbeCase):
         )
         self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
         self.assertIn("DISPLAY=X RES=3840x2160@60 DEGRADED=0 PREVIEW=3840x2160", proc.stdout)
+        # UM-DISPLAY-SELECT-AND-LOG-1 round 1c: recorded, never gated -- 'unknown' when the
+        # app never logged a preferred_matched= field (this fixture's target has none).
+        self.assertIn("PREFERRED=unknown", proc.stdout)
+
+    def test_result_tail_reports_the_preferred_match_status_when_the_app_logged_it(self) -> None:
+        proc = self.run_probe(
+            "$inv = [pscustomobject]@{ collected = $true; devices = @([pscustomobject]@{ "
+            "deviceName='\\\\.\\DISPLAY1'; modeCollected=$true; width=3840; height=2160 }); error = $null }\n"
+            "$appSel = [pscustomobject]@{\n"
+            "    screensCollected = $true\n"
+            "    screens = @([ordered]@{ name='X'; physicalWidth=3840; physicalHeight=2160; refreshHz=60.0 })\n"
+            "    screensError = $null\n"
+            "    target = [ordered]@{ name='X'; reason='max_physical_pixels_tie_preferred'; candidates=2; "
+            "fallback=$true; preferred='PA329C'; preferredMatched='matched' }\n"
+            "    targetError = $null\n"
+            "    placement = [ordered]@{ mode='fullscreen'; previewWidth=3840; previewHeight=2160 }\n"
+            "    placementError = $null\n"
+            "}\n"
+            "$block = Build-AttrCudaDisplayBlock -WindowsInventory $inv -Venue 'ultra-magnus' "
+            "-ExpectedWidth 3840 -ExpectedHeight 2160 -AppSelection $appSel\n"
+            "Write-Host (Get-AttrCudaDisplayResultTail $block)\n"
+        )
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        self.assertIn("PREFERRED=matched", proc.stdout)
 
     def test_degraded_fallback_produces_degraded_one(self) -> None:
         proc = self.run_probe(
@@ -580,10 +628,18 @@ class JobTemplateDisplayBlockWiringTests(unittest.TestCase):
 
     def test_only_ultra_magnus_venue_gets_an_expected_resolution(self) -> None:
         venue_at = self.template.index("$measurementVenue = Get-AttrCudaMeasurementVenue")
-        tail = self.template[venue_at:venue_at + 400]
+        tail = self.template[venue_at:venue_at + 500]
         self.assertIn("if ($measurementVenue -eq 'ultra-magnus') {", tail)
         self.assertIn("$expectedDisplayWidth = 3840", tail)
         self.assertIn("$expectedDisplayHeight = 2160", tail)
+
+    def test_only_ultra_magnus_venue_gets_a_preferred_display_substring(self) -> None:
+        # UM-DISPLAY-SELECT-AND-LOG-1 round 1c: kept in the same venue table, next to the
+        # expected resolution.
+        venue_at = self.template.index("$measurementVenue = Get-AttrCudaMeasurementVenue")
+        tail = self.template[venue_at:venue_at + 500]
+        self.assertIn("$displayPreferSubstring = ''", tail)
+        self.assertIn("$displayPreferSubstring = 'PA329C'", tail)
 
     def test_app_selection_is_reparsed_once_the_smoke_log_is_available(self) -> None:
         raw_log_at = self.template.index("$rawLog = [IO.File]::ReadAllText($logPath)")
