@@ -102,6 +102,93 @@ class QuiescenceSampleTests(_ProbeCase):
         self.assertIn("UTILITY=NULL", proc.stdout)
         self.assertIn("TIME=15", proc.stdout)
 
+    # UM-DISPLAY-SELECT-AND-LOG-1 round 1c (sol BLOCKER 4 / opus design-review hardening item 4):
+    # a null/NaN/out-of-range CookedValue, or a nonzero-invalid Status, must be the same third
+    # (unknown) state as a throwing Get-Counter -- never cast through to "0% busy" or left to
+    # compare falsely against both -gt and -le.
+
+    def test_a_null_cooked_value_is_unknown_not_zero_percent_busy(self) -> None:
+        proc = self.run_snippet(
+            "function Get-CimInstance { param($ClassName, $ErrorAction) [pscustomobject]@{ LoadPercentage = 10 } }\n"
+            "function Get-Counter { param($Counter, $ErrorAction) "
+            "[pscustomobject]@{ CounterSamples = @([pscustomobject]@{ CookedValue = $null; Status = 0 }) } }\n"
+            "$s = Get-AttrCudaQuiescenceSample\n"
+            "Write-Host \"TIME=$(if ($null -eq $s.timePercent) { 'NULL' } else { $s.timePercent }) ERROR=$($s.timePercentError)\"\n"
+        )
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        self.assertIn("TIME=NULL", proc.stdout)
+        self.assertIn("ERROR=InvalidOperationException", proc.stdout)
+
+    def test_a_nan_cooked_value_is_unknown(self) -> None:
+        proc = self.run_snippet(
+            "function Get-CimInstance { param($ClassName, $ErrorAction) [pscustomobject]@{ LoadPercentage = 10 } }\n"
+            "function Get-Counter { param($Counter, $ErrorAction) "
+            "[pscustomobject]@{ CounterSamples = @([pscustomobject]@{ CookedValue = [double]::NaN; Status = 0 }) } }\n"
+            "$s = Get-AttrCudaQuiescenceSample\n"
+            "Write-Host \"TIME=$(if ($null -eq $s.timePercent) { 'NULL' } else { $s.timePercent }) ERROR=$($s.timePercentError)\"\n"
+        )
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        self.assertIn("TIME=NULL", proc.stdout)
+        self.assertIn("ERROR=InvalidOperationException", proc.stdout)
+
+    def test_an_infinite_cooked_value_is_unknown(self) -> None:
+        proc = self.run_snippet(
+            "function Get-CimInstance { param($ClassName, $ErrorAction) [pscustomobject]@{ LoadPercentage = 10 } }\n"
+            "function Get-Counter { param($Counter, $ErrorAction) "
+            "[pscustomobject]@{ CounterSamples = @([pscustomobject]@{ CookedValue = [double]::PositiveInfinity; Status = 0 }) } }\n"
+            "$s = Get-AttrCudaQuiescenceSample\n"
+            "Write-Host \"TIME=$(if ($null -eq $s.timePercent) { 'NULL' } else { $s.timePercent })\"\n"
+        )
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        self.assertIn("TIME=NULL", proc.stdout)
+
+    def test_an_out_of_range_cooked_value_is_unknown(self) -> None:
+        proc = self.run_snippet(
+            "function Get-CimInstance { param($ClassName, $ErrorAction) [pscustomobject]@{ LoadPercentage = 10 } }\n"
+            "function Get-Counter { param($Counter, $ErrorAction) "
+            "[pscustomobject]@{ CounterSamples = @([pscustomobject]@{ CookedValue = 101.0; Status = 0 }) } }\n"
+            "$s = Get-AttrCudaQuiescenceSample\n"
+            "Write-Host \"TIME=$(if ($null -eq $s.timePercent) { 'NULL' } else { $s.timePercent })\"\n"
+        )
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        self.assertIn("TIME=NULL", proc.stdout)
+
+    def test_a_negative_cooked_value_is_unknown(self) -> None:
+        proc = self.run_snippet(
+            "function Get-CimInstance { param($ClassName, $ErrorAction) [pscustomobject]@{ LoadPercentage = 10 } }\n"
+            "function Get-Counter { param($Counter, $ErrorAction) "
+            "[pscustomobject]@{ CounterSamples = @([pscustomobject]@{ CookedValue = -1.0; Status = 0 }) } }\n"
+            "$s = Get-AttrCudaQuiescenceSample\n"
+            "Write-Host \"TIME=$(if ($null -eq $s.timePercent) { 'NULL' } else { $s.timePercent })\"\n"
+        )
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        self.assertIn("TIME=NULL", proc.stdout)
+
+    def test_a_nonzero_invalid_status_is_unknown_even_with_a_plausible_cooked_value(self) -> None:
+        proc = self.run_snippet(
+            "function Get-CimInstance { param($ClassName, $ErrorAction) [pscustomobject]@{ LoadPercentage = 10 } }\n"
+            "function Get-Counter { param($Counter, $ErrorAction) "
+            "[pscustomobject]@{ CounterSamples = @([pscustomobject]@{ CookedValue = 15.0; Status = 0x800000BC }) } }\n"
+            "$s = Get-AttrCudaQuiescenceSample\n"
+            "Write-Host \"TIME=$(if ($null -eq $s.timePercent) { 'NULL' } else { $s.timePercent }) ERROR=$($s.timePercentError)\"\n"
+        )
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        self.assertIn("TIME=NULL", proc.stdout)
+        self.assertIn("ERROR=InvalidOperationException", proc.stdout)
+
+    def test_status_0_and_status_1_are_both_accepted_as_valid(self) -> None:
+        for status in (0, 1):
+            with self.subTest(status=status):
+                proc = self.run_snippet(
+                    "function Get-CimInstance { param($ClassName, $ErrorAction) [pscustomobject]@{ LoadPercentage = 10 } }\n"
+                    "function Get-Counter { param($Counter, $ErrorAction) "
+                    f"[pscustomobject]@{{ CounterSamples = @([pscustomobject]@{{ CookedValue = 15.0; Status = {status} }}) }} }}\n"
+                    "$s = Get-AttrCudaQuiescenceSample\n"
+                    "Write-Host \"TIME=$($s.timePercent)\"\n"
+                )
+                self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+                self.assertIn("TIME=15", proc.stdout)
+
 
 @requires_pwsh
 class TopCpuProcessesTests(_ProbeCase):
@@ -221,7 +308,12 @@ class JobTemplateGateWiringTests(unittest.TestCase):
         self.template = self.source[start:end]
 
     def test_gate_condition_compares_the_time_mean_not_a_bare_load_percentage(self) -> None:
-        self.assertIn("if ($cpuTimeUnknown -or $avgTime -gt $cpuThresholdPercent) {", self.template)
+        # UM-DISPLAY-SELECT-AND-LOG-1 round 1c (opus hardening item 4): written fail-closed as
+        # "-not (<= threshold)" rather than "-gt threshold" -- a stray NaN compares false against
+        # both operators, so only the negated -le form refuses it.
+        self.assertIn(
+            "if ($cpuTimeUnknown -or -not ($avgTime -le $cpuThresholdPercent)) {", self.template)
+        self.assertNotIn("if ($cpuTimeUnknown -or $avgTime -gt $cpuThresholdPercent) {", self.template)
         # The old bare-utility gate must be gone, not merely supplemented.
         self.assertNotIn("if ($avgLoad -gt 20.0) {", self.template)
 

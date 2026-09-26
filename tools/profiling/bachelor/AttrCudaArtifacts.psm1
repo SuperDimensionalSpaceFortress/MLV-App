@@ -2264,7 +2264,33 @@ function Get-AttrCudaQuiescenceSample {
     $timePercentError = $null
     try {
         $counter = Get-Counter -Counter '\Processor(_Total)\% Processor Time' -ErrorAction Stop
-        $timePercent = [double]$counter.CounterSamples[0].CookedValue
+        $sample = $counter.CounterSamples[0]
+        # UM-DISPLAY-SELECT-AND-LOG-1 round 1c (sol BLOCKER 4 / opus design-review hardening):
+        # validate the RAW sample BEFORE any cast. [double]$null casts to 0, so an unread/null
+        # CookedValue used to silently pass as "0% busy" (a caller compares timePercent to a
+        # threshold and would then never refuse). Status is PDH's own signal that the value is
+        # trustworthy -- 0 (VALID_DATA) or 1 (NEW_DATA); anything else (including a Status this
+        # module's own mocks/tests never set, which reads $null and is treated as valid) is an
+        # unread sample, never a "0% busy" one. A finite range check catches NaN/Infinity/out-of-
+        # range CookedValue values that would otherwise cast cleanly and compare as neither
+        # -gt nor -le the threshold.
+        # $sample.Status (not .PSObject.Properties['Status'].Value) throws
+        # PropertyNotFoundException under $ErrorActionPreference='Stop' when the sample object
+        # has no such member at all (this module's own mocks/tests included) -- the property
+        # lookup below never throws for a missing member, it simply returns $null.
+        $statusProp = $sample.PSObject.Properties['Status']
+        $status = if ($statusProp) { $statusProp.Value } else { $null }
+        if ($null -ne $status -and $status -ne 0 -and $status -ne 1) {
+            throw [System.InvalidOperationException]::new("counter sample status $status is not valid")
+        }
+        if ($null -eq $sample.CookedValue) {
+            throw [System.InvalidOperationException]::new('counter sample CookedValue is null')
+        }
+        $cooked = [double]$sample.CookedValue
+        if (-not [double]::IsFinite($cooked) -or $cooked -lt 0.0 -or $cooked -gt 100.0) {
+            throw [System.InvalidOperationException]::new("counter sample CookedValue $cooked is out of range")
+        }
+        $timePercent = $cooked
     } catch {
         $timePercent = $null
         $timePercentError = $_.Exception.GetType().Name
@@ -2552,14 +2578,25 @@ function Get-AttrCudaDisplayDegradedState {
     UM-DISPLAY-SELECT-AND-LOG-1 item 3: a leg on a degraded display is RECORDED, never gated, but
     it must never be silently reported as "not degraded" when it is really "cannot tell". Returns
     'unknown' (string) whenever a verdict cannot be asserted either way -- no expected resolution
-    for this venue (ExpectedWidth/Height $null, e.g. Bachelor), or the target's own width/height
-    could not be read -- and only then compares. Never averages or guesses through a $null.
+    for this venue (ExpectedWidth/Height $null, e.g. Bachelor), the target's own width/height
+    could not be read, OR (round 1c, sol BLOCKER 2 / opus design-review hardening) the INDEPENDENT
+    Windows-API inventory this verdict is meant to be cross-checked against was itself unreadable
+    -- -WindowsCollected $false (Get-AttrCudaWindowsDisplayInventory threw) or
+    -WindowsAnyModeCollected $false (it returned collected=true but zero devices, or every device
+    had modeCollected=false, e.g. the headless/Session-0 contexts this fleet has hit before) both
+    make the verdict unknown, never "not degraded" purely on the app's own Qt-reported size. Both
+    parameters default to $true so an existing caller that has already established the Windows
+    inventory is trustworthy (or is testing the target-vs-expected comparison in isolation) is
+    unaffected. Never averages or guesses through a $null.
     .OUTPUTS
     'unknown', or a [bool] (true = degraded: target narrower or shorter than expected).
     #>
     [CmdletBinding()]
-    param($TargetWidth, $TargetHeight, $ExpectedWidth, $ExpectedHeight)
+    param($TargetWidth, $TargetHeight, $ExpectedWidth, $ExpectedHeight,
+          [bool]$WindowsCollected = $true, [bool]$WindowsAnyModeCollected = $true)
 
+    if (-not $WindowsCollected) { return 'unknown' }
+    if (-not $WindowsAnyModeCollected) { return 'unknown' }
     if ($null -eq $ExpectedWidth -or $null -eq $ExpectedHeight) { return 'unknown' }
     if ($null -eq $TargetWidth -or $null -eq $TargetHeight) { return 'unknown' }
     return [bool]($TargetWidth -lt $ExpectedWidth -or $TargetHeight -lt $ExpectedHeight)

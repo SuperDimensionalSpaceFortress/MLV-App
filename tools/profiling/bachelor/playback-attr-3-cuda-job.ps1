@@ -852,10 +852,17 @@ function Build-AttrCudaDisplayBlock {
         $targetUnknownReason = $targetError
     }
 
+    # UM-DISPLAY-SELECT-AND-LOG-1 round 1c (sol BLOCKER 2 / opus design-review hardening): the
+    # verdict must be blind to the app's own report the moment the INDEPENDENT Windows-API
+    # inventory it is meant to be cross-checked against cannot itself be trusted -- collected=
+    # $false, or collected=$true with zero devices / no device whose mode was readable (both
+    # plausible in the headless/Session-0 contexts this fleet has hit before).
+    $windowsAnyModeCollected = [bool]($WindowsInventory.devices | Where-Object { $_.modeCollected } | Select-Object -First 1)
     $degraded = Get-AttrCudaDisplayDegradedState `
         -TargetWidth $(if ($targetBlock) { $targetBlock.width } else { $null }) `
         -TargetHeight $(if ($targetBlock) { $targetBlock.height } else { $null }) `
-        -ExpectedWidth $ExpectedWidth -ExpectedHeight $ExpectedHeight
+        -ExpectedWidth $ExpectedWidth -ExpectedHeight $ExpectedHeight `
+        -WindowsCollected ([bool]$WindowsInventory.collected) -WindowsAnyModeCollected $windowsAnyModeCollected
 
     [ordered]@{
         windowsDisplaysCollected = [bool]$WindowsInventory.collected
@@ -1192,7 +1199,12 @@ $avgUtility = Get-Mean ($cpuUtilitySamples | Where-Object { $null -ne $_ })
 $cpuTimeUnknown = $cpuTimeSamples.Count -lt 3
 $avgTime = if ($cpuTimeUnknown) { $null } else { Get-Mean $cpuTimeSamples }
 $cpuThresholdPercent = 20.0
-if ($cpuTimeUnknown -or $avgTime -gt $cpuThresholdPercent) {
+# UM-DISPLAY-SELECT-AND-LOG-1 round 1c (opus design-review hardening item 4): written
+# fail-closed as "-not (<= threshold)", not "-gt threshold" -- a stray NaN that ever reached
+# this point (Get-AttrCudaQuiescenceSample now refuses one before averaging) would compare
+# false against BOTH -gt and -le, so only the negated -le form refuses it; -gt alone would
+# silently pass.
+if ($cpuTimeUnknown -or -not ($avgTime -le $cpuThresholdPercent)) {
     $venue = [ordered]@{
         schema='playback-attr-3-cuda-venue.v1'
         result='VENUE_NOT_QUIESCENT'

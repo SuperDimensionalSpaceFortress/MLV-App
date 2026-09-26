@@ -142,6 +142,40 @@ class DisplayDegradedStateTests(_ProbeCase):
         self.assertIn("R=unknown", proc.stdout)
         self.assertNotIn("R=False", proc.stdout)
 
+    # UM-DISPLAY-SELECT-AND-LOG-1 round 1c (sol BLOCKER 2): an unreadable INDEPENDENT Windows
+    # inventory must make the verdict unknown even when the app's own (Qt) target reads exactly
+    # at-expectation -- never "not degraded" purely on the app's own say-so.
+
+    def test_windows_inventory_not_collected_is_unknown_even_at_expectation(self) -> None:
+        proc = self.run_snippet(
+            "$r = Get-AttrCudaDisplayDegradedState -TargetWidth 3840 -TargetHeight 2160 "
+            "-ExpectedWidth 3840 -ExpectedHeight 2160 -WindowsCollected $false\nWrite-Host \"R=$r\"\n"
+        )
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        self.assertIn("R=unknown", proc.stdout)
+        self.assertNotIn("R=False", proc.stdout)
+
+    def test_windows_inventory_with_no_readable_mode_is_unknown_even_at_expectation(self) -> None:
+        # collected=true with zero devices, or every device unreadable, is the sibling gap opus's
+        # design review flagged: same as not collected at all.
+        proc = self.run_snippet(
+            "$r = Get-AttrCudaDisplayDegradedState -TargetWidth 3840 -TargetHeight 2160 "
+            "-ExpectedWidth 3840 -ExpectedHeight 2160 -WindowsCollected $true "
+            "-WindowsAnyModeCollected $false\nWrite-Host \"R=$r\"\n"
+        )
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        self.assertIn("R=unknown", proc.stdout)
+        self.assertNotIn("R=False", proc.stdout)
+
+    def test_windows_inventory_collected_with_a_readable_mode_still_compares_normally(self) -> None:
+        proc = self.run_snippet(
+            "$r = Get-AttrCudaDisplayDegradedState -TargetWidth 2560 -TargetHeight 1440 "
+            "-ExpectedWidth 3840 -ExpectedHeight 2160 -WindowsCollected $true "
+            "-WindowsAnyModeCollected $true\nWrite-Host \"R=$r\"\n"
+        )
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        self.assertIn("R=True", proc.stdout)
+
 
 @requires_pwsh
 class GuiSmokeDisplaySelectionParsingTests(_ProbeCase):
@@ -253,7 +287,8 @@ class TemplateDisplayBlockExecutionTests(_ProbeCase):
 
     def test_full_happy_path_produces_the_documented_result_tail(self) -> None:
         proc = self.run_probe(
-            "$inv = [pscustomobject]@{ collected = $true; devices = @(); error = $null }\n"
+            "$inv = [pscustomobject]@{ collected = $true; devices = @([pscustomobject]@{ "
+            "deviceName='\\\\.\\DISPLAY1'; modeCollected=$true; width=3840; height=2160 }); error = $null }\n"
             "$appSel = [pscustomobject]@{\n"
             "    screensCollected = $true\n"
             "    screens = @([ordered]@{ name='X'; physicalWidth=3840; physicalHeight=2160; refreshHz=60.0 })\n"
@@ -272,7 +307,8 @@ class TemplateDisplayBlockExecutionTests(_ProbeCase):
 
     def test_degraded_fallback_produces_degraded_one(self) -> None:
         proc = self.run_probe(
-            "$inv = [pscustomobject]@{ collected = $true; devices = @(); error = $null }\n"
+            "$inv = [pscustomobject]@{ collected = $true; devices = @([pscustomobject]@{ "
+            "deviceName='\\\\.\\DISPLAY1'; modeCollected=$true; width=2560; height=1440 }); error = $null }\n"
             "$appSel = [pscustomobject]@{\n"
             "    screensCollected = $true\n"
             "    screens = @([ordered]@{ name='X'; physicalWidth=2560; physicalHeight=1440; refreshHz=60.0 })\n"
@@ -290,6 +326,72 @@ class TemplateDisplayBlockExecutionTests(_ProbeCase):
         self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
         self.assertIn("DISPLAY=X RES=2560x1440@60 DEGRADED=1 PREVIEW=2560x1440", proc.stdout)
         self.assertIn("FALLBACK=True", proc.stdout)
+
+    def test_uncollected_windows_inventory_is_degraded_unknown_even_with_a_4k_qt_target(self) -> None:
+        # sol's exact repro (pre-review BLOCKER 2): WindowsInventory.collected=false plus a Qt
+        # target that itself reads 3840x2160 used to produce DEGRADED=0 -- the independent
+        # Windows-API check that DEGRADED exists to provide was never actually consulted.
+        proc = self.run_probe(
+            "$inv = [pscustomobject]@{ collected = $false; devices = @(); "
+            "error = 'UnauthorizedAccessException' }\n"
+            "$appSel = [pscustomobject]@{\n"
+            "    screensCollected = $true\n"
+            "    screens = @([ordered]@{ name='X'; physicalWidth=3840; physicalHeight=2160; refreshHz=60.0 })\n"
+            "    screensError = $null\n"
+            "    target = [ordered]@{ name='X'; reason='max_physical_pixels'; candidates=1; fallback=$false }\n"
+            "    targetError = $null\n"
+            "    placement = [ordered]@{ mode='fullscreen'; previewWidth=3840; previewHeight=2160 }\n"
+            "    placementError = $null\n"
+            "}\n"
+            "$block = Build-AttrCudaDisplayBlock -WindowsInventory $inv -Venue 'ultra-magnus' "
+            "-ExpectedWidth 3840 -ExpectedHeight 2160 -AppSelection $appSel\n"
+            "Write-Host (Get-AttrCudaDisplayResultTail $block)\n"
+        )
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        self.assertIn("DISPLAY=X RES=3840x2160@60 DEGRADED=unknown PREVIEW=3840x2160", proc.stdout)
+
+    def test_windows_inventory_collected_with_zero_devices_is_degraded_unknown(self) -> None:
+        # opus design-review sibling gap: collected=true with an empty device list (the adapter
+        # loop breaking immediately, plausible headless/Session-0) must be as unknown as
+        # collected=false, never "not degraded" purely on the app's own Qt-reported size.
+        proc = self.run_probe(
+            "$inv = [pscustomobject]@{ collected = $true; devices = @(); error = $null }\n"
+            "$appSel = [pscustomobject]@{\n"
+            "    screensCollected = $true\n"
+            "    screens = @([ordered]@{ name='X'; physicalWidth=3840; physicalHeight=2160; refreshHz=60.0 })\n"
+            "    screensError = $null\n"
+            "    target = [ordered]@{ name='X'; reason='max_physical_pixels'; candidates=1; fallback=$false }\n"
+            "    targetError = $null\n"
+            "    placement = [ordered]@{ mode='fullscreen'; previewWidth=3840; previewHeight=2160 }\n"
+            "    placementError = $null\n"
+            "}\n"
+            "$block = Build-AttrCudaDisplayBlock -WindowsInventory $inv -Venue 'ultra-magnus' "
+            "-ExpectedWidth 3840 -ExpectedHeight 2160 -AppSelection $appSel\n"
+            "Write-Host (Get-AttrCudaDisplayResultTail $block)\n"
+        )
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        self.assertIn("DEGRADED=unknown", proc.stdout)
+
+    def test_windows_inventory_with_every_device_mode_unreadable_is_degraded_unknown(self) -> None:
+        proc = self.run_probe(
+            "$inv = [pscustomobject]@{ collected = $true; devices = @([pscustomobject]@{ "
+            "deviceName='\\\\.\\DISPLAY1'; modeCollected=$false; width=$null; height=$null }); "
+            "error = $null }\n"
+            "$appSel = [pscustomobject]@{\n"
+            "    screensCollected = $true\n"
+            "    screens = @([ordered]@{ name='X'; physicalWidth=3840; physicalHeight=2160; refreshHz=60.0 })\n"
+            "    screensError = $null\n"
+            "    target = [ordered]@{ name='X'; reason='max_physical_pixels'; candidates=1; fallback=$false }\n"
+            "    targetError = $null\n"
+            "    placement = [ordered]@{ mode='fullscreen'; previewWidth=3840; previewHeight=2160 }\n"
+            "    placementError = $null\n"
+            "}\n"
+            "$block = Build-AttrCudaDisplayBlock -WindowsInventory $inv -Venue 'ultra-magnus' "
+            "-ExpectedWidth 3840 -ExpectedHeight 2160 -AppSelection $appSel\n"
+            "Write-Host (Get-AttrCudaDisplayResultTail $block)\n"
+        )
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        self.assertIn("DEGRADED=unknown", proc.stdout)
 
     def test_before_the_smoke_log_is_available_every_field_reads_unknown(self) -> None:
         proc = self.run_probe(
