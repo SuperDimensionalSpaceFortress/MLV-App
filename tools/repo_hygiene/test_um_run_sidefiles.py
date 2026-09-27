@@ -432,7 +432,7 @@ class UmRunDropModuleTests(_Share):
         log_text = self.log.read_text(encoding="utf-8")
         self.assertIn("RACE_WRITE_DENIED", log_text, log_text)
         self.assertNotIn("RACE_WRITE_SUCCEEDED", log_text, log_text)
-        self.assertEqual(self.names(), ["demo-source.zip", "demo.job.ps1"])
+        self.assertEqual(self.names(), ["demo-source.zip", "demo.job.ps1", "demo.meta.json"])
         self.assertEqual(
             hashlib.sha256((self.inbox / "demo-source.zip").read_bytes()).hexdigest(),
             hashlib.sha256(self.side.read_bytes()).hexdigest(),
@@ -1985,7 +1985,7 @@ class UmRunFixtureContentPinRaceTests(unittest.TestCase):
         # Positive control: the new check must not false-positive when nothing raced.
         proc = self.drop("{ param($p) }")
         self.assertIn("UMRUN_JOBID=demo", proc.stdout, proc.stdout + proc.stderr)
-        self.assertEqual(self.names(), sorted(["demo.job.ps1", "tiny_dual_iso.umrunprobe"]))
+        self.assertEqual(self.names(), sorted(["demo.job.ps1", "demo.meta.json", "tiny_dual_iso.umrunprobe"]))
         self.assertEqual(
             hashlib.sha256((self.inbox / "tiny_dual_iso.umrunprobe").read_bytes()).hexdigest(),
             hashlib.sha256(self.fixture.read_bytes()).hexdigest(),
