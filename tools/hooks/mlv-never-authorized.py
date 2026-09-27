@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""MLV-App PROJECT PreToolUse gate for the never-authorized register (NA-1..NA-10).
+"""MLV-App PROJECT PreToolUse gate for the never-authorized register (NA-1..NA-11).
 
 Contract
 --------
@@ -821,6 +821,12 @@ NA10_GUARDED_TAILS = (
     "tools/hooks/mlv-never-authorized.py",
     "tools/gates/verify_consented_footage.py",
 )
+
+# NA-11 (owner ruling 2026-09-09): Agent Bridge product SoT is layibabalola/agent-bridge.
+# Deny Write/Edit/NotebookEdit and shell truncating/destructive writes under
+# tools/agent-bridge/** under ANY root. agents/ docs are outside this prefix.
+# FAIL-CLOSED: no casual MLV_ALLOW_* escape for this row.
+NA11_AGENT_BRIDGE_SEG = "tools/agent-bridge"
 
 
 class Deny(Exception):
@@ -3938,6 +3944,47 @@ def rule_na10(ctx):
             _na10_deny(ctx, path_norm, "a shell write")
 
 
+
+# ------------------------------------------------------------------------ NA-11
+#
+# Owner ruling 2026-09-09 -- Agent Bridge SoT is the dedicated repo. Suspend
+# in-tree tools/agent-bridge/** product churn. The deny is PATH-shaped: any
+# Write/Edit/NotebookEdit or shell write destination under tools/agent-bridge
+# (as whole path segments, under any root) is refused. Docs that point at SoT
+# live under agents/ and are outside this prefix. No MLV_ALLOW_* unlocks this
+# row; emergency patches require an in-thread owner exception and a later
+# register change, not an env flip.
+
+
+def _na11_guarded(path_norm):
+    """True when path is tools/agent-bridge or lives under it (segment-wise)."""
+    if not path_norm:
+        return False
+    return has_seg(path_norm, NA11_AGENT_BRIDGE_SEG)
+
+
+def _na11_deny(ctx, path_norm, how):
+    raise Deny(
+        "NA-11",
+        "%s %s touches tools/agent-bridge/**; Agent Bridge SoT is "
+        "layibabalola/agent-bridge and the in-tree package is suspended "
+        "(owner ruling 2026-09-09)" % (how, path_norm),
+    )
+
+
+def rule_na11(ctx):
+    if ctx.tool in FILE_TOOLS:
+        if _na11_guarded(ctx.path_norm):
+            _na11_deny(ctx, ctx.path_norm, ctx.tool)
+        return
+    candidates = [norm(dest) for dest in _write_destinations(ctx.command)]
+    if shell_acts(ctx.command):
+        candidates.extend(norm(token) for token in tokens(ctx.command))
+    for path_norm in candidates:
+        if _na11_guarded(path_norm):
+            _na11_deny(ctx, path_norm, "a shell write")
+
+
 RULES = (
     rule_na1,
     rule_na2,
@@ -3947,6 +3994,7 @@ RULES = (
     rule_na7,
     rule_na8,
     rule_na9,
+    rule_na11,
     rule_na10,
 )
 

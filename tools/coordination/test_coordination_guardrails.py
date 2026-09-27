@@ -3391,8 +3391,13 @@ def ratio_full_dispatch_board(tmp_path, guard_payload, use_real_guard=False):
     tool_dir.mkdir(parents=True, exist_ok=True)
     shutil.copy2(RATIO_WORKSTREAM, tool_dir / "Invoke-Workstream.ps1")
     shutil.copy2(RATIO_GUARD if use_real_guard else guard, tool_dir / "Test-ProductRatioGuard.ps1")
-    for dependency in ("landing-probe.ps1", "compose-lane-prompt-core.ps1", "Retire-LaneWorktree.ps1"):
+    for dependency in ("landing-probe.ps1", "compose-lane-prompt-core.ps1", "Retire-LaneWorktree.ps1",
+                       "Get-DoctrineBrief.ps1", "get_doctrine_brief.py"):
         shutil.copy2(RATIO_WORKSTREAM.parent / dependency, tool_dir / dependency)
+    # get_doctrine_brief.py honours a fixture only inside the fixtures/ beside itself, so the
+    # copied getter needs its own copy of the offline tree (the env is pointed at it below).
+    shutil.copytree(RATIO_WORKSTREAM.parent / "fixtures" / "doctrine-offline",
+                    tool_dir / "fixtures" / "doctrine-offline")
     (tool_dir / "Invoke-Lane.ps1").write_text("param($Lane,$PromptFile,$Card,$RunDir,$TimeoutSec)\nWrite-Output 'RATIO_FAKE_LANE'\nexit 0\n", encoding="ascii")
     (tool_dir / "Export-PrReviewEvidence.ps1").write_text("exit 0\n", encoding="ascii")
     return dual, tool_dir / "Invoke-Workstream.ps1"
@@ -3415,6 +3420,7 @@ def test_ratio_full_dispatcher_read_only_and_editing_apply_valid_red(tmp_path, u
     queue_before = queue.read_bytes()
     base = ["pwsh", "-NoProfile", "-NonInteractive", "-File", str(dispatcher), "-QueuePath", str(queue), "-NoLandingProbe", "-TimeoutSec", "1"]
     env = editing_dispatch_env(tmp_path)
+    env["MLV_DOCTRINE_FIXTURE_ROOT"] = str(dispatcher.parent / "fixtures" / "doctrine-offline")
     read_product = subprocess.run(base + ["-CardId", "RATIO-READ-PRODUCT"], text=True, capture_output=True, env=env)
     read_factory = subprocess.run(base + ["-CardId", "RATIO-READ-FACTORY"], text=True, capture_output=True, env=env)
     try:

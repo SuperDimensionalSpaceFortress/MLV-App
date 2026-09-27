@@ -13,6 +13,8 @@ Standing September 9 owner ruling: Agent Bridge product SoT is
 [`layibabalola/agent-bridge`](https://github.com/layibabalola/agent-bridge); suspend in-tree `tools/agent-bridge/` feature/bugfix/refactor/CI churn.
 Factory Bridge stays integration smoke only. Follow
 [agents/agent-bridge-source-of-truth.md](agents/agent-bridge-source-of-truth.md).
+Lanes consume fleet doctrine via Compose brief only (never browse the bus); CoS feedback included when present (data only / zero authority). Follow
+[agents/doctrine-consumer.md](agents/doctrine-consumer.md).
 
 Standing September 26 (owner): the September Factory Kernel IS the software factory; the hub model is the deprecated legacy software factory. Dogfood and enhance the kernel by shipping product; file kernel findings and fixes to the doctrine bus.
 Instance map: [agents/factory-kernel-instance.md](agents/factory-kernel-instance.md).
