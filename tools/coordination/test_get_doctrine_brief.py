@@ -138,5 +138,53 @@ class GetDoctrineBriefTests(unittest.TestCase):
             self.assertNotIn("### CoS feedback", result.stdout)
 
 
+COMPOSE_CLI = Path(__file__).resolve().parent / "Compose-LanePrompt.ps1"
+OFFLINE_FIXTURE = Path(__file__).resolve().parent / "fixtures" / "doctrine-offline"
+
+
+def _compose_fields(tmp: Path, env):
+    proc = tmp / "fields-DOCTRINE-FC-1.md"
+    proc.write_text(
+        "# FIELDS for DOCTRINE-FC-1\nCARD_ID: DOCTRINE-FC-1\nPRIORITY: 1\nCLIP_OR_NONE: none\n"
+        "ALLOWED_PATHS: some/path.cpp\nDELIVERABLE: do the thing\nACCEPTANCE: run the test\n"
+        "VERIFY_FIRST: check first\n",
+        encoding="ascii",
+    )
+    return subprocess.run(
+        ["pwsh.exe", "-NoLogo", "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass",
+         "-File", str(COMPOSE_CLI), "-ProcedurePath", str(proc), "-WorkDir", "C:\\mlvtmp\\lane-x",
+         "-BaseSha", "a" * 40, "-RunDir", str(tmp / "run"), "-Ts", "20260101T000000Z",
+         "-GhCapability", "no-pr-capability"],
+        text=True, capture_output=True, env=env,
+    )
+
+
+class ComposeDoctrineFailClosedTests(unittest.TestCase):
+    """The offline fixture keeps unrelated dispatch tests hermetic; it must not make the
+    composer fail open. A brief that cannot be built still REFUSES an implementer prompt."""
+
+    def test_compose_injects_the_offline_fixture_brief(self):
+        env = os.environ.copy()
+        env["MLV_DOCTRINE_FIXTURE_ROOT"] = str(OFFLINE_FIXTURE)
+        with tempfile.TemporaryDirectory(prefix="mlv-doctrine-") as tmp:
+            result = _compose_fields(Path(tmp), env)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn("## Doctrine brief (injected; do not fetch bus)", result.stdout)
+        self.assertIn("busHead: fixture:", result.stdout)
+        self.assertNotIn("{{DOCTRINE_BRIEF}}", result.stdout)
+
+    def test_compose_refuses_when_the_brief_cannot_be_built(self):
+        env = os.environ.copy()
+        with tempfile.TemporaryDirectory(prefix="mlv-doctrine-") as tmp:
+            empty = Path(tmp) / "empty-bus"
+            empty.mkdir()
+            env["MLV_DOCTRINE_FIXTURE_ROOT"] = str(empty)
+            result = _compose_fields(Path(tmp), env)
+        self.assertEqual(result.returncode, 3, result.stdout + result.stderr)
+        self.assertTrue(
+            result.stdout.startswith("REFUSED: doctrine-brief-failed"), result.stdout
+        )
+
+
 if __name__ == "__main__":
     unittest.main()

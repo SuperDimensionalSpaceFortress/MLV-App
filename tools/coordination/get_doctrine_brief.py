@@ -304,7 +304,9 @@ def build_brief(
         "mlvSpecSha256: %s" % spec_sha,
         "candidateCount: %d" % len(selected),
         "candidateZeroPresent: %s" % ("true" if CANDIDATE_ZERO in seen else "false"),
-        "fetchedUtc: %s" % _utc_now(),
+        # A fixture is not fetched: a wall-clock stamp there would make composition
+        # non-deterministic for identical inputs (test_composition_is_deterministic_*).
+        "fetchedUtc: %s" % ("none (fixture)" if fixture_root else _utc_now()),
         "-->",
         "",
     ]

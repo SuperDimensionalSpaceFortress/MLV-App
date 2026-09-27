@@ -98,13 +98,16 @@ function Get-DoctrineBriefText {
     if (-not (Test-Path -LiteralPath $getter)) {
         throw "doctrine-brief-missing: $getter"
     }
-    $args = @()
+    # HASHTABLE splat, not an array: an array splat of '-FixtureRoot',<path> into a script binds
+    # both strings POSITIONALLY (to -DoctrineRepo/-Ref), so the fixture never reached the getter
+    # and python saw `--repo -FixtureRoot`. (Also never reuse the automatic $args variable.)
+    $getterArgs = @{}
     if ($FixtureRoot) {
-        $args += @('-FixtureRoot', $FixtureRoot)
+        $getterArgs['FixtureRoot'] = $FixtureRoot
     } elseif ($env:MLV_DOCTRINE_FIXTURE_ROOT) {
-        $args += @('-FixtureRoot', $env:MLV_DOCTRINE_FIXTURE_ROOT)
+        $getterArgs['FixtureRoot'] = $env:MLV_DOCTRINE_FIXTURE_ROOT
     }
-    $output = & $getter @args 2>&1 | Out-String
+    $output = & $getter @getterArgs 2>&1 | Out-String
     $code = $LASTEXITCODE
     if ($null -eq $code) { $code = 0 }
     $trimmed = if ($null -eq $output) { '' } else { $output.TrimEnd() }
