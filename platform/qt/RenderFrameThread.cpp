@@ -455,21 +455,6 @@ public:
     }
 };
 
-class GpuPlaybackReconFrameIdScope
-{
-public:
-    explicit GpuPlaybackReconFrameIdScope( uint64_t frameId )
-    {
-        llrpSetGpuPlaybackReconFrameIdForCurrentThread( frameId );
-    }
-
-    ~GpuPlaybackReconFrameIdScope()
-    {
-        /* The C shim stores frame+1; UINT64_MAX therefore clears the token. */
-        llrpSetGpuPlaybackReconFrameIdForCurrentThread( UINT64_MAX );
-    }
-};
-
 bool gpuPlaybackReconEnvRequested()
 {
     const QByteArray value = qgetenv("MLVAPP_GPU_PLAYBACK_RECON");
@@ -508,40 +493,23 @@ void insertGpuPlaybackReconRunTelemetry( QJsonObject &target )
     target.insert(
         QStringLiteral("gpu_playback_recon_rc"),
         llrpGpuPlaybackReconLastRunRcForTesting() );
-    llrpGpuPlaybackReconPreuploadStatus_t preupload;
-    memset( &preupload, 0, sizeof( preupload ) );
-    const bool preuploadAvailable =
-        llrpGpuPlaybackReconGetLastPreuploadStatus( &preupload ) != 0;
+    /* gpu_playback_recon_async_h2d_* used to be read here via
+     * llrpGpuPlaybackReconGetLastPreuploadStatus(), an ambient
+     * MLV_THREAD_LOCAL written inside llrawproc_gpu_recon_run_backend().
+     * That status is written on whichever thread actually calls the GPU
+     * backend for THIS frame's texture presentation -- typically the GUI/GL
+     * thread, asynchronously, well after this function returns on the
+     * render worker thread -- so a same-thread read here could only ever
+     * observe a stale or zeroed value (the exact env_enabled=true,
+     * everything-else-zero fingerprint this was rewritten to fix; see
+     * .claude-state/project-memory/async-h2d-frameid-crosses-a-subsystem-boundary-20260905.md).
+     * The real, per-run status is now delivered as an explicit OUT param
+     * (llrpGpuPlaybackReconTiming_t::preupload) to whichever call site
+     * actually invoked the backend, and inserted into telemetry from there
+     * -- see MainWindow::presentPlaybackPreparedFrame(). */
     target.insert(
         QStringLiteral("gpu_playback_recon_async_h2d_env_enabled"),
         gpuPlaybackReconAsyncH2dRequested() );
-    target.insert(
-        QStringLiteral("gpu_playback_recon_async_h2d_available"),
-        preuploadAvailable );
-    target.insert(
-        QStringLiteral("gpu_playback_recon_async_h2d_accepted"),
-        preupload.accepted != 0 );
-    target.insert(
-        QStringLiteral("gpu_playback_recon_async_h2d_used"),
-        preupload.used != 0 );
-    target.insert(
-        QStringLiteral("gpu_playback_recon_async_h2d_exact_match"),
-        preupload.exact_match != 0 );
-    target.insert(
-        QStringLiteral("gpu_playback_recon_async_h2d_submitted_while_prior_run_active"),
-        preupload.submitted_while_prior_run_active != 0 );
-    target.insert(
-        QStringLiteral("gpu_playback_recon_async_h2d_ready_before_run"),
-        preupload.ready_before_run != 0 );
-    target.insert(
-        QStringLiteral("gpu_playback_recon_async_h2d_host_staging_ms"),
-        preupload.host_staging_ms );
-    target.insert(
-        QStringLiteral("gpu_playback_recon_async_h2d_upload_ms"),
-        preupload.upload_ms );
-    target.insert(
-        QStringLiteral("gpu_playback_recon_async_h2d_upload_wait_ms"),
-        preupload.upload_wait_ms );
 }
 
 bool gpuPlaybackReconNoReadbackOutputValidationEnabled()
@@ -835,6 +803,7 @@ bool assignGpuPlaybackReconTextureState(
     }
     destination.applyDither = source.apply_dither != 0;
     destination.processingGeneration = processingGeneration;
+    destination.frameId = source.frame_id;
     return true;
 }
 
@@ -2100,8 +2069,6 @@ void RenderFrameThread::reconFrameForWorker( const ReconQueueEntry &entry,
         const GpuPlaybackReconTexturePrepareOnlyScope
             gpuPlaybackReconTexturePrepareOnlyScope(
                 allowGpuPlaybackReconTexturePrepareOnly );
-        const GpuPlaybackReconFrameIdScope gpuPlaybackReconFrameIdScope(
-            entry.request.frameNumber );
         stampReconStage( "phase3_recon_after_scope_setup_stage_time" );
         stampReconStage( "phase3_recon_before_capture_set_frame_stage_time" );
         mlv_pipeline_capture_set_current_frame( entry.request.frameNumber );
@@ -2245,6 +2212,14 @@ void RenderFrameThread::reconFrameForWorker( const ReconQueueEntry &entry,
             memset( &preparedState, 0, sizeof( preparedState ) );
             const bool preparedStateAvailable =
                 llrpGpuPlaybackReconGetLastPreparedState( &preparedState ) != 0;
+            /* llrpGpuPlaybackReconGetLastPreparedState() snapshots the
+             * dual-ISO recon state prepared moments ago on THIS thread, but
+             * that snapshot carries no frame identity of its own. Stamp it
+             * explicitly with the frame this render pass is for so it
+             * threads through GpuPlaybackReconTextureState -> PlaybackPrepTask
+             * -> the GL-side llrpGpuPlaybackReconState_t that eventually
+             * reaches llrawproc_gpu_recon_run_backend()'s async-H2D gate. */
+            preparedState.frame_id = entry.request.frameNumber;
             gpuPlaybackReconTexturePreparedStateValid = preparedState.valid != 0;
             bool gpuPlaybackReconTextureLutCacheHit = false;
             int gpuPlaybackReconTextureLutCacheEntries = 0;

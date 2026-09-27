@@ -92,7 +92,30 @@ typedef struct
     const double * fullres_curve;
     const float * randn05;
     int apply_dither;
+    /* Identity of the frame this state was prepared for. The async-H2D
+     * preupload gate in llrawproc_gpu_recon_run_backend() keys on this value
+     * to decide whether a previously host-staged upload matches the frame
+     * about to be reconstructed. It MUST be supplied explicitly by whichever
+     * side builds this struct (RenderFrameThread.cpp / MainWindow.cpp) --
+     * it used to travel as an ambient MLV_THREAD_LOCAL armed on the render
+     * worker thread and read on the GL presentation thread, which never
+     * bridged the two and left async H2D permanently disarmed. See
+     * .claude-state/project-memory/async-h2d-frameid-crosses-a-subsystem-boundary-20260905.md. */
+    uint64_t frame_id;
 } llrpGpuPlaybackReconState_t;
+
+typedef struct
+{
+    int available;
+    int accepted;
+    int used;
+    int exact_match;
+    int submitted_while_prior_run_active;
+    int ready_before_run;
+    double host_staging_ms;
+    double upload_ms;
+    double upload_wait_ms;
+} llrpGpuPlaybackReconPreuploadStatus_t;
 
 typedef struct
 {
@@ -108,20 +131,12 @@ typedef struct
     double recon_wall_ms;
     double amaze_wall_ms;
     double post_ms;
+    /* Populated from the SAME run_backend() invocation that filled the
+     * timing fields above -- an explicit OUT param, not the old ambient
+     * thread-local, so it is safe to read from any thread that owns this
+     * timing_out pointer. */
+    llrpGpuPlaybackReconPreuploadStatus_t preupload;
 } llrpGpuPlaybackReconTiming_t;
-
-typedef struct
-{
-    int available;
-    int accepted;
-    int used;
-    int exact_match;
-    int submitted_while_prior_run_active;
-    int ready_before_run;
-    double host_staging_ms;
-    double upload_ms;
-    double upload_wait_ms;
-} llrpGpuPlaybackReconPreuploadStatus_t;
 
 typedef struct
 {
@@ -147,12 +162,9 @@ int llrpGpuPlaybackReconGetLastPreparedState(llrpGpuPlaybackReconState_t * state
 size_t llrpGpuPlaybackReconGetLastInputBayer16(uint16_t * output,
                                                size_t output_words);
 int llrpGpuPlaybackReconGetBackendInfo(llrpGpuPlaybackReconBackendInfo_t * info);
-void llrpSetGpuPlaybackReconFrameIdForCurrentThread(uint64_t frame_id);
 int llrpGpuPlaybackReconPreuploadFrame(uint64_t frame_id,
                                       const uint16_t * raw_input_bayer14,
                                       size_t raw_image_size);
-int llrpGpuPlaybackReconGetLastPreuploadStatus(
-    llrpGpuPlaybackReconPreuploadStatus_t * status);
 int llrpGpuPlaybackReconResetGlTextureResources(void);
 int llrpGpuPlaybackReconRunGlTexture(const llrpGpuPlaybackReconState_t * state,
                                      const uint16_t * raw_input_bayer14,
