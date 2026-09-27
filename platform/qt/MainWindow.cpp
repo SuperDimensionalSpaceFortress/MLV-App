@@ -2111,6 +2111,24 @@ static bool nativeWindowIsForeground( QWidget *window )
 #endif
 }
 
+/* Keeps the display awake while media plays -- ordinary media-player behaviour,
+ * independent of any playback-smoke telemetry flag (CUDA-PERF-DISPLAY-WAKE-1). Called once
+ * on play start and once on stop/window-close, never per frame: SetThreadExecutionState only
+ * needs to be told the current intent, not refreshed continuously. Returns the acquisition
+ * OUTCOME (the Win32 return value is nonzero on success), not just the request, so a failed
+ * acquire is visible to the caller instead of assumed (CUDA-PERF-DISPLAY-WAKE-2). */
+static bool setPlaybackDisplayRequiredExecutionState( bool required )
+{
+#ifdef Q_OS_WIN
+    const EXECUTION_STATE previousState =
+        SetThreadExecutionState( required ? ( ES_CONTINUOUS | ES_DISPLAY_REQUIRED ) : ES_CONTINUOUS );
+    return previousState != 0;
+#else
+    Q_UNUSED( required );
+    return true;
+#endif
+}
+
 /* spaceTag argument options: ffmpeg color space tag number compliant */
 #define SPACETAG_REC709   1   /* rec709 color space */
 #define SPACETAG_UNKNOWN  2   /* No color space tag set */
@@ -3429,6 +3447,13 @@ void MainWindow::openMlvSet( QStringList list )
 //App shall close -> hammer method, we shot on the main class... for making the app close and killing everything in background
 void MainWindow::closeEvent(QCloseEvent *event)
 {
+    // CUDA-PERF-DISPLAY-WAKE-1: explicit release on window close, never relied on solely via
+    // setChecked(false)'s toggled() signal below -- that only fires when actionPlay was
+    // actually checked, and the request must never outlive the window regardless.
+    setPlaybackDisplayRequiredExecutionState( false );
+    // CUDA-PERF-DISPLAY-WAKE-2: same defensive reasoning -- close nativeEvent()'s screen-saver-
+    // refusal window here too, not solely via the toggled() signal.
+    m_playbackDisplayRequiredActive = false;
     ui->actionPlay->setChecked( false );
     on_actionPlay_triggered( false );
 
@@ -3460,6 +3485,46 @@ void MainWindow::closeEvent(QCloseEvent *event)
     qApp->quit();
     event->accept();
 }
+
+#ifdef Q_OS_WIN
+// CUDA-PERF-DISPLAY-WAKE-2: SetThreadExecutionState(ES_DISPLAY_REQUIRED) keeps the display
+// powered but Microsoft documents that it does NOT stop the screen saver itself -- see
+// setPlaybackDisplayRequiredExecutionState() above. Ordinary media players instead refuse the
+// WM_SYSCOMMAND the shell sends to start the screen saver or turn the monitor off; this does the
+// same, gated on m_playbackDisplayRequiredActive so it only refuses while playback actually holds
+// the display required (armed/disarmed at the same three call sites as that state -- play-start,
+// play-stop, closeEvent). Round 1b (lane-CUDA-PERF-DISPLAY-WAKE-2-r1b-20260925T2000Z/summary.md)
+// found the round-1 citation this comment used to carry was dangling -- that summary was never
+// written -- and declined to inject a real WM_SYSCOMMAND SC_SCREENSAVE on this shared dev box, for
+// the blast-radius reason recorded there. The on-host verification of this exact mechanism is
+// step 0 of a live leg on Bachelor (a single-purpose measurement host); see
+// lane-CUDA-PERF-DISPLAY-WAKE-2-r1c-20260925T2115Z/summary.md for whether that step ran and what
+// it found.
+#if QT_VERSION >= QT_VERSION_CHECK(6, 0, 0)
+bool MainWindow::nativeEvent( const QByteArray &eventType, void *message, qintptr *result )
+#else
+bool MainWindow::nativeEvent( const QByteArray &eventType, void *message, long *result )
+#endif
+{
+    if( m_playbackDisplayRequiredActive
+     && eventType == "windows_generic_MSG"
+     && message != nullptr )
+    {
+        const MSG *msg = static_cast<const MSG *>( message );
+        if( msg->message == WM_SYSCOMMAND )
+        {
+            const WPARAM sysCommand = msg->wParam & 0xFFF0;
+            if( sysCommand == SC_SCREENSAVE || sysCommand == SC_MONITORPOWER )
+            {
+                ++m_playbackScreensaverBlockedCount;
+                if( result ) *result = 0;
+                return true;
+            }
+        }
+    }
+    return QMainWindow::nativeEvent( eventType, message, result );
+}
+#endif
 
 //Disable WBPicker if picture is left and if mouse is clicked somewhere else
 bool MainWindow::eventFilter(QObject *watched, QEvent *event)
@@ -23248,6 +23313,18 @@ void MainWindow::beginPlaybackSmokeTelemetry( void )
                .arg( QString::fromLatin1(
                    playbackQualityAutoDecisionReasonName(
                        m_playbackQualityAutoDecisionReason ) ) );
+
+    // CUDA-PERF-DISPLAY-WAKE-1: once per playback session, reporting the display-required
+    // request this same play-start already made above (setPlaybackDisplayRequiredExecutionState
+    // is unconditional and not gated on telemetry; this line is just its record).
+    // CUDA-PERF-DISPLAY-WAKE-2: display_required now reports the acquisition OUTCOME
+    // (m_playbackDisplayRequiredAcquired, from SetThreadExecutionState's return value) rather
+    // than the request that was always true -- a failed acquire logs display_required=0.
+    qInfo().noquote()
+        << QStringLiteral(
+               "playback_smoke.display_required session=%1 display_required=%2" )
+               .arg( static_cast<qulonglong>( m_playbackSmokeSessionId ) )
+               .arg( bool01( m_playbackDisplayRequiredAcquired ) );
 }
 
 void MainWindow::notePlaybackSmokePresentedFrame(
@@ -25815,7 +25892,8 @@ void MainWindow::finishPlaybackSmokeTelemetry( const char *reason )
                "auto_validated_no_readback_capability_demoted_last=%63 "
                "present_nothing_drops=%64 "
                "gpu_texture_route_scale_clamp_active=%65 "
-               "gpu_texture_route_scale_clamp_requested_scale=%66" )
+               "gpu_texture_route_scale_clamp_requested_scale=%66 "
+               "screensaver_blocked_count=%67" )
                .arg( static_cast<qulonglong>( m_playbackSmokeSessionId ) )
                .arg( QString::fromLatin1( reason ? reason : "unknown" ) )
                .arg( elapsedMs, 0, 'f', 3 )
@@ -25893,7 +25971,10 @@ void MainWindow::finishPlaybackSmokeTelemetry( const char *reason )
                .arg( deltaCounter( currentPresentNothingDrops,
                                     m_playbackSmokeStartPresentNothingDrops ) )
                .arg( bool01( m_playbackScaleClampedForGpuTextureRouteActive ) )
-               .arg( m_playbackScaleClampedForGpuTextureRouteRequestedScale );
+               .arg( m_playbackScaleClampedForGpuTextureRouteRequestedScale )
+               // CUDA-PERF-DISPLAY-WAKE-2: how many WM_SYSCOMMAND SC_SCREENSAVE/SC_MONITORPOWER
+               // refusals nativeEvent() issued this session -- see m_playbackScreensaverBlockedCount.
+               .arg( static_cast<qulonglong>( m_playbackScreensaverBlockedCount ) );
 
     qInfo().noquote()
         << QStringLiteral(
@@ -26645,6 +26726,14 @@ void MainWindow::on_actionPlay_toggled(bool checked)
     //When stopping, debayer selection has to come in right order from render thread (extra-invitation)
     if( !checked )
     {
+        // CUDA-PERF-DISPLAY-WAKE-1: release the display-required request unconditionally, not
+        // gated on m_playbackSmokeActive -- finishPlaybackSmokeTelemetry() below no-ops when a
+        // session was never begun, and this call must never depend on that.
+        setPlaybackDisplayRequiredExecutionState( false );
+        // CUDA-PERF-DISPLAY-WAKE-2: also closes nativeEvent()'s screen-saver-refusal window --
+        // read by finishPlaybackSmokeTelemetry() below via m_playbackScreensaverBlockedCount
+        // before that counter is reset by the next play-start.
+        m_playbackDisplayRequiredActive = false;
         finishPlaybackSmokeTelemetry( "play-stop" );
         m_playbackStopped = true;
         m_playToFirstFramePending = false;
@@ -26660,6 +26749,14 @@ void MainWindow::on_actionPlay_toggled(bool checked)
     applyEffectiveDualIsoPlaybackSettings();
     if( checked )
     {
+        // CUDA-PERF-DISPLAY-WAKE-1: acquired before beginPlaybackSmokeTelemetry() so the
+        // playback_smoke.display_required line it emits reports the state already in effect.
+        // CUDA-PERF-DISPLAY-WAKE-2: capture the acquisition OUTCOME (the Win32 return value),
+        // arm nativeEvent()'s screen-saver refusal for this session, and reset its counter --
+        // both read by beginPlaybackSmokeTelemetry()/finishPlaybackSmokeTelemetry() below.
+        m_playbackDisplayRequiredAcquired = setPlaybackDisplayRequiredExecutionState( true );
+        m_playbackDisplayRequiredActive = true;
+        m_playbackScreensaverBlockedCount = 0;
         resetPlaybackQualityAutoRunState();
         // B2 (capture-only playback mode): the contact-sheet capture pass restarts Play
         // itself, potentially many times, strictly AFTER the measured interval's own

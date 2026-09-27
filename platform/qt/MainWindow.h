@@ -196,6 +196,20 @@ protected:
     void dropEvent( QDropEvent *event );
     void closeEvent( QCloseEvent *event );
     bool eventFilter(QObject *watched, QEvent *event);
+#ifdef Q_OS_WIN
+    // Refuses the screen-saver/monitor-off WM_SYSCOMMAND while playback holds the display
+    // required (CUDA-PERF-DISPLAY-WAKE-2) -- see MainWindow.cpp for why
+    // SetThreadExecutionState(ES_DISPLAY_REQUIRED) alone is not enough.
+    // CUDA-PERF-DISPLAY-WAKE-3 round 1 (fable note): `override` so a future Qt signature change
+    // fails to COMPILE instead of silently compiling as a new, never-called overload -- which
+    // would stop the screen-saver refusal above from ever engaging without any build error to
+    // catch it.
+#if QT_VERSION >= QT_VERSION_CHECK(6, 0, 0)
+    bool nativeEvent( const QByteArray &eventType, void *message, qintptr *result ) override;
+#else
+    bool nativeEvent( const QByteArray &eventType, void *message, long *result ) override;
+#endif
+#endif
 
 signals:
     void frameReady( void );
@@ -1006,6 +1020,17 @@ private:
     bool m_playbackSmokeFrameTelemetry = false;
     bool m_playbackSmokeTimelineTelemetry = false;
     uint64_t m_playbackSmokeSessionId = 0;
+    // Display-wake state (CUDA-PERF-DISPLAY-WAKE-1/2): m_playbackDisplayRequiredActive is true
+    // for exactly the window between setPlaybackDisplayRequiredExecutionState(true) on play-start
+    // and its (false) release on play-stop/close -- independent of any telemetry flag, and it is
+    // what gates nativeEvent()'s WM_SYSCOMMAND screen-saver refusal below.
+    // m_playbackDisplayRequiredAcquired is the Win32 acquisition OUTCOME (SetThreadExecutionState's
+    // return value), not just the request, reported by playback_smoke.display_required.
+    // m_playbackScreensaverBlockedCount counts WM_SYSCOMMAND SC_SCREENSAVE/SC_MONITORPOWER
+    // refusals during the current session, reset at play-start, reported at session end.
+    bool m_playbackDisplayRequiredActive = false;
+    bool m_playbackDisplayRequiredAcquired = false;
+    uint64_t m_playbackScreensaverBlockedCount = 0;
     // CUDA-PLAYBACK-CONTACT-SHEET-2 (HARDENING): set once runGuiPlaybackSmoke() has logged the
     // explicit playback_smoke.measured_session marker for the session opened by ITS OWN measured
     // play trigger, so a Bachelor job's parser can bind to that id instead of assuming the first

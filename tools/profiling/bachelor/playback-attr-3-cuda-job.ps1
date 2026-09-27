@@ -497,7 +497,39 @@ $embeddedFunctions = Get-AttrCudaEmbeddedFunctionSource -Name @(
     # host with no checkout/Import-Module before publishing presentMonStatus. Both are self-
     # contained (no calls to other AttrCuda functions), so no further names are needed.
     'Get-AttrCudaAppSwapTelemetry',
-    'Get-AttrCudaTemporalCoverage'
+    'Get-AttrCudaTemporalCoverage',
+    # CUDA-PERF-DISPLAY-WAKE-1/2: wakes the display from the interactive session before this leg
+    # launches MLVApp, holds it awake for the leg, and keeps nudging periodically for the whole
+    # leg (SetThreadExecutionState alone does not stop the screen saver) -- see their own header in
+    # AttrCudaArtifacts.psm1. All twelve call Register-.../Get-AttrCudaScreensaver*/
+    # Wait-AttrCudaScreensaverDismissed/Invoke-AttrCudaInputDesktopNudge internally, so all twelve
+    # must be embedded together.
+    'Register-AttrCudaDisplayWakeNativeMethods',
+    'Get-AttrCudaScreensaverRunning',
+    'Get-AttrCudaScreensaverTimeoutSeconds',
+    'Get-AttrCudaScreensaverActive',
+    # CUDA-PERF-DISPLAY-WAKE-2 round 1c: SPI_GETSCREENSAVESECURE (gates every dismiss attempt) and
+    # the OpenInputDesktop/SetThreadDesktop dedicated-thread nudge Start-AttrCudaDisplayWake
+    # dispatches to when the screen saver is already running and not secure.
+    'Get-AttrCudaScreensaverSecure',
+    # CUDA-PERF-DISPLAY-WAKE-3 round 3: the bounded after-dismiss poll Start-AttrCudaDisplayWake
+    # calls instead of a single immediate Get-AttrCudaScreensaverRunning read.
+    'Wait-AttrCudaScreensaverDismissed',
+    'Invoke-AttrCudaInputDesktopNudge',
+    'Start-AttrCudaDisplayWake',
+    'Stop-AttrCudaDisplayWake',
+    'Start-AttrCudaDisplayWakeKeepAlive',
+    # CUDA-PERF-DISPLAY-WAKE-3 round 1: the keep-alive's own non-throwing health read, checked
+    # before the smoke launch and again at the start of the measured interval (see the template
+    # body below).
+    'Get-AttrCudaDisplayWakeKeepAliveHealth',
+    'Stop-AttrCudaDisplayWakeKeepAlive',
+    # CUDA-PERF-DISPLAY-WAKE-4 round 1d (sol PRE-REVIEW #2 BLOCKER): Start-AttrCudaDisplayWakeKeepAlive's
+    # own loop calls this by name (Get-Command, resolved from whatever is defined in this flat
+    # script's own scope) every tick -- omitted here, Get-Command could not find it on a host with no
+    # checkout/Import-Module, so keep-alive setup recorded a setupError and the health gate failed
+    # every leg.
+    'Invoke-AttrCudaBoundedProbe'
 )
 # ATTR3-FOOTAGE-BIND-1 PR-B round 4b: the private verified-part directory (one hard link per
 # verified part, under a neutral name derived from its index, so nothing downstream -- the smoke
@@ -658,6 +690,85 @@ $ownerLinkHandles = [System.Collections.Generic.List[object]]::new()
 __EMBEDDED_FUNCTIONS__
 # --- end embedded verifiers -------------------------------------------------------------------
 
+# Moved above the TEMP boundary (CUDA-PERF-DISPLAY-WAKE-3 round 1): the secure/unknown-screensaver
+# gate just below needs Save-Json and $Pub, both already available here, and moving it costs
+# nothing to define this early.
+function Save-Json($Object, [string]$Path) {
+    # Artifact writes go through the slot-checked helper: never through a link or into a directory (sol PR #133).
+    [void](Publish-AttrCudaText -Path $Path -Value ($Object | ConvertTo-Json -Depth 30))
+}
+
+# CUDA-PERF-DISPLAY-WAKE-2 round 1c: THE VERY FIRST ACTION this job takes after claim, before the
+# TEMP boundary, before $Work/$Pub are even created, before footage resolution, before package/
+# build-manifest verification, and before the CPU-quiescence sleeps far below. Round 1b's live
+# leg on Bachelor recorded a 4.5-minute gap between job claim and the keep-alive's first nudge
+# (footage resolution and package verification ran first) -- long enough for a 300s screen-saver
+# timeout to elapse before this job ever touched the desktop, after which SendInput could no
+# longer recover it (screensaverRunningBefore=true, SendInput lastError=5 ERROR_ACCESS_DENIED).
+# Bounded and non-throwing -- see Start-AttrCudaDisplayWake's own header in AttrCudaArtifacts.psm1.
+# Start-AttrCudaDisplayWake itself reads the screen saver's running/secure state and performs the
+# one-time nudge (never attempted when secure or unknown); the SECURE/UNKNOWN GATE below runs
+# immediately after it, BEFORE the periodic keep-alive is even started (CUDA-PERF-DISPLAY-WAKE-3
+# round 1, sol BLOCKER: the keep-alive's own loop has no secure check of its own -- see
+# Start-AttrCudaDisplayWakeKeepAlive's header -- so starting it before this gate had run left
+# periodic input injection armed against a screen saver this job had not yet confirmed was safe to
+# touch). Order is: read running/secure -> gate -> first (one-time) nudge -> keep-alive; the first
+# two are Start-AttrCudaDisplayWake's own work, the gate is the `if` immediately below, and the
+# keep-alive starts only once the gate has passed.
+#
+# CUDA-PERF-DISPLAY-WAKE-3 round 1b (sol HARDENING): the outer `try`/`finally` that stops the
+# keep-alive and the wake (see the `finally` far below) used to begin only at the owner-footage
+# `try` further down -- everything from Start-AttrCudaDisplayWake here through that later `try`
+# ran OUTSIDE it, so a terminating error in that stretch (package expansion, footage resolution,
+# build-manifest verification) left the wake and keep-alive to be released only by the process
+# itself exiting, never explicitly recorded. The `try` now opens right here, at the first line of
+# the claim-time wake lifetime, so Stop-AttrCudaDisplayWakeKeepAlive/Stop-AttrCudaDisplayWake run
+# on every exit from this point on, including the `exit 25` immediately below.
+try {
+$displayWake = Start-AttrCudaDisplayWake
+if ($displayWake.screensaverSecureOwnerOnly) {
+    [void](New-AttrCudaDirectory -Path (Join-Path $Root 'outbox'))
+    [void](New-AttrCudaDirectory -Path $Pub)
+    $secureRefusal = [ordered]@{
+        schema='playback-attr-3-cuda-venue.v1'; result='SCREENSAVER_SECURE_OWNER_ONLY'
+        fixtureRehearsal=$FixtureRehearsal
+        displayWake=$displayWake
+        sourceCommit=$SourceCommit; clipId=$ClipId; artifactRoot=$Pub
+    }
+    Save-Json $secureRefusal (Join-Path $Pub 'summary.json')
+    Write-Output "RESULT=SCREENSAVER_SECURE_OWNER_ONLY ARTIFACTS=$Pub"
+    exit 25
+}
+# CUDA-PERF-DISPLAY-WAKE-3 round 2 (live UM evidence, defect class fix): a non-secure screen saver
+# that was running before this job touched the desktop, and that the dismiss attempt above did not
+# CONFIRM ended (still running, or the after-probe itself failed), must stop the leg with a typed
+# refusal here -- before the keep-alive even starts -- rather than silently proceeding into a
+# measurement PASS176 would score against a screen that was never actually showing MLVApp's output.
+# See Start-AttrCudaDisplayWake's own .dismissFailed doc for the fail-closed reasoning.
+if ($displayWake.dismissFailed) {
+    [void](New-AttrCudaDirectory -Path (Join-Path $Root 'outbox'))
+    [void](New-AttrCudaDirectory -Path $Pub)
+    $dismissRefusal = [ordered]@{
+        schema='playback-attr-3-cuda-venue.v1'; result='DISPLAY_WAKE_DISMISS_FAILED'
+        fixtureRehearsal=$FixtureRehearsal
+        displayWake=$displayWake
+        sourceCommit=$SourceCommit; clipId=$ClipId; artifactRoot=$Pub
+    }
+    Save-Json $dismissRefusal (Join-Path $Pub 'summary.json')
+    Write-Output "RESULT=DISPLAY_WAKE_DISMISS_FAILED ARTIFACTS=$Pub"
+    exit 27
+}
+$displayWakeKeepAlive = Start-AttrCudaDisplayWakeKeepAlive
+# Folded into $displayWake itself (by reference for .keepAliveNudgeState -- the SAME live
+# Hashtable instance the background loop mutates) rather than added as a separate field at each
+# evidence write site below: every one of those already carries whatever is in $displayWake at
+# the moment it serializes, so this is the only edit needed for every recorded outcome to also
+# carry live keep-alive evidence, right up to the count at that write's own moment.
+$displayWake['keepAliveIntervalSeconds'] = $displayWakeKeepAlive.intervalSeconds
+$displayWake['keepAliveStartedUtc'] = $displayWakeKeepAlive.startedUtc
+$displayWake['keepAliveNudgeState'] = $displayWakeKeepAlive.nudgeState
+$displayWake['keepAliveSetupError'] = $displayWakeKeepAlive.setupError
+
 # TEMP boundary (BLOCKER fix): job-owned scratch dir under this job's own C:\mlvtmp
 # work dir, set as TEMP/TMP at the very start -- before any child process (reg.exe,
 # the pwsh that runs run-release-gui-smoke.ps1/MLVApp.exe, PresentMon) -- so every one
@@ -693,12 +804,6 @@ $env:TMP = $Scratch
 
 function Get-Sha([string]$Path) {
     (Get-FileHash -LiteralPath $Path -Algorithm SHA256).Hash.ToUpperInvariant()
-}
-
-
-function Save-Json($Object, [string]$Path) {
-    # Artifact writes go through the slot-checked helper: never through a link or into a directory (sol PR #133).
-    [void](Publish-AttrCudaText -Path $Path -Value ($Object | ConvertTo-Json -Depth 30))
 }
 
 function Get-Mean([double[]]$Values) {
@@ -1001,6 +1106,7 @@ if ($FixtureRehearsal) {
         $mismatch = [ordered]@{
             schema='playback-attr-3-cuda-venue.v1'; result='FIXTURE_CONTENT_MISMATCH'
             fixtureRehearsal=$FixtureRehearsal
+            displayWake=$displayWake
             clipPath=$clipPath; expectedSha256=$FixtureSha256; actualSha256=$actualClipSha256
             sourceCommit=$SourceCommit; clipId=$ClipId; artifactRoot=$Pub
         }
@@ -1033,6 +1139,7 @@ if ($FixtureRehearsal) {
         $notVerified = [ordered]@{
             schema='playback-attr-3-cuda-venue.v1'; result='OWNER_FOOTAGE_NOT_VERIFIED'
             fixtureRehearsal=$FixtureRehearsal
+            displayWake=$displayWake
             parts=@($ownerPartResults)
             sourceCommit=$SourceCommit; clipId=$ClipId; artifactRoot=$Pub
         }
@@ -1055,6 +1162,7 @@ if ($FixtureRehearsal) {
         $notContiguous = [ordered]@{
             schema='playback-attr-3-cuda-venue.v1'; result='OWNER_PARTS_NOT_CONTIGUOUS'
             fixtureRehearsal=$FixtureRehearsal
+            displayWake=$displayWake
             partCount=$ownerDecodedParts.Count
             sourceCommit=$SourceCommit; clipId=$ClipId; artifactRoot=$Pub
         }
@@ -1102,6 +1210,7 @@ if ($FixtureRehearsal) {
             $relinkRefusal = [ordered]@{
                 schema='playback-attr-3-cuda-venue.v1'; result='OWNER_FOOTAGE_NOT_VERIFIED'
                 fixtureRehearsal=$FixtureRehearsal
+                displayWake=$displayWake
                 parts=@(@{ index = $part.index; status = $Matches[1] })
                 sourceCommit=$SourceCommit; clipId=$ClipId; artifactRoot=$Pub
             }
@@ -1118,6 +1227,7 @@ if ($FixtureRehearsal) {
         $linkRefusal = [ordered]@{
             schema='playback-attr-3-cuda-venue.v1'; result=$linkToken
             fixtureRehearsal=$FixtureRehearsal
+            displayWake=$displayWake
             partIndex=$part.index
             sourceCommit=$SourceCommit; clipId=$ClipId; artifactRoot=$Pub
         }
@@ -1127,14 +1237,19 @@ if ($FixtureRehearsal) {
     }
 }
 
-# ATTR3-FOOTAGE-BIND-1 PR-B round 4: everything from here to the end of the job runs inside a
-# `try`/`finally` so the private directory's read-share handles (opened above, owner runs only)
-# are always closed and its neutrally-named links are always cleaned up -- on every exit path
-# below, including an early `exit N` (PowerShell still runs a pending `finally` on `exit`, proven
-# by CI before this shipped) and an uncaught terminating error. $OwnerClipDir stays $null for a
-# fixture run, so the `finally` is a no-op there.
-try {
+# ATTR3-FOOTAGE-BIND-1 PR-B round 4: everything from here to the end of the job runs inside the
+# same outer `try`/`finally` (opened at Start-AttrCudaDisplayWake, above -- CUDA-PERF-
+# DISPLAY-WAKE-3 round 1b) so the private directory's read-share handles (opened above, owner runs
+# only) are always closed and its neutrally-named links are always cleaned up -- on every exit
+# path below, including an early `exit N` (PowerShell still runs a pending `finally` on `exit`,
+# proven by CI before this shipped) and an uncaught terminating error. $OwnerClipDir stays $null
+# for a fixture run, so the `finally` is a no-op there.
 Expand-Archive -LiteralPath (Join-Path $Cache $BasePackageZip) -DestinationPath (Join-Path $Work 'pkg') -Force
+# CUDA-PERF-DISPLAY-WAKE-1/2. OWNER (2026-09-25): "if display is asleep just wake it. its just the
+# blank screensaver". $displayWake/$displayWakeKeepAlive were already started at the very top of
+# this job (round 1c -- see that block's own comment for why: closing the gap between job claim
+# and the keep-alive's first nudge), so nothing further is needed here; both are released in the
+# `finally` below, on every exit path.
 $baseExe = Get-ChildItem -LiteralPath (Join-Path $Work 'pkg') -Recurse -Filter $BasePackageExeName | Select-Object -First 1
 if (-not $baseExe) { throw "base package executable not found: $BasePackageExeName" }
 $pkgDir = $baseExe.Directory.FullName
@@ -1168,6 +1283,7 @@ if ($avgLoad -gt 20.0) {
         schema='playback-attr-3-cuda-venue.v1'
         result='VENUE_NOT_QUIESCENT'
         fixtureRehearsal=$FixtureRehearsal
+        displayWake=$displayWake
         cpuSamples=$loads
         cpuMean=$avgLoad
         cpuThresholdPercent=20.0
@@ -1255,6 +1371,33 @@ if ($ContactSheetEnabled) {
 # post-spawn wall clock) and the residual uncertainty it implies are all persisted below, before
 # parsing, so a consumer needing a tighter join than this one can see exactly how much slack to
 # allow rather than trusting a single unbracketed stamp.
+
+# CUDA-PERF-DISPLAY-WAKE-3 round 1: first of three keep-alive health checkpoints (the second is
+# right before the smoke launch below, bracketing the PresentMon spawn gap between them; round 1b
+# adds a third, right after PresentMon is waited on, bracketing the measured interval itself --
+# see that checkpoint's own comment further down). The
+# periodic keep-alive ticks on its own timer with no secure-screensaver check of its own (see
+# Start-AttrCudaDisplayWakeKeepAlive's own header) and never throws on a failed nudge (see its
+# loop's own try/catch) -- so its health (did it ever start, has a nudge failed, did its
+# background pipeline die) is never assumed from "no exception happened" and is instead read
+# explicitly, here at the start of the measured interval (PresentMon's own capture window, about
+# to begin).
+# CUDA-PERF-DISPLAY-WAKE-3 round 1b: -RequireSuccessSoFar only at this FIRST checkpoint -- see
+# Get-AttrCudaDisplayWakeKeepAliveHealth's own .PARAMETER doc for why only here.
+$keepAliveHealthAtMeasurementStart = Get-AttrCudaDisplayWakeKeepAliveHealth -Handle $displayWakeKeepAlive -RequireSuccessSoFar
+if (-not $keepAliveHealthAtMeasurementStart.healthy) {
+    $displayWake['keepAliveHealth'] = $keepAliveHealthAtMeasurementStart
+    $keepAliveRefusal = [ordered]@{
+        schema='playback-attr-3-cuda-venue.v1'; result='KEEPALIVE_FAILED'
+        fixtureRehearsal=$FixtureRehearsal
+        displayWake=$displayWake
+        keepAliveCheckpoint='start_of_measured_interval'
+        sourceCommit=$SourceCommit; clipId=$ClipId; artifactRoot=$Pub
+    }
+    Save-Json $keepAliveRefusal (Join-Path $Pub 'summary.json')
+    Write-Output "RESULT=KEEPALIVE_FAILED CHECKPOINT=start_of_measured_interval REASON=$($keepAliveHealthAtMeasurementStart.reason) ARTIFACTS=$Pub"
+    exit 26
+}
 $presentMonPreSpawnUtc = (Get-Date).ToUniversalTime()
 # PRESENTMON-HARNESS-ROBUSTNESS-1: Start-PresentMonCapture throws -- a pre-existing output file,
 # or a PresentMon process that exited nonzero within its own 3s startup check (rc=6 is ETW access
@@ -1272,6 +1415,7 @@ if ($null -ne $presentMonSpawnError) {
     $displayFailure = [ordered]@{
         schema='playback-attr-3-cuda-venue.v1'; result='PRESENTMON_UNAVAILABLE'
         fixtureRehearsal=$FixtureRehearsal
+        displayWake=$displayWake
         reason="PresentMon failed to start: $presentMonSpawnError"
         presentMonStatus='unavailable'
         chains=@()
@@ -1294,6 +1438,31 @@ $presentMonCaptureStartUncertaintyMs = ($presentMonPostSpawnUtc - $presentMonCap
 # $smokeRc and the whole SMOKE_RUN_FAILED branch below, bypassing PresentMon cleanup entirely.
 # Caught here instead, so every path -- normal failure, normal success, or a launch exception --
 # reaches the same Stop-PresentMonCapture call before this job decides anything else.
+
+# CUDA-PERF-DISPLAY-WAKE-3 round 1: second keep-alive health checkpoint -- see the first one's own
+# comment above, right before Start-PresentMonCapture. This one brackets the PresentMon spawn gap:
+# a keep-alive that failed only after PresentMon started must still stop the leg before MLVApp
+# ever launches, rather than being discovered only after a full measured run. PresentMon is
+# already running at this point, so it is stopped (never left orphaned) before this exits, the
+# same way SMOKE_RUN_FAILED already does below.
+$keepAliveHealthBeforeSmokeLaunch = Get-AttrCudaDisplayWakeKeepAliveHealth -Handle $displayWakeKeepAlive
+if (-not $keepAliveHealthBeforeSmokeLaunch.healthy) {
+    $displayWake['keepAliveHealth'] = $keepAliveHealthBeforeSmokeLaunch
+    $presentMonStopOnKeepAliveFailure = Stop-PresentMonCapture -Proc $presentMonProc
+    $keepAliveRefusal = [ordered]@{
+        schema='playback-attr-3-cuda-venue.v1'; result='KEEPALIVE_FAILED'
+        fixtureRehearsal=$FixtureRehearsal
+        displayWake=$displayWake
+        keepAliveCheckpoint='before_smoke_launch'
+        presentMonConfirmedExited=$presentMonStopOnKeepAliveFailure.confirmedExited
+        presentMonKillError=$presentMonStopOnKeepAliveFailure.killError
+        presentMonWaitError=$presentMonStopOnKeepAliveFailure.waitError
+        sourceCommit=$SourceCommit; clipId=$ClipId; artifactRoot=$Pub
+    }
+    Save-Json $keepAliveRefusal (Join-Path $Pub 'summary.json')
+    Write-Output "RESULT=KEEPALIVE_FAILED CHECKPOINT=before_smoke_launch REASON=$($keepAliveHealthBeforeSmokeLaunch.reason) ARTIFACTS=$Pub"
+    exit 26
+}
 $smokeRc = $null
 $smokeLaunchException = $null
 try {
@@ -1346,6 +1515,7 @@ if ($null -ne $smokeLaunchException -or $smokeRc -ne 0 -or -not (Test-Path -Lite
     $smokeFailure = [ordered]@{
         schema='playback-attr-3-cuda-venue.v1'; result='SMOKE_RUN_FAILED'
         fixtureRehearsal=$FixtureRehearsal
+        displayWake=$displayWake
         smokeExitCode=$smokeRc; smokeResultPresent=(Test-Path -LiteralPath $resultPath)
         smokeStderrTail=$smokeStderrTail
         smokeLaunchExceptionType=$smokeLaunchExceptionType
@@ -1397,6 +1567,7 @@ try {
     $unavailable = [ordered]@{
         schema='playback-attr-3-cuda-venue.v1'; result='SMOKE_LOG_UNAVAILABLE'
         fixtureRehearsal=$FixtureRehearsal
+        displayWake=$displayWake
         message=$_.Exception.Message; smokeExitCode=$smokeRc; resultJson=$resultPath
         presentMonConfirmedExited=$presentMonStop.confirmedExited
         presentMonKillError=$presentMonStop.killError
@@ -1465,6 +1636,7 @@ if ($null -ne $presentMonWaitError) {
     $displayFailure = [ordered]@{
         schema='playback-attr-3-cuda-venue.v1'; result='PRESENTMON_UNAVAILABLE'
         fixtureRehearsal=$FixtureRehearsal
+        displayWake=$displayWake
         reason=$presentMonWaitError
         presentMonStatus='unavailable'
         chains=@()
@@ -1482,6 +1654,35 @@ if ($null -ne $presentMonWaitError) {
     # naive parser reading this stdout line's quoted REASON="..." field.
     Write-Output "RESULT=PRESENTMON_UNAVAILABLE REASON=`"$(ConvertTo-AttrCudaResultLineSafeText $presentMonWaitError)`" FRAME_ROWS=$($rows.Count) ARTIFACTS=$Pub"
     exit 23
+}
+
+# CUDA-PERF-DISPLAY-WAKE-3 round 1b (sol BLOCKER): the two existing checkpoints above only
+# bracket the PresentMon SPAWN gap (before it starts, and again before the smoke launch) -- both
+# run before the ~40s synchronous smoke run even begins. A tick that fails DURING that measured
+# interval (or a background pipeline that dies mid-run) was recorded by the keep-alive's own
+# nudgeState, but nothing downstream ever read it again: if PresentMon still displayed at least
+# one frame, $displayReport.status reads OK regardless, and the leg would publish
+# MEASUREMENT_CAPTURED over a run whose wake mechanism had already stopped working. Read a third
+# time, right here -- PresentMon has just been waited on and confirmed done, so the measured
+# interval is unambiguously over and this is the earliest point that is true. A failure here ends
+# the leg the same typed way the earlier two checkpoints already do (never silently, and never
+# read as a clean measurement), rather than continuing on to a report that would call it OK.
+$keepAliveHealthAfterMeasuredInterval = Get-AttrCudaDisplayWakeKeepAliveHealth -Handle $displayWakeKeepAlive
+if (-not $keepAliveHealthAfterMeasuredInterval.healthy) {
+    $displayWake['keepAliveHealth'] = $keepAliveHealthAfterMeasuredInterval
+    if (Test-Path -LiteralPath $presentMonPath -PathType Leaf) {
+        [void](Publish-AttrCudaFileCopy -Source $presentMonPath -Destination (Join-Path $Pub 'presentmon.csv'))
+    }
+    $keepAliveRefusal = [ordered]@{
+        schema='playback-attr-3-cuda-venue.v1'; result='KEEPALIVE_FAILED'
+        fixtureRehearsal=$FixtureRehearsal
+        displayWake=$displayWake
+        keepAliveCheckpoint='after_measured_interval'
+        sourceCommit=$SourceCommit; clipId=$ClipId; artifactRoot=$Pub
+    }
+    Save-Json $keepAliveRefusal (Join-Path $Pub 'summary.json')
+    Write-Output "RESULT=KEEPALIVE_FAILED CHECKPOINT=after_measured_interval REASON=$($keepAliveHealthAfterMeasuredInterval.reason) ARTIFACTS=$Pub"
+    exit 26
 }
 
 # Backend-availability gate (swarm ruling, 2026-09-16): parse the run's own diagnostic
@@ -1510,6 +1711,7 @@ if (-not $verdict.admitted) {
     $refusal = [ordered]@{
         schema='playback-attr-3-cuda-venue.v1'; result='BACKEND_NOT_AVAILABLE'
         fixtureRehearsal=$FixtureRehearsal
+        displayWake=$displayWake
         diagnostics=$diagnostics; sourceCommit=$SourceCommit; clipId=$ClipId; artifactRoot=$Pub
     }
     Save-Json $refusal (Join-Path $Pub 'summary.json')
@@ -1529,6 +1731,7 @@ if ($gpuFramesTotal -le 0) {
     $fallback = [ordered]@{
         schema='playback-attr-3-cuda-venue.v1'; result='GPU_RECON_FRAMES_ZERO'
         fixtureRehearsal=$FixtureRehearsal
+        displayWake=$displayWake
         gpuSummary=$gpuSummary; sourceCommit=$SourceCommit; clipId=$ClipId; artifactRoot=$Pub
     }
     Save-Json $fallback (Join-Path $Pub 'summary.json')
@@ -1539,6 +1742,7 @@ if ($gpuSummary.cpuFrames -gt 0) {
     $fallback = [ordered]@{
         schema='playback-attr-3-cuda-venue.v1'; result='CPU_FALLBACK_DETECTED'
         fixtureRehearsal=$FixtureRehearsal
+        displayWake=$displayWake
         gpuSummary=$gpuSummary; sourceCommit=$SourceCommit; clipId=$ClipId; artifactRoot=$Pub
     }
     Save-Json $fallback (Join-Path $Pub 'summary.json')
@@ -1601,6 +1805,9 @@ if ($displayReport.status -ne 'OK') {
     $displayFailure = [ordered]@{
         schema='playback-attr-3-cuda-venue.v1'; result=$displayReport.status
         fixtureRehearsal=$FixtureRehearsal
+        # CUDA-PERF-DISPLAY-WAKE-1: if this leg still ends DISPLAY_ASLEEP, the wake attempt that
+        # ran before MLVApp ever launched is right here -- never omitted on this path.
+        displayWake=$displayWake
         reason=$displayReport.reason
         presentMonStatus=$displayFailurePresentMonStatus
         chains=$displayReport.chains
@@ -1732,6 +1939,8 @@ $manifest = [ordered]@{
     sourceCommit = $SourceCommit
     clipId = $ClipId
     fixtureRehearsal = $FixtureRehearsal
+    # CUDA-PERF-DISPLAY-WAKE-1: the wake attempt made before MLVApp launched for this leg.
+    displayWake = $displayWake
     # A rehearsal cites no consent receipt: the fixtures are repository bytes, and recording the
     # owner-footage receipt here would be misleading provenance (sol, PR #137 r2 minor).
     consentReceipt = $(if ($FixtureRehearsal) { $null } else { $ConsentReceiptFileName })
@@ -1779,6 +1988,7 @@ Save-Json $manifest (Join-Path $Pub 'evidence-manifest.json')
 Save-Json ([ordered]@{
     result = $(if ($FixtureRehearsal) { 'FIXTURE_REHEARSAL_CAPTURED' } else { 'MEASUREMENT_CAPTURED' })
     fixtureRehearsal = $FixtureRehearsal
+    displayWake = $displayWake
     sourceCommit = $SourceCommit
     clipId = $ClipId
     rows = $rows.Count
@@ -1947,6 +2157,14 @@ exit 0
     if ($OwnerClipDir) {
         Close-AttrCudaOwnerFootageWorkspace -Handles $ownerLinkHandles -Directory $OwnerClipDir
     }
+    # CUDA-PERF-DISPLAY-WAKE-2: stop the periodic keep-alive first -- releases its background
+    # Runspace -- before releasing the execution-state request itself, on every exit path from
+    # the try above, including an early `exit N`. Stop-AttrCudaDisplayWakeKeepAlive tolerates a
+    # $null handle, so this is safe even if the try above threw before Start- was reached.
+    [void](Stop-AttrCudaDisplayWakeKeepAlive -Handle $displayWakeKeepAlive)
+    # CUDA-PERF-DISPLAY-WAKE-1: released on every exit path from the try above, including an
+    # early `exit N` -- never left held past this leg regardless of how it ended.
+    [void](Stop-AttrCudaDisplayWake)
 }
 '@
 
