@@ -23,6 +23,7 @@
 
 #include <stddef.h>
 #include <stdint.h>
+#include <string.h>
 
 #include "llrawproc_object.h"
 #include "../mlv_object.h"
@@ -154,7 +155,8 @@ static inline llrpGpuPlaybackReconTiming_t llrpGpuPlaybackReconCombineTiming(
     int debayer_available, double upload_ms, double kernel_ms,
     double interop_ms, double total_ms)
 {
-    llrpGpuPlaybackReconTiming_t combined = {0};
+    llrpGpuPlaybackReconTiming_t combined;
+    memset(&combined, 0, sizeof(combined));
     combined.preupload = recon->preupload;
     combined.available = recon->available || debayer_available;
     combined.upload_ms = (recon->available ? recon->upload_ms : 0.0)
@@ -195,6 +197,10 @@ int llrpGpuPlaybackReconGetBackendInfo(llrpGpuPlaybackReconBackendInfo_t * info)
 int llrpGpuPlaybackReconPreuploadFrame(uint64_t frame_id,
                                       const uint16_t * raw_input_bayer14,
                                       size_t raw_image_size);
+/* Test-only synchronous observer: substitutes for upload on the current thread.
+ * The observer must copy the bytes before returning; NULL restores real upload. */
+typedef void (*llrpGpuPlaybackPreuploadObserver_t)(uint64_t, const uint16_t *, size_t);
+void llrpSetGpuPlaybackPreuploadObserverForTesting(llrpGpuPlaybackPreuploadObserver_t observer);
 int llrpGpuPlaybackReconResetGlTextureResources(void);
 int llrpGpuPlaybackReconRunGlTexture(const llrpGpuPlaybackReconState_t * state,
                                      const uint16_t * raw_input_bayer14,

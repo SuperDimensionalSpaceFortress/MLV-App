@@ -2799,10 +2799,17 @@ class RepoHygieneTests(unittest.TestCase):
 
     def test_async_preupload_tokens_and_display_timing_use_shared_boundaries(self) -> None:
         source = (ROOT / "src/mlv/llrawproc/llrawproc.c").read_text(encoding="utf-8")
+        render = (ROOT / "platform/qt/RenderFrameThread.cpp").read_text(encoding="utf-8")
+        self.assertNotIn("llrpGpuPlaybackReconPreuploadFrame(", render)
+        self.assertRegex(source, r"(?s)if \(gpu_playback_prepare_only_allowed\)\s*\{\s*"
+                         r"/\*.*?\*/\s*\(void\)llrpGpuPlaybackReconPreuploadFrame\(\s*"
+                         r"mlv_pipeline_capture_get_current_frame\(\),\s*gpu_playback_input,\s*raw_image_size\);")
         for call in ("preupload_frame", "run_preuploaded"):
             with self.subTest(call=call):
                 self.assertRegex(source, rf"g->{call}\(g->backend,\s*frame_token,")
-        self.assertEqual(2, source.count("llrpGpuPlaybackReconFrameToken(frame_id)"))
+        # The deterministic observer shares the same token admission as upload
+        # and reconstruction; it must not introduce a separate frame-zero rule.
+        self.assertEqual(3, source.count("llrpGpuPlaybackReconFrameToken(frame_id)"))
         self.assertNotIn("&& frame_id != 0", source)
         for filename in ("GpuDisplayViewport.cpp", "GpuDisplayWindow.cpp"):
             with self.subTest(adapter=filename):

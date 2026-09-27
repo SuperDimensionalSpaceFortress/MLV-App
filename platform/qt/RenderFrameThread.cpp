@@ -1895,15 +1895,6 @@ void RenderFrameThread::decodeFrameForWorker( const DecodeQueueEntry &entry )
         (void)getMlvRawFrameUint16( m_pMlvObject,
                                     entry.request.frameNumber,
                                     slot.rawImage16.data() );
-        if( entry.request.phase3Mode == Phase3Mode::DecodeReconProcess
-         && entry.request.presentationContext.playbackActive
-         && gpuPlaybackReconAsyncH2dRequested() )
-        {
-            (void)llrpGpuPlaybackReconPreuploadFrame(
-                entry.request.frameNumber,
-                slot.rawImage16.data(),
-                rawPixelCount * sizeof(uint16_t) );
-        }
     }
     const double decodeEndStageTime = mlv_stage_timing_now();
     if( playbackSmokeTimelineTelemetryEnabled() )

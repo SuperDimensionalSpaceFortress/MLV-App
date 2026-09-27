@@ -229,6 +229,26 @@ static int llrawproc_gpu_export_trusted_enabled(void)
 static MLV_THREAD_LOCAL int g_llrawproc_gpu_playback_recon_allowed = 0;
 static MLV_THREAD_LOCAL int g_llrawproc_gpu_playback_texture_present_preferred = 0;
 static MLV_THREAD_LOCAL int g_llrawproc_gpu_playback_texture_prepare_only_allowed = 0;
+static MLV_THREAD_LOCAL llrpGpuPlaybackPreuploadObserver_t g_llrawproc_preupload_observer = NULL;
+
+void llrpSetGpuPlaybackPreuploadObserverForTesting(llrpGpuPlaybackPreuploadObserver_t observer)
+{
+    g_llrawproc_preupload_observer = observer;
+}
+
+static int llrawproc_observe_preupload_for_testing(uint64_t frame_id,
+                                                  const uint16_t * input,
+                                                  size_t bytes)
+{
+    if (g_llrawproc_preupload_observer && input && bytes
+     && llrpGpuPlaybackReconFrameToken(frame_id) != 0
+     && llrawproc_env_truthy_value(getenv("MLVAPP_GPU_PLAYBACK_RECON_ASYNC_H2D")))
+    {
+        g_llrawproc_preupload_observer(frame_id, input, bytes);
+        return 1;
+    }
+    return 0;
+}
 
 void llrpSetGpuPlaybackReconAllowedForCurrentThread(int enabled);
 void llrpSetGpuPlaybackReconAllowedForCurrentThread(int enabled)
@@ -1026,6 +1046,10 @@ int llrpGpuPlaybackReconPreuploadFrame(uint64_t frame_id,
         return 0;
     }
 
+    if(llrawproc_observe_preupload_for_testing(frame_id, raw_input_bayer14, raw_image_size))
+    {
+        return 1;
+    }
     locked = pthread_mutex_trylock(&g_llrawproc_gpu_recon_backend_mutex) == 0;
     if(!locked)
     {
@@ -1873,6 +1897,10 @@ int llrpGpuPlaybackReconPreuploadFrame(uint64_t frame_id,
                                       const uint16_t * raw_input_bayer14,
                                       size_t raw_image_size)
 {
+    if(llrawproc_observe_preupload_for_testing(frame_id, raw_input_bayer14, raw_image_size))
+    {
+        return 1;
+    }
     (void)frame_id;
     (void)raw_input_bayer14;
     (void)raw_image_size;
@@ -3503,6 +3531,15 @@ void applyLLRawProcObjectWorker(mlvObject_t * video,
                         && !gpu_playback_post_recon_fix_would_run;
                     if (gpu_playback_prepare_only_allowed)
                     {
+                        /* Stage exactly the corrected input consumed by recon.
+                         * Decode output can still change during RAW preparation;
+                         * the backend deliberately rejects different bytes even
+                         * when the frame token matches. The call copies into its
+                         * pinned slot before this worker can reuse the buffer. */
+                        (void)llrpGpuPlaybackReconPreuploadFrame(
+                            mlv_pipeline_capture_get_current_frame(),
+                            gpu_playback_input,
+                            raw_image_size);
                         if (llrawproc_gpu_playback_retain_device_output_enabled())
                         {
                             llrpGpuPlaybackReconState_t public_gpu_playback_state;

@@ -8,6 +8,7 @@
 #include "playback_path_test_state.h"
 
 #include "../../src/mlv/llrawproc/llrawproc.h"
+#include "../../src/mlv/pipeline_stage_capture.h"
 extern "C" {
 #include "../../src/mlv/llrawproc/hist.h"
 }
@@ -2726,6 +2727,114 @@ TEST(DualIsoPipeline, GpuPlaybackReconOutputValidationKeepsCpuOraclePath)
     qunsetenv("MLVAPP_GPU_PLAYBACK_RECON");
     qunsetenv("MLVAPP_GPU_PLAYBACK_RECON_VALIDATE_OUTPUT");
     ASSERT_EQ(1, llrpResetGpuPlaybackReconRunForTesting());
+}
+
+namespace {
+struct PreuploadObservation {
+    int calls = 0;
+    uint64_t frame = UINT64_MAX;
+    std::vector<uint16_t> input;
+};
+thread_local PreuploadObservation *preuploadObservation = nullptr;
+
+void observePreparedPreupload(uint64_t frame, const uint16_t *input, size_t bytes)
+{
+    ++preuploadObservation->calls;
+    preuploadObservation->frame = frame;
+    preuploadObservation->input.assign(input, input + bytes / sizeof(uint16_t));
+}
+
+class PreparedPreuploadFixtureScope {
+    std::vector<std::pair<QByteArray, QByteArray>> saved;
+public:
+    PreparedPreuploadFixtureScope(PreuploadObservation *observation, bool gpu, bool async)
+    {
+        for (const auto &setting : std::vector<std::pair<QByteArray, QByteArray>>{
+                 {"MLVAPP_GPU_EXPORT", "0"},
+                 {"MLVAPP_GPU_PLAYBACK_RECON", gpu ? "1" : "0"},
+                 {"MLVAPP_GPU_PLAYBACK_RECON_ASYNC_H2D", async ? "1" : "0"},
+                 {"MLVAPP_GPU_PLAYBACK_RECON_VALIDATE_OUTPUT", "0"},
+                 {"MLVAPP_GPU_PLAYBACK_RECON_RETAIN_DEVICE_OUTPUT", "0"}})
+        {
+            saved.push_back({setting.first, qgetenv(setting.first.constData())});
+            qputenv(setting.first.constData(), setting.second);
+        }
+        preuploadObservation = observation;
+        llrpSetGpuPlaybackPreuploadObserverForTesting(observePreparedPreupload);
+    }
+    ~PreparedPreuploadFixtureScope()
+    {
+        llrpSetGpuPlaybackPreuploadObserverForTesting(nullptr);
+        preuploadObservation = nullptr;
+        for (const auto &setting : saved) {
+            if (setting.second.isNull()) qunsetenv(setting.first.constData());
+            else qputenv(setting.first.constData(), setting.second);
+        }
+    }
+};
+}
+
+TEST(DualIsoPipeline, AsyncPreuploadStagesPreparedPixelsAfterBitExpansion)
+{
+    for (uint64_t frameIndex : {uint64_t(0), uint64_t(1)})
+    {
+        MlvPipelineFixture fixture;
+        assert_fixture_ready(fixture);
+        configure_gpu_export_supported_dual_iso(fixture);
+        auto *video = fixture.video();
+        llrpSetDualIsoInterpolationMethod(video, DISOI_MEAN23);
+        video->llrawproc->focus_pixels = 0;
+        video->llrawproc->bad_pixels = 0;
+        video->llrawproc->vertical_stripes = 0;
+        std::vector<uint16_t> raw(size_t(fixture.width()) * size_t(fixture.height()));
+        ASSERT_EQ(0, getMlvRawFrameUint16(video, frameIndex, raw.data()));
+        for (auto &pixel : raw) pixel >>= 2;
+        const auto decoded12 = raw;
+        // This synthetic unpacked frame contains exactly the decoded active area.
+        video->RAWI.raw_info.width = fixture.width();
+        video->RAWI.raw_info.height = fixture.height();
+        video->RAWI.raw_info.bits_per_pixel = 12;
+        video->RAWI.raw_info.black_level >>= 2;
+        video->RAWI.raw_info.white_level >>= 2;
+        // Decode is complete; exclude the independent compressed-range transform
+        // so this fixture isolates actual 12-to-14-bit preparation.
+        video->MLVI.videoClass &= ~MLV_VIDEO_CLASS_FLAG_LJ92;
+        PreuploadObservation observation;
+        const PreparedPreuploadFixtureScope observer(&observation, true, true);
+        const GpuPlaybackReconThreadOptIn optIn(true);
+        const GpuPlaybackReconTexturePresentOptIn texturePresent(true);
+        const GpuPlaybackReconTexturePrepareOnlyOptIn prepareOnly(true);
+        mlv_pipeline_capture_set_current_frame(frameIndex);
+        applyLLRawProcObjectWorker(video, raw.data(), raw.size() * sizeof(uint16_t), nullptr, 0);
+        ASSERT_EQ(1, llrpGpuPlaybackReconLastPrepareOnlyForTesting());
+        ASSERT_EQ(1, observation.calls);
+        ASSERT_EQ(frameIndex, observation.frame);
+        ASSERT_EQ(raw.size(), observation.input.size());
+        ASSERT_TRUE(observation.input == raw);
+        ASSERT_TRUE(observation.input != decoded12);
+        auto expanded14 = decoded12;
+        for (auto &pixel : expanded14) pixel <<= 2;
+        ASSERT_TRUE(observation.input == expanded14);
+    }
+}
+
+TEST(DualIsoPipeline, AsyncPreuploadDoesNotStageDisabledOrIneligibleFrames)
+{
+    for (int disabledGate : {0, 1, 2})
+    {
+        MlvPipelineFixture fixture;
+        assert_fixture_ready(fixture);
+        configure_gpu_export_supported_dual_iso(fixture);
+        llrpSetDualIsoInterpolationMethod(fixture.video(), disabledGate == 2 ? DISOI_AMAZE : DISOI_MEAN23);
+        PreuploadObservation observation;
+        const PreparedPreuploadFixtureScope observer(&observation, disabledGate != 0, disabledGate != 1);
+        const GpuPlaybackReconThreadOptIn optIn(true);
+        const GpuPlaybackReconTexturePresentOptIn texturePresent(true);
+        const GpuPlaybackReconTexturePrepareOnlyOptIn prepareOnly(true);
+        const auto frame = fixture.renderFrame16(0, 1);
+        ASSERT_TRUE(!frame.empty());
+        ASSERT_EQ(0, observation.calls);
+    }
 }
 
 TEST(DualIsoPipeline, NormalDualIsoRawOutputStableAcrossThreadCounts)
