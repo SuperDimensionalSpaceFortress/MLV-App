@@ -5920,12 +5920,19 @@ class DisplayWakeKeepAliveJobOrderingTests(unittest.TestCase):
 
 
 class InputDesktopNudgeSecureDesktopGateTests(unittest.TestCase):
-    """Static shape/ordering checks on InputDesktopNudge.Run's new desktop-name gate. A live
+    """Static shape/ordering checks on InputDesktopNudge.Run's desktop-name gate. A live
     secure-desktop switch is not reproducible in this test environment (same reasoning
     DisplayWakeKeepAlivePerTickDesktopSwitchTests already uses for its own live-UM-only class of
     evidence), so the mechanism itself is proven live below (InputDesktopNudgeDesktopNameLiveTests)
     against the one desktop name this host CAN produce ("Default"), and the refusal shape is pinned
-    here, mutation-checked."""
+    here, mutation-checked. CUDA-PERF-DISPLAY-WAKE-4 round 1c (sonnet hardening): round 1b's
+    original allow-list of "Default" alone was a HUB-BLOCKER regression -- a read-only hub probe on
+    Ultra-Magnus measured a RUNNING, non-secure screen saver's input desktop as named
+    "Screen-saver", not "Default", so that allow-list refused every real dismiss (the golden path
+    this whole helper exists for). "Screen-saver" now joins the allow-list; see
+    InputDesktopNudgeSecureScreensaverGateTests immediately below for the state re-read that
+    separates a secure screen saver from a non-secure one on that SAME desktop name, since the name
+    alone cannot."""
 
     def setUp(self) -> None:
         text = MODULE.read_text(encoding="utf-8")
@@ -5940,8 +5947,19 @@ class InputDesktopNudgeSecureDesktopGateTests(unittest.TestCase):
         self.assertLess(set_thread_desktop_at, read_name_at)
         self.assertLess(read_name_at, send_input_at)
 
-    def test_only_the_default_desktop_name_is_treated_as_safe(self) -> None:
-        self.assertIn('string.Equals(desktopName, "Default", StringComparison.Ordinal)', self.body)
+    def test_default_and_screensaver_desktop_names_are_both_treated_as_safe(self) -> None:
+        # CUDA-PERF-DISPLAY-WAKE-4 round 1c regression guard: a mutation that narrows this
+        # allow-list back to "Default" alone (round 1b's shape, proven live-broken by the hub's own
+        # Ultra-Magnus probe) must red this test.
+        safe_at = self.body.index("bool desktopNameSafe = desktopNameRead && (")
+        refused_at = self.body.index("if (!desktopNameSafe)", safe_at)
+        safe_expr = self.body[safe_at:refused_at]
+        self.assertIn('string.Equals(desktopName, "Default", StringComparison.Ordinal)', safe_expr)
+        self.assertIn('string.Equals(desktopName, "Screen-saver", StringComparison.Ordinal)', safe_expr)
+        self.assertIn("||", safe_expr)
+        # Exactly two names allow-listed -- guards against silently widening this to "Winlogon" or
+        # any other name instead of relying on default-deny.
+        self.assertEqual(2, safe_expr.count("string.Equals(desktopName,"))
 
     def test_an_unreadable_desktop_name_is_refused_with_a_typed_reason(self) -> None:
         self.assertIn("ATTRCUDA_SECURE_DESKTOP_REFUSED reason=desktop_name_unknown", self.body)
@@ -5978,7 +5996,9 @@ class InputDesktopNudgeDesktopNameLiveTests(_PwshCase):
             "[void](Register-AttrCudaDisplayWakeNativeMethods)\n"
             "$result = [MLVAppAttrCudaDisplayWake.InputDesktopNudge]::Run(5000)\n"
             "$out = [ordered]@{ desktopName = $result.DesktopName; desktopNameRefused = [bool]$result.DesktopNameRefused; "
-            "sendInputError = $result.SendInputError; threadJoined = [bool]$result.ThreadJoined }\n"
+            "sendInputError = $result.SendInputError; threadJoined = [bool]$result.ThreadJoined; "
+            "screensaverRunningAtInject = $result.ScreensaverRunningAtInject; "
+            "screensaverSecureAtInject = $result.ScreensaverSecureAtInject; secureRefused = [bool]$result.SecureRefused }\n"
             f"[IO.File]::WriteAllText('{(self.tmp / 'r.json')}', ($out | ConvertTo-Json -Depth 5))\n"
         )
         self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
@@ -5987,6 +6007,10 @@ class InputDesktopNudgeDesktopNameLiveTests(_PwshCase):
         self.assertIs(result["desktopNameRefused"], False)
         self.assertIsNone(result["sendInputError"])
         self.assertIs(result["threadJoined"], True)
+        # CUDA-PERF-DISPLAY-WAKE-4 round 1c: on this host's quiet (no screen saver running)
+        # desktop, the in-thread secure re-read must confirm running=false and never refuse.
+        self.assertIs(result["screensaverRunningAtInject"], False)
+        self.assertIs(result["secureRefused"], False)
 
     def test_invoke_attr_cuda_input_desktop_nudge_surfaces_desktop_name_fields(self) -> None:
         proc = self.run_with_module(
@@ -5997,6 +6021,8 @@ class InputDesktopNudgeDesktopNameLiveTests(_PwshCase):
         result = json.loads((self.tmp / "r.json").read_text(encoding="utf-8"))
         self.assertEqual(result["desktopName"], "Default")
         self.assertIs(result["desktopNameRefused"], False)
+        self.assertIs(result["screensaverRunningAtInject"], False)
+        self.assertIs(result["secureRefused"], False)
 
     def test_getuserobjectinformation_fails_closed_on_an_invalid_handle(self) -> None:
         # Grounds the "unreadable name" mechanism in a real Win32 call this host CAN exercise, even
@@ -6012,6 +6038,220 @@ class InputDesktopNudgeDesktopNameLiveTests(_PwshCase):
         self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
         result = json.loads((self.tmp / "r.json").read_text(encoding="utf-8"))
         self.assertIs(result["ok"], False)
+
+
+# --------------------------------------------------------------------------------------------
+# CUDA-PERF-DISPLAY-WAKE-4 round 1c (sonnet hardening, hub-blocker correction): round 1b's
+# desktop-name-only gate refused every real dismiss once a hub probe on Ultra-Magnus proved a
+# RUNNING non-secure screen saver's input desktop is named "Screen-saver", not "Default". The
+# name allow-list now admits both -- but a SECURE screen saver can run on that same
+# "Screen-saver" name, so the name check alone cannot separate secure from non-secure. This
+# section pins the new in-thread SPI_GETSCREENSAVERRUNNING/-SECURE re-read that does.
+# --------------------------------------------------------------------------------------------
+
+
+class InputDesktopNudgeSecureScreensaverGateTests(unittest.TestCase):
+    """Static shape/ordering checks on InputDesktopNudge.Run's new in-thread secure-state
+    re-read. A live secure screen saver (or a live "Screen-saver" desktop name at all, on this
+    non-UM host) is not reproducible in this test environment -- same reasoning
+    InputDesktopNudgeSecureDesktopGateTests already uses for its own class of evidence -- so this
+    is mutation-checked against the source the same way that class's refusal shape is."""
+
+    def setUp(self) -> None:
+        text = MODULE.read_text(encoding="utf-8")
+        start_at = text.index("public static InputDesktopNudgeResult Run(int joinTimeoutMilliseconds)")
+        end_at = text.index("'@ -ErrorAction Stop", start_at)
+        self.body = text[start_at:end_at]
+        self.name_gate_return_at = self.body.index(
+            'result.SendInputError = "ATTRCUDA_SECURE_DESKTOP_REFUSED reason=" + secureRefusalReason')
+        self.name_gate_return_at = self.body.rindex("return;", 0, self.name_gate_return_at)
+
+    def test_secure_state_is_reread_after_the_desktop_name_gate_passes_and_before_sendinput(self) -> None:
+        # The desktop-name gate's own `return;` (on refusal) must precede the secure re-read, and
+        # the secure re-read must precede SendInput -- a mutation that reorders these (e.g. reading
+        # secure state before the name is even known safe) must red this test.
+        name_return_at = self.body.index("result.DesktopNameRefused = true;")
+        name_return_at = self.body.index("return;", name_return_at)
+        running_read_at = self.body.index(
+            'NativeMethods.SystemParametersInfo(0x0072 /* SPI_GETSCREENSAVERRUNNING */', name_return_at)
+        secure_read_at = self.body.index(
+            'NativeMethods.SystemParametersInfo(0x0076 /* SPI_GETSCREENSAVESECURE */', running_read_at)
+        send_input_at = self.body.index("NativeMethods.SendInput(", secure_read_at)
+        self.assertLess(name_return_at, running_read_at)
+        self.assertLess(running_read_at, secure_read_at)
+        self.assertLess(secure_read_at, send_input_at)
+
+    def test_a_running_and_confirmed_secure_screensaver_is_refused_with_a_typed_reason(self) -> None:
+        # The reason is built as "...REFUSED reason=" + secureRefusalReason -- the literal prefix
+        # and the "secure_screensaver" value (assigned only when runningNow && secureNow) are
+        # pinned separately since they are never adjacent text in the source.
+        self.assertIn('result.SendInputError = "ATTRCUDA_SECURE_DESKTOP_REFUSED reason=" + secureRefusalReason', self.body)
+        self.assertIn('secureNow ? "secure_screensaver" : null', self.body)
+
+    def test_an_unreadable_running_or_secure_state_is_refused_as_state_unknown(self) -> None:
+        # Both branches that fail closed on an unreadable probe (running unreadable at all, and
+        # running=true with secure unreadable) must assign the SAME "state_unknown" literal.
+        self.assertIn('secureRefusalReason = "state_unknown";', self.body)
+        self.assertIn('!secureRead ? "state_unknown"', self.body)
+        self.assertEqual(2, self.body.count('"state_unknown"'))
+
+    def test_a_running_and_confirmed_not_secure_screensaver_is_not_refused_by_this_gate(self) -> None:
+        # The regression this gate must never introduce: a running, NON-secure screen saver (the
+        # golden path -- the whole reason this dismiss helper exists) must still reach SendInput.
+        # secureRefusalReason stays null exactly when runningNow is true and secureRead/secureNow
+        # confirm not-secure -- pinned by the ternary shape itself, since there is no live host in
+        # this environment that can force a real secure screen saver to exercise this end to end.
+        self.assertIn(
+            "secureRefusalReason = !secureRead ? \"state_unknown\" : (secureNow ? \"secure_screensaver\" : null);",
+            self.body)
+
+    def test_a_secure_refusal_returns_before_the_nudge_input_array_is_built(self) -> None:
+        # A mutation that lets this refusal fall through to SendInput anyway (e.g. removing the
+        # `return;`) must red this test even if SecureRefused is still recorded.
+        refused_at = self.body.index("result.SecureRefused = true;")
+        nudge_array_at = self.body.index("INPUT[] nudge = new INPUT[]", refused_at)
+        return_at = self.body.index("return;", refused_at)
+        self.assertLess(refused_at, return_at)
+        self.assertLess(return_at, nudge_array_at)
+
+    def test_the_secure_refusal_is_written_to_senderror_so_tick_failure_detection_still_catches_it(self) -> None:
+        # Same reasoning as the desktop-name gate's own equivalent test: the keep-alive loop's
+        # tickError candidate list only ever selects $result.SendInputError, so routing this
+        # refusal through a different field would make it invisible to keep-alive health.
+        refused_at = self.body.index("result.SecureRefused = true;")
+        send_error_at = self.body.index("result.SendInputError = ", refused_at)
+        self.assertLess(refused_at, send_error_at)
+        self.assertLess(send_error_at, self.body.index("return;", refused_at))
+
+    def test_the_running_and_secure_state_read_are_recorded_on_the_result_regardless_of_outcome(self) -> None:
+        # ScreensaverRunningAtInject/ScreensaverSecureAtInject must be assigned BEFORE the refusal
+        # branch's early return, so a refused tick still carries the state that refused it (not
+        # just $null-by-omission).
+        running_assign_at = self.body.index("result.ScreensaverRunningAtInject = runningRead")
+        secure_assign_at = self.body.index("result.ScreensaverSecureAtInject = secureRead", running_assign_at)
+        refused_at = self.body.index("result.SecureRefused = true;", secure_assign_at)
+        self.assertLess(running_assign_at, secure_assign_at)
+        self.assertLess(secure_assign_at, refused_at)
+
+
+class InvokeAttrCudaInputDesktopNudgeSecureFieldWiringTests(unittest.TestCase):
+    """Static check: all three return branches of Invoke-AttrCudaInputDesktopNudge (native
+    unavailable, success, exception) surface the three new secure-gate fields -- a mutation that
+    adds them to only the success branch would silently drop them to $null on the native-
+    unavailable/exception paths instead of raising a missing-member error, since this module's
+    ordered hashtables are duck-typed."""
+
+    def setUp(self) -> None:
+        text = MODULE.read_text(encoding="utf-8")
+        start_at = text.index("function Invoke-AttrCudaInputDesktopNudge {")
+        end_at = text.index("\nfunction Start-AttrCudaDisplayWake {", start_at)
+        self.body = text[start_at:end_at]
+
+    def test_all_three_branches_declare_the_new_secure_fields(self) -> None:
+        for field in ("screensaverRunningAtInject", "screensaverSecureAtInject", "secureRefused"):
+            self.assertEqual(
+                3, self.body.count(field),
+                f"expected '{field}' in all three ordered-hashtable branches, found "
+                f"{self.body.count(field)}")
+
+
+@requires_pwsh
+class InvokeAttrCudaInputDesktopNudgeNativeUnavailableSecureFieldsTests(unittest.TestCase):
+    """Live proof of the native-unavailable branch specifically -- the success branch's shape is
+    already proven by InputDesktopNudgeDesktopNameLiveTests. Same flat-scope override technique
+    as test_input_desktop_nudge_does_not_throw_when_native_type_is_unavailable: Import-Module's
+    own module-scope isolation means a top-level redefinition of Register-AttrCudaDisplayWakeNativeMethods
+    never reaches Invoke-AttrCudaInputDesktopNudge's own internal call to it."""
+
+    def setUp(self) -> None:
+        if os.name != "nt":
+            self.skipTest("the ATTR-3 keep-alive is Windows-only (P/Invoke, drive-letter paths)")
+        self._tmp = tempfile.TemporaryDirectory(prefix="attr3-nudge-native-unavailable-")
+        self.tmp = _long_path(Path(self._tmp.name))
+        self.addCleanup(self._tmp.cleanup)
+
+    def test_native_unavailable_branch_still_reports_the_secure_fields(self) -> None:
+        extract_script = self.tmp / "extract.ps1"
+        extract_script.write_text(
+            "$ErrorActionPreference = 'Stop'\n"
+            "Import-Module '" + str(MODULE) + "' -Force\n"
+            "$src = Get-AttrCudaEmbeddedFunctionSource -Name @("
+            "'Register-AttrCudaDisplayWakeNativeMethods','Invoke-AttrCudaInputDesktopNudge')\n"
+            f"Set-Content -LiteralPath '{(self.tmp / 'extracted.ps1')}' -Value $src -Encoding utf8\n",
+            encoding="utf-8",
+        )
+        extract_proc = _run_pwsh_file(extract_script)
+        self.assertEqual(extract_proc.returncode, 0, extract_proc.stdout + extract_proc.stderr)
+
+        probe_script = self.tmp / "extracted.ps1"
+        with probe_script.open("a", encoding="utf-8") as f:
+            f.write(
+                "\n$ErrorActionPreference = 'Stop'\n"
+                "function Register-AttrCudaDisplayWakeNativeMethods { $false }\n"
+                "$r = Invoke-AttrCudaInputDesktopNudge -JoinTimeoutMilliseconds 5000\n"
+                f"[IO.File]::WriteAllText('{(self.tmp / 'r.json')}', ($r | ConvertTo-Json -Depth 5))\n"
+            )
+        proc = _run_pwsh_file(probe_script)
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        result = json.loads((self.tmp / "r.json").read_text(encoding="utf-8"))
+        self.assertIs(result["attempted"], False)
+        self.assertIsNone(result["screensaverRunningAtInject"])
+        self.assertIsNone(result["screensaverSecureAtInject"])
+        self.assertIs(result["secureRefused"], False)
+
+
+class DisplayWakeKeepAlivePerTickDesktopNameStateTests(unittest.TestCase):
+    """CUDA-PERF-DISPLAY-WAKE-4 round 1c: the keep-alive loop records the desktop name each tick's
+    dedicated thread actually read, not just the tick's pass/fail outcome -- static text-scan,
+    same reasoning DisplayWakeKeepAlivePerTickDesktopSwitchTests already uses for this loop body
+    (a live desktop switch is not reproducible here)."""
+
+    def setUp(self) -> None:
+        self.text = MODULE.read_text(encoding="utf-8")
+        loop_start_at = self.text.index("$loopScript = {")
+        loop_end_at = self.text.index(
+            "# CUDA-PERF-DISPLAY-WAKE-3 round 1 (fable hardening): CreateRunspace/Open/BeginInvoke",
+            loop_start_at)
+        self.loop_body = self.text[loop_start_at:loop_end_at]
+
+    def test_each_tick_records_the_dedicated_threads_desktop_name(self) -> None:
+        run_at = self.loop_body.index("[MLVAppAttrCudaDisplayWake.InputDesktopNudge]::Run([int]$JoinTimeoutMilliseconds)")
+        record_at = self.loop_body.index("$NudgeState.lastDesktopName = $result.DesktopName", run_at)
+        self.assertLess(run_at, record_at)
+
+    def test_the_desktop_name_is_recorded_regardless_of_tick_outcome(self) -> None:
+        # Recorded before the success/failure branch below it decides count/success/failure --
+        # a mutation that moves this recording inside only the success or only the failure arm
+        # must red this test.
+        record_at = self.loop_body.index("$NudgeState.lastDesktopName = $result.DesktopName")
+        tick_error_computed_at = self.loop_body.index(
+            "@($result.OpenInputDesktopError, $result.SetThreadDesktopError, $result.SendInputError, "
+            "$result.CloseDesktopError)")
+        self.assertLess(record_at, tick_error_computed_at)
+
+    def test_nudge_state_initializers_declare_last_desktop_name(self) -> None:
+        # Both the early-return (native-unavailable) handle and the real handle's nudgeState must
+        # declare the key up front -- Set-StrictMode -Version Latest (this module's own contract)
+        # turns a missing-key read into a terminating error rather than $null.
+        self.assertEqual(2, self.text.count("lastDesktopName = $null"))
+
+
+@requires_pwsh
+class DisplayWakeKeepAliveLastDesktopNameLiveTests(_PwshCase):
+    """Live proof: a real keep-alive tick on this host's quiet ("Default", not running) desktop
+    populates .nudgeState.lastDesktopName."""
+
+    def test_a_healthy_tick_records_the_default_desktop_name(self) -> None:
+        proc = self.run_with_module(
+            "$h = Start-AttrCudaDisplayWakeKeepAlive -IntervalSeconds 1\n"
+            "Start-Sleep -Milliseconds 2500\n"
+            "$lastDesktopName = $h.nudgeState.lastDesktopName\n"
+            "[void](Stop-AttrCudaDisplayWakeKeepAlive -Handle $h)\n"
+            f"[IO.File]::WriteAllText('{(self.tmp / 'r.json')}', (@{{ lastDesktopName = $lastDesktopName }} | ConvertTo-Json))\n"
+        )
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        result = json.loads((self.tmp / "r.json").read_text(encoding="utf-8"))
+        self.assertEqual(result["lastDesktopName"], "Default")
 
 
 # --------------------------------------------------------------------------------------------

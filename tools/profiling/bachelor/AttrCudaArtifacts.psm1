@@ -2721,6 +2721,17 @@ function Register-AttrCudaDisplayWakeNativeMethods {
             // what this closes.
             public string DesktopName;
             public bool DesktopNameRefused;
+            // CUDA-PERF-DISPLAY-WAKE-4 round 1c (sonnet hardening): the running/secure state this
+            // thread read back, from INSIDE itself, immediately before SendInput -- see
+            // InputDesktopNudge.Run's own new comment block for why the desktop-name gate alone
+            // (above) cannot substitute for this: a secure ("on resume, display logon screen")
+            // screen saver can run on the SAME "Screen-saver" desktop name a non-secure one does,
+            // so only this state re-read actually separates them. $null when that particular probe
+            // itself could not be read (SystemParametersInfo returning false); SecureRefused is
+            // $true when this gate is the reason SendInput was never attempted.
+            public bool? ScreensaverRunningAtInject;
+            public bool? ScreensaverSecureAtInject;
+            public bool SecureRefused;
         }
 
         public static class InputDesktopNudge
@@ -2780,38 +2791,89 @@ function Register-AttrCudaDisplayWakeNativeMethods {
                         // narrowing the window to THIS thread itself: read the name of the desktop
                         // hDesktop (the one OpenInputDesktop just resolved as "currently receiving
                         // input") actually is, immediately before SendInput, and inject only when it
-                        // is the expected non-secure desktop. Windows names the interactive desktop
-                        // "Default"; every OpenInputDesktop leg this module's own history records for
-                        // a NON-secure screen saver (the round-2/round-3 UM evidence cited throughout
-                        // this file) resolved without ever logging any other name, so "Default" is
-                        // the one name treated as safe here -- "Winlogon" (the desktop Windows
-                        // documents the secure/password-prompt screen saver, UAC and the lock screen
-                        // itself as running on) and any other or unreadable name are refused with NO
-                        // SendInput of any kind. The remaining window -- between this name read and
-                        // SendInput, both on this same thread with nothing else able to run in
-                        // between -- is closed by Windows itself, not by this code: SendInput from a
-                        // non-SYSTEM process is documented (and this file's own round-2 evidence
-                        // above independently observed, as ERROR_ACCESS_DENIED) to be rejected by any
-                        // desktop the calling thread is not actually attached to, and a secure
-                        // desktop switch reassigns the ACTIVE input desktop away from hDesktop, not
-                        // this thread's own SetThreadDesktop attachment to it -- so even a
-                        // secure-desktop switch landing in that last instant leaves SendInput
-                        // injecting into the (by then background, non-secure) desktop this thread is
-                        // still attached to, never onto the new secure one, which is exactly the
-                        // security boundary this job must never cross.
+                        // is one of the two names a NON-secure desktop is documented/observed to use.
+                        // Windows names the plain interactive desktop "Default"; a RUNNING screen
+                        // saver -- secure or not -- switches the input desktop to one named
+                        // "Screen-saver" (CUDA-PERF-DISPLAY-WAKE-4 round 1c, read-only hub probe on
+                        // Ultra-Magnus: screensaverRunning=True, inputDesktopName=Screen-saver, for a
+                        // NON-secure scrnsave.scr). Round 1b's original comment here claimed every
+                        // logged leg resolved to "Default" and treated that as the only safe name --
+                        // that was only ever true because none of those legs had a screen saver
+                        // actually RUNNING at nudge time; it was never evidence that a running
+                        // non-secure saver also uses "Default", and narrowing the allow-list to
+                        // "Default" alone made every running-saver dismiss (the golden path this
+                        // helper exists for) fail closed as a false secure-desktop refusal. "Default"
+                        // and "Screen-saver" are therefore both treated as safe here; "Winlogon" (the
+                        // desktop Windows documents the secure/password-prompt screen saver, UAC and
+                        // the lock screen itself as running on) and any other or unreadable name are
+                        // refused with NO SendInput of any kind. Crucially, the desktop NAME alone
+                        // does not separate a secure saver from a non-secure one -- a secure
+                        // ("on resume, display logon screen") saver can likewise run on this SAME
+                        // "Screen-saver" desktop -- so this name check is necessary but not
+                        // sufficient; the SPI_GETSCREENSAVESECURE/-RUNNING re-read immediately below,
+                        // taken from inside this same thread, is what actually excludes it. The
+                        // remaining window -- between this name read and SendInput, both on this same
+                        // thread with nothing else able to run in between -- is closed by Windows
+                        // itself, not by this code: SendInput from a non-SYSTEM process is documented
+                        // (and this file's own round-2 evidence above independently observed, as
+                        // ERROR_ACCESS_DENIED) to be rejected by any desktop the calling thread is not
+                        // actually attached to, and a secure desktop switch reassigns the ACTIVE input
+                        // desktop away from hDesktop, not this thread's own SetThreadDesktop
+                        // attachment to it -- so even a secure-desktop switch landing in that last
+                        // instant leaves SendInput injecting into the (by then background, non-secure)
+                        // desktop this thread is still attached to, never onto the new secure one,
+                        // which is exactly the security boundary this job must never cross.
                         int desktopNameLengthNeeded;
                         StringBuilder desktopNameBuilder = new StringBuilder(256);
                         bool desktopNameRead = NativeMethods.GetUserObjectInformation(
                             hDesktop, 2 /* UOI_NAME */, desktopNameBuilder, desktopNameBuilder.Capacity, out desktopNameLengthNeeded);
                         string desktopName = desktopNameRead ? desktopNameBuilder.ToString() : null;
                         result.DesktopName = desktopName;
-                        bool desktopNameSafe = desktopNameRead && string.Equals(desktopName, "Default", StringComparison.Ordinal);
+                        bool desktopNameSafe = desktopNameRead && (
+                            string.Equals(desktopName, "Default", StringComparison.Ordinal) ||
+                            string.Equals(desktopName, "Screen-saver", StringComparison.Ordinal));
                         if (!desktopNameSafe)
                         {
                             result.DesktopNameRefused = true;
                             result.SendInputError = desktopNameRead
                                 ? "ATTRCUDA_SECURE_DESKTOP_REFUSED reason=secure_desktop desktop name '" + desktopName + "' is not the expected non-secure desktop; no SendInput attempted"
                                 : "ATTRCUDA_SECURE_DESKTOP_REFUSED reason=desktop_name_unknown desktop name could not be read (lastError=" + Marshal.GetLastWin32Error() + "); no SendInput attempted";
+                            return;
+                        }
+                        // CUDA-PERF-DISPLAY-WAKE-4 round 1c (sonnet hardening): the desktop-name gate
+                        // above admits "Screen-saver" -- but a SECURE screen saver can run on that
+                        // very same desktop name, so the name alone never proved this is safe to
+                        // inject into. Re-read SPI_GETSCREENSAVERRUNNING and SPI_GETSCREENSAVESECURE
+                        // from INSIDE this dedicated thread, immediately before SendInput -- the same
+                        // "narrow the window to this thread itself" argument the name read above
+                        // makes, applied to the state a name check cannot see. Fails closed exactly
+                        // like Start-AttrCudaDisplayWake's own claim-time gate
+                        // (.screensaverSecureOwnerOnly): only a CONFIRMED running=false, or
+                        // (running=true AND secure=false), may reach SendInput; an unreadable running
+                        // or secure state is treated the same as running+secure, never as "not
+                        // running". The residual window is between THIS read and SendInput, both
+                        // still on this same thread with nothing else able to run in between -- not
+                        // eliminated by shrinking it further, same as the desktop-name comment above.
+                        bool runningNow = false;
+                        bool runningRead = NativeMethods.SystemParametersInfo(0x0072 /* SPI_GETSCREENSAVERRUNNING */, 0, ref runningNow, 0);
+                        bool secureNow = false;
+                        bool secureRead = NativeMethods.SystemParametersInfo(0x0076 /* SPI_GETSCREENSAVESECURE */, 0, ref secureNow, 0);
+                        result.ScreensaverRunningAtInject = runningRead ? (bool?)runningNow : null;
+                        result.ScreensaverSecureAtInject = secureRead ? (bool?)secureNow : null;
+                        string secureRefusalReason = null;
+                        if (!runningRead)
+                        {
+                            secureRefusalReason = "state_unknown";
+                        }
+                        else if (runningNow)
+                        {
+                            secureRefusalReason = !secureRead ? "state_unknown" : (secureNow ? "secure_screensaver" : null);
+                        }
+                        if (secureRefusalReason != null)
+                        {
+                            result.SecureRefused = true;
+                            result.SendInputError = "ATTRCUDA_SECURE_DESKTOP_REFUSED reason=" + secureRefusalReason +
+                                " screen saver running/secure state at inject time forbids SendInput; no SendInput attempted";
                             return;
                         }
                         // CUDA-PERF-DISPLAY-WAKE-3 round 3 (live UM evidence, defect class fix):
@@ -3106,7 +3168,11 @@ function Invoke-AttrCudaInputDesktopNudge {
     (which already touched user32 via Register-AttrCudaDisplayWakeNativeMethods/SendInput above).
     Never called when the screen saver is SECURE (SPI_GETSCREENSAVESECURE) -- that gate lives in
     Start-AttrCudaDisplayWake, one level up, not here: ending a password-protected screen saver is
-    an owner action, never something this job attempts.
+    an owner action, never something this job attempts. CUDA-PERF-DISPLAY-WAKE-4 round 1c
+    (sonnet hardening): that claim-time gate cannot close the gap between its own read and this
+    helper's SendInput, so the C# InputDesktopNudge.Run body re-reads SPI_GETSCREENSAVERRUNNING/
+    -SECURE a second time, from inside its dedicated thread, immediately before SendInput -- this
+    is defense in depth, not a replacement for the claim-time/per-tick gates above it.
     Non-throwing by construction, like every other function in this file: every failure is
     recorded in the returned evidence, never allowed to propagate to the caller. The dedicated
     thread itself is built entirely in C# (Register-AttrCudaDisplayWakeNativeMethods's
@@ -3137,6 +3203,9 @@ function Invoke-AttrCudaInputDesktopNudge {
             threadJoined = $false
             desktopName = $null
             desktopNameRefused = $false
+            screensaverRunningAtInject = $null
+            screensaverSecureAtInject = $null
+            secureRefused = $false
         }
     }
 
@@ -3155,6 +3224,13 @@ function Invoke-AttrCudaInputDesktopNudge {
             # caller-side re-check, is what closes the read-then-inject race.
             desktopName = $result.DesktopName
             desktopNameRefused = [bool]$result.DesktopNameRefused
+            # CUDA-PERF-DISPLAY-WAKE-4 round 1c (sonnet hardening): the running/secure state the
+            # same dedicated thread read back right before SendInput, and whether THAT is what
+            # refused the injection -- see InputDesktopNudge.Run's own comment for why the desktop
+            # name above cannot substitute for this.
+            screensaverRunningAtInject = $result.ScreensaverRunningAtInject
+            screensaverSecureAtInject = $result.ScreensaverSecureAtInject
+            secureRefused = [bool]$result.SecureRefused
         }
     } catch {
         [ordered]@{
@@ -3166,6 +3242,9 @@ function Invoke-AttrCudaInputDesktopNudge {
             threadJoined = $false
             desktopName = $null
             desktopNameRefused = $false
+            screensaverRunningAtInject = $null
+            screensaverSecureAtInject = $null
+            secureRefused = $false
         }
     }
 }
@@ -3458,7 +3537,11 @@ function Start-AttrCudaDisplayWakeKeepAlive {
     saver is CONFIRMED not running afterward (bounded re-read), never merely because SendInput
     reported delivering its events; and CloseDesktopError now joins the same tick-failure
     candidate list OpenInputDesktop/SetThreadDesktop/SendInput already used, so a leaked desktop
-    handle is no longer invisible to keep-alive health.
+    handle is no longer invisible to keep-alive health. CUDA-PERF-DISPLAY-WAKE-4 round 1c (sonnet
+    hardening): .nudgeState.lastDesktopName records the desktop name the dedicated thread read
+    back on the MOST RECENT tick that actually reached InputDesktopNudge.Run (attempted or
+    refused alike) -- $null before the first such tick, unchanged by a tick that never reached
+    InputDesktopNudge.Run at all (the owner-only gate above tripping).
     .setupError is $null when the background pipeline started; non-$null means either
     CreateRunspace/Open/BeginInvoke itself failed (recorded, never thrown -- CUDA-PERF-
     DISPLAY-WAKE-3 round 1 hardening) or the native P/Invoke type could not be loaded at all
@@ -3497,6 +3580,7 @@ function Start-AttrCudaDisplayWakeKeepAlive {
                 failureCount = 0
                 lastError = $null
                 lastFailureUtc = $null
+                lastDesktopName = $null
             })
             intervalSeconds = $IntervalSeconds
             nudgeJoinTimeoutMilliseconds = $NudgeJoinTimeoutMilliseconds
@@ -3515,6 +3599,7 @@ function Start-AttrCudaDisplayWakeKeepAlive {
         failureCount = 0
         lastError = $null
         lastFailureUtc = $null
+        lastDesktopName = $null
     })
     $loopScript = {
         param($StopEvent, $IntervalSeconds, $NudgeState, $JoinTimeoutMilliseconds, $ProbeTimeoutMilliseconds)
@@ -3562,6 +3647,11 @@ function Start-AttrCudaDisplayWakeKeepAlive {
                     # Runspace's own thread -- see this function's own header for why a plain SendInput
                     # here failed on every tick once a screen saver had taken the input desktop.
                     $result = [MLVAppAttrCudaDisplayWake.InputDesktopNudge]::Run([int]$JoinTimeoutMilliseconds)
+                    # CUDA-PERF-DISPLAY-WAKE-4 round 1c (sonnet hardening): the desktop name this
+                    # tick's dedicated thread actually read back right before SendInput (or refused
+                    # on), so a still-live keep-alive shows what desktop it has been injecting into --
+                    # not only visible after the fact in the one-time dismiss's own evidence.
+                    $NudgeState.lastDesktopName = $result.DesktopName
                     $NudgeState.count = [int]$NudgeState.count + 1
                     # CUDA-PERF-DISPLAY-WAKE-3 round 1 (sol BLOCKER): SendInput's own return is the
                     # number of events it actually inserted -- Microsoft documents fewer than
