@@ -171,6 +171,37 @@ static inline uint64_t llrpGpuPlaybackReconFrameIdAfterCompareAndReject(
     return prepared_frame_id == display_frame_id ? prepared_frame_id : UINT64_MAX;
 }
 
+/* Shared by both display adapters (GpuDisplayViewport.cpp, GpuDisplayWindow.cpp),
+ * at both the public entry point and the internal submit function that backs
+ * it, so there is exactly one implementation of "is this retained device
+ * buffer usable for this frame" for all of them to key off. Previously each
+ * of those call sites reimplemented this boolean inline, which let sol's
+ * pre-review #2 hardening finding stand: a regression in any one copy had no
+ * automated test, because the tests/gui directory (the only harness that can
+ * instantiate a real adapter) is an excluded path for this card, and the pure-function
+ * compare-and-reject tests never invoked an adapter. Pulling this out here
+ * makes it directly unit-testable without a GUI harness, the same reasoning
+ * that pulled llrpGpuPlaybackReconFrameIdAfterCompareAndReject() out above --
+ * a mismatched frame's compare-and-reject leaves frame_id at the UINT64_MAX
+ * "not armed" sentinel, which llrpGpuPlaybackReconFrameToken() maps to token
+ * 0, and that must disqualify the retained-buffer shortcut exactly as it
+ * disqualifies the run_backend() token gate. */
+static inline int llrpGpuPlaybackReconRetainedDeviceBufferValid(
+    const uint16_t * retained_device_bayer16,
+    int retained_device_width,
+    int retained_device_height,
+    int expected_width,
+    int expected_height,
+    int validation_probe_texture,
+    uint64_t state_frame_id)
+{
+    return retained_device_bayer16 != NULL
+        && retained_device_width == expected_width
+        && retained_device_height == expected_height
+        && !validation_probe_texture
+        && llrpGpuPlaybackReconFrameToken( state_frame_id ) != 0;
+}
+
 /* Shared by both display adapters. Preupload status belongs to the recon run,
  * including when its scalar timer is unavailable. A retained-device handoff
  * without a recon call supplies a zero-initialized recon timing here. */

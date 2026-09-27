@@ -178,6 +178,49 @@ TEST(DualIsoPipeline, AsyncPreuploadFrameIdCompareAndRejectMismatchDisarmsFrameI
     ASSERT_EQ(uint64_t(0), llrpGpuPlaybackReconFrameToken(result));
 }
 
+// Sol pre-review #2 hardening: GpuDisplayViewport.cpp (both its public entry
+// point and the internal submit function it delegates to) and
+// GpuDisplayWindow.cpp used to each reimplement retainedDeviceValid inline,
+// so removing the frame-token clause from any one copy had no automated
+// test -- tests/gui/* is the only harness that can instantiate a real
+// adapter and is an excluded path for this card, and these pure-function
+// compare-and-reject tests never invoked an adapter. All three call sites
+// now delegate to this one shared, header-only predicate
+// (llrpGpuPlaybackReconRetainedDeviceBufferValid(), llrawproc.h), so this
+// test is a direct adapter-level regression test for the retained-buffer
+// mismatch without needing a GUI harness: it exercises the exact function
+// both adapters call, not a re-encoding of their logic.
+TEST(DualIsoPipeline, RetainedDeviceBufferValidRejectsFrameIdMismatch)
+{
+    const uint16_t retainedBayer16[4] = { 1024, 2048, 3072, 4096 };
+
+    // The exact MainWindow scenario sol's pre-review repro'd: a retained
+    // buffer built for frame 41, now paired with a display task for frame 42.
+    const uint64_t mismatchedFrameId =
+        llrpGpuPlaybackReconFrameIdAfterCompareAndReject(41, 42);
+    ASSERT_EQ(UINT64_MAX, mismatchedFrameId);
+    ASSERT_FALSE(llrpGpuPlaybackReconRetainedDeviceBufferValid(
+        retainedBayer16, 2, 2, /*expected*/ 2, 2, /*validationProbe*/ 0,
+        mismatchedFrameId));
+
+    // A matching frame_id, otherwise identical inputs, must be accepted.
+    const uint64_t armedFrameId =
+        llrpGpuPlaybackReconFrameIdAfterCompareAndReject(42, 42);
+    ASSERT_EQ(uint64_t(42), armedFrameId);
+    ASSERT_TRUE(llrpGpuPlaybackReconRetainedDeviceBufferValid(
+        retainedBayer16, 2, 2, 2, 2, 0, armedFrameId));
+
+    // Every other clause still gates independently of frame_id.
+    ASSERT_FALSE(llrpGpuPlaybackReconRetainedDeviceBufferValid(
+        nullptr, 2, 2, 2, 2, 0, armedFrameId));            // no retained buffer
+    ASSERT_FALSE(llrpGpuPlaybackReconRetainedDeviceBufferValid(
+        retainedBayer16, 3, 2, 2, 2, 0, armedFrameId));    // width mismatch
+    ASSERT_FALSE(llrpGpuPlaybackReconRetainedDeviceBufferValid(
+        retainedBayer16, 2, 3, 2, 2, 0, armedFrameId));    // height mismatch
+    ASSERT_FALSE(llrpGpuPlaybackReconRetainedDeviceBufferValid(
+        retainedBayer16, 2, 2, 2, 2, 1, armedFrameId));    // validation probe texture
+}
+
 TEST(DualIsoPipeline, AsyncPreuploadStatusSurvivesBothDisplayTimingAdapters)
 {
     llrpGpuPlaybackReconTiming_t recon = {};

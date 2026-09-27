@@ -487,7 +487,19 @@ int main(int argc, char** argv)
      * The staged upload must not be consumed for a different frame even when
      * the bytes are byte-identical to what was staged -- the frame token is
      * the sole admission gate, not a content hash. Fallback output must
-     * match the plain synchronous run on the same bytes exactly. */
+     * match the plain synchronous run on the same bytes exactly.
+     *
+     * The frame-41 slot staged for step 6 above was already consumed by that
+     * step's own run_preuploaded(41) call -- take_exact_preupload() sets
+     * state=0 on acceptance (igpu_recon_cuda.cu), so without restaging here
+     * this call would find no live slot at all and could pass on that
+     * technicality alone, never exercising the frame-id compare against a
+     * slot that IS live. Restage frame 41 immediately before the frame-42
+     * call so a live, wrong-token slot is actually on the table to reject. */
+    if (f_preupload(b, 41, h_in, n * sizeof(uint16_t), 0) != 0) {
+        fprintf(stderr, "[dll_test] cross-frame restage of frame 41 rejected\n");
+        return 4;
+    }
     uint16_t* cross_frame_result = (uint16_t*)malloc(n * sizeof(uint16_t));
     memset(cross_frame_result, 0, n * sizeof(uint16_t));
     rc = f_run_preuploaded(b, 42, &frame, h_in,

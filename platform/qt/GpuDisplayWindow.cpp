@@ -560,16 +560,21 @@ bool GpuDisplayWindow::setPresentedGpuPlaybackReconAmazePostWbTexture(
 
     const int texWidth = state->width;
     const int texHeight = state->height;
+    /* Shared with GpuDisplayViewport's equivalent gate and unit-tested
+     * without a GUI harness -- see llrpGpuPlaybackReconRetainedDeviceBufferValid()
+     * (llrawproc.h). Rejects the retained device buffer on a frame-id
+     * mismatch too -- MainWindow's compare-and-reject leaves state->frame_id
+     * unarmed (UINT64_MAX) for a mismatched frame, and this shortcut bypasses
+     * run_backend()'s own token gate entirely. */
     const bool retainedDeviceValid =
-        retainedDeviceBayer16
-        && retainedDeviceWidth == texWidth
-        && retainedDeviceHeight == texHeight
-        && !validationProbeTexture
-        /* Reject the retained device buffer on a frame-id mismatch too --
-         * MainWindow's compare-and-reject leaves state->frame_id unarmed
-         * (UINT64_MAX) for a mismatched frame, and this shortcut bypasses
-         * run_backend()'s own token gate entirely. */
-        && llrpGpuPlaybackReconFrameToken( state->frame_id ) != 0;
+        llrpGpuPlaybackReconRetainedDeviceBufferValid(
+            retainedDeviceBayer16,
+            retainedDeviceWidth,
+            retainedDeviceHeight,
+            texWidth,
+            texHeight,
+            validationProbeTexture,
+            state->frame_id );
     const size_t expectedWords =
         static_cast<size_t>(texWidth) * static_cast<size_t>(texHeight);
     if ( !rawInputBayer14 && !retainedDeviceValid )

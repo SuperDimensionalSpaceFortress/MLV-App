@@ -5488,6 +5488,46 @@ void MainWindow::presentPlaybackPreparedFrame( const PlaybackPrepResult &result 
                 QStringLiteral("gpu_playback_recon_async_h2d_upload_wait_ms"),
                 texturePresentTiming.preupload.upload_wait_ms );
         }
+        else if( gpuReconFrameIdMismatch )
+        {
+            /* This call site did not run the backend (preupload.available
+             * == 0) *and* the frame-ID compare-and-reject above just
+             * rejected the retained buffer that RenderFrameThread.cpp's
+             * insertGpuPlaybackReconRunTelemetry() recorded telemetry for.
+             * That worker-thread telemetry belongs to the frame that
+             * populated the retained slot, not to task.displayFrame, so it
+             * must not be preserved into this frame's presented rollup --
+             * clear/replace every async_h2d_* field rather than only
+             * "available" (perf_field_log_playback_rollup.py reads used /
+             * exact_match / timings directly, independent of available). */
+            readyFrame.stageTimingTelemetry.insert(
+                QStringLiteral("gpu_playback_recon_async_h2d_available"),
+                false );
+            readyFrame.stageTimingTelemetry.insert(
+                QStringLiteral("gpu_playback_recon_async_h2d_accepted"),
+                false );
+            readyFrame.stageTimingTelemetry.insert(
+                QStringLiteral("gpu_playback_recon_async_h2d_used"),
+                false );
+            readyFrame.stageTimingTelemetry.insert(
+                QStringLiteral("gpu_playback_recon_async_h2d_exact_match"),
+                false );
+            readyFrame.stageTimingTelemetry.insert(
+                QStringLiteral("gpu_playback_recon_async_h2d_submitted_while_prior_run_active"),
+                false );
+            readyFrame.stageTimingTelemetry.insert(
+                QStringLiteral("gpu_playback_recon_async_h2d_ready_before_run"),
+                false );
+            readyFrame.stageTimingTelemetry.insert(
+                QStringLiteral("gpu_playback_recon_async_h2d_host_staging_ms"),
+                0.0 );
+            readyFrame.stageTimingTelemetry.insert(
+                QStringLiteral("gpu_playback_recon_async_h2d_upload_ms"),
+                0.0 );
+            readyFrame.stageTimingTelemetry.insert(
+                QStringLiteral("gpu_playback_recon_async_h2d_upload_wait_ms"),
+                0.0 );
+        }
         else if( !readyFrame.stageTimingTelemetry.contains(
                      QStringLiteral("gpu_playback_recon_async_h2d_available") ) )
         {
