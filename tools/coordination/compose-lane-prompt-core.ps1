@@ -89,7 +89,9 @@ function Get-ParsedFields {
 
 function Get-DoctrineBriefText {
     # Fail-closed: implementer/editing composition requires a brief. Fixture via
-    # MLV_DOCTRINE_FIXTURE_ROOT for offline tests. Never browses the bus from a lane;
+    # MLV_DOCTRINE_FIXTURE_ROOT for offline tests ONLY: get_doctrine_brief.py refuses it
+    # unless PYTEST_CURRENT_TEST is set and the root sits in tools/coordination/fixtures/.
+    # Never browses the bus from a lane;
     # this runs on the hub/dispatcher host only.
     param(
         [string]$FixtureRoot = ''
@@ -118,6 +120,17 @@ function Get-DoctrineBriefText {
     if (-not $trimmed) {
         throw "doctrine-brief-failed: empty brief"
     }
+    # Provenance is part of the brief (get_doctrine_brief.py writes it); a brief without it is
+    # not one we produced. Defence in depth behind the getter's own gate: a fixture brief is
+    # refused unless pytest is driving this composition. There is deliberately NO parameter
+    # for handing in brief text - the only brief a lane prompt can carry is this fetch.
+    $provMatch = [regex]::Match($trimmed, '(?m)^provenance: (live|fixture)\s*$')
+    if (-not $provMatch.Success) {
+        throw "doctrine-brief-failed: brief carries no provenance line"
+    }
+    if ($provMatch.Groups[1].Value -eq 'fixture' -and -not $env:PYTEST_CURRENT_TEST) {
+        throw "doctrine-brief-failed: doctrine-fixture-refused: fixture brief outside pytest"
+    }
     return $trimmed
 }
 
@@ -130,7 +143,6 @@ function Get-ComposedLanePrompt {
         [Parameter(Mandatory)][string]$RunDir,
         [string]$Ts = '',
         [Parameter(Mandatory)][string]$GhCapability,
-        [string]$DoctrineBrief = '',
         [string]$DoctrineFixtureRoot = '',
         [switch]$SkipDoctrineBrief
     )
@@ -176,7 +188,7 @@ function Get-ComposedLanePrompt {
             if ($SkipDoctrineBrief) {
                 throw "doctrine-brief-failed: SkipDoctrineBrief is not permitted on implementer/editing paths"
             }
-            $brief = if ($DoctrineBrief) { $DoctrineBrief } else { Get-DoctrineBriefText -FixtureRoot $DoctrineFixtureRoot }
+            $brief = Get-DoctrineBriefText -FixtureRoot $DoctrineFixtureRoot
             $composed = $composed.Replace('{{DOCTRINE_BRIEF}}', $brief)
         }
 
@@ -210,7 +222,7 @@ function Get-ComposedLanePrompt {
             if ($SkipDoctrineBrief) {
                 throw "doctrine-brief-failed: SkipDoctrineBrief is not permitted when {{DOCTRINE_BRIEF}} is present"
             }
-            $brief = if ($DoctrineBrief) { $DoctrineBrief } else { Get-DoctrineBriefText -FixtureRoot $DoctrineFixtureRoot }
+            $brief = Get-DoctrineBriefText -FixtureRoot $DoctrineFixtureRoot
             $composed = $composed.Replace('{{DOCTRINE_BRIEF}}', $brief)
         }
 

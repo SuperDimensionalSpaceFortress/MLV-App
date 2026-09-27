@@ -27,7 +27,10 @@ param(
     [string]$Ts = '',
     [Parameter(Mandatory)][string]$GhCapability,
     [string]$OutFile = '',
-    [string]$DoctrineBrief = '',
+    # Test-only: honoured by get_doctrine_brief.py only under pytest and only inside
+    # tools/coordination/fixtures/; refused everywhere else. There is no parameter that hands
+    # in brief text: the only brief a composed prompt can carry is the live fetch (or, under
+    # pytest, the checked-in fixture), and the brief records which.
     [string]$DoctrineFixtureRoot = ''
 )
 $ErrorActionPreference = 'Stop'
@@ -41,7 +44,7 @@ if (-not $TemplatePath) {
 
 try {
     $result = Get-ComposedLanePrompt -ProcedurePath $ProcedurePath -TemplatePath $TemplatePath `
-        -WorkDir $WorkDir -BaseSha $BaseSha -RunDir $RunDir -Ts $Ts -GhCapability $GhCapability -DoctrineBrief $DoctrineBrief -DoctrineFixtureRoot $DoctrineFixtureRoot
+        -WorkDir $WorkDir -BaseSha $BaseSha -RunDir $RunDir -Ts $Ts -GhCapability $GhCapability -DoctrineFixtureRoot $DoctrineFixtureRoot
 } catch {
     Write-Output ("REFUSED: {0}" -f $_.Exception.Message)
     exit 3

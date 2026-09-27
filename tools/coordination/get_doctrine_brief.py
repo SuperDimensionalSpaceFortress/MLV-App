@@ -14,6 +14,14 @@ Exit 2: print one line starting ``REFUSED:`` on stdout and exit (fetch/fixture f
 Offline tests: pass ``--fixture-root <dir>`` with files laid out like the bus tip
 (``RULINGS.md``, ``specs/mlv-app.md``, ``ruling-candidates/*.md``;
 optional ``cos-feedback/mlv-app/pr-*.md``). No ``gh`` then.
+
+A fixture is NOT doctrine. It is honoured only under pytest (``PYTEST_CURRENT_TEST``,
+which pytest itself sets for the duration of each test) AND only when it resolves
+inside the ``fixtures/`` directory beside this script. Anywhere else the fixture
+(flag or ``MLV_DOCTRINE_FIXTURE_ROOT``) REFUSES with ``doctrine-fixture-refused`` rather
+than being silently ignored, so a misconfigured production host fails loudly instead of
+composing a lane prompt from test text. Every brief records ``provenance: live`` or
+``provenance: fixture`` so a reader of the composed prompt can tell which it got.
 """
 
 from __future__ import annotations
@@ -40,6 +48,33 @@ CANDIDATE_SNIPPET_CHARS = 480
 COS_FEEDBACK_DIR = "cos-feedback/mlv-app"
 COS_FEEDBACK_MAX_FILES = 8
 COS_FEEDBACK_BODY_CHARS = 6000
+# The only directory a fixture may live in: the checked-in test trees beside this script.
+FIXTURES_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "fixtures")
+
+
+def _gate_fixture_root(fixture_root: str) -> str:
+    """Return the resolved fixture root, or raise RuntimeError (-> REFUSED) outside tests.
+
+    Fail closed: production composition must carry the live fetch, never a test tree.
+    """
+    if not os.environ.get("PYTEST_CURRENT_TEST"):
+        raise RuntimeError(
+            "doctrine-fixture-refused: a doctrine fixture is honoured only under pytest "
+            "(PYTEST_CURRENT_TEST unset); production composition requires the live fetch"
+        )
+    resolved = os.path.realpath(fixture_root)
+    allowed = os.path.realpath(FIXTURES_DIR)
+    norm_resolved = os.path.normcase(resolved)
+    norm_allowed = os.path.normcase(allowed)
+    try:
+        common = os.path.commonpath([norm_resolved, norm_allowed])
+    except ValueError:  # different drives
+        common = ""
+    if common != norm_allowed or norm_resolved == norm_allowed:
+        raise RuntimeError(
+            "doctrine-fixture-refused: fixture root %s is not inside %s" % (resolved, allowed)
+        )
+    return resolved
 
 
 def _utc_now() -> str:
@@ -216,6 +251,7 @@ def build_brief(
 ) -> str:
     """Assemble the markdown brief. Raises RuntimeError on hard failure."""
     if fixture_root:
+        fixture_root = _gate_fixture_root(fixture_root)
         bus_head = "fixture:" + _sha256_text(fixture_root)[:12]
         rulings_text, rulings_sha = _fixture_read(fixture_root, "RULINGS.md")
         spec_text, spec_sha = _fixture_read(fixture_root, "specs/mlv-app.md")
@@ -295,8 +331,10 @@ def build_brief(
     # Stable order: candidate-zero first if present, then alpha.
     selected.sort(key=lambda row: (0 if row[0] == CANDIDATE_ZERO else 1, row[0]))
 
+    provenance = "fixture" if fixture_root else "live"
     meta_lines = [
         "<!-- DOCTRINE_BRIEF_META",
+        "provenance: %s" % provenance,
         "busHead: %s" % bus_head,
         "doctrineRepo: %s" % repo,
         "doctrineRef: %s" % ref,
@@ -313,6 +351,12 @@ def build_brief(
 
     body: List[str] = [
         "### Bus tip (read-only; do not browse or write the bus)",
+        (
+            "- provenance: `fixture` -- OFFLINE TEST FIXTURE (pytest only); NOT authoritative doctrine"
+            if fixture_root
+            else "- provenance: `live` -- fetched read-only from `%s` at ref `%s`, busHead `%s`"
+            % (repo, ref, bus_head)
+        ),
         "- repo: `%s`" % repo,
         "- ref: `%s`" % ref,
         "- busHead: `%s`" % bus_head,

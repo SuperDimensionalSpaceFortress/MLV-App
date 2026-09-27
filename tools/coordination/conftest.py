@@ -9,7 +9,10 @@ on network plus a ``gh`` token (hosted CI has no GH_TOKEN, so they all refused w
 
 Each test therefore runs with MLV_DOCTRINE_FIXTURE_ROOT pointing at the checked-in
 offline tree beside this file. Production is unchanged: nothing outside pytest sets
-the variable. The fail-closed path is still exercised: a test that needs the
+the variable, and get_doctrine_brief.py REFUSES a fixture unless PYTEST_CURRENT_TEST
+is set and the root lies inside tools/coordination/fixtures/ (a stray production
+MLV_DOCTRINE_FIXTURE_ROOT therefore fails closed; see NonLiveDoctrineRefusedOutsidePytestTests).
+The fail-closed path is still exercised: a test that needs the
 no-fixture behaviour removes the variable, and a fixture tree missing a required
 file still refuses (both in test_get_doctrine_brief.py).
 """

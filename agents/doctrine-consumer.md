@@ -15,7 +15,8 @@ Standing owner posture, September 9, 2026:
 - `tools/coordination/Get-DoctrineBrief.ps1` (wrapper) and `get_doctrine_brief.py` (implementation) fetch **read-only** via `gh api` Contents API.
 - Default repo: `layibabalola/softwarefactory-fleet-doctrine` (override: `-DoctrineRepo` / `MLV_DOCTRINE_REPO`).
 - On fetch failure when `gh` is required: exit non-zero and print `REFUSED: …`. Composer **refuses** composition for implementer/editing paths if the brief is missing or failed.
-- Offline tests: `MLV_DOCTRINE_FIXTURE_ROOT` / `-FixtureRoot` (no `gh`).
+- Offline tests: `MLV_DOCTRINE_FIXTURE_ROOT` / `-FixtureRoot` (no `gh`). **Tests only:** honoured solely under pytest (`PYTEST_CURRENT_TEST`) and solely inside `tools/coordination/fixtures/`; anywhere else it **refuses** (`doctrine-fixture-refused`). There is no parameter that supplies brief text — a production prompt carries the live fetch or nothing.
+- Every brief records `provenance: live` (repo, ref, busHead sha) or `provenance: fixture` (OFFLINE TEST FIXTURE, not authoritative), so a reader of the composed prompt can tell which it got.
 - Brief includes: short `RULINGS.md` digest, MLV-relevant `ruling-candidates/*` (must surface `agent-bridge-sot-suspend-mlv-in-tree-20260909.md` when present on bus tip or doctrine PR #56 tip, labeled **CANDIDATE_ZERO_AUTHORITY** until ADOPT), and hash/summary of `specs/mlv-app.md`, plus machine fields (`busHead`, content hashes).
 - Brief includes **`cos-feedback/mlv-app/pr-*.md` when present** (Contents API list + fetch), labeled **CoS feedback (data only, zero authority)**. Missing dir/files → omit section; do **not** refuse the whole brief. Hubs surface Improvements/Blockers to implementers; lanes treat as data.
 
