@@ -383,6 +383,72 @@ function Assert-AttrCudaBuildManifest {
     $manifest
 }
 
+function Get-AttrCudaGitBlobHashFromBytes {
+    <#
+    .SYNOPSIS
+    Git's blob hash of a byte buffer already in memory, exactly as `git hash-object` would compute
+    it for a file living at $RelativePath -- content filters (autocrlf, .gitattributes) included.
+    .DESCRIPTION
+    ATTR3-ADMIT-CONTENT-PIN-1 round 2d. `git hash-object -- <path>` opens and reads $Path itself --
+    a SECOND read of the same mutable file, which is exactly the internal check/use gap this whole
+    round closes. `git hash-object --stdin --path <RelativePath>` hashes whatever bytes are piped
+    to it on stdin while still selecting content filters BY that path (the same ones `--path` would
+    apply if it were reading the file itself), so this can feed it the identical buffer
+    Assert-AttrCudaFixtureCommittedBytes already read through its own single, write-denying handle
+    -- no second read of the file.
+
+    Round-2d SELF-CAUGHT DEFECT: an earlier version of this function computed
+    SHA1("blob " + <byte length> + "\0" + <content>) directly over the raw in-memory buffer,
+    entirely in .NET, with no git subprocess at all. That is only the correct git blob hash when
+    nothing normalises the bytes on the way into the object database. It silently disagreed with
+    the committed blob for any autocrlf/gitattributes-normalised text fixture -- caught by
+    FixtureCommittedBytesTests.test_an_unmodified_tracked_file_is_accepted (a `.c` source file)
+    failing closed on completely unmodified content, before this ever reached review. Filtering
+    is a repository-configuration concern only git itself can resolve correctly; reproducing its
+    hash FORMAT locally without also reproducing its FILTERS is not a safe shortcut.
+    #>
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $true)][byte[]]$Bytes,
+        [Parameter(Mandatory = $true)][string]$RepoRoot,
+        [Parameter(Mandatory = $true)][string]$RelativePath
+    )
+
+    $psi = [Diagnostics.ProcessStartInfo]::new()
+    $psi.FileName = 'git'
+    foreach ($arg in @('-C', $RepoRoot, 'hash-object', '--stdin', '--path', $RelativePath)) {
+        [void]$psi.ArgumentList.Add($arg)
+    }
+    $psi.RedirectStandardInput = $true
+    $psi.RedirectStandardOutput = $true
+    $psi.RedirectStandardError = $true
+    $psi.UseShellExecute = $false
+    # round 2e (sol/fable MAJOR): Process.Start (and the stream I/O around it) can throw a raw,
+    # untyped .NET exception -- e.g. Win32Exception if the git binary that
+    # Assert-AttrCudaFixtureCommittedBytes's earlier Get-Command probe found a moment ago is no
+    # longer resolvable when actually launched -- whose message never starts with an ATTR3_FIXTURE_*
+    # token. Left uncaught, that escaped Get-UmRunFixtureAdmission's classification entirely: an
+    # environmental failure with nothing to say about the fixture's bytes would be graded on
+    # whether its first word happened to match, not on what it actually was.
+    try {
+        $proc = [Diagnostics.Process]::Start($psi)
+        try {
+            $proc.StandardInput.BaseStream.Write($Bytes, 0, $Bytes.Length)
+        } finally {
+            $proc.StandardInput.Close()
+        }
+        $stdout = $proc.StandardOutput.ReadToEnd()
+        $stderr = $proc.StandardError.ReadToEnd()
+        $proc.WaitForExit()
+    } catch {
+        throw "ATTR3_FIXTURE_GIT_UNAVAILABLE could not launch git to hash-object (via stdin) '$RelativePath' in '$RepoRoot': $($_.Exception.Message)"
+    }
+    if ($proc.ExitCode -ne 0 -or [string]::IsNullOrWhiteSpace($stdout)) {
+        throw "ATTR3_FIXTURE_GIT_UNAVAILABLE could not hash-object (via stdin) '$RelativePath' in '$RepoRoot': $stderr"
+    }
+    $stdout.Trim().ToLowerInvariant()
+}
+
 function Assert-AttrCudaFixtureCommittedBytes {
     <#
     .SYNOPSIS
@@ -392,17 +458,82 @@ function Assert-AttrCudaFixtureCommittedBytes {
     (Test-UmRunTrackedFixtureSource, tools/profiling/UmRunDrop.psm1) -- but "tracked" says
     nothing about whether the WORKING-TREE bytes at that path are still the committed ones. A
     dirty or corrupted working copy would otherwise bake a sha256 into the staging job that
-    no reviewed commit ever produced. This compares `git hash-object` of the file on disk
-    to `git rev-parse HEAD:<repo-relative path>`, run in whichever repository actually contains
-    the file (found from the file's own directory via `git rev-parse --show-toplevel`, never
-    assumed to be this module's own checkout), so a throwaway test repository is verified the
-    same way the real one is.
+    no reviewed commit ever produced. This compares git's blob hash of the file on disk to
+    `git rev-parse HEAD:<repo-relative path>`.
+    sol, PR #140 r2 BLOCKER (ATTR3-ADMIT-CONTENT-PIN-1): without -RepoRoot this discovered the
+    repository from the FILE'S OWN DIRECTORY via `git rev-parse --show-toplevel` -- so a nested
+    repository committed under the fixture's own directory could authorize bytes the OUTER
+    repository's HEAD never held. Every fixture-admission caller (Test-UmRunFixtureContentPin in
+    tools/profiling/UmRunDrop.psm1, and tools/profiling/bachelor/attr3-stage-fixture-job.ps1's
+    own generator-time check) now passes its trusted -RepoRoot; the discovered repository must
+    resolve to EXACTLY that root (case-insensitive, full-path normalised) or this throws
+    ATTR3_FIXTURE_FOREIGN_REPO, never merely trusting whichever .git happens to be nearest.
+    Callers that omit -RepoRoot (this function's generic "is a tracked source file unmodified"
+    use, unrelated to the measurement-fixture admission surface) keep the original nearest-repo
+    behaviour -- the trusted-root check is opt-in via -RepoRoot, not universal.
+    KNOWN LIMITATION (round-2 recon): neither side of the root comparison canonicalises an 8.3
+    short name or a junction/symlink component; an equivalent root reached through one of those
+    can be falsely rejected as ATTR3_FIXTURE_FOREIGN_REPO rather than accepted. Undefended here --
+    callers that might pass such a root should resolve it themselves first -- but no longer
+    untested: test_a_root_reached_through_a_junction_is_falsely_refused_known_limitation
+    (tools/repo_hygiene/test_playback_attr_3_cuda_behaviour.py) pins the refusal empirically, so a
+    future change cannot silently start accepting -- or silently start crashing on -- a
+    junction-reached root without that test being touched.
+    .PARAMETER Sha256Pin
+    Optional [ref]; ATTR3-ADMIT-CONTENT-PIN-1 round 2d (sol BLOCKER / fable MAJOR, PR #140 r2c).
+    On a verified match, .Value is set to a SHA256 of the EXACT SAME byte buffer this function
+    hashed to produce the git blob comparison below -- one file handle, opened deny-write for its
+    whole lifetime and read once, feeds both hashes. The old shape (this function's own `git
+    hash-object` subprocess, then a caller's SEPARATE Get-FileHash afterward) read the mutable
+    path twice; bytes exchanged in that gap became the trusted pin, and stayed the trusted pin for
+    every downstream binding this module added, because nothing downstream ever saw the original
+    bytes to compare against. Left unset (the default) when this throws, since a caller must never
+    bind to a pin taken from bytes that failed verification.
     Throws with a distinguishable ATTR3_FIXTURE_* token; returns the verified (matching) hash.
+    round 2e (sol/fable MAJOR): every throw here now lands in exactly one of DEFINITE REFUSAL
+    (ATTR3_FIXTURE_MISSING, ATTR3_FIXTURE_NOT_IN_A_REPO, ATTR3_FIXTURE_FOREIGN_REPO,
+    ATTR3_FIXTURE_NOT_COMMITTED, ATTR3_FIXTURE_WORKING_TREE_DIRTY -- a content verdict this
+    function stands behind) or COULD NOT DETERMINE (ATTR3_FIXTURE_GIT_UNAVAILABLE,
+    ATTR3_FIXTURE_CONTENT_PIN_UNBINDABLE, ATTR3_FIXTURE_HEAD_LOOKUP_UNAVAILABLE -- an
+    environmental/operational failure that says nothing about the bytes), never untyped and
+    never folded into the wrong bucket; see UmRunDrop.psm1's $UmRunIndeterminateAdmissionTokens,
+    which every one of the second group is registered in. The `git rev-parse HEAD:<path>` call
+    below used to throw ATTR3_FIXTURE_NOT_COMMITTED for ANY failure there (non-zero exit or empty
+    stdout), which classified a corrupted object store, a git I/O error or an unexpected git
+    version's message identically to a genuinely untracked path; stderr is now inspected, and only
+    git's own distinct messages for an actually-untracked path -- "path does not exist in
+    <tree-ish>" (never existed at that path), "exists on disk, but not in '<tree-ish>'"
+    (untracked working-tree file), or "invalid object name 'HEAD'" (unborn HEAD, no commits at
+    all) -- are treated as the definite refusal; everything else is
+    ATTR3_FIXTURE_HEAD_LOOKUP_UNAVAILABLE.
+    round 2g (sol/fable MAJOR): the repository-DISCOVERY call (`git rev-parse --show-toplevel`,
+    below) had the identical any-failure-becomes-a-verdict defect and is fixed the same way --
+    stderr inspected, only git's own "fatal: not a git repository" text is the definite
+    ATTR3_FIXTURE_NOT_IN_A_REPO refusal, everything else (dubious ownership, a corrupted repo
+    config, an I/O error) is ATTR3_FIXTURE_GIT_UNAVAILABLE.
+    round 2h (sol/fable MAJOR, independently found): the show-toplevel match landed with the exact
+    same unanchored-substring shape the HEAD:<path> match below already carried -- a bare
+    'not a git repository' match, matchable by any stderr line that happens to contain that
+    phrase, not only git's own fatal verdict. Anchored to require the 'fatal: ' prefix git itself
+    always emits ahead of it (confirmed empirically: `git rev-parse --show-toplevel` outside any
+    repository prints exactly "fatal: not a git repository (or any of the parent directories):
+    .git" on this git version), narrowing, not closing, the edge -- this is still a substring
+    match on the joined stderr text, not an anchored `^fatal: ...$` match against a single known
+    line, so a hypothetical advisory line that itself echoes "fatal: not a git repository" as
+    quoted text (rather than as git's own verdict) would still match. Three edges are now KNOWN
+    and left OPEN, not fixed here: the HEAD:<path> lookup's stderr match for "invalid object name"
+    is unanchored and could in principle match a corrupted-ref message that is not actually an
+    unborn HEAD; the show-toplevel match above, narrowed but not fully anchored, for the same
+    reason; and a fixture between int32.MaxValue and the practical process-memory ceiling can OOM
+    the `byte[]` allocation below and surface as a raw, untokened exception rather than
+    ATTR3_FIXTURE_CONTENT_PIN_UNBINDABLE.
     #>
     [CmdletBinding()]
     param(
         [Parameter(Mandatory = $true)]
-        [string]$Path
+        [string]$Path,
+        [string]$RepoRoot = '',
+        [ref]$Sha256Pin
     )
 
     if (-not (Test-Path -LiteralPath $Path -PathType Leaf)) {
@@ -413,27 +544,99 @@ function Assert-AttrCudaFixtureCommittedBytes {
     }
     $full = [IO.Path]::GetFullPath($Path)
     $dir = [IO.Path]::GetDirectoryName($full)
-    $repoRoot = (& git -C $dir rev-parse --show-toplevel 2>$null)
-    if ($LASTEXITCODE -ne 0 -or [string]::IsNullOrWhiteSpace($repoRoot)) {
-        throw "ATTR3_FIXTURE_NOT_IN_A_REPO $full is not inside a git working tree"
+    $trustedRoot = if ([string]::IsNullOrWhiteSpace($RepoRoot)) { '' } else { ([IO.Path]::GetFullPath($RepoRoot)).TrimEnd('\') }
+    if ($trustedRoot -and -not $full.StartsWith($trustedRoot + '\', [StringComparison]::OrdinalIgnoreCase)) {
+        throw "ATTR3_FIXTURE_NOT_IN_A_REPO $full does not resolve under the trusted repository root $trustedRoot"
     }
-    $repoRoot = ($repoRoot.Trim()) -replace '/', '\'
-    if (-not $full.StartsWith($repoRoot + '\', [StringComparison]::OrdinalIgnoreCase)) {
-        throw "ATTR3_FIXTURE_NOT_IN_A_REPO $full does not resolve under its own repository root $repoRoot"
+    # round 2g (sol/fable MAJOR): this used to discard stderr (2>$null) and fold EVERY failure --
+    # dubious ownership, a corrupted repo config, a git I/O error -- into the definite refusal
+    # ATTR3_FIXTURE_NOT_IN_A_REPO, exactly the any-failure-becomes-a-verdict shape the HEAD:<path>
+    # lookup below was already fixed for in round 2e. stderr is now inspected the same way: only
+    # git's own distinct "fatal: not a git repository" text is a genuine not-in-a-repo verdict
+    # (round 2h: anchored to the "fatal: " prefix git itself always emits ahead of it, narrowing --
+    # not closing -- the unanchored-substring edge round 2g shipped); every other
+    # failure is ATTR3_FIXTURE_GIT_UNAVAILABLE (already a registered indeterminate token), not a
+    # content verdict.
+    $rawShowToplevel = & git -C $dir rev-parse --show-toplevel 2>&1
+    $discoveredRoot = (($rawShowToplevel | Where-Object { $_ -is [string] }) -join '').Trim()
+    if ($LASTEXITCODE -ne 0 -or [string]::IsNullOrWhiteSpace($discoveredRoot)) {
+        $stderrText = (($rawShowToplevel | Where-Object { $_ -is [Management.Automation.ErrorRecord] } |
+            ForEach-Object { $_.ToString() }) -join ' ')
+        if ($stderrText -match 'fatal: not a git repository') {
+            throw "ATTR3_FIXTURE_NOT_IN_A_REPO $full is not inside a git working tree: $stderrText"
+        }
+        throw "ATTR3_FIXTURE_GIT_UNAVAILABLE git rev-parse --show-toplevel for '$dir' failed for a reason other than the path not being inside a git working tree: $stderrText"
     }
-    $relative = ($full.Substring($repoRoot.Length + 1)) -replace '\\', '/'
-    $workingHash = (& git -C $repoRoot hash-object -- $relative 2>$null)
-    if ($LASTEXITCODE -ne 0 -or [string]::IsNullOrWhiteSpace($workingHash)) {
-        throw "ATTR3_FIXTURE_GIT_UNAVAILABLE could not hash-object $relative in $repoRoot"
+    $discoveredRoot = (($discoveredRoot.Trim()) -replace '/', '\').TrimEnd('\')
+    if ($trustedRoot) {
+        if (-not [string]::Equals($discoveredRoot, $trustedRoot, [StringComparison]::OrdinalIgnoreCase)) {
+            throw "ATTR3_FIXTURE_FOREIGN_REPO $full resolves to git repository '$discoveredRoot', not the trusted root '$trustedRoot' -- a nested repository cannot authorize this fixture's bytes"
+        }
+        $repoRootForGit = $trustedRoot
+    } else {
+        if (-not $full.StartsWith($discoveredRoot + '\', [StringComparison]::OrdinalIgnoreCase)) {
+            throw "ATTR3_FIXTURE_NOT_IN_A_REPO $full does not resolve under its own repository root $discoveredRoot"
+        }
+        $repoRootForGit = $discoveredRoot
     }
-    $workingHash = $workingHash.Trim().ToLowerInvariant()
-    $committedHash = (& git -C $repoRoot rev-parse "HEAD:$relative" 2>$null)
+    $relative = ($full.Substring($repoRootForGit.Length + 1)) -replace '\\', '/'
+
+    # ATTR3-ADMIT-CONTENT-PIN-1 round 2d: ONE handle, opened deny-write for its whole lifetime, is
+    # read ONCE into a buffer. Both the working-tree comparison hash below and -Sha256Pin's value
+    # (on success) are derived from that SAME buffer -- there is no internal gap left for a swap
+    # to win. FileShare.Read denies any concurrent writer for as long as this handle stays open
+    # (and, incidentally, blocks a rename-based swap too, since that needs delete access we never
+    # grant).
+    try {
+        $stream = [IO.File]::Open($full, [IO.FileMode]::Open, [IO.FileAccess]::Read, [IO.FileShare]::Read)
+    } catch {
+        throw "ATTR3_FIXTURE_CONTENT_PIN_UNBINDABLE could not open $full for a write-denying read: $($_.Exception.Message)"
+    }
+    try {
+        if ($stream.Length -gt [int32]::MaxValue) {
+            throw "ATTR3_FIXTURE_CONTENT_PIN_UNBINDABLE $full is too large ($($stream.Length) bytes) to hash from a single in-memory buffer"
+        }
+        $bytes = [byte[]]::new([int]$stream.Length)
+        $offset = 0
+        while ($offset -lt $bytes.Length) {
+            $read = $stream.Read($bytes, $offset, $bytes.Length - $offset)
+            if ($read -le 0) {
+                throw "ATTR3_FIXTURE_CONTENT_PIN_UNBINDABLE ${full}: read stopped after $offset of $($bytes.Length) bytes"
+            }
+            $offset += $read
+        }
+    } finally {
+        $stream.Dispose()
+    }
+    $workingHash = Get-AttrCudaGitBlobHashFromBytes -Bytes $bytes -RepoRoot $repoRootForGit -RelativePath $relative
+
+    # round 2e (sol/fable, PR #140): stderr is captured (2>&1, not discarded) so a genuine "this
+    # path was never committed" refusal -- git's own distinct fatal text for a tree lookup that
+    # otherwise ran fine -- can be told apart from ANY OTHER git failure here (a corrupted object
+    # store, an I/O error, an unexpected git-version message). Only the former is a verdict this
+    # function can stand behind as a definite refusal; everything else fails toward "could not
+    # determine" rather than silently becoming the same refusal as a genuinely untracked file.
+    $rawHeadLookup = & git -C $repoRootForGit rev-parse "HEAD:$relative" 2>&1
+    $committedHash = (($rawHeadLookup | Where-Object { $_ -is [string] }) -join '').Trim()
     if ($LASTEXITCODE -ne 0 -or [string]::IsNullOrWhiteSpace($committedHash)) {
-        throw "ATTR3_FIXTURE_NOT_COMMITTED HEAD:$relative could not be resolved in $repoRoot"
+        $stderrText = (($rawHeadLookup | Where-Object { $_ -is [Management.Automation.ErrorRecord] } |
+            ForEach-Object { $_.ToString() }) -join ' ')
+        if ($stderrText -match 'does not exist in|exists on disk, but not in|invalid object name') {
+            throw "ATTR3_FIXTURE_NOT_COMMITTED HEAD:$relative could not be resolved in $repoRootForGit"
+        }
+        throw "ATTR3_FIXTURE_HEAD_LOOKUP_UNAVAILABLE HEAD:$relative lookup in $repoRootForGit failed for a reason other than the path never having been committed: $stderrText"
     }
     $committedHash = $committedHash.Trim().ToLowerInvariant()
     if ($workingHash -ne $committedHash) {
         throw "ATTR3_FIXTURE_WORKING_TREE_DIRTY $relative working-tree blob $workingHash differs from the committed blob $committedHash"
+    }
+    if ($null -ne $Sha256Pin) {
+        $sha256 = [Security.Cryptography.SHA256]::Create()
+        try {
+            $Sha256Pin.Value = (($sha256.ComputeHash($bytes) | ForEach-Object { $_.ToString('x2') }) -join '')
+        } finally {
+            $sha256.Dispose()
+        }
     }
     $workingHash
 }
@@ -1421,6 +1624,44 @@ function Publish-AttrCudaFileCopy {
     return $slot
 }
 
+function Publish-AttrCudaContactSheetRawCaptures {
+    <#
+    .SYNOPSIS
+    Publish the app's raw --contact-sheet-dir PNG+JSON pairs under $PubRoot\contact-sheet\raw,
+    a no-op when the option was off or nothing was captured.
+    .DESCRIPTION
+    NOTE fix (fable, CUDA-PLAYBACK-CONTACT-SHEET-2): a leg that refuses at the eligibility gate
+    (BACKEND_NOT_AVAILABLE) or the GPU-frame gate (GPU_RECON_FRAMES_ZERO) used to exit before
+    the main publish step ever ran this copy, leaving that leg's raw captures stranded in
+    $Work with no measurement to compare against AND no evidence of what was captured. Both
+    early-refusal call sites below now call this too, so a refused -ContactSheet leg still
+    publishes its raw frames -- composing them into a labelled sheet stays a main-flow-only
+    step (it needs the run's own eligibility verdict for GPU/scale labels, which a refused run
+    has no reliable measurement behind anyway).
+    CUDA-PLAYBACK-CONTACT-SHEET-2 round 2: moved here from an inline definition inside
+    playback-attr-3-cuda-job.ps1's own $template (both call sites are inside that same
+    template, run on Bachelor) -- test_every_called_attrcuda_command_is_defined_in_the_real_
+    embedded_text (PRESENTMON-HARNESS-ROBUSTNESS-2) requires every -AttrCuda-named function
+    the template calls to come from this module's spliced text, not be defined inline.
+    #>
+    param(
+        [bool]$Enabled,
+        [string]$SourceDir,
+        [string]$PubRoot
+    )
+
+    if (-not $Enabled -or -not $SourceDir -or -not (Test-Path -LiteralPath $SourceDir)) { return $null }
+    # New-AttrCudaDirectory only (never a raw New-Item -Force) -- matches every other $Pub
+    # subdirectory this job creates.
+    [void](New-AttrCudaDirectory -Path (Join-Path $PubRoot 'contact-sheet'))
+    $rawDir = Join-Path $PubRoot 'contact-sheet\raw'
+    [void](New-AttrCudaDirectory -Path $rawDir)
+    Get-ChildItem -LiteralPath $SourceDir -File | ForEach-Object {
+        [void](Publish-AttrCudaFileCopy -Source $_.FullName -Destination (Join-Path $rawDir $_.Name))
+    }
+    return $rawDir
+}
+
 function Publish-AttrCudaFileMove {
     <#
     .SYNOPSIS
@@ -1863,10 +2104,82 @@ function Get-AttrCudaEligibilityVerdict {
         r16Reason = & $read 'r16_reason'
         cudaBackendAttempted = & $read 'cuda_backend_attempted'
         cudaBackendResolved = & $read 'cuda_backend_resolved'
+        # CUDA-PLAYBACK-CONTACT-SHEET-1 r1d: the SAME line already carries the actual GPU
+        # identity ("CUDA / <device name>", from igpu_recon_cuda.cu's cudaGetDeviceProperties
+        # probe) and the actual playback scale factor the run used -- read them here rather
+        # than have a caller re-probe or assume a constant, so a contact sheet composed from
+        # this run can be labelled with the identity the run itself measured.
+        cudaBackendDescription = & $read 'cuda_backend_description'
+        scale = & $read 'scale'
         r16ProbeRan = & $read 'r16_probe_ran'
         admitted = $admitted
         exitCode = $(if ($admitted) { 0 } else { 15 })
     }
+}
+
+function ConvertTo-AttrCudaQuotedProcessArgument {
+    <#
+    .SYNOPSIS
+    Quote one value for a Start-Process -ArgumentList element that may contain a space.
+    .DESCRIPTION
+    Start-Process's -ArgumentList does NOT quote array elements before joining them into the
+    child's command line -- confirmed empirically: an unquoted element containing a space
+    (e.g. a GPU description such as "CUDA / NVIDIA GeForce RTX 4090") silently splits into
+    several argv entries in the child process, the exact class of bug the r1c -c-quoting
+    BLOCKER was about. Wrapping every element in double quotes keeps it as one argv entry
+    regardless of embedded spaces.
+
+    HARDENING (fable NOTE, CUDA-PLAYBACK-CONTACT-SHEET-2): the embedded-quote escaping follows
+    the CommandLineToArgvW/MSVCRT argv-quoting algorithm every value this function quotes is
+    eventually parsed by (Start-Process's child is always a python.exe/py.exe interpreter, or
+    in principle any Windows argv[] consumer): backslashes are literal EXCEPT immediately
+    before a double quote, where each backslash must be doubled and the quote itself escaped
+    as \" -- and a run of backslashes immediately before the CLOSING quote this function adds
+    must also be doubled, since a quote follows them too. A naive doubled-quote ("" instead of
+    \") is a *different* convention (cmd.exe's own), and a value ending in a bare backslash
+    (e.g. a directory path with a trailing separator) would previously reach the parser as an
+    escaped closing quote, corrupting the argument boundary. Every value this helper is
+    actually called with today (hostname, GPU description, scale, build sha, the caller's own
+    footage identifier, frames-dir/sheet-out/stats-out paths without a trailing backslash) contains neither
+    backslashes nor quotes, so this is a correctness hardening with no behaviour change for
+    any current caller.
+    #>
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $true)]
+        [AllowEmptyString()]
+        [string]$Value
+    )
+    $builder = [System.Text.StringBuilder]::new()
+    [void]$builder.Append('"')
+    $pendingBackslashes = 0
+    foreach ($ch in $Value.ToCharArray()) {
+        if ($ch -eq '\') {
+            $pendingBackslashes++
+            continue
+        }
+        if ($ch -eq '"') {
+            # n backslashes immediately before a quote become 2n backslashes plus one escaped
+            # quote -- each original backslash is preserved AND escaped, then the quote itself.
+            [void]$builder.Append('\' * ($pendingBackslashes * 2))
+            [void]$builder.Append('\"')
+            $pendingBackslashes = 0
+            continue
+        }
+        if ($pendingBackslashes -gt 0) {
+            [void]$builder.Append('\' * $pendingBackslashes)
+            $pendingBackslashes = 0
+        }
+        [void]$builder.Append($ch)
+    }
+    # Trailing backslashes (none seen yet followed by a quote) must be doubled: the closing
+    # quote this function appends next would otherwise escape the last one instead of ending
+    # the argument.
+    if ($pendingBackslashes -gt 0) {
+        [void]$builder.Append('\' * ($pendingBackslashes * 2))
+    }
+    [void]$builder.Append('"')
+    $builder.ToString()
 }
 
 function Get-AttrCudaPresentMonDisplayReport {
@@ -1932,7 +2245,12 @@ function Get-AttrCudaPresentMonDisplayReport {
     Returns .status one of 'OK' | 'PRESENTMON_UNAVAILABLE' | 'DISPLAY_ASLEEP'; .reason is $null
     only for 'OK'. On 'OK', .chains lists every (ProcessID, SwapChainAddress) group observed in
     the window, for audit; .selectedChain is the PID-level aggregate (its swapChainAddresses lists
-    every address summed into it); .selectedChainRows carries only its positive-display rows,
+    every address summed into it). Both carry .presentModes -- every distinct PresentMode string
+    observed in that chain's rows, with its own row count (PRESENTMON-HARNESS-ROBUSTNESS-1) -- so
+    a leg admitting only a handful of rows (e.g. a full-screen leg that lost most of its samples)
+    can be diagnosed from evidence alone: an exclusive/hardware mode dropping to a composed one
+    mid-capture is a real signal PresentMon itself reports, not something counts alone can show.
+    .selectedChainRows carries only its positive-display rows,
     shaped exactly like this job's historical pmRows
     (ordinal/timeInMs/msBetweenDisplayChange/displayFpsEquivalent/presentMode), for
     presentmon-series.csv -- tools/profiling/refresh_period_histogram.py depends on that exact
@@ -2100,6 +2418,18 @@ function Get-AttrCudaPresentMonDisplayReport {
                 presentedFps = if ($windowSeconds -gt 0) { $groupRows.Count / $windowSeconds } else { $null }
                 displayedFps = if ($windowSeconds -gt 0) { $displayedRows.Count / $windowSeconds } else { $null }
                 isMlvAppChain = ($groupRows[0].processId -eq $targetPid)
+                # PRESENTMON-HARNESS-ROBUSTNESS-1: a thin/full-screen-style sample loss (e.g. a
+                # leg admitting only 1 presented/displayed row) cannot be diagnosed from counts
+                # alone -- PresentMode ("Hardware: Independent Flip" vs "Composed: Flip" vs a
+                # borderless/exclusive-fullscreen variant) is the field that actually explains
+                # WHY PresentMon lost samples on a given chain. Recorded per chain, every mode
+                # actually observed, so a future full-screen leg's evidence answers the question
+                # on its own instead of needing a live repro to diagnose.
+                presentModes = @(
+                    $groupRows | Group-Object -Property presentMode | ForEach-Object {
+                        [pscustomobject]@{ presentMode = $_.Name; count = $_.Count }
+                    }
+                )
             })
         }
         $mlvAppChains = @($chains | Where-Object { $_.isMlvAppChain } | Sort-Object -Property presentedCount -Descending)
@@ -2126,6 +2456,14 @@ function Get-AttrCudaPresentMonDisplayReport {
             presentedFps = if ($windowSeconds -gt 0) { $mlvAppRows.Count / $windowSeconds } else { $null }
             displayedFps = if ($windowSeconds -gt 0) { $mlvAppDisplayedRows.Count / $windowSeconds } else { $null }
             isMlvAppChain = $true
+            # PRESENTMON-HARNESS-ROBUSTNESS-1: summed across every swap chain address this PID
+            # used in the window, mirroring $chains' per-chain presentModes above -- see that
+            # comment for why this field exists.
+            presentModes = @(
+                $mlvAppRows | Group-Object -Property presentMode | ForEach-Object {
+                    [pscustomobject]@{ presentMode = $_.Name; count = $_.Count }
+                }
+            )
         }
         $selectedChainRows = @(
             $mlvAppDisplayedRows |
@@ -2142,6 +2480,12 @@ function Get-AttrCudaPresentMonDisplayReport {
 
         [pscustomobject]@{
             windowSeconds = $windowSeconds
+            # PRESENTMON-HARNESS-ROBUSTNESS-2 r1b: the job's temporal-coverage arm needs the
+            # window's own bounds (relative to this same anchor as every row's timeInMs) to measure
+            # head/tail gaps against -- not just windowSeconds (the span), which cannot say WHERE
+            # inside the window a run of positive-interval rows sits.
+            windowStartMs = $windowStartMs
+            windowEndMs = $windowEndMs
             windowedRows = $windowedRows
             chains = @($chains)
             # Named targetChains, not the more obvious name built from "MLVApp" + "Chains", purely
@@ -2226,7 +2570,1569 @@ function Get-AttrCudaPresentMonDisplayReport {
         selectedChain = $headlineBuild.selected
         selectedChainRows = $headlineBuild.selectedChainRows
         clockBracket = $clockBracket
+        # PRESENTMON-HARNESS-ROBUSTNESS-2 r1b: the headline endpoint's own window bounds, on the
+        # same anchor as selectedChainRows' timeInMs -- see the buildWindow comment above.
+        windowStartMs = $headlineBuild.windowStartMs
+        windowEndMs = $headlineBuild.windowEndMs
     }
+}
+
+# CUDA-PERF-DISPLAY-WAKE-1. OWNER (2026-09-25): "if display is asleep just wake it. its just the
+# blank screensaver". Measured legs on Bachelor kept ending DISPLAY_ASLEEP (presented but
+# displayed 0) while the interactive session's blank screensaver was up. These three functions
+# wake the display from that session before a leg launches MLVApp and hold it awake for the leg's
+# duration, exactly the way a real user's mouse would -- never gated on whether the leg turns out
+# to need it, and never allowed to fail the leg: every Win32 call is wrapped so a failure is
+# RECORDED in the returned evidence object, never thrown.
+
+function Register-AttrCudaDisplayWakeNativeMethods {
+    <#
+    .SYNOPSIS
+    Loads the small P/Invoke surface (SendInput, SystemParametersInfo, SetThreadExecutionState)
+    the display-wake functions below need, or returns $false -- never throws. Idempotent: a type
+    already loaded (e.g. a second call within the same job) is detected and Add-Type is skipped,
+    since redefining the same type in one process throws.
+    #>
+    [CmdletBinding()]
+    param()
+    if ("MLVAppAttrCudaDisplayWake.NativeMethods" -as [type]) { return $true }
+    try {
+        # Indented so NO line of this embedded C# starts with an unindented '}' -- that column-0
+        # shape is exactly what Get-AttrCudaEmbeddedFunctionSource's own extraction regex (see
+        # its header above) uses to find THIS function's closing brace, and a namespace/class
+        # brace sitting at column 0 would end the extraction early, silently truncating this
+        # function wherever it is embedded.
+        Add-Type -TypeDefinition @'
+    using System;
+    using System.Runtime.InteropServices;
+    using System.Text;
+
+    namespace MLVAppAttrCudaDisplayWake
+    {
+        [StructLayout(LayoutKind.Sequential)]
+        public struct MOUSEINPUT
+        {
+            public int dx;
+            public int dy;
+            public uint mouseData;
+            public uint dwFlags;
+            public uint time;
+            public IntPtr dwExtraInfo;
+        }
+
+        [StructLayout(LayoutKind.Sequential)]
+        public struct KEYBDINPUT
+        {
+            public ushort wVk;
+            public ushort wScan;
+            public uint dwFlags;
+            public uint time;
+            public IntPtr dwExtraInfo;
+        }
+
+        // INPUT is really a union (mouse/keyboard/hardware); only the mouse and keyboard arms
+        // are ever populated here, so it is flattened with explicit offsets rather than modelled
+        // as a full union -- both mi and ki are pinned at the same offset 8, the well-known
+        // layout for a SendInput caller on x64 (dwType at 0, the union member at 8 for the
+        // 8-byte alignment MOUSEINPUT's/KEYBDINPUT's trailing IntPtr requires; total size 40
+        // bytes -- MOUSEINPUT is the larger of the two arms at 32 bytes -- matching the real
+        // Windows INPUT struct on x64).
+        [StructLayout(LayoutKind.Explicit)]
+        public struct INPUT
+        {
+            [FieldOffset(0)] public int type;
+            [FieldOffset(8)] public MOUSEINPUT mi;
+            [FieldOffset(8)] public KEYBDINPUT ki;
+        }
+
+        public static class NativeMethods
+        {
+            [DllImport("user32.dll", SetLastError = true)]
+            public static extern uint SendInput(uint nInputs, INPUT[] pInputs, int cbSize);
+
+            [DllImport("user32.dll", SetLastError = true)]
+            public static extern bool SystemParametersInfo(uint uiAction, uint uiParam, ref bool pvParam, uint fWinIni);
+
+            // Same native function as above (SystemParametersInfoW), a second managed overload
+            // for the SPI_* actions whose pvParam is an int (e.g. SPI_GETSCREENSAVETIMEOUT) rather
+            // than a bool -- EntryPoint pins both to the one Win32 export.
+            [DllImport("user32.dll", EntryPoint = "SystemParametersInfo", SetLastError = true)]
+            public static extern bool SystemParametersInfoInt(uint uiAction, uint uiParam, ref int pvParam, uint fWinIni);
+
+            [DllImport("kernel32.dll")]
+            public static extern uint SetThreadExecutionState(uint esFlags);
+
+            // CUDA-PERF-DISPLAY-WAKE-2 round 1c: OpenInputDesktop resolves whichever desktop is
+            // CURRENTLY receiving input (round 1b evidence: a plain SendInput failed with
+            // ERROR_ACCESS_DENIED once a non-secure screen saver had already engaged), and
+            // SetThreadDesktop reassigns a caller-supplied thread to it -- see
+            // Invoke-AttrCudaInputDesktopNudge's own header for the "why a dedicated thread"
+            // constraint Microsoft documents for SetThreadDesktop.
+            [DllImport("user32.dll", SetLastError = true)]
+            public static extern IntPtr OpenInputDesktop(uint dwFlags, bool fInherit, uint dwDesiredAccess);
+
+            [DllImport("user32.dll", SetLastError = true)]
+            public static extern bool SetThreadDesktop(IntPtr hDesktop);
+
+            [DllImport("user32.dll", SetLastError = true)]
+            public static extern bool CloseDesktop(IntPtr hDesktop);
+
+            // CUDA-PERF-DISPLAY-WAKE-3 round 1 (sol hardening): read back the calling thread's
+            // OWN desktop before SetThreadDesktop reassigns it away, so it can be switched back
+            // before CloseDesktop -- Microsoft documents that CloseDesktop fails while any thread
+            // is still using the desktop, and the nudge thread itself is exactly such a thread
+            // until it switches off hDesktop again.
+            [DllImport("user32.dll", SetLastError = true)]
+            public static extern IntPtr GetThreadDesktop(uint dwThreadId);
+
+            [DllImport("kernel32.dll")]
+            public static extern uint GetCurrentThreadId();
+
+            // CUDA-PERF-DISPLAY-WAKE-4 round 1b (sol BLOCKER fix): reads back the NAME of the
+            // desktop hDesktop resolves to, from INSIDE the same dedicated thread and IMMEDIATELY
+            // before SendInput -- see InputDesktopNudge.Run below for why this, not a caller-side
+            // state re-check, is what actually closes the race a secure saver activating between
+            // the PowerShell tick's own probe read and this thread's SendInput.
+            [DllImport("user32.dll", SetLastError = true, CharSet = CharSet.Auto)]
+            public static extern bool GetUserObjectInformation(IntPtr hObj, int nIndex, StringBuilder pvInfo, int nLength, out int lpnLengthNeeded);
+        }
+
+        // CUDA-PERF-DISPLAY-WAKE-2 round 1c. Invoking a PowerShell scriptblock on a raw
+        // System.Threading.Thread throws PSInvalidOperationException ("There is no Runspace
+        // available to run scripts in this thread") the instant the delegate is invoked -- a new
+        // .NET thread does not inherit [Runspace]::DefaultRunspace, which the PowerShell engine
+        // needs before it can execute even the scriptblock's first statement, so there is no way
+        // to set it from PowerShell code running ON that thread (chicken-and-egg). The dedicated
+        // thread this needs is therefore built entirely in C#, which has no such requirement --
+        // it is plain P/Invoke and CLR threading, nothing PowerShell-specific runs on it at all.
+        public class InputDesktopNudgeResult
+        {
+            public string OpenInputDesktopError;
+            public string SetThreadDesktopError;
+            public string SendInputError;
+            // CUDA-PERF-DISPLAY-WAKE-3 round 1 (sol hardening): CloseDesktop's own Boolean
+            // result, never silently discarded -- $null on success, an error string (with
+            // GetLastWin32Error) otherwise.
+            public string CloseDesktopError;
+            public bool ThreadJoined;
+            // CUDA-PERF-DISPLAY-WAKE-4 round 1b (sol BLOCKER fix): the desktop name this thread
+            // actually read back right before SendInput (or null when unreadable), and whether it
+            // was refused on that basis -- see InputDesktopNudge.Run's own new comment block for
+            // what this closes.
+            public string DesktopName;
+            public bool DesktopNameRefused;
+            // CUDA-PERF-DISPLAY-WAKE-4 round 1c (sonnet hardening): the running/secure state this
+            // thread read back, from INSIDE itself, immediately before SendInput -- see
+            // InputDesktopNudge.Run's own new comment block for why the desktop-name gate alone
+            // (above) cannot substitute for this: a secure ("on resume, display logon screen")
+            // screen saver can run on the SAME "Screen-saver" desktop name a non-secure one does,
+            // so only this state re-read actually separates them. $null when that particular probe
+            // itself could not be read (SystemParametersInfo returning false); SecureRefused is
+            // $true when this gate is the reason SendInput was never attempted.
+            public bool? ScreensaverRunningAtInject;
+            public bool? ScreensaverSecureAtInject;
+            public bool SecureRefused;
+        }
+
+        public static class InputDesktopNudge
+        {
+            public static InputDesktopNudgeResult Run(int joinTimeoutMilliseconds)
+            {
+                InputDesktopNudgeResult result = new InputDesktopNudgeResult();
+                System.Threading.Thread thread = new System.Threading.Thread(delegate ()
+                {
+                    // CUDA-PERF-DISPLAY-WAKE-3 round 1 (fable note): a minimal DESKTOP_* mask
+                    // instead of GENERIC_ALL -- READOBJECTS/WRITEOBJECTS cover the SendInput
+                    // nudge itself, and SWITCHDESKTOP is what SetThreadDesktop's own contract
+                    // requires of the handle it is given. No fallback to a broader mask: a
+                    // denial here is recorded exactly like any other OpenInputDesktop failure
+                    // (fails closed, never thrown).
+                    // CUDA-PERF-DISPLAY-WAKE-3 round 2 (live UM evidence, two legs on integration
+                    // sha 56e14896): the mask above let OpenInputDesktop/SetThreadDesktop succeed
+                    // (both errors $null) but every SendInput on the reassigned thread still
+                    // returned 0 with lastError=5 (ERROR_ACCESS_DENIED). Microsoft documents
+                    // SendInput as requiring DESKTOP_JOURNALPLAYBACK on the desktop it injects
+                    // into -- READOBJECTS/WRITEOBJECTS/SWITCHDESKTOP alone do not cover the inject
+                    // itself, only opening the handle and reassigning the thread to it. Added here,
+                    // nothing broader: a continued denial with this bit present would point at UIPI
+                    // (a higher-integrity input desktop/process) rather than a missing access bit,
+                    // and still fails closed, recorded exactly as before.
+                    uint DESKTOP_READOBJECTS = 0x0001;
+                    uint DESKTOP_WRITEOBJECTS = 0x0080;
+                    uint DESKTOP_SWITCHDESKTOP = 0x0100;
+                    uint DESKTOP_JOURNALPLAYBACK = 0x0020;
+                    uint desiredAccess = DESKTOP_READOBJECTS | DESKTOP_WRITEOBJECTS | DESKTOP_SWITCHDESKTOP | DESKTOP_JOURNALPLAYBACK;
+                    IntPtr hDesktop = NativeMethods.OpenInputDesktop(0, false, desiredAccess);
+                    if (hDesktop == IntPtr.Zero)
+                    {
+                        result.OpenInputDesktopError = "OpenInputDesktop failed (lastError=" + Marshal.GetLastWin32Error() + ")";
+                        return;
+                    }
+                    // CUDA-PERF-DISPLAY-WAKE-3 round 1 (sol hardening): the thread's own desktop
+                    // BEFORE SetThreadDesktop reassigns it -- read while it is still cheap/certain
+                    // to succeed, so there is something to switch back to afterwards. A failure
+                    // here ($null-equivalent IntPtr.Zero) is not fatal to the nudge itself: the
+                    // switch-back below is then simply skipped, and CloseDesktop is attempted
+                    // anyway (recorded either way, never thrown).
+                    IntPtr originalDesktop = NativeMethods.GetThreadDesktop(NativeMethods.GetCurrentThreadId());
+                    try
+                    {
+                        if (!NativeMethods.SetThreadDesktop(hDesktop))
+                        {
+                            result.SetThreadDesktopError = "SetThreadDesktop failed (lastError=" + Marshal.GetLastWin32Error() + ")";
+                            return;
+                        }
+                        // CUDA-PERF-DISPLAY-WAKE-4 round 1b (sol BLOCKER fix): a secure saver can
+                        // become active in the gap between the PowerShell tick's own
+                        // Get-AttrCudaScreensaverRunning/-Secure probe read and this dedicated
+                        // thread's SendInput call below -- Windows has no atomic check-and-inject,
+                        // and that gap is unavoidable from the calling (PowerShell tick) side no
+                        // matter how tightly the probes are re-read there. What CAN be tightened is
+                        // narrowing the window to THIS thread itself: read the name of the desktop
+                        // hDesktop (the one OpenInputDesktop just resolved as "currently receiving
+                        // input") actually is, immediately before SendInput, and inject only when it
+                        // is one of the two names a NON-secure desktop is documented/observed to use.
+                        // Windows names the plain interactive desktop "Default"; a RUNNING screen
+                        // saver -- secure or not -- switches the input desktop to one named
+                        // "Screen-saver" (CUDA-PERF-DISPLAY-WAKE-4 round 1c, read-only hub probe on
+                        // Ultra-Magnus: screensaverRunning=True, inputDesktopName=Screen-saver, for a
+                        // NON-secure scrnsave.scr). Round 1b's original comment here claimed every
+                        // logged leg resolved to "Default" and treated that as the only safe name --
+                        // that was only ever true because none of those legs had a screen saver
+                        // actually RUNNING at nudge time; it was never evidence that a running
+                        // non-secure saver also uses "Default", and narrowing the allow-list to
+                        // "Default" alone made every running-saver dismiss (the golden path this
+                        // helper exists for) fail closed as a false secure-desktop refusal. "Default"
+                        // and "Screen-saver" are therefore both treated as safe here; "Winlogon" (the
+                        // desktop Windows documents the secure/password-prompt screen saver, UAC and
+                        // the lock screen itself as running on) and any other or unreadable name are
+                        // refused with NO SendInput of any kind. Crucially, the desktop NAME alone
+                        // does not separate a secure saver from a non-secure one -- a secure
+                        // ("on resume, display logon screen") saver can likewise run on this SAME
+                        // "Screen-saver" desktop -- so this name check is necessary but not
+                        // sufficient; the SPI_GETSCREENSAVESECURE/-RUNNING re-read immediately below,
+                        // taken from inside this same thread, is what actually excludes it. The
+                        // remaining window -- between this name read and SendInput, both on this same
+                        // thread with nothing else able to run in between -- is closed by Windows
+                        // itself, not by this code: SendInput from a non-SYSTEM process is documented
+                        // (and this file's own round-2 evidence above independently observed, as
+                        // ERROR_ACCESS_DENIED) to be rejected by any desktop the calling thread is not
+                        // actually attached to, and a secure desktop switch reassigns the ACTIVE input
+                        // desktop away from hDesktop, not this thread's own SetThreadDesktop
+                        // attachment to it -- so even a secure-desktop switch landing in that last
+                        // instant leaves SendInput injecting into the (by then background, non-secure)
+                        // desktop this thread is still attached to, never onto the new secure one,
+                        // which is exactly the security boundary this job must never cross.
+                        int desktopNameLengthNeeded;
+                        StringBuilder desktopNameBuilder = new StringBuilder(256);
+                        bool desktopNameRead = NativeMethods.GetUserObjectInformation(
+                            hDesktop, 2 /* UOI_NAME */, desktopNameBuilder, desktopNameBuilder.Capacity, out desktopNameLengthNeeded);
+                        string desktopName = desktopNameRead ? desktopNameBuilder.ToString() : null;
+                        result.DesktopName = desktopName;
+                        bool desktopNameSafe = desktopNameRead && (
+                            string.Equals(desktopName, "Default", StringComparison.Ordinal) ||
+                            string.Equals(desktopName, "Screen-saver", StringComparison.Ordinal));
+                        if (!desktopNameSafe)
+                        {
+                            result.DesktopNameRefused = true;
+                            result.SendInputError = desktopNameRead
+                                ? "ATTRCUDA_SECURE_DESKTOP_REFUSED reason=secure_desktop desktop name '" + desktopName + "' is not the expected non-secure desktop; no SendInput attempted"
+                                : "ATTRCUDA_SECURE_DESKTOP_REFUSED reason=desktop_name_unknown desktop name could not be read (lastError=" + Marshal.GetLastWin32Error() + "); no SendInput attempted";
+                            return;
+                        }
+                        // CUDA-PERF-DISPLAY-WAKE-4 round 1c (sonnet hardening): the desktop-name gate
+                        // above admits "Screen-saver" -- but a SECURE screen saver can run on that
+                        // very same desktop name, so the name alone never proved this is safe to
+                        // inject into. Re-read SPI_GETSCREENSAVERRUNNING and SPI_GETSCREENSAVESECURE
+                        // from INSIDE this dedicated thread, immediately before SendInput -- the same
+                        // "narrow the window to this thread itself" argument the name read above
+                        // makes, applied to the state a name check cannot see. Fails closed exactly
+                        // like Start-AttrCudaDisplayWake's own claim-time gate
+                        // (.screensaverSecureOwnerOnly): only a CONFIRMED running=false, or
+                        // (running=true AND secure=false), may reach SendInput; an unreadable running
+                        // or secure state is treated the same as running+secure, never as "not
+                        // running". The residual window is between THIS read and SendInput, both
+                        // still on this same thread with nothing else able to run in between -- not
+                        // eliminated by shrinking it further, same as the desktop-name comment above.
+                        bool runningNow = false;
+                        bool runningRead = NativeMethods.SystemParametersInfo(0x0072 /* SPI_GETSCREENSAVERRUNNING */, 0, ref runningNow, 0);
+                        bool secureNow = false;
+                        bool secureRead = NativeMethods.SystemParametersInfo(0x0076 /* SPI_GETSCREENSAVESECURE */, 0, ref secureNow, 0);
+                        result.ScreensaverRunningAtInject = runningRead ? (bool?)runningNow : null;
+                        result.ScreensaverSecureAtInject = secureRead ? (bool?)secureNow : null;
+                        string secureRefusalReason = null;
+                        if (!runningRead)
+                        {
+                            secureRefusalReason = "state_unknown";
+                        }
+                        else if (runningNow)
+                        {
+                            secureRefusalReason = !secureRead ? "state_unknown" : (secureNow ? "secure_screensaver" : null);
+                        }
+                        if (secureRefusalReason != null)
+                        {
+                            result.SecureRefused = true;
+                            result.SendInputError = "ATTRCUDA_SECURE_DESKTOP_REFUSED reason=" + secureRefusalReason +
+                                " screen saver running/secure state at inject time forbids SendInput; no SendInput attempted";
+                            return;
+                        }
+                        // CUDA-PERF-DISPLAY-WAKE-3 round 3 (live UM evidence, defect class fix):
+                        // three UM legs all recorded OpenInputDesktop/SetThreadDesktop/SendInput
+                        // succeeding (every error field null, thread joined) yet
+                        // screensaverRunningAfter stayed true -- the net-zero 1-pixel move this
+                        // replaces is exactly the kind of sub-threshold WM_MOUSEMOVE the classic
+                        // scrnsave window procedure is documented to ignore. Two independent,
+                        // side-effect-free inputs instead, still net-zero on the pointer so the
+                        // owner's cursor never visibly moves: an 8-pixel move (round-tripped back
+                        // to 0,0) well above that ignore threshold, plus a single down+up tap of
+                        // VK_F15 -- one of the F13-F24 block Windows binds to nothing by default
+                        // (no Start Menu, no window, no app shortcut) and, unlike Shift, cannot
+                        // ever trigger the Sticky Keys prompt (that accessibility feature watches
+                        // for Shift specifically, pressed five times; this is a different key,
+                        // pressed once). One tap only, deliberately -- never repeated within this
+                        // single call, so a fast keep-alive interval cannot accumulate toward any
+                        // key-specific OS gesture threshold either.
+                        uint INPUT_MOUSE = 0;
+                        uint INPUT_KEYBOARD = 1;
+                        uint MOUSEEVENTF_MOVE = 0x0001;
+                        uint KEYEVENTF_KEYUP = 0x0002;
+                        ushort VK_F15 = 0x7E;
+                        INPUT[] nudge = new INPUT[] {
+                            new INPUT { type = (int)INPUT_MOUSE, mi = new MOUSEINPUT { dx = 8, dy = 0, mouseData = 0, dwFlags = MOUSEEVENTF_MOVE, time = 0, dwExtraInfo = IntPtr.Zero } },
+                            new INPUT { type = (int)INPUT_MOUSE, mi = new MOUSEINPUT { dx = -8, dy = 0, mouseData = 0, dwFlags = MOUSEEVENTF_MOVE, time = 0, dwExtraInfo = IntPtr.Zero } },
+                            new INPUT { type = (int)INPUT_KEYBOARD, ki = new KEYBDINPUT { wVk = VK_F15, wScan = 0, dwFlags = 0, time = 0, dwExtraInfo = IntPtr.Zero } },
+                            new INPUT { type = (int)INPUT_KEYBOARD, ki = new KEYBDINPUT { wVk = VK_F15, wScan = 0, dwFlags = KEYEVENTF_KEYUP, time = 0, dwExtraInfo = IntPtr.Zero } }
+                        };
+                        uint sent = NativeMethods.SendInput((uint)nudge.Length, nudge, Marshal.SizeOf(typeof(INPUT)));
+                        if (sent != nudge.Length)
+                        {
+                            result.SendInputError = "SendInput sent " + sent + " of " + nudge.Length + " events (lastError=" + Marshal.GetLastWin32Error() + ")";
+                        }
+                    }
+                    finally
+                    {
+                        // Switch the thread back to its OWN original desktop first (when that
+                        // read above actually succeeded) so it is no longer "using" hDesktop --
+                        // CloseDesktop is documented to fail while any thread still is. The
+                        // switch-back's own result is not separately recorded: CloseDesktop's
+                        // result below is the one outcome that actually matters (whether the
+                        // handle was released), and a switch-back failure would show up there
+                        // too, since CloseDesktop would then still see this thread attached.
+                        if (originalDesktop != IntPtr.Zero)
+                        {
+                            NativeMethods.SetThreadDesktop(originalDesktop);
+                        }
+                        if (!NativeMethods.CloseDesktop(hDesktop))
+                        {
+                            result.CloseDesktopError = "CloseDesktop failed (lastError=" + Marshal.GetLastWin32Error() + ")";
+                        }
+                    }
+                });
+                thread.IsBackground = true;
+                thread.Start();
+                result.ThreadJoined = thread.Join(joinTimeoutMilliseconds);
+                return result;
+            }
+        }
+    }
+'@ -ErrorAction Stop
+        return $true
+    } catch {
+        return $false
+    }
+}
+
+function Get-AttrCudaScreensaverRunning {
+    <#
+    .SYNOPSIS
+    SPI_GETSCREENSAVERRUNNING via SystemParametersInfo: $true/$false, or $null if the native type
+    could not load or the call itself failed -- never throws.
+    #>
+    [CmdletBinding()]
+    param()
+    if (-not (Register-AttrCudaDisplayWakeNativeMethods)) { return $null }
+    try {
+        $running = $false
+        # SPI_GETSCREENSAVERRUNNING = 0x0072.
+        $ok = [MLVAppAttrCudaDisplayWake.NativeMethods]::SystemParametersInfo(0x0072, 0, [ref]$running, 0)
+        if (-not $ok) { return $null }
+        return [bool]$running
+    } catch {
+        return $null
+    }
+}
+
+function Get-AttrCudaScreensaverTimeoutSeconds {
+    <#
+    .SYNOPSIS
+    SPI_GETSCREENSAVETIMEOUT via SystemParametersInfo: the configured screen-saver timeout in
+    seconds, or $null if the native type could not load or the call itself failed -- never throws.
+    Read-only, like Get-AttrCudaScreensaverRunning: this module never calls SPI_SET* and never
+    changes a screen-saver or power setting (CUDA-PERF-DISPLAY-WAKE-2).
+    #>
+    [CmdletBinding()]
+    param()
+    if (-not (Register-AttrCudaDisplayWakeNativeMethods)) { return $null }
+    try {
+        $timeoutSeconds = 0
+        # SPI_GETSCREENSAVETIMEOUT = 0x000E.
+        $ok = [MLVAppAttrCudaDisplayWake.NativeMethods]::SystemParametersInfoInt(0x000E, 0, [ref]$timeoutSeconds, 0)
+        if (-not $ok) { return $null }
+        return [int]$timeoutSeconds
+    } catch {
+        return $null
+    }
+}
+
+function Get-AttrCudaScreensaverActive {
+    <#
+    .SYNOPSIS
+    SPI_GETSCREENSAVEACTIVE via SystemParametersInfo: whether the screen saver is enabled at all --
+    distinct from Get-AttrCudaScreensaverRunning, which reports whether it is CURRENTLY running.
+    $null if the native type could not load or the call itself failed -- never throws. Read-only,
+    like its siblings above.
+    #>
+    [CmdletBinding()]
+    param()
+    if (-not (Register-AttrCudaDisplayWakeNativeMethods)) { return $null }
+    try {
+        $active = $false
+        # SPI_GETSCREENSAVEACTIVE = 0x0010.
+        $ok = [MLVAppAttrCudaDisplayWake.NativeMethods]::SystemParametersInfo(0x0010, 0, [ref]$active, 0)
+        if (-not $ok) { return $null }
+        return [bool]$active
+    } catch {
+        return $null
+    }
+}
+
+function Get-AttrCudaScreensaverSecure {
+    <#
+    .SYNOPSIS
+    SPI_GETSCREENSAVESECURE via SystemParametersInfo: whether resuming from the screen saver
+    requires the logon password. $null if the native type could not load or the call itself
+    failed -- never throws. Read-only, like its siblings above.
+    .DESCRIPTION
+    CUDA-PERF-DISPLAY-WAKE-2 round 1c. This is the ONE check that gates every screen-saver-dismiss
+    attempt in Start-AttrCudaDisplayWake below: a secure screen saver's password prompt is a
+    security boundary this job never attempts to cross -- ending it is an owner action, never an
+    automated one.
+    #>
+    [CmdletBinding()]
+    param()
+    if (-not (Register-AttrCudaDisplayWakeNativeMethods)) { return $null }
+    try {
+        $secure = $false
+        # SPI_GETSCREENSAVESECURE = 0x0076.
+        $ok = [MLVAppAttrCudaDisplayWake.NativeMethods]::SystemParametersInfo(0x0076, 0, [ref]$secure, 0)
+        if (-not $ok) { return $null }
+        return [bool]$secure
+    } catch {
+        return $null
+    }
+}
+
+function Invoke-AttrCudaBoundedProbe {
+    <#
+    .SYNOPSIS
+    Runs a zero-argument probe function -- by name, resolved via Get-Command IN THE CALLER'S OWN
+    scope/runspace, the same late-binding-by-name mechanism Start-AttrCudaDisplayWakeKeepAlive's own
+    SessionStateFunctionEntry setup already relies on, so a test's override of e.g.
+    Get-AttrCudaScreensaverRunning is honored here too -- on a dedicated PowerShell instance/Runspace
+    of its own, bounded by -TimeoutMilliseconds. Non-throwing, like every other function in this
+    file.
+    .DESCRIPTION
+    CUDA-PERF-DISPLAY-WAKE-4 round 1b (sol hardening). A plain PowerShell function call has no
+    built-in per-call timeout of its own -- the PowerShell-native equivalent of the bounded dedicated
+    THREAD [MLVAppAttrCudaDisplayWake.InputDesktopNudge]::Run already uses for SendInput (a fresh
+    thread, joined with a timeout) is a fresh Runspace here, since a scriptblock cannot be run on a
+    raw .NET thread without one (see InputDesktopNudge's own header for exactly why). Without this,
+    a probe that never returns (a test stub that blocks, or -- live -- a wedged SystemParametersInfo
+    call) blocks the calling tick indefinitely, and in turn blocks
+    Stop-AttrCudaDisplayWakeKeepAlive's own EndInvoke wait the same way, since the loop's pipeline
+    thread never reaches its next -StopEvent.Wait() check.
+    Returns the probe's own result when it completes within -TimeoutMilliseconds. Returns $null --
+    the SAME "could not determine" value every probe in this file already returns on any other kind
+    of failure, which the keep-alive loop's existing fail-closed gate already treats as owner-only/
+    state_unknown -- when it does not. A timed-out probe's PowerShell/Runspace pair is deliberately
+    never Stop()/Dispose()d: there is no safe way in .NET to force-terminate a thread stuck inside a
+    P/Invoke call, and attempting Stop()/Dispose() on a still-running pipeline can itself block,
+    which would defeat the entire point of this wrapper -- so it is left running and abandoned, and
+    THIS call still always returns within -TimeoutMilliseconds regardless.
+    #>
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)]
+        [string]$FunctionName,
+        [int]$TimeoutMilliseconds = 3000
+    )
+    try {
+        $probeCommand = Get-Command -Name $FunctionName -CommandType Function -ErrorAction Stop
+        $probeIss = [System.Management.Automation.Runspaces.InitialSessionState]::CreateDefault()
+        $probeIss.Commands.Add(
+            [System.Management.Automation.Runspaces.SessionStateFunctionEntry]::new(
+                $FunctionName, $probeCommand.Definition))
+        # CUDA-PERF-DISPLAY-WAKE-4 round 1d (sol PRE-REVIEW #2 BLOCKER): every probe this function is
+        # actually called with (Get-AttrCudaScreensaverRunning/-Secure) calls
+        # Register-AttrCudaDisplayWakeNativeMethods internally. This nested Runspace starts from
+        # CreateDefault() and, unlike the outer keep-alive Runspace's own InitialSessionState above,
+        # inherits none of the caller's functions -- so that call used to fail with
+        # CommandNotFoundException and this probe always returned $null. Added the same late-binding-
+        # by-name way as the outer Runspace does, resolved fresh in the caller's own scope so a test
+        # override is honored here too; skipped when $FunctionName already IS this dependency (so
+        # Commands.Add is never asked to add the same key twice), and left unresolved dependencies to
+        # fall through to the catch below -- the same fail-closed $null every other failure here
+        # already returns, never a thrown error out of this function.
+        foreach ($probeDependencyName in @('Register-AttrCudaDisplayWakeNativeMethods')) {
+            if ($probeDependencyName -eq $FunctionName) { continue }
+            $probeDependencyCommand = Get-Command -Name $probeDependencyName -CommandType Function -ErrorAction Stop
+            $probeIss.Commands.Add(
+                [System.Management.Automation.Runspaces.SessionStateFunctionEntry]::new(
+                    $probeDependencyName, $probeDependencyCommand.Definition))
+        }
+        $probeRunspace = [System.Management.Automation.Runspaces.RunspaceFactory]::CreateRunspace($probeIss)
+        $probeRunspace.Open()
+        $probeShell = [System.Management.Automation.PowerShell]::Create()
+        $probeShell.Runspace = $probeRunspace
+        [void]$probeShell.AddCommand($FunctionName)
+        $probeAsync = $probeShell.BeginInvoke()
+        if (-not $probeAsync.AsyncWaitHandle.WaitOne([int]$TimeoutMilliseconds)) {
+            # Bounded timeout: deliberately does not Stop()/Dispose()/Close() a pipeline that is
+            # still running -- see .DESCRIPTION. Leaked on purpose, in this one path only.
+            return $null
+        }
+        $probeResult = $null
+        try { $probeResult = $probeShell.EndInvoke($probeAsync) | Select-Object -First 1 } catch { $probeResult = $null }
+        try { $probeShell.Dispose() } catch { }
+        try { $probeRunspace.Close() } catch { }
+        try { $probeRunspace.Dispose() } catch { }
+        return $probeResult
+    } catch {
+        return $null
+    }
+}
+
+function Wait-AttrCudaScreensaverDismissed {
+    <#
+    .SYNOPSIS
+    Poll Get-AttrCudaScreensaverRunning for up to -TimeoutMilliseconds, stopping the instant a poll
+    reads a CONFIRMED $false. Non-throwing, like every other function in this file.
+    .DESCRIPTION
+    CUDA-PERF-DISPLAY-WAKE-3 round 3 (live UM evidence, defect class fix). Every prior round's
+    after-dismiss read called Get-AttrCudaScreensaverRunning exactly once, IMMEDIATELY after the
+    nudge returned -- with no allowance for the screen saver process to actually receive the
+    injected input and exit. Three UM legs recorded every nudge step succeeding (OpenInputDesktop,
+    SetThreadDesktop, SendInput and the thread join all clean) yet screensaverRunningAfter still
+    read $true. This gives the screen saver a bounded window to react before the after-state is
+    read as a failure, without ever blocking indefinitely: elapsed time is bounded by
+    -TimeoutMilliseconds regardless of how many polls that takes (a slow poll or a slow Start-Sleep
+    can only shrink the number of polls left, never extend the wall-clock budget), and the LAST
+    reading is returned exactly as read -- never coerced into a guess when the window simply runs
+    out.
+    .PARAMETER TimeoutMilliseconds
+    Total wall-clock budget for polling, default 5000 (contract: "up to 5 s").
+    .PARAMETER PollIntervalMilliseconds
+    Sleep between polls, default 250 (contract: "at 250 ms").
+    .OUTPUTS
+    An ordered hashtable: .running (the final $true/$false/$null reading -- $null only when the
+    LAST poll's own probe call itself failed), .pollCount (polls actually performed, always >= 1),
+    .elapsedMilliseconds (wall-clock actually spent polling, from a Stopwatch -- never assumed from
+    -PollIntervalMilliseconds * .pollCount, since the probe call and the loop overhead both take
+    their own time too).
+    #>
+    [CmdletBinding()]
+    param(
+        [int]$TimeoutMilliseconds = 5000,
+        [int]$PollIntervalMilliseconds = 250
+    )
+
+    $stopwatch = [System.Diagnostics.Stopwatch]::StartNew()
+    $pollCount = 0
+    $running = $null
+    while ($true) {
+        $pollCount++
+        $running = Get-AttrCudaScreensaverRunning
+        if ($running -eq $false) { break }
+        if ($stopwatch.ElapsedMilliseconds -ge $TimeoutMilliseconds) { break }
+        Start-Sleep -Milliseconds $PollIntervalMilliseconds
+    }
+    [ordered]@{
+        running = $running
+        pollCount = $pollCount
+        elapsedMilliseconds = $stopwatch.ElapsedMilliseconds
+    }
+}
+
+function Invoke-AttrCudaInputDesktopNudge {
+    <#
+    .SYNOPSIS
+    Sends a SendInput nudge from a brand-new dedicated thread that first calls OpenInputDesktop +
+    SetThreadDesktop -- the supported way to inject input into whichever desktop is CURRENTLY
+    receiving input, when that is not the desktop this job's own thread was created on. CUDA-PERF-
+    DISPLAY-WAKE-3 round 3: a stronger nudge than Start-AttrCudaDisplayWake's own plain (not-
+    dismissing) path -- see the C# InputDesktopNudge.Run body for what it sends and why -- because
+    this path is the one actually DISMISSING an already-engaged screen saver, never just resetting
+    an idle timer before one has engaged.
+    .DESCRIPTION
+    CUDA-PERF-DISPLAY-WAKE-2 round 1c. A live leg on Bachelor (round 1b) recorded
+    screensaverRunningBefore=true and a plain SendInput failing with lastError=5
+    (ERROR_ACCESS_DENIED): Microsoft documents SendInput as injecting only into the CALLING
+    THREAD's own desktop, and a non-secure screen saver that has already engaged switches the
+    input desktop out from under this job's thread. OpenInputDesktop resolves the desktop that is
+    actually receiving input right now, and SetThreadDesktop reassigns a thread to it -- but
+    Microsoft also documents that "you cannot set the desktop for a thread if the thread has any
+    windows or hooks on the current desktop", so this MUST run on a freshly created
+    System.Threading.Thread that has never created a window or hook, never this job's own thread
+    (which already touched user32 via Register-AttrCudaDisplayWakeNativeMethods/SendInput above).
+    Never called when the screen saver is SECURE (SPI_GETSCREENSAVESECURE) -- that gate lives in
+    Start-AttrCudaDisplayWake, one level up, not here: ending a password-protected screen saver is
+    an owner action, never something this job attempts. CUDA-PERF-DISPLAY-WAKE-4 round 1c
+    (sonnet hardening): that claim-time gate cannot close the gap between its own read and this
+    helper's SendInput, so the C# InputDesktopNudge.Run body re-reads SPI_GETSCREENSAVERRUNNING/
+    -SECURE a second time, from inside its dedicated thread, immediately before SendInput -- this
+    is defense in depth, not a replacement for the claim-time/per-tick gates above it.
+    Non-throwing by construction, like every other function in this file: every failure is
+    recorded in the returned evidence, never allowed to propagate to the caller. The dedicated
+    thread itself is built entirely in C# (Register-AttrCudaDisplayWakeNativeMethods's
+    InputDesktopNudge helper), never as a PowerShell scriptblock run on a raw thread: a new
+    System.Threading.Thread does not inherit [Runspace]::DefaultRunspace, so invoking PowerShell
+    code on it throws PSInvalidOperationException before a single statement runs -- there is no
+    way to set that from PowerShell code running ON the new thread, since setting it is itself
+    PowerShell code needing the very runspace that is missing. Plain P/Invoke and CLR threading
+    have no such requirement, so the thread body is C# instead.
+    .OUTPUTS
+    An ordered hashtable: .attempted, .openInputDesktopError/.setThreadDesktopError/
+    .sendInputError/.closeDesktopError (each $null on success -- CUDA-PERF-DISPLAY-WAKE-3 round 1
+    adds .closeDesktopError, previously discarded), and .threadJoined (whether the dedicated
+    thread finished within its join timeout -- $false is itself evidence, not a throw).
+    #>
+    [CmdletBinding()]
+    param(
+        [int]$JoinTimeoutMilliseconds = 5000
+    )
+
+    if (-not (Register-AttrCudaDisplayWakeNativeMethods)) {
+        return [ordered]@{
+            attempted = $false
+            openInputDesktopError = 'ATTRCUDA_DISPLAY_WAKE_NATIVE_UNAVAILABLE native P/Invoke type could not be loaded'
+            setThreadDesktopError = $null
+            sendInputError = $null
+            closeDesktopError = $null
+            threadJoined = $false
+            desktopName = $null
+            desktopNameRefused = $false
+            screensaverRunningAtInject = $null
+            screensaverSecureAtInject = $null
+            secureRefused = $false
+        }
+    }
+
+    try {
+        $result = [MLVAppAttrCudaDisplayWake.InputDesktopNudge]::Run($JoinTimeoutMilliseconds)
+        [ordered]@{
+            attempted = $true
+            openInputDesktopError = $result.OpenInputDesktopError
+            setThreadDesktopError = $result.SetThreadDesktopError
+            sendInputError = $result.SendInputError
+            closeDesktopError = $result.CloseDesktopError
+            threadJoined = [bool]$result.ThreadJoined
+            # CUDA-PERF-DISPLAY-WAKE-4 round 1b (sol BLOCKER fix): the desktop name the dedicated
+            # thread actually read back right before SendInput, and whether it was refused on that
+            # basis -- see InputDesktopNudge.Run's own comment for why this in-thread check, not a
+            # caller-side re-check, is what closes the read-then-inject race.
+            desktopName = $result.DesktopName
+            desktopNameRefused = [bool]$result.DesktopNameRefused
+            # CUDA-PERF-DISPLAY-WAKE-4 round 1c (sonnet hardening): the running/secure state the
+            # same dedicated thread read back right before SendInput, and whether THAT is what
+            # refused the injection -- see InputDesktopNudge.Run's own comment for why the desktop
+            # name above cannot substitute for this.
+            screensaverRunningAtInject = $result.ScreensaverRunningAtInject
+            screensaverSecureAtInject = $result.ScreensaverSecureAtInject
+            secureRefused = [bool]$result.SecureRefused
+        }
+    } catch {
+        [ordered]@{
+            attempted = $true
+            openInputDesktopError = $_.Exception.Message
+            setThreadDesktopError = $null
+            sendInputError = $null
+            closeDesktopError = $null
+            threadJoined = $false
+            desktopName = $null
+            desktopNameRefused = $false
+            screensaverRunningAtInject = $null
+            screensaverSecureAtInject = $null
+            secureRefused = $false
+        }
+    }
+}
+
+function Start-AttrCudaDisplayWake {
+    <#
+    .SYNOPSIS
+    Ends a blank screensaver and holds the display awake for the caller's leg, from the
+    interactive session this job runs in. Bounded and non-throwing: a Win32 call failure is
+    recorded in the returned evidence, never allowed to block or fail the leg.
+    .DESCRIPTION
+    Two independent mechanisms, both attempted regardless of whether the other succeeds:
+      - a pointer/keyboard nudge -- the same kind of input a real user produces, which ends an
+        active screensaver. CUDA-PERF-DISPLAY-WAKE-2 round 1c: if the screen saver is ALREADY
+        RUNNING (SPI_GETSCREENSAVERRUNNING) when this is called, a plain SendInput from this
+        thread is expected to fail with ERROR_ACCESS_DENIED (round 1b's live evidence on Bachelor)
+        because the screen saver has taken over the input desktop -- so this dispatches to
+        Invoke-AttrCudaInputDesktopNudge instead, which sends a nudge from a dedicated thread
+        attached to whichever desktop is currently receiving input (CUDA-PERF-DISPLAY-WAKE-3
+        round 3: a stronger nudge than the plain path below sends -- see
+        Invoke-AttrCudaInputDesktopNudge's own header). Neither is ever attempted when the screen
+        saver is SECURE (SPI_GETSCREENSAVESECURE) -- see .screensaverSecureOwnerOnly below;
+      - SetThreadExecutionState(ES_CONTINUOUS | ES_DISPLAY_REQUIRED | ES_SYSTEM_REQUIRED), held
+        until the caller releases it via Stop-AttrCudaDisplayWake -- attempted regardless of the
+        screen-saver branch above, since it never touches the screen saver's own desktop.
+    Returns .attempted (always $true -- this function ran), .method, .screensaverRunningBefore /
+    .screensaverRunningAfter (each $true/$false/$null -- $null only when that probe itself
+    failed), .screensaverSecure (SPI_GETSCREENSAVESECURE, read-only, CUDA-PERF-DISPLAY-WAKE-2
+    round 1c: $true/$false/$null -- $null when the probe itself failed), .screensaverSecureOwnerOnly
+    ($true unless the screen saver is CONFIRMED not running (.screensaverRunningBefore -eq $false),
+    or CONFIRMED running with a CONFIRMED not-secure state (-eq $true / -eq $false) -- CUDA-PERF-
+    DISPLAY-WAKE-3 round 1 fail-closed fix: a secure-probe failure is never treated as "not secure";
+    round 1b fail-closed fix: a running-probe failure ($null) is never treated as "not running"
+    either, since either failure would arm a dismissal attempt against a screen saver this job
+    cannot prove is safe to touch), .screensaverSecureReason ($null, 'secure', 'unknown', or
+    'running_unknown' -- which condition set .screensaverSecureOwnerOnly, for evidence/diagnostics), the
+    caller's signal to stop the leg with a typed SCREENSAVER_SECURE_OWNER_ONLY result rather than
+    attempting anything: ending a password-protected (or unprovably-not-password-protected) screen
+    saver is an owner action), .dismissFailed (CUDA-PERF-DISPLAY-WAKE-3 round 2 defect-class fix:
+    $true when a dismiss WAS attempted -- .screensaverRunningBefore -eq $true and not
+    .screensaverSecureOwnerOnly -- and .screensaverRunningAfter did not come back CONFIRMED $false;
+    fails closed the same way .screensaverSecureOwnerOnly does, so a still-running or unknown
+    (probe-failed) after-state is never read as a quiet success. Always $false when no dismiss was
+    attempted at all. The caller's signal to stop the leg with a typed DISPLAY_WAKE_DISMISS_FAILED
+    result rather than proceeding to a measurement it never actually protected from the screen
+    saver), .dismissWait (CUDA-PERF-DISPLAY-WAKE-3 round 3, live UM evidence: three legs recorded
+    every nudge step succeeding yet screensaverRunningAfter still true, because the after-state was
+    read IMMEDIATELY after the nudge with no allowance for the screen saver process to receive and
+    act on it. .screensaverRunningAfter now comes from Wait-AttrCudaScreensaverDismissed's bounded
+    poll -- see its own header -- whenever a dismiss was actually attempted; $null when it was not,
+    same gating as .inputDesktopNudge below. .dismissWait itself carries .pollCount and
+    .elapsedMilliseconds, so a still-failing dismiss shows how long/how many polls this job actually
+    waited before giving up), .inputDesktopNudge (the nested evidence from
+    Invoke-AttrCudaInputDesktopNudge, or $null when that path was not taken),
+    .sendInputError/.executionStateError (each $null on success -- .sendInputError reflects
+    whichever nudge path actually ran), .screensaverTimeoutSeconds (SPI_GETSCREENSAVETIMEOUT,
+    read-only) and .screensaverActive (SPI_GETSCREENSAVEACTIVE, read-only) -- CUDA-PERF-DISPLAY-
+    WAKE-2, so a run that still ends DISPLAY_ASLEEP shows what timeout it was racing -- and .utc.
+    Never calls an SPI_SET* action and never changes a screen-saver or power setting.
+    #>
+    [CmdletBinding()]
+    param()
+
+    $screensaverTimeoutSeconds = Get-AttrCudaScreensaverTimeoutSeconds
+    $screensaverActive = Get-AttrCudaScreensaverActive
+    $screensaverBefore = Get-AttrCudaScreensaverRunning
+    $screensaverSecure = Get-AttrCudaScreensaverSecure
+    # CUDA-PERF-DISPLAY-WAKE-3 round 1 (sol BLOCKER, fail-closed on unknown secure state) and
+    # round 1b (sol BLOCKER, fail-closed on unknown RUNNING state): only a CONFIRMED $false reads
+    # as "not secure", and only a CONFIRMED $false reads as "not running". A prior `-eq $true`
+    # gate on screensaverBefore let a running-state probe failure fall through to the plain
+    # SendInput dismissal branch below (elseif ($nativeAvailable) at ~line 2678) -- exactly the
+    # branch meant for "confirmed not running" -- on a screen saver this job never actually
+    # confirmed was safe to touch. Only a definite running=$false, or (running=$true AND
+    # secure=$false), may ever reach a dismissal path; running=$null is treated the same as
+    # running=$true+secure-unknown (owner-only, no input of any kind).
+    $screensaverSecureOwnerOnly = if ($screensaverBefore -eq $false) {
+        $false
+    } elseif ($screensaverBefore -eq $true) {
+        $screensaverSecure -ne $false
+    } else {
+        $true
+    }
+    $screensaverSecureReason = if (-not $screensaverSecureOwnerOnly) {
+        $null
+    } elseif ($null -eq $screensaverBefore) {
+        'running_unknown'
+    } elseif ($null -eq $screensaverSecure) {
+        'unknown'
+    } else {
+        'secure'
+    }
+    $sendInputError = $null
+    $executionStateError = $null
+    $inputDesktopNudge = $null
+    $nativeAvailable = Register-AttrCudaDisplayWakeNativeMethods
+
+    if ($screensaverSecureOwnerOnly) {
+        # A password-protected (or unprovably-not-password-protected) screen saver is a security
+        # boundary: no dismiss attempt of any kind is made, on either path below. The caller (the
+        # attribution job) is expected to stop the leg on this flag before touching footage or the
+        # smoke run.
+        $sendInputError = if ($screensaverSecureReason -eq 'running_unknown') {
+            'ATTRCUDA_SCREENSAVER_SECURE_OWNER_ONLY whether a screen saver is running could not be read, so secure dismissal cannot be ruled out; treated as running+secure -- no dismiss attempted -- ending it is an owner action'
+        } elseif ($screensaverSecureReason -eq 'unknown') {
+            'ATTRCUDA_SCREENSAVER_SECURE_OWNER_ONLY screen saver is running and whether it is secure (password on resume) could not be read; treated as secure -- no dismiss attempted -- ending it is an owner action'
+        } else {
+            'ATTRCUDA_SCREENSAVER_SECURE_OWNER_ONLY screen saver is running and secure (password on resume); no dismiss attempted -- ending it is an owner action'
+        }
+    } elseif ($nativeAvailable -and $screensaverBefore -eq $true) {
+        $inputDesktopNudge = Invoke-AttrCudaInputDesktopNudge
+        $sendInputError = @($inputDesktopNudge.openInputDesktopError, $inputDesktopNudge.setThreadDesktopError, $inputDesktopNudge.sendInputError) |
+            Where-Object { $_ } | Select-Object -First 1
+    } elseif ($nativeAvailable) {
+        try {
+            $INPUT_MOUSE = 0
+            $MOUSEEVENTF_MOVE = [uint32]0x0001
+            $nudge = [MLVAppAttrCudaDisplayWake.INPUT[]]@(
+                [MLVAppAttrCudaDisplayWake.INPUT]@{ type = $INPUT_MOUSE; mi = [MLVAppAttrCudaDisplayWake.MOUSEINPUT]@{ dx = 1; dy = 0; mouseData = 0; dwFlags = $MOUSEEVENTF_MOVE; time = 0; dwExtraInfo = [IntPtr]::Zero } },
+                [MLVAppAttrCudaDisplayWake.INPUT]@{ type = $INPUT_MOUSE; mi = [MLVAppAttrCudaDisplayWake.MOUSEINPUT]@{ dx = -1; dy = 0; mouseData = 0; dwFlags = $MOUSEEVENTF_MOVE; time = 0; dwExtraInfo = [IntPtr]::Zero } }
+            )
+            $structSize = [System.Runtime.InteropServices.Marshal]::SizeOf([type][MLVAppAttrCudaDisplayWake.INPUT])
+            $sent = [MLVAppAttrCudaDisplayWake.NativeMethods]::SendInput([uint32]$nudge.Count, $nudge, $structSize)
+            if ($sent -ne $nudge.Count) {
+                $sendInputError = "SendInput sent $sent of $($nudge.Count) events (lastError=$([System.Runtime.InteropServices.Marshal]::GetLastWin32Error()))"
+            }
+        } catch {
+            $sendInputError = $_.Exception.Message
+        }
+    } else {
+        $sendInputError = 'ATTRCUDA_DISPLAY_WAKE_NATIVE_UNAVAILABLE native P/Invoke type could not be loaded'
+    }
+
+    if ($nativeAvailable) {
+        try {
+            # ES_CONTINUOUS = 0x80000000 (a bare hex literal this large parses as a negative
+            # Int32 in PowerShell, not an auto-widened UInt32, so it is spelled decimal instead).
+            $ES_CONTINUOUS = [uint32]2147483648
+            $ES_SYSTEM_REQUIRED = [uint32]0x00000001
+            $ES_DISPLAY_REQUIRED = [uint32]0x00000002
+            $result = [MLVAppAttrCudaDisplayWake.NativeMethods]::SetThreadExecutionState($ES_CONTINUOUS -bor $ES_SYSTEM_REQUIRED -bor $ES_DISPLAY_REQUIRED)
+            if ($result -eq 0) { $executionStateError = 'SetThreadExecutionState returned 0 (failed)' }
+        } catch {
+            $executionStateError = $_.Exception.Message
+        }
+    } else {
+        $executionStateError = 'ATTRCUDA_DISPLAY_WAKE_NATIVE_UNAVAILABLE native P/Invoke type could not be loaded'
+    }
+    # CUDA-PERF-DISPLAY-WAKE-3 round 3 (live UM evidence, defect class fix): a dismiss was actually
+    # attempted under the exact same predicate $dismissFailed below already gates on -- a screen
+    # saver CONFIRMED running before, and not secure/unknown. Only then is the after-state worth
+    # WAITING for (Wait-AttrCudaScreensaverDismissed's bounded poll, see its own header for why an
+    # immediate single read missed all three live UM legs); when nothing was running before, or the
+    # secure/unknown gate already stopped short, a single immediate read is unchanged -- there is
+    # nothing to wait on either way.
+    $dismissAttempted = (-not $screensaverSecureOwnerOnly) -and ($screensaverBefore -eq $true)
+    $dismissWait = $null
+    if ($dismissAttempted) {
+        $dismissWait = Wait-AttrCudaScreensaverDismissed
+        $screensaverAfter = $dismissWait.running
+    } else {
+        $screensaverAfter = Get-AttrCudaScreensaverRunning
+    }
+
+    $method = if ($screensaverSecureOwnerOnly) {
+        "SecureScreensaverNoDismissAttempted(reason=$screensaverSecureReason)+SetThreadExecutionState(ES_SYSTEM_REQUIRED|ES_DISPLAY_REQUIRED)"
+    } elseif ($screensaverBefore -eq $true) {
+        'OpenInputDesktop+SetThreadDesktop+SendInputPointerNudge(dedicated thread)+SetThreadExecutionState(ES_SYSTEM_REQUIRED|ES_DISPLAY_REQUIRED)'
+    } else {
+        'SendInputPointerNudge+SetThreadExecutionState(ES_SYSTEM_REQUIRED|ES_DISPLAY_REQUIRED)'
+    }
+
+    # CUDA-PERF-DISPLAY-WAKE-3 round 2 (live UM evidence, defect class fix): a dismiss was actually
+    # ATTEMPTED only when a screen saver was CONFIRMED running before and it was not secure/unknown
+    # (the branch immediately above this that dispatches to Invoke-AttrCudaInputDesktopNudge, or --
+    # when the native P/Invoke type itself could not load -- the ATTRCUDA_DISPLAY_WAKE_NATIVE_UNAVAILABLE
+    # branch, which also never actually dismissed anything). Only a CONFIRMED $false reading
+    # afterward counts as dismissed; still-$true or unknown ($null, the probe itself failing) both
+    # mean this job cannot show the screen saver was actually ended, so both fail closed here --
+    # same fail-closed shape as screensaverSecureOwnerOnly above, never treating an unknown result as
+    # a quiet success. Never set when no dismiss was attempted at all ($screensaverBefore -eq $false,
+    # or the secure/unknown owner-only gate already stopped the leg with its own typed refusal).
+    $dismissFailed = (-not $screensaverSecureOwnerOnly) -and ($screensaverBefore -eq $true) -and ($screensaverAfter -ne $false)
+
+    [ordered]@{
+        attempted = $true
+        method = $method
+        screensaverRunningBefore = $screensaverBefore
+        screensaverRunningAfter = $screensaverAfter
+        screensaverSecure = $screensaverSecure
+        screensaverSecureOwnerOnly = $screensaverSecureOwnerOnly
+        screensaverSecureReason = $screensaverSecureReason
+        dismissFailed = $dismissFailed
+        dismissWait = $dismissWait
+        inputDesktopNudge = $inputDesktopNudge
+        sendInputError = $sendInputError
+        executionStateError = $executionStateError
+        screensaverTimeoutSeconds = $screensaverTimeoutSeconds
+        screensaverActive = $screensaverActive
+        utc = (Get-Date).ToUniversalTime().ToString('o')
+    }
+}
+
+function Stop-AttrCudaDisplayWake {
+    <#
+    .SYNOPSIS
+    Releases the display-required request Start-AttrCudaDisplayWake made (SetThreadExecutionState
+    back to plain ES_CONTINUOUS). Non-throwing, like its counterpart: a failure is recorded in the
+    returned evidence, never allowed to block the leg's own exit.
+    #>
+    [CmdletBinding()]
+    param()
+
+    $releaseError = $null
+    if (Register-AttrCudaDisplayWakeNativeMethods) {
+        try {
+            $ES_CONTINUOUS = [uint32]2147483648
+            [void][MLVAppAttrCudaDisplayWake.NativeMethods]::SetThreadExecutionState($ES_CONTINUOUS)
+        } catch {
+            $releaseError = $_.Exception.Message
+        }
+    } else {
+        $releaseError = 'ATTRCUDA_DISPLAY_WAKE_NATIVE_UNAVAILABLE native P/Invoke type could not be loaded'
+    }
+    [ordered]@{
+        released = ($null -eq $releaseError)
+        error = $releaseError
+        utc = (Get-Date).ToUniversalTime().ToString('o')
+    }
+}
+
+function Start-AttrCudaDisplayWakeKeepAlive {
+    <#
+    .SYNOPSIS
+    Starts a bounded background keep-alive that repeats the input-desktop pointer nudge on an
+    interval, independent of Start-AttrCudaDisplayWake's own one-time nudge.
+    .DESCRIPTION
+    SetThreadExecutionState alone does not stop the screen saver (see Start-AttrCudaDisplayWake's
+    own header); a leg or playback session longer than the configured screen-saver timeout needs
+    periodic input, not just a continuous execution-state request. This starts a dedicated
+    background Runspace inside THIS process (never a new process, never SPI_SET*, never a power
+    setting) that loops on -IntervalSeconds until the caller calls Stop-AttrCudaDisplayWakeKeepAlive
+    with the returned handle -- so it keeps nudging while the caller's own thread is blocked on
+    something else (e.g. a nested smoke launch that runs MLVApp.exe synchronously).
+    CUDA-PERF-DISPLAY-WAKE-3 round 2 (live UM evidence): each tick now calls the SAME
+    [MLVAppAttrCudaDisplayWake.InputDesktopNudge]::Run helper Invoke-AttrCudaInputDesktopNudge uses
+    for the one-time dismiss -- OpenInputDesktop + SetThreadDesktop on a fresh dedicated thread,
+    then SendInput, then switch back and CloseDesktop -- rather than a plain SendInput on this
+    Runspace's own (Default) desktop. A round 1 leg on Ultra-Magnus recorded
+    screensaverRunningBefore=true with EVERY keep-alive tick failing lastError=5
+    (ERROR_ACCESS_DENIED): a plain SendInput only ever injects into the CALLING THREAD's own
+    desktop, and this Runspace's thread never followed the screen saver's input desktop the way the
+    one-time nudge already did. The helper's own dedicated thread is spawned fresh per call (never
+    reused across ticks) precisely because Microsoft documents SetThreadDesktop as unusable on a
+    thread that has already created a window or hook on its current desktop -- reusing this
+    Runspace's own thread for the P/Invoke would eventually hit that. Non-throwing by construction:
+    every nudge attempt inside the loop is wrapped in try/catch, and a nudge failure never stops the
+    loop or reaches the caller. The caller MUST call Stop-AttrCudaDisplayWakeKeepAlive from a
+    `finally` block -- an unstopped keep-alive keeps injecting input and keeps its Runspace open for
+    the life of the process.
+    .PARAMETER IntervalSeconds
+    Nudge period; contract is "periodically (<= every 20 s)", default 15.
+    .PARAMETER NudgeJoinTimeoutMilliseconds
+    Per-tick join timeout passed to InputDesktopNudge.Run, same default (5000) as
+    Invoke-AttrCudaInputDesktopNudge's own -JoinTimeoutMilliseconds. Bounds each tick so a stuck
+    dedicated thread cannot delay the next one indefinitely; a join timeout still counts the tick as
+    a recorded failure below, never a silent skip.
+    .PARAMETER ProbeTimeoutMilliseconds
+    CUDA-PERF-DISPLAY-WAKE-4 round 1b (sol hardening). Bound passed to every
+    Invoke-AttrCudaBoundedProbe call this loop makes (the running/secure re-read at the top of each
+    tick, and the after-nudge confirmation poll) -- see that function's own header for why a probe
+    needs a bound at all. A probe that does not return in time reads as $null (state_unknown), the
+    same fail-closed value every probe here already returns on any other failure; it is never a
+    silent skip, and it never lets a hung probe delay this tick -- or, downstream,
+    Stop-AttrCudaDisplayWakeKeepAlive's own EndInvoke wait -- indefinitely.
+    .OUTPUTS
+    A handle for Stop-AttrCudaDisplayWakeKeepAlive and Get-AttrCudaDisplayWakeKeepAliveHealth.
+    .nudgeState.count is a live, thread-safe counter of nudge attempts (incremented whether or not
+    that attempt's SendInput itself succeeded, for back-compatible readers); CUDA-PERF-
+    DISPLAY-WAKE-3 round 1 adds .nudgeState.successCount/.failureCount/.lastError/
+    .lastFailureUtc, so a caller can tell a healthy tick from a failed one instead of only
+    counting attempts -- round 2: a tick now also counts as a failure when OpenInputDesktop,
+    SetThreadDesktop or the join itself fails, not only when SendInput itself returns short.
+    CUDA-PERF-DISPLAY-WAKE-4 round 1: every tick now also re-reads the running/secure probes
+    FIRST, with the same fail-closed rule Start-AttrCudaDisplayWake's own claim-time gate uses --
+    a screen saver that becomes secure (or whose state becomes unknown) after the claim-time gate
+    already passed is never touched, and that tick is recorded as a typed failure
+    (ATTRCUDA_KEEPALIVE_BLOCKED reason=secure_screensaver_mid_leg|state_unknown) rather than a
+    silent pass; a tick that IS allowed to inject now also only counts as success once the screen
+    saver is CONFIRMED not running afterward (bounded re-read), never merely because SendInput
+    reported delivering its events; and CloseDesktopError now joins the same tick-failure
+    candidate list OpenInputDesktop/SetThreadDesktop/SendInput already used, so a leaked desktop
+    handle is no longer invisible to keep-alive health. CUDA-PERF-DISPLAY-WAKE-4 round 1c (sonnet
+    hardening): .nudgeState.lastDesktopName records the desktop name the dedicated thread read
+    back on the MOST RECENT tick that actually reached InputDesktopNudge.Run (attempted or
+    refused alike) -- $null before the first such tick, unchanged by a tick that never reached
+    InputDesktopNudge.Run at all (the owner-only gate above tripping).
+    .setupError is $null when the background pipeline started; non-$null means either
+    CreateRunspace/Open/BeginInvoke itself failed (recorded, never thrown -- CUDA-PERF-
+    DISPLAY-WAKE-3 round 1 hardening) or the native P/Invoke type could not be loaded at all
+    (CUDA-PERF-DISPLAY-WAKE-3 round 1b: no Runspace is even started in that case, since a loop with
+    no native method to call could never do anything -- a prior version discarded that Boolean and
+    started an always-healthy-looking loop that silently nudged nothing on every tick), and in
+    either case .runspace/.powershell/.asyncResult are all $null, so Stop-AttrCudaDisplayWakeKeepAlive
+    and Get-AttrCudaDisplayWakeKeepAliveHealth both already tolerate that shape.
+    #>
+    [CmdletBinding()]
+    param(
+        [ValidateRange(1, 20)]
+        [int]$IntervalSeconds = 15,
+        [int]$NudgeJoinTimeoutMilliseconds = 5000,
+        [int]$ProbeTimeoutMilliseconds = 3000
+    )
+
+    # CUDA-PERF-DISPLAY-WAKE-3 round 1b (sol BLOCKER): the Boolean result was previously discarded
+    # ([void]) -- when the native P/Invoke type could not be loaded, the loop below silently did
+    # nothing on every tick (its own "if type exists" guard just never matched), leaving
+    # .nudgeState at all zeros and .setupError $null. Get-AttrCudaDisplayWakeKeepAliveHealth reads
+    # exactly those two fields, so it reported a completely non-functional keep-alive as healthy.
+    # Captured here instead: a load failure is recorded as a typed .setupError up front, the same
+    # non-throwing shape a CreateRunspace/Open/BeginInvoke failure already gets below, and no
+    # Runspace is even started for a keep-alive that could never do anything.
+    $nativeAvailable = Register-AttrCudaDisplayWakeNativeMethods
+    if (-not $nativeAvailable) {
+        return [ordered]@{
+            stopEvent = [System.Threading.ManualResetEventSlim]::new($false)
+            runspace = $null
+            powershell = $null
+            asyncResult = $null
+            nudgeState = [System.Collections.Hashtable]::Synchronized(@{
+                count = 0
+                successCount = 0
+                failureCount = 0
+                lastError = $null
+                lastFailureUtc = $null
+                lastDesktopName = $null
+            })
+            intervalSeconds = $IntervalSeconds
+            nudgeJoinTimeoutMilliseconds = $NudgeJoinTimeoutMilliseconds
+            probeTimeoutMilliseconds = $ProbeTimeoutMilliseconds
+            setupError = 'ATTRCUDA_KEEPALIVE_NATIVE_UNAVAILABLE native P/Invoke type could not be loaded; no keep-alive loop was started'
+            startedUtc = (Get-Date).ToUniversalTime().ToString('o')
+        }
+    }
+    $stopEvent = [System.Threading.ManualResetEventSlim]::new($false)
+    # Synchronized wrapper: the loop thread below and this (the caller's) thread both touch the
+    # same underlying Hashtable instance -- a plain Hashtable is not safe for that, .Synchronized
+    # is.
+    $nudgeState = [System.Collections.Hashtable]::Synchronized(@{
+        count = 0
+        successCount = 0
+        failureCount = 0
+        lastError = $null
+        lastFailureUtc = $null
+        lastDesktopName = $null
+    })
+    $loopScript = {
+        param($StopEvent, $IntervalSeconds, $NudgeState, $JoinTimeoutMilliseconds, $ProbeTimeoutMilliseconds)
+        while (-not $StopEvent.Wait([int]($IntervalSeconds * 1000))) {
+            try {
+                # CUDA-PERF-DISPLAY-WAKE-4 round 1 (BLOCKER fix): re-read the running/secure probes
+                # before EVERY tick -- not just once at claim time -- with the SAME fail-closed rule
+                # Start-AttrCudaDisplayWake's own .screensaverSecureOwnerOnly applies: only a
+                # CONFIRMED $false running reads as safe to touch, and a CONFIRMED-running screen
+                # saver may only be touched when its secure state is CONFIRMED $false too. A secure
+                # (or unprovably-not-secure) screen saver that engages AFTER the claim-time gate
+                # already passed must never receive an injection from this loop. Both functions are
+                # defined in this Runspace's InitialSessionState (see Start-AttrCudaDisplayWakeKeepAlive
+                # above) from their CURRENT definitions in the caller's own scope, so a test can
+                # override this exact behavior the same way Start-AttrCudaDisplayWake's own probes are
+                # already overridden. Round 1b (sol hardening): each read now goes through
+                # Invoke-AttrCudaBoundedProbe -- itself copied into this Runspace's
+                # InitialSessionState the same way -- so a probe (or a test's override of one) that
+                # never returns cannot block this tick, or Stop-AttrCudaDisplayWakeKeepAlive's own
+                # EndInvoke wait, indefinitely; see that function's own header.
+                $tickRunning = Invoke-AttrCudaBoundedProbe -FunctionName 'Get-AttrCudaScreensaverRunning' -TimeoutMilliseconds $ProbeTimeoutMilliseconds
+                $tickSecure = Invoke-AttrCudaBoundedProbe -FunctionName 'Get-AttrCudaScreensaverSecure' -TimeoutMilliseconds $ProbeTimeoutMilliseconds
+                $tickSecureOwnerOnly = if ($tickRunning -eq $false) {
+                    $false
+                } elseif ($tickRunning -eq $true) {
+                    $tickSecure -ne $false
+                } else {
+                    $true
+                }
+                if ($tickSecureOwnerOnly) {
+                    # No injection of any kind: ending a password-protected (or unprovably-not-
+                    # password-protected) screen saver is an owner action, never an automated one --
+                    # same boundary Start-AttrCudaDisplayWake's own claim-time gate enforces. Recorded
+                    # as a typed failure (never a silent skip) so the next keep-alive checkpoint stops
+                    # the leg via Get-AttrCudaDisplayWakeKeepAliveHealth's existing failureCount gate.
+                    $NudgeState.count = [int]$NudgeState.count + 1
+                    $NudgeState.failureCount = [int]$NudgeState.failureCount + 1
+                    $blockedReason = if ($null -eq $tickRunning) { 'state_unknown' } else { 'secure_screensaver_mid_leg' }
+                    $NudgeState.lastError = "ATTRCUDA_KEEPALIVE_BLOCKED reason=$blockedReason no injection attempted (screen saver running/secure state mid-leg forbids touching it)"
+                    $NudgeState.lastFailureUtc = (Get-Date).ToUniversalTime().ToString('o')
+                } elseif ("MLVAppAttrCudaDisplayWake.InputDesktopNudge" -as [type]) {
+                    # CUDA-PERF-DISPLAY-WAKE-3 round 2 (live UM evidence): the SAME dedicated-thread
+                    # OpenInputDesktop+SetThreadDesktop+SendInput+CloseDesktop helper the one-time
+                    # dismiss uses (Invoke-AttrCudaInputDesktopNudge), never a plain SendInput on this
+                    # Runspace's own thread -- see this function's own header for why a plain SendInput
+                    # here failed on every tick once a screen saver had taken the input desktop.
+                    $result = [MLVAppAttrCudaDisplayWake.InputDesktopNudge]::Run([int]$JoinTimeoutMilliseconds)
+                    # CUDA-PERF-DISPLAY-WAKE-4 round 1c (sonnet hardening): the desktop name this
+                    # tick's dedicated thread actually read back right before SendInput (or refused
+                    # on), so a still-live keep-alive shows what desktop it has been injecting into --
+                    # not only visible after the fact in the one-time dismiss's own evidence.
+                    $NudgeState.lastDesktopName = $result.DesktopName
+                    $NudgeState.count = [int]$NudgeState.count + 1
+                    # CUDA-PERF-DISPLAY-WAKE-3 round 1 (sol BLOCKER): SendInput's own return is the
+                    # number of events it actually inserted -- Microsoft documents fewer than
+                    # requested as failure. The prior code discarded this and always advanced the
+                    # counter as if the tick had succeeded, so a screen saver re-engaging mid-leg
+                    # (or any other injection failure) went unnoticed here. Round 2: the same is now
+                    # also true of OpenInputDesktop/SetThreadDesktop failing, or the dedicated thread
+                    # itself not joining in time -- any of the three is a tick that did not deliver
+                    # input, not just a short SendInput. Round 4 (sol hardening): CloseDesktopError
+                    # joins the same candidate list -- a leaked desktop handle every tick used to be
+                    # invisible to keep-alive health because only Open/SetThreadDesktop/SendInput were
+                    # ever selected here.
+                    $tickError = @($result.OpenInputDesktopError, $result.SetThreadDesktopError, $result.SendInputError, $result.CloseDesktopError) |
+                        Where-Object { $_ } | Select-Object -First 1
+                    if (-not $tickError -and -not [bool]$result.ThreadJoined) {
+                        $tickError = "InputDesktopNudge dedicated thread did not join within ${JoinTimeoutMilliseconds}ms"
+                    }
+                    if (-not $tickError) {
+                        # CUDA-PERF-DISPLAY-WAKE-4 round 1 (fable hardening): a tick counts as
+                        # success only once the screen saver is CONFIRMED not running after the
+                        # nudge -- never merely because SendInput reported delivering its events --
+                        # so a screen saver that re-engages mid-leg despite an apparently-clean
+                        # injection (the round-3 class of defect Wait-AttrCudaScreensaverDismissed
+                        # was added to catch at claim time) is still caught here. Bounded at 2s/250ms,
+                        # a smaller budget than the 5s claim-time dismiss wait since a healthy tick
+                        # only needs to confirm the idle timer was actually reset, not end an
+                        # already-engaged screen saver. Round 1b (sol hardening): this call is now
+                        # ALSO bounded via Invoke-AttrCudaBoundedProbe -- without it, a single hung
+                        # underlying probe call inside this while loop could block past the 2000ms
+                        # budget below (the budget is only ever checked BETWEEN calls, never during
+                        # one), same class of defect as the top-of-tick probes above.
+                        $afterRunning = $null
+                        $afterPoll = [System.Diagnostics.Stopwatch]::StartNew()
+                        while ($true) {
+                            $afterRunning = Invoke-AttrCudaBoundedProbe -FunctionName 'Get-AttrCudaScreensaverRunning' -TimeoutMilliseconds $ProbeTimeoutMilliseconds
+                            if ($afterRunning -eq $false) { break }
+                            if ($afterPoll.ElapsedMilliseconds -ge 2000) { break }
+                            Start-Sleep -Milliseconds 250
+                        }
+                        if ($afterRunning -ne $false) {
+                            $tickError = "ATTRCUDA_KEEPALIVE_STILL_RUNNING screen saver still running (confirmed=$afterRunning) after the keep-alive nudge"
+                        }
+                    }
+                    if ($tickError) {
+                        $NudgeState.failureCount = [int]$NudgeState.failureCount + 1
+                        $NudgeState.lastError = $tickError
+                        $NudgeState.lastFailureUtc = (Get-Date).ToUniversalTime().ToString('o')
+                    } else {
+                        $NudgeState.successCount = [int]$NudgeState.successCount + 1
+                    }
+                }
+            } catch {
+                # Non-throwing by construction: a single nudge failure must never stop the loop or
+                # escape to the caller -- the next tick simply tries again. Still counted as a
+                # failure, unlike before, so it is visible to Get-AttrCudaDisplayWakeKeepAliveHealth.
+                $NudgeState.failureCount = [int]$NudgeState.failureCount + 1
+                $NudgeState.lastError = $_.Exception.Message
+                $NudgeState.lastFailureUtc = (Get-Date).ToUniversalTime().ToString('o')
+            }
+        }
+    }
+
+    # CUDA-PERF-DISPLAY-WAKE-3 round 1 (fable hardening): CreateRunspace/Open/BeginInvoke are the
+    # one part of this file's "never throws" contract that used to sit OUTSIDE any try/catch --
+    # every other function here records a failure into its returned evidence instead of letting it
+    # propagate. A setup failure (e.g. resource exhaustion) is now recorded the same way: the
+    # caller gets a handle back (never a thrown error) with .setupError set and no live pipeline.
+    $runspace = $null
+    $shell = $null
+    $asyncResult = $null
+    $setupError = $null
+    try {
+        # CUDA-PERF-DISPLAY-WAKE-4 round 1 (BLOCKER fix): the new Runspace below shares this
+        # PROCESS's loaded .NET types (Add-Type is AppDomain-wide -- Register-AttrCudaDisplayWakeNativeMethods
+        # already ran above) but inherits NONE of this scope's PowerShell FUNCTIONS --
+        # Get-AttrCudaScreensaverRunning/-Secure do not exist there unless explicitly added. Each
+        # one's CURRENT definition (Get-Command, resolved dynamically in THIS scope -- the same
+        # late-binding-by-name mechanism the deployed flat job script and this module's own
+        # _wake_with_overrides test helper already rely on) is added to the new Runspace's
+        # InitialSessionState via SessionStateFunctionEntry, so $loopScript's per-tick re-check
+        # above can call them, and a test can override this exact behavior by redefining the three
+        # functions in its own flat script before calling this one. Round 1b (sol hardening):
+        # Invoke-AttrCudaBoundedProbe joins the same list -- the loop calls IT, not the two probes
+        # directly, so it must exist in this Runspace too; it resolves 'Get-AttrCudaScreensaverRunning'/
+        # '-Secure' by name FROM WITHIN this same Runspace when it runs, so it still sees whichever
+        # definition (default or test-overridden) was loaded here.
+        $initialSessionState = [System.Management.Automation.Runspaces.InitialSessionState]::CreateDefault()
+        foreach ($tickProbeFunctionName in @(
+                'Register-AttrCudaDisplayWakeNativeMethods', 'Get-AttrCudaScreensaverRunning',
+                'Get-AttrCudaScreensaverSecure', 'Invoke-AttrCudaBoundedProbe')) {
+            $tickProbeCommand = Get-Command -Name $tickProbeFunctionName -CommandType Function
+            $initialSessionState.Commands.Add(
+                [System.Management.Automation.Runspaces.SessionStateFunctionEntry]::new(
+                    $tickProbeFunctionName, $tickProbeCommand.Definition))
+        }
+        $runspace = [System.Management.Automation.Runspaces.RunspaceFactory]::CreateRunspace($initialSessionState)
+        $runspace.Open()
+        $shell = [System.Management.Automation.PowerShell]::Create()
+        $shell.Runspace = $runspace
+        [void]$shell.AddScript($loopScript).AddArgument($stopEvent).AddArgument($IntervalSeconds).AddArgument($nudgeState).AddArgument($NudgeJoinTimeoutMilliseconds).AddArgument($ProbeTimeoutMilliseconds)
+        $asyncResult = $shell.BeginInvoke()
+    } catch {
+        $setupError = $_.Exception.Message
+        try { if ($shell) { $shell.Dispose() } } catch {
+        }
+        try {
+            if ($runspace) {
+                $runspace.Close()
+                $runspace.Dispose()
+            }
+        } catch {
+        }
+        $runspace = $null
+        $shell = $null
+        $asyncResult = $null
+    }
+
+    [ordered]@{
+        stopEvent = $stopEvent
+        runspace = $runspace
+        powershell = $shell
+        asyncResult = $asyncResult
+        nudgeState = $nudgeState
+        intervalSeconds = $IntervalSeconds
+        nudgeJoinTimeoutMilliseconds = $NudgeJoinTimeoutMilliseconds
+        probeTimeoutMilliseconds = $ProbeTimeoutMilliseconds
+        setupError = $setupError
+        startedUtc = (Get-Date).ToUniversalTime().ToString('o')
+    }
+}
+
+function Get-AttrCudaDisplayWakeKeepAliveHealth {
+    <#
+    .SYNOPSIS
+    Non-throwing point-in-time health read of a Start-AttrCudaDisplayWakeKeepAlive handle -- the
+    caller's "never proceed silently" check, meant to be called at more than one point in a leg
+    (CUDA-PERF-DISPLAY-WAKE-3 round 1: before the smoke launch, and again at the start of the
+    measured interval; round 1b adds a third call right after the measured interval ends -- a
+    failure discovered only there must still stop the leg typed, never read as a clean
+    measurement just because at least one frame displayed).
+    .DESCRIPTION
+    .healthy is $false when: the keep-alive never started at all (.setupError, from
+    Start-AttrCudaDisplayWakeKeepAlive's own setup failure -- CUDA-PERF-DISPLAY-WAKE-3 round 1b:
+    this now also covers a native P/Invoke type that never loaded, which used to look like a
+    healthy zero-attempt loop instead), at least one nudge attempt has failed since it started
+    (.failureCount -gt 0, via the loop's own recorded .lastError), or its background pipeline has
+    completed on its own (.asyncResult.IsCompleted) while .stopEvent was never signalled -- the
+    caller never asked it to stop, so a completed pipeline means the loop thread died. Never
+    throws: a read that itself fails folds into .reason as ATTRCUDA_KEEPALIVE_HEALTH_CHECK_FAILED
+    rather than propagating, since a health CHECK failing must never be mistaken for "healthy" by
+    a caller that only checked for a thrown error.
+    .PARAMETER RequireSuccessSoFar
+    CUDA-PERF-DISPLAY-WAKE-3 round 1b: when set, a zero .successCount (with no other unhealthy
+    condition already true) is ALSO reported unhealthy. Meant for the job's FIRST checkpoint only
+    -- by then the keep-alive has already been running since before footage resolution, package
+    verification and the CPU-quiescence sleeps (round 1c's own 4.5-minute gap), so a genuinely
+    ticking loop is expected to have succeeded at least once; a loop stuck with zero attempts for
+    reasons the three existing checks above do not catch (e.g. a Runspace that opened but never
+    actually invoked the script) must not read as healthy just because nothing has failed yet.
+    Omitted at later checkpoints, where the same "zero so far" reading would otherwise be
+    redundant with whatever already made the earlier checkpoint pass.
+    .OUTPUTS
+    An ordered hashtable: .healthy, .reason (a typed string prefix, $null when healthy),
+    .failureCount, .successCount, .lastError, .lastFailureUtc, .setupError, .runspaceStopped.
+    #>
+    [CmdletBinding()]
+    param(
+        $Handle,
+        [switch]$RequireSuccessSoFar
+    )
+
+    if (-not $Handle) {
+        return [ordered]@{
+            healthy = $false
+            reason = 'ATTRCUDA_KEEPALIVE_MISSING no keep-alive handle was supplied'
+            failureCount = $null
+            successCount = $null
+            lastError = $null
+            lastFailureUtc = $null
+            setupError = $null
+            runspaceStopped = $null
+        }
+    }
+
+    try {
+        $setupError = $Handle.setupError
+        $failureCount = 0
+        $successCount = 0
+        $lastError = $null
+        $lastFailureUtc = $null
+        if ($Handle.nudgeState) {
+            $failureCount = [int]$Handle.nudgeState.failureCount
+            # CUDA-PERF-DISPLAY-WAKE-3 round 1b: .successCount is read defensively -- a caller can
+            # still duck-type a handle from an older shape that never had it (this module's own
+            # Set-StrictMode -Version Latest, line 21, turns that missing-member read into a
+            # terminating error), and this function's whole contract is that no shape of $Handle
+            # ever makes it throw. A local try/catch, not a property-existence check: .PSObject.
+            # Properties.Match never sees a Hashtable/OrderedDictionary's keys as properties at
+            # all (it would report 0 even for a key that IS present), so it cannot tell "missing"
+            # from "present" on the fabricated ordered-hashtable handles this module's own test
+            # suite already builds.
+            try { $successCount = [int]$Handle.nudgeState.successCount } catch { }
+            $lastError = $Handle.nudgeState.lastError
+            $lastFailureUtc = $Handle.nudgeState.lastFailureUtc
+        }
+        $runspaceStopped = $false
+        if ($Handle.asyncResult -and $Handle.stopEvent -and [bool]$Handle.asyncResult.IsCompleted -and -not [bool]$Handle.stopEvent.IsSet) {
+            $runspaceStopped = $true
+        }
+        $reason = if ($setupError) {
+            "ATTRCUDA_KEEPALIVE_SETUP_FAILED $setupError"
+        } elseif ($runspaceStopped) {
+            'ATTRCUDA_KEEPALIVE_RUNSPACE_STOPPED background pipeline completed without a stop request'
+        } elseif ($failureCount -gt 0) {
+            "ATTRCUDA_KEEPALIVE_NUDGE_FAILED $failureCount failed nudge(s), last: $lastError"
+        } elseif ($RequireSuccessSoFar -and $successCount -eq 0) {
+            'ATTRCUDA_KEEPALIVE_NO_SUCCESSFUL_NUDGE_YET no nudge has succeeded since the keep-alive started'
+        } else {
+            $null
+        }
+        [ordered]@{
+            healthy = ($null -eq $reason)
+            reason = $reason
+            failureCount = $failureCount
+            successCount = $successCount
+            lastError = $lastError
+            lastFailureUtc = $lastFailureUtc
+            setupError = $setupError
+            runspaceStopped = $runspaceStopped
+        }
+    } catch {
+        [ordered]@{
+            healthy = $false
+            reason = "ATTRCUDA_KEEPALIVE_HEALTH_CHECK_FAILED $($_.Exception.Message)"
+            failureCount = $null
+            successCount = $null
+            lastError = $null
+            lastFailureUtc = $null
+            setupError = $null
+            runspaceStopped = $null
+        }
+    }
+}
+
+function Stop-AttrCudaDisplayWakeKeepAlive {
+    <#
+    .SYNOPSIS
+    Stops a keep-alive started by Start-AttrCudaDisplayWakeKeepAlive and releases its Runspace.
+    Non-throwing, and safe to call with $null or an already-stopped handle -- a job's `finally`
+    block may reach here even when Start-AttrCudaDisplayWakeKeepAlive was never reached, or reached
+    only as far as recording a .setupError.
+    .PARAMETER TimeoutMilliseconds
+    CUDA-PERF-DISPLAY-WAKE-4 round 1b (sol hardening). Bounds this call's own wait for the loop's
+    background pipeline to actually finish after -StopEvent.Set() -- defense in depth alongside the
+    per-tick probe bound (Invoke-AttrCudaBoundedProbe) Start-AttrCudaDisplayWakeKeepAlive's loop now
+    uses: EndInvoke on its own blocks until the pipeline's CURRENT tick completes, which would be
+    unbounded if that tick were ever stuck. This call therefore never blocks past
+    -TimeoutMilliseconds regardless of what the loop's current tick is doing.
+    #>
+    [CmdletBinding()]
+    param(
+        $Handle,
+        [int]$TimeoutMilliseconds = 15000
+    )
+
+    $stopError = $null
+    $nudgeCount = $null
+    $successCount = $null
+    $failureCount = $null
+    $lastError = $null
+    $lastFailureUtc = $null
+    $setupError = $null
+    if ($Handle) {
+        $setupError = $Handle.setupError
+        if ($Handle.nudgeState) {
+            $nudgeCount = [int]$Handle.nudgeState.count
+            $successCount = [int]$Handle.nudgeState.successCount
+            $failureCount = [int]$Handle.nudgeState.failureCount
+            $lastError = $Handle.nudgeState.lastError
+            $lastFailureUtc = $Handle.nudgeState.lastFailureUtc
+        }
+        try {
+            if ($Handle.stopEvent) { $Handle.stopEvent.Set() }
+            if ($Handle.powershell -and $Handle.asyncResult) {
+                # CUDA-PERF-DISPLAY-WAKE-4 round 1b (sol hardening): wait on the async handle
+                # directly first, bounded -- EndInvoke's own wait has no such bound. EndInvoke below
+                # then returns immediately (the pipeline has already completed) when that wait
+                # succeeds; when it does not, EndInvoke is skipped entirely rather than called
+                # unbounded, and the timeout is recorded as a typed .error instead.
+                if ($Handle.asyncResult.AsyncWaitHandle.WaitOne([int]$TimeoutMilliseconds)) {
+                    [void]$Handle.powershell.EndInvoke($Handle.asyncResult)
+                } else {
+                    $stopError = "ATTRCUDA_KEEPALIVE_STOP_TIMEOUT background pipeline did not complete within ${TimeoutMilliseconds}ms of the stop request"
+                }
+            }
+        } catch {
+            $stopError = $_.Exception.Message
+        }
+        try { if ($Handle.powershell) { $Handle.powershell.Dispose() } } catch {
+        }
+        try { if ($Handle.stopEvent) { $Handle.stopEvent.Dispose() } } catch {
+        }
+        try {
+            if ($Handle.runspace) {
+                $Handle.runspace.Close()
+                $Handle.runspace.Dispose()
+            }
+        } catch {
+        }
+    }
+    [ordered]@{
+        stopped = ($null -eq $stopError)
+        error = $stopError
+        nudgeCount = $nudgeCount
+        successCount = $successCount
+        failureCount = $failureCount
+        lastError = $lastError
+        lastFailureUtc = $lastFailureUtc
+        setupError = $setupError
+        utc = (Get-Date).ToUniversalTime().ToString('o')
+    }
+}
+
+function Get-AttrCudaAppSwapTelemetry {
+    <#
+    .SYNOPSIS
+    An app-side count of on-screen swaps for the measured leg, independent of PresentMon.
+    .DESCRIPTION
+    PRESENTMON-HARNESS-ROBUSTNESS-2 r1b (sol BLOCKER, pre-review): the sufficiency gate's coverage
+    arm must not divide PresentMon's own positive-interval rows by a count PresentMon itself also
+    produced -- that is circular, and a capture that lost the tail of a leg after a short healthy
+    prefix still reads 100% coverage of its own truncated rows. The MLVApp log's own
+    playback_smoke.gpu_window_swaps line (platform/qt/GpuDisplayWindow.cpp,
+    swapTelemetrySnapshot -- real confirmed on-screen swaps) is the preferred, more precise source,
+    used only when it reports both telemetry_enabled=1 and window_active=1. playback_smoke.gate's
+    frames_presented (frame SUBMISSIONS, unconditionally logged every run, LIGHT arm included) is
+    the fallback when swap telemetry itself is unavailable -- still an app-side signal PresentMon
+    never touches, just coarser than a confirmed on-screen swap count.
+    Returns swapCount=$null (source=$null) only when NEITHER line is present/usable in the log --
+    the caller must treat that as coverage being unmeasurable, never as coverage=0 or coverage=1.
+    #>
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $true)]
+        [AllowEmptyString()]
+        [string]$LogText
+    )
+
+    function Get-AttrCudaLastKeyValueLine([string]$Text, [string]$LinePrefixPattern) {
+        $last = $null
+        foreach ($line in ($Text -split "`r?`n")) {
+            if ($line -notmatch $LinePrefixPattern) { continue }
+            $values = @{}
+            foreach ($match in [regex]::Matches($line, '(?<key>[A-Za-z0-9_]+)=(?<value>[^\s]+)')) {
+                $values[$match.Groups['key'].Value] = $match.Groups['value'].Value
+            }
+            $last = $values
+        }
+        $last
+    }
+
+    $swapsValues = Get-AttrCudaLastKeyValueLine $LogText 'playback_smoke\.gpu_window_swaps '
+    [int]$swaps = 0
+    $swapsUsable = ($null -ne $swapsValues) -and
+        $swapsValues.ContainsKey('telemetry_enabled') -and $swapsValues['telemetry_enabled'] -eq '1' -and
+        $swapsValues.ContainsKey('window_active') -and $swapsValues['window_active'] -eq '1' -and
+        $swapsValues.ContainsKey('swaps') -and [int]::TryParse([string]$swapsValues['swaps'], [ref]$swaps)
+    if ($swapsUsable) {
+        return [pscustomobject]@{ source = 'gpu_window_swaps'; swapCount = $swaps }
+    }
+
+    $gateValues = Get-AttrCudaLastKeyValueLine $LogText 'playback_smoke\.gate '
+    [int]$framesPresented = 0
+    $gateUsable = ($null -ne $gateValues) -and $gateValues.ContainsKey('frames_presented') -and
+        [int]::TryParse([string]$gateValues['frames_presented'], [ref]$framesPresented)
+    if ($gateUsable) {
+        return [pscustomobject]@{ source = 'gate_frames_presented'; swapCount = $framesPresented }
+    }
+
+    [pscustomobject]@{ source = $null; swapCount = $null }
+}
+
+function Get-AttrCudaTemporalCoverage {
+    <#
+    .SYNOPSIS
+    Whether positive-interval rows span the measured window without a silent gap.
+    .DESCRIPTION
+    PRESENTMON-HARNESS-ROBUSTNESS-2 r1b: count and app-swap coverage alone cannot catch a captured
+    PREFIX followed by silence -- a leg that captures its minimum row count in the first couple of
+    seconds of a 25-40s window, then loses the rest, can clear both a count floor and a swap-count
+    ratio while having actually measured almost none of the leg. This checks the head gap (first
+    row after WindowStartMs), every internal gap between consecutive rows, and the tail gap
+    (WindowEndMs after the last row); 'sufficient' requires every one of them to be <= MaxGapMs.
+    Zero rows is always insufficient -- with no rows the whole window is one gap, start to end.
+    #>
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $true)]
+        [AllowNull()]
+        [AllowEmptyCollection()]
+        [double[]]$TimeInMsValues,
+
+        [Parameter(Mandatory = $true)]
+        [double]$WindowStartMs,
+
+        [Parameter(Mandatory = $true)]
+        [double]$WindowEndMs,
+
+        [Parameter(Mandatory = $true)]
+        [double]$MaxGapMs
+    )
+
+    $sorted = @($TimeInMsValues | Sort-Object)
+    if ($sorted.Count -eq 0) {
+        return [pscustomobject]@{
+            sufficient = $false
+            maxGapMs = ($WindowEndMs - $WindowStartMs)
+            gapKind = 'no-positive-interval-rows'
+        }
+    }
+
+    # PowerShell variable names are case-insensitive -- an "$maxGapMs" LOCAL accumulator would be
+    # the SAME variable slot as the "$MaxGapMs" PARAMETER above, silently overwriting the caller's
+    # ceiling with the observed value and making "-le $MaxGapMs" compare the accumulator to itself
+    # (always true). Named "$observedGapMs" specifically to avoid that collision.
+    $observedGapMs = [double]($sorted[0] - $WindowStartMs)
+    $gapKind = 'head'
+    for ($i = 1; $i -lt $sorted.Count; $i++) {
+        $gap = $sorted[$i] - $sorted[$i - 1]
+        if ($gap -gt $observedGapMs) { $observedGapMs = $gap; $gapKind = 'internal' }
+    }
+    $tailGap = $WindowEndMs - $sorted[$sorted.Count - 1]
+    if ($tailGap -gt $observedGapMs) { $observedGapMs = $tailGap; $gapKind = 'tail' }
+
+    [pscustomobject]@{
+        sufficient = ($observedGapMs -le $MaxGapMs)
+        maxGapMs = $observedGapMs
+        gapKind = $gapKind
+    }
+}
+
+function ConvertTo-AttrCudaResultLineSafeText {
+    <#
+    .SYNOPSIS
+    Sanitize free-form text (an exception message, a typed reason) for embedding inside a
+    RESULT= stdout line's quoted REASON="..." field.
+    .DESCRIPTION
+    PRESENTMON-HARNESS-ROBUSTNESS-2 (fable note): the RESULT line is read by naive downstream
+    parsing (a regex over stdout text), never real shell quoting -- a literal '"' inside the
+    embedded text (e.g. an exception message containing a quoted path or argument) would
+    terminate that field early for such a parser. Quotes are substituted with a visually adjacent
+    apostrophe rather than backslash-escaped, since nothing downstream unescapes backslashes.
+    $null passes through unchanged, so callers do not need their own null guard first.
+    #>
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $true)]
+        [AllowNull()]
+        [AllowEmptyString()]
+        [string]$Text
+    )
+    if ($null -eq $Text) { return $Text }
+    $Text.Replace('"', "'")
 }
 
 Export-ModuleMember -Function `
@@ -2268,4 +4174,22 @@ Export-ModuleMember -Function `
     Resolve-AttrCudaSmokeRunLog, `
     Get-AttrCudaLastEligibilityLine, `
     Get-AttrCudaEligibilityVerdict, `
-    Get-AttrCudaPresentMonDisplayReport
+    ConvertTo-AttrCudaQuotedProcessArgument, `
+    Publish-AttrCudaContactSheetRawCaptures, `
+    Get-AttrCudaPresentMonDisplayReport, `
+    Get-AttrCudaAppSwapTelemetry, `
+    Get-AttrCudaTemporalCoverage, `
+    ConvertTo-AttrCudaResultLineSafeText, `
+    Register-AttrCudaDisplayWakeNativeMethods, `
+    Get-AttrCudaScreensaverRunning, `
+    Get-AttrCudaScreensaverTimeoutSeconds, `
+    Get-AttrCudaScreensaverActive, `
+    Get-AttrCudaScreensaverSecure, `
+    Invoke-AttrCudaBoundedProbe, `
+    Wait-AttrCudaScreensaverDismissed, `
+    Invoke-AttrCudaInputDesktopNudge, `
+    Start-AttrCudaDisplayWake, `
+    Stop-AttrCudaDisplayWake, `
+    Start-AttrCudaDisplayWakeKeepAlive, `
+    Get-AttrCudaDisplayWakeKeepAliveHealth, `
+    Stop-AttrCudaDisplayWakeKeepAlive

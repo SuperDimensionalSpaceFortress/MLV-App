@@ -328,15 +328,34 @@ pwsh -NoProfile -File "tools\profiling\um-run.ps1" `
 
 ## 5. Extract the histogram
 
-Pull `presentmon-series.csv` and `logs\smoke-run.log` from the attribution artifacts, then:
-
 ```powershell
 py -3 tools\profiling\refresh_period_histogram.py `
-    --presentmon-csv <artifacts-dir>\presentmon-series.csv `
-    --frame-log <artifacts-dir>\logs\smoke-run.log `
+    --artifacts-dir <artifacts-dir> `
     --refresh-period-ms <Bachelor's panel refresh period in ms> `
     --out <artifacts-dir>\refresh-period-histogram.json
 ```
+
+`--artifacts-dir` is the leg's own published artifact root (`evidence-manifest.json`'s
+`artifactRoot`). It does three things at once: `--presentmon-csv`/`--frame-log` default to the
+standard paths inside it (`presentmon-series.csv`, `logs\smoke-run.log`), and
+the leg's `presentMonStatus` (and reason) is ALWAYS read from its `summary.json` (preferred) or
+`evidence-manifest.json` (`presentMon.status`/`statusReason`) and is authoritative.
+
+**PRESENTMON-HARNESS-ROBUSTNESS-3: one leg, one status.** With `--artifacts-dir`, an explicit
+`--presentmon-status` may only AGREE with the leg's published status (a contradiction is refused, exit 1), and
+explicit `--presentmon-csv`/`--frame-log` must resolve INSIDE that directory (another leg's data is refused), so one
+leg's `ok` can never authorize another leg's capture. The emitted report always carries `presentMonStatus`
+and `presentMonStatusReason`.
+
+**PRESENTMON-HARNESS-ROBUSTNESS-2 (sol BLOCKER, pre-review): the status is not optional.** This
+tool refuses to compute a histogram at all -- before reading either input file -- unless it knows
+the leg's own `presentMonStatus`: pass `--artifacts-dir` (preferred, above) so it is read
+automatically, or pass `--presentmon-status`/`--presentmon-status-reason` explicitly (e.g. against
+a bare csv with no published artifacts dir). Omitting BOTH is a refusal (exit 1), never a
+histogram computed from evidence whose sufficiency was never checked. A non-`'ok'` status (e.g.
+`degraded`, `verified_zero_displayed`) also refuses, naming the status and reason -- the job's own
+sufficiency gate already found the evidence too thin/absent to present as measured (see section
+5a below for what that gate now checks).
 
 `--refresh-period-ms` is Bachelor's actual panel refresh period and must be supplied. Without it
 the tool estimates the period from the interval distribution's near-minimum cluster -- an
@@ -344,6 +363,31 @@ estimate that cannot distinguish a healthy all-1-refresh capture from a uniforml
 all-2-refresh one, so it fails closed (`"ambiguous"`) whenever too little of the distribution
 falls outside that cluster to cross-check the assumption. `refreshPeriodSource` records which
 path was taken: `"nominal"` when supplied, `"estimated-min-interval"` when not.
+
+## 5a. The sufficiency gate (presentMonStatus)
+
+`playback-attr-3-cuda-job.ps1` tags every leg's PresentMon evidence `ok` or `degraded` in
+`evidence-manifest.json`'s `presentMon.sufficiency`/`presentMon.status` and `summary.json`'s
+top-level `presentMonStatus`, before this histogram ever runs. `'ok'` requires ALL THREE,
+independently:
+
+- **count** -- at least `minIntervalCount` (30) positive-`MsBetweenDisplayChange` rows.
+- **app-swap coverage** -- `positiveSamples / appSwapCount >= minCoverageFraction` (0.5), where
+  `appSwapCount` is an APP-SIDE count PresentMon never produced: the MLVApp log's own
+  `playback_smoke.gpu_window_swaps` line (real confirmed on-screen swaps) when swap telemetry is
+  active, falling back to `playback_smoke.gate`'s `frames_presented` when it is not. (r1's own
+  `coverageFraction` divided by PresentMon's own `presentedCount` instead -- numerator and
+  denominator from the same csv, so a capture that lost the tail of a leg after a short healthy
+  prefix still read 100% coverage of its own truncated rows; fixed in r1b.)
+- **temporal** -- no gap between positive-interval rows, including the head/tail gaps to the
+  playback window's own bounds, exceeds `maxGapMs` (5000ms). This is what catches a captured
+  PREFIX followed by silence: count and app-swap coverage alone can both clear even though the
+  capture measured almost none of the actual leg.
+
+A `degraded` leg's `presentMonStatusReason` names every arm that failed, with its own numbers.
+`DISPLAY_ASLEEP` and `PRESENTMON_UNAVAILABLE` tag `presentMonStatus` too (`verified_zero_displayed`
+/ `unavailable`) before the gate above even runs, since PresentMon never produced a chain to
+measure at all.
 
 ## 6. Reading the within-run verdict
 

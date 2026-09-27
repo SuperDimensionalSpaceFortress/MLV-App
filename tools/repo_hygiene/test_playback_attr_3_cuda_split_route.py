@@ -1230,7 +1230,13 @@ class FixtureRehearsalVisibilityTests(unittest.TestCase):
         # the success path writes summary.json too, not only the failure paths
         tail = self.template[self.template.index("$resultVerb ="):] if "$resultVerb =" in self.template else ""
         self.assertTrue(tail, "no success result verb found")
-        self.assertIn("summary.json", self.template[self.template.index("artifact-index.v1") - 2500:])
+        # CUDA-PLAYBACK-CONTACT-SHEET-1 r1b widened this window (2500 -> 6000), r1c widened it
+        # again (6000 -> 7000), r1d widened it again (7000 -> 10000): the contact-sheet compose
+        # step (probe Python/Pillow/numpy via a small probe script file rather than an inline
+        # -c program, run the composer with its host/GPU/scale identity and quoted arguments,
+        # publish or record a typed unavailable marker plus any timed-out-child warning) now
+        # sits between the two, and is legitimately that long.
+        self.assertIn("summary.json", self.template[self.template.index("artifact-index.v1") - 10000:])
 
 
 if __name__ == "__main__":

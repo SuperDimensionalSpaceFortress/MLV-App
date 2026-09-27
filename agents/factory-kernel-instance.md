@@ -1,5 +1,9 @@
 # Fleet factory kernel: MLV-App instance map
 
+**Owner ruling 2026-09-26: this kernel IS the software factory.** The hub model (orchestrator hub, dual-lane pens, lanes, hub-procedure
+v2.x) is the deprecated legacy software factory; its mechanisms stay only as the substrate the clauses below map onto, until each
+clause has its own enforcement. Product ships as kernel subjects, and every gap it exposes is fixed here and filed to the bus.
+
 MLV-App runs `specs/fleet-factory-kernel.md` on the fleet doctrine bus as **DOGFOOD, not ADOPT** (bus
 `bootstrap/PROMPT-K-dogfood-kernel.md`). Kernel r1. Profile: `code@r1` primary, with a proposed `measured-objective@r1`
 sub-instance for render/export parity and playback measurement. Since 2026-09-14.

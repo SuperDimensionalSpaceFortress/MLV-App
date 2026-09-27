@@ -1240,6 +1240,24 @@ static int runGuiPlaybackSmoke(QApplication &app)
         QStringLiteral("path"));
     parser.addOption(windowScreenshotOutputOpt);
 
+    const QCommandLineOption contactSheetDirOpt(
+        QStringLiteral("contact-sheet-dir"),
+        QStringLiteral("Optional directory for a contact-sheet capture pass: N evenly spaced presented frames (PNG + JSON sidecar each), grabbed in an un-timed pass after the measured playback interval. Requires --contact-sheet-frames."),
+        QStringLiteral("dir"));
+    parser.addOption(contactSheetDirOpt);
+
+    const QCommandLineOption contactSheetFramesOpt(
+        QStringLiteral("contact-sheet-frames"),
+        QStringLiteral("Number of evenly spaced frames to grab for --contact-sheet-dir. Requires --contact-sheet-dir."),
+        QStringLiteral("count"),
+        QStringLiteral("0"));
+    parser.addOption(contactSheetFramesOpt);
+
+    const QCommandLineOption contactSheetSeekModeOpt(
+        QStringLiteral("contact-sheet-seek-mode"),
+        QStringLiteral("Explicit, labelled alternative to the default contact-sheet capture pass: grabs frames by pausing/seeking after playback stops instead of during a genuine second playback pass. A seeked frame is rendered by a different, non-playback path and can show a different look; sidecars from this mode record playback_path=false. Default off."));
+    parser.addOption(contactSheetSeekModeOpt);
+
     const QCommandLineOption scopeOpt(
         QStringLiteral("scope"),
         QStringLiteral("Force a live scope during the smoke: none, histogram, waveform, parade, vectorscope. If omitted, the user's persisted GUI state is used."),
@@ -1392,6 +1410,20 @@ static int runGuiPlaybackSmoke(QApplication &app)
     if (!ok || targetPresentedFrames < 0)
     {
         err << "[GUI-SMOKE] ERROR: --presented-frames must be 0 or greater.\n";
+        return 2;
+    }
+
+    const int contactSheetFrames = parser.value(contactSheetFramesOpt).toInt(&ok);
+    if (!ok || contactSheetFrames < 0)
+    {
+        err << "[GUI-SMOKE] ERROR: --contact-sheet-frames must be 0 or greater.\n";
+        return 2;
+    }
+    const bool contactSheetDirSet =
+        parser.isSet(contactSheetDirOpt) && !parser.value(contactSheetDirOpt).isEmpty();
+    if (contactSheetDirSet != (contactSheetFrames > 0))
+    {
+        err << "[GUI-SMOKE] ERROR: --contact-sheet-dir and --contact-sheet-frames (> 0) must be set together.\n";
         return 2;
     }
 
@@ -1565,6 +1597,11 @@ static int runGuiPlaybackSmoke(QApplication &app)
     options.windowScreenshotOutputPath = parser.value(windowScreenshotOutputOpt).isEmpty()
         ? QString()
         : QFileInfo(parser.value(windowScreenshotOutputOpt)).absoluteFilePath();
+    options.contactSheetDir = contactSheetDirSet
+        ? QFileInfo(parser.value(contactSheetDirOpt)).absoluteFilePath()
+        : QString();
+    options.contactSheetFrames = contactSheetFrames;
+    options.contactSheetSeekMode = parser.isSet(contactSheetSeekModeOpt);
     options.scope = scope;
     options.playbackDebayer = playbackDebayer;
     options.playbackProcessing = playbackProcessing;
