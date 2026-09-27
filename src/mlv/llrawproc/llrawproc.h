@@ -23,6 +23,7 @@
 
 #include <stddef.h>
 #include <stdint.h>
+#include <string.h>
 
 #include "llrawproc_object.h"
 #include "../mlv_object.h"
@@ -92,7 +93,37 @@ typedef struct
     const double * fullres_curve;
     const float * randn05;
     int apply_dither;
+    /* Zero-based identity of the frame this state was prepared for. The async-H2D
+     * preupload gate in llrawproc_gpu_recon_run_backend() keys on this value
+     * to decide whether a previously host-staged upload matches the frame
+     * about to be reconstructed. It MUST be supplied explicitly by whichever
+     * side builds this struct (RenderFrameThread.cpp / MainWindow.cpp) --
+     * it used to travel as an ambient MLV_THREAD_LOCAL armed on the render
+     * worker thread and read on the GL presentation thread, which never
+     * bridged the two and left async H2D permanently disarmed. See
+     * .claude-state/project-memory/async-h2d-frameid-crosses-a-subsystem-boundary-20260905.md. */
+    uint64_t frame_id;
 } llrpGpuPlaybackReconState_t;
+
+typedef struct
+{
+    int available;
+    int accepted;
+    int used;
+    int exact_match;
+    int submitted_while_prior_run_active;
+    int ready_before_run;
+    double host_staging_ms;
+    double upload_ms;
+    double upload_wait_ms;
+} llrpGpuPlaybackReconPreuploadStatus_t;
+
+/* Render-worker-thread-only: the preupload status of whichever recon call
+ * applyLLRawProcObjectWorker() itself just made on THIS thread (retained-
+ * device or synchronous-CPU16 playback path). Same-thread producer and
+ * consumer -- see the comment on the backing TLS in llrawproc.c. */
+int llrpGpuPlaybackReconLastPreuploadStatusForTesting(
+    llrpGpuPlaybackReconPreuploadStatus_t * status);
 
 typedef struct
 {
@@ -108,20 +139,91 @@ typedef struct
     double recon_wall_ms;
     double amaze_wall_ms;
     double post_ms;
+    /* Populated from the SAME run_backend() invocation that filled the
+     * timing fields above -- an explicit OUT param, not the old ambient
+     * thread-local, so it is safe to read from any thread that owns this
+     * timing_out pointer. */
+    llrpGpuPlaybackReconPreuploadStatus_t preupload;
 } llrpGpuPlaybackReconTiming_t;
 
-typedef struct
+/* The CUDA slot API reserves zero for an unavailable token. Both producer and
+ * consumer translate the public zero-based frame identity at this boundary.
+ * UINT64_MAX cannot be represented without aliasing zero: use synchronous work. */
+static inline uint64_t llrpGpuPlaybackReconFrameToken(uint64_t frame_id)
 {
-    int available;
-    int accepted;
-    int used;
-    int exact_match;
-    int submitted_while_prior_run_active;
-    int ready_before_run;
-    double host_staging_ms;
-    double upload_ms;
-    double upload_wait_ms;
-} llrpGpuPlaybackReconPreuploadStatus_t;
+    return frame_id == UINT64_MAX ? 0 : frame_id + 1u;
+}
+
+/* Shared compare-and-reject: MainWindow calls this with the frame identity a
+ * prepared llrpGpuPlaybackReconState_t was built for and the frame actually
+ * being presented. A mismatch means the prepared state does not provably
+ * belong to this frame, so this returns the UINT64_MAX "not armed" sentinel
+ * (llrpGpuPlaybackReconFrameToken() maps it to token 0) instead of the
+ * prepared frame_id -- both llrawproc_gpu_recon_run_backend()'s token gate
+ * and GpuDisplayViewport/Window's retained-device-buffer gate key off the
+ * same sentinel, so this one function is the single source of the decision
+ * both of them act on. Pulled out to a pure, header-only function (rather
+ * than left inline in MainWindow.cpp) specifically so it is unit-testable
+ * without a GUI harness. */
+static inline uint64_t llrpGpuPlaybackReconFrameIdAfterCompareAndReject(
+    uint64_t prepared_frame_id, uint64_t display_frame_id)
+{
+    return prepared_frame_id == display_frame_id ? prepared_frame_id : UINT64_MAX;
+}
+
+/* Shared by both display adapters (GpuDisplayViewport.cpp, GpuDisplayWindow.cpp),
+ * at both the public entry point and the internal submit function that backs
+ * it, so there is exactly one implementation of "is this retained device
+ * buffer usable for this frame" for all of them to key off. Previously each
+ * of those call sites reimplemented this boolean inline, which let sol's
+ * pre-review #2 hardening finding stand: a regression in any one copy had no
+ * automated test, because the tests/gui directory (the only harness that can
+ * instantiate a real adapter) is an excluded path for this card, and the pure-function
+ * compare-and-reject tests never invoked an adapter. Pulling this out here
+ * makes it directly unit-testable without a GUI harness, the same reasoning
+ * that pulled llrpGpuPlaybackReconFrameIdAfterCompareAndReject() out above --
+ * a mismatched frame's compare-and-reject leaves frame_id at the UINT64_MAX
+ * "not armed" sentinel, which llrpGpuPlaybackReconFrameToken() maps to token
+ * 0, and that must disqualify the retained-buffer shortcut exactly as it
+ * disqualifies the run_backend() token gate. */
+static inline int llrpGpuPlaybackReconRetainedDeviceBufferValid(
+    const uint16_t * retained_device_bayer16,
+    int retained_device_width,
+    int retained_device_height,
+    int expected_width,
+    int expected_height,
+    int validation_probe_texture,
+    uint64_t state_frame_id)
+{
+    return retained_device_bayer16 != NULL
+        && retained_device_width == expected_width
+        && retained_device_height == expected_height
+        && !validation_probe_texture
+        && llrpGpuPlaybackReconFrameToken( state_frame_id ) != 0;
+}
+
+/* Shared by both display adapters. Preupload status belongs to the recon run,
+ * including when its scalar timer is unavailable. A retained-device handoff
+ * without a recon call supplies a zero-initialized recon timing here. */
+static inline llrpGpuPlaybackReconTiming_t llrpGpuPlaybackReconCombineTiming(
+    const llrpGpuPlaybackReconTiming_t * recon,
+    int debayer_available, double upload_ms, double kernel_ms,
+    double interop_ms, double total_ms)
+{
+    llrpGpuPlaybackReconTiming_t combined;
+    memset(&combined, 0, sizeof(combined));
+    combined.preupload = recon->preupload;
+    combined.available = recon->available || debayer_available;
+    combined.upload_ms = (recon->available ? recon->upload_ms : 0.0)
+        + (debayer_available ? upload_ms : 0.0);
+    combined.kernel_ms = (recon->available ? recon->kernel_ms : 0.0)
+        + (debayer_available ? kernel_ms : 0.0);
+    combined.interop_ms = (recon->available ? recon->interop_ms : 0.0)
+        + (debayer_available ? interop_ms : 0.0);
+    combined.total_ms = (recon->available ? recon->total_ms : 0.0)
+        + (debayer_available ? total_ms : 0.0);
+    return combined;
+}
 
 typedef struct
 {
@@ -147,12 +249,13 @@ int llrpGpuPlaybackReconGetLastPreparedState(llrpGpuPlaybackReconState_t * state
 size_t llrpGpuPlaybackReconGetLastInputBayer16(uint16_t * output,
                                                size_t output_words);
 int llrpGpuPlaybackReconGetBackendInfo(llrpGpuPlaybackReconBackendInfo_t * info);
-void llrpSetGpuPlaybackReconFrameIdForCurrentThread(uint64_t frame_id);
 int llrpGpuPlaybackReconPreuploadFrame(uint64_t frame_id,
                                       const uint16_t * raw_input_bayer14,
                                       size_t raw_image_size);
-int llrpGpuPlaybackReconGetLastPreuploadStatus(
-    llrpGpuPlaybackReconPreuploadStatus_t * status);
+/* Test-only synchronous observer: substitutes for upload on the current thread.
+ * The observer must copy the bytes before returning; NULL restores real upload. */
+typedef void (*llrpGpuPlaybackPreuploadObserver_t)(uint64_t, const uint16_t *, size_t);
+void llrpSetGpuPlaybackPreuploadObserverForTesting(llrpGpuPlaybackPreuploadObserver_t observer);
 int llrpGpuPlaybackReconResetGlTextureResources(void);
 int llrpGpuPlaybackReconRunGlTexture(const llrpGpuPlaybackReconState_t * state,
                                      const uint16_t * raw_input_bayer14,

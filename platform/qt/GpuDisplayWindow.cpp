@@ -560,11 +560,21 @@ bool GpuDisplayWindow::setPresentedGpuPlaybackReconAmazePostWbTexture(
 
     const int texWidth = state->width;
     const int texHeight = state->height;
+    /* Shared with GpuDisplayViewport's equivalent gate and unit-tested
+     * without a GUI harness -- see llrpGpuPlaybackReconRetainedDeviceBufferValid()
+     * (llrawproc.h). Rejects the retained device buffer on a frame-id
+     * mismatch too -- MainWindow's compare-and-reject leaves state->frame_id
+     * unarmed (UINT64_MAX) for a mismatched frame, and this shortcut bypasses
+     * run_backend()'s own token gate entirely. */
     const bool retainedDeviceValid =
-        retainedDeviceBayer16
-        && retainedDeviceWidth == texWidth
-        && retainedDeviceHeight == texHeight
-        && !validationProbeTexture;
+        llrpGpuPlaybackReconRetainedDeviceBufferValid(
+            retainedDeviceBayer16,
+            retainedDeviceWidth,
+            retainedDeviceHeight,
+            texWidth,
+            texHeight,
+            validationProbeTexture,
+            state->frame_id );
     const size_t expectedWords =
         static_cast<size_t>(texWidth) * static_cast<size_t>(texHeight);
     if ( !rawInputBayer14 && !retainedDeviceValid )
@@ -803,20 +813,9 @@ bool GpuDisplayWindow::setPresentedGpuPlaybackReconAmazePostWbTexture(
     const bool ok = reconOk && amazeOk;
     if ( timing )
     {
-        memset(timing, 0, sizeof(*timing));
-        timing->available = reconTiming.available || amazeTiming.available;
-        timing->upload_ms =
-            (reconTiming.available ? reconTiming.upload_ms : 0.0)
-            + (amazeTiming.available ? amazeTiming.uploadMs : 0.0);
-        timing->kernel_ms =
-            (reconTiming.available ? reconTiming.kernel_ms : 0.0)
-            + (amazeTiming.available ? amazeTiming.kernelMs : 0.0);
-        timing->interop_ms =
-            (reconTiming.available ? reconTiming.interop_ms : 0.0)
-            + (amazeTiming.available ? amazeTiming.downloadMs : 0.0);
-        timing->total_ms =
-            (reconTiming.available ? reconTiming.total_ms : 0.0)
-            + (amazeTiming.available ? amazeTiming.totalMs : 0.0);
+        *timing = llrpGpuPlaybackReconCombineTiming(
+            &reconTiming, amazeTiming.available, amazeTiming.uploadMs,
+            amazeTiming.kernelMs, amazeTiming.downloadMs, amazeTiming.totalMs);
     }
     if ( !ok )
     {
