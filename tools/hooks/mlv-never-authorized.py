@@ -51,7 +51,8 @@ assume the hub":
     its content -- see THE PRE-FLIGHT ARTIFACT ACT below).
   * NA-10, O129 (hub extension) -- a lane editing its own gate.  Any write to
     ``.claude/settings.json``, ``.claude/settings.local.json`` or
-    ``tools/hooks/mlv-never-authorized.py``, UNDER ANY ROOT, is denied away from the board
+    ``tools/hooks/mlv-never-authorized.py`` or ``tools/gates/verify_consented_footage.py``
+    (NA-4's content verifier), UNDER ANY ROOT, is denied away from the board
     venue: this hook is re-read on every tool call, so a lane's edit of its registration or
     of this script would take effect on its next call.  Hook evolution stays hub-authored.
 
@@ -450,6 +451,7 @@ import os
 import posixpath
 import re
 import sys
+import types
 
 EXIT_ALLOW = 0
 EXIT_DENY = 2
@@ -808,11 +810,16 @@ MANIFEST_PROMPTS_PREFIX = "prompts/v2/"
 # NA-10 (O129, hub extension): a lane editing its OWN gate.  Path TAILS, matched
 # segment-wise against the END of the path, UNDER ANY ROOT -- the rule is about which file
 # is being written, not about which tree it sits in, because every lane worktree carries its
-# own copy of all three and each one governs that lane's next tool call.
+# own copy of all three and each one governs that lane's next tool call.  (NA-4's owner-
+# consented footage table lives IN the hook script, so the third tail already guards it.  The
+# FOURTH tail is that table's content verifier (NA4-OWNER-CONSENTED-FOOTAGE-1 round 3, E):
+# every tracked, id-addressed footage consumer must call it before opening a clip, so a lane
+# that rewrites it rewrites the only content check those consumers have.)
 NA10_GUARDED_TAILS = (
     ".claude/settings.json",
     ".claude/settings.local.json",
     "tools/hooks/mlv-never-authorized.py",
+    "tools/gates/verify_consented_footage.py",
 )
 
 
@@ -3285,6 +3292,182 @@ def rule_na3(ctx):
 _CLIP_LINE_RX = re.compile(r"^(?:- )?CLIP_OR_NONE:\s*(.*?)\s*$", re.M)
 FIXTURE_TAIL = "tests/fixtures/clips"
 
+# NA4-OWNER-CONSENTED-FOOTAGE-1 -- THE OWNER-CONSENTED FOOTAGE RECORD, WHO DECIDED IT, AND
+# WHAT IT BINDS.
+#
+# AUTHORITY (round 2, re-cited; every line hash is sha256 of the raw JSONL line bytes EXCLUDING
+# the line terminator).  The CONSENT is the owner's own typed line in the peaceful-rubin
+# transcript, line 1739, answering the assistant's question at line 1718.  The hub transcript's
+# line 2137 is a DIFFERENT owner line: the directive against manual path steps; it names no
+# clip.  The six ids are the HUB's derivation, not the owner's words (``scope_derivation``
+# below); M02-1344 is NOT here.  No lane, quorum or adjudication can widen this table.
+#
+# ROUND 6: NARROW.  Rounds 1-5 used this table for an NA-4 exception (3) that ADMITTED a
+# consented path named in agent command text.  Every round found a new command-text bypass,
+# because this hook evaluates text that differs from what bash, PowerShell or cmd execute.
+# That admission is REMOVED: this hook admits NO consented path from command text, and a
+# consented-footage path in command text is DENIED by NA-4 exactly as on master.  Only NA-4
+# exceptions (1) tracked fixtures and (2) CLIP_OR_NONE remain.  The table stays as the CONSENT
+# RECORD that tracked, id-addressed consumers verify content against.
+#
+# WHAT IS FROZEN.  Per consented id, per part: the byte length, the lowercase sha256 of the
+# content, and ``path_norm_sha256`` -- the sha256 of this hook's own ``norm()`` output for that
+# part's path, UTF-8 encoded.  NO PATH is stored.  No rule in this hook reads the table.
+#
+# LIMITS, stated rather than papered over.  TWO NUMBERINGS MEET IN THIS BLOCK AND ARE KEPT
+# APART: the limits below are labelled L1..L6, and the NA-4 exceptions keep their own (1) and
+# (2) but are ALWAYS written as "NA-4 exception (n)", never as a bare number.
+#
+# L1. THE ROUTE THIS CARD PROVIDES for consented
+# footage is tracked, id-addressed consumers that verify content against this table with
+# tools/gates/verify_consented_footage.py (each part's existence, length and sha256).  None is
+# wired yet: the CUDA job (card ATTR3-FOOTAGE-BIND-1) and the #72b delta tooling are not, and
+# until then the CUDA job generator refuses every owner-clip id.  THAT IS NOT THE ONLY WAY A
+# CONSENTED CLIP CAN BE OPENED TODAY.  NA-4 exception (2) admits the ONE canonical path on the
+# card's CLIP_OR_NONE line, and NOTHING EXCLUDES A CONSENTED CLIP'S OWN PATH FROM IT: a
+# consented clip named there is opened with NO content check against this table and by no
+# id-addressed consumer, exactly as before this card.
+#
+# L2. THE NARROWING REDUCES
+# SCOPE, NOT EXPOSURE.  The interpreter-one-liner residual is UNCHANGED: a text-matching hook
+# never sees the path an interpreter one-liner or a script opens, so such a one-liner can open
+# any path, consented or not, exactly as before this card.  Removing NA-4 exception (3) removes
+# a review surface; it does not close that hole.
+#
+# L3. Widening needs a change to THIS table,
+# which is visible in the diff and VALUE-pinned by tests
+# (tools/repo_hygiene/test_mlv_never_authorized.py pins the sha256 of a canonical
+# serialisation of the WHOLE table -- ids, per-part length, content sha256 and
+# path_norm_sha256, part counts, purposes and citations -- plus each id's part count, so an
+# in-place hash swap or an appended part row goes red); the merge path is agent-reviewed and
+# CI-test-pinned, NOT an un-mintable owner gate -- the repo has zero required reviews and one
+# shared account.  A board-rooted actor can still edit the table transiently: that is the same
+# residual as every NA rule at the board venue, bounded by the NA-10 venue gate and the 0.05
+# hook-enforced receipt that Invoke-Lane checks.
+#
+# L4. The purposes are recorded, not enforced.
+# L5. NA-4 clip detection does not strip trailing dots or spaces from a clip name outside the
+# cache, so such a spelling is not detected as a clip; this predates the card, and a follow-up
+# card (NA4-CLIP-NAME-TRIM-1) fixes it.
+# L6. NA-4 exceptions (1) and (2) still compare the EXPANDED token, so a hook-read variable a
+# child shell reassigns can open a different target; this predates the card, and follow-up card
+# NA4-EXC12-LITERAL-TOKENS-1 tracks it.
+OWNER_CONSENTED_FOOTAGE = types.MappingProxyType(
+    {
+        # clip id -> ((length, content sha256, path_norm_sha256), ...) in part order.
+        "clips": types.MappingProxyType(
+            {
+                "M16-1243": (
+                    (
+                        2221399552,
+                        "c8f09e1ea8e6c40f673bf465d2d4adb90ca218bc9f78c6461db5cd22cd3e01b9",
+                        "28a106d4cc483f1ffd83d54c0b95536c4e7a21a127808fad7dfa3d8f25c0f552",
+                    ),
+                    (
+                        1174057472,
+                        "5dd782178e1658dad5da31808bf3a7c249f7e282682220e4d72b7743dacc163b",
+                        "0f2c4cb7c41a4f836e38acfe44a0d7dcd589b0dc8f889986668f05e30a32de7c",
+                    ),
+                ),
+                "M16-1327": (
+                    (
+                        2654424576,
+                        "cfdcd64da9931db94b2b4f938fec1e10b8a742c2e79847975bdd6a986e137a3f",
+                        "cba05ef72d33bb8116c21d912938575f173ee5b54975d64e85bc98847a3f17af",
+                    ),
+                    (
+                        1327107584,
+                        "c13ed73d60a5767f58bee0a22bbb046f8cf795a8c09511689bbfa6213e770cd7",
+                        "a823c17ae653fb2b8c5d7abd6a7027e160c6c5dab481df9c46967cfc0cbafec3",
+                    ),
+                ),
+                "M16-1347": (
+                    (
+                        2454400512,
+                        "763e5a302a8d04e97d84ca7d281d65752529a6ed00bf5a7ff8bbb1e46609934d",
+                        "63fbc5a24cc158754bacd0dd2d4be7abdc92053134a603b6f983d60602d5da52",
+                    ),
+                    (
+                        1236876288,
+                        "e32c19b7b61619e1ea29c05358a23e863218ba021c4d2e8bdda5d057417d5fb1",
+                        "6af3176539897975fb494a9ec370fa476e474660c664e344fa9fd1df1c2d1e1d",
+                    ),
+                ),
+                "M17-1207": (
+                    (
+                        2367993856,
+                        "3bbb5034d8ab5d63a078517af5a3098fff89677be37e78298317a19def043dce",
+                        "5fc530e0e0e1a06d34cc702ba48de0a6db3e8018a0045989cb7315581a49574e",
+                    ),
+                    (
+                        1369447936,
+                        "3ab34479a80363a693bce3e13782b828b1eccbc38e96dd11ad0eb8c2d919a54e",
+                        "cb94f742140e72e46ee029eb40b93cfed9299f00a68c87e3d9fc59b39a60aea3",
+                    ),
+                ),
+                "M15-1320": (
+                    (
+                        462899712,
+                        "b72347ace4f18981a9ea66db9fc2db9413718c99d4818a1846413b86b703ca1e",
+                        "81a01b33a298de563aed14851308ce0e706e3287b9413b9e42d8b68bc3dd0873",
+                    ),
+                    (
+                        228077056,
+                        "8b7de65f58e9118001e53e1b6490784c0fa2cda0ef108e7eb63c8d62f5c7e999",
+                        "bae2d8f11f9b221456feec6d9e699b63cffd9af607bdc6e5bde689d8f628cad6",
+                    ),
+                ),
+                "M16-1210": (
+                    (
+                        793847808,
+                        "679ee976b0150c71ca26f7d8895c775afdca273fa7f907db22cf7c3d58af17cd",
+                        "e29feea8e1cd1c5a77ea1efbb4001af0e5d81659b3f25631df9567c89ce290c0",
+                    ),
+                    (
+                        395081728,
+                        "d7a31dbb9b2afe717485a4f664619c7d4f2e747c3e13be1d503f93904551af84",
+                        "c084dd034f80f90ce3ec26ef25a635fe8192ddcc9bf63ab77e9661013585a8b4",
+                    ),
+                ),
+            }
+        ),
+        "purposes": ("#72b delta-baseline gate", "PLAYBACK-ATTR-3-CUDA"),
+        "authority": types.MappingProxyType(
+            {
+                "hash_convention": "sha256 of the raw line bytes excluding the terminator",
+                "consent": types.MappingProxyType(
+                    {
+                        "transcript": r"C:\Users\obabalola\.claude\projects"
+                        r"\C---Layi-Wkspc-MLV-App--claude-worktrees-peaceful-rubin-701ecd"
+                        r"\a482bbe6-87e2-4332-970e-8accb08b1663.jsonl",
+                        "line": 1739,
+                        "sha256": "461af7a5291099e009230a8abcfe547e064435287a23f40cf93e5ba4ddb0a066",
+                        "timestamp": "2026-09-16T16:42:09Z",
+                        "answers_line": 1718,
+                        "answers_line_sha256": (
+                            "88484275b4ef158bdaf0a98a3755c70fb65be34c514ae406c6603446dee4a38a"
+                        ),
+                    }
+                ),
+                "directive_no_manual_paths": types.MappingProxyType(
+                    {
+                        "transcript": r"C:\Users\obabalola\.claude\projects"
+                        r"\C---Layi-Wkspc-MLV-App--claude-worktrees-happy-ptolemy-9fe12d"
+                        r"\f9010ab1-55f2-4f4c-967c-467cf19c04ef.jsonl",
+                        "line": 2137,
+                        "sha256": "254075c85a821758067f7d37dbc5a26a05ae8e2a2368f1e02af0fa2110ac8e41",
+                    }
+                ),
+                "scope_derivation": (
+                    "ids derived by the hub from tools/gates/output-budget.json at abcf1697; "
+                    "M02-1344 excluded (not acquired); purposes #72b delta-baseline gate and "
+                    "PLAYBACK-ATTR-3-CUDA from the consent exchange"
+                ),
+            }
+        ),
+    }
+)
+
 
 def authorized_clip(ctx):
     """The ONE canonical absolute path from the lane prompt, or None."""
@@ -3319,6 +3502,13 @@ def rule_na4(ctx):
             continue  # tracked fixtures are always allowed
         if allowed is not None and path_norm == allowed:
             continue
+        # No exception (3) (round 6, NARROW): a consented-footage path in command text is
+        # denied here exactly as on master.  THE ROUTE THIS CARD PROVIDES for consented footage
+        # is tracked, id-addressed consumers that verify content against OWNER_CONSENTED_FOOTAGE.
+        # THAT IS NOT THE ONLY WAY A CONSENTED CLIP CAN BE OPENED TODAY: the NA-4 exception (2)
+        # ``continue`` DIRECTLY ABOVE admits a consented clip's own path on the CLIP_OR_NONE
+        # line, with NO content check against the table and by no id-addressed consumer.  See
+        # the LIMITS block above OWNER_CONSENTED_FOOTAGE.
         if allowed is None:
             raise Deny(
                 "NA-4",
@@ -3711,12 +3901,12 @@ def rule_na9(ctx):
 #     `hook-unregistered` refusals at dispatch and the sol review of every PR diff.
 #
 # NA-10 runs LAST, in register order.  Every specified row is attributable there: NA-7
-# allows a lane's own worktree by construction, and none of the three tails is an NA-2
+# allows a lane's own worktree by construction, and none of the four tails is an NA-2
 # protected path, so nothing else fires first and steals the reason line.
 
 
 def _na10_guarded(path_norm):
-    """Does this path END with one of the three gate tails, under any root?"""
+    """Does this path END with one of the four gate tails, under any root?"""
     if not path_norm:
         return False
     return any(

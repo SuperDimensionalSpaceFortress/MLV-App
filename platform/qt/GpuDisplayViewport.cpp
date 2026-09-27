@@ -213,26 +213,6 @@ bool viewportAbPrimeEnabled()
     return envFlagEnabled(qgetenv("MLVAPP_VIEWPORT_AB_PRIME"));
 }
 
-QOpenGLTexture * createOrResizeLookupTexture(QOpenGLTexture * texture, int width, int height)
-{
-    if ( texture
-      && texture->width() == width
-      && texture->height() == height )
-    {
-        return texture;
-    }
-
-    delete texture;
-    texture = new QOpenGLTexture(QOpenGLTexture::Target2D);
-    texture->setFormat(QOpenGLTexture::RGBA16_UNorm);
-    texture->setSize(width, height);
-    texture->setMipLevels(1);
-    texture->allocateStorage(QOpenGLTexture::RGBA, QOpenGLTexture::UInt16);
-    texture->setWrapMode(QOpenGLTexture::ClampToEdge);
-    texture->setMinMagFilters(QOpenGLTexture::Nearest, QOpenGLTexture::Nearest);
-    return texture;
-}
-
 bool rowLooksLikeUniformTopMagentaBandRgb16(const uint16_t *row, int width)
 {
     if( !row || width <= 0 )
@@ -399,16 +379,9 @@ GpuDisplayViewport::GpuDisplayViewport(QWidget *parent)
     , m_fallbackItem(nullptr)
     , m_pendingTextureWidth(0)
     , m_pendingTextureHeight(0)
-    , m_processingTextureSignature(0)
-    , m_processingTextureSignatureValid(false)
     , m_program(nullptr)
     , m_texture(nullptr)
     , m_gpuReconSourceTexture(nullptr)
-    , m_levelsLutTexture(nullptr)
-    , m_matrixLutRTexture(nullptr)
-    , m_matrixLutGTexture(nullptr)
-    , m_matrixLutBTexture(nullptr)
-    , m_gammaLutTexture(nullptr)
 {
     QSurfaceFormat requestedFormat = format();
     requestedFormat.setSwapInterval(0);
@@ -738,7 +711,8 @@ bool GpuDisplayViewport::presentImage(QGraphicsView *view,
     {
         const QSize displaySize =
             displaySizeForWindowPresent(view, fallbackItem, image);
-        if ( GpuDisplayWindow::presentImageIfActive(image, displaySize) ) return true;
+        if ( GpuDisplayWindow::presentImageIfActive(image, displaySize, options.presentationSerial) )
+            return true;
     }
     else if ( GpuDisplayWindow::clearIfActive() )
     {
@@ -1026,7 +1000,25 @@ void GpuDisplayViewport::paintGL()
     glClear(GL_COLOR_BUFFER_BIT);
 
     updateTextureIfNeeded();
-    if ( !m_texture || !m_program || !m_view )
+
+    // FAIL CLOSED (GPU-TEXNR-S1-DARK-GREEN-1 round 3, sol major): a GPU-recon/AMaZE
+    // texture is the post-WB-undo linear camera RGB output, not display-referred -- it
+    // must never be drawn with preview processing unavailable, which the shared shader's
+    // previewProcessingEnabled=0 branch would otherwise render as a passthrough-equivalent
+    // (the dark/green-cast regression this fix line exists to close). The submit-time gate
+    // in setPresentedGpuPlaybackReconAmazePostWbTexture() already refuses to accept such a
+    // texture when its LUTs are not usable, but that is re-checked here rather than
+    // trusted -- mirrors GpuDisplayWindow::paintGL's reconRefused re-check -- so a texture
+    // that somehow reached this point with its LUTs torn down (e.g. destroyTexture()
+    // racing a paint, or updateTextureIfNeeded()'s own re-upload attempt above failing)
+    // is refused rather than ever shown through the in-shader disable.
+    const bool presentingReconTexture = m_pendingTextureFromGpuRecon || m_pendingTextureFromGpuAmaze;
+    const bool reconLutsReady = presentingReconTexture
+        && gpuPreviewProcessingLutTextureSetReady(m_lutSet, m_presentationOptions.previewProcessing);
+    const bool reconRefused = gpuPreviewProcessingReconTexturePresentationRefused(
+        presentingReconTexture, m_lutSet, m_presentationOptions.previewProcessing);
+
+    if ( !m_texture || !m_program || !m_view || reconRefused )
     {
         m_texturePresentationActive = false;
         if ( viewportPresentDiagEnabled() )
@@ -1035,7 +1027,7 @@ void GpuDisplayViewport::paintGL()
                 << " hasPending=" << hasPendingFrame() << " imgNull=" << m_pendingImage.isNull()
                 << " bytesEmpty=" << m_pendingTextureBytes.isEmpty()
                 << " recon=" << m_pendingTextureFromGpuRecon << " amaze=" << m_pendingTextureFromGpuAmaze
-                << " dirty=" << m_textureDirty;
+                << " dirty=" << m_textureDirty << " reconRefused=" << reconRefused;
         return;
     }
 
@@ -1071,67 +1063,25 @@ void GpuDisplayViewport::paintGL()
     vertices[13] = vertices[9];
 
     m_program->bind();
-    const bool previewProcessingReady =
-        m_presentationOptions.previewProcessing.enabled
-        && m_levelsLutTexture
-        && m_matrixLutRTexture
-        && m_matrixLutGTexture
-        && m_matrixLutBTexture
-        && m_gammaLutTexture;
+    // reconRefused above already proved reconLutsReady==true whenever presentingReconTexture
+    // is true (otherwise paintGL returned before reaching here) -- reuse it instead of
+    // re-evaluating the same predicate for that case.
+    const bool previewProcessingReady = presentingReconTexture
+        ? reconLutsReady
+        : gpuPreviewProcessingLutTextureSetReady(m_lutSet, m_presentationOptions.previewProcessing);
     m_program->setUniformValue("frameTexture", 0);
-    m_program->setUniformValue("textureSize",
-                               QVector2D(static_cast<float>(pendingWidth()),
-                                         static_cast<float>(pendingHeight())));
-    m_program->setUniformValue("frameTextureMode", m_textureIsBayer16 ? 1 : 0);
-    m_program->setUniformValue("samplingMode", static_cast<int>(m_presentationOptions.samplingMode));
-    m_program->setUniformValue("zebraEnabled", m_presentationOptions.showZebras ? 1.0f : 0.0f);
-    m_program->setUniformValue("zebraUnderThreshold", m_presentationOptions.zebraUnderThreshold);
-    m_program->setUniformValue("zebraOverThreshold", m_presentationOptions.zebraOverThreshold);
-    m_program->setUniformValue("previewProcessingEnabled", previewProcessingReady ? 1.0f : 0.0f);
-    m_program->setUniformValue("previewUseCameraMatrix", m_presentationOptions.previewProcessing.useCameraMatrix ? 1.0f : 0.0f);
-    m_program->setUniformValue("previewApplyGamutCompression", m_presentationOptions.previewProcessing.applyGamutCompression ? 1.0f : 0.0f);
-    m_program->setUniformValue("previewProperWbRow0",
-                               QVector3D(m_presentationOptions.previewProcessing.properWbMatrix[0],
-                                         m_presentationOptions.previewProcessing.properWbMatrix[1],
-                                         m_presentationOptions.previewProcessing.properWbMatrix[2]));
-    m_program->setUniformValue("previewProperWbRow1",
-                               QVector3D(m_presentationOptions.previewProcessing.properWbMatrix[3],
-                                         m_presentationOptions.previewProcessing.properWbMatrix[4],
-                                         m_presentationOptions.previewProcessing.properWbMatrix[5]));
-    m_program->setUniformValue("previewProperWbRow2",
-                               QVector3D(m_presentationOptions.previewProcessing.properWbMatrix[6],
-                                         m_presentationOptions.previewProcessing.properWbMatrix[7],
-                                         m_presentationOptions.previewProcessing.properWbMatrix[8]));
-    m_program->setUniformValue("previewRgbToY",
-                               QVector3D(m_presentationOptions.previewProcessing.rgbToY[0],
-                                         m_presentationOptions.previewProcessing.rgbToY[1],
-                                         m_presentationOptions.previewProcessing.rgbToY[2]));
+    GpuPreviewProcessingDisplayUniforms displayUniforms;
+    displayUniforms.textureSize = QVector2D(static_cast<float>(pendingWidth()),
+                                            static_cast<float>(pendingHeight()));
+    displayUniforms.frameTextureMode = m_textureIsBayer16 ? 1 : 0;
+    displayUniforms.samplingMode = static_cast<int>(m_presentationOptions.samplingMode);
+    displayUniforms.zebraEnabled = m_presentationOptions.showZebras;
+    displayUniforms.zebraUnderThreshold = m_presentationOptions.zebraUnderThreshold;
+    displayUniforms.zebraOverThreshold = m_presentationOptions.zebraOverThreshold;
     m_texture->bind(0);
-    if ( previewProcessingReady && m_levelsLutTexture )
-    {
-        m_program->setUniformValue("levelsLut", 1);
-        m_levelsLutTexture->bind(1);
-    }
-    if ( previewProcessingReady && m_matrixLutRTexture )
-    {
-        m_program->setUniformValue("matrixLutR", 2);
-        m_matrixLutRTexture->bind(2);
-    }
-    if ( previewProcessingReady && m_matrixLutGTexture )
-    {
-        m_program->setUniformValue("matrixLutG", 3);
-        m_matrixLutGTexture->bind(3);
-    }
-    if ( previewProcessingReady && m_matrixLutBTexture )
-    {
-        m_program->setUniformValue("matrixLutB", 4);
-        m_matrixLutBTexture->bind(4);
-    }
-    if ( previewProcessingReady && m_gammaLutTexture )
-    {
-        m_program->setUniformValue("gammaLut", 5);
-        m_gammaLutTexture->bind(5);
-    }
+    gpuPreviewProcessingBindDisplayUniformsAndTextures(
+        m_program, m_presentationOptions.previewProcessing, m_lutSet,
+        displayUniforms, previewProcessingReady);
 
     const int posLoc = m_program->attributeLocation("position");
     const int texLoc = m_program->attributeLocation("texCoord");
@@ -1145,11 +1095,7 @@ void GpuDisplayViewport::paintGL()
     m_program->disableAttributeArray(posLoc);
     m_program->disableAttributeArray(texLoc);
     m_texture->release();
-    if ( previewProcessingReady && m_levelsLutTexture ) m_levelsLutTexture->release();
-    if ( previewProcessingReady && m_matrixLutRTexture ) m_matrixLutRTexture->release();
-    if ( previewProcessingReady && m_matrixLutGTexture ) m_matrixLutGTexture->release();
-    if ( previewProcessingReady && m_matrixLutBTexture ) m_matrixLutBTexture->release();
-    if ( previewProcessingReady && m_gammaLutTexture ) m_gammaLutTexture->release();
+    gpuPreviewProcessingReleaseDisplayTextures(m_lutSet, previewProcessingReady);
     m_program->release();
     m_texturePresentationActive = true;
 
@@ -1360,6 +1306,21 @@ bool GpuDisplayViewport::setPresentedGpuPlaybackReconTexture(
     setPresentationOptions(options);
     updateProcessingTexturesIfNeeded();
 
+    // FAIL CLOSED (GPU-TEXNR-S1-DARK-GREEN-1 round 4, fable minor): this raw-Bayer16
+    // route feeds the same shared display shader/LUT set as the AMaZE route, whose
+    // submit path already refuses here (see setPresentedGpuPlaybackReconAmazePostWbTexture
+    // above) -- this route was missing the same gate, so an unready LUT set only refused
+    // at paintGL's draw-time re-check, AFTER this function had already returned true and
+    // MainWindow had recorded a successful present with no fallback. Refuse up front, same
+    // as the AMaZE route, so MainWindow's existing fallback runs instead.
+    if ( !gpuPreviewProcessingLutTextureSetReady(m_lutSet, options.previewProcessing) )
+    {
+        if ( madeCurrent ) doneCurrent();
+        return fail(QStringLiteral(
+            "GPU playback recon texture-present refused: LUT texture upload failed "
+            "for a linear post-WB-undo texture (trace=gpu_viewport_recon_raw_lut_upload_failed)"));
+    }
+
     if ( !m_texture
       || m_texture->width() != width
       || m_texture->height() != height
@@ -1471,6 +1432,32 @@ bool GpuDisplayViewport::setPresentedGpuPlaybackReconAmazePostWbTexture(
         return fail(QStringLiteral("GPU playback recon AMaZE texture-present input is invalid"));
     }
 
+    // FAIL CLOSED (GPU-TEXNR-S1-DARK-GREEN-1 round 2): same gate as
+    // GpuDisplayWindow::setPresentedGpuPlaybackReconAmazePostWbTexture -- this texture is
+    // the post-WB-undo linear camera RGB output of AMaZE, not display-referred. Without
+    // usable LUTs the shared display shader would still draw it, just with
+    // previewProcessingEnabled=0 (passthrough-equivalent in-shader), which is the same
+    // dark/green-cast regression this fix line exists to close. Refuse up front rather
+    // than let the in-shader disable stand in for a real refusal. MainWindow passes the
+    // same task.gpuPresentationOptions to this route as to the window route today
+    // (MainWindow.cpp), so this is not reachable in production; it closes the gap for
+    // any future/direct caller.
+    const GpuPreviewProcessingConfig &previewProcessing = options.previewProcessing;
+    const bool previewProcessingOptionsUsable =
+        previewProcessing.enabled
+        && previewProcessing.levelsLut.size() >= static_cast<int>(65536u * sizeof(uint16_t))
+        && previewProcessing.matrixLutR.size() >= static_cast<int>(65536u * sizeof(uint16_t))
+        && previewProcessing.matrixLutG.size() >= static_cast<int>(65536u * sizeof(uint16_t))
+        && previewProcessing.matrixLutB.size() >= static_cast<int>(65536u * sizeof(uint16_t))
+        && previewProcessing.gammaLut.size() >= static_cast<int>(65536u * sizeof(uint16_t));
+    if ( !previewProcessingOptionsUsable )
+    {
+        return fail(QStringLiteral(
+            "GPU playback recon AMaZE texture-present refused: preview-processing options/LUTs "
+            "are not ready for a linear post-WB-undo texture "
+            "(trace=gpu_viewport_recon_missing_processing_options)"));
+    }
+
     const int width = state->width;
     const int height = state->height;
     const bool retainedDeviceValid =
@@ -1523,6 +1510,22 @@ bool GpuDisplayViewport::setPresentedGpuPlaybackReconAmazePostWbTexture(
 
     setPresentationOptions(options);
     updateProcessingTexturesIfNeeded();
+
+    // FAIL CLOSED (GPU-TEXNR-S1-DARK-GREEN-1 round 3, sol major): the options-usable
+    // check above only proves the LUT *source bytes* were big enough to attempt an
+    // upload -- it says nothing about whether updateProcessingTexturesIfNeeded() (via
+    // gpuPreviewProcessingUpdateLutTextureSet) actually got real GL textures created and
+    // uploaded. Re-check the SAME shared readiness predicate the window's equivalent
+    // submit path checks (GpuDisplayWindow::setPresentedGpuPlaybackReconAmazePostWbTexture)
+    // and refuse here too, before any recon/AMaZE GL work runs, rather than letting a
+    // failed upload reach paintGL's draw-time re-check as the only backstop.
+    if ( !gpuPreviewProcessingLutTextureSetReady(m_lutSet, previewProcessing) )
+    {
+        if ( madeCurrent ) doneCurrent();
+        return fail(QStringLiteral(
+            "GPU playback recon AMaZE texture-present refused: LUT texture upload failed "
+            "for a linear post-WB-undo texture (trace=gpu_viewport_recon_lut_upload_failed)"));
+    }
 
     if ( !m_texture
       || m_texture->width() != width
@@ -1995,20 +1998,7 @@ void GpuDisplayViewport::updateTextureIfNeeded()
 
 void GpuDisplayViewport::ensureProgram()
 {
-    if ( m_program ) return;
-    const QByteArray vertexShader = gpuPreviewProcessingVertexShaderSource();
-    const QByteArray fragmentShader = gpuPreviewProcessingDisplayFragmentShaderSource();
-
-    m_program = new QOpenGLShaderProgram(this);
-    if ( !m_program->addShaderFromSourceCode(QOpenGLShader::Vertex, vertexShader)
-      || !m_program->addShaderFromSourceCode(QOpenGLShader::Fragment, fragmentShader)
-      || !m_program->link() )
-    {
-        qWarning() << "Experimental GPU viewport shader setup failed:"
-                   << m_program->log();
-        delete m_program;
-        m_program = nullptr;
-    }
+    gpuPreviewProcessingEnsureDisplayProgram(m_program, this);
 }
 
 void GpuDisplayViewport::destroyTexture()
@@ -2037,33 +2027,7 @@ void GpuDisplayViewport::destroyTexture()
 
 void GpuDisplayViewport::destroyProcessingTextures()
 {
-    if ( m_levelsLutTexture )
-    {
-        delete m_levelsLutTexture;
-        m_levelsLutTexture = nullptr;
-    }
-    if ( m_matrixLutRTexture )
-    {
-        delete m_matrixLutRTexture;
-        m_matrixLutRTexture = nullptr;
-    }
-    if ( m_matrixLutGTexture )
-    {
-        delete m_matrixLutGTexture;
-        m_matrixLutGTexture = nullptr;
-    }
-    if ( m_matrixLutBTexture )
-    {
-        delete m_matrixLutBTexture;
-        m_matrixLutBTexture = nullptr;
-    }
-    if ( m_gammaLutTexture )
-    {
-        delete m_gammaLutTexture;
-        m_gammaLutTexture = nullptr;
-    }
-    m_processingTextureSignature = 0;
-    m_processingTextureSignatureValid = false;
+    gpuPreviewProcessingDestroyLutTextureSet(m_lutSet);
 }
 
 void GpuDisplayViewport::setPresentationOptions(const PresentationOptions &options)
@@ -2089,72 +2053,7 @@ void GpuDisplayViewport::updateProcessingTexturesIfNeeded()
         return;
     }
 
-    if ( !m_presentationOptions.previewProcessing.enabled )
-    {
-        destroyProcessingTextures();
-        m_processingTexturesDirty = false;
-        return;
-    }
-
-    if ( m_processingTextureSignatureValid
-      && m_processingTextureSignature
-            == m_presentationOptions.previewProcessing.signature
-      && m_levelsLutTexture
-      && m_matrixLutRTexture
-      && m_matrixLutGTexture
-      && m_matrixLutBTexture
-      && m_gammaLutTexture )
-    {
-        m_processingTexturesDirty = false;
-        return;
-    }
-
-    const QByteArray & levelsLut = m_presentationOptions.previewProcessing.levelsLut;
-    const QByteArray & matrixLutR = m_presentationOptions.previewProcessing.matrixLutR;
-    const QByteArray & matrixLutG = m_presentationOptions.previewProcessing.matrixLutG;
-    const QByteArray & matrixLutB = m_presentationOptions.previewProcessing.matrixLutB;
-    const QByteArray & gammaLut = m_presentationOptions.previewProcessing.gammaLut;
-    if ( levelsLut.size() < static_cast<int>(65536u * sizeof(uint16_t))
-      || matrixLutR.size() < static_cast<int>(65536u * sizeof(uint16_t))
-      || matrixLutG.size() < static_cast<int>(65536u * sizeof(uint16_t))
-      || matrixLutB.size() < static_cast<int>(65536u * sizeof(uint16_t))
-      || gammaLut.size() < static_cast<int>(65536u * sizeof(uint16_t)) )
-    {
-        destroyProcessingTextures();
-        m_processingTexturesDirty = false;
-        return;
-    }
-
-    const QByteArray levelsBytes = gpuPreviewProcessingPackLookupTextureRgba16(levelsLut);
-    const QByteArray matrixRBytes = gpuPreviewProcessingPackLookupTextureRgba16(matrixLutR);
-    const QByteArray matrixGBytes = gpuPreviewProcessingPackLookupTextureRgba16(matrixLutG);
-    const QByteArray matrixBBytes = gpuPreviewProcessingPackLookupTextureRgba16(matrixLutB);
-    const QByteArray gammaBytes = gpuPreviewProcessingPackLookupTextureRgba16(gammaLut);
-
-    m_levelsLutTexture = createOrResizeLookupTexture(m_levelsLutTexture, 256, 256);
-    m_matrixLutRTexture = createOrResizeLookupTexture(m_matrixLutRTexture, 256, 256);
-    m_matrixLutGTexture = createOrResizeLookupTexture(m_matrixLutGTexture, 256, 256);
-    m_matrixLutBTexture = createOrResizeLookupTexture(m_matrixLutBTexture, 256, 256);
-    m_gammaLutTexture = createOrResizeLookupTexture(m_gammaLutTexture, 256, 256);
-
-    m_levelsLutTexture->setData(QOpenGLTexture::RGBA,
-                                QOpenGLTexture::UInt16,
-                                levelsBytes.constData());
-    m_matrixLutRTexture->setData(QOpenGLTexture::RGBA,
-                                 QOpenGLTexture::UInt16,
-                                 matrixRBytes.constData());
-    m_matrixLutGTexture->setData(QOpenGLTexture::RGBA,
-                                 QOpenGLTexture::UInt16,
-                                 matrixGBytes.constData());
-    m_matrixLutBTexture->setData(QOpenGLTexture::RGBA,
-                                 QOpenGLTexture::UInt16,
-                                 matrixBBytes.constData());
-    m_gammaLutTexture->setData(QOpenGLTexture::RGBA,
-                               QOpenGLTexture::UInt16,
-                               gammaBytes.constData());
-    m_processingTextureSignature =
-        m_presentationOptions.previewProcessing.signature;
-    m_processingTextureSignatureValid = true;
+    gpuPreviewProcessingUpdateLutTextureSet(m_lutSet, m_presentationOptions.previewProcessing);
     m_processingTexturesDirty = false;
 }
 

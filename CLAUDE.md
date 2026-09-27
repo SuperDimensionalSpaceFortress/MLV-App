@@ -14,7 +14,7 @@ Standing September 9 owner ruling: Agent Bridge product SoT is
 Factory Bridge stays integration smoke only. Follow
 [agents/agent-bridge-source-of-truth.md](agents/agent-bridge-source-of-truth.md).
 
-Standing September 14: MLV-App dogfoods the fleet factory kernel r1 (not adopted).
+Standing September 26 (owner): the September Factory Kernel IS the software factory; the hub model is the deprecated legacy software factory. Dogfood and enhance the kernel by shipping product; file kernel findings and fixes to the doctrine bus.
 Instance map: [agents/factory-kernel-instance.md](agents/factory-kernel-instance.md).
 
 Index only; details live in claude/. Policy: [fragmentation limits](docs/22-doc-fragmentation-policy.md), 8KB soft/12KB hard. Check with:

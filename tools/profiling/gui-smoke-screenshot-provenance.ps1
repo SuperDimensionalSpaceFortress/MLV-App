@@ -76,10 +76,17 @@ function Get-GuiSmokeScreenshotProvenanceV1 {
     $screenshotLine = if ($screenshotIndex -ge 0) { $OrderedLogLines[$screenshotIndex] } else { $null }
     $present = if ($presentLine) { Convert-GuiSmokeProvenanceLogLineToObject $presentLine } else { $null }
     $manifest = if ($manifestLine) { Convert-GuiSmokeProvenanceLogLineToObject $manifestLine } else { $null }
+    $screenshot = if ($screenshotLine) { Convert-GuiSmokeProvenanceLogLineToObject $screenshotLine } else { $null }
 
     $failures = [System.Collections.Generic.List[string]]::new()
     if ($screenshotIndex -lt 0) {
         $failures.Add('missing-screenshot-event')
+    }
+    $screenshotMethod = Get-GuiSmokeObjectPropertyValue $screenshot 'method'
+    $glWindowActive = Get-GuiSmokeObjectPropertyValue $screenshot 'gl_window_active'
+    if ($null -ne $glWindowActive -and [long]$glWindowActive -ne 0 -and
+        [string]$screenshotMethod -ne 'gl_window_framebuffer_readback') {
+        $failures.Add('gl-window-active-non-gl-capture-method')
     }
     if ($presentIndex -lt 0) {
         $failures.Add('missing-present-content-before-screenshot')
@@ -183,6 +190,17 @@ function Copy-GuiSmokeStableProperties {
     return [pscustomobject]$copy
 }
 
+# KNOWN LIMITATION (ATTR3-VISUAL-QUALITY-EVIDENCE-1, part 1; not fixed this round -- carried
+# forward as documented follow-up work, not silently accepted). The GPU-recon TEXTURE
+# presentation path never emits a draw_frame_ready.present_content line (or its associated
+# ready-begin/render-request) for the frame it presents, only the CPU displayImage path does
+# (platform/qt/MainWindow.cpp ~:5880-5906). So -RequireFreshScreenshotRender can never pass on
+# that texture path today: the chain below always fails at 'missing-associated-present-content'
+# (and the hash checks that depend on it), even for a valid, correctly-presented capture. This
+# is fail-closed and correct -- it never falsely certifies freshness it cannot prove -- but a red
+# result on that path must be read as "provenance not yet wired for this path", never as a flake
+# or as evidence of a bad frame. Part 2 is expected to add present-content logging to the texture
+# path; until then, treat any texture-path -RequireFreshScreenshotRender run as permanently red.
 function Get-GuiSmokeScreenshotProvenanceV2 {
     [CmdletBinding()]
     param(
@@ -216,6 +234,11 @@ function Get-GuiSmokeScreenshotProvenanceV2 {
     if ($null -eq $screenshotHeight -or [long]$screenshotHeight -le 0) {
         $failures.Add('missing-screenshot-height')
     }
+    $glWindowActive = Get-GuiSmokeObjectPropertyValue $screenshot 'gl_window_active'
+    if ($null -ne $glWindowActive -and [long]$glWindowActive -ne 0 -and
+        [string]$screenshotMethod -ne 'gl_window_framebuffer_readback') {
+        $failures.Add('gl-window-active-non-gl-capture-method')
+    }
 
     $searchEnd = if ($screenshotIndex -ge 0) { $screenshotIndex - 1 } else { $OrderedLogLines.Count - 1 }
     $frameIndex = Find-GuiSmokeLogEventIndex `
@@ -237,6 +260,32 @@ function Get-GuiSmokeScreenshotProvenanceV2 {
         @{ value = $requestSerial; failure = 'missing-request-serial' }
     )) {
         if ($null -eq $required.value) { $failures.Add($required.failure) }
+    }
+
+    # The GL-window path reports, on the screenshot event itself, the presentation serial
+    # of the frame grabPresentedFramebufferIfActive() actually captured (see
+    # platform/qt/GpuDisplayWindow.cpp paintGL()/grabPresentedFramebufferIfActive()) --
+    # this is the frame's OWN account of what it captured, independent of the
+    # playback_smoke.frame binding derived above. Cross-checking the two closes the gap
+    # where a screenshot could otherwise be attributed to the wrong frame (e.g. queued
+    # telemetry running ahead of what was actually captured). Only meaningful for the
+    # GL-window readback method: other capture methods never populate this field and
+    # legitimately report serial_valid=0, which must not be treated as a failure here.
+    $glWindowPresentedSerial = Get-GuiSmokeObjectPropertyValue $screenshot 'gl_window_presented_serial'
+    $glWindowPresentedSerialValid = Get-GuiSmokeObjectPropertyValue $screenshot 'gl_window_presented_serial_valid'
+    if ([string]$screenshotMethod -eq 'gl_window_framebuffer_readback') {
+        if ($null -eq $glWindowPresentedSerialValid) {
+            $failures.Add('missing-gl-window-presented-serial-valid')
+        }
+        elseif ([long]$glWindowPresentedSerialValid -eq 0) {
+            $failures.Add('gl-window-presented-serial-invalid')
+        }
+        if ($null -eq $glWindowPresentedSerial) {
+            $failures.Add('missing-gl-window-presented-serial')
+        }
+        elseif ($null -ne $requestSerial -and [long]$glWindowPresentedSerial -ne [long]$requestSerial) {
+            $failures.Add('gl-window-presented-serial-mismatch')
+        }
     }
 
     $manifestIndex = -1
@@ -472,6 +521,8 @@ function Get-GuiSmokeScreenshotProvenanceV2 {
         screenshotMethod = $screenshotMethod
         screenshotWidth = $screenshotWidth
         screenshotHeight = $screenshotHeight
+        glWindowPresentedSerial = $glWindowPresentedSerial
+        glWindowPresentedSerialValid = $glWindowPresentedSerialValid
         presentedHistory = @($history)
         effectiveState = [pscustomobject]@{
             visualState = Copy-GuiSmokeStableProperties $visualState @('event')

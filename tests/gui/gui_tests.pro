@@ -6,6 +6,10 @@ TEMPLATE = app
 CONFIG += testcase
 TARGET = gui_tests
 
+# GpuDisplayWindow.cpp's swap telemetry calls mlv_stage_timing_now(), whose non-QPC fallback is omp_get_wtime();
+# the app links libgomp in MLVApp.pro, gui_tests must too (hosted Windows GUI Pilot link failure on #159/#161).
+win32: LIBS += -llibgomp-1
+
 SOURCES += \
     $$REPO_ROOT/platform/qt/ColorToolButton.cpp \
     $$REPO_ROOT/platform/qt/GpuDebayer.cpp \

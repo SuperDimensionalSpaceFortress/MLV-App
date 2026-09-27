@@ -1,10 +1,11 @@
 # attr3_publish_write_scan.ps1 -- REGRESSION TRIPWIRE for the emitted PLAYBACK-ATTR-3-CUDA job
 # templates. It is NOT a soundness proof, and nothing may rely on it as one.
 #
-# THE SAFETY BOUNDARY IS AT RUNTIME, in tools/profiling/bachelor/AttrCudaArtifacts.psm1: every
-# publish write goes through Publish-AttrCuda* / New-AttrCudaDirectory (slot check + write in one
-# call), every tree delete through Remove-AttrCudaTree (trusted-root ancestor chain + no reparse
-# point inside). The job's trusted roots (the agent root, C:\mlvtmp) are provisioning boundaries.
+# THE SAFETY BOUNDARY IS AT RUNTIME, in tools/profiling/bachelor/AttrCudaArtifacts.psm1 and
+# tools/profiling/bachelor/AttrCudaOwnerFootage.psm1: every publish write goes through
+# Publish-AttrCuda* / New-AttrCudaDirectory (slot check + write in one call), every tree delete
+# through Remove-AttrCudaTree (trusted-root ancestor chain + no reparse point inside). The job's
+# trusted roots (the agent root, C:\mlvtmp) are provisioning boundaries.
 #
 # WHAT THIS SCRIPT DOES: it rejects the known-dangerous SHAPES a trusted author could introduce by
 # accident into the three templates, using an allowlist so that an unfamiliar shape fails loudly
@@ -40,7 +41,7 @@
 param(
     [string[]]$GeneratorPath = @(),
     [string[]]$TemplateFile = @(),
-    [string]$ModulePath = ''
+    [string[]]$ModulePath = @()
 )
 
 $ErrorActionPreference = 'Stop'
@@ -49,8 +50,17 @@ Set-StrictMode -Version Latest
 # `pwsh -File` cannot pass an array, so ';'-separated lists are accepted too.
 $GeneratorPath = @($GeneratorPath | ForEach-Object { $_ -split ';' } | Where-Object { $_ })
 $TemplateFile = @($TemplateFile | ForEach-Object { $_ -split ';' } | Where-Object { $_ })
-if ([string]::IsNullOrWhiteSpace($ModulePath)) {
-    $ModulePath = Join-Path $PSScriptRoot '..\profiling\bachelor\AttrCudaArtifacts.psm1'
+$ModulePath = @($ModulePath | ForEach-Object { $_ -split ';' } | Where-Object { $_ })
+if ($ModulePath.Count -eq 0) {
+    # ATTR3-FOOTAGE-BIND-1 PR-B round 4b: playback-attr-3-cuda-job.ps1 also embeds functions from
+    # AttrCudaOwnerFootage.psm1 (the private owner-footage workspace), moved out of
+    # AttrCudaArtifacts.psm1 so that module stays free of any footage knowledge -- see that
+    # module's own header. Both are scanned by default so a caller that names neither still gets
+    # the templates' full module-function vocabulary.
+    $ModulePath = @(
+        (Join-Path $PSScriptRoot '..\profiling\bachelor\AttrCudaArtifacts.psm1'),
+        (Join-Path $PSScriptRoot '..\profiling\bachelor\AttrCudaOwnerFootage.psm1')
+    )
 }
 
 $allowedCmdlets = @(
@@ -69,8 +79,9 @@ $childExecutables = @('vsLocator', 'psExe', 'cuobjdump', 'exportTool', 'nvcc')
 $allowedStatic = @(
     'double::Parse', 'double::TryParse', 'Environment::GetEnvironmentVariable',
     'Globalization.CultureInfo::InvariantCulture', 'Globalization.NumberStyles::Float',
+    'Guid::NewGuid',
     'IO.File::ReadAllText', 'IO.Path::GetFileNameWithoutExtension', 'IO.Path::GetFullPath',
-    'math::Ceiling', 'math::Floor', 'math::Pow', 'math::Sqrt', 'regex::Escape', 'regex::Matches',
+    'math::Ceiling', 'math::Floor', 'math::Pow', 'math::Round', 'math::Sqrt', 'regex::Escape', 'regex::Matches',
     'string::IsNullOrWhiteSpace', 'StringComparison::OrdinalIgnoreCase',
     'System.Collections.Generic.List[object]::new', 'System.Collections.Specialized.OrderedDictionary::new'
 )
@@ -382,7 +393,7 @@ function Invoke-Scan([string]$Source, [string]$Text, [string[]]$ModuleFunctions)
     }
 }
 
-$moduleFunctions = @(Get-ModuleFunctionNames $ModulePath)
+$moduleFunctions = @($ModulePath | ForEach-Object { Get-ModuleFunctionNames $_ })
 
 foreach ($generator in $GeneratorPath) {
     $text = [IO.File]::ReadAllText($generator)

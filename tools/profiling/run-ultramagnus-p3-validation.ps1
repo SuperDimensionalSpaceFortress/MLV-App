@@ -177,6 +177,54 @@ function Add-Failure {
     [void]$Failures.Add($Message)
 }
 
+function Get-SmokeSummaryHostLoadFields {
+    # PLAYBACK-MEASURE-HOST-LOAD-GATE-1 round 3: this script invokes run-release-gui-smoke.ps1
+    # per clip and already parses its JSON output ($result below) for presentedFps etc; that JSON
+    # carries a hostLoad block. Same fail-toward-provisional logic as
+    # run-release-cuda-playback-ab.ps1's Get-SmokeSummaryHostLoadFields (this script is a separate
+    # standalone .ps1 with no shared module, hence the duplicate rather than an import).
+    param([object]$HostLoad)
+
+    if ($null -eq $HostLoad) {
+        return [pscustomobject]@{
+            provisional = $true
+            state = "unknown"
+            reason = "no hostLoad telemetry recorded in the smoke result"
+        }
+    }
+    # round 4 (sol major): "provisional" and "state" used to be derived independently, so a block
+    # carrying an explicit provisional=false alongside a missing/blank state read as
+    # state=unknown PROVISIONAL=false -- an inconsistent, clean-reading combination that let
+    # UNKNOWN enter an fps comparison unrefused. state=unknown now always forces provisional=true.
+    # round 8 (sol MAJOR item 3): that fix only special-cased state=="unknown" -- a leg with
+    # state="exceeded" and an inconsistent/fabricated provisional=false still read clean. THE
+    # CANONICAL PREDICATE (identical at every one of this card's six sites -- see
+    # compare-machine-perf.ps1's Get-PlaybackAbLegHostLoadProvisional for the full cross-file
+    # note): clean iff state=="quiet" AND provisional==false; every other combination is
+    # provisional.
+    $provisionalProperty = $HostLoad.PSObject.Properties["provisional"]
+    $provisionalDeclared = if ($null -eq $provisionalProperty -or $null -eq $provisionalProperty.Value) {
+        $true
+    } else {
+        [bool]$provisionalProperty.Value
+    }
+    $stateProperty = $HostLoad.PSObject.Properties["state"]
+    $state = if ($null -eq $stateProperty -or [string]::IsNullOrWhiteSpace([string]$stateProperty.Value)) {
+        "unknown"
+    } else {
+        [string]$stateProperty.Value
+    }
+    $provisional = ($provisionalDeclared -or $state -ne "quiet")
+    $reasonProperty = $HostLoad.PSObject.Properties["reason"]
+    $reason = if ($null -eq $reasonProperty) { $null } else { [string]$reasonProperty.Value }
+
+    [pscustomobject]@{
+        provisional = $provisional
+        state = $state
+        reason = $reason
+    }
+}
+
 function Add-NullableDouble {
     param(
         [System.Collections.Generic.List[double]]$Values,
@@ -599,6 +647,46 @@ function Import-EvidencePacket {
                     [double]$summary.inputs.minPresentedFps
                 } else {
                     24.0
+                }
+                # round 4 (sol major): re-applying the floor is not enough on its own -- a legacy
+                # or degenerate packet whose summary.proof.speedValidated was computed under an
+                # older schema (before host-load provenance existed, or a future drift) could
+                # still carry a presentedFps that clears the floor while its host load was
+                # provisional or unrecorded. Reject independently, per clip, rather than trusting
+                # speedValidated (checked above) alone -- fail toward provisional on a missing
+                # property, same stance as Get-SmokeSummaryHostLoadFields.
+                #
+                # round 5 (sol BLOCKER): reading hostLoadProvisional alone repeats the exact
+                # inconsistency round 4 closed at the producer -- a clip carrying an explicit
+                # hostLoadProvisional=false alongside a missing/blank/"unknown" hostLoadState is a
+                # legacy or degenerate clip, not a clean one. sol's repro: a clip with
+                # hostLoadProvisional=false and hostLoadState='unknown' passed this check
+                # unrefused. Combine both properties the same way Get-SmokeSummaryHostLoadFields
+                # already does above in this file, so reading the flag without the state is not
+                # possible here either.
+                # round 8 (sol MAJOR item 3): that fix only special-cased hostLoadState=="unknown"
+                # -- a clip with hostLoadState="exceeded" and an inconsistent/fabricated
+                # hostLoadProvisional=false still passed unrefused. THE CANONICAL PREDICATE
+                # (identical at every one of this card's readers -- see compare-machine-perf.ps1's
+                # Get-PlaybackAbLegHostLoadProvisional for the full cross-file note): clean iff
+                # state=="quiet" AND provisional==false; every other combination is provisional.
+                $clipHostLoadProvisionalProperty = $clip.PSObject.Properties["hostLoadProvisional"]
+                $clipHostLoadProvisionalDeclared = if ($null -eq $clipHostLoadProvisionalProperty -or
+                    $null -eq $clipHostLoadProvisionalProperty.Value) {
+                    $true
+                } else {
+                    [bool]$clipHostLoadProvisionalProperty.Value
+                }
+                $clipHostLoadStateProperty = $clip.PSObject.Properties["hostLoadState"]
+                $clipHostLoadState = if ($null -eq $clipHostLoadStateProperty -or
+                    [string]::IsNullOrWhiteSpace([string]$clipHostLoadStateProperty.Value)) {
+                    "unknown"
+                } else {
+                    [string]$clipHostLoadStateProperty.Value
+                }
+                $clipHostLoadProvisional = ($clipHostLoadProvisionalDeclared -or $clipHostLoadState -ne "quiet")
+                if ($clipHostLoadProvisional) {
+                    Add-Failure $importFailures "$clipName host load was PROVISIONAL or unrecorded (hostLoadProvisional=$clipHostLoadProvisional); an fps number measured under provisional host load is not proof of speed, regardless of the floor."
                 }
                 if ([double]$clip.presentedFps -lt $minSpeedFps) {
                     Add-Failure $importFailures "$clipName had presentedFps=$($clip.presentedFps); expected >= $minSpeedFps for speed proof mode."
@@ -1170,6 +1258,13 @@ exit `$LASTEXITCODE
             Add-Failure $clipFailures "Smoke result did not report a log path."
         }
 
+        # round 4 (sol major): computed here, ahead of the SpeedLeg floor check below that needs
+        # it -- it used to be computed only after $clipFailures was finalized, so a loaded host
+        # that dragged presented_fps under the hard floor was recorded as a genuine clipFailures
+        # entry, conflating "we couldn't get a clean signal" with "the build is broken", exactly
+        # backwards from this card's own rule that host load MARKS, never fails, a run.
+        $hostLoadFields = Get-SmokeSummaryHostLoadFields -HostLoad $(if ($result) { $result.hostLoad } else { $null })
+
         if ($receiptRawFixesEnabled) {
             if ($noReadbackFrames -le 0) {
                 Add-Failure $clipFailures "gpu_texture_no_readback_frames was $noReadbackFrames; expected > 0."
@@ -1195,7 +1290,18 @@ exit `$LASTEXITCODE
             if ($SpeedLeg) {
                 $presentedFpsValue = if ($result) { [double]$result.log.summary.presented_fps } else { 0.0 }
                 if ($presentedFpsValue -lt $MinPresentedFps) {
-                    Add-Failure $clipFailures ("Speed leg presented_fps={0:N3} was below hard floor {1:N3} fps." -f $presentedFpsValue, $MinPresentedFps)
+                    if ($hostLoadFields.provisional) {
+                        [void]$warnings.Add((
+                            "Speed leg presented_fps={0:N3} was below hard floor {1:N3} fps, but " +
+                            "host load was PROVISIONAL (state=$($hostLoadFields.state) " +
+                            "reason=$($hostLoadFields.reason)); this is not evidence the build is " +
+                            "slow, only that this run's fps is not a trustworthy signal. Rerun on " +
+                            "a quiet host."
+                        ) -f $presentedFpsValue, $MinPresentedFps)
+                    }
+                    else {
+                        Add-Failure $clipFailures ("Speed leg presented_fps={0:N3} was below hard floor {1:N3} fps." -f $presentedFpsValue, $MinPresentedFps)
+                    }
                 }
                 if (($borrowedNoReadbackInputFrameCount + $ownedNoReadbackInputFrameCount) -le 0) {
                     Add-Failure $clipFailures "Speed leg did not report borrowed or owned no-readback input frames; expected r16_amaze_skip_input_borrowed=1 or gpu_tex_nr_owned_input=1."
@@ -1269,6 +1375,10 @@ exit `$LASTEXITCODE
         }
 
         $clipStatus = if ($clipFailures.Count -eq 0) { "success" } else { "failed" }
+        # MARKS, never fails: per this card's own rule, host load never fails a run by itself --
+        # it only disqualifies the fps it recorded from being trusted as a regression/acceptance
+        # signal. $speedValidated below is exactly that acceptance signal for the speed leg.
+        # ($hostLoadFields is computed above, ahead of the SpeedLeg floor check that needs it.)
         $clipResults += [pscustomobject]@{
             clip = $clipItem.FullName
             status = $clipStatus
@@ -1281,6 +1391,9 @@ exit `$LASTEXITCODE
             presentedFrames = if ($result) { $result.log.summary.presented_frames } else { $null }
             presentedFps = if ($result) { $result.log.summary.presented_fps } else { $null }
             timelineFps = if ($result) { $result.log.summary.timeline_fps } else { $null }
+            hostLoadProvisional = $hostLoadFields.provisional
+            hostLoadState = $hostLoadFields.state
+            hostLoadReason = $hostLoadFields.reason
             gpuTextureNoReadbackFrames = $noReadbackFrames
             gpuTextureReadbackFrames = $textureReadbackFrames
             noReadbackCandidateFrameCount = $noReadbackCandidateFrameCount
@@ -1370,7 +1483,12 @@ $speedValidated =
         [double]$_.presentedFps -lt $MinPresentedFps -or
         [int]$_.gpuTextureNoReadbackFrames -le 0 -or
         [int]$_.fallbackFrameCount -ne 0 -or
-        $acceptedAmazeFrameCount -ne [int]$_.activeNoReadbackFrameCount
+        $acceptedAmazeFrameCount -ne [int]$_.activeNoReadbackFrameCount -or
+        # PLAYBACK-MEASURE-HOST-LOAD-GATE-1: speedValidated is exactly the "acceptance signal"
+        # this card's own rule names -- a presentedFps that cleared $MinPresentedFps only
+        # because a loaded/uncollectable host happened not to drag it far enough below the
+        # floor is not proof the build is fast; it is proof the floor was generous enough.
+        [bool]$_.hostLoadProvisional
     }).Count -eq 0)
 
 $summary = [pscustomobject]@{

@@ -78,10 +78,33 @@ try {
     } while ((Get-Date) -lt $heartbeatDeadline)
     if (-not (Test-Path -LiteralPath $heartbeatPath -PathType Leaf)) { throw "Timed out waiting for $heartbeatPath" }
 
+    # The agent is started with its own -JobTimeoutSec 4 (below); the client asks for 20s. Before
+    # ATTR3-FOOTAGE-STAGE-SUBMIT-RETRY-1 round 2 this agent had no meta.json handling at all, so it
+    # always killed at its own 4s regardless of what the client asked for -- this test passed, but
+    # for the wrong reason (fable/sol major 2). It now must kill at the REQUESTED 20s instead.
     $result = & $runnerScript -ScriptPath $payloadPath -AgentShare $root -TimeoutSec 20 -PollSeconds 1
     if ([int]$result.exitCode -ne 124 -or -not [bool]$result.timedOut) {
         throw "Expected agent timeout result; got exitCode=$($result.exitCode) timedOut=$($result.timedOut)."
     }
+    if ([int]$result.timeoutSec -ne 20) {
+        throw "Expected the agent to honour the job's metadata budget (20s) rather than its own -JobTimeoutSec default (4s); got timeoutSec=$($result.timeoutSec)."
+    }
+    $metaInboxPath = Join-Path $root ("inbox\{0}.meta.json" -f $result.jobId)
+    $metaProcessedPath = Join-Path $root ("processed\{0}.meta.json" -f $result.jobId)
+    # fable round 6 minor: this honour-path E2E used to assert both facts the instant um-run.ps1
+    # returned, with no settle allowance at all -- the exact flake class round 5 fixed for
+    # test_ultra_magnus_agent_metadata.py's own archival assertion (the agent publishes
+    # outbox\<id>.result.json, which is what retires the JobId and what um-run.ps1 polls for,
+    # BEFORE it archives inbox\<id>.job.ps1/meta.json to processed\ -- a few more of the agent's own
+    # instructions past the instant the result becomes visible, not simultaneous with it). Protected
+    # only incidentally, until now, by um-run.ps1's 400ms post-result settle sleep and 1s poll
+    # cadence. Same bounded 5s poll, same two assertions.
+    $metaSettleDeadline = (Get-Date).AddSeconds(5)
+    while ((Test-Path -LiteralPath $metaInboxPath) -and -not (Test-Path -LiteralPath $metaProcessedPath) -and (Get-Date) -lt $metaSettleDeadline) {
+        Start-Sleep -Milliseconds 100
+    }
+    if (Test-Path -LiteralPath $metaInboxPath) { throw "Job metadata was left behind in inbox: $metaInboxPath" }
+    if (-not (Test-Path -LiteralPath $metaProcessedPath)) { throw "Job metadata was not moved to processed alongside its job: $metaProcessedPath" }
     if (-not (Test-Path -LiteralPath $grandchildIdentityPath -PathType Leaf)) { throw 'Tracked descendant did not publish its identity.' }
     $grandchildIdentity = Get-Content -LiteralPath $grandchildIdentityPath -Raw | ConvertFrom-Json
     $survivor = Get-Process -Id ([int]$grandchildIdentity.processId) -ErrorAction SilentlyContinue

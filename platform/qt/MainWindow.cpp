@@ -37,6 +37,7 @@ extern "C" {
 #include <QThread>
 #include <QTime>
 #include <QByteArray>
+#include <QGuiApplication>
 #include <QSignalBlocker>
 #include <QSettings>
 #include <QCryptographicHash>
@@ -63,6 +64,7 @@ extern "C" {
 #include <QDate>
 #include <QStorageInfo>
 #include <QColorDialog>
+#include <QPainter>
 #include <algorithm>
 #include <cstring>
 #include <functional>
@@ -2095,6 +2097,20 @@ static double normalizedProcessCpuPercent( double cpuSecondsDelta,
         * ( 100.0 / static_cast<double>( cores ) );
 }
 
+/* Single source of truth for "is this window the OS foreground window", used both by
+ * forcePlaybackSmokeWindowForeground()'s verification step and by the playback-smoke
+ * foreground telemetry (session begin / gate) -- CUDA-PERF-PLAYBACK-FOREGROUND-1. */
+static bool nativeWindowIsForeground( QWidget *window )
+{
+#ifdef Q_OS_WIN
+    if( !window ) return false;
+    const HWND hwnd = reinterpret_cast<HWND>( window->window()->winId() );
+    return hwnd != nullptr && GetForegroundWindow() == hwnd;
+#else
+    return window && window->isActiveWindow();
+#endif
+}
+
 /* spaceTag argument options: ffmpeg color space tag number compliant */
 #define SPACETAG_REC709   1   /* rec709 color space */
 #define SPACETAG_UNKNOWN  2   /* No color space tag set */
@@ -2656,6 +2672,17 @@ MainWindow::MainWindow(int &argc, char **argv, QWidget *parent) :
              Qt::QueuedConnection );
     m_playbackPrepStop.store( false, std::memory_order_release );
     m_playbackPrepThread = std::thread( &MainWindow::playbackPrepThreadLoop, this );
+
+    // Playback-smoke foreground-loss telemetry (CUDA-PERF-PLAYBACK-FOREGROUND-1):
+    // event-driven, not per-frame polling. Reuses the existing MLVAPP_PLAYBACK_SMOKE_TELEMETRY
+    // gate exactly like GpuDisplayWindow's swap telemetry -- decided once, here, so when the
+    // env var is off this connection is never made at all (zero cost, not just an early
+    // return in the slot).
+    if( playbackSmokeFrameTelemetryEnabled() )
+    {
+        connect( qApp, &QGuiApplication::applicationStateChanged,
+                 this, &MainWindow::onPlaybackSmokeApplicationStateChanged );
+    }
 
     //Init scripting engine
     m_pScripting = new Scripting( this );
@@ -5026,6 +5053,7 @@ void MainWindow::presentPlaybackPreparedFrame( const PlaybackPrepResult &result 
                         &gpuReconState,
                         readyFrame.gpuPlaybackReconTextureBlackLevel,
                         readyFrame.gpuPlaybackReconTextureWbMultipliers.data(),
+                        task.gpuPresentationOptions,
                         &texturePresentReason,
                         &texturePresentTiming,
                         &texturePresentHandoffMode,
@@ -5034,7 +5062,8 @@ void MainWindow::presentPlaybackPreparedFrame( const PlaybackPrepResult &result 
                         task.gpuPlaybackReconTextureRetainedDeviceWidth,
                         task.gpuPlaybackReconTextureRetainedDeviceHeight,
                         textureDisplaySize.width(),
-                        textureDisplaySize.height() );
+                        textureDisplaySize.height(),
+                        task.requestSerial );
                 gpuPlaybackReconAmazeTexturePresentedByWindow =
                     framePresentedByViewport;
             }
@@ -5828,6 +5857,24 @@ void MainWindow::presentPlaybackPreparedFrame( const PlaybackPrepResult &result 
         readyFrame.stageTimingTelemetry.insert(
             QStringLiteral("playback_prep_region_total_ms"),
             prepRegionTotalMs );
+        const bool preparedEmpty =
+            result.preparedOwnedImage.isNull()
+            && result.preparedImage.empty()
+            && !( result.preparedBorrowedImage && result.preparedBorrowedImageSize > 0 );
+        m_presentNothingDropCount.fetch_add( 1, std::memory_order_acq_rel );
+        logInteractionEvent(
+            QStringLiteral("draw_frame_ready.present_nothing"),
+            QStringLiteral("serial=%1 display_frame=%2 amaze_texture_candidate=%3 "
+                           "gpu16=%4 widget_viewport_installed=%5 window_active=%6 "
+                           "prepared_empty=%7 texture_fallback_reason=\"%8\"")
+                .arg( static_cast<qulonglong>( task.requestSerial ) )
+                .arg( static_cast<qulonglong>( display_frame ) )
+                .arg( bool01( gpuAmazeTexturePresentCandidate ) )
+                .arg( bool01( gpu16PreviewActive ) )
+                .arg( bool01( GpuDisplayViewport::isInstalledOn( ui->graphicsView ) ) )
+                .arg( bool01( GpuDisplayWindow::isActive() ) )
+                .arg( bool01( preparedEmpty ) )
+                .arg( sanitizeLogValue( readyFrame.gpuAmazeFallbackReason ) ) );
         if( m_pRenderThread )
             m_pRenderThread->releasePresentedFrameForRequestSerial( task.requestSerial );
         m_frameStillDrawing = m_pRenderThread && !m_pRenderThread->isIdle();
@@ -5890,10 +5937,14 @@ void MainWindow::presentPlaybackPreparedFrame( const PlaybackPrepResult &result 
     bool imagePresentedByViewport = false;
     if( !framePresentedByViewport )
     {
+        // Threaded through so GpuDisplayWindow can record which requestSerial it actually
+        // swapped in -- see GpuDisplayWindow::grabPresentedFramebufferIfActive.
+        GpuDisplayViewport::PresentationOptions presentationOptions = task.gpuPresentationOptions;
+        presentationOptions.presentationSerial = task.requestSerial;
         imagePresentedByViewport = GpuDisplayViewport::presentImage( ui->graphicsView,
                                                                       m_pGraphicsItem,
                                                                       displayImage,
-                                                                      task.gpuPresentationOptions );
+                                                                      presentationOptions );
     }
 
     if( !framePresentedByViewport && !imagePresentedByViewport )
@@ -6168,6 +6219,8 @@ void MainWindow::drawFrame( bool updateTimecodeLabel )
 
     MainWindowGpuPreviewPolicyState renderPolicy;
     renderPolicy.gpuViewportInstalled = gpuPreviewSurfaceActive();
+    renderPolicy.gpuWidgetViewportInstalled =
+        GpuDisplayViewport::isInstalledOn( ui->graphicsView );
     renderPolicy.gpuPreviewProcessingBackendRequest = m_gpuPreviewProcessingBackendRequest;
     renderPolicy.gpuPreviewProcessingEnvironmentRequested =
         gpuPreviewProcessingRequestedByEnvironment();
@@ -8812,12 +8865,34 @@ int MainWindow::runGuiPlaybackSmoke(const GuiPlaybackSmokeOptions & options)
     // clip plays once, the engine unchecks Play at clip-end, and the wait loop below exits early ("MLV
     // playback stopping too early"). Frame-matched A/B callers omit --loop so both legs stop on the same frame.
     if( options.loopPlayback && !ui->actionLoop->isChecked() ) ui->actionLoop->trigger();
+    // CUDA-PERF-PLAYBACK-FOREGROUND-1: force the window to the OS foreground right before
+    // the measured play trigger below -- a process launched by a background measurement job
+    // otherwise plays occluded/background, which a compositor can present at far fewer
+    // frames than the app submits.
+    forcePlaybackSmokeWindowForeground();
     ui->actionPlay->trigger();
     qApp->processEvents( QEventLoop::AllEvents );
     if( !ui->actionPlay->isChecked() )
     {
         err << "[GUI-SMOKE] ERROR: Play action did not enter checked state.\n";
         return 7;
+    }
+
+    // HARDENING (CUDA-PLAYBACK-CONTACT-SHEET-2): bind the explicit measured-session marker to
+    // THIS trigger -- the one that starts the measured timed loop -- rather than to whichever
+    // playback session happens to close first via a "play-stop". beginPlaybackSmokeTelemetry()
+    // (invoked synchronously by the trigger() above, through on_actionPlay_toggled) has already
+    // assigned m_playbackSmokeSessionId for the session this call just opened, so it is safe to
+    // log it right here. Previously this was logged from finishPlaybackSmokeTelemetry() on the
+    // first "play-stop" of the process's lifetime, which a warmup settle (see the Look Assist
+    // Auto-warmup block above) or clip-lifecycle stress (which toggles Play inside the measured
+    // loop below) could reach first, mislabelling a session fragment as the measured session.
+    if( !m_playbackSmokeMeasuredSessionLogged )
+    {
+        m_playbackSmokeMeasuredSessionLogged = true;
+        qInfo().noquote()
+            << QStringLiteral( "playback_smoke.measured_session id=%1" )
+                   .arg( static_cast<qulonglong>( m_playbackSmokeSessionId ) );
     }
 
     /* The play transition is where the normal GUI turns the policy on for
@@ -8916,7 +8991,8 @@ int MainWindow::runGuiPlaybackSmoke(const GuiPlaybackSmokeOptions & options)
 
     auto seekAndSettleLoadedClip = [&]( int requestedFrame,
                                         const char *reason,
-                                        int *settledFrameOut ) -> bool
+                                        int *settledFrameOut,
+                                        int timeoutMs = 8000 ) -> bool
     {
         const int frameCount = loadedFrameCount();
         if( frameCount < 2 ) return false;
@@ -8925,7 +9001,7 @@ int MainWindow::runGuiPlaybackSmoke(const GuiPlaybackSmokeOptions & options)
         ui->horizontalSliderPosition->setValue( frameIndex );
         m_frameChanged = true;
         qApp->processEvents( QEventLoop::AllEvents );
-        return waitForFrameSettled( frameIndex, reason, 8000 );
+        return waitForFrameSettled( frameIndex, reason, qMax( 1, timeoutMs ) );
     };
 
     auto runClipLifecycleStress = [&]() -> bool
@@ -9127,6 +9203,38 @@ int MainWindow::runGuiPlaybackSmoke(const GuiPlaybackSmokeOptions & options)
         QThread::msleep( 10 );
     }
 
+    // Snapshot the measured-interval span now, before any later step (stress check,
+    // screenshots, stopping playback) can move the timeline: the un-timed contact-sheet
+    // pass below replays evenly spaced points across exactly this span, after playback
+    // has stopped and playback_smoke/swap telemetry has closed (see its capture block).
+    //
+    // BLOCKER fix (CUDA-PLAYBACK-CONTACT-SHEET-2): first..lastPresentedFrame is only the
+    // content actually covered when the measured run never wrapped. A looping run on a clip
+    // shorter than the measured duration wraps the timeline back to cutIn one or more times,
+    // and the LAST presented frame is then just wherever the final wrap happened to be sitting
+    // when the timer ran out -- an artifact of timing, not of what was shown. Once
+    // m_playbackSmokeWrapped is set (notePlaybackSmokePresentedFrame saw the timeline go
+    // backwards at least once), the run is known to have covered the WHOLE loop range at least
+    // once, so the span becomes cutIn..cutOut: the same two settings values on every host,
+    // never a presented-frame artifact that can differ run to run.
+    const qint64 contactSheetMeasuredElapsedMs = playbackClock.elapsed();
+    const bool contactSheetSpanWrapped = m_playbackSmokeWrapped;
+    int contactSheetStartFrame = options.startFrame;
+    int contactSheetEndFrame = m_playbackSmokeLastPresentedFrame >= 0
+        ? m_playbackSmokeLastPresentedFrame
+        : ui->horizontalSliderPosition->value();
+    if( contactSheetSpanWrapped )
+    {
+        const int contactSheetSpanTotalFrames = getMlvFrames( m_pMlvObject );
+        const int contactSheetLoopCutInFrame = qBound(
+            0, ui->spinBoxCutIn->value() - 1, qMax( 0, contactSheetSpanTotalFrames - 1 ) );
+        const int contactSheetLoopCutOutFrame = qBound(
+            contactSheetLoopCutInFrame, ui->spinBoxCutOut->value() - 1,
+            qMax( 0, contactSheetSpanTotalFrames - 1 ) );
+        contactSheetStartFrame = contactSheetLoopCutInFrame;
+        contactSheetEndFrame = contactSheetLoopCutOutFrame;
+    }
+
     if( m_playbackSmokeTargetPresentedFrames > 0
      && m_playbackSmokePresentedFrames != m_playbackSmokeTargetPresentedFrames )
     {
@@ -9159,6 +9267,48 @@ int MainWindow::runGuiPlaybackSmoke(const GuiPlaybackSmokeOptions & options)
         qApp->processEvents( QEventLoop::AllEvents );
 
         QPixmap windowScreenshot = grab();
+        QString windowScreenshotMethod = QStringLiteral("app_internal_window_grab");
+        bool glWindowComposited = false;
+        QString glWindowCompositeReason;
+        qulonglong glWindowCompositedPresentedSerial = 0;
+        bool glWindowCompositedPresentedSerialValid = false;
+        if( GpuDisplayWindow::isActive() )
+        {
+            QWidget *glWindowContainer =
+                findChild<QWidget *>( QStringLiteral("gpuDisplayWindowContainer") );
+            if( !glWindowContainer || !glWindowContainer->isVisible() )
+            {
+                glWindowCompositeReason = QStringLiteral(
+                    "GPU window container is not visible for window-screenshot compositing" );
+            }
+            else
+            {
+                QImage glWindowFrame;
+                quint64 glWindowPresentedSerial = 0;
+                bool glWindowPresentedSerialValid = false;
+                if( GpuDisplayWindow::grabPresentedFramebufferIfActive(
+                        &glWindowFrame, &glWindowCompositeReason,
+                        &glWindowPresentedSerial, &glWindowPresentedSerialValid )
+                 && !glWindowFrame.isNull()
+                 && !windowScreenshot.isNull() )
+                {
+                    glWindowCompositedPresentedSerial =
+                        static_cast<qulonglong>( glWindowPresentedSerial );
+                    glWindowCompositedPresentedSerialValid = glWindowPresentedSerialValid;
+                    const QPoint containerTopLeft =
+                        glWindowContainer->mapTo( this, QPoint( 0, 0 ) );
+                    const QRect targetRect(
+                        containerTopLeft, glWindowContainer->size() );
+                    QPainter windowScreenshotPainter( &windowScreenshot );
+                    windowScreenshotPainter.drawImage( targetRect, glWindowFrame );
+                    windowScreenshotPainter.end();
+                    glWindowComposited = true;
+                    windowScreenshotMethod = QStringLiteral(
+                        "app_internal_window_grab_composited_gl_window_framebuffer_readback" );
+                }
+            }
+        }
+
         QFileInfo windowScreenshotInfo( options.windowScreenshotOutputPath );
         if( !windowScreenshotInfo.absoluteDir().exists()
          && !QDir().mkpath( windowScreenshotInfo.absolutePath() ) )
@@ -9178,10 +9328,19 @@ int MainWindow::runGuiPlaybackSmoke(const GuiPlaybackSmokeOptions & options)
 
         logInteractionEvent(
             QStringLiteral("gui_smoke.window_screenshot"),
-            QStringLiteral("path=\"%1\" width=%2 height=%3 method=app_internal_window_grab fps_status=\"%4\"")
+            QStringLiteral("path=\"%1\" width=%2 height=%3 method=%4 gl_window_active=%5 "
+                            "gl_window_composited=%6 gl_window_composite_reason=\"%7\" "
+                            "gl_window_presented_serial=%8 gl_window_presented_serial_valid=%9 "
+                            "fps_status=\"%10\"")
                 .arg( windowScreenshotInfo.absoluteFilePath() )
                 .arg( windowScreenshot.width() )
                 .arg( windowScreenshot.height() )
+                .arg( windowScreenshotMethod )
+                .arg( bool01( GpuDisplayWindow::isActive() ) )
+                .arg( bool01( glWindowComposited ) )
+                .arg( glWindowCompositeReason )
+                .arg( glWindowCompositedPresentedSerial )
+                .arg( bool01( glWindowCompositedPresentedSerialValid ) )
                 .arg( m_pFpsStatus ? m_pFpsStatus->text() : QStringLiteral("unavailable") ) );
     }
 
@@ -9211,7 +9370,46 @@ int MainWindow::runGuiPlaybackSmoke(const GuiPlaybackSmokeOptions & options)
 
         QPixmap screenshot;
         QString screenshotMethod = QStringLiteral("app_internal_presented_pixmap");
-        if( ( GpuDisplayViewport::isTexturePresentationActive( ui->graphicsView )
+        QString glWindowReadbackReason;
+        qulonglong glWindowPresentedSerial = 0;
+        bool glWindowPresentedSerialValid = false;
+        if( GpuDisplayWindow::isActive() )
+        {
+            QImage glWindowFrame;
+            quint64 capturedSerial = 0;
+            bool capturedSerialValid = false;
+            if( GpuDisplayWindow::grabPresentedFramebufferIfActive(
+                    &glWindowFrame, &glWindowReadbackReason,
+                    &capturedSerial, &capturedSerialValid )
+             && !glWindowFrame.isNull() )
+            {
+                screenshot = QPixmap::fromImage( glWindowFrame );
+                screenshotMethod = QStringLiteral("gl_window_framebuffer_readback");
+                // The identity of the frame actually captured. Since round 5 (capture-by-
+                // real-present), the capture itself IS a real, synchronous paintGL()+swap:
+                // if a frame was pending and Qt's own event loop had not yet painted it, this
+                // call promotes and captures it right here, one paint earlier than Qt would
+                // have otherwise. So this may legitimately differ from screenshotSerial (the
+                // most recently QUEUED frame) exactly in that case; provenance should bind to
+                // this value, not screenshotSerial.
+                glWindowPresentedSerial = static_cast<qulonglong>( capturedSerial );
+                glWindowPresentedSerialValid = capturedSerialValid;
+            }
+            else
+            {
+                // The GL window is what's actually on screen. A failed framebuffer
+                // readback must never silently fall through to a pixmap/viewport
+                // capture -- that would save content from a different presentation
+                // surface than the one the user (and the coherence gate) is looking
+                // at, and the resulting screenshot would look plausible while being
+                // wrong. Fail the capture outright instead.
+                err << "[GUI-SMOKE] ERROR: gl_window_readback_required_but_failed: "
+                    << glWindowReadbackReason << "\n";
+                return 12;
+            }
+        }
+        if( screenshot.isNull()
+         && ( GpuDisplayViewport::isTexturePresentationActive( ui->graphicsView )
            || GpuDisplayViewport::hasPresentedGpuReconTexture( ui->graphicsView ) )
          && ui->graphicsView
          && ui->graphicsView->viewport() )
@@ -9260,7 +9458,10 @@ int MainWindow::runGuiPlaybackSmoke(const GuiPlaybackSmokeOptions & options)
 
         logInteractionEvent(
             QStringLiteral("gui_smoke.screenshot"),
-            QStringLiteral("path=\"%1\" width=%2 height=%3 method=%4 bytes=%5 sha256=%6 frame=%7 serial=%8 generation=%9")
+            QStringLiteral("path=\"%1\" width=%2 height=%3 method=%4 bytes=%5 sha256=%6 "
+                            "frame=%7 serial=%8 generation=%9 gl_window_active=%10 "
+                            "gl_window_readback_reason=\"%11\" "
+                            "gl_window_presented_serial=%12 gl_window_presented_serial_valid=%13")
                 .arg( screenshotInfo.absoluteFilePath() )
                 .arg( screenshot.width() )
                 .arg( screenshot.height() )
@@ -9269,7 +9470,11 @@ int MainWindow::runGuiPlaybackSmoke(const GuiPlaybackSmokeOptions & options)
                 .arg( QString::fromLatin1( screenshotSha256 ) )
                 .arg( screenshotFrame )
                 .arg( screenshotSerial )
-                .arg( screenshotGeneration ) );
+                .arg( screenshotGeneration )
+                .arg( bool01( GpuDisplayWindow::isActive() ) )
+                .arg( glWindowReadbackReason )
+                .arg( glWindowPresentedSerial )
+                .arg( bool01( glWindowPresentedSerialValid ) ) );
     }
 
     if( ui->actionPlay->isChecked() )
@@ -9284,6 +9489,325 @@ int MainWindow::runGuiPlaybackSmoke(const GuiPlaybackSmokeOptions & options)
     }
     m_frameStillDrawing = m_pRenderThread && !m_pRenderThread->isIdle();
 
+    // Contact-sheet capture: N evenly spaced frame positions from the just-measured
+    // playback span. Deliberately placed AFTER actionPlay was unchecked above (which
+    // already ran finishPlaybackSmokeTelemetry, closing both the playback_smoke frame
+    // counters and the GpuDisplayWindow swap-telemetry session for the MEASURED
+    // interval), so nothing below can perturb the fps/swap-cadence numbers already
+    // finalized for that interval.
+    //
+    // DEFAULT (options.contactSheetSeekMode == false): a genuine SECOND, un-timed
+    // PLAYBACK pass -- playback is started again from the span's start frame and left
+    // running while noteContactSheetPresentedFrame() (hooked into the same real-
+    // presented-frame call site as notePlaybackSmokePresentedFrame) grabs each target
+    // frame as it is actually presented. Every grab therefore comes from the real
+    // playback fast path (CUDA texture-present included), never a paused/seeked one.
+    //
+    // --contact-sheet-seek-mode (explicit, labelled alternative): the OLD capture,
+    // pausing/seeking to each target after playback has already stopped. A seeked frame
+    // is rendered by a different, non-playback path and can show a different look, so
+    // its sidecars record playback_path=false and render_path reflects whatever path
+    // that seek actually rendered through.
+    int contactSheetFramesWritten = 0;
+    QString contactSheetError;
+    if( !options.contactSheetDir.isEmpty() && options.contactSheetFrames > 0 )
+    {
+        // HARDENING (default-off): flips the cheap gate finishPresentedFrame() checks before
+        // calling noteContactSheetPresentedFrame() at all. Only ever true inside this block,
+        // so a smoke run with the options off makes zero contact-sheet calls per presented
+        // frame, not just an early-returning one.
+        m_contactSheetOptionsPresent = true;
+        const QDir contactSheetDirInfo( options.contactSheetDir );
+        if( !contactSheetDirInfo.exists() && !QDir().mkpath( options.contactSheetDir ) )
+        {
+            err << "[GUI-SMOKE] ERROR: failed to create contact sheet directory: "
+                << options.contactSheetDir << "\n";
+            return 13;
+        }
+
+        const double contactSheetFps = getFramerate();
+        const int contactSheetClipFrameCount = loadedFrameCount();
+        const int sheetStartFrame = qBound(
+            0, contactSheetStartFrame, qMax( 0, contactSheetClipFrameCount - 1 ) );
+        const int sheetEndFrame = qBound(
+            sheetStartFrame, contactSheetEndFrame, qMax( 0, contactSheetClipFrameCount - 1 ) );
+
+        QVector<int> contactSheetTargetFrames;
+        contactSheetTargetFrames.reserve( options.contactSheetFrames );
+        for( int i = 0; i < options.contactSheetFrames; ++i )
+        {
+            contactSheetTargetFrames.append( playback_frame_range::contactSheetTargetFrame(
+                i, options.contactSheetFrames, sheetStartFrame, sheetEndFrame ) );
+        }
+
+        if( options.contactSheetSeekMode )
+        {
+            for( int i = 0; i < options.contactSheetFrames; ++i )
+            {
+                const int targetFrame = contactSheetTargetFrames.at( i );
+
+                int settledFrame = targetFrame;
+                const bool settled = seekAndSettleLoadedClip(
+                    targetFrame, "gui-smoke-contact-sheet-seek", &settledFrame );
+
+                QImage contactFrameImage;
+                QString contactFrameSource = QStringLiteral("app_internal_viewport_grab");
+                QString contactFrameReadbackReason;
+                quint64 contactFramePresentedSerial = 0;
+                bool contactFramePresentedSerialValid = false;
+                QString contactFrameRenderPath;
+                if( settled )
+                {
+                    const QJsonObject &seekTiming = m_lastPresentedStageTimingTelemetry;
+                    const GpuPlaybackPipelineStatus seekPipelineStatus =
+                        mainWindowGpuPlaybackPipelineStatus(
+                            m_lastPresentedRequestContext.gpuPreviewPolicy,
+                            telemetryBoolValue( seekTiming, "gpu_playback_recon_used" ),
+                            telemetryBoolValue( seekTiming, "gpu_playback_recon_texture_present_active" ),
+                            telemetryBoolValue( seekTiming, "gpu_playback_recon_texture_present_no_readback_active" ) );
+                    contactFrameRenderPath = QString::fromLatin1(
+                        mainWindowGpuPlaybackPipelineStatusToken( seekPipelineStatus ) );
+
+                    if( GpuDisplayWindow::isActive() )
+                    {
+                        if( !GpuDisplayWindow::grabPresentedFramebufferIfActive(
+                                &contactFrameImage, &contactFrameReadbackReason,
+                                &contactFramePresentedSerial, &contactFramePresentedSerialValid )
+                         || contactFrameImage.isNull() )
+                        {
+                            contactFrameImage = QImage();
+                        }
+                        else
+                        {
+                            contactFrameSource = QStringLiteral("gl_window_framebuffer_readback");
+                        }
+                    }
+                    if( contactFrameImage.isNull()
+                     && ( GpuDisplayViewport::isTexturePresentationActive( ui->graphicsView )
+                       || GpuDisplayViewport::hasPresentedGpuReconTexture( ui->graphicsView ) )
+                     && ui->graphicsView && ui->graphicsView->viewport() )
+                    {
+                        contactFrameImage = ui->graphicsView->viewport()->grab().toImage();
+                        contactFrameSource = QStringLiteral("app_internal_gl_viewport_grab");
+                    }
+                    if( contactFrameImage.isNull() && m_pGraphicsItem )
+                    {
+                        contactFrameImage = m_pGraphicsItem->pixmap().toImage();
+                        contactFrameSource = QStringLiteral("app_internal_presented_pixmap");
+                    }
+                    if( contactFrameImage.isNull() && ui->graphicsView && ui->graphicsView->viewport() )
+                    {
+                        contactFrameImage = ui->graphicsView->viewport()->grab().toImage();
+                        contactFrameSource = QStringLiteral("app_internal_viewport_grab");
+                    }
+                }
+
+                const QString frameBaseName =
+                    QStringLiteral("frame-%1").arg( i, 2, 10, QLatin1Char('0') );
+                // H3: relative, never an absolute local path -- see the playback-mode hook's
+                // matching comment in noteContactSheetPresentedFrame.
+                const QString pngRelativeName = frameBaseName + QStringLiteral(".png");
+                const QString pngPath = contactSheetDirInfo.absoluteFilePath( pngRelativeName );
+                const QString jsonPath = contactSheetDirInfo.absoluteFilePath(
+                    frameBaseName + QStringLiteral(".json") );
+
+                bool frameOk = settled && !contactFrameImage.isNull()
+                    && contactFrameImage.save( pngPath, "PNG" );
+
+                const double elapsedMsForFrame = contactSheetFps > 0.0
+                    ? ( static_cast<double>( settledFrame - sheetStartFrame )
+                        / contactSheetFps ) * 1000.0
+                    : 0.0;
+
+                QJsonObject frameJson;
+                frameJson.insert( QStringLiteral("index"), i );
+                frameJson.insert( QStringLiteral("captured_utc"),
+                    QDateTime::currentDateTimeUtc().toString( Qt::ISODateWithMs ) );
+                frameJson.insert( QStringLiteral("serial"), static_cast<double>(
+                    contactFramePresentedSerialValid ? contactFramePresentedSerial
+                                                      : m_lastPresentedRequestSerial ) );
+                frameJson.insert( QStringLiteral("display_frame"), settledFrame );
+                frameJson.insert( QStringLiteral("elapsed_ms"), elapsedMsForFrame );
+                frameJson.insert( QStringLiteral("texture_source"), contactFrameSource );
+                frameJson.insert( QStringLiteral("render_path"), contactFrameRenderPath );
+                frameJson.insert( QStringLiteral("playback_path"), false );
+                frameJson.insert( QStringLiteral("path"), pngRelativeName );
+                frameJson.insert( QStringLiteral("span_start"), sheetStartFrame );
+                frameJson.insert( QStringLiteral("span_end"), sheetEndFrame );
+                frameJson.insert( QStringLiteral("span_wrapped"), contactSheetSpanWrapped );
+                frameJson.insert( QStringLiteral("look_assist_enabled"),
+                    ui->checkBoxLookAssistEnable->isChecked() );
+                frameJson.insert( QStringLiteral("look_assist_scene"),
+                    m_lastLookAssistDiagnosticsValid ? m_lastLookAssistScene : QString() );
+                frameJson.insert( QStringLiteral("look_assist_exposure"),
+                    ui->horizontalSliderExposure->value() );
+                frameJson.insert( QStringLiteral("look_assist_contrast"),
+                    ui->horizontalSliderContrast->value() );
+                frameJson.insert( QStringLiteral("look_assist_pivot"),
+                    ui->horizontalSliderPivot->value() );
+                frameJson.insert( QStringLiteral("look_assist_temperature"),
+                    ui->horizontalSliderTemperature->value() );
+                frameJson.insert( QStringLiteral("look_assist_tint"),
+                    ui->horizontalSliderTint->value() );
+                frameJson.insert( QStringLiteral("look_assist_vibrance"),
+                    ui->horizontalSliderVibrance->value() );
+                frameJson.insert( QStringLiteral("look_assist_shadows"),
+                    ui->horizontalSliderShadows->value() );
+                frameJson.insert( QStringLiteral("look_assist_highlights"),
+                    ui->horizontalSliderHighlights->value() );
+                frameJson.insert( QStringLiteral("settled"), settled );
+                frameJson.insert( QStringLiteral("saved"), frameOk );
+
+                if( frameOk )
+                {
+                    QFile sidecarFile( jsonPath );
+                    if( sidecarFile.open( QIODevice::WriteOnly | QIODevice::Truncate ) )
+                    {
+                        sidecarFile.write( QJsonDocument( frameJson ).toJson( QJsonDocument::Indented ) );
+                        sidecarFile.close();
+                        ++contactSheetFramesWritten;
+                    }
+                    else
+                    {
+                        frameOk = false;
+                    }
+                }
+
+                if( !frameOk && contactSheetError.isEmpty() )
+                {
+                    contactSheetError = QStringLiteral(
+                        "frame %1 capture failed (settled=%2 reason=%3)" )
+                        .arg( i ).arg( bool01( settled ) ).arg( contactFrameReadbackReason );
+                }
+            }
+        }
+        else
+        {
+            m_contactSheetCaptureDir = options.contactSheetDir;
+            m_contactSheetCaptureTargetFrames = contactSheetTargetFrames;
+            m_contactSheetCaptureNextTargetIndex = 0;
+            m_contactSheetCaptureStartFrame = sheetStartFrame;
+            m_contactSheetCaptureEndFrame = sheetEndFrame;
+            m_contactSheetCaptureWrapped = contactSheetSpanWrapped;
+            m_contactSheetCaptureFps = contactSheetFps;
+            m_contactSheetCaptureFramesWritten = 0;
+            m_contactSheetCaptureError.clear();
+            m_contactSheetCaptureActive = true;
+
+            // BLOCKER fix (CUDA-PLAYBACK-CONTACT-SHEET-2 round 2): drop-frame-mode playback
+            // wraps the timeline the instant the NEXT tick's position would reach the loop's
+            // last frame, subtracting the loop width before that position is ever set on the
+            // slider (see advanceDropFrameTick) -- so with Loop checked, the range's last frame
+            // (sheetEndFrame on a wrapped run) is never actually presented, and its capture
+            // target can never be satisfied: this pass spins to its own timeout instead. This
+            // un-timed replay has no real-time pacing requirement of its own (fps/swap-cadence
+            // telemetry for the MEASURED interval already closed above), so force deterministic,
+            // non-dropping single-frame advance for its duration -- every position from
+            // sheetStartFrame..sheetEndFrame is then presented in order, including the last one,
+            // never skipping a frame regardless of the loop-relative drop step. Restored
+            // afterward so the user's own setting is unaffected.
+            const bool contactSheetDropFrameModeBefore = ui->actionDropFrameMode->isChecked();
+            if( contactSheetDropFrameModeBefore )
+            {
+                ui->actionDropFrameMode->setChecked( false );
+            }
+
+            QElapsedTimer contactSheetPlaybackClock;
+            contactSheetPlaybackClock.start();
+            const qint64 contactSheetPlaybackTimeoutMs = qMax<qint64>(
+                8000, contactSheetMeasuredElapsedMs * 2 );
+
+            // A clip shorter than options.contactSheetFrames distinct presented-frame
+            // events (the fixture clip used for local demos is an extreme case, at 2
+            // frames) reaches its own end and auto-stops -- clearing actionPlay's checked
+            // state -- before every target is captured. Re-cue to the span's start and
+            // restart play rather than force the Loop action (toggling it mid-playback is
+            // not an exercised code path and is not worth the risk here); bounded by the
+            // same overall timeout and by a retry cap, so a clip that keeps failing to
+            // advance can never spin this pass forever.
+            int contactSheetRestarts = 0;
+            const int contactSheetMaxRestarts = 50;
+            while( m_contactSheetCaptureActive
+                && contactSheetPlaybackClock.elapsed() < contactSheetPlaybackTimeoutMs )
+            {
+                if( !ui->actionPlay->isChecked() )
+                {
+                    if( ++contactSheetRestarts > contactSheetMaxRestarts ) break;
+                    int restartSettledFrame = sheetStartFrame;
+                    // Bounded by what remains of the overall capture-pass deadline (H1), not
+                    // its own fixed 8000ms: a clip that keeps failing to settle can burn at
+                    // most the time this pass has left, never up to 50 * 8000ms regardless of
+                    // contactSheetPlaybackTimeoutMs.
+                    const qint64 restartSeekTimeoutMs = qBound(
+                        qint64( 1 ),
+                        contactSheetPlaybackTimeoutMs - contactSheetPlaybackClock.elapsed(),
+                        qint64( 8000 ) );
+                    seekAndSettleLoadedClip(
+                        sheetStartFrame, "gui-smoke-contact-sheet-restart",
+                        &restartSettledFrame, static_cast<int>( restartSeekTimeoutMs ) );
+                    ui->actionPlay->trigger();
+                }
+                qApp->processEvents( QEventLoop::AllEvents );
+                QThread::msleep( 5 );
+            }
+
+            if( ui->actionPlay->isChecked() )
+            {
+                ui->actionPlay->setChecked( false );
+                qApp->processEvents( QEventLoop::AllEvents );
+            }
+            for( int attempt = 0;
+                 attempt < 400 && m_pRenderThread && !m_pRenderThread->isIdle();
+                 ++attempt )
+            {
+                qApp->processEvents( QEventLoop::AllEvents );
+                QThread::msleep( 5 );
+            }
+
+            if( contactSheetDropFrameModeBefore )
+            {
+                ui->actionDropFrameMode->setChecked( true );
+            }
+
+            if( m_contactSheetCaptureActive && m_contactSheetCaptureError.isEmpty() )
+            {
+                m_contactSheetCaptureError = QStringLiteral(
+                    "playback pass timed out after %1 ms before all %2 frame(s) were captured (wrote %3)" )
+                    .arg( contactSheetPlaybackClock.elapsed() )
+                    .arg( options.contactSheetFrames )
+                    .arg( m_contactSheetCaptureFramesWritten );
+            }
+            m_contactSheetCaptureActive = false;
+            contactSheetFramesWritten = m_contactSheetCaptureFramesWritten;
+            contactSheetError = m_contactSheetCaptureError;
+            m_contactSheetCaptureTargetFrames.clear();
+        }
+
+        logInteractionEvent(
+            QStringLiteral("gui_smoke.contact_sheet"),
+            QStringLiteral("dir=\"%1\" requested_frames=%2 written_frames=%3 "
+                            "start_frame=%4 end_frame=%5 wrapped=%6 measured_elapsed_ms=%7 mode=%8 error=\"%9\"")
+                .arg( options.contactSheetDir )
+                .arg( options.contactSheetFrames )
+                .arg( contactSheetFramesWritten )
+                .arg( sheetStartFrame )
+                .arg( sheetEndFrame )
+                .arg( bool01( contactSheetSpanWrapped ) )
+                .arg( contactSheetMeasuredElapsedMs )
+                .arg( options.contactSheetSeekMode
+                          ? QStringLiteral("seek")
+                          : QStringLiteral("playback") )
+                .arg( contactSheetError ) );
+
+        if( contactSheetFramesWritten != options.contactSheetFrames )
+        {
+            err << "[GUI-SMOKE] ERROR: contact sheet capture incomplete; requested="
+                << options.contactSheetFrames << " written=" << contactSheetFramesWritten
+                << " detail=" << contactSheetError << "\n";
+            return 14;
+        }
+    }
+
     out << "[GUI-SMOKE] DONE clip=" << inputInfo.absoluteFilePath()
         << " duration_ms=" << durationMs
         << " settle_ms=" << settleMs
@@ -9293,8 +9817,12 @@ int MainWindow::runGuiPlaybackSmoke(const GuiPlaybackSmokeOptions & options)
         << " settle_cpu_stable_elapsed_ms=" << cpuStableMs
         << " settle_cpu_last_percent=" << QString::number( lastMeasuredCpuPercent, 'f', 3 )
         << " settle_cpu_elapsed_ms=" << settleClock.elapsed()
-        << " diagnostic_log_file=" << CrashForensics::currentLogFilePath()
-        << "\n";
+        << " diagnostic_log_file=" << CrashForensics::currentLogFilePath();
+    // B4: default-off must be byte-identical to a build that never had this option at all --
+    // never append this field unless a contact sheet was actually requested.
+    if( !options.contactSheetDir.isEmpty() && options.contactSheetFrames > 0 )
+        out << " contact_sheet_frames_written=" << contactSheetFramesWritten;
+    out << "\n";
 
     return 0;
 }
@@ -9920,23 +10448,20 @@ void MainWindow::playbackHandling(int timeDiff)
                 //Drop Frame Mode: calc picture for actual time
                 else
                 {
-                //This is the exact frame we need on the time line NOW!
-                m_newPosDropMode += (getFramerate() * (double)timeDiff / 1000.0);
-                //Loop!
-                if( ui->actionLoop->isChecked() && ( m_newPosDropMode >= ui->spinBoxCutOut->value() - 1 ) )
+                //This is the exact frame we need on the time line NOW! (advanceDropFrameTick:
+                //loop wraps back by the cut range width, or clamps to the last frame -- see
+                //PlaybackFrameRange.h for the BLOCKER note on why the wrapped case can never
+                //return the range's last frame)
+                const playback_frame_range::DropFrameTickResult dropFrameTick =
+                    playback_frame_range::advanceDropFrameTick(
+                        m_newPosDropMode, getFramerate() * (double)timeDiff / 1000.0,
+                        ui->spinBoxCutIn->value(), ui->spinBoxCutOut->value(),
+                        ui->actionLoop->isChecked() );
+                m_newPosDropMode = dropFrameTick.position;
+                //Sync audio
+                if( dropFrameTick.wrapped && ui->actionAudioOutput->isChecked() )
                 {
-                    m_newPosDropMode -= (ui->spinBoxCutOut->value() - ui->spinBoxCutIn->value());
-                    //Sync audio
-                    if( ui->actionAudioOutput->isChecked() )
-                    {
-                        m_tryToSyncAudio = true;
-                    }
-                }
-                //Limit to last frame if not in loop
-                else if( m_newPosDropMode >= ui->spinBoxCutOut->value() - 1 )
-                {
-                    // -1 because 0 <= frame < ui->spinBoxCutOut->value()
-                    m_newPosDropMode = ui->spinBoxCutOut->value() - 1;
+                    m_tryToSyncAudio = true;
                 }
                 //Because we need it NOW, block slider signals and draw after this function in this timerEvent
                 ui->horizontalSliderPosition->blockSignals( true );
@@ -10746,6 +11271,10 @@ void MainWindow::initLib( void )
 
     m_pRawImage = NULL;
     m_pRawImage16 = NULL;
+
+    /* CUDA-S4-TEXTURE-ROUTE-CLAMP-1 round 2: m_pProcessingObject (and the rest of the
+     * processing library state above) is only safe to read from here on. */
+    m_gpuPlaybackReconPolicyLibraryReady = true;
 }
 
 //Read some settings from registry
@@ -17302,6 +17831,8 @@ bool MainWindow::shouldUseGpu16PreviewPath( void ) const
 {
     MainWindowGpuPreviewPolicyState policyState;
     policyState.gpuViewportInstalled = gpuPreviewSurfaceActive();
+    policyState.gpuWidgetViewportInstalled =
+        GpuDisplayViewport::isInstalledOn( ui->graphicsView );
     const bool scopeDisplayVisible = ui->dockWidgetEdit->isVisible();
     policyState.histogramEnabled = mainWindowScopeActionConsumesPresentedPixels(
         scopeDisplayVisible, ui->actionShowHistogram->isChecked() );
@@ -17318,6 +17849,8 @@ bool MainWindow::shouldUseGpuPreviewProcessingPath( void ) const
 {
     MainWindowGpuPreviewPolicyState policyState;
     policyState.gpuViewportInstalled = gpuPreviewSurfaceActive();
+    policyState.gpuWidgetViewportInstalled =
+        GpuDisplayViewport::isInstalledOn( ui->graphicsView );
     policyState.gpuPreviewProcessingBackendRequest = m_gpuPreviewProcessingBackendRequest;
     policyState.gpuPreviewProcessingEnvironmentRequested =
         gpuPreviewProcessingRequestedByEnvironment();
@@ -17338,6 +17871,8 @@ bool MainWindow::shouldUseGpuBilinearDebayerPath( void ) const
 {
     MainWindowGpuPreviewPolicyState policyState;
     policyState.gpuViewportInstalled = gpuPreviewSurfaceActive();
+    policyState.gpuWidgetViewportInstalled =
+        GpuDisplayViewport::isInstalledOn( ui->graphicsView );
     policyState.gpuPreviewProcessingBackendRequest = m_gpuPreviewProcessingBackendRequest;
     policyState.gpuPreviewProcessingEnvironmentRequested =
         gpuPreviewProcessingRequestedByEnvironment();
@@ -17363,6 +17898,8 @@ bool MainWindow::shouldUseGpuAmazeDebayerPath( void ) const
 {
     MainWindowGpuPreviewPolicyState policyState;
     policyState.gpuViewportInstalled = gpuPreviewSurfaceActive();
+    policyState.gpuWidgetViewportInstalled =
+        GpuDisplayViewport::isInstalledOn( ui->graphicsView );
     policyState.gpuPreviewProcessingBackendRequest = m_gpuPreviewProcessingBackendRequest;
     policyState.gpuPreviewProcessingEnvironmentRequested =
         gpuPreviewProcessingRequestedByEnvironment();
@@ -20391,7 +20928,87 @@ void MainWindow::updatePlaybackQualityIndicator( void )
     m_playbackQualityIndicatorCacheValid = true;
 }
 
+/* CUDA-S4-TEXTURE-ROUTE-CLAMP-1: the GPU recon texture-present route
+ * (CUDA reconstruction straight to a GL texture, no per-frame CPU readback)
+ * is only wired for playbackScaleFactor == 1 -- see the '== 1' gates in
+ * RenderFrameThread.cpp and the two policy builders below. Requesting a
+ * downscale (2/4/8) while that route would otherwise be armed does NOT
+ * reduce render work; it silently reroutes to the much slower full-res
+ * float-convert + upload + CUDA AMaZE + download + wb_undo + re-upload
+ * path (gpu_recon_readback), which measured ~4-5x slower than the
+ * unscaled no-readback texture route on the same clip. Clamp the request
+ * to 1 here -- the single policy source -- instead of adding an eleventh
+ * '== 1' gate. */
+bool MainWindow::gpuPlaybackReconTextureRouteEligibleAtScaleOne( void ) const
+{
+    /* Not eligible until initLib() has finished -- m_pProcessingObject and the rest of
+     * the processing/recon library state below are not safe to touch before that,
+     * regardless of whether the GL presenter already exists. See the flag's
+     * declaration comment in MainWindow.h for why this can't be a null check instead.
+     * This early return must stay first and must short-circuit: nothing past it may
+     * be evaluated before the library is ready. */
+    if( !m_gpuPlaybackReconPolicyLibraryReady ) return false;
+
+    const bool scopeDisplayVisible = ui->dockWidgetEdit->isVisible();
+    const bool hasScopeVisualization =
+        mainWindowScopeActionConsumesPresentedPixels(
+            scopeDisplayVisible, ui->actionShowHistogram->isChecked() )
+        || mainWindowScopeActionConsumesPresentedPixels(
+            scopeDisplayVisible, ui->actionShowWaveFormMonitor->isChecked() )
+        || mainWindowScopeActionConsumesPresentedPixels(
+            scopeDisplayVisible, ui->actionShowParade->isChecked() )
+        || mainWindowScopeActionConsumesPresentedPixels(
+            scopeDisplayVisible, ui->actionShowVectorScope->isChecked() );
+
+    const Phase3Mode requestedPhase3Mode =
+        phase3ModeFor( playbackQualityModeFromInt( m_playbackQualityMode ) );
+
+    // The pure decision table (also unit-tested standalone in
+    // MainWindowGpuPreviewPolicy.h) re-asserts libraryReady=true; every input past
+    // this point was only just computed because the early return above already
+    // proved the library is ready.
+    return mainWindowGpuPlaybackReconTextureRouteEligibleAtScaleOne(
+        /*libraryReady*/ true,
+        gpuPreviewSurfaceActive(),
+        hasScopeVisualization,
+        playback_recon_requested_by_environment(),
+        playback_recon_texture_present_requested_by_environment(),
+        gpuPreviewProcessingIsSupported( m_pProcessingObject ),
+        m_gpuPreviewProcessingBackendRequest == GpuPreviewProcessingBackendRequest::Cpu,
+        requestedPhase3Mode == Phase3Mode::DecodeReconProcess,
+        ui->actionCaching->isChecked() );
+}
+
 int MainWindow::effectivePlaybackScaleFactorForRequest( void ) const
+{
+    const int requestedScale = playbackScaleFactorPolicyDecision();
+    const int effectiveScale = mainWindowClampPlaybackScaleForGpuTextureRoute(
+        requestedScale, gpuPlaybackReconTextureRouteEligibleAtScaleOne() );
+    if( effectiveScale != requestedScale )
+    {
+        static bool loggedScaleClampOnce = false;
+        if( !loggedScaleClampOnce )
+        {
+            qInfo().noquote()
+                << QStringLiteral(
+                       "playback_scale_clamped_for_gpu_texture_route "
+                       "requested=%1 effective=%2" )
+                       .arg( requestedScale )
+                       .arg( effectiveScale );
+            loggedScaleClampOnce = true;
+        }
+        m_playbackScaleClampedForGpuTextureRouteActive = true;
+        m_playbackScaleClampedForGpuTextureRouteRequestedScale = requestedScale;
+    }
+    else
+    {
+        m_playbackScaleClampedForGpuTextureRouteActive = false;
+        m_playbackScaleClampedForGpuTextureRouteRequestedScale = 0;
+    }
+    return effectiveScale;
+}
+
+int MainWindow::playbackScaleFactorPolicyDecision( void ) const
 {
     const int envScale = playback_scale_factor_env_override();
     if ( envScale == 1 || envScale == 2 || envScale == 4 || envScale == 8 )
@@ -20557,6 +21174,8 @@ MainWindowGpuPreviewPolicyState MainWindow::gpuPreviewPolicyForCurrentScopeState
 {
     MainWindowGpuPreviewPolicyState policyState;
     policyState.gpuViewportInstalled = gpuPreviewSurfaceActive();
+    policyState.gpuWidgetViewportInstalled =
+        GpuDisplayViewport::isInstalledOn( ui->graphicsView );
     policyState.gpuPreviewProcessingBackendRequest =
         m_gpuPreviewProcessingBackendRequest;
     policyState.gpuPreviewProcessingEnvironmentRequested =
@@ -22238,6 +22857,82 @@ void MainWindow::notePlayToFirstFramePresentation( int presentedFrame )
     m_playToFirstFrameTargetFrame = -1;
 }
 
+// --gui-smoke-playback only (CUDA-PERF-PLAYBACK-FOREGROUND-1). Never called from normal
+// (non-smoke) startup or from the generic on_actionPlay_toggled() handler -- see
+// MainWindow::runGuiPlaybackSmoke(), the only call site. A process launched by a
+// background measurement job is normally refused SetForegroundWindow by Windows'
+// foreground lock, so without this the measured window plays occluded/background and
+// PresentMon sees far fewer displayed frames than the app actually submits.
+void MainWindow::forcePlaybackSmokeWindowForeground( void )
+{
+    showNormal();
+    raise();
+    activateWindow();
+    if( QWindow *gpuWindow = GpuDisplayWindow::activeWindow() )
+    {
+        // The GPU display window is embedded via createWindowContainer, so it has no
+        // independent OS-level foreground state (that belongs to the top-level MainWindow
+        // HWND below) -- requestActivate() only needs to stop Qt itself from treating it
+        // as backgrounded.
+        gpuWindow->requestActivate();
+    }
+
+#ifdef Q_OS_WIN
+    const HWND target = reinterpret_cast<HWND>( this->window()->winId() );
+    const HWND previousForeground = GetForegroundWindow();
+    if( target && previousForeground != target )
+    {
+        // Workaround for the Windows foreground lock, which normally refuses
+        // SetForegroundWindow from a process that was not launched by the user's own
+        // foreground action (exactly the case here -- launched by a background
+        // measurement job): allow this process to set the foreground, then briefly
+        // attach input to whichever thread currently owns the foreground so
+        // SetForegroundWindow is granted rather than silently ignored.
+        AllowSetForegroundWindow( ASFW_ANY );
+        const DWORD myThreadId = GetCurrentThreadId();
+        DWORD foregroundThreadId = 0;
+        bool attached = false;
+        if( previousForeground )
+        {
+            foregroundThreadId = GetWindowThreadProcessId( previousForeground, nullptr );
+            if( foregroundThreadId != 0 && foregroundThreadId != myThreadId )
+            {
+                attached = AttachThreadInput( myThreadId, foregroundThreadId, TRUE ) != 0;
+            }
+        }
+        ShowWindow( target, SW_SHOWNORMAL );
+        // Brief HWND_TOPMOST -> HWND_NOTOPMOST: forces the z-order swap SetForegroundWindow
+        // alone can be refused for, then immediately releases it -- the window must not
+        // stay permanently topmost after this call returns.
+        SetWindowPos( target, HWND_TOPMOST, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE );
+        SetForegroundWindow( target );
+        BringWindowToTop( target );
+        SetWindowPos( target, HWND_NOTOPMOST, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE );
+        if( attached )
+        {
+            AttachThreadInput( myThreadId, foregroundThreadId, FALSE );
+        }
+    }
+    const bool verified = target && GetForegroundWindow() == target;
+#else
+    const bool verified = isActiveWindow();
+#endif
+
+    qInfo().noquote()
+        << QStringLiteral( "gui_smoke.foreground_request requested=1 verified=%1" )
+               .arg( bool01( verified ) );
+}
+
+void MainWindow::onPlaybackSmokeApplicationStateChanged( Qt::ApplicationState state )
+{
+    // Only counts while a playback-smoke session is open -- see beginPlaybackSmokeTelemetry()/
+    // finishPlaybackSmokeTelemetry(). Event-driven (this slot only fires on a real OS-level
+    // application activation/deactivation), never polled per frame.
+    if( !m_playbackSmokeActive ) return;
+    if( state == Qt::ApplicationActive ) return;
+    ++m_playbackSmokeForegroundLostCount;
+}
+
 void MainWindow::beginPlaybackSmokeTelemetry( void )
 {
     if( m_playbackSmokeActive )
@@ -22248,6 +22943,10 @@ void MainWindow::beginPlaybackSmokeTelemetry( void )
 
     m_playbackSmokeActive = true;
     m_playbackSmokeFrameTelemetry = playbackSmokeFrameTelemetryEnabled();
+    GpuDisplayWindow::resetSwapTelemetry( m_playbackSmokeSessionId );
+    m_playbackSmokeForegroundLostCount = 0;
+    m_playbackSmokeForegroundAtBegin =
+        m_playbackSmokeFrameTelemetry && nativeWindowIsForeground( this );
     m_playbackSmokeTimelineTelemetry =
         m_playbackSmokeFrameTelemetry
         && playbackSmokeTimelineTelemetryEnabled();
@@ -22261,6 +22960,7 @@ void MainWindow::beginPlaybackSmokeTelemetry( void )
     m_playbackSmokeParityMatchCount = 0;
     m_playbackSmokeFirstPresentedFrame = -1;
     m_playbackSmokeLastPresentedFrame = -1;
+    m_playbackSmokeWrapped = false;
     m_playbackSmokeStartRequestSerial = m_nextRenderRequestSerial;
     m_playbackSmokeStartDecodeRequestsIssued =
         m_pRenderThread ? m_pRenderThread->decodeRequestsIssuedCount() : 0;
@@ -22268,6 +22968,8 @@ void MainWindow::beginPlaybackSmokeTelemetry( void )
         m_playbackPrepStaleDropCount.load( std::memory_order_acquire );
     m_playbackSmokeStartPrepGenerationDrops =
         m_playbackPrepGenerationDropCount.load( std::memory_order_acquire );
+    m_playbackSmokeStartPresentNothingDrops =
+        m_presentNothingDropCount.load( std::memory_order_acquire );
     m_playbackSmokeStartPrepReplacedBefore =
         m_playbackPrepReplacedBeforeComputeCount.load( std::memory_order_acquire );
     m_playbackSmokeStartPrepReplacedAfter =
@@ -22570,6 +23272,26 @@ void MainWindow::notePlaybackSmokePresentedFrame(
     {
         m_playbackSmokeFirstPresentMs = elapsedMs;
         m_playbackSmokeFirstPresentedFrame = static_cast<int>( displayFrame );
+    }
+
+    // BLOCKER fix (CUDA-PLAYBACK-CONTACT-SHEET-2): a presented frame lower than the previous
+    // one can only mean the Loop action wrapped (cutOut back to cutIn) -- playback otherwise
+    // only advances the timeline. Checked against the frame this call is about to overwrite,
+    // so it fires exactly once per wrap, however many wraps a short looping clip goes through.
+    //
+    // HARDENING fix (CUDA-PLAYBACK-CONTACT-SHEET-2 round 2, LOOP-WRAP-QUALIFICATION): a bare
+    // "went backward" test also fires for an external backward scrub, or a stress seek to an
+    // arbitrary earlier frame, during a session where Loop never actually wrapped -- see
+    // isContactSheetLoopWrapTransition for why Loop state and jump size now both gate this.
+    if( m_playbackSmokePresentedFrames > 0
+     && playback_frame_range::isContactSheetLoopWrapTransition(
+            ui->actionLoop->isChecked(),
+            ui->spinBoxCutIn->value() - 1,
+            ui->spinBoxCutOut->value() - 1,
+            m_playbackSmokeLastPresentedFrame,
+            static_cast<int>( displayFrame ) ) )
+    {
+        m_playbackSmokeWrapped = true;
     }
 
     m_playbackSmokeLastPresentedTime = now;
@@ -24762,6 +25484,190 @@ void MainWindow::notePlaybackSmokePresentedFrame(
     }
 }
 
+void MainWindow::noteContactSheetPresentedFrame(
+    uint64_t displayFrame,
+    const RenderFrameThread::ReadyFrame &readyFrame,
+    const PresentationRequestContext &requestContext )
+{
+    if( !m_contactSheetCaptureActive ) return;
+    // B1: this hook fires on EVERY presented frame, seeked or played -- the restart re-cue
+    // (seekAndSettleLoadedClip) runs while m_contactSheetCaptureActive is already true, and its
+    // own settle-wait pumps the event loop, so a seek-presented frame can reach here before
+    // ui->actionPlay->trigger() is ever called. Disarm on any such frame: never save a
+    // seek-presented frame as playback_path=true. Re-arms itself the moment Play is actually
+    // checked and the next genuinely-played frame presents.
+    if( !ui->actionPlay->isChecked() ) return;
+    if( m_contactSheetCaptureNextTargetIndex >= m_contactSheetCaptureTargetFrames.size() )
+    {
+        m_contactSheetCaptureActive = false;
+        return;
+    }
+    // Targets are ascending and playback only moves the timeline forward, so the first
+    // presented frame at or past the next target is the capture for that target -- this
+    // never blocks waiting for an exact frame number playback happened to skip over.
+    const int targetFrame =
+        m_contactSheetCaptureTargetFrames.at( m_contactSheetCaptureNextTargetIndex );
+    if( static_cast<int>( displayFrame ) < targetFrame ) return;
+
+    const int i = m_contactSheetCaptureNextTargetIndex;
+
+    const QJsonObject &timing = readyFrame.stageTimingTelemetry;
+    const GpuPlaybackPipelineStatus contactFramePipelineStatus =
+        mainWindowGpuPlaybackPipelineStatus(
+            requestContext.gpuPreviewPolicy,
+            telemetryBoolValue( timing, "gpu_playback_recon_used" ),
+            telemetryBoolValue( timing, "gpu_playback_recon_texture_present_active" ),
+            telemetryBoolValue( timing, "gpu_playback_recon_texture_present_no_readback_active" ) );
+    const QString contactFrameRenderPath = QString::fromLatin1(
+        mainWindowGpuPlaybackPipelineStatusToken( contactFramePipelineStatus ) );
+
+    QImage contactFrameImage;
+    QString contactFrameSource = QStringLiteral("app_internal_viewport_grab");
+    QString contactFrameReadbackReason;
+    quint64 contactFramePresentedSerial = readyFrame.requestSerial;
+    // H2: when the GPU window is the active presentation path, its readback is the ONLY
+    // source allowed to stand for "the frame the playback path actually presented" -- a
+    // failed grab, or one whose own serial disagrees with the frame this hook was told is
+    // ready, must fail closed for this tile rather than silently substitute a viewport/pixmap
+    // grab (a different, non-GPU-window-proven source) under the same playback_path=true claim.
+    bool gpuWindowGrabFailedClosed = false;
+    if( GpuDisplayWindow::isActive() )
+    {
+        quint64 grabbedSerial = 0;
+        bool grabbedSerialValid = false;
+        if( !GpuDisplayWindow::grabPresentedFramebufferIfActive(
+                &contactFrameImage, &contactFrameReadbackReason,
+                &grabbedSerial, &grabbedSerialValid )
+         || contactFrameImage.isNull() )
+        {
+            contactFrameImage = QImage();
+            gpuWindowGrabFailedClosed = true;
+            if( contactFrameReadbackReason.isEmpty() )
+                contactFrameReadbackReason = QStringLiteral("gpu_window_grab_failed");
+        }
+        else if( grabbedSerialValid && grabbedSerial != readyFrame.requestSerial )
+        {
+            contactFrameImage = QImage();
+            gpuWindowGrabFailedClosed = true;
+            contactFrameReadbackReason = QStringLiteral(
+                "gpu_window_grab_serial_mismatch grabbed=%1 ready=%2" )
+                .arg( grabbedSerial ).arg( readyFrame.requestSerial );
+        }
+        else
+        {
+            contactFrameSource = QStringLiteral("gl_window_framebuffer_readback");
+            if( grabbedSerialValid ) contactFramePresentedSerial = grabbedSerial;
+        }
+    }
+    if( !gpuWindowGrabFailedClosed && contactFrameImage.isNull()
+     && ( GpuDisplayViewport::isTexturePresentationActive( ui->graphicsView )
+       || GpuDisplayViewport::hasPresentedGpuReconTexture( ui->graphicsView ) )
+     && ui->graphicsView && ui->graphicsView->viewport() )
+    {
+        contactFrameImage = ui->graphicsView->viewport()->grab().toImage();
+        contactFrameSource = QStringLiteral("app_internal_gl_viewport_grab");
+    }
+    if( !gpuWindowGrabFailedClosed && contactFrameImage.isNull() && m_pGraphicsItem )
+    {
+        contactFrameImage = m_pGraphicsItem->pixmap().toImage();
+        contactFrameSource = QStringLiteral("app_internal_presented_pixmap");
+    }
+    if( !gpuWindowGrabFailedClosed && contactFrameImage.isNull()
+     && ui->graphicsView && ui->graphicsView->viewport() )
+    {
+        contactFrameImage = ui->graphicsView->viewport()->grab().toImage();
+        contactFrameSource = QStringLiteral("app_internal_viewport_grab");
+    }
+
+    const QDir contactSheetDirInfo( m_contactSheetCaptureDir );
+    const QString frameBaseName =
+        QStringLiteral("frame-%1").arg( i, 2, 10, QLatin1Char('0') );
+    // H3: the sidecar's own "path" field is never an absolute local path -- just the
+    // basename, relative to this capture's own directory (frames_dir). The composer resolves
+    // the image against frames_dir FIRST (never its own current working directory, which
+    // could otherwise silently pick up an unrelated same-named file sitting there -- r1d, sol
+    // pre-review #2), and always falls back to <frames_dir>/<json stem>.png otherwise (see
+    // _resolve_frame_image_path/make-contact-sheet.py), so publishing this sidecar without
+    // rewriting it never breaks composition.
+    const QString pngRelativeName = frameBaseName + QStringLiteral(".png");
+    const QString pngPath = contactSheetDirInfo.absoluteFilePath( pngRelativeName );
+    const QString jsonPath = contactSheetDirInfo.absoluteFilePath(
+        frameBaseName + QStringLiteral(".json") );
+
+    bool frameOk = !gpuWindowGrabFailedClosed
+        && !contactFrameImage.isNull() && contactFrameImage.save( pngPath, "PNG" );
+
+    const double elapsedMsForFrame = m_contactSheetCaptureFps > 0.0
+        ? ( static_cast<double>(
+                static_cast<int>( displayFrame ) - m_contactSheetCaptureStartFrame )
+            / m_contactSheetCaptureFps ) * 1000.0
+        : 0.0;
+
+    QJsonObject frameJson;
+    frameJson.insert( QStringLiteral("index"), i );
+    frameJson.insert( QStringLiteral("captured_utc"),
+        QDateTime::currentDateTimeUtc().toString( Qt::ISODateWithMs ) );
+    frameJson.insert( QStringLiteral("serial"),
+        static_cast<double>( contactFramePresentedSerial ) );
+    frameJson.insert( QStringLiteral("display_frame"), static_cast<int>( displayFrame ) );
+    frameJson.insert( QStringLiteral("elapsed_ms"), elapsedMsForFrame );
+    frameJson.insert( QStringLiteral("texture_source"), contactFrameSource );
+    frameJson.insert( QStringLiteral("render_path"), contactFrameRenderPath );
+    frameJson.insert( QStringLiteral("playback_path"), true );
+    frameJson.insert( QStringLiteral("path"), pngRelativeName );
+    frameJson.insert( QStringLiteral("span_start"), m_contactSheetCaptureStartFrame );
+    frameJson.insert( QStringLiteral("span_end"), m_contactSheetCaptureEndFrame );
+    frameJson.insert( QStringLiteral("span_wrapped"), m_contactSheetCaptureWrapped );
+    frameJson.insert( QStringLiteral("look_assist_enabled"),
+        ui->checkBoxLookAssistEnable->isChecked() );
+    frameJson.insert( QStringLiteral("look_assist_scene"),
+        m_lastLookAssistDiagnosticsValid ? m_lastLookAssistScene : QString() );
+    frameJson.insert( QStringLiteral("look_assist_exposure"),
+        ui->horizontalSliderExposure->value() );
+    frameJson.insert( QStringLiteral("look_assist_contrast"),
+        ui->horizontalSliderContrast->value() );
+    frameJson.insert( QStringLiteral("look_assist_pivot"),
+        ui->horizontalSliderPivot->value() );
+    frameJson.insert( QStringLiteral("look_assist_temperature"),
+        ui->horizontalSliderTemperature->value() );
+    frameJson.insert( QStringLiteral("look_assist_tint"),
+        ui->horizontalSliderTint->value() );
+    frameJson.insert( QStringLiteral("look_assist_vibrance"),
+        ui->horizontalSliderVibrance->value() );
+    frameJson.insert( QStringLiteral("look_assist_shadows"),
+        ui->horizontalSliderShadows->value() );
+    frameJson.insert( QStringLiteral("look_assist_highlights"),
+        ui->horizontalSliderHighlights->value() );
+    frameJson.insert( QStringLiteral("settled"), true );
+    frameJson.insert( QStringLiteral("saved"), frameOk );
+
+    if( frameOk )
+    {
+        QFile sidecarFile( jsonPath );
+        if( sidecarFile.open( QIODevice::WriteOnly | QIODevice::Truncate ) )
+        {
+            sidecarFile.write( QJsonDocument( frameJson ).toJson( QJsonDocument::Indented ) );
+            sidecarFile.close();
+            ++m_contactSheetCaptureFramesWritten;
+        }
+        else
+        {
+            frameOk = false;
+        }
+    }
+
+    if( !frameOk && m_contactSheetCaptureError.isEmpty() )
+    {
+        m_contactSheetCaptureError = QStringLiteral(
+            "frame %1 capture failed (reason=%2)" )
+            .arg( i ).arg( contactFrameReadbackReason );
+    }
+
+    ++m_contactSheetCaptureNextTargetIndex;
+    if( m_contactSheetCaptureNextTargetIndex >= m_contactSheetCaptureTargetFrames.size() )
+        m_contactSheetCaptureActive = false;
+}
+
 void MainWindow::finishPlaybackSmokeTelemetry( const char *reason )
 {
     if( !m_playbackSmokeActive ) return;
@@ -24839,6 +25745,8 @@ void MainWindow::finishPlaybackSmokeTelemetry( const char *reason )
         m_playbackPrepReplacedBeforeComputeCount.load( std::memory_order_acquire );
     const uint64_t currentReplacedAfter =
         m_playbackPrepReplacedAfterComputeCount.load( std::memory_order_acquire );
+    const uint64_t currentPresentNothingDrops =
+        m_presentNothingDropCount.load( std::memory_order_acquire );
     auto deltaCounter = []( uint64_t current, uint64_t start ) -> qulonglong
     {
         return static_cast<qulonglong>( current >= start ? current - start : 0 );
@@ -24866,6 +25774,12 @@ void MainWindow::finishPlaybackSmokeTelemetry( const char *reason )
     }
 
     m_playbackSmokeActive = false;
+
+    // CUDA-PLAYBACK-CONTACT-SHEET-2 (HARDENING): the "playback_smoke.measured_session id=N"
+    // marker is now logged from runGuiPlaybackSmoke() itself, right after the measured play
+    // trigger that opens this very session -- see the comment there. Binding it to the first
+    // "play-stop" (as this function used to do) let a warmup settle or an in-loop lifecycle
+    // stress toggle claim the marker before the run's real measured interval ever closed.
 
     qInfo().noquote()
         << QStringLiteral(
@@ -24898,7 +25812,10 @@ void MainWindow::finishPlaybackSmokeTelemetry( const char *reason )
                "auto_avg_fps_equivalent=%59 auto_budget_fps_equivalent=%60 "
                "auto_headroom_capability_last=%61 "
                "auto_validated_no_readback_capability_observed=%62 "
-               "auto_validated_no_readback_capability_demoted_last=%63" )
+               "auto_validated_no_readback_capability_demoted_last=%63 "
+               "present_nothing_drops=%64 "
+               "gpu_texture_route_scale_clamp_active=%65 "
+               "gpu_texture_route_scale_clamp_requested_scale=%66" )
                .arg( static_cast<qulonglong>( m_playbackSmokeSessionId ) )
                .arg( QString::fromLatin1( reason ? reason : "unknown" ) )
                .arg( elapsedMs, 0, 'f', 3 )
@@ -24972,7 +25889,11 @@ void MainWindow::finishPlaybackSmokeTelemetry( const char *reason )
                .arg( bool01(
                    m_playbackQualityAutoCapabilityTracker.validatedNoReadbackObserved() ) )
                .arg( bool01(
-                   m_playbackQualityAutoCapabilityTracker.lastObservationDemotedCapability() ) );
+                   m_playbackQualityAutoCapabilityTracker.lastObservationDemotedCapability() ) )
+               .arg( deltaCounter( currentPresentNothingDrops,
+                                    m_playbackSmokeStartPresentNothingDrops ) )
+               .arg( bool01( m_playbackScaleClampedForGpuTextureRouteActive ) )
+               .arg( m_playbackScaleClampedForGpuTextureRouteRequestedScale );
 
     qInfo().noquote()
         << QStringLiteral(
@@ -25605,6 +26526,72 @@ void MainWindow::finishPlaybackSmokeTelemetry( const char *reason )
                .arg( static_cast<qulonglong>( decodeRequestsIssuedDelta ) )
                .arg( m_playbackSmokeParityMatchCount )
                .arg( m_playbackSmokeTargetPresentedFrames );
+
+    // Window foreground state at session begin and at this gate, plus how many times the
+    // whole application lost the OS foreground during the session (event-driven via
+    // onPlaybackSmokeApplicationStateChanged(), not polled) -- so the joined analysis can
+    // filter a run where the measured window was occluded/backgrounded
+    // (CUDA-PERF-PLAYBACK-FOREGROUND-1). Sibling line to playback_smoke.gate above, gated
+    // on the same MLVAPP_PLAYBACK_SMOKE_TELEMETRY flag as the swap telemetry below.
+    if ( m_playbackSmokeFrameTelemetry )
+    {
+        const bool foregroundAtGate = nativeWindowIsForeground( this );
+        qInfo().noquote()
+            << QStringLiteral(
+                   "playback_smoke.foreground session=%1 telemetry_enabled=%2 "
+                   "foreground_at_begin=%3 foreground_at_gate=%4 foreground_lost_count=%5" )
+                   .arg( static_cast<qulonglong>( m_playbackSmokeSessionId ) )
+                   .arg( bool01( m_playbackSmokeFrameTelemetry ) )
+                   .arg( bool01( m_playbackSmokeForegroundAtBegin ) )
+                   .arg( bool01( foregroundAtGate ) )
+                   .arg( static_cast<qulonglong>( m_playbackSmokeForegroundLostCount ) );
+    }
+
+    // Displayed cadence, distinct from frames_presented above (which counts frame
+    // SUBMISSIONS -- see notePlaybackSmokePresentedFrame -- not confirmed on-screen
+    // swaps). See GpuDisplayWindow::resetSwapTelemetry/swapTelemetrySnapshot. This also
+    // closes the swap-telemetry session, so it must run exactly once here, regardless of
+    // whether telemetry is enabled -- swaps after this point must stop being attributed to
+    // this (now-finished) session even when nothing below ends up being logged for it.
+    const GpuWindowSwapTelemetrySnapshot swapSnapshot = GpuDisplayWindow::swapTelemetrySnapshot();
+    if ( swapSnapshot.telemetryEnabled )
+    {
+        qInfo().noquote()
+            << QStringLiteral(
+                   "playback_smoke.gpu_window_swaps session=%1 window_active=%2 "
+                   "telemetry_enabled=%3 swaps=%4 swap_fps=%5 max_gap_ms=%6 "
+                   "max_gap_before_serial=%7 max_gap_after_serial=%8 frames_presented=%9 "
+                   "swaps_minus_frames_presented=%10 head_gap_ms=%11 tail_gap_ms=%12 "
+                   "first_swap_utc=%13 last_swap_utc=%14" )
+                   .arg( static_cast<qulonglong>( swapSnapshot.sessionId ) )
+                   .arg( bool01( swapSnapshot.windowActive ) )
+                   .arg( bool01( swapSnapshot.telemetryEnabled ) )
+                   .arg( static_cast<qulonglong>( swapSnapshot.summary.swapCount ) )
+                   .arg( swapSnapshot.summary.swapFps, 0, 'f', 3 )
+                   .arg( swapSnapshot.summary.maxGapMs, 0, 'f', 3 )
+                   .arg( static_cast<qulonglong>( swapSnapshot.summary.maxGapBeforeSerial ) )
+                   .arg( static_cast<qulonglong>( swapSnapshot.summary.maxGapAfterSerial ) )
+                   .arg( m_playbackSmokePresentedFrames )
+                   .arg( static_cast<qlonglong>( swapSnapshot.summary.swapCount )
+                         - static_cast<qlonglong>( m_playbackSmokePresentedFrames ) )
+                   .arg( swapSnapshot.summary.headGapMs, 0, 'f', 3 )
+                   .arg( swapSnapshot.summary.tailGapMs, 0, 'f', 3 )
+                   .arg( swapSnapshot.summary.firstSwapUtc )
+                   .arg( swapSnapshot.summary.lastSwapUtc );
+    }
+
+    // CUDA-PLAYBACK-CONTACT-SHEET-1 r1d (sol HARDENING): cleared LAST, after every summary
+    // line above has read them (frame_telemetry=%44 on playback_smoke.summary,
+    // telemetry_enabled=%2 on playback_smoke.foreground) -- clearing them earlier would make
+    // this session's own summary misreport a telemetry-enabled session as disabled. Every
+    // frame emitted AFTER this point belongs to no smoke session (e.g. a contact-sheet
+    // capture pass's frames, drawn via beginPlaybackSmokeTelemetry-suppressed restarts): with
+    // these flags left set, such a frame still passed m_playbackSmokeFrameTelemetry/
+    // m_playbackSmokeTimelineTelemetry gates elsewhere (e.g. the playback_auto.decision line
+    // and the playback_timeline_* stageTimingTelemetry fields) and was logged carrying this
+    // now-CLOSED session's id and its frozen presented-frame index.
+    m_playbackSmokeFrameTelemetry = false;
+    m_playbackSmokeTimelineTelemetry = false;
 }
 
 bool MainWindow::primePlaybackCacheOnPlayStart( void )
@@ -25674,7 +26661,14 @@ void MainWindow::on_actionPlay_toggled(bool checked)
     if( checked )
     {
         resetPlaybackQualityAutoRunState();
-        beginPlaybackSmokeTelemetry();
+        // B2 (capture-only playback mode): the contact-sheet capture pass restarts Play
+        // itself, potentially many times, strictly AFTER the measured interval's own
+        // beginPlaybackSmokeTelemetry()/finishPlaybackSmokeTelemetry() pair has already
+        // closed. Never re-open a new playback_smoke session (and never reset the GPU
+        // swap-telemetry counters) for one of those restarts: doing so would emit
+        // additional playback_smoke.frame/summary/gpu_summary lines the Bachelor job's
+        // parsers could pick up in place of (or mixed with) the measured session.
+        if( !m_contactSheetCaptureActive ) beginPlaybackSmokeTelemetry();
         beginPlayToFirstFrameMeasurement();
         m_playbackScopeLastUpdateTime = 0.0;
         requestFrameRefresh( true, "play-start" );
@@ -27399,6 +28393,12 @@ void MainWindow::finishPresentedFrame( uint64_t displayFrame,
             : 0.0 );
     m_lastPresentedStageTimingTelemetry = readyFrame.stageTimingTelemetry;
     notePlaybackSmokePresentedFrame( displayFrame, readyFrame, requestContext );
+    // HARDENING (default-off): m_contactSheetOptionsPresent is only ever true inside
+    // runGuiPlaybackSmoke's own --contact-sheet-dir/--contact-sheet-frames block, so this call
+    // does not happen at all -- not even as an early return -- on the measured-frame hot path
+    // when the options are off.
+    if( m_contactSheetOptionsPresent )
+        noteContactSheetPresentedFrame( displayFrame, readyFrame, requestContext );
     if( dualIsoWarmupInstrumentationEnabled() )
         ++m_dualIsoWarmupTelemetryPresentedFrames;
     if( interactiveTraceEnabled() )
@@ -27991,6 +28991,8 @@ void MainWindow::drawFrameReady()
 
     MainWindowGpuPreviewPolicyState gpuPreviewPolicy = requestContext.gpuPreviewPolicy;
     gpuPreviewPolicy.gpuViewportInstalled = gpuViewportInstalled;
+    gpuPreviewPolicy.gpuWidgetViewportInstalled =
+        GpuDisplayViewport::isInstalledOn( ui->graphicsView );
 
     const bool gpu16PreviewActive = mainWindowUsesGpu16PreviewPresentation( gpuPreviewPolicy );
     const bool gpuPreviewProcessingActive = mainWindowUsesGpuPreviewProcessing( gpuPreviewPolicy );

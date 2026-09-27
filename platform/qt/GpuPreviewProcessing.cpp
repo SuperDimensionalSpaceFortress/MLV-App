@@ -2016,6 +2016,254 @@ QByteArray gpuPreviewProcessingPackLookupTextureRgba16(const QByteArray & source
     return packed;
 }
 
+bool gpuPreviewProcessingEnsureDisplayProgram(QOpenGLShaderProgram *& program,
+                                              QObject * shaderParent)
+{
+    if ( program ) return true;
+
+    const QByteArray vertexShader = gpuPreviewProcessingVertexShaderSource();
+    const QByteArray fragmentShader = gpuPreviewProcessingDisplayFragmentShaderSource();
+
+    program = new QOpenGLShaderProgram(shaderParent);
+    if ( !program->addShaderFromSourceCode(QOpenGLShader::Vertex, vertexShader)
+      || !program->addShaderFromSourceCode(QOpenGLShader::Fragment, fragmentShader)
+      || !program->link() )
+    {
+        qWarning() << "GPU preview-processing display shader setup failed:" << program->log();
+        delete program;
+        program = nullptr;
+        return false;
+    }
+    return true;
+}
+
+QOpenGLTexture * gpuPreviewProcessingCreateOrResizeLookupTexture(QOpenGLTexture * texture,
+                                                                 int width,
+                                                                 int height)
+{
+    if ( texture && texture->isCreated() && texture->width() == width && texture->height() == height )
+    {
+        return texture;
+    }
+
+    delete texture;
+    texture = new QOpenGLTexture(QOpenGLTexture::Target2D);
+    texture->setFormat(QOpenGLTexture::RGBA16_UNorm);
+    texture->setSize(width, height);
+    texture->setMipLevels(1);
+    texture->allocateStorage(QOpenGLTexture::RGBA, QOpenGLTexture::UInt16);
+    // FAIL CLOSED (GPU-TEXNR-S1-DARK-GREEN-1 round 2): allocateStorage() is void, so
+    // isCreated() is the only signal that the GL texture object actually came into
+    // being (e.g. it stays false with no current context or a lost context). A caller
+    // that got a non-null pointer back here used to be indistinguishable from one that
+    // got a real GPU texture; now a failed allocation returns nullptr instead.
+    if ( !texture->isCreated() )
+    {
+        delete texture;
+        return nullptr;
+    }
+    texture->setWrapMode(QOpenGLTexture::ClampToEdge);
+    texture->setMinMagFilters(QOpenGLTexture::Nearest, QOpenGLTexture::Nearest);
+    return texture;
+}
+
+void gpuPreviewProcessingDestroyLutTextureSet(GpuPreviewProcessingLutTextureSet & set)
+{
+    delete set.levels;
+    delete set.matrixR;
+    delete set.matrixG;
+    delete set.matrixB;
+    delete set.gamma;
+    set.levels = nullptr;
+    set.matrixR = nullptr;
+    set.matrixG = nullptr;
+    set.matrixB = nullptr;
+    set.gamma = nullptr;
+    set.signature = 0;
+    set.signatureValid = false;
+}
+
+void gpuPreviewProcessingUpdateLutTextureSet(GpuPreviewProcessingLutTextureSet & set,
+                                             const GpuPreviewProcessingConfig & config)
+{
+    if ( !config.enabled )
+    {
+        gpuPreviewProcessingDestroyLutTextureSet(set);
+        return;
+    }
+    if ( set.signatureValid
+      && set.signature == config.signature
+      && set.levels && set.matrixR && set.matrixG && set.matrixB && set.gamma )
+    {
+        return;
+    }
+    if ( config.levelsLut.size() < static_cast<int>(65536u * sizeof(uint16_t))
+      || config.matrixLutR.size() < static_cast<int>(65536u * sizeof(uint16_t))
+      || config.matrixLutG.size() < static_cast<int>(65536u * sizeof(uint16_t))
+      || config.matrixLutB.size() < static_cast<int>(65536u * sizeof(uint16_t))
+      || config.gammaLut.size() < static_cast<int>(65536u * sizeof(uint16_t)) )
+    {
+        gpuPreviewProcessingDestroyLutTextureSet(set);
+        return;
+    }
+
+    const QByteArray levelsBytes = gpuPreviewProcessingPackLookupTextureRgba16(config.levelsLut);
+    const QByteArray matrixRBytes = gpuPreviewProcessingPackLookupTextureRgba16(config.matrixLutR);
+    const QByteArray matrixGBytes = gpuPreviewProcessingPackLookupTextureRgba16(config.matrixLutG);
+    const QByteArray matrixBBytes = gpuPreviewProcessingPackLookupTextureRgba16(config.matrixLutB);
+    const QByteArray gammaBytes = gpuPreviewProcessingPackLookupTextureRgba16(config.gammaLut);
+
+    set.levels = gpuPreviewProcessingCreateOrResizeLookupTexture(set.levels, kLutTextureEdge, kLutTextureEdge);
+    set.matrixR = gpuPreviewProcessingCreateOrResizeLookupTexture(set.matrixR, kLutTextureEdge, kLutTextureEdge);
+    set.matrixG = gpuPreviewProcessingCreateOrResizeLookupTexture(set.matrixG, kLutTextureEdge, kLutTextureEdge);
+    set.matrixB = gpuPreviewProcessingCreateOrResizeLookupTexture(set.matrixB, kLutTextureEdge, kLutTextureEdge);
+    set.gamma = gpuPreviewProcessingCreateOrResizeLookupTexture(set.gamma, kLutTextureEdge, kLutTextureEdge);
+
+    // FAIL CLOSED (GPU-TEXNR-S1-DARK-GREEN-1 round 2): a real GL allocation failure
+    // (lost/recreated context, out of memory) now surfaces as a null member above
+    // instead of a stale/half-built set silently being stamped ready. Destroy
+    // whatever did get created and leave signatureValid false so the next call
+    // retries from scratch rather than presenting with a subset of LUTs bound.
+    if ( !set.levels || !set.matrixR || !set.matrixG || !set.matrixB || !set.gamma )
+    {
+        gpuPreviewProcessingDestroyLutTextureSet(set);
+        return;
+    }
+
+    // FAIL CLOSED (GPU-TEXNR-S1-DARK-GREEN-1 round 3): setData() is void, so a failed
+    // upload (e.g. a driver rejecting the transfer on an otherwise-created texture) was
+    // previously indistinguishable from a successful one -- signatureValid was stamped
+    // regardless. Drain any pre-existing GL error first so a stale error from unrelated
+    // prior work is never misattributed to these uploads, then check once after all five
+    // -- any error found leaves signatureValid false (destroying the whole set, same as
+    // an allocation failure above) rather than presenting with corrupt LUT content.
+    QOpenGLContext * currentContext = QOpenGLContext::currentContext();
+    QOpenGLFunctions * gl = currentContext ? currentContext->functions() : nullptr;
+    if ( gl )
+    {
+        // BOUNDED (GPU-TEXNR-S1-DARK-GREEN-1 round 4, fable minor): on a robustness-
+        // enabled context (GL_KHR_robustness), glGetError() can report GL_CONTEXT_LOST
+        // (0x0507) persistently until the app handles the reset, which would otherwise
+        // spin this drain forever. Cap it at 16 iterations -- comfortably above any real
+        // burst of stale errors -- and treat a lost context as not-ready immediately
+        // rather than draining through it and attempting five uploads that cannot
+        // succeed.
+        constexpr GLenum kGlContextLost = 0x0507;
+        int drainIterations = 0;
+        GLenum drainedError = GL_NO_ERROR;
+        while ( drainIterations < 16 && (drainedError = gl->glGetError()) != GL_NO_ERROR )
+        {
+            if ( drainedError == kGlContextLost )
+            {
+                gpuPreviewProcessingDestroyLutTextureSet(set);
+                return;
+            }
+            ++drainIterations;
+        }
+    }
+
+    set.levels->setData(QOpenGLTexture::RGBA, QOpenGLTexture::UInt16, levelsBytes.constData());
+    set.matrixR->setData(QOpenGLTexture::RGBA, QOpenGLTexture::UInt16, matrixRBytes.constData());
+    set.matrixG->setData(QOpenGLTexture::RGBA, QOpenGLTexture::UInt16, matrixGBytes.constData());
+    set.matrixB->setData(QOpenGLTexture::RGBA, QOpenGLTexture::UInt16, matrixBBytes.constData());
+    set.gamma->setData(QOpenGLTexture::RGBA, QOpenGLTexture::UInt16, gammaBytes.constData());
+
+    const GLenum uploadError = gl ? gl->glGetError() : GL_NO_ERROR;
+    if ( !gl || uploadError != GL_NO_ERROR )
+    {
+        gpuPreviewProcessingDestroyLutTextureSet(set);
+        return;
+    }
+
+    set.signature = config.signature;
+    set.signatureValid = true;
+}
+
+bool gpuPreviewProcessingLutTextureSetReady(const GpuPreviewProcessingLutTextureSet & set,
+                                            const GpuPreviewProcessingConfig & config)
+{
+    // FAIL CLOSED (GPU-TEXNR-S1-DARK-GREEN-1 round 2): signatureValid is only set by
+    // gpuPreviewProcessingUpdateLutTextureSet() after every LUT texture is confirmed
+    // GL-created and uploaded (see above) -- checking it here, not just the pointers,
+    // is what makes readiness reflect actual GL success rather than "five non-null
+    // C++ wrappers", which a never-created QOpenGLTexture would otherwise satisfy.
+    return config.enabled
+        && set.signatureValid
+        && set.levels && set.matrixR && set.matrixG && set.matrixB && set.gamma;
+}
+
+bool gpuPreviewProcessingReconTexturePresentationRefused(
+    bool presentingReconTexture,
+    const GpuPreviewProcessingLutTextureSet & set,
+    const GpuPreviewProcessingConfig & config)
+{
+    return presentingReconTexture && !gpuPreviewProcessingLutTextureSetReady(set, config);
+}
+
+void gpuPreviewProcessingBindDisplayUniformsAndTextures(
+    QOpenGLShaderProgram * program,
+    const GpuPreviewProcessingConfig & config,
+    const GpuPreviewProcessingLutTextureSet & lutSet,
+    const GpuPreviewProcessingDisplayUniforms & uniforms,
+    bool lutsReady)
+{
+    if ( !program ) return;
+
+    program->setUniformValue("textureSize", uniforms.textureSize);
+    program->setUniformValue("frameTextureMode", uniforms.frameTextureMode);
+    program->setUniformValue("samplingMode", uniforms.samplingMode);
+    program->setUniformValue("zebraEnabled", uniforms.zebraEnabled ? 1.0f : 0.0f);
+    program->setUniformValue("zebraUnderThreshold", uniforms.zebraUnderThreshold);
+    program->setUniformValue("zebraOverThreshold", uniforms.zebraOverThreshold);
+    program->setUniformValue("previewProcessingEnabled", lutsReady ? 1.0f : 0.0f);
+    program->setUniformValue("previewUseCameraMatrix", config.useCameraMatrix ? 1.0f : 0.0f);
+    program->setUniformValue("previewApplyGamutCompression", config.applyGamutCompression ? 1.0f : 0.0f);
+    program->setUniformValue("previewProperWbRow0",
+                             QVector3D(config.properWbMatrix[0], config.properWbMatrix[1], config.properWbMatrix[2]));
+    program->setUniformValue("previewProperWbRow1",
+                             QVector3D(config.properWbMatrix[3], config.properWbMatrix[4], config.properWbMatrix[5]));
+    program->setUniformValue("previewProperWbRow2",
+                             QVector3D(config.properWbMatrix[6], config.properWbMatrix[7], config.properWbMatrix[8]));
+    program->setUniformValue("previewRgbToY",
+                             QVector3D(config.rgbToY[0], config.rgbToY[1], config.rgbToY[2]));
+
+    if ( lutsReady && lutSet.levels )
+    {
+        program->setUniformValue("levelsLut", 1);
+        lutSet.levels->bind(1);
+    }
+    if ( lutsReady && lutSet.matrixR )
+    {
+        program->setUniformValue("matrixLutR", 2);
+        lutSet.matrixR->bind(2);
+    }
+    if ( lutsReady && lutSet.matrixG )
+    {
+        program->setUniformValue("matrixLutG", 3);
+        lutSet.matrixG->bind(3);
+    }
+    if ( lutsReady && lutSet.matrixB )
+    {
+        program->setUniformValue("matrixLutB", 4);
+        lutSet.matrixB->bind(4);
+    }
+    if ( lutsReady && lutSet.gamma )
+    {
+        program->setUniformValue("gammaLut", 5);
+        lutSet.gamma->bind(5);
+    }
+}
+
+void gpuPreviewProcessingReleaseDisplayTextures(const GpuPreviewProcessingLutTextureSet & lutSet,
+                                                bool lutsReady)
+{
+    if ( lutsReady && lutSet.levels ) lutSet.levels->release();
+    if ( lutsReady && lutSet.matrixR ) lutSet.matrixR->release();
+    if ( lutsReady && lutSet.matrixG ) lutSet.matrixG->release();
+    if ( lutsReady && lutSet.matrixB ) lutSet.matrixB->release();
+    if ( lutsReady && lutSet.gamma ) lutSet.gamma->release();
+}
+
 bool gpuPreviewProcessingRendererIsSoftware(const QString & rendererDescription)
 {
     const QString normalized = rendererDescription.trimmed().toLower();

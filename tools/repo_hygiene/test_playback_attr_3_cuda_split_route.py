@@ -36,6 +36,25 @@ def _pwsh_quote(value: str) -> str:
     return "'" + value.replace("'", "''") + "'"
 
 
+_ANSI_ESCAPE_RX = re.compile(r"\x1b\[[0-9;]*[A-Za-z]")
+_PWSH_ERROR_VIEW_CONTINUATION_RX = re.compile(r"(?m)^[ \t]*\|[ \t]?")
+
+
+def normalize_pwsh_message_text(text: str) -> str:
+    """Undo pwsh's console-width error-view wrapping before substring matching.
+
+    An uncaught terminating error is rendered by pwsh's own default host formatter, which wraps
+    the exception message at the console width and prefixes each continuation line with ANSI
+    colour codes and a '|' gutter -- so a phrase can land split across two lines on a narrower
+    console than this one, and assertIn looking for the unbroken phrase then fails even though
+    the thrown message is correct. Strip the ANSI codes and the '|' continuation prefixes, then
+    collapse whitespace runs (including the newline the wrap introduced) to one space.
+    """
+    text = _ANSI_ESCAPE_RX.sub("", text)
+    text = _PWSH_ERROR_VIEW_CONTINUATION_RX.sub(" ", text)
+    return re.sub(r"\s+", " ", text).strip()
+
+
 ROOT = Path(__file__).resolve().parents[2]
 
 DLL_PAIR_JOB = ROOT / "tools" / "profiling" / "ultramagnus" / "playback-attr-3-cuda-dll-job.ps1"
@@ -384,6 +403,215 @@ class AttributionJobTests(unittest.TestCase):
                 self.assertLess(refusal, self.text.index(later_verdict))
 
 
+class SmokeRunnerPinTests(unittest.TestCase):
+    """ATTR3-SMOKE-RUNNER-DEPS-1: the runner's FULL dependency closure is pinned, not the
+    runner alone.
+
+    Round 1 (ATTR3-SMOKE-RUNNER-PIN-1) hash-pinned only run-release-gui-smoke.ps1; Bachelor
+    still could not launch it, because the runner dot-sources four siblings and imports a
+    module, all resolved via $PSScriptRoot, and none of those five was ever staged. Round 1/2
+    then derived the closure by SCANNING; round 3 (NARROW BY REDESIGN) replaced discovery with
+    an EXPLICITLY PINNED six-file manifest (Get-AttrCudaSmokeRunnerClosureManifest) -- never
+    mechanically derived -- proved complete by an AST census (Assert-AttrCudaClosureComplete) at
+    generation time -- every file in it is still hash-pinned from the committed git blob at
+    -SourceCommit -- the same bytes attr3-stage-smoke-runner-job.ps1 stages -- never from a
+    working-tree file.
+    """
+
+    def setUp(self) -> None:
+        self.text = _read(ATTRIBUTION_JOB)
+
+    def test_existence_only_check_is_gone(self) -> None:
+        self.assertNotIn(
+            "foreach ($name in @($PresentMonName, 'run-release-gui-smoke.ps1')) {", self.text
+        )
+
+    def test_single_file_pin_check_is_gone(self) -> None:
+        # ATTR3-SMOKE-RUNNER-PIN-1's single-file pin (round 2) is superseded by the closure.
+        self.assertNotIn("$SmokeRunnerSha256 = '__SMOKE_RUNNER_SHA256__'", self.text)
+        self.assertNotIn(
+            '$SmokeRunnerCacheName = "run-release-gui-smoke-$($SmokeRunnerSha256.Substring(0, 16)).ps1"',
+            self.text,
+        )
+
+    def test_the_scan_based_member_loop_is_gone(self) -> None:
+        # round 3 (NARROW BY REDESIGN): the inline per-member loop is replaced by one call into
+        # the shared, embedded Get-AttrCudaClosureDirectoryMismatch.
+        self.assertNotIn("foreach ($closureEntry in $SmokeRunnerClosure) {", self.text)
+        self.assertNotIn(
+            "if ($closureEntryActualSha -ne $closureEntry.sha256.ToUpperInvariant()) {", self.text
+        )
+
+    def test_the_emitted_job_pins_the_closure_and_checks_it_with_the_shared_function(self) -> None:
+        self.assertIn("$SmokeRunnerClosure = __SMOKE_RUNNER_CLOSURE__", self.text)
+        self.assertIn("$SmokeRunnerClosureDirName = '__SMOKE_RUNNER_CLOSURE_DIR_NAME__'", self.text)
+        self.assertIn(
+            "$smokeRunnerClosureDir = Join-Path $Cache $SmokeRunnerClosureDirName", self.text
+        )
+        self.assertIn(
+            "$smokeRunnerClosureMismatch = Get-AttrCudaClosureDirectoryMismatch -Dir "
+            "$smokeRunnerClosureDir -Entries $SmokeRunnerClosure",
+            self.text,
+        )
+        self.assertIn(
+            'throw "ATTRCUDA_SMOKE_RUNNER_STALE $smokeRunnerClosureMismatch"', self.text
+        )
+
+    def test_the_shared_directory_mismatch_function_is_embedded(self) -> None:
+        self.assertIn("'Get-AttrCudaClosureDirectoryMismatch',", self.text)
+
+    def test_the_closure_digest_is_validated_before_it_is_trusted(self) -> None:
+        # Fable minor (round 2, carried forward): validated the same way -PresentMonSha256 is,
+        # before it is substituted into the emitted job.
+        self.assertIn(
+            "if ($smokeRunnerClosureDigest -notmatch '^[0-9a-f]{64}$') {", self.text
+        )
+        self.assertIn("ATTRCUDA_BLOB_SHA_MALFORMED", self.text)
+
+    def test_the_pin_is_baked_from_the_committed_git_blob_not_the_working_tree(self) -> None:
+        # round 3: the pinned manifest, never a -RepoRelativePath parameter -- and proved
+        # complete against the real files before it is trusted (Assert-AttrCudaClosureComplete).
+        self.assertIn(
+            "Assert-AttrCudaClosureComplete -RepoRoot $RepoRoot -Commit $SourceCommit", self.text
+        )
+        self.assertIn(
+            "Resolve-AttrCudaSmokeRunnerClosure -RepoRoot $RepoRoot -Commit $SourceCommit",
+            self.text,
+        )
+        self.assertNotIn("-RepoRelativePath $SmokeRunnerRelativePath", self.text)
+        self.assertNotIn("SmokeRunnerRelativePath", self.text)
+        self.assertIn("Get-AttrCudaClosureDigestHex -Closure $smokeRunnerClosure", self.text)
+        # ATTR3-FOOTAGE-BIND-1 PR-B round 3 (STRUCTURAL): substitution is now a single
+        # Expand-AttrCudaTemplate call over a token map, not a chained .Replace() sequence.
+        self.assertIn("SMOKE_RUNNER_CLOSURE_DIR_NAME = $smokeRunnerClosureDirName", self.text)
+        self.assertIn("Expand-AttrCudaTemplate -Template $template -Tokens", self.text)
+
+    def test_the_refusal_runs_before_presentmon_and_before_deployment(self) -> None:
+        refusal = self.text.index("ATTRCUDA_SMOKE_RUNNER_STALE")
+        deploy = self.text.index(
+            "[void](Publish-AttrCudaFileCopy -Source (Join-Path $Cache $ExeName) -Destination $exePath)"
+        )
+        present_mon_start = self.text.index("Start-PresentMonCapture $presentMonPath")
+        self.assertLess(refusal, deploy, "the pin must be checked before the package is deployed")
+        self.assertLess(
+            refusal, present_mon_start, "the pin must be checked before PresentMon starts"
+        )
+
+
+class SmokeRunFailedBeforePresentMonTests(unittest.TestCase):
+    """ATTR3-SMOKE-RUNNER-DEPS-1 (D): the smoke run's own outcome is checked before PresentMon
+    is waited on, so a smoke-side failure is never reported as PRESENTMON_TIMEOUT."""
+
+    def setUp(self) -> None:
+        self.text = _read(ATTRIBUTION_JOB)
+
+    def test_smoke_outcome_is_checked_before_waiting_on_presentmon(self) -> None:
+        smoke_launch = self.text.index("$smokeLaunchException = $null")
+        check = self.text.index(
+            "if ($null -ne $smokeLaunchException -or $smokeRc -ne 0 -or -not "
+            "(Test-Path -LiteralPath $resultPath)) {"
+        )
+        wait = self.text.index("$presentMonDoneResult = Wait-PresentMonCapture $presentMonProc")
+        self.assertLess(smoke_launch, check)
+        self.assertLess(check, wait, "the outcome check must run before PresentMon is waited on")
+
+    def test_presentmon_is_stopped_not_waited_out_on_a_smoke_failure(self) -> None:
+        check = self.text.index(
+            "if ($null -ne $smokeLaunchException -or $smokeRc -ne 0 -or -not "
+            "(Test-Path -LiteralPath $resultPath)) {"
+        )
+        stop = self.text.index("Stop-PresentMonCapture", check)
+        wait = self.text.index("$presentMonDoneResult = Wait-PresentMonCapture $presentMonProc")
+        self.assertLess(stop, wait)
+
+    def test_smoke_run_failed_is_a_distinct_result_with_a_stderr_tail(self) -> None:
+        self.assertIn("RESULT=SMOKE_RUN_FAILED", self.text)
+        self.assertIn("smokeStderrTail", self.text)
+        self.assertIn("exit 18", self.text)
+
+    def test_presentmon_timeout_still_exists_for_its_own_case(self) -> None:
+        # Unchanged: Wait-PresentMonCapture still throws PRESENTMON_TIMEOUT, now reached only
+        # once the smoke run is already known to have succeeded.
+        self.assertIn("PRESENTMON_TIMEOUT: did not exit within", self.text)
+        failed = self.text.index("RESULT=SMOKE_RUN_FAILED")
+        timeout_fn = self.text.index("function Wait-PresentMonCapture")
+        self.assertLess(timeout_fn, failed, "PRESENTMON_TIMEOUT's own function is defined earlier in the file")
+
+    def test_a_launch_exception_is_caught_and_mapped_to_smoke_run_failed(self) -> None:
+        # sol, PR #144 major 3: a terminating exception starting the nested pwsh used to skip
+        # $smokeRc and the whole SMOKE_RUN_FAILED branch, bypassing PresentMon cleanup entirely.
+        launch = self.text.index("& \"$env:ProgramFiles\\PowerShell\\7\\pwsh.exe\"")
+        try_start = self.text.rindex("try {", 0, launch)
+        catch_start = self.text.index("} catch {", launch)
+        exception_capture = self.text.index("$smokeLaunchException = $_", catch_start)
+        check = self.text.index(
+            "if ($null -ne $smokeLaunchException -or $smokeRc -ne 0 -or -not "
+            "(Test-Path -LiteralPath $resultPath)) {"
+        )
+        self.assertLess(try_start, launch)
+        self.assertLess(launch, catch_start)
+        self.assertLess(catch_start, exception_capture)
+        self.assertLess(exception_capture, check)
+
+    def test_smoke_run_failed_records_the_capped_exception_type_and_presentmon_stop_outcome(self) -> None:
+        self.assertIn("smokeLaunchExceptionType", self.text)
+        self.assertIn("smokeLaunchExceptionMessage", self.text)
+        self.assertIn("presentMonConfirmedExited", self.text)
+        self.assertIn("presentMonKillError", self.text)
+        self.assertIn("presentMonWaitError", self.text)
+        self.assertIn("$MaxSmokeLaunchExceptionChars = 500", self.text)
+
+
+class StopPresentMonCaptureReportsFailuresTests(unittest.TestCase):
+    """ATTR3-SMOKE-RUNNER-DEPS-1 (sol, PR #144 major 3): Kill()/WaitForExit() failures must be
+    reported, not swallowed by an empty catch block, and confirmedExited must be read from the
+    process afterward rather than assumed from "no exception"."""
+
+    def setUp(self) -> None:
+        self.text = _read(ATTRIBUTION_JOB)
+
+    def test_no_empty_catch_blocks_remain_in_the_stop_function(self) -> None:
+        start = self.text.index("function Stop-PresentMonCapture(")
+        end = self.text.index("\nfunction Get-FrameRows(", start)
+        body = self.text[start:end]
+        self.assertNotIn("catch { }", body)
+        self.assertIn("$killError = $_.Exception.Message", body)
+        self.assertIn("$waitError = ", body)
+
+    def test_returns_a_status_object_not_void(self) -> None:
+        start = self.text.index("function Stop-PresentMonCapture(")
+        end = self.text.index("\nfunction Get-FrameRows(", start)
+        body = self.text[start:end]
+        self.assertIn("confirmedExited = [bool]$Proc.HasExited", body)
+        self.assertIn("killError = $killError", body)
+        self.assertIn("waitError = $waitError", body)
+
+
+class Attr3JobNeverActivatesExcludedDependencyTests(unittest.TestCase):
+    """ATTR3-SMOKE-RUNNER-DEPS-1 round 3: the AST-census pinned exclusion for the dormant
+    detect-playback-artifacts.ps1 launch site (kept next to
+    Test-AttrCudaClosureScanExclusionMatch in AttrCudaArtifacts.psm1) is sound only as long as
+    the ATTR-3 attribution job never passes -DetectPlaybackArtifacts -- the one switch that
+    would make run-release-gui-smoke.ps1 actually execute that reference. Required test (per the
+    review): if this job ever starts passing that switch, this test must fail before the
+    exclusion becomes unsound in production.
+    """
+
+    def setUp(self) -> None:
+        self.text = _read(ATTRIBUTION_JOB)
+
+    def test_the_emitted_smoke_command_never_passes_detectplaybackartifacts(self) -> None:
+        cmd_start = self.text.index('$cmd = "& $(ConvertTo-PsSingleQuoted $smoke)')
+        cmd_end = self.text.index('\n', cmd_start)
+        cmd_line = self.text[cmd_start:cmd_end]
+        self.assertNotIn("-DetectPlaybackArtifacts", cmd_line)
+
+    def test_no_other_reference_to_the_switch_exists_in_the_generator(self) -> None:
+        # Belt and suspenders: the flag must not appear anywhere else in the generator either
+        # (e.g. a second, less obvious invocation site added later).
+        self.assertNotIn("-DetectPlaybackArtifacts", self.text)
+
+
 class AttributionJobFixtureRehearsalTests(unittest.TestCase):
     """ATTR3-FIXTURE-REHEARSAL-1: -ClipId also admits the two tracked fixtures, unmistakably."""
 
@@ -449,7 +677,11 @@ class AttributionJobFixtureRehearsalTests(unittest.TestCase):
     def test_emitted_job_carries_the_flag_from_the_generators_membership_test(self) -> None:
         self.assertIn("$FixtureRehearsal = __FIXTURE_REHEARSAL__", self.text)
         self.assertIn("$fixtureRehearsalLiteral = if ($isFixtureRehearsal)", self.text)
-        self.assertIn("Replace('__FIXTURE_REHEARSAL__', $fixtureRehearsalLiteral)", self.text)
+        # ATTR3-FOOTAGE-BIND-1 PR-B round 3 (STRUCTURAL): substitution is now a single
+        # Expand-AttrCudaTemplate call over a token map, not a chained .Replace() sequence -- see
+        # that function's own header in AttrCudaArtifacts.psm1.
+        self.assertIn("FIXTURE_REHEARSAL = $fixtureRehearsalLiteral", self.text)
+        self.assertIn("Expand-AttrCudaTemplate -Template $template -Tokens", self.text)
 
     def test_flag_is_recorded_in_every_summary_and_in_the_evidence_manifest(self) -> None:
         # summary.json is written on every early-exit venue; evidence-manifest.json only on
@@ -481,7 +713,10 @@ class AttributionJobFixtureRehearsalTests(unittest.TestCase):
         self.assertIn("[string]$FixtureSha256 = ''", self.text)
         self.assertIn("PLAYBACK_ATTR3_FIXTURE_SHA_REQUIRED", self.text)
         self.assertIn("PLAYBACK_ATTR3_FIXTURE_SHA_REFUSED", self.text)
-        self.assertIn("PLAYBACK_ATTR3_CLIPPATH_REQUIRED", self.text)
+        # ATTR3-FOOTAGE-BIND-1 PR-B: -ClipPath is REFUSED for an owner id, never required --
+        # the id is resolved through tools/gates/resolve_consented_clip.py instead.
+        self.assertIn("PLAYBACK_ATTR3_CLIPPATH_REFUSED", self.text)
+        self.assertNotIn("PLAYBACK_ATTR3_CLIPPATH_REQUIRED", self.text)
 
     def test_fixture_content_is_authenticated_before_the_package_is_deployed(self) -> None:
         # ATTR3-FIXTURE-STAGE-1: a cache file name proves nothing about its bytes.
@@ -508,6 +743,317 @@ class AttributionJobFixtureRehearsalTests(unittest.TestCase):
         )
         self.assertIn("if (-not $verdict.admitted)", self.text)
         self.assertIn("exit $verdict.exitCode", self.text)
+
+
+class AttributionJobOwnerClipRefusalTests(unittest.TestCase):
+    """ATTR3-FOOTAGE-BIND-1 PR-B: an owner id is resolved (never handed a path); -ClipPath and
+    -FixtureSha256 are both REFUSED for one. The fixture arm is untouched."""
+
+    def setUp(self) -> None:
+        self.text = _read(ATTRIBUTION_JOB)
+
+    def _generate(self, clip_id: str, out_file: Path, *, clip_path: str | None = None) -> subprocess.CompletedProcess:
+        if PWSH is None:
+            self.skipTest("pwsh is not on PATH")
+        head = subprocess.run(
+            ["git", "-C", str(ROOT), "rev-parse", "HEAD"], capture_output=True, text=True
+        ).stdout.strip()
+        # ATTR3-FIXTURE-STAGE-1 made -FixtureSha256 mandatory for a fixture id.
+        is_fixture = clip_id in ("tiny_dual_iso", "large_dual_iso")
+        fixture_sha = ["-FixtureSha256", "b" * 64] if is_fixture else []
+        if clip_path is None:
+            clip_path = "C:\\synthetic-cache\\" + clip_id if is_fixture else None
+        clip_path_args = ["-ClipPath", clip_path] if clip_path else []
+        return subprocess.run(
+            [
+                PWSH, "-NoLogo", "-NoProfile", "-NonInteractive", "-File", str(ATTRIBUTION_JOB),
+                "-SourceCommit", head, "-BuildManifestSha256", "0" * 64,
+                "-ClipId", clip_id,
+                *clip_path_args,
+                *fixture_sha,
+                "-OutFile", str(out_file),
+            ],
+            capture_output=True, text=True,
+        )
+
+    def test_the_owner_route_decision_precedes_the_write(self) -> None:
+        decision = self.text.index("$ownerPartsForJob = @(Resolve-AttrCudaOwnerClipParts")
+        self.assertLess(decision, self.text.index("[IO.File]::WriteAllText($OutFile"))
+        self.assertNotIn("ContentVerifiedBy", self.text)  # unconditional: no override switch
+
+    def test_an_owner_clip_id_with_a_typed_path_is_refused_before_resolving_anything(self) -> None:
+        import tempfile
+
+        with tempfile.TemporaryDirectory() as tmp:
+            out_file = Path(tmp) / "owner.job.ps1"
+            proc = self._generate("M16-1243", out_file, clip_path="C:\\synthetic-cache\\M16-1243")
+            self.assertNotEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+            self.assertIn(
+                "PLAYBACK_ATTR3_CLIPPATH_REFUSED",
+                normalize_pwsh_message_text(proc.stdout + proc.stderr),
+            )
+            self.assertFalse(out_file.exists())
+
+    def test_a_fixture_id_is_still_emitted(self) -> None:
+        import tempfile
+
+        with tempfile.TemporaryDirectory() as tmp:
+            out_file = Path(tmp) / "fixture.job.ps1"
+            proc = self._generate("tiny_dual_iso", out_file)
+            self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+            self.assertTrue(out_file.exists())
+            self.assertIn("$FixtureRehearsal = $true", out_file.read_text(encoding="utf-8"))
+
+
+class OwnerDecisionOrderingAstTests(unittest.TestCase):
+    """ATTR3-FOOTAGE-BIND-1 PR-B round 3 (STRUCTURAL), extended round 6. An AST census over the
+    generator's own TOP-LEVEL statements only -- a FunctionDefinitionAst is one top-level
+    statement whose BODY never executes at definition time, so this never descends into one.
+    Proves: no Import-Module, Get-AttrCudaEmbeddedFunctionSource, git invocation or Test-Path
+    precedes the statement that throws PLAYBACK_ATTR3_CLIPPATH_REFUSED, that the $RepoRoot
+    resolution statement is the only thing standing between that decision and the resolver call
+    (Resolve-AttrCudaOwnerClipParts), and (round 6, astra major) that the resolver call itself
+    precedes the owner arm's own -AgentRoot shape-check statement -- so the complete owner-id
+    decision (flags, RepoRoot, resolver) always runs before AgentRoot validation, never after."""
+
+    def _census(self) -> dict:
+        import json
+        import tempfile
+
+        if PWSH is None:
+            self.skipTest("pwsh is not on PATH")
+        script = (
+            "$ErrorActionPreference = 'Stop'\n"
+            f"$text = [IO.File]::ReadAllText('{ATTRIBUTION_JOB}')\n"
+            "$tokens = $null; $errors = $null\n"
+            "$ast = [System.Management.Automation.Language.Parser]::ParseInput($text, [ref]$tokens, [ref]$errors)\n"
+            "if ($errors.Count -gt 0) { throw ('PARSE_ERROR: ' + ($errors -join '; ')) }\n"
+            "$statements = @($ast.EndBlock.Statements)\n"
+            "$forbiddenNames = @('Import-Module', 'Get-AttrCudaEmbeddedFunctionSource', 'Test-Path', 'git')\n"
+            "$forbiddenIndex = -1\n"
+            "$throwIndex = -1\n"
+            "$repoRootIndex = -1\n"
+            "$resolverCallIndex = -1\n"
+            "$ownerAgentRootIndex = -1\n"
+            "for ($i = 0; $i -lt $statements.Count; $i++) {\n"
+            "    $stmt = $statements[$i]\n"
+            "    if ($stmt -is [System.Management.Automation.Language.FunctionDefinitionAst]) { continue }\n"
+            "    if ($forbiddenIndex -lt 0) {\n"
+            "        $commands = $stmt.FindAll({ param($n) $n -is [System.Management.Automation.Language.CommandAst] }, $true)\n"
+            "        foreach ($c in $commands) {\n"
+            "            $name = $c.GetCommandName()\n"
+            "            if ($null -ne $name -and ($forbiddenNames -icontains $name)) { $forbiddenIndex = $i; break }\n"
+            "        }\n"
+            "    }\n"
+            "    if ($throwIndex -lt 0) {\n"
+            "        $throwStatements = $stmt.FindAll({ param($n) $n -is [System.Management.Automation.Language.ThrowStatementAst] }, $true)\n"
+            "        foreach ($t in $throwStatements) {\n"
+            "            if ($t.Extent.Text -like '*PLAYBACK_ATTR3_CLIPPATH_REFUSED*') { $throwIndex = $i; break }\n"
+            "        }\n"
+            "    }\n"
+            "    if ($repoRootIndex -lt 0 -and $stmt.Extent.Text -like '*Resolve-Path -LiteralPath $RepoRoot*') { $repoRootIndex = $i }\n"
+            "    if ($resolverCallIndex -lt 0 -and $stmt.Extent.Text -like '*Resolve-AttrCudaOwnerClipParts -ClipId*') { $resolverCallIndex = $i }\n"
+            "    # The LAST top-level statement carrying this throw is the owner arm's standalone,\n"
+            "    # post-resolver AgentRoot check -- the fixture arm's own copy lives earlier, nested\n"
+            "    # inside the owner/fixture flag-refusal if/else.\n"
+            "    if ($stmt.Extent.Text -like '*PLAYBACK_ATTR3_AGENTROOT_INVALID*') { $ownerAgentRootIndex = $i }\n"
+            "}\n"
+            "[pscustomobject]@{ forbiddenIndex = $forbiddenIndex; throwIndex = $throwIndex; "
+            "repoRootIndex = $repoRootIndex; resolverCallIndex = $resolverCallIndex; "
+            "ownerAgentRootIndex = $ownerAgentRootIndex } | ConvertTo-Json -Compress\n"
+        )
+        with tempfile.TemporaryDirectory(prefix="attr3-ast-order-") as tmp:
+            script_path = Path(tmp) / "census.ps1"
+            script_path.write_text(script, encoding="utf-8")
+            proc = subprocess.run(
+                [PWSH, "-NoLogo", "-NoProfile", "-NonInteractive", "-File", str(script_path)],
+                capture_output=True, text=True,
+            )
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        return json.loads(proc.stdout)
+
+    def test_no_import_module_embedded_source_git_or_test_path_precedes_the_clippath_refusal(
+        self,
+    ) -> None:
+        census = self._census()
+        self.assertGreaterEqual(census["throwIndex"], 0, "CLIPPATH_REFUSED throw not found")
+        self.assertGreaterEqual(census["forbiddenIndex"], 0, "no forbidden command found at all")
+        self.assertLess(
+            census["throwIndex"],
+            census["forbiddenIndex"],
+            "an Import-Module / Get-AttrCudaEmbeddedFunctionSource / git / Test-Path statement "
+            "precedes the PLAYBACK_ATTR3_CLIPPATH_REFUSED throw",
+        )
+
+    def test_reporoot_resolution_is_the_only_io_before_the_resolver_call(self) -> None:
+        census = self._census()
+        self.assertGreaterEqual(census["repoRootIndex"], 0, "RepoRoot resolution statement not found")
+        self.assertGreaterEqual(census["resolverCallIndex"], 0, "resolver call statement not found")
+        self.assertLess(census["throwIndex"], census["repoRootIndex"])
+        self.assertLess(census["repoRootIndex"], census["resolverCallIndex"])
+        # None of Import-Module / Get-AttrCudaEmbeddedFunctionSource / git / Test-Path appears in
+        # ANY top-level statement before the resolver call -- so the only I/O between the
+        # CLIPPATH decision and the resolver call is RepoRoot's own Resolve-Path.
+        self.assertGreater(census["forbiddenIndex"], census["resolverCallIndex"])
+
+    def test_resolver_call_precedes_the_owner_arm_agentroot_validation(self) -> None:
+        # ATTR3-FOOTAGE-BIND-1 PR-B round 6 (astra major): the complete owner-id decision -- flag
+        # refusals, then RepoRoot resolution, then the resolver call and its own typed refusal --
+        # must run before AgentRoot validation (and anything else unrelated), never after it.
+        census = self._census()
+        self.assertGreaterEqual(census["resolverCallIndex"], 0, "resolver call statement not found")
+        self.assertGreaterEqual(census["ownerAgentRootIndex"], 0, "owner-arm AgentRoot check not found")
+        self.assertLess(
+            census["resolverCallIndex"],
+            census["ownerAgentRootIndex"],
+            "the owner arm's AgentRoot validation precedes the resolver invocation",
+        )
+
+
+class FirstThrowCapableStatementAstTests(unittest.TestCase):
+    """ATTR3-FOOTAGE-BIND-1 PR-B round 5 (STRUCTURAL). Generalizes
+    OwnerDecisionOrderingAstTests beyond the four forbidden command names: walking the
+    generator's own $ast.EndBlock.Statements in textual order (skipping FunctionDefinitionAst,
+    whose body never executes at definition time), the FIRST statement that CAN throw -- either
+    it contains a ThrowStatementAst directly, or it calls a function (by name) whose own body
+    contains a ThrowStatementAst -- must be the owner/fixture flag-refusal if/else block itself.
+    Round 4 left -AgentRoot's shape check as a standalone `if` ahead of that block, so it was the
+    first throw-capable statement instead; round 5 folded it into both arms of the if/else so the
+    block remains the first thing that can throw. Round 6 moves the OWNER arm's copy out again --
+    now to a standalone statement AFTER the resolver call, per OwnerDecisionOrderingAstTests --
+    but the FIXTURE arm's own copy stays nested here, so this block is still the first thing that
+    can throw for either arm."""
+
+    def _first_throw_capable(self) -> dict:
+        import json
+        import tempfile
+
+        if PWSH is None:
+            self.skipTest("pwsh is not on PATH")
+        script = (
+            "$ErrorActionPreference = 'Stop'\n"
+            f"$text = [IO.File]::ReadAllText('{ATTRIBUTION_JOB}')\n"
+            "$tokens = $null; $errors = $null\n"
+            "$ast = [System.Management.Automation.Language.Parser]::ParseInput($text, [ref]$tokens, [ref]$errors)\n"
+            "if ($errors.Count -gt 0) { throw ('PARSE_ERROR: ' + ($errors -join '; ')) }\n"
+            "$statements = @($ast.EndBlock.Statements)\n"
+            "$throwingFunctionNames = [System.Collections.Generic.HashSet[string]]::new(\n"
+            "    [string[]]@(), [System.StringComparer]::OrdinalIgnoreCase)\n"
+            "foreach ($stmt in $statements) {\n"
+            "    if ($stmt -isnot [System.Management.Automation.Language.FunctionDefinitionAst]) { continue }\n"
+            "    $bodyThrows = @($stmt.Body.FindAll({ param($n) $n -is [System.Management.Automation.Language.ThrowStatementAst] }, $true))\n"
+            "    if ($bodyThrows.Count -gt 0) { [void]$throwingFunctionNames.Add($stmt.Name) }\n"
+            "}\n"
+            "$firstIndex = -1\n"
+            "$firstText = $null\n"
+            "for ($i = 0; $i -lt $statements.Count; $i++) {\n"
+            "    $stmt = $statements[$i]\n"
+            "    if ($stmt -is [System.Management.Automation.Language.FunctionDefinitionAst]) { continue }\n"
+            "    $canThrow = $false\n"
+            "    $throwStatements = @($stmt.FindAll({ param($n) $n -is [System.Management.Automation.Language.ThrowStatementAst] }, $true))\n"
+            "    if ($throwStatements.Count -gt 0) { $canThrow = $true }\n"
+            "    if (-not $canThrow) {\n"
+            "        $commands = @($stmt.FindAll({ param($n) $n -is [System.Management.Automation.Language.CommandAst] }, $true))\n"
+            "        foreach ($c in $commands) {\n"
+            "            $name = $c.GetCommandName()\n"
+            "            if ($null -ne $name -and $throwingFunctionNames.Contains($name)) { $canThrow = $true; break }\n"
+            "        }\n"
+            "    }\n"
+            "    if ($canThrow) { $firstIndex = $i; $firstText = $stmt.Extent.Text; break }\n"
+            "}\n"
+            "[pscustomobject]@{ firstIndex = $firstIndex; firstText = $firstText } | ConvertTo-Json -Compress\n"
+        )
+        with tempfile.TemporaryDirectory(prefix="attr3-first-throw-ast-") as tmp:
+            script_path = Path(tmp) / "first_throw_census.ps1"
+            script_path.write_text(script, encoding="utf-8")
+            proc = subprocess.run(
+                [PWSH, "-NoLogo", "-NoProfile", "-NonInteractive", "-File", str(script_path)],
+                capture_output=True, text=True,
+            )
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        return json.loads(proc.stdout)
+
+    def test_first_throw_capable_statement_is_the_owner_fixture_flag_refusal_block(self) -> None:
+        census = self._first_throw_capable()
+        self.assertGreaterEqual(census["firstIndex"], 0, "no throw-capable top-level statement found")
+        text = census["firstText"] or ""
+        self.assertIn(
+            "PLAYBACK_ATTR3_CLIPPATH_REFUSED",
+            text,
+            "the first throw-capable top-level statement is not the owner/fixture flag-refusal "
+            "block -- something else can throw before it",
+        )
+        self.assertIn(
+            "PLAYBACK_ATTR3_AGENTROOT_INVALID",
+            text,
+            "the AgentRoot shape check must be nested inside the same flag-refusal if/else, not "
+            "a standalone statement ahead of it",
+        )
+
+
+class ParamBlockBindingTimeAstTests(unittest.TestCase):
+    """ATTR3-FOOTAGE-BIND-1 PR-B round 4 (BINDING-TIME ORDERING). An AST census over the
+    generator's own $ast.ParamBlock: no parameter DEFAULT expression may invoke
+    Resolve-Path/Test-Path/Get-Item/Get-ChildItem/git/Join-Path (a default runs at BIND TIME,
+    before this script's first statement -- see -RepoRoot's own round-4 comment), and no
+    path-shaped parameter (-ClipPath/-RepoRoot/-AgentRoot/-OutFile) may carry a ValidatePattern or
+    ValidateScript attribute (PowerShell's own binding-failure message echoes a rejected value
+    verbatim, disclosing a path-shaped string before this file's own path-free refusal ever runs).
+    Hash/filename-shaped parameters (-SourceCommit, -BuildManifestSha256, the .zip/.exe/.json
+    name parameters) are exempt: a commit hash or a plain filename cannot itself carry a path.
+    """
+
+    def _param_census(self) -> dict:
+        import json
+        import tempfile
+
+        if PWSH is None:
+            self.skipTest("pwsh is not on PATH")
+        script = (
+            "$ErrorActionPreference = 'Stop'\n"
+            f"$text = [IO.File]::ReadAllText('{ATTRIBUTION_JOB}')\n"
+            "$tokens = $null; $errors = $null\n"
+            "$ast = [System.Management.Automation.Language.Parser]::ParseInput($text, [ref]$tokens, [ref]$errors)\n"
+            "if ($errors.Count -gt 0) { throw ('PARSE_ERROR: ' + ($errors -join '; ')) }\n"
+            "$pathParams = @('ClipPath', 'RepoRoot', 'AgentRoot', 'OutFile')\n"
+            "$forbiddenDefaultNames = @('Resolve-Path', 'Test-Path', 'Get-Item', 'Get-ChildItem', 'git', 'Join-Path')\n"
+            "$violations = [System.Collections.Generic.List[string]]::new()\n"
+            "foreach ($p in $ast.ParamBlock.Parameters) {\n"
+            "    $name = $p.Name.VariablePath.UserPath\n"
+            "    if ($null -ne $p.DefaultValue) {\n"
+            "        $commands = $p.DefaultValue.FindAll({ param($n) $n -is [System.Management.Automation.Language.CommandAst] }, $true)\n"
+            "        foreach ($c in $commands) {\n"
+            "            $cn = $c.GetCommandName()\n"
+            "            if ($null -ne $cn -and ($forbiddenDefaultNames -icontains $cn)) { [void]$violations.Add(\"DEFAULT_IO:${name}:${cn}\") }\n"
+            "        }\n"
+            "    }\n"
+            "    foreach ($attr in $p.Attributes) {\n"
+            "        if ($attr -isnot [System.Management.Automation.Language.AttributeAst]) { continue }\n"
+            "        $attrName = $attr.TypeName.Name\n"
+            "        if ((@('ValidatePattern', 'ValidateScript') -icontains $attrName) -and ($pathParams -icontains $name)) {\n"
+            "            [void]$violations.Add(\"VALIDATOR:${name}:${attrName}\")\n"
+            "        }\n"
+            "    }\n"
+            "}\n"
+            "$violations | ConvertTo-Json -Compress\n"
+        )
+        with tempfile.TemporaryDirectory(prefix="attr3-param-ast-") as tmp:
+            script_path = Path(tmp) / "param_census.ps1"
+            script_path.write_text(script, encoding="utf-8")
+            proc = subprocess.run(
+                [PWSH, "-NoLogo", "-NoProfile", "-NonInteractive", "-File", str(script_path)],
+                capture_output=True, text=True,
+            )
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        raw = proc.stdout.strip()
+        if not raw:
+            return []
+        parsed = json.loads(raw)
+        return parsed if isinstance(parsed, list) else [parsed]
+
+    def test_no_param_default_does_io_and_no_path_param_carries_a_validator(self) -> None:
+        violations = self._param_census()
+        self.assertEqual(violations, [], f"param block violations: {violations}")
 
 
 class RetiredCompileJobTests(unittest.TestCase):
@@ -547,7 +1093,7 @@ class RunbookTests(unittest.TestCase):
             self.text.index("playback-attr-3-cuda-dll-job.ps1"),
             self.text.index("playback-attr-3-cuda-assemble.ps1"),
             self.text.index("playback-attr-3-cuda-stage-job.ps1"),
-            self.text.index("Attribution job (inside the owner-granted lane)"),
+            self.text.index("Attribution job (owner clip, id-only)"),
         ]
         self.assertEqual(positions, sorted(positions))
 
@@ -600,7 +1146,9 @@ class RunbookTests(unittest.TestCase):
 class NoFootageTokensTests(unittest.TestCase):
     """None of the new scripts may name, glob or resolve footage, or sweep the agent cache.
 
-    NA-4 admits a real clip only as the one owner-typed path the attribution job is handed. The
+    NA-4's id-addressed-consumer route admits a real clip only by RESOLVING an owner-clip id
+    through tools/gates/resolve_consented_clip.py against the frozen consent table
+    (ATTR3-FOOTAGE-BIND-1); the attribution job never takes a caller-typed path for one. The
     build-route scripts have no business knowing footage exists, and a cache sweep is how an
     id-to-file resolver gets reintroduced by accident.
     """
@@ -682,7 +1230,13 @@ class FixtureRehearsalVisibilityTests(unittest.TestCase):
         # the success path writes summary.json too, not only the failure paths
         tail = self.template[self.template.index("$resultVerb ="):] if "$resultVerb =" in self.template else ""
         self.assertTrue(tail, "no success result verb found")
-        self.assertIn("summary.json", self.template[self.template.index("artifact-index.v1") - 2500:])
+        # CUDA-PLAYBACK-CONTACT-SHEET-1 r1b widened this window (2500 -> 6000), r1c widened it
+        # again (6000 -> 7000), r1d widened it again (7000 -> 10000): the contact-sheet compose
+        # step (probe Python/Pillow/numpy via a small probe script file rather than an inline
+        # -c program, run the composer with its host/GPU/scale identity and quoted arguments,
+        # publish or record a typed unavailable marker plus any timed-out-child warning) now
+        # sits between the two, and is legitimately that long.
+        self.assertIn("summary.json", self.template[self.template.index("artifact-index.v1") - 10000:])
 
 
 if __name__ == "__main__":
