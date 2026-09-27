@@ -3072,6 +3072,24 @@ function Invoke-AttrCudaBoundedProbe {
         $probeIss.Commands.Add(
             [System.Management.Automation.Runspaces.SessionStateFunctionEntry]::new(
                 $FunctionName, $probeCommand.Definition))
+        # CUDA-PERF-DISPLAY-WAKE-4 round 1d (sol PRE-REVIEW #2 BLOCKER): every probe this function is
+        # actually called with (Get-AttrCudaScreensaverRunning/-Secure) calls
+        # Register-AttrCudaDisplayWakeNativeMethods internally. This nested Runspace starts from
+        # CreateDefault() and, unlike the outer keep-alive Runspace's own InitialSessionState above,
+        # inherits none of the caller's functions -- so that call used to fail with
+        # CommandNotFoundException and this probe always returned $null. Added the same late-binding-
+        # by-name way as the outer Runspace does, resolved fresh in the caller's own scope so a test
+        # override is honored here too; skipped when $FunctionName already IS this dependency (so
+        # Commands.Add is never asked to add the same key twice), and left unresolved dependencies to
+        # fall through to the catch below -- the same fail-closed $null every other failure here
+        # already returns, never a thrown error out of this function.
+        foreach ($probeDependencyName in @('Register-AttrCudaDisplayWakeNativeMethods')) {
+            if ($probeDependencyName -eq $FunctionName) { continue }
+            $probeDependencyCommand = Get-Command -Name $probeDependencyName -CommandType Function -ErrorAction Stop
+            $probeIss.Commands.Add(
+                [System.Management.Automation.Runspaces.SessionStateFunctionEntry]::new(
+                    $probeDependencyName, $probeDependencyCommand.Definition))
+        }
         $probeRunspace = [System.Management.Automation.Runspaces.RunspaceFactory]::CreateRunspace($probeIss)
         $probeRunspace.Open()
         $probeShell = [System.Management.Automation.PowerShell]::Create()

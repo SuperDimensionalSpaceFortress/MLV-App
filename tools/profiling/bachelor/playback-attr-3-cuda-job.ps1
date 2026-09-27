@@ -523,7 +523,13 @@ $embeddedFunctions = Get-AttrCudaEmbeddedFunctionSource -Name @(
     # before the smoke launch and again at the start of the measured interval (see the template
     # body below).
     'Get-AttrCudaDisplayWakeKeepAliveHealth',
-    'Stop-AttrCudaDisplayWakeKeepAlive'
+    'Stop-AttrCudaDisplayWakeKeepAlive',
+    # CUDA-PERF-DISPLAY-WAKE-4 round 1d (sol PRE-REVIEW #2 BLOCKER): Start-AttrCudaDisplayWakeKeepAlive's
+    # own loop calls this by name (Get-Command, resolved from whatever is defined in this flat
+    # script's own scope) every tick -- omitted here, Get-Command could not find it on a host with no
+    # checkout/Import-Module, so keep-alive setup recorded a setupError and the health gate failed
+    # every leg.
+    'Invoke-AttrCudaBoundedProbe'
 )
 # ATTR3-FOOTAGE-BIND-1 PR-B round 4b: the private verified-part directory (one hard link per
 # verified part, under a neutral name derived from its index, so nothing downstream -- the smoke

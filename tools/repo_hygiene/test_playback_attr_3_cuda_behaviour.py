@@ -4428,6 +4428,7 @@ class EmbeddedFunctionContractTests(_PwshCase):
             "Start-AttrCudaDisplayWakeKeepAlive",
             "Get-AttrCudaDisplayWakeKeepAliveHealth",
             "Stop-AttrCudaDisplayWakeKeepAlive",
+            "Invoke-AttrCudaBoundedProbe",
         ),
     }
 
@@ -6312,6 +6313,60 @@ class InvokeAttrCudaBoundedProbeTests(_PwshCase):
         self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
         result = json.loads((self.tmp / "r.json").read_text(encoding="utf-8"))
         self.assertIsNone(result["r"])
+
+    def test_the_real_production_probe_resolves_its_own_native_dependency(self) -> None:
+        # CUDA-PERF-DISPLAY-WAKE-4 round 1d (sol PRE-REVIEW #2 BLOCKER): the fake probes above never
+        # exercised Get-AttrCudaScreensaverRunning/-Secure themselves, so they never caught that the
+        # nested Runspace above lacks Register-AttrCudaDisplayWakeNativeMethods, which both call
+        # internally. Called here as the FIRST screen-saver-related call in this fresh process --
+        # nothing has registered [MLVAppAttrCudaDisplayWake.NativeMethods] into this AppDomain yet --
+        # the exact ordering sol's repro hit: a direct call elsewhere in the process happening to run
+        # first was masking this, since Add-Type is AppDomain-wide and a later bounded-probe call
+        # would then find the type already there regardless of its own missing dependency.
+        proc = self.run_with_module(
+            "$r = Invoke-AttrCudaBoundedProbe -FunctionName 'Get-AttrCudaScreensaverRunning' -TimeoutMilliseconds 3000\n"
+            "$direct = Get-AttrCudaScreensaverRunning\n"
+            f"[IO.File]::WriteAllText('{(self.tmp / 'r.json')}', (@{{ r = $r; direct = $direct }} | ConvertTo-Json))\n"
+        )
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        result = json.loads((self.tmp / "r.json").read_text(encoding="utf-8"))
+        # A real host always resolves this to a real True/False; only a broken dependency chain
+        # produces $null here (the same "could not determine" value a genuine native-load failure
+        # returns, so a regression would fail closed rather than throw -- but must not happen on a
+        # real host with the dependency actually wired through).
+        self.assertIn(result["r"], (True, False))
+        self.assertEqual(result["r"], result["direct"])
+
+    def test_the_emitted_jobs_bounded_probe_resolves_its_dependency_too(self) -> None:
+        # Same proof as above, but through the SAME embedding mechanism the deployed job actually
+        # uses (Get-AttrCudaEmbeddedFunctionSource splicing verbatim function text into one flat
+        # script, never Import-Module) -- sol's own repro used exactly this shape. The bounded probe
+        # call is still the first screen-saver-related call in this fresh process.
+        extract_script = self.tmp / "extract.ps1"
+        extract_script.write_text(
+            "$ErrorActionPreference = 'Stop'\n"
+            "Import-Module '" + str(MODULE) + "' -Force\n"
+            "$src = Get-AttrCudaEmbeddedFunctionSource -Name @("
+            "'Register-AttrCudaDisplayWakeNativeMethods','Get-AttrCudaScreensaverRunning',"
+            "'Invoke-AttrCudaBoundedProbe')\n"
+            f"Set-Content -LiteralPath '{(self.tmp / 'extracted.ps1')}' -Value $src -Encoding utf8\n",
+            encoding="utf-8",
+        )
+        extract_proc = _run_pwsh_file(extract_script)
+        self.assertEqual(extract_proc.returncode, 0, extract_proc.stdout + extract_proc.stderr)
+
+        probe_script = self.tmp / "extracted.ps1"
+        with probe_script.open("a", encoding="utf-8") as f:
+            f.write(
+                "\n$r = Invoke-AttrCudaBoundedProbe -FunctionName 'Get-AttrCudaScreensaverRunning' -TimeoutMilliseconds 3000\n"
+                "$direct = Get-AttrCudaScreensaverRunning\n"
+                f"[IO.File]::WriteAllText('{(self.tmp / 'r.json')}', (@{{ r = $r; direct = $direct }} | ConvertTo-Json))\n"
+            )
+        proc = _run_pwsh_file(probe_script)
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        result = json.loads((self.tmp / "r.json").read_text(encoding="utf-8"))
+        self.assertIn(result["r"], (True, False))
+        self.assertEqual(result["r"], result["direct"])
 
 
 class DisplayWakeKeepAlivePerTickProbeBoundTests(unittest.TestCase):
