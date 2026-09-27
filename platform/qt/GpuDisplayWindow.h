@@ -32,7 +32,9 @@
 #include <QOpenGLWindow>
 #include "GpuDisplayViewport.h"
 #include "GpuPreviewProcessing.h"
+#include "GpuWindowSwapTelemetry.h"
 #include "../../src/mlv/llrawproc/llrawproc.h"
+#include <array>
 #include <cstddef>
 #include <cstdint>
 
@@ -45,6 +47,13 @@ public:
     static const char *environmentVariableName(void);
     static bool isRequestedByEnvironment(void);
     static bool isActive(void);
+    /* The active window's own QWindow, or nullptr when none is active. Used by
+     * --gui-smoke-playback's foreground-forcing (CUDA-PERF-PLAYBACK-FOREGROUND-1) to
+     * activate the GPU display window alongside the main window -- it is embedded via
+     * createWindowContainer, so it has no OS-level foreground state of its own (that
+     * belongs to the top-level MainWindow), but still needs QWindow::requestActivate()
+     * so Qt does not consider it backgrounded. */
+    static QWindow *activeWindow(void);
 
     /* Replace the QGraphicsView with a QOpenGLWindow container in the same layout
      * slot and register it as the active preview window. Returns true on success. */
@@ -109,6 +118,31 @@ public:
      * surface, not the hidden QGraphicsView. GUI-thread only. */
     static QSize displaySize(void);
 
+    /* Opt-in (MLVAPP_PLAYBACK_SMOKE_TELEMETRY, the same env var that gates MainWindow's
+     * playback smoke frame telemetry) swap-cadence telemetry: records every REAL buffer
+     * swap this window performs -- Qt's own automatic swap after paintGL() and the
+     * explicit swapBuffers() in grabPresentedFramebufferIfActive -- so displayed cadence
+     * can be joined against PresentMon and against frames_presented (which counts
+     * submissions, not swaps). Call resetSwapTelemetry() at playback-smoke-session start
+     * and swapTelemetrySnapshot() at session end; the latter also CLOSES the session (see
+     * below), so it must be called exactly once per session, at the end. GUI-thread only,
+     * like the swaps themselves.
+     *
+     * Zero cost and zero output when the env var is unset: the constructor never connects
+     * frameSwapped() to the recorder in that case (the env var is cached and cannot change
+     * mid-run, so this is decided once, not re-checked per swap), and swapTelemetrySnapshot()
+     * never emits a summary.
+     *
+     * The session id and its active/closed state live at file scope in GpuDisplayWindow.cpp,
+     * not on this instance: they must survive the window being inactive when a session
+     * begins, or being destroyed and recreated mid-session, so the summary swapTelemetrySnapshot()
+     * returns never reports a different session than the playback_smoke.gate line it is
+     * paired with. Once a session is closed, noteRealSwap() is a no-op for any further swap
+     * (queued or screenshot-capture swaps included) until the next resetSwapTelemetry() --
+     * so the summary and every already-emitted per-swap gpu_window.swap line always agree. */
+    static void resetSwapTelemetry(quint64 sessionId);
+    static GpuWindowSwapTelemetrySnapshot swapTelemetrySnapshot(void);
+
     explicit GpuDisplayWindow(QWindow *parent = nullptr);
     ~GpuDisplayWindow() override;
 
@@ -144,6 +178,25 @@ protected:
 
 private:
     friend class GuiSmokeTest; // Exercise real context-loss teardown/rebuild without requiring the OS to recreate the platform window.
+
+    /* One recorded real swap: monotonic swap serial (1-based, distinct from the
+     * presentationSerial identifying WHICH submitted frame it displayed), the QPC-ms
+     * timestamp of the swap (the UTC-ISO timestamp is formatted only for the per-swap log
+     * line, not retained here), and that frame's presentationSerial when known. */
+    struct SwapTelemetryRecord
+    {
+        quint64 swapSerial = 0;
+        double qpcMs = 0.0;
+        quint64 presentedSerial = 0;
+        bool presentedSerialValid = false;
+    };
+    // Bounded, preallocated once at construction -- never grows, never reallocates, so a
+    // long playback session costs no more memory than a short one. Oldest entries are
+    // overwritten (ring index = swapSerial % capacity); the running aggregates below (not
+    // a ring scan) answer the session-summary questions (count/fps/max gap).
+    static const int kSwapTelemetryRingCapacity = 2048;
+    void noteRealSwap(void);
+
     void ensureProgram(void);
     void ensurePreviewProcessingProgram(void);
     void updateTextureIfNeeded(void);
@@ -199,6 +252,12 @@ private:
     bool m_loggedSetImage;
     bool m_loggedSetGpuTexture;
     QString m_rendererDescription;
+
+    // Swap telemetry (see resetSwapTelemetry()/swapTelemetrySnapshot()/noteRealSwap()).
+    // The session id/active-state live at file scope in the .cpp, not here -- see the
+    // resetSwapTelemetry() doc comment above.
+    std::array<SwapTelemetryRecord, kSwapTelemetryRingCapacity> m_swapTelemetryRing;
+    GpuWindowSwapTelemetryCounters m_swapTelemetryCounters;
 };
 
 #endif // GPUDISPLAYWINDOW_H

@@ -21,6 +21,7 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import re
 import shutil
 import subprocess
 import tempfile
@@ -1135,6 +1136,184 @@ class EndToEndTransferIdempotenceTests(unittest.TestCase):
 
 
 @unittest.skipIf(PWSH is None, "pwsh is not on PATH")
+class QueueWaitBoundTests(unittest.TestCase):
+    """ATTR3-FOOTAGE-STAGE-SUBMIT-RETRY-1 round 4 (fable major): neither um-run.ps1 call site used
+    to bound the QUEUED phase, so a dead/wedged agent left a job unclaimed for up to um-run's own
+    86400s -MaxQueueWaitSec default -- round 2's own 300s preflight execution cap notwithstanding.
+    Both call sites now pass a -MaxQueueWaitSec derived from THIS run's own -TimeoutSec."""
+
+    def test_both_um_run_call_sites_pass_a_caller_derived_max_queue_wait_sec(self) -> None:
+        text = GENERATOR.read_text(encoding="utf-8")
+        self.assertIn(
+            "-MaxQueueWaitSec $presenceTimeoutSecValue", text,
+            "the presence preflight must bound its own queue wait to its own capped budget, "
+            "never um-run.ps1's 86400s default",
+        )
+        self.assertIn(
+            "-MaxQueueWaitSec $timeoutSecValue", text,
+            "the placement submission must bound its queue wait to the caller's own -TimeoutSec, "
+            "never um-run.ps1's 86400s default",
+        )
+
+    def test_both_um_run_call_sites_pass_a_caller_derived_max_claimed_wait_sec(self) -> None:
+        # ATTR3-FOOTAGE-STAGE-SUBMIT-RETRY-1 round 11 (fable minor, item 3): an idle agent's
+        # untagged between-jobs heartbeat is not proof of work on OUR job -- a lost-receipt failure
+        # mode could otherwise hold either call for the full -MaxClaimedWaitSec default (86400s, a
+        # day) instead of a bounded multiple of what the caller actually asked for.
+        text = GENERATOR.read_text(encoding="utf-8")
+        self.assertIn(
+            "-MaxClaimedWaitSec $presenceTimeoutSecValue", text,
+            "the presence preflight must bound its own claimed-phase wait to its own capped "
+            "budget, never um-run.ps1's 86400s default",
+        )
+        self.assertIn(
+            "-MaxClaimedWaitSec $timeoutSecValue", text,
+            "the placement submission must bound its claimed-phase wait to the caller's own "
+            "-TimeoutSec, never um-run.ps1's 86400s default",
+        )
+
+
+# PowerShell block-comment stripper for _production_um_run_references below: a `<# ... #>`
+# doc-comment (e.g. a function's .SYNOPSIS/.DESCRIPTION) can mention "um-run.ps1" in prose on a
+# line that carries no leading '#' of its own -- a plain per-line '#'-prefix filter misreads that
+# as code. Replacing each block with the same number of blank lines keeps line numbers aligned
+# (not load-bearing here, but cheap) while removing its text from the scan.
+_PS_BLOCK_COMMENT_RX = re.compile(r"<#.*?#>", re.S)
+
+
+@unittest.skipIf(PWSH is None, "pwsh is not on PATH")
+@unittest.skipUnless(os.name == "nt", "the emitted job targets a Windows measurement host")
+class SameJobIdRulingPremiseTests(unittest.TestCase):
+    """ATTR3-FOOTAGE-STAGE-SUBMIT-RETRY-1 round 9 (hub scope ruling) -- SUPERSEDED at round 10.
+    The round-9 ruling read below is WRONG and no longer the reason the same-JobId race is closed:
+    sol proved both of its premises false (docs/playback-attr-3-cuda.md documents manual
+    submissions with OPERATOR-CHOSEN, non-random JobIds -- see the fixture-rehearsal workflow's own
+    -JobId <stageJobId> -- and attr3-footage-stage.ps1's own presence-preflight budget already
+    lands in the range round-9 called "residual only at probe budgets"). Round 10 closes the race
+    BY CONSTRUCTION instead (UmRunDrop.psm1's claim-first ownership: every submission claims
+    inbox\\<id>.meta.json via an atomic no-overwrite rename before touching a side-file or the job,
+    so of two racing submitters for the same JobId exactly one can ever proceed, regardless of
+    whether the JobId happens to collide) -- see that module's own header and
+    test_two_racing_claims_for_the_same_jobid_exactly_one_proceeds_metadata_belongs_to_the_winner
+    in test_um_run_sidefiles.py for the real mechanism and its own test.
+
+    This class's own checks -- the generator is the only tracked automated caller, and it mints a
+    fresh random jobId on every call -- remain TRUE and cheap to keep proving, so they stay as a
+    secondary guard (defense in depth: even if claim-first were ever weakened, this generator's own
+    jobId freshness still holds), not because either one is load-bearing for correctness any more.
+    Kept below verbatim for the historical record of what the (now-superseded) round-9 ruling
+    argued, pinned two ways, neither by regex over prose:
+      1. enumerates every tracked, non-test, non-comment line under tools/ that names
+         um-run.ps1 and asserts the generator is the only one that actually builds a path to it --
+         so a new caller is caught here before anyone trusts the stale ruling for it;
+      2. calls the SAME jobId-constructing code the generator's real submissions run
+         (New-Attr3FootageStageJob / New-Attr3FootagePresenceJob) twice with byte-identical inputs
+         and proves the two emitted jobIds differ and each carries a GUID-shaped attempt nonce --
+         exercising the code, never asserting on its source text.
+
+    Two OTHER generators legitimately construct a fixed (non-random) jobId --
+    attr3-stage-fixture-job.ps1 (`"attr3-stage-fixture-$ClipStem-$($fixtureSha.Substring(0, 12))"`)
+    and playback-attr-3-cuda-stage-job.ps1 (`"playback-attr-3-cuda-stage-$($names.shortSha)"`) --
+    but neither is a tracked CALLER of um-run.ps1: both only write a <jobId>.job.ps1 file and print
+    it; submission is a documented manual, one-shot CLI step a human operator runs next (see each
+    script's own header/usage comment: "then submit with tools\\profiling\\um-run.ps1 ..."), never
+    an automated or concurrent invocation, so a fixed id there cannot collide with itself.
+    """
+
+    KNOWN_PRODUCTION_CALLERS = {GENERATOR}
+
+    def _production_um_run_references(self) -> set[Path]:
+        proc = subprocess.run(
+            ["git", "grep", "-l", "um-run.ps1", "--", "tools/"],
+            cwd=ROOT, capture_output=True, text=True,
+        )
+        self.assertIn(proc.returncode, (0, 1), proc.stdout + proc.stderr)
+        referencing: set[Path] = set()
+        for rel in proc.stdout.splitlines():
+            rel = rel.strip()
+            if not rel:
+                continue
+            if rel.startswith("tools/repo_hygiene/") or rel.startswith("tools/testing/"):
+                continue
+            path = ROOT / rel
+            if path == UM_RUN:
+                continue
+            text = path.read_text(encoding="utf-8")
+            stripped = _PS_BLOCK_COMMENT_RX.sub(lambda m: "\n" * m.group(0).count("\n"), text)
+            for line in stripped.splitlines():
+                if line.strip().startswith("#"):
+                    continue
+                if "um-run.ps1" in line:
+                    referencing.add(path)
+                    break
+        return referencing
+
+    def test_the_generator_is_the_only_tracked_non_test_caller_that_builds_a_path_to_um_run(self) -> None:
+        callers = self._production_um_run_references()
+        self.assertEqual(
+            callers, self.KNOWN_PRODUCTION_CALLERS,
+            "a new non-test, non-comment reference to um-run.ps1 appeared under tools/ outside "
+            "the ruled-on caller -- the round-9 same-JobId scope ruling does not cover it and "
+            "must be re-examined before it is trusted for this file: " + repr(sorted(callers)),
+        )
+
+    def _assert_two_calls_mint_distinct_fresh_jobids(
+        self, module: Path, function: str, clip_id: str, id_prefix: str, *, pass_agent_root: bool,
+    ) -> None:
+        tmp_dir = tempfile.TemporaryDirectory(prefix="umrunjobidfresh-")
+        self.addCleanup(tmp_dir.cleanup)
+        tmp = Path(tmp_dir.name)
+        agent_root = tmp / "agent"
+        agent_root.mkdir()
+        out_dir = tmp / "out"
+        out_dir.mkdir()
+        content = b"synthetic fresh-jobid invariant part " * 11
+        target = agent_root / "spec" / clip_id / "part0.raw"
+        parts_payload = [
+            {"index": 0, "path": str(target), "length": len(content), "sha256": _sha256(content)}
+        ]
+        parts_json_path = tmp / "parts.json"
+        parts_json_path.write_text(json.dumps(parts_payload), encoding="utf-8")
+        agent_root_arg = f" -AgentRoot '{agent_root}'" if pass_agent_root else ""
+        script = (
+            f"Import-Module '{module}' -Force; "
+            f"$parts = @(Get-Content -LiteralPath '{parts_json_path}' -Raw | ConvertFrom-Json); "
+            f"{function} -ClipId '{clip_id}' -Parts $parts -OutDir '{out_dir}'{agent_root_arg} | Out-Null"
+        )
+        for _ in range(2):
+            proc = _run(["-Command", script])
+            self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        jobs = sorted(out_dir.glob("*.job.ps1"))
+        self.assertEqual(
+            len(jobs), 2,
+            f"two identical-input calls to {function} must emit two distinct job files: {jobs!r}",
+        )
+        job_ids = [p.name[: -len(".job.ps1")] for p in jobs]
+        self.assertNotEqual(
+            job_ids[0], job_ids[1],
+            f"same ClipId+Parts must still mint distinct jobIds from {function}",
+        )
+        nonce_rx = re.compile(r"^" + re.escape(id_prefix) + r"-.+-[0-9a-f]{10}$")
+        for job_id in job_ids:
+            self.assertRegex(
+                job_id, nonce_rx,
+                f"jobId {job_id!r} from {function} must carry a GUID-shaped attempt nonce",
+            )
+
+    def test_new_attr3_footage_stage_job_mints_a_fresh_random_jobid_every_call(self) -> None:
+        self._assert_two_calls_mint_distinct_fresh_jobids(
+            STAGE_MODULE, "New-Attr3FootageStageJob", "FRESH-0001", "attr3-footage-stage",
+            pass_agent_root=True,
+        )
+
+    def test_new_attr3_footage_presence_job_mints_a_fresh_random_jobid_every_call(self) -> None:
+        self._assert_two_calls_mint_distinct_fresh_jobids(
+            PRESENCE_MODULE, "New-Attr3FootagePresenceJob", "FRESH-0002", "attr3-footage-presence",
+            pass_agent_root=False,
+        )
+
+
+@unittest.skipIf(PWSH is None, "pwsh is not on PATH")
 @unittest.skipUnless(os.name == "nt", "the emitted job targets a Windows measurement host")
 class NoPathInAnyBranchTests(unittest.TestCase):
     """ATTR3-FOOTAGE-STAGE-1 round 3 (sol/astra PR #148 MAJOR): the specific branches the
@@ -1204,6 +1383,127 @@ class NoPathInAnyBranchTests(unittest.TestCase):
         combined = wrapped.stdout + wrapped.stderr
         self.assertIn("ATTR3_FOOTAGE_STAGE_SUBMIT_FAILED", combined)
         self.assertNotIn(str(dead_share), combined)
+
+    # ---- round 12 (fable MAJOR, item 4): the wrapper's own UNRESOLVED outcome is untested; -------
+    # ---- round 12 (sol BLOCKER, item 2): UNRESOLVED must never delete staged residue --------------
+
+    def test_get_attr3_footage_umrun_failure_class_classifies_known_prefixes_and_unknown(self) -> None:
+        # Get-Attr3FootageUmRunFailureClass, extracted via AST from the tracked generator -- never
+        # a hand-copied duplicate -- exactly like ConvertTo-Attr3FootageStageSafeOutput's own test
+        # above. Before round 12 this classifier had no test at all: reverting its RETRACTED or
+        # UNRESOLVED branch, or the whole function, failed no test in either suite.
+        script = (
+            f"$genText = [IO.File]::ReadAllText('{GENERATOR}'); "
+            "$t=$null; $e=$null; "
+            "$ast = [System.Management.Automation.Language.Parser]::ParseInput($genText, [ref]$t, [ref]$e); "
+            "$fn = $ast.FindAll({ param($n) $n -is [System.Management.Automation.Language.FunctionDefinitionAst] -and "
+            "$n.Name -eq 'Get-Attr3FootageUmRunFailureClass' }, $true) | Select-Object -First 1; "
+            "if (-not $fn) { throw 'FUNCTION_NOT_FOUND' }; "
+            "Invoke-Expression $fn.Extent.Text; "
+            "Get-Attr3FootageUmRunFailureClass -Message 'RETRACTED: demo reached its queue ceiling'; "
+            "Get-Attr3FootageUmRunFailureClass -Message 'UNRESOLVED: demo was claimed by the agent'; "
+            "Get-Attr3FootageUmRunFailureClass -Message 'some unrelated .NET exception text'"
+        )
+        proc = subprocess.run([PWSH, "-NoLogo", "-NoProfile", "-NonInteractive", "-Command", script],
+                              capture_output=True, text=True)
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        lines = [line for line in proc.stdout.splitlines() if line.strip()]
+        self.assertEqual(lines, ["RETRACTED", "UNRESOLVED", "UNKNOWN"], proc.stdout + proc.stderr)
+
+    def _run_submit_catch_harness(self, throw_statement: str, *, clip_id: str = "FIX-UNRESOLVED-0001",
+                                   parts_count: int = 2, job_id: str = "job-abc",
+                                   extra_setup: str = "") -> subprocess.CompletedProcess:
+        # Drives the REAL submit try/catch (attr3-footage-stage.ps1's own step 6, around um-run.ps1
+        # -- the one that classifies um-run's failure and decides RESULT=FOOTAGE_STAGE_UNRESOLVED /
+        # exit 2 versus an ordinary ATTR3_FOOTAGE_STAGE_SUBMIT_FAILED), extracted via AST -- never a
+        # hand-copied duplicate -- the same technique this file already uses for the outer catch
+        # (_run_generator_outer_catch) and for ConvertTo-Attr3FootageStageSafeOutput. There are
+        # THREE try statements in the real script (the whole-body outer one, the transfer+submit
+        # block, and this one); selected by the ONLY one whose own text mentions $submitFailClass.
+        harness = self.tmp / f"submit-catch-harness-{id(throw_statement)}-{id(extra_setup)}.ps1"
+        harness.write_text(
+            "$ErrorActionPreference = 'Stop'\n"
+            f"$genText = [IO.File]::ReadAllText('{GENERATOR}')\n"
+            "$t=$null; $e=$null\n"
+            "$ast = [System.Management.Automation.Language.Parser]::ParseInput($genText, [ref]$t, [ref]$e)\n"
+            "$classifyFn = $ast.FindAll({ param($n) $n -is [System.Management.Automation.Language.FunctionDefinitionAst] -and "
+            "$n.Name -eq 'Get-Attr3FootageUmRunFailureClass' }, $true) | Select-Object -First 1\n"
+            "if (-not $classifyFn) { throw 'CLASSIFY_FN_NOT_FOUND' }\n"
+            "Invoke-Expression $classifyFn.Extent.Text\n"
+            "$tryStatements = @($ast.FindAll({ param($n) $n -is [System.Management.Automation.Language.TryStatementAst] }, $true))\n"
+            # Every TryStatementAst that CONTAINS the submit try (the whole-body outer one, and the
+            # transfer+submit block) also matches a plain substring search on its own Extent.Text,
+            # since it is a superset -- Select-Object -First 1 over THAT would pick the outermost,
+            # not the innermost. Matched on the CATCH CLAUSE's own text instead: only the submit
+            # try's own catch clause assigns $submitFailClass at all.
+            "$submitTry = $tryStatements | Where-Object { $_.CatchClauses[0].Body.Extent.Text -match 'submitFailClass = Get-Attr3FootageUmRunFailureClass' } | Select-Object -First 1\n"
+            "if (-not $submitTry) { throw 'SUBMIT_TRY_NOT_FOUND' }\n"
+            "$catchBodyText = $submitTry.CatchClauses[0].Body.Extent.Text\n"
+            "$catchBody = $catchBodyText.Substring(1, $catchBodyText.Length - 2)\n"
+            f"$ClipId = '{clip_id}'\n"
+            f"$parts = New-Object 'object[]' {parts_count}\n"
+            f"$job = [pscustomobject]@{{ jobId = '{job_id}' }}\n"
+            + extra_setup +
+            "try {\n"
+            f"    {throw_statement}\n"
+            "} catch {\n"
+            "    . ([scriptblock]::Create($catchBody))\n"
+            "}\n",
+            encoding="utf-8",
+        )
+        return subprocess.run([PWSH, "-NoLogo", "-NoProfile", "-NonInteractive", "-File", str(harness)],
+                              capture_output=True, text=True)
+
+    def test_the_submit_catch_reports_unresolved_with_exit_2_and_never_deletes_staged_residue(self) -> None:
+        # fable MAJOR (item 4): before round 12 nothing in either suite drove the wrapper through
+        # RESULT=FOOTAGE_STAGE_UNRESOLVED at all -- deleting the classifier's UNRESOLVED branch, the
+        # whole exit-2 block, or flipping exit 2 to exit 1 all left every existing test green.
+        # sol BLOCKER (item 2): UNRESOLVED used to unconditionally call
+        # Remove-Attr3FootageStageAttemptResidue -- deleting this attempt's own already-staged
+        # share-side parts while the very message it emits says the agent may still be reading
+        # them. Remove-Attr3FootageStageAttemptResidue is extracted here too (real function, real
+        # $createdSharePaths naming a REAL staged file) so that if a future edit reintroduces that
+        # call on this branch, the staged file is actually deleted and this test actually fails --
+        # not merely a text assertion that the call is absent.
+        share_stage_root = self.tmp / "unresolved-share-stage-root"
+        share_stage_dir = share_stage_root / "job-abc"
+        share_stage_dir.mkdir(parents=True)
+        staged_part = share_stage_dir / "part-0"
+        staged_part.write_bytes(b"synthetic staged bytes that must survive UNRESOLVED")
+
+        extra_setup = (
+            f"Import-Module '{ARTIFACTS_MODULE}' -Force\n"
+            "$residueFnAst = $ast.FindAll({ param($n) $n -is [System.Management.Automation.Language.FunctionDefinitionAst] -and "
+            "$n.Name -eq 'Remove-Attr3FootageStageAttemptResidue' }, $true) | Select-Object -First 1\n"
+            "if (-not $residueFnAst) { throw 'RESIDUE_FN_NOT_FOUND' }\n"
+            "Invoke-Expression $residueFnAst.Extent.Text\n"
+            f"$shareStageRoot = '{share_stage_root}'\n"
+            f"$shareStageDir = '{share_stage_dir}'\n"
+            f"$createdSharePaths = @('{staged_part}')\n"
+        )
+        proc = self._run_submit_catch_harness(
+            "throw 'UNRESOLVED: demo was claimed by the agent and has kept proving liveness'",
+            extra_setup=extra_setup,
+        )
+        combined = proc.stdout + proc.stderr
+        self.assertEqual(proc.returncode, 2, combined)
+        self.assertIn(
+            "RESULT=FOOTAGE_STAGE_UNRESOLVED CLIP=FIX-UNRESOLVED-0001 PARTS=2 JOB=job-abc RESIDUE=RETAINED",
+            combined,
+        )
+        self.assertTrue(staged_part.exists(), "UNRESOLVED must never delete this attempt's staged inputs")
+
+    def test_the_submit_catch_reports_ordinary_submit_failed_with_class_unknown_for_an_unrecognized_message(self) -> None:
+        # The other branch of the same classifier call: a message that is neither RETRACTED: nor
+        # UNRESOLVED: must still be an ordinary, safely-retryable ATTR3_FOOTAGE_STAGE_SUBMIT_FAILED
+        # failure (CLASS=UNKNOWN), never exit 2, never RESULT=FOOTAGE_STAGE_UNRESOLVED.
+        proc = self._run_submit_catch_harness("throw 'some unrelated .NET exception naming a real path'")
+        combined = proc.stdout + proc.stderr
+        self.assertNotEqual(proc.returncode, 0, combined)
+        self.assertNotEqual(proc.returncode, 2, combined)
+        self.assertIn("ATTR3_FOOTAGE_STAGE_SUBMIT_FAILED", combined)
+        self.assertIn("CLASS=UNKNOWN", combined)
+        self.assertNotIn("RESULT=FOOTAGE_STAGE_UNRESOLVED", combined)
 
     def test_cleanup_warning_is_suppressed_and_never_reaches_output(self) -> None:
         # Remove-AttrCudaPartialFile (AttrCudaArtifacts.psm1) writes a path-bearing Write-Warning
@@ -1763,6 +2063,27 @@ class Attr3FootageStageCliEndToEndTests(unittest.TestCase):
             self.assertIn("ATTR3_FOOTAGE_STAGE_TIMEOUT_SEC_INVALID", combined)
             self.assertNotIn("RESULT=FOOTAGE_STAGED", combined)
 
+    def test_a_timeout_sec_above_the_agents_maximum_is_rejected_before_any_transfer(self) -> None:
+        # ATTR3-FOOTAGE-STAGE-SUBMIT-RETRY-1 round 6 (sol major 2): -TimeoutSec used to be
+        # range-checked only against a floor here, so a value above UmRunDrop.psm1's own accepted
+        # 1..86400 maximum was accepted, resolved, and fully transferred -- discovered invalid only
+        # once Invoke-UmRunDrop itself threw UMRUN_JOB_TIMEOUT_INVALID, after paying for the whole
+        # placement. A real clip id would be needed to prove a transfer WAS attempted; using an
+        # invalid one here proves the opposite -- that this rejection fires before even the
+        # resolver runs, so RESOLVED (which the resolver alone can emit) never appears either.
+        clip_id = "NOT-A-REAL-CLIP-ID-ATTR3-STAGE-TIMEOUT"
+        proc = subprocess.run(
+            [PWSH, "-NoLogo", "-NoProfile", "-NonInteractive", "-File", str(self.cli_path),
+             "-ClipId", clip_id, "-TimeoutSec", "86401"],
+            capture_output=True, text=True,
+        )
+        combined = proc.stdout + proc.stderr
+        self.assertNotEqual(proc.returncode, 0, combined)
+        self.assertIn("ATTR3_FOOTAGE_STAGE_TIMEOUT_SEC_INVALID", combined)
+        self.assertNotIn("RESOLVED", combined)
+        self.assertNotIn("TRANSFER PART", combined)
+        self.assertNotIn("RESULT=FOOTAGE_STAGED", combined)
+
     def test_a_path_shaped_timeout_sec_value_never_reaches_output(self) -> None:
         # ATTR3-FOOTAGE-STAGE-1 round 6 (sol major, astra major: binding-time output). -TimeoutSec
         # used to be [int]-typed, so PowerShell's OWN parameter binder attempted the conversion
@@ -1891,6 +2212,39 @@ class Attr3FootageStageCliEndToEndTests(unittest.TestCase):
         self.assertIn("SOURCE PART=0 STATUS=SOURCE_PATH_UNSAFE", combined)
         self.assertNotIn("TRANSFER PART", combined)
         self.assertEqual(real_file.read_bytes(), content)
+
+    # ---- round 4 (fable major): the queued phase is bounded, never a day-long hang --------------
+
+    def test_a_dead_agent_bounds_the_presence_preflights_queue_wait(self) -> None:
+        # ATTR3-FOOTAGE-STAGE-SUBMIT-RETRY-1 round 4 (fable major). Before this round, neither
+        # um-run.ps1 call site bounded the QUEUED phase, so a dead/wedged agent -- a stale
+        # heartbeat.txt, exactly this repro -- left the presence preflight (round 2 capped at 300s
+        # of its own EXECUTION precisely so a stuck preflight cannot delay fallback,
+        # attr3-footage-stage.ps1:144-145) unclaimed for up to um-run's own 86400s
+        # -MaxQueueWaitSec default. It is now bounded to this run's own -TimeoutSec (floored to
+        # 30s here), so the preflight must fail in well under a minute, never a day.
+        clip_id = "FIX-E2E-CLI-DEADAGENT-0001"
+        target_dir = self.tmp / "spec" / clip_id
+        content = (b"e2e cli dead agent part zero " * 53, b"e2e cli dead agent part one " * 5)
+        parts = [
+            {"index": i, "path": str(target_dir / f"part{i}.raw"), "length": len(c), "sha256": hashlib.sha256(c).hexdigest()}
+            for i, c in enumerate(content)
+        ]
+        self.set_fixture_parts(clip_id, parts)
+        self._stop_agent()   # heartbeat.txt remains on the share, stale -- exactly fable's own repro
+        started = time.monotonic()
+        proc = self.run_cli(clip_id, timeout_sec=30)   # the CLI's own -TimeoutSec floor
+        elapsed = time.monotonic() - started
+        combined = proc.stdout + proc.stderr
+        self.assertNotEqual(proc.returncode, 0)
+        self.assertLess(elapsed, 90, "a dead agent must fail in a bounded multiple of -TimeoutSec, not hang for a day")
+        # ATTR3-FOOTAGE-STAGE-SUBMIT-RETRY-1 round 11: um-run.ps1 no longer synthesizes a generic
+        # "QUEUED" timeout failure -- a dead agent that never claims the preflight is now
+        # RETRACTED (withdrawn from the inbox before it could ever be claimed), never a diagnosis
+        # about the agent's health.
+        self.assertIn("PRESENCE PREFLIGHT=INCONCLUSIVE CLASS=RETRACTED", combined, combined)
+        self.assertNotIn("RESULT=FOOTAGE_STAGED", combined)
+        self._no_console_leak(combined)
 
 
 if __name__ == "__main__":

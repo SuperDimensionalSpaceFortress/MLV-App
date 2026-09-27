@@ -7,6 +7,7 @@
 
 #include "GpuDisplayWindow.h"
 #include "GpuDebayer.h"
+#include "debug/StageTiming.h"
 
 #include <QGraphicsView>
 #include <QWidget>
@@ -14,6 +15,7 @@
 #include <QLayout>
 #include <QThread>
 #include <QByteArray>
+#include <QDateTime>
 #include <QSurfaceFormat>
 #include <QOpenGLContext>
 #include <QElapsedTimer>
@@ -34,11 +36,31 @@ namespace
 std::atomic<GpuDisplayWindow *> g_activeWindow{nullptr};
 QMutex g_activeMutex;
 
+// Swap-telemetry session identity: file scope, not a GpuDisplayWindow member, so it
+// survives the window being inactive when a session begins or being destroyed and
+// recreated mid-session -- resetSwapTelemetry()/swapTelemetrySnapshot() must agree with
+// MainWindow's playback_smoke.gate session id regardless of window lifetime. GUI-thread
+// only, like the swaps themselves, so no synchronization is needed.
+quint64 g_swapTelemetrySessionId = 0;
+bool g_swapTelemetrySessionActive = false;
+double g_swapTelemetrySessionBeginQpcMs = 0.0;
+
 bool windowEnvFlagEnabled(const QByteArray &value)
 {
     if ( value.isEmpty() ) return false;
     const QByteArray normalized = value.trimmed().toLower();
     return normalized == "1" || normalized == "true" || normalized == "yes" || normalized == "on";
+}
+
+// Same env var and the same "set and not literally 0" semantics as MainWindow's
+// playbackSmokeFrameTelemetryEnabled() -- deliberately reused rather than a new flag, so
+// one env var opts into both the frame-submission and the real-swap telemetry together.
+bool swapTelemetryEnabled()
+{
+    static const bool enabled =
+        qEnvironmentVariableIsSet( "MLVAPP_PLAYBACK_SMOKE_TELEMETRY" )
+        && qEnvironmentVariable( "MLVAPP_PLAYBACK_SMOKE_TELEMETRY" ) != QStringLiteral("0");
+    return enabled;
 }
 
 /* GLSL 1.20 passthrough -- works in the NVIDIA compatibility context a QOpenGLWindow
@@ -77,6 +99,11 @@ bool GpuDisplayWindow::isActive()
     return g_activeWindow.load(std::memory_order_acquire) != nullptr;
 }
 
+QWindow *GpuDisplayWindow::activeWindow()
+{
+    return g_activeWindow.load(std::memory_order_acquire);
+}
+
 QString GpuDisplayWindow::rendererDescription()
 {
     GpuDisplayWindow *win = g_activeWindow.load(std::memory_order_acquire);
@@ -97,6 +124,96 @@ QSize GpuDisplayWindow::displaySize()
 {
     GpuDisplayWindow *win = g_activeWindow.load(std::memory_order_acquire);
     return win ? win->size() : QSize();
+}
+
+void GpuDisplayWindow::resetSwapTelemetry(quint64 sessionId)
+{
+    // Telemetry off: no clock sample, no state change -- the instrument does no work at all
+    // (CUDA-PERF-DISPLAY-IDENTITY-3, sol on #161).
+    if ( !swapTelemetryEnabled() ) return;
+    // Session identity is set unconditionally, before any window lookup, so it is
+    // correct even when no window is active yet at session begin (hardening: the
+    // summary must never print a different session than playback_smoke.gate's).
+    g_swapTelemetrySessionId = sessionId;
+    g_swapTelemetrySessionActive = true;
+    g_swapTelemetrySessionBeginQpcMs = mlv_stage_timing_now() * 1000.0;
+
+    GpuDisplayWindow *win = g_activeWindow.load(std::memory_order_acquire);
+    if ( !win ) return;
+    win->m_swapTelemetryCounters = GpuWindowSwapTelemetryCounters();
+}
+
+GpuWindowSwapTelemetrySnapshot GpuDisplayWindow::swapTelemetrySnapshot()
+{
+    // Telemetry off: return the default (telemetryEnabled=false) snapshot before any clock sample
+    // or state change; no session was ever opened by resetSwapTelemetry either.
+    if ( !swapTelemetryEnabled() ) return GpuWindowSwapTelemetrySnapshot();
+    // Closes the session: called once, at playback-smoke session end. Deactivating
+    // before returning means any swap that happens later in this same synchronous
+    // call stack -- e.g. a queued or screenshot-capture swap after the gate -- is not
+    // recorded under this (now-finished) session, so this summary and every
+    // already-emitted per-swap gpu_window.swap line always agree.
+    const double gateQpcMs = mlv_stage_timing_now() * 1000.0;
+
+    GpuWindowSwapTelemetrySnapshot snapshot;
+    snapshot.telemetryEnabled = swapTelemetryEnabled();
+    snapshot.sessionId = g_swapTelemetrySessionId;
+    g_swapTelemetrySessionActive = false;
+
+    GpuDisplayWindow *win = g_activeWindow.load(std::memory_order_acquire);
+    if ( !win ) return snapshot;
+    snapshot.windowActive = true;
+    snapshot.summary = GpuWindowSwapTelemetryPolicy::summarize(
+        win->m_swapTelemetryCounters, g_swapTelemetrySessionBeginQpcMs, gateQpcMs );
+    return snapshot;
+}
+
+void GpuDisplayWindow::noteRealSwap()
+{
+    if ( !swapTelemetryEnabled() ) return;
+    // Closed session (past the gate, or no session begun yet): a queued or
+    // screenshot-capture swap must not be attributed to a finished session.
+    if ( !g_swapTelemetrySessionActive ) return;
+
+    const double qpcMs = mlv_stage_timing_now() * 1000.0;
+    const quint64 swapSerial = ++m_swapTelemetryCounters.swapCount;
+    const QString utc = QDateTime::currentDateTimeUtc().toString( Qt::ISODateWithMs );
+
+    SwapTelemetryRecord record;
+    record.swapSerial = swapSerial;
+    record.qpcMs = qpcMs;
+    record.presentedSerial = m_presentedSerial;
+    record.presentedSerialValid = m_presentedSerialValid;
+    m_swapTelemetryRing[ static_cast<std::size_t>( ( swapSerial - 1 ) % kSwapTelemetryRingCapacity ) ] = record;
+
+    if ( swapSerial == 1 )
+    {
+        m_swapTelemetryCounters.firstSwapQpcMs = qpcMs;
+        m_swapTelemetryCounters.firstSwapUtc = utc;
+    }
+    else
+    {
+        const double gapMs = qpcMs - m_swapTelemetryCounters.lastSwapQpcMs;
+        if ( gapMs > m_swapTelemetryCounters.maxGapMs )
+        {
+            m_swapTelemetryCounters.maxGapMs = gapMs;
+            m_swapTelemetryCounters.maxGapBeforeSerial = swapSerial - 1;
+            m_swapTelemetryCounters.maxGapAfterSerial = swapSerial;
+        }
+    }
+    m_swapTelemetryCounters.lastSwapQpcMs = qpcMs;
+    m_swapTelemetryCounters.lastSwapUtc = utc;
+
+    qInfo().noquote()
+        << QStringLiteral(
+               "gpu_window.swap session=%1 serial=%2 qpc_ms=%3 utc=%4 "
+               "presented_serial=%5 presented_serial_valid=%6" )
+               .arg( static_cast<qulonglong>( g_swapTelemetrySessionId ) )
+               .arg( static_cast<qulonglong>( record.swapSerial ) )
+               .arg( record.qpcMs, 0, 'f', 3 )
+               .arg( utc )
+               .arg( static_cast<qulonglong>( record.presentedSerial ) )
+               .arg( record.presentedSerialValid ? 1 : 0 );
 }
 
 bool GpuDisplayWindow::installInPreview(QGraphicsView *view)
@@ -292,6 +409,18 @@ GpuDisplayWindow::GpuDisplayWindow(QWindow *parent)
     QSurfaceFormat fmt = format();
     fmt.setSwapInterval(0);
     setFormat(fmt);
+
+    // Real swap path 1 of 2: Qt's own automatic swap after paintGL() returns, in its
+    // normal paint-event cycle (frameSwapped() fires only for THIS swap, not for the
+    // explicit manual one in grabPresentedFramebufferIfActive -- see path 2 there).
+    // Decided once, here, rather than re-checked per swap: the env var is cached (see
+    // swapTelemetryEnabled()) and cannot change mid-run, so when telemetry is off this
+    // window never even connects the signal -- zero cost, not just an early return in
+    // the slot.
+    if ( swapTelemetryEnabled() )
+    {
+        connect(this, &QOpenGLWindow::frameSwapped, this, &GpuDisplayWindow::noteRealSwap);
+    }
 }
 
 GpuDisplayWindow::~GpuDisplayWindow()
@@ -911,6 +1040,10 @@ bool GpuDisplayWindow::grabPresentedFramebufferIfActive(QImage *outImage,
     // swap now so the window's own swapchain reflects exactly what was just captured,
     // making this a real present rather than a side-channel readback.
     glContext->swapBuffers(win);
+    // Real swap path 2 of 2: this manual swap runs outside Qt's own paint-event cycle, so
+    // QOpenGLWindow's frameSwapped() signal (path 1, connected in the constructor) does
+    // NOT fire for it -- record it explicitly so swap telemetry covers every real swap.
+    if ( swapTelemetryEnabled() ) win->noteRealSwap();
     if ( madeCurrent ) win->doneCurrent();
 
     if ( outImage ) *outImage = win->m_captureReadbackImage;

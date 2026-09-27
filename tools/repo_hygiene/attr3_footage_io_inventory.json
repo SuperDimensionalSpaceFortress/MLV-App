@@ -163,7 +163,7 @@
     {
       "source": "Attr3FootageStageJob.psm1::template",
       "function": "<top-level>",
-      "line": 313,
+      "line": 333,
       "kind": "cmdlet",
       "name": "Remove-Item",
       "text": "Remove-Item -LiteralPath $localPartialPath -Force -Confirm:$false -ErrorAction SilentlyContinue",
@@ -203,7 +203,7 @@
     {
       "source": "Attr3FootageStageJob.psm1::template",
       "function": "<top-level>",
-      "line": 333,
+      "line": 313,
       "kind": "cmdlet",
       "name": "Remove-Item",
       "text": "Remove-Item -LiteralPath $localPartialPath -Force -Confirm:$false -ErrorAction SilentlyContinue",
@@ -503,7 +503,7 @@
     {
       "source": "attr3-footage-stage.ps1",
       "function": "<top-level>",
-      "line": 170,
+      "line": 196,
       "kind": "cmdlet",
       "name": "Resolve-Path",
       "text": "Resolve-Path (Join-Path $PSScriptRoot '..\\..\\..')",
@@ -513,7 +513,7 @@
     {
       "source": "attr3-footage-stage.ps1",
       "function": "<top-level>",
-      "line": 230,
+      "line": 286,
       "kind": "cmdlet",
       "name": "Test-Path",
       "text": "Test-Path -LiteralPath $ResolverPath -PathType Leaf",
@@ -523,7 +523,7 @@
     {
       "source": "attr3-footage-stage.ps1",
       "function": "<top-level>",
-      "line": 262,
+      "line": 318,
       "kind": "cmdlet",
       "name": "Test-Path",
       "text": "Test-Path -LiteralPath $emitPath -PathType Leaf",
@@ -533,7 +533,7 @@
     {
       "source": "attr3-footage-stage.ps1",
       "function": "<top-level>",
-      "line": 265,
+      "line": 321,
       "kind": "static-method",
       "name": "ReadAllBytes",
       "text": "[IO.File]::ReadAllBytes($emitPath)",
@@ -543,7 +543,7 @@
     {
       "source": "attr3-footage-stage.ps1",
       "function": "<top-level>",
-      "line": 267,
+      "line": 323,
       "kind": "cmdlet",
       "name": "Test-Path",
       "text": "Test-Path -LiteralPath $emitPath",
@@ -553,7 +553,7 @@
     {
       "source": "attr3-footage-stage.ps1",
       "function": "<top-level>",
-      "line": 267,
+      "line": 323,
       "kind": "cmdlet",
       "name": "Remove-Item",
       "text": "Remove-Item -LiteralPath $emitPath -Force",
@@ -563,7 +563,7 @@
     {
       "source": "attr3-footage-stage.ps1",
       "function": "Remove-Attr3FootageStageAttemptResidue",
-      "line": 395,
+      "line": 469,
       "kind": "cmdlet",
       "name": "Test-Path",
       "text": "Test-Path -LiteralPath $shareStageDir -PathType Container -ErrorAction SilentlyContinue",
@@ -573,7 +573,7 @@
     {
       "source": "attr3-footage-stage.ps1",
       "function": "Remove-Attr3FootageStageAttemptResidue",
-      "line": 399,
+      "line": 473,
       "kind": "static-method",
       "name": "Delete",
       "text": "[IO.Directory]::Delete($shareStageDir, $false)",

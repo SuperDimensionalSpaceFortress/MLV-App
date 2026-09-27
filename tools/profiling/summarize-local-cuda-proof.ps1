@@ -642,7 +642,57 @@ else {
                 -NextAction "Fix the A/B proof failure before quoting playback speed."
         }
     }
-    if ($playbackAbSpeedCompare -and $null -ne $playbackAbSpeedCompare.presentedFps) {
+    # round 4 (sol major): relying only on $playbackAb.proofFailures let a legacy/degenerate
+    # packet -- one produced before the host-load gate existed, or lacking the field for any other
+    # reason -- pass this section cleanly even though its FPS numbers were never checked against
+    # host load at all. Check the relevant legs' hostLoadProvisional independently, defaulting a
+    # missing/absent property to provisional (fail toward provisional, same stance as every other
+    # reader in this card).
+    $playbackAbCandidateLeg = if ($playbackAbComparisonBasis -eq "candidateSpeed") {
+        $playbackAb.candidateSpeed
+    } else {
+        $playbackAb.candidate
+    }
+    $playbackAbHostLoadLegs = @(
+        [pscustomobject]@{ Name = "baseline"; Leg = $playbackAb.baseline },
+        [pscustomobject]@{ Name = $playbackAbComparisonBasis; Leg = $playbackAbCandidateLeg }
+    )
+    # round 5 (sol BLOCKER): checking hostLoadProvisional alone repeats the exact inconsistency
+    # round 4 closed at the producer -- a leg carrying an explicit hostLoadProvisional=false
+    # alongside a missing/blank/"unknown" hostLoadState is a legacy or degenerate leg, not a clean
+    # one. sol's repro: hostLoadProvisional=false with hostLoadState='unknown' checked only the
+    # boolean here. Combine both fields, same as Get-Field's other callers in this section.
+    # round 8 (sol MAJOR item 3): that fix only special-cased hostLoadState=="unknown" -- a leg
+    # with hostLoadState="exceeded" and an inconsistent/fabricated hostLoadProvisional=false still
+    # read clean. THE CANONICAL PREDICATE (identical at every one of this card's six sites --
+    # see compare-machine-perf.ps1's Get-PlaybackAbLegHostLoadProvisional for the full cross-file
+    # note): clean iff state=="quiet" AND provisional==false; every other combination is
+    # provisional.
+    $playbackAbHostLoadProvisional = $false
+    foreach ($legEntry in $playbackAbHostLoadLegs) {
+        $legProvisionalValue = Get-Field $legEntry.Leg "hostLoadProvisional"
+        $legProvisionalDeclared = if ($null -eq $legProvisionalValue) { $true } else { [bool]$legProvisionalValue }
+        $legStateValue = Get-Field $legEntry.Leg "hostLoadState"
+        $legState = if ($null -eq $legStateValue -or [string]::IsNullOrWhiteSpace([string]$legStateValue)) {
+            "unknown"
+        } else {
+            [string]$legStateValue
+        }
+        $legProvisional = ($legProvisionalDeclared -or $legState -ne "quiet")
+        if ($legProvisional) {
+            $playbackAbHostLoadProvisional = $true
+            [void]$playbackAbBlockers.Add("playback A/B $($legEntry.Name) leg host load was PROVISIONAL or unrecorded")
+            Add-Diagnostic `
+                -Diagnostics $diagnostics `
+                -Area "playback-speed" `
+                -Code "PLAYBACK_AB_HOST_LOAD_PROVISIONAL" `
+                -Message "Playback A/B $($legEntry.Name) leg host load was PROVISIONAL or unrecorded." `
+                -Evidence @("leg=$($legEntry.Name)") `
+                -NextAction "Rerun the playback A/B stage on a quiet host; an fps number measured under provisional or unrecorded host load is not a property of the build."
+        }
+    }
+    if (-not $playbackAbHostLoadProvisional -and
+        $playbackAbSpeedCompare -and $null -ne $playbackAbSpeedCompare.presentedFps) {
         $fpsDelta = Convert-ToNullableDouble (Get-Field $playbackAbSpeedCompare.presentedFps "delta")
         if ($null -ne $fpsDelta -and $fpsDelta -le 0) {
             Add-Diagnostic `

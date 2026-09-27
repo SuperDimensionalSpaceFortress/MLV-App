@@ -4,10 +4,33 @@
 #
 # Protocol (all under <agent root>, which is this script's folder):
 #   inbox\<jobId>.job.ps1   - VM drops a PowerShell script here (atomic rename)
+#   inbox\<jobId>.meta.json - OPTIONAL, VM-written per-job budget: {"jobId":...,"timeoutSec":N}
+#   running\<jobId>.started.json - written the instant this agent claims a job: {"jobId":...,
+#                            "startedUtc":...}. Consumed by um-run.ps1's client to switch from its
+#                            submission-anchored QUEUED-phase deadline to a claim-anchored CLAIMED-
+#                            phase one; removed again once the job's result is published so a later
+#                            submission that reuses the same jobId never reads a stale claim time.
 #   outbox\<jobId>.result.json - agent writes {exitCode,stdout,stderr,timing}
-#   processed\              - consumed job scripts are moved here
+#   processed\              - consumed job scripts (and their meta.json, if any) are moved here
 #   logs\                   - per-job stdout/stderr capture
 #   heartbeat.txt           - rewritten every poll so the VM can prove liveness
+#
+# ATTR3-FOOTAGE-STAGE-SUBMIT-RETRY-1 round 2 (fable/sol major 2): this is the repository's ONLY
+# tracked agent, and it is a DELIBERATELY MINIMAL double of the richer, untracked agent deployed at
+# \\bachelor\mlv-agent\ultra-magnus-agent.ps1 (which additionally has queue-age expiry). This
+# tracked copy reads ONLY inbox\<jobId>.meta.json's timeoutSec, in the SAME 1..86400 range and the
+# SAME fall-back-to-default-when-missing-or-unparseable rule as the deployed one, so -JobTimeoutSec
+# below is an agent-wide FALLBACK, never the effective per-job budget when metadata is present.
+#
+# ATTR3-FOOTAGE-STAGE-SUBMIT-RETRY-1 round 6 (sol major 1): this copy now WRITES the same
+# running\<jobId>.started.json claim marker the deployed copy does. Without it, both production
+# wrapper call sites (attr3-footage-stage.ps1) set -MaxQueueWaitSec equal to -TimeoutSec, so a
+# full-budget job's client never saw a claim signal, stayed on its submission-anchored QUEUED
+# deadline for its entire wait, and could throw before the agent -- whose own deadline starts only
+# at claim, strictly after submission -- ever published its timeout receipt. Writing the marker
+# closes that gap the same way the deployed agent already does, rather than asking every client to
+# reason about a queue ceiling that cannot itself outlast an execution ceiling it has no visibility
+# into.
 #
 # Security: this intentionally executes scripts dropped into inbox\. It is a
 # private automation channel on the user's own LAN/host/account. Stop it by
@@ -26,9 +49,10 @@ $ErrorActionPreference = "Continue"
 $inbox     = Join-Path $Root "inbox"
 $outbox    = Join-Path $Root "outbox"
 $processed = Join-Path $Root "processed"
+$running   = Join-Path $Root "running"
 $logs      = Join-Path $Root "logs"
 $heartbeat = Join-Path $Root "heartbeat.txt"
-foreach ($d in @($inbox, $outbox, $processed, $logs)) {
+foreach ($d in @($inbox, $outbox, $processed, $running, $logs)) {
     New-Item -ItemType Directory -Force -Path $d | Out-Null
 }
 
@@ -221,6 +245,35 @@ function Quote-ProcessArgument {
     return '"' + ($Value -replace '"', '\"') + '"'
 }
 
+function Get-JobEffectiveTimeoutSec {
+    <#
+    ATTR3-FOOTAGE-STAGE-SUBMIT-RETRY-1 round 2 (fable/sol major 2). Mirrors the deployed agent's
+    Get-JobMetadata timeoutSec handling: 1..86400, falling back to $DefaultTimeoutSec when the file
+    is missing, unreadable, or the value is absent/unparseable/out of range. Never throws -- a
+    malformed metadata file must degrade to the agent's own default, not abort the job.
+    #>
+    param(
+        [Parameter(Mandatory = $true)][string]$MetaPath,
+        [Parameter(Mandatory = $true)][int]$DefaultTimeoutSec,
+        [string]$ErrFile = $null
+    )
+
+    if (-not (Test-Path -LiteralPath $MetaPath -PathType Leaf)) { return $DefaultTimeoutSec }
+    try {
+        $meta = Get-Content -LiteralPath $MetaPath -Raw | ConvertFrom-Json
+    } catch {
+        if ($ErrFile) {
+            "failed to parse job metadata '$MetaPath': $($_.Exception.Message)" | Add-Content -Encoding ASCII $ErrFile
+        }
+        return $DefaultTimeoutSec
+    }
+    $parsed = 0
+    if ($null -eq $meta.timeoutSec -or -not [int]::TryParse([string]$meta.timeoutSec, [ref]$parsed) -or $parsed -lt 1 -or $parsed -gt 86400) {
+        return $DefaultTimeoutSec
+    }
+    return $parsed
+}
+
 function Write-AgentHeartbeat {
     param([string]$Activity = "")
 
@@ -244,6 +297,13 @@ while ($true) {
         $outFile = Join-Path $logs "$jobId.out.txt"
         $errFile = Join-Path $logs "$jobId.err.txt"
         $started = (Get-Date).ToUniversalTime().ToString("o")
+        $startedMarkerPath = Join-Path $running "$jobId.started.json"
+        # sol round 6 major 1: written the instant this job is claimed (dequeued off the inbox),
+        # before any per-job setup below -- um-run.ps1's client switches to a claim-anchored
+        # deadline the moment this file appears, so claiming later than this line would leave the
+        # same submission-anchored race window open for whatever runs between here and the write.
+        [pscustomobject]@{ jobId = $jobId; startedUtc = $started } |
+            ConvertTo-Json -Compress | Set-Content -Encoding ASCII $startedMarkerPath
         $exit    = $null
         $timedOut = $false
         $killedProcessIds = @()
@@ -254,6 +314,13 @@ while ($true) {
         $pendingSymbolPresence = $null
         $dllSha256 = $null
         Remove-Item -LiteralPath $outFile, $errFile -Force -ErrorAction SilentlyContinue
+
+        # ATTR3-FOOTAGE-STAGE-SUBMIT-RETRY-1 round 2 (fable/sol major 2): honour a per-job budget
+        # from inbox\<jobId>.meta.json (written by um-run.ps1 BEFORE the job becomes visible, so it
+        # is always here by the time this agent claims the job), falling back to this agent's own
+        # -JobTimeoutSec when the file is absent or the value is unparseable/out of range.
+        $metaPath = Join-Path $inbox "$jobId.meta.json"
+        $effectiveTimeoutSec = Get-JobEffectiveTimeoutSec -MetaPath $metaPath -DefaultTimeoutSec $JobTimeoutSec -ErrFile $errFile
 
         # Run the dropped script in a child PowerShell with a wall-clock timeout
         # so one hung job cannot freeze the agent. Output goes to files (no pipe
@@ -291,7 +358,7 @@ while ($true) {
             $rootIdentitySource = "Win32_Process"
             $rootIdentityHasImage = $true
 
-            $deadline = (Get-Date).AddSeconds($JobTimeoutSec)
+            $deadline = (Get-Date).AddSeconds($effectiveTimeoutSec)
             $waitSliceMs = [Math]::Max(250, [Math]::Min(5000, $PollSeconds * 1000))
             while (!$jobProcess.HasExited -and (Get-Date) -lt $deadline) {
                 foreach ($descendant in @(Get-DescendantProcessIdentities -ParentIdentity $jobIdentity)) {
@@ -309,7 +376,7 @@ while ($true) {
                 $timedOut = $true
                 $exit = 124
                 $killedProcessIds = @(Stop-ProcessTree -RootIdentity $jobIdentity -KnownIdentities @($trackedDescendants.Values))
-                "timed out after ${JobTimeoutSec}s; killed process tree pids=$($killedProcessIds -join ',')" |
+                "timed out after ${effectiveTimeoutSec}s; killed process tree pids=$($killedProcessIds -join ',')" |
                     Add-Content -Encoding ASCII $errFile
             }
         }
@@ -359,7 +426,7 @@ while ($true) {
             startedUtc = $started
             endedUtc   = $ended
             host       = $env:COMPUTERNAME
-            timeoutSec = $JobTimeoutSec
+            timeoutSec = $effectiveTimeoutSec
             timedOut   = $timedOut
             killedProcessIds = @($killedProcessIds)
             rootIdentitySource = $rootIdentitySource
@@ -377,7 +444,21 @@ while ($true) {
         $fin = Join-Path $outbox "$jobId.result.json"
         $result | ConvertTo-Json -Depth 6 | Set-Content -Encoding ASCII $tmp
         Move-Item -Force $tmp $fin
+        # sol round 6 major 1: the claim marker's lifetime matches the job's -- removed once the
+        # result is published (the instant that retires this JobId in UmRunDrop.psm1's own
+        # outbox-result check), never left behind. A deterministic job id reused by a later retry
+        # must never read THIS run's claim time as its own, which a stale marker would cause: the
+        # client would treat it as already claimed long ago and give up almost immediately.
+        Remove-Item -LiteralPath $startedMarkerPath -Force -ErrorAction SilentlyContinue
         Move-Item -Force $job.FullName (Join-Path $processed $job.Name)
+        # fable/sol major 1/2: the metadata's lifetime matches the job's -- move it out of inbox\
+        # alongside the job it governed, whether or not it was actually honoured this round.
+        # Leaving it behind (a) accumulates unconsumed files in inbox\ forever, and (b) would brick
+        # a retry that reuses this job id (UmRunDrop.psm1 refuses to place metadata over an existing
+        # file).
+        if (Test-Path -LiteralPath $metaPath -PathType Leaf) {
+            Move-Item -Force -LiteralPath $metaPath -Destination (Join-Path $processed "$jobId.meta.json")
+        }
     }
 
     Start-Sleep -Seconds $PollSeconds

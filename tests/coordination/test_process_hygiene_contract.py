@@ -405,6 +405,247 @@ Start-Sleep -Milliseconds 200
     assert observed["childAlive"] is False
 
 
+@pytest.mark.skipif(os.name != "nt", reason="MLV-App process ownership is Windows-specific")
+def test_gui_smoke_process_boundary_no_longer_accepts_a_sampling_callback(tmp_path: Path) -> None:
+    # PLAYBACK-MEASURE-HOST-LOAD-GATE-1 round 7 (sol + astra MAJOR -- "the new budget does not
+    # bound collection as a whole, and a non-returning sampler prevents both timeout handling and
+    # receipt publication"): rounds 3-6 gave this module a -SampleIntervalMs/-OnSample pair so
+    # run-release-gui-smoke.ps1 could sample host load DURING the wait, invoked synchronously
+    # inside this module's own scope with no way to preempt a callback that never returned. Item 1
+    # (replacing per-process CPU accounting with one GetSystemTimes syscall plus one process-handle
+    # read) made a host-load sample cheap and self-bounded enough that the sampling loop moved OUT
+    # of this module entirely and into run-release-gui-smoke.ps1's own scope, sampling inline
+    # between chunked waits it drives itself -- see that script's sampling loop, immediately before
+    # its (now parameter-less-for-sampling) call into this function. This function goes back to
+    # being exactly its round-3 default branch: one bounded wait, then the stream-drain/kill-tree
+    # finalize. Passing -SampleIntervalMs/-OnSample now fails to bind (the parameters no longer
+    # exist) -- proving the removal is real, not merely unused.
+    pwsh = shutil.which("pwsh.exe") or shutil.which("pwsh")
+    if not pwsh:
+        pytest.skip("PowerShell 7 is unavailable")
+
+    module_literal = str(GUI_SMOKE_PROCESS_BOUNDARY).replace("'", "''")
+    python_literal = str(sys.executable).replace("'", "''")
+    command = rf"""
+Import-Module '{module_literal}' -Force
+
+$start = [Diagnostics.ProcessStartInfo]::new()
+$start.FileName = '{python_literal}'
+$start.UseShellExecute = $false
+$start.RedirectStandardOutput = $true
+$start.RedirectStandardError = $true
+[void]$start.ArgumentList.Add('-c')
+[void]$start.ArgumentList.Add('import time; time.sleep(0.2)')
+$p = [Diagnostics.Process]::new()
+$p.StartInfo = $start
+[void]$p.Start()
+$stdoutTask = $p.StandardOutput.ReadToEndAsync()
+$stderrTask = $p.StandardError.ReadToEndAsync()
+$onSample = {{ }}
+$outcome = 'BOUND'
+$errorMessage = ''
+$errorId = ''
+try {{
+    Wait-GuiSmokeProcessBounded -Process $p -StandardOutputTask $stdoutTask -StandardErrorTask $stderrTask -TimeoutMs 3000 -TerminationGraceMs 3000 -StreamDrainMs 3000 -SampleIntervalMs 300 -OnSample $onSample | Out-Null
+}} catch {{
+    $outcome = 'REJECTED'
+    $errorMessage = $_.Exception.Message
+    $errorId = $_.FullyQualifiedErrorId
+}}
+if ($outcome -eq 'BOUND') {{ $p.Kill($true) }}
+
+[pscustomobject]@{{
+    outcome = $outcome
+    errorMessage = $errorMessage
+    errorId = $errorId
+}} | ConvertTo-Json -Depth 8 -Compress
+"""
+    completed = subprocess.run(
+        [
+            pwsh,
+            "-NoLogo",
+            "-NoProfile",
+            "-NonInteractive",
+            "-ExecutionPolicy",
+            "Bypass",
+            "-Command",
+            command,
+        ],
+        cwd=REPO_ROOT,
+        capture_output=True,
+        text=True,
+        timeout=30,
+        check=False,
+    )
+
+    assert completed.returncode == 0, completed.stdout + completed.stderr
+    observed = json.loads(completed.stdout.strip())
+    assert observed["outcome"] == "REJECTED", observed
+    error_message = observed["errorMessage"]
+    assert "SampleIntervalMs" in error_message or "OnSample" in error_message, error_message
+    assert observed["errorId"], observed
+    assert "NamedParameterNotFound" in observed["errorId"], observed
+    assert "Wait-GuiSmokeProcessBounded" in observed["errorId"], observed
+
+
+@pytest.mark.skipif(os.name != "nt", reason="MLV-App process ownership is Windows-specific")
+def test_gui_smoke_process_boundary_sanitizes_process_handle_exceptions(tmp_path: Path) -> None:
+    # PLAYBACK-MEASURE-HOST-LOAD-GATE-1 round 7 (sol MINOR -- "remaining process-boundary catches
+    # still append raw Exception.Message"): three catches in Wait-GuiSmokeProcessBounded itself
+    # (the main WaitForExit, Process.Kill, and the post-kill grace WaitForExit) still recorded the
+    # raw exception message, same class already sanitized round 5/6 for OnSample and the
+    # stdout/stderr task drain. A [Diagnostics.Process] that was constructed but never Start()'d
+    # has no associated OS process -- WaitForExit/Kill both throw a real, natural (not mocked)
+    # exception ("No process is associated with this object") for exactly this reason, giving a
+    # live way to exercise all three catches in one call: the main wait fails closed into the
+    # timeout branch, Kill then fails, and the post-kill grace wait fails identically.
+    pwsh = shutil.which("pwsh.exe") or shutil.which("pwsh")
+    if not pwsh:
+        pytest.skip("PowerShell 7 is unavailable")
+
+    module_literal = str(GUI_SMOKE_PROCESS_BOUNDARY).replace("'", "''")
+    command = rf"""
+Import-Module '{module_literal}' -Force
+
+$p = [Diagnostics.Process]::new()
+$stdoutTask = [System.Threading.Tasks.Task]::FromResult('')
+$stderrTask = [System.Threading.Tasks.Task]::FromResult('')
+$result = Wait-GuiSmokeProcessBounded -Process $p -StandardOutputTask $stdoutTask -StandardErrorTask $stderrTask -TimeoutMs 300 -TerminationGraceMs 300 -StreamDrainMs 3000
+
+[pscustomobject]@{{
+    failures = @($result.failures)
+    timedOut = $result.timedOut
+    exitCode = $result.exitCode
+    treeKillAttempted = $result.treeKillAttempted
+    treeKillSucceeded = $result.treeKillSucceeded
+    terminationConfirmed = $result.terminationConfirmed
+}} | ConvertTo-Json -Depth 8 -Compress
+"""
+    completed = subprocess.run(
+        [
+            pwsh,
+            "-NoLogo",
+            "-NoProfile",
+            "-NonInteractive",
+            "-ExecutionPolicy",
+            "Bypass",
+            "-Command",
+            command,
+        ],
+        cwd=REPO_ROOT,
+        capture_output=True,
+        text=True,
+        timeout=30,
+        check=False,
+    )
+
+    assert completed.returncode == 0, completed.stdout + completed.stderr
+    observed = json.loads(completed.stdout.strip())
+    failures = observed["failures"]
+    if isinstance(failures, str):
+        failures = [failures]
+    joined = " ".join(failures)
+
+    wait_failures = [f for f in failures if f.startswith("Process wait failed:")]
+    assert len(wait_failures) == 1, failures
+    wait_type_name = wait_failures[0].split(": ", 1)[1]
+    assert " " not in wait_type_name, wait_failures[0]
+
+    kill_failures = [f for f in failures if f.startswith("MLVApp process-tree termination failed:")]
+    assert len(kill_failures) == 1, failures
+    kill_type_name = kill_failures[0].split(": ", 1)[1]
+    assert " " not in kill_type_name, kill_failures[0]
+
+    postkill_failures = [f for f in failures if f.startswith("MLVApp post-kill wait failed:")]
+    assert len(postkill_failures) == 1, failures
+    postkill_type_name = postkill_failures[0].split(": ", 1)[1]
+    assert " " not in postkill_type_name, postkill_failures[0]
+
+    # All three arise from the identical root cause (no associated OS process), so they should be
+    # the same underlying exception type -- a further structural check on the sanitized shape.
+    assert wait_type_name == kill_type_name == postkill_type_name, failures
+
+    # The sanitized shape must never leak the underlying .NET message text -- exactly what a
+    # future catch reverting to raw $_.Exception.Message would reintroduce.
+    assert "No process" not in joined, joined
+    assert "associated" not in joined, joined
+
+    # Unrelated invariants must still hold for this never-started-process case: the wait never
+    # confirmed termination, so this is treated identically to a genuine hung-process timeout.
+    assert observed["timedOut"] is True
+    assert observed["exitCode"] == 124
+    assert observed["treeKillAttempted"] is True
+    assert observed["treeKillSucceeded"] is False
+    assert observed["terminationConfirmed"] is False
+
+
+@pytest.mark.skipif(os.name != "nt", reason="MLV-App process ownership is Windows-specific")
+def test_gui_smoke_process_boundary_sanitizes_faulted_stdout_task_exception_message(tmp_path: Path) -> None:
+    # PLAYBACK-MEASURE-HOST-LOAD-GATE-1 round 6 (sol MINOR, same class as round 5's OnSample
+    # sanitization above): Get-GuiSmokeTaskText's own catch block (used to drain BOTH the stdout
+    # and stderr tasks) still recorded the raw $_.Exception.Message -- sol's exact repro: "a
+    # faulted stdout task whose synthetic exception includes a sentinel path... result.failures
+    # reproduces the raw sentinel." Passes a Task that is ALREADY faulted (constructed via
+    # Task.FromException, carrying a sentinel path in its message) as -StandardOutputTask.
+    pwsh = shutil.which("pwsh.exe") or shutil.which("pwsh")
+    if not pwsh:
+        pytest.skip("PowerShell 7 is unavailable")
+
+    module_literal = str(GUI_SMOKE_PROCESS_BOUNDARY).replace("'", "''")
+    python_literal = str(sys.executable).replace("'", "''")
+    command = rf"""
+Import-Module '{module_literal}' -Force
+
+$start = [Diagnostics.ProcessStartInfo]::new()
+$start.FileName = '{python_literal}'
+$start.UseShellExecute = $false
+$start.RedirectStandardOutput = $true
+$start.RedirectStandardError = $true
+[void]$start.ArgumentList.Add('-c')
+[void]$start.ArgumentList.Add('import time; time.sleep(0.2)')
+$p = [Diagnostics.Process]::new()
+$p.StartInfo = $start
+[void]$p.Start()
+$sentinelException = [System.Exception]::new('stdout drain failed for host BACHELOR at C:\Users\owner\secret')
+$faultedStdoutTask = [System.Threading.Tasks.Task]::FromException($sentinelException)
+$stderrTask = $p.StandardError.ReadToEndAsync()
+$result = Wait-GuiSmokeProcessBounded -Process $p -StandardOutputTask $faultedStdoutTask -StandardErrorTask $stderrTask -TimeoutMs 8000 -TerminationGraceMs 5000 -StreamDrainMs 5000
+
+[pscustomobject]@{{
+    stdoutDrained = $result.stdoutDrained
+    failures = @($result.failures)
+}} | ConvertTo-Json -Depth 8 -Compress
+"""
+    completed = subprocess.run(
+        [
+            pwsh,
+            "-NoLogo",
+            "-NoProfile",
+            "-NonInteractive",
+            "-ExecutionPolicy",
+            "Bypass",
+            "-Command",
+            command,
+        ],
+        cwd=REPO_ROOT,
+        capture_output=True,
+        text=True,
+        timeout=30,
+        check=False,
+    )
+
+    assert completed.returncode == 0, completed.stdout + completed.stderr
+    observed = json.loads(completed.stdout.strip())
+    assert observed["stdoutDrained"] is False
+    failures = observed["failures"]
+    assert any("stdout drain failed:" in f for f in failures), failures
+    joined = " ".join(failures)
+    assert "secret" not in joined
+    assert "owner" not in joined
+    assert "BACHELOR" not in joined
+    assert "C:\\" not in joined
+
+
 @pytest.mark.skipif(os.name != "nt", reason="MLV-App GUI smoke comparer is PowerShell-based")
 def test_gui_smoke_ab_requires_same_last_presented_frame(tmp_path: Path) -> None:
     pwsh = shutil.which("pwsh.exe") or shutil.which("pwsh")

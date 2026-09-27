@@ -82,6 +82,15 @@ param(
     [switch]$LaunchOnlyProbe,
     [ValidateRange(0.0, 1.0)]
     [double]$MaxSkippedOrUnpresentedRatio = 0.5,
+    [double]$HostLoadCpuPercentBar = 75,
+    [int]$HostLoadTopProcessCount = 8,
+    # PLAYBACK-MEASURE-HOST-LOAD-GATE-1 round 3: cadence for interior host-load sampling while the
+    # leg runs, not just before/after it. 4000ms on a 24-30s leg (per the round-2 evidence) yields
+    # ~6-7 interior samples -- enough to catch an agent-job-length burst without materially adding
+    # to the leg's own cost (see the "cost" note on $hostLoadDuringSamples below). 0 disables
+    # interior sampling and reproduces round 2's bracket-only behaviour exactly.
+    [ValidateRange(0, 60000)]
+    [int]$HostLoadSampleIntervalMs = 4000,
     [switch]$DryRun
 )
 
@@ -260,7 +269,11 @@ function Wait-SystemCpuSettle {
             $cpuPercent = Get-SystemCpuPercent
         }
         catch {
-            $result.failure = $_.Exception.Message
+            # round 8 (fable minor 2): raw exception TEXT can embed a host/namespace identifier
+            # (the same CIM-connection-failure class Get-HostLoadSnapshot already sanitizes below);
+            # this result flows into the receipt via preLaunchSystemCpuSettle, so record the
+            # exception's TYPE only, matching every other sanitized catch in this file.
+            $result.failure = $_.Exception.GetType().Name
             break
         }
 
@@ -280,6 +293,523 @@ function Wait-SystemCpuSettle {
     $result.elapsedMs = [int]$watch.ElapsedMilliseconds
     $result.settled = $result.stableMs -ge $StableMs
     [pscustomobject]$result
+}
+
+function Get-HostLoadSystemTimes {
+    # PLAYBACK-MEASURE-HOST-LOAD-GATE-1 round 7 (sol + astra BLOCKER -- replace per-process
+    # accounting BY CONSTRUCTION): rounds 4-6 built non-subject load by enumerating every process
+    # on the host and summing (or diffing) their individually-read TotalProcessorTime values. Each
+    # round found a new way for that per-process mechanism to undercount without recording that it
+    # had: a throwing getter stored as zero, a loader present in only one snapshot contributing
+    # nothing, PID reuse matched without creation identity. This function retires that whole
+    # mechanism: ONE Win32 syscall (GetSystemTimes) returns the host's cumulative idle/kernel/user
+    # time directly from the kernel -- there is no process list to enumerate, so none of those
+    # failure modes can exist here, by construction, not by another patch. Kernel time on Windows
+    # INCLUDES idle time, so system-wide busy time is (kernel - idle) + user; see
+    # Get-HostLoadNonSubjectCpuLoadPercent below for the subtraction that turns this into a
+    # non-subject figure.
+    #
+    # round 9 (sol BLOCKER item 1): -SubjectProcess/-SubjectNotYetStarted read the subject's own
+    # TotalProcessorTime HERE, immediately after the GetSystemTimes syscall, with nothing but a
+    # null-check assignment between the two reads -- not by a separate caller-side read one or more
+    # statements later (as Get-HostLoadSnapshot did through round 8). Both numbers now describe the
+    # SAME instant by construction: there is no window left in which the subject can keep burning
+    # CPU that then gets attributed, via subtraction, to a system-wide interval it was never
+    # inside. sol's round-8 repro depended on exactly that gap (a delayed subject read pulling in
+    # 0.88 CPU-seconds accrued after the system endpoint, turning a true 96% into a reported 74%
+    # quiet); folding the read in here removes the gap rather than bounding it.
+    #
+    # Self-contained (the Add-Type guard lives inside this function, not at file scope) so the test
+    # harness's verbatim-splice extraction (_extract_functions) can pull this function alone and it
+    # still works standalone -- same precedent as capture-window-screenshot.ps1's NativeMethods
+    # guard. Returns $null (never throws) on any failure: non-Windows platform, Add-Type failure,
+    # or GetSystemTimes itself returning FALSE -- callers must treat $null as "could not collect",
+    # the same fail-toward-unknown contract every other collection point in this file already uses.
+    param(
+        [AllowNull()][System.Diagnostics.Process]$SubjectProcess = $null,
+        # round 7: the BEFORE snapshot is captured before the subject process is even started --
+        # its cumulative CPU time is not "unreadable", it is DEFINITIONALLY zero. See
+        # Get-HostLoadSnapshot's own parameter comment for the full rationale; carried here
+        # verbatim now that the read itself lives in this function.
+        [switch]$SubjectNotYetStarted
+    )
+    if ([System.Environment]::OSVersion.Platform -ne [System.PlatformID]::Win32NT) {
+        return $null
+    }
+    try {
+        if (-not ("HostLoadNative.NativeMethods" -as [type])) {
+            # A literal (single-quoted) here-string: this is plain C# source text with no
+            # PowerShell variable interpolation needed, and it must not accidentally get any.
+            # NOTE for future edits: keep every closing brace off a line by itself (no line that
+            # is JUST "}") -- the test harness's function-extraction regex looks for the literal
+            # sequence newline-close-brace-newline to find where a PowerShell FUNCTION ends, and a
+            # bare "}" line inside this embedded C# block (e.g. a namespace's own closing brace on
+            # its own line) matches that same pattern and truncates the splice early. Kept on one
+            # line together instead.
+            Add-Type -TypeDefinition @'
+using System;
+using System.Runtime.InteropServices;
+namespace HostLoadNative {
+    public static class NativeMethods {
+        // FILETIME is two little-endian DWORDs (low then high); that is bit-identical to a
+        // 64-bit integer's memory layout on a little-endian machine, so marshaling straight to
+        // "long" reproduces the exact 100-nanosecond-tick value with no manual high/low combining.
+        [DllImport("kernel32.dll", SetLastError = true)]
+        public static extern bool GetSystemTimes(out long idleTime, out long kernelTime, out long userTime);
+    } }
+'@ -ErrorAction Stop
+        }
+    } catch {
+        return $null
+    }
+    $idleTicks = [int64]0
+    $kernelTicks = [int64]0
+    $userTicks = [int64]0
+    # round 8 (sol BLOCKER = fable minor 1 -- window misalignment): stamped immediately adjacent to
+    # the syscall itself, not by the caller before its own CIM/Get-Process evidence work -- see
+    # Get-HostLoadNonSubjectCpuLoadPercent, which now computes elapsed time from THIS timestamp on
+    # both sides of an interval, never from Get-HostLoadSnapshot's top-of-function capturedAtUtc.
+    $syscallAtUtc = [datetime]::UtcNow
+    try {
+        $ok = [HostLoadNative.NativeMethods]::GetSystemTimes([ref]$idleTicks, [ref]$kernelTicks, [ref]$userTicks)
+    } catch {
+        return $null
+    }
+    if (-not $ok) {
+        return $null
+    }
+    # round 9 (sol BLOCKER item 1): read immediately -- the only statements between the syscall
+    # above and this read are the two null checks above it, none of which can block or sleep.
+    $subjectCpuSeconds = $null
+    if ($SubjectNotYetStarted) {
+        $subjectCpuSeconds = 0.0
+    }
+    elseif ($null -ne $SubjectProcess) {
+        try {
+            # Read straight off the caller's own held handle -- no process lookup, so PID reuse
+            # and "the process already exited" cannot make this read the WRONG process's CPU
+            # time. See Get-HostLoadSnapshot's former copy of this comment (round 4/7) for the
+            # full rationale; unchanged, only relocated.
+            $SubjectProcess.Refresh()
+            $subjectTotalProcessorTime = $SubjectProcess.TotalProcessorTime
+            # round 7: a disposed/invalid Process handle's TotalProcessorTime getter does NOT
+            # always throw -- PowerShell's member-access can suppress the .NET property getter's
+            # exception and simply yield $null instead. An explicit null check -- not exception
+            # handling alone -- is what closes it; casting $null straight to [double] would
+            # silently produce 0.0.
+            if ($null -ne $subjectTotalProcessorTime) {
+                $subjectCpuSeconds = [double]$subjectTotalProcessorTime.TotalSeconds
+            }
+        } catch {
+            # A genuinely thrown exception is handled identically: subjectCpuSeconds stays at its
+            # $null default (unreadable, the third state -- never guess zero).
+        }
+    }
+    [pscustomobject]@{
+        idleSeconds = $idleTicks / 1e7
+        kernelSeconds = $kernelTicks / 1e7
+        userSeconds = $userTicks / 1e7
+        capturedAtUtc = $syscallAtUtc
+        subjectCpuSeconds = $subjectCpuSeconds
+    }
+}
+
+function Get-HostLoadSnapshot {
+    # Records host state around a playback leg. BACHELOR is also the owner's interactive
+    # workstation: an fps number measured while it is loaded is not a property of the build
+    # (measured 2026-09-22 -- CPU_LOAD_PCT=96 turned a 4.8fps CPU reference into 1.2fps with
+    # identical route counters). Top consumers are recorded BY NAME ONLY -- no command lines,
+    # no paths -- this is host-load evidence, not process forensics.
+    # round 4 (sol minor): collection is bounded with -OperationTimeoutSec so a slow/hung CIM
+    # query cannot extend the measured leg without limit -- interior samples run inline in the
+    # process-wait loop (see the main body's sampling loop), so an unbounded query here would
+    # perturb the very thing this gate exists to keep clean.
+    # round 4 (sol minor, fable minor -- privacy): $_.Exception.Message can embed a path, server
+    # name, namespace, or other host/environment identifier (e.g. a WMI/CIM connection failure
+    # names the machine and namespace it tried to reach). Record only the exception's TYPE, never
+    # its message text -- kept inline (not a helper function) so this function stays
+    # self-contained for the test harness's verbatim-splice extraction.
+    # round 4 (fable minor -- subject exclusion): -SubjectProcess optionally identifies the
+    # process actually being measured (MLVApp itself). When given, its cumulative CPU time
+    # (TotalProcessorTime, seconds) is recorded as subjectCpuSeconds so a caller can later derive
+    # how much of the host's system-wide busy time was the subject's OWN legitimate decode work
+    # rather than exogenous host load (see Get-HostLoadNonSubjectCpuLoadPercent below) -- a
+    # CPU-route decode leg can legitimately push a quiet host's total load past the bar, and that
+    # is not the same thing as the host being loaded by something else.
+    #
+    # round 7 (both keys BLOCKER): cpuLoadPercent (Win32_Processor.LoadPercentage via CIM) and
+    # topCpuConsumers (Get-Process, sorted) are kept for the receipt's own sake -- they are useful
+    # evidence for a human reading a receipt -- but NEITHER feeds the quiet/exceeded decision
+    # anymore; that decision is systemIdleSeconds/systemKernelSeconds/systemUserSeconds and
+    # subjectCpuSeconds, both now read together by Get-HostLoadSystemTimes (one syscall plus one
+    # subject-handle read, back to back) only. -SubjectProcess/-SubjectNotYetStarted are passed
+    # straight through to that function -- see its own comment for the full rationale (why the
+    # caller's held handle, never a fresh Get-Process -Id lookup; why "not yet started" is a
+    # legitimate zero, distinct from "unreadable"). topCpuConsumers' own Get-Process call is
+    # wrapped in its OWN try/catch: a failure gathering that purely-evidentiary list must not block
+    # collection of the data the gate actually depends on.
+    #
+    # round 9 (sol BLOCKER item 1 + fable minor -- evidence stretches the final interval): the
+    # syscall + subject-CPU reading (via Get-HostLoadSystemTimes) now happens FIRST, before any
+    # CIM/Get-Process evidence collection, for EVERY snapshot -- not just during-leg ones. Through
+    # round 8, the evidence block ran first and the syscall ran after it, so up to
+    # ~2*OperationTimeoutSec of CIM latency plus an unbounded Get-Process could land between the
+    # leg boundary and the syscall that is supposed to mark it: the BEFORE snapshot's syscall
+    # landed late (shrinking the first interval) and the AFTER snapshot's syscall landed late
+    # (stretching the final interval past leg end, diluting a leg-tail burst -- fable's round-8
+    # residual). capturedAtUtc -- the general timestamp the main body's spacing guard
+    # (hostLoadObservedMaxSampleGapMs) measures gaps from -- is now the syscall's own instant when
+    # the syscall succeeds, not a separate top-of-function stamp taken before that evidence work,
+    # so the guard can no longer be blind to the stretch either.
+    param(
+        [int]$TopProcessCount = 8,
+        [int]$OperationTimeoutSec = 2,
+        [AllowNull()][System.Diagnostics.Process]$SubjectProcess = $null,
+        # round 7: the BEFORE snapshot is captured before the subject process is even started --
+        # its cumulative CPU time is not "unreadable", it is DEFINITIONALLY zero (a process that
+        # does not exist yet has accumulated no CPU time). This is a distinct, legitimate input
+        # from "-SubjectProcess omitted because this caller isn't tracking a subject at all" (which
+        # leaves subjectCpuSeconds at its $null/untracked default) -- conflating the two would
+        # either wrongly force the process-start interval to read unknown forever, or wrongly
+        # attribute a genuine read failure elsewhere to "zero used".
+        [switch]$SubjectNotYetStarted,
+        # round 8 (sol MAJOR item 2 -- evidence-only enumeration runs inside every measured leg,
+        # unbounded): topCpuConsumers/processCount (Get-Process, unbounded) and cpuLoadPercent/
+        # memory (CIM, bounded but still a round-trip) are receipt-only evidence -- neither feeds
+        # the quiet/exceeded decision (see Get-HostLoadNonSubjectCpuLoadPercent). An interior
+        # during-leg sample needs none of it, so when this switch is set the ENTIRE evidence block
+        # below is skipped and a sample is exactly the syscall plus the subject-handle read: two
+        # direct reads, no CIM round-trip, no process-table walk, nothing left inside a during-leg
+        # sample that can hang or perturb the leg it is measuring. Before/after brackets are called
+        # without this switch and keep full evidence for the receipt.
+        [switch]$SkipEvidenceCollection
+    )
+
+    # round 9: this is now only a FALLBACK top-of-function stamp -- overwritten below with the
+    # syscall's own instant whenever Get-HostLoadSystemTimes succeeds (the common Windows case).
+    # It stays as the default so a host where the syscall is unavailable (non-Windows, or the
+    # Add-Type/syscall failure path) still records a timestamp, matching the pre-round-9 contract.
+    $fallbackCapturedAtUtc = [datetime]::UtcNow
+    $snapshot = [ordered]@{
+        capturedAtUtc = $fallbackCapturedAtUtc.ToString("o")
+        collected = $false
+        error = $null
+        cpuLoadPercent = $null
+        processCount = $null
+        freePhysicalMemoryMb = $null
+        totalVisibleMemoryMb = $null
+        topCpuConsumers = @()
+        subjectCpuSeconds = $null
+        systemTimesCollected = $false
+        systemTimesCapturedAtUtc = $null
+        systemIdleSeconds = $null
+        systemKernelSeconds = $null
+        systemUserSeconds = $null
+    }
+    try {
+        # hub (sol r9 contract BLOCKER, PARK/SPLIT ruling 2026-09-25): WHICH end of the evidence work the
+        # syscall sits on depends on which leg boundary this snapshot marks. The AFTER bracket (and every
+        # during-leg sample) marks the END of an interval that has already happened, so its syscall runs
+        # FIRST (round 9) and evidence latency can no longer stretch the final interval past leg end. The
+        # BEFORE bracket (-SubjectNotYetStarted; its only production caller runs Process.Start right after
+        # it returns) marks the START of the first interval, so its syscall must run LAST, immediately
+        # before the subject starts -- otherwise the evidence latency is pre-leg time folded into the
+        # first interval, diluting an early-leg load burst toward quiet. subjectCpuSeconds is a constant
+        # 0.0 on that path, so moving its syscall later cannot inflate subject CPU (round 8's blocker).
+        $captureSystemTimes = {
+            # round 9: syscall + subject-CPU reading FIRST, before any evidence collection -- see the
+            # function-level comment above for why the ordering itself is the fix.
+            $systemTimes = Get-HostLoadSystemTimes -SubjectProcess $SubjectProcess -SubjectNotYetStarted:$SubjectNotYetStarted
+            if ($null -ne $systemTimes) {
+                $snapshot.capturedAtUtc = $systemTimes.capturedAtUtc.ToString("o")
+                $snapshot.systemIdleSeconds = [double]$systemTimes.idleSeconds
+                $snapshot.systemKernelSeconds = [double]$systemTimes.kernelSeconds
+                $snapshot.systemUserSeconds = [double]$systemTimes.userSeconds
+                $snapshot.systemTimesCapturedAtUtc = $systemTimes.capturedAtUtc.ToString("o")
+                $snapshot.systemTimesCollected = $true
+                $snapshot.subjectCpuSeconds = $systemTimes.subjectCpuSeconds
+            }
+            else {
+                # round 9: GetSystemTimes itself was unavailable here (non-Windows, or the native
+                # syscall/Add-Type failed) -- the window-alignment fix this round exists for is moot on
+                # this path (the interval is unknown regardless; see
+                # Get-HostLoadNonSubjectCpuLoadPercent's systemTimesCollected gate), but the subject-CPU
+                # field's own contract (SubjectNotYetStarted -> a genuine 0.0, an unreadable handle ->
+                # $null, never guessed) must still hold independent of platform. This duplicates
+                # Get-HostLoadSystemTimes' own subject-read block exactly, for this fallback path only.
+                if ($SubjectNotYetStarted) {
+                    $snapshot.subjectCpuSeconds = 0.0
+                }
+                elseif ($null -ne $SubjectProcess) {
+                    try {
+                        $SubjectProcess.Refresh()
+                        $subjectTotalProcessorTime = $SubjectProcess.TotalProcessorTime
+                        if ($null -ne $subjectTotalProcessorTime) {
+                            $snapshot.subjectCpuSeconds = [double]$subjectTotalProcessorTime.TotalSeconds
+                        }
+                    } catch {
+                        # stays $null -- unreadable, never guessed zero.
+                    }
+                }
+            }
+        }
+        $collectEvidence = {
+                $cpuLoad = (Get-CimInstance -ClassName Win32_Processor -ErrorAction Stop `
+                    -OperationTimeoutSec $OperationTimeoutSec |
+                    Measure-Object -Property LoadPercentage -Average).Average
+                $os = Get-CimInstance -ClassName Win32_OperatingSystem -ErrorAction Stop `
+                    -OperationTimeoutSec $OperationTimeoutSec
+                if ($null -eq $cpuLoad) {
+                    $snapshot.error = "LoadPercentage unavailable from Win32_Processor."
+                }
+                else {
+                    $snapshot.cpuLoadPercent = [double]$cpuLoad
+                }
+                $snapshot.freePhysicalMemoryMb = [Math]::Round($os.FreePhysicalMemory / 1024.0, 1)
+                $snapshot.totalVisibleMemoryMb = [Math]::Round($os.TotalVisibleMemorySize / 1024.0, 1)
+
+                try {
+                    $processes = Get-Process -ErrorAction Stop
+                    $snapshot.processCount = [int]$processes.Count
+                    $snapshot.topCpuConsumers = @(
+                        $processes | Sort-Object CPU -Descending | Select-Object -First $TopProcessCount |
+                            ForEach-Object { $_.ProcessName }
+                    )
+                } catch {
+                    # topCpuConsumers/processCount stay at their evidence-only defaults (empty/$null) --
+                    # this must never block collection of the load-relevant data below.
+                }
+        }
+        if ($SubjectNotYetStarted -and -not $SkipEvidenceCollection) {
+            # An evidence failure (always, on non-Windows pwsh, where Get-CimInstance does not exist)
+            # must not skip the timing capture: hold it, capture, then rethrow so the outer catch
+            # records it exactly as it did when the syscall ran first.
+            $evidenceFailure = $null
+            try { . $collectEvidence } catch { $evidenceFailure = $_ }
+            . $captureSystemTimes
+            if ($null -ne $evidenceFailure) { throw $evidenceFailure }
+        }
+        else {
+            . $captureSystemTimes
+            if (-not $SkipEvidenceCollection) { . $collectEvidence }
+        }
+
+        $snapshot.collected = $snapshot.systemTimesCollected
+    }
+    catch {
+        $snapshot.collected = $false
+        $snapshot.error = if ($null -eq $_.Exception) {
+            "collection failed (unknown exception)"
+        } else {
+            "collection failed: $($_.Exception.GetType().Name)"
+        }
+    }
+    [pscustomobject]$snapshot
+}
+
+function Get-HostLoadNonSubjectCpuLoadPercent {
+    # PLAYBACK-MEASURE-HOST-LOAD-GATE-1 round 7 (both keys BLOCKER -- replace per-process
+    # accounting BY CONSTRUCTION): non-subject load is now system-wide busy time (Win32
+    # GetSystemTimes: kernel time INCLUDES idle time, so busy = (kernel - idle) + user) minus the
+    # subject's own CPU time, both as cumulative deltas over the SAME [previous, current] window --
+    # one syscall plus one process-handle read per snapshot (see Get-HostLoadSnapshot), no process
+    # list involved anywhere in this computation. This retires the round 4-6 per-process-sum
+    # mechanism (Get-HostLoadProcessCpuSecondsPairs, processCpuSecondsById, unreadableProcessCount,
+    # totalCpuSeconds) and, with it, the whole class of failure modes that mechanism kept growing
+    # new instances of every round: a throwing per-process getter silently reading as zero, a
+    # process present in only one of the two snapshots contributing nothing to either side, and PID
+    # reuse matched with no creation-identity check. None of those are inputs to this computation
+    # anymore, so none of them are failure modes of it either.
+    #
+    # Third state, BY CONSTRUCTION, never a raw fallback: returns $null when EITHER snapshot's
+    # system times could not be collected (systemTimesCollected=$false, i.e. Get-HostLoadSystemTimes
+    # failed), OR either snapshot's subjectCpuSeconds is unreadable (including the subject having
+    # exited mid-interval without a final reading), OR the elapsed window is non-positive, OR
+    # ProcessorCount is invalid. $null here means the interval's coverage is UNKNOWN -- the caller
+    # (Get-HostLoadVerdict) must never substitute a raw system-wide number for a missing value here;
+    # that raw-fallback path is exactly what rounds 4-6 relied on and what let an honest-looking
+    # LOW number actually be an INCOMPLETE one. cpuLoadPercent is retained on the snapshot purely
+    # for the receipt (round 7 brief: "it must not feed the quiet decision on its own") and is never
+    # read by this function at all.
+    #
+    # round 8 (sol BLOCKER = fable minor 1 -- window misalignment): elapsed time is now taken from
+    # systemTimesCapturedAtUtc (stamped inside Get-HostLoadSystemTimes, immediately adjacent to the
+    # GetSystemTimes syscall itself), never from the snapshot's general capturedAtUtc (stamped at
+    # the TOP of Get-HostLoadSnapshot, before up to ~4s of CIM/Get-Process evidence work that
+    # precedes the syscall). Busy-delta and elapsed must describe the SAME window; using the
+    # earlier caller timestamp let variable pre-syscall collection latency stretch or shrink the
+    # denominator independently of the numerator (sol's repro: a continuously 100%-busy host's
+    # 1.015s counter interval divided by a 2.127s timestamp interval read 47.7%/quiet).
+    param(
+        [object]$CurrentSnapshot,
+        [object]$PreviousSnapshot,
+        [int]$ProcessorCount = [Environment]::ProcessorCount
+    )
+
+    if ($null -eq $CurrentSnapshot -or $null -eq $PreviousSnapshot -or $ProcessorCount -le 0) {
+        return $null
+    }
+    if (-not [bool]$CurrentSnapshot.systemTimesCollected -or -not [bool]$PreviousSnapshot.systemTimesCollected) {
+        return $null
+    }
+    if ($null -eq $CurrentSnapshot.systemIdleSeconds -or $null -eq $CurrentSnapshot.systemKernelSeconds -or
+        $null -eq $CurrentSnapshot.systemUserSeconds -or $null -eq $PreviousSnapshot.systemIdleSeconds -or
+        $null -eq $PreviousSnapshot.systemKernelSeconds -or $null -eq $PreviousSnapshot.systemUserSeconds) {
+        return $null
+    }
+    if ($null -eq $CurrentSnapshot.subjectCpuSeconds -or $null -eq $PreviousSnapshot.subjectCpuSeconds) {
+        return $null
+    }
+    if ($null -eq $CurrentSnapshot.systemTimesCapturedAtUtc -or $null -eq $PreviousSnapshot.systemTimesCapturedAtUtc) {
+        return $null
+    }
+    $elapsedSec = ([datetime]$CurrentSnapshot.systemTimesCapturedAtUtc - [datetime]$PreviousSnapshot.systemTimesCapturedAtUtc).TotalSeconds
+    if ($elapsedSec -le 0) {
+        return $null
+    }
+
+    $idleDeltaSeconds = [double]$CurrentSnapshot.systemIdleSeconds - [double]$PreviousSnapshot.systemIdleSeconds
+    $kernelDeltaSeconds = [double]$CurrentSnapshot.systemKernelSeconds - [double]$PreviousSnapshot.systemKernelSeconds
+    $userDeltaSeconds = [double]$CurrentSnapshot.systemUserSeconds - [double]$PreviousSnapshot.systemUserSeconds
+    $busyDeltaSeconds = ($kernelDeltaSeconds - $idleDeltaSeconds) + $userDeltaSeconds
+    $subjectDeltaSeconds = [double]$CurrentSnapshot.subjectCpuSeconds - [double]$PreviousSnapshot.subjectCpuSeconds
+
+    $percent = 100.0 * ($busyDeltaSeconds - $subjectDeltaSeconds) / ($elapsedSec * $ProcessorCount)
+    [Math]::Max(0.0, [Math]::Min(100.0, $percent))
+}
+
+function Get-HostLoadVerdict {
+    # Three outcomes, never two: quiet (usable), exceeded (usable-as-evidence, unusable-as-signal),
+    # unknown (telemetry could not be collected -- treated as PROVISIONAL too, never as "quiet").
+    # PLAYBACK-MEASURE-HOST-LOAD-GATE-1: a run whose load exceeds the bar, or whose load could
+    # not be measured, is marked PROVISIONAL -- worth recording, never usable as a regression or
+    # acceptance signal. Never fail the run for this; only mark it.
+    #
+    # round 3: -During carries zero or more interior samples taken WHILE the leg was running. THE
+    # RULE is PEAK: the maximum of every measured interval's non-subject load decides
+    # exceeded/quiet, not an average or a "sustained for N samples" threshold. Peak is deliberate: a
+    # short interior burst is exactly the case bracketing misses and this round exists to catch, and
+    # averaging or requiring sustain would dilute or miss it again. The failure direction is
+    # asymmetric -- under-marking a loaded leg as clean is dangerous (a noisy fps number enters
+    # comparisons as trustworthy), while over-marking a quiet leg as provisional is cheap
+    # (provisional never fails a run, only removes it from comparisons) -- so peak is the
+    # conservative choice on both counts.
+    #
+    # round 4 (sol BLOCKER): before/after-plus-interior sampling only bounds the risk, it does not
+    # eliminate it. -SampleIntervalMs states the cadence the caller actually used for interior
+    # sampling. When the caller declares a cadence, this leg can be "quiet" ONLY if sampling was
+    # both enabled (SampleIntervalMs > 0) and it produced at least one interior sample -- otherwise
+    # the leg's coverage never rose above bracket-only and the verdict must say the sampling could
+    # not see a mid-leg burst (unknown/provisional), not "quiet".
+    #
+    # round 5 (sol MAJOR): -ObservedMaxSampleGapMs carries the REAL max gap between consecutive
+    # sample timestamps (computed by the caller from each snapshot's own capturedAtUtc), and
+    # coverage is unknown when that observed gap materially exceeds the declared cadence (1.5x
+    # slack for ordinary scheduling jitter, not a loophole).
+    #
+    # round 7 (both keys BLOCKER -- replace per-process accounting BY CONSTRUCTION): peak
+    # non-subject load is now computed HERE, centrally, as the maximum over every CONSECUTIVE pair's
+    # matched-window delta in the full before/during/after sequence (Get-HostLoadNonSubjectCpuLoadPercent),
+    # rather than requiring each call site to pre-attach a "nonSubjectCpuLoadPercent" property to
+    # each sample by hand. That hand-wiring was exactly astra's round-6 finding: the
+    # lastDuring-to-after interval (and, symmetrically, any interval a caller simply forgot to
+    # compute) never got a value at all and silently fell back to raw cpuLoadPercent. Centralizing
+    # the computation means every interval in the sequence is covered by construction -- there is no
+    # call site left that could forget one. $Before is the sequence's reference point and is never
+    # independently evaluated; every OTHER sample's value is the interval ending at it. When ANY
+    # interval's load could not be computed (Get-HostLoadNonSubjectCpuLoadPercent returned $null --
+    # see that function for the exact conditions), the whole leg is unknown; there is no raw
+    # cpuLoadPercent fallback anywhere in this path, per the round-7 brief.
+    param(
+        [object]$Before,
+        [object]$After,
+        [object[]]$During = @(),
+        [double]$Bar,
+        [int]$ProcessorCount = [Environment]::ProcessorCount,
+        [AllowNull()][System.Nullable[int]]$SampleIntervalMs = $null,
+        [AllowNull()][System.Nullable[int]]$ObservedMaxSampleGapMs = $null
+    )
+
+    $samples = @($Before) + @($During) + @($After)
+    $collectedSamples = @($samples | Where-Object { $_.collected })
+    $collectionUnknown = ($collectedSamples.Count -lt $samples.Count)
+    $samplingDeclared = ($null -ne $SampleIntervalMs)
+    $samplingDisabled = ($samplingDeclared -and $SampleIntervalMs -le 0)
+    $samplingBlind = ($samplingDeclared -and $SampleIntervalMs -gt 0 -and @($During).Count -eq 0)
+    $samplingSpacingExceeded = (
+        $samplingDeclared -and $SampleIntervalMs -gt 0 -and $null -ne $ObservedMaxSampleGapMs -and
+        [double]$ObservedMaxSampleGapMs -gt ([double]$SampleIntervalMs * 1.5))
+    $coverageUnknown = ($samplingDisabled -or $samplingBlind -or $samplingSpacingExceeded)
+
+    $intervalLoads = [System.Collections.Generic.List[double]]::new()
+    $intervalUnknown = $false
+    for ($sampleIndex = 1; $sampleIndex -lt $samples.Count; $sampleIndex++) {
+        $intervalPercent = Get-HostLoadNonSubjectCpuLoadPercent `
+            -CurrentSnapshot $samples[$sampleIndex] -PreviousSnapshot $samples[$sampleIndex - 1] `
+            -ProcessorCount $ProcessorCount
+        if ($null -eq $intervalPercent) {
+            $intervalUnknown = $true
+        } else {
+            $intervalLoads.Add([double]$intervalPercent)
+        }
+    }
+
+    $unknown = ($collectionUnknown -or $coverageUnknown -or $intervalUnknown)
+    $maxCpuLoadPercent = if ($intervalLoads.Count -gt 0) {
+        ($intervalLoads | Measure-Object -Maximum).Maximum
+    } else {
+        $null
+    }
+    $exceeded = ($null -ne $maxCpuLoadPercent -and $maxCpuLoadPercent -gt $Bar)
+    $state = if ($unknown) {
+        "unknown"
+    } elseif ($exceeded) {
+        "exceeded"
+    } else {
+        "quiet"
+    }
+    $provisional = ($unknown -or $exceeded)
+    $reason = if ($collectionUnknown) {
+        $uncollectedCount = @($samples).Count - $collectedSamples.Count
+        "Host load telemetry could not be collected for $uncollectedCount of $($samples.Count) " +
+            "snapshot(s) (before.collected=$($Before.collected), during=$($During.Count) " +
+            "sample(s), after.collected=$($After.collected)); an fps measurement under unknown " +
+            "host load is never usable as a regression or acceptance signal."
+    } elseif ($intervalUnknown) {
+        "Non-subject host load could not be computed for at least one sampling interval in this " +
+            "leg (system-wide CPU time or the subject's own CPU time was unreadable at one or both " +
+            "ends of that interval, or the subject exited mid-interval without a final reading); " +
+            "an fps measurement is never usable as a regression or acceptance signal without a " +
+            "trustworthy load figure for the interval it was measured over."
+    } elseif ($samplingDisabled) {
+        "Interior host-load sampling was disabled (-HostLoadSampleIntervalMs 0); a mid-leg burst " +
+            "confined between the before/after snapshots would be invisible to bracket-only " +
+            "monitoring, so this leg's coverage cannot certify quiet."
+    } elseif ($samplingBlind) {
+        "Interior host-load sampling was enabled at $($SampleIntervalMs)ms but collected zero " +
+            "samples during this leg (the leg ended before the first sampling tick); coverage " +
+            "never rose above bracket-only, so this leg's coverage cannot certify quiet."
+    } elseif ($samplingSpacingExceeded) {
+        "Interior host-load sampling was declared at $($SampleIntervalMs)ms but the observed " +
+            "max spacing between samples was $($ObservedMaxSampleGapMs)ms; coverage did not " +
+            "actually meet the declared cadence (a slow OnSample callback can widen the true " +
+            "blind interval beyond what was requested), so this leg's coverage cannot certify quiet."
+    } elseif ($exceeded) {
+        "Host non-subject CPU load reached $maxCpuLoadPercent% during this leg (peak across " +
+            "$($samples.Count - 1) measured interval(s) spanning before/after plus " +
+            "$($During.Count) interior sample(s)), exceeding the $Bar% bar; an fps number " +
+            "measured on a loaded host is not a property of the build."
+    } else {
+        $null
+    }
+
+    [pscustomobject]@{
+        bar = $Bar
+        maxCpuLoadPercent = $maxCpuLoadPercent
+        state = $state
+        provisional = [bool]$provisional
+        reason = $reason
+    }
 }
 
 function Get-ObjectPropertyValue {
@@ -1054,6 +1584,9 @@ $preLaunchSystemCpuSettle = Wait-SystemCpuSettle `
     -StableMs $SystemSettleCpuStableMs `
     -MaxMs $SystemSettleCpuMaxMs
 
+# -SubjectNotYetStarted also makes Get-HostLoadSnapshot take its system-times counters AFTER its evidence
+# collection, i.e. immediately before Process.Start below, so the first interval starts at leg start.
+$hostLoadBefore = Get-HostLoadSnapshot -TopProcessCount $HostLoadTopProcessCount -SubjectNotYetStarted
 $startUtc = [datetime]::UtcNow
 $process = [System.Diagnostics.Process]::Start($startInfo)
 $screenshotCapture = $null
@@ -1062,16 +1595,101 @@ $fpsStatusCropCapture = $null
 $colorArtifactScan = $null
 $stdoutTask = $process.StandardOutput.ReadToEndAsync()
 $stderrTask = $process.StandardError.ReadToEndAsync()
+# PLAYBACK-MEASURE-HOST-LOAD-GATE-1 round 3: before/after alone only BRACKET the leg -- a burst
+# confined to the interior reads quiet. $hostLoadDuringSamples collects zero or more interior
+# snapshots taken WHILE the leg runs.
+#
+# round 7 (sol + astra MAJOR -- "the new budget does not bound collection as a whole, and a
+# non-returning sampler prevents both timeout handling and receipt publication"): rounds 3-6 ran
+# this loop's polling AND its Get-HostLoadSnapshot calls INSIDE Wait-GuiSmokeProcessBounded's
+# module scope via an -OnSample callback -- a callback that never returned could never be
+# preempted from there, and the module had to guess at "too slow" using an unrelated
+# -SampleIntervalMs multiplier. With item 1 retiring the per-process enumeration, a
+# Get-HostLoadSnapshot call is now bounded entirely by its own CIM/syscall timeouts (each CIM call
+# already carries -OperationTimeoutSec; GetSystemTimes and the subject handle read are direct,
+# unbounded-loop-free reads), so the chunk-and-sample loop moves HERE, into the caller's OWN scope,
+# with no callback indirection at all -- Wait-GuiSmokeProcessBounded (below) goes back to being
+# exactly what its round-3 default branch always was: a single bounded wait plus the
+# stream-drain/kill-tree finalize, nothing else. If Get-HostLoadSnapshot itself somehow ran long
+# (a slow CIM query near its own timeout ceiling), THIS loop is still bounded overall by
+# $effectiveProcessTimeoutMs -- $hostLoadRemainingMs is recomputed every iteration, so a slow
+# sample simply shortens (never lengthens past its own worst case) how much chunked-wait budget is
+# left, and the loop still terminates.
+#
+# round 8 (sol MAJOR item 2 -- "evidence-only enumeration runs inside every measured leg,
+# unbounded"): every interior call now passes -SkipEvidenceCollection, so a during-leg sample is
+# EXACTLY the GetSystemTimes syscall plus the subject-handle read -- no CIM round-trip (even a
+# bounded one still perturbed the leg it was measuring), no Get-Process/Sort-Object at all (the
+# one truly unbounded call in the prior shape). Bound on one during-leg sample: two direct,
+# loop-free reads with no I/O and no timeout surface to hang on. Before/after brackets still call
+# without the switch and keep full CIM/Get-Process evidence for the receipt. At the default
+# 4000ms cadence a 24-30s leg still takes ~6-7 interior samples, now at a cost too small to
+# meaningfully measure (no round-trip of any kind), and adding no extra wall-clock time at all
+# (the sampling happens inside intervals the code was already spending blocked in WaitForExit).
+$hostLoadDuringSamples = [System.Collections.Generic.List[object]]::new()
+if ($HostLoadSampleIntervalMs -gt 0) {
+    $hostLoadSampleLoopStopwatch = [System.Diagnostics.Stopwatch]::StartNew()
+    while ($true) {
+        $hostLoadRemainingMs = $effectiveProcessTimeoutMs - [int]$hostLoadSampleLoopStopwatch.ElapsedMilliseconds
+        if ($hostLoadRemainingMs -le 0) {
+            break
+        }
+        $hostLoadChunkMs = [Math]::Min($HostLoadSampleIntervalMs, $hostLoadRemainingMs)
+        if ($process.WaitForExit($hostLoadChunkMs)) {
+            break
+        }
+        $newSample = Get-HostLoadSnapshot -TopProcessCount $HostLoadTopProcessCount -SubjectProcess $process `
+            -SkipEvidenceCollection
+        $hostLoadDuringSamples.Add($newSample)
+    }
+    $hostLoadSampleLoopElapsedMs = [int]$hostLoadSampleLoopStopwatch.ElapsedMilliseconds
+}
+else {
+    $hostLoadSampleLoopElapsedMs = 0
+}
+# Whatever wall-clock time the sampling loop already spent waiting counts against the overall
+# process timeout budget -- the finalize wait below only needs to cover what's left. The 1ms floor
+# never actually extends an already-finished leg: WaitForExit on an already-exited process returns
+# TRUE immediately regardless of the timeout value passed to it.
+$hostLoadFinalizeTimeoutMs = [Math]::Max(1, $effectiveProcessTimeoutMs - $hostLoadSampleLoopElapsedMs)
 $processBoundary = Wait-GuiSmokeProcessBounded `
     -Process $process `
     -StandardOutputTask $stdoutTask `
     -StandardErrorTask $stderrTask `
-    -TimeoutMs $effectiveProcessTimeoutMs
+    -TimeoutMs $hostLoadFinalizeTimeoutMs
 $stdout = $processBoundary.stdout
 $stderr = $processBoundary.stderr
 $processExitCode = [int]$processBoundary.exitCode
 $captureBindingFailures += @($processBoundary.failures)
 $endUtc = [datetime]::UtcNow
+# round 7: -SubjectProcess is now passed to the AFTER snapshot too (it previously was not passed
+# at all). Under the new interval-based verdict (Get-HostLoadVerdict computes each interval's
+# non-subject load itself -- see that function), the FINAL interval (last-during-or-before ->
+# after) needs the after-snapshot's own subjectCpuSeconds reading exactly the same way every
+# interior sample already needed its own; omitting it would have made that last interval
+# permanently unknown. $process's own handle (not a fresh Get-Process -Id lookup) stays readable
+# here even though the subject has typically already exited/been killed by this point -- see
+# Get-HostLoadSnapshot's own comment on -SubjectProcess for why.
+$hostLoadAfter = Get-HostLoadSnapshot -TopProcessCount $HostLoadTopProcessCount -SubjectProcess $process
+# round 5 (sol MAJOR): the real upper bound on the blind interval is the actual spacing between
+# consecutive sample TIMESTAMPS, not the declared -HostLoadSampleIntervalMs -- derived here
+# directly from each snapshot's own capturedAtUtc (set by Get-HostLoadSnapshot itself) across the
+# full before/during/after sequence, so a slow sample (or any other source of drift between
+# chunked waits) shows up honestly instead of being silently absorbed into a receipt field that
+# only ever echoed the request.
+$hostLoadSampleSequence = @($hostLoadBefore) + @($hostLoadDuringSamples) + @($hostLoadAfter)
+$hostLoadObservedMaxSampleGapMs = $null
+for ($i = 1; $i -lt $hostLoadSampleSequence.Count; $i++) {
+    $gapMs = ([datetime]$hostLoadSampleSequence[$i].capturedAtUtc -
+        [datetime]$hostLoadSampleSequence[$i - 1].capturedAtUtc).TotalMilliseconds
+    if ($null -eq $hostLoadObservedMaxSampleGapMs -or $gapMs -gt $hostLoadObservedMaxSampleGapMs) {
+        $hostLoadObservedMaxSampleGapMs = $gapMs
+    }
+}
+$hostLoadVerdict = Get-HostLoadVerdict -Before $hostLoadBefore -After $hostLoadAfter `
+    -During @($hostLoadDuringSamples) -Bar $HostLoadCpuPercentBar `
+    -SampleIntervalMs $HostLoadSampleIntervalMs `
+    -ObservedMaxSampleGapMs $(if ($null -ne $hostLoadObservedMaxSampleGapMs) { [int][Math]::Ceiling($hostLoadObservedMaxSampleGapMs) } else { $null })
 
 if ($CaptureScreenshot) {
     if (-not (Test-Path -LiteralPath $screenshotPath)) {
@@ -1094,7 +1712,10 @@ if ($CaptureScreenshot) {
             $colorArtifactScan = Get-ScreenshotColorArtifactScan -Path $screenshotPath
         }
         catch {
-            $captureBindingFailures += "GUI smoke screenshot validation failed: $($_.Exception.Message)"
+            # round 8 (fable minor 2): type name only, matching every other sanitized catch in this
+            # file -- raw exception text can embed a path or host identifier beyond what this
+            # receipt already discloses deliberately (e.g. screenshotItem.FullName above).
+            $captureBindingFailures += "GUI smoke screenshot validation failed: $($_.Exception.GetType().Name)"
         }
     }
 }
@@ -1120,7 +1741,8 @@ if (-not [string]::IsNullOrWhiteSpace($windowScreenshotPath)) {
             }
         }
         catch {
-            $captureBindingFailures += "GUI smoke window-screenshot validation failed: $($_.Exception.Message)"
+            # round 8 (fable minor 2): type name only, same rationale as the screenshot catch above.
+            $captureBindingFailures += "GUI smoke window-screenshot validation failed: $($_.Exception.GetType().Name)"
         }
     }
 }
@@ -1849,6 +2471,23 @@ $result = [pscustomobject]@{
         note = "sustainedBottomLeftGuiFps/visibleBottomLeftGuiFps/screenshotGuiStatusValue is the bottom-left Playback FPS label visible after the requested playback duration in screenshot.windowCapture and enlarged in playbackFps.sustainedBottomLeftGuiProof; guiStatusValue is the later end-of-run summary sample and can differ; smokePresentedFps and smokeTimelineFps are smoke-run telemetry over the full requested duration, and per-stage FPS-equivalent values are 1000 / stage_ms."
     }
     playbackArtifacts = $playbackArtifacts
+    hostLoad = [pscustomobject]@{
+        schema = "mlvapp-gui-smoke-host-load.v1"
+        bar = [pscustomobject]@{ cpuLoadPercent = $HostLoadCpuPercentBar }
+        before = $hostLoadBefore
+        during = @($hostLoadDuringSamples)
+        duringSampleIntervalMs = $HostLoadSampleIntervalMs
+        # round 5 (sol MAJOR): duringSampleIntervalMs above is the REQUESTED cadence only, never
+        # an upper bound -- observedMaxSampleGapMs is the actual max spacing between consecutive
+        # sample timestamps (before/during/after), which is what Get-HostLoadVerdict's coverage
+        # rule now checks against the declared cadence (see -ObservedMaxSampleGapMs).
+        observedMaxSampleGapMs = $hostLoadObservedMaxSampleGapMs
+        after = $hostLoadAfter
+        maxCpuLoadPercent = $hostLoadVerdict.maxCpuLoadPercent
+        state = $hostLoadVerdict.state
+        provisional = [bool]$hostLoadVerdict.provisional
+        reason = $hostLoadVerdict.reason
+    }
     process = [pscustomobject]@{
         id = $process.Id
         exitCode = $processExitCode

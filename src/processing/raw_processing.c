@@ -145,6 +145,7 @@ static MLV_PROCESSING_THREAD_LOCAL int g_processing_last_shadows_highlights_quar
 static MLV_PROCESSING_THREAD_LOCAL int g_processing_last_shadows_highlights_halfres_downsample_completed = 0;
 static MLV_PROCESSING_THREAD_LOCAL int g_processing_last_shadows_highlights_halfres_rbf_completed = 0;
 static MLV_PROCESSING_THREAD_LOCAL int g_processing_last_shadows_highlights_halfres_upsample_completed = 0;
+static MLV_PROCESSING_THREAD_LOCAL int g_processing_last_shadows_highlights_fullres_completed = 0;
 /* Monotonic per-call counters proving the SH blur pre-pass / filter actually
  * executed. A wall-clock Milliseconds() field can legitimately read 0.0 when
  * the stage runs faster than the timer resolves, so it must never be the
@@ -429,6 +430,7 @@ void processingResetLastTimingTelemetry(void)
     g_processing_last_shadows_highlights_halfres_downsample_completed = 0;
     g_processing_last_shadows_highlights_halfres_rbf_completed = 0;
     g_processing_last_shadows_highlights_halfres_upsample_completed = 0;
+    g_processing_last_shadows_highlights_fullres_completed = 0;
     g_processing_last_shadows_highlights_prep_run_count = 0;
     g_processing_last_shadows_highlights_filter_run_count = 0;
     g_processing_last_shadows_highlights_rbf_total_ms = 0.0;
@@ -1668,6 +1670,7 @@ static void processing_compute_shadows_highlights_blur( processingObject_t * pro
             g_processing_last_shadows_highlights_filter_fullres_ms +=
                 (omp_get_wtime() - fullres_rbf_start) * 1000.0;
         }
+        g_processing_last_shadows_highlights_fullres_completed = 1;
     }
     else
     {
@@ -1684,6 +1687,7 @@ static void processing_compute_shadows_highlights_blur( processingObject_t * pro
             g_processing_last_shadows_highlights_filter_fullres_ms +=
                 (omp_get_wtime() - fullres_rbf_start) * 1000.0;
         }
+        g_processing_last_shadows_highlights_fullres_completed = 1;
     }
     processing_capture_last_shadows_highlights_rbf_timing();
     g_processing_last_shadows_highlights_filter_ms +=
@@ -1728,6 +1732,7 @@ int processingRefreshShadowsHighlightsBlurFromRgb16(processingObject_t * process
     g_processing_last_shadows_highlights_halfres_downsample_completed = 0;
     g_processing_last_shadows_highlights_halfres_rbf_completed = 0;
     g_processing_last_shadows_highlights_halfres_upsample_completed = 0;
+    g_processing_last_shadows_highlights_fullres_completed = 0;
     g_processing_last_shadows_highlights_prep_run_count = 0;
     g_processing_last_shadows_highlights_filter_run_count = 0;
     g_processing_last_shadows_highlights_rbf_total_ms = 0.0;
@@ -4292,6 +4297,11 @@ int processingGetLastShadowsHighlightsHalfresRbfCompletedForTesting(void)
 int processingGetLastShadowsHighlightsHalfresUpsampleCompletedForTesting(void)
 {
     return g_processing_last_shadows_highlights_halfres_upsample_completed;
+}
+
+int processingGetLastShadowsHighlightsFullresCompletedForTesting(void)
+{
+    return g_processing_last_shadows_highlights_fullres_completed;
 }
 
 int processingGetLastShadowsHighlightsPrepRunCountForTesting(void)
