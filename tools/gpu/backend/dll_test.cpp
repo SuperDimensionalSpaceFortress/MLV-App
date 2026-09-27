@@ -483,6 +483,35 @@ int main(int argc, char** argv)
         compare_to_oracle("ASYNC_H2D exact", preuploaded_result,
                           h_out, n, (size_t)clip.width);
 
+    /* ---- 6a. cross-frame token mismatch: preupload 41, run 42, SAME bytes.
+     * The staged upload must not be consumed for a different frame even when
+     * the bytes are byte-identical to what was staged -- the frame token is
+     * the sole admission gate, not a content hash. Fallback output must
+     * match the plain synchronous run on the same bytes exactly. */
+    uint16_t* cross_frame_result = (uint16_t*)malloc(n * sizeof(uint16_t));
+    memset(cross_frame_result, 0, n * sizeof(uint16_t));
+    rc = f_run_preuploaded(b, 42, &frame, h_in,
+                          IGPU_OUT_CPU16, cross_frame_result, 0);
+    if (rc != 0) {
+        fprintf(stderr, "[dll_test] run_preuploaded(cross-frame) returned %d\n", rc);
+        return 4;
+    }
+    igpu_recon_preupload_status_t cross_frame_status;
+    memset(&cross_frame_status, 0, sizeof(cross_frame_status));
+    if (f_preupload_status(b, &cross_frame_status) != 0 ||
+        cross_frame_status.accepted ||
+        cross_frame_status.used ||
+        cross_frame_status.exact_match ||
+        memcmp(result, cross_frame_result, n * sizeof(uint16_t)) != 0) {
+        fprintf(stderr,
+                "[dll_test] cross-frame preupload was not rejected accepted=%d used=%d exact=%d\n",
+                cross_frame_status.accepted,
+                cross_frame_status.used,
+                cross_frame_status.exact_match);
+        return 4;
+    }
+    printf("[dll_test] async-H2D cross-frame (41 staged, 42 run) rejected + fell back correctly PASS\n");
+
     uint16_t* mutated = (uint16_t*)malloc(n * sizeof(uint16_t));
     uint16_t* sync_mutated = (uint16_t*)malloc(n * sizeof(uint16_t));
     uint16_t* fallback_mutated = (uint16_t*)malloc(n * sizeof(uint16_t));
