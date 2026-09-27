@@ -118,6 +118,13 @@ typedef struct
     double upload_wait_ms;
 } llrpGpuPlaybackReconPreuploadStatus_t;
 
+/* Render-worker-thread-only: the preupload status of whichever recon call
+ * applyLLRawProcObjectWorker() itself just made on THIS thread (retained-
+ * device or synchronous-CPU16 playback path). Same-thread producer and
+ * consumer -- see the comment on the backing TLS in llrawproc.c. */
+int llrpGpuPlaybackReconLastPreuploadStatusForTesting(
+    llrpGpuPlaybackReconPreuploadStatus_t * status);
+
 typedef struct
 {
     int available;

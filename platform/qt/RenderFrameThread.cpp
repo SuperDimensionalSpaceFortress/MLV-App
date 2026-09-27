@@ -495,21 +495,69 @@ void insertGpuPlaybackReconRunTelemetry( QJsonObject &target )
         llrpGpuPlaybackReconLastRunRcForTesting() );
     /* gpu_playback_recon_async_h2d_* used to be read here via
      * llrpGpuPlaybackReconGetLastPreuploadStatus(), an ambient
-     * MLV_THREAD_LOCAL written inside llrawproc_gpu_recon_run_backend().
-     * That status is written on whichever thread actually calls the GPU
-     * backend for THIS frame's texture presentation -- typically the GUI/GL
-     * thread, asynchronously, well after this function returns on the
-     * render worker thread -- so a same-thread read here could only ever
-     * observe a stale or zeroed value (the exact env_enabled=true,
-     * everything-else-zero fingerprint this was rewritten to fix; see
+     * MLV_THREAD_LOCAL written inside llrawproc_gpu_recon_run_backend() on
+     * whichever thread actually called the GPU backend for THIS frame's
+     * texture presentation -- typically the GUI/GL thread, asynchronously,
+     * well after this function returns on the render worker thread -- so a
+     * same-thread read here could only ever observe a stale or zeroed value
+     * (the exact env_enabled=true, everything-else-zero fingerprint this was
+     * rewritten to fix; see
      * .claude-state/project-memory/async-h2d-frameid-crosses-a-subsystem-boundary-20260905.md).
-     * The real, per-run status is now delivered as an explicit OUT param
-     * (llrpGpuPlaybackReconTiming_t::preupload) to whichever call site
-     * actually invoked the backend, and inserted into telemetry from there
-     * -- see MainWindow::presentPlaybackPreparedFrame(). */
+     *
+     * llrpGpuPlaybackReconLastPreuploadStatusForTesting() below is NOT that
+     * same bug reintroduced: it is written by applyLLRawProcObjectWorker()
+     * (the retained-device and synchronous-CPU16 playback paths) on THIS
+     * same render worker thread, and read right here, immediately after that
+     * call returns, still on this thread. When this frame instead presents
+     * through MainWindow's own GL-texture-present call (a separate backend
+     * invocation on the GUI thread), that call's real, per-run status is
+     * delivered as an explicit OUT param (llrpGpuPlaybackReconTiming_t::
+     * preupload) and inserted from there instead -- see
+     * MainWindow::presentPlaybackPreparedFrame(), which only overwrites these
+     * same-named fields when its own call actually ran the backend. */
     target.insert(
         QStringLiteral("gpu_playback_recon_async_h2d_env_enabled"),
         gpuPlaybackReconAsyncH2dRequested() );
+    llrpGpuPlaybackReconPreuploadStatus_t preupload;
+    memset( &preupload, 0, sizeof( preupload ) );
+    const bool preuploadAvailable =
+        llrpGpuPlaybackReconLastPreuploadStatusForTesting( &preupload ) != 0;
+    if( preuploadAvailable )
+    {
+        target.insert(
+            QStringLiteral("gpu_playback_recon_async_h2d_available"),
+            true );
+        target.insert(
+            QStringLiteral("gpu_playback_recon_async_h2d_accepted"),
+            preupload.accepted != 0 );
+        target.insert(
+            QStringLiteral("gpu_playback_recon_async_h2d_used"),
+            preupload.used != 0 );
+        target.insert(
+            QStringLiteral("gpu_playback_recon_async_h2d_exact_match"),
+            preupload.exact_match != 0 );
+        target.insert(
+            QStringLiteral("gpu_playback_recon_async_h2d_submitted_while_prior_run_active"),
+            preupload.submitted_while_prior_run_active != 0 );
+        target.insert(
+            QStringLiteral("gpu_playback_recon_async_h2d_ready_before_run"),
+            preupload.ready_before_run != 0 );
+        target.insert(
+            QStringLiteral("gpu_playback_recon_async_h2d_host_staging_ms"),
+            preupload.host_staging_ms );
+        target.insert(
+            QStringLiteral("gpu_playback_recon_async_h2d_upload_ms"),
+            preupload.upload_ms );
+        target.insert(
+            QStringLiteral("gpu_playback_recon_async_h2d_upload_wait_ms"),
+            preupload.upload_wait_ms );
+    }
+    else
+    {
+        target.insert(
+            QStringLiteral("gpu_playback_recon_async_h2d_available"),
+            false );
+    }
 }
 
 bool gpuPlaybackReconNoReadbackOutputValidationEnabled()

@@ -310,6 +310,15 @@ static MLV_THREAD_LOCAL uint16_t *g_llrawproc_gpu_playback_last_input_bayer16 = 
 static MLV_THREAD_LOCAL size_t g_llrawproc_gpu_playback_last_input_words = 0;
 static MLV_THREAD_LOCAL llrpGpuPlaybackRetainedDeviceBayer16_t
     g_llrawproc_gpu_playback_last_retained_device_bayer16 = {0};
+/* Populated ONLY from the timing_out of a run_backend() call made HERE, on
+ * the render worker thread, inside applyLLRawProcObjectWorker (the retained-
+ * device and synchronous-CPU16 playback paths below) -- read back on the
+ * SAME thread, synchronously, by insertGpuPlaybackReconRunTelemetry()
+ * (RenderFrameThread.cpp) right after this function returns. This is NOT the
+ * cross-thread ambient token removed elsewhere in this file: writer and
+ * reader are provably the same thread for the lifetime of one frame. */
+static MLV_THREAD_LOCAL llrpGpuPlaybackReconPreuploadStatus_t
+    g_llrawproc_gpu_playback_last_preupload_status = {0};
 
 static void llrawproc_gpu_export_reset_last_run_state(void)
 {
@@ -355,6 +364,9 @@ static void llrawproc_gpu_playback_reset_last_run_state(void)
     memset(&g_llrawproc_gpu_playback_last_retained_device_bayer16,
            0,
            sizeof(g_llrawproc_gpu_playback_last_retained_device_bayer16));
+    memset(&g_llrawproc_gpu_playback_last_preupload_status,
+           0,
+           sizeof(g_llrawproc_gpu_playback_last_preupload_status));
 }
 
 static int llrawproc_gpu_playback_take_last_input_bayer16(uint16_t * owned_input,
@@ -494,6 +506,21 @@ int llrpGpuPlaybackReconLastPrepareOnlyForTesting(void);
 int llrpGpuPlaybackReconLastPrepareOnlyForTesting(void)
 {
     return g_llrawproc_gpu_playback_last_prepare_only;
+}
+
+/* Render-worker-thread-only preupload status: see the comment on
+ * g_llrawproc_gpu_playback_last_preupload_status above. Despite the
+ * "-ForTesting" naming convention shared with this file's other same-thread
+ * accessors, this one has a real caller: RenderFrameThread.cpp reads it,
+ * same-thread, immediately after applyLLRawProcObjectWorker() returns. */
+int llrpGpuPlaybackReconLastPreuploadStatusForTesting(
+    llrpGpuPlaybackReconPreuploadStatus_t * status);
+int llrpGpuPlaybackReconLastPreuploadStatusForTesting(
+    llrpGpuPlaybackReconPreuploadStatus_t * status)
+{
+    if(!status) return 0;
+    *status = g_llrawproc_gpu_playback_last_preupload_status;
+    return status->available;
 }
 
 static void llrawproc_gpu_playback_public_state_from_dualiso(
@@ -859,12 +886,292 @@ static void llrawproc_gpu_export_backend_mark_unavailable(llrawprocGpuExportBack
     snprintf(g->dll_path, sizeof(g->dll_path), "%s", dll_path ? dll_path : "");
 }
 
+/* ---- In-process fake backend: an executable, GPU-less consume-side proof ----
+ *
+ * This board has no NVIDIA GPU, so igpu_recon_cuda.dll cannot load here (see
+ * tools/gpu/backend/dll_test.cpp). The real consuming logic under test --
+ * llrawproc_gpu_recon_run_backend()'s token match/mismatch/fallback decision
+ * -- lives entirely on the C side of the igpu_recon_backend seam, so a fake
+ * implementation of that same seam (bypassing LoadLibrary, installed
+ * directly into g_llrawproc_gpu_export_backend's function-pointer table)
+ * exercises the identical decision code a real CUDA backend would, without
+ * any device. This is the "seam at the token-match function" alternative to
+ * a real fake DLL. */
+static int g_llrawproc_fake_gpu_backend_installed = 0;
+static char g_llrawproc_fake_gpu_backend_sentinel;
+static igpu_recon_clip_t g_llrawproc_fake_gpu_backend_clip = {0};
+static uint64_t g_llrawproc_fake_gpu_backend_preupload_token = 0;
+static uint16_t * g_llrawproc_fake_gpu_backend_preupload_bytes = NULL;
+static size_t g_llrawproc_fake_gpu_backend_preupload_byte_count = 0;
+static int g_llrawproc_fake_gpu_backend_preupload_submitted_while_prior_run_active = 0;
+static igpu_recon_preupload_status_t g_llrawproc_fake_gpu_backend_last_status = {0};
+static uint16_t * g_llrawproc_fake_gpu_backend_last_device_output = NULL;
+static int g_llrawproc_fake_gpu_backend_last_device_width = 0;
+static int g_llrawproc_fake_gpu_backend_last_device_height = 0;
+
+/* Deterministic, invertible-by-inspection stand-in for real reconstruction:
+ * output[i] = input[i] + 1. Its ONLY job is to let a test tell "the fake ran
+ * on THESE bytes" apart from "the fake ran on THOSE bytes" -- exact numeric
+ * behavior is not the point. */
+static void llrawproc_fake_gpu_backend_transform(const uint16_t * in,
+                                                 uint16_t * out,
+                                                 size_t pixel_count)
+{
+    size_t i;
+    for(i = 0; i < pixel_count; ++i)
+    {
+        out[i] = (uint16_t)(in[i] + 1u);
+    }
+}
+
+static int llrawproc_fake_gpu_backend_abi_version(igpu_recon_backend * b)
+{
+    (void)b;
+    return IGPU_RECON_ABI_VERSION;
+}
+
+static const char * llrawproc_fake_gpu_backend_describe(igpu_recon_backend * b)
+{
+    (void)b;
+    return "fake-test-backend (no GPU, C-seam only)";
+}
+
+static int llrawproc_fake_gpu_backend_set_clip(igpu_recon_backend * b,
+                                               const igpu_recon_clip_t * clip)
+{
+    (void)b;
+    if(!clip) return -1;
+    g_llrawproc_fake_gpu_backend_clip = *clip;
+    return 0;
+}
+
+static int llrawproc_fake_gpu_backend_set_luts(igpu_recon_backend * b,
+                                               const igpu_recon_luts_t * luts)
+{
+    (void)b;
+    (void)luts;
+    return 0;
+}
+
+static int llrawproc_fake_gpu_backend_run(igpu_recon_backend * b,
+                                          const igpu_recon_frame_t * frame,
+                                          const uint16_t * in_bayer14,
+                                          igpu_recon_out_kind out_kind,
+                                          uint16_t * out_bayer16,
+                                          unsigned int gl_texture)
+{
+    const size_t pixel_count = (size_t)g_llrawproc_fake_gpu_backend_clip.width
+        * (size_t)g_llrawproc_fake_gpu_backend_clip.height;
+    (void)b;
+    (void)frame;
+    (void)gl_texture;
+    if(!in_bayer14 || pixel_count == 0) return -1;
+    if(out_kind == IGPU_OUT_CPU16)
+    {
+        if(!out_bayer16) return -1;
+        llrawproc_fake_gpu_backend_transform(in_bayer14, out_bayer16, pixel_count);
+    }
+    else if(out_kind == IGPU_OUT_DEVICE_BAYER16)
+    {
+        uint16_t * device_output = (uint16_t *)realloc(
+            g_llrawproc_fake_gpu_backend_last_device_output,
+            pixel_count * sizeof(uint16_t));
+        if(!device_output) return -1;
+        g_llrawproc_fake_gpu_backend_last_device_output = device_output;
+        llrawproc_fake_gpu_backend_transform(
+            in_bayer14, device_output, pixel_count);
+        g_llrawproc_fake_gpu_backend_last_device_width =
+            g_llrawproc_fake_gpu_backend_clip.width;
+        g_llrawproc_fake_gpu_backend_last_device_height =
+            g_llrawproc_fake_gpu_backend_clip.height;
+    }
+    /* IGPU_OUT_GL_TEXTURE: no real GL context on this board. Succeeding
+     * without touching gl_texture is sufficient to exercise the token
+     * match/mismatch decision above this seam; pixel-level GL parity is a
+     * GPU-leg-only proof (see round summary). */
+    return 0;
+}
+
+static int llrawproc_fake_gpu_backend_preupload_frame(igpu_recon_backend * b,
+                                                      uint64_t frame_token,
+                                                      const uint16_t * in_bayer14,
+                                                      size_t input_bytes,
+                                                      int submitted_while_prior_run_active)
+{
+    uint16_t * copy;
+    (void)b;
+    if(!in_bayer14 || input_bytes == 0) return -1;
+    copy = (uint16_t *)malloc(input_bytes);
+    if(!copy) return -1;
+    memcpy(copy, in_bayer14, input_bytes);
+    free(g_llrawproc_fake_gpu_backend_preupload_bytes);
+    g_llrawproc_fake_gpu_backend_preupload_bytes = copy;
+    g_llrawproc_fake_gpu_backend_preupload_byte_count = input_bytes;
+    g_llrawproc_fake_gpu_backend_preupload_token = frame_token;
+    g_llrawproc_fake_gpu_backend_preupload_submitted_while_prior_run_active =
+        submitted_while_prior_run_active;
+    return 0;
+}
+
+static int llrawproc_fake_gpu_backend_run_preuploaded(igpu_recon_backend * b,
+                                                      uint64_t frame_token,
+                                                      const igpu_recon_frame_t * frame,
+                                                      const uint16_t * in_bayer14,
+                                                      igpu_recon_out_kind out_kind,
+                                                      uint16_t * out_bayer16,
+                                                      unsigned int gl_texture)
+{
+    const size_t pixel_count = (size_t)g_llrawproc_fake_gpu_backend_clip.width
+        * (size_t)g_llrawproc_fake_gpu_backend_clip.height;
+    const size_t expected_bytes = pixel_count * sizeof(uint16_t);
+    const int token_matches =
+        g_llrawproc_fake_gpu_backend_preupload_token != 0
+        && g_llrawproc_fake_gpu_backend_preupload_token == frame_token;
+    const int bytes_match =
+        token_matches
+        && g_llrawproc_fake_gpu_backend_preupload_byte_count == expected_bytes
+        && in_bayer14 != NULL
+        && memcmp(g_llrawproc_fake_gpu_backend_preupload_bytes,
+                  in_bayer14,
+                  expected_bytes) == 0;
+
+    memset(&g_llrawproc_fake_gpu_backend_last_status,
+           0,
+           sizeof(g_llrawproc_fake_gpu_backend_last_status));
+    g_llrawproc_fake_gpu_backend_last_status.accepted = token_matches ? 1 : 0;
+    g_llrawproc_fake_gpu_backend_last_status.used = bytes_match ? 1 : 0;
+    g_llrawproc_fake_gpu_backend_last_status.exact_match = bytes_match ? 1 : 0;
+    g_llrawproc_fake_gpu_backend_last_status.submitted_while_prior_run_active =
+        g_llrawproc_fake_gpu_backend_preupload_submitted_while_prior_run_active;
+    g_llrawproc_fake_gpu_backend_last_status.ready_before_run = 1;
+    g_llrawproc_fake_gpu_backend_last_status.host_staging_ms = 1.0;
+    g_llrawproc_fake_gpu_backend_last_status.upload_ms = 2.0;
+    g_llrawproc_fake_gpu_backend_last_status.upload_wait_ms = 0.5;
+
+    /* Real backends run on the current live bytes regardless of whether the
+     * preupload was used -- a rejected/mismatched preupload falls back to
+     * the ordinary synchronous path, it does not fail the call. This is what
+     * lets a test assert output parity between the preuploaded and
+     * synchronous paths on a mismatch. */
+    return llrawproc_fake_gpu_backend_run(
+        b, frame, in_bayer14, out_kind, out_bayer16, gl_texture);
+}
+
+static int llrawproc_fake_gpu_backend_last_preupload_status(
+    igpu_recon_backend * b, igpu_recon_preupload_status_t * status)
+{
+    (void)b;
+    if(!status) return -1;
+    *status = g_llrawproc_fake_gpu_backend_last_status;
+    return 0;
+}
+
+static int llrawproc_fake_gpu_backend_last_timing(igpu_recon_backend * b,
+                                                   igpu_recon_timing_t * t)
+{
+    (void)b;
+    if(!t) return -1;
+    memset(t, 0, sizeof(*t));
+    t->upload_ms = 1.0;
+    t->kernel_ms = 1.0;
+    t->download_ms = 1.0;
+    t->total_ms = 3.0;
+    return 0;
+}
+
+static int llrawproc_fake_gpu_backend_last_device_output(
+    igpu_recon_backend * b,
+    const uint16_t ** device_bayer16,
+    int * width,
+    int * height)
+{
+    (void)b;
+    if(!g_llrawproc_fake_gpu_backend_last_device_output) return -1;
+    if(device_bayer16) *device_bayer16 = g_llrawproc_fake_gpu_backend_last_device_output;
+    if(width) *width = g_llrawproc_fake_gpu_backend_last_device_width;
+    if(height) *height = g_llrawproc_fake_gpu_backend_last_device_height;
+    return 0;
+}
+
+static int llrawproc_fake_gpu_backend_retain_last_device_output(
+    igpu_recon_backend * b,
+    const uint16_t ** device_bayer16,
+    int * width,
+    int * height,
+    uint64_t * token)
+{
+    const int rc = llrawproc_fake_gpu_backend_last_device_output(
+        b, device_bayer16, width, height);
+    if(rc != 0) return rc;
+    if(token) *token = 1;
+    return 0;
+}
+
+static int llrawproc_fake_gpu_backend_release_retained_device_output(
+    igpu_recon_backend * b, uint64_t token)
+{
+    (void)b;
+    (void)token;
+    return 0;
+}
+
+/* Test-only hook: install (1) or remove (0) the fake backend above in place
+ * of any real DLL-loaded backend. Installing releases whatever backend is
+ * currently configured (real or fake); removing releases the fake and
+ * leaves the next call to load a real backend normally. */
+int llrpInstallFakeGpuPlaybackReconBackendForTesting(int install);
+int llrpInstallFakeGpuPlaybackReconBackendForTesting(int install)
+{
+    llrawprocGpuExportBackend_t * g = &g_llrawproc_gpu_export_backend;
+    pthread_mutex_lock(&g_llrawproc_gpu_recon_backend_mutex);
+    llrawproc_gpu_export_backend_release(g);
+    free(g_llrawproc_fake_gpu_backend_preupload_bytes);
+    g_llrawproc_fake_gpu_backend_preupload_bytes = NULL;
+    g_llrawproc_fake_gpu_backend_preupload_byte_count = 0;
+    g_llrawproc_fake_gpu_backend_preupload_token = 0;
+    free(g_llrawproc_fake_gpu_backend_last_device_output);
+    g_llrawproc_fake_gpu_backend_last_device_output = NULL;
+    g_llrawproc_fake_gpu_backend_last_device_width = 0;
+    g_llrawproc_fake_gpu_backend_last_device_height = 0;
+    memset(&g_llrawproc_fake_gpu_backend_clip, 0, sizeof(g_llrawproc_fake_gpu_backend_clip));
+    memset(&g_llrawproc_fake_gpu_backend_last_status, 0, sizeof(g_llrawproc_fake_gpu_backend_last_status));
+    if(install)
+    {
+        g->backend = (igpu_recon_backend *)&g_llrawproc_fake_gpu_backend_sentinel;
+        g->attempted = 1;
+        g->unavailable = 0;
+        snprintf(g->backend_name, sizeof(g->backend_name), "%s", "fake-test-backend");
+        snprintf(g->dll_path, sizeof(g->dll_path), "%s", "<in-process-fake>");
+        snprintf(g->dll_resolved_path, sizeof(g->dll_resolved_path), "%s", "<in-process-fake>");
+        g->abi_version = llrawproc_fake_gpu_backend_abi_version;
+        g->describe = llrawproc_fake_gpu_backend_describe;
+        g->set_clip = llrawproc_fake_gpu_backend_set_clip;
+        g->set_luts = llrawproc_fake_gpu_backend_set_luts;
+        g->run = llrawproc_fake_gpu_backend_run;
+        g->preupload_frame = llrawproc_fake_gpu_backend_preupload_frame;
+        g->run_preuploaded = llrawproc_fake_gpu_backend_run_preuploaded;
+        g->last_preupload_status = llrawproc_fake_gpu_backend_last_preupload_status;
+        g->last_timing = llrawproc_fake_gpu_backend_last_timing;
+        g->last_device_output = llrawproc_fake_gpu_backend_last_device_output;
+        g->retain_last_device_output = llrawproc_fake_gpu_backend_retain_last_device_output;
+        g->release_retained_device_output = llrawproc_fake_gpu_backend_release_retained_device_output;
+        g_llrawproc_fake_gpu_backend_installed = 1;
+    }
+    else
+    {
+        g_llrawproc_fake_gpu_backend_installed = 0;
+    }
+    pthread_mutex_unlock(&g_llrawproc_gpu_recon_backend_mutex);
+    return 1;
+}
+
 /* Test-only hook: clear the sticky LoadLibrary result so a focused test can
  * exercise missing-DLL fallback without poisoning later in-process cases. */
 int llrpResetGpuExportBackendForTesting(void);
 int llrpResetGpuExportBackendForTesting(void)
 {
     llrawproc_gpu_export_backend_release(&g_llrawproc_gpu_export_backend);
+    g_llrawproc_fake_gpu_backend_installed = 0;
     llrawproc_gpu_export_reset_last_run_state();
     return 1;
 }
@@ -896,8 +1203,21 @@ static FARPROC llrawproc_gpu_export_resolve(HMODULE dll, const char * name)
 static int llrawproc_gpu_export_backend_available(int prefer_playback_dll)
 {
     llrawprocGpuExportBackend_t * g = &g_llrawproc_gpu_export_backend;
-    const char * dll_path = llrawproc_gpu_recon_backend_dll_path(prefer_playback_dll);
-    const char * backend_name = llrawproc_gpu_recon_backend_name(prefer_playback_dll);
+    const char * dll_path;
+    const char * backend_name;
+
+    (void)prefer_playback_dll;
+    if(g_llrawproc_fake_gpu_backend_installed)
+    {
+        /* llrpInstallFakeGpuPlaybackReconBackendForTesting() already
+         * populated g->backend and every fn pointer this function would
+         * otherwise resolve via LoadLibrary/GetProcAddress; skip all of
+         * that and just report the fake as available. */
+        return g->backend != NULL;
+    }
+
+    dll_path = llrawproc_gpu_recon_backend_dll_path(prefer_playback_dll);
+    backend_name = llrawproc_gpu_recon_backend_name(prefer_playback_dll);
 
     if(g->backend)
     {
@@ -1399,7 +1719,8 @@ static int llrawproc_gpu_recon_run_cpu16(const dualiso_gpu_recon_state_t * state
                                          uint64_t frame_id,
                                          int * rc_out,
                                          uint64_t * allocated_bytes_out,
-                                         int * allocated_bytes_valid_out)
+                                         int * allocated_bytes_valid_out,
+                                         llrpGpuPlaybackReconTiming_t * timing_out)
 {
     return llrawproc_gpu_recon_run_backend(state,
                                           gpu_input,
@@ -1412,7 +1733,7 @@ static int llrawproc_gpu_recon_run_cpu16(const dualiso_gpu_recon_state_t * state
                                            rc_out,
                                            allocated_bytes_out,
                                            allocated_bytes_valid_out,
-                                           NULL,
+                                           timing_out,
                                            NULL,
                                            NULL,
                                            NULL,
@@ -1475,7 +1796,8 @@ static int llrawproc_gpu_export_try_replace(uint16_t * cpu_output,
                                         0,
                                         &rc,
                                         &allocated_bytes,
-                                        &allocated_bytes_valid);
+                                        &allocated_bytes_valid,
+                                        NULL);
     g_llrawproc_gpu_export_last_run_rc = rc;
     if(allocated_bytes_valid)
     {
@@ -1572,7 +1894,8 @@ static int llrawproc_gpu_export_try_trusted(const dualiso_gpu_recon_state_t * st
                                         0,
                                         &rc,
                                         &allocated_bytes,
-                                        &allocated_bytes_valid);
+                                        &allocated_bytes_valid,
+                                        NULL);
     g_llrawproc_gpu_export_last_run_rc = rc;
     if(allocated_bytes_valid)
     {
@@ -1595,7 +1918,10 @@ static int llrawproc_gpu_playback_try_reconstruct(const dualiso_gpu_recon_state_
 {
     uint16_t * gpu_recon_output = NULL;
     int rc = -1;
+    llrpGpuPlaybackReconTiming_t timing;
+    int result;
 
+    memset(&timing, 0, sizeof(timing));
     llrawproc_gpu_playback_reset_last_run_state();
     g_llrawproc_gpu_playback_last_state_valid =
         (state && state->valid) ? 1 : 0;
@@ -1622,15 +1948,21 @@ static int llrawproc_gpu_playback_try_reconstruct(const dualiso_gpu_recon_state_
      * this reconstruction is for. Do not replace this with a new ambient
      * thread-local dedicated to GPU recon -- reuse this already-armed,
      * synchronous, same-thread value instead. */
-    if(llrawproc_gpu_recon_run_cpu16(state,
-                                     gpu_input,
-                                     gpu_recon_output,
-                                     raw_image_size,
-                                     1,
-                                     mlv_pipeline_capture_get_current_frame(),
-                                     &rc,
-                                     NULL,
-                                     NULL))
+    result = llrawproc_gpu_recon_run_cpu16(state,
+                                           gpu_input,
+                                           gpu_recon_output,
+                                           raw_image_size,
+                                           1,
+                                           mlv_pipeline_capture_get_current_frame(),
+                                           &rc,
+                                           NULL,
+                                           NULL,
+                                           &timing);
+    /* Same-thread status handoff to insertGpuPlaybackReconRunTelemetry()
+     * (RenderFrameThread.cpp), win or lose -- a rejected/mismatched preupload
+     * is exactly the case async-H2D telemetry needs to show. */
+    g_llrawproc_gpu_playback_last_preupload_status = timing.preupload;
+    if(result)
     {
         memcpy(gpu_output, gpu_recon_output, raw_image_size);
         free(gpu_recon_output);
@@ -3544,11 +3876,13 @@ void applyLLRawProcObjectWorker(mlvObject_t * video,
                         {
                             llrpGpuPlaybackReconState_t public_gpu_playback_state;
                             llrpGpuPlaybackRetainedDeviceBayer16_t retained_device;
+                            llrpGpuPlaybackReconTiming_t retained_timing;
                             int retained_rc = -1;
                             memset(&public_gpu_playback_state,
                                    0,
                                    sizeof(public_gpu_playback_state));
                             memset(&retained_device, 0, sizeof(retained_device));
+                            memset(&retained_timing, 0, sizeof(retained_timing));
                             llrawproc_gpu_playback_public_state_from_dualiso(
                                 &gpu_playback_state,
                                 &public_gpu_playback_state);
@@ -3567,7 +3901,7 @@ void applyLLRawProcObjectWorker(mlvObject_t * video,
                                     raw_image_size,
                                     &retained_device,
                                     &retained_rc,
-                                    NULL)
+                                    &retained_timing)
                              && retained_device.valid)
                             {
                                 g_llrawproc_gpu_playback_last_retained_device_bayer16 =
@@ -3583,6 +3917,15 @@ void applyLLRawProcObjectWorker(mlvObject_t * video,
                                     sizeof(g_llrawproc_gpu_playback_last_retained_device_bayer16));
                                 g_llrawproc_gpu_playback_last_run_rc = retained_rc;
                             }
+                            /* Same-thread status handoff to
+                             * insertGpuPlaybackReconRunTelemetry()
+                             * (RenderFrameThread.cpp): this is the ONLY call
+                             * that actually invokes the backend for this
+                             * frame's retained-device output, so it is the
+                             * only place that can observe whether the
+                             * preupload staged above was accepted and used. */
+                            g_llrawproc_gpu_playback_last_preupload_status =
+                                retained_timing.preupload;
                         }
                         dual_iso_recon_ok = 1;
                         gpu_playback_prepare_only_used = 1;
