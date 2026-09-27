@@ -5477,6 +5477,128 @@ class DisplayWakeKeepAlivePerTickDesktopSwitchTests(unittest.TestCase):
                        self.loop_body)
         self.assertIn("InputDesktopNudge]::Run([int]$JoinTimeoutMilliseconds)", self.loop_body)
 
+    def test_close_desktop_error_is_a_tick_failure_candidate(self) -> None:
+        # CUDA-PERF-DISPLAY-WAKE-4 round 1 (sol hardening): a leaked desktop handle every tick used
+        # to be invisible to keep-alive health because only Open/SetThreadDesktop/SendInput were
+        # ever selected into $tickError. Live CloseDesktop failure is not reproducible on a CI host
+        # (same reasoning as the round-2 desktop-switch tests above), so this pins the SHAPE.
+        self.assertIn(
+            "@($result.OpenInputDesktopError, $result.SetThreadDesktopError, $result.SendInputError, "
+            "$result.CloseDesktopError)",
+            self.loop_body)
+
+    def test_the_secure_gate_check_runs_before_the_dedicated_thread_nudge(self) -> None:
+        # BLOCKER fix ordering: the mutually-exclusive if/elseif means InputDesktopNudge.Run can
+        # never execute on the same tick the owner-only gate trips.
+        gate_at = self.loop_body.index("$tickSecureOwnerOnly = if")
+        if_at = self.loop_body.index("if ($tickSecureOwnerOnly) {", gate_at)
+        elseif_at = self.loop_body.index(
+            'elseif ("MLVAppAttrCudaDisplayWake.InputDesktopNudge" -as [type]) {', if_at)
+        nudge_at = self.loop_body.index("[MLVAppAttrCudaDisplayWake.InputDesktopNudge]::Run(", elseif_at)
+        self.assertLess(gate_at, if_at)
+        self.assertLess(if_at, elseif_at)
+        self.assertLess(elseif_at, nudge_at)
+
+
+@requires_pwsh
+class DisplayWakeKeepAlivePerTickScreensaverGateTests(unittest.TestCase):
+    """CUDA-PERF-DISPLAY-WAKE-4 round 1: the keep-alive loop re-reads the running/secure probes
+    before EVERY tick -- not just once at claim time -- with the same fail-closed rule
+    Start-AttrCudaDisplayWake's own claim-time gate uses, and only counts a tick as success once the
+    screen saver is CONFIRMED not running afterward.
+
+    The loop runs in a brand-new Runspace (RunspaceFactory.CreateRunspace) that inherits none of
+    this scope's PowerShell functions, only .NET types loaded via Add-Type (AppDomain-wide) --
+    Get-AttrCudaScreensaverRunning/-Secure are copied into it (Start-AttrCudaDisplayWakeKeepAlive's
+    own SessionStateFunctionEntry setup) from THEIR CURRENT DEFINITION in the calling scope, late-
+    bound by name. Overriding them therefore requires the SAME flat-script embedding technique
+    DisplayWakeKeepAliveHealthTests.test_native_wake_surface_unavailable_is_unhealthy_not_a_healthy_zero_attempt_loop
+    already uses (Get-AttrCudaEmbeddedFunctionSource into one scope with no module boundary,
+    override appended after) -- Import-Module's own module-scope isolation would let the override
+    shadow nothing the module's own internal calls actually resolve to."""
+
+    def setUp(self) -> None:
+        if os.name != "nt":
+            self.skipTest("the ATTR-3 keep-alive is Windows-only (P/Invoke, drive-letter paths)")
+        self._tmp = tempfile.TemporaryDirectory(prefix="attr3-keepalive-gate-")
+        self.tmp = _long_path(Path(self._tmp.name))
+        self.addCleanup(self._tmp.cleanup)
+
+    def _run_with_probe_overrides(self, *, running_script: str, secure_script: str,
+                                   interval_seconds: int = 1, sleep_ms: int = 1500) -> dict:
+        extract_script = self.tmp / "extract.ps1"
+        extract_script.write_text(
+            "$ErrorActionPreference = 'Stop'\n"
+            "Import-Module '" + str(MODULE) + "' -Force\n"
+            "$src = Get-AttrCudaEmbeddedFunctionSource -Name @("
+            "'Register-AttrCudaDisplayWakeNativeMethods','Get-AttrCudaScreensaverRunning',"
+            "'Get-AttrCudaScreensaverSecure','Start-AttrCudaDisplayWakeKeepAlive',"
+            "'Stop-AttrCudaDisplayWakeKeepAlive')\n"
+            f"Set-Content -LiteralPath '{(self.tmp / 'extracted.ps1')}' -Value $src -Encoding utf8\n",
+            encoding="utf-8",
+        )
+        extract_proc = _run_pwsh_file(extract_script)
+        self.assertEqual(extract_proc.returncode, 0, extract_proc.stdout + extract_proc.stderr)
+
+        probe_script = self.tmp / "extracted.ps1"
+        with probe_script.open("a", encoding="utf-8") as f:
+            f.write(
+                "\n$ErrorActionPreference = 'Stop'\n"
+                # Overrides defined AFTER the extracted originals, in this SAME flat scope, replace
+                # them outright (last-definition-wins, no module boundary) -- the exact mechanism
+                # this module's own _wake_with_overrides test helper already relies on.
+                f"function Get-AttrCudaScreensaverRunning {{ {running_script} }}\n"
+                f"function Get-AttrCudaScreensaverSecure {{ {secure_script} }}\n"
+                f"$h = Start-AttrCudaDisplayWakeKeepAlive -IntervalSeconds {interval_seconds}\n"
+                f"Start-Sleep -Milliseconds {sleep_ms}\n"
+                "$r = Stop-AttrCudaDisplayWakeKeepAlive -Handle $h\n"
+                f"[IO.File]::WriteAllText('{(self.tmp / 'r.json')}', ($r | ConvertTo-Json -Depth 5))\n"
+            )
+        proc = _run_pwsh_file(probe_script)
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        return json.loads((self.tmp / "r.json").read_text(encoding="utf-8"))
+
+    def test_secure_screensaver_mid_leg_blocks_injection_and_is_typed(self) -> None:
+        result = self._run_with_probe_overrides(running_script="$true", secure_script="$true")
+        self.assertGreaterEqual(result["nudgeCount"], 1)
+        self.assertEqual(result["successCount"], 0)
+        self.assertGreater(result["failureCount"], 0)
+        self.assertIn("ATTRCUDA_KEEPALIVE_BLOCKED", result["lastError"])
+        self.assertIn("reason=secure_screensaver_mid_leg", result["lastError"])
+
+    def test_unknown_running_state_mid_leg_blocks_injection_and_is_typed(self) -> None:
+        result = self._run_with_probe_overrides(running_script="$null", secure_script="$false")
+        self.assertGreaterEqual(result["nudgeCount"], 1)
+        self.assertEqual(result["successCount"], 0)
+        self.assertGreater(result["failureCount"], 0)
+        self.assertIn("ATTRCUDA_KEEPALIVE_BLOCKED", result["lastError"])
+        self.assertIn("reason=state_unknown", result["lastError"])
+
+    def test_confirmed_not_running_ticks_succeed(self) -> None:
+        result = self._run_with_probe_overrides(running_script="$false", secure_script="$false")
+        self.assertGreaterEqual(result["nudgeCount"], 1)
+        self.assertEqual(result["failureCount"], 0)
+        self.assertEqual(result["successCount"], result["nudgeCount"])
+        self.assertIsNone(result["lastError"])
+
+    def test_still_running_after_a_structurally_clean_nudge_is_a_counted_failure(self) -> None:
+        # running=$true with secure=$false clears the owner-only gate (not secure, so a dismiss IS
+        # attempted) and reaches the real InputDesktopNudge.Run on this host's live desktop -- the
+        # same real nudge DisplayWakeKeepAliveFunctionTests.test_keep_alive_starts_nudges_and_stops_without_throwing
+        # already proves succeeds cleanly here (Open/SetThreadDesktop/SendInput/CloseDesktop all
+        # $null, thread joined). Because Get-AttrCudaScreensaverRunning is stubbed to ALWAYS read
+        # running=true, the post-nudge confirmation can never see a $false -- exactly the "SendInput
+        # delivered but the screen saver never actually reacted" class fable's r2 hardening targets.
+        # sleep_ms=4500 gives margin over the worst case per tick (1s interval wait + the up-to-2s
+        # bounded post-nudge poll, which always maxes out here since running never reads $false) so
+        # the first tick's failureCount write is not still in flight when Stop- reads it.
+        result = self._run_with_probe_overrides(
+            running_script="$true", secure_script="$false", sleep_ms=4500)
+        self.assertGreaterEqual(result["nudgeCount"], 1)
+        self.assertEqual(result["successCount"], 0)
+        self.assertGreater(result["failureCount"], 0)
+        self.assertIn("ATTRCUDA_KEEPALIVE_STILL_RUNNING", result["lastError"])
+
 
 # --------------------------------------------------------------------------------------------
 # CUDA-PERF-DISPLAY-WAKE-3 round 1: Get-AttrCudaDisplayWakeKeepAliveHealth, the non-throwing
@@ -5727,7 +5849,11 @@ class DisplayWakeKeepAliveSetupHardeningTests(unittest.TestCase):
         func_end_at = self.text.index("\nfunction Get-AttrCudaDisplayWakeKeepAliveHealth {", func_at)
         body = self.text[func_at:func_end_at]
         try_at = body.index("try {")
-        create_at = body.index("RunspaceFactory]::CreateRunspace()", try_at)
+        # CUDA-PERF-DISPLAY-WAKE-4 round 1: CreateRunspace now takes an InitialSessionState (so the
+        # loop's Runspace can see the per-tick screensaver probe functions) instead of the
+        # parameterless overload -- the invariant under test (wrapped in try/catch, .setupError set
+        # in the catch) is unchanged.
+        create_at = body.index("RunspaceFactory]::CreateRunspace($initialSessionState)", try_at)
         begin_invoke_at = body.index(".BeginInvoke()", create_at)
         catch_at = body.index("} catch {", begin_invoke_at)
         setup_error_at = body.index("$setupError = $_.Exception.Message", catch_at)
