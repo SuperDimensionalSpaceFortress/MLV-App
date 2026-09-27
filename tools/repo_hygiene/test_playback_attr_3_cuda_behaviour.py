@@ -4979,6 +4979,7 @@ class WakeLifetimeFinallyHardeningTests(_PwshCase):
             "'Get-AttrCudaScreensaverSecure','Wait-AttrCudaScreensaverDismissed',"
             "'Invoke-AttrCudaInputDesktopNudge',"
             "'Start-AttrCudaDisplayWake','Stop-AttrCudaDisplayWake',"
+            "'Invoke-AttrCudaBoundedProbe',"
             "'Start-AttrCudaDisplayWakeKeepAlive','Stop-AttrCudaDisplayWakeKeepAlive')\n"
             f"Set-Content -LiteralPath '{(self.tmp / 'extracted.ps1')}' -Value $src -Encoding utf8\n",
             encoding="utf-8",
@@ -5414,6 +5415,7 @@ class DisplayWakeKeepAliveFunctionTests(_PwshCase):
             "Import-Module '" + str(MODULE) + "' -Force\n"
             "$src = Get-AttrCudaEmbeddedFunctionSource -Name @("
             "'Register-AttrCudaDisplayWakeNativeMethods',"
+            "'Invoke-AttrCudaBoundedProbe',"
             "'Start-AttrCudaDisplayWakeKeepAlive','Stop-AttrCudaDisplayWakeKeepAlive')\n"
             f"Set-Content -LiteralPath '{(self.tmp / 'extracted.ps1')}' -Value $src -Encoding utf8\n",
             encoding="utf-8",
@@ -5473,8 +5475,12 @@ class DisplayWakeKeepAlivePerTickDesktopSwitchTests(unittest.TestCase):
 
     def test_start_keep_alive_passes_a_join_timeout_into_the_loop(self) -> None:
         self.assertIn("AddArgument($NudgeJoinTimeoutMilliseconds)", self.text)
-        self.assertIn("param($StopEvent, $IntervalSeconds, $NudgeState, $JoinTimeoutMilliseconds)",
-                       self.loop_body)
+        # CUDA-PERF-DISPLAY-WAKE-4 round 1b (sol hardening): $ProbeTimeoutMilliseconds joins the
+        # loop's own parameter list -- the invariant under test here (the join timeout is threaded
+        # through) is unchanged.
+        self.assertIn(
+            "param($StopEvent, $IntervalSeconds, $NudgeState, $JoinTimeoutMilliseconds, $ProbeTimeoutMilliseconds)",
+            self.loop_body)
         self.assertIn("InputDesktopNudge]::Run([int]$JoinTimeoutMilliseconds)", self.loop_body)
 
     def test_close_desktop_error_is_a_tick_failure_candidate(self) -> None:
@@ -5532,7 +5538,8 @@ class DisplayWakeKeepAlivePerTickScreensaverGateTests(unittest.TestCase):
             "Import-Module '" + str(MODULE) + "' -Force\n"
             "$src = Get-AttrCudaEmbeddedFunctionSource -Name @("
             "'Register-AttrCudaDisplayWakeNativeMethods','Get-AttrCudaScreensaverRunning',"
-            "'Get-AttrCudaScreensaverSecure','Start-AttrCudaDisplayWakeKeepAlive',"
+            "'Get-AttrCudaScreensaverSecure','Invoke-AttrCudaBoundedProbe',"
+            "'Start-AttrCudaDisplayWakeKeepAlive',"
             "'Stop-AttrCudaDisplayWakeKeepAlive')\n"
             f"Set-Content -LiteralPath '{(self.tmp / 'extracted.ps1')}' -Value $src -Encoding utf8\n",
             encoding="utf-8",
@@ -5668,7 +5675,8 @@ class DisplayWakeKeepAliveHealthTests(_PwshCase):
             "$ErrorActionPreference = 'Stop'\n"
             "Import-Module '" + str(MODULE) + "' -Force\n"
             "$src = Get-AttrCudaEmbeddedFunctionSource -Name @("
-            "'Register-AttrCudaDisplayWakeNativeMethods','Start-AttrCudaDisplayWakeKeepAlive',"
+            "'Register-AttrCudaDisplayWakeNativeMethods','Invoke-AttrCudaBoundedProbe',"
+            "'Start-AttrCudaDisplayWakeKeepAlive',"
             "'Get-AttrCudaDisplayWakeKeepAliveHealth','Stop-AttrCudaDisplayWakeKeepAlive')\n"
             f"Set-Content -LiteralPath '{(self.tmp / 'extracted.ps1')}' -Value $src -Encoding utf8\n",
             encoding="utf-8",
@@ -5900,6 +5908,326 @@ class DisplayWakeKeepAliveJobOrderingTests(unittest.TestCase):
         fold_at = self.text.index(
             "$displayWake['keepAliveNudgeState'] = $displayWakeKeepAlive.nudgeState", keep_alive_at)
         self.assertGreater(fold_at, keep_alive_at)
+
+
+# --------------------------------------------------------------------------------------------
+# CUDA-PERF-DISPLAY-WAKE-4 round 1b (sol BLOCKER fix): a secure saver can become active between
+# the per-tick state read and InputDesktopNudge.Run's own SendInput call -- Windows has no atomic
+# check-and-inject, so this narrows the window to the injecting thread itself: it reads the
+# ATTACHED desktop's own name right before SendInput and refuses to inject into anything but the
+# expected non-secure ("Default") desktop.
+# --------------------------------------------------------------------------------------------
+
+
+class InputDesktopNudgeSecureDesktopGateTests(unittest.TestCase):
+    """Static shape/ordering checks on InputDesktopNudge.Run's new desktop-name gate. A live
+    secure-desktop switch is not reproducible in this test environment (same reasoning
+    DisplayWakeKeepAlivePerTickDesktopSwitchTests already uses for its own live-UM-only class of
+    evidence), so the mechanism itself is proven live below (InputDesktopNudgeDesktopNameLiveTests)
+    against the one desktop name this host CAN produce ("Default"), and the refusal shape is pinned
+    here, mutation-checked."""
+
+    def setUp(self) -> None:
+        text = MODULE.read_text(encoding="utf-8")
+        start_at = text.index("public static InputDesktopNudgeResult Run(int joinTimeoutMilliseconds)")
+        end_at = text.index("'@ -ErrorAction Stop", start_at)
+        self.body = text[start_at:end_at]
+
+    def test_desktop_name_is_read_after_setthreaddesktop_and_before_sendinput(self) -> None:
+        set_thread_desktop_at = self.body.index("NativeMethods.SetThreadDesktop(hDesktop)")
+        read_name_at = self.body.index("GetUserObjectInformation(", set_thread_desktop_at)
+        send_input_at = self.body.index("NativeMethods.SendInput(", read_name_at)
+        self.assertLess(set_thread_desktop_at, read_name_at)
+        self.assertLess(read_name_at, send_input_at)
+
+    def test_only_the_default_desktop_name_is_treated_as_safe(self) -> None:
+        self.assertIn('string.Equals(desktopName, "Default", StringComparison.Ordinal)', self.body)
+
+    def test_an_unreadable_desktop_name_is_refused_with_a_typed_reason(self) -> None:
+        self.assertIn("ATTRCUDA_SECURE_DESKTOP_REFUSED reason=desktop_name_unknown", self.body)
+
+    def test_an_unexpected_desktop_name_is_refused_with_a_typed_reason(self) -> None:
+        self.assertIn("ATTRCUDA_SECURE_DESKTOP_REFUSED reason=secure_desktop", self.body)
+
+    def test_a_refused_desktop_name_returns_before_the_nudge_input_array_is_built(self) -> None:
+        # A mutation that lets the refusal fall through to SendInput anyway (e.g. removing the
+        # `return;`) must red this test even if the refusal is still recorded.
+        refused_at = self.body.index("result.DesktopNameRefused = true;")
+        nudge_array_at = self.body.index("INPUT[] nudge = new INPUT[]", refused_at)
+        return_at = self.body.index("return;", refused_at)
+        self.assertLess(refused_at, return_at)
+        self.assertLess(return_at, nudge_array_at)
+
+    def test_the_refusal_is_written_to_senderror_so_existing_tick_failure_detection_still_catches_it(self) -> None:
+        # The keep-alive loop's own tickError candidate list (pinned by
+        # DisplayWakeKeepAlivePerTickDesktopSwitchTests.test_close_desktop_error_is_a_tick_failure_candidate)
+        # already selects $result.SendInputError -- routing the refusal through a different,
+        # unselected field would make it invisible to keep-alive health despite being "recorded".
+        self.assertIn("result.SendInputError = desktopNameRead", self.body)
+
+
+@requires_pwsh
+class InputDesktopNudgeDesktopNameLiveTests(_PwshCase):
+    """Live proof, against the one desktop name this host can actually produce ("Default"): the
+    dedicated thread's new name read does not regress the golden path DisplayWakeKeepAliveFunctionTests
+    and DisplayWakeKeepAlivePerTickScreensaverGateTests already exercise, and both the C# result and
+    the Invoke-AttrCudaInputDesktopNudge wrapper surface the new fields."""
+
+    def test_the_dedicated_thread_reports_the_default_desktop_name_and_is_not_refused(self) -> None:
+        proc = self.run_with_module(
+            "[void](Register-AttrCudaDisplayWakeNativeMethods)\n"
+            "$result = [MLVAppAttrCudaDisplayWake.InputDesktopNudge]::Run(5000)\n"
+            "$out = [ordered]@{ desktopName = $result.DesktopName; desktopNameRefused = [bool]$result.DesktopNameRefused; "
+            "sendInputError = $result.SendInputError; threadJoined = [bool]$result.ThreadJoined }\n"
+            f"[IO.File]::WriteAllText('{(self.tmp / 'r.json')}', ($out | ConvertTo-Json -Depth 5))\n"
+        )
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        result = json.loads((self.tmp / "r.json").read_text(encoding="utf-8"))
+        self.assertEqual(result["desktopName"], "Default")
+        self.assertIs(result["desktopNameRefused"], False)
+        self.assertIsNone(result["sendInputError"])
+        self.assertIs(result["threadJoined"], True)
+
+    def test_invoke_attr_cuda_input_desktop_nudge_surfaces_desktop_name_fields(self) -> None:
+        proc = self.run_with_module(
+            "$r = Invoke-AttrCudaInputDesktopNudge -JoinTimeoutMilliseconds 5000\n"
+            f"[IO.File]::WriteAllText('{(self.tmp / 'r.json')}', ($r | ConvertTo-Json -Depth 5))\n"
+        )
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        result = json.loads((self.tmp / "r.json").read_text(encoding="utf-8"))
+        self.assertEqual(result["desktopName"], "Default")
+        self.assertIs(result["desktopNameRefused"], False)
+
+    def test_getuserobjectinformation_fails_closed_on_an_invalid_handle(self) -> None:
+        # Grounds the "unreadable name" mechanism in a real Win32 call this host CAN exercise, even
+        # though forcing InputDesktopNudge.Run's own hDesktop into an unreadable state needs a real
+        # secure-desktop switch this environment cannot produce.
+        proc = self.run_with_module(
+            "[void](Register-AttrCudaDisplayWakeNativeMethods)\n"
+            "$len = 0\n"
+            "$sb = [System.Text.StringBuilder]::new(256)\n"
+            "$ok = [MLVAppAttrCudaDisplayWake.NativeMethods]::GetUserObjectInformation([IntPtr]::Zero, 2, $sb, $sb.Capacity, [ref]$len)\n"
+            f"[IO.File]::WriteAllText('{(self.tmp / 'r.json')}', (@{{ ok = [bool]$ok }} | ConvertTo-Json))\n"
+        )
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        result = json.loads((self.tmp / "r.json").read_text(encoding="utf-8"))
+        self.assertIs(result["ok"], False)
+
+
+# --------------------------------------------------------------------------------------------
+# CUDA-PERF-DISPLAY-WAKE-4 round 1b (sol hardening): bound a stalled keep-alive probe -- each
+# per-tick probe now has a timeout (Invoke-AttrCudaBoundedProbe), and stopping the keep-alive
+# (Stop-AttrCudaDisplayWakeKeepAlive) never waits unbounded on EndInvoke either.
+# --------------------------------------------------------------------------------------------
+
+
+@requires_pwsh
+class InvokeAttrCudaBoundedProbeTests(_PwshCase):
+    """Invoke-AttrCudaBoundedProbe in isolation: a fast probe's own result passes through
+    untouched, and a hung probe returns $null within the bound instead of blocking."""
+
+    def test_a_fast_probe_returns_its_own_result_within_the_timeout(self) -> None:
+        proc = self.run_with_module(
+            "function Get-AttrCudaFakeFastProbe { return $true }\n"
+            "$r = Invoke-AttrCudaBoundedProbe -FunctionName 'Get-AttrCudaFakeFastProbe' -TimeoutMilliseconds 3000\n"
+            f"[IO.File]::WriteAllText('{(self.tmp / 'r.json')}', (@{{ r = $r }} | ConvertTo-Json))\n"
+        )
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        result = json.loads((self.tmp / "r.json").read_text(encoding="utf-8"))
+        self.assertIs(result["r"], True)
+
+    def test_a_probe_that_returns_false_is_not_confused_with_a_timeout(self) -> None:
+        # A timeout and a clean $false result must be distinguishable -- both are falsy, but only
+        # one is "could not determine" ($null).
+        proc = self.run_with_module(
+            "function Get-AttrCudaFakeFalseProbe { return $false }\n"
+            "$r = Invoke-AttrCudaBoundedProbe -FunctionName 'Get-AttrCudaFakeFalseProbe' -TimeoutMilliseconds 3000\n"
+            f"[IO.File]::WriteAllText('{(self.tmp / 'r.json')}', (@{{ r = $r }} | ConvertTo-Json))\n"
+        )
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        result = json.loads((self.tmp / "r.json").read_text(encoding="utf-8"))
+        self.assertIs(result["r"], False)
+
+    def test_a_hanging_probe_times_out_and_returns_null_within_the_bound(self) -> None:
+        proc = self.run_with_module(
+            "function Get-AttrCudaFakeHangingProbe { Start-Sleep -Milliseconds 999999; return $true }\n"
+            "$sw = [System.Diagnostics.Stopwatch]::StartNew()\n"
+            "$r = Invoke-AttrCudaBoundedProbe -FunctionName 'Get-AttrCudaFakeHangingProbe' -TimeoutMilliseconds 800\n"
+            "$sw.Stop()\n"
+            "$out = [ordered]@{ r = $r; elapsedMs = $sw.ElapsedMilliseconds }\n"
+            f"[IO.File]::WriteAllText('{(self.tmp / 'r.json')}', ($out | ConvertTo-Json))\n"
+        )
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        result = json.loads((self.tmp / "r.json").read_text(encoding="utf-8"))
+        self.assertIsNone(result["r"])
+        # Comfortably below the 999999ms the probe itself sleeps for -- the bound, not the probe,
+        # decided when this call returned. A generous upper margin tolerates a slow CI host.
+        self.assertLess(result["elapsedMs"], 10000)
+
+    def test_an_unknown_function_name_returns_null_not_a_throw(self) -> None:
+        proc = self.run_with_module(
+            "$r = Invoke-AttrCudaBoundedProbe -FunctionName 'Get-AttrCudaDoesNotExistAtAll' -TimeoutMilliseconds 500\n"
+            f"[IO.File]::WriteAllText('{(self.tmp / 'r.json')}', (@{{ r = $r }} | ConvertTo-Json))\n"
+        )
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        result = json.loads((self.tmp / "r.json").read_text(encoding="utf-8"))
+        self.assertIsNone(result["r"])
+
+
+class DisplayWakeKeepAlivePerTickProbeBoundTests(unittest.TestCase):
+    """Static shape checks: the keep-alive loop's per-tick probes (and the after-nudge
+    confirmation poll) go through Invoke-AttrCudaBoundedProbe, never a direct, unbounded call --
+    mutation-checked the same way DisplayWakeKeepAlivePerTickDesktopSwitchTests already pins the
+    dedicated-thread nudge call."""
+
+    def setUp(self) -> None:
+        self.text = MODULE.read_text(encoding="utf-8")
+        loop_start_at = self.text.index("$loopScript = {")
+        loop_end_at = self.text.index(
+            "# CUDA-PERF-DISPLAY-WAKE-3 round 1 (fable hardening): CreateRunspace/Open/BeginInvoke",
+            loop_start_at)
+        self.loop_body = self.text[loop_start_at:loop_end_at]
+
+    def test_top_of_tick_probes_go_through_the_bounded_wrapper(self) -> None:
+        self.assertIn(
+            "$tickRunning = Invoke-AttrCudaBoundedProbe -FunctionName 'Get-AttrCudaScreensaverRunning'",
+            self.loop_body)
+        self.assertIn(
+            "$tickSecure = Invoke-AttrCudaBoundedProbe -FunctionName 'Get-AttrCudaScreensaverSecure'",
+            self.loop_body)
+        self.assertNotIn("$tickRunning = Get-AttrCudaScreensaverRunning\n", self.loop_body)
+        self.assertNotIn("$tickSecure = Get-AttrCudaScreensaverSecure\n", self.loop_body)
+
+    def test_after_nudge_confirmation_poll_also_goes_through_the_bounded_wrapper(self) -> None:
+        self.assertIn(
+            "$afterRunning = Invoke-AttrCudaBoundedProbe -FunctionName 'Get-AttrCudaScreensaverRunning'",
+            self.loop_body)
+        self.assertNotIn("$afterRunning = Get-AttrCudaScreensaverRunning\n", self.loop_body)
+
+    def test_probe_timeout_is_threaded_through_the_loop_parameters(self) -> None:
+        self.assertIn(
+            "param($StopEvent, $IntervalSeconds, $NudgeState, $JoinTimeoutMilliseconds, $ProbeTimeoutMilliseconds)",
+            self.loop_body)
+        self.assertIn("AddArgument($ProbeTimeoutMilliseconds)", self.text)
+
+    def test_bounded_probe_is_registered_in_the_loop_runspaces_initial_session_state(self) -> None:
+        foreach_at = self.text.index("foreach ($tickProbeFunctionName in @(")
+        foreach_end_at = self.text.index(")) {", foreach_at)
+        foreach_list = self.text[foreach_at:foreach_end_at]
+        self.assertIn("'Invoke-AttrCudaBoundedProbe'", foreach_list)
+
+
+class StopKeepAliveBoundedWaitTests(unittest.TestCase):
+    """Static shape check: Stop-AttrCudaDisplayWakeKeepAlive waits on the async handle directly,
+    bounded, before ever calling EndInvoke -- defense in depth alongside the per-tick probe bound
+    above, for the exact repro sol's review described (a hung probe leaving EndInvoke to wait
+    unbounded)."""
+
+    def setUp(self) -> None:
+        text = MODULE.read_text(encoding="utf-8")
+        start_at = text.index("function Stop-AttrCudaDisplayWakeKeepAlive {")
+        end_at = text.index("\nfunction Get-AttrCudaAppSwapTelemetry {", start_at)
+        self.body = text[start_at:end_at]
+
+    def test_endinvoke_is_gated_behind_a_bounded_async_wait(self) -> None:
+        wait_at = self.body.index("AsyncWaitHandle.WaitOne([int]$TimeoutMilliseconds)")
+        end_invoke_at = self.body.index("EndInvoke($Handle.asyncResult)", wait_at)
+        self.assertLess(wait_at, end_invoke_at)
+
+    def test_a_timeout_is_recorded_as_a_typed_stop_error(self) -> None:
+        self.assertIn("ATTRCUDA_KEEPALIVE_STOP_TIMEOUT", self.body)
+
+
+@requires_pwsh
+class KeepAliveHungProbeDoesNotBlockStopTests(unittest.TestCase):
+    """End-to-end reproduction of sol's exact hardening repro: Get-AttrCudaScreensaverRunning
+    blocks forever starting on the next tick. Before this fix, the tick itself never returned (no
+    recorded failure, health stays "healthy" on its prior success) and
+    Stop-AttrCudaDisplayWakeKeepAlive then hung in EndInvoke. Same flat-scope override technique as
+    DisplayWakeKeepAlivePerTickScreensaverGateTests."""
+
+    def setUp(self) -> None:
+        if os.name != "nt":
+            self.skipTest("the ATTR-3 keep-alive is Windows-only (P/Invoke, drive-letter paths)")
+        self._tmp = tempfile.TemporaryDirectory(prefix="attr3-keepalive-probe-bound-")
+        self.tmp = _long_path(Path(self._tmp.name))
+        self.addCleanup(self._tmp.cleanup)
+
+    def _extracted_script(self) -> Path:
+        extract_script = self.tmp / "extract.ps1"
+        extract_script.write_text(
+            "$ErrorActionPreference = 'Stop'\n"
+            "Import-Module '" + str(MODULE) + "' -Force\n"
+            "$src = Get-AttrCudaEmbeddedFunctionSource -Name @("
+            "'Register-AttrCudaDisplayWakeNativeMethods','Get-AttrCudaScreensaverRunning',"
+            "'Get-AttrCudaScreensaverSecure','Invoke-AttrCudaBoundedProbe',"
+            "'Start-AttrCudaDisplayWakeKeepAlive','Stop-AttrCudaDisplayWakeKeepAlive')\n"
+            f"Set-Content -LiteralPath '{(self.tmp / 'extracted.ps1')}' -Value $src -Encoding utf8\n",
+            encoding="utf-8",
+        )
+        extract_proc = _run_pwsh_file(extract_script)
+        self.assertEqual(extract_proc.returncode, 0, extract_proc.stdout + extract_proc.stderr)
+        return self.tmp / "extracted.ps1"
+
+    def test_a_hung_running_probe_is_a_counted_failure_and_stop_returns_promptly(self) -> None:
+        probe_script = self._extracted_script()
+        with probe_script.open("a", encoding="utf-8") as f:
+            f.write(
+                "\n$ErrorActionPreference = 'Stop'\n"
+                "function Get-AttrCudaScreensaverRunning { Start-Sleep -Milliseconds 999999; return $true }\n"
+                "$h = Start-AttrCudaDisplayWakeKeepAlive -IntervalSeconds 1 -ProbeTimeoutMilliseconds 1000\n"
+                "Start-Sleep -Milliseconds 3500\n"
+                "$midFailureCount = [int]$h.nudgeState.failureCount\n"
+                "$midLastError = $h.nudgeState.lastError\n"
+                "$stopSw = [System.Diagnostics.Stopwatch]::StartNew()\n"
+                "$r = Stop-AttrCudaDisplayWakeKeepAlive -Handle $h -TimeoutMilliseconds 15000\n"
+                "$stopSw.Stop()\n"
+                "$out = [ordered]@{ midFailureCount = $midFailureCount; midLastError = $midLastError; "
+                "stopElapsedMs = $stopSw.ElapsedMilliseconds; stopStopped = [bool]$r.stopped; stopError = $r.error }\n"
+                f"[IO.File]::WriteAllText('{(self.tmp / 'r.json')}', ($out | ConvertTo-Json -Depth 5))\n"
+            )
+        proc = _run_pwsh_file(probe_script)
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        result = json.loads((self.tmp / "r.json").read_text(encoding="utf-8"))
+        # Before this fix: 0, with no recorded failure at all (the tick never returned).
+        self.assertGreaterEqual(result["midFailureCount"], 1)
+        self.assertIn("ATTRCUDA_KEEPALIVE_BLOCKED", result["midLastError"])
+        self.assertIn("reason=state_unknown", result["midLastError"])
+        # Before this fix: hangs for the full 999999ms sleep (or forever). A generous upper margin
+        # tolerates a slow CI host while still proving this is bounded, not unbounded.
+        self.assertLess(result["stopElapsedMs"], 10000)
+        self.assertIs(result["stopStopped"], True)
+        self.assertIsNone(result["stopError"])
+
+    def test_stop_itself_times_out_typed_when_its_own_bound_is_shorter_than_the_stuck_probe(self) -> None:
+        # Proves the Stop-level bound is a REAL, independent guarantee -- not just a side effect of
+        # the probe bound happening to be tight enough: a probe bound (5000ms) comfortably longer
+        # than Stop's own -TimeoutMilliseconds (300ms). -IntervalSeconds 1 means the loop's FIRST
+        # tick does not even start until ~1000ms in (it waits on -StopEvent.Wait(IntervalSeconds*1000)
+        # before ever probing) -- so the sleep here is 1200ms, long enough for that first tick to
+        # have entered its bounded (and, here, permanently stuck) probe call, short enough that it
+        # has nowhere near returned by the time Stop- is called.
+        probe_script = self._extracted_script()
+        with probe_script.open("a", encoding="utf-8") as f:
+            f.write(
+                "\n$ErrorActionPreference = 'Stop'\n"
+                "function Get-AttrCudaScreensaverRunning { Start-Sleep -Milliseconds 999999; return $true }\n"
+                "$h = Start-AttrCudaDisplayWakeKeepAlive -IntervalSeconds 1 -ProbeTimeoutMilliseconds 5000\n"
+                "Start-Sleep -Milliseconds 1200\n"
+                "$stopSw = [System.Diagnostics.Stopwatch]::StartNew()\n"
+                "$r = Stop-AttrCudaDisplayWakeKeepAlive -Handle $h -TimeoutMilliseconds 300\n"
+                "$stopSw.Stop()\n"
+                "$out = [ordered]@{ stopElapsedMs = $stopSw.ElapsedMilliseconds; stopStopped = [bool]$r.stopped; stopError = $r.error }\n"
+                f"[IO.File]::WriteAllText('{(self.tmp / 'r.json')}', ($out | ConvertTo-Json -Depth 5))\n"
+            )
+        proc = _run_pwsh_file(probe_script)
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        result = json.loads((self.tmp / "r.json").read_text(encoding="utf-8"))
+        self.assertIs(result["stopStopped"], False)
+        self.assertIn("ATTRCUDA_KEEPALIVE_STOP_TIMEOUT", result["stopError"])
+        # Bounded by Stop's OWN -TimeoutMilliseconds (300ms), not by the probe's much longer 5000ms
+        # bound or the probe's 999999ms sleep. A generous upper margin tolerates a slow CI host.
+        self.assertLess(result["stopElapsedMs"], 5000)
 
 
 if __name__ == "__main__":

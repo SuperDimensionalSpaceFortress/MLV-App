@@ -2605,6 +2605,7 @@ function Register-AttrCudaDisplayWakeNativeMethods {
         Add-Type -TypeDefinition @'
     using System;
     using System.Runtime.InteropServices;
+    using System.Text;
 
     namespace MLVAppAttrCudaDisplayWake
     {
@@ -2686,6 +2687,14 @@ function Register-AttrCudaDisplayWakeNativeMethods {
 
             [DllImport("kernel32.dll")]
             public static extern uint GetCurrentThreadId();
+
+            // CUDA-PERF-DISPLAY-WAKE-4 round 1b (sol BLOCKER fix): reads back the NAME of the
+            // desktop hDesktop resolves to, from INSIDE the same dedicated thread and IMMEDIATELY
+            // before SendInput -- see InputDesktopNudge.Run below for why this, not a caller-side
+            // state re-check, is what actually closes the race a secure saver activating between
+            // the PowerShell tick's own probe read and this thread's SendInput.
+            [DllImport("user32.dll", SetLastError = true, CharSet = CharSet.Auto)]
+            public static extern bool GetUserObjectInformation(IntPtr hObj, int nIndex, StringBuilder pvInfo, int nLength, out int lpnLengthNeeded);
         }
 
         // CUDA-PERF-DISPLAY-WAKE-2 round 1c. Invoking a PowerShell scriptblock on a raw
@@ -2706,6 +2715,12 @@ function Register-AttrCudaDisplayWakeNativeMethods {
             // GetLastWin32Error) otherwise.
             public string CloseDesktopError;
             public bool ThreadJoined;
+            // CUDA-PERF-DISPLAY-WAKE-4 round 1b (sol BLOCKER fix): the desktop name this thread
+            // actually read back right before SendInput (or null when unreadable), and whether it
+            // was refused on that basis -- see InputDesktopNudge.Run's own new comment block for
+            // what this closes.
+            public string DesktopName;
+            public bool DesktopNameRefused;
         }
 
         public static class InputDesktopNudge
@@ -2754,6 +2769,49 @@ function Register-AttrCudaDisplayWakeNativeMethods {
                         if (!NativeMethods.SetThreadDesktop(hDesktop))
                         {
                             result.SetThreadDesktopError = "SetThreadDesktop failed (lastError=" + Marshal.GetLastWin32Error() + ")";
+                            return;
+                        }
+                        // CUDA-PERF-DISPLAY-WAKE-4 round 1b (sol BLOCKER fix): a secure saver can
+                        // become active in the gap between the PowerShell tick's own
+                        // Get-AttrCudaScreensaverRunning/-Secure probe read and this dedicated
+                        // thread's SendInput call below -- Windows has no atomic check-and-inject,
+                        // and that gap is unavoidable from the calling (PowerShell tick) side no
+                        // matter how tightly the probes are re-read there. What CAN be tightened is
+                        // narrowing the window to THIS thread itself: read the name of the desktop
+                        // hDesktop (the one OpenInputDesktop just resolved as "currently receiving
+                        // input") actually is, immediately before SendInput, and inject only when it
+                        // is the expected non-secure desktop. Windows names the interactive desktop
+                        // "Default"; every OpenInputDesktop leg this module's own history records for
+                        // a NON-secure screen saver (the round-2/round-3 UM evidence cited throughout
+                        // this file) resolved without ever logging any other name, so "Default" is
+                        // the one name treated as safe here -- "Winlogon" (the desktop Windows
+                        // documents the secure/password-prompt screen saver, UAC and the lock screen
+                        // itself as running on) and any other or unreadable name are refused with NO
+                        // SendInput of any kind. The remaining window -- between this name read and
+                        // SendInput, both on this same thread with nothing else able to run in
+                        // between -- is closed by Windows itself, not by this code: SendInput from a
+                        // non-SYSTEM process is documented (and this file's own round-2 evidence
+                        // above independently observed, as ERROR_ACCESS_DENIED) to be rejected by any
+                        // desktop the calling thread is not actually attached to, and a secure
+                        // desktop switch reassigns the ACTIVE input desktop away from hDesktop, not
+                        // this thread's own SetThreadDesktop attachment to it -- so even a
+                        // secure-desktop switch landing in that last instant leaves SendInput
+                        // injecting into the (by then background, non-secure) desktop this thread is
+                        // still attached to, never onto the new secure one, which is exactly the
+                        // security boundary this job must never cross.
+                        int desktopNameLengthNeeded;
+                        StringBuilder desktopNameBuilder = new StringBuilder(256);
+                        bool desktopNameRead = NativeMethods.GetUserObjectInformation(
+                            hDesktop, 2 /* UOI_NAME */, desktopNameBuilder, desktopNameBuilder.Capacity, out desktopNameLengthNeeded);
+                        string desktopName = desktopNameRead ? desktopNameBuilder.ToString() : null;
+                        result.DesktopName = desktopName;
+                        bool desktopNameSafe = desktopNameRead && string.Equals(desktopName, "Default", StringComparison.Ordinal);
+                        if (!desktopNameSafe)
+                        {
+                            result.DesktopNameRefused = true;
+                            result.SendInputError = desktopNameRead
+                                ? "ATTRCUDA_SECURE_DESKTOP_REFUSED reason=secure_desktop desktop name '" + desktopName + "' is not the expected non-secure desktop; no SendInput attempted"
+                                : "ATTRCUDA_SECURE_DESKTOP_REFUSED reason=desktop_name_unknown desktop name could not be read (lastError=" + Marshal.GetLastWin32Error() + "); no SendInput attempted";
                             return;
                         }
                         // CUDA-PERF-DISPLAY-WAKE-3 round 3 (live UM evidence, defect class fix):
@@ -2912,6 +2970,68 @@ function Get-AttrCudaScreensaverSecure {
     }
 }
 
+function Invoke-AttrCudaBoundedProbe {
+    <#
+    .SYNOPSIS
+    Runs a zero-argument probe function -- by name, resolved via Get-Command IN THE CALLER'S OWN
+    scope/runspace, the same late-binding-by-name mechanism Start-AttrCudaDisplayWakeKeepAlive's own
+    SessionStateFunctionEntry setup already relies on, so a test's override of e.g.
+    Get-AttrCudaScreensaverRunning is honored here too -- on a dedicated PowerShell instance/Runspace
+    of its own, bounded by -TimeoutMilliseconds. Non-throwing, like every other function in this
+    file.
+    .DESCRIPTION
+    CUDA-PERF-DISPLAY-WAKE-4 round 1b (sol hardening). A plain PowerShell function call has no
+    built-in per-call timeout of its own -- the PowerShell-native equivalent of the bounded dedicated
+    THREAD [MLVAppAttrCudaDisplayWake.InputDesktopNudge]::Run already uses for SendInput (a fresh
+    thread, joined with a timeout) is a fresh Runspace here, since a scriptblock cannot be run on a
+    raw .NET thread without one (see InputDesktopNudge's own header for exactly why). Without this,
+    a probe that never returns (a test stub that blocks, or -- live -- a wedged SystemParametersInfo
+    call) blocks the calling tick indefinitely, and in turn blocks
+    Stop-AttrCudaDisplayWakeKeepAlive's own EndInvoke wait the same way, since the loop's pipeline
+    thread never reaches its next -StopEvent.Wait() check.
+    Returns the probe's own result when it completes within -TimeoutMilliseconds. Returns $null --
+    the SAME "could not determine" value every probe in this file already returns on any other kind
+    of failure, which the keep-alive loop's existing fail-closed gate already treats as owner-only/
+    state_unknown -- when it does not. A timed-out probe's PowerShell/Runspace pair is deliberately
+    never Stop()/Dispose()d: there is no safe way in .NET to force-terminate a thread stuck inside a
+    P/Invoke call, and attempting Stop()/Dispose() on a still-running pipeline can itself block,
+    which would defeat the entire point of this wrapper -- so it is left running and abandoned, and
+    THIS call still always returns within -TimeoutMilliseconds regardless.
+    #>
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)]
+        [string]$FunctionName,
+        [int]$TimeoutMilliseconds = 3000
+    )
+    try {
+        $probeCommand = Get-Command -Name $FunctionName -CommandType Function -ErrorAction Stop
+        $probeIss = [System.Management.Automation.Runspaces.InitialSessionState]::CreateDefault()
+        $probeIss.Commands.Add(
+            [System.Management.Automation.Runspaces.SessionStateFunctionEntry]::new(
+                $FunctionName, $probeCommand.Definition))
+        $probeRunspace = [System.Management.Automation.Runspaces.RunspaceFactory]::CreateRunspace($probeIss)
+        $probeRunspace.Open()
+        $probeShell = [System.Management.Automation.PowerShell]::Create()
+        $probeShell.Runspace = $probeRunspace
+        [void]$probeShell.AddCommand($FunctionName)
+        $probeAsync = $probeShell.BeginInvoke()
+        if (-not $probeAsync.AsyncWaitHandle.WaitOne([int]$TimeoutMilliseconds)) {
+            # Bounded timeout: deliberately does not Stop()/Dispose()/Close() a pipeline that is
+            # still running -- see .DESCRIPTION. Leaked on purpose, in this one path only.
+            return $null
+        }
+        $probeResult = $null
+        try { $probeResult = $probeShell.EndInvoke($probeAsync) | Select-Object -First 1 } catch { $probeResult = $null }
+        try { $probeShell.Dispose() } catch { }
+        try { $probeRunspace.Close() } catch { }
+        try { $probeRunspace.Dispose() } catch { }
+        return $probeResult
+    } catch {
+        return $null
+    }
+}
+
 function Wait-AttrCudaScreensaverDismissed {
     <#
     .SYNOPSIS
@@ -3015,6 +3135,8 @@ function Invoke-AttrCudaInputDesktopNudge {
             sendInputError = $null
             closeDesktopError = $null
             threadJoined = $false
+            desktopName = $null
+            desktopNameRefused = $false
         }
     }
 
@@ -3027,6 +3149,12 @@ function Invoke-AttrCudaInputDesktopNudge {
             sendInputError = $result.SendInputError
             closeDesktopError = $result.CloseDesktopError
             threadJoined = [bool]$result.ThreadJoined
+            # CUDA-PERF-DISPLAY-WAKE-4 round 1b (sol BLOCKER fix): the desktop name the dedicated
+            # thread actually read back right before SendInput, and whether it was refused on that
+            # basis -- see InputDesktopNudge.Run's own comment for why this in-thread check, not a
+            # caller-side re-check, is what closes the read-then-inject race.
+            desktopName = $result.DesktopName
+            desktopNameRefused = [bool]$result.DesktopNameRefused
         }
     } catch {
         [ordered]@{
@@ -3036,6 +3164,8 @@ function Invoke-AttrCudaInputDesktopNudge {
             sendInputError = $null
             closeDesktopError = $null
             threadJoined = $false
+            desktopName = $null
+            desktopNameRefused = $false
         }
     }
 }
@@ -3303,6 +3433,14 @@ function Start-AttrCudaDisplayWakeKeepAlive {
     Invoke-AttrCudaInputDesktopNudge's own -JoinTimeoutMilliseconds. Bounds each tick so a stuck
     dedicated thread cannot delay the next one indefinitely; a join timeout still counts the tick as
     a recorded failure below, never a silent skip.
+    .PARAMETER ProbeTimeoutMilliseconds
+    CUDA-PERF-DISPLAY-WAKE-4 round 1b (sol hardening). Bound passed to every
+    Invoke-AttrCudaBoundedProbe call this loop makes (the running/secure re-read at the top of each
+    tick, and the after-nudge confirmation poll) -- see that function's own header for why a probe
+    needs a bound at all. A probe that does not return in time reads as $null (state_unknown), the
+    same fail-closed value every probe here already returns on any other failure; it is never a
+    silent skip, and it never lets a hung probe delay this tick -- or, downstream,
+    Stop-AttrCudaDisplayWakeKeepAlive's own EndInvoke wait -- indefinitely.
     .OUTPUTS
     A handle for Stop-AttrCudaDisplayWakeKeepAlive and Get-AttrCudaDisplayWakeKeepAliveHealth.
     .nudgeState.count is a live, thread-safe counter of nudge attempts (incremented whether or not
@@ -3334,7 +3472,8 @@ function Start-AttrCudaDisplayWakeKeepAlive {
     param(
         [ValidateRange(1, 20)]
         [int]$IntervalSeconds = 15,
-        [int]$NudgeJoinTimeoutMilliseconds = 5000
+        [int]$NudgeJoinTimeoutMilliseconds = 5000,
+        [int]$ProbeTimeoutMilliseconds = 3000
     )
 
     # CUDA-PERF-DISPLAY-WAKE-3 round 1b (sol BLOCKER): the Boolean result was previously discarded
@@ -3361,6 +3500,7 @@ function Start-AttrCudaDisplayWakeKeepAlive {
             })
             intervalSeconds = $IntervalSeconds
             nudgeJoinTimeoutMilliseconds = $NudgeJoinTimeoutMilliseconds
+            probeTimeoutMilliseconds = $ProbeTimeoutMilliseconds
             setupError = 'ATTRCUDA_KEEPALIVE_NATIVE_UNAVAILABLE native P/Invoke type could not be loaded; no keep-alive loop was started'
             startedUtc = (Get-Date).ToUniversalTime().ToString('o')
         }
@@ -3377,7 +3517,7 @@ function Start-AttrCudaDisplayWakeKeepAlive {
         lastFailureUtc = $null
     })
     $loopScript = {
-        param($StopEvent, $IntervalSeconds, $NudgeState, $JoinTimeoutMilliseconds)
+        param($StopEvent, $IntervalSeconds, $NudgeState, $JoinTimeoutMilliseconds, $ProbeTimeoutMilliseconds)
         while (-not $StopEvent.Wait([int]($IntervalSeconds * 1000))) {
             try {
                 # CUDA-PERF-DISPLAY-WAKE-4 round 1 (BLOCKER fix): re-read the running/secure probes
@@ -3390,9 +3530,13 @@ function Start-AttrCudaDisplayWakeKeepAlive {
                 # defined in this Runspace's InitialSessionState (see Start-AttrCudaDisplayWakeKeepAlive
                 # above) from their CURRENT definitions in the caller's own scope, so a test can
                 # override this exact behavior the same way Start-AttrCudaDisplayWake's own probes are
-                # already overridden.
-                $tickRunning = Get-AttrCudaScreensaverRunning
-                $tickSecure = Get-AttrCudaScreensaverSecure
+                # already overridden. Round 1b (sol hardening): each read now goes through
+                # Invoke-AttrCudaBoundedProbe -- itself copied into this Runspace's
+                # InitialSessionState the same way -- so a probe (or a test's override of one) that
+                # never returns cannot block this tick, or Stop-AttrCudaDisplayWakeKeepAlive's own
+                # EndInvoke wait, indefinitely; see that function's own header.
+                $tickRunning = Invoke-AttrCudaBoundedProbe -FunctionName 'Get-AttrCudaScreensaverRunning' -TimeoutMilliseconds $ProbeTimeoutMilliseconds
+                $tickSecure = Invoke-AttrCudaBoundedProbe -FunctionName 'Get-AttrCudaScreensaverSecure' -TimeoutMilliseconds $ProbeTimeoutMilliseconds
                 $tickSecureOwnerOnly = if ($tickRunning -eq $false) {
                     $false
                 } elseif ($tickRunning -eq $true) {
@@ -3444,11 +3588,15 @@ function Start-AttrCudaDisplayWakeKeepAlive {
                         # was added to catch at claim time) is still caught here. Bounded at 2s/250ms,
                         # a smaller budget than the 5s claim-time dismiss wait since a healthy tick
                         # only needs to confirm the idle timer was actually reset, not end an
-                        # already-engaged screen saver.
+                        # already-engaged screen saver. Round 1b (sol hardening): this call is now
+                        # ALSO bounded via Invoke-AttrCudaBoundedProbe -- without it, a single hung
+                        # underlying probe call inside this while loop could block past the 2000ms
+                        # budget below (the budget is only ever checked BETWEEN calls, never during
+                        # one), same class of defect as the top-of-tick probes above.
                         $afterRunning = $null
                         $afterPoll = [System.Diagnostics.Stopwatch]::StartNew()
                         while ($true) {
-                            $afterRunning = Get-AttrCudaScreensaverRunning
+                            $afterRunning = Invoke-AttrCudaBoundedProbe -FunctionName 'Get-AttrCudaScreensaverRunning' -TimeoutMilliseconds $ProbeTimeoutMilliseconds
                             if ($afterRunning -eq $false) { break }
                             if ($afterPoll.ElapsedMilliseconds -ge 2000) { break }
                             Start-Sleep -Milliseconds 250
@@ -3495,10 +3643,15 @@ function Start-AttrCudaDisplayWakeKeepAlive {
         # _wake_with_overrides test helper already rely on) is added to the new Runspace's
         # InitialSessionState via SessionStateFunctionEntry, so $loopScript's per-tick re-check
         # above can call them, and a test can override this exact behavior by redefining the three
-        # functions in its own flat script before calling this one.
+        # functions in its own flat script before calling this one. Round 1b (sol hardening):
+        # Invoke-AttrCudaBoundedProbe joins the same list -- the loop calls IT, not the two probes
+        # directly, so it must exist in this Runspace too; it resolves 'Get-AttrCudaScreensaverRunning'/
+        # '-Secure' by name FROM WITHIN this same Runspace when it runs, so it still sees whichever
+        # definition (default or test-overridden) was loaded here.
         $initialSessionState = [System.Management.Automation.Runspaces.InitialSessionState]::CreateDefault()
         foreach ($tickProbeFunctionName in @(
-                'Register-AttrCudaDisplayWakeNativeMethods', 'Get-AttrCudaScreensaverRunning', 'Get-AttrCudaScreensaverSecure')) {
+                'Register-AttrCudaDisplayWakeNativeMethods', 'Get-AttrCudaScreensaverRunning',
+                'Get-AttrCudaScreensaverSecure', 'Invoke-AttrCudaBoundedProbe')) {
             $tickProbeCommand = Get-Command -Name $tickProbeFunctionName -CommandType Function
             $initialSessionState.Commands.Add(
                 [System.Management.Automation.Runspaces.SessionStateFunctionEntry]::new(
@@ -3508,7 +3661,7 @@ function Start-AttrCudaDisplayWakeKeepAlive {
         $runspace.Open()
         $shell = [System.Management.Automation.PowerShell]::Create()
         $shell.Runspace = $runspace
-        [void]$shell.AddScript($loopScript).AddArgument($stopEvent).AddArgument($IntervalSeconds).AddArgument($nudgeState).AddArgument($NudgeJoinTimeoutMilliseconds)
+        [void]$shell.AddScript($loopScript).AddArgument($stopEvent).AddArgument($IntervalSeconds).AddArgument($nudgeState).AddArgument($NudgeJoinTimeoutMilliseconds).AddArgument($ProbeTimeoutMilliseconds)
         $asyncResult = $shell.BeginInvoke()
     } catch {
         $setupError = $_.Exception.Message
@@ -3534,6 +3687,7 @@ function Start-AttrCudaDisplayWakeKeepAlive {
         nudgeState = $nudgeState
         intervalSeconds = $IntervalSeconds
         nudgeJoinTimeoutMilliseconds = $NudgeJoinTimeoutMilliseconds
+        probeTimeoutMilliseconds = $ProbeTimeoutMilliseconds
         setupError = $setupError
         startedUtc = (Get-Date).ToUniversalTime().ToString('o')
     }
@@ -3659,10 +3813,18 @@ function Stop-AttrCudaDisplayWakeKeepAlive {
     Non-throwing, and safe to call with $null or an already-stopped handle -- a job's `finally`
     block may reach here even when Start-AttrCudaDisplayWakeKeepAlive was never reached, or reached
     only as far as recording a .setupError.
+    .PARAMETER TimeoutMilliseconds
+    CUDA-PERF-DISPLAY-WAKE-4 round 1b (sol hardening). Bounds this call's own wait for the loop's
+    background pipeline to actually finish after -StopEvent.Set() -- defense in depth alongside the
+    per-tick probe bound (Invoke-AttrCudaBoundedProbe) Start-AttrCudaDisplayWakeKeepAlive's loop now
+    uses: EndInvoke on its own blocks until the pipeline's CURRENT tick completes, which would be
+    unbounded if that tick were ever stuck. This call therefore never blocks past
+    -TimeoutMilliseconds regardless of what the loop's current tick is doing.
     #>
     [CmdletBinding()]
     param(
-        $Handle
+        $Handle,
+        [int]$TimeoutMilliseconds = 15000
     )
 
     $stopError = $null
@@ -3684,7 +3846,16 @@ function Stop-AttrCudaDisplayWakeKeepAlive {
         try {
             if ($Handle.stopEvent) { $Handle.stopEvent.Set() }
             if ($Handle.powershell -and $Handle.asyncResult) {
-                [void]$Handle.powershell.EndInvoke($Handle.asyncResult)
+                # CUDA-PERF-DISPLAY-WAKE-4 round 1b (sol hardening): wait on the async handle
+                # directly first, bounded -- EndInvoke's own wait has no such bound. EndInvoke below
+                # then returns immediately (the pipeline has already completed) when that wait
+                # succeeds; when it does not, EndInvoke is skipped entirely rather than called
+                # unbounded, and the timeout is recorded as a typed .error instead.
+                if ($Handle.asyncResult.AsyncWaitHandle.WaitOne([int]$TimeoutMilliseconds)) {
+                    [void]$Handle.powershell.EndInvoke($Handle.asyncResult)
+                } else {
+                    $stopError = "ATTRCUDA_KEEPALIVE_STOP_TIMEOUT background pipeline did not complete within ${TimeoutMilliseconds}ms of the stop request"
+                }
             }
         } catch {
             $stopError = $_.Exception.Message
@@ -3906,6 +4077,7 @@ Export-ModuleMember -Function `
     Get-AttrCudaScreensaverTimeoutSeconds, `
     Get-AttrCudaScreensaverActive, `
     Get-AttrCudaScreensaverSecure, `
+    Invoke-AttrCudaBoundedProbe, `
     Wait-AttrCudaScreensaverDismissed, `
     Invoke-AttrCudaInputDesktopNudge, `
     Start-AttrCudaDisplayWake, `
