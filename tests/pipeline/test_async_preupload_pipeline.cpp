@@ -3,8 +3,14 @@
 #include "../../src/mlv/llrawproc/llrawproc.h"
 #include "../../src/mlv/pipeline_stage_capture.h"
 #include <cstdint>
+#include <cstring>
 #include <vector>
 #include <QByteArray>
+
+extern "C" int llrpInstallFakeGpuPlaybackReconBackendForTesting(int install);
+extern "C" int llrpResetGpuExportBackendForTesting(void);
+extern "C" int llrpGpuPlaybackReconLastPreuploadStatusForTesting(
+    llrpGpuPlaybackReconPreuploadStatus_t * status);
 
 static void assert_fixture_ready(MlvPipelineFixture & fixture)
 {
@@ -247,4 +253,296 @@ TEST(DualIsoPipeline, AsyncPreuploadDoesNotStageDisabledOrIneligibleFrames)
         ASSERT_TRUE(!frame.empty());
         ASSERT_EQ(0, observation.calls);
     }
+}
+
+// ---- Executable consume-side proof (GPU-less board): an in-process fake
+// implementation of the igpu_recon_backend C seam, installed in place of a
+// real DLL-loaded backend. This board has no NVIDIA GPU, so it cannot prove
+// real CUDA slot matching or pixel parity (see round summary,
+// GPU-UNPROVEN); it DOES exercise the exact token match/mismatch/fallback
+// decision in llrawproc_gpu_recon_run_backend() -- the C-side logic under
+// this card's scope -- for every public consuming entry point.
+
+namespace {
+class FakeGpuBackendScope {
+public:
+    FakeGpuBackendScope()
+    {
+        llrpInstallFakeGpuPlaybackReconBackendForTesting(1);
+    }
+    ~FakeGpuBackendScope()
+    {
+        llrpInstallFakeGpuPlaybackReconBackendForTesting(0);
+        llrpResetGpuExportBackendForTesting();
+    }
+};
+
+class AsyncH2dEnvScope {
+    QByteArray saved;
+    bool hadSaved;
+public:
+    explicit AsyncH2dEnvScope(bool enabled)
+    {
+        hadSaved = qEnvironmentVariableIsSet("MLVAPP_GPU_PLAYBACK_RECON_ASYNC_H2D");
+        if (hadSaved) saved = qgetenv("MLVAPP_GPU_PLAYBACK_RECON_ASYNC_H2D");
+        qputenv("MLVAPP_GPU_PLAYBACK_RECON_ASYNC_H2D", enabled ? "1" : "0");
+    }
+    ~AsyncH2dEnvScope()
+    {
+        if (hadSaved) qputenv("MLVAPP_GPU_PLAYBACK_RECON_ASYNC_H2D", saved);
+        else qunsetenv("MLVAPP_GPU_PLAYBACK_RECON_ASYNC_H2D");
+    }
+};
+
+llrpGpuPlaybackReconState_t makeValidatedFakeBackendState(uint64_t frameId,
+                                                          int width,
+                                                          int height)
+{
+    static int dummy_int_lut[1] = { 0 };
+    static double dummy_double_lut[1] = { 0.0 };
+    llrpGpuPlaybackReconState_t state = {};
+    state.valid = 1;
+    state.width = width;
+    state.height = height;
+    state.black_level = 0;
+    state.white_level = 65535;
+    state.white_darkened = 65535;
+    state.black_delta = 0;
+    state.ev_correction = 0.0;
+    state.dark_noise = 0.0;
+    state.interp_method = 1;    // AMaZE: the only admitted no-readback class
+    state.use_alias_map = 1;
+    state.use_fullres = 1;
+    state.chroma_smooth_method = 0;
+    state.raw2ev = dummy_int_lut;
+    state.ev2raw = dummy_int_lut;
+    state.mix_curve = dummy_double_lut;
+    state.fullres_curve = dummy_double_lut;
+    state.frame_id = frameId;
+    return state;
+}
+
+std::vector<uint16_t> makeBayer14(int width, int height, uint16_t base)
+{
+    std::vector<uint16_t> pixels(size_t(width) * size_t(height));
+    for (size_t i = 0; i < pixels.size(); ++i) pixels[i] = uint16_t(base + i);
+    return pixels;
+}
+}
+
+TEST(DualIsoPipeline, AsyncPreuploadCpu16ProbeConsumesMatchingFrameAndBytes)
+{
+    const FakeGpuBackendScope fakeBackend;
+    const AsyncH2dEnvScope asyncEnv(true);
+    const int width = 4, height = 4;
+    auto state = makeValidatedFakeBackendState(7, width, height);
+    auto bytesA = makeBayer14(width, height, 100);
+    std::vector<uint16_t> output(bytesA.size());
+    int rc = -1;
+    llrpGpuPlaybackReconTiming_t timing = {};
+
+    // Warm up: g->clip_configured must already be true before a preupload can
+    // be accepted (llrpGpuPlaybackReconPreuploadFrame() checks it) -- exactly
+    // as it would be in production after the first frame's recon call.
+    ASSERT_NE(0, llrpGpuPlaybackReconRunCpu16Probe(&state, bytesA.data(),
+        bytesA.size() * sizeof(uint16_t), output.data(), &rc, &timing));
+
+    ASSERT_NE(0, llrpGpuPlaybackReconPreuploadFrame(7, bytesA.data(),
+        bytesA.size() * sizeof(uint16_t)));
+    ASSERT_NE(0, llrpGpuPlaybackReconRunCpu16Probe(&state, bytesA.data(),
+        bytesA.size() * sizeof(uint16_t), output.data(), &rc, &timing));
+    ASSERT_EQ(0, rc);
+    ASSERT_NE(0, timing.preupload.available);
+    ASSERT_NE(0, timing.preupload.accepted);
+    ASSERT_NE(0, timing.preupload.used);
+    ASSERT_NE(0, timing.preupload.exact_match);
+    for (size_t i = 0; i < bytesA.size(); ++i)
+    {
+        ASSERT_EQ(uint16_t(bytesA[i] + 1u), output[i]);
+    }
+}
+
+TEST(DualIsoPipeline, AsyncPreuploadRejectsCrossFrameTokenAndFallsBackCorrectly)
+{
+    const FakeGpuBackendScope fakeBackend;
+    const AsyncH2dEnvScope asyncEnv(true);
+    const int width = 4, height = 4;
+    auto stateN = makeValidatedFakeBackendState(41, width, height);
+    auto stateM = makeValidatedFakeBackendState(42, width, height);
+    auto bytesA = makeBayer14(width, height, 200);
+    auto bytesB = makeBayer14(width, height, 300);
+    std::vector<uint16_t> outputPreuploaded(bytesA.size());
+    std::vector<uint16_t> outputSync(bytesB.size());
+    int rc = -1;
+    llrpGpuPlaybackReconTiming_t timing = {};
+
+    ASSERT_NE(0, llrpGpuPlaybackReconRunCpu16Probe(&stateN, bytesA.data(),
+        bytesA.size() * sizeof(uint16_t), outputPreuploaded.data(), &rc, &timing));
+
+    // Stage frame 41's bytes, then run frame 42 with DIFFERENT live bytes.
+    ASSERT_NE(0, llrpGpuPlaybackReconPreuploadFrame(41, bytesA.data(),
+        bytesA.size() * sizeof(uint16_t)));
+    ASSERT_NE(0, llrpGpuPlaybackReconRunCpu16Probe(&stateM, bytesB.data(),
+        bytesB.size() * sizeof(uint16_t), outputPreuploaded.data(), &rc, &timing));
+    ASSERT_EQ(0, rc);
+    ASSERT_EQ(0, timing.preupload.accepted);
+    ASSERT_EQ(0, timing.preupload.used);
+    ASSERT_EQ(0, timing.preupload.exact_match);
+
+    // Fallback output must equal the plain synchronous path run directly on
+    // the same (mismatched-frame) live bytes -- a real backend's documented
+    // "otherwise it executes the ordinary synchronous upload path".
+    ASSERT_NE(0, llrpGpuPlaybackReconRunCpu16Probe(&stateM, bytesB.data(),
+        bytesB.size() * sizeof(uint16_t), outputSync.data(), &rc, &timing));
+    ASSERT_TRUE(outputPreuploaded == outputSync);
+}
+
+TEST(DualIsoPipeline, AsyncPreuploadRejectsByteMismatchWithSameFrameAndFallsBackCorrectly)
+{
+    const FakeGpuBackendScope fakeBackend;
+    const AsyncH2dEnvScope asyncEnv(true);
+    const int width = 4, height = 4;
+    auto state = makeValidatedFakeBackendState(9, width, height);
+    auto bytesA = makeBayer14(width, height, 10);
+    auto bytesB = makeBayer14(width, height, 20);
+    std::vector<uint16_t> outputPreuploaded(bytesA.size());
+    std::vector<uint16_t> outputSync(bytesB.size());
+    int rc = -1;
+    llrpGpuPlaybackReconTiming_t timing = {};
+
+    ASSERT_NE(0, llrpGpuPlaybackReconRunCpu16Probe(&state, bytesA.data(),
+        bytesA.size() * sizeof(uint16_t), outputPreuploaded.data(), &rc, &timing));
+
+    // Stage frame 9 with bytesA, but the decoded input changed by the time
+    // recon actually runs (bytesB) -- same frame token, different bytes.
+    ASSERT_NE(0, llrpGpuPlaybackReconPreuploadFrame(9, bytesA.data(),
+        bytesA.size() * sizeof(uint16_t)));
+    ASSERT_NE(0, llrpGpuPlaybackReconRunCpu16Probe(&state, bytesB.data(),
+        bytesB.size() * sizeof(uint16_t), outputPreuploaded.data(), &rc, &timing));
+    ASSERT_EQ(0, rc);
+    ASSERT_NE(0, timing.preupload.accepted);   // token matched...
+    ASSERT_EQ(0, timing.preupload.used);       // ...but bytes did not
+    ASSERT_EQ(0, timing.preupload.exact_match);
+
+    ASSERT_NE(0, llrpGpuPlaybackReconRunCpu16Probe(&state, bytesB.data(),
+        bytesB.size() * sizeof(uint16_t), outputSync.data(), &rc, &timing));
+    ASSERT_TRUE(outputPreuploaded == outputSync);
+}
+
+TEST(DualIsoPipeline, AsyncPreuploadFrameZeroIsArmedAcrossAllConsumingEntryPoints)
+{
+    const FakeGpuBackendScope fakeBackend;
+    const AsyncH2dEnvScope asyncEnv(true);
+    const int width = 2, height = 2;
+    auto state = makeValidatedFakeBackendState(0, width, height);
+    auto bytes = makeBayer14(width, height, 5);
+    int rc = -1;
+    llrpGpuPlaybackReconTiming_t timing = {};
+
+    // Cpu16Probe.
+    std::vector<uint16_t> cpuOut(bytes.size());
+    ASSERT_NE(0, llrpGpuPlaybackReconRunCpu16Probe(&state, bytes.data(),
+        bytes.size() * sizeof(uint16_t), cpuOut.data(), &rc, &timing));
+    ASSERT_NE(0, llrpGpuPlaybackReconPreuploadFrame(0, bytes.data(),
+        bytes.size() * sizeof(uint16_t)));
+    ASSERT_NE(0, llrpGpuPlaybackReconRunCpu16Probe(&state, bytes.data(),
+        bytes.size() * sizeof(uint16_t), cpuOut.data(), &rc, &timing));
+    ASSERT_NE(0, timing.preupload.used);
+
+    // GL texture (fake backend succeeds without touching the texture id).
+    ASSERT_NE(0, llrpGpuPlaybackReconPreuploadFrame(0, bytes.data(),
+        bytes.size() * sizeof(uint16_t)));
+    ASSERT_NE(0, llrpGpuPlaybackReconRunGlTexture(&state, bytes.data(),
+        bytes.size() * sizeof(uint16_t), 1u, &rc, &timing));
+    ASSERT_NE(0, timing.preupload.used);
+
+    // Device Bayer16.
+    const uint16_t * deviceBayer16 = nullptr;
+    int deviceWidth = 0, deviceHeight = 0;
+    ASSERT_NE(0, llrpGpuPlaybackReconPreuploadFrame(0, bytes.data(),
+        bytes.size() * sizeof(uint16_t)));
+    ASSERT_NE(0, llrpGpuPlaybackReconRunDeviceBayer16(&state, bytes.data(),
+        bytes.size() * sizeof(uint16_t), &deviceBayer16, &deviceWidth,
+        &deviceHeight, &rc, &timing));
+    ASSERT_NE(0, timing.preupload.used);
+    ASSERT_TRUE(deviceBayer16 != nullptr);
+
+    // Retained device Bayer16.
+    llrpGpuPlaybackRetainedDeviceBayer16_t retained = {};
+    ASSERT_NE(0, llrpGpuPlaybackReconPreuploadFrame(0, bytes.data(),
+        bytes.size() * sizeof(uint16_t)));
+    ASSERT_NE(0, llrpGpuPlaybackReconRunRetainedDeviceBayer16(&state,
+        bytes.data(), bytes.size() * sizeof(uint16_t), &retained, &rc, &timing));
+    ASSERT_NE(0, timing.preupload.used);
+    ASSERT_NE(0, retained.valid);
+}
+
+TEST(DualIsoPipeline, AsyncPreuploadRenderThreadRetainedDevicePathReportsStatusSameThread)
+{
+    // This is the actual production call chain (blocker fixed in this round):
+    // applyLLRawProcObjectWorker()'s retained-device, prepare-only branch now
+    // passes a real timing_out to llrpGpuPlaybackReconRunRetainedDeviceBayer16()
+    // and copies its .preupload into a same-thread TLS that
+    // insertGpuPlaybackReconRunTelemetry() (RenderFrameThread.cpp) reads right
+    // after this call returns. Reverting that timing_out back to NULL, or
+    // dropping the TLS copy, turns this test red.
+    const FakeGpuBackendScope fakeBackend;
+    // Mirrors PreparedPreuploadFixtureScope's env set (the working pattern
+    // used by the staging-side tests above) plus RETAIN_DEVICE_OUTPUT=1:
+    // gpu_playback_prepare_only_allowed requires MLVAPP_GPU_PLAYBACK_RECON
+    // truthy (not just the thread-local opt-in below) and !gpu_export_input
+    // requires MLVAPP_GPU_EXPORT off, or this whole branch is silently
+    // skipped and every status stays at its zeroed reset.
+    std::vector<std::pair<QByteArray, QByteArray>> savedEnv;
+    for (const auto &setting : std::vector<std::pair<QByteArray, QByteArray>>{
+             {"MLVAPP_GPU_EXPORT", "0"},
+             {"MLVAPP_GPU_PLAYBACK_RECON", "1"},
+             {"MLVAPP_GPU_PLAYBACK_RECON_ASYNC_H2D", "1"},
+             {"MLVAPP_GPU_PLAYBACK_RECON_VALIDATE_OUTPUT", "0"},
+             {"MLVAPP_GPU_PLAYBACK_RECON_RETAIN_DEVICE_OUTPUT", "1"}})
+    {
+        savedEnv.push_back({setting.first, qgetenv(setting.first.constData())});
+        qputenv(setting.first.constData(), setting.second);
+    }
+
+    MlvPipelineFixture fixture;
+    assert_fixture_ready(fixture);
+    configure_gpu_export_supported_dual_iso(fixture);
+    auto *video = fixture.video();
+    llrpSetDualIsoInterpolationMethod(video, DISOI_MEAN23);
+    video->llrawproc->focus_pixels = 0;
+    video->llrawproc->bad_pixels = 0;
+    video->llrawproc->vertical_stripes = 0;
+
+    const GpuPlaybackReconThreadOptIn optIn(true);
+    const GpuPlaybackReconTexturePresentOptIn texturePresent(true);
+    const GpuPlaybackReconTexturePrepareOnlyOptIn prepareOnly(true);
+
+    const size_t pixelCount = size_t(fixture.width()) * size_t(fixture.height());
+    mlv_pipeline_capture_set_current_frame(0);
+
+    // First pass warms up clip_configured on the fake backend (see the other
+    // tests in this file); the second pass is the one whose preupload is
+    // actually staged-then-consumed inside the worker. Each pass decodes a
+    // fresh buffer -- applyLLRawProcObjectWorker corrects it in place, and
+    // reusing an already-corrected buffer would double-apply those fixes.
+    std::vector<uint16_t> rawPass1(pixelCount);
+    ASSERT_EQ(0, getMlvRawFrameUint16(video, 0, rawPass1.data()));
+    applyLLRawProcObjectWorker(video, rawPass1.data(), rawPass1.size() * sizeof(uint16_t), nullptr, 0);
+
+    std::vector<uint16_t> rawPass2(pixelCount);
+    ASSERT_EQ(0, getMlvRawFrameUint16(video, 0, rawPass2.data()));
+    applyLLRawProcObjectWorker(video, rawPass2.data(), rawPass2.size() * sizeof(uint16_t), nullptr, 0);
+
+    llrpGpuPlaybackReconPreuploadStatus_t status = {};
+    const bool available = llrpGpuPlaybackReconLastPreuploadStatusForTesting(&status) != 0;
+
+    for (const auto &setting : savedEnv) {
+        if (setting.second.isNull()) qunsetenv(setting.first.constData());
+        else qputenv(setting.first.constData(), setting.second);
+    }
+
+    ASSERT_TRUE(available);
+    ASSERT_NE(0, status.accepted);
+    ASSERT_NE(0, status.used);
 }
