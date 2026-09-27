@@ -190,6 +190,11 @@ jobs:
         run: |
           & tools\profiling\test-gui-smoke-screenshot-provenance.ps1
 
+      - name: Test color-artifact scan capture-invalid contract
+        if: needs.protected-check-route.outputs.product == 'true'
+        run: |
+          & tools\profiling\test-gui-smoke-color-artifact-scan.ps1
+
       - name: Set up Python
         uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6
         with:

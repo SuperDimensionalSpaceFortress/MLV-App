@@ -24,6 +24,7 @@
 #include "rt_math.h"
 #include "opthelper.h"
 #include "StopWatch.h"
+#include <new>
 #ifdef _OPENMP
 #include <omp.h>
 #endif

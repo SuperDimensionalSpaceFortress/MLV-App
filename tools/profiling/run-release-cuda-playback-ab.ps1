@@ -379,6 +379,14 @@ function New-PlaybackAbAnalysis {
     $suggestion = "rerun_playback_ab_for_stage_metrics"
     $confidence = "missing_metrics"
 
+    # PLAYBACK-MEASURE-HOST-LOAD-GATE-1 round 3: this analysis is embedded in the summary JSON and
+    # trusted verbatim downstream (compare-machine-perf.ps1's Get-ProofSummarySuggestion reads
+    # .analysis.suggestedOptimization directly). A host-load-provisional leg must refuse the
+    # delta-based bottleneck diagnosis here too, or the refusal never reaches that consumer -- the
+    # fps deltas below ($fpsDeltaPct etc.) are still computed and kept in .evidence for
+    # transparency, only the derived diagnosis is withheld.
+    $hostLoadProofFailures = @($ProofFailures | Where-Object { $_ -match 'host-load-provisional' })
+
     if ($null -ne $fpsDeltaPct) {
         $confidence = "observed_delta"
         if ($fpsDeltaPct -lt -1.0) {
@@ -450,6 +458,12 @@ function New-PlaybackAbAnalysis {
                 $suggestion = "validate_same_clip_on_second_machine"
             }
         }
+    }
+
+    if ($hostLoadProofFailures.Count -gt 0) {
+        $dominant = "host-load-provisional"
+        $suggestion = "rerun_playback_ab_with_quiet_host"
+        $confidence = "host_load_provisional"
     }
 
     [pscustomobject]@{
@@ -697,6 +711,79 @@ function Invoke-ChildPowerShell {
     }
 }
 
+function Get-HostLoadProofFailures {
+    # PLAYBACK-MEASURE-HOST-LOAD-GATE-1: this proof's presentedFps comparison is exactly the kind
+    # of cross-run fps comparison a PROVISIONAL leg must never enter -- an fps number measured on
+    # a loaded host (or one whose load could not be measured) is not a property of the build.
+    # Refuse the whole A/B fps proof rather than silently proving an improvement that is really
+    # host noise.
+    param(
+        [object]$BaselineSummary,
+        [object]$CandidateSummary,
+        [object]$CandidateSpeedSummary,
+        [switch]$SeparateCandidateSpeedRun
+    )
+
+    $failures = @()
+    if ($BaselineSummary.hostLoadProvisional) {
+        $failures += (
+            "baseline-host-load-provisional state=$($BaselineSummary.hostLoadState) " +
+            "reason=$($BaselineSummary.hostLoadReason)"
+        )
+    }
+    if ($CandidateSummary.hostLoadProvisional) {
+        $failures += (
+            "candidate-host-load-provisional state=$($CandidateSummary.hostLoadState) " +
+            "reason=$($CandidateSummary.hostLoadReason)"
+        )
+    }
+    if ($SeparateCandidateSpeedRun -and $CandidateSpeedSummary.hostLoadProvisional) {
+        $failures += (
+            "candidate-speed-host-load-provisional state=$($CandidateSpeedSummary.hostLoadState) " +
+            "reason=$($CandidateSpeedSummary.hostLoadReason)"
+        )
+    }
+    @($failures)
+}
+
+function Get-SmokeSummaryHostLoadFields {
+    # A leg recorded before PLAYBACK-MEASURE-HOST-LOAD-GATE-1 (or one whose host-load capture
+    # never made it into the JSON) never MEASURED its load, which is UNKNOWN, not "quiet".
+    # round 3: same for a hostLoad block that is PRESENT but missing "provisional"/"state" --
+    # [bool]$null -eq $false would silently read a degenerate block as clean, exactly backwards
+    # from this gate's fail-toward-provisional stance. Factored out of Read-SmokeSummary so it is
+    # independently testable, mirroring compare-release-gui-smoke-ab.ps1's
+    # Get-HostLoadComparisonEvidence.
+    param([object]$HostLoad)
+
+    # round 4 (sol major): "provisional" and "state" used to be derived independently, so a block
+    # carrying an explicit provisional=false alongside a missing/blank state read as
+    # state=unknown PROVISIONAL=false -- an inconsistent, clean-reading combination that let
+    # UNKNOWN enter an fps comparison unrefused. state=unknown now always forces provisional=true.
+    # round 8 (sol MAJOR item 3): that fix only special-cased state=="unknown" -- a leg with
+    # state="exceeded" and an inconsistent/fabricated provisional=false still read clean. THE
+    # CANONICAL PREDICATE (identical at every one of this card's six sites -- see
+    # compare-machine-perf.ps1's Get-PlaybackAbLegHostLoadProvisional for the full cross-file
+    # note): clean iff state=="quiet" AND provisional==false; every other combination is
+    # provisional.
+    $provisionalRaw = if ($null -eq $HostLoad) { $null } else { Get-NestedValue $HostLoad "provisional" }
+    $provisionalDeclared = if ($null -eq $HostLoad -or $null -eq $provisionalRaw) { $true } else { [bool]$provisionalRaw }
+    $stateRaw = if ($null -eq $HostLoad) { $null } else { Get-NestedValue $HostLoad "state" }
+    $state = if ($null -eq $HostLoad -or [string]::IsNullOrWhiteSpace([string]$stateRaw)) { "unknown" } else { [string]$stateRaw }
+    $provisional = ($provisionalDeclared -or $state -ne "quiet")
+    $reason = if ($null -eq $HostLoad) {
+        "no hostLoad telemetry recorded in the smoke result"
+    } else {
+        [string](Get-NestedValue $HostLoad "reason")
+    }
+
+    [pscustomobject]@{
+        provisional = $provisional
+        state = $state
+        reason = $reason
+    }
+}
+
 function Read-SmokeSummary {
     param(
         [Parameter(Mandatory = $true)][string]$Path,
@@ -710,10 +797,18 @@ function Read-SmokeSummary {
             exists = $false
             exitCode = $ExitCode
             validationOk = $false
+            hostLoadProvisional = $true
+            hostLoadState = "unknown"
+            hostLoadReason = "smoke result JSON does not exist"
         }
     }
 
     $json = Get-Content -LiteralPath $Path -Raw | ConvertFrom-Json -Depth 100
+    $hostLoad = Get-NestedValue $json "hostLoad"
+    $hostLoadFields = Get-SmokeSummaryHostLoadFields -HostLoad $hostLoad
+    $hostLoadProvisional = $hostLoadFields.provisional
+    $hostLoadState = $hostLoadFields.state
+    $hostLoadReason = $hostLoadFields.reason
     $summary = Get-NestedValue $json "log.summary"
     $glProof = Get-NestedValue $json "visualQuality.glOutputProof"
     if ($null -eq $glProof) {
@@ -822,6 +917,9 @@ function Read-SmokeSummary {
         exists = $true
         exitCode = $ExitCode
         validationOk = $validationOk
+        hostLoadProvisional = $hostLoadProvisional
+        hostLoadState = $hostLoadState
+        hostLoadReason = $hostLoadReason
         runMetadata = Get-NestedValue $json "log.runMetadata"
         validationFailures = @(Get-NestedValue $json "validation.failures")
         validationWarnings = @(Get-NestedValue $json "validation.warnings")
@@ -1524,6 +1622,11 @@ if (-not $candidateSummary.validationOk) {
 if ($SeparateCandidateSpeedRun -and -not $candidateSpeedSummary.validationOk) {
     $proofFailures += "candidate-speed-validation-not-ok"
 }
+$proofFailures += @(Get-HostLoadProofFailures `
+    -BaselineSummary $baselineSummary `
+    -CandidateSummary $candidateSummary `
+    -CandidateSpeedSummary $candidateSpeedSummary `
+    -SeparateCandidateSpeedRun:$SeparateCandidateSpeedRun)
 $candidateTextureProofSummaries = @(
     [pscustomobject]@{ label = "candidate"; summary = $candidateSummary }
 )
@@ -1585,11 +1688,25 @@ if ($RequireCandidateGlParity) {
     }
 }
 if ($RequireCandidateImprovesPresentedFps) {
-    $baselineFps = Convert-ToNullableDouble $baselineSummary.presentedFps
     $candidateForSpeed = if ($SeparateCandidateSpeedRun) { $candidateSpeedSummary } else { $candidateSummary }
-    $candidateFps = Convert-ToNullableDouble $candidateForSpeed.presentedFps
-    if ($null -eq $baselineFps -or $null -eq $candidateFps -or $candidateFps -le $baselineFps) {
-        $proofFailures += "candidate-presented-fps-not-improved baseline=$baselineFps candidate=$candidateFps"
+    # round 4 (sol major): this requirement used to compare presentedFps unconditionally, even
+    # when Get-HostLoadProofFailures (above) had already flagged one of these exact legs as
+    # host-load provisional -- the overall proof still failed either way, but this check ALSO
+    # emitted a "candidate-presented-fps-not-improved" line computed from noisy data, which
+    # misrepresents a host-load problem as an fps regression. Refuse the fps comparison itself
+    # when either leg is provisional instead of computing it from untrustworthy numbers.
+    if ($baselineSummary.hostLoadProvisional -or $candidateForSpeed.hostLoadProvisional) {
+        $proofFailures += (
+            "candidate-presented-fps-improvement-not-evaluated host-load-provisional " +
+            "baseline=$($baselineSummary.hostLoadProvisional) candidate=$($candidateForSpeed.hostLoadProvisional)"
+        )
+    }
+    else {
+        $baselineFps = Convert-ToNullableDouble $baselineSummary.presentedFps
+        $candidateFps = Convert-ToNullableDouble $candidateForSpeed.presentedFps
+        if ($null -eq $baselineFps -or $null -eq $candidateFps -or $candidateFps -le $baselineFps) {
+            $proofFailures += "candidate-presented-fps-not-improved baseline=$baselineFps candidate=$candidateFps"
+        }
     }
 }
 

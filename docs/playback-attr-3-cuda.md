@@ -20,11 +20,16 @@ an unnecessary system change to the owner's laptop.
 > read its `result.json` (exit 5, `msvcDiscovery`). `safe_to_submit_to_bachelor` certified script
 > safety, not toolchain existence.
 
-**Footage (NA-4).** `docs/never-authorized.json` NA-4 lets a lane open exactly one real clip:
-the single full canonical path on the `CLIP_OR_NONE:` line of that lane's own prompt
-(`MLV_LANE_PROMPT`). Agent sessions cannot write that line, so the **owner types it by hand**.
-Only step 5 touches footage; steps 1-4 compile, hash and move build artifacts and never name a
-media file. Adjudication: `.claude-state/fleet-runs/swarm-footage-route-20260916T2020Z/SYNTHESIS.md`.
+**Footage (NA-4, id-only route).** `docs/never-authorized.json` NA-4's `CLIP_OR_NONE:`
+owner-typed-path mechanism is how OTHER cards admit footage; this card uses NA-4's
+id-addressed-consumer route instead (ATTR3-FOOTAGE-BIND-1). Step 4 below takes an owner clip
+**id** (e.g. `M16-1243`), never a path: the generator resolves it through
+`tools/gates/resolve_consented_clip.py` against the frozen consent table
+(`OWNER_CONSENTED_FOOTAGE` in `tools/hooks/mlv-never-authorized.py`), and `-ClipPath` /
+`-FixtureSha256` are both refused outright for an owner id. Only step 4 touches footage; steps
+1-3 compile, hash and move build artifacts and never name a media file. Adjudication:
+`.claude-state/fleet-runs/swarm-footage-route-20260916T2020Z/SYNTHESIS.md` (round 1);
+ATTR3-FOOTAGE-BIND-1 (round 2, the current route).
 
 **Submission (NA-7).** Direct hooked writes to `\\bachelor\...` are refused. The tracked
 submitter `tools/profiling/um-run.ps1` is the route, and the agents execute only `inbox\*.job.ps1`
@@ -148,15 +153,19 @@ interrupted run leaves `build.json` unpublished by construction (it is copied la
 artifact has been renamed into place), so the attribution job's requirement that it be present is
 what makes a partial stage safe: re-drop the side-files and re-run.
 
-## 4. Attribution job (inside the owner-granted lane)
+## 4. Attribution job (owner clip, id-only)
 
-Run this **only inside a lane whose prompt carries the owner-typed `CLIP_OR_NONE:` path**.
-`-ClipPath` must be exactly that path.
+Run this for the owner's clip id. **No `-ClipPath` and no `-FixtureSha256`: both are refused
+outright for an owner clip id (ATTR3-FOOTAGE-BIND-1).** The generator resolves the id through
+`tools/gates/resolve_consented_clip.py` against the frozen consent table, bakes each resolved
+part's path (base64 of its UTF-8 bytes), length and lower-case sha256 into the emitted job, and
+the job re-verifies every part's content on Bachelor before anything opens. A resolver refusal
+throws with the resolver's own typed status and emits nothing -- never a path.
 
 ```powershell
 pwsh -NoProfile -File tools\profiling\bachelor\playback-attr-3-cuda-job.ps1 `
-    -SourceCommit <same-40-hex-sha> -BuildManifestSha256 <64-lowercase-hex> -ClipId <id> `
-    -ClipPath '<the lane prompt CLIP_OR_NONE path>' -OutFile <staging-dir>\<jobId>.job.ps1
+    -SourceCommit <same-40-hex-sha> -BuildManifestSha256 <64-lowercase-hex> `
+    -ClipId <owner id, e.g. M16-1243> -OutFile <staging-dir>\<jobId>.job.ps1
 ```
 
 **`-BuildManifestSha256` is mandatory, and the hub passes the sha the assembler printed**
@@ -170,9 +179,24 @@ parsed field is already a trusted field -- and then requires its `sourceCommit` 
 `pendingSymbolPresence` to be a real boolean. Both hashes land in `evidence-manifest.json` under
 `buildManifest`.
 
-On Bachelor the emitted job refuses to run unless the clip path sits directly in the agent cache,
-names that clip id, and exists. It verifies all three cache artifacts against the authenticated
-`build.json` and **reads `pendingSymbolPresence` from it**. PresentMon runs as a direct child,
+On Bachelor the emitted job re-verifies each resolved part against the live filesystem, AT ITS
+OWN RESOLVER PATH -- exists, readable, length, and sha256 (case-insensitive) -- through the
+shared `Test-AttrCudaFootagePart` verifier. Once every part passes, the job builds a PRIVATE,
+neutrally-named directory under its own work tree (one hard link per verified part, contiguous,
+never spelled from the caller's real names) and re-verifies each link's identity and content
+against its source before opening anything: playback opens only that private link's part 0
+(neutral base name `owner-clip`), never the owner's real path. Nothing this job publishes --
+stdout, `summary.json`, `evidence-manifest.json`, or any other artifact -- ever names a source
+path; every reader-facing output carries only the part's index and status. Any non-`PASS` part,
+or a failure creating/opening/re-verifying a private link, fails closed (`OWNER_FOOTAGE_NOT_VERIFIED`
+exit 19, `OWNER_FOOTAGE_LINK_CROSS_VOLUME` exit 21, or `OWNER_FOOTAGE_LINK_FAILED` exit 22),
+closing whatever handles were already held and removing whatever private links were already
+created, before PresentMon starts, before deploy, and before the smoke child. (The fixture route in
+section 4b instead requires the clip path to sit directly in the agent cache, name that clip id,
+and exist, then hashes it against `-FixtureSha256`, failing closed at
+`FIXTURE_CONTENT_MISMATCH`, exit 17, on a mismatch.) The job also verifies all three package
+cache artifacts (exe, DLL pair, PresentMon) against the authenticated `build.json` and **reads
+`pendingSymbolPresence` from it**. PresentMon runs as a direct child,
 inheriting the job-owned TEMP; if the agent account lacks ETW trace rights the job fails
 `PRESENTMON_FAILED rc=6` and never falls back to the elevated scheduled task.
 
@@ -189,14 +213,49 @@ Before any verdict the job takes the run's own `gpu_playback_recon.eligibility` 
 snapshot and exits **15 `BACKEND_NOT_AVAILABLE`** unless `cuda_backend_available=1` **and**
 `r16_available=1`, recording both plus `r16_reason`. A log with no eligibility line at all is
 refused the same way: absence of the diagnostic is not evidence of eligibility. Other outcomes:
-12 `VENUE_NOT_QUIESCENT`, 13 `GPU_RECON_FRAMES_ZERO`, 14 `CPU_FALLBACK_DETECTED`, 0
-`MEASUREMENT_CAPTURED`. It publishes `presentmon-series.csv`, `logs\smoke-run.log`,
+12 `VENUE_NOT_QUIESCENT`, 13 `GPU_RECON_FRAMES_ZERO`, 14 `CPU_FALLBACK_DETECTED`, 18
+`SMOKE_RUN_FAILED` (the smoke run itself never produced a passing `result.json`), 23
+`PRESENTMON_UNAVAILABLE` (PresentMon never produced a usable capture for the MLVApp process --
+covers a missing/unreadable/columnless csv, a wait timeout, and a nonzero PresentMon exit code
+alike, all typed and never destroying the smoke evidence already published; a wait timeout or
+nonzero exit also publishes `presentmon.csv`, if it exists, and `presentmon-capture.json` before
+exiting, the same evidence a parsing failure already left behind), 24 `DISPLAY_ASLEEP` (the
+MLVApp chain presented frames but displayed none), 0 `MEASUREMENT_CAPTURED`. Display rates
+(`presentedFps`/`displayedFps`) are for the MLVApp process id, summed across every swap chain
+address it used inside the playback window -- a mid-run swap chain recreation (e.g. a resize) is
+one logical preview, not two. It publishes `presentmon-series.csv`, `presentmon-capture.json`
+(the PresentMon clock anchor, bracketed by a pre-spawn/post-spawn wall-clock pair and the
+OS-reported process start, with the residual uncertainty in ms), `logs\smoke-run.log`,
 `evidence-manifest.json`, `provenance.json` and `artifact-index.json`.
+
+**Clock-bracket windowing.** PresentMon's own `TimeInMs=0` origin cannot be pinned to a single
+instant, so display/presented rows are windowed under BOTH endpoints of the capture-start bracket
+-- the OS-reported process start (or the pre-spawn wall clock, if the OS reported none) and the
+post-spawn wall clock -- never just the earlier one. `summary.json`/`evidence-manifest.json`
+carry the result as `clockBracket`: `earliest`/`latest` (each with `presentedCount`,
+`displayedCount`, `presentedFps`, `displayedFps`), `rowsDifferingInWindowMembership` (how many
+rows, any process, disagree on window membership between the two endpoints), and
+`headline`/`headlineReason` naming which endpoint the reported `chains`/`selectedChain`/
+`selectedChainRows` actually come from -- the endpoint admitting more DISPLAYED MLVApp rows,
+then more presented rows, ties to the earlier endpoint. Neither endpoint is exact; ranking by
+displayed rows first means `DISPLAY_ASLEEP` is reported only when neither endpoint admits a
+displayed MLVApp row.
+
+**Interval statistics exclude interval-less rows.** A row displayed only via `MsUntilDisplayed`
+(observed on the very first present of a capture, when `MsBetweenDisplayChange` reads `NA`) has
+no display-change interval to report -- `evidence-manifest.json`'s `presentMonStats`
+(`meanMs`/`sdMs`/`cvPct`/percentiles/`fpsEquivalentMean`/`count`) and `presentMon.positiveSamples`
+are computed only from rows with a positive `msBetweenDisplayChange`, never a `[double]$null`
+coerced to `0.0`. `presentmon-series.csv` and `presentMonSamples` still carry every displayed row
+(including the interval-less one, with an empty `msBetweenDisplayChange` cell);
+`refresh_period_histogram.py` already skips blank/non-positive cells reading that csv.
 
 The owner's consent for the clip on this card is recorded at
 `.claude-state/coordination/dual-lane/receipts/owner-footage-consent-20260916.json`, with its
 `-correction.json`. That receipt is evidence of consent, never an authorization -- the
-authorization is the owner-typed path line. The job cites the receipt's file name in
+authorization is the resolver's own cross-check of the id against the frozen consent table in
+`tools/hooks/mlv-never-authorized.py` (`OWNER_CONSENTED_FOOTAGE`), re-verified against the live
+filesystem by the job itself before anything opens. The job cites the receipt's file name in
 `evidence-manifest.json`.
 
 ## 4b. Fixture rehearsal (no footage)
@@ -224,6 +283,13 @@ pwsh -NoProfile -File "tools\profiling\bachelor\attr3-stage-fixture-job.ps1" `
 #     MANDATORY: um-run.ps1 defaults to the Ultra-Magnus share, not Bachelor's. -JobId is
 #     <stageJobId> from step (i) -- DISTINCT from step (iv)'s <attrJobId> below; reusing one
 #     id for both submissions is rejected with UMRUN_JOBID_IN_USE.
+#     ATTR3-FOOTAGE-STAGE-SUBMIT-RETRY-1 round 11: a JobId's claim is never reclaimed by age any
+#     more -- it is held until the submission that made it finishes (success or its own rollback)
+#     or an operator removes it by hand. Retrying THIS SAME <stageJobId> while an earlier attempt's
+#     claim is still sitting in the inbox (e.g. after killing a stuck `large_dual_iso` transfer) is
+#     refused outright with "choose a new -JobId" -- pick a fresh <stageJobId> for the retry, or,
+#     only if you are certain the earlier attempt is dead, remove
+#     \\bachelor\mlv-agent\inbox\<stageJobId>.meta.json by hand first.
 pwsh -NoProfile -File "tools\profiling\um-run.ps1" `
     -ScriptPath "<staging-dir>\<stageJobId>.job.ps1" -SideFile "<repo>\tests\fixtures\clips\<name>" `
     -JobId <stageJobId> -AgentShare \\bachelor\mlv-agent
@@ -243,12 +309,14 @@ pwsh -NoProfile -File "tools\profiling\um-run.ps1" `
     -ScriptPath "<staging-dir>\<attrJobId>.job.ps1" -JobId <attrJobId> -AgentShare \\bachelor\mlv-agent
 ```
 
-- **-ClipPath is OPTIONAL for a fixture id (ATTR3-FIXTURE-STAGE-1).** Omitted, the generator
-  derives it as the agent cache path for `-ClipId`; supplied, it must still resolve into the agent
-  cache with `BaseName -ceq $ClipId`, unchanged from the owner-clip case. `-FixtureSha256` is
-  MANDATORY for a fixture id and REFUSED for an owner clip id: the emitted job hashes the cached
-  clip before it is ever opened and fails closed at `FIXTURE_CONTENT_MISMATCH` (exit 17) on a
-  mismatch -- a cache file name proves nothing about its bytes.
+- **-ClipPath is OPTIONAL for a fixture id (ATTR3-FIXTURE-STAGE-1).** An owner clip id refuses
+  `-ClipPath` outright (section 4): its footage path is resolved, never typed by a caller.
+  Omitted for a fixture id, the generator derives it as the
+  agent cache path for `-ClipId`; supplied, it must still resolve into the agent cache with
+  `BaseName -ceq $ClipId`. `-FixtureSha256` is MANDATORY for a fixture id and REFUSED for an
+  owner clip id: the emitted job hashes the cached clip before it is ever opened and fails closed
+  at `FIXTURE_CONTENT_MISMATCH` (exit 17) on a mismatch -- a cache file name proves nothing about
+  its bytes.
 - **Unchanged for a fixture run.** `-BuildManifestSha256` still authenticates the staged manifest;
   the eligibility gate still exits 15 unless `cuda_backend_available=1` and `r16_available=1`.
 - **What it establishes.** That staging, backend load, the eligibility gate, PresentMon capture and
@@ -260,15 +328,34 @@ pwsh -NoProfile -File "tools\profiling\um-run.ps1" `
 
 ## 5. Extract the histogram
 
-Pull `presentmon-series.csv` and `logs\smoke-run.log` from the attribution artifacts, then:
-
 ```powershell
 py -3 tools\profiling\refresh_period_histogram.py `
-    --presentmon-csv <artifacts-dir>\presentmon-series.csv `
-    --frame-log <artifacts-dir>\logs\smoke-run.log `
+    --artifacts-dir <artifacts-dir> `
     --refresh-period-ms <Bachelor's panel refresh period in ms> `
     --out <artifacts-dir>\refresh-period-histogram.json
 ```
+
+`--artifacts-dir` is the leg's own published artifact root (`evidence-manifest.json`'s
+`artifactRoot`). It does three things at once: `--presentmon-csv`/`--frame-log` default to the
+standard paths inside it (`presentmon-series.csv`, `logs\smoke-run.log`), and
+the leg's `presentMonStatus` (and reason) is ALWAYS read from its `summary.json` (preferred) or
+`evidence-manifest.json` (`presentMon.status`/`statusReason`) and is authoritative.
+
+**PRESENTMON-HARNESS-ROBUSTNESS-3: one leg, one status.** With `--artifacts-dir`, an explicit
+`--presentmon-status` may only AGREE with the leg's published status (a contradiction is refused, exit 1), and
+explicit `--presentmon-csv`/`--frame-log` must resolve INSIDE that directory (another leg's data is refused), so one
+leg's `ok` can never authorize another leg's capture. The emitted report always carries `presentMonStatus`
+and `presentMonStatusReason`.
+
+**PRESENTMON-HARNESS-ROBUSTNESS-2 (sol BLOCKER, pre-review): the status is not optional.** This
+tool refuses to compute a histogram at all -- before reading either input file -- unless it knows
+the leg's own `presentMonStatus`: pass `--artifacts-dir` (preferred, above) so it is read
+automatically, or pass `--presentmon-status`/`--presentmon-status-reason` explicitly (e.g. against
+a bare csv with no published artifacts dir). Omitting BOTH is a refusal (exit 1), never a
+histogram computed from evidence whose sufficiency was never checked. A non-`'ok'` status (e.g.
+`degraded`, `verified_zero_displayed`) also refuses, naming the status and reason -- the job's own
+sufficiency gate already found the evidence too thin/absent to present as measured (see section
+5a below for what that gate now checks).
 
 `--refresh-period-ms` is Bachelor's actual panel refresh period and must be supplied. Without it
 the tool estimates the period from the interval distribution's near-minimum cluster -- an
@@ -276,6 +363,31 @@ estimate that cannot distinguish a healthy all-1-refresh capture from a uniforml
 all-2-refresh one, so it fails closed (`"ambiguous"`) whenever too little of the distribution
 falls outside that cluster to cross-check the assumption. `refreshPeriodSource` records which
 path was taken: `"nominal"` when supplied, `"estimated-min-interval"` when not.
+
+## 5a. The sufficiency gate (presentMonStatus)
+
+`playback-attr-3-cuda-job.ps1` tags every leg's PresentMon evidence `ok` or `degraded` in
+`evidence-manifest.json`'s `presentMon.sufficiency`/`presentMon.status` and `summary.json`'s
+top-level `presentMonStatus`, before this histogram ever runs. `'ok'` requires ALL THREE,
+independently:
+
+- **count** -- at least `minIntervalCount` (30) positive-`MsBetweenDisplayChange` rows.
+- **app-swap coverage** -- `positiveSamples / appSwapCount >= minCoverageFraction` (0.5), where
+  `appSwapCount` is an APP-SIDE count PresentMon never produced: the MLVApp log's own
+  `playback_smoke.gpu_window_swaps` line (real confirmed on-screen swaps) when swap telemetry is
+  active, falling back to `playback_smoke.gate`'s `frames_presented` when it is not. (r1's own
+  `coverageFraction` divided by PresentMon's own `presentedCount` instead -- numerator and
+  denominator from the same csv, so a capture that lost the tail of a leg after a short healthy
+  prefix still read 100% coverage of its own truncated rows; fixed in r1b.)
+- **temporal** -- no gap between positive-interval rows, including the head/tail gaps to the
+  playback window's own bounds, exceeds `maxGapMs` (5000ms). This is what catches a captured
+  PREFIX followed by silence: count and app-swap coverage alone can both clear even though the
+  capture measured almost none of the actual leg.
+
+A `degraded` leg's `presentMonStatusReason` names every arm that failed, with its own numbers.
+`DISPLAY_ASLEEP` and `PRESENTMON_UNAVAILABLE` tag `presentMonStatus` too (`verified_zero_displayed`
+/ `unavailable`) before the gate above even runs, since PresentMon never produced a chain to
+measure at all.
 
 ## 6. Reading the within-run verdict
 

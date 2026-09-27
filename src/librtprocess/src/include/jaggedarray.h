@@ -21,6 +21,7 @@
 
 #include <cstring>
 #include <limits>
+#include <new>
 
 namespace librtprocess
 {
