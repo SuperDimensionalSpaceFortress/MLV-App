@@ -19,6 +19,8 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[2]
 GENERATOR = ROOT / "tools" / "profiling" / "bachelor" / "attr3-stage-fixture-job.ps1"
+UMRUNDROP_MODULE = ROOT / "tools" / "profiling" / "UmRunDrop.psm1"
+ATTR_CUDA_MODULE = ROOT / "tools" / "profiling" / "bachelor" / "AttrCudaArtifacts.psm1"
 FIXTURES = ROOT / "tests" / "fixtures" / "clips"
 FIXTURE_STEMS = ("tiny_dual_iso", "large_dual_iso")
 PWSH = shutil.which("pwsh")
@@ -88,6 +90,11 @@ class StageFixtureJobTests(unittest.TestCase):
         proc = self.generate(stem=other)
         self.assertNotEqual(proc.returncode, 0)
         self.assertIn("ATTR3_FIXTURE_STEM_MISMATCH", proc.stdout + proc.stderr)
+
+    # Generator-time admission/bake race coverage (sol, PR #140 r2c) moved to
+    # StageFixtureJobRaceTests below (sol, PR #140 r2e MAJOR): it used to corrupt THIS class's
+    # self.clip -- the REAL tracked repository fixture -- relying on unittest's addCleanup to
+    # restore it, so a killed test process left the real checkout dirty. See that class.
 
     # ---- emitted job -------------------------------------------------------------------------
 
@@ -213,6 +220,115 @@ class StageFixtureJobTests(unittest.TestCase):
             (outside / self.clip.name).is_file(),
             "a refused cleanup must leave the file exactly where it was",
         )
+
+
+@unittest.skipIf(PWSH is None, "pwsh is not on PATH")
+@unittest.skipIf(GIT is None, "git is not on PATH")
+@unittest.skipUnless(os.name == "nt", "the emitted job targets a Windows measurement host")
+class StageFixtureJobRaceTests(unittest.TestCase):
+    """sol, PR #140 r2e MAJOR: the generator-time admission/bake race coverage (sol, PR #140 r2c)
+    used to live in StageFixtureJobTests and corrupted THE REAL TRACKED FIXTURE in
+    tests/fixtures/clips directly via -PostAdmissionHook, relying on unittest's addCleanup to
+    restore the original bytes afterward -- so a hard-killed test process (timeout, Ctrl-C, a
+    crash in an earlier assertion) left the real checkout holding corrupted fixture bytes with
+    nothing left to restore them.
+
+    This exercises the IDENTICAL race against a throwaway git repository instead. The generator
+    resolves its own -RepoRoot as three levels up from wherever ITS OWN SCRIPT FILE lives
+    ($PSScriptRoot), and imports UmRunDrop.psm1 and AttrCudaArtifacts.psm1 from paths relative to
+    that same location -- so a COPY of all three, placed at the identical relative layout
+    (<disposable root>\\tools\\profiling\\bachelor\\attr3-stage-fixture-job.ps1 and its two
+    dependency modules) under a disposable git repository, resolves its trusted root to that
+    disposable repository exclusively. A fixture is committed under ITS OWN
+    tests\\fixtures\\clips, never the real repository's. Nothing under the real working tree is
+    ever opened for writing.
+    """
+
+    def setUp(self) -> None:
+        self._tmp = tempfile.TemporaryDirectory(prefix="attr3stage-race-")
+        self.addCleanup(self._tmp.cleanup)
+        self.tmp = Path(os.path.realpath(self._tmp.name))
+        self.repo = self.tmp / "repo"
+        self.repo.mkdir()
+        for args in (
+            ["init", "-q"],
+            ["config", "commit.gpgsign", "false"],
+            ["config", "user.email", "attr3stage-race@example.invalid"],
+            ["config", "user.name", "Attr3 Stage Race Test"],
+            # fable, PR #140 r2d MINOR: see test_playback_attr_3_cuda_behaviour.py's
+            # _make_fixture_repo -- this repo's content-pin check is the same reused code path.
+            ["config", "core.autocrlf", "true"],
+        ):
+            subprocess.run([GIT, *args], cwd=str(self.repo), capture_output=True, text=True, check=True)
+
+        clips = self.repo / "tests" / "fixtures" / "clips"
+        clips.mkdir(parents=True)
+        self.clip = clips / "tiny_dual_iso.umrunprobe"
+        self.clip.write_bytes(b"committed fixture bytes for the disposable generator race repo")
+        subprocess.run([GIT, "add", "tests/fixtures/clips/tiny_dual_iso.umrunprobe"],
+                        cwd=str(self.repo), capture_output=True, text=True, check=True)
+        subprocess.run([GIT, "commit", "-q", "-m", "fixture"],
+                        cwd=str(self.repo), capture_output=True, text=True, check=True)
+
+        # The real generator and its two dependency modules, copied to the SAME relative layout
+        # under the disposable root, so every $PSScriptRoot-derived path (the generator's own
+        # -RepoRoot, and its two Import-Module calls) resolves inside the disposable tree only.
+        bachelor_dir = self.repo / "tools" / "profiling" / "bachelor"
+        bachelor_dir.mkdir(parents=True)
+        self.generator = bachelor_dir / GENERATOR.name
+        shutil.copy2(GENERATOR, self.generator)
+        shutil.copy2(ATTR_CUDA_MODULE, bachelor_dir / ATTR_CUDA_MODULE.name)
+        shutil.copy2(UMRUNDROP_MODULE, self.repo / "tools" / "profiling" / UMRUNDROP_MODULE.name)
+
+        self.out = self.tmp / "out"
+        self.out.mkdir()
+        self.agent = self.tmp / "agent"
+        (self.agent / "inbox").mkdir(parents=True)
+        (self.agent / "cache").mkdir()
+
+    def generate_with_post_admission_hook(self, hook: str) -> subprocess.CompletedProcess:
+        # sol, PR #140 r2c: -PostAdmissionHook is a test-only seam (no-op in production, mirroring
+        # Invoke-UmRunDrop's identical seam in tools/profiling/UmRunDrop.psm1) that fires in the
+        # exact gap between admission verifying the fixture's committed bytes and this generator's
+        # own re-read of those bytes for the sha256 it bakes -- the gap a swap would need to win.
+        script = self.tmp / "generate-with-hook.ps1"
+        script.write_text(
+            "$ErrorActionPreference = 'Stop'\n"
+            f"& {_q(self.generator)} -ClipStem {_q(self.clip.stem)} -FixturePath {_q(self.clip)} "
+            f"-OutDir {_q(self.out)} -AgentRoot {_q(self.agent)} -PostAdmissionHook {hook}\n",
+            encoding="utf-8",
+        )
+        return subprocess.run(
+            [PWSH, "-NoLogo", "-NoProfile", "-NonInteractive", "-File", str(script)],
+            capture_output=True, text=True,
+        )
+
+    def test_bytes_swapped_between_admission_and_the_baked_hash_are_refused(self) -> None:
+        # THE DEFECT this closes: the generator used to call Assert-AttrCudaFixtureCommittedBytes
+        # to verify the committed bytes, then take a SECOND, independent Get-FileHash read to bake
+        # into the job -- bytes swapped in that gap would silently bake the SWAPPED bytes' hash
+        # with no error at all. -PostAdmissionHook fires in exactly that gap and is never set in
+        # production; it stands in for a real attacker/race window. self.clip is this test's own
+        # disposable fixture, so corrupting it is exactly the point and needs no restoration.
+        hook = (
+            "{ param($p) [IO.File]::WriteAllBytes($p, "
+            "[Text.Encoding]::UTF8.GetBytes('raced bytes (attr3-stage-fixture-job race test)')) }"
+        )
+
+        proc = self.generate_with_post_admission_hook(hook)
+
+        self.assertNotEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        self.assertIn("ATTR3_FIXTURE_CONTENT_PIN_RACE", proc.stdout + proc.stderr)
+        self.assertEqual(
+            sorted(self.out.iterdir()), [], "a raced fixture must never reach an emitted job"
+        )
+
+    def test_a_no_op_hook_still_bakes_the_correct_hash(self) -> None:
+        # Positive control: the new check must not false-positive when nothing raced.
+        proc = self.generate_with_post_admission_hook("{ param($p) }")
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        self.assertIn(hashlib.sha256(self.clip.read_bytes()).hexdigest(), proc.stdout)
+        self.assertEqual(len(sorted(self.out.glob("*.job.ps1"))), 1, proc.stdout + proc.stderr)
 
 
 if __name__ == "__main__":

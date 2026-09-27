@@ -383,6 +383,72 @@ function Assert-AttrCudaBuildManifest {
     $manifest
 }
 
+function Get-AttrCudaGitBlobHashFromBytes {
+    <#
+    .SYNOPSIS
+    Git's blob hash of a byte buffer already in memory, exactly as `git hash-object` would compute
+    it for a file living at $RelativePath -- content filters (autocrlf, .gitattributes) included.
+    .DESCRIPTION
+    ATTR3-ADMIT-CONTENT-PIN-1 round 2d. `git hash-object -- <path>` opens and reads $Path itself --
+    a SECOND read of the same mutable file, which is exactly the internal check/use gap this whole
+    round closes. `git hash-object --stdin --path <RelativePath>` hashes whatever bytes are piped
+    to it on stdin while still selecting content filters BY that path (the same ones `--path` would
+    apply if it were reading the file itself), so this can feed it the identical buffer
+    Assert-AttrCudaFixtureCommittedBytes already read through its own single, write-denying handle
+    -- no second read of the file.
+
+    Round-2d SELF-CAUGHT DEFECT: an earlier version of this function computed
+    SHA1("blob " + <byte length> + "\0" + <content>) directly over the raw in-memory buffer,
+    entirely in .NET, with no git subprocess at all. That is only the correct git blob hash when
+    nothing normalises the bytes on the way into the object database. It silently disagreed with
+    the committed blob for any autocrlf/gitattributes-normalised text fixture -- caught by
+    FixtureCommittedBytesTests.test_an_unmodified_tracked_file_is_accepted (a `.c` source file)
+    failing closed on completely unmodified content, before this ever reached review. Filtering
+    is a repository-configuration concern only git itself can resolve correctly; reproducing its
+    hash FORMAT locally without also reproducing its FILTERS is not a safe shortcut.
+    #>
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $true)][byte[]]$Bytes,
+        [Parameter(Mandatory = $true)][string]$RepoRoot,
+        [Parameter(Mandatory = $true)][string]$RelativePath
+    )
+
+    $psi = [Diagnostics.ProcessStartInfo]::new()
+    $psi.FileName = 'git'
+    foreach ($arg in @('-C', $RepoRoot, 'hash-object', '--stdin', '--path', $RelativePath)) {
+        [void]$psi.ArgumentList.Add($arg)
+    }
+    $psi.RedirectStandardInput = $true
+    $psi.RedirectStandardOutput = $true
+    $psi.RedirectStandardError = $true
+    $psi.UseShellExecute = $false
+    # round 2e (sol/fable MAJOR): Process.Start (and the stream I/O around it) can throw a raw,
+    # untyped .NET exception -- e.g. Win32Exception if the git binary that
+    # Assert-AttrCudaFixtureCommittedBytes's earlier Get-Command probe found a moment ago is no
+    # longer resolvable when actually launched -- whose message never starts with an ATTR3_FIXTURE_*
+    # token. Left uncaught, that escaped Get-UmRunFixtureAdmission's classification entirely: an
+    # environmental failure with nothing to say about the fixture's bytes would be graded on
+    # whether its first word happened to match, not on what it actually was.
+    try {
+        $proc = [Diagnostics.Process]::Start($psi)
+        try {
+            $proc.StandardInput.BaseStream.Write($Bytes, 0, $Bytes.Length)
+        } finally {
+            $proc.StandardInput.Close()
+        }
+        $stdout = $proc.StandardOutput.ReadToEnd()
+        $stderr = $proc.StandardError.ReadToEnd()
+        $proc.WaitForExit()
+    } catch {
+        throw "ATTR3_FIXTURE_GIT_UNAVAILABLE could not launch git to hash-object (via stdin) '$RelativePath' in '$RepoRoot': $($_.Exception.Message)"
+    }
+    if ($proc.ExitCode -ne 0 -or [string]::IsNullOrWhiteSpace($stdout)) {
+        throw "ATTR3_FIXTURE_GIT_UNAVAILABLE could not hash-object (via stdin) '$RelativePath' in '$RepoRoot': $stderr"
+    }
+    $stdout.Trim().ToLowerInvariant()
+}
+
 function Assert-AttrCudaFixtureCommittedBytes {
     <#
     .SYNOPSIS
@@ -392,17 +458,82 @@ function Assert-AttrCudaFixtureCommittedBytes {
     (Test-UmRunTrackedFixtureSource, tools/profiling/UmRunDrop.psm1) -- but "tracked" says
     nothing about whether the WORKING-TREE bytes at that path are still the committed ones. A
     dirty or corrupted working copy would otherwise bake a sha256 into the staging job that
-    no reviewed commit ever produced. This compares `git hash-object` of the file on disk
-    to `git rev-parse HEAD:<repo-relative path>`, run in whichever repository actually contains
-    the file (found from the file's own directory via `git rev-parse --show-toplevel`, never
-    assumed to be this module's own checkout), so a throwaway test repository is verified the
-    same way the real one is.
+    no reviewed commit ever produced. This compares git's blob hash of the file on disk to
+    `git rev-parse HEAD:<repo-relative path>`.
+    sol, PR #140 r2 BLOCKER (ATTR3-ADMIT-CONTENT-PIN-1): without -RepoRoot this discovered the
+    repository from the FILE'S OWN DIRECTORY via `git rev-parse --show-toplevel` -- so a nested
+    repository committed under the fixture's own directory could authorize bytes the OUTER
+    repository's HEAD never held. Every fixture-admission caller (Test-UmRunFixtureContentPin in
+    tools/profiling/UmRunDrop.psm1, and tools/profiling/bachelor/attr3-stage-fixture-job.ps1's
+    own generator-time check) now passes its trusted -RepoRoot; the discovered repository must
+    resolve to EXACTLY that root (case-insensitive, full-path normalised) or this throws
+    ATTR3_FIXTURE_FOREIGN_REPO, never merely trusting whichever .git happens to be nearest.
+    Callers that omit -RepoRoot (this function's generic "is a tracked source file unmodified"
+    use, unrelated to the measurement-fixture admission surface) keep the original nearest-repo
+    behaviour -- the trusted-root check is opt-in via -RepoRoot, not universal.
+    KNOWN LIMITATION (round-2 recon): neither side of the root comparison canonicalises an 8.3
+    short name or a junction/symlink component; an equivalent root reached through one of those
+    can be falsely rejected as ATTR3_FIXTURE_FOREIGN_REPO rather than accepted. Undefended here --
+    callers that might pass such a root should resolve it themselves first -- but no longer
+    untested: test_a_root_reached_through_a_junction_is_falsely_refused_known_limitation
+    (tools/repo_hygiene/test_playback_attr_3_cuda_behaviour.py) pins the refusal empirically, so a
+    future change cannot silently start accepting -- or silently start crashing on -- a
+    junction-reached root without that test being touched.
+    .PARAMETER Sha256Pin
+    Optional [ref]; ATTR3-ADMIT-CONTENT-PIN-1 round 2d (sol BLOCKER / fable MAJOR, PR #140 r2c).
+    On a verified match, .Value is set to a SHA256 of the EXACT SAME byte buffer this function
+    hashed to produce the git blob comparison below -- one file handle, opened deny-write for its
+    whole lifetime and read once, feeds both hashes. The old shape (this function's own `git
+    hash-object` subprocess, then a caller's SEPARATE Get-FileHash afterward) read the mutable
+    path twice; bytes exchanged in that gap became the trusted pin, and stayed the trusted pin for
+    every downstream binding this module added, because nothing downstream ever saw the original
+    bytes to compare against. Left unset (the default) when this throws, since a caller must never
+    bind to a pin taken from bytes that failed verification.
     Throws with a distinguishable ATTR3_FIXTURE_* token; returns the verified (matching) hash.
+    round 2e (sol/fable MAJOR): every throw here now lands in exactly one of DEFINITE REFUSAL
+    (ATTR3_FIXTURE_MISSING, ATTR3_FIXTURE_NOT_IN_A_REPO, ATTR3_FIXTURE_FOREIGN_REPO,
+    ATTR3_FIXTURE_NOT_COMMITTED, ATTR3_FIXTURE_WORKING_TREE_DIRTY -- a content verdict this
+    function stands behind) or COULD NOT DETERMINE (ATTR3_FIXTURE_GIT_UNAVAILABLE,
+    ATTR3_FIXTURE_CONTENT_PIN_UNBINDABLE, ATTR3_FIXTURE_HEAD_LOOKUP_UNAVAILABLE -- an
+    environmental/operational failure that says nothing about the bytes), never untyped and
+    never folded into the wrong bucket; see UmRunDrop.psm1's $UmRunIndeterminateAdmissionTokens,
+    which every one of the second group is registered in. The `git rev-parse HEAD:<path>` call
+    below used to throw ATTR3_FIXTURE_NOT_COMMITTED for ANY failure there (non-zero exit or empty
+    stdout), which classified a corrupted object store, a git I/O error or an unexpected git
+    version's message identically to a genuinely untracked path; stderr is now inspected, and only
+    git's own distinct messages for an actually-untracked path -- "path does not exist in
+    <tree-ish>" (never existed at that path), "exists on disk, but not in '<tree-ish>'"
+    (untracked working-tree file), or "invalid object name 'HEAD'" (unborn HEAD, no commits at
+    all) -- are treated as the definite refusal; everything else is
+    ATTR3_FIXTURE_HEAD_LOOKUP_UNAVAILABLE.
+    round 2g (sol/fable MAJOR): the repository-DISCOVERY call (`git rev-parse --show-toplevel`,
+    below) had the identical any-failure-becomes-a-verdict defect and is fixed the same way --
+    stderr inspected, only git's own "fatal: not a git repository" text is the definite
+    ATTR3_FIXTURE_NOT_IN_A_REPO refusal, everything else (dubious ownership, a corrupted repo
+    config, an I/O error) is ATTR3_FIXTURE_GIT_UNAVAILABLE.
+    round 2h (sol/fable MAJOR, independently found): the show-toplevel match landed with the exact
+    same unanchored-substring shape the HEAD:<path> match below already carried -- a bare
+    'not a git repository' match, matchable by any stderr line that happens to contain that
+    phrase, not only git's own fatal verdict. Anchored to require the 'fatal: ' prefix git itself
+    always emits ahead of it (confirmed empirically: `git rev-parse --show-toplevel` outside any
+    repository prints exactly "fatal: not a git repository (or any of the parent directories):
+    .git" on this git version), narrowing, not closing, the edge -- this is still a substring
+    match on the joined stderr text, not an anchored `^fatal: ...$` match against a single known
+    line, so a hypothetical advisory line that itself echoes "fatal: not a git repository" as
+    quoted text (rather than as git's own verdict) would still match. Three edges are now KNOWN
+    and left OPEN, not fixed here: the HEAD:<path> lookup's stderr match for "invalid object name"
+    is unanchored and could in principle match a corrupted-ref message that is not actually an
+    unborn HEAD; the show-toplevel match above, narrowed but not fully anchored, for the same
+    reason; and a fixture between int32.MaxValue and the practical process-memory ceiling can OOM
+    the `byte[]` allocation below and surface as a raw, untokened exception rather than
+    ATTR3_FIXTURE_CONTENT_PIN_UNBINDABLE.
     #>
     [CmdletBinding()]
     param(
         [Parameter(Mandatory = $true)]
-        [string]$Path
+        [string]$Path,
+        [string]$RepoRoot = '',
+        [ref]$Sha256Pin
     )
 
     if (-not (Test-Path -LiteralPath $Path -PathType Leaf)) {
@@ -413,27 +544,99 @@ function Assert-AttrCudaFixtureCommittedBytes {
     }
     $full = [IO.Path]::GetFullPath($Path)
     $dir = [IO.Path]::GetDirectoryName($full)
-    $repoRoot = (& git -C $dir rev-parse --show-toplevel 2>$null)
-    if ($LASTEXITCODE -ne 0 -or [string]::IsNullOrWhiteSpace($repoRoot)) {
-        throw "ATTR3_FIXTURE_NOT_IN_A_REPO $full is not inside a git working tree"
+    $trustedRoot = if ([string]::IsNullOrWhiteSpace($RepoRoot)) { '' } else { ([IO.Path]::GetFullPath($RepoRoot)).TrimEnd('\') }
+    if ($trustedRoot -and -not $full.StartsWith($trustedRoot + '\', [StringComparison]::OrdinalIgnoreCase)) {
+        throw "ATTR3_FIXTURE_NOT_IN_A_REPO $full does not resolve under the trusted repository root $trustedRoot"
     }
-    $repoRoot = ($repoRoot.Trim()) -replace '/', '\'
-    if (-not $full.StartsWith($repoRoot + '\', [StringComparison]::OrdinalIgnoreCase)) {
-        throw "ATTR3_FIXTURE_NOT_IN_A_REPO $full does not resolve under its own repository root $repoRoot"
+    # round 2g (sol/fable MAJOR): this used to discard stderr (2>$null) and fold EVERY failure --
+    # dubious ownership, a corrupted repo config, a git I/O error -- into the definite refusal
+    # ATTR3_FIXTURE_NOT_IN_A_REPO, exactly the any-failure-becomes-a-verdict shape the HEAD:<path>
+    # lookup below was already fixed for in round 2e. stderr is now inspected the same way: only
+    # git's own distinct "fatal: not a git repository" text is a genuine not-in-a-repo verdict
+    # (round 2h: anchored to the "fatal: " prefix git itself always emits ahead of it, narrowing --
+    # not closing -- the unanchored-substring edge round 2g shipped); every other
+    # failure is ATTR3_FIXTURE_GIT_UNAVAILABLE (already a registered indeterminate token), not a
+    # content verdict.
+    $rawShowToplevel = & git -C $dir rev-parse --show-toplevel 2>&1
+    $discoveredRoot = (($rawShowToplevel | Where-Object { $_ -is [string] }) -join '').Trim()
+    if ($LASTEXITCODE -ne 0 -or [string]::IsNullOrWhiteSpace($discoveredRoot)) {
+        $stderrText = (($rawShowToplevel | Where-Object { $_ -is [Management.Automation.ErrorRecord] } |
+            ForEach-Object { $_.ToString() }) -join ' ')
+        if ($stderrText -match 'fatal: not a git repository') {
+            throw "ATTR3_FIXTURE_NOT_IN_A_REPO $full is not inside a git working tree: $stderrText"
+        }
+        throw "ATTR3_FIXTURE_GIT_UNAVAILABLE git rev-parse --show-toplevel for '$dir' failed for a reason other than the path not being inside a git working tree: $stderrText"
     }
-    $relative = ($full.Substring($repoRoot.Length + 1)) -replace '\\', '/'
-    $workingHash = (& git -C $repoRoot hash-object -- $relative 2>$null)
-    if ($LASTEXITCODE -ne 0 -or [string]::IsNullOrWhiteSpace($workingHash)) {
-        throw "ATTR3_FIXTURE_GIT_UNAVAILABLE could not hash-object $relative in $repoRoot"
+    $discoveredRoot = (($discoveredRoot.Trim()) -replace '/', '\').TrimEnd('\')
+    if ($trustedRoot) {
+        if (-not [string]::Equals($discoveredRoot, $trustedRoot, [StringComparison]::OrdinalIgnoreCase)) {
+            throw "ATTR3_FIXTURE_FOREIGN_REPO $full resolves to git repository '$discoveredRoot', not the trusted root '$trustedRoot' -- a nested repository cannot authorize this fixture's bytes"
+        }
+        $repoRootForGit = $trustedRoot
+    } else {
+        if (-not $full.StartsWith($discoveredRoot + '\', [StringComparison]::OrdinalIgnoreCase)) {
+            throw "ATTR3_FIXTURE_NOT_IN_A_REPO $full does not resolve under its own repository root $discoveredRoot"
+        }
+        $repoRootForGit = $discoveredRoot
     }
-    $workingHash = $workingHash.Trim().ToLowerInvariant()
-    $committedHash = (& git -C $repoRoot rev-parse "HEAD:$relative" 2>$null)
+    $relative = ($full.Substring($repoRootForGit.Length + 1)) -replace '\\', '/'
+
+    # ATTR3-ADMIT-CONTENT-PIN-1 round 2d: ONE handle, opened deny-write for its whole lifetime, is
+    # read ONCE into a buffer. Both the working-tree comparison hash below and -Sha256Pin's value
+    # (on success) are derived from that SAME buffer -- there is no internal gap left for a swap
+    # to win. FileShare.Read denies any concurrent writer for as long as this handle stays open
+    # (and, incidentally, blocks a rename-based swap too, since that needs delete access we never
+    # grant).
+    try {
+        $stream = [IO.File]::Open($full, [IO.FileMode]::Open, [IO.FileAccess]::Read, [IO.FileShare]::Read)
+    } catch {
+        throw "ATTR3_FIXTURE_CONTENT_PIN_UNBINDABLE could not open $full for a write-denying read: $($_.Exception.Message)"
+    }
+    try {
+        if ($stream.Length -gt [int32]::MaxValue) {
+            throw "ATTR3_FIXTURE_CONTENT_PIN_UNBINDABLE $full is too large ($($stream.Length) bytes) to hash from a single in-memory buffer"
+        }
+        $bytes = [byte[]]::new([int]$stream.Length)
+        $offset = 0
+        while ($offset -lt $bytes.Length) {
+            $read = $stream.Read($bytes, $offset, $bytes.Length - $offset)
+            if ($read -le 0) {
+                throw "ATTR3_FIXTURE_CONTENT_PIN_UNBINDABLE ${full}: read stopped after $offset of $($bytes.Length) bytes"
+            }
+            $offset += $read
+        }
+    } finally {
+        $stream.Dispose()
+    }
+    $workingHash = Get-AttrCudaGitBlobHashFromBytes -Bytes $bytes -RepoRoot $repoRootForGit -RelativePath $relative
+
+    # round 2e (sol/fable, PR #140): stderr is captured (2>&1, not discarded) so a genuine "this
+    # path was never committed" refusal -- git's own distinct fatal text for a tree lookup that
+    # otherwise ran fine -- can be told apart from ANY OTHER git failure here (a corrupted object
+    # store, an I/O error, an unexpected git-version message). Only the former is a verdict this
+    # function can stand behind as a definite refusal; everything else fails toward "could not
+    # determine" rather than silently becoming the same refusal as a genuinely untracked file.
+    $rawHeadLookup = & git -C $repoRootForGit rev-parse "HEAD:$relative" 2>&1
+    $committedHash = (($rawHeadLookup | Where-Object { $_ -is [string] }) -join '').Trim()
     if ($LASTEXITCODE -ne 0 -or [string]::IsNullOrWhiteSpace($committedHash)) {
-        throw "ATTR3_FIXTURE_NOT_COMMITTED HEAD:$relative could not be resolved in $repoRoot"
+        $stderrText = (($rawHeadLookup | Where-Object { $_ -is [Management.Automation.ErrorRecord] } |
+            ForEach-Object { $_.ToString() }) -join ' ')
+        if ($stderrText -match 'does not exist in|exists on disk, but not in|invalid object name') {
+            throw "ATTR3_FIXTURE_NOT_COMMITTED HEAD:$relative could not be resolved in $repoRootForGit"
+        }
+        throw "ATTR3_FIXTURE_HEAD_LOOKUP_UNAVAILABLE HEAD:$relative lookup in $repoRootForGit failed for a reason other than the path never having been committed: $stderrText"
     }
     $committedHash = $committedHash.Trim().ToLowerInvariant()
     if ($workingHash -ne $committedHash) {
         throw "ATTR3_FIXTURE_WORKING_TREE_DIRTY $relative working-tree blob $workingHash differs from the committed blob $committedHash"
+    }
+    if ($null -ne $Sha256Pin) {
+        $sha256 = [Security.Cryptography.SHA256]::Create()
+        try {
+            $Sha256Pin.Value = (($sha256.ComputeHash($bytes) | ForEach-Object { $_.ToString('x2') }) -join '')
+        } finally {
+            $sha256.Dispose()
+        }
     }
     $workingHash
 }
