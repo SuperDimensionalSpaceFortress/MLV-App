@@ -2768,21 +2768,34 @@ class RepoHygieneTests(unittest.TestCase):
         non_windows = llrawproc.split(
             "#else\nstatic int llrawproc_gpu_export_backend_available", 1
         )[1].split("#endif\n\nstatic int llrawproc_worker_copy_pixel_map", 1)[0]
-        for symbol in (
-            "llrpGpuPlaybackReconPreuploadFrame",
-            "llrpGpuPlaybackReconGetLastPreuploadStatus",
-        ):
+        for symbol in ("llrpGpuPlaybackReconPreuploadFrame",):
             self.assertRegex(
                 non_windows,
                 rf"(?s)int {symbol}\([^;]*?\)\s*\{{.*?return 0;\s*\}}",
                 f"{symbol} must fail closed at the non-Windows llrawproc API boundary",
             )
-        self.assertRegex(
-            non_windows,
-            r"(?s)int llrpGpuPlaybackReconGetLastPreuploadStatus\([^;]*?\)\s*\{"
-            r".*?if\(status\) memset\(status, 0, sizeof\(\*status\)\);.*?return 0;\s*\}",
-            "unavailable preupload telemetry must be fully initialized before returning",
+
+        # llrpGpuPlaybackReconGetLastPreuploadStatus was REMOVED from the public API, not
+        # merely from this fallback. It read an ambient MLV_THREAD_LOCAL written on
+        # whichever thread called the GPU backend, so on the render thread it returned that
+        # thread's own untouched zeros -- which is why async_h2d_available sat at 0 across
+        # 1076 telemetry frames. The status now travels out through
+        # llrpGpuPlaybackReconTiming_t.preupload, with the call.
+        #
+        # This pin exists to keep the public API COMPLETE on non-Windows. A symbol that
+        # exists on no platform needs no fail-closed stub, so the assertion goes with it --
+        # and the check below keeps that honest: if the symbol ever returns to the header,
+        # the fallback must carry it again.
+        header = (ROOT / "src" / "mlv" / "llrawproc" / "llrawproc.h").read_text(
+            encoding="utf-8"
         )
+        if "llrpGpuPlaybackReconGetLastPreuploadStatus" in header:
+            self.assertRegex(
+                non_windows,
+                r"(?s)int llrpGpuPlaybackReconGetLastPreuploadStatus\([^;]*?\)\s*\{"
+                r".*?if\(status\) memset\(status, 0, sizeof\(\*status\)\);.*?return 0;\s*\}",
+                "unavailable preupload telemetry must be fully initialized before returning",
+            )
 
     def test_dependency_updates_and_private_security_reporting_are_bounded(self) -> None:
         dependabot = (ROOT / ".github" / "dependabot.yml").read_text(encoding="utf-8")
