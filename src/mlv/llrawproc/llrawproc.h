@@ -154,6 +154,23 @@ static inline uint64_t llrpGpuPlaybackReconFrameToken(uint64_t frame_id)
     return frame_id == UINT64_MAX ? 0 : frame_id + 1u;
 }
 
+/* Shared compare-and-reject: MainWindow calls this with the frame identity a
+ * prepared llrpGpuPlaybackReconState_t was built for and the frame actually
+ * being presented. A mismatch means the prepared state does not provably
+ * belong to this frame, so this returns the UINT64_MAX "not armed" sentinel
+ * (llrpGpuPlaybackReconFrameToken() maps it to token 0) instead of the
+ * prepared frame_id -- both llrawproc_gpu_recon_run_backend()'s token gate
+ * and GpuDisplayViewport/Window's retained-device-buffer gate key off the
+ * same sentinel, so this one function is the single source of the decision
+ * both of them act on. Pulled out to a pure, header-only function (rather
+ * than left inline in MainWindow.cpp) specifically so it is unit-testable
+ * without a GUI harness. */
+static inline uint64_t llrpGpuPlaybackReconFrameIdAfterCompareAndReject(
+    uint64_t prepared_frame_id, uint64_t display_frame_id)
+{
+    return prepared_frame_id == display_frame_id ? prepared_frame_id : UINT64_MAX;
+}
+
 /* Shared by both display adapters. Preupload status belongs to the recon run,
  * including when its scalar timer is unavailable. A retained-device handoff
  * without a recon call supplies a zero-initialized recon timing here. */

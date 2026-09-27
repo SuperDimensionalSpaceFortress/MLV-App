@@ -22,8 +22,8 @@ from perf_field_log_playback_rollup import (
 def _clean_rollup() -> dict:
     # Mirrors buildAsyncH2dRollup()'s two field shapes: boolean fields carry
     # samples/true_frames/false_frames, timing fields carry samples/mean_ms/max_ms.
-    boolean_keys = ASYNC_H2D_KEYS[:7]
-    timing_keys = ASYNC_H2D_KEYS[7:]
+    boolean_keys = ASYNC_H2D_KEYS[:8]
+    timing_keys = ASYNC_H2D_KEYS[8:]
     rollup = {}
     for key in boolean_keys:
         rollup[key] = {"samples": 12, "true_frames": 9, "false_frames": 3}
@@ -48,6 +48,21 @@ def _clean_record() -> dict:
 
 def test_accepts_a_clean_record():
     assert validate_playback_record(_clean_record()) == []
+
+
+def test_accepts_a_one_frame_mismatch_rollup():
+    # ASYNC-H2D-FRAME-BINDING-1 sol-flagged blocker repro: MainWindow's
+    # compare-and-reject emits gpu_playback_recon_async_h2d_frame_id_mismatch into
+    # the session rollup; a one-frame session whose rollup carries only that key
+    # (as buildAsyncH2dRollup() would produce when every other key's inputs were
+    # absent that frame) must not be rejected as "unknown key(s)".
+    record = _clean_record()
+    record[ROLLUP_KEY] = {
+        "gpu_playback_recon_async_h2d_frame_id_mismatch": {
+            "samples": 1, "true_frames": 1, "false_frames": 0,
+        },
+    }
+    assert validate_playback_record(record) == []
 
 
 def test_rejects_bogus_eleventh_key_in_rollup():

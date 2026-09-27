@@ -1551,6 +1551,7 @@ static int llrawproc_gpu_recon_run_backend(const dualiso_gpu_recon_state_t * sta
     if(rc == 0)
     {
         const uint64_t frame_token = llrpGpuPlaybackReconFrameToken(frame_id);
+        int used_run_preuploaded = 0;
         InterlockedExchange(&g_llrawproc_gpu_recon_run_active, 1);
         if(prefer_playback_dll
          && llrawproc_env_truthy_value(
@@ -1559,6 +1560,7 @@ static int llrawproc_gpu_recon_run_backend(const dualiso_gpu_recon_state_t * sta
          && g->run_preuploaded
          && g->last_preupload_status)
         {
+            used_run_preuploaded = 1;
             rc = g->run_preuploaded(g->backend,
                                     frame_token,
                                     &frame,
@@ -1577,7 +1579,14 @@ static int llrawproc_gpu_recon_run_backend(const dualiso_gpu_recon_state_t * sta
                         gl_texture_id);
         }
         InterlockedExchange(&g_llrawproc_gpu_recon_run_active, 0);
-        if(prefer_playback_dll && g->last_preupload_status && timing_out)
+        /* Only a run_preuploaded() call this invocation can have updated the
+         * backend's last_preupload_status -- the plain run() path (taken on
+         * an unarmed/frame_id-mismatched token, or with ASYNC_H2D off) does
+         * not touch it, so querying it unconditionally here would report a
+         * PRIOR frame's successful preupload as this frame's status. Scope
+         * it to this call: leave timing_out->preupload at its memset-zero
+         * ("unavailable") default whenever run_preuploaded was not used. */
+        if(used_run_preuploaded && g->last_preupload_status && timing_out)
         {
             igpu_recon_preupload_status_t status;
             memset(&status, 0, sizeof(status));
@@ -1914,7 +1923,8 @@ static int llrawproc_gpu_export_try_trusted(const dualiso_gpu_recon_state_t * st
 static int llrawproc_gpu_playback_try_reconstruct(const dualiso_gpu_recon_state_t * state,
                                                   const uint16_t * gpu_input,
                                                   uint16_t * gpu_output,
-                                                  size_t raw_image_size)
+                                                  size_t raw_image_size,
+                                                  uint64_t frame_id)
 {
     uint16_t * gpu_recon_output = NULL;
     int rc = -1;
@@ -1942,18 +1952,15 @@ static int llrawproc_gpu_playback_try_reconstruct(const dualiso_gpu_recon_state_
     }
 
     g_llrawproc_gpu_playback_last_run_attempted = 1;
-    /* This call runs synchronously on the SAME thread that set the current
-     * frame index just above applyLLRawProcObjectWorker (RenderFrameThread.cpp),
-     * so mlv_pipeline_capture_get_current_frame() reliably names the frame
-     * this reconstruction is for. Do not replace this with a new ambient
-     * thread-local dedicated to GPU recon -- reuse this already-armed,
-     * synchronous, same-thread value instead. */
+    /* frame_id is threaded in explicitly by the caller (applyLLRawProcObjectWorker),
+     * which captured it once from the same-thread ambient accessor rather than
+     * having this consuming path re-read it itself. */
     result = llrawproc_gpu_recon_run_cpu16(state,
                                            gpu_input,
                                            gpu_recon_output,
                                            raw_image_size,
                                            1,
-                                           mlv_pipeline_capture_get_current_frame(),
+                                           frame_id,
                                            &rc,
                                            NULL,
                                            NULL,
@@ -2264,12 +2271,14 @@ static int llrawproc_gpu_export_try_trusted(const dualiso_gpu_recon_state_t * st
 static int llrawproc_gpu_playback_try_reconstruct(const dualiso_gpu_recon_state_t * state,
                                                   const uint16_t * gpu_input,
                                                   uint16_t * gpu_output,
-                                                  size_t raw_image_size)
+                                                  size_t raw_image_size,
+                                                  uint64_t frame_id)
 {
     (void)state;
     (void)gpu_input;
     (void)gpu_output;
     (void)raw_image_size;
+    (void)frame_id;
     llrawproc_gpu_playback_reset_last_run_state();
     g_llrawproc_gpu_playback_last_run_attempted = 1;
     g_llrawproc_gpu_playback_last_run_rc = -1;
@@ -3813,6 +3822,17 @@ void applyLLRawProcObjectWorker(mlvObject_t * video,
 
             if (gpu_playback_input)
             {
+                /* Single, same-thread capture point: read the ambient current-frame
+                 * accessor exactly once here, then thread the value explicitly as a
+                 * plain parameter into every consuming path below (staging, the
+                 * retained-device frame_id, and the synchronous CPU16 fallback) --
+                 * none of those call mlv_pipeline_capture_get_current_frame() itself
+                 * any more. This is a same-thread, synchronous value the whole time
+                 * (this function runs on the render worker thread that just set it,
+                 * see RenderFrameThread.cpp); explicit threading removes the need for
+                 * a reader three call-sites down to re-derive that invariant. */
+                const uint64_t gpu_playback_current_frame_index =
+                    mlv_pipeline_capture_get_current_frame();
                 dualiso_gpu_recon_state_t gpu_playback_state;
                 memset(&gpu_playback_state, 0, sizeof(gpu_playback_state));
                 /* Prepare may resolve Dual ISO pattern/match fields; CPU fallback
@@ -3869,7 +3889,7 @@ void applyLLRawProcObjectWorker(mlvObject_t * video,
                          * when the frame token matches. The call copies into its
                          * pinned slot before this worker can reuse the buffer. */
                         (void)llrpGpuPlaybackReconPreuploadFrame(
-                            mlv_pipeline_capture_get_current_frame(),
+                            gpu_playback_current_frame_index,
                             gpu_playback_input,
                             raw_image_size);
                         if (llrawproc_gpu_playback_retain_device_output_enabled())
@@ -3886,14 +3906,12 @@ void applyLLRawProcObjectWorker(mlvObject_t * video,
                             llrawproc_gpu_playback_public_state_from_dualiso(
                                 &gpu_playback_state,
                                 &public_gpu_playback_state);
-                            /* Same-thread, synchronous call (this runs inside
-                             * applyLLRawProcObjectWorker on the render worker
-                             * thread that just set the current frame index),
-                             * so this already-armed accessor names the right
-                             * frame -- see the note on the run_cpu16 call in
-                             * llrawproc_gpu_playback_try_reconstruct() above. */
+                            /* Explicit, not ambient: gpu_playback_current_frame_index
+                             * was captured once above and threaded down as a plain
+                             * parameter, rather than re-reading the thread-local
+                             * accessor here. */
                             public_gpu_playback_state.frame_id =
-                                mlv_pipeline_capture_get_current_frame();
+                                gpu_playback_current_frame_index;
                             g_llrawproc_gpu_playback_last_run_attempted = 1;
                             if (llrpGpuPlaybackReconRunRetainedDeviceBayer16(
                                     &public_gpu_playback_state,
@@ -3941,7 +3959,8 @@ void applyLLRawProcObjectWorker(mlvObject_t * video,
                      && llrawproc_gpu_playback_try_reconstruct(&gpu_playback_state,
                                                                gpu_playback_input,
                                                                raw_image_buff,
-                                                               raw_image_size))
+                                                               raw_image_size,
+                                                               gpu_playback_current_frame_index))
                     {
                         dual_iso_recon_ok = 1;
                         gpu_playback_recon_used = 1;

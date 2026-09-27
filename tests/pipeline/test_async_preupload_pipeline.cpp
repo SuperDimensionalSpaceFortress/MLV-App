@@ -147,6 +147,37 @@ TEST(DualIsoPipeline, AsyncPreuploadFrameTokenIncludesFirstFrameWithoutOverflow)
     ASSERT_EQ(uint64_t(0), llrpGpuPlaybackReconFrameToken(UINT64_MAX));
 }
 
+// Consume-side proof for MainWindow's compare-and-reject (blocker fixed this
+// round): MainWindow.cpp's presentation path no longer reimplements this
+// decision inline -- it calls this same shared, header-only function, and
+// GpuDisplayViewport/Window's retainedDeviceValid gate (also fixed this
+// round) keys off exactly llrpGpuPlaybackReconFrameToken() of ITS result.
+// tests/gui/* (the only harness that can instantiate a real
+// GpuDisplayViewport/Window to drive that gate end to end) is out of scope
+// for this card (excluded path), so this proves the decision function and
+// its "unarmed" consequence directly instead.
+TEST(DualIsoPipeline, AsyncPreuploadFrameIdCompareAndRejectMatchesLeavesFrameIdArmed)
+{
+    const uint64_t result =
+        llrpGpuPlaybackReconFrameIdAfterCompareAndReject(41, 41);
+    ASSERT_EQ(uint64_t(41), result);
+    ASSERT_NE(uint64_t(0), llrpGpuPlaybackReconFrameToken(result));
+}
+
+TEST(DualIsoPipeline, AsyncPreuploadFrameIdCompareAndRejectMismatchDisarmsFrameId)
+{
+    // The exact MainWindow scenario sol's pre-review repro'd: a retained
+    // buffer for frame 41 paired with a display task for frame 42.
+    const uint64_t result =
+        llrpGpuPlaybackReconFrameIdAfterCompareAndReject(41, 42);
+    ASSERT_EQ(UINT64_MAX, result);
+    // This is exactly the condition GpuDisplayViewport/Window's
+    // retainedDeviceValid now checks: a disarmed frame_id must map to
+    // token 0, so the retained buffer is refused on the presentation path,
+    // not only on llrawproc_gpu_recon_run_backend()'s token gate.
+    ASSERT_EQ(uint64_t(0), llrpGpuPlaybackReconFrameToken(result));
+}
+
 TEST(DualIsoPipeline, AsyncPreuploadStatusSurvivesBothDisplayTimingAdapters)
 {
     llrpGpuPlaybackReconTiming_t recon = {};
@@ -395,6 +426,53 @@ TEST(DualIsoPipeline, AsyncPreuploadRejectsCrossFrameTokenAndFallsBackCorrectly)
     ASSERT_NE(0, llrpGpuPlaybackReconRunCpu16Probe(&stateM, bytesB.data(),
         bytesB.size() * sizeof(uint16_t), outputSync.data(), &rc, &timing));
     ASSERT_TRUE(outputPreuploaded == outputSync);
+}
+
+TEST(DualIsoPipeline, AsyncPreuploadUnarmedFallbackDoesNotLeakPriorSuccessfulStatus)
+{
+    // Blocker fixed this round: MainWindow's compare-and-reject disarms a
+    // mismatched frame's state.frame_id to UINT64_MAX (token 0), which takes
+    // the plain g->run() path in llrawproc_gpu_recon_run_backend() -- NOT
+    // g->run_preuploaded(). Querying g->last_preupload_status() after a
+    // plain run() would report a PRIOR frame's successful preupload as this
+    // (unarmed) frame's status; llrawproc.c must scope that query to only
+    // the call that actually used run_preuploaded().
+    const FakeGpuBackendScope fakeBackend;
+    const AsyncH2dEnvScope asyncEnv(true);
+    const int width = 4, height = 4;
+    auto stateArmed = makeValidatedFakeBackendState(5, width, height);
+    auto stateUnarmed = makeValidatedFakeBackendState(UINT64_MAX, width, height);
+    auto bytesA = makeBayer14(width, height, 40);
+    auto bytesB = makeBayer14(width, height, 50);
+    std::vector<uint16_t> output(bytesA.size());
+    int rc = -1;
+    llrpGpuPlaybackReconTiming_t timing = {};
+
+    // Warm up: g->clip_configured must already be true before a preupload can
+    // be accepted (llrpGpuPlaybackReconPreuploadFrame() checks it) -- exactly
+    // as it would be in production after the first frame's recon call.
+    ASSERT_NE(0, llrpGpuPlaybackReconRunCpu16Probe(&stateArmed, bytesA.data(),
+        bytesA.size() * sizeof(uint16_t), output.data(), &rc, &timing));
+
+    // A prior frame's preupload is staged, matched and CONSUMED: used=1,
+    // accepted=1, exact_match=1 all land in g_llrawproc_fake_gpu_backend_last_status.
+    ASSERT_NE(0, llrpGpuPlaybackReconPreuploadFrame(5, bytesA.data(),
+        bytesA.size() * sizeof(uint16_t)));
+    ASSERT_NE(0, llrpGpuPlaybackReconRunCpu16Probe(&stateArmed, bytesA.data(),
+        bytesA.size() * sizeof(uint16_t), output.data(), &rc, &timing));
+    ASSERT_EQ(0, rc);
+    ASSERT_NE(0, timing.preupload.used);
+    ASSERT_NE(0, timing.preupload.exact_match);
+
+    // Now an unarmed (mismatch-disarmed) frame runs with NO preupload staged
+    // for it at all. This must not report the previous call's used/exact_match.
+    ASSERT_NE(0, llrpGpuPlaybackReconRunCpu16Probe(&stateUnarmed, bytesB.data(),
+        bytesB.size() * sizeof(uint16_t), output.data(), &rc, &timing));
+    ASSERT_EQ(0, rc);
+    ASSERT_EQ(0, timing.preupload.available);
+    ASSERT_EQ(0, timing.preupload.accepted);
+    ASSERT_EQ(0, timing.preupload.used);
+    ASSERT_EQ(0, timing.preupload.exact_match);
 }
 
 TEST(DualIsoPipeline, AsyncPreuploadRejectsByteMismatchWithSameFrameAndFallsBackCorrectly)

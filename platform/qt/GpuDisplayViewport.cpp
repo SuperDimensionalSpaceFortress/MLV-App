@@ -834,7 +834,14 @@ bool GpuDisplayViewport::presentGpuPlaybackReconAmazePostWbTexture(
         && state->valid
         && retainedDeviceWidth == state->width
         && retainedDeviceHeight == state->height
-        && !validationProbeTexture;
+        && !validationProbeTexture
+        /* A frame-id mismatch (MainWindow's compare-and-reject) leaves
+         * state->frame_id at the UINT64_MAX "not armed" sentinel. The
+         * retained device buffer must be rejected on this presentation
+         * path too, not only on llrawproc's backend-call gate below --
+         * otherwise a mismatched frame's retained buffer is still shown
+         * because this branch never calls run_backend() at all. */
+        && llrpGpuPlaybackReconFrameToken( state->frame_id ) != 0;
     if ( !viewport
       || !state
       || !state->valid
@@ -1464,7 +1471,13 @@ bool GpuDisplayViewport::setPresentedGpuPlaybackReconAmazePostWbTexture(
         retainedDeviceBayer16
         && retainedDeviceWidth == width
         && retainedDeviceHeight == height
-        && !validationProbeTexture;
+        && !validationProbeTexture
+        /* Same reject-on-mismatch as the public entry point above: a
+         * mismatched frame's compare-and-reject leaves state->frame_id
+         * unarmed (UINT64_MAX), which must also disqualify the retained
+         * device buffer shortcut, not only the run_backend() call in the
+         * else branch below. */
+        && llrpGpuPlaybackReconFrameToken( state->frame_id ) != 0;
     const size_t expectedWords =
         static_cast<size_t>(width) * static_cast<size_t>(height);
     if ( !rawInputBayer14 && !retainedDeviceValid )

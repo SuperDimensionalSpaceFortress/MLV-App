@@ -2801,9 +2801,12 @@ class RepoHygieneTests(unittest.TestCase):
         source = (ROOT / "src/mlv/llrawproc/llrawproc.c").read_text(encoding="utf-8")
         render = (ROOT / "platform/qt/RenderFrameThread.cpp").read_text(encoding="utf-8")
         self.assertNotIn("llrpGpuPlaybackReconPreuploadFrame(", render)
+        # ASYNC-H2D-FRAME-BINDING-1 hardening: the ambient current-frame accessor is
+        # read exactly once (gpu_playback_current_frame_index) and threaded explicitly
+        # into every consuming path below it, rather than re-read at each call site.
         self.assertRegex(source, r"(?s)if \(gpu_playback_prepare_only_allowed\)\s*\{\s*"
                          r"/\*.*?\*/\s*\(void\)llrpGpuPlaybackReconPreuploadFrame\(\s*"
-                         r"mlv_pipeline_capture_get_current_frame\(\),\s*gpu_playback_input,\s*raw_image_size\);")
+                         r"gpu_playback_current_frame_index,\s*gpu_playback_input,\s*raw_image_size\);")
         for call in ("preupload_frame", "run_preuploaded"):
             with self.subTest(call=call):
                 self.assertRegex(source, rf"g->{call}\(g->backend,\s*frame_token,")

@@ -5074,13 +5074,20 @@ void MainWindow::presentPlaybackPreparedFrame( const PlaybackPrepResult &result 
          * preupload must not be consumed for it (state.frame_id is left at
          * UINT64_MAX, which llrpGpuPlaybackReconFrameToken() maps to token 0
          * -- "not armed" -- so run_backend() falls back to the ordinary
-         * synchronous upload path instead of a stale or unrelated preupload). */
+         * synchronous upload path instead of a stale or unrelated preupload;
+         * GpuDisplayViewport/Window's retained-device-buffer gate keys off
+         * the same sentinel, so a mismatch also stops the retained buffer
+         * itself from being presented, not only the backend call). The
+         * decision is the shared, unit-tested
+         * llrpGpuPlaybackReconFrameIdAfterCompareAndReject() (llrawproc.h),
+         * not reimplemented here, so this one function is what both the
+         * backend gate and the presentation gate act on. */
         const bool gpuReconFrameIdMismatch =
             gpuReconState.frame_id != static_cast<uint64_t>( task.displayFrame );
-        if( gpuReconFrameIdMismatch )
-        {
-            gpuReconState.frame_id = UINT64_MAX;
-        }
+        gpuReconState.frame_id =
+            llrpGpuPlaybackReconFrameIdAfterCompareAndReject(
+                gpuReconState.frame_id,
+                static_cast<uint64_t>( task.displayFrame ) );
         readyFrame.stageTimingTelemetry.insert(
             QStringLiteral("gpu_playback_recon_async_h2d_frame_id_mismatch"),
             gpuReconFrameIdMismatch );

@@ -2081,14 +2081,18 @@ static int igpu_recon_run_internal(igpu_recon_backend* b,
     b->last_timing.kernel_ms   = (double)kern;
     b->last_timing.download_ms = (double)dl;
     b->last_timing.total_ms    = (double)tot;
-    if (allow_preupload) {
-        EnterCriticalSection(&b->preupload_lock);
-        b->last_preupload_status = preupload_status;
-        if (preupload_slot_index >= 0) {
-            b->preupload[preupload_slot_index].state = 0;
-        }
-        LeaveCriticalSection(&b->preupload_lock);
+    /* Unconditional, not gated on allow_preupload: an ordinary igpu_recon_run()
+     * call (allow_preupload=0) must scope last_preupload_status to THIS run,
+     * not leave a prior igpu_recon_run_preuploaded() call's status sticking
+     * around. preupload_status is zero-initialized above and only populated
+     * by take_exact_preupload() when allow_preupload is set, so this correctly
+     * resets to "unavailable" on the plain path. */
+    EnterCriticalSection(&b->preupload_lock);
+    b->last_preupload_status = preupload_status;
+    if (allow_preupload && preupload_slot_index >= 0) {
+        b->preupload[preupload_slot_index].state = 0;
     }
+    LeaveCriticalSection(&b->preupload_lock);
     return 0;
 }
 
