@@ -1,0 +1,1758 @@
+{
+  "_meta": {
+    "card": "PROD-TELEMETRY-DURATION-AS-PROOF-4B round 1 (successor of parked #173)",
+    "pattern_set": [
+      "ident_compare: a TOKEN-based duration identifier (see duration_as_proof_scan._is_duration_identifier) compared to a zero literal. The unit word (ms/msec/millis/milliseconds/seconds/secs/sec/duration/elapsed/micros/nanos, plus us/ns as a whole underscore segment only) may be the whole identifier, a suffix (Ms/Seconds/_ms), or an earlier word followed by a qualifier (wallMsDelta, expectedDurationSeconds) -- position-independent by design.",
+      "duration_getter: a niladic call `fooBar()` whose name is itself a duration identifier by the same rule (e.g. getFooMilliseconds()), compared to a zero literal. Formerly named 'milliseconds_getter' and limited to the literal suffix 'Milliseconds'.",
+      "json_ms_key: a QJsonObject '*_ms' key read via .toDouble()/.toInt(), WITH OR WITHOUT a default-value argument (e.g. .toDouble(-1.0)), compared to a zero literal.",
+      "assert_macro: a gtest predicate macro encoding a duration-vs-zero comparison -- 2-arg ASSERT_*/EXPECT_* (EQ NE GT GE LT LE DOUBLE_EQ FLOAT_EQ) whose two arguments are a zero literal and a duration expression, or 3-arg ASSERT_NEAR/EXPECT_NEAR(val1, val2, abs_error) applying the same check to (val1, val2) and ignoring the tolerance."
+    ],
+    "round_4b_grammar_hardening": "Round 4B (successor of the parked #173 review) replaced round 4's four literal-suffix/fixed-macro-list patterns with the token-based rule above after sol and fable independently found real, then-current false negatives (camelCase Seconds/Duration names with no _ms/_seconds/Ms suffix, a bare 'ms' identifier, .toDouble() with a default argument, and ASSERT_NEAR/ASSERT_DOUBLE_EQ outside the macro allow-list). The rule is deliberately still bounded, not maximal: 'us'/'ns' only count as a whole underscore-delimited segment (never a bare camelCase Us/Ns token, too collision-prone), and shapes with zero live instances in this tree at round-4B time (qFuzzyIsNull, std::max(0.0, x_ms), a bare *Seconds() getter, chrono .count() compares) were deliberately left unmatched -- broadening for a shape nothing here uses would only add false-positive surface with no coverage benefit. The scanner also now blanks `//` and `/* */` comment text (tracking multi-line block comments and string literals) before matching, since the broader identifier rule turned two comments describing duration behavior in prose into false positives under the old raw-text scan. Anchors are computed by a small tokenizer (identifiers/numbers/operators/punctuation, single-space-joined, string literals kept as one verbatim atom) instead of a whitespace-collapse, so token-boundary spacing choices (`if(x)` vs `if ( x )`) no longer change a site's identity while whitespace INSIDE a string literal still does; this changed nearly every existing anchor's exact text in this round's migration (a mechanical resync, verified against the previous rows by shared line numbers -- no row's classification changed, only its anchor/lines fields). A site's identity also now includes its occurrence COUNT (see test_duration_as_proof_inventory._row_key), not just (path, anchor), so a newly added identical copy of an already-classified line cannot silently inherit that row's verdict.",
+    "lower_bound_caveat": "This inventory is a LOWER BOUND on 'duration used as run-proof' sites, not a completeness proof. The scanner (tools/repo_hygiene/duration_as_proof_scan.py) only matches the four textual shapes above, per physical line (a comparison split across two physical lines is not caught), over git-tracked *.c/*.cpp/*.h/*.hpp files under src/, platform/qt/ and tests/. A duration compared through an intermediate variable on another line, a helper function that hides the comparison, a duration hidden inside a multi-line block comment's own multi-line reach, or a fifth pattern shape entirely, would not be caught. The gate's job is to make the class it DOES see finite and reviewed, not to prove no other duration-as-proof site exists anywhere in the codebase.",
+    "classes": {
+      "division_guard": "Guards a division (X / duration) against a zero denominator; the comparison exists to avoid a divide-by-zero/NaN, never to prove a stage ran.",
+      "display_or_format": "Formats or converts an already-computed duration for display or logging (unit conversion, an FPS-equivalent for a print); the zero-guard only avoids a garbage displayed value.",
+      "value_fallback_select": "Selects between a measured value and a fallback/default, or filters a sample/sentinel before recording it, based on whether a duration read as zero/non-positive; a config or data-validity decision, not a run-proof.",
+      "not_run_proof_structural": "A structural check that can never distinguish 'ran' from 'did not run' (e.g. >=0.0 non-negativity), or a negative-lane exclusivity check proving a stage did NOT run (paired elsewhere with a positive completed-flag/counter proof that another stage DID).",
+      "run_proof": "Duration-as-proof in the sense this card exists to retire: a zero/nonzero duration read is the ONLY signal that a stage ran, produced output, or is exclusive of another stage, with no completed-flag/counter alternative recorded alongside it. Carries either a 'flag' naming an already-existing replacement, or 'status: open' + 'successor' naming the card that will fix it."
+    },
+    "clocks": {
+      "qpc_stage_clock": "mlv_stage_timing_now()/_ns() (src/debug/StageTiming.h) or another QueryPerformanceCounter-based monotonic clock (e.g. GpuWindowSwapTelemetry's *QpcMs fields); falls back to omp_get_wtime() only if QueryPerformanceFrequency itself fails, so not a flake source in practice.",
+      "omp_get_wtime_direct": "Calls omp_get_wtime() unconditionally with no monotonic-clock fallback (raw_processing.c's per-substage Shadows/Highlights filter timers, ~1484-1694); the #169 ruling's correction names this family as the ONLY source of the 1 ms flake.",
+      "other": "A config value, CLI argument, epoch/wall-clock sentinel, Qt QTime delta, std::chrono::steady_clock read, or a field whose clock was not independently traced this round; not itself a flake-risk clock in the omp_get_wtime sense."
+    }
+  },
+  "rows": [
+    {
+      "path": "platform/qt/GpuWindowSwapTelemetry.h",
+      "anchor": "( counters . swapCount > 1 && spanMs > 0.0 )",
+      "class": "division_guard",
+      "clock": "qpc_stage_clock",
+      "justification": "Guards the fps = (swapCount-1)*1000/spanMs division; with <=1 swap or a zero-width span (QPC ties) the guard reports 0 rather than dividing by zero. Decides a formatting fallback for an already-computed summary, never whether any stage ran.",
+      "lines": [
+        86
+      ]
+    },
+    {
+      "path": "platform/qt/MainWindow.cpp",
+      "anchor": "if ( cpuSecondsDelta < 0.0 || wallMsDelta <= 0 ) return - 1.0 ;",
+      "class": "division_guard",
+      "clock": "other",
+      "justification": "Guards normalizedProcessCpuPercent()'s cpuSecondsDelta / (wallMsDelta/1000.0) division: a negative CPU delta (clock read failure, sentinel -1.0 propagated) or a non-positive wall-time sample span returns -1.0 (unavailable) instead of dividing. Formatting/availability guard for a CPU% diagnostic, never a stage run-proof.",
+      "lines": [
+        2094
+      ]
+    },
+    {
+      "path": "platform/qt/MainWindow.cpp",
+      "anchor": "averageFrameMs > 0.0 ? averageFrameMs : frameBudgetMs * 1.20 ,",
+      "class": "value_fallback_select",
+      "clock": "other",
+      "justification": "Selects between a caller-supplied measured average frame time and a synthetic 120%-over-budget estimate when constructing a forced-fast playback-quality decision for test/diagnostic callers; does not gate whether any pipeline stage executed.",
+      "lines": [
+        2470
+      ]
+    },
+    {
+      "path": "platform/qt/MainWindow.cpp",
+      "anchor": "if ( autoplaySeconds > 0 )",
+      "class": "value_fallback_select",
+      "clock": "other",
+      "justification": "MLVAPP_AUTOPLAY_SECONDS is an automation/test env-var config flag: >0 enables the auto-play-then-stop hook, 0 (unset) leaves it off. A feature-enablement config decision, not proof that any pipeline stage ran.",
+      "lines": [
+        2738
+      ]
+    },
+    {
+      "path": "platform/qt/MainWindow.cpp",
+      "anchor": "if ( autoplaySettleMs <= 0 ) autoplaySettleMs = 2500 ;",
+      "class": "value_fallback_select",
+      "clock": "other",
+      "justification": "MLVAPP_AUTOPLAY_SETTLE_MS is an operator-supplied config knob (ms to wait before autoplay); <=0 falls back to the 2500 ms default. Never a measured duration and never used as run-proof.",
+      "lines": [
+        2741
+      ]
+    },
+    {
+      "path": "platform/qt/MainWindow.cpp",
+      "anchor": "if ( measuredFrameMs > 0 )",
+      "class": "value_fallback_select",
+      "clock": "other",
+      "justification": "measuredFrameMs is a Qt QTime::msecsTo() wall-clock delta between playback timer ticks; a non-positive value (clock stalled/went backwards) is excluded from the FPS EMA update rather than treated as proof a frame did or did not render.",
+      "lines": [
+        3085
+      ]
+    },
+    {
+      "path": "platform/qt/MainWindow.cpp",
+      "anchor": "if ( m_playbackFpsEmaFrameMs <= 0.0 )",
+      "class": "value_fallback_select",
+      "clock": "other",
+      "justification": "Distinguishes the EMA's first sample (seed with the raw value) from a subsequent update (blend 90/10); the sentinel is an initialization marker, not run-proof.",
+      "lines": [
+        3087
+      ]
+    },
+    {
+      "path": "platform/qt/MainWindow.cpp",
+      "anchor": "if ( shouldUpdateFpsText && m_playbackFpsEmaFrameMs > 0.0 )",
+      "class": "division_guard",
+      "clock": "other",
+      "justification": "Guards 1000.0 / m_playbackFpsEmaFrameMs (fps-from-frame-time) against a division by zero/uninitialized EMA before formatting the on-screen FPS label.",
+      "lines": [
+        3100
+      ]
+    },
+    {
+      "path": "platform/qt/MainWindow.cpp",
+      "anchor": "texturePresentTiming . wall_ms > 0.0",
+      "class": "value_fallback_select",
+      "clock": "other",
+      "justification": "Chooses between the GPU-interop-measured wall_ms and a coarser texturePresentMs fallback when only the coarse timer produced a real reading; a display-value selection for the telemetry JSON, not a run-proof gate.",
+      "lines": [
+        5322
+      ]
+    },
+    {
+      "path": "platform/qt/MainWindow.cpp",
+      "anchor": "&& lastCpuSeconds >= 0.0",
+      "class": "value_fallback_select",
+      "clock": "other",
+      "justification": "currentProcessCpuSeconds() returns -1.0 as an unavailable-clock sentinel; `lastCpuSeconds >= 0.0` gates the CPU-settle wait loop on that reading being available at all -- a feature-availability/data-validity decision (pairs with settleCpuPercent>=0.0 opting into the feature), never a stage run-proof.",
+      "lines": [
+        8806,
+        8814
+      ]
+    },
+    {
+      "path": "platform/qt/MainWindow.cpp",
+      "anchor": "options . settleCpuPercent >= 0.0 && lastCpuSeconds >= 0.0 ;",
+      "class": "value_fallback_select",
+      "clock": "other",
+      "justification": "Same CPU-settle availability decision as the loop guard above, computed once more into cpuSettleRequested for the diagnostic log line -- a config/data-validity read, not a stage run-proof.",
+      "lines": [
+        8839
+      ]
+    },
+    {
+      "path": "platform/qt/MainWindow.cpp",
+      "anchor": "if ( measuredFrameMs <= 0",
+      "class": "value_fallback_select",
+      "clock": "other",
+      "justification": "notePhase3PlaybackTime() discards non-positive frame-time samples (and non-Phase-3 modes) before accumulating clip playtime; a sample-validity filter, not proof any stage ran.",
+      "lines": [
+        20946
+      ]
+    },
+    {
+      "path": "platform/qt/MainWindow.cpp",
+      "anchor": "|| m_phase3ClipPlaytimePendingMs <= 0 )",
+      "class": "value_fallback_select",
+      "clock": "other",
+      "justification": "flushPhase3PlaybackTime() has nothing to flush when the pending accumulator is empty or non-positive; an early-return guard on an accumulator, not a run-proof.",
+      "lines": [
+        20971
+      ]
+    },
+    {
+      "path": "platform/qt/MainWindow.cpp",
+      "anchor": "if ( force && seconds == 0 ) seconds = 1 ;",
+      "class": "value_fallback_select",
+      "clock": "other",
+      "justification": "flushPhase3PlaybackTime rounds m_phase3ClipPlaytimePendingMs (a wall-clock accumulator, not a stage clock) down to whole seconds; when forced to flush early and truncation produced exactly 0, this substitutes a minimum-1-second fallback so a forced flush is never silently a no-op write. A fallback-value selection, not a run-proof.",
+      "lines": [
+        20977
+      ]
+    },
+    {
+      "path": "platform/qt/MainWindow.cpp",
+      "anchor": "if ( seconds <= 0 && ! force ) return ;",
+      "class": "value_fallback_select",
+      "clock": "other",
+      "justification": "Skips persisting the accumulated clip-playtime settings write when less than a second has accumulated and the flush was not forced -- an early-return threshold on a wall-clock accumulator, not proof that any pipeline stage ran.",
+      "lines": [
+        20978
+      ]
+    },
+    {
+      "path": "platform/qt/MainWindow.cpp",
+      "anchor": "if ( m_phase3ClipPlaytimePendingMs < 0 ) m_phase3ClipPlaytimePendingMs = 0 ;",
+      "class": "value_fallback_select",
+      "clock": "other",
+      "justification": "Defensive clamp of the residual playtime accumulator to zero after subtracting the flushed whole seconds; guards integer-division residue, not run-proof.",
+      "lines": [
+        20985
+      ]
+    },
+    {
+      "path": "platform/qt/MainWindow.cpp",
+      "anchor": "const double elapsedSeconds = elapsedMs > 0.0 ? elapsedMs / 1000.0 : 0.0 ;",
+      "class": "display_or_format",
+      "clock": "qpc_stage_clock",
+      "justification": "Unit conversion (ms to s) for the playback-smoke summary log line; elapsedMs is derived from mlv_stage_timing_now() and the guard only avoids reporting a negative/garbage value, it does not decide whether anything ran.",
+      "lines": [
+        25102
+      ]
+    },
+    {
+      "path": "platform/qt/MainWindow.cpp",
+      "anchor": "elapsedSeconds > 0.0",
+      "class": "division_guard",
+      "clock": "qpc_stage_clock",
+      "justification": "Guards presentedFps = presentedFrames/elapsedSeconds and timelineFps = timelineDeltaAbs/elapsedSeconds in finishPlaybackSmokeTelemetry against dividing by zero when the smoke run's elapsed wall time (derived from mlv_stage_timing_now()) is non-positive; reports 0 fps instead. Formatting fallback for a diagnostic summary, never a run-proof.",
+      "lines": [
+        25111,
+        25116
+      ]
+    },
+    {
+      "path": "platform/qt/MainWindow.cpp",
+      "anchor": "if ( m_playbackSmokeProcessingShadowsHighlightsRbfTotalSumMs > 0.0 )",
+      "class": "run_proof",
+      "clock": "omp_get_wtime_direct",
+      "justification": "Gates whether the playback_smoke.rbf_detail_summary diagnostic block is logged at all on whether the omp_get_wtime-direct RBF substage accumulator (processing_shadows_highlights_filter_rbf_total_ms, sourced from raw_processing.c's per-substage omp_get_wtime() writes ~1671-1694) summed to something nonzero across the session -- the named site from the #169 ruling (MainWindow.cpp smoke rbf_detail_summary ~25773).",
+      "status": "open",
+      "successor": "PROD-TELEMETRY-DURATION-AS-PROOF-5",
+      "lines": [
+        25773
+      ]
+    },
+    {
+      "path": "platform/qt/MainWindow.cpp",
+      "anchor": "renderTotalMs > 0.0",
+      "class": "value_fallback_select",
+      "clock": "qpc_stage_clock",
+      "justification": "Chooses between a measured render-thread-total-driven scope-update cadence and the configured base interval when the telemetry field read zero (not yet populated); a UI-update-interval selection, not a run-proof.",
+      "lines": [
+        27347
+      ]
+    },
+    {
+      "path": "platform/qt/MainWindow.cpp",
+      "anchor": "intervalMs <= 0",
+      "class": "value_fallback_select",
+      "clock": "other",
+      "justification": "Part of the 'should I refresh the scopes now' throttle predicate (also true when never updated, or enough wall time elapsed); intervalMs is a UI cadence, not a stage-completion signal.",
+      "lines": [
+        27353
+      ]
+    },
+    {
+      "path": "platform/qt/MainWindow.cpp",
+      "anchor": "if ( presentedIntervalMs > 0.0 )",
+      "class": "value_fallback_select",
+      "clock": "qpc_stage_clock",
+      "justification": "Excludes a non-positive inter-present interval (clock non-monotonic, or first frame) from being recorded into the playback-quality frame-time sampler; a sample-validity filter over a mlv_stage_timing_now()-derived interval (displayStart), not a run-proof.",
+      "lines": [
+        27553
+      ]
+    },
+    {
+      "path": "platform/qt/PlaybackQualityPolicy.h",
+      "anchor": "if ( tierEnteredAtMs <= 0 ) return false ;",
+      "class": "value_fallback_select",
+      "clock": "other",
+      "justification": "tierEnteredAtMs is an epoch-ms sentinel meaning 'tier not yet entered' when <=0 (default-constructed); guards two promotion-eligibility checks, never a measured duration.",
+      "lines": [
+        594,
+        608
+      ]
+    },
+    {
+      "path": "platform/qt/PlaybackQualityPolicy.h",
+      "anchor": "if ( autoFallbackEpochMs > 0",
+      "class": "value_fallback_select",
+      "clock": "other",
+      "justification": "autoFallbackEpochMs is 0 when no auto-fallback has happened yet; the >0 check gates a 'still in cooldown after a recent auto-fallback' rule, not a duration/run-proof.",
+      "lines": [
+        596
+      ]
+    },
+    {
+      "path": "platform/qt/PlaybackQualityPolicy.h",
+      "anchor": "return frameMs > 0.0 ? 1000.0 / frameMs : 0.0 ;",
+      "class": "division_guard",
+      "clock": "other",
+      "justification": "Standard fps-from-frame-time division guard; frameMs is a caller-supplied sample, not itself a run-proof signal.",
+      "lines": [
+        785
+      ]
+    },
+    {
+      "path": "platform/qt/PlaybackQualityPolicy.h",
+      "anchor": "if ( frameMs <= 0.0 ) return ;",
+      "class": "value_fallback_select",
+      "clock": "other",
+      "justification": "recordFrameMs() drops non-positive samples before pushing into the sliding window; a sample-validity filter.",
+      "lines": [
+        795
+      ]
+    },
+    {
+      "path": "platform/qt/RenderFrameThread.cpp",
+      "anchor": "if ( ! std :: isfinite ( ms ) || ms <= 0.0 ) return 0 ;",
+      "class": "display_or_format",
+      "clock": "qpc_stage_clock",
+      "justification": "The durationNs() lambda clamps a millisecond duration to 0 before converting to nanoseconds (ms*1e6) for CSV event timestamps, guarding against a non-finite or negative value producing a nonsensical duration in the emitted event. A unit-conversion clamp, not itself the run-proof decision -- the actual run/skip decisions for these stages are the already-inventoried decodeMs<=0.0 (line 2958) and reconMs<=0.0 (line 2962) run_proof rows this same function computes just above.",
+      "lines": [
+        2926
+      ]
+    },
+    {
+      "path": "platform/qt/RenderFrameThread.cpp",
+      "anchor": "if ( reconMs <= 0.0 ) reconMs = fieldMs ( \"llrawproc_ms\" ) ;",
+      "class": "run_proof",
+      "clock": "qpc_stage_clock",
+      "justification": "Part of the Phase-3 CSV stage-timing emission named as a BLOCKER in the #169 review (RenderFrameThread.cpp ~2921-2966): a zero read from llrawproc_total_ms falls back to llrawproc_ms and, combined with the reconMs<=0.0 gate at line 2962, a genuinely-fast-but-real recon stage cannot be told apart from one that did not run at all; both readings trace to mlv_stage_timing_now()-based accumulators.",
+      "status": "open",
+      "successor": "PROD-TELEMETRY-DURATION-AS-PROOF-5",
+      "lines": [
+        2930
+      ]
+    },
+    {
+      "path": "platform/qt/RenderFrameThread.cpp",
+      "anchor": "if ( processMs <= 0.0 ) processMs = fieldMs ( \"processed16_total_ms\" ) ;",
+      "class": "run_proof",
+      "clock": "qpc_stage_clock",
+      "justification": "Same Phase-3 CSV fallback chain as the reconMs site (processed8_total_ms -> processed16_total_ms -> processing_ms); a zero read is treated as 'field not populated', indistinguishable from 'stage ran in under clock resolution'. Named in the #169 review BLOCKER for RenderFrameThread.cpp ~2921-2966.",
+      "status": "open",
+      "successor": "PROD-TELEMETRY-DURATION-AS-PROOF-5",
+      "lines": [
+        2933
+      ]
+    },
+    {
+      "path": "platform/qt/RenderFrameThread.cpp",
+      "anchor": "if ( processMs <= 0.0 ) processMs = fieldMs ( \"processing_ms\" ) ;",
+      "class": "run_proof",
+      "clock": "qpc_stage_clock",
+      "justification": "Second link of the same processMs fallback chain (processed16_total_ms -> processing_ms); see the processed8_total_ms link's justification above. Named in the #169 review BLOCKER for RenderFrameThread.cpp ~2921-2966.",
+      "status": "open",
+      "successor": "PROD-TELEMETRY-DURATION-AS-PROOF-5",
+      "lines": [
+        2934
+      ]
+    },
+    {
+      "path": "platform/qt/RenderFrameThread.cpp",
+      "anchor": "&& decodeMs <= 0.0 ) )",
+      "class": "run_proof",
+      "clock": "qpc_stage_clock",
+      "justification": "Suppresses emitting the MLV_STAGE_DECODE CSV event entirely when decodeMs read <=0.0 for a decode-only/decode-recon-process Phase-3 mode -- the named BLOCKER: a decode that legitimately completed in under clock resolution is indistinguishable from one that never ran, and the CSV consumer treats the missing event as 'did not run'.",
+      "status": "open",
+      "successor": "PROD-TELEMETRY-DURATION-AS-PROOF-5",
+      "lines": [
+        2958
+      ]
+    },
+    {
+      "path": "platform/qt/RenderFrameThread.cpp",
+      "anchor": "if ( ! ( mode == Phase3Mode :: DecodeReconProcess && reconMs <= 0.0 ) )",
+      "class": "run_proof",
+      "clock": "qpc_stage_clock",
+      "justification": "Suppresses emitting the MLV_STAGE_RECON CSV event when reconMs read <=0.0 in DecodeReconProcess mode -- the other half of the sol/fable #169 BLOCKER named for this file (~2921-2966).",
+      "status": "open",
+      "successor": "PROD-TELEMETRY-DURATION-AS-PROOF-5",
+      "lines": [
+        2962
+      ]
+    },
+    {
+      "path": "platform/qt/RenderFrameThread.cpp",
+      "anchor": "const bool preDualIsoFixActive = llrawprocPreDualIsoFixMs > 0.0 ;",
+      "class": "run_proof",
+      "clock": "qpc_stage_clock",
+      "justification": "Reads llrawproc->playback_pre_dualiso_fix_ms > 0.0 as proof the pre-dual-ISO fix ran for THIS frame's telemetry dims. The field is a thread-local reset only at explicit reset points (llrawproc.c ~2825-2828) and written from mlv_stage_timing_now() at llrawproc.c ~3233, but the processed8 cache-hit path in getMlvProcessedFrame8_with_scale() (video_mlv.c, cache-hit branch ~7325-7364, reached via goto cleanup at ~7363) does NOT reset or replay it -- a cache-hit frame can report the calling thread's stale value from an earlier miss frame. This is the #169-review cache-hit-replay BLOCKER (video_mlv.c ~7334-7376 / entry reset ~7235-7247).",
+      "status": "open",
+      "successor": "PROD-TELEMETRY-DURATION-AS-PROOF-5",
+      "lines": [
+        4802
+      ]
+    },
+    {
+      "path": "platform/qt/main.cpp",
+      "anchor": "if ( ! ok || seconds <= 0.0 )",
+      "class": "not_run_proof_structural",
+      "clock": "other",
+      "justification": "CLI arg range validation for the GUI-smoke harness's --seconds option (must be greater than 0), the same shape as the --settle-ms/--start-frame/--presented-frames checks immediately below it. Rejects malformed input before any run begins; cannot distinguish 'ran' from 'did not run'.",
+      "lines": [
+        1370
+      ]
+    },
+    {
+      "path": "platform/qt/main.cpp",
+      "anchor": "if ( ! ok || settleMs < 0 )",
+      "class": "not_run_proof_structural",
+      "clock": "other",
+      "justification": "gui-smoke CLI argument range validation (--settle-ms must be >=0); a config-input check, unrelated to whether any playback stage ran.",
+      "lines": [
+        1377
+      ]
+    },
+    {
+      "path": "platform/qt/main.cpp",
+      "anchor": "if ( ! ok || settleCpuStableMs < 0 )",
+      "class": "not_run_proof_structural",
+      "clock": "other",
+      "justification": "gui-smoke CLI argument range validation (--settle-cpu-stable-ms must be >=0); a config-input check, unrelated to whether any playback stage ran.",
+      "lines": [
+        1416
+      ]
+    },
+    {
+      "path": "platform/qt/main.cpp",
+      "anchor": "if ( ! ok || stressSwitchAtMs < 0 )",
+      "class": "not_run_proof_structural",
+      "clock": "other",
+      "justification": "gui-smoke CLI argument range validation (--stress-switch-at-ms must be >=0); a config-input check, unrelated to whether any playback stage ran.",
+      "lines": [
+        1430
+      ]
+    },
+    {
+      "path": "src/batch/BatchRenderedVideoPlan.cpp",
+      "anchor": "&& outputVerificationPlan . expectedDurationSeconds > 0.0 ;",
+      "class": "value_fallback_select",
+      "clock": "other",
+      "justification": "durationFieldPlanned only includes the duration cross-check in the rendered-output verification plan when expectedDurationSeconds is a meaningful positive value (it is 0 when the source frame count wasn't ready) -- a verification-readiness/data-validity decision about what to check, not proof that rendering itself ran (that is frameCountFieldPlanned's job, ANDed in first).",
+      "lines": [
+        3513
+      ]
+    },
+    {
+      "path": "src/batch/BatchRenderedVideoPlan.cpp",
+      "anchor": "&& plan . expectedDurationSeconds > 0.0 ;",
+      "class": "value_fallback_select",
+      "clock": "other",
+      "justification": "frameCountExpectationReady requires both expectedFrameCount>0 and expectedDurationSeconds>0.0 before the frame-count check is considered plannable -- a verification-readiness decision derived from source metadata, not proof that any stage ran.",
+      "lines": [
+        3777
+      ]
+    },
+    {
+      "path": "src/batch/BatchRunner.cpp",
+      "anchor": "if ( micros > 0 )",
+      "class": "value_fallback_select",
+      "clock": "other",
+      "justification": "Parses ffmpeg's `out_time_us=` progress line (an external process's stderr, not an internal stage clock); only overwrites facts.durationSeconds when the parsed microsecond value is positive, so a malformed/absent progress line leaves the prior value untouched. A parsed-value acceptance filter, not a run-proof.",
+      "lines": [
+        176
+      ]
+    },
+    {
+      "path": "src/batch/BatchRunner.cpp",
+      "anchor": "if ( expectedDuration > 0.0",
+      "class": "value_fallback_select",
+      "clock": "other",
+      "justification": "expectedDuration (framesToExport/frameRate, 0 when frameRate is unavailable) gates whether the decoded-vs-expected duration tolerance check runs at all; the frame-count check just above it is what actually guards exported content. A verification-readiness decision, not a stage run-proof.",
+      "lines": [
+        678
+      ]
+    },
+    {
+      "path": "src/dng/dng.c",
+      "anchor": "if ( delay_ms == 0 )",
+      "class": "value_fallback_select",
+      "clock": "other",
+      "justification": "dng_payload_writer_debug_delay() is an opt-in MLVAPP_* debug knob to artificially slow DNG writes for testing; delay_ms==0 (the default, unset) skips the sleep entirely. Not a measured duration and not run-proof.",
+      "lines": [
+        422
+      ]
+    },
+    {
+      "path": "src/dng/dng.c",
+      "anchor": "if ( g_export_profile_last_frame_finish_ms > 0.0 )",
+      "class": "value_fallback_select",
+      "clock": "qpc_stage_clock",
+      "justification": "First-frame sentinel: no prior frame finish has been recorded yet (initial value 0.0), so there is no queue-idle interval to compute. export_profile_now_ms() is QueryPerformanceCounter-based (Windows) / CLOCK_MONOTONIC elsewhere -- the same family as mlv_stage_timing_now().",
+      "lines": [
+        501
+      ]
+    },
+    {
+      "path": "src/dng/dng.c",
+      "anchor": "frame -> stages_ms [ EXPORT_PROFILE_QUEUE_IDLE ] = idle_ms > 0.0 ? idle_ms : 0.0 ;",
+      "class": "value_fallback_select",
+      "clock": "qpc_stage_clock",
+      "justification": "Clamps a computed idle interval to zero when clock skew or reordering would otherwise produce a negative value; a defensive clamp on an optional export-profiler diagnostic, not a run-proof.",
+      "lines": [
+        504
+      ]
+    },
+    {
+      "path": "src/dng/dng.c",
+      "anchor": "if ( g_export_profile_last_producer_finish_ms > 0.0 )",
+      "class": "value_fallback_select",
+      "clock": "qpc_stage_clock",
+      "justification": "Producer-side counterpart of the frame-finish sentinel above: no prior producer finish recorded yet, so there is no producer-queue-idle interval to compute.",
+      "lines": [
+        507
+      ]
+    },
+    {
+      "path": "src/dng/dng.c",
+      "anchor": "frame -> stages_ms [ EXPORT_PROFILE_PRODUCER_QUEUE_IDLE ] = idle_ms > 0.0 ? idle_ms : 0.0 ;",
+      "class": "value_fallback_select",
+      "clock": "qpc_stage_clock",
+      "justification": "Producer-queue counterpart of the idle-interval clamp above.",
+      "lines": [
+        510
+      ]
+    },
+    {
+      "path": "src/dng/dng.c",
+      "anchor": "frame -> stages_ms [ stage ] = value_ms > 0.0 ? value_ms : 0.0 ;",
+      "class": "value_fallback_select",
+      "clock": "qpc_stage_clock",
+      "justification": "export_profile_stage_set() clamps an externally-supplied stage duration to zero if negative before recording it into the optional export profiler; a defensive clamp, not a run-proof.",
+      "lines": [
+        544
+      ]
+    },
+    {
+      "path": "tests/console/test_clip_golden.cpp",
+      "anchor": "if ( sample . value ( QStringLiteral ( \"raw_uint16_ms\" ) ) . toDouble ( ) > 0.0 ) {",
+      "class": "run_proof",
+      "clock": "qpc_stage_clock",
+      "justification": "first_frame_with_raw_decode_telemetry()'s search for 'a frame that actually exercised raw decode' uses raw_uint16_ms > 0.0 as one of five OR'd signals (the others are the lj92 predictor field and three *_requested booleans); a raw decode that completed in under clock resolution would fail this leg of the OR silently (mitigated, not eliminated, by the other four signals). Named as the card's 'test_clip_golden.cpp frame selector (~227-245)' known debt.",
+      "status": "open",
+      "successor": "PROD-TELEMETRY-DURATION-AS-PROOF-5",
+      "lines": [
+        235
+      ]
+    },
+    {
+      "path": "tests/console/test_clip_golden.cpp",
+      "anchor": "ASSERT_TRUE ( field_ms >= 0.0 ) ;",
+      "class": "not_run_proof_structural",
+      "clock": "other",
+      "justification": "Generic per-field schema check shared by many call sites in require_processing_timing_field(): any telemetry timing field must be a non-negative double. >=0.0 can never distinguish 'ran' from 'did not run' (both satisfy it), so it is never a run-proof, only a type/range sanity check.",
+      "lines": [
+        350
+      ]
+    },
+    {
+      "path": "tests/console/test_clip_golden.cpp",
+      "anchor": "ASSERT_TRUE ( metadata . value ( QStringLiteral ( \"average_latency_ms\" ) ) . toDouble ( ) > 0.0 ) ;",
+      "class": "run_proof",
+      "clock": "other",
+      "justification": "Golden-JSON assertion that the whole-session average GUI frame latency measured nonzero; a real wall-clock GUI round-trip (Qt-timer based, not mlv_stage_timing_now), so not part of the omp_get_wtime 1 ms flake class, but still literally 'duration as proof a playback session produced measured frames' with no completed-flag alternative recorded alongside it.",
+      "status": "open",
+      "successor": "PROD-TELEMETRY-DURATION-AS-PROOF-5",
+      "lines": [
+        556
+      ]
+    },
+    {
+      "path": "tests/console/test_clip_golden.cpp",
+      "anchor": "ASSERT_TRUE ( metadata . value ( QStringLiteral ( \"play_to_first_frame_ms\" ) ) . toDouble ( ) > 0.0 ) ;",
+      "class": "run_proof",
+      "clock": "other",
+      "justification": "Same class as average_latency_ms: a GUI round-trip wall-clock measurement asserted nonzero as proof the first frame was actually presented, with no completed-flag alternative. Occurs in three tests sharing this exact assertion line.",
+      "status": "open",
+      "successor": "PROD-TELEMETRY-DURATION-AS-PROOF-5",
+      "lines": [
+        601,
+        1994,
+        2056
+      ]
+    },
+    {
+      "path": "tests/console/test_clip_golden.cpp",
+      "anchor": "ASSERT_TRUE ( first_frame . value ( QStringLiteral ( \"raw_uint16_lj92_pred6_total_ms\" ) ) . toDouble ( ) >= 0.0 ) ;",
+      "class": "not_run_proof_structural",
+      "clock": "qpc_stage_clock",
+      "justification": "Schema/non-negativity sanity check on the 'raw_uint16_lj92_pred6_total_ms' telemetry field (part of a large block of near-identical ASSERT_TRUE(...).toDouble() >= 0.0) checks over the playback-profile JSON): >=0.0 can never distinguish 'ran' from 'did not run', both satisfy it. Inferred from the field's source module (video_mlv.c / llrawproc.c / lj92.c), all on mlv_stage_timing_now(); not independently re-verified per field this round.",
+      "lines": [
+        610,
+        2119
+      ]
+    },
+    {
+      "path": "tests/console/test_clip_golden.cpp",
+      "anchor": "ASSERT_TRUE ( first_frame . value ( QStringLiteral ( \"raw_uint16_lj92_pred6_bitstream_ms\" ) ) . toDouble ( ) >= 0.0 ) ;",
+      "class": "not_run_proof_structural",
+      "clock": "qpc_stage_clock",
+      "justification": "Schema/non-negativity sanity check on the 'raw_uint16_lj92_pred6_bitstream_ms' telemetry field (part of a large block of near-identical ASSERT_TRUE(...).toDouble() >= 0.0) checks over the playback-profile JSON): >=0.0 can never distinguish 'ran' from 'did not run', both satisfy it. Inferred from the field's source module (video_mlv.c / llrawproc.c / lj92.c), all on mlv_stage_timing_now(); not independently re-verified per field this round.",
+      "lines": [
+        611,
+        2120
+      ]
+    },
+    {
+      "path": "tests/console/test_clip_golden.cpp",
+      "anchor": "ASSERT_TRUE ( first_frame . value ( QStringLiteral ( \"raw_uint16_lj92_pred6_predictor_ms\" ) ) . toDouble ( ) >= 0.0 ) ;",
+      "class": "not_run_proof_structural",
+      "clock": "qpc_stage_clock",
+      "justification": "Schema/non-negativity sanity check on the 'raw_uint16_lj92_pred6_predictor_ms' telemetry field (part of a large block of near-identical ASSERT_TRUE(...).toDouble() >= 0.0) checks over the playback-profile JSON): >=0.0 can never distinguish 'ran' from 'did not run', both satisfy it. Inferred from the field's source module (video_mlv.c / llrawproc.c / lj92.c), all on mlv_stage_timing_now(); not independently re-verified per field this round.",
+      "lines": [
+        612,
+        2121
+      ]
+    },
+    {
+      "path": "tests/console/test_clip_golden.cpp",
+      "anchor": "ASSERT_TRUE ( first_frame . value ( QStringLiteral ( \"raw_uint16_lj92_pred6_other_ms\" ) ) . toDouble ( ) >= 0.0 ) ;",
+      "class": "not_run_proof_structural",
+      "clock": "qpc_stage_clock",
+      "justification": "Schema/non-negativity sanity check on the 'raw_uint16_lj92_pred6_other_ms' telemetry field (part of a large block of near-identical ASSERT_TRUE(...).toDouble() >= 0.0) checks over the playback-profile JSON): >=0.0 can never distinguish 'ran' from 'did not run', both satisfy it. Inferred from the field's source module (video_mlv.c / llrawproc.c / lj92.c), all on mlv_stage_timing_now(); not independently re-verified per field this round.",
+      "lines": [
+        613,
+        2122
+      ]
+    },
+    {
+      "path": "tests/console/test_clip_golden.cpp",
+      "anchor": "ASSERT_TRUE ( first_frame . value ( QStringLiteral ( \"raw_uint16_lj92_generic_total_ms\" ) ) . toDouble ( ) >= 0.0 ) ;",
+      "class": "not_run_proof_structural",
+      "clock": "qpc_stage_clock",
+      "justification": "Schema/non-negativity sanity check on the 'raw_uint16_lj92_generic_total_ms' telemetry field (part of a large block of near-identical ASSERT_TRUE(...).toDouble() >= 0.0) checks over the playback-profile JSON): >=0.0 can never distinguish 'ran' from 'did not run', both satisfy it. Inferred from the field's source module (video_mlv.c / llrawproc.c / lj92.c), all on mlv_stage_timing_now(); not independently re-verified per field this round.",
+      "lines": [
+        614,
+        2185
+      ]
+    },
+    {
+      "path": "tests/console/test_clip_golden.cpp",
+      "anchor": "ASSERT_TRUE ( first_frame . value ( QStringLiteral ( \"raw_uint16_lj92_generic_bitstream_ms\" ) ) . toDouble ( ) >= 0.0 ) ;",
+      "class": "not_run_proof_structural",
+      "clock": "qpc_stage_clock",
+      "justification": "Schema/non-negativity sanity check on the 'raw_uint16_lj92_generic_bitstream_ms' telemetry field (part of a large block of near-identical ASSERT_TRUE(...).toDouble() >= 0.0) checks over the playback-profile JSON): >=0.0 can never distinguish 'ran' from 'did not run', both satisfy it. Inferred from the field's source module (video_mlv.c / llrawproc.c / lj92.c), all on mlv_stage_timing_now(); not independently re-verified per field this round.",
+      "lines": [
+        615,
+        2186
+      ]
+    },
+    {
+      "path": "tests/console/test_clip_golden.cpp",
+      "anchor": "ASSERT_TRUE ( first_frame . value ( QStringLiteral ( \"raw_uint16_lj92_generic_predictor_ms\" ) ) . toDouble ( ) >= 0.0 ) ;",
+      "class": "not_run_proof_structural",
+      "clock": "qpc_stage_clock",
+      "justification": "Schema/non-negativity sanity check on the 'raw_uint16_lj92_generic_predictor_ms' telemetry field (part of a large block of near-identical ASSERT_TRUE(...).toDouble() >= 0.0) checks over the playback-profile JSON): >=0.0 can never distinguish 'ran' from 'did not run', both satisfy it. Inferred from the field's source module (video_mlv.c / llrawproc.c / lj92.c), all on mlv_stage_timing_now(); not independently re-verified per field this round.",
+      "lines": [
+        616,
+        2187
+      ]
+    },
+    {
+      "path": "tests/console/test_clip_golden.cpp",
+      "anchor": "ASSERT_TRUE ( first_frame . value ( QStringLiteral ( \"raw_uint16_lj92_generic_other_ms\" ) ) . toDouble ( ) >= 0.0 ) ;",
+      "class": "not_run_proof_structural",
+      "clock": "qpc_stage_clock",
+      "justification": "Schema/non-negativity sanity check on the 'raw_uint16_lj92_generic_other_ms' telemetry field (part of a large block of near-identical ASSERT_TRUE(...).toDouble() >= 0.0) checks over the playback-profile JSON): >=0.0 can never distinguish 'ran' from 'did not run', both satisfy it. Inferred from the field's source module (video_mlv.c / llrawproc.c / lj92.c), all on mlv_stage_timing_now(); not independently re-verified per field this round.",
+      "lines": [
+        617,
+        2188
+      ]
+    },
+    {
+      "path": "tests/console/test_clip_golden.cpp",
+      "anchor": "ASSERT_TRUE ( first_frame . value ( QStringLiteral ( \"raw_uint16_lj92_pred1_fast_path_total_ms\" ) ) . toDouble ( ) >= 0.0 ) ;",
+      "class": "not_run_proof_structural",
+      "clock": "qpc_stage_clock",
+      "justification": "Schema/non-negativity sanity check on the 'raw_uint16_lj92_pred1_fast_path_total_ms' telemetry field (part of a large block of near-identical ASSERT_TRUE(...).toDouble() >= 0.0) checks over the playback-profile JSON): >=0.0 can never distinguish 'ran' from 'did not run', both satisfy it. Inferred from the field's source module (video_mlv.c / llrawproc.c / lj92.c), all on mlv_stage_timing_now(); not independently re-verified per field this round.",
+      "lines": [
+        618
+      ]
+    },
+    {
+      "path": "tests/console/test_clip_golden.cpp",
+      "anchor": "ASSERT_TRUE ( first_frame . value ( QStringLiteral ( \"raw_uint16_lj92_pred1_fast_path_bitstream_ms\" ) ) . toDouble ( ) >= 0.0 ) ;",
+      "class": "not_run_proof_structural",
+      "clock": "qpc_stage_clock",
+      "justification": "Schema/non-negativity sanity check on the 'raw_uint16_lj92_pred1_fast_path_bitstream_ms' telemetry field (part of a large block of near-identical ASSERT_TRUE(...).toDouble() >= 0.0) checks over the playback-profile JSON): >=0.0 can never distinguish 'ran' from 'did not run', both satisfy it. Inferred from the field's source module (video_mlv.c / llrawproc.c / lj92.c), all on mlv_stage_timing_now(); not independently re-verified per field this round.",
+      "lines": [
+        619,
+        2586
+      ]
+    },
+    {
+      "path": "tests/console/test_clip_golden.cpp",
+      "anchor": "ASSERT_TRUE ( first_frame . value ( QStringLiteral ( \"raw_uint16_lj92_pred1_fast_path_predictor_ms\" ) ) . toDouble ( ) >= 0.0 ) ;",
+      "class": "not_run_proof_structural",
+      "clock": "qpc_stage_clock",
+      "justification": "Schema/non-negativity sanity check on the 'raw_uint16_lj92_pred1_fast_path_predictor_ms' telemetry field (part of a large block of near-identical ASSERT_TRUE(...).toDouble() >= 0.0) checks over the playback-profile JSON): >=0.0 can never distinguish 'ran' from 'did not run', both satisfy it. Inferred from the field's source module (video_mlv.c / llrawproc.c / lj92.c), all on mlv_stage_timing_now(); not independently re-verified per field this round.",
+      "lines": [
+        620,
+        2587
+      ]
+    },
+    {
+      "path": "tests/console/test_clip_golden.cpp",
+      "anchor": "ASSERT_TRUE ( first_frame . value ( QStringLiteral ( \"raw_uint16_lj92_pred1_fast_path_other_ms\" ) ) . toDouble ( ) >= 0.0 ) ;",
+      "class": "not_run_proof_structural",
+      "clock": "qpc_stage_clock",
+      "justification": "Schema/non-negativity sanity check on the 'raw_uint16_lj92_pred1_fast_path_other_ms' telemetry field (part of a large block of near-identical ASSERT_TRUE(...).toDouble() >= 0.0) checks over the playback-profile JSON): >=0.0 can never distinguish 'ran' from 'did not run', both satisfy it. Inferred from the field's source module (video_mlv.c / llrawproc.c / lj92.c), all on mlv_stage_timing_now(); not independently re-verified per field this round.",
+      "lines": [
+        621,
+        2588
+      ]
+    },
+    {
+      "path": "tests/console/test_clip_golden.cpp",
+      "anchor": "ASSERT_TRUE ( sample . value ( QStringLiteral ( \"latency_ms\" ) ) . toDouble ( ) > 0.0 ) ;",
+      "class": "run_proof",
+      "clock": "other",
+      "justification": "Per-frame GUI presentation latency asserted nonzero as proof each sampled frame was presented; same class as the two session-level latency sites above.",
+      "status": "open",
+      "successor": "PROD-TELEMETRY-DURATION-AS-PROOF-5",
+      "lines": [
+        627
+      ]
+    },
+    {
+      "path": "tests/console/test_clip_golden.cpp",
+      "anchor": "ASSERT_TRUE ( sample . value ( QStringLiteral ( \"dual_iso_preview_histogram_ms\" ) ) . toDouble ( ) >= 0.0 ) ;",
+      "class": "not_run_proof_structural",
+      "clock": "qpc_stage_clock",
+      "justification": "Schema/non-negativity sanity check on the 'dual_iso_preview_histogram_ms' telemetry field (part of a large block of near-identical ASSERT_TRUE(...).toDouble() >= 0.0) checks over the playback-profile JSON): >=0.0 can never distinguish 'ran' from 'did not run', both satisfy it. Inferred from the field's source module (video_mlv.c / llrawproc.c / lj92.c), all on mlv_stage_timing_now(); not independently re-verified per field this round.",
+      "lines": [
+        744
+      ]
+    },
+    {
+      "path": "tests/console/test_clip_golden.cpp",
+      "anchor": "ASSERT_TRUE ( sample . value ( QStringLiteral ( \"dual_iso_preview_regression_ms\" ) ) . toDouble ( ) >= 0.0 ) ;",
+      "class": "not_run_proof_structural",
+      "clock": "qpc_stage_clock",
+      "justification": "Schema/non-negativity sanity check on the 'dual_iso_preview_regression_ms' telemetry field (part of a large block of near-identical ASSERT_TRUE(...).toDouble() >= 0.0) checks over the playback-profile JSON): >=0.0 can never distinguish 'ran' from 'did not run', both satisfy it. Inferred from the field's source module (video_mlv.c / llrawproc.c / lj92.c), all on mlv_stage_timing_now(); not independently re-verified per field this round.",
+      "lines": [
+        745
+      ]
+    },
+    {
+      "path": "tests/console/test_clip_golden.cpp",
+      "anchor": "ASSERT_TRUE ( sample . value ( QStringLiteral ( \"dual_iso_preview_rowscale_ms\" ) ) . toDouble ( ) >= 0.0 ) ;",
+      "class": "not_run_proof_structural",
+      "clock": "qpc_stage_clock",
+      "justification": "Schema/non-negativity sanity check on the 'dual_iso_preview_rowscale_ms' telemetry field (part of a large block of near-identical ASSERT_TRUE(...).toDouble() >= 0.0) checks over the playback-profile JSON): >=0.0 can never distinguish 'ran' from 'did not run', both satisfy it. Inferred from the field's source module (video_mlv.c / llrawproc.c / lj92.c), all on mlv_stage_timing_now(); not independently re-verified per field this round.",
+      "lines": [
+        746
+      ]
+    },
+    {
+      "path": "tests/console/test_clip_golden.cpp",
+      "anchor": "ASSERT_TRUE ( sample . value ( QStringLiteral ( \"raw_uint16_ms\" ) ) . toDouble ( ) >= 0.0 ) ;",
+      "class": "not_run_proof_structural",
+      "clock": "qpc_stage_clock",
+      "justification": "Schema/non-negativity sanity check on the 'raw_uint16_ms' telemetry field (part of a large block of near-identical ASSERT_TRUE(...).toDouble() >= 0.0) checks over the playback-profile JSON): >=0.0 can never distinguish 'ran' from 'did not run', both satisfy it. Inferred from the field's source module (video_mlv.c / llrawproc.c / lj92.c), all on mlv_stage_timing_now(); not independently re-verified per field this round.",
+      "lines": [
+        747
+      ]
+    },
+    {
+      "path": "tests/console/test_clip_golden.cpp",
+      "anchor": "ASSERT_TRUE ( sample . value ( QStringLiteral ( \"raw_uint16_disk_read_ms\" ) ) . toDouble ( ) >= 0.0 ) ;",
+      "class": "not_run_proof_structural",
+      "clock": "qpc_stage_clock",
+      "justification": "Schema/non-negativity sanity check on the 'raw_uint16_disk_read_ms' telemetry field (part of a large block of near-identical ASSERT_TRUE(...).toDouble() >= 0.0) checks over the playback-profile JSON): >=0.0 can never distinguish 'ran' from 'did not run', both satisfy it. Inferred from the field's source module (video_mlv.c / llrawproc.c / lj92.c), all on mlv_stage_timing_now(); not independently re-verified per field this round.",
+      "lines": [
+        748
+      ]
+    },
+    {
+      "path": "tests/console/test_clip_golden.cpp",
+      "anchor": "ASSERT_TRUE ( sample . value ( QStringLiteral ( \"raw_uint16_decompress_ms\" ) ) . toDouble ( ) >= 0.0 ) ;",
+      "class": "not_run_proof_structural",
+      "clock": "qpc_stage_clock",
+      "justification": "Schema/non-negativity sanity check on the 'raw_uint16_decompress_ms' telemetry field (part of a large block of near-identical ASSERT_TRUE(...).toDouble() >= 0.0) checks over the playback-profile JSON): >=0.0 can never distinguish 'ran' from 'did not run', both satisfy it. Inferred from the field's source module (video_mlv.c / llrawproc.c / lj92.c), all on mlv_stage_timing_now(); not independently re-verified per field this round.",
+      "lines": [
+        749
+      ]
+    },
+    {
+      "path": "tests/console/test_clip_golden.cpp",
+      "anchor": "ASSERT_TRUE ( sample . value ( QStringLiteral ( \"raw_uint16_decompress_prepare_ms\" ) ) . toDouble ( ) >= 0.0 ) ;",
+      "class": "not_run_proof_structural",
+      "clock": "qpc_stage_clock",
+      "justification": "Schema/non-negativity sanity check on the 'raw_uint16_decompress_prepare_ms' telemetry field (part of a large block of near-identical ASSERT_TRUE(...).toDouble() >= 0.0) checks over the playback-profile JSON): >=0.0 can never distinguish 'ran' from 'did not run', both satisfy it. Inferred from the field's source module (video_mlv.c / llrawproc.c / lj92.c), all on mlv_stage_timing_now(); not independently re-verified per field this round.",
+      "lines": [
+        750
+      ]
+    },
+    {
+      "path": "tests/console/test_clip_golden.cpp",
+      "anchor": "ASSERT_TRUE ( sample . value ( QStringLiteral ( \"raw_uint16_decompress_execute_ms\" ) ) . toDouble ( ) >= 0.0 ) ;",
+      "class": "not_run_proof_structural",
+      "clock": "qpc_stage_clock",
+      "justification": "Schema/non-negativity sanity check on the 'raw_uint16_decompress_execute_ms' telemetry field (part of a large block of near-identical ASSERT_TRUE(...).toDouble() >= 0.0) checks over the playback-profile JSON): >=0.0 can never distinguish 'ran' from 'did not run', both satisfy it. Inferred from the field's source module (video_mlv.c / llrawproc.c / lj92.c), all on mlv_stage_timing_now(); not independently re-verified per field this round.",
+      "lines": [
+        751
+      ]
+    },
+    {
+      "path": "tests/console/test_clip_golden.cpp",
+      "anchor": "ASSERT_TRUE ( sample . value ( QStringLiteral ( \"raw_uint16_unpack_ms\" ) ) . toDouble ( ) >= 0.0 ) ;",
+      "class": "not_run_proof_structural",
+      "clock": "qpc_stage_clock",
+      "justification": "Schema/non-negativity sanity check on the 'raw_uint16_unpack_ms' telemetry field (part of a large block of near-identical ASSERT_TRUE(...).toDouble() >= 0.0) checks over the playback-profile JSON): >=0.0 can never distinguish 'ran' from 'did not run', both satisfy it. Inferred from the field's source module (video_mlv.c / llrawproc.c / lj92.c), all on mlv_stage_timing_now(); not independently re-verified per field this round.",
+      "lines": [
+        752
+      ]
+    },
+    {
+      "path": "tests/console/test_clip_golden.cpp",
+      "anchor": "ASSERT_TRUE ( sample . value ( QStringLiteral ( \"raw_uint16_copy_ms\" ) ) . toDouble ( ) >= 0.0 ) ;",
+      "class": "not_run_proof_structural",
+      "clock": "qpc_stage_clock",
+      "justification": "Schema/non-negativity sanity check on the 'raw_uint16_copy_ms' telemetry field (part of a large block of near-identical ASSERT_TRUE(...).toDouble() >= 0.0) checks over the playback-profile JSON): >=0.0 can never distinguish 'ran' from 'did not run', both satisfy it. Inferred from the field's source module (video_mlv.c / llrawproc.c / lj92.c), all on mlv_stage_timing_now(); not independently re-verified per field this round.",
+      "lines": [
+        753
+      ]
+    },
+    {
+      "path": "tests/console/test_clip_golden.cpp",
+      "anchor": "ASSERT_TRUE ( sample . value ( QStringLiteral ( \"raw_uint16_other_ms\" ) ) . toDouble ( ) >= 0.0 ) ;",
+      "class": "not_run_proof_structural",
+      "clock": "qpc_stage_clock",
+      "justification": "Schema/non-negativity sanity check on the 'raw_uint16_other_ms' telemetry field (part of a large block of near-identical ASSERT_TRUE(...).toDouble() >= 0.0) checks over the playback-profile JSON): >=0.0 can never distinguish 'ran' from 'did not run', both satisfy it. Inferred from the field's source module (video_mlv.c / llrawproc.c / lj92.c), all on mlv_stage_timing_now(); not independently re-verified per field this round.",
+      "lines": [
+        755
+      ]
+    },
+    {
+      "path": "tests/console/test_clip_golden.cpp",
+      "anchor": "ASSERT_TRUE ( sample . value ( QStringLiteral ( \"llrawproc_ms\" ) ) . toDouble ( ) >= 0.0 ) ;",
+      "class": "not_run_proof_structural",
+      "clock": "qpc_stage_clock",
+      "justification": "Schema/non-negativity sanity check on the 'llrawproc_ms' telemetry field (part of a large block of near-identical ASSERT_TRUE(...).toDouble() >= 0.0) checks over the playback-profile JSON): >=0.0 can never distinguish 'ran' from 'did not run', both satisfy it. Inferred from the field's source module (video_mlv.c / llrawproc.c / lj92.c), all on mlv_stage_timing_now(); not independently re-verified per field this round.",
+      "lines": [
+        756
+      ]
+    },
+    {
+      "path": "tests/console/test_clip_golden.cpp",
+      "anchor": "ASSERT_TRUE ( sample . value ( QStringLiteral ( \"llrawproc_pre_dualiso_fix_ms\" ) ) . toDouble ( ) >= 0.0 ) ;",
+      "class": "not_run_proof_structural",
+      "clock": "qpc_stage_clock",
+      "justification": "Schema/non-negativity sanity check on the 'llrawproc_pre_dualiso_fix_ms' telemetry field (part of a large block of near-identical ASSERT_TRUE(...).toDouble() >= 0.0) checks over the playback-profile JSON): >=0.0 can never distinguish 'ran' from 'did not run', both satisfy it. Inferred from the field's source module (video_mlv.c / llrawproc.c / lj92.c), all on mlv_stage_timing_now(); not independently re-verified per field this round.",
+      "lines": [
+        757
+      ]
+    },
+    {
+      "path": "tests/console/test_clip_golden.cpp",
+      "anchor": "ASSERT_TRUE ( sample . value ( QStringLiteral ( \"llrawproc_total_ms\" ) ) . toDouble ( ) >= 0.0 ) ;",
+      "class": "not_run_proof_structural",
+      "clock": "qpc_stage_clock",
+      "justification": "Schema/non-negativity sanity check on the 'llrawproc_total_ms' telemetry field (part of a large block of near-identical ASSERT_TRUE(...).toDouble() >= 0.0) checks over the playback-profile JSON): >=0.0 can never distinguish 'ran' from 'did not run', both satisfy it. Inferred from the field's source module (video_mlv.c / llrawproc.c / lj92.c), all on mlv_stage_timing_now(); not independently re-verified per field this round.",
+      "lines": [
+        758
+      ]
+    },
+    {
+      "path": "tests/console/test_clip_golden.cpp",
+      "anchor": "ASSERT_TRUE ( sample . value ( QStringLiteral ( \"llrawproc_dark_frame_ms\" ) ) . toDouble ( ) >= 0.0 ) ;",
+      "class": "not_run_proof_structural",
+      "clock": "qpc_stage_clock",
+      "justification": "Schema/non-negativity sanity check on the 'llrawproc_dark_frame_ms' telemetry field (part of a large block of near-identical ASSERT_TRUE(...).toDouble() >= 0.0) checks over the playback-profile JSON): >=0.0 can never distinguish 'ran' from 'did not run', both satisfy it. Inferred from the field's source module (video_mlv.c / llrawproc.c / lj92.c), all on mlv_stage_timing_now(); not independently re-verified per field this round.",
+      "lines": [
+        759
+      ]
+    },
+    {
+      "path": "tests/console/test_clip_golden.cpp",
+      "anchor": "ASSERT_TRUE ( sample . value ( QStringLiteral ( \"llrawproc_vertical_stripes_ms\" ) ) . toDouble ( ) >= 0.0 ) ;",
+      "class": "not_run_proof_structural",
+      "clock": "qpc_stage_clock",
+      "justification": "Schema/non-negativity sanity check on the 'llrawproc_vertical_stripes_ms' telemetry field (part of a large block of near-identical ASSERT_TRUE(...).toDouble() >= 0.0) checks over the playback-profile JSON): >=0.0 can never distinguish 'ran' from 'did not run', both satisfy it. Inferred from the field's source module (video_mlv.c / llrawproc.c / lj92.c), all on mlv_stage_timing_now(); not independently re-verified per field this round.",
+      "lines": [
+        760
+      ]
+    },
+    {
+      "path": "tests/console/test_clip_golden.cpp",
+      "anchor": "ASSERT_TRUE ( sample . value ( QStringLiteral ( \"llrawproc_focus_pixels_ms\" ) ) . toDouble ( ) >= 0.0 ) ;",
+      "class": "not_run_proof_structural",
+      "clock": "qpc_stage_clock",
+      "justification": "Schema/non-negativity sanity check on the 'llrawproc_focus_pixels_ms' telemetry field (part of a large block of near-identical ASSERT_TRUE(...).toDouble() >= 0.0) checks over the playback-profile JSON): >=0.0 can never distinguish 'ran' from 'did not run', both satisfy it. Inferred from the field's source module (video_mlv.c / llrawproc.c / lj92.c), all on mlv_stage_timing_now(); not independently re-verified per field this round.",
+      "lines": [
+        761
+      ]
+    },
+    {
+      "path": "tests/console/test_clip_golden.cpp",
+      "anchor": "ASSERT_TRUE ( sample . value ( QStringLiteral ( \"llrawproc_bad_pixels_ms\" ) ) . toDouble ( ) >= 0.0 ) ;",
+      "class": "not_run_proof_structural",
+      "clock": "qpc_stage_clock",
+      "justification": "Schema/non-negativity sanity check on the 'llrawproc_bad_pixels_ms' telemetry field (part of a large block of near-identical ASSERT_TRUE(...).toDouble() >= 0.0) checks over the playback-profile JSON): >=0.0 can never distinguish 'ran' from 'did not run', both satisfy it. Inferred from the field's source module (video_mlv.c / llrawproc.c / lj92.c), all on mlv_stage_timing_now(); not independently re-verified per field this round.",
+      "lines": [
+        762
+      ]
+    },
+    {
+      "path": "tests/console/test_clip_golden.cpp",
+      "anchor": "ASSERT_TRUE ( sample . value ( QStringLiteral ( \"llrawproc_pattern_noise_ms\" ) ) . toDouble ( ) >= 0.0 ) ;",
+      "class": "not_run_proof_structural",
+      "clock": "qpc_stage_clock",
+      "justification": "Schema/non-negativity sanity check on the 'llrawproc_pattern_noise_ms' telemetry field (part of a large block of near-identical ASSERT_TRUE(...).toDouble() >= 0.0) checks over the playback-profile JSON): >=0.0 can never distinguish 'ran' from 'did not run', both satisfy it. Inferred from the field's source module (video_mlv.c / llrawproc.c / lj92.c), all on mlv_stage_timing_now(); not independently re-verified per field this round.",
+      "lines": [
+        763
+      ]
+    },
+    {
+      "path": "tests/console/test_clip_golden.cpp",
+      "anchor": "ASSERT_TRUE ( sample . value ( QStringLiteral ( \"llrawproc_dual_iso_ms\" ) ) . toDouble ( ) >= 0.0 ) ;",
+      "class": "not_run_proof_structural",
+      "clock": "qpc_stage_clock",
+      "justification": "Schema/non-negativity sanity check on the 'llrawproc_dual_iso_ms' telemetry field (part of a large block of near-identical ASSERT_TRUE(...).toDouble() >= 0.0) checks over the playback-profile JSON): >=0.0 can never distinguish 'ran' from 'did not run', both satisfy it. Inferred from the field's source module (video_mlv.c / llrawproc.c / lj92.c), all on mlv_stage_timing_now(); not independently re-verified per field this round.",
+      "lines": [
+        764
+      ]
+    },
+    {
+      "path": "tests/console/test_clip_golden.cpp",
+      "anchor": "ASSERT_TRUE ( sample . value ( QStringLiteral ( \"llrawproc_chroma_smooth_ms\" ) ) . toDouble ( ) >= 0.0 ) ;",
+      "class": "not_run_proof_structural",
+      "clock": "qpc_stage_clock",
+      "justification": "Schema/non-negativity sanity check on the 'llrawproc_chroma_smooth_ms' telemetry field (part of a large block of near-identical ASSERT_TRUE(...).toDouble() >= 0.0) checks over the playback-profile JSON): >=0.0 can never distinguish 'ran' from 'did not run', both satisfy it. Inferred from the field's source module (video_mlv.c / llrawproc.c / lj92.c), all on mlv_stage_timing_now(); not independently re-verified per field this round.",
+      "lines": [
+        765
+      ]
+    },
+    {
+      "path": "tests/console/test_clip_golden.cpp",
+      "anchor": "ASSERT_TRUE ( sample . value ( QStringLiteral ( \"llrawproc_other_ms\" ) ) . toDouble ( ) >= 0.0 ) ;",
+      "class": "not_run_proof_structural",
+      "clock": "qpc_stage_clock",
+      "justification": "Schema/non-negativity sanity check on the 'llrawproc_other_ms' telemetry field (part of a large block of near-identical ASSERT_TRUE(...).toDouble() >= 0.0) checks over the playback-profile JSON): >=0.0 can never distinguish 'ran' from 'did not run', both satisfy it. Inferred from the field's source module (video_mlv.c / llrawproc.c / lj92.c), all on mlv_stage_timing_now(); not independently re-verified per field this round.",
+      "lines": [
+        766
+      ]
+    },
+    {
+      "path": "tests/console/test_clip_golden.cpp",
+      "anchor": "ASSERT_TRUE ( sample . value ( QStringLiteral ( \"dual_iso_full20_interp_mean23_ms\" ) ) . toDouble ( ) >= 0.0 ) ;",
+      "class": "not_run_proof_structural",
+      "clock": "qpc_stage_clock",
+      "justification": "Schema/non-negativity sanity check on the 'dual_iso_full20_interp_mean23_ms' telemetry field (part of a large block of near-identical ASSERT_TRUE(...).toDouble() >= 0.0) checks over the playback-profile JSON): >=0.0 can never distinguish 'ran' from 'did not run', both satisfy it. Inferred from the field's source module (video_mlv.c / llrawproc.c / lj92.c), all on mlv_stage_timing_now(); not independently re-verified per field this round.",
+      "lines": [
+        772
+      ]
+    },
+    {
+      "path": "tests/console/test_clip_golden.cpp",
+      "anchor": "ASSERT_TRUE ( sample . value ( QStringLiteral ( \"dual_iso_full20_interp_amaze_ms\" ) ) . toDouble ( ) >= 0.0 ) ;",
+      "class": "not_run_proof_structural",
+      "clock": "qpc_stage_clock",
+      "justification": "Schema/non-negativity sanity check on the 'dual_iso_full20_interp_amaze_ms' telemetry field (part of a large block of near-identical ASSERT_TRUE(...).toDouble() >= 0.0) checks over the playback-profile JSON): >=0.0 can never distinguish 'ran' from 'did not run', both satisfy it. Inferred from the field's source module (video_mlv.c / llrawproc.c / lj92.c), all on mlv_stage_timing_now(); not independently re-verified per field this round.",
+      "lines": [
+        773
+      ]
+    },
+    {
+      "path": "tests/console/test_clip_golden.cpp",
+      "anchor": "ASSERT_TRUE ( sample . value ( QStringLiteral ( \"dual_iso_full20_interp_amaze_scratch_ms\" ) ) . toDouble ( ) >= 0.0 ) ;",
+      "class": "not_run_proof_structural",
+      "clock": "qpc_stage_clock",
+      "justification": "Schema/non-negativity sanity check on the 'dual_iso_full20_interp_amaze_scratch_ms' telemetry field (part of a large block of near-identical ASSERT_TRUE(...).toDouble() >= 0.0) checks over the playback-profile JSON): >=0.0 can never distinguish 'ran' from 'did not run', both satisfy it. Inferred from the field's source module (video_mlv.c / llrawproc.c / lj92.c), all on mlv_stage_timing_now(); not independently re-verified per field this round.",
+      "lines": [
+        774
+      ]
+    },
+    {
+      "path": "tests/console/test_clip_golden.cpp",
+      "anchor": "ASSERT_TRUE ( sample . value ( QStringLiteral ( \"dual_iso_full20_interp_amaze_clear_ms\" ) ) . toDouble ( ) >= 0.0 ) ;",
+      "class": "not_run_proof_structural",
+      "clock": "qpc_stage_clock",
+      "justification": "Schema/non-negativity sanity check on the 'dual_iso_full20_interp_amaze_clear_ms' telemetry field (part of a large block of near-identical ASSERT_TRUE(...).toDouble() >= 0.0) checks over the playback-profile JSON): >=0.0 can never distinguish 'ran' from 'did not run', both satisfy it. Inferred from the field's source module (video_mlv.c / llrawproc.c / lj92.c), all on mlv_stage_timing_now(); not independently re-verified per field this round.",
+      "lines": [
+        775
+      ]
+    },
+    {
+      "path": "tests/console/test_clip_golden.cpp",
+      "anchor": "ASSERT_TRUE ( sample . value ( QStringLiteral ( \"dual_iso_full20_interp_amaze_squeeze_ms\" ) ) . toDouble ( ) >= 0.0 ) ;",
+      "class": "not_run_proof_structural",
+      "clock": "qpc_stage_clock",
+      "justification": "Schema/non-negativity sanity check on the 'dual_iso_full20_interp_amaze_squeeze_ms' telemetry field (part of a large block of near-identical ASSERT_TRUE(...).toDouble() >= 0.0) checks over the playback-profile JSON): >=0.0 can never distinguish 'ran' from 'did not run', both satisfy it. Inferred from the field's source module (video_mlv.c / llrawproc.c / lj92.c), all on mlv_stage_timing_now(); not independently re-verified per field this round.",
+      "lines": [
+        776
+      ]
+    },
+    {
+      "path": "tests/console/test_clip_golden.cpp",
+      "anchor": "ASSERT_TRUE ( sample . value ( QStringLiteral ( \"dual_iso_full20_interp_amaze_rawdata_ms\" ) ) . toDouble ( ) >= 0.0 ) ;",
+      "class": "not_run_proof_structural",
+      "clock": "qpc_stage_clock",
+      "justification": "Schema/non-negativity sanity check on the 'dual_iso_full20_interp_amaze_rawdata_ms' telemetry field (part of a large block of near-identical ASSERT_TRUE(...).toDouble() >= 0.0) checks over the playback-profile JSON): >=0.0 can never distinguish 'ran' from 'did not run', both satisfy it. Inferred from the field's source module (video_mlv.c / llrawproc.c / lj92.c), all on mlv_stage_timing_now(); not independently re-verified per field this round.",
+      "lines": [
+        777
+      ]
+    },
+    {
+      "path": "tests/console/test_clip_golden.cpp",
+      "anchor": "ASSERT_TRUE ( sample . value ( QStringLiteral ( \"dual_iso_full20_interp_amaze_demosaic_ms\" ) ) . toDouble ( ) >= 0.0 ) ;",
+      "class": "not_run_proof_structural",
+      "clock": "qpc_stage_clock",
+      "justification": "Schema/non-negativity sanity check on the 'dual_iso_full20_interp_amaze_demosaic_ms' telemetry field (part of a large block of near-identical ASSERT_TRUE(...).toDouble() >= 0.0) checks over the playback-profile JSON): >=0.0 can never distinguish 'ran' from 'did not run', both satisfy it. Inferred from the field's source module (video_mlv.c / llrawproc.c / lj92.c), all on mlv_stage_timing_now(); not independently re-verified per field this round.",
+      "lines": [
+        778
+      ]
+    },
+    {
+      "path": "tests/console/test_clip_golden.cpp",
+      "anchor": "ASSERT_TRUE ( sample . value ( QStringLiteral ( \"dual_iso_full20_interp_amaze_demosaic_setup_ms\" ) ) . toDouble ( ) >= 0.0 ) ;",
+      "class": "not_run_proof_structural",
+      "clock": "qpc_stage_clock",
+      "justification": "Schema/non-negativity sanity check on the 'dual_iso_full20_interp_amaze_demosaic_setup_ms' telemetry field (part of a large block of near-identical ASSERT_TRUE(...).toDouble() >= 0.0) checks over the playback-profile JSON): >=0.0 can never distinguish 'ran' from 'did not run', both satisfy it. Inferred from the field's source module (video_mlv.c / llrawproc.c / lj92.c), all on mlv_stage_timing_now(); not independently re-verified per field this round.",
+      "lines": [
+        779
+      ]
+    },
+    {
+      "path": "tests/console/test_clip_golden.cpp",
+      "anchor": "ASSERT_TRUE ( sample . value ( QStringLiteral ( \"dual_iso_full20_interp_amaze_demosaic_create_ms\" ) ) . toDouble ( ) >= 0.0 ) ;",
+      "class": "not_run_proof_structural",
+      "clock": "qpc_stage_clock",
+      "justification": "Schema/non-negativity sanity check on the 'dual_iso_full20_interp_amaze_demosaic_create_ms' telemetry field (part of a large block of near-identical ASSERT_TRUE(...).toDouble() >= 0.0) checks over the playback-profile JSON): >=0.0 can never distinguish 'ran' from 'did not run', both satisfy it. Inferred from the field's source module (video_mlv.c / llrawproc.c / lj92.c), all on mlv_stage_timing_now(); not independently re-verified per field this round.",
+      "lines": [
+        780
+      ]
+    },
+    {
+      "path": "tests/console/test_clip_golden.cpp",
+      "anchor": "ASSERT_TRUE ( sample . value ( QStringLiteral ( \"dual_iso_full20_interp_amaze_demosaic_join_ms\" ) ) . toDouble ( ) >= 0.0 ) ;",
+      "class": "not_run_proof_structural",
+      "clock": "qpc_stage_clock",
+      "justification": "Schema/non-negativity sanity check on the 'dual_iso_full20_interp_amaze_demosaic_join_ms' telemetry field (part of a large block of near-identical ASSERT_TRUE(...).toDouble() >= 0.0) checks over the playback-profile JSON): >=0.0 can never distinguish 'ran' from 'did not run', both satisfy it. Inferred from the field's source module (video_mlv.c / llrawproc.c / lj92.c), all on mlv_stage_timing_now(); not independently re-verified per field this round.",
+      "lines": [
+        781
+      ]
+    },
+    {
+      "path": "tests/console/test_clip_golden.cpp",
+      "anchor": "ASSERT_TRUE ( sample . value ( QStringLiteral ( \"dual_iso_full20_interp_amaze_demosaic_worker_total_ms\" ) ) . toDouble ( ) >= 0.0 ) ;",
+      "class": "not_run_proof_structural",
+      "clock": "qpc_stage_clock",
+      "justification": "Schema/non-negativity sanity check on the 'dual_iso_full20_interp_amaze_demosaic_worker_total_ms' telemetry field (part of a large block of near-identical ASSERT_TRUE(...).toDouble() >= 0.0) checks over the playback-profile JSON): >=0.0 can never distinguish 'ran' from 'did not run', both satisfy it. Inferred from the field's source module (video_mlv.c / llrawproc.c / lj92.c), all on mlv_stage_timing_now(); not independently re-verified per field this round.",
+      "lines": [
+        782
+      ]
+    },
+    {
+      "path": "tests/console/test_clip_golden.cpp",
+      "anchor": "ASSERT_TRUE ( sample . value ( QStringLiteral ( \"dual_iso_full20_interp_amaze_demosaic_worker_max_ms\" ) ) . toDouble ( ) >= 0.0 ) ;",
+      "class": "not_run_proof_structural",
+      "clock": "qpc_stage_clock",
+      "justification": "Schema/non-negativity sanity check on the 'dual_iso_full20_interp_amaze_demosaic_worker_max_ms' telemetry field (part of a large block of near-identical ASSERT_TRUE(...).toDouble() >= 0.0) checks over the playback-profile JSON): >=0.0 can never distinguish 'ran' from 'did not run', both satisfy it. Inferred from the field's source module (video_mlv.c / llrawproc.c / lj92.c), all on mlv_stage_timing_now(); not independently re-verified per field this round.",
+      "lines": [
+        783
+      ]
+    },
+    {
+      "path": "tests/console/test_clip_golden.cpp",
+      "anchor": "ASSERT_TRUE ( sample . value ( QStringLiteral ( \"dual_iso_full20_interp_amaze_postprocess_ms\" ) ) . toDouble ( ) >= 0.0 ) ;",
+      "class": "not_run_proof_structural",
+      "clock": "qpc_stage_clock",
+      "justification": "Schema/non-negativity sanity check on the 'dual_iso_full20_interp_amaze_postprocess_ms' telemetry field (part of a large block of near-identical ASSERT_TRUE(...).toDouble() >= 0.0) checks over the playback-profile JSON): >=0.0 can never distinguish 'ran' from 'did not run', both satisfy it. Inferred from the field's source module (video_mlv.c / llrawproc.c / lj92.c), all on mlv_stage_timing_now(); not independently re-verified per field this round.",
+      "lines": [
+        785
+      ]
+    },
+    {
+      "path": "tests/console/test_clip_golden.cpp",
+      "anchor": "ASSERT_TRUE ( sample . value ( QStringLiteral ( \"dual_iso_full20_interp_amaze_grayscale_ms\" ) ) . toDouble ( ) >= 0.0 ) ;",
+      "class": "not_run_proof_structural",
+      "clock": "qpc_stage_clock",
+      "justification": "Schema/non-negativity sanity check on the 'dual_iso_full20_interp_amaze_grayscale_ms' telemetry field (part of a large block of near-identical ASSERT_TRUE(...).toDouble() >= 0.0) checks over the playback-profile JSON): >=0.0 can never distinguish 'ran' from 'did not run', both satisfy it. Inferred from the field's source module (video_mlv.c / llrawproc.c / lj92.c), all on mlv_stage_timing_now(); not independently re-verified per field this round.",
+      "lines": [
+        786
+      ]
+    },
+    {
+      "path": "tests/console/test_clip_golden.cpp",
+      "anchor": "ASSERT_TRUE ( sample . value ( QStringLiteral ( \"dual_iso_full20_interp_amaze_edge_init_ms\" ) ) . toDouble ( ) >= 0.0 ) ;",
+      "class": "not_run_proof_structural",
+      "clock": "qpc_stage_clock",
+      "justification": "Schema/non-negativity sanity check on the 'dual_iso_full20_interp_amaze_edge_init_ms' telemetry field (part of a large block of near-identical ASSERT_TRUE(...).toDouble() >= 0.0) checks over the playback-profile JSON): >=0.0 can never distinguish 'ran' from 'did not run', both satisfy it. Inferred from the field's source module (video_mlv.c / llrawproc.c / lj92.c), all on mlv_stage_timing_now(); not independently re-verified per field this round.",
+      "lines": [
+        787
+      ]
+    },
+    {
+      "path": "tests/console/test_clip_golden.cpp",
+      "anchor": "ASSERT_TRUE ( sample . value ( QStringLiteral ( \"dual_iso_full20_interp_amaze_lut_ms\" ) ) . toDouble ( ) >= 0.0 ) ;",
+      "class": "not_run_proof_structural",
+      "clock": "qpc_stage_clock",
+      "justification": "Schema/non-negativity sanity check on the 'dual_iso_full20_interp_amaze_lut_ms' telemetry field (part of a large block of near-identical ASSERT_TRUE(...).toDouble() >= 0.0) checks over the playback-profile JSON): >=0.0 can never distinguish 'ran' from 'did not run', both satisfy it. Inferred from the field's source module (video_mlv.c / llrawproc.c / lj92.c), all on mlv_stage_timing_now(); not independently re-verified per field this round.",
+      "lines": [
+        788
+      ]
+    },
+    {
+      "path": "tests/console/test_clip_golden.cpp",
+      "anchor": "ASSERT_TRUE ( sample . value ( QStringLiteral ( \"dual_iso_full20_interp_amaze_edge_direction_ms\" ) ) . toDouble ( ) >= 0.0 ) ;",
+      "class": "not_run_proof_structural",
+      "clock": "qpc_stage_clock",
+      "justification": "Schema/non-negativity sanity check on the 'dual_iso_full20_interp_amaze_edge_direction_ms' telemetry field (part of a large block of near-identical ASSERT_TRUE(...).toDouble() >= 0.0) checks over the playback-profile JSON): >=0.0 can never distinguish 'ran' from 'did not run', both satisfy it. Inferred from the field's source module (video_mlv.c / llrawproc.c / lj92.c), all on mlv_stage_timing_now(); not independently re-verified per field this round.",
+      "lines": [
+        789
+      ]
+    },
+    {
+      "path": "tests/console/test_clip_golden.cpp",
+      "anchor": "ASSERT_TRUE ( sample . value ( QStringLiteral ( \"dual_iso_full20_interp_amaze_actual_interp_ms\" ) ) . toDouble ( ) >= 0.0 ) ;",
+      "class": "not_run_proof_structural",
+      "clock": "qpc_stage_clock",
+      "justification": "Schema/non-negativity sanity check on the 'dual_iso_full20_interp_amaze_actual_interp_ms' telemetry field (part of a large block of near-identical ASSERT_TRUE(...).toDouble() >= 0.0) checks over the playback-profile JSON): >=0.0 can never distinguish 'ran' from 'did not run', both satisfy it. Inferred from the field's source module (video_mlv.c / llrawproc.c / lj92.c), all on mlv_stage_timing_now(); not independently re-verified per field this round.",
+      "lines": [
+        797
+      ]
+    },
+    {
+      "path": "tests/console/test_clip_golden.cpp",
+      "anchor": "ASSERT_TRUE ( sample . value ( QStringLiteral ( \"dual_iso_full20_interp_border_ms\" ) ) . toDouble ( ) >= 0.0 ) ;",
+      "class": "not_run_proof_structural",
+      "clock": "qpc_stage_clock",
+      "justification": "Schema/non-negativity sanity check on the 'dual_iso_full20_interp_border_ms' telemetry field (part of a large block of near-identical ASSERT_TRUE(...).toDouble() >= 0.0) checks over the playback-profile JSON): >=0.0 can never distinguish 'ran' from 'did not run', both satisfy it. Inferred from the field's source module (video_mlv.c / llrawproc.c / lj92.c), all on mlv_stage_timing_now(); not independently re-verified per field this round.",
+      "lines": [
+        798
+      ]
+    },
+    {
+      "path": "tests/console/test_clip_golden.cpp",
+      "anchor": "ASSERT_TRUE ( sample . value ( QStringLiteral ( \"dual_iso_full20_mix_alias_map_setup_ms\" ) ) . toDouble ( ) >= 0.0 ) ;",
+      "class": "not_run_proof_structural",
+      "clock": "qpc_stage_clock",
+      "justification": "Schema/non-negativity sanity check on the 'dual_iso_full20_mix_alias_map_setup_ms' telemetry field (part of a large block of near-identical ASSERT_TRUE(...).toDouble() >= 0.0) checks over the playback-profile JSON): >=0.0 can never distinguish 'ran' from 'did not run', both satisfy it. Inferred from the field's source module (video_mlv.c / llrawproc.c / lj92.c), all on mlv_stage_timing_now(); not independently re-verified per field this round.",
+      "lines": [
+        799
+      ]
+    },
+    {
+      "path": "tests/console/test_clip_golden.cpp",
+      "anchor": "ASSERT_TRUE ( sample . value ( QStringLiteral ( \"dual_iso_full20_mix_alias_map_init_ms\" ) ) . toDouble ( ) >= 0.0 ) ;",
+      "class": "not_run_proof_structural",
+      "clock": "qpc_stage_clock",
+      "justification": "Schema/non-negativity sanity check on the 'dual_iso_full20_mix_alias_map_init_ms' telemetry field (part of a large block of near-identical ASSERT_TRUE(...).toDouble() >= 0.0) checks over the playback-profile JSON): >=0.0 can never distinguish 'ran' from 'did not run', both satisfy it. Inferred from the field's source module (video_mlv.c / llrawproc.c / lj92.c), all on mlv_stage_timing_now(); not independently re-verified per field this round.",
+      "lines": [
+        800
+      ]
+    },
+    {
+      "path": "tests/console/test_clip_golden.cpp",
+      "anchor": "ASSERT_TRUE ( sample . value ( QStringLiteral ( \"dual_iso_full20_mix_alias_map_copy_ms\" ) ) . toDouble ( ) >= 0.0 ) ;",
+      "class": "not_run_proof_structural",
+      "clock": "qpc_stage_clock",
+      "justification": "Schema/non-negativity sanity check on the 'dual_iso_full20_mix_alias_map_copy_ms' telemetry field (part of a large block of near-identical ASSERT_TRUE(...).toDouble() >= 0.0) checks over the playback-profile JSON): >=0.0 can never distinguish 'ran' from 'did not run', both satisfy it. Inferred from the field's source module (video_mlv.c / llrawproc.c / lj92.c), all on mlv_stage_timing_now(); not independently re-verified per field this round.",
+      "lines": [
+        801
+      ]
+    },
+    {
+      "path": "tests/console/test_clip_golden.cpp",
+      "anchor": "ASSERT_TRUE ( sample . value ( QStringLiteral ( \"dual_iso_full20_mix_alias_map_filter_ms\" ) ) . toDouble ( ) >= 0.0 ) ;",
+      "class": "not_run_proof_structural",
+      "clock": "qpc_stage_clock",
+      "justification": "Schema/non-negativity sanity check on the 'dual_iso_full20_mix_alias_map_filter_ms' telemetry field (part of a large block of near-identical ASSERT_TRUE(...).toDouble() >= 0.0) checks over the playback-profile JSON): >=0.0 can never distinguish 'ran' from 'did not run', both satisfy it. Inferred from the field's source module (video_mlv.c / llrawproc.c / lj92.c), all on mlv_stage_timing_now(); not independently re-verified per field this round.",
+      "lines": [
+        802
+      ]
+    },
+    {
+      "path": "tests/console/test_clip_golden.cpp",
+      "anchor": "ASSERT_TRUE ( sample . value ( QStringLiteral ( \"dual_iso_full20_mix_alias_map_gaussian_ms\" ) ) . toDouble ( ) >= 0.0 ) ;",
+      "class": "not_run_proof_structural",
+      "clock": "qpc_stage_clock",
+      "justification": "Schema/non-negativity sanity check on the 'dual_iso_full20_mix_alias_map_gaussian_ms' telemetry field (part of a large block of near-identical ASSERT_TRUE(...).toDouble() >= 0.0) checks over the playback-profile JSON): >=0.0 can never distinguish 'ran' from 'did not run', both satisfy it. Inferred from the field's source module (video_mlv.c / llrawproc.c / lj92.c), all on mlv_stage_timing_now(); not independently re-verified per field this round.",
+      "lines": [
+        803
+      ]
+    },
+    {
+      "path": "tests/console/test_clip_golden.cpp",
+      "anchor": "ASSERT_TRUE ( sample . value ( QStringLiteral ( \"dual_iso_full20_mix_alias_map_grayscale_ms\" ) ) . toDouble ( ) >= 0.0 ) ;",
+      "class": "not_run_proof_structural",
+      "clock": "qpc_stage_clock",
+      "justification": "Schema/non-negativity sanity check on the 'dual_iso_full20_mix_alias_map_grayscale_ms' telemetry field (part of a large block of near-identical ASSERT_TRUE(...).toDouble() >= 0.0) checks over the playback-profile JSON): >=0.0 can never distinguish 'ran' from 'did not run', both satisfy it. Inferred from the field's source module (video_mlv.c / llrawproc.c / lj92.c), all on mlv_stage_timing_now(); not independently re-verified per field this round.",
+      "lines": [
+        804
+      ]
+    },
+    {
+      "path": "tests/console/test_clip_golden.cpp",
+      "anchor": "ASSERT_TRUE ( sample . value ( QStringLiteral ( \"dual_iso_preview_total_ms\" ) ) . toDouble ( ) >= 0.0 ) ;",
+      "class": "not_run_proof_structural",
+      "clock": "qpc_stage_clock",
+      "justification": "Schema/non-negativity sanity check on the 'dual_iso_preview_total_ms' telemetry field (part of a large block of near-identical ASSERT_TRUE(...).toDouble() >= 0.0) checks over the playback-profile JSON): >=0.0 can never distinguish 'ran' from 'did not run', both satisfy it. Inferred from the field's source module (video_mlv.c / llrawproc.c / lj92.c), all on mlv_stage_timing_now(); not independently re-verified per field this round.",
+      "lines": [
+        805
+      ]
+    },
+    {
+      "path": "tests/console/test_clip_golden.cpp",
+      "anchor": "ASSERT_TRUE ( sample . value ( QStringLiteral ( \"debayered_frame_ms\" ) ) . toDouble ( ) >= 0.0 ) ;",
+      "class": "not_run_proof_structural",
+      "clock": "qpc_stage_clock",
+      "justification": "Schema/non-negativity sanity check on the 'debayered_frame_ms' telemetry field (part of a large block of near-identical ASSERT_TRUE(...).toDouble() >= 0.0) checks over the playback-profile JSON): >=0.0 can never distinguish 'ran' from 'did not run', both satisfy it. Inferred from the field's source module (video_mlv.c / llrawproc.c / lj92.c), all on mlv_stage_timing_now(); not independently re-verified per field this round.",
+      "lines": [
+        806
+      ]
+    },
+    {
+      "path": "tests/console/test_clip_golden.cpp",
+      "anchor": "ASSERT_TRUE ( sample . value ( QStringLiteral ( \"raw_float_convert_ms\" ) ) . toDouble ( ) >= 0.0 ) ;",
+      "class": "not_run_proof_structural",
+      "clock": "qpc_stage_clock",
+      "justification": "Schema/non-negativity sanity check on the 'raw_float_convert_ms' telemetry field (part of a large block of near-identical ASSERT_TRUE(...).toDouble() >= 0.0) checks over the playback-profile JSON): >=0.0 can never distinguish 'ran' from 'did not run', both satisfy it. Inferred from the field's source module (video_mlv.c / llrawproc.c / lj92.c), all on mlv_stage_timing_now(); not independently re-verified per field this round.",
+      "lines": [
+        807
+      ]
+    },
+    {
+      "path": "tests/console/test_clip_golden.cpp",
+      "anchor": "ASSERT_TRUE ( sample . value ( QStringLiteral ( \"debayer_exclusive_ms\" ) ) . toDouble ( ) >= 0.0 ) ;",
+      "class": "not_run_proof_structural",
+      "clock": "qpc_stage_clock",
+      "justification": "Schema/non-negativity sanity check on the 'debayer_exclusive_ms' telemetry field (part of a large block of near-identical ASSERT_TRUE(...).toDouble() >= 0.0) checks over the playback-profile JSON): >=0.0 can never distinguish 'ran' from 'did not run', both satisfy it. Inferred from the field's source module (video_mlv.c / llrawproc.c / lj92.c), all on mlv_stage_timing_now(); not independently re-verified per field this round.",
+      "lines": [
+        808
+      ]
+    },
+    {
+      "path": "tests/console/test_clip_golden.cpp",
+      "anchor": "ASSERT_TRUE ( sample . value ( QStringLiteral ( \"debayer_wb_prepare_ms\" ) ) . toDouble ( ) >= 0.0 ) ;",
+      "class": "not_run_proof_structural",
+      "clock": "other",
+      "justification": "Schema/non-negativity sanity check on the 'debayer_wb_prepare_ms' telemetry field (part of a large block of near-identical ASSERT_TRUE(...).toDouble() >= 0.0) checks over the playback-profile JSON): >=0.0 can never distinguish 'ran' from 'did not run', both satisfy it. Sourced from frame_caching.c's mlv_debayer_timing_now_seconds(), which calls omp_get_wtime() when built with OpenMP (typical) else falls back to QueryPerformanceCounter -- not independently re-verified per build this round.",
+      "lines": [
+        812
+      ]
+    },
+    {
+      "path": "tests/console/test_clip_golden.cpp",
+      "anchor": "ASSERT_TRUE ( sample . value ( QStringLiteral ( \"debayer_ca_ms\" ) ) . toDouble ( ) >= 0.0 ) ;",
+      "class": "not_run_proof_structural",
+      "clock": "other",
+      "justification": "Schema/non-negativity sanity check on the 'debayer_ca_ms' telemetry field (part of a large block of near-identical ASSERT_TRUE(...).toDouble() >= 0.0) checks over the playback-profile JSON): >=0.0 can never distinguish 'ran' from 'did not run', both satisfy it. Sourced from frame_caching.c's mlv_debayer_timing_now_seconds(), which calls omp_get_wtime() when built with OpenMP (typical) else falls back to QueryPerformanceCounter -- not independently re-verified per build this round.",
+      "lines": [
+        813
+      ]
+    },
+    {
+      "path": "tests/console/test_clip_golden.cpp",
+      "anchor": "ASSERT_TRUE ( sample . value ( QStringLiteral ( \"debayer_kernel_ms\" ) ) . toDouble ( ) >= 0.0 ) ;",
+      "class": "not_run_proof_structural",
+      "clock": "other",
+      "justification": "Schema/non-negativity sanity check on the 'debayer_kernel_ms' telemetry field (part of a large block of near-identical ASSERT_TRUE(...).toDouble() >= 0.0) checks over the playback-profile JSON): >=0.0 can never distinguish 'ran' from 'did not run', both satisfy it. Sourced from frame_caching.c's mlv_debayer_timing_now_seconds(), which calls omp_get_wtime() when built with OpenMP (typical) else falls back to QueryPerformanceCounter -- not independently re-verified per build this round.",
+      "lines": [
+        814
+      ]
+    },
+    {
+      "path": "tests/console/test_clip_golden.cpp",
+      "anchor": "ASSERT_TRUE ( sample . value ( QStringLiteral ( \"debayer_wb_undo_ms\" ) ) . toDouble ( ) >= 0.0 ) ;",
+      "class": "not_run_proof_structural",
+      "clock": "other",
+      "justification": "Schema/non-negativity sanity check on the 'debayer_wb_undo_ms' telemetry field (part of a large block of near-identical ASSERT_TRUE(...).toDouble() >= 0.0) checks over the playback-profile JSON): >=0.0 can never distinguish 'ran' from 'did not run', both satisfy it. Sourced from frame_caching.c's mlv_debayer_timing_now_seconds(), which calls omp_get_wtime() when built with OpenMP (typical) else falls back to QueryPerformanceCounter -- not independently re-verified per build this round.",
+      "lines": [
+        815
+      ]
+    },
+    {
+      "path": "tests/console/test_clip_golden.cpp",
+      "anchor": "ASSERT_TRUE ( sample . value ( QStringLiteral ( \"debayer_pipeline_other_ms\" ) ) . toDouble ( ) >= 0.0 ) ;",
+      "class": "not_run_proof_structural",
+      "clock": "qpc_stage_clock",
+      "justification": "Schema/non-negativity sanity check on the 'debayer_pipeline_other_ms' telemetry field (part of a large block of near-identical ASSERT_TRUE(...).toDouble() >= 0.0) checks over the playback-profile JSON): >=0.0 can never distinguish 'ran' from 'did not run', both satisfy it. Inferred from the field's source module (video_mlv.c / llrawproc.c / lj92.c), all on mlv_stage_timing_now(); not independently re-verified per field this round.",
+      "lines": [
+        816
+      ]
+    },
+    {
+      "path": "tests/console/test_clip_golden.cpp",
+      "anchor": "ASSERT_TRUE ( sample . value ( QStringLiteral ( \"processing_ms\" ) ) . toDouble ( ) >= 0.0 ) ;",
+      "class": "not_run_proof_structural",
+      "clock": "qpc_stage_clock",
+      "justification": "Schema/non-negativity sanity check on the 'processing_ms' telemetry field (part of a large block of near-identical ASSERT_TRUE(...).toDouble() >= 0.0) checks over the playback-profile JSON): >=0.0 can never distinguish 'ran' from 'did not run', both satisfy it. Inferred from the field's source module (video_mlv.c / llrawproc.c / lj92.c), all on mlv_stage_timing_now(); not independently re-verified per field this round.",
+      "lines": [
+        817,
+        866
+      ]
+    },
+    {
+      "path": "tests/console/test_clip_golden.cpp",
+      "anchor": "ASSERT_TRUE ( sample . value ( QStringLiteral ( \"processed16_total_ms\" ) ) . toDouble ( ) >= 0.0 ) ;",
+      "class": "not_run_proof_structural",
+      "clock": "qpc_stage_clock",
+      "justification": "Schema/non-negativity sanity check on the 'processed16_total_ms' telemetry field (part of a large block of near-identical ASSERT_TRUE(...).toDouble() >= 0.0) checks over the playback-profile JSON): >=0.0 can never distinguish 'ran' from 'did not run', both satisfy it. Inferred from the field's source module (video_mlv.c / llrawproc.c / lj92.c), all on mlv_stage_timing_now(); not independently re-verified per field this round.",
+      "lines": [
+        818
+      ]
+    },
+    {
+      "path": "tests/console/test_clip_golden.cpp",
+      "anchor": "ASSERT_TRUE ( sample . value ( QStringLiteral ( \"processed16_for_8bit_ms\" ) ) . toDouble ( ) >= 0.0 ) ;",
+      "class": "not_run_proof_structural",
+      "clock": "qpc_stage_clock",
+      "justification": "Schema/non-negativity sanity check on the 'processed16_for_8bit_ms' telemetry field (part of a large block of near-identical ASSERT_TRUE(...).toDouble() >= 0.0) checks over the playback-profile JSON): >=0.0 can never distinguish 'ran' from 'did not run', both satisfy it. Inferred from the field's source module (video_mlv.c / llrawproc.c / lj92.c), all on mlv_stage_timing_now(); not independently re-verified per field this round.",
+      "lines": [
+        819
+      ]
+    },
+    {
+      "path": "tests/console/test_clip_golden.cpp",
+      "anchor": "ASSERT_TRUE ( sample . value ( QStringLiteral ( \"processed16_to_8bit_ms\" ) ) . toDouble ( ) >= 0.0 ) ;",
+      "class": "not_run_proof_structural",
+      "clock": "qpc_stage_clock",
+      "justification": "Schema/non-negativity sanity check on the 'processed16_to_8bit_ms' telemetry field (part of a large block of near-identical ASSERT_TRUE(...).toDouble() >= 0.0) checks over the playback-profile JSON): >=0.0 can never distinguish 'ran' from 'did not run', both satisfy it. Inferred from the field's source module (video_mlv.c / llrawproc.c / lj92.c), all on mlv_stage_timing_now(); not independently re-verified per field this round.",
+      "lines": [
+        820
+      ]
+    },
+    {
+      "path": "tests/console/test_clip_golden.cpp",
+      "anchor": "ASSERT_TRUE ( sample . value ( QStringLiteral ( \"processed8_total_ms\" ) ) . toDouble ( ) >= 0.0 ) ;",
+      "class": "not_run_proof_structural",
+      "clock": "qpc_stage_clock",
+      "justification": "Schema/non-negativity sanity check on the 'processed8_total_ms' telemetry field (part of a large block of near-identical ASSERT_TRUE(...).toDouble() >= 0.0) checks over the playback-profile JSON): >=0.0 can never distinguish 'ran' from 'did not run', both satisfy it. Inferred from the field's source module (video_mlv.c / llrawproc.c / lj92.c), all on mlv_stage_timing_now(); not independently re-verified per field this round.",
+      "lines": [
+        821,
+        1165
+      ]
+    },
+    {
+      "path": "tests/console/test_clip_golden.cpp",
+      "anchor": "ASSERT_TRUE ( sample . value ( QStringLiteral ( \"draw_frame_ready_queue_ms\" ) ) . toDouble ( ) >= 0.0 ) ;",
+      "class": "not_run_proof_structural",
+      "clock": "qpc_stage_clock",
+      "justification": "Schema/non-negativity sanity check on the 'draw_frame_ready_queue_ms' telemetry field (part of a large block of near-identical ASSERT_TRUE(...).toDouble() >= 0.0) checks over the playback-profile JSON): >=0.0 can never distinguish 'ran' from 'did not run', both satisfy it. Inferred from the field's source module (video_mlv.c / llrawproc.c / lj92.c), all on mlv_stage_timing_now(); not independently re-verified per field this round.",
+      "lines": [
+        822
+      ]
+    },
+    {
+      "path": "tests/console/test_clip_golden.cpp",
+      "anchor": "ASSERT_TRUE ( sample . value ( QStringLiteral ( \"draw_frame_ready_advance_ms\" ) ) . toDouble ( ) >= 0.0 ) ;",
+      "class": "not_run_proof_structural",
+      "clock": "qpc_stage_clock",
+      "justification": "Schema/non-negativity sanity check on the 'draw_frame_ready_advance_ms' telemetry field (part of a large block of near-identical ASSERT_TRUE(...).toDouble() >= 0.0) checks over the playback-profile JSON): >=0.0 can never distinguish 'ran' from 'did not run', both satisfy it. Inferred from the field's source module (video_mlv.c / llrawproc.c / lj92.c), all on mlv_stage_timing_now(); not independently re-verified per field this round.",
+      "lines": [
+        823
+      ]
+    },
+    {
+      "path": "tests/console/test_clip_golden.cpp",
+      "anchor": "ASSERT_TRUE ( sample . value ( QStringLiteral ( \"draw_frame_ready_scene_ms\" ) ) . toDouble ( ) >= 0.0 ) ;",
+      "class": "not_run_proof_structural",
+      "clock": "qpc_stage_clock",
+      "justification": "Schema/non-negativity sanity check on the 'draw_frame_ready_scene_ms' telemetry field (part of a large block of near-identical ASSERT_TRUE(...).toDouble() >= 0.0) checks over the playback-profile JSON): >=0.0 can never distinguish 'ran' from 'did not run', both satisfy it. Inferred from the field's source module (video_mlv.c / llrawproc.c / lj92.c), all on mlv_stage_timing_now(); not independently re-verified per field this round.",
+      "lines": [
+        824
+      ]
+    },
+    {
+      "path": "tests/console/test_clip_golden.cpp",
+      "anchor": "ASSERT_TRUE ( sample . value ( QStringLiteral ( \"draw_frame_ready_image_ms\" ) ) . toDouble ( ) >= 0.0 ) ;",
+      "class": "not_run_proof_structural",
+      "clock": "qpc_stage_clock",
+      "justification": "Schema/non-negativity sanity check on the 'draw_frame_ready_image_ms' telemetry field (part of a large block of near-identical ASSERT_TRUE(...).toDouble() >= 0.0) checks over the playback-profile JSON): >=0.0 can never distinguish 'ran' from 'did not run', both satisfy it. Inferred from the field's source module (video_mlv.c / llrawproc.c / lj92.c), all on mlv_stage_timing_now(); not independently re-verified per field this round.",
+      "lines": [
+        825
+      ]
+    },
+    {
+      "path": "tests/console/test_clip_golden.cpp",
+      "anchor": "ASSERT_TRUE ( sample . value ( QStringLiteral ( \"draw_frame_ready_present_ms\" ) ) . toDouble ( ) >= 0.0 ) ;",
+      "class": "not_run_proof_structural",
+      "clock": "qpc_stage_clock",
+      "justification": "Schema/non-negativity sanity check on the 'draw_frame_ready_present_ms' telemetry field (part of a large block of near-identical ASSERT_TRUE(...).toDouble() >= 0.0) checks over the playback-profile JSON): >=0.0 can never distinguish 'ran' from 'did not run', both satisfy it. Inferred from the field's source module (video_mlv.c / llrawproc.c / lj92.c), all on mlv_stage_timing_now(); not independently re-verified per field this round.",
+      "lines": [
+        826
+      ]
+    },
+    {
+      "path": "tests/console/test_clip_golden.cpp",
+      "anchor": "ASSERT_TRUE ( sample . value ( QStringLiteral ( \"draw_frame_ready_scopes_ms\" ) ) . toDouble ( ) >= 0.0 ) ;",
+      "class": "not_run_proof_structural",
+      "clock": "qpc_stage_clock",
+      "justification": "Schema/non-negativity sanity check on the 'draw_frame_ready_scopes_ms' telemetry field (part of a large block of near-identical ASSERT_TRUE(...).toDouble() >= 0.0) checks over the playback-profile JSON): >=0.0 can never distinguish 'ran' from 'did not run', both satisfy it. Inferred from the field's source module (video_mlv.c / llrawproc.c / lj92.c), all on mlv_stage_timing_now(); not independently re-verified per field this round.",
+      "lines": [
+        827
+      ]
+    },
+    {
+      "path": "tests/console/test_clip_golden.cpp",
+      "anchor": "ASSERT_TRUE ( sample . value ( QStringLiteral ( \"draw_frame_ready_overlay_ms\" ) ) . toDouble ( ) >= 0.0 ) ;",
+      "class": "not_run_proof_structural",
+      "clock": "qpc_stage_clock",
+      "justification": "Schema/non-negativity sanity check on the 'draw_frame_ready_overlay_ms' telemetry field (part of a large block of near-identical ASSERT_TRUE(...).toDouble() >= 0.0) checks over the playback-profile JSON): >=0.0 can never distinguish 'ran' from 'did not run', both satisfy it. Inferred from the field's source module (video_mlv.c / llrawproc.c / lj92.c), all on mlv_stage_timing_now(); not independently re-verified per field this round.",
+      "lines": [
+        828
+      ]
+    },
+    {
+      "path": "tests/console/test_clip_golden.cpp",
+      "anchor": "ASSERT_TRUE ( sample . value ( QStringLiteral ( \"draw_frame_ready_total_ms\" ) ) . toDouble ( ) >= 0.0 ) ;",
+      "class": "not_run_proof_structural",
+      "clock": "qpc_stage_clock",
+      "justification": "Schema/non-negativity sanity check on the 'draw_frame_ready_total_ms' telemetry field (part of a large block of near-identical ASSERT_TRUE(...).toDouble() >= 0.0) checks over the playback-profile JSON): >=0.0 can never distinguish 'ran' from 'did not run', both satisfy it. Inferred from the field's source module (video_mlv.c / llrawproc.c / lj92.c), all on mlv_stage_timing_now(); not independently re-verified per field this round.",
+      "lines": [
+        829
+      ]
+    },
+    {
+      "path": "tests/console/test_clip_golden.cpp",
+      "anchor": "ASSERT_TRUE ( sample . value ( QStringLiteral ( \"render_thread_queue_wait_ms\" ) ) . toDouble ( ) >= 0.0 ) ;",
+      "class": "not_run_proof_structural",
+      "clock": "qpc_stage_clock",
+      "justification": "Schema/non-negativity sanity check on the 'render_thread_queue_wait_ms' telemetry field (part of a large block of near-identical ASSERT_TRUE(...).toDouble() >= 0.0) checks over the playback-profile JSON): >=0.0 can never distinguish 'ran' from 'did not run', both satisfy it. Inferred from the field's source module (video_mlv.c / llrawproc.c / lj92.c), all on mlv_stage_timing_now(); not independently re-verified per field this round.",
+      "lines": [
+        832
+      ]
+    },
+    {
+      "path": "tests/console/test_clip_golden.cpp",
+      "anchor": "ASSERT_TRUE ( sample . value ( QStringLiteral ( \"render_thread_work_ms\" ) ) . toDouble ( ) >= 0.0 ) ;",
+      "class": "not_run_proof_structural",
+      "clock": "qpc_stage_clock",
+      "justification": "Schema/non-negativity sanity check on the 'render_thread_work_ms' telemetry field (part of a large block of near-identical ASSERT_TRUE(...).toDouble() >= 0.0) checks over the playback-profile JSON): >=0.0 can never distinguish 'ran' from 'did not run', both satisfy it. Inferred from the field's source module (video_mlv.c / llrawproc.c / lj92.c), all on mlv_stage_timing_now(); not independently re-verified per field this round.",
+      "lines": [
+        833
+      ]
+    },
+    {
+      "path": "tests/console/test_clip_golden.cpp",
+      "anchor": "ASSERT_TRUE ( sample . value ( QStringLiteral ( \"render_thread_total_ms\" ) ) . toDouble ( ) >= 0.0 ) ;",
+      "class": "not_run_proof_structural",
+      "clock": "qpc_stage_clock",
+      "justification": "Schema/non-negativity sanity check on the 'render_thread_total_ms' telemetry field (part of a large block of near-identical ASSERT_TRUE(...).toDouble() >= 0.0) checks over the playback-profile JSON): >=0.0 can never distinguish 'ran' from 'did not run', both satisfy it. Inferred from the field's source module (video_mlv.c / llrawproc.c / lj92.c), all on mlv_stage_timing_now(); not independently re-verified per field this round.",
+      "lines": [
+        834
+      ]
+    },
+    {
+      "path": "tests/console/test_clip_golden.cpp",
+      "anchor": "|| sample . value ( QStringLiteral ( \"dual_iso_preview_rowscale_ms\" ) ) . toDouble ( ) > 0.0 ;",
+      "class": "run_proof",
+      "clock": "qpc_stage_clock",
+      "justification": "Accumulates whether ANY frame reported nonzero dual-iso preview rowscale time, later asserted true at line 900 (ASSERT_TRUE(saw_preview_rowscale_timing)) as proof the rowscale substage ran at least once across the sampled frames -- the sol #169 HARDENING item asking for a real rowscale completed-counter in place of this duration latch.",
+      "status": "open",
+      "successor": "PROD-TELEMETRY-DURATION-AS-PROOF-5",
+      "lines": [
+        893
+      ]
+    },
+    {
+      "path": "tests/console/test_clip_golden.cpp",
+      "anchor": "ASSERT_TRUE ( first_frame . value ( QStringLiteral ( \"raw_uint16_lj92_pred1_fast_path_total_ms\" ) ) . toDouble ( ) > 0.0 ) ;",
+      "class": "run_proof",
+      "clock": "qpc_stage_clock",
+      "justification": "Redundant with the measurement_active flag already asserted immediately above in the same test; the flag is the real proof the fast path executed, this duration check adds no coverage the flag does not already provide.",
+      "flag": "raw_uint16_lj92_pred1_fast_path_measurement_active (already asserted true two lines above, at test_clip_golden.cpp:2583, in this same test)",
+      "lines": [
+        2585
+      ]
+    },
+    {
+      "path": "tests/console/test_gpu_window_swap_telemetry.cpp",
+      "anchor": "ASSERT_NEAR ( 0.0 , summary . maxGapMs , 1 e - 9 ) ;",
+      "class": "not_run_proof_structural",
+      "clock": "other",
+      "justification": "Pure-function unit test: GpuWindowSwapTelemetryPolicy::summarize() is called on a synthetic, test-constructed zero-swap counters struct with no live clock involved; asserting its deterministic output is ~0 verifies the policy's math on a known input, not that any stage ran.",
+      "lines": [
+        14
+      ]
+    },
+    {
+      "path": "tests/console/test_gpu_window_swap_telemetry.cpp",
+      "anchor": "ASSERT_NEAR ( 0.0 , summary . headGapMs , 1 e - 9 ) ;",
+      "class": "not_run_proof_structural",
+      "clock": "other",
+      "justification": "Same synthetic-input pure-function verification as the maxGapMs control above, for a different summarize() output field.",
+      "lines": [
+        101,
+        118
+      ]
+    },
+    {
+      "path": "tests/console/test_gpu_window_swap_telemetry.cpp",
+      "anchor": "ASSERT_NEAR ( 0.0 , summary . tailGapMs , 1 e - 9 ) ;",
+      "class": "not_run_proof_structural",
+      "clock": "other",
+      "justification": "Same synthetic-input pure-function verification as the maxGapMs control above, for a different summarize() output field.",
+      "lines": [
+        102,
+        119
+      ]
+    },
+    {
+      "path": "tests/console/test_playback_quality_auto_mode.cpp",
+      "anchor": "ASSERT_NEAR ( 0.0 , playbackQualityFpsEquivalentForFrameMs ( 0.0 ) , 0.001 ) ;",
+      "class": "not_run_proof_structural",
+      "clock": "other",
+      "justification": "Pure-function unit test of playbackQualityFpsEquivalentForFrameMs() on the literal input 0.0; verifies the conversion function's own math, not that any stage ran.",
+      "lines": [
+        145
+      ]
+    },
+    {
+      "path": "tests/console/test_playback_quality_auto_mode.cpp",
+      "anchor": "ASSERT_NEAR ( 0.0 , playbackQualityFpsEquivalentForFrameMs ( - 5.0 ) , 0.001 ) ;",
+      "class": "not_run_proof_structural",
+      "clock": "other",
+      "justification": "Pure-function unit test of playbackQualityFpsEquivalentForFrameMs() on the literal input -5.0 (a defensive negative-input case); verifies the conversion function's own math, not that any stage ran.",
+      "lines": [
+        146
+      ]
+    },
+    {
+      "path": "tests/console/test_playback_quality_auto_mode.cpp",
+      "anchor": "ASSERT_NEAR ( 0.0 , d . averageFrameMs , 0.001 ) ;",
+      "class": "not_run_proof_structural",
+      "clock": "other",
+      "justification": "Asserts PlaybackQualityAutoSampler's averageFrameMs is 0 in its initial, no-samples-fed-yet state ('No samples yet' per the adjacent comment) -- a known-initial-state check on a freshly constructed object, not proof that any stage ran or did not run.",
+      "lines": [
+        160
+      ]
+    },
+    {
+      "path": "tests/gui/test_gui_smoke.cpp",
+      "anchor": "if ( captureHoldMs > 0 ) QTest :: qWait ( captureHoldMs ) ;",
+      "class": "value_fallback_select",
+      "clock": "other",
+      "justification": "MLVAPP_TEST_VISIBLE_HOLD_MS is an optional operator-supplied dwell for manual screenshot capture; the guard only decides whether to wait, and the test's actual assertions (immediately above and below) do not depend on it.",
+      "lines": [
+        1578
+      ]
+    },
+    {
+      "path": "tests/perf/perf_main.cpp",
+      "anchor": "if ( shared_lock_ms >= 0.0 ) llrawproc_shared_lock_samples . push_back ( shared_lock_ms ) ;",
+      "class": "value_fallback_select",
+      "clock": "qpc_stage_clock",
+      "justification": "llrpGetLastSharedLockMilliseconds() returns a negative sentinel when the lock was never taken during the sampled render; the perf harness excludes that sentinel from the reported statistics rather than treating zero-or-negative as proof of anything.",
+      "lines": [
+        729
+      ]
+    },
+    {
+      "path": "tests/perf/perf_main.cpp",
+      "anchor": "if ( dualiso_refine_lock_ms >= 0.0 ) llrawproc_dualiso_refine_lock_samples . push_back ( dualiso_refine_lock_ms ) ;",
+      "class": "value_fallback_select",
+      "clock": "qpc_stage_clock",
+      "justification": "Same sentinel-exclusion pattern as shared_lock_ms, for the dual-ISO refine lock sample.",
+      "lines": [
+        731
+      ]
+    },
+    {
+      "path": "tests/perf/perf_main.cpp",
+      "anchor": "if ( publish_lock_ms >= 0.0 ) llrawproc_publish_lock_samples . push_back ( publish_lock_ms ) ;",
+      "class": "value_fallback_select",
+      "clock": "qpc_stage_clock",
+      "justification": "Same sentinel-exclusion pattern as shared_lock_ms, for the publish lock sample.",
+      "lines": [
+        733
+      ]
+    },
+    {
+      "path": "tests/perf/perf_main.cpp",
+      "anchor": "metric . cv_pct = metric . average_ms > 0.0 ? ( metric . stddev_ms / metric . average_ms ) * 100.0 : 0.0 ;",
+      "class": "division_guard",
+      "clock": "other",
+      "justification": "Guards the stddev/average coefficient-of-variation division against a zero average; a perf-report statistic, not a run-proof.",
+      "lines": [
+        745
+      ]
+    },
+    {
+      "path": "tests/perf/perf_main.cpp",
+      "anchor": "metric . fps = metric . average_ms > 0.0 ? 1000.0 / metric . average_ms : 0.0 ;",
+      "class": "division_guard",
+      "clock": "other",
+      "justification": "Guards the 1000/average fps-from-average-ms division; a perf-report statistic, not a run-proof.",
+      "lines": [
+        752
+      ]
+    },
+    {
+      "path": "tests/perf/perf_main.cpp",
+      "anchor": "run . preview16_speedup = run . preview16 . average_ms > 0.0 ? ( run . full16 . average_ms / run . preview16 . average_ms ) : 0.0 ;",
+      "class": "division_guard",
+      "clock": "other",
+      "justification": "Guards the full16/preview16 speedup-ratio division against a zero denominator; a perf-report statistic.",
+      "lines": [
+        1437
+      ]
+    },
+    {
+      "path": "tests/perf/perf_main.cpp",
+      "anchor": "run . preview8_speedup = run . preview8 . average_ms > 0.0 ? ( run . full8 . average_ms / run . preview8 . average_ms ) : 0.0 ;",
+      "class": "division_guard",
+      "clock": "other",
+      "justification": "Guards the full8/preview8 speedup-ratio division against a zero denominator; a perf-report statistic.",
+      "lines": [
+        1438
+      ]
+    },
+    {
+      "path": "tests/pipeline/test_dual_iso_pipeline.cpp",
+      "anchor": "elapsed_ms , elapsed_ms > 0.0 ? 1000.0 / elapsed_ms : 0.0 ) ;",
+      "class": "display_or_format",
+      "clock": "other",
+      "justification": "Formats an FPS-equivalent for a diagnostic stderr print in a histogram perf test; elapsed_ms is a std::chrono::steady_clock measurement of the call under test, guarded only to avoid dividing by zero when printing (a separate ASSERT_TRUE(elapsed_ms < 2000.0) bounds it from above; nothing here proves the call ran).",
+      "lines": [
+        178
+      ]
+    },
+    {
+      "path": "tests/pipeline/test_dual_iso_pipeline.cpp",
+      "anchor": "ASSERT_TRUE ( queue_idle . value ( QStringLiteral ( \"avg_ms\" ) ) . toDouble ( - 1.0 ) >= 0.0 ) ;",
+      "class": "value_fallback_select",
+      "clock": "other",
+      "justification": "A JSON field-presence check with a -1.0 sentinel default (a missing 'avg_ms' field reads as -1.0 and fails >=0.0); the actual run-proof for this stage is the adjacent `samples>=1` counter assertion just above, the correct kind of proof.",
+      "lines": [
+        4552
+      ]
+    },
+    {
+      "path": "tests/pipeline/test_dual_iso_pipeline.cpp",
+      "anchor": "ASSERT_TRUE ( producer_queue_idle . value ( QStringLiteral ( \"avg_ms\" ) ) . toDouble ( - 1.0 ) >= 0.0 ) ;",
+      "class": "value_fallback_select",
+      "clock": "other",
+      "justification": "Same JSON field-presence check (sentinel-default pattern) as the queue_idle avg_ms control above, for the producer_queue_idle_ms stage; the run-proof is the adjacent `samples>=1` counter.",
+      "lines": [
+        4556
+      ]
+    },
+    {
+      "path": "tests/pipeline/test_dual_iso_pipeline.cpp",
+      "anchor": "ASSERT_TRUE ( fixture . video ( ) -> llrawproc -> playback_pre_dualiso_fix_ms > 0.0 ) ;",
+      "class": "run_proof",
+      "clock": "qpc_stage_clock",
+      "justification": "Golden test asserting the same field RenderFrameThread.cpp reads as run-proof for the pre-dual-ISO fix (see that file's ~4802 entry); shares its exposure to the processed8 cache-hit reset gap (video_mlv.c ~7334-7376 / entry reset ~7235-7247) named in the #169 review BLOCKER.",
+      "status": "open",
+      "successor": "PROD-TELEMETRY-DURATION-AS-PROOF-5",
+      "lines": [
+        10114
+      ]
+    },
+    {
+      "path": "tests/pipeline/test_dual_iso_pipeline.cpp",
+      "anchor": "ASSERT_EQ ( 0.0 , processingGetLastShadowsHighlightsFilterQuarterresDownsampleMilliseconds ( ) ) ;",
+      "class": "not_run_proof_structural",
+      "clock": "omp_get_wtime_direct",
+      "justification": "Negative-lane exclusivity: this SH-filter quarterres substage is asserted to have accumulated exactly 0.0 ms because this test's fixture takes the halfres lane instead (scale-four preview mode). Sourced from the per-substage omp_get_wtime() writes named in the #169 ruling's clock correction (raw_processing.c ~1484-1694), guarded by MLVAPP_SHADOWS_HIGHLIGHTS_PROBE and proven-not-run by construction. Correction (fable, PROD-TELEMETRY-DURATION-AS-PROOF-4B round 1): the test does NOT carry a positive completed-flag/run-counter assertion alongside this trio -- its only other positive claim is ASSERT_TRUE(!got.empty()) on the rendered scale-four preview output, weaker than the paired-flag pattern used elsewhere in this file. The classification itself (negative-lane, claiming nothing about what ran) remains honest; the write-up of what backs it does not.",
+      "lines": [
+        11152
+      ]
+    },
+    {
+      "path": "tests/pipeline/test_dual_iso_pipeline.cpp",
+      "anchor": "ASSERT_EQ ( 0.0 , processingGetLastShadowsHighlightsFilterQuarterresRbfMilliseconds ( ) ) ;",
+      "class": "not_run_proof_structural",
+      "clock": "omp_get_wtime_direct",
+      "justification": "Same negative-lane exclusivity pattern as the quarterres-downsample site above, for the quarterres RBF substage.",
+      "lines": [
+        11153
+      ]
+    },
+    {
+      "path": "tests/pipeline/test_dual_iso_pipeline.cpp",
+      "anchor": "ASSERT_EQ ( 0.0 , processingGetLastShadowsHighlightsFilterQuarterresUpsampleMilliseconds ( ) ) ;",
+      "class": "not_run_proof_structural",
+      "clock": "omp_get_wtime_direct",
+      "justification": "Same negative-lane exclusivity pattern as the quarterres-downsample site above, for the quarterres upsample substage.",
+      "lines": [
+        11154
+      ]
+    },
+    {
+      "path": "tests/pipeline/test_dual_iso_pipeline.cpp",
+      "anchor": "ASSERT_EQ ( 0.0 , getMlvLastProcessed8CacheStoreMilliseconds ( ) ) ;",
+      "class": "not_run_proof_structural",
+      "clock": "qpc_stage_clock",
+      "justification": "Negative-lane exclusivity check reused across four tests: each asserts the processed8-cache-store timer stayed at its reset value of 0.0 because that test's code path (x8/x1 aggressive-preview direct/skip paths) deliberately skips the cache-store bookkeeping. Proves absence of a side-effect (the store was skipped), not presence of a stage; g_mlv_last_processed8_cache_store_ms is explicitly reset to 0.0 at the top of every call (video_mlv.c ~7243), and the surrounding scale/path assertions in the same tests independently confirm which path ran.",
+      "lines": [
+        11930,
+        11973,
+        11998,
+        12031
+      ]
+    },
+    {
+      "path": "tests/pipeline/test_processing_filters.cpp",
+      "anchor": "ASSERT_EQ ( 0.0 , processingGetLastShadowsHighlightsFilterHalfresDownsampleMilliseconds ( ) ) ;",
+      "class": "not_run_proof_structural",
+      "clock": "omp_get_wtime_direct",
+      "justification": "Proof-by-construction negative-lane check documented in this file's own comments (~654-664): with the quarterres/aggressive env unset, this substage's omp_get_wtime()-gated accumulator is never written, so it reads 0.0 -- paired with a positive CompletedForTesting()/RunCountForTesting() assertion for the substage that DID run. Restoring this to run-proof duty is the exact regression PROD-TELEMETRY-DURATION-AS-PROOF-1 round 3 undid, per the file's own comment.",
+      "lines": [
+        665,
+        709
+      ]
+    },
+    {
+      "path": "tests/pipeline/test_processing_filters.cpp",
+      "anchor": "ASSERT_EQ ( 0.0 , processingGetLastShadowsHighlightsFilterHalfresRbfMilliseconds ( ) ) ;",
+      "class": "not_run_proof_structural",
+      "clock": "omp_get_wtime_direct",
+      "justification": "Same proof-by-construction negative-lane pattern as HalfresDownsample above, for the halfres RBF substage (also used in the fullres-lane tests to prove the halfres lane did NOT run).",
+      "lines": [
+        666,
+        710,
+        796,
+        855
+      ]
+    },
+    {
+      "path": "tests/pipeline/test_processing_filters.cpp",
+      "anchor": "ASSERT_EQ ( 0.0 , processingGetLastShadowsHighlightsFilterHalfresUpsampleMilliseconds ( ) ) ;",
+      "class": "not_run_proof_structural",
+      "clock": "omp_get_wtime_direct",
+      "justification": "Same proof-by-construction negative-lane pattern as HalfresDownsample above, for the halfres upsample substage.",
+      "lines": [
+        667,
+        711
+      ]
+    },
+    {
+      "path": "tests/pipeline/test_processing_filters.cpp",
+      "anchor": "ASSERT_EQ ( 0.0 , processingGetLastShadowsHighlightsFilterQuarterresDownsampleMilliseconds ( ) ) ;",
+      "class": "not_run_proof_structural",
+      "clock": "omp_get_wtime_direct",
+      "justification": "Same proof-by-construction negative-lane pattern as HalfresDownsample above, for the quarterres downsample substage.",
+      "lines": [
+        668,
+        712
+      ]
+    },
+    {
+      "path": "tests/pipeline/test_processing_filters.cpp",
+      "anchor": "ASSERT_EQ ( 0.0 , processingGetLastShadowsHighlightsFilterQuarterresRbfMilliseconds ( ) ) ;",
+      "class": "not_run_proof_structural",
+      "clock": "omp_get_wtime_direct",
+      "justification": "Same proof-by-construction negative-lane pattern as HalfresDownsample above, for the quarterres RBF substage.",
+      "lines": [
+        669,
+        713,
+        755
+      ]
+    },
+    {
+      "path": "tests/pipeline/test_processing_filters.cpp",
+      "anchor": "ASSERT_EQ ( 0.0 , processingGetLastShadowsHighlightsFilterQuarterresUpsampleMilliseconds ( ) ) ;",
+      "class": "not_run_proof_structural",
+      "clock": "omp_get_wtime_direct",
+      "justification": "Same proof-by-construction negative-lane pattern as HalfresDownsample above, for the quarterres upsample substage.",
+      "lines": [
+        670,
+        714
+      ]
+    },
+    {
+      "path": "tests/pipeline/test_processing_filters.cpp",
+      "anchor": "ASSERT_EQ ( 0.0 , processingGetLastShadowsHighlightsFilterFullresMilliseconds ( ) ) ;",
+      "class": "not_run_proof_structural",
+      "clock": "omp_get_wtime_direct",
+      "justification": "Proof-by-construction negative-lane check documented in this file's own comments (~750-752, ~792-794): asserted 0.0 in the halfres/quarterres-lane tests to prove the fullres lane did NOT run, paired with a positive CompletedForTesting()/RunCountForTesting() assertion for whichever lane DID run.",
+      "lines": [
+        753,
+        795,
+        854
+      ]
+    }
+  ]
+}

@@ -43,7 +43,19 @@ SOURCES += \
     $$REPO_ROOT/tests/console/test_receipt_applier.cpp \
     $$REPO_ROOT/tests/console/test_rendered_video_runner.cpp \
     $$REPO_ROOT/tests/console/test_sync_download_waiter.cpp \
-    $$REPO_ROOT/tests/console/test_download_manager.cpp
+    $$REPO_ROOT/tests/console/test_download_manager.cpp \
+    $$REPO_ROOT/tests/console/test_playback_gate_policy.cpp \
+    $$REPO_ROOT/tests/console/test_async_h2d_counter_contract.cpp \
+    $$REPO_ROOT/tests/console/test_gpu_window_swap_telemetry.cpp \
+    $$REPO_ROOT/tests/console/test_gpu_window_swap_wiring.cpp \
+    $$REPO_ROOT/tests/console/test_playback_smoke_foreground_wiring.cpp \
+    $$REPO_ROOT/tests/console/test_playback_display_wake_wiring.cpp \
+    $$REPO_ROOT/tests/console/test_contact_sheet_capture_wiring.cpp \
+    $$REPO_ROOT/tests/console/test_playback_achieved_scale_policy.cpp \
+    $$REPO_ROOT/tests/console/test_gpu_texture_present_availability_policy.cpp \
+    $$REPO_ROOT/tests/console/test_playback_frame_population_policy.cpp \
+    $$REPO_ROOT/tests/console/test_playback_lookahead_loop_position_policy.cpp \
+    $$REPO_ROOT/tests/console/test_playback_drop_frame_advance_policy.cpp
 
 HEADERS += \
     $$REPO_ROOT/platform/qt/FpmNameValidator.h \
@@ -66,7 +78,16 @@ HEADERS += \
     $$REPO_ROOT/platform/qt/ExportProcess.h \
     $$REPO_ROOT/platform/qt/DualIsoLevelSyncPolicy.h \
     $$REPO_ROOT/platform/qt/PlaybackFrameRange.h \
-    $$REPO_ROOT/platform/qt/PlaybackPrepPresentationPolicy.h
+    $$REPO_ROOT/platform/qt/PlaybackPrepPresentationPolicy.h \
+    $$REPO_ROOT/platform/qt/PlaybackGatePolicy.h \
+    $$REPO_ROOT/platform/qt/AsyncH2dCounterContract.h \
+    $$REPO_ROOT/platform/qt/GpuWindowSwapTelemetry.h \
+    $$REPO_ROOT/platform/qt/PlaybackFramePopulationPolicy.h \
+    $$REPO_ROOT/platform/qt/PlaybackPresentedFrameIdentityTracker.h \
+    $$REPO_ROOT/platform/qt/PlaybackDropFrameAdvancePolicy.h \
+    $$REPO_ROOT/platform/qt/PlaybackAchievedScalePolicy.h \
+    $$REPO_ROOT/platform/qt/PlaybackLookaheadLoopPositionPolicy.h \
+    $$REPO_ROOT/platform/qt/GpuTexturePresentAvailabilityPolicy.h
 
 win32{
     WINDOWS_TEST_RUNTIME_DEPLOY = $$relative_path($$REPO_ROOT/tools/testing/deploy-windows-test-runtime.ps1, $$OUT_PWD)

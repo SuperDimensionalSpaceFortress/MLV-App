@@ -222,6 +222,52 @@
       "redistribution_readiness": "blocked-missing-notices-and-arm64-payload"
     },
     {
+      "id": "ffmpeg-macos-arm64",
+      "path": "platform/qt/FFmpeg/ffmpegOSXarm.zip",
+      "archive_format": "zip",
+      "bytes": 17625512,
+      "sha256": "3b5dca90699cd0ba48e8a4144713b29dd7a692b654ab0e936c0f3e00623cfa86",
+      "member_summary": {
+        "entries": 2,
+        "file_entries": 2,
+        "directory_entries": 0,
+        "total_uncompressed_bytes": 40346081
+      },
+      "selected_members": [
+        {
+          "path": "ffmpeg",
+          "output_name": "ffmpeg",
+          "kind": "executable",
+          "bytes": 40345768,
+          "sha256": "be264bfb91a8998216fe191475ad660e67f6fc2e26a7c2d58f2e8a8a0eb385c1",
+          "executable": true,
+          "binary": {
+            "format": "macho",
+            "machine": "arm64"
+          }
+        }
+      ],
+      "consumers": [
+        {
+          "target": "macos-local",
+          "path": "platform/qt/MLVApp.pro",
+          "status": "active-local-install-rule-unvalidated",
+          "reference_marker": "$$PWD/../qt/FFmpeg/ffmpegOSXarm.zip",
+          "operation_marker": "QMAKE_POST_LINK += unzip -o $$quote($$PWD/../qt/FFmpeg/ffmpegOSXarm.zip)"
+        }
+      ],
+      "provenance": {
+        "status": "partial-local-evidence",
+        "source": "upstream ilia3101/MLV-App commit 877dea2cb9413bd0542abb622af517cf12db63d3 (added the archive)",
+        "source_evidence": "git history of the upstream merge (PROD-UPSTREAM-SYNC-1, PR #132)",
+        "build_recipe": "unknown",
+        "upstream_checksum_verified": false,
+        "license": "unverified",
+        "license_notice_in_archive": false
+      },
+      "redistribution_readiness": "blocked-unverified-upstream-build"
+    },
+    {
       "id": "ffmpeg-windows-x86",
       "path": "platform/qt/FFmpeg/ffmpegWin32.zip",
       "archive_format": "zip",

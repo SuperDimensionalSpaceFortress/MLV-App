@@ -37,7 +37,10 @@ function Get-RefusalKind {
         @{ kind = 'provider-usage-limit'; rx = 'usage[ _-]limit[ _-]reached' },
         @{ kind = 'provider-rate-limit';  rx = '\brate[ _-]limit(ed|s)?\b' },
         @{ kind = 'provider-rate-limit';  rx = '\b429\b' },
-        @{ kind = 'provider-auth';        rx = 'not logged in|invalid api key|authentication failed' }
+        @{ kind = 'provider-auth';        rx = 'not logged in|invalid api key|authentication failed' },
+        # Measured 2026-09-15 (fleet-runs\ws-PLAY-COUNTERS-CPU-B-20260915T080318Z): the claude CLI's
+        # token expired after an account rotation; envelope is_error=true, api_error_status=null.
+        @{ kind = 'provider-auth';        rx = 'failed to authenticate|oauth session expired' }
     )
     foreach ($p in $patterns) { if ($Line -imatch $p.rx) { return $p.kind } }
     return $null
@@ -54,6 +57,57 @@ function New-RefusalRecord {
         default                { 'unclassified provider error; read the matched line' }
     }
     return [ordered]@{ kind = $Kind; engine = $Engine; match = $Match.Trim(); retryAfter = $retry; remedy = $remedy }
+}
+
+function Find-ClaudeResultEnvelope {
+    param([AllowEmptyString()][AllowNull()][string]$Answer)
+    if ([string]::IsNullOrWhiteSpace($Answer)) { return $null }
+    foreach ($ln in ($Answer -split "`r?`n")) {
+        $t = $ln.Trim()
+        if ($t.Length -eq 0) { continue }
+        $cand = $null
+        try { $cand = $t | ConvertFrom-Json -ErrorAction Stop } catch { continue }
+        if ($null -eq $cand -or $cand -isnot [System.Management.Automation.PSCustomObject]) { continue }
+        $candNames = @($cand.PSObject.Properties.Name)
+        if (-not ($candNames -contains 'type') -or [string]$cand.type -ne 'result') { continue }
+        return $cand
+    }
+    return $null
+}
+
+# Get-LaneWorkEvidence: POSITIVE evidence that the lane finished its work, never "the process ended".
+# Incident 2026-09-14 (fleet-runs\ws-PLAY-COUNTERS-CPU-20260914T151951Z): exitCode 1, envelope
+# is_error=true subtype=error_max_turns terminal_reason=max_turns -- and the receipt said
+# state=complete, complete=true, because both fields only recorded that the child had exited.
+# workCompleted is $true only when: exit code 0 AND (codex: nothing more is observable) or
+# (claude: a result envelope exists with is_error=false, subtype=success and terminal_reason
+# absent or 'completed'). A missing envelope on the claude engine is NOT evidence of completion.
+function Get-LaneWorkEvidence {
+    param(
+        [string]$Engine = 'unknown',
+        [AllowEmptyString()][AllowNull()][string]$Answer = '',
+        [int]$ExitCode = -999
+    )
+    $rec = [ordered]@{ workCompleted = $false; reason = $null; subtype = $null; terminalReason = $null; isError = $null }
+    if ($Engine -eq 'claude') {
+        $j = Find-ClaudeResultEnvelope -Answer $Answer
+        if ($null -ne $j) {
+            $names = @($j.PSObject.Properties.Name)
+            if ($names -contains 'subtype') { $rec.subtype = [string]$j.subtype }
+            if ($names -contains 'terminal_reason') { $rec.terminalReason = [string]$j.terminal_reason }
+            if ($names -contains 'is_error') { $rec.isError = [bool]$j.is_error }
+        }
+    }
+    if ($ExitCode -ne 0) { $rec.reason = "exit-code-$ExitCode"; return $rec }
+    if ($Engine -eq 'claude') {
+        if ($null -eq $rec.isError -and $null -eq $rec.subtype) { $rec.reason = 'no-result-envelope'; return $rec }
+        if ($null -eq $rec.isError) { $rec.reason = 'envelope-is-error-absent'; return $rec }
+        if ($rec.isError -ne $false) { $rec.reason = 'envelope-is-error'; return $rec }
+        if ($rec.subtype -ne 'success') { $rec.reason = "subtype-$($rec.subtype)"; return $rec }
+        if ($rec.terminalReason -and $rec.terminalReason -ne 'completed') { $rec.reason = "terminal-reason-$($rec.terminalReason)"; return $rec }
+    }
+    $rec.workCompleted = $true
+    return $rec
 }
 
 function Get-ProviderRefusal {
@@ -77,18 +131,7 @@ function Get-ProviderRefusal {
         # the diagnostic came first and hid a later real one. --output-format json's envelope always
         # carries "type":"result" (see REAL_CLAUDE_429_ENVELOPE / CLAUDE_SUCCESS_QUOTING_ENVELOPE in
         # the tests); require that exact shape so an unrelated JSON blob is never mistaken for it.
-        $j = $null
-        foreach ($ln in ($Answer -split "`r?`n")) {
-            $t = $ln.Trim()
-            if ($t.Length -eq 0) { continue }
-            $cand = $null
-            try { $cand = $t | ConvertFrom-Json -ErrorAction Stop } catch { continue }
-            if ($null -eq $cand -or $cand -isnot [System.Management.Automation.PSCustomObject]) { continue }
-            $candNames = @($cand.PSObject.Properties.Name)
-            if (-not ($candNames -contains 'type') -or [string]$cand.type -ne 'result') { continue }
-            $j = $cand
-            break
-        }
+        $j = Find-ClaudeResultEnvelope -Answer $Answer
         if ($null -eq $j) { return $null }
         $names = @($j.PSObject.Properties.Name)
         $isError = ($names -contains 'is_error') -and ($j.is_error -eq $true)
@@ -96,6 +139,9 @@ function Get-ProviderRefusal {
         if (-not $isError -and $status -eq '') { return $null }
         $msg  = if ($names -contains 'result') { [string]$j.result } else { '' }
         $kind = Get-RefusalKind -Line $msg
+        # Result TEXT never classifies a successful envelope (sol PR #117 BLOCKER): with is_error=false only
+        # the numeric 429 status counts. 134 recorded envelopes never pair is_error=false with a status.
+        if (-not $isError) { $kind = $null }
         if ($null -eq $kind -and $status -eq '429') { $kind = 'provider-rate-limit' }
         if ($null -eq $kind) { return $null }
         return New-RefusalRecord -Kind $kind -Engine $Engine -Match ("api_error_status=$status " + $msg)

@@ -188,6 +188,7 @@ drive letter that does not exist), never the board, and they SKIP rather than pr
 import datetime
 import hashlib
 import importlib.util
+import inspect
 import json
 import os
 import re
@@ -578,6 +579,7 @@ READONLY_AUTH_STATUS = " ".join(("claude", "au" + "th", "status"))
 # the board root, which is where hook evolution is authored.
 NA10_SETTINGS = "{REPO}/.claude/settings.json"
 NA10_HOOK_SCRIPT = "{REPO}/tools/hooks/mlv-never-authorized.py"
+NA10_VERIFIER = "{REPO}/tools/gates/verify_consented_footage.py"
 NA10_UNRELATED = "{REPO}/src/mlv/video_mlv.c"
 NA10_NEW_TEXT = "# rewritten by the lane this gate governs\n"
 
@@ -3365,8 +3367,20 @@ CASES = [
         "fixture": "venue_at_worktree",
     },
     {
+        # NA4-OWNER-CONSENTED-FOOTAGE-1 round 3 (E): the consent table's content verifier is
+        # the fourth gate tail.  A lane that rewrites it rewrites the content half of NA-4.
+        "name": "na10 lane rewrites the consented footage verifier",
+        "group": "na10",
+        "tool": "Write",
+        "input": {"file_path": NA10_VERIFIER, "content": NA10_NEW_TEXT},
+        "expect": "DENY",
+        "na": "NA-10",
+        "reason_contains": "OWN gate",
+        "fixture": "venue_at_worktree",
+    },
+    {
         # THE CONTROL.  An ordinary source edit in the same worktree at the same venue: NA-10
-        # is about three files, not about a lane's right to edit code.
+        # is about four files, not about a lane's right to edit code.
         "name": "na10 control unrelated worktree edit at a lane venue",
         "group": "na10",
         "tool": "Edit",
@@ -6058,10 +6072,15 @@ class MlvNeverAuthorizedHookTests(unittest.TestCase):
         # persistent verbs covered, plus the in-process `$env:` ALLOW control that keeps the
         # rule about PERSISTENCE.  `na10` is the hub extension: two DENY writes at a lane
         # venue, the same two ALLOW at the board venue, the shell arm, and the unrelated-file
-        # control that keeps it about the GATE and not about the worktree.
+        # control that keeps it about the GATE and not about the worktree.  `na10` grew 6 -> 7
+        # at NA4-OWNER-CONSENTED-FOOTAGE-1 round 3 (E): the consent verifier's DENY row.
         self.assertEqual(counts.get("na3"), 5, "5 NA-3 claude-auth rows")
         self.assertEqual(counts.get("na3_persistent"), 6, "6 NA-3 O129 persistent-scope rows")
-        self.assertEqual(counts.get("na10"), 6, "6 NA-10 self-edit rows")
+        self.assertEqual(counts.get("na10"), 7, "7 NA-10 self-edit rows")
+        # `na11` is NEW at register v27 via #107 (Agent Bridge SoT suspend, owner ruling
+        # 2026-09-09): three DENY writes at a lane venue (Write, nested Edit, shell
+        # Set-Content), one DENY at the BOARD venue (NA-11 has no venue unlock), and the
+        # agents/ SoT-doc ALLOW control that keeps the rule about the package path.
         self.assertEqual(counts.get("na11"), 5, "5 NA-11 agent-bridge SoT rows")
         # PINNED, NEW at the thirteenth commit (S131): a NEW group, 3 rows -- the `setx.exe`
         # credential-prefix bypass, the `setx.exe` persistent-name bypass, and the fully
@@ -6847,6 +6866,1016 @@ class EnableCompoundIsFailClosedTests(unittest.TestCase):
         self.assertFalse(
             os.path.exists(self.marker), "the marker should be gone" + detail
         )
+
+
+# ------------------------------------ NA4-OWNER-CONSENTED-FOOTAGE-1: the consent record
+#
+# ROUND 6 (NARROW).  Rounds 1-5 tested an exception (3) that admitted a consented path named in
+# command text; that admission is removed, and with it every row of its machinery (the
+# literal-token allowlist, the whole-shell-word span test, ``is_owner_consented_path``).  The
+# frozen ``OWNER_CONSENTED_FOOTAGE`` table stays as the consent record, value-pinned here, and a
+# consented-footage path in command text is DENIED by NA-4 like any other footage path.  Every
+# row uses synthetic, extension-free names under a synthetic CLIP CACHE root -- NA-4 treats the
+# cache root as footage exactly as it treats a clip extension -- and an injected fixture table
+# whose path hashes are computed from the hook's own ``norm``, so the DENY rows run against a
+# table under which each path WOULD have been consented.  No row reads real footage.
+
+CONSENTED_IDS_PINNED = (
+    "M16-1243",
+    "M16-1327",
+    "M16-1347",
+    "M17-1207",
+    "M15-1320",
+    "M16-1210",
+)
+# sha256 of the raw JSONL line bytes EXCLUDING the line terminator.
+OWNER_CONSENT_LINE = 1739
+OWNER_CONSENT_LINE_SHA256 = "461af7a5291099e009230a8abcfe547e064435287a23f40cf93e5ba4ddb0a066"
+OWNER_CONSENT_QUESTION_LINE = 1718
+OWNER_CONSENT_QUESTION_LINE_SHA256 = (
+    "88484275b4ef158bdaf0a98a3755c70fb65be34c514ae406c6603446dee4a38a"
+)
+OWNER_DIRECTIVE_LINE = 2137
+OWNER_DIRECTIVE_LINE_SHA256 = "254075c85a821758067f7d37dbc5a26a05ae8e2a2368f1e02af0fa2110ac8e41"
+REGISTER_DOC = os.path.join(REPO_ROOT, "docs", "never-authorized.json")
+# ROUND 3 (A; sol BLOCKER, fable MAJOR).  The VALUES of the frozen table, pinned: the sha256 of
+# `_canonical_consent_table` over the WHOLE table (ids, per-part length, content sha256 and
+# path_norm_sha256, part counts, purposes and citations), and each id's part count.  An
+# in-place hash swap or an appended part row changes the digest; the latter also a count.
+OWNER_CONSENT_TABLE_SHA256 = "38a4e60b7f4e1a484d361d175d839314c87d49063adb5760ac3a9f07aa9c860a"
+OWNER_CONSENT_PART_COUNTS = {
+    "M16-1243": 2,
+    "M16-1327": 2,
+    "M16-1347": 2,
+    "M17-1207": 2,
+    "M15-1320": 2,
+    "M16-1210": 2,
+}
+
+
+def _plain_consent_value(value):
+    """Mapping proxies and tuples -> plain dicts and lists, so the table serialises as JSON."""
+    if hasattr(value, "items") and hasattr(value, "keys"):
+        return {str(key): _plain_consent_value(item) for key, item in value.items()}
+    if isinstance(value, (tuple, list)):
+        return [_plain_consent_value(item) for item in value]
+    return value
+
+
+def _canonical_consent_table(table):
+    """-> the canonical UTF-8 serialisation the pinned digest is taken over."""
+    return json.dumps(
+        _plain_consent_value(table), sort_keys=True, separators=(",", ":"), ensure_ascii=True
+    ).encode("utf-8")
+
+
+def _normalised_claim_prose(text):
+    """-> one lowercase line: ``#`` markers dropped, every whitespace run collapsed to a space.
+
+    ROUND 8.  Round 6's overclaim survived round 7 inside ``rule_na4``'s own comment as the
+    PARAPHRASE "reached only through", which walked straight past a literal, case-sensitive
+    anti-needle for "reachable ONLY through" -- and it was split across two ``#`` lines, so even
+    the right spelling would have needed the right wrap point.  Normalising first removes all
+    three escapes at once: case, line wrapping and the comment marker.
+    """
+    flat = re.sub(r"(?m)^[ \t]*#[ \t]?", " ", text)
+    return re.sub(r"\s+", " ", flat).lower()
+
+
+# One exclusivity claim about consented footage: the SUBJECT, then ``only``, then a route
+# preposition, all inside one sentence.  A literal ``.`` ends the window, which is deliberately
+# conservative -- a period inside a path (``verify_consented_footage.py``) or a version number
+# closes it early, so this UNDER-matches rather than firing on honest neighbouring prose.
+_EXCLUSIVE_ROUTE_CLAIM_RX = re.compile(
+    r"\bconsented[ -](?:footage|clips?|parts?|paths?)\b"
+    r"(?:(?!\.)[\s\S]){0,140}?"
+    r"\bonly\b"
+    r"(?:(?!\.)[\s\S]){0,60}?"
+    r"\b(?:through|via|by|with|using|from)\b"
+)
+
+# Spellings that assert exclusivity without naming the subject nearby, so the regex above
+# cannot see them.  Matched against NORMALISED prose, hence all lowercase and single-spaced.
+_EXCLUSIVE_ROUTE_PHRASINGS = (
+    "reachable only through", "reachable only via", "reachable only by",
+    "reached only through", "reached only via", "reached only by",
+    "accessible only through", "accessible only via",
+    "available only through", "available only via",
+    "opened only through", "opened only via", "opened only by",
+    "only reachable through", "only reached through", "only reachable via",
+    "only through tracked", "only via tracked", "only by tracked",
+    "only through id-addressed", "only via id-addressed", "only by id-addressed",
+)
+
+
+def _assert_no_exclusive_route_claim(case, text, label):
+    """Fail if ``text`` claims consented footage is reachable ONLY through the card's route.
+
+    WHAT THIS CATCHES: the claim re-cased, re-wrapped across
+    comment lines, or reworded with one of the subject/verb/preposition combinations
+    enumerated above ("reached only via", "a consented clip is opened only by tracked
+    consumers"), plus the bounded subject/``only``/route-preposition regex.
+    WHAT IT DOES NOT CATCH: it is a phrasing family, NOT a paraphrase detector.  This is not a
+    caveat on an otherwise-complete check -- an arbitrary paraphrase of the false claim passes,
+    and ROUND 9 pins four that do, by execution, at
+    ``test_the_anti_needle_does_not_catch_an_arbitrary_paraphrase``: "the sole route for
+    consented footage is...", "a consented clip cannot be opened except by...", "there is no
+    other path for...", "nothing besides the verifier can reach...".  A claim whose subject is
+    reworded ("owner-consented media", "the six ids") escapes both the list and the regex, as
+    does one whose subject and ``only`` are separated by a period or by more than 140
+    characters.  It raises the COST of the overclaim; it does not make the overclaim
+    impossible, and no finite list of spellings could.
+    """
+    prose = _normalised_claim_prose(text)
+    for phrasing in _EXCLUSIVE_ROUTE_PHRASINGS:
+        case.assertNotIn(
+            phrasing, prose, "%s: exclusive-route claim %r -- the route is NOT the only way "
+            "in; NA-4 exception (2) still admits a consented clip's own path" % (label, phrasing)
+        )
+    match = _EXCLUSIVE_ROUTE_CLAIM_RX.search(prose)
+    case.assertIsNone(
+        match,
+        "%s: exclusive-route claim %r -- the route is NOT the only way in; NA-4 exception (2) "
+        "still admits a consented clip's own path" % (label, match.group(0) if match else ""),
+    )
+
+
+# ---------------------------------------------------------------- derived carrier coverage
+#
+# ROUND 9.  Round 8 ran the anti-needle over a HAND-MAINTAINED list of four surfaces and was
+# one site short: `tools/profiling/bachelor/playback-attr-3-cuda-job.ps1` carries the same
+# claim surface and was uncovered, so rewording ITS header back to the false claim would have
+# left the whole suite green.  That is the EXACT defect shape of round 7 reappearing inside
+# the mechanism built at round 8 to prevent it -- which is the argument against hand lists,
+# not against that particular list.
+#
+# So coverage is DERIVED: scan the tree for files carrying the claim SUBJECT, and run the
+# needle over whatever comes back.  Nothing is enumerated by hand, so the specific way round
+# 8's list rotted -- somebody forgetting to add a file -- is not how this one rots.
+#
+# ROUND 10.  That is a CHANGE of failure mode, not the removal of one, and round 9 wrote the
+# stronger sentence ("a new carrier cannot be silently uncovered").  What the walk actually
+# does: `_derive_claim_carriers` is a BOUNDED filesystem walk, and a carrier that lands in
+# any of its bounds is absent from the derived set without a word.
+#
+# ROUND 11.  Round 10 wrote "FOUR `continue` paths ... all four, named", and BOTH halves of
+# that were wrong: (b) below is a `dirnames[:]` filter rather than a `continue` and was
+# counted into that total, and the `os.walk` defaults tagged (f) and (g) below skip carriers
+# and appeared in NO disclosure, here or in the PR body.  So the closure framing is GONE.
+#
+#   (a) [continue] its extension is not in `_CARRIER_SUFFIXES` -- a `.rst`, `.adoc` or
+#       extensionless carrier is invisible;
+#   (b) [dirnames filter, NOT a `continue`] it is under a pruned directory
+#       (`_CARRIER_PRUNE_DIRS`), notably `.claude-state/` and `worktrees/`;
+#   (c) [continue] it is larger than `_CARRIER_MAX_BYTES`;
+#   (d) [continue] reading it raises `OSError` or `UnicodeDecodeError` -- a non-UTF-8 carrier
+#       is skipped;
+#   (e) BEFORE any of those, `_CLAIM_SUBJECT_RX` matches a LITERAL subject family, so a file
+#       that words the subject differently ("owner-consented media", "the six ids") is not
+#       found however plainly it asserts the claim;
+#   (f) `os.walk(root)` takes the default `onerror=None`, so an `OSError` raised while
+#       SCANNING a directory -- permission denied, a vanished path, a long-path failure --
+#       is swallowed and that whole subtree contributes nothing, with no exception and no
+#       record.  This is NOT the (d) skip: (d) loses one file and this loses a subtree;
+#   (g) `os.walk(root)` takes the default `followlinks=False`, so a carrier reachable only
+#       through a symlinked directory is never visited.
+# A further bound on (e), which round 10 left unsaid: `_CLAIM_SUBJECT_RX` is matched against
+# the file's RAW text, so a carrier whose only subject mention is broken across two lines --
+# "consented" ending one comment line and "footage" opening the next -- never matches and the
+# needle never runs over it, even though `_normalised_claim_prose` would join those lines if
+# it were handed them.  DISCLOSED, NOT FIXED: reflow handling would be a new mechanism, and
+# this round adds none.
+# `_CLAIM_CARRIERS_PINNED` is NOT a backstop for any of these.  It is an equality test between
+# the derived set and a frozen copy of it; a file that never entered the derived set never
+# enters either side, so the equality stays true and nothing reds.  The pin catches a new
+# carrier THE WALK SEES.  It is blind to precisely what the walk is blind to.
+_CLAIM_SUBJECT_RX = re.compile(r"consented[ -](?:footage|clips?|parts?|paths?)", re.I)
+_CARRIER_PRUNE_DIRS = frozenset({
+    ".git", ".claude-state", "node_modules", "__pycache__", ".mypy_cache", ".pytest_cache",
+    "worktrees",
+})
+# Text the claim could plausibly be written in; skip (a) above.
+_CARRIER_SUFFIXES = (
+    ".py", ".ps1", ".psm1", ".json", ".md", ".txt", ".yml", ".yaml", ".sh", ".cpp", ".h",
+    ".hpp", ".c", ".pro", ".qrc", ".ui", ".bat", ".cmd", ".mjs", ".js", ".toml",
+)
+_CARRIER_MAX_BYTES = 4 * 1024 * 1024
+
+
+def _derive_claim_carriers(root=REPO_ROOT):
+    """-> sorted repo-relative paths of the carriers THIS WALK SEES, by the bounds above.
+
+    Not a hand list.  It is a
+    SEARCH, not a census: bounded by the subject regex and by the bounds documented above,
+    and a carrier outside those bounds is returned by neither this walk nor the pin it feeds.
+    """
+    found = []
+    for dirpath, dirnames, filenames in os.walk(root):
+        dirnames[:] = [name for name in dirnames if name not in _CARRIER_PRUNE_DIRS]
+        for name in filenames:
+            if not name.lower().endswith(_CARRIER_SUFFIXES):
+                continue
+            full = os.path.join(dirpath, name)
+            try:
+                if os.path.getsize(full) > _CARRIER_MAX_BYTES:
+                    continue
+                with open(full, "r", encoding="utf-8") as handle:
+                    text = handle.read()
+            except (OSError, UnicodeDecodeError):
+                continue
+            if _CLAIM_SUBJECT_RX.search(text):
+                found.append(os.path.relpath(full, root).replace("\\", "/"))
+    return sorted(found)
+
+
+# The derived set AS PINNED.  This is not the coverage list -- coverage is whatever the
+# derivation returns.  This exists so that a new carrier THE WALK RETURNS fails loudly instead
+# of quietly widening the set the needle is asked to trust.  A carrier the walk does not
+# return reaches neither side of the equality and fails nothing; see the bounds documented
+# above `_derive_claim_carriers`.
+_CLAIM_CARRIERS_PINNED = (
+    "docs/never-authorized.json",
+    "tools/gates/resolve_consented_clip.py",
+    "tools/gates/verify_consented_footage.py",
+    "tools/hooks/mlv-never-authorized.py",
+    "tools/profiling/bachelor/Attr3FootagePresenceJob.psm1",
+    "tools/profiling/bachelor/Attr3FootageStageJob.psm1",
+    "tools/profiling/bachelor/attr3-footage-presence-job.ps1",
+    "tools/profiling/bachelor/playback-attr-3-cuda-job.ps1",
+    "tools/repo_hygiene/test_attr3_footage_presence_job.py",
+    "tools/repo_hygiene/test_mlv_never_authorized.py",
+    "tools/repo_hygiene/test_verify_consented_footage.py",
+)
+
+# The ONE carrier the needle cannot be run over, with the reason.  This module must quote the
+# false claim verbatim -- the round-6 header and the round-7 residual are probe INPUTS at
+# `test_the_anti_needle_catches_the_round_6_and_round_7_residual_spellings`, and an anti-needle
+# that forbade its own test fixtures could never be exercised at all.
+_CARRIER_NEEDLE_EXCLUSIONS = {
+    "tools/repo_hygiene/test_mlv_never_authorized.py":
+        "quotes the false claim as anti-needle probe input; see the `caught` tuple",
+}
+
+
+class OwnerConsentedFootageTests(unittest.TestCase):
+    """NA-4 consent record: frozen and value-pinned; a consented path in command text is DENIED."""
+
+    def setUp(self):
+        self.module = _load_hook_module()
+        self.tmp = tempfile.mkdtemp(prefix="mlv-na4c-")
+        self.addCleanup(shutil.rmtree, self.tmp, True)
+        # SYNTHETIC drive-letter roots, never the temp dir: portable across the ubuntu and
+        # windows legs.  NA-4 decides on strings alone, so nothing here has to exist.
+        self.board = "C:/synthetic-board"
+        self.cache = "C:/synthetic-board/cache"
+        self.part0 = os.path.join(self.cache, "mirror", "consented", "clip-a.part0")
+        self.part1 = os.path.join(self.cache, "mirror", "consented", "clip-a.part1")
+        self.unconsented = os.path.join(self.cache, "mirror", "unconsented", "clip-z.part0")
+        self.saved_env = dict(os.environ)
+        self.addCleanup(self._restore_env)
+        for key in list(os.environ):
+            if key.startswith("MLV_"):
+                del os.environ[key]
+        os.environ["MLV_BOARD_ROOT"] = self.board
+        os.environ["MLV_CLIP_CACHE_ROOT"] = self.cache
+        self.table = self._table({"M16-1243": (self.part0, self.part1)})
+
+    def _restore_env(self):
+        os.environ.clear()
+        os.environ.update(self.saved_env)
+
+    # ------------------------------------------------------------------ fixtures
+
+    def _path_hash(self, path):
+        return hashlib.sha256(self.module.norm(path).encode("utf-8")).hexdigest()
+
+    def _table(self, clips):
+        return {
+            "clips": {
+                clip_id: tuple(
+                    (
+                        index + 1,
+                        hashlib.sha256(b"fixture part %d" % index).hexdigest(),
+                        self._path_hash(path),
+                    )
+                    for index, path in enumerate(paths)
+                )
+                for clip_id, paths in clips.items()
+            },
+            "purposes": ("fixture purpose",),
+            "authority": {},
+        }
+
+    def _decide(self, path, consent="fixture"):
+        consent = self.table if consent == "fixture" else consent
+        saved = self.module.OWNER_CONSENTED_FOOTAGE
+        if consent is not None:
+            self.module.OWNER_CONSENTED_FOOTAGE = consent
+        try:
+            return self.module.decide(
+                {"tool_name": "Bash", "tool_input": {"command": 'mlv_dump -v "%s"' % path}},
+                None,
+            )
+        finally:
+            self.module.OWNER_CONSENTED_FOOTAGE = saved
+
+    def _decide_command(self, command):
+        saved = self.module.OWNER_CONSENTED_FOOTAGE
+        self.module.OWNER_CONSENTED_FOOTAGE = self.table
+        try:
+            return self.module.decide(
+                {"tool_name": "Bash", "tool_input": {"command": command}}, None
+            )
+        finally:
+            self.module.OWNER_CONSENTED_FOOTAGE = saved
+
+    def assertNa4Deny(self, decision):
+        self.assertEqual(decision[0], 2, decision)
+        self.assertTrue(decision[1].startswith("NA-4: "), decision)
+
+    # ---------------------------------------------------------------------- rows
+
+    def test_deny_a_consented_footage_path_in_command_text(self):
+        # ROUND 6 (NARROW).  The fixture table consents `self.part0` and `self.part1` -- their
+        # norm hashes ARE in it -- and NA-4 still denies each one named in command text, in
+        # every spelling, as a whole shell word, alone or joined to a neighbour.  Every row was
+        # an ALLOW at d4bd9721 (exception (3)).  This closes the COMMAND-TEXT route only:
+        # exception (2) still admits a consented clip's own path on the CLIP_OR_NONE line,
+        # with no content check against the table.
+        path = self.part0.replace("\\", "/")
+        self.assertIn(self._path_hash(self.part0), [p[2] for p in self.table["clips"]["M16-1243"]])
+        for spelling in (self.part0, self.part1, self.part1.upper().replace("\\", "/")):
+            with self.subTest(spelling=spelling):
+                self.assertNa4Deny(self._decide(spelling))
+        for command in (
+            "probe %s" % path,
+            'probe "%s"' % path,
+            "probe '%s'" % path,
+            'probe "%s";echo done' % path,
+            '(probe "%s")' % path,
+        ):
+            with self.subTest(command=command):
+                self.assertNa4Deny(self._decide_command(command))
+
+    def test_m02_1344_is_absent_from_the_frozen_consent_record(self):
+        # ROUND 7.  The two NA-4 DENY calls this row used to make were VACUOUS: no hook rule
+        # reads the consent table, so they passed for a reason unrelated to M02-1344 and
+        # would have passed with the table deleted outright.  What is left discriminates --
+        # it goes RED the moment M02-1344 is added to the FROZEN record.
+        self.assertNotIn("M02-1344", self.module.OWNER_CONSENTED_FOOTAGE["clips"])
+
+    def test_the_consent_table_does_not_change_the_na4_decision(self):
+        # ROUND 8.  This row used to be named ...`_deny_any_token_whose_norm_hash_is_absent`
+        # and asserted NOTHING about norm hashes: `setUp` clears every `MLV_*` key, so
+        # `authorized_clip` returns None, `allowed` is None, and every DENY here came from
+        # rule_na4's DEFAULT branch -- the fourth vacuous row, green with the table deleted.
+        #
+        # What replaces it discriminates on the property round 6 actually established: NO HOOK
+        # RULE READS THE TABLE, so a token whose norm hash IS in the table and one whose norm
+        # hash is NOT get the SAME decision, byte for byte, under every table state.  Restore
+        # exception (3) -- the admission rounds 1-5 carried -- and `self.part0` becomes an
+        # ALLOW while `self.unconsented` stays a DENY, and this row goes red.
+        consented_hash = self._path_hash(self.part0)
+        absent_hash = self._path_hash(self.unconsented)
+        table_hashes = [part[2] for part in self.table["clips"]["M16-1243"]]
+        self.assertIn(consented_hash, table_hashes, "fixture precondition: part0 IS consented")
+        self.assertNotIn(absent_hash, table_hashes, "fixture precondition: clip-z is NOT")
+
+        empty = {"clips": {}, "purposes": ("fixture purpose",), "authority": {}}
+        for label, consent in (("fixture table", "fixture"), ("empty table", empty),
+                               ("real frozen table", None)):
+            with self.subTest(table=label):
+                consented = self._decide(self.part0, consent=consent)
+                absent = self._decide(self.unconsented, consent=consent)
+                self.assertNa4Deny(consented)
+                self.assertNa4Deny(absent)
+                # Same exit code and the same reason SHAPE: the two differ only in the path
+                # they name, never in whether the table admitted one of them.
+                self.assertEqual(consented[0], absent[0])
+                self.assertEqual(
+                    consented[1].replace(self.module.norm(self.part0), "<PATH>"),
+                    absent[1].replace(self.module.norm(self.unconsented), "<PATH>"),
+                    "a consented norm hash must not buy a different NA-4 outcome",
+                )
+
+    # ------------------------------------------------------------- values pinned (A)
+
+    def test_the_whole_frozen_table_is_value_pinned(self):
+        table = self.module.OWNER_CONSENTED_FOOTAGE
+        self.assertEqual(
+            hashlib.sha256(_canonical_consent_table(table)).hexdigest(),
+            OWNER_CONSENT_TABLE_SHA256,
+            "the frozen consent table's VALUES changed; a change here is a consent change",
+        )
+        self.assertEqual(
+            {clip_id: len(parts) for clip_id, parts in table["clips"].items()},
+            OWNER_CONSENT_PART_COUNTS,
+        )
+
+    def test_the_pin_sees_a_swapped_hash_and_an_appended_part(self):
+        # The two edits both reviewers named: each would have kept round 2's shape tests green.
+        plain = _plain_consent_value(self.module.OWNER_CONSENTED_FOOTAGE)
+        pinned = hashlib.sha256(_canonical_consent_table(plain)).hexdigest()
+        swapped = json.loads(json.dumps(plain))
+        swapped["clips"]["M16-1243"][0][2] = "f" * 64
+        appended = json.loads(json.dumps(plain))
+        appended["clips"]["M16-1243"].append([1, "a" * 64, "b" * 64])
+        for label, edited in (("swapped path hash", swapped), ("appended part", appended)):
+            with self.subTest(edit=label):
+                self.assertNotEqual(
+                    hashlib.sha256(_canonical_consent_table(edited)).hexdigest(), pinned
+                )
+        self.assertEqual(len(appended["clips"]["M16-1243"]), 3)
+        self.assertNotEqual(OWNER_CONSENT_PART_COUNTS["M16-1243"], 3)
+
+    def test_limits_state_the_value_pin_the_residual_and_the_trailing_dot_gap(self):
+        with open(self.module.__file__, "r", encoding="utf-8") as handle:
+            source = handle.read()
+        for needle in (
+            # Round 6 (NARROW): no command-text admission, and the id-only route.
+            "this hook admits NO consented path from command text",
+            "No rule in this hook reads the table.",
+            "L1. THE ROUTE THIS CARD PROVIDES for consented\n"
+            "# footage is tracked, id-addressed consumers that verify content against this"
+            " table",
+            # ROUND 7: the route this card provides is NOT the only way in.  NA-4 exception (2)
+            # reaches a consented clip today with no content check; CI holds that in place.
+            "THAT IS NOT THE ONLY WAY A\n"
+            "# CONSENTED CLIP CAN BE OPENED TODAY.",
+            "NA-4 exception (2) admits the ONE canonical path on the\n"
+            "# card's CLIP_OR_NONE line, and NOTHING EXCLUDES A CONSENTED CLIP'S OWN PATH"
+            " FROM IT",
+            # ROUND 8 (minor): the LIMITS block carries two numberings.  They are kept apart,
+            # and the rule that keeps them apart is stated where they meet.
+            "TWO NUMBERINGS MEET IN THIS BLOCK AND ARE KEPT",
+            "the limits below are labelled L1..L6, and the NA-4 exceptions keep their own (1)"
+            " and",
+            # The honesty statement: scope, not exposure; the interpreter residual stands.
+            "L2. THE NARROWING REDUCES\n# SCOPE, NOT EXPOSURE.",
+            "The interpreter-one-liner residual is UNCHANGED:",
+            "so such a one-liner can open\n# any path, consented or not,",
+            "VALUE-pinned by tests",
+            "A board-rooted actor can still edit the table transiently:",
+            "bounded by the NA-10 venue gate and the 0.05\n# hook-enforced receipt that Invoke-Lane checks.",
+            "until then the CUDA job generator refuses every owner-clip id.",
+            "L5. NA-4 clip detection does not strip trailing dots or spaces from a clip name outside the\n"
+            "# cache",
+            "NA4-CLIP-NAME-TRIM-1",
+            "L6. NA-4 exceptions (1) and (2) still compare the EXPANDED token,",
+            "NA4-EXC12-LITERAL-TOKENS-1",
+            # ROUND 8: rule_na4's OWN comment carries the disclosure, beside the `continue`
+            # that refutes the overclaim.  Round 7 fixed the header block and left this one.
+            "THAT IS NOT THE ONLY WAY A CONSENTED CLIP CAN BE OPENED TODAY: the NA-4"
+            " exception (2)\n"
+            "        # ``continue`` DIRECTLY ABOVE admits a consented clip's own path on the"
+            " CLIP_OR_NONE\n"
+            "        # line, with NO content check against the table and by no id-addressed"
+            " consumer.",
+        ):
+            with self.subTest(needle=needle):
+                self.assertIn(needle, source)
+        # ROUND 9 (was: "must not come back IN ANY SPELLING").  That was an OVERCLAIM about
+        # an anti-overclaim needle, and sol disproved it by execution: four ordinary
+        # paraphrases walked straight through.  What this actually catches is the round-6 and
+        # round-7 spellings re-cased, re-wrapped or re-worded WITHIN the enumerated phrase
+        # family, plus the bounded subject/``only``/preposition regex.  An
+        # arbitrary paraphrase passes, by construction and for good: a finite list of
+        # forbidden spellings can never be "any spelling", and enlarging the list each time a
+        # reviewer finds a new one has no end.  The bound is pinned by execution at
+        # ``test_the_anti_needle_does_not_catch_an_arbitrary_paraphrase``.
+        _assert_no_exclusive_route_claim(self, source, "hook source")
+        verifier = os.path.join(REPO_ROOT, "tools", "gates", "verify_consented_footage.py")
+        with open(verifier, "r", encoding="utf-8") as handle:
+            _assert_no_exclusive_route_claim(self, handle.read(), "verify_consented_footage.py")
+        # The removed machinery is gone, not dormant.
+        for removed in (
+            "is_owner_consented_path", "is_literal_canonical_token", "is_whole_shell_word",
+            "token_spans", "_consented_path_norm_hashes",
+        ):
+            with self.subTest(removed=removed):
+                self.assertFalse(hasattr(self.module, removed), removed)
+
+    def test_the_anti_needle_catches_the_round_6_and_round_7_residual_spellings(self):
+        # ROUND 8.  An anti-needle nobody exercised is the same defect as a vacuous DENY row:
+        # round 7's literal `assertNotIn("Consented footage is reachable ONLY through", ...)`
+        # was green while the claim sat four lines away in another spelling.  This row feeds
+        # the anti-needle the ACTUAL round-6 text, the ACTUAL round-7 residual, and several
+        # rewordings, and requires each to FAIL -- and requires today's honest text to pass.
+        caught = (
+            # Round 6, as the header block carried it.
+            "# Consented footage is reachable ONLY through tracked, id-addressed consumers.",
+            # Round 7's surviving residual at rule_na4:3496, wrapped exactly as it was.
+            "        # denied here exactly as on master.  Consented footage is reached only"
+            " through tracked,\n"
+            "        # id-addressed consumers that verify content against"
+            " OWNER_CONSENTED_FOOTAGE.",
+            # Rewordings of the same false claim.
+            "a consented clip is opened only by tracked, id-addressed consumers",
+            "consented footage is accessible only via the verifier",
+            "CONSENTED FOOTAGE IS REACHED ONLY THROUGH THE CARD'S ROUTE",
+            "consented parts are available only through id-addressed consumers",
+        )
+        for text in caught:
+            with self.subTest(text=text[:60]):
+                with self.assertRaises(AssertionError):
+                    _assert_no_exclusive_route_claim(self, text, "probe")
+        # And the honest disclosures the card actually ships must NOT trip it.
+        for text in (
+            "THAT IS NOT THE ONLY WAY A CONSENTED CLIP CAN BE OPENED TODAY.",
+            "The route this card provides for consented footage is tracked, id-addressed"
+            " consumers that verify content against tools/gates/verify_consented_footage.py",
+            "a consented clip named there is opened with NO content check against this table"
+            " and by no id-addressed consumer, exactly as before this card.",
+        ):
+            with self.subTest(honest=text[:60]):
+                _assert_no_exclusive_route_claim(self, text, "probe")
+
+    def test_the_anti_needle_runs_over_the_carriers_the_walk_returns(self):
+        # ROUND 9.  Round 8's needle ran over four HAND-LISTED surfaces and missed
+        # `playback-attr-3-cuda-job.ps1`, which carries the same claim surface -- the round-7
+        # defect shape, reappearing inside the round-8 mechanism built to prevent it.  Coverage
+        # is now DERIVED: the needle runs over whatever the scan returns, not over what
+        # somebody remembered to list.
+        #
+        # ROUND 10.  Round 9 wrote that as "the failure mode it exhibited is not available".
+        # One failure mode is traded for another: this row covers THE CARRIERS THE WALK FINDS,
+        # and the walk has the bounds documented above `_derive_claim_carriers`.  A carrier in
+        # any of them is covered by neither this loop nor the pin.
+        carriers = _derive_claim_carriers()
+        # FAIL LOUDLY on a new carrier THE WALK RETURNED -- which, quoted on its own, is
+        # narrower than "a new carrier": a carrier inside the bounds documented above
+        # `_derive_claim_carriers` reaches neither side of this equality and fails nothing.
+        # Within that scope: not because a new
+        # carrier is wrong, but because it must be looked at, since silently widening the
+        # derived set is how a hand list rots without anyone noticing.
+        self.assertEqual(
+            carriers, list(_CLAIM_CARRIERS_PINNED),
+            "the set of files carrying the consented-route claim changed.  Read the new "
+            "carrier, confirm it does not assert the false exclusivity claim, then update "
+            "_CLAIM_CARRIERS_PINNED.  Do NOT add it to an exclusion list to make this pass.",
+        )
+        for rel in carriers:
+            if rel in _CARRIER_NEEDLE_EXCLUSIONS:
+                continue
+            with self.subTest(carrier=rel):
+                with open(os.path.join(REPO_ROOT, rel), "r", encoding="utf-8") as handle:
+                    _assert_no_exclusive_route_claim(self, handle.read(), rel)
+        # The exclusion is a real hole, so it is named, reasoned, and held to ONE entry: a
+        # growing exclusion list would be the hand list again, wearing a different hat.
+        self.assertEqual(len(_CARRIER_NEEDLE_EXCLUSIONS), 1)
+        self.assertIn("tools/repo_hygiene/test_mlv_never_authorized.py",
+                      _CARRIER_NEEDLE_EXCLUSIONS)
+        # ROUND 10 (opus).  This is a LANDMARK, and it used to be commented "genuinely
+        # covered, not merely listed" -- which is the one thing it does NOT show.  The
+        # `assertEqual` four lines up already contains this path, so this line can never fail
+        # independently; what it records is that round 8's missed carrier is in the derived
+        # set.  COVERAGE comes from the loop above, and the only evidence the loop bites is the
+        # mutation that rewords this file's header back to the false claim and reds this row.
+        self.assertIn("tools/profiling/bachelor/playback-attr-3-cuda-job.ps1", carriers)
+
+    def test_the_anti_needle_does_not_catch_an_arbitrary_paraphrase(self):
+        # ROUND 9.  Round 8 shipped the needle under the heading "the overclaim must not come
+        # back IN ANY SPELLING", and the PR body called it something "a reword cannot pass".
+        # Both were overclaims ABOUT AN ANTI-OVERCLAIM NEEDLE, and sol disproved them by
+        # running four ordinary paraphrases through the helper: all four returned clean.
+        #
+        # The remedy is the one this card already applied to its own subject matter -- state
+        # the limit honestly -- NOT a longer list.  Adding these four spellings and re-claiming
+        # completeness would be the same error one round later: a finite list of forbidden
+        # spellings can never be "any spelling", and paraphrase has no end.
+        #
+        # So this row pins the LIMIT ITSELF.  Each paraphrase below asserts the SAME false
+        # claim the needle exists to kill, and each MUST pass the needle.  If a later round
+        # enlarges the phrase family to swallow one of THESE FOUR STRINGS, this row goes RED.
+        # It pins four specific escapes, not the
+        # existence of escapes -- a round that widened the family around all four would leave
+        # this row green, and the disclosure would then be wrong with nothing to say so.
+        escapes = (
+            "The sole route for consented footage is the tracked verifier",
+            "A consented clip cannot be opened except by an id-addressed consumer",
+            "There is no other path for opening consented clips",
+            "Nothing besides the verifier can reach a consented clip",
+        )
+        for text in escapes:
+            with self.subTest(escapes=text[:60]):
+                # Not assertRaises: the POINT is that nothing is raised.
+                _assert_no_exclusive_route_claim(self, text, "paraphrase probe")
+        # And the documented bound must actually say so, so the code and the prose cannot
+        # drift apart the way the heading and the docstring did at round 8.
+        doc = _assert_no_exclusive_route_claim.__doc__
+        self.assertIn("NOT a paraphrase detector", doc)
+        self.assertIn("no finite list of spellings could", doc)
+
+    def test_no_subprocess_on_the_na4_path(self):
+        cases = (self.part0, self.part1, self.unconsented, os.path.join(self.tmp, "x.txt"))
+        baseline = [self._decide(path) for path in cases]
+
+        def refuse(*args, **kwargs):
+            raise AssertionError("NA-4 must not start a process")
+
+        patched = [
+            (subprocess, "Popen"), (subprocess, "run"), (subprocess, "check_output"),
+            (os, "system"), (os, "popen"),
+        ]
+        saved = [(owner, name, getattr(owner, name)) for owner, name in patched]
+        for owner, name in patched:
+            setattr(owner, name, refuse)
+        try:
+            refused = [self._decide(path) for path in cases]
+        finally:
+            for owner, name, value in saved:
+                setattr(owner, name, value)
+        self.assertEqual(refused, baseline)
+        # ROUND 9 (SIXTH vacuous row, found by the ablation at
+        # `test_the_discovered_decision_rows_discriminate_on_consent_status`, not by hand).
+        # These two
+        # lines used to read `assertEqual(baseline[0][0], 2)  # round 6: a consented path is
+        # denied too` and `assertEqual(baseline[2][0], 2)`.  Both passed for a reason unrelated
+        # to consent: `setUp` clears every `MLV_*` key, so `allowed` is None and EVERY path
+        # here is denied by rule_na4's default branch.  Re-point `self.part0` at an unconsented
+        # path and both stayed green -- so the trailing comment claimed a consent-dependent
+        # property the assertions never tested.
+        #
+        # What replaces them discriminates the same way :7031 does: the consented and the
+        # unconsented path must get the SAME decision shape.  Restore exception (3) and
+        # `baseline[0]` becomes an ALLOW while `baseline[2]` stays a DENY, and this goes red.
+        #
+        # The PRECONDITION is what makes the comparison mean anything, and its absence is what
+        # made the old lines vacuous: without it, "these two paths get the same decision" is
+        # true of any two paths whatever.
+        table_hashes = [part[2] for part in self.table["clips"]["M16-1243"]]
+        self.assertIn(self._path_hash(self.part0), table_hashes, "part0 IS consented")
+        self.assertNotIn(self._path_hash(self.unconsented), table_hashes, "clip-z is NOT")
+        consented, unconsented = baseline[0], baseline[2]
+        self.assertNa4Deny(consented)
+        self.assertNa4Deny(unconsented)
+        self.assertEqual(
+            consented[1].replace(self.module.norm(self.part0), "<PATH>"),
+            unconsented[1].replace(self.module.norm(self.unconsented), "<PATH>"),
+            "a consented norm hash must not buy a different NA-4 outcome on the no-subprocess"
+            " path either",
+        )
+        self.assertFalse(hasattr(self.module, "_read_merged_output_budget"))
+        self.assertNotIn("subprocess", vars(self.module))
+
+    def test_the_real_hook_process_denies_a_cache_path_as_a_separate_process(self):
+        # ROUND 9 (FIFTH vacuous row -- opus, round 8).  This was named
+        # ..._denies_an_unconsented_cache_path and fed `self.part0`, the path every other row
+        # in this class calls CONSENTED.  It passed for a reason unrelated to the word
+        # "unconsented" in its name: `setUp` clears every `MLV_*` key, so `authorized_clip`
+        # returns None and the DENY comes from rule_na4's default branch.  Deleting
+        # OWNER_CONSENTED_FOOTAGE outright left it green.
+        #
+        # KEPT, not deleted: its property is end-to-end -- the REAL hook, as a separate
+        # process, exits 2 with an "NA-4: " reason, so the in-process `decide()` rows are not
+        # testing a different code path than production.
+        #
+        # ROUND 12 (sol).  Round 9 wrote that as "end-to-end AND NOTHING ELSE COVERS IT", and
+        # the added clause is FALSE.  The table-driven rows at the top of this module run the
+        # REAL hook as a separate process through `_invoke`, and `_run_case` asserts
+        # returncode 2, exactly one stderr line, and that the line starts with the row's own
+        # `na` id -- so "r1 open an unnamed clip" and "na4 same basename different clip",
+        # both `"na": "NA-4"` with `"expect": "DENY"`, already assert that the real hook, in
+        # a separate process, exits 2 with an "NA-4: " reason.  The clause is DELETED rather
+        # than narrowed.
+        #
+        # ROUND 10 (sol) -- DISCLOSED, NOT FIXED, and here is which and why.  Round 9 renamed
+        # this row `..._whatever_its_consent_status` and added the fixture precondition below,
+        # which made the vacuity enumeration call it discriminating.  IT IS NOT, and this
+        # round did not make it so.  The subprocess loads the hook fresh and reads the REAL
+        # frozen table; `self.table` exists only in THIS process and is never passed to the
+        # child (the call passes argv, env, `cwd=self.tmp` and a JSON payload on stdin --
+        # read the `subprocess.run` below rather than this parenthesis).  Under the
+        # child's own table NEITHER `self.part0` NOR `self.unconsented` is consented, so the
+        # two iterations below are two UNCONSENTED paths and the row observes exactly one
+        # consent status, whatever its name said.
+        #
+        # ROUND 11 -- WHAT THE PATH-HASH FACT ACTUALLY SUPPORTS.  Round 10 argued: the real
+        # table stores sha256 path hashes and no paths, THEREFORE no input the child would
+        # call consented can be constructed from it.  The premise is true; the conclusion does
+        # not follow from it.  What follows is only that a consented path cannot be RECOVERED
+        # FROM THE TABLE, sha256 not being invertible.  It does NOT follow that no such path
+        # exists: the six consented clips are real files with real paths, and a row handed one
+        # of them WOULD be consented in the child.  What actually blocks that here is narrower,
+        # and is a fact about scope rather than an impossibility -- those paths are the owner's
+        # footage, deliberately absent from the repo and from this fixture, and materialising
+        # one is not something this card does.  A table-injection seam would be the other
+        # route, and that is executable hook behaviour this card may not change.  So: NOT FIXED
+        # HERE, on scope.  NOT proven unfixable.
+        #
+        # So the row is moved to `_CONSENT_AGNOSTIC_DECIDERS` below, which is what that escape
+        # hatch is for, and it now promises only what it shows: the real hook, in a separate
+        # process, denies a cache path.  The two-path loop is kept because it does show that
+        # two DIFFERENT cache paths get the same outcome shape from the real process -- which
+        # is worth having and is not a consent property.
+        # ROUND 10.  The paragraph above is a claim about the child, so it is ASSERTED rather
+        # than only written down: under the module's REAL frozen table -- the one the child
+        # loads -- NEITHER of these two paths is consented.  If a later round ever makes one of
+        # them genuinely consented in the child, this goes RED and the disclosure above has to
+        # be rewritten instead of quietly becoming false.
+        real_path_hashes = {
+            part[2]
+            for parts in self.module.OWNER_CONSENTED_FOOTAGE["clips"].values()
+            for part in parts
+        }
+        for label, path in (("part0", self.part0), ("unconsented", self.unconsented)):
+            with self.subTest(child_table=label):
+                self.assertNotIn(
+                    self._path_hash(path), real_path_hashes,
+                    "%s is consented under the REAL table, so this row now DOES observe two "
+                    "consent statuses in the child -- rewrite the ROUND 10 note and reconsider "
+                    "the _CONSENT_AGNOSTIC_DECIDERS entry" % label,
+                )
+        # The labels below are the PARENT fixture's names for these paths.  The child consents
+        # neither; see the ROUND 10 note above, now backed by the assertion just made.
+        outcomes = {}
+        for label, path in (("consented", self.part0), ("unconsented", self.unconsented)):
+            env = dict(os.environ)
+            env.pop("CLAUDE_PROJECT_DIR", None)
+            env["PYTHONIOENCODING"] = "utf-8"
+            payload = json.dumps(
+                {"tool_name": "Bash", "tool_input": {"command": 'mlv_dump -v "%s"' % path}}
+            )
+            refused = subprocess.run(
+                [sys.executable, HOOK], input=payload, capture_output=True, text=True,
+                encoding="utf-8", env=env, cwd=self.tmp,
+            )
+            with self.subTest(consent=label):
+                self.assertEqual(refused.returncode, 2, refused.stderr)
+                self.assertTrue(refused.stderr.startswith("NA-4: "), refused.stderr)
+            outcomes[label] = (
+                refused.returncode,
+                refused.stderr.replace(self.module.norm(path), "<PATH>"),
+            )
+        # ROUND 10.  These two lines are a PARENT-PROCESS fact and nothing more: under the
+        # FIXTURE table, part0's norm hash is present and clip-z's is not.  They say nothing
+        # about the child, which never sees this table.  They are kept because they document
+        # why the two paths were chosen; they are NOT a precondition that makes the comparison
+        # below a consent comparison, and round 9's comment here said they were.
+        table_hashes = [part[2] for part in self.table["clips"]["M16-1243"]]
+        self.assertIn(self._path_hash(self.part0), table_hashes)
+        self.assertNotIn(self._path_hash(self.unconsented), table_hashes)
+        self.assertEqual(
+            outcomes["consented"], outcomes["unconsented"],
+            "the real hook process must give these two cache paths the same outcome shape "
+            "(both are UNCONSENTED under the child's own table; the labels are the parent's)",
+        )
+
+    # Rows that reach a DECISION but promise nothing about consent status, so the ablation
+    # below has nothing to hold them to.
+    #
+    # ROUND 10 (opus).  Round 9 commented this "an explicit, reasoned list because an empty one
+    # would be a lie" while it WAS empty -- a sentence that contradicted the line under it, in
+    # the card whose subject is comments that assert more than their code.  It is now non-empty
+    # and the sentence is gone.  Adding to this set WEAKENS the enumeration, so an entry is a
+    # disclosure, not a pass: it says out loud that this row is not held to the consent
+    # property, rather than letting an unearned green say the opposite.
+    _CONSENT_AGNOSTIC_DECIDERS = frozenset({
+        # The subprocess reads the module's REAL frozen table and never receives `self.table`,
+        # so both of its inputs are unconsented in the process that decides and the row cannot
+        # observe two consent statuses at all.  Full reasoning at the row itself.
+        "test_the_real_hook_process_denies_a_cache_path_as_a_separate_process",
+    })
+
+    def test_the_discovered_decision_rows_discriminate_on_consent_status(self):
+        # ROUND 9.  FOUR rows of the same vacuity class were found ONE AT A TIME across rounds
+        # 6, 7 and 8 (two deleted at round 7, one replaced at round 8, a fifth found by opus at
+        # round 8).  Finding them one at a time IS the defect: each round declared the class
+        # closed and the next round reopened it.  So this row sweeps the class instead of
+        # waiting for a reviewer to hit the next member.
+        #
+        # THE PROPERTY.  A row is vacuous with respect to consent iff its assertions hold
+        # identically when consent status is flipped.  So flip it and see whether the row
+        # notices.  A row that stays GREEN under every flip is not testing what its name says,
+        # whatever its name says.
+        #
+        # This found the fifth row independently AND a sixth -- the two consent-flavoured
+        # assertions on `test_no_subprocess_on_the_na4_path` -- which three rounds of hand
+        # auditing had walked past.  Both are fixed above.
+        #
+        # ROUND 10 -- WHAT THIS DOES NOT DO.  Round 9 said it "closes the class"; that was the
+        # card's own defect, reappearing in the mechanism built to prevent it.  This is a
+        # SOURCE-TEXT HEURISTIC over an ablation harness, and it has three escapes:
+        #
+        #  (i) DISCOVERY IS BY LITERAL SPELLING.  A row counts as a decider iff its own source
+        #      contains one of three exact strings (see the predicate below).  `_decide` is a
+        #      four-line wrapper over `self.module.decide(...)`, so a row calling
+        #      `self.module.decide(...)` directly is never classified as a decider, is never
+        #      ablated, and can be vacuous and green indefinitely.  So can one using
+        #      `subprocess.Popen` or `check_output` instead of `subprocess.run`.
+        #      `_CONSENT_AGNOSTIC_DECIDERS` is no backstop: such a row never reaches the
+        #      membership test.  THE REMEDY IS NOT A FOURTH SPELLING -- adding spellings and
+        #      re-claiming completeness is the defect with a longer list.
+        # (ii) DISCRIMINATION HERE MEANS "THE FIXTURE PRECONDITION BREAKS", NOT "THE ROW'S REAL
+        #      ASSERTIONS NOTICE".  Since round 6 removed the only rule that read the table, NO
+        #      row's substantive assertions CAN depend on consent -- that is the card's own
+        #      finding.  Every surviving decider therefore goes red under ablation because a
+        #      `self.assertIn(self._path_hash(self.part0), table_hashes)` line stops holding.
+        #      The practical consequence: two lines of that boilerplate satisfy this row around
+        #      an otherwise vacuous test.  What this actually detects is a decision row that
+        #      does not so much as RECORD the consent status of what it hands the decider.
+        #      That is weaker than "the row tests consent", and it is what is on offer.
+        #(iii) IT SEES ONLY THIS CLASS.  `vars(type(self))` is `OwnerConsentedFootageTests`; a
+        #      vacuous consent row in another class is outside it entirely.
+        source_of = {}
+        for name, function in vars(type(self)).items():
+            if not name.startswith("test_") or name == self._testMethodName:
+                continue
+            try:
+                source_of[name] = inspect.getsource(function)
+            except (OSError, TypeError):  # pragma: no cover - source always available here
+                self.fail("cannot read the source of %s; the enumeration would be a lie" % name)
+        # HEURISTIC, by literal spelling -- escape (i) above.
+        # A decision row worded any other way is invisible to it.
+        deciders = sorted(
+            name for name, src in source_of.items()
+            if ("self._decide(" in src or "self._decide_command(" in src
+                or "subprocess.run(" in src)
+            and name not in self._CONSENT_AGNOSTIC_DECIDERS
+        )
+        self.assertTrue(deciders, "no decision rows found -- the derivation broke, not the class")
+        # ROUND 11.  `_CONSENT_AGNOSTIC_DECIDERS` is an opt-out FROM this enumeration, and it
+        # was unpinned while its sibling `_CARRIER_NEEDLE_EXCLUSIONS` has been pinned by a
+        # length equality plus a membership check since round 9.  Pinned the SAME WAY, so a
+        # second entry has to be argued for in a diff instead of appearing quietly.  This is
+        # not a new mechanism: it is the two lines the sibling already runs, applied here.
+        # It pins the SIZE and the one member.  It does not make the opt-out safe.
+        self.assertEqual(len(self._CONSENT_AGNOSTIC_DECIDERS), 1)
+        self.assertIn(
+            "test_the_real_hook_process_denies_a_cache_path_as_a_separate_process",
+            self._CONSENT_AGNOSTIC_DECIDERS,
+        )
+
+        original_setup = type(self).setUp
+
+        def ablate(kind):
+            def setUp(case):
+                original_setup(case)
+                if kind == "UNCONSENT":
+                    # The fixture table still consents the ORIGINAL part0/part1; the row is now
+                    # handed paths that are NOT in it.  Consent status flipped, and because it
+                    # is flipped in the ARGUMENT, this reaches the real-hook subprocess row too.
+                    # Deliberately NOT `case.unconsented`: if the flipped path collided with
+                    # the row's own unconsented path, a consented-vs-unconsented comparison
+                    # would compare a path with itself and pass for a NEW vacuous reason.
+                    base = os.path.join(case.cache, "mirror", "unconsented")
+                    case.part0 = os.path.join(base, "clip-q.part0")
+                    case.part1 = os.path.join(base, "clip-q.part1")
+                else:  # EMPTYTABLE: the frozen module table consents nothing.
+                    case.module.OWNER_CONSENTED_FOOTAGE = {
+                        "clips": {}, "purposes": ("fixture purpose",), "authority": {},
+                    }
+            return setUp
+
+        def run_under(name, kind):
+            type(self).setUp = ablate(kind)
+            try:
+                suite = unittest.TestLoader().loadTestsFromName(name, type(self))
+                with open(os.devnull, "w") as sink:
+                    return unittest.TextTestRunner(stream=sink, verbosity=0).run(suite)
+            finally:
+                type(self).setUp = original_setup
+
+        vacuous = []
+        for name in deciders:
+            noticed = [
+                kind for kind in ("UNCONSENT", "EMPTYTABLE")
+                if not run_under(name, kind).wasSuccessful()
+            ]
+            with self.subTest(row=name):
+                if not noticed:
+                    vacuous.append(name)
+                self.assertTrue(
+                    noticed,
+                    "%s decides on a path but is GREEN under BOTH consent-status ablations: "
+                    "its assertions do not depend on consent at all. Make it discriminate (see "
+                    "test_the_consent_table_does_not_change_the_na4_decision for the shape), "
+                    "delete it, or -- if it genuinely promises nothing about consent -- add it "
+                    "to _CONSENT_AGNOSTIC_DECIDERS with a reason." % name,
+                )
+        self.assertEqual(vacuous, [], "the vacuity class is not empty: %s" % vacuous)
+
+    def test_the_frozen_consent_table_is_exactly_the_six_consented_ids(self):
+        table = self.module.OWNER_CONSENTED_FOOTAGE
+        self.assertEqual(len(table["clips"]), 6)
+        self.assertEqual(sorted(table["clips"]), sorted(CONSENTED_IDS_PINNED))
+        self.assertNotIn("M02-1344", table["clips"])
+        path_hashes = []
+        for clip_id, parts in table["clips"].items():
+            self.assertTrue(parts, clip_id)
+            for part in parts:
+                self.assertEqual(len(part), 3, clip_id)
+                length, digest, path_hash = part
+                self.assertIsInstance(length, int, clip_id)
+                self.assertGreater(length, 0, clip_id)
+                self.assertRegex(digest, r"\A[0-9a-f]{64}\Z", clip_id)
+                self.assertRegex(path_hash, r"\A[0-9a-f]{64}\Z", clip_id)
+                path_hashes.append(path_hash)
+        self.assertEqual(len(path_hashes), len(set(path_hashes)), "a path hash is listed twice")
+        self.assertEqual(
+            tuple(table["purposes"]), ("#72b delta-baseline gate", "PLAYBACK-ATTR-3-CUDA")
+        )
+        with self.assertRaises(TypeError):
+            table["clips"]["M02-1344"] = ()  # frozen: a mapping proxy refuses assignment
+
+    def test_the_authority_citations_are_distinct_and_hashed(self):
+        authority = self.module.OWNER_CONSENTED_FOOTAGE["authority"]
+        self.assertEqual(
+            authority["hash_convention"], "sha256 of the raw line bytes excluding the terminator"
+        )
+        consent = authority["consent"]
+        self.assertIn("peaceful-rubin-701ecd", consent["transcript"])
+        self.assertIn("a482bbe6-87e2-4332-970e-8accb08b1663.jsonl", consent["transcript"])
+        self.assertEqual(consent["line"], OWNER_CONSENT_LINE)
+        self.assertEqual(consent["sha256"], OWNER_CONSENT_LINE_SHA256)
+        self.assertEqual(consent["answers_line"], OWNER_CONSENT_QUESTION_LINE)
+        self.assertEqual(consent["answers_line_sha256"], OWNER_CONSENT_QUESTION_LINE_SHA256)
+        directive = authority["directive_no_manual_paths"]
+        self.assertIn("f9010ab1-55f2-4f4c-967c-467cf19c04ef.jsonl", directive["transcript"])
+        self.assertEqual(directive["line"], OWNER_DIRECTIVE_LINE)
+        self.assertEqual(directive["sha256"], OWNER_DIRECTIVE_LINE_SHA256)
+        self.assertIn("derived by the hub", authority["scope_derivation"])
+        self.assertIn("M02-1344 excluded (not acquired)", authority["scope_derivation"])
+
+    def test_the_frozen_consent_table_matches_the_register_text(self):
+        with open(REGISTER_DOC, "r", encoding="utf-8") as handle:
+            register = json.load(handle)
+        na4 = [item for item in register["items"] if item["id"] == "NA-4"]
+        self.assertEqual(len(na4), 1)
+        act = na4[0]["act"]
+        listed = re.search(r"consented ids \[([^\]]*)\]", act)
+        self.assertIsNotNone(listed, "NA-4 act text must list the consented ids")
+        ids = [value.strip() for value in listed.group(1).split(",")]
+        self.assertEqual(sorted(ids), sorted(self.module.OWNER_CONSENTED_FOOTAGE["clips"]))
+        self.assertIn("M02-1344 is NOT consented", act)
+        self.assertIn("path_norm_sha256", act)
+        self.assertIn("tools/gates/verify_consented_footage.py", act)
+        self.assertIn("agent-reviewed and CI-test-pinned", act)
+        self.assertIn("NOT yet wired", act)
+        # Round 4 (fable minor 2): the register's disclosures are pinned, not only the hook's.
+        for needle in (
+            "value-pinned (the tests pin a sha256 of the whole canonical table plus each id's part"
+            " count)",
+            "a board-rooted actor can still edit the table transiently",
+            "clip detection does not strip trailing dots or spaces from a clip name outside the"
+            " cache (follow-up card NA4-CLIP-NAME-TRIM-1)",
+            "until then the CUDA job generator refuses every owner-clip id",
+            "exceptions (1) and (2) still compare the expanded token",
+            "NA4-EXC12-LITERAL-TOKENS-1",
+            # Round 6 (NARROW): no third exception, the id-only route, and the honest residual.
+            "there is NO third exception",
+            "a consented-footage path named in command text is DENIED exactly like any other"
+            " clip outside (1) and (2)",
+            "no hook rule reads it",
+            "The route this card provides for consented footage is tracked, id-addressed"
+            " consumers",
+            # ROUND 7: the act must NAME the route that reaches consented footage with no
+            # content check, so it agrees with its own LIMITS instead of contradicting them.
+            "exception (2) still admits a consented clip's own path on the CLIP_OR_NONE line"
+            " with no content check against the table and no id-addressed consumer",
+            "the narrowing reduces scope, not exposure: the interpreter-one-liner residual is"
+            " unchanged",
+            "such a one-liner can open any path, consented or not",
+        ):
+            with self.subTest(needle=needle):
+                self.assertIn(needle, act)
+        self.assertNotIn("fork/master", act)
+        self.assertNotIn("exception (3) admits", act)
+        # ROUND 8: was two literal, case-sensitive strings; "reached only through" would have
+        # passed both.  Now a normalised phrasing family -- see _assert_no_exclusive_route_claim
+        # for the bound on what that does and does not cover.
+        _assert_no_exclusive_route_claim(self, act, "NA-4 register act")
+        for purpose in self.module.OWNER_CONSENTED_FOOTAGE["purposes"]:
+            self.assertIn(purpose, act)
+        enforced = na4[0]["enforced_after_0_1"]
+        self.assertNotIn("exception (3)", enforced)
+        self.assertIn(
+            "a consented-footage path in command text is denied like any other footage path",
+            enforced,
+        )
+        self.assertIn(
+            "the route this card provides for consented footage is tracked, id-addressed"
+            " consumers",
+            enforced,
+        )
+        self.assertIn(
+            "exception (2) still admits a consented clip's own path on the CLIP_OR_NONE line"
+            " with no content check",
+            enforced,
+        )
+        _assert_no_exclusive_route_claim(self, enforced, "NA-4 register enforced_after_0_1")
+        for needle in (
+            OWNER_CONSENT_LINE_SHA256, OWNER_CONSENT_QUESTION_LINE_SHA256,
+            OWNER_DIRECTIVE_LINE_SHA256, "line 1739", "line 1718", "line 2137",
+            "excluding the terminator",
+        ):
+            self.assertIn(needle, register["authority"])
+        # Round 1's spec tail is gone with the spec read: the table lives in the hook script.
+        self.assertNotIn("tools/gates/output-budget.json", self.module.NA10_GUARDED_TAILS)
+        # Round 3 (E): the content verifier IS a gate tail, and the NA-10 register row says so.
+        self.assertIn("tools/gates/verify_consented_footage.py", self.module.NA10_GUARDED_TAILS)
+        na10 = [item for item in register["items"] if item["id"] == "NA-10"]
+        self.assertIn("tools/gates/verify_consented_footage.py", na10[0]["act"])
 
 
 def _slug(name):

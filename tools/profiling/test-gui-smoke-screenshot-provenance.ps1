@@ -24,7 +24,11 @@ function New-V2ProvenanceFixture {
         [int[]]$Frames,
         [string]$TargetHash = 'target-content',
         [int]$TargetRawPrefetch = 1,
-        [int]$Temperature = 6000
+        [int]$Temperature = 6000,
+        [string]$ScreenshotMethod = 'app_internal_presented_pixmap',
+        [Nullable[long]]$GlWindowPresentedSerial = $null,
+        [Nullable[long]]$GlWindowPresentedSerialValid = $null,
+        [Nullable[long]]$GlWindowActive = $null
     )
 
     $lines = [System.Collections.Generic.List[string]]::new()
@@ -44,7 +48,18 @@ function New-V2ProvenanceFixture {
         $lines.Add("[INFO] playback_smoke.render_manifest session=1 index=$presentIndex path_code=3 path_label=full-xy-pre-recon path_source=render_thread processed8_cache_hit=0 raw_prefetch=$rawPrefetch dual_iso_valid=1 rendered_w=452 rendered_h=567 reduced=1")
         $lines.Add("[INFO] interaction_trace event=draw_frame_ready.end serial=$serial display_frame=$frame")
     }
-    $lines.Add('[INFO] interaction_trace event=gui_smoke.screenshot path="frame.png" width=1958 height=818 method=app_internal_presented_pixmap')
+    $screenshotLine =
+        "[INFO] interaction_trace event=gui_smoke.screenshot path=`"frame.png`" width=1958 height=818 method=$ScreenshotMethod"
+    if ($null -ne $GlWindowPresentedSerial) {
+        $screenshotLine += " gl_window_presented_serial=$GlWindowPresentedSerial"
+    }
+    if ($null -ne $GlWindowPresentedSerialValid) {
+        $screenshotLine += " gl_window_presented_serial_valid=$GlWindowPresentedSerialValid"
+    }
+    if ($null -ne $GlWindowActive) {
+        $screenshotLine += " gl_window_active=$GlWindowActive"
+    }
+    $lines.Add($screenshotLine)
     return @($lines)
 }
 
@@ -188,6 +203,83 @@ Assert-True $controlledPair.validComparable `
     "Controlled equal-history replay should pass: $($controlledPair.failures -join ', ')"
 Assert-True ($controlledParentProof.presentationIndex -eq 3) 'Controlled parent index should be 3.'
 Assert-True ($controlledParentProof.requestSerial -eq 6) 'Controlled parent serial should be 6.'
+
+# gl_window_presented_serial cross-check (ATTR3-VISUAL-QUALITY-EVIDENCE-1 round 5): the
+# GL-window path reports, on the screenshot event itself, the serial of the frame it
+# actually captured (paintGL()'s promotion, see GpuDisplayWindow.cpp). This must be
+# cross-checked against the bound playback_smoke.frame serial (6, for this fixture) and
+# must fail closed both on a mismatch and on a reported-invalid serial. Other capture
+# methods never populate this field and must not be penalized for serial_valid=0.
+$glWindowMatchLines = @(New-V2ProvenanceFixture `
+    -StartFrame 90 -Frames @(91, 92, 93) -TargetHash 'gl-window-match' `
+    -ScreenshotMethod 'gl_window_framebuffer_readback' `
+    -GlWindowPresentedSerial 6 -GlWindowPresentedSerialValid 1)
+$glWindowMatchProof = Get-GuiSmokeScreenshotProvenance `
+    -OrderedLogLines $glWindowMatchLines -RequestedStartFrame 90
+Assert-True $glWindowMatchProof.validFresh `
+    "A GL-window capture whose presented serial matches the bound frame serial should pass: $($glWindowMatchProof.failures -join ', ')"
+Assert-True ($glWindowMatchProof.glWindowPresentedSerial -eq 6) `
+    'gl_window_presented_serial was not parsed from the screenshot event.'
+
+$glWindowMismatchLines = @(New-V2ProvenanceFixture `
+    -StartFrame 90 -Frames @(91, 92, 93) -TargetHash 'gl-window-mismatch' `
+    -ScreenshotMethod 'gl_window_framebuffer_readback' `
+    -GlWindowPresentedSerial 5 -GlWindowPresentedSerialValid 1)
+Assert-Failure (Get-GuiSmokeScreenshotProvenance `
+    -OrderedLogLines $glWindowMismatchLines -RequestedStartFrame 90) `
+    'gl-window-presented-serial-mismatch'
+
+$glWindowInvalidLines = @(New-V2ProvenanceFixture `
+    -StartFrame 90 -Frames @(91, 92, 93) -TargetHash 'gl-window-invalid' `
+    -ScreenshotMethod 'gl_window_framebuffer_readback' `
+    -GlWindowPresentedSerial 6 -GlWindowPresentedSerialValid 0)
+Assert-Failure (Get-GuiSmokeScreenshotProvenance `
+    -OrderedLogLines $glWindowInvalidLines -RequestedStartFrame 90) `
+    'gl-window-presented-serial-invalid'
+
+# A non-GL-window capture method never populates this field (serial_valid=0 by
+# construction) and must not be flagged -- this fixture omits the field entirely, matching
+# the plain app_internal_presented_pixmap method the base fixture already produces.
+Assert-True $controlledParentProof.validFresh `
+    'A non-GL-window screenshot method must not be penalized for a missing/invalid gl_window_presented_serial.'
+
+# GL-window-active / non-GL-capture-method refusal (ATTR3-VISUAL-QUALITY-EVIDENCE-1 round
+# 6, sol major): a screenshot event that reports the GL window was active but was captured
+# by any method other than the GL framebuffer readback is exactly the coherence bug this
+# round fixes in MainWindow.cpp -- a fallback pixmap/viewport grab saved while the GL window
+# is what's actually on screen. Provenance must refuse it independently of the C++ fix.
+$glWindowActiveNonGlMethod = @(
+    $fresh[0],
+    $fresh[1],
+    '[INFO] interaction_trace event=gui_smoke.screenshot path="frame.png" width=1958 height=818 method=app_internal_viewport_grab gl_window_active=1'
+)
+Assert-Failure (Get-GuiSmokeScreenshotProvenance $glWindowActiveNonGlMethod) `
+    'gl-window-active-non-gl-capture-method'
+
+$glWindowActiveGlMethod = @(
+    $fresh[0],
+    $fresh[1],
+    '[INFO] interaction_trace event=gui_smoke.screenshot path="frame.png" width=1958 height=818 method=gl_window_framebuffer_readback gl_window_active=1'
+)
+$glWindowActiveGlMethodResult = Get-GuiSmokeScreenshotProvenance $glWindowActiveGlMethod
+Assert-True (-not ($glWindowActiveGlMethodResult.failures -contains 'gl-window-active-non-gl-capture-method')) `
+    'A GL-window-framebuffer capture while the GL window is active must not be flagged.'
+
+$glWindowInactiveNonGlMethod = @(
+    $fresh[0],
+    $fresh[1],
+    '[INFO] interaction_trace event=gui_smoke.screenshot path="frame.png" width=1958 height=818 method=app_internal_viewport_grab gl_window_active=0'
+)
+$glWindowInactiveNonGlMethodResult = Get-GuiSmokeScreenshotProvenance $glWindowInactiveNonGlMethod
+Assert-True (-not ($glWindowInactiveNonGlMethodResult.failures -contains 'gl-window-active-non-gl-capture-method')) `
+    'A non-GL capture method while the GL window is inactive is the expected, legitimate shape.'
+
+$glWindowActiveNonGlV2Lines = @(New-V2ProvenanceFixture `
+    -StartFrame 90 -Frames @(91, 92, 93) -TargetHash 'gl-window-active-non-gl' `
+    -ScreenshotMethod 'app_internal_viewport_grab' -GlWindowActive 1)
+Assert-Failure (Get-GuiSmokeScreenshotProvenance `
+    -OrderedLogLines $glWindowActiveNonGlV2Lines -RequestedStartFrame 90) `
+    'gl-window-active-non-gl-capture-method'
 
 $requestFrameMismatchLines = [System.Collections.Generic.List[string]]::new()
 $requestFrameMismatchLines.AddRange([string[]]$controlledParentLines)
@@ -341,5 +433,36 @@ $pairGateIndex = $blockingAbText.IndexOf('Assert-GuiSmokeScreenshotPair')
 $metricIndex = $blockingAbText.IndexOf('$metricsJson =')
 Assert-True ($pairGateIndex -ge 0 -and $metricIndex -gt $pairGateIndex) `
     'The pair comparability assertion must run before image metrics consume either screenshot.'
+
+Assert-True $wrapperText.Contains('-FailOnColorArtifact requires -CaptureScreenshot.') `
+    'run-release-gui-smoke.ps1 must reject -FailOnColorArtifact without -CaptureScreenshot at parameter validation.'
+
+# -FailOnColorArtifact without -CaptureScreenshot must fail LOUD, not silently no-op
+# (colorArtifactScan is never populated without -CaptureScreenshot, so the failure gate
+# would otherwise be unreachable). Invoke the real wrapper -- a parameter-validation throw
+# happens before anything needs a real MLVApp build, so this runs without a Qt toolchain.
+$failOnColorArtifactOutput = & pwsh -NoProfile -Command (
+    "try { & '$wrapperPath' -FailOnColorArtifact -ErrorAction Stop } " +
+    "catch { Write-Output ('CAUGHT: ' + `$_.Exception.Message) }"
+) 2>&1
+Assert-True (($failOnColorArtifactOutput -join "`n").Contains(
+    'CAUGHT: -FailOnColorArtifact requires -CaptureScreenshot.')) `
+    "run-release-gui-smoke.ps1 -FailOnColorArtifact (without -CaptureScreenshot) did not fail loud at parameter validation; observed: $($failOnColorArtifactOutput -join ' | ')"
+
+# Paired with -CaptureScreenshot, validation must move PAST that gate (the run then fails
+# later for an unrelated, expected reason -- no MLVApp build in this environment -- which
+# proves the combination is accepted rather than also being rejected).
+$failOnColorArtifactWithScreenshotOutput = & pwsh -NoProfile -Command (
+    "try { & '$wrapperPath' -FailOnColorArtifact -CaptureScreenshot -ErrorAction Stop } " +
+    "catch { Write-Output ('CAUGHT: ' + `$_.Exception.Message) }"
+) 2>&1
+$failOnColorArtifactWithScreenshotJoined = $failOnColorArtifactWithScreenshotOutput -join "`n"
+Assert-True (-not $failOnColorArtifactWithScreenshotJoined.Contains(
+    '-FailOnColorArtifact requires -CaptureScreenshot.')) `
+    "run-release-gui-smoke.ps1 -FailOnColorArtifact -CaptureScreenshot must pass the parameter-validation gate; observed: $failOnColorArtifactWithScreenshotJoined"
+Assert-True $failOnColorArtifactWithScreenshotJoined.Contains('CAUGHT:') `
+    "Expected -FailOnColorArtifact -CaptureScreenshot to fail later for an unrelated reason (no MLVApp build here); observed: $failOnColorArtifactWithScreenshotJoined"
+
+Write-Host 'PASS: GUI smoke screenshot provenance tests'
 
 Write-Host 'PASS: GUI smoke screenshot fresh-render provenance tests'

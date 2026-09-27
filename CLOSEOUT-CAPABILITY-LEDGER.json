@@ -16,6 +16,7 @@
   },
   "generatedAt": "2026-05-08T04:24:37-05:00",
   "lastVerifiedAt": "2026-05-08T04:25:56-05:00",
+  "status": "STALE-2026-05-08",
   "ledgerProfile": "Standard",
   "frameworkArtifacts": {
     "historicalIncidentMap": "CLOSEOUT-HISTORICAL-INCIDENT-MAP.md",

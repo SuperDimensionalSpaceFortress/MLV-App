@@ -338,6 +338,183 @@ TEST(SecuritySizing, RawInputMetadataCannotSelectAnOversizedRead)
                                          tinyOutput));
 }
 
+TEST(SecuritySizing, Jpeg2000FrameSizeCannotExceedTheAdmittedCapacity)
+{
+    /* The JPEG2000 VIDF branch reads frame_size bytes into the buffer sized by
+     * mlvRawFrameInputCapacity(), so a JPEG2000 clip must be sized from its
+     * encoded frame size exactly as an LJ92 clip is. 8x8 at 14bpp packs to 112
+     * bytes and admits at most 8*8*3+200 = 392 encoded bytes. */
+    const int width = 8;
+    const int height = 8;
+    const int bitdepth = 14;
+    size_t packedSize = 0;
+    size_t allocationSize = 0;
+
+    ASSERT_TRUE(mlvRawFrameInputCapacity(width, height, bitdepth, 392,
+                                         &packedSize, &allocationSize));
+    ASSERT_EQ(static_cast<size_t>(112), packedSize);
+    ASSERT_EQ(static_cast<size_t>(396), allocationSize);
+    /* The read is bounded by allocationSize - 4; the admitted frame must fit. */
+    ASSERT_TRUE(allocationSize - 4u >= static_cast<size_t>(392));
+
+    /* A frame_size beyond the codec-independent ceiling is rejected outright,
+     * so no allocation and no read of that size ever happens. */
+    ASSERT_FALSE(mlvRawFrameInputCapacity(width, height, bitdepth, 393,
+                                          &packedSize, &allocationSize));
+    ASSERT_FALSE(mlvRawFrameInputCapacity(width, height, bitdepth, 0xffffffffu,
+                                          &packedSize, &allocationSize));
+
+    /* Sizing a JPEG2000 frame from the packed RAW size alone - the pre-fix
+     * behaviour - admits only a 112-byte buffer, while a 392-byte frame's
+     * channel table addresses bytes well past it. The layout validator is the
+     * second gate: it refuses any channel that is not wholly inside the bytes
+     * actually read, so a short buffer can never be indexed out of bounds. */
+    ASSERT_TRUE(mlvRawFrameInputCapacity(width, height, bitdepth, 0,
+                                         &packedSize, &allocationSize));
+    ASSERT_EQ(static_cast<size_t>(116), allocationSize);
+    const uint32_t offsets[4] = {36u, 125u, 214u, 303u};
+    const uint32_t sizes[4] = {89u, 89u, 89u, 89u};
+    uint32_t quarterWidth = 0;
+    uint32_t quarterHeight = 0;
+    ASSERT_TRUE(mlvJpeg2kBayerLayoutIsValid(392, width, height,
+                                            offsets, sizes,
+                                            &quarterWidth, &quarterHeight));
+    ASSERT_EQ(static_cast<uint32_t>(4), quarterWidth);
+    ASSERT_EQ(static_cast<uint32_t>(4), quarterHeight);
+    quarterWidth = 0;
+    quarterHeight = 0;
+    ASSERT_FALSE(mlvJpeg2kBayerLayoutIsValid(allocationSize - 4u, width, height,
+                                             offsets, sizes,
+                                             &quarterWidth, &quarterHeight));
+    ASSERT_EQ(static_cast<uint32_t>(0), quarterWidth);
+    ASSERT_EQ(static_cast<uint32_t>(0), quarterHeight);
+}
+
+TEST(SecuritySizing, Jpeg2000ChannelTableRejectsOutOfBoundsOffsets)
+{
+    const int width = 8;
+    const int height = 8;
+    const size_t frameSize = MLV_JPEG2K_BAYER_HEADER_BYTES + 40u;
+    const uint32_t validOffsets[4] = {36u, 46u, 56u, 66u};
+    const uint32_t validSizes[4] = {10u, 10u, 10u, 10u};
+    uint32_t quarterWidth = 0;
+    uint32_t quarterHeight = 0;
+
+    ASSERT_TRUE(mlvJpeg2kBayerLayoutIsValid(frameSize, width, height,
+                                            validOffsets, validSizes,
+                                            &quarterWidth, &quarterHeight));
+    ASSERT_EQ(static_cast<uint32_t>(4), quarterWidth);
+    ASSERT_EQ(static_cast<uint32_t>(4), quarterHeight);
+
+    /* A channel that starts inside the fixed header. */
+    uint32_t offsets[4] = {35u, 46u, 56u, 66u};
+    ASSERT_FALSE(mlvJpeg2kBayerLayoutIsValid(frameSize, width, height,
+                                             offsets, validSizes,
+                                             &quarterWidth, &quarterHeight));
+
+    /* A channel that starts past the end of the frame. */
+    offsets[0] = 36u;
+    offsets[3] = static_cast<uint32_t>(frameSize) + 1u;
+    ASSERT_FALSE(mlvJpeg2kBayerLayoutIsValid(frameSize, width, height,
+                                             offsets, validSizes,
+                                             &quarterWidth, &quarterHeight));
+
+    /* A channel that starts inside the frame but runs past its end. */
+    offsets[3] = 66u;
+    uint32_t sizes[4] = {10u, 10u, 10u, 11u};
+    ASSERT_FALSE(mlvJpeg2kBayerLayoutIsValid(frameSize, width, height,
+                                             offsets, sizes,
+                                             &quarterWidth, &quarterHeight));
+
+    /* Offset/size arithmetic must not wrap. */
+    sizes[3] = 0xffffffffu;
+    ASSERT_FALSE(mlvJpeg2kBayerLayoutIsValid(frameSize, width, height,
+                                             offsets, sizes,
+                                             &quarterWidth, &quarterHeight));
+    sizes[3] = 10u;
+    offsets[3] = 0xffffffffu;
+    ASSERT_FALSE(mlvJpeg2kBayerLayoutIsValid(frameSize, width, height,
+                                             offsets, sizes,
+                                             &quarterWidth, &quarterHeight));
+
+    /* An empty channel carries no samples for its quarter of the frame. */
+    offsets[3] = 66u;
+    sizes[2] = 0u;
+    ASSERT_FALSE(mlvJpeg2kBayerLayoutIsValid(frameSize, width, height,
+                                             offsets, sizes,
+                                             &quarterWidth, &quarterHeight));
+
+    /* A frame too short to even hold the channel table. */
+    ASSERT_FALSE(mlvJpeg2kBayerLayoutIsValid(MLV_JPEG2K_BAYER_HEADER_BYTES - 1u,
+                                             width, height,
+                                             validOffsets, validSizes,
+                                             &quarterWidth, &quarterHeight));
+
+    /* Geometry the 2x2 channel split is not defined for. */
+    ASSERT_FALSE(mlvJpeg2kBayerLayoutIsValid(frameSize, 9, height,
+                                             validOffsets, validSizes,
+                                             &quarterWidth, &quarterHeight));
+    ASSERT_FALSE(mlvJpeg2kBayerLayoutIsValid(frameSize, width, 9,
+                                             validOffsets, validSizes,
+                                             &quarterWidth, &quarterHeight));
+    ASSERT_FALSE(mlvJpeg2kBayerLayoutIsValid(frameSize, 2, 2,
+                                             validOffsets, validSizes,
+                                             &quarterWidth, &quarterHeight));
+    ASSERT_FALSE(mlvJpeg2kBayerLayoutIsValid(frameSize, width, height,
+                                             nullptr, validSizes,
+                                             &quarterWidth, &quarterHeight));
+}
+
+TEST(SecuritySizing, CurvBlockCannotOverrunTheLinearisationTable)
+{
+    const uint32_t headerBytes = static_cast<uint32_t>(sizeof(mlv_curv_hdr_t));
+    uint32_t lutEntries = 0xdeadbeefu;
+
+    /* A full-range curve is exactly the allocation. */
+    ASSERT_TRUE(mlvCurvLutEntryCount(
+        headerBytes + MLV_LINEARISE_LUT_ENTRIES * 2u, &lutEntries));
+    ASSERT_EQ(MLV_LINEARISE_LUT_ENTRIES, lutEntries);
+
+    /* One entry past the allocation is rejected, not truncated. */
+    lutEntries = 0xdeadbeefu;
+    ASSERT_FALSE(mlvCurvLutEntryCount(
+        headerBytes + (MLV_LINEARISE_LUT_ENTRIES + 1u) * 2u, &lutEntries));
+    ASSERT_EQ(static_cast<uint32_t>(0), lutEntries);
+
+    /* So is a wildly oversized block, with no size arithmetic wrapping. */
+    ASSERT_FALSE(mlvCurvLutEntryCount(0xffffffffu, &lutEntries));
+    ASSERT_EQ(static_cast<uint32_t>(0), lutEntries);
+
+    /* A short or empty block carries no curve at all. */
+    ASSERT_FALSE(mlvCurvLutEntryCount(0u, &lutEntries));
+    ASSERT_FALSE(mlvCurvLutEntryCount(headerBytes - 1u, &lutEntries));
+    ASSERT_FALSE(mlvCurvLutEntryCount(headerBytes, &lutEntries));
+    ASSERT_FALSE(mlvCurvLutEntryCount(headerBytes + 1u, &lutEntries));
+
+    /* The payload is an array of uint16 samples: every odd size is rejected
+     * outright, never divided down to the entry count below it. The +3 case is
+     * the one that used to be accepted as a single entry with a stray byte. */
+    lutEntries = 0xdeadbeefu;
+    ASSERT_FALSE(mlvCurvLutEntryCount(headerBytes + 3u, &lutEntries));
+    ASSERT_EQ(static_cast<uint32_t>(0), lutEntries);
+    ASSERT_FALSE(mlvCurvLutEntryCount(headerBytes + 5u, &lutEntries));
+    ASSERT_FALSE(mlvCurvLutEntryCount(headerBytes + 8191u, &lutEntries));
+    ASSERT_FALSE(mlvCurvLutEntryCount(
+        headerBytes + MLV_LINEARISE_LUT_ENTRIES * 2u - 1u, &lutEntries));
+    ASSERT_EQ(static_cast<uint32_t>(0), lutEntries);
+    /* One odd byte past the allocation stays rejected for both reasons. */
+    ASSERT_FALSE(mlvCurvLutEntryCount(
+        headerBytes + MLV_LINEARISE_LUT_ENTRIES * 2u + 1u, &lutEntries));
+
+    /* Partial curves stay admissible; the table is zero-padded past them. */
+    ASSERT_TRUE(mlvCurvLutEntryCount(headerBytes + 2u, &lutEntries));
+    ASSERT_EQ(static_cast<uint32_t>(1), lutEntries);
+    ASSERT_TRUE(mlvCurvLutEntryCount(headerBytes + 8192u, &lutEntries));
+    ASSERT_EQ(static_cast<uint32_t>(4096), lutEntries);
+
+    ASSERT_FALSE(mlvCurvLutEntryCount(headerBytes + 2u, nullptr));
+}
+
 TEST(SecuritySizing, DngOffsetsAndFolderGeometryFailClosedBeforeNarrowing)
 {
     ASSERT_FALSE(dng_reader_range_fits(UINT32_MAX, 2, 16));

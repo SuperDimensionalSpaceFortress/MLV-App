@@ -142,6 +142,16 @@ static MLV_PROCESSING_THREAD_LOCAL int g_processing_last_shadows_highlights_quar
 static MLV_PROCESSING_THREAD_LOCAL int g_processing_last_shadows_highlights_quarterres_downsample_completed = 0;
 static MLV_PROCESSING_THREAD_LOCAL int g_processing_last_shadows_highlights_quarterres_rbf_completed = 0;
 static MLV_PROCESSING_THREAD_LOCAL int g_processing_last_shadows_highlights_quarterres_upsample_completed = 0;
+static MLV_PROCESSING_THREAD_LOCAL int g_processing_last_shadows_highlights_halfres_downsample_completed = 0;
+static MLV_PROCESSING_THREAD_LOCAL int g_processing_last_shadows_highlights_halfres_rbf_completed = 0;
+static MLV_PROCESSING_THREAD_LOCAL int g_processing_last_shadows_highlights_halfres_upsample_completed = 0;
+static MLV_PROCESSING_THREAD_LOCAL int g_processing_last_shadows_highlights_fullres_completed = 0;
+/* Monotonic per-call counters proving the SH blur pre-pass / filter actually
+ * executed. A wall-clock Milliseconds() field can legitimately read 0.0 when
+ * the stage runs faster than the timer resolves, so it must never be the
+ * only evidence that a stage ran (see PROD-TELEMETRY-DURATION-AS-PROOF-1). */
+static MLV_PROCESSING_THREAD_LOCAL int g_processing_last_shadows_highlights_prep_run_count = 0;
+static MLV_PROCESSING_THREAD_LOCAL int g_processing_last_shadows_highlights_filter_run_count = 0;
 
 static int g_processing_shadows_highlights_probe_initialized = 0;
 static int g_processing_shadows_highlights_probe_mode = -1;
@@ -417,6 +427,12 @@ void processingResetLastTimingTelemetry(void)
     g_processing_last_shadows_highlights_quarterres_downsample_completed = 0;
     g_processing_last_shadows_highlights_quarterres_rbf_completed = 0;
     g_processing_last_shadows_highlights_quarterres_upsample_completed = 0;
+    g_processing_last_shadows_highlights_halfres_downsample_completed = 0;
+    g_processing_last_shadows_highlights_halfres_rbf_completed = 0;
+    g_processing_last_shadows_highlights_halfres_upsample_completed = 0;
+    g_processing_last_shadows_highlights_fullres_completed = 0;
+    g_processing_last_shadows_highlights_prep_run_count = 0;
+    g_processing_last_shadows_highlights_filter_run_count = 0;
     g_processing_last_shadows_highlights_rbf_total_ms = 0.0;
     g_processing_last_shadows_highlights_rbf_boundary_ms = 0.0;
     g_processing_last_shadows_highlights_rbf_range_table_ms = 0.0;
@@ -1420,6 +1436,7 @@ static void processing_compute_shadows_highlights_blur( processingObject_t * pro
                                                         int imageX, int imageY, int threads,
                                                         int force_export_policy )
 {
+    g_processing_last_shadows_highlights_prep_run_count++;
     const int shadows_highlights_probe_enabled =
         processing_shadows_highlights_probe_mode() >= 0;
     const int halfres_even_dimensions =
@@ -1576,6 +1593,7 @@ static void processing_compute_shadows_highlights_blur( processingObject_t * pro
             g_processing_last_shadows_highlights_filter_halfres_downsample_ms +=
                 (omp_get_wtime() - halfres_downsample_start) * 1000.0;
         }
+        g_processing_last_shadows_highlights_halfres_downsample_completed = 1;
         const double halfres_rbf_start =
             shadows_highlights_probe_enabled ? omp_get_wtime() : 0.0;
         if( processing_shadows_highlights_curve_index_mask_enabled() )
@@ -1606,6 +1624,7 @@ static void processing_compute_shadows_highlights_blur( processingObject_t * pro
             g_processing_last_shadows_highlights_filter_halfres_rbf_ms +=
                 (omp_get_wtime() - halfres_rbf_start) * 1000.0;
         }
+        g_processing_last_shadows_highlights_halfres_rbf_completed = 1;
         const double halfres_upsample_start =
             shadows_highlights_probe_enabled ? omp_get_wtime() : 0.0;
         rgb_u16_upsample_2x_bilinear(get_buffer(processing->shadows_highlights.blur_image_half_out),
@@ -1631,6 +1650,7 @@ static void processing_compute_shadows_highlights_blur( processingObject_t * pro
             g_processing_last_shadows_highlights_filter_halfres_upsample_ms +=
                 (omp_get_wtime() - halfres_upsample_start) * 1000.0;
         }
+        g_processing_last_shadows_highlights_halfres_upsample_completed = 1;
     }
     else if( processing_shadows_highlights_curve_index_mask_enabled() )
     {
@@ -1650,6 +1670,7 @@ static void processing_compute_shadows_highlights_blur( processingObject_t * pro
             g_processing_last_shadows_highlights_filter_fullres_ms +=
                 (omp_get_wtime() - fullres_rbf_start) * 1000.0;
         }
+        g_processing_last_shadows_highlights_fullres_completed = 1;
     }
     else
     {
@@ -1666,10 +1687,12 @@ static void processing_compute_shadows_highlights_blur( processingObject_t * pro
             g_processing_last_shadows_highlights_filter_fullres_ms +=
                 (omp_get_wtime() - fullres_rbf_start) * 1000.0;
         }
+        g_processing_last_shadows_highlights_fullres_completed = 1;
     }
     processing_capture_last_shadows_highlights_rbf_timing();
     g_processing_last_shadows_highlights_filter_ms +=
         (omp_get_wtime() - shadows_highlights_filter_start) * 1000.0;
+    g_processing_last_shadows_highlights_filter_run_count++;
 }
 
 int processingRefreshShadowsHighlightsBlurFromRgb16(processingObject_t * processing,
@@ -1706,6 +1729,12 @@ int processingRefreshShadowsHighlightsBlurFromRgb16(processingObject_t * process
     g_processing_last_shadows_highlights_quarterres_downsample_completed = 0;
     g_processing_last_shadows_highlights_quarterres_rbf_completed = 0;
     g_processing_last_shadows_highlights_quarterres_upsample_completed = 0;
+    g_processing_last_shadows_highlights_halfres_downsample_completed = 0;
+    g_processing_last_shadows_highlights_halfres_rbf_completed = 0;
+    g_processing_last_shadows_highlights_halfres_upsample_completed = 0;
+    g_processing_last_shadows_highlights_fullres_completed = 0;
+    g_processing_last_shadows_highlights_prep_run_count = 0;
+    g_processing_last_shadows_highlights_filter_run_count = 0;
     g_processing_last_shadows_highlights_rbf_total_ms = 0.0;
     g_processing_last_shadows_highlights_rbf_boundary_ms = 0.0;
     g_processing_last_shadows_highlights_rbf_range_table_ms = 0.0;
@@ -4253,6 +4282,36 @@ int processingGetLastShadowsHighlightsQuarterresRbfCompletedForTesting(void)
 int processingGetLastShadowsHighlightsQuarterresUpsampleCompletedForTesting(void)
 {
     return g_processing_last_shadows_highlights_quarterres_upsample_completed;
+}
+
+int processingGetLastShadowsHighlightsHalfresDownsampleCompletedForTesting(void)
+{
+    return g_processing_last_shadows_highlights_halfres_downsample_completed;
+}
+
+int processingGetLastShadowsHighlightsHalfresRbfCompletedForTesting(void)
+{
+    return g_processing_last_shadows_highlights_halfres_rbf_completed;
+}
+
+int processingGetLastShadowsHighlightsHalfresUpsampleCompletedForTesting(void)
+{
+    return g_processing_last_shadows_highlights_halfres_upsample_completed;
+}
+
+int processingGetLastShadowsHighlightsFullresCompletedForTesting(void)
+{
+    return g_processing_last_shadows_highlights_fullres_completed;
+}
+
+int processingGetLastShadowsHighlightsPrepRunCountForTesting(void)
+{
+    return g_processing_last_shadows_highlights_prep_run_count;
+}
+
+int processingGetLastShadowsHighlightsFilterRunCountForTesting(void)
+{
+    return g_processing_last_shadows_highlights_filter_run_count;
 }
 
 double processingGetLastShadowsHighlightsRbfTotalMilliseconds(void)

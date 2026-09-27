@@ -93,6 +93,19 @@ param(
     [Parameter(ParameterSetName='Dispatch')]
     [string]$ExporterPath = '',
 
+    # STAGE-2 CONTINUATION (TOOL-DISPATCHER-NO-CONTINUATION-PATH-1). The 40-hex tip this dispatch
+    # expects to continue from. Empty (the default) preserves the historical refusal exactly: a
+    # branch carrying commits beyond baseSha is work this dispatch must not overwrite.
+    #
+    # It is a SHA and not a bare -Continue switch on purpose. A switch would say "attach to
+    # whatever is on that branch", which is the same class of defect as the consumed owner grant:
+    # an authorization that does not name what it authorizes. Naming the tip makes a continuation
+    # content-addressed, so it fails closed when the branch moved since the caller looked - the
+    # caller re-derives and decides again, rather than silently building on a stranger's commit.
+    [Parameter(ParameterSetName='Dispatch')]
+    [ValidatePattern('^$|^[0-9a-fA-F]{40}$')]
+    [string]$ContinueFromSha = '',
+
     [Parameter(Mandatory=$true,ParameterSetName='Completion')]
     [switch]$RecordCompletion,
     [Parameter(Mandatory=$true,ParameterSetName='Completion')]
@@ -303,16 +316,20 @@ function Write-DispatchReservation {
         [string]$Kind = '',
         [string]$Lane = '',
         [string]$RunDir = '',
-        $ObservedExit = $null
+        $ObservedExit = $null,
+        [AllowNull()]$LaneAllowEdits = $null
     )
     $dir = Split-Path -Parent $ReservationsPath
     if (-not (Test-Path -LiteralPath $dir)) { New-Item -ItemType Directory -Path $dir -Force | Out-Null }
     $row = [ordered]@{
+        schemaVersion = 2
+        venue         = 'invoke-workstream'
         reservationId = $ReservationId
         state         = $State
         card          = $Card
         kind          = $Kind
         lane          = $Lane
+        allowEdits    = $LaneAllowEdits
         runDir        = $RunDir
         recordedUtc   = (Get-Date).ToUniversalTime().ToString('o')
     }
@@ -323,7 +340,19 @@ function Write-DispatchReservation {
         # Unknown spend remains charged; success at zero cost remains charged.
         $row.state = if ($evidence.laneCostReported -and $evidence.laneCostUsd -eq 0 -and $null -ne $ObservedExit -and $ObservedExit -ne 0) { 'refunded' } else { 'charged' }
     }
-    Add-Content -LiteralPath $ReservationsPath -Value ($row | ConvertTo-Json -Compress -Depth 6) -Encoding UTF8
+    # MLV-DISPATCH-LEDGER-WRITER-V3-SERIALIZED (see Invoke-Lane.ps1 Add-DispatchLedgerRow; the guard checks both files).
+    # Same machine-wide mutex as Invoke-Lane.ps1's Add-DispatchLedgerRow: unserialized appends can
+    # overwrite each other's row.
+    $ledgerMutex = [Threading.Mutex]::new($false, 'Global\MLV-App-DispatchLedger')
+    $ledgerHeld = $false
+    try {
+        try { $ledgerHeld = $ledgerMutex.WaitOne(30000) } catch [Threading.AbandonedMutexException] { $ledgerHeld = $true }
+        if (-not $ledgerHeld) { throw 'dispatch ledger lock timeout' }
+        Add-Content -LiteralPath $ReservationsPath -Value ($row | ConvertTo-Json -Compress -Depth 6) -Encoding UTF8
+    } finally {
+        if ($ledgerHeld) { $ledgerMutex.ReleaseMutex() }
+        $ledgerMutex.Dispose()
+    }
     return [pscustomobject]$row
 }
 
@@ -613,6 +642,83 @@ $engine = if ($Lane -eq 'sol' -or $Lane -eq 'luna') { 'codex' } else { 'claude' 
 $stamp  = (Get-Date).ToUniversalTime().ToString('yyyyMMddTHHmmssZ')
 $runDir = Join-Path $RepoRoot ".claude-state\fleet-runs\ws-$cardId-$stamp"
 
+# DISPATCH-ATTEMPT RECEIPT. Every attempt that names a run directory leaves a typed
+# dispatch-attempt.json in it: 'launching' (about to start the lane), then 'launched' (the lane process
+# ran and returned; its own receipt sits beside this one), or 'refused-before-launch' with the cause,
+# or 'launch-unconfirmed' (a throw between 'launching' and the child returning). MEASURED 2026-09-14: PLAY-COUNTERS-CPU left
+# ~90 run dirs holding ONLY lane-prompt.md - `git worktree add` failed after the prompt was written;
+# the exit-3 reason reached only a detail line in a separate loop-cycles receipt, so the run dirs
+# themselves read as launches that silently produced nothing. Never throws: a receipt write failure is reported on stdout AND
+# stderr (the disk that refused the receipt is the one fact no receipt can carry), never fatal.
+# -DryRun writes one too (outcome 'dry-run-not-launched'): it names a run dir and writes into it.
+function Write-DispatchAttempt {
+    param([string]$Outcome, [string]$Cause, [int]$ExitCode, [string]$Detail = '', $LaneExitCode = $null)
+    try {
+        if (-not (Test-Path -LiteralPath $runDir)) { New-Item -ItemType Directory -Path $runDir -Force | Out-Null }
+        $laneReceipts = @(Get-ChildItem -LiteralPath $runDir -Filter '*.receipt.json' -File -ErrorAction SilentlyContinue | ForEach-Object { $_.FullName })
+        $attempt = [ordered]@{
+            schema       = 'mlv-app/workstream-dispatch-attempt/v1'
+            outcome      = $Outcome
+            cause        = $Cause
+            detail       = $Detail
+            card         = $cardId
+            track        = $cardTrack
+            lane         = $Lane
+            engine       = $engine
+            allowEdits   = [bool]$AllowEdits
+            exitCode     = $ExitCode
+            laneExitCode = $LaneExitCode
+            laneReceipts = $laneReceipts
+            runDir       = $runDir
+            recordedUtc  = (Get-Date).ToUniversalTime().ToString('o')
+        }
+        # dispatch-attempt.json is the LATEST state; dispatch-attempts.jsonl is the append-only history of
+        # every transition (sol PR #111 post-merge: a single overwritten file lost 'launching' and any
+        # refusal cause a later trap replaced).
+        [System.IO.File]::AppendAllText((Join-Path $runDir 'dispatch-attempts.jsonl'), (($attempt | ConvertTo-Json -Depth 4 -Compress) + "`n"), [System.Text.UTF8Encoding]::new($false))
+        [System.IO.File]::WriteAllText((Join-Path $runDir 'dispatch-attempt.json'), ($attempt | ConvertTo-Json -Depth 4), [System.Text.UTF8Encoding]::new($false))
+    } catch {
+        $why = "WORKSTREAM: dispatch-attempt receipt NOT written ($($_.Exception.Message)) runDir=$runDir"
+        # FALLBACK SPOOL outside the run dir, so an unwritable run dir still leaves a typed record a
+        # reader can find. Only when the spool also fails is stdout/stderr the last channel; the loop
+        # copies these lines into its cycle receipt (receiptWriteFailures).
+        $runDirError = $_.Exception.Message
+        try {
+            $spool = Join-Path $RepoRoot '.claude-state\fleet-runs\dispatch-attempt-spool'
+            if (-not (Test-Path -LiteralPath $spool)) { New-Item -ItemType Directory -Path $spool -Force | Out-Null }
+            $spooled = [ordered]@{
+                schema = 'mlv-app/workstream-dispatch-attempt/v1'; outcome = $Outcome; cause = $Cause; detail = $Detail
+                card = $cardId; lane = $Lane; exitCode = $ExitCode; laneExitCode = $LaneExitCode; runDir = $runDir
+                runDirWriteError = $runDirError; recordedUtc = (Get-Date).ToUniversalTime().ToString('o')
+            }
+            $spoolFile = Join-Path $spool ('{0}-{1}-{2}.json' -f $cardId, (Get-Date).ToUniversalTime().ToString('yyyyMMddTHHmmssfffZ'), $Outcome)
+            [System.IO.File]::WriteAllText($spoolFile, ($spooled | ConvertTo-Json -Depth 4), [System.Text.UTF8Encoding]::new($false))
+            $why += " spooled=$spoolFile"
+        } catch {
+            $why += " spool ALSO failed ($($_.Exception.Message))"
+        }
+        Write-Output $why
+        [Console]::Error.WriteLine($why)
+    }
+}
+
+# A TERMINATING ERROR is an exit path too (sol PR #111 R1): New-Item, the prompt write, Get-FileHash,
+# reservation writes and worktree cleanup can all throw after the run dir is named. A trap applies to
+# the whole script scope, so it is guarded on $runDir existing; `break` re-throws, so the process
+# still fails exactly as before - it just no longer fails silently.
+# LaneStarting is set just before the child pwsh call; LaneLaunched only AFTER it returns (sol PR #111
+# post-merge: setting 'launched' before the call receipted a start failure as a launch).
+$script:LaneStarting = $false
+$script:LaneLaunched = $false
+trap {
+    if (Get-Variable -Name runDir -Scope Script -ErrorAction SilentlyContinue) {
+        $trapOutcome = if ($script:LaneLaunched) { 'launched' } elseif ($script:LaneStarting) { 'launch-unconfirmed' } else { 'refused-before-launch' }
+        $trapLaneExit = if (Get-Variable -Name laneExit -Scope Script -ErrorAction SilentlyContinue) { $script:laneExit } else { $null }
+        Write-DispatchAttempt -Outcome $trapOutcome -Cause 'unhandled-error' -ExitCode 1 -Detail $_.Exception.Message -LaneExitCode $trapLaneExit
+    }
+    break
+}
+
 # ------------------------------------------------------------------ pre-dispatch PR review evidence
 # DELIVERABLE 9 (S126): before every review-lane dispatch, run the SAME exporter the hub ran by
 # hand for the three PRs that landed before this card - from this card on, the DISPATCHER is the
@@ -635,6 +741,7 @@ if ($isReviewLane -and $cardPrNumber) {
     $exporterExit = $LASTEXITCODE
     if ($exporterExit -ne 0) {
         Write-Output "WORKSTREAM: REFUSED review-evidence-export-failed card=$cardId pr=$cardPrNumber exit=$exporterExit"
+        Write-DispatchAttempt -Outcome 'refused-before-launch' -Cause 'review-evidence-export-failed' -ExitCode 6 -Detail "pr=$cardPrNumber exporterExit=$exporterExit"
         exit 6
     }
 }
@@ -925,6 +1032,7 @@ $fence
         # The exports above ALREADY RAN and are on disk. Saying "nothing dispatched" without saying
         # that would be a lie by omission about a directory this command created.
         Write-Output 'WORKSTREAM: DRY RUN - no lane dispatched. Any gh-evidence export above is real and on disk.'
+        Write-DispatchAttempt -Outcome 'dry-run-not-launched' -Cause 'dry-run' -ExitCode 0
         exit 0
     }
 
@@ -932,26 +1040,37 @@ $fence
     # at the top of the loop's cycle, which can dispatch several lanes across a single cycle.
     if (Test-KillSwitchArmed) {
         Write-Output "WORKSTREAM: REFUSED kill-switch-armed card=$cardId"
+        Write-DispatchAttempt -Outcome 'refused-before-launch' -Cause 'kill-switch-armed' -ExitCode 6
         exit 6
     }
 
     $ratioExit = Test-RatioDispatchPermission -Kind $cardKind
-    if ($ratioExit -ne 0) { exit $ratioExit }
+    if ($ratioExit -ne 0) {
+        Write-DispatchAttempt -Outcome 'refused-before-launch' -Cause 'product-ratio-guard' -ExitCode $ratioExit
+        exit $ratioExit
+    }
 
     # Reservation events (deliverable 7, S76): APPENDED, never updated in place. 'reserved' is
     # written before launch. The budget counts reservations and refunds only verified
     # zero-spend terminal events; absent/ambiguous outcomes stay spent.
     $reservationId = [guid]::NewGuid().ToString()
-    $null = Write-DispatchReservation -ReservationId $reservationId -State 'reserved' -Card $cardId -Kind $cardKind -Lane $Lane -RunDir $runDir
+    $null = Write-DispatchReservation -ReservationId $reservationId -State 'reserved' -Card $cardId -Kind $cardKind -Lane $Lane -RunDir $runDir -LaneAllowEdits ([bool]$AllowEdits)
 
+    Write-DispatchAttempt -Outcome 'launching' -Cause 'lane-starting' -ExitCode 0
+    $script:LaneStarting = $true
     $laneExit = $null
     $reservationOutcome = 'charged'
+    # Invoke-Lane reads this and writes a 'linked' ledger row naming its receipt instead of a second
+    # 'reserved' row. An environment variable, not a parameter, so it also crosses Start-EditingLane.ps1.
+    $env:MLV_DISPATCH_RESERVATION_ID = $reservationId
     try {
         & pwsh -NoProfile -NonInteractive -ExecutionPolicy Bypass -File $LaneRunner `
             -Lane $Lane -PromptFile $promptPath -Card $cardId -RunDir $runDir -TimeoutSec $TimeoutSec
         $laneExit = $LASTEXITCODE
+        $script:LaneLaunched = $true
         $reservationOutcome = 'charged'
     } finally {
+        Remove-Item Env:\MLV_DISPATCH_RESERVATION_ID -ErrorAction SilentlyContinue
         $reservationRecord = Write-DispatchReservation -ReservationId $reservationId -State $reservationOutcome -Card $cardId -Kind $cardKind -Lane $Lane -RunDir $runDir -ObservedExit $laneExit
     }
 
@@ -975,6 +1094,7 @@ $fence
     }
     Add-Content -LiteralPath $LogPath -Value ($record | ConvertTo-Json -Compress) -Encoding UTF8
 
+    Write-DispatchAttempt -Outcome 'launched' -Cause 'lane-returned' -ExitCode 0 -LaneExitCode $laneExit
     Write-Output "WORKSTREAM: dispatched, laneExit=$laneExit runDir=$runDir"
     exit 0
 }
@@ -986,6 +1106,7 @@ $fence
     # reason lands in stdout - and so in the loop's cycle receipt - before any process starts.
     if ($Lane -eq 'sol' -or $Lane -eq 'luna') {
         Write-Output "WORKSTREAM: REFUSED codex-lane-never-edits lane=$Lane card=$cardId"
+        Write-DispatchAttempt -Outcome 'refused-before-launch' -Cause 'codex-lane-never-edits' -ExitCode 6
         exit 6
     }
 
@@ -997,17 +1118,20 @@ $fence
     $procedureSha = Get-Prop $card 'procedureSha256'
     if (-not $procedureRel -or -not $procedureSha) {
         Write-Output "WORKSTREAM: REFUSED procedure-missing-or-drifted card=$cardId reason=no-procedure-or-sha"
+        Write-DispatchAttempt -Outcome 'refused-before-launch' -Cause 'procedure-missing-or-drifted' -ExitCode 6 -Detail 'no-procedure-or-sha'
         exit 6
     }
     $procedurePath = Join-Path $RepoRoot $procedureRel
     if (-not (Test-Path -LiteralPath $procedurePath)) {
         Write-Output "WORKSTREAM: REFUSED procedure-missing-or-drifted card=$cardId reason=file-missing path=$procedurePath"
+        Write-DispatchAttempt -Outcome 'refused-before-launch' -Cause 'procedure-missing-or-drifted' -ExitCode 6 -Detail "file-missing path=$procedurePath"
         exit 6
     }
     $actualProcedureSha = (Get-FileHash -LiteralPath $procedurePath -Algorithm SHA256).Hash.ToLowerInvariant()
     if ($actualProcedureSha -ne ([string]$procedureSha).ToLowerInvariant()) {
         Write-Output ("WORKSTREAM: REFUSED procedure-missing-or-drifted card=$cardId reason=sha-mismatch " +
             "recorded=$procedureSha actual=$actualProcedureSha")
+        Write-DispatchAttempt -Outcome 'refused-before-launch' -Cause 'procedure-missing-or-drifted' -ExitCode 6 -Detail "sha-mismatch recorded=$procedureSha actual=$actualProcedureSha"
         exit 6
     }
 
@@ -1016,6 +1140,7 @@ $fence
     $baseSha = (& git -C $RepoRoot rev-parse fork/master 2>$null | Select-Object -First 1)
     if (-not $baseSha -or $baseSha -notmatch '^[0-9a-f]{40}$') {
         Write-Output "WORKSTREAM: CANNOT-DETERMINE - could not resolve fork/master to a full sha at $RepoRoot"
+        Write-DispatchAttempt -Outcome 'refused-before-launch' -Cause 'cannot-determine-base-sha' -ExitCode 3
         exit 3
     }
 
@@ -1049,6 +1174,8 @@ $fence
         } else {
             Write-Output "WORKSTREAM: REFUSED procedure-missing-or-drifted card=$cardId detail=$composerMsg"
         }
+        $composerCause = if ($composerMsg -like 'unknown-field:*') { 'unknown-field' } else { 'procedure-missing-or-drifted' }
+        Write-DispatchAttempt -Outcome 'refused-before-launch' -Cause $composerCause -ExitCode 6 -Detail $composerMsg
         exit 6
     }
 
@@ -1061,21 +1188,160 @@ $fence
     # diagnosis-base sha - and is recorded on the receipt below. A real branch checkout, never
     # --detach: the composed procedure itself tells the lane to `git switch -c` this branch, so
     # the worktree must already be on it.
-    & git -C $RepoRoot -c core.longpaths=true worktree add -b $branch $laneWorkDir $baseSha 2>&1 | Out-Null
+    #
+    # A branch left behind by an earlier attempt (the lane worktree is removed, the branch ref is
+    # not) used to make `worktree add -b` fail on every later cycle - the loop logged
+    # "worktree add failed" for PLAY-COUNTERS-CPU every 45 min from 2026-09-10. Reuse such a
+    # branch ONLY when it carries nothing beyond baseSha, and move it to baseSha first so the lane
+    # never starts from a stale tip. A branch with commits not in baseSha holds work this dispatch
+    # must not overwrite: refuse the card instead (exit 6, the loop's skip-this-track code).
+    & git -C $RepoRoot show-ref --verify --quiet "refs/heads/$branch" 2>$null
+    $branchExists = switch ($LASTEXITCODE) { 0 { $true } 1 { $false } default { $null } }
+    if ($null -eq $branchExists) {
+        Write-Output "WORKSTREAM: CANNOT-DETERMINE - could not check whether branch $branch exists"
+        Write-DispatchAttempt -Outcome 'refused-before-launch' -Cause 'cannot-determine-branch-exists' -ExitCode 3 -Detail "branch=$branch"
+        exit 3
+    }
+    if ($branchExists) {
+        $uniqueOut = @(& git -C $RepoRoot rev-list "$baseSha..refs/heads/$branch" 2>$null)
+        if ($LASTEXITCODE -ne 0) {
+            Write-Output "WORKSTREAM: CANNOT-DETERMINE - rev-list failed for existing branch $branch"
+            Write-DispatchAttempt -Outcome 'refused-before-launch' -Cause 'cannot-determine-branch-commits' -ExitCode 3 -Detail "branch=$branch"
+            exit 3
+        }
+        $unique = @($uniqueOut | Where-Object { $_ })
+        # sol PR #122 R1 BLOCKER: this arm used to be entered on $unique.Count alone, so a
+        # -ContinueFromSha whose branch happened to carry NOTHING beyond baseSha fell through to
+        # the rewind arm below - the named sha never compared, a continuation silently converted
+        # into a fresh dispatch, and `git branch -f` reachable from a continuation invocation.
+        # The gate is now on the INTENT (-ContinueFromSha was passed), never on the branch's
+        # incidental shape, so a continuation can never reach the rewind.
+        if ($ContinueFromSha) {
+            # A branch with commits not in baseSha holds work. Historically that was always a
+            # refusal - which made the board's own two-stage packet rule undispatchable, because a
+            # stage-2 lane starts from stage 1's commit BY CONSTRUCTION. Every stage 2 therefore
+            # went direct via Invoke-Lane, wrote no dispatch-attempt row, and the missing rows are
+            # what make Test-ProductRatioGuard report dispatchCoverage=PARTIAL - one of the two
+            # reasons that guard reads RED. The guard was partly RED because of THIS refusal.
+            $branchTip = (& git -C $RepoRoot rev-parse --verify "refs/heads/$branch^{commit}" 2>$null)
+            if ($LASTEXITCODE -ne 0 -or -not $branchTip) {
+                Write-Output "WORKSTREAM: CANNOT-DETERMINE - could not resolve tip of $branch"
+                Write-DispatchAttempt -Outcome 'refused-before-launch' -Cause 'cannot-determine-branch-tip' -ExitCode 3 -Detail "branch=$branch"
+                exit 3
+            }
+            $branchTip = $branchTip.Trim()
+            # Content-addressed: the caller said which commit it looked at. If the branch moved
+            # since, fail closed rather than continue onto work nobody named.
+            if ($branchTip -ne $ContinueFromSha.ToLowerInvariant() -and $branchTip -ne $ContinueFromSha) {
+                Write-Output "WORKSTREAM: REFUSED continuation-sha-mismatch card=$cardId branch=$branch expected=$ContinueFromSha actual=$branchTip"
+                Write-DispatchAttempt -Outcome 'refused-before-launch' -Cause 'continuation-sha-mismatch' -ExitCode 6 -Detail "branch=$branch expected=$ContinueFromSha actual=$branchTip"
+                exit 6
+            }
+            # A continuation EXTENDS the base; it never continues onto a branch that has diverged
+            # from it. Without this, a stale branch cut from an older master would look like a
+            # legitimate stage 1 and the lane would build on a base the board never approved.
+            & git -C $RepoRoot merge-base --is-ancestor $baseSha $branchTip 2>$null
+            if ($LASTEXITCODE -ne 0) {
+                Write-Output "WORKSTREAM: REFUSED continuation-not-descended-from-base card=$cardId branch=$branch tip=$branchTip baseSha=$baseSha"
+                Write-DispatchAttempt -Outcome 'refused-before-launch' -Cause 'continuation-not-descended-from-base' -ExitCode 6 -Detail "branch=$branch tip=$branchTip baseSha=$baseSha"
+                exit 6
+            }
+            # Reuse the worktree the branch is already checked out in, when there is one: stage 1's
+            # tree carries its build outputs, and making stage 2 rebuild from scratch is most of
+            # why the wide packets ran out of turns in the first place.
+            $existingWt = $null
+            $wtLines = @(& git -C $RepoRoot worktree list --porcelain 2>$null)
+            $wtPath = $null
+            foreach ($line in $wtLines) {
+                if ($line -like 'worktree *') { $wtPath = $line.Substring(9).Trim() }
+                elseif ($line -eq "branch refs/heads/$branch") { $existingWt = $wtPath; break }
+            }
+            if ($existingWt) {
+                # sol PR #122 R1 MAJOR: reuse used to hand the directory straight to the lane. A
+                # tree someone else left dirty carries staged, tracked or untracked changes the
+                # lane did not make and will commit as if it had. Refuse and name the paths; the
+                # owner of that work decides, never this dispatch.
+                $dirty = @(& git -C $existingWt status --porcelain 2>$null | Where-Object { $_ })
+                if ($LASTEXITCODE -ne 0) {
+                    Write-Output "WORKSTREAM: CANNOT-DETERMINE - status failed in existing worktree $existingWt"
+                    Write-DispatchAttempt -Outcome 'refused-before-launch' -Cause 'cannot-determine-worktree-status' -ExitCode 3 -Detail "workDir=$existingWt branch=$branch"
+                    exit 3
+                }
+                if ($dirty.Count -gt 0) {
+                    $names = ($dirty | Select-Object -First 10) -join '; '
+                    Write-Output "WORKSTREAM: REFUSED continuation-worktree-dirty card=$cardId workDir=$existingWt entries=$($dirty.Count) $names"
+                    Write-DispatchAttempt -Outcome 'refused-before-launch' -Cause 'continuation-worktree-dirty' -ExitCode 6 -Detail "workDir=$existingWt entries=$($dirty.Count)"
+                    exit 6
+                }
+                # The worktree must also actually BE at the tip we verified; a detached or stale
+                # HEAD there would give the lane a different tree from the one reviewed.
+                $wtHead = (& git -C $existingWt rev-parse --verify 'HEAD^{commit}' 2>$null)
+                if ($LASTEXITCODE -ne 0 -or -not $wtHead -or $wtHead.Trim() -ne $branchTip) {
+                    Write-Output "WORKSTREAM: REFUSED continuation-worktree-head-mismatch card=$cardId workDir=$existingWt head=$($wtHead) tip=$branchTip"
+                    Write-DispatchAttempt -Outcome 'refused-before-launch' -Cause 'continuation-worktree-head-mismatch' -ExitCode 6 -Detail "workDir=$existingWt head=$($wtHead) tip=$branchTip"
+                    exit 6
+                }
+                $laneWorkDir = $existingWt
+                Write-Output "WORKSTREAM: CONTINUATION card=$cardId branch=$branch tip=$branchTip reusing-worktree=$laneWorkDir"
+            } else {
+                & git -C $RepoRoot -c core.longpaths=true worktree add $laneWorkDir $branch 2>&1 | Out-Null
+                Write-Output "WORKSTREAM: CONTINUATION card=$cardId branch=$branch tip=$branchTip new-worktree=$laneWorkDir"
+            }
+            $script:IsContinuation = $true
+            $script:ContinuationTip = $branchTip
+        } else {
+            if ($unique.Count -gt 0) {
+                Write-Output "WORKSTREAM: REFUSED existing-branch-has-work card=$cardId branch=$branch commits=$($unique.Count)"
+                Write-DispatchAttempt -Outcome 'refused-before-launch' -Cause 'existing-branch-has-work' -ExitCode 6 -Detail "branch=$branch commits=$($unique.Count)"
+                exit 6
+            }
+            # Fails (and is reported) if the branch is checked out in another worktree.
+            & git -C $RepoRoot branch -f $branch $baseSha 2>&1 | Out-Null
+            if ($LASTEXITCODE -ne 0) {
+                Write-Output "WORKSTREAM: CANNOT-DETERMINE - could not move existing branch $branch to $baseSha (checked out elsewhere?)"
+                Write-DispatchAttempt -Outcome 'refused-before-launch' -Cause 'cannot-move-existing-branch' -ExitCode 3 -Detail "branch=$branch baseSha=$baseSha"
+                exit 3
+            }
+            Write-Output "WORKSTREAM: reusing existing branch $branch (no commits beyond baseSha), moved to $baseSha"
+            & git -C $RepoRoot -c core.longpaths=true worktree add $laneWorkDir $branch 2>&1 | Out-Null
+        }
+    } else {
+        if ($ContinueFromSha) {
+            Write-Output "WORKSTREAM: REFUSED continuation-branch-absent card=$cardId branch=$branch expected=$ContinueFromSha"
+            Write-DispatchAttempt -Outcome 'refused-before-launch' -Cause 'continuation-branch-absent' -ExitCode 6 -Detail "branch=$branch expected=$ContinueFromSha"
+            exit 6
+        }
+        & git -C $RepoRoot -c core.longpaths=true worktree add -b $branch $laneWorkDir $baseSha 2>&1 | Out-Null
+    }
     if ($LASTEXITCODE -ne 0) {
         Write-Output "WORKSTREAM: CANNOT-DETERMINE - git worktree add failed for $laneWorkDir at $baseSha (branch $branch)"
+        Write-DispatchAttempt -Outcome 'refused-before-launch' -Cause 'worktree-add-failed' -ExitCode 3 -Detail "workDir=$laneWorkDir baseSha=$baseSha branch=$branch"
         exit 3
     }
 
+    $script:LastWorktreeDisposition = $null
     function Remove-LaneWorktreeIfClean([string]$WorkDirToCheck) {
-        # Never removes a worktree the lane left dirty - the path is recorded on the dispatch
-        # record instead, so nothing a lane produced is silently discarded.
-        $statusOut = & git -C $WorkDirToCheck status --porcelain 2>$null
-        if ($LASTEXITCODE -eq 0 -and -not $statusOut) {
-            & git -C $RepoRoot -c core.longpaths=true worktree remove $WorkDirToCheck --force 2>&1 | Out-Null
-            return $true
+        # Loaded lazily and fail-closed: a dispatcher copied without its helper (test fixtures copy
+        # dependencies by name) must KEEP the worktree with a reason, never abort the dispatch.
+        if (-not (Get-Command Invoke-RetireLaneWorktree -ErrorAction SilentlyContinue)) {
+            try { . (Join-Path $PSScriptRoot 'Retire-LaneWorktree.ps1') } catch {
+                $script:LastWorktreeDisposition = [ordered]@{ action = 'kept'; reason = "cannot-determine: Retire-LaneWorktree.ps1 not loadable: $($_.Exception.Message)" }
+                Write-Output "WORKSTREAM: worktree left in place ($($script:LastWorktreeDisposition.reason)): $WorkDirToCheck"
+                return $false
+            }
         }
-        Write-Output "WORKSTREAM: worktree left in place (not clean): $WorkDirToCheck"
+        # Never removes a worktree the lane left dirty, unpushed or unmerged - the SAFE gate in
+        # Retire-LaneWorktree.ps1 decides, without --force, and the disposition (with its
+        # reason) is recorded on the dispatch record, so nothing a lane produced is silently
+        # discarded. The previous `worktree remove --force` after a porcelain-only check
+        # also deleted git-ignored evidence and never looked for unpushed commits.
+        # MergeTarget is the ref baseSha was resolved from: local master can lag fork/master,
+        # which would wrongly keep a worktree whose HEAD is still exactly baseSha.
+        $disp = Invoke-RetireLaneWorktree -WorkDir $WorkDirToCheck -MergeTarget 'fork/master' `
+            -QuarantineRoot (Join-Path $RepoRoot ('.claude-state\disk-hygiene\quarantine\lane-exit\' + (Get-Date).ToUniversalTime().ToString('yyyyMMdd')))
+        $script:LastWorktreeDisposition = $disp
+        if ($disp.action -eq 'retired') { return $true }
+        Write-Output "WORKSTREAM: worktree left in place ($($disp.reason)): $WorkDirToCheck"
         return $false
     }
 
@@ -1089,8 +1355,15 @@ $fence
         # The worktree above is REAL, exactly like the gh-evidence export in the read-only path
         # is real under -DryRun: what you inspect is byte-identical to what a lane would receive.
         # Nothing ran in it, so it is guaranteed clean - remove it rather than leaving debris.
-        Write-Output 'WORKSTREAM: DRY RUN - no lane dispatched. Worktree and prompt above were real and are now removed.'
-        Remove-LaneWorktreeIfClean $laneWorkDir | Out-Null
+        Write-Output 'WORKSTREAM: DRY RUN - no lane dispatched. Worktree and prompt above were real; the worktree is retired if it passes the SAFE gate.'
+        # The function also emits status lines, so its pipeline output is an array (always truthy);
+        # decide from the recorded disposition instead.
+        # Receipt BEFORE cleanup, so the cause is on disk even if cleanup hangs or the process is
+        # killed. A cleanup THROW still overwrites it with 'unhandled-error' (single-file receipt;
+        # append-only semantics are deferred to TOOL-DISPATCH-ATTEMPT-WRITE-FAILURE-1).
+        Write-DispatchAttempt -Outcome 'dry-run-not-launched' -Cause 'dry-run' -ExitCode 0
+        Remove-LaneWorktreeIfClean $laneWorkDir | Out-Host
+        if ($script:LastWorktreeDisposition -and $script:LastWorktreeDisposition.action -eq 'retired') { Write-Output "WORKSTREAM: DRY RUN worktree retired: $laneWorkDir" }
         exit 0
     }
 
@@ -1099,12 +1372,14 @@ $fence
     # between the cycle's own check and this particular start.
     if (Test-KillSwitchArmed) {
         Write-Output "WORKSTREAM: REFUSED kill-switch-armed card=$cardId"
+        Write-DispatchAttempt -Outcome 'refused-before-launch' -Cause 'kill-switch-armed' -ExitCode 6
         Remove-LaneWorktreeIfClean $laneWorkDir | Out-Null
         exit 6
     }
 
     $ratioExit = Test-RatioDispatchPermission -Kind $cardKind
     if ($ratioExit -ne 0) {
+        Write-DispatchAttempt -Outcome 'refused-before-launch' -Cause 'product-ratio-guard' -ExitCode $ratioExit
         Remove-LaneWorktreeIfClean $laneWorkDir | Out-Null
         exit $ratioExit
     }
@@ -1113,18 +1388,25 @@ $fence
     # written before launch. Zero-spend refunds require a bound terminal receipt;
     # uncertain launch failures cannot create budget.
     $reservationId = [guid]::NewGuid().ToString()
-    $null = Write-DispatchReservation -ReservationId $reservationId -State 'reserved' -Card $cardId -Kind $cardKind -Lane $Lane -RunDir $runDir
+    $null = Write-DispatchReservation -ReservationId $reservationId -State 'reserved' -Card $cardId -Kind $cardKind -Lane $Lane -RunDir $runDir -LaneAllowEdits ([bool]$AllowEdits)
 
+    Write-DispatchAttempt -Outcome 'launching' -Cause 'lane-starting' -ExitCode 0
+    $script:LaneStarting = $true
     $laneExit = $null
     $reservationOutcome = 'charged'
+    # Invoke-Lane reads this and writes a 'linked' ledger row naming its receipt instead of a second
+    # 'reserved' row. An environment variable, not a parameter, so it also crosses Start-EditingLane.ps1.
+    $env:MLV_DISPATCH_RESERVATION_ID = $reservationId
     try {
         & pwsh -NoProfile -NonInteractive -ExecutionPolicy Bypass -File $StartEditingLane `
             -Lane $Lane -PromptFile $promptPath -WorkDir $laneWorkDir -Card $cardId -RunDir $runDir `
             -ExtraReadDir $runDir -TimeoutSec $TimeoutSec
         $laneExit = $LASTEXITCODE
+        $script:LaneLaunched = $true
         # The terminal writer derives any refund from the actual receipt bytes.
         $reservationOutcome = 'charged'
     } finally {
+        Remove-Item Env:\MLV_DISPATCH_RESERVATION_ID -ErrorAction SilentlyContinue
         $reservationRecord = Write-DispatchReservation -ReservationId $reservationId -State $reservationOutcome -Card $cardId -Kind $cardKind -Lane $Lane -RunDir $runDir -ObservedExit $laneExit
     }
 
@@ -1145,6 +1427,7 @@ $fence
         promptPath      = $promptPath
         runDir          = $runDir
         worktreeRemoved = $cleanRemoved
+        worktreeDisposition = $script:LastWorktreeDisposition
         dispatchedUtc   = (Get-Date).ToUniversalTime().ToString('o')
         laneExitCode    = $laneExit
         laneCostUsd     = $reservationRecord.laneCostUsd
@@ -1152,5 +1435,6 @@ $fence
     }
     Add-Content -LiteralPath $LogPath -Value ($record | ConvertTo-Json -Compress) -Encoding UTF8
 
+    Write-DispatchAttempt -Outcome 'launched' -Cause 'lane-returned' -ExitCode 0 -LaneExitCode $laneExit
     Write-Output "WORKSTREAM: dispatched, laneExit=$laneExit runDir=$runDir workDir=$laneWorkDir"
     exit 0

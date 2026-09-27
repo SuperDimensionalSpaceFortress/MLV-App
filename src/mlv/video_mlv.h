@@ -39,6 +39,29 @@ int mlvRawFrameInputCapacity(int width, int height, int bitdepth,
                              size_t * packed_size,
                              size_t * allocation_size);
 
+/* The linearisation LUT is indexed by a full 16-bit sample, so it is always
+ * allocated at this entry count and a CURV block may never claim more. */
+#define MLV_LINEARISE_LUT_ENTRIES 65536u
+
+/* Bound the file-controlled CURV payload to that allocation before any read.
+ * Returns 0 for a block that is short, empty, oversized, or whose payload is
+ * not a whole number of uint16 samples. Exposed for sizing regression tests. */
+int mlvCurvLutEntryCount(uint32_t block_size, uint32_t * lut_entries);
+
+/* Fixed prefix of the bayer JPEG2000 VIDF payload: layout version plus an
+ * offset/size pair per quarter-resolution channel. */
+#define MLV_JPEG2K_BAYER_HEADER_BYTES 36u
+
+/* Validate the file-controlled JPEG2000 bayer channel table against the frame
+ * bytes actually read and against the RAWI geometry, before any pointer
+ * arithmetic or decode. Returns the quarter-frame dimensions every channel must
+ * decode to. Exposed for sizing regression tests. */
+int mlvJpeg2kBayerLayoutIsValid(size_t frame_size, int width, int height,
+                                const uint32_t * offsets,
+                                const uint32_t * sizes,
+                                uint32_t * quarter_width,
+                                uint32_t * quarter_height);
+
 /* Validate CinemaDNG folder metadata before it is narrowed into RAWI's
  * uint16 geometry or used by legacy int-indexed processing paths. */
 int mlvDngSequenceGeometryIsRepresentable(uint32_t width, uint32_t height,
@@ -74,7 +97,7 @@ enum open_mode { MLV_OPEN_FULL, MLV_OPEN_MAPP, MLV_OPEN_PREVIEW };
 /* Functions for saving cut or averaged MLV */
 int saveMlvHeaders(mlvObject_t * video, FILE * output_mlv, int export_audio, int export_mode, uint32_t frame_start, uint32_t frame_end, const char * version, char * error_message);
 int saveMlvAVFrame(mlvObject_t * video, FILE * output_mlv, int export_audio, int export_mode, uint32_t frame_start, uint32_t frame_end, uint32_t frame_index, uint64_t * avg_buf, char * error_message);
-enum export_mode { MLV_FAST_PASS, MLV_COMPRESS, MLV_DECOMPRESS, MLV_AVERAGED_FRAME, MLV_DF_INT };
+enum export_mode { MLV_FAST_PASS, MLV_LJ92, MLV_DECOMPRESS, MLV_AVERAGED_FRAME, MLV_DF_INT, MLV_JP2K_LOW, MLV_JP2K_MED, MLV_JP2K_HIGH, MLV_JP2K_VERYHIGH, MLV_JP2K_VISULOSSLESS };
 /* from darkframe.c */
 extern int df_init(mlvObject_t * video);
 

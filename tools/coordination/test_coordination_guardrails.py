@@ -999,6 +999,33 @@ CLAUDE_SUCCESS_QUOTING_ENVELOPE = (
     '"num_turns":3}\n'
 )
 
+# Measured 2026-09-15, fleet-runs\ws-PLAY-COUNTERS-CPU-B-20260915T080318Z: the lane CLI's OAuth token
+# expired after an account rotation. exit 1 in 5.9 s, USD 0, and no api_error_status - yet the
+# receipt carried providerRefusal=null, so a dead login read as an ordinary incomplete run.
+REAL_CLAUDE_OAUTH_EXPIRED_ENVELOPE = (
+    '{"type":"result","subtype":"success","is_error":true,"api_error_status":null,'
+    '"result":"Failed to authenticate: OAuth session expired and could not be refreshed",'
+    '"terminal_reason":"api_error","num_turns":1}\n'
+)
+
+
+def test_an_expired_claude_oauth_session_is_a_provider_auth_refusal(tmp_path):
+    r = _classify(tmp_path, "", "claude", answer=REAL_CLAUDE_OAUTH_EXPIRED_ENVELOPE)
+    assert r is not None and r["kind"] == "provider-auth", r
+    assert "owner re-authenticates" in r["remedy"], r
+    # Quoting the phrase in a SUCCESSFUL answer is still not a refusal.
+    quoting = ('{"type":"result","subtype":"success","is_error":false,'
+               '"result":"the log said Failed to authenticate: OAuth session expired","num_turns":2}\n')
+    assert _classify(tmp_path, "", "claude", answer=quoting) is None
+    # sol PR #117 BLOCKER repro: a status on a SUCCESSFUL envelope must not let quoted text classify.
+    quoting_with_status = ('{"type":"result","subtype":"success","is_error":false,"api_error_status":401,'
+                           '"result":"Failed to authenticate: OAuth session expired"}\n')
+    assert _classify(tmp_path, "", "claude", answer=quoting_with_status) is None
+    # ...while the numeric 429 status still classifies on its own.
+    status_429 = '{"type":"result","subtype":"success","is_error":false,"api_error_status":429,"result":"ok"}\n'
+    r429 = _classify(tmp_path, "", "claude", answer=status_429)
+    assert r429 is not None and r429["kind"] == "provider-rate-limit", r429
+
 
 def _classify(tmp_path, text, engine, prompt="", answer=""):
     src = tmp_path / "lane-stderr.txt"
@@ -1188,7 +1215,90 @@ def test_invoke_lane_records_a_provider_refusal_as_refused_not_complete():
     assert "-Prompt $Prompt" in body, "the echoed prompt must be excluded from classification (sol PR #80 R1 BLOCKER)"
     assert "providerRefusal = $providerRefusal" in body, "the receipt must carry the refusal verbatim"
     assert "elseif ($null -ne $providerRefusal) { 'refused' }" in body, "state must have a third value"
-    assert "$null -eq $providerRefusal -and $exitCode -ne -999" in body, "complete must be false on refusal"
+    assert "$null -eq $failure -and $null -eq $providerRefusal -and $processEnded -and $workEvidence.workCompleted -eq $true" in body, (
+        "complete must be false on refusal, on failure, and without positive work evidence"
+    )
+
+
+# --- Invoke-Lane: `complete` is POSITIVE evidence the work finished, never "the process ended" ---
+# Incident 2026-09-14, fleet-runs\ws-PLAY-COUNTERS-CPU-20260914T151951Z: exitCode 1 and this
+# envelope (trimmed to the deciding fields), yet the receipt said state=complete, complete=true.
+REAL_CLAUDE_MAX_TURNS_ENVELOPE = (
+    '{"type":"result","subtype":"error_max_turns","is_error":true,"num_turns":66,'
+    '"stop_reason":"tool_use","terminal_reason":"max_turns","total_cost_usd":4.87,'
+    '"errors":["Reached maximum number of turns (65)"]}\n'
+)
+CLAUDE_SUCCESS_ENVELOPE = (
+    '{"type":"result","subtype":"success","is_error":false,"num_turns":18,'
+    '"stop_reason":"end_turn","terminal_reason":"completed","result":"done"}\n'
+)
+# Measured on this board: is_error=true while subtype still says success.
+CLAUDE_API_ERROR_SUCCESS_SUBTYPE_ENVELOPE = (
+    '{"type":"result","subtype":"success","is_error":true,"terminal_reason":"api_error","result":"x"}\n'
+)
+
+
+def _work_evidence(tmp_path, engine, answer, exit_code):
+    asrc = tmp_path / "lane-answer.txt"
+    asrc.write_text(answer, encoding="utf-8")
+    cmd = (
+        f". '{REFUSAL_HELPER}'; "
+        f"$a = [IO.File]::ReadAllText('{asrc}'); "
+        f"Get-LaneWorkEvidence -Engine '{engine}' -Answer $a -ExitCode {exit_code} | ConvertTo-Json -Compress"
+    )
+    out = subprocess.run(
+        ["pwsh", "-NoLogo", "-NoProfile", "-NonInteractive", "-Command", cmd],
+        text=True, capture_output=True,
+    )
+    assert out.returncode == 0, out.stderr
+    return json.loads(out.stdout.strip().splitlines()[-1])
+
+
+def test_work_evidence_falsifier_exit_1_max_turns_is_not_complete(tmp_path):
+    r = _work_evidence(tmp_path, "claude", REAL_CLAUDE_MAX_TURNS_ENVELOPE, 1)
+    assert r["workCompleted"] is False, r
+    assert r["subtype"] == "error_max_turns" and r["terminalReason"] == "max_turns", r
+
+
+def test_work_evidence_max_turns_is_not_complete_even_with_exit_0(tmp_path):
+    # The envelope alone must defeat completion: exit code is necessary, never sufficient.
+    r = _work_evidence(tmp_path, "claude", REAL_CLAUDE_MAX_TURNS_ENVELOPE, 0)
+    assert r["workCompleted"] is False, r
+    assert r["reason"] == "envelope-is-error", r
+
+
+def test_work_evidence_requires_every_success_signal(tmp_path):
+    assert _work_evidence(tmp_path, "claude", CLAUDE_SUCCESS_ENVELOPE, 0)["workCompleted"] is True
+    assert _work_evidence(tmp_path, "claude", CLAUDE_API_ERROR_SUCCESS_SUBTYPE_ENVELOPE, 0)["workCompleted"] is False
+    # One falsifier per remaining conjunct (degraded review PR #111, opus-002 major): each envelope
+    # passes every other guard, so deleting exactly that guard turns this red.
+    bad_subtype = '{"type":"result","subtype":"error_during_execution","is_error":false,"terminal_reason":"completed"}\n'
+    r = _work_evidence(tmp_path, "claude", bad_subtype, 0)
+    assert r["workCompleted"] is False and r["reason"] == "subtype-error_during_execution", r
+    bad_terminal = '{"type":"result","subtype":"success","is_error":false,"terminal_reason":"max_turns"}\n'
+    r = _work_evidence(tmp_path, "claude", bad_terminal, 0)
+    assert r["workCompleted"] is False and r["reason"] == "terminal-reason-max_turns", r
+    no_is_error = '{"type":"result","subtype":"success","terminal_reason":"completed"}\n'
+    r = _work_evidence(tmp_path, "claude", no_is_error, 0)
+    assert r["workCompleted"] is False and r["reason"] == "envelope-is-error-absent", r
+    # terminal_reason absent on an otherwise-successful envelope is still completion.
+    no_terminal = '{"type":"result","subtype":"success","is_error":false}\n'
+    assert _work_evidence(tmp_path, "claude", no_terminal, 0)["workCompleted"] is True
+    # No envelope on the claude engine is absence of evidence, not completion.
+    assert _work_evidence(tmp_path, "claude", "", 0)["reason"] == "no-result-envelope"
+    assert _work_evidence(tmp_path, "claude", "not json at all", 0)["workCompleted"] is False
+    # codex exposes no envelope: exit 0 is the only observable, and non-zero defeats it.
+    assert _work_evidence(tmp_path, "codex", "answer", 0)["workCompleted"] is True
+    assert _work_evidence(tmp_path, "codex", "answer", 1)["workCompleted"] is False
+
+
+def test_invoke_lane_receipt_separates_process_ended_from_complete():
+    body = LANE_RUNNER.read_text(encoding="utf-8")
+    assert "processEnded = $processEnded" in body
+    assert "complete     = $workCompleted" in body
+    assert "workEvidence = $workEvidence" in body
+    assert "elseif ($workCompleted) { 'complete' }" in body, "state=complete must require work evidence"
+    assert "elseif ($processEnded) { 'ended-incomplete' }" in body
 
 
 def test_invoke_lane_propagates_a_refusal_as_125_ahead_of_the_child_code():
@@ -1199,6 +1309,269 @@ def test_invoke_lane_propagates_a_refusal_as_125_ahead_of_the_child_code():
     i_refused = body.index("{ $null -ne $providerRefusal } { 125; break }")
     i_timeout = body.index("-1      { 124 }")
     assert i_refused < i_timeout
+
+
+# =============================================================================================
+# ASTRA-LANE-1: close the name-keyed edit hole, make Claude-lane effort real, add a read-only
+# Astra judgement lane.
+# =============================================================================================
+
+
+def test_invoke_lane_edit_refusal_is_keyed_on_engine_not_lane_name():
+    """THE HOLE: the old guard was `$Lane -eq 'sol' -or $Lane -eq 'luna'`, an enumerated list of
+    lane NAMES. A new codex row (astra) added to $LANES without also being added to that list
+    would silently pass -AllowEdits through to codex exec with workspace-write and no Claude
+    hook watching it. Keying on `$LANES[$Lane].engine -eq 'codex'` makes every future codex row
+    refuse edits by construction, with nothing left to remember to update."""
+    body = LANE_RUNNER.read_text(encoding="utf-8")
+    assert "$AllowEdits -and $LANES[$Lane].engine -eq 'codex'" in body, (
+        "the edit-refusal guard must read the engine out of the lane table, not enumerate names"
+    )
+    assert "$Lane -eq 'sol' -or $Lane -eq 'luna'" not in body, (
+        "the name-enumerated guard is exactly the hole this change closes"
+    )
+
+
+def test_invoke_lane_astra_edit_is_refused_before_any_rundir_is_created(tmp_path):
+    cmd = (
+        "try { & '%s' -Lane astra -Prompt 'x' -WorkDir '%s' -AllowEdits -AllowedTools 'Read' } "
+        "catch { $_.Exception.Message }" % (LANE_RUNNER.as_posix(), tmp_path.as_posix())
+    )
+    result = run_pwsh_command(cmd)
+    assert "codex-lane-never-edits" in (result.stdout + result.stderr), result.stdout + result.stderr
+    assert not (tmp_path / ".claude-state" / "fleet-runs").exists(), (
+        "a run dir was created before the edit refusal fired -- the refusal must precede any "
+        "run-dir or receipt-slot creation"
+    )
+
+
+def test_invoke_lane_sol_edit_refusal_still_works_after_the_engine_rekey(tmp_path):
+    # Regression: re-keying the guard from lane name to engine must not change sol/luna's own
+    # outcome, only how it is decided.
+    cmd = (
+        "try { & '%s' -Lane sol -Prompt 'x' -WorkDir '%s' -AllowEdits -AllowedTools 'Read' } "
+        "catch { $_.Exception.Message }" % (LANE_RUNNER.as_posix(), tmp_path.as_posix())
+    )
+    result = run_pwsh_command(cmd)
+    assert "codex-lane-never-edits" in (result.stdout + result.stderr), result.stdout + result.stderr
+
+
+def test_invoke_lane_sonnet_edit_is_not_refused_by_the_codex_only_guard(tmp_path):
+    # Control: a claude-engine lane must still reach the (separate) allowlist-required guard,
+    # never the codex-only refusal -- proves the rekey did not widen the refusal to every engine.
+    cmd = (
+        "try { & '%s' -Lane sonnet -Prompt 'x' -WorkDir '%s' -AllowEdits -AllowedTools 'ALL' } "
+        "catch { $_.Exception.Message }" % (LANE_RUNNER.as_posix(), tmp_path.as_posix())
+    )
+    result = run_pwsh_command(cmd)
+    blob = result.stdout + result.stderr
+    assert "allowlist-required" in blob, blob
+    assert "codex-lane-never-edits" not in blob, blob
+
+
+def test_lane_provider_refusal_classifies_by_engine_not_lane_name():
+    """Astra needs no new branch here: Get-ProviderRefusal / Get-RefusalKind take only
+    -Engine (never a lane id), and Invoke-Lane.ps1 always calls it with -Engine $cfg.engine.
+    A new codex-engine lane is classified identically to sol/luna with zero changes to this
+    file -- confirmed rather than assumed, per the packet's own instruction to check which."""
+    refusal_body = REFUSAL_HELPER.read_text(encoding="utf-8")
+    assert "function Get-RefusalKind" in refusal_body
+    assert "$Lane" not in refusal_body, (
+        "lane-provider-refusal.ps1 must stay engine-keyed; a lane-name branch here would need "
+        "a matching astra arm and silently miss the next new lane too"
+    )
+    lane_body = LANE_RUNNER.read_text(encoding="utf-8")
+    assert "Get-ProviderRefusal -Text $stderrText -Answer $stdout -Engine $cfg.engine -Prompt $Prompt" in lane_body
+
+
+def test_claude_lane_child_effort_applies_the_resolved_table_effort_not_only_an_override():
+    """THE BUG: only an explicit -ReasoningEffort ever reached CLAUDE_CODE_EFFORT_LEVEL, so a
+    lane dispatched with no override (the common case) ran at whatever the claude CLI's own
+    default effort is -- while the receipt recorded $cfg.effort (the table value) as if it had
+    been applied. $cfg.effort already IS the effective value by this point (the table default,
+    overridden by -ReasoningEffort when supplied at line ~281), so gating the environment
+    variable on $cfg.effort instead of the raw override makes what runs match what is recorded,
+    and an explicit override still wins because it already mutated $cfg.effort upstream."""
+    body = LANE_RUNNER.read_text(encoding="utf-8")
+    assert "if ($cfg.engine -eq 'claude' -and $cfg.effort) {" in body, (
+        "the environment-variable gate must key on the resolved $cfg.effort, not the raw override"
+    )
+    assert "$psi.Environment['CLAUDE_CODE_EFFORT_LEVEL'] = $cfg.effort" in body
+    assert "$psi.Environment['CLAUDE_CODE_EFFORT_LEVEL'] = $ReasoningEffort" not in body, (
+        "the old gate ignored every table-default effort for a lane with no explicit override"
+    )
+    # the override must still take effect, and must do so BEFORE the environment variable is set
+    i_override = body.index("if ($ReasoningEffort) { $cfg.effort = $ReasoningEffort }")
+    i_applied = body.index("if ($cfg.engine -eq 'claude' -and $cfg.effort) {")
+    assert i_override < i_applied, "an explicit -ReasoningEffort must resolve into $cfg.effort before it is applied"
+
+
+def test_receipt_effort_field_already_records_the_same_resolved_value_that_is_applied():
+    # The receipt's `effort` field reads $cfg.effort -- the same variable now gating the
+    # environment variable above -- so a claude lane's receipt can never again claim an effort
+    # that was not actually requested of the child process.
+    body = LANE_RUNNER.read_text(encoding="utf-8")
+    assert "effort       = $cfg.effort" in body
+
+
+def test_fable_lane_resolves_to_high_effort_by_default():
+    # Binding fleet owner ruling, 2026-09-08: Fable spends tokens only on important complex
+    # reviews and runs at high effort by default (agents/orchestration-tiering.md).
+    # LANE-MODEL-CURRENCY-1 (2026-09-26): the pinned id `claude-fable-5` is replaced by the
+    # floating CLI alias `fable`, so the row can never go stale the way a pinned id would.
+    body = LANE_RUNNER.read_text(encoding="utf-8")
+    assert "fable  = @{ engine = 'claude'; model = 'fable';  effort = 'high';" in body
+
+
+def test_astra_lane_row_is_a_read_only_high_effort_codex_judgement_lane():
+    # LANE-MODEL-CURRENCY-1 (owner ruling 2026-09-26): astra's earlier 'xhigh' effort and
+    # pinned `gpt-6-astra` id are both superseded -- every lane, astra included, now runs at
+    # 'high' effort (never max/xhigh), and a codex row names a TIER ('astra'), resolved to the
+    # current highest-version slug at launch by Resolve-CodexModelTier, never a pinned slug.
+    body = LANE_RUNNER.read_text(encoding="utf-8")
+    assert "astra  = @{ engine = 'codex';  tier = 'astra';   effort = 'high'; role = 'design-arbiter' }" in body
+    assert "ValidateSet('opus', 'sonnet', 'fable', 'sol', 'luna', 'astra')" in body
+
+
+def test_lanes_table_pins_no_model_id_and_every_effort_is_high():
+    # LANE-MODEL-CURRENCY-1: the defect class this card closes is a version written down
+    # somewhere going stale. Every claude row's `model` must be a bare CLI alias (never a
+    # `claude-*` id), every codex row must name a `tier` (never a `gpt-*` id), and every row's
+    # effort must be exactly 'high' -- never max/xhigh, per the owner's ruling.
+    body = LANE_RUNNER.read_text(encoding="utf-8")
+    lanes_block = body[body.index("$LANES = @{"):body.index("# Absolute launcher paths")]
+    lane_lines = [ln for ln in lanes_block.splitlines() if "engine = " in ln]
+    assert len(lane_lines) == 6, "expected six lane rows (opus, sonnet, fable, sol, luna, astra)"
+    for line in lane_lines:
+        assert not re.search(r"model = 'claude-[a-z0-9.-]+'", line), (
+            "a claude-engine row pins a versioned model id instead of a floating alias: %s" % line
+        )
+        assert not re.search(r"'gpt-[0-9]", line), (
+            "a codex-engine row pins a versioned model slug instead of a tier: %s" % line
+        )
+        assert "effort = 'high'" in line, "every lane row must resolve to 'high' effort: %s" % line
+        if "engine = 'claude'" in line:
+            assert "model = '" in line and "tier = " not in line
+        else:
+            assert "tier = '" in line and "model = " not in line
+
+
+def test_astra_reuses_the_engine_generic_codex_argv_branch_verbatim():
+    """No lane-specific branch exists or is needed: the codex argv-build block keys off
+    $cfg.engine/$cfg.model/$cfg.effort/$sandbox, all resolved from the SAME table row lookup
+    every other codex lane goes through -- so astra gets `-s read-only` (the $AllowEdits-false
+    default, since astra is never granted edits) and `-c model_reasoning_effort="high"` by
+    construction, the same way sol/luna already do, without a new conditional to test."""
+    body = LANE_RUNNER.read_text(encoding="utf-8")
+    start = body.index("} else {\n    $exe  = $CODEX_EXE")
+    end = body.index("# ---------------------------------------------------------------- run, bounded")
+    codex_branch = body[start:end]
+    assert "$sandbox = if ($AllowEdits) { 'workspace-write' } else { 'read-only' }" in codex_branch
+    assert "'-s', $sandbox" in codex_branch
+    assert 'model_reasoning_effort=`"{0}`"' in codex_branch and "-f $cfg.effort" in codex_branch
+    assert "$Lane -eq" not in codex_branch, (
+        "the codex argv build must stay lane-name-agnostic; a per-name branch here is exactly "
+        "the pattern that left the edit-refusal guard stale"
+    )
+
+
+def test_xhigh_effort_is_never_assigned_to_a_claude_engine_table_row():
+    body = LANE_RUNNER.read_text(encoding="utf-8")
+    lanes_block = body[body.index("$LANES = @{"):body.index("# Absolute launcher paths")]
+    for line in lanes_block.splitlines():
+        if "engine = 'claude'" in line:
+            assert "xhigh" not in line, "a claude-engine lane row claims an xhigh effort: %s" % line
+    # The table is the only place a lane's effort is authored (line ~119's own comment); the sole
+    # runtime path that can still change it is -ReasoningEffort, whose ValidateSet excludes
+    # 'xhigh' entirely, so neither a caller override nor a codex-only table value can put 'xhigh'
+    # onto a claude lane's child process.
+    assert "[ValidateSet('', 'low', 'medium', 'high')]" in body, (
+        "the -ReasoningEffort override must not admit 'xhigh' -- that is the only runtime path "
+        "that could otherwise push an engine-illegal effort onto a claude lane"
+    )
+
+
+def test_a_real_lane_launch_refuses_any_effort_other_than_high():
+    """LANE-MODEL-CURRENCY-1 round 2 (sol blocker 1, owner ruling 2026-09-26): -ReasoningEffort's
+    ValidateSet above still syntactically admits 'low'/'medium' (existing containment fixture
+    tests rely on that to prove the override mechanically reaches the child), but a REAL launch
+    -- $CLAUDE_EXE/$CODEX_EXE unmodified from their own $REAL_CLAUDE_EXE/$REAL_CODEX_EXE twins --
+    must now refuse before ever starting a provider process. This pins the refusal's source
+    shape; tests/coordination/test_lane_containment.py::test_real_lane_launch_refuses_non_high_effort
+    proves it end-to-end against a fixture-forced 'real' launch."""
+    body = LANE_RUNNER.read_text(encoding="utf-8")
+    assert "$REAL_CLAUDE_EXE = Join-Path $env:APPDATA 'npm\\claude.cmd'" in body
+    assert "$REAL_CODEX_EXE  = Join-Path $env:APPDATA 'npm\\codex.cmd'" in body
+    assert "$ConfiguredExeForLane -eq $RealExeForLane -and $cfg.effort -ne 'high'" in body, (
+        "the refusal must be scoped to a launch whose exe was never replaced away from the real one"
+    )
+    assert 'lane-effort-must-be-high' in body
+    # The actual throw is deferred into the main try (so a refusal still yields a normal
+    # 'failed' receipt and non-zero exit), and must fire before the dispatch ledger row and
+    # before any argv/process-start code for either engine.
+    i_refusal_computed = body.index("$LaneEffortMustBeHighRefusal = ")
+    i_throw = body.index("if ($LaneEffortMustBeHighRefusal) { throw $LaneEffortMustBeHighRefusal }")
+    i_ledger = body.index("DISPATCH LEDGER ROW")
+    i_claude_argv = body.index("if ($cfg.engine -eq 'claude') {\n    $exe  = $CLAUDE_EXE")
+    assert i_refusal_computed < i_throw < i_ledger < i_claude_argv
+
+
+def test_codex_selected_model_is_recorded_before_resolved_model_is_ever_proven():
+    """LANE-MODEL-CURRENCY-1 round 2 (sol blocker 2): the pre-launch model choice is recorded
+    as selectedModel, never resolvedModel, until the child is proven to have run. Pins that
+    $ResolvedModel is no longer assigned in the codex tier-resolution block (the exact defect
+    sol's repro exercised: Process.Start throwing after the old code had already set
+    resolvedModel), and that the receipt exposes selectedModel as its own field."""
+    body = LANE_RUNNER.read_text(encoding="utf-8")
+    assert "$SelectedModel = $codexLaunchModel" in body
+    assert "$SelectedModel = $claudeLaunchModel" in body
+    assert "$ResolvedModel = $codexLaunchModel" not in body, (
+        "resolvedModel must never be assigned from the pre-launch choice before Process.Start"
+    )
+    assert "selectedModel    = $SelectedModel" in body
+    # resolvedModel is filled in for codex only after exit, gated on a clean, non-timed-out,
+    # non-empty-output completion -- the minimum evidence bar the card sets.
+    i_codex_resolved = body.index("if (-not $timedOut -and $exitCode -eq 0 -and -not [string]::IsNullOrWhiteSpace($final)) {\n        $ResolvedModel = $SelectedModel\n    }")
+    i_wait_for_exit = body.index("$exitCode = if ($timedOut) { -1 } else { $proc.ExitCode }")
+    assert i_wait_for_exit < i_codex_resolved, (
+        "the exit code must be known (the child proven to have run) before resolvedModel can be filled in"
+    )
+
+
+def test_resolve_codex_model_tier_ok_check_uses_the_strictmode_safe_indexer():
+    """CODEX-RESOLVER-UNTYPED-EDGE-1 (fable hardening): the ok-check and error extraction must
+    use the `.PSObject.Properties[name]` indexer -- the same idiom this file's own modelUsage
+    comment (see test above referencing 'PSObject.Properties[' usage) documents as safe
+    unconditionally -- never bare `.ok` dot access or `.PSObject.Properties.Name -contains`,
+    both of which throw under this file's `Set-StrictMode -Version Latest` on a resolver result
+    that is valid JSON but lacks the expected shape (e.g. '{}' or JSON without 'ok')."""
+    body = LANE_RUNNER.read_text(encoding="utf-8")
+    fn_start = body.index("function Resolve-CodexModelTier")
+    fn_end = body.index("\n}\n", fn_start)
+    fn_body = body[fn_start:fn_end]
+    assert "$resolverParsed.PSObject.Properties['ok']" in fn_body
+    assert "$resolverParsed.PSObject.Properties['error']" in fn_body
+    assert "-not $resolverParsed.ok" not in fn_body, (
+        "bare dot access on a possibly-absent 'ok' property throws under Set-StrictMode Latest"
+    )
+    assert "$resolverParsed.PSObject.Properties.Name -contains" not in fn_body, (
+        "enumerating .Name over a zero-property PSMemberInfoCollection throws under Set-StrictMode Latest"
+    )
+
+
+def test_astra_is_absent_from_the_timer_reachable_lane_lists():
+    """Structural 'the top tier never runs a heartbeat': Invoke-Workstream.ps1 and
+    Invoke-WorkstreamLoop.ps1 own SEPARATE -Lane ValidateSets and are explicitly out of scope
+    for this change. Leaving them untouched is what keeps astra unreachable from anything on a
+    schedule; this test pins that as a fact rather than an assumption."""
+    workstream_body = WORKSTREAM.read_text(encoding="utf-8")
+    loop_body = LOOP.read_text(encoding="utf-8")
+    assert "ValidateSet('opus','sonnet','fable','sol','luna')" in workstream_body
+    assert "ValidateSet('', 'opus', 'sonnet', 'fable', 'sol', 'luna')" in loop_body
+    assert "astra" not in workstream_body
+    assert "astra" not in loop_body
+
+
 # =============================================================================================
 # TOOL-LOOP-PLUMBING-1: install-arg forwarding, kind-based lane resolution, the editing dispatch
 # (worktree + composer + reservations + kill-switch recheck), and the pre-dispatch PR-review
@@ -1581,6 +1954,375 @@ def test_editing_dispatch_prints_workdir_lane_and_a_full_basesha(tmp_path):
         cleanup_lane_worktree(tmp_path, "TEST-EDIT-A")
 
 
+def _reuse_card(dual, card_id):
+    proc = write_fields_card(dual / "prompts" / "v2", card_id)
+    return {"id": card_id, "state": "queued", "track": "product", "kind": "product",
+            "owner": "sonnet", "priority": 1,
+            "procedure": ".claude-state/coordination/dual-lane/prompts/v2/fields-%s.md" % card_id,
+            "procedureSha256": sha256_of(proc)}
+
+
+def test_editing_dispatch_reuses_a_stale_branch_with_no_unique_commits_and_moves_it_to_base(tmp_path):
+    """A branch left by an earlier attempt, sitting on an OLDER commit that is an ancestor of
+    baseSha, must not block `worktree add` forever: it is reused and moved to baseSha, so the
+    lane starts from the fresh base, never the stale tip."""
+    dual, first = editing_board(tmp_path)
+    subprocess.run(["git", "branch", "product/TEST-EDIT-REUSE-1", first], cwd=tmp_path, check=True)
+    (tmp_path / "seed2.txt").write_text("more\n")
+    subprocess.run(["git", "add", "seed2.txt"], cwd=tmp_path, check=True)
+    subprocess.run(["git", "commit", "-qm", "second"], cwd=tmp_path, check=True)
+    head = git(tmp_path, "rev-parse", "HEAD")
+    subprocess.run(["git", "update-ref", "refs/remotes/fork/master", head], cwd=tmp_path, check=True)
+    try:
+        result = run_editing_dispatch(tmp_path, [_reuse_card(dual, "TEST-EDIT-REUSE-1")], "TEST-EDIT-REUSE-1")
+        assert result.returncode == 0, result.stdout + result.stderr
+        assert "reusing existing branch product/TEST-EDIT-REUSE-1" in result.stdout, result.stdout
+        assert git(tmp_path, "rev-parse", "refs/heads/product/TEST-EDIT-REUSE-1") == head
+    finally:
+        cleanup_lane_worktree(tmp_path, "TEST-EDIT-REUSE-1")
+
+
+def test_editing_dispatch_refuses_an_existing_branch_that_carries_work(tmp_path):
+    """A branch with a commit NOT in baseSha holds work; the dispatcher must refuse (exit 6)
+    and must not move or overwrite the branch."""
+    dual, head = editing_board(tmp_path)
+    subprocess.run(["git", "checkout", "-q", "-b", "product/TEST-EDIT-REUSE-2"], cwd=tmp_path, check=True)
+    (tmp_path / "work.txt").write_text("lane work\n")
+    subprocess.run(["git", "add", "work.txt"], cwd=tmp_path, check=True)
+    subprocess.run(["git", "commit", "-qm", "lane work"], cwd=tmp_path, check=True)
+    tip = git(tmp_path, "rev-parse", "HEAD")
+    subprocess.run(["git", "checkout", "-q", "--detach", head], cwd=tmp_path, check=True)
+    try:
+        result = run_editing_dispatch(tmp_path, [_reuse_card(dual, "TEST-EDIT-REUSE-2")], "TEST-EDIT-REUSE-2")
+        assert result.returncode == 6, result.stdout + result.stderr
+        assert "REFUSED existing-branch-has-work card=TEST-EDIT-REUSE-2" in result.stdout, result.stdout
+        assert git(tmp_path, "rev-parse", "refs/heads/product/TEST-EDIT-REUSE-2") == tip
+    finally:
+        cleanup_lane_worktree(tmp_path, "TEST-EDIT-REUSE-2")
+
+
+def test_continuation_dispatches_onto_a_branch_that_carries_stage_one_work(tmp_path):
+    """TOOL-DISPATCHER-NO-CONTINUATION-PATH-1. The board's two-stage packet rule (implement+commit,
+    then a FRESH lane to verify+ship) was UNDISPATCHABLE through this dispatcher: a stage-2 lane
+    starts from stage 1's commit by construction, and that was always refused. Every stage 2
+    therefore went direct via Invoke-Lane and wrote no dispatch-attempt row, which is what made
+    Test-ProductRatioGuard report dispatchCoverage=PARTIAL - one of the two arms that hold the
+    guard RED. With the tip named, the dispatch proceeds and the branch is NOT rewound."""
+    dual, head = editing_board(tmp_path)
+    subprocess.run(["git", "checkout", "-q", "-b", "product/TEST-EDIT-CONT-1"], cwd=tmp_path, check=True)
+    (tmp_path / "stage1.txt").write_text("stage one work\n")
+    subprocess.run(["git", "add", "stage1.txt"], cwd=tmp_path, check=True)
+    subprocess.run(["git", "commit", "-qm", "stage one"], cwd=tmp_path, check=True)
+    tip = git(tmp_path, "rev-parse", "HEAD")
+    subprocess.run(["git", "checkout", "-q", "--detach", head], cwd=tmp_path, check=True)
+    try:
+        result = run_editing_dispatch(tmp_path, [_reuse_card(dual, "TEST-EDIT-CONT-1")],
+                                      "TEST-EDIT-CONT-1", extra=("-ContinueFromSha", tip))
+        assert result.returncode == 0, result.stdout + result.stderr
+        assert "CONTINUATION card=TEST-EDIT-CONT-1" in result.stdout, result.stdout
+        assert tip in result.stdout, result.stdout
+        # The load-bearing assertion: stage 1's commit survived. A continuation that rewound the
+        # branch to baseSha would silently discard the very work it exists to build on.
+        assert git(tmp_path, "rev-parse", "refs/heads/product/TEST-EDIT-CONT-1") == tip
+    finally:
+        cleanup_lane_worktree(tmp_path, "TEST-EDIT-CONT-1")
+
+
+def test_continuation_refuses_when_the_branch_moved_since_the_caller_looked(tmp_path):
+    """The continuation is content-addressed on purpose. If the branch tip is not the commit the
+    caller named, fail closed: continuing onto an unnamed commit is how a dispatch silently builds
+    on a stranger's work. A bare -Continue switch could not make this distinction."""
+    dual, head = editing_board(tmp_path)
+    subprocess.run(["git", "checkout", "-q", "-b", "product/TEST-EDIT-CONT-2"], cwd=tmp_path, check=True)
+    (tmp_path / "stage1.txt").write_text("stage one work\n")
+    subprocess.run(["git", "add", "stage1.txt"], cwd=tmp_path, check=True)
+    subprocess.run(["git", "commit", "-qm", "stage one"], cwd=tmp_path, check=True)
+    stale = git(tmp_path, "rev-parse", "HEAD")
+    (tmp_path / "stage1b.txt").write_text("someone else moved it\n")
+    subprocess.run(["git", "add", "stage1b.txt"], cwd=tmp_path, check=True)
+    subprocess.run(["git", "commit", "-qm", "a later commit the caller never saw"], cwd=tmp_path, check=True)
+    actual = git(tmp_path, "rev-parse", "HEAD")
+    subprocess.run(["git", "checkout", "-q", "--detach", head], cwd=tmp_path, check=True)
+    try:
+        result = run_editing_dispatch(tmp_path, [_reuse_card(dual, "TEST-EDIT-CONT-2")],
+                                      "TEST-EDIT-CONT-2", extra=("-ContinueFromSha", stale))
+        assert result.returncode == 6, result.stdout + result.stderr
+        assert "REFUSED continuation-sha-mismatch" in result.stdout, result.stdout
+        assert git(tmp_path, "rev-parse", "refs/heads/product/TEST-EDIT-CONT-2") == actual
+    finally:
+        cleanup_lane_worktree(tmp_path, "TEST-EDIT-CONT-2")
+
+
+def test_continuation_refuses_a_branch_that_has_diverged_from_base(tmp_path):
+    """A continuation EXTENDS the approved base. A branch cut from an older master carries work
+    that was never based on what the board approved, and naming its tip must not launder that."""
+    dual, first = editing_board(tmp_path)
+    subprocess.run(["git", "checkout", "-q", "-b", "product/TEST-EDIT-CONT-3", first], cwd=tmp_path, check=True)
+    (tmp_path / "old.txt").write_text("work on an old base\n")
+    subprocess.run(["git", "add", "old.txt"], cwd=tmp_path, check=True)
+    subprocess.run(["git", "commit", "-qm", "work on an old base"], cwd=tmp_path, check=True)
+    tip = git(tmp_path, "rev-parse", "HEAD")
+    subprocess.run(["git", "checkout", "-q", "--detach", first], cwd=tmp_path, check=True)
+    (tmp_path / "moved.txt").write_text("master moved on\n")
+    subprocess.run(["git", "add", "moved.txt"], cwd=tmp_path, check=True)
+    subprocess.run(["git", "commit", "-qm", "master moved on"], cwd=tmp_path, check=True)
+    newbase = git(tmp_path, "rev-parse", "HEAD")
+    subprocess.run(["git", "update-ref", "refs/remotes/fork/master", newbase], cwd=tmp_path, check=True)
+    try:
+        result = run_editing_dispatch(tmp_path, [_reuse_card(dual, "TEST-EDIT-CONT-3")],
+                                      "TEST-EDIT-CONT-3", extra=("-ContinueFromSha", tip))
+        assert result.returncode == 6, result.stdout + result.stderr
+        assert "REFUSED continuation-not-descended-from-base" in result.stdout, result.stdout
+    finally:
+        cleanup_lane_worktree(tmp_path, "TEST-EDIT-CONT-3")
+
+
+def test_continuation_refuses_when_the_branch_does_not_exist(tmp_path):
+    """Naming a tip on a branch that is not there is a caller error, not a fresh dispatch. Falling
+    through to 'create the branch at baseSha' would silently turn a continuation into a stage 1 and
+    the lane would find none of the work its packet describes."""
+    dual, head = editing_board(tmp_path)
+    absent = "0" * 40
+    try:
+        result = run_editing_dispatch(tmp_path, [_reuse_card(dual, "TEST-EDIT-CONT-4")],
+                                      "TEST-EDIT-CONT-4", extra=("-ContinueFromSha", absent))
+        assert result.returncode == 6, result.stdout + result.stderr
+        assert "REFUSED continuation-branch-absent" in result.stdout, result.stdout
+    finally:
+        cleanup_lane_worktree(tmp_path, "TEST-EDIT-CONT-4")
+
+
+def test_continuation_on_a_branch_with_no_extra_commits_still_checks_the_sha(tmp_path):
+    """sol PR #122 R1 BLOCKER. The continuation gate was keyed on the branch carrying commits
+    beyond baseSha. A -ContinueFromSha whose branch happened to carry NOTHING beyond base fell
+    through to the fresh-dispatch arm: the named sha was never compared and `git branch -f` was
+    reached from a continuation invocation. A continuation must never be silently downgraded into
+    a fresh dispatch, and must never reach the rewind."""
+    dual, first = editing_board(tmp_path)
+    subprocess.run(["git", "branch", "product/TEST-EDIT-CONT-5", first], cwd=tmp_path, check=True)
+    (tmp_path / "seed2.txt").write_text("more\n")
+    subprocess.run(["git", "add", "seed2.txt"], cwd=tmp_path, check=True)
+    subprocess.run(["git", "commit", "-qm", "second"], cwd=tmp_path, check=True)
+    head = git(tmp_path, "rev-parse", "HEAD")
+    subprocess.run(["git", "update-ref", "refs/remotes/fork/master", head], cwd=tmp_path, check=True)
+    # The branch sits at an ANCESTOR of baseSha, so it carries nothing beyond base - the exact
+    # shape that used to bypass the sha comparison.
+    try:
+        result = run_editing_dispatch(tmp_path, [_reuse_card(dual, "TEST-EDIT-CONT-5")],
+                                      "TEST-EDIT-CONT-5", extra=("-ContinueFromSha", "0" * 40))
+        assert result.returncode == 6, result.stdout + result.stderr
+        assert "REFUSED continuation-sha-mismatch" in result.stdout, result.stdout
+        # And the rewind must NOT have happened: the branch is still where it was.
+        assert git(tmp_path, "rev-parse", "refs/heads/product/TEST-EDIT-CONT-5") == first
+        assert "reusing existing branch" not in result.stdout, result.stdout
+    finally:
+        cleanup_lane_worktree(tmp_path, "TEST-EDIT-CONT-5")
+
+
+def test_continuation_refuses_a_dirty_existing_worktree(tmp_path):
+    """sol PR #122 R1 MAJOR. Reuse handed the directory straight to the lane. A tree someone else
+    left dirty carries changes the lane did not make and would commit as its own."""
+    dual, head = editing_board(tmp_path)
+    subprocess.run(["git", "checkout", "-q", "-b", "product/TEST-EDIT-CONT-6"], cwd=tmp_path, check=True)
+    (tmp_path / "stage1.txt").write_text("stage one\n")
+    subprocess.run(["git", "add", "stage1.txt"], cwd=tmp_path, check=True)
+    subprocess.run(["git", "commit", "-qm", "stage one"], cwd=tmp_path, check=True)
+    tip = git(tmp_path, "rev-parse", "HEAD")
+    subprocess.run(["git", "checkout", "-q", "--detach", head], cwd=tmp_path, check=True)
+    wt = tmp_path / "wt-cont-6"
+    subprocess.run(["git", "worktree", "add", str(wt), "product/TEST-EDIT-CONT-6"],
+                   cwd=tmp_path, check=True, capture_output=True)
+    (wt / "someone-elses-work.txt").write_text("uncommitted\n")
+    try:
+        result = run_editing_dispatch(tmp_path, [_reuse_card(dual, "TEST-EDIT-CONT-6")],
+                                      "TEST-EDIT-CONT-6", extra=("-ContinueFromSha", tip))
+        assert result.returncode == 6, result.stdout + result.stderr
+        assert "REFUSED continuation-worktree-dirty" in result.stdout, result.stdout
+        assert (wt / "someone-elses-work.txt").exists()
+    finally:
+        subprocess.run(["git", "worktree", "remove", "--force", str(wt)], cwd=tmp_path,
+                       check=False, capture_output=True)
+        cleanup_lane_worktree(tmp_path, "TEST-EDIT-CONT-6")
+
+
+def test_continuation_reuses_a_clean_existing_worktree(tmp_path):
+    """The arm none of the round-1 tests exercised: the branch IS checked out somewhere. Stage 1's
+    tree carries its build outputs, and making stage 2 rebuild from scratch is most of why the wide
+    packets ran out of turns - so a clean, on-tip worktree must be reused, not duplicated."""
+    dual, head = editing_board(tmp_path)
+    subprocess.run(["git", "checkout", "-q", "-b", "product/TEST-EDIT-CONT-7"], cwd=tmp_path, check=True)
+    (tmp_path / "stage1.txt").write_text("stage one\n")
+    subprocess.run(["git", "add", "stage1.txt"], cwd=tmp_path, check=True)
+    subprocess.run(["git", "commit", "-qm", "stage one"], cwd=tmp_path, check=True)
+    tip = git(tmp_path, "rev-parse", "HEAD")
+    subprocess.run(["git", "checkout", "-q", "--detach", head], cwd=tmp_path, check=True)
+    wt = tmp_path / "wt-cont-7"
+    subprocess.run(["git", "worktree", "add", str(wt), "product/TEST-EDIT-CONT-7"],
+                   cwd=tmp_path, check=True, capture_output=True)
+    try:
+        result = run_editing_dispatch(tmp_path, [_reuse_card(dual, "TEST-EDIT-CONT-7")],
+                                      "TEST-EDIT-CONT-7", extra=("-ContinueFromSha", tip))
+        assert result.returncode == 0, result.stdout + result.stderr
+        assert "reusing-worktree=" in result.stdout, result.stdout
+        assert git(tmp_path, "rev-parse", "refs/heads/product/TEST-EDIT-CONT-7") == tip
+    finally:
+        subprocess.run(["git", "worktree", "remove", "--force", str(wt)], cwd=tmp_path,
+                       check=False, capture_output=True)
+        cleanup_lane_worktree(tmp_path, "TEST-EDIT-CONT-7")
+
+
+def test_a_real_refused_dispatch_leaves_a_typed_attempt_receipt(tmp_path):
+    """2026-09-14: ~90 PLAY-COUNTERS-CPU run dirs held only lane-prompt.md because a pre-launch
+    refusal reached stdout alone. A NON-dry-run refusal must leave dispatch-attempt.json naming
+    the cause, and no lane may have started (no lane receipt)."""
+    dual, head = editing_board(tmp_path)
+    subprocess.run(["git", "checkout", "-q", "-b", "product/TEST-EDIT-ATTEMPT"], cwd=tmp_path, check=True)
+    (tmp_path / "work.txt").write_text("lane work\n")
+    subprocess.run(["git", "add", "work.txt"], cwd=tmp_path, check=True)
+    subprocess.run(["git", "commit", "-qm", "lane work"], cwd=tmp_path, check=True)
+    subprocess.run(["git", "checkout", "-q", "--detach", head], cwd=tmp_path, check=True)
+    try:
+        result = run_editing_dispatch(tmp_path, [_reuse_card(dual, "TEST-EDIT-ATTEMPT")], "TEST-EDIT-ATTEMPT",
+                                      dry_run=False)
+        assert result.returncode == 6, result.stdout + result.stderr
+        run_dirs = glob.glob(str(tmp_path / ".claude-state" / "fleet-runs" / "ws-TEST-EDIT-ATTEMPT-*"))
+        assert len(run_dirs) == 1, run_dirs
+        attempt = json.loads((Path(run_dirs[0]) / "dispatch-attempt.json").read_text(encoding="utf-8"))
+        assert attempt["schema"] == "mlv-app/workstream-dispatch-attempt/v1"
+        assert attempt["outcome"] == "refused-before-launch", attempt
+        assert attempt["cause"] == "existing-branch-has-work", attempt
+        assert attempt["exitCode"] == 6 and attempt["laneReceipts"] == [], attempt
+    finally:
+        cleanup_lane_worktree(tmp_path, "TEST-EDIT-ATTEMPT")
+
+
+def test_a_terminating_error_after_the_run_dir_is_named_still_leaves_an_attempt_receipt(tmp_path):
+    """sol PR #111 R1: a THROW is an exit path too. A procedure path that is a directory passes
+    Test-Path and then makes Get-FileHash throw - after $runDir is named, before any refusal."""
+    dual, head = editing_board(tmp_path)
+    (dual / "prompts" / "v2" / "fields-TEST-EDIT-THROW.md").mkdir(parents=True)
+    item = {"id": "TEST-EDIT-THROW", "state": "queued", "track": "product", "kind": "product",
+            "owner": "sonnet", "priority": 1,
+            "procedure": ".claude-state/coordination/dual-lane/prompts/v2/fields-TEST-EDIT-THROW.md",
+            "procedureSha256": "0" * 64}
+    try:
+        result = run_editing_dispatch(tmp_path, [item], "TEST-EDIT-THROW", dry_run=False)
+        assert result.returncode != 0, result.stdout + result.stderr
+        run_dirs = glob.glob(str(tmp_path / ".claude-state" / "fleet-runs" / "ws-TEST-EDIT-THROW-*"))
+        assert len(run_dirs) == 1, (run_dirs, result.stdout, result.stderr)
+        attempt = json.loads((Path(run_dirs[0]) / "dispatch-attempt.json").read_text(encoding="utf-8"))
+        assert attempt["outcome"] == "refused-before-launch" and attempt["cause"] == "unhandled-error", attempt
+    finally:
+        cleanup_lane_worktree(tmp_path, "TEST-EDIT-THROW")
+
+
+def test_every_workstream_exit_after_the_run_dir_is_named_writes_an_attempt_receipt():
+    """Structural: once $runDir is named, every exit (DryRun included) has a Write-DispatchAttempt
+    call within the three lines above it (a worktree-cleanup call may sit between), throws are
+    covered by a guarded trap, and both launch paths record 'launched' before and after.
+    Behavioural tests cover the real refusal and throw paths; this is the cheap net for new exits."""
+    lines = WORKSTREAM.read_text(encoding="utf-8").splitlines()
+    start = next(i for i, l in enumerate(lines) if l.startswith("$runDir = Join-Path"))
+    unreceipted = []
+    for i in range(start, len(lines)):
+        if re.match(r"^\s*exit\b", lines[i]):
+            # The receipt comes first; at most a cleanup call and its status line may sit between.
+            window = [l.strip() for l in lines[i - 3:i]]
+            if any("Write-DispatchAttempt" in l for l in window) or "WORKSTREAM: dispatched" in window[-1]:
+                continue
+            unreceipted.append((i + 1, window[-1]))
+    assert not unreceipted, unreceipted
+    body = "\n".join(lines)
+    assert "if ($DryRun) { return }" not in body
+    assert body.count("-Outcome 'dry-run-not-launched'") == 2
+    assert "-Cause 'unhandled-error'" in body and re.search(r"^trap \{", body, re.M)
+    assert body.count("-Outcome 'launching' -Cause 'lane-starting'") == 2
+    assert body.count("-Outcome 'launched' -Cause 'lane-returned'") == 2
+    assert "-Outcome 'launched' -Cause 'lane-starting'" not in body
+    # sol PR #111 post-merge: 'launched' only after the child returned. Each LaneLaunched assignment
+    # must directly follow the $LASTEXITCODE capture inside the launch try, never precede the call.
+    launched_at = [i for i, l in enumerate(lines) if l.strip() == "$script:LaneLaunched = $true"]
+    assert len(launched_at) == 2, launched_at
+    for i in launched_at:
+        assert lines[i - 1].strip() == "$laneExit = $LASTEXITCODE", (i + 1, lines[i - 1])
+    assert body.count("$script:LaneStarting = $true") == 2
+    assert "elseif ($script:LaneStarting) { 'launch-unconfirmed' }" in body
+
+
+def _extract_ps_function(tmp_path, source, name):
+    extractor = tmp_path / ("extract-%s.ps1" % name)
+    extractor.write_text(
+        "param($Source,$Name)\n$tokens=$null;$errors=$null\n"
+        "$ast=[System.Management.Automation.Language.Parser]::ParseFile($Source,[ref]$tokens,[ref]$errors)\n"
+        "if($errors.Count){throw 'parse failed'}\n"
+        "$f=@($ast.FindAll({param($n) $n -is [System.Management.Automation.Language.FunctionDefinitionAst] -and $n.Name -eq $Name},$true))\n"
+        "if($f.Count -ne 1){throw 'expected one function'}\n$f[0].Extent.Text\n", encoding="utf-8")
+    out = subprocess.run(["pwsh", "-NoProfile", "-NonInteractive", "-File", str(extractor), "-Source", str(source), "-Name", name],
+                         text=True, capture_output=True)
+    assert out.returncode == 0, out.stderr
+    return out.stdout
+
+
+def test_an_unwritable_run_dir_spools_a_typed_attempt_receipt(tmp_path):
+    """sol PR #111 post-merge: a failed dispatch-attempt.json write was only printed. With the run
+    dir unwritable (its parent is a FILE), the receipt must land in the fixed spool instead."""
+    fn = _extract_ps_function(tmp_path, WORKSTREAM, "Write-DispatchAttempt")
+    blocker = tmp_path / "not-a-dir"
+    blocker.write_text("x", encoding="utf-8")
+    harness = tmp_path / "spool-harness.ps1"
+    harness.write_text(
+        "$ErrorActionPreference='Stop'\n"
+        "$RepoRoot='" + str(tmp_path).replace("'", "''") + "'\n"
+        "$runDir='" + str(blocker / "ws-CARD-1-T").replace("'", "''") + "'\n"
+        "$cardId='CARD-1';$cardTrack='product';$Lane='sonnet';$engine='claude';$AllowEdits=$true\n"
+        + fn + "\nWrite-DispatchAttempt -Outcome 'refused-before-launch' -Cause 'worktree-add-failed' -ExitCode 3\n",
+        encoding="utf-8")
+    result = subprocess.run(["pwsh", "-NoProfile", "-NonInteractive", "-File", str(harness)], text=True, capture_output=True)
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert "dispatch-attempt receipt NOT written" in result.stdout and "spooled=" in result.stdout, result.stdout
+    spooled = list((tmp_path / ".claude-state" / "fleet-runs" / "dispatch-attempt-spool").glob("CARD-1-*-refused-before-launch.json"))
+    assert len(spooled) == 1, spooled
+    rec = json.loads(spooled[0].read_text(encoding="utf-8"))
+    assert rec["cause"] == "worktree-add-failed" and rec["exitCode"] == 3 and rec["runDirWriteError"], rec
+
+
+def test_the_loop_carries_receipt_write_failures_into_its_cycle_receipt(tmp_path):
+    extractor = tmp_path / "extract-loop.ps1"
+    extractor.write_text("param($Source)\n$tokens=$null;$errors=$null\n"
+        "$ast=[System.Management.Automation.Language.Parser]::ParseFile($Source,[ref]$tokens,[ref]$errors)\n"
+        "if($errors.Count){throw 'loop parse failed'}\n"
+        "$loops=@($ast.FindAll({param($node) $node -is [System.Management.Automation.Language.ForEachStatementAst] -and $node.Variable.VariablePath.UserPath -eq 'track'},$true))\n"
+        "if($loops.Count -ne 1){throw 'expected one track loop'}\n$loops[0].Extent.Text\n", encoding="utf-8")
+    extracted = subprocess.run(["pwsh", "-NoProfile", "-NonInteractive", "-File", str(extractor), "-Source", str(LOOP_SCRIPT)], text=True, capture_output=True)
+    assert extracted.returncode == 0, extracted.stderr
+    dispatcher = tmp_path / "fake-dispatcher.ps1"
+    dispatcher.write_text("param($Track)\nWrite-Output ('WORKSTREAM: track=' + $Track + ' card=C1')\n"
+                          "Write-Output 'WORKSTREAM: dispatch-attempt receipt NOT written (disk full) runDir=X spool ALSO failed (disk full)'\nexit 0\n", encoding="ascii")
+    harness = tmp_path / "loop-body.ps1"
+    harness.write_text("$Tracks=@('product')\n$dispatched=@()\n$skipped=@()\n$receiptWriteFailures=@()\n$MaxDispatchesPerCycle=1\n$DailyBudget=9\n$spentToday=0\n$Dispatcher='"
+        + str(dispatcher).replace("'", "''") + "'\n$TimeoutSec=1\n$StaleHours=1\n$Lane=''\n$AllowEdits=$false\n$DryRun=$false\n"
+        + extracted.stdout + "\n[ordered]@{dispatched=$dispatched;receiptWriteFailures=$receiptWriteFailures}|ConvertTo-Json -Depth 6 -Compress\n", encoding="utf-8")
+    result = subprocess.run(["pwsh", "-NoProfile", "-NonInteractive", "-File", str(harness)], text=True, capture_output=True)
+    assert result.returncode == 0, result.stderr
+    payload = json.loads(result.stdout.splitlines()[-1])
+    failures = payload["receiptWriteFailures"]
+    if isinstance(failures, dict):
+        failures = [failures]
+    assert len(failures) == 1 and "disk full" in failures[0]["line"] and failures[0]["track"] == "product", payload
+    assert "receiptWriteFailures = $receiptWriteFailures" in LOOP_SCRIPT.read_text(encoding="utf-8")
+
+
+def test_editing_dispatch_creates_a_new_branch_when_none_exists(tmp_path):
+    dual, head = editing_board(tmp_path)
+    try:
+        result = run_editing_dispatch(tmp_path, [_reuse_card(dual, "TEST-EDIT-REUSE-3")], "TEST-EDIT-REUSE-3")
+        assert result.returncode == 0, result.stdout + result.stderr
+        assert "reusing existing branch" not in result.stdout
+        assert git(tmp_path, "rev-parse", "refs/heads/product/TEST-EDIT-REUSE-3") == head
+    finally:
+        cleanup_lane_worktree(tmp_path, "TEST-EDIT-REUSE-3")
+
+
 def test_two_editing_dispatches_get_two_distinct_worktree_paths(tmp_path):
     dual, head = editing_board(tmp_path)
     proc_a = write_fields_card(dual / "prompts" / "v2", "TEST-EDIT-B1")
@@ -1673,6 +2415,14 @@ def test_a_real_editing_dispatch_reserves_before_it_starts_and_charges_after(tmp
         assert rows[0]["state"] == "reserved", rows
         assert rows[1]["state"] == "charged", rows
         assert rows[0]["reservationId"] == rows[1]["reservationId"]
+        # Attempt history is append-only: 'launching' before the child, 'launched' after it returned.
+        run_dirs = glob.glob(str(tmp_path / ".claude-state" / "fleet-runs" / "ws-TEST-EDIT-RES-1-*"))
+        assert len(run_dirs) == 1, run_dirs
+        history = [json.loads(l) for l in (Path(run_dirs[0]) / "dispatch-attempts.jsonl").read_text(encoding="utf-8").splitlines() if l.strip()]
+        assert [h["outcome"] for h in history] == ["launching", "launched"], history
+        assert history[1]["cause"] == "lane-returned" and history[1]["laneExitCode"] == 0, history
+        latest = json.loads((Path(run_dirs[0]) / "dispatch-attempt.json").read_text(encoding="utf-8"))
+        assert latest["outcome"] == "launched", latest
     finally:
         cleanup_lane_worktree(tmp_path, "TEST-EDIT-RES-1")
 
@@ -2099,6 +2849,8 @@ def test_exporter_writes_both_exports_byte_exact(tmp_path):
     checks_doc = json.loads(checks_raw.decode("utf-8"))
     review_doc = json.loads(review_raw.decode("utf-8"))
     assert checks_doc["checks"] == checks_payload
+    assert review_doc["number"] == 99
+    assert review_doc["stateBefore"] == "OPEN" and review_doc["stateAfter"] == "OPEN"
     assert review_doc["headRefOidBefore"] == head_sha
     assert review_doc["headRefOidAfter"] == head_sha
     assert review_doc["requiredContextsBefore"] == ["build"]
@@ -2639,7 +3391,7 @@ def ratio_full_dispatch_board(tmp_path, guard_payload, use_real_guard=False):
     tool_dir.mkdir(parents=True, exist_ok=True)
     shutil.copy2(RATIO_WORKSTREAM, tool_dir / "Invoke-Workstream.ps1")
     shutil.copy2(RATIO_GUARD if use_real_guard else guard, tool_dir / "Test-ProductRatioGuard.ps1")
-    for dependency in ("landing-probe.ps1", "compose-lane-prompt-core.ps1"):
+    for dependency in ("landing-probe.ps1", "compose-lane-prompt-core.ps1", "Retire-LaneWorktree.ps1"):
         shutil.copy2(RATIO_WORKSTREAM.parent / dependency, tool_dir / dependency)
     (tool_dir / "Invoke-Lane.ps1").write_text("param($Lane,$PromptFile,$Card,$RunDir,$TimeoutSec)\nWrite-Output 'RATIO_FAKE_LANE'\nexit 0\n", encoding="ascii")
     (tool_dir / "Export-PrReviewEvidence.ps1").write_text("exit 0\n", encoding="ascii")
@@ -2917,3 +3669,370 @@ $row|ConvertTo-Json -Depth 6 -Compress
         assert terminal['receiptSha256'] == sha256_of(path)
         assert (tmp_path / terminal['receiptPath']).resolve() == path.resolve()
         assert terminal['laneCostReported'] is True and terminal['laneCostUsd'] == 0
+
+
+# --- TOOL-GUARD-COVERAGE-ARM-UNSATISFIABLE-1: COMPLETE coverage through the REAL reader. Plan 0.6
+# ratified that unfreezing needs seven days of version-enforced all-venue accounting; before this,
+# Read-DispatchEvidence returned PARTIAL on every path, so every GREEN test injected COMPLETE.
+# These cases drive the actual guard against a disposable repo, ledger and receipt tree.
+
+COVERAGE_WINDOW_START = RATIO_SOURCE_AS_OF - 7 * RATIO_SOURCE_DAY
+COVERAGE_LANDED = RATIO_SOURCE_AS_OF - 20 * RATIO_SOURCE_DAY
+
+
+def coverage_stamp(epoch):
+    return datetime.fromtimestamp(epoch, timezone.utc).isoformat().replace("+00:00", "Z")
+
+
+def coverage_repo(tmp_path, landed=True):
+    """Share 6/10 over the window, two recognized product PRs, so only coverage and rate decide."""
+    tmp_path.mkdir(parents=True, exist_ok=True)
+    repo = ratio_source_init_repo(tmp_path / "repo")
+    # A root commit outside the window, so every in-window landing has a first parent.
+    ratio_source_commit(repo, "base", RATIO_SOURCE_AS_OF - 30 * RATIO_SOURCE_DAY, {"docs/base.txt": "base"})
+    # The ledger writer "lands" on the source ref before the window; rows older than this commit never start the clock.
+    if landed:
+        ratio_source_commit(repo, "land ledger writer", COVERAGE_LANDED, {"tools/coordination/Invoke-Lane.ps1": "function Add-DispatchLedgerRow([string]$Path, $Row) { } # MLV-DISPATCH-LEDGER-WRITER-V3-SERIALIZED\n"})
+    for index in range(10):
+        if index < 6:
+            subject, path = f"product change {index} (#{101 + index % 2})", f"src/p{index}.txt"
+        else:
+            subject, path = f"docs {index}", f"docs/d{index}.txt"
+        ratio_source_commit(repo, subject, RATIO_SOURCE_AS_OF - RATIO_SOURCE_DAY + index, {path: str(index)})
+    return repo
+
+
+def coverage_receipt(fleet, name, epoch, *, text=None, schema="mlv-app/fleet-lane-receipt/v1"):
+    path = fleet / "run" / name
+    path.parent.mkdir(parents=True, exist_ok=True)
+    if text is None:
+        text = json.dumps({"schema": schema, "state": "complete", "lane": "sol", "startedUtc": coverage_stamp(epoch)})
+    path.write_text(text, encoding="utf-8")
+    os.utime(path, (epoch, epoch))
+    return path
+
+
+def coverage_row(epoch, state="reserved", receipt=None, version=2, **extra):
+    row = {"state": state, "recordedUtc": coverage_stamp(epoch), "lane": "sol", "card": "C"}
+    if version is not None:
+        row["schemaVersion"] = version
+    if receipt is not None:
+        row["receiptPath"] = str(receipt)
+    row.update(extra)
+    return json.dumps(row)
+
+
+def coverage_guard(repo, ledger, fleet):
+    command = [
+        "pwsh", "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass",
+        "-File", str(RATIO_SOURCE_GUARD), "-RepoRoot", str(repo), "-SourceRef", "master",
+        "-AsOfEpoch", str(RATIO_SOURCE_AS_OF), "-ReservationsPath", str(ledger),
+        "-LegacyDispatchPath", str(ledger.parent / "absent-legacy.jsonl"), "-FleetRunsPath", str(fleet),
+    ]
+    result = ratio_source_run(*command)
+    assert result.returncode == 0, result.stdout + result.stderr
+    return json.loads(result.stdout)
+
+
+def coverage_enforced_fixture(tmp_path, landed=True):
+    repo = coverage_repo(tmp_path, landed=landed)
+    fleet = tmp_path / "fleet-runs"
+    fleet.mkdir()
+    first = coverage_receipt(fleet, "sol-001.receipt.json", RATIO_SOURCE_AS_OF - 3600)
+    second = coverage_receipt(fleet, "sol-002.receipt.json", RATIO_SOURCE_AS_OF - 1800)
+    rows = [
+        # Enforcement began before the window: the first versioned row predates windowStart.
+        coverage_row(COVERAGE_WINDOW_START - 60, state="charged"),
+        coverage_row(RATIO_SOURCE_AS_OF - 3600, receipt=first),
+        coverage_row(RATIO_SOURCE_AS_OF - 1800, state="linked", receipt=second, reservationId="R-1", venue="invoke-lane"),
+        # The dispatcher reservation the linked row above names.
+        coverage_row(RATIO_SOURCE_AS_OF - 1801, reservationId="R-1", venue="invoke-workstream"),
+    ]
+    return repo, fleet, rows, first, second
+
+
+def test_ratio_coverage_complete_goes_green_through_the_real_reader(tmp_path):
+    repo, fleet, rows, _, _ = coverage_enforced_fixture(tmp_path)
+    ledger = tmp_path / "ledger.jsonl"
+    ledger.write_text("\n".join(rows) + "\n", encoding="utf-8")
+    payload = coverage_guard(repo, ledger, fleet)
+    assert payload["dispatchCoverage"] == "COMPLETE", payload["reasons"]
+    # The linked row names a receipt but is not a second launch.
+    assert payload["dispatchesObserved"] == 2
+    assert payload["recognizedProductPrIds"] == [101, 102]
+    assert payload["verdict"] == "GREEN", (payload["reasons"], payload["productShare7d"], payload["dispatchesPerLandedProductPr7dLowerBound"])
+    assert payload["reasons"] == []
+
+
+def test_ratio_coverage_unreserved_invoke_lane_receipt_stays_red(tmp_path):
+    repo, fleet, rows, _, _ = coverage_enforced_fixture(tmp_path)
+    coverage_receipt(fleet, "opus-001.receipt.json", RATIO_SOURCE_AS_OF - 900)
+    ledger = tmp_path / "ledger.jsonl"
+    ledger.write_text("\n".join(rows) + "\n", encoding="utf-8")
+    payload = coverage_guard(repo, ledger, fleet)
+    assert payload["dispatchCoverage"] == "PARTIAL"
+    assert payload["verdict"] == "RED"
+    assert "COVERAGE_RECEIPT_UNRESERVED" in payload["reasons"]
+
+
+def test_ratio_coverage_window_that_starts_before_enforcement_stays_red(tmp_path):
+    repo, fleet, rows, _, _ = coverage_enforced_fixture(tmp_path)
+    ledger = tmp_path / "ledger.jsonl"
+    ledger.write_text("\n".join(rows[1:]) + "\n", encoding="utf-8")
+    payload = coverage_guard(repo, ledger, fleet)
+    assert payload["verdict"] == "RED"
+    assert "COVERAGE_WINDOW_PREDATES_ENFORCEMENT" in payload["reasons"]
+
+
+def test_ratio_coverage_unversioned_row_after_enforcement_stays_red(tmp_path):
+    repo, fleet, rows, _, _ = coverage_enforced_fixture(tmp_path)
+    ledger = tmp_path / "ledger.jsonl"
+    ledger.write_text("\n".join(rows + [coverage_row(RATIO_SOURCE_AS_OF - 600, version=None)]) + "\n", encoding="utf-8")
+    payload = coverage_guard(repo, ledger, fleet)
+    assert payload["verdict"] == "RED"
+    assert "COVERAGE_UNVERSIONED_ROW_AFTER_ENFORCEMENT" in payload["reasons"]
+
+
+def test_ratio_coverage_legacy_only_ledger_is_not_enforced_and_not_malformed(tmp_path):
+    repo, fleet, _, _, _ = coverage_enforced_fixture(tmp_path)
+    ledger = tmp_path / "ledger.jsonl"
+    # Unversioned history, including an out-of-window row with no state, is legacy - never malformed.
+    ledger.write_text("\n".join([
+        coverage_row(COVERAGE_WINDOW_START - 999, version=None),
+        json.dumps({"recordedUtc": coverage_stamp(COVERAGE_WINDOW_START - 998)}),
+        coverage_row(RATIO_SOURCE_AS_OF - 10, version=None),
+    ]) + "\n", encoding="utf-8")
+    payload = coverage_guard(repo, ledger, fleet)
+    assert payload["malformedDispatchRows"] == 0
+    assert payload["dispatchesObserved"] == 1
+    assert "COVERAGE_NOT_ENFORCED" in payload["reasons"]
+    assert payload["verdict"] == "RED"
+
+
+def test_ratio_coverage_missing_receipt_unreadable_and_in_flight_are_never_complete(tmp_path):
+    repo, fleet, rows, first, _ = coverage_enforced_fixture(tmp_path)
+    ledger = tmp_path / "ledger.jsonl"
+    ledger.write_text("\n".join(rows) + "\n", encoding="utf-8")
+    first.unlink()
+    payload = coverage_guard(repo, ledger, fleet)
+    assert "COVERAGE_RESERVATION_RECEIPT_MISSING" in payload["reasons"]
+    assert payload["verdict"] == "RED"
+
+    repo, fleet, rows, _, _ = coverage_enforced_fixture(tmp_path / "b")
+    coverage_receipt(fleet, "luna-001.receipt.json", RATIO_SOURCE_AS_OF - 100, text="")
+    coverage_receipt(fleet, "luna-002.receipt.json", RATIO_SOURCE_AS_OF - 100, text="{not json")
+    coverage_receipt(fleet, "luna-003.receipt.json", RATIO_SOURCE_AS_OF - 100, text=json.dumps({
+        "schema": "mlv-app/fleet-lane-receipt/v1", "state": "reserved", "reservedUtc": coverage_stamp(RATIO_SOURCE_AS_OF - 100)}))
+    ledger = tmp_path / "b" / "ledger.jsonl"
+    ledger.write_text("\n".join(rows) + "\n", encoding="utf-8")
+    payload = coverage_guard(repo, ledger, fleet)
+    assert "COVERAGE_RECEIPT_IN_FLIGHT" in payload["reasons"]
+    assert "COVERAGE_RECEIPT_UNREADABLE" in payload["reasons"]
+    assert "COVERAGE_RECEIPT_UNRESERVED" not in payload["reasons"], "a bare slot marker is in flight, not unreserved"
+    assert payload["dispatchCoverage"] == "PARTIAL"
+
+    repo, fleet, rows, _, _ = coverage_enforced_fixture(tmp_path / "c")
+    ledger = tmp_path / "c" / "ledger.jsonl"
+    ledger.write_text("\n".join(rows) + "\n", encoding="utf-8")
+    payload = coverage_guard(repo, ledger, tmp_path / "c" / "no-such-fleet-runs")
+    assert "COVERAGE_RECEIPTS_UNAVAILABLE" in payload["reasons"]
+    assert payload["verdict"] == "RED"
+
+
+def test_ratio_coverage_ignores_other_schemas_pre_window_receipts_and_refused_launches(tmp_path):
+    repo, fleet, rows, _, _ = coverage_enforced_fixture(tmp_path)
+    coverage_receipt(fleet, "other.receipt.json", RATIO_SOURCE_AS_OF - 50, schema="mlv-app/something-else/v1")
+    coverage_receipt(fleet, "old.receipt.json", COVERAGE_WINDOW_START - 50)
+    coverage_receipt(fleet, "refused.receipt.json", RATIO_SOURCE_AS_OF - 40, text=json.dumps({
+        "schema": "mlv-app/fleet-lane-receipt/v1", "state": "failed", "startedUtc": coverage_stamp(RATIO_SOURCE_AS_OF - 40),
+        "failure": "dispatch-ledger-write-failed: disk full"}))
+    ledger = tmp_path / "ledger.jsonl"
+    ledger.write_text("\n".join(rows) + "\n", encoding="utf-8")
+    payload = coverage_guard(repo, ledger, fleet)
+    assert payload["dispatchCoverage"] == "COMPLETE", payload["reasons"]
+    assert payload["verdict"] == "GREEN"
+
+
+def test_ratio_coverage_every_launch_venue_writes_a_versioned_ledger_row():
+    lane = LANE_RUNNER.read_text(encoding="utf-8")
+    ws = RATIO_WORKSTREAM.read_text(encoding="utf-8")
+    # Invoke-Lane: the row names the receipt slot, is written before any provider starts, and a
+    # failed write refuses the launch.
+    slot = lane.index("[System.IO.FileMode]::CreateNew")
+    row = lane.index("Add-DispatchLedgerRow -Path $DispatchLedgerPath")
+    start = lane.index("[Diagnostics.Process]::Start($psi)")
+    assert slot < row < start
+    assert "throw \"dispatch-ledger-write-failed:" in lane
+    assert "schemaVersion = 2" in lane and "receiptPath   = $rcptPath" in lane
+    assert "[void]$psi.Environment.Remove('MLV_DISPATCH_RESERVATION_ID')" in lane
+    # Invoke-Workstream: versioned rows, and the reservation id is handed to BOTH launch sites
+    # (Invoke-Lane directly and Start-EditingLane) before launch and cleared after.
+    assert "schemaVersion = 2" in ws and "venue         = 'invoke-workstream'" in ws
+    assert ws.count("$env:MLV_DISPATCH_RESERVATION_ID = $reservationId") == 2
+    assert ws.count("Remove-Item Env:\\MLV_DISPATCH_RESERVATION_ID") == 2
+    for launch in ("-File $LaneRunner", "-File $StartEditingLane"):
+        at = ws.index(launch)
+        assert ws.rindex("$env:MLV_DISPATCH_RESERVATION_ID = $reservationId", 0, at) > ws.rindex("-State 'reserved'", 0, at)
+
+
+# --- PR #127 round 2 (sol CHANGES_REQUESTED at 7e41d5b8): four ways COMPLETE could be reached without
+# seven days of all-venue accounting. Each case must stay RED.
+
+def test_ratio_coverage_rows_from_an_unlanded_writer_never_start_the_clock(tmp_path):
+    repo, fleet, rows, _, _ = coverage_enforced_fixture(tmp_path, landed=False)
+    ledger = tmp_path / "ledger.jsonl"
+    ledger.write_text("\n".join(rows) + "\n", encoding="utf-8")
+    payload = coverage_guard(repo, ledger, fleet)
+    assert payload["verdict"] == "RED"
+    assert "COVERAGE_NOT_ENFORCED" in payload["reasons"]
+
+
+def test_ratio_coverage_rows_older_than_the_landing_commit_never_start_the_clock(tmp_path):
+    repo, fleet, rows, _, _ = coverage_enforced_fixture(tmp_path)
+    ledger = tmp_path / "ledger.jsonl"
+    # The only row that predates the window was written before the writer landed.
+    rows[0] = coverage_row(COVERAGE_LANDED - 60, state="charged")
+    ledger.write_text("\n".join(rows) + "\n", encoding="utf-8")
+    payload = coverage_guard(repo, ledger, fleet)
+    assert "COVERAGE_WINDOW_PREDATES_ENFORCEMENT" in payload["reasons"], payload["reasons"]
+    assert payload["verdict"] == "RED"
+
+
+def test_ratio_coverage_unmatched_or_duplicate_links_count_as_launches(tmp_path):
+    repo, fleet, rows, _, second = coverage_enforced_fixture(tmp_path)
+    ledger = tmp_path / "ledger.jsonl"
+    extra = [
+        coverage_row(RATIO_SOURCE_AS_OF - 1700, state="linked", receipt=second, reservationId="R-1", venue="invoke-lane"),
+        coverage_row(RATIO_SOURCE_AS_OF - 1600, state="linked", reservationId="NO-SUCH-RESERVATION", venue="invoke-lane"),
+    ]
+    ledger.write_text("\n".join(rows + extra) + "\n", encoding="utf-8")
+    payload = coverage_guard(repo, ledger, fleet)
+    assert payload["dispatchesObserved"] == 4, "a duplicate and an unmatched link are each a launch"
+    assert "COVERAGE_LINK_UNMATCHED" in payload["reasons"]
+    assert payload["verdict"] == "RED"
+
+
+def test_ratio_coverage_a_receipt_with_an_old_file_time_is_still_judged_by_startedUtc(tmp_path):
+    repo, fleet, rows, _, _ = coverage_enforced_fixture(tmp_path)
+    stale = coverage_receipt(fleet, "opus-009.receipt.json", RATIO_SOURCE_AS_OF - 500)
+    os.utime(stale, (COVERAGE_WINDOW_START - 9999, COVERAGE_WINDOW_START - 9999))
+    ledger = tmp_path / "ledger.jsonl"
+    ledger.write_text("\n".join(rows) + "\n", encoding="utf-8")
+    payload = coverage_guard(repo, ledger, fleet)
+    assert "COVERAGE_RECEIPT_UNRESERVED" in payload["reasons"]
+    assert payload["verdict"] == "RED"
+
+
+def test_ratio_coverage_a_stale_worktree_runner_keeping_receipts_in_its_worktree_is_seen(tmp_path):
+    repo, fleet, rows, _, _ = coverage_enforced_fixture(tmp_path)
+    worktree = tmp_path / "wt"
+    ratio_source_git(repo, "worktree", "add", "-q", str(worktree))
+    coverage_receipt(worktree / ".claude-state" / "fleet-runs", "sonnet-001.receipt.json", RATIO_SOURCE_AS_OF - 300)
+    ledger = tmp_path / "ledger.jsonl"
+    ledger.write_text("\n".join(rows) + "\n", encoding="utf-8")
+    payload = coverage_guard(repo, ledger, fleet)
+    assert "COVERAGE_RECEIPT_UNRESERVED" in payload["reasons"], payload["reasons"]
+    assert payload["verdict"] == "RED"
+
+
+# --- PR #127 round 3 (sol CHANGES_REQUESTED at 84ad327b).
+
+def test_ratio_coverage_a_registered_checkout_with_a_stale_runner_is_never_complete(tmp_path):
+    # -RunDir can point anywhere, so a stale runner's receipt may never be scanned; the runner itself is.
+    repo, fleet, rows, _, _ = coverage_enforced_fixture(tmp_path)
+    worktree = tmp_path / "old"
+    ratio_source_git(repo, "worktree", "add", "-q", str(worktree))
+    (worktree / "tools" / "coordination" / "Invoke-Lane.ps1").write_text("# a runner from before the ledger writer\n", encoding="utf-8")
+    ledger = tmp_path / "ledger.jsonl"
+    ledger.write_text("\n".join(rows) + "\n", encoding="utf-8")
+    payload = coverage_guard(repo, ledger, fleet)
+    assert "COVERAGE_STALE_RUNNER_PRESENT" in payload["reasons"], payload["reasons"]
+    assert payload["verdict"] == "RED"
+
+
+def test_ratio_coverage_a_runner_replaced_inside_the_window_is_never_complete(tmp_path):
+    repo, fleet, rows, _, _ = coverage_enforced_fixture(tmp_path)
+    runner = repo / "tools" / "coordination" / "Invoke-Lane.ps1"
+    os.utime(runner, (RATIO_SOURCE_AS_OF - 3600, RATIO_SOURCE_AS_OF - 3600))
+    ledger = tmp_path / "ledger.jsonl"
+    ledger.write_text("\n".join(rows) + "\n", encoding="utf-8")
+    payload = coverage_guard(repo, ledger, fleet)
+    assert "COVERAGE_RUNNER_UPDATED_IN_WINDOW" in payload["reasons"], payload["reasons"]
+    assert payload["verdict"] == "RED"
+
+
+def test_ratio_ledger_writers_in_both_launchers_never_lose_a_row_under_contention(tmp_path):
+    # FileMode.Append snapshots EOF per stream, so unserialized concurrent appends can overwrite rows.
+    # Both writers must take the same machine-wide mutex: 4 processes x 40 rows, mixed writers.
+    ledger = tmp_path / "ledger.jsonl"
+    harness = tmp_path / "writer.ps1"
+    harness.write_text('''param($Lane,$Workstream,$Ledger,$Which,$Count)
+$ErrorActionPreference='Stop'
+Set-StrictMode -Version Latest
+$ReservationsPath=$Ledger
+$tokens=$null;$errors=$null
+foreach($pair in @(@($Lane,'Add-DispatchLedgerRow'),@($Workstream,'Write-DispatchReservation'))) {
+    $ast=[Management.Automation.Language.Parser]::ParseFile($pair[0],[ref]$tokens,[ref]$errors)
+    if($errors.Count){throw 'source parse failed'}
+    $found=@($ast.FindAll({param($n) $n -is [Management.Automation.Language.FunctionDefinitionAst] -and $n.Name -eq $pair[1]},$true))
+    if($found.Count -ne 1){throw "missing $($pair[1])"}
+    Invoke-Expression $found[0].Extent.Text
+}
+for($i=0;$i -lt [int]$Count;$i++){
+    if($Which -eq 'lane'){ Add-DispatchLedgerRow -Path $Ledger -Row ([ordered]@{schemaVersion=2;state='reserved';n=$i;pad=('x'*512);recordedUtc=(Get-Date).ToUniversalTime().ToString('o')}) }
+    else { $null = Write-DispatchReservation -ReservationId "W-$PID-$i" -State reserved -Card C -Kind product -Lane sonnet -RunDir R }
+}
+''', encoding="utf-8")
+    procs = [
+        subprocess.Popen(["pwsh", "-NoProfile", "-NonInteractive", "-File", str(harness), "-Lane", str(LANE_RUNNER),
+                          "-Workstream", str(RATIO_WORKSTREAM), "-Ledger", str(ledger), "-Which", which, "-Count", "40"],
+                         stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+        for which in ("lane", "workstream", "lane", "workstream")
+    ]
+    for proc in procs:
+        out, err = proc.communicate(timeout=300)
+        assert proc.returncode == 0, out + err
+    lines = [line for line in ledger.read_text(encoding="utf-8-sig").splitlines() if line.strip()]
+    assert len(lines) == 160
+    for line in lines:
+        json.loads(line)
+
+
+def test_loop_budget_ignores_invoke_lane_ledger_rows_and_never_halts_on_linked(tmp_path):
+    # PR #127: Invoke-Lane now writes 'reserved' (direct) and 'linked' rows for the ratio guard's
+    # coverage. Before the fix, 'linked' threw 'unknown reservation state' in the loop's reducer,
+    # halting every cycle, and direct hub/review launches would have spent the unattended budget.
+    rows = [
+        {'reservationId': 'W-1', 'state': 'reserved', 'schemaVersion': 2, 'venue': 'invoke-workstream',
+         'lane': 'sonnet', 'card': 'C', 'runDir': 'R', 'recordedUtc': '2026-09-05T09:00:00Z'},
+        {'reservationId': 'W-1', 'state': 'linked', 'schemaVersion': 2, 'venue': 'invoke-lane',
+         'lane': 'sonnet', 'card': 'C', 'runDir': 'R', 'receiptPath': 'R/sonnet-001.receipt.json', 'recordedUtc': '2026-09-05T09:00:01Z'},
+        {'reservationId': 'L-1', 'state': 'reserved', 'schemaVersion': 2, 'venue': 'invoke-lane',
+         'lane': 'sol', 'card': 'REVIEW', 'runDir': 'R2', 'receiptPath': 'R2/sol-001.receipt.json', 'recordedUtc': '2026-09-05T10:00:00Z'},
+    ]
+    assert _run_reservation_budget(tmp_path, rows) == 1
+
+
+@pytest.mark.parametrize("writer,text", [
+    # The unserialized round-2 runner already had the writer function but no mutex (sol, PR #127 r3).
+    ("Invoke-Lane.ps1", "function Add-DispatchLedgerRow([string]$Path, $Row) { [IO.File]::Open($Path, 'Append') }\n"),
+    ("Invoke-Workstream.ps1", "function Write-DispatchReservation { Add-Content -LiteralPath $ReservationsPath -Value $row }\n"),
+])
+def test_ratio_coverage_a_writer_without_the_serialized_marker_is_stale_even_with_an_old_file_time(tmp_path, writer, text):
+    repo, fleet, rows, _, _ = coverage_enforced_fixture(tmp_path)
+    worktree = tmp_path / "unsafe"
+    ratio_source_git(repo, "worktree", "add", "-q", str(worktree))
+    target = worktree / "tools" / "coordination" / writer
+    target.write_text(text, encoding="utf-8")
+    os.utime(target, (COVERAGE_WINDOW_START - 9999, COVERAGE_WINDOW_START - 9999))
+    ledger = tmp_path / "ledger.jsonl"
+    ledger.write_text("\n".join(rows) + "\n", encoding="utf-8")
+    payload = coverage_guard(repo, ledger, fleet)
+    assert "COVERAGE_STALE_RUNNER_PRESENT" in payload["reasons"], payload["reasons"]
+    assert payload["verdict"] == "RED"
+
+
+def test_ratio_coverage_marker_is_carried_by_both_shipped_writers_and_the_guard():
+    marker = "MLV-DISPATCH-LEDGER-WRITER-V3-SERIALIZED"
+    for path in (LANE_RUNNER, RATIO_WORKSTREAM, RATIO_SOURCE_GUARD):
+        assert marker in path.read_text(encoding="utf-8"), path

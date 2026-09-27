@@ -679,6 +679,8 @@ try {
             }
         })
         `$dllSha256 = (@(`$payload.backend.artifacts | Where-Object { `$_.name -eq 'igpu_recon_cuda.dll' }) | Select-Object -First 1).sha256
+        # The PR #67 validator requires a lowercase digest; Get-FileHash returns uppercase (GPU-PROVENANCE-SELF-BINDING-1).
+        if (`$dllSha256) { `$dllSha256 = ([string]`$dllSha256).ToLowerInvariant() }
         `$pendingSymbolPresence = Test-BackendDllExportsPending -DllPath `$backendDll
         `$payload.provenance.dllSha256 = `$dllSha256
         `$payload.provenance.pendingSymbolPresence = `$pendingSymbolPresence

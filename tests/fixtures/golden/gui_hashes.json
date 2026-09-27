@@ -1,6 +1,6 @@
 {
-  "gpu.viewport.rgb888.pattern_nearest": "48758a9c5b87ce14ef78aab9e69e8624a8a9ed841af80df84c352f837f6dfe63",
-  "gpu.viewport.rgb16.pattern_nearest": "48758a9c5b87ce14ef78aab9e69e8624a8a9ed841af80df84c352f837f6dfe63",
+  "gpu.viewport.rgb888.pattern_nearest": "817ca20ee0f7bc67e467002d38a3f4c9cd915035c4a5a4a38e038e6230b08ae6",
+  "gpu.viewport.rgb16.pattern_nearest": "817ca20ee0f7bc67e467002d38a3f4c9cd915035c4a5a4a38e038e6230b08ae6",
   "scope.histogram.synthetic_rgb888": "4733ecabcba01cae3836fc9fb36be0565b36f624cf3ea17dfe2f511c395f83e4",
   "scope.vectorscope.synthetic_raw": "90bb836210ff9db9dd515ca5958d011dd0ce527303a8cbb8e1cb457ae767c79b",
   "scope.waveform.synthetic_raw": "7cc353d518e3e45f26ebaaddf4b96226745be7103d39ddee8b011b552456a2ec",

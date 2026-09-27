@@ -1,3 +1,4 @@
+import atexit
 import hashlib
 import json
 import os
@@ -195,6 +196,31 @@ def process_is_running(pid: int) -> bool:
         return False
     except PermissionError:
         return True
+
+
+# Building the base repo costs seven `git` child processes (ten with a remote),
+# and `init_repo()` has 212 call sites here.  On Windows a spawn is ~30ms against
+# ~3-5ms on Linux, which is why this module runs 448.8s on the hosted Windows leg
+# versus 40.7s on ubuntu (run 35242441426).  One template per distinct
+# (config, remote) shape is built once per process and copied per test.  A git
+# repository is self-contained, so the copy is exact; only `origin`'s absolute
+# URL has to be re-pointed afterwards.
+#
+# Measured A,B,A,B on Windows: 578/552s baseline vs 527/450s here, 249/249 passing
+# in every arm.  Consistently faster, but only ~9-18% -- the fixture is a slice,
+# not the cause.  The module makes ~17,800 git spawns in total, ~7,300 of them
+# `git rev-parse`; caching resolved refs is where the rest of the time is.
+# See .claude-state/project-memory/windows-ci-5x-gap-root-cause-20260917.md.
+_TEMPLATE_CACHE: dict[tuple[str, bool], Path] = {}
+_TEMPLATE_ROOT: Path | None = None
+
+
+def _template_root() -> Path:
+    global _TEMPLATE_ROOT
+    if _TEMPLATE_ROOT is None:
+        _TEMPLATE_ROOT = Path(tempfile.mkdtemp(prefix="brokered-closeout-template-"))
+        atexit.register(shutil.rmtree, _TEMPLATE_ROOT, True)
+    return _TEMPLATE_ROOT
 
 
 class BrokeredCloseoutTests(unittest.TestCase):
@@ -442,10 +468,12 @@ class BrokeredCloseoutTests(unittest.TestCase):
             config = deep_update(config, updates)
         (repo / "closeout.config.json").write_text(json.dumps(config, indent=2), encoding="utf-8")
 
-    def init_repo(self, *, remote: bool = False, config_updates: dict | None = None) -> Path:
-        self.repo_counter += 1
-        repo = self.tempdir / ("repo" if self.repo_counter == 1 else f"repo-{self.repo_counter}")
-        repo.mkdir()
+    def _build_repo_template(
+        self, destination: Path, *, remote: bool, config_updates: dict | None
+    ) -> None:
+        """Build the canonical base repo exactly as this fixture always has."""
+        repo = destination / "repo"
+        repo.mkdir(parents=True)
         git(repo, "init", "-b", "master")
         git(repo, "config", "user.email", "test@example.invalid")
         git(repo, "config", "user.name", "Test User")
@@ -458,10 +486,36 @@ class BrokeredCloseoutTests(unittest.TestCase):
         git(repo, "add", "closeout.config.json")
         git(repo, "commit", "-m", "add closeout policy")
         if remote:
-            bare = self.tempdir / f"origin-{self.repo_counter}.git"
-            git(self.tempdir, "init", "--bare", str(bare))
+            bare = destination / "origin.git"
+            git(destination, "init", "--bare", str(bare))
             git(repo, "remote", "add", "origin", str(bare))
             git(repo, "push", "-u", "origin", "master")
+
+    def _repo_template(self, *, remote: bool, config_updates: dict | None) -> Path:
+        key = (json.dumps(config_updates, sort_keys=True, default=str), remote)
+        template = _TEMPLATE_CACHE.get(key)
+        if template is None:
+            digest = hashlib.sha256(
+                f"{key[0]}|{remote}".encode("utf-8")
+            ).hexdigest()[:16]
+            template = _template_root() / digest
+            self._build_repo_template(
+                template, remote=remote, config_updates=config_updates
+            )
+            _TEMPLATE_CACHE[key] = template
+        return template
+
+    def init_repo(self, *, remote: bool = False, config_updates: dict | None = None) -> Path:
+        self.repo_counter += 1
+        repo = self.tempdir / ("repo" if self.repo_counter == 1 else f"repo-{self.repo_counter}")
+        template = self._repo_template(remote=remote, config_updates=config_updates)
+        shutil.copytree(template / "repo", repo)
+        if remote:
+            bare = self.tempdir / f"origin-{self.repo_counter}.git"
+            shutil.copytree(template / "origin.git", bare)
+            # The template's origin URL points into the template root; re-point
+            # it at this test's own bare copy.
+            git(repo, "remote", "set-url", "origin", str(bare))
         return repo
 
     def make_feature(self, repo: Path, work_block_id: str, *, filename: str = "work.txt") -> dict:

@@ -39,6 +39,10 @@ public:
         float zebraUnderThreshold;
         float zebraOverThreshold;
         GpuPreviewProcessingConfig previewProcessing;
+        // Identity of the frame being presented (e.g. RenderFrameThread's requestSerial),
+        // forwarded to GpuDisplayWindow so it can record which frame it actually swapped
+        // in (see GpuDisplayWindow::grabPresentedFramebufferIfActive's presentedSerial).
+        quint64 presentationSerial;
 
         PresentationOptions()
             : samplingMode(SamplingLinear)
@@ -46,6 +50,7 @@ public:
             , zebraUnderThreshold(preview_zebra::kUnderThresholdNormalized)
             , zebraOverThreshold(preview_zebra::kOverThresholdNormalized)
             , previewProcessing()
+            , presentationSerial(0)
         {
         }
     };
@@ -126,11 +131,13 @@ public:
                                     QGraphicsPixmapItem *fallbackItem = nullptr);
 
 protected:
+    bool eventFilter(QObject *watched, QEvent *event) override;
     void initializeGL() override;
     void paintGL() override;
     void resizeGL(int w, int h) override;
 
 private:
+    friend class GuiSmokeTest; // Exercise display geometry without requiring GL.
     static GpuDisplayViewport *from(QGraphicsView *view);
     static const GpuDisplayViewport *from(const QGraphicsView *view);
 
@@ -201,17 +208,13 @@ private:
     int m_pendingTextureWidth;
     int m_pendingTextureHeight;
     PresentationOptions m_presentationOptions;
-    uint64_t m_processingTextureSignature;
-    bool m_processingTextureSignatureValid;
     QString m_rendererDescription;
     QOpenGLShaderProgram *m_program;
     QOpenGLTexture *m_texture;
     QOpenGLTexture *m_gpuReconSourceTexture;
-    QOpenGLTexture *m_levelsLutTexture;
-    QOpenGLTexture *m_matrixLutRTexture;
-    QOpenGLTexture *m_matrixLutGTexture;
-    QOpenGLTexture *m_matrixLutBTexture;
-    QOpenGLTexture *m_gammaLutTexture;
+    // Shared with GpuDisplayWindow (GpuPreviewProcessing.h) so both routes draw
+    // through the identical display shader and LUT upload/bind path.
+    GpuPreviewProcessingLutTextureSet m_lutSet;
 };
 
 #endif // GPUDISPLAYVIEWPORT_H

@@ -48,7 +48,7 @@
 [CmdletBinding()]
 param(
     [Parameter(Mandatory = $true)]
-    [ValidateSet('opus', 'sonnet', 'fable', 'sol', 'luna')]
+    [ValidateSet('opus', 'sonnet', 'fable', 'sol', 'luna', 'astra')]
     [string]$Lane,
 
     [string]$Prompt,
@@ -72,11 +72,19 @@ param(
     # Backstop against a runaway lane. Claude only (codex exec has no equivalent).
     # 0 disables the cap. Measured 2026-09-03: real lanes used 13-21 turns, so 40 is a
     # runaway guard, NOT the spend control - that is -DenyBulkReads below.
-    [int]$MaxTurns = 40,
+    # Updated 2026-09-10: raised from 40 to 65 to prevent mid-work cutoffs (lanes executed 41 turns).
+    [int]$MaxTurns = 65,
 
     # Optional per-process override; never changes the user's provider settings.
     [ValidateSet('', 'low', 'medium', 'high')]
     [string]$ReasoningEffort = '',
+
+    # LANE-MODEL-CURRENCY-1: an explicit escape hatch that bypasses the normal model
+    # resolution (a claude alias floating with the CLI, or a codex tier resolved at
+    # launch from the current models cache) and launches this EXACT model id instead.
+    # Recorded in the receipt as `pinnedByOverride` so a reader can never mistake an
+    # overridden run for the fleet's own currency-preserving resolution.
+    [string]$ModelOverride = '',
 
     # Let the lane read the bulk coordination files. OFF by default.
     # MEASURED 2026-09-03: three unattended fable lanes cost USD 22-25 EACH, every one
@@ -95,7 +103,24 @@ param(
     # 0.1: an extra directory the lane may read beyond -WorkDir (e.g. board
     # coordination paths an editing lane needs without a full -AllowBulkReads
     # grant). Optional; claude engine only (--add-dir).
-    [string]$ExtraReadDir = ''
+    [string]$ExtraReadDir = '',
+
+    # Disk hygiene (2026-09-14): when the lane exits, retire -WorkDir if it is a linked
+    # worktree that passes the SAFE gate in Retire-LaneWorktree.ps1; otherwise keep it.
+    # Either way the receipt carries `worktreeDisposition` saying which and why.
+    # Never applies to the main checkout, and never deletes a branch ref.
+    [switch]$RetireWorktree,
+
+    # Lane scratch. The child's TEMP/TMP point at <ScratchRoot>\<lane>-NNN, never bare
+    # %TEMP% (which every project on this box shares). C:\mlvtmp is a DiskGuard-registered
+    # MLV root. The run's own scratch dir is removed when the lane exits unless -KeepScratch;
+    # its size is recorded in the receipt either way.
+    [string]$ScratchRoot = 'C:\mlvtmp\lane-scratch',
+    # Set only by Invoke-Workstream.ps1, which has already written the 'reserved' row for this
+    # launch. This lane then writes a 'linked' row naming its receipt instead of a second
+    # 'reserved' row, so the product-ratio guard counts the launch once.
+    [string]$DispatchReservationId = '',
+    [switch]$KeepScratch
 )
 
 $ErrorActionPreference = 'Stop'
@@ -105,18 +130,166 @@ Set-StrictMode -Version Latest
 # Engine, model and effort per lane. This table IS the topology; there is no
 # other place a lane's model is decided, so a lane cannot silently drift onto
 # the wrong tier the way a registry field could.
+#
+# LANE-MODEL-CURRENCY-1 (owner ruling 2026-09-26: always the latest model per tier, at
+# HIGH effort -- never max/xhigh): no row here names a pinned model id. A claude-engine
+# row's `model` is a CLI ALIAS ('opus'/'sonnet'/'fable') -- the alias floats with the
+# claude CLI itself (verified 2026-09-26: `--model opus` resolved to canonicalModel
+# `claude-opus-5-5`, `--model fable` to `claude-fable-5-1`), so a superseded pinned id
+# (`claude-opus-5`, `claude-fable-5`, ...) can never sit here going stale. A codex-engine
+# row's `tier` is resolved to the current highest-version slug AT LAUNCH by
+# Resolve-CodexModelTier (below), which reads live from ~/.codex/models_cache.json --
+# Codex has no floating alias, so this is the equivalent resolution step. Every effort is
+# 'high': the owner's ruling is high for every lane, sonnet included, never max/xhigh.
 $LANES = @{
-    opus   = @{ engine = 'claude'; model = 'opus';           effort = 'high';   role = 'orchestrator' }
-    sonnet = @{ engine = 'claude'; model = 'sonnet';         effort = '';       role = 'implementer' }
-    fable  = @{ engine = 'claude'; model = 'claude-fable-5'; effort = '';       role = 'review-guidance-planning' }
-    sol    = @{ engine = 'codex';  model = 'gpt-5.6-sol';    effort = 'high';   role = 'adversarial-verifier' }
-    luna   = @{ engine = 'codex';  model = 'gpt-5.6-luna';   effort = 'high';   role = 'breadth-recon' }
+    opus   = @{ engine = 'claude'; model = 'opus';   effort = 'high'; role = 'orchestrator' }
+    sonnet = @{ engine = 'claude'; model = 'sonnet'; effort = 'high'; role = 'implementer' }
+    fable  = @{ engine = 'claude'; model = 'fable';  effort = 'high'; role = 'review-guidance-planning' }
+    sol    = @{ engine = 'codex';  tier = 'sol';     effort = 'high'; role = 'adversarial-verifier' }
+    luna   = @{ engine = 'codex';  tier = 'luna';    effort = 'high'; role = 'breadth-recon' }
+    astra  = @{ engine = 'codex';  tier = 'astra';   effort = 'high'; role = 'design-arbiter' }
 }
 
 # Absolute launcher paths. NEITHER is on the Git Bash PATH on this host, and a
 # bare name resolves differently per shell - measured 2026-08-29.
 $CLAUDE_EXE = Join-Path $env:APPDATA 'npm\claude.cmd'
 $CODEX_EXE  = Join-Path $env:APPDATA 'npm\codex.cmd'
+
+# LANE-MODEL-CURRENCY-1 round 2 (sol blocker 1): the REAL absolute launcher paths, named and
+# computed separately from $CLAUDE_EXE/$CODEX_EXE above so the effort-must-be-high enforcement
+# below can tell an actual CLI launch apart from the containment fixture, which reaches this
+# launcher ONLY by text-replacing the two exact lines above with a disposable shim path
+# (tests/coordination/test_lane_containment.py's prepare()). That substitution can never touch
+# these two lines -- different text, never matched by the fixture's literal string replace -- so
+# $REAL_CLAUDE_EXE/$REAL_CODEX_EXE always hold the genuine npm-cmd path even inside a
+# fixture-patched copy of this script, and a launch whose $CLAUDE_EXE/$CODEX_EXE no longer equals
+# its own $REAL_* twin is thereby proven incapable of ever reaching the real CLI.
+$REAL_CLAUDE_EXE = Join-Path $env:APPDATA 'npm\claude.cmd'
+$REAL_CODEX_EXE  = Join-Path $env:APPDATA 'npm\codex.cmd'
+
+# LANE-NO-BACKGROUND-END-TURN-1 round 13 (hub ruling): rounds 8-12 each closed one hole in
+# proving that whichever bash.exe/powershell.exe this launcher self-tested was the SAME
+# executable Claude Code's own, undocumented shell auto-detection would spawn for a SHELL-FORM
+# `--settings` hook command (a bare `command` string with no `args` field) -- a WSL launcher
+# stub on PATH, a second Git Bash reachable only via PATH, an inherited
+# `CLAUDE_CODE_GIT_BASH_PATH`. The vendor docs name the exit directly (code.claude.com/docs/en/
+# hooks, "Exec form and shell form", fetched 2026-09-22; full quote in this round's summary.md):
+# "Shell form runs when `args` is absent. The `command` string is passed to a shell... Exec form
+# runs when `args` is present. Claude Code resolves `command` as an executable... and spawns it
+# directly with `args` as the argument vector. There is no shell." EXEC FORM has no shell to
+# resolve, classify, or enumerate candidates for -- so `Resolve-LaneExecutableAllCandidates`, the
+# Git Bash and PowerShell resolvers, the per-shell-kind self-test loop, and the
+# `MLV_GIT_BASH`/`MLV_LANE_POWERSHELL_EXE` overrides are DELETED, not disabled. See
+# docs/lane-containment.md for the full removal rationale.
+#
+# What still needs resolving: the INTERPRETER (`command` in exec form still names an executable
+# this launcher chooses). Resolved the same way rounds 9-10 established, for the reason they
+# measured directly against hosted CI (run 35758428267, job 106850299120, 2026-09-22: a pinned
+# per-user $PYTHON_EXE broke the runner, a resolved one does not) -- an explicit override env var
+# (deterministic, test/operator use only), then curated known install locations, then PATH as a
+# last resort. Known-locations-before-PATH guards against the same class of hazard the WSL stub
+# was for bash (a PATH-shadowing shim that exists but does not run a real interpreter), even
+# though no such Python shim has actually been measured on this host.
+function Resolve-LaneExecutable {
+    param(
+        [Parameter(Mandatory = $true)][string]$OverrideEnvName,
+        [Parameter(Mandatory = $true)][string[]]$KnownLocations,
+        [Parameter(Mandatory = $true)][string[]]$PathCommandNames
+    )
+    $override = [Environment]::GetEnvironmentVariable($OverrideEnvName)
+    if ($override) {
+        # An explicit override is AUTHORITATIVE: it does not fall through to known locations or
+        # PATH even when the named path does not exist. A "force unresolvable" test (or an
+        # operator ruling out a specific broken install) would not be deterministic if a real
+        # known-location/PATH hit could silently rescue a deliberately-wrong override.
+        if (Test-Path -LiteralPath $override -PathType Leaf) {
+            return [pscustomobject]@{ Path = $override; Source = "override:$OverrideEnvName" }
+        }
+        return [pscustomobject]@{ Path = $null; Source = "override:$OverrideEnvName=$override (not found)" }
+    }
+    foreach ($loc in $KnownLocations) {
+        if (Test-Path -LiteralPath $loc -PathType Leaf) {
+            return [pscustomobject]@{ Path = $loc; Source = "known-location:$loc" }
+        }
+    }
+    foreach ($name in $PathCommandNames) {
+        $cmd = Get-Command -Name $name -CommandType Application -ErrorAction SilentlyContinue | Select-Object -First 1
+        if ($cmd -and (Test-Path -LiteralPath $cmd.Source -PathType Leaf)) {
+            return [pscustomobject]@{ Path = $cmd.Source; Source = "PATH:$name" }
+        }
+    }
+    return [pscustomobject]@{ Path = $null; Source = 'unresolved (checked override, known locations, PATH)' }
+}
+
+$PYTHON_EXE_RESOLUTION = Resolve-LaneExecutable -OverrideEnvName 'MLV_LANE_PYTHON_EXE' `
+    -PathCommandNames @('python.exe', 'python3.exe') `
+    -KnownLocations @('C:/Users/obabalola/AppData/Local/Python/bin/python.exe')
+$PYTHON_EXE = $PYTHON_EXE_RESOLUTION.Path
+$LANE_NO_BACKGROUND_HOOK = Join-Path $PSScriptRoot 'lane-no-background.py'
+$RESOLVE_CODEX_TIER_SCRIPT = Join-Path $PSScriptRoot 'resolve-codex-tier.py'
+
+# LANE-MODEL-CURRENCY-1: resolves a codex-engine lane's TIER (e.g. 'sol') to the current
+# highest-version slug via resolve-codex-tier.py, which reads live from
+# ~/.codex/models_cache.json (overridable for tests via MLV_CODEX_MODELS_CACHE). FAILS
+# CLOSED -- throws, never returns a guess -- when the interpreter is unresolved, the
+# script cannot be invoked, its output does not parse, or it reports "ok": false (no
+# cache, or no exact tier match). The caller's own top-level try/catch turns that throw
+# into a well-formed 'failed' receipt naming this exact reason, the same pattern the
+# background-gate self-test above already uses.
+function Resolve-CodexModelTier {
+    param(
+        [Parameter(Mandatory = $true)][string]$Tier,
+        [Parameter(Mandatory = $true)][string]$PythonExe
+    )
+    $resolverArgs = @($RESOLVE_CODEX_TIER_SCRIPT, '--tier', $Tier)
+    if ($env:MLV_CODEX_MODELS_CACHE) { $resolverArgs += @('--cache', $env:MLV_CODEX_MODELS_CACHE) }
+    try {
+        $resolverOutput = & $PythonExe @resolverArgs 2>&1
+        $resolverExit = $LASTEXITCODE
+    } catch {
+        throw "codex-tier-resolution-failed: interpreter invocation threw for tier '$Tier': $($_.Exception.Message)"
+    }
+    $resolverOutputText = ($resolverOutput -join "`n")
+    try {
+        $resolverParsed = $resolverOutputText | ConvertFrom-Json
+    } catch {
+        throw "codex-tier-resolution-failed: unparseable resolver output for tier '$Tier' (exit $resolverExit): $resolverOutputText"
+    }
+    # CODEX-RESOLVER-UNTYPED-EDGE-1 (fable hardening): the ok-check and error extraction live
+    # INSIDE this try, and use the `.PSObject.Properties[name]` INDEXER -- never bare dot access
+    # (`$resolverParsed.ok`, which throws PropertyNotFoundException under this file's own
+    # `Set-StrictMode -Version Latest` when the resolver emits valid JSON that simply lacks an
+    # `ok` key, e.g. a corrupted resolve-codex-tier.py) and never `.PSObject.Properties.Name
+    # -contains name` (which throws enumerating an EMPTY PSMemberInfoCollection, e.g. `{}` -- the
+    # exact hazard this file's own modelUsage comment above already documents and works around).
+    # Both degenerate shapes now fail closed through the SAME typed 'codex-tier-resolution-failed'
+    # token as an ordinary ok:false result, instead of leaking a raw StrictMode exception message.
+    try {
+        $okProp = $resolverParsed.PSObject.Properties['ok']
+        $resolverOk = ($null -ne $okProp) -and [bool]$okProp.Value
+        if ($resolverExit -ne 0 -or -not $resolverOk) {
+            $errorProp = $resolverParsed.PSObject.Properties['error']
+            $resolverError = if ($null -ne $errorProp) { $errorProp.Value } else { 'unknown' }
+            throw "codex-tier-resolution-failed: tier '$Tier' did not resolve: $resolverError"
+        }
+    } catch {
+        if ($_.Exception.Message -like 'codex-tier-resolution-failed:*') { throw }
+        throw "codex-tier-resolution-failed: tier '$Tier' produced a malformed resolver result: $($_.Exception.Message)"
+    }
+    return [string]$resolverParsed.resolvedModel
+}
+
+# Every tool that either fans out to another agent (Agent, Task, Workflow, TaskCreate) or
+# promises a LATER turn a headless lane cannot receive (Monitor, ScheduleWakeup, CronCreate,
+# CronDelete, RemoteTrigger). ONE constant feeds the pre-reservation allowlist rejection, the
+# --disallowedTools argv, and the receipt's authority.disallowedTools, so the enforcement
+# points cannot drift apart the way sol PR #150 round 1 found them (rejection checked only
+# Agent/Task while the deny list covered all seven). Round 3 (fable minor 1): Workflow spawns
+# a background-orchestrated fan-out the launching lane cannot supervise, and TaskCreate is the
+# same background-promise shape as ScheduleWakeup/CronCreate -- both belong beside the other
+# six, not only in a caller's allowlist check.
+$DENIED_TOOLS_DISPLAY = @('Agent', 'Task', 'Monitor', 'ScheduleWakeup', 'CronCreate', 'CronDelete', 'RemoteTrigger', 'Workflow', 'TaskCreate')
+$DENIED_TOOLS = @($DENIED_TOOLS_DISPLAY | ForEach-Object { $_.ToLowerInvariant() })
 
 function Get-Sha256([string]$Text) {
     $sha = [System.Security.Cryptography.SHA256]::Create()
@@ -126,9 +299,146 @@ function Get-Sha256([string]$Text) {
     } finally { $sha.Dispose() }
 }
 
+# LANE-NO-BACKGROUND-END-TURN-1 round 3 (sol minor / fable minor 2): a porcelain STATUS LINE
+# (e.g. ' M tracked.txt') is the same text before and after a lane makes a SECOND edit to a
+# file that was already dirty when the lane started -- the status code does not change, only
+# the content does -- so round 2's line-text comparison could not see it. This returns a
+# path -> content-identity map instead: the sha256 of `git diff HEAD -- <path>`, which changes
+# whenever the path's actual content (staged or unstaged, relative to HEAD) changes, covering
+# modify/add/delete uniformly. Callers compare this map's VALUES for a given key, not just key
+# presence, so a further edit to an already-dirty path is visible even though the path was
+# already in the map.
+#
+# Round 4 (sol minor / fable minor 3): round 3's parser read `git status --porcelain` (no -z)
+# and stripped one leading/trailing '"' per path -- git's default quoting escapes a space with
+# nothing (a space needs no quoting) but escapes non-ASCII bytes as C-style octal sequences
+# ('\346\226\207...') and wraps the whole path in quotes when it does, so a tracked path with
+# both a space AND a non-ASCII character round-tripped through Trim('"') as a still-escaped,
+# not-actually-restored string that never matched the real on-disk path. `-z` asks git for
+# NUL-separated records with quoting turned OFF entirely: each record is "XY <path>" for an
+# ordinary change, or "XY <newpath>\0<origpath>\0" for a rename/copy (two NUL-separated fields,
+# no " -> " text to parse). PowerShell's line-based capture of `&` output only ever splits on
+# LF, never NUL, so the whole -z stream comes back as one string to split ourselves. `&`-captured
+# output is also decoded using [Console]::OutputEncoding, which is not reliably UTF-8 in this
+# script's redirected/non-interactive invocation -- measured: a non-ASCII byte in a path
+# silently mis-decoded, so the returned path never matched the real on-disk path and the diff
+# lookup below found nothing for it. Invoke-GitCaptureUtf8 routes through ProcessStartInfo with
+# an explicit StandardOutputEncoding instead (the same mechanism this script already uses for
+# provider child processes), which sidesteps console state entirely.
+#
+# Round 5 (sol minor 1 / fable minor 1): every caller used to receive plain '' on ANY failure --
+# process-start failure, a stream-read exception, or (previously unchecked entirely) a non-zero
+# git exit -- indistinguishable from '' being git's true, successful, empty output (e.g. `git
+# status --porcelain` on a clean tree). A caller could not tell "git could not be asked" from
+# "git answered: nothing is dirty", which is exactly the false-clean the dirty-no-commit check
+# below exists to rule out. This now returns a result object every caller must check `.ok` on
+# before touching `.stdout`; `.error` names WHERE the call failed, not git's raw stderr text (the
+# receipt is not the place to surface arbitrary process output as if it were a diagnosis).
+function Invoke-GitCaptureUtf8([string]$WorkDir, [string[]]$GitArgs) {
+    $psi = [System.Diagnostics.ProcessStartInfo]::new()
+    $psi.FileName = 'git'
+    foreach ($a in (@('-C', $WorkDir) + $GitArgs)) { [void]$psi.ArgumentList.Add($a) }
+    $psi.UseShellExecute = $false
+    $psi.RedirectStandardOutput = $true
+    $psi.RedirectStandardError = $true
+    $psi.StandardOutputEncoding = [System.Text.UTF8Encoding]::new($false)
+    $psi.StandardErrorEncoding = [System.Text.UTF8Encoding]::new($false)
+    try {
+        $p = [System.Diagnostics.Process]::Start($psi)
+    } catch {
+        return [ordered]@{ ok = $false; stdout = $null; exitCode = $null; error = "git-start-failed: $($_.Exception.Message)" }
+    }
+    $outTask = $p.StandardOutput.ReadToEndAsync()
+    $errTask = $p.StandardError.ReadToEndAsync()
+    $p.WaitForExit()
+    try {
+        $out = $outTask.GetAwaiter().GetResult()
+    } catch {
+        return [ordered]@{ ok = $false; stdout = $null; exitCode = $p.ExitCode; error = "git-read-failed: $($_.Exception.Message)" }
+    }
+    if ($p.ExitCode -ne 0) {
+        $errText = try { $errTask.GetAwaiter().GetResult() } catch { '' }
+        return [ordered]@{ ok = $false; stdout = $out; exitCode = $p.ExitCode; error = ("git-exit-{0}: {1}" -f $p.ExitCode, $errText).Trim() }
+    }
+    return [ordered]@{ ok = $true; stdout = $out; exitCode = 0; error = $null }
+}
+
+# Round 5 (sol minor 2): content identity of a dirty tracked path is now the git blob hash of the
+# WORKING-TREE FILE ITSELF (`git hash-object`), not a hash of rendered `git diff` text. Diff
+# rendering passes through config a caller does not control here (textconv filters, whitespace/
+# rename-detection options), which can make two DIFFERENT on-disk contents render as the SAME
+# diff text -- the opposite of what a content-identity check must guarantee. `hash-object`
+# reports the identity of the bytes git would actually commit, with nothing interpretive between
+# the file and the hash. A path absent from the working tree (deleted, or a rename's old path
+# already consumed below) has no bytes to hash, so it gets a fixed 'DELETED' marker instead --
+# distinct from any real hash-object output, so a delete can never collide with a real blob hash.
+#
+# Returns a result object, never a bare map: a git failure partway through (e.g. `status`
+# succeeds but a later `hash-object` fails) must be visible to the caller as "this snapshot could
+# not be taken" rather than silently returning whatever partial map had been built so far, which
+# would read as "here is the complete truth" when it is not.
+function Get-TrackedDirtyContentIdentity([string]$WorkDir) {
+    $statusResult = Invoke-GitCaptureUtf8 -WorkDir $WorkDir -GitArgs @('status', '--porcelain=v1', '-z')
+    if (-not $statusResult.ok) {
+        return [ordered]@{ ok = $false; map = $null; reason = "git status failed: $($statusResult.error)" }
+    }
+    $raw = $statusResult.stdout
+    if ([string]::IsNullOrEmpty($raw)) { return [ordered]@{ ok = $true; map = [ordered]@{}; reason = $null } }
+    $fields = @($raw -split "`0" | Where-Object { $_ -ne '' })
+    $map = [ordered]@{}
+    $i = 0
+    while ($i -lt $fields.Count) {
+        $entry = $fields[$i]; $i++
+        if ($entry.Length -lt 3) { continue }
+        $statusCode = $entry.Substring(0, 2)
+        $path = $entry.Substring(3)
+        if ($statusCode[0] -eq 'R' -or $statusCode[0] -eq 'C') {
+            # Rename/copy: $path (just read) is the NEW path -- the one that still exists
+            # in the working tree and is what content identity keys on. The ORIGINAL path
+            # is the NEXT NUL-separated field; consume it here so it is never mistaken for
+            # a separate status entry of its own.
+            if ($i -lt $fields.Count) { $i++ }
+        }
+        if ($statusCode -eq '??') { continue }
+        $fullPath = Join-Path $WorkDir $path
+        if (-not (Test-Path -LiteralPath $fullPath -PathType Leaf)) {
+            $map[$path] = 'DELETED'
+            continue
+        }
+        $hashResult = Invoke-GitCaptureUtf8 -WorkDir $WorkDir -GitArgs @('hash-object', '--', $path)
+        if (-not $hashResult.ok) {
+            return [ordered]@{ ok = $false; map = $null; reason = "git hash-object failed for '$path': $($hashResult.error)" }
+        }
+        $map[$path] = $hashResult.stdout.Trim()
+    }
+    return [ordered]@{ ok = $true; map = $map; reason = $null }
+}
+
 function Write-Utf8NoBom([string]$Path, [string]$Content) {
     # UTF-8 WITHOUT BOM: a BOM has broken JSON consumers on this box before.
     [System.IO.File]::WriteAllText($Path, $Content, [System.Text.UTF8Encoding]::new($false))
+}
+
+function Add-DispatchLedgerRow([string]$Path, $Row) {
+    # MLV-DISPATCH-LEDGER-WRITER-V3-SERIALIZED - the product-ratio guard requires this exact token in BOTH ledger writer files of every
+    # registered checkout. Change it only together with a change to how rows are serialized.
+    # SERIALIZED with every other ledger writer by one machine-wide mutex. FileMode.Append records EOF
+    # as each stream's private offset, so two unserialized writers can overwrite each other's row.
+    # Invoke-Workstream.ps1's Write-DispatchReservation takes the SAME mutex name; keep them equal.
+    $dir = Split-Path -Parent $Path
+    if (-not (Test-Path -LiteralPath $dir)) { New-Item -ItemType Directory -Path $dir -Force | Out-Null }
+    $bytes = [Text.UTF8Encoding]::new($false).GetBytes(($Row | ConvertTo-Json -Compress -Depth 4) + "`n")
+    $mutex = [Threading.Mutex]::new($false, 'Global\MLV-App-DispatchLedger')
+    $held = $false
+    try {
+        try { $held = $mutex.WaitOne(30000) } catch [Threading.AbandonedMutexException] { $held = $true }
+        if (-not $held) { throw 'dispatch ledger lock timeout' }
+        $stream = [IO.File]::Open($Path, [IO.FileMode]::Append, [IO.FileAccess]::Write, [IO.FileShare]::Read)
+        try { $stream.Write($bytes, 0, $bytes.Length); $stream.Flush($true) } finally { $stream.Dispose() }
+    } finally {
+        if ($held) { $mutex.ReleaseMutex() }
+        $mutex.Dispose()
+    }
 }
 
 function Write-Utf8NoBomAtomic([string]$Path, [string]$Content) {
@@ -205,9 +515,11 @@ if (-not $WorkDir) { $WorkDir = (Resolve-Path -LiteralPath (Join-Path $PSScriptR
 $WorkDir = (Resolve-Path -LiteralPath $WorkDir).Path
 
 # ---------------------------------------------------------------- 0.1 pre-flight (before any process, before any run dir)
-# (a) A codex lane (sol, luna) can never be granted write access: no Claude hook is
-# visible to codex exec, so nothing here could enforce NA-1..NA-10 against it.
-if ($AllowEdits -and ($Lane -eq 'sol' -or $Lane -eq 'luna')) {
+# (a) A codex lane can never be granted write access: no Claude hook is visible to codex exec,
+# so nothing here could enforce NA-1..NA-10 against it. Keyed on ENGINE, not an enumerated list
+# of lane names -- a new codex row (e.g. astra) refuses edits by construction, with nothing left
+# to remember to add to a name list (that omission was the hole this rekey closes).
+if ($AllowEdits -and $LANES[$Lane].engine -eq 'codex') {
     throw "codex-lane-never-edits: -Lane $Lane with -AllowEdits (no Claude hook is visible to codex exec)"
 }
 # (b) An editing lane's tool grant must be an explicit, auditable list. 'ALL' is
@@ -215,19 +527,35 @@ if ($AllowEdits -and ($Lane -eq 'sol' -or $Lane -eq 'luna')) {
 if ($AllowEdits -and ([string]::IsNullOrWhiteSpace($AllowedTools) -or $AllowedTools -eq 'ALL')) {
     throw "allowlist-required: -AllowEdits requires -AllowedTools <comma-separated list>; 'ALL' is never granted"
 }
-# Nested agent dispatch is forbidden even when embedded in a caller-supplied editing
-# allowlist. Normalize comma tokens for the decision; preserve the original argv text.
-if ($AllowEdits) {
+# Nested agent dispatch and every background-promise tool are forbidden even when embedded in a
+# caller-supplied editing allowlist. Checked against the SAME $DENIED_TOOLS list the
+# --disallowedTools argv is built from below, not a re-enumerated Agent/Task pair -- sol PR #150
+# round 1 found the two lists had drifted (rejection: Agent/Task only; deny list: seven tools).
+# Normalize comma tokens for the decision; preserve the original argv text.
+# Round 4 (sol major 1): explicitly gated to engine -eq 'claude', not just $AllowEdits. Today the
+# codex-never-edits throw at (a) above always fires first for any codex+-AllowEdits combination,
+# so this block is already unreachable for codex in practice -- but that unreachability was an
+# ACCIDENT of check ORDER, not a stated invariant, and DENIED_TOOLS/DENIED_TOOLS_DISPLAY are
+# claude-CLI tool names (Agent/Task/Monitor/... are claude flags; codex has no --disallowedTools
+# equivalent and its own $AllowedTools value is never consumed for argv -- see the codex argv
+# branch below, which hardcodes authority.allowedTools = 'ALL'). Codex lanes keep their previous
+# behaviour: this check never applies to them, explicitly, independent of check order elsewhere.
+if ($AllowEdits -and $LANES[$Lane].engine -eq 'claude') {
     $forbiddenTools = @($AllowedTools -split ',' | ForEach-Object { $_.Trim().ToLowerInvariant() } |
-        Where-Object { $_ -eq 'agent' -or $_ -eq 'task' })
+        Where-Object { $DENIED_TOOLS -contains $_ })
     if ($forbiddenTools.Count -gt 0) {
-        throw "nested-agent-tool-forbidden: -AllowedTools cannot contain Agent or Task"
+        throw "nested-agent-tool-forbidden: -AllowedTools cannot contain $($forbiddenTools -join ', ')"
     }
 }
 # MLV_BOARD_ROOT: only a test sets it (a tmp-dir board fixture); the default is the
 # real board (mirrors Start-EditingLane.ps1's own resolution, O107).
 $RepoRoot = if ($env:MLV_BOARD_ROOT) { $env:MLV_BOARD_ROOT } else { 'C:\!Layi Wkspc\MLV-App' }
 $HookEnforcedReceipt = Join-Path $RepoRoot '.claude-state\coordination\dual-lane\receipts\0.05-hook-enforced.json'
+$DispatchLedgerPath  = Join-Path $RepoRoot '.claude-state\coordination\dual-lane\receipts\dispatch-reservations.jsonl'
+# Invoke-Workstream passes its reservation id through the environment so it also crosses
+# Start-EditingLane.ps1. It is consumed here and removed from the child's environment below, so a
+# process the lane starts can never claim the dispatcher's reservation.
+if (-not $DispatchReservationId -and $env:MLV_DISPATCH_RESERVATION_ID) { $DispatchReservationId = $env:MLV_DISPATCH_RESERVATION_ID }
 $WorkDirHookPath     = Join-Path $WorkDir 'tools\hooks\mlv-never-authorized.py'
 # hookSha256 is computed unconditionally (when the file exists) so the receipt can
 # always carry it, per 0.1's receipt-fields requirement - not only on editing lanes.
@@ -251,20 +579,95 @@ if ($AllowEdits) {
         throw ("hook-not-enforced: worktree hook sha256={0} != receipt hookSha256={1}" -f $WorkDirHookSha256, $receiptHookSha256)
     }
 }
-$BaseSha = try {
-    (& git -C $WorkDir rev-parse HEAD 2>$null | Select-Object -First 1)
-} catch { $null }
-if ([string]::IsNullOrWhiteSpace($BaseSha)) { $BaseSha = $null }
+# Round 7 (sol minor): routed through Invoke-GitCaptureUtf8 instead of a bare `& git ...`
+# catch, so a failed rev-parse is distinguishable from "this gate does not apply to this
+# lane" downstream -- the old form read a failed call and a legitimately-inapplicable gate
+# as the same falsy $BaseSha, which the post-exit block then misclassified as 'not-applicable'
+# instead of 'unavailable' (or, at post-exit, as "HEAD moved").
+$BaseShaCapture = Invoke-GitCaptureUtf8 -WorkDir $WorkDir -GitArgs @('rev-parse', 'HEAD')
+$BaseSha = $null
+$BaseShaCaptureFailureReason = $null
+if ($BaseShaCapture.ok) {
+    $trimmed = $BaseShaCapture.stdout.Trim()
+    if (-not [string]::IsNullOrWhiteSpace($trimmed)) { $BaseSha = $trimmed }
+} else {
+    $BaseShaCaptureFailureReason = "pre-launch rev-parse HEAD failed: $($BaseShaCapture.error)"
+}
+# LANE-NO-BACKGROUND-END-TURN-1 round 2 (sol major 1 / fable minor 3): the dirty-no-commit
+# override below applies ONLY to editing Claude lanes, and only to tracked dirt the LANE
+# ITSELF introduced. Snapshot a per-path CONTENT IDENTITY (round 3: sol minor / fable minor 2 --
+# a raw status line cannot tell a further edit of an already-dirty path from no edit at all)
+# HERE, before the child ever starts, so pre-existing dirt in a shared or already-dirty
+# worktree can never be mistaken for work the lane left behind. Nothing between here and
+# process launch touches $WorkDir's tracked files (settings.json and the prompt file are
+# written under $RunDir / the board root, not $WorkDir), so this snapshot is equivalent to
+# "immediately before launch".
+$InitialTrackedDirt = $null
+# Round 5 (sol minor 1): a failed PRE-launch snapshot must never read as "nothing was dirty" --
+# that reading is a false-clean the post-exit comparison could then act on as ground truth. Kept
+# separate from $InitialTrackedDirt itself (rather than folding a sentinel into the map) so the
+# post-exit block below can distinguish "captured, empty" from "never captured" without
+# inspecting map contents.
+$InitialTrackedDirtUnavailableReason = $null
+if ($AllowEdits -and $LANES[$Lane].engine -eq 'claude' -and -not $BaseShaCaptureFailureReason -and $BaseSha) {
+    $preSnapshot = Get-TrackedDirtyContentIdentity -WorkDir $WorkDir
+    if ($preSnapshot.ok) {
+        $InitialTrackedDirt = $preSnapshot.map
+    } else {
+        $InitialTrackedDirtUnavailableReason = $preSnapshot.reason
+    }
+}
 
 if (-not $RunDir) {
     $stamp = (Get-Date).ToUniversalTime().ToString('yyyyMMddTHHmmssZ')
-    $RunDir = Join-Path $WorkDir ".claude-state\fleet-runs\$stamp"
+    # The BOARD's fleet-runs, not the worktree's: a receipt inside a worktree vanishes with it, and the
+    # product-ratio guard's coverage check reads the board tree first.
+    $RunDir = Join-Path $RepoRoot ".claude-state\fleet-runs\$stamp"
 }
 if (-not (Test-Path -LiteralPath $RunDir)) { New-Item -ItemType Directory -Path $RunDir -Force | Out-Null }
 $RunDir = (Resolve-Path -LiteralPath $RunDir).Path
 
 $cfg = $LANES[$Lane].Clone()
 if ($ReasoningEffort) { $cfg.effort = $ReasoningEffort }
+
+# ---------------------------------------------------------------- model identity (LANE-MODEL-CURRENCY-1)
+# requestedModel is the lane's IDENTITY as authored in the table: an alias for a claude
+# lane, a tier for a codex lane. Recorded even when -ModelOverride bypasses the normal
+# resolution below, so a receipt always shows what was ASKED for beside what actually
+# ran. resolvedModel starts 'unknown' -- a third state, never the requested string
+# copied over -- and is filled in per engine below: a codex lane fills it the instant
+# its tier resolves (or its override is accepted); a claude lane fills it only after the
+# child exits, from the canonicalModel(s) its own JSON output reports it actually ran as.
+$RequestedModel = if ($cfg.engine -eq 'claude') { $cfg.model } else { $cfg.tier }
+$PinnedByOverride = [bool]$ModelOverride
+$ResolvedModel = 'unknown'
+$AuxiliaryModels = @()
+# LANE-MODEL-CURRENCY-1 round 2 (sol blocker 2): selectedModel is the PRE-LAUNCH choice (the
+# exact `--model`/`-m` argument value) -- filled in per engine below, the instant that choice is
+# made, never mistaken for proof the child ran. resolvedModel is filled in ONLY from evidence
+# gathered after the child is known to have run (a codex lane: after WaitForExit, from a clean
+# exit that produced real output; a claude lane: from its own JSON modelUsage, unchanged from
+# above). A launch that never starts (Process.Start throws) still leaves selectedModel recorded,
+# so a reader can always see what was ASKED to start, but resolvedModel stays 'unknown' -- never
+# copied from selectedModel before the child is proven to have run.
+$SelectedModel = $null
+
+# LANE-MODEL-CURRENCY-1 round 2 (sol blocker 1): owner ruling 2026-09-26 is that EVERY lane runs
+# at high effort. $cfg.effort is already the fully-resolved effective value at this point (table
+# default, then any -ReasoningEffort override just above), so this is the one place that can
+# refuse a non-high value before it ever reaches a real provider process. The refusal is skipped
+# only when $CLAUDE_EXE/$CODEX_EXE no longer equal their own $REAL_* twins declared beside them --
+# the one way that happens is the containment fixture's text-replace of those two lines with a
+# disposable shim (tests/coordination/test_lane_containment.py's prepare()), which by
+# construction can never reach a real model regardless of what effort value is requested. The
+# actual `throw` is deferred to just inside the main try below, so a refusal still produces a
+# normal 'failed' receipt and non-zero exit rather than a silent pre-reservation script error.
+$RealExeForLane = if ($cfg.engine -eq 'claude') { $REAL_CLAUDE_EXE } else { $REAL_CODEX_EXE }
+$ConfiguredExeForLane = if ($cfg.engine -eq 'claude') { $CLAUDE_EXE } else { $CODEX_EXE }
+$LaneEffortMustBeHighRefusal = $null
+if ($ConfiguredExeForLane -eq $RealExeForLane -and $cfg.effort -ne 'high') {
+    $LaneEffortMustBeHighRefusal = "lane-effort-must-be-high: a real lane may only run at 'high' effort (owner ruling 2026-09-26); refusing effort '$($cfg.effort)' for lane '$Lane'."
+}
 
 # ATOMIC SLOT RESERVATION. The previous form was
 #     while (Test-Path <candidate>) { $n++ }
@@ -325,11 +728,25 @@ $exitCode   = -999
 $timedOut   = $false
 $final      = ''
 $failure    = $null
+# Initialized here, before the try, so the finally never resolves a parent-scope $scratchDir
+# (dynamic scoping) and removes a path this run did not create.
+$scratchDir = $null
 # A PROVIDER REFUSAL is a third outcome beside ran/threw: the child exited cleanly and
 # the provider did no work. Detected from raw output after harvest; see lane-provider-refusal.ps1.
 $providerRefusal = $null
-$authority  = [ordered]@{ permissionMode = 'unset'; allowedTools = 'unset'; sandbox = 'unset'; writableRoot = $null }
+# Set at the top of the try; initialised here so the finally's receipt never reads an unset variable.
+$dispatchLedgerState = $null
+$dispatchLedgerReservationId = $null
+# Harvested child stdout; initialised here so the finally can classify work evidence on every path.
+$stdout = ''
+$authority  =[ordered]@{ permissionMode = 'unset'; allowedTools = 'unset'; sandbox = 'unset'; writableRoot = $null }
 $denyRules  = @()
+# LANE-NO-BACKGROUND-END-TURN-1 round 7: set here so a codex lane (which never enters the
+# claude branch below) can be checked against $null under Set-StrictMode without a separate
+# engine test at every read site.
+$hookCopyPath = $null
+$backgroundHookLaunchSha256 = $null
+$backgroundInterpreterLaunchSha256 = $null
 $jobHandle = [IntPtr]::Zero
 $jobAssigned = $false
 $promptDelivered = $false
@@ -382,6 +799,36 @@ $cacheCreateTokens = $null; $cacheReadTokens = $null; $outputTokens = $null
 
 try {
 
+# LANE-MODEL-CURRENCY-1 round 2 (sol blocker 1): thrown here, first thing inside the main try --
+# after the receipt slot is reserved (so this refusal gets a normal 'failed' receipt and non-zero
+# exit, not a silent pre-reservation script error) but before the dispatch ledger row or any
+# provider process, so a refused launch is never counted as an attempt.
+if ($LaneEffortMustBeHighRefusal) { throw $LaneEffortMustBeHighRefusal }
+
+# DISPATCH LEDGER ROW (plan 0.6: version-enforced all-venue accounting). Written after the receipt
+# slot exists, so the row can name it, and before any provider process starts. A direct launch
+# writes 'reserved' and counts toward the product-ratio guard's rate; a launch that
+# Invoke-Workstream already reserved writes 'linked' and does not. A row that cannot be written
+# refuses the launch, because a launch the ledger does not show breaks coverage for seven days.
+$dispatchLedgerState = if ($DispatchReservationId) { 'linked' } else { 'reserved' }
+$dispatchLedgerReservationId = if ($DispatchReservationId) { $DispatchReservationId } else { [guid]::NewGuid().ToString() }
+try {
+    Add-DispatchLedgerRow -Path $DispatchLedgerPath -Row ([ordered]@{
+        schemaVersion = 2
+        venue         = 'invoke-lane'
+        reservationId = $dispatchLedgerReservationId
+        state         = $dispatchLedgerState
+        card          = $Card
+        lane          = $Lane
+        allowEdits    = [bool]$AllowEdits
+        runDir        = $RunDir
+        receiptPath   = $rcptPath
+        recordedUtc   = (Get-Date).ToUniversalTime().ToString('o')
+    })
+} catch {
+    throw "dispatch-ledger-write-failed: $($_.Exception.Message)"
+}
+
 Write-Utf8NoBom $promptPath $Prompt
 
 # ---------------------------------------------------------------- build argv
@@ -389,11 +836,142 @@ Write-Utf8NoBom $promptPath $Prompt
 # and a '!' in them, and string-built command lines have mis-split here before.
 if ($cfg.engine -eq 'claude') {
     $exe  = $CLAUDE_EXE
-    $argv = @('-p', '--model', $cfg.model, '--output-format', 'json', '--add-dir', $WorkDir)
+    $claudeLaunchModel = if ($ModelOverride) { $ModelOverride } else { $cfg.model }
+    # LANE-MODEL-CURRENCY-1 round 2: the pre-launch choice, same discipline as the codex branch
+    # below -- resolvedModel is still filled in only from the child's own modelUsage, never copied
+    # from this.
+    $SelectedModel = $claudeLaunchModel
+    $argv = @('-p', '--model', $claudeLaunchModel, '--output-format', 'json', '--add-dir', $WorkDir)
     if ($ExtraReadDir) { $argv += @('--add-dir', $ExtraReadDir) }
     if ($MaxTurns -gt 0) { $argv += @('--max-turns', [string]$MaxTurns) }
-    # Deny-list written to the RUN DIR so the grant is auditable beside the receipt that
-    # it produced, rather than being an invisible property of the invocation.
+    # Settings file written to the RUN DIR so the grant is auditable beside the receipt that
+    # it produced, rather than being an invisible property of the invocation. Round 6
+    # (swarm ruling, 2026-09-22): every Claude-engine lane now gets this file -- previously
+    # only a non-bulk-reads lane did -- because it is now also how the lane-no-background
+    # PreToolUse hook is wired; the Read deny rules stay conditional on -AllowBulkReads exactly
+    # as before.
+    # Round 7 (sol major 3): docs/Start-EditingLane.ps1 resolves and runs Invoke-Lane.ps1 FROM
+    # $WorkDir for every editing lane, so $PSScriptRoot -- and $LANE_NO_BACKGROUND_HOOK beside
+    # it -- is INSIDE the lane's own writable worktree; an editing lane keeps Write/Edit/Bash
+    # for its whole session and could alter its own gate script before ever calling Bash. Copy
+    # the source into THIS run's reserved, board-rooted slot (never $WorkDir, unlike
+    # $PSScriptRoot) before it is ever registered, and point the registration at the copy, not
+    # at the source. Hashed immediately so the receipt records exactly what shipped.
+    $hookCopyPath = "$base.lane-no-background.py"
+    try {
+        Copy-Item -LiteralPath $LANE_NO_BACKGROUND_HOOK -Destination $hookCopyPath -Force -ErrorAction Stop
+        $backgroundHookLaunchSha256 = (Get-FileHash -LiteralPath $hookCopyPath -Algorithm SHA256).Hash.ToLowerInvariant()
+    } catch {
+        throw "background-gate-copy-failed: $($_.Exception.Message)"
+    }
+    # Round 9: resolution can come back empty (checked override, PATH, and known locations, and
+    # none of them exist on this host). An unrunnable hook command denies nothing, so refuse the
+    # launch here, before ever building the registered string or running the self-test against a
+    # command that could never have worked -- same fail-closed posture the self-test itself
+    # enforces below, just one step earlier because there is no command to even attempt yet.
+    if (-not $PYTHON_EXE) {
+        throw "background-gate-interpreter-not-found: no Python interpreter resolved ($($PYTHON_EXE_RESOLUTION.Source)); an unrunnable hook command denies nothing, so the launch is refused rather than registering one that cannot run."
+    }
+    # Round 14 (sol major, r13): the hook COPY gets a launch-hash/post-run-rehash tamper check
+    # (below and at the post-run section), but the INTERPRETER named as exec form's `command` --
+    # a user-writable executable this launcher only ever proves ONCE, at self-test time -- got
+    # none. An editing lane's own allowed foreground Bash/PowerShell call can delete or replace
+    # that executable after the self-test passes; every later hook spawn then fails, which the
+    # vendor docs this PR already cites (round 7 comment above) treat as a NON-BLOCKING error, so
+    # `run_in_background: true` would proceed while the receipt still read `denied-by-settings-
+    # hook`. Same treatment as the hook copy: hash it now, before it is ever spawned, and compare
+    # again after the run (post-run section, below `background-gate-tampered` for the hook copy).
+    # Hashed BEFORE the self-test below so the recorded hash is provably of the exact bytes the
+    # self-test itself just proved deny -- not a later, possibly-already-different file at the
+    # same path.
+    try {
+        $backgroundInterpreterLaunchSha256 = (Get-FileHash -LiteralPath $PYTHON_EXE -Algorithm SHA256).Hash.ToLowerInvariant()
+    } catch {
+        throw "background-gate-interpreter-not-found: resolved interpreter $PYTHON_EXE could not be hashed: $($_.Exception.Message)"
+    }
+    # Round 13 (hub ruling): registered in EXEC FORM (`args` present) -- Claude Code resolves
+    # `command` as an executable and spawns it directly with `args` as the argument vector, "no
+    # shell" (code.claude.com/docs/en/hooks, "Exec form and shell form", quoted in full above
+    # $PYTHON_EXE's resolver and in this round's summary.md). There is no shell kind to select,
+    # classify, or fall back between, so rounds 10-12's Git-Bash-preferred/PowerShell-fallback
+    # loop, and round 9's "neither shell resolved" refusal, are gone entirely -- the only
+    # remaining executable is the already-resolved interpreter.
+    #
+    # Round 7 (sol major 2): a missing or wrong-path interpreter cannot be detected FROM INSIDE
+    # the hook -- Claude Code treats a failed hook COMMAND as a non-blocking error and the tool
+    # call proceeds, so a receipt claiming the gate denies background work could be false while
+    # every route stayed open. Prove it, synchronously, before this lane is ever launched: invoke
+    # the EXACT executable-plus-argv the settings file registers and require the fail-closed deny
+    # (exit 2, lane-no-background.py's own protocol). A launch whose self-test does not pass never
+    # starts the provider -- the throw below is caught by this script's own top-level try/catch,
+    # which still writes a well-formed 'failed' receipt naming this exact reason.
+    #
+    # Round 11 (sol minor / fable minor 2), still true under exec form: exit 2 ALONE is not proof
+    # the hook ran and denied THIS payload -- lane-no-background.py's own fail-closed empty-stdin
+    # path also exits 2, and Python itself exits 2 when the registered script path is missing or
+    # misquoted (it prints its own "can't open file" message and nothing the hook would ever say).
+    # The hook's own DENY_REASON text ("headless lane: ... a headless lane has no later turn")
+    # only ever reaches stdout/stderr on the genuine `run_in_background: true` branch -- neither
+    # fail-closed-input path nor a Python launch failure prints it -- so requiring it in the
+    # captured self-test output is a positive proof the DENY branch itself ran, not merely that
+    # something upstream returned 2.
+    $backgroundGateExpectedDenySubstring = 'headless lane'
+    $backgroundGateSelfTestDenyPayload = '{"tool_name":"Bash","tool_input":{"command":"echo x","run_in_background":true}}'
+    # Round 11 (sol minor / fable minor 2): a deny-only self-test cannot distinguish "the gate
+    # discriminates on run_in_background" from "this executable always exits 2 no matter what" --
+    # a subject and a control that differ is the only thing that proves discrimination. Run the
+    # SAME executable-plus-argv against a non-background payload and require it to be ALLOWED
+    # (exit 0) before trusting the deny result above.
+    $backgroundGateSelfTestAllowPayload = '{"tool_name":"Bash","tool_input":{"command":"echo x","run_in_background":false}}'
+    # Round 13: PowerShell's call operator with an ARGUMENT ARRAY ($PYTHON_EXE, $hookCopyPath as
+    # two distinct elements, never a joined string) invokes the exact same executable-plus-argv
+    # pair exec form itself performs -- no shell tokenizes either side. One executable, one argv,
+    # one proof; there is no candidate list left to enumerate.
+    try {
+        $denyOutput = $backgroundGateSelfTestDenyPayload | & $PYTHON_EXE $hookCopyPath 2>&1
+        $denyExit = $LASTEXITCODE
+    } catch {
+        throw "background-gate-selftest-failed: interpreter invocation threw: $($_.Exception.Message)"
+    }
+    $denyOutputText = ($denyOutput -join ' | ')
+    if ($denyExit -ne 2 -or $denyOutputText -notlike "*$backgroundGateExpectedDenySubstring*") {
+        throw "background-gate-selftest-failed: expected exit 2 with a deny reason containing '$backgroundGateExpectedDenySubstring' from the exact registered executable and argv, got exit $denyExit; output: $denyOutputText"
+    }
+    try {
+        $allowOutput = $backgroundGateSelfTestAllowPayload | & $PYTHON_EXE $hookCopyPath 2>&1
+        $allowExit = $LASTEXITCODE
+    } catch {
+        throw "background-gate-selftest-failed: positive-control invocation threw: $($_.Exception.Message)"
+    }
+    if ($allowExit -ne 0) {
+        throw "background-gate-selftest-failed: positive control failed -- a non-background payload through the exact registered executable and argv was expected to be ALLOWED (exit 0) but got exit $allowExit; output: $($allowOutput -join ' | '); a self-test that cannot show BOTH a deny and an allow does not prove the gate discriminates"
+    }
+    # Matcher covers BOTH shell tools carrying `run_in_background` (round 7, sol major 1 /
+    # fable major): PowerShell has the same parameter Bash does, and the sanctioned editing
+    # dispatch (docs/Start-EditingLane.ps1) grants PowerShell to every editing lane. The
+    # script's own should_deny check is now tool-name-agnostic as a second, independent gate
+    # (see lane-no-background.py), so this matcher narrows WHICH calls invoke the hook at all,
+    # not which calls the hook is capable of denying.
+    # Round 13: `args` present makes this EXEC FORM -- `command` is the executable
+    # (code.claude.com/docs/en/hooks, "Command hook fields": "With `args`, the executable to
+    # spawn directly"), `args` is the argument vector, and `shell` is "ignored when `args` is
+    # set" -- omitted rather than written misleadingly.
+    $settingsObj = [ordered]@{
+        hooks = [ordered]@{
+            PreToolUse = @(
+                [ordered]@{
+                    matcher = 'Bash|PowerShell'
+                    hooks   = @(
+                        [ordered]@{
+                            type    = 'command'
+                            command = $PYTHON_EXE
+                            args    = @($hookCopyPath)
+                        }
+                    )
+                }
+            )
+        }
+    }
     if (-not $AllowBulkReads) {
         $denyRules = @(
             'Read(**/gpu-lane-impl-review-sync.md)',
@@ -402,10 +980,10 @@ if ($cfg.engine -eq 'claude') {
             'Read(**/fable-resume-CURRENT.md)',
             'Read(**/orchestrator-resume-CURRENT.md)'
         )
-        $settingsObj = @{ permissions = @{ deny = $denyRules } }
-        Write-Utf8NoBom $settingsPath ($settingsObj | ConvertTo-Json -Depth 5)
-        $argv += @('--settings', $settingsPath)
+        $settingsObj.permissions = [ordered]@{ deny = $denyRules }
     }
+    Write-Utf8NoBom $settingsPath ($settingsObj | ConvertTo-Json -Depth 6)
+    $argv += @('--settings', $settingsPath)
     if ($AllowEdits) {
         # 0.1: acceptEdits still takes an explicit --allowedTools list - the mode
         # decides HOW an allowed tool behaves (auto-accept vs prompt), the list
@@ -423,9 +1001,17 @@ if ($cfg.engine -eq 'claude') {
         $capabilityNotice = 'This read-only lane has permission to use only Read, Grep, and Glob. Bash, PowerShell, editing tools, Agent, and Task are unavailable: do not call or retry them. Inspect hub-exported diffs and evidence with the available read tools. If a required export is missing, name that missing evidence and return an unmeasured finding; do not claim you ran shell commands or tests.'
         $argv += @('--append-system-prompt', $capabilityNotice)
     }
-    # Prevent nested provider fan-out through the CLI's supported deny surface.
-    # One comma-separated token avoids the same variadic swallowing hazard as allowedTools.
-    $argv += @('--disallowedTools', 'Agent,Task')
+    # Prevent nested provider fan-out through the CLI's supported deny surface, AND
+    # deny every tool that hands a headless lane a LATER turn it does not have.
+    # LANE-NO-BACKGROUND-END-TURN-1 (2026-09-22): four headless `claude -p` implementer
+    # lanes ended their final turn on "I'll resume when the background job completes" --
+    # a headless lane gets no later turn, so the work sat uncommitted with no receipt.
+    # Monitor/ScheduleWakeup/CronCreate/CronDelete/RemoteTrigger/TaskCreate all promise a
+    # callback this process cannot receive, and Workflow fans out background-orchestrated
+    # work the launching lane cannot supervise. One comma-separated token avoids the same
+    # variadic swallowing hazard as allowedTools. Built from $DENIED_TOOLS_DISPLAY, the same
+    # list the pre-reservation rejection above checks against.
+    $argv += @('--disallowedTools', ($DENIED_TOOLS_DISPLAY -join ','))
     # PROMPT GOES VIA STDIN, NOT AS A POSITIONAL ARGUMENT. Several claude flags
     # (--allowedTools, --add-dir) are VARIADIC and keep consuming every following
     # token that does not start with '-', so a trailing positional prompt is
@@ -444,17 +1030,69 @@ if ($cfg.engine -eq 'claude') {
         maxTurns       = if ($MaxTurns -gt 0) { $MaxTurns } else { 'unset' }
         bulkReads      = if ($AllowBulkReads) { 'ALLOWED' } else { 'DENIED' }
         denyRules      = if ($AllowBulkReads) { @() } else { $denyRules }
-        disallowedTools = @('Agent', 'Task')
+        disallowedTools = $DENIED_TOOLS_DISPLAY
         capabilityNotice = if ($AllowEdits) { $null } else { $capabilityNotice }
+        # Round 6 (swarm ruling): --disallowedTools cannot reach run_in_background -- it is a
+        # parameter of a tool call, not a separate tool name -- so the settings-file
+        # PreToolUse hook wired above is the actual mechanism, with the dirty-no-commit receipt
+        # check as the after-the-fact backstop. See docs/lane-containment.md.
+        # Round 7: renamed from backgroundBash now that the matcher and the hook's own check
+        # both cover PowerShell (and, for the hook's own check, any tool) alongside Bash. The
+        # self-test above already proved the copy denies before this lane ever started;
+        # backgroundHookSha256 is the copy's hash at that instant -- compared again after the
+        # run below, where a mismatch overwrites this value with 'background-gate-tampered'.
+        backgroundGate       = 'denied-by-settings-hook'
+        backgroundHookSha256 = $backgroundHookLaunchSha256
+        # Round 9: the resolved interpreter path (never a pin) plus WHERE it came from --
+        # override, PATH, or a known location -- so a receipt can be audited against what
+        # actually ran the gate on this host, not what a stale comment claims is pinned.
+        # Round 13: rounds 9-12's backgroundGateShellKind/-Path/-Source/-ValidatedCandidates are
+        # GONE -- there is no shell kind, no shell executable, and no candidate list once the
+        # hook is registered in exec form (see the round-13 comment above the settings object).
+        # backgroundGateForm records that fact directly: 'exec' means Claude Code spawns
+        # backgroundGateInterpreterPath with backgroundGateHookArgs as its argv, with no shell
+        # auto-detection step this launcher had to out-guess.
+        backgroundGateInterpreterPath   = $PYTHON_EXE
+        backgroundGateInterpreterSource = $PYTHON_EXE_RESOLUTION.Source
+        backgroundGateForm              = 'exec'
+        backgroundGateHookArgs          = @($hookCopyPath)
+        # Round 14: same treatment, same field shape, as backgroundHookSha256 above -- the
+        # resolved interpreter's own hash at the instant the self-test proved it denies. Compared
+        # again post-run below; a mismatch or a now-missing interpreter overwrites
+        # backgroundGate to 'background-gate-tampered' exactly the way a hook-copy mismatch does,
+        # never a separate state -- both are "this run's proof no longer describes what could
+        # have run" and are not distinguishable in severity, so this reuses that one literal
+        # rather than inventing an 'unverified' third state that would only blur the same fact.
+        backgroundGateInterpreterSha256 = $backgroundInterpreterLaunchSha256
     }
 } else {
     $exe  = $CODEX_EXE
     $sandbox = if ($AllowEdits) { 'workspace-write' } else { 'read-only' }
+    # LANE-MODEL-CURRENCY-1: the table names a TIER, never a pinned slug, so it is
+    # resolved to the current highest-version model HERE, at launch -- fail closed
+    # (throws) rather than falling back to a guess. -ModelOverride bypasses this
+    # resolution entirely for an explicit, auditable pin (recorded as pinnedByOverride).
+    $codexLaunchModel = if ($ModelOverride) {
+        $ModelOverride
+    } else {
+        if (-not $PYTHON_EXE) {
+            throw "codex-tier-resolution-failed: no Python interpreter resolved ($($PYTHON_EXE_RESOLUTION.Source)) to resolve tier '$($cfg.tier)'."
+        }
+        Resolve-CodexModelTier -Tier $cfg.tier -PythonExe $PYTHON_EXE
+    }
+    # LANE-MODEL-CURRENCY-1 round 2 (sol blocker 2): this is the PRE-LAUNCH choice, recorded as
+    # selectedModel -- NOT resolvedModel. The previous code assigned this straight to
+    # resolvedModel here, before Process.Start below, so a missing/unstartable codex executable
+    # (Process.Start throws) produced a 'failed' receipt that still named this slug as
+    # resolvedModel -- a model that never ran. resolvedModel is now filled in only after the
+    # child is proven to have run (see the harvest section below), and stays 'unknown' on any
+    # start failure.
+    $SelectedModel = $codexLaunchModel
     # -s and -c are set EXPLICITLY per call. ~/.codex/config.toml carries
     # approval_policy=never + sandbox_mode=danger-full-access globally, which is
     # fine for a watched interactive session and NOT fine for automated fan-out.
     $argv = @('exec',
-              '-m', $cfg.model,
+              '-m', $codexLaunchModel,
               '-c', ("model_reasoning_effort=`"{0}`"" -f $cfg.effort),
               '-s', $sandbox,
               '-C', $WorkDir,
@@ -493,8 +1131,35 @@ $psi = [System.Diagnostics.ProcessStartInfo]::new()
 $psi.WorkingDirectory       = $WorkDir
 $psi.UseShellExecute        = $false
 $psi.CreateNoWindow         = $true
-if ($cfg.engine -eq 'claude' -and $ReasoningEffort) {
-    $psi.Environment['CLAUDE_CODE_EFFORT_LEVEL'] = $ReasoningEffort
+[void]$psi.Environment.Remove('MLV_DISPATCH_RESERVATION_ID')
+# $cfg.effort is already the EFFECTIVE value here (table default, overridden by -ReasoningEffort
+# a few lines up), so gating on it -- rather than only on the raw override -- makes a table
+# effort (e.g. fable/opus/sol/luna at 'high') actually reach the child instead of being recorded
+# in the receipt but never applied to the process that ran.
+if ($cfg.engine -eq 'claude' -and $cfg.effort) {
+    # LANE-NO-BACKGROUND-END-TURN-1 round 3 (hub ruling): this PR does not ADD any
+    # ANTHROPIC_/OPENAI_/CLAUDE_CODE_ assignment; the pre-existing CLAUDE_CODE_EFFORT_LEVEL
+    # assignment (from 8ad69168, 2026-09-07, previously reviewed) is tracked under
+    # NA3-CHILD-ENV-SCOPE-1 -- whether NA-3's prefix rule covers a launcher setting a child
+    # process's environment in code is a governance interpretation filed separately there,
+    # not decided by this PR. Do not remove or change this assignment to "fix" NA-3 here.
+    $psi.Environment['CLAUDE_CODE_EFFORT_LEVEL'] = $cfg.effort
+}
+# LANE-NO-BACKGROUND-END-TURN-1 round 2 (hub ruling): a CLAUDE_CODE_DISABLE_BACKGROUND_TASKS
+# child-environment flag was here through round 1. docs/never-authorized.json NA-3 prohibits
+# assigning ANY CLAUDE_CODE_* variable, and widening that rule is an authority change the hub
+# will not make -- so the flag is removed entirely, not narrowed (this PR adds no new
+# ANTHROPIC_/OPENAI_/CLAUDE_CODE_ assignment of its own; see the NA3-CHILD-ENV-SCOPE-1 note
+# above for the one pre-existing assignment that remains). Containment of background work now
+# rests on the --disallowedTools deny list above, the dirty-no-commit receipt check below
+# (scoped to lane-introduced tracked-file changes only), and the brief-level prohibition on
+# background work; see docs/lane-containment.md.
+# Per-run lane scratch under an MLV-owned root instead of the shared %TEMP%.
+$scratchDir = $null
+if ($ScratchRoot) {
+    $scratchDir = Join-Path $ScratchRoot ('{0}-{1}' -f (Split-Path $RunDir -Leaf), (Split-Path $base -Leaf))
+    New-Item -ItemType Directory -Force -Path $scratchDir | Out-Null
+    foreach ($v in 'TEMP', 'TMP', 'TMPDIR') { $psi.Environment[$v] = $scratchDir }
 }
 $psi.RedirectStandardInput  = $true
 $psi.RedirectStandardOutput = $true
@@ -657,6 +1322,56 @@ if ($cfg.engine -eq 'claude') {
             $costUsd = [double]$j.total_cost_usd
         }
         if ($j.PSObject.Properties.Name -contains 'num_turns') { $numTurns = [int]$j.num_turns }
+        # LANE-MODEL-CURRENCY-1: `--model opus`/`fable`/`sonnet` is a FLOATING ALIAS -- what
+        # actually ran is only knowable from the child's own JSON, never assumed from the
+        # alias string. `modelUsage` is AGGREGATE usage: it can carry auxiliary/tool-call
+        # entries (e.g. a haiku sub-call) alongside the lane's own model, and sol's pre-review
+        # proved treating every key as equally authoritative lets an auxiliary model's id (or,
+        # worse, a raw un-proven key) overwrite the lane's real identity. So only the entry
+        # whose canonicalModel belongs to the REQUESTED ALIAS'S FAMILY (a canonicalModel of the
+        # form `claude-<alias>-...`, e.g. `claude-sonnet-5` for alias 'sonnet') is ever recorded
+        # as resolvedModel; every other entry is aggregated separately into auxiliaryModels,
+        # never into resolvedModel. resolvedModel stays 'unknown' (never a raw modelUsage key,
+        # never the requested alias copied over) when no entry of that family is present or the
+        # matching entry has no canonicalModel -- a died-before-emitting-JSON run, or a run that
+        # silently fell back to a different family entirely, must never claim a model it cannot
+        # prove ran as the requested one.
+        # Property-existence checks below use the `.PSObject.Properties[name]` INDEXER, never
+        # `.PSObject.Properties.Name -contains name` -- under this file's own `Set-StrictMode
+        # -Version Latest` (line 127), PowerShell's multi-value member enumeration over an
+        # EMPTY PSMemberInfoCollection throws "The property 'Name' cannot be found on this
+        # object" instead of returning an empty list. A modelUsage entry commonly IS an empty
+        # JSON object (`{}`, no canonicalModel yet recorded), so that idiom would silently
+        # abort this entire try block via the catch below, discarding costUsd/numTurns/result
+        # along with the model identity -- a strictly worse failure than the one this fix
+        # exists to close. The indexer form returns $null for a missing property on any
+        # collection, empty or not, so it is safe unconditionally.
+        $modelUsageProp = $j.PSObject.Properties['modelUsage']
+        if ($null -ne $modelUsageProp -and $null -ne $modelUsageProp.Value) {
+            $modelUsageProps = @($modelUsageProp.Value.PSObject.Properties)
+            if ($modelUsageProps.Count -gt 0) {
+                $modelUsageNames = @($modelUsageProps.Name)
+                $familyPattern = '^claude-' + [regex]::Escape($RequestedModel) + '-'
+                $familyCanonicals = @()
+                $auxiliaryEntries = @()
+                foreach ($name in $modelUsageNames) {
+                    $entry = $modelUsageProp.Value.$name
+                    $canonicalProp = if ($null -ne $entry) { $entry.PSObject.Properties['canonicalModel'] } else { $null }
+                    $canonical = $null
+                    if ($null -ne $canonicalProp -and $canonicalProp.Value) { $canonical = [string]$canonicalProp.Value }
+                    if ($canonical -and ($canonical -match $familyPattern)) {
+                        $familyCanonicals += $canonical
+                    } elseif ($canonical) {
+                        $auxiliaryEntries += $canonical
+                    } else {
+                        $auxiliaryEntries += $name
+                    }
+                }
+                $familyCanonicals = @($familyCanonicals | Select-Object -Unique)
+                if ($familyCanonicals.Count -gt 0) { $ResolvedModel = ($familyCanonicals -join ',') }
+                $AuxiliaryModels = @($auxiliaryEntries | Select-Object -Unique)
+            }
+        }
         if ($j.PSObject.Properties.Name -contains 'usage' -and $null -ne $j.usage) {
             if ($j.usage.PSObject.Properties.Name -contains 'cache_creation_input_tokens') {
                 $cacheCreateTokens = [int64]$j.usage.cache_creation_input_tokens
@@ -684,6 +1399,15 @@ if ($cfg.engine -eq 'claude') {
     if ([string]::IsNullOrWhiteSpace($final)) { $final = $stderrText }
     if ($null -eq $final) { $final = '' }
     if ($timedOut) { Write-Utf8NoBom $lastPath $final }
+    # LANE-MODEL-CURRENCY-1 round 2 (sol blocker 2): resolvedModel is proof, not intent. codex
+    # exec emits no modelUsage-style attestation the way claude's own JSON does, so the bar here
+    # is the card's stated minimum: a clean exit (never timed out, exit 0) that produced real
+    # output FROM THIS INVOCATION -- never merely that a host process existed. A kill, crash, or
+    # non-zero exit leaves resolvedModel 'unknown' with selectedModel still recorded above, same
+    # discipline as the claude branch's family-matched modelUsage check.
+    if (-not $timedOut -and $exitCode -eq 0 -and -not [string]::IsNullOrWhiteSpace($final)) {
+        $ResolvedModel = $SelectedModel
+    }
 }
 
 }
@@ -799,18 +1523,207 @@ if ($jobHandle -ne [IntPtr]::Zero) {
     $jobHandle = [IntPtr]::Zero
 }
 $sw.Stop()
+# Disk hygiene. Neither step may throw: a failure here is recorded, never propagated,
+# because the receipt below must still be written on every exit path.
+$scratchDisposition = $null
+if ($scratchDir) {
+    try {
+        $sb = [int64]0
+        if (Test-Path -LiteralPath $scratchDir) { Get-ChildItem -LiteralPath $scratchDir -Recurse -File -Force -ErrorAction SilentlyContinue | ForEach-Object { $sb += $_.Length } }
+        $removed = $false
+        if (-not $KeepScratch -and (Test-Path -LiteralPath $scratchDir)) { Remove-Item -LiteralPath $scratchDir -Recurse -Force -ErrorAction Stop; $removed = $true }
+        $scratchDisposition = [ordered]@{ path = $scratchDir; bytes = $sb; removed = $removed; error = $null }
+    } catch {
+        $scratchDisposition = [ordered]@{ path = $scratchDir; bytes = $null; removed = $false; error = $_.Exception.Message }
+    }
+}
+$worktreeDisposition = $null
+if ($RetireWorktree) {
+    try {
+        . (Join-Path $PSScriptRoot 'Retire-LaneWorktree.ps1')
+        # The CANONICAL board (parent of the common .git), never the checkout this script runs
+        # from: a copy of this script inside a linked worktree must not quarantine into that worktree.
+        # No `| Select-Object -First 1` on the native call: it can stop the pipeline before
+        # $LASTEXITCODE is set, and reading it then throws under StrictMode Latest.
+        $commonOut = @(& git -C $PSScriptRoot rev-parse --path-format=absolute --git-common-dir 2>$null)
+        $commonDir = if ($commonOut.Count) { [string]$commonOut[0] } else { $null }
+        if (-not $commonDir -or -not (Test-Path -LiteralPath $commonDir)) { throw 'cannot resolve board root from git common dir' }
+        $boardRoot = Split-Path -Parent ($commonDir -replace '/', '\')
+        $worktreeDisposition = Invoke-RetireLaneWorktree -WorkDir $WorkDir -ProtectPath @($RunDir) `
+            -QuarantineRoot (Join-Path $boardRoot ('.claude-state\disk-hygiene\quarantine\lane-exit\' + (Get-Date).ToUniversalTime().ToString('yyyyMMdd')))
+    } catch {
+        $worktreeDisposition = [ordered]@{ action = 'kept'; reason = "cannot-determine: $($_.Exception.Message)" }
+    }
+}
+# `processEnded` records that the child exited; `complete` records POSITIVE evidence that the WORK
+# finished (exit 0 and, for claude, a success envelope). Until 2026-09-14 `complete` meant only the
+# former, so an exit-1 error_max_turns run was receipted state=complete, complete=true.
+$processEnded = ($exitCode -ne -999)
+try {
+    $workEvidence = Get-LaneWorkEvidence -Engine $cfg.engine -Answer $stdout -ExitCode $exitCode
+} catch {
+    $workEvidence = [ordered]@{ workCompleted = $false; reason = "cannot-determine: $($_.Exception.Message)"; subtype = $null; terminalReason = $null; isError = $null }
+}
+# LANE-NO-BACKGROUND-END-TURN-1: a success envelope is not positive evidence of work if the
+# tree never moved. HEAD still equal to the sha this lane started from, with tracked files
+# left dirty BY THIS LANE, is exactly what "I'll resume when the background job completes"
+# leaves behind on a headless lane that has no later turn to make good on that promise -- so
+# it overrides whatever the envelope claims. Untracked-only dirt (scratch files, logs) does
+# not count.
+# Round 2 (sol major 1 / fable minor 3): gated to editing Claude lanes only, and compared
+# against $InitialTrackedDirt so PRE-EXISTING tracked dirt never flips a receipt. A read-only
+# lane can never move HEAD by construction, so without this gate the check degenerated to
+# "was the surrounding checkout dirty" -- a fact outside a review lane's control. A codex
+# lane never sets $InitialTrackedDirt (claude-only capture above) and is likewise excluded.
+# Round 3 (sol minor / fable minor 2): a path counts as lane-introduced if it is NEWLY dirty
+# (absent from $InitialTrackedDirt) OR its CONTENT IDENTITY changed -- not merely if its
+# porcelain status line differs. A further edit to an already-dirty tracked file keeps the
+# same status code (still ' M path') both before and after, so status-line comparison alone
+# missed it; comparing the per-path content hash catches it.
+# Round 5 (sol minor 1 / fable minor 1): `$dirtyCheck` records what this block actually managed
+# to determine, and is carried into the receipt below so a reader never has to infer it from
+# `workEvidence.reason` alone. Both git-capture failure paths -- the PRE-launch snapshot
+# ($InitialTrackedDirtUnavailableReason, set above) and this POST-exit snapshot -- resolve to
+# 'unavailable' and leave `workEvidence` completely untouched: an unavailable check must never
+# manufacture a false 'ended-incomplete' (git was merely unreachable, not evidence of a dirty
+# tree) NOR silently fall back to a false claim of 'clean' (an unavailable check has no basis to
+# claim the tree is clean either).
+# Round 7 (sol minor): a failed PRE-launch rev-parse ($BaseShaCaptureFailureReason) and a
+# failed POST-exit rev-parse are now both surfaced as 'unavailable' with a reason naming
+# exactly which call failed and why, instead of collapsing into 'not-applicable' (pre-launch
+# failure) or the misleading 'HEAD moved' (post-exit failure) the way a bare, uncaptured
+# `$null -ne $BaseSha` comparison did.
+$dirtyCheck = 'not-applicable'
+$dirtyCheckReason = $null
+if ($AllowEdits -and $cfg.engine -eq 'claude') {
+    if ($BaseShaCaptureFailureReason) {
+        $dirtyCheck = 'unavailable'
+        $dirtyCheckReason = $BaseShaCaptureFailureReason
+    } elseif ($InitialTrackedDirtUnavailableReason) {
+        $dirtyCheck = 'unavailable'
+        $dirtyCheckReason = "pre-launch snapshot: $InitialTrackedDirtUnavailableReason"
+    } elseif (-not $BaseSha) {
+        $dirtyCheck = 'not-applicable'
+        $dirtyCheckReason = 'no base sha: pre-launch rev-parse HEAD succeeded but returned nothing'
+    } else {
+        $headAfterCapture = Invoke-GitCaptureUtf8 -WorkDir $WorkDir -GitArgs @('rev-parse', 'HEAD')
+        if (-not $headAfterCapture.ok) {
+            $dirtyCheck = 'unavailable'
+            $dirtyCheckReason = "post-exit rev-parse HEAD failed: $($headAfterCapture.error)"
+        } else {
+            $headAfter = $headAfterCapture.stdout.Trim()
+            if ($headAfter -ne $BaseSha) {
+                $dirtyCheck = 'not-applicable'
+                $dirtyCheckReason = 'HEAD moved: a commit landed, so pre-commit leftover dirt is out of scope for this check'
+            } else {
+                $postSnapshot = Get-TrackedDirtyContentIdentity -WorkDir $WorkDir
+                if (-not $postSnapshot.ok) {
+                    $dirtyCheck = 'unavailable'
+                    $dirtyCheckReason = "post-exit snapshot: $($postSnapshot.reason)"
+                } else {
+                    $trackedDirtyAfter = $postSnapshot.map
+                    $introducedPaths = @($trackedDirtyAfter.Keys | Where-Object {
+                        -not $InitialTrackedDirt.Contains($_) -or $InitialTrackedDirt[$_] -ne $trackedDirtyAfter[$_]
+                    })
+                    if ($introducedPaths.Count -gt 0) {
+                        $dirtyCheck = 'dirty'
+                        $dirtyCheckReason = "lane-introduced tracked dirt: $($introducedPaths -join ', ')"
+                        $workEvidence.workCompleted = $false
+                        # Preserve any existing reason (e.g. a subtype-* classification from a partially
+                        # successful envelope) by appending rather than overwriting it -- sol/fable round 1
+                        # noted an unconditional overwrite can mask the original failure reason.
+                        $workEvidence.reason = if ($workEvidence.reason) { "$($workEvidence.reason) | dirty-worktree-no-commit" } else { 'dirty-worktree-no-commit' }
+                    } else {
+                        $dirtyCheck = 'clean'
+                    }
+                }
+            }
+        }
+    }
+}
+# LANE-NO-BACKGROUND-END-TURN-1 round 7 (sol major 3): the copy this lane's hook actually ran
+# against sits in the per-run reserved slot specifically so it is outside the lane's own
+# writable worktree -- but an editing lane keeps Bash for its whole session, and Bash is not
+# confined to --add-dir, so the lane could still reach out and rewrite the copy after its
+# self-test-proven launch. Detection, not prevention: re-hash the copy now and compare against
+# the hash taken the instant it was written, before the child ever started. A read-only lane
+# has no Write/Edit/Bash grant at all, so this can only ever fire for an editing lane, but the
+# check is cheap and unconditional for every claude lane that got a copy.
+# Round 8 (fable minor): stated plainly because it is easy to over-read as continuous
+# monitoring -- it is NOT. This compares the copy's hash at exactly two points in time: the
+# instant it was written, before the child ever started, and the instant the provider process
+# exits. A rewrite that happens mid-run and is RESTORED to the original bytes before the
+# provider exits leaves the two hashes identical, so this check records no tamper and the
+# receipt still claims 'denied-by-settings-hook' -- even though the gate was provably absent
+# for however long the rewrite was in effect. See docs/lane-containment.md for the full
+# statement of what this does and does not detect.
+if ($cfg.engine -eq 'claude' -and $backgroundHookLaunchSha256) {
+    $backgroundHookPostRunSha256 = if (Test-Path -LiteralPath $hookCopyPath) {
+        (Get-FileHash -LiteralPath $hookCopyPath -Algorithm SHA256).Hash.ToLowerInvariant()
+    } else { $null }
+    if ($backgroundHookPostRunSha256 -ne $backgroundHookLaunchSha256) {
+        $authority.backgroundGate = 'background-gate-tampered'
+        $authority.backgroundGateTamperDetail = if ($null -eq $backgroundHookPostRunSha256) {
+            'background-gate-tampered: hook copy missing after run'
+        } else {
+            "background-gate-tampered: sha256 was $backgroundHookLaunchSha256, now $backgroundHookPostRunSha256"
+        }
+    }
+}
+# Round 14 (sol major, r13): the SAME two-point-in-time check as directly above, now also for
+# the registered `command` executable itself -- the interpreter, hashed at self-test time
+# (above, before the provider ever started). An editing lane's own foreground Bash/PowerShell
+# grant can delete or replace a user-writable interpreter mid-run; this is the only thing that
+# can catch it after the fact. Same literal, same field, appended (not overwritten) if the hook
+# copy above ALSO tampered, so neither finding masks the other -- see workEvidence.reason above
+# for the same append-not-overwrite reasoning. Exactly two points in time here too (launch,
+# exit): a replace-then-restore inside the run leaves both hashes matching and records nothing,
+# same limitation docs/lane-containment.md already states for the hook copy.
+if ($cfg.engine -eq 'claude' -and $backgroundInterpreterLaunchSha256) {
+    $backgroundInterpreterPostRunSha256 = if (Test-Path -LiteralPath $PYTHON_EXE) {
+        (Get-FileHash -LiteralPath $PYTHON_EXE -Algorithm SHA256).Hash.ToLowerInvariant()
+    } else { $null }
+    if ($backgroundInterpreterPostRunSha256 -ne $backgroundInterpreterLaunchSha256) {
+        $authority.backgroundGate = 'background-gate-tampered'
+        $interpreterTamperDetail = if ($null -eq $backgroundInterpreterPostRunSha256) {
+            'background-gate-tampered: interpreter missing after run'
+        } else {
+            "background-gate-tampered: interpreter sha256 was $backgroundInterpreterLaunchSha256, now $backgroundInterpreterPostRunSha256"
+        }
+        $authority.backgroundGateTamperDetail = if ($authority.Contains('backgroundGateTamperDetail') -and $authority.backgroundGateTamperDetail) {
+            "$($authority.backgroundGateTamperDetail) | $interpreterTamperDetail"
+        } else { $interpreterTamperDetail }
+    }
+}
+$workCompleted = ($null -eq $failure -and $null -eq $providerRefusal -and $processEnded -and $workEvidence.workCompleted -eq $true)
 $receipt = [ordered]@{
     schema       = 'mlv-app/fleet-lane-receipt/v1'
     # SAME KEY AT EVERY STAGE. A reader checks `state` once - reserved, complete or
     # failed - instead of inferring liveness from which fields happen to be present.
+    # 'ended-incomplete' = the process exited but there is no positive evidence the work finished.
     state        = if ($null -ne $failure) { 'failed' }
                    elseif ($null -ne $providerRefusal) { 'refused' }
-                   elseif ($exitCode -ne -999) { 'complete' }
+                   elseif ($workCompleted) { 'complete' }
+                   elseif ($processEnded) { 'ended-incomplete' }
                    else { 'incomplete' }
     lane         = $Lane
     role         = $cfg.role
     engine       = $cfg.engine
-    model        = $cfg.model
+    # LANE-MODEL-CURRENCY-1: requestedModel is the table's alias/tier (the lane's
+    # identity); resolvedModel is what actually ran -- a codex tier's resolved slug, or,
+    # for a claude lane, the canonicalModel(s) of the modelUsage entry matching the
+    # requested alias's family -- and stays 'unknown' (never the requested string copied
+    # over, never a raw modelUsage key) when that cannot be determined. auxiliaryModels
+    # carries every OTHER modelUsage entry (auxiliary/tool-call models, e.g. haiku) that
+    # was seen but never counted as the lane's own identity. selectedModel (round 2) is the
+    # PRE-LAUNCH choice -- the exact --model/-m argument value -- recorded even when the child
+    # never started, so a start failure is never silently unrecorded; it is never a substitute
+    # for resolvedModel's proof.
+    requestedModel   = $RequestedModel
+    selectedModel    = $SelectedModel
+    resolvedModel    = $ResolvedModel
+    auxiliaryModels  = $AuxiliaryModels
+    pinnedByOverride = $PinnedByOverride
     effort       = $cfg.effort
     card         = $Card
     workDir      = $WorkDir
@@ -834,12 +1747,24 @@ $receipt = [ordered]@{
     stdoutPath   = $outPath
     stderrPath   = $errPath
     failure      = $failure
+    dispatchLedger = [ordered]@{ state = $dispatchLedgerState; reservationId = $dispatchLedgerReservationId }
     # null when the provider did the work. Otherwise {kind, engine, match, retryAfter, remedy};
     # `complete` is false in that case even though `failure` is null -- the lane script did not
     # fail, the provider declined, and a reader must never mistake that for a verdict.
     providerRefusal = $providerRefusal
     containment  = $containment
-    complete     = ($null -eq $failure -and $null -eq $providerRefusal -and $exitCode -ne -999)
+    scratch      = $scratchDisposition
+    worktreeDisposition = $worktreeDisposition
+    processEnded = $processEnded
+    complete     = $workCompleted
+    workEvidence = $workEvidence
+    # Round 5 (sol minor 1): what the dirty-no-commit check above actually determined --
+    # 'not-applicable' (gate did not apply, or HEAD moved), 'unavailable' (a git capture failed;
+    # see dirtyCheckReason for pre- vs post-snapshot and why), 'clean', or 'dirty' (folded into
+    # workEvidence.reason as dirty-worktree-no-commit). A reader must never treat 'unavailable'
+    # as either verdict.
+    dirtyCheck       = $dirtyCheck
+    dirtyCheckReason = $dirtyCheckReason
     spend        = [ordered]@{
         costUsd            = $costUsd
         costReported       = ($null -ne $costUsd)
@@ -866,8 +1791,8 @@ try {
 
 }   # end finally - the receipt is now written on EVERY exit path
 
-Write-Host ("[{0}] {1}/{2} effort={3} exit={4} {5}s cost={6} -> {7}" -f `
-    $Lane, $cfg.engine, $cfg.model, $cfg.effort, $exitCode, $receipt.durationSec,
+Write-Host ("[{0}] {1}/{2}->{3} effort={4} exit={5} {6}s cost={7} -> {8}" -f `
+    $Lane, $cfg.engine, $RequestedModel, $ResolvedModel, $cfg.effort, $exitCode, $receipt.durationSec,
     $(if ($null -ne $costUsd) { 'USD ' + ([math]::Round($costUsd,2)) } else { 'unreported' }),
     $rcptPath)
 

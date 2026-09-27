@@ -105,6 +105,15 @@ foreach ($run in $runs) {
         latency_ms     = [math]::Round($j.metadata.average_latency_ms,1)
         cadence_ms     = [math]::Round($j.metadata.average_cadence_ms,1)
         fps            = if ($j.metadata.average_cadence_ms) { [math]::Round(1000.0/$j.metadata.average_cadence_ms,1) } else { 0 }
+        # round 6 (astra MAJOR, consumer sweep): this script has no PLAYBACK-MEASURE-HOST-LOAD-
+        # GATE-1 telemetry at all (no Get-HostLoadSnapshot call anywhere in this file) -- its fps
+        # was never checked against host load. Mark it unrecorded/provisional, same stance as
+        # compare-machine-perf.ps1's New-ProfileRow/New-FieldLogRow for the identical reason,
+        # rather than silently implying a clean signal. This script is outside the
+        # compare-machine-perf.ps1 census's reach (a standalone script, not a New-*Row function in
+        # that file) -- see PLAYBACK-MEASURE-HOST-LOAD-GATE-1 round 6 summary for why it is marked
+        # rather than brought under real host-load sampling this round.
+        host_load_provisional = $true
     }
 }
 

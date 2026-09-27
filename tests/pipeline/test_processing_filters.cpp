@@ -634,8 +634,34 @@ TEST(ProcessingFilters, ShadowsHighlightsProbeTelemetryIsOptInByDefault)
                           1,
                           0);
 
-    ASSERT_TRUE(processingGetLastShadowsHighlightsPrepMilliseconds() > 0.0);
-    ASSERT_TRUE(processingGetLastShadowsHighlightsFilterMilliseconds() > 0.0);
+    /* PROD-TELEMETRY-DURATION-AS-PROOF-1: a Milliseconds() field can legitimately
+     * read 0.0 when a stage runs faster than the timer resolves, so it must never
+     * be the evidence for whether a stage ran. Assert on the execution counter /
+     * completed-flag telemetry instead; durations stay reportable but unproven.
+     * This fixture is 24x20 (even width and height), so the 16-bit pipeline takes
+     * the halfres RBF lane by design (processing_compute_shadows_highlights_blur
+     * halves even-dimension frames as a perf win); non-preview mode means the
+     * quarterres preview lane never runs. */
+    ASSERT_TRUE(processingGetLastShadowsHighlightsPrepRunCountForTesting() > 0);
+    ASSERT_TRUE(processingGetLastShadowsHighlightsFilterRunCountForTesting() > 0);
+    ASSERT_TRUE(processingGetLastShadowsHighlightsHalfresDownsampleCompletedForTesting());
+    ASSERT_TRUE(processingGetLastShadowsHighlightsHalfresRbfCompletedForTesting());
+    ASSERT_TRUE(processingGetLastShadowsHighlightsHalfresUpsampleCompletedForTesting());
+    ASSERT_EQ(0, processingGetLastShadowsHighlightsQuarterresDownsampleCompletedForTesting());
+    ASSERT_EQ(0, processingGetLastShadowsHighlightsQuarterresRbfCompletedForTesting());
+    ASSERT_EQ(0, processingGetLastShadowsHighlightsQuarterresUpsampleCompletedForTesting());
+
+    /* This is the test's namesake contract: with MLVAPP_SHADOWS_HIGHLIGHTS_PROBE
+     * unset, processing_shadows_highlights_probe_mode() (via
+     * processing_parse_probe_mode()) returns -1, so
+     * shadows_highlights_probe_enabled in
+     * processing_compute_shadows_highlights_blur() is false and every
+     * per-substage omp_get_wtime() write - halfres AND quarterres alike - is
+     * skipped (raw_processing.c: the `if( shadows_highlights_probe_enabled )`
+     * guards around each _ms accumulator). These stay 0.0 because detailed probe
+     * timing was never recorded, not because the halfres stages (proven above to
+     * have run) were merely fast. Do not "fix" these back to run-proof duty -
+     * that regression is what PROD-TELEMETRY-DURATION-AS-PROOF-1 round 3 undid. */
     ASSERT_EQ(0.0, processingGetLastShadowsHighlightsFilterHalfresDownsampleMilliseconds());
     ASSERT_EQ(0.0, processingGetLastShadowsHighlightsFilterHalfresRbfMilliseconds());
     ASSERT_EQ(0.0, processingGetLastShadowsHighlightsFilterHalfresUpsampleMilliseconds());
@@ -675,7 +701,11 @@ TEST(ProcessingFilters, SharpOddHeightPlaybackPreviewKeepsFullresShadowsHighligh
                           1,
                           0);
 
-    ASSERT_TRUE(processingGetLastShadowsHighlightsFilterFullresMilliseconds() > 0.0);
+    /* PROD-TELEMETRY-DURATION-AS-PROOF-2: a fixture this small can run the
+     * fullres RBF faster than omp_get_wtime() resolves, so Milliseconds() > 0.0
+     * is not proof it ran -- assert the completed-flag set by the fullres
+     * branch of processing_compute_shadows_highlights_blur() instead. */
+    ASSERT_TRUE(processingGetLastShadowsHighlightsFullresCompletedForTesting());
     ASSERT_EQ(0.0, processingGetLastShadowsHighlightsFilterHalfresDownsampleMilliseconds());
     ASSERT_EQ(0.0, processingGetLastShadowsHighlightsFilterHalfresRbfMilliseconds());
     ASSERT_EQ(0.0, processingGetLastShadowsHighlightsFilterHalfresUpsampleMilliseconds());
@@ -717,10 +747,13 @@ TEST(ProcessingFilters, AggressiveOddHeightPlaybackPreviewUsesHalfresShadowsHigh
                           1,
                           0);
 
+    /* PROD-TELEMETRY-DURATION-AS-PROOF-2: proof by construction, not by a
+     * wall-clock read that can round to 0.0 on a fast/tiny run -- the completed
+     * flag and run counter are only ever set where the path actually executes. */
     ASSERT_EQ(0.0, processingGetLastShadowsHighlightsFilterFullresMilliseconds());
-    ASSERT_TRUE(processingGetLastShadowsHighlightsFilterHalfresRbfMilliseconds() > 0.0);
+    ASSERT_TRUE(processingGetLastShadowsHighlightsHalfresRbfCompletedForTesting());
     ASSERT_EQ(0.0, processingGetLastShadowsHighlightsFilterQuarterresRbfMilliseconds());
-    ASSERT_TRUE(processingGetLastShadowsHighlightsFilterMilliseconds() > 0.0);
+    ASSERT_TRUE(processingGetLastShadowsHighlightsFilterRunCountForTesting() > 0);
 
     freeProcessingObject(processing);
     unset_env_for_test("MLVAPP_SHADOWS_HIGHLIGHTS_PROBE");
@@ -756,13 +789,15 @@ TEST(ProcessingFilters, AggressiveX8PlaybackPreviewUsesQuarterresShadowsHighligh
                           1,
                           0);
 
+    /* PROD-TELEMETRY-DURATION-AS-PROOF-2: proof by construction, not by a
+     * wall-clock read that can round to 0.0 on a fast/tiny run -- the completed
+     * flags and run counter are only ever set where the path actually executes. */
     ASSERT_EQ(0.0, processingGetLastShadowsHighlightsFilterFullresMilliseconds());
     ASSERT_EQ(0.0, processingGetLastShadowsHighlightsFilterHalfresRbfMilliseconds());
-    ASSERT_TRUE(
-        processingGetLastShadowsHighlightsFilterQuarterresDownsampleMilliseconds()
-      + processingGetLastShadowsHighlightsFilterQuarterresRbfMilliseconds()
-      + processingGetLastShadowsHighlightsFilterQuarterresUpsampleMilliseconds() > 0.0);
-    ASSERT_TRUE(processingGetLastShadowsHighlightsFilterMilliseconds() > 0.0);
+    ASSERT_TRUE(processingGetLastShadowsHighlightsQuarterresDownsampleCompletedForTesting());
+    ASSERT_TRUE(processingGetLastShadowsHighlightsQuarterresRbfCompletedForTesting());
+    ASSERT_TRUE(processingGetLastShadowsHighlightsQuarterresUpsampleCompletedForTesting());
+    ASSERT_TRUE(processingGetLastShadowsHighlightsFilterRunCountForTesting() > 0);
 
     freeProcessingObject(processing);
     unset_env_for_test("MLVAPP_SHADOWS_HIGHLIGHTS_PROBE");

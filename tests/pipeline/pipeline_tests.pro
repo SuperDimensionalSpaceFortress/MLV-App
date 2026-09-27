@@ -7,6 +7,13 @@ TARGET = pipeline_tests
 
 DEFINES += STDOUT_SILENT
 
+# Compile video_mlv.c's real JPEG2000 frame-read branch into the test binary so
+# the upstream-sync hardening regressions run the production lines rather than
+# the "codec not enabled" stub. OpenJPH itself is not linked: the codec entry
+# points come from tests/pipeline/ojph_decoder_test_stub.cpp, which is the only
+# thing replaced. See that file for why.
+DEFINES += ENABLE_JPEG2K
+
 SOURCES += \
     $$REPO_ROOT/tests/common/test_artifacts.cpp \
     $$REPO_ROOT/tests/common/frame_compare.cpp \
@@ -90,6 +97,7 @@ SOURCES += \
     $$REPO_ROOT/src/librtprocess/src/demosaic/xtransfast.cc \
     $$REPO_ROOT/src/librtprocess/src/postprocess/hilite_recon.cc \
     $$REPO_ROOT/src/librtprocess/src/preprocess/CA_correct.cc \
+    $$REPO_ROOT/tests/pipeline/ojph_decoder_test_stub.cpp \
     $$REPO_ROOT/tests/pipeline/mlv_pipeline_fixture.cpp \
     $$REPO_ROOT/tests/pipeline/backend_parametric_fixture.cpp \
     $$REPO_ROOT/tests/pipeline/test_main.cpp \
@@ -101,6 +109,7 @@ SOURCES += \
     $$REPO_ROOT/tests/pipeline/test_playback_scaling.cpp \
     $$REPO_ROOT/tests/pipeline/test_crash_forensics.cpp \
     $$REPO_ROOT/tests/pipeline/test_phase3_infrastructure.cpp \
+    $$REPO_ROOT/tests/pipeline/test_upstream_sync_hardening.cpp \
     $$REPO_ROOT/tests/pipeline/test_phase3_parity.cpp \
     $$REPO_ROOT/tests/pipeline/test_cdng_sequence_export.cpp
 
@@ -121,6 +130,7 @@ HEADERS += \
     $$REPO_ROOT/src/debug/StageTimingCsvSink.h \
     $$REPO_ROOT/platform/qt/GpuDebayer.h \
     $$REPO_ROOT/platform/qt/GpuPreviewProcessing.h \
+    $$REPO_ROOT/tests/pipeline/ojph_decoder_test_stub.h \
     $$REPO_ROOT/tests/pipeline/mlv_pipeline_fixture.h \
     $$REPO_ROOT/tests/pipeline/backend_parametric_fixture.h \
     $$REPO_ROOT/tests/pipeline/playback_path_test_state.h \

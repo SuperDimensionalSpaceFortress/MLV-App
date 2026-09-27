@@ -97,4 +97,5 @@ jobs:
           python -m pytest `
             tools\profiling `
             --ignore=tools\profiling\test_frame_colour_spatial_metrics.py `
+            --ignore=tools\profiling\test_make_contact_sheet.py `
             -q

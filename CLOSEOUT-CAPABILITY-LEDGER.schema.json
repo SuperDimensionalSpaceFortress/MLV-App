@@ -37,6 +37,10 @@
         }
       ]
     },
+    "status": {
+      "type": "string",
+      "minLength": 1
+    },
     "ledgerProfile": {
       "$ref": "#/$defs/profile"
     },

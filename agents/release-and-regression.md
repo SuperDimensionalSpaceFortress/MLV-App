@@ -80,3 +80,34 @@ gates + residual risks: `docs/regression-prevention-program.md`. Binding rules:
   or roll back; it cannot promote after an objective veto. Re-bless laundering
   (greenlighting a regressed build by regenerating the golden) is the worst failure mode -- guard it
   structurally.
+
+### September 8 synthetic GUI reference adjudication
+
+The owner explicitly delegated the prepared two-reference decision to the hub
+and adversarial low-inference agents, directing that execution continue without
+another owner question. Two independent Luna reviewers approved the bounded
+correction; the Fable hub returned `APPLY_EXACT_TWO_HASHES`. This owner instruction
+supersedes the human-approval requirement above for this exact proposal only.
+
+- Keys: `gpu.viewport.rgb888.pattern_nearest` and
+  `gpu.viewport.rgb16.pattern_nearest` in `tests/fixtures/golden/gui_hashes.json`.
+- Old value for both: `48758a9c5b87ce14ef78aab9e69e8624a8a9ed841af80df84c352f837f6dfe63`.
+- Approved value for both: `817ca20ee0f7bc67e467002d38a3f4c9cd915035c4a5a4a38e038e6230b08ae6`.
+- Independent derivation: the old hash encodes vertical inversion and a 4x4 to
+  5x5 inclusive-edge expansion followed by trimming; the new hash encodes the
+  original 4x4 pixels with the unchanged hash header. Exact pixel comparisons
+  precede these hashes. Geometry and U16 endpoint regressions have preserved RED
+  evidence; the corrected native suite failed only these two old hashes.
+- Only the prepared patch was applied. The unchanged native executable then
+  passed all 42 tests with no failures or skips; offscreen passed 33 with nine
+  native GL skips. A clean app build and Bachelor playback validation remain
+  required afterward. Failed outputs, proposal and adjudication receipt are
+  preserved.
+- No other golden, tolerance, shipping default, known-good real-footage baseline
+  requirement, or merge gate changes. This does not activate the general
+  autonomous golden-authority infrastructure.
+
+Evidence: `.claude-state/project-audit/20260907/pr72-synthetic-golden-proposal.md`,
+the adjacent patch and adjudication receipt, and
+`.claude-state/fleet-runs/pr72-synthetic-hub-adjudication-fable-20260908-01/fable-001.last.txt`
+(SHA-256 `4a6d08a2daa82353b469b6cdc392b5470b50a66ee3c87f6533ad7ca866b8edb1`).

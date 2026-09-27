@@ -467,7 +467,7 @@ int MLVBlenderExportMLV(MLVBlender_t * Blender, const char * OutputPath)
         export_failed = saveMlvHeaders(mlv_object, mlv_output_file, 0, MLV_FAST_PASS,
                                        frame_start, frame_end, "MLVStitcher", error);
     else
-        export_failed = saveMlvHeaders(mlv_object, mlv_output_file, 0, MLV_COMPRESS,
+        export_failed = saveMlvHeaders(mlv_object, mlv_output_file, 0, MLV_LJ92,
                                        frame_start, frame_end, "MLVStitcher", error);
 
     if (export_failed) {

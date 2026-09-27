@@ -25,10 +25,15 @@ function Get-GuiSmokeTaskText {
         }
     }
     catch {
+        # round 6 (sol MINOR, same class as round 5's OnSample sanitization): a faulted
+        # stdout/stderr drain task's exception message can embed a path or host identifier (e.g. a
+        # file-in-use error naming the exact file path) -- this string flowed unsanitized into
+        # result.failures -> validation.failures -> the receipt/summary JSON. Record only the
+        # exception's TYPE, never its message text.
         return [pscustomobject]@{
             completed = $false
             text = ""
-            failure = "$Label drain failed: $($_.Exception.Message)"
+            failure = "$Label drain failed: $($_.Exception.GetType().Name)"
         }
     }
 }
@@ -50,6 +55,22 @@ function Wait-GuiSmokeProcessBounded {
         [int]$StreamDrainMs = 15000
     )
 
+    # PLAYBACK-MEASURE-HOST-LOAD-GATE-1 round 3-6: this used to chop the wait into chunks and
+    # invoke an -OnSample callback between them, so host-load telemetry could be sampled DURING the
+    # leg. round 5/6 kept finding new ways a slow or non-returning callback (running synchronously,
+    # in this module's own scope, with no cooperative-cancellation point) could compound past
+    # -TimeoutMs or block this function from ever returning at all.
+    #
+    # round 7 (sol + astra MAJOR -- "the new budget does not bound collection as a whole, and a
+    # non-returning sampler prevents both timeout handling and receipt publication"): item 1's
+    # replacement of per-process CPU accounting with a single GetSystemTimes syscall plus one
+    # process-handle read means a host-load sample no longer needs an unbounded-scriptblock
+    # indirection to be taken safely DURING the wait -- run-release-gui-smoke.ps1's own sampling
+    # loop now calls Wait-GuiSmokeProcessBounded only for the FINAL, already-chunked-down remainder
+    # of the timeout budget, sampling inline in its own scope between chunks. This function goes
+    # back to being exactly what its round-3 default branch always was: ONE bounded wait, then the
+    # stream-drain/kill-tree finalize below -- no callback, no per-callback overrun bookkeeping, and
+    # therefore no way for a caller-supplied scriptblock to prevent this function from returning.
     $failures = [System.Collections.Generic.List[string]]::new()
     $timedOut = $false
     $treeKillAttempted = $false
@@ -60,7 +81,9 @@ function Wait-GuiSmokeProcessBounded {
         $terminationConfirmed = $Process.WaitForExit($TimeoutMs)
     }
     catch {
-        $failures.Add("Process wait failed: $($_.Exception.Message)")
+        # round 7 (sol MINOR, same class as the two sanitizations already below): record only the
+        # exception's TYPE, never its message text.
+        $failures.Add("Process wait failed: $($_.Exception.GetType().Name)")
     }
 
     if (-not $terminationConfirmed) {
@@ -75,14 +98,18 @@ function Wait-GuiSmokeProcessBounded {
             $treeKillSucceeded = $true
         }
         catch {
-            $failures.Add("MLVApp process-tree termination failed: $($_.Exception.Message)")
+            # round 7 (sol MINOR): $_.Exception.Message can embed a path or host identifier and
+            # this string reaches the receipt via processBoundary.failures -> the summary JSON.
+            # Record only the exception's TYPE, same class as round 5/6's OnSample/task-drain
+            # sanitizations.
+            $failures.Add("MLVApp process-tree termination failed: $($_.Exception.GetType().Name)")
         }
 
         try {
             $terminationConfirmed = $Process.WaitForExit($TerminationGraceMs)
         }
         catch {
-            $failures.Add("MLVApp post-kill wait failed: $($_.Exception.Message)")
+            $failures.Add("MLVApp post-kill wait failed: $($_.Exception.GetType().Name)")
         }
         if (-not $terminationConfirmed) {
             $failures.Add("MLVApp process tree was not confirmed terminated within $TerminationGraceMs ms.")
@@ -105,7 +132,8 @@ function Wait-GuiSmokeProcessBounded {
             $nativeExitCode = $Process.ExitCode
         }
         catch {
-            $failures.Add("MLVApp exit code was unavailable: $($_.Exception.Message)")
+            # round 7 (sol MINOR): same sanitization class as the catches above.
+            $failures.Add("MLVApp exit code was unavailable: $($_.Exception.GetType().Name)")
         }
     }
     $effectiveExitCode = if ($timedOut -or -not $terminationConfirmed) {

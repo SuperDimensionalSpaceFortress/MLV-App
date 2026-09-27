@@ -5,6 +5,16 @@ remediated and adjudicated with wisdom and hub lanes and swarm of Luna agents.
 Update durable memory and workflows". This extends the August 31 hub-adjudication
 ruling in `tools/coordination/Invoke-Workstream.ps1`.
 
+September 8 correction: the owner directed, "Dont ask me questions or pull me
+into the loop. Adjudicate next steps using hub lanes and swarms of adversarial
+low inference agents like Luna". Resolve ordinary technical decisions through
+bounded adversarial Luna reviews and the hub, record the decision and evidence,
+and continue execution. Do not turn an adjudicable repair into another owner
+question. Preserve objective validation failures and genuine access blockers.
+The specific synthetic GUI reference decision that prompted this direction is
+recorded in `agents/release-and-regression.md`; it does not activate the general
+autonomous golden-authority infrastructure.
+
 ## Recovery workflow
 
 A recoverable build, test, import, tooling, or environment failure is work to

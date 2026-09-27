@@ -85,6 +85,27 @@ class GpuJobResultProvenanceTests(unittest.TestCase):
         self.assertEqual(DEFAULT_LLRAWPROC_PATH, "src/mlv/llrawproc/llrawproc.c")
         self.assertTrue((ROOT / DEFAULT_LLRAWPROC_PATH).is_file())
 
+    def test_uppercase_dll_digest_is_rejected_so_producers_must_lowercase(self) -> None:
+        manifest = _read_json(BOUND_FIXTURE)
+        manifest["dllSha256"] = manifest["dllSha256"].upper()
+        with self.assertRaises(ProvenanceValidationError) as ctx:
+            validate(manifest, git=self.git)
+        self.assertIn("dllSha256", str(ctx.exception))
+
+    def test_bachelor_evidence_producers_lowercase_the_dll_digest_before_recording_it(self) -> None:
+        # GPU-PROVENANCE-SELF-BINDING-1: Get-FileHash returns UPPERCASE, the validator above
+        # requires lowercase, and both remote evidence scripts copied the raw digest into
+        # dllSha256, so every real bachelor provenance manifest failed validation.
+        for name in ("invoke-ultramagnus-cdng-export-evidence.ps1", "invoke-ultramagnus-p3-evidence.ps1"):
+            text = (ROOT / "tools" / "profiling" / name).read_text(encoding="utf-8")
+            resolved = text.index("$dllSha256 = (@(")
+            lowered = text.index("$dllSha256 = ([string]`$dllSha256).ToLowerInvariant()", resolved)
+            self.assertLess(resolved, lowered, name)
+            # Nothing may record the digest between resolving and lowercasing it.
+            between = text[resolved:lowered]
+            self.assertNotIn("provenance.dllSha256", between, name)
+            self.assertNotIn("Write-ProvenanceFile", between, name)
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -12,6 +12,13 @@ param(
 
 $ErrorActionPreference = "Stop"
 
+# Get-ColorArtifactFailingVerdicts is the single source of truth for which
+# colorArtifactScan.verdict values fail a leg -- see gui-smoke-color-artifact-scan.ps1.
+# Sourcing it here (rather than hand-keeping a second copy) is what closes PR147 round 3's
+# gap: this comparator's own list used to omit capture-invalid and capture-too-dark, so an
+# A/B leg with an unusable or artifacted capture could still report PASS.
+. (Join-Path $PSScriptRoot 'gui-smoke-color-artifact-scan.ps1')
+
 function Read-SmokeJson {
     param([string]$Path)
 
@@ -383,6 +390,68 @@ function Get-LegEvidenceBinding {
         summary = $summary
         visualState = $visualState
         git = $git
+    }
+}
+
+function Get-HostLoadComparisonEvidence {
+    # PLAYBACK-MEASURE-HOST-LOAD-GATE-1: refuse to compare fps across a pair where either leg's
+    # host load is PROVISIONAL (bar exceeded, or telemetry UNKNOWN -- a run recorded before this
+    # gate existed has no hostLoad field at all, which is also UNKNOWN, never "quiet"). An fps
+    # number measured on a loaded host is not a property of the build, so a provisional leg is
+    # never usable as a regression signal, whatever the other leg's state is.
+    param(
+        [object]$BeforeSmoke,
+        [object]$AfterSmoke
+    )
+
+    $evidence = [ordered]@{}
+    $failures = @()
+    foreach ($leg in @(
+        [pscustomobject]@{ Name = "before"; Smoke = $BeforeSmoke },
+        [pscustomobject]@{ Name = "after"; Smoke = $AfterSmoke }
+    )) {
+        $legHostLoad = Get-NestedValue $leg.Smoke "hostLoad"
+        # round 3: a hostLoad block that is PRESENT but missing "provisional" (or "state") must
+        # read the same as a missing block entirely -- provisional/unknown, never coerced to
+        # clean. [bool]$null -eq $false is the trap: it would make a degenerate block silently
+        # pass as a clean leg, exactly backwards from this gate's fail-toward-provisional stance.
+        # round 4 (sol major): "provisional" and "state" used to be derived independently, so a
+        # block carrying an explicit provisional=false alongside a missing/blank state read as
+        # state=unknown PROVISIONAL=false -- an inconsistent, clean-reading combination that let
+        # UNKNOWN enter comparison unrefused. state=unknown now always forces provisional=true.
+        # round 8 (sol MAJOR item 3): that fix only special-cased state=="unknown" -- a leg with
+        # state="exceeded" and an inconsistent/fabricated provisional=false still read clean. THE
+        # CANONICAL PREDICATE (identical at every one of this card's six sites -- see
+        # compare-machine-perf.ps1's Get-PlaybackAbLegHostLoadProvisional for the full cross-file
+        # note): clean iff state=="quiet" AND provisional==false; every other combination is
+        # provisional.
+        $legProvisionalRaw = if ($null -eq $legHostLoad) { $null } else { Get-NestedValue $legHostLoad "provisional" }
+        $legProvisionalDeclared = if ($null -eq $legHostLoad -or $null -eq $legProvisionalRaw) { $true } else { [bool]$legProvisionalRaw }
+        $legStateRaw = if ($null -eq $legHostLoad) { $null } else { Get-NestedValue $legHostLoad "state" }
+        $legState = if ($null -eq $legHostLoad -or [string]::IsNullOrWhiteSpace([string]$legStateRaw)) { "unknown" } else { [string]$legStateRaw }
+        $legProvisional = ($legProvisionalDeclared -or $legState -ne "quiet")
+        $legReason = if ($null -eq $legHostLoad) {
+            "no hostLoad telemetry recorded in the smoke result"
+        } else {
+            [string](Get-NestedValue $legHostLoad "reason")
+        }
+        $evidence[$leg.Name] = [pscustomobject]@{
+            state = $legState
+            provisional = $legProvisional
+            reason = $legReason
+        }
+        if ($legProvisional) {
+            $failures += (
+                "$($leg.Name) smoke host load is PROVISIONAL (state=$legState" +
+                $(if ($legReason) { ": $legReason" } else { "" }) +
+                "); an fps comparison against a PROVISIONAL run is refused."
+            )
+        }
+    }
+
+    [pscustomobject]@{
+        evidence = [pscustomobject]$evidence
+        failures = @($failures)
     }
 }
 
@@ -764,7 +833,7 @@ foreach ($leg in @(
     if ([string]::IsNullOrWhiteSpace($colorVerdict)) {
         $failures += "$($leg.Name) smoke has no color-artifact verdict."
     }
-    elseif ($colorVerdict -in @("suspect-block-or-bar", "scan-error")) {
+    elseif ($colorVerdict -in (Get-ColorArtifactFailingVerdicts)) {
         $failures += "$($leg.Name) smoke color-artifact verdict is $colorVerdict."
     }
 }
@@ -801,6 +870,10 @@ foreach ($leg in @(
         $failures += "$($leg.Name) smoke did not prove displayed-frame advancement."
     }
 }
+$hostLoadComparison = Get-HostLoadComparisonEvidence -BeforeSmoke $beforeSmoke -AfterSmoke $afterSmoke
+$hostLoadEvidence = $hostLoadComparison.evidence
+$failures += @($hostLoadComparison.failures)
+
 $beforeLastPresented = $presentedFrameEvidence.before.lastPresentedFrame
 $afterLastPresented = $presentedFrameEvidence.after.lastPresentedFrame
 if ($null -eq $beforeLastPresented -or $null -eq $afterLastPresented -or
@@ -845,6 +918,7 @@ $result = [pscustomobject]@{
     }
     screenshot = $screenshotCompare
     presentedFrameEvidence = [pscustomobject]$presentedFrameEvidence
+    hostLoadEvidence = $hostLoadEvidence
     autoDecision = New-AutoDecisionComparison `
         -BeforeSmoke $beforeSmoke `
         -AfterSmoke $afterSmoke
@@ -888,7 +962,7 @@ Write-Host ((
     "GUI-SMOKE-AB verdict={0} screenshot_status={1} mean_abs_rgb_delta={2} " +
     "changed_sample_ratio={3} gui_fps_delta={4} presented_fps_delta={5} " +
     "auto_reason_before={6} auto_reason_after={7} auto_avg_ms_delta={8} " +
-    "auto_avg_fps_eq_delta={9} output={10}") -f
+    "auto_avg_fps_eq_delta={9} host_load_before={10} host_load_after={11} output={12}") -f
     $result.verdict,
     $result.screenshot.status,
     $result.screenshot.meanAbsRgbDelta,
@@ -899,6 +973,8 @@ Write-Host ((
     $result.autoDecision.reason.after,
     $result.autoDecision.averageMs.delta,
     $result.autoDecision.averageFpsEquivalent.delta,
+    $result.hostLoadEvidence.before.state,
+    $result.hostLoadEvidence.after.state,
     $(if ([string]::IsNullOrWhiteSpace($Output)) { "<stdout-json>" } else { $resolvedOutput })
 )
 

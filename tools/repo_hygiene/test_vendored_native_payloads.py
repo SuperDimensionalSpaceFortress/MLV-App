@@ -221,7 +221,9 @@ class VendoredNativePayloadTests(unittest.TestCase):
     def test_committed_manifest_integrity_passes_but_redistribution_remains_blocked(self) -> None:
         result = validate(ROOT)
         self.assertEqual(result["integrity"], "pass")
-        self.assertEqual(result["payload_count"], 9)
+        # 10 since PROD-UPSTREAM-SYNC-1 (PR #132): upstream 877dea2c added the arm64 FFmpeg archive
+        # platform/qt/FFmpeg/ffmpegOSXarm.zip, registered as payload ffmpeg-macos-arm64.
+        self.assertEqual(result["payload_count"], 10)
         self.assertEqual(result["inactive_artifact_count"], 1)
         self.assertEqual(result["redistribution_readiness"], "blocked")
         self.assertEqual(result["redistribution_enforcement"], "advisory")
