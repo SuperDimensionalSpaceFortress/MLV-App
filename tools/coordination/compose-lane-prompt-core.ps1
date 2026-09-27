@@ -86,6 +86,54 @@ function Get-ParsedFields {
     return $fieldMap
 }
 
+
+function Get-DoctrineBriefText {
+    # Fail-closed: implementer/editing composition requires a brief. Fixture via
+    # MLV_DOCTRINE_FIXTURE_ROOT for offline tests ONLY: get_doctrine_brief.py refuses it
+    # unless PYTEST_CURRENT_TEST is set and the root sits in tools/coordination/fixtures/.
+    # Never browses the bus from a lane;
+    # this runs on the hub/dispatcher host only.
+    param(
+        [string]$FixtureRoot = ''
+    )
+    $getter = Join-Path $PSScriptRoot 'Get-DoctrineBrief.ps1'
+    if (-not (Test-Path -LiteralPath $getter)) {
+        throw "doctrine-brief-missing: $getter"
+    }
+    # HASHTABLE splat, not an array: an array splat of '-FixtureRoot',<path> into a script binds
+    # both strings POSITIONALLY (to -DoctrineRepo/-Ref), so the fixture never reached the getter
+    # and python saw `--repo -FixtureRoot`. (Also never reuse the automatic $args variable.)
+    $getterArgs = @{}
+    if ($FixtureRoot) {
+        $getterArgs['FixtureRoot'] = $FixtureRoot
+    } elseif ($env:MLV_DOCTRINE_FIXTURE_ROOT) {
+        $getterArgs['FixtureRoot'] = $env:MLV_DOCTRINE_FIXTURE_ROOT
+    }
+    $output = & $getter @getterArgs 2>&1 | Out-String
+    $code = $LASTEXITCODE
+    if ($null -eq $code) { $code = 0 }
+    $trimmed = if ($null -eq $output) { '' } else { $output.TrimEnd() }
+    if ($code -ne 0 -or $trimmed -match '^REFUSED:') {
+        $msg = if ($trimmed) { $trimmed } else { "doctrine-brief-failed exit=$code" }
+        throw ("doctrine-brief-failed: {0}" -f $msg)
+    }
+    if (-not $trimmed) {
+        throw "doctrine-brief-failed: empty brief"
+    }
+    # Provenance is part of the brief (get_doctrine_brief.py writes it); a brief without it is
+    # not one we produced. Defence in depth behind the getter's own gate: a fixture brief is
+    # refused unless pytest is driving this composition. There is deliberately NO parameter
+    # for handing in brief text - the only brief a lane prompt can carry is this fetch.
+    $provMatch = [regex]::Match($trimmed, '(?m)^provenance: (live|fixture)\s*$')
+    if (-not $provMatch.Success) {
+        throw "doctrine-brief-failed: brief carries no provenance line"
+    }
+    if ($provMatch.Groups[1].Value -eq 'fixture' -and -not $env:PYTEST_CURRENT_TEST) {
+        throw "doctrine-brief-failed: doctrine-fixture-refused: fixture brief outside pytest"
+    }
+    return $trimmed
+}
+
 function Get-ComposedLanePrompt {
     param(
         [Parameter(Mandatory)][string]$ProcedurePath,
@@ -94,7 +142,9 @@ function Get-ComposedLanePrompt {
         [Parameter(Mandatory)][string]$BaseSha,
         [Parameter(Mandatory)][string]$RunDir,
         [string]$Ts = '',
-        [Parameter(Mandatory)][string]$GhCapability
+        [Parameter(Mandatory)][string]$GhCapability,
+        [string]$DoctrineFixtureRoot = '',
+        [switch]$SkipDoctrineBrief
     )
     if (-not (Test-Path -LiteralPath $ProcedurePath)) { throw "procedure-missing: $ProcedurePath" }
     $procedureText = Get-Content -LiteralPath $ProcedurePath -Raw
@@ -133,6 +183,15 @@ function Get-ComposedLanePrompt {
         $composed = $composed.Replace('{{RUNDIR}}', $RunDir)
         $composed = $composed.Replace('{{TS}}', $Ts)
 
+        # Implementer/editing path (fields-* -> product-card-TEMPLATE): doctrine brief is mandatory.
+        if ($composed -match '\{\{DOCTRINE_BRIEF\}\}') {
+            if ($SkipDoctrineBrief) {
+                throw "doctrine-brief-failed: SkipDoctrineBrief is not permitted on implementer/editing paths"
+            }
+            $brief = Get-DoctrineBriefText -FixtureRoot $DoctrineFixtureRoot
+            $composed = $composed.Replace('{{DOCTRINE_BRIEF}}', $brief)
+        }
+
         if ($composed -match '\{\{[A-Z_]+\}\}') {
             throw "composer-incomplete: unresolved placeholder $($Matches[0]) in $cardId"
         }
@@ -157,6 +216,15 @@ function Get-ComposedLanePrompt {
         $composed = $composed.Replace('{{RUNDIR}}', $RunDir)
         $composed = $composed.Replace('{{TS}}', $Ts)
         $composed = $composed.Replace('{{BRANCH}}', $branch)
+
+        if ($composed -match '\{\{DOCTRINE_BRIEF\}\}') {
+            # Full card carrying the placeholder is an editing/implementer path: refuse if brief fails.
+            if ($SkipDoctrineBrief) {
+                throw "doctrine-brief-failed: SkipDoctrineBrief is not permitted when {{DOCTRINE_BRIEF}} is present"
+            }
+            $brief = Get-DoctrineBriefText -FixtureRoot $DoctrineFixtureRoot
+            $composed = $composed.Replace('{{DOCTRINE_BRIEF}}', $brief)
+        }
 
         if ($composed -match '\{\{[A-Z_]+\}\}') {
             throw "composer-incomplete: unresolved placeholder $($Matches[0]) in $ProcedurePath"

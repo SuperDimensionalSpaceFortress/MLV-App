@@ -239,6 +239,8 @@ REGISTER_ROWS_WITH_DENY_CASES = (
     # NA-10 joined the register at v18 (O129, hub extension) and is enforced by this hook,
     # so it joins the gate: a row with zero DENY cases is a rule with no proof.
     "NA-10",
+    # NA-11: Agent Bridge SoT suspend (owner ruling 2026-09-09).
+    "NA-11",
 )
 
 APP_ID = 15368
@@ -580,6 +582,13 @@ NA10_HOOK_SCRIPT = "{REPO}/tools/hooks/mlv-never-authorized.py"
 NA10_VERIFIER = "{REPO}/tools/gates/verify_consented_footage.py"
 NA10_UNRELATED = "{REPO}/src/mlv/video_mlv.c"
 NA10_NEW_TEXT = "# rewritten by the lane this gate governs\n"
+
+# NA-11: Agent Bridge SoT — deny tools/agent-bridge/** writes under the lane worktree
+# (NA-7 allows the worktree by construction, so DENY is attributable to NA-11).
+NA11_BRIDGE_FILE = "{REPO}/tools/agent-bridge/bridge_core.py"
+NA11_BRIDGE_NESTED = "{REPO}/tools/agent-bridge/pkg/session.py"
+NA11_OUTSIDE_AGENTS = "{REPO}/agents/agent-bridge-source-of-truth.md"
+NA11_NEW_TEXT = "# suspended in-tree agent-bridge churn\n"
 
 
 # --------------------------------------------------------------------------- table
@@ -3383,6 +3392,63 @@ CASES = [
         "expect": "ALLOW",
         "fixture": "venue_at_worktree",
     },
+    # ------------------------------------------------- NA-11: Agent Bridge SoT suspend
+    #
+    # Owner ruling 2026-09-09. Deny Write/Edit/shell truncating writes under
+    # tools/agent-bridge/**. agents/ docs are outside the prefix (ALLOW control).
+    # Fail-closed: no MLV_ALLOW_* escape. Board venue does NOT unlock (unlike NA-10).
+    {
+        "name": "na11 write under tools/agent-bridge at lane venue",
+        "group": "na11",
+        "tool": "Write",
+        "input": {"file_path": NA11_BRIDGE_FILE, "content": NA11_NEW_TEXT},
+        "expect": "DENY",
+        "na": "NA-11",
+        "reason_contains": "tools/agent-bridge",
+        "fixture": "venue_at_worktree",
+    },
+    {
+        "name": "na11 edit nested under tools/agent-bridge",
+        "group": "na11",
+        "tool": "Edit",
+        "input": {
+            "file_path": NA11_BRIDGE_NESTED,
+            "old_string": "x = 0\n",
+            "new_string": "x = 1\n",
+        },
+        "expect": "DENY",
+        "na": "NA-11",
+        "reason_contains": "layibabalola/agent-bridge",
+        "fixture": "venue_at_worktree",
+    },
+    {
+        "name": "na11 shell set-content under tools/agent-bridge",
+        "group": "na11",
+        "tool": "PowerShell",
+        "input": {"command": _set_content(NA11_BRIDGE_FILE)},
+        "expect": "DENY",
+        "na": "NA-11",
+        "reason_contains": "tools/agent-bridge",
+        "fixture": "venue_at_worktree",
+    },
+    {
+        "name": "na11 write under tools/agent-bridge at board venue still denied",
+        "group": "na11",
+        "tool": "Write",
+        "input": {"file_path": NA11_BRIDGE_FILE, "content": NA11_NEW_TEXT},
+        "expect": "DENY",
+        "na": "NA-11",
+        "reason_contains": "suspended",
+        "fixture": "venue_at_board",
+    },
+    {
+        "name": "na11 control agents SoT doc outside package is allowed",
+        "group": "na11",
+        "tool": "Write",
+        "input": {"file_path": NA11_OUTSIDE_AGENTS, "content": NA11_NEW_TEXT},
+        "expect": "ALLOW",
+        "fixture": "venue_at_worktree",
+    },
     # ------------------------------------ HOOK-FALSE-POSITIVE-1: the falsifier PAIRS
     #
     # MEASURED, NOT ARGUED.  On 2026-09-07/08 the hub measured this gate refusing read-only
@@ -5765,10 +5831,11 @@ class MlvNeverAuthorizedHookTests(unittest.TestCase):
                 os.environ["MLV_BOARD_ROOT"] = saved
 
     def test_every_register_row_has_at_least_one_deny_case(self):
-        """The suite FAILS if any of NA-1,2,3,4,6,7,8,9,10 has zero DENY cases.
+        """The suite FAILS if any of NA-1,2,3,4,6,7,8,9,10,11 has zero DENY cases.
 
         NA-10 joined the list at register v18 (O129, hub extension): a rule the hook
         enforces but the table does not falsify is a rule nobody can tell is still wired.
+        NA-11 joined at v27 (Agent Bridge SoT suspend, 2026-09-09).
         """
         covered = set(
             case["na"] for case in CASES if case["expect"] == "DENY" and "na" in case
@@ -6010,6 +6077,11 @@ class MlvNeverAuthorizedHookTests(unittest.TestCase):
         self.assertEqual(counts.get("na3"), 5, "5 NA-3 claude-auth rows")
         self.assertEqual(counts.get("na3_persistent"), 6, "6 NA-3 O129 persistent-scope rows")
         self.assertEqual(counts.get("na10"), 7, "7 NA-10 self-edit rows")
+        # `na11` is NEW at register v27 via #107 (Agent Bridge SoT suspend, owner ruling
+        # 2026-09-09): three DENY writes at a lane venue (Write, nested Edit, shell
+        # Set-Content), one DENY at the BOARD venue (NA-11 has no venue unlock), and the
+        # agents/ SoT-doc ALLOW control that keeps the rule about the package path.
+        self.assertEqual(counts.get("na11"), 5, "5 NA-11 agent-bridge SoT rows")
         # PINNED, NEW at the thirteenth commit (S131): a NEW group, 3 rows -- the `setx.exe`
         # credential-prefix bypass, the `setx.exe` persistent-name bypass, and the fully
         # qualified `[System.Environment]::SetEnvironmentVariable` persistent-name bypass.
