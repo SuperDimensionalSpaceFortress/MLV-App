@@ -33,6 +33,7 @@
 #include "rt_math.h"
 #include "median.h"
 #include "StopWatch.h"
+#include <new>
 
 namespace {
 
