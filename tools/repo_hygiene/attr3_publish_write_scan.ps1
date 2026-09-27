@@ -81,7 +81,7 @@ $allowedStatic = @(
     'Globalization.CultureInfo::InvariantCulture', 'Globalization.NumberStyles::Float',
     'Guid::NewGuid',
     'IO.File::ReadAllText', 'IO.Path::GetFileNameWithoutExtension', 'IO.Path::GetFullPath',
-    'math::Ceiling', 'math::Floor', 'math::Pow', 'math::Sqrt', 'regex::Escape', 'regex::Matches',
+    'math::Ceiling', 'math::Floor', 'math::Pow', 'math::Round', 'math::Sqrt', 'regex::Escape', 'regex::Matches',
     'string::IsNullOrWhiteSpace', 'StringComparison::OrdinalIgnoreCase',
     'System.Collections.Generic.List[object]::new', 'System.Collections.Specialized.OrderedDictionary::new'
 )

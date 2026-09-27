@@ -25,6 +25,9 @@ Get-AttrCudaPresentMonDisplayReport against real csv fixtures.
 
 from __future__ import annotations
 
+import shutil
+import subprocess
+import tempfile
 import unittest
 from pathlib import Path
 
@@ -32,6 +35,19 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[2]
 MODULE = ROOT / "tools" / "profiling" / "bachelor" / "AttrCudaArtifacts.psm1"
 ATTRIBUTION_GENERATOR = ROOT / "tools" / "profiling" / "bachelor" / "playback-attr-3-cuda-job.ps1"
+BACHELOR_DIR = ATTRIBUTION_GENERATOR.parent
+
+PWSH = shutil.which("pwsh")
+requires_pwsh = unittest.skipIf(PWSH is None, "pwsh is not on PATH")
+
+
+def _run_pwsh_file(script: Path) -> subprocess.CompletedProcess:
+    return subprocess.run(
+        [PWSH, "-NoLogo", "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass",
+         "-File", str(script)],
+        capture_output=True,
+        text=True,
+    )
 
 
 class TemplateOrderingTests(unittest.TestCase):
@@ -241,6 +257,289 @@ class TemplateOrderingTests(unittest.TestCase):
             "'MsBetweenPresents', 'MsBetweenDisplayChange', 'MsUntilDisplayed', 'TimeInMs')",
             module_text,
         )
+
+    def test_start_presentmon_capture_is_wrapped_in_try_catch_not_left_uncaught(self) -> None:
+        # PRESENTMON-HARNESS-ROBUSTNESS-1: the call site used to sit bare inside the outer
+        # try/finally (which has no catch of its own) -- either of Start-PresentMonCapture's own
+        # throws would crash the whole job with a raw PowerShell error. Now caught, typed, and
+        # exits 23 like every other PresentMon failure.
+        spawn_call = self.template.index("$presentMonProc = Start-PresentMonCapture $presentMonPath")
+        try_start = self.template.rindex("try {", 0, spawn_call)
+        catch_start = self.template.index("} catch {", spawn_call)
+        error_capture = self.template.index("$presentMonSpawnError = $_.Exception.Message", catch_start)
+        typed_check = self.template.index("if ($null -ne $presentMonSpawnError) {", error_capture)
+        typed_result = self.template.index("result='PRESENTMON_UNAVAILABLE'", typed_check)
+        typed_exit = self.template.index("exit 23", typed_result)
+        self.assertLess(try_start, spawn_call)
+        self.assertLess(spawn_call, catch_start)
+        self.assertLess(catch_start, error_capture)
+        self.assertLess(error_capture, typed_check)
+        self.assertLess(typed_check, typed_result)
+        self.assertLess(typed_result, typed_exit)
+        # This typed check must run strictly before the smoke run is ever launched -- a spawn
+        # failure means no app-side measurement exists yet to preserve.
+        smoke_launch = self.template.index("$smokeLaunchException = $null")
+        self.assertLess(typed_exit, smoke_launch)
+
+    def test_the_display_and_wait_failure_branches_carry_a_present_mon_status_field(self) -> None:
+        # PRESENTMON-HARNESS-ROBUSTNESS-1: every typed PresentMon refusal (spawn, wait) tags
+        # presentMonStatus='unavailable' literally -- a coarse field simple downstream consumers
+        # can key on without re-deriving it from .status/exit code.
+        self.assertEqual(self.template.count("presentMonStatus='unavailable'"), 2)
+
+    def test_every_result_line_reason_is_sanitized_before_embedding(self) -> None:
+        # PRESENTMON-HARNESS-ROBUSTNESS-2 (fable note, applied to all three REASON= sites: spawn,
+        # wait, and display-failure): free-form text (an exception message, a typed reason) must
+        # pass through ConvertTo-AttrCudaResultLineSafeText before it is embedded in a RESULT=
+        # stdout line's quoted REASON="..." field, so a literal '"' inside it cannot garble a
+        # naive downstream parser. Executed end to end (for the spawn branch) in
+        # tools/repo_hygiene/test_playback_attr_3_cuda_behaviour.py::PresentMonSpawnFailureTests;
+        # this is the static tripwire pinning all three call sites, including the ones not
+        # separately executed.
+        self.assertIn(
+            'REASON=`"PresentMon failed to start: $(ConvertTo-AttrCudaResultLineSafeText $presentMonSpawnError)`"',
+            self.template,
+        )
+        self.assertIn(
+            'REASON=`"$(ConvertTo-AttrCudaResultLineSafeText $presentMonWaitError)`"',
+            self.template,
+        )
+        self.assertIn(
+            'REASON=`"$(ConvertTo-AttrCudaResultLineSafeText $displayReport.reason)`"',
+            self.template,
+        )
+        self.assertIn("'ConvertTo-AttrCudaResultLineSafeText'", ATTRIBUTION_GENERATOR.read_text(encoding="utf-8"))
+
+    def test_the_display_failure_branch_distinguishes_verified_zero_displayed(self) -> None:
+        # PRESENTMON-HARNESS-ROBUSTNESS-2 (fable note): DISPLAY_ASLEEP is PresentMon
+        # AFFIRMATIVELY measuring zero displayed frames, not PresentMon being unable to measure
+        # at all -- the display-failure branch's presentMonStatus is now derived dynamically from
+        # $displayReport.status rather than the blanket literal 'unavailable' the other two
+        # refusal branches still use.
+        self.assertIn(
+            "$displayFailurePresentMonStatus = if ($displayReport.status -eq 'DISPLAY_ASLEEP') "
+            "{ 'verified_zero_displayed' } else { 'unavailable' }",
+            self.template,
+        )
+        self.assertIn("presentMonStatus=$displayFailurePresentMonStatus", self.template)
+
+    def test_the_display_failure_branch_carries_the_already_computed_app_side_measurement(self) -> None:
+        # PRESENTMON-HARNESS-ROBUSTNESS-1: the backend-eligibility/GPU-frames gates and the
+        # region timing stats have ALL already run and succeeded by the time displayReport.status
+        # is checked -- discarding them here (the pre-fix behaviour) threw away a leg whose own
+        # app-side measurement was fine, just because PresentMon itself could not verify display.
+        report_check = self.template.index("if ($displayReport.status -ne 'OK') {")
+        typed_exit = self.template.index("exit $displayExitCode", report_check)
+        for field in ("diagnostics=$diagnostics", "gpuSummary=$gpuSummary", "gpuFramesTotal=$gpuFramesTotal",
+                      "frameRows=$rows.Count", "regions=$stats"):
+            with self.subTest(field=field):
+                pos = self.template.index(field, report_check)
+                self.assertLess(pos, typed_exit)
+
+    def test_the_wait_failure_branch_carries_the_frame_row_count(self) -> None:
+        # PRESENTMON-HARNESS-ROBUSTNESS-1: $rows is already parsed and published by the time a
+        # PresentMon WAIT failure can happen -- carried into that typed refusal too.
+        typed_check = self.template.index("if ($null -ne $presentMonWaitError) {")
+        typed_exit = self.template.index("exit 23", typed_check)
+        frame_rows = self.template.index("frameRows=$rows.Count", typed_check)
+        self.assertLess(typed_check, frame_rows)
+        self.assertLess(frame_rows, typed_exit)
+
+    def test_the_success_path_derives_ok_or_degraded_from_a_sufficiency_gate(self) -> None:
+        # PRESENTMON-HARNESS-ROBUSTNESS-2 (sol BLOCKER, PR #174 r1): the round-1 rule
+        # ($pmIntervalRows.Count -gt 0) was itself too weak -- a single positive interval still
+        # read fully 'ok'.
+        #
+        # PRESENTMON-HARNESS-ROBUSTNESS-2 r1b (sol BLOCKER, pre-review): r1's own coverage arm
+        # divided by $displayReport.selectedChain.presentedCount -- PresentMon's own count, from
+        # the same csv as the numerator, so a truncated capture could read 100% coverage of its own
+        # truncated rows. 'ok' now requires THREE independent arms together: count, app-swap
+        # coverage (against Get-AttrCudaAppSwapTelemetry's independent app-side count, never
+        # presentedCount), and temporal (no gap between positive-interval rows, including the
+        # window's own head/tail bounds, exceeds a stated ceiling) -- never a bare count-only or
+        # coverage-only check, and never re-spelled as $pmRows.Count (which over-counts by
+        # including the interval-less NA-first-present row).
+        self.assertIn("$presentMonSufficiencyMinIntervalCount = 30", self.template)
+        self.assertIn("$presentMonSufficiencyMinCoverageFraction = 0.5", self.template)
+        self.assertIn("$presentMonSufficiencyMaxGapMs = 5000.0", self.template)
+        self.assertIn(
+            "$presentMonPresentedCount = [int]$displayReport.selectedChain.presentedCount",
+            self.template,
+        )
+        self.assertIn("$appSwapTelemetry = Get-AttrCudaAppSwapTelemetry -LogText $rawLog", self.template)
+        self.assertIn(
+            "$presentMonTemporal = Get-AttrCudaTemporalCoverage -TimeInMsValues "
+            "@($pmIntervalRows | ForEach-Object { [double]$_.timeInMs }) -WindowStartMs "
+            "$displayReport.windowStartMs -WindowEndMs $displayReport.windowEndMs -MaxGapMs "
+            "$presentMonSufficiencyMaxGapMs",
+            self.template,
+        )
+        self.assertIn(
+            "$presentMonCountSufficient = ($pmIntervalRows.Count -ge $presentMonSufficiencyMinIntervalCount)",
+            self.template,
+        )
+        self.assertIn(
+            "$presentMonCoverageSufficient = ($presentMonCoverageAvailable -and "
+            "($presentMonCoverageFraction -ge $presentMonSufficiencyMinCoverageFraction))",
+            self.template,
+        )
+        self.assertIn("$presentMonTemporalSufficient = [bool]$presentMonTemporal.sufficient", self.template)
+        self.assertIn(
+            "$presentMonSufficient = $presentMonCountSufficient -and $presentMonCoverageSufficient "
+            "-and $presentMonTemporalSufficient",
+            self.template,
+        )
+        self.assertIn(
+            "$presentMonStatus = if ($presentMonSufficient) { 'ok' } else { 'degraded' }",
+            self.template,
+        )
+        # The old blocker rules (bare "any positive sample" gate, and r1's circular
+        # presentedCount-based coverage-only gate) must be gone, not merely superseded elsewhere.
+        self.assertNotIn(
+            "$presentMonStatus = if ($pmIntervalRows.Count -gt 0) { 'ok' } else { 'degraded' }",
+            self.template,
+        )
+        self.assertNotIn(
+            "$presentMonStatus = if ($pmRows.Count -gt 0) { 'ok' } else { 'degraded' }",
+            self.template,
+        )
+        self.assertNotIn(
+            "$presentMonCoverageFraction = if ($presentMonPresentedCount -gt 0) "
+            "{ $pmIntervalRows.Count / [double]$presentMonPresentedCount } else { 0.0 }",
+            self.template,
+        )
+        pm_rows_built = self.template.index("$pmRows = @($displayReport.selectedChainRows)")
+        coverage_computed = self.template.index("$presentMonCoverageFraction = if (")
+        temporal_computed = self.template.index("$presentMonTemporal = Get-AttrCudaTemporalCoverage")
+        status_assigned = self.template.index("$presentMonStatus = if ($presentMonSufficient)")
+        self.assertLess(pm_rows_built, coverage_computed)
+        self.assertLess(coverage_computed, temporal_computed)
+        self.assertLess(temporal_computed, status_assigned)
+
+    def test_the_sufficiency_rule_and_computed_coverage_are_published(self) -> None:
+        # PRESENTMON-HARNESS-ROBUSTNESS-2 (round 1 requirement, extended r1b): the rule, its
+        # thresholds, and the computed coverage/temporal figures are all persisted -- in
+        # evidence-manifest.json's presentMon block, at summary.json's top level, and in the
+        # RESULT= stdout line -- so a reader never has to reverse-engineer the threshold from
+        # positiveSamples alone.
+        self.assertIn("presentedCount=$presentMonPresentedCount", self.template)
+        self.assertIn("appSwapCount=$presentMonAppSwapCount", self.template)
+        self.assertIn("appSwapSource=$presentMonAppSwapSource", self.template)
+        self.assertIn("coverageFraction=$presentMonCoverageFraction", self.template)
+        self.assertIn("temporalMaxGapMs=$presentMonTemporal.maxGapMs", self.template)
+        self.assertIn(
+            "sufficiency=[ordered]@{ minIntervalCount=$presentMonSufficiencyMinIntervalCount; "
+            "minCoverageFraction=$presentMonSufficiencyMinCoverageFraction; "
+            "maxGapMs=$presentMonSufficiencyMaxGapMs; countSufficient=$presentMonCountSufficient; "
+            "coverageSufficient=$presentMonCoverageSufficient; "
+            "temporalSufficient=$presentMonTemporalSufficient; sufficient=$presentMonSufficient }",
+            self.template,
+        )
+        self.assertIn("presentMonPositiveSamples = $pmIntervalRows.Count", self.template)
+        self.assertIn("presentMonPresentedCount = $presentMonPresentedCount", self.template)
+        self.assertIn("presentMonAppSwapCount = $presentMonAppSwapCount", self.template)
+        self.assertIn("presentMonCoverageFraction = $presentMonCoverageFraction", self.template)
+        self.assertIn(
+            "PRESENTMON_COVERAGE=$([math]::Round($presentMonCoverageFraction, 3))",
+            self.template,
+        )
+
+    def test_present_modes_are_a_field_of_get_attr_cuda_present_mon_display_report(self) -> None:
+        # PRESENTMON-HARNESS-ROBUSTNESS-1: the module's own chain/selectedChain objects, not a
+        # job-level re-derivation -- a full-screen leg's missing-samples diagnosis needs this on
+        # every chain the function already builds, never a second copy that could drift from it.
+        module_text = MODULE.read_text(encoding="utf-8")
+        start = module_text.index("function Get-AttrCudaPresentMonDisplayReport {")
+        end = module_text.index("\n}\n\nExport-ModuleMember", start)
+        function_text = module_text[start:end]
+        self.assertEqual(function_text.count("presentModes = @("), 2)
+
+
+@requires_pwsh
+class EmbeddedFunctionCoverageTests(unittest.TestCase):
+    """PRESENTMON-HARNESS-ROBUSTNESS-2 r1c (sol PRE-REVIEW #2 BLOCKER): the emitted job has no
+    checkout and cannot Import-Module on its host -- every function the template CALLS must be
+    present in the REAL text Get-AttrCudaEmbeddedFunctionSource splices in, not merely listed in
+    one of the generator's own -Name arrays (a name could be typo'd, or a new call added without
+    ever touching either -Name list, and a check against the quoted list alone would still pass).
+    This runs the generator's own embedding statements verbatim -- the exact source text between
+    Import-Module and the second Get-AttrCudaEmbeddedFunctionSource call's closing parens -- against
+    the real modules, so the assembled text checked here is byte-for-byte what Bachelor receives.
+    A missing embed (this round's blocker: Get-AttrCudaAppSwapTelemetry / Get-AttrCudaTemporalCoverage
+    called at template:1540/1545 but absent from the -Name list at generator:436-464) reds this
+    test instead of surfacing only as a CommandNotFoundException after PresentMon has already run."""
+
+    @classmethod
+    def setUpClass(cls) -> None:
+        text = ATTRIBUTION_GENERATOR.read_text(encoding="utf-8").replace("\r\n", "\n")
+        start = text.index("Import-Module (Join-Path $PSScriptRoot 'AttrCudaArtifacts.psm1') -Force")
+        second_call = text.index("$embeddedFunctions = $embeddedFunctions + ", start)
+        end = text.index("\n))\n", second_call) + len("\n))")
+        cls.embedding_snippet = text[start:end].replace("$PSScriptRoot", "$bachelorRoot")
+
+        # The body ONLY -- unlike this file's other classes, which keep the "$template = @'"
+        # prefix (harmless there, since they only ever substring-search it) -- because this class
+        # feeds the text to PowerShell's own parser, and a bare unterminated "@'" opener with no
+        # matching "'@" is a real parse error ("missing the terminator: '@"), not junk to ignore.
+        template_marker = "$template = @'"
+        template_start = text.index(template_marker) + len(template_marker)
+        template_end = text.index("\n'@", template_start)
+        cls.template = text[template_start:template_end]
+
+    def test_every_called_attrcuda_command_is_defined_in_the_real_embedded_text(self) -> None:
+        # Both halves use PowerShell's own AST parser, exactly like
+        # test_every_module_helper_call_names_all_mandatory_parameters in
+        # test_playback_attr_3_cuda_behaviour.py: CommandAst.GetCommandName() for call sites (so a
+        # comment mentioning a function's name, e.g. line ~853's "(Get-AttrCudaEmbeddedFunctionSource),
+        # so there is only ever one definition ...", can never be mistaken for a call), and
+        # FunctionDefinitionAst.Name for what the real embedding actually defines. __TOKEN__
+        # placeholders are substituted with a dummy variable reference first, the same way that
+        # sibling test parses the generator's own placeholder-bearing source.
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            template_path = tmp_path / "template.txt"
+            template_path.write_text(self.template, encoding="utf-8")
+            out_path = tmp_path / "missing.txt"
+            script = tmp_path / "probe.ps1"
+            script.write_text(
+                "$ErrorActionPreference = 'Stop'\n"
+                f"$bachelorRoot = '{BACHELOR_DIR}'\n"
+                f"{self.embedding_snippet}\n"
+                "$definedNames = [System.Collections.Generic.HashSet[string]]::new()\n"
+                "$tokens = $null; $errors = $null\n"
+                "$embeddedAst = [System.Management.Automation.Language.Parser]::ParseInput("
+                "$embeddedFunctions, [ref]$tokens, [ref]$errors)\n"
+                "foreach ($fn in $embeddedAst.FindAll("
+                "{ param($n) $n -is [System.Management.Automation.Language.FunctionDefinitionAst] }, $true)) {\n"
+                "    [void]$definedNames.Add($fn.Name)\n"
+                "}\n"
+                f"$templateText = Get-Content -LiteralPath '{template_path}' -Raw\n"
+                "$templateText = [regex]::Replace($templateText, '__[A-Z0-9_]+__', '$attrCudaPlaceholder')\n"
+                "$tokens = $null; $errors = $null\n"
+                "$templateAst = [System.Management.Automation.Language.Parser]::ParseInput("
+                "$templateText, [ref]$tokens, [ref]$errors)\n"
+                "$called = [System.Collections.Generic.HashSet[string]]::new()\n"
+                "foreach ($call in $templateAst.FindAll("
+                "{ param($n) $n -is [System.Management.Automation.Language.CommandAst] }, $true)) {\n"
+                "    $name = $call.GetCommandName()\n"
+                "    if ($name -and $name -match '-AttrCuda') { [void]$called.Add($name) }\n"
+                "}\n"
+                "$missing = @($called | Where-Object { -not $definedNames.Contains($_) } | Sort-Object)\n"
+                f"Set-Content -LiteralPath '{out_path}' -Value $missing -Encoding UTF8\n"
+                "Write-Output ('CALLED_COUNT=' + $called.Count)\n"
+                "Write-Output 'PROBE_DONE'\n",
+                encoding="utf-8",
+            )
+            proc = _run_pwsh_file(script)
+            self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+            self.assertIn("PROBE_DONE", proc.stdout, proc.stdout + proc.stderr)
+            self.assertNotIn("CALLED_COUNT=0", proc.stdout, "no *-AttrCuda* calls found in the template at all")
+            missing = [line for line in out_path.read_text(encoding="utf-8").splitlines() if line.strip()]
+            self.assertEqual(
+                missing, [],
+                f"called in the template but not defined in the real embedded text: {missing} "
+                f"-- add each to the -Name list(s) in {ATTRIBUTION_GENERATOR.name}",
+            )
 
 
 if __name__ == "__main__":

@@ -215,6 +215,13 @@ def _make_fixture_repo(path: Path) -> list[str]:
     (path / "tools" / "profiling" / "gui-smoke-gpu-texture-route-validation.ps1").write_text(
         "# fixture stand-in sibling (dot-sourced directly by the runner)\n", encoding="utf-8"
     )
+    # CUDA-PLAYBACK-CONTACT-SHEET-1 r1b: the attribution generator also resolves this path's
+    # committed blob unconditionally (to embed it in the emitted job for the contact-sheet
+    # compose step), same reason as the smoke-runner closure comment above -- every test that
+    # generates a job through it needs the path to exist in the throwaway repo too.
+    (path / "tools" / "profiling" / "make-contact-sheet.py").write_text(
+        "# fixture stand-in for make-contact-sheet.py\n", encoding="utf-8"
+    )
     shas = []
     for index, text in enumerate(("first", "second")):
         (path / "src" / "mlv" / "llrawproc" / "llrawproc.c").write_text(
@@ -3493,7 +3500,14 @@ class SmokeRunFailedPresentMonCleanupTests(_PwshCase):
 
     def _failure_block(self) -> str:
         text = ATTRIBUTION_GENERATOR.read_text(encoding="utf-8")
-        start_marker = "$presentMonProc = Start-PresentMonCapture $presentMonPath"
+        # PRESENTMON-HARNESS-ROBUSTNESS-1: starts at the spawn-guard's own flush-left assignment,
+        # not at the (now indented, inside its own try) Start-PresentMonCapture call itself --
+        # extracting from mid-try would leave this span's leading "} catch {" with no opening
+        # "try {" of its own, an unbalanced-brace syntax error in the synthetic script below.
+        # This boundary is a self-contained superset instead: the whole spawn-guard try/catch/if
+        # is included (a no-op here, since the stub below always succeeds), then everything the
+        # predecessor boundary already covered.
+        start_marker = "$presentMonSpawnError = $null"
         # CUDA-PERF-DISPLAY-IDENTITY-HARNESS-2 (sol BLOCKER 1): the span now ends right after the
         # SMOKE_RUN_FAILED if-block's own closing brace -- everything hoisted above the
         # PresentMon wait (reading result.json, resolving the run log, publishing smoke evidence,
@@ -3588,6 +3602,122 @@ class SmokeRunFailedPresentMonCleanupTests(_PwshCase):
         self.assertIsNotNone(summary.get("smokeLaunchExceptionType"))
         self.assertIn("CommandNotFoundException", summary["smokeLaunchExceptionType"])
         self.assertIs(summary.get("presentMonConfirmedExited"), True, summary)
+
+
+@requires_pwsh
+class PresentMonSpawnFailureTests(_PwshCase):
+    """PRESENTMON-HARNESS-ROBUSTNESS-1: Start-PresentMonCapture's own throws (a pre-existing
+    output file, or PresentMon exiting nonzero within its 3s startup check) sat inside the outer
+    try/finally with NO catch of its own -- so either would crash the whole job with a raw
+    PowerShell error and publish nothing, one step before the smoke run (and any app-side
+    measurement) had even started. This EXECUTES the real spawn-guard span extracted verbatim
+    from the generator, with only Start-PresentMonCapture itself swapped for a stub that throws
+    exactly as the real function does -- never a hand-reimplemented guard."""
+
+    def _spawn_guard(self) -> str:
+        text = ATTRIBUTION_GENERATOR.read_text(encoding="utf-8")
+        # Ends right before $presentMonPostSpawnUtc is (re)assigned on the success path -- the
+        # guard's own try/catch/if is fully closed within this span, so it stays balanced whether
+        # or not the stubbed Start-PresentMonCapture throws.
+        start_marker = "$presentMonPreSpawnUtc = (Get-Date).ToUniversalTime()"
+        end_marker = "$presentMonPostSpawnUtc = (Get-Date).ToUniversalTime()"
+        start = text.index(start_marker)
+        end = text.index(end_marker, start)
+        return text[start:end]
+
+    def _run(self, *, stub: str, present_mon_path: Path) -> tuple[subprocess.CompletedProcess, dict]:
+        pub = self.tmp / "pub"
+        pub.mkdir()
+        script = self.tmp / "probe.ps1"
+        script.write_text(
+            "$ErrorActionPreference = 'Stop'\n"
+            # PRESENTMON-HARNESS-ROBUSTNESS-2: the spawn guard's RESULT= line now calls the
+            # module's own ConvertTo-AttrCudaResultLineSafeText -- imported here (never
+            # hand-reimplemented) so this probe exercises the real sanitizer, not a stand-in.
+            f"Import-Module '{MODULE}' -Force\n"
+            + stub + "\n"
+            f"$presentMonPath = '{present_mon_path}'\n"
+            "$FixtureRehearsal = $true\n"
+            "$SourceCommit = ('1' * 40)\n"
+            "$ClipId = 'tiny_dual_iso'\n"
+            f"$Pub = '{pub}'\n"
+            "function Save-Json($Object, [string]$Path) {\n"
+            "    $Object | ConvertTo-Json -Depth 30 | Set-Content -LiteralPath $Path -Encoding UTF8\n"
+            "}\n"
+            + self._spawn_guard() + "\n"
+            "Write-Output 'RESULT=NO_FAILURE_BRANCH_TAKEN'\n",
+            encoding="utf-8",
+        )
+        proc = _run_pwsh_file(script)
+        summary_path = pub / "summary.json"
+        summary = json.loads(summary_path.read_text(encoding="utf-8")) if summary_path.exists() else {}
+        return proc, summary
+
+    def test_a_startup_check_throw_is_a_typed_terminal_not_an_uncaught_exception(self) -> None:
+        stub = (
+            "function Start-PresentMonCapture([string]$CsvPath) {\n"
+            "    throw \"PRESENTMON_FAILED rc=6 (6 = ETW access denied: the agent account needs "
+            "'Performance Log Users')\"\n"
+            "}\n"
+        )
+        proc, summary = self._run(stub=stub, present_mon_path=self.tmp / "presentmon.csv")
+
+        self.assertEqual(proc.returncode, 23, proc.stdout + proc.stderr)
+        self.assertIn("RESULT=PRESENTMON_UNAVAILABLE", proc.stdout)
+        self.assertNotIn("RESULT=NO_FAILURE_BRANCH_TAKEN", proc.stdout)
+        self.assertEqual(summary.get("result"), "PRESENTMON_UNAVAILABLE")
+        self.assertEqual(summary.get("presentMonStatus"), "unavailable")
+        self.assertIn("PresentMon failed to start", summary.get("reason", ""))
+        self.assertIn("ETW access denied", summary.get("reason", ""))
+
+    def test_a_pre_existing_output_file_is_also_a_typed_terminal(self) -> None:
+        existing_csv = self.tmp / "presentmon.csv"
+        existing_csv.write_text("stale", encoding="utf-8")
+        # The real function's own guard, not a hand-picked message -- proves this call site's
+        # try/catch actually catches THIS throw, not just a stub written to match the assertion.
+        stub = (
+            "function Start-PresentMonCapture([string]$CsvPath) {\n"
+            "    if (Test-Path -LiteralPath $CsvPath) { throw \"PresentMon output already exists: $CsvPath\" }\n"
+            "}\n"
+        )
+        proc, summary = self._run(stub=stub, present_mon_path=existing_csv)
+
+        self.assertEqual(proc.returncode, 23, proc.stdout + proc.stderr)
+        self.assertEqual(summary.get("presentMonStatus"), "unavailable")
+        self.assertIn("already exists", summary.get("reason", ""))
+
+    def test_a_clean_spawn_falls_through_to_the_rest_of_the_job(self) -> None:
+        # Regression guard for the guard itself: a Start-PresentMonCapture that succeeds must
+        # never take the typed-refusal branch, so $presentMonPostSpawnUtc (excluded from the
+        # extracted span, deliberately -- see _spawn_guard) is reached and this probe's own
+        # trailing marker prints.
+        stub = (
+            "function Start-PresentMonCapture([string]$CsvPath) {\n"
+            "    [pscustomobject]@{ HasExited = $false; ExitCode = 0 }\n"
+            "}\n"
+        )
+        proc, summary = self._run(stub=stub, present_mon_path=self.tmp / "presentmon.csv")
+
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        self.assertIn("RESULT=NO_FAILURE_BRANCH_TAKEN", proc.stdout)
+        self.assertEqual(summary, {})
+
+    def test_a_quote_in_the_exception_message_does_not_garble_the_result_line(self) -> None:
+        # PRESENTMON-HARNESS-ROBUSTNESS-2 (fable note): a '"' inside the exception message used to
+        # land raw inside this stdout line's quoted REASON="..." field, garbling naive downstream
+        # parsing. summary.json's own `reason` (real JSON, already properly escaped) keeps the
+        # quote verbatim -- only the plain-text RESULT= line is sanitized.
+        stub = (
+            "function Start-PresentMonCapture([string]$CsvPath) {\n"
+            '    throw \'bad arg: "--foo" was rejected\'\n'
+            "}\n"
+        )
+        proc, summary = self._run(stub=stub, present_mon_path=self.tmp / "presentmon.csv")
+
+        self.assertEqual(proc.returncode, 23, proc.stdout + proc.stderr)
+        self.assertIn('bad arg: \'--foo\' was rejected', proc.stdout)
+        self.assertNotIn('bad arg: "--foo" was rejected', proc.stdout)
+        self.assertIn('bad arg: "--foo" was rejected', summary.get("reason", ""))
 
 
 @requires_pwsh
@@ -4959,10 +5089,13 @@ class DisplayWakeJobOrderingTests(unittest.TestCase):
         # adds two more: the two KEEPALIVE_FAILED checkpoints (before the smoke launch, and again
         # at the start of the measured interval) -- 15 grows to 17. Round 1b adds a third
         # KEEPALIVE_FAILED checkpoint (after the measured interval ends) -- 17 grows to 18. Round 2
-        # adds the DISPLAY_WAKE_DISMISS_FAILED gate -- 18 grows to 19.
+        # adds the DISPLAY_WAKE_DISMISS_FAILED gate -- 18 grows to 19. Round 4 (fork/master merge,
+        # PRESENTMON-HARNESS-ROBUSTNESS-1) adds a 20th: the PRESENTMON_UNAVAILABLE early exit when
+        # Start-PresentMonCapture itself throws on spawn, before this branch's own wake existed on
+        # master -- displayWake=$displayWake was added to that block to match every sibling site.
         summary_writes = body.count("(Join-Path $Pub 'summary.json')")
         display_wake_fields = body.count("displayWake=$displayWake") + body.count("displayWake = $displayWake")
-        self.assertEqual(19, summary_writes, "a summary.json write site was added/removed after the wake")
+        self.assertEqual(20, summary_writes, "a summary.json write site was added/removed after the wake")
         # +1: the success path also stamps displayWake into evidence-manifest.json, a second file.
         self.assertEqual(summary_writes + 1, display_wake_fields)
 

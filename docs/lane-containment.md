@@ -220,14 +220,21 @@ too, with `dirtyCheckReason` naming exactly which call failed and why,
 rather than collapsing into the misleading `'not-applicable'`/`'HEAD moved'`
 readings a falsy `$BaseSha` previously produced either way.
 
-`-ReasoningEffort low` explicitly requests low effort for one invocation. Codex
-receives its normal reasoning configuration argument. Claude receives
-`CLAUDE_CODE_EFFORT_LEVEL=low` in the child environment -- the same
+`-ReasoningEffort` explicitly overrides effort for one invocation. LANE-MODEL-CURRENCY-1
+round 2 (owner ruling 2026-09-26: every lane runs at high effort): a REAL launch --
+`$CLAUDE_EXE`/`$CODEX_EXE` unmodified from `Invoke-Lane.ps1`'s own definitions -- now
+refuses any value other than `high` with a typed `lane-effort-must-be-high` failure (a
+normal `failed` receipt, non-zero exit, before any provider process starts). The parameter
+still parses `low`/`medium` syntactically; the disposable fixture below is the one place
+that still passes them, because it replaces `$CLAUDE_EXE`/`$CODEX_EXE` with a fake shim and
+so can never reach a real CLI regardless of the value -- it exists to prove the override
+still reaches the child's effort configuration mechanically, not to license a real low-effort
+launch. When `high` is what runs, Codex receives its normal reasoning configuration argument
+and Claude receives `CLAUDE_CODE_EFFORT_LEVEL=high` in the child environment -- the same
 pre-existing, out-of-scope-for-this-PR assignment tracked under
-NA3-CHILD-ENV-SCOPE-1 above. The receipt records the override; user settings
-and the parent environment are unchanged. Omitting it preserves the existing
-lane defaults. Codex continues through its existing direct process path; the
-new Windows job containment applies to Claude.
+NA3-CHILD-ENV-SCOPE-1 above. The receipt records the effective effort; user settings
+and the parent environment are unchanged. Codex continues through its existing direct
+process path; the new Windows job containment applies to Claude.
 
 Run the real Windows fixture suite with:
 
