@@ -63,6 +63,60 @@ extern "C" int dngFormatDateTimeForFrameForTesting(mlvObject_t * mlv_data,
                                                      char * datetime,
                                                      size_t datetime_capacity);
 
+TEST(DualIsoPipeline, AsyncPreuploadFrameTokenIncludesFirstFrameWithoutOverflow)
+{
+    ASSERT_EQ(uint64_t(1), llrpGpuPlaybackReconFrameToken(0));
+    ASSERT_EQ(uint64_t(2), llrpGpuPlaybackReconFrameToken(1));
+    ASSERT_EQ(uint64_t(UINT32_MAX) + 1u, llrpGpuPlaybackReconFrameToken(UINT32_MAX));
+    ASSERT_EQ(UINT64_MAX, llrpGpuPlaybackReconFrameToken(UINT64_MAX - 1u));
+    ASSERT_EQ(uint64_t(0), llrpGpuPlaybackReconFrameToken(UINT64_MAX));
+}
+
+TEST(DualIsoPipeline, AsyncPreuploadStatusSurvivesBothDisplayTimingAdapters)
+{
+    llrpGpuPlaybackReconTiming_t recon = {};
+    recon.upload_ms = 1.0;
+    recon.kernel_ms = 2.0;
+    recon.interop_ms = 3.0;
+    recon.total_ms = 6.0;
+    recon.preupload = {1, 1, 1, 1, 1, 1, 1.25, 2.5, 3.75};
+    for (int reconAvailable : {0, 1})
+    {
+        recon.available = reconAvailable;
+        const auto timing = llrpGpuPlaybackReconCombineTiming(&recon, 1, 10, 20, 30, 60);
+        ASSERT_EQ(1, timing.available);
+        ASSERT_EQ(reconAvailable ? 11.0 : 10.0, timing.upload_ms);
+        ASSERT_EQ(reconAvailable ? 22.0 : 20.0, timing.kernel_ms);
+        ASSERT_EQ(reconAvailable ? 33.0 : 30.0, timing.interop_ms);
+        ASSERT_EQ(reconAvailable ? 66.0 : 60.0, timing.total_ms);
+        ASSERT_EQ(1, timing.preupload.available);
+        ASSERT_EQ(1, timing.preupload.accepted);
+        ASSERT_EQ(1, timing.preupload.used);
+        ASSERT_EQ(1, timing.preupload.exact_match);
+        ASSERT_EQ(1, timing.preupload.submitted_while_prior_run_active);
+        ASSERT_EQ(1, timing.preupload.ready_before_run);
+        ASSERT_EQ(1.25, timing.preupload.host_staging_ms);
+        ASSERT_EQ(2.5, timing.preupload.upload_ms);
+        ASSERT_EQ(3.75, timing.preupload.upload_wait_ms);
+        ASSERT_EQ(0.0, timing.wall_ms);
+    }
+    // A retained-device handoff does no reconstruction here. Neither unavailable
+    // timers nor the previous invocation's preupload status can leak into it.
+    recon = {};
+    auto empty = llrpGpuPlaybackReconCombineTiming(&recon, 0, 10, 20, 30, 60);
+    ASSERT_EQ(0, empty.available);
+    ASSERT_EQ(0.0, empty.total_ms);
+    ASSERT_EQ(0, empty.preupload.available);
+    ASSERT_EQ(0, empty.preupload.accepted);
+    ASSERT_EQ(0, empty.preupload.used);
+    ASSERT_EQ(0, empty.preupload.exact_match);
+    ASSERT_EQ(0, empty.preupload.submitted_while_prior_run_active);
+    ASSERT_EQ(0, empty.preupload.ready_before_run);
+    ASSERT_EQ(0.0, empty.preupload.host_staging_ms);
+    ASSERT_EQ(0.0, empty.preupload.upload_ms);
+    ASSERT_EQ(0.0, empty.preupload.upload_wait_ms);
+}
+
 TEST(DualIsoPipeline, FourteenBitFrameSizeUsesCheckedWideArithmetic)
 {
     uint32_t frame_size = 0;

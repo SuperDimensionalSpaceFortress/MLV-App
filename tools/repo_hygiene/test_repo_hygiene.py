@@ -2797,6 +2797,20 @@ class RepoHygieneTests(unittest.TestCase):
                 "unavailable preupload telemetry must be fully initialized before returning",
             )
 
+    def test_async_preupload_tokens_and_display_timing_use_shared_boundaries(self) -> None:
+        source = (ROOT / "src/mlv/llrawproc/llrawproc.c").read_text(encoding="utf-8")
+        for call in ("preupload_frame", "run_preuploaded"):
+            with self.subTest(call=call):
+                self.assertRegex(source, rf"g->{call}\(g->backend,\s*frame_token,")
+        self.assertEqual(2, source.count("llrpGpuPlaybackReconFrameToken(frame_id)"))
+        self.assertNotIn("&& frame_id != 0", source)
+        for filename in ("GpuDisplayViewport.cpp", "GpuDisplayWindow.cpp"):
+            with self.subTest(adapter=filename):
+                adapter = (ROOT / "platform/qt" / filename).read_text(encoding="utf-8")
+                self.assertEqual(1, adapter.count("*timing = llrpGpuPlaybackReconCombineTiming("))
+                self.assertIn("&reconTiming, amazeTiming.available, amazeTiming.uploadMs,", adapter)
+                self.assertIn("amazeTiming.kernelMs, amazeTiming.downloadMs, amazeTiming.totalMs);", adapter)
+
     def test_dependency_updates_and_private_security_reporting_are_bounded(self) -> None:
         dependabot = (ROOT / ".github" / "dependabot.yml").read_text(encoding="utf-8")
         update_blocks = re.split(r"(?m)^  - package-ecosystem:\s*", dependabot)[1:]

@@ -1016,10 +1016,12 @@ int llrpGpuPlaybackReconPreuploadFrame(uint64_t frame_id,
     int run_active = 0;
     int bypass_claimed = 0;
     int rc = 0;
+    const uint64_t frame_token = llrpGpuPlaybackReconFrameToken(frame_id);
     if(!llrawproc_env_truthy_value(
            getenv("MLVAPP_GPU_PLAYBACK_RECON_ASYNC_H2D"))
      || !raw_input_bayer14
-     || raw_image_size == 0)
+     || raw_image_size == 0
+     || frame_token == 0)
     {
         return 0;
     }
@@ -1051,7 +1053,7 @@ int llrpGpuPlaybackReconPreuploadFrame(uint64_t frame_id,
      && g->last_preupload_status)
     {
         rc = g->preupload_frame(g->backend,
-                                frame_id + 1u,
+                                frame_token,
                                 raw_input_bayer14,
                                 raw_image_size,
                                 run_active);
@@ -1204,16 +1206,17 @@ static int llrawproc_gpu_recon_run_backend(const dualiso_gpu_recon_state_t * sta
     }
     if(rc == 0)
     {
+        const uint64_t frame_token = llrpGpuPlaybackReconFrameToken(frame_id);
         InterlockedExchange(&g_llrawproc_gpu_recon_run_active, 1);
         if(prefer_playback_dll
          && llrawproc_env_truthy_value(
                 getenv("MLVAPP_GPU_PLAYBACK_RECON_ASYNC_H2D"))
-         && frame_id != 0
+         && frame_token != 0
          && g->run_preuploaded
          && g->last_preupload_status)
         {
             rc = g->run_preuploaded(g->backend,
-                                    frame_id,
+                                    frame_token,
                                     &frame,
                                     gpu_input,
                                     out_kind,

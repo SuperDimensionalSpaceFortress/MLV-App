@@ -92,7 +92,7 @@ typedef struct
     const double * fullres_curve;
     const float * randn05;
     int apply_dither;
-    /* Identity of the frame this state was prepared for. The async-H2D
+    /* Zero-based identity of the frame this state was prepared for. The async-H2D
      * preupload gate in llrawproc_gpu_recon_run_backend() keys on this value
      * to decide whether a previously host-staged upload matches the frame
      * about to be reconstructed. It MUST be supplied explicitly by whichever
@@ -137,6 +137,36 @@ typedef struct
      * timing_out pointer. */
     llrpGpuPlaybackReconPreuploadStatus_t preupload;
 } llrpGpuPlaybackReconTiming_t;
+
+/* The CUDA slot API reserves zero for an unavailable token. Both producer and
+ * consumer translate the public zero-based frame identity at this boundary.
+ * UINT64_MAX cannot be represented without aliasing zero: use synchronous work. */
+static inline uint64_t llrpGpuPlaybackReconFrameToken(uint64_t frame_id)
+{
+    return frame_id == UINT64_MAX ? 0 : frame_id + 1u;
+}
+
+/* Shared by both display adapters. Preupload status belongs to the recon run,
+ * including when its scalar timer is unavailable. A retained-device handoff
+ * without a recon call supplies a zero-initialized recon timing here. */
+static inline llrpGpuPlaybackReconTiming_t llrpGpuPlaybackReconCombineTiming(
+    const llrpGpuPlaybackReconTiming_t * recon,
+    int debayer_available, double upload_ms, double kernel_ms,
+    double interop_ms, double total_ms)
+{
+    llrpGpuPlaybackReconTiming_t combined = {0};
+    combined.preupload = recon->preupload;
+    combined.available = recon->available || debayer_available;
+    combined.upload_ms = (recon->available ? recon->upload_ms : 0.0)
+        + (debayer_available ? upload_ms : 0.0);
+    combined.kernel_ms = (recon->available ? recon->kernel_ms : 0.0)
+        + (debayer_available ? kernel_ms : 0.0);
+    combined.interop_ms = (recon->available ? recon->interop_ms : 0.0)
+        + (debayer_available ? interop_ms : 0.0);
+    combined.total_ms = (recon->available ? recon->total_ms : 0.0)
+        + (debayer_available ? total_ms : 0.0);
+    return combined;
+}
 
 typedef struct
 {

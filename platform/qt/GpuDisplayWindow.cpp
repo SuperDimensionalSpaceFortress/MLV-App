@@ -803,20 +803,9 @@ bool GpuDisplayWindow::setPresentedGpuPlaybackReconAmazePostWbTexture(
     const bool ok = reconOk && amazeOk;
     if ( timing )
     {
-        memset(timing, 0, sizeof(*timing));
-        timing->available = reconTiming.available || amazeTiming.available;
-        timing->upload_ms =
-            (reconTiming.available ? reconTiming.upload_ms : 0.0)
-            + (amazeTiming.available ? amazeTiming.uploadMs : 0.0);
-        timing->kernel_ms =
-            (reconTiming.available ? reconTiming.kernel_ms : 0.0)
-            + (amazeTiming.available ? amazeTiming.kernelMs : 0.0);
-        timing->interop_ms =
-            (reconTiming.available ? reconTiming.interop_ms : 0.0)
-            + (amazeTiming.available ? amazeTiming.downloadMs : 0.0);
-        timing->total_ms =
-            (reconTiming.available ? reconTiming.total_ms : 0.0)
-            + (amazeTiming.available ? amazeTiming.totalMs : 0.0);
+        *timing = llrpGpuPlaybackReconCombineTiming(
+            &reconTiming, amazeTiming.available, amazeTiming.uploadMs,
+            amazeTiming.kernelMs, amazeTiming.downloadMs, amazeTiming.totalMs);
     }
     if ( !ok )
     {
