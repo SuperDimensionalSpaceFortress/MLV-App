@@ -248,7 +248,13 @@ param(
     # longer a per-frame cost either way, since MainWindow.cpp now dedupes it against its last
     # emitted value and a stable CUDA session logs it once.
     [ValidateSet('HEAVY', 'LIGHT')]
-    [string]$TelemetryArm = 'HEAVY'
+    [string]$TelemetryArm = 'HEAVY',
+
+    # CUDA-PLAYBACK-PRESENT-CADENCE-2 same-build A/B: sets
+    # MLVAPP_GPU_WINDOW_PAINT_PER_SUBMIT=0 on the emitted leg, restoring the pre-fix
+    # update()-driven paint path so a "before" leg can be measured from the exact same
+    # package as the "after" leg -- never rebuilt, never a different -SourceCommit.
+    [switch]$DisablePaintPerSubmit
 )
 
 $ErrorActionPreference = 'Stop'
@@ -666,6 +672,7 @@ if ($ContactSheet) {
     $contactSheetComposerPyBase64 = ''
     $contactSheetComposerSha256ForTemplate = ''
 }
+$disablePaintPerSubmitLiteral = if ($DisablePaintPerSubmit) { '$true' } else { '$false' }
 
 # --- job body template (placeholders are substituted below; the body itself never
 #     touches this generator's variables directly, so there is no accidental capture
@@ -696,6 +703,7 @@ $ContactSheetFrameCount = __CONTACT_SHEET_FRAME_COUNT__
 $ContactSheetComposerPyBase64 = '__CONTACT_SHEET_COMPOSER_PY_BASE64__'
 $ContactSheetComposerSha256 = '__CONTACT_SHEET_COMPOSER_SHA256__'
 $TelemetryArm = '__TELEMETRY_ARM__'
+$DisablePaintPerSubmit = __DISABLE_PAINT_PER_SUBMIT__
 $Root = '__AGENT_ROOT__'
 $Cache = Join-Path $Root 'cache'
 $Stamp = Get-Date -Format 'yyyyMMdd-HHmmss'
@@ -1377,7 +1385,7 @@ $envs = @(
     ('QT_QPA_PLATFORM_PLUGIN_PATH=' + (Join-Path $pkgDir 'platforms')),
     'QT_OPENGL=desktop',
     'QT_FORCE_STDERR_LOGGING=1'
-)
+) + $(if ($DisablePaintPerSubmit) { @('MLVAPP_GPU_WINDOW_PAINT_PER_SUBMIT=0') } else { @() })
 # Shipping default: scale factor 4. Unlike PLAYBACK-ATTR-2, no
 # MLVAPP_PLAYBACK_SCALE_FACTOR override is emitted; -ScaleFactor 4 is explicit
 # below for self-documentation even though it is run-release-gui-smoke.ps1's own
@@ -2313,6 +2321,7 @@ $text = Expand-AttrCudaTemplate -Template $template -Tokens ([ordered]@{
     CONTACT_SHEET_COMPOSER_PY_BASE64 = $contactSheetComposerPyBase64
     CONTACT_SHEET_COMPOSER_SHA256 = $contactSheetComposerSha256ForTemplate
     TELEMETRY_ARM = $TelemetryArm
+    DISABLE_PAINT_PER_SUBMIT = $disablePaintPerSubmitLiteral
     EMBEDDED_FUNCTIONS = $embeddedFunctions
 })
 

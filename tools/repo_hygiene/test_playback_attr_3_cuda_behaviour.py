@@ -1057,6 +1057,54 @@ class AttributionJobTelemetryArmTests(_PwshCase):
         self.assertIn("MLVAPP_STAGE_TIMING=1", job_text)
         self.assertIn("MLVAPP_PERF_FIELD_LOG=1", job_text)
 
+
+@requires_pwsh
+@requires_git
+class AttributionJobDisablePaintPerSubmitTests(_PwshCase):
+    """CUDA-PLAYBACK-PRESENT-CADENCE-2: -DisablePaintPerSubmit must actually reach the emitted
+    job as a real boolean, not a leftover __DISABLE_PAINT_PER_SUBMIT__ token -- the same class of
+    wiring bug AttributionJobTelemetryArmTests exists to catch for -TelemetryArm."""
+
+    def setUp(self) -> None:
+        super().setUp()
+        self.repo = self.tmp / "repo"
+        self.shas = _make_fixture_repo(self.repo)
+        self.staging = self.tmp / "staging"
+        self.staging.mkdir()
+
+    def _generate(self, extra_args=()):
+        out_file = self.staging / "job.ps1"
+        parts = [
+            f"-SourceCommit '{self.shas[1]}'",
+            f"-BuildManifestSha256 '{'a' * 64}'",
+            "-ClipId 'tiny_dual_iso'",
+            f"-FixtureSha256 '{'b' * 64}'",
+            f"-OutFile '{out_file}'",
+            f"-RepoRoot '{self.repo}'",
+        ] + list(extra_args)
+        script = self.tmp / "generate.ps1"
+        script.write_text(
+            "$ErrorActionPreference = 'Stop'\n"
+            f"& '{ATTRIBUTION_GENERATOR}' " + " ".join(parts) + "\n",
+            encoding="utf-8",
+        )
+        proc = _run_pwsh_file(script)
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        return out_file.read_text(encoding="utf-8")
+
+    def test_default_is_false_and_substituted_not_left_undefined(self) -> None:
+        job_text = self._generate()
+        self.assertIn("$DisablePaintPerSubmit = $false", job_text)
+        self.assertNotIn("__DISABLE_PAINT_PER_SUBMIT__", job_text)
+
+    def test_switch_sets_true(self) -> None:
+        job_text = self._generate(extra_args=["-DisablePaintPerSubmit"])
+        self.assertIn("$DisablePaintPerSubmit = $true", job_text)
+
+    def test_opt_out_env_var_is_wired_into_the_envs_list(self) -> None:
+        job_text = self._generate()
+        self.assertIn("MLVAPP_GPU_WINDOW_PAINT_PER_SUBMIT=0", job_text)
+
     def test_an_invalid_arm_is_refused_at_parameter_binding(self) -> None:
         proc_script = self.tmp / "generate-invalid.ps1"
         proc_script.write_text(
