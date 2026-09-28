@@ -517,6 +517,10 @@ $embeddedFunctions = Get-AttrCudaEmbeddedFunctionSource -Name @(
     # contained (no calls to other AttrCuda functions), so no further names are needed.
     'Get-AttrCudaAppSwapTelemetry',
     'Get-AttrCudaTemporalCoverage',
+    # CUDA-PLAYBACK-PRESENT-CADENCE-2 round 1: the DISPLAY_ASLEEP override's app-side
+    # foreground/fullscreen confirmation -- self-contained (no calls to other AttrCuda
+    # functions), like the two above it.
+    'Get-AttrCudaForegroundVerification',
     # CUDA-PERF-DISPLAY-WAKE-1/2: wakes the display from the interactive session before this leg
     # launches MLVApp, holds it awake for the leg, and keeps nudging periodically for the whole
     # leg (SetThreadExecutionState alone does not stop the screen saver) -- see their own header in
@@ -1628,6 +1632,13 @@ $rawLog = [IO.File]::ReadAllText($logPath)
 $measuredSmokeSessionId = Get-MeasuredSmokeSessionId $rawLog
 $rows = Get-FrameRows $rawLog $measuredSmokeSessionId -AllowFewRows:($TelemetryArm -eq 'LIGHT')
 $rows | Export-Csv -LiteralPath (Join-Path $legOut 'probe-timeline.csv') -NoTypeInformation
+# CUDA-PLAYBACK-PRESENT-CADENCE-2 round 1: an EARLY, separately-named read (before the
+# PresentMon display-report gate below) purely for the DISPLAY_ASLEEP override -- the
+# sufficiency-arm status block further down (PRESENTMON-HARNESS-ROBUSTNESS-2's status_source,
+# an isolated, self-contained slice the test suite executes verbatim) still computes its own
+# $appSwapTelemetry at its original call site, unchanged, so that slice keeps working with no
+# variables assumed set before it.
+$earlyAppSwapTelemetry = Get-AttrCudaAppSwapTelemetry -LogText $rawLog
 
 # CUDA-PERF-DISPLAY-IDENTITY-HARNESS-1/2: publish the smoke artifacts BEFORE any PresentMon
 # parsing, AND before PresentMon is even waited on. They are already known-good the moment the
@@ -1832,7 +1843,36 @@ Save-Json ([ordered]@{
 # below, and why -- persisted verbatim into every outcome's summary.json so a reader never has to
 # take the headline number's clock origin on faith.
 $displayReport = Get-AttrCudaPresentMonDisplayReport -CsvPath $presentMonPath -ResultJson $resultJson -EarliestCaptureStartUtc $presentMonCaptureStartUtc -LatestCaptureStartUtc $presentMonPostSpawnUtc
-if ($displayReport.status -ne 'OK') {
+
+# CUDA-PLAYBACK-PRESENT-CADENCE-2 round 1: DISPLAY_ASLEEP override. PresentMon is not trusted
+# on Optimus fullscreen GL (docs/playback-attr-3-cuda.md venue notes) -- a real fullscreen CUDA-
+# playback leg can present zero PresentMon-visible frames while the app itself, verified
+# fullscreen and foregrounded throughout, genuinely displayed many. Rather than fail this leg
+# closed on PresentMon's own (unreliable, on this venue) verdict, fall through to the OK path
+# when the app's OWN evidence says otherwise: new_frame_swaps (a real swap displaying content
+# the owner has not already seen -- GpuWindowSwapTelemetryCounters::newFrameSwapCount) is
+# greater than zero, AND the app's foreground/fullscreen telemetry independently confirms the
+# leg never lost fullscreen or foreground. Both conditions together, not new_frame_swaps alone:
+# a leg that lost fullscreen mid-run could still swap frames without those swaps being what a
+# viewer would call "the display". Design review, item 4 ("VERDICT FIX"): never report
+# DISPLAY_ASLEEP when new_frame_swaps>0 and fullscreen/foreground are verified; record
+# PresentMon as unavailable (not a verified negative) on this venue instead -- see the
+# presentMonStatus override further down, where $displayAsleepOverride is consumed.
+$displayAsleepForegroundVerification = Get-AttrCudaForegroundVerification -LogText $rawLog
+$displayAsleepOverridden =
+    ($displayReport.status -eq 'DISPLAY_ASLEEP') -and
+    ($null -ne $earlyAppSwapTelemetry.newFrameSwapCount) -and
+    ($earlyAppSwapTelemetry.newFrameSwapCount -gt 0) -and
+    $displayAsleepForegroundVerification.verified
+$displayAsleepOverride = [ordered]@{
+    triggered = $displayAsleepOverridden
+    presentMonReportedStatus = $displayReport.status
+    presentMonReportedReason = $displayReport.reason
+    newFrameSwapCount = $earlyAppSwapTelemetry.newFrameSwapCount
+    foregroundVerified = $displayAsleepForegroundVerification.verified
+    foregroundVerificationReason = $displayAsleepForegroundVerification.reason
+}
+if ($displayReport.status -ne 'OK' -and -not $displayAsleepOverridden) {
     # PRESENTMON-HARNESS-ROBUSTNESS-1: the backend-eligibility gate, the GPU-frames gate and the
     # region timing stats above have ALL already run and already succeeded by this point in the
     # script -- $diagnostics/$gpuSummary/$gpuFramesTotal/$stats/$rows are real, computed evidence
@@ -1959,6 +1999,21 @@ $presentMonStatusReason = if ($presentMonSufficient) {
     }
     "PresentMon's display-cadence evidence is too thin to corroborate as measured -- $($presentMonFailedArms -join '; ') -- display itself is still confirmed, cadence is not"
 }
+# CUDA-PLAYBACK-PRESENT-CADENCE-2 round 1: the DISPLAY_ASLEEP override above (see
+# $displayAsleepOverride) means $pmRows/$pmIntervalRows are empty here -- PresentMon reported
+# zero displayed rows on this venue, not a genuine cadence gap -- so the sufficiency arithmetic
+# just computed would otherwise read 'degraded' with a misleading "too thin" reason. Overridden
+# to 'unavailable', distinct from both 'ok' and 'degraded': PresentMon had nothing usable to say
+# on this venue at all, never a verified negative and never a real-but-thin measurement.
+if ($displayAsleepOverridden) {
+    $presentMonStatus = 'unavailable'
+    $presentMonStatusReason =
+        "PresentMon reported DISPLAY_ASLEEP (reason: $($displayReport.reason)) -- not trusted " +
+        "on Optimus fullscreen GL (docs/playback-attr-3-cuda.md venue notes). Overridden: the " +
+        "app's own new_frame_swaps=$($appSwapTelemetry.newFrameSwapCount) and verified " +
+        "foreground/fullscreen telemetry (fullscreen_lost_count=0, foreground_lost_count=0 " +
+        "throughout) confirm real on-screen display that PresentMon could not observe on this venue."
+}
 
 $dllSha256Lower = (Get-Sha $reconDll).ToLowerInvariant()
 # $pendingSymbolPresence came from the build manifest above, whose dll.sha256 was verified
@@ -2018,6 +2073,8 @@ $manifest = [ordered]@{
         status=$presentMonStatus
         statusReason=$presentMonStatusReason
     }
+    appSwapTelemetry = $appSwapTelemetry
+    displayAsleepOverride = $displayAsleepOverride
     environmentBoundary = [ordered]@{ jobTempDir=$Scratch; allChildrenInheritJobTemp=$true }
     cpuQuiescence = [ordered]@{ samples=$loads; meanPercent=$avgLoad; thresholdPercent=20.0; pass=($avgLoad -le 20.0) }
     frameRows = $rows.Count
@@ -2055,6 +2112,8 @@ Save-Json ([ordered]@{
     presentMonPresentedCount = $presentMonPresentedCount
     presentMonAppSwapCount = $presentMonAppSwapCount
     presentMonAppSwapSource = $presentMonAppSwapSource
+    newFrameSwapCount = $appSwapTelemetry.newFrameSwapCount
+    displayAsleepOverride = $displayAsleepOverride
     presentMonCoverageFraction = $presentMonCoverageFraction
     presentMonTemporalMaxGapMs = $presentMonTemporal.maxGapMs
     presentMonTemporalGapKind = $presentMonTemporal.gapKind
@@ -2201,7 +2260,7 @@ Save-Json ([ordered]@{ schema='playback-attr-3-cuda-artifact-index.v1'; artifact
 # outbox result.json carries stdout and nothing else, so a reader who never opens an artifact
 # still cannot mistake a rehearsal for a measurement.
 $resultVerb = if ($FixtureRehearsal) { 'FIXTURE_REHEARSAL_CAPTURED' } else { 'MEASUREMENT_CAPTURED' }
-Write-Output "RESULT=$resultVerb FIXTURE_REHEARSAL=$FixtureRehearsal SOURCE=$SourceCommit CLIP=$ClipId ROWS=$($rows.Count) GPU_FRAMES=$gpuFramesTotal CPU_FRAMES=$($gpuSummary.cpuFrames) PRESENTMON_SAMPLES=$($pmRows.Count) PRESENTMON_STATUS=$presentMonStatus PRESENTMON_COVERAGE=$([math]::Round($presentMonCoverageFraction, 3)) ARTIFACTS=$Pub"
+Write-Output "RESULT=$resultVerb FIXTURE_REHEARSAL=$FixtureRehearsal SOURCE=$SourceCommit CLIP=$ClipId ROWS=$($rows.Count) GPU_FRAMES=$gpuFramesTotal CPU_FRAMES=$($gpuSummary.cpuFrames) PRESENTMON_SAMPLES=$($pmRows.Count) PRESENTMON_STATUS=$presentMonStatus PRESENTMON_COVERAGE=$([math]::Round($presentMonCoverageFraction, 3)) NEW_FRAME_SWAPS=$($appSwapTelemetry.newFrameSwapCount) DISPLAY_ASLEEP_OVERRIDDEN=$displayAsleepOverridden ARTIFACTS=$Pub"
 exit 0
 } finally {
     if ($OwnerClipDir) {

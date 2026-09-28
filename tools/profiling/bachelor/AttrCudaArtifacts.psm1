@@ -4038,7 +4038,20 @@ function Get-AttrCudaAppSwapTelemetry {
         $swapsValues.ContainsKey('window_active') -and $swapsValues['window_active'] -eq '1' -and
         $swapsValues.ContainsKey('swaps') -and [int]::TryParse([string]$swapsValues['swaps'], [ref]$swaps)
     if ($swapsUsable) {
-        return [pscustomobject]@{ source = 'gpu_window_swaps'; swapCount = $swaps }
+        # CUDA-PLAYBACK-PRESENT-CADENCE-2 round 1: new_frame_swaps (platform/qt/MainWindow.cpp's
+        # playback_smoke.gpu_window_swaps line, GpuWindowSwapTelemetryCounters::newFrameSwapCount)
+        # -- swaps that displayed genuinely new content, as opposed to swaps= above which counts
+        # every real swap including a repaint of already-shown content. $null (not 0) when the
+        # field is absent (an older build's log, predating this round), so a caller can tell
+        # "no new-frame field in this log" apart from "the field reported zero".
+        [int]$newFrameSwaps = 0
+        $newFrameSwapsPresent = $swapsValues.ContainsKey('new_frame_swaps') -and
+            [int]::TryParse([string]$swapsValues['new_frame_swaps'], [ref]$newFrameSwaps)
+        return [pscustomobject]@{
+            source = 'gpu_window_swaps'
+            swapCount = $swaps
+            newFrameSwapCount = $(if ($newFrameSwapsPresent) { $newFrameSwaps } else { $null })
+        }
     }
 
     $gateValues = Get-AttrCudaLastKeyValueLine $LogText 'playback_smoke\.gate '
@@ -4046,10 +4059,71 @@ function Get-AttrCudaAppSwapTelemetry {
     $gateUsable = ($null -ne $gateValues) -and $gateValues.ContainsKey('frames_presented') -and
         [int]::TryParse([string]$gateValues['frames_presented'], [ref]$framesPresented)
     if ($gateUsable) {
-        return [pscustomobject]@{ source = 'gate_frames_presented'; swapCount = $framesPresented }
+        # The gate fallback has no new-frame concept of its own (frames_presented counts
+        # SUBMISSIONS, before the window's one-pending-slot mailbox can even drop or repaint
+        # one) -- $null here, same as the "neither line present" case below, so a caller
+        # never mistakes a coarser fallback source for a measured zero.
+        return [pscustomobject]@{ source = 'gate_frames_presented'; swapCount = $framesPresented; newFrameSwapCount = $null }
     }
 
-    [pscustomobject]@{ source = $null; swapCount = $null }
+    [pscustomobject]@{ source = $null; swapCount = $null; newFrameSwapCount = $null }
+}
+
+function Get-AttrCudaForegroundVerification {
+    <#
+    .SYNOPSIS
+    App-side confirmation that the measured leg ran fullscreen and in the foreground
+    throughout, independent of PresentMon.
+    .DESCRIPTION
+    CUDA-PLAYBACK-PRESENT-CADENCE-2 round 1: the DISPLAY_ASLEEP override (see
+    playback-attr-3-cuda-job.ps1) must never trust the app's own new_frame_swaps count alone
+    -- a leg that lost fullscreen or foreground mid-run could still swap frames while genuinely
+    not being the on-screen content a viewer would see. Reads MainWindow.cpp's
+    playback_smoke.foreground line (finishPlaybackSmokeTelemetry): "verified" requires telemetry
+    to have been enabled AND fullscreen at BOTH begin and gate AND zero fullscreen losses AND zero
+    foreground losses in between -- the same event-driven counters #171/CUDA-PERF-PLAYBACK-
+    FOREGROUND-1 already accumulate, reused here rather than re-derived. Returns
+    verified=$false (never $true) when the line is absent/unusable -- absence is never treated
+    as passing evidence.
+    #>
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $true)]
+        [AllowEmptyString()]
+        [string]$LogText
+    )
+
+    $last = $null
+    foreach ($line in ($LogText -split "`r?`n")) {
+        if ($line -notmatch 'playback_smoke\.foreground ') { continue }
+        $values = @{}
+        foreach ($match in [regex]::Matches($line, '(?<key>[A-Za-z0-9_]+)=(?<value>[^\s]+)')) {
+            $values[$match.Groups['key'].Value] = $match.Groups['value'].Value
+        }
+        $last = $values
+    }
+    if ($null -eq $last) {
+        return [pscustomobject]@{ verified = $false; reason = 'no playback_smoke.foreground line found in the log' }
+    }
+
+    [int]$foregroundLostCount = -1
+    [int]$fullscreenLostCount = -1
+    $usable =
+        $last.ContainsKey('telemetry_enabled') -and $last['telemetry_enabled'] -eq '1' -and
+        $last.ContainsKey('fullscreen_at_begin') -and $last['fullscreen_at_begin'] -eq '1' -and
+        $last.ContainsKey('fullscreen_at_gate') -and $last['fullscreen_at_gate'] -eq '1' -and
+        $last.ContainsKey('foreground_lost_count') -and [int]::TryParse([string]$last['foreground_lost_count'], [ref]$foregroundLostCount) -and
+        $last.ContainsKey('fullscreen_lost_count') -and [int]::TryParse([string]$last['fullscreen_lost_count'], [ref]$fullscreenLostCount)
+    if (-not $usable) {
+        return [pscustomobject]@{ verified = $false; reason = 'playback_smoke.foreground line present but missing/unparseable required fields' }
+    }
+    if ($foregroundLostCount -ne 0 -or $fullscreenLostCount -ne 0) {
+        return [pscustomobject]@{
+            verified = $false
+            reason = "foreground_lost_count=$foregroundLostCount fullscreen_lost_count=$fullscreenLostCount (both must be 0)"
+        }
+    }
+    [pscustomobject]@{ verified = $true; reason = $null }
 }
 
 function Get-AttrCudaTemporalCoverage {
@@ -4178,6 +4252,7 @@ Export-ModuleMember -Function `
     Publish-AttrCudaContactSheetRawCaptures, `
     Get-AttrCudaPresentMonDisplayReport, `
     Get-AttrCudaAppSwapTelemetry, `
+    Get-AttrCudaForegroundVerification, `
     Get-AttrCudaTemporalCoverage, `
     ConvertTo-AttrCudaResultLineSafeText, `
     Register-AttrCudaDisplayWakeNativeMethods, `

@@ -377,3 +377,92 @@ TEST(GpuWindowSwapWiring, NoteSupersededBeforePaintCountsBeforeAndOutsideThePerE
     ASSERT_TRUE(logAt > gateAt);
 }
 
+// CUDA-PLAYBACK-PRESENT-CADENCE-2 round 1: paint-per-submit (real swap path 3) and the
+// new-frame counter it makes meaningful.
+
+TEST(GpuWindowSwapWiring, PaintPerSubmitOptOutHelperDefaultsEnabled)
+{
+    const QString source = readRepoFile(QStringLiteral("platform/qt/GpuDisplayWindow.cpp"));
+    const int functionAt = source.indexOf(QStringLiteral("bool paintPerSubmitEnabled()"));
+    ASSERT_TRUE(functionAt >= 0);
+    const QString body = source.mid(functionAt, 400);
+    // Opt-out shape (mirrors swapTelemetryEnabled()'s own "!= '0'" pattern): unset, or set
+    // to anything but a literal "0", leaves the new path active.
+    ASSERT_TRUE(body.contains(QStringLiteral(
+        "!qEnvironmentVariableIsSet( \"MLVAPP_GPU_WINDOW_PAINT_PER_SUBMIT\" )")));
+    ASSERT_TRUE(body.contains(QStringLiteral(
+        "qEnvironmentVariable( \"MLVAPP_GPU_WINDOW_PAINT_PER_SUBMIT\" ) != QStringLiteral(\"0\")")));
+}
+
+TEST(GpuWindowSwapWiring, ReconAmazeSubmitPaintsSynchronouslyBehindTheExposedValidGuard)
+{
+    const QString source = readRepoFile(QStringLiteral("platform/qt/GpuDisplayWindow.cpp"));
+    const int functionAt = source.indexOf(
+        QStringLiteral("bool GpuDisplayWindow::setPresentedGpuPlaybackReconAmazePostWbTexture("));
+    ASSERT_TRUE(functionAt >= 0);
+    const int nextFunctionAt = source.indexOf(
+        QStringLiteral("bool GpuDisplayWindow::readGpuReconSourceBayer16Texture("), functionAt);
+    ASSERT_TRUE(nextFunctionAt > functionAt);
+    const QString body = source.mid(functionAt, nextFunctionAt - functionAt);
+
+    // Same guard as the grab idiom (isExposed()/isValid()), gated additionally on the
+    // opt-out, and never during a non-exposed/mid-transition window (#171's own invariant --
+    // Qt reports a window as not exposed during a fullscreen enter/exit).
+    const int guardAt = body.indexOf(
+        QStringLiteral("if ( paintPerSubmitEnabled() && isExposed() && isValid() )"));
+    ASSERT_TRUE(guardAt >= 0);
+    const int paintAt = body.indexOf(QStringLiteral("paintGL();"), guardAt);
+    const int swapAt = body.indexOf(QStringLiteral("glContext->swapBuffers(this);"), guardAt);
+    const int noteAt = body.indexOf(QStringLiteral("noteRealSwap();"), guardAt);
+    ASSERT_TRUE(paintAt > guardAt);
+    ASSERT_TRUE(swapAt > paintAt);
+    ASSERT_TRUE(noteAt > swapAt);
+
+    // The trailing update() must be conditional on NOT having already painted -- otherwise
+    // Qt would paint (and vsync-block-swap) the same already-shown serial a second time.
+    const int flagSetAt = body.indexOf(QStringLiteral("paintedSynchronously = true;"), guardAt);
+    const int conditionalUpdateAt = body.indexOf(
+        QStringLiteral("if ( !paintedSynchronously ) update();"), flagSetAt);
+    ASSERT_TRUE(flagSetAt > guardAt);
+    ASSERT_TRUE(conditionalUpdateAt > flagSetAt);
+    // An unconditional update() call must not remain in this function alongside the
+    // conditional one (a leftover would repaint every submit regardless of paintedSynchronously).
+    ASSERT_EQ(0, countOccurrences(body.left(conditionalUpdateAt), QStringLiteral("\n    update();\n")));
+}
+
+TEST(GpuWindowSwapWiring, NewFrameSwapCountingUsesThisSwapsOwnRecordNotWindowState)
+{
+    const QString source = readRepoFile(QStringLiteral("platform/qt/GpuDisplayWindow.cpp"));
+    const int functionAt = source.indexOf(QStringLiteral("void GpuDisplayWindow::noteRealSwap()"));
+    ASSERT_TRUE(functionAt >= 0);
+    const int nextFunctionAt = source.indexOf(
+        QStringLiteral("void GpuDisplayWindow::noteSupersededBeforePaint("), functionAt);
+    ASSERT_TRUE(nextFunctionAt > functionAt);
+    const QString body = source.mid(functionAt, nextFunctionAt - functionAt);
+
+    // Reads record.presentedSerialValid/record.presentedSerial (this exact swap's own
+    // just-written ring entry), never m_presentedSerial/m_presentedSerialValid directly --
+    // see GpuWindowSwapTelemetryPolicy::isNewFrameSwap's own wiring comment.
+    const int policyCallAt = body.indexOf(QStringLiteral("GpuWindowSwapTelemetryPolicy::isNewFrameSwap("));
+    ASSERT_TRUE(policyCallAt >= 0);
+    const QString callRegion = body.mid(policyCallAt, 220);
+    ASSERT_TRUE(callRegion.contains(QStringLiteral("record.presentedSerialValid")));
+    ASSERT_TRUE(callRegion.contains(QStringLiteral("record.presentedSerial")));
+    ASSERT_TRUE(callRegion.contains(
+        QStringLiteral("m_swapTelemetryCounters.lastCountedNewFramePresentedSerial")));
+
+    const int recordWriteAt = body.indexOf(
+        QStringLiteral("m_swapTelemetryRing[ static_cast<std::size_t>"));
+    ASSERT_TRUE(recordWriteAt >= 0 && recordWriteAt < policyCallAt);
+}
+
+TEST(GpuWindowSwapWiring, GpuWindowSwapSummaryLineCarriesNewFrameFields)
+{
+    const QString source = readRepoFile(QStringLiteral("platform/qt/MainWindow.cpp"));
+    const int lineAt = source.indexOf(QStringLiteral("playback_smoke.gpu_window_swaps"));
+    ASSERT_TRUE(lineAt >= 0);
+    const QString region = source.mid(lineAt, 2700);
+    ASSERT_TRUE(region.contains(QStringLiteral("new_frame_swaps=%18")));
+    ASSERT_TRUE(region.contains(QStringLiteral("swapSnapshot.summary.newFrameSwapCount")));
+}
+

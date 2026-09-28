@@ -27044,7 +27044,9 @@ void MainWindow::finishPlaybackSmokeTelemetry( const char *reason )
                    "max_gap_before_serial=%7 max_gap_after_serial=%8 frames_presented=%9 "
                    "swaps_minus_frames_presented=%10 head_gap_ms=%11 tail_gap_ms=%12 "
                    "first_swap_utc=%13 last_swap_utc=%14 superseded_before_paint=%15 "
-                   "last_superseded_serial=%16 last_superseded_by_serial=%17" )
+                   "last_superseded_serial=%16 last_superseded_by_serial=%17 "
+                   "new_frame_swaps=%18 new_frame_swap_fps=%19 new_frame_max_gap_ms=%20 "
+                   "new_frame_p95_gap_ms=%21" )
                    .arg( static_cast<qulonglong>( swapSnapshot.sessionId ) )
                    .arg( bool01( swapSnapshot.windowActive ) )
                    .arg( bool01( swapSnapshot.telemetryEnabled ) )
@@ -27062,7 +27064,16 @@ void MainWindow::finishPlaybackSmokeTelemetry( const char *reason )
                    .arg( swapSnapshot.summary.lastSwapUtc )
                    .arg( static_cast<qulonglong>( swapSnapshot.summary.supersededCount ) )
                    .arg( static_cast<qulonglong>( swapSnapshot.summary.lastSupersededSerial ) )
-                   .arg( static_cast<qulonglong>( swapSnapshot.summary.lastSupersededBySerial ) );
+                   .arg( static_cast<qulonglong>( swapSnapshot.summary.lastSupersededBySerial ) )
+                   // CUDA-PLAYBACK-PRESENT-CADENCE-2 round 1: swaps that displayed
+                   // genuinely NEW content (see GpuWindowSwapTelemetryCounters::
+                   // newFrameSwapCount) -- the round-1 acceptance gate's own denominator,
+                   // reported here rather than derived from swaps=%4 alone, since %4
+                   // counts every real swap including a repaint of already-shown content.
+                   .arg( static_cast<qulonglong>( swapSnapshot.summary.newFrameSwapCount ) )
+                   .arg( swapSnapshot.summary.newFrameSwapFps, 0, 'f', 3 )
+                   .arg( swapSnapshot.summary.newFrameMaxGapMs, 0, 'f', 3 )
+                   .arg( swapSnapshot.summary.newFrameP95GapMs, 0, 'f', 3 );
     }
 
     // CUDA-PLAYBACK-CONTACT-SHEET-1 r1d (sol HARDENING): cleared LAST, after every summary

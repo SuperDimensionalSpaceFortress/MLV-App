@@ -185,3 +185,129 @@ TEST(GpuWindowSwapTelemetryPolicy, SupersededCountIsIndependentOfSwapFpsArithmet
     ASSERT_NEAR(60.0, summary.swapFps, 0.01);
     ASSERT_EQ(static_cast<quint64>(5000), summary.supersededCount);
 }
+
+// New-frame counting (CUDA-PLAYBACK-PRESENT-CADENCE-2 round 1): the round's own acceptance
+// denominator. isNewFrameSwap is the extracted pure predicate; the summarize() tests below
+// cover the derived fps/gap/p95 arithmetic built on top of it.
+
+TEST(GpuWindowSwapTelemetryPolicy, IsNewFrameSwapRejectsAnInvalidPresentedSerial)
+{
+    // A swap whose route never supplied a real presentationSerial (e.g. a screenshot
+    // capture with no playback-smoke session) must never count as a new frame.
+    ASSERT_FALSE(GpuWindowSwapTelemetryPolicy::isNewFrameSwap(
+        /*presentedSerialValid=*/false, /*presentedSerial=*/7, /*previousCounted=*/0));
+}
+
+TEST(GpuWindowSwapTelemetryPolicy, IsNewFrameSwapAcceptsTheFirstValidSerial)
+{
+    // previousCountedNewFramePresentedSerial starts at 0 (the sentinel), and a real
+    // presentationSerial is never 0 (MainWindow's presentImageIfActive/
+    // presentGpuPlaybackReconAmazePostWbTextureIfActive treat 0 as "no serial supplied"),
+    // so the first genuinely-serialed swap of a session must always count.
+    ASSERT_TRUE(GpuWindowSwapTelemetryPolicy::isNewFrameSwap(
+        /*presentedSerialValid=*/true, /*presentedSerial=*/1, /*previousCounted=*/0));
+}
+
+TEST(GpuWindowSwapTelemetryPolicy, IsNewFrameSwapRejectsARepaintOfAnAlreadyCountedSerial)
+{
+    // MUTATION-TESTED (design review note "e"): dropping the strict "greater than" check
+    // (e.g. changing it to >=, or to just presentedSerialValid) makes this assertion fail,
+    // because a leftover update() repainting serial 5 a second time -- exactly what
+    // paint-per-submit's "skip the trailing update() when painted" guard exists to avoid --
+    // would then double-count. presentedSerial equal to (not just less than) the previous
+    // counted serial must also be rejected.
+    ASSERT_FALSE(GpuWindowSwapTelemetryPolicy::isNewFrameSwap(
+        /*presentedSerialValid=*/true, /*presentedSerial=*/5, /*previousCounted=*/5));
+    ASSERT_FALSE(GpuWindowSwapTelemetryPolicy::isNewFrameSwap(
+        /*presentedSerialValid=*/true, /*presentedSerial=*/4, /*previousCounted=*/5));
+}
+
+TEST(GpuWindowSwapTelemetryPolicy, IsNewFrameSwapAcceptsAStrictlyAdvancingSerial)
+{
+    ASSERT_TRUE(GpuWindowSwapTelemetryPolicy::isNewFrameSwap(
+        /*presentedSerialValid=*/true, /*presentedSerial=*/6, /*previousCounted=*/5));
+}
+
+TEST(GpuWindowSwapTelemetryPolicy, ZeroNewFrameSwapsReportsZeroFpsAndZeroGaps)
+{
+    GpuWindowSwapTelemetryCounters counters;
+    counters.swapCount = 40; // real swaps happened, but none were ever new-frame swaps
+
+    const GpuWindowSwapTelemetrySummary summary =
+        GpuWindowSwapTelemetryPolicy::summarize(counters);
+
+    ASSERT_EQ(static_cast<quint64>(0), summary.newFrameSwapCount);
+    ASSERT_NEAR(0.0, summary.newFrameSwapFps, 1e-9);
+    ASSERT_NEAR(0.0, summary.newFrameMaxGapMs, 1e-9);
+    ASSERT_NEAR(0.0, summary.newFrameP95GapMs, 1e-9);
+}
+
+TEST(GpuWindowSwapTelemetryPolicy, NewFrameCadenceIsIndependentOfTotalSwapCadence)
+{
+    // Modeled on the round's own scored diagnosis: a naive fix can inflate swaps= without
+    // inflating displayed new content. 200 total swaps at ~60 fps, but only 25 of them ever
+    // advanced the presented serial, at an even 25 fps -- the two fps figures must be
+    // computed independently and must not collide.
+    GpuWindowSwapTelemetryCounters counters;
+    counters.swapCount = 200;
+    counters.firstSwapQpcMs = 0.0;
+    counters.lastSwapQpcMs = 3316.67; // ~60 fps over 199 intervals
+    counters.newFrameSwapCount = 25;
+    counters.newFrameFirstSwapQpcMs = 0.0;
+    counters.newFrameLastSwapQpcMs = 1000.0; // 25 new-frame swaps over 1000 ms = 24 intervals
+
+    const GpuWindowSwapTelemetrySummary summary =
+        GpuWindowSwapTelemetryPolicy::summarize(counters);
+
+    ASSERT_NEAR(60.0, summary.swapFps, 0.1);
+    ASSERT_NEAR(24.0, summary.newFrameSwapFps, 0.1);
+}
+
+TEST(GpuWindowSwapTelemetryPolicy, NewFrameMaxGapAndItsSerialBracketPassThroughUnchanged)
+{
+    GpuWindowSwapTelemetryCounters counters;
+    counters.newFrameSwapCount = 10;
+    counters.newFrameMaxGapMs = 412.5;
+    counters.newFrameMaxGapBeforePresentedSerial = 7;
+    counters.newFrameMaxGapAfterPresentedSerial = 9;
+
+    const GpuWindowSwapTelemetrySummary summary =
+        GpuWindowSwapTelemetryPolicy::summarize(counters);
+
+    ASSERT_NEAR(412.5, summary.newFrameMaxGapMs, 1e-9);
+    ASSERT_EQ(static_cast<quint64>(7), summary.newFrameMaxGapBeforePresentedSerial);
+    ASSERT_EQ(static_cast<quint64>(9), summary.newFrameMaxGapAfterPresentedSerial);
+}
+
+TEST(GpuWindowSwapTelemetryPolicy, NewFrameP95GapIsNearestRankOverObservedSamples)
+{
+    // 5 gap samples with one outlier, deliberately pushed onto the vector OUT OF ORDER
+    // (so a bug that reads the unsorted vector's raw last element, rather than sorting
+    // first, would read this test right by accident on a pre-sorted input but wrong here).
+    // Nearest-rank p95 of N=5 ascending-sorted samples is index ceil(0.95*5)-1 = 4
+    // (0-based) -- the last (largest) sample, i.e. the 500ms outlier.
+    GpuWindowSwapTelemetryCounters counters;
+    counters.newFrameSwapCount = 6;
+    counters.newFrameGapSamplesMs.push_back(30.0);
+    counters.newFrameGapSamplesMs.push_back(500.0);
+    counters.newFrameGapSamplesMs.push_back(10.0);
+    counters.newFrameGapSamplesMs.push_back(40.0);
+    counters.newFrameGapSamplesMs.push_back(20.0);
+
+    const GpuWindowSwapTelemetrySummary summary =
+        GpuWindowSwapTelemetryPolicy::summarize(counters);
+
+    ASSERT_NEAR(500.0, summary.newFrameP95GapMs, 1e-9);
+}
+
+TEST(GpuWindowSwapTelemetryPolicy, NewFrameP95GapWithASingleSampleReturnsThatSample)
+{
+    GpuWindowSwapTelemetryCounters counters;
+    counters.newFrameSwapCount = 2;
+    counters.newFrameGapSamplesMs.push_back(33.3);
+
+    const GpuWindowSwapTelemetrySummary summary =
+        GpuWindowSwapTelemetryPolicy::summarize(counters);
+
+    ASSERT_NEAR(33.3, summary.newFrameP95GapMs, 1e-9);
+}

@@ -79,6 +79,20 @@ bool swapTelemetryPerEventLogEnabled()
     return !disabled;
 }
 
+// CUDA-PLAYBACK-PRESENT-CADENCE-2: opt-out, not opt-in (mirrors
+// swapTelemetryPerEventLogEnabled() above and MLVAPP_F3_DISABLE_CUT_RANGE_REPAIR in
+// MainWindow.cpp) -- unset, or set to anything but a literal "0", leaves the new
+// paint-per-submit path (see setPresentedGpuPlaybackReconAmazePostWbTexture) active.
+// MLVAPP_GPU_WINDOW_PAINT_PER_SUBMIT=0 restores the pre-round-2 update()-only path
+// unconditionally, so one build can run a same-build A/B leg and there is a kill switch.
+bool paintPerSubmitEnabled()
+{
+    static const bool enabled =
+        !qEnvironmentVariableIsSet( "MLVAPP_GPU_WINDOW_PAINT_PER_SUBMIT" )
+        || qEnvironmentVariable( "MLVAPP_GPU_WINDOW_PAINT_PER_SUBMIT" ) != QStringLiteral("0");
+    return enabled;
+}
+
 /* GLSL 1.20 passthrough -- works in the NVIDIA compatibility context a QOpenGLWindow
  * gets by default, no LUT/Bayer uniforms. Milestone 1 displays the already-final CPU
  * RGBA frame; the shared GpuPreviewProcessing shader (zebras/LUTs/Bayer) comes with the
@@ -219,6 +233,38 @@ void GpuDisplayWindow::noteRealSwap()
     }
     m_swapTelemetryCounters.lastSwapQpcMs = qpcMs;
     m_swapTelemetryCounters.lastSwapUtc = utc;
+
+    // CUDA-PLAYBACK-PRESENT-CADENCE-2 round 1: new-frame counting, gated on the same
+    // predicate the behaviour test exercises without a live GL window (see
+    // GpuWindowSwapTelemetryPolicy::isNewFrameSwap). Uses this swap's own record, not
+    // m_presentedSerial/m_presentedSerialValid directly, so it always agrees with the
+    // presented_serial/presented_serial_valid fields the per-swap log line above (or its
+    // suppressed LIGHT-arm equivalent) would have printed for this exact swap.
+    if ( GpuWindowSwapTelemetryPolicy::isNewFrameSwap(
+             record.presentedSerialValid, record.presentedSerial,
+             m_swapTelemetryCounters.lastCountedNewFramePresentedSerial ) )
+    {
+        const bool isFirstNewFrame = m_swapTelemetryCounters.newFrameSwapCount == 0;
+        ++m_swapTelemetryCounters.newFrameSwapCount;
+        if ( isFirstNewFrame )
+        {
+            m_swapTelemetryCounters.newFrameFirstSwapQpcMs = qpcMs;
+        }
+        else
+        {
+            const double newFrameGapMs = qpcMs - m_swapTelemetryCounters.newFrameLastSwapQpcMs;
+            m_swapTelemetryCounters.newFrameGapSamplesMs.push_back( newFrameGapMs );
+            if ( newFrameGapMs > m_swapTelemetryCounters.newFrameMaxGapMs )
+            {
+                m_swapTelemetryCounters.newFrameMaxGapMs = newFrameGapMs;
+                m_swapTelemetryCounters.newFrameMaxGapBeforePresentedSerial =
+                    m_swapTelemetryCounters.lastCountedNewFramePresentedSerial;
+                m_swapTelemetryCounters.newFrameMaxGapAfterPresentedSerial = record.presentedSerial;
+            }
+        }
+        m_swapTelemetryCounters.newFrameLastSwapQpcMs = qpcMs;
+        m_swapTelemetryCounters.lastCountedNewFramePresentedSerial = record.presentedSerial;
+    }
 
     if ( swapTelemetryPerEventLogEnabled() )
     {
@@ -462,9 +508,10 @@ GpuDisplayWindow::GpuDisplayWindow(QWindow *parent)
     fmt.setSwapInterval(0);
     setFormat(fmt);
 
-    // Real swap path 1 of 2: Qt's own automatic swap after paintGL() returns, in its
+    // Real swap path 1 of 3: Qt's own automatic swap after paintGL() returns, in its
     // normal paint-event cycle (frameSwapped() fires only for THIS swap, not for the
-    // explicit manual one in grabPresentedFramebufferIfActive -- see path 2 there).
+    // explicit manual ones in grabPresentedFramebufferIfActive (path 2) or
+    // setPresentedGpuPlaybackReconAmazePostWbTexture's paint-per-submit (path 3)).
     // Decided once, here, rather than re-checked per swap: the env var is cached (see
     // swapTelemetryEnabled()) and cannot change mid-run, so when telemetry is off this
     // window never even connects the signal -- zero cost, not just an early return in
@@ -909,7 +956,6 @@ bool GpuDisplayWindow::setPresentedGpuPlaybackReconAmazePostWbTexture(
     // a presented frame.
     m_pendingPresentationSerial = presentationSerial;
     m_pendingPresentationSerialValid = presentationSerial != 0;
-    if ( madeCurrent ) doneCurrent();
     if ( !m_loggedSetGpuTexture )
     {
         qInfo().nospace()
@@ -919,7 +965,36 @@ bool GpuDisplayWindow::setPresentedGpuPlaybackReconAmazePostWbTexture(
             << "x" << m_pendingDisplayHeight << ").";
         m_loggedSetGpuTexture = true;
     }
-    update();
+    // CUDA-PLAYBACK-PRESENT-CADENCE-2: paint-per-submit. The recon+AMaZE render above
+    // already paid the per-frame GPU cost of a real paint on THIS thread; routing through
+    // Qt's own update()-driven paint-event cycle instead risked paying that cost for
+    // nothing whenever a newer submission arrived before Qt got around to painting this
+    // one -- the window holds exactly one pending slot (see noteSupersededBeforePaint), so
+    // a submission Qt never painted was silently dropped either way. Painting
+    // synchronously, right here, means every render that reaches this point is the one
+    // that gets shown. Reuses the grab idiom's own guard (grabPresentedFramebufferIfActive,
+    // isExposed()/isValid()) so this never swaps a non-exposed or mid-transition window --
+    // Qt reports a window as not exposed during a fullscreen enter/exit, so this also
+    // covers #171's "no swap during a fullscreen transition" invariant. The GL context is
+    // still current from the render above (see madeCurrent), so paintGL() and the manual
+    // swap below run against it directly, with no further makeCurrent().
+    bool paintedSynchronously = false;
+    if ( paintPerSubmitEnabled() && isExposed() && isValid() )
+    {
+        paintGL();
+        glContext->swapBuffers(this);
+        // Real swap path 3 of 3: like grabPresentedFramebufferIfActive's manual swap (path 2),
+        // this runs outside Qt's own paint-event cycle, so frameSwapped() (path 1) does
+        // NOT fire for it -- record it explicitly so swap telemetry covers every real swap.
+        if ( swapTelemetryEnabled() ) noteRealSwap();
+        paintedSynchronously = true;
+    }
+    if ( madeCurrent ) doneCurrent();
+    // Only fall back to Qt's paint-event cycle when this submit did NOT already paint --
+    // otherwise Qt would paint the SAME serial a second time (m_presentedSerial is only
+    // promoted inside paintGL(), so a second call here would re-promote an already-shown
+    // serial and pay a second vsync-blocked swap for content already on screen).
+    if ( !paintedSynchronously ) update();
     postMs = elapsedMs() - postStartMs;
     if ( handoffMode ) *handoffMode = handoffModeValue;
     if ( timing )
@@ -1093,7 +1168,7 @@ bool GpuDisplayWindow::grabPresentedFramebufferIfActive(QImage *outImage,
     // swap now so the window's own swapchain reflects exactly what was just captured,
     // making this a real present rather than a side-channel readback.
     glContext->swapBuffers(win);
-    // Real swap path 2 of 2: this manual swap runs outside Qt's own paint-event cycle, so
+    // Real swap path 2 of 3: this manual swap runs outside Qt's own paint-event cycle, so
     // QOpenGLWindow's frameSwapped() signal (path 1, connected in the constructor) does
     // NOT fire for it -- record it explicitly so swap telemetry covers every real swap.
     if ( swapTelemetryEnabled() ) win->noteRealSwap();
