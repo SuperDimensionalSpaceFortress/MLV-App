@@ -191,6 +191,7 @@ public:
 protected:
     void timerEvent( QTimerEvent *t );
     void resizeEvent( QResizeEvent *event );
+    void changeEvent( QEvent *event );
     bool event( QEvent *event );
     void dragEnterEvent( QDragEnterEvent *event );
     void dropEvent( QDropEvent *event );
@@ -1045,6 +1046,21 @@ private:
     // QGuiApplication::applicationStateChanged, never polled per frame).
     bool m_playbackSmokeForegroundAtBegin = false;
     uint64_t m_playbackSmokeForegroundLostCount = 0;
+    // Fullscreen-state telemetry (CUDA-PERF-PLAYBACK-FULLSCREEN-1): same
+    // MLVAPP_PLAYBACK_SMOKE_TELEMETRY gate as the foreground fields above, sampled at
+    // session begin in beginPlaybackSmokeTelemetry() and again (fresh, not reused) at the
+    // gate in finishPlaybackSmokeTelemetry() -- see playbackSmokeViewportSize().
+    bool m_playbackSmokeFullscreenAtBegin = false;
+    int m_playbackSmokeViewportWidthAtBegin = 0;
+    int m_playbackSmokeViewportHeightAtBegin = 0;
+    // Mid-session fullscreen-loss latch (CUDA-PLAYBACK-FULLSCREEN-UI-2): the end-of-loop
+    // isFullScreen() check alone is a point sample and misses a lose-then-regain interval
+    // within the measured window -- see changeEvent() and runGuiPlaybackSmoke(). Armed only
+    // for the measured interval itself (after full screen is verified, right before the
+    // play trigger) and disarmed at loop exit, so entry/verification and end-of-session
+    // teardown never count.
+    bool m_playbackSmokeFullscreenLossLatchArmed = false;
+    uint64_t m_playbackSmokeFullscreenLostCount = 0;
     int m_playbackSmokeStartPosition = 0;
     int m_playbackSmokeStartCutIn = 0;
     int m_playbackSmokeStartCutOut = 0;
@@ -1478,6 +1494,13 @@ private:
     // GetForegroundWindow(); never called from normal (non-smoke) startup or from the
     // generic Play toggle. See MainWindow::runGuiPlaybackSmoke().
     void forcePlaybackSmokeWindowForeground( void );
+    // --gui-smoke-playback only (CUDA-PERF-PLAYBACK-FULLSCREEN-1): enters/leaves full
+    // screen via the existing actionFullscreen toggle (unhidden for normal use since
+    // CUDA-PLAYBACK-FULLSCREEN-UI-1) for the measured interval; never called from normal
+    // (non-smoke) startup. See MainWindow::runGuiPlaybackSmoke().
+    bool enterPlaybackSmokeFullscreen( void );
+    void leavePlaybackSmokeFullscreen( void );
+    QSize playbackSmokeViewportSize( void ) const;
     void onPlaybackSmokeApplicationStateChanged( Qt::ApplicationState state );
     void enqueuePlaybackPrepTask( const PlaybackPrepTask &task );
     void invalidatePlaybackPrepForDisplayChange( const char *reason );

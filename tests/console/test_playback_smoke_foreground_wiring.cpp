@@ -57,15 +57,17 @@ TEST(PlaybackSmokeForegroundWiring, HeaderDeclaresTheForegroundApi)
     ASSERT_TRUE(header.contains(QStringLiteral("void onPlaybackSmokeApplicationStateChanged( Qt::ApplicationState state );")));
 }
 
-TEST(PlaybackSmokeForegroundWiring, ForegroundRequestIsCalledExactlyOnceAndOnlyFromGuiPlaybackSmoke)
+TEST(PlaybackSmokeForegroundWiring, ForegroundRequestIsCalledOnlyFromGuiPlaybackSmoke)
 {
     const QString source = readRepoFile(QStringLiteral("platform/qt/MainWindow.cpp"));
 
-    // Exactly one call site anywhere in the file (the definition itself uses the
+    // Exactly two call sites anywhere in the file (the definition itself uses the
     // qualified "MainWindow::forcePlaybackSmokeWindowForeground" spelling, so an
-    // unqualified-name search below counts ONLY call sites, not the definition).
+    // unqualified-name search below counts ONLY call sites, not the definition): once
+    // before the full-screen switch, once after, to re-verify/re-establish foreground
+    // once the window has re-laid-out (CUDA-PERF-PLAYBACK-FULLSCREEN-1).
     const int callCount = countOccurrences(source, QStringLiteral("forcePlaybackSmokeWindowForeground();"));
-    ASSERT_EQ(1, callCount);
+    ASSERT_EQ(2, callCount);
 
     const QString smokeBody = functionBody(source,
         QStringLiteral("int MainWindow::runGuiPlaybackSmoke(const GuiPlaybackSmokeOptions & options)"),
