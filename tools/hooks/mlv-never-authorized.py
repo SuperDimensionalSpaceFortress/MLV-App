@@ -3435,9 +3435,38 @@ OWNER_CONSENTED_FOOTAGE = types.MappingProxyType(
                         "c084dd034f80f90ce3ec26ef25a635fe8192ddcc9bf63ab77e9661013585a8b4",
                     ),
                 ),
+                "M16-1456": (
+                    (
+                        1455382016,
+                        "0e451260df2e69c5bd606ffc3c8930c30e3c55b889b0c1bd961c5386d0cbd255",
+                        "5cea2134ff623b9710a2897debc0147229bb559c18a277f38d168bbea42bcb99",
+                    ),
+                ),
             }
         ),
         "purposes": ("#72b delta-baseline gate", "PLAYBACK-ATTR-3-CUDA"),
+        # Later, separately consented admissions.  "purposes" and "authority" cover the ORIGINAL
+        # six ids only; each id admitted afterwards carries its own card, purposes and consent
+        # citation here, so no earlier citation is widened to cover it.
+        "admissions": types.MappingProxyType(
+            {
+                "M16-1456": types.MappingProxyType(
+                    {
+                        "card": "FOOTAGE-ADMIT-HFR-1",
+                        "purposes": (
+                            "PLAYBACK-HFR-CONFORM-DEFAULT-1",
+                            "CUDA playback measurement",
+                        ),
+                        "consent_receipt": r"C:\!Layi Wkspc\MLV-App\.claude-state\coordination"
+                        r"\dual-lane\receipts\owner-footage-consent-20260928-hfr.json",
+                        "consent_receipt_sha256": (
+                            "1dbbe30eeedac971861110a3dc47822ea33f2de26d8ea51164c15a497196f5d0"
+                        ),
+                        "recordedUtc": "2026-09-28T16:13:33Z",
+                    }
+                ),
+            }
+        ),
         "authority": types.MappingProxyType(
             {
                 "hash_convention": "sha256 of the raw line bytes excluding the terminator",
