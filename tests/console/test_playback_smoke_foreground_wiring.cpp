@@ -219,3 +219,78 @@ TEST(PlaybackSmokeForegroundWiring, ForegroundAtGateIsSampledFreshNotReusedFromB
     ASSERT_TRUE(source.contains(QStringLiteral(
         "const bool foregroundAtGate = nativeWindowIsForeground( this );")));
 }
+
+// Round 2 (CUDA-PLAYBACK-PRESENT-CADENCE-1): counters-only mode. The per-frame
+// "playback_smoke.frame" and "playback_auto.decision" qInfo() lines are gated on a
+// separate member (m_playbackSmokeFrameLogEnabled), derived from -- and never more
+// permissive than -- m_playbackSmokeFrameTelemetry, so every counter this session
+// accumulates keeps running when the new opt-out flag suppresses only the per-frame log
+// lines.
+
+TEST(PlaybackSmokeForegroundWiring, FrameLogEnabledIsDerivedFromFrameTelemetryAndTheNewOptOutFlag)
+{
+    const QString source = readRepoFile(QStringLiteral("platform/qt/MainWindow.cpp"));
+    const int helperAt = source.indexOf(QStringLiteral(
+        "static bool playbackSmokeFrameLogDisabledByEnvironment()"));
+    ASSERT_TRUE(helperAt >= 0);
+    ASSERT_TRUE(source.mid(helperAt, 200).contains(QStringLiteral(
+        "environmentFlagEnabled( \"MLVAPP_PLAYBACK_SMOKE_TELEMETRY_DISABLE_FRAME_LOG\" );")));
+
+    const int beginAt = source.indexOf(QStringLiteral("void MainWindow::beginPlaybackSmokeTelemetry( void )"));
+    ASSERT_TRUE(beginAt >= 0);
+    const int assignAt = source.indexOf(QStringLiteral(
+        "m_playbackSmokeFrameLogEnabled =\n"
+        "        m_playbackSmokeFrameTelemetry && !playbackSmokeFrameLogDisabledByEnvironment();"),
+        beginAt);
+    ASSERT_TRUE(assignAt > beginAt);
+    ASSERT_TRUE(assignAt < beginAt + 2500);
+}
+
+TEST(PlaybackSmokeForegroundWiring, PlaybackSmokeFrameLineIsGatedOnFrameLogEnabledNotFrameTelemetry)
+{
+    const QString source = readRepoFile(QStringLiteral("platform/qt/MainWindow.cpp"));
+    const int gateAt = source.indexOf(QStringLiteral("if( m_playbackSmokeFrameLogEnabled )"));
+    const int lineAt = source.indexOf(QStringLiteral("playback_smoke.frame session=%1"), gateAt);
+    ASSERT_TRUE(gateAt >= 0);
+    ASSERT_TRUE(lineAt > gateAt);
+}
+
+TEST(PlaybackSmokeForegroundWiring, PlaybackAutoDecisionLineIsGatedOnFrameLogEnabledNotFrameTelemetry)
+{
+    const QString source = readRepoFile(QStringLiteral("platform/qt/MainWindow.cpp"));
+    const int firstGateAt = source.indexOf(QStringLiteral("if( m_playbackSmokeFrameLogEnabled )"));
+    ASSERT_TRUE(firstGateAt >= 0);
+    const int secondGateAt = source.indexOf(
+        QStringLiteral("if( m_playbackSmokeFrameLogEnabled )"), firstGateAt + 1);
+    ASSERT_TRUE(secondGateAt > firstGateAt);
+    const int lineAt = source.indexOf(QStringLiteral("playback_auto.decision session=%1"), secondGateAt);
+    ASSERT_TRUE(lineAt > secondGateAt);
+}
+
+TEST(PlaybackSmokeForegroundWiring, EligibilityDiagLineIsDedupedAgainstItsLastEmittedValue)
+{
+    // CUDA-PLAYBACK-PRESENT-CADENCE-1 round 2: this line used to run unconditionally on
+    // every presented frame under MLVAPP_GPU_PLAYBACK_RECON_ELIGIBILITY_DIAG=1. Deduped
+    // against the last emitted line rather than dropped, so the job-side
+    // Get-AttrCudaLastEligibilityLine parse (which needs at least one occurrence) still
+    // finds a correct verdict while a stable session logs it only once.
+    const QString source = readRepoFile(QStringLiteral("platform/qt/MainWindow.cpp"));
+    const int diagGateAt = source.indexOf(QStringLiteral(
+        "if( playback_recon_eligibility_diag_requested_by_environment() )"));
+    ASSERT_TRUE(diagGateAt >= 0);
+    const int eligibilityLineAt = source.indexOf(
+        QStringLiteral("const QString eligibilityLine ="), diagGateAt);
+    ASSERT_TRUE(eligibilityLineAt > diagGateAt);
+    const int staticCacheAt = source.indexOf(
+        QStringLiteral("static QString lastEligibilityLine;"), eligibilityLineAt);
+    ASSERT_TRUE(staticCacheAt > eligibilityLineAt);
+    const int compareAt = source.indexOf(
+        QStringLiteral("if( eligibilityLine != lastEligibilityLine )"), staticCacheAt);
+    ASSERT_TRUE(compareAt > staticCacheAt);
+    const int logAt = source.indexOf(
+        QStringLiteral("qInfo().noquote() << eligibilityLine;"), compareAt);
+    ASSERT_TRUE(logAt > compareAt);
+    const int updateAt = source.indexOf(
+        QStringLiteral("lastEligibilityLine = eligibilityLine;"), logAt);
+    ASSERT_TRUE(updateAt > logAt);
+}

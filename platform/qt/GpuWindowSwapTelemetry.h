@@ -11,6 +11,10 @@
 
 #include <QString>
 #include <QtGlobal>
+#include <algorithm>
+#include <cmath>
+#include <cstddef>
+#include <vector>
 
 /*! \brief Cumulative SESSION totals GpuDisplayWindow accumulates while it performs real
  *  buffer swaps (Qt's own automatic swap after paintGL() and the explicit swapBuffers()
@@ -25,6 +29,40 @@ struct GpuWindowSwapTelemetryCounters
     double maxGapMs = 0.0;
     quint64 maxGapBeforeSerial = 0;
     quint64 maxGapAfterSerial = 0;
+    // Fate telemetry (CUDA-PLAYBACK-PRESENT-CADENCE-1): a submitted frame is "superseded
+    // before paint" when a NEWER present call overwrites the window's single pending slot
+    // (m_pendingPresentationSerial) before paintGL() ever drew it -- the window holds
+    // exactly one pending frame, not a queue, so every submission that is not the most
+    // recent one at the moment Qt actually paints is silently lost by construction. This
+    // was previously invisible: only the swap count and the app's own upstream
+    // frames_presented counter existed, and their difference had to be inferred
+    // out-of-band (see docs/cuda-playback-present-cadence.md). Counted only while a
+    // playback-smoke session is active, mirroring noteRealSwap()'s own gating.
+    quint64 supersededCount = 0;
+    quint64 lastSupersededSerial = 0;
+    quint64 lastSupersededBySerial = 0;
+
+    // CUDA-PLAYBACK-PRESENT-CADENCE-2 round 1: a "new frame" swap is a real swap whose
+    // presentedSerialValid is true and whose presentedSerial is strictly greater than the
+    // previous COUNTED new-frame swap's presentedSerial -- i.e. it displays content the
+    // owner has not already seen, as opposed to a repaint of a serial already shown (a
+    // leftover update() after paint-per-submit already painted, or an expose-event
+    // repaint). swapCount above counts every real swap regardless of content; this is the
+    // denominator the round-1 acceptance gate (new_frame_swaps/s) actually requires, and it
+    // cannot be inflated by upstream frame-dropping the way swapCount/preparedFps can (see
+    // the design review, "ratio gameable by upstream shedding").
+    quint64 newFrameSwapCount = 0;
+    quint64 lastCountedNewFramePresentedSerial = 0;
+    double newFrameFirstSwapQpcMs = 0.0;
+    double newFrameLastSwapQpcMs = 0.0;
+    double newFrameMaxGapMs = 0.0;
+    quint64 newFrameMaxGapBeforePresentedSerial = 0;
+    quint64 newFrameMaxGapAfterPresentedSerial = 0;
+    // Every inter-swap gap between consecutive new-frame swaps, in the order observed --
+    // the raw material for a p95, which (unlike count/fps/max) cannot be reduced to a
+    // running scalar as each sample arrives. Reset along with every other counter here
+    // (GpuDisplayWindow::resetSwapTelemetry() replaces the whole counters struct).
+    std::vector<double> newFrameGapSamplesMs;
 };
 
 /*! \brief Derived, report-ready swap-cadence numbers for one playback smoke session's
@@ -45,6 +83,26 @@ struct GpuWindowSwapTelemetrySummary
     double tailGapMs = 0.0;
     QString firstSwapUtc;
     QString lastSwapUtc;
+    // See GpuWindowSwapTelemetryCounters::supersededCount.
+    quint64 supersededCount = 0;
+    quint64 lastSupersededSerial = 0;
+    quint64 lastSupersededBySerial = 0;
+
+    // See GpuWindowSwapTelemetryCounters::newFrameSwapCount. newFrameSwapFps mirrors
+    // swapFps's own zero-guard (fewer than 2 new-frame swaps, or a zero-width span,
+    // reports 0 rather than dividing by zero). newFrameP95GapMs is 0 whenever fewer than
+    // two new-frame swaps were observed -- there is no gap to measure. round 1c: when
+    // summarize() is given a real gate timestamp, newFrameMaxGapMs, newFrameSwapFps and
+    // (round 1e) newFrameP95GapMs also account for the interval from the LAST new-frame
+    // swap through that gate, so a display that stops showing new content cannot report an
+    // unchanged, passing cadence just because no further new-frame swap ever arrived to end
+    // the stall.
+    quint64 newFrameSwapCount = 0;
+    double newFrameSwapFps = 0.0;
+    double newFrameMaxGapMs = 0.0;
+    quint64 newFrameMaxGapBeforePresentedSerial = 0;
+    quint64 newFrameMaxGapAfterPresentedSerial = 0;
+    double newFrameP95GapMs = 0.0;
 };
 
 /*! \brief What GpuDisplayWindow::swapTelemetrySnapshot() hands back to a caller (e.g. the
@@ -77,6 +135,9 @@ public:
         summary.maxGapAfterSerial = counters.maxGapAfterSerial;
         summary.firstSwapUtc = counters.firstSwapUtc;
         summary.lastSwapUtc = counters.lastSwapUtc;
+        summary.supersededCount = counters.supersededCount;
+        summary.lastSupersededSerial = counters.lastSupersededSerial;
+        summary.lastSupersededBySerial = counters.lastSupersededBySerial;
 
         // fps is over (swapCount - 1) intervals spanning [firstSwapQpcMs, lastSwapQpcMs];
         // a single swap (or two swaps whose QPC timestamps happen to collide at clock
@@ -98,7 +159,84 @@ public:
             summary.headGapMs = qMax( 0.0, counters.firstSwapQpcMs - sessionBeginQpcMs );
             summary.tailGapMs = qMax( 0.0, gateQpcMs - counters.lastSwapQpcMs );
         }
+
+        summary.newFrameSwapCount = counters.newFrameSwapCount;
+        summary.newFrameMaxGapMs = counters.newFrameMaxGapMs;
+        summary.newFrameMaxGapBeforePresentedSerial = counters.newFrameMaxGapBeforePresentedSerial;
+        summary.newFrameMaxGapAfterPresentedSerial = counters.newFrameMaxGapAfterPresentedSerial;
+        double newFrameSpanMs = counters.newFrameLastSwapQpcMs - counters.newFrameFirstSwapQpcMs;
+
+        // round 1c (sol BLOCKER): the interior gap/fps above only ever look BETWEEN
+        // observed new-frame swaps, so a display that shows its last new content and then
+        // simply stops -- no more new-frame swaps at all, interior math untouched --
+        // reported an unchanged, passing cadence. gateQpcMs > 0.0 marks a caller that
+        // actually has a session gate to compare against (swapTelemetrySnapshot() always
+        // samples a real monotonic clock there); the interior-only unit tests above that
+        // omit it (default 0.0) keep their original count-1/interior-span numbers.
+        const bool haveGate = gateQpcMs > 0.0 && counters.newFrameSwapCount > 0;
+        double newFrameTailGapMs = 0.0;
+        if ( haveGate )
+        {
+            newFrameTailGapMs = qMax( 0.0, gateQpcMs - counters.newFrameLastSwapQpcMs );
+            if ( newFrameTailGapMs > summary.newFrameMaxGapMs )
+            {
+                summary.newFrameMaxGapMs = newFrameTailGapMs;
+                summary.newFrameMaxGapBeforePresentedSerial = counters.lastCountedNewFramePresentedSerial;
+                // No new frame ever arrived to close a stall that runs to the gate, so
+                // there is no "after" serial to name; 0 is never a valid presented serial
+                // (they start at 1), so leave it at that default rather than inventing one.
+                summary.newFrameMaxGapAfterPresentedSerial = 0;
+            }
+            // rate = new frames / (gate - first new frame): the denominator is the whole
+            // window the display was supposed to be showing new content in, not just the
+            // span between the observed swaps, so the numerator is the full swap count
+            // (not count - 1) -- a tail stall shrinks this rate even though it adds no
+            // interior interval to divide by.
+            newFrameSpanMs = gateQpcMs - counters.newFrameFirstSwapQpcMs;
+        }
+
+        summary.newFrameSwapFps =
+            haveGate
+                ? ( newFrameSpanMs > 0.0
+                        ? ( static_cast<double>( counters.newFrameSwapCount ) * 1000.0 ) / newFrameSpanMs
+                        : 0.0 )
+                : ( ( counters.newFrameSwapCount > 1 && newFrameSpanMs > 0.0 )
+                        ? ( static_cast<double>( counters.newFrameSwapCount - 1 ) * 1000.0 ) / newFrameSpanMs
+                        : 0.0 );
+        // round 1e (sol BLOCKER): p95 mirrors newFrameMaxGapMs/newFrameSwapFps above --
+        // include the last-new-frame -> gate interval as one more gap sample, or a display
+        // that freezes after a few frames reports a passing p95 forever (the interior
+        // samples never change once the stall begins).
+        std::vector<double> gapSamplesMs = counters.newFrameGapSamplesMs;
+        if ( haveGate )
+        {
+            gapSamplesMs.push_back( newFrameTailGapMs );
+        }
+        if ( !gapSamplesMs.empty() )
+        {
+            // Nearest-rank p95: sort ascending, take the ceil(0.95 * N)-th sample
+            // (1-based), clamped so a 1-sample vector returns that sample rather than
+            // reading past the end.
+            std::sort( gapSamplesMs.begin(), gapSamplesMs.end() );
+            const std::size_t rank = static_cast<std::size_t>(
+                std::ceil( 0.95 * static_cast<double>( gapSamplesMs.size() ) ) );
+            const std::size_t index = std::min(
+                gapSamplesMs.size() - 1,
+                rank == 0 ? static_cast<std::size_t>( 0 ) : rank - 1 );
+            summary.newFrameP95GapMs = gapSamplesMs[index];
+        }
         return summary;
+    }
+
+    /*! \brief Pure predicate, extracted so the invariant itself (not just its accumulated
+     *  effect on the counters) can be unit-tested without a live GL window: does this real
+     *  swap display genuinely NEW content, as opposed to a repaint of a frame already
+     *  counted? See GpuWindowSwapTelemetryCounters::newFrameSwapCount. */
+    static bool isNewFrameSwap( bool presentedSerialValid,
+                                 quint64 presentedSerial,
+                                 quint64 previousCountedNewFramePresentedSerial )
+    {
+        return presentedSerialValid && presentedSerial > previousCountedNewFramePresentedSerial;
     }
 };
 

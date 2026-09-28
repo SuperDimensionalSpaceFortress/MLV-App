@@ -229,7 +229,32 @@ param(
     # hunk small while UM-CUDA-BENCH-VENUE-1 also edits this file.
     [switch]$ContactSheet,
     [ValidateRange(1, 60)]
-    [int]$ContactSheetFrames = 6
+    [int]$ContactSheetFrames = 6,
+
+    # CUDA-PLAYBACK-PRESENT-CADENCE-1 round 2 discriminating legs. HEAVY (default, unchanged
+    # behavior for every existing caller) keeps every diagnostic env var PLAYBACK-ATTR-3-CUDA
+    # has always set. LIGHT drops the four per-frame GUI-thread diagnostic sources that are not
+    # needed for THIS job's own pass/fail gating or for the gpu_window swap counters/summary --
+    # MLVAPP_PLAYBACK_SMOKE_TIMELINE_TELEMETRY, MLVAPP_PLAYBACK_DETAILED_TIMELINE_TELEMETRY,
+    # MLVAPP_STAGE_TIMING, MLVAPP_PERF_FIELD_LOG -- and additionally sets
+    # MLVAPP_PLAYBACK_SMOKE_TELEMETRY_DISABLE_FRAME_LOG=1 (platform/qt/GpuDisplayWindow.cpp's
+    # swapTelemetryPerEventLogEnabled() / MainWindow.cpp's m_playbackSmokeFrameLogEnabled) to
+    # suppress the per-frame/per-swap/per-superseded-frame qInfo() lines those two files gate on
+    # MLVAPP_PLAYBACK_SMOKE_TELEMETRY alone. MLVAPP_PLAYBACK_SMOKE_TELEMETRY=1 and
+    # MLVAPP_GPU_PLAYBACK_RECON_ELIGIBILITY_DIAG=1 stay ON in BOTH arms: the former still drives
+    # every counter behind playback_smoke.gate/playback_smoke.gpu_window_swaps regardless of the
+    # new flag, and the latter's own eligibility line is what Get-AttrCudaEligibilityVerdict
+    # requires to avoid failing this job closed at BACKEND_NOT_AVAILABLE (exit 15) -- it is no
+    # longer a per-frame cost either way, since MainWindow.cpp now dedupes it against its last
+    # emitted value and a stable CUDA session logs it once.
+    [ValidateSet('HEAVY', 'LIGHT')]
+    [string]$TelemetryArm = 'HEAVY',
+
+    # CUDA-PLAYBACK-PRESENT-CADENCE-2 same-build A/B: sets
+    # MLVAPP_GPU_WINDOW_PAINT_PER_SUBMIT=0 on the emitted leg, restoring the pre-fix
+    # update()-driven paint path so a "before" leg can be measured from the exact same
+    # package as the "after" leg -- never rebuilt, never a different -SourceCommit.
+    [switch]$DisablePaintPerSubmit
 )
 
 $ErrorActionPreference = 'Stop'
@@ -498,6 +523,10 @@ $embeddedFunctions = Get-AttrCudaEmbeddedFunctionSource -Name @(
     # contained (no calls to other AttrCuda functions), so no further names are needed.
     'Get-AttrCudaAppSwapTelemetry',
     'Get-AttrCudaTemporalCoverage',
+    # CUDA-PLAYBACK-PRESENT-CADENCE-2 round 1: the DISPLAY_ASLEEP override's app-side
+    # foreground/fullscreen confirmation -- self-contained (no calls to other AttrCuda
+    # functions), like the two above it.
+    'Get-AttrCudaForegroundVerification',
     # CUDA-PERF-DISPLAY-WAKE-1/2: wakes the display from the interactive session before this leg
     # launches MLVApp, holds it awake for the leg, and keeps nudging periodically for the whole
     # leg (SetThreadExecutionState alone does not stop the screen saver) -- see their own header in
@@ -643,6 +672,7 @@ if ($ContactSheet) {
     $contactSheetComposerPyBase64 = ''
     $contactSheetComposerSha256ForTemplate = ''
 }
+$disablePaintPerSubmitLiteral = if ($DisablePaintPerSubmit) { '$true' } else { '$false' }
 
 # --- job body template (placeholders are substituted below; the body itself never
 #     touches this generator's variables directly, so there is no accidental capture
@@ -672,6 +702,8 @@ $ContactSheetEnabled = __CONTACT_SHEET_ENABLED__
 $ContactSheetFrameCount = __CONTACT_SHEET_FRAME_COUNT__
 $ContactSheetComposerPyBase64 = '__CONTACT_SHEET_COMPOSER_PY_BASE64__'
 $ContactSheetComposerSha256 = '__CONTACT_SHEET_COMPOSER_SHA256__'
+$TelemetryArm = '__TELEMETRY_ARM__'
+$DisablePaintPerSubmit = __DISABLE_PAINT_PER_SUBMIT__
 $Root = '__AGENT_ROOT__'
 $Cache = Join-Path $Root 'cache'
 $Stamp = Get-Date -Format 'yyyyMMdd-HHmmss'
@@ -954,7 +986,7 @@ function Get-MeasuredSmokeSessionId([string]$RawLog) {
     throw 'no playback_smoke.summary line found in the MLVApp log'
 }
 
-function Get-FrameRows([string]$RawLog, [string]$MeasuredSessionId) {
+function Get-FrameRows([string]$RawLog, [string]$MeasuredSessionId, [switch]$AllowFewRows) {
     $rows = [System.Collections.Generic.List[object]]::new()
     $keys = @(
         'prep_region_setup_ms', 'prep_region_gpu_ms', 'prep_region_image_ms',
@@ -984,7 +1016,18 @@ function Get-FrameRows([string]$RawLog, [string]$MeasuredSessionId) {
             [void]$rows.Add([pscustomobject]$row)
         }
     }
-    if ($rows.Count -lt 10) { throw "only $($rows.Count) high-resolution frame rows; require >=10" }
+    # CUDA-PLAYBACK-PRESENT-CADENCE-1 round 2: the LIGHT telemetry arm sets
+    # MLVAPP_PLAYBACK_SMOKE_TELEMETRY_DISABLE_FRAME_LOG=1, which deliberately suppresses the
+    # source of these rows (platform/qt/MainWindow.cpp's playback_smoke.frame line) in exchange
+    # for far less GUI-thread log I/O during the very measurement this round exists to take. Zero
+    # rows is therefore EXPECTED and not a defect for that arm -- $AllowFewRows lets the caller
+    # say so explicitly, rather than this function guessing from an env var of its own. $rows is
+    # never used for this job's own pass/fail gating (that comes from playback_smoke.gpu_summary
+    # and PresentMon, both unconditional one-shot lines) -- only for the optional prep_region_*
+    # percentile stats and probe-timeline.csv, both empty for a LIGHT leg by design.
+    if ($rows.Count -lt 10 -and -not $AllowFewRows) {
+        throw "only $($rows.Count) high-resolution frame rows; require >=10"
+    }
     return @($rows)
 }
 
@@ -1302,16 +1345,30 @@ New-Item -ItemType Directory -Path $legOut -Force | Out-Null
 $resultPath = Join-Path $legOut 'result.json'
 $presentMonPath = Join-Path $legOut 'presentmon.csv'
 $smoke = Join-Path $smokeRunnerClosureDir $SmokeRunnerName
+$telemetryArmEnvs = if ($TelemetryArm -eq 'LIGHT') {
+    # Only what MLVAPP_GPU_PLAYBACK_RECON_ELIGIBILITY_DIAG and the gpu_window swap
+    # counters/summary need, plus the opt-out that suppresses the per-frame/per-swap/
+    # per-superseded-frame qInfo() lines MLVAPP_PLAYBACK_SMOKE_TELEMETRY alone still gates.
+    @(
+        'MLVAPP_PLAYBACK_SMOKE_TELEMETRY=1',
+        'MLVAPP_PLAYBACK_SMOKE_TELEMETRY_DISABLE_FRAME_LOG=1',
+        'MLVAPP_GPU_PLAYBACK_RECON_ELIGIBILITY_DIAG=1'
+    )
+} else {
+    @(
+        'MLVAPP_PLAYBACK_SMOKE_TELEMETRY=1',
+        'MLVAPP_PLAYBACK_SMOKE_TIMELINE_TELEMETRY=1',
+        'MLVAPP_PLAYBACK_DETAILED_TIMELINE_TELEMETRY=1',
+        'MLVAPP_GPU_PLAYBACK_RECON_ELIGIBILITY_DIAG=1',
+        'MLVAPP_STAGE_TIMING=1',
+        'MLVAPP_PERF_FIELD_LOG=1'
+    )
+}
 $envs = @(
     'MLVAPP_PLAYBACK_QUALITY_MODE=phase3_hq',
     'MLVAPP_PLAYBACK_AGGRESSIVE_PREVIEW=0',
-    'MLVAPP_PLAYBACK_PREVIEW_MODE=sharp_smooth',
-    'MLVAPP_PLAYBACK_SMOKE_TELEMETRY=1',
-    'MLVAPP_PLAYBACK_SMOKE_TIMELINE_TELEMETRY=1',
-    'MLVAPP_PLAYBACK_DETAILED_TIMELINE_TELEMETRY=1',
-    'MLVAPP_GPU_PLAYBACK_RECON_ELIGIBILITY_DIAG=1',
-    'MLVAPP_STAGE_TIMING=1',
-    'MLVAPP_PERF_FIELD_LOG=1',
+    'MLVAPP_PLAYBACK_PREVIEW_MODE=sharp_smooth'
+) + $telemetryArmEnvs + @(
     'MLVAPP_PLAYBACK_PHASE3_UNATTENDED=1',
     'MLVAPP_GPU_PLAYBACK_RECON=1',
     'MLVAPP_GPU_PLAYBACK_RECON_BACKEND=cuda',
@@ -1328,7 +1385,7 @@ $envs = @(
     ('QT_QPA_PLATFORM_PLUGIN_PATH=' + (Join-Path $pkgDir 'platforms')),
     'QT_OPENGL=desktop',
     'QT_FORCE_STDERR_LOGGING=1'
-)
+) + $(if ($DisablePaintPerSubmit) { @('MLVAPP_GPU_WINDOW_PAINT_PER_SUBMIT=0') } else { @() })
 # Shipping default: scale factor 4. Unlike PLAYBACK-ATTR-2, no
 # MLVAPP_PLAYBACK_SCALE_FACTOR override is emitted; -ScaleFactor 4 is explicit
 # below for self-documentation even though it is run-release-gui-smoke.ps1's own
@@ -1581,8 +1638,15 @@ try {
 $logPath = $runLog.path
 $rawLog = [IO.File]::ReadAllText($logPath)
 $measuredSmokeSessionId = Get-MeasuredSmokeSessionId $rawLog
-$rows = Get-FrameRows $rawLog $measuredSmokeSessionId
+$rows = Get-FrameRows $rawLog $measuredSmokeSessionId -AllowFewRows:($TelemetryArm -eq 'LIGHT')
 $rows | Export-Csv -LiteralPath (Join-Path $legOut 'probe-timeline.csv') -NoTypeInformation
+# CUDA-PLAYBACK-PRESENT-CADENCE-2 round 1: an EARLY, separately-named read (before the
+# PresentMon display-report gate below) purely for the DISPLAY_ASLEEP override -- the
+# sufficiency-arm status block further down (PRESENTMON-HARNESS-ROBUSTNESS-2's status_source,
+# an isolated, self-contained slice the test suite executes verbatim) still computes its own
+# $appSwapTelemetry at its original call site, unchanged, so that slice keeps working with no
+# variables assumed set before it.
+$earlyAppSwapTelemetry = Get-AttrCudaAppSwapTelemetry -LogText $rawLog
 
 # CUDA-PERF-DISPLAY-IDENTITY-HARNESS-1/2: publish the smoke artifacts BEFORE any PresentMon
 # parsing, AND before PresentMon is even waited on. They are already known-good the moment the
@@ -1787,7 +1851,36 @@ Save-Json ([ordered]@{
 # below, and why -- persisted verbatim into every outcome's summary.json so a reader never has to
 # take the headline number's clock origin on faith.
 $displayReport = Get-AttrCudaPresentMonDisplayReport -CsvPath $presentMonPath -ResultJson $resultJson -EarliestCaptureStartUtc $presentMonCaptureStartUtc -LatestCaptureStartUtc $presentMonPostSpawnUtc
-if ($displayReport.status -ne 'OK') {
+
+# CUDA-PLAYBACK-PRESENT-CADENCE-2 round 1: DISPLAY_ASLEEP override. PresentMon is not trusted
+# on Optimus fullscreen GL (docs/playback-attr-3-cuda.md venue notes) -- a real fullscreen CUDA-
+# playback leg can present zero PresentMon-visible frames while the app itself, verified
+# fullscreen and foregrounded throughout, genuinely displayed many. Rather than fail this leg
+# closed on PresentMon's own (unreliable, on this venue) verdict, fall through to the OK path
+# when the app's OWN evidence says otherwise: new_frame_swaps (a real swap displaying content
+# the owner has not already seen -- GpuWindowSwapTelemetryCounters::newFrameSwapCount) is
+# greater than zero, AND the app's foreground/fullscreen telemetry independently confirms the
+# leg never lost fullscreen or foreground. Both conditions together, not new_frame_swaps alone:
+# a leg that lost fullscreen mid-run could still swap frames without those swaps being what a
+# viewer would call "the display". Design review, item 4 ("VERDICT FIX"): never report
+# DISPLAY_ASLEEP when new_frame_swaps>0 and fullscreen/foreground are verified; record
+# PresentMon as unavailable (not a verified negative) on this venue instead -- see the
+# presentMonStatus override further down, where $displayAsleepOverride is consumed.
+$displayAsleepForegroundVerification = Get-AttrCudaForegroundVerification -LogText $rawLog
+$displayAsleepOverridden =
+    ($displayReport.status -eq 'DISPLAY_ASLEEP') -and
+    ($null -ne $earlyAppSwapTelemetry.newFrameSwapCount) -and
+    ($earlyAppSwapTelemetry.newFrameSwapCount -gt 0) -and
+    $displayAsleepForegroundVerification.verified
+$displayAsleepOverride = [ordered]@{
+    triggered = $displayAsleepOverridden
+    presentMonReportedStatus = $displayReport.status
+    presentMonReportedReason = $displayReport.reason
+    newFrameSwapCount = $earlyAppSwapTelemetry.newFrameSwapCount
+    foregroundVerified = $displayAsleepForegroundVerification.verified
+    foregroundVerificationReason = $displayAsleepForegroundVerification.reason
+}
+if ($displayReport.status -ne 'OK' -and -not $displayAsleepOverridden) {
     # PRESENTMON-HARNESS-ROBUSTNESS-1: the backend-eligibility gate, the GPU-frames gate and the
     # region timing stats above have ALL already run and already succeeded by this point in the
     # script -- $diagnostics/$gpuSummary/$gpuFramesTotal/$stats/$rows are real, computed evidence
@@ -1914,6 +2007,21 @@ $presentMonStatusReason = if ($presentMonSufficient) {
     }
     "PresentMon's display-cadence evidence is too thin to corroborate as measured -- $($presentMonFailedArms -join '; ') -- display itself is still confirmed, cadence is not"
 }
+# CUDA-PLAYBACK-PRESENT-CADENCE-2 round 1: the DISPLAY_ASLEEP override above (see
+# $displayAsleepOverride) means $pmRows/$pmIntervalRows are empty here -- PresentMon reported
+# zero displayed rows on this venue, not a genuine cadence gap -- so the sufficiency arithmetic
+# just computed would otherwise read 'degraded' with a misleading "too thin" reason. Overridden
+# to 'unavailable', distinct from both 'ok' and 'degraded': PresentMon had nothing usable to say
+# on this venue at all, never a verified negative and never a real-but-thin measurement.
+if ($displayAsleepOverridden) {
+    $presentMonStatus = 'unavailable'
+    $presentMonStatusReason =
+        "PresentMon reported DISPLAY_ASLEEP (reason: $($displayReport.reason)) -- not trusted " +
+        "on Optimus fullscreen GL (docs/playback-attr-3-cuda.md venue notes). Overridden: the " +
+        "app's own new_frame_swaps=$($appSwapTelemetry.newFrameSwapCount) and verified " +
+        "foreground/fullscreen telemetry (fullscreen_lost_count=0, foreground_lost_count=0 " +
+        "throughout) confirm real on-screen display that PresentMon could not observe on this venue."
+}
 
 $dllSha256Lower = (Get-Sha $reconDll).ToLowerInvariant()
 # $pendingSymbolPresence came from the build manifest above, whose dll.sha256 was verified
@@ -1926,6 +2034,10 @@ $provenance = [ordered]@{
     # A rehearsal is carried by the provenance sidecar too: a reader who consults only this file
     # must still be told that these numbers are a plumbing proof (sol, PR #137 r1).
     fixtureRehearsal = $FixtureRehearsal
+    # CUDA-PLAYBACK-PRESENT-CADENCE-1 round 2: which telemetry arm this leg ran, so a reader of
+    # provenance.json alone (never cross-referencing the launch command) can still tell a LIGHT
+    # counters-only leg apart from a HEAVY fully-verbose one.
+    telemetryArm = $TelemetryArm
 }
 Save-Json $provenance (Join-Path $Pub 'provenance.json')
 
@@ -1941,6 +2053,7 @@ $manifest = [ordered]@{
     fixtureRehearsal = $FixtureRehearsal
     # CUDA-PERF-DISPLAY-WAKE-1: the wake attempt made before MLVApp launched for this leg.
     displayWake = $displayWake
+    telemetryArm = $TelemetryArm
     # A rehearsal cites no consent receipt: the fixtures are repository bytes, and recording the
     # owner-footage receipt here would be misleading provenance (sol, PR #137 r2 minor).
     consentReceipt = $(if ($FixtureRehearsal) { $null } else { $ConsentReceiptFileName })
@@ -1968,6 +2081,8 @@ $manifest = [ordered]@{
         status=$presentMonStatus
         statusReason=$presentMonStatusReason
     }
+    appSwapTelemetry = $appSwapTelemetry
+    displayAsleepOverride = $displayAsleepOverride
     environmentBoundary = [ordered]@{ jobTempDir=$Scratch; allChildrenInheritJobTemp=$true }
     cpuQuiescence = [ordered]@{ samples=$loads; meanPercent=$avgLoad; thresholdPercent=20.0; pass=($avgLoad -le 20.0) }
     frameRows = $rows.Count
@@ -2005,6 +2120,8 @@ Save-Json ([ordered]@{
     presentMonPresentedCount = $presentMonPresentedCount
     presentMonAppSwapCount = $presentMonAppSwapCount
     presentMonAppSwapSource = $presentMonAppSwapSource
+    newFrameSwapCount = $appSwapTelemetry.newFrameSwapCount
+    displayAsleepOverride = $displayAsleepOverride
     presentMonCoverageFraction = $presentMonCoverageFraction
     presentMonTemporalMaxGapMs = $presentMonTemporal.maxGapMs
     presentMonTemporalGapKind = $presentMonTemporal.gapKind
@@ -2151,7 +2268,7 @@ Save-Json ([ordered]@{ schema='playback-attr-3-cuda-artifact-index.v1'; artifact
 # outbox result.json carries stdout and nothing else, so a reader who never opens an artifact
 # still cannot mistake a rehearsal for a measurement.
 $resultVerb = if ($FixtureRehearsal) { 'FIXTURE_REHEARSAL_CAPTURED' } else { 'MEASUREMENT_CAPTURED' }
-Write-Output "RESULT=$resultVerb FIXTURE_REHEARSAL=$FixtureRehearsal SOURCE=$SourceCommit CLIP=$ClipId ROWS=$($rows.Count) GPU_FRAMES=$gpuFramesTotal CPU_FRAMES=$($gpuSummary.cpuFrames) PRESENTMON_SAMPLES=$($pmRows.Count) PRESENTMON_STATUS=$presentMonStatus PRESENTMON_COVERAGE=$([math]::Round($presentMonCoverageFraction, 3)) ARTIFACTS=$Pub"
+Write-Output "RESULT=$resultVerb FIXTURE_REHEARSAL=$FixtureRehearsal SOURCE=$SourceCommit CLIP=$ClipId ROWS=$($rows.Count) GPU_FRAMES=$gpuFramesTotal CPU_FRAMES=$($gpuSummary.cpuFrames) PRESENTMON_SAMPLES=$($pmRows.Count) PRESENTMON_STATUS=$presentMonStatus PRESENTMON_COVERAGE=$([math]::Round($presentMonCoverageFraction, 3)) NEW_FRAME_SWAPS=$($appSwapTelemetry.newFrameSwapCount) DISPLAY_ASLEEP_OVERRIDDEN=$displayAsleepOverridden ARTIFACTS=$Pub"
 exit 0
 } finally {
     if ($OwnerClipDir) {
@@ -2203,6 +2320,8 @@ $text = Expand-AttrCudaTemplate -Template $template -Tokens ([ordered]@{
     CONTACT_SHEET_FRAME_COUNT = $contactSheetFrameCountLiteral
     CONTACT_SHEET_COMPOSER_PY_BASE64 = $contactSheetComposerPyBase64
     CONTACT_SHEET_COMPOSER_SHA256 = $contactSheetComposerSha256ForTemplate
+    TELEMETRY_ARM = $TelemetryArm
+    DISABLE_PAINT_PER_SUBMIT = $disablePaintPerSubmitLiteral
     EMBEDDED_FUNCTIONS = $embeddedFunctions
 })
 

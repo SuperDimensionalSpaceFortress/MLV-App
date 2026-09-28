@@ -212,6 +212,19 @@ static bool playbackSmokeTimelineTelemetryEnabled()
     return enabled;
 }
 
+// CUDA-PLAYBACK-PRESENT-CADENCE-1 round 2: counters-only mode, sibling to
+// GpuDisplayWindow.cpp's swapTelemetryPerEventLogEnabled(). MLVAPP_PLAYBACK_SMOKE_TELEMETRY
+// still drives every counter this session accumulates (m_playbackSmokePresentedFrames and
+// the render/queue/llrawproc sums) unconditionally -- only the once-per-frame
+// "playback_smoke.frame" qInfo() line is gated by this, so the one-shot session-end
+// summary lines emitted by finishPlaybackSmokeTelemetry() are unaffected. Opt-out (default
+// unset = legacy fully-verbose behavior), matching environmentFlagEnabled()'s existing
+// MLVAPP_F3_DISABLE_CUT_RANGE_REPAIR convention.
+static bool playbackSmokeFrameLogDisabledByEnvironment()
+{
+    return environmentFlagEnabled( "MLVAPP_PLAYBACK_SMOKE_TELEMETRY_DISABLE_FRAME_LOG" );
+}
+
 static bool dualIsoWarmupInstrumentationEnabled()
 {
     static const bool enabled =
@@ -6616,8 +6629,18 @@ void MainWindow::drawFrame( bool updateTimecodeLabel )
         llrpGpuPlaybackReconBackendInfo_t backendInfo;
         memset( &backendInfo, 0, sizeof( backendInfo ) );
         llrpGpuPlaybackReconGetBackendInfo( &backendInfo );
-        qInfo().noquote()
-            << QStringLiteral(
+        // CUDA-PLAYBACK-PRESENT-CADENCE-1 round 2: this line was previously emitted
+        // unconditionally every presented frame (hub forensics: ~1 line/frame of
+        // synchronous GUI-thread log I/O, one of several contributors to the ~18
+        // lines/frame budget under the diag env var). Its fields describe backend/
+        // widget/config eligibility, which is stable for the whole duration of a
+        // playback session in the overwhelming common case -- deduped against the
+        // last emitted line (persists across sessions, so a run that never changes
+        // eligibility logs it exactly once) rather than dropped outright, so
+        // Get-AttrCudaLastEligibilityLine's "last occurrence in the log" parse still
+        // finds a correct, and correctly-updated-on-change, verdict.
+        const QString eligibilityLine =
+            QStringLiteral(
                    "gpu_playback_recon.eligibility "
                    "viewport_widget=%1 gl_window=%2 surface=%3 recon_env=%4 "
                    "texture_env=%5 preview_env=%6 preview_compatible=%7 "
@@ -6674,6 +6697,12 @@ void MainWindow::drawFrame( bool updateTimecodeLabel )
                    .arg( ui->dockWidgetEdit->width() )
                    .arg( ui->dockWidgetEdit->height() )
                    .arg( bool01( ui->actionShowEditArea->isChecked() ) );
+        static QString lastEligibilityLine;
+        if( eligibilityLine != lastEligibilityLine )
+        {
+            qInfo().noquote() << eligibilityLine;
+            lastEligibilityLine = eligibilityLine;
+        }
     }
     if( renderPolicy.gpuPlaybackReconTexturePresentationEnvironmentRequested
      && !requestContext.gpuPlaybackReconTexturePresentRequested )
@@ -23353,6 +23382,8 @@ void MainWindow::beginPlaybackSmokeTelemetry( void )
 
     m_playbackSmokeActive = true;
     m_playbackSmokeFrameTelemetry = playbackSmokeFrameTelemetryEnabled();
+    m_playbackSmokeFrameLogEnabled =
+        m_playbackSmokeFrameTelemetry && !playbackSmokeFrameLogDisabledByEnvironment();
     GpuDisplayWindow::resetSwapTelemetry( m_playbackSmokeSessionId );
     m_playbackSmokeForegroundLostCount = 0;
     m_playbackSmokeForegroundAtBegin =
@@ -24701,7 +24732,7 @@ void MainWindow::notePlaybackSmokePresentedFrame(
     m_playbackSmokeLastScaleRequest = requestContext.playbackScaleFactor;
     m_playbackSmokeLastScaleActive = readyFrame.playbackScaleFactorActive;
 
-    if( m_playbackSmokeFrameTelemetry )
+    if( m_playbackSmokeFrameLogEnabled )
     {
         qInfo().noquote()
             << QStringLiteral(
@@ -27012,7 +27043,10 @@ void MainWindow::finishPlaybackSmokeTelemetry( const char *reason )
                    "telemetry_enabled=%3 swaps=%4 swap_fps=%5 max_gap_ms=%6 "
                    "max_gap_before_serial=%7 max_gap_after_serial=%8 frames_presented=%9 "
                    "swaps_minus_frames_presented=%10 head_gap_ms=%11 tail_gap_ms=%12 "
-                   "first_swap_utc=%13 last_swap_utc=%14" )
+                   "first_swap_utc=%13 last_swap_utc=%14 superseded_before_paint=%15 "
+                   "last_superseded_serial=%16 last_superseded_by_serial=%17 "
+                   "new_frame_swaps=%18 new_frame_swap_fps=%19 new_frame_max_gap_ms=%20 "
+                   "new_frame_p95_gap_ms=%21" )
                    .arg( static_cast<qulonglong>( swapSnapshot.sessionId ) )
                    .arg( bool01( swapSnapshot.windowActive ) )
                    .arg( bool01( swapSnapshot.telemetryEnabled ) )
@@ -27027,7 +27061,19 @@ void MainWindow::finishPlaybackSmokeTelemetry( const char *reason )
                    .arg( swapSnapshot.summary.headGapMs, 0, 'f', 3 )
                    .arg( swapSnapshot.summary.tailGapMs, 0, 'f', 3 )
                    .arg( swapSnapshot.summary.firstSwapUtc )
-                   .arg( swapSnapshot.summary.lastSwapUtc );
+                   .arg( swapSnapshot.summary.lastSwapUtc )
+                   .arg( static_cast<qulonglong>( swapSnapshot.summary.supersededCount ) )
+                   .arg( static_cast<qulonglong>( swapSnapshot.summary.lastSupersededSerial ) )
+                   .arg( static_cast<qulonglong>( swapSnapshot.summary.lastSupersededBySerial ) )
+                   // CUDA-PLAYBACK-PRESENT-CADENCE-2 round 1: swaps that displayed
+                   // genuinely NEW content (see GpuWindowSwapTelemetryCounters::
+                   // newFrameSwapCount) -- the round-1 acceptance gate's own denominator,
+                   // reported here rather than derived from swaps=%4 alone, since %4
+                   // counts every real swap including a repaint of already-shown content.
+                   .arg( static_cast<qulonglong>( swapSnapshot.summary.newFrameSwapCount ) )
+                   .arg( swapSnapshot.summary.newFrameSwapFps, 0, 'f', 3 )
+                   .arg( swapSnapshot.summary.newFrameMaxGapMs, 0, 'f', 3 )
+                   .arg( swapSnapshot.summary.newFrameP95GapMs, 0, 'f', 3 );
     }
 
     // CUDA-PLAYBACK-CONTACT-SHEET-1 r1d (sol HARDENING): cleared LAST, after every summary
@@ -28701,7 +28747,7 @@ void MainWindow::finishPresentedFrame( uint64_t displayFrame,
                 }
             }
         }
-        if( m_playbackSmokeFrameTelemetry )
+        if( m_playbackSmokeFrameLogEnabled )
         {
             qInfo().noquote()
                 << QStringLiteral(

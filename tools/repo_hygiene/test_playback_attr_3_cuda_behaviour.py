@@ -998,6 +998,137 @@ class AttributionJobOptionalClipPathTests(_PwshCase):
 
 @requires_pwsh
 @requires_git
+class AttributionJobTelemetryArmTests(_PwshCase):
+    """CUDA-PLAYBACK-PRESENT-CADENCE-1 round 2: -TelemetryArm HEAVY|LIGHT must actually reach the
+    emitted job, not just exist as a branch in the generator's own template text. This class
+    exists because a first version of -TelemetryArm referenced $TelemetryArm inside the emitted
+    job's $envs-building if/else without ever substituting a __TELEMETRY_ARM__ token for it --
+    the emitted job's $TelemetryArm was therefore always $null, silently taking the else (HEAVY)
+    branch regardless of what was requested, discovered only by running a live LIGHT leg on
+    Bachelor and finding it produced HEAVY-sized logs. These tests run the REAL generator (not
+    read its source as text) so that class of defect cannot recur unnoticed."""
+
+    def setUp(self) -> None:
+        super().setUp()
+        self.repo = self.tmp / "repo"
+        self.shas = _make_fixture_repo(self.repo)
+        self.staging = self.tmp / "staging"
+        self.staging.mkdir()
+
+    def _generate(self, **overrides):
+        out_file = self.staging / "job.ps1"
+        args = {
+            "SourceCommit": self.shas[1],
+            "BuildManifestSha256": "a" * 64,
+            "ClipId": "tiny_dual_iso",
+            "FixtureSha256": "b" * 64,
+            "OutFile": str(out_file),
+            "RepoRoot": str(self.repo),
+        }
+        args.update(overrides)
+        parts = [f"-{key} '{value}'" for key, value in args.items() if value is not None]
+        script = self.tmp / "generate.ps1"
+        script.write_text(
+            "$ErrorActionPreference = 'Stop'\n"
+            f"& '{ATTRIBUTION_GENERATOR}' " + " ".join(parts) + "\n",
+            encoding="utf-8",
+        )
+        proc = _run_pwsh_file(script)
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        return out_file.read_text(encoding="utf-8")
+
+    def test_default_arm_is_heavy_and_substituted_not_left_undefined(self) -> None:
+        job_text = self._generate()
+        self.assertIn("$TelemetryArm = 'HEAVY'", job_text)
+        # The token must actually be gone -- a leftover __TELEMETRY_ARM__ means the substitution
+        # was never wired up and $TelemetryArm stayed the literal string '__TELEMETRY_ARM__'
+        # (still non-null, but never equal to 'LIGHT' either -- a quieter version of the same bug).
+        self.assertNotIn("__TELEMETRY_ARM__", job_text)
+
+    def test_light_arm_is_substituted_and_drops_the_heavy_only_env_vars(self) -> None:
+        job_text = self._generate(TelemetryArm="LIGHT")
+        self.assertIn("$TelemetryArm = 'LIGHT'", job_text)
+        self.assertIn("MLVAPP_PLAYBACK_SMOKE_TELEMETRY_DISABLE_FRAME_LOG=1", job_text)
+
+    def test_heavy_arm_keeps_the_per_frame_diagnostic_env_vars(self) -> None:
+        job_text = self._generate(TelemetryArm="HEAVY")
+        self.assertIn("$TelemetryArm = 'HEAVY'", job_text)
+        self.assertIn("MLVAPP_PLAYBACK_SMOKE_TIMELINE_TELEMETRY=1", job_text)
+        self.assertIn("MLVAPP_STAGE_TIMING=1", job_text)
+        self.assertIn("MLVAPP_PERF_FIELD_LOG=1", job_text)
+
+
+@requires_pwsh
+@requires_git
+class AttributionJobDisablePaintPerSubmitTests(_PwshCase):
+    """CUDA-PLAYBACK-PRESENT-CADENCE-2: -DisablePaintPerSubmit must actually reach the emitted
+    job as a real boolean, not a leftover __DISABLE_PAINT_PER_SUBMIT__ token -- the same class of
+    wiring bug AttributionJobTelemetryArmTests exists to catch for -TelemetryArm."""
+
+    def setUp(self) -> None:
+        super().setUp()
+        self.repo = self.tmp / "repo"
+        self.shas = _make_fixture_repo(self.repo)
+        self.staging = self.tmp / "staging"
+        self.staging.mkdir()
+
+    def _generate(self, extra_args=()):
+        out_file = self.staging / "job.ps1"
+        parts = [
+            f"-SourceCommit '{self.shas[1]}'",
+            f"-BuildManifestSha256 '{'a' * 64}'",
+            "-ClipId 'tiny_dual_iso'",
+            f"-FixtureSha256 '{'b' * 64}'",
+            f"-OutFile '{out_file}'",
+            f"-RepoRoot '{self.repo}'",
+        ] + list(extra_args)
+        script = self.tmp / "generate.ps1"
+        script.write_text(
+            "$ErrorActionPreference = 'Stop'\n"
+            f"& '{ATTRIBUTION_GENERATOR}' " + " ".join(parts) + "\n",
+            encoding="utf-8",
+        )
+        proc = _run_pwsh_file(script)
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        return out_file.read_text(encoding="utf-8")
+
+    def test_default_is_false_and_substituted_not_left_undefined(self) -> None:
+        job_text = self._generate()
+        self.assertIn("$DisablePaintPerSubmit = $false", job_text)
+        self.assertNotIn("__DISABLE_PAINT_PER_SUBMIT__", job_text)
+
+    def test_switch_sets_true(self) -> None:
+        job_text = self._generate(extra_args=["-DisablePaintPerSubmit"])
+        self.assertIn("$DisablePaintPerSubmit = $true", job_text)
+
+    def test_opt_out_env_var_is_wired_into_the_envs_list(self) -> None:
+        job_text = self._generate()
+        self.assertIn("MLVAPP_GPU_WINDOW_PAINT_PER_SUBMIT=0", job_text)
+
+    def test_an_invalid_arm_is_refused_at_parameter_binding(self) -> None:
+        proc_script = self.tmp / "generate-invalid.ps1"
+        proc_script.write_text(
+            "$ErrorActionPreference = 'Stop'\n"
+            f"& '{ATTRIBUTION_GENERATOR}' -SourceCommit '{self.shas[1]}' "
+            f"-BuildManifestSha256 '{'a' * 64}' -ClipId 'tiny_dual_iso' "
+            f"-FixtureSha256 '{'b' * 64}' -TelemetryArm 'MEDIUM' "
+            f"-OutFile '{self.staging / 'job.ps1'}' -RepoRoot '{self.repo}'\n",
+            encoding="utf-8",
+        )
+        proc = _run_pwsh_file(proc_script)
+        self.assertNotEqual(proc.returncode, 0)
+        self.assertFalse((self.staging / "job.ps1").exists())
+
+    # A "dot-source just the $envs-building block and evaluate it" test was tried here and
+    # dropped: that block sits inside the emitted job's single enclosing try/finally, so slicing
+    # it out by text markers breaks brace balance in a ParserError before the intended assertion
+    # ever runs. The substring checks above already exercise the real generator end to end (not
+    # a copy of its logic) and pin both the substitution and the per-arm env-var membership this
+    # bug needed; that is the regression coverage for this defect class.
+
+
+@requires_pwsh
+@requires_git
 class GeneratorBakeTokenInjectionTests(_PwshCase):
     """ATTR3-FOOTAGE-BIND-1 PR-B round 2 (astra BLOCKER): every __TOKEN__ this generator bakes
     into the emitted job's single-quoted template literals must be either strictly validated to
@@ -6523,6 +6654,101 @@ class KeepAliveHungProbeDoesNotBlockStopTests(unittest.TestCase):
         # Bounded by Stop's OWN -TimeoutMilliseconds (300ms), not by the probe's much longer 5000ms
         # bound or the probe's 999999ms sleep. A generous upper margin tolerates a slow CI host.
         self.assertLess(result["stopElapsedMs"], 5000)
+
+
+# --------------------------------------------------------------------------------------------
+# (z) foreground verification (CUDA-PLAYBACK-PRESENT-CADENCE-2 round 1c, sol BLOCKER)
+# --------------------------------------------------------------------------------------------
+
+
+def _foreground_line(
+    *,
+    telemetry_enabled: int = 1,
+    fullscreen_at_begin: int = 1,
+    fullscreen_at_gate: int = 1,
+    foreground_at_begin: int = 1,
+    foreground_at_gate: int = 1,
+    foreground_lost_count: int = 0,
+    fullscreen_lost_count: int = 0,
+) -> str:
+    """Builds a synthetic playback_smoke.foreground log line in the exact field order/shape
+    MainWindow.cpp's finishPlaybackSmokeTelemetry emits it (platform/qt/MainWindow.cpp
+    ~27010-27028); viewport_at_begin/_at_gate are along for the ride (unused by the verifier)
+    but included so a test line is indistinguishable from a real one."""
+    return (
+        "playback_smoke.foreground session=1 "
+        f"telemetry_enabled={telemetry_enabled} "
+        f"foreground_at_begin={foreground_at_begin} foreground_at_gate={foreground_at_gate} "
+        f"foreground_lost_count={foreground_lost_count} "
+        f"fullscreen_at_begin={fullscreen_at_begin} fullscreen_at_gate={fullscreen_at_gate} "
+        "viewport_at_begin=1920x1080 viewport_at_gate=1920x1080 "
+        f"fullscreen_lost_count={fullscreen_lost_count}"
+    )
+
+
+@requires_pwsh
+class ForegroundVerificationTests(_PwshCase):
+    """Get-AttrCudaForegroundVerification (AttrCudaArtifacts.psm1 ~4072): the DISPLAY_ASLEEP
+    override's app-side gate against a backgrounded-but-fullscreen run reporting
+    new_frame_swaps > 0."""
+
+    def _verify(self, log_text: str) -> dict:
+        script = self.tmp / "verify.ps1"
+        script.write_text(
+            "$ErrorActionPreference = 'Stop'\n"
+            f"Import-Module '{MODULE}' -Force\n"
+            f"$log = @'\n{log_text}\n'@\n"
+            "$r = Get-AttrCudaForegroundVerification -LogText $log\n"
+            f"[IO.File]::WriteAllText('{(self.tmp / 'r.json')}', ($r | ConvertTo-Json -Depth 5))\n",
+            encoding="utf-8",
+        )
+        proc = _run_pwsh_file(script)
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        return json.loads((self.tmp / "r.json").read_text(encoding="utf-8"))
+
+    def test_sol_repro_backgrounded_fullscreen_run_is_not_verified(self) -> None:
+        # sol's exact repro (r1 review, PR #185): fullscreen at both begin and gate, zero
+        # losses, but the window was never in the foreground at either sample. Pre-fix: the
+        # verifier never looked at foreground_at_begin/_at_gate at all, only the *_lost_count
+        # deltas -- a run that starts AND ends backgrounded never "loses" foreground in
+        # between, so this read verified=true and could feed the DISPLAY_ASLEEP override.
+        result = self._verify(_foreground_line(
+            fullscreen_at_begin=1, fullscreen_at_gate=1,
+            foreground_at_begin=0, foreground_at_gate=0,
+            foreground_lost_count=0, fullscreen_lost_count=0,
+        ))
+        self.assertIs(result["verified"], False)
+
+    def test_all_good_line_is_verified(self) -> None:
+        # The genuine positive: fullscreen and foreground at both begin and gate, zero losses.
+        result = self._verify(_foreground_line(
+            fullscreen_at_begin=1, fullscreen_at_gate=1,
+            foreground_at_begin=1, foreground_at_gate=1,
+            foreground_lost_count=0, fullscreen_lost_count=0,
+        ))
+        self.assertIs(result["verified"], True)
+        self.assertIsNone(result["reason"])
+
+    def test_foreground_lost_at_begin_only_is_not_verified(self) -> None:
+        # Started backgrounded, ended in the foreground: foreground_at_begin=0 alone must
+        # still fail closed even though foreground_at_gate=1 and the lost-count deltas read 0.
+        result = self._verify(_foreground_line(
+            fullscreen_at_begin=1, fullscreen_at_gate=1,
+            foreground_at_begin=0, foreground_at_gate=1,
+            foreground_lost_count=0, fullscreen_lost_count=0,
+        ))
+        self.assertIs(result["verified"], False)
+
+    def test_missing_foreground_fields_is_unusable_not_verified(self) -> None:
+        # A line from before this field existed (or any other malformed/partial line): missing
+        # required fields must read as unusable, never as passing evidence.
+        result = self._verify(
+            "playback_smoke.foreground session=1 telemetry_enabled=1 "
+            "fullscreen_at_begin=1 fullscreen_at_gate=1 "
+            "foreground_lost_count=0 fullscreen_lost_count=0"
+        )
+        self.assertIs(result["verified"], False)
+        self.assertIn("missing/unparseable", result["reason"])
 
 
 if __name__ == "__main__":

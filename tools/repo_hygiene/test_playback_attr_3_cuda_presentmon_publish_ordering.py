@@ -93,7 +93,10 @@ class TemplateOrderingTests(unittest.TestCase):
         # only branches on $displayReport.status dynamically, so it is the branch and the
         # exit-code mapping that are checked here, not a re-spelling of the module's own string
         # literals.
-        self.assertIn("if ($displayReport.status -ne 'OK')", self.template)
+        # CUDA-PLAYBACK-PRESENT-CADENCE-2 round 1: the gate now also skips this branch on an
+        # overridden DISPLAY_ASLEEP (see $displayAsleepOverridden and its own header comment) --
+        # still routes on $displayReport.status, just no longer unconditionally.
+        self.assertIn("if ($displayReport.status -ne 'OK' -and -not $displayAsleepOverridden)", self.template)
         self.assertIn("{ 24 } else { 23 }", self.template)
         self.assertIn("if ($displayReport.status -eq 'DISPLAY_ASLEEP')", self.template)
 
@@ -328,7 +331,7 @@ class TemplateOrderingTests(unittest.TestCase):
         # region timing stats have ALL already run and succeeded by the time displayReport.status
         # is checked -- discarding them here (the pre-fix behaviour) threw away a leg whose own
         # app-side measurement was fine, just because PresentMon itself could not verify display.
-        report_check = self.template.index("if ($displayReport.status -ne 'OK') {")
+        report_check = self.template.index("if ($displayReport.status -ne 'OK' -and -not $displayAsleepOverridden) {")
         typed_exit = self.template.index("exit $displayExitCode", report_check)
         for field in ("diagnostics=$diagnostics", "gpuSummary=$gpuSummary", "gpuFramesTotal=$gpuFramesTotal",
                       "frameRows=$rows.Count", "regions=$stats"):

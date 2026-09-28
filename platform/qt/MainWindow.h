@@ -1019,6 +1019,7 @@ private:
     double m_lastPlaybackAudioSyncTime = 0.0;
     bool m_playbackSmokeActive = false;
     bool m_playbackSmokeFrameTelemetry = false;
+    bool m_playbackSmokeFrameLogEnabled = false;
     bool m_playbackSmokeTimelineTelemetry = false;
     uint64_t m_playbackSmokeSessionId = 0;
     // Display-wake state (CUDA-PERF-DISPLAY-WAKE-1/2): m_playbackDisplayRequiredActive is true
