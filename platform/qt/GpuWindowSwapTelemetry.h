@@ -91,7 +91,12 @@ struct GpuWindowSwapTelemetrySummary
     // See GpuWindowSwapTelemetryCounters::newFrameSwapCount. newFrameSwapFps mirrors
     // swapFps's own zero-guard (fewer than 2 new-frame swaps, or a zero-width span,
     // reports 0 rather than dividing by zero). newFrameP95GapMs is 0 whenever fewer than
-    // two new-frame swaps were observed -- there is no gap to measure.
+    // two new-frame swaps were observed -- there is no gap to measure. round 1c: when
+    // summarize() is given a real gate timestamp, both newFrameMaxGapMs and
+    // newFrameSwapFps also account for the interval from the LAST new-frame swap through
+    // that gate, so a display that stops showing new content cannot report an unchanged,
+    // passing cadence just because no further new-frame swap ever arrived to end the
+    // stall.
     quint64 newFrameSwapCount = 0;
     double newFrameSwapFps = 0.0;
     double newFrameMaxGapMs = 0.0;
@@ -159,11 +164,44 @@ public:
         summary.newFrameMaxGapMs = counters.newFrameMaxGapMs;
         summary.newFrameMaxGapBeforePresentedSerial = counters.newFrameMaxGapBeforePresentedSerial;
         summary.newFrameMaxGapAfterPresentedSerial = counters.newFrameMaxGapAfterPresentedSerial;
-        const double newFrameSpanMs = counters.newFrameLastSwapQpcMs - counters.newFrameFirstSwapQpcMs;
+        double newFrameSpanMs = counters.newFrameLastSwapQpcMs - counters.newFrameFirstSwapQpcMs;
+
+        // round 1c (sol BLOCKER): the interior gap/fps above only ever look BETWEEN
+        // observed new-frame swaps, so a display that shows its last new content and then
+        // simply stops -- no more new-frame swaps at all, interior math untouched --
+        // reported an unchanged, passing cadence. gateQpcMs > 0.0 marks a caller that
+        // actually has a session gate to compare against (swapTelemetrySnapshot() always
+        // samples a real monotonic clock there); the interior-only unit tests above that
+        // omit it (default 0.0) keep their original count-1/interior-span numbers.
+        const bool haveGate = gateQpcMs > 0.0 && counters.newFrameSwapCount > 0;
+        if ( haveGate )
+        {
+            const double tailGapMs = qMax( 0.0, gateQpcMs - counters.newFrameLastSwapQpcMs );
+            if ( tailGapMs > summary.newFrameMaxGapMs )
+            {
+                summary.newFrameMaxGapMs = tailGapMs;
+                summary.newFrameMaxGapBeforePresentedSerial = counters.lastCountedNewFramePresentedSerial;
+                // No new frame ever arrived to close a stall that runs to the gate, so
+                // there is no "after" serial to name; 0 is never a valid presented serial
+                // (they start at 1), so leave it at that default rather than inventing one.
+                summary.newFrameMaxGapAfterPresentedSerial = 0;
+            }
+            // rate = new frames / (gate - first new frame): the denominator is the whole
+            // window the display was supposed to be showing new content in, not just the
+            // span between the observed swaps, so the numerator is the full swap count
+            // (not count - 1) -- a tail stall shrinks this rate even though it adds no
+            // interior interval to divide by.
+            newFrameSpanMs = gateQpcMs - counters.newFrameFirstSwapQpcMs;
+        }
+
         summary.newFrameSwapFps =
-            ( counters.newFrameSwapCount > 1 && newFrameSpanMs > 0.0 )
-                ? ( static_cast<double>( counters.newFrameSwapCount - 1 ) * 1000.0 ) / newFrameSpanMs
-                : 0.0;
+            haveGate
+                ? ( newFrameSpanMs > 0.0
+                        ? ( static_cast<double>( counters.newFrameSwapCount ) * 1000.0 ) / newFrameSpanMs
+                        : 0.0 )
+                : ( ( counters.newFrameSwapCount > 1 && newFrameSpanMs > 0.0 )
+                        ? ( static_cast<double>( counters.newFrameSwapCount - 1 ) * 1000.0 ) / newFrameSpanMs
+                        : 0.0 );
         if ( !counters.newFrameGapSamplesMs.empty() )
         {
             // Nearest-rank p95: sort ascending, take the ceil(0.95 * N)-th sample

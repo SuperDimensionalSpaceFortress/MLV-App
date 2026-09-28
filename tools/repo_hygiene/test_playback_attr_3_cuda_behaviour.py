@@ -6656,5 +6656,100 @@ class KeepAliveHungProbeDoesNotBlockStopTests(unittest.TestCase):
         self.assertLess(result["stopElapsedMs"], 5000)
 
 
+# --------------------------------------------------------------------------------------------
+# (z) foreground verification (CUDA-PLAYBACK-PRESENT-CADENCE-2 round 1c, sol BLOCKER)
+# --------------------------------------------------------------------------------------------
+
+
+def _foreground_line(
+    *,
+    telemetry_enabled: int = 1,
+    fullscreen_at_begin: int = 1,
+    fullscreen_at_gate: int = 1,
+    foreground_at_begin: int = 1,
+    foreground_at_gate: int = 1,
+    foreground_lost_count: int = 0,
+    fullscreen_lost_count: int = 0,
+) -> str:
+    """Builds a synthetic playback_smoke.foreground log line in the exact field order/shape
+    MainWindow.cpp's finishPlaybackSmokeTelemetry emits it (platform/qt/MainWindow.cpp
+    ~27010-27028); viewport_at_begin/_at_gate are along for the ride (unused by the verifier)
+    but included so a test line is indistinguishable from a real one."""
+    return (
+        "playback_smoke.foreground session=1 "
+        f"telemetry_enabled={telemetry_enabled} "
+        f"foreground_at_begin={foreground_at_begin} foreground_at_gate={foreground_at_gate} "
+        f"foreground_lost_count={foreground_lost_count} "
+        f"fullscreen_at_begin={fullscreen_at_begin} fullscreen_at_gate={fullscreen_at_gate} "
+        "viewport_at_begin=1920x1080 viewport_at_gate=1920x1080 "
+        f"fullscreen_lost_count={fullscreen_lost_count}"
+    )
+
+
+@requires_pwsh
+class ForegroundVerificationTests(_PwshCase):
+    """Get-AttrCudaForegroundVerification (AttrCudaArtifacts.psm1 ~4072): the DISPLAY_ASLEEP
+    override's app-side gate against a backgrounded-but-fullscreen run reporting
+    new_frame_swaps > 0."""
+
+    def _verify(self, log_text: str) -> dict:
+        script = self.tmp / "verify.ps1"
+        script.write_text(
+            "$ErrorActionPreference = 'Stop'\n"
+            f"Import-Module '{MODULE}' -Force\n"
+            f"$log = @'\n{log_text}\n'@\n"
+            "$r = Get-AttrCudaForegroundVerification -LogText $log\n"
+            f"[IO.File]::WriteAllText('{(self.tmp / 'r.json')}', ($r | ConvertTo-Json -Depth 5))\n",
+            encoding="utf-8",
+        )
+        proc = _run_pwsh_file(script)
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        return json.loads((self.tmp / "r.json").read_text(encoding="utf-8"))
+
+    def test_sol_repro_backgrounded_fullscreen_run_is_not_verified(self) -> None:
+        # sol's exact repro (r1 review, PR #185): fullscreen at both begin and gate, zero
+        # losses, but the window was never in the foreground at either sample. Pre-fix: the
+        # verifier never looked at foreground_at_begin/_at_gate at all, only the *_lost_count
+        # deltas -- a run that starts AND ends backgrounded never "loses" foreground in
+        # between, so this read verified=true and could feed the DISPLAY_ASLEEP override.
+        result = self._verify(_foreground_line(
+            fullscreen_at_begin=1, fullscreen_at_gate=1,
+            foreground_at_begin=0, foreground_at_gate=0,
+            foreground_lost_count=0, fullscreen_lost_count=0,
+        ))
+        self.assertIs(result["verified"], False)
+
+    def test_all_good_line_is_verified(self) -> None:
+        # The genuine positive: fullscreen and foreground at both begin and gate, zero losses.
+        result = self._verify(_foreground_line(
+            fullscreen_at_begin=1, fullscreen_at_gate=1,
+            foreground_at_begin=1, foreground_at_gate=1,
+            foreground_lost_count=0, fullscreen_lost_count=0,
+        ))
+        self.assertIs(result["verified"], True)
+        self.assertIsNone(result["reason"])
+
+    def test_foreground_lost_at_begin_only_is_not_verified(self) -> None:
+        # Started backgrounded, ended in the foreground: foreground_at_begin=0 alone must
+        # still fail closed even though foreground_at_gate=1 and the lost-count deltas read 0.
+        result = self._verify(_foreground_line(
+            fullscreen_at_begin=1, fullscreen_at_gate=1,
+            foreground_at_begin=0, foreground_at_gate=1,
+            foreground_lost_count=0, fullscreen_lost_count=0,
+        ))
+        self.assertIs(result["verified"], False)
+
+    def test_missing_foreground_fields_is_unusable_not_verified(self) -> None:
+        # A line from before this field existed (or any other malformed/partial line): missing
+        # required fields must read as unusable, never as passing evidence.
+        result = self._verify(
+            "playback_smoke.foreground session=1 telemetry_enabled=1 "
+            "fullscreen_at_begin=1 fullscreen_at_gate=1 "
+            "foreground_lost_count=0 fullscreen_lost_count=0"
+        )
+        self.assertIs(result["verified"], False)
+        self.assertIn("missing/unparseable", result["reason"])
+
+
 if __name__ == "__main__":
     unittest.main()

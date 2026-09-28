@@ -4080,11 +4080,15 @@ function Get-AttrCudaForegroundVerification {
     -- a leg that lost fullscreen or foreground mid-run could still swap frames while genuinely
     not being the on-screen content a viewer would see. Reads MainWindow.cpp's
     playback_smoke.foreground line (finishPlaybackSmokeTelemetry): "verified" requires telemetry
-    to have been enabled AND fullscreen at BOTH begin and gate AND zero fullscreen losses AND zero
-    foreground losses in between -- the same event-driven counters #171/CUDA-PERF-PLAYBACK-
-    FOREGROUND-1 already accumulate, reused here rather than re-derived. Returns
-    verified=$false (never $true) when the line is absent/unusable -- absence is never treated
-    as passing evidence.
+    to have been enabled AND fullscreen at BOTH begin and gate AND foreground at BOTH begin and
+    gate AND zero fullscreen losses AND zero foreground losses in between -- the same
+    event-driven counters #171/CUDA-PERF-PLAYBACK-FOREGROUND-1 already accumulate, reused here
+    rather than re-derived. round 1c (sol blocker): fullscreen_at_begin/_at_gate alone let a
+    backgrounded-but-fullscreen run (foreground_at_begin=0, foreground_at_gate=0) read as
+    verified, since only the *_lost_count deltas were checked and a run that starts and ends
+    backgrounded never "loses" foreground in between; foreground_at_begin/_at_gate are now
+    required fields too, so a background run fails closed. Returns verified=$false (never
+    $true) when the line is absent/unusable -- absence is never treated as passing evidence.
     #>
     [CmdletBinding()]
     param(
@@ -4112,6 +4116,8 @@ function Get-AttrCudaForegroundVerification {
         $last.ContainsKey('telemetry_enabled') -and $last['telemetry_enabled'] -eq '1' -and
         $last.ContainsKey('fullscreen_at_begin') -and $last['fullscreen_at_begin'] -eq '1' -and
         $last.ContainsKey('fullscreen_at_gate') -and $last['fullscreen_at_gate'] -eq '1' -and
+        $last.ContainsKey('foreground_at_begin') -and $last['foreground_at_begin'] -eq '1' -and
+        $last.ContainsKey('foreground_at_gate') -and $last['foreground_at_gate'] -eq '1' -and
         $last.ContainsKey('foreground_lost_count') -and [int]::TryParse([string]$last['foreground_lost_count'], [ref]$foregroundLostCount) -and
         $last.ContainsKey('fullscreen_lost_count') -and [int]::TryParse([string]$last['fullscreen_lost_count'], [ref]$fullscreenLostCount)
     if (-not $usable) {

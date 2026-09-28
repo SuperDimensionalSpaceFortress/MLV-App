@@ -311,3 +311,72 @@ TEST(GpuWindowSwapTelemetryPolicy, NewFrameP95GapWithASingleSampleReturnsThatSam
 
     ASSERT_NEAR(33.3, summary.newFrameP95GapMs, 1e-9);
 }
+
+// round 1c (sol BLOCKER): a display that stops showing new content must not report a
+// passing new-frame cadence just because no further new-frame swap ever arrived to close
+// the interior-gap/fps math above. These pin sol's own repro numbers.
+
+TEST(GpuWindowSwapTelemetryPolicy, TailStallPastLastNewFrameWidensMaxGapAndDepressesRate)
+{
+    // sol's repro: 241 new frames at an even 40 ms cadence through t=9.6 s (240 intervals,
+    // so first=0, last=9600), then nothing until the smoke gate at t=20 s. Pre-fix, the
+    // interior max gap (40 ms) and an fps computed only over [first, last] (~24 fps) never
+    // saw the 10.4 s of dead air between the last new frame and the gate.
+    GpuWindowSwapTelemetryCounters counters;
+    counters.newFrameSwapCount = 241;
+    counters.newFrameFirstSwapQpcMs = 0.0;
+    counters.newFrameLastSwapQpcMs = 9600.0;
+    counters.newFrameMaxGapMs = 40.0;
+    counters.newFrameMaxGapBeforePresentedSerial = 240;
+    counters.newFrameMaxGapAfterPresentedSerial = 241;
+    counters.lastCountedNewFramePresentedSerial = 241;
+
+    const GpuWindowSwapTelemetrySummary summary =
+        GpuWindowSwapTelemetryPolicy::summarize(counters, /*sessionBeginQpcMs=*/0.0, /*gateQpcMs=*/20000.0);
+
+    ASSERT_NEAR(10400.0, summary.newFrameMaxGapMs, 1e-6);
+    ASSERT_EQ(static_cast<quint64>(241), summary.newFrameMaxGapBeforePresentedSerial);
+    ASSERT_EQ(static_cast<quint64>(0), summary.newFrameMaxGapAfterPresentedSerial);
+    ASSERT_NEAR(12.05, summary.newFrameSwapFps, 0.01);
+}
+
+TEST(GpuWindowSwapTelemetryPolicy, NoTailStallLeavesInteriorGapAndPreGateRateUnchanged)
+{
+    // Same even cadence, but the gate arrives right after the last new-frame swap (no
+    // dead air): the interior max gap must still win over the (near-zero) tail gap, and
+    // the gated rate formula (count / (gate - first)) must land close to the steady-state
+    // cadence rather than being depressed by a stall that never happened.
+    GpuWindowSwapTelemetryCounters counters;
+    counters.newFrameSwapCount = 241;
+    counters.newFrameFirstSwapQpcMs = 0.0;
+    counters.newFrameLastSwapQpcMs = 9600.0;
+    counters.newFrameMaxGapMs = 40.0;
+    counters.newFrameMaxGapBeforePresentedSerial = 240;
+    counters.newFrameMaxGapAfterPresentedSerial = 241;
+
+    const GpuWindowSwapTelemetrySummary summary =
+        GpuWindowSwapTelemetryPolicy::summarize(counters, /*sessionBeginQpcMs=*/0.0, /*gateQpcMs=*/9600.0);
+
+    ASSERT_NEAR(40.0, summary.newFrameMaxGapMs, 1e-9);
+    ASSERT_EQ(static_cast<quint64>(240), summary.newFrameMaxGapBeforePresentedSerial);
+    ASSERT_EQ(static_cast<quint64>(241), summary.newFrameMaxGapAfterPresentedSerial);
+    ASSERT_NEAR(25.1, summary.newFrameSwapFps, 0.01);
+}
+
+TEST(GpuWindowSwapTelemetryPolicy, UngatedSummarizeCallIsUnaffectedByTheTailStallFix)
+{
+    // A caller that never supplies a gate (gateQpcMs defaults to 0.0, as every pre-round-1c
+    // unit test above does) must keep the original interior-only count-1/span arithmetic --
+    // this is the regression guard for the "haveGate" branch itself.
+    GpuWindowSwapTelemetryCounters counters;
+    counters.newFrameSwapCount = 241;
+    counters.newFrameFirstSwapQpcMs = 0.0;
+    counters.newFrameLastSwapQpcMs = 9600.0;
+    counters.newFrameMaxGapMs = 40.0;
+
+    const GpuWindowSwapTelemetrySummary summary =
+        GpuWindowSwapTelemetryPolicy::summarize(counters);
+
+    ASSERT_NEAR(40.0, summary.newFrameMaxGapMs, 1e-9);
+    ASSERT_NEAR(25.0, summary.newFrameSwapFps, 0.01); // (241 - 1) * 1000 / 9600
+}
