@@ -1803,6 +1803,36 @@
         795,
         854
       ]
+    },
+    {
+      "path": "platform/qt/GpuWindowSwapTelemetry.h",
+      "anchor": "( counters . newFrameSwapCount > 1 && newFrameSpanMs > 0.0 )",
+      "class": "division_guard",
+      "clock": "qpc_stage_clock",
+      "justification": "Guards the new_frame_swap_fps = (newFrameSwapCount-1)*1000/newFrameSpanMs division (CUDA-PLAYBACK-PRESENT-CADENCE-2); with <=1 new-frame swap or a zero-width span the guard reports 0 rather than dividing by zero. Same role as the swapCount/spanMs guard above; decides a formatting fallback for an already-computed summary, never whether any stage ran.",
+      "lines": [
+        164
+      ]
+    },
+    {
+      "path": "tests/console/test_gpu_window_swap_telemetry.cpp",
+      "anchor": "ASSERT_NEAR ( 0.0 , summary . newFrameMaxGapMs , 1 e - 9 ) ;",
+      "class": "not_run_proof_structural",
+      "clock": "other",
+      "justification": "Pure-function unit test on a synthetic, test-constructed counters struct (no live clock): verifies summarize() reports a 0 new-frame max gap for a known input, mirroring the maxGapMs control; not a proof that any stage ran.",
+      "lines": [
+        241
+      ]
+    },
+    {
+      "path": "tests/console/test_gpu_window_swap_telemetry.cpp",
+      "anchor": "ASSERT_NEAR ( 0.0 , summary . newFrameP95GapMs , 1 e - 9 ) ;",
+      "class": "not_run_proof_structural",
+      "clock": "other",
+      "justification": "Same synthetic-input pure-function verification as the newFrameMaxGapMs control above, for the new-frame p95 gap field.",
+      "lines": [
+        242
+      ]
     }
   ]
 }
