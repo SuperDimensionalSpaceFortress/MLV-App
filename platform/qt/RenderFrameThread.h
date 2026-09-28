@@ -135,6 +135,11 @@ public:
         std::array<int, 4> isBright{{0, 0, 0, 0}};
         bool applyDither = false;
         uint64_t processingGeneration = 0;
+        /* Identity of the frame this recon state was prepared for, threaded
+         * through explicitly (see llrpGpuPlaybackReconState_t::frame_id) so
+         * the async-H2D preupload gate has a value it can trust regardless
+         * of which thread ends up presenting this frame. */
+        uint64_t frameId = 0;
         std::shared_ptr<const LutSnapshot> luts;
     };
 

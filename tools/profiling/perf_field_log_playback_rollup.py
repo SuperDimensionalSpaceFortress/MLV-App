@@ -29,6 +29,7 @@ ASYNC_H2D_KEYS = [
     "gpu_playback_recon_async_h2d_exact_match",
     "gpu_playback_recon_async_h2d_submitted_while_prior_run_active",
     "gpu_playback_recon_async_h2d_ready_before_run",
+    "gpu_playback_recon_async_h2d_frame_id_mismatch",
     "gpu_playback_recon_async_h2d_host_staging_ms",
     "gpu_playback_recon_async_h2d_upload_ms",
     "gpu_playback_recon_async_h2d_upload_wait_ms",

@@ -190,6 +190,7 @@ static bool buildGpuPlaybackReconStateForTexturePresent(
     destination->randn05 =
         source.applyDither ? source.luts->randn05.data() : nullptr;
     destination->apply_dither = source.applyDither ? 1 : 0;
+    destination->frame_id = source.frameId;
     return true;
 }
 
@@ -1074,6 +1075,7 @@ static QStringList gpuPlaybackReconAsyncH2dTelemetryKeys()
         << QStringLiteral(
                "gpu_playback_recon_async_h2d_submitted_while_prior_run_active" )
         << QStringLiteral("gpu_playback_recon_async_h2d_ready_before_run")
+        << QStringLiteral("gpu_playback_recon_async_h2d_frame_id_mismatch")
         << QStringLiteral("gpu_playback_recon_async_h2d_host_staging_ms")
         << QStringLiteral("gpu_playback_recon_async_h2d_upload_ms")
         << QStringLiteral("gpu_playback_recon_async_h2d_upload_wait_ms");
@@ -5077,6 +5079,37 @@ void MainWindow::presentPlaybackPreparedFrame( const PlaybackPrepResult &result 
             buildGpuPlaybackReconStateForTexturePresent(
                 task.gpuPlaybackReconTextureState,
                 &gpuReconState );
+        /* Authoritative frame identity for the async-H2D preupload gate in
+         * llrawproc_gpu_recon_run_backend(). task.displayFrame and the
+         * gpuPlaybackReconTextureState.frameId threaded from
+         * RenderFrameThread.cpp are EXPECTED to agree -- both derive from the
+         * same request slot's frame number (RenderFrameThread::FrameReady::
+         * frameNumber is assigned from RenderFrameRequest::frameNumber for
+         * this exact slot, and MainWindow's display_frame is read straight
+         * from readyFrame.frameNumber) -- but a silent overwrite here would
+         * mask a real threading bug by always trusting the later value. So
+         * this is a compare-and-reject, not a stamp: a mismatch means the
+         * prepared state does not provably belong to this frame, and the
+         * preupload must not be consumed for it (state.frame_id is left at
+         * UINT64_MAX, which llrpGpuPlaybackReconFrameToken() maps to token 0
+         * -- "not armed" -- so run_backend() falls back to the ordinary
+         * synchronous upload path instead of a stale or unrelated preupload;
+         * GpuDisplayViewport/Window's retained-device-buffer gate keys off
+         * the same sentinel, so a mismatch also stops the retained buffer
+         * itself from being presented, not only the backend call). The
+         * decision is the shared, unit-tested
+         * llrpGpuPlaybackReconFrameIdAfterCompareAndReject() (llrawproc.h),
+         * not reimplemented here, so this one function is what both the
+         * backend gate and the presentation gate act on. */
+        const bool gpuReconFrameIdMismatch =
+            gpuReconState.frame_id != static_cast<uint64_t>( task.displayFrame );
+        gpuReconState.frame_id =
+            llrpGpuPlaybackReconFrameIdAfterCompareAndReject(
+                gpuReconState.frame_id,
+                static_cast<uint64_t>( task.displayFrame ) );
+        readyFrame.stageTimingTelemetry.insert(
+            QStringLiteral("gpu_playback_recon_async_h2d_frame_id_mismatch"),
+            gpuReconFrameIdMismatch );
         const double texturePresentStart = mlv_stage_timing_now();
         QString texturePresentReason;
         llrpGpuPlaybackReconTiming_t texturePresentTiming;
@@ -5424,6 +5457,103 @@ void MainWindow::presentPlaybackPreparedFrame( const PlaybackPrepResult &result 
         readyFrame.stageTimingTelemetry.insert(
             QStringLiteral("gpu_playback_recon_texture_present_post_ms"),
             texturePresentTiming.post_ms );
+        /* gpu_playback_recon_async_h2d_* -- sourced from the explicit OUT
+         * param of the run_backend() call this function actually just made
+         * (texturePresentTiming.preupload), NOT from the old ambient
+         * MLV_THREAD_LOCAL that RenderFrameThread.cpp used to read on a
+         * different thread from the one that wrote it.
+         *
+         * This is NOT unconditionally the only place these fields are
+         * inserted: when this frame instead reuses an already-retained
+         * device buffer (retainedDeviceValid in GpuDisplayViewport /
+         * GpuDisplayWindow), no backend call runs here at all, so
+         * texturePresentTiming.preupload stays zeroed -- it must not stomp
+         * the real status that insertGpuPlaybackReconRunTelemetry()
+         * (RenderFrameThread.cpp) already recorded, same-thread, for the
+         * render-thread call that actually produced and consumed that
+         * retained buffer (llrpGpuPlaybackReconRunRetainedDeviceBayer16() in
+         * applyLLRawProcObjectWorker). So only overwrite when this call site
+         * itself ran the backend. */
+        readyFrame.stageTimingTelemetry.insert(
+            QStringLiteral("gpu_playback_recon_async_h2d_env_enabled"),
+            environmentFlagEnabled( "MLVAPP_GPU_PLAYBACK_RECON_ASYNC_H2D" ) );
+        if( texturePresentTiming.preupload.available != 0 )
+        {
+            readyFrame.stageTimingTelemetry.insert(
+                QStringLiteral("gpu_playback_recon_async_h2d_available"),
+                true );
+            readyFrame.stageTimingTelemetry.insert(
+                QStringLiteral("gpu_playback_recon_async_h2d_accepted"),
+                texturePresentTiming.preupload.accepted != 0 );
+            readyFrame.stageTimingTelemetry.insert(
+                QStringLiteral("gpu_playback_recon_async_h2d_used"),
+                texturePresentTiming.preupload.used != 0 );
+            readyFrame.stageTimingTelemetry.insert(
+                QStringLiteral("gpu_playback_recon_async_h2d_exact_match"),
+                texturePresentTiming.preupload.exact_match != 0 );
+            readyFrame.stageTimingTelemetry.insert(
+                QStringLiteral("gpu_playback_recon_async_h2d_submitted_while_prior_run_active"),
+                texturePresentTiming.preupload.submitted_while_prior_run_active != 0 );
+            readyFrame.stageTimingTelemetry.insert(
+                QStringLiteral("gpu_playback_recon_async_h2d_ready_before_run"),
+                texturePresentTiming.preupload.ready_before_run != 0 );
+            readyFrame.stageTimingTelemetry.insert(
+                QStringLiteral("gpu_playback_recon_async_h2d_host_staging_ms"),
+                texturePresentTiming.preupload.host_staging_ms );
+            readyFrame.stageTimingTelemetry.insert(
+                QStringLiteral("gpu_playback_recon_async_h2d_upload_ms"),
+                texturePresentTiming.preupload.upload_ms );
+            readyFrame.stageTimingTelemetry.insert(
+                QStringLiteral("gpu_playback_recon_async_h2d_upload_wait_ms"),
+                texturePresentTiming.preupload.upload_wait_ms );
+        }
+        else if( gpuReconFrameIdMismatch )
+        {
+            /* This call site did not run the backend (preupload.available
+             * == 0) *and* the frame-ID compare-and-reject above just
+             * rejected the retained buffer that RenderFrameThread.cpp's
+             * insertGpuPlaybackReconRunTelemetry() recorded telemetry for.
+             * That worker-thread telemetry belongs to the frame that
+             * populated the retained slot, not to task.displayFrame, so it
+             * must not be preserved into this frame's presented rollup --
+             * clear/replace every async_h2d_* field rather than only
+             * "available" (perf_field_log_playback_rollup.py reads used /
+             * exact_match / timings directly, independent of available). */
+            readyFrame.stageTimingTelemetry.insert(
+                QStringLiteral("gpu_playback_recon_async_h2d_available"),
+                false );
+            readyFrame.stageTimingTelemetry.insert(
+                QStringLiteral("gpu_playback_recon_async_h2d_accepted"),
+                false );
+            readyFrame.stageTimingTelemetry.insert(
+                QStringLiteral("gpu_playback_recon_async_h2d_used"),
+                false );
+            readyFrame.stageTimingTelemetry.insert(
+                QStringLiteral("gpu_playback_recon_async_h2d_exact_match"),
+                false );
+            readyFrame.stageTimingTelemetry.insert(
+                QStringLiteral("gpu_playback_recon_async_h2d_submitted_while_prior_run_active"),
+                false );
+            readyFrame.stageTimingTelemetry.insert(
+                QStringLiteral("gpu_playback_recon_async_h2d_ready_before_run"),
+                false );
+            readyFrame.stageTimingTelemetry.insert(
+                QStringLiteral("gpu_playback_recon_async_h2d_host_staging_ms"),
+                0.0 );
+            readyFrame.stageTimingTelemetry.insert(
+                QStringLiteral("gpu_playback_recon_async_h2d_upload_ms"),
+                0.0 );
+            readyFrame.stageTimingTelemetry.insert(
+                QStringLiteral("gpu_playback_recon_async_h2d_upload_wait_ms"),
+                0.0 );
+        }
+        else if( !readyFrame.stageTimingTelemetry.contains(
+                     QStringLiteral("gpu_playback_recon_async_h2d_available") ) )
+        {
+            readyFrame.stageTimingTelemetry.insert(
+                QStringLiteral("gpu_playback_recon_async_h2d_available"),
+                false );
+        }
         // Sample the heavy GL-vs-oracle parity check on every Nth presented
         // no-readback frame so the cadence/artifact detector measures real
         // (un-instrumented) playback while the sampled frames still prove

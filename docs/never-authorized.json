@@ -69,6 +69,13 @@
       "enforced_today": "prose-only",
       "enforced_after_0_1": "project hook (venue test on the registration files, the hook script and the consent verifier)",
       "also": "card-TOOL-HOOK-ENFORCE-1 NA-10 rows"
+    },
+    {
+      "id": "NA-11",
+      "act": "writing under tools/agent-bridge/** (Write, Edit, NotebookEdit, or a shell truncating/destructive write): Agent Bridge product SoT is layibabalola/agent-bridge; in-tree package feature/bugfix/refactor/CI churn is suspended (owner ruling 2026-09-09). Docs pointing at SoT live under agents/, outside this deny. FAIL-CLOSED: no MLV_ALLOW_* escape hatch for this row (MLV_ALLOW_STALE_TOOLS exists only for assert-script-currency and does not unlock NA-11).",
+      "enforced_today": "prose-only until this PR's hook lands",
+      "enforced_after_0_1": "project hook (path prefix tools/agent-bridge under any root)",
+      "also": "agents/agent-bridge-source-of-truth.md; doctrine candidate agent-bridge-sot-suspend-mlv-in-tree-20260909.md (CANDIDATE_ZERO_AUTHORITY until ADOPT)"
     }
   ]
 }

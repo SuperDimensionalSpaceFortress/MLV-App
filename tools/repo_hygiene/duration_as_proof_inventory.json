@@ -1589,6 +1589,56 @@
       ]
     },
     {
+      "path": "tests/pipeline/test_async_preupload_pipeline.cpp",
+      "anchor": "ASSERT_EQ ( 0.0 , timing . wall_ms ) ;",
+      "class": "not_run_proof_structural",
+      "clock": "other",
+      "justification": "Proves llrpGpuPlaybackReconCombineTiming() never touches wall_ms (it has no wall_ms input and does not set it); a structural scope check on the function under test, not evidence any stage ran.",
+      "lines": [
+        176
+      ]
+    },
+    {
+      "path": "tests/pipeline/test_async_preupload_pipeline.cpp",
+      "anchor": "ASSERT_EQ ( 0.0 , empty . total_ms ) ;",
+      "class": "not_run_proof_structural",
+      "clock": "other",
+      "justification": "Asserts a retained-device handoff (debayer_available=0, all-zero recon timing in) produces an all-zero combined timing; proves llrpGpuPlaybackReconCombineTiming() does not fabricate a nonzero duration from nothing, never that a stage ran.",
+      "lines": [
+        183
+      ]
+    },
+    {
+      "path": "tests/pipeline/test_async_preupload_pipeline.cpp",
+      "anchor": "ASSERT_EQ ( 0.0 , empty . preupload . host_staging_ms ) ;",
+      "class": "not_run_proof_structural",
+      "clock": "other",
+      "justification": "Part of the same all-zero retained-device-handoff assertion block as the total_ms row above: proves the zero-initialized preupload sub-struct passed in is copied through unmodified, not that any upload ran.",
+      "lines": [
+        190
+      ]
+    },
+    {
+      "path": "tests/pipeline/test_async_preupload_pipeline.cpp",
+      "anchor": "ASSERT_EQ ( 0.0 , empty . preupload . upload_ms ) ;",
+      "class": "not_run_proof_structural",
+      "clock": "other",
+      "justification": "Same all-zero retained-device-handoff assertion block: proves the zero-initialized preupload sub-struct passed in is copied through unmodified, not that any upload ran.",
+      "lines": [
+        191
+      ]
+    },
+    {
+      "path": "tests/pipeline/test_async_preupload_pipeline.cpp",
+      "anchor": "ASSERT_EQ ( 0.0 , empty . preupload . upload_wait_ms ) ;",
+      "class": "not_run_proof_structural",
+      "clock": "other",
+      "justification": "Same all-zero retained-device-handoff assertion block: proves the zero-initialized preupload sub-struct passed in is copied through unmodified, not that any upload ran.",
+      "lines": [
+        192
+      ]
+    },
+    {
       "path": "tests/pipeline/test_dual_iso_pipeline.cpp",
       "anchor": "elapsed_ms , elapsed_ms > 0.0 ? 1000.0 / elapsed_ms : 0.0 ) ;",
       "class": "display_or_format",
