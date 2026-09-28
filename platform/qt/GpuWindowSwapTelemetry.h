@@ -92,11 +92,11 @@ struct GpuWindowSwapTelemetrySummary
     // swapFps's own zero-guard (fewer than 2 new-frame swaps, or a zero-width span,
     // reports 0 rather than dividing by zero). newFrameP95GapMs is 0 whenever fewer than
     // two new-frame swaps were observed -- there is no gap to measure. round 1c: when
-    // summarize() is given a real gate timestamp, both newFrameMaxGapMs and
-    // newFrameSwapFps also account for the interval from the LAST new-frame swap through
-    // that gate, so a display that stops showing new content cannot report an unchanged,
-    // passing cadence just because no further new-frame swap ever arrived to end the
-    // stall.
+    // summarize() is given a real gate timestamp, newFrameMaxGapMs, newFrameSwapFps and
+    // (round 1e) newFrameP95GapMs also account for the interval from the LAST new-frame
+    // swap through that gate, so a display that stops showing new content cannot report an
+    // unchanged, passing cadence just because no further new-frame swap ever arrived to end
+    // the stall.
     quint64 newFrameSwapCount = 0;
     double newFrameSwapFps = 0.0;
     double newFrameMaxGapMs = 0.0;
@@ -174,12 +174,13 @@ public:
         // samples a real monotonic clock there); the interior-only unit tests above that
         // omit it (default 0.0) keep their original count-1/interior-span numbers.
         const bool haveGate = gateQpcMs > 0.0 && counters.newFrameSwapCount > 0;
+        double newFrameTailGapMs = 0.0;
         if ( haveGate )
         {
-            const double tailGapMs = qMax( 0.0, gateQpcMs - counters.newFrameLastSwapQpcMs );
-            if ( tailGapMs > summary.newFrameMaxGapMs )
+            newFrameTailGapMs = qMax( 0.0, gateQpcMs - counters.newFrameLastSwapQpcMs );
+            if ( newFrameTailGapMs > summary.newFrameMaxGapMs )
             {
-                summary.newFrameMaxGapMs = tailGapMs;
+                summary.newFrameMaxGapMs = newFrameTailGapMs;
                 summary.newFrameMaxGapBeforePresentedSerial = counters.lastCountedNewFramePresentedSerial;
                 // No new frame ever arrived to close a stall that runs to the gate, so
                 // there is no "after" serial to name; 0 is never a valid presented serial
@@ -202,19 +203,27 @@ public:
                 : ( ( counters.newFrameSwapCount > 1 && newFrameSpanMs > 0.0 )
                         ? ( static_cast<double>( counters.newFrameSwapCount - 1 ) * 1000.0 ) / newFrameSpanMs
                         : 0.0 );
-        if ( !counters.newFrameGapSamplesMs.empty() )
+        // round 1e (sol BLOCKER): p95 mirrors newFrameMaxGapMs/newFrameSwapFps above --
+        // include the last-new-frame -> gate interval as one more gap sample, or a display
+        // that freezes after a few frames reports a passing p95 forever (the interior
+        // samples never change once the stall begins).
+        std::vector<double> gapSamplesMs = counters.newFrameGapSamplesMs;
+        if ( haveGate )
+        {
+            gapSamplesMs.push_back( newFrameTailGapMs );
+        }
+        if ( !gapSamplesMs.empty() )
         {
             // Nearest-rank p95: sort ascending, take the ceil(0.95 * N)-th sample
             // (1-based), clamped so a 1-sample vector returns that sample rather than
             // reading past the end.
-            std::vector<double> sortedGaps = counters.newFrameGapSamplesMs;
-            std::sort( sortedGaps.begin(), sortedGaps.end() );
+            std::sort( gapSamplesMs.begin(), gapSamplesMs.end() );
             const std::size_t rank = static_cast<std::size_t>(
-                std::ceil( 0.95 * static_cast<double>( sortedGaps.size() ) ) );
+                std::ceil( 0.95 * static_cast<double>( gapSamplesMs.size() ) ) );
             const std::size_t index = std::min(
-                sortedGaps.size() - 1,
+                gapSamplesMs.size() - 1,
                 rank == 0 ? static_cast<std::size_t>( 0 ) : rank - 1 );
-            summary.newFrameP95GapMs = sortedGaps[index];
+            summary.newFrameP95GapMs = gapSamplesMs[index];
         }
         return summary;
     }

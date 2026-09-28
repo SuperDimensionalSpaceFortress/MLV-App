@@ -363,6 +363,32 @@ TEST(GpuWindowSwapTelemetryPolicy, NoTailStallLeavesInteriorGapAndPreGateRateUnc
     ASSERT_NEAR(25.1, summary.newFrameSwapFps, 0.01);
 }
 
+TEST(GpuWindowSwapTelemetryPolicy, NewFrameP95GapIncludesTailStallGapWhenGated)
+{
+    // round 1e (sol BLOCKER): newFrameP95GapMs only ever looked at the INTERIOR gap
+    // samples, so a display that shows a few new frames and then simply stops -- no
+    // further new-frame swap at all, interior samples untouched -- still reported a
+    // passing (tiny) p95 even though summary.newFrameMaxGapMs/newFrameSwapFps above
+    // already saw the stall via the gate. sol's repro: 5 new frames at an even 40 ms
+    // cadence (4 interior 40 ms gaps), then nothing until the smoke gate at t=20 s.
+    // Nearest-rank p95 over the resulting 5 samples ([40, 40, 40, 40, 19840] sorted) is
+    // index ceil(0.95*5)-1 = 4 (0-based) -- the 19,840 ms tail gap itself.
+    GpuWindowSwapTelemetryCounters counters;
+    counters.newFrameSwapCount = 5;
+    counters.newFrameFirstSwapQpcMs = 0.0;
+    counters.newFrameLastSwapQpcMs = 160.0;
+    counters.lastCountedNewFramePresentedSerial = 5;
+    counters.newFrameGapSamplesMs.push_back(40.0);
+    counters.newFrameGapSamplesMs.push_back(40.0);
+    counters.newFrameGapSamplesMs.push_back(40.0);
+    counters.newFrameGapSamplesMs.push_back(40.0);
+
+    const GpuWindowSwapTelemetrySummary summary =
+        GpuWindowSwapTelemetryPolicy::summarize(counters, /*sessionBeginQpcMs=*/0.0, /*gateQpcMs=*/20000.0);
+
+    ASSERT_NEAR(19840.0, summary.newFrameP95GapMs, 1e-6);
+}
+
 TEST(GpuWindowSwapTelemetryPolicy, UngatedSummarizeCallIsUnaffectedByTheTailStallFix)
 {
     // A caller that never supplies a gate (gateQpcMs defaults to 0.0, as every pre-round-1c
