@@ -5192,6 +5192,14 @@ static int mlv_render_scaled_rgb16_v2(mlvObject_t * video,
     g_mlv_phase4bv2_last_fallback_reason = "none";
 
     if (!video || !outputFrame || scaleFactor <= 1) return 0;
+    /* PROD-TELEMETRY-DURATION-AS-PROOF-3: thread-local only (see
+     * llrpResetLastPreDualIsoFixTelemetry) -- NOT video->llrawproc's shared
+     * playback_pre_dualiso_fix_ms/completed fields, which the concurrent
+     * processed8-prefetch worker thread also renders through this same
+     * per-frame entry point and writes on its own schedule; resetting the
+     * shared fields here raced that worker's own set-to-1 and intermittently
+     * clobbered it back to stale-looking zero. */
+    llrpResetLastPreDualIsoFixTelemetry();
     if (mlv_phase4bv2_disabled_via_env())
     {
         mlv_phase4bv2_log_rejection("MLVAPP_DISABLE_PHASE4BV2 set");
@@ -5709,7 +5717,9 @@ static int mlv_render_scaled_rgb16_from_raw(mlvObject_t * video,
     if (video->llrawproc)
     {
         video->llrawproc->playback_pre_dualiso_fix_ms = 0.0;
+        video->llrawproc->playback_pre_dualiso_fix_completed = 0;
     }
+    llrpResetLastPreDualIsoFixTelemetry();
 
     g_mlv_phase4bv2_path_taken = 0;
     g_mlv_phase4bv3_y_crop_rows = 0;
@@ -5837,11 +5847,6 @@ static int mlv_render_scaled_rgb16_from_raw(mlvObject_t * video,
             int x4FixesApplied = receiptCompatible;
             uint16_t * x4_fix_buffer = NULL;
             mlv_phase4bv2_receipt_flag_snapshot_t x4_receipt_flags_snapshot = { 0 };
-
-            if (video->llrawproc)
-            {
-                video->llrawproc->playback_pre_dualiso_fix_ms = 0.0;
-            }
 
             if (x4FullResFixesActive && !receiptCompatible)
             {
@@ -6843,6 +6848,7 @@ static void getMlvProcessedFrame16_with_scale(mlvObject_t * video,
     g_mlv_last_processed8_direct_path_active = 0;
     g_mlv_last_processed8_cache_hit = 0;
     g_mlv_last_processed8_cache_hit_scale_factor = 0;
+    llrpResetLastPreDualIsoFixTelemetry();
 
     /* Phase 4B: resolve effective scale (rejects scales that don't divide
      * the sensor evenly). The cache key uses the *effective* scale so a
@@ -7245,6 +7251,11 @@ static void getMlvProcessedFrame8_with_scale(mlvObject_t * video,
     g_mlv_last_processed8_cache_hit = 0;
     g_mlv_last_processed8_cache_hit_scale_factor = 0;
     g_mlv_last_processed8_prefetch_hit = 0;
+    /* PROD-TELEMETRY-DURATION-AS-PROOF-3b: a processed8 cache hit below returns
+     * without entering mlv_render_scaled_rgb16_v2 / _from_raw (the per-render
+     * resets), so clear the thread-local pre-dual-ISO telemetry here too --
+     * otherwise a cache-served frame reports the previous frame's "fix ran". */
+    llrpResetLastPreDualIsoFixTelemetry();
     /* Keep the playback-preview policy visible on the main render thread so
      * the direct8 gate sees the same state as the prefetch worker.
      * Round-4 item 0b: ONLY for playback callers (getMlvProcessedFrame8Scaled).
@@ -7747,6 +7758,13 @@ int getMlvProcessedFrame8ScaledFromReconnedRaw16(mlvObject_t * video,
     g_mlv_last_processed8_cache_hit = 0;
     g_mlv_last_processed8_cache_hit_scale_factor = 0;
     g_mlv_last_processed8_prefetch_hit = 0;
+    /* PROD-TELEMETRY-DURATION-AS-PROOF-3b round 3: this render (downsample +
+     * processing over an already-reconstructed raw) never enters llrawproc, so
+     * it must not leave the previous render's thread-local pre-dual-ISO
+     * "completed" flag readable as if this frame ran the fix. The reconstruction
+     * ran on the recon worker's own thread (its thread-locals, stop=0), so there
+     * is no same-thread "ran" to preserve. */
+    llrpResetLastPreDualIsoFixTelemetry();
 
     if (!video || !reconnedRawFrame || !outputFrame) return 0;
     processingSetPlaybackAggressivePreviewMode(mlvPlaybackAggressivePreviewMode());
