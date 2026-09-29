@@ -1129,6 +1129,67 @@ class AttributionJobDisablePaintPerSubmitTests(_PwshCase):
 
 @requires_pwsh
 @requires_git
+class AttributionJobCpuLoadGateTests(_PwshCase):
+    """PLAYBACK-HFR-CONFORM-DEFAULT-1: -CpuLoadGatePercent must reach the emitted job's venue gate
+    as a real number (default 20, so every existing caller's gate is unchanged), never as a
+    leftover __CPU_LOAD_GATE_PERCENT__ token or the old hard-coded 20.0 literal."""
+
+    def setUp(self) -> None:
+        super().setUp()
+        self.repo = self.tmp / "repo"
+        self.shas = _make_fixture_repo(self.repo)
+        self.staging = self.tmp / "staging"
+        self.staging.mkdir()
+
+    def _generate(self, extra_args=()):
+        out_file = self.staging / "job.ps1"
+        parts = [
+            f"-SourceCommit '{self.shas[1]}'",
+            f"-BuildManifestSha256 '{'a' * 64}'",
+            "-ClipId 'tiny_dual_iso'",
+            f"-FixtureSha256 '{'b' * 64}'",
+            f"-OutFile '{out_file}'",
+            f"-RepoRoot '{self.repo}'",
+        ] + list(extra_args)
+        script = self.tmp / "generate.ps1"
+        script.write_text(
+            "$ErrorActionPreference = 'Stop'\n"
+            f"& '{ATTRIBUTION_GENERATOR}' " + " ".join(parts) + "\n",
+            encoding="utf-8",
+        )
+        proc = _run_pwsh_file(script)
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        return out_file.read_text(encoding="utf-8")
+
+    def test_default_gate_is_twenty_and_substituted(self) -> None:
+        job_text = self._generate()
+        self.assertIn("$CpuLoadGatePercent = [double]20", job_text)
+        self.assertNotIn("__CPU_LOAD_GATE_PERCENT__", job_text)
+
+    def test_override_reaches_the_gate_and_the_recorded_threshold(self) -> None:
+        job_text = self._generate(extra_args=["-CpuLoadGatePercent 60"])
+        self.assertIn("$CpuLoadGatePercent = [double]60", job_text)
+        self.assertIn("if ($avgLoad -gt $CpuLoadGatePercent) {", job_text)
+        self.assertIn("cpuThresholdPercent=$CpuLoadGatePercent", job_text)
+        self.assertNotIn("$avgLoad -gt 20.0", job_text)
+
+    def test_a_gate_below_the_historical_twenty_is_refused(self) -> None:
+        script = self.tmp / "generate-low.ps1"
+        script.write_text(
+            "$ErrorActionPreference = 'Stop'\n"
+            f"& '{ATTRIBUTION_GENERATOR}' -SourceCommit '{self.shas[1]}' "
+            f"-BuildManifestSha256 '{'a' * 64}' -ClipId 'tiny_dual_iso' "
+            f"-FixtureSha256 '{'b' * 64}' -CpuLoadGatePercent 5 "
+            f"-OutFile '{self.staging / 'job.ps1'}' -RepoRoot '{self.repo}'\n",
+            encoding="utf-8",
+        )
+        proc = _run_pwsh_file(script)
+        self.assertNotEqual(proc.returncode, 0)
+        self.assertFalse((self.staging / "job.ps1").exists())
+
+
+@requires_pwsh
+@requires_git
 class GeneratorBakeTokenInjectionTests(_PwshCase):
     """ATTR3-FOOTAGE-BIND-1 PR-B round 2 (astra BLOCKER): every __TOKEN__ this generator bakes
     into the emitted job's single-quoted template literals must be either strictly validated to

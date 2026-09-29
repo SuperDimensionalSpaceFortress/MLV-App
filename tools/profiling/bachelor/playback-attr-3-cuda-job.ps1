@@ -254,7 +254,16 @@ param(
     # MLVAPP_GPU_WINDOW_PAINT_PER_SUBMIT=0 on the emitted leg, restoring the pre-fix
     # update()-driven paint path so a "before" leg can be measured from the exact same
     # package as the "after" leg -- never rebuilt, never a different -SourceCommit.
-    [switch]$DisablePaintPerSubmit
+    [switch]$DisablePaintPerSubmit,
+
+    # PLAYBACK-HFR-CONFORM-DEFAULT-1: the venue gate on Win32_Processor LoadPercentage (total
+    # mean of three samples 12 s apart). 20 stays the default, so every existing caller's
+    # emitted job is unchanged; the hub's 2026-09-28 quiet-window ruling for Bachelor (P-core
+    # threads 0-11 mean <= 35 % AND total <= 55 %, checked externally by the watcher) needs a
+    # leg to be submittable at a total above 20, so a caller may raise it here. The value used
+    # is recorded as cpuThresholdPercent beside cpuMean in a refused leg's summary.json.
+    [ValidateRange(20, 100)]
+    [int]$CpuLoadGatePercent = 20
 )
 
 $ErrorActionPreference = 'Stop'
@@ -673,6 +682,7 @@ if ($ContactSheet) {
     $contactSheetComposerSha256ForTemplate = ''
 }
 $disablePaintPerSubmitLiteral = if ($DisablePaintPerSubmit) { '$true' } else { '$false' }
+$cpuLoadGatePercentLiteral = [string][int]$CpuLoadGatePercent
 
 # --- job body template (placeholders are substituted below; the body itself never
 #     touches this generator's variables directly, so there is no accidental capture
@@ -704,6 +714,7 @@ $ContactSheetComposerPyBase64 = '__CONTACT_SHEET_COMPOSER_PY_BASE64__'
 $ContactSheetComposerSha256 = '__CONTACT_SHEET_COMPOSER_SHA256__'
 $TelemetryArm = '__TELEMETRY_ARM__'
 $DisablePaintPerSubmit = __DISABLE_PAINT_PER_SUBMIT__
+$CpuLoadGatePercent = [double]__CPU_LOAD_GATE_PERCENT__
 $Root = '__AGENT_ROOT__'
 $Cache = Join-Path $Root 'cache'
 $Stamp = Get-Date -Format 'yyyyMMdd-HHmmss'
@@ -1321,7 +1332,7 @@ for ($i = 0; $i -lt 3; $i++) {
     if ($i -lt 2) { Start-Sleep -Seconds 12 }
 }
 $avgLoad = Get-Mean $loads
-if ($avgLoad -gt 20.0) {
+if ($avgLoad -gt $CpuLoadGatePercent) {
     $venue = [ordered]@{
         schema='playback-attr-3-cuda-venue.v1'
         result='VENUE_NOT_QUIESCENT'
@@ -1329,7 +1340,7 @@ if ($avgLoad -gt 20.0) {
         displayWake=$displayWake
         cpuSamples=$loads
         cpuMean=$avgLoad
-        cpuThresholdPercent=20.0
+        cpuThresholdPercent=$CpuLoadGatePercent
         sourceCommit=$SourceCommit
         clipId=$ClipId
         executableSha256=$cacheExeSha
@@ -2322,6 +2333,7 @@ $text = Expand-AttrCudaTemplate -Template $template -Tokens ([ordered]@{
     CONTACT_SHEET_COMPOSER_SHA256 = $contactSheetComposerSha256ForTemplate
     TELEMETRY_ARM = $TelemetryArm
     DISABLE_PAINT_PER_SUBMIT = $disablePaintPerSubmitLiteral
+    CPU_LOAD_GATE_PERCENT = $cpuLoadGatePercentLiteral
     EMBEDDED_FUNCTIONS = $embeddedFunctions
 })
 
