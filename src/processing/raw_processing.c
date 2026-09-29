@@ -689,6 +689,21 @@ static inline void agx_store_float_triplet_fast(const double out_r,
 #define M_PI 3.14159265358979323846 /* pi */
 #endif
 
+/* Test seams (LOOK-ASSIST-GUI-FREEZE-1): call counts, not timings. Declared
+ * before processing.c because that file is #included below. */
+static unsigned long g_processing_full_init_count = 0;
+static unsigned long g_processing_final_matrix_print_count = 0;
+
+unsigned long processingDebugFullInitCount(void)
+{
+    return __atomic_load_n(&g_processing_full_init_count, __ATOMIC_RELAXED);
+}
+
+unsigned long processingDebugFinalMatrixPrintCount(void)
+{
+    return __atomic_load_n(&g_processing_final_matrix_print_count, __ATOMIC_RELAXED);
+}
+
 /* Because why compile a whole .o just for this? */
 #include "processing.c"
 /* Default image profiles */
@@ -1068,6 +1083,7 @@ static int ensure_sharpen_mask_scratch(processingObject_t * processing, size_t p
 
 processingObject_t * initProcessingObject()
 {
+    __atomic_fetch_add(&g_processing_full_init_count, 1, __ATOMIC_RELAXED);
     processingObject_t * processing = calloc( 1, sizeof(processingObject_t) );
 
     processing->exr_mode = 0;
