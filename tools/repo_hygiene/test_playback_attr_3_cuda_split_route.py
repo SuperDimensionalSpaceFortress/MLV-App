@@ -1221,7 +1221,9 @@ class FixtureRehearsalVisibilityTests(unittest.TestCase):
         for artifact in ("summary.json", "provenance.json", "evidence-manifest.json", "artifact-index.json"):
             with self.subTest(artifact=artifact):
                 index = self.template.index(artifact)
-                window = self.template[max(0, index - 3000):index]
+                # window 3000 -> 5000: the evidence manifest grew (PresentMon sufficiency, app-swap
+                # telemetry, cpuQuiescence, display block) between the fixtureRehearsal field and the write.
+                window = self.template[max(0, index - 5000):index]
                 self.assertIn("fixtureRehearsal", window, f"{artifact} is written without the flag nearby")
 
     def test_the_success_path_writes_a_summary_and_a_distinct_result_verb(self) -> None:
@@ -1230,7 +1232,13 @@ class FixtureRehearsalVisibilityTests(unittest.TestCase):
         # the success path writes summary.json too, not only the failure paths
         tail = self.template[self.template.index("$resultVerb ="):] if "$resultVerb =" in self.template else ""
         self.assertTrue(tail, "no success result verb found")
-        self.assertIn("summary.json", self.template[self.template.index("artifact-index.v1") - 2500:])
+        # CUDA-PLAYBACK-CONTACT-SHEET-1 r1b widened this window (2500 -> 6000), r1c widened it
+        # again (6000 -> 7000), r1d widened it again (7000 -> 10000): the contact-sheet compose
+        # step (probe Python/Pillow/numpy via a small probe script file rather than an inline
+        # -c program, run the composer with its host/GPU/scale identity and quoted arguments,
+        # publish or record a typed unavailable marker plus any timed-out-child warning) now
+        # sits between the two, and is legitimately that long.
+        self.assertIn("summary.json", self.template[self.template.index("artifact-index.v1") - 10000:])
 
 
 if __name__ == "__main__":

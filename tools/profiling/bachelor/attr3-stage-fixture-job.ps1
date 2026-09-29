@@ -39,12 +39,24 @@ param(
     [string]$OutDir,
 
     [ValidatePattern('^[A-Za-z]:\\[A-Za-z0-9 _.\\-]+$')]
-    [string]$AgentRoot = 'C:\mlvtmp\mlv-agent'
+    [string]$AgentRoot = 'C:\mlvtmp\mlv-agent',
+
+    # Test-only seam (no-op in production): fires immediately after admission verifies the
+    # fixture's committed bytes and before this generator's own re-read of those bytes for the
+    # sha256 it bakes -- the exact gap a swap would need to win the check/use race (sol, PR #140
+    # r2c), mirroring Invoke-UmRunDrop's -PostAdmissionHook in tools/profiling/UmRunDrop.psm1.
+    [scriptblock]$PostAdmissionHook = { param($Source) }
 )
 
 $ErrorActionPreference = 'Stop'
 Import-Module (Join-Path $PSScriptRoot '..\UmRunDrop.psm1') -Force
 Import-Module (Join-Path $PSScriptRoot 'AttrCudaArtifacts.psm1') -Force
+
+# This generator ships at tools\profiling\bachelor\<this file>.ps1 -- three levels up is the
+# repository root. sol, PR #140 r2 BLOCKER (ATTR3-ADMIT-CONTENT-PIN-1): passed explicitly to
+# every fixture-admission check below, so a nested repository under tests/fixtures/clips cannot
+# authorize bytes the outer repository's HEAD never held.
+$RepoRoot = Split-Path -Parent (Split-Path -Parent (Split-Path -Parent $PSScriptRoot))
 
 if (@('tiny_dual_iso', 'large_dual_iso') -cnotcontains $ClipStem) {
     throw "ATTR3_FIXTURE_STEM_INVALID '$ClipStem' is not one of the clip fixture stems (exact case)"
@@ -52,19 +64,40 @@ if (@('tiny_dual_iso', 'large_dual_iso') -cnotcontains $ClipStem) {
 if (-not (Test-Path -LiteralPath $FixturePath -PathType Leaf)) {
     throw "ATTR3_FIXTURE_MISSING $FixturePath"
 }
-if (-not (Test-UmRunTrackedFixtureSource -SourcePath $FixturePath)) {
-    throw "ATTR3_FIXTURE_NOT_TRACKED $FixturePath is not a tracked clip fixture of this repository"
+$admission = Get-UmRunFixtureAdmission -SourcePath $FixturePath -RepoRoot $RepoRoot
+if (-not $admission.IsFixture) {
+    # round 2d (sol/fable MAJOR): carry admission's own distinct reason out rather than folding
+    # every refusal into this one generic token.
+    $reasonSuffix = if ($admission.Reason) { " ($($admission.Reason))" } else { '' }
+    # round 2e (sol/fable MAJOR): a definite non-fixture and a could-not-determine outcome used to
+    # share this one token, distinguished only by prose in the parenthetical -- see the identical
+    # split in UmRunDrop.psm1's Assert-UmRunSideFileName.
+    if ($admission.Indeterminate) {
+        throw "ATTR3_FIXTURE_ADMISSION_INDETERMINATE $FixturePath admissibility could not be determined$reasonSuffix"
+    }
+    throw "ATTR3_FIXTURE_NOT_TRACKED $FixturePath is not a tracked, content-pinned clip fixture of this repository$reasonSuffix"
 }
 $fixture = Get-Item -LiteralPath $FixturePath -Force
 if ([IO.Path]::GetFileNameWithoutExtension($fixture.Name) -cne $ClipStem) {
     throw "ATTR3_FIXTURE_STEM_MISMATCH '$($fixture.Name)' does not carry the stem '$ClipStem'"
 }
 [void](Assert-AttrCudaSafeArtifactName -Name $fixture.Name)
-# ATTR3-FIXTURE-STAGE-1: "tracked" is not "unmodified" -- refuse before baking a sha256 for
-# working-tree bytes no reviewed commit ever produced.
-[void](Assert-AttrCudaFixtureCommittedBytes -Path $fixture.FullName)
-
+# ATTR3-FIXTURE-STAGE-1 / ATTR3-ADMIT-CONTENT-PIN-1 (sol, PR #140 r2c): "tracked" is not
+# "unmodified" -- refuse before baking a sha256 for working-tree bytes no reviewed commit ever
+# produced. This used to call Assert-AttrCudaFixtureCommittedBytes directly and then re-read the
+# file a SECOND time with its own independent Get-FileHash -- two separate reads of the same
+# path, exactly the check/use gap tools/profiling/UmRunDrop.psm1's admission/placement race (sol,
+# PR #140 r2 MAJOR) was fixed to close. Get-UmRunFixtureAdmission already runs that identical
+# content-pin check and hands back a SHA256 of the bytes it verified, taken immediately after the
+# check returns (ContentSha256); this generator's own later read is bound back to THAT value
+# rather than trusted blind, closing this generator's contribution to the gap the same way
+# Invoke-UmRunDrop closes its own (-PostAdmissionHook is the identical test seam, reused here).
+& $PostAdmissionHook $fixture.FullName
 $fixtureSha = (Get-FileHash -LiteralPath $fixture.FullName -Algorithm SHA256).Hash.ToLowerInvariant()
+if ($fixtureSha -ne $admission.ContentSha256) {
+    throw "ATTR3_FIXTURE_CONTENT_PIN_RACE $($fixture.Name) changed between admission and staging (admission verified $($admission.ContentSha256), now $fixtureSha)"
+}
+
 $jobId = "attr3-stage-fixture-$ClipStem-$($fixtureSha.Substring(0, 12))"
 
 $template = @'

@@ -216,7 +216,45 @@ param(
     [ValidatePattern('^[A-Za-z0-9._-]+\.json\z')]
     [string]$ConsentReceiptFileName = 'owner-footage-consent-20260916.json',
 
-    [string]$LlrawprocRelativePath = 'src/mlv/llrawproc/llrawproc.c'
+    [string]$LlrawprocRelativePath = 'src/mlv/llrawproc/llrawproc.c',
+
+    # CUDA-PLAYBACK-CONTACT-SHEET-1: opt-in, off by default like every other optional capture
+    # in this job. When set, the emitted job passes the app's own --contact-sheet-dir/
+    # --contact-sheet-frames through -AdditionalArgs on the SAME leg's un-timed pass (the app
+    # captures those frames strictly after its own measured playback interval closes -- see
+    # runGuiPlaybackSmoke's contact-sheet capture block -- so this never perturbs the leg's
+    # fps/swap-cadence numbers) and publishes the raw PNG+JSON pairs under
+    # artifacts/contact-sheet/raw/. Composing them into one labelled sheet (tools/profiling/
+    # make-contact-sheet.py) is left to a later step, off this job: round-1 scope keeps this
+    # hunk small while UM-CUDA-BENCH-VENUE-1 also edits this file.
+    [switch]$ContactSheet,
+    [ValidateRange(1, 60)]
+    [int]$ContactSheetFrames = 6,
+
+    # CUDA-PLAYBACK-PRESENT-CADENCE-1 round 2 discriminating legs. HEAVY (default, unchanged
+    # behavior for every existing caller) keeps every diagnostic env var PLAYBACK-ATTR-3-CUDA
+    # has always set. LIGHT drops the four per-frame GUI-thread diagnostic sources that are not
+    # needed for THIS job's own pass/fail gating or for the gpu_window swap counters/summary --
+    # MLVAPP_PLAYBACK_SMOKE_TIMELINE_TELEMETRY, MLVAPP_PLAYBACK_DETAILED_TIMELINE_TELEMETRY,
+    # MLVAPP_STAGE_TIMING, MLVAPP_PERF_FIELD_LOG -- and additionally sets
+    # MLVAPP_PLAYBACK_SMOKE_TELEMETRY_DISABLE_FRAME_LOG=1 (platform/qt/GpuDisplayWindow.cpp's
+    # swapTelemetryPerEventLogEnabled() / MainWindow.cpp's m_playbackSmokeFrameLogEnabled) to
+    # suppress the per-frame/per-swap/per-superseded-frame qInfo() lines those two files gate on
+    # MLVAPP_PLAYBACK_SMOKE_TELEMETRY alone. MLVAPP_PLAYBACK_SMOKE_TELEMETRY=1 and
+    # MLVAPP_GPU_PLAYBACK_RECON_ELIGIBILITY_DIAG=1 stay ON in BOTH arms: the former still drives
+    # every counter behind playback_smoke.gate/playback_smoke.gpu_window_swaps regardless of the
+    # new flag, and the latter's own eligibility line is what Get-AttrCudaEligibilityVerdict
+    # requires to avoid failing this job closed at BACKEND_NOT_AVAILABLE (exit 15) -- it is no
+    # longer a per-frame cost either way, since MainWindow.cpp now dedupes it against its last
+    # emitted value and a stable CUDA session logs it once.
+    [ValidateSet('HEAVY', 'LIGHT')]
+    [string]$TelemetryArm = 'HEAVY',
+
+    # CUDA-PLAYBACK-PRESENT-CADENCE-2 same-build A/B: sets
+    # MLVAPP_GPU_WINDOW_PAINT_PER_SUBMIT=0 on the emitted leg, restoring the pre-fix
+    # update()-driven paint path so a "before" leg can be measured from the exact same
+    # package as the "after" leg -- never rebuilt, never a different -SourceCommit.
+    [switch]$DisablePaintPerSubmit
 )
 
 $ErrorActionPreference = 'Stop'
@@ -332,6 +370,11 @@ $FixtureClipIds = @('tiny_dual_iso', 'large_dual_iso')
 $isFixtureRehearsal = $FixtureClipIds -ccontains $ClipId
 $fixtureRehearsalLiteral = if ($isFixtureRehearsal) { '$true' } else { '$false' }
 
+# CUDA-PLAYBACK-CONTACT-SHEET-1: baked the same way fixtureRehearsalLiteral is above --
+# a plain bool/int literal substituted into the template, never caller text.
+$contactSheetEnabledLiteral = if ($ContactSheet) { '$true' } else { '$false' }
+$contactSheetFrameCountLiteral = [string]$ContactSheetFrames
+
 # ATTR3-FIXTURE-STAGE-1. The compound suffix the two tracked fixtures carry is never spelled
 # as one literal token anywhere in this file: a token ending in it trips this repository's own
 # NA-4 PreToolUse gate, even in source text that names no real clip, so it is composed here.
@@ -442,6 +485,18 @@ $embeddedFunctions = Get-AttrCudaEmbeddedFunctionSource -Name @(
     'Test-AttrCudaPathIsReparsePoint',
     'Get-AttrCudaClosureDirectoryMismatch',
     'Publish-AttrCudaText',
+    # CUDA-PLAYBACK-CONTACT-SHEET-1 r1b: writes the embedded composer script's decoded bytes
+    # to a file under $Work before it is invoked -- the byte-array counterpart of
+    # Publish-AttrCudaText, for a payload that arrived base64-decoded rather than copied.
+    'Publish-AttrCudaBytes',
+    # CUDA-PLAYBACK-CONTACT-SHEET-1 r1d: quotes a Start-Process -ArgumentList element that may
+    # contain a space (the composer's --host/--gpu values) -- see its own header.
+    'ConvertTo-AttrCudaQuotedProcessArgument',
+    # CUDA-PLAYBACK-CONTACT-SHEET-2 round 2: was defined inline in this template until the
+    # PRESENTMON-HARNESS-ROBUSTNESS-2 merge's test_every_called_attrcuda_command_is_defined_in_
+    # the_real_embedded_text required every -AttrCuda-named call in the template to come from
+    # this splice instead -- see its own header in AttrCudaArtifacts.psm1.
+    'Publish-AttrCudaContactSheetRawCaptures',
     'Publish-AttrCudaFileCopy',
     'Publish-AttrCudaFileMove',
     'New-AttrCudaDirectory',
@@ -458,6 +513,52 @@ $embeddedFunctions = Get-AttrCudaEmbeddedFunctionSource -Name @(
     # typed PRESENTMON_UNAVAILABLE/DISPLAY_ASLEEP refusal instead of an uncaught throw. See its own
     # header in AttrCudaArtifacts.psm1.
     'Get-AttrCudaPresentMonDisplayReport',
+    # PRESENTMON-HARNESS-ROBUSTNESS-2: sanitizes free-form reason text before it is embedded in a
+    # RESULT= stdout line's quoted REASON="..." field -- see its own header in AttrCudaArtifacts.psm1.
+    'ConvertTo-AttrCudaResultLineSafeText',
+    # PRESENTMON-HARNESS-ROBUSTNESS-2 r1c (sol PRE-REVIEW #2 BLOCKER): the sufficiency gate's two
+    # coverage-arm helpers, called by the emitted template's PresentMon status block below but
+    # missing from this list -- every otherwise-successful leg hit CommandNotFoundException on a
+    # host with no checkout/Import-Module before publishing presentMonStatus. Both are self-
+    # contained (no calls to other AttrCuda functions), so no further names are needed.
+    'Get-AttrCudaAppSwapTelemetry',
+    'Get-AttrCudaTemporalCoverage',
+    # CUDA-PLAYBACK-PRESENT-CADENCE-2 round 1: the DISPLAY_ASLEEP override's app-side
+    # foreground/fullscreen confirmation -- self-contained (no calls to other AttrCuda
+    # functions), like the two above it.
+    'Get-AttrCudaForegroundVerification',
+    # CUDA-PERF-DISPLAY-WAKE-1/2: wakes the display from the interactive session before this leg
+    # launches MLVApp, holds it awake for the leg, and keeps nudging periodically for the whole
+    # leg (SetThreadExecutionState alone does not stop the screen saver) -- see their own header in
+    # AttrCudaArtifacts.psm1. All twelve call Register-.../Get-AttrCudaScreensaver*/
+    # Wait-AttrCudaScreensaverDismissed/Invoke-AttrCudaInputDesktopNudge internally, so all twelve
+    # must be embedded together.
+    'Register-AttrCudaDisplayWakeNativeMethods',
+    'Get-AttrCudaScreensaverRunning',
+    'Get-AttrCudaScreensaverTimeoutSeconds',
+    'Get-AttrCudaScreensaverActive',
+    # CUDA-PERF-DISPLAY-WAKE-2 round 1c: SPI_GETSCREENSAVESECURE (gates every dismiss attempt) and
+    # the OpenInputDesktop/SetThreadDesktop dedicated-thread nudge Start-AttrCudaDisplayWake
+    # dispatches to when the screen saver is already running and not secure.
+    'Get-AttrCudaScreensaverSecure',
+    # CUDA-PERF-DISPLAY-WAKE-3 round 3: the bounded after-dismiss poll Start-AttrCudaDisplayWake
+    # calls instead of a single immediate Get-AttrCudaScreensaverRunning read.
+    'Wait-AttrCudaScreensaverDismissed',
+    'Invoke-AttrCudaInputDesktopNudge',
+    'Start-AttrCudaDisplayWake',
+    'Stop-AttrCudaDisplayWake',
+    'Start-AttrCudaDisplayWakeKeepAlive',
+    # CUDA-PERF-DISPLAY-WAKE-3 round 1: the keep-alive's own non-throwing health read, checked
+    # before the smoke launch and again at the start of the measured interval (see the template
+    # body below).
+    'Get-AttrCudaDisplayWakeKeepAliveHealth',
+    'Stop-AttrCudaDisplayWakeKeepAlive',
+    # CUDA-PERF-DISPLAY-WAKE-4 round 1d (sol PRE-REVIEW #2 BLOCKER): Start-AttrCudaDisplayWakeKeepAlive's
+    # own loop calls this by name (Get-Command, resolved from whatever is defined in this flat
+    # script's own scope) every tick -- omitted here, Get-Command could not find it on a host with no
+    # checkout/Import-Module, so keep-alive setup recorded a setupError and the health gate failed
+    # every leg.
+    'Invoke-AttrCudaBoundedProbe',
     # UM-DISPLAY-SELECT-AND-LOG-1 round 2b: the venue-quiescence gate now reads busy TIME
     # (\Processor(_Total)\% Processor Time), not frequency-scaled utility (LoadPercentage),
     # and publishes the top CPU-seconds consumers as evidence on both the pass and refusal
@@ -556,6 +657,38 @@ $shortSha = $SourceCommit.Substring(0, 12)
 $exeName = "MLVApp-playback-attr-3-cuda-$shortSha.exe"
 $reconName = "igpu_recon_cuda-playback-attr-3-cuda-$shortSha.dll"
 
+# CUDA-PLAYBACK-CONTACT-SHEET-1 r1b: the venue has no checkout (see the smoke-runner
+# closure comment above), so the composer that turns raw --contact-sheet-dir captures
+# into one labelled sheet + stats sidecar must ship INLINE, byte-exact as committed at
+# $SourceCommit -- same generator-only, byte-exact mechanism as the smoke-runner closure
+# and the llrawproc blob (Resolve-AttrCudaCommittedBlobId/Save-AttrCudaCommittedBlobBytes),
+# just base64-embedded directly rather than cached: one small text file, not cache-worthy
+# like the six-file closure or the multi-MB llrawproc blob.
+# CUDA-PLAYBACK-CONTACT-SHEET-1 r1c (BLOCKER fix): resolved ONLY when -ContactSheet is
+# set. This path did not exist at every commit this generator can be asked to build (a
+# pre-card $SourceCommit has no tools/profiling/make-contact-sheet.py at all), so
+# resolving it unconditionally broke every default-off generation against such a commit --
+# the one thing -ContactSheet being off is supposed to leave byte-identical.
+if ($ContactSheet) {
+    $contactSheetComposerBlobId = Resolve-AttrCudaCommittedBlobId -RepoRoot $RepoRoot -Commit $SourceCommit -RepoRelativePath 'tools/profiling/make-contact-sheet.py'
+    $contactSheetComposerTempPath = Join-Path ([IO.Path]::GetTempPath()) "playback-attr-3-cuda-contact-sheet-composer-$([guid]::NewGuid().ToString('N')).py"
+    try {
+        $contactSheetComposerSha256 = Save-AttrCudaCommittedBlobBytes -RepoRoot $RepoRoot -BlobId $contactSheetComposerBlobId -Destination $contactSheetComposerTempPath
+        if ($contactSheetComposerSha256 -notmatch '^[0-9a-f]{64}$') {
+            throw "ATTRCUDA_BLOB_SHA_MALFORMED composer script sha256 is not 64 lowercase hex: '$contactSheetComposerSha256'"
+        }
+        $contactSheetComposerBytes = [IO.File]::ReadAllBytes($contactSheetComposerTempPath)
+    } finally {
+        if (Test-Path -LiteralPath $contactSheetComposerTempPath) { Remove-Item -LiteralPath $contactSheetComposerTempPath -Force }
+    }
+    $contactSheetComposerPyBase64 = [Convert]::ToBase64String($contactSheetComposerBytes)
+    $contactSheetComposerSha256ForTemplate = $contactSheetComposerSha256
+} else {
+    $contactSheetComposerPyBase64 = ''
+    $contactSheetComposerSha256ForTemplate = ''
+}
+$disablePaintPerSubmitLiteral = if ($DisablePaintPerSubmit) { '$true' } else { '$false' }
+
 # --- job body template (placeholders are substituted below; the body itself never
 #     touches this generator's variables directly, so there is no accidental capture
 #     of this machine's environment into the emitted script) ----------------------
@@ -580,6 +713,12 @@ $SmokeRunnerName = '__SMOKE_RUNNER_NAME__'
 $ConsentReceiptFileName = '__CONSENT_RECEIPT__'
 $FixtureRehearsal = __FIXTURE_REHEARSAL__
 $FixtureSha256 = '__FIXTURE_SHA256__'
+$ContactSheetEnabled = __CONTACT_SHEET_ENABLED__
+$ContactSheetFrameCount = __CONTACT_SHEET_FRAME_COUNT__
+$ContactSheetComposerPyBase64 = '__CONTACT_SHEET_COMPOSER_PY_BASE64__'
+$ContactSheetComposerSha256 = '__CONTACT_SHEET_COMPOSER_SHA256__'
+$TelemetryArm = '__TELEMETRY_ARM__'
+$DisablePaintPerSubmit = __DISABLE_PAINT_PER_SUBMIT__
 $Root = '__AGENT_ROOT__'
 $Cache = Join-Path $Root 'cache'
 $Stamp = Get-Date -Format 'yyyyMMdd-HHmmss'
@@ -597,6 +736,85 @@ $ownerLinkHandles = [System.Collections.Generic.List[object]]::new()
 # called above its definition, so every emitted job died with command-not-found).
 __EMBEDDED_FUNCTIONS__
 # --- end embedded verifiers -------------------------------------------------------------------
+
+# Moved above the TEMP boundary (CUDA-PERF-DISPLAY-WAKE-3 round 1): the secure/unknown-screensaver
+# gate just below needs Save-Json and $Pub, both already available here, and moving it costs
+# nothing to define this early.
+function Save-Json($Object, [string]$Path) {
+    # Artifact writes go through the slot-checked helper: never through a link or into a directory (sol PR #133).
+    [void](Publish-AttrCudaText -Path $Path -Value ($Object | ConvertTo-Json -Depth 30))
+}
+
+# CUDA-PERF-DISPLAY-WAKE-2 round 1c: THE VERY FIRST ACTION this job takes after claim, before the
+# TEMP boundary, before $Work/$Pub are even created, before footage resolution, before package/
+# build-manifest verification, and before the CPU-quiescence sleeps far below. Round 1b's live
+# leg on Bachelor recorded a 4.5-minute gap between job claim and the keep-alive's first nudge
+# (footage resolution and package verification ran first) -- long enough for a 300s screen-saver
+# timeout to elapse before this job ever touched the desktop, after which SendInput could no
+# longer recover it (screensaverRunningBefore=true, SendInput lastError=5 ERROR_ACCESS_DENIED).
+# Bounded and non-throwing -- see Start-AttrCudaDisplayWake's own header in AttrCudaArtifacts.psm1.
+# Start-AttrCudaDisplayWake itself reads the screen saver's running/secure state and performs the
+# one-time nudge (never attempted when secure or unknown); the SECURE/UNKNOWN GATE below runs
+# immediately after it, BEFORE the periodic keep-alive is even started (CUDA-PERF-DISPLAY-WAKE-3
+# round 1, sol BLOCKER: the keep-alive's own loop has no secure check of its own -- see
+# Start-AttrCudaDisplayWakeKeepAlive's header -- so starting it before this gate had run left
+# periodic input injection armed against a screen saver this job had not yet confirmed was safe to
+# touch). Order is: read running/secure -> gate -> first (one-time) nudge -> keep-alive; the first
+# two are Start-AttrCudaDisplayWake's own work, the gate is the `if` immediately below, and the
+# keep-alive starts only once the gate has passed.
+#
+# CUDA-PERF-DISPLAY-WAKE-3 round 1b (sol HARDENING): the outer `try`/`finally` that stops the
+# keep-alive and the wake (see the `finally` far below) used to begin only at the owner-footage
+# `try` further down -- everything from Start-AttrCudaDisplayWake here through that later `try`
+# ran OUTSIDE it, so a terminating error in that stretch (package expansion, footage resolution,
+# build-manifest verification) left the wake and keep-alive to be released only by the process
+# itself exiting, never explicitly recorded. The `try` now opens right here, at the first line of
+# the claim-time wake lifetime, so Stop-AttrCudaDisplayWakeKeepAlive/Stop-AttrCudaDisplayWake run
+# on every exit from this point on, including the `exit 25` immediately below.
+try {
+$displayWake = Start-AttrCudaDisplayWake
+if ($displayWake.screensaverSecureOwnerOnly) {
+    [void](New-AttrCudaDirectory -Path (Join-Path $Root 'outbox'))
+    [void](New-AttrCudaDirectory -Path $Pub)
+    $secureRefusal = [ordered]@{
+        schema='playback-attr-3-cuda-venue.v1'; result='SCREENSAVER_SECURE_OWNER_ONLY'
+        fixtureRehearsal=$FixtureRehearsal
+        displayWake=$displayWake
+        sourceCommit=$SourceCommit; clipId=$ClipId; artifactRoot=$Pub
+    }
+    Save-Json $secureRefusal (Join-Path $Pub 'summary.json')
+    Write-Output "RESULT=SCREENSAVER_SECURE_OWNER_ONLY ARTIFACTS=$Pub"
+    exit 25
+}
+# CUDA-PERF-DISPLAY-WAKE-3 round 2 (live UM evidence, defect class fix): a non-secure screen saver
+# that was running before this job touched the desktop, and that the dismiss attempt above did not
+# CONFIRM ended (still running, or the after-probe itself failed), must stop the leg with a typed
+# refusal here -- before the keep-alive even starts -- rather than silently proceeding into a
+# measurement PASS176 would score against a screen that was never actually showing MLVApp's output.
+# See Start-AttrCudaDisplayWake's own .dismissFailed doc for the fail-closed reasoning.
+if ($displayWake.dismissFailed) {
+    [void](New-AttrCudaDirectory -Path (Join-Path $Root 'outbox'))
+    [void](New-AttrCudaDirectory -Path $Pub)
+    $dismissRefusal = [ordered]@{
+        schema='playback-attr-3-cuda-venue.v1'; result='DISPLAY_WAKE_DISMISS_FAILED'
+        fixtureRehearsal=$FixtureRehearsal
+        displayWake=$displayWake
+        sourceCommit=$SourceCommit; clipId=$ClipId; artifactRoot=$Pub
+    }
+    Save-Json $dismissRefusal (Join-Path $Pub 'summary.json')
+    Write-Output "RESULT=DISPLAY_WAKE_DISMISS_FAILED ARTIFACTS=$Pub"
+    exit 27
+}
+$displayWakeKeepAlive = Start-AttrCudaDisplayWakeKeepAlive
+# Folded into $displayWake itself (by reference for .keepAliveNudgeState -- the SAME live
+# Hashtable instance the background loop mutates) rather than added as a separate field at each
+# evidence write site below: every one of those already carries whatever is in $displayWake at
+# the moment it serializes, so this is the only edit needed for every recorded outcome to also
+# carry live keep-alive evidence, right up to the count at that write's own moment.
+$displayWake['keepAliveIntervalSeconds'] = $displayWakeKeepAlive.intervalSeconds
+$displayWake['keepAliveStartedUtc'] = $displayWakeKeepAlive.startedUtc
+$displayWake['keepAliveNudgeState'] = $displayWakeKeepAlive.nudgeState
+$displayWake['keepAliveSetupError'] = $displayWakeKeepAlive.setupError
 
 # TEMP boundary (BLOCKER fix): job-owned scratch dir under this job's own C:\mlvtmp
 # work dir, set as TEMP/TMP at the very start -- before any child process (reg.exe,
@@ -633,12 +851,6 @@ $env:TMP = $Scratch
 
 function Get-Sha([string]$Path) {
     (Get-FileHash -LiteralPath $Path -Algorithm SHA256).Hash.ToUpperInvariant()
-}
-
-
-function Save-Json($Object, [string]$Path) {
-    # Artifact writes go through the slot-checked helper: never through a link or into a directory (sol PR #133).
-    [void](Publish-AttrCudaText -Path $Path -Value ($Object | ConvertTo-Json -Depth 30))
 }
 
 function Get-Mean([double[]]$Values) {
@@ -751,7 +963,45 @@ function Stop-PresentMonCapture($Proc, [int]$TimeoutSeconds = 10) {
     }
 }
 
-function Get-FrameRows([string]$RawLog) {
+function Get-MeasuredSmokeSessionId([string]$RawLog) {
+    <#
+    .SYNOPSIS
+    The playback_smoke session id of the MEASURED interval -- BLOCKER fix (r1c): with a
+    contact-sheet capture pass on the leg, the raw log can carry more than one
+    playback_smoke session (see MainWindow.cpp's on_actionPlay_toggled and the
+    m_contactSheetCaptureActive guard around beginPlaybackSmokeTelemetry -- suppressed for a
+    capture restart, but this parser must not depend on that app-side suppression alone).
+    .DESCRIPTION
+    HARDENING (r1d, sol; rebound in CUDA-PLAYBACK-CONTACT-SHEET-2): bind to the app's own
+    explicit "playback_smoke.measured_session id=N" marker when the log carries one, rather
+    than positionally assuming the first playback_smoke.summary line is the measured one -- an
+    alternate GUI-smoke mode (e.g. an Auto Look Assist warmup or lifecycle stress pass that
+    opens its own session first) could make that assumption false. As of
+    CUDA-PLAYBACK-CONTACT-SHEET-2, MainWindow.cpp's runGuiPlaybackSmoke() logs this marker
+    itself, right after the measured play trigger that opens the measured session -- not from
+    finishPlaybackSmokeTelemetry() on a "play-stop", which a warmup settle or an in-loop
+    lifecycle-stress toggle could reach first and mislabel. Falls back to the old first-summary
+    heuristic against a log from a build that predates the marker, so this never regresses an
+    older build's run: on such a log, the measured interval's own
+    playback_smoke.summary/gpu_summary line pair runs strictly BEFORE the contact-sheet capture
+    block even starts (see runGuiPlaybackSmoke's own ordering comment), so every session opened
+    afterwards is chronologically LATER, and the FIRST playback_smoke.summary line's session id
+    is still the measured one.
+    #>
+    foreach ($line in ($RawLog -split "`r?`n")) {
+        if ($line -match 'playback_smoke\.measured_session id=(?<session>\d+)') {
+            return $Matches['session']
+        }
+    }
+    foreach ($line in ($RawLog -split "`r?`n")) {
+        if ($line -match 'playback_smoke\.summary session=(?<session>\d+)') {
+            return $Matches['session']
+        }
+    }
+    throw 'no playback_smoke.summary line found in the MLVApp log'
+}
+
+function Get-FrameRows([string]$RawLog, [string]$MeasuredSessionId, [switch]$AllowFewRows) {
     $rows = [System.Collections.Generic.List[object]]::new()
     $keys = @(
         'prep_region_setup_ms', 'prep_region_gpu_ms', 'prep_region_image_ms',
@@ -765,6 +1015,10 @@ function Get-FrameRows([string]$RawLog) {
             $values[$match.Groups['key'].Value] = $match.Groups['value'].Value
         }
         if (-not $values.ContainsKey('prep_region_total_ms')) { continue }
+        # BLOCKER fix (r1c): a contact-sheet capture pass can (or, on a code path that fails
+        # to suppress it, could) open further playback_smoke sessions after the measured
+        # one -- select ONLY the measured session's rows, even when more lines exist.
+        if ($values.ContainsKey('session') -and $values['session'] -ne $MeasuredSessionId) { continue }
         $row = [ordered]@{}
         foreach ($key in @('session','index','elapsed_ms','interval_ms','display_frame','serial')) {
             if ($values.ContainsKey($key)) { $row[$key] = $values[$key] }
@@ -777,12 +1031,27 @@ function Get-FrameRows([string]$RawLog) {
             [void]$rows.Add([pscustomobject]$row)
         }
     }
-    if ($rows.Count -lt 10) { throw "only $($rows.Count) high-resolution frame rows; require >=10" }
+    # CUDA-PLAYBACK-PRESENT-CADENCE-1 round 2: the LIGHT telemetry arm sets
+    # MLVAPP_PLAYBACK_SMOKE_TELEMETRY_DISABLE_FRAME_LOG=1, which deliberately suppresses the
+    # source of these rows (platform/qt/MainWindow.cpp's playback_smoke.frame line) in exchange
+    # for far less GUI-thread log I/O during the very measurement this round exists to take. Zero
+    # rows is therefore EXPECTED and not a defect for that arm -- $AllowFewRows lets the caller
+    # say so explicitly, rather than this function guessing from an env var of its own. $rows is
+    # never used for this job's own pass/fail gating (that comes from playback_smoke.gpu_summary
+    # and PresentMon, both unconditional one-shot lines) -- only for the optional prep_region_*
+    # percentile stats and probe-timeline.csv, both empty for a LIGHT leg by design.
+    if ($rows.Count -lt 10 -and -not $AllowFewRows) {
+        throw "only $($rows.Count) high-resolution frame rows; require >=10"
+    }
     return @($rows)
 }
 
-function Get-LastGpuSummary([string]$RawLog) {
-    # Cumulative per-session counters: the LAST line carries the run's final totals.
+function Get-LastGpuSummary([string]$RawLog, [string]$MeasuredSessionId) {
+    # Cumulative per-session counters: the LAST line FOR THE MEASURED SESSION carries that
+    # session's final totals. BLOCKER fix (r1c): a plain "last line in the log" pick is wrong
+    # once a contact-sheet capture pass can open further sessions after the measured one --
+    # each such session emits its own gpu_summary line, chronologically after the measured
+    # session's, so "last" used to mean "the capture pass's, not the measured interval's".
     $last = $null
     foreach ($line in ($RawLog -split "`r?`n")) {
         if ($line -notmatch 'playback_smoke\.gpu_summary ') { continue }
@@ -790,9 +1059,10 @@ function Get-LastGpuSummary([string]$RawLog) {
         foreach ($match in [regex]::Matches($line, '(?<key>[A-Za-z0-9_]+)=(?<value>[^\s]+)')) {
             $values[$match.Groups['key'].Value] = $match.Groups['value'].Value
         }
+        if ($values.ContainsKey('session') -and $values['session'] -ne $MeasuredSessionId) { continue }
         $last = $values
     }
-    if ($null -eq $last) { throw 'no playback_smoke.gpu_summary line found in the MLVApp log' }
+    if ($null -eq $last) { throw 'no playback_smoke.gpu_summary line found in the MLVApp log for the measured session' }
     $required = @('cpu_frames','gpu_preview_frames','gpu_recon_readback_frames','gpu_texture_readback_frames','gpu_texture_no_readback_frames')
     foreach ($key in $required) {
         if (-not $last.ContainsKey($key)) { throw "playback_smoke.gpu_summary line missing $key" }
@@ -808,7 +1078,7 @@ function Get-LastGpuSummary([string]$RawLog) {
 
 function Build-AttrCudaDisplayBlock {
     # UM-DISPLAY-SELECT-AND-LOG-1 item 2c: assembles the `display` block published into every
-    # summary.json/evidence-manifest.json this leg writes from leg start onward. -AppSelection is
+    # summary.json and the evidence manifest this leg writes from leg start onward. -AppSelection is
     # $null before the smoke log is available -- windowsDisplays is already known and published,
     # while appScreens/target/mode/preview are 'unknown'/$null with their own reason, never
     # defaulted or folded into "not degraded" (item 3/e).
@@ -1038,6 +1308,7 @@ if ($FixtureRehearsal) {
         $mismatch = [ordered]@{
             schema='playback-attr-3-cuda-venue.v1'; result='FIXTURE_CONTENT_MISMATCH'
             fixtureRehearsal=$FixtureRehearsal
+            displayWake=$displayWake
             clipPath=$clipPath; expectedSha256=$FixtureSha256; actualSha256=$actualClipSha256
             sourceCommit=$SourceCommit; clipId=$ClipId; artifactRoot=$Pub
         }
@@ -1070,6 +1341,7 @@ if ($FixtureRehearsal) {
         $notVerified = [ordered]@{
             schema='playback-attr-3-cuda-venue.v1'; result='OWNER_FOOTAGE_NOT_VERIFIED'
             fixtureRehearsal=$FixtureRehearsal
+            displayWake=$displayWake
             parts=@($ownerPartResults)
             sourceCommit=$SourceCommit; clipId=$ClipId; artifactRoot=$Pub
         }
@@ -1092,6 +1364,7 @@ if ($FixtureRehearsal) {
         $notContiguous = [ordered]@{
             schema='playback-attr-3-cuda-venue.v1'; result='OWNER_PARTS_NOT_CONTIGUOUS'
             fixtureRehearsal=$FixtureRehearsal
+            displayWake=$displayWake
             partCount=$ownerDecodedParts.Count
             sourceCommit=$SourceCommit; clipId=$ClipId; artifactRoot=$Pub
         }
@@ -1139,6 +1412,7 @@ if ($FixtureRehearsal) {
             $relinkRefusal = [ordered]@{
                 schema='playback-attr-3-cuda-venue.v1'; result='OWNER_FOOTAGE_NOT_VERIFIED'
                 fixtureRehearsal=$FixtureRehearsal
+                displayWake=$displayWake
                 parts=@(@{ index = $part.index; status = $Matches[1] })
                 sourceCommit=$SourceCommit; clipId=$ClipId; artifactRoot=$Pub
             }
@@ -1155,6 +1429,7 @@ if ($FixtureRehearsal) {
         $linkRefusal = [ordered]@{
             schema='playback-attr-3-cuda-venue.v1'; result=$linkToken
             fixtureRehearsal=$FixtureRehearsal
+            displayWake=$displayWake
             partIndex=$part.index
             sourceCommit=$SourceCommit; clipId=$ClipId; artifactRoot=$Pub
         }
@@ -1164,14 +1439,19 @@ if ($FixtureRehearsal) {
     }
 }
 
-# ATTR3-FOOTAGE-BIND-1 PR-B round 4: everything from here to the end of the job runs inside a
-# `try`/`finally` so the private directory's read-share handles (opened above, owner runs only)
-# are always closed and its neutrally-named links are always cleaned up -- on every exit path
-# below, including an early `exit N` (PowerShell still runs a pending `finally` on `exit`, proven
-# by CI before this shipped) and an uncaught terminating error. $OwnerClipDir stays $null for a
-# fixture run, so the `finally` is a no-op there.
-try {
+# ATTR3-FOOTAGE-BIND-1 PR-B round 4: everything from here to the end of the job runs inside the
+# same outer `try`/`finally` (opened at Start-AttrCudaDisplayWake, above -- CUDA-PERF-
+# DISPLAY-WAKE-3 round 1b) so the private directory's read-share handles (opened above, owner runs
+# only) are always closed and its neutrally-named links are always cleaned up -- on every exit
+# path below, including an early `exit N` (PowerShell still runs a pending `finally` on `exit`,
+# proven by CI before this shipped) and an uncaught terminating error. $OwnerClipDir stays $null
+# for a fixture run, so the `finally` is a no-op there.
 Expand-Archive -LiteralPath (Join-Path $Cache $BasePackageZip) -DestinationPath (Join-Path $Work 'pkg') -Force
+# CUDA-PERF-DISPLAY-WAKE-1/2. OWNER (2026-09-25): "if display is asleep just wake it. its just the
+# blank screensaver". $displayWake/$displayWakeKeepAlive were already started at the very top of
+# this job (round 1c -- see that block's own comment for why: closing the gap between job claim
+# and the keep-alive's first nudge), so nothing further is needed here; both are released in the
+# `finally` below, on every exit path.
 $baseExe = Get-ChildItem -LiteralPath (Join-Path $Work 'pkg') -Recurse -Filter $BasePackageExeName | Select-Object -First 1
 if (-not $baseExe) { throw "base package executable not found: $BasePackageExeName" }
 $pkgDir = $baseExe.Directory.FullName
@@ -1260,6 +1540,7 @@ if ($cpuTimeUnknown -or -not ($avgTime -le $cpuThresholdPercent)) {
         schema='playback-attr-3-cuda-venue.v1'
         result='VENUE_NOT_QUIESCENT'
         fixtureRehearsal=$FixtureRehearsal
+        displayWake=$displayWake
         cpuUtilitySamples=$cpuUtilitySamples
         cpuUtilityMean=$avgUtility
         cpuTimeSamples=$cpuTimeSamples
@@ -1285,16 +1566,30 @@ New-Item -ItemType Directory -Path $legOut -Force | Out-Null
 $resultPath = Join-Path $legOut 'result.json'
 $presentMonPath = Join-Path $legOut 'presentmon.csv'
 $smoke = Join-Path $smokeRunnerClosureDir $SmokeRunnerName
+$telemetryArmEnvs = if ($TelemetryArm -eq 'LIGHT') {
+    # Only what MLVAPP_GPU_PLAYBACK_RECON_ELIGIBILITY_DIAG and the gpu_window swap
+    # counters/summary need, plus the opt-out that suppresses the per-frame/per-swap/
+    # per-superseded-frame qInfo() lines MLVAPP_PLAYBACK_SMOKE_TELEMETRY alone still gates.
+    @(
+        'MLVAPP_PLAYBACK_SMOKE_TELEMETRY=1',
+        'MLVAPP_PLAYBACK_SMOKE_TELEMETRY_DISABLE_FRAME_LOG=1',
+        'MLVAPP_GPU_PLAYBACK_RECON_ELIGIBILITY_DIAG=1'
+    )
+} else {
+    @(
+        'MLVAPP_PLAYBACK_SMOKE_TELEMETRY=1',
+        'MLVAPP_PLAYBACK_SMOKE_TIMELINE_TELEMETRY=1',
+        'MLVAPP_PLAYBACK_DETAILED_TIMELINE_TELEMETRY=1',
+        'MLVAPP_GPU_PLAYBACK_RECON_ELIGIBILITY_DIAG=1',
+        'MLVAPP_STAGE_TIMING=1',
+        'MLVAPP_PERF_FIELD_LOG=1'
+    )
+}
 $envs = @(
     'MLVAPP_PLAYBACK_QUALITY_MODE=phase3_hq',
     'MLVAPP_PLAYBACK_AGGRESSIVE_PREVIEW=0',
-    'MLVAPP_PLAYBACK_PREVIEW_MODE=sharp_smooth',
-    'MLVAPP_PLAYBACK_SMOKE_TELEMETRY=1',
-    'MLVAPP_PLAYBACK_SMOKE_TIMELINE_TELEMETRY=1',
-    'MLVAPP_PLAYBACK_DETAILED_TIMELINE_TELEMETRY=1',
-    'MLVAPP_GPU_PLAYBACK_RECON_ELIGIBILITY_DIAG=1',
-    'MLVAPP_STAGE_TIMING=1',
-    'MLVAPP_PERF_FIELD_LOG=1',
+    'MLVAPP_PLAYBACK_PREVIEW_MODE=sharp_smooth'
+) + $telemetryArmEnvs + @(
     'MLVAPP_PLAYBACK_PHASE3_UNATTENDED=1',
     'MLVAPP_GPU_PLAYBACK_RECON=1',
     'MLVAPP_GPU_PLAYBACK_RECON_BACKEND=cuda',
@@ -1311,7 +1606,7 @@ $envs = @(
     ('QT_QPA_PLATFORM_PLUGIN_PATH=' + (Join-Path $pkgDir 'platforms')),
     'QT_OPENGL=desktop',
     'QT_FORCE_STDERR_LOGGING=1'
-)
+) + $(if ($DisablePaintPerSubmit) { @('MLVAPP_GPU_WINDOW_PAINT_PER_SUBMIT=0') } else { @() })
 # Shipping default: scale factor 4. Unlike PLAYBACK-ATTR-2, no
 # MLVAPP_PLAYBACK_SCALE_FACTOR override is emitted; -ScaleFactor 4 is explicit
 # below for self-documentation even though it is run-release-gui-smoke.ps1's own
@@ -1324,6 +1619,18 @@ if (-not [string]::IsNullOrWhiteSpace($displayPreferSubstring)) {
     # binary's --help before forwarding -display-prefer to it, so a legacy "before" binary in
     # an A/B is never killed by an unrecognized option.
     $cmd += " -DisplayPrefer $(ConvertTo-PsSingleQuoted $displayPreferSubstring)"
+}
+# CUDA-PLAYBACK-CONTACT-SHEET-1: appended, never baked into the base $cmd string above, so a
+# disabled run's $cmd (and therefore this job's emitted text) is byte-identical to before this
+# card. Passed through -AdditionalArgs (run-release-gui-smoke.ps1's own generic extra-args
+# passthrough) rather than adding new named parameters to that runner -- smallest possible touch
+# to a file another concurrent lane (UM-CUDA-BENCH-VENUE-1) also edits.
+$contactSheetDir = $null
+if ($ContactSheetEnabled) {
+    $contactSheetDir = Join-Path $Work 'contact-sheet'
+    New-Item -ItemType Directory -Path $contactSheetDir -Force | Out-Null
+    $contactSheetAdditionalArgs = "@('--contact-sheet-dir', $(ConvertTo-PsSingleQuoted $contactSheetDir), '--contact-sheet-frames', '$ContactSheetFrameCount')"
+    $cmd = "$cmd -AdditionalArgs $contactSheetAdditionalArgs"
 }
 # CUDA-PERF-DISPLAY-IDENTITY-HARNESS-1/2/3 (sol BLOCKER 2 / fable HARDENING, direction corrected
 # HARNESS-3): PresentMon's own TimeInMs=0 origin is its internal trace-session start, which lands
@@ -1348,8 +1655,63 @@ if (-not [string]::IsNullOrWhiteSpace($displayPreferSubstring)) {
 # post-spawn wall clock) and the residual uncertainty it implies are all persisted below, before
 # parsing, so a consumer needing a tighter join than this one can see exactly how much slack to
 # allow rather than trusting a single unbracketed stamp.
+
+# CUDA-PERF-DISPLAY-WAKE-3 round 1: first of three keep-alive health checkpoints (the second is
+# right before the smoke launch below, bracketing the PresentMon spawn gap between them; round 1b
+# adds a third, right after PresentMon is waited on, bracketing the measured interval itself --
+# see that checkpoint's own comment further down). The
+# periodic keep-alive ticks on its own timer with no secure-screensaver check of its own (see
+# Start-AttrCudaDisplayWakeKeepAlive's own header) and never throws on a failed nudge (see its
+# loop's own try/catch) -- so its health (did it ever start, has a nudge failed, did its
+# background pipeline die) is never assumed from "no exception happened" and is instead read
+# explicitly, here at the start of the measured interval (PresentMon's own capture window, about
+# to begin).
+# CUDA-PERF-DISPLAY-WAKE-3 round 1b: -RequireSuccessSoFar only at this FIRST checkpoint -- see
+# Get-AttrCudaDisplayWakeKeepAliveHealth's own .PARAMETER doc for why only here.
+$keepAliveHealthAtMeasurementStart = Get-AttrCudaDisplayWakeKeepAliveHealth -Handle $displayWakeKeepAlive -RequireSuccessSoFar
+if (-not $keepAliveHealthAtMeasurementStart.healthy) {
+    $displayWake['keepAliveHealth'] = $keepAliveHealthAtMeasurementStart
+    $keepAliveRefusal = [ordered]@{
+        schema='playback-attr-3-cuda-venue.v1'; result='KEEPALIVE_FAILED'
+        fixtureRehearsal=$FixtureRehearsal
+        displayWake=$displayWake
+        keepAliveCheckpoint='start_of_measured_interval'
+        sourceCommit=$SourceCommit; clipId=$ClipId; artifactRoot=$Pub
+    }
+    Save-Json $keepAliveRefusal (Join-Path $Pub 'summary.json')
+    Write-Output "RESULT=KEEPALIVE_FAILED CHECKPOINT=start_of_measured_interval REASON=$($keepAliveHealthAtMeasurementStart.reason) ARTIFACTS=$Pub"
+    exit 26
+}
 $presentMonPreSpawnUtc = (Get-Date).ToUniversalTime()
-$presentMonProc = Start-PresentMonCapture $presentMonPath
+# PRESENTMON-HARNESS-ROBUSTNESS-1: Start-PresentMonCapture throws -- a pre-existing output file,
+# or a PresentMon process that exited nonzero within its own 3s startup check (rc=6 is ETW access
+# denied) -- and this call site sat inside the outer try/finally with NO catch of its own, so
+# either throw would terminate the whole job with a raw PowerShell error and publish nothing, one
+# step before the smoke run (and therefore any app-side measurement) had even started. Typed the
+# same way every other PresentMon failure already is: PRESENTMON_UNAVAILABLE, exit 23.
+$presentMonSpawnError = $null
+try {
+    $presentMonProc = Start-PresentMonCapture $presentMonPath
+} catch {
+    $presentMonSpawnError = $_.Exception.Message
+}
+if ($null -ne $presentMonSpawnError) {
+    $displayFailure = [ordered]@{
+        schema='playback-attr-3-cuda-venue.v1'; result='PRESENTMON_UNAVAILABLE'
+        fixtureRehearsal=$FixtureRehearsal
+        displayWake=$displayWake
+        reason="PresentMon failed to start: $presentMonSpawnError"
+        presentMonStatus='unavailable'
+        chains=@()
+        display=$displayBlock
+        sourceCommit=$SourceCommit; clipId=$ClipId; artifactRoot=$Pub
+    }
+    Save-Json $displayFailure (Join-Path $Pub 'summary.json')
+    # PRESENTMON-HARNESS-ROBUSTNESS-2 (fable note): the raw exception message could itself contain
+    # a '"', which would garble a naive parser reading this stdout line's quoted REASON="..." field.
+    Write-Output "RESULT=PRESENTMON_UNAVAILABLE REASON=`"PresentMon failed to start: $(ConvertTo-AttrCudaResultLineSafeText $presentMonSpawnError)`" $(Get-AttrCudaDisplayResultTail $displayBlock) ARTIFACTS=$Pub"
+    exit 23
+}
 $presentMonPostSpawnUtc = (Get-Date).ToUniversalTime()
 $presentMonProcessStartUtc = $null
 try { $presentMonProcessStartUtc = $presentMonProc.StartTime.ToUniversalTime() } catch { $presentMonProcessStartUtc = $null }
@@ -1361,6 +1723,31 @@ $presentMonCaptureStartUncertaintyMs = ($presentMonPostSpawnUtc - $presentMonCap
 # $smokeRc and the whole SMOKE_RUN_FAILED branch below, bypassing PresentMon cleanup entirely.
 # Caught here instead, so every path -- normal failure, normal success, or a launch exception --
 # reaches the same Stop-PresentMonCapture call before this job decides anything else.
+
+# CUDA-PERF-DISPLAY-WAKE-3 round 1: second keep-alive health checkpoint -- see the first one's own
+# comment above, right before Start-PresentMonCapture. This one brackets the PresentMon spawn gap:
+# a keep-alive that failed only after PresentMon started must still stop the leg before MLVApp
+# ever launches, rather than being discovered only after a full measured run. PresentMon is
+# already running at this point, so it is stopped (never left orphaned) before this exits, the
+# same way SMOKE_RUN_FAILED already does below.
+$keepAliveHealthBeforeSmokeLaunch = Get-AttrCudaDisplayWakeKeepAliveHealth -Handle $displayWakeKeepAlive
+if (-not $keepAliveHealthBeforeSmokeLaunch.healthy) {
+    $displayWake['keepAliveHealth'] = $keepAliveHealthBeforeSmokeLaunch
+    $presentMonStopOnKeepAliveFailure = Stop-PresentMonCapture -Proc $presentMonProc
+    $keepAliveRefusal = [ordered]@{
+        schema='playback-attr-3-cuda-venue.v1'; result='KEEPALIVE_FAILED'
+        fixtureRehearsal=$FixtureRehearsal
+        displayWake=$displayWake
+        keepAliveCheckpoint='before_smoke_launch'
+        presentMonConfirmedExited=$presentMonStopOnKeepAliveFailure.confirmedExited
+        presentMonKillError=$presentMonStopOnKeepAliveFailure.killError
+        presentMonWaitError=$presentMonStopOnKeepAliveFailure.waitError
+        sourceCommit=$SourceCommit; clipId=$ClipId; artifactRoot=$Pub
+    }
+    Save-Json $keepAliveRefusal (Join-Path $Pub 'summary.json')
+    Write-Output "RESULT=KEEPALIVE_FAILED CHECKPOINT=before_smoke_launch REASON=$($keepAliveHealthBeforeSmokeLaunch.reason) ARTIFACTS=$Pub"
+    exit 26
+}
 $smokeRc = $null
 $smokeLaunchException = $null
 try {
@@ -1413,6 +1800,7 @@ if ($null -ne $smokeLaunchException -or $smokeRc -ne 0 -or -not (Test-Path -Lite
     $smokeFailure = [ordered]@{
         schema='playback-attr-3-cuda-venue.v1'; result='SMOKE_RUN_FAILED'
         fixtureRehearsal=$FixtureRehearsal
+        displayWake=$displayWake
         smokeExitCode=$smokeRc; smokeResultPresent=(Test-Path -LiteralPath $resultPath)
         smokeStderrTail=$smokeStderrTail
         smokeLaunchExceptionType=$smokeLaunchExceptionType
@@ -1465,6 +1853,7 @@ try {
     $unavailable = [ordered]@{
         schema='playback-attr-3-cuda-venue.v1'; result='SMOKE_LOG_UNAVAILABLE'
         fixtureRehearsal=$FixtureRehearsal
+        displayWake=$displayWake
         message=$_.Exception.Message; smokeExitCode=$smokeRc; resultJson=$resultPath
         presentMonConfirmedExited=$presentMonStop.confirmedExited
         presentMonKillError=$presentMonStop.killError
@@ -1478,17 +1867,25 @@ try {
 }
 $logPath = $runLog.path
 $rawLog = [IO.File]::ReadAllText($logPath)
+$measuredSmokeSessionId = Get-MeasuredSmokeSessionId $rawLog
 # UM-DISPLAY-SELECT-AND-LOG-1 item 2b: the app's own gui_smoke.display_screen/display_target/
 # window_placement lines are only ever knowable once the smoke log itself is in hand -- recomputed
-# here, once, and reused for every summary.json/evidence-manifest.json/RESULT line from this point
+# here, once, and reused for every summary.json/evidence-manifest/RESULT line from this point
 # to the end of the leg (item 2c/2d). A parse failure (missing line, unexpected shape) is the
 # function's own third state -- 'unknown' with a reason -- never folded into "not degraded".
 $appDisplaySelection = Get-AttrCudaGuiSmokeDisplaySelection -LogText $rawLog
 $displayBlock = Build-AttrCudaDisplayBlock -WindowsInventory $windowsDisplayInventory `
     -Venue $measurementVenue -ExpectedWidth $expectedDisplayWidth -ExpectedHeight $expectedDisplayHeight `
     -AppSelection $appDisplaySelection
-$rows = Get-FrameRows $rawLog
+$rows = Get-FrameRows $rawLog $measuredSmokeSessionId -AllowFewRows:($TelemetryArm -eq 'LIGHT')
 $rows | Export-Csv -LiteralPath (Join-Path $legOut 'probe-timeline.csv') -NoTypeInformation
+# CUDA-PLAYBACK-PRESENT-CADENCE-2 round 1: an EARLY, separately-named read (before the
+# PresentMon display-report gate below) purely for the DISPLAY_ASLEEP override -- the
+# sufficiency-arm status block further down (PRESENTMON-HARNESS-ROBUSTNESS-2's status_source,
+# an isolated, self-contained slice the test suite executes verbatim) still computes its own
+# $appSwapTelemetry at its original call site, unchanged, so that slice keeps working with no
+# variables assumed set before it.
+$earlyAppSwapTelemetry = Get-AttrCudaAppSwapTelemetry -LogText $rawLog
 
 # CUDA-PERF-DISPLAY-IDENTITY-HARNESS-1/2: publish the smoke artifacts BEFORE any PresentMon
 # parsing, AND before PresentMon is even waited on. They are already known-good the moment the
@@ -1542,15 +1939,54 @@ if ($null -ne $presentMonWaitError) {
     $displayFailure = [ordered]@{
         schema='playback-attr-3-cuda-venue.v1'; result='PRESENTMON_UNAVAILABLE'
         fixtureRehearsal=$FixtureRehearsal
+        displayWake=$displayWake
         reason=$presentMonWaitError
+        presentMonStatus='unavailable'
         chains=@()
         presentMonCaptureStartUtc=$presentMonCaptureStartUtc.ToString('o')
         display=$displayBlock
+        # PRESENTMON-HARNESS-ROBUSTNESS-1: the smoke run's own frame rows are already parsed and
+        # published (above, before PresentMon was ever waited on) by the time a wait failure can
+        # happen here -- carried into this typed refusal too, so a reader is not left guessing
+        # whether the app-side run produced any frame telemetry at all.
+        frameRows=$rows.Count
         sourceCommit=$SourceCommit; clipId=$ClipId; artifactRoot=$Pub
     }
     Save-Json $displayFailure (Join-Path $Pub 'summary.json')
-    Write-Output "RESULT=PRESENTMON_UNAVAILABLE REASON=`"$presentMonWaitError`" $(Get-AttrCudaDisplayResultTail $displayBlock) ARTIFACTS=$Pub"
+    # PRESENTMON-HARNESS-ROBUSTNESS-2 (fable note, applied here too -- identical convention to the
+    # spawn-guard branch above): sanitized so an exception message containing a '"' cannot garble a
+    # naive parser reading this stdout line's quoted REASON="..." field.
+    Write-Output "RESULT=PRESENTMON_UNAVAILABLE REASON=`"$(ConvertTo-AttrCudaResultLineSafeText $presentMonWaitError)`" FRAME_ROWS=$($rows.Count) $(Get-AttrCudaDisplayResultTail $displayBlock) ARTIFACTS=$Pub"
     exit 23
+}
+
+# CUDA-PERF-DISPLAY-WAKE-3 round 1b (sol BLOCKER): the two existing checkpoints above only
+# bracket the PresentMon SPAWN gap (before it starts, and again before the smoke launch) -- both
+# run before the ~40s synchronous smoke run even begins. A tick that fails DURING that measured
+# interval (or a background pipeline that dies mid-run) was recorded by the keep-alive's own
+# nudgeState, but nothing downstream ever read it again: if PresentMon still displayed at least
+# one frame, $displayReport.status reads OK regardless, and the leg would publish
+# MEASUREMENT_CAPTURED over a run whose wake mechanism had already stopped working. Read a third
+# time, right here -- PresentMon has just been waited on and confirmed done, so the measured
+# interval is unambiguously over and this is the earliest point that is true. A failure here ends
+# the leg the same typed way the earlier two checkpoints already do (never silently, and never
+# read as a clean measurement), rather than continuing on to a report that would call it OK.
+$keepAliveHealthAfterMeasuredInterval = Get-AttrCudaDisplayWakeKeepAliveHealth -Handle $displayWakeKeepAlive
+if (-not $keepAliveHealthAfterMeasuredInterval.healthy) {
+    $displayWake['keepAliveHealth'] = $keepAliveHealthAfterMeasuredInterval
+    if (Test-Path -LiteralPath $presentMonPath -PathType Leaf) {
+        [void](Publish-AttrCudaFileCopy -Source $presentMonPath -Destination (Join-Path $Pub 'presentmon.csv'))
+    }
+    $keepAliveRefusal = [ordered]@{
+        schema='playback-attr-3-cuda-venue.v1'; result='KEEPALIVE_FAILED'
+        fixtureRehearsal=$FixtureRehearsal
+        displayWake=$displayWake
+        keepAliveCheckpoint='after_measured_interval'
+        sourceCommit=$SourceCommit; clipId=$ClipId; artifactRoot=$Pub
+    }
+    Save-Json $keepAliveRefusal (Join-Path $Pub 'summary.json')
+    Write-Output "RESULT=KEEPALIVE_FAILED CHECKPOINT=after_measured_interval REASON=$($keepAliveHealthAfterMeasuredInterval.reason) ARTIFACTS=$Pub"
+    exit 26
 }
 
 # Backend-availability gate (swarm ruling, 2026-09-16): parse the run's own diagnostic
@@ -1573,9 +2009,13 @@ $diagnostics = [ordered]@{
     log = [ordered]@{ path = $runLog.path; sha256 = $runLog.sha256; bytes = $runLog.bytes; runNonce = $runLog.runNonce; source = $runLog.source; aggregateSourcePath = $runLog.aggregateSourcePath }
 }
 if (-not $verdict.admitted) {
+    # NOTE fix (fable): publish raw contact-sheet captures even on this early refusal -- see
+    # Publish-AttrCudaContactSheetRawCaptures's own header.
+    [void](Publish-AttrCudaContactSheetRawCaptures -Enabled $ContactSheetEnabled -SourceDir $contactSheetDir -PubRoot $Pub)
     $refusal = [ordered]@{
         schema='playback-attr-3-cuda-venue.v1'; result='BACKEND_NOT_AVAILABLE'
         fixtureRehearsal=$FixtureRehearsal
+        displayWake=$displayWake
         diagnostics=$diagnostics; display=$displayBlock; sourceCommit=$SourceCommit; clipId=$ClipId; artifactRoot=$Pub
     }
     Save-Json $refusal (Join-Path $Pub 'summary.json')
@@ -1583,15 +2023,19 @@ if (-not $verdict.admitted) {
     exit $verdict.exitCode
 }
 
-$gpuSummary = Get-LastGpuSummary $rawLog
+$gpuSummary = Get-LastGpuSummary $rawLog $measuredSmokeSessionId
 # CUDA gate fix (MAJOR): gpu_preview_frames is not CUDA reconstruction -- a run with
 # only preview frames and zero recon/readback/texture frames must not pass as CUDA-
 # exercised. Only recon/texture readback and no-readback frames count toward the gate.
 $gpuFramesTotal = $gpuSummary.gpuReconReadbackFrames + $gpuSummary.gpuTextureReadbackFrames + $gpuSummary.gpuTextureNoReadbackFrames
 if ($gpuFramesTotal -le 0) {
+    # NOTE fix (fable): publish raw contact-sheet captures even on this early refusal -- see
+    # Publish-AttrCudaContactSheetRawCaptures's own header.
+    [void](Publish-AttrCudaContactSheetRawCaptures -Enabled $ContactSheetEnabled -SourceDir $contactSheetDir -PubRoot $Pub)
     $fallback = [ordered]@{
         schema='playback-attr-3-cuda-venue.v1'; result='GPU_RECON_FRAMES_ZERO'
         fixtureRehearsal=$FixtureRehearsal
+        displayWake=$displayWake
         gpuSummary=$gpuSummary; display=$displayBlock; sourceCommit=$SourceCommit; clipId=$ClipId; artifactRoot=$Pub
     }
     Save-Json $fallback (Join-Path $Pub 'summary.json')
@@ -1602,6 +2046,7 @@ if ($gpuSummary.cpuFrames -gt 0) {
     $fallback = [ordered]@{
         schema='playback-attr-3-cuda-venue.v1'; result='CPU_FALLBACK_DETECTED'
         fixtureRehearsal=$FixtureRehearsal
+        displayWake=$displayWake
         gpuSummary=$gpuSummary; display=$displayBlock; sourceCommit=$SourceCommit; clipId=$ClipId; artifactRoot=$Pub
     }
     Save-Json $fallback (Join-Path $Pub 'summary.json')
@@ -1646,19 +2091,71 @@ Save-Json ([ordered]@{
 # below, and why -- persisted verbatim into every outcome's summary.json so a reader never has to
 # take the headline number's clock origin on faith.
 $displayReport = Get-AttrCudaPresentMonDisplayReport -CsvPath $presentMonPath -ResultJson $resultJson -EarliestCaptureStartUtc $presentMonCaptureStartUtc -LatestCaptureStartUtc $presentMonPostSpawnUtc
-if ($displayReport.status -ne 'OK') {
+
+# CUDA-PLAYBACK-PRESENT-CADENCE-2 round 1: DISPLAY_ASLEEP override. PresentMon is not trusted
+# on Optimus fullscreen GL (docs/playback-attr-3-cuda.md venue notes) -- a real fullscreen CUDA-
+# playback leg can present zero PresentMon-visible frames while the app itself, verified
+# fullscreen and foregrounded throughout, genuinely displayed many. Rather than fail this leg
+# closed on PresentMon's own (unreliable, on this venue) verdict, fall through to the OK path
+# when the app's OWN evidence says otherwise: new_frame_swaps (a real swap displaying content
+# the owner has not already seen -- GpuWindowSwapTelemetryCounters::newFrameSwapCount) is
+# greater than zero, AND the app's foreground/fullscreen telemetry independently confirms the
+# leg never lost fullscreen or foreground. Both conditions together, not new_frame_swaps alone:
+# a leg that lost fullscreen mid-run could still swap frames without those swaps being what a
+# viewer would call "the display". Design review, item 4 ("VERDICT FIX"): never report
+# DISPLAY_ASLEEP when new_frame_swaps>0 and fullscreen/foreground are verified; record
+# PresentMon as unavailable (not a verified negative) on this venue instead -- see the
+# presentMonStatus override further down, where $displayAsleepOverride is consumed.
+$displayAsleepForegroundVerification = Get-AttrCudaForegroundVerification -LogText $rawLog
+$displayAsleepOverridden =
+    ($displayReport.status -eq 'DISPLAY_ASLEEP') -and
+    ($null -ne $earlyAppSwapTelemetry.newFrameSwapCount) -and
+    ($earlyAppSwapTelemetry.newFrameSwapCount -gt 0) -and
+    $displayAsleepForegroundVerification.verified
+$displayAsleepOverride = [ordered]@{
+    triggered = $displayAsleepOverridden
+    presentMonReportedStatus = $displayReport.status
+    presentMonReportedReason = $displayReport.reason
+    newFrameSwapCount = $earlyAppSwapTelemetry.newFrameSwapCount
+    foregroundVerified = $displayAsleepForegroundVerification.verified
+    foregroundVerificationReason = $displayAsleepForegroundVerification.reason
+}
+if ($displayReport.status -ne 'OK' -and -not $displayAsleepOverridden) {
+    # PRESENTMON-HARNESS-ROBUSTNESS-1: the backend-eligibility gate, the GPU-frames gate and the
+    # region timing stats above have ALL already run and already succeeded by this point in the
+    # script -- $diagnostics/$gpuSummary/$gpuFramesTotal/$stats/$rows are real, computed evidence
+    # that this leg's own app-side measurement worked, not placeholders. Discarding them here,
+    # only because PresentMon itself could not verify the display side, used to throw away a leg
+    # whose measurement was fine; they are published alongside the typed refusal now, tagged with
+    # presentMonStatus so nothing downstream mistakes this for a display-verified result.
+    # PRESENTMON-HARNESS-ROBUSTNESS-2 (fable note): DISPLAY_ASLEEP is PresentMon AFFIRMATIVELY
+    # measuring zero displayed frames -- a verified negative -- not PresentMon being unable to
+    # measure at all (PRESENTMON_UNAVAILABLE). The old blanket 'unavailable' under-described the
+    # DISPLAY_ASLEEP case; tagged distinctly here so a coarse-field reader is not told PresentMon
+    # had nothing to say when it actually said "zero, confirmed". $displayReport.status itself
+    # (and the typed `result`/exit code above/below) stays authoritative either way.
+    $displayFailurePresentMonStatus = if ($displayReport.status -eq 'DISPLAY_ASLEEP') { 'verified_zero_displayed' } else { 'unavailable' }
     $displayFailure = [ordered]@{
         schema='playback-attr-3-cuda-venue.v1'; result=$displayReport.status
         fixtureRehearsal=$FixtureRehearsal
+        # CUDA-PERF-DISPLAY-WAKE-1: if this leg still ends DISPLAY_ASLEEP, the wake attempt that
+        # ran before MLVApp ever launched is right here -- never omitted on this path.
+        displayWake=$displayWake
         reason=$displayReport.reason
+        presentMonStatus=$displayFailurePresentMonStatus
         chains=$displayReport.chains
         presentMonCaptureStartUtc=$presentMonCaptureStartUtc.ToString('o')
         clockBracket=$displayReport.clockBracket
         display=$displayBlock
+        diagnostics=$diagnostics
+        gpuSummary=$gpuSummary
+        gpuFramesTotal=$gpuFramesTotal
+        frameRows=$rows.Count
+        regions=$stats
         sourceCommit=$SourceCommit; clipId=$ClipId; artifactRoot=$Pub
     }
     Save-Json $displayFailure (Join-Path $Pub 'summary.json')
-    Write-Output "RESULT=$($displayReport.status) REASON=`"$($displayReport.reason)`" $(Get-AttrCudaDisplayResultTail $displayBlock) ARTIFACTS=$Pub"
+    Write-Output "RESULT=$($displayReport.status) REASON=`"$(ConvertTo-AttrCudaResultLineSafeText $displayReport.reason)`" FRAME_ROWS=$($rows.Count) GPU_FRAMES=$gpuFramesTotal $(Get-AttrCudaDisplayResultTail $displayBlock) ARTIFACTS=$Pub"
     $displayExitCode = if ($displayReport.status -eq 'DISPLAY_ASLEEP') { 24 } else { 23 }
     exit $displayExitCode
 }
@@ -1678,6 +2175,94 @@ $pmRows | Export-Csv -LiteralPath (Join-Path $legOut 'presentmon-series.csv') -N
 # and non-positive msBetweenDisplayChange cells reading the csv this exports).
 $pmIntervalRows = @($pmRows | Where-Object { $null -ne $_.msBetweenDisplayChange -and $_.msBetweenDisplayChange -gt 0 })
 $pmStats = Get-Stats @($pmIntervalRows | ForEach-Object { [double]$_.msBetweenDisplayChange })
+# PRESENTMON-HARNESS-ROBUSTNESS-1: $displayReport.status is 'OK' here (the typed refusal above
+# already returned on anything else), meaning PresentMon confirmed at least one genuine display
+# change for MLVApp -- but that alone does not mean presentMonStats above is a real cadence
+# measurement. A leg admitting only NA-first-present row(s) (displayed via MsUntilDisplayed, no
+# prior display change to diff against) has $pmIntervalRows.Count -eq 0: pmStats.count reads 0
+# and every stat reads $null, silently, while the rest of this leg still reports
+# RESULT=MEASUREMENT_CAPTURED as if PresentMon had fully corroborated it -- exactly the "very
+# thin admitted-row count" gap disclosed on CUDA-PLAYBACK-FULLSCREEN-UI-1 r2b (a real full-screen
+# leg with presentedCount=1 displayedCount=1). Typed here as 'degraded': display is genuinely
+# confirmed, but cadence cannot be, and the reason says why -- never silent.
+#
+# PRESENTMON-HARNESS-ROBUSTNESS-2 (sol BLOCKER, PR #174 r1): the check above ($pmIntervalRows.Count
+# -gt 0) was itself too weak -- a SINGLE positive interval still read fully 'ok', so a leg that
+# could not establish cadence over the whole 25-40s playback (the disclosed full-screen leg had
+# presentedCount=1) still read as display-cadence corroborated, and the histogram consumer turned
+# that one interval into a 100% one-refresh bucket. 'ok' requires a minimum absolute COUNT of
+# positive-interval samples (below) -- an order of magnitude below the low end of the real windowed
+# range on record (~150-240 displayed rows over 25-40s), so a genuinely thin/full-screen-style leg
+# (0-2 samples) still reads degraded while a healthy leg clears it with wide margin.
+#
+# PRESENTMON-HARNESS-ROBUSTNESS-2 r1b (sol BLOCKER, pre-review): r1's coverage arm divided
+# positiveSamples by $displayReport.selectedChain.presentedCount -- both numerator and denominator
+# came from the SAME PresentMon csv, so a capture that lost the tail of a 25-40s leg after a short
+# healthy prefix still read coverage=1.0 over its own truncated rows. 'ok' now requires THREE
+# independent arms, cleared together, each named in the reason on failure:
+#   (1) COUNT: unchanged from r1, above.
+#   (2) APP-SWAP COVERAGE: positiveSamples over an app-side swap count PresentMon never produced --
+#       Get-AttrCudaAppSwapTelemetry reads the MLVApp log's own swap/frame telemetry (never this
+#       csv). A log carrying neither line leaves coverage unavailable, which fails this arm rather
+#       than dividing by zero or by a PresentMon-derived count again.
+#   (3) TEMPORAL: no gap between positive-interval rows -- including the head/tail gaps to the
+#       playback window's own bounds -- exceeds $presentMonSufficiencyMaxGapMs. (1) and (2) alone
+#       cannot catch a captured PREFIX followed by silence: a leg that captures
+#       >= $presentMonSufficiencyMinIntervalCount rows in the first couple of seconds of a 25-40s
+#       leg then loses the rest can still clear a count floor and a swap-count-based coverage ratio
+#       while having measured almost none of the actual leg. maxGapMs is an order of magnitude
+#       above the real windowed range's typical inter-sample spacing (~150-240 rows over 25-40s).
+$presentMonSufficiencyMinIntervalCount = 30
+$presentMonSufficiencyMinCoverageFraction = 0.5
+$presentMonSufficiencyMaxGapMs = 5000.0
+$presentMonPresentedCount = [int]$displayReport.selectedChain.presentedCount
+$appSwapTelemetry = Get-AttrCudaAppSwapTelemetry -LogText $rawLog
+$presentMonAppSwapCount = $appSwapTelemetry.swapCount
+$presentMonAppSwapSource = $appSwapTelemetry.source
+$presentMonCoverageAvailable = ($null -ne $presentMonAppSwapCount) -and ($presentMonAppSwapCount -gt 0)
+$presentMonCoverageFraction = if ($presentMonCoverageAvailable) { $pmIntervalRows.Count / [double]$presentMonAppSwapCount } else { 0.0 }
+$presentMonTemporal = Get-AttrCudaTemporalCoverage -TimeInMsValues @($pmIntervalRows | ForEach-Object { [double]$_.timeInMs }) -WindowStartMs $displayReport.windowStartMs -WindowEndMs $displayReport.windowEndMs -MaxGapMs $presentMonSufficiencyMaxGapMs
+$presentMonCountSufficient = ($pmIntervalRows.Count -ge $presentMonSufficiencyMinIntervalCount)
+$presentMonCoverageSufficient = ($presentMonCoverageAvailable -and ($presentMonCoverageFraction -ge $presentMonSufficiencyMinCoverageFraction))
+$presentMonTemporalSufficient = [bool]$presentMonTemporal.sufficient
+$presentMonSufficient = $presentMonCountSufficient -and $presentMonCoverageSufficient -and $presentMonTemporalSufficient
+$presentMonStatus = if ($presentMonSufficient) { 'ok' } else { 'degraded' }
+$presentMonStatusReason = if ($presentMonSufficient) {
+    $null
+} elseif ($pmIntervalRows.Count -eq 0) {
+    "PresentMon confirmed $($pmRows.Count) displayed MLVApp row(s) in the playback window, but none carried a positive MsBetweenDisplayChange interval -- every displayed sample came from MsUntilDisplayed on what PresentMon reports as an NA-first-present row, so presentMonStats has no interval to compute cadence from; display itself is still confirmed, cadence is not"
+} else {
+    $presentMonFailedArms = @()
+    if (-not $presentMonCountSufficient) {
+        $presentMonFailedArms += "count: only $($pmIntervalRows.Count) positive-interval row(s), below the minimum of $presentMonSufficiencyMinIntervalCount"
+    }
+    if (-not $presentMonCoverageSufficient) {
+        if ($presentMonCoverageAvailable) {
+            $presentMonFailedArms += "app-swap coverage: only $($pmIntervalRows.Count) positive-interval row(s) out of $presentMonAppSwapCount app-side $presentMonAppSwapSource ($([math]::Round($presentMonCoverageFraction * 100, 1))%), below the minimum of $([math]::Round($presentMonSufficiencyMinCoverageFraction * 100, 1))%"
+        } else {
+            $presentMonFailedArms += 'app-swap coverage: no independent app-side swap or frame telemetry found in the run log (neither playback_smoke.gpu_window_swaps nor playback_smoke.gate)'
+        }
+    }
+    if (-not $presentMonTemporalSufficient) {
+        $presentMonFailedArms += "temporal: a $([math]::Round($presentMonTemporal.maxGapMs / 1000.0, 1))s $($presentMonTemporal.gapKind) gap between positive-interval rows exceeds the $([math]::Round($presentMonSufficiencyMaxGapMs / 1000.0, 1))s ceiling"
+    }
+    "PresentMon's display-cadence evidence is too thin to corroborate as measured -- $($presentMonFailedArms -join '; ') -- display itself is still confirmed, cadence is not"
+}
+# CUDA-PLAYBACK-PRESENT-CADENCE-2 round 1: the DISPLAY_ASLEEP override above (see
+# $displayAsleepOverride) means $pmRows/$pmIntervalRows are empty here -- PresentMon reported
+# zero displayed rows on this venue, not a genuine cadence gap -- so the sufficiency arithmetic
+# just computed would otherwise read 'degraded' with a misleading "too thin" reason. Overridden
+# to 'unavailable', distinct from both 'ok' and 'degraded': PresentMon had nothing usable to say
+# on this venue at all, never a verified negative and never a real-but-thin measurement.
+if ($displayAsleepOverridden) {
+    $presentMonStatus = 'unavailable'
+    $presentMonStatusReason =
+        "PresentMon reported DISPLAY_ASLEEP (reason: $($displayReport.reason)) -- not trusted " +
+        "on Optimus fullscreen GL (docs/playback-attr-3-cuda.md venue notes). Overridden: the " +
+        "app's own new_frame_swaps=$($appSwapTelemetry.newFrameSwapCount) and verified " +
+        "foreground/fullscreen telemetry (fullscreen_lost_count=0, foreground_lost_count=0 " +
+        "throughout) confirm real on-screen display that PresentMon could not observe on this venue."
+}
 
 $dllSha256Lower = (Get-Sha $reconDll).ToLowerInvariant()
 # $pendingSymbolPresence came from the build manifest above, whose dll.sha256 was verified
@@ -1690,6 +2275,10 @@ $provenance = [ordered]@{
     # A rehearsal is carried by the provenance sidecar too: a reader who consults only this file
     # must still be told that these numbers are a plumbing proof (sol, PR #137 r1).
     fixtureRehearsal = $FixtureRehearsal
+    # CUDA-PLAYBACK-PRESENT-CADENCE-1 round 2: which telemetry arm this leg ran, so a reader of
+    # provenance.json alone (never cross-referencing the launch command) can still tell a LIGHT
+    # counters-only leg apart from a HEAVY fully-verbose one.
+    telemetryArm = $TelemetryArm
 }
 Save-Json $provenance (Join-Path $Pub 'provenance.json')
 
@@ -1703,6 +2292,9 @@ $manifest = [ordered]@{
     sourceCommit = $SourceCommit
     clipId = $ClipId
     fixtureRehearsal = $FixtureRehearsal
+    # CUDA-PERF-DISPLAY-WAKE-1: the wake attempt made before MLVApp launched for this leg.
+    displayWake = $displayWake
+    telemetryArm = $TelemetryArm
     # A rehearsal cites no consent receipt: the fixtures are repository bytes, and recording the
     # owner-footage receipt here would be misleading provenance (sol, PR #137 r2 minor).
     consentReceipt = $(if ($FixtureRehearsal) { $null } else { $ConsentReceiptFileName })
@@ -1714,19 +2306,24 @@ $manifest = [ordered]@{
     reconDll = [ordered]@{ name=$ReconName; sha256=(Get-Sha $reconDll) }
     presentMon = [ordered]@{
         name=$PresentMonName; sha256=$PresentMonSha; launch='direct-child-inherits-job-temp'
-        # CUDA-PERF-DISPLAY-IDENTITY-HARNESS-1: display rates are reported for the MLVApp preview
-        # chain only -- selectedChain names which (ProcessID, SwapChainAddress) that is; chains
-        # lists every group PresentMon reported inside the playback window, for audit.
         chains=$displayReport.chains
         selectedChain=$displayReport.selectedChain
-        # CUDA-PERF-DISPLAY-IDENTITY-HARNESS-3 (sol BLOCKER): this is the count of rows that fed
-        # presentMonStats below -- i.e. rows with a positive msBetweenDisplayChange interval, the
-        # same population as $pmIntervalRows -- not $pmRows.Count (every displayed row, including
-        # the interval-less NA-first-present one), which the name previously read from and which
-        # inflated this above the sample size the statistics below were actually computed on.
+        # positiveSamples: positive-interval rows (presentMonStats' own population); presentedCount
+        # is PresentMon's own count, audit only -- coverage below divides by appSwapCount instead.
         positiveSamples=$pmIntervalRows.Count
+        presentedCount=$presentMonPresentedCount
+        appSwapCount=$presentMonAppSwapCount
+        appSwapSource=$presentMonAppSwapSource
+        coverageFraction=$presentMonCoverageFraction
+        temporalMaxGapMs=$presentMonTemporal.maxGapMs
+        temporalGapKind=$presentMonTemporal.gapKind
         clockBracket=$displayReport.clockBracket
+        sufficiency=[ordered]@{ minIntervalCount=$presentMonSufficiencyMinIntervalCount; minCoverageFraction=$presentMonSufficiencyMinCoverageFraction; maxGapMs=$presentMonSufficiencyMaxGapMs; countSufficient=$presentMonCountSufficient; coverageSufficient=$presentMonCoverageSufficient; temporalSufficient=$presentMonTemporalSufficient; sufficient=$presentMonSufficient }
+        status=$presentMonStatus
+        statusReason=$presentMonStatusReason
     }
+    appSwapTelemetry = $appSwapTelemetry
+    displayAsleepOverride = $displayAsleepOverride
     environmentBoundary = [ordered]@{ jobTempDir=$Scratch; allChildrenInheritJobTemp=$true }
     # Round 2b: recorded on this PASS path too, not only on a VENUE_NOT_QUIESCENT refusal.
     cpuQuiescence = [ordered]@{
@@ -1755,6 +2352,7 @@ Save-Json $manifest (Join-Path $Pub 'evidence-manifest.json')
 Save-Json ([ordered]@{
     result = $(if ($FixtureRehearsal) { 'FIXTURE_REHEARSAL_CAPTURED' } else { 'MEASUREMENT_CAPTURED' })
     fixtureRehearsal = $FixtureRehearsal
+    displayWake = $displayWake
     sourceCommit = $SourceCommit
     clipId = $ClipId
     rows = $rows.Count
@@ -1762,12 +2360,159 @@ Save-Json ([ordered]@{
     cpuFrames = $gpuSummary.cpuFrames
     presentMonSamples = $pmRows.Count
     presentMonSelectedChain = $displayReport.selectedChain
+    presentMonStatus = $presentMonStatus
+    presentMonStatusReason = $presentMonStatusReason
+    # PRESENTMON-HARNESS-ROBUSTNESS-2: the sufficiency gate's inputs and verdict, at top level
+    # (not only nested under evidence-manifest.json's presentMon block) since summary.json is the
+    # first file a reader opens -- see the manifest's own comment for the rule.
+    presentMonPositiveSamples = $pmIntervalRows.Count
+    presentMonPresentedCount = $presentMonPresentedCount
+    presentMonAppSwapCount = $presentMonAppSwapCount
+    presentMonAppSwapSource = $presentMonAppSwapSource
+    newFrameSwapCount = $appSwapTelemetry.newFrameSwapCount
+    displayAsleepOverride = $displayAsleepOverride
+    presentMonCoverageFraction = $presentMonCoverageFraction
+    presentMonTemporalMaxGapMs = $presentMonTemporal.maxGapMs
+    presentMonTemporalGapKind = $presentMonTemporal.gapKind
+    presentMonSufficiency = [ordered]@{
+        minIntervalCount=$presentMonSufficiencyMinIntervalCount
+        minCoverageFraction=$presentMonSufficiencyMinCoverageFraction
+        maxGapMs=$presentMonSufficiencyMaxGapMs
+        countSufficient=$presentMonCountSufficient
+        coverageSufficient=$presentMonCoverageSufficient
+        temporalSufficient=$presentMonTemporalSufficient
+        sufficient=$presentMonSufficient
+    }
     clockBracket = $displayReport.clockBracket
     cpuQuiescence = $manifest.cpuQuiescence
     diagnostics = $diagnostics
     display = $displayBlock
     artifactRoot = $Pub
 }) (Join-Path $Pub 'summary.json')
+# CUDA-PLAYBACK-CONTACT-SHEET-1: publish the raw per-frame PNG+JSON pairs the app's own
+# --contact-sheet-dir pass wrote (a no-op, touching nothing, when the switch was off -- see
+# $contactSheetDir's declaration above). Composing them into one labelled sheet is left to a
+# later step, off this job (see the -ContactSheet param's own comment). Published BEFORE the
+# artifact index below so these land in it the same way every other published file does.
+if ($ContactSheetEnabled -and $contactSheetDir -and (Test-Path -LiteralPath $contactSheetDir)) {
+    $contactSheetPubDir = Publish-AttrCudaContactSheetRawCaptures -Enabled $ContactSheetEnabled -SourceDir $contactSheetDir -PubRoot $Pub
+    # CUDA-PLAYBACK-CONTACT-SHEET-1 r1b: compose the raw captures into one labelled sheet +
+    # stats sidecar right here, in the job's publish step, so a reader gets the composed
+    # artifact without running make-contact-sheet.py by hand. Pillow/numpy (and Python
+    # itself) are not guaranteed on every venue -- probe first and degrade to a typed,
+    # non-fatal marker (never fail the whole job) when either is missing; the hub can
+    # still compose locally from the published raw frames in that case.
+    $contactSheetComposeMarker = $null
+    $contactSheetPyExe = $null
+    $contactSheetPyPrefixArgs = @()
+    # HARDENING (r1d, sol pre-review #2): any deps-probe child that is still alive after a
+    # timed-out Kill() attempt is recorded here, regardless of whether a LATER candidate goes
+    # on to provide a usable interpreter -- published unconditionally below (never folded only
+    # into the "no interpreter found" marker, which a later candidate's success would bypass).
+    $contactSheetOrphanNotes = [System.Collections.Generic.List[object]]::new()
+    # BLOCKER fix (r1c): a `-c 'import PIL, numpy'` -ArgumentList element does not survive
+    # Start-Process's own argument-list-to-command-line join on every venue -- confirmed on
+    # this host, where the direct `python -c "import PIL, numpy"` shell invocation exits 0
+    # but the equivalent Start-Process -ArgumentList @('-c','import PIL, numpy') shape exits
+    # 1, so a capable venue was falsely marked as lacking the dependency. A file path has no
+    # such quoting/joining hazard: probe with one small script file instead of an inline -c
+    # program string.
+    $contactSheetDepsProbeScriptPath = Join-Path $Work 'contact-sheet-deps-probe.py'
+    [void](Publish-AttrCudaText -Path $contactSheetDepsProbeScriptPath -Value "import PIL`nimport numpy")
+    foreach ($candidate in @(
+        [pscustomobject]@{ exe = 'python.exe'; prefix = @() },
+        [pscustomobject]@{ exe = 'py.exe'; prefix = @('-3') }
+    )) {
+        if ($null -ne $contactSheetPyExe) { continue }
+        try {
+            $depsArgs = @($candidate.prefix) + @($contactSheetDepsProbeScriptPath)
+            $depsProc = Start-Process -FilePath $candidate.exe -ArgumentList $depsArgs -PassThru -WindowStyle Hidden
+            if (-not $depsProc.WaitForExit(20000)) {
+                # HARDENING (r1d, sol pre-review #2): an empty catch around a bare Kill() left
+                # no trace of a probe child that survived both the timeout and the kill attempt
+                # -- mirror Stop-PresentMonCapture's own already-tested Kill()+bounded-
+                # WaitForExit()+confirmedExited pattern instead of assuming Kill() succeeded.
+                $depsStop = Stop-PresentMonCapture $depsProc
+                if (-not $depsStop.confirmedExited) {
+                    $contactSheetOrphanNotes.Add(
+                        "dependency probe ($($candidate.exe)) did not exit after Kill() " +
+                        "(killError=$($depsStop.killError) waitError=$($depsStop.waitError))")
+                }
+            } elseif ($depsProc.ExitCode -eq 0) {
+                $contactSheetPyExe = $candidate.exe
+                $contactSheetPyPrefixArgs = $candidate.prefix
+            }
+        } catch {
+            continue
+        }
+    }
+    if ($null -eq $contactSheetPyExe) {
+        $contactSheetComposeMarker = 'CONTACT_SHEET_COMPOSE_UNAVAILABLE no Python 3 interpreter with Pillow+numpy was found on this venue'
+    } else {
+        $contactSheetComposerPayload = Read-AttrCudaBase64Payload -Base64 $ContactSheetComposerPyBase64
+        if ($contactSheetComposerPayload.sha256 -ne $ContactSheetComposerSha256) {
+            $contactSheetComposeMarker = 'CONTACT_SHEET_COMPOSE_UNAVAILABLE embedded composer sha256 mismatch'
+        } else {
+            $contactSheetComposerScriptPath = Join-Path $Work 'contact-sheet-composer.py'
+            [void](Publish-AttrCudaBytes -Path $contactSheetComposerScriptPath -Bytes $contactSheetComposerPayload.bytes)
+            $contactSheetSheetOut = Join-Path $Pub 'contact-sheet\sheet.png'
+            $contactSheetStatsOut = Join-Path $Pub 'contact-sheet\stats.json'
+            $contactSheetBackendLabel = if ($FixtureRehearsal) { 'fixture' } else { 'cuda' }
+            # CUDA-PLAYBACK-CONTACT-SHEET-1 r1d (sol BLOCKER): without host/GPU/scale every
+            # job-composed sheet's header reads host=unknown gpu=unknown scale=unknown,
+            # defeating a side-by-side host/build/look comparison. Host is this job's own
+            # venue -- the same $env:COMPUTERNAME value ultra-magnus-agent.ps1's own
+            # result.json envelope records as its `host` field, captured independently here
+            # since this job composes the sheet before that envelope is written. GPU and
+            # scale are read from $verdict (the SAME gpu_playback_recon.eligibility line
+            # already parsed above for the backend-availability gate), never re-probed --
+            # [string] so an unset $verdict (e.g. this step run standalone in a test) yields
+            # an empty string, never $null, which the composer renders as "unknown", never a
+            # guessed real value.
+            $contactSheetHostLabel = [string]$env:COMPUTERNAME
+            $contactSheetGpuLabel = [string]$verdict.cudaBackendDescription
+            $contactSheetScaleLabel = [string]$verdict.scale
+            $composeArgs = @($contactSheetPyPrefixArgs) + @(
+                $contactSheetComposerScriptPath,
+                '--frames-dir', $contactSheetPubDir,
+                '--sheet-out', $contactSheetSheetOut,
+                '--stats-out', $contactSheetStatsOut,
+                '--clip-id', $ClipId,
+                '--host', $contactSheetHostLabel,
+                '--gpu', $contactSheetGpuLabel,
+                '--build-sha', $SourceCommit,
+                '--backend', $contactSheetBackendLabel,
+                '--scale', $contactSheetScaleLabel
+            )
+            # BLOCKER fix (r1d): quote every element -- see ConvertTo-AttrCudaQuotedProcessArgument's
+            # own header for why an unquoted GPU description would silently split across argv.
+            $composeArgs = @($composeArgs | ForEach-Object { ConvertTo-AttrCudaQuotedProcessArgument -Value $_ })
+            try {
+                $composeProc = Start-Process -FilePath $contactSheetPyExe -ArgumentList $composeArgs -PassThru -WindowStyle Hidden
+                if (-not $composeProc.WaitForExit(60000)) {
+                    # HARDENING (r1d, sol pre-review #2): same fix as the deps-probe above -- a
+                    # bounded WaitForExit after Kill(), with the outcome folded into this leg's
+                    # own marker rather than swallowed by an empty catch.
+                    $composeStop = Stop-PresentMonCapture $composeProc
+                    $contactSheetComposeMarker = 'CONTACT_SHEET_COMPOSE_UNAVAILABLE composer did not exit within 60s'
+                    if (-not $composeStop.confirmedExited) {
+                        $contactSheetComposeMarker += " (still running after Kill(): killError=$($composeStop.killError) waitError=$($composeStop.waitError))"
+                    }
+                } elseif ($composeProc.ExitCode -ne 0 -or -not (Test-Path -LiteralPath $contactSheetSheetOut) -or -not (Test-Path -LiteralPath $contactSheetStatsOut)) {
+                    $contactSheetComposeMarker = "CONTACT_SHEET_COMPOSE_UNAVAILABLE composer exited $($composeProc.ExitCode) or did not write its outputs"
+                }
+            } catch {
+                $contactSheetComposeMarker = "CONTACT_SHEET_COMPOSE_UNAVAILABLE $($_.Exception.Message)"
+            }
+        }
+    }
+    if ($null -ne $contactSheetComposeMarker) {
+        [void](Publish-AttrCudaText -Path (Join-Path $Pub 'contact-sheet\compose-status.txt') -Value $contactSheetComposeMarker)
+    }
+    if ($contactSheetOrphanNotes.Count -gt 0) {
+        [void](Publish-AttrCudaText -Path (Join-Path $Pub 'contact-sheet\compose-warnings.txt') -Value ($contactSheetOrphanNotes -join "`n"))
+    }
+}
 $files = Get-ChildItem -LiteralPath $Pub -Recurse -File | ForEach-Object { [ordered]@{ path=$_.FullName.Substring($Pub.Length + 1); sha256=(Get-Sha $_.FullName); bytes=$_.Length } }
 Save-Json ([ordered]@{ schema='playback-attr-3-cuda-artifact-index.v1'; artifactRoot=$Pub; fixtureRehearsal=$FixtureRehearsal; files=$files }) (Join-Path $Pub 'artifact-index.json')
 # The agent-visible result line says which kind of run this was, in the verb itself: the agent's
@@ -1775,12 +2520,20 @@ Save-Json ([ordered]@{ schema='playback-attr-3-cuda-artifact-index.v1'; artifact
 # still cannot mistake a rehearsal for a measurement.
 $resultVerb = if ($FixtureRehearsal) { 'FIXTURE_REHEARSAL_CAPTURED' } else { 'MEASUREMENT_CAPTURED' }
 $cpuTimeResultField = if ($cpuTimeUnknown) { 'unknown' } else { $avgTime }
-Write-Output "RESULT=$resultVerb FIXTURE_REHEARSAL=$FixtureRehearsal SOURCE=$SourceCommit CLIP=$ClipId ROWS=$($rows.Count) GPU_FRAMES=$gpuFramesTotal CPU_FRAMES=$($gpuSummary.cpuFrames) PRESENTMON_SAMPLES=$($pmRows.Count) CPU_TIME=$cpuTimeResultField CPU_UTILITY=$avgUtility $(Get-AttrCudaDisplayResultTail $displayBlock) ARTIFACTS=$Pub"
+Write-Output "RESULT=$resultVerb FIXTURE_REHEARSAL=$FixtureRehearsal SOURCE=$SourceCommit CLIP=$ClipId ROWS=$($rows.Count) GPU_FRAMES=$gpuFramesTotal CPU_FRAMES=$($gpuSummary.cpuFrames) PRESENTMON_SAMPLES=$($pmRows.Count) CPU_TIME=$cpuTimeResultField CPU_UTILITY=$avgUtility PRESENTMON_STATUS=$presentMonStatus PRESENTMON_COVERAGE=$([math]::Round($presentMonCoverageFraction, 3)) NEW_FRAME_SWAPS=$($appSwapTelemetry.newFrameSwapCount) DISPLAY_ASLEEP_OVERRIDDEN=$displayAsleepOverridden $(Get-AttrCudaDisplayResultTail $displayBlock) ARTIFACTS=$Pub"
 exit 0
 } finally {
     if ($OwnerClipDir) {
         Close-AttrCudaOwnerFootageWorkspace -Handles $ownerLinkHandles -Directory $OwnerClipDir
     }
+    # CUDA-PERF-DISPLAY-WAKE-2: stop the periodic keep-alive first -- releases its background
+    # Runspace -- before releasing the execution-state request itself, on every exit path from
+    # the try above, including an early `exit N`. Stop-AttrCudaDisplayWakeKeepAlive tolerates a
+    # $null handle, so this is safe even if the try above threw before Start- was reached.
+    [void](Stop-AttrCudaDisplayWakeKeepAlive -Handle $displayWakeKeepAlive)
+    # CUDA-PERF-DISPLAY-WAKE-1: released on every exit path from the try above, including an
+    # early `exit N` -- never left held past this leg regardless of how it ended.
+    [void](Stop-AttrCudaDisplayWake)
 }
 '@
 
@@ -1815,6 +2568,12 @@ $text = Expand-AttrCudaTemplate -Template $template -Tokens ([ordered]@{
     FIXTURE_REHEARSAL = $fixtureRehearsalLiteral
     AGENT_ROOT = $AgentRoot
     FIXTURE_SHA256 = $FixtureSha256
+    CONTACT_SHEET_ENABLED = $contactSheetEnabledLiteral
+    CONTACT_SHEET_FRAME_COUNT = $contactSheetFrameCountLiteral
+    CONTACT_SHEET_COMPOSER_PY_BASE64 = $contactSheetComposerPyBase64
+    CONTACT_SHEET_COMPOSER_SHA256 = $contactSheetComposerSha256ForTemplate
+    TELEMETRY_ARM = $TelemetryArm
+    DISABLE_PAINT_PER_SUBMIT = $disablePaintPerSubmitLiteral
     EMBEDDED_FUNCTIONS = $embeddedFunctions
 })
 

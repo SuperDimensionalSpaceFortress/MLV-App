@@ -239,6 +239,8 @@ REGISTER_ROWS_WITH_DENY_CASES = (
     # NA-10 joined the register at v18 (O129, hub extension) and is enforced by this hook,
     # so it joins the gate: a row with zero DENY cases is a rule with no proof.
     "NA-10",
+    # NA-11: Agent Bridge SoT suspend (owner ruling 2026-09-09).
+    "NA-11",
 )
 
 APP_ID = 15368
@@ -580,6 +582,13 @@ NA10_HOOK_SCRIPT = "{REPO}/tools/hooks/mlv-never-authorized.py"
 NA10_VERIFIER = "{REPO}/tools/gates/verify_consented_footage.py"
 NA10_UNRELATED = "{REPO}/src/mlv/video_mlv.c"
 NA10_NEW_TEXT = "# rewritten by the lane this gate governs\n"
+
+# NA-11: Agent Bridge SoT — deny tools/agent-bridge/** writes under the lane worktree
+# (NA-7 allows the worktree by construction, so DENY is attributable to NA-11).
+NA11_BRIDGE_FILE = "{REPO}/tools/agent-bridge/bridge_core.py"
+NA11_BRIDGE_NESTED = "{REPO}/tools/agent-bridge/pkg/session.py"
+NA11_OUTSIDE_AGENTS = "{REPO}/agents/agent-bridge-source-of-truth.md"
+NA11_NEW_TEXT = "# suspended in-tree agent-bridge churn\n"
 
 
 # --------------------------------------------------------------------------- table
@@ -3383,6 +3392,63 @@ CASES = [
         "expect": "ALLOW",
         "fixture": "venue_at_worktree",
     },
+    # ------------------------------------------------- NA-11: Agent Bridge SoT suspend
+    #
+    # Owner ruling 2026-09-09. Deny Write/Edit/shell truncating writes under
+    # tools/agent-bridge/**. agents/ docs are outside the prefix (ALLOW control).
+    # Fail-closed: no MLV_ALLOW_* escape. Board venue does NOT unlock (unlike NA-10).
+    {
+        "name": "na11 write under tools/agent-bridge at lane venue",
+        "group": "na11",
+        "tool": "Write",
+        "input": {"file_path": NA11_BRIDGE_FILE, "content": NA11_NEW_TEXT},
+        "expect": "DENY",
+        "na": "NA-11",
+        "reason_contains": "tools/agent-bridge",
+        "fixture": "venue_at_worktree",
+    },
+    {
+        "name": "na11 edit nested under tools/agent-bridge",
+        "group": "na11",
+        "tool": "Edit",
+        "input": {
+            "file_path": NA11_BRIDGE_NESTED,
+            "old_string": "x = 0\n",
+            "new_string": "x = 1\n",
+        },
+        "expect": "DENY",
+        "na": "NA-11",
+        "reason_contains": "layibabalola/agent-bridge",
+        "fixture": "venue_at_worktree",
+    },
+    {
+        "name": "na11 shell set-content under tools/agent-bridge",
+        "group": "na11",
+        "tool": "PowerShell",
+        "input": {"command": _set_content(NA11_BRIDGE_FILE)},
+        "expect": "DENY",
+        "na": "NA-11",
+        "reason_contains": "tools/agent-bridge",
+        "fixture": "venue_at_worktree",
+    },
+    {
+        "name": "na11 write under tools/agent-bridge at board venue still denied",
+        "group": "na11",
+        "tool": "Write",
+        "input": {"file_path": NA11_BRIDGE_FILE, "content": NA11_NEW_TEXT},
+        "expect": "DENY",
+        "na": "NA-11",
+        "reason_contains": "suspended",
+        "fixture": "venue_at_board",
+    },
+    {
+        "name": "na11 control agents SoT doc outside package is allowed",
+        "group": "na11",
+        "tool": "Write",
+        "input": {"file_path": NA11_OUTSIDE_AGENTS, "content": NA11_NEW_TEXT},
+        "expect": "ALLOW",
+        "fixture": "venue_at_worktree",
+    },
     # ------------------------------------ HOOK-FALSE-POSITIVE-1: the falsifier PAIRS
     #
     # MEASURED, NOT ARGUED.  On 2026-09-07/08 the hub measured this gate refusing read-only
@@ -5765,10 +5831,11 @@ class MlvNeverAuthorizedHookTests(unittest.TestCase):
                 os.environ["MLV_BOARD_ROOT"] = saved
 
     def test_every_register_row_has_at_least_one_deny_case(self):
-        """The suite FAILS if any of NA-1,2,3,4,6,7,8,9,10 has zero DENY cases.
+        """The suite FAILS if any of NA-1,2,3,4,6,7,8,9,10,11 has zero DENY cases.
 
         NA-10 joined the list at register v18 (O129, hub extension): a rule the hook
         enforces but the table does not falsify is a rule nobody can tell is still wired.
+        NA-11 joined at v27 (Agent Bridge SoT suspend, 2026-09-09).
         """
         covered = set(
             case["na"] for case in CASES if case["expect"] == "DENY" and "na" in case
@@ -6010,6 +6077,11 @@ class MlvNeverAuthorizedHookTests(unittest.TestCase):
         self.assertEqual(counts.get("na3"), 5, "5 NA-3 claude-auth rows")
         self.assertEqual(counts.get("na3_persistent"), 6, "6 NA-3 O129 persistent-scope rows")
         self.assertEqual(counts.get("na10"), 7, "7 NA-10 self-edit rows")
+        # `na11` is NEW at register v27 via #107 (Agent Bridge SoT suspend, owner ruling
+        # 2026-09-09): three DENY writes at a lane venue (Write, nested Edit, shell
+        # Set-Content), one DENY at the BOARD venue (NA-11 has no venue unlock), and the
+        # agents/ SoT-doc ALLOW control that keeps the rule about the package path.
+        self.assertEqual(counts.get("na11"), 5, "5 NA-11 agent-bridge SoT rows")
         # PINNED, NEW at the thirteenth commit (S131): a NEW group, 3 rows -- the `setx.exe`
         # credential-prefix bypass, the `setx.exe` persistent-name bypass, and the fully
         # qualified `[System.Environment]::SetEnvironmentVariable` persistent-name bypass.
@@ -6815,7 +6887,19 @@ CONSENTED_IDS_PINNED = (
     "M17-1207",
     "M15-1320",
     "M16-1210",
+    # FOOTAGE-ADMIT-HFR-1 (2026-09-28): a later, separately consented admission; its citation
+    # lives in the table's "admissions" mapping, not in the original "authority".
+    "M16-1456",
 )
+# Later admissions, pinned: id -> (card, purposes, consent receipt sha256, recordedUtc).
+CONSENT_ADMISSIONS_PINNED = {
+    "M16-1456": (
+        "FOOTAGE-ADMIT-HFR-1",
+        ("PLAYBACK-HFR-CONFORM-DEFAULT-1", "CUDA playback measurement"),
+        "1dbbe30eeedac971861110a3dc47822ea33f2de26d8ea51164c15a497196f5d0",
+        "2026-09-28T16:13:33Z",
+    ),
+}
 # sha256 of the raw JSONL line bytes EXCLUDING the line terminator.
 OWNER_CONSENT_LINE = 1739
 OWNER_CONSENT_LINE_SHA256 = "461af7a5291099e009230a8abcfe547e064435287a23f40cf93e5ba4ddb0a066"
@@ -6830,7 +6914,9 @@ REGISTER_DOC = os.path.join(REPO_ROOT, "docs", "never-authorized.json")
 # `_canonical_consent_table` over the WHOLE table (ids, per-part length, content sha256 and
 # path_norm_sha256, part counts, purposes and citations), and each id's part count.  An
 # in-place hash swap or an appended part row changes the digest; the latter also a count.
-OWNER_CONSENT_TABLE_SHA256 = "38a4e60b7f4e1a484d361d175d839314c87d49063adb5760ac3a9f07aa9c860a"
+# FOOTAGE-ADMIT-HFR-1 re-pinned this digest (was 38a4e60b...c860a) when M16-1456 and the
+# "admissions" citation were added; every earlier entry is byte-identical.
+OWNER_CONSENT_TABLE_SHA256 = "60578c52c682a88d0cef9159b378b0ccd235f5bcf9c71f87ada7475f58a8b4f8"
 OWNER_CONSENT_PART_COUNTS = {
     "M16-1243": 2,
     "M16-1327": 2,
@@ -6838,6 +6924,7 @@ OWNER_CONSENT_PART_COUNTS = {
     "M17-1207": 2,
     "M15-1320": 2,
     "M16-1210": 2,
+    "M16-1456": 1,
 }
 
 
@@ -7685,7 +7772,7 @@ class OwnerConsentedFootageTests(unittest.TestCase):
 
     def test_the_frozen_consent_table_is_exactly_the_six_consented_ids(self):
         table = self.module.OWNER_CONSENTED_FOOTAGE
-        self.assertEqual(len(table["clips"]), 6)
+        self.assertEqual(len(table["clips"]), 7)  # the six plus FOOTAGE-ADMIT-HFR-1's M16-1456
         self.assertEqual(sorted(table["clips"]), sorted(CONSENTED_IDS_PINNED))
         self.assertNotIn("M02-1344", table["clips"])
         path_hashes = []
@@ -7724,6 +7811,28 @@ class OwnerConsentedFootageTests(unittest.TestCase):
         self.assertEqual(directive["sha256"], OWNER_DIRECTIVE_LINE_SHA256)
         self.assertIn("derived by the hub", authority["scope_derivation"])
         self.assertIn("M02-1344 excluded (not acquired)", authority["scope_derivation"])
+
+    def test_later_admissions_carry_their_own_card_purposes_and_consent_receipt(self):
+        # FOOTAGE-ADMIT-HFR-1.  Every id outside the original six must be cited in
+        # "admissions", and every admission must name an id that is in "clips".
+        table = self.module.OWNER_CONSENTED_FOOTAGE
+        admissions = table["admissions"]
+        self.assertEqual(sorted(admissions), sorted(CONSENT_ADMISSIONS_PINNED))
+        self.assertEqual(
+            sorted(set(table["clips"]) - set(admissions)),
+            sorted(set(CONSENTED_IDS_PINNED) - set(CONSENT_ADMISSIONS_PINNED)),
+        )
+        for clip_id, (card, purposes, receipt_sha, recorded) in CONSENT_ADMISSIONS_PINNED.items():
+            with self.subTest(clip_id=clip_id):
+                self.assertIn(clip_id, table["clips"])
+                entry = admissions[clip_id]
+                self.assertEqual(entry["card"], card)
+                self.assertEqual(tuple(entry["purposes"]), purposes)
+                self.assertEqual(entry["consent_receipt_sha256"], receipt_sha)
+                self.assertEqual(entry["recordedUtc"], recorded)
+                self.assertIn(r"\receipts\owner-footage-consent-", entry["consent_receipt"])
+        with self.assertRaises(TypeError):
+            admissions["M02-1344"] = {}  # frozen: a mapping proxy refuses assignment
 
     def test_the_frozen_consent_table_matches_the_register_text(self):
         with open(REGISTER_DOC, "r", encoding="utf-8") as handle:
@@ -7775,6 +7884,11 @@ class OwnerConsentedFootageTests(unittest.TestCase):
         _assert_no_exclusive_route_claim(self, act, "NA-4 register act")
         for purpose in self.module.OWNER_CONSENTED_FOOTAGE["purposes"]:
             self.assertIn(purpose, act)
+        for clip_id, entry in self.module.OWNER_CONSENTED_FOOTAGE["admissions"].items():
+            with self.subTest(admission=clip_id):
+                self.assertIn(entry["card"], act)
+                for purpose in entry["purposes"]:
+                    self.assertIn(purpose, act)
         enforced = na4[0]["enforced_after_0_1"]
         self.assertNotIn("exception (3)", enforced)
         self.assertIn(

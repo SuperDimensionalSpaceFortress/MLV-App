@@ -32,6 +32,7 @@
 #include "rt_math.h"
 #include "median.h"
 #include "StopWatch.h"
+#include <new>
 
 #define TS 144
 

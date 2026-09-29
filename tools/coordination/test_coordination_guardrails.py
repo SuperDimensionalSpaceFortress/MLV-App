@@ -1417,21 +1417,50 @@ def test_receipt_effort_field_already_records_the_same_resolved_value_that_is_ap
 def test_fable_lane_resolves_to_high_effort_by_default():
     # Binding fleet owner ruling, 2026-09-08: Fable spends tokens only on important complex
     # reviews and runs at high effort by default (agents/orchestration-tiering.md).
+    # LANE-MODEL-CURRENCY-1 (2026-09-26): the pinned id `claude-fable-5` is replaced by the
+    # floating CLI alias `fable`, so the row can never go stale the way a pinned id would.
     body = LANE_RUNNER.read_text(encoding="utf-8")
-    assert "fable  = @{ engine = 'claude'; model = 'claude-fable-5'; effort = 'high';" in body
+    assert "fable  = @{ engine = 'claude'; model = 'fable';  effort = 'high';" in body
 
 
-def test_astra_lane_row_is_a_read_only_xhigh_codex_judgement_lane():
+def test_astra_lane_row_is_a_read_only_high_effort_codex_judgement_lane():
+    # LANE-MODEL-CURRENCY-1 (owner ruling 2026-09-26): astra's earlier 'xhigh' effort and
+    # pinned `gpt-6-astra` id are both superseded -- every lane, astra included, now runs at
+    # 'high' effort (never max/xhigh), and a codex row names a TIER ('astra'), resolved to the
+    # current highest-version slug at launch by Resolve-CodexModelTier, never a pinned slug.
     body = LANE_RUNNER.read_text(encoding="utf-8")
-    assert "astra  = @{ engine = 'codex';  model = 'gpt-6-astra';    effort = 'xhigh';  role = 'judgement-design-arbiter' }" in body
+    assert "astra  = @{ engine = 'codex';  tier = 'astra';   effort = 'high'; role = 'design-arbiter' }" in body
     assert "ValidateSet('opus', 'sonnet', 'fable', 'sol', 'luna', 'astra')" in body
+
+
+def test_lanes_table_pins_no_model_id_and_every_effort_is_high():
+    # LANE-MODEL-CURRENCY-1: the defect class this card closes is a version written down
+    # somewhere going stale. Every claude row's `model` must be a bare CLI alias (never a
+    # `claude-*` id), every codex row must name a `tier` (never a `gpt-*` id), and every row's
+    # effort must be exactly 'high' -- never max/xhigh, per the owner's ruling.
+    body = LANE_RUNNER.read_text(encoding="utf-8")
+    lanes_block = body[body.index("$LANES = @{"):body.index("# Absolute launcher paths")]
+    lane_lines = [ln for ln in lanes_block.splitlines() if "engine = " in ln]
+    assert len(lane_lines) == 6, "expected six lane rows (opus, sonnet, fable, sol, luna, astra)"
+    for line in lane_lines:
+        assert not re.search(r"model = 'claude-[a-z0-9.-]+'", line), (
+            "a claude-engine row pins a versioned model id instead of a floating alias: %s" % line
+        )
+        assert not re.search(r"'gpt-[0-9]", line), (
+            "a codex-engine row pins a versioned model slug instead of a tier: %s" % line
+        )
+        assert "effort = 'high'" in line, "every lane row must resolve to 'high' effort: %s" % line
+        if "engine = 'claude'" in line:
+            assert "model = '" in line and "tier = " not in line
+        else:
+            assert "tier = '" in line and "model = " not in line
 
 
 def test_astra_reuses_the_engine_generic_codex_argv_branch_verbatim():
     """No lane-specific branch exists or is needed: the codex argv-build block keys off
     $cfg.engine/$cfg.model/$cfg.effort/$sandbox, all resolved from the SAME table row lookup
     every other codex lane goes through -- so astra gets `-s read-only` (the $AllowEdits-false
-    default, since astra is never granted edits) and `-c model_reasoning_effort="xhigh"` by
+    default, since astra is never granted edits) and `-c model_reasoning_effort="high"` by
     construction, the same way sol/luna already do, without a new conditional to test."""
     body = LANE_RUNNER.read_text(encoding="utf-8")
     start = body.index("} else {\n    $exe  = $CODEX_EXE")
@@ -1459,6 +1488,74 @@ def test_xhigh_effort_is_never_assigned_to_a_claude_engine_table_row():
     assert "[ValidateSet('', 'low', 'medium', 'high')]" in body, (
         "the -ReasoningEffort override must not admit 'xhigh' -- that is the only runtime path "
         "that could otherwise push an engine-illegal effort onto a claude lane"
+    )
+
+
+def test_a_real_lane_launch_refuses_any_effort_other_than_high():
+    """LANE-MODEL-CURRENCY-1 round 2 (sol blocker 1, owner ruling 2026-09-26): -ReasoningEffort's
+    ValidateSet above still syntactically admits 'low'/'medium' (existing containment fixture
+    tests rely on that to prove the override mechanically reaches the child), but a REAL launch
+    -- $CLAUDE_EXE/$CODEX_EXE unmodified from their own $REAL_CLAUDE_EXE/$REAL_CODEX_EXE twins --
+    must now refuse before ever starting a provider process. This pins the refusal's source
+    shape; tests/coordination/test_lane_containment.py::test_real_lane_launch_refuses_non_high_effort
+    proves it end-to-end against a fixture-forced 'real' launch."""
+    body = LANE_RUNNER.read_text(encoding="utf-8")
+    assert "$REAL_CLAUDE_EXE = Join-Path $env:APPDATA 'npm\\claude.cmd'" in body
+    assert "$REAL_CODEX_EXE  = Join-Path $env:APPDATA 'npm\\codex.cmd'" in body
+    assert "$ConfiguredExeForLane -eq $RealExeForLane -and $cfg.effort -ne 'high'" in body, (
+        "the refusal must be scoped to a launch whose exe was never replaced away from the real one"
+    )
+    assert 'lane-effort-must-be-high' in body
+    # The actual throw is deferred into the main try (so a refusal still yields a normal
+    # 'failed' receipt and non-zero exit), and must fire before the dispatch ledger row and
+    # before any argv/process-start code for either engine.
+    i_refusal_computed = body.index("$LaneEffortMustBeHighRefusal = ")
+    i_throw = body.index("if ($LaneEffortMustBeHighRefusal) { throw $LaneEffortMustBeHighRefusal }")
+    i_ledger = body.index("DISPATCH LEDGER ROW")
+    i_claude_argv = body.index("if ($cfg.engine -eq 'claude') {\n    $exe  = $CLAUDE_EXE")
+    assert i_refusal_computed < i_throw < i_ledger < i_claude_argv
+
+
+def test_codex_selected_model_is_recorded_before_resolved_model_is_ever_proven():
+    """LANE-MODEL-CURRENCY-1 round 2 (sol blocker 2): the pre-launch model choice is recorded
+    as selectedModel, never resolvedModel, until the child is proven to have run. Pins that
+    $ResolvedModel is no longer assigned in the codex tier-resolution block (the exact defect
+    sol's repro exercised: Process.Start throwing after the old code had already set
+    resolvedModel), and that the receipt exposes selectedModel as its own field."""
+    body = LANE_RUNNER.read_text(encoding="utf-8")
+    assert "$SelectedModel = $codexLaunchModel" in body
+    assert "$SelectedModel = $claudeLaunchModel" in body
+    assert "$ResolvedModel = $codexLaunchModel" not in body, (
+        "resolvedModel must never be assigned from the pre-launch choice before Process.Start"
+    )
+    assert "selectedModel    = $SelectedModel" in body
+    # resolvedModel is filled in for codex only after exit, gated on a clean, non-timed-out,
+    # non-empty-output completion -- the minimum evidence bar the card sets.
+    i_codex_resolved = body.index("if (-not $timedOut -and $exitCode -eq 0 -and -not [string]::IsNullOrWhiteSpace($final)) {\n        $ResolvedModel = $SelectedModel\n    }")
+    i_wait_for_exit = body.index("$exitCode = if ($timedOut) { -1 } else { $proc.ExitCode }")
+    assert i_wait_for_exit < i_codex_resolved, (
+        "the exit code must be known (the child proven to have run) before resolvedModel can be filled in"
+    )
+
+
+def test_resolve_codex_model_tier_ok_check_uses_the_strictmode_safe_indexer():
+    """CODEX-RESOLVER-UNTYPED-EDGE-1 (fable hardening): the ok-check and error extraction must
+    use the `.PSObject.Properties[name]` indexer -- the same idiom this file's own modelUsage
+    comment (see test above referencing 'PSObject.Properties[' usage) documents as safe
+    unconditionally -- never bare `.ok` dot access or `.PSObject.Properties.Name -contains`,
+    both of which throw under this file's `Set-StrictMode -Version Latest` on a resolver result
+    that is valid JSON but lacks the expected shape (e.g. '{}' or JSON without 'ok')."""
+    body = LANE_RUNNER.read_text(encoding="utf-8")
+    fn_start = body.index("function Resolve-CodexModelTier")
+    fn_end = body.index("\n}\n", fn_start)
+    fn_body = body[fn_start:fn_end]
+    assert "$resolverParsed.PSObject.Properties['ok']" in fn_body
+    assert "$resolverParsed.PSObject.Properties['error']" in fn_body
+    assert "-not $resolverParsed.ok" not in fn_body, (
+        "bare dot access on a possibly-absent 'ok' property throws under Set-StrictMode Latest"
+    )
+    assert "$resolverParsed.PSObject.Properties.Name -contains" not in fn_body, (
+        "enumerating .Name over a zero-property PSMemberInfoCollection throws under Set-StrictMode Latest"
     )
 
 
@@ -3294,8 +3391,13 @@ def ratio_full_dispatch_board(tmp_path, guard_payload, use_real_guard=False):
     tool_dir.mkdir(parents=True, exist_ok=True)
     shutil.copy2(RATIO_WORKSTREAM, tool_dir / "Invoke-Workstream.ps1")
     shutil.copy2(RATIO_GUARD if use_real_guard else guard, tool_dir / "Test-ProductRatioGuard.ps1")
-    for dependency in ("landing-probe.ps1", "compose-lane-prompt-core.ps1", "Retire-LaneWorktree.ps1"):
+    for dependency in ("landing-probe.ps1", "compose-lane-prompt-core.ps1", "Retire-LaneWorktree.ps1",
+                       "Get-DoctrineBrief.ps1", "get_doctrine_brief.py"):
         shutil.copy2(RATIO_WORKSTREAM.parent / dependency, tool_dir / dependency)
+    # get_doctrine_brief.py honours a fixture only inside the fixtures/ beside itself, so the
+    # copied getter needs its own copy of the offline tree (the env is pointed at it below).
+    shutil.copytree(RATIO_WORKSTREAM.parent / "fixtures" / "doctrine-offline",
+                    tool_dir / "fixtures" / "doctrine-offline")
     (tool_dir / "Invoke-Lane.ps1").write_text("param($Lane,$PromptFile,$Card,$RunDir,$TimeoutSec)\nWrite-Output 'RATIO_FAKE_LANE'\nexit 0\n", encoding="ascii")
     (tool_dir / "Export-PrReviewEvidence.ps1").write_text("exit 0\n", encoding="ascii")
     return dual, tool_dir / "Invoke-Workstream.ps1"
@@ -3318,6 +3420,7 @@ def test_ratio_full_dispatcher_read_only_and_editing_apply_valid_red(tmp_path, u
     queue_before = queue.read_bytes()
     base = ["pwsh", "-NoProfile", "-NonInteractive", "-File", str(dispatcher), "-QueuePath", str(queue), "-NoLandingProbe", "-TimeoutSec", "1"]
     env = editing_dispatch_env(tmp_path)
+    env["MLV_DOCTRINE_FIXTURE_ROOT"] = str(dispatcher.parent / "fixtures" / "doctrine-offline")
     read_product = subprocess.run(base + ["-CardId", "RATIO-READ-PRODUCT"], text=True, capture_output=True, env=env)
     read_factory = subprocess.run(base + ["-CardId", "RATIO-READ-FACTORY"], text=True, capture_output=True, env=env)
     try:

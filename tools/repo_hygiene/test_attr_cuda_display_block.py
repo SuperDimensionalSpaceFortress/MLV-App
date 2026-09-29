@@ -671,7 +671,9 @@ class JobTemplateDisplayBlockWiringTests(unittest.TestCase):
 
     def test_display_block_is_published_on_the_presentmon_display_report_failure_path(self) -> None:
         at = self.template.index("result=$displayReport.status")
-        tail = self.template[at:at + 500]
+        # window widened 500 -> 900: fork/master's CUDA-PERF-DISPLAY-WAKE-1 comment + displayWake
+        # line now sit between the anchor and display=$displayBlock.
+        tail = self.template[at:at + 900]
         self.assertIn("display=$displayBlock", tail)
 
     def test_display_block_is_published_in_the_evidence_manifest_and_success_summary(self) -> None:

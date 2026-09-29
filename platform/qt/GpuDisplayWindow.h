@@ -133,6 +133,15 @@ public:
      * mid-run, so this is decided once, not re-checked per swap), and swapTelemetrySnapshot()
      * never emits a summary.
      *
+     * Same gate also covers fate telemetry (CUDA-PLAYBACK-PRESENT-CADENCE-1): the window
+     * holds exactly one pending frame, not a queue, so a present call that arrives before
+     * paintGL() drew the previous one silently overwrites it. noteSupersededBeforePaint()
+     * counts and logs that as "superseded_before_paint", and the count is folded into
+     * swapTelemetrySnapshot()'s summary alongside the swap count -- see
+     * docs/cuda-playback-present-cadence.md for why this, not GUI-thread work on a named
+     * component (overlays/scopes/histogram/slider/look-assist/logging) or swap-chain
+     * recreation, accounts for the gap between frames produced and frames shown.
+     *
      * The session id and its active/closed state live at file scope in GpuDisplayWindow.cpp,
      * not on this instance: they must survive the window being inactive when a session
      * begins, or being destroyed and recreated mid-session, so the summary swapTelemetrySnapshot()
@@ -196,6 +205,16 @@ private:
     // a ring scan) answer the session-summary questions (count/fps/max gap).
     static const int kSwapTelemetryRingCapacity = 2048;
     void noteRealSwap(void);
+    /* Fate telemetry (CUDA-PLAYBACK-PRESENT-CADENCE-1): called at the START of
+     * setPresentedImage()/setPresentedGpuPlaybackReconAmazePostWbTexture(), before either
+     * mutates any pending state, with the NEW submission's presentationSerial. If the
+     * window's current pending slot still holds an earlier, validly-serialed submission
+     * that paintGL() has not yet drawn (m_pendingPresentationSerialValid &&
+     * !m_texturePresentationActive), that earlier frame is about to be overwritten having
+     * never been painted -- counted and logged as superseded_before_paint. A no-op (no
+     * clock sample, no state change) when telemetry is disabled or no session is active,
+     * mirroring noteRealSwap()'s own gating. */
+    void noteSupersededBeforePaint(quint64 supersedingSerial);
 
     void ensureProgram(void);
     void ensurePreviewProcessingProgram(void);
