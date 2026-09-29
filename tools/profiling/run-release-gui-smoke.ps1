@@ -78,6 +78,12 @@ param(
     [switch]$DetectPlaybackArtifacts,
     [switch]$ArtifactCadenceAdvisory,
     [switch]$LegacyGuiSmokeOptions,
+    # UM-DISPLAY-SELECT-AND-LOG-1 round 1c: a per-venue name substring, forwarded to the app's
+    # own --display-prefer only when non-empty, not under -LegacyGuiSmokeOptions, AND the
+    # target binary's own --help lists the option (feature-probed -- an older "before" binary
+    # in an A/B does not register it, and QCommandLineParser::process() rejects an unknown
+    # option outright, which would kill that leg rather than just skip the preference).
+    [string]$DisplayPrefer = "",
     [switch]$AllowZeroPresentedFrames,
     [switch]$LaunchOnlyProbe,
     [ValidateRange(0.0, 1.0)]
@@ -100,6 +106,7 @@ $validationWarnings = @()
 . (Join-Path $PSScriptRoot 'gui-smoke-screenshot-provenance.ps1')
 . (Join-Path $PSScriptRoot 'gui-smoke-color-artifact-scan.ps1')
 . (Join-Path $PSScriptRoot 'gui-smoke-gpu-texture-route-validation.ps1')
+. (Join-Path $PSScriptRoot 'gui-smoke-display-identity.ps1')
 Import-Module (Join-Path $PSScriptRoot 'gui-smoke-process-boundary.psm1') -Force
 . (Join-Path $PSScriptRoot 'provenance-stamp.ps1')
 
@@ -1302,6 +1309,119 @@ if ($GpuAmazeTexturePresent) {
 if ($DisableLookAssist -and -not $LegacyGuiSmokeOptions) {
     $arguments += "--no-look-assist"
 }
+# Hard bound on the --display-prefer feature probe below (seconds). The probe is a child process of
+# an app that has a GUI mode; it must never be able to stall the leg (round 4, fable BLOCKER 1).
+$displayPreferProbeTimeoutSec = 20
+
+function Test-GuiSmokeDisplayPreferSupport {
+    # UM-DISPLAY-SELECT-AND-LOG-1 round 4 (fable BLOCKER 1). Asks the target binary whether it
+    # registers --display-prefer, WITHOUT ever starting its GUI and under a hard timeout.
+    #
+    # WHY THE ARGUMENTS. main() treats any argv without --batch/--trim-mlv/--profile-playback/
+    # --gui-smoke-playback as normal GUI mode (MainWindow.show(); a.exec()), so a bare `--help`
+    # never exits. The one path that prints the option list and returns 0 with no window is the
+    # smoke sub-parser's own help (platform/qt/main.cpp: registered with --gui-smoke-playback and
+    # answered before any window exists), and legacy binaries answer it too.
+    #
+    # WHY THE BOUND. Even the right arguments are a child process of a GUI application, so the
+    # probe is killed BY PID (whole tree) when it outlives -TimeoutSec, and every failure to
+    # decide is a typed UNKNOWN -- never a throw, never a hang, never a guess. UNKNOWN means the
+    # preference is NOT used; the caller logs the reason.
+    #
+    # Returns [pscustomobject] { status ('supported'|'unsupported'|'unknown'); reason; pid;
+    # arguments; timeoutSec }.
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$ExePath,
+
+        [ValidateRange(1, 600)]
+        [int]$TimeoutSec = 20
+    )
+
+    $probeArguments = '--gui-smoke-playback --help'
+    $status = 'unknown'
+    $reason = $null
+    $probePid = $null
+    $probeProcess = $null
+    # The target is a Windows GUI .exe and the kill path is taskkill /T; off Windows neither exists,
+    # so say so instead of surfacing an opaque process-start exception. Same platform test as
+    # Get-HostLoadSnapshot; it also holds on Windows PowerShell 5.1, which has no $IsWindows.
+    if ([System.Environment]::OSVersion.Platform -ne [System.PlatformID]::Win32NT) {
+        return [pscustomobject]@{
+            status = 'unknown'
+            reason = "feature probe is Windows-only (the target is a Windows .exe); platform is $([System.Environment]::OSVersion.Platform)"
+            pid = $null
+            arguments = $probeArguments
+            timeoutSec = $TimeoutSec
+        }
+    }
+    $startInfo = New-Object System.Diagnostics.ProcessStartInfo
+    $startInfo.FileName = $ExePath
+    $startInfo.Arguments = $probeArguments
+    $startInfo.UseShellExecute = $false
+    $startInfo.RedirectStandardOutput = $true
+    $startInfo.RedirectStandardError = $true
+    $startInfo.CreateNoWindow = $true
+    try {
+        $probeProcess = [System.Diagnostics.Process]::Start($startInfo)
+        $probePid = $probeProcess.Id
+        $probeStdout = $probeProcess.StandardOutput.ReadToEndAsync()
+        $probeStderr = $probeProcess.StandardError.ReadToEndAsync()
+        if (-not $probeProcess.WaitForExit($TimeoutSec * 1000)) {
+            try { & taskkill.exe /PID $probePid /T /F 2>&1 | Out-Null } catch { }
+            try { if (-not $probeProcess.HasExited) { $probeProcess.Kill() } } catch { }
+            [void]$probeProcess.WaitForExit(5000)
+            $reason = "feature probe timed out after $TimeoutSec s and was killed (pid $probePid)"
+        } else {
+            $probeProcess.WaitForExit()
+            [void]$probeStdout.Wait(5000)
+            [void]$probeStderr.Wait(5000)
+            $probeText = ''
+            if ($probeStdout.IsCompleted) { $probeText += [string]$probeStdout.Result }
+            if ($probeStderr.IsCompleted) { $probeText += "`n" + [string]$probeStderr.Result }
+            if ($probeProcess.ExitCode -ne 0) {
+                $reason = "feature probe exited with exit code $($probeProcess.ExitCode) (pid $probePid); the help text is not trusted"
+            } elseif ($probeText -match '(?m)^\s*--display-prefer\b') {
+                $status = 'supported'
+            } else {
+                $status = 'unsupported'
+                $reason = 'the binary does not list --display-prefer in its help (predates the option)'
+            }
+        }
+    } catch {
+        $reason = "feature probe could not run: $($_.Exception.GetType().Name)"
+    } finally {
+        if ($null -ne $probeProcess) { $probeProcess.Dispose() }
+    }
+    [pscustomobject]@{
+        status = $status
+        reason = $reason
+        pid = $probePid
+        arguments = $probeArguments
+        timeoutSec = $TimeoutSec
+    }
+}
+
+# UM-DISPLAY-SELECT-AND-LOG-1 round 4 (fable BLOCKER 1): --display-prefer feature probe. The record
+# is published on result.json (launch.displayPrefer) so a preference that was requested but not
+# used is visible downstream (fable DISPLAY-PREFER-PROBE-RECORDED-1).
+$displayPreferRecord = [ordered]@{ requested = $DisplayPrefer; probe = 'not_requested'; reason = $null; forwarded = $false }
+if (-not [string]::IsNullOrWhiteSpace($DisplayPrefer) -and -not $LegacyGuiSmokeOptions) {
+    # UM-DISPLAY-SELECT-AND-LOG-1 round 1c (opus design-review item 5): the help lists every
+    # option QCommandLineParser registered, so a binary that predates --display-prefer is
+    # detected here and simply never gets the flag, instead of failing to launch at all.
+    $displayPreferProbe = Test-GuiSmokeDisplayPreferSupport -ExePath $exe -TimeoutSec $displayPreferProbeTimeoutSec
+    $displayPreferRecord.probe = $displayPreferProbe.status
+    $displayPreferRecord.reason = $displayPreferProbe.reason
+    if ($displayPreferProbe.status -eq 'supported') {
+        $arguments += "--display-prefer=$DisplayPrefer"
+        $displayPreferRecord.forwarded = $true
+    } else {
+        $displayPreferSkipMessage = "--display-prefer '$DisplayPrefer' NOT used (probe $($displayPreferProbe.status)): $($displayPreferProbe.reason)"
+        $validationWarnings += $displayPreferSkipMessage
+        Write-Warning $displayPreferSkipMessage
+    }
+}
 if ($ExerciseClipLifecycleStress) {
     $arguments += "--exercise-clip-lifecycle-stress"
     if (-not [string]::IsNullOrWhiteSpace($StressSwitchInput)) {
@@ -1447,6 +1567,7 @@ if ($DryRun) {
         exePath = $exe
         workingDirectory = $root
         arguments = $arguments
+        displayPrefer = $displayPreferRecord
         environment = $launchEnv
         clearsEnvironment = $clearedEnvironment
         preserveExperimentalEnvironment = [bool]$PreserveExperimentalEnvironment
@@ -2344,6 +2465,19 @@ if ($ExerciseClipLifecycleStress) {
     }
 }
 
+# UM-DISPLAY-SELECT-AND-LOG-1 round 1c (sol pre-review BLOCKER 1): this leg's own display
+# identity/mode, from the app's OWN gui_smoke.window_placement/display_screen lines --
+# independent of any downstream comparison, published on EVERY result.json so
+# compare-release-gui-smoke-ab.ps1 (or any other consumer) can refuse to treat two
+# differently-displayed legs as comparable. identityUnknownReason is the third state (a
+# legacy binary that predates presentation_screen=, or a missing/malformed line) -- never
+# folded into a guessed identity, never folded into verified=true.
+# Round 3 (binding design-review item opus-blocker-1): parsed by the ONE shared parser the
+# attribution job also embeds (gui-smoke-display-identity.ps1, a pinned closure sibling) -- this
+# runner carries no display regex of its own, so it cannot disagree with the job.
+$displaySelection = ConvertFrom-GuiSmokeDisplayLog -LogText (@($recentLines) -join "`n")
+$displayBlock = Get-GuiSmokeDisplayIdentity -Selection $displaySelection
+
 $result = [pscustomobject]@{
     schema = "mlvapp-gui-smoke-result.v2"
     capturedAtUtc = $endUtc.ToString("o")
@@ -2352,6 +2486,7 @@ $result = [pscustomobject]@{
     clipPath = $inputPath
     inputBindings = $launchInputBindings
     outputPath = $outputPath
+    display = $displayBlock
     evidence = [pscustomobject]@{
         runNonce = $runNonce
         inputs = $captureInputBindings
@@ -2360,6 +2495,7 @@ $result = [pscustomobject]@{
     launch = [pscustomobject]@{
         workingDirectory = $root
         arguments = $arguments
+        displayPrefer = $displayPreferRecord
         environment = $launchEnv
         validationPolicy = [pscustomobject]@{
             requireLookAssist = $RequireLookAssist

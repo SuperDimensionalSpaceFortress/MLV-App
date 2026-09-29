@@ -1319,6 +1319,21 @@ static int runGuiPlaybackSmoke(QApplication &app)
         QStringLiteral("Loop the clip so a short clip plays continuously for the whole --seconds window (default: play once then stop)."));
     parser.addOption(loopPlaybackOpt);
 
+    const QCommandLineOption windowedOpt(
+        QStringLiteral("windowed"),
+        QStringLiteral("Place the window on the chosen target display and maximize it there instead of going full screen (default: full screen)."));
+    parser.addOption(windowedOpt);
+
+    // UM-DISPLAY-SELECT-AND-LOG-1 round 1c: a per-venue name substring (case-insensitive,
+    // matched against QScreen name/model/manufacturer), used ONLY as a tie-break among the
+    // displays already tied for the most physical pixels -- real resolution always wins
+    // first. Empty (the default) means no preference. See choosePlaybackSmokeDisplayTarget().
+    const QCommandLineOption displayPreferOpt(
+        QStringLiteral("display-prefer"),
+        QStringLiteral("Case-insensitive substring (matched against name/model/manufacturer) that tie-breaks among displays already tied for the most physical pixels. No effect on the pixel comparison itself."),
+        QStringLiteral("substring"));
+    parser.addOption(displayPreferOpt);
+
     const QCommandLineOption exerciseClipLifecycleStressOpt(
         QStringLiteral("exercise-clip-lifecycle-stress"),
         QStringLiteral("During GUI smoke playback, seek, switch clips, close/unload, and reopen to validate clip lifecycle handoff."));
@@ -1612,6 +1627,8 @@ static int runGuiPlaybackSmoke(QApplication &app)
     options.forcePlaybackDebayer = parser.isSet(playbackDebayerOpt);
     options.disableLookAssist = parser.isSet(noLookAssistOpt);
     options.loopPlayback = parser.isSet(loopPlaybackOpt);
+    options.windowed = parser.isSet(windowedOpt);
+    options.displayPreferSubstring = parser.value(displayPreferOpt);
     options.zebras = parser.isSet(zebrasOpt);
     options.forceZebras = parser.isSet(zebrasOpt) || parser.isSet(noZebrasOpt);
     options.dropFrame = dropFrameMode == QStringLiteral("on");

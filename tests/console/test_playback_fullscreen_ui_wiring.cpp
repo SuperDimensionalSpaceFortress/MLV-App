@@ -135,17 +135,23 @@ TEST(PlaybackFullscreenUiWiring, ZoomFitSceneSizesFromTheWindowsOwnScreenNotAlwa
 TEST(PlaybackFullscreenUiWiring, SmokeGeometryVerificationUsesTheSameScreenChoice)
 {
     // Consistency pin: the --gui-smoke-playback verification in enterPlaybackSmokeFullscreen()
-    // must agree with computeDisplaySceneGeometry() on which screen "full screen" means, or a
-    // window fullscreened on a non-primary monitor would spuriously fail verification.
+    // must agree with computeDisplaySceneGeometry() on which screen "full screen" means (both
+    // read this->screen(), not always primary), or a window fullscreened on a non-primary
+    // monitor would spuriously fail verification. UM-DISPLAY-SELECT-AND-LOG-1 round 1c (sol
+    // pre-review BLOCKER 3): enterPlaybackSmokeFullscreen() now takes the CHOSEN target and
+    // re-queries this->screen() on every settle pass (never captured once up front) to verify
+    // it actually landed there -- the window is moved to that same target BEFORE this call
+    // (movePlaybackSmokeWindowToScreen(), runGuiPlaybackSmoke()'s only caller), so
+    // this->screen() and computeDisplaySceneGeometry()'s own choice still converge once
+    // verified=true.
     const QString source = readRepoFile(QStringLiteral("platform/qt/MainWindow.cpp"));
     const QString body = functionBody(source,
-        QStringLiteral("bool MainWindow::enterPlaybackSmokeFullscreen( void )"),
+        QStringLiteral("bool MainWindow::enterPlaybackSmokeFullscreen( QScreen *target )"),
         QStringLiteral("void MainWindow::leavePlaybackSmokeFullscreen( void )"));
     ASSERT_FALSE(body.isEmpty());
-    ASSERT_TRUE(body.contains(QStringLiteral("QScreen *fullscreenScreen = this->screen();")));
-    ASSERT_TRUE(body.contains(QStringLiteral("if( !fullscreenScreen ) fullscreenScreen = QApplication::primaryScreen();")));
-    ASSERT_TRUE(body.contains(QStringLiteral("const QSize screenSize = fullscreenScreen ? fullscreenScreen->size() : QSize();")));
-    ASSERT_FALSE(body.contains(QStringLiteral("QApplication::primaryScreen()\n        ? QApplication::primaryScreen()")));
+    ASSERT_TRUE(body.contains(QStringLiteral("QScreen *presentationScreen = this->screen();")));
+    ASSERT_TRUE(body.contains(QStringLiteral("presentationScreen = this->screen();")));
+    ASSERT_TRUE(body.contains(QStringLiteral("const bool onTarget = ( presentationScreen == target );")));
 }
 
 TEST(PlaybackFullscreenUiWiring, HeaderStillDeclaresTheAction)
