@@ -1033,3 +1033,228 @@ TEST(ProcessingFilters, PatternNoiseScratchReuseMatchesFreshResultAfterResize)
 
     free_pattern_noise_scratch(&reused_scratch);
 }
+
+/* LOOK-ASSIST-GUI-FREEZE-1: the look-assist analysis clone must not pay for a
+ * full default init, and the white-balance search must not print per candidate.
+ * These count calls (processingDebug*Count); nothing here asserts wall-clock. */
+namespace {
+
+std::vector<uint16_t> make_flat_rgb16(int width, int height, uint16_t r, uint16_t g, uint16_t b)
+{
+    std::vector<uint16_t> image(static_cast<std::size_t>(width) * static_cast<std::size_t>(height) * 3);
+    for( std::size_t i = 0; i < image.size(); i += 3 )
+    {
+        image[i + 0] = r;
+        image[i + 1] = g;
+        image[i + 2] = b;
+    }
+    return image;
+}
+
+std::vector<uint16_t> make_gradient_rgb16(int width, int height)
+{
+    std::vector<uint16_t> image(static_cast<std::size_t>(width) * static_cast<std::size_t>(height) * 3);
+    for( int y = 0; y < height; ++y )
+    {
+        for( int x = 0; x < width; ++x )
+        {
+            const std::size_t index = (static_cast<std::size_t>(y) * static_cast<std::size_t>(width) + static_cast<std::size_t>(x)) * 3;
+            image[index + 0] = static_cast<uint16_t>(1500 + x * 1250 + y * 90);
+            image[index + 1] = static_cast<uint16_t>(1200 + y * 1700 + x * 40);
+            image[index + 2] = static_cast<uint16_t>(900 + (x + y) * 610);
+        }
+    }
+    return image;
+}
+
+/* In the app processing->dual_iso points at the clip's llrawproc flag; init
+ * leaves it NULL and highlight reconstruction dereferences it every frame. */
+int g_look_assist_test_dual_iso = 1;
+
+/* A fresh init has an all-zero camera matrix, which makes proper_wb_matrix NaN
+ * and the white-balance search degenerate (delta 0 on the first candidate).
+ * The app loads the clip's matrix; this is Canon EOS 5D Mark II (dcraw) as a
+ * plausible stand-in. */
+processingObject_t * init_with_camera_matrix()
+{
+    processingObject_t * p = initProcessingObject();
+    if( !p ) return nullptr;
+    double cam[9] = { 0.4716, 0.0603, -0.0830,
+                     -0.7798, 1.5474,  0.2480,
+                     -0.1496, 0.1937,  0.6651 };
+    processingSetCamMatrix(p, cam, cam);
+    return p;
+}
+
+processingObject_t * make_non_default_source()
+{
+    processingObject_t * src = init_with_camera_matrix();
+    if( !src ) return nullptr;
+    src->dual_iso = &g_look_assist_test_dual_iso;
+    processingSetWhiteBalance(src, 4300.0, 2.5);
+    processingSetExposureStops(src, 0.7);
+    processingSetContrast(src, 0.6, 3.0, 0.4, 1.5, 0.1);
+    processingSetPivot(src, 0.6);
+    processingSetGamut(src, GAMUT_Rec2020);
+    processingSetImageProfile(src, PROFILE_ALEXA_LOG);
+    processingEnableHighlightReconstruction(src);
+    return src;
+}
+
+int render_pair_memcmp(processingObject_t * a, processingObject_t * b)
+{
+    const int width = 48;
+    const int height = 32;
+    /* The levels pass rewrites its input in place, so each render gets its own copy. */
+    std::vector<uint16_t> input_a = make_gradient_rgb16(width, height);
+    std::vector<uint16_t> input_b = input_a;
+    std::vector<uint16_t> out_a(input_a.size(), 0);
+    std::vector<uint16_t> out_b(input_a.size(), 1);
+    applyProcessingObject(a, width, height, input_a.data(), out_a.data(), 1, 1, 0);
+    applyProcessingObject(b, width, height, input_b.data(), out_b.data(), 1, 1, 0);
+    /* A flat or NaN-collapsed render would make the comparison vacuous. */
+    if( std::count(out_a.begin(), out_a.end(), out_a[0]) == static_cast<std::ptrdiff_t>(out_a.size()) )
+    {
+        return 2;
+    }
+    return std::memcmp(out_a.data(), out_b.data(), out_a.size() * sizeof(uint16_t));
+}
+
+} // namespace
+
+TEST(LookAssistClone, CloneDoesNotRunFullDefaultInit)
+{
+    processingObject_t * src = make_non_default_source();
+    ASSERT_TRUE(src != nullptr);
+
+    /* Positive control: the counter really moves on a full init. */
+    const unsigned long before_init = processingDebugFullInitCount();
+    processingObject_t * probe = initProcessingObject();
+    ASSERT_TRUE(probe != nullptr);
+    ASSERT_EQ(1ul, processingDebugFullInitCount() - before_init);
+    freeProcessingObject(probe);
+
+    const unsigned long before_clone = processingDebugFullInitCount();
+    processingObject_t * clone = processingCloneForAnalysis(src);
+    ASSERT_TRUE(clone != nullptr);
+    ASSERT_EQ(0ul, processingDebugFullInitCount() - before_clone);
+
+    processingFreeClone(clone);
+    freeProcessingObject(src);
+}
+
+TEST(LookAssistClone, CloneRendersIdenticallyAndOwnsItsBuffers)
+{
+    processingObject_t * src = make_non_default_source();
+    ASSERT_TRUE(src != nullptr);
+    /* The source's transfer function must differ from init's default, or the
+     * clone could pass by accident on the default it used to get from init. */
+    ASSERT_TRUE(src->transfer_function_string != nullptr);
+    ASSERT_TRUE(std::strcmp(src->transfer_function_string, "pow(x/(1+x), 1/3.15)") != 0);
+    processingObject_t * clone = processingCloneForAnalysis(src);
+    ASSERT_TRUE(clone != nullptr);
+
+    /* Structure first: a clone that shares or lacks a buffer must fail here, cleanly,
+     * rather than crash inside a render. */
+    ASSERT_TRUE(clone->filter != src->filter);
+    ASSERT_TRUE(clone->lut != src->lut);
+    for( int i = 0; i < 9; ++i )
+    {
+        ASSERT_TRUE(clone->pre_calc_matrix[i] != nullptr);
+        ASSERT_TRUE(clone->pre_calc_matrix[i] != src->pre_calc_matrix[i]);
+        ASSERT_TRUE(clone->pre_calc_matrix_gradient[i] != nullptr);
+        ASSERT_TRUE(clone->pre_calc_matrix_gradient[i] != src->pre_calc_matrix_gradient[i]);
+    }
+    for( int i = 0; i < 7; ++i )
+    {
+        ASSERT_TRUE(clone->cs_zone.pre_calc_rgb_to_YCbCr[i] != nullptr);
+        ASSERT_TRUE(clone->cs_zone.pre_calc_rgb_to_YCbCr[i] != src->cs_zone.pre_calc_rgb_to_YCbCr[i]);
+    }
+    for( int i = 0; i < 4; ++i )
+    {
+        ASSERT_TRUE(clone->cs_zone.pre_calc_YCbCr_to_rgb[i] != nullptr);
+        ASSERT_TRUE(clone->cs_zone.pre_calc_YCbCr_to_rgb[i] != src->cs_zone.pre_calc_YCbCr_to_rgb[i]);
+    }
+    ASSERT_TRUE(clone->cs_zone.pre_calc_YCbCr_to_rgb[4] == nullptr);
+    ASSERT_TRUE(clone->shadows_highlights.blur_image != src->shadows_highlights.blur_image);
+    ASSERT_TRUE(clone->shadows_highlights.blur_image_half_in != src->shadows_highlights.blur_image_half_in);
+    ASSERT_TRUE(clone->shadows_highlights.blur_image_half_out != src->shadows_highlights.blur_image_half_out);
+    ASSERT_TRUE(clone->transfer_function != nullptr);
+    ASSERT_TRUE(clone->transfer_function_string != nullptr);
+    ASSERT_TRUE(clone->transfer_function_string_formatted != nullptr);
+    ASSERT_TRUE(clone->transfer_function != src->transfer_function);
+    ASSERT_TRUE(clone->transfer_function_string != src->transfer_function_string);
+    ASSERT_TRUE(clone->transfer_function_string_formatted != src->transfer_function_string_formatted);
+    ASSERT_EQ(0, std::strcmp(clone->transfer_function_string, src->transfer_function_string));
+
+    ASSERT_EQ(0, render_pair_memcmp(src, clone));
+
+    /* Same setters on both: exercises the clone's own compiled transfer function. */
+    processingSetWhiteBalance(src, 5100.0, -1.3);
+    processingSetWhiteBalance(clone, 5100.0, -1.3);
+    processingSetExposureStops(src, -0.4);
+    processingSetExposureStops(clone, -0.4);
+    processingSetGamut(src, GAMUT_AdobeRGB);
+    processingSetGamut(clone, GAMUT_AdobeRGB);
+    ASSERT_EQ(0, render_pair_memcmp(src, clone));
+
+    processingFreeClone(clone);
+    freeProcessingObject(src);
+}
+
+/* Flat synthetic patches in the 16-bit domain (pre_calc_levels maps 8192..59580 to 0..65535). */
+#define PATCH_WARM_R 44000
+#define PATCH_WARM_G 36000
+#define PATCH_WARM_B 24000
+#define PATCH_COOL_R 30000
+#define PATCH_COOL_G 36000
+#define PATCH_COOL_B 32000
+
+TEST(WhiteBalanceSearch, SearchDoesNotPrintPerCandidate)
+{
+    processingObject_t * processing = init_with_camera_matrix();
+    ASSERT_TRUE(processing != nullptr);
+    std::vector<uint16_t> image = make_flat_rgb16(64, 64, PATCH_WARM_R, PATCH_WARM_G, PATCH_WARM_B);
+
+    int temp = 0;
+    int tint = 0;
+    const unsigned long before = processingDebugFinalMatrixPrintCount();
+    processingFindWhiteBalance(processing, 64, 64, image.data(), 32, 32, &temp, &tint, 0);
+    /* The search must have walked past the first candidate, otherwise this
+     * test would pass for the wrong reason. */
+    ASSERT_TRUE(temp != 2300 || tint != -100);
+    /* Only the restore of the original white balance may print. */
+    ASSERT_EQ(1ul, processingDebugFinalMatrixPrintCount() - before);
+
+    freeProcessingObject(processing);
+}
+
+TEST(WhiteBalanceSearch, OrdinaryUpdatesStillPrintAndSolverOutputPinned)
+{
+    processingObject_t * processing = init_with_camera_matrix();
+    ASSERT_TRUE(processing != nullptr);
+    const unsigned long before = processingDebugFinalMatrixPrintCount();
+    processingSetWhiteBalance(processing, 5000.0, 0.0);
+    const unsigned long plain_delta = processingDebugFinalMatrixPrintCount() - before;
+    ASSERT_EQ(1ul, plain_delta);
+    freeProcessingObject(processing);
+
+    /* Solver results captured on the pre-fix (C1) build. */
+    struct Patch { uint16_t r, g, b; int temp, tint; };
+    const Patch patches[2] = {
+        { PATCH_WARM_R, PATCH_WARM_G, PATCH_WARM_B, 2300, -73 },  /* warm cast */
+        { PATCH_COOL_R, PATCH_COOL_G, PATCH_COOL_B, 3840, -94 },  /* cool / green cast */
+    };
+    for( const Patch & patch : patches )
+    {
+        processingObject_t * p = init_with_camera_matrix();
+        ASSERT_TRUE(p != nullptr);
+        std::vector<uint16_t> image = make_flat_rgb16(64, 64, patch.r, patch.g, patch.b);
+        int temp = 0;
+        int tint = 0;
+        processingFindWhiteBalance(p, 64, 64, image.data(), 32, 32, &temp, &tint, 0);
+        ASSERT_EQ(patch.temp, temp);
+        ASSERT_EQ(patch.tint, tint);
+        freeProcessingObject(p);
+    }
+}

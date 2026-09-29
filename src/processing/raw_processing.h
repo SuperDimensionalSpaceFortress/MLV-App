@@ -47,6 +47,9 @@ int processingRefreshShadowsHighlightsBlurFromRgb16(processingObject_t * process
                                                     int height,
                                                     int threads,
                                                     int forceExportPolicy);
+/* Test seams: process-global call counts (not timings). */
+unsigned long processingDebugFullInitCount(void);        /* initProcessingObject() calls */
+unsigned long processingDebugFinalMatrixPrintCount(void); /* processing_update_matrices printMatrix call site */
 #ifdef __cplusplus
 }
 #endif
