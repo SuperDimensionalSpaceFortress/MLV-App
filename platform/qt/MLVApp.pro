@@ -367,6 +367,7 @@ HEADERS += MainWindow.h \
            ClipLifecycleBarrier.h \
            CrashForensics.h \
            PlaybackFrameRange.h \
+           PlaybackFpsMeterPolicy.h \
            PlaybackGatePolicy.h \
            Phase3Breadcrumbs.h \
            Phase3Checksums.h \
