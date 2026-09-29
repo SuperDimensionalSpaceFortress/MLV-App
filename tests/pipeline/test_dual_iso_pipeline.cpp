@@ -10197,14 +10197,19 @@ TEST(DualIsoPipeline, Phase4B_PreDualIsoFixCompletedTelemetryIsSetThenResetOnNex
     ASSERT_EQ(1, llrpGetLastPreDualIsoFixCompleted());
     ASSERT_TRUE(llrpGetLastPreDualIsoFixMilliseconds() >= 0.0);
 
-    MLVAPP_TEST_SETENV("MLVAPP_ENABLE_DUAL_ISO_X4_FULLRES_FIXES", "0");
-    mlv_phase4bv_reset_env_cache_for_testing();
-    const std::vector<uint8_t> skipped = fixture.renderFrame8Scaled(0, 1, 4);
-    MLVAPP_TEST_UNSETENV("MLVAPP_ENABLE_DUAL_ISO_X4_FULLRES_FIXES");
-    mlv_phase4bv_reset_env_cache_for_testing();
+    // Second render on the same thread through a phase-4b scaled-buffer path (x2, aggressive preview, no raw fixes ->
+    // path 4) that goes through applyLLRawProcObject_with_dims and never touches the llrawproc thread-local
+    // statics, so ONLY the per-entry reset can clear the previous render's "ran".
+    fixture.receipt().setFocusPixels(0);
+    fixture.receipt().setBadPixels(0);
+    fixture.receipt().setVerticalStripes(0);
+    fixture.receipt().setPatternNoise(0);
+    ASSERT_TRUE(fixture.applyReceipt(&error_message));
+    ScopedAggressivePreviewMode aggressivePreviewOn(1);
+    const std::vector<uint8_t> skipped = fixture.renderFrame8Scaled(0, 1, 2);
 
     ASSERT_FALSE(skipped.empty());
-    ASSERT_EQ(0, mlv_phase4bv2_last_path_taken());
+    ASSERT_EQ(4, mlv_phase4bv2_last_path_taken());
     ASSERT_EQ(0, llrpGetLastPreDualIsoFixCompleted());
     ASSERT_EQ(0.0, llrpGetLastPreDualIsoFixMilliseconds());
 }
