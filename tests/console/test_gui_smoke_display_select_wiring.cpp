@@ -132,10 +132,35 @@ TEST(GuiSmokeDisplaySelectWiring, PreferredDisplayMatchesNameModelOrManufacturer
     const int fnAt = source.indexOf(QStringLiteral(
         "static QString playbackSmokeDisplayPreferenceMatchedField("));
     ASSERT_TRUE(fnAt >= 0);
-    const QString tail = source.mid(fnAt, 700);
+    const QString tail = source.mid(fnAt, 1600);
     ASSERT_TRUE(tail.contains(QStringLiteral("screen->name().contains( preferSubstring, Qt::CaseInsensitive )")));
     ASSERT_TRUE(tail.contains(QStringLiteral("screen->model().contains( preferSubstring, Qt::CaseInsensitive )")));
     ASSERT_TRUE(tail.contains(QStringLiteral("screen->manufacturer().contains( preferSubstring, Qt::CaseInsensitive )")));
+}
+
+// UM-DISPLAY-SELECT-AND-LOG-1 round 2 (sol PRE-REVIEW #2 BLOCKER a). The job resolves the
+// preferred Windows monitor name ('ASUS PA329C') to its GDI device name and hands the app THAT
+// (Qt reports QScreen::name() as the GDI device name with an empty model on the measured UM
+// topology). A device name is matched for EXACT equality first -- a substring match would make
+// \\.\DISPLAY1 also select \\.\DISPLAY10 -- and reported as its own matched field. MUTATION
+// CAUGHT: deleting the exact-name branch (the preference then matches nothing on that topology).
+TEST(GuiSmokeDisplaySelectWiring, PreferredDeviceNameIsMatchedExactlyBeforeTheSubstringFields)
+{
+    const QString source = readRepoFile(QStringLiteral("platform/qt/MainWindow.cpp"));
+    const int fnAt = source.indexOf(QStringLiteral(
+        "static QString playbackSmokeDisplayPreferenceMatchedField("));
+    ASSERT_TRUE(fnAt >= 0);
+    const QString tail = source.mid(fnAt, 1600);
+    const int deviceBranchAt = tail.indexOf(QStringLiteral("preferSubstring.startsWith( QStringLiteral( \"\\\\\\\\.\\\\\" ) )"));
+    const int exactAt = tail.indexOf(QStringLiteral(
+        "screen->name().compare( preferSubstring, Qt::CaseInsensitive ) == 0"));
+    const int substringAt = tail.indexOf(QStringLiteral("screen->name().contains( preferSubstring, Qt::CaseInsensitive )"));
+    ASSERT_TRUE(deviceBranchAt >= 0);
+    ASSERT_TRUE(exactAt > deviceBranchAt);
+    ASSERT_TRUE(tail.contains(QStringLiteral("QStringLiteral(\"device_name\")")));
+    // A device-name preference NEVER falls through to the substring fields.
+    ASSERT_TRUE(substringAt > exactAt);
+    ASSERT_TRUE(tail.mid(deviceBranchAt, substringAt - deviceBranchAt).contains(QStringLiteral("return QString();")));
 }
 
 TEST(GuiSmokeDisplaySelectWiring, DisplayTargetLineCarriesThePreferredFieldsAppendedAfterFallback)

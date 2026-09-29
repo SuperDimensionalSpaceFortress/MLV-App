@@ -91,6 +91,16 @@ static QString bool01( bool value )
 static QString playbackSmokeDisplayPreferenceMatchedField( QScreen *screen, const QString &preferSubstring )
 {
     if( !screen || preferSubstring.isEmpty() ) return QString();
+    // Round 2 (sol PRE-REVIEW #2 BLOCKER a): the job resolves the preferred Windows monitor
+    // name to its GDI device name (\\.\DISPLAYn -- exactly what QScreen::name() reports on
+    // Windows, with an empty model on the measured UM topology) and passes THAT. A device-name
+    // preference is compared for equality and never falls through to the substring fields, so
+    // \\.\DISPLAY1 cannot also select \\.\DISPLAY10.
+    if( preferSubstring.startsWith( QStringLiteral( "\\\\.\\" ) ) )
+    {
+        if( screen->name().compare( preferSubstring, Qt::CaseInsensitive ) == 0 ) return QStringLiteral("device_name");
+        return QString();
+    }
     if( screen->name().contains( preferSubstring, Qt::CaseInsensitive ) ) return QStringLiteral("name");
     if( screen->model().contains( preferSubstring, Qt::CaseInsensitive ) ) return QStringLiteral("model");
     if( screen->manufacturer().contains( preferSubstring, Qt::CaseInsensitive ) ) return QStringLiteral("manufacturer");

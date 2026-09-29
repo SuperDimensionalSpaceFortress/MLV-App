@@ -2928,6 +2928,52 @@ function Get-AttrCudaMeasurementVenue {
     return 'bachelor'
 }
 
+function Resolve-AttrCudaPreferredDisplay {
+    <#
+    .SYNOPSIS
+    Maps the venue's preferred monitor NAME (as Windows reports it, e.g. 'ASUS PA329C') to the
+    GDI device name (\\.\DISPLAYn) the app can match exactly -- UM-DISPLAY-SELECT-AND-LOG-1
+    round 2 (sol PRE-REVIEW #2 BLOCKER a).
+    .DESCRIPTION
+    Qt on Windows reports QScreen::name() as the GDI device name and, on the measured UM
+    topology, an empty model/manufacturer, so a monitor-name substring ('PA329C') matches neither
+    field and the preference silently vanishes (the refresh tie then falls to the primary -- the
+    Denon/LG). The Windows inventory already pairs each deviceName with its monitorName, so the
+    job resolves the pair here and hands the app the device name. Statuses (recorded, never
+    gated): 'mapped' (exactly one device's monitorName contains the substring, case-insensitive;
+    argument = its deviceName), 'ambiguous' (two or more), 'absent' (none), 'unknown' (the
+    inventory itself is unreadable), 'none' (no preference configured). In every non-mapped case
+    argument stays the original substring, so the app's own name/model/manufacturer match remains
+    the fallback rather than the preference being dropped.
+    .OUTPUTS
+    [pscustomobject] { argument; status; deviceName; monitorName; matches (int) }.
+    #>
+    [CmdletBinding()]
+    param($WindowsInventory, [string]$Substring)
+
+    $result = [ordered]@{ argument = $Substring; status = 'none'; deviceName = $null; monitorName = $null; matches = 0 }
+    if ([string]::IsNullOrWhiteSpace($Substring)) { $result.argument = ''; return [pscustomobject]$result }
+    if ($null -eq $WindowsInventory -or -not $WindowsInventory.collected) {
+        $result.status = 'unknown'
+        return [pscustomobject]$result
+    }
+    $found = @($WindowsInventory.devices | Where-Object {
+        $_.deviceName -and $_.monitorName -and ([string]$_.monitorName).IndexOf($Substring, [StringComparison]::OrdinalIgnoreCase) -ge 0
+    })
+    $result.matches = $found.Count
+    if ($found.Count -eq 1) {
+        $result.status = 'mapped'
+        $result.argument = [string]$found[0].deviceName
+        $result.deviceName = [string]$found[0].deviceName
+        $result.monitorName = [string]$found[0].monitorName
+    } elseif ($found.Count -gt 1) {
+        $result.status = 'ambiguous'
+    } else {
+        $result.status = 'absent'
+    }
+    return [pscustomobject]$result
+}
+
 function Get-AttrCudaDisplayDegradedState {
     <#
     .SYNOPSIS
@@ -4821,5 +4867,6 @@ Export-ModuleMember -Function `
     Get-AttrCudaTopCpuProcesses, `
     Get-AttrCudaWindowsDisplayInventory, `
     Get-AttrCudaMeasurementVenue, `
+    Resolve-AttrCudaPreferredDisplay, `
     Get-AttrCudaDisplayDegradedState, `
     Get-AttrCudaGuiSmokeDisplaySelection

@@ -572,6 +572,7 @@ $embeddedFunctions = Get-AttrCudaEmbeddedFunctionSource -Name @(
     # headers in AttrCudaArtifacts.psm1.
     'Get-AttrCudaWindowsDisplayInventory',
     'Get-AttrCudaMeasurementVenue',
+    'Resolve-AttrCudaPreferredDisplay',
     'Get-AttrCudaDisplayDegradedState',
     'Get-AttrCudaGuiSmokeDisplaySelection'
 )
@@ -1087,7 +1088,8 @@ function Build-AttrCudaDisplayBlock {
         [Parameter(Mandatory = $true)] [string]$Venue,
         $ExpectedWidth,
         $ExpectedHeight,
-        $AppSelection
+        $AppSelection,
+        $PreferredResolution = $null
     )
 
     $appKnown = ($null -ne $AppSelection)
@@ -1159,7 +1161,30 @@ function Build-AttrCudaDisplayBlock {
     # inventory it is meant to be cross-checked against cannot itself be trusted -- collected=
     # $false, or collected=$true with zero devices / no device whose mode was readable (both
     # plausible in the headless/Session-0 contexts this fleet has hit before).
-    $windowsAnyModeCollected = [bool]($WindowsInventory.devices | Where-Object { $_.modeCollected } | Select-Object -First 1)
+    # Round 2 (sol PRE-REVIEW #2 BLOCKER b): "some Windows device was readable" is not
+    # corroboration -- the screen the leg ACTUALLY presented on (the effective block's name, a GDI
+    # device name on Windows) must map to a Windows device whose own mode was readable, else the
+    # verdict is unknown. status: mapped | unreadable (device found, mode not) | unmapped (no
+    # device carries that name) | unknown (no presentation/target name at all).
+    $presentationWindowsDevice = [ordered]@{ status = 'unknown'; deviceName = $null; monitorName = $null }
+    $windowsAnyModeCollected = $false
+    if ($effectiveBlock -and $effectiveBlock.name) {
+        $mappedDevice = @($WindowsInventory.devices | Where-Object {
+            $_.deviceName -and ([string]$_.deviceName -ieq [string]$effectiveBlock.name)
+        }) | Select-Object -First 1
+        if ($null -eq $mappedDevice) {
+            $presentationWindowsDevice.status = 'unmapped'
+        } else {
+            $presentationWindowsDevice.deviceName = $mappedDevice.deviceName
+            $presentationWindowsDevice.monitorName = $mappedDevice.monitorName
+            if ($mappedDevice.modeCollected) {
+                $presentationWindowsDevice.status = 'mapped'
+                $windowsAnyModeCollected = $true
+            } else {
+                $presentationWindowsDevice.status = 'unreadable'
+            }
+        }
+    }
     $degraded = Get-AttrCudaDisplayDegradedState `
         -TargetWidth $(if ($effectiveBlock) { $effectiveBlock.width } else { $null }) `
         -TargetHeight $(if ($effectiveBlock) { $effectiveBlock.height } else { $null }) `
@@ -1179,6 +1204,10 @@ function Build-AttrCudaDisplayBlock {
         targetUnknownReason = $targetUnknownReason
         presentation = $presentationBlock
         presentationUnknownReason = $presentationUnknownReason
+        presentationWindowsDevice = $presentationWindowsDevice
+        # Round 2 (sol PRE-REVIEW #2 BLOCKER a): how the venue's preferred monitor name was
+        # resolved to the device name handed to the app (mapped|ambiguous|absent|unknown|none).
+        preferredWindowsMapping = $PreferredResolution
         placementVerified = $(if ($placement) { $placement.verified } else { 'unknown' })
         selectionFallback = $(if ($targetInfo) { $targetInfo.fallback } else { 'unknown' })
         # UM-DISPLAY-SELECT-AND-LOG-1 round 1c: recorded, never gated -- a Denon leg (real 4K,
@@ -1492,11 +1521,16 @@ if ($measurementVenue -eq 'ultra-magnus') {
     $expectedDisplayHeight = 2160
     $displayPreferSubstring = 'PA329C'
 }
+# Round 2 (sol PRE-REVIEW #2 BLOCKER a): the substring names the MONITOR as Windows reports it;
+# Qt reports GDI device names with no model, so resolve monitorName -> deviceName here (from the
+# same independent inventory) and hand the app THAT. Non-mapped outcomes keep the substring.
+$displayPreferResolution = Resolve-AttrCudaPreferredDisplay -WindowsInventory $windowsDisplayInventory -Substring $displayPreferSubstring
+$displayPreferArgument = $displayPreferResolution.argument
 # -AppSelection $null until the smoke log is parsed further down -- appScreens/target/mode/
 # preview read 'unknown' with their own reason until then (Build-AttrCudaDisplayBlock's header).
 $displayBlock = Build-AttrCudaDisplayBlock -WindowsInventory $windowsDisplayInventory `
     -Venue $measurementVenue -ExpectedWidth $expectedDisplayWidth -ExpectedHeight $expectedDisplayHeight `
-    -AppSelection $null
+    -AppSelection $null -PreferredResolution $displayPreferResolution
 
 # UM-DISPLAY-SELECT-AND-LOG-1 round 2b: LoadPercentage is frequency-scaled processor UTILITY,
 # not busy time -- a hub probe on Ultra-Magnus (2026-09-26T15:51Z, same ~26s window) read
@@ -1614,11 +1648,11 @@ $envs = @(
 $envList = "'" + ($envs -join "','") + "'"
 function ConvertTo-PsSingleQuoted([string]$Value) { "'" + $Value.Replace("'", "''") + "'" }
 $cmd = "& $(ConvertTo-PsSingleQuoted $smoke) -ExePath $(ConvertTo-PsSingleQuoted $exePath) -Input $(ConvertTo-PsSingleQuoted $clipPath) -Output $(ConvertTo-PsSingleQuoted $resultPath) -Seconds 40 -StartFrame 0 -SettleMs 2500 -ScaleFactor 4 -UsePersistedPlaybackSettings -RequireLookAssist:`$false -Scope none -FrameTelemetry -PreserveExperimentalEnvironment -ExtraEnvironment @($envList)"
-if (-not [string]::IsNullOrWhiteSpace($displayPreferSubstring)) {
+if (-not [string]::IsNullOrWhiteSpace($displayPreferArgument)) {
     # UM-DISPLAY-SELECT-AND-LOG-1 round 1c: the runner itself feature-probes the target
     # binary's --help before forwarding -display-prefer to it, so a legacy "before" binary in
     # an A/B is never killed by an unrecognized option.
-    $cmd += " -DisplayPrefer $(ConvertTo-PsSingleQuoted $displayPreferSubstring)"
+    $cmd += " -DisplayPrefer $(ConvertTo-PsSingleQuoted $displayPreferArgument)"
 }
 # CUDA-PLAYBACK-CONTACT-SHEET-1: appended, never baked into the base $cmd string above, so a
 # disabled run's $cmd (and therefore this job's emitted text) is byte-identical to before this
@@ -1876,7 +1910,7 @@ $measuredSmokeSessionId = Get-MeasuredSmokeSessionId $rawLog
 $appDisplaySelection = Get-AttrCudaGuiSmokeDisplaySelection -LogText $rawLog
 $displayBlock = Build-AttrCudaDisplayBlock -WindowsInventory $windowsDisplayInventory `
     -Venue $measurementVenue -ExpectedWidth $expectedDisplayWidth -ExpectedHeight $expectedDisplayHeight `
-    -AppSelection $appDisplaySelection
+    -AppSelection $appDisplaySelection -PreferredResolution $displayPreferResolution
 $rows = Get-FrameRows $rawLog $measuredSmokeSessionId -AllowFewRows:($TelemetryArm -eq 'LIGHT')
 $rows | Export-Csv -LiteralPath (Join-Path $legOut 'probe-timeline.csv') -NoTypeInformation
 # CUDA-PLAYBACK-PRESENT-CADENCE-2 round 1: an EARLY, separately-named read (before the

@@ -352,9 +352,9 @@ class TemplateDisplayBlockExecutionTests(_ProbeCase):
             "deviceName='\\\\.\\DISPLAY1'; modeCollected=$true; width=3840; height=2160 }); error = $null }\n"
             "$appSel = [pscustomobject]@{\n"
             "    screensCollected = $true\n"
-            "    screens = @([ordered]@{ name='X'; physicalWidth=3840; physicalHeight=2160; refreshHz=60.0 })\n"
+            "    screens = @([ordered]@{ name='\\\\.\\DISPLAY1'; physicalWidth=3840; physicalHeight=2160; refreshHz=60.0 })\n"
             "    screensError = $null\n"
-            "    target = [ordered]@{ name='X'; reason='max_physical_pixels'; candidates=2; fallback=$false }\n"
+            "    target = [ordered]@{ name='\\\\.\\DISPLAY1'; reason='max_physical_pixels'; candidates=2; fallback=$false }\n"
             "    targetError = $null\n"
             "    placement = [ordered]@{ mode='fullscreen'; previewWidth=3840; previewHeight=2160 }\n"
             "    placementError = $null\n"
@@ -364,7 +364,7 @@ class TemplateDisplayBlockExecutionTests(_ProbeCase):
             "Write-Host (Get-AttrCudaDisplayResultTail $block)\n"
         )
         self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
-        self.assertIn("DISPLAY=X RES=3840x2160@60 DEGRADED=0 PREVIEW=3840x2160", proc.stdout)
+        self.assertIn("DISPLAY=\\\\.\\DISPLAY1 RES=3840x2160@60 DEGRADED=0 PREVIEW=3840x2160", proc.stdout)
         # UM-DISPLAY-SELECT-AND-LOG-1 round 1c: recorded, never gated -- 'unknown' when the
         # app never logged a preferred_matched= field (this fixture's target has none).
         self.assertIn("PREFERRED=unknown", proc.stdout)
@@ -375,9 +375,9 @@ class TemplateDisplayBlockExecutionTests(_ProbeCase):
             "deviceName='\\\\.\\DISPLAY1'; modeCollected=$true; width=3840; height=2160 }); error = $null }\n"
             "$appSel = [pscustomobject]@{\n"
             "    screensCollected = $true\n"
-            "    screens = @([ordered]@{ name='X'; physicalWidth=3840; physicalHeight=2160; refreshHz=60.0 })\n"
+            "    screens = @([ordered]@{ name='\\\\.\\DISPLAY1'; physicalWidth=3840; physicalHeight=2160; refreshHz=60.0 })\n"
             "    screensError = $null\n"
-            "    target = [ordered]@{ name='X'; reason='max_physical_pixels_tie_preferred'; candidates=2; "
+            "    target = [ordered]@{ name='\\\\.\\DISPLAY1'; reason='max_physical_pixels_tie_preferred'; candidates=2; "
             "fallback=$true; preferred='PA329C'; preferredMatched='matched' }\n"
             "    targetError = $null\n"
             "    placement = [ordered]@{ mode='fullscreen'; previewWidth=3840; previewHeight=2160 }\n"
@@ -396,9 +396,9 @@ class TemplateDisplayBlockExecutionTests(_ProbeCase):
             "deviceName='\\\\.\\DISPLAY1'; modeCollected=$true; width=2560; height=1440 }); error = $null }\n"
             "$appSel = [pscustomobject]@{\n"
             "    screensCollected = $true\n"
-            "    screens = @([ordered]@{ name='X'; physicalWidth=2560; physicalHeight=1440; refreshHz=60.0 })\n"
+            "    screens = @([ordered]@{ name='\\\\.\\DISPLAY1'; physicalWidth=2560; physicalHeight=1440; refreshHz=60.0 })\n"
             "    screensError = $null\n"
-            "    target = [ordered]@{ name='X'; reason='max_physical_pixels'; candidates=1; fallback=$true }\n"
+            "    target = [ordered]@{ name='\\\\.\\DISPLAY1'; reason='max_physical_pixels'; candidates=1; fallback=$true }\n"
             "    targetError = $null\n"
             "    placement = [ordered]@{ mode='windowed'; previewWidth=2560; previewHeight=1440 }\n"
             "    placementError = $null\n"
@@ -409,7 +409,7 @@ class TemplateDisplayBlockExecutionTests(_ProbeCase):
             "Write-Host \"FALLBACK=$($block.selectionFallback)\"\n"
         )
         self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
-        self.assertIn("DISPLAY=X RES=2560x1440@60 DEGRADED=1 PREVIEW=2560x1440", proc.stdout)
+        self.assertIn("DISPLAY=\\\\.\\DISPLAY1 RES=2560x1440@60 DEGRADED=1 PREVIEW=2560x1440", proc.stdout)
         self.assertIn("FALLBACK=True", proc.stdout)
 
     def test_uncollected_windows_inventory_is_degraded_unknown_even_with_a_4k_qt_target(self) -> None:
@@ -421,9 +421,9 @@ class TemplateDisplayBlockExecutionTests(_ProbeCase):
             "error = 'UnauthorizedAccessException' }\n"
             "$appSel = [pscustomobject]@{\n"
             "    screensCollected = $true\n"
-            "    screens = @([ordered]@{ name='X'; physicalWidth=3840; physicalHeight=2160; refreshHz=60.0 })\n"
+            "    screens = @([ordered]@{ name='\\\\.\\DISPLAY1'; physicalWidth=3840; physicalHeight=2160; refreshHz=60.0 })\n"
             "    screensError = $null\n"
-            "    target = [ordered]@{ name='X'; reason='max_physical_pixels'; candidates=1; fallback=$false }\n"
+            "    target = [ordered]@{ name='\\\\.\\DISPLAY1'; reason='max_physical_pixels'; candidates=1; fallback=$false }\n"
             "    targetError = $null\n"
             "    placement = [ordered]@{ mode='fullscreen'; previewWidth=3840; previewHeight=2160 }\n"
             "    placementError = $null\n"
@@ -433,7 +433,7 @@ class TemplateDisplayBlockExecutionTests(_ProbeCase):
             "Write-Host (Get-AttrCudaDisplayResultTail $block)\n"
         )
         self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
-        self.assertIn("DISPLAY=X RES=3840x2160@60 DEGRADED=unknown PREVIEW=3840x2160", proc.stdout)
+        self.assertIn("DISPLAY=\\\\.\\DISPLAY1 RES=3840x2160@60 DEGRADED=unknown PREVIEW=3840x2160", proc.stdout)
 
     def test_windows_inventory_collected_with_zero_devices_is_degraded_unknown(self) -> None:
         # opus design-review sibling gap: collected=true with an empty device list (the adapter
@@ -443,9 +443,9 @@ class TemplateDisplayBlockExecutionTests(_ProbeCase):
             "$inv = [pscustomobject]@{ collected = $true; devices = @(); error = $null }\n"
             "$appSel = [pscustomobject]@{\n"
             "    screensCollected = $true\n"
-            "    screens = @([ordered]@{ name='X'; physicalWidth=3840; physicalHeight=2160; refreshHz=60.0 })\n"
+            "    screens = @([ordered]@{ name='\\\\.\\DISPLAY1'; physicalWidth=3840; physicalHeight=2160; refreshHz=60.0 })\n"
             "    screensError = $null\n"
-            "    target = [ordered]@{ name='X'; reason='max_physical_pixels'; candidates=1; fallback=$false }\n"
+            "    target = [ordered]@{ name='\\\\.\\DISPLAY1'; reason='max_physical_pixels'; candidates=1; fallback=$false }\n"
             "    targetError = $null\n"
             "    placement = [ordered]@{ mode='fullscreen'; previewWidth=3840; previewHeight=2160 }\n"
             "    placementError = $null\n"
@@ -464,9 +464,9 @@ class TemplateDisplayBlockExecutionTests(_ProbeCase):
             "error = $null }\n"
             "$appSel = [pscustomobject]@{\n"
             "    screensCollected = $true\n"
-            "    screens = @([ordered]@{ name='X'; physicalWidth=3840; physicalHeight=2160; refreshHz=60.0 })\n"
+            "    screens = @([ordered]@{ name='\\\\.\\DISPLAY1'; physicalWidth=3840; physicalHeight=2160; refreshHz=60.0 })\n"
             "    screensError = $null\n"
-            "    target = [ordered]@{ name='X'; reason='max_physical_pixels'; candidates=1; fallback=$false }\n"
+            "    target = [ordered]@{ name='\\\\.\\DISPLAY1'; reason='max_physical_pixels'; candidates=1; fallback=$false }\n"
             "    targetError = $null\n"
             "    placement = [ordered]@{ mode='fullscreen'; previewWidth=3840; previewHeight=2160 }\n"
             "    placementError = $null\n"
@@ -491,13 +491,13 @@ class TemplateDisplayBlockExecutionTests(_ProbeCase):
             "    screensCollected = $true\n"
             "    screens = @(\n"
             "        [ordered]@{ name='TARGET'; physicalWidth=3840; physicalHeight=2160; refreshHz=60.0 },\n"
-            "        [ordered]@{ name='PRESENTED'; physicalWidth=2560; physicalHeight=1440; refreshHz=60.0 }\n"
+            "        [ordered]@{ name='\\\\.\\DISPLAY2'; physicalWidth=2560; physicalHeight=1440; refreshHz=60.0 }\n"
             "    )\n"
             "    screensError = $null\n"
             "    target = [ordered]@{ name='TARGET'; reason='max_physical_pixels'; candidates=2; fallback=$false }\n"
             "    targetError = $null\n"
             "    placement = [ordered]@{ mode='fullscreen'; previewWidth=2560; previewHeight=1440; "
-            "verified=$false; targetScreenName='TARGET'; presentationScreenName='PRESENTED'; "
+            "verified=$false; targetScreenName='TARGET'; presentationScreenName='\\\\.\\DISPLAY2'; "
             "presentationPhysicalWidth=2560; presentationPhysicalHeight=1440 }\n"
             "    placementError = $null\n"
             "}\n"
@@ -508,8 +508,8 @@ class TemplateDisplayBlockExecutionTests(_ProbeCase):
             "PLACEMENT_VERIFIED=$($block.placementVerified)\"\n"
         )
         self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
-        self.assertIn("DISPLAY=PRESENTED RES=2560x1440@60 DEGRADED=1 PREVIEW=2560x1440", proc.stdout)
-        self.assertIn("TARGET_NAME=TARGET PRESENTATION_NAME=PRESENTED PLACEMENT_VERIFIED=False", proc.stdout)
+        self.assertIn("DISPLAY=\\\\.\\DISPLAY2 RES=2560x1440@60 DEGRADED=1 PREVIEW=2560x1440", proc.stdout)
+        self.assertIn("TARGET_NAME=TARGET PRESENTATION_NAME=\\\\.\\DISPLAY2 PLACEMENT_VERIFIED=False", proc.stdout)
 
     def test_a_verified_move_reports_the_same_presentation_as_target(self) -> None:
         proc = self.run_probe(
@@ -517,9 +517,9 @@ class TemplateDisplayBlockExecutionTests(_ProbeCase):
             "deviceName='\\\\.\\DISPLAY1'; modeCollected=$true; width=3840; height=2160 }); error = $null }\n"
             "$appSel = [pscustomobject]@{\n"
             "    screensCollected = $true\n"
-            "    screens = @([ordered]@{ name='X'; physicalWidth=3840; physicalHeight=2160; refreshHz=60.0 })\n"
+            "    screens = @([ordered]@{ name='\\\\.\\DISPLAY1'; physicalWidth=3840; physicalHeight=2160; refreshHz=60.0 })\n"
             "    screensError = $null\n"
-            "    target = [ordered]@{ name='X'; reason='max_physical_pixels'; candidates=1; fallback=$false }\n"
+            "    target = [ordered]@{ name='\\\\.\\DISPLAY1'; reason='max_physical_pixels'; candidates=1; fallback=$false }\n"
             "    targetError = $null\n"
             "    placement = [ordered]@{ mode='fullscreen'; previewWidth=3840; previewHeight=2160; "
             "verified=$true; targetScreenName='X'; presentationScreenName='X'; "
@@ -531,7 +531,7 @@ class TemplateDisplayBlockExecutionTests(_ProbeCase):
             "Write-Host (Get-AttrCudaDisplayResultTail $block)\n"
         )
         self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
-        self.assertIn("DISPLAY=X RES=3840x2160@60 DEGRADED=0 PREVIEW=3840x2160", proc.stdout)
+        self.assertIn("DISPLAY=\\\\.\\DISPLAY1 RES=3840x2160@60 DEGRADED=0 PREVIEW=3840x2160", proc.stdout)
 
     def test_a_legacy_placement_with_no_presentation_field_falls_back_to_the_target(self) -> None:
         # Pre-round-1c behavior preserved for a legacy binary/log that never logged
@@ -541,9 +541,9 @@ class TemplateDisplayBlockExecutionTests(_ProbeCase):
             "deviceName='\\\\.\\DISPLAY1'; modeCollected=$true; width=3840; height=2160 }); error = $null }\n"
             "$appSel = [pscustomobject]@{\n"
             "    screensCollected = $true\n"
-            "    screens = @([ordered]@{ name='X'; physicalWidth=3840; physicalHeight=2160; refreshHz=60.0 })\n"
+            "    screens = @([ordered]@{ name='\\\\.\\DISPLAY1'; physicalWidth=3840; physicalHeight=2160; refreshHz=60.0 })\n"
             "    screensError = $null\n"
-            "    target = [ordered]@{ name='X'; reason='max_physical_pixels'; candidates=1; fallback=$false }\n"
+            "    target = [ordered]@{ name='\\\\.\\DISPLAY1'; reason='max_physical_pixels'; candidates=1; fallback=$false }\n"
             "    targetError = $null\n"
             "    placement = [ordered]@{ mode='fullscreen'; previewWidth=3840; previewHeight=2160 }\n"
             "    placementError = $null\n"
@@ -555,7 +555,7 @@ class TemplateDisplayBlockExecutionTests(_ProbeCase):
             "REASON=$($block.presentationUnknownReason)\"\n"
         )
         self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
-        self.assertIn("DISPLAY=X RES=3840x2160@60 DEGRADED=0 PREVIEW=3840x2160", proc.stdout)
+        self.assertIn("DISPLAY=\\\\.\\DISPLAY1 RES=3840x2160@60 DEGRADED=0 PREVIEW=3840x2160", proc.stdout)
         self.assertIn("PRESENTATION_NULL=True", proc.stdout)
 
     def test_before_the_smoke_log_is_available_every_field_reads_unknown(self) -> None:
@@ -573,9 +573,9 @@ class TemplateDisplayBlockExecutionTests(_ProbeCase):
             "$inv = [pscustomobject]@{ collected = $true; devices = @(); error = $null }\n"
             "$appSel = [pscustomobject]@{\n"
             "    screensCollected = $true\n"
-            "    screens = @([ordered]@{ name='X'; physicalWidth=1920; physicalHeight=1080; refreshHz=144.0 })\n"
+            "    screens = @([ordered]@{ name='\\\\.\\DISPLAY1'; physicalWidth=1920; physicalHeight=1080; refreshHz=144.0 })\n"
             "    screensError = $null\n"
-            "    target = [ordered]@{ name='X'; reason='max_physical_pixels'; candidates=1; fallback=$false }\n"
+            "    target = [ordered]@{ name='\\\\.\\DISPLAY1'; reason='max_physical_pixels'; candidates=1; fallback=$false }\n"
             "    targetError = $null\n"
             "    placement = [ordered]@{ mode='fullscreen'; previewWidth=1920; previewHeight=1080 }\n"
             "    placementError = $null\n"
@@ -586,8 +586,137 @@ class TemplateDisplayBlockExecutionTests(_ProbeCase):
             "Write-Host \"EXPECTED_NULL=$($null -eq $block.expected)\"\n"
         )
         self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
-        self.assertIn("DISPLAY=X RES=1920x1080@144 DEGRADED=unknown PREVIEW=1920x1080", proc.stdout)
+        self.assertIn("DISPLAY=\\\\.\\DISPLAY1 RES=1920x1080@144 DEGRADED=unknown PREVIEW=1920x1080", proc.stdout)
         self.assertIn("EXPECTED_NULL=True", proc.stdout)
+
+
+@requires_pwsh
+class PresentationWindowsMappingTests(_ProbeCase):
+    """UM-DISPLAY-SELECT-AND-LOG-1 round 2 (sol PRE-REVIEW #2 BLOCKERs a and b).
+
+    (b) DEGRADED may be asserted only when the screen the leg ACTUALLY presented on maps to a
+    Windows device whose mode was readable -- "some other device was readable" is not
+    corroboration. (a) The venue's preferred monitor is named by its Windows monitorName
+    ('ASUS PA329C'), but Qt reports GDI device names (\\\\.\\DISPLAYn) with no model, so the job
+    must resolve monitorName -> deviceName from the Windows inventory before the app sees it.
+    """
+
+    def setUp(self) -> None:
+        super().setUp()
+        text = JOB_SCRIPT.read_text(encoding="utf-8").replace("\r\n", "\n")
+        build_at = text.index("function Build-AttrCudaDisplayBlock")
+        tail_end = text.index("\n\nforeach ($item in @(", text.index("function Get-AttrCudaDisplayResultTail"))
+        self.functions = text[build_at:tail_end]
+
+    def run_probe(self, body: str) -> subprocess.CompletedProcess:
+        return self.run_snippet(self.functions + "\n" + body)
+
+    D1 = "\\\\.\\DISPLAY1"
+    D2 = "\\\\.\\DISPLAY2"
+
+    def _app_sel_on_display1(self) -> str:
+        return (
+            "$appSel = [pscustomobject]@{\n"
+            "    screensCollected = $true\n"
+            f"    screens = @([ordered]@{{ name='{self.D1}'; physicalWidth=3840; physicalHeight=2160; refreshHz=60.0 }})\n"
+            "    screensError = $null\n"
+            f"    target = [ordered]@{{ name='{self.D1}'; reason='max_physical_pixels'; candidates=1; fallback=$false }}\n"
+            "    targetError = $null\n"
+            "    placement = [ordered]@{ mode='fullscreen'; previewWidth=3840; previewHeight=2160; verified=$true; "
+            f"targetScreenName='{self.D1}'; presentationScreenName='{self.D1}'; "
+            "presentationPhysicalWidth=3840; presentationPhysicalHeight=2160 }\n"
+            "    placementError = $null\n"
+            "}\n"
+        )
+
+    def _block_probe(self, devices: str) -> subprocess.CompletedProcess:
+        return self.run_probe(
+            f"$inv = [pscustomobject]@{{ collected = $true; devices = @({devices}); error = $null }}\n"
+            + self._app_sel_on_display1() +
+            "$block = Build-AttrCudaDisplayBlock -WindowsInventory $inv -Venue 'ultra-magnus' "
+            "-ExpectedWidth 3840 -ExpectedHeight 2160 -AppSelection $appSel\n"
+            "Write-Host (Get-AttrCudaDisplayResultTail $block)\n"
+            "Write-Host \"MAPPING=$($block.presentationWindowsDevice.status)\"\n"
+        )
+
+    def test_an_unrelated_readable_windows_device_does_not_corroborate_an_unmapped_presentation_screen(self) -> None:
+        # MUTATION CAUGHT: reverting Build-AttrCudaDisplayBlock to "any device with a readable
+        # mode" (the r1c rule). Sol's exact repro: only DISPLAY2 was readable, the app presented
+        # on DISPLAY1, and the leg published DEGRADED=0.
+        proc = self._block_probe(
+            f"[pscustomobject]@{{ deviceName='{self.D2}'; modeCollected=$true; width=3840; height=2160 }}")
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        self.assertIn("DEGRADED=unknown", proc.stdout)
+        self.assertNotIn("DEGRADED=0", proc.stdout)
+        self.assertIn("MAPPING=unmapped", proc.stdout)
+
+    def test_a_presentation_screen_that_maps_to_a_readable_windows_device_still_gets_a_verdict(self) -> None:
+        # Guards the fix against over-refusal: the mapped, readable device keeps the comparison.
+        proc = self._block_probe(
+            f"[pscustomobject]@{{ deviceName='{self.D1}'; modeCollected=$true; width=3840; height=2160 }}")
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        self.assertIn("DEGRADED=0", proc.stdout)
+        self.assertIn("MAPPING=mapped", proc.stdout)
+
+    def test_a_mapped_but_unreadable_device_is_unknown_and_the_reason_is_published(self) -> None:
+        # MUTATION CAUGHT: dropping the modeCollected requirement on the MAPPED device.
+        proc = self._block_probe(
+            f"[pscustomobject]@{{ deviceName='{self.D1}'; modeCollected=$false; width=$null; height=$null }},"
+            f"[pscustomobject]@{{ deviceName='{self.D2}'; modeCollected=$true; width=3840; height=2160 }}")
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        self.assertIn("DEGRADED=unknown", proc.stdout)
+        self.assertIn("MAPPING=unreadable", proc.stdout)
+
+    # ---- (a) preferred monitor -> Windows device name -> Qt screen name -------------------
+
+    def _measured_um_inventory(self) -> str:
+        return (
+            "$inv = [pscustomobject]@{ collected = $true; devices = @("
+            f"[pscustomobject]@{{ deviceName='{self.D1}'; monitorName='ASUS PA329C'; isPrimary=$false; "
+            "modeCollected=$true; width=3840; height=2160; refreshHz=60 },"
+            f"[pscustomobject]@{{ deviceName='{self.D2}'; monitorName='Generic PnP Monitor'; isPrimary=$true; "
+            "modeCollected=$true; width=3840; height=2160; refreshHz=60 }); error = $null }\n"
+        )
+
+    def test_the_preferred_monitor_name_resolves_to_its_windows_device_name(self) -> None:
+        # MUTATION CAUGHT: passing the raw 'PA329C' substring straight to the app (r1c). Qt
+        # reports name=\\.\DISPLAYn with empty model/manufacturer on the measured UM topology,
+        # so PA329C matched neither Qt screen and the refresh tie fell to the primary (the
+        # Denon/LG) -- sol's blocker (a).
+        proc = self.run_snippet(
+            self._measured_um_inventory() +
+            "$r = Resolve-AttrCudaPreferredDisplay -WindowsInventory $inv -Substring 'PA329C'\n"
+            "Write-Host \"ARG=$($r.argument) STATUS=$($r.status) DEVICE=$($r.deviceName) MONITOR=$($r.monitorName)\"\n"
+        )
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        self.assertIn(f"ARG={self.D1} STATUS=mapped DEVICE={self.D1} MONITOR=ASUS PA329C", proc.stdout)
+
+    def test_an_ambiguous_or_absent_or_unreadable_preference_keeps_the_substring_and_says_why(self) -> None:
+        proc = self.run_snippet(
+            "$inv2 = [pscustomobject]@{ collected = $true; devices = @("
+            f"[pscustomobject]@{{ deviceName='{self.D1}'; monitorName='ASUS PA329C' }},"
+            f"[pscustomobject]@{{ deviceName='{self.D2}'; monitorName='ASUS PA329C' }}); error = $null }}\n"
+            "$absent = [pscustomobject]@{ collected = $true; devices = @("
+            f"[pscustomobject]@{{ deviceName='{self.D1}'; monitorName='Generic PnP Monitor' }}); error = $null }}\n"
+            "$bad = [pscustomobject]@{ collected = $false; devices = @(); error = 'X' }\n"
+            "foreach ($case in @(@('ambiguous',$inv2),@('absent',$absent),@('unknown',$bad))) {\n"
+            "    $r = Resolve-AttrCudaPreferredDisplay -WindowsInventory $case[1] -Substring 'PA329C'\n"
+            "    Write-Host \"CASE=$($case[0]) STATUS=$($r.status) ARG=$($r.argument)\"\n"
+            "}\n"
+            "$n = Resolve-AttrCudaPreferredDisplay -WindowsInventory $absent -Substring ''\n"
+            "Write-Host \"CASE=none STATUS=$($n.status) ARG=[$($n.argument)]\"\n"
+        )
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        for line in ("CASE=ambiguous STATUS=ambiguous ARG=PA329C", "CASE=absent STATUS=absent ARG=PA329C",
+                     "CASE=unknown STATUS=unknown ARG=PA329C", "CASE=none STATUS=none ARG=[]"):
+            self.assertIn(line, proc.stdout)
+
+    def test_the_job_passes_the_resolved_device_name_not_the_raw_substring_to_the_runner(self) -> None:
+        text = JOB_SCRIPT.read_text(encoding="utf-8").replace("\r\n", "\n")
+        self.assertIn("Resolve-AttrCudaPreferredDisplay -WindowsInventory $windowsDisplayInventory", text)
+        self.assertIn("-DisplayPrefer $(ConvertTo-PsSingleQuoted $displayPreferArgument)", text)
+        self.assertNotIn("-DisplayPrefer $(ConvertTo-PsSingleQuoted $displayPreferSubstring)", text)
+        self.assertIn("'Resolve-AttrCudaPreferredDisplay'", text)
 
 
 @requires_pwsh
