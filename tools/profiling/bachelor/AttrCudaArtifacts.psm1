@@ -34,13 +34,13 @@ $script:AttrCudaModulePath = $PSCommandPath
 # warm 4 MiB reads ran 13 MB/s. Small files are slow cold too (an 11 MB exe hashed in 125 s).
 $script:AttrCudaMeasuredColdReadMBps = 1.5
 
-# BACHELOR-OWNER-CLIP-STAGE-STALL-1 round 1f (fable hardening 2): the fixed (size-independent) part
+# STAGE-STALL card round 1f (fable hardening 2): the fixed (size-independent) part
 # of a leg's wall time, from the two real leg-D traces on Bachelor (bocs-legd-proof-01 and -02,
-# build 74464398, clip M16-1243; both in the r1b summary.md "Measured on bachelor"):
+# build 74464398, the two-part 3.3 GB owner input; both in the r1b summary.md "Measured on bachelor"):
 #   agent child start -> first script line   570 s (proof-01, 9.5 min)   646 s (proof-02, 10.8 min)   -> 650
 #   display-wake                               270 s (4.5 min)             598 s (10 min)              -> 600
 #   cold small-artifact hashes (exe/dll/zip)   ~150 s (13 s + 125 s + ..)   49 s (34 + 13 + 2)         -> 150
-#   footage length screen (per clip, 2 parts)  80 s                         46 s                        -> 100
+#   footage length screen (both parts)         80 s                        46 s                        -> 100
 #   worst observed sum before the identity read starts                                                 = 1500
 #   package-expand + deploy + quiescence + PresentMon spawn (after the identity read): NOT MEASURED --
 #   no run reached them (proof-02 was killed as package-expand started) -- so a stated allowance     =  300
