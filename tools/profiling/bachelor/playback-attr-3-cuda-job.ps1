@@ -1184,25 +1184,29 @@ function Build-AttrCudaDisplayBlock {
     # device name on Windows) must map to a Windows device whose own mode was readable, else the
     # verdict is unknown. status: mapped | unreadable (device found, mode not) | unmapped (no
     # device carries that name) | unknown (no presentation/target name at all).
-    $presentationWindowsDevice = [ordered]@{ status = 'unknown'; deviceName = $null; monitorName = $null }
+    # (Locals, then one literal: the publish-write lint R5 refuses member assignment in this template.)
+    $presentationDeviceStatus = 'unknown'
+    $presentationDeviceName = $null
+    $presentationMonitorName = $null
     $windowsAnyModeCollected = $false
     if ($effectiveBlock -and $effectiveBlock.name) {
         $mappedDevice = @($WindowsInventory.devices | Where-Object {
             $_.deviceName -and ([string]$_.deviceName -ieq [string]$effectiveBlock.name)
         }) | Select-Object -First 1
         if ($null -eq $mappedDevice) {
-            $presentationWindowsDevice.status = 'unmapped'
+            $presentationDeviceStatus = 'unmapped'
         } else {
-            $presentationWindowsDevice.deviceName = $mappedDevice.deviceName
-            $presentationWindowsDevice.monitorName = $mappedDevice.monitorName
+            $presentationDeviceName = $mappedDevice.deviceName
+            $presentationMonitorName = $mappedDevice.monitorName
             if ($mappedDevice.modeCollected) {
-                $presentationWindowsDevice.status = 'mapped'
+                $presentationDeviceStatus = 'mapped'
                 $windowsAnyModeCollected = $true
             } else {
-                $presentationWindowsDevice.status = 'unreadable'
+                $presentationDeviceStatus = 'unreadable'
             }
         }
     }
+    $presentationWindowsDevice = [ordered]@{ status = $presentationDeviceStatus; deviceName = $presentationDeviceName; monitorName = $presentationMonitorName }
     $degraded = Get-AttrCudaDisplayDegradedState `
         -TargetWidth $(if ($effectiveBlock) { $effectiveBlock.width } else { $null }) `
         -TargetHeight $(if ($effectiveBlock) { $effectiveBlock.height } else { $null }) `
