@@ -4,14 +4,20 @@ kind: trap
 source_commit: PENDING
 law4: attested
 ---
-### mlv-app, 2026-09-29 — to reclaim disk from another tool's archive whose index stores file paths, compress in place (NTFS LZX) instead of deleting or moving: 12.35 GiB back, every path still valid
+### mlv-app, 2026-09-29 — to reclaim disk from another tool's archive whose index stores file paths, compress in place (NTFS LZX) instead of deleting or moving: about 13.4 GiB saved, every path still valid
 
-**Symptom (measured):** a build machine sat below its 50 GiB free-space floor for new worktrees, and the largest reclaimable pile was another tool's archive of old session transcripts (`rollout-*.jsonl`, 4,930 files older than 2026-09-01, 23.86 GiB logical). That tool keeps a sqlite state database whose `threads` table stores a `rollout_path` for each archived thread (6,146 rows, per the swarm's read of the schema); deleting or moving the files would have left those rows pointing at nothing, and the tool's behaviour on a dangling path is not ours to test on its live state.
+**Symptom (measured):** a build machine sat below its 50 GiB free-space floor, and the largest reclaimable pile was another tool's archive of old session transcripts (`rollout-*.jsonl`, 4,930 files older than 2026-09-01, 23.86 GiB logical). That tool's sqlite state database stores a `rollout_path` per archived thread (6,146 rows, from a read-only query of its index during the swarm, not re-queried by the producer of this note). Deleting or moving the files would leave those rows dangling, and the tool's behaviour on a dangling path is not ours to test on its live state.
 
-**What worked:** transparent NTFS compression in place, `compact.exe /c /exe:lzx /q /i`, in batches of 40 files. No file was moved, renamed or deleted, so every indexed path stayed valid and the content bytes read back unchanged. The run's own receipt: at start 38.43 GiB free; at the end 50.79 GiB free; `deltaGiB=12.35` over about 21 minutes (13:23Z to 13:44Z), which put the volume back above the floor. Undo is one command (`compact /u /exe /i <files>`). The script skipped files modified in the last day and any file `compact` could not open, so an active transcript was never touched. Earlier in the week the same lever on the board's own run-receipt and quarantine areas freed 2.89 GiB.
+**What worked:** NTFS compression in place, `compact.exe /c /exe:lzx /q /i`, in batches of 40 files. Nothing was moved, renamed or deleted, so every indexed path stayed valid. Files modified in the last day, or that `compact` could not open, were skipped. Undo is `compact /u /exe /i <files>`.
 
-**Cause of the trap:** "delete the old archive" is the reflex, and it is only safe when nothing indexes the files. The index is another tool's private state and is invisible from the directory listing.
+**Direct measurement (2026-09-29 about 15:55Z, `compact /q` on the archive directory's `*.jsonl`):**
 
-**Rule:** before deleting or moving files that another tool owns, look for an index that references their paths (a database column, a manifest). If one exists, prefer a lever that keeps paths and bytes intact, such as in-place LZX compression, restrict it to files past an age cutoff and outside the last day, and record free space before and after in a receipt. Read the free-space delta as approximate: the volume was also being written by other work (the mid-run reading was 51.43 GiB, above the end value).
+> 4930 are compressed and 1216 are not compressed. 28,637,436,777 total bytes of data are stored in 14,272,831,740 bytes. The compression ratio is 2.0 to 1.
 
-**Falsifier:** after the run, read one compressed file (content hash equal to before) and confirm the tool's index still resolves that path; if it does not, the lever was not path-safe.
+The 4,930 compressed files held about 25.6 GB logical; the 1,216 uncompressed are about 3.0 GB. So about 25.6 GB now occupies about 11.2 GB: a saving of about 14.4 GB (about 13.4 GiB), reversible, every indexed path intact.
+
+**Do not read free-space change as the saving.** The run's receipt shows free space 38.43 to 50.79 GiB (`deltaGiB=12.35`), but two other reclaim jobs (worktree archive batches 3 and 4) freed space over the same window, so that delta does not measure what LZX saved.
+
+**Rule:** before deleting or moving files another tool owns, look for an index that references their paths (a database column, a manifest). If one exists, prefer a lever that keeps paths and bytes intact, such as in-place LZX, limited to files past an age cutoff, and measure the saving with `compact /q`, not a before/after free-space reading.
+
+**Falsifier:** `compact /q` on the directory reports the stored and total bytes (above: 28,637,436,777 stored in 14,272,831,740). If the tool's index no longer resolves a compressed file's path, the lever was not path-safe.
