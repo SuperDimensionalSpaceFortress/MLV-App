@@ -1853,6 +1853,60 @@
       "lines": [
         242
       ]
+    },
+    {
+      "path": "platform/qt/PlaybackConformPolicy.h",
+      "anchor": "int credited = elapsedMs < 0 ? 0 : elapsedMs ;",
+      "class": "value_fallback_select",
+      "clock": "other",
+      "justification": "PLAYBACK-HFR-CONFORM-DEFAULT-1: clamps a possibly negative elapsed-time argument (a QTime delta across a wall-clock step) to zero before the pure early-credit arithmetic. Input sanitizing of a caller-supplied delta; it never decides whether a stage ran.",
+      "lines": [
+        199
+      ]
+    },
+    {
+      "path": "platform/qt/PlaybackConformPolicy.h",
+      "anchor": "int debt = debtMs < 0 ? 0 : debtMs ;",
+      "class": "value_fallback_select",
+      "clock": "other",
+      "justification": "PLAYBACK-HFR-CONFORM-DEFAULT-1: clamps a possibly negative carried-debt argument to zero (defensive sanitizing of the previous step's own output). Not a run-proof: the value is early-credit bookkeeping in milliseconds, never a stage-executed signal.",
+      "lines": [
+        200
+      ]
+    },
+    {
+      "path": "tests/console/test_playback_conform_policy.cpp",
+      "anchor": "ASSERT_EQ ( 0 , c . creditedMs ) ;",
+      "class": "not_run_proof_structural",
+      "clock": "other",
+      "justification": "Synthetic-input pure-function verification of PlaybackConformPolicy applyEarlyCredit: a step whose whole elapsed time is absorbed by carried debt (or a clamped negative clock delta) must credit zero elapsed ms to the timeline. A zero here is the arithmetic's specified output for a hand-built input, never inferred from a real run's timer.",
+      "lines": [
+        204,
+        208,
+        222
+      ]
+    },
+    {
+      "path": "tests/console/test_playback_conform_policy.cpp",
+      "anchor": "ASSERT_EQ ( 0 , c . debtMs ) ;",
+      "class": "not_run_proof_structural",
+      "clock": "other",
+      "justification": "Same synthetic-input pure-function verification as the creditedMs zero controls, for the carried-debt output: a non-early step, or a clamped negative input, leaves no debt.",
+      "lines": [
+        217,
+        220,
+        223
+      ]
+    },
+    {
+      "path": "tests/console/test_playback_source_advance_tracker.cpp",
+      "anchor": "ASSERT_EQ ( 0.0 , t . spanSeconds ( ) ) ;",
+      "class": "not_run_proof_structural",
+      "clock": "other",
+      "justification": "Synthetic-input verification of PlaybackSourceAdvanceTracker: with fewer than two presented frames the measured span is defined to be 0 (no rate reported). The input is hand-built; nothing is inferred from a real run's timer.",
+      "lines": [
+        79
+      ]
     }
   ]
 }
