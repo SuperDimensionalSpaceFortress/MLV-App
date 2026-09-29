@@ -30,6 +30,7 @@ import subprocess
 import tempfile
 import time
 import unittest
+import uuid
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -78,6 +79,7 @@ class _ProbeCase(unittest.TestCase):
         self._tmp = tempfile.TemporaryDirectory(prefix="run-gui-smoke-display-prefer-")
         self.addCleanup(self._tmp.cleanup)
         self.tmp = Path(self._tmp.name)
+        self.marker = "HANGMARK" + uuid.uuid4().hex
 
     def _write_cmd(self, name: str, body: str) -> Path:
         stub = self.tmp / name
@@ -89,10 +91,31 @@ class _ProbeCase(unittest.TestCase):
         return self._write_cmd("help_stub.cmd", body)
 
     def _hang_stub(self, name: str = "hang_stub.cmd") -> Path:
-        # Never exits on its own (ping -n N sleeps ~N seconds) and leaves a CHILD process behind,
+        # Never exits on its own (a 600 s sleep) and leaves a CHILD process behind (cmd -> pwsh),
         # so an implementation that kills only the direct process still leaks -- and a probe with
-        # no timeout never returns.
-        return self._write_cmd(name, "ping -n 600 127.0.0.1 >nul")
+        # no timeout never returns. pwsh rather than ping.exe: this host runs several lanes at once
+        # and a ping.exe sweep by another session killed the stub mid-test (observed 2026-09-29).
+        return self._write_cmd(name, self._sleep_command())
+
+    def _sleep_command(self) -> str:
+        # The marker makes THIS test's sleeper identifiable by command line, so a test can prove
+        # the whole process tree (not just the cmd parent) is gone.
+        return (f'"{PWSH}" -NoLogo -NoProfile -NonInteractive -Command '
+                f'"Start-Sleep -Seconds 600 # {self.marker}"')
+
+    def _run_hang_probe(self, exe: Path) -> subprocess.CompletedProcess:
+        """Runs the bounded probe against a never-exiting stub. The machine hosts several lanes
+        and an outside process sweep has killed a stub before the probe's own timeout (the probe
+        then correctly reports UNKNOWN with an exit code instead of a timeout); rerun, up to 3
+        attempts, only when the reason shows it was NOT the timeout path -- every attempt still
+        has to return inside the wall-clock bound, and the last attempt's result is what is
+        asserted."""
+        proc = None
+        for _ in range(3):
+            proc = self.run_span(exe=exe, display_prefer="PA329C", legacy=False, timeout_sec=3)
+            if proc.returncode == 0 and "timed out after 3 s" in proc.stdout:
+                break
+        return proc
 
     def _gui_model_stub(self, help_lines: list[str]) -> Path:
         # Models the real app's main(): ONLY `--gui-smoke-playback --help` is answered (help text,
@@ -103,7 +126,7 @@ class _ProbeCase(unittest.TestCase):
             f"{echoes}\n"
             "  exit /b 0\n"
             ")\n"
-            "ping -n 600 127.0.0.1 >nul"
+            + self._sleep_command()
         )
         return self._write_cmd("gui_model_stub.cmd", body)
 
@@ -196,10 +219,10 @@ class DisplayPreferProbeCannotHangTests(_ProbeCase):
         # MUTATION CAUGHT: removing the WaitForExit timeout (or going back to `& $exe ... | Out-String`).
         # Without the bound this test does not fail by assertion -- subprocess.run times out.
         started = time.monotonic()
-        proc = self.run_span(exe=self._hang_stub(), display_prefer="PA329C", legacy=False, timeout_sec=3)
+        proc = self._run_hang_probe(self._hang_stub())
         elapsed = time.monotonic() - started
         self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
-        self.assertLess(elapsed, HANG_TEST_BOUND_SECONDS)
+        self.assertLess(elapsed, 3 * HANG_TEST_BOUND_SECONDS)
         self.assertIn("PROBE=unknown FORWARDED=False", proc.stdout)
         self.assertNotIn("--display-prefer", proc.stdout.split("ARGS=")[1].splitlines()[0])
         # The reason is logged, and it names the timeout and the killed pid.
@@ -209,18 +232,22 @@ class DisplayPreferProbeCannotHangTests(_ProbeCase):
         self.assertIn("WARNINGS=1", proc.stdout)
 
     def test_the_killed_probe_leaves_no_process_behind(self) -> None:
-        # Kill by pid, tree included: the hang stub's ping child must die with its cmd parent.
+        # Kill by pid, tree included: the hang stub's pwsh sleeper (a CHILD of the cmd the probe
+        # started) must die with its cmd parent. MUTATION CAUGHT: killing only the direct process.
         exe = self._hang_stub()
-        proc = self.run_span(exe=exe, display_prefer="PA329C", legacy=False, timeout_sec=3)
+        proc = self._run_hang_probe(exe)
         self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
         reason = next(line for line in proc.stdout.splitlines() if line.startswith("REASON="))
         pid = int(re.search(r"pid (\d+)", reason).group(1))
-        alive = subprocess.run(
+        survivors = subprocess.run(
             [PWSH, "-NoLogo", "-NoProfile", "-NonInteractive", "-Command",
-             f"if (Get-Process -Id {pid} -ErrorAction SilentlyContinue) {{ 'ALIVE' }} else {{ 'GONE' }}"],
+             f"$parent = Get-Process -Id {pid} -ErrorAction SilentlyContinue\n"
+             "$kids = @(Get-CimInstance Win32_Process | Where-Object "
+             f"{{ $_.ProcessId -ne $PID -and $_.CommandLine -like '*{self.marker}*' }})\n"
+             "\"PARENT=$(if ($parent) { 'ALIVE' } else { 'GONE' }) SLEEPERS=$($kids.Count)\""],
             capture_output=True, text=True, timeout=HANG_TEST_BOUND_SECONDS,
         )
-        self.assertIn("GONE", alive.stdout)
+        self.assertIn("PARENT=GONE SLEEPERS=0", survivors.stdout, survivors.stdout + survivors.stderr)
 
     def test_the_probe_uses_the_arguments_main_answers_not_a_bare_help(self) -> None:
         # The real app's main() only answers `--gui-smoke-playback --help`; a bare `--help` is
