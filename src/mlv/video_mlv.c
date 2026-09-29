@@ -6855,6 +6855,7 @@ static void getMlvProcessedFrame16_with_scale(mlvObject_t * video,
     g_mlv_last_processed8_direct_path_active = 0;
     g_mlv_last_processed8_cache_hit = 0;
     g_mlv_last_processed8_cache_hit_scale_factor = 0;
+    llrpResetLastPreDualIsoFixTelemetry();
 
     /* Phase 4B: resolve effective scale (rejects scales that don't divide
      * the sensor evenly). The cache key uses the *effective* scale so a
@@ -7257,6 +7258,11 @@ static void getMlvProcessedFrame8_with_scale(mlvObject_t * video,
     g_mlv_last_processed8_cache_hit = 0;
     g_mlv_last_processed8_cache_hit_scale_factor = 0;
     g_mlv_last_processed8_prefetch_hit = 0;
+    /* PROD-TELEMETRY-DURATION-AS-PROOF-3b: a processed8 cache hit below returns
+     * without entering mlv_render_scaled_rgb16_v2 / _from_raw (the per-render
+     * resets), so clear the thread-local pre-dual-ISO telemetry here too --
+     * otherwise a cache-served frame reports the previous frame's "fix ran". */
+    llrpResetLastPreDualIsoFixTelemetry();
     /* Keep the playback-preview policy visible on the main render thread so
      * the direct8 gate sees the same state as the prefetch worker.
      * Round-4 item 0b: ONLY for playback callers (getMlvProcessedFrame8Scaled).
@@ -7653,6 +7659,7 @@ int getMlvProcessedFrame8ScaledFromRaw16(mlvObject_t * video,
     g_mlv_last_processed8_cache_hit = 0;
     g_mlv_last_processed8_cache_hit_scale_factor = 0;
     g_mlv_last_processed8_prefetch_hit = 0;
+    llrpResetLastPreDualIsoFixTelemetry();
 
     if (!video || !decodedRawFrame || !outputFrame) return 0;
     processingSetPlaybackAggressivePreviewMode(mlvPlaybackAggressivePreviewMode());
@@ -7759,6 +7766,7 @@ int getMlvProcessedFrame8ScaledFromReconnedRaw16(mlvObject_t * video,
     g_mlv_last_processed8_cache_hit = 0;
     g_mlv_last_processed8_cache_hit_scale_factor = 0;
     g_mlv_last_processed8_prefetch_hit = 0;
+    llrpResetLastPreDualIsoFixTelemetry();
 
     if (!video || !reconnedRawFrame || !outputFrame) return 0;
     processingSetPlaybackAggressivePreviewMode(mlvPlaybackAggressivePreviewMode());
