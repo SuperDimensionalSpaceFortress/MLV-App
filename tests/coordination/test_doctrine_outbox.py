@@ -1122,7 +1122,13 @@ def test_a_key_landed_by_another_publisher_is_already_sent_not_published(tmp_pat
     def rejecting_git_try(repo, *args, **kw):
         if args and args[0] == "push" and state["armed"]:
             state["armed"] = False
-            rival = ob.drain(src, rival_clone, "HEAD", tmp_path / "rival-sent.jsonl", [], push=True)
+            # The rival builds the same block on the same tip with the same pinned identity, so
+            # within one clock second its commit would be byte-identical to ours -- and an
+            # identical commit IS ours. Date it differently so it is a different publisher's.
+            with monkeypatch.context() as m:
+                m.setenv("GIT_AUTHOR_DATE", "2001-01-01T00:00:00Z")
+                m.setenv("GIT_COMMITTER_DATE", "2001-01-01T00:00:00Z")
+                rival = ob.drain(src, rival_clone, "HEAD", tmp_path / "rival-sent.jsonl", [], push=True)
             assert rival["pushed"] is True
             return 1, "", "rejected: non-fast-forward"
         return real_git_try(repo, *args, **kw)
