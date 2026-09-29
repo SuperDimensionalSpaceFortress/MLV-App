@@ -105,7 +105,7 @@ class LargeBlockHashReaderTests(_PwshCase):
         self.assertRegex(lines[-1], r" unit done bytes=3145729 seconds=[\d.]+ MBps=[\d.]+$")
 
     def test_a_missing_file_throws_and_does_not_echo_the_path(self) -> None:
-        missing = self.tmp / "no-such-file-secret-name.bin"
+        missing = self.tmp / "no-such-file-name.bin"
         proc = self.run_with_module(
             f"try {{ [void](Get-AttrCudaFileSha256Blocks -Path '{missing}'); Write-Output 'NO_THROW' }} "
             "catch { Write-Output 'THREW' }\n"
@@ -373,14 +373,14 @@ class ReadRateAndTraceFetchGeneratorTests(_PwshCase):
         return _run_pwsh_file(script).stdout
 
     def test_the_read_rate_job_is_built_from_parts_without_a_path_in_its_text(self) -> None:
-        secret = "C:/secret-dir/owner-clip-part.bin"
+        fake_part_path = "C:/owner-dir/owner-clip-part.bin"
         out = self.tmp / "out"
         script = self.tmp / "build.ps1"
         script.write_text(
             "$ErrorActionPreference = 'Stop'\n"
             f"Import-Module '{MODULE}' -Force\n"
             f"Import-Module '{READ_RATE_MODULE}' -Force\n"
-            f"$parts = @([pscustomobject]@{{ index = 0; path = '{secret}'; length = 1073741824; sha256 = ('a' * 64) }})\n"
+            f"$parts = @([pscustomobject]@{{ index = 0; path = '{fake_part_path}'; length = 1073741824; sha256 = ('a' * 64) }})\n"
             f"$r = New-Attr3FootageReadRateJob -ClipId 'X99-0001' -Parts $parts -OutDir '{out}' -RegionMB 16 | Where-Object {{ $_ -isnot [string] }}\n"
             "Write-Output ('JOB=' + $r.jobFile)\n",
             encoding="utf-8",
@@ -389,9 +389,9 @@ class ReadRateAndTraceFetchGeneratorTests(_PwshCase):
         self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
         job = Path(re.search(r"JOB=(.+)", proc.stdout).group(1).strip())
         text = job.read_text(encoding="utf-8")
-        self.assertNotIn(secret, text)
-        self.assertNotIn("secret-dir", text)
-        self.assertIn(base64_of(secret), text)
+        self.assertNotIn(fake_part_path, text)
+        self.assertNotIn("owner-dir", text)
+        self.assertIn(base64_of(fake_part_path), text)
         self.assertIn("$RegionBytes = [int64]16 * 1048576", text)
         self.assertNotIn("Get-CimInstance", text, "a CIM call took ~45 s on the measurement host")
         self.assertIn("PARSE_ERRORS=0", self._parse_errors(job))
