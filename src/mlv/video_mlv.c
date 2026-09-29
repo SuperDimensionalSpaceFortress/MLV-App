@@ -5848,13 +5848,6 @@ static int mlv_render_scaled_rgb16_from_raw(mlvObject_t * video,
             uint16_t * x4_fix_buffer = NULL;
             mlv_phase4bv2_receipt_flag_snapshot_t x4_receipt_flags_snapshot = { 0 };
 
-            if (video->llrawproc)
-            {
-                video->llrawproc->playback_pre_dualiso_fix_ms = 0.0;
-                video->llrawproc->playback_pre_dualiso_fix_completed = 0;
-            }
-            llrpResetLastPreDualIsoFixTelemetry();
-
             if (x4FullResFixesActive && !receiptCompatible)
             {
                 x4_fix_buffer = mlv_ensure_thread_u16_buffer(full_pixels);
@@ -7765,6 +7758,13 @@ int getMlvProcessedFrame8ScaledFromReconnedRaw16(mlvObject_t * video,
     g_mlv_last_processed8_cache_hit = 0;
     g_mlv_last_processed8_cache_hit_scale_factor = 0;
     g_mlv_last_processed8_prefetch_hit = 0;
+    /* PROD-TELEMETRY-DURATION-AS-PROOF-3b round 3: this render (downsample +
+     * processing over an already-reconstructed raw) never enters llrawproc, so
+     * it must not leave the previous render's thread-local pre-dual-ISO
+     * "completed" flag readable as if this frame ran the fix. The reconstruction
+     * ran on the recon worker's own thread (its thread-locals, stop=0), so there
+     * is no same-thread "ran" to preserve. */
+    llrpResetLastPreDualIsoFixTelemetry();
 
     if (!video || !reconnedRawFrame || !outputFrame) return 0;
     processingSetPlaybackAggressivePreviewMode(mlvPlaybackAggressivePreviewMode());

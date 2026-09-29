@@ -3440,6 +3440,18 @@ void RenderFrameThread::drawFrame( int slotIndex,
     slot.requestSerial = m_activeFrameRequestSerial;
     slot.outputMode = m_activeOutputMode;
     slot.presentationContext = m_activePresentationContext;
+    /* PROD-TELEMETRY-DURATION-AS-PROOF-3b round 3: clear the thread-local
+     * pre-dual-ISO fix telemetry (completed flag + its elapsed-ms twin) ONCE per
+     * frame, here, before any render path is chosen, and read it only after the
+     * render below. The producer-side entry resets cover only the CPU renders that
+     * pass through them; a frame that renders through
+     * getMlvProcessedFrame8ScaledFromReconnedRaw16 (no llrawproc call) or skips the
+     * CPU render for the GPU texture no-readback path would otherwise read the
+     * previous CPU render's "fix ran" on this thread. Nothing earlier in this
+     * function can set it (the only setter is the stop-before-dual-ISO tail of the
+     * CPU render entries, all called from the render dispatch below), so this
+     * cannot clear a legitimate "ran" from the same frame. */
+    llrpResetLastPreDualIsoFixTelemetry();
     if( preserveGpuPlaybackReconTextureSnapshot )
     {
         slot.gpuPlaybackReconTextureNoReadbackCandidate = true;
@@ -4813,8 +4825,9 @@ void RenderFrameThread::drawFrame( int slotIndex,
      * fallback-clock tick and read 0.0 ms, so "ran" is read from the explicit
      * completed flag, not from the elapsed-ms value (still emitted
      * separately as raw telemetry, see llrawproc_pre_dualiso_fix_ms). Both
-     * values are read from the thread-local getters (llrawproc.c), reset on
-     * every per-frame entry to the render path on THIS calling thread --
+     * values are read from the thread-local getters (llrawproc.c), reset once
+     * per frame at the top of drawFrame (before any render path is chosen) on
+     * THIS calling thread --
      * unlike llrawproc->playback_pre_dualiso_fix_ms/_completed (shared
      * struct fields also written by the processed8-prefetch worker thread
      * rendering concurrently on the same mlvObject), they cannot read a

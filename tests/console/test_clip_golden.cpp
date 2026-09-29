@@ -554,9 +554,9 @@ TEST(ClipGolden, TinyDualIsoHeadlessPlaybackProfileProducesJson)
     ASSERT_TRUE(!metadata.value(QStringLiteral("window_visible")).toBool());
     ASSERT_TRUE(!metadata.value(QStringLiteral("wait_for_paint")).toBool());
     /* PROD-TELEMETRY-DURATION-AS-PROOF-3: "ran" is proved above by
-     * measured_frames == 2 (an explicit run counter), not by this duration
-     * reading positive -- a fast real run on a coarse fallback clock can
-     * still read 0.0 ms. */
+     * frames.size() == 2 (one sample pushed per presented frame), not by this
+     * duration reading positive -- a fast real run on a coarse fallback clock
+     * can still read 0.0 ms. */
     ASSERT_TRUE(metadata.value(QStringLiteral("average_latency_ms")).toDouble() >= 0.0);
     ASSERT_TRUE(metadata.value(QStringLiteral("measurement_model")).toString().contains(QStringLiteral("frameReady")));
     ASSERT_TRUE(metadata.value(QStringLiteral("playback_policy_active")).toBool());
@@ -630,9 +630,9 @@ TEST(ClipGolden, TinyDualIsoHeadlessPlaybackProfileProducesJson)
         ASSERT_TRUE(value.isObject());
         const QJsonObject sample = value.toObject();
         /* PROD-TELEMETRY-DURATION-AS-PROOF-3: "ran" is proved by
-         * measured_frames == 2 and measurement_model containing "frameReady"
-         * (asserted once above at the metadata level), not by this per-frame
-         * duration reading positive. */
+         * frames.size() == 2 (asserted once above; one sample is pushed per
+         * presented frame), not by this per-frame duration reading positive.
+         * measured_frames is options-derived, so it is no run witness. */
         ASSERT_TRUE(sample.value(QStringLiteral("latency_ms")).toDouble() >= 0.0);
         ASSERT_TRUE(sample.contains(QStringLiteral("engine_latency_ms")));
         ASSERT_TRUE(sample.contains(QStringLiteral("presentation_overhead_ms")));

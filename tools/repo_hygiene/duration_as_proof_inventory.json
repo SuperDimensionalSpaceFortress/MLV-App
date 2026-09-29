@@ -21,7 +21,7 @@
       "omp_get_wtime_direct": "Calls omp_get_wtime() unconditionally with no monotonic-clock fallback (raw_processing.c's per-substage Shadows/Highlights filter timers, ~1484-1694); the #169 ruling's correction names this family as the ONLY source of the 1 ms flake.",
       "other": "A config value, CLI argument, epoch/wall-clock sentinel, Qt QTime delta, std::chrono::steady_clock read, or a field whose clock was not independently traced this round; not itself a flake-risk clock in the omp_get_wtime sense."
     },
-    "round_3b_note": "PROD-TELEMETRY-DURATION-AS-PROOF-3b (successor of parked #169, on the round-4B scanner): carried the completed-flag work for the pre-dual-ISO fix (llrawproc playback_pre_dualiso_fix_completed + thread-local llrpGetLastPreDualIsoFixCompleted, reset at the mlv_render_scaled_rgb16_v2 / _from_raw entries) and the TinyDualIso playback assertion relaxations. Rows retired because the site is gone: RenderFrameThread.cpp preDualIsoFixActive (now reads the completed flag), the dual_iso_preview_rowscale_ms latch, and the pred1 fast-path total_ms '> 0.0' (measurement_active is the proof). Rows reclassified run_proof/open -> not_run_proof_structural: the five '> 0.0' asserts turned '>= 0.0'. CLOSED IN ROUND 2: the processed8 cache-hit branch of getMlvProcessedFrame8_with_scale (video_mlv.c) and the processed16 cache-hit returns of getMlvProcessedFrame16_with_scale skipped the _v2/_from_raw entries, so the thread-local completed flag was not reset for a cache-served frame; both entries now call llrpResetLastPreDualIsoFixTelemetry() beside the g_mlv_last_processed8_cache_hit resets, guarded by Phase4B_PreDualIsoFixCompletedTelemetryIsClearedOnProcessed8CacheHit / ...Processed16CacheHit (named mutations MC1/MC2 red). The FromRaw16 / FromReconnedRaw16 entries do not reset (they have no cache-hit return; mlv_render_scaled_rgb16_from_raw resets at its own entry, guarded by ...ResetOnNextRenderFromRaw16)."
+    "round_3b_note": "PROD-TELEMETRY-DURATION-AS-PROOF-3b (successor of parked #169, on the round-4B scanner): carried the completed-flag work for the pre-dual-ISO fix (llrawproc playback_pre_dualiso_fix_completed + thread-local llrpGetLastPreDualIsoFixCompleted, reset at the mlv_render_scaled_rgb16_v2 / _from_raw entries) and the TinyDualIso playback assertion relaxations. Rows retired because the site is gone: RenderFrameThread.cpp preDualIsoFixActive (now reads the completed flag), the dual_iso_preview_rowscale_ms latch, and the pred1 fast-path total_ms '> 0.0' (measurement_active is the proof). Rows reclassified run_proof/open -> not_run_proof_structural: the five '> 0.0' asserts turned '>= 0.0'. CLOSED IN ROUND 2: the processed8 cache-hit branch of getMlvProcessedFrame8_with_scale (video_mlv.c) and the processed16 cache-hit returns of getMlvProcessedFrame16_with_scale skipped the _v2/_from_raw entries, so the thread-local completed flag was not reset for a cache-served frame; both entries now call llrpResetLastPreDualIsoFixTelemetry() beside the g_mlv_last_processed8_cache_hit resets, guarded by Phase4B_PreDualIsoFixCompletedTelemetryIsClearedOnProcessed8CacheHit / ...Processed16CacheHit. CLOSED IN ROUND 3 (both formal keys' blocker): the reset was only inside CPU render entries, so a drawFrame that rendered via getMlvProcessedFrame8ScaledFromReconnedRaw16 (no llrawproc call) or skipped the CPU render for the GPU texture no-readback path read a previous frame's 'ran'. RenderFrameThread::drawFrame now resets the thread-local telemetry once per frame before any render path is chosen (operative, pinned by test_pre_dualiso_telemetry_reset_wiring.cpp), and the FromReconnedRaw16 entry also resets so the getter contract holds for any caller (pinned by ...ResetOnNextRenderFromReconnedRaw16). The redundant x4-branch reset inside mlv_render_scaled_rgb16_from_raw (equivalent mutant MF2) was deleted. SUCCESSOR OPEN (carried from the retired dual_iso_preview_rowscale_ms latch row): emit a per-frame dual_iso_preview_rowscale_completed counter and assert it in the TinyDualIso playback-profile test, because the structural stand-in does not cover diso_get_preview's detection-failure early return (dualiso.c ~1525-1539)."
   },
   "rows": [
     {
@@ -526,7 +526,7 @@
       "anchor": "ASSERT_TRUE ( metadata . value ( QStringLiteral ( \"average_latency_ms\" ) ) . toDouble ( ) >= 0.0 ) ;",
       "class": "not_run_proof_structural",
       "clock": "other",
-      "justification": "PROD-TELEMETRY-DURATION-AS-PROOF-3b: Was a run_proof '> 0.0' (successor PROD-TELEMETRY-DURATION-AS-PROOF-5); now a non-negativity sanity check that cannot distinguish 'ran' from 'did not run'. 'The playback session ran and measured frames' is proved in the same test by the explicit run counter measured_frames == 2 and by measurement_model containing 'frameReady'.",
+      "justification": "PROD-TELEMETRY-DURATION-AS-PROOF-3b: Was a run_proof '> 0.0' (successor PROD-TELEMETRY-DURATION-AS-PROOF-5); now a non-negativity sanity check that cannot distinguish 'ran' from 'did not run'. 'The playback session ran and measured frames' is proved in the same test by ASSERT_EQ(2, frames.size()) (one sample is pushed per presented frame, MainWindow.cpp). measured_frames is computed from the options before the run and measurement_model is a constant string, so neither is a run witness.",
       "lines": [
         560
       ]
@@ -680,7 +680,7 @@
       "anchor": "ASSERT_TRUE ( sample . value ( QStringLiteral ( \"latency_ms\" ) ) . toDouble ( ) >= 0.0 ) ;",
       "class": "not_run_proof_structural",
       "clock": "other",
-      "justification": "PROD-TELEMETRY-DURATION-AS-PROOF-3b: Was a run_proof '> 0.0' per sampled frame; now a non-negativity sanity check. 'The frame was measured' is proved once at metadata level by measured_frames == 2 and measurement_model containing 'frameReady', both asserted before the per-frame loop.",
+      "justification": "PROD-TELEMETRY-DURATION-AS-PROOF-3b: Was a run_proof '> 0.0' per sampled frame; now a non-negativity sanity check. 'The frame was measured' is proved once by ASSERT_EQ(2, frames.size()) asserted before the per-frame loop (one sample is pushed per presented frame); measured_frames and measurement_model are not run witnesses.",
       "lines": [
         636
       ]
@@ -1654,12 +1654,13 @@
       "anchor": "ASSERT_EQ ( 0.0 , llrpGetLastPreDualIsoFixMilliseconds ( ) ) ;",
       "class": "not_run_proof_structural",
       "clock": "qpc_stage_clock",
-      "justification": "PROD-TELEMETRY-DURATION-AS-PROOF-3b: Negative-lane check that a render which never runs the pass reads the RESET value 0.0 ms; it proves the reset happened, never that a stage ran, and is paired with the completed-flag assertion llrpGetLastPreDualIsoFixCompleted() == 0 directly above it. Four occurrences: the SetThenResetOnNextRender test and the round-2 cache-hit (processed8, processed16) and from_raw reset tests.",
+      "justification": "PROD-TELEMETRY-DURATION-AS-PROOF-3b: Negative-lane check that a render which never runs the pass reads the RESET value 0.0 ms; it proves the reset happened, never that a stage ran, and is paired with the completed-flag assertion llrpGetLastPreDualIsoFixCompleted() == 0 directly above it. Five occurrences: the SetThenResetOnNextRender test, the round-2 cache-hit (processed8, processed16) and from_raw reset tests, and the round-3 FromReconnedRaw16 reset test.",
       "lines": [
         10214,
         10258,
         10300,
-        10353
+        10353,
+        10406
       ]
     },
     {
@@ -1669,7 +1670,7 @@
       "clock": "omp_get_wtime_direct",
       "justification": "Negative-lane exclusivity: this SH-filter quarterres substage is asserted to have accumulated exactly 0.0 ms because this test's fixture takes the halfres lane instead (scale-four preview mode). Sourced from the per-substage omp_get_wtime() writes named in the #169 ruling's clock correction (raw_processing.c ~1484-1694), guarded by MLVAPP_SHADOWS_HIGHLIGHTS_PROBE and proven-not-run by construction. Correction (fable, PROD-TELEMETRY-DURATION-AS-PROOF-4B round 1): the test does NOT carry a positive completed-flag/run-counter assertion alongside this trio -- its only other positive claim is ASSERT_TRUE(!got.empty()) on the rendered scale-four preview output, weaker than the paired-flag pattern used elsewhere in this file. The classification itself (negative-lane, claiming nothing about what ran) remains honest; the write-up of what backs it does not.",
       "lines": [
-        11152
+        11205
       ]
     },
     {
@@ -1679,7 +1680,7 @@
       "clock": "omp_get_wtime_direct",
       "justification": "Same negative-lane exclusivity pattern as the quarterres-downsample site above, for the quarterres RBF substage.",
       "lines": [
-        11153
+        11206
       ]
     },
     {
@@ -1689,7 +1690,7 @@
       "clock": "omp_get_wtime_direct",
       "justification": "Same negative-lane exclusivity pattern as the quarterres-downsample site above, for the quarterres upsample substage.",
       "lines": [
-        11154
+        11207
       ]
     },
     {
@@ -1699,10 +1700,10 @@
       "clock": "qpc_stage_clock",
       "justification": "Negative-lane exclusivity check reused across four tests: each asserts the processed8-cache-store timer stayed at its reset value of 0.0 because that test's code path (x8/x1 aggressive-preview direct/skip paths) deliberately skips the cache-store bookkeeping. Proves absence of a side-effect (the store was skipped), not presence of a stage; g_mlv_last_processed8_cache_store_ms is explicitly reset to 0.0 at the top of every call (video_mlv.c ~7243), and the surrounding scale/path assertions in the same tests independently confirm which path ran.",
       "lines": [
-        11930,
-        11973,
-        11998,
-        12031
+        11983,
+        12026,
+        12051,
+        12084
       ]
     },
     {
