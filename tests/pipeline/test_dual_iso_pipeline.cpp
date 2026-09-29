@@ -10162,6 +10162,53 @@ TEST(DualIsoPipeline, Phase4B_DualIsoScaleFourFullResFixesCanBeOptedOut)
     ASSERT_TRUE(std::any_of(got.begin(), got.end(), [](uint8_t v) { return v != 0; }));
 }
 
+// PROD-TELEMETRY-DURATION-AS-PROOF-3b: the thread-local completed flag that production telemetry
+// (RenderFrameThread::drawFrame) reads instead of "pre_dualiso_fix_ms > 0" must (a) be set by a render that ran the
+// pre-dual-ISO fix pass and (b) be reset at the entry of the NEXT render on the same thread, so a render that never
+// runs the pass cannot report the previous frame's "ran". Mutations: dropping the set line in llrawproc.c fails (a);
+// dropping the llrpResetLastPreDualIsoFixTelemetry() calls at the mlv_render_scaled_rgb16_v2 /
+// _from_raw entries fails (b) with a stale 1.
+TEST(DualIsoPipeline, Phase4B_PreDualIsoFixCompletedTelemetryIsSetThenResetOnNextRender)
+{
+    ScopedAggressivePreviewMode aggressivePreview(0);
+    MLVAPP_TEST_UNSETENV("MLVAPP_ENABLE_DUAL_ISO_X4_FULLRES_FIXES");
+    MLVAPP_TEST_UNSETENV("MLVAPP_LOG_PHASE4BV2");
+    mlv_phase4bv_reset_env_cache_for_testing();
+
+    MlvPipelineFixture fixture;
+    QString error_message;
+    ASSERT_TRUE(fixture.openTinyDualIso(&error_message));
+    ASSERT_TRUE(fixture.loadReceipt(QStringLiteral("tests/fixtures/receipts/tiny_dual_iso_hq.marxml"), &error_message));
+    fixture.receipt().setFocusPixels(1);
+    fixture.receipt().setBadPixels(1);
+    fixture.receipt().setVerticalStripes(1);
+    fixture.receipt().setPatternNoise(1);
+    ASSERT_TRUE(fixture.applyReceipt(&error_message));
+
+    const int full_w = fixture.width();
+    const int full_h = fixture.height();
+    if ((full_w % 4) != 0 || full_h < 16) {
+        return;
+    }
+
+    const std::vector<uint8_t> ran = fixture.renderFrame8Scaled(0, 1, 4);
+    ASSERT_FALSE(ran.empty());
+    ASSERT_EQ(3, mlv_phase4bv2_last_path_taken());
+    ASSERT_EQ(1, llrpGetLastPreDualIsoFixCompleted());
+    ASSERT_TRUE(llrpGetLastPreDualIsoFixMilliseconds() >= 0.0);
+
+    MLVAPP_TEST_SETENV("MLVAPP_ENABLE_DUAL_ISO_X4_FULLRES_FIXES", "0");
+    mlv_phase4bv_reset_env_cache_for_testing();
+    const std::vector<uint8_t> skipped = fixture.renderFrame8Scaled(0, 1, 4);
+    MLVAPP_TEST_UNSETENV("MLVAPP_ENABLE_DUAL_ISO_X4_FULLRES_FIXES");
+    mlv_phase4bv_reset_env_cache_for_testing();
+
+    ASSERT_FALSE(skipped.empty());
+    ASSERT_EQ(0, mlv_phase4bv2_last_path_taken());
+    ASSERT_EQ(0, llrpGetLastPreDualIsoFixCompleted());
+    ASSERT_EQ(0.0, llrpGetLastPreDualIsoFixMilliseconds());
+}
+
 TEST(DualIsoPipeline, Phase4B_DualIsoScaleEightAggressiveSkipsCoordinateRawFixesForEarlyPath)
 {
     ScopedAggressivePreviewMode aggressivePreview(1);
