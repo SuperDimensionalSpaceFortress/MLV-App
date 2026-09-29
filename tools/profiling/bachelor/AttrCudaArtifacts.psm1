@@ -1091,6 +1091,16 @@ $script:AttrCudaClosureScanExclusions = @(
             '$startInfo.FileName is the same pinned application executable ($ExePath is passed ' +
             '$exe), run with `--gui-smoke-playback --help` under a hard timeout and killed by pid. ' +
             'It replaced a bare `& $exe --help 2>&1` site whose own exclusion was deleted with it.'
+    },
+    [pscustomobject]@{
+        repoRelativePath = 'tools/profiling/run-release-gui-smoke.ps1'
+        literal = '& taskkill.exe /PID $probePid /T /F 2>&1'
+        reason = 'UM-DISPLAY-SELECT-AND-LOG-1 round 4 (fable BLOCKER 1): the kill-by-pid of the ' +
+            '--display-prefer feature probe that outlived its timeout (Test-GuiSmokeDisplayPreferSupport). ' +
+            'taskkill.exe is the Windows system binary, named bare and resolved by the OS -- never ' +
+            'a $PSScriptRoot sibling script -- and its only argument is the numeric pid Process.Start ' +
+            'returned for the probe. It loads and runs no PowerShell/.NET code from a file this ' +
+            'census needs to see.'
     }
 )
 
