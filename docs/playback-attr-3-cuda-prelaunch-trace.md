@@ -9,7 +9,11 @@ On Bachelor an owner input is read at ~2 MB/s cold (real-time scanner on; the fi
 2.2 GB). The leg job read it three to four times before playback (two hashes, then the smoke
 runner, then the app), printed nothing, and the agent's cap killed it with an empty stdout.
 Measured on the host: 4 KiB reads (what `Get-FileHash` issues) run at 0.55 MB/s even warm; 4 MiB
-reads with an incremental SHA-256 ran 2.1-2.4 MB/s cold in steady state and 13 MB/s warm.
+reads with an incremental SHA-256 ran 13 MB/s warm and 0.9-2.4 MB/s cold (a real leg's single
+identity pass over the 2.2 GB first part: 1.6 MB/s whole-part; even an 11 MB exe took 125 s cold).
+Defender's CPU time did not move during any pass (the cost is not MsMpEng CPU); the storage itself
+is slow. The default sizing rate is therefore 1.5 MB/s, and a 3.3 GB two-part clip needs a
+`-TimeoutSec` of about two hours (`recommendedJobTimeoutSec`), not the 40-50 min the old caps gave.
 
 ## 1. Trace: a killed job still tells you where it was
 

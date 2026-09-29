@@ -24,13 +24,15 @@ $script:AttrCudaModulePath = $PSCommandPath
 
 # STAGE-STALL card: worst-case cold sequential read rate of an owner input on the
 # measurement host (Bachelor), in MB/s -- the figure Get-AttrCudaLegTimeBudget sizes a leg's
-# timeouts from. MEASURED 2026-09-29 by attr3-footage-read-rate-job.ps1 (trace files
-# attr3-footage-read-rate-M16-1243-{61ef1a06bf,a7429d9f28}.trace.txt on the host, quoted in the
-# card summary): reading the 2.2 GB first part cold with 4 MiB blocks and an incremental SHA-256,
-# the steady-state rate was 2.1-2.4 MB/s over three consecutive 256 MB progress windows (the 2.1 is
-# kept: the sizing figure is the SLOWEST steady window, not the mean); an isolated 128 MB cold
-# region ran 6.1 MB/s. 4 KiB blocks (what Get-FileHash uses) ran 0.55 MB/s even WARM.
-$script:AttrCudaMeasuredColdReadMBps = 2.1
+# timeouts from. MEASURED 2026-09-29 on the host, from the traces the jobs themselves left:
+# playback-attr-3-cuda-74464398c1cf-M16-1243-20260929-193043.trace.txt (a real leg-D job) read the
+# 2.2 GB first part cold in ONE pass, 4 MiB blocks + incremental SHA-256, in 1352 s = 1.6 MB/s
+# whole-part, with progress windows between 0.9 and 1.9 MB/s; the first 256 MB of the second part
+# ran 1.3 MB/s. (An earlier attr3-footage-read-rate-job.ps1 pass saw 2.1-2.4 MB/s and one isolated
+# 128 MB cold region 6.1 MB/s -- the host is not steady, so the figure sized from is the whole-part
+# mean of a real leg, rounded DOWN.) 4 KiB blocks (what Get-FileHash uses) ran 0.55 MB/s even WARM;
+# warm 4 MiB reads ran 13 MB/s. Small files are slow cold too (an 11 MB exe hashed in 125 s).
+$script:AttrCudaMeasuredColdReadMBps = 1.5
 
 function Get-AttrCudaEmbeddedFunctionSource {
     <#
