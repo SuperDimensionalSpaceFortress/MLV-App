@@ -34,6 +34,23 @@ $script:AttrCudaModulePath = $PSCommandPath
 # warm 4 MiB reads ran 13 MB/s. Small files are slow cold too (an 11 MB exe hashed in 125 s).
 $script:AttrCudaMeasuredColdReadMBps = 1.5
 
+# BACHELOR-OWNER-CLIP-STAGE-STALL-1 round 1f (fable hardening 2): the fixed (size-independent) part
+# of a leg's wall time, from the two real leg-D traces on Bachelor (bocs-legd-proof-01 and -02,
+# build 74464398, clip M16-1243; both in the r1b summary.md "Measured on bachelor"):
+#   agent child start -> first script line   570 s (proof-01, 9.5 min)   646 s (proof-02, 10.8 min)   -> 650
+#   display-wake                               270 s (4.5 min)             598 s (10 min)              -> 600
+#   cold small-artifact hashes (exe/dll/zip)   ~150 s (13 s + 125 s + ..)   49 s (34 + 13 + 2)         -> 150
+#   footage length screen (per clip, 2 parts)  80 s                         46 s                        -> 100
+#   worst observed sum before the identity read starts                                                 = 1500
+#   package-expand + deploy + quiescence + PresentMon spawn (after the identity read): NOT MEASURED --
+#   no run reached them (proof-02 was killed as package-expand started) -- so a stated allowance     =  300
+# = 1800 s. PostRunSeconds (PresentMon wait <= 35 s in the job + publishing/hashing the artifact
+# files) is likewise NOT MEASURED; 300 s is an allowance until a leg gets past launch. Both are
+# generator parameters (-FixedPreLaunchSeconds / -PostRunSeconds) so a fresh measurement overrides
+# them without editing this file.
+$script:AttrCudaMeasuredFixedPreLaunchSeconds = 1800
+$script:AttrCudaAllowancePostRunSeconds = 300
+
 function Get-AttrCudaEmbeddedFunctionSource {
     <#
     .SYNOPSIS
@@ -1551,8 +1568,8 @@ function Get-AttrCudaLegTimeBudget {
         [ValidateRange(0, 3600)][int]$PlaySeconds = 40,
         [ValidateRange(0, 3600)][int]$SettleSeconds = 3,
         [ValidateRange(0, 3600)][int]$RunnerSlackSeconds = 30,
-        [ValidateRange(0, 7200)][int]$FixedPreLaunchSeconds = 600,
-        [ValidateRange(0, 7200)][int]$PostRunSeconds = 300
+        [ValidateRange(0, 7200)][int]$FixedPreLaunchSeconds = $script:AttrCudaMeasuredFixedPreLaunchSeconds,
+        [ValidateRange(0, 7200)][int]$PostRunSeconds = $script:AttrCudaAllowancePostRunSeconds
     )
 
     $inputMB = $InputBytes / 1048576.0
@@ -1610,9 +1627,10 @@ function Get-AttrCudaFileSha256Blocks {
     SHA-256 a file with ONE sequential large-block read, timing it and tracing its progress.
     Returns @{ sha256 (lowercase hex); bytes; seconds; mbPerSec }.
     .DESCRIPTION
-    STAGE-STALL card. Get-FileHash reads in small blocks; on Bachelor's cold C:
-    with real-time scanning on (measured ~2.3 MB/s at 4 KB blocks, MsMpEng at 12-39 % CPU) that
-    made every full read of a 1.3-2.2 GB owner part cost 8-10 minutes. This reads in
+    STAGE-STALL card. Get-FileHash reads in small blocks (0.55 MB/s at 4 KiB blocks on Bachelor,
+    even warm); the storage there is simply slow (cold reads 1.3-2.3 MB/s at any block size; the
+    read-rate receipt shows Defender using no CPU), so every full read of a 1.3-2.2 GB owner part
+    costs 8-25 minutes and must happen exactly once. This reads in
     -BlockBytes (default 4 MiB) chunks with FILE_FLAG_SEQUENTIAL_SCAN and feeds an incremental
     SHA-256, so the identity check and the OS-file-cache pre-warm are the SAME single pass: the
     app's own load that follows reads warm pages. A progress line is traced every -ProgressBytes
