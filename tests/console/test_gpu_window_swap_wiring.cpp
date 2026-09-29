@@ -10,6 +10,7 @@
 #include "../common/repo_paths.h"
 
 #include <QFile>
+#include <QRegularExpression>
 #include <QString>
 #include <QTextStream>
 
@@ -466,3 +467,207 @@ TEST(GpuWindowSwapWiring, GpuWindowSwapSummaryLineCarriesNewFrameFields)
     ASSERT_TRUE(region.contains(QStringLiteral("swapSnapshot.summary.newFrameSwapCount")));
 }
 
+
+// PIN-CUDA-PRESENT-INVARIANTS-1: direct pins for two invariants of the paint-per-submit
+// present path (PR #185) that no earlier test asserted -- (1) the presented serial is
+// promoted in paintGL() and nowhere else, only after a real draw; (2) the fail-closed LUT
+// gates on the GPU-recon (post-WB-undo, linear) texture route. Source-text pins, same
+// technique as the tests above (GpuDisplayWindow.cpp is not linked into console_tests).
+
+namespace
+{
+int countMatches(const QString & haystack, const QString & pattern)
+{
+    QRegularExpressionMatchIterator it = QRegularExpression(pattern).globalMatch(haystack);
+    int count = 0;
+    while (it.hasNext()) {
+        it.next();
+        ++count;
+    }
+    return count;
+}
+
+QString reconSubmitBody(const QString & source)
+{
+    return functionBody(source,
+        QStringLiteral("bool GpuDisplayWindow::setPresentedGpuPlaybackReconAmazePostWbTexture("),
+        QStringLiteral("bool GpuDisplayWindow::readGpuReconSourceBayer16Texture("));
+}
+
+// paintGL() is the last function in GpuDisplayWindow.cpp, so its body runs to end of file.
+QString paintGlBody(const QString & source)
+{
+    const int at = source.indexOf(QStringLiteral("void GpuDisplayWindow::paintGL()"));
+    return at < 0 ? QString() : source.mid(at);
+}
+} // namespace
+
+TEST(GpuWindowPresentInvariants, PresentedSerialIsPromotedInPaintGlAndNowhereElse)
+{
+    const QString source = readRepoFile(QStringLiteral("platform/qt/GpuDisplayWindow.cpp"));
+
+    // Exactly one promotion of each field, ever. A second one (for example in a submit
+    // path) would mark a frame as presented that no paint has drawn.
+    ASSERT_EQ(1, countOccurrences(source, QStringLiteral("m_presentedSerial = m_pendingPresentationSerial;")));
+    ASSERT_EQ(1, countOccurrences(source,
+        QStringLiteral("m_presentedSerialValid = m_pendingPresentationSerialValid;")));
+
+    // Every assignment to the presented fields in the file: m_presentedSerial is written
+    // by the promotion and by clearPresented()'s reset; m_presentedSerialValid by those
+    // two and by paintGL()'s refused-paint branch. Anything more is a new writer.
+    ASSERT_EQ(2, countMatches(source, QStringLiteral("\\bm_presentedSerial\\s*=[^=]")));
+    ASSERT_EQ(3, countMatches(source, QStringLiteral("\\bm_presentedSerialValid\\s*=[^=]")));
+
+    const QString body = paintGlBody(source);
+    ASSERT_FALSE(body.isEmpty());
+    ASSERT_EQ(1, countOccurrences(body, QStringLiteral("m_presentedSerial = m_pendingPresentationSerial;")));
+    ASSERT_EQ(1, countOccurrences(body,
+        QStringLiteral("m_presentedSerialValid = m_pendingPresentationSerialValid;")));
+}
+
+TEST(GpuWindowPresentInvariants, PaintGlPromotesOnlyAfterTheDrawAndNeverOnARefusedPaint)
+{
+    const QString source = readRepoFile(QStringLiteral("platform/qt/GpuDisplayWindow.cpp"));
+    const QString body = paintGlBody(source);
+    ASSERT_FALSE(body.isEmpty());
+
+    const int refusalGateAt = body.indexOf(QStringLiteral("|| reconRefused )"));
+    ASSERT_TRUE(refusalGateAt >= 0);
+    const int refusalReturnAt = body.indexOf(QStringLiteral("return;"), refusalGateAt);
+    const int drawAt = body.indexOf(QStringLiteral("glDrawArrays(GL_TRIANGLE_STRIP, 0, 4);"));
+    const int activeAt = body.indexOf(QStringLiteral("m_texturePresentationActive = true;"), drawAt);
+    const int promoteAt = body.indexOf(QStringLiteral("m_presentedSerial = m_pendingPresentationSerial;"));
+    const int promoteValidAt = body.indexOf(
+        QStringLiteral("m_presentedSerialValid = m_pendingPresentationSerialValid;"));
+    ASSERT_TRUE(refusalReturnAt > refusalGateAt);
+    ASSERT_TRUE(drawAt > refusalReturnAt);
+    ASSERT_TRUE(activeAt > drawAt);
+    ASSERT_TRUE(promoteAt > activeAt);
+    ASSERT_TRUE(promoteValidAt > promoteAt);
+
+    // The refused/empty paint branch presents nothing: it must invalidate the presented
+    // serial (the new-frame counter rejects presentedSerialValid=false swaps) and must not
+    // promote the pending serial.
+    const QString refusedBranch = body.mid(refusalGateAt, refusalReturnAt - refusalGateAt);
+    ASSERT_TRUE(refusedBranch.contains(QStringLiteral("m_texturePresentationActive = false;")));
+    ASSERT_TRUE(refusedBranch.contains(QStringLiteral("m_presentedSerialValid = false;")));
+    ASSERT_FALSE(refusedBranch.contains(QStringLiteral("m_presentedSerial = ")));
+}
+
+TEST(GpuWindowPresentInvariants, SubmitRoutesOnlyStagePendingSerialsAndNeverPromoteThem)
+{
+    const QString source = readRepoFile(QStringLiteral("platform/qt/GpuDisplayWindow.cpp"));
+    // A write to either presented field (comments may name them; only assignments count).
+    const QString presentedWrite = QStringLiteral("\\bm_presentedSerial(Valid)?\\s*=[^=]");
+
+    const QString reconBody = reconSubmitBody(source);
+    ASSERT_FALSE(reconBody.isEmpty());
+    ASSERT_TRUE(reconBody.contains(QStringLiteral("m_pendingPresentationSerial = presentationSerial;")));
+    ASSERT_TRUE(reconBody.contains(
+        QStringLiteral("m_pendingPresentationSerialValid = presentationSerial != 0;")));
+    ASSERT_EQ(0, countMatches(reconBody, presentedWrite));
+
+    const QString imageBody = functionBody(source,
+        QStringLiteral("void GpuDisplayWindow::setPresentedImage("),
+        QStringLiteral("void GpuDisplayWindow::clearPresented()"));
+    ASSERT_FALSE(imageBody.isEmpty());
+    ASSERT_TRUE(imageBody.contains(QStringLiteral("m_pendingPresentationSerial = presentationSerial;")));
+    ASSERT_TRUE(imageBody.contains(
+        QStringLiteral("m_pendingPresentationSerialValid = presentationSerial != 0;")));
+    ASSERT_EQ(0, countMatches(imageBody, presentedWrite));
+
+    const QString uploadBody = functionBody(source,
+        QStringLiteral("void GpuDisplayWindow::updateTextureIfNeeded()"),
+        QStringLiteral("void GpuDisplayWindow::paintGL()"));
+    ASSERT_FALSE(uploadBody.isEmpty());
+    ASSERT_EQ(0, countMatches(uploadBody, presentedWrite));
+}
+
+// Fail-closed LUT gates (GPU-TEXNR-S1-DARK-GREEN-1): the recon texture is linear post-WB-undo
+// camera RGB, so it must never be drawn without the display LUTs. Three refusals guard it;
+// the first two run at submit time, the third re-checks at paint time.
+
+TEST(GpuWindowPresentInvariants, LutGate1SubmitRefusesWhenPreviewProcessingOptionsAreNotUsable)
+{
+    const QString source = readRepoFile(QStringLiteral("platform/qt/GpuDisplayWindow.cpp"));
+    const QString body = reconSubmitBody(source);
+    ASSERT_FALSE(body.isEmpty());
+
+    const int usableAt = body.indexOf(QStringLiteral("const bool previewProcessingOptionsUsable ="));
+    ASSERT_TRUE(usableAt >= 0);
+    const QString definition = body.mid(usableAt, 700);
+    ASSERT_TRUE(definition.contains(QStringLiteral("previewProcessing.enabled")));
+    ASSERT_TRUE(definition.contains(QStringLiteral("previewProcessing.levelsLut.size()")));
+    ASSERT_TRUE(definition.contains(QStringLiteral("previewProcessing.matrixLutR.size()")));
+    ASSERT_TRUE(definition.contains(QStringLiteral("previewProcessing.matrixLutG.size()")));
+    ASSERT_TRUE(definition.contains(QStringLiteral("previewProcessing.matrixLutB.size()")));
+    ASSERT_TRUE(definition.contains(QStringLiteral("previewProcessing.gammaLut.size()")));
+    // All five LUTs must be held to the full 65536-entry uint16 size.
+    ASSERT_EQ(5, countOccurrences(definition,
+        QStringLiteral(">= static_cast<int>(65536u * sizeof(uint16_t))")));
+
+    const int gateAt = body.indexOf(QStringLiteral("if ( !previewProcessingOptionsUsable )"));
+    ASSERT_TRUE(gateAt > usableAt);
+    const QString refusal = body.mid(gateAt, 400);
+    ASSERT_TRUE(refusal.contains(QStringLiteral("return fail(")));
+    ASSERT_TRUE(refusal.contains(QStringLiteral("trace=gpu_window_recon_missing_processing_options")));
+
+    // "Before any GL work": ahead of context acquisition, the LUT upload and every write to
+    // pending state.
+    ASSERT_TRUE(body.indexOf(QStringLiteral("QOpenGLContext *glContext = context();")) > gateAt);
+    ASSERT_TRUE(body.indexOf(QStringLiteral("gpuPreviewProcessingUpdateLutTextureSet(")) > gateAt);
+    ASSERT_TRUE(body.indexOf(QStringLiteral("m_pendingPresentationSerial = presentationSerial;")) > gateAt);
+}
+
+TEST(GpuWindowPresentInvariants, LutGate2SubmitRefusesWhenTheLutTextureUploadIsNotReady)
+{
+    const QString source = readRepoFile(QStringLiteral("platform/qt/GpuDisplayWindow.cpp"));
+    const QString body = reconSubmitBody(source);
+    ASSERT_FALSE(body.isEmpty());
+
+    const int uploadAt = body.indexOf(
+        QStringLiteral("gpuPreviewProcessingUpdateLutTextureSet(m_lutSet, previewProcessing);"));
+    ASSERT_TRUE(uploadAt >= 0);
+    const int gateAt = body.indexOf(
+        QStringLiteral("if ( !gpuPreviewProcessingLutTextureSetReady(m_lutSet, previewProcessing) )"), uploadAt);
+    ASSERT_TRUE(gateAt > uploadAt);
+    const QString refusal = body.mid(gateAt, 400);
+    ASSERT_TRUE(refusal.contains(QStringLiteral("return fail(")));
+    ASSERT_TRUE(refusal.contains(QStringLiteral("trace=gpu_window_recon_lut_upload_failed")));
+
+    // The refusal must land before the fate call and every pending-state write, so a
+    // refused submit leaves the pending slot (and its serial) untouched.
+    ASSERT_TRUE(body.indexOf(
+        QStringLiteral("if ( swapTelemetryEnabled() ) noteSupersededBeforePaint(presentationSerial);")) > gateAt);
+    ASSERT_TRUE(body.indexOf(QStringLiteral("m_pendingPresentationSerial = presentationSerial;")) > gateAt);
+    ASSERT_TRUE(body.indexOf(QStringLiteral("paintGL();")) > gateAt);
+}
+
+TEST(GpuWindowPresentInvariants, LutGate3PaintGlRefusesAReconTextureWhoseLutsAreNotReady)
+{
+    const QString source = readRepoFile(QStringLiteral("platform/qt/GpuDisplayWindow.cpp"));
+    const QString body = paintGlBody(source);
+    ASSERT_FALSE(body.isEmpty());
+
+    const int readyAt = body.indexOf(QStringLiteral("const bool reconLutsReady = presentingReconTexture"));
+    ASSERT_TRUE(readyAt >= 0);
+    ASSERT_TRUE(body.mid(readyAt, 250).contains(QStringLiteral(
+        "gpuPreviewProcessingLutTextureSetReady(m_lutSet, m_reconPresentationOptions.previewProcessing)")));
+
+    const int refusedAt = body.indexOf(QStringLiteral("const bool reconRefused ="));
+    ASSERT_TRUE(refusedAt > readyAt);
+    ASSERT_TRUE(body.mid(refusedAt, 250).contains(QStringLiteral(
+        "gpuPreviewProcessingReconTexturePresentationRefused(\n"
+        "        presentingReconTexture, m_lutSet, m_reconPresentationOptions.previewProcessing)")));
+
+    // The refusal is part of the early-return condition that precedes the draw, and the
+    // recon route draws through the preview-processing program, never the passthrough one.
+    const int gateAt = body.indexOf(
+        QStringLiteral("if ( !m_texture || !activeProgram || width() <= 0 || height() <= 0 || reconRefused )"));
+    ASSERT_TRUE(gateAt > refusedAt);
+    ASSERT_TRUE(body.indexOf(QStringLiteral("glDrawArrays(GL_TRIANGLE_STRIP, 0, 4);")) > gateAt);
+    ASSERT_TRUE(body.contains(QStringLiteral(
+        "presentingReconTexture ? m_previewProcessingProgram : m_program")));
+    ASSERT_TRUE(body.contains(QStringLiteral(
+        "displayUniforms, reconLutsReady);")));
+}
