@@ -12,6 +12,7 @@
 #include "ExportDimensions.h"
 #include "ExportProcess.h"
 #include "DualIsoLevelSyncPolicy.h"
+#include "PlaybackFpsMeterPolicy.h"
 #include "PlaybackFrameRange.h"
 #include "PlaybackGatePolicy.h"
 #include "PlaybackPrepPresentationPolicy.h"
@@ -51,6 +52,7 @@ extern "C" {
 #include <QStringList>
 #include <QScrollBar>
 #include <QScreen>
+#include <QWindow>
 #include <QMimeData>
 #include <QUrl>
 #include <QVBoxLayout>
@@ -81,6 +83,29 @@ namespace
 static QString bool01( bool value )
 {
     return value ? QStringLiteral("1") : QStringLiteral("0");
+}
+
+// UM-DISPLAY-SELECT-AND-LOG-1 round 1c (measured topology, project-memory
+// um-display-topology-lg-tv-denon-fallback-20260926.md): case-insensitive match against
+// name/model/manufacturer, in that order -- the field that matched is returned (for logging
+// which one it was), never guessed. An empty substring or a null screen never matches.
+static QString playbackSmokeDisplayPreferenceMatchedField( QScreen *screen, const QString &preferSubstring )
+{
+    if( !screen || preferSubstring.isEmpty() ) return QString();
+    // Round 2 (sol PRE-REVIEW #2 BLOCKER a): the job resolves the preferred Windows monitor
+    // name to its GDI device name (\\.\DISPLAYn -- exactly what QScreen::name() reports on
+    // Windows, with an empty model on the measured UM topology) and passes THAT. A device-name
+    // preference is compared for equality and never falls through to the substring fields, so
+    // \\.\DISPLAY1 cannot also select \\.\DISPLAY10.
+    if( preferSubstring.startsWith( QStringLiteral( "\\\\.\\" ) ) )
+    {
+        if( screen->name().compare( preferSubstring, Qt::CaseInsensitive ) == 0 ) return QStringLiteral("device_name");
+        return QString();
+    }
+    if( screen->name().contains( preferSubstring, Qt::CaseInsensitive ) ) return QStringLiteral("name");
+    if( screen->model().contains( preferSubstring, Qt::CaseInsensitive ) ) return QStringLiteral("model");
+    if( screen->manufacturer().contains( preferSubstring, Qt::CaseInsensitive ) ) return QStringLiteral("manufacturer");
+    return QString();
 }
 
 static QString fingerprintDisplayValue( const QJsonObject &fingerprint,
@@ -2982,7 +3007,29 @@ static int mlvappStartPlaybackTimer( QObject *owner, double framerate )
 void MainWindow::timerFrameEvent( bool predictivePlaybackAdvance )
 {
     static QTime lastTime;              //Last Time a picture was rendered
-    static int timeDiff = 0;            //TimeDiff between 2 rendered frames in Playback
+    static QTime lastDrawTime;          //Last Time a frame was DRAWN (fps meter only; lastTime is re-armed on idle ticks)
+    static int timeDiff = 0;           //TimeDiff between 2 rendered frames in Playback
+
+    //Zero the fps meter when paused, before the first draw, or stalled. Runs on EVERY tick, including
+    //the still-drawing early returns below: a busy render must not leave the previous fps on screen.
+    //Touches only the meter state, never lastTime, so drop-frame pacing is unchanged.
+    const auto resetFpsMeterIfIdle = [this]( const QTime & now )
+    {
+        const bool hasDraw = lastDrawTime.isValid();
+        if( playback_fps_meter::fpsMeterShouldReset( ui->actionPlay->isChecked(), hasDraw,
+                                                     hasDraw ? lastDrawTime.msecsTo( now ) : 0 ) )
+        {
+            const QString playbackFpsText = playbackFpsStatusText( 0.0 );
+            if( m_lastPlaybackFpsStatusText != playbackFpsText )
+            {
+                m_pFpsStatus->setText( playbackFpsText );
+                m_lastPlaybackFpsStatusText = playbackFpsText;
+            }
+            m_playbackFpsEmaFrameMs = 0.0;
+            m_lastPlaybackFpsStatusUpdateTime = QTime();
+            lastDrawTime = QTime();
+        }
+    };
 
     if( m_frameStillDrawing )
     {
@@ -3005,6 +3052,7 @@ void MainWindow::timerFrameEvent( bool predictivePlaybackAdvance )
                         .arg( ui->horizontalSliderPosition->value() ),
                     true );
             }
+            resetFpsMeterIfIdle( QTime::currentTime() );
             //On setup slider priority
             if( !ui->actionPlay->isChecked() )
             {
@@ -3111,22 +3159,14 @@ void MainWindow::timerFrameEvent( bool predictivePlaybackAdvance )
         //Allow interaction while playback
         //qApp->processEvents();
 
-        //fps measurement
-        const int measuredFrameMs = lastTime.msecsTo( nowTime );
+        //fps measurement: draw-to-draw interval. lastTime is re-armed on every idle poll tick (it
+        //feeds the drop-frame elapsed time), so it cannot serve here -- see playback_fps_meter::smoothedFrameMs.
+        const int measuredFrameMs = lastDrawTime.isValid() ? lastDrawTime.msecsTo( nowTime ) : 0;
+        lastDrawTime = nowTime;
         if( timeDiff != 0 )
         {
-            if( measuredFrameMs > 0 )
-            {
-                if( m_playbackFpsEmaFrameMs <= 0.0 )
-                {
-                    m_playbackFpsEmaFrameMs = static_cast<double>( measuredFrameMs );
-                }
-                else
-                {
-                    m_playbackFpsEmaFrameMs =
-                        ( m_playbackFpsEmaFrameMs * 0.9 ) + ( static_cast<double>( measuredFrameMs ) * 0.1 );
-                }
-            }
+            m_playbackFpsEmaFrameMs =
+                playback_fps_meter::smoothedFrameMs( m_playbackFpsEmaFrameMs, measuredFrameMs );
             const bool shouldUpdateFpsText =
                 !m_lastPlaybackFpsStatusUpdateTime.isValid()
                 || m_lastPlaybackFpsStatusUpdateTime.msecsTo( nowTime ) >= 250;
@@ -3161,14 +3201,9 @@ void MainWindow::timerFrameEvent( bool predictivePlaybackAdvance )
                     .arg( ui->horizontalSliderPosition->value() ),
                 true );
         }
-        const QString playbackFpsText = playbackFpsStatusText( 0.0 );
-        if( m_lastPlaybackFpsStatusText != playbackFpsText )
-        {
-            m_pFpsStatus->setText( playbackFpsText );
-            m_lastPlaybackFpsStatusText = playbackFpsText;
-        }
-        m_playbackFpsEmaFrameMs = 0.0;
-        m_lastPlaybackFpsStatusUpdateTime = QTime();
+        //An idle poll tick between two draws is normal while playing (8 ms poll, ~42 ms frame
+        //period at 24 fps): only paused or stalled playback zeroes the fps meter.
+        resetFpsMeterIfIdle( nowTime );
         lastTime = QTime::currentTime(); //do that for calculation of timeDiff for DropFrameMode;
 
     }
@@ -9117,6 +9152,44 @@ int MainWindow::runGuiPlaybackSmoke(const GuiPlaybackSmokeOptions & options)
     // clip plays once, the engine unchecks Play at clip-end, and the wait loop below exits early ("MLV
     // playback stopping too early"). Frame-matched A/B callers omit --loop so both legs stop on the same frame.
     if( options.loopPlayback && !ui->actionLoop->isChecked() ) ui->actionLoop->trigger();
+
+    // UM-DISPLAY-SELECT-AND-LOG-1: a leg must never silently benchmark whatever screen the
+    // window's persisted geometry happened to leave it on -- log every attached display,
+    // choose the highest-physical-pixel one, and move the window there BEFORE any fullscreen
+    // request or windowed maximize below. The geometry guard restores the pre-smoke geometry
+    // before this function returns on every path (success and every early return past this
+    // point) so a smoke run never overwrites the user's saved mainWindowGeometry.
+    const bool windowedSmoke = options.windowed;
+    logPlaybackSmokeDisplayInventory();
+    bool displayFallback = false;
+    int displayCandidateCount = 0;
+    QString displayTargetReason;
+    QString displayPreferredStatus;
+    QScreen *displayTarget =
+        choosePlaybackSmokeDisplayTarget( &displayFallback, &displayCandidateCount, &displayTargetReason,
+                                           options.displayPreferSubstring, &displayPreferredStatus );
+    // UM-DISPLAY-SELECT-AND-LOG-1 round 1c: preferred=/preferred_matched= appended after
+    // fallback=, never inserted -- recorded, never gated (a Denon leg, real 4K just not the
+    // preferred one, is still a valid measurement; see choosePlaybackSmokeDisplayTarget()).
+    qInfo().noquote()
+        << QStringLiteral(
+               "gui_smoke.display_target screen=\"%1\" reason=%2 candidates=%3 fallback=%4 "
+               "preferred=\"%5\" preferred_matched=%6" )
+               .arg( displayTarget ? displayTarget->name() : QStringLiteral("none") )
+               .arg( displayTargetReason )
+               .arg( displayCandidateCount )
+               .arg( bool01( displayFallback ) )
+               .arg( options.displayPreferSubstring )
+               .arg( displayPreferredStatus );
+
+    struct PlaybackSmokeGeometryGuard
+    {
+        MainWindow *window;
+        QByteArray geometry;
+        ~PlaybackSmokeGeometryGuard() { if( window ) window->restoreGeometry( geometry ); }
+    } playbackSmokeGeometryGuard{ this, saveGeometry() };
+    movePlaybackSmokeWindowToScreen( displayTarget );
+
     // CUDA-PERF-PLAYBACK-FOREGROUND-1: force the window to the OS foreground right before
     // the measured play trigger below -- a process launched by a background measurement job
     // otherwise plays occluded/background, which a compositor can present at far fewer
@@ -9129,13 +9202,78 @@ int MainWindow::runGuiPlaybackSmoke(const GuiPlaybackSmokeOptions & options)
     // windowed measurement does not represent what is being tuned. Entered after the
     // foreground step above and left at session end via the guard below, which restores
     // normal window chrome regardless of how this function returns (every early-return
-    // error path included), not only on the success path.
+    // error path included), not only on the success path. UM-DISPLAY-SELECT-AND-LOG-1 round
+    // 1b: --windowed skips full screen entirely and instead maximizes on the chosen target
+    // screen (deterministic size), so the guard below must only leave full screen when it
+    // was actually entered.
     struct PlaybackSmokeFullscreenGuard
     {
         MainWindow *window;
-        ~PlaybackSmokeFullscreenGuard() { if( window ) window->leavePlaybackSmokeFullscreen(); }
-    } playbackSmokeFullscreenGuard{ this };
-    const bool fullscreenVerified = enterPlaybackSmokeFullscreen();
+        bool active;
+        ~PlaybackSmokeFullscreenGuard() { if( window && active ) window->leavePlaybackSmokeFullscreen(); }
+    } playbackSmokeFullscreenGuard{ this, !windowedSmoke };
+    QRect windowedGeometry;
+    QSize windowedPreviewSize;
+    bool fullscreenVerified = true;
+    // UM-DISPLAY-SELECT-AND-LOG-1 round 1c (sol BLOCKER 3 / opus design-review item 3): the
+    // ACTUAL presentation screen -- not the intended target -- is what a leg was really
+    // benchmarked on, so it is queried fresh (this->screen(), after placement/fullscreen
+    // settle) and logged as its own field, appended after preview= (never inserted), rather
+    // than folded into "screen=" (which stays the intended target, for back-compat with the
+    // existing parser and its pinned tests).
+    auto presentationPhysicalSize = [&]( QScreen *s ) -> QSize
+    {
+        if( !s ) return QSize( 0, 0 );
+        const double dpr = s->devicePixelRatio();
+        return QSize( qRound( s->geometry().width() * dpr ), qRound( s->geometry().height() * dpr ) );
+    };
+    if( windowedSmoke )
+    {
+        fullscreenVerified =
+            placePlaybackSmokeWindowWindowed( displayTarget, &windowedGeometry, &windowedPreviewSize );
+        QScreen *presentationScreen = this->screen();
+        const QSize presentationPhysical = presentationPhysicalSize( presentationScreen );
+        qInfo().noquote()
+            << QStringLiteral(
+                   "gui_smoke.window_placement mode=windowed screen=\"%1\" verified=%2 "
+                   "window=%3,%4 %5x%6 preview=%7x%8 target_screen=\"%9\" "
+                   "presentation_screen=\"%10\" presentation_physical=%11x%12" )
+                   .arg( displayTarget ? displayTarget->name() : QStringLiteral("none") )
+                   .arg( bool01( fullscreenVerified ) )
+                   .arg( windowedGeometry.x() )
+                   .arg( windowedGeometry.y() )
+                   .arg( windowedGeometry.width() )
+                   .arg( windowedGeometry.height() )
+                   .arg( windowedPreviewSize.width() )
+                   .arg( windowedPreviewSize.height() )
+                   .arg( displayTarget ? displayTarget->name() : QStringLiteral("none") )
+                   .arg( presentationScreen ? presentationScreen->name() : QStringLiteral("none") )
+                   .arg( presentationPhysical.width() )
+                   .arg( presentationPhysical.height() );
+    }
+    else
+    {
+        fullscreenVerified = enterPlaybackSmokeFullscreen( displayTarget );
+        QScreen *presentationScreen = this->screen();
+        const QSize presentationPhysical = presentationPhysicalSize( presentationScreen );
+        qInfo().noquote()
+            << QStringLiteral(
+                   "gui_smoke.window_placement mode=fullscreen screen=\"%1\" verified=%2 "
+                   "window=%3,%4 %5x%6 preview=%7x%8 target_screen=\"%9\" "
+                   "presentation_screen=\"%10\" presentation_physical=%11x%12" )
+                   .arg( displayTarget ? displayTarget->name() : QStringLiteral("none") )
+                   .arg( bool01( fullscreenVerified ) )
+                   .arg( geometry().x() )
+                   .arg( geometry().y() )
+                   .arg( geometry().width() )
+                   .arg( geometry().height() )
+                   .arg( playbackSmokeViewportSize().width() )
+                   .arg( playbackSmokeViewportSize().height() )
+                   .arg( displayTarget ? displayTarget->name() : QStringLiteral("none") )
+                   .arg( presentationScreen ? presentationScreen->name() : QStringLiteral("none") )
+                   .arg( presentationPhysical.width() )
+                   .arg( presentationPhysical.height() );
+    }
     // Entering full screen hides chrome and re-lays-out the window -- re-verify (and, if
     // it slipped, re-establish) OS foreground now rather than trusting the pre-fullscreen
     // check above to still describe the window actually being measured.
@@ -9144,6 +9282,8 @@ int MainWindow::runGuiPlaybackSmoke(const GuiPlaybackSmokeOptions & options)
     // CUDA-PLAYBACK-FULLSCREEN-UI-1 round 2: a full-screen measured run must never
     // silently fall back to windowed or a wrong-sized GPU viewport -- fail closed here,
     // before the play trigger, rather than logging verified=0 above and measuring anyway.
+    // UM-DISPLAY-SELECT-AND-LOG-1 round 1b: the same fail-closed helper covers a windowed
+    // leg whose placement did not verify.
     auto logFullscreenSmokeFailure = [&]( const char *reason ) -> int
     {
         QScreen *failScreen = this->screen();
@@ -9161,7 +9301,8 @@ int MainWindow::runGuiPlaybackSmoke(const GuiPlaybackSmokeOptions & options)
     };
     if( !fullscreenVerified )
     {
-        return logFullscreenSmokeFailure( "fullscreen_not_verified" );
+        return logFullscreenSmokeFailure(
+            windowedSmoke ? "windowed_placement_not_verified" : "fullscreen_not_verified" );
     }
 
     const qint64 preambleMs = preambleClock.elapsed();
@@ -9519,8 +9660,10 @@ int MainWindow::runGuiPlaybackSmoke(const GuiPlaybackSmokeOptions & options)
     // lose-then-regain interval entirely within the measured window (e.g. Escape to
     // windowed, then F11/Ctrl+F back to full screen before the loop ends) -- also fail
     // closed on m_playbackSmokeFullscreenLostCount, latched event-driven throughout the
-    // measured interval above, rather than trusting only the final state.
-    if( !isFullScreen() || m_playbackSmokeFullscreenLostCount > 0 )
+    // measured interval above, rather than trusting only the final state. UM-DISPLAY-SELECT-
+    // AND-LOG-1 round 1b: a windowed leg never enters full screen, so this gate does not
+    // apply to it -- isFullScreen() would be trivially false the whole time.
+    if( !windowedSmoke && ( !isFullScreen() || m_playbackSmokeFullscreenLostCount > 0 ) )
     {
         return logFullscreenSmokeFailure( "fullscreen_lost_mid_session" );
     }
@@ -23271,6 +23414,224 @@ void MainWindow::forcePlaybackSmokeWindowForeground( void )
                .arg( bool01( verified ) );
 }
 
+// --gui-smoke-playback only (UM-DISPLAY-SELECT-AND-LOG-1): one line per attached QScreen so
+// a UM number is never presented without knowing what every candidate display was at that
+// moment -- both the happy path (LG TV via the Denon AVR at 4K) and the degraded fallback
+// (the AVR's headless output at a lower resolution when the TV is off) are logged the same
+// way. Never called from normal (non-smoke) startup -- see runGuiPlaybackSmoke(), the only
+// call site.
+void MainWindow::logPlaybackSmokeDisplayInventory( void ) const
+{
+    const QList<QScreen *> screens = QGuiApplication::screens();
+    QScreen * const primary = QGuiApplication::primaryScreen();
+    for( int i = 0; i < screens.size(); ++i )
+    {
+        QScreen *s = screens.at( i );
+        if( !s ) continue;
+        const QRect geo = s->geometry();
+        const double dpr = s->devicePixelRatio();
+        const int physicalWidth = qRound( geo.width() * dpr );
+        const int physicalHeight = qRound( geo.height() * dpr );
+        qInfo().noquote()
+            << QStringLiteral(
+                   "gui_smoke.display_screen index=%1 name=\"%2\" manufacturer=\"%3\" "
+                   "model=\"%4\" serial=\"%5\" geometry=%6,%7 %8x%9 physical=%10x%11 "
+                   "dpr=%12 refresh_hz=%13 primary=%14" )
+                   .arg( i )
+                   .arg( s->name() )
+                   .arg( s->manufacturer() )
+                   .arg( s->model() )
+                   .arg( s->serialNumber() )
+                   .arg( geo.x() )
+                   .arg( geo.y() )
+                   .arg( geo.width() )
+                   .arg( geo.height() )
+                   .arg( physicalWidth )
+                   .arg( physicalHeight )
+                   .arg( dpr, 0, 'f', 2 )
+                   .arg( s->refreshRate(), 0, 'f', 3 )
+                   .arg( bool01( s == primary ) );
+    }
+}
+
+// --gui-smoke-playback only (UM-DISPLAY-SELECT-AND-LOG-1): picks the display a smoke leg
+// presents on. Rule (owner request, ultra-magnus-lg-tv-denon topology): the highest physical
+// pixel count wins, ties broken by higher refresh rate and then by primary -- never "wherever
+// the window's saved geometry happens to leave it", which can silently land on the AVR's
+// degraded headless fallback. outFallback is set when the choice differs from either the
+// window's starting screen or the primary screen, so a caller that never moved the window
+// still gets an accurate signal.
+QScreen *MainWindow::choosePlaybackSmokeDisplayTarget( bool *outFallback,
+                                                       int *outCandidateCount,
+                                                       QString *outReason,
+                                                       const QString &preferSubstring,
+                                                       QString *outPreferredStatus ) const
+{
+    const QList<QScreen *> screens = QGuiApplication::screens();
+    QScreen * const primary = QGuiApplication::primaryScreen();
+    QScreen * const startScreen = this->screen();
+
+    if( outCandidateCount ) *outCandidateCount = screens.size();
+
+    QScreen *best = nullptr;
+    qint64 bestPixels = -1;
+    double bestRefresh = -1.0;
+    bool bestIsPrimary = false;
+    bool bestIsPreferred = false;
+    QString reason = QStringLiteral("no_screens");
+
+    for( QScreen *s : screens )
+    {
+        if( !s ) continue;
+        const QRect geo = s->geometry();
+        const double dpr = s->devicePixelRatio();
+        const qint64 pixels =
+            static_cast<qint64>( qRound( geo.width() * dpr ) )
+            * static_cast<qint64>( qRound( geo.height() * dpr ) );
+        const double refresh = s->refreshRate();
+        const bool isPrimaryScreen = ( s == primary );
+        // UM-DISPLAY-SELECT-AND-LOG-1 round 1c: a per-venue preference is a TIE-BREAK among
+        // the candidates already tied for the most physical pixels -- checked BEFORE refresh
+        // (order: max pixels, then preferred, then refresh, then primary), never instead of
+        // the pixel comparison, so a preferred display with fewer pixels never wins over the
+        // real resolution.
+        const bool isPreferred = !playbackSmokeDisplayPreferenceMatchedField( s, preferSubstring ).isEmpty();
+
+        bool better = false;
+        QString candidateReason;
+        if( !best || pixels > bestPixels )
+        {
+            better = true;
+            candidateReason = QStringLiteral("max_physical_pixels");
+        }
+        else if( pixels == bestPixels )
+        {
+            if( isPreferred && !bestIsPreferred )
+            {
+                better = true;
+                candidateReason = QStringLiteral("max_physical_pixels_tie_preferred");
+            }
+            else if( isPreferred == bestIsPreferred && refresh > bestRefresh )
+            {
+                better = true;
+                candidateReason = QStringLiteral("max_physical_pixels_tie_refresh");
+            }
+            else if( isPreferred == bestIsPreferred && refresh == bestRefresh && isPrimaryScreen && !bestIsPrimary )
+            {
+                better = true;
+                candidateReason = QStringLiteral("max_physical_pixels_tie_primary");
+            }
+        }
+
+        if( better )
+        {
+            best = s;
+            bestPixels = pixels;
+            bestRefresh = refresh;
+            bestIsPrimary = isPrimaryScreen;
+            bestIsPreferred = isPreferred;
+            reason = candidateReason;
+        }
+    }
+
+    if( !best ) best = primary;
+    if( !best ) best = startScreen;
+
+    if( outReason ) *outReason = reason;
+    if( outFallback )
+    {
+        // UM-DISPLAY-SELECT-AND-LOG-1 round 1c (opus design-review hardening item 5): this
+        // reads 1 on every nominal UM run once a non-primary preferred display (the ASUS
+        // PA329C) is chosen -- expected, not a fault, since "differs from primary" was always
+        // this flag's definition, never renamed to moved_from_start/primary_chosen this round.
+        *outFallback = best && ( ( best != startScreen ) || ( best != primary ) );
+    }
+    if( outPreferredStatus )
+    {
+        // Recorded, never gated: the owner "accepts the ASUS for now", and a Denon leg (real
+        // 4K, just not the preferred one) is still valid -- this reports what happened, it
+        // never fails a leg. 'none' (no preference configured), 'absent' (configured but no
+        // screen matched), 'matched' (matched AND it is the chosen target), or 'not_max' (a
+        // screen matched but a higher-pixel screen won -- real resolution always wins first).
+        if( preferSubstring.isEmpty() )
+        {
+            *outPreferredStatus = QStringLiteral("none");
+        }
+        else
+        {
+            QScreen *preferredCandidate = nullptr;
+            qint64 preferredCandidatePixels = -1;
+            for( QScreen *s : screens )
+            {
+                if( !s || playbackSmokeDisplayPreferenceMatchedField( s, preferSubstring ).isEmpty() ) continue;
+                const QRect geo = s->geometry();
+                const double dpr = s->devicePixelRatio();
+                const qint64 pixels =
+                    static_cast<qint64>( qRound( geo.width() * dpr ) )
+                    * static_cast<qint64>( qRound( geo.height() * dpr ) );
+                if( !preferredCandidate || pixels > preferredCandidatePixels )
+                {
+                    preferredCandidate = s;
+                    preferredCandidatePixels = pixels;
+                }
+            }
+            if( !preferredCandidate ) *outPreferredStatus = QStringLiteral("absent");
+            else if( preferredCandidate == best ) *outPreferredStatus = QStringLiteral("matched");
+            else *outPreferredStatus = QStringLiteral("not_max");
+        }
+    }
+    return best;
+}
+
+// --gui-smoke-playback only (UM-DISPLAY-SELECT-AND-LOG-1): relocates the window to the
+// chosen target screen BEFORE any fullscreen request or windowed maximize -- showFullScreen()
+// and showMaximized() both act on whichever screen the window already occupies, so the
+// window must actually move there first, not just be told to fullscreen/maximize in place.
+void MainWindow::movePlaybackSmokeWindowToScreen( QScreen *target )
+{
+    if( !target ) return;
+    if( isFullScreen() || isMaximized() ) showNormal();
+    if( QWindow *handle = windowHandle() ) handle->setScreen( target );
+    move( target->availableGeometry().topLeft() );
+    qApp->processEvents( QEventLoop::AllEvents );
+}
+
+// --gui-smoke-playback only (UM-DISPLAY-SELECT-AND-LOG-1, round 1b): the windowed-leg
+// counterpart to enterPlaybackSmokeFullscreen() -- deterministic size (the target screen's
+// availableGeometry, via showMaximized()) instead of whatever mainWindowGeometry last left
+// on disk, and on the chosen target screen instead of wherever that geometry happened to be.
+// Bounded, event-driven wait mirrors enterPlaybackSmokeFullscreen()'s settle loop.
+bool MainWindow::placePlaybackSmokeWindowWindowed( QScreen *target,
+                                                   QRect *outGeometry,
+                                                   QSize *outPreviewSize )
+{
+    // UM-DISPLAY-SELECT-AND-LOG-1 round 1c (opus design-review item 3): a null target is a
+    // typed failure, not a vacuous pass onto whatever screen the window already happens to be
+    // on -- choosePlaybackSmokeDisplayTarget() only returns null when QGuiApplication::screens()
+    // is itself empty, so this is defensive fail-closed, never a real fallback path.
+    if( !target )
+    {
+        if( outGeometry ) *outGeometry = geometry();
+        if( outPreviewSize ) *outPreviewSize = playbackSmokeViewportSize();
+        return false;
+    }
+    movePlaybackSmokeWindowToScreen( target );
+    showMaximized();
+
+    bool verified = false;
+    for( int attempt = 0; attempt < 200; ++attempt )
+    {
+        qApp->processEvents( QEventLoop::AllEvents );
+        verified = isMaximized() && target && this->screen() == target;
+        if( verified ) break;
+        QThread::msleep( 5 );
+    }
+
+    if( outGeometry ) *outGeometry = geometry();
+    if( outPreviewSize ) *outPreviewSize = playbackSmokeViewportSize();
+    return verified;
+}
+
 // --gui-smoke-playback only (CUDA-PERF-PLAYBACK-FULLSCREEN-1). Never called from normal
 // (non-smoke) startup -- see MainWindow::runGuiPlaybackSmoke(), the only call site. Full
 // screen is how the owner watches, and it changes the present path (window size, pixels
@@ -23281,35 +23642,63 @@ void MainWindow::forcePlaybackSmokeWindowForeground( void )
 // sizing in computeDisplaySceneGeometry() (which already branches on
 // ui->actionFullscreen->isChecked() to size from the window's own screen) apply exactly as
 // they would for a user-triggered toggle.
-bool MainWindow::enterPlaybackSmokeFullscreen( void )
+bool MainWindow::enterPlaybackSmokeFullscreen( QScreen *target )
 {
+    // UM-DISPLAY-SELECT-AND-LOG-1 round 1c (sol pre-review BLOCKER 3 / opus design-review
+    // item 3): a null target is a typed failure, not a vacuous pass -- previously this
+    // function took no target at all and simply trusted this->screen() (captured ONCE,
+    // before the settle loop) as ground truth for both what to verify against AND what to
+    // report as "target_screen". A move the OS/window manager silently ignored (this
+    // topology has TWO same-size 4K outputs -- the Denon path and the ASUS monitor -- so
+    // size alone cannot distinguish a rejected move) would then verify=true and report the
+    // intended target's name, while playback actually ran on the wrong screen.
+    if( !target )
+    {
+        qInfo().noquote()
+            << QStringLiteral(
+                   "gui_smoke.fullscreen_request requested=1 verified=0 screen=0x0 "
+                   "window=%1x%2 gpu_viewport=0x0 dpr=%3 target_screen=\"none\" "
+                   "presentation_screen=\"none\" presentation_physical=0x0" )
+                   .arg( size().width() )
+                   .arg( size().height() )
+                   .arg( devicePixelRatioF(), 0, 'f', 2 );
+        return false;
+    }
+
     if( !ui->actionFullscreen->isChecked() )
     {
         ui->actionFullscreen->trigger();
     }
 
-    // Matches computeDisplaySceneGeometry()'s screen choice: the window's own screen, not
-    // always primary -- showFullScreen() goes fullscreen wherever the window already is.
-    QScreen *fullscreenScreen = this->screen();
-    if( !fullscreenScreen ) fullscreenScreen = QApplication::primaryScreen();
-    const QSize screenSize = fullscreenScreen ? fullscreenScreen->size() : QSize();
+    const QSize targetSize = target->size();
 
     // Bounded, event-driven wait: showFullScreen() is asynchronous under the window
     // manager, and when the experimental GL viewport path is active the GPU display
     // window's own container resize is a further layout pass on top of that -- both need
-    // to settle before the geometry checked below is meaningful.
+    // to settle before the geometry checked below is meaningful. this->screen() is
+    // re-queried and re-compared against the CHOSEN target on every pass, not captured
+    // once before the loop -- the failure this closes is a rejected move that never shows
+    // up in isFullScreen()/size() alone.
+    QScreen *presentationScreen = this->screen();
     bool mainVerified = false;
     QSize gpuViewport( 0, 0 ); // stays 0x0 (not -1x-1) when the GPU display path is never active
     bool gpuVerified = true; // vacuously true when the GPU display path is not active
     for( int attempt = 0; attempt < 200; ++attempt )
     {
         qApp->processEvents( QEventLoop::AllEvents );
-        mainVerified = isFullScreen() && screenSize.isValid() && size() == screenSize;
+        presentationScreen = this->screen();
+        const bool onTarget = ( presentationScreen == target );
+        mainVerified = isFullScreen() && onTarget && targetSize.isValid() && size() == targetSize;
 
         if( GpuDisplayWindow::isActive() )
         {
             gpuViewport = GpuDisplayWindow::displaySize();
-            gpuVerified = screenSize.isValid() && gpuViewport == screenSize;
+            gpuVerified = targetSize.isValid() && gpuViewport == targetSize;
+        }
+        else
+        {
+            gpuViewport = QSize( 0, 0 );
+            gpuVerified = true;
         }
 
         if( mainVerified && gpuVerified ) break;
@@ -23317,18 +23706,29 @@ bool MainWindow::enterPlaybackSmokeFullscreen( void )
     }
 
     const bool verified = mainVerified && gpuVerified;
+    if( !presentationScreen ) presentationScreen = QApplication::primaryScreen();
+    const double presentationDpr = presentationScreen ? presentationScreen->devicePixelRatio() : 1.0;
+    const QSize presentationPhysical = presentationScreen
+        ? QSize( qRound( presentationScreen->geometry().width() * presentationDpr ),
+                 qRound( presentationScreen->geometry().height() * presentationDpr ) )
+        : QSize( 0, 0 );
     qInfo().noquote()
         << QStringLiteral(
                "gui_smoke.fullscreen_request requested=1 verified=%1 screen=%2x%3 "
-               "window=%4x%5 gpu_viewport=%6x%7 dpr=%8" )
+               "window=%4x%5 gpu_viewport=%6x%7 dpr=%8 target_screen=\"%9\" "
+               "presentation_screen=\"%10\" presentation_physical=%11x%12" )
                .arg( bool01( verified ) )
-               .arg( screenSize.width() )
-               .arg( screenSize.height() )
+               .arg( targetSize.width() )
+               .arg( targetSize.height() )
                .arg( size().width() )
                .arg( size().height() )
                .arg( gpuViewport.width() )
                .arg( gpuViewport.height() )
-               .arg( devicePixelRatioF(), 0, 'f', 2 );
+               .arg( devicePixelRatioF(), 0, 'f', 2 )
+               .arg( target->name() )
+               .arg( presentationScreen ? presentationScreen->name() : QStringLiteral("none") )
+               .arg( presentationPhysical.width() )
+               .arg( presentationPhysical.height() );
     return verified;
 }
 

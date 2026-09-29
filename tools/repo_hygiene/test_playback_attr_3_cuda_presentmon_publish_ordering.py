@@ -25,6 +25,7 @@ Get-AttrCudaPresentMonDisplayReport against real csv fixtures.
 
 from __future__ import annotations
 
+import re
 import shutil
 import subprocess
 import tempfile
@@ -480,6 +481,17 @@ class EmbeddedFunctionCoverageTests(unittest.TestCase):
         end = text.index("\n))\n", second_call) + len("\n))")
         cls.embedding_snippet = text[start:end].replace("$PSScriptRoot", "$bachelorRoot")
 
+        # UM-DISPLAY-SELECT-AND-LOG-1 round 4 (fable EMBEDDED-COVERAGE-INCLUDE-SHARED-PARSER-1):
+        # the shared display-identity parser is embedded by a THIRD call (from the committed
+        # gui-smoke-display-identity.ps1 blob, inside a try/finally that needs a real repo), which
+        # the snippet above stops short of. Its -Name list is parsed out of the generator here and
+        # embedded from the working-tree copy of the same file, so the functions the template calls
+        # (Get-GuiSmokeDisplayIdentity, ...) are checked as defined in the emitted job's text too.
+        shared_call = text.index("-ModulePath $displayIdentityTemp -Name @(", second_call)
+        shared_list_end = text.index("\n    ))", shared_call)
+        shared_list = text[shared_call:shared_list_end]
+        cls.shared_parser_names = re.findall(r"'([A-Za-z]+-[A-Za-z]+)'", shared_list)
+
         # The body ONLY -- unlike this file's other classes, which keep the "$template = @'"
         # prefix (harmless there, since they only ever substring-search it) -- because this class
         # feeds the text to PowerShell's own parser, and a bare unterminated "@'" opener with no
@@ -508,7 +520,11 @@ class EmbeddedFunctionCoverageTests(unittest.TestCase):
                 "$ErrorActionPreference = 'Stop'\n"
                 f"$bachelorRoot = '{BACHELOR_DIR}'\n"
                 f"{self.embedding_snippet}\n"
-                "$definedNames = [System.Collections.Generic.HashSet[string]]::new()\n"
+                "$sharedParserNames = @(" + ",".join(f"'{n}'" for n in self.shared_parser_names) + ")\n"
+                "$embeddedFunctions = $embeddedFunctions + \"`r`n`r`n\" + (Get-AttrCudaEmbeddedFunctionSource "
+                f"-ModulePath '{ROOT / 'tools' / 'profiling' / 'gui-smoke-display-identity.ps1'}' "
+                "-Name $sharedParserNames)\n"
+                "$definedNames =[System.Collections.Generic.HashSet[string]]::new()\n"
                 "$tokens = $null; $errors = $null\n"
                 "$embeddedAst = [System.Management.Automation.Language.Parser]::ParseInput("
                 "$embeddedFunctions, [ref]$tokens, [ref]$errors)\n"
@@ -521,11 +537,19 @@ class EmbeddedFunctionCoverageTests(unittest.TestCase):
                 "$tokens = $null; $errors = $null\n"
                 "$templateAst = [System.Management.Automation.Language.Parser]::ParseInput("
                 "$templateText, [ref]$tokens, [ref]$errors)\n"
+                # UM-DISPLAY-SELECT-AND-LOG-1: Build-AttrCudaDisplayBlock/Get-AttrCudaDisplayResultTail
+                # are defined IN the template itself (they close over nothing module-side beyond
+                # what is embedded), so a function the template defines is also "defined".
+                "foreach ($fn in $templateAst.FindAll("
+                "{ param($n) $n -is [System.Management.Automation.Language.FunctionDefinitionAst] }, $true)) {\n"
+                "    [void]$definedNames.Add($fn.Name)\n"
+                "}\n"
                 "$called = [System.Collections.Generic.HashSet[string]]::new()\n"
                 "foreach ($call in $templateAst.FindAll("
                 "{ param($n) $n -is [System.Management.Automation.Language.CommandAst] }, $true)) {\n"
                 "    $name = $call.GetCommandName()\n"
-                "    if ($name -and $name -match '-AttrCuda') { [void]$called.Add($name) }\n"
+                # -GuiSmoke: the shared display-identity parser's commands (round 4).
+                "    if ($name -and $name -match '-(AttrCuda|GuiSmoke)') { [void]$called.Add($name) }\n"
                 "}\n"
                 "$missing = @($called | Where-Object { -not $definedNames.Contains($_) } | Sort-Object)\n"
                 f"Set-Content -LiteralPath '{out_path}' -Value $missing -Encoding UTF8\n"
