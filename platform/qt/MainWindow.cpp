@@ -558,14 +558,6 @@ static GpuPlaybackReconLiveVectorDumpResult dumpGpuPlaybackReconLiveVectorOnce(
     return result;
 }
 
-static QString playbackFpsStatusText( double fps )
-{
-    if( fps < 0.0 ) fps = 0.0;
-    return fps < 10.0
-        ? QStringLiteral( "Playback: %1 fps" ).arg( fps, 0, 'f', 1 )
-        : QStringLiteral( "Playback: %1 fps" ).arg( static_cast<int>( fps ) );
-}
-
 static int playbackScopeUpdateIntervalMs()
 {
     bool ok = false;
@@ -3023,14 +3015,29 @@ void MainWindow::timerFrameEvent( bool predictivePlaybackAdvance )
     //Time measurement
     QTime nowTime = QTime::currentTime();
     timeDiff = lastTime.msecsTo( nowTime );
-    const double targetFrameMs = 1000.0 / qMax( getFramerate(), 1.0 );
+    const double targetFrameMs = 1000.0 / qMax( getPlaybackFramerate(), 1.0 );
     const int targetFrameMsFloor = qMax( 1, static_cast<int>( targetFrameMs ) );
     const int targetFrameMsCeil = qMax( 1, static_cast<int>( targetFrameMs + 0.999 ) );
-    if( predictivePlaybackAdvance
-     && ui->actionPlay->isChecked()
-     && timeDiff < targetFrameMs )
+    /* PLAYBACK-HFR-CONFORM-DEFAULT-1 item 3: an early (predictive) advance still credits one
+     * full frame period so a fresh frame is available at once, but the excess over the real
+     * elapsed time is carried as a debt and deducted from the following steps instead of
+     * being kept -- rounding up outright put the timeline ahead of the wall clock every time
+     * it fired (more often the faster frames render, and a longer period under conform). */
+    static int earlyCreditDebtMs = 0;
+    if( ui->actionPlay->isChecked() )
     {
-        timeDiff = targetFrameMsCeil;
+        const playback_conform::ElapsedCredit credit =
+            playback_conform::applyEarlyCredit( timeDiff,
+                                                targetFrameMs,
+                                                targetFrameMsCeil,
+                                                predictivePlaybackAdvance,
+                                                earlyCreditDebtMs );
+        timeDiff = credit.creditedMs;
+        earlyCreditDebtMs = credit.debtMs;
+    }
+    else
+    {
+        earlyCreditDebtMs = 0;
     }
     if( hadPendingAdvance )
     {
@@ -3133,7 +3140,8 @@ void MainWindow::timerFrameEvent( bool predictivePlaybackAdvance )
             if( shouldUpdateFpsText && m_playbackFpsEmaFrameMs > 0.0 )
             {
                 const double smoothedFps = 1000.0 / m_playbackFpsEmaFrameMs;
-                const QString playbackFpsText = playbackFpsStatusText( smoothedFps );
+                const QString playbackFpsText = playback_conform::playbackFpsStatusText(
+                    smoothedFps, getMlvFramerate( m_pMlvObject ), getPlaybackFramerate() );
                 if( m_lastPlaybackFpsStatusText != playbackFpsText )
                 {
                     m_pFpsStatus->setText( playbackFpsText );
@@ -3145,7 +3153,7 @@ void MainWindow::timerFrameEvent( bool predictivePlaybackAdvance )
         lastTime = nowTime;
 
         //When playback is off, the timeDiff is set to 0 for DropFrameMode
-        if( !ui->actionPlay->isChecked() ) timeDiff = 1000 / getFramerate();
+        if( !ui->actionPlay->isChecked() ) timeDiff = 1000 / getPlaybackFramerate();
     }
     else
     {
@@ -3161,7 +3169,8 @@ void MainWindow::timerFrameEvent( bool predictivePlaybackAdvance )
                     .arg( ui->horizontalSliderPosition->value() ),
                 true );
         }
-        const QString playbackFpsText = playbackFpsStatusText( 0.0 );
+        const QString playbackFpsText = playback_conform::playbackFpsStatusText(
+            0.0, getMlvFramerate( m_pMlvObject ), getPlaybackFramerate() );
         if( m_lastPlaybackFpsStatusText != playbackFpsText )
         {
             m_pFpsStatus->setText( playbackFpsText );
@@ -9847,7 +9856,7 @@ int MainWindow::runGuiPlaybackSmoke(const GuiPlaybackSmokeOptions & options)
             return 13;
         }
 
-        const double contactSheetFps = getFramerate();
+        const double contactSheetFps = getPlaybackFramerate();
         const int contactSheetClipFrameCount = loadedFrameCount();
         const int sheetStartFrame = qBound(
             0, contactSheetStartFrame, qMax( 0, contactSheetClipFrameCount - 1 ) );
@@ -10580,7 +10589,8 @@ int MainWindow::openMlv( QString fileName )
     ui->horizontalSliderPosition->setMaximum( getMlvFrames( m_pMlvObject ) - 1 );
 
     //Restart timer
-    m_timerId = mlvappStartPlaybackTimer( this, getFramerate() );
+    m_timerId = mlvappStartPlaybackTimer( this, getPlaybackFramerate() );
+    refreshPlaybackFpsStatus();
 
     if( ui->actionDontSwitchDebayerForPlayback->isChecked() )
     {
@@ -10748,7 +10758,7 @@ void MainWindow::playbackHandling(int timeDiff)
                 if( ui->actionAudioOutput->isChecked()
                  && ui->actionDropFrameMode->isChecked() )
                 {
-                    m_tryToSyncAudio = true;
+                    requestPlaybackAudioSync();
                 }
             }
             else
@@ -10778,14 +10788,14 @@ void MainWindow::playbackHandling(int timeDiff)
                 //return the range's last frame)
                 const playback_frame_range::DropFrameTickResult dropFrameTick =
                     playback_frame_range::advanceDropFrameTick(
-                        m_newPosDropMode, getFramerate() * (double)timeDiff / 1000.0,
+                        m_newPosDropMode, getPlaybackFramerate() * (double)timeDiff / 1000.0,
                         ui->spinBoxCutIn->value(), ui->spinBoxCutOut->value(),
                         ui->actionLoop->isChecked() );
                 m_newPosDropMode = dropFrameTick.position;
                 //Sync audio
                 if( dropFrameTick.wrapped && ui->actionAudioOutput->isChecked() )
                 {
-                    m_tryToSyncAudio = true;
+                    requestPlaybackAudioSync();
                 }
                 //Because we need it NOW, block slider signals and draw after this function in this timerEvent
                 ui->horizontalSliderPosition->blockSignals( true );
@@ -11122,6 +11132,7 @@ void MainWindow::initGui( void )
              &MainWindow::showPerformanceProfilingDialog );
     ui->menuPlayback->addSeparator();
     ui->menuPlayback->addAction( performanceProfilingAction );
+    setupPlaybackConformMenu();
     connect( ui->actionDropFrameMode,
              &QAction::toggled,
              this,
@@ -11296,9 +11307,10 @@ void MainWindow::initGui( void )
 
     //Set up fps status label
     m_pFpsStatus = new QLabel( statusBar() );
-    m_pFpsStatus->setMaximumWidth( 110 );
-    m_pFpsStatus->setMinimumWidth( 110 );
-    m_pFpsStatus->setText( playbackFpsStatusText( 0.0 ) );
+    // Wide enough for the conform suffix, e.g. "Playback: 24 fps (59.94 -> 24)".
+    m_pFpsStatus->setMaximumWidth( 210 );
+    m_pFpsStatus->setMinimumWidth( 210 );
+    m_pFpsStatus->setText( playback_conform::playbackFpsStatusText( 0.0, 0.0, 0.0 ) );
     m_lastPlaybackFpsStatusText = m_pFpsStatus->text();
     //m_pFpsStatus->setFrameStyle(QFrame::Panel | QFrame::Sunken);
     statusBar()->addWidget( m_pFpsStatus );
@@ -17872,10 +17884,159 @@ void MainWindow::setPreviewMode( void )
 }
 
 //Get the framerate. Override or Original
+//EXPORT / METADATA / TIMECODE rate: the export FPS override lives here and ONLY here.
 double MainWindow::getFramerate( void )
 {
     if( m_fpsOverride ) return m_frameRate;
     else return getMlvFramerate( m_pMlvObject );
+}
+
+//Get the rate the PLAYBACK timeline runs at (PLAYBACK-HFR-CONFORM-DEFAULT-1): the clip's own
+//rate, or the conform rate for a high-frame-rate clip. No export-override input, by design.
+double MainWindow::getPlaybackFramerate( void )
+{
+    return playback_conform::playbackFps( getMlvFramerate( m_pMlvObject ),
+                                          m_conformEnabled,
+                                          m_conformTargetFps,
+                                          m_conformThresholdFps );
+}
+
+bool MainWindow::playbackConformActive( void )
+{
+    return m_fileLoaded && m_pMlvObject
+        && playback_conform::conformApplies( getMlvFramerate( m_pMlvObject ),
+                                             m_conformEnabled,
+                                             m_conformTargetFps,
+                                             m_conformThresholdFps );
+}
+
+//Auto quality target, capped by the rate playback runs at. An explicit env override of the
+//Auto target is a diagnostic and stays authoritative.
+int MainWindow::effectivePlaybackAutoTargetFps( void )
+{
+    if( playback_auto_target_fps_env_override() > 0 ) return m_playbackAutoTargetFps;
+    return playback_conform::effectiveAutoTargetFps( m_playbackAutoTargetFps,
+                                                     m_pMlvObject ? getPlaybackFramerate() : 0.0 );
+}
+
+//The ONLY place m_tryToSyncAudio is raised: audio is muted while conform is active (its native
+//rate cannot follow slowed-down picture); the saved actionAudioOutput is left untouched.
+void MainWindow::requestPlaybackAudioSync( void )
+{
+    if( !playback_conform::audioSyncAllowed( playbackConformActive() ) ) return;
+    m_tryToSyncAudio = true;
+}
+
+void MainWindow::refreshPlaybackFpsStatus( void )
+{
+    if( !m_pFpsStatus ) return;
+    const QString text = playback_conform::playbackFpsStatusText(
+        0.0, getMlvFramerate( m_pMlvObject ), getPlaybackFramerate() );
+    m_pFpsStatus->setText( text );
+    m_lastPlaybackFpsStatusText = text;
+    m_pFpsStatus->setToolTip( playbackConformActive() && ui->actionAudioOutput->isChecked()
+                                  && doesMlvHaveAudio( m_pMlvObject )
+                                  ? playback_conform::audioMutedStatusText()
+                                  : QString() );
+}
+
+//Playback > High Frame Rate Conform: enable, target rate and threshold, persisted under
+//Playback/Conform* (deliberately not Playback/AutoTargetFps, which is the Auto quality budget).
+void MainWindow::setupPlaybackConformMenu( void )
+{
+    {
+        // Invalid saved values fall back to the defaults (playback_conform::loadSettings).
+        QSettings set( QSettings::UserScope,
+                       PlaybackQualitySettings::kOrganization(),
+                       PlaybackQualitySettings::kApplication() );
+        const playback_conform::Settings saved = playback_conform::loadSettings( set );
+        m_conformEnabled = saved.enabled;
+        m_conformTargetFps = saved.targetFps;
+        m_conformThresholdFps = saved.thresholdFps;
+    }
+    QMenu *menu = ui->menuPlayback->addMenu( tr( "High Frame Rate Conform" ) );
+    menu->setToolTipsVisible( true );
+
+    QAction *enable = menu->addAction( tr( "Conform high frame rate clips" ) );
+    enable->setObjectName( QStringLiteral( "actionPlaybackConformEnabled" ) );
+    enable->setCheckable( true );
+    enable->setChecked( m_conformEnabled );
+    enable->setToolTip( tr( "Play clips faster than the threshold as slow motion at the target rate. "
+                            "Export is not affected; audio is muted while conforming." ) );
+    connect( enable, &QAction::toggled, this, [this]( bool on )
+    {
+        m_conformEnabled = on;
+        applyPlaybackConformSettings( true );
+    } );
+
+    QMenu *targetMenu = menu->addMenu( tr( "Conform to" ) );
+    m_conformTargetGroup = new QActionGroup( this );
+    m_conformTargetGroup->setExclusive( true );
+    const double targets[] = { 24.0, 25.0, 30.0 };
+    for( const double target : targets )
+    {
+        QAction *a = targetMenu->addAction( tr( "%1 fps" ).arg( target, 0, 'g', 4 ) );
+        a->setCheckable( true );
+        a->setData( target );
+        a->setChecked( qFuzzyCompare( target, m_conformTargetFps ) );
+        m_conformTargetGroup->addAction( a );
+        connect( a, &QAction::triggered, this, [this, target]()
+        {
+            m_conformTargetFps = target;
+            applyPlaybackConformSettings( true );
+        } );
+    }
+
+    QMenu *thresholdMenu = menu->addMenu( tr( "For clips above" ) );
+    m_conformThresholdGroup = new QActionGroup( this );
+    m_conformThresholdGroup->setExclusive( true );
+    const double thresholds[] = { 30.0, 50.0 };
+    for( const double threshold : thresholds )
+    {
+        QAction *a = thresholdMenu->addAction( tr( "%1 fps" ).arg( threshold, 0, 'g', 4 ) );
+        a->setCheckable( true );
+        a->setData( threshold );
+        a->setChecked( qFuzzyCompare( threshold, m_conformThresholdFps ) );
+        m_conformThresholdGroup->addAction( a );
+        connect( a, &QAction::triggered, this, [this, threshold]()
+        {
+            m_conformThresholdFps = threshold;
+            applyPlaybackConformSettings( true );
+        } );
+    }
+}
+
+void MainWindow::applyPlaybackConformSettings( bool persist )
+{
+    m_conformTargetFps = playback_conform::sanitizedTargetFps( m_conformTargetFps );
+    m_conformThresholdFps = playback_conform::sanitizedThresholdFps( m_conformThresholdFps );
+    if( persist )
+    {
+        QSettings set( QSettings::UserScope,
+                       PlaybackQualitySettings::kOrganization(),
+                       PlaybackQualitySettings::kApplication() );
+        playback_conform::Settings s;
+        s.enabled = m_conformEnabled;
+        s.targetFps = m_conformTargetFps;
+        s.thresholdFps = m_conformThresholdFps;
+        playback_conform::saveSettings( set, s );
+    }
+    // A conform change mid-playback: audio that was already running must stop (it cannot follow
+    // the new rate); the next play start / wrap / seek re-syncs it when conform is inactive.
+    if( m_pAudioPlayback && playbackConformActive() ) m_pAudioPlayback->stop();
+    m_tryToSyncAudio = false;
+    if( m_fileLoaded && m_pMlvObject )
+    {
+        killTimer( m_timerId );
+        m_timerId = mlvappStartPlaybackTimer( this, getPlaybackFramerate() );
+        resetPlaybackQualityAutoRunState();
+    }
+    refreshPlaybackFpsStatus();
+    if( playbackConformActive() && ui->actionAudioOutput->isChecked()
+     && m_pMlvObject && doesMlvHaveAudio( m_pMlvObject ) )
+    {
+        statusBar()->showMessage( playback_conform::audioMutedStatusText(), 4000 );
+    }
 }
 
 //Paint the Audio Track Wave to GUI
@@ -18791,7 +18952,7 @@ void MainWindow::on_horizontalSliderPosition_valueChanged(int position)
         m_newPosDropMode = position;
         if( ui->actionAudioOutput->isChecked() )
         {
-            m_tryToSyncAudio = true;
+            requestPlaybackAudioSync();
         }
     }
 
@@ -19613,7 +19774,7 @@ void MainWindow::on_actionGoto_First_Frame_triggered()
      && ui->actionDropFrameMode->isChecked()
      && ui->actionPlay->isChecked() )
     {
-        m_tryToSyncAudio = true;
+        requestPlaybackAudioSync();
     }
 }
 
@@ -20628,7 +20789,7 @@ void MainWindow::resetPlaybackQualityAutoRunState( void )
     m_playbackQualityAutoCapabilityTracker.reset();
     m_playbackQualityAutoDecisionBudgetMs =
         1000.0 / static_cast<double>( m_playbackAutoTargetFps > 0
-                                      ? m_playbackAutoTargetFps
+                                      ? effectivePlaybackAutoTargetFps()
                                       : 30 );
     m_playbackQualityAutoHeadroomCapability = false;
     if( m_playbackQualityMode == static_cast<int>( PlaybackQualityMode::Auto )
@@ -21854,7 +22015,7 @@ void MainWindow::on_actionExportSettings_triggered()
     {
         //Restart timer with chosen framerate
         killTimer( m_timerId );
-        m_timerId = mlvappStartPlaybackTimer( this, getFramerate() );
+        m_timerId = mlvappStartPlaybackTimer( this, getPlaybackFramerate() );
 
         //Refresh Timecode Label
         if( m_tcModeDuration )
@@ -23093,10 +23254,14 @@ void MainWindow::on_actionPlay_triggered(bool checked)
     else
     {
         //Start Audio
+        if( ui->actionAudioOutput->isChecked() && playbackConformActive() )
+        {
+            statusBar()->showMessage( playback_conform::audioMutedStatusText(), 4000 );
+        }
         if( ui->actionAudioOutput->isChecked()
          && ui->actionDropFrameMode->isChecked() )
         {
-            m_tryToSyncAudio = true;
+            requestPlaybackAudioSync();
         }
     }
 
@@ -23412,6 +23577,7 @@ void MainWindow::beginPlaybackSmokeTelemetry( void )
     m_playbackSmokeFirstPresentedFrame = -1;
     m_playbackSmokeLastPresentedFrame = -1;
     m_playbackSmokeWrapped = false;
+    m_playbackSmokeSourceAdvance.reset();
     m_playbackSmokeStartRequestSerial = m_nextRenderRequestSerial;
     m_playbackSmokeStartDecodeRequestsIssued =
         m_pRenderThread ? m_pRenderThread->decodeRequestsIssuedCount() : 0;
@@ -23746,16 +23912,25 @@ void MainWindow::notePlaybackSmokePresentedFrame(
     // "went backward" test also fires for an external backward scrub, or a stress seek to an
     // arbitrary earlier frame, during a session where Loop never actually wrapped -- see
     // isContactSheetLoopWrapTransition for why Loop state and jump size now both gate this.
-    if( m_playbackSmokePresentedFrames > 0
+    const bool playbackSmokeWrapNow =
+        m_playbackSmokePresentedFrames > 0
      && playback_frame_range::isContactSheetLoopWrapTransition(
             ui->actionLoop->isChecked(),
             ui->spinBoxCutIn->value() - 1,
             ui->spinBoxCutOut->value() - 1,
             m_playbackSmokeLastPresentedFrame,
-            static_cast<int>( displayFrame ) ) )
+            static_cast<int>( displayFrame ) );
+    if( playbackSmokeWrapNow )
     {
         m_playbackSmokeWrapped = true;
     }
+    // PLAYBACK-HFR-CONFORM-DEFAULT-1 item 8: how fast the TIMELINE moves (source frames per
+    // wall second) and the largest jump between presented source frames, loop wrap excluded.
+    m_playbackSmokeSourceAdvance.notePresented( now,
+                                                static_cast<int>( displayFrame ),
+                                                playbackSmokeWrapNow,
+                                                ui->spinBoxCutIn->value() - 1,
+                                                ui->spinBoxCutOut->value() - 1 );
 
     m_playbackSmokeLastPresentedTime = now;
     m_playbackSmokeLastPresentedFrame = static_cast<int>( displayFrame );
@@ -26994,6 +27169,41 @@ void MainWindow::finishPlaybackSmokeTelemetry( const char *reason )
                .arg( m_playbackSmokeParityMatchCount )
                .arg( m_playbackSmokeTargetPresentedFrames );
 
+    // PLAYBACK-HFR-CONFORM-DEFAULT-1 item 8: conform state + timeline speed. source_fps is source
+    // frames advanced per wall-clock second between the first and last presented frame (the
+    // acceptance's 24 +/- 3 % gate); max_jump == 1 means every source frame was shown (loop wrap
+    // excluded). audio_sync_requests must be 0 while conform_active=1 (audio muted). The
+    // export-override value is recorded so a leg proves the coupling is gone.
+    if ( m_playbackSmokeFrameTelemetry )
+    {
+        const PlaybackSourceAdvanceTracker & adv = m_playbackSmokeSourceAdvance;
+        qInfo().noquote()
+            << QStringLiteral(
+                   "playback_smoke.conform session=%1 clip_fps=%2 playback_fps=%3 conform_active=%4 "
+                   "conform_enabled=%5 conform_target=%6 conform_threshold=%7 export_fps_override=%8 "
+                   "export_frame_rate=%9 audio_sync_requests=%10 presented=%11 source_advanced=%12 "
+                   "span_s=%13 source_fps=%14 max_jump=%15 wraps=%16 backward=%17 repeats=%18" )
+                   .arg( static_cast<qulonglong>( m_playbackSmokeSessionId ) )
+                   .arg( getMlvFramerate( m_pMlvObject ), 0, 'f', 3 )
+                   .arg( getPlaybackFramerate(), 0, 'f', 3 )
+                   .arg( bool01( playbackConformActive() ) )
+                   .arg( bool01( m_conformEnabled ) )
+                   .arg( m_conformTargetFps, 0, 'f', 3 )
+                   .arg( m_conformThresholdFps, 0, 'f', 3 )
+                   .arg( bool01( m_fpsOverride ) )
+                   .arg( m_frameRate, 0, 'f', 3 )
+                   .arg( static_cast<qulonglong>(
+                             m_playbackAudioSyncRequestCount - m_playbackSmokeStartAudioSyncRequests ) )
+                   .arg( static_cast<qulonglong>( adv.presented() ) )
+                   .arg( static_cast<qlonglong>( adv.advancedFrames() ) )
+                   .arg( adv.spanSeconds(), 0, 'f', 3 )
+                   .arg( adv.sourceFps(), 0, 'f', 3 )
+                   .arg( adv.maxJump() )
+                   .arg( static_cast<qulonglong>( adv.wraps() ) )
+                   .arg( static_cast<qulonglong>( adv.backwardJumps() ) )
+                   .arg( static_cast<qulonglong>( adv.repeatedFrames() ) );
+    }
+
     // Window foreground state at session begin and at this gate, plus how many times the
     // whole application lost the OS foreground during the session (event-driven via
     // onPlaybackSmokeApplicationStateChanged(), not polled) -- so the joined analysis can
@@ -28533,7 +28743,8 @@ void MainWindow::finishPresentedFrame( uint64_t displayFrame,
         ( mlv_stage_timing_now() - scopeDispatchStart ) * 1000.0 );
 
     const double overlay_start = mlv_stage_timing_now();
-    if( m_tryToSyncAudio && m_pAudioPlayback && ui->actionAudioOutput->isChecked() && ui->actionPlay->isChecked() && ui->actionDropFrameMode->isChecked() )
+    if( m_tryToSyncAudio && m_pAudioPlayback && ui->actionAudioOutput->isChecked() && ui->actionPlay->isChecked() && ui->actionDropFrameMode->isChecked()
+     && playback_conform::audioSyncAllowed( playbackConformActive() ) )
     {
         m_tryToSyncAudio = false;
         ++m_playbackAudioSyncRequestCount;
@@ -28687,7 +28898,7 @@ void MainWindow::finishPresentedFrame( uint64_t displayFrame,
                             ? m_playbackQualityFrameCounter
                             : PlaybackQualityAutoSampler::kSlidingWindow;
                         decision = playback_auto_force_fast_decision(
-                            m_playbackAutoTargetFps,
+                            effectivePlaybackAutoTargetFps(),
                             sharperHeadroomScaleAllowed,
                             presentedIntervalMs,
                             diagnosticSampleCount );
@@ -28695,7 +28906,7 @@ void MainWindow::finishPresentedFrame( uint64_t displayFrame,
                     else
                     {
                         decision = m_playbackQualitySampler.decideNextSlot(
-                            m_playbackAutoTargetFps,
+                            effectivePlaybackAutoTargetFps(),
                             dualIsoActive,
                             mlvPlaybackAggressivePreviewMode() != 0,
                             sharperHeadroomScaleAllowed );
