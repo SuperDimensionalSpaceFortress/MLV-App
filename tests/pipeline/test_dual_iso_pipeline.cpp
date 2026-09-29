@@ -10353,6 +10353,59 @@ TEST(DualIsoPipeline, Phase4B_PreDualIsoFixCompletedTelemetryIsResetOnNextRender
     ASSERT_EQ(0.0, llrpGetLastPreDualIsoFixMilliseconds());
 }
 
+// PROD-TELEMETRY-DURATION-AS-PROOF-3b round 3 (both formal keys' blocker): getMlvProcessedFrame8ScaledFromReconnedRaw16
+// (the Phase-3 DecodeReconProcess consumer; the recon ran on ReconWorker's own thread, so it never runs the pre-dual-ISO
+// fix on the render thread) renders through downsample + processing only and never enters llrawproc. Without its own
+// reset the render thread's thread-local completed flag still carries an earlier x4 fix render's "ran", and
+// RenderFrameThread::drawFrame would report it for this frame. Mutation: dropping the llrpResetLastPreDualIsoFixTelemetry()
+// call at the getMlvProcessedFrame8ScaledFromReconnedRaw16 entry leaves a stale 1 here. (The operative consumer-side
+// reset, one per drawFrame before any render path, is pinned by the RenderFrameThread wiring test in
+// tests/console/test_pre_dualiso_telemetry_reset_wiring.cpp; this test pins the getter contract of this entry.)
+TEST(DualIsoPipeline, Phase4B_PreDualIsoFixCompletedTelemetryIsResetOnNextRenderFromReconnedRaw16)
+{
+    ScopedAggressivePreviewMode aggressivePreview(0);
+    MLVAPP_TEST_UNSETENV("MLVAPP_ENABLE_DUAL_ISO_X4_FULLRES_FIXES");
+    MLVAPP_TEST_UNSETENV("MLVAPP_LOG_PHASE4BV2");
+    mlv_phase4bv_reset_env_cache_for_testing();
+
+    MlvPipelineFixture fixture;
+    QString error_message;
+    ASSERT_TRUE(fixture.openTinyDualIso(&error_message));
+    ASSERT_TRUE(fixture.loadReceipt(QStringLiteral("tests/fixtures/receipts/tiny_dual_iso_hq.marxml"), &error_message));
+    fixture.receipt().setFocusPixels(1);
+    fixture.receipt().setBadPixels(1);
+    fixture.receipt().setVerticalStripes(1);
+    fixture.receipt().setPatternNoise(1);
+    ASSERT_TRUE(fixture.applyReceipt(&error_message));
+
+    const int full_w = fixture.width();
+    const int full_h = fixture.height();
+    if ((full_w % 4) != 0 || full_h < 16) {
+        return;
+    }
+
+    const std::vector<uint8_t> ran = fixture.renderFrame8Scaled(0, 1, 4);
+    ASSERT_FALSE(ran.empty());
+    ASSERT_EQ(1, llrpGetLastPreDualIsoFixCompleted());
+
+    fixture.receipt().setFocusPixels(0);
+    fixture.receipt().setBadPixels(0);
+    fixture.receipt().setVerticalStripes(0);
+    fixture.receipt().setPatternNoise(0);
+    ASSERT_TRUE(fixture.applyReceipt(&error_message));
+
+    std::vector<uint16_t> raw(static_cast<std::size_t>(full_w) * static_cast<std::size_t>(full_h));
+    ASSERT_EQ(0, getMlvRawFrameUint16(fixture.video(), 0, raw.data()));
+    int dim_w = 0, dim_h = 0;
+    mlvFrameOutputDimensions(fixture.video(), 4, &dim_w, &dim_h);
+    std::vector<uint8_t> got(static_cast<std::size_t>(dim_w) * static_cast<std::size_t>(dim_h) * 3u);
+    // Success (== 1) proves a render ran through the reconned entry rather than an early return.
+    ASSERT_EQ(1, getMlvProcessedFrame8ScaledFromReconnedRaw16(fixture.video(), 0, raw.data(), got.data(), 1, 4, 0));
+
+    ASSERT_EQ(0, llrpGetLastPreDualIsoFixCompleted());
+    ASSERT_EQ(0.0, llrpGetLastPreDualIsoFixMilliseconds());
+}
+
 TEST(DualIsoPipeline, Phase4B_DualIsoScaleEightAggressiveSkipsCoordinateRawFixesForEarlyPath)
 {
     ScopedAggressivePreviewMode aggressivePreview(1);
