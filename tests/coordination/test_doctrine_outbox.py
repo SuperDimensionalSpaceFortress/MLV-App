@@ -1,0 +1,1051 @@
+"""Tests for tools/coordination/doctrine_outbox.py -- MLV-App's port of agent-bridge's doctrine
+outbox. Every repository used here is a throwaway git repository built under pytest's tmp_path;
+nothing touches the network or the real bus. Lives under tests/coordination/ because CI runs that
+directory by name (.github/workflows/tests.yml, "Run coordination and self-healing guardrails");
+a test file beside the tool would never be collected.
+
+Named mutations (each turns the named test red, then is reverted):
+  M1  drop one LAW4 pattern (e.g. "fleet run receipts")  -> test_law4_pattern_refuses[fleet run receipts]
+  M2  make key_on_bus() return False                     -> test_key_on_bus_blocks_reappend_with_empty_ledger
+  M3  make keyword advisories fail check-ledger          -> test_keyword_hits_are_advisory_never_failing
+"""
+from __future__ import annotations
+
+import importlib.util
+import json
+import os
+import subprocess
+import sys
+import time
+from pathlib import Path
+
+import pytest
+
+REPO_ROOT = Path(__file__).resolve().parents[2]
+_spec = importlib.util.spec_from_file_location("doctrine_outbox", REPO_ROOT / "tools" / "coordination" / "doctrine_outbox.py")
+ob = importlib.util.module_from_spec(_spec)
+sys.modules["doctrine_outbox"] = ob
+_spec.loader.exec_module(ob)
+
+GIT_ID = ["-c", "user.name=t", "-c", "user.email=t@example.invalid", "-c", "core.autocrlf=false", "-c", "core.safecrlf=false"]
+
+
+def git(repo: Path, *args: str, env: dict[str, str] | None = None) -> str:
+    result = subprocess.run(["git", "-C", str(repo), *GIT_ID, *args], capture_output=True, text=True,
+                            env={**os.environ, **env} if env else None)
+    assert result.returncode == 0, f"git {args} failed: {result.stderr}"
+    return result.stdout.strip()
+
+
+def git_raw(repo: Path, *args: str) -> bytes:
+    result = subprocess.run(["git", "-C", str(repo), *args], capture_output=True)
+    assert result.returncode == 0, f"git {args} failed: {result.stderr!r}"
+    return result.stdout
+
+
+def dated(seconds_ago: float) -> dict[str, str]:
+    stamp = f"{int(time.time() - seconds_ago)} +0000"
+    return {"GIT_AUTHOR_DATE": stamp, "GIT_COMMITTER_DATE": stamp}
+
+
+def init_bus(tmp_path: Path, crlf_target: str | None = None, name: str = "bus",
+             traps: str | None = None) -> tuple[Path, Path]:
+    """A bare repo as the bus 'origin', and a clone of it as the bus working repo."""
+    bare = tmp_path / f"{name}-origin.git"
+    clone = tmp_path / f"{name}-clone"
+    subprocess.run(["git", "init", "--bare", "-b", "master", str(bare)], check=True, capture_output=True, text=True)
+    subprocess.run(["git", "clone", str(bare), str(clone)], check=True, capture_output=True, text=True)
+    for target in ob.TARGETS:
+        content = f"# {target}\n\n"
+        if target == "TRAPS.md" and traps is not None:
+            content = traps
+        if crlf_target == target:
+            content = content.replace("\n", "\r\n")
+        (clone / target).write_bytes(content.encode("utf-8"))
+    git(clone, "add", *ob.TARGETS)
+    git(clone, "commit", "-m", "seed bus files")
+    git(clone, "push", "origin", "HEAD:refs/heads/master")
+    return bare, clone
+
+
+def init_source(tmp_path: Path, name: str = "source", with_tool: bool = True) -> Path:
+    """A small source repo on master. With the tool committed, as on a ref that has adopted it."""
+    src = tmp_path / name
+    src.mkdir()
+    subprocess.run(["git", "init", "-b", "master", str(src)], check=True, capture_output=True, text=True)
+    (src / "README.md").write_text("fixture\n", encoding="utf-8")
+    git(src, "add", "README.md")
+    if with_tool:
+        tool = src / ob.TOOL_REL
+        tool.parent.mkdir(parents=True)
+        tool.write_text("# stand-in for the tool at this ref\n", encoding="utf-8")
+        git(src, "add", ob.TOOL_REL)
+    git(src, "commit", "-m", "init")
+    return src
+
+
+def item_text(target: str = "TRAPS.md", kind: str = "trap", source_commit: str = "PENDING",
+              ratified_by: str | None = None, published_as: str | None = None,
+              body: str = "### Example finding\nBody text describing the finding.\n") -> str:
+    front = f"target: {target}\nkind: {kind}\nsource_commit: {source_commit}\nlaw4: attested\n"
+    if ratified_by:
+        front += f"ratified_by: {ratified_by}\n"
+    if published_as:
+        front += f"published_as: {published_as}\n"
+    return f"---\n{front}---\n{body}"
+
+
+def add_item(src: Path, name: str, message: str | None = None, env: dict[str, str] | None = None, **kwargs) -> Path:
+    item_dir = src / "doctrine-outbox"
+    item_dir.mkdir(exist_ok=True)
+    path = item_dir / name
+    path.write_text(item_text(**kwargs), encoding="utf-8")
+    git(src, "add", f"doctrine-outbox/{name}")
+    git(src, "commit", "-m", message or f"add {name}", env=env)
+    return path
+
+
+# ---------- pinned runner identity ----------
+#
+# gather_deny_terms() reads socket.gethostname(), COMPUTERNAME, USERNAME, USER, USERPROFILE and
+# HOME straight off the runner it executes on. Any test that reaches it -- directly, or through
+# the CLI commands via ob.main() -- must not depend on this machine's real hostname or account
+# name. This autouse fixture pins all six to fixed values that occur nowhere in the fixture
+# bodies. A test that sets its own values afterward still wins.
+PINNED_HOST = "outboxtestrunner"
+PINNED_COMPUTERNAME = "OUTBOXTESTHOST"
+PINNED_ACCOUNT = "outboxtestacct"
+PINNED_USERPROFILE = f"C:\\Users\\{PINNED_ACCOUNT}"
+
+
+@pytest.fixture(autouse=True)
+def _pin_runner_identity(monkeypatch):
+    monkeypatch.setattr(ob.socket, "gethostname", lambda: PINNED_HOST)
+    monkeypatch.setenv("COMPUTERNAME", PINNED_COMPUTERNAME)
+    monkeypatch.setenv("USERNAME", PINNED_ACCOUNT)
+    monkeypatch.setenv("USER", PINNED_ACCOUNT)
+    monkeypatch.setenv("USERPROFILE", PINNED_USERPROFILE)
+    monkeypatch.setenv("HOME", PINNED_USERPROFILE)
+    monkeypatch.delenv(ob.SUBJECT_LEDGER_ENV, raising=False)
+    monkeypatch.delenv(ob.WATERMARK_ENV, raising=False)
+    yield
+
+
+# ---------- byte-compatibility with agent-bridge ----------
+
+def test_key_and_block_are_byte_compatible_with_agent_bridge():
+    # Golden vector computed from agent-bridge's own render_block (github/master bfc39bf) with
+    # project "agent-bridge"; only the project word in the marker may differ here.
+    item = {"meta": {"target": "TRAPS.md"}, "body": "### Golden entry\nBody line.\n"}
+    commit = "0123456789abcdef0123456789abcdef01234567"
+    key, block = ob.render_block(item, commit)
+    assert key == "c6ae3711beb8bd2f"
+    assert block == "### Golden entry\nBody line.\n<!-- outbox:c6ae3711beb8bd2f mlv-app:0123456789ab -->\n"
+    assert ob.PROJECT == "mlv-app"
+
+
+def test_default_ref_is_the_fork_master_tracking_ref_everywhere():
+    assert ob.DEFAULT_REF == "refs/remotes/fork/master"
+    parser = ob.build_parser()
+    assert parser.parse_args(["debt"]).ref == ob.DEFAULT_REF
+    assert parser.parse_args(["drain", "--bus", "x"]).ref == ob.DEFAULT_REF
+    assert parser.parse_args(["check-commits"]).rev_range == f"{ob.DEFAULT_REF}..HEAD"
+
+
+# ---------- parse / schema refusals ----------
+
+def test_parse_item_no_front_matter():
+    with pytest.raises(ob.Refusal) as excinfo:
+        ob.parse_item("not front matter at all\n")
+    assert excinfo.value.code == "ITEM_NO_FRONT_MATTER"
+
+
+def test_parse_item_bad_target():
+    with pytest.raises(ob.Refusal) as excinfo:
+        ob.parse_item(item_text(target="NOTATARGET.md"))
+    assert excinfo.value.code == "ITEM_BAD_TARGET"
+
+
+def test_parse_item_rulings_without_ratified_by():
+    with pytest.raises(ob.Refusal) as excinfo:
+        ob.parse_item(item_text(target="RULINGS.md", kind="ruling"))
+    assert excinfo.value.code == "ITEM_RULING_UNRATIFIED"
+
+
+def test_parse_item_body_not_an_entry():
+    with pytest.raises(ob.Refusal) as excinfo:
+        ob.parse_item(item_text(body="not a heading at all\n"))
+    assert excinfo.value.code == "ITEM_BODY_NOT_AN_ENTRY"
+
+
+def test_parse_item_rulings_with_ratified_by_ok():
+    item = ob.parse_item(item_text(target="RULINGS.md", kind="ruling", ratified_by="RULINGS.md#anchor"))
+    assert item["meta"]["ratified_by"] == "RULINGS.md#anchor"
+
+
+def test_parse_item_accepts_published_as_and_refuses_a_malformed_one():
+    assert ob.parse_item(item_text(published_as="19545ca"))["meta"]["published_as"] == "19545ca"
+    with pytest.raises(ob.Refusal) as excinfo:
+        ob.parse_item(item_text(published_as="not-a-sha"))
+    assert excinfo.value.code == "ITEM_BAD_PUBLISHED_AS"
+
+
+# ---------- Law-4 screen ----------
+
+# One sample per LAW4 class. Each must trip ITS OWN class first, so dropping a pattern from
+# LAW4 turns exactly that parametrized case red (mutation M1).
+LAW4_SAMPLES = {
+    "email address": "### h\ncontact someone@example.com about it\n",
+    "account/org uuid": "### h\nsession 123e4567-e89b-12d3-a456-426614174000 flagged\n",
+    "lane wire path": "### h\nsee coordination/lanes/x for the wire\n",
+    "HUB heartbeat": "### h\nread HUB.md first\n",
+    "owner transcript store": "### h\nit lives in loops.json today\n",
+    "bearer/API token": "### h\nheader Bearer abcdefghijklmnopqrstuvwxyz was sent\n",
+    "owner state dir": "### h\nfiles under state/ were read\n",
+    "dead-man floor surface": "### h\nsee coordination/deadman/ for it\n",
+    "user home path": "### h\nfound at C:\\Users\\someacct\\notes.txt during review\n",
+    "board private state dir": "### h\nnotes under .claude-state/tmp were read\n",
+    "subject ledger": "### h\nthe subject-ledger records it\n",
+    "fleet run receipts": "### h\nreceipts sit in fleet-runs today\n",
+    "hub write-ahead log": "### h\nthe HUB_RUN_WAL tail says so\n",
+    "dual-lane ledger": "### h\nthe dual-lane board says so\n",
+    "GPU host name": "### h\nreproduced on Ultra-Magnus overnight\n",
+}
+
+
+def test_every_law4_class_has_a_sample():
+    assert {name for name, _rx in ob.LAW4} == set(LAW4_SAMPLES)
+
+
+@pytest.mark.parametrize("name", list(LAW4_SAMPLES))
+def test_law4_pattern_refuses(name):
+    with pytest.raises(ob.Refusal) as excinfo:
+        ob.screen_law4(LAW4_SAMPLES[name])
+    assert excinfo.value.code == "LAW4_REFUSED"
+    assert name in excinfo.value.detail, f"the sample tripped a different class: {excinfo.value.detail}"
+
+
+def test_law4_lets_an_ordinary_entry_through():
+    ob.screen_law4("### Piped make masks a missing toolchain\nThe pipeline exit status is tail's.\n")
+
+
+def test_law4_over_cap():
+    with pytest.raises(ob.Refusal) as excinfo:
+        ob.screen_law4("### h\n" + "word " * 500)
+    assert excinfo.value.code == "LAW4_OVER_CAP"
+
+
+def test_screen_law4_host_and_account_name_refused_without_echo(monkeypatch):
+    monkeypatch.setattr(ob.socket, "gethostname", lambda: "secrethostname")
+    monkeypatch.setenv("COMPUTERNAME", "SECRETHOSTNAME")
+    monkeypatch.setenv("USERNAME", "secretacct")
+    monkeypatch.setenv("USER", "secretacct")
+    monkeypatch.delenv("USERPROFILE", raising=False)
+    monkeypatch.delenv("HOME", raising=False)
+
+    terms = ob.gather_deny_terms(None)
+    lowered = {value.lower() for _cls, value in terms}
+    assert "secrethostname" in lowered
+    assert "secretacct" in lowered
+
+    with pytest.raises(ob.Refusal) as host_exc:
+        ob.screen_law4("### heading\nreported from secrethostname during the run\n", terms)
+    assert host_exc.value.code == "LAW4_REFUSED"
+    assert "secrethostname" not in str(host_exc.value).lower()
+
+    with pytest.raises(ob.Refusal) as acct_exc:
+        ob.screen_law4("### heading\nrun by secretacct this morning\n", terms)
+    assert "secretacct" not in str(acct_exc.value).lower()
+
+
+def test_screen_law4_deny_file_name_refused_without_echo(tmp_path):
+    deny_file = tmp_path / "deny-names.txt"
+    deny_file.write_text("ProjectCodename\n", encoding="utf-8")
+    terms = ob.gather_deny_terms(deny_file)
+    assert ("deny-list name", "ProjectCodename") in terms
+    with pytest.raises(ob.Refusal) as excinfo:
+        ob.screen_law4("### heading\nthe ProjectCodename effort continues\n", terms)
+    assert excinfo.value.code == "LAW4_REFUSED"
+    assert "projectcodename" not in str(excinfo.value).lower()
+
+
+def test_gather_deny_terms_refuses_short_host_or_account(monkeypatch):
+    # A name shorter than 3 characters is unscreenable: refuse fail-closed, never drop it.
+    monkeypatch.setattr(ob.socket, "gethostname", lambda: "ab")
+    monkeypatch.delenv("COMPUTERNAME", raising=False)
+    monkeypatch.setenv("USERNAME", "ab")
+    monkeypatch.delenv("USER", raising=False)
+    monkeypatch.delenv("USERPROFILE", raising=False)
+    monkeypatch.delenv("HOME", raising=False)
+    with pytest.raises(ob.Refusal) as excinfo:
+        ob.gather_deny_terms(None)
+    assert excinfo.value.code == "SHORT_IDENTITY_UNSCREENABLE"
+    assert "ab" not in str(excinfo.value)
+
+
+def test_gather_deny_terms_refuses_short_deny_file_entry(monkeypatch, tmp_path):
+    monkeypatch.setattr(ob.socket, "gethostname", lambda: "a-perfectly-normal-hostname")
+    monkeypatch.delenv("COMPUTERNAME", raising=False)
+    monkeypatch.setenv("USERNAME", "normalaccountname")
+    monkeypatch.delenv("USER", raising=False)
+    monkeypatch.delenv("USERPROFILE", raising=False)
+    monkeypatch.delenv("HOME", raising=False)
+    deny_file = tmp_path / "deny.txt"
+    deny_file.write_text("xy\n", encoding="utf-8")
+    with pytest.raises(ob.Refusal) as excinfo:
+        ob.gather_deny_terms(deny_file)
+    assert excinfo.value.code == "SHORT_IDENTITY_UNSCREENABLE"
+    assert "xy" not in str(excinfo.value)
+
+
+def test_underscore_adjacency_is_caught():
+    terms = [("account name", "secretacct")]
+    with pytest.raises(ob.Refusal):
+        ob.screen_law4("### heading\nfound in secretacct_dump.log during review\n", terms)
+    with pytest.raises(ob.Refusal):
+        ob.screen_law4("### heading\nfound in state_secretacct_dump during review\n", terms)
+
+
+# ---------- drain: dry run and push ----------
+
+def test_dry_run_drain_pushes_nothing(tmp_path):
+    bare, clone = init_bus(tmp_path)
+    src = init_source(tmp_path)
+    add_item(src, "20260925-example.md")
+    ledger = tmp_path / "sent.jsonl"
+
+    before = git(bare, "rev-parse", "master")
+    report = ob.drain(src, clone, "HEAD", ledger, [], push=False)
+    after = git(bare, "rev-parse", "master")
+
+    assert before == after
+    assert report["pushed"] is False
+    assert report["published"] == []
+    assert len(report.get("would_push", [])) == 1
+    assert not ledger.exists()
+
+
+def test_push_drain_appends_exactly_one_block_and_proves_it_with_ls_remote(tmp_path):
+    bare, clone = init_bus(tmp_path)
+    src = init_source(tmp_path)
+    add_item(src, "20260925-example.md")
+    ledger = tmp_path / "sent.jsonl"
+    old_bytes = git_raw(clone, "show", "origin/master:TRAPS.md")
+
+    report = ob.drain(src, clone, "HEAD", ledger, [], push=True)
+
+    assert report["pushed"] is True
+    assert len(report["published"]) == 1
+    key = report["published"][0]["key"]
+    remote_sha = git(clone, "ls-remote", "origin", "refs/heads/master").split()[0]
+    assert remote_sha == report["commit"] == git(bare, "rev-parse", "master")
+
+    new_bytes = git_raw(clone, "show", f"{remote_sha}:TRAPS.md")
+    assert new_bytes.startswith(old_bytes)
+    assert f"<!-- outbox:{key} mlv-app:".encode("utf-8") in new_bytes
+    assert new_bytes.count(f"outbox:{key}".encode("utf-8")) == 1
+
+    rows = [json.loads(line) for line in ledger.read_text(encoding="utf-8").splitlines() if line.strip()]
+    assert len(rows) == 1
+    assert rows[0]["key"] == key and rows[0]["target"] == "TRAPS.md" and rows[0]["item"] == "20260925-example"
+
+
+def test_second_drain_is_idempotent(tmp_path):
+    bare, clone = init_bus(tmp_path)
+    src = init_source(tmp_path)
+    add_item(src, "20260925-example.md")
+    ledger = tmp_path / "sent.jsonl"
+
+    first = ob.drain(src, clone, "HEAD", ledger, [], push=True)
+    master_after_first = git(bare, "rev-parse", "master")
+    second = ob.drain(src, clone, "HEAD", ledger, [], push=True)
+
+    assert first["pushed"] is True
+    assert second["published"] == [] and second["pushed"] is False
+    assert git(bare, "rev-parse", "master") == master_after_first
+    assert len([line for line in ledger.read_text(encoding="utf-8").splitlines() if line.strip()]) == 1
+
+
+def test_key_on_bus_blocks_reappend_with_empty_ledger(tmp_path):
+    """M2. The sent ledger is per machine and can be lost (new clone, machine move). The marker
+    on the fetched bus tip is then the ONLY thing standing between a rerun and a duplicate."""
+    bare, clone = init_bus(tmp_path)
+    src = init_source(tmp_path)
+    add_item(src, "20260925-example.md")
+    first = ob.drain(src, clone, "HEAD", tmp_path / "sent-a.jsonl", [], push=True)
+    assert first["pushed"] is True
+    master_after_first = git(bare, "rev-parse", "master")
+
+    fresh_clone = tmp_path / "bus-fresh-clone"
+    subprocess.run(["git", "clone", str(bare), str(fresh_clone)], check=True, capture_output=True, text=True)
+    lost_ledger = tmp_path / "sent-lost.jsonl"
+    second = ob.drain(src, fresh_clone, "HEAD", lost_ledger, [], push=True)
+
+    assert second["published"] == [] and second["pushed"] is False
+    assert [a["via"] for a in second["already_sent"]] == ["bus_tip"]
+    assert git(bare, "rev-parse", "master") == master_after_first
+    assert git_raw(fresh_clone, "show", "origin/master:TRAPS.md").count(b"outbox:") == 1
+
+
+def test_crlf_target_stays_crlf_conformant(tmp_path):
+    bare, clone = init_bus(tmp_path, crlf_target="TRAPS.md")
+    src = init_source(tmp_path)
+    add_item(src, "20260925-example.md")
+
+    report = ob.drain(src, clone, "HEAD", tmp_path / "sent.jsonl", [], push=True)
+    new_bytes = git_raw(clone, "show", f"{report['commit']}:TRAPS.md")
+
+    assert b"\r\n" in new_bytes
+    assert b"\n" not in new_bytes.replace(b"\r\n", b""), "a bare LF was introduced into a CRLF file"
+
+
+@pytest.mark.parametrize("tail,label", [
+    ("### Old entry\nold body", "no-trailing-newline"),
+    ("### Old entry\nold body\n", "single-newline"),
+    ("### Old entry\nold body\n\n", "already-blank-line"),
+])
+def test_drain_puts_a_blank_line_before_every_appended_block(tmp_path, tail, label):
+    # The live bus TRAPS.md has a tip that ends without a blank line before the next heading.
+    bare, clone = init_bus(tmp_path, traps="# TRAPS\n\n" + tail)
+    src = init_source(tmp_path)
+    add_item(src, "20260925-first.md", body="### First finding\nfirst body\n")
+    add_item(src, "20260925-second.md", body="### Second finding\nsecond body\n")
+    old_bytes = git_raw(clone, "show", "origin/master:TRAPS.md")
+
+    report = ob.drain(src, clone, "HEAD", tmp_path / "sent.jsonl", [], push=True)
+    new_text = git_raw(clone, "show", f"{report['commit']}:TRAPS.md").decode("utf-8")
+
+    assert new_text.encode("utf-8").startswith(old_bytes), label
+    assert "old body\n\n### First finding" in new_text, label
+    assert new_text.count("old body\n\n\n") == 0, "a blank line was doubled"
+    assert "-->\n\n### Second finding" in new_text, "consecutive blocks must be separated too"
+
+
+def test_drain_blank_line_separator_in_a_crlf_target(tmp_path):
+    bare, clone = init_bus(tmp_path, crlf_target="TRAPS.md", traps="# TRAPS\n\n### Old entry\nold body\n")
+    src = init_source(tmp_path)
+    add_item(src, "20260925-first.md", body="### First finding\nfirst body\n")
+    report = ob.drain(src, clone, "HEAD", tmp_path / "sent.jsonl", [], push=True)
+    new_bytes = git_raw(clone, "show", f"{report['commit']}:TRAPS.md")
+    assert b"old body\r\n\r\n### First finding" in new_bytes
+
+
+def test_non_fast_forward_race_retries_from_scratch(tmp_path, monkeypatch):
+    bare, clone = init_bus(tmp_path)
+    competitor = tmp_path / "competitor-clone"
+    subprocess.run(["git", "clone", str(bare), str(competitor)], check=True, capture_output=True, text=True)
+    src = init_source(tmp_path)
+    add_item(src, "20260925-example.md")
+
+    original_make_worktree = ob.make_temp_worktree
+    calls = {"n": 0}
+
+    def racing_make_worktree(bus_repo, tip):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            current = (competitor / "TRAPS.md").read_bytes()
+            addition = b"### Competitor entry\ncompetitor body\n<!-- outbox:cccccccccccccccc other:0123456789ab -->\n"
+            (competitor / "TRAPS.md").write_bytes(current + addition)
+            git(competitor, "add", "TRAPS.md")
+            git(competitor, "commit", "-m", "competing outbox entry")
+            git(competitor, "push", "origin", "HEAD:refs/heads/master")
+        return original_make_worktree(bus_repo, tip)
+
+    monkeypatch.setattr(ob, "make_temp_worktree", racing_make_worktree)
+    report = ob.drain(src, clone, "HEAD", tmp_path / "sent.jsonl", [], push=True)
+
+    assert calls["n"] >= 2
+    assert report["pushed"] is True
+    final_bytes = git_raw(clone, "show", f"{report['commit']}:TRAPS.md")
+    assert b"outbox:cccccccccccccccc" in final_bytes, "the competitor's entry was overwritten"
+    assert final_bytes.count(b"outbox:") == 2
+
+
+def test_filename_deny_term_refused_before_any_commit(tmp_path):
+    bare, clone = init_bus(tmp_path)
+    src = init_source(tmp_path)
+    add_item(src, "20260925-secretacct-incident.md")
+    ledger = tmp_path / "sent.jsonl"
+    before = git(bare, "rev-parse", "master")
+
+    report = ob.drain(src, clone, "HEAD", ledger, [("account name", "secretacct")], push=True)
+
+    assert git(bare, "rev-parse", "master") == before
+    assert report["published"] == [] and report["pushed"] is False
+    assert any(r["code"] == "LAW4_REFUSED" for r in report["refused"])
+    assert not ledger.exists()
+
+
+def test_commit_author_and_committer_are_pinned_not_ambient(tmp_path):
+    bare, clone = init_bus(tmp_path)
+    subprocess.run(["git", "-C", str(clone), "config", "user.name", "Personal Name"], check=True, capture_output=True, text=True)
+    subprocess.run(["git", "-C", str(clone), "config", "user.email", "personal@example.com"], check=True, capture_output=True, text=True)
+    src = init_source(tmp_path)
+    add_item(src, "20260925-example.md")
+
+    report = ob.drain(src, clone, "HEAD", tmp_path / "sent.jsonl", [], push=True)
+
+    fmt = git(clone, "show", "-s", "--format=%an <%ae>|%cn <%ce>", report["commit"])
+    who = f"{ob.OUTBOX_IDENTITY_NAME} <{ob.OUTBOX_IDENTITY_EMAIL}>"
+    assert fmt == f"{who}|{who}"
+
+
+def test_prefix_broken_by_clean_filter_refuses_push(tmp_path):
+    """A clean filter that mangles the leading bytes of the target must be caught AFTER the
+    commit, comparing committed blobs -- the in-memory concatenation cannot see this."""
+    bare, clone = init_bus(tmp_path)
+    (clone / ".gitattributes").write_text("TRAPS.md filter=corrupt\n", encoding="utf-8")
+    git(clone, "add", ".gitattributes")
+    git(clone, "commit", "-m", "seed a corrupting clean filter attribute for TRAPS.md")
+    git(clone, "push", "origin", "HEAD:refs/heads/master")
+    filter_script = tmp_path / "corrupt_filter.py"
+    filter_script.write_text("import sys\ndata = sys.stdin.buffer.read()\nsys.stdout.buffer.write(data[1:] if data else data)\n", encoding="utf-8")
+    subprocess.run(["git", "-C", str(clone), "config", "filter.corrupt.clean", f'"{sys.executable}" "{filter_script}"'],
+                   check=True, capture_output=True, text=True)
+    src = init_source(tmp_path)
+    add_item(src, "20260925-example.md")
+    ledger = tmp_path / "sent.jsonl"
+    before = git(bare, "rev-parse", "master")
+
+    with pytest.raises(ob.Refusal) as excinfo:
+        ob.drain(src, clone, "HEAD", ledger, [], push=True)
+
+    assert excinfo.value.code == "PREFIX_BROKEN"
+    assert git(bare, "rev-parse", "master") == before
+    assert not ledger.exists() or ledger.read_text(encoding="utf-8").strip() == ""
+
+
+# ---------- published_as: hand-written bus entries are never re-appended ----------
+
+def _bus_with_hand_entry(tmp_path):
+    """A bus whose TRAPS.md already carries an entry written by hand (no outbox marker), then a
+    later commit so that entry's sha is an ancestor of the tip and not the tip itself."""
+    bare, clone = init_bus(tmp_path)
+    hand = "### Hand written finding\nwritten by hand, no marker\n"
+    traps = (clone / "TRAPS.md").read_text(encoding="utf-8")
+    (clone / "TRAPS.md").write_text(traps + hand, encoding="utf-8")
+    git(clone, "add", "TRAPS.md")
+    git(clone, "commit", "-m", "hand entry")
+    hand_sha = git(clone, "rev-parse", "HEAD")
+    (clone / "RECEIPTS.md").write_text("# RECEIPTS.md\n\nlater unrelated commit\n", encoding="utf-8")
+    git(clone, "add", "RECEIPTS.md")
+    git(clone, "commit", "-m", "later commit")
+    git(clone, "push", "origin", "HEAD:refs/heads/master")
+    return bare, hand_sha
+
+
+def test_published_as_item_is_skipped_on_a_fresh_clone_with_an_empty_ledger(tmp_path):
+    bare, hand_sha = _bus_with_hand_entry(tmp_path)
+    fresh_clone = tmp_path / "bus-fresh-clone"
+    subprocess.run(["git", "clone", str(bare), str(fresh_clone)], check=True, capture_output=True, text=True)
+    src = init_source(tmp_path)
+    add_item(src, "20260928-hand-written.md", published_as=hand_sha[:12],
+             body="### Hand written finding\nwritten by hand, no marker\n")
+    before = git(bare, "rev-parse", "master")
+    ledger = tmp_path / "never-existed.jsonl"
+
+    report = ob.drain(src, fresh_clone, "HEAD", ledger, [], push=True)
+
+    assert git(bare, "rev-parse", "master") == before, "a hand-published entry was appended a second time"
+    assert report["published"] == [] and report["pushed"] is False and report["refused"] == []
+    assert [a["via"] for a in report["already_sent"]] == ["published_as"]
+    assert not ledger.exists()
+
+
+@pytest.mark.parametrize("claim,heading,why", [
+    ("deadbeefdead", "### Hand written finding", "not an ancestor"),
+    (None, "### A different heading entirely", "heading"),
+])
+def test_unverifiable_published_as_claim_is_refused_and_never_appended(tmp_path, claim, heading, why):
+    bare, hand_sha = _bus_with_hand_entry(tmp_path)
+    clone = tmp_path / "bus-drain-clone"
+    subprocess.run(["git", "clone", str(bare), str(clone)], check=True, capture_output=True, text=True)
+    src = init_source(tmp_path)
+    add_item(src, "20260928-hand-written.md", published_as=claim or hand_sha[:12], body=f"{heading}\nbody\n")
+    before = git(bare, "rev-parse", "master")
+
+    report = ob.drain(src, clone, "HEAD", tmp_path / "sent.jsonl", [], push=True)
+
+    assert git(bare, "rev-parse", "master") == before
+    assert report["published"] == []
+    assert [r["code"] for r in report["refused"]] == ["PUBLISHED_AS_UNVERIFIED"]
+    assert why in report["refused"][0]["detail"]
+
+
+# ---------- ref, not HEAD: a checkout on a peer branch ----------
+
+def _fork_checkout(tmp_path):
+    """MLV-App's shape: remote `fork` holds master; the work clone sits on a peer branch that
+    carries an extra item master does not have."""
+    fork_bare = tmp_path / "fork.git"
+    subprocess.run(["git", "init", "--bare", "-b", "master", str(fork_bare)], check=True, capture_output=True, text=True)
+    wc = init_source(tmp_path, "wc")
+    add_item(wc, "20260925-on-master.md", body="### On master\nbody\n")
+    git(wc, "remote", "add", "fork", str(fork_bare))
+    git(wc, "push", "fork", "master")
+    git(wc, "checkout", "-b", "peer/other-lane")
+    add_item(wc, "20260926-peer-only.md", body="### Peer only\nbody\n")
+    return wc
+
+
+def test_debt_reads_fork_master_not_the_checked_out_peer_branch(tmp_path, capsys):
+    wc = _fork_checkout(tmp_path)
+    assert ob.main(["--repo", str(wc), "debt", "--ledger", str(tmp_path / "s.jsonl"), "--json"]) == 1
+    out = json.loads(capsys.readouterr().out)
+    assert out["ref"] == "refs/remotes/fork/master"
+    assert [i["path"] for i in out["items"]] == ["doctrine-outbox/20260925-on-master.md"]
+
+
+def test_debt_json_reports_ok_when_the_ledger_covers_the_ref(tmp_path, capsys):
+    src = init_source(tmp_path)
+    add_item(src, "20260925-example.md")
+    ledger = tmp_path / "sent.jsonl"
+    key = ob.idempotency_key(git(src, "rev-parse", "HEAD"), "TRAPS.md", "### Example finding\nBody text describing the finding.\n")
+    ob.append_ledger_rows(ledger, [{"key": key}])
+    assert ob.main(["--repo", str(src), "debt", "--ref", "master", "--ledger", str(ledger), "--json"]) == 0
+    assert json.loads(capsys.readouterr().out)["status"] == "OK"
+
+
+def test_debt_is_unknown_never_zero_when_the_ref_lacks_the_tool(tmp_path, capsys):
+    src = init_source(tmp_path, with_tool=False)
+    add_item(src, "20260925-example.md")
+    code = ob.main(["--repo", str(src), "debt", "--ref", "master", "--ledger", str(tmp_path / "s.jsonl")])
+    out = capsys.readouterr().out
+    assert code == 2
+    assert "UNKNOWN" in out and "TOOL_ABSENT_AT_REF" in out
+    assert "no unsent" not in out
+
+
+def test_debt_is_unknown_when_the_ref_lacks_the_items_directory(tmp_path, capsys):
+    src = init_source(tmp_path)
+    code = ob.main(["--repo", str(src), "debt", "--ref", "master", "--json"])
+    out = json.loads(capsys.readouterr().out)
+    assert code == 2 and out["status"] == "UNKNOWN" and out["code"] == "TOOL_ABSENT_AT_REF"
+    assert "doctrine-outbox/" in out["detail"]
+
+
+def test_debt_is_unknown_when_the_default_ref_does_not_resolve(tmp_path, capsys):
+    src = init_source(tmp_path)  # no `fork` remote: refs/remotes/fork/master does not exist
+    add_item(src, "20260925-example.md")
+    code = ob.main(["--repo", str(src), "debt", "--json"])
+    out = json.loads(capsys.readouterr().out)
+    assert code == 2 and out["code"] == "REF_UNRESOLVED"
+
+
+def test_drain_refuses_a_ref_without_the_tool_and_pushes_nothing(tmp_path, capsys):
+    bare, clone = init_bus(tmp_path)
+    src = init_source(tmp_path, with_tool=False)
+    add_item(src, "20260925-example.md")
+    before = git(bare, "rev-parse", "master")
+    code = ob.main(["--repo", str(src), "drain", "--bus", str(clone), "--ref", "master", "--push",
+                    "--ledger", str(tmp_path / "s.jsonl")])
+    assert code == 2
+    assert "TOOL_ABSENT_AT_REF" in capsys.readouterr().err
+    assert git(bare, "rev-parse", "master") == before
+
+
+def test_debt_with_a_bus_sees_a_marker_the_ledger_never_recorded(tmp_path, capsys):
+    bare, clone = init_bus(tmp_path)
+    src = init_source(tmp_path)
+    add_item(src, "20260925-example.md")
+    ob.drain(src, clone, "HEAD", tmp_path / "a.jsonl", [], push=True)
+    args = ["--repo", str(src), "debt", "--ref", "master", "--ledger", str(tmp_path / "lost.jsonl")]
+    assert ob.main(args) == 1  # without the bus, the lost ledger reads as debt
+    capsys.readouterr()
+    assert ob.main([*args, "--bus", str(clone)]) == 0
+
+
+# ---------- committed-bytes-only visibility ----------
+
+def test_working_tree_only_item_is_invisible(tmp_path):
+    src = init_source(tmp_path)
+    item_dir = src / "doctrine-outbox"
+    item_dir.mkdir()
+    (item_dir / "README.md").write_text("# doctrine-outbox\n", encoding="utf-8")
+    git(src, "add", "doctrine-outbox/README.md")
+    git(src, "commit", "-m", "readme")
+    (item_dir / "20260925-uncommitted.md").write_text(item_text(), encoding="utf-8")
+    assert ob.load_outbox_items(src, "HEAD") == []
+    assert ob.main(["--repo", str(src), "debt", "--ref", "HEAD", "--ledger", str(tmp_path / "s.jsonl")]) == 0
+
+
+def test_readme_in_outbox_dir_is_not_an_item(tmp_path):
+    src = init_source(tmp_path)
+    (src / "doctrine-outbox").mkdir()
+    (src / "doctrine-outbox" / "README.md").write_text("# doctrine-outbox\n", encoding="utf-8")
+    git(src, "add", "doctrine-outbox/README.md")
+    git(src, "commit", "-m", "add readme")
+    assert ob.load_outbox_items(src, "HEAD") == []
+
+
+def test_pending_source_commit_resolves_to_adding_commit(tmp_path):
+    src = init_source(tmp_path)
+    add_item(src, "20260925-example.md")
+    adding_commit = git(src, "rev-parse", "HEAD")
+    items = ob.load_outbox_items(src, "HEAD")
+    assert len(items) == 1 and items[0]["source_commit"] == adding_commit
+
+
+def test_debt_command_respects_ledger(tmp_path):
+    src = init_source(tmp_path)
+    item = add_item(src, "20260925-example.md")
+    ledger = tmp_path / "sent.jsonl"
+    argv = ["--repo", str(src), "debt", "--ref", "HEAD", "--ledger", str(ledger)]
+    assert ob.main(argv) == 1
+    parsed = ob.parse_item(item.read_text(encoding="utf-8"))
+    key = ob.idempotency_key(git(src, "rev-parse", "HEAD"), parsed["meta"]["target"], parsed["body"])
+    ob.append_ledger_rows(ledger, [{"key": key, "target": "TRAPS.md", "item": "20260925-example"}])
+    assert ob.main(argv) == 0
+
+
+# ---------- debt age: from the merge into the ref, not the branch commit ----------
+
+def _merged_item_repo(tmp_path, branch_age_s: float, merge_age_s: float):
+    src = init_source(tmp_path)
+    git(src, "checkout", "-b", "feature")
+    add_item(src, "20260925-example.md", env=dated(branch_age_s))
+    git(src, "checkout", "master")
+    git(src, "merge", "--no-ff", "feature", "-m", "Merge pull request #1 from feature", env=dated(merge_age_s))
+    return src
+
+
+def test_debt_age_counts_from_the_merge_not_the_branch_commit(tmp_path):
+    day = 86400
+    src = _merged_item_repo(tmp_path, branch_age_s=5 * day, merge_age_s=2 * 3600)
+    result = ob.compute_debt(src, "master", tmp_path / "s.jsonl")
+    assert result["count"] == 1
+    assert 1.5 < result["oldest_age_hours"] < 3, "age must be ~2h since the merge, not ~120h since the branch commit"
+    assert result["stale_over_24h"] is False
+
+
+def test_debt_older_than_24h_since_the_merge_is_stale(tmp_path):
+    day = 86400
+    src = _merged_item_repo(tmp_path, branch_age_s=6 * day, merge_age_s=3 * day)
+    result = ob.compute_debt(src, "master", tmp_path / "s.jsonl")
+    assert 70 < result["oldest_age_hours"] < 74
+    assert result["stale_over_24h"] is True
+
+
+def test_debt_age_of_a_direct_first_parent_commit_is_its_own_time(tmp_path):
+    src = init_source(tmp_path)
+    add_item(src, "20260925-example.md", env=dated(30 * 3600))
+    result = ob.compute_debt(src, "master", tmp_path / "s.jsonl")
+    assert 29 < result["oldest_age_hours"] < 31 and result["stale_over_24h"] is True
+
+
+# ---------- check-ledger: structured findings need a disposition ----------
+
+LEDGER_TEXT = """# Subject ledger
+
+## SUBJECT 1
+A hub error, disclosed; the root cause was a TRAP in the launcher. See KF-9 above.
+
+## KERNEL FINDINGS from this attempt (file to the bus at the next seam)
+
+- **KF-1 -- first finding.** It happened.
+  Doctrine-Export: outbox 20260929-first-finding.md
+- **KF-2 -- second finding.** It also happened.
+
+## SUBJECT 2
+Finding: KF-3 tagged outside any section
+Doctrine-Export: none the fix is product internal only
+"""
+
+
+def _ledger(tmp_path, text: str = LEDGER_TEXT) -> Path:
+    path = tmp_path / "subject-ledger.md"
+    path.write_bytes(text.encode("utf-8"))
+    return path
+
+
+def test_check_ledger_flags_only_the_undisposed_finding(tmp_path):
+    code, lines = ob.check_ledger(_ledger(tmp_path), tmp_path / "wm.json")
+    text = "\n".join(lines)
+    assert code == 1
+    assert "UNDISPOSED KF-2" in text
+    assert "UNDISPOSED KF-1" not in text and "UNDISPOSED KF-3" not in text
+    assert "3 finding(s)" in text and "1 undisposed" in text
+
+
+def test_check_ledger_ignores_a_kf_mentioned_mid_line(tmp_path):
+    code, lines = ob.check_ledger(_ledger(tmp_path), tmp_path / "wm.json")
+    assert "KF-9" not in "\n".join(lines)
+
+
+def test_keyword_hits_are_advisory_never_failing(tmp_path):
+    """M3. 'hub error', 'root cause' and 'TRAP' say "look here"; only a structured finding gate fails."""
+    ledger = _ledger(tmp_path, "# L\n\n## S\nHub error, disclosed. Root cause found. A TRAP.\n")
+    code, lines = ob.check_ledger(ledger, tmp_path / "wm.json")
+    text = "\n".join(lines)
+    assert code == 0, text
+    assert text.count("ADVISORY") == 1
+    disposed = _ledger(tmp_path, LEDGER_TEXT.replace("It also happened.\n", "It also happened.\n  Doctrine-Export: none nothing fleet relevant here\n"))
+    code, lines = ob.check_ledger(disposed, tmp_path / "wm.json")
+    assert code == 0, "\n".join(lines)
+    assert "ADVISORY" in "\n".join(lines)
+
+
+@pytest.mark.parametrize("line,why", [
+    ("Doctrine-Export: none n/a", "DISPOSITION_NONE_NEEDS_REASON_OF_4_WORDS"),
+    ("Doctrine-Export: none", "DISPOSITION_NONE_NEEDS_REASON_OF_4_WORDS"),
+    ("Doctrine-Export: outbox", "DISPOSITION_OUTBOX_NEEDS_ITEM_FILE"),
+    ("Doctrine-Export: outbox somefile", "DISPOSITION_OUTBOX_NEEDS_ITEM_FILE"),
+])
+def test_a_weak_or_malformed_disposition_does_not_count(tmp_path, line, why):
+    ledger = _ledger(tmp_path, f"## KERNEL FINDINGS\n\n- **KF-1 -- f.** x\n  {line}\n")
+    code, lines = ob.check_ledger(ledger, tmp_path / "wm.json")
+    assert code == 1 and why in "\n".join(lines)
+
+
+def test_a_disposition_before_the_finding_or_after_the_next_one_does_not_count(tmp_path):
+    ledger = _ledger(tmp_path, "## KERNEL FINDINGS\n\nDoctrine-Export: none stray line before any finding\n"
+                               "- **KF-1 -- a.** x\n- **KF-2 -- b.** y\n  Doctrine-Export: none belongs to the second one only\n")
+    code, lines = ob.check_ledger(ledger, tmp_path / "wm.json")
+    text = "\n".join(lines)
+    assert code == 1 and "UNDISPOSED KF-1" in text and "UNDISPOSED KF-2" not in text
+
+
+def test_a_heading_ends_a_findings_span(tmp_path):
+    ledger = _ledger(tmp_path, "## KERNEL FINDINGS\n- **KF-1 -- a.** x\n## NEXT\nDoctrine-Export: none but this is under another heading\n")
+    code, _lines = ob.check_ledger(ledger, tmp_path / "wm.json")
+    assert code == 1
+
+
+def test_check_ledger_is_unknown_when_the_ledger_is_missing(tmp_path):
+    code, lines = ob.check_ledger(tmp_path / "nope.md", tmp_path / "wm.json")
+    assert code == 2 and "UNKNOWN" in lines[0]
+
+
+def test_watermark_advances_only_on_disposition_and_detects_a_rewrite(tmp_path):
+    ledger, wm = _ledger(tmp_path), tmp_path / "wm.json"
+    code, lines = ob.check_ledger(ledger, wm, advance=True)
+    assert code == 1
+    stop = json.loads(wm.read_text(encoding="utf-8"))["offset"]
+    data = ledger.read_bytes()
+    assert data[stop:].startswith(b"- **KF-2"), "watermark must stop AT the first undisposed finding"
+
+    # Dispose KF-2 (appended after its line): the next run advances to the end.
+    ledger.write_bytes(data.replace(b"It also happened.\n", b"It also happened.\n  Doctrine-Export: none nothing fleet relevant here\n"))
+    code, lines = ob.check_ledger(ledger, wm, advance=True)
+    assert code == 0
+    assert json.loads(wm.read_text(encoding="utf-8"))["offset"] == len(ledger.read_bytes())
+
+    # A new undisposed finding after the watermark is the only thing reported.
+    ledger.write_bytes(ledger.read_bytes() + b"\nFinding: KF-4 a brand new one\n")
+    code, lines = ob.check_ledger(ledger, wm)
+    text = "\n".join(lines)
+    assert code == 1 and "UNDISPOSED KF-4" in text and "1 finding(s)" in text
+
+    # Rewriting history under the watermark is detected and the scan restarts from 0.
+    ledger.write_bytes(ledger.read_bytes().replace(b"# Subject ledger", b"# Subject LEDGER"))
+    code, lines = ob.check_ledger(ledger, wm)
+    assert "WATERMARK_PREFIX_MISMATCH" in "\n".join(lines)
+    assert "4 finding(s)" in "\n".join(lines)
+
+
+def test_check_ledger_without_advance_never_writes_the_watermark(tmp_path):
+    ob.check_ledger(_ledger(tmp_path), tmp_path / "wm.json")
+    assert not (tmp_path / "wm.json").exists()
+
+
+def test_baseline_explicitly_waives_history_and_says_how_much(tmp_path):
+    ledger, wm = _ledger(tmp_path), tmp_path / "wm.json"
+    code, lines = ob.check_ledger(ledger, wm, baseline=True)
+    assert code == 0 and "1 undisposed historical finding(s) explicitly waived" in lines[0]
+    code, lines = ob.check_ledger(ledger, wm)
+    assert code == 0 and "0 finding(s)" in "\n".join(lines)
+
+
+def test_advance_stops_at_the_last_complete_line(tmp_path):
+    ledger, wm = _ledger(tmp_path, "## S\nplain text\nhalf a li"), tmp_path / "wm.json"
+    ob.check_ledger(ledger, wm, advance=True)
+    assert json.loads(wm.read_text(encoding="utf-8"))["offset"] == len(b"## S\nplain text\n")
+
+
+def test_check_ledger_cli_path_precedence_flag_over_env_over_default(tmp_path, monkeypatch, capsys):
+    env_ledger = tmp_path / "env.md"
+    env_ledger.write_text("## KERNEL FINDINGS\n- **KF-7 -- env.** x\n", encoding="utf-8")
+    flag_ledger = tmp_path / "flag.md"
+    flag_ledger.write_text("# nothing\n", encoding="utf-8")
+    wm = tmp_path / "wm.json"
+    monkeypatch.setenv(ob.SUBJECT_LEDGER_ENV, str(env_ledger))
+    assert ob.main(["--repo", str(tmp_path), "check-ledger", "--watermark", str(wm)]) == 1
+    assert "KF-7" in capsys.readouterr().out
+    assert ob.main(["--repo", str(tmp_path), "check-ledger", "--ledger", str(flag_ledger), "--watermark", str(wm)]) == 0
+    monkeypatch.delenv(ob.SUBJECT_LEDGER_ENV)
+    assert ob.main(["--repo", str(tmp_path), "check-ledger", "--watermark", str(wm)]) == 2  # default path absent
+
+
+def test_check_ledger_watermark_env_override(tmp_path, monkeypatch):
+    ledger, wm = _ledger(tmp_path), tmp_path / "from-env.json"
+    monkeypatch.setenv(ob.WATERMARK_ENV, str(wm))
+    ob.main(["--repo", str(tmp_path), "check-ledger", "--ledger", str(ledger), "--baseline"])
+    assert wm.is_file()
+
+
+# ---------- check-commits: the trailer check ----------
+
+def _commit(src: Path, files: dict[str, str], message: str) -> str:
+    for rel, content in files.items():
+        path = src / rel
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(content, encoding="utf-8")
+        git(src, "add", rel)
+    git(src, "commit", "-m", message)
+    return git(src, "rev-parse", "HEAD")
+
+
+def _range_repo(tmp_path):
+    src = init_source(tmp_path)
+    return src, git(src, "rev-parse", "HEAD")
+
+
+@pytest.mark.parametrize("path", ["tools/coordination/x.ps1", "agents/x.md", ".claude/x.json", "CLAUDE.md"])
+def test_a_finding_path_commit_without_a_trailer_fails(tmp_path, path):
+    src, base = _range_repo(tmp_path)
+    _commit(src, {path: "x\n"}, "touch a finding path")
+    failures = ob.check_commits(src, f"{base}..HEAD", [])
+    assert [p for ps in failures.values() for p in ps][0].startswith("MISSING_DOCTRINE_EXPORT")
+
+
+def test_a_non_finding_path_commit_needs_no_trailer(tmp_path):
+    src, base = _range_repo(tmp_path)
+    _commit(src, {"src/foo.cpp": "x\n", "docs/y.md": "y\n"}, "ordinary product commit")
+    assert ob.check_commits(src, f"{base}..HEAD", []) == {}
+
+
+def test_none_with_a_real_reason_passes_and_a_short_one_fails(tmp_path):
+    src, base = _range_repo(tmp_path)
+    _commit(src, {"agents/a.md": "a\n"}, "ok\n\nDoctrine-Export: none tooling change with no fleet lesson")
+    assert ob.check_commits(src, f"{base}..HEAD", []) == {}
+    _commit(src, {"agents/b.md": "b\n"}, "bad\n\nDoctrine-Export: none n/a")
+    failures = ob.check_commits(src, f"{base}..HEAD", [])
+    assert len(failures) == 1
+    assert "NEEDS_REASON_OF_4_WORDS" in next(iter(failures.values()))[0]
+
+
+def test_outbox_trailer_needs_an_item_added_in_the_range_that_passes_validation(tmp_path):
+    src, base = _range_repo(tmp_path)
+    _commit(src, {"agents/a.md": "a\n", "doctrine-outbox/20260929-real-item.md": item_text()},
+            "good\n\nDoctrine-Export: outbox 20260929-real-item.md")
+    assert ob.check_commits(src, f"{base}..HEAD", []) == {}
+
+    _commit(src, {"agents/b.md": "b\n"}, "cites nothing\n\nDoctrine-Export: outbox 20260929-not-there.md")
+    _commit(src, {"agents/c.md": "c\n", "doctrine-outbox/20260929-leaky-item.md": item_text(body="### h\nmail x@example.com\n")},
+            "leaky\n\nDoctrine-Export: outbox doctrine-outbox/20260929-leaky-item.md")
+    _commit(src, {"agents/d.md": "d\n"}, "no item at all\n\nDoctrine-Export: outbox")
+    failures = ob.check_commits(src, f"{base}..HEAD", [])
+    reasons = sorted(p.split(":")[0] for ps in failures.values() for p in ps)
+    assert reasons == ["DOCTRINE_EXPORT_OUTBOX_ITEM_INVALID", "DOCTRINE_EXPORT_OUTBOX_ITEM_NOT_ADDED_IN_RANGE",
+                       "DOCTRINE_EXPORT_OUTBOX_NEEDS_ITEM_FILE"]
+
+
+def test_a_garbled_trailer_fails_even_on_a_non_finding_path(tmp_path):
+    src, base = _range_repo(tmp_path)
+    _commit(src, {"src/a.cpp": "a\n"}, "garbled\n\nDoctrine-Export: maybe later")
+    failures = ob.check_commits(src, f"{base}..HEAD", [])
+    assert next(iter(failures.values()))[0].startswith("BAD_DOCTRINE_EXPORT")
+
+
+def test_merge_commits_are_not_checked_but_their_branch_commits_are(tmp_path):
+    src, base = _range_repo(tmp_path)
+    git(src, "checkout", "-b", "feature")
+    _commit(src, {"agents/a.md": "a\n"}, "branch commit\n\nDoctrine-Export: none tooling change with no fleet lesson")
+    git(src, "checkout", "master")
+    _commit(src, {"src/m.cpp": "m\n"}, "master moves on")
+    git(src, "merge", "--no-ff", "feature", "-m", "Merge pull request #2 from feature")
+    assert ob.check_commits(src, f"{base}..HEAD", []) == {}
+
+
+def test_an_unresolvable_range_is_unknown_not_a_pass(tmp_path, capsys):
+    src = init_source(tmp_path)
+    assert ob.main(["--repo", str(src), "check-commits"]) == 2  # default refs/remotes/fork/master absent
+    assert "RANGE_UNRESOLVED" in capsys.readouterr().err
+
+
+def test_check_commits_cli_reports_failures_on_stderr(tmp_path, capsys):
+    src, base = _range_repo(tmp_path)
+    _commit(src, {"CLAUDE.md": "x\n"}, "touch")
+    assert ob.main(["--repo", str(src), "check-commits", "--range", f"{base}..HEAD"]) == 1
+    assert "MISSING_DOCTRINE_EXPORT" in capsys.readouterr().err
+
+
+@pytest.mark.skipif(os.environ.get("GITHUB_EVENT_NAME") != "pull_request",
+                    reason="runs only on a hosted pull_request event, where the PR's commit range is known")
+def test_pull_request_commits_declare_doctrine_export():
+    """The CI seam for the trailer check: every non-merge commit of THIS pull request that touches a
+    finding path (tools/coordination/**, agents/**, .claude/**, CLAUDE.md) carries a valid
+    `Doctrine-Export:` trailer. An unresolvable range raises, which fails the test."""
+    event = json.loads(Path(os.environ["GITHUB_EVENT_PATH"]).read_text(encoding="utf-8"))
+    base, head = event["pull_request"]["base"]["sha"], event["pull_request"]["head"]["sha"]
+    failures = ob.check_commits(REPO_ROOT, f"{base}..{head}", [])
+    assert failures == {}, "\n".join(f"{sha[:12]}: {'; '.join(p)}" for sha, p in failures.items())
+
+
+# ---------- validate CLI ----------
+
+def test_validate_cli_ok_and_refused(tmp_path, capsys):
+    good = tmp_path / "20260929-good-item.md"
+    good.write_text(item_text(body="### heading\nbody\n"), encoding="utf-8")
+    bad = tmp_path / "20260929-bad-item.md"
+    bad.write_text("not front matter\n", encoding="utf-8")
+    assert ob.main(["--repo", str(tmp_path), "validate", str(good)]) == 0
+    assert ob.main(["--repo", str(tmp_path), "validate", str(bad)]) == 1
+    assert "ITEM_NO_FRONT_MATTER" in capsys.readouterr().err
+
+
+def test_validate_refuses_a_filename_the_drain_would_refuse_forever(tmp_path, capsys):
+    """A slug over the limit passed validate but was refused by every drain as ITEM_BAD_FILENAME;
+    found by the shipped-items test against the staged backfill (five of them were over)."""
+    too_long = tmp_path / ("20260929-" + "a" * 62 + ".md")
+    too_long.write_text(item_text(body="### heading\nbody\n"), encoding="utf-8")
+    assert ob.main(["--repo", str(tmp_path), "validate", str(too_long)]) == 1
+    assert "ITEM_BAD_FILENAME" in capsys.readouterr().err
+    src = init_source(tmp_path, "namesrc")
+    item_dir = src / "doctrine-outbox"
+    item_dir.mkdir()
+    (item_dir / too_long.name).write_text(item_text(body="### heading\nbody\n"), encoding="utf-8")
+    git(src, "add", "doctrine-outbox")
+    git(src, "commit", "-m", "long name")
+    assert [i["error"].split(":")[0] for i in ob.load_outbox_items(src, "HEAD")] == ["ITEM_BAD_FILENAME"]
+
+
+def test_validate_refuses_short_identity_via_cli(monkeypatch, tmp_path, capsys):
+    monkeypatch.setattr(ob.socket, "gethostname", lambda: "ab")
+    monkeypatch.delenv("COMPUTERNAME", raising=False)
+    monkeypatch.setenv("USERNAME", "ab")
+    monkeypatch.delenv("USER", raising=False)
+    monkeypatch.delenv("USERPROFILE", raising=False)
+    monkeypatch.delenv("HOME", raising=False)
+    good = tmp_path / "20260929-good-item.md"
+    good.write_text(item_text(body="### heading\nbody\n"), encoding="utf-8")
+    assert ob.main(["--repo", str(tmp_path), "validate", str(good)]) == 1
+    err = capsys.readouterr().err
+    assert "SHORT_IDENTITY_UNSCREENABLE" in err and "ab" not in err
+
+
+# ---------- the sent ledger and watermark never travel ----------
+
+def test_gitignore_excludes_the_outbox_state_files_portably(tmp_path):
+    """Present in the TRACKED .gitignore, not only a local exclude: proved in a brand new repo
+    holding only that file."""
+    clean = tmp_path / "gitignore-check-repo"
+    clean.mkdir()
+    subprocess.run(["git", "init", "-q", "-b", "master", str(clean)], check=True, capture_output=True, text=True)
+    (clean / ".gitignore").write_bytes((REPO_ROOT / ".gitignore").read_bytes())
+    for rel in (ob.LEDGER_REL, ob.WATERMARK_REL, ob.DENY_FILE_REL):
+        result = subprocess.run(["git", "-C", str(clean), "check-ignore", "-q", str(rel).replace("\\", "/")],
+                                capture_output=True, text=True)
+        assert result.returncode == 0, f"tracked .gitignore does not exclude {rel}"
+
+
+def test_shipped_backfill_items_all_validate_and_screen_clean():
+    """Every item committed under doctrine-outbox/ in this checkout parses and passes the Law-4
+    screen, so the first drain cannot refuse one."""
+    items = sorted(p for p in (REPO_ROOT / "doctrine-outbox").glob("*.md") if p.name != "README.md")
+    for path in items:
+        assert ob.ITEM_NAME_RE.match(path.name), path.name
+        parsed = ob.parse_item(path.read_text(encoding="utf-8"))
+        ob.screen_law4(parsed["body"], [])
+        ob.screen_law4(path.name, [])
+        assert path.read_text(encoding="utf-8").startswith("---\n") and "published_as" not in parsed["meta"]
