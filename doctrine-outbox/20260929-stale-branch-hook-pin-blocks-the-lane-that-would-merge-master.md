@@ -6,11 +6,16 @@ law4: attested
 ---
 ### mlv-app, 2026-09-29 — a stale branch cannot start the editing lane that would merge master: the runner's hook pin refuses it first, so sync only the guard files, then let the lane merge
 
-**Symptom (measured):** an editing lane dispatched onto a branch that was behind master threw `hook-not-enforced: worktree hook sha256=<A> != receipt hookSha256=<B>` at the runner's pre-launch gate and produced no lane output at all (empty stdout, a 452-byte error file, a dispatch-proof file). The lane's first job was exactly to merge master into the branch, and a full master merge conflicted in three tooling files, and resolving them was the lane's job, not the orchestrator's. The branch was stuck behind the very gate the merge would have satisfied.
+**Symptom (measured):** an editing lane dispatched onto a branch that was behind master threw `hook-not-enforced: worktree hook sha256=<A> != receipt hookSha256=<B>` at the runner's pre-launch gate and produced no lane output at all (empty stdout, a 452-byte error file). The lane's first job was to merge master into the branch (three tooling files conflict, and resolving them is the lane's job, not the orchestrator's), so the branch was stuck behind the very gate the merge would satisfy.
 
-**Cause:** the runner refuses `-AllowEdits` unless the worktree's command-guard hook hash equals the hash pinned in the enforcement receipt, which tracks the hook on master. A branch cut before a hook change carries the old hook, so it fails the pin by construction, and the gate runs before the lane can do anything about it. This is the branch-side mirror of the 2026-09-27 entry, where the receipt went stale after a merge to master; here the receipt was current and the branch was old.
+**Cause:** the runner refuses `-AllowEdits` unless the worktree's command-guard hook hash equals the hash pinned in the enforcement receipt, which tracks the hook on master. A branch cut before a hook change fails the pin by construction, and the gate runs before the lane can act. This mirrors the 2026-09-27 entry (receipt stale after a merge to master); here the receipt was current and the branch old.
 
-**What worked:** one named commit on the branch that brought over only the guard: the hook directory and the guard's data file, checked out from the fork's master (2 files, +86/-2 lines). The orchestrator ran it as a small pre-step script (the first version had a PowerShell parse error and never ran; the second did). The next dispatch passed the gate, and the lane did the full master merge itself: a merge commit with the three conflicted files resolved by union, then its own fixes, ending `exit=0`. The guard files then merged cleanly because their content was already identical.
+**What worked (sequence, each step with a receipt):**
+
+1. The dispatch above failed: empty stdout, `DISPATCH_UNPROVEN`, `hook-not-enforced` in the error file.
+2. One named commit (`c8f8b72a`) brought over only the guard: the hook script and the guard's data file, checked out from the fork's master. A saved `git show --stat` receipt gives its size: 2 files changed, 86 insertions, 2 deletions. It ran as a pre-step script (the first version had a parse error and never ran; the second did).
+3. The next dispatch wrote a dispatch-proof reading `PROVEN` at 13:47:04Z.
+4. That lane then did the full master merge itself: merge commit `d899b358` with the three conflicted files resolved by union (none of them a guard file) and exited 0.
 
 **Rule:** when `hook-not-enforced` refuses a stale branch, do not loosen or re-pin the receipt and do not hand-merge master from the orchestrator. Sync the guard files alone in one named commit (never a broad checkout, never `add -A`), confirm the worktree hook hash now equals the receipt's, then dispatch the lane to merge and resolve. Before dispatching any editing lane onto a branch older than the last hook change, do the sync first.
 

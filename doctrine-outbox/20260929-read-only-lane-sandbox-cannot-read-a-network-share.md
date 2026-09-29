@@ -14,4 +14,4 @@ law4: attested
 
 **Falsifier:** from inside the same lane configuration, read one file on the share. A denial confirms the sandbox boundary, and the same file read from an unsandboxed shell succeeds.
 
-Relates to the `RECEIPTS.md` bullet "Worker-env credential blindness" (a worker's launch environment differing from the interactive one): the same class, filesystem reach instead of credentials.
+Relates to the `RECEIPTS.md` bullet "Worker-env credential blindness" (a worker's launch environment differing from the interactive one): the same class, filesystem reach instead of credentials. Also relates to `TRAPS.md` > the dng-auto-processor 2026-09-13 entry "A Codex `--approve-for-me` sandbox on Windows cannot reach an administrative share", which measured the same sandbox boundary on a different share type.
