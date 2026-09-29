@@ -50,8 +50,10 @@ SOURCES += \
     $$REPO_ROOT/tests/console/test_gpu_window_swap_wiring.cpp \
     $$REPO_ROOT/tests/console/test_playback_smoke_foreground_wiring.cpp \
     $$REPO_ROOT/tests/console/test_playback_smoke_fullscreen_wiring.cpp \
+    $$REPO_ROOT/tests/console/test_gui_smoke_display_select_wiring.cpp \
     $$REPO_ROOT/tests/console/test_playback_fullscreen_ui_wiring.cpp \
     $$REPO_ROOT/tests/console/test_playback_display_wake_wiring.cpp \
+    $$REPO_ROOT/tests/console/test_pre_dualiso_telemetry_reset_wiring.cpp \
     $$REPO_ROOT/tests/console/test_contact_sheet_capture_wiring.cpp \
     $$REPO_ROOT/tests/console/test_playback_achieved_scale_policy.cpp \
     $$REPO_ROOT/tests/console/test_gpu_texture_present_availability_policy.cpp \
@@ -60,7 +62,9 @@ SOURCES += \
     $$REPO_ROOT/tests/console/test_playback_drop_frame_advance_policy.cpp \
     $$REPO_ROOT/tests/console/test_playback_conform_policy.cpp \
     $$REPO_ROOT/tests/console/test_playback_conform_wiring.cpp \
-    $$REPO_ROOT/tests/console/test_playback_source_advance_tracker.cpp
+    $$REPO_ROOT/tests/console/test_playback_source_advance_tracker.cpp \
+    $$REPO_ROOT/tests/console/test_playback_fps_meter_policy.cpp \
+    $$REPO_ROOT/tests/console/test_playback_fps_meter_wiring.cpp
 
 HEADERS += \
     $$REPO_ROOT/platform/qt/FpmNameValidator.h \
@@ -94,6 +98,7 @@ HEADERS += \
     $$REPO_ROOT/platform/qt/PlaybackSourceAdvanceTracker.h \
     $$REPO_ROOT/platform/qt/PlaybackAchievedScalePolicy.h \
     $$REPO_ROOT/platform/qt/PlaybackLookaheadLoopPositionPolicy.h \
+    $$REPO_ROOT/platform/qt/PlaybackFpsMeterPolicy.h \
     $$REPO_ROOT/platform/qt/GpuTexturePresentAvailabilityPolicy.h
 
 win32{

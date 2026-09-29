@@ -337,27 +337,3 @@ TEST(PlaybackConformWiring, ConformTelemetryLineCarriesTheAcceptanceInputs)
     ASSERT_TRUE(source.contains(QStringLiteral("m_playbackSmokeSourceAdvance.notePresented(")));
     ASSERT_TRUE(source.contains(QStringLiteral("m_playbackSmokeSourceAdvance.reset();")));
 }
-
-// The status fps is a draw-to-draw meter. The idle poll ticks between two draws (8 ms poll vs a
-// ~42 ms frame period under a 24 fps conform) must not restart it: they used to re-arm lastTime,
-// zero the average and reset the update throttle, so the label read the poll period (~90 fps).
-TEST(PlaybackConformWiring, FpsMeterMeasuresDrawToDrawAndIdleTicksDoNotRestartIt)
-{
-    const QString body = timerFrameEventBody(mainWindowSource());
-    ASSERT_FALSE(body.isEmpty());
-    ASSERT_TRUE(body.contains(QStringLiteral("static QTime lastDrawTime;")));
-    ASSERT_TRUE(body.contains(QStringLiteral(
-        "const int measuredFrameMs = lastDrawTime.isValid() ? lastDrawTime.msecsTo( nowTime ) : 0;")));
-    ASSERT_TRUE(body.contains(QStringLiteral("playback_conform::smoothedFrameMs(")));
-    // the old measurement off the idle-re-armed lastTime is gone
-    ASSERT_FALSE(body.contains(QStringLiteral("const int measuredFrameMs = lastTime.msecsTo( nowTime );")));
-    // the idle branch zeroes the meter only when paused, before the first draw, or stalled
-    const int idleAt = body.indexOf(QStringLiteral("timer_frame.idle"));
-    ASSERT_TRUE(idleAt >= 0);
-    const QString idle = body.mid(idleAt);
-    const int guardAt = idle.indexOf(QStringLiteral("playback_conform::fpsMeterStalled("));
-    const int resetAt = idle.indexOf(QStringLiteral("m_playbackFpsEmaFrameMs = 0.0;"));
-    ASSERT_TRUE(guardAt >= 0);
-    ASSERT_TRUE(resetAt > guardAt); // the reset sits inside the guarded block, not before it
-    ASSERT_TRUE(idle.contains(QStringLiteral("!ui->actionPlay->isChecked()")));
-}

@@ -689,6 +689,21 @@ static inline void agx_store_float_triplet_fast(const double out_r,
 #define M_PI 3.14159265358979323846 /* pi */
 #endif
 
+/* Test seams (LOOK-ASSIST-GUI-FREEZE-1): call counts, not timings. Declared
+ * before processing.c because that file is #included below. */
+static unsigned long g_processing_full_init_count = 0;
+static unsigned long g_processing_final_matrix_print_count = 0;
+
+unsigned long processingDebugFullInitCount(void)
+{
+    return __atomic_load_n(&g_processing_full_init_count, __ATOMIC_RELAXED);
+}
+
+unsigned long processingDebugFinalMatrixPrintCount(void)
+{
+    return __atomic_load_n(&g_processing_final_matrix_print_count, __ATOMIC_RELAXED);
+}
+
 /* Because why compile a whole .o just for this? */
 #include "processing.c"
 /* Default image profiles */
@@ -1066,12 +1081,12 @@ static int ensure_sharpen_mask_scratch(processingObject_t * processing, size_t p
 }
 
 
-processingObject_t * initProcessingObject()
+/* Allocation half of initProcessingObject: the object and every buffer it owns,
+ * without the default setters. processingCloneForAnalysisOnce uses it alone,
+ * because it overwrites all the setter output from its source anyway. */
+static processingObject_t * alloc_processing_object_buffers(void)
 {
     processingObject_t * processing = calloc( 1, sizeof(processingObject_t) );
-
-    processing->exr_mode = 0;
-    processing->AgX = 1;
 
     processing->filter = initFilterObject();
 
@@ -1132,6 +1147,18 @@ processingObject_t * initProcessingObject()
     processing->x_variable.address = &processing->x_value;
     processing->x_variable.name = "x";
     processing->x_variable.context = 0;
+
+    return processing;
+}
+
+
+processingObject_t * initProcessingObject()
+{
+    __atomic_fetch_add(&g_processing_full_init_count, 1, __ATOMIC_RELAXED);
+    processingObject_t * processing = alloc_processing_object_buffers();
+
+    processing->exr_mode = 0;
+    processing->AgX = 1;
 
     /* Gradient */
     processing->gradient_exposure_stops = 0.0;
@@ -5429,7 +5456,13 @@ static processingObject_t * processingCloneForAnalysisOnce(const processingObjec
         return NULL;
     }
 
-    processingObject_t * clone = initProcessingObject();
+    /* The default setters in initProcessingObject (about 15 tinyexpr gamma-table
+     * builds) are overwritten below by *clone = *src, so only allocate. Exception:
+     * a source with no transfer function string leaves the clone with the default
+     * one that init compiles, so that case keeps the full init. */
+    processingObject_t * clone = src->transfer_function_string
+                               ? alloc_processing_object_buffers()
+                               : initProcessingObject();
     if (!clone)
     {
         return NULL;

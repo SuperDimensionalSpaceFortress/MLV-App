@@ -141,6 +141,10 @@ typedef struct
      * at llrawproc.c also short-circuits the per-frame fast-path. */
     int diso_playback_force_disable_alias_map;
     double playback_pre_dualiso_fix_ms;
+    /* 1 when the pre-dual-ISO fix pass ran to its stop_before_dual_iso return for the current frame; reset with
+     * playback_pre_dualiso_fix_ms. Proof that the pass ran, independent of the timer's resolution (a 1 ms
+     * omp_get_wtime fallback can read a real, fast pass as 0.0 ms). */
+    int playback_pre_dualiso_fix_completed;
     int dark_frame;       // flag for Dark Frame subtraction mode 0 = off, 1 = ext, 2 = int
     dualiso_preview_scratch_t diso_preview_scratch;
     dualiso_full20bit_scratch_t diso_full20bit_scratch;

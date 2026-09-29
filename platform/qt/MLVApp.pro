@@ -369,6 +369,7 @@ HEADERS += MainWindow.h \
            PlaybackConformPolicy.h \
            PlaybackSourceAdvanceTracker.h \
            PlaybackFrameRange.h \
+           PlaybackFpsMeterPolicy.h \
            PlaybackGatePolicy.h \
            Phase3Breadcrumbs.h \
            Phase3Checksums.h \
