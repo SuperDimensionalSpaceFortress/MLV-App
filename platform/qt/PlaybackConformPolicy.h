@@ -162,6 +162,34 @@ inline QString playbackFpsStatusText( double measuredFps,
     return text;
 }
 
+/*! Status-bar fps meter. The interval it smooths is the time between two DRAWS,
+ *  not between two timer polls: the playback timer polls every 8 ms
+ *  (mlvappPlaybackTimerIntervalMs), so most ticks draw nothing, and a meter
+ *  that restarts on every idle tick reads the poll period (~11 ms, "90 fps")
+ *  whatever rate the timeline actually runs at -- under a 24 fps conform too. */
+inline constexpr int kFpsMeterStallMs = 500;
+
+/*! \return true when no draw has happened for long enough that the meter
+ *  should read 0 and restart (paused, stalled, or a fresh clip). */
+inline bool fpsMeterStalled( int msSinceLastDraw )
+{
+    return msSinceLastDraw > kFpsMeterStallMs;
+}
+
+/*! One meter step: fold the interval since the previous draw into the running
+ *  frame-time average. A non-positive interval (same millisecond, clock wrap)
+ *  leaves the average alone; an interval past the stall limit is a restart
+ *  (the average is reseeded from it rather than smoothed into stale data). */
+inline double smoothedFrameMs( double emaFrameMs, int msSinceLastDraw )
+{
+    if( msSinceLastDraw <= 0 ) return emaFrameMs;
+    if( emaFrameMs <= 0.0 || fpsMeterStalled( msSinceLastDraw ) )
+    {
+        return static_cast<double>( msSinceLastDraw );
+    }
+    return ( emaFrameMs * 0.9 ) + ( static_cast<double>( msSinceLastDraw ) * 0.1 );
+}
+
 /*! Result of one elapsed-time pacing step (see applyEarlyCredit()). */
 struct ElapsedCredit
 {
