@@ -772,13 +772,18 @@ function Save-AttrCudaCommittedBlobBytes {
 # CUDA-S4-TEXTURE-ROUTE-CLAMP-1 round 2: added gui-smoke-gpu-texture-route-validation.ps1 --
 # run-release-gui-smoke.ps1 dot-sources it (~:93) but round 1 never staged it, so the same
 # closure-completeness tests caught the same gap the same way, again.
+#
+# UM-DISPLAY-SELECT-AND-LOG-1 round 3: added gui-smoke-display-identity.ps1 -- the ONE parser for
+# the app's gui_smoke.display_screen/display_target/window_placement lines, dot-sourced by the
+# runner and embedded verbatim into the attribution job (see that file's header).
 $script:AttrCudaSmokeRunnerClosureManifest = @(
     'tools/profiling/run-release-gui-smoke.ps1',
     'tools/profiling/gui-smoke-screenshot-provenance.ps1',
     'tools/profiling/provenance-stamp.ps1',
     'tools/profiling/gui-smoke-process-boundary.psm1',
     'tools/profiling/gui-smoke-color-artifact-scan.ps1',
-    'tools/profiling/gui-smoke-gpu-texture-route-validation.ps1'
+    'tools/profiling/gui-smoke-gpu-texture-route-validation.ps1',
+    'tools/profiling/gui-smoke-display-identity.ps1'
 )
 
 function Get-AttrCudaSmokeRunnerClosureManifest {
@@ -1092,7 +1097,22 @@ $script:AttrCudaClosureScanExclusions = @(
             '$startInfo.FileName is set to $exe, the built app path resolved before this line, ' +
             'never a $PSScriptRoot sibling script. Process.Start executes an OS binary directly; ' +
             'it does not load or run PowerShell/.NET code from a file this census needs to see ' +
-            '(round 4, fable round-3 minor, PR #144).'
+            '(round 4, fable round-3 minor, PR #144). UM-DISPLAY-SELECT-AND-LOG-1 round 4 (fable ' +
+            'BLOCKER 1): the runner''s --display-prefer feature probe, ' +
+            'Test-GuiSmokeDisplayPreferSupport, launches through the identical literal -- its ' +
+            '$startInfo.FileName is the same pinned application executable ($ExePath is passed ' +
+            '$exe), run with `--gui-smoke-playback --help` under a hard timeout and killed by pid. ' +
+            'It replaced a bare `& $exe --help 2>&1` site whose own exclusion was deleted with it.'
+    },
+    [pscustomobject]@{
+        repoRelativePath = 'tools/profiling/run-release-gui-smoke.ps1'
+        literal = '& taskkill.exe /PID $probePid /T /F 2>&1'
+        reason = 'UM-DISPLAY-SELECT-AND-LOG-1 round 4 (fable BLOCKER 1): the kill-by-pid of the ' +
+            '--display-prefer feature probe that outlived its timeout (Test-GuiSmokeDisplayPreferSupport). ' +
+            'taskkill.exe is the Windows system binary, named bare and resolved by the OS -- never ' +
+            'a $PSScriptRoot sibling script -- and its only argument is the numeric pid Process.Start ' +
+            'returned for the probe. It loads and runs no PowerShell/.NET code from a file this ' +
+            'census needs to see.'
     }
 )
 
@@ -2755,6 +2775,456 @@ function Get-AttrCudaPresentMonDisplayReport {
         windowStartMs = $headlineBuild.windowStartMs
         windowEndMs = $headlineBuild.windowEndMs
     }
+}
+
+function Get-AttrCudaQuiescenceSample {
+    <#
+    .SYNOPSIS
+    One venue-quiescence sample: BOTH the legacy Win32_Processor.LoadPercentage (utility, kept
+    for continuity) and the \Processor(_Total)\% Processor Time counter (busy TIME, the gating
+    metric) -- never only the first.
+    .DESCRIPTION
+    UM-DISPLAY-SELECT-AND-LOG-1 round 2b. LoadPercentage is frequency-scaled processor UTILITY,
+    not busy time: a hub probe on Ultra-Magnus (2026-09-26T15:51Z, same ~26s window) read
+    LoadPercentage at 73/82/83 while \Processor(_Total)\% Processor Time read 21.4/43.2/37 on the
+    same i9-13900KS -- turbo inflates the former, so gating on it refused three legs at 58-83%
+    while actual busy time was ~15-40%. Both are still recorded (utilityPercent is diagnostic
+    context, never the gate), but timePercent is the one a caller compares to a threshold.
+    .OUTPUTS
+    [pscustomobject] with utilityPercent (double, $null if Win32_Processor could not be read),
+    timePercent (double, $null if the counter could not be read) and timePercentError (the
+    exception's bare type name, sanitized, when timePercent is $null; $null otherwise). Third
+    state, never folded into either number: a caller that finds timePercent -eq $null must treat
+    the whole sample as UNKNOWN, never as "0% busy".
+    #>
+    [CmdletBinding()]
+    param()
+
+    $utilityPercent = $null
+    try {
+        $utilityPercent = [double](Get-CimInstance Win32_Processor -ErrorAction Stop |
+            Measure-Object -Property LoadPercentage -Average).Average
+    } catch {
+        $utilityPercent = $null
+    }
+
+    $timePercent = $null
+    $timePercentError = $null
+    try {
+        $counter = Get-Counter -Counter '\Processor(_Total)\% Processor Time' -ErrorAction Stop
+        $sample = $counter.CounterSamples[0]
+        # UM-DISPLAY-SELECT-AND-LOG-1 round 1c (sol BLOCKER 4 / opus design-review hardening):
+        # validate the RAW sample BEFORE any cast. [double]$null casts to 0, so an unread/null
+        # CookedValue used to silently pass as "0% busy" (a caller compares timePercent to a
+        # threshold and would then never refuse). Status is PDH's own signal that the value is
+        # trustworthy -- 0 (VALID_DATA) or 1 (NEW_DATA); anything else is an unread sample, never a
+        # "0% busy" one. Round 3 (sol hardening): an ABSENT Status is no longer accepted as valid --
+        # a real PDH CounterSample always carries one, so a sample without it cannot be vouched for.
+        # A finite range check catches NaN/Infinity/out-of-
+        # range CookedValue values that would otherwise cast cleanly and compare as neither
+        # -gt nor -le the threshold.
+        # $sample.Status (not .PSObject.Properties['Status'].Value) throws
+        # PropertyNotFoundException under $ErrorActionPreference='Stop' when the sample object
+        # has no such member at all (this module's own mocks/tests included) -- the property
+        # lookup below never throws for a missing member, it simply returns $null.
+        $statusProp = $sample.PSObject.Properties['Status']
+        $status = if ($statusProp) { $statusProp.Value } else { $null }
+        if ($null -eq $status) {
+            throw [System.InvalidOperationException]::new('counter sample carries no Status')
+        }
+        if ($status -ne 0 -and $status -ne 1) {
+            throw [System.InvalidOperationException]::new("counter sample status $status is not valid")
+        }
+        if ($null -eq $sample.CookedValue) {
+            throw [System.InvalidOperationException]::new('counter sample CookedValue is null')
+        }
+        $cooked = [double]$sample.CookedValue
+        if (-not [double]::IsFinite($cooked) -or $cooked -lt 0.0 -or $cooked -gt 100.0) {
+            throw [System.InvalidOperationException]::new("counter sample CookedValue $cooked is out of range")
+        }
+        $timePercent = $cooked
+    } catch {
+        $timePercent = $null
+        $timePercentError = $_.Exception.GetType().Name
+    }
+
+    [pscustomobject]@{
+        utilityPercent = $utilityPercent
+        timePercent = $timePercent
+        timePercentError = $timePercentError
+    }
+}
+
+function Get-AttrCudaProcessCpuSnapshot {
+    <#
+    .SYNOPSIS
+    {Id, Name, cpuSeconds} for every readable process right now, for Get-AttrCudaTopCpuProcesses.
+    .DESCRIPTION
+    A process that disappears, or whose CPU time is momentarily unreadable, is dropped from the
+    snapshot rather than failing the whole collection -- this is evidentiary (which process was
+    busy), never the gate itself, so a single throwing process must not take the sample down.
+    #>
+    [CmdletBinding()]
+    param()
+
+    $rows = @()
+    try {
+        $procs = Get-Process -ErrorAction Stop
+    } catch {
+        return $rows
+    }
+    foreach ($p in $procs) {
+        try {
+            if ($null -eq $p.TotalProcessorTime) { continue }
+            $rows += [pscustomobject]@{
+                id = $p.Id
+                name = $p.Name
+                cpuSeconds = $p.TotalProcessorTime.TotalSeconds
+            }
+        } catch {
+            continue
+        }
+    }
+    $rows
+}
+
+function Get-AttrCudaTopCpuProcesses {
+    <#
+    .SYNOPSIS
+    Top -Count processes by CPU-SECONDS CONSUMED between two Get-AttrCudaProcessCpuSnapshot calls
+    (never a point-in-time percentage), published as venue-quiescence evidence on both the pass
+    and refusal paths.
+    .DESCRIPTION
+    UM-DISPLAY-SELECT-AND-LOG-1 round 2b: the hub probe that found LoadPercentage's turbo-
+    inflation also found vmware-vmx (the board VM, which runs OTHER projects' builds) as the top
+    CPU consumer over the same window -- callers are expected to annotate that name specially
+    (see -VmProcessName), but this function itself makes no policy decision, only the ranking.
+    A process present in only one snapshot (started or exited mid-window) contributes nothing --
+    matched by Id, so PID reuse across the window cannot merge two different processes' time.
+    .OUTPUTS
+    Up to -Count [pscustomobject] rows, each {name, pid, cpuSeconds, note}, sorted by cpuSeconds
+    descending. note is $null except for -VmProcessName's exact name match (case-insensitive).
+    #>
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $true)]
+        [AllowEmptyCollection()]
+        [object[]]$Before,
+
+        [Parameter(Mandatory = $true)]
+        [AllowEmptyCollection()]
+        [object[]]$After,
+
+        [int]$Count = 10,
+
+        [string]$VmProcessName = 'vmware-vmx'
+    )
+
+    $beforeById = @{}
+    foreach ($p in $Before) { $beforeById[[int]$p.id] = $p }
+
+    $deltas = @()
+    foreach ($p in $After) {
+        $prior = $beforeById[[int]$p.id]
+        if ($null -eq $prior) { continue }
+        $delta = [double]$p.cpuSeconds - [double]$prior.cpuSeconds
+        if ($delta -le 0) { continue }
+        $deltas += [pscustomobject]@{
+            name = $p.name
+            pid = $p.id
+            cpuSeconds = [math]::Round($delta, 3)
+            note = $(if ($p.name -ieq $VmProcessName) { 'board VM (other projects can build here)' } else { $null })
+        }
+    }
+    $deltas | Sort-Object -Property cpuSeconds -Descending | Select-Object -First $Count
+}
+
+function Get-AttrCudaWindowsDisplayInventory {
+    <#
+    .SYNOPSIS
+    The Windows view of every active display, independent of Qt: EnumDisplayDevices (adapter
+    name, adapter string, monitor friendly name, primary flag) and EnumDisplaySettings's CURRENT
+    mode (width, height, refresh, bits) for each one -- UM-DISPLAY-SELECT-AND-LOG-1 item 2.
+    .DESCRIPTION
+    Ultra-Magnus's primary display is an LG TV through a Denon AVR, both at 4K when on; when the
+    TV is off the primary falls back to the Denon's headless output at a DEGRADED resolution
+    (evidence: a 2026-09-26 probe recorded "2x 2560x1440"). This is the ground truth a caller
+    compares the app's own QScreen inventory against, so a leg that silently benchmarked the
+    degraded fallback is provable independent of what the app itself reported.
+    Read-only: never calls ChangeDisplaySettings or any SPI_SET* -- enumeration only.
+    .OUTPUTS
+    [pscustomobject] { collected (bool); devices (array of {deviceName, adapterString,
+    monitorName, isPrimary, modeCollected, width, height, refreshHz, bitsPerPixel}); error (the
+    exception's bare type name, sanitized, when collected is $false) }. Third state: collected
+    -eq $false means NOTHING here is trustworthy -- a caller must treat the whole inventory as
+    unknown, never as "zero displays". A single adapter's mode failing to read (modeCollected
+    -eq $false) does not fail the rest of the inventory -- that adapter's width/height/refreshHz/
+    bitsPerPixel are $null, its own third state.
+    #>
+    [CmdletBinding()]
+    param()
+
+    $result = [ordered]@{ collected = $false; devices = @(); error = $null }
+    try {
+        if (-not ("AttrCudaNativeDisplay" -as [type])) {
+            Add-Type -TypeDefinition @"
+                using System;
+                using System.Runtime.InteropServices;
+
+                [StructLayout(LayoutKind.Sequential, CharSet = CharSet.Unicode)]
+                public struct AttrCudaDisplayDevice
+                {
+                    public int cb;
+                    [MarshalAs(UnmanagedType.ByValTStr, SizeConst = 32)]
+                    public string DeviceName;
+                    [MarshalAs(UnmanagedType.ByValTStr, SizeConst = 128)]
+                    public string DeviceString;
+                    public int StateFlags;
+                    [MarshalAs(UnmanagedType.ByValTStr, SizeConst = 128)]
+                    public string DeviceID;
+                    [MarshalAs(UnmanagedType.ByValTStr, SizeConst = 128)]
+                    public string DeviceKey;
+                }
+
+                [StructLayout(LayoutKind.Sequential, CharSet = CharSet.Unicode)]
+                public struct AttrCudaDevMode
+                {
+                    [MarshalAs(UnmanagedType.ByValTStr, SizeConst = 32)]
+                    public string dmDeviceName;
+                    public short dmSpecVersion;
+                    public short dmDriverVersion;
+                    public short dmSize;
+                    public short dmDriverExtra;
+                    public int dmFields;
+                    public int dmPositionX;
+                    public int dmPositionY;
+                    public int dmDisplayOrientation;
+                    public int dmDisplayFixedOutput;
+                    public short dmColor;
+                    public short dmDuplex;
+                    public short dmYResolution;
+                    public short dmTTOption;
+                    public short dmCollate;
+                    [MarshalAs(UnmanagedType.ByValTStr, SizeConst = 32)]
+                    public string dmFormName;
+                    public short dmLogPixels;
+                    public int dmBitsPerPel;
+                    public int dmPelsWidth;
+                    public int dmPelsHeight;
+                    public int dmDisplayFlags;
+                    public int dmDisplayFrequency;
+                    public int dmICMMethod;
+                    public int dmICMIntent;
+                    public int dmMediaType;
+                    public int dmDitherType;
+                    public int dmReserved1;
+                    public int dmReserved2;
+                    public int dmPanningWidth;
+                    public int dmPanningHeight;
+                }
+
+                public static class AttrCudaNativeDisplay
+                {
+                    // Two overloads, deliberately: PowerShell's $null binds to a P/Invoke
+                    // 'string' parameter as an EMPTY string, not a true NULL pointer -- and
+                    // EnumDisplayDevices treats lpDevice="" as "no such adapter" (returns
+                    // false immediately), not as "enumerate adapters" (lpDevice=NULL). The
+                    // adapter-enumeration call below always passes IntPtr.Zero through the
+                    // first overload; every other call passes a real device name string
+                    // through the second.
+                    [DllImport("user32.dll", EntryPoint = "EnumDisplayDevicesW", SetLastError = true)]
+                    public static extern bool EnumDisplayDevices(IntPtr lpDevice, uint iDevNum, ref AttrCudaDisplayDevice lpDisplayDevice, uint dwFlags);
+
+                    [DllImport("user32.dll", EntryPoint = "EnumDisplayDevicesW", SetLastError = true, CharSet = CharSet.Unicode)]
+                    public static extern bool EnumDisplayDevicesNamed(string lpDevice, uint iDevNum, ref AttrCudaDisplayDevice lpDisplayDevice, uint dwFlags);
+
+                    [DllImport("user32.dll", EntryPoint = "EnumDisplaySettingsW", SetLastError = true, CharSet = CharSet.Unicode)]
+                    public static extern bool EnumDisplaySettings(string lpszDeviceName, int iModeNum, ref AttrCudaDevMode lpDevMode);
+                }
+"@
+        }
+
+        # ATTACHED_TO_DESKTOP = 0x1, PRIMARY_DEVICE = 0x4 -- read-only enumeration flags, not
+        # ChangeDisplaySettings/SPI_SET* (this function never mutates display state).
+        $attachedFlag = 0x1
+        $primaryFlag = 0x4
+        $currentSettingsMode = -1
+        $devices = New-Object System.Collections.Generic.List[object]
+        $adapterIndex = 0
+        while ($true) {
+            $adapter = New-Object AttrCudaDisplayDevice
+            $adapter.cb = [System.Runtime.InteropServices.Marshal]::SizeOf($adapter)
+            $adapterOk = [AttrCudaNativeDisplay]::EnumDisplayDevices([IntPtr]::Zero, $adapterIndex, [ref]$adapter, 0)
+            if (-not $adapterOk) { break }
+            $adapterIndex++
+            if (($adapter.StateFlags -band $attachedFlag) -eq 0) { continue }
+
+            $monitorName = $null
+            $monitor = New-Object AttrCudaDisplayDevice
+            $monitor.cb = [System.Runtime.InteropServices.Marshal]::SizeOf($monitor)
+            if ([AttrCudaNativeDisplay]::EnumDisplayDevicesNamed($adapter.DeviceName, 0, [ref]$monitor, 0)) {
+                if (-not [string]::IsNullOrWhiteSpace($monitor.DeviceString)) {
+                    $monitorName = $monitor.DeviceString
+                }
+            }
+
+            $mode = New-Object AttrCudaDevMode
+            $mode.dmSize = [System.Runtime.InteropServices.Marshal]::SizeOf($mode)
+            $modeOk = [AttrCudaNativeDisplay]::EnumDisplaySettings($adapter.DeviceName, $currentSettingsMode, [ref]$mode)
+
+            $devices.Add([pscustomobject]@{
+                deviceName = $adapter.DeviceName
+                adapterString = $adapter.DeviceString
+                monitorName = $monitorName
+                isPrimary = (($adapter.StateFlags -band $primaryFlag) -ne 0)
+                modeCollected = $modeOk
+                width = $(if ($modeOk) { $mode.dmPelsWidth } else { $null })
+                height = $(if ($modeOk) { $mode.dmPelsHeight } else { $null })
+                refreshHz = $(if ($modeOk) { $mode.dmDisplayFrequency } else { $null })
+                bitsPerPixel = $(if ($modeOk) { $mode.dmBitsPerPel } else { $null })
+            })
+        }
+
+        $result.collected = $true
+        # .ToArray(), never @($devices): wrapping a List[object] directly in the array
+        # subexpression operator throws "Argument types do not match" -- measured on both
+        # Windows PowerShell 5.1 and pwsh 7 in this environment -- so the List's own ToArray()
+        # is used instead of relying on @()'s enumeration of a generic List.
+        $result.devices = $devices.ToArray()
+    } catch {
+        $result.collected = $false
+        $result.devices = @()
+        $result.error = $_.Exception.GetType().Name
+    }
+
+    [pscustomobject]$result
+}
+
+function Get-AttrCudaMeasurementVenue {
+    <#
+    .SYNOPSIS
+    Which display-expectation venue this leg is running in -- UM-DISPLAY-SELECT-AND-LOG-1 item 2.
+    .DESCRIPTION
+    Only 'ultra-magnus' carries a known expected resolution (the owner's LG-TV/Denon-AVR rig,
+    4K when the TV is on -- see .claude-state/project-memory/
+    um-display-topology-lg-tv-denon-fallback-20260926.md). No display resolution for any other
+    host (Bachelor included) is pinned anywhere in this repo, so every other name -- Bachelor's
+    own included -- returns 'bachelor': record the display identity and mode, assert nothing.
+    -ComputerName defaults to $env:COMPUTERNAME (the real host at run time); a caller overrides it
+    to test the classification without touching the process environment.
+    .OUTPUTS
+    'ultra-magnus' or 'bachelor' (string).
+    #>
+    [CmdletBinding()]
+    param([string]$ComputerName = $env:COMPUTERNAME)
+
+    if ($ComputerName -and $ComputerName -match '(?i)ultra.?magnus') { return 'ultra-magnus' }
+    return 'bachelor'
+}
+
+function Resolve-AttrCudaPreferredDisplay {
+    <#
+    .SYNOPSIS
+    Maps the venue's preferred monitor NAME (as Windows reports it, e.g. 'ASUS PA329C') to the
+    GDI device name (\\.\DISPLAYn) the app can match exactly -- UM-DISPLAY-SELECT-AND-LOG-1
+    round 2 (sol PRE-REVIEW #2 BLOCKER a).
+    .DESCRIPTION
+    Qt on Windows reports QScreen::name() as the GDI device name and, on the measured UM
+    topology, an empty model/manufacturer, so a monitor-name substring ('PA329C') matches neither
+    field and the preference silently vanishes (the refresh tie then falls to the primary -- the
+    Denon/LG). The Windows inventory already pairs each deviceName with its monitorName, so the
+    job resolves the pair here and hands the app the device name. Statuses (recorded, never
+    gated): 'mapped' (exactly one device's monitorName contains the substring, case-insensitive;
+    argument = its deviceName), 'ambiguous' (two or more), 'absent' (none), 'unknown' (the
+    inventory itself is unreadable), 'none' (no preference configured). In every non-mapped case
+    argument stays the original substring, so the app's own name/model/manufacturer match remains
+    the fallback rather than the preference being dropped.
+    .OUTPUTS
+    [pscustomobject] { argument; status; deviceName; monitorName; matches (int) }.
+    #>
+    [CmdletBinding()]
+    param($WindowsInventory, [string]$Substring)
+
+    $result = [ordered]@{ argument = $Substring; status = 'none'; deviceName = $null; monitorName = $null; matches = 0 }
+    if ([string]::IsNullOrWhiteSpace($Substring)) { $result.argument = ''; return [pscustomobject]$result }
+    if ($null -eq $WindowsInventory -or -not $WindowsInventory.collected) {
+        $result.status = 'unknown'
+        return [pscustomobject]$result
+    }
+    $found = @($WindowsInventory.devices | Where-Object {
+        $_.deviceName -and $_.monitorName -and ([string]$_.monitorName).IndexOf($Substring, [StringComparison]::OrdinalIgnoreCase) -ge 0
+    })
+    $result.matches = $found.Count
+    if ($found.Count -eq 1) {
+        $result.status = 'mapped'
+        $result.argument = [string]$found[0].deviceName
+        $result.deviceName = [string]$found[0].deviceName
+        $result.monitorName = [string]$found[0].monitorName
+    } elseif ($found.Count -gt 1) {
+        $result.status = 'ambiguous'
+    } else {
+        $result.status = 'absent'
+    }
+    return [pscustomobject]$result
+}
+
+function Get-AttrCudaDisplayDegradedState {
+    <#
+    .SYNOPSIS
+    Three-state degraded verdict for the chosen display target vs this venue's expectation.
+    .DESCRIPTION
+    UM-DISPLAY-SELECT-AND-LOG-1 item 3: a leg on a degraded display is RECORDED, never gated, but
+    it must never be silently reported as "not degraded" when it is really "cannot tell". Returns
+    'unknown' (string) whenever a verdict cannot be asserted either way -- no expected resolution
+    for this venue (ExpectedWidth/Height $null, e.g. Bachelor), the target's own width/height
+    could not be read, OR (round 1c, sol BLOCKER 2 / opus design-review hardening) the INDEPENDENT
+    Windows-API inventory this verdict is meant to be cross-checked against was itself unreadable
+    -- -WindowsCollected $false (Get-AttrCudaWindowsDisplayInventory threw) or
+    -WindowsAnyModeCollected $false (it returned collected=true but zero devices, or every device
+    had modeCollected=false, e.g. the headless/Session-0 contexts this fleet has hit before) both
+    make the verdict unknown, never "not degraded" purely on the app's own Qt-reported size. Both
+    parameters default to $true so an existing caller that has already established the Windows
+    inventory is trustworthy (or is testing the target-vs-expected comparison in isolation) is
+    unaffected. Never averages or guesses through a $null.
+    .OUTPUTS
+    'unknown', or a [bool] (true = degraded: target narrower or shorter than expected).
+    #>
+    [CmdletBinding()]
+    param($TargetWidth, $TargetHeight, $ExpectedWidth, $ExpectedHeight,
+          [bool]$WindowsCollected = $true, [bool]$WindowsAnyModeCollected = $true)
+
+    if (-not $WindowsCollected) { return 'unknown' }
+    if (-not $WindowsAnyModeCollected) { return 'unknown' }
+    if ($null -eq $ExpectedWidth -or $null -eq $ExpectedHeight) { return 'unknown' }
+    if ($null -eq $TargetWidth -or $null -eq $TargetHeight) { return 'unknown' }
+    return [bool]($TargetWidth -lt $ExpectedWidth -or $TargetHeight -lt $ExpectedHeight)
+}
+
+function Get-AttrCudaGuiSmokeDisplaySelection {
+    <#
+    .SYNOPSIS
+    Parses the app's own gui_smoke.display_screen / display_target / window_placement lines
+    (MainWindow.cpp, UM-DISPLAY-SELECT-AND-LOG-1) out of a smoke run's raw log text.
+    .DESCRIPTION
+    A THIN DELEGATE (round 3, binding design-review item opus-blocker-1): the one parser is
+    ConvertFrom-GuiSmokeDisplayLog in tools/profiling/gui-smoke-display-identity.ps1, which the
+    smoke runner also dot-sources -- so the job and the runner cannot publish two different
+    identities for one leg. In an emitted job that function is already embedded (from the same
+    committed bytes the smoke-runner closure stages), so Get-Command finds it; imported as a
+    module (the tests, the generators) it is dot-sourced from the checkout, once per call.
+    See ConvertFrom-GuiSmokeDisplayLog for the returned shape and the parsing rule.
+    #>
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $true)]
+        [AllowEmptyString()]
+        [string]$LogText
+    )
+
+    if (-not (Get-Command ConvertFrom-GuiSmokeDisplayLog -CommandType Function -ErrorAction SilentlyContinue)) {
+        . (Join-Path $PSScriptRoot '..\gui-smoke-display-identity.ps1')
+    }
+    ConvertFrom-GuiSmokeDisplayLog -LogText $LogText
 }
 
 # CUDA-PERF-DISPLAY-WAKE-1. OWNER (2026-09-25): "if display is asleep just wake it. its just the
@@ -4456,4 +4926,12 @@ Export-ModuleMember -Function `
     Stop-AttrCudaDisplayWake, `
     Start-AttrCudaDisplayWakeKeepAlive, `
     Get-AttrCudaDisplayWakeKeepAliveHealth, `
-    Stop-AttrCudaDisplayWakeKeepAlive
+    Stop-AttrCudaDisplayWakeKeepAlive, `
+    Get-AttrCudaQuiescenceSample, `
+    Get-AttrCudaProcessCpuSnapshot, `
+    Get-AttrCudaTopCpuProcesses, `
+    Get-AttrCudaWindowsDisplayInventory, `
+    Get-AttrCudaMeasurementVenue, `
+    Resolve-AttrCudaPreferredDisplay, `
+    Get-AttrCudaDisplayDegradedState, `
+    Get-AttrCudaGuiSmokeDisplaySelection

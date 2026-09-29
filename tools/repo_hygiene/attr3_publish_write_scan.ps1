@@ -59,7 +59,10 @@ if ($ModulePath.Count -eq 0) {
     # the templates' full module-function vocabulary.
     $ModulePath = @(
         (Join-Path $PSScriptRoot '..\profiling\bachelor\AttrCudaArtifacts.psm1'),
-        (Join-Path $PSScriptRoot '..\profiling\bachelor\AttrCudaOwnerFootage.psm1')
+        (Join-Path $PSScriptRoot '..\profiling\bachelor\AttrCudaOwnerFootage.psm1'),
+        # UM-DISPLAY-SELECT-AND-LOG-1 round 3: the shared display-identity parser the job embeds
+        # (ConvertFrom-GuiSmokeDisplayLog / Get-GuiSmokeDisplayIdentity), a pinned closure sibling.
+        (Join-Path $PSScriptRoot '..\profiling\gui-smoke-display-identity.ps1')
     )
 }
 

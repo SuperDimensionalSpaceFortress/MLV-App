@@ -54,6 +54,11 @@ SMOKE_RUNNER_STAGE_GENERATOR = ROOT / "tools" / "profiling" / "bachelor" / "attr
 STAGE_JOB_MODULE = ROOT / "tools" / "profiling" / "bachelor" / "Attr3FootageStageJob.psm1"
 PRESENCE_JOB_MODULE = ROOT / "tools" / "profiling" / "bachelor" / "Attr3FootagePresenceJob.psm1"
 
+# UM-DISPLAY-SELECT-AND-LOG-1 round 3: the shared display-identity parser is a pinned
+# smoke-runner closure sibling AND the job embeds its functions from the committed blob,
+# so a fixture repo must carry its REAL text, not a stand-in.
+_DISPLAY_IDENTITY_TEXT = (Path(__file__).resolve().parents[2] / "tools" / "profiling" / "gui-smoke-display-identity.ps1").read_text(encoding="utf-8")
+
 PWSH = shutil.which("pwsh")
 GIT = shutil.which("git")
 
@@ -210,7 +215,8 @@ def _make_fixture_repo(path: Path) -> list[str]:
         "Import-Module (Join-Path $PSScriptRoot 'gui-smoke-process-boundary.psm1') -Force\n"
         ". (Join-Path $PSScriptRoot 'provenance-stamp.ps1')\n"
         ". (Join-Path $PSScriptRoot 'gui-smoke-color-artifact-scan.ps1')\n"
-        ". (Join-Path $PSScriptRoot 'gui-smoke-gpu-texture-route-validation.ps1')\n",
+        ". (Join-Path $PSScriptRoot 'gui-smoke-gpu-texture-route-validation.ps1')\n"
+        ". (Join-Path $PSScriptRoot 'gui-smoke-display-identity.ps1')\n",
         encoding="utf-8",
     )
     (path / "tools" / "profiling" / "gui-smoke-screenshot-provenance.ps1").write_text(
@@ -228,6 +234,7 @@ def _make_fixture_repo(path: Path) -> list[str]:
     (path / "tools" / "profiling" / "gui-smoke-gpu-texture-route-validation.ps1").write_text(
         "# fixture stand-in sibling (dot-sourced directly by the runner)\n", encoding="utf-8"
     )
+    (path / "tools" / "profiling" / "gui-smoke-display-identity.ps1").write_text(_DISPLAY_IDENTITY_TEXT, encoding="utf-8")
     # CUDA-PLAYBACK-CONTACT-SHEET-1 r1b: the attribution generator also resolves this path's
     # committed blob unconditionally (to embed it in the emitted job for the contact-sheet
     # compose step), same reason as the smoke-runner closure comment above -- every test that
@@ -1125,6 +1132,63 @@ class AttributionJobDisablePaintPerSubmitTests(_PwshCase):
     # ever runs. The substring checks above already exercise the real generator end to end (not
     # a copy of its logic) and pin both the substitution and the per-arm env-var membership this
     # bug needed; that is the regression coverage for this defect class.
+
+
+@requires_pwsh
+@requires_git
+class DisplayIdentityEmbedsFromCommittedBlobTests(_PwshCase):
+    """UM-DISPLAY-SELECT-AND-LOG-1 round 4 (fable DISPLAY-IDENTITY-EMBED-FROM-BLOB-TEST-1).
+
+    The emitted job embeds the shared display-identity parser from its COMMITTED bytes at
+    -SourceCommit -- the bytes the smoke-runner closure stages -- never the generator's working
+    tree. The generator runs against a throwaway repo whose committed parser is the real file and
+    whose WORKING-TREE copy is then edited without committing; the emitted job must carry the
+    committed text and none of the edit."""
+
+    MARKER = "WORKING_TREE_ONLY_MARKER_4F1C"
+
+    def setUp(self) -> None:
+        super().setUp()
+        self.repo = self.tmp / "repo"
+        self.shas = _make_fixture_repo(self.repo)
+        self.staging = self.tmp / "staging"
+        self.staging.mkdir()
+
+    def _generate(self) -> str:
+        out_file = self.staging / "job.ps1"
+        script = self.tmp / "generate.ps1"
+        script.write_text(
+            "$ErrorActionPreference = 'Stop'\n"
+            f"& '{ATTRIBUTION_GENERATOR}' -SourceCommit '{self.shas[1]}' "
+            f"-BuildManifestSha256 '{'a' * 64}' -ClipId 'tiny_dual_iso' "
+            f"-FixtureSha256 '{'b' * 64}' -OutFile '{out_file}' -RepoRoot '{self.repo}'\n",
+            encoding="utf-8",
+        )
+        proc = _run_pwsh_file(script)
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        return out_file.read_text(encoding="utf-8")
+
+    def test_the_job_embeds_the_committed_parser_not_the_working_tree(self) -> None:
+        # MUTATION CAUGHT: extracting from `Join-Path $RepoRoot 'tools/profiling/gui-smoke-
+        # display-identity.ps1'` (the working tree) instead of the blob at -SourceCommit.
+        baseline = self._generate()
+        for name in ("ConvertFrom-GuiSmokeLogFields", "ConvertFrom-GuiSmokeDisplayLog",
+                     "Get-GuiSmokeDisplayIdentity", "Find-GuiSmokeDisplayScreen"):
+            with self.subTest(embedded=name):
+                self.assertIn(f"function {name} {{", baseline)
+        self.assertNotIn(self.MARKER, baseline)
+
+        shared = self.repo / "tools" / "profiling" / "gui-smoke-display-identity.ps1"
+        text = shared.read_bytes().decode("utf-8")
+        anchor = "function Get-GuiSmokeDisplayIdentity {"
+        self.assertIn(anchor, text.replace("\r\n", "\n"))
+        edited = text.replace("\r\n", "\n").replace(anchor, anchor + f"\n    # {self.MARKER}", 1)
+        shared.write_bytes(edited.encode("utf-8"))  # working tree only -- deliberately NOT committed
+        self.addCleanup(lambda: shared.write_bytes(text.encode("utf-8")))
+
+        job_text = self._generate()
+        self.assertNotIn(self.MARKER, job_text)
+        self.assertIn(f"function Get-GuiSmokeDisplayIdentity {{", job_text)
 
 
 @requires_pwsh
@@ -2548,6 +2612,7 @@ SMOKE_RUNNER_CLOSURE_NAMES = (
     "gui-smoke-process-boundary.psm1",
     "gui-smoke-color-artifact-scan.ps1",
     "gui-smoke-gpu-texture-route-validation.ps1",
+    "gui-smoke-display-identity.ps1",
 )
 
 
@@ -2556,7 +2621,7 @@ class SmokeRunnerClosureManifestTests(_PwshCase):
     """Get-AttrCudaSmokeRunnerClosureManifest: the EXPLICIT, pinned list that replaced discovery
     (ATTR3-SMOKE-RUNNER-DEPS-1 round 3, NARROW BY REDESIGN)."""
 
-    def test_the_manifest_is_the_six_pinned_repo_relative_paths_in_order(self) -> None:
+    def test_the_manifest_is_the_seven_pinned_repo_relative_paths_in_order(self) -> None:
         proc = self.run_with_module(
             "Get-AttrCudaSmokeRunnerClosureManifest | ForEach-Object { Write-Output \"PATH=$_\" }\n"
         )
@@ -2571,6 +2636,7 @@ class SmokeRunnerClosureManifestTests(_PwshCase):
                 "tools/profiling/gui-smoke-process-boundary.psm1",
                 "tools/profiling/gui-smoke-color-artifact-scan.ps1",
                 "tools/profiling/gui-smoke-gpu-texture-route-validation.ps1",
+                "tools/profiling/gui-smoke-display-identity.ps1",
             ],
         )
 
@@ -2682,6 +2748,7 @@ class ClosureCompletenessTests(_PwshCase):
             "provenance-stamp.ps1",
             "gui-smoke-color-artifact-scan.ps1",
             "gui-smoke-gpu-texture-route-validation.ps1",
+            "gui-smoke-display-identity.ps1",
         ):
             (path / "tools" / "profiling" / sibling).write_text(f"# {sibling} stand-in\n", encoding="utf-8")
         (path / "tools" / "profiling" / "gui-smoke-process-boundary.psm1").write_text(
@@ -2707,7 +2774,7 @@ class ClosureCompletenessTests(_PwshCase):
         self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
         self.assertIn("NO_THROW", proc.stdout)
 
-    def test_all_six_pinned_dependency_loads_classify_cleanly(self) -> None:
+    def test_all_pinned_dependency_loads_classify_cleanly(self) -> None:
         repo = self.tmp / "repo"
         runner = (
             ". (Join-Path $PSScriptRoot 'gui-smoke-screenshot-provenance.ps1')\n"
@@ -2715,6 +2782,7 @@ class ClosureCompletenessTests(_PwshCase):
             "Import-Module (Join-Path $PSScriptRoot 'gui-smoke-process-boundary.psm1') -Force\n"
             ". (Join-Path $PSScriptRoot 'gui-smoke-color-artifact-scan.ps1')\n"
             ". (Join-Path $PSScriptRoot 'gui-smoke-gpu-texture-route-validation.ps1')\n"
+            ". (Join-Path $PSScriptRoot 'gui-smoke-display-identity.ps1')\n"
         )
         sha = self._repo_with_runner_text(repo, runner)
         proc = self._assert_complete(repo, sha)
@@ -2831,6 +2899,7 @@ class ClosureCompletenessTests(_PwshCase):
             "Import-Module (Join-Path $PSScriptRoot 'gui-smoke-process-boundary.psm1') -Force\n"
             ". (Join-Path $PSScriptRoot 'gui-smoke-color-artifact-scan.ps1')\n"
             ". (Join-Path $PSScriptRoot 'gui-smoke-gpu-texture-route-validation.ps1')\n"
+            ". (Join-Path $PSScriptRoot 'gui-smoke-display-identity.ps1')\n"
             "function f([scriptblock]$p) { & $p 1 }\n"
         )
         sha = self._repo_with_runner_text(repo, runner)
@@ -2846,6 +2915,7 @@ class ClosureCompletenessTests(_PwshCase):
             "Import-Module (Join-Path $PSScriptRoot 'gui-smoke-process-boundary.psm1') -Force\n"
             ". (Join-Path $PSScriptRoot 'gui-smoke-color-artifact-scan.ps1')\n"
             ". (Join-Path $PSScriptRoot 'gui-smoke-gpu-texture-route-validation.ps1')\n"
+            ". (Join-Path $PSScriptRoot 'gui-smoke-display-identity.ps1')\n"
             "$predicate = { param($x) $x -eq 1 }\n"
             "& $predicate 1\n"
         )
@@ -2878,6 +2948,7 @@ class ClosureCompletenessTests(_PwshCase):
             "Import-Module (Join-Path $PSScriptRoot 'gui-smoke-process-boundary.psm1') -Force\n"
             ". (Join-Path $PSScriptRoot 'gui-smoke-color-artifact-scan.ps1')\n"
             ". (Join-Path $PSScriptRoot 'gui-smoke-gpu-texture-route-validation.ps1')\n"
+            ". (Join-Path $PSScriptRoot 'gui-smoke-display-identity.ps1')\n"
             "Add-Type -AssemblyName System.Drawing\n"
         )
         sha = self._repo_with_runner_text(repo, runner)
@@ -2908,6 +2979,7 @@ class ClosureCompletenessTests(_PwshCase):
             "Import-Module (Join-Path $PSScriptRoot 'gui-smoke-process-boundary.psm1') -Force\n"
             ". (Join-Path $PSScriptRoot 'gui-smoke-color-artifact-scan.ps1')\n"
             ". (Join-Path $PSScriptRoot 'gui-smoke-gpu-texture-route-validation.ps1')\n"
+            ". (Join-Path $PSScriptRoot 'gui-smoke-display-identity.ps1')\n"
             "$detectorPwsh = 'pwsh.exe'\n"
             "$detectorArgs = @()\n"
             "$detectorOut = & $detectorPwsh @detectorArgs 2>&1\n"
@@ -2944,6 +3016,7 @@ class ClosureCompletenessTests(_PwshCase):
             ". (Join-Path $PSScriptRoot 'provenance-stamp.ps1')\n"
             ". (Join-Path $PSScriptRoot 'gui-smoke-color-artifact-scan.ps1')\n"
             ". (Join-Path $PSScriptRoot 'gui-smoke-gpu-texture-route-validation.ps1')\n"
+            ". (Join-Path $PSScriptRoot 'gui-smoke-display-identity.ps1')\n"
             "Microsoft.PowerShell.Core\\Import-Module "
             "(Join-Path $PSScriptRoot 'gui-smoke-process-boundary.psm1') -Force\n"
         )
@@ -3022,6 +3095,7 @@ class ClosureCompletenessTests(_PwshCase):
             "Import-Module (Join-Path $PSScriptRoot 'gui-smoke-process-boundary.psm1') -Force\n"
             ". (Join-Path $PSScriptRoot 'gui-smoke-color-artifact-scan.ps1')\n"
             ". (Join-Path $PSScriptRoot 'gui-smoke-gpu-texture-route-validation.ps1')\n"
+            ". (Join-Path $PSScriptRoot 'gui-smoke-display-identity.ps1')\n"
             "$startInfo = [System.Diagnostics.ProcessStartInfo]::new()\n"
             "$process = [System.Diagnostics.Process]::Start($startInfo)\n"
         )
@@ -3886,6 +3960,15 @@ class PresentMonSpawnFailureTests(_PwshCase):
         end = text.index(end_marker, start)
         return text[start:end]
 
+    def _display_result_tail_function(self) -> str:
+        # UM-DISPLAY-SELECT-AND-LOG-1: the spawn guard's RESULT= line now appends the display tail
+        # too (the pre-smoke, all-unknown display block), so the probe carries the job's REAL
+        # Get-AttrCudaDisplayResultTail extracted verbatim -- never a stand-in.
+        text = ATTRIBUTION_GENERATOR.read_text(encoding="utf-8")
+        start = text.index("function Get-AttrCudaDisplayResultTail")
+        end = text.index("\n}\n", start) + len("\n}\n")
+        return text[start:end]
+
     def _run(self, *, stub: str, present_mon_path: Path) -> tuple[subprocess.CompletedProcess, dict]:
         pub = self.tmp / "pub"
         pub.mkdir()
@@ -3906,6 +3989,8 @@ class PresentMonSpawnFailureTests(_PwshCase):
             "    $Object | ConvertTo-Json -Depth 30 | Set-Content -LiteralPath $Path -Encoding UTF8\n"
             "}\n"
             "function Write-JobTrace([string]$Message) { }\n"
+            "$displayBlock = [ordered]@{ displayDegraded = 'unknown' }\n"
+            + self._display_result_tail_function() + "\n"
             + self._spawn_guard() + "\n"
             "Write-Output 'RESULT=NO_FAILURE_BRANCH_TAKEN'\n",
             encoding="utf-8",
@@ -4557,6 +4642,13 @@ class EmbeddedFunctionContractTests(_PwshCase):
             "Publish-AttrCudaFileMove",
             "New-AttrCudaDirectory",
             "Remove-AttrCudaTree",
+            # UM-DISPLAY-SELECT-AND-LOG-1 round 2b/2: venue-quiescence (CPU busy time, not
+            # utility) and the Windows display inventory, both embedded verbatim like every
+            # other shared function.
+            "Get-AttrCudaQuiescenceSample",
+            "Get-AttrCudaProcessCpuSnapshot",
+            "Get-AttrCudaTopCpuProcesses",
+            "Get-AttrCudaWindowsDisplayInventory",
             "Register-AttrCudaDisplayWakeNativeMethods",
             "Get-AttrCudaScreensaverRunning",
             "Get-AttrCudaScreensaverTimeoutSeconds",
@@ -5380,7 +5472,9 @@ class DisplayWakeJobOrderingTests(unittest.TestCase):
         footage_marker_at = self.text.index(
             "ATTR3-FIXTURE-STAGE-1: a fixture run authenticates the cached clip's CONTENT",
             package_verification_at)
-        quiescence_at = self.text.index("$loads = @()", footage_marker_at)
+        # UM-DISPLAY-SELECT-AND-LOG-1 round 2b: the gate's sample accumulators moved from
+        # `$loads = @()` (LoadPercentage) to `$cpuUtilitySamples = @()` (utility + busy-time pair).
+        quiescence_at = self.text.index("$cpuUtilitySamples = @()", footage_marker_at)
         self.assertGreater(wake_at, embedded_end_at,
                             "the wake must run only after its own functions are embedded")
         self.assertGreater(secure_exit_at, wake_at)

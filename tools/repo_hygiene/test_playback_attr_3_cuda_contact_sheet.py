@@ -28,6 +28,11 @@ import unittest
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[2]
+# UM-DISPLAY-SELECT-AND-LOG-1 round 3: the shared display-identity parser is a pinned
+# smoke-runner closure sibling AND the job embeds its functions from the committed blob,
+# so a fixture repo must carry its REAL text, not a stand-in.
+_DISPLAY_IDENTITY_TEXT = (Path(__file__).resolve().parents[2] / "tools" / "profiling" / "gui-smoke-display-identity.ps1").read_text(encoding="utf-8")
+
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
@@ -75,7 +80,8 @@ def _make_fixture_repo_pre_contact_sheet_card(path: Path) -> list[str]:
         "Import-Module (Join-Path $PSScriptRoot 'gui-smoke-process-boundary.psm1') -Force\n"
         ". (Join-Path $PSScriptRoot 'provenance-stamp.ps1')\n"
         ". (Join-Path $PSScriptRoot 'gui-smoke-color-artifact-scan.ps1')\n"
-        ". (Join-Path $PSScriptRoot 'gui-smoke-gpu-texture-route-validation.ps1')\n",
+        ". (Join-Path $PSScriptRoot 'gui-smoke-gpu-texture-route-validation.ps1')\n"
+        ". (Join-Path $PSScriptRoot 'gui-smoke-display-identity.ps1')\n",
         encoding="utf-8",
     )
     (path / "tools" / "profiling" / "gui-smoke-screenshot-provenance.ps1").write_text(
@@ -93,6 +99,7 @@ def _make_fixture_repo_pre_contact_sheet_card(path: Path) -> list[str]:
     (path / "tools" / "profiling" / "gui-smoke-gpu-texture-route-validation.ps1").write_text(
         "# fixture stand-in sibling (dot-sourced directly by the runner)\n", encoding="utf-8"
     )
+    (path / "tools" / "profiling" / "gui-smoke-display-identity.ps1").write_text(_DISPLAY_IDENTITY_TEXT, encoding="utf-8")
     # Deliberately OMITTED from the first commit: tools/profiling/make-contact-sheet.py.
     shas = []
     for index, text in enumerate(("first", "second")):

@@ -1221,7 +1221,9 @@ class FixtureRehearsalVisibilityTests(unittest.TestCase):
         for artifact in ("summary.json", "provenance.json", "evidence-manifest.json", "artifact-index.json"):
             with self.subTest(artifact=artifact):
                 index = self.template.index(artifact)
-                window = self.template[max(0, index - 3000):index]
+                # window 3000 -> 5000: the evidence manifest grew (PresentMon sufficiency, app-swap
+                # telemetry, cpuQuiescence, display block) between the fixtureRehearsal field and the write.
+                window = self.template[max(0, index - 5000):index]
                 self.assertIn("fixtureRehearsal", window, f"{artifact} is written without the flag nearby")
 
     def test_the_success_path_writes_a_summary_and_a_distinct_result_verb(self) -> None:

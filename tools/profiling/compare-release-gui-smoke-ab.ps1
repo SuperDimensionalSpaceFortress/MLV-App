@@ -506,6 +506,92 @@ function New-DeltaObject {
     }
 }
 
+function Get-DisplayComparability {
+    <#
+    .SYNOPSIS
+    UM-DISPLAY-SELECT-AND-LOG-1 round 1c (sol pre-review BLOCKER 1): whether the before/after
+    GUI-smoke legs are known to have presented on the same display identity and mode -- an
+    FPS comparison between legs that did not (a 4K leg vs a degraded-fallback leg, or two
+    different physical outputs, or an unverified placement on either side) is not meaningful.
+    .DESCRIPTION
+    Third state, never guessed into "same": 'unknown' when either leg's own display block
+    could not be resolved (a legacy binary that predates it, or its window_placement line
+    failed to parse -- reasonCode DISPLAY_IDENTITY_UNKNOWN) or either leg's placement never
+    verified (reasonCode PLACEMENT_UNVERIFIED). 'different' (DISPLAY_MISMATCH) when both are
+    known and verified but disagree on identity or mode. 'same' only when both are known,
+    verified, and agree on presentation screen name, physical size, rounded refresh, DPR,
+    window mode, and preview size.
+    .OUTPUTS
+    [pscustomobject] { status ('same'|'different'|'unknown'); reasonCode (string or $null);
+    before; after }.
+    #>
+    param([object]$BeforeDisplay, [object]$AfterDisplay)
+
+    if ($null -eq $BeforeDisplay -or $null -eq $AfterDisplay -or
+        $BeforeDisplay.identityUnknownReason -or $AfterDisplay.identityUnknownReason) {
+        return [pscustomobject]@{
+            status = 'unknown'; reasonCode = 'DISPLAY_IDENTITY_UNKNOWN'
+            before = $BeforeDisplay; after = $AfterDisplay
+        }
+    }
+    # Round 2 (sol PRE-REVIEW #2 BLOCKER c): identity is name+manufacturer+model+serial. A block
+    # from a runner that predates those fields does not carry the properties at all -- unknown,
+    # never "absent equals absent".
+    foreach ($identityProperty in 'presentationManufacturer', 'presentationModel', 'presentationSerial') {
+        if ($null -eq $BeforeDisplay.PSObject.Properties[$identityProperty] -or
+            $null -eq $AfterDisplay.PSObject.Properties[$identityProperty]) {
+            return [pscustomobject]@{
+                status = 'unknown'; reasonCode = 'DISPLAY_IDENTITY_UNKNOWN'
+                before = $BeforeDisplay; after = $AfterDisplay
+            }
+        }
+    }
+    # Round 4 (sol r1 BLOCKER): a PRESENT-but-empty manufacturer/model/serial is not a known
+    # identity either (Qt reports an empty string for a display with no EDID descriptor). The
+    # shared parser already turns that into identityUnknownReason above; this refuses a block
+    # that reaches the comparator without going through it (hand-built or legacy result.json),
+    # so two empty-EDID legs can never agree on "empty == empty" and compare 'same'.
+    foreach ($identityProperty in 'presentationManufacturer', 'presentationModel', 'presentationSerial') {
+        foreach ($side in @([pscustomobject]@{ name = 'before'; block = $BeforeDisplay },
+                [pscustomobject]@{ name = 'after'; block = $AfterDisplay })) {
+            if ([string]::IsNullOrWhiteSpace([string]$side.block.PSObject.Properties[$identityProperty].Value)) {
+                return [pscustomobject]@{
+                    status = 'unknown'; reasonCode = 'DISPLAY_IDENTITY_UNKNOWN'
+                    detail = "$($side.name) leg has an empty $identityProperty (no EDID descriptor): two displays sharing one device name cannot be told apart"
+                    before = $BeforeDisplay; after = $AfterDisplay
+                }
+            }
+        }
+    }
+    if ($BeforeDisplay.verified -ne $true -or $AfterDisplay.verified -ne $true) {
+        return [pscustomobject]@{
+            status = 'unknown'; reasonCode = 'PLACEMENT_UNVERIFIED'
+            before = $BeforeDisplay; after = $AfterDisplay
+        }
+    }
+    $same = (
+        ([string]$BeforeDisplay.presentationScreenName -eq [string]$AfterDisplay.presentationScreenName) -and
+        ([string]$BeforeDisplay.presentationManufacturer -eq [string]$AfterDisplay.presentationManufacturer) -and
+        ([string]$BeforeDisplay.presentationModel -eq [string]$AfterDisplay.presentationModel) -and
+        ([string]$BeforeDisplay.presentationSerial -eq [string]$AfterDisplay.presentationSerial) -and
+        ($BeforeDisplay.physicalWidth -eq $AfterDisplay.physicalWidth) -and
+        ($BeforeDisplay.physicalHeight -eq $AfterDisplay.physicalHeight) -and
+        ($BeforeDisplay.refreshHzRounded -eq $AfterDisplay.refreshHzRounded) -and
+        ($BeforeDisplay.dpr -eq $AfterDisplay.dpr) -and
+        ([string]$BeforeDisplay.windowMode -eq [string]$AfterDisplay.windowMode) -and
+        ($BeforeDisplay.previewWidth -eq $AfterDisplay.previewWidth) -and
+        ($BeforeDisplay.previewHeight -eq $AfterDisplay.previewHeight)
+    )
+    if ($same) {
+        [pscustomobject]@{ status = 'same'; reasonCode = $null; before = $BeforeDisplay; after = $AfterDisplay }
+    } else {
+        [pscustomobject]@{
+            status = 'different'; reasonCode = 'DISPLAY_MISMATCH'
+            before = $BeforeDisplay; after = $AfterDisplay
+        }
+    }
+}
+
 function New-ValueChangeObject {
     param(
         [object]$BeforeValue,
@@ -874,6 +960,34 @@ $hostLoadComparison = Get-HostLoadComparisonEvidence -BeforeSmoke $beforeSmoke -
 $hostLoadEvidence = $hostLoadComparison.evidence
 $failures += @($hostLoadComparison.failures)
 
+# UM-DISPLAY-SELECT-AND-LOG-1 round 1c (sol pre-review BLOCKER 1): refuse the whole comparison
+# -- never merely note it -- when the two legs are not known to have presented on the same
+# display identity and mode. FAILs closed on 'unknown' exactly like 'different': an unproven
+# match is never treated as a pass.
+$displayComparability = Get-DisplayComparability `
+    -BeforeDisplay (Get-NestedValue $beforeSmoke "display") `
+    -AfterDisplay (Get-NestedValue $afterSmoke "display")
+if ($displayComparability.status -ne 'same') {
+    # Round 4: the refusal says WHY -- the comparator's own detail and each leg's own
+    # identityUnknownReason (e.g. empty EDID fields), never just an opaque reason code.
+    $displayWhy = @()
+    if ($displayComparability.PSObject.Properties['detail'] -and $displayComparability.detail) {
+        $displayWhy += [string]$displayComparability.detail
+    }
+    foreach ($leg in 'before', 'after') {
+        $legBlock = $displayComparability.$leg
+        if ($null -ne $legBlock -and $legBlock.identityUnknownReason) {
+            $displayWhy += "$leg leg: $($legBlock.identityUnknownReason)"
+        }
+    }
+    $failures += (
+        "Display comparability is '$($displayComparability.status)' ($($displayComparability.reasonCode)): " +
+        "the before/after legs are not known to have presented on the same display identity and " +
+        "mode, so an FPS comparison between them is not meaningful." +
+        $(if ($displayWhy.Count -gt 0) { " Why: " + ($displayWhy -join '; ') } else { '' })
+    )
+}
+
 $beforeLastPresented = $presentedFrameEvidence.before.lastPresentedFrame
 $afterLastPresented = $presentedFrameEvidence.after.lastPresentedFrame
 if ($null -eq $beforeLastPresented -or $null -eq $afterLastPresented -or
@@ -922,6 +1036,12 @@ $result = [pscustomobject]@{
     autoDecision = New-AutoDecisionComparison `
         -BeforeSmoke $beforeSmoke `
         -AfterSmoke $afterSmoke
+    displayComparability = $displayComparability
+    # UM-DISPLAY-SELECT-AND-LOG-1 round 1c (sol pre-review BLOCKER 1): before/after raw values
+    # are always kept (each leg's own FPS is still true regardless of the OTHER leg), but
+    # delta/deltaPercent are withheld -- set $null below, right after this block -- whenever
+    # displayComparability.status is not 'same', so a comparison across different displays can
+    # never present as a meaningful FPS delta.
     fps = [pscustomobject]@{
         visibleBottomLeftGuiFps = New-DeltaObject `
             -BeforeValue (Get-NestedValue $beforeSmoke "playbackFps.visibleBottomLeftGuiFps") `
@@ -949,6 +1069,17 @@ $result = [pscustomobject]@{
     verdict = if ($failures.Count -eq 0) { "PASS" } else { "FAIL" }
 }
 
+# UM-DISPLAY-SELECT-AND-LOG-1 round 1c (sol pre-review BLOCKER 1): withheld here, AFTER
+# $result exists, rather than skipping New-DeltaObject above -- each leg's own raw FPS value
+# is still true regardless of the other leg, and is kept; only delta/deltaPercent (the
+# cross-leg comparison) are nulled when the legs are not known to be the same display/mode.
+if ($displayComparability.status -ne 'same') {
+    foreach ($fpsField in @('visibleBottomLeftGuiFps', 'smokePresentedFps', 'smokeTimelineFps')) {
+        $result.fps.$fpsField.delta = $null
+        $result.fps.$fpsField.deltaPercent = $null
+    }
+}
+
 $json = $result | ConvertTo-Json -Depth 24
 if (-not [string]::IsNullOrWhiteSpace($Output)) {
     $outputDir = Split-Path -Parent $resolvedOutput
@@ -959,11 +1090,12 @@ if (-not [string]::IsNullOrWhiteSpace($Output)) {
 }
 
 Write-Host ((
-    "GUI-SMOKE-AB verdict={0} screenshot_status={1} mean_abs_rgb_delta={2} " +
-    "changed_sample_ratio={3} gui_fps_delta={4} presented_fps_delta={5} " +
-    "auto_reason_before={6} auto_reason_after={7} auto_avg_ms_delta={8} " +
-    "auto_avg_fps_eq_delta={9} host_load_before={10} host_load_after={11} output={12}") -f
+    "GUI-SMOKE-AB verdict={0} display_comparable={1} screenshot_status={2} mean_abs_rgb_delta={3} " +
+    "changed_sample_ratio={4} gui_fps_delta={5} presented_fps_delta={6} " +
+    "auto_reason_before={7} auto_reason_after={8} auto_avg_ms_delta={9} " +
+    "auto_avg_fps_eq_delta={10} host_load_before={11} host_load_after={12} output={13}") -f
     $result.verdict,
+    $displayComparability.status,
     $result.screenshot.status,
     $result.screenshot.meanAbsRgbDelta,
     $result.screenshot.changedSampleRatio,
