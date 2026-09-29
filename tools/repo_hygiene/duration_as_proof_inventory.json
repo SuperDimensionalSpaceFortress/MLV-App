@@ -75,26 +75,6 @@
     },
     {
       "path": "platform/qt/MainWindow.cpp",
-      "anchor": "if ( measuredFrameMs > 0 )",
-      "class": "value_fallback_select",
-      "clock": "other",
-      "justification": "measuredFrameMs is a Qt QTime::msecsTo() wall-clock delta between playback timer ticks; a non-positive value (clock stalled/went backwards) is excluded from the FPS EMA update rather than treated as proof a frame did or did not render.",
-      "lines": [
-        3085
-      ]
-    },
-    {
-      "path": "platform/qt/MainWindow.cpp",
-      "anchor": "if ( m_playbackFpsEmaFrameMs <= 0.0 )",
-      "class": "value_fallback_select",
-      "clock": "other",
-      "justification": "Distinguishes the EMA's first sample (seed with the raw value) from a subsequent update (blend 90/10); the sentinel is an initialization marker, not run-proof.",
-      "lines": [
-        3087
-      ]
-    },
-    {
-      "path": "platform/qt/MainWindow.cpp",
       "anchor": "if ( shouldUpdateFpsText && m_playbackFpsEmaFrameMs > 0.0 )",
       "class": "division_guard",
       "clock": "other",
@@ -1852,6 +1832,26 @@
       "justification": "Same synthetic-input pure-function verification as the newFrameMaxGapMs control above, for the new-frame p95 gap field.",
       "lines": [
         242
+      ]
+    },
+    {
+      "path": "platform/qt/PlaybackFpsMeterPolicy.h",
+      "anchor": "if ( msSinceLastDraw <= 0 ) return emaFrameMs ;",
+      "class": "value_fallback_select",
+      "clock": "other",
+      "justification": "STATUS-FPS-METER-1: smoothedFrameMs() input-validity guard. msSinceLastDraw is a Qt QTime::msecsTo() draw-to-draw wall-clock delta; a non-positive value (first draw with no prior timestamp, or a clock step) leaves the FPS EMA unchanged instead of blending a bogus sample. A display smoothing guard for the status-bar FPS meter, not proof that any stage ran or a frame rendered.",
+      "lines": [
+        34
+      ]
+    },
+    {
+      "path": "platform/qt/PlaybackFpsMeterPolicy.h",
+      "anchor": "if ( emaFrameMs <= 0.0 || fpsMeterStalled ( msSinceLastDraw ) )",
+      "class": "value_fallback_select",
+      "clock": "other",
+      "justification": "STATUS-FPS-METER-1: smoothedFrameMs() seed-or-reset select. emaFrameMs <= 0.0 is the EMA's uninitialized sentinel (seed with the raw sample rather than blend); fpsMeterStalled() re-seeds after a long gap between draws. Both choose how the displayed FPS smooths a measured interval, never whether work ran; the value feeds only the status-bar FPS text.",
+      "lines": [
+        35
       ]
     }
   ]
