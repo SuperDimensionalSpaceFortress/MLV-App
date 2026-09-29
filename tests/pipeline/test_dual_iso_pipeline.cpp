@@ -10258,6 +10258,48 @@ TEST(DualIsoPipeline, Phase4B_PreDualIsoFixCompletedTelemetryIsClearedOnProcesse
     ASSERT_EQ(0.0, llrpGetLastPreDualIsoFixMilliseconds());
 }
 
+// PROD-TELEMETRY-DURATION-AS-PROOF-3b round 2: RenderFrameThread also calls getMlvProcessedFrame16Scaled directly,
+// and its exact processed16 cache returns before any render, so the same stale flag is reachable there. The
+// phase4b path tag is reset at that entry and only set by a real render, so path 0 on the second call proves no render
+// ran. Mutation: dropping the llrpResetLastPreDualIsoFixTelemetry() call in getMlvProcessedFrame16_with_scale leaves a
+// stale 1 here.
+TEST(DualIsoPipeline, Phase4B_PreDualIsoFixCompletedTelemetryIsClearedOnProcessed16CacheHit)
+{
+    ScopedPlaybackPathTestState playbackPathState(
+        ScopedPlaybackPathTestState::Processed8PrefetchPolicy::Disabled);
+    ScopedAggressivePreviewMode aggressivePreview(0);
+    MLVAPP_TEST_UNSETENV("MLVAPP_ENABLE_DUAL_ISO_X4_FULLRES_FIXES");
+    MLVAPP_TEST_UNSETENV("MLVAPP_LOG_PHASE4BV2");
+    mlv_phase4bv_reset_env_cache_for_testing();
+
+    MlvPipelineFixture fixture;
+    QString error_message;
+    ASSERT_TRUE(fixture.openTinyDualIso(&error_message));
+    ASSERT_TRUE(fixture.loadReceipt(QStringLiteral("tests/fixtures/receipts/tiny_dual_iso_hq.marxml"), &error_message));
+    fixture.receipt().setFocusPixels(1);
+    fixture.receipt().setBadPixels(1);
+    fixture.receipt().setVerticalStripes(1);
+    fixture.receipt().setPatternNoise(1);
+    ASSERT_TRUE(fixture.applyReceipt(&error_message));
+
+    const int full_w = fixture.width();
+    const int full_h = fixture.height();
+    if ((full_w % 4) != 0 || full_h < 16) {
+        return;
+    }
+
+    const std::vector<uint16_t> ran = fixture.renderFrame16Scaled(0, 1, 4);
+    ASSERT_FALSE(ran.empty());
+    ASSERT_EQ(3, mlv_phase4bv2_last_path_taken());
+    ASSERT_EQ(1, llrpGetLastPreDualIsoFixCompleted());
+
+    const std::vector<uint16_t> hit = fixture.renderFrame16Scaled(0, 1, 4);
+    ASSERT_TRUE(ran == hit);
+    ASSERT_EQ(0, mlv_phase4bv2_last_path_taken());
+    ASSERT_EQ(0, llrpGetLastPreDualIsoFixCompleted());
+    ASSERT_EQ(0.0, llrpGetLastPreDualIsoFixMilliseconds());
+}
+
 // PROD-TELEMETRY-DURATION-AS-PROOF-3b round 2: the per-entry reset at the top of mlv_render_scaled_rgb16_from_raw
 // (reached through getMlvProcessedFrame8ScaledFromRaw16 -> mlv_render_processed_frame8_direct_with_processing_from_raw)
 // had no covering test. The second render goes through a phase-4b scaled-buffer path (x2 aggressive, no raw fixes ->

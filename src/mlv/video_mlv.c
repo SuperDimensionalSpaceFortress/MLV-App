@@ -7659,7 +7659,6 @@ int getMlvProcessedFrame8ScaledFromRaw16(mlvObject_t * video,
     g_mlv_last_processed8_cache_hit = 0;
     g_mlv_last_processed8_cache_hit_scale_factor = 0;
     g_mlv_last_processed8_prefetch_hit = 0;
-    llrpResetLastPreDualIsoFixTelemetry();
 
     if (!video || !decodedRawFrame || !outputFrame) return 0;
     processingSetPlaybackAggressivePreviewMode(mlvPlaybackAggressivePreviewMode());
@@ -7766,7 +7765,6 @@ int getMlvProcessedFrame8ScaledFromReconnedRaw16(mlvObject_t * video,
     g_mlv_last_processed8_cache_hit = 0;
     g_mlv_last_processed8_cache_hit_scale_factor = 0;
     g_mlv_last_processed8_prefetch_hit = 0;
-    llrpResetLastPreDualIsoFixTelemetry();
 
     if (!video || !reconnedRawFrame || !outputFrame) return 0;
     processingSetPlaybackAggressivePreviewMode(mlvPlaybackAggressivePreviewMode());
