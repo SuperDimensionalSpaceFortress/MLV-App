@@ -93,7 +93,7 @@ FINDING_PATH_PREFIXES = ("tools/coordination/", "agents/", ".claude/")
 FINDING_PATH_FILES = ("CLAUDE.md",)
 
 # Law 4 screen on the body. Each pattern names the class it refuses; the screen prints
-# which and a short excerpt of what matched. The first nine are agent-bridge's; the rest
+# which, never the matched text. The first nine are agent-bridge's; the rest
 # are MLV's own deny terms (private board state, and the GPU host).
 LAW4 = (
     ("email address", re.compile(r"[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}")),
@@ -270,9 +270,9 @@ def screen_law4(body: str, deny_terms: list[tuple[str, str]] = ()) -> None:
     if words > WORD_CAP:
         raise Refusal("LAW4_OVER_CAP", f"{words} words > {WORD_CAP}")
     for name, rx in LAW4:
-        m = rx.search(body)
-        if m:
-            raise Refusal("LAW4_REFUSED", f"{name}: {m.group(0)[:24]!r}")
+        if rx.search(body):
+            # Name the CLASS only: the matched text is exactly what must not leave the machine.
+            raise Refusal("LAW4_REFUSED", name)
     for cls, value in deny_terms:
         if _word_boundary_pattern(value).search(body):
             # Never echo the matched value -- the refusal message itself must not leak it.
@@ -437,6 +437,11 @@ def verify_published_as(bus_repo: pathlib.Path, tip: str, item: dict) -> str | N
     return None
 
 
+def is_ancestor(repo: pathlib.Path, sha: str, tip: str) -> bool:
+    rc, _out, _err = git_try(repo, "merge-base", "--is-ancestor", sha, tip)
+    return rc == 0
+
+
 def make_temp_worktree(bus_repo: pathlib.Path, tip: str) -> pathlib.Path:
     base = pathlib.Path(tempfile.mkdtemp(prefix="doctrine-outbox-wt-"))
     wt = base / "wt"
@@ -566,18 +571,33 @@ def drain(repo: pathlib.Path, bus_repo: pathlib.Path, ref: str, ledger: pathlib.
         report["commit"] = tip
         return report
 
+    attempted: dict[str, str] = {}  # key -> the bus commit WE built for it, across attempts
     attempt = 0
     while True:
         attempt += 1
         pending = []
         tip_sent_rows = []
+        landed_rows = []
         for c in candidates:
             if key_on_bus(bus_repo, tip, c["target"], c["key"]):
-                report["already_sent"].append({"path": c["path"], "key": c["key"], "via": "bus_tip"})
-                if push and c["key"] not in ledger_keys:
-                    tip_sent_rows.append(_ledger_row(c, tip))
+                ours = attempted.get(c["key"])
+                if ours is not None and is_ancestor(bus_repo, ours, tip):
+                    # An earlier push of ours returned a failure, yet its commit is on the
+                    # refetched tip: the bus accepted it and the acknowledgement was lost.
+                    # That is a landed publication of OURS, not another publisher's.
+                    report["published"].append({"path": c["path"], "key": c["key"], "target": c["target"],
+                                                 "bus_commit": ours})
+                    landed_rows.append(_ledger_row(c, ours))
+                else:
+                    report["already_sent"].append({"path": c["path"], "key": c["key"], "via": "bus_tip"})
+                    if push and c["key"] not in ledger_keys:
+                        tip_sent_rows.append(_ledger_row(c, tip))
             else:
                 pending.append(c)
+
+        if landed_rows:
+            report["pushed"] = True
+            append_ledger_rows(ledger, landed_rows)
 
         if not pending:
             if push and tip_sent_rows:
@@ -591,6 +611,7 @@ def drain(repo: pathlib.Path, bus_repo: pathlib.Path, ref: str, ledger: pathlib.
             for c in pending:
                 append_block_to_file(wt / c["target"], c["block"])
                 commits[c["key"]] = git_commit(wt, c["message"])
+                attempted[c["key"]] = commits[c["key"]]
             head = git(wt, "rev-parse", "HEAD")
             # The in-memory prefix check inside append_block_to_file proves nothing about what
             # actually landed in the commit -- a clean filter, attribute, or hook can still
@@ -614,11 +635,15 @@ def drain(repo: pathlib.Path, bus_repo: pathlib.Path, ref: str, ledger: pathlib.
             remote = git(bus_repo, "ls-remote", "origin", "refs/heads/master")
             remote_sha = remote.split()[0] if remote else None
             if remote_sha != head:
-                raise Refusal("PUSH_VERIFY_FAILED", f"ls-remote={remote_sha!r} head={head!r}")
+                # Equality would call a benign race a failure: another publisher may have
+                # advanced the bus between our push and this ls-remote. Landed means our
+                # commit is an ANCESTOR of the remote tip, checked after fetching that tip.
+                if remote_sha is None or not is_ancestor(bus_repo, head, bus_fetch(bus_repo)):
+                    raise Refusal("PUSH_VERIFY_FAILED", f"ls-remote={remote_sha!r} head={head!r}")
             rows = [_ledger_row(c, commits[c["key"]]) for c in pending] + tip_sent_rows
             append_ledger_rows(ledger, rows)
-            report["published"] = [{"path": c["path"], "key": c["key"], "target": c["target"],
-                                     "bus_commit": commits[c["key"]]} for c in pending]
+            report["published"] += [{"path": c["path"], "key": c["key"], "target": c["target"],
+                                      "bus_commit": commits[c["key"]]} for c in pending]
             report["pushed"] = True
             report["commit"] = head
             return report

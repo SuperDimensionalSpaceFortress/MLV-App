@@ -1049,3 +1049,150 @@ def test_shipped_backfill_items_all_validate_and_screen_clean():
         ob.screen_law4(parsed["body"], [])
         ob.screen_law4(path.name, [])
         assert path.read_text(encoding="utf-8").startswith("---\n") and "published_as" not in parsed["meta"]
+
+
+# ---------- drain: acknowledgement and verification races (sol pre-review B1, B2) ----------
+#
+# Named mutations for this block (each turns the named test red, then is reverted):
+#   M4  ignore that our own commit is on the refetched tip  -> test_lost_push_ack_that_landed_is_reported_published
+#   M5  restore ls-remote equality (`remote_sha != head`)   -> test_ls_remote_descendant_of_the_pushed_commit_is_a_success
+
+def _competitor_push(bare: Path, tmp_path: Path, tag: str) -> str:
+    """Land one unrelated commit on the bus origin from a second clone; return its sha."""
+    clone = tmp_path / f"competitor-{tag}"
+    subprocess.run(["git", "clone", str(bare), str(clone)], check=True, capture_output=True, text=True)
+    current = (clone / "TRAPS.md").read_bytes()
+    addition = f"### Competitor {tag}\nbody\n<!-- outbox:{tag * 16} other:0123456789ab -->\n"
+    (clone / "TRAPS.md").write_bytes(current + addition.encode("utf-8"))
+    git(clone, "add", "TRAPS.md")
+    git(clone, "commit", "-m", f"competing entry {tag}")
+    git(clone, "push", "origin", "HEAD:refs/heads/master")
+    return git(clone, "rev-parse", "HEAD")
+
+
+def _ledger_rows(ledger: Path) -> list[dict]:
+    if not ledger.exists():
+        return []
+    return [json.loads(line) for line in ledger.read_text(encoding="utf-8").splitlines() if line.strip()]
+
+
+def test_lost_push_ack_that_landed_is_reported_published(tmp_path, monkeypatch):
+    """B1. The bus accepted the push but the acknowledgement came back as a failure. The retry
+    refetches, finds the key on the tip, and our own commit is an ancestor of that tip: that is
+    a landed publication, not `pushed:false, published:[]`."""
+    bare, clone = init_bus(tmp_path)
+    src = init_source(tmp_path)
+    add_item(src, "20260925-example.md")
+    ledger = tmp_path / "sent.jsonl"
+    real_git_try, calls = ob.git_try, {"pushes": 0}
+
+    def lossy_git_try(repo, *args, **kw):
+        if args and args[0] == "push":
+            calls["pushes"] += 1
+            rc, out, err = real_git_try(repo, *args, **kw)
+            assert rc == 0, err
+            if calls["pushes"] == 1:
+                return 1, "", "simulated lost acknowledgement"
+            return rc, out, err
+        return real_git_try(repo, *args, **kw)
+
+    monkeypatch.setattr(ob, "git_try", lossy_git_try)
+    report = ob.drain(src, clone, "HEAD", ledger, [], push=True)
+
+    assert calls["pushes"] == 1, "the retry must find the landed key, not push again"
+    assert report["pushed"] is True
+    assert len(report["published"]) == 1
+    assert report["already_sent"] == []
+    rows = _ledger_rows(ledger)
+    assert [r["key"] for r in rows] == [report["published"][0]["key"]]
+    assert rows[0]["bus_commit"] == report["published"][0]["bus_commit"]
+    assert git_raw(clone, "show", "origin/master:TRAPS.md").count(b"outbox:") == 1
+
+
+def test_a_key_landed_by_another_publisher_is_already_sent_not_published(tmp_path, monkeypatch):
+    """The other half of B1: the push really was rejected and a different publisher landed the
+    exact same block. Our commit is NOT on the tip, so it is already_sent, never `published`."""
+    bare, clone = init_bus(tmp_path)
+    rival_clone = tmp_path / "rival-bus-clone"
+    subprocess.run(["git", "clone", str(bare), str(rival_clone)], check=True, capture_output=True, text=True)
+    src = init_source(tmp_path)
+    add_item(src, "20260925-example.md")
+    real_git_try, state = ob.git_try, {"armed": True}
+
+    def rejecting_git_try(repo, *args, **kw):
+        if args and args[0] == "push" and state["armed"]:
+            state["armed"] = False
+            rival = ob.drain(src, rival_clone, "HEAD", tmp_path / "rival-sent.jsonl", [], push=True)
+            assert rival["pushed"] is True
+            return 1, "", "rejected: non-fast-forward"
+        return real_git_try(repo, *args, **kw)
+
+    monkeypatch.setattr(ob, "git_try", rejecting_git_try)
+    ledger = tmp_path / "sent.jsonl"
+    report = ob.drain(src, clone, "HEAD", ledger, [], push=True)
+
+    assert report["published"] == [] and report["pushed"] is False
+    assert [a["via"] for a in report["already_sent"]] == ["bus_tip"]
+    assert git_raw(clone, "show", "origin/master:TRAPS.md").count(b"outbox:") == 1
+
+
+def test_ls_remote_descendant_of_the_pushed_commit_is_a_success(tmp_path, monkeypatch):
+    """B2. Another publisher advances the bus between our push and our ls-remote. Our commit is
+    an ancestor of the remote tip, so the publication landed; equality would call it a failure."""
+    bare, clone = init_bus(tmp_path)
+    src = init_source(tmp_path)
+    add_item(src, "20260925-example.md")
+    ledger = tmp_path / "sent.jsonl"
+    real_git = ob.git
+
+    def racing_git(repo, *args, **kw):
+        if args and args[0] == "ls-remote":
+            _competitor_push(bare, tmp_path, "b")
+        return real_git(repo, *args, **kw)
+
+    monkeypatch.setattr(ob, "git", racing_git)
+    report = ob.drain(src, clone, "HEAD", ledger, [], push=True)
+
+    assert report["pushed"] is True and len(report["published"]) == 1
+    assert git(bare, "rev-parse", "master") != report["commit"], "the competitor must have moved the tip"
+    assert len(_ledger_rows(ledger)) == 1
+    assert git_raw(bare, "show", "master:TRAPS.md").count(b"outbox:") == 2
+
+
+def test_ls_remote_tip_that_lacks_the_pushed_commit_still_fails_verification(tmp_path, monkeypatch):
+    """B2's guard: verification fails only when the pushed commit is genuinely not on the remote."""
+    bare, clone = init_bus(tmp_path)
+    src = init_source(tmp_path)
+    add_item(src, "20260925-example.md")
+    ledger = tmp_path / "sent.jsonl"
+    real_git_try = ob.git_try
+
+    def phantom_git_try(repo, *args, **kw):
+        if args and args[0] == "push":
+            return 0, "", ""  # claims success, pushes nothing
+        return real_git_try(repo, *args, **kw)
+
+    monkeypatch.setattr(ob, "git_try", phantom_git_try)
+    with pytest.raises(ob.Refusal) as excinfo:
+        ob.drain(src, clone, "HEAD", ledger, [], push=True)
+
+    assert excinfo.value.code == "PUSH_VERIFY_FAILED"
+    assert not ledger.exists()
+
+
+# ---------- hardening: refusal details name the class, never the matched value ----------
+
+@pytest.mark.parametrize("name", list(LAW4_SAMPLES))
+def test_law4_refusal_detail_is_the_class_alone(name):
+    with pytest.raises(ob.Refusal) as excinfo:
+        ob.screen_law4(LAW4_SAMPLES[name])
+    assert excinfo.value.detail == name
+
+
+def test_law4_refusal_does_not_echo_a_home_path_or_a_token():
+    cases = (("### h\nfound at /Users/OtherPerson/notes\n", "OtherPerson"),
+             ("### h\ntoken ghp_a1B2c3D4e5F6g7H8i9J0k1L2m3 was pasted\n", "ghp_a1B2"))
+    for body, leaked in cases:
+        with pytest.raises(ob.Refusal) as excinfo:
+            ob.screen_law4(body)
+        assert leaked not in str(excinfo.value)
