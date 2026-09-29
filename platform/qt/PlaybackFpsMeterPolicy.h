@@ -25,6 +25,14 @@ inline bool fpsMeterStalled( int msSinceLastDraw )
     return msSinceLastDraw > kFpsMeterStallMs;
 }
 
+/*! \return true when the meter must read 0 and restart: playback is paused, no
+ *  draw has happened yet, or the last draw is stale. Evaluated on EVERY poll
+ *  tick, including the ticks a still-drawing render turns away early. */
+inline bool fpsMeterShouldReset( bool playChecked, bool hasDraw, int msSinceLastDraw )
+{
+    return !playChecked || !hasDraw || fpsMeterStalled( msSinceLastDraw );
+}
+
 /*! One meter step: fold the interval since the previous draw into the running
  *  frame-time average. A non-positive interval (same millisecond, clock wrap)
  *  leaves the average alone; an interval past the stall limit is a restart

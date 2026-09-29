@@ -50,13 +50,41 @@ TEST(PlaybackFpsMeterWiring, FpsMeterMeasuresDrawToDrawAndIdleTicksDoNotRestartI
     ASSERT_TRUE(body.contains(QStringLiteral("playback_fps_meter::smoothedFrameMs(")));
     // the old measurement off the idle-re-armed lastTime is gone
     ASSERT_FALSE(body.contains(QStringLiteral("const int measuredFrameMs = lastTime.msecsTo( nowTime );")));
-    // the idle branch zeroes the meter only when paused, before the first draw, or stalled
+    // the reset policy lives in one pure function, called with the real play state and draw age
+    // (exact text: a `true ||` or dropped operand cannot slip through)
+    const int lambdaAt = body.indexOf(QStringLiteral("const auto resetFpsMeterIfIdle = [this]( const QTime & now )"));
+    ASSERT_TRUE(lambdaAt >= 0);
+    const QString lambda = body.mid(lambdaAt);
+    const int policyAt = lambda.indexOf(QStringLiteral(
+        "playback_fps_meter::fpsMeterShouldReset( ui->actionPlay->isChecked(), hasDraw,\n"
+        "                                                     hasDraw ? lastDrawTime.msecsTo( now ) : 0 )"));
+    const int zeroAt = lambda.indexOf(QStringLiteral("m_playbackFpsEmaFrameMs = 0.0;"));
+    ASSERT_TRUE(policyAt >= 0);
+    ASSERT_TRUE(zeroAt > policyAt); // the reset sits inside the guarded block, not before it
+    // the lambda must not touch lastTime (drop-frame pacing)
+    const int lambdaEnd = lambda.indexOf(QStringLiteral("if( m_frameStillDrawing )"));
+    ASSERT_TRUE(lambdaEnd > zeroAt);
+    ASSERT_FALSE(lambda.left(lambdaEnd).contains(QStringLiteral("lastTime =")));
+}
+
+// sol r1 BLOCKER: each 8 ms tick used to return through the m_frameStillDrawing branch before the
+// idle reset, so a stalled render or a pause left the old fps on screen. The reset must run on the
+// still-drawing early-return path too, BEFORE its returns.
+TEST(PlaybackFpsMeterWiring, FpsMeterResetRunsOnTheStillDrawingEarlyReturnPath)
+{
+    const QString body = timerFrameEventBody();
+    ASSERT_FALSE(body.isEmpty());
+    const int busyAt = body.indexOf(QStringLiteral("if( m_frameStillDrawing )"));
+    const int busyEnd = body.indexOf(QStringLiteral("const bool hadPendingAdvance"));
+    ASSERT_TRUE(busyAt >= 0);
+    ASSERT_TRUE(busyEnd > busyAt);
+    const QString busy = body.mid(busyAt, busyEnd - busyAt);
+    const int callAt = busy.indexOf(QStringLiteral("resetFpsMeterIfIdle( QTime::currentTime() );"));
+    const int firstReturnAt = busy.indexOf(QStringLiteral("return;"));
+    ASSERT_TRUE(callAt >= 0);
+    ASSERT_TRUE(firstReturnAt > callAt); // evaluated before either early return
+    // ...and the idle branch still evaluates it with the tick's own time
     const int idleAt = body.indexOf(QStringLiteral("timer_frame.idle"));
     ASSERT_TRUE(idleAt >= 0);
-    const QString idle = body.mid(idleAt);
-    const int guardAt = idle.indexOf(QStringLiteral("playback_fps_meter::fpsMeterStalled("));
-    const int resetAt = idle.indexOf(QStringLiteral("m_playbackFpsEmaFrameMs = 0.0;"));
-    ASSERT_TRUE(guardAt >= 0);
-    ASSERT_TRUE(resetAt > guardAt); // the reset sits inside the guarded block, not before it
-    ASSERT_TRUE(idle.contains(QStringLiteral("!ui->actionPlay->isChecked()")));
+    ASSERT_TRUE(body.mid(idleAt).contains(QStringLiteral("resetFpsMeterIfIdle( nowTime );")));
 }

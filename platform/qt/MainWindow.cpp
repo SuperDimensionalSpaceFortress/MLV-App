@@ -2986,6 +2986,27 @@ void MainWindow::timerFrameEvent( bool predictivePlaybackAdvance )
     static QTime lastDrawTime;          //Last Time a frame was DRAWN (fps meter only; lastTime is re-armed on idle ticks)
     static int timeDiff = 0;           //TimeDiff between 2 rendered frames in Playback
 
+    //Zero the fps meter when paused, before the first draw, or stalled. Runs on EVERY tick, including
+    //the still-drawing early returns below: a busy render must not leave the previous fps on screen.
+    //Touches only the meter state, never lastTime, so drop-frame pacing is unchanged.
+    const auto resetFpsMeterIfIdle = [this]( const QTime & now )
+    {
+        const bool hasDraw = lastDrawTime.isValid();
+        if( playback_fps_meter::fpsMeterShouldReset( ui->actionPlay->isChecked(), hasDraw,
+                                                     hasDraw ? lastDrawTime.msecsTo( now ) : 0 ) )
+        {
+            const QString playbackFpsText = playbackFpsStatusText( 0.0 );
+            if( m_lastPlaybackFpsStatusText != playbackFpsText )
+            {
+                m_pFpsStatus->setText( playbackFpsText );
+                m_lastPlaybackFpsStatusText = playbackFpsText;
+            }
+            m_playbackFpsEmaFrameMs = 0.0;
+            m_lastPlaybackFpsStatusUpdateTime = QTime();
+            lastDrawTime = QTime();
+        }
+    };
+
     if( m_frameStillDrawing )
     {
         const bool allowPredictiveBusyAdvance =
@@ -3007,6 +3028,7 @@ void MainWindow::timerFrameEvent( bool predictivePlaybackAdvance )
                         .arg( ui->horizontalSliderPosition->value() ),
                     true );
             }
+            resetFpsMeterIfIdle( QTime::currentTime() );
             //On setup slider priority
             if( !ui->actionPlay->isChecked() )
             {
@@ -3157,20 +3179,7 @@ void MainWindow::timerFrameEvent( bool predictivePlaybackAdvance )
         }
         //An idle poll tick between two draws is normal while playing (8 ms poll, ~42 ms frame
         //period at 24 fps): only paused or stalled playback zeroes the fps meter.
-        if( !ui->actionPlay->isChecked()
-         || !lastDrawTime.isValid()
-         || playback_fps_meter::fpsMeterStalled( lastDrawTime.msecsTo( nowTime ) ) )
-        {
-            const QString playbackFpsText = playbackFpsStatusText( 0.0 );
-            if( m_lastPlaybackFpsStatusText != playbackFpsText )
-            {
-                m_pFpsStatus->setText( playbackFpsText );
-                m_lastPlaybackFpsStatusText = playbackFpsText;
-            }
-            m_playbackFpsEmaFrameMs = 0.0;
-            m_lastPlaybackFpsStatusUpdateTime = QTime();
-            lastDrawTime = QTime();
-        }
+        resetFpsMeterIfIdle( nowTime );
         lastTime = QTime::currentTime(); //do that for calculation of timeDiff for DropFrameMode;
 
     }

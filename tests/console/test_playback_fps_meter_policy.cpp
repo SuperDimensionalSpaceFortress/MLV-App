@@ -4,6 +4,7 @@
 
 #include <cmath>
 
+using playback_fps_meter::fpsMeterShouldReset;
 using playback_fps_meter::fpsMeterStalled;
 using playback_fps_meter::kFpsMeterStallMs;
 using playback_fps_meter::smoothedFrameMs;
@@ -42,4 +43,19 @@ TEST(PlaybackFpsMeterPolicy, IgnoresANonPositiveIntervalAndRestartsAfterAStall)
     ASSERT_TRUE(fpsMeterStalled(kFpsMeterStallMs + 1));
     ASSERT_FALSE(fpsMeterStalled(42)); // one 24 fps frame period is nowhere near a stall
     ASSERT_FALSE(fpsMeterStalled(0));
+}
+
+TEST(PlaybackFpsMeterPolicy, ResetsWhenPausedBeforeAnyDrawOrStalledButNotBetweenPlayingDraws)
+{
+    // playing, a draw 42 ms ago (one 24 fps frame, the normal idle poll tick): keep the reading
+    ASSERT_FALSE(fpsMeterShouldReset(true, true, 42));
+    ASSERT_FALSE(fpsMeterShouldReset(true, true, kFpsMeterStallMs));
+    // paused resets even with a fresh draw: the label read 24 and the user paused
+    ASSERT_TRUE(fpsMeterShouldReset(false, true, 0));
+    ASSERT_TRUE(fpsMeterShouldReset(false, true, 42));
+    // no draw yet (fresh clip): reset
+    ASSERT_TRUE(fpsMeterShouldReset(true, false, 0));
+    // the sol r1 repro: label at 24 fps, a render stays busy 900 ms -> stale, must reset
+    ASSERT_TRUE(fpsMeterShouldReset(true, true, 900));
+    ASSERT_TRUE(fpsMeterShouldReset(true, true, kFpsMeterStallMs + 1));
 }
