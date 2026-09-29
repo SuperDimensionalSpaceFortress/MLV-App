@@ -57,7 +57,9 @@ SOURCES += \
     $$REPO_ROOT/tests/console/test_gpu_texture_present_availability_policy.cpp \
     $$REPO_ROOT/tests/console/test_playback_frame_population_policy.cpp \
     $$REPO_ROOT/tests/console/test_playback_lookahead_loop_position_policy.cpp \
-    $$REPO_ROOT/tests/console/test_playback_drop_frame_advance_policy.cpp
+    $$REPO_ROOT/tests/console/test_playback_drop_frame_advance_policy.cpp \
+    $$REPO_ROOT/tests/console/test_playback_fps_meter_policy.cpp \
+    $$REPO_ROOT/tests/console/test_playback_fps_meter_wiring.cpp
 
 HEADERS += \
     $$REPO_ROOT/platform/qt/FpmNameValidator.h \
@@ -89,6 +91,7 @@ HEADERS += \
     $$REPO_ROOT/platform/qt/PlaybackDropFrameAdvancePolicy.h \
     $$REPO_ROOT/platform/qt/PlaybackAchievedScalePolicy.h \
     $$REPO_ROOT/platform/qt/PlaybackLookaheadLoopPositionPolicy.h \
+    $$REPO_ROOT/platform/qt/PlaybackFpsMeterPolicy.h \
     $$REPO_ROOT/platform/qt/GpuTexturePresentAvailabilityPolicy.h
 
 win32{

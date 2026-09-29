@@ -12,6 +12,7 @@
 #include "ExportDimensions.h"
 #include "ExportProcess.h"
 #include "DualIsoLevelSyncPolicy.h"
+#include "PlaybackFpsMeterPolicy.h"
 #include "PlaybackFrameRange.h"
 #include "PlaybackGatePolicy.h"
 #include "PlaybackPrepPresentationPolicy.h"
@@ -2982,7 +2983,8 @@ static int mlvappStartPlaybackTimer( QObject *owner, double framerate )
 void MainWindow::timerFrameEvent( bool predictivePlaybackAdvance )
 {
     static QTime lastTime;              //Last Time a picture was rendered
-    static int timeDiff = 0;            //TimeDiff between 2 rendered frames in Playback
+    static QTime lastDrawTime;          //Last Time a frame was DRAWN (fps meter only; lastTime is re-armed on idle ticks)
+    static int timeDiff = 0;           //TimeDiff between 2 rendered frames in Playback
 
     if( m_frameStillDrawing )
     {
@@ -3111,22 +3113,14 @@ void MainWindow::timerFrameEvent( bool predictivePlaybackAdvance )
         //Allow interaction while playback
         //qApp->processEvents();
 
-        //fps measurement
-        const int measuredFrameMs = lastTime.msecsTo( nowTime );
+        //fps measurement: draw-to-draw interval. lastTime is re-armed on every idle poll tick (it
+        //feeds the drop-frame elapsed time), so it cannot serve here -- see playback_fps_meter::smoothedFrameMs.
+        const int measuredFrameMs = lastDrawTime.isValid() ? lastDrawTime.msecsTo( nowTime ) : 0;
+        lastDrawTime = nowTime;
         if( timeDiff != 0 )
         {
-            if( measuredFrameMs > 0 )
-            {
-                if( m_playbackFpsEmaFrameMs <= 0.0 )
-                {
-                    m_playbackFpsEmaFrameMs = static_cast<double>( measuredFrameMs );
-                }
-                else
-                {
-                    m_playbackFpsEmaFrameMs =
-                        ( m_playbackFpsEmaFrameMs * 0.9 ) + ( static_cast<double>( measuredFrameMs ) * 0.1 );
-                }
-            }
+            m_playbackFpsEmaFrameMs =
+                playback_fps_meter::smoothedFrameMs( m_playbackFpsEmaFrameMs, measuredFrameMs );
             const bool shouldUpdateFpsText =
                 !m_lastPlaybackFpsStatusUpdateTime.isValid()
                 || m_lastPlaybackFpsStatusUpdateTime.msecsTo( nowTime ) >= 250;
@@ -3161,14 +3155,22 @@ void MainWindow::timerFrameEvent( bool predictivePlaybackAdvance )
                     .arg( ui->horizontalSliderPosition->value() ),
                 true );
         }
-        const QString playbackFpsText = playbackFpsStatusText( 0.0 );
-        if( m_lastPlaybackFpsStatusText != playbackFpsText )
+        //An idle poll tick between two draws is normal while playing (8 ms poll, ~42 ms frame
+        //period at 24 fps): only paused or stalled playback zeroes the fps meter.
+        if( !ui->actionPlay->isChecked()
+         || !lastDrawTime.isValid()
+         || playback_fps_meter::fpsMeterStalled( lastDrawTime.msecsTo( nowTime ) ) )
         {
-            m_pFpsStatus->setText( playbackFpsText );
-            m_lastPlaybackFpsStatusText = playbackFpsText;
+            const QString playbackFpsText = playbackFpsStatusText( 0.0 );
+            if( m_lastPlaybackFpsStatusText != playbackFpsText )
+            {
+                m_pFpsStatus->setText( playbackFpsText );
+                m_lastPlaybackFpsStatusText = playbackFpsText;
+            }
+            m_playbackFpsEmaFrameMs = 0.0;
+            m_lastPlaybackFpsStatusUpdateTime = QTime();
+            lastDrawTime = QTime();
         }
-        m_playbackFpsEmaFrameMs = 0.0;
-        m_lastPlaybackFpsStatusUpdateTime = QTime();
         lastTime = QTime::currentTime(); //do that for calculation of timeDiff for DropFrameMode;
 
     }
