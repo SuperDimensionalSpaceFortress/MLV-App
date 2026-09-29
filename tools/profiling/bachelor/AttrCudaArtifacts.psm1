@@ -760,13 +760,18 @@ function Save-AttrCudaCommittedBlobBytes {
 # CUDA-S4-TEXTURE-ROUTE-CLAMP-1 round 2: added gui-smoke-gpu-texture-route-validation.ps1 --
 # run-release-gui-smoke.ps1 dot-sources it (~:93) but round 1 never staged it, so the same
 # closure-completeness tests caught the same gap the same way, again.
+#
+# UM-DISPLAY-SELECT-AND-LOG-1 round 3: added gui-smoke-display-identity.ps1 -- the ONE parser for
+# the app's gui_smoke.display_screen/display_target/window_placement lines, dot-sourced by the
+# runner and embedded verbatim into the attribution job (see that file's header).
 $script:AttrCudaSmokeRunnerClosureManifest = @(
     'tools/profiling/run-release-gui-smoke.ps1',
     'tools/profiling/gui-smoke-screenshot-provenance.ps1',
     'tools/profiling/provenance-stamp.ps1',
     'tools/profiling/gui-smoke-process-boundary.psm1',
     'tools/profiling/gui-smoke-color-artifact-scan.ps1',
-    'tools/profiling/gui-smoke-gpu-texture-route-validation.ps1'
+    'tools/profiling/gui-smoke-gpu-texture-route-validation.ps1',
+    'tools/profiling/gui-smoke-display-identity.ps1'
 )
 
 function Get-AttrCudaSmokeRunnerClosureManifest {
@@ -2627,9 +2632,10 @@ function Get-AttrCudaQuiescenceSample {
         # validate the RAW sample BEFORE any cast. [double]$null casts to 0, so an unread/null
         # CookedValue used to silently pass as "0% busy" (a caller compares timePercent to a
         # threshold and would then never refuse). Status is PDH's own signal that the value is
-        # trustworthy -- 0 (VALID_DATA) or 1 (NEW_DATA); anything else (including a Status this
-        # module's own mocks/tests never set, which reads $null and is treated as valid) is an
-        # unread sample, never a "0% busy" one. A finite range check catches NaN/Infinity/out-of-
+        # trustworthy -- 0 (VALID_DATA) or 1 (NEW_DATA); anything else is an unread sample, never a
+        # "0% busy" one. Round 3 (sol hardening): an ABSENT Status is no longer accepted as valid --
+        # a real PDH CounterSample always carries one, so a sample without it cannot be vouched for.
+        # A finite range check catches NaN/Infinity/out-of-
         # range CookedValue values that would otherwise cast cleanly and compare as neither
         # -gt nor -le the threshold.
         # $sample.Status (not .PSObject.Properties['Status'].Value) throws
@@ -2638,7 +2644,10 @@ function Get-AttrCudaQuiescenceSample {
         # lookup below never throws for a missing member, it simply returns $null.
         $statusProp = $sample.PSObject.Properties['Status']
         $status = if ($statusProp) { $statusProp.Value } else { $null }
-        if ($null -ne $status -and $status -ne 0 -and $status -ne 1) {
+        if ($null -eq $status) {
+            throw [System.InvalidOperationException]::new('counter sample carries no Status')
+        }
+        if ($status -ne 0 -and $status -ne 1) {
             throw [System.InvalidOperationException]::new("counter sample status $status is not valid")
         }
         if ($null -eq $sample.CookedValue) {
@@ -3010,27 +3019,15 @@ function Get-AttrCudaGuiSmokeDisplaySelection {
     <#
     .SYNOPSIS
     Parses the app's own gui_smoke.display_screen / display_target / window_placement lines
-    (MainWindow.cpp, UM-DISPLAY-SELECT-AND-LOG-1 items 1/1b) out of a smoke run's raw log text.
+    (MainWindow.cpp, UM-DISPLAY-SELECT-AND-LOG-1) out of a smoke run's raw log text.
     .DESCRIPTION
-    Independent of Get-AttrCudaWindowsDisplayInventory's Windows-API view: this is what the APP
-    itself reported choosing and presenting on. Every one of the three lines is optional in the
-    parse -- an older build or a run that never reached that log statement leaves the
-    corresponding field $null with its own *Error reason, never guessed or defaulted. The LAST
-    matching line wins for display_target/window_placement (each is logged at most once per run,
-    but "last" is still the correct rule if a future caller ever logs it more than once);
-    display_screen is logged once per attached QScreen, so every matching line is kept.
-    .OUTPUTS
-    [pscustomobject] { screensCollected (bool); screens (array of {index,name,manufacturer,model,
-    serial,geometryX,geometryY,width,height,physicalWidth,physicalHeight,devicePixelRatio,
-    refreshHz,primary}); screensError; target ({name,reason,candidates,fallback} or $null);
-    targetError; placement ({mode,screenName,verified,windowX,windowY,windowWidth,windowHeight,
-    previewWidth,previewHeight,targetScreenName,presentationScreenName,
-    presentationPhysicalWidth,presentationPhysicalHeight} or $null); placementError }.
-    UM-DISPLAY-SELECT-AND-LOG-1 round 1c (sol BLOCKER 3): targetScreenName/presentationScreenName/
-    presentationPhysical* are appended fields on the window_placement line (MainWindow.cpp) --
-    all four read $null on a legacy log line that predates them (the regex's trailing group is
-    optional), never guessed from screenName, which stays the INTENDED target's name for
-    back-compat with every caller/test that predates this round.
+    A THIN DELEGATE (round 3, binding design-review item opus-blocker-1): the one parser is
+    ConvertFrom-GuiSmokeDisplayLog in tools/profiling/gui-smoke-display-identity.ps1, which the
+    smoke runner also dot-sources -- so the job and the runner cannot publish two different
+    identities for one leg. In an emitted job that function is already embedded (from the same
+    committed bytes the smoke-runner closure stages), so Get-Command finds it; imported as a
+    module (the tests, the generators) it is dot-sourced from the checkout, once per call.
+    See ConvertFrom-GuiSmokeDisplayLog for the returned shape and the parsing rule.
     #>
     [CmdletBinding()]
     param(
@@ -3039,130 +3036,10 @@ function Get-AttrCudaGuiSmokeDisplaySelection {
         [string]$LogText
     )
 
-    $result = [ordered]@{
-        screensCollected = $false
-        screens = @()
-        screensError = $null
-        target = $null
-        targetError = $null
-        placement = $null
-        placementError = $null
+    if (-not (Get-Command ConvertFrom-GuiSmokeDisplayLog -CommandType Function -ErrorAction SilentlyContinue)) {
+        . (Join-Path $PSScriptRoot '..\gui-smoke-display-identity.ps1')
     }
-
-    $lines = @($LogText -split "`r?`n")
-
-    try {
-        $screens = New-Object System.Collections.Generic.List[object]
-        $screenPattern = 'gui_smoke\.display_screen index=(?<index>\d+) name="(?<name>[^"]*)" ' +
-            'manufacturer="(?<manufacturer>[^"]*)" model="(?<model>[^"]*)" serial="(?<serial>[^"]*)" ' +
-            'geometry=(?<gx>-?\d+),(?<gy>-?\d+) (?<gw>\d+)x(?<gh>\d+) physical=(?<pw>\d+)x(?<ph>\d+) ' +
-            'dpr=(?<dpr>[0-9.]+) refresh_hz=(?<refresh>[0-9.]+) primary=(?<primary>[01])'
-        foreach ($line in $lines) {
-            $m = [regex]::Match($line, $screenPattern)
-            if (-not $m.Success) { continue }
-            $screens.Add([ordered]@{
-                index = [int]$m.Groups['index'].Value
-                name = $m.Groups['name'].Value
-                manufacturer = $m.Groups['manufacturer'].Value
-                model = $m.Groups['model'].Value
-                serial = $m.Groups['serial'].Value
-                geometryX = [int]$m.Groups['gx'].Value
-                geometryY = [int]$m.Groups['gy'].Value
-                width = [int]$m.Groups['gw'].Value
-                height = [int]$m.Groups['gh'].Value
-                physicalWidth = [int]$m.Groups['pw'].Value
-                physicalHeight = [int]$m.Groups['ph'].Value
-                devicePixelRatio = [double]$m.Groups['dpr'].Value
-                refreshHz = [double]$m.Groups['refresh'].Value
-                primary = ($m.Groups['primary'].Value -eq '1')
-            })
-        }
-        if ($screens.Count -gt 0) {
-            $result.screensCollected = $true
-            $result.screens = $screens.ToArray()
-        } else {
-            $result.screensError = 'no gui_smoke.display_screen lines found in the smoke log'
-        }
-    } catch {
-        $result.screensCollected = $false
-        $result.screens = @()
-        $result.screensError = $_.Exception.GetType().Name
-    }
-
-    try {
-        $targetLine = $null
-        foreach ($line in $lines) {
-            if ($line -match 'gui_smoke\.display_target ') { $targetLine = $line }
-        }
-        if ($null -eq $targetLine) {
-            $result.targetError = 'no gui_smoke.display_target line found in the smoke log'
-        } else {
-            # UM-DISPLAY-SELECT-AND-LOG-1 round 1c: preferred=/preferred_matched= are appended
-            # fields (optional group -- a legacy log line that predates them still matches on
-            # its pre-existing fields, both reading $null, never guessed).
-            $m = [regex]::Match($targetLine,
-                'screen="(?<name>[^"]*)" reason=(?<reason>\S+) candidates=(?<candidates>\d+) fallback=(?<fallback>[01])' +
-                '(?: preferred="(?<preferred>[^"]*)" preferred_matched=(?<preferredMatched>\S+))?')
-            if (-not $m.Success) {
-                $result.targetError = 'gui_smoke.display_target line did not match the expected shape'
-            } else {
-                $result.target = [ordered]@{
-                    name = $m.Groups['name'].Value
-                    reason = $m.Groups['reason'].Value
-                    candidates = [int]$m.Groups['candidates'].Value
-                    fallback = ($m.Groups['fallback'].Value -eq '1')
-                    preferred = $(if ($m.Groups['preferred'].Success) { $m.Groups['preferred'].Value } else { $null })
-                    preferredMatched = $(if ($m.Groups['preferredMatched'].Success) { $m.Groups['preferredMatched'].Value } else { $null })
-                }
-            }
-        }
-    } catch {
-        $result.targetError = $_.Exception.GetType().Name
-    }
-
-    try {
-        $placementLine = $null
-        foreach ($line in $lines) {
-            if ($line -match 'gui_smoke\.window_placement ') { $placementLine = $line }
-        }
-        if ($null -eq $placementLine) {
-            $result.placementError = 'no gui_smoke.window_placement line found in the smoke log'
-        } else {
-            # UM-DISPLAY-SELECT-AND-LOG-1 round 1c (sol BLOCKER 3): the trailing group is
-            # OPTIONAL -- a legacy log line that predates target_screen=/presentation_screen=/
-            # presentation_physical= (an older "before" binary in an A/B, or a log this parser
-            # has not been told about yet) still matches on its pre-existing fields, with all
-            # four new captures reading $null, never guessed.
-            $m = [regex]::Match($placementLine,
-                'mode=(?<mode>\w+) screen="(?<name>[^"]*)" verified=(?<verified>[01]) ' +
-                'window=(?<wx>-?\d+),(?<wy>-?\d+) (?<ww>\d+)x(?<wh>\d+) preview=(?<pw>\d+)x(?<ph>\d+)' +
-                '(?: target_screen="(?<targetScreen>[^"]*)" presentation_screen="(?<presentationScreen>[^"]*)" ' +
-                'presentation_physical=(?<ppw>\d+)x(?<pph>\d+))?')
-            if (-not $m.Success) {
-                $result.placementError = 'gui_smoke.window_placement line did not match the expected shape'
-            } else {
-                $result.placement = [ordered]@{
-                    mode = $m.Groups['mode'].Value
-                    screenName = $m.Groups['name'].Value
-                    verified = ($m.Groups['verified'].Value -eq '1')
-                    windowX = [int]$m.Groups['wx'].Value
-                    windowY = [int]$m.Groups['wy'].Value
-                    windowWidth = [int]$m.Groups['ww'].Value
-                    windowHeight = [int]$m.Groups['wh'].Value
-                    previewWidth = [int]$m.Groups['pw'].Value
-                    previewHeight = [int]$m.Groups['ph'].Value
-                    targetScreenName = $(if ($m.Groups['targetScreen'].Success) { $m.Groups['targetScreen'].Value } else { $null })
-                    presentationScreenName = $(if ($m.Groups['presentationScreen'].Success) { $m.Groups['presentationScreen'].Value } else { $null })
-                    presentationPhysicalWidth = $(if ($m.Groups['ppw'].Success) { [int]$m.Groups['ppw'].Value } else { $null })
-                    presentationPhysicalHeight = $(if ($m.Groups['pph'].Success) { [int]$m.Groups['pph'].Value } else { $null })
-                }
-            }
-        }
-    } catch {
-        $result.placementError = $_.Exception.GetType().Name
-    }
-
-    [pscustomobject]$result
+    ConvertFrom-GuiSmokeDisplayLog -LogText $LogText
 }
 
 # CUDA-PERF-DISPLAY-WAKE-1. OWNER (2026-09-25): "if display is asleep just wake it. its just the

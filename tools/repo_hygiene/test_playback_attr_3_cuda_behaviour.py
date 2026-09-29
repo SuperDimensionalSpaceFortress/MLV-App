@@ -54,6 +54,11 @@ SMOKE_RUNNER_STAGE_GENERATOR = ROOT / "tools" / "profiling" / "bachelor" / "attr
 STAGE_JOB_MODULE = ROOT / "tools" / "profiling" / "bachelor" / "Attr3FootageStageJob.psm1"
 PRESENCE_JOB_MODULE = ROOT / "tools" / "profiling" / "bachelor" / "Attr3FootagePresenceJob.psm1"
 
+# UM-DISPLAY-SELECT-AND-LOG-1 round 3: the shared display-identity parser is a pinned
+# smoke-runner closure sibling AND the job embeds its functions from the committed blob,
+# so a fixture repo must carry its REAL text, not a stand-in.
+_DISPLAY_IDENTITY_TEXT = (Path(__file__).resolve().parents[2] / "tools" / "profiling" / "gui-smoke-display-identity.ps1").read_text(encoding="utf-8")
+
 PWSH = shutil.which("pwsh")
 GIT = shutil.which("git")
 
@@ -210,7 +215,8 @@ def _make_fixture_repo(path: Path) -> list[str]:
         "Import-Module (Join-Path $PSScriptRoot 'gui-smoke-process-boundary.psm1') -Force\n"
         ". (Join-Path $PSScriptRoot 'provenance-stamp.ps1')\n"
         ". (Join-Path $PSScriptRoot 'gui-smoke-color-artifact-scan.ps1')\n"
-        ". (Join-Path $PSScriptRoot 'gui-smoke-gpu-texture-route-validation.ps1')\n",
+        ". (Join-Path $PSScriptRoot 'gui-smoke-gpu-texture-route-validation.ps1')\n"
+        ". (Join-Path $PSScriptRoot 'gui-smoke-display-identity.ps1')\n",
         encoding="utf-8",
     )
     (path / "tools" / "profiling" / "gui-smoke-screenshot-provenance.ps1").write_text(
@@ -228,6 +234,7 @@ def _make_fixture_repo(path: Path) -> list[str]:
     (path / "tools" / "profiling" / "gui-smoke-gpu-texture-route-validation.ps1").write_text(
         "# fixture stand-in sibling (dot-sourced directly by the runner)\n", encoding="utf-8"
     )
+    (path / "tools" / "profiling" / "gui-smoke-display-identity.ps1").write_text(_DISPLAY_IDENTITY_TEXT, encoding="utf-8")
     # CUDA-PLAYBACK-CONTACT-SHEET-1 r1b: the attribution generator also resolves this path's
     # committed blob unconditionally (to embed it in the emitted job for the contact-sheet
     # compose step), same reason as the smoke-runner closure comment above -- every test that
@@ -2540,6 +2547,7 @@ SMOKE_RUNNER_CLOSURE_NAMES = (
     "gui-smoke-process-boundary.psm1",
     "gui-smoke-color-artifact-scan.ps1",
     "gui-smoke-gpu-texture-route-validation.ps1",
+    "gui-smoke-display-identity.ps1",
 )
 
 
@@ -2548,7 +2556,7 @@ class SmokeRunnerClosureManifestTests(_PwshCase):
     """Get-AttrCudaSmokeRunnerClosureManifest: the EXPLICIT, pinned list that replaced discovery
     (ATTR3-SMOKE-RUNNER-DEPS-1 round 3, NARROW BY REDESIGN)."""
 
-    def test_the_manifest_is_the_six_pinned_repo_relative_paths_in_order(self) -> None:
+    def test_the_manifest_is_the_seven_pinned_repo_relative_paths_in_order(self) -> None:
         proc = self.run_with_module(
             "Get-AttrCudaSmokeRunnerClosureManifest | ForEach-Object { Write-Output \"PATH=$_\" }\n"
         )
@@ -2563,6 +2571,7 @@ class SmokeRunnerClosureManifestTests(_PwshCase):
                 "tools/profiling/gui-smoke-process-boundary.psm1",
                 "tools/profiling/gui-smoke-color-artifact-scan.ps1",
                 "tools/profiling/gui-smoke-gpu-texture-route-validation.ps1",
+                "tools/profiling/gui-smoke-display-identity.ps1",
             ],
         )
 
@@ -2674,6 +2683,7 @@ class ClosureCompletenessTests(_PwshCase):
             "provenance-stamp.ps1",
             "gui-smoke-color-artifact-scan.ps1",
             "gui-smoke-gpu-texture-route-validation.ps1",
+            "gui-smoke-display-identity.ps1",
         ):
             (path / "tools" / "profiling" / sibling).write_text(f"# {sibling} stand-in\n", encoding="utf-8")
         (path / "tools" / "profiling" / "gui-smoke-process-boundary.psm1").write_text(
@@ -2699,7 +2709,7 @@ class ClosureCompletenessTests(_PwshCase):
         self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
         self.assertIn("NO_THROW", proc.stdout)
 
-    def test_all_six_pinned_dependency_loads_classify_cleanly(self) -> None:
+    def test_all_pinned_dependency_loads_classify_cleanly(self) -> None:
         repo = self.tmp / "repo"
         runner = (
             ". (Join-Path $PSScriptRoot 'gui-smoke-screenshot-provenance.ps1')\n"
@@ -2707,6 +2717,7 @@ class ClosureCompletenessTests(_PwshCase):
             "Import-Module (Join-Path $PSScriptRoot 'gui-smoke-process-boundary.psm1') -Force\n"
             ". (Join-Path $PSScriptRoot 'gui-smoke-color-artifact-scan.ps1')\n"
             ". (Join-Path $PSScriptRoot 'gui-smoke-gpu-texture-route-validation.ps1')\n"
+            ". (Join-Path $PSScriptRoot 'gui-smoke-display-identity.ps1')\n"
         )
         sha = self._repo_with_runner_text(repo, runner)
         proc = self._assert_complete(repo, sha)
@@ -2823,6 +2834,7 @@ class ClosureCompletenessTests(_PwshCase):
             "Import-Module (Join-Path $PSScriptRoot 'gui-smoke-process-boundary.psm1') -Force\n"
             ". (Join-Path $PSScriptRoot 'gui-smoke-color-artifact-scan.ps1')\n"
             ". (Join-Path $PSScriptRoot 'gui-smoke-gpu-texture-route-validation.ps1')\n"
+            ". (Join-Path $PSScriptRoot 'gui-smoke-display-identity.ps1')\n"
             "function f([scriptblock]$p) { & $p 1 }\n"
         )
         sha = self._repo_with_runner_text(repo, runner)
@@ -2838,6 +2850,7 @@ class ClosureCompletenessTests(_PwshCase):
             "Import-Module (Join-Path $PSScriptRoot 'gui-smoke-process-boundary.psm1') -Force\n"
             ". (Join-Path $PSScriptRoot 'gui-smoke-color-artifact-scan.ps1')\n"
             ". (Join-Path $PSScriptRoot 'gui-smoke-gpu-texture-route-validation.ps1')\n"
+            ". (Join-Path $PSScriptRoot 'gui-smoke-display-identity.ps1')\n"
             "$predicate = { param($x) $x -eq 1 }\n"
             "& $predicate 1\n"
         )
@@ -2870,6 +2883,7 @@ class ClosureCompletenessTests(_PwshCase):
             "Import-Module (Join-Path $PSScriptRoot 'gui-smoke-process-boundary.psm1') -Force\n"
             ". (Join-Path $PSScriptRoot 'gui-smoke-color-artifact-scan.ps1')\n"
             ". (Join-Path $PSScriptRoot 'gui-smoke-gpu-texture-route-validation.ps1')\n"
+            ". (Join-Path $PSScriptRoot 'gui-smoke-display-identity.ps1')\n"
             "Add-Type -AssemblyName System.Drawing\n"
         )
         sha = self._repo_with_runner_text(repo, runner)
@@ -2900,6 +2914,7 @@ class ClosureCompletenessTests(_PwshCase):
             "Import-Module (Join-Path $PSScriptRoot 'gui-smoke-process-boundary.psm1') -Force\n"
             ". (Join-Path $PSScriptRoot 'gui-smoke-color-artifact-scan.ps1')\n"
             ". (Join-Path $PSScriptRoot 'gui-smoke-gpu-texture-route-validation.ps1')\n"
+            ". (Join-Path $PSScriptRoot 'gui-smoke-display-identity.ps1')\n"
             "$detectorPwsh = 'pwsh.exe'\n"
             "$detectorArgs = @()\n"
             "$detectorOut = & $detectorPwsh @detectorArgs 2>&1\n"
@@ -2936,6 +2951,7 @@ class ClosureCompletenessTests(_PwshCase):
             ". (Join-Path $PSScriptRoot 'provenance-stamp.ps1')\n"
             ". (Join-Path $PSScriptRoot 'gui-smoke-color-artifact-scan.ps1')\n"
             ". (Join-Path $PSScriptRoot 'gui-smoke-gpu-texture-route-validation.ps1')\n"
+            ". (Join-Path $PSScriptRoot 'gui-smoke-display-identity.ps1')\n"
             "Microsoft.PowerShell.Core\\Import-Module "
             "(Join-Path $PSScriptRoot 'gui-smoke-process-boundary.psm1') -Force\n"
         )
@@ -3014,6 +3030,7 @@ class ClosureCompletenessTests(_PwshCase):
             "Import-Module (Join-Path $PSScriptRoot 'gui-smoke-process-boundary.psm1') -Force\n"
             ". (Join-Path $PSScriptRoot 'gui-smoke-color-artifact-scan.ps1')\n"
             ". (Join-Path $PSScriptRoot 'gui-smoke-gpu-texture-route-validation.ps1')\n"
+            ". (Join-Path $PSScriptRoot 'gui-smoke-display-identity.ps1')\n"
             "$startInfo = [System.Diagnostics.ProcessStartInfo]::new()\n"
             "$process = [System.Diagnostics.Process]::Start($startInfo)\n"
         )

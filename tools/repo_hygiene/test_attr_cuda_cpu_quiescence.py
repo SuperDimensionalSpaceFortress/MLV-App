@@ -62,7 +62,7 @@ class QuiescenceSampleTests(_ProbeCase):
             "function Get-CimInstance { param($ClassName, $ErrorAction) "
             "[pscustomobject]@{ LoadPercentage = 82 } }\n"
             "function Get-Counter { param($Counter, $ErrorAction) "
-            "[pscustomobject]@{ CounterSamples = @([pscustomobject]@{ CookedValue = 37.2 }) } }\n"
+            "[pscustomobject]@{ CounterSamples = @([pscustomobject]@{ CookedValue = 37.2; Status = 0 }) } }\n"
             "$s = Get-AttrCudaQuiescenceSample\n"
             "Write-Host \"UTILITY=$($s.utilityPercent) TIME=$($s.timePercent) ERROR=$($s.timePercentError)\"\n"
         )
@@ -94,7 +94,7 @@ class QuiescenceSampleTests(_ProbeCase):
             "function Get-CimInstance { param($ClassName, $ErrorAction) "
             "throw [System.InvalidOperationException]::new('CIM unavailable') }\n"
             "function Get-Counter { param($Counter, $ErrorAction) "
-            "[pscustomobject]@{ CounterSamples = @([pscustomobject]@{ CookedValue = 15.0 }) } }\n"
+            "[pscustomobject]@{ CounterSamples = @([pscustomobject]@{ CookedValue = 15.0; Status = 0 }) } }\n"
             "$s = Get-AttrCudaQuiescenceSample\n"
             "Write-Host \"UTILITY=$(if ($null -eq $s.utilityPercent) { 'NULL' } else { $s.utilityPercent }) TIME=$($s.timePercent)\"\n"
         )
@@ -169,6 +169,22 @@ class QuiescenceSampleTests(_ProbeCase):
             "function Get-CimInstance { param($ClassName, $ErrorAction) [pscustomobject]@{ LoadPercentage = 10 } }\n"
             "function Get-Counter { param($Counter, $ErrorAction) "
             "[pscustomobject]@{ CounterSamples = @([pscustomobject]@{ CookedValue = 15.0; Status = 0x800000BC }) } }\n"
+            "$s = Get-AttrCudaQuiescenceSample\n"
+            "Write-Host \"TIME=$(if ($null -eq $s.timePercent) { 'NULL' } else { $s.timePercent }) ERROR=$($s.timePercentError)\"\n"
+        )
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        self.assertIn("TIME=NULL", proc.stdout)
+        self.assertIn("ERROR=InvalidOperationException", proc.stdout)
+
+    def test_an_absent_status_is_unknown_not_valid(self) -> None:
+        # UM-DISPLAY-SELECT-AND-LOG-1 round 3 (sol hardening): a real PDH CounterSample always
+        # carries Status; a sample with NO Status member cannot be vouched for, so it must be the
+        # same third (unknown) state -- never accepted as valid. MUTATION CAUGHT: treating an
+        # absent Status as valid again.
+        proc = self.run_snippet(
+            "function Get-CimInstance { param($ClassName, $ErrorAction) [pscustomobject]@{ LoadPercentage = 10 } }\n"
+            "function Get-Counter { param($Counter, $ErrorAction) "
+            "[pscustomobject]@{ CounterSamples = @([pscustomobject]@{ CookedValue = 15.0 }) } }\n"
             "$s = Get-AttrCudaQuiescenceSample\n"
             "Write-Host \"TIME=$(if ($null -eq $s.timePercent) { 'NULL' } else { $s.timePercent }) ERROR=$($s.timePercentError)\"\n"
         )

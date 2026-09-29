@@ -23,6 +23,7 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[2]
 RUNNER = ROOT / "tools" / "profiling" / "run-release-gui-smoke.ps1"
 COMPARE_SCRIPT = ROOT / "tools" / "profiling" / "compare-release-gui-smoke-ab.ps1"
+SHARED = ROOT / "tools" / "profiling" / "gui-smoke-display-identity.ps1"
 
 PWSH = shutil.which("pwsh")
 requires_pwsh = unittest.skipIf(PWSH is None, "pwsh is not on PATH")
@@ -174,7 +175,9 @@ class RunnerDisplayBlockExtractionTests(_ProbeCase):
 
     def setUp(self) -> None:
         super().setUp()
-        self.span = _extract_display_block_span()
+        # The runner dot-sources the shared parser as a closure sibling; the extracted span needs
+        # the same functions in scope.
+        self.span = f". '{SHARED}'\n" + _extract_display_block_span()
 
     def _probe(self, recent_lines_literal: str) -> subprocess.CompletedProcess:
         return self.run_snippet(

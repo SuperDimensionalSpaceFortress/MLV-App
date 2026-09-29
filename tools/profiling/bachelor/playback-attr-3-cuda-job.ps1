@@ -638,6 +638,24 @@ foreach ($entry in $smokeRunnerClosure) {
         throw "ATTRCUDA_BLOB_SHA_MALFORMED resolved closure file sha256 is not 64 lowercase hex for $($entry.name): '$($entry.sha256)'"
     }
 }
+# UM-DISPLAY-SELECT-AND-LOG-1 round 3 (opus-blocker-1): the ONE display-identity parser. The smoke
+# runner dot-sources gui-smoke-display-identity.ps1 as a pinned closure sibling; this job embeds the
+# SAME file's functions, extracted from its COMMITTED bytes at $SourceCommit (the bytes the closure
+# stages -- never the generator's working tree, which may differ), so the job and the runner cannot
+# publish two different identities for one leg. Get-AttrCudaGuiSmokeDisplaySelection (embedded from
+# AttrCudaArtifacts.psm1 above) delegates to ConvertFrom-GuiSmokeDisplayLog.
+$displayIdentityBlobId = Resolve-AttrCudaCommittedBlobId -RepoRoot $RepoRoot -Commit $SourceCommit -RepoRelativePath 'tools/profiling/gui-smoke-display-identity.ps1'
+$displayIdentityTemp = Join-Path ([IO.Path]::GetTempPath()) "attrcuda-display-identity-$([Guid]::NewGuid().ToString('N')).ps1"
+try {
+    [void](Save-AttrCudaCommittedBlobBytes -RepoRoot $RepoRoot -BlobId $displayIdentityBlobId -Destination $displayIdentityTemp)
+    $embeddedFunctions = $embeddedFunctions + "`r`n`r`n" + (Get-AttrCudaEmbeddedFunctionSource -ModulePath $displayIdentityTemp -Name @(
+        'ConvertFrom-GuiSmokeLogFields',
+        'ConvertFrom-GuiSmokeDisplayLog',
+        'Get-GuiSmokeDisplayIdentity'
+    ))
+} finally {
+    if (Test-Path -LiteralPath $displayIdentityTemp) { Remove-Item -LiteralPath $displayIdentityTemp -Force -ErrorAction SilentlyContinue }
+}
 $smokeRunnerClosureDigest = Get-AttrCudaClosureDigestHex -Closure $smokeRunnerClosure
 if ($smokeRunnerClosureDigest -notmatch '^[0-9a-f]{64}$') {
     throw "ATTRCUDA_BLOB_SHA_MALFORMED smoke-runner closure digest is not 64 lowercase hex: '$smokeRunnerClosureDigest'"
@@ -1192,6 +1210,10 @@ function Build-AttrCudaDisplayBlock {
         -WindowsCollected ([bool]$WindowsInventory.collected) -WindowsAnyModeCollected $windowsAnyModeCollected
 
     [ordered]@{
+        # Round 3 (sol hardening): which side of the smoke run this block describes. A refusal that
+        # fires before the smoke log exists (SMOKE_RUN_FAILED, VENUE_NOT_QUIESCENT, ...) publishes a
+        # 'pre-smoke' block -- the app never reported anything, so nothing in it was measured.
+        phase = $(if ($appKnown) { 'post-smoke' } else { 'pre-smoke' })
         windowsDisplaysCollected = [bool]$WindowsInventory.collected
         windowsDisplays = $WindowsInventory.devices
         windowsDisplaysError = $WindowsInventory.error
@@ -1205,6 +1227,10 @@ function Build-AttrCudaDisplayBlock {
         presentation = $presentationBlock
         presentationUnknownReason = $presentationUnknownReason
         presentationWindowsDevice = $presentationWindowsDevice
+        # Round 3 (opus-blocker-1): the identity the smoke runner's result.json publishes and the
+        # comparator consumes, from the SAME shared parser (ConvertFrom-GuiSmokeDisplayLog /
+        # Get-GuiSmokeDisplayIdentity, embedded below) -- $null until the smoke log is available.
+        presentationIdentity = $(if ($appKnown) { Get-GuiSmokeDisplayIdentity -Selection $AppSelection } else { $null })
         # Round 2 (sol PRE-REVIEW #2 BLOCKER a): how the venue's preferred monitor name was
         # resolved to the device name handed to the app (mapped|ambiguous|absent|unknown|none).
         preferredWindowsMapping = $PreferredResolution

@@ -25,6 +25,7 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[2]
 MODULE = ROOT / "tools" / "profiling" / "bachelor" / "AttrCudaArtifacts.psm1"
 JOB_SCRIPT = ROOT / "tools" / "profiling" / "bachelor" / "playback-attr-3-cuda-job.ps1"
+SHARED_IDENTITY = ROOT / "tools" / "profiling" / "gui-smoke-display-identity.ps1"
 
 PWSH = shutil.which("pwsh")
 requires_pwsh = unittest.skipIf(PWSH is None, "pwsh is not on PATH")
@@ -344,7 +345,32 @@ class TemplateDisplayBlockExecutionTests(_ProbeCase):
         self.functions = text[build_at:tail_end]
 
     def run_probe(self, body: str) -> subprocess.CompletedProcess:
-        return self.run_snippet(self.functions + "\n" + body)
+        # The job embeds the shared display-identity functions (Build-AttrCudaDisplayBlock calls
+        # Get-GuiSmokeDisplayIdentity); a probe of the extracted function needs them in scope.
+        return self.run_snippet(f". '{SHARED_IDENTITY}'\n" + self.functions + "\n" + body)
+
+    def test_a_block_built_before_the_smoke_log_exists_is_marked_pre_smoke(self) -> None:
+        # UM-DISPLAY-SELECT-AND-LOG-1 round 3 (sol hardening): SMOKE_RUN_FAILED (and every other
+        # refusal that fires before the smoke log exists) publishes the pre-smoke block; it must
+        # say so, so nothing in it can be read as measured on the presented screen.
+        # MUTATION CAUGHT: dropping the phase marker.
+        proc = self.run_probe(
+            "$inv = [pscustomobject]@{ collected = $false; devices = @(); error = 'x' }\n"
+            "$pre = Build-AttrCudaDisplayBlock -WindowsInventory $inv -Venue 'bachelor' -AppSelection $null\n"
+            "$sel = [pscustomobject]@{ screensCollected = $false; screens = @(); screensError = 'e'; target = $null; "
+            "targetError = 'e'; placement = $null; placementError = 'e' }\n"
+            "$post = Build-AttrCudaDisplayBlock -WindowsInventory $inv -Venue 'bachelor' -AppSelection $sel\n"
+            "Write-Host \"PRE=$($pre.phase) POST=$($post.phase)\"\n"
+        )
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        self.assertIn("PRE=pre-smoke POST=post-smoke", proc.stdout)
+
+    def test_smoke_run_failed_publishes_the_pre_smoke_marked_block(self) -> None:
+        text = JOB_SCRIPT.read_text(encoding="utf-8").replace("\r\n", "\n")
+        template = text[text.index("$template = @'"):]
+        at = template.index("result='SMOKE_RUN_FAILED'")
+        self.assertIn("display=$displayBlock", template[at:at + 900])
+        self.assertIn("phase = $(if ($appKnown) { 'post-smoke' } else { 'pre-smoke' })", template)
 
     def test_full_happy_path_produces_the_documented_result_tail(self) -> None:
         proc = self.run_probe(
@@ -609,7 +635,9 @@ class PresentationWindowsMappingTests(_ProbeCase):
         self.functions = text[build_at:tail_end]
 
     def run_probe(self, body: str) -> subprocess.CompletedProcess:
-        return self.run_snippet(self.functions + "\n" + body)
+        # The job embeds the shared display-identity functions (Build-AttrCudaDisplayBlock calls
+        # Get-GuiSmokeDisplayIdentity); a probe of the extracted function needs them in scope.
+        return self.run_snippet(f". '{SHARED_IDENTITY}'\n" + self.functions + "\n" + body)
 
     D1 = "\\\\.\\DISPLAY1"
     D2 = "\\\\.\\DISPLAY2"
