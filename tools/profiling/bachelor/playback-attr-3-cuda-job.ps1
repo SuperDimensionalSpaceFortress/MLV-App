@@ -651,6 +651,7 @@ try {
     $embeddedFunctions = $embeddedFunctions + "`r`n`r`n" + (Get-AttrCudaEmbeddedFunctionSource -ModulePath $displayIdentityTemp -Name @(
         'ConvertFrom-GuiSmokeLogFields',
         'ConvertFrom-GuiSmokeDisplayLog',
+        'Find-GuiSmokeDisplayScreen',
         'Get-GuiSmokeDisplayIdentity'
     ))
 } finally {
@@ -1125,7 +1126,9 @@ function Build-AttrCudaDisplayBlock {
     # so a name mismatch between Qt and Win32 device naming can never produce a wrong target size.
     $targetPhysical = $null
     if ($null -ne $targetInfo) {
-        $targetPhysical = $screens | Where-Object { $_.name -eq $targetInfo.name } | Select-Object -First 1
+        # ONE lookup rule with the identity block: Find-GuiSmokeDisplayScreen (last record wins,
+        # case-insensitive) -- round 4, fable DISPLAY-BLOCK-LOOKUP-LAST-WINS-1.
+        $targetPhysical = Find-GuiSmokeDisplayScreen -Screens $screens -Name ([string]$targetInfo.name)
     }
     $targetBlock = $null
     $targetUnknownReason = $null
@@ -1152,7 +1155,7 @@ function Build-AttrCudaDisplayBlock {
     $presentationName = if ($placement) { $placement.presentationScreenName } else { $null }
     $presentationPhysical = $null
     if ($null -ne $presentationName) {
-        $presentationPhysical = $screens | Where-Object { $_.name -eq $presentationName } | Select-Object -First 1
+        $presentationPhysical = Find-GuiSmokeDisplayScreen -Screens $screens -Name ([string]$presentationName)
     }
     $presentationBlock = $null
     $presentationUnknownReason = $null

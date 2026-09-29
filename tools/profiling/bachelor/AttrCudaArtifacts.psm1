@@ -1085,17 +1085,12 @@ $script:AttrCudaClosureScanExclusions = @(
             '$startInfo.FileName is set to $exe, the built app path resolved before this line, ' +
             'never a $PSScriptRoot sibling script. Process.Start executes an OS binary directly; ' +
             'it does not load or run PowerShell/.NET code from a file this census needs to see ' +
-            '(round 4, fable round-3 minor, PR #144).'
-    },
-    [pscustomobject]@{
-        repoRelativePath = 'tools/profiling/run-release-gui-smoke.ps1'
-        literal = '& $exe --help 2>&1'
-        reason = 'UM-DISPLAY-SELECT-AND-LOG-1 round 1c: the --display-prefer feature probe -- ' +
-            '$exe is the same hash-pinned, already-deployed application executable as the ' +
-            '[System.Diagnostics.Process]::Start($startInfo) exclusion above, never a ' +
-            '$PSScriptRoot sibling script. Runs the OS binary with --help and greps its own ' +
-            'stdout for the option name; it does not load or run PowerShell/.NET code from a ' +
-            'file this census needs to see.'
+            '(round 4, fable round-3 minor, PR #144). UM-DISPLAY-SELECT-AND-LOG-1 round 4 (fable ' +
+            'BLOCKER 1): the runner''s --display-prefer feature probe, ' +
+            'Test-GuiSmokeDisplayPreferSupport, launches through the identical literal -- its ' +
+            '$startInfo.FileName is the same pinned application executable ($ExePath is passed ' +
+            '$exe), run with `--gui-smoke-playback --help` under a hard timeout and killed by pid. ' +
+            'It replaced a bare `& $exe --help 2>&1` site whose own exclusion was deleted with it.'
     }
 )
 

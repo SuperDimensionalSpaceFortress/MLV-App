@@ -330,3 +330,50 @@ TEST(GuiSmokeDisplaySelectWiring, FullscreenRequestLineCarriesTheTargetScreenNam
     ASSERT_TRUE(tail.contains(QStringLiteral(
         ".arg( presentationScreen ? presentationScreen->name() : QStringLiteral(\"none\") )")));
 }
+
+TEST(GuiSmokeDisplaySelectWiring, TheDisplayPreferFeatureProbeArgumentsExitWithoutStartingTheGui)
+{
+    // UM-DISPLAY-SELECT-AND-LOG-1 round 4 (fable BLOCKER 1). The runner's --display-prefer probe
+    // (run-release-gui-smoke.ps1, Test-GuiSmokeDisplayPreferSupport) runs `MLVApp.exe
+    // --gui-smoke-playback --help`. That is only a safe probe because of three facts about
+    // main.cpp, pinned here so a refactor cannot silently turn the probe back into a GUI launch
+    // that never exits (the round-1c probe was a bare `--help`, which is normal GUI mode):
+    //   (1) --gui-smoke-playback routes to runGuiPlaybackSmoke, never to MainWindow;
+    //   (2) that sub-parser registers `--help` as its own option, so process() does not exit
+    //       and does not need an --input;
+    //   (3) the help handler prints the parser's help text and returns 0 BEFORE the "--input is
+    //       required" check and before anything that could create a window.
+    const QString source = readRepoFile(QStringLiteral("platform/qt/main.cpp"));
+
+    const int smokeAt = source.indexOf(QStringLiteral("static int runGuiPlaybackSmoke(QApplication &app)"));
+    ASSERT_TRUE(smokeAt >= 0);
+    const QString smoke = source.mid(smokeAt);
+
+    const int helpRegAt = smoke.indexOf(QStringLiteral("QCommandLineOption helpOpt("));
+    ASSERT_TRUE(helpRegAt >= 0);
+    ASSERT_TRUE(smoke.mid(helpRegAt, 200).contains(QStringLiteral("QStringLiteral(\"help\")")));
+
+    const int helpUseAt = smoke.indexOf(QStringLiteral("if (parser.isSet(helpOpt))"));
+    ASSERT_TRUE(helpUseAt > helpRegAt);
+    const QString helpBlock = smoke.mid(helpUseAt, 160);
+    ASSERT_TRUE(helpBlock.contains(QStringLiteral("parser.helpText()")));
+    ASSERT_TRUE(helpBlock.contains(QStringLiteral("return 0;")));
+
+    const int inputRequiredAt = smoke.indexOf(QStringLiteral("--input is required."));
+    ASSERT_TRUE(inputRequiredAt > helpUseAt);
+
+    // Nothing that builds a window sits between the start of runGuiPlaybackSmoke and its help
+    // handler.
+    const QString beforeHelp = smoke.left(helpUseAt);
+    ASSERT_FALSE(beforeHelp.contains(QStringLiteral("MainWindow ")));
+    ASSERT_FALSE(beforeHelp.contains(QStringLiteral(".show()")));
+    ASSERT_FALSE(beforeHelp.contains(QStringLiteral("a.exec()")));
+
+    // (1) the routing: the smoke flag excludes normal GUI mode and dispatches to the smoke
+    // function; a bare --help (no smoke flag) is normal GUI mode -- the reason the probe must
+    // carry --gui-smoke-playback.
+    ASSERT_TRUE(source.contains(QStringLiteral(
+        "!batch && !trim_mlv && !profile_playback && !gui_playback_smoke;")));
+    ASSERT_TRUE(source.contains(QStringLiteral("return runGuiPlaybackSmoke(a);")));
+    ASSERT_TRUE(source.contains(QStringLiteral("/* Normal GUI mode")));
+}

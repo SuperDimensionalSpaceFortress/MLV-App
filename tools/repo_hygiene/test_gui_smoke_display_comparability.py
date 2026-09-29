@@ -14,6 +14,7 @@ These tests EXTRACT the real function/span text (never a reimplementation) and e
 
 from __future__ import annotations
 
+import re
 import shutil
 import subprocess
 import tempfile
@@ -84,6 +85,7 @@ class DisplayComparabilityTests(_ProbeCase):
             f"$after = {after}\n"
             "$r = Get-DisplayComparability -BeforeDisplay $before -AfterDisplay $after\n"
             "Write-Host \"STATUS=$($r.status) REASON=$($r.reasonCode)\"\n"
+            "Write-Host \"DETAIL=$($r.detail)\"\n"
         )
 
     SAME_A = (
@@ -119,6 +121,20 @@ class DisplayComparabilityTests(_ProbeCase):
         proc = self._compare(legacy, legacy)
         self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
         self.assertIn("STATUS=unknown REASON=DISPLAY_IDENTITY_UNKNOWN", proc.stdout)
+
+    def test_empty_identity_fields_in_a_block_are_unknown_never_same(self) -> None:
+        # sol r1 BLOCKER, defence in depth: a block carrying EMPTY manufacturer/model/serial (a
+        # hand-built or legacy-runner result.json that never went through the shared parser's
+        # identity-unknown state) must not compare 'same' on ordinal+mode alone. MUTATION CAUGHT:
+        # comparing the three fields without requiring them non-empty.
+        for prop in ("presentationManufacturer", "presentationModel", "presentationSerial"):
+            with self.subTest(empty=prop):
+                empty = re.sub(rf"{prop}='[^']*'", f"{prop}=''", self.SAME_A)
+                self.assertNotEqual(empty, self.SAME_A)
+                proc = self._compare(empty, empty)
+                self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+                self.assertIn("STATUS=unknown REASON=DISPLAY_IDENTITY_UNKNOWN", proc.stdout)
+                self.assertIn(prop, proc.stdout.split("DETAIL=")[1])
 
     def test_two_identical_verified_legs_are_same(self) -> None:
         proc = self._compare(self.SAME_A, self.SAME_A)
@@ -169,6 +185,64 @@ class DisplayComparabilityTests(_ProbeCase):
 
 
 @requires_pwsh
+class EmptyEdidLegsAreNotComparableTests(_ProbeCase):
+    """sol r1 BLOCKER, exact repro, end to end through the REAL shared parser and the REAL
+    comparator: two DIFFERENT physical 4K displays that reused \\\\.\\DISPLAY1 between legs, both
+    with verified fullscreen placement, identical preview, and EMPTY Qt manufacturer/model/serial
+    (no EDID descriptors). The parser used to publish a 'known' block of empty strings and the
+    comparator returned 'same' -- an FPS delta across different physical displays. Now the legs
+    are identity-unknown and the comparison is REFUSED, and the refusal says why."""
+
+    D1 = "\\\\.\\DISPLAY1"
+
+    def _placement(self) -> str:
+        return (
+            f'gui_smoke.window_placement mode=fullscreen screen="{self.D1}" verified=1 window=0,0 3840x2160 '
+            f'preview=3840x2160 target_screen="{self.D1}" presentation_screen="{self.D1}" '
+            "presentation_physical=3840x2160"
+        )
+
+    def _screen(self, manufacturer: str, model: str, serial: str) -> str:
+        return (
+            f'gui_smoke.display_screen index=0 name="{self.D1}" manufacturer="{manufacturer}" '
+            f'model="{model}" serial="{serial}" geometry=0,0 3840x2160 physical=3840x2160 dpr=1.00 '
+            "refresh_hz=59.997 primary=1"
+        )
+
+    def _compare_logs(self, before_screen: str, after_screen: str) -> subprocess.CompletedProcess:
+        def literal(lines: list[str]) -> str:
+            return "@(" + ",".join("'" + ln.replace("'", "''") + "'" for ln in lines) + ")"
+
+        return self.run_snippet(
+            f". '{SHARED}'\n"
+            + _extract_function(COMPARE_SCRIPT, "Get-DisplayComparability") + "\n"
+            f"$before = Get-GuiSmokeDisplayIdentity -Selection (ConvertFrom-GuiSmokeDisplayLog -LogText ({literal([before_screen, self._placement()])} -join \"`n\"))\n"
+            f"$after = Get-GuiSmokeDisplayIdentity -Selection (ConvertFrom-GuiSmokeDisplayLog -LogText ({literal([after_screen, self._placement()])} -join \"`n\"))\n"
+            "$r = Get-DisplayComparability -BeforeDisplay $before -AfterDisplay $after\n"
+            "Write-Host \"STATUS=$($r.status) REASON=$($r.reasonCode)\"\n"
+            "Write-Host \"BEFORE_REASON=$($before.identityUnknownReason)\"\n"
+        )
+
+    def test_two_edid_less_displays_sharing_a_device_name_are_refused_never_same(self) -> None:
+        proc = self._compare_logs(self._screen("", "", ""), self._screen("", "", ""))
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        self.assertIn("STATUS=unknown REASON=DISPLAY_IDENTITY_UNKNOWN", proc.stdout)
+        # ...and the refusal says why.
+        self.assertRegex(proc.stdout, r"BEFORE_REASON=.*empty.*manufacturer.*model.*serial")
+
+    def test_two_fully_populated_identical_legs_are_still_same(self) -> None:
+        # The refusal must not swallow the good case.
+        proc = self._compare_logs(self._screen("ASUS", "PA329C", "S-9"), self._screen("ASUS", "PA329C", "S-9"))
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        self.assertIn("STATUS=same REASON=", proc.stdout)
+
+    def test_two_populated_legs_that_differ_in_model_are_different(self) -> None:
+        proc = self._compare_logs(self._screen("ASUS", "PA329C", "S-9"), self._screen("DON", "DENON-AVR", "S-9"))
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        self.assertIn("STATUS=different REASON=DISPLAY_MISMATCH", proc.stdout)
+
+
+@requires_pwsh
 class RunnerDisplayBlockExtractionTests(_ProbeCase):
     """Executes the ACTUAL runner span (extracted verbatim) that turns $recentLines into the
     `display` block published on result.json."""
@@ -194,7 +268,7 @@ class RunnerDisplayBlockExtractionTests(_ProbeCase):
         lines = (
             "@("
             "'gui_smoke.display_screen index=0 name=\"\\\\.\\DISPLAY1\" manufacturer=\"ASUS\" "
-            "model=\"PA329C\" serial=\"\" geometry=0,0 3840x2160 physical=3840x2160 dpr=1.00 "
+            "model=\"PA329C\" serial=\"S-9\" geometry=0,0 3840x2160 physical=3840x2160 dpr=1.00 "
             "refresh_hz=59.997 primary=0',"
             "'gui_smoke.window_placement mode=fullscreen screen=\"\\\\.\\DISPLAY1\" verified=1 "
             "window=0,0 3840x2160 preview=3840x2160 target_screen=\"\\\\.\\DISPLAY1\" "
@@ -244,8 +318,8 @@ class RunnerDisplayBlockExtractionTests(_ProbeCase):
     def test_a_rejected_move_reports_the_presentation_screen_not_the_target(self) -> None:
         lines = (
             "@("
-            "'gui_smoke.display_screen index=0 name=\"\\\\.\\DISPLAY2\" manufacturer=\"\" "
-            "model=\"\" serial=\"\" geometry=0,0 2560x1440 physical=2560x1440 dpr=1.00 "
+            "'gui_smoke.display_screen index=0 name=\"\\\\.\\DISPLAY2\" manufacturer=\"GEN\" "
+            "model=\"PNP\" serial=\"G-1\" geometry=0,0 2560x1440 physical=2560x1440 dpr=1.00 "
             "refresh_hz=60.000 primary=1',"
             "'gui_smoke.window_placement mode=fullscreen screen=\"\\\\.\\DISPLAY1\" verified=0 "
             "window=0,0 2560x1440 preview=2560x1440 target_screen=\"\\\\.\\DISPLAY1\" "

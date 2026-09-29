@@ -546,6 +546,23 @@ function Get-DisplayComparability {
             }
         }
     }
+    # Round 4 (sol r1 BLOCKER): a PRESENT-but-empty manufacturer/model/serial is not a known
+    # identity either (Qt reports an empty string for a display with no EDID descriptor). The
+    # shared parser already turns that into identityUnknownReason above; this refuses a block
+    # that reaches the comparator without going through it (hand-built or legacy result.json),
+    # so two empty-EDID legs can never agree on "empty == empty" and compare 'same'.
+    foreach ($identityProperty in 'presentationManufacturer', 'presentationModel', 'presentationSerial') {
+        foreach ($side in @([pscustomobject]@{ name = 'before'; block = $BeforeDisplay },
+                [pscustomobject]@{ name = 'after'; block = $AfterDisplay })) {
+            if ([string]::IsNullOrWhiteSpace([string]$side.block.PSObject.Properties[$identityProperty].Value)) {
+                return [pscustomobject]@{
+                    status = 'unknown'; reasonCode = 'DISPLAY_IDENTITY_UNKNOWN'
+                    detail = "$($side.name) leg has an empty $identityProperty (no EDID descriptor): two displays sharing one device name cannot be told apart"
+                    before = $BeforeDisplay; after = $AfterDisplay
+                }
+            }
+        }
+    }
     if ($BeforeDisplay.verified -ne $true -or $AfterDisplay.verified -ne $true) {
         return [pscustomobject]@{
             status = 'unknown'; reasonCode = 'PLACEMENT_UNVERIFIED'
@@ -951,10 +968,23 @@ $displayComparability = Get-DisplayComparability `
     -BeforeDisplay (Get-NestedValue $beforeSmoke "display") `
     -AfterDisplay (Get-NestedValue $afterSmoke "display")
 if ($displayComparability.status -ne 'same') {
+    # Round 4: the refusal says WHY -- the comparator's own detail and each leg's own
+    # identityUnknownReason (e.g. empty EDID fields), never just an opaque reason code.
+    $displayWhy = @()
+    if ($displayComparability.PSObject.Properties['detail'] -and $displayComparability.detail) {
+        $displayWhy += [string]$displayComparability.detail
+    }
+    foreach ($leg in 'before', 'after') {
+        $legBlock = $displayComparability.$leg
+        if ($null -ne $legBlock -and $legBlock.identityUnknownReason) {
+            $displayWhy += "$leg leg: $($legBlock.identityUnknownReason)"
+        }
+    }
     $failures += (
         "Display comparability is '$($displayComparability.status)' ($($displayComparability.reasonCode)): " +
         "the before/after legs are not known to have presented on the same display identity and " +
-        "mode, so an FPS comparison between them is not meaningful."
+        "mode, so an FPS comparison between them is not meaningful." +
+        $(if ($displayWhy.Count -gt 0) { " Why: " + ($displayWhy -join '; ') } else { '' })
     )
 }
 

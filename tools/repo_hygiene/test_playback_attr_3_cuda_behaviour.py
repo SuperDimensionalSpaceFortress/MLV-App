@@ -1136,6 +1136,63 @@ class AttributionJobDisablePaintPerSubmitTests(_PwshCase):
 
 @requires_pwsh
 @requires_git
+class DisplayIdentityEmbedsFromCommittedBlobTests(_PwshCase):
+    """UM-DISPLAY-SELECT-AND-LOG-1 round 4 (fable DISPLAY-IDENTITY-EMBED-FROM-BLOB-TEST-1).
+
+    The emitted job embeds the shared display-identity parser from its COMMITTED bytes at
+    -SourceCommit -- the bytes the smoke-runner closure stages -- never the generator's working
+    tree. The generator runs against a throwaway repo whose committed parser is the real file and
+    whose WORKING-TREE copy is then edited without committing; the emitted job must carry the
+    committed text and none of the edit."""
+
+    MARKER = "WORKING_TREE_ONLY_MARKER_4F1C"
+
+    def setUp(self) -> None:
+        super().setUp()
+        self.repo = self.tmp / "repo"
+        self.shas = _make_fixture_repo(self.repo)
+        self.staging = self.tmp / "staging"
+        self.staging.mkdir()
+
+    def _generate(self) -> str:
+        out_file = self.staging / "job.ps1"
+        script = self.tmp / "generate.ps1"
+        script.write_text(
+            "$ErrorActionPreference = 'Stop'\n"
+            f"& '{ATTRIBUTION_GENERATOR}' -SourceCommit '{self.shas[1]}' "
+            f"-BuildManifestSha256 '{'a' * 64}' -ClipId 'tiny_dual_iso' "
+            f"-FixtureSha256 '{'b' * 64}' -OutFile '{out_file}' -RepoRoot '{self.repo}'\n",
+            encoding="utf-8",
+        )
+        proc = _run_pwsh_file(script)
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        return out_file.read_text(encoding="utf-8")
+
+    def test_the_job_embeds_the_committed_parser_not_the_working_tree(self) -> None:
+        # MUTATION CAUGHT: extracting from `Join-Path $RepoRoot 'tools/profiling/gui-smoke-
+        # display-identity.ps1'` (the working tree) instead of the blob at -SourceCommit.
+        baseline = self._generate()
+        for name in ("ConvertFrom-GuiSmokeLogFields", "ConvertFrom-GuiSmokeDisplayLog",
+                     "Get-GuiSmokeDisplayIdentity", "Find-GuiSmokeDisplayScreen"):
+            with self.subTest(embedded=name):
+                self.assertIn(f"function {name} {{", baseline)
+        self.assertNotIn(self.MARKER, baseline)
+
+        shared = self.repo / "tools" / "profiling" / "gui-smoke-display-identity.ps1"
+        text = shared.read_bytes().decode("utf-8")
+        anchor = "function Get-GuiSmokeDisplayIdentity {"
+        self.assertIn(anchor, text.replace("\r\n", "\n"))
+        edited = text.replace("\r\n", "\n").replace(anchor, anchor + f"\n    # {self.MARKER}", 1)
+        shared.write_bytes(edited.encode("utf-8"))  # working tree only -- deliberately NOT committed
+        self.addCleanup(lambda: shared.write_bytes(text.encode("utf-8")))
+
+        job_text = self._generate()
+        self.assertNotIn(self.MARKER, job_text)
+        self.assertIn(f"function Get-GuiSmokeDisplayIdentity {{", job_text)
+
+
+@requires_pwsh
+@requires_git
 class GeneratorBakeTokenInjectionTests(_PwshCase):
     """ATTR3-FOOTAGE-BIND-1 PR-B round 2 (astra BLOCKER): every __TOKEN__ this generator bakes
     into the emitted job's single-quoted template literals must be either strictly validated to

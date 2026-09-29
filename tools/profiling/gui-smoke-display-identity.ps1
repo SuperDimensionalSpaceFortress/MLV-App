@@ -233,6 +233,36 @@ function ConvertFrom-GuiSmokeDisplayLog {
     [pscustomobject]$result
 }
 
+function Find-GuiSmokeDisplayScreen {
+    <#
+    .SYNOPSIS
+    The ONE lookup rule for "the display_screen record for this screen name": case-insensitive
+    name match, and when several records carry the name the LAST one wins.
+    .DESCRIPTION
+    Every consumer that resolves a screen name to its display_screen record -- this file's
+    Get-GuiSmokeDisplayIdentity and the attribution job's Build-AttrCudaDisplayBlock (target and
+    presentation blocks) -- goes through this function, so one summary.json can never carry two
+    different refresh/size values for one screen name (UM-DISPLAY-SELECT-AND-LOG-1 round 4,
+    fable DISPLAY-BLOCK-LOOKUP-LAST-WINS-1). Returns $null when no record carries the name.
+    #>
+    [CmdletBinding()]
+    param(
+        [AllowNull()]
+        $Screens,
+
+        [AllowNull()]
+        [AllowEmptyString()]
+        [string]$Name
+    )
+
+    $found = $null
+    if ([string]::IsNullOrEmpty($Name)) { return $null }
+    foreach ($candidate in @($Screens)) {
+        if ($null -ne $candidate -and [string]$candidate.name -ieq $Name) { $found = $candidate }
+    }
+    return $found
+}
+
 function Get-GuiSmokeDisplayIdentity {
     <#
     .SYNOPSIS
@@ -245,8 +275,12 @@ function Get-GuiSmokeDisplayIdentity {
     identity field $null, verified $false and identityUnknownReason set -- never a "known" block
     with null-valued fields (two of those used to compare 'same'). A screen line that predates
     manufacturer/model/serial is identity-unknown too, since the \\.\DISPLAYn ordinal alone can
-    be reused by a different monitor between two legs. When two display_screen lines carry the
-    same name (case-insensitively) the LAST one wins.
+    be reused by a different monitor between two legs. An EMPTY (or whitespace-only) manufacturer,
+    model or serial is NOT a known value either (round 4, sol BLOCKER): Qt reports an empty string
+    for a display with no EDID descriptor, and two different displays that reuse one device name
+    would then agree on every "field" and compare 'same'. Empty means identity UNKNOWN, so the
+    comparison is refused and the reason names the empty fields. When two display_screen lines
+    carry the same name (case-insensitively) the LAST one wins (Find-GuiSmokeDisplayScreen).
     .OUTPUTS
     [pscustomobject] { presentationScreenName; presentationManufacturer; presentationModel;
     presentationSerial; physicalWidth; physicalHeight; refreshHzRounded; dpr; windowMode;
@@ -272,15 +306,22 @@ function Get-GuiSmokeDisplayIdentity {
         } elseif ($null -eq $placement.presentationPhysicalWidth -or $null -eq $placement.presentationPhysicalHeight) {
             $unknownReason = 'window_placement has presentation_screen= but no readable presentation_physical='
         } else {
-            foreach ($candidate in @($Selection.screens)) {
-                if ($null -ne $candidate -and [string]$candidate.name -ieq [string]$placement.presentationScreenName) { $screen = $candidate }
-            }
+            $screen = Find-GuiSmokeDisplayScreen -Screens $Selection.screens -Name ([string]$placement.presentationScreenName)
             if ($null -eq $screen) {
                 # A presentation screen with no matching display_screen record is identity UNKNOWN
                 # -- refresh/DPR/model/serial are all unknowable.
                 $unknownReason = 'presentation screen has no matching gui_smoke.display_screen line'
             } elseif ($null -eq $screen.manufacturer -or $null -eq $screen.model -or $null -eq $screen.serial) {
                 $unknownReason = 'presentation screen display_screen line predates manufacturer/model/serial (identity not knowable)'
+            } else {
+                $emptyFields = @()
+                if ([string]::IsNullOrWhiteSpace([string]$screen.manufacturer)) { $emptyFields += 'manufacturer' }
+                if ([string]::IsNullOrWhiteSpace([string]$screen.model)) { $emptyFields += 'model' }
+                if ([string]::IsNullOrWhiteSpace([string]$screen.serial)) { $emptyFields += 'serial' }
+                if ($emptyFields.Count -gt 0) {
+                    $unknownReason = 'presentation screen reports empty ' + ($emptyFields -join '/') +
+                        ' (no EDID descriptor): displays sharing this device name cannot be told apart, so identity is not knowable'
+                }
             }
         }
     }

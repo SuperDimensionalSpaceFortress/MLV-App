@@ -35,7 +35,12 @@ SHARED = ROOT / "tools" / "profiling" / "gui-smoke-display-identity.ps1"
 PWSH = shutil.which("pwsh")
 requires_pwsh = unittest.skipIf(PWSH is None, "pwsh is not on PATH")
 
-SHARED_FUNCTIONS = ("ConvertFrom-GuiSmokeLogFields", "ConvertFrom-GuiSmokeDisplayLog", "Get-GuiSmokeDisplayIdentity")
+SHARED_FUNCTIONS = (
+    "ConvertFrom-GuiSmokeLogFields",
+    "ConvertFrom-GuiSmokeDisplayLog",
+    "Find-GuiSmokeDisplayScreen",
+    "Get-GuiSmokeDisplayIdentity",
+)
 
 D1 = '\\\\.\\DISPLAY1'
 
@@ -118,6 +123,10 @@ class _ParityCase(unittest.TestCase):
     def job_identity(self, lines: list[str]) -> dict:
         """The job's path: psm1 Get-AttrCudaGuiSmokeDisplaySelection -> the job template's own
         Build-AttrCudaDisplayBlock -> its published `presentationIdentity`."""
+        return self.job_block(lines)["presentationIdentity"]
+
+    def job_block(self, lines: list[str]) -> dict:
+        """The whole `display` block the job's real Build-AttrCudaDisplayBlock publishes."""
         log = self._write_log(lines)
         job_text = JOB_SCRIPT.read_text(encoding="utf-8").replace("\r\n", "\n")
         build = _extract_function(job_text, "Build-AttrCudaDisplayBlock")
@@ -129,7 +138,7 @@ class _ParityCase(unittest.TestCase):
             "$sel = Get-AttrCudaGuiSmokeDisplaySelection -LogText $log\n"
             "$inv = [pscustomobject]@{ collected = $false; devices = @(); error = 'stub' }\n"
             "$b = Build-AttrCudaDisplayBlock -WindowsInventory $inv -Venue 'bachelor' -AppSelection $sel\n"
-            "Write-Output ('JSON=' + ($b.presentationIdentity | ConvertTo-Json -Compress))\n"
+            "Write-Output ('JSON=' + ($b | ConvertTo-Json -Compress -Depth 8))\n"
         )
         self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
         return self._json(proc)
@@ -239,6 +248,61 @@ class JobAndRunnerPublishTheSameIdentityTests(_ParityCase):
         self.assertIn("no matching gui_smoke.display_screen line", identity["identityUnknownReason"])
 
 
+    # ---- round 4, sol BLOCKER 2: empty Qt manufacturer/model/serial are NOT a known identity ----
+
+    def _screen_with(self, manufacturer: str, model: str, serial: str) -> str:
+        return (
+            f'gui_smoke.display_screen index=0 name="{D1}" manufacturer="{manufacturer}" model="{model}" '
+            f'serial="{serial}" geometry=0,0 3840x2160 physical=3840x2160 dpr=1.00 refresh_hz=59.997 primary=1'
+        )
+
+    def test_empty_qt_manufacturer_model_and_serial_are_identity_unknown_in_both(self) -> None:
+        # sol's exact repro: two DIFFERENT displays reusing \\.\DISPLAY1 at 3840x2160@60, Qt
+        # reporting empty manufacturer/model/serial for both. The parser used to publish a KNOWN
+        # block of empty strings and the comparator called two of them 'same'. MUTATION CAUGHT:
+        # treating empty/whitespace strings as known (`$null -eq` instead of IsNullOrWhiteSpace).
+        identity = self.assert_parity([self._screen_with("", "", ""), TARGET, PLACEMENT])
+        self.assertIsNotNone(identity["identityUnknownReason"])
+        self.assertIn("empty", identity["identityUnknownReason"])
+        self.assertIn("manufacturer", identity["identityUnknownReason"])
+        self.assertIn("model", identity["identityUnknownReason"])
+        self.assertIn("serial", identity["identityUnknownReason"])
+        self.assertFalse(identity["verified"])
+        self.assertIsNone(identity["presentationManufacturer"])
+        self.assertIsNone(identity["presentationModel"])
+        self.assertIsNone(identity["presentationSerial"])
+
+    def test_any_single_empty_identity_field_is_identity_unknown_and_named_in_both(self) -> None:
+        for field, screen in (
+            ("manufacturer", self._screen_with("", "PA329C", "S-9")),
+            ("model", self._screen_with("ASUS", "", "S-9")),
+            ("serial", self._screen_with("ASUS", "PA329C", "")),
+            ("whitespace-only serial", self._screen_with("ASUS", "PA329C", "   ")),
+        ):
+            with self.subTest(empty=field):
+                identity = self.assert_parity([screen, TARGET, PLACEMENT])
+                self.assertIsNotNone(identity["identityUnknownReason"])
+                self.assertIn(field.split()[-1], identity["identityUnknownReason"])
+                self.assertFalse(identity["verified"])
+
+    def test_a_fully_populated_identity_is_still_known(self) -> None:
+        # The other side of the rule: nothing that IS populated is refused.
+        self.assert_parity([self._screen_with("ASUS", "PA329C", "S-9"), TARGET, PLACEMENT], KNOWN_ASUS)
+
+    # ---- round 4, fable DISPLAY-BLOCK-LOOKUP-LAST-WINS-1 ----
+
+    def test_the_job_block_and_the_identity_take_the_same_display_screen_record_last_wins(self) -> None:
+        # Two display_screen lines for one name (refresh 30 then 60): the job's target/presentation
+        # blocks used to take the FIRST (30) while the shared parser's identity takes the LAST
+        # (60), so one summary.json carried two refresh values for one leg. MUTATION CAUGHT: a
+        # `Select-Object -First 1` lookup in Build-AttrCudaDisplayBlock.
+        first = SCREEN.replace("refresh_hz=59.997", "refresh_hz=30.000")
+        block = self.job_block([first, SCREEN, TARGET, PLACEMENT])
+        self.assertEqual(block["presentationIdentity"]["refreshHzRounded"], 60)
+        self.assertEqual(round(block["presentation"]["refreshHz"]), 60)
+        self.assertEqual(round(block["target"]["refreshHz"]), 60)
+
+
 @requires_pwsh
 class OnlyOneParserExistsTests(_ParityCase):
     """Structural pins: the consumers must DELEGATE, not carry a regex of their own."""
@@ -269,7 +333,7 @@ class OnlyOneParserExistsTests(_ParityCase):
         placeholder_at = text.index("__EMBEDDED_FUNCTIONS__")
         before = text[:placeholder_at]
         self.assertIn("gui-smoke-display-identity.ps1", before)
-        for name in ("ConvertFrom-GuiSmokeLogFields", "ConvertFrom-GuiSmokeDisplayLog", "Get-GuiSmokeDisplayIdentity"):
+        for name in SHARED_FUNCTIONS:
             with self.subTest(function=name):
                 self.assertIn(f"'{name}'", before)
 

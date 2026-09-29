@@ -1,21 +1,34 @@
-"""Behavioural tests for UM-DISPLAY-SELECT-AND-LOG-1 round 1c's -DisplayPrefer forwarding in
-run-release-gui-smoke.ps1.
+"""Behavioural tests for UM-DISPLAY-SELECT-AND-LOG-1's -DisplayPrefer forwarding in
+run-release-gui-smoke.ps1 (round 1c feature probe; round 4 hang fix).
 
-WHY. opus design-review item 5: the app rejects an unknown CLI option outright
+WHY. opus design-review item 5 (round 1c): the app rejects an unknown CLI option outright
 (QCommandLineParser::process()), so forwarding --display-prefer unconditionally to an older
 "before" binary in an A/B would kill that leg rather than just skip the preference. The runner
-feature-probes the target binary's own --help output before forwarding the flag.
+feature-probes the target binary's own help output before forwarding the flag.
 
-This test EXTRACTS the actual forwarding span (text, not a reimplementation) from
-run-release-gui-smoke.ps1 and executes it standalone against a stub $exe whose --help output is
-controlled per test case, proving the probe's real behavior rather than merely pinning strings.
+ROUND 4, fable BLOCKER 1. The round-1c probe ran a BARE `MLVApp.exe --help`. main() treats any argv
+without --batch/--trim-mlv/--profile-playback/--gui-smoke-playback as normal GUI mode
+(MainWindow.show(); a.exec()), so the probe never exited, the runner never reached the smoke launch,
+and the attribution job (which launches the runner synchronously, PresentMon already capturing)
+hung on EVERY Ultra-Magnus leg. The probe now (1) passes `--gui-smoke-playback --help`, the only
+path main() answers with exit 0 and no window, and (2) runs under a hard timeout that kills the
+process tree by pid and returns a typed UNKNOWN, where UNKNOWN means the preference is not used and
+the reason is logged.
+
+These tests EXTRACT the real function and forwarding span (text, never a reimplementation) from
+run-release-gui-smoke.ps1 and execute them against STUB EXECUTABLES (.cmd files, launched by the
+same Process.Start the real app is) whose behaviour is controlled per test case -- including a stub
+that never exits, and a stub that models the real app by hanging unless it is given exactly the
+probe arguments main() answers.
 """
 
 from __future__ import annotations
 
+import re
 import shutil
 import subprocess
 import tempfile
+import time
 import unittest
 from pathlib import Path
 
@@ -25,13 +38,37 @@ RUNNER = ROOT / "tools" / "profiling" / "run-release-gui-smoke.ps1"
 PWSH = shutil.which("pwsh")
 requires_pwsh = unittest.skipIf(PWSH is None, "pwsh is not on PATH")
 
+SPAN_START = "# UM-DISPLAY-SELECT-AND-LOG-1 round 4 (fable BLOCKER 1): --display-prefer feature probe"
+
+# Wall-clock ceiling for a probe test whose probe timeout is 3 s: kill + process start + pwsh
+# startup must fit well inside it. A regression to an unbounded probe never returns at all, which
+# subprocess.run's own timeout turns into a red test instead of a hung suite.
+HANG_TEST_BOUND_SECONDS = 60
+
+
+def _runner_text() -> str:
+    return RUNNER.read_text(encoding="utf-8").replace("\r\n", "\n")
+
+
+def _extract_function(text: str, name: str) -> str:
+    start = text.index(f"function {name} {{")
+    depth = 0
+    i = text.index("{", start)
+    j = i
+    while True:
+        if text[j] == "{":
+            depth += 1
+        elif text[j] == "}":
+            depth -= 1
+            if depth == 0:
+                break
+        j += 1
+    return text[start:j + 1]
+
 
 def _forwarding_span() -> str:
-    text = RUNNER.read_text(encoding="utf-8").replace("\r\n", "\n")
-    start_marker = "if (-not [string]::IsNullOrWhiteSpace($DisplayPrefer) and -not $LegacyGuiSmokeOptions) {"
-    # PowerShell spells the boolean operator "-and", not "and" -- match the real source exactly.
-    start_marker = start_marker.replace(" and ", " -and ")
-    start = text.index(start_marker)
+    text = _runner_text()
+    start = text.index(SPAN_START)
     end = text.index("\n}\n", start) + len("\n}")
     return text[start:end]
 
@@ -42,92 +79,183 @@ class _ProbeCase(unittest.TestCase):
         self.addCleanup(self._tmp.cleanup)
         self.tmp = Path(self._tmp.name)
 
-    def _write_stub_exe(self, help_text: str) -> Path:
-        # A .ps1 standing in for $exe -- "& $exe --help" invokes it as a script, exactly as
-        # "& $exe --help" would invoke a real .exe.
-        stub = self.tmp / "stub.ps1"
-        stub.write_text(
-            "param([Parameter(ValueFromRemainingArguments=$true)]$Args)\n"
-            f"Write-Output @'\n{help_text}\n'@\n",
-            encoding="utf-8",
-        )
+    def _write_cmd(self, name: str, body: str) -> Path:
+        stub = self.tmp / name
+        stub.write_text("@echo off\r\n" + body.replace("\n", "\r\n") + "\r\n", encoding="ascii")
         return stub
 
-    def run_probe(self, *, exe: Path, display_prefer: str, legacy: bool) -> subprocess.CompletedProcess:
+    def _help_stub(self, help_lines: list[str], *, exit_code: int = 0) -> Path:
+        body = "\n".join(f"echo {line}" for line in help_lines) + f"\nexit /b {exit_code}"
+        return self._write_cmd("help_stub.cmd", body)
+
+    def _hang_stub(self, name: str = "hang_stub.cmd") -> Path:
+        # Never exits on its own (ping -n N sleeps ~N seconds) and leaves a CHILD process behind,
+        # so an implementation that kills only the direct process still leaks -- and a probe with
+        # no timeout never returns.
+        return self._write_cmd(name, "ping -n 600 127.0.0.1 >nul")
+
+    def _gui_model_stub(self, help_lines: list[str]) -> Path:
+        # Models the real app's main(): ONLY `--gui-smoke-playback --help` is answered (help text,
+        # exit 0, no window); any other argv is "normal GUI mode" and never exits.
+        echoes = "\n".join(f"  echo {line}" for line in help_lines)
+        body = (
+            'if "%~1"=="--gui-smoke-playback" if "%~2"=="--help" (\n'
+            f"{echoes}\n"
+            "  exit /b 0\n"
+            ")\n"
+            "ping -n 600 127.0.0.1 >nul"
+        )
+        return self._write_cmd("gui_model_stub.cmd", body)
+
+    def run_span(self, *, exe: Path, display_prefer: str, legacy: bool,
+                 timeout_sec: int = 20) -> subprocess.CompletedProcess:
+        text = _runner_text()
         script = self.tmp / "probe.ps1"
         script.write_text(
             "$ErrorActionPreference = 'Stop'\n"
             f"$exe = '{exe}'\n"
             f"$DisplayPrefer = '{display_prefer}'\n"
             f"$LegacyGuiSmokeOptions = ${'true' if legacy else 'false'}\n"
+            f"$displayPreferProbeTimeoutSec = {timeout_sec}\n"
+            "$validationWarnings = @()\n"
             "$arguments = @('--gui-smoke-playback')\n"
+            + _extract_function(text, "Test-GuiSmokeDisplayPreferSupport") + "\n"
             + _forwarding_span()
-            + "\nWrite-Host \"ARGS=$($arguments -join '|')\"\n",
+            + "\nWrite-Host \"ARGS=$($arguments -join '|')\"\n"
+            "Write-Host \"PROBE=$($displayPreferRecord.probe) FORWARDED=$($displayPreferRecord.forwarded)\"\n"
+            "Write-Host \"REASON=$($displayPreferRecord.reason)\"\n"
+            "Write-Host \"WARNINGS=$(@($validationWarnings).Count)\"\n",
             encoding="utf-8",
         )
         return subprocess.run(
             [PWSH, "-NoLogo", "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass",
              "-File", str(script)],
-            capture_output=True, text=True,
+            capture_output=True, text=True, timeout=HANG_TEST_BOUND_SECONDS,
         )
 
 
 @requires_pwsh
 class DisplayPreferForwardingTests(_ProbeCase):
+    HELP = [
+        "Usage: MLVApp.exe [options]",
+        "  --windowed          Place the window ...",
+        "  --display-prefer ^<substring^>  Tie-break among displays ...",
+    ]
+
     def test_forwards_the_flag_when_the_binary_lists_it_in_help(self) -> None:
-        exe = self._write_stub_exe(
-            "Usage: MLVApp.exe [options]\n"
-            "  --windowed          Place the window ...\n"
-            "  --display-prefer <substring>  Tie-break among displays ...\n"
-        )
-        proc = self.run_probe(exe=exe, display_prefer="PA329C", legacy=False)
+        proc = self.run_span(exe=self._help_stub(self.HELP), display_prefer="PA329C", legacy=False)
         self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
         self.assertIn("--display-prefer=PA329C", proc.stdout)
+        self.assertIn("PROBE=supported FORWARDED=True", proc.stdout)
 
     def test_never_forwards_to_a_legacy_binary_whose_help_does_not_list_it(self) -> None:
-        # The exact failure this closes: an older "before" binary in an A/B does not register
-        # --display-prefer, and forwarding it unconditionally would make the app reject the
-        # whole command line.
-        exe = self._write_stub_exe(
-            "Usage: MLVApp.exe [options]\n"
-            "  --windowed          Place the window ...\n"
-        )
-        proc = self.run_probe(exe=exe, display_prefer="PA329C", legacy=False)
+        # The exact failure round 1c closed: an older "before" binary in an A/B does not register
+        # --display-prefer, and forwarding it unconditionally would make the app reject the whole
+        # command line. The skip is RECORDED, never silent.
+        exe = self._help_stub(["Usage: MLVApp.exe [options]", "  --windowed          Place the window ..."])
+        proc = self.run_span(exe=exe, display_prefer="PA329C", legacy=False)
         self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
-        self.assertNotIn("--display-prefer", proc.stdout)
+        self.assertNotIn("--display-prefer", proc.stdout.split("ARGS=")[1].splitlines()[0])
+        self.assertIn("PROBE=unsupported FORWARDED=False", proc.stdout)
+        self.assertIn("WARNINGS=1", proc.stdout)
 
     def test_never_forwards_under_legacy_gui_smoke_options_even_if_supported(self) -> None:
-        exe = self._write_stub_exe("  --display-prefer <substring>  Tie-break ...\n")
-        proc = self.run_probe(exe=exe, display_prefer="PA329C", legacy=True)
+        proc = self.run_span(exe=self._help_stub(self.HELP), display_prefer="PA329C", legacy=True)
         self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
-        self.assertNotIn("--display-prefer", proc.stdout)
+        self.assertNotIn("--display-prefer", proc.stdout.split("ARGS=")[1].splitlines()[0])
+        self.assertIn("PROBE=not_requested", proc.stdout)
 
     def test_never_forwards_an_empty_preference_even_when_supported(self) -> None:
-        exe = self._write_stub_exe("  --display-prefer <substring>  Tie-break ...\n")
-        proc = self.run_probe(exe=exe, display_prefer="", legacy=False)
+        proc = self.run_span(exe=self._help_stub(self.HELP), display_prefer="", legacy=False)
         self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
-        self.assertNotIn("--display-prefer", proc.stdout)
+        self.assertNotIn("--display-prefer", proc.stdout.split("ARGS=")[1].splitlines()[0])
+        self.assertIn("PROBE=not_requested", proc.stdout)
 
-    def test_a_throwing_help_probe_is_treated_as_unsupported_not_an_error(self) -> None:
-        # A stub that throws instead of printing help -- the probe's own try/catch must
-        # swallow it and simply skip forwarding, never propagate.
-        exe = self.tmp / "throws.ps1"
-        exe.write_text(
-            "param([Parameter(ValueFromRemainingArguments=$true)]$Args)\n"
-            "throw [System.InvalidOperationException]::new('no --help support')\n",
-            encoding="utf-8",
+    def test_an_exe_that_cannot_start_is_unknown_and_never_an_error(self) -> None:
+        proc = self.run_span(exe=self.tmp / "does-not-exist.exe", display_prefer="PA329C", legacy=False)
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        self.assertNotIn("--display-prefer", proc.stdout.split("ARGS=")[1].splitlines()[0])
+        self.assertIn("PROBE=unknown FORWARDED=False", proc.stdout)
+        self.assertIn("WARNINGS=1", proc.stdout)
+
+    def test_a_nonzero_exit_is_unknown_even_if_the_output_mentions_the_option(self) -> None:
+        # An error banner that happens to print the option name is not a capability statement.
+        exe = self._help_stub(["  --display-prefer ^<substring^>  Tie-break ..."], exit_code=2)
+        proc = self.run_span(exe=exe, display_prefer="PA329C", legacy=False)
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        self.assertNotIn("--display-prefer", proc.stdout.split("ARGS=")[1].splitlines()[0])
+        self.assertIn("PROBE=unknown FORWARDED=False", proc.stdout)
+        self.assertIn("exit code 2", proc.stdout)
+
+
+@requires_pwsh
+class DisplayPreferProbeCannotHangTests(_ProbeCase):
+    """fable BLOCKER 1, RED-FIRST: a stub exe that never exits."""
+
+    def test_a_probe_that_never_exits_returns_within_the_bound_as_unknown(self) -> None:
+        # MUTATION CAUGHT: removing the WaitForExit timeout (or going back to `& $exe ... | Out-String`).
+        # Without the bound this test does not fail by assertion -- subprocess.run times out.
+        started = time.monotonic()
+        proc = self.run_span(exe=self._hang_stub(), display_prefer="PA329C", legacy=False, timeout_sec=3)
+        elapsed = time.monotonic() - started
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        self.assertLess(elapsed, HANG_TEST_BOUND_SECONDS)
+        self.assertIn("PROBE=unknown FORWARDED=False", proc.stdout)
+        self.assertNotIn("--display-prefer", proc.stdout.split("ARGS=")[1].splitlines()[0])
+        # The reason is logged, and it names the timeout and the killed pid.
+        reason = next(line for line in proc.stdout.splitlines() if line.startswith("REASON="))
+        self.assertRegex(reason, r"timed out after 3 s")
+        self.assertRegex(reason, r"pid \d+")
+        self.assertIn("WARNINGS=1", proc.stdout)
+
+    def test_the_killed_probe_leaves_no_process_behind(self) -> None:
+        # Kill by pid, tree included: the hang stub's ping child must die with its cmd parent.
+        exe = self._hang_stub()
+        proc = self.run_span(exe=exe, display_prefer="PA329C", legacy=False, timeout_sec=3)
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        reason = next(line for line in proc.stdout.splitlines() if line.startswith("REASON="))
+        pid = int(re.search(r"pid (\d+)", reason).group(1))
+        alive = subprocess.run(
+            [PWSH, "-NoLogo", "-NoProfile", "-NonInteractive", "-Command",
+             f"if (Get-Process -Id {pid} -ErrorAction SilentlyContinue) {{ 'ALIVE' }} else {{ 'GONE' }}"],
+            capture_output=True, text=True, timeout=HANG_TEST_BOUND_SECONDS,
         )
-        proc = self.run_probe(exe=exe, display_prefer="PA329C", legacy=False)
+        self.assertIn("GONE", alive.stdout)
+
+    def test_the_probe_uses_the_arguments_main_answers_not_a_bare_help(self) -> None:
+        # The real app's main() only answers `--gui-smoke-playback --help`; a bare `--help` is
+        # normal GUI mode and never exits. This stub models that: with the bare probe it hangs
+        # (and the bound turns it into UNKNOWN); with the right probe it answers and is SUPPORTED.
+        # MUTATION CAUGHT: reverting the probe to a bare `--help`.
+        exe = self._gui_model_stub(DisplayPreferForwardingTests.HELP)
+        proc = self.run_span(exe=exe, display_prefer="PA329C", legacy=False, timeout_sec=10)
         self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
-        self.assertNotIn("--display-prefer", proc.stdout)
+        self.assertIn("PROBE=supported FORWARDED=True", proc.stdout)
+        self.assertIn("--display-prefer=PA329C", proc.stdout)
 
 
-class RunnerParamDeclarationTests(unittest.TestCase):
-    """Text-level pin: the -DisplayPrefer parameter itself is declared."""
+class RunnerProbeSourcePinTests(unittest.TestCase):
+    """Text-level pins that complement the behavioural tests above."""
 
     def test_display_prefer_param_is_declared(self) -> None:
         source = RUNNER.read_text(encoding="utf-8")
         self.assertIn('[string]$DisplayPrefer = "",', source)
+
+    def test_no_bare_help_probe_remains_in_the_runner(self) -> None:
+        # The hang's exact line. A bare `& $exe --help` starts the GUI.
+        self.assertNotIn("& $exe --help", _runner_text())
+
+    def test_the_probe_timeout_default_is_bounded(self) -> None:
+        text = _runner_text()
+        match = re.search(r"^\$displayPreferProbeTimeoutSec = (\d+)\s*$", text, re.MULTILINE)
+        self.assertIsNotNone(match, "the runner must define $displayPreferProbeTimeoutSec at script level")
+        self.assertLessEqual(int(match.group(1)), 30)
+        self.assertIn("-TimeoutSec $displayPreferProbeTimeoutSec", _forwarding_span())
+
+    def test_the_probe_outcome_is_published_in_result_json(self) -> None:
+        # fable DISPLAY-PREFER-PROBE-RECORDED-1: a skipped preference must be visible downstream.
+        text = _runner_text()
+        self.assertIn("displayPrefer = $displayPreferRecord", text)
 
 
 if __name__ == "__main__":
