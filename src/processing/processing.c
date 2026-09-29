@@ -501,9 +501,13 @@ void processing_update_matrices(processingObject_t * processing)
     /* Highest green value - pixels at this value will need to be reconstructed */
     processing_update_highest_green(processing);
 
-    /* This is nice */
-    __atomic_fetch_add(&g_processing_final_matrix_print_count, 1, __ATOMIC_RELAXED);
-    printMatrix(processing->final_matrix);
+    /* This is nice (but not once per candidate of the white balance search, 155k
+     * times: the search restores the original setting afterwards, which prints) */
+    if( processing->wbFindActive == 0 )
+    {
+        __atomic_fetch_add(&g_processing_final_matrix_print_count, 1, __ATOMIC_RELAXED);
+        printMatrix(processing->final_matrix);
+    }
 
     /* done? */
 }
