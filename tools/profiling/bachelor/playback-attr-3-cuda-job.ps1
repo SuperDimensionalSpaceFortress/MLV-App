@@ -263,7 +263,16 @@ param(
     # leg to be submittable at a total above 20, so a caller may raise it here. The value used
     # is recorded as cpuThresholdPercent beside cpuMean in a refused leg's summary.json.
     [ValidateRange(20, 100)]
-    [int]$CpuLoadGatePercent = 20
+    [int]$CpuLoadGatePercent = 20,
+
+    # PLAYBACK-HFR-CONFORM-DEFAULT-1: run-release-gui-smoke.ps1's -ProcessTimeoutMs for the app
+    # launch. 0 (the default) passes nothing, so every existing caller's emitted job is
+    # byte-identical. The derived default is ~125 s for a 40 s run, which is shorter than the time
+    # the app needs to open a cold owner clip on Bachelor when its file reads are slow (measured
+    # 2026-09-29: 4 KB-block reads of footage-sized files ran at 2-11 MB/s, and a 2.2 GB clip had
+    # not finished loading after 140 s), so the smoke reported exit 124 with 'timeout of 1 ms'.
+    [ValidateScript({ $_ -eq 0 -or ($_ -ge 30000 -and $_ -le 3600000) })]
+    [int]$SmokeProcessTimeoutMs = 0
 )
 
 $ErrorActionPreference = 'Stop'
@@ -683,6 +692,7 @@ if ($ContactSheet) {
 }
 $disablePaintPerSubmitLiteral = if ($DisablePaintPerSubmit) { '$true' } else { '$false' }
 $cpuLoadGatePercentLiteral = [string][int]$CpuLoadGatePercent
+$smokeProcessTimeoutMsLiteral = [string][int]$SmokeProcessTimeoutMs
 
 # --- job body template (placeholders are substituted below; the body itself never
 #     touches this generator's variables directly, so there is no accidental capture
@@ -715,6 +725,7 @@ $ContactSheetComposerSha256 = '__CONTACT_SHEET_COMPOSER_SHA256__'
 $TelemetryArm = '__TELEMETRY_ARM__'
 $DisablePaintPerSubmit = __DISABLE_PAINT_PER_SUBMIT__
 $CpuLoadGatePercent = [double]__CPU_LOAD_GATE_PERCENT__
+$SmokeProcessTimeoutMs = [int]__SMOKE_PROCESS_TIMEOUT_MS__
 $Root = '__AGENT_ROOT__'
 $Cache = Join-Path $Root 'cache'
 $Stamp = Get-Date -Format 'yyyyMMdd-HHmmss'
@@ -1404,6 +1415,9 @@ $envs = @(
 $envList = "'" + ($envs -join "','") + "'"
 function ConvertTo-PsSingleQuoted([string]$Value) { "'" + $Value.Replace("'", "''") + "'" }
 $cmd = "& $(ConvertTo-PsSingleQuoted $smoke) -ExePath $(ConvertTo-PsSingleQuoted $exePath) -Input $(ConvertTo-PsSingleQuoted $clipPath) -Output $(ConvertTo-PsSingleQuoted $resultPath) -Seconds 40 -StartFrame 0 -SettleMs 2500 -ScaleFactor 4 -UsePersistedPlaybackSettings -RequireLookAssist:`$false -Scope none -FrameTelemetry -PreserveExperimentalEnvironment -ExtraEnvironment @($envList)"
+if ($SmokeProcessTimeoutMs -gt 0) {
+    $cmd = "$cmd -ProcessTimeoutMs $SmokeProcessTimeoutMs"
+}
 # CUDA-PLAYBACK-CONTACT-SHEET-1: appended, never baked into the base $cmd string above, so a
 # disabled run's $cmd (and therefore this job's emitted text) is byte-identical to before this
 # card. Passed through -AdditionalArgs (run-release-gui-smoke.ps1's own generic extra-args
@@ -2334,6 +2348,7 @@ $text = Expand-AttrCudaTemplate -Template $template -Tokens ([ordered]@{
     TELEMETRY_ARM = $TelemetryArm
     DISABLE_PAINT_PER_SUBMIT = $disablePaintPerSubmitLiteral
     CPU_LOAD_GATE_PERCENT = $cpuLoadGatePercentLiteral
+    SMOKE_PROCESS_TIMEOUT_MS = $smokeProcessTimeoutMsLiteral
     EMBEDDED_FUNCTIONS = $embeddedFunctions
 })
 

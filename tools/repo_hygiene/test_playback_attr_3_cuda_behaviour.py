@@ -1173,6 +1173,32 @@ class AttributionJobCpuLoadGateTests(_PwshCase):
         self.assertIn("cpuThresholdPercent=$CpuLoadGatePercent", job_text)
         self.assertNotIn("$avgLoad -gt 20.0", job_text)
 
+    def test_smoke_process_timeout_defaults_to_zero_and_adds_no_argument(self) -> None:
+        job_text = self._generate()
+        self.assertIn("$SmokeProcessTimeoutMs = [int]0", job_text)
+        self.assertNotIn("__SMOKE_PROCESS_TIMEOUT_MS__", job_text)
+        self.assertIn("if ($SmokeProcessTimeoutMs -gt 0) {", job_text)
+
+    def test_smoke_process_timeout_override_reaches_the_emitted_job(self) -> None:
+        job_text = self._generate(extra_args=["-SmokeProcessTimeoutMs 900000"])
+        self.assertIn("$SmokeProcessTimeoutMs = [int]900000", job_text)
+        self.assertIn('$cmd = "$cmd -ProcessTimeoutMs $SmokeProcessTimeoutMs"', job_text)
+
+    def test_smoke_process_timeout_outside_the_runner_ceiling_is_refused(self) -> None:
+        for bad in (1000, 3600001):
+            script = self.tmp / f"generate-timeout-{bad}.ps1"
+            script.write_text(
+                "$ErrorActionPreference = 'Stop'\n"
+                f"& '{ATTRIBUTION_GENERATOR}' -SourceCommit '{self.shas[1]}' "
+                f"-BuildManifestSha256 '{'a' * 64}' -ClipId 'tiny_dual_iso' "
+                f"-FixtureSha256 '{'b' * 64}' -SmokeProcessTimeoutMs {bad} "
+                f"-OutFile '{self.staging / 'job.ps1'}' -RepoRoot '{self.repo}'\n",
+                encoding="utf-8",
+            )
+            proc = _run_pwsh_file(script)
+            self.assertNotEqual(proc.returncode, 0, bad)
+            self.assertFalse((self.staging / "job.ps1").exists())
+
     def test_a_gate_below_the_historical_twenty_is_refused(self) -> None:
         script = self.tmp / "generate-low.ps1"
         script.write_text(
