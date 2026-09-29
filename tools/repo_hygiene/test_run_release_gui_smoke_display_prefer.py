@@ -24,6 +24,7 @@ probe arguments main() answers.
 
 from __future__ import annotations
 
+import os
 import re
 import shutil
 import subprocess
@@ -38,6 +39,10 @@ RUNNER = ROOT / "tools" / "profiling" / "run-release-gui-smoke.ps1"
 
 PWSH = shutil.which("pwsh")
 requires_pwsh = unittest.skipIf(PWSH is None, "pwsh is not on PATH")
+# The probe's target is a Windows .exe: these tests drive it with .cmd stubs and prove the process
+# TREE is killed with taskkill /T and Get-CimInstance, none of which exist on a Linux runner.
+requires_windows = unittest.skipUnless(
+    os.name == "nt", "the probe targets a Windows .exe; the stubs, taskkill and CIM are Windows-only")
 
 SPAN_START = "# UM-DISPLAY-SELECT-AND-LOG-1 round 4 (fable BLOCKER 1): --display-prefer feature probe"
 
@@ -158,6 +163,7 @@ class _ProbeCase(unittest.TestCase):
 
 
 @requires_pwsh
+@requires_windows
 class DisplayPreferForwardingTests(_ProbeCase):
     HELP = [
         "Usage: MLVApp.exe [options]",
@@ -212,6 +218,7 @@ class DisplayPreferForwardingTests(_ProbeCase):
 
 
 @requires_pwsh
+@requires_windows
 class DisplayPreferProbeCannotHangTests(_ProbeCase):
     """fable BLOCKER 1, RED-FIRST: a stub exe that never exits."""
 
@@ -259,6 +266,25 @@ class DisplayPreferProbeCannotHangTests(_ProbeCase):
         self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
         self.assertIn("PROBE=supported FORWARDED=True", proc.stdout)
         self.assertIn("--display-prefer=PA329C", proc.stdout)
+
+
+@requires_pwsh
+@unittest.skipIf(os.name == "nt", "the non-Windows contract is only observable off Windows")
+class DisplayPreferProbeNonWindowsTests(_ProbeCase):
+    """Off Windows the probe cannot run its target: it must say so, return UNKNOWN, and the
+    preference must not be forwarded (never a throw, never a guess)."""
+
+    def test_probe_is_unknown_with_a_clear_reason_and_never_forwards(self) -> None:
+        stub = self.tmp / "help_stub.sh"
+        stub.write_text("#!/bin/sh\necho '  --display-prefer <substring>  Tie-break ...'\n", encoding="ascii")
+        stub.chmod(0o755)  # runnable, so only the platform guard can explain UNKNOWN
+        proc = self.run_span(exe=stub, display_prefer="PA329C", legacy=False)
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        self.assertNotIn("--display-prefer", proc.stdout.split("ARGS=")[1].splitlines()[0])
+        self.assertIn("PROBE=unknown FORWARDED=False", proc.stdout)
+        reason = next(line for line in proc.stdout.splitlines() if line.startswith("REASON="))
+        self.assertIn("Windows-only", reason)
+        self.assertIn("WARNINGS=1", proc.stdout)
 
 
 class RunnerProbeSourcePinTests(unittest.TestCase):

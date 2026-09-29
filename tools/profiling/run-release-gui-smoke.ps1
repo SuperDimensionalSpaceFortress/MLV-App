@@ -1343,6 +1343,18 @@ function Test-GuiSmokeDisplayPreferSupport {
     $reason = $null
     $probePid = $null
     $probeProcess = $null
+    # The target is a Windows GUI .exe and the kill path is taskkill /T; off Windows neither exists,
+    # so say so instead of surfacing an opaque process-start exception. Same platform test as
+    # Get-HostLoadSnapshot; it also holds on Windows PowerShell 5.1, which has no $IsWindows.
+    if ([System.Environment]::OSVersion.Platform -ne [System.PlatformID]::Win32NT) {
+        return [pscustomobject]@{
+            status = 'unknown'
+            reason = "feature probe is Windows-only (the target is a Windows .exe); platform is $([System.Environment]::OSVersion.Platform)"
+            pid = $null
+            arguments = $probeArguments
+            timeoutSec = $TimeoutSec
+        }
+    }
     $startInfo = New-Object System.Diagnostics.ProcessStartInfo
     $startInfo.FileName = $ExePath
     $startInfo.Arguments = $probeArguments
