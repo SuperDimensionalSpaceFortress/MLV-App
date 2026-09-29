@@ -2395,14 +2395,37 @@ if (-not $windowPlacementLine) {
         } | Select-Object -Last 1
         $refreshHzRounded = $null
         $dpr = $null
-        if ($screenMatch) {
+        $presentationManufacturer = $null
+        $presentationModel = $null
+        $presentationSerial = $null
+        if (-not $screenMatch) {
+            # Round 2 (sol PRE-REVIEW #2 hardening): a presentation screen with no matching
+            # display_screen record is identity UNKNOWN -- never a "known" block whose refresh/DPR/
+            # model/serial are null (two of those used to compare 'same').
+            $displayIdentityUnknownReason = "presentation screen has no matching gui_smoke.display_screen line"
+        } else {
             $refreshMatch = [regex]::Match($screenMatch, 'refresh_hz=(?<r>[0-9.]+)')
             $dprMatch = [regex]::Match($screenMatch, 'dpr=(?<d>[0-9.]+)')
             if ($refreshMatch.Success) { $refreshHzRounded = [Math]::Round([double]$refreshMatch.Groups['r'].Value) }
             if ($dprMatch.Success) { $dpr = [double]$dprMatch.Groups['d'].Value }
+            # Round 2 (sol PRE-REVIEW #2 BLOCKER c): physical identity is name+manufacturer+model+
+            # serial, each read BY KEY (order-tolerant) from the same display_screen line -- the
+            # \\.\DISPLAYn ordinal alone can be reused by a different monitor between two legs.
+            $manufacturerMatch = [regex]::Match($screenMatch, ' manufacturer="(?<v>[^"]*)"')
+            $modelMatch = [regex]::Match($screenMatch, ' model="(?<v>[^"]*)"')
+            $serialMatch = [regex]::Match($screenMatch, ' serial="(?<v>[^"]*)"')
+            if ($manufacturerMatch.Success) { $presentationManufacturer = $manufacturerMatch.Groups['v'].Value }
+            if ($modelMatch.Success) { $presentationModel = $modelMatch.Groups['v'].Value }
+            if ($serialMatch.Success) { $presentationSerial = $serialMatch.Groups['v'].Value }
         }
+        if ($displayIdentityUnknownReason) {
+            # falls through to the identity-unknown block below
+        } else {
         $displayBlock = [pscustomobject]@{
             presentationScreenName = $presentationName
+            presentationManufacturer = $presentationManufacturer
+            presentationModel = $presentationModel
+            presentationSerial = $presentationSerial
             physicalWidth = [int]$placementMatch.Groups['ppw'].Value
             physicalHeight = [int]$placementMatch.Groups['pph'].Value
             refreshHzRounded = $refreshHzRounded
@@ -2413,11 +2436,15 @@ if (-not $windowPlacementLine) {
             verified = ($placementMatch.Groups['verified'].Value -eq '1')
             identityUnknownReason = $null
         }
+        }
     }
 }
 if ($null -eq $displayBlock) {
     $displayBlock = [pscustomobject]@{
         presentationScreenName = $null
+        presentationManufacturer = $null
+        presentationModel = $null
+        presentationSerial = $null
         physicalWidth = $null
         physicalHeight = $null
         refreshHzRounded = $null

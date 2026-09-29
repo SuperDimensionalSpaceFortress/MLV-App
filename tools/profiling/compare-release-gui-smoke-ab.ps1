@@ -534,6 +534,18 @@ function Get-DisplayComparability {
             before = $BeforeDisplay; after = $AfterDisplay
         }
     }
+    # Round 2 (sol PRE-REVIEW #2 BLOCKER c): identity is name+manufacturer+model+serial. A block
+    # from a runner that predates those fields does not carry the properties at all -- unknown,
+    # never "absent equals absent".
+    foreach ($identityProperty in 'presentationManufacturer', 'presentationModel', 'presentationSerial') {
+        if ($null -eq $BeforeDisplay.PSObject.Properties[$identityProperty] -or
+            $null -eq $AfterDisplay.PSObject.Properties[$identityProperty]) {
+            return [pscustomobject]@{
+                status = 'unknown'; reasonCode = 'DISPLAY_IDENTITY_UNKNOWN'
+                before = $BeforeDisplay; after = $AfterDisplay
+            }
+        }
+    }
     if ($BeforeDisplay.verified -ne $true -or $AfterDisplay.verified -ne $true) {
         return [pscustomobject]@{
             status = 'unknown'; reasonCode = 'PLACEMENT_UNVERIFIED'
@@ -542,6 +554,9 @@ function Get-DisplayComparability {
     }
     $same = (
         ([string]$BeforeDisplay.presentationScreenName -eq [string]$AfterDisplay.presentationScreenName) -and
+        ([string]$BeforeDisplay.presentationManufacturer -eq [string]$AfterDisplay.presentationManufacturer) -and
+        ([string]$BeforeDisplay.presentationModel -eq [string]$AfterDisplay.presentationModel) -and
+        ([string]$BeforeDisplay.presentationSerial -eq [string]$AfterDisplay.presentationSerial) -and
         ($BeforeDisplay.physicalWidth -eq $AfterDisplay.physicalWidth) -and
         ($BeforeDisplay.physicalHeight -eq $AfterDisplay.physicalHeight) -and
         ($BeforeDisplay.refreshHzRounded -eq $AfterDisplay.refreshHzRounded) -and

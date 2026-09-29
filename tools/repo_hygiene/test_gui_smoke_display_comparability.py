@@ -86,10 +86,38 @@ class DisplayComparabilityTests(_ProbeCase):
         )
 
     SAME_A = (
-        "[pscustomobject]@{ presentationScreenName='X'; physicalWidth=3840; physicalHeight=2160; "
+        "[pscustomobject]@{ presentationScreenName='X'; presentationManufacturer='ASUS'; "
+        "presentationModel='PA329C'; presentationSerial='ASUS-1'; physicalWidth=3840; physicalHeight=2160; "
         "refreshHzRounded=60; dpr=1.0; windowMode='fullscreen'; previewWidth=3840; previewHeight=2160; "
         "verified=$true; identityUnknownReason=$null }"
     )
+
+    def test_a_reused_windows_ordinal_on_a_different_physical_monitor_is_different(self) -> None:
+        # sol PRE-REVIEW #2 BLOCKER c, exact repro: same \\.\DISPLAYn ordinal, size, refresh, DPR
+        # and preview but ASUS/PA329C/ASUS-1 before vs Generic/DENON/DENON-1 after used to compare
+        # 'same' (the comparator never looked at model/serial) and publish FPS deltas.
+        # MUTATION CAUGHT: dropping manufacturer/model/serial from the identity comparison.
+        other = (self.SAME_A.replace("presentationManufacturer='ASUS'", "presentationManufacturer='Generic'")
+                 .replace("presentationModel='PA329C'", "presentationModel='DENON'")
+                 .replace("presentationSerial='ASUS-1'", "presentationSerial='DENON-1'"))
+        proc = self._compare(self.SAME_A, other)
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        self.assertIn("STATUS=different REASON=DISPLAY_MISMATCH", proc.stdout)
+
+    def test_a_serial_alone_differing_is_different(self) -> None:
+        other = self.SAME_A.replace("presentationSerial='ASUS-1'", "presentationSerial='ASUS-2'")
+        proc = self._compare(self.SAME_A, other)
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        self.assertIn("STATUS=different REASON=DISPLAY_MISMATCH", proc.stdout)
+
+    def test_a_block_from_a_runner_that_predates_model_and_serial_is_unknown_never_same(self) -> None:
+        # MUTATION CAUGHT: treating an absent identity property as equal-to-absent.
+        legacy = (self.SAME_A.replace("presentationManufacturer='ASUS'; ", "")
+                  .replace("presentationModel='PA329C'; ", "")
+                  .replace("presentationSerial='ASUS-1'; ", ""))
+        proc = self._compare(legacy, legacy)
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        self.assertIn("STATUS=unknown REASON=DISPLAY_IDENTITY_UNKNOWN", proc.stdout)
 
     def test_two_identical_verified_legs_are_same(self) -> None:
         proc = self._compare(self.SAME_A, self.SAME_A)
@@ -176,6 +204,39 @@ class RunnerDisplayBlockExtractionTests(_ProbeCase):
             r"NAME=\\.\DISPLAY1 PW=3840 PH=2160 REFRESH=60 DPR=1 MODE=fullscreen VERIFIED=True REASON=",
             proc.stdout,
         )
+
+    def test_the_display_block_carries_manufacturer_model_and_serial_in_any_field_order(self) -> None:
+        # sol PRE-REVIEW #2 BLOCKER c: identity is name+model+serial, not just the ordinal.
+        # MUTATION CAUGHT: dropping the three fields from the published block; and (order
+        # tolerance) the serial/model keys are read by key, not by position.
+        lines = (
+            "@("
+            "'gui_smoke.display_screen index=0 name=\"\\\\.\\DISPLAY1\" serial=\"S-9\" model=\"PA329C\" "
+            "manufacturer=\"ASUS\" geometry=0,0 3840x2160 physical=3840x2160 dpr=1.00 "
+            "refresh_hz=59.997 primary=0',"
+            "'gui_smoke.window_placement mode=fullscreen screen=\"\\\\.\\DISPLAY1\" verified=1 "
+            "window=0,0 3840x2160 preview=3840x2160 target_screen=\"\\\\.\\DISPLAY1\" "
+            "presentation_screen=\"\\\\.\\DISPLAY1\" presentation_physical=3840x2160'"
+            ")"
+        )
+        proc = self.run_snippet(
+            f"$recentLines = {lines}\n" + self.span +
+            "\nWrite-Host \"IDENT=$($displayBlock.presentationManufacturer)|$($displayBlock.presentationModel)"
+            "|$($displayBlock.presentationSerial) REASON=$($displayBlock.identityUnknownReason)\"\n")
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        self.assertIn("IDENT=ASUS|PA329C|S-9 REASON=", proc.stdout)
+
+    def test_a_placement_whose_presentation_screen_has_no_display_screen_line_is_identity_unknown(self) -> None:
+        # sol hardening: the runner used to build a KNOWN block with null refresh/DPR/identity,
+        # and two such blocks compared 'same'. MUTATION CAUGHT: restoring the null-valued block.
+        lines = (
+            "@('gui_smoke.window_placement mode=fullscreen screen=\"\\\\.\\DISPLAY1\" verified=1 "
+            "window=0,0 3840x2160 preview=3840x2160 target_screen=\"\\\\.\\DISPLAY1\" "
+            "presentation_screen=\"\\\\.\\DISPLAY1\" presentation_physical=3840x2160')"
+        )
+        proc = self._probe(lines)
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        self.assertIn("REASON=presentation screen has no matching gui_smoke.display_screen line", proc.stdout)
 
     def test_a_rejected_move_reports_the_presentation_screen_not_the_target(self) -> None:
         lines = (
