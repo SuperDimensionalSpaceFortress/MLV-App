@@ -22,6 +22,16 @@ Set-StrictMode -Version Latest
 
 $script:AttrCudaModulePath = $PSCommandPath
 
+# STAGE-STALL card: worst-case cold sequential read rate of an owner input on the
+# measurement host (Bachelor), in MB/s -- the figure Get-AttrCudaLegTimeBudget sizes a leg's
+# timeouts from. MEASURED 2026-09-29 by attr3-footage-read-rate-job.ps1 (trace files
+# attr3-footage-read-rate-M16-1243-{61ef1a06bf,a7429d9f28}.trace.txt on the host, quoted in the
+# card summary): reading the 2.2 GB first part cold with 4 MiB blocks and an incremental SHA-256,
+# the steady-state rate was 2.1-2.4 MB/s over three consecutive 256 MB progress windows (the 2.1 is
+# kept: the sizing figure is the SLOWEST steady window, not the mean); an isolated 128 MB cold
+# region ran 6.1 MB/s. 4 KiB blocks (what Get-FileHash uses) ran 0.55 MB/s even WARM.
+$script:AttrCudaMeasuredColdReadMBps = 2.1
+
 function Get-AttrCudaEmbeddedFunctionSource {
     <#
     .SYNOPSIS
@@ -1489,11 +1499,155 @@ function Read-AttrCudaBase64Payload {
     [pscustomobject]@{ bytes = $bytes; sha256 = $sha256 }
 }
 
+function Get-AttrCudaLegTimeBudget {
+    <#
+    .SYNOPSIS
+    Derive the timeouts of an owner-input attribution leg from the input's size and a MEASURED cold
+    read rate -- never a guessed round number. GENERATOR-side (not embedded in any job).
+    .DESCRIPTION
+    STAGE-STALL card. A leg's wall time before the app even launches is the
+    one full identity read of the input, and the app's own load can pay that read again if the
+    pages were evicted, so both are bounded by  inputBytes / coldReadMBps  (with a margin), plus
+    a fixed launch allowance, the measured play interval and the runner's own fixed slack:
+      identityReadSec       = ceil(inputMB / ColdReadMBps * ReadMargin)
+      smokeProcessTimeoutMs = 1000 * (identityReadSec + LaunchSeconds + PlaySeconds + SettleSeconds + RunnerSlackSeconds)
+                              -- passed to run-release-gui-smoke.ps1 as -ProcessTimeoutMs; its own
+                              derived default (~75 s) has no allowance for loading the input at all
+      jobTimeoutSec         = identityReadSec + smokeProcessTimeoutMs/1000 + FixedPreLaunchSeconds + PostRunSeconds
+                              -- what to pass um-run as -TimeoutSec, so the agent's cap cannot fire
+                                 inside a step that is still making progress
+    ColdReadMBps is the measured worst case (see $script:AttrCudaMeasuredColdReadMBps, sourced
+    from the read-rate job's receipt named beside it); pass -ColdReadMBps to override with a fresh
+    measurement. InputBytes 0 (a tiny tracked fixture) yields the fixed allowances only.
+    #>
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $true)][ValidateRange(0, 1099511627776)][int64]$InputBytes,
+        [ValidateRange(0.01, 100000)][double]$ColdReadMBps = $script:AttrCudaMeasuredColdReadMBps,
+        [ValidateRange(1.0, 10.0)][double]$ReadMargin = 1.5,
+        [ValidateRange(0, 3600)][int]$LaunchSeconds = 60,
+        [ValidateRange(0, 3600)][int]$PlaySeconds = 40,
+        [ValidateRange(0, 3600)][int]$SettleSeconds = 3,
+        [ValidateRange(0, 3600)][int]$RunnerSlackSeconds = 30,
+        [ValidateRange(0, 7200)][int]$FixedPreLaunchSeconds = 600,
+        [ValidateRange(0, 7200)][int]$PostRunSeconds = 300
+    )
+
+    $inputMB = $InputBytes / 1048576.0
+    $identityReadSec = [int][math]::Ceiling($inputMB / $ColdReadMBps * $ReadMargin)
+    $smokeSec = $identityReadSec + $LaunchSeconds + $PlaySeconds + $SettleSeconds + $RunnerSlackSeconds
+    $smokeProcessTimeoutMs = [int64]$smokeSec * 1000
+    if ($smokeProcessTimeoutMs -gt 3600000) {
+        # run-release-gui-smoke.ps1's own safety ceiling on a DERIVED timeout is 3 600 000 ms.
+        throw "ATTRCUDA_TIMEBUDGET_EXCEEDS_SMOKE_CEILING derived smoke process timeout $smokeProcessTimeoutMs ms is over 3600000 ms (inputMB=$([math]::Round($inputMB)) coldReadMBps=$ColdReadMBps): the input cannot be read in a bounded leg at this rate"
+    }
+    [ordered]@{
+        inputMB = [math]::Round($inputMB, 1)
+        coldReadMBps = $ColdReadMBps
+        identityReadSec = $identityReadSec
+        smokeProcessTimeoutMs = [int]$smokeProcessTimeoutMs
+        jobTimeoutSec = [int]($identityReadSec + $smokeSec + $FixedPreLaunchSeconds + $PostRunSeconds)
+    }
+}
+
+function Add-AttrCudaTraceLine {
+    <#
+    .SYNOPSIS
+    Append ONE timestamped line to a trace file, flushed to disk before returning. Never throws.
+    .DESCRIPTION
+    STAGE-STALL card. A job the agent kills at its cap returns NO stdout, so a
+    stall in a pre-launch step used to leave nothing at all (r1c: "can exceed 20 min with no
+    output"; r1e: two 2400 s kills, empty stdout). Each pre-launch step now appends a line here
+    as it starts and as it ends, so a killed job still leaves the last step it reached and how
+    long the ones before it took. Fetch the file with attr3-trace-fetch-job.ps1's emitted job.
+    A blank -TracePath is a no-op (a caller that wants no trace passes none), and every failure
+    is swallowed: a trace that cannot be written must never turn a working job into a failed one.
+    The caller supplies only path-free text -- CR/LF are folded to spaces here so one call is
+    always exactly one line.
+    #>
+    [CmdletBinding()]
+    param(
+        [AllowEmptyString()][string]$TracePath = '',
+        [Parameter(Mandatory = $true)][AllowEmptyString()][string]$Message
+    )
+
+    if ([string]::IsNullOrWhiteSpace($TracePath)) { return }
+    try {
+        $directory = [IO.Path]::GetDirectoryName($TracePath)
+        if (-not [IO.Directory]::Exists($directory)) { [void][IO.Directory]::CreateDirectory($directory) }
+        $line = [DateTime]::UtcNow.ToString('yyyy-MM-ddTHH:mm:ss.fffZ') + ' ' + ($Message -replace '[\r\n]+', ' ') + [Environment]::NewLine
+        [IO.File]::AppendAllText($TracePath, $line, [Text.UTF8Encoding]::new($false))
+    } catch {
+        return
+    }
+}
+
+function Get-AttrCudaFileSha256Blocks {
+    <#
+    .SYNOPSIS
+    SHA-256 a file with ONE sequential large-block read, timing it and tracing its progress.
+    Returns @{ sha256 (lowercase hex); bytes; seconds; mbPerSec }.
+    .DESCRIPTION
+    STAGE-STALL card. Get-FileHash reads in small blocks; on Bachelor's cold C:
+    with real-time scanning on (measured ~2.3 MB/s at 4 KB blocks, MsMpEng at 12-39 % CPU) that
+    made every full read of a 1.3-2.2 GB owner part cost 8-10 minutes. This reads in
+    -BlockBytes (default 4 MiB) chunks with FILE_FLAG_SEQUENTIAL_SCAN and feeds an incremental
+    SHA-256, so the identity check and the OS-file-cache pre-warm are the SAME single pass: the
+    app's own load that follows reads warm pages. A progress line is traced every -ProgressBytes
+    so a hung read shows how far it got. Throws whatever the open/read throws (callers map it to a
+    status token; this function never echoes -Path).
+    #>
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $true)][string]$Path,
+        [ValidateRange(4096, 67108864)][int]$BlockBytes = 4194304,
+        [AllowEmptyString()][string]$TracePath = '',
+        [string]$Label = 'hash',
+        [ValidateRange(1048576, 1099511627776)][int64]$ProgressBytes = 268435456
+    )
+
+    $stopwatch = [Diagnostics.Stopwatch]::StartNew()
+    $stream = [IO.FileStream]::new($Path, [IO.FileMode]::Open, [IO.FileAccess]::Read, [IO.FileShare]::Read, $BlockBytes, [IO.FileOptions]::SequentialScan)
+    $incremental = [Security.Cryptography.IncrementalHash]::CreateHash([Security.Cryptography.HashAlgorithmName]::SHA256)
+    $total = [int64]0
+    $sha256 = $null
+    try {
+        Add-AttrCudaTraceLine -TracePath $TracePath -Message "$Label start bytes=$($stream.Length) blockBytes=$BlockBytes"
+        $buffer = [byte[]]::new($BlockBytes)
+        $nextProgress = $ProgressBytes
+        while ($true) {
+            $read = $stream.Read($buffer, 0, $BlockBytes)
+            if ($read -le 0) { break }
+            $incremental.AppendData($buffer, 0, $read)
+            $total += $read
+            if ($total -ge $nextProgress) {
+                $elapsed = [math]::Max(0.001, $stopwatch.Elapsed.TotalSeconds)
+                Add-AttrCudaTraceLine -TracePath $TracePath -Message ("$Label progress bytes=$total elapsedSec={0:N1} MBps={1:N1}" -f $elapsed, ($total / 1048576.0 / $elapsed))
+                $nextProgress += $ProgressBytes
+            }
+        }
+        $sha256 = ([BitConverter]::ToString($incremental.GetHashAndReset()).Replace('-', '')).ToLowerInvariant()
+    } finally {
+        $incremental.Dispose()
+        $stream.Dispose()
+    }
+    $stopwatch.Stop()
+    $seconds = [math]::Max(0.001, $stopwatch.Elapsed.TotalSeconds)
+    $mbPerSec = $total / 1048576.0 / $seconds
+    Add-AttrCudaTraceLine -TracePath $TracePath -Message ("$Label done bytes=$total seconds={0:N1} MBps={1:N1}" -f $seconds, $mbPerSec)
+    [pscustomobject]@{ sha256 = $sha256; bytes = $total; seconds = $seconds; mbPerSec = $mbPerSec }
+}
+
 function Test-AttrCudaFootagePart {
     <#
     .SYNOPSIS
     Verify one footage part's content on THIS host: existence, readability, length, then sha256.
     .DESCRIPTION
+    STAGE-STALL card: the sha256 is one large-block sequential read
+    (Get-AttrCudaFileSha256Blocks), traced when -TracePath is given, and -LengthOnly stops after
+    the existence/readability/length checks WITHOUT reading the content -- so a job that must
+    hash a part exactly once can screen every part cheaply first and pay the full read only where
+    it holds the part's handle.
     ATTR3-FOOTAGE-BIND-1 PR-B: shared by attr3-footage-presence-job.ps1's emitted probe and
     playback-attr-3-cuda-job.ps1's owner-id content gate -- ONE definition of "does this part's
     bytes match", embedded verbatim in both via Get-AttrCudaEmbeddedFunctionSource so the two jobs
@@ -1516,7 +1670,14 @@ function Test-AttrCudaFootagePart {
         [int64]$ExpectedLength,
 
         [Parameter(Mandatory = $true)]
-        [string]$ExpectedSha256
+        [string]$ExpectedSha256,
+
+        [switch]$LengthOnly,
+
+        [AllowEmptyString()]
+        [string]$TracePath = '',
+
+        [string]$TraceLabel = 'footage-hash'
     )
 
     $expectedSha256Lower = $ExpectedSha256.ToLowerInvariant()
@@ -1559,8 +1720,25 @@ function Test-AttrCudaFootagePart {
         }
     }
 
+    if ($LengthOnly) {
+        # Screen only: existence, length (above) and that the content can actually be opened and
+        # one byte read. The single full-content read happens later, on the held link.
+        $probeStream = $null
+        try {
+            $probeStream = [IO.File]::OpenRead($Path)
+            if ($actualLength -gt 0) { [void]$probeStream.ReadByte() }
+            return 'PASS'
+        } catch [System.UnauthorizedAccessException] {
+            return 'ACCESS_DENIED'
+        } catch {
+            return $(if ($_.CategoryInfo.Category -eq 'PermissionDenied') { 'ACCESS_DENIED' } else { 'UNREADABLE' })
+        } finally {
+            if ($probeStream) { $probeStream.Dispose() }
+        }
+    }
+
     try {
-        $actualSha256 = (Get-FileHash -LiteralPath $Path -Algorithm SHA256 -ErrorAction Stop).Hash.ToLowerInvariant()
+        $actualSha256 = (Get-AttrCudaFileSha256Blocks -Path $Path -TracePath $TracePath -Label $TraceLabel).sha256
         return $(if ($actualSha256 -eq $expectedSha256Lower) { 'PASS' } else { 'SHA256_MISMATCH' })
     } catch [System.UnauthorizedAccessException] {
         return 'ACCESS_DENIED'
@@ -4238,6 +4416,9 @@ Export-ModuleMember -Function `
     Test-AttrCudaPathIsReparsePoint, `
     Get-AttrCudaClosureDirectoryMismatch, `
     Assert-AttrCudaNonOverwritingFileSlot, `
+    Get-AttrCudaLegTimeBudget, `
+    Add-AttrCudaTraceLine, `
+    Get-AttrCudaFileSha256Blocks, `
     Read-AttrCudaBase64Payload, `
     Test-AttrCudaFootagePart, `
     ConvertTo-AttrCudaUtf8String, `

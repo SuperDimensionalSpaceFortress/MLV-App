@@ -253,7 +253,7 @@ function New-Attr3FootageStageJob {
     $embeddedFunctions = Get-AttrCudaEmbeddedFunctionSource -Name @(
         'Read-AttrCudaBase64Payload',
         'ConvertTo-AttrCudaUtf8String',
-        'Test-AttrCudaFootagePart',
+        'Add-AttrCudaTraceLine', 'Get-AttrCudaFileSha256Blocks', 'Test-AttrCudaFootagePart',
         'Assert-AttrCudaDirectChild',
         'Assert-AttrCudaNoLinkBelowRoot',
         'New-AttrCudaDirectory',

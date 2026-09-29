@@ -1348,6 +1348,7 @@ class AttributionJobFixtureContentAuthenticationTests(_PwshCase):
             "function Save-Json($Object, [string]$Path) {\n"
             "    [void](Publish-AttrCudaText -Path $Path -Value ($Object | ConvertTo-Json -Depth 30))\n"
             "}\n"
+            "function Write-JobTrace([string]$Message) { }\n"
             + block + "\n"
             "Write-Output 'RESULT=NO_MISMATCH'\n",
             encoding="utf-8",
@@ -1494,6 +1495,7 @@ class AttributionJobOwnerContentAuthenticationTests(_PwshCase):
             "function Save-Json($Object, [string]$Path) {\n"
             "    [void](Publish-AttrCudaText -Path $Path -Value ($Object | ConvertTo-Json -Depth 30))\n"
             "}\n"
+            "function Write-JobTrace([string]$Message) { }\n"
             + block + "\n"
             "Write-Output ('RESULT=NO_MISMATCH clipPath=' + $clipPath)\n",
             encoding="utf-8",
@@ -1545,7 +1547,11 @@ class AttributionJobOwnerContentAuthenticationTests(_PwshCase):
         self.assertEqual(link1_path.stat().st_ino, part1_path.stat().st_ino)
 
     def test_a_mismatched_part_fails_closed_before_the_package_is_touched(self) -> None:
-        part0_path = self.tmp / "owner-content-mismatch-part0.raw"
+        # STAGE-STALL card: the content hash is no longer a separate up-front pass -- the one full
+        # read happens on the held link, AFTER the naming/contiguity assertion -- so this part must
+        # carry a valid neutral-name extension (composed, never spelled whole) for the sha mismatch
+        # to be the first defect the job can find. A wrongly-named part is refused at exit 20.
+        part0_path = self.tmp / ("owner-content-mismatch-part0" + "." + "MLV")
         part0_bytes = b"synthetic owner content that will not match"
         part0_path.write_bytes(part0_bytes)
         parts = [
@@ -1658,6 +1664,7 @@ class OwnerFootagePrivateDirectoryLeakAndRefusalTests(_PwshCase):
             "function Save-Json($Object, [string]$Path) {\n"
             "    [void](Publish-AttrCudaText -Path $Path -Value ($Object | ConvertTo-Json -Depth 30))\n"
             "}\n"
+            "function Write-JobTrace([string]$Message) { }\n"
             + block + "\n"
             "Write-Output ('CLIPPATH=' + $clipPath)\n",
             encoding="utf-8",
@@ -1902,6 +1909,7 @@ class OwnerFootagePrivateDirectoryLeakAndRefusalTests(_PwshCase):
             "function Save-Json($Object, [string]$Path) {\n"
             "    [void](Publish-AttrCudaText -Path $Path -Value ($Object | ConvertTo-Json -Depth 30))\n"
             "}\n"
+            "function Write-JobTrace([string]$Message) { }\n"
             # Real handle for part 0's link; synthetic IOException for part 1's -- the block calls
             # this unqualified at SCRIPT scope (it is spliced in directly, not called from inside
             # the module), so overriding it here is enough without the module-scope mock trick.
@@ -3805,6 +3813,7 @@ class SmokeRunFailedPresentMonCleanupTests(_PwshCase):
             "function Save-Json($Object, [string]$Path) {\n"
             "    [void](Publish-AttrCudaText -Path $Path -Value ($Object | ConvertTo-Json -Depth 30))\n"
             "}\n"
+            "function Write-JobTrace([string]$Message) { }\n"
             # CUDA-PERF-DISPLAY-WAKE-3 round 1: the extracted failure block now includes the
             # "before smoke launch" keep-alive health checkpoint, which reads $displayWake and
             # $displayWakeKeepAlive and calls Get-AttrCudaDisplayWakeKeepAliveHealth (already
@@ -3896,6 +3905,7 @@ class PresentMonSpawnFailureTests(_PwshCase):
             "function Save-Json($Object, [string]$Path) {\n"
             "    $Object | ConvertTo-Json -Depth 30 | Set-Content -LiteralPath $Path -Encoding UTF8\n"
             "}\n"
+            "function Write-JobTrace([string]$Message) { }\n"
             + self._spawn_guard() + "\n"
             "Write-Output 'RESULT=NO_FAILURE_BRANCH_TAKEN'\n",
             encoding="utf-8",
@@ -5946,6 +5956,7 @@ class KeepAliveAfterMeasuredIntervalCheckpointTests(_PwshCase):
             "function Save-Json($Object, [string]$Path) {\n"
             "    [void](Publish-AttrCudaText -Path $Path -Value ($Object | ConvertTo-Json -Depth 30))\n"
             "}\n"
+            "function Write-JobTrace([string]$Message) { }\n"
             + self._extract_checkpoint() + "\n"
             "Write-Output 'RESULT=FELL_THROUGH_TO_BACKEND_GATE'\n",
             encoding="utf-8",
