@@ -758,11 +758,11 @@ $clipBytesForBudget = [int64]0
 if (-not $isFixtureRehearsal) {
     foreach ($budgetPart in $ownerPartsForJob) { $clipBytesForBudget += [int64]$budgetPart.length }
 }
-$timeBudgetArgs = @{ InputBytes = $clipBytesForBudget }
+$timeBudgetArgs = @{}
 if ($ColdReadMBps -gt 0.0) { $timeBudgetArgs['ColdReadMBps'] = $ColdReadMBps }
 if ($FixedPreLaunchSeconds -gt 0) { $timeBudgetArgs['FixedPreLaunchSeconds'] = $FixedPreLaunchSeconds }
 if ($PostRunSeconds -gt 0) { $timeBudgetArgs['PostRunSeconds'] = $PostRunSeconds }
-$timeBudget = Get-AttrCudaLegTimeBudget @timeBudgetArgs
+$timeBudget = Get-AttrCudaLegTimeBudget -InputBytes $clipBytesForBudget @timeBudgetArgs
 
 # --- job body template (placeholders are substituted below; the body itself never
 #     touches this generator's variables directly, so there is no accidental capture
