@@ -265,14 +265,23 @@ param(
     [ValidateRange(20, 100)]
     [int]$CpuLoadGatePercent = 20,
 
-    # PLAYBACK-HFR-CONFORM-DEFAULT-1: run-release-gui-smoke.ps1's -ProcessTimeoutMs for the app
-    # launch. 0 (the default) passes nothing, so every existing caller's emitted job is
-    # byte-identical. The derived default is ~125 s for a 40 s run, which is shorter than the time
-    # the app needs to open a cold owner clip on Bachelor when its file reads are slow (measured
-    # 2026-09-29: 4 KB-block reads of footage-sized files ran at 2-11 MB/s, and a 2.2 GB clip had
-    # not finished loading after 140 s), so the smoke reported exit 124 with 'timeout of 1 ms'.
-    [ValidateScript({ $_ -eq 0 -or ($_ -ge 30000 -and $_ -le 3600000) })]
-    [int]$SmokeProcessTimeoutMs = 0
+    # BACHELOR-OWNER-CLIP-STAGE-STALL-1: the cold read rate (MB/s) the leg's timeouts are sized
+    # from. 0 (default) uses the rate MEASURED on the measurement host and recorded beside
+    # $script:AttrCudaMeasuredColdReadMBps in AttrCudaArtifacts.psm1; pass a fresh measurement
+    # (attr3-footage-read-rate-job.ps1) to override. The derived smoke-process timeout is baked
+    # into the emitted job and the recommended um-run -TimeoutSec is returned as
+    # recommendedJobTimeoutSec.
+    [ValidateRange(0.0, 100000.0)]
+    [double]$ColdReadMBps = 0.0,
+
+    # BACHELOR-OWNER-CLIP-STAGE-STALL-1 round 1f: the size-independent allowances behind
+    # recommendedJobTimeoutSec. 0 (default) uses the values derived from the proof traces and
+    # recorded beside $script:AttrCudaMeasuredFixedPreLaunchSeconds / AttrCudaAllowancePostRunSeconds
+    # in AttrCudaArtifacts.psm1; pass a fresh measurement to override.
+    [ValidateRange(0, 7200)]
+    [int]$FixedPreLaunchSeconds = 0,
+    [ValidateRange(0, 7200)]
+    [int]$PostRunSeconds = 0
 )
 
 $ErrorActionPreference = 'Stop'
@@ -524,6 +533,11 @@ $embeddedFunctions = Get-AttrCudaEmbeddedFunctionSource -Name @(
     # SAME function Attr3FootagePresenceJob.psm1 embeds for its own probe -- one definition,
     # spliced verbatim into both, never two copies that can drift apart.
     'Read-AttrCudaBase64Payload',
+    # BACHELOR-OWNER-CLIP-STAGE-STALL-1: the one large-block reader every hash in this job goes
+    # through (Get-Sha, the owner identity check, the fixture check) and the trace writer every
+    # pre-launch step reports to. Test-AttrCudaFootagePart calls both by name.
+    'Add-AttrCudaTraceLine',
+    'Get-AttrCudaFileSha256Blocks',
     'Test-AttrCudaFootagePart',
     'ConvertTo-AttrCudaUtf8String',
     # CUDA-PERF-DISPLAY-IDENTITY-HARNESS-1: the PresentMon post-step's own safety boundary --
@@ -610,6 +624,8 @@ $embeddedFunctions = $embeddedFunctions + "`r`n`r`n" + (Get-AttrCudaEmbeddedFunc
     'Get-AttrCudaFileIdentity',
     'New-AttrCudaOwnerFootageLink',
     'Open-AttrCudaReadOnlyHandle',
+    # BACHELOR-OWNER-CLIP-STAGE-STALL-1 round 1f: the runner's carried-identity file (see its header).
+    'New-AttrCudaVerifiedClipBinding',
     'Close-AttrCudaOwnerFootageWorkspace'
 ))
 
@@ -686,6 +702,21 @@ $smokeRunnerClosureDirName = "smoke-runner-$($smokeRunnerClosureDigest.Substring
 [void](Assert-AttrCudaSafeArtifactName -Name $smokeRunnerClosureDirName)
 $smokeRunnerName = $smokeRunnerClosure[0].name
 
+# BACHELOR-OWNER-CLIP-STAGE-STALL-1 round 1f: does the runner that will actually run -- the bytes
+# COMMITTED at -SourceCommit, which the closure above pins -- declare the two parameters the job
+# passes it to avoid re-reading the clip? Decided here from those committed bytes: the venue has no
+# checkout to ask, and a runner without the parameters rejects them and the leg dies at launch.
+$smokeRunnerCommittedText = (& git -C $RepoRoot show "${SourceCommit}:tools/profiling/$smokeRunnerName" 2>$null | Out-String)
+$runnerAcceptsVerifiedClipBinding = ($LASTEXITCODE -eq 0) -and
+    ($smokeRunnerCommittedText -match '\[string\]\$VerifiedClipBindingPath\b') -and
+    ($smokeRunnerCommittedText -match '\[string\]\$TracePath\b')
+if (-not $isFixtureRehearsal -and -not $runnerAcceptsVerifiedClipBinding) {
+    Write-Warning ("The smoke runner committed at $($SourceCommit.Substring(0, 12)) does not take -VerifiedClipBindingPath, so it will read the owner clip " +
+        "again itself (small blocks, before the app launches). The single-read guarantee is NOT end to end for this leg, and the derived timeouts do not cover those reads. " +
+        "Generate from a -SourceCommit that contains the runner from BACHELOR-OWNER-CLIP-STAGE-STALL-1 round 1f or later.")
+}
+$runnerAcceptsVerifiedClipBindingLiteral = if ($runnerAcceptsVerifiedClipBinding) { '$true' } else { '$false' }
+
 function ConvertTo-AttrCudaGeneratorPsLiteral([string]$Value) { "'" + $Value.Replace("'", "''") + "'" }
 $smokeRunnerClosureLiteral = "@(`r`n" + (($smokeRunnerClosure | ForEach-Object {
     "    [pscustomobject]@{ name = $(ConvertTo-AttrCudaGeneratorPsLiteral $_.name); sha256 = '$($_.sha256)' }"
@@ -727,7 +758,21 @@ if ($ContactSheet) {
 }
 $disablePaintPerSubmitLiteral = if ($DisablePaintPerSubmit) { '$true' } else { '$false' }
 $cpuLoadGatePercentLiteral = [string][int]$CpuLoadGatePercent
-$smokeProcessTimeoutMsLiteral = [string][int]$SmokeProcessTimeoutMs
+
+# BACHELOR-OWNER-CLIP-STAGE-STALL-1: timeouts derived from the clip's size and the MEASURED cold
+# read rate, never guessed. run-release-gui-smoke.ps1's own derived process timeout (~75 s) has no
+# allowance for loading the clip at all, so it is passed explicitly; the same derivation yields the
+# um-run -TimeoutSec the hub should submit with. A fixture (tiny tracked file) has no owner parts,
+# so it gets the fixed allowances only.
+$clipBytesForBudget = [int64]0
+if (-not $isFixtureRehearsal) {
+    foreach ($budgetPart in $ownerPartsForJob) { $clipBytesForBudget += [int64]$budgetPart.length }
+}
+$timeBudgetArgs = @{}
+if ($ColdReadMBps -gt 0.0) { $timeBudgetArgs['ColdReadMBps'] = $ColdReadMBps }
+if ($FixedPreLaunchSeconds -gt 0) { $timeBudgetArgs['FixedPreLaunchSeconds'] = $FixedPreLaunchSeconds }
+if ($PostRunSeconds -gt 0) { $timeBudgetArgs['PostRunSeconds'] = $PostRunSeconds }
+$timeBudget = Get-AttrCudaLegTimeBudget -InputBytes $clipBytesForBudget @timeBudgetArgs
 
 # --- job body template (placeholders are substituted below; the body itself never
 #     touches this generator's variables directly, so there is no accidental capture
@@ -760,14 +805,32 @@ $ContactSheetComposerSha256 = '__CONTACT_SHEET_COMPOSER_SHA256__'
 $TelemetryArm = '__TELEMETRY_ARM__'
 $DisablePaintPerSubmit = __DISABLE_PAINT_PER_SUBMIT__
 $CpuLoadGatePercent = [double]__CPU_LOAD_GATE_PERCENT__
-$SmokeProcessTimeoutMs = [int]__SMOKE_PROCESS_TIMEOUT_MS__
 $Root = '__AGENT_ROOT__'
 $Cache = Join-Path $Root 'cache'
 $Stamp = Get-Date -Format 'yyyyMMdd-HHmmss'
 $JobId = "playback-attr-3-cuda-$($SourceCommit.Substring(0,12))-$ClipId-$Stamp"
 $Work = Join-Path 'C:\mlvtmp' $JobId
 $Pub = Join-Path $Root "outbox\$JobId.artifacts"
-$PresentMonTimedSeconds = 55
+# BACHELOR-OWNER-CLIP-STAGE-STALL-1: every pre-launch step appends a timestamped line here as it
+# starts and ends, flushed immediately, so a job the agent kills at its cap (which returns NO
+# stdout) still leaves the last step it reached. Fetch it with attr3-trace-fetch-job.ps1.
+$Trace = Join-Path $Root "logs\$JobId.trace.txt"
+# BACHELOR-OWNER-CLIP-STAGE-STALL-1 round 1f (fable hardening 1): PresentMon starts BEFORE the smoke
+# launch, and an owner leg's app load alone can take many minutes on Bachelor's cold storage, so a
+# fixed 55 s capture ended before playback and the leg failed on an empty capture. An owner leg
+# sizes the capture CEILING from the same derived budget as the smoke process (its own timeout) and
+# asks PresentMon to stop when the app exits (--terminate_on_proc_exit), so the ceiling is never
+# waited out; a fixture leg (tiny file, instant load) keeps the fixed 55 s. The display report
+# windows the rows to the playback interval, so the idle head of a longer capture is never scored.
+$PresentMonTimedSeconds = __PRESENTMON_TIMED_SECONDS__
+$PresentMonTerminateOnProcExit = __PRESENTMON_TERMINATE_ON_PROC_EXIT__
+$SmokeProcessTimeoutMs = __SMOKE_PROCESS_TIMEOUT_MS__
+# BACHELOR-OWNER-CLIP-STAGE-STALL-1 round 1f: true only when the smoke runner COMMITTED at this leg's
+# -SourceCommit declares -VerifiedClipBindingPath and -TracePath (decided by the generator from those
+# committed bytes -- the venue has no checkout). A runner without them would reject the parameters
+# outright, so they are then not passed and that runner re-reads the clip itself.
+$RunnerAcceptsVerifiedClipBinding = __RUNNER_ACCEPTS_VERIFIED_CLIP_BINDING__
+$VerifiedClipBindingPath = ''
 # ATTR3-FOOTAGE-BIND-1 PR-B round 4: set by the owner branch below; stays $null/empty for a
 # fixture run, so the `finally` around the smoke run further down is a no-op for one.
 $OwnerClipDir = $null
@@ -786,6 +849,12 @@ function Save-Json($Object, [string]$Path) {
     # Artifact writes go through the slot-checked helper: never through a link or into a directory (sol PR #133).
     [void](Publish-AttrCudaText -Path $Path -Value ($Object | ConvertTo-Json -Depth 30))
 }
+
+# One line per pre-launch step (path-free text only -- step names, indexes, sizes, rates).
+function Write-JobTrace([string]$Message) {
+    Add-AttrCudaTraceLine -TracePath $Trace -Message $Message
+}
+Write-JobTrace "job start id=$JobId commit=$($SourceCommit.Substring(0,12)) clip=$ClipId fixture=$FixtureRehearsal smokeProcessTimeoutMs=$SmokeProcessTimeoutMs"
 
 # CUDA-PERF-DISPLAY-WAKE-2 round 1c: THE VERY FIRST ACTION this job takes after claim, before the
 # TEMP boundary, before $Work/$Pub are even created, before footage resolution, before package/
@@ -813,8 +882,10 @@ function Save-Json($Object, [string]$Path) {
 # itself exiting, never explicitly recorded. The `try` now opens right here, at the first line of
 # the claim-time wake lifetime, so Stop-AttrCudaDisplayWakeKeepAlive/Stop-AttrCudaDisplayWake run
 # on every exit from this point on, including the `exit 25` immediately below.
+Write-JobTrace 'step display-wake start'
 try {
 $displayWake = Start-AttrCudaDisplayWake
+Write-JobTrace 'step display-wake done'
 if ($displayWake.screensaverSecureOwnerOnly) {
     [void](New-AttrCudaDirectory -Path (Join-Path $Root 'outbox'))
     [void](New-AttrCudaDirectory -Path $Pub)
@@ -891,8 +962,10 @@ $env:TMP = $Scratch
 # missing, PresentMon exits 6 (access denied) and this job fails closed; it never falls back to
 # the task.
 
-function Get-Sha([string]$Path) {
-    (Get-FileHash -LiteralPath $Path -Algorithm SHA256).Hash.ToUpperInvariant()
+function Get-Sha([string]$Path, [string]$Label) {
+    # BACHELOR-OWNER-CLIP-STAGE-STALL-1: one large-block read (was the built-in hash cmdlet's small blocks),
+    # traced under $Label so each hash's size and rate is on the record.
+    (Get-AttrCudaFileSha256Blocks -Path $Path -TracePath $Trace -Label $Label).sha256.ToUpperInvariant()
 }
 
 function Get-Mean([double[]]$Values) {
@@ -938,6 +1011,7 @@ function Start-PresentMonCapture([string]$CsvPath) {
     if (Test-Path -LiteralPath $CsvPath) { throw "PresentMon output already exists: $CsvPath" }
     $pmArgs = @('--process_name', $ExeName, '--output_file', $CsvPath, '--timed', [string]$PresentMonTimedSeconds,
                 '--terminate_after_timed', '--stop_existing_session', '--no_console_stats')
+    if ($PresentMonTerminateOnProcExit) { $pmArgs += '--terminate_on_proc_exit' }
     # Direct child: inherits this job's TEMP/TMP. -PassThru so the exit code is checked.
     $proc = Start-Process -FilePath (Join-Path $Cache $PresentMonName) -ArgumentList $pmArgs -PassThru -WindowStyle Hidden
     Start-Sleep -Seconds 3
@@ -1308,8 +1382,9 @@ foreach ($item in @(
     @{ path=(Join-Path $Cache $PresentMonName); sha=$PresentMonSha }
 )) {
     if (-not (Test-Path -LiteralPath $item.path)) { throw "cache missing $($item.path)" }
-    if ((Get-Sha $item.path) -ne $item.sha) { throw "hash mismatch $($item.path)" }
+    if ((Get-Sha $item.path 'presentmon-hash') -ne $item.sha) { throw "hash mismatch $($item.path)" }
 }
+Write-JobTrace 'step presentmon-verified'
 # Non-transactional publish fix (BLOCKER): existence of the exe/DLL/pkg alone does not
 # prove they belong together -- a compile job's publish could have been interrupted
 # between renames. The compile job's cache manifest (holding all three lowercase
@@ -1339,11 +1414,17 @@ $manifestChecks = @(
     @{ label = 'exe'; path = (Join-Path $Cache $ExeName); expectedSha = $buildManifest.exe.sha256 },
     @{ label = 'dll'; path = (Join-Path $Cache $ReconName); expectedSha = $buildManifest.dll.sha256 }
 )
+# BACHELOR-OWNER-CLIP-STAGE-STALL-1: each cached artifact is hashed ONCE per job. The digest that
+# just matched the authenticated manifest is kept and reused below as the expected value for the
+# deployed copies -- the deployed-copy comparison further down still catches any change since.
+$manifestHashes = @{}
 foreach ($check in $manifestChecks) {
     if (-not (Test-Path -LiteralPath $check.path)) { throw "cache missing $($check.path)" }
     if ([string]::IsNullOrWhiteSpace($check.expectedSha)) { throw "build manifest $buildManifestName is missing a sha256 for $($check.label)" }
-    if ((Get-Sha $check.path) -ne $check.expectedSha.ToUpperInvariant()) { throw "hash mismatch (vs build manifest $buildManifestName) for $($check.path)" }
+    $manifestHashes[$check.label] = Get-Sha $check.path "manifest-$($check.label)-hash"
+    if ($manifestHashes[$check.label] -ne $check.expectedSha.ToUpperInvariant()) { throw "hash mismatch (vs build manifest $buildManifestName) for $($check.path)" }
 }
+Write-JobTrace 'step build-manifest-artifacts-verified'
 if (-not (Test-Path -LiteralPath (Join-Path $Cache $PresentMonName))) { throw "cache missing $PresentMonName" }
 # ATTR3-SMOKE-RUNNER-DEPS-1 round 3 (NARROW BY REDESIGN): the runner alone is not launchable --
 # it is one file in an explicitly pinned six-file manifest (four dot-sourced siblings and one
@@ -1386,8 +1467,9 @@ New-Item -ItemType Directory -Path (Join-Path $Work 'out') -Force | Out-Null
 # ATTR3-FIXTURE-STAGE-1: a fixture run authenticates the cached clip's CONTENT before it is
 # ever opened -- a cache file name proves nothing about its bytes. Hashed and checked before any
 # package is deployed or playback launched.
+Write-JobTrace 'step footage-verify start'
 if ($FixtureRehearsal) {
-    $actualClipSha256 = (Get-FileHash -LiteralPath $clipPath -Algorithm SHA256).Hash.ToLowerInvariant()
+    $actualClipSha256 = (Get-AttrCudaFileSha256Blocks -Path $clipPath -TracePath $Trace -Label 'fixture-identity-hash').sha256
     if ($actualClipSha256 -ne $FixtureSha256) {
         $mismatch = [ordered]@{
             schema='playback-attr-3-cuda-venue.v1'; result='FIXTURE_CONTENT_MISMATCH'
@@ -1415,7 +1497,13 @@ if ($FixtureRehearsal) {
         # PowerShell parses as code.
         $decoded = Read-AttrCudaBase64Payload -Base64 $rawPart.pathBase64
         $partPath = ConvertTo-AttrCudaUtf8String -Bytes $decoded.bytes
-        $status = Test-AttrCudaFootagePart -Path $partPath -ExpectedLength ([int64]$rawPart.length) -ExpectedSha256 ([string]$rawPart.sha256)
+        # BACHELOR-OWNER-CLIP-STAGE-STALL-1: this is the CHEAP screen -- existence, readability
+        # and length, no content read. The clip is read in full exactly ONCE per job, further
+        # down, through the link this job holds open (the identity hash that doubles as the
+        # cache pre-warm); it used to be hashed here AND again there, then read by the smoke
+        # runner and by the app -- three to four cold reads at ~2.3 MB/s.
+        $status = Test-AttrCudaFootagePart -Path $partPath -ExpectedLength ([int64]$rawPart.length) -ExpectedSha256 ([string]$rawPart.sha256) -LengthOnly
+        Write-JobTrace "footage part=$($rawPart.index) screen status=$status length=$($rawPart.length)"
         [void]$ownerPartResults.Add([ordered]@{ index = [int]$rawPart.index; status = $status })
         [void]$ownerDecodedParts.Add([ordered]@{ index = [int]$rawPart.index; path = $partPath; length = [int64]$rawPart.length; sha256 = [string]$rawPart.sha256 })
     }
@@ -1458,6 +1546,7 @@ if ($FixtureRehearsal) {
     }
 
     $OwnerClipDir = New-AttrCudaDirectory -Path (Join-Path $Work 'owner-clip')
+    $ownerVerifiedParts = [System.Collections.Generic.List[object]]::new()
     # ATTR3-FOOTAGE-BIND-1 PR-B round 5 (astra major): the cleanup `try` now wraps this ENTIRE
     # loop -- creating every link, opening every held handle, and re-verifying every link's
     # content -- not just the code from a link's successful creation onward. Round 4 only guarded
@@ -1480,11 +1569,19 @@ if ($FixtureRehearsal) {
             # own re-hash below both read it.
             $handle = Open-AttrCudaReadOnlyHandle -Path $linkPath
             [void]$ownerLinkHandles.Add($handle)
-            $relinkStatus = Test-AttrCudaFootagePart -Path $linkPath -ExpectedLength $part.length -ExpectedSha256 $part.sha256
+            Write-JobTrace "footage part=$($part.index) linked and held; identity hash start"
+            # THE one full read of this part in this job: length, then a large-block sha256 of the
+            # very file object this job now holds read-shared (identity proven by
+            # New-AttrCudaOwnerFootageLink), traced with its size and rate. Never skipped -- it is
+            # the identity/consent check -- and never repeated: the app that follows reads the
+            # pages this pass just warmed.
+            $relinkStatus = Test-AttrCudaFootagePart -Path $linkPath -ExpectedLength $part.length -ExpectedSha256 $part.sha256 -TracePath $Trace -TraceLabel "footage-part$($part.index)-identity-hash"
+            Write-JobTrace "footage part=$($part.index) identity status=$relinkStatus"
             if ($relinkStatus -ne 'PASS') {
                 throw "OWNER_FOOTAGE_NOT_VERIFIED status=$relinkStatus"
             }
             if ($part.index -eq 0) { $clipPath = $linkPath }
+            [void]$ownerVerifiedParts.Add([ordered]@{ path = $linkPath; length = $part.length; sha256 = $part.sha256 })
         }
     } catch {
         # Closes whatever handles were acquired before the failure and deletes only the neutral
@@ -1521,6 +1618,20 @@ if ($FixtureRehearsal) {
         Write-Output "RESULT=$linkToken PART=$($part.index) ARTIFACTS=$Pub"
         exit $linkExitCode
     }
+
+    # BACHELOR-OWNER-CLIP-STAGE-STALL-1 round 1f (sol BLOCKER): the smoke runner used to hash every
+    # part again, in small blocks, before it launched anything (0.55 MB/s on the measurement host;
+    # untraced; outside its own process timeout). Every part was just verified above, in full, on a
+    # handle this job STILL HOLDS through the smoke run, so that verified identity is handed to the
+    # runner instead: it records it, and honours an entry only while the file keeps the bound length
+    # and stays pinned by that handle -- so the file the app opens is the file that was hashed.
+    if ($RunnerAcceptsVerifiedClipBinding) {
+        $VerifiedClipBindingPath = Join-Path $Work 'verified-clip-binding.json'
+        [void](Publish-AttrCudaText -Path $VerifiedClipBindingPath -Value (New-AttrCudaVerifiedClipBinding -Parts @($ownerVerifiedParts)))
+        Write-JobTrace "footage verified identity handed to the smoke runner parts=$($ownerVerifiedParts.Count)"
+    } else {
+        Write-JobTrace 'WARNING smoke runner at this SourceCommit takes no verified clip binding: it will read the clip again itself'
+    }
 }
 
 # ATTR3-FOOTAGE-BIND-1 PR-B round 4: everything from here to the end of the job runs inside the
@@ -1530,7 +1641,10 @@ if ($FixtureRehearsal) {
 # path below, including an early `exit N` (PowerShell still runs a pending `finally` on `exit`,
 # proven by CI before this shipped) and an uncaught terminating error. $OwnerClipDir stays $null
 # for a fixture run, so the `finally` is a no-op there.
+Write-JobTrace 'step footage-verify done'
+Write-JobTrace 'step package-expand start'
 Expand-Archive -LiteralPath (Join-Path $Cache $BasePackageZip) -DestinationPath (Join-Path $Work 'pkg') -Force
+Write-JobTrace 'step package-expand done'
 # CUDA-PERF-DISPLAY-WAKE-1/2. OWNER (2026-09-25): "if display is asleep just wake it. its just the
 # blank screensaver". $displayWake/$displayWakeKeepAlive were already started at the very top of
 # this job (round 1c -- see that block's own comment for why: closing the gap between job claim
@@ -1541,13 +1655,18 @@ if (-not $baseExe) { throw "base package executable not found: $BasePackageExeNa
 $pkgDir = $baseExe.Directory.FullName
 $exePath = Join-Path $pkgDir $ExeName
 $reconDll = Join-Path $pkgDir 'igpu_recon_cuda.dll'
-$cacheExeSha = Get-Sha (Join-Path $Cache $ExeName)
-$cacheReconSha = Get-Sha (Join-Path $Cache $ReconName)
+# The cached exe/DLL were hashed once, in the manifest check above; that digest (already equal to
+# the authenticated manifest's) is the expected value for the deployed copies. Re-hashing the
+# cache here again would only re-read the same bytes.
+$cacheExeSha = $manifestHashes['exe']
+$cacheReconSha = $manifestHashes['dll']
+Write-JobTrace 'step deploy start'
 [void](Publish-AttrCudaFileCopy -Source (Join-Path $Cache $ExeName) -Destination $exePath)
 [void](Publish-AttrCudaFileCopy -Source (Join-Path $Cache $ReconName) -Destination $reconDll)
-if ((Get-Sha $exePath) -ne $cacheExeSha -or (Get-Sha $reconDll) -ne $cacheReconSha) {
+if ((Get-Sha $exePath 'deployed-exe-hash') -ne $cacheExeSha -or (Get-Sha $reconDll 'deployed-dll-hash') -ne $cacheReconSha) {
     throw 'deployed artifact hash verification failed (copy from cache did not round-trip)'
 }
+Write-JobTrace 'step deploy done'
 
 reg add "HKCU\Software\Microsoft\DirectX\UserGpuPreferences" /v "$exePath" /t REG_SZ /d "GpuPreference=2;" /f | Out-Null
 reg add "HKCU\Software\magiclantern.MLVApp\MLVApp" /v playbackProcessingSubset /t REG_DWORD /d 1 /f | Out-Null
@@ -1595,6 +1714,7 @@ $displayBlock = Build-AttrCudaDisplayBlock -WindowsInventory $windowsDisplayInve
 # decision. Both metrics and the top 10 CPU-seconds consumers are published in summary.json on
 # BOTH this refusal path and the pass path (see the cpuQuiescence block in the evidence
 # manifest written further down).
+Write-JobTrace 'step quiescence-check start'
 $cpuProcessBefore = Get-AttrCudaProcessCpuSnapshot
 $cpuUtilitySamples = @()
 $cpuTimeSamples = @()
@@ -1621,6 +1741,7 @@ $avgTime = if ($cpuTimeUnknown) { $null } else { Get-Mean $cpuTimeSamples }
 # PLAYBACK-HFR-CONFORM-DEFAULT-1: the threshold is the -CpuLoadGatePercent parameter (default 20,
 # so every existing caller's gate is unchanged); it now bounds the % Processor Time mean above.
 $cpuThresholdPercent = $CpuLoadGatePercent
+Write-JobTrace "step quiescence-check done cpuTimeMean=$avgTime cpuUtilityMean=$avgUtility cpuTimeUnknown=$cpuTimeUnknown"
 # UM-DISPLAY-SELECT-AND-LOG-1 round 1c (opus design-review hardening item 4): written
 # fail-closed as "-not (<= threshold)", not "-gt threshold" -- a stray NaN that ever reached
 # this point (Get-AttrCudaQuiescenceSample now refuses one before averaging) would compare
@@ -1704,9 +1825,14 @@ $envs = @(
 # default.
 $envList = "'" + ($envs -join "','") + "'"
 function ConvertTo-PsSingleQuoted([string]$Value) { "'" + $Value.Replace("'", "''") + "'" }
-$cmd = "& $(ConvertTo-PsSingleQuoted $smoke) -ExePath $(ConvertTo-PsSingleQuoted $exePath) -Input $(ConvertTo-PsSingleQuoted $clipPath) -Output $(ConvertTo-PsSingleQuoted $resultPath) -Seconds 40 -StartFrame 0 -SettleMs 2500 -ScaleFactor 4 -UsePersistedPlaybackSettings -RequireLookAssist:`$false -Scope none -FrameTelemetry -PreserveExperimentalEnvironment -ExtraEnvironment @($envList)"
-if ($SmokeProcessTimeoutMs -gt 0) {
-    $cmd = "$cmd -ProcessTimeoutMs $SmokeProcessTimeoutMs"
+$cmd = "& $(ConvertTo-PsSingleQuoted $smoke) -ExePath $(ConvertTo-PsSingleQuoted $exePath) -Input $(ConvertTo-PsSingleQuoted $clipPath) -Output $(ConvertTo-PsSingleQuoted $resultPath) -Seconds 40 -StartFrame 0 -SettleMs 2500 -ProcessTimeoutMs $SmokeProcessTimeoutMs -ScaleFactor 4 -UsePersistedPlaybackSettings -RequireLookAssist:`$false -Scope none -FrameTelemetry -PreserveExperimentalEnvironment -ExtraEnvironment @($envList)"
+if ($RunnerAcceptsVerifiedClipBinding) {
+    # BACHELOR-OWNER-CLIP-STAGE-STALL-1 round 1f: the runner's own remaining reads are traced into
+    # this job's trace file, and (owner run) it takes the identity verified above instead of re-reading.
+    $cmd += " -TracePath $(ConvertTo-PsSingleQuoted $Trace)"
+    if (-not [string]::IsNullOrWhiteSpace($VerifiedClipBindingPath)) {
+        $cmd += " -VerifiedClipBindingPath $(ConvertTo-PsSingleQuoted $VerifiedClipBindingPath)"
+    }
 }
 if (-not [string]::IsNullOrWhiteSpace($displayPreferArgument)) {
     # UM-DISPLAY-SELECT-AND-LOG-1 round 1c: the runner itself feature-probes the target
@@ -1784,11 +1910,13 @@ $presentMonPreSpawnUtc = (Get-Date).ToUniversalTime()
 # step before the smoke run (and therefore any app-side measurement) had even started. Typed the
 # same way every other PresentMon failure already is: PRESENTMON_UNAVAILABLE, exit 23.
 $presentMonSpawnError = $null
+Write-JobTrace 'step presentmon-spawn start'
 try {
     $presentMonProc = Start-PresentMonCapture $presentMonPath
 } catch {
     $presentMonSpawnError = $_.Exception.Message
 }
+Write-JobTrace 'step presentmon-spawn done'
 if ($null -ne $presentMonSpawnError) {
     $displayFailure = [ordered]@{
         schema='playback-attr-3-cuda-venue.v1'; result='PRESENTMON_UNAVAILABLE'
@@ -1844,12 +1972,14 @@ if (-not $keepAliveHealthBeforeSmokeLaunch.healthy) {
 }
 $smokeRc = $null
 $smokeLaunchException = $null
+Write-JobTrace 'step smoke-launch start (app launch + load + playback)'
 try {
     & "$env:ProgramFiles\PowerShell\7\pwsh.exe" -NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -Command $cmd 1> (Join-Path $legOut 'smoke-stdout.txt') 2> (Join-Path $legOut 'smoke-stderr.txt')
     $smokeRc = $LASTEXITCODE
 } catch {
     $smokeLaunchException = $_
 }
+Write-JobTrace "step smoke-launch done rc=$smokeRc"
 
 # ATTR3-SMOKE-RUNNER-DEPS-1 (D, round 1 BLOCKER): the smoke run's own outcome is checked BEFORE
 # PresentMon is waited on. The previous order waited up to 35s for PresentMon to exit even when
@@ -2669,7 +2799,10 @@ $text = Expand-AttrCudaTemplate -Template $template -Tokens ([ordered]@{
     TELEMETRY_ARM = $TelemetryArm
     DISABLE_PAINT_PER_SUBMIT = $disablePaintPerSubmitLiteral
     CPU_LOAD_GATE_PERCENT = $cpuLoadGatePercentLiteral
-    SMOKE_PROCESS_TIMEOUT_MS = $smokeProcessTimeoutMsLiteral
+    SMOKE_PROCESS_TIMEOUT_MS = [string]$timeBudget.smokeProcessTimeoutMs
+    RUNNER_ACCEPTS_VERIFIED_CLIP_BINDING = $runnerAcceptsVerifiedClipBindingLiteral
+    PRESENTMON_TIMED_SECONDS = $(if ($isFixtureRehearsal) { '55' } else { [string][int][math]::Ceiling($timeBudget.smokeProcessTimeoutMs / 1000.0) })
+    PRESENTMON_TERMINATE_ON_PROC_EXIT = $(if ($isFixtureRehearsal) { '$false' } else { '$true' })
     EMBEDDED_FUNCTIONS = $embeddedFunctions
 })
 
@@ -2688,4 +2821,10 @@ if ($outDir -and -not (Test-Path -LiteralPath $outDir)) { New-Item -ItemType Dir
     llrawprocBlobId = $llrawprocBlobId
     smokeRunnerClosureDigest = $smokeRunnerClosureDigest
     smokeRunnerClosureDirName = $smokeRunnerClosureDirName
+    # Submit with um-run -TimeoutSec <recommendedJobTimeoutSec>; the derivation is in timeBudget.
+    recommendedJobTimeoutSec = $timeBudget.jobTimeoutSec
+    smokeProcessTimeoutMs = $timeBudget.smokeProcessTimeoutMs
+    # false = this SourceCommit's runner re-reads the owner clip itself (see the warning above).
+    runnerVerifiedClipBinding = $runnerAcceptsVerifiedClipBinding
+    timeBudget = $timeBudget
 }

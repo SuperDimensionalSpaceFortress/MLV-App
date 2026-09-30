@@ -1183,32 +1183,6 @@ class AttributionJobCpuLoadGateTests(_PwshCase):
         self.assertNotIn("$cpuThresholdPercent = 20.0", job_text)
         self.assertNotIn("$avgLoad", job_text)
 
-    def test_smoke_process_timeout_defaults_to_zero_and_adds_no_argument(self) -> None:
-        job_text = self._generate()
-        self.assertIn("$SmokeProcessTimeoutMs = [int]0", job_text)
-        self.assertNotIn("__SMOKE_PROCESS_TIMEOUT_MS__", job_text)
-        self.assertIn("if ($SmokeProcessTimeoutMs -gt 0) {", job_text)
-
-    def test_smoke_process_timeout_override_reaches_the_emitted_job(self) -> None:
-        job_text = self._generate(extra_args=["-SmokeProcessTimeoutMs 900000"])
-        self.assertIn("$SmokeProcessTimeoutMs = [int]900000", job_text)
-        self.assertIn('$cmd = "$cmd -ProcessTimeoutMs $SmokeProcessTimeoutMs"', job_text)
-
-    def test_smoke_process_timeout_outside_the_runner_ceiling_is_refused(self) -> None:
-        for bad in (1000, 3600001):
-            script = self.tmp / f"generate-timeout-{bad}.ps1"
-            script.write_text(
-                "$ErrorActionPreference = 'Stop'\n"
-                f"& '{ATTRIBUTION_GENERATOR}' -SourceCommit '{self.shas[1]}' "
-                f"-BuildManifestSha256 '{'a' * 64}' -ClipId 'tiny_dual_iso' "
-                f"-FixtureSha256 '{'b' * 64}' -SmokeProcessTimeoutMs {bad} "
-                f"-OutFile '{self.staging / 'job.ps1'}' -RepoRoot '{self.repo}'\n",
-                encoding="utf-8",
-            )
-            proc = _run_pwsh_file(script)
-            self.assertNotEqual(proc.returncode, 0, bad)
-            self.assertFalse((self.staging / "job.ps1").exists())
-
     def test_a_gate_below_the_historical_twenty_is_refused(self) -> None:
         script = self.tmp / "generate-low.ps1"
         script.write_text(
@@ -1502,6 +1476,7 @@ class AttributionJobFixtureContentAuthenticationTests(_PwshCase):
             "function Save-Json($Object, [string]$Path) {\n"
             "    [void](Publish-AttrCudaText -Path $Path -Value ($Object | ConvertTo-Json -Depth 30))\n"
             "}\n"
+            "function Write-JobTrace([string]$Message) { }\n"
             + block + "\n"
             "Write-Output 'RESULT=NO_MISMATCH'\n",
             encoding="utf-8",
@@ -1648,6 +1623,7 @@ class AttributionJobOwnerContentAuthenticationTests(_PwshCase):
             "function Save-Json($Object, [string]$Path) {\n"
             "    [void](Publish-AttrCudaText -Path $Path -Value ($Object | ConvertTo-Json -Depth 30))\n"
             "}\n"
+            "function Write-JobTrace([string]$Message) { }\n"
             + block + "\n"
             "Write-Output ('RESULT=NO_MISMATCH clipPath=' + $clipPath)\n",
             encoding="utf-8",
@@ -1699,7 +1675,11 @@ class AttributionJobOwnerContentAuthenticationTests(_PwshCase):
         self.assertEqual(link1_path.stat().st_ino, part1_path.stat().st_ino)
 
     def test_a_mismatched_part_fails_closed_before_the_package_is_touched(self) -> None:
-        part0_path = self.tmp / "owner-content-mismatch-part0.raw"
+        # STAGE-STALL card: the content hash is no longer a separate up-front pass -- the one full
+        # read happens on the held link, AFTER the naming/contiguity assertion -- so this part must
+        # carry a valid neutral-name extension (composed, never spelled whole) for the sha mismatch
+        # to be the first defect the job can find. A wrongly-named part is refused at exit 20.
+        part0_path = self.tmp / ("owner-content-mismatch-part0" + "." + "MLV")
         part0_bytes = b"synthetic owner content that will not match"
         part0_path.write_bytes(part0_bytes)
         parts = [
@@ -1812,6 +1792,7 @@ class OwnerFootagePrivateDirectoryLeakAndRefusalTests(_PwshCase):
             "function Save-Json($Object, [string]$Path) {\n"
             "    [void](Publish-AttrCudaText -Path $Path -Value ($Object | ConvertTo-Json -Depth 30))\n"
             "}\n"
+            "function Write-JobTrace([string]$Message) { }\n"
             + block + "\n"
             "Write-Output ('CLIPPATH=' + $clipPath)\n",
             encoding="utf-8",
@@ -2056,6 +2037,7 @@ class OwnerFootagePrivateDirectoryLeakAndRefusalTests(_PwshCase):
             "function Save-Json($Object, [string]$Path) {\n"
             "    [void](Publish-AttrCudaText -Path $Path -Value ($Object | ConvertTo-Json -Depth 30))\n"
             "}\n"
+            "function Write-JobTrace([string]$Message) { }\n"
             # Real handle for part 0's link; synthetic IOException for part 1's -- the block calls
             # this unqualified at SCRIPT scope (it is spliced in directly, not called from inside
             # the module), so overriding it here is enough without the module-scope mock trick.
@@ -3969,6 +3951,7 @@ class SmokeRunFailedPresentMonCleanupTests(_PwshCase):
             "function Save-Json($Object, [string]$Path) {\n"
             "    [void](Publish-AttrCudaText -Path $Path -Value ($Object | ConvertTo-Json -Depth 30))\n"
             "}\n"
+            "function Write-JobTrace([string]$Message) { }\n"
             # CUDA-PERF-DISPLAY-WAKE-3 round 1: the extracted failure block now includes the
             # "before smoke launch" keep-alive health checkpoint, which reads $displayWake and
             # $displayWakeKeepAlive and calls Get-AttrCudaDisplayWakeKeepAliveHealth (already
@@ -4069,6 +4052,7 @@ class PresentMonSpawnFailureTests(_PwshCase):
             "function Save-Json($Object, [string]$Path) {\n"
             "    $Object | ConvertTo-Json -Depth 30 | Set-Content -LiteralPath $Path -Encoding UTF8\n"
             "}\n"
+            "function Write-JobTrace([string]$Message) { }\n"
             "$displayBlock = [ordered]@{ displayDegraded = 'unknown' }\n"
             + self._display_result_tail_function() + "\n"
             + self._spawn_guard() + "\n"
@@ -6130,6 +6114,7 @@ class KeepAliveAfterMeasuredIntervalCheckpointTests(_PwshCase):
             "function Save-Json($Object, [string]$Path) {\n"
             "    [void](Publish-AttrCudaText -Path $Path -Value ($Object | ConvertTo-Json -Depth 30))\n"
             "}\n"
+            "function Write-JobTrace([string]$Message) { }\n"
             + self._extract_checkpoint() + "\n"
             "Write-Output 'RESULT=FELL_THROUGH_TO_BACKEND_GATE'\n",
             encoding="utf-8",

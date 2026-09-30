@@ -151,7 +151,7 @@ function New-Attr3FootagePresenceJob {
     # ATTR3-FOOTAGE-STAGE-1 round 4 (astra 3): Assert-AttrCudaNoLinkBelowRoot is the SAME
     # target-chain link check Attr3FootageStageJob.psm1's own emitted job applies to its target
     # path -- embedded here too so this probe never hashes/reads a part through an unproven chain.
-    $embeddedFunctions = Get-AttrCudaEmbeddedFunctionSource -Name @('Read-AttrCudaBase64Payload', 'Test-AttrCudaFootagePart', 'Assert-AttrCudaNoLinkBelowRoot')
+    $embeddedFunctions = Get-AttrCudaEmbeddedFunctionSource -Name @('Read-AttrCudaBase64Payload', 'Add-AttrCudaTraceLine', 'Get-AttrCudaFileSha256Blocks', 'Test-AttrCudaFootagePart', 'Assert-AttrCudaNoLinkBelowRoot')
 
     # --- job body template (placeholders are substituted below; the body itself never touches
     #     this function's variables directly, so there is no accidental capture of this process's
