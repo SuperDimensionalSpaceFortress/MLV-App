@@ -17,6 +17,13 @@ venue, starts a job or writes a file. The refusals it enforces (see DESIGN.md pr
   Owner rule 2026-09-30 (long clips): a PASS/FAIL receipt is playback evidence only with metrics.clipSeconds >= 20
   and metrics.wrapped == 0. wrapped=1 -> INVALID_LOOPED, clipSeconds < 20 -> INVALID_CLIP_TOO_SHORT (both refused,
   never counted); fields absent -> UNVERIFIED_CLIP_LENGTH (excluded from acceptance).
+  DUAL-VENUE-RECONCILE-2 -- ONE CLASS: acceptance is never computed over a subset that hides a newer attempt.
+  Recency is decided over EVERY receipt of a leg (card, leg, backend, lookFlavor, venue): valid PASS/FAIL, refused
+  (looped, short, role/detection mismatch, duplicate id), withheld (UNRESOLVED, RETRACTED, ...), and receipt files that
+  could not be parsed (they become barriers: unorderable, or at least as new as the newest parsed one, they withhold).
+  Only the NEWEST attempt can be evidence, and only as a clean PASS/FAIL; anything else newest WITHHOLDS and the card
+  is non-green (NEWEST_ATTEMPT_WITHHELD). There is no fallback to an older receipt, at any digest or filter.
+  A blank argument is an error, never "no filter" or "report mode".
 ASCII only (cp1252-safe). Requires PowerShell 7+ (ConvertFrom-Json -AsHashtable).
 #>
 
@@ -30,6 +37,7 @@ $script:SignalOutcomes = @('PASS', 'FAIL')
 $script:KnownBackends = @('cuda', 'gl', 'cpu')
 $script:MaxReceiptBytes = 1MB
 $script:MinClipSeconds = 20
+$script:MaxClockSkewMinutes = 15
 
 # ---------------------------------------------------------------- small helpers
 
@@ -114,7 +122,7 @@ function Read-VenueTable {
     $result.present = $true
     $dr = Get-VeValue $t 'defaultRole'
     if ($null -ne $dr) {
-        if ($dr -notin $script:KnownRoles) { throw "venue table '$Path': defaultRole '$dr' is not acceptance|supplementary" }
+        if ($dr -cnotin $script:KnownRoles) { throw "venue table '$Path': defaultRole '$dr' is not acceptance|supplementary" }
         $result.defaultRole = [string]$dr
     }
     $venues = Get-VeValue $t 'venues'
@@ -128,13 +136,18 @@ function Read-VenueTable {
     $roles = Get-VeValue $t 'roles'
     if ($null -ne $roles) {
         if ($roles -isnot [System.Collections.IDictionary]) { throw "venue table '$Path': roles must be an object" }
+        $seenCards = @{}
         foreach ($card in $roles.Keys) {
+            # Card names match case-insensitively, so two spellings of one card would make "last wins" decide a role.
+            $cardLower = ([string]$card).ToLowerInvariant()
+            if ($seenCards.ContainsKey($cardLower)) { throw "venue table '$Path': roles names card '$card' twice (card names are case-insensitive)" }
+            $seenCards[$cardLower] = $true
             $perVenue = $roles[$card]
             if ($perVenue -isnot [System.Collections.IDictionary]) { throw "venue table '$Path': roles['$card'] must be an object" }
             $clean = @{}
             foreach ($v in $perVenue.Keys) {
                 if ([string]$v -notin $script:KnownVenues) { throw "venue table '$Path': roles['$card'] names unknown venue '$v'" }
-                if ($perVenue[$v] -notin $script:KnownRoles) { throw "venue table '$Path': roles['$card']['$v'] = '$($perVenue[$v])' is not acceptance|supplementary" }
+                if ($perVenue[$v] -cnotin $script:KnownRoles) { throw "venue table '$Path': roles['$card']['$v'] = '$($perVenue[$v])' is not acceptance|supplementary" }
                 $clean[[string]$v] = [string]$perVenue[$v]
             }
             $result.roles[[string]$card] = $clean
@@ -148,6 +161,15 @@ function Get-VeExpectedRole {
     $ck = Find-VeKey $Table.roles $Card
     if ($null -ne $ck -and $Table.roles[$ck].ContainsKey($Venue)) { return $Table.roles[$ck][$Venue] }
     return $Table.defaultRole
+}
+
+function Get-VeExplicitRole {
+    # Acceptance reads ONLY a role the table names for this exact (card, venue). Unlike Get-VeExpectedRole it never
+    # falls back to defaultRole: a venue the card's entry does not list is not an acceptance venue.
+    param($Table, [string]$Card, [string]$Venue)
+    $ck = Find-VeKey $Table.roles $Card
+    if ($null -ne $ck -and $Table.roles[$ck].ContainsKey($Venue)) { return $Table.roles[$ck][$Venue] }
+    return $null
 }
 
 function Get-VeExpectedVenues {
@@ -196,8 +218,11 @@ function ConvertTo-VeRecord {
         foreach ($f in 'buildManifestSha256', 'legSpecSha256', 'clipId', 'clipContentSha256') {
             if (-not (Test-VeString (Get-VeValue $subject $f))) { $reasons.Add("subject.$f missing") }
         }
+        # lookFlavor distinguishes legs (it is part of the leg key), so a present value that is not a string is
+        # malformed, never silently "no flavor".
         $lf = Get-VeValue $subject 'lookFlavor'
         if ($lf -is [string]) { $lookFlavor = $lf }
+        elseif ($null -ne $lf) { $reasons.Add('subject.lookFlavor is not a string') }
         $b = Get-VeValue $subject 'backend'
         if ($null -ne $b) {
             if ($b -cnotin $script:KnownBackends) { $reasons.Add("subject.backend '$b' is not cuda|gl|cpu") } else { $backend = [string]$b }
@@ -225,13 +250,19 @@ function ConvertTo-VeRecord {
     if ($null -eq $started) { $reasons.Add('startedUtc is not an ISO-8601 instant with a zone') }
     if ($null -eq $finished) { $reasons.Add('finishedUtc is not an ISO-8601 instant with a zone') }
     if ($null -ne $started -and $null -ne $finished -and $finished -lt $started) { $reasons.Add('finishedUtc is before startedUtc') }
+    # "Newest" is decided by finishedUtc, so a finish time in the future would outrank every real later attempt for ever.
+    if ($null -ne $finished -and $finished -gt [System.DateTimeOffset]::UtcNow.AddMinutes($script:MaxClockSkewMinutes)) {
+        $reasons.Add("finishedUtc is more than $($script:MaxClockSkewMinutes) minutes in the future")
+    }
 
     $metrics = Get-VeValue $Receipt 'metrics'
     if ($metrics -isnot [System.Collections.IDictionary]) { $reasons.Add('metrics missing or not an object') }
 
     # Place in the append-only layout: the path is part of the claim, so a receipt filed under another
     # venue/leg/card folder is refused rather than trusted.
-    if ($RelParts.Count -eq 4) {
+    if ($RelParts.Count -ne 4) {
+        $reasons.Add('receipt is not filed at <card>\<legId>\<venue>\<receiptId>.json')
+    } else {
         if ((Test-VeString $card) -and $card -ine $RelParts[0]) { $reasons.Add('card does not match its folder') }
         if ((Test-VeString $legId) -and $legId -ine $RelParts[1]) { $reasons.Add('legId does not match its folder') }
         if ($null -ne $venueName -and $venueName -ine $RelParts[2]) { $reasons.Add('venue.name does not match its folder') }
@@ -244,7 +275,12 @@ function ConvertTo-VeRecord {
     $evidence = Get-VeValue $Receipt 'evidence'
     $clip = @{ state = 'NOT_APPLICABLE'; clipSeconds = $null; wrapped = $null }
     if ($outcome -in $script:SignalOutcomes) { $clip = Get-VeClipLength $metrics }
+    # state = what this receipt amounts to as an ATTEMPT: its outcome, or UNVERIFIED_CLIP_LENGTH when a PASS/FAIL
+    # cannot prove a long, non-looping clip. A refusal (set by the caller) overrides it. Only PASS and FAIL carry signal.
+    $state = $(if ($clip.state -ceq 'UNVERIFIED') { 'UNVERIFIED_CLIP_LENGTH' } else { [string]$outcome })
     $record = @{
+        state         = $state
+        refusal       = $null
         receiptId     = [string]$receiptId
         card          = [string]$card
         legId         = [string]$legId
@@ -273,20 +309,73 @@ function ConvertTo-VeRecord {
 }
 
 function Get-VeReceiptFiles {
-    # Exactly the four-level layout <root>\<card>\<leg>\<venue>\*.json -- no recursive scan, hard cap on count.
+    # EVERY *.json under the root, hard cap on count. A receipt is only valid at the four-level layout
+    # <root>\<card>\<leg>\<venue>\<id>.json, but a file anywhere else is still SEEN (and reported), never invisible:
+    # a newer result misfiled one level off must not let an older PASS stand. rel = the path segments below the root.
     param([string]$Root, [int]$Max)
     $files = [System.Collections.Generic.List[object]]::new()
-    foreach ($cardDir in (Get-ChildItem -LiteralPath $Root -Directory | Sort-Object Name)) {
-        foreach ($legDir in (Get-ChildItem -LiteralPath $cardDir.FullName -Directory | Sort-Object Name)) {
-            foreach ($venueDir in (Get-ChildItem -LiteralPath $legDir.FullName -Directory | Sort-Object Name)) {
-                foreach ($f in (Get-ChildItem -LiteralPath $venueDir.FullName -File -Filter '*.json' | Sort-Object Name)) {
-                    $files.Add(@{ file = $f; rel = @($cardDir.Name, $legDir.Name, $venueDir.Name, $f.Name) })
-                    if ($files.Count -gt $Max) { throw "receipts root holds more than -MaxReceipts ($Max) receipts; raise the bound deliberately" }
-                }
-            }
-        }
+    $rootFull = (Resolve-Path -LiteralPath $Root).ProviderPath
+    foreach ($f in (Get-ChildItem -LiteralPath $Root -Recurse -File -Force -Filter '*.json' | Sort-Object FullName)) {
+        $relPath = [System.IO.Path]::GetRelativePath($rootFull, $f.FullName)
+        $files.Add(@{ file = $f; rel = @($relPath -split '[\\/]') })
+        if ($files.Count -gt $Max) { throw "receipts root holds more than -MaxReceipts ($Max) receipts; raise the bound deliberately" }
     }
     return , $files.ToArray()
+}
+
+function New-VeBarrier {
+    <#
+    A receipt file that could not be turned into a record (not JSON, not an object, oversized, failed validation, or
+    misfiled) still TOOK PLACE. It becomes a barrier for acceptance: what it could belong to is read from the folder it
+    sits in AND from what it claims about itself; anything unknown is a wildcard (null). finished = its finishedUtc
+    instant when it has a real one, else $null (unorderable: it may be newer than anything, so it always withholds).
+    #>
+    param([string[]]$Rel, $Parsed, [string[]]$Reasons)
+    $n = $Rel.Count
+    $cards = [System.Collections.Generic.List[string]]::new()
+    $legs = [System.Collections.Generic.List[string]]::new()
+    $venues = [System.Collections.Generic.List[string]]::new()
+    if ($n -ge 2) { $cards.Add($Rel[0]) }
+    if ($n -ge 3) { $legs.Add($Rel[1]) }
+    if ($n -ge 4 -and $Rel[2] -in $script:KnownVenues) { $venues.Add($Rel[2]) }
+    $finished = $null
+    if ($Parsed -is [System.Collections.IDictionary]) {
+        $c = Get-VeValue $Parsed 'card'
+        if (Test-VeString $c) { $cards.Add([string]$c) }
+        $l = Get-VeValue $Parsed 'legId'
+        if (Test-VeString $l) { $legs.Add([string]$l) }
+        $venue = Get-VeValue $Parsed 'venue'
+        $vn = $(if ($venue -is [System.Collections.IDictionary]) { Get-VeValue $venue 'name' } else { $null })
+        if ($vn -is [string] -and $vn -cin $script:KnownVenues) { $venues.Add([string]$vn) }
+        $finished = ConvertTo-VeInstant (Get-VeValue $Parsed 'finishedUtc')
+    }
+    return @{
+        path     = ($Rel -join '\')
+        reasons  = @($Reasons)
+        cards    = $(if ($cards.Count -gt 0) { @($cards.ToArray()) } else { $null })
+        legs     = $(if ($legs.Count -gt 0) { @($legs.ToArray()) } else { $null })
+        venues   = $(if ($venues.Count -gt 0) { @($venues.ToArray()) } else { $null })
+        finished = $finished
+    }
+}
+
+function Test-VeBarrierMatch {
+    # A wildcard ($null) matches anything; otherwise the barrier must name this card, leg and venue (case-insensitive).
+    param($Barrier, [string]$Card, [string]$Leg, [string]$Venue)
+    foreach ($pair in @(@($Barrier.cards, $Card), @($Barrier.legs, $Leg), @($Barrier.venues, $Venue))) {
+        if ($null -eq $pair[0]) { continue }
+        $want = $pair[1]
+        if (@($pair[0] | Where-Object { $_ -ieq $want }).Count -eq 0) { return $false }
+    }
+    return $true
+}
+
+function Get-VeLegKey {
+    # Which LEG a receipt belongs to: card, leg, backend, lookFlavor, venue. Every subject field that distinguishes legs
+    # is in here (the digest folds backend and lookFlavor in, so the key must not be coarser than the digest).
+    param($Record)
+    $flavor = $(if ($Record.lookFlavor) { ([string]$Record.lookFlavor).Trim().ToLowerInvariant() } else { '' })
+    return "$($Record.card.ToLowerInvariant())|$($Record.legId.ToLowerInvariant())|$($Record.backend)|$flavor|$($Record.venue)"
 }
 
 # ---------------------------------------------------------------- comparison helpers
@@ -302,7 +391,7 @@ function Sort-VeReceipts {
             param($a, $b)
             $c = $a.finished.UtcTicks.CompareTo($b.finished.UtcTicks)
             if ($c -ne 0) { return $c }
-            $c = (Get-VeTieRank $a.outcome).CompareTo((Get-VeTieRank $b.outcome))
+            $c = (Get-VeTieRank $a.state).CompareTo((Get-VeTieRank $b.state))
             if ($c -ne 0) { return $c }
             return [string]::CompareOrdinal($a.receiptId, $b.receiptId)
         })
@@ -315,9 +404,11 @@ function Test-VeNumber {
 }
 
 function Get-VeTieRank {
-    param([string]$Outcome)
-    if ($Outcome -ceq 'PASS') { return 0 }
-    if ($Outcome -ceq 'FAIL') { return 1 }
+    # $State is a receipt's state (outcome, UNVERIFIED_CLIP_LENGTH or a refusal reason): anything that is not a plain
+    # PASS/FAIL outranks both, so an exact tie never resolves toward a pass.
+    param([string]$State)
+    if ($State -ceq 'PASS') { return 0 }
+    if ($State -ceq 'FAIL') { return 1 }
     return 2
 }
 
@@ -331,10 +422,17 @@ function Get-VeClipLength {
     $secs = $null
     $wrap = $null
     if ($Metrics -is [System.Collections.IDictionary]) {
+        # Both spellings present: the STRICTER reading decides (the smaller length); one of them unreadable -> unverified.
+        # Never "the first one found", which would let the lenient spelling win.
         $rawSecs = $null
+        $secsList = [System.Collections.Generic.List[object]]::new()
         foreach ($n in 'clipSeconds', 'clip_seconds') {
             $v = Get-VeValue $Metrics $n
-            if ($null -ne $v) { $rawSecs = $v; break }
+            if ($null -ne $v) { $secsList.Add($v) }
+        }
+        if ($secsList.Count -gt 0) {
+            $bad = @($secsList | Where-Object { -not (Test-VeNumber $_) -or [double]::IsNaN([double]$_) })
+            if ($bad.Count -eq 0) { $rawSecs = ($secsList | ForEach-Object { [double]$_ } | Measure-Object -Minimum).Minimum }
         }
         $rawWrap = Get-VeValue $Metrics 'wrapped'
         if ((Test-VeNumber $rawSecs) -and -not [double]::IsNaN([double]$rawSecs)) { $secs = [double]$rawSecs }
@@ -357,6 +455,7 @@ function ConvertTo-VeReceiptView {
         roleVerified  = $RoleVerified
         clipLength    = $clipLength
         outcome       = $Record.outcome
+        refusal       = $Record.refusal
         outcomeDetail = $Record.outcomeDetail
         startedUtc    = (Format-VeInstant $Record.started)
         finishedUtc   = (Format-VeInstant $Record.finished)
@@ -382,6 +481,7 @@ function ConvertTo-VeReceiptView {
             clipSeconds   = $Record.clipSeconds
             wrapped       = $Record.wrapped
             outcome       = $Record.outcome
+            refusal       = $Record.refusal
             outcomeDetail = $Record.outcomeDetail
             startedUtc    = (Format-VeInstant $Record.started)
             finishedUtc   = (Format-VeInstant $Record.finished)
@@ -445,6 +545,14 @@ function Get-VenueEvidenceReport {
         [string]$BuildManifestSha256,
         [int]$MaxReceipts = 20000
     )
+    # A parameter that is BOUND but empty/blank is refused: an unset caller variable must never silently switch modes
+    # (report instead of acceptance) or drop a filter (an unbound-looking query is broader than the one asked for).
+    foreach ($n in 'Card', 'LegId', 'AcceptanceFor', 'SubjectDigest', 'BuildManifestSha256') {
+        if ($PSBoundParameters.ContainsKey($n) -and [string]::IsNullOrWhiteSpace([string]$PSBoundParameters[$n])) {
+            throw "-$n was supplied but is empty or blank; omit the parameter instead (an empty value never means 'no filter' or 'report mode')"
+        }
+    }
+    if ($Card -and $AcceptanceFor -and $Card -ine $AcceptanceFor) { throw "-Card '$Card' conflicts with -AcceptanceFor '$AcceptanceFor'; acceptance is asked for one card" }
     foreach ($f in @(@('SubjectDigest', $SubjectDigest), @('BuildManifestSha256', $BuildManifestSha256))) {
         if (-not $f[1]) { continue }
         if (-not $AcceptanceFor) { throw "-$($f[0]) applies to -AcceptanceFor only" }
@@ -456,24 +564,41 @@ function Get-VenueEvidenceReport {
     $malformed = [System.Collections.Generic.List[object]]::new()
     $refused = [System.Collections.Generic.List[object]]::new()
     $structural = [System.Collections.Generic.List[object]]::new()
+    $barriers = [System.Collections.Generic.List[object]]::new()
 
     if ($rootExists) {
         foreach ($entry in (Get-VeReceiptFiles -Root $ReceiptsRoot -Max $MaxReceipts)) {
             $scanned++
             $rel = ($entry.rel -join '\')
+            $placed = ($entry.rel.Count -eq 4)
             if ($entry.file.Length -gt $script:MaxReceiptBytes) {
-                $malformed.Add([ordered]@{ path = $rel; reasons = @("file is larger than $($script:MaxReceiptBytes) bytes; not read") })
+                $why = @("file is larger than $($script:MaxReceiptBytes) bytes; not read")
+                $malformed.Add([ordered]@{ path = $rel; reasons = $why })
+                # Unread, so unorderable: inside the layout it may be the newest attempt of its leg.
+                if ($placed) { $barriers.Add((New-VeBarrier -Rel $entry.rel -Parsed $null -Reasons $why)) }
                 continue
             }
+            $parsed = $null
             try {
                 $parsed = ConvertFrom-VeJsonText -Text (Get-Content -LiteralPath $entry.file.FullName -Raw -Encoding UTF8)
             } catch {
-                $malformed.Add([ordered]@{ path = $rel; reasons = @('not valid JSON') })
+                $why = @('not valid JSON')
+                $malformed.Add([ordered]@{ path = $rel; reasons = $why })
+                if ($placed) { $barriers.Add((New-VeBarrier -Rel $entry.rel -Parsed $null -Reasons $why)) }
                 continue
             }
             $checked = ConvertTo-VeRecord -Receipt $parsed -RelParts $entry.rel
             if ($checked.reasons.Count -gt 0) {
                 $malformed.Add([ordered]@{ path = $rel; reasons = @($checked.reasons) })
+                # A file that sits in the layout, or that calls itself a receipt anywhere, took place: it is a barrier.
+                # (any schema version: a v2 file misfiled one level off is still somebody's newer attempt)
+                $claimsReceipt = $false
+                if ($parsed -is [System.Collections.IDictionary]) {
+                    $sch = Get-VeValue $parsed 'schema'
+                    $claimsReceipt = (($sch -is [string]) -and ($sch -clike 'mlv-app/dual-venue-receipt*')) -or
+                        ($null -ne (Get-VeValue $parsed 'receiptId') -and $null -ne (Get-VeValue $parsed 'outcome'))
+                }
+                if ($placed -or $claimsReceipt) { $barriers.Add((New-VeBarrier -Rel $entry.rel -Parsed $parsed -Reasons @($checked.reasons))) }
                 continue
             }
             $checked.record.path = $rel
@@ -489,7 +614,11 @@ function Get-VenueEvidenceReport {
         if (-not $byId.ContainsKey($id)) { $byId[$id] = 0 }
         $byId[$id]++
     }
+    # $valid = receipts that are fully trustworthy; $participants = EVERY parsed receipt, refused or not. Recency is
+    # decided over $participants (a refused run still happened and is newer than what it follows); only $valid may
+    # carry a verdict.
     $valid = [System.Collections.Generic.List[object]]::new()
+    $participants = [System.Collections.Generic.List[object]]::new()
     foreach ($r in $structural) {
         $reason = $null
         if ($byId[$r.receiptId.ToLowerInvariant()] -gt 1) {
@@ -506,9 +635,12 @@ function Get-VenueEvidenceReport {
         }
         if ($reason) {
             $refused.Add([ordered]@{ path = $r.path; receiptId = $r.receiptId; card = $r.card; legId = $r.legId; venue = $r.venue; reason = $reason })
+            $r.refusal = $reason
+            $r.state = $reason
         } else {
             $valid.Add($r)
         }
+        $participants.Add($r)
     }
 
     $report = [ordered]@{
@@ -525,83 +657,130 @@ function Get-VenueEvidenceReport {
         # Acceptance needs an AUTHORITATIVE role: a present, valid venue table that lists this card. A receipt's own
         # venue.role is a label, never the authority, so without the table there is nothing to read.
         $blocked = $null
+        $acceptVenues = @()
         if (-not $table.present) { $blocked = 'VENUE_TABLE_ABSENT' }
         elseif ($null -eq (Find-VeKey $table.roles $AcceptanceFor)) { $blocked = 'CARD_NOT_IN_VENUE_TABLE' }
+        else {
+            # Only a venue the table EXPLICITLY names acceptance for this card; defaultRole never makes one.
+            foreach ($v in $script:KnownVenues) {
+                if ((Get-VeExplicitRole -Table $table -Card $AcceptanceFor -Venue $v) -ceq 'acceptance') { $acceptVenues += $v }
+            }
+            if ($acceptVenues.Count -eq 0) { $blocked = 'NO_ACCEPTANCE_VENUE_FOR_CARD' }
+        }
 
-        $latest = @{}
-        if (-not $blocked) {
-            foreach ($r in $valid) {
-                if ($r.card -ine $AcceptanceFor) { continue }
-                if ((Get-VeExpectedRole -Table $table -Card $r.card -Venue $r.venue) -cne 'acceptance' -or $r.role -cne 'acceptance') { continue }
-                if ($LegId -and $r.legId -ine $LegId) { continue }
-                if ($SubjectDigest -and $r.digest -ne $SubjectDigest.ToLowerInvariant()) { continue }
-                if ($BuildManifestSha256 -and $r.buildManifest -ine $BuildManifestSha256) { continue }
-                $key = "$($r.legId)|$($r.backend)|$($r.venue)|$($r.digest)"
-                if (-not $latest.ContainsKey($key)) { $latest[$key] = [System.Collections.Generic.List[object]]::new() }
-                $latest[$key].Add($r)
-            }
-        }
-        # One entry per (leg, backend, venue, digest): its latest receipt plus how many receipts of each outcome exist.
-        $entriesByLeg = @{}
-        foreach ($key in ($latest.Keys | Sort-Object)) {
-            $sorted = Sort-VeReceipts $latest[$key]
-            $top = $sorted[$sorted.Count - 1]
-            $hist = [ordered]@{}
-            foreach ($o in ($latest[$key] | ForEach-Object { $_.outcome } | Sort-Object -Unique)) {
-                $hist[$o] = @($latest[$key] | Where-Object { $_.outcome -eq $o }).Count
-            }
-            $legKey = "$($top.legId)|$($top.backend)|$($top.venue)"
-            if (-not $entriesByLeg.ContainsKey($legKey)) { $entriesByLeg[$legKey] = [System.Collections.Generic.List[object]]::new() }
-            $entriesByLeg[$legKey].Add(@{ top = $top; history = [ordered]@{ total = $latest[$key].Count; byOutcome = $hist } })
-        }
+        # RECENCY IS DECIDED OVER EVERY ATTEMPT. One entry per LEG (card, leg, backend, lookFlavor, venue) holds every
+        # parsed receipt of that leg -- valid PASS/FAIL, refused (looped, short, role/detection mismatch, duplicate id),
+        # withheld (UNRESOLVED, RETRACTED, ...) -- whatever its digest. Only the NEWEST of them can be evidence, and only
+        # if it is a clean PASS/FAIL. Anything else newest WITHHOLDS. There is no fallback to an older receipt, ever.
         $filtered = [bool]($SubjectDigest -or $BuildManifestSha256)
+        $legGroups = @{}
+        $outsideFilter = @{}
+        if (-not $blocked) {
+            foreach ($r in $participants) {
+                if ($r.card -ine $AcceptanceFor) { continue }
+                if ($r.venue -cnotin $acceptVenues) { continue }
+                if ($LegId -and $r.legId -ine $LegId) { continue }
+                $inFilter = (-not $SubjectDigest -or $r.digest -ceq $SubjectDigest.ToLowerInvariant()) -and
+                    (-not $BuildManifestSha256 -or $r.buildManifest -ieq $BuildManifestSha256)
+                $bucket = $(if ($inFilter) { $legGroups } else { $outsideFilter })
+                $key = Get-VeLegKey $r
+                if (-not $bucket.ContainsKey($key)) { $bucket[$key] = [System.Collections.Generic.List[object]]::new() }
+                $bucket[$key].Add($r)
+            }
+        }
+
         $receipts = [System.Collections.Generic.List[object]]::new()
         $withheld = [System.Collections.Generic.List[object]]::new()
         $olderDigests = [System.Collections.Generic.List[object]]::new()
+        $newerOutside = [System.Collections.Generic.List[object]]::new()
+        $matchedBarriers = [System.Collections.Generic.HashSet[object]]::new()
         $failCount = 0
-        foreach ($legKey in ($entriesByLeg.Keys | Sort-Object)) {
-            $entries = $entriesByLeg[$legKey]
-            $selected = @($entries.ToArray())
-            if (-not $filtered -and $entries.Count -gt 1) {
-                # No subject filter: only the NEWEST digest of a leg can speak for the candidate; older digests are
-                # listed but are never evidence.
-                $order = Sort-VeReceipts @($entries | ForEach-Object { $_.top })
-                $newestId = $order[$order.Count - 1].receiptId
-                $selected = @($entries | Where-Object { $_.top.receiptId -ceq $newestId })
-                foreach ($e in ($entries | Where-Object { $_.top.receiptId -cne $newestId })) {
-                    $olderDigests.Add([ordered]@{ legId = $e.top.legId; backend = $e.top.backend; venue = $e.top.venue
-                            subjectDigest = $e.top.digest; latestOutcome = $e.top.outcome; receiptId = $e.top.receiptId })
+        foreach ($key in ($legGroups.Keys | Sort-Object)) {
+            $members = $legGroups[$key]
+            $sorted = Sort-VeReceipts $members
+            $top = $sorted[$sorted.Count - 1]
+
+            # Older subject digests of this leg: listed, never evidence.
+            $digests = @($sorted | ForEach-Object { $_.digest } | Select-Object -Unique | Where-Object { $_ -cne $top.digest })
+            foreach ($d in $digests) {
+                $latestOfDigest = @($sorted | Where-Object { $_.digest -ceq $d })[-1]
+                $olderDigests.Add([ordered]@{ legId = $latestOfDigest.legId; backend = $latestOfDigest.backend; lookFlavor = $latestOfDigest.lookFlavor
+                        venue = $latestOfDigest.venue; subjectDigest = $d; latestOutcome = $latestOfDigest.state; receiptId = $latestOfDigest.receiptId })
+            }
+            # With a subject filter: attempts of this leg OUTSIDE the filter that are newer are named, never silent.
+            if ($filtered -and $outsideFilter.ContainsKey($key)) {
+                foreach ($o in $outsideFilter[$key]) {
+                    if ($o.finished.UtcTicks -ge $top.finished.UtcTicks) {
+                        $newerOutside.Add([ordered]@{ legId = $o.legId; backend = $o.backend; lookFlavor = $o.lookFlavor; venue = $o.venue
+                                subjectDigest = $o.digest; buildManifestSha256 = $o.buildManifest; latestOutcome = $o.state; receiptId = $o.receiptId
+                                finishedUtc = (Format-VeInstant $o.finished) })
+                    }
                 }
             }
-            foreach ($e in $selected) {
-                $top = $e.top
-                if ($top.outcome -notin $script:SignalOutcomes) {
-                    $withheld.Add([ordered]@{ legId = $top.legId; backend = $top.backend; subjectDigest = $top.digest; venue = $top.venue
-                            receiptId = $top.receiptId; reason = $top.outcome })
-                } elseif ($top.clipState -cne 'OK') {
-                    $withheld.Add([ordered]@{ legId = $top.legId; backend = $top.backend; subjectDigest = $top.digest; venue = $top.venue
-                            receiptId = $top.receiptId; reason = 'UNVERIFIED_CLIP_LENGTH' })
-                } else {
-                    if ($top.outcome -ceq 'FAIL') { $failCount++ }
-                    $receipts.Add((ConvertTo-VeReceiptView -Record $top -RoleVerified $true -Full $true -History $e.history))
-                }
+            # Receipt files that could not be parsed but belong to this leg: an unorderable one, or one at least as new
+            # as the newest parsed receipt, withholds it.
+            $blockers = [System.Collections.Generic.List[object]]::new()
+            foreach ($b in $barriers) {
+                if (-not (Test-VeBarrierMatch -Barrier $b -Card $top.card -Leg $top.legId -Venue $top.venue)) { continue }
+                [void]$matchedBarriers.Add($b)
+                if ($null -eq $b.finished -or $b.finished.UtcTicks -ge $top.finished.UtcTicks) { $blockers.Add($b) }
+            }
+
+            $hist = [ordered]@{}
+            $atDigest = @($members | Where-Object { $_.digest -ceq $top.digest })
+            foreach ($o in ($atDigest | ForEach-Object { $_.state } | Sort-Object -Unique)) { $hist[$o] = @($atDigest | Where-Object { $_.state -ceq $o }).Count }
+            $history = [ordered]@{ total = $atDigest.Count; byOutcome = $hist }
+            $superseded = @($sorted | Where-Object { $_.receiptId -cne $top.receiptId -and $_.state -cin $script:SignalOutcomes } | ForEach-Object { $_.receiptId })
+
+            $entry = [ordered]@{ legId = $top.legId; backend = $top.backend; lookFlavor = $top.lookFlavor; subjectDigest = $top.digest; venue = $top.venue
+                receiptId = $top.receiptId; reason = $null }
+            if ($blockers.Count -gt 0) {
+                $entry.reason = $(if (@($blockers | Where-Object { $null -eq $_.finished }).Count -gt 0) { 'UNORDERABLE_MALFORMED_RECEIPT' } else { 'MALFORMED_NEWER_RECEIPT' })
+                $entry['blockedBy'] = @($blockers | ForEach-Object { $_.path })
+                $entry['supersededSignal'] = @($superseded + @($(if ($top.state -cin $script:SignalOutcomes) { $top.receiptId })))
+                $withheld.Add($entry)
+            } elseif ($top.state -cin $script:SignalOutcomes) {
+                if ($top.outcome -ceq 'FAIL') { $failCount++ }
+                $receipts.Add((ConvertTo-VeReceiptView -Record $top -RoleVerified $true -Full $true -History $history))
+            } else {
+                $entry.reason = $top.state
+                $entry['supersededSignal'] = $superseded
+                $withheld.Add($entry)
             }
         }
+        # A barrier that matched no parsed leg: an attempt whose result cannot be read is not the same as never having run.
+        foreach ($b in $barriers) {
+            if ($matchedBarriers.Contains($b)) { continue }
+            if ($blocked) { continue }
+            if ($null -ne $b.cards -and @($b.cards | Where-Object { $_ -ieq $AcceptanceFor }).Count -eq 0) { continue }
+            if ($null -ne $b.venues -and @($b.venues | Where-Object { $_ -cin $acceptVenues }).Count -eq 0) { continue }
+            if ($LegId -and $null -ne $b.legs -and @($b.legs | Where-Object { $_ -ieq $LegId }).Count -eq 0) { continue }
+            $withheld.Add([ordered]@{ legId = $(if ($b.legs) { $b.legs[0] } else { '*' }); backend = $null; lookFlavor = $null; subjectDigest = $null
+                    venue = $(if ($b.venues) { $b.venues[0] } else { '*' }); receiptId = $null
+                    reason = $(if ($null -eq $b.finished) { 'UNORDERABLE_MALFORMED_RECEIPT' } else { 'MALFORMED_NEWER_RECEIPT' })
+                    blockedBy = @($b.path); supersededSignal = @() })
+        }
+
+        # ACCEPTANCE_EVIDENCE means every attempted acceptance leg's newest receipt is a clean PASS/FAIL: one withheld
+        # leg makes the whole card non-green (the healthy legs stay listed under receipts, but are not an acceptance).
         $reason = $blocked
+        if (-not $reason -and $withheld.Count -gt 0) { $reason = 'NEWEST_ATTEMPT_WITHHELD' }
         if (-not $reason -and $receipts.Count -eq 0) { $reason = 'NO_ACCEPTANCE_RECEIPTS' }
         $report['acceptance'] = [ordered]@{
             card                = $AcceptanceFor
-            status              = $(if ($receipts.Count -gt 0) { 'ACCEPTANCE_EVIDENCE' } else { 'NO_ACCEPTANCE_EVIDENCE' })
+            status              = $(if ($receipts.Count -gt 0 -and $withheld.Count -eq 0) { 'ACCEPTANCE_EVIDENCE' } else { 'NO_ACCEPTANCE_EVIDENCE' })
             reason              = $reason
             failCount           = $failCount
             digestSelection     = $(if ($filtered) { 'FILTERED' } else { 'NEWEST_PER_LEG' })
-            digestSelectionNote = $(if ($filtered) { 'Filtered by -SubjectDigest and/or -BuildManifestSha256: every matching digest is reported.' }
-                else { 'No -SubjectDigest/-BuildManifestSha256 filter: only the NEWEST subject digest per leg/backend/venue is reported; older digests are listed under olderDigests and are never evidence. Bind to the candidate build with -BuildManifestSha256.' })
-            filters             = [ordered]@{ subjectDigest = $(if ($SubjectDigest) { $SubjectDigest.ToLowerInvariant() } else { $null })
+            digestSelectionNote = $(if ($filtered) { 'Filtered by -SubjectDigest and/or -BuildManifestSha256: within the filter only the newest attempt per leg decides; a newer attempt outside the filter is listed under newerOutsideFilter.' }
+                else { 'No -SubjectDigest/-BuildManifestSha256 filter: only the NEWEST attempt per leg (card, leg, backend, lookFlavor, venue) decides, at whatever digest; older digests are listed under olderDigests and are never evidence. Bind to the candidate build with -BuildManifestSha256.' })
+            filters             = [ordered]@{ legId = $(if ($LegId) { $LegId } else { $null }); subjectDigest = $(if ($SubjectDigest) { $SubjectDigest.ToLowerInvariant() } else { $null })
                 buildManifestSha256 = $(if ($BuildManifestSha256) { $BuildManifestSha256.ToLowerInvariant() } else { $null }) }
+            acceptanceVenues    = @($acceptVenues)
             receipts            = @($receipts.ToArray())
             withheld            = @($withheld.ToArray())
             olderDigests        = @($olderDigests.ToArray())
+            newerOutsideFilter  = @($newerOutside.ToArray())
         }
         $report['malformed'] = @($malformed.ToArray())
         $report['refused'] = @($refused.ToArray() | Where-Object { $_.card -ieq $AcceptanceFor })
@@ -609,11 +788,15 @@ function Get-VenueEvidenceReport {
     }
 
     # ---- per-(card, leg, backend, digest) groups
+    # Members are EVERY parsed receipt, refused ones included: a newer refused run is the venue's latest attempt, so the
+    # pair is INCOMPLETE with that refusal as the reason instead of COMPLETE on an older PASS. (A receipt that could not
+    # be parsed at all has no digest to group by; it is listed loudly under `malformed`, which report mode never hides.)
     $groupMap = @{}
-    foreach ($r in $valid) {
+    foreach ($r in $participants) {
         if ($Card -and $r.card -ine $Card) { continue }
         if ($LegId -and $r.legId -ine $LegId) { continue }
-        $key = "$($r.card)|$($r.legId)|$($r.backend)|$($r.digest)"
+        $flavorKey = $(if ($r.lookFlavor) { ([string]$r.lookFlavor).Trim().ToLowerInvariant() } else { '' })
+        $key = "$($r.card.ToLowerInvariant())|$($r.legId.ToLowerInvariant())|$($r.backend)|$flavorKey|$($r.digest)"
         if (-not $groupMap.ContainsKey($key)) { $groupMap[$key] = [System.Collections.Generic.List[object]]::new() }
         $groupMap[$key].Add($r)
     }
@@ -633,6 +816,7 @@ function Get-VenueEvidenceReport {
             $mine = @($members | Where-Object { $_.venue -eq $v })
             $hist = [ordered]@{}
             foreach ($o in ($mine | ForEach-Object { $_.outcome } | Sort-Object -Unique)) { $hist[$o] = @($mine | Where-Object { $_.outcome -eq $o }).Count }
+            $eff = { param($rec) $(if ($rec.refusal) { $rec.refusal } else { $rec.outcome }) }
             if ($mine.Count -eq 0) {
                 $venueRows[$v] = [ordered]@{ expected = ($v -in $expected); status = 'missing'; latest = $null; history = [ordered]@{ total = 0; byOutcome = $hist } }
             } else {
@@ -641,14 +825,14 @@ function Get-VenueEvidenceReport {
                 $latestByVenue[$v] = $top
                 $venueRows[$v] = [ordered]@{
                     expected = ($v -in $expected)
-                    status   = $top.outcome
+                    status   = (& $eff $top)
                     latest   = (ConvertTo-VeReceiptView -Record $top -RoleVerified $table.present -Full $false)
                     history  = [ordered]@{ total = $mine.Count; byOutcome = $hist }
                 }
             }
             if ($v -in $expected) {
                 if (-not $latestByVenue.ContainsKey($v)) { $reasons.Add([ordered]@{ venue = $v; reason = 'missing' }) }
-                elseif ($latestByVenue[$v].outcome -notin $script:SignalOutcomes) { $reasons.Add([ordered]@{ venue = $v; reason = $latestByVenue[$v].outcome }) }
+                elseif ((& $eff $latestByVenue[$v]) -notin $script:SignalOutcomes) { $reasons.Add([ordered]@{ venue = $v; reason = (& $eff $latestByVenue[$v]) }) }
             }
         }
         $complete = ($reasons.Count -eq 0)
@@ -656,6 +840,7 @@ function Get-VenueEvidenceReport {
             card            = $first.card
             legId           = $first.legId
             backend         = $first.backend
+            lookFlavor      = $first.lookFlavor
             subjectDigest   = $first.digest
             expectedVenues  = @($expected)
             venues          = $venueRows
@@ -664,7 +849,7 @@ function Get-VenueEvidenceReport {
         if ($complete) { $g['delta'] = Get-VeDelta -Venues $expected -LatestByVenue $latestByVenue }
         $groups.Add($g)
 
-        $legKey = "$($first.card)/$($first.legId)" + $(if ($first.backend) { " [$($first.backend)]" } else { '' })
+        $legKey = "$($first.card)/$($first.legId)" + $(if ($first.backend) { " [$($first.backend)]" } else { '' }) + $(if ($first.lookFlavor) { " look=$($first.lookFlavor)" } else { '' })
         if (-not $digestsPerLeg.ContainsKey($legKey)) { $digestsPerLeg[$legKey] = [System.Collections.Generic.List[string]]::new() }
         $digestsPerLeg[$legKey].Add($first.digest)
     }
@@ -700,6 +885,7 @@ function Format-VenueEvidenceText {
         $a = $Report.acceptance
         $out.Add("ACCEPTANCE for $($a.card): $($a.status)" + $(if ($a.reason) { " (reason: $($a.reason))" } else { '' }))
         $out.Add("  subject digest selection: $($a.digestSelection) -- $($a.digestSelectionNote)")
+        if ($a.filters.legId) { $out.Add("  SCOPE: leg '$($a.filters.legId)' only -- other legs of the card are not part of this answer") }
         foreach ($r in $a.receipts) {
             $short = $r.subjectDigest.Substring(0, 12)
             $flavor = $(if ($r.lookFlavor) { " look=$($r.lookFlavor)" } else { '' })
@@ -707,16 +893,28 @@ function Format-VenueEvidenceText {
             $out.Add("  $($r.outcome)  $($r.venue) ($($r.role); role verified against venue table)  leg=$($r.legId)$(if ($r.backend) { " backend=$($r.backend)" })$flavor  clip=$($r.clipId) ($($r.clipSeconds) s, wrapped=$($r.wrapped))  build=$($r.buildManifestSha256.Substring(0, [Math]::Min(12, $r.buildManifestSha256.Length)))  leg-spec=$($r.legSpecSha256.Substring(0, [Math]::Min(12, $r.legSpecSha256.Length)))  digest=$short  finished=$($r.finishedUtc)  receipts=$($r.history.total) [$hist]  receipt=$($r.receiptId)")
         }
         foreach ($w in $a.withheld) {
-            $why = $(if ($w.reason -ceq 'UNVERIFIED_CLIP_LENGTH') { 'UNVERIFIED_CLIP_LENGTH: the receipt carries no clipSeconds/wrapped proof of a long, non-looping clip' } else { "latest receipt is $($w.reason), which carries no signal" })
-            $out.Add("  WITHHELD  $($w.venue) leg=$($w.legId) digest=$($w.subjectDigest.Substring(0, 12)): $why")
+            $why = switch -CaseSensitive ($w.reason) {
+                'UNVERIFIED_CLIP_LENGTH' { 'UNVERIFIED_CLIP_LENGTH: the receipt carries no clipSeconds/wrapped proof of a long, non-looping clip' }
+                'MALFORMED_NEWER_RECEIPT' { "MALFORMED_NEWER_RECEIPT: a receipt file that could not be read is at least as new as the newest parsed one ($($w.blockedBy -join '; '))" }
+                'UNORDERABLE_MALFORMED_RECEIPT' { "UNORDERABLE_MALFORMED_RECEIPT: a receipt file with no readable finish time sits in this leg ($($w.blockedBy -join '; '))" }
+                default { $(if ($w.reason -cin @('PASS', 'FAIL')) { "latest receipt is $($w.reason)" } elseif ($w.reason -cmatch '^(INVALID_|ROLE_MISMATCH|VENUE_DETECTION_MISMATCH|DUPLICATE_RECEIPT_ID)') { "the newest attempt was refused ($($w.reason)); it is still the newest attempt" } else { "latest receipt is $($w.reason), which carries no signal" }) }
+            }
+            $sup = $(if ($w.supersededSignal -and @($w.supersededSignal).Count -gt 0) { "; does NOT fall back to older receipt(s) $(@($w.supersededSignal) -join ',')" } else { '' })
+            $dig = $(if ($w.subjectDigest) { $w.subjectDigest.Substring(0, 12) } else { '-' })
+            $flv = $(if ($w.lookFlavor) { " look=$($w.lookFlavor)" } else { '' })
+            $out.Add("  WITHHELD  $($w.venue) leg=$($w.legId)$flv digest=$dig`: $why$sup")
         }
         foreach ($o in $a.olderDigests) {
-            $out.Add("  OLDER DIGEST (not evidence)  $($o.venue) leg=$($o.legId) digest=$($o.subjectDigest.Substring(0, 12)) latest=$($o.latestOutcome)")
+            $flv = $(if ($o.lookFlavor) { " look=$($o.lookFlavor)" } else { '' })
+            $out.Add("  OLDER DIGEST (not evidence)  $($o.venue) leg=$($o.legId)$flv digest=$($o.subjectDigest.Substring(0, 12)) latest=$($o.latestOutcome)")
+        }
+        foreach ($n in $a.newerOutsideFilter) {
+            $out.Add("  NOTE: a newer attempt exists outside the filter  $($n.venue) leg=$($n.legId) digest=$($n.subjectDigest.Substring(0, 12)) build=$($n.buildManifestSha256.Substring(0, [Math]::Min(12, $n.buildManifestSha256.Length))) latest=$($n.latestOutcome) finished=$($n.finishedUtc)")
         }
         if ($a.failCount -gt 0) { $out.Add("  NOTE: $($a.failCount) acceptance receipt(s) say FAIL (exit code 3)") }
     } else {
         foreach ($g in $Report.groups) {
-            $be = $(if ($g.backend) { " [$($g.backend)]" } else { '' })
+            $be = $(if ($g.backend) { " [$($g.backend)]" } else { '' }) + $(if ($g.lookFlavor) { " look=$($g.lookFlavor)" } else { '' })
             $out.Add("$($g.card) / $($g.legId)$be  digest $($g.subjectDigest.Substring(0, 12))")
             if ($g.pair.state -eq 'COMPLETE') {
                 $out.Add('  pair: COMPLETE (every expected venue has a PASS/FAIL receipt at this digest; no merged verdict)')

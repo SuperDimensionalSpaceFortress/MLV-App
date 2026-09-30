@@ -8,6 +8,7 @@ Receipts (schema mlv-app/dual-venue-receipt/v1) live at
   * each receipt is validated; a malformed one is reported as MALFORMED and never counted;
   * receipts group by card, leg and SUBJECT DIGEST; receipts of different digests are never compared;
   * per venue the LATEST receipt (finishedUtc; an exact tie goes to the non-signal, then FAIL, then PASS, then receiptId) is shown with its role and outcome;
+    a refused run (looped, too short, ...) is that venue's latest attempt too, so the pair is INCOMPLETE with its reason;
   * a pair is COMPLETE only when every venue in the card's roles has a PASS/FAIL receipt at that digest,
     otherwise INCOMPLETE with the reason (missing | UNRESOLVED | RETRACTED | VENUE_UNHEALTHY | ...);
     the cross-venue delta is printed only for COMPLETE pairs and is labelled DIAGNOSTIC (P2: no merged verdict);
@@ -16,16 +17,26 @@ Receipts (schema mlv-app/dual-venue-receipt/v1) live at
     The role is never taken from the receipt: acceptance REQUIRES a present, valid venue table that lists the card.
     No table (absent file, typo'd path) -> NO_ACCEPTANCE_EVIDENCE reason VENUE_TABLE_ABSENT; card not in the table ->
     reason CARD_NOT_IN_VENUE_TABLE. Report mode (no -AcceptanceFor) still shows recorded roles, marked UNVERIFIED.
-  * acceptance without -SubjectDigest/-BuildManifestSha256 reports the NEWEST subject digest per leg/backend/venue
+  * ONLY THE NEWEST ATTEMPT PER LEG DECIDES (leg = card, legId, backend, lookFlavor, venue). Every receipt of a leg
+    takes part in recency: valid PASS/FAIL, refused ones (INVALID_LOOPED, INVALID_CLIP_TOO_SHORT, VENUE_DETECTION_MISMATCH,
+    ROLE_MISMATCH, DUPLICATE_RECEIPT_ID), withheld ones (UNRESOLVED, RETRACTED, VENUE_UNHEALTHY, ...), and receipt files
+    that cannot be parsed (MALFORMED_NEWER_RECEIPT when the file has a readable finish time at least as new as the newest
+    parsed receipt; UNORDERABLE_MALFORMED_RECEIPT when it has none). If the newest attempt is not a clean PASS/FAIL the
+    leg is WITHHELD (reason named, the superseded PASS listed under supersededSignal) and the CARD is non-green:
+    status NO_ACCEPTANCE_EVIDENCE, reason NEWEST_ATTEMPT_WITHHELD. There is never a fallback to an older receipt.
+  * acceptance without -SubjectDigest/-BuildManifestSha256 lets the newest attempt speak at whatever digest it has
     (older digests are listed under olderDigests, never as evidence) and says so; each receipt shows
-    buildManifestSha256, legSpecSha256, clipId, backend, lookFlavor and its outcome history.
+    buildManifestSha256, legSpecSha256, clipId, backend, lookFlavor and its outcome history. With a filter the newest
+    attempt INSIDE the filter decides, and a newer attempt outside it is named under newerOutsideFilter.
+  * a blank argument (-AcceptanceFor '', -SubjectDigest '', -LegId '', ...) is an error (exit 1), never "report mode"
+    or "no filter". A *.json anywhere under the receipts root is seen; one misfiled off the layout is MALFORMED.
   * playback evidence rule (owner, 2026-09-30): a PASS/FAIL receipt counts only with metrics.clipSeconds >= 20
     (or clip_seconds) and metrics.wrapped == 0. wrapped=1 -> INVALID_LOOPED and clipSeconds < 20 ->
     INVALID_CLIP_TOO_SHORT (refused, never counted); fields absent -> UNVERIFIED_CLIP_LENGTH (excluded from acceptance).
 
-Exit codes: 0 report produced; in acceptance mode 0 means acceptance evidence is present AND every returned
-receipt is PASS. 3 acceptance evidence is present but at least one returned receipt is FAIL. 2 acceptance mode and
-NO_ACCEPTANCE_EVIDENCE. 1 tool error (unreadable or invalid venue table, bad filter, receipts over -MaxReceipts, ...).
+Exit codes: 0 report produced; in acceptance mode 0 means acceptance evidence is present, every leg's newest attempt
+is a clean PASS and nothing is withheld. 3 at least one returned receipt is FAIL. 2 acceptance mode and
+NO_ACCEPTANCE_EVIDENCE (including a leg whose newest attempt is withheld). 1 tool error (unreadable or invalid venue table, bad filter, receipts over -MaxReceipts, ...).
 Still read the status field: an exit code is a convenience, never treat 0 as "accepted" without it.
 
 .PARAMETER ReceiptsRoot
@@ -67,10 +78,20 @@ $ErrorActionPreference = 'Stop'
 Import-Module (Join-Path $PSScriptRoot 'VenueEvidence.psm1') -Force
 
 try {
-    if (-not $ReceiptsRoot) { $ReceiptsRoot = Resolve-VeDefaultReceiptsRoot }
-    if (-not $VenueTable) { $VenueTable = Join-Path $PSScriptRoot 'venues.json' }
-    $report = Get-VenueEvidenceReport -ReceiptsRoot $ReceiptsRoot -VenueTablePath $VenueTable -Card $Card -LegId $LegId `
-        -AcceptanceFor $AcceptanceFor -SubjectDigest $SubjectDigest -BuildManifestSha256 $BuildManifestSha256 -MaxReceipts $MaxReceipts
+    # A parameter that is BOUND but empty/blank is an error, never "use the default" / "no filter" / "report mode":
+    # an unset caller variable must not silently change what is being asked. Only bound parameters are passed on.
+    foreach ($n in 'ReceiptsRoot', 'VenueTable') {
+        if ($PSBoundParameters.ContainsKey($n) -and [string]::IsNullOrWhiteSpace([string]$PSBoundParameters[$n])) {
+            throw "-$n was supplied but is empty or blank; omit the parameter to use the default"
+        }
+    }
+    if (-not $PSBoundParameters.ContainsKey('ReceiptsRoot')) { $ReceiptsRoot = Resolve-VeDefaultReceiptsRoot }
+    if (-not $PSBoundParameters.ContainsKey('VenueTable')) { $VenueTable = Join-Path $PSScriptRoot 'venues.json' }
+    $reportArgs = @{ ReceiptsRoot = $ReceiptsRoot; VenueTablePath = $VenueTable; MaxReceipts = $MaxReceipts }
+    foreach ($n in 'Card', 'LegId', 'AcceptanceFor', 'SubjectDigest', 'BuildManifestSha256') {
+        if ($PSBoundParameters.ContainsKey($n)) { $reportArgs[$n] = $PSBoundParameters[$n] }
+    }
+    $report = Get-VenueEvidenceReport @reportArgs
 } catch {
     [Console]::Error.WriteLine("Get-VenueEvidence: $($_.Exception.Message)")
     exit 1
@@ -82,8 +103,9 @@ if ($Json) {
     foreach ($line in (Format-VenueEvidenceText -Report $report)) { Write-Output $line }
 }
 
-if ($AcceptanceFor) {
-    if ($report.acceptance.status -ne 'ACCEPTANCE_EVIDENCE') { exit 2 }
+if ($report.mode -eq 'acceptance') {
+    # 3 first: a FAIL is never "no evidence". Then anything that is not a complete, current ACCEPTANCE_EVIDENCE is 2.
     if ($report.acceptance.failCount -gt 0) { exit 3 }
+    if ($report.acceptance.status -ne 'ACCEPTANCE_EVIDENCE') { exit 2 }
 }
 exit 0
