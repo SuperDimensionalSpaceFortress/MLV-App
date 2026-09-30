@@ -34,6 +34,7 @@ jobs:
 
     - name: Install hash-locked Python dependencies
       timeout-minutes: 15
+      shell: pwsh -NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -Command "$ErrorActionPreference = 'Stop'; $PSNativeCommandUseErrorActionPreference = $true; . '{0}'"
       run: |
         python -m pip install --disable-pip-version-check --no-input --only-binary=:all: --require-hashes -r .github/requirements/pip.txt
         python -m pip install --disable-pip-version-check --no-input --only-binary=:all: --require-hashes -r .github/requirements/repo-hygiene.txt
@@ -194,6 +195,7 @@ jobs:
             python -m tools.repo_hygiene.extract_vendored_native_payload --repo-root "${{ github.workspace }}" --payload-id ffmpeg-windows-x86_64 --archive-reference ffmpegWin64.zip --output-dir "${{ env.SOURCE_DIR }}\build\release" --verify-installed
 
     - name: Install verified RAW2MLV
+      shell: pwsh -NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -Command "$ErrorActionPreference = 'Stop'; $PSNativeCommandUseErrorActionPreference = $true; . '{0}'"
       run:  |
             python -m tools.repo_hygiene.extract_vendored_native_payload --repo-root "${{ github.workspace }}" --payload-id raw2mlv-windows-x86-compat --archive-reference raw2mlvWin64.zip --output-dir "${{ env.SOURCE_DIR }}\build\release" --verify-installed
             dir ${{ env.SOURCE_DIR }}\build\release
@@ -207,6 +209,7 @@ jobs:
            dir
 
     - name: Print toolchain
+      shell: pwsh -NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -Command "$ErrorActionPreference = 'Stop'; $PSNativeCommandUseErrorActionPreference = $true; . '{0}'"
       run: |
            $qtVersion = (& $env:QMAKE_EXE -query QT_VERSION).Trim()
            $compilerVersion = (& $env:GXX_EXE -dumpfullversion -dumpversion).Trim()
@@ -231,6 +234,7 @@ jobs:
         if-no-files-found: error
 
     - name: Generate single-build release evidence
+      shell: pwsh -NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -Command "$ErrorActionPreference = 'Stop'; $PSNativeCommandUseErrorActionPreference = $true; . '{0}'"
       run: |
            $QmakePath = (Get-Command $env:QMAKE_EXE -CommandType Application -ErrorAction Stop).Source
            $CompilerPath = (Get-Command $env:GXX_EXE -CommandType Application -ErrorAction Stop).Source
