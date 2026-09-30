@@ -258,22 +258,6 @@ class FootageStageJobTests(unittest.TestCase):
         )
         return _run(["-Command", script])
 
-    def build_with_corrupt_and_removal_failure_hooks(self, corrupt_index: int, removal_failure_index: int) -> subprocess.CompletedProcess:
-        # ATTR3-FOOTAGE-STAGE-1 round 5: -TestHookForceRemovalFailurePartIndex is a second
-        # test-only parameter, same non-reachability guarantee as the one above -- see
-        # New-Attr3FootageStageJob's own header.
-        parts_json_path = self.tmp / f"parts-hook2-{id(self.parts_payload)}.json"
-        parts_json_path.write_text(json.dumps(self.parts_payload), encoding="utf-8")
-        script = (
-            f"Import-Module '{STAGE_MODULE}' -Force; "
-            f"$parts = @(Get-Content -LiteralPath '{parts_json_path}' -Raw | ConvertFrom-Json); "
-            f"New-Attr3FootageStageJob -ClipId '{self.clip_id}' -Parts $parts "
-            f"-OutDir '{self.out}' -AgentRoot '{self.agent_root}' "
-            f"-TestHookCorruptAfterVerifyPartIndex {corrupt_index} "
-            f"-TestHookForceRemovalFailurePartIndex {removal_failure_index}"
-        )
-        return _run(["-Command", script])
-
     def job_path(self, proc: subprocess.CompletedProcess) -> Path:
         jobs = sorted(self.out.glob("*.job.ps1"))
         self.assertEqual(len(jobs), 1, proc.stdout + proc.stderr)
@@ -290,6 +274,20 @@ class FootageStageJobTests(unittest.TestCase):
 
     def run_job(self, job: Path) -> subprocess.CompletedProcess:
         return _run(["-File", str(job)])
+
+    def patch_job(self, job: Path, anchor: str, inject: str, *, before: bool = False) -> None:
+        """Insert test-only PowerShell into an emitted job next to ONE exact line of it, to model an
+        interleaving (a swap between two statements) that cannot be timed from outside."""
+        text = job.read_text(encoding="utf-8")
+        self.assertEqual(text.count(anchor), 1, f"anchor not unique in the emitted job: {anchor}")
+        text = text.replace(anchor, inject + "\r\n" + anchor if before else anchor + "\r\n" + inject)
+        job.write_text(text, encoding="utf-8")
+
+    def leftover_records(self, job_id: str) -> dict:
+        directory = self.agent_root / "footage-stage-leftovers"
+        if not directory.is_dir():
+            return {}
+        return {p.name: json.loads(p.read_text(encoding="utf-8")) for p in sorted(directory.glob(f"{job_id}-*.json"))}
 
     def _assert_no_token(self, *texts: str) -> None:
         for text in texts:
@@ -666,22 +664,35 @@ class FootageStageJobTests(unittest.TestCase):
         self.assertIn("PART=1 STATUS=PLACED", run.stdout)
         self.assertTrue(self.targets[1].is_file())
 
-    def test_corruption_between_local_verify_and_publish_removes_the_target_and_a_rerun_is_not_blocked(self) -> None:
-        # ATTR3-FOOTAGE-STAGE-1 round 4 (sol BLOCKER 2b). The test-only corruption hook flips a
-        # byte in the LOCAL target-volume partial after it passed local verification but before
-        # the same-volume publish rename -- modelling bytes changing between "verified" and
-        # "published". The post-rename re-hash must catch it, this job must remove the target IT
-        # just placed (never leaving a corrupt file at the spec path under a PLACED-shaped
-        # status), and a later rerun must succeed rather than being blocked by a false
-        # TARGET_CONFLICT against the bytes this job itself removed.
+    def test_a_failed_post_publication_verification_leaves_the_target_records_it_and_a_rerun_refuses(self) -> None:
+        # ATTR3-FOOTAGE-STAGE-1 round 4 (sol BLOCKER 2b) made this job remove a published target whose
+        # post-rename re-hash failed. UM-OWNER-FOOTAGE-CROSS-VOLUME-2 r2 (sol r1 blocker 2) REVERSES it:
+        # a delete by pathname in the owner's directory cannot prove it still hits this job's own
+        # file. The test-only corruption hook flips a byte in the local partial after its verify and
+        # before the publish rename, so the post-rename re-hash fails. The copy STAYS where it is, the
+        # part is reported PLACED_VERIFY_FAILED_TARGET_RETAINED, a leftover record names it (on the
+        # host, never in the job's output), and a rerun refuses TARGET_CONFLICT -- never a silent
+        # recovery, never a delete.
         proc = self.build_with_corrupt_hook(0)
         job = self.job_path(proc)
-        stage_dir = self.stage_dir(job.name[: -len(".job.ps1")])
+        job_id = job.name[: -len(".job.ps1")]
+        stage_dir = self.stage_dir(job_id)
         self.stage_all_parts(stage_dir)
         run = self.run_job(job)
         self.assertEqual(run.returncode, 1, run.stdout + run.stderr)
-        self.assertIn("PART=0 STATUS=PLACED_VERIFY_LENGTH_MISMATCH", run.stdout)
-        self.assertFalse(self.targets[0].exists())
+        self.assertIn("PART=0 STATUS=PLACED_VERIFY_FAILED_TARGET_RETAINED", run.stdout)
+        self.assertTrue(self.targets[0].is_file())
+        corrupt_bytes = self.targets[0].read_bytes()
+        self.assertNotEqual(corrupt_bytes, self.content[0])
+        records = self.leftover_records(job_id)
+        self.assertEqual(sorted(records), [f"{job_id}-part0-target.json"])
+        record = records[f"{job_id}-part0-target.json"]
+        self.assertEqual(record["schema"], "mlvapp.owner-target-leftover.v1")
+        self.assertEqual(record["kind"], "target")
+        self.assertTrue(record["leftover"])
+        self.assertEqual(record["verifyStatus"], "LENGTH_MISMATCH")
+        self.assertEqual(os.path.normcase(record["leftoverPath"]), os.path.normcase(str(self.targets[0])))
+        self.assertNotIn(str(self.targets[0]), run.stdout + run.stderr)
         # Part 1 (never corrupted) still places cleanly in the SAME run.
         self.assertIn("PART=1 STATUS=PLACED", run.stdout)
         self.assertTrue(self.targets[1].is_file())
@@ -692,12 +703,82 @@ class FootageStageJobTests(unittest.TestCase):
         second_stage_dir = self.stage_dir(second_job.name[: -len(".job.ps1")])
         self.stage_all_parts(second_stage_dir)
         second_run = self.run_job(second_job)
-        self.assertEqual(second_run.returncode, 0, second_run.stdout + second_run.stderr)
-        self.assertIn("PART=0 STATUS=PLACED", second_run.stdout)
-        self.assertNotIn("TARGET_CONFLICT", second_run.stdout)
+        self.assertEqual(second_run.returncode, 1, second_run.stdout + second_run.stderr)
+        self.assertIn("PART=0 STATUS=TARGET_CONFLICT", second_run.stdout)
         self.assertIn("PART=1 STATUS=ALREADY_PRESENT", second_run.stdout)
-        for target, content in zip(self.targets, self.content):
-            self.assertEqual(target.read_bytes(), content)
+        self.assertEqual(self.targets[0].read_bytes(), corrupt_bytes)
+
+    def test_sol_r1_a_target_swapped_for_an_owner_footage_link_after_a_failed_verify_keeps_its_name(self) -> None:
+        # sol r1 blocker 2, executed: hold the published copy so the verifier fails, then -- before the
+        # cleanup -- replace the pathname with a same-volume hard link to (synthetic) owner footage.
+        # The old cleanup resolved the path afresh and deleted that name. The job must never delete
+        # it: the name, the link count and the bytes all survive.
+        owner_bytes = b"synthetic owner footage bytes that must keep every name " * 11
+        owner = self.tmp / "owner-synthetic.raw"
+        owner.write_bytes(owner_bytes)
+        proc = self.build_with_corrupt_hook(0)
+        job = self.job_path(proc)
+        job_id = job.name[: -len(".job.ps1")]
+        swap = (
+            "    if ($index -eq 0) { [IO.File]::Delete($targetPath); "
+            f"[void](New-Item -ItemType HardLink -Path $targetPath -Value '{owner}') }}"
+        )
+        self.patch_job(
+            job,
+            "    $placedStatus = Test-AttrCudaFootagePart -Path $targetPath -ExpectedLength $expectedLength -ExpectedSha256 $expectedSha256",
+            swap,
+        )
+        self.stage_all_parts(self.stage_dir(job_id))
+        run = self.run_job(job)
+        self.assertEqual(run.returncode, 1, run.stdout + run.stderr)
+        self.assertTrue(self.targets[0].exists(), f"the job deleted a name of owner footage\n{run.stdout}")
+        self.assertEqual(os.stat(self.targets[0]).st_nlink, 2)
+        self.assertEqual(self.targets[0].read_bytes(), owner_bytes)
+        self.assertEqual(owner.read_bytes(), owner_bytes)
+        self.assertIn("PART=0 STATUS=PLACED_VERIFY_FAILED_TARGET_RETAINED", run.stdout)
+
+    def test_a_failed_target_volume_verify_leaves_the_partial_and_records_it(self) -> None:
+        # The same policy for this attempt's own partial in the owner's directory: no delete by
+        # pathname, so a swap at the partial's name cannot cost a name of owner footage either.
+        proc = self.build()
+        job = self.job_path(proc)
+        job_id = job.name[: -len(".job.ps1")]
+        self.patch_job(
+            job,
+            "    $localStatus = Test-AttrCudaFootagePart -Path $localPartialPath -ExpectedLength $expectedLength -ExpectedSha256 $expectedSha256",
+            "    if ($index -eq 0) { [IO.File]::AppendAllText($localPartialPath, 'x') }",
+            before=True,
+        )
+        self.stage_all_parts(self.stage_dir(job_id))
+        run = self.run_job(job)
+        self.assertEqual(run.returncode, 1, run.stdout + run.stderr)
+        self.assertIn("PART=0 STATUS=TARGET_VOLUME_VERIFY_LENGTH_MISMATCH", run.stdout)
+        partial = self.target_dir / f".attr3-footage-stage-{job_id}-part0.partial"
+        self.assertTrue(partial.is_file(), "the partial was deleted by pathname")
+        self.assertFalse(self.targets[0].exists())
+        record = self.leftover_records(job_id)[f"{job_id}-part0-local-partial.json"]
+        self.assertEqual(record["kind"], "local-partial")
+        self.assertEqual(os.path.normcase(record["leftoverPath"]), os.path.normcase(str(partial)))
+        self.assertIn("PART=1 STATUS=PLACED", run.stdout)
+
+    def test_a_refused_publish_leaves_the_partial_and_the_occupant_untouched(self) -> None:
+        proc = self.build()
+        job = self.job_path(proc)
+        job_id = job.name[: -len(".job.ps1")]
+        self.patch_job(
+            job,
+            "        [void](Publish-AttrCudaFileMoveNonOverwriting -Source $localPartialPath -Destination $targetPath)",
+            "        if ($index -eq 0) { [IO.File]::WriteAllBytes($targetPath, [byte[]](1, 2, 3)) }",
+            before=True,
+        )
+        self.stage_all_parts(self.stage_dir(job_id))
+        run = self.run_job(job)
+        self.assertEqual(run.returncode, 1, run.stdout + run.stderr)
+        self.assertIn("PART=0 STATUS=TARGET_CONFLICT", run.stdout)
+        self.assertEqual(self.targets[0].read_bytes(), bytes([1, 2, 3]))
+        partial = self.target_dir / f".attr3-footage-stage-{job_id}-part0.partial"
+        self.assertTrue(partial.is_file(), "the partial was deleted by pathname")
+        self.assertIn(f"{job_id}-part0-local-partial.json", self.leftover_records(job_id))
 
     # ---- round 5: cleanup ownership (astra major) -- only delete what THIS attempt created -----
 
@@ -733,34 +814,6 @@ class FootageStageJobTests(unittest.TestCase):
         self.assertEqual(unrelated_partial.read_bytes(), b"bytes this attempt never created and must never delete")
         self.assertFalse(self.targets[0].exists())
         # Part 1 (never hooked) still places cleanly in the SAME run.
-        self.assertIn("PART=1 STATUS=PLACED", run.stdout)
-        self.assertTrue(self.targets[1].is_file())
-
-    # ---- round 4/8: removal-verified refusal -- the retained-bytes token, no recovery path -------
-
-    def test_removal_failure_after_publish_verify_fails_reports_a_distinct_token_and_retains_the_target(self) -> None:
-        # ATTR3-FOOTAGE-STAGE-1 round 5 (sol blocker): when this job cannot verify that it
-        # actually removed the corrupt bytes IT JUST PLACED, it must report a status DISTINCT
-        # from the ordinary PLACED_VERIFY_<status> (removal succeeded) case. ATTR3-FOOTAGE-STAGE-1
-        # round 8 (scope cut): the round 5/6 residue-marker recovery mechanism this token used to
-        # feed into is gone -- the retained bytes are simply left where they are, and a later run
-        # for the same target refuses TARGET_CONFLICT (see
-        # test_existing_different_target_refuses_and_leaves_target_untouched above).
-        proc = self.build_with_corrupt_and_removal_failure_hooks(corrupt_index=0, removal_failure_index=0)
-        job = self.job_path(proc)
-        stage_dir = self.stage_dir(job.name[: -len(".job.ps1")])
-        self.stage_all_parts(stage_dir)
-        run = self.run_job(job)
-        self.assertEqual(run.returncode, 1, run.stdout + run.stderr)
-        self.assertIn("PART=0 STATUS=PLACED_VERIFY_FAILED_TARGET_RETAINED", run.stdout)
-        self.assertNotIn("PART=0 STATUS=PLACED_VERIFY_LENGTH_MISMATCH", run.stdout)
-        # The corrupt bytes THIS job placed are still there -- removal was never actually skipped
-        # silently; the retained-target token means exactly what it says.
-        self.assertTrue(self.targets[0].is_file())
-        self.assertNotEqual(self.targets[0].read_bytes(), self.content[0])
-        # ATTR3-FOOTAGE-STAGE-1 round 8: no residue marker is ever written any more.
-        self.assertFalse(Path(str(self.targets[0]) + ".attr3-footage-stage-verify-failed").exists())
-        # Part 1 (never corrupted, never hooked) still places cleanly in the SAME run.
         self.assertIn("PART=1 STATUS=PLACED", run.stdout)
         self.assertTrue(self.targets[1].is_file())
 

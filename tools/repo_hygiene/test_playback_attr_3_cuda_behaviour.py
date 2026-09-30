@@ -2255,54 +2255,115 @@ class OwnerFootagePrivateDirectoryLeakAndRefusalTests(_PwshCase):
         self.assertIn("SIDECAR_EXISTS=True", proc.stdout)
         self.assertEqual(part_path.read_bytes(), payload)
 
-    def test_the_only_recursive_delete_in_the_job_refuses_a_work_tree_holding_a_link_directory(self) -> None:
-        # The job's own pre-clean (Remove-AttrCudaTree on $Work) is a recursive delete; a $Work
-        # that already holds a private link directory of an earlier attempt must be REFUSED, not
-        # emptied, because that directory holds link names of owner footage.
+    # ---- UM-OWNER-FOOTAGE-CROSS-VOLUME-2 r2: $Work is unique by construction, created create-new, and
+    # never pre-cleaned (sol r1 blocker 1: the recursive pre-clean could delete a hard link under any
+    # other name, or race a concurrent job sharing the second-resolution $Work).
+
+    def _work_preparation_block(self, mlvtmp: Path) -> str:
+        """The job's own statements from the TEMP-boundary check through the creation of $Work, with
+        the venue's 'C:\\mlvtmp' pointed at a temp root. The two anchors exist in both the pre-r2 and
+        the r2 job, so the same test is the red-first repro on the old source."""
         text = ATTRIBUTION_GENERATOR.read_text(encoding="utf-8")
-        start = text.index("if (Test-Path -LiteralPath (Join-Path $Work 'owner-clip')) {")
-        end = text.index("Remove-AttrCudaTree -TrustedRoot 'C:\\mlvtmp' -Path $Work", start)
-        guard = text[start:end]
-        source_dir = self.tmp / "guard-owner-source"
-        source_dir.mkdir()
-        source = source_dir / ("source" + "." + "MLV")
-        source.write_bytes(b"guard bytes")
-        work = self.tmp / "guard-work"
-        link_dir = work / ("owner-" + "clip")
-        link_dir.mkdir(parents=True)
-        link = link_dir / ("owner-" + "clip" + "." + "MLV")
-        os.link(source, link)
-        (self.tmp / "guard-root").mkdir()
-        pub = self.tmp / "guard-pub"
-        script = self.tmp / "guard-probe.ps1"
+        start = text.index("function Assert-UnderMlvTmp([string]$Path, [string]$Label) {")
+        end = text.index("$Scratch = Join-Path $Work '.job-tmp'", start)
+        self.assertGreater(end, start, "the Work-preparation markers moved in the generator")
+        return text[start:end].replace("C:\\mlvtmp", str(mlvtmp))
+
+    def _work_preparation_script(self, name: str, mlvtmp: Path, work: Path) -> Path:
+        agent = mlvtmp / "mlv-agent"
+        agent.mkdir(parents=True, exist_ok=True)
+        script = self.tmp / f"{name}-work-probe.ps1"
         script.write_text(
             "$ErrorActionPreference = 'Stop'\n"
             f"Import-Module '{MODULE}' -Force\n"
             f"Import-Module '{OWNER_FOOTAGE_MODULE}' -Force\n"
+            f"$Root = '{agent}'\n"
             f"$Work = '{work}'\n"
-            f"$Root = '{self.tmp / 'guard-root'}'\n"
-            f"$Pub = '{pub}'\n"
+            f"$Pub = '{agent / 'outbox' / (name + '.artifacts')}'\n"
             "$FixtureRehearsal = $false\n"
             "$displayWake = @{}\n"
             f"$SourceCommit = '{'d' * 40}'\n"
-            "$ClipId = 'FIX-GUARD-0001'\n"
+            "$ClipId = 'FIX-WORK-0001'\n"
             "function Save-Json($Object, [string]$Path) { [void](Publish-AttrCudaText -Path $Path -Value ($Object | ConvertTo-Json -Depth 30)) }\n"
-            + guard +
+            + self._work_preparation_block(mlvtmp) +
             "Write-Output 'FELL_THROUGH'\n",
             encoding="utf-8",
         )
-        proc = _run_pwsh_file(script)
-        self.assertEqual(proc.returncode, 28, f"{proc.stdout}\n{proc.stderr}")
-        self.assertIn("RESULT=OWNER_LINK_DIRECTORY_PRESENT", proc.stdout)
+        return script
+
+    def test_sol_r1_a_renamed_owner_link_in_an_existing_work_tree_is_refused_and_survives(self) -> None:
+        mlvtmp = self.tmp / "mlvtmp-renamed"
+        source = self.tmp / "renamed-owner-source.bin"
+        source.write_bytes(b"synthetic owner bytes whose last name may be a link")
+        work = mlvtmp / "work"
+        work.mkdir(parents=True)
+        # A retained link under a name the old exact-name guard never looked for.
+        link = work / ("owner-" + "clip" + ".saved")
+        os.link(source, link)
+        keep = work / "keep.txt"
+        keep.write_text("other job state", encoding="utf-8")
+        proc = _run_pwsh_file(self._work_preparation_script("renamed", mlvtmp, work))
+        self.assertEqual(proc.returncode, 28, f"the existing work tree was not refused\n{proc.stdout}\n{proc.stderr}")
+        self.assertIn("RESULT=WORK_DIRECTORY_EXISTS", proc.stdout)
         self.assertNotIn("FELL_THROUGH", proc.stdout)
-        self.assertTrue(link.exists())
+        self.assertTrue(link.exists(), "a name of owner footage was deleted")
         self.assertEqual(os.stat(source).st_nlink, 2)
-        # And a $Work with no such directory falls straight through to the (guarded) delete.
-        os.unlink(link)
-        link_dir.rmdir()
-        proc = _run_pwsh_file(script)
+        self.assertTrue(keep.exists())
+
+    def test_a_fresh_work_tree_is_created_and_an_existing_empty_one_is_refused_untouched(self) -> None:
+        mlvtmp = self.tmp / "mlvtmp-fresh"
+        fresh = mlvtmp / "fresh"
+        proc = _run_pwsh_file(self._work_preparation_script("fresh", mlvtmp, fresh))
         self.assertEqual(proc.returncode, 0, f"{proc.stdout}\n{proc.stderr}")
         self.assertIn("FELL_THROUGH", proc.stdout)
+        self.assertTrue(fresh.is_dir())
+        # The same Work again: create-new semantics refuse it (an old job would have emptied and reused it).
+        marker = fresh / "from-the-first-run.txt"
+        marker.write_text("first run", encoding="utf-8")
+        again = _run_pwsh_file(self._work_preparation_script("again", mlvtmp, fresh))
+        self.assertEqual(again.returncode, 28, f"{again.stdout}\n{again.stderr}")
+        self.assertIn("RESULT=WORK_DIRECTORY_EXISTS", again.stdout)
+        self.assertTrue(marker.exists())
+
+    def test_concurrent_jobs_given_the_same_work_path_cannot_both_get_it(self) -> None:
+        mlvtmp = self.tmp / "mlvtmp-race"
+        work = mlvtmp / "shared"
+        scripts = [self._work_preparation_script(f"race{i}", mlvtmp, work) for i in range(4)]
+        procs = [
+            subprocess.Popen(
+                [PWSH, "-NoLogo", "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-File", str(s)],
+                stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+            )
+            for s in scripts
+        ]
+        results = [(p.communicate(), p.returncode) for p in procs]
+        codes = sorted(code for _, code in results)
+        self.assertEqual(codes, [0, 28, 28, 28], f"exactly one job may create the work tree: {results}")
+        self.assertTrue(work.is_dir())
+
+    def test_two_jobs_can_never_share_a_work_tree(self) -> None:
+        text = ATTRIBUTION_GENERATOR.read_text(encoding="utf-8")
+        start = text.index("$Stamp = Get-Date -Format 'yyyyMMdd-HHmmss'")
+        end = text.index('$Pub = Join-Path $Root "outbox\\$JobId.artifacts"', start)
+        block = text[start:end]
+        script = self.tmp / "unique-work-probe.ps1"
+        script.write_text(
+            "$ErrorActionPreference = 'Stop'\n"
+            f"$SourceCommit = '{'d' * 40}'\n"
+            "$ClipId = 'FIX-WORK-0001'\n"
+            "$first = & { " + block + " $Work }\n"
+            "$second = & { " + block + " $Work }\n"
+            "Write-Output ('W1=' + $first)\n"
+            "Write-Output ('W2=' + $second)\n",
+            encoding="utf-8",
+        )
+        proc = _run_pwsh_file(script)
+        self.assertEqual(proc.returncode, 0, f"{proc.stdout}\n{proc.stderr}")
+        paths = dict(line.split("=", 1) for line in proc.stdout.splitlines() if line[:3] in {"W1=", "W2="})
+        # Same commit, same clip, same second: still two different work trees.
+        self.assertNotEqual(paths["W1"], paths["W2"])
+        for path in paths.values():
+            self.assertRegex(path, r"^C:\\mlvtmp\\playback-attr-3-cuda-d{12}-FIX-WORK-0001-\d{8}-\d{6}-[0-9a-f]{12}$")
 
     # ---- the empty-only directory remover: the one delete left, and why it cannot cost a name -----
 
@@ -2415,6 +2476,50 @@ class OwnerFootagePrivateDirectoryLeakAndRefusalTests(_PwshCase):
         self.assertIn("THREW OWNER_FOOTAGE_LINK_FAILED", proc.stdout)
         self.assertIn("ELSEWHERE_ENTRIES=0", proc.stdout)
         self.assertEqual(os.stat(source).st_nlink, 1)
+
+    def test_a_junction_planted_above_the_relocated_directory_is_refused_before_any_link_exists(self) -> None:
+        # fable r1 note: Register-...Pin -Relocated ran no ancestor walk, so a junction at the
+        # relocated parent (<clip drive>\\mlvtmp) let the link be CREATED inside the junction's target.
+        target = self.tmp / "junction-target"
+        target.mkdir()
+        junction = self.tmp / "on-the-clip-volume-junction"
+        made = subprocess.run(["cmd", "/c", "mklink", "/J", str(junction), str(target)], capture_output=True, text=True)
+        if made.returncode != 0:
+            self.skipTest(f"cannot create a directory junction here: {made.stdout}{made.stderr}")
+        part_path, part = self._one_part("owner-junction-parent", b"junction parent bytes " * 20)
+        pub = self.tmp / "agent" / "outbox" / "owner-junction-parent.artifacts"
+        work = self.tmp / "work"
+        proc = self._run_owner_content_check(
+            parts=[part], pub=pub, work=work,
+            preamble=self._simulated_second_volume_preamble(work=work, relocated_parent=junction),
+        )
+        self.assertEqual(proc.returncode, 22, f"{proc.stdout}\n{proc.stderr}")
+        self.assertIn("RESULT=OWNER_FOOTAGE_LINK_FAILED", proc.stdout)
+        self.assertEqual(list(target.iterdir()), [], "a link or directory was left inside the junction's target")
+        self.assertEqual(os.stat(part_path).st_nlink, 1)
+
+    def test_registering_a_relocated_directory_walks_its_ancestors_for_reparse_points(self) -> None:
+        target = self.tmp / "pin-junction-target"
+        (target / "inner").mkdir(parents=True)
+        junction = self.tmp / "pin-junction"
+        made = subprocess.run(["cmd", "/c", "mklink", "/J", str(junction), str(target)], capture_output=True, text=True)
+        if made.returncode != 0:
+            self.skipTest(f"cannot create a directory junction here: {made.stdout}{made.stderr}")
+        plain = self.tmp / "pin-plain" / "inner"
+        plain.mkdir(parents=True)
+        proc = self.run_with_module(
+            f"try {{ [void](Register-AttrCudaOwnerFootageDirectoryPin -Directory '{junction / 'inner'}' -Relocated); Write-Output 'JUNCTION_NO_THROW' }} "
+            "catch { Write-Output ('JUNCTION_THREW ' + (([string]$_.Exception.Message) -split '\\s+')[0]) }\n"
+            f"try {{ [void](Register-AttrCudaOwnerFootageDirectoryPin -Directory '{plain}' -Relocated); Write-Output 'PLAIN_OK' }} "
+            "catch { Write-Output ('PLAIN_THREW ' + $_.Exception.Message) }\n"
+            # Not relocated: no ancestor walk is asked for (the job's own work tree is pinned this way).
+            f"try {{ [void](Register-AttrCudaOwnerFootageDirectoryPin -Directory '{junction / 'inner'}'); Write-Output 'PLAIN_MODE_OK' }} "
+            "catch { Write-Output ('PLAIN_MODE_THREW ' + $_.Exception.Message) }\n"
+        )
+        self.assertEqual(proc.returncode, 0, f"{proc.stdout}\n{proc.stderr}")
+        self.assertIn("JUNCTION_THREW ATTRCUDA_OWNER_DIRECTORY_PIN_REFUSED", proc.stdout)
+        self.assertIn("PLAIN_OK", proc.stdout)
+        self.assertIn("PLAIN_MODE_OK", proc.stdout)
 
     def test_a_preexisting_relocated_directory_is_refused_and_left_untouched(self) -> None:
         relocated_parent = self.tmp / "on-the-clip-volume"
@@ -5183,9 +5288,9 @@ class EmbeddedFunctionContractTests(_PwshCase):
             "Test-AttrCudaPathIsReparsePoint",
             "Publish-AttrCudaText",
             "Publish-AttrCudaFileCopy",
-            "Publish-AttrCudaFileMove",
+            # UM-OWNER-FOOTAGE-CROSS-VOLUME-2 r2: Publish-AttrCudaFileMove (unused here) and
+            # Remove-AttrCudaTree (the job-start pre-clean, now gone) are no longer embedded.
             "New-AttrCudaDirectory",
-            "Remove-AttrCudaTree",
             # UM-DISPLAY-SELECT-AND-LOG-1 round 2b/2: venue-quiescence (CPU busy time, not
             # utility) and the Windows display inventory, both embedded verbatim like every
             # other shared function.
@@ -5997,7 +6102,8 @@ class DisplayWakeJobOrderingTests(unittest.TestCase):
         # can be prepared on the clip's volume (OWNER_FOOTAGE_LINK_CROSS_VOLUME/_FAILED, no part yet).
         # UM-OWNER-FOOTAGE-CROSS-VOLUME-2 adds a 22nd and 23rd: the refusal of a $Work that already
         # holds a private link directory (OWNER_LINK_DIRECTORY_PRESENT, exit 28) and the refusal
-        # when the leftover-directory record cannot be written (OWNER_FOOTAGE_LINK_FAILED).
+        # when the leftover-directory record cannot be written (OWNER_FOOTAGE_LINK_FAILED). r2: the
+        # first became WORK_DIRECTORY_EXISTS (exit 28, any existing $Work; same site, same count).
         summary_writes = body.count("(Join-Path $Pub 'summary.json')")
         display_wake_fields = body.count("displayWake=$displayWake") + body.count("displayWake = $displayWake")
         self.assertEqual(23, summary_writes, "a summary.json write site was added/removed after the wake")

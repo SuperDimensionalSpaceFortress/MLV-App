@@ -42,9 +42,16 @@
 # transfer, not the core transfer itself -- most recently a review finding that the recovery
 # branch could delete an ordinary file at the fixed marker name this tool does not own. The
 # replacement policy: a target that already holds bytes THIS job just published (its own
-# non-overwriting rename) and fails its post-rename re-hash is removed -- that file, and only that
-# file, came from this job's own rename -- and reported with a failing token; nothing else is ever
-# recovered automatically. A failed run is simply re-run.
+# non-overwriting rename) and fails its post-rename re-hash is REPORTED and LEFT IN PLACE --
+# UM-OWNER-FOOTAGE-CROSS-VOLUME-2 r2 superseded the "removed" half of this policy: a delete by
+# pathname in the owner's directory cannot prove it still hits this job's own file (the name can be
+# swapped for a hard link to real owner footage between the failed re-hash and the delete). No job
+# deletes by pathname anything in the owner's directory: the failed copy at the spec path, and this
+# attempt's own target-volume partial after a failed copy, verify or publish, STAY, each named in a
+# leftover record under <AgentRoot>\footage-stage-leftovers (same record family as
+# owner-link-directory.json) for a later sweep, which must verify the object's identity before
+# acting and never open it for write. The disk cost is one staged copy (or partial) of the part per
+# such failure. A failed run is simply re-run.
 #
 # WHY BASE64, NOT A CHARACTER ALLOWLIST. Same reasoning as Attr3FootagePresenceJob.psm1's own
 # header: the job template wraps $PartsJson in a SINGLE-QUOTED PowerShell string literal, so a raw
@@ -96,11 +103,12 @@ function New-Attr3FootageStageJob {
     TARGET_VOLUME_PARTIAL_EXISTS (round 4: the target-volume partial slot is already occupied --
     refused, untouched, never this job's to delete), TARGET_VOLUME_COPY_FAILED,
     TARGET_VOLUME_VERIFY_<Test-AttrCudaFootagePart status> (the same-volume partial copy failed
-    verification), PLACED_VERIFY_<status> (the post-rename re-hash at the spec path failed and the
-    target IT just placed was successfully removed, round 4), PLACED_VERIFY_FAILED_TARGET_RETAINED
-    (round 4/8: that removal itself could not be verified -- the bytes THIS job just placed are
-    retained, reported and left in place; a later run then sees a mismatched target and refuses
-    TARGET_CONFLICT, never a silent recovery), STAGE_SLOT_INVALID, STAGED_PATH_UNSAFE (round 4:
+    verification; the partial is left in place and recorded), PLACED_VERIFY_FAILED_TARGET_RETAINED
+    (the post-rename re-hash at the spec path failed: the bytes THIS job just placed are retained,
+    reported and recorded, never deleted -- UM-OWNER-FOOTAGE-CROSS-VOLUME-2 r2; a later run then
+    sees a mismatched target and refuses TARGET_CONFLICT, never a silent recovery),
+    PLACED_VERIFY_FAILED_TARGET_RETAINED_UNRECORDED (the same, and the leftover record could not be
+    written), STAGE_SLOT_INVALID, STAGED_PATH_UNSAFE (round 4:
     the staged file's own leaf is a reparse point) or STAGED_<status> (the staged copy itself
     failed verification); the overall result is FOOTAGE_STAGED (exit 0) when every part is PLACED
     or ALREADY_PRESENT, else FOOTAGE_STAGE_REFUSED (exit 1). No exception's own text ever reaches
@@ -133,14 +141,6 @@ function New-Attr3FootageStageJob {
         # check, is what gates a PLACED report, and that a target this job's own rename just
         # created is removed by this same job when that re-hash fails.
         [int]$TestHookCorruptAfterVerifyPartIndex = -1,
-
-        # ATTR3-FOOTAGE-STAGE-1 round 5: a second TEST-ONLY hook, same non-reachability guarantee
-        # as the one above. -1 (the default) is inert. A test that passes a real index gets a job
-        # whose emitted body SKIPS its own Remove-Item call on a post-rename-verify-failed target
-        # for that one part -- modelling a removal that genuinely fails (a lock, a permissions
-        # fault) without needing to fabricate one at the OS level -- so the removal-verification
-        # branch (PLACED_VERIFY_FAILED_TARGET_RETAINED) can be proven directly.
-        [int]$TestHookForceRemovalFailurePartIndex = -1,
 
         # ATTR3-FOOTAGE-STAGE-1 round 5: a third TEST-ONLY hook, same non-reachability guarantee.
         # -1 (the default) is inert. A test that passes a real index gets a job whose emitted body
@@ -289,9 +289,6 @@ $PartsJson = '__PARTS_JSON__'
 # -TestHookCorruptAfterVerifyPartIndex set -- see New-Attr3FootageStageJob's own header.
 $TestHookCorruptPartIndex = __TEST_HOOK_CORRUPT_PART_INDEX__
 # Test-only hook (round 5): -1 unless a test explicitly built this job with
-# -TestHookForceRemovalFailurePartIndex set -- see New-Attr3FootageStageJob's own header.
-$TestHookForceRemovalFailurePartIndex = __TEST_HOOK_FORCE_REMOVAL_FAILURE_PART_INDEX__
-# Test-only hook (round 5): -1 unless a test explicitly built this job with
 # -TestHookForceLocalSourceOpenFailurePartIndex set -- see New-Attr3FootageStageJob's own header.
 $TestHookForceLocalSourceOpenFailurePartIndex = __TEST_HOOK_FORCE_LOCAL_SOURCE_OPEN_FAILURE_PART_INDEX__
 # Test-only hook (round 7): -1 unless a test explicitly built this job with
@@ -369,6 +366,48 @@ function Record-PartResult([int]$Index, [string]$Status, [string]$CleanupPath) {
     if ($CleanupPath) { [void](Remove-AttrCudaPartialFile -TrustedRoot $AgentRoot -Path $CleanupPath -WarningAction SilentlyContinue) }
     $results.Add([ordered]@{ index = $Index; status = $Status })
     Write-Output "PART=$Index STATUS=$Status"
+}
+
+# UM-OWNER-FOOTAGE-CROSS-VOLUME-2 r2: the leftover record for a file in the OWNER'S directory that
+# this job made and deliberately does NOT delete -- the published copy at the spec path after a
+# failed post-publication verification (-Kind target), or this attempt's own target-volume partial
+# after a failed copy, verify or publish (-Kind local-partial). Same record family as
+# owner-link-directory.json (mlvapp.owner-link-leftover.v1): schema, where it is, leftover = true.
+# Written with create-new semantics under a link-checked directory of the agent root, named from the
+# unique job id, part index and kind, so it never replaces anything. The record names a real path, so
+# it stays on this host: it is never written to this job's output. Returns $false (never throws)
+# when it could not be written.
+function Write-StageLeftoverRecord([int]$Index, [string]$Kind, [string]$Reason, [string]$VerifyStatus, [string]$LeftoverPath, [int64]$ExpectedLength, [string]$ExpectedSha256) {
+    try {
+        $leftoverDir = Join-Path $AgentRoot 'footage-stage-leftovers'
+        [void](Assert-AttrCudaNoLinkBelowRoot -TrustedRoot $AgentRoot -Path $leftoverDir)
+        [void](New-AttrCudaDirectory -Path $leftoverDir)
+        $recordPath = Join-Path $leftoverDir "$JobId-part$Index-$Kind.json"
+        $record = [ordered]@{
+            schema = 'mlvapp.owner-target-leftover.v1'
+            jobId = $JobId
+            clipId = $ClipId
+            partIndex = $Index
+            kind = $Kind
+            leftoverPath = $LeftoverPath
+            leftover = $true
+            reason = $Reason
+            verifyStatus = $VerifyStatus
+            expectedLength = $ExpectedLength
+            expectedSha256 = $ExpectedSha256
+        }
+        $bytes = [Text.UTF8Encoding]::new($false).GetBytes((($record | ConvertTo-Json -Depth 4)) + [Environment]::NewLine)
+        $stream = [IO.File]::Open($recordPath, [IO.FileMode]::CreateNew, [IO.FileAccess]::Write, [IO.FileShare]::None)
+        try {
+            $stream.Write($bytes, 0, $bytes.Length)
+            $stream.Flush($true)
+        } finally {
+            $stream.Dispose()
+        }
+        return $true
+    } catch {
+        return $false
+    }
 }
 
 foreach ($rawPart in $RawParts) {
@@ -571,7 +610,9 @@ foreach ($rawPart in $RawParts) {
     }
     if ($localCopyFailed) {
         if ($weCreatedLocalPartial) {
-            try { Remove-Item -LiteralPath $localPartialPath -Force -Confirm:$false -ErrorAction SilentlyContinue } catch {}
+            # UM-OWNER-FOOTAGE-CROSS-VOLUME-2 r2: left in place and recorded, never deleted by pathname
+            # (see the post-publication branch below for why: this directory is the owner's).
+            [void](Write-StageLeftoverRecord -Index $index -Kind 'local-partial' -Reason 'the copy into the target-volume partial failed; the partial was not deleted' -VerifyStatus 'COPY_FAILED' -LeftoverPath $localPartialPath -ExpectedLength $expectedLength -ExpectedSha256 $expectedSha256)
         }
         Record-PartResult -Index $index -Status 'TARGET_VOLUME_COPY_FAILED' -CleanupPath $stagedPath
         continue
@@ -579,7 +620,7 @@ foreach ($rawPart in $RawParts) {
 
     $localStatus = Test-AttrCudaFootagePart -Path $localPartialPath -ExpectedLength $expectedLength -ExpectedSha256 $expectedSha256
     if ($localStatus -ne 'PASS') {
-        try { Remove-Item -LiteralPath $localPartialPath -Force -Confirm:$false -ErrorAction SilentlyContinue } catch {}
+        [void](Write-StageLeftoverRecord -Index $index -Kind 'local-partial' -Reason 'the target-volume partial failed verification; the partial was not deleted' -VerifyStatus $localStatus -LeftoverPath $localPartialPath -ExpectedLength $expectedLength -ExpectedSha256 $expectedSha256)
         Record-PartResult -Index $index -Status "TARGET_VOLUME_VERIFY_$localStatus" -CleanupPath $stagedPath
         continue
     }
@@ -599,7 +640,7 @@ foreach ($rawPart in $RawParts) {
         # rather than assume either outcome. Either way the same-volume rename never happened, so
         # the local partial this attempt made is still there and still needs cleaning up.
         $racedStatus = Test-AttrCudaFootagePart -Path $targetPath -ExpectedLength $expectedLength -ExpectedSha256 $expectedSha256
-        try { Remove-Item -LiteralPath $localPartialPath -Force -Confirm:$false -ErrorAction SilentlyContinue } catch {}
+        [void](Write-StageLeftoverRecord -Index $index -Kind 'local-partial' -Reason 'the non-overwriting publish was refused; the partial was not deleted' -VerifyStatus $racedStatus -LeftoverPath $localPartialPath -ExpectedLength $expectedLength -ExpectedSha256 $expectedSha256)
         if ($racedStatus -eq 'PASS') {
             Record-PartResult -Index $index -Status 'ALREADY_PRESENT' -CleanupPath $stagedPath
         } else {
@@ -613,34 +654,23 @@ foreach ($rawPart in $RawParts) {
     # proves the arrived bytes are correct: report PLACED only when a fresh read confirms it.
     $placedStatus = Test-AttrCudaFootagePart -Path $targetPath -ExpectedLength $expectedLength -ExpectedSha256 $expectedSha256
     if ($placedStatus -ne 'PASS') {
-        # ATTR3-FOOTAGE-STAGE-1 round 4 (sol BLOCKER 2b): the non-overwriting rename just above
-        # created $targetPath as THIS JOB'S OWN OBJECT -- nothing else could already have been
-        # there, or the rename itself would have thrown ATTRCUDA_NONOVERWRITE_DESTINATION_EXISTS
-        # instead of succeeding. A failed post-rename re-hash therefore means the bytes THIS JOB
-        # just placed are wrong, so this job -- and only this job -- removes them, rather than
-        # leaving a corrupt file at the spec path under a PLACED-shaped status. A rerun's own
-        # ALREADY_PRESENT check then sees a clean absence, never a false TARGET_CONFLICT against
-        # bytes this job itself left broken.
-        # ATTR3-FOOTAGE-STAGE-1 round 5 (sol blocker, publish recovery): -ErrorAction
-        # SilentlyContinue on that removal used to be trusted blindly -- if it actually failed
-        # (a lock, a permissions fault), the corrupt bytes stayed at the spec path and every
-        # LATER run's own "already exists, different bytes" check refused it as TARGET_CONFLICT
-        # forever, indistinguishable from a genuine stranger's file. The removal is now VERIFIED
-        # (the target must actually be gone afterwards); on success this reports the same
-        # PLACED_VERIFY_$placedStatus as before, but on failure it reports the distinct
-        # PLACED_VERIFY_FAILED_TARGET_RETAINED token and leaves the retained bytes exactly where
-        # they are (round 8 scope cut: no residue marker is written -- a later run simply sees a
-        # mismatched target and refuses TARGET_CONFLICT; a failed run is re-run, never recovered
-        # automatically).
-        if ($index -ne $TestHookForceRemovalFailurePartIndex) {
-            try { Remove-Item -LiteralPath $targetPath -Force -Confirm:$false -ErrorAction Stop } catch {}
-        }
-        $targetRemoved = $true
-        try { $targetRemoved = -not (Test-Path -LiteralPath $targetPath -PathType Leaf -ErrorAction Stop) } catch { $targetRemoved = $false }
-        if ($targetRemoved) {
-            Record-PartResult -Index $index -Status "PLACED_VERIFY_$placedStatus" -CleanupPath $stagedPath
-        } else {
+        # UM-OWNER-FOOTAGE-CROSS-VOLUME-2 r2 (sol r1 blocker 2): NO DELETE BY PATHNAME. $targetPath is
+        # the resolver's spec path -- a name of owner footage. The non-overwriting rename above
+        # created it as this job's own object, but that proves nothing about what the pathname NAMES
+        # by the time a delete would run: between the failed re-hash and a Remove-Item the name can
+        # be swapped for a hard link to real owner footage (hold the file so the verifier reads
+        # UNREADABLE, release it, relink), and Windows has no "delete this name only if it is still
+        # that file". So the failed copy is LEFT WHERE IT IS, the part is reported with a typed
+        # token, and a leftover record names it for a later sweep (which must verify the object's
+        # identity, with the owner present, before acting, and must never open it for write). Disk
+        # cost, stated honestly: one full staged copy of the part per failed post-publication
+        # verification, at the spec path, until a sweep resolves it. A later run sees a mismatched
+        # target and refuses TARGET_CONFLICT, never recovers it automatically.
+        $recordWritten = Write-StageLeftoverRecord -Index $index -Kind 'target' -Reason 'post-publication verification failed; the published copy was not deleted' -VerifyStatus $placedStatus -LeftoverPath $targetPath -ExpectedLength $expectedLength -ExpectedSha256 $expectedSha256
+        if ($recordWritten) {
             Record-PartResult -Index $index -Status 'PLACED_VERIFY_FAILED_TARGET_RETAINED' -CleanupPath $stagedPath
+        } else {
+            Record-PartResult -Index $index -Status 'PLACED_VERIFY_FAILED_TARGET_RETAINED_UNRECORDED' -CleanupPath $stagedPath
         }
         continue
     }
@@ -691,7 +721,6 @@ exit $exitCode
         PARTS_JSON = $partsJson
         EMBEDDED_FUNCTIONS = $embeddedFunctions
         TEST_HOOK_CORRUPT_PART_INDEX = $TestHookCorruptAfterVerifyPartIndex
-        TEST_HOOK_FORCE_REMOVAL_FAILURE_PART_INDEX = $TestHookForceRemovalFailurePartIndex
         TEST_HOOK_FORCE_LOCAL_SOURCE_OPEN_FAILURE_PART_INDEX = $TestHookForceLocalSourceOpenFailurePartIndex
         TEST_HOOK_FORCE_DISPOSE_THROW_PART_INDEX = $TestHookForceDisposeThrowPartIndex
         TEST_HOOK_FORCE_ARBITRARY_THROW_PART_INDEX = $TestHookForceArbitraryThrowPartIndex

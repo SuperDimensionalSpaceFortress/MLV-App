@@ -111,7 +111,8 @@ function New-Attr3FootageBindProofJob {
     .DESCRIPTION
     Emitted job exit codes: 0 OWNER_FOOTAGE_BIND_PROVEN, 19 OWNER_FOOTAGE_NOT_VERIFIED, 20
     OWNER_PARTS_NOT_CONTIGUOUS, 21 OWNER_FOOTAGE_LINK_CROSS_VOLUME, 22 OWNER_FOOTAGE_LINK_FAILED,
-    23 OWNER_FOOTAGE_BIND_NOT_PINNED (the held link accepted a write-open), 24
+    23 OWNER_FOOTAGE_BIND_NOT_PINNED (the held link accepted a write-open), 28 WORK_DIRECTORY_EXISTS
+    (r2: the proof's own work directory already existed -- refused, never cleaned), 24
     OWNER_FOOTAGE_BIND_MISMATCH (the binding differs from the verified parts), 25
     OWNER_FOOTAGE_BIND_HASH_READS (not exactly one full read per part), 26
     OWNER_FOOTAGE_BIND_SOURCE_NOT_INTACT (an owner part is missing after the job, or is no longer
@@ -223,8 +224,10 @@ try {
         [ordered]@{ path = $_.path; volume = $before.VolumeSerialNumber; high = $before.FileIndexHigh; low = $before.FileIndexLow; length = ([IO.FileInfo]::new($_.path)).Length }
     })
 
+    # UM-OWNER-FOOTAGE-CROSS-VOLUME-2 r2: create-new. $JobId already carries a random component, and an
+    # existing directory is refused (exit 28), never reused: nothing in this job deletes a tree.
     $work = Join-Path $WorkRoot $JobId
-    [void](New-Item -ItemType Directory -Path $work -Force)
+    try { [void](New-Item -ItemType Directory -Path $work -ErrorAction Stop) } catch { $work = $null; $token = 'WORK_DIRECTORY_EXISTS'; $exitCode = 28; throw $token }
     $preferred = New-AttrCudaDirectory -Path (Join-Path $work 'owner-clip')
     $workVolume = (Get-AttrCudaFileIdentity -Path $work).VolumeSerialNumber
     $sourceVolume = (Get-AttrCudaFileIdentity -Path $firstSource).VolumeSerialNumber
@@ -232,6 +235,23 @@ try {
     $linkDir = Resolve-AttrCudaOwnerFootageDirectory -PreferredDirectory $preferred -SourcePath @($asserted | ForEach-Object { $_.path })
     $relocated = ($linkDir -ne $preferred)
     $leftover = Get-AttrCudaOwnerFootageLeftoverRecord -Directory $linkDir -Relocated $relocated -LinkName @($asserted | ForEach-Object { Get-AttrCudaOwnerFootageNeutralName -Index $_.index })
+    # UM-OWNER-FOOTAGE-CROSS-VOLUME-2 r2 (both keys): the record is PERSISTED to disk BEFORE the first
+    # link exists, like the attribution job's owner-link-directory.json, so a proof killed mid-run
+    # still leaves a record naming the directory that holds its links. Create-new, flushed; if it
+    # cannot be written the proof stops here with no link made (the empty relocated directory, if any,
+    # is removed by the finally below -- non-recursive, so it can only succeed on an empty one).
+    try {
+        $recordBytes = [Text.UTF8Encoding]::new($false).GetBytes(($leftover | ConvertTo-Json -Depth 6) + [Environment]::NewLine)
+        $recordStream = [IO.File]::Open((Join-Path $work 'owner-link-directory.json'), [IO.FileMode]::CreateNew, [IO.FileAccess]::Write, [IO.FileShare]::None)
+        try {
+            $recordStream.Write($recordBytes, 0, $recordBytes.Length)
+            $recordStream.Flush($true)
+        } finally {
+            $recordStream.Dispose()
+        }
+    } catch {
+        $token = 'OWNER_FOOTAGE_LINK_FAILED'; $exitCode = 22; throw $token
+    }
     $linkVolume = (Get-AttrCudaFileIdentity -Path $linkDir).VolumeSerialNumber
     Say "link directory relocated=$relocated workVolume=$workVolume sourceVolume=$sourceVolume linkVolume=$linkVolume"
 

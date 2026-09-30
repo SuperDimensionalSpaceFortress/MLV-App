@@ -569,7 +569,10 @@ function Register-AttrCudaOwnerFootageDirectoryPin {
     a link in it, removing it when it is empty -- first proves it is still THIS object. A
     relocated directory (-Relocated) also has its whole ancestor chain checked for reparse points.
     UM-OWNER-FOOTAGE-CROSS-VOLUME-2: no link name is ever deleted, so the recorded names are only
-    a record of what this job created there.
+    a record of what this job created there. r2 (fable note): -Relocated also runs the ancestor
+    reparse-point walk HERE, at registration, so a junction planted at '<clip drive>\mlvtmp' (or
+    anywhere above the directory) refuses the directory before a single link can be created in
+    the junction's target -- not only when it is later removed.
     #>
     [CmdletBinding()]
     param(
@@ -580,6 +583,9 @@ function Register-AttrCudaOwnerFootageDirectoryPin {
     $identity = Get-AttrCudaNoFollowIdentity -Path $Directory
     if ($identity.IsReparsePoint -or -not $identity.IsDirectory) {
         throw 'ATTRCUDA_OWNER_DIRECTORY_PIN_REFUSED the private directory is not a plain directory'
+    }
+    if ($Relocated -and -not (Test-AttrCudaPathAncestorsHaveNoReparsePoint -Path $Directory)) {
+        throw 'ATTRCUDA_OWNER_DIRECTORY_PIN_REFUSED an ancestor of the private directory is a reparse point'
     }
     $pin = [pscustomobject]@{
         VolumeSerialNumber = $identity.VolumeSerialNumber
@@ -774,6 +780,7 @@ function Get-AttrCudaOwnerFootageLeftoverRecord {
         relocated = [bool]$Relocated
         leftover = $true
         linkNames = @($LinkName)
+        sweepRule = 'each link is a name of the owner clip: verify identity with the owner present; never open one for write'
     }
 }
 

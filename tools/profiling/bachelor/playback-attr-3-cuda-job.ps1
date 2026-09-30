@@ -516,10 +516,8 @@ $embeddedFunctions = Get-AttrCudaEmbeddedFunctionSource -Name @(
     # this splice instead -- see its own header in AttrCudaArtifacts.psm1.
     'Publish-AttrCudaContactSheetRawCaptures',
     'Publish-AttrCudaFileCopy',
-    'Publish-AttrCudaFileMove',
     'New-AttrCudaDirectory',
     'Assert-AttrCudaNoLinkBelowRoot',
-    'Remove-AttrCudaTree',
     # ATTR3-FOOTAGE-BIND-1 PR-B: the owner-clip content gate. Test-AttrCudaFootagePart is the
     # SAME function Attr3FootagePresenceJob.psm1 embeds for its own probe -- one definition,
     # spliced verbatim into both, never two copies that can drift apart.
@@ -817,7 +815,12 @@ $DisablePaintPerSubmit = __DISABLE_PAINT_PER_SUBMIT__
 $Root = '__AGENT_ROOT__'
 $Cache = Join-Path $Root 'cache'
 $Stamp = Get-Date -Format 'yyyyMMdd-HHmmss'
-$JobId = "playback-attr-3-cuda-$($SourceCommit.Substring(0,12))-$ClipId-$Stamp"
+# UM-OWNER-FOOTAGE-CROSS-VOLUME-2 r2: $Work (and with it the private link directory) is UNIQUE BY
+# CONSTRUCTION -- a random component no other job can share -- and is created with create-new
+# semantics below, so no job ever has a reason to delete a work tree that may hold names of owner
+# footage: an existing $Work is refused, never cleaned.
+$JobNonce = [Guid]::NewGuid().ToString('N').Substring(0, 12)
+$JobId = "playback-attr-3-cuda-$($SourceCommit.Substring(0,12))-$ClipId-$Stamp-$JobNonce"
 $Work = Join-Path 'C:\mlvtmp' $JobId
 $Pub = Join-Path $Root "outbox\$JobId.artifacts"
 # BACHELOR-OWNER-CLIP-STAGE-STALL-1: every pre-launch step appends a timestamped line here as it
@@ -961,25 +964,37 @@ foreach ($check in @(
     @{ path = $Pub; label = 'Pub' }
 )) { Assert-UnderMlvTmp $check.path $check.label }
 
-# UM-OWNER-FOOTAGE-CROSS-VOLUME-2: the recursive delete below must NEVER reach a link name of owner
-# footage, and a leftover private link directory of an earlier attempt at this same $Work is
-# exactly that (no job deletes its link names any more; they stay for a sweep). So a $Work that
-# already holds one is refused, untouched -- this is the ONLY recursive delete in this job.
-if (Test-Path -LiteralPath (Join-Path $Work 'owner-clip')) {
+# UM-OWNER-FOOTAGE-CROSS-VOLUME-2 r2: there is NO pre-clean of $Work. The job used to empty an existing
+# $Work recursively, and a recursive delete can remove a hard link under ANY name (a link is not a
+# reparse point), including the last name of an owner's clip (sol r1). $Work is unique by
+# construction (see $JobNonce) and is created here with create-new semantics -- New-Item without
+# -Force fails on an existing directory, atomically -- so an existing $Work is a typed refusal
+# (exit 28 WORK_DIRECTORY_EXISTS) and is left exactly as found. Nothing in this job deletes a
+# directory tree; the exit-28 name guard the r1 job carried is gone with the delete it guarded.
+$workCreated = $false
+$workAncestorsClear = $true
+try { [void](Assert-AttrCudaNoLinkBelowRoot -TrustedRoot 'C:\mlvtmp' -Path $Work) } catch { $workAncestorsClear = $false }
+if ($workAncestorsClear) {
+    try {
+        [void](New-Item -ItemType Directory -Path $Work -ErrorAction Stop)
+        $workCreated = $true
+    } catch {
+        $workCreated = $false
+    }
+}
+if (-not $workCreated) {
     [void](New-AttrCudaDirectory -Path (Join-Path $Root 'outbox'))
     [void](New-AttrCudaDirectory -Path $Pub)
-    $leftoverPresentRefusal = [ordered]@{
-        schema='playback-attr-3-cuda-venue.v1'; result='OWNER_LINK_DIRECTORY_PRESENT'
+    $workRefusal = [ordered]@{
+        schema='playback-attr-3-cuda-venue.v1'; result='WORK_DIRECTORY_EXISTS'
         fixtureRehearsal=$FixtureRehearsal
         displayWake=$displayWake
         sourceCommit=$SourceCommit; clipId=$ClipId; artifactRoot=$Pub
     }
-    Save-Json $leftoverPresentRefusal (Join-Path $Pub 'summary.json')
-    Write-Output "RESULT=OWNER_LINK_DIRECTORY_PRESENT ARTIFACTS=$Pub"
+    Save-Json $workRefusal (Join-Path $Pub 'summary.json')
+    Write-Output "RESULT=WORK_DIRECTORY_EXISTS ARTIFACTS=$Pub"
     exit 28
 }
-Remove-AttrCudaTree -TrustedRoot 'C:\mlvtmp' -Path $Work
-New-Item -ItemType Directory -Path $Work -Force | Out-Null
 $Scratch = Join-Path $Work '.job-tmp'
 New-Item -ItemType Directory -Path $Scratch -Force | Out-Null
 $env:TEMP = $Scratch
@@ -2879,6 +2894,8 @@ exit 0
     if ($OwnerClipDir) {
         # Handles only: the private link names stay (owner-link-directory.json records where);
         # a relocated directory is removed only if it is EMPTY. No name of owner footage is deleted.
+        # The empty preferred $Work\owner-clip a relocated run leaves behind is MOOT since r2: $Work
+        # is unique by construction and never reused, so nothing can later trip over it.
         Close-AttrCudaOwnerFootageWorkspace -Handles $ownerLinkHandles -Directory $OwnerClipDir
         if ($OwnerClipRelocated) { [void](Remove-AttrCudaEmptyOwnerFootageDirectory -Directory $OwnerClipDir) }
     }

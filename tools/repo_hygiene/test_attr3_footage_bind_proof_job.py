@@ -224,6 +224,70 @@ class FootageBindProofJobTests(_BindProofHarness):
         self.assertEqual(len(survivors), 1)
         self.assertEqual(survivors[0].read_bytes(), payload)  # the last name of the original bytes
 
+    def test_the_leftover_record_is_on_disk_before_the_first_link_exists(self) -> None:
+        # sol r1 + fable r1 hardening: the proof used to keep its leftover record in memory and emit it
+        # only in its final JSON, so a proof killed after the first link left a link directory that no
+        # record named. The record is persisted BEFORE the first link, like the attribution job's
+        # owner-link-directory.json. The job is ended hard (no finally, no final output) right after
+        # the first link is created.
+        payload = b"bind proof killed after the first link " * 300
+        parts, paths = self._parts([payload])
+        job = self._emit(parts)
+        text = job.read_text(encoding="utf-8")
+        marker = "        $handle = Open-AttrCudaReadOnlyHandle -Path $linkPath"
+        self.assertEqual(text.count(marker), 1)
+        job.write_text(text.replace(marker, "        [Environment]::Exit(97)\r\n" + marker), encoding="utf-8")
+
+        proc = self._run(job)
+
+        self.assertEqual(proc.returncode, 97, f"{proc.stdout}\n{proc.stderr}")
+        self.assertNotIn("RESULT=", proc.stdout)
+        work_dirs = [p for p in self.work_root.iterdir() if p.is_dir()]
+        self.assertEqual(len(work_dirs), 1)
+        record = json.loads((work_dirs[0] / "owner-link-directory.json").read_text(encoding="utf-8"))
+        self.assertEqual(record["schema"], "mlvapp.owner-link-leftover.v1")
+        self.assertTrue(record["leftover"])
+        link_dir = Path(record["linkDirectory"])
+        self.assertEqual(len(record["linkNames"]), 1)
+        self.assertTrue(os.path.samefile(link_dir / record["linkNames"][0], paths[0]))
+        self.assertEqual(os.stat(paths[0]).st_nlink, 2)
+
+    def test_a_record_that_cannot_be_written_stops_the_proof_before_any_link_exists(self) -> None:
+        payload = b"bind proof unwritable record " * 300
+        parts, paths = self._parts([payload])
+        job = self._emit(parts)
+        text = job.read_text(encoding="utf-8")
+        target = "(Join-Path $work 'owner-link-directory.json')"
+        self.assertEqual(text.count(target), 1)
+        job.write_text(text.replace(target, "'Z:\\no-such-directory\\record.json'"), encoding="utf-8")
+
+        proc = self._run(job)
+
+        self.assertEqual(proc.returncode, 22, f"{proc.stdout}\n{proc.stderr}")
+        self.assertIn("RESULT=OWNER_FOOTAGE_LINK_FAILED", proc.stdout)
+        self.assertEqual(os.stat(paths[0]).st_nlink, 1, "a link was made although its record could not be written")
+        self.assertEqual(paths[0].read_bytes(), payload)
+
+    def test_a_work_directory_that_already_exists_is_refused_and_left_untouched(self) -> None:
+        # r2: the proof's work directory is created create-new. The pre-r2 job took an existing one
+        # (New-Item -Force) and carried on into it; it is now refused and nothing in it is touched.
+        payload = b"bind proof existing work directory " * 300
+        parts, paths = self._parts([payload])
+        job = self._emit(parts)
+        job_id = job.name[: -len(".job.ps1")]
+        work = self.work_root / job_id
+        work.mkdir()
+        retained = work / ("owner-" + "clip" + ".saved")
+        os.link(paths[0], retained)
+
+        proc = self._run(job)
+
+        self.assertEqual(proc.returncode, 28, f"{proc.stdout}\n{proc.stderr}")
+        self.assertIn("RESULT=WORK_DIRECTORY_EXISTS", proc.stdout)
+        self.assertTrue(retained.exists(), "a name of owner footage was deleted")
+        self.assertEqual(os.stat(paths[0]).st_nlink, 2)
+        self.assertEqual(sorted(p.name for p in work.iterdir()), [retained.name])
+
 
 def _short_path(path: Path) -> str:
     """The 8.3 spelling of ``path`` (every segment that has an alias), or the path unchanged."""

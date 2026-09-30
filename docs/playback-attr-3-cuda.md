@@ -216,11 +216,22 @@ removed, not narrowed. The job closes its handles, removes a link directory only
 linkDirectory, relocated, leftover, linkNames}`, written before the first link exists, so a later sweep
 can find it even if the job is killed). Before creating a link the directory is re-proved to be the
 identity-pinned object the job created (volume serial + file id, read without following a reparse
-point). The job's one recursive delete, the pre-clean of its own `$Work`, is refused (exit 28,
-`OWNER_LINK_DIRECTORY_PRESENT`) when `$Work` already holds a private link directory.
+point). **No job deletes a directory tree** (r2): `$Work` is unique by construction (the job id carries a
+random component, so two jobs can never share it) and is created create-new, so the job has no pre-clean --
+an existing `$Work` is refused, untouched (exit 28, `WORK_DIRECTORY_EXISTS`; the bind proof's own work
+directory likewise). The empty `$Work\owner-clip` a relocated run leaves behind is moot for the same reason.
+The footage-staging job (`Attr3FootageStageJob.psm1`) does not delete by pathname anything in the owner's
+directory either: a published copy that fails its post-publication re-hash, and its own target-volume
+partial after a failed copy, verify or publish, are LEFT IN PLACE and named in a leftover record under
+`<AgentRoot>\footage-stage-leftovers\<job id>-part<n>-<kind>.json` (`mlvapp.owner-target-leftover.v1`;
+status `PLACED_VERIFY_FAILED_TARGET_RETAINED`, or `..._UNRECORDED` when the record could not be written).
+Disk cost: one staged copy (or partial) of the part per such failure, until a sweep resolves it. A sweep of
+any leftover (link directory or copy) must verify the object's identity with the owner present and must
+never open a leftover for write: each one is a name of the owner's clip.
 `tools/repo_hygiene/test_owner_footage_no_delete_class.py` is the static guard: any delete / rename /
-replace primitive reachable from the owner-footage module, the job or the bind-proof module that is
-not a named exception fails.
+replace / truncate primitive (including the `rm` `ri` `rd` `del` `erase` `rmdir` aliases and `Clear-Item`)
+reachable from the owner-footage module, the attribution job, the bind-proof module, the staging job and
+CLI, or the shared verifiers they embed, that is not a named, reasoned exception fails.
 `attr3-footage-presence-job.ps1 -BindProof -WorkRoot <dir>` emits a bounded job that runs exactly
 this link/hold/one-hash/binding path with no playback, for proving it on a venue. `-WorkRoot` is
 resolved to its long path before it is validated (an 8.3 alias such as `C:\Users\RUNNER~1\...` is
