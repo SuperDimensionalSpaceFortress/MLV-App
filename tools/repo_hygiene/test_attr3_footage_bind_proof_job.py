@@ -5,8 +5,11 @@ Every row uses SYNTHETIC parts written under a temp directory (a ``.raw`` stem p
 naming's own extension, composed, never the real clip), built through the module's function
 directly -- the real CLI's only path to parts is tools/gates/resolve_consented_clip.py. The emitted
 job is then RUN locally: it must link, hold, hash once, build the binding, prove the write block,
-release everything and leave the source with a single name, saying nothing that names a path.
-A second row proves the job refuses a part whose bytes differ from the baked length/sha256.
+release the handles and leave every owner part untouched, saying nothing that names an owner path.
+UM-OWNER-FOOTAGE-CROSS-VOLUME-2: the job deletes NO link name (a "read the link count, then delete"
+cleanup can remove the last name of the clip when the owner's source name is replaced between the
+two); the directory it leaves is reported in integrity.leftover. A row proves the job refuses a
+part whose bytes differ from the baked length/sha256, and one replaces the source name mid-job.
 """
 
 from __future__ import annotations
@@ -129,12 +132,23 @@ class FootageBindProofJobTests(_BindProofHarness):
         self.assertTrue(proof["linkOnSourceVolume"])
         self.assertTrue(proof["bindingMatches"])
         self.assertTrue(proof["writeBlockedWhileHeld"])
-        self.assertEqual(proof["sourceLinkCountAfterCleanup"], 1)
-        self.assertTrue(proof["workTreeRemoved"])
-        self.assertEqual(list(self.work_root.iterdir()), [])
+        self.assertTrue(proof["sourcesIntact"])
+        integrity = json.loads(payload_line)["integrity"]
+        self.assertTrue(integrity["sourcesIntact"])
+        # No name of the owner's footage was deleted: each part keeps its own name AND the job's
+        # private link, and the directory holding the links is recorded for a later sweep.
         for path, payload in zip(paths, payloads):
             self.assertEqual(path.read_bytes(), payload)
-            self.assertEqual(os.stat(path).st_nlink, 1)
+            self.assertEqual(os.stat(path).st_nlink, 2)
+        leftover = integrity["leftover"]
+        self.assertEqual(leftover["schema"], "mlvapp.owner-link-leftover.v1")
+        self.assertTrue(leftover["leftover"])
+        link_dir = Path(leftover["linkDirectory"])
+        self.assertTrue(link_dir.is_dir())
+        self.assertEqual(len(leftover["linkNames"]), 2)
+        for name, path in zip(leftover["linkNames"], paths):
+            self.assertTrue(os.path.samefile(link_dir / name, path))
+        self.assertTrue(integrity["workTreeLeftover"])
 
     def test_a_single_part_clip_is_proven_too(self) -> None:
         # The real clip is one part: a one-element result must not be indexed as a dictionary.
@@ -144,8 +158,8 @@ class FootageBindProofJobTests(_BindProofHarness):
 
         self.assertEqual(proc.returncode, 0, f"{proc.stdout}\n{proc.stderr}")
         self.assertIn("RESULT=OWNER_FOOTAGE_BIND_PROVEN", proc.stdout)
-        self.assertEqual(os.stat(paths[0]).st_nlink, 1)
-        self.assertEqual(list(self.work_root.iterdir()), [])
+        self.assertEqual(os.stat(paths[0]).st_nlink, 2)
+        self.assertEqual(paths[0].read_bytes(), payload)
 
     def test_a_part_whose_bytes_differ_is_refused_and_nothing_is_left_behind(self) -> None:
         payload = b"bind proof mismatch " * 300
@@ -157,8 +171,9 @@ class FootageBindProofJobTests(_BindProofHarness):
         self.assertEqual(proc.returncode, 19, f"{proc.stdout}\n{proc.stderr}")
         self.assertIn("RESULT=OWNER_FOOTAGE_NOT_VERIFIED", proc.stdout)
         self.assertNotIn(TOKEN, proc.stdout + proc.stderr)
-        self.assertEqual(list(self.work_root.iterdir()), [])
-        self.assertEqual(os.stat(paths[0]).st_nlink, 1)
+        # The owner's part is untouched; the link the job made before the hash refused it stays.
+        self.assertEqual(paths[0].read_bytes(), b"X" * len(payload))
+        self.assertEqual(os.stat(paths[0]).st_nlink, 2)
 
     def test_success_is_gated_on_every_reported_invariant(self) -> None:
         # sol r1 hardening: bindingMatches, hashReads and the cleanup fields are reported AND
@@ -171,9 +186,43 @@ class FootageBindProofJobTests(_BindProofHarness):
         ):
             self.assertIn(gate, text)
             self.assertLess(text.index(gate), success_at, gate)
-        cleanup_gate = "if ($exitCode -eq 0 -and ($linksAfter -ne 1 -or -not $workGone -or -not $linkDirGone))"
-        self.assertIn(cleanup_gate, text)
-        self.assertLess(text.index(cleanup_gate), text.index("$result = if ($exitCode -eq 0)"))
+        # UM-OWNER-FOOTAGE-CROSS-VOLUME-2: the gate is the real safety property -- every owner part
+        # STILL EXISTS under its own name with the identity it had before the job -- not whether a
+        # cleanup managed to delete the job's own links.
+        source_gate = "if ($exitCode -eq 0 -and -not $sourcesIntact) { $token = 'OWNER_FOOTAGE_BIND_SOURCE_NOT_INTACT'; $exitCode = 26 }"
+        self.assertIn(source_gate, text)
+        self.assertLess(text.index(source_gate), text.index("$result = if ($exitCode -eq 0)"))
+        self.assertNotIn("linkDirectoryRemoved", text)
+        self.assertNotIn("OWNER_FOOTAGE_BIND_CLEANUP_INCOMPLETE", text)
+
+    def test_replacing_the_owners_source_name_mid_job_loses_no_name_and_fails_the_proof(self) -> None:
+        # Item 4a at job level. A decoy is renamed over the owner's source name AFTER the links
+        # exist and the hash is done, before the job's finally runs (the NTFS premise of PR #200's
+        # own swap test). The job must delete nothing -- the original bytes keep the private link --
+        # and, because the owner's source name is no longer the file it was, must NOT say PROVEN.
+        payload = b"bind proof swap mid job " * 300
+        parts, paths = self._parts([payload])
+        decoy = self.tmp / "decoy.bin"
+        decoy_bytes = b"a different file that replaces the source name"
+        decoy.write_bytes(decoy_bytes)
+        job = self._emit(parts)
+        text = job.read_text(encoding="utf-8")
+        marker = "    $binding = New-AttrCudaVerifiedClipBinding"
+        self.assertEqual(text.count(marker), 1)
+        swap = f"    [IO.File]::Move('{decoy}', '{paths[0]}', $true)\r\n"
+        job.write_text(text.replace(marker, swap + marker), encoding="utf-8")
+
+        proc = self._run(job)
+
+        self.assertEqual(proc.returncode, 26, f"{proc.stdout}\n{proc.stderr}")
+        self.assertIn("RESULT=OWNER_FOOTAGE_BIND_SOURCE_NOT_INTACT", proc.stdout)
+        self.assertEqual(paths[0].read_bytes(), decoy_bytes)
+        result = json.loads(next(l for l in proc.stdout.splitlines() if "mlvapp.attr3-footage-bind-proof.v1" in l))
+        self.assertFalse(result["integrity"]["sourcesIntact"])
+        link_dir = Path(result["integrity"]["leftover"]["linkDirectory"])
+        survivors = [p for p in link_dir.iterdir()]
+        self.assertEqual(len(survivors), 1)
+        self.assertEqual(survivors[0].read_bytes(), payload)  # the last name of the original bytes
 
 
 def _short_path(path: Path) -> str:
@@ -209,7 +258,9 @@ class FootageBindProofWorkRootTests(_BindProofHarness):
         self.assertNotIn("~", literal)
         self.assertEqual(os.path.normcase(literal), os.path.normcase(os.path.realpath(self.work_root)))
         self.assertEqual(self._run(job).returncode, 0)
-        self.assertEqual(list(self.work_root.iterdir()), [])
+        # The job ran under the resolved root; its work tree stays (it holds the job's trace and
+        # the private link directory -- no job deletes a link name).
+        self.assertEqual(len(list(self.work_root.iterdir())), 1)
 
     def test_a_not_yet_existing_directory_under_a_short_ancestor_is_accepted(self) -> None:
         short = _short_path(self.work_root)

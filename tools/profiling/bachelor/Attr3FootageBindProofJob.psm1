@@ -9,8 +9,12 @@
 # work tree is elsewhere), one hard link per part with its same-file-object proof, a read-share
 # handle held on each link, and the ONE full identity hash per part through that handle. It then
 # builds the verified binding the runner would receive, proves a write-open of the link is refused,
-# releases everything, and proves the owner's part has one name again. It launches nothing, plays
-# nothing and copies nothing; its whole stdout is path-free tokens and volume serials.
+# releases the held handles, and proves every owner part is STILL THERE, the same file object with
+# the same length. It launches nothing, plays nothing and copies nothing, and it DELETES NO NAME
+# OF THE OWNER'S FOOTAGE (UM-OWNER-FOOTAGE-CROSS-VOLUME-2): the private link names it created are
+# left where they are and reported (integrity.leftover) so a later sweep can find them. Its whole
+# stdout is path-free tokens, volume serials and the job-private link directory -- never an owner
+# path.
 #
 # WHY -WorkRoot. The defect this proves fixed only exists when the work tree and the clip are on
 # different volumes (Ultra-Magnus: the agent share and scratch are on G:, the clip under proof is
@@ -110,8 +114,8 @@ function New-Attr3FootageBindProofJob {
     23 OWNER_FOOTAGE_BIND_NOT_PINNED (the held link accepted a write-open), 24
     OWNER_FOOTAGE_BIND_MISMATCH (the binding differs from the verified parts), 25
     OWNER_FOOTAGE_BIND_HASH_READS (not exactly one full read per part), 26
-    OWNER_FOOTAGE_BIND_CLEANUP_INCOMPLETE (the source's link count, the work tree or the link
-    directory was not restored), 4 anything else.
+    OWNER_FOOTAGE_BIND_SOURCE_NOT_INTACT (an owner part is missing after the job, or is no longer
+    the same file object with the same length), 4 anything else.
     #>
     [CmdletBinding()]
     param(
@@ -160,14 +164,13 @@ function New-Attr3FootageBindProofJob {
         'Get-AttrCudaOwnerFootageNeutralName', 'Assert-AttrCudaOwnerPartsNaming', 'Get-AttrCudaFileIdentity',
         'New-AttrCudaOwnerFootageLink', 'Open-AttrCudaReadOnlyHandle', 'New-AttrCudaVerifiedClipBinding',
         'Close-AttrCudaOwnerFootageWorkspace', 'Resolve-AttrCudaOwnerFootageDirectory',
-        'Remove-AttrCudaOwnerFootageRelocatedDirectory',
-        # UM-OWNER-FOOTAGE-CROSS-VOLUME-1 round 2: the directory pin and the by-handle link delete.
+        'Remove-AttrCudaEmptyOwnerFootageDirectory', 'Get-AttrCudaOwnerFootageLeftoverRecord',
+        # UM-OWNER-FOOTAGE-CROSS-VOLUME-1 round 2: the directory pin (no delete primitive).
         'Initialize-AttrCudaPinNativeMethods', 'Get-AttrCudaNoFollowIdentity',
         'Test-AttrCudaPathAncestorsHaveNoReparsePoint', 'Get-AttrCudaOwnerFootagePinTable',
         'Get-AttrCudaOwnerFootagePinKey', 'Get-AttrCudaOwnerFootageDirectoryPin',
         'Register-AttrCudaOwnerFootageDirectoryPin', 'Register-AttrCudaOwnerFootageDirectoryPinBestEffort',
-        'Test-AttrCudaOwnerFootageDirectoryPin', 'Remove-AttrCudaOwnerFootageLinkName',
-        'Remove-AttrCudaOwnerFootageRecordedLinks'))
+        'Test-AttrCudaOwnerFootageDirectoryPin'))
 
     $template = @'
 $ErrorActionPreference = 'Stop'
@@ -193,6 +196,8 @@ $preferred = $null
 $linkDir = $null
 $relocated = $false
 $firstSource = $null
+$sourceBefore = @()
+$leftover = $null
 $token = $null
 $exitCode = 4
 $proof = $null
@@ -211,6 +216,12 @@ try {
     # @() matters: a single-part clip comes back as one bare dictionary, and [0] on that indexes by position.
     try { $asserted = @(Assert-AttrCudaOwnerPartsNaming -Parts $decodedParts) } catch { $token = 'OWNER_PARTS_NOT_CONTIGUOUS'; $exitCode = 20; throw $token }
     $firstSource = $asserted[0].path
+    # The safety property of this proof: what each owner part IS before anything is linked, so the
+    # end of the job can prove every one is still there, the same file object, the same length.
+    $sourceBefore = @($asserted | ForEach-Object {
+        $before = Get-AttrCudaFileIdentity -Path $_.path
+        [ordered]@{ path = $_.path; volume = $before.VolumeSerialNumber; high = $before.FileIndexHigh; low = $before.FileIndexLow; length = ([IO.FileInfo]::new($_.path)).Length }
+    })
 
     $work = Join-Path $WorkRoot $JobId
     [void](New-Item -ItemType Directory -Path $work -Force)
@@ -220,6 +231,7 @@ try {
 
     $linkDir = Resolve-AttrCudaOwnerFootageDirectory -PreferredDirectory $preferred -SourcePath @($asserted | ForEach-Object { $_.path })
     $relocated = ($linkDir -ne $preferred)
+    $leftover = Get-AttrCudaOwnerFootageLeftoverRecord -Directory $linkDir -Relocated $relocated -LinkName @($asserted | ForEach-Object { Get-AttrCudaOwnerFootageNeutralName -Index $_.index })
     $linkVolume = (Get-AttrCudaFileIdentity -Path $linkDir).VolumeSerialNumber
     Say "link directory relocated=$relocated workVolume=$workVolume sourceVolume=$sourceVolume linkVolume=$linkVolume"
 
@@ -289,26 +301,36 @@ try {
         else { $token = 'OWNER_FOOTAGE_BIND_JOB_ERROR'; $exitCode = 4 }
     }
 } finally {
+    # UM-OWNER-FOOTAGE-CROSS-VOLUME-2: handles are released and NOTHING is deleted that could be a
+    # name of the owner's footage. The link names stay (recorded in $leftover); the only removals
+    # are of directories that are EMPTY, by a non-recursive delete the OS itself refuses otherwise.
     if ($linkDir) {
         Close-AttrCudaOwnerFootageWorkspace -Handles $handles -Directory $linkDir 3>$null
-        if ($relocated) { Remove-AttrCudaOwnerFootageRelocatedDirectory -Directory $linkDir 3>$null }
+        [void](Remove-AttrCudaEmptyOwnerFootageDirectory -Directory $linkDir 3>$null)
     }
-    try {
-        if ($work -and (Test-Path -LiteralPath (Join-Path $work 'trace.txt'))) { Remove-Item -LiteralPath (Join-Path $work 'trace.txt') -Force -ErrorAction Stop }
-        if ($preferred) { [IO.Directory]::Delete($preferred, $false) }
-        if ($work) { [IO.Directory]::Delete($work, $false) }
-    } catch { }
+    if ($preferred -and $preferred -ne $linkDir) { [void](Remove-AttrCudaEmptyOwnerFootageDirectory -Directory $preferred 3>$null) }
 }
 
 $linksAfter = 'unknown'
 if ($firstSource) { try { $linksAfter = (Get-AttrCudaFileIdentity -Path $firstSource).NumberOfLinks } catch { } }
-$workGone = if ($work) { -not (Test-Path -LiteralPath $work) } else { $true }
-$linkDirGone = if ($linkDir) { -not (Test-Path -LiteralPath $linkDir) } else { $true }
-if ($exitCode -eq 0 -and ($linksAfter -ne 1 -or -not $workGone -or -not $linkDirGone)) { $token = 'OWNER_FOOTAGE_BIND_CLEANUP_INCOMPLETE'; $exitCode = 26 }
+# The real safety property: every owner part still exists under its own name, is the very file
+# object it was before the job, and has the same length.
+$sourcesIntact = $true
+foreach ($before in $sourceBefore) {
+    try {
+        $now = Get-AttrCudaFileIdentity -Path $before.path
+        if ($now.VolumeSerialNumber -ne $before.volume -or $now.FileIndexHigh -ne $before.high -or $now.FileIndexLow -ne $before.low -or ([IO.FileInfo]::new($before.path)).Length -ne $before.length) { $sourcesIntact = $false }
+    } catch { $sourcesIntact = $false }
+}
+$workTreeLeft = if ($work) { Test-Path -LiteralPath $work } else { $false }
+$linkDirLeft = if ($linkDir) { Test-Path -LiteralPath $linkDir } else { $false }
+if ($leftover) { $leftover['leftover'] = $linkDirLeft }
+$integrity = [ordered]@{ sourcesIntact = $sourcesIntact; sourceLinkCountAfter = $linksAfter; workTreeLeftover = $workTreeLeft; leftover = $leftover }
+if ($exitCode -eq 0 -and -not $sourcesIntact) { $token = 'OWNER_FOOTAGE_BIND_SOURCE_NOT_INTACT'; $exitCode = 26 }
 $result = if ($exitCode -eq 0) { 'OWNER_FOOTAGE_BIND_PROVEN' } else { $token }
-if ($proof) { $proof['sourceLinkCountAfterCleanup'] = $linksAfter; $proof['workTreeRemoved'] = $workGone; $proof['linkDirectoryRemoved'] = $linkDirGone }
+if ($proof) { $proof['sourcesIntact'] = $sourcesIntact }
 Write-Output "RESULT=$result CLIP=$ClipId"
-Write-Output (([ordered]@{ schema = 'mlvapp.attr3-footage-bind-proof.v1'; jobId = $JobId; clipId = $ClipId; result = $result; exitCode = $exitCode; proof = $proof }) | ConvertTo-Json -Compress -Depth 5)
+Write-Output (([ordered]@{ schema = 'mlvapp.attr3-footage-bind-proof.v1'; jobId = $JobId; clipId = $ClipId; result = $result; exitCode = $exitCode; proof = $proof; integrity = $integrity }) | ConvertTo-Json -Compress -Depth 6)
 exit $exitCode
 '@
 

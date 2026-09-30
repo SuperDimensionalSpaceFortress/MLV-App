@@ -2069,276 +2069,323 @@ class OwnerFootagePrivateDirectoryLeakAndRefusalTests(_PwshCase):
         # ... and the link still serves exactly the bytes that were hashed.
         self.assertIn(f"LINK_SHA={hashlib.sha256(payload).hexdigest()}", proc.stdout)
 
-    def test_relocated_directory_cleanup_removes_its_own_links_and_leaves_every_other_file_in_place(self) -> None:
-        # UM-OWNER-FOOTAGE-CROSS-VOLUME-1 round 2: the cleanup deletes only the link names this
-        # job created (each with a second name still alive) and NEVER a file with a single link --
-        # so a file the app wrote there (a sidecar) is left in place, and with it the directory.
-        # A leftover directory is acceptable; a deleted sole name is not.
-        payload = b"relocated cleanup bytes " * 40
-        part_path, part = self._one_part("owner-cleanup", payload)
-        pub = self.tmp / "agent" / "outbox" / "owner-cleanup.artifacts"
-        work = self.tmp / "work"
-        relocated_parent = self.tmp / "on-the-clip-volume"
-        tail = (
-            "$dir = Split-Path -Parent $clipPath\n"
-            "Set-Content -LiteralPath (Join-Path $dir 'app-sidecar.txt') -Value 'written by the app'\n"
-            "Close-AttrCudaOwnerFootageWorkspace -Handles $ownerLinkHandles -Directory $dir\n"
-            "Remove-AttrCudaOwnerFootageRelocatedDirectory -Directory $dir 3>$null\n"
-            "Write-Output ('DIR_EXISTS=' + (Test-Path -LiteralPath $dir))\n"
-            "Write-Output ('LINK_EXISTS=' + (Test-Path -LiteralPath $clipPath))\n"
-            "Write-Output ('SIDECAR_EXISTS=' + (Test-Path -LiteralPath (Join-Path $dir 'app-sidecar.txt')))\n"
-        )
-
-        proc = self._run_owner_content_check(
-            parts=[part], pub=pub, work=work,
-            preamble=self._simulated_second_volume_preamble(work=work, relocated_parent=relocated_parent),
-            tail=tail,
-        )
-
-        self.assertEqual(proc.returncode, 0, f"{proc.stdout}\n{proc.stderr}")
-        self.assertIn("DIR_EXISTS=True", proc.stdout)
-        self.assertIn("LINK_EXISTS=False", proc.stdout)
-        self.assertIn("SIDECAR_EXISTS=True", proc.stdout)
-        self.assertEqual(part_path.read_bytes(), payload)
-        self.assertEqual(os.stat(part_path).st_nlink, 1)
-
-    def test_relocated_directory_cleanup_leaves_the_last_name_of_the_owners_bytes_in_place(self) -> None:
-        # Close leaves a neutral-name entry whose live link count is 1 (the owner's other name is
-        # gone) -- the relocated-directory cleanup must not delete that either, nor the directory.
-        directory = self.tmp / "relocated-last-name"
-        directory.mkdir()
-        last_name = directory / ("owner-" + "clip" + "." + "MLV")
-        last_name.write_bytes(b"the only name left of these bytes")
-        script = self.tmp / "relocated-last-name-probe.ps1"
-        script.write_text(
-            "$ErrorActionPreference = 'Stop'\n"
-            f"Import-Module '{MODULE}' -Force\n"
-            f"Import-Module '{OWNER_FOOTAGE_MODULE}' -Force\n"
-            f"Remove-AttrCudaOwnerFootageRelocatedDirectory -Directory '{directory}' 3>$null\n",
-            encoding="utf-8",
-        )
-        proc = _run_pwsh_file(script)
-        self.assertEqual(proc.returncode, 0, f"{proc.stdout}\n{proc.stderr}")
-        self.assertEqual(last_name.read_bytes(), b"the only name left of these bytes")
-
-    # ---- UM-OWNER-FOOTAGE-CROSS-VOLUME-1 round 2 (sol r1 blocker): cleanup must not follow a swap ----
-    # Every case below uses a SYNTHETIC owner folder under this test's own temp tree, never real
-    # footage. The job block creates the link(s) and the directory pin exactly as a real run does,
-    # then the tail plays the substitution and runs the cleanup in the SAME pwsh process (the pin
-    # lives in that process).
+    # ---- UM-OWNER-FOOTAGE-CROSS-VOLUME-2: no job deletes a name of owner footage --------------------
+    # PR #200 cleaned up by reading NumberOfLinks and then deleting a link name. Windows has no
+    # atomic "delete this name only if another name of the file remains", and the owner's source
+    # name stays replaceable while our handle on the link is held (the swap test above), so the
+    # delete could remove the LAST name of the owner's clip (sol r2). The cleanup is REMOVED, not
+    # narrowed. Every case below uses a SYNTHETIC owner folder under this test's own temp tree.
 
     _VICTIM_NAME = "victim" + "." + "MLV"
 
-    def _relocated_run(self, name: str, tail: str, *, payload: bytes = b"owner footage sole name bytes " * 40):
+    # The job's own outer-`finally` owner cleanup, taken verbatim from the generator so the test
+    # runs whatever the job runs (the block reads $OwnerClipDir / $ownerLinkHandles /
+    # $OwnerClipRelocated, which the extracted owner block has already set).
+    def _job_owner_cleanup(self) -> str:
+        text = ATTRIBUTION_GENERATOR.read_text(encoding="utf-8")
+        start = text.rindex("    if ($OwnerClipDir) {")
+        end = text.index("    # CUDA-PERF-DISPLAY-WAKE-2: stop the periodic keep-alive first", start)
+        return text[start:end]
+
+    # A stand-in for the two Win32 calls the pre-fix cleanup made on a link name, with a hook that
+    # fires right after the link count was READ as 2 -- the exact interleaving sol r2 described:
+    # the owner's source name is replaced by a decoy between the count and the delete. Defining the
+    # type first makes the module use it (Initialize-AttrCudaPinNativeMethods returns early when
+    # the type exists); the fixed code never calls SetFileInformationByHandle at all.
+    _INTERPOSER = (
+        "Add-Type -TypeDefinition @'\n"
+        "using System;\n"
+        "using System.Runtime.InteropServices;\n"
+        "namespace AttrCudaWin32 {\n"
+        "  public static class PinNativeMethods {\n"
+        "    [StructLayout(LayoutKind.Sequential)]\n"
+        "    public struct PinIdentity {\n"
+        "      public uint FileAttributes; public uint CreationTimeLow; public uint CreationTimeHigh;\n"
+        "      public uint LastAccessTimeLow; public uint LastAccessTimeHigh; public uint LastWriteTimeLow;\n"
+        "      public uint LastWriteTimeHigh; public uint VolumeSerialNumber; public uint FileSizeHigh;\n"
+        "      public uint FileSizeLow; public uint NumberOfLinks; public uint FileIndexHigh; public uint FileIndexLow;\n"
+        "    }\n"
+        "    [DllImport(\"kernel32.dll\", SetLastError = true, CharSet = CharSet.Unicode)]\n"
+        "    public static extern IntPtr CreateFileW(string lpFileName, uint dwDesiredAccess, uint dwShareMode, IntPtr lpSecurityAttributes, uint dwCreationDisposition, uint dwFlagsAndAttributes, IntPtr hTemplateFile);\n"
+        "    [DllImport(\"kernel32.dll\", SetLastError = true, EntryPoint = \"GetFileInformationByHandle\")]\n"
+        "    private static extern bool QueryNative(IntPtr hFile, out PinIdentity info);\n"
+        "    public static bool GetFileInformationByHandle(IntPtr hFile, out PinIdentity info) {\n"
+        "      bool ok = QueryNative(hFile, out info);\n"
+        "      if (ok && Armed && (info.FileAttributes & 0x10) == 0 && info.NumberOfLinks == 2 && AfterPlainFileQuery != null) {\n"
+        "        Armed = false; Fired = true; AfterPlainFileQuery();\n"
+        "      }\n"
+        "      return ok;\n"
+        "    }\n"
+        "    [DllImport(\"kernel32.dll\", SetLastError = true)]\n"
+        "    public static extern bool SetFileInformationByHandle(IntPtr hFile, int fileInformationClass, ref byte lpFileInformation, uint dwBufferSize);\n"
+        "    [DllImport(\"kernel32.dll\", SetLastError = true)]\n"
+        "    public static extern bool CloseHandle(IntPtr hObject);\n"
+        "    public static bool Armed;\n"
+        "    public static bool Fired;\n"
+        "    public static Action AfterPlainFileQuery;\n"
+        "  }\n"
+        "}\n"
+        "'@\n"
+    )
+
+    def _relocated_run(self, name: str, tail: str, *, payload: bytes = b"owner footage sole name bytes " * 40, preamble_extra: str = ""):
         part_path, part = self._one_part(name, payload)
         pub = self.tmp / "agent" / "outbox" / f"{name}.artifacts"
         work = self.tmp / "work"
         relocated_parent = self.tmp / "on-the-clip-volume"
         proc = self._run_owner_content_check(
             parts=[part], pub=pub, work=work,
-            preamble=self._simulated_second_volume_preamble(work=work, relocated_parent=relocated_parent),
+            preamble=preamble_extra + self._simulated_second_volume_preamble(work=work, relocated_parent=relocated_parent),
             tail=tail,
         )
         return proc, part_path, payload, relocated_parent, work
 
-    _DISPOSE_HANDLES = "foreach ($h in $ownerLinkHandles) { $h.Dispose() }\n"
+    def _same_volume_run(self, name: str, tail: str, *, payload: bytes = b"owner footage sole name bytes " * 40, preamble_extra: str = ""):
+        part_path, part = self._one_part(name, payload)
+        pub = self.tmp / "agent" / "outbox" / f"{name}.artifacts"
+        work = self.tmp / "work"
+        proc = self._run_owner_content_check(parts=[part], pub=pub, work=work, preamble=preamble_extra, tail=tail)
+        return proc, part_path, payload, pub, work
 
-    def test_a_directory_junction_substituted_for_the_relocated_directory_never_deletes_the_owners_sole_name(self) -> None:
-        # sol r1 blocker, exact repro. The link is removed by Close (handles released), the now
-        # empty relocated directory is replaced by a junction to the owner's folder, and the
-        # cleanup runs: the entry there has ONE link, so the old per-entry check deleted the sole
-        # name of the clip. The fix refuses the directory and leaves the owner's folder alone.
-        owner_dir = self.tmp / "owner-real-folder-source"
+    def _source_swap_tail(self, part_path: Path, decoy: Path) -> str:
+        return (
+            f"$global:Src = '{part_path}'\n"
+            f"$global:Decoy = '{decoy}'\n"
+            "$global:LinkPath = $clipPath\n"
+            "[AttrCudaWin32.PinNativeMethods]::AfterPlainFileQuery = [Action]{ [IO.File]::Move($global:Decoy, $global:Src, $true) }\n"
+            "[AttrCudaWin32.PinNativeMethods]::Armed = $true\n"
+            + self._job_owner_cleanup() +
+            "Write-Output ('INTERLEAVED=' + [AttrCudaWin32.PinNativeMethods]::Fired)\n"
+            # Where the (fixed) cleanup no longer reads a link count, the replacement still happens,
+            # after it: the invariant below must hold for either order.
+            "if (-not [AttrCudaWin32.PinNativeMethods]::Fired) { [IO.File]::Move($global:Decoy, $global:Src, $true) }\n"
+            "Write-Output ('LINK_LEFT=' + (Test-Path -LiteralPath $global:LinkPath))\n"
+            "if (Test-Path -LiteralPath $global:LinkPath) { Write-Output ('LINK_SHA=' + (Get-FileHash -LiteralPath $global:LinkPath -Algorithm SHA256).Hash.ToLowerInvariant()) }\n"
+        )
+
+    def _assert_original_bytes_keep_a_name(self, proc, payload: bytes, part_path: Path, decoy_bytes: bytes) -> None:
+        self.assertEqual(proc.returncode, 0, f"{proc.stdout}\n{proc.stderr}")
+        # The owner's source name now serves the decoy ...
+        self.assertEqual(part_path.read_bytes(), decoy_bytes)
+        # ... and the ORIGINAL file still has a name: the private link. Deleting it (as PR #200's
+        # cleanup did in this interleaving) would leave the original bytes with none.
+        self.assertIn("LINK_LEFT=True", proc.stdout, f"the last name of the original bytes was deleted\n{proc.stdout}")
+        self.assertIn(f"LINK_SHA={hashlib.sha256(payload).hexdigest()}", proc.stdout)
+
+    def test_sol_r2_source_name_replaced_between_the_link_count_read_and_the_delete_loses_no_name_relocated(self) -> None:
+        decoy_bytes = b"a different file that replaces the owner's source name"
+        decoy = self.tmp / "decoy.bin"
+        decoy.write_bytes(decoy_bytes)
+        payload = b"original bytes that must keep a name " * 40
+        # _one_part is called inside _relocated_run, so the source path is derived first.
+        source = self.tmp / "owner-swap-race-relocated-source" / ("source" + "." + "MLV")
+        proc, part_path, _, _, _ = self._relocated_run(
+            "owner-swap-race-relocated", self._source_swap_tail(source, decoy), payload=payload,
+            preamble_extra=self._INTERPOSER)
+        self.assertEqual(part_path, source)
+        self._assert_original_bytes_keep_a_name(proc, payload, part_path, decoy_bytes)
+
+    def test_sol_r2_source_name_replaced_between_the_link_count_read_and_the_delete_loses_no_name_same_volume(self) -> None:
+        decoy_bytes = b"a different file that replaces the owner's source name"
+        decoy = self.tmp / "decoy.bin"
+        decoy.write_bytes(decoy_bytes)
+        payload = b"original bytes that must keep a name " * 40
+        source = self.tmp / "owner-swap-race-same-source" / ("source" + "." + "MLV")
+        proc, part_path, _, _, _ = self._same_volume_run(
+            "owner-swap-race-same", self._source_swap_tail(source, decoy), payload=payload,
+            preamble_extra=self._INTERPOSER)
+        self.assertEqual(part_path, source)
+        self._assert_original_bytes_keep_a_name(proc, payload, part_path, decoy_bytes)
+
+    def test_the_jobs_cleanup_leaves_every_name_and_records_the_link_directory_relocated(self) -> None:
+        # Item 4c (extracted-block form): the job's own finally, run on a synthetic owner folder,
+        # touches no name and no byte of the owner's, leaves the link, and the directory that
+        # holds it is recorded in the artifact directory for a later sweep.
         tail = (
             "$dir = Split-Path -Parent $clipPath\n"
-            "Close-AttrCudaOwnerFootageWorkspace -Handles $ownerLinkHandles -Directory $dir 3>$null\n"
+            + self._job_owner_cleanup() +
+            "Write-Output ('DIR_EXISTS=' + (Test-Path -LiteralPath $dir))\n"
+            "Write-Output ('LINK_EXISTS=' + (Test-Path -LiteralPath $clipPath))\n"
+            "Write-Output ('DIRECTORY=' + $dir)\n"
+        )
+        proc, part_path, payload, relocated_parent, _ = self._relocated_run("owner-leftover-relocated", tail)
+        self.assertEqual(proc.returncode, 0, f"{proc.stdout}\n{proc.stderr}")
+        self.assertIn("DIR_EXISTS=True", proc.stdout)
+        self.assertIn("LINK_EXISTS=True", proc.stdout)
+        self.assertEqual(part_path.read_bytes(), payload)
+        self.assertEqual(os.stat(part_path).st_nlink, 2)  # the owner's name + the job's leftover link
+        link_dir = Path(next(l for l in proc.stdout.splitlines() if l.startswith("DIRECTORY="))[len("DIRECTORY="):])
+        self.assertEqual(link_dir.parent, relocated_parent)
+        self.assertTrue(os.path.samefile(link_dir / ("owner-" + "clip" + "." + "MLV"), part_path))
+        record = json.loads((self.tmp / "agent" / "outbox" / "owner-leftover-relocated.artifacts" / "owner-link-directory.json").read_text(encoding="utf-8"))
+        self.assertEqual(record["schema"], "mlvapp.owner-link-leftover.v1")
+        self.assertEqual(os.path.normcase(record["linkDirectory"]), os.path.normcase(str(link_dir)))
+        self.assertTrue(record["relocated"])
+        self.assertTrue(record["leftover"])
+        self.assertEqual(record["linkNames"], ["owner-" + "clip" + "." + "MLV"])
+        self.assertNotIn(str(part_path.parent), json.dumps(record))
+
+    def test_the_jobs_cleanup_leaves_every_name_and_records_the_link_directory_same_volume(self) -> None:
+        tail = (
+            "$dir = Split-Path -Parent $clipPath\n"
+            + self._job_owner_cleanup() +
+            "Write-Output ('LINK_EXISTS=' + (Test-Path -LiteralPath $clipPath))\n"
+        )
+        proc, part_path, payload, pub, work = self._same_volume_run("owner-leftover-same", tail)
+        self.assertEqual(proc.returncode, 0, f"{proc.stdout}\n{proc.stderr}")
+        self.assertIn("LINK_EXISTS=True", proc.stdout)
+        self.assertEqual(part_path.read_bytes(), payload)
+        self.assertEqual(os.stat(part_path).st_nlink, 2)
+        record = json.loads((pub / "owner-link-directory.json").read_text(encoding="utf-8"))
+        self.assertEqual(os.path.normcase(record["linkDirectory"]), os.path.normcase(str(work / ("owner-" + "clip"))))
+        self.assertFalse(record["relocated"])
+        self.assertTrue(record["leftover"])
+
+    def test_a_sidecar_and_the_link_both_stay_when_the_job_ends(self) -> None:
+        tail = (
+            "$dir = Split-Path -Parent $clipPath\n"
+            "Set-Content -LiteralPath (Join-Path $dir 'app-sidecar.txt') -Value 'written by the app'\n"
+            + self._job_owner_cleanup() +
+            "Write-Output ('LINK_EXISTS=' + (Test-Path -LiteralPath $clipPath))\n"
+            "Write-Output ('SIDECAR_EXISTS=' + (Test-Path -LiteralPath (Join-Path $dir 'app-sidecar.txt')))\n"
+        )
+        proc, part_path, payload, _, _ = self._relocated_run("owner-sidecar", tail)
+        self.assertEqual(proc.returncode, 0, f"{proc.stdout}\n{proc.stderr}")
+        self.assertIn("LINK_EXISTS=True", proc.stdout)
+        self.assertIn("SIDECAR_EXISTS=True", proc.stdout)
+        self.assertEqual(part_path.read_bytes(), payload)
+
+    def test_the_only_recursive_delete_in_the_job_refuses_a_work_tree_holding_a_link_directory(self) -> None:
+        # The job's own pre-clean (Remove-AttrCudaTree on $Work) is a recursive delete; a $Work
+        # that already holds a private link directory of an earlier attempt must be REFUSED, not
+        # emptied, because that directory holds link names of owner footage.
+        text = ATTRIBUTION_GENERATOR.read_text(encoding="utf-8")
+        start = text.index("if (Test-Path -LiteralPath (Join-Path $Work 'owner-clip')) {")
+        end = text.index("Remove-AttrCudaTree -TrustedRoot 'C:\\mlvtmp' -Path $Work", start)
+        guard = text[start:end]
+        source_dir = self.tmp / "guard-owner-source"
+        source_dir.mkdir()
+        source = source_dir / ("source" + "." + "MLV")
+        source.write_bytes(b"guard bytes")
+        work = self.tmp / "guard-work"
+        link_dir = work / ("owner-" + "clip")
+        link_dir.mkdir(parents=True)
+        link = link_dir / ("owner-" + "clip" + "." + "MLV")
+        os.link(source, link)
+        (self.tmp / "guard-root").mkdir()
+        pub = self.tmp / "guard-pub"
+        script = self.tmp / "guard-probe.ps1"
+        script.write_text(
+            "$ErrorActionPreference = 'Stop'\n"
+            f"Import-Module '{MODULE}' -Force\n"
+            f"Import-Module '{OWNER_FOOTAGE_MODULE}' -Force\n"
+            f"$Work = '{work}'\n"
+            f"$Root = '{self.tmp / 'guard-root'}'\n"
+            f"$Pub = '{pub}'\n"
+            "$FixtureRehearsal = $false\n"
+            "$displayWake = @{}\n"
+            f"$SourceCommit = '{'d' * 40}'\n"
+            "$ClipId = 'FIX-GUARD-0001'\n"
+            "function Save-Json($Object, [string]$Path) { [void](Publish-AttrCudaText -Path $Path -Value ($Object | ConvertTo-Json -Depth 30)) }\n"
+            + guard +
+            "Write-Output 'FELL_THROUGH'\n",
+            encoding="utf-8",
+        )
+        proc = _run_pwsh_file(script)
+        self.assertEqual(proc.returncode, 28, f"{proc.stdout}\n{proc.stderr}")
+        self.assertIn("RESULT=OWNER_LINK_DIRECTORY_PRESENT", proc.stdout)
+        self.assertNotIn("FELL_THROUGH", proc.stdout)
+        self.assertTrue(link.exists())
+        self.assertEqual(os.stat(source).st_nlink, 2)
+        # And a $Work with no such directory falls straight through to the (guarded) delete.
+        os.unlink(link)
+        link_dir.rmdir()
+        proc = _run_pwsh_file(script)
+        self.assertEqual(proc.returncode, 0, f"{proc.stdout}\n{proc.stderr}")
+        self.assertIn("FELL_THROUGH", proc.stdout)
+
+    # ---- the empty-only directory remover: the one delete left, and why it cannot cost a name -----
+
+    def _empty_remover_probe(self, name: str, body: str, *, source_bytes: bytes = b"owner bytes for the empty-remover probe"):
+        source_dir = self.tmp / f"{name}-source"
+        source_dir.mkdir()
+        source = source_dir / ("source" + "." + "MLV")
+        source.write_bytes(source_bytes)
+        pinned = self.tmp / f"{name}-link-directory"
+        pinned.mkdir()
+        script = self.tmp / f"{name}-probe.ps1"
+        script.write_text(
+            "$ErrorActionPreference = 'Stop'\n"
+            f"Import-Module '{MODULE}' -Force\n"
+            f"Import-Module '{OWNER_FOOTAGE_MODULE}' -Force\n"
+            f"$source = '{source}'\n"
+            f"$dir = '{pinned}'\n"
+            "[void](Resolve-AttrCudaOwnerFootageDirectory -PreferredDirectory $dir -SourcePath @($source))\n"
+            + body,
+            encoding="utf-8",
+        )
+        return _run_pwsh_file(script), source, pinned, source_bytes
+
+    def test_an_empty_pinned_directory_is_removed(self) -> None:
+        proc, source, pinned, _ = self._empty_remover_probe(
+            "empty-remove", "Write-Output ('STATUS=' + (Remove-AttrCudaEmptyOwnerFootageDirectory -Directory $dir))\n")
+        self.assertEqual(proc.returncode, 0, f"{proc.stdout}\n{proc.stderr}")
+        self.assertIn("STATUS=REMOVED", proc.stdout)
+        self.assertFalse(pinned.exists())
+
+    def test_a_directory_holding_a_link_name_is_never_removed_or_emptied(self) -> None:
+        body = (
+            "[void](New-AttrCudaOwnerFootageLink -Directory $dir -Index 0 -SourcePath $source)\n"
+            "Write-Output ('STATUS=' + (Remove-AttrCudaEmptyOwnerFootageDirectory -Directory $dir))\n"
+        )
+        proc, source, pinned, source_bytes = self._empty_remover_probe("nonempty-keep", body)
+        self.assertEqual(proc.returncode, 0, f"{proc.stdout}\n{proc.stderr}")
+        self.assertIn("STATUS=NOT_EMPTY", proc.stdout)
+        self.assertTrue((pinned / ("owner-" + "clip" + "." + "MLV")).exists())
+        self.assertEqual(source.read_bytes(), source_bytes)
+        self.assertEqual(os.stat(source).st_nlink, 2)
+
+    def test_a_junction_substituted_for_the_directory_is_refused_and_the_owner_folder_is_untouched(self) -> None:
+        owner_dir = self.tmp / "owner-real-folder-for-junction"
+        owner_dir.mkdir()
+        (owner_dir / ("victim" + "." + "MLV")).write_bytes(b"the sole name of these bytes")
+        body = (
             "[IO.Directory]::Delete($dir, $false)\n"
             f"[void](New-Item -ItemType Junction -Path $dir -Target '{owner_dir}')\n"
-            "$out = Remove-AttrCudaOwnerFootageRelocatedDirectory -Directory $dir 3>&1\n"
-            "Write-Output ('CLEANUP_OUTPUT=' + (($out | Out-String) -replace '\\s+', ' ').Trim())\n"
+            "Write-Output ('STATUS=' + (Remove-AttrCudaEmptyOwnerFootageDirectory -Directory $dir 3>$null))\n"
             "try { [IO.Directory]::Delete($dir, $false) } catch { }\n"
         )
-        # _one_part names its source folder '<name>-source'.
-        proc, part_path, payload, _, _ = self._relocated_run("owner-real-folder", tail)
+        proc, _, _, _ = self._empty_remover_probe("junction-refuse", body)
         self.assertEqual(proc.returncode, 0, f"{proc.stdout}\n{proc.stderr}")
-        self.assertEqual(part_path.parent, owner_dir)
-        self.assertTrue(part_path.exists(), f"the owner's sole name was deleted through the junction\n{proc.stdout}")
-        self.assertEqual(part_path.read_bytes(), payload)
-        self.assertEqual(os.stat(part_path).st_nlink, 1)
-        self.assertIn("ATTRCUDA_OWNER_RELOCATED_DIRECTORY_REFUSED", proc.stdout)
+        self.assertIn("STATUS=REFUSED", proc.stdout)
+        self.assertEqual((owner_dir / ("victim" + "." + "MLV")).read_bytes(), b"the sole name of these bytes")
 
-    def test_a_junction_on_an_ancestor_of_the_relocated_directory_refuses_all_cleanup(self) -> None:
-        # The ancestor is swapped for a junction that points back at the very same directory: the
-        # directory's own identity still matches, so ONLY the ancestor rule can refuse. Nothing is
-        # deleted -- not the link, not an app sidecar -- and the directory stays.
-        tail = (
-            "$dir = Split-Path -Parent $clipPath\n"
-            "$parent = Split-Path -Parent $dir\n"
-            "Set-Content -LiteralPath (Join-Path $dir 'app-sidecar.txt') -Value 'written by the app'\n"
-            + self._DISPOSE_HANDLES +
-            "$moved = $parent + '-moved'\n"
-            "Move-Item -LiteralPath $parent -Destination $moved\n"
-            "[void](New-Item -ItemType Junction -Path $parent -Target $moved)\n"
-            "$out = Remove-AttrCudaOwnerFootageRelocatedDirectory -Directory $dir 3>&1\n"
-            "Write-Output ('CLEANUP_OUTPUT=' + (($out | Out-String) -replace '\\s+', ' ').Trim())\n"
-            "$realDir = Join-Path $moved (Split-Path -Leaf $dir)\n"
-            "Write-Output ('LINK_LEFT=' + (Test-Path -LiteralPath (Join-Path $realDir (Split-Path -Leaf $clipPath))))\n"
-            "Write-Output ('SIDECAR_LEFT=' + (Test-Path -LiteralPath (Join-Path $realDir 'app-sidecar.txt')))\n"
-            "try { [IO.Directory]::Delete($parent, $false) } catch { }\n"
-        )
-        proc, part_path, payload, _, _ = self._relocated_run("owner-ancestor-junction", tail)
-        self.assertEqual(proc.returncode, 0, f"{proc.stdout}\n{proc.stderr}")
-        self.assertIn("ATTRCUDA_OWNER_RELOCATED_DIRECTORY_REFUSED", proc.stdout)
-        self.assertIn("LINK_LEFT=True", proc.stdout)
-        self.assertIn("SIDECAR_LEFT=True", proc.stdout)
-        self.assertEqual(part_path.read_bytes(), payload)
-
-    def test_a_different_real_directory_at_the_relocated_path_is_refused(self) -> None:
-        # The relocated directory is removed and a DIFFERENT real directory (holding a lone file
-        # that stands for an owner's sole name) is created at the same path. Same path, not the
-        # directory this job created: refuse.
-        tail = (
-            "$dir = Split-Path -Parent $clipPath\n"
-            "Close-AttrCudaOwnerFootageWorkspace -Handles $ownerLinkHandles -Directory $dir 3>$null\n"
+    def test_a_different_real_directory_at_the_path_is_refused(self) -> None:
+        body = (
             "[IO.Directory]::Delete($dir, $false)\n"
             "[void](New-Item -ItemType Directory -Path $dir)\n"
-            f"Set-Content -LiteralPath (Join-Path $dir '{self._VICTIM_NAME}') -Value 'a sole name that is not ours'\n"
-            "$out = Remove-AttrCudaOwnerFootageRelocatedDirectory -Directory $dir 3>&1\n"
-            "Write-Output ('CLEANUP_OUTPUT=' + (($out | Out-String) -replace '\\s+', ' ').Trim())\n"
-            f"Write-Output ('VICTIM_LEFT=' + (Test-Path -LiteralPath (Join-Path $dir '{self._VICTIM_NAME}')))\n"
+            "Write-Output ('STATUS=' + (Remove-AttrCudaEmptyOwnerFootageDirectory -Directory $dir 3>$null))\n"
         )
-        proc, part_path, payload, _, _ = self._relocated_run("owner-other-directory", tail)
+        proc, _, pinned, _ = self._empty_remover_probe("other-directory-refuse", body)
         self.assertEqual(proc.returncode, 0, f"{proc.stdout}\n{proc.stderr}")
-        self.assertIn("ATTRCUDA_OWNER_RELOCATED_DIRECTORY_REFUSED", proc.stdout)
-        self.assertIn("VICTIM_LEFT=True", proc.stdout)
-        self.assertEqual(part_path.read_bytes(), payload)
+        self.assertIn("STATUS=REFUSED", proc.stdout)
+        self.assertTrue(pinned.exists())
 
-    def test_a_link_whose_count_dropped_to_one_is_never_deleted(self) -> None:
-        # The owner's other name is gone, so the private link is the LAST name of the bytes. Both
-        # Close and the relocated cleanup must leave it, and with it the directory.
-        payload = b"the only name left of these bytes " * 40
-        src = self.tmp / "owner-last-name-source" / ("source" + "." + "MLV")
-        tail = (
-            "$dir = Split-Path -Parent $clipPath\n"
-            + self._DISPOSE_HANDLES +
-            f"Remove-Item -LiteralPath '{src}' -Force\n"
-            "Close-AttrCudaOwnerFootageWorkspace -Handles @() -Directory $dir 3>$null\n"
-            "Remove-AttrCudaOwnerFootageRelocatedDirectory -Directory $dir 3>$null\n"
-            "Write-Output ('LAST_NAME_LEFT=' + (Test-Path -LiteralPath $clipPath))\n"
-            "Write-Output ('LAST_NAME_BYTES=' + (Get-FileHash -LiteralPath $clipPath -Algorithm SHA256).Hash.ToLowerInvariant())\n"
-            "Write-Output ('DIR_LEFT=' + (Test-Path -LiteralPath $dir))\n"
+    def test_a_directory_that_was_never_pinned_is_refused(self) -> None:
+        unpinned = self.tmp / "never-pinned"
+        unpinned.mkdir()
+        script = self.tmp / "never-pinned-probe.ps1"
+        script.write_text(
+            "$ErrorActionPreference = 'Stop'\n"
+            f"Import-Module '{MODULE}' -Force\n"
+            f"Import-Module '{OWNER_FOOTAGE_MODULE}' -Force\n"
+            f"Write-Output ('STATUS=' + (Remove-AttrCudaEmptyOwnerFootageDirectory -Directory '{unpinned}' 3>$null))\n",
+            encoding="utf-8",
         )
-        proc, part_path, _, _, _ = self._relocated_run("owner-last-name", tail, payload=payload)
+        proc = _run_pwsh_file(script)
         self.assertEqual(proc.returncode, 0, f"{proc.stdout}\n{proc.stderr}")
-        self.assertEqual(part_path, src)
-        self.assertIn("LAST_NAME_LEFT=True", proc.stdout)
-        self.assertIn(f"LAST_NAME_BYTES={hashlib.sha256(payload).hexdigest()}", proc.stdout)
-        self.assertIn("DIR_LEFT=True", proc.stdout)
-
-    def test_a_neutral_name_this_job_did_not_create_is_never_deleted_even_with_two_links(self) -> None:
-        # A file wearing a neutral link name, with a second name elsewhere, that this job never
-        # created in the directory. Old cleanup deleted any neutral name with two links.
-        foreign_source = self.tmp / "foreign-source.bin"
-        foreign_source.write_bytes(b"a file some other process linked into the directory")
-        tail = (
-            "$dir = Split-Path -Parent $clipPath\n"
-            "$foreign = Join-Path $dir ('owner-' + 'clip' + '.' + 'M07')\n"
-            f"[void](New-Item -ItemType HardLink -Path $foreign -Value '{foreign_source}')\n"
-            "Close-AttrCudaOwnerFootageWorkspace -Handles $ownerLinkHandles -Directory $dir 3>$null\n"
-            "Remove-AttrCudaOwnerFootageRelocatedDirectory -Directory $dir 3>$null\n"
-            "Write-Output ('FOREIGN_LEFT=' + (Test-Path -LiteralPath $foreign))\n"
-            "Write-Output ('OWN_LINK_LEFT=' + (Test-Path -LiteralPath $clipPath))\n"
-            "Remove-Item -LiteralPath $foreign -Force\n"
-        )
-        proc, part_path, payload, _, _ = self._relocated_run("owner-foreign-name", tail)
-        self.assertEqual(proc.returncode, 0, f"{proc.stdout}\n{proc.stderr}")
-        self.assertIn("FOREIGN_LEFT=True", proc.stdout)
-        self.assertIn("OWN_LINK_LEFT=False", proc.stdout)
-        self.assertEqual(foreign_source.read_bytes(), b"a file some other process linked into the directory")
-        self.assertEqual(part_path.read_bytes(), payload)
-
-    def test_a_reparse_point_entry_inside_the_relocated_directory_is_never_followed_or_deleted(self) -> None:
-        owner_dir = self.tmp / "owner-inner-junction-source"
-        tail = (
-            "$dir = Split-Path -Parent $clipPath\n"
-            f"[void](New-Item -ItemType Junction -Path (Join-Path $dir 'inner') -Target '{owner_dir}')\n"
-            "Close-AttrCudaOwnerFootageWorkspace -Handles $ownerLinkHandles -Directory $dir 3>$null\n"
-            "Remove-AttrCudaOwnerFootageRelocatedDirectory -Directory $dir 3>$null\n"
-            "Write-Output ('INNER_LEFT=' + (Test-Path -LiteralPath (Join-Path $dir 'inner')))\n"
-            "Write-Output ('DIR_LEFT=' + (Test-Path -LiteralPath $dir))\n"
-            "try { [IO.Directory]::Delete((Join-Path $dir 'inner'), $false) } catch { }\n"
-        )
-        proc, part_path, payload, _, _ = self._relocated_run("owner-inner-junction", tail)
-        self.assertEqual(proc.returncode, 0, f"{proc.stdout}\n{proc.stderr}")
-        self.assertEqual(part_path.parent, owner_dir)
-        self.assertIn("INNER_LEFT=True", proc.stdout)
-        self.assertIn("DIR_LEFT=True", proc.stdout)
-        self.assertEqual(part_path.read_bytes(), payload)
-
-    def test_a_recorded_link_name_replaced_by_a_junction_is_not_followed_or_deleted(self) -> None:
-        owner_dir = self.tmp / "owner-name-junction-source"
-        tail = (
-            "$dir = Split-Path -Parent $clipPath\n"
-            + self._DISPOSE_HANDLES +
-            "Remove-Item -LiteralPath $clipPath -Force\n"
-            f"[void](New-Item -ItemType Junction -Path $clipPath -Target '{owner_dir}')\n"
-            "Close-AttrCudaOwnerFootageWorkspace -Handles @() -Directory $dir 3>$null\n"
-            "Remove-AttrCudaOwnerFootageRelocatedDirectory -Directory $dir 3>$null\n"
-            "Write-Output ('NAME_LEFT=' + (Test-Path -LiteralPath $clipPath))\n"
-            "try { [IO.Directory]::Delete($clipPath, $false) } catch { }\n"
-        )
-        proc, part_path, payload, _, _ = self._relocated_run("owner-name-junction", tail)
-        self.assertEqual(proc.returncode, 0, f"{proc.stdout}\n{proc.stderr}")
-        self.assertEqual(part_path.parent, owner_dir)
-        self.assertIn("NAME_LEFT=True", proc.stdout)
-        self.assertEqual(part_path.read_bytes(), payload)
-
-    def test_a_recorded_link_name_replaced_by_a_hard_link_to_a_different_file_is_left_in_place(self) -> None:
-        # The name still exists and has two links, but it is no longer the file object this job
-        # created it as: it must not be deleted.
-        other_source = self.tmp / "some-other-file.bin"
-        other_source.write_bytes(b"a different file that also has two names")
-        tail = (
-            "$dir = Split-Path -Parent $clipPath\n"
-            + self._DISPOSE_HANDLES +
-            "Remove-Item -LiteralPath $clipPath -Force\n"
-            f"[void](New-Item -ItemType HardLink -Path $clipPath -Value '{other_source}')\n"
-            "Close-AttrCudaOwnerFootageWorkspace -Handles @() -Directory $dir 3>$null\n"
-            "Remove-AttrCudaOwnerFootageRelocatedDirectory -Directory $dir 3>$null\n"
-            "Write-Output ('NAME_LEFT=' + (Test-Path -LiteralPath $clipPath))\n"
-            "Remove-Item -LiteralPath $clipPath -Force\n"
-        )
-        proc, part_path, payload, _, _ = self._relocated_run("owner-name-other-file", tail)
-        self.assertEqual(proc.returncode, 0, f"{proc.stdout}\n{proc.stderr}")
-        self.assertIn("NAME_LEFT=True", proc.stdout)
-        self.assertEqual(other_source.read_bytes(), b"a different file that also has two names")
-        self.assertEqual(part_path.read_bytes(), payload)
-
-    def test_a_junction_substituted_for_the_same_volume_link_directory_is_not_cleaned_through(self) -> None:
-        # The same swap against the NON-relocated directory under the work tree: Close must not
-        # delete a neutral name through a junction either (the decoy folder's file has two links).
-        decoy_source = self.tmp / "decoy-source.bin"
-        decoy_source.write_bytes(b"decoy bytes with two names")
-        decoy_dir = self.tmp / "decoy-folder"
-        decoy_dir.mkdir()
-        tail = (
-            "$dir = Split-Path -Parent $clipPath\n"
-            + self._DISPOSE_HANDLES +
-            "Move-Item -LiteralPath $dir -Destination ($dir + '-moved')\n"
-            f"[void](New-Item -ItemType Junction -Path $dir -Target '{decoy_dir}')\n"
-            f"$decoy = Join-Path '{decoy_dir}' ('owner-' + 'clip' + '.' + 'MLV')\n"
-            f"[void](New-Item -ItemType HardLink -Path $decoy -Value '{decoy_source}')\n"
-            "Close-AttrCudaOwnerFootageWorkspace -Handles @() -Directory $dir 3>$null\n"
-            "Write-Output ('DECOY_LEFT=' + (Test-Path -LiteralPath $decoy))\n"
-            "try { [IO.Directory]::Delete($dir, $false) } catch { }\n"
-        )
-        part_path, part = self._one_part("owner-same-volume-swap", b"same volume swap bytes " * 40)
-        pub = self.tmp / "agent" / "outbox" / "owner-same-volume-swap.artifacts"
-        work = self.tmp / "work"
-        proc = self._run_owner_content_check(parts=[part], pub=pub, work=work, tail=tail)
-        self.assertEqual(proc.returncode, 0, f"{proc.stdout}\n{proc.stderr}")
-        self.assertIn("DECOY_LEFT=True", proc.stdout)
-        self.assertEqual(decoy_source.read_bytes(), b"decoy bytes with two names")
+        self.assertIn("STATUS=REFUSED", proc.stdout)
+        self.assertTrue(unpinned.exists())
 
     def test_a_link_is_not_created_into_a_directory_swapped_for_a_junction_after_creation(self) -> None:
         elsewhere = self.tmp / "elsewhere-folder"
@@ -2387,20 +2434,6 @@ class OwnerFootagePrivateDirectoryLeakAndRefusalTests(_PwshCase):
         self.assertEqual(marker.read_text(encoding="utf-8"), "not ours")
         self.assertEqual(os.stat(part_path).st_nlink, 1)
 
-    def test_relocated_directory_with_only_its_own_links_is_removed(self) -> None:
-        tail = (
-            "$dir = Split-Path -Parent $clipPath\n"
-            "Close-AttrCudaOwnerFootageWorkspace -Handles $ownerLinkHandles -Directory $dir 3>$null\n"
-            "Remove-AttrCudaOwnerFootageRelocatedDirectory -Directory $dir 3>$null\n"
-            "Write-Output ('DIR_EXISTS=' + (Test-Path -LiteralPath $dir))\n"
-        )
-        proc, part_path, payload, relocated_parent, _ = self._relocated_run("owner-clean-removal", tail)
-        self.assertEqual(proc.returncode, 0, f"{proc.stdout}\n{proc.stderr}")
-        self.assertIn("DIR_EXISTS=False", proc.stdout)
-        self.assertEqual(list(relocated_parent.iterdir()), [])
-        self.assertEqual(part_path.read_bytes(), payload)
-        self.assertEqual(os.stat(part_path).st_nlink, 1)
-
     def test_identity_mismatch_after_link_creation_is_refused(self) -> None:
         base_extension = "." + "MLV"
         src_dir = self.tmp / "owner-identity-mismatch-source"
@@ -2441,8 +2474,9 @@ class OwnerFootagePrivateDirectoryLeakAndRefusalTests(_PwshCase):
         # ATTR3-FOOTAGE-BIND-1 PR-B round 5 (astra major). Part 0 links and its handle opens
         # normally; part 1's handle acquisition is synthetically failed AFTER part 1's own link
         # was already created. Proves the round-5 enclosing try/catch (not a per-part try around
-        # New-AttrCudaOwnerFootageLink alone) closes the part-0 handle, deletes BOTH neutral link
-        # entries, leaves the real sources untouched, and reports the typed refusal.
+        # New-AttrCudaOwnerFootageLink alone) closes the part-0 handle, leaves the real sources
+        # untouched (the two neutral links STAY: no job deletes a name of owner footage), and
+        # reports the typed refusal.
         base_extension = "." + "MLV"
         continuation_extension = "." + "M00"
         src_dir = self.tmp / "owner-handle-failure-source"
@@ -2502,10 +2536,15 @@ class OwnerFootagePrivateDirectoryLeakAndRefusalTests(_PwshCase):
         self.assertIn("PART=1", proc.stdout)
         self.assertNotIn("UNREACHABLE_NO_THROW", proc.stdout)
 
+        # UM-OWNER-FOOTAGE-CROSS-VOLUME-2: no job deletes a name of owner footage, so the two
+        # neutral links this run created (part 1's exists: only its handle acquisition failed) STAY.
         private_dir_name = "owner-" + "clip"
         private_dir = work / private_dir_name
         self.assertTrue(private_dir.exists())
-        self.assertEqual(sorted(p.name for p in private_dir.iterdir()), [])
+        self.assertEqual(sorted(p.name for p in private_dir.iterdir()),
+                         [private_dir_name + "." + "M00", private_dir_name + "." + "MLV"])
+        self.assertEqual(os.stat(part0_path).st_nlink, 2)
+        self.assertEqual(os.stat(part1_path).st_nlink, 2)
 
         # The real sources are untouched -- never linked away, never truncated, never renamed.
         self.assertTrue(part0_path.is_file())
@@ -5956,9 +5995,12 @@ class DisplayWakeJobOrderingTests(unittest.TestCase):
         # master -- displayWake=$displayWake was added to that block to match every sibling site.
         # UM-OWNER-FOOTAGE-CROSS-VOLUME-1 adds a 21st: the refusal when no private link directory
         # can be prepared on the clip's volume (OWNER_FOOTAGE_LINK_CROSS_VOLUME/_FAILED, no part yet).
+        # UM-OWNER-FOOTAGE-CROSS-VOLUME-2 adds a 22nd and 23rd: the refusal of a $Work that already
+        # holds a private link directory (OWNER_LINK_DIRECTORY_PRESENT, exit 28) and the refusal
+        # when the leftover-directory record cannot be written (OWNER_FOOTAGE_LINK_FAILED).
         summary_writes = body.count("(Join-Path $Pub 'summary.json')")
         display_wake_fields = body.count("displayWake=$displayWake") + body.count("displayWake = $displayWake")
-        self.assertEqual(21, summary_writes, "a summary.json write site was added/removed after the wake")
+        self.assertEqual(23, summary_writes, "a summary.json write site was added/removed after the wake")
         # +1: the success path also stamps displayWake into evidence-manifest.json, a second file.
         self.assertEqual(summary_writes + 1, display_wake_fields)
 

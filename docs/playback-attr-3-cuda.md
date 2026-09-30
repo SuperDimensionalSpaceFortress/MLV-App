@@ -199,25 +199,36 @@ stdout, `summary.json`, `evidence-manifest.json`, or any other artifact -- ever 
 path; every reader-facing output carries only the part's index and status. Any non-`PASS` part,
 or a failure creating/opening/re-verifying a private link, fails closed (`OWNER_FOOTAGE_NOT_VERIFIED`
 exit 19, `OWNER_FOOTAGE_LINK_CROSS_VOLUME` exit 21, or `OWNER_FOOTAGE_LINK_FAILED` exit 22),
-closing whatever handles were already held and removing whatever private links were already
-created, before PresentMon starts, before deploy, and before the smoke child. A hard link cannot
+closing whatever handles were already held (the private links already created STAY -- see below),
+before PresentMon starts, before deploy, and before the smoke child. A hard link cannot
 cross volumes, so when the clip is on another volume than the job's work tree (Ultra-Magnus: clip on
 `C:`, agent share and scratch on `G:`) the private directory is created on the CLIP's volume instead
-(`Resolve-AttrCudaOwnerFootageDirectory`, under `<clip drive>\mlvtmp\<job>-owner-clip`, removed at
-the end) -- nothing is copied and every guarantee above is unchanged; parts spanning more than one
+(`Resolve-AttrCudaOwnerFootageDirectory`, under `<clip drive>\mlvtmp\<job>-owner-clip`) -- nothing is copied and every guarantee above is unchanged; parts spanning more than one
 volume, or a relocation that does not land on the clip's volume, still fail closed at exit 21.
-Cleanup of that directory never trusts a path: the directory is identity-pinned when created
-(volume serial + file id, read without following a reparse point), the cleanup refuses unless it is
-still that object and neither it nor any ancestor up to the volume root is a junction or symlink,
-and it deletes only the link names this job recorded creating, by handle, while each still has a
-second name (a file with a single link is never deleted, so an app sidecar stays and keeps the
-directory). A refusal is logged path-free and leaves everything in place: a leftover link directory
-is acceptable, a deleted name of the owner's footage is not.
+**No job deletes a name of owner footage** (UM-OWNER-FOOTAGE-CROSS-VOLUME-2). The private links this job
+creates STAY when it ends: Windows has no atomic "delete this name only if another name of the file
+remains", and the owner's source name stays replaceable while the job holds its handle on the link, so
+any "read the link count, then delete the link" (PR #200 tried it, then narrowed it twice) can remove
+the LAST name of the owner's clip if the source name is replaced between the two -- the class is
+removed, not narrowed. The job closes its handles, removes a link directory only when it is EMPTY
+(a non-recursive delete the OS itself refuses otherwise), and records the directory it leaves in
+`owner-link-directory.json` in its artifact directory (`{schema: mlvapp.owner-link-leftover.v1,
+linkDirectory, relocated, leftover, linkNames}`, written before the first link exists, so a later sweep
+can find it even if the job is killed). Before creating a link the directory is re-proved to be the
+identity-pinned object the job created (volume serial + file id, read without following a reparse
+point). The job's one recursive delete, the pre-clean of its own `$Work`, is refused (exit 28,
+`OWNER_LINK_DIRECTORY_PRESENT`) when `$Work` already holds a private link directory.
+`tools/repo_hygiene/test_owner_footage_no_delete_class.py` is the static guard: any delete / rename /
+replace primitive reachable from the owner-footage module, the job or the bind-proof module that is
+not a named exception fails.
 `attr3-footage-presence-job.ps1 -BindProof -WorkRoot <dir>` emits a bounded job that runs exactly
 this link/hold/one-hash/binding path with no playback, for proving it on a venue. `-WorkRoot` is
 resolved to its long path before it is validated (an 8.3 alias such as `C:\Users\RUNNER~1\...` is
 expanded, a `..` segment is refused, and the resolved value must still be a plain drive-absolute
-path with no quote or `~`). (The fixture route in
+path with no quote or `~`). The bind proof deletes nothing at all: its success gate is that every owner
+part STILL EXISTS under its own name as the same file object with the same length (exit 26,
+`OWNER_FOOTAGE_BIND_SOURCE_NOT_INTACT`), and it reports the leftover link directory in
+`integrity.leftover`. (The fixture route in
 section 4b instead requires the clip path to sit directly in the agent cache, name that clip id,
 and exist, then hashes it against `-FixtureSha256`, failing closed at
 `FIXTURE_CONTENT_MISMATCH`, exit 17, on a mismatch.) The job also verifies all three package

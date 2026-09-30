@@ -623,9 +623,12 @@ $embeddedFunctions = $embeddedFunctions + "`r`n`r`n" + (Get-AttrCudaEmbeddedFunc
     'Close-AttrCudaOwnerFootageWorkspace',
     # UM-OWNER-FOOTAGE-CROSS-VOLUME-1: the private link directory follows the clip's volume.
     'Resolve-AttrCudaOwnerFootageDirectory',
-    'Remove-AttrCudaOwnerFootageRelocatedDirectory',
+    # UM-OWNER-FOOTAGE-CROSS-VOLUME-2: an EMPTY-only directory remover and the leftover record; no
+    # function embedded here deletes a link name.
+    'Remove-AttrCudaEmptyOwnerFootageDirectory',
+    'Get-AttrCudaOwnerFootageLeftoverRecord',
     # UM-OWNER-FOOTAGE-CROSS-VOLUME-1 round 2: the directory pin (identity + ancestor reparse-point
-    # walk, recorded link names) and the by-handle link delete the two cleanups above now use.
+    # walk, recorded link names), used before a link is created in the directory.
     'Initialize-AttrCudaPinNativeMethods',
     'Get-AttrCudaNoFollowIdentity',
     'Test-AttrCudaPathAncestorsHaveNoReparsePoint',
@@ -634,9 +637,7 @@ $embeddedFunctions = $embeddedFunctions + "`r`n`r`n" + (Get-AttrCudaEmbeddedFunc
     'Get-AttrCudaOwnerFootageDirectoryPin',
     'Register-AttrCudaOwnerFootageDirectoryPin',
     'Register-AttrCudaOwnerFootageDirectoryPinBestEffort',
-    'Test-AttrCudaOwnerFootageDirectoryPin',
-    'Remove-AttrCudaOwnerFootageLinkName',
-    'Remove-AttrCudaOwnerFootageRecordedLinks'
+    'Test-AttrCudaOwnerFootageDirectoryPin'
 ))
 
 # --- resolve provenance locally, BEFORE the job ever touches Bachelor -------------
@@ -960,6 +961,23 @@ foreach ($check in @(
     @{ path = $Pub; label = 'Pub' }
 )) { Assert-UnderMlvTmp $check.path $check.label }
 
+# UM-OWNER-FOOTAGE-CROSS-VOLUME-2: the recursive delete below must NEVER reach a link name of owner
+# footage, and a leftover private link directory of an earlier attempt at this same $Work is
+# exactly that (no job deletes its link names any more; they stay for a sweep). So a $Work that
+# already holds one is refused, untouched -- this is the ONLY recursive delete in this job.
+if (Test-Path -LiteralPath (Join-Path $Work 'owner-clip')) {
+    [void](New-AttrCudaDirectory -Path (Join-Path $Root 'outbox'))
+    [void](New-AttrCudaDirectory -Path $Pub)
+    $leftoverPresentRefusal = [ordered]@{
+        schema='playback-attr-3-cuda-venue.v1'; result='OWNER_LINK_DIRECTORY_PRESENT'
+        fixtureRehearsal=$FixtureRehearsal
+        displayWake=$displayWake
+        sourceCommit=$SourceCommit; clipId=$ClipId; artifactRoot=$Pub
+    }
+    Save-Json $leftoverPresentRefusal (Join-Path $Pub 'summary.json')
+    Write-Output "RESULT=OWNER_LINK_DIRECTORY_PRESENT ARTIFACTS=$Pub"
+    exit 28
+}
 Remove-AttrCudaTree -TrustedRoot 'C:\mlvtmp' -Path $Work
 New-Item -ItemType Directory -Path $Work -Force | Out-Null
 $Scratch = Join-Path $Work '.job-tmp'
@@ -1619,6 +1637,27 @@ if ($FixtureRehearsal) {
     }
     if ($ownerLinkDirectory -ne $OwnerClipDir) { $OwnerClipRelocated = $true }
     $OwnerClipDir = $ownerLinkDirectory
+    # UM-OWNER-FOOTAGE-CROSS-VOLUME-2: NO job deletes a name of owner footage, so the private link
+    # names this job creates in $OwnerClipDir STAY (a "read the link count, then delete the link"
+    # cleanup can remove the last name of the clip if the owner's source name is replaced between
+    # the two -- Windows has no atomic delete-only-if-another-name-remains). The directory is
+    # RECORDED in the artifact directory before the first link exists, so a later sweep can find it
+    # even if this job is killed.
+    try {
+        $ownerLeftover = Get-AttrCudaOwnerFootageLeftoverRecord -Directory $OwnerClipDir -Relocated $OwnerClipRelocated -LinkName @($ownerAssertedParts | ForEach-Object { Get-AttrCudaOwnerFootageNeutralName -Index $_.index })
+        Save-Json $ownerLeftover (Join-Path $Pub 'owner-link-directory.json')
+    } catch {
+        if ($OwnerClipRelocated) { [void](Remove-AttrCudaEmptyOwnerFootageDirectory -Directory $OwnerClipDir) }
+        $recordRefusal = [ordered]@{
+            schema='playback-attr-3-cuda-venue.v1'; result='OWNER_FOOTAGE_LINK_FAILED'
+            fixtureRehearsal=$FixtureRehearsal
+            displayWake=$displayWake
+            sourceCommit=$SourceCommit; clipId=$ClipId; artifactRoot=$Pub
+        }
+        Save-Json $recordRefusal (Join-Path $Pub 'summary.json')
+        Write-Output "RESULT=OWNER_FOOTAGE_LINK_FAILED ARTIFACTS=$Pub"
+        exit 22
+    }
     $ownerVerifiedParts = [System.Collections.Generic.List[object]]::new()
     # ATTR3-FOOTAGE-BIND-1 PR-B round 5 (astra major): the cleanup `try` now wraps this ENTIRE
     # loop -- creating every link, opening every held handle, and re-verifying every link's
@@ -1657,11 +1696,12 @@ if ($FixtureRehearsal) {
             [void]$ownerVerifiedParts.Add([ordered]@{ path = $linkPath; length = $part.length; sha256 = $part.sha256 })
         }
     } catch {
-        # Closes whatever handles were acquired before the failure and deletes only the neutral
-        # link entries that exist with a live link count >= 2 -- never throws, so the refusal
-        # below is always reached.
+        # Closes whatever handles were acquired before the failure. The neutral link names already
+        # created STAY (no job deletes a name of owner footage; the directory is recorded in
+        # owner-link-directory.json), and the relocated directory is removed only if it is EMPTY --
+        # never throws, so the refusal below is always reached.
         Close-AttrCudaOwnerFootageWorkspace -Handles $ownerLinkHandles -Directory $OwnerClipDir
-        if ($OwnerClipRelocated) { Remove-AttrCudaOwnerFootageRelocatedDirectory -Directory $OwnerClipDir }
+        if ($OwnerClipRelocated) { [void](Remove-AttrCudaEmptyOwnerFootageDirectory -Directory $OwnerClipDir) }
         $message = $_.Exception.Message
         if ($message -match '^OWNER_FOOTAGE_NOT_VERIFIED status=(\S+)$') {
             $relinkRefusal = [ordered]@{
@@ -2837,8 +2877,10 @@ Write-Output "RESULT=$resultVerb FIXTURE_REHEARSAL=$FixtureRehearsal SOURCE=$Sou
 exit 0
 } finally {
     if ($OwnerClipDir) {
+        # Handles only: the private link names stay (owner-link-directory.json records where);
+        # a relocated directory is removed only if it is EMPTY. No name of owner footage is deleted.
         Close-AttrCudaOwnerFootageWorkspace -Handles $ownerLinkHandles -Directory $OwnerClipDir
-        if ($OwnerClipRelocated) { Remove-AttrCudaOwnerFootageRelocatedDirectory -Directory $OwnerClipDir }
+        if ($OwnerClipRelocated) { [void](Remove-AttrCudaEmptyOwnerFootageDirectory -Directory $OwnerClipDir) }
     }
     # CUDA-PERF-DISPLAY-WAKE-2: stop the periodic keep-alive first -- releases its background
     # Runspace -- before releasing the execution-state request itself, on every exit path from

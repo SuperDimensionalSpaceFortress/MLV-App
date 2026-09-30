@@ -1,6 +1,7 @@
 # AttrCudaOwnerFootage.psm1 -- the private per-job owner-footage workspace: neutral link
-# naming, part-contiguity proof, Win32 file identity, hard-link creation, held read handles and
-# link-only cleanup. ATTR3-FOOTAGE-BIND-1 PR-B round 4b.
+# naming, part-contiguity proof, Win32 file identity, hard-link creation and held read handles.
+# ATTR3-FOOTAGE-BIND-1 PR-B round 4b. No function here deletes a name of owner footage (see
+# Close-AttrCudaOwnerFootageWorkspace): UM-OWNER-FOOTAGE-CROSS-VOLUME-2.
 #
 # WHY THIS IS ITS OWN MODULE, SEPARATE FROM AttrCudaArtifacts.psm1. AttrCudaArtifacts.psm1 is
 # shared by every PLAYBACK-ATTR-3-CUDA build-route script (assemble/stage/DLL-pair), none of
@@ -340,8 +341,7 @@ function Get-AttrCudaFileIdentity {
     count) of an existing file or directory, via GetFileInformationByHandle.
     .DESCRIPTION
     ATTR3-FOOTAGE-BIND-1 PR-B round 4: this is the ONE way this module proves two paths name the
-    SAME file object -- a private hard link and the owner's source part -- and the ONE way it
-    learns a file's live hard-link count before ever deleting it. CreateFileW opens with
+    SAME file object -- a private hard link and the owner's source part. CreateFileW opens with
     FILE_FLAG_BACKUP_SEMANTICS so a directory handle works too (needed to read the private
     directory's own volume serial for the cross-volume check, before any part is linked). Every
     share flag is requested because this call only ever QUERIES metadata -- it competes with
@@ -413,7 +413,8 @@ function Get-AttrCudaFileIdentity {
 function Initialize-AttrCudaPinNativeMethods {
     <#
     .SYNOPSIS
-    Define, once per process, the Win32 calls the directory pin and the by-handle link delete use.
+    Define, once per process, the Win32 calls the directory pin uses (open without following a
+    reparse point, read the identity, close). There is no delete call here.
     .DESCRIPTION
     UM-OWNER-FOOTAGE-CROSS-VOLUME-1 round 2. Separate from Get-AttrCudaFileIdentity's own type so
     that function (and the tests that replace it) stay untouched. Both callers open with
@@ -446,9 +447,6 @@ function Initialize-AttrCudaPinNativeMethods {
 
     [System.Runtime.InteropServices.DllImport("kernel32.dll", SetLastError = true)]
     public static extern bool GetFileInformationByHandle(System.IntPtr hFile, out PinIdentity lpFileInformation);
-
-    [System.Runtime.InteropServices.DllImport("kernel32.dll", SetLastError = true)]
-    public static extern bool SetFileInformationByHandle(System.IntPtr hFile, int fileInformationClass, ref byte lpFileInformation, uint dwBufferSize);
 
     [System.Runtime.InteropServices.DllImport("kernel32.dll", SetLastError = true)]
     public static extern bool CloseHandle(System.IntPtr hObject);
@@ -567,10 +565,11 @@ function Register-AttrCudaOwnerFootageDirectoryPin {
     of a private link directory this job has just created, plus an empty list of the link names
     the job creates in it. Throws if -Directory is not a real directory.
     .DESCRIPTION
-    UM-OWNER-FOOTAGE-CROSS-VOLUME-1 round 2. Everything destructive later -- deleting a link name,
-    removing the directory -- first proves the directory it is about to act on is still THIS
-    object. A relocated directory (-Relocated) also has its whole ancestor chain checked for
-    reparse points at cleanup time.
+    UM-OWNER-FOOTAGE-CROSS-VOLUME-1 round 2. Everything that later acts on the directory -- creating
+    a link in it, removing it when it is empty -- first proves it is still THIS object. A
+    relocated directory (-Relocated) also has its whole ancestor chain checked for reparse points.
+    UM-OWNER-FOOTAGE-CROSS-VOLUME-2: no link name is ever deleted, so the recorded names are only
+    a record of what this job created there.
     #>
     [CmdletBinding()]
     param(
@@ -621,90 +620,6 @@ function Test-AttrCudaOwnerFootageDirectoryPin {
         if (-not (Test-AttrCudaPathAncestorsHaveNoReparsePoint -Path $Directory)) { return $false }
     }
     return $true
-}
-
-function Remove-AttrCudaOwnerFootageLinkName {
-    <#
-    .SYNOPSIS
-    Delete ONE link name, bound to the file object it really is: the name is opened without
-    following a reparse point, and the deletion is requested on that same open handle only when
-    the object is a plain file, has a live link count of 2 or more, and is the very file object
-    this job created the link as (-Record). Returns a status word; deletes nothing otherwise.
-    .DESCRIPTION
-    UM-OWNER-FOOTAGE-CROSS-VOLUME-1 round 2. The handle is opened with DELETE access and without
-    FILE_SHARE_DELETE, so while it is open no other name of the file can be removed: the link
-    count read here cannot drop to 1 before the deletion lands. Statuses: DELETED, ABSENT_OR_BUSY,
-    UNREADABLE, REPARSE, DIRECTORY, LAST_NAME, NOT_CREATED_HERE, DELETE_FAILED.
-    #>
-    [CmdletBinding()]
-    param(
-        [Parameter(Mandatory = $true)][string]$Path,
-        [Parameter(Mandatory = $true)][object]$Record
-    )
-
-    Initialize-AttrCudaPinNativeMethods
-    $deleteAndReadAttributes = [uint32](0x00010000 -bor 0x80)
-    $shareReadWrite = [uint32]3
-    $openExisting = [uint32]3
-    $backupSemanticsOpenReparsePoint = [uint32](0x02000000 -bor 0x00200000)
-    $invalidHandle = [IntPtr]::new(-1)
-
-    $handle = [AttrCudaWin32.PinNativeMethods]::CreateFileW(
-        $Path, $deleteAndReadAttributes, $shareReadWrite, [IntPtr]::Zero, $openExisting, $backupSemanticsOpenReparsePoint, [IntPtr]::Zero)
-    if ($handle -eq $invalidHandle) { return 'ABSENT_OR_BUSY' }
-    try {
-        $info = [AttrCudaWin32.PinNativeMethods+PinIdentity]::new()
-        if (-not [AttrCudaWin32.PinNativeMethods]::GetFileInformationByHandle($handle, [ref]$info)) { return 'UNREADABLE' }
-        if (($info.FileAttributes -band 0x400) -ne 0) { return 'REPARSE' }
-        if (($info.FileAttributes -band 0x10) -ne 0) { return 'DIRECTORY' }
-        if ($info.NumberOfLinks -lt 2) { return 'LAST_NAME' }
-        if ($info.VolumeSerialNumber -ne $Record.VolumeSerialNumber -or
-            $info.FileIndexHigh -ne $Record.FileIndexHigh -or
-            $info.FileIndexLow -ne $Record.FileIndexLow) { return 'NOT_CREATED_HERE' }
-        [byte]$deleteFlag = 1
-        if (-not [AttrCudaWin32.PinNativeMethods]::SetFileInformationByHandle($handle, 4, [ref]$deleteFlag, 1)) { return 'DELETE_FAILED' }
-        return 'DELETED'
-    } finally {
-        [void][AttrCudaWin32.PinNativeMethods]::CloseHandle($handle)
-    }
-}
-
-function Remove-AttrCudaOwnerFootageRecordedLinks {
-    <#
-    .SYNOPSIS
-    Delete, from -Directory, exactly the link names this job recorded creating there, each only
-    when Remove-AttrCudaOwnerFootageLinkName finds it still a second name of the same file object.
-    Never enumerates the directory, never recurses, never throws.
-    .DESCRIPTION
-    UM-OWNER-FOOTAGE-CROSS-VOLUME-1 round 2. Before each name the directory is re-proved to be the
-    pinned one (Test-AttrCudaOwnerFootageDirectoryPin, ancestors included for a relocated
-    directory); on any failure everything is left in place. A leftover link directory is
-    acceptable; a deleted name of the owner's footage is not.
-    #>
-    [CmdletBinding()]
-    param([Parameter(Mandatory = $true)][string]$Directory)
-
-    $pin = Get-AttrCudaOwnerFootageDirectoryPin -Directory $Directory
-    if ($null -eq $pin) {
-        Write-Warning 'ATTRCUDA_OWNER_DIRECTORY_NOT_PINNED links left in place'
-        return
-    }
-    foreach ($record in @($pin.Links)) {
-        if (-not (Test-AttrCudaOwnerFootageDirectoryPin -Directory $Directory)) {
-            Write-Warning 'ATTRCUDA_OWNER_DIRECTORY_PIN_MISMATCH links left in place'
-            return
-        }
-        try {
-            $status = Remove-AttrCudaOwnerFootageLinkName -Path (Join-Path $Directory $record.Name) -Record $record
-        } catch {
-            $status = 'ERROR'
-        }
-        if ($status -eq 'LAST_NAME') {
-            Write-Warning 'ATTRCUDA_OWNER_LINK_IS_LAST_NAME left in place'
-        } elseif ($status -ne 'DELETED' -and $status -ne 'ABSENT_OR_BUSY') {
-            Write-Warning "ATTRCUDA_OWNER_LINK_CLEANUP_REFUSED $status left in place"
-        }
-    }
 }
 
 function New-AttrCudaOwnerFootageLink {
@@ -762,7 +677,7 @@ function New-AttrCudaOwnerFootageLink {
     }
 
     # UM-OWNER-FOOTAGE-CROSS-VOLUME-1 round 2: record the file object this name IS the moment it
-    # exists, so cleanup can later delete exactly the names this job created and nothing else.
+    # exists (a record of what this job created; no job deletes it -- CROSS-VOLUME-2).
     try {
         $created = Get-AttrCudaNoFollowIdentity -Path $linkPath
         [void]$pin.Links.Add([pscustomobject]@{
@@ -807,35 +722,59 @@ function Open-AttrCudaReadOnlyHandle {
 function Close-AttrCudaOwnerFootageWorkspace {
     <#
     .SYNOPSIS
-    Close every held read-share handle (independently -- one failure never blocks the rest), then
-    delete ONLY the link names this job recorded creating in -Directory, and only while the
-    directory is still the one pinned at creation and each name is still a second name (live
-    hard-link count >= 2) of the file object it was created as, so a link is never the last name
-    of the owner's bytes.
+    Close every held read-share handle, independently -- one failure never blocks the rest. It
+    DELETES NOTHING: no job ever removes a name of owner footage.
     .DESCRIPTION
-    ATTR3-FOOTAGE-BIND-1 PR-B round 4; UM-OWNER-FOOTAGE-CROSS-VOLUME-1 round 2 (recorded names,
-    pinned directory, by-handle delete -- see Remove-AttrCudaOwnerFootageRecordedLinks). Anything
-    else in -Directory (e.g. a sidecar file the app wrote while it had the footage open) is left
-    in place for the job's normal work-tree cleanup.
+    ATTR3-FOOTAGE-BIND-1 PR-B round 4; UM-OWNER-FOOTAGE-CROSS-VOLUME-2 (the cleanup that used to
+    follow the handle release is gone). The private link names this job created stay where they
+    are and the job records the directory that holds them (Get-AttrCudaOwnerFootageLeftoverRecord),
+    so a later sweep can find them. WHY: Windows has no atomic "delete this name only if another
+    name of the file remains", and the owner's source name stays replaceable while a
+    no-share-delete handle is held on the link -- so any "read the link count, then delete the
+    link" (however carefully bound to a handle or a pin) can remove the LAST name of the owner's
+    clip if the source name is replaced between the two. A leftover link is a few bytes of
+    directory entry; a lost name of owner footage is not recoverable. -Directory is accepted so
+    the call sites stay as they were; it is not acted on.
     Never throws: this runs in a `finally`, where an exception would mask the job's real exit
     code.
     #>
     [CmdletBinding()]
     param(
         [object[]]$Handles = @(),
-        [Parameter(Mandatory = $true)][string]$Directory
+        [string]$Directory = ''
     )
 
     foreach ($handle in $Handles) {
         if ($null -eq $handle) { continue }
         try { $handle.Dispose() } catch { Write-Warning "ATTRCUDA_OWNER_HANDLE_CLOSE_FAILED: $($_.Exception.Message)" }
     }
+}
 
-    if ([string]::IsNullOrWhiteSpace($Directory) -or -not (Test-Path -LiteralPath $Directory)) { return }
-    # UM-OWNER-FOOTAGE-CROSS-VOLUME-1 round 2: no enumeration. Only the names this job recorded
-    # creating in the pinned directory are candidates, each deleted by handle and only while it is
-    # still a second name of the file object it was created as.
-    Remove-AttrCudaOwnerFootageRecordedLinks -Directory $Directory
+function Get-AttrCudaOwnerFootageLeftoverRecord {
+    <#
+    .SYNOPSIS
+    The record a job writes into its result JSON for the private link directory it leaves behind:
+    { schema, linkDirectory, relocated, leftover, linkNames }.
+    .DESCRIPTION
+    UM-OWNER-FOOTAGE-CROSS-VOLUME-2. No job deletes a link name, so a link directory is left on
+    every owner run (leftover = true: a later sweep, with the owner present, decides what to do).
+    -LinkName is the neutral names the job creates in it. The directory is a job-private path
+    under the job's own scratch, never the owner's; the record carries no owner path.
+    #>
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $true)][string]$Directory,
+        [object]$Relocated = $false,
+        [string[]]$LinkName = @()
+    )
+
+    [ordered]@{
+        schema = 'mlvapp.owner-link-leftover.v1'
+        linkDirectory = [IO.Path]::GetFullPath($Directory)
+        relocated = [bool]$Relocated
+        leftover = $true
+        linkNames = @($LinkName)
+    }
 }
 
 function New-AttrCudaVerifiedClipBinding {
@@ -914,6 +853,9 @@ function Resolve-AttrCudaOwnerFootageDirectory {
         return $PreferredDirectory
     }
 
+    # The work-tree directory stays empty on this path; pin it so it can be removed again (empty
+    # only) by Remove-AttrCudaEmptyOwnerFootageDirectory.
+    Register-AttrCudaOwnerFootageDirectoryPinBestEffort -Directory $PreferredDirectory
     $parent = $RelocatedParent
     if ([string]::IsNullOrWhiteSpace($parent)) {
         $parent = Join-Path ([IO.Path]::GetPathRoot([IO.Path]::GetFullPath($SourcePath[0]))) 'mlvtmp'
@@ -926,7 +868,7 @@ function Resolve-AttrCudaOwnerFootageDirectory {
     } catch {
         throw 'OWNER_FOOTAGE_LINK_FAILED no private directory could be prepared on the source volume'
     }
-    # Pin the directory the instant it exists: cleanup later acts only on THIS directory object
+    # Pin the directory the instant it exists: later steps act only on THIS directory object
     # (volume serial + file id, read without following a reparse point), never on whatever a path
     # names by then. A directory that cannot be pinned is not used; it is empty, so removing it
     # non-recursively cannot touch anything else (and on a junction removes only the junction).
@@ -956,52 +898,42 @@ function Register-AttrCudaOwnerFootageDirectoryPinBestEffort {
     try { [void](Register-AttrCudaOwnerFootageDirectoryPin -Directory $Directory) } catch {}
 }
 
-function Remove-AttrCudaOwnerFootageRelocatedDirectory {
+function Remove-AttrCudaEmptyOwnerFootageDirectory {
     <#
     .SYNOPSIS
-    Delete a directory Resolve-AttrCudaOwnerFootageDirectory relocated OUT of the job work tree
-    (which nothing else cleans up), without ever deleting a name of the owner's bytes.
+    Remove a private link directory this job created ONLY if it is empty. Returns REMOVED,
+    NOT_EMPTY or REFUSED. It can never remove a name of the owner's footage.
     .DESCRIPTION
-    UM-OWNER-FOOTAGE-CROSS-VOLUME-1. Call it AFTER Close-AttrCudaOwnerFootageWorkspace, which has
-    already removed every link name this job created that still has a second name.
-    Round 2 (sol r1 blocker: a junction substituted for this directory, or an ancestor, made the
-    per-entry checks run against the owner's own folder). Now: the directory must still be the
-    object pinned when it was created (volume serial + file id, read without following a reparse
-    point), must not be a reparse point itself, and no ancestor up to the volume root may be one;
-    any failure logs ATTRCUDA_OWNER_RELOCATED_DIRECTORY_REFUSED and leaves EVERYTHING in place.
-    Only the link names recorded at creation are ever deleted, by handle, and only while each has
-    a second name; a file with a single link is never deleted, whatever it is called -- so an app
-    sidecar stays, and keeps the directory. The directory itself is removed NON-recursively. Never
-    enumerates, never recurses, never throws; every warning is path-free. A leftover link
-    directory is acceptable; a deleted name of the owner's footage is not.
+    UM-OWNER-FOOTAGE-CROSS-VOLUME-2 (replaces Remove-AttrCudaOwnerFootageRelocatedDirectory, which
+    also deleted link names). The only delete primitive is [IO.Directory]::Delete($Directory,
+    $false): non-recursive, so the OS itself refuses a directory that holds any entry -- a link
+    name, an app sidecar, anything -- and there is no enumeration, no per-name check and no
+    by-handle delete to race. The directory must still be the object pinned when this job created
+    it (volume serial + file id, read without following a reparse point; ancestors clear of
+    reparse points for a relocated one), so a junction planted in its place is left alone rather
+    than removed. Never throws; every warning is path-free.
     #>
     [CmdletBinding()]
     param([Parameter(Mandatory = $true)][string]$Directory)
 
-    if ([string]::IsNullOrWhiteSpace($Directory) -or -not (Test-Path -LiteralPath $Directory)) { return }
-    # Refuse unless this is still the directory Resolve-AttrCudaOwnerFootageDirectory created:
-    # same volume serial + file id, itself not a reparse point, and no reparse point on ANY
-    # ancestor up to the volume root. Everything is then left exactly where it is.
+    if ([string]::IsNullOrWhiteSpace($Directory) -or -not (Test-Path -LiteralPath $Directory)) { return 'REMOVED' }
     if (-not (Test-AttrCudaOwnerFootageDirectoryPin -Directory $Directory)) {
-        Write-Warning 'ATTRCUDA_OWNER_RELOCATED_DIRECTORY_REFUSED identity or reparse-point check failed; nothing removed'
-        return
-    }
-    Remove-AttrCudaOwnerFootageRecordedLinks -Directory $Directory
-    if (-not (Test-AttrCudaOwnerFootageDirectoryPin -Directory $Directory)) {
-        Write-Warning 'ATTRCUDA_OWNER_RELOCATED_DIRECTORY_REFUSED identity or reparse-point check failed; nothing removed'
-        return
+        Write-Warning 'ATTRCUDA_OWNER_LINK_DIRECTORY_LEFT identity or reparse-point check failed; nothing removed'
+        return 'REFUSED'
     }
     try {
         [IO.Directory]::Delete($Directory, $false)
         [void](Get-AttrCudaOwnerFootagePinTable).Remove((Get-AttrCudaOwnerFootagePinKey -Directory $Directory))
+        return 'REMOVED'
     } catch {
-        Write-Warning 'ATTRCUDA_OWNER_RELOCATED_DIRECTORY_NOT_REMOVED'
+        return 'NOT_EMPTY'
     }
 }
 
 Export-ModuleMember -Function `
     Resolve-AttrCudaOwnerFootageDirectory, `
-    Remove-AttrCudaOwnerFootageRelocatedDirectory, `
+    Remove-AttrCudaEmptyOwnerFootageDirectory, `
+    Get-AttrCudaOwnerFootageLeftoverRecord, `
     Get-AttrCudaOwnerFootageStagingName, `
     Send-AttrCudaOwnerFootagePartToStaging, `
     Get-AttrCudaOwnerFootageNeutralName, `
@@ -1016,8 +948,6 @@ Export-ModuleMember -Function `
     Register-AttrCudaOwnerFootageDirectoryPin, `
     Register-AttrCudaOwnerFootageDirectoryPinBestEffort, `
     Test-AttrCudaOwnerFootageDirectoryPin, `
-    Remove-AttrCudaOwnerFootageLinkName, `
-    Remove-AttrCudaOwnerFootageRecordedLinks, `
     New-AttrCudaOwnerFootageLink, `
     Open-AttrCudaReadOnlyHandle, `
     New-AttrCudaVerifiedClipBinding, `
