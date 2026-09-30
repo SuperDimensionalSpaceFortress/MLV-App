@@ -831,6 +831,7 @@ class CandidateAcceptanceTests(unittest.TestCase):
             self.assertFalse(parent_trust["ownerTrusted"])
             self.assertTrue(any(item["unsafeWriteGrants"] for item in trust["pathTrust"][:-1]))
 
+    @unittest.skipUnless(os.name == "nt", "Windows trust probe needs the system powershell.exe")
     def test_trust_probe_reports_module_evidence_even_when_the_token_grants_replacement(self) -> None:
         # The runner shape, simulated: the protected-module pinning holds but the token (an elevated
         # admin) holds Delete on the real curl path chain. The PROBE (process + module pinning) must
