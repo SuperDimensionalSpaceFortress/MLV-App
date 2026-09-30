@@ -70,7 +70,9 @@ jobs:
   repo-hygiene-python:
     name: Repo Hygiene Python (${{ matrix.os }})
     runs-on: ${{ matrix.os }}
-    timeout-minutes: 45
+    # windows-latest ran the suite in 44m54s against a 45m cap (PR #204), so the next added test turned a green job
+    # into a cancelled one ("exceeded the maximum execution time", 45m9s on PR #209) with no test failing.
+    timeout-minutes: 75
     strategy:
       fail-fast: false
       matrix:
