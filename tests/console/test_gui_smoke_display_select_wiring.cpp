@@ -87,6 +87,10 @@ TEST(GuiSmokeDisplaySelectWiring, InventoryLogsEveryScreenWithIdentityGeometryAn
     // Physical pixels = geometry size x devicePixelRatio, not the logical (scaled) size.
     ASSERT_TRUE(body.contains(QStringLiteral("qRound( geo.width() * dpr )")));
     ASSERT_TRUE(body.contains(QStringLiteral("qRound( geo.height() * dpr )")));
+    // UM-DISPLAY-QT-WINDOWS-MAPPING-PROOF-1: the derived GDI device rides on the same line, so the
+    // recorded log always says which \\.\DISPLAYn the app believes each QScreen is (empty = unknown).
+    ASSERT_TRUE(body.contains(QStringLiteral("primary=%14 device=\\\"%15\\\"")));
+    ASSERT_TRUE(body.contains(QStringLiteral(".arg( playbackSmokeScreenGdiDevice( s ) );")));
 }
 
 TEST(GuiSmokeDisplaySelectWiring, TargetChoosesMaxPhysicalPixelsTieRefreshThenPrimary)
@@ -128,39 +132,79 @@ TEST(GuiSmokeDisplaySelectWiring, TargetChoosesMaxPhysicalPixelsTieRefreshThenPr
 
 TEST(GuiSmokeDisplaySelectWiring, PreferredDisplayMatchesNameModelOrManufacturerCaseInsensitively)
 {
+    // The rules moved to DisplayDeviceMapping.h (UM-DISPLAY-QT-WINDOWS-MAPPING-PROOF-1) so the
+    // recorded UM values can drive them as real unit tests; MainWindow.cpp only feeds it the screen.
     const QString source = readRepoFile(QStringLiteral("platform/qt/MainWindow.cpp"));
     const int fnAt = source.indexOf(QStringLiteral(
         "static QString playbackSmokeDisplayPreferenceMatchedField("));
     ASSERT_TRUE(fnAt >= 0);
-    const QString tail = source.mid(fnAt, 1600);
-    ASSERT_TRUE(tail.contains(QStringLiteral("screen->name().contains( preferSubstring, Qt::CaseInsensitive )")));
-    ASSERT_TRUE(tail.contains(QStringLiteral("screen->model().contains( preferSubstring, Qt::CaseInsensitive )")));
-    ASSERT_TRUE(tail.contains(QStringLiteral("screen->manufacturer().contains( preferSubstring, Qt::CaseInsensitive )")));
+    const QString tail = source.mid(fnAt, 900);
+    ASSERT_TRUE(tail.contains(QStringLiteral("DisplayDeviceMapping::preferenceMatchedField(")));
+    ASSERT_TRUE(tail.contains(QStringLiteral("screen->name(), screen->model(), screen->manufacturer(),")));
+
+    const QString mapping = readRepoFile(QStringLiteral("platform/qt/DisplayDeviceMapping.h"));
+    ASSERT_TRUE(mapping.contains(QStringLiteral("screenName.contains( prefer, Qt::CaseInsensitive )")));
+    ASSERT_TRUE(mapping.contains(QStringLiteral("model.contains( prefer, Qt::CaseInsensitive )")));
+    ASSERT_TRUE(mapping.contains(QStringLiteral("manufacturer.contains( prefer, Qt::CaseInsensitive )")));
 }
 
 // UM-DISPLAY-SELECT-AND-LOG-1 round 2 (sol PRE-REVIEW #2 BLOCKER a). The job resolves the
-// preferred Windows monitor name ('ASUS PA329C') to its GDI device name and hands the app THAT
-// (Qt reports QScreen::name() as the GDI device name with an empty model on the measured UM
-// topology). A device name is matched for EXACT equality first -- a substring match would make
-// \\.\DISPLAY1 also select \\.\DISPLAY10 -- and reported as its own matched field. MUTATION
-// CAUGHT: deleting the exact-name branch (the preference then matches nothing on that topology).
-TEST(GuiSmokeDisplaySelectWiring, PreferredDeviceNameIsMatchedExactlyBeforeTheSubstringFields)
+// preferred Windows monitor name ('ASUS PA329C') to its GDI device name and hands the app THAT.
+// A device name is matched for EXACT equality first -- a substring match would make
+// \\.\DISPLAY1 also select \\.\DISPLAY10 -- and reported as its own matched field.
+// UM-DISPLAY-QT-WINDOWS-MAPPING-PROOF-1: it is compared with the GDI device DERIVED for the
+// screen (native origin + physical size), because QScreen::name() is the EDID friendly name on a
+// monitor that has one (measured on UM). MUTATION CAUGHT: passing screen->name() as the only
+// candidate again (the preference then matches nothing on that topology); deleting the exact
+// branch; letting a device preference fall through to the substring fields. The behaviour itself
+// is pinned by test_display_device_mapping.cpp; this pins the wiring that feeds it.
+TEST(GuiSmokeDisplaySelectWiring, PreferredDeviceNameIsMatchedExactlyAgainstTheDerivedGdiDevice)
 {
     const QString source = readRepoFile(QStringLiteral("platform/qt/MainWindow.cpp"));
     const int fnAt = source.indexOf(QStringLiteral(
         "static QString playbackSmokeDisplayPreferenceMatchedField("));
     ASSERT_TRUE(fnAt >= 0);
-    const QString tail = source.mid(fnAt, 1600);
-    const int deviceBranchAt = tail.indexOf(QStringLiteral("preferSubstring.startsWith( QStringLiteral( \"\\\\\\\\.\\\\\" ) )"));
-    const int exactAt = tail.indexOf(QStringLiteral(
-        "screen->name().compare( preferSubstring, Qt::CaseInsensitive ) == 0"));
-    const int substringAt = tail.indexOf(QStringLiteral("screen->name().contains( preferSubstring, Qt::CaseInsensitive )"));
+    const QString tail = source.mid(fnAt, 900);
+    ASSERT_TRUE(tail.contains(QStringLiteral(
+        "preferSubstring.startsWith( QStringLiteral( \"\\\\\\\\.\\\\\" ) ) ? playbackSmokeScreenGdiDevice( screen ) : QString(),")));
+
+    const QString mapping = readRepoFile(QStringLiteral("platform/qt/DisplayDeviceMapping.h"));
+    const int deviceBranchAt = mapping.indexOf(QStringLiteral("prefer.startsWith( QStringLiteral( \"\\\\\\\\.\\\\\" ) )"));
+    const int derivedAt = mapping.indexOf(QStringLiteral(
+        "gdiDevice.compare( prefer, Qt::CaseInsensitive ) == 0"), deviceBranchAt);
+    const int exactAt = mapping.indexOf(QStringLiteral(
+        "screenName.compare( prefer, Qt::CaseInsensitive ) == 0"), deviceBranchAt);
+    const int substringAt = mapping.indexOf(QStringLiteral("screenName.contains( prefer, Qt::CaseInsensitive )"));
     ASSERT_TRUE(deviceBranchAt >= 0);
-    ASSERT_TRUE(exactAt > deviceBranchAt);
-    ASSERT_TRUE(tail.contains(QStringLiteral("QStringLiteral(\"device_name\")")));
+    ASSERT_TRUE(derivedAt > deviceBranchAt);
+    ASSERT_TRUE(exactAt > derivedAt);
+    ASSERT_TRUE(mapping.contains(QStringLiteral("QStringLiteral(\"device_name\")")));
     // A device-name preference NEVER falls through to the substring fields.
     ASSERT_TRUE(substringAt > exactAt);
-    ASSERT_TRUE(tail.mid(deviceBranchAt, substringAt - deviceBranchAt).contains(QStringLiteral("return QString();")));
+    ASSERT_TRUE(mapping.mid(deviceBranchAt, substringAt - deviceBranchAt).contains(QStringLiteral("return QString();")));
+}
+
+// UM-DISPLAY-QT-WINDOWS-MAPPING-PROOF-1: the derivation feeds the mapping the screen's NATIVE origin
+// (geometry().topLeft() -- Qt divides only the SIZE by the DPR) and PHYSICAL size, against the Win32
+// monitor list; a Qt origin scaled by dpr, or a logical size, would never match a GDI rect on a
+// scaled desktop (UM runs at 150%).
+TEST(GuiSmokeDisplaySelectWiring, TheGdiDeviceIsDerivedFromNativeOriginAndPhysicalSizeAgainstEnumDisplayMonitors)
+{
+    const QString source = readRepoFile(QStringLiteral("platform/qt/MainWindow.cpp"));
+    const QString body = functionBody(source,
+        QStringLiteral("static QString playbackSmokeScreenGdiDevice( QScreen *screen )"),
+        QStringLiteral("static QString playbackSmokeDisplayPreferenceMatchedField("));
+    ASSERT_FALSE(body.isEmpty());
+    ASSERT_TRUE(body.contains(QStringLiteral("DisplayDeviceMapping::gdiDeviceForScreen(")));
+    ASSERT_TRUE(body.contains(QStringLiteral("geo.topLeft(),")));
+    ASSERT_TRUE(body.contains(QStringLiteral("QSize( qRound( geo.width() * dpr ), qRound( geo.height() * dpr ) ),")));
+    ASSERT_TRUE(body.contains(QStringLiteral("DisplayDeviceMapping::enumerateGdiMonitors()")));
+
+    const QString mapping = readRepoFile(QStringLiteral("platform/qt/DisplayDeviceMapping.h"));
+    ASSERT_TRUE(mapping.contains(QStringLiteral("EnumDisplayMonitors(")));
+    ASSERT_TRUE(mapping.contains(QStringLiteral("GetMonitorInfoW(")));
+    // Uniqueness: a cloned pair (two monitors on one rect) is UNKNOWN, never the first hit.
+    ASSERT_TRUE(mapping.contains(QStringLiteral("return matches == 1 ? found : QString();")));
 }
 
 TEST(GuiSmokeDisplaySelectWiring, DisplayTargetLineCarriesThePreferredFieldsAppendedAfterFallback)

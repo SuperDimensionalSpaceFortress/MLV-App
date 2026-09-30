@@ -205,6 +205,11 @@ TEST(PlaybackSmokeFullscreenWiring, EnterTriggersTheExistingActionAndVerifiesGeo
     // Appended after the pre-existing fields, never inserted between them.
     ASSERT_TRUE(body.contains(QStringLiteral(
         "presentation_screen=\\\"%10\\\" presentation_physical=%11x%12")));
+    // UM-DISPLAY-QT-WINDOWS-MAPPING-PROOF-1 round 2: a null presentation screen is logged as "none",
+    // never replaced by the primary screen (a default must not stand in for a measured presentation).
+    ASSERT_FALSE(body.contains(QStringLiteral("QApplication::primaryScreen()")));
+    ASSERT_TRUE(body.contains(QStringLiteral(
+        ".arg( presentationScreen ? presentationScreen->name() : QStringLiteral(\"none\") )")));
 
     // Round 2 (CUDA-PLAYBACK-FULLSCREEN-UI-1): the caller now fails closed on this value,
     // so it must actually be returned, not just logged.

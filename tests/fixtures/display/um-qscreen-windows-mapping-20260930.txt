@@ -1,0 +1,57 @@
+# um-qscreen-windows-mapping-20260930.txt -- RECORDED, not synthesized (UM-DISPLAY-QT-WINDOWS-MAPPING-PROOF-1).
+# Source: tools/profiling/ultramagnus/um-display-mapping-probe-job.ps1 run by the UM agent as job
+#   um-display-mapping-probe-r1c on 2026-09-30 (host ULTRA-MAGNUS, interactive console session 1, RTX 4090,
+#   2 monitors, Qt 6.10.2 mingw_64 windows QPA via tools/profiling/qscreen-probe built from this repo).
+# Every line below the header is the job's stdout verbatim EXCEPT one edit: the ASUS monitor's serial
+#   number (a device identifier) is replaced by M1LMQSXXXXXX everywhere it appears, consistently in the
+#   Qt and WMI sections, so the "Qt serial == WMI serial" correspondence still holds.
+# The unmasked raw output is kept with the round evidence (fleet-runs, not committed).
+=====BEGIN CONTEXT=====
+computer=ULTRA-MAGNUS
+user=ULTRA-MAGNUS\obabalola
+session_id=1
+pwsh=7.6.6
+utc=2026-09-30T10:55:15.8572646Z
+os=Microsoft Windows NT 10.0.19045.0
+sm_cmonitors=2
+manufacturer=Gigabyte Technology Co., Ltd. model=Z690 GAMING X DDR4
+hyperv_vm_worker_processes=0
+cpu_total_pct_samples=92.9,95.6,78.8
+=====END CONTEXT=====
+=====BEGIN ENUM_DISPLAY_DEVICES=====
+[{"deviceName":"\\\\.\\DISPLAY1","adapterString":"NVIDIA GeForce RTX 4090","stateFlags":"0x1","attached":true,"primary":false,"modeCollected":true,"posX":3840,"posY":0,"width":3840,"height":2160,"refreshHz":60,"monitors":[{"deviceName":"\\\\.\\DISPLAY1\\Monitor0","deviceString":"ASUS PA329C(DisplayPort)","stateFlags":"0x3","deviceId":"MONITOR\\AUS3264\\{4d36e96e-e325-11ce-bfc1-08002be10318}\\0004","interfacePath":"\\\\?\\DISPLAY#AUS3264#5&cb6b9a9&0&UID4353#{e6f07b5f-ee97-4a90-b076-33f57bf4eaa7}"}]},{"deviceName":"\\\\.\\DISPLAY2","adapterString":"NVIDIA GeForce RTX 4090","stateFlags":"0x5","attached":true,"primary":true,"modeCollected":true,"posX":0,"posY":0,"width":3840,"height":2160,"refreshHz":60,"monitors":[{"deviceName":"\\\\.\\DISPLAY2\\Monitor0","deviceString":"Generic PnP Monitor","stateFlags":"0x3","deviceId":"MONITOR\\GSMC0A0\\{4d36e96e-e325-11ce-bfc1-08002be10318}\\0021","interfacePath":"\\\\?\\DISPLAY#GSMC0A0#5&cb6b9a9&0&UID4352#{e6f07b5f-ee97-4a90-b076-33f57bf4eaa7}"}]},{"deviceName":"\\\\.\\DISPLAY3","adapterString":"NVIDIA GeForce RTX 4090","stateFlags":"0x0","attached":false,"primary":false,"modeCollected":false,"posX":null,"posY":null,"width":null,"height":null,"refreshHz":null,"monitors":[]},{"deviceName":"\\\\.\\DISPLAY4","adapterString":"NVIDIA GeForce RTX 4090","stateFlags":"0x0","attached":false,"primary":false,"modeCollected":false,"posX":null,"posY":null,"width":null,"height":null,"refreshHz":null,"monitors":[]},{"deviceName":"\\\\.\\DISPLAY5","adapterString":"Intel(R) UHD Graphics 770","stateFlags":"0x0","attached":false,"primary":false,"modeCollected":false,"posX":null,"posY":null,"width":null,"height":null,"refreshHz":null,"monitors":[]},{"deviceName":"\\\\.\\DISPLAY6","adapterString":"Intel(R) UHD Graphics 770","stateFlags":"0x0","attached":false,"primary":false,"modeCollected":false,"posX":null,"posY":null,"width":null,"height":null,"refreshHz":null,"monitors":[]},{"deviceName":"\\\\.\\DISPLAY7","adapterString":"Intel(R) UHD Graphics 770","stateFlags":"0x0","attached":false,"primary":false,"modeCollected":false,"posX":null,"posY":null,"width":null,"height":null,"refreshHz":null,"monitors":[]},{"deviceName":"\\\\.\\DISPLAY8","adapterString":"Intel(R) UHD Graphics 770","stateFlags":"0x0","attached":false,"primary":false,"modeCollected":false,"posX":null,"posY":null,"width":null,"height":null,"refreshHz":null,"monitors":[]}]
+=====END ENUM_DISPLAY_DEVICES=====
+=====BEGIN GET_MONITOR_INFO=====
+[{"szDevice":"\\\\.\\DISPLAY1","left":2560,"top":0,"right":5120,"bottom":1440,"primary":false},{"szDevice":"\\\\.\\DISPLAY2","left":0,"top":0,"right":2560,"bottom":1440,"primary":true}]
+=====END GET_MONITOR_INFO=====
+=====BEGIN QUERY_DISPLAY_CONFIG=====
+[{"gdiName":"\\\\.\\DISPLAY1","friendlyName":"PA329C","devicePath":"\\\\?\\DISPLAY#AUS3264#5&cb6b9a9&0&UID4353#{e6f07b5f-ee97-4a90-b076-33f57bf4eaa7}","edidManufacturerIdRaw":45830,"edidManufacturerDecode":"LXF","edidManufacturerDecodeSwapped":"AUS","edidProductCodeId":12900,"edidProductCodeHex":"3264","connectorInstance":0,"outputTechnology":10},{"gdiName":"\\\\.\\DISPLAY2","friendlyName":"LG TV","devicePath":"\\\\?\\DISPLAY#GSMC0A0#5&cb6b9a9&0&UID4352#{e6f07b5f-ee97-4a90-b076-33f57bf4eaa7}","edidManufacturerIdRaw":27934,"edidManufacturerDecode":"[H^","edidManufacturerDecodeSwapped":"GSM","edidProductCodeId":49312,"edidProductCodeHex":"C0A0","connectorInstance":0,"outputTechnology":5}]
+=====END QUERY_DISPLAY_CONFIG=====
+=====BEGIN WMI_MONITOR_ID=====
+[{"instanceName":"DISPLAY\\AUS3264\\5&cb6b9a9&0&UID4353_0","active":true,"manufacturerName":"AUS","productCodeId":"3264","serialNumberId":"M1LMQSXXXXXX","userFriendlyName":"PA329C","yearOfManufacture":2021,"weekOfManufacture":4},{"instanceName":"DISPLAY\\GSMC0A0\\5&cb6b9a9&0&UID4352_0","active":true,"manufacturerName":"GSM","productCodeId":"C0A0","serialNumberId":"16843009","userFriendlyName":"LG TV","yearOfManufacture":2019,"weekOfManufacture":1}]
+=====END WMI_MONITOR_ID=====
+=====BEGIN QT_PROBE=====
+probe_zip_sha256=db60003380da22cc354db4ae087461c27cdd4f05c09408a45bea8fae660b37da
+probe_exit=0
+qscreen_probe.qt_version 6.10.2
+qscreen_probe.platform windows
+qscreen_probe.screen_count 2
+qscreen_probe.gdi_monitor device="\\.\DISPLAY1" rect=3840,0 3840x2160
+qscreen_probe.gdi_monitor device="\\.\DISPLAY2" rect=0,0 3840x2160
+gui_smoke.display_screen index=0 name="LG TV" manufacturer="on" model="LG TV" serial="16843009" geometry=0,0 2560x1440 physical=3840x2160 dpr=1.50 refresh_hz=60.000 primary=1 device="\\.\DISPLAY2"
+qscreen_probe.detail index=0 physical_size_mm=1600.0x900.0 logical_dpi=96.00 physical_dpi=40.64 available=0,0 2560x1400 siblings=2
+qscreen_probe.prefer_match index=0 name="LG TV" prefer="\\.\DISPLAY1" matched=""
+qscreen_probe.prefer_match index=0 name="LG TV" prefer="PA329C" matched=""
+qscreen_probe.prefer_match index=0 name="LG TV" prefer="\\.\DISPLAY2" matched="device_name"
+qscreen_probe.prefer_match index=0 name="LG TV" prefer="\\.\DISPLAY9" matched=""
+qscreen_probe.prefer_match index=0 name="LG TV" prefer="\\.\DISPLAY" matched=""
+gui_smoke.display_screen index=1 name="PA329C" manufacturer="ASUSTek COMPUTER INC" model="PA329C" serial="M1LMQSXXXXXX" geometry=3840,0 2560x1440 physical=3840x2160 dpr=1.50 refresh_hz=59.997 primary=0 device="\\.\DISPLAY1"
+qscreen_probe.detail index=1 physical_size_mm=708.0x399.0 logical_dpi=96.00 physical_dpi=91.76 available=3840,0 2560x1440 siblings=2
+qscreen_probe.prefer_match index=1 name="PA329C" prefer="\\.\DISPLAY1" matched="device_name"
+qscreen_probe.prefer_match index=1 name="PA329C" prefer="PA329C" matched="name"
+qscreen_probe.prefer_match index=1 name="PA329C" prefer="\\.\DISPLAY2" matched=""
+qscreen_probe.prefer_match index=1 name="PA329C" prefer="\\.\DISPLAY9" matched=""
+qscreen_probe.prefer_match index=1 name="PA329C" prefer="\\.\DISPLAY" matched=""
+qscreen_probe.json [{"devicePixelRatio":1.5,"geometryHeight":1440,"geometryWidth":2560,"geometryX":0,"geometryY":0,"index":0,"manufacturer":"on","model":"LG TV","name":"LG TV","physicalHeight":2160,"physicalWidth":3840,"primary":true,"refreshRate":60,"serialNumber":"16843009"},{"devicePixelRatio":1.5,"geometryHeight":1440,"geometryWidth":2560,"geometryX":3840,"geometryY":0,"index":1,"manufacturer":"ASUSTek COMPUTER INC","model":"PA329C","name":"PA329C","physicalHeight":2160,"physicalWidth":3840,"primary":false,"refreshRate":59.997,"serialNumber":"M1LMQSXXXXXX"}]
+=====END QT_PROBE=====
+JOB_DONE

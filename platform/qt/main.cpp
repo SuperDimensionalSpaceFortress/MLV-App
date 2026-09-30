@@ -1328,9 +1328,12 @@ static int runGuiPlaybackSmoke(QApplication &app)
     // matched against QScreen name/model/manufacturer), used ONLY as a tie-break among the
     // displays already tied for the most physical pixels -- real resolution always wins
     // first. Empty (the default) means no preference. See choosePlaybackSmokeDisplayTarget().
+    // A value starting with \\.\ is a GDI device name (\\.\DISPLAYn) compared for equality against
+    // the device the app DERIVES per screen (DisplayDeviceMapping.h) -- QScreen::name() is the EDID
+    // friendly name on a monitor that has one, not the GDI name (UM-DISPLAY-QT-WINDOWS-MAPPING-PROOF-1).
     const QCommandLineOption displayPreferOpt(
         QStringLiteral("display-prefer"),
-        QStringLiteral("Case-insensitive substring (matched against name/model/manufacturer) that tie-breaks among displays already tied for the most physical pixels. No effect on the pixel comparison itself."),
+        QStringLiteral("Case-insensitive substring (matched against name/model/manufacturer), or a Windows GDI device name (\\\\.\\DISPLAYn) compared for equality with the device derived for each screen, that tie-breaks among displays already tied for the most physical pixels. No effect on the pixel comparison itself."),
         QStringLiteral("substring"));
     parser.addOption(displayPreferOpt);
 

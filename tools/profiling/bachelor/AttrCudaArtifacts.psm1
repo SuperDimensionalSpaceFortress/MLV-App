@@ -3147,11 +3147,15 @@ function Resolve-AttrCudaPreferredDisplay {
     GDI device name (\\.\DISPLAYn) the app can match exactly -- UM-DISPLAY-SELECT-AND-LOG-1
     round 2 (sol PRE-REVIEW #2 BLOCKER a).
     .DESCRIPTION
-    Qt on Windows reports QScreen::name() as the GDI device name and, on the measured UM
-    topology, an empty model/manufacturer, so a monitor-name substring ('PA329C') matches neither
-    field and the preference silently vanishes (the refresh tie then falls to the primary -- the
-    Denon/LG). The Windows inventory already pairs each deviceName with its monitorName, so the
-    job resolves the pair here and hands the app the device name. Statuses (recorded, never
+    The Windows inventory pairs each deviceName with its monitorName, so the job resolves the pair
+    here and hands the app the GDI device name. CORRECTED (UM-DISPLAY-QT-WINDOWS-MAPPING-PROOF-1):
+    this used to claim QScreen::name() IS the GDI device name. It is not, on a monitor that has an
+    EDID name: measured on UM (Qt 6.10.2, session 1) name()/model() are the friendly name
+    ('PA329C', 'LG TV'), and only a monitor without one reports '\\.\DISPLAYn'. The app therefore
+    derives each screen's GDI device from its native origin + physical size
+    (platform/qt/DisplayDeviceMapping.h, logged as display_screen device=) and compares THAT with
+    the device name handed over here; before that fix the preference silently vanished and the
+    equal-4K refresh tie fell to the primary (the LG TV). Statuses (recorded, never
     gated): 'mapped' (exactly one device's monitorName contains the substring, case-insensitive;
     argument = its deviceName), 'ambiguous' (two or more), 'absent' (none), 'unknown' (the
     inventory itself is unreadable), 'none' (no preference configured). In every non-mapped case
