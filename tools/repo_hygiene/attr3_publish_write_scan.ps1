@@ -407,7 +407,12 @@ foreach ($generator in $GeneratorPath) {
     }
     # Placeholders (__NAME__) are substituted by the generator, some outside quotes; a neutral
     # variable keeps the template parseable without granting it any proof.
-    Invoke-Scan $generator ([regex]::Replace($match.Groups[1].Value, '__[A-Z0-9_]+__', '$attrCudaPlaceholder')) $moduleFunctions
+    # DUAL-VENUE-EVIDENCE-1: __SCRATCH_ROOT__ is the job's trusted provisioning boundary (C:\mlvtmp
+    # for bachelor, the venue table's scratchRoot for another venue -- the generator validates it
+    # against the same drive-path allowlist as -AgentRoot). The scan proves the template's SHAPE, so it
+    # reads that token as the literal boundary the R2/R5 rules name, not as an unproven placeholder.
+    $shapeText = $match.Groups[1].Value.Replace('__SCRATCH_ROOT__', 'C:\mlvtmp')
+    Invoke-Scan $generator ([regex]::Replace($shapeText, '__[A-Z0-9_]+__', '$attrCudaPlaceholder')) $moduleFunctions
 }
 foreach ($file in $TemplateFile) {
     Invoke-Scan $file ([IO.File]::ReadAllText($file)) $moduleFunctions

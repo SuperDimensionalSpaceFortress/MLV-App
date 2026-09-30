@@ -352,6 +352,13 @@ function Resolve-DualVenueRoots {
     $script:venueAgentRoot = [string]$entry.agentRoot
     $script:venueScratchRoot = [string]$entry.scratchRoot
     $script:venueExpectedHost = [string]$entry.expectedHost
+    # The scratch root is baked into single-quoted literals and is a deletion boundary
+    # (Remove-AttrCudaTree -TrustedRoot): same allowlist as -AgentRoot, and the agent root must sit under it.
+    if ($script:venueScratchRoot -notmatch '^[A-Za-z]:\\[A-Za-z0-9 _.\\-]+$' -or $script:venueAgentRoot -notmatch '^[A-Za-z]:\\[A-Za-z0-9 _.\\-]+$' -or
+        -not $script:venueAgentRoot.StartsWith($script:venueScratchRoot + '\', [StringComparison]::OrdinalIgnoreCase) -or
+        $script:venueExpectedHost -notmatch '^[A-Za-z0-9-]+$') {
+        throw 'DUAL_VENUE_TABLE_INVALID the venue table entry has a root or host outside the allowlist, or the agent root is not under the scratch root'
+    }
     if (-not $script:agentRootWasBound) { $script:AgentRoot = $script:venueAgentRoot }
 }
 

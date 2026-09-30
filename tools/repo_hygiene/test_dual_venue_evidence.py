@@ -163,6 +163,19 @@ class GeneratorByteIdentityAndVariantTests(unittest.TestCase):
             self.assertIn(token, proc.stdout + proc.stderr)
             self.assertFalse(out.exists())
 
+    def test_a_venue_table_root_outside_the_allowlist_is_refused(self) -> None:
+        table = json.loads((DV / "venues.json").read_text(encoding="utf-8"))
+        table["venues"]["ultra-magnus"]["scratchRoot"] = "G:\\Temp\\x'; Remove-Item C:\\ #"
+        bad = self.tmp / "bad-venues.json"
+        bad.write_text(json.dumps(table), encoding="utf-8")
+        out = self.tmp / "bad-table.job.ps1"
+        proc = run_pwsh(["-File", str(GENERATOR), "-SourceCommit", self.head, "-BuildManifestSha256", "ab" * 32, "-ClipId", FIXTURE_IDS[0],
+                         "-FixtureSha256", "cd" * 32, "-RepoRoot", str(ROOT), "-OutFile", str(out), "-Venue", "ultra-magnus",
+                         "-VenueTablePath", str(bad)])
+        self.assertNotEqual(proc.returncode, 0)
+        self.assertIn("DUAL_VENUE_TABLE_INVALID", proc.stdout + proc.stderr)
+        self.assertFalse(out.exists())
+
     def test_venues_json_bachelor_entry_equals_the_generator_defaults(self) -> None:
         table = json.loads((DV / "venues.json").read_text(encoding="utf-8"))
         self.assertEqual(table["venues"]["bachelor"]["agentRoot"], "C:\\mlvtmp\\mlv-agent")
