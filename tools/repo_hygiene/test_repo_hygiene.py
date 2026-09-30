@@ -977,7 +977,7 @@ class RepoHygieneTests(unittest.TestCase):
 
         expected_timeouts = {
             "protected-check-route": 10,
-            "repo-hygiene-python": 75,  # windows-latest needs ~45 min; a 45 min cap was a cliff (PR #209)
+            "repo-hygiene-python": 45,
             "windows-product-oracles": 120,
             "windows-gui-pilot": 60,
             "batch-compile": 30,
