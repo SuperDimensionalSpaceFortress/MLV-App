@@ -3,7 +3,7 @@
 # The settled-grab gates (review-dualiso-fullres-recon.ps1, run-release-gui-smoke.ps1 single screenshot)
 # are BLIND to the LIVE look: the cold (first-uncached) pass, the dark->bright Look Assist shift, temporal
 # grain/chroma residual, and whether the displayed frame actually ADVANCES. This rebuilds the deleted
-# capturer: it launches the GUI-smoke playback (which auto-plays + loops), PrintWindow-captures the MLVApp
+# capturer: it launches the GUI-smoke playback (which auto-plays ONCE, never loops: a clip under 20 s is refused), PrintWindow-captures the MLVApp
 # window every ~1s into a cap-*.png filmstrip, then runs filmstrip-balance-trace.ps1 so the green/warm
 # cast is quantified per frame. VALIDATE BY PIXELS -- then open the caps and LOOK (the artifact is the
 # verdict; FPS/timer telemetry can read "smooth" over a frozen viewport).
@@ -47,6 +47,16 @@ $balanceScript = Join-Path $PSScriptRoot "filmstrip-balance-trace.ps1"
 $needSeconds = [int]([math]::Ceiling(($SettleMs + $Captures * $IntervalMs) / 1000.0)) + 4
 if ($Seconds -lt $needSeconds) { $Seconds = $needSeconds }
 
+# PLAYBACK-CLIP-LENGTH-ENFORCE-1 (owner rule 2026-09-30): this launches the app directly, so it runs
+# the same clip-length gate run-release-gui-smoke.ps1 does. A clip under 20 s, or shorter than the
+# play window, is refused (exit 41 CLIP_TOO_SHORT / 42 CLIP_LENGTH_UNKNOWN); --loop is never passed.
+. (Join-Path $PSScriptRoot 'gui-smoke-clip-length.ps1')
+$clipLengthGate = Test-GuiSmokeClipLength -Path $clip -WindowSeconds $Seconds
+if ($clipLengthGate.verdict -ne 'OK') {
+    [Console]::Error.WriteLine("PLAYBACK-CLIP-LENGTH-ENFORCE-1: $($clipLengthGate.message)")
+    exit $(if ($clipLengthGate.verdict -eq 'CLIP_TOO_SHORT') { 41 } else { 42 })
+}
+
 $argList = @(
     "--gui-smoke-playback",
     "--input", $clip,
@@ -56,8 +66,7 @@ $argList = @(
     "--settle-ms", "2500",
     "--settle-cpu-percent", "10",
     "--settle-cpu-stable-ms", "1000",
-    "--settle-cpu-max-ms", "45000",
-    "--loop"
+    "--settle-cpu-max-ms", "45000"
 )
 if ($NoLookAssist) { $argList += "--no-look-assist" }
 if (-not [string]::IsNullOrWhiteSpace($Receipt)) { $argList += @("--receipt", (Resolve-Path -LiteralPath $Receipt).Path) }

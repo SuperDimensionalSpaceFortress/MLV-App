@@ -80,13 +80,25 @@ $env:MLVAPP_CRASH_FORENSICS_LOG_DIR    = $OutDir
 $applied = @('MLVAPP_PLAYBACK_PHASE3_UNATTENDED','MLVAPP_PLAYBACK_SMOKE_TELEMETRY','MLVAPP_INTERACTIVE_TRACE','MLVAPP_CRASH_FORENSICS_LOG_DIR')
 foreach ($k in $ExtraEnv.Keys) { Set-Item -Path ("env:" + $k) -Value ([string]$ExtraEnv[$k]); $applied += $k }
 
+# PLAYBACK-CLIP-LENGTH-ENFORCE-1 (owner rule 2026-09-30): this launches the app directly, so it runs the
+# same clip-length gate run-release-gui-smoke.ps1 does (>= 20 s of footage, window never exceeds it).
+# A pinned-frame capture (-PresentedFrames N) has no wall-clock window (-Seconds is only its fail-closed
+# timeout), so only the 20 s floor applies there. Exit 41 CLIP_TOO_SHORT / 42 CLIP_LENGTH_UNKNOWN.
+. (Join-Path $PSScriptRoot 'gui-smoke-clip-length.ps1')
+$clipLengthGate = Test-GuiSmokeClipLength -Path $Clip -WindowSeconds $(if ($PresentedFrames -gt 0) { 0 } else { $Seconds })
+if ($clipLengthGate.verdict -ne 'OK') {
+    Write-Output "CAPTURE: REFUSED - $($clipLengthGate.message)"
+    exit $(if ($clipLengthGate.verdict -eq 'CLIP_TOO_SHORT') { 41 } else { 42 })
+}
+
 $shot = Join-Path $OutDir 'reference-frame.png'
 # --loop is DELIBERATELY ABSENT when the frame is pinned: looping wraps the timeline and
 # reintroduces exactly the which-frame ambiguity --presented-frames exists to remove.
 $playArgs = @('--gui-smoke-playback','--input',$Clip,'--scope','none','--no-zebras',
               '--seconds',[string]$Seconds,'--settle-ms',[string]$SettleMs,'--start-frame','0','--drop-frame-mode',$DropFrameMode)
 if ($PresentedFrames -gt 0) { $playArgs += @('--presented-frames',[string]$PresentedFrames) }
-else                        { $playArgs += @('--loop') }
+# PLAYBACK-CLIP-LENGTH-ENFORCE-1 (owner rule 2026-09-30): the old time-based fallback passed --loop.
+# Looping is never allowed; a time-based capture plays once over a window the clip outlasts.
 $playArgs += @('--screenshot-output',$shot)
 $proc = Start-Process -FilePath $Exe -NoNewWindow -PassThru -Wait `
     -ArgumentList $playArgs `

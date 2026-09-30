@@ -26655,6 +26655,13 @@ void MainWindow::finishPlaybackSmokeTelemetry( const char *reason )
 
     m_playbackSmokeActive = false;
 
+    // PLAYBACK-CLIP-LENGTH-ENFORCE-1: the loaded clip's own length, printed on the summary and
+    // gate lines so a receipt carries the footage length the measured window actually played.
+    const int smokeClipTotalFrames = m_pMlvObject ? static_cast<int>( getMlvFrames( m_pMlvObject ) ) : 0;
+    const double smokeClipFps = m_pMlvObject ? static_cast<double>( getMlvFramerate( m_pMlvObject ) ) : 0.0;
+    const double smokeClipSeconds =
+        ( smokeClipTotalFrames > 0 && smokeClipFps > 0.0 ) ? smokeClipTotalFrames / smokeClipFps : 0.0;
+
     // CUDA-PLAYBACK-CONTACT-SHEET-2 (HARDENING): the "playback_smoke.measured_session id=N"
     // marker is now logged from runGuiPlaybackSmoke() itself, right after the measured play
     // trigger that opens this very session -- see the comment there. Binding it to the first
@@ -26696,7 +26703,8 @@ void MainWindow::finishPlaybackSmokeTelemetry( const char *reason )
                "present_nothing_drops=%64 "
                "gpu_texture_route_scale_clamp_active=%65 "
                "gpu_texture_route_scale_clamp_requested_scale=%66 "
-               "screensaver_blocked_count=%67" )
+               "screensaver_blocked_count=%67 "
+               "wrapped=%68 total_frames=%69 clip_seconds=%70" )
                .arg( static_cast<qulonglong>( m_playbackSmokeSessionId ) )
                .arg( QString::fromLatin1( reason ? reason : "unknown" ) )
                .arg( elapsedMs, 0, 'f', 3 )
@@ -26777,7 +26785,13 @@ void MainWindow::finishPlaybackSmokeTelemetry( const char *reason )
                .arg( m_playbackScaleClampedForGpuTextureRouteRequestedScale )
                // CUDA-PERF-DISPLAY-WAKE-2: how many WM_SYSCOMMAND SC_SCREENSAVE/SC_MONITORPOWER
                // refusals nativeEvent() issued this session -- see m_playbackScreensaverBlockedCount.
-               .arg( static_cast<qulonglong>( m_playbackScreensaverBlockedCount ) );
+               .arg( static_cast<qulonglong>( m_playbackScreensaverBlockedCount ) )
+               // PLAYBACK-CLIP-LENGTH-ENFORCE-1 (owner rule 2026-09-30): the runtime backstop. A
+               // venue playback leg never loops a short clip; the runner turns wrapped=1 into
+               // INVALID_LOOPED and never a PASS, whatever the pre-launch length check said.
+               .arg( bool01( m_playbackSmokeWrapped ) )
+               .arg( smokeClipTotalFrames )
+               .arg( smokeClipSeconds, 0, 'f', 3 );
 
     qInfo().noquote()
         << QStringLiteral(
@@ -27403,13 +27417,17 @@ void MainWindow::finishPlaybackSmokeTelemetry( const char *reason )
     qInfo().noquote()
         << QStringLiteral(
                "playback_smoke.gate session=%1 verdict=%2 frames_presented=%3 "
-               "decode_requests_issued=%4 parity_match_count=%5 frames_expected=%6" )
+               "decode_requests_issued=%4 parity_match_count=%5 frames_expected=%6 "
+               "wrapped=%7 total_frames=%8 clip_seconds=%9" )
                .arg( static_cast<qulonglong>( m_playbackSmokeSessionId ) )
                .arg( static_cast<int>( gateVerdict ) )
                .arg( m_playbackSmokePresentedFrames )
                .arg( static_cast<qulonglong>( decodeRequestsIssuedDelta ) )
                .arg( m_playbackSmokeParityMatchCount )
-               .arg( m_playbackSmokeTargetPresentedFrames );
+               .arg( m_playbackSmokeTargetPresentedFrames )
+               .arg( bool01( m_playbackSmokeWrapped ) )
+               .arg( smokeClipTotalFrames )
+               .arg( smokeClipSeconds, 0, 'f', 3 );
 
     // Window foreground state at session begin and at this gate, plus how many times the
     // whole application lost the OS foreground during the session (event-driven via

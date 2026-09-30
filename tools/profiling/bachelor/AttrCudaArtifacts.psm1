@@ -793,6 +793,10 @@ function Save-AttrCudaCommittedBlobBytes {
 # UM-DISPLAY-SELECT-AND-LOG-1 round 3: added gui-smoke-display-identity.ps1 -- the ONE parser for
 # the app's gui_smoke.display_screen/display_target/window_placement lines, dot-sourced by the
 # runner and embedded verbatim into the attribution job (see that file's header).
+#
+# PLAYBACK-CLIP-LENGTH-ENFORCE-1: added gui-smoke-clip-length.ps1 -- the runner dot-sources it (the
+# clip-length gate that refuses a clip under 20 s or shorter than the play window), so the venue's
+# staged closure must carry it or the runner dies at its first dot-source.
 $script:AttrCudaSmokeRunnerClosureManifest = @(
     'tools/profiling/run-release-gui-smoke.ps1',
     'tools/profiling/gui-smoke-screenshot-provenance.ps1',
@@ -800,7 +804,8 @@ $script:AttrCudaSmokeRunnerClosureManifest = @(
     'tools/profiling/gui-smoke-process-boundary.psm1',
     'tools/profiling/gui-smoke-color-artifact-scan.ps1',
     'tools/profiling/gui-smoke-gpu-texture-route-validation.ps1',
-    'tools/profiling/gui-smoke-display-identity.ps1'
+    'tools/profiling/gui-smoke-display-identity.ps1',
+    'tools/profiling/gui-smoke-clip-length.ps1'
 )
 
 function Get-AttrCudaSmokeRunnerClosureManifest {

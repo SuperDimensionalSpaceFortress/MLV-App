@@ -15,8 +15,15 @@ param(
     [ValidateSet("persisted", "on", "off")]
     [string]$DropFrameMode = "persisted",
     [int]$SettleMs = 2500,
-    [switch]$NoLoop,          # default: pass --loop so a short clip plays continuously for the whole
-                              # -Seconds window. Set this to play once then stop (e.g. a frame-matched A/B).
+    # PLAYBACK-CLIP-LENGTH-ENFORCE-1 -- OWNER RULE 2026-09-30 SUPERSEDES the 2026-06-26 "loop short
+    # clips" rule that used to live here: NO-LOOP IS THE DEFAULT. A venue playback leg plays >= 20 s
+    # of real footage once and never loops (a looped 16-frame clip is not a playback result).
+    # -NoLoop is kept only so existing callers still bind; it is now a no-op.
+    [switch]$NoLoop,
+    # The ONLY way to pass --loop. Refused unless -LaunchOnlyProbe (a run that cannot produce playback
+    # evidence); allowlist of legitimate uses: NONE tracked. Anything else that plays the app must go
+    # through the clip-length gate below with a clip that outlasts the window.
+    [switch]$AllowLoop,
     [double]$SettleCpuPercent = 10,
     [int]$SettleCpuStableMs = 1000,
     [int]$SettleCpuMaxMs = 45000,
@@ -119,6 +126,7 @@ $validationWarnings = @()
 . (Join-Path $PSScriptRoot 'gui-smoke-color-artifact-scan.ps1')
 . (Join-Path $PSScriptRoot 'gui-smoke-gpu-texture-route-validation.ps1')
 . (Join-Path $PSScriptRoot 'gui-smoke-display-identity.ps1')
+. (Join-Path $PSScriptRoot 'gui-smoke-clip-length.ps1')
 Import-Module (Join-Path $PSScriptRoot 'gui-smoke-process-boundary.psm1') -Force
 . (Join-Path $PSScriptRoot 'provenance-stamp.ps1')
 
@@ -162,9 +170,15 @@ if ($ExerciseClipLifecycleStress -and $DetectPlaybackArtifacts) {
 if ($ArtifactCadenceAdvisory -and -not $DetectPlaybackArtifacts) {
     throw "-ArtifactCadenceAdvisory requires -DetectPlaybackArtifacts."
 }
+if ($AllowLoop -and $NoLoop) {
+    throw "-AllowLoop and -NoLoop contradict each other."
+}
+if ($AllowLoop -and -not $LaunchOnlyProbe) {
+    throw "-AllowLoop is refused: looping a clip is never playback evidence (owner rule 2026-09-30). It is permitted only with -LaunchOnlyProbe."
+}
 if ($LegacyGuiSmokeOptions) {
-    if (-not $NoLoop) {
-        throw "-LegacyGuiSmokeOptions requires -NoLoop because the pinned legacy CLI has no --loop option."
+    if ($AllowLoop) {
+        throw "-LegacyGuiSmokeOptions cannot be combined with -AllowLoop because the pinned legacy CLI has no --loop option."
     }
     if ($DropFrameMode -ne "persisted") {
         throw "-LegacyGuiSmokeOptions supports only the legacy persisted drop-frame default."
@@ -1313,6 +1327,19 @@ $inputPath =
     else {
         $resolvedClipPath.Path
     }
+# PLAYBACK-CLIP-LENGTH-ENFORCE-1 (owner rule 2026-09-30): THE CHOKE POINT. Every venue playback leg
+# goes through this runner, so a clip that is too short to be played for the requested window is
+# refused HERE, before anything is hashed, staged or launched. Typed, path-free, fail-closed:
+#   exit 41 CLIP_TOO_SHORT (clip=<s> window=<s>)   exit 42 CLIP_LENGTH_UNKNOWN (reason=<token>)
+# The only exemption is -AllowLoop, which itself requires -LaunchOnlyProbe (no playback evidence).
+$clipLengthGate = [pscustomobject]@{ verdict = 'SKIPPED_LAUNCH_ONLY_PROBE'; message = 'SKIPPED_LAUNCH_ONLY_PROBE' }
+if (-not $AllowLoop) {
+    $clipLengthGate = Test-GuiSmokeClipLength -Path $inputPath -WindowSeconds $Seconds -StartFrame $StartFrame
+    if ($clipLengthGate.verdict -ne 'OK') {
+        [Console]::Error.WriteLine("PLAYBACK-CLIP-LENGTH-ENFORCE-1: $($clipLengthGate.message)")
+        exit $(if ($clipLengthGate.verdict -eq 'CLIP_TOO_SHORT') { 41 } else { 42 })
+    }
+}
 $smokeReceiptPath = if ([string]::IsNullOrWhiteSpace($Receipt)) {
     $null
 } else {
@@ -1416,8 +1443,10 @@ $arguments += @(
     "--settle-cpu-stable-ms", [string]$SettleCpuStableMs,
     "--settle-cpu-max-ms", [string]$SettleCpuMaxMs
 )
-# RULE 2026-06-26 (Layi): loop short clips so they play the whole -Seconds window (not one pass + stop).
-if (-not $NoLoop) { $arguments += "--loop" }
+# PLAYBACK-CLIP-LENGTH-ENFORCE-1: the 2026-06-26 rule ("loop short clips so they fill -Seconds") is
+# SUPERSEDED by the owner rule of 2026-09-30. --loop is passed ONLY under the explicit -AllowLoop
+# (itself refused unless -LaunchOnlyProbe); the default argument list never contains it.
+if ($AllowLoop) { $arguments += "--loop" }
 if (-not [string]::IsNullOrWhiteSpace($Receipt)) {
     $arguments += @("--receipt", $smokeReceiptPath)
 }
@@ -1703,6 +1732,7 @@ if ($DryRun) {
         exePath = $exe
         workingDirectory = $root
         arguments = $arguments
+        clipLengthGate = $clipLengthGate.verdict
         displayPrefer = $displayPreferRecord
         environment = $launchEnv
         clearsEnvironment = $clearedEnvironment
@@ -2409,6 +2439,25 @@ if ($RequireCpuSettled -and
     -not $preLaunchSystemCpuSettle.settled) {
     $validationFailures += "System CPU did not settle before launching MLVApp."
 }
+# PLAYBACK-CLIP-LENGTH-ENFORCE-1: RUNTIME BACKSTOP. Whatever the pre-launch header check said, a run
+# in which the app's own timeline wrapped (wrapped=1 on playback_smoke.summary) looped the clip and is
+# INVALID_LOOPED -- never a PASS, exit 43. A reported clip length under the floor/window is refused
+# the same way (a header that lied). A binary that predates these fields reports $null: not a wrap.
+$loopWrappedRaw = Get-ObjectPropertyValue $playbackSummary "wrapped"
+$loopTotalFrames = Get-ObjectPropertyValue $playbackSummary "total_frames"
+$loopClipSeconds = Get-ObjectPropertyValue $playbackSummary "clip_seconds"
+$invalidLooped = $false
+if (-not $LaunchOnlyProbe) {
+    if ($null -ne $loopWrappedRaw -and [int]$loopWrappedRaw -ne 0) {
+        $invalidLooped = $true
+        $validationFailures += "INVALID_LOOPED: the playback timeline wrapped (wrapped=1, total_frames=$loopTotalFrames clip_seconds=$loopClipSeconds); a looped short clip is never playback evidence."
+    }
+    if ($null -ne $loopClipSeconds -and [double]$loopClipSeconds -gt 0 -and
+        [double]$loopClipSeconds -lt [Math]::Max($script:GuiSmokeMinClipSeconds, $Seconds)) {
+        $invalidLooped = $true
+        $validationFailures += "INVALID_LOOPED: the app reports clip_seconds=$loopClipSeconds, under max($($script:GuiSmokeMinClipSeconds), window=$Seconds)."
+    }
+}
 if (-not $LaunchOnlyProbe) {
     if ($null -eq $presentedFrames) {
         $validationFailures += "Playback summary did not report presented_frames."
@@ -2724,6 +2773,19 @@ $result = [pscustomobject]@{
             failure = Get-ObjectPropertyValue $clipLifecycleStress "failure"
         }
     }
+    # PLAYBACK-CLIP-LENGTH-ENFORCE-1: what the length gate decided before launch and what the app's
+    # own summary said afterwards (wrapped/total_frames/clip_seconds). loopAllowed is true only for
+    # a -LaunchOnlyProbe, which is never playback evidence.
+    clipLength = [pscustomobject]@{
+        gate = $clipLengthGate.verdict
+        clipSeconds = Get-ObjectPropertyValue $clipLengthGate "clipSeconds"
+        requiredSeconds = Get-ObjectPropertyValue $clipLengthGate "requiredSeconds"
+        loopAllowed = [bool]$AllowLoop
+        runtimeWrapped = $loopWrappedRaw
+        runtimeTotalFrames = $loopTotalFrames
+        runtimeClipSeconds = $loopClipSeconds
+        invalidLooped = $invalidLooped
+    }
     playbackFps = [pscustomobject]@{
         requestedPlaybackSeconds = $Seconds
         requestedPlaybackDurationMs = $requestedPlaybackDurationMs
@@ -2923,7 +2985,7 @@ elseif ($validationFailures.Count -gt 0) {
     foreach ($failure in $validationFailures) {
         Write-Error $failure
     }
-    $scriptExitCode = 2
+    $scriptExitCode = if ($invalidLooped) { 43 } else { 2 }
 }
 }
 finally {

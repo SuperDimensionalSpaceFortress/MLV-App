@@ -272,7 +272,15 @@ param(
     [ValidateRange(0, 7200)]
     [int]$FixedPreLaunchSeconds = 0,
     [ValidateRange(0, 7200)]
-    [int]$PostRunSeconds = 0
+    [int]$PostRunSeconds = 0,
+
+    # PLAYBACK-CLIP-LENGTH-ENFORCE-1 (owner rule 2026-09-30): the settled-playback window the emitted
+    # job passes to run-release-gui-smoke.ps1 as -Seconds (it used to be a hard-coded 40). The
+    # runner refuses, before launching, any clip shorter than max(20, this); a fixture id is refused
+    # HERE, at generation, because both tracked fixtures are far under 20 s and are never played on
+    # a venue. Floor 20: a play window under the owner's 20 s minimum is not a playback test.
+    [ValidateRange(20, 3600)]
+    [int]$PlaySeconds = 25
 )
 
 $ErrorActionPreference = 'Stop'
@@ -473,6 +481,21 @@ $ownerPartsJson = ''
 if (-not $isFixtureRehearsal) {
     $ownerPartsJson = $ownerPartsForJob | ConvertTo-Json -Compress -Depth 5
     if ($ownerPartsForJob.Count -eq 1) { $ownerPartsJson = "[$ownerPartsJson]" }
+}
+
+# PLAYBACK-CLIP-LENGTH-ENFORCE-1: refuse at GENERATION time, with the runner's own typed verdict
+# (one shared implementation), when the clip's known length cannot cover the play window. A fixture
+# id's length is read from its TRACKED header under -RepoRoot (52 bytes, never the footage); an owner
+# clip's bytes are never opened by this generator and the resolver records no frame count, so the
+# owner arm is enforced by the same gate inside the emitted job's run-release-gui-smoke.ps1 call,
+# which reads the clip's header at the venue before anything launches.
+. (Join-Path $PSScriptRoot '..\gui-smoke-clip-length.ps1')
+if ($isFixtureRehearsal) {
+    $fixtureHeaderPath = Join-Path $RepoRoot ('tests' + [IO.Path]::DirectorySeparatorChar + 'fixtures' + [IO.Path]::DirectorySeparatorChar + 'clips' + [IO.Path]::DirectorySeparatorChar + $ClipId + $FixtureClipExtension)
+    $fixtureLengthGate = Test-GuiSmokeClipLength -Path $fixtureHeaderPath -WindowSeconds $PlaySeconds
+    if ($fixtureLengthGate.verdict -ne 'OK') {
+        throw "PLAYBACK_ATTR3_$($fixtureLengthGate.message)"
+    }
 }
 
 # ATTR3-FOOTAGE-BIND-1 PR-B round 6 (astra major): the owner arm's -AgentRoot shape check runs
@@ -765,6 +788,9 @@ $timeBudgetArgs = @{}
 if ($ColdReadMBps -gt 0.0) { $timeBudgetArgs['ColdReadMBps'] = $ColdReadMBps }
 if ($FixedPreLaunchSeconds -gt 0) { $timeBudgetArgs['FixedPreLaunchSeconds'] = $FixedPreLaunchSeconds }
 if ($PostRunSeconds -gt 0) { $timeBudgetArgs['PostRunSeconds'] = $PostRunSeconds }
+# PLAYBACK-CLIP-LENGTH-ENFORCE-1: the smoke-process timeout keeps the old 40 s play allowance as a
+# floor (extra slack only; the default baked timeout is unchanged) and grows with a longer -PlaySeconds.
+$timeBudgetArgs['PlaySeconds'] = [int][Math]::Max(40, $PlaySeconds)
 $timeBudget = Get-AttrCudaLegTimeBudget -InputBytes $clipBytesForBudget @timeBudgetArgs
 
 # --- job body template (placeholders are substituted below; the body itself never
@@ -817,6 +843,7 @@ $Trace = Join-Path $Root "logs\$JobId.trace.txt"
 $PresentMonTimedSeconds = __PRESENTMON_TIMED_SECONDS__
 $PresentMonTerminateOnProcExit = __PRESENTMON_TERMINATE_ON_PROC_EXIT__
 $SmokeProcessTimeoutMs = __SMOKE_PROCESS_TIMEOUT_MS__
+$PlaySeconds = __PLAY_SECONDS__
 # BACHELOR-OWNER-CLIP-STAGE-STALL-1 round 1f: true only when the smoke runner COMMITTED at this leg's
 # -SourceCommit declares -VerifiedClipBindingPath and -TracePath (decided by the generator from those
 # committed bytes -- the venue has no checkout). A runner without them would reject the parameters
@@ -1855,7 +1882,7 @@ $envs = @(
 # default.
 $envList = "'" + ($envs -join "','") + "'"
 function ConvertTo-PsSingleQuoted([string]$Value) { "'" + $Value.Replace("'", "''") + "'" }
-$cmd = "& $(ConvertTo-PsSingleQuoted $smoke) -ExePath $(ConvertTo-PsSingleQuoted $exePath) -Input $(ConvertTo-PsSingleQuoted $clipPath) -Output $(ConvertTo-PsSingleQuoted $resultPath) -Seconds 40 -StartFrame 0 -SettleMs 2500 -ProcessTimeoutMs $SmokeProcessTimeoutMs -ScaleFactor 4 -UsePersistedPlaybackSettings -RequireLookAssist:`$false -Scope none -FrameTelemetry -PreserveExperimentalEnvironment -ExtraEnvironment @($envList)"
+$cmd = "& $(ConvertTo-PsSingleQuoted $smoke) -ExePath $(ConvertTo-PsSingleQuoted $exePath) -Input $(ConvertTo-PsSingleQuoted $clipPath) -Output $(ConvertTo-PsSingleQuoted $resultPath) -Seconds $PlaySeconds -StartFrame 0 -SettleMs 2500 -ProcessTimeoutMs $SmokeProcessTimeoutMs -ScaleFactor 4 -UsePersistedPlaybackSettings -RequireLookAssist:`$false -Scope none -FrameTelemetry -PreserveExperimentalEnvironment -ExtraEnvironment @($envList)"
 if ($RunnerAcceptsVerifiedClipBinding) {
     # BACHELOR-OWNER-CLIP-STAGE-STALL-1 round 1f: the runner's own remaining reads are traced into
     # this job's trace file, and (owner run) it takes the identity verified above instead of re-reading.
@@ -2844,6 +2871,7 @@ $text = Expand-AttrCudaTemplate -Template $template -Tokens ([ordered]@{
     TELEMETRY_ARM = $TelemetryArm
     DISABLE_PAINT_PER_SUBMIT = $disablePaintPerSubmitLiteral
     SMOKE_PROCESS_TIMEOUT_MS = [string]$timeBudget.smokeProcessTimeoutMs
+    PLAY_SECONDS = [string]$PlaySeconds
     RUNNER_ACCEPTS_VERIFIED_CLIP_BINDING = $runnerAcceptsVerifiedClipBindingLiteral
     PRESENTMON_TIMED_SECONDS = $(if ($isFixtureRehearsal) { '55' } else { [string][int][math]::Ceiling($timeBudget.smokeProcessTimeoutMs / 1000.0) })
     PRESENTMON_TERMINATE_ON_PROC_EXIT = $(if ($isFixtureRehearsal) { '$false' } else { '$true' })
