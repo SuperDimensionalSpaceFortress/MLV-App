@@ -191,16 +191,76 @@ parsed field is already a trusted field -- and then requires its `sourceCommit` 
 On Bachelor the emitted job re-verifies each resolved part against the live filesystem, AT ITS
 OWN RESOLVER PATH -- exists, readable, length, and sha256 (case-insensitive) -- through the
 shared `Test-AttrCudaFootagePart` verifier. Once every part passes, the job builds a PRIVATE,
-neutrally-named directory under its own work tree (one hard link per verified part, contiguous,
-never spelled from the caller's real names) and re-verifies each link's identity and content
-against its source before opening anything: playback opens only that private link's part 0
+neutrally-named directory under its own work tree (one VIEW per verified part, contiguous,
+never spelled from the caller's real names) and re-verifies each view's identity and content
+against its source before opening anything: playback opens only that private directory's part 0
 (neutral base name `owner-clip`), never the owner's real path. Nothing this job publishes --
 stdout, `summary.json`, `evidence-manifest.json`, or any other artifact -- ever names a source
-path; every reader-facing output carries only the part's index and status. Any non-`PASS` part,
-or a failure creating/opening/re-verifying a private link, fails closed (`OWNER_FOOTAGE_NOT_VERIFIED`
-exit 19, `OWNER_FOOTAGE_LINK_CROSS_VOLUME` exit 21, or `OWNER_FOOTAGE_LINK_FAILED` exit 22),
-closing whatever handles were already held and removing whatever private links were already
-created, before PresentMon starts, before deploy, and before the smoke child. (The fixture route in
+path; every reader-facing output carries only the part's index and status.
+
+**Owner footage is viewed through symbolic links or verified copies, never hard links
+(OWNER-FOOTAGE-NO-HARDLINK-1, supersedes PR #200 / #203).** *Threat model.* A hard link is a
+second, equal NAME of a file's bytes. Any tool that deletes, sweeps or truncates a path it believes
+is job scratch -- the assembler's recursive `.work-*` delete, a staging partial's cleanup, a lane
+scratch sweep, a write through a leftover link -- can destroy the owner's footage through it, and
+four review rounds kept finding that same class in a new place. The class is removed by changing
+the mechanism, not by narrowing another check:
+
+1. **No code path creates a hard link to owner footage.** `tools/repo_hygiene/
+   test_owner_footage_no_hardlink_class.py` fails on any tracked non-test source under `tools/`
+   that can (`CreateHardLink`, `New-Item -ItemType HardLink`, `fsutil hardlink`, `mklink /H`,
+   `os.link`, `hardlink_to`, ...), with a commented allowlist (today one entry: the workstream-
+   completion ledger's own temp-file publish, which never sees a footage path).
+2. **Each view is a file symbolic link where the venue can create one, else a verified byte copy.**
+   The job asks, at run time, with a typed probe (`Test-AttrCudaSymlinkCapability`: create a
+   symlink to a throwaway file, read a byte back through it; `SYMLINK_CAPABLE` or
+   `SYMLINK_UNAVAILABLE`). Measured 2026-09-30: bachelor can (Developer Mode, non-admin agent);
+   ultra-magnus cannot (not elevated, no Developer Mode) and takes the copy path. A symlink is only
+   a pointer -- deleting it by any route removes the link, never the target's bytes. A copy is a
+   separate file object with one name -- deleting it is harmless -- created with
+   `FileMode.CreateNew`, hash-verified against the consent/stage record before use, refused up
+   front (`OWNER_FOOTAGE_VIEW_NO_SPACE`, exit 21) when the job scratch volume cannot hold every
+   part plus 1 GiB. Both work across volumes, so no cross-volume relocation exists.
+3. **The originals are pinned for the whole run.** Each original is opened read-only with
+   `FileShare.Read` (no write, no delete, no rename granted to anyone else) before its view is
+   built and held until the smoke child has exited. A view is proven to lead to the pinned file
+   object by the identity of the open handle (volume serial + 64-bit file index), not by a path,
+   and `Assert-AttrCudaOwnerFootageViewsIntact` re-checks every view right before the smoke launch
+   (`OWNER_FOOTAGE_VIEW_CHANGED`, exit 24).
+4. **A name this repository made is deleted only through an identity check on the deleting
+   handle** (`Remove-AttrCudaFileById`): the name is opened (a symlink as itself, never followed)
+   with DELETE access, its identity is read off that handle, it must equal the identity recorded
+   when the name was created and the object must still have exactly one name, and only then is the
+   delete disposition set on the same handle. Anything else is left where it is and recorded.
+   Used for the view copies and symlinks, the staging job's target-volume partial and placed
+   target, the share-side staged copy (accepted only if first seen with a single name) and
+   `Send-AttrCudaOwnerFootagePartToStaging`'s partial. The emitted staging job deletes nothing by
+   pathname any more.
+5. **Nothing opens an original, a view entry or a staged copy for write.** The class guard also
+   fails on `FileMode.Create/Truncate/OpenOrCreate/Append`, `FileAccess.Write/ReadWrite`,
+   `File.WriteAll*/AppendAll*/Create/Replace`, `Set-Content/Out-File/Add-Content/Clear-Content`,
+   `Copy-Item -Force`, `New-Item -Force` and redirection in every source that can reach footage,
+   unless the exact line is listed with the reason its target cannot be one; the delete/rename
+   class stays pinned by the I/O inventory (`test_attr3_footage_io_inventory.py`).
+6. **Backstops.** `Remove-AttrCudaTree` (the recursive scratch delete every build-route job
+   embeds) refuses a tree in which any file has a second name (`ATTRCUDA_TREE_HAS_HARD_LINK`),
+   exactly as it already refuses a reparse point, and the attribution job's start-of-job sweep first
+   removes the view entries a killed earlier run left, each by identity, so the sweep never meets a
+   symlink -- and never deletes a leftover that has a second name.
+
+Residual limits, stated rather than hidden: a process running as the owner can still delete or
+overwrite a file the pin does not cover (the pin is held only while the job runs, and only against
+other processes -- the job's own user can always take it down); a hard link created by something
+outside this repository's tools is only *detected* (link count) at the delete sites listed above,
+not prevented; and the symlink arm could not be exercised on the development host (no Developer
+Mode), so it is proven on the Windows CI runners and by bachelor's own capability probe, not here.
+Any non-`PASS` part, or a failure pinning/viewing/re-verifying, fails closed
+(`OWNER_FOOTAGE_NOT_VERIFIED` exit 19, `OWNER_FOOTAGE_VIEW_NO_SPACE` exit 21,
+`OWNER_FOOTAGE_VIEW_FAILED` exit 22, or `OWNER_FOOTAGE_VIEW_CHANGED` exit 24),
+closing whatever handles were already held and removing whatever view entries were already
+created (by identity). The pin / view refusals happen before deploy; the last look
+(`OWNER_FOOTAGE_VIEW_CHANGED`) happens right before PresentMon starts and the smoke child runs.
+(The fixture route in
 section 4b instead requires the clip path to sit directly in the agent cache, name that clip id,
 and exist, then hashes it against `-FixtureSha256`, failing closed at
 `FIXTURE_CONTENT_MISMATCH`, exit 17, on a mismatch.) The job also verifies all three package

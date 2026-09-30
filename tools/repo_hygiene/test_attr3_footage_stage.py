@@ -526,6 +526,59 @@ class FootageStageJobTests(unittest.TestCase):
         self.assertIn("PART=1 STATUS=PLACED", run.stdout)
         self.assertEqual(self.targets[0].read_bytes(), self.content[0])
 
+    # ---- OWNER-FOOTAGE-NO-HARDLINK-1: the staging job deletes nothing by pathname ---------------
+
+    def test_a_staged_copy_with_a_second_name_is_never_deleted(self) -> None:
+        # sol r2 blocker 2: the share-side staged copy 'part-0' is a hard link to a file that
+        # matters. A path-based delete (Remove-AttrCudaPartialFile) accepted it -- a plain file, no
+        # reparse point -- and removed that name. The job now deletes a staged copy only when it was
+        # first seen with exactly ONE name and is still that object; this one gets no identity, so it
+        # is LEFT, recorded, and both names survive.
+        proc = self.build()
+        job = self.job_path(proc)
+        stage_dir = self.stage_dir(job.name[: -len(".job.ps1")])
+        self.stage_all_parts(stage_dir)
+        owner_original = self.tmp / "owner-original.raw"
+        owner_original.write_bytes(self.content[0])
+        (stage_dir / "part-0").unlink()
+        os.link(owner_original, stage_dir / "part-0")
+
+        run = self.run_job(job)
+
+        self.assertEqual(run.returncode, 0, run.stdout + run.stderr)
+        self.assertIn("PART=0 STATUS=PLACED", run.stdout)
+        self.assertIn("LEFTOVER PART=0 KIND=staged RESULT=LEFT_NO_IDENTITY", run.stdout)
+        self.assertTrue((stage_dir / "part-0").is_file())
+        self.assertEqual(owner_original.read_bytes(), self.content[0])
+        self.assertEqual((stage_dir / "part-0").read_bytes(), self.content[0])
+        self.assertEqual(os.stat(owner_original).st_nlink, 2)
+        self.assertFalse((stage_dir / "part-1").exists(), "a lone staged copy is still cleaned")
+        payload = json.loads(run.stdout.strip().splitlines()[-1])
+        self.assertEqual(payload["leftovers"], [{"index": 0, "kind": "staged", "result": "LEFT_NO_IDENTITY"}])
+        self._assert_no_token(run.stdout, run.stderr)
+
+    def test_a_clean_run_reports_no_leftovers(self) -> None:
+        proc = self.build()
+        job = self.job_path(proc)
+        stage_dir = self.stage_dir(job.name[: -len(".job.ps1")])
+        self.stage_all_parts(stage_dir)
+        run = self.run_job(job)
+        self.assertEqual(run.returncode, 0, run.stdout + run.stderr)
+        self.assertNotIn("LEFTOVER", run.stdout)
+        payload = json.loads(run.stdout.strip().splitlines()[-1])
+        self.assertNotIn("leftovers", payload)
+
+    def test_the_emitted_job_template_deletes_nothing_by_pathname(self) -> None:
+        text = STAGE_MODULE.read_text(encoding="utf-8")
+        start = text.index("$template = @'")
+        template = text[start : text.index("\n'@", start)]
+        # Code only: a comment may name what the job used to do.
+        code = "\n".join(line for line in template.splitlines() if not line.strip().startswith("#"))
+        for forbidden in ("Remove-Item", "Remove-AttrCudaPartialFile", "Remove-AttrCudaTree", "[IO.File]::Delete", ".Delete("):
+            with self.subTest(forbidden=forbidden):
+                self.assertFalse(forbidden in code, f"the emitted staging job template still contains {forbidden}")
+        self.assertIn("Remove-AttrCudaFileById", code)
+
     def test_a_corrupt_staged_copy_refuses_and_cleans_its_own_staged_file(self) -> None:
         proc = self.build()
         job = self.job_path(proc)

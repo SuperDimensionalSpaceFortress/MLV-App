@@ -2111,6 +2111,14 @@ function Remove-AttrCudaTree {
     absent, so a linked parent can never steer the delete (sol PR #133 r6). The walk then does not
     descend into reparse points; if one is found the function throws ATTRCUDA_TREE_HAS_REPARSE_POINT
     and deletes nothing. Only a tree proved free of links is handed to Remove-Item -Recurse.
+    OWNER-FOOTAGE-NO-HARDLINK-1: a FILE with a second hard link is a link too. A recursive delete
+    removes every name under the tree, so a name in here that is also a name of a file OUTSIDE the
+    tree -- and possibly its last -- would be destroyed with the tree. The walk therefore reads each
+    file's live link count (Get-AttrCudaFileId, the name itself, never followed) and throws
+    ATTRCUDA_TREE_HAS_HARD_LINK, deleting nothing, when any file has more than one name; a file
+    whose identity cannot be read throws ATTRCUDA_TREE_FILE_ID_UNAVAILABLE. No code in this
+    repository creates such a link (tools/repo_hygiene/test_owner_footage_no_hardlink_class.py), so
+    this is the backstop for one that arrived some other way.
     #>
     [CmdletBinding()]
     param(
@@ -2130,9 +2138,219 @@ function Remove-AttrCudaTree {
         }
         if ($entry -is [System.IO.DirectoryInfo]) {
             foreach ($child in $entry.EnumerateFileSystemInfos()) { $stack.Push($child) }
+        } else {
+            $fileId = $null
+            try {
+                $fileId = Get-AttrCudaFileId -Path $entry.FullName
+            } catch {
+                throw "ATTRCUDA_TREE_FILE_ID_UNAVAILABLE $($entry.FullName) (refusing to delete $Path)"
+            }
+            if ($fileId.NumberOfLinks -gt 1) {
+                throw "ATTRCUDA_TREE_HAS_HARD_LINK $($entry.FullName) has $($fileId.NumberOfLinks) names (refusing to delete $Path)"
+            }
         }
     }
     Remove-Item -LiteralPath $Path -Recurse -Force -Confirm:$false
+}
+
+function Initialize-AttrCudaFileIdNative {
+    <#
+    .SYNOPSIS
+    Define (once per process) the Win32 surface the file-identity functions below share:
+    CreateFileW, GetFileInformationByHandle, SetFileInformationByHandle (delete-on-close
+    disposition only) and CloseHandle.
+    .DESCRIPTION
+    OWNER-FOOTAGE-NO-HARDLINK-1: ONE definition, so Get-AttrCudaFileId and Remove-AttrCudaFileById
+    (and, through them, Remove-AttrCudaTree) never define the same native type twice with
+    different members -- a second Add-Type for an already-defined name would silently keep the
+    FIRST definition and lose the members only the second one declared. Idempotent; footage-neutral.
+    #>
+    [CmdletBinding()]
+    param()
+
+    if ('AttrCudaWin32.FileIdNative' -as [type]) { return }
+    $definition = @'
+    [System.Runtime.InteropServices.StructLayout(System.Runtime.InteropServices.LayoutKind.Sequential)]
+    public struct FileIdInfo {
+        public uint FileAttributes;
+        public uint CreationTimeLow;
+        public uint CreationTimeHigh;
+        public uint LastAccessTimeLow;
+        public uint LastAccessTimeHigh;
+        public uint LastWriteTimeLow;
+        public uint LastWriteTimeHigh;
+        public uint VolumeSerialNumber;
+        public uint FileSizeHigh;
+        public uint FileSizeLow;
+        public uint NumberOfLinks;
+        public uint FileIndexHigh;
+        public uint FileIndexLow;
+    }
+
+    [System.Runtime.InteropServices.StructLayout(System.Runtime.InteropServices.LayoutKind.Sequential)]
+    public struct FileDispositionInfo {
+        [System.Runtime.InteropServices.MarshalAs(System.Runtime.InteropServices.UnmanagedType.U1)]
+        public bool DeleteFile;
+    }
+
+    [System.Runtime.InteropServices.DllImport("kernel32.dll", SetLastError = true, CharSet = System.Runtime.InteropServices.CharSet.Unicode)]
+    public static extern System.IntPtr CreateFileW(string lpFileName, uint dwDesiredAccess, uint dwShareMode, System.IntPtr lpSecurityAttributes, uint dwCreationDisposition, uint dwFlagsAndAttributes, System.IntPtr hTemplateFile);
+
+    [System.Runtime.InteropServices.DllImport("kernel32.dll", SetLastError = true)]
+    public static extern bool GetFileInformationByHandle(System.IntPtr hFile, out FileIdInfo lpFileInformation);
+
+    [System.Runtime.InteropServices.DllImport("kernel32.dll", SetLastError = true)]
+    public static extern bool SetFileInformationByHandle(System.IntPtr hFile, int fileInformationClass, ref FileDispositionInfo lpFileInformation, uint dwBufferSize);
+
+    [System.Runtime.InteropServices.DllImport("kernel32.dll", SetLastError = true)]
+    public static extern bool CloseHandle(System.IntPtr hObject);
+'@
+    Add-Type -Namespace AttrCudaWin32 -Name FileIdNative -MemberDefinition $definition -ErrorAction Stop
+}
+
+function ConvertTo-AttrCudaFileIdObject {
+    <#
+    .SYNOPSIS
+    Shape a GetFileInformationByHandle result: volume serial, 64-bit file index (high/low), live
+    hard-link count, attributes, and the two attribute bits callers branch on.
+    #>
+    [CmdletBinding()]
+    param([Parameter(Mandatory = $true)]$Info)
+
+    [pscustomobject]@{
+        VolumeSerialNumber = $Info.VolumeSerialNumber
+        FileIndexHigh = $Info.FileIndexHigh
+        FileIndexLow = $Info.FileIndexLow
+        NumberOfLinks = $Info.NumberOfLinks
+        FileAttributes = $Info.FileAttributes
+        IsDirectory = (($Info.FileAttributes -band [uint32]0x10) -ne 0)
+        IsReparsePoint = (($Info.FileAttributes -band [uint32]0x400) -ne 0)
+    }
+}
+
+function Get-AttrCudaFileId {
+    <#
+    .SYNOPSIS
+    Return the Win32 file identity (volume serial, 64-bit file index, live hard-link count,
+    attributes) of a path -- by default of the NAME ITSELF, never following a symbolic link or
+    junction -- or of an open FileStream's own handle.
+    .DESCRIPTION
+    OWNER-FOOTAGE-NO-HARDLINK-1. -Path opens with FILE_READ_ATTRIBUTES only (no data access, so it
+    conflicts with no other handle's share mode and never blocks or is blocked by a reader or
+    writer) and FILE_FLAG_OPEN_REPARSE_POINT unless -FollowLinks is given, so a symlink reports its
+    OWN identity and IsReparsePoint = $true rather than its target's. -FollowLinks reports the
+    target's. -Stream reads the identity off the stream's own handle -- race-free, because no path
+    is resolved at all: it is the identity of the very file object the stream holds.
+    Exactly one of -Path / -Stream is required. Throws ATTRCUDA_FILE_ID_UNAVAILABLE on any Win32
+    failure; the message never echoes the path.
+    #>
+    [CmdletBinding()]
+    param(
+        [string]$Path = '',
+        [System.IO.FileStream]$Stream = $null,
+        [switch]$FollowLinks
+    )
+
+    if (([string]::IsNullOrEmpty($Path)) -eq ($null -eq $Stream)) {
+        throw 'ATTRCUDA_FILE_ID_UNAVAILABLE exactly one of -Path / -Stream is required'
+    }
+    Initialize-AttrCudaFileIdNative
+
+    $handle = [IntPtr]::Zero
+    $ownsHandle = $false
+    if ($null -ne $Stream) {
+        $handle = $Stream.SafeFileHandle.DangerousGetHandle()
+    } else {
+        $readAttributes = [uint32]0x80
+        $shareAll = [uint32]0x00000007
+        $openExisting = [uint32]3
+        $flags = [uint32]0x02000000
+        if (-not $FollowLinks) { $flags = [uint32]($flags -bor [uint32]0x00200000) }
+        $handle = [AttrCudaWin32.FileIdNative]::CreateFileW(
+            $Path, $readAttributes, $shareAll, [IntPtr]::Zero, $openExisting, $flags, [IntPtr]::Zero)
+        if ($handle -eq [IntPtr]::new(-1)) {
+            throw "ATTRCUDA_FILE_ID_UNAVAILABLE CreateFileW failed (Win32 error $([Runtime.InteropServices.Marshal]::GetLastWin32Error()))"
+        }
+        $ownsHandle = $true
+    }
+    try {
+        $info = [AttrCudaWin32.FileIdNative+FileIdInfo]::new()
+        if (-not [AttrCudaWin32.FileIdNative]::GetFileInformationByHandle($handle, [ref]$info)) {
+            throw "ATTRCUDA_FILE_ID_UNAVAILABLE GetFileInformationByHandle failed (Win32 error $([Runtime.InteropServices.Marshal]::GetLastWin32Error()))"
+        }
+        ConvertTo-AttrCudaFileIdObject -Info $info
+    } finally {
+        if ($ownsHandle) { [void][AttrCudaWin32.FileIdNative]::CloseHandle($handle) }
+    }
+}
+
+function Remove-AttrCudaFileById {
+    <#
+    .SYNOPSIS
+    Delete ONE name, only if it is still the exact file object this caller recorded when it created
+    it, and that object still has exactly one name. Returns a fixed token; never throws.
+    .DESCRIPTION
+    OWNER-FOOTAGE-NO-HARDLINK-1. A pathname is not an identity: between "this is my file" and
+    "delete it", another process can replace the name with a hard link to something that matters,
+    and Remove-Item then deletes that name. This primitive closes the window by making the check
+    and the delete one handle: it opens the NAME (FILE_FLAG_OPEN_REPARSE_POINT, so a symlink is
+    opened as itself, never followed) with DELETE access, reads the identity off THAT handle,
+    requires it to equal -FileId (volume serial + 64-bit file index, recorded by
+    Get-AttrCudaFileId -Stream at creation) and NumberOfLinks = 1, and only then sets the delete
+    disposition on the same handle. The caller must already have closed its own handles to the
+    name (a DELETE open honours their share mode).
+    Tokens: DELETED, ABSENT, LEFT_ID_MISMATCH (a different object now owns the name),
+    LEFT_LINKED (the object has another name, so this delete could be one of its last),
+    LEFT_NOT_A_FILE (a directory, or a reparse point when -ExpectReparsePoint is not given),
+    LEFT_UNAVAILABLE (any other failure, including a sharing violation). Anything but DELETED or
+    ABSENT leaves the name exactly where it is; the caller records it and moves on.
+    -ExpectReparsePoint is for deleting a symbolic link this caller created: the link is opened as
+    itself, its own identity is compared, and ONLY the link is removed -- never its target.
+    #>
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $true)][string]$Path,
+        [Parameter(Mandatory = $true)]$FileId,
+        [switch]$ExpectReparsePoint
+    )
+
+    try {
+        Initialize-AttrCudaFileIdNative
+        $deleteAccess = [uint32]0x00010000
+        $readAttributes = [uint32]0x80
+        $shareAll = [uint32]0x00000007
+        $openExisting = [uint32]3
+        $flags = [uint32](0x02000000 -bor 0x00200000)
+        $handle = [AttrCudaWin32.FileIdNative]::CreateFileW(
+            $Path, [uint32]($deleteAccess -bor $readAttributes), $shareAll, [IntPtr]::Zero, $openExisting, $flags, [IntPtr]::Zero)
+        if ($handle -eq [IntPtr]::new(-1)) {
+            $error32 = [Runtime.InteropServices.Marshal]::GetLastWin32Error()
+            if ($error32 -eq 2 -or $error32 -eq 3) { return 'ABSENT' }
+            return 'LEFT_UNAVAILABLE'
+        }
+        try {
+            $info = [AttrCudaWin32.FileIdNative+FileIdInfo]::new()
+            if (-not [AttrCudaWin32.FileIdNative]::GetFileInformationByHandle($handle, [ref]$info)) { return 'LEFT_UNAVAILABLE' }
+            $id = ConvertTo-AttrCudaFileIdObject -Info $info
+            if ($id.IsDirectory) { return 'LEFT_NOT_A_FILE' }
+            if ($id.IsReparsePoint -ne [bool]$ExpectReparsePoint) {
+                if ($id.IsReparsePoint) { return 'LEFT_NOT_A_FILE' }
+                return 'LEFT_ID_MISMATCH'
+            }
+            if ($id.VolumeSerialNumber -ne $FileId.VolumeSerialNumber -or
+                $id.FileIndexHigh -ne $FileId.FileIndexHigh -or
+                $id.FileIndexLow -ne $FileId.FileIndexLow) { return 'LEFT_ID_MISMATCH' }
+            if ($id.NumberOfLinks -ne 1) { return 'LEFT_LINKED' }
+            $disposition = [AttrCudaWin32.FileIdNative+FileDispositionInfo]::new()
+            $disposition.DeleteFile = $true
+            if (-not [AttrCudaWin32.FileIdNative]::SetFileInformationByHandle($handle, 4, [ref]$disposition, [uint32]1)) { return 'LEFT_UNAVAILABLE' }
+            return 'DELETED'
+        } finally {
+            [void][AttrCudaWin32.FileIdNative]::CloseHandle($handle)
+        }
+    } catch {
+        return 'LEFT_UNAVAILABLE'
+    }
 }
 
 function Resolve-AttrCudaSmokeRunLog {
@@ -5007,6 +5225,10 @@ Export-ModuleMember -Function `
     Remove-AttrCudaPartialFile, `
     Assert-AttrCudaNoLinkBelowRoot, `
     Remove-AttrCudaTree, `
+    Initialize-AttrCudaFileIdNative, `
+    ConvertTo-AttrCudaFileIdObject, `
+    Get-AttrCudaFileId, `
+    Remove-AttrCudaFileById, `
     Resolve-AttrCudaSmokeRunLog, `
     Get-AttrCudaLastEligibilityLine, `
     Get-AttrCudaEligibilityVerdict, `

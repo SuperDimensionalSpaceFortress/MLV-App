@@ -341,7 +341,12 @@ $embeddedFunctions = Get-AttrCudaEmbeddedFunctionSource -Name @(
     'Publish-AttrCudaText',
     'Publish-AttrCudaDirectoryMoveNonOverwriting',
     'New-AttrCudaDirectory',
-    'Remove-AttrCudaTree'
+    'Remove-AttrCudaTree',
+    # OWNER-FOOTAGE-NO-HARDLINK-1: Remove-AttrCudaTree refuses a tree holding a file with a second
+    # name (Get-AttrCudaFileId reads the live link count); these three are what it stands on.
+    'Initialize-AttrCudaFileIdNative',
+    'ConvertTo-AttrCudaFileIdObject',
+    'Get-AttrCudaFileId'
 )
 
 $jobPath = Join-Path $OutDir "$jobId.job.ps1"

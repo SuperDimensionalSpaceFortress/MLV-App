@@ -248,8 +248,10 @@ function New-Attr3FootageStageJob {
     # AttrCudaArtifacts.psm1. Publish-AttrCudaFileMoveNonOverwriting/Assert-AttrCudaNonOverwriting-
     # FileSlot/Assert-AttrCudaWritableFileSlot are the same non-overwriting-publish primitives
     # ATTR3-FIXTURE-STAGE-1's fixture job uses; Assert-AttrCudaDirectChild/Assert-AttrCudaNoLink-
-    # BelowRoot/New-AttrCudaDirectory/Remove-AttrCudaPartialFile are the same link-safety
-    # primitives every job in this route embeds.
+    # BelowRoot/New-AttrCudaDirectory are the same link-safety primitives every job in this route
+    # embeds. OWNER-FOOTAGE-NO-HARDLINK-1: this job deletes NOTHING by pathname any more --
+    # Remove-AttrCudaFileById (with the three functions it stands on) deletes a name only while it
+    # is still the exact file object this job recorded and that object has one name.
     $embeddedFunctions = Get-AttrCudaEmbeddedFunctionSource -Name @(
         'Read-AttrCudaBase64Payload',
         'ConvertTo-AttrCudaUtf8String',
@@ -260,7 +262,10 @@ function New-Attr3FootageStageJob {
         'Assert-AttrCudaWritableFileSlot',
         'Assert-AttrCudaNonOverwritingFileSlot',
         'Publish-AttrCudaFileMoveNonOverwriting',
-        'Remove-AttrCudaPartialFile'
+        'Initialize-AttrCudaFileIdNative',
+        'ConvertTo-AttrCudaFileIdObject',
+        'Get-AttrCudaFileId',
+        'Remove-AttrCudaFileById'
     )
 
     # --- job body template (placeholders are substituted below; the body itself never touches
@@ -358,15 +363,35 @@ if (-not $stagingChainSafe) {
     exit 1
 }
 
+# OWNER-FOOTAGE-NO-HARDLINK-1: NO name is ever deleted by pathname in this job. A pathname is not an
+# identity -- between "this is the file I made" and "delete it", another process can replace the
+# name with a hard link to something that matters, and a path-based delete then removes that name.
+# Every delete below goes through Remove-AttrCudaFileById with the identity (volume serial + 64-bit
+# file index) recorded when the name was created (the target-volume partial, read off this job's own
+# CreateNew handle; it survives the publish rename, so it also identifies the placed target) or
+# first seen (the staged copy, accepted only with exactly one name): the name is opened, checked
+# against that identity and a link count of one ON THE SAME HANDLE, and only then deleted. Anything
+# else is LEFT where it is and recorded -- a line `LEFTOVER PART= KIND= RESULT=` and, in the final
+# JSON, a `leftovers` entry carrying only the part index, the kind and a fixed token, never a path.
+$leftovers = New-Object System.Collections.Generic.List[object]
+function Remove-StageOwnName([string]$Path, $FileId, [int]$Index, [string]$Kind) {
+    $token = 'LEFT_NO_IDENTITY'
+    if ($null -ne $FileId) {
+        $token = Remove-AttrCudaFileById -Path $Path -FileId $FileId
+    } else {
+        try { if (-not (Test-Path -LiteralPath $Path)) { $token = 'ABSENT' } } catch { $token = 'LEFT_UNAVAILABLE' }
+    }
+    if ($token -ne 'DELETED' -and $token -ne 'ABSENT') {
+        $leftovers.Add([ordered]@{ index = $Index; kind = $Kind; result = $token })
+        Write-Output "LEFTOVER PART=$Index KIND=$Kind RESULT=$token"
+    }
+}
+
 # A single recorder so every one of the branches below cleans up its OWN staged neutral file (or
 # explicitly declines to, when there was never a resolvable slot to clean) the same way, rather
 # than each branch repeating the same three lines with room for one of them to forget it.
-function Record-PartResult([int]$Index, [string]$Status, [string]$CleanupPath) {
-    # -WarningAction SilentlyContinue (round 3, no path in any branch): Remove-AttrCudaPartialFile
-    # writes a Write-Warning diagnostic naming the path on a refused cleanup -- useful for a human
-    # operator tailing this job's own log on Bachelor directly, but this job's RESULT is what
-    # travels back to the submitter over um-run.ps1, and that channel must never carry a path.
-    if ($CleanupPath) { [void](Remove-AttrCudaPartialFile -TrustedRoot $AgentRoot -Path $CleanupPath -WarningAction SilentlyContinue) }
+function Record-PartResult([int]$Index, [string]$Status, [string]$CleanupPath, $CleanupId = $null) {
+    if ($CleanupPath) { Remove-StageOwnName -Path $CleanupPath -FileId $CleanupId -Index $Index -Kind 'staged' }
     $results.Add([ordered]@{ index = $Index; status = $Status })
     Write-Output "PART=$Index STATUS=$Status"
 }
@@ -394,6 +419,7 @@ foreach ($rawPart in $RawParts) {
     $stagedName = "part-$index"
 
     $stagedPath = $null
+    $stagedId = $null
     try {
         $stagedPath = Assert-AttrCudaDirectChild -Root $StageDir -Path (Join-Path $StageDir $stagedName) -Label "stage part $index"
     } catch {
@@ -409,13 +435,24 @@ foreach ($rawPart in $RawParts) {
     try {
         [void](Assert-AttrCudaNoLinkBelowRoot -TrustedRoot $StageDir -Path $stagedPath)
     } catch {
-        Record-PartResult -Index $index -Status 'STAGED_PATH_UNSAFE' -CleanupPath $stagedPath
+        Record-PartResult -Index $index -Status 'STAGED_PATH_UNSAFE' -CleanupPath $stagedPath -CleanupId $stagedId
         continue
+    }
+
+    # OWNER-FOOTAGE-NO-HARDLINK-1: the staged copy's identity, recorded the first time it is seen
+    # (the NAME itself, never followed) and ONLY when it is a plain file with exactly one name. A
+    # staged copy with a second name is not ours to delete whatever its bytes are -- it could be a
+    # hard link to a file that matters -- so it gets no identity and every cleanup below leaves it.
+    try {
+        $seenStagedId = Get-AttrCudaFileId -Path $stagedPath
+        if (-not $seenStagedId.IsDirectory -and -not $seenStagedId.IsReparsePoint -and $seenStagedId.NumberOfLinks -eq 1) { $stagedId = $seenStagedId }
+    } catch {
+        $stagedId = $null
     }
 
     $stageStatus = Test-AttrCudaFootagePart -Path $stagedPath -ExpectedLength $expectedLength -ExpectedSha256 $expectedSha256
     if ($stageStatus -ne 'PASS') {
-        Record-PartResult -Index $index -Status "STAGED_$stageStatus" -CleanupPath $stagedPath
+        Record-PartResult -Index $index -Status "STAGED_$stageStatus" -CleanupPath $stagedPath -CleanupId $stagedId
         continue
     }
 
@@ -423,7 +460,7 @@ foreach ($rawPart in $RawParts) {
     try {
         [void](Assert-AttrCudaNoLinkBelowRoot -TrustedRoot $driveRoot -Path $targetPath)
     } catch {
-        Record-PartResult -Index $index -Status 'TARGET_PATH_UNSAFE' -CleanupPath $stagedPath
+        Record-PartResult -Index $index -Status 'TARGET_PATH_UNSAFE' -CleanupPath $stagedPath -CleanupId $stagedId
         continue
     }
 
@@ -436,13 +473,13 @@ foreach ($rawPart in $RawParts) {
     try {
         $targetExists = Test-Path -LiteralPath $targetPath -PathType Leaf -ErrorAction Stop
     } catch {
-        Record-PartResult -Index $index -Status 'TARGET_STATE_UNKNOWN' -CleanupPath $stagedPath
+        Record-PartResult -Index $index -Status 'TARGET_STATE_UNKNOWN' -CleanupPath $stagedPath -CleanupId $stagedId
         continue
     }
     if ($targetExists) {
         $existingStatus = Test-AttrCudaFootagePart -Path $targetPath -ExpectedLength $expectedLength -ExpectedSha256 $expectedSha256
         if ($existingStatus -eq 'PASS') {
-            Record-PartResult -Index $index -Status 'ALREADY_PRESENT' -CleanupPath $stagedPath
+            Record-PartResult -Index $index -Status 'ALREADY_PRESENT' -CleanupPath $stagedPath -CleanupId $stagedId
             continue
         }
         # ATTR3-FOOTAGE-STAGE-1 round 8 (scope cut): a mismatched target is ALWAYS a refusal --
@@ -451,7 +488,7 @@ foreach ($rawPart in $RawParts) {
         # via a fixed-name sidecar) is removed: a review found the recovery branch could delete an
         # ordinary file that merely occupied the marker's fixed name, which this tool does not
         # own. A failed run is simply re-run.
-        Record-PartResult -Index $index -Status 'TARGET_CONFLICT' -CleanupPath $stagedPath
+        Record-PartResult -Index $index -Status 'TARGET_CONFLICT' -CleanupPath $stagedPath -CleanupId $stagedId
         continue
     }
 
@@ -474,7 +511,7 @@ foreach ($rawPart in $RawParts) {
         }
     }
     if ($dirCreateFailed) {
-        Record-PartResult -Index $index -Status 'TARGET_DIR_FAILED' -CleanupPath $stagedPath
+        Record-PartResult -Index $index -Status 'TARGET_DIR_FAILED' -CleanupPath $stagedPath -CleanupId $stagedId
         continue
     }
 
@@ -495,7 +532,7 @@ foreach ($rawPart in $RawParts) {
     try {
         $localPartialPath = Assert-AttrCudaDirectChild -Root $targetDir -Path (Join-Path $targetDir $localPartialName) -Label "local partial part $index"
     } catch {
-        Record-PartResult -Index $index -Status 'TARGET_PATH_UNSAFE' -CleanupPath $stagedPath
+        Record-PartResult -Index $index -Status 'TARGET_PATH_UNSAFE' -CleanupPath $stagedPath -CleanupId $stagedId
         continue
     }
 
@@ -515,6 +552,9 @@ foreach ($rawPart in $RawParts) {
     # lines below) -- so the "copy failed, clean up" handler below must never delete it unless this
     # flag says this attempt is the one that brought it into existence.
     $weCreatedLocalPartial = $false
+    # OWNER-FOOTAGE-NO-HARDLINK-1: read off THIS attempt's own CreateNew handle just below; it keeps
+    # identifying the same file object through the publish rename, so it names the placed target too.
+    $localPartialId = $null
     try {
         if ($index -eq $TestHookForceLocalSourceOpenFailurePartIndex) {
             $localCopyFailed = $true
@@ -529,6 +569,7 @@ foreach ($rawPart in $RawParts) {
             try {
                 $localDstStream = [IO.File]::Open($localPartialPath, [IO.FileMode]::CreateNew, [IO.FileAccess]::Write, [IO.FileShare]::None)
                 $weCreatedLocalPartial = $true
+                $localPartialId = Get-AttrCudaFileId -Stream $localDstStream
             } catch [IO.IOException] {
                 $localPartialExists = $true
             } catch {
@@ -566,21 +607,21 @@ foreach ($rawPart in $RawParts) {
     if ($localPartialExists) {
         # Refused, untouched: this is NOT ours to delete -- either a concurrent placer for this
         # exact part is still writing it, or a prior attempt's own partial is still there.
-        Record-PartResult -Index $index -Status 'TARGET_VOLUME_PARTIAL_EXISTS' -CleanupPath $stagedPath
+        Record-PartResult -Index $index -Status 'TARGET_VOLUME_PARTIAL_EXISTS' -CleanupPath $stagedPath -CleanupId $stagedId
         continue
     }
     if ($localCopyFailed) {
         if ($weCreatedLocalPartial) {
-            try { Remove-Item -LiteralPath $localPartialPath -Force -Confirm:$false -ErrorAction SilentlyContinue } catch {}
+            Remove-StageOwnName -Path $localPartialPath -FileId $localPartialId -Index $index -Kind 'partial'
         }
-        Record-PartResult -Index $index -Status 'TARGET_VOLUME_COPY_FAILED' -CleanupPath $stagedPath
+        Record-PartResult -Index $index -Status 'TARGET_VOLUME_COPY_FAILED' -CleanupPath $stagedPath -CleanupId $stagedId
         continue
     }
 
     $localStatus = Test-AttrCudaFootagePart -Path $localPartialPath -ExpectedLength $expectedLength -ExpectedSha256 $expectedSha256
     if ($localStatus -ne 'PASS') {
-        try { Remove-Item -LiteralPath $localPartialPath -Force -Confirm:$false -ErrorAction SilentlyContinue } catch {}
-        Record-PartResult -Index $index -Status "TARGET_VOLUME_VERIFY_$localStatus" -CleanupPath $stagedPath
+        Remove-StageOwnName -Path $localPartialPath -FileId $localPartialId -Index $index -Kind 'partial'
+        Record-PartResult -Index $index -Status "TARGET_VOLUME_VERIFY_$localStatus" -CleanupPath $stagedPath -CleanupId $stagedId
         continue
     }
 
@@ -599,11 +640,11 @@ foreach ($rawPart in $RawParts) {
         # rather than assume either outcome. Either way the same-volume rename never happened, so
         # the local partial this attempt made is still there and still needs cleaning up.
         $racedStatus = Test-AttrCudaFootagePart -Path $targetPath -ExpectedLength $expectedLength -ExpectedSha256 $expectedSha256
-        try { Remove-Item -LiteralPath $localPartialPath -Force -Confirm:$false -ErrorAction SilentlyContinue } catch {}
+        Remove-StageOwnName -Path $localPartialPath -FileId $localPartialId -Index $index -Kind 'partial'
         if ($racedStatus -eq 'PASS') {
-            Record-PartResult -Index $index -Status 'ALREADY_PRESENT' -CleanupPath $stagedPath
+            Record-PartResult -Index $index -Status 'ALREADY_PRESENT' -CleanupPath $stagedPath -CleanupId $stagedId
         } else {
-            Record-PartResult -Index $index -Status 'TARGET_CONFLICT' -CleanupPath $stagedPath
+            Record-PartResult -Index $index -Status 'TARGET_CONFLICT' -CleanupPath $stagedPath -CleanupId $stagedId
         }
         continue
     }
@@ -633,21 +674,21 @@ foreach ($rawPart in $RawParts) {
         # mismatched target and refuses TARGET_CONFLICT; a failed run is re-run, never recovered
         # automatically).
         if ($index -ne $TestHookForceRemovalFailurePartIndex) {
-            try { Remove-Item -LiteralPath $targetPath -Force -Confirm:$false -ErrorAction Stop } catch {}
+            Remove-StageOwnName -Path $targetPath -FileId $localPartialId -Index $index -Kind 'placed'
         }
         $targetRemoved = $true
         try { $targetRemoved = -not (Test-Path -LiteralPath $targetPath -PathType Leaf -ErrorAction Stop) } catch { $targetRemoved = $false }
         if ($targetRemoved) {
-            Record-PartResult -Index $index -Status "PLACED_VERIFY_$placedStatus" -CleanupPath $stagedPath
+            Record-PartResult -Index $index -Status "PLACED_VERIFY_$placedStatus" -CleanupPath $stagedPath -CleanupId $stagedId
         } else {
-            Record-PartResult -Index $index -Status 'PLACED_VERIFY_FAILED_TARGET_RETAINED' -CleanupPath $stagedPath
+            Record-PartResult -Index $index -Status 'PLACED_VERIFY_FAILED_TARGET_RETAINED' -CleanupPath $stagedPath -CleanupId $stagedId
         }
         continue
     }
     # The rename already relocated the local partial -- nothing left there to clean -- but
     # $stagedPath (the SHARE-side staged copy) was only ever COPIED from, never moved, so it is
     # still there and still needs cleaning up now that its bytes are safely verified at the target.
-    Record-PartResult -Index $index -Status 'PLACED' -CleanupPath $stagedPath
+    Record-PartResult -Index $index -Status 'PLACED' -CleanupPath $stagedPath -CleanupId $stagedId
 }
 
 # Overall-result mapping: only a part that is actually AT the target (placed just now, or
@@ -662,14 +703,18 @@ if (($statuses | Where-Object { $okStatuses -notcontains $_ }).Count -eq 0) {
 }
 
 Write-Output "RESULT=$overall CLIP=$ClipId PARTS=$PartCount"
-Write-Output (([ordered]@{
+$stageSummary = [ordered]@{
     schema = 'mlvapp.attr3-footage-stage.v1'
     jobId = $JobId
     clipId = $ClipId
     result = $overall
     partCount = $PartCount
     parts = $results
-}) | ConvertTo-Json -Compress -Depth 5)
+}
+# .ToArray(), not @($leftovers): assigning @(<List of ordered dictionaries>) into an ordered
+# dictionary throws "Argument types do not match" on PowerShell 7.
+if ($leftovers.Count -gt 0) { $stageSummary['leftovers'] = $leftovers.ToArray() }
+Write-Output ($stageSummary | ConvertTo-Json -Compress -Depth 5)
 exit $exitCode
 } catch {
     # ATTR3-FOOTAGE-STAGE-1 round 7 (class b: outer boundary): a fixed, path-free token only --

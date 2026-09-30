@@ -28,8 +28,8 @@ Disposition legend (also documented in the inventory file's own rows, per-site):
                            semantics, which refuse outright rather than write through an existing
                            file or reparse point.
   job-private-temp         the call's target is a path this run/job itself created fresh (a
-                           GUID-named temp file/directory, or a private per-job hard-link
-                           workspace) -- nothing else could have pre-planted a link there before
+                           GUID-named temp file/directory, or a private per-job view
+                           workspace: a symlink or a byte copy, never a hard link) -- nothing else could have pre-planted a link there before
                            this run's own creation.
   read-only-fixed          the call only ever reads metadata or bytes -- never enumerates a
                            directory for further action, never writes or deletes -- from a path

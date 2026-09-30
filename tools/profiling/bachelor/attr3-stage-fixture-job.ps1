@@ -299,7 +299,12 @@ $embeddedFunctions = Get-AttrCudaEmbeddedFunctionSource -Name @(
     'Publish-AttrCudaFileMoveNonOverwriting',
     'New-AttrCudaDirectory',
     'Remove-AttrCudaPartialFile',
-    'Remove-AttrCudaTree'
+    'Remove-AttrCudaTree',
+    # OWNER-FOOTAGE-NO-HARDLINK-1: Remove-AttrCudaTree refuses a tree holding a file with a second
+    # name (Get-AttrCudaFileId reads the live link count); these three are what it stands on.
+    'Initialize-AttrCudaFileIdNative',
+    'ConvertTo-AttrCudaFileIdObject',
+    'Get-AttrCudaFileId'
 )
 
 if (-not (Test-Path -LiteralPath $OutDir)) { [void](New-Item -ItemType Directory -Path $OutDir -Force) }

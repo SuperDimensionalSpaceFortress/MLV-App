@@ -26,11 +26,12 @@
 # this route, and a content hash is meaningless without the resolver's own cross-check against
 # the frozen table. An interpreter one-liner can still open any path; that residual is
 # unchanged. Every verified part -- base part and any continuation part alike -- is named by
-# THIS code, never the application: each gets a neutral link name (AttrCudaOwnerFootage.psm1's
-# Get-AttrCudaOwnerFootageNeutralName), a held read-only handle opened before the smoke child
-# ever runs, and a re-verification of its content against the resolved length/sha256 while that
-# handle is held, all under a private per-job directory the application only ever sees by its
-# neutral names. The owner's consent record (receipts/owner-footage-consent-20260916.json
+# THIS code, never the application: each gets a neutral view name (AttrCudaOwnerFootage.psm1's
+# Get-AttrCudaOwnerFootageNeutralName) -- a file symbolic link to the original where the venue can
+# create one, else a verified byte copy, NEVER a hard link (OWNER-FOOTAGE-NO-HARDLINK-1) -- a
+# read-only pin held on the ORIGINAL before the smoke child ever runs, and a re-verification of
+# the view's content against the resolved length/sha256 while those handles are held, all under a
+# private per-job directory the application only ever sees by its neutral names. The owner's consent record (receipts/owner-footage-consent-20260916.json
 # and its -correction.json) is evidence of consent, never an authorization. Adjudication:
 # .claude-state/fleet-runs/swarm-footage-route-20260916T2020Z/SYNTHESIS.md (round 1);
 # ATTR3-FOOTAGE-BIND-1 (round 2, this file).
@@ -520,6 +521,13 @@ $embeddedFunctions = Get-AttrCudaEmbeddedFunctionSource -Name @(
     'New-AttrCudaDirectory',
     'Assert-AttrCudaNoLinkBelowRoot',
     'Remove-AttrCudaTree',
+    # OWNER-FOOTAGE-NO-HARDLINK-1: Remove-AttrCudaTree reads each file's live link count through
+    # Get-AttrCudaFileId, and the view cleanup deletes only through Remove-AttrCudaFileById (the
+    # identity-checked primitive); both need the one native type Initialize-... defines.
+    'Initialize-AttrCudaFileIdNative',
+    'ConvertTo-AttrCudaFileIdObject',
+    'Get-AttrCudaFileId',
+    'Remove-AttrCudaFileById',
     # ATTR3-FOOTAGE-BIND-1 PR-B: the owner-clip content gate. Test-AttrCudaFootagePart is the
     # SAME function Attr3FootagePresenceJob.psm1 embeds for its own probe -- one definition,
     # spliced verbatim into both, never two copies that can drift apart.
@@ -602,8 +610,9 @@ $embeddedFunctions = Get-AttrCudaEmbeddedFunctionSource -Name @(
     # (no result.json) and parses it with the shared parser; calls Get-AttrCudaGuiSmokeDisplaySelection.
     'Find-AttrCudaFailedSmokeDisplayLog'
 )
-# ATTR3-FOOTAGE-BIND-1 PR-B round 4b: the private verified-part directory (one hard link per
-# verified part, under a neutral name derived from its index, so nothing downstream -- the smoke
+# ATTR3-FOOTAGE-BIND-1 PR-B round 4b: the private verified-part directory (one view entry per
+# verified part -- since OWNER-FOOTAGE-NO-HARDLINK-1 a symbolic link or a byte copy, never a hard
+# link -- under a neutral name derived from its index, so nothing downstream -- the smoke
 # runner's own sibling glob, the app's own continuation-part walk or sidecar -- ever sees the
 # owner's real directory) moved OUT of AttrCudaArtifacts.psm1 into AttrCudaOwnerFootage.psm1: that
 # shared module is embedded by every PLAYBACK-ATTR-3-CUDA build-route script (assemble/stage/
@@ -615,11 +624,15 @@ $embeddedFunctions = Get-AttrCudaEmbeddedFunctionSource -Name @(
 $embeddedFunctions = $embeddedFunctions + "`r`n`r`n" + (Get-AttrCudaEmbeddedFunctionSource -ModulePath (Join-Path $PSScriptRoot 'AttrCudaOwnerFootage.psm1') -Name @(
     'Get-AttrCudaOwnerFootageNeutralName',
     'Assert-AttrCudaOwnerPartsNaming',
-    'Get-AttrCudaFileIdentity',
-    'New-AttrCudaOwnerFootageLink',
+    'New-AttrCudaFileSymlink',
+    'Test-AttrCudaSymlinkCapability',
     'Open-AttrCudaReadOnlyHandle',
+    'Assert-AttrCudaOwnerFootageCopySpace',
+    'New-AttrCudaOwnerFootageView',
+    'Assert-AttrCudaOwnerFootageViewsIntact',
     # BACHELOR-OWNER-CLIP-STAGE-STALL-1 round 1f: the runner's carried-identity file (see its header).
     'New-AttrCudaVerifiedClipBinding',
+    'Clear-AttrCudaOwnerFootageLeftovers',
     'Close-AttrCudaOwnerFootageWorkspace'
 ))
 
@@ -826,7 +839,10 @@ $VerifiedClipBindingPath = ''
 # ATTR3-FOOTAGE-BIND-1 PR-B round 4: set by the owner branch below; stays $null/empty for a
 # fixture run, so the `finally` around the smoke run further down is a no-op for one.
 $OwnerClipDir = $null
-$ownerLinkHandles = [System.Collections.Generic.List[object]]::new()
+# OWNER-FOOTAGE-NO-HARDLINK-1: every handle held on an original (the PIN) or on a view entry, and the
+# view records the cleanup deletes by identity. Empty for a fixture run.
+$ownerViewHandles = [System.Collections.Generic.List[object]]::new()
+$ownerViews = [System.Collections.Generic.List[object]]::new()
 
 # --- verifiers, embedded VERBATIM from tools/profiling/bachelor/AttrCudaArtifacts.psm1 --------
 # Defined FIRST, before any statement that calls them (sol PR #133 r3: the work-tree cleanup was
@@ -940,6 +956,13 @@ foreach ($check in @(
     @{ path = $Pub; label = 'Pub' }
 )) { Assert-UnderMlvTmp $check.path $check.label }
 
+# OWNER-FOOTAGE-NO-HARDLINK-1: an earlier run of this job that was killed before its `finally` leaves
+# view entries (symbolic links or copies) under $Work\owner-clip. Each is removed first, through the
+# identity-checked primitive, so the recursive sweep below never meets a reparse point -- and never
+# reaches a hard link: an entry with a second name is left and the sweep then REFUSES the tree
+# (Remove-AttrCudaTree throws ATTRCUDA_TREE_HAS_HARD_LINK) rather than deleting it.
+[void](Assert-AttrCudaNoLinkBelowRoot -TrustedRoot 'C:\mlvtmp' -Path (Join-Path $Work 'owner-clip'))
+[void](Clear-AttrCudaOwnerFootageLeftovers -Directory (Join-Path $Work 'owner-clip'))
 Remove-AttrCudaTree -TrustedRoot 'C:\mlvtmp' -Path $Work
 New-Item -ItemType Directory -Path $Work -Force | Out-Null
 $Scratch = Join-Path $Work '.job-tmp'
@@ -1555,11 +1578,13 @@ if ($FixtureRehearsal) {
 
     # ATTR3-FOOTAGE-BIND-1 PR-B round 4 (STRUCTURAL, closes B1/B2). The parts just verified on
     # the owner's OWN directory never travel any further: a PRIVATE, neutrally-named directory is
-    # built under this job's own $Work -- one hard link per verified part -- so the smoke
-    # runner's own sibling glob and the app's own continuation-part walk / sidecar file see ONLY
-    # the parts this job verified, and every path this job hands to the smoke child or writes
-    # into $Pub from here on names only an entry under $OwnerClipDir (never the owner's real
-    # directory).
+    # built under this job's own $Work -- one VIEW per verified part -- so the smoke runner's own
+    # sibling glob and the app's own continuation-part walk / sidecar file see ONLY the parts this
+    # job verified, and every path this job hands to the smoke child or writes into $Pub from here
+    # on names only an entry under $OwnerClipDir (never the owner's real directory).
+    # OWNER-FOOTAGE-NO-HARDLINK-1: a view is a FILE SYMBOLIC LINK to the original where this venue
+    # can create one (probed now, typed), else a VERIFIED BYTE COPY -- never a hard link, which
+    # would be a second name of the owner's bytes for any delete, sweep or write to destroy.
     try {
         $ownerAssertedParts = Assert-AttrCudaOwnerPartsNaming -Parts $ownerDecodedParts
     } catch {
@@ -1577,34 +1602,38 @@ if ($FixtureRehearsal) {
 
     $OwnerClipDir = New-AttrCudaDirectory -Path (Join-Path $Work 'owner-clip')
     $ownerVerifiedParts = [System.Collections.Generic.List[object]]::new()
-    # ATTR3-FOOTAGE-BIND-1 PR-B round 5 (astra major): the cleanup `try` now wraps this ENTIRE
-    # loop -- creating every link, opening every held handle, and re-verifying every link's
-    # content -- not just the code from a link's successful creation onward. Round 4 only guarded
-    # New-AttrCudaOwnerFootageLink's own throw with a per-part try/catch; a failure from
-    # Open-AttrCudaReadOnlyHandle (e.g. a sharing violation on part N after parts 0..N-1 were
-    # already linked and held) had no catch of its own and propagated straight out of the script,
-    # skipping cleanup entirely and leaking every link already created. One catch below now
-    # handles all three failure shapes (cross-volume, link/identity/handle failure, post-link
-    # content mismatch): $part still holds the failing iteration's value here (a PowerShell
-    # `foreach` variable is not iteration-scoped, so it survives the loop being broken out of by
-    # an exception), which is enough to report the affected index without re-deriving it from the
-    # exception text.
+    $ownerViewCapability = Test-AttrCudaSymlinkCapability -Directory $OwnerClipDir
+    $ownerViewMode = if ($ownerViewCapability.Capable) { 'symlink' } else { 'copy' }
+    Write-JobTrace "footage view mode=$ownerViewMode capability=$($ownerViewCapability.Result)"
+    $part = $null
+    # ATTR3-FOOTAGE-BIND-1 PR-B round 5 (astra major): the cleanup `try` wraps this ENTIRE loop --
+    # pinning every original, building every view, opening every held handle, and re-verifying
+    # every view's content -- not just the code from a view's successful creation onward. One catch
+    # below handles every failure shape (no room for a copy, a pin or view that could not be
+    # built, a post-view content mismatch, a view that changed before launch): $part still holds
+    # the failing iteration's value here (a PowerShell `foreach` variable is not iteration-scoped,
+    # so it survives the loop being broken out of by an exception), which is enough to report the
+    # affected index without re-deriving it from the exception text.
     try {
+        if ($ownerViewMode -eq 'copy') {
+            Assert-AttrCudaOwnerFootageCopySpace -Directory $OwnerClipDir -Parts @($ownerAssertedParts)
+        }
         foreach ($part in $ownerAssertedParts) {
-            $linkPath = New-AttrCudaOwnerFootageLink -Directory $OwnerClipDir -Index $part.index -SourcePath $part.path
-            # Held open from the moment the link's identity is confirmed until the smoke child
-            # that reads it has exited (see the `finally` around the smoke run below) --
-            # FileShare.Read blocks any writer from replacing or truncating the link's target
-            # underneath a live measurement, while still letting the smoke child and this job's
-            # own re-hash below both read it.
-            $handle = Open-AttrCudaReadOnlyHandle -Path $linkPath
-            [void]$ownerLinkHandles.Add($handle)
-            Write-JobTrace "footage part=$($part.index) linked and held; identity hash start"
-            # THE one full read of this part in this job: length, then a large-block sha256 of the
-            # very file object this job now holds read-shared (identity proven by
-            # New-AttrCudaOwnerFootageLink), traced with its size and rate. Never skipped -- it is
-            # the identity/consent check -- and never repeated: the app that follows reads the
-            # pages this pass just warmed.
+            # THE PIN: the ORIGINAL part opened read-only with FileShare.Read, held until the smoke
+            # child has exited (see the `finally` at the end of this job). FileShare.Read grants
+            # neither write nor delete, so no other process can truncate, replace, rename or delete
+            # the original while a measurement reads its view.
+            $pin = Open-AttrCudaReadOnlyHandle -Path $part.path
+            [void]$ownerViewHandles.Add($pin)
+            $view = New-AttrCudaOwnerFootageView -Directory $OwnerClipDir -Index $part.index -SourcePath $part.path -PinStream $pin -Mode $ownerViewMode
+            [void]$ownerViews.Add($view)
+            [void]$ownerViewHandles.Add($view.ViewStream)
+            $linkPath = $view.Path
+            Write-JobTrace "footage part=$($part.index) viewed ($ownerViewMode) and pinned; identity hash start"
+            # THE one full read of this part's bytes for the identity check: length, then a
+            # large-block sha256 of the view (a symlink to the pinned original, or the verified
+            # copy), traced with its size and rate. Never skipped -- it is the identity/consent
+            # check -- and never repeated: the app that follows reads the pages this pass warmed.
             $relinkStatus = Test-AttrCudaFootagePart -Path $linkPath -ExpectedLength $part.length -ExpectedSha256 $part.sha256 -TracePath $Trace -TraceLabel "footage-part$($part.index)-identity-hash"
             Write-JobTrace "footage part=$($part.index) identity status=$relinkStatus"
             if ($relinkStatus -ne 'PASS') {
@@ -1613,40 +1642,42 @@ if ($FixtureRehearsal) {
             if ($part.index -eq 0) { $clipPath = $linkPath }
             [void]$ownerVerifiedParts.Add([ordered]@{ path = $linkPath; length = $part.length; sha256 = $part.sha256 })
         }
+        Assert-AttrCudaOwnerFootageViewsIntact -Views @($ownerViews)
     } catch {
-        # Closes whatever handles were acquired before the failure and deletes only the neutral
-        # link entries that exist with a live link count >= 2 -- never throws, so the refusal
-        # below is always reached.
-        Close-AttrCudaOwnerFootageWorkspace -Handles $ownerLinkHandles -Directory $OwnerClipDir
+        # Closes whatever handles were acquired before the failure and removes only the view
+        # entries this job recorded (by identity) -- never throws, so the refusal below is always
+        # reached.
+        Close-AttrCudaOwnerFootageWorkspace -Handles $ownerViewHandles -Views @($ownerViews)
         $message = $_.Exception.Message
+        $failedIndex = if ($message -match '\bpart (\d+)\b') { [int]$Matches[1] } elseif ($null -ne $part) { $part.index } else { -1 }
         if ($message -match '^OWNER_FOOTAGE_NOT_VERIFIED status=(\S+)$') {
             $relinkRefusal = [ordered]@{
                 schema='playback-attr-3-cuda-venue.v1'; result='OWNER_FOOTAGE_NOT_VERIFIED'
                 fixtureRehearsal=$FixtureRehearsal
                 displayWake=$displayWake
-                parts=@(@{ index = $part.index; status = $Matches[1] })
+                parts=@(@{ index = $failedIndex; status = $Matches[1] })
                 sourceCommit=$SourceCommit; clipId=$ClipId; artifactRoot=$Pub
             }
             Save-Json $relinkRefusal (Join-Path $Pub 'summary.json')
-            Write-Output "RESULT=OWNER_FOOTAGE_NOT_VERIFIED PARTS=$($part.index)=$($Matches[1]) ARTIFACTS=$Pub"
+            Write-Output "RESULT=OWNER_FOOTAGE_NOT_VERIFIED PARTS=$failedIndex=$($relinkRefusal.parts[0].status) ARTIFACTS=$Pub"
             exit 19
         }
-        # Any other failure in this loop -- cross-volume, link/identity creation, or a handle that
-        # could not even be opened -- is reported the same way New-AttrCudaOwnerFootageLink's own
-        # throws always were: by index only, never a path or the raw exception text.
-        $linkToken = ($message -split '\s+')[0]
-        if ($linkToken -ne 'OWNER_FOOTAGE_LINK_CROSS_VOLUME') { $linkToken = 'OWNER_FOOTAGE_LINK_FAILED' }
-        $linkExitCode = if ($linkToken -eq 'OWNER_FOOTAGE_LINK_CROSS_VOLUME') { 21 } else { 22 }
-        $linkRefusal = [ordered]@{
-            schema='playback-attr-3-cuda-venue.v1'; result=$linkToken
+        # Any other failure in this block is reported by a fixed token and the part index only,
+        # never a path or the raw exception text.
+        $viewToken = ($message -split '\s+')[0]
+        if ($viewToken -ne 'OWNER_FOOTAGE_VIEW_NO_SPACE' -and $viewToken -ne 'OWNER_FOOTAGE_VIEW_CHANGED') { $viewToken = 'OWNER_FOOTAGE_VIEW_FAILED' }
+        $viewExitCode = switch ($viewToken) { 'OWNER_FOOTAGE_VIEW_NO_SPACE' { 21 } 'OWNER_FOOTAGE_VIEW_CHANGED' { 24 } default { 22 } }
+        $viewRefusal = [ordered]@{
+            schema='playback-attr-3-cuda-venue.v1'; result=$viewToken
             fixtureRehearsal=$FixtureRehearsal
             displayWake=$displayWake
-            partIndex=$part.index
+            viewMode=$ownerViewMode
+            partIndex=$failedIndex
             sourceCommit=$SourceCommit; clipId=$ClipId; artifactRoot=$Pub
         }
-        Save-Json $linkRefusal (Join-Path $Pub 'summary.json')
-        Write-Output "RESULT=$linkToken PART=$($part.index) ARTIFACTS=$Pub"
-        exit $linkExitCode
+        Save-Json $viewRefusal (Join-Path $Pub 'summary.json')
+        Write-Output "RESULT=$viewToken PART=$failedIndex ARTIFACTS=$Pub"
+        exit $viewExitCode
     }
 
     # BACHELOR-OWNER-CLIP-STAGE-STALL-1 round 1f (sol BLOCKER): the smoke runner used to hash every
@@ -1931,6 +1962,28 @@ if (-not $keepAliveHealthAtMeasurementStart.healthy) {
     Save-Json $keepAliveRefusal (Join-Path $Pub 'summary.json')
     Write-Output "RESULT=KEEPALIVE_FAILED CHECKPOINT=start_of_measured_interval REASON=$($keepAliveHealthAtMeasurementStart.reason) ARTIFACTS=$Pub"
     exit 26
+}
+# OWNER-FOOTAGE-NO-HARDLINK-1: the last look before the app can read anything. Every view must still be
+# the entry this job built (name identity, one name, reparse-point state) and must still lead to the
+# pinned original -- the held handles already refuse a write or replace, this DETECTS anything that
+# slipped in earlier. A view that changed ends the run here, before PresentMon and before the smoke
+# child, with a typed refusal that names only the part index. A fixture run has no views.
+if ($ownerViews.Count -gt 0) {
+    try {
+        Assert-AttrCudaOwnerFootageViewsIntact -Views @($ownerViews)
+    } catch {
+        $changedIndex = if ($_.Exception.Message -match '\bpart (\d+)\b') { [int]$Matches[1] } else { -1 }
+        $viewChanged = [ordered]@{
+            schema='playback-attr-3-cuda-venue.v1'; result='OWNER_FOOTAGE_VIEW_CHANGED'
+            fixtureRehearsal=$FixtureRehearsal
+            displayWake=$displayWake
+            partIndex=$changedIndex
+            sourceCommit=$SourceCommit; clipId=$ClipId; artifactRoot=$Pub
+        }
+        Save-Json $viewChanged (Join-Path $Pub 'summary.json')
+        Write-Output "RESULT=OWNER_FOOTAGE_VIEW_CHANGED PART=$changedIndex ARTIFACTS=$Pub"
+        exit 24
+    }
 }
 $presentMonPreSpawnUtc = (Get-Date).ToUniversalTime()
 # PRESENTMON-HARNESS-ROBUSTNESS-1: Start-PresentMonCapture throws -- a pre-existing output file,
@@ -2793,7 +2846,7 @@ Write-Output "RESULT=$resultVerb FIXTURE_REHEARSAL=$FixtureRehearsal SOURCE=$Sou
 exit 0
 } finally {
     if ($OwnerClipDir) {
-        Close-AttrCudaOwnerFootageWorkspace -Handles $ownerLinkHandles -Directory $OwnerClipDir
+        Close-AttrCudaOwnerFootageWorkspace -Handles $ownerViewHandles -Views @($ownerViews)
     }
     # CUDA-PERF-DISPLAY-WAKE-2: stop the periodic keep-alive first -- releases its background
     # Runspace -- before releasing the execution-state request itself, on every exit path from

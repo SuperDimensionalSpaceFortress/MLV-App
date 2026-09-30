@@ -1,34 +1,274 @@
 {
   "rows": [
     {
-      "source": "Attr3FootagePresenceJob.psm1",
-      "function": "New-Attr3FootagePresenceJob",
-      "line": 298,
-      "kind": "cmdlet",
-      "name": "New-Item",
-      "text": "New-Item -ItemType Directory -Path $OutDir -Force",
-      "disposition": "job-private-temp",
-      "note": "OutDir is a fresh per-run temp directory this run creates itself"
-    },
-    {
-      "source": "Attr3FootagePresenceJob.psm1",
-      "function": "New-Attr3FootagePresenceJob",
-      "line": 298,
-      "kind": "cmdlet",
-      "name": "Test-Path",
-      "text": "Test-Path -LiteralPath $OutDir",
-      "disposition": "job-private-temp",
-      "note": "OutDir is a fresh per-run temp directory this run creates itself"
-    },
-    {
-      "source": "Attr3FootagePresenceJob.psm1",
-      "function": "New-Attr3FootagePresenceJob",
-      "line": 299,
+      "source": "attr3-footage-stage.ps1",
+      "function": "<top-level>",
+      "line": 196,
       "kind": "cmdlet",
       "name": "Resolve-Path",
-      "text": "Resolve-Path -LiteralPath $OutDir",
+      "text": "Resolve-Path (Join-Path $PSScriptRoot '..\\..\\..')",
+      "disposition": "read-only-fixed",
+      "note": "fixed relative to $PSScriptRoot, this script's own tracked location -- never caller input"
+    },
+    {
+      "source": "AttrCudaOwnerFootage.psm1",
+      "function": "Send-AttrCudaOwnerFootagePartToStaging",
+      "line": 194,
+      "kind": "cmdlet",
+      "name": "Test-Path",
+      "text": "Test-Path -LiteralPath $finalPath -PathType Leaf -ErrorAction Stop",
+      "disposition": "boundary-root-asserted",
+      "note": "finalPath is a direct child of the already-asserted StagingDirectory"
+    },
+    {
+      "source": "AttrCudaOwnerFootage.psm1",
+      "function": "New-AttrCudaFileSymlink",
+      "line": 374,
+      "kind": "cmdlet",
+      "name": "New-Item",
+      "text": "New-Item -ItemType SymbolicLink -Path $LinkPath -Target $TargetPath -ErrorAction Stop",
       "disposition": "job-private-temp",
-      "note": "OutDir is a fresh per-run temp directory this run creates itself"
+      "note": "creates ONE symbolic link at a fresh neutral name inside the job-private view directory, never with -Force so it cannot replace anything; -Target only records the original's path in the link -- the original is not opened, written or modified by this call, and deleting the link can never touch it"
+    },
+    {
+      "source": "AttrCudaOwnerFootage.psm1",
+      "function": "Clear-AttrCudaOwnerFootageLeftovers",
+      "line": 652,
+      "kind": "cmdlet",
+      "name": "Get-ChildItem",
+      "text": "Get-ChildItem -LiteralPath $Directory -Force -ErrorAction SilentlyContinue",
+      "disposition": "boundary-root-asserted",
+      "note": "enumerates the job's own view directory for neutral-named leftovers of a killed run; the caller proves the chain link-free from C:\\mlvtmp first (Assert-AttrCudaNoLinkBelowRoot), the directory itself is checked not to be a reparse point here, and every removal goes through Remove-AttrCudaFileById (identity + single name), never by pathname"
+    },
+    {
+      "source": "AttrCudaOwnerFootage.psm1",
+      "function": "Send-AttrCudaOwnerFootagePartToStaging",
+      "line": 222,
+      "kind": "static-method",
+      "name": "Open",
+      "text": "[IO.File]::Open($SourcePath, [IO.FileMode]::Open, [IO.FileAccess]::Read, [IO.FileShare]::Read)",
+      "disposition": "boundary-root-asserted",
+      "note": "SourcePath link-safety is the caller's contract: attr3-footage-stage.ps1 step 3 asserts every part's source chain before calling this function (documented in this function's own header)"
+    },
+    {
+      "source": "AttrCudaOwnerFootage.psm1",
+      "function": "Send-AttrCudaOwnerFootagePartToStaging",
+      "line": 227,
+      "kind": "static-method",
+      "name": "Open",
+      "text": "[IO.File]::Open($partialPath, [IO.FileMode]::CreateNew, [IO.FileAccess]::Write, [IO.FileShare]::None)",
+      "disposition": "boundary-root-asserted",
+      "note": "partialPath is a direct child of the already-asserted StagingDirectory"
+    },
+    {
+      "source": "AttrCudaOwnerFootage.psm1",
+      "function": "Send-AttrCudaOwnerFootagePartToStaging",
+      "line": 236,
+      "kind": "instance-method",
+      "name": "CopyTo",
+      "text": "$sourceStream.CopyTo($destStream)",
+      "disposition": "boundary-root-asserted",
+      "note": "operates on streams opened from the already-asserted StagingDirectory"
+    },
+    {
+      "source": "AttrCudaOwnerFootage.psm1",
+      "function": "Send-AttrCudaOwnerFootagePartToStaging",
+      "line": 237,
+      "kind": "instance-method",
+      "name": "Flush",
+      "text": "$destStream.Flush()",
+      "disposition": "boundary-root-asserted",
+      "note": "operates on streams opened from the already-asserted StagingDirectory"
+    },
+    {
+      "source": "AttrCudaOwnerFootage.psm1",
+      "function": "Send-AttrCudaOwnerFootagePartToStaging",
+      "line": 246,
+      "kind": "instance-method",
+      "name": "Dispose",
+      "text": "$sourceStream.Dispose()",
+      "disposition": "boundary-root-asserted",
+      "note": "releases a stream opened from the already-asserted StagingDirectory"
+    },
+    {
+      "source": "AttrCudaOwnerFootage.psm1",
+      "function": "Send-AttrCudaOwnerFootagePartToStaging",
+      "line": 258,
+      "kind": "instance-method",
+      "name": "Dispose",
+      "text": "$destStream.Dispose()",
+      "disposition": "boundary-root-asserted",
+      "note": "releases a stream opened from the already-asserted StagingDirectory"
+    },
+    {
+      "source": "AttrCudaOwnerFootage.psm1",
+      "function": "Send-AttrCudaOwnerFootagePartToStaging",
+      "line": 264,
+      "kind": "instance-method",
+      "name": "Dispose",
+      "text": "$destStream.Dispose()",
+      "disposition": "boundary-root-asserted",
+      "note": "releases a stream opened from the already-asserted StagingDirectory"
+    },
+    {
+      "source": "AttrCudaOwnerFootage.psm1",
+      "function": "Send-AttrCudaOwnerFootagePartToStaging",
+      "line": 265,
+      "kind": "instance-method",
+      "name": "Dispose",
+      "text": "$sourceStream.Dispose()",
+      "disposition": "boundary-root-asserted",
+      "note": "releases a stream opened from the already-asserted StagingDirectory"
+    },
+    {
+      "source": "AttrCudaOwnerFootage.psm1",
+      "function": "Send-AttrCudaOwnerFootagePartToStaging",
+      "line": 182,
+      "kind": "cmdlet",
+      "name": "New-Item",
+      "text": "New-Item -ItemType Directory -Path $StagingDirectory -Force -ErrorAction Stop",
+      "disposition": "boundary-root-asserted",
+      "note": "StagingDirectory already asserted above"
+    },
+    {
+      "source": "AttrCudaOwnerFootage.psm1",
+      "function": "Send-AttrCudaOwnerFootagePartToStaging",
+      "line": 269,
+      "kind": "instance-method",
+      "name": "Dispose",
+      "text": "$sourceStream.Dispose()",
+      "disposition": "boundary-root-asserted",
+      "note": "releases a stream opened from the already-asserted StagingDirectory"
+    },
+    {
+      "source": "AttrCudaOwnerFootage.psm1",
+      "function": "Send-AttrCudaOwnerFootagePartToStaging",
+      "line": 282,
+      "kind": "static-method",
+      "name": "Move",
+      "text": "[IO.File]::Move($partialPath, $finalPath, $false)",
+      "disposition": "boundary-root-asserted",
+      "note": "both paths are direct children of the already-asserted StagingDirectory"
+    },
+    {
+      "source": "AttrCudaOwnerFootage.psm1",
+      "function": "Test-AttrCudaSymlinkCapability",
+      "line": 403,
+      "kind": "static-method",
+      "name": "Open",
+      "text": "[IO.File]::Open($targetPath, [IO.FileMode]::CreateNew, [IO.FileAccess]::Write, [IO.FileShare]::None)",
+      "disposition": "job-private-temp",
+      "note": "the throwaway probe target: a GUID-named file created by this call with FileMode.CreateNew inside the job-private view directory, written one byte, then removed by identity; it is never an owner original or a view entry"
+    },
+    {
+      "source": "AttrCudaOwnerFootage.psm1",
+      "function": "Test-AttrCudaSymlinkCapability",
+      "line": 405,
+      "kind": "instance-method",
+      "name": "WriteByte",
+      "text": "$stream.WriteByte(1)",
+      "disposition": "job-private-temp",
+      "note": "the throwaway probe target: a GUID-named file created by this call with FileMode.CreateNew inside the job-private view directory, written one byte, then removed by identity; it is never an owner original or a view entry"
+    },
+    {
+      "source": "AttrCudaOwnerFootage.psm1",
+      "function": "Test-AttrCudaSymlinkCapability",
+      "line": 406,
+      "kind": "instance-method",
+      "name": "Dispose",
+      "text": "$stream.Dispose()",
+      "disposition": "job-private-temp",
+      "note": "the throwaway probe target: a GUID-named file created by this call with FileMode.CreateNew inside the job-private view directory, written one byte, then removed by identity; it is never an owner original or a view entry"
+    },
+    {
+      "source": "AttrCudaOwnerFootage.psm1",
+      "function": "Test-AttrCudaSymlinkCapability",
+      "line": 426,
+      "kind": "instance-method",
+      "name": "Dispose",
+      "text": "$stream.Dispose()",
+      "disposition": "job-private-temp",
+      "note": "the throwaway probe target: a GUID-named file created by this call with FileMode.CreateNew inside the job-private view directory, written one byte, then removed by identity; it is never an owner original or a view entry"
+    },
+    {
+      "source": "AttrCudaOwnerFootage.psm1",
+      "function": "Open-AttrCudaReadOnlyHandle",
+      "line": 447,
+      "kind": "static-method",
+      "name": "Open",
+      "text": "[IO.File]::Open($Path, [IO.FileMode]::Open, [IO.FileAccess]::Read, [IO.FileShare]::Read)",
+      "disposition": "read-only-fixed",
+      "note": "opens for READ ONLY (FileAccess.Read) with FileShare.Read: it is the PIN on an owner original and the read handle on a view entry. It writes nothing, and while it is held no other process is granted write or delete on the file, so a run cannot be edited, replaced, renamed or deleted under it"
+    },
+    {
+      "source": "AttrCudaOwnerFootage.psm1",
+      "function": "New-AttrCudaOwnerFootageView",
+      "line": 533,
+      "kind": "static-method",
+      "name": "Open",
+      "text": "[IO.File]::Open($viewPath, [IO.FileMode]::CreateNew, [IO.FileAccess]::Write, [IO.FileShare]::None)",
+      "disposition": "job-private-temp",
+      "note": "copy mode only: the VIEW COPY is created here with FileMode.CreateNew under the neutral name in the job-private view directory and filled from the read-only pin on the original (the original is only READ, never opened for write); the handle calls act on that fresh copy or on read handles"
+    },
+    {
+      "source": "AttrCudaOwnerFootage.psm1",
+      "function": "New-AttrCudaOwnerFootageView",
+      "line": 537,
+      "kind": "instance-method",
+      "name": "CopyTo",
+      "text": "$PinStream.CopyTo($destStream, 4194304)",
+      "disposition": "job-private-temp",
+      "note": "copy mode only: the VIEW COPY is created here with FileMode.CreateNew under the neutral name in the job-private view directory and filled from the read-only pin on the original (the original is only READ, never opened for write); the handle calls act on that fresh copy or on read handles"
+    },
+    {
+      "source": "AttrCudaOwnerFootage.psm1",
+      "function": "New-AttrCudaOwnerFootageView",
+      "line": 538,
+      "kind": "instance-method",
+      "name": "Flush",
+      "text": "$destStream.Flush($true)",
+      "disposition": "job-private-temp",
+      "note": "copy mode only: the VIEW COPY is created here with FileMode.CreateNew under the neutral name in the job-private view directory and filled from the read-only pin on the original (the original is only READ, never opened for write); the handle calls act on that fresh copy or on read handles"
+    },
+    {
+      "source": "AttrCudaOwnerFootage.psm1",
+      "function": "New-AttrCudaOwnerFootageView",
+      "line": 539,
+      "kind": "instance-method",
+      "name": "Dispose",
+      "text": "$destStream.Dispose()",
+      "disposition": "boundary-root-asserted",
+      "note": "releases a stream opened from the already-asserted StagingDirectory"
+    },
+    {
+      "source": "AttrCudaOwnerFootage.psm1",
+      "function": "New-AttrCudaOwnerFootageView",
+      "line": 556,
+      "kind": "instance-method",
+      "name": "Dispose",
+      "text": "$viewStream.Dispose()",
+      "disposition": "job-private-temp",
+      "note": "copy mode only: the VIEW COPY is created here with FileMode.CreateNew under the neutral name in the job-private view directory and filled from the read-only pin on the original (the original is only READ, never opened for write); the handle calls act on that fresh copy or on read handles"
+    },
+    {
+      "source": "AttrCudaOwnerFootage.psm1",
+      "function": "Send-AttrCudaOwnerFootagePartToStaging",
+      "line": 270,
+      "kind": "instance-method",
+      "name": "Dispose",
+      "text": "$destStream.Dispose()",
+      "disposition": "boundary-root-asserted",
+      "note": "releases a stream opened from the already-asserted StagingDirectory"
+    },
+    {
+      "source": "AttrCudaOwnerFootage.psm1",
+      "function": "Send-AttrCudaOwnerFootagePartToStaging",
+      "line": 181,
+      "kind": "cmdlet",
+      "name": "Test-Path",
+      "text": "Test-Path -LiteralPath $StagingDirectory -PathType Container -ErrorAction Stop",
+      "disposition": "boundary-root-asserted",
+      "note": "runs only after StagingDirectory = Assert-AttrCudaNoLinkBelowRoot(...) succeeded at the top of this function"
     },
     {
       "source": "Attr3FootagePresenceJob.psm1",
@@ -41,474 +281,14 @@
       "note": "jobPath is under the job-private OutDir"
     },
     {
-      "source": "Attr3FootageStageJob.psm1",
-      "function": "New-Attr3FootageStageJob",
-      "line": 700,
-      "kind": "cmdlet",
-      "name": "Test-Path",
-      "text": "Test-Path -LiteralPath $OutDir",
-      "disposition": "job-private-temp",
-      "note": "OutDir is a fresh per-run temp directory this run creates itself"
-    },
-    {
-      "source": "Attr3FootageStageJob.psm1",
-      "function": "New-Attr3FootageStageJob",
-      "line": 700,
-      "kind": "cmdlet",
-      "name": "New-Item",
-      "text": "New-Item -ItemType Directory -Path $OutDir -Force",
-      "disposition": "job-private-temp",
-      "note": "OutDir is a fresh per-run temp directory this run creates itself"
-    },
-    {
-      "source": "Attr3FootageStageJob.psm1",
-      "function": "New-Attr3FootageStageJob",
-      "line": 701,
+      "source": "Attr3FootagePresenceJob.psm1",
+      "function": "New-Attr3FootagePresenceJob",
+      "line": 299,
       "kind": "cmdlet",
       "name": "Resolve-Path",
       "text": "Resolve-Path -LiteralPath $OutDir",
       "disposition": "job-private-temp",
       "note": "OutDir is a fresh per-run temp directory this run creates itself"
-    },
-    {
-      "source": "Attr3FootageStageJob.psm1",
-      "function": "New-Attr3FootageStageJob",
-      "line": 703,
-      "kind": "static-method",
-      "name": "WriteAllText",
-      "text": "[IO.File]::WriteAllText($jobPath, $text, [Text.UTF8Encoding]::new($false))",
-      "disposition": "job-private-temp",
-      "note": "jobPath is under the job-private OutDir"
-    },
-    {
-      "source": "Attr3FootageStageJob.psm1::template",
-      "function": "<top-level>",
-      "line": 168,
-      "kind": "cmdlet",
-      "name": "Test-Path",
-      "text": "Test-Path -LiteralPath $targetPath -PathType Leaf -ErrorAction Stop",
-      "disposition": "boundary-root-asserted",
-      "note": "runs only after Assert-AttrCudaNoLinkBelowRoot(TrustedRoot=driveRoot, Path=targetPath) succeeded (TARGET_PATH_UNSAFE gate)"
-    },
-    {
-      "source": "Attr3FootageStageJob.psm1::template",
-      "function": "<top-level>",
-      "line": 254,
-      "kind": "static-method",
-      "name": "Open",
-      "text": "[IO.File]::Open($stagedPath, [IO.FileMode]::Open, [IO.FileAccess]::Read, [IO.FileShare]::Read)",
-      "disposition": "boundary-root-asserted",
-      "note": "stagedPath already proven link-free via Assert-AttrCudaNoLinkBelowRoot(TrustedRoot=StageDir) earlier this iteration"
-    },
-    {
-      "source": "Attr3FootageStageJob.psm1::template",
-      "function": "<top-level>",
-      "line": 261,
-      "kind": "static-method",
-      "name": "Open",
-      "text": "[IO.File]::Open($localPartialPath, [IO.FileMode]::CreateNew, [IO.FileAccess]::Write, [IO.FileShare]::None)",
-      "disposition": "boundary-root-asserted",
-      "note": "localPartialPath is a direct child of targetDir, itself under the root-asserted targetPath chain"
-    },
-    {
-      "source": "Attr3FootageStageJob.psm1::template",
-      "function": "<top-level>",
-      "line": 271,
-      "kind": "instance-method",
-      "name": "CopyTo",
-      "text": "$localSrcStream.CopyTo($localDstStream)",
-      "disposition": "boundary-root-asserted",
-      "note": "both streams opened from already-asserted paths above"
-    },
-    {
-      "source": "Attr3FootageStageJob.psm1::template",
-      "function": "<top-level>",
-      "line": 272,
-      "kind": "instance-method",
-      "name": "Flush",
-      "text": "$localDstStream.Flush()",
-      "disposition": "boundary-root-asserted",
-      "note": "both streams opened from already-asserted paths above"
-    },
-    {
-      "source": "Attr3FootageStageJob.psm1::template",
-      "function": "<top-level>",
-      "line": 284,
-      "kind": "instance-method",
-      "name": "Dispose",
-      "text": "$localSrcStream.Dispose()",
-      "disposition": "boundary-root-asserted",
-      "note": "releases a handle opened from an already-asserted path"
-    },
-    {
-      "source": "Attr3FootageStageJob.psm1::template",
-      "function": "<top-level>",
-      "line": 294,
-      "kind": "instance-method",
-      "name": "Dispose",
-      "text": "$localDstStream.Dispose()",
-      "disposition": "boundary-root-asserted",
-      "note": "releases a handle opened from an already-asserted path"
-    },
-    {
-      "source": "Attr3FootageStageJob.psm1::template",
-      "function": "<top-level>",
-      "line": 305,
-      "kind": "cmdlet",
-      "name": "Remove-Item",
-      "text": "Remove-Item -LiteralPath $localPartialPath -Force -Confirm:$false -ErrorAction SilentlyContinue",
-      "disposition": "boundary-root-asserted",
-      "note": "cleans up this attempt's own local partial under the root-asserted targetPath chain"
-    },
-    {
-      "source": "Attr3FootageStageJob.psm1::template",
-      "function": "<top-level>",
-      "line": 333,
-      "kind": "cmdlet",
-      "name": "Remove-Item",
-      "text": "Remove-Item -LiteralPath $localPartialPath -Force -Confirm:$false -ErrorAction SilentlyContinue",
-      "disposition": "boundary-root-asserted",
-      "note": "cleans up this attempt's own local partial after a raced publish; already-asserted chain"
-    },
-    {
-      "source": "Attr3FootageStageJob.psm1::template",
-      "function": "<top-level>",
-      "line": 322,
-      "kind": "static-method",
-      "name": "Open",
-      "text": "[IO.File]::Open($localPartialPath, [IO.FileMode]::Append, [IO.FileAccess]::Write, [IO.FileShare]::None)",
-      "disposition": "boundary-root-asserted",
-      "note": "test-only hook (-1 unless a test sets -TestHookCorruptAfterVerifyPartIndex); same already-asserted localPartialPath"
-    },
-    {
-      "source": "Attr3FootageStageJob.psm1::template",
-      "function": "<top-level>",
-      "line": 323,
-      "kind": "instance-method",
-      "name": "WriteByte",
-      "text": "$corruptStream.WriteByte(0)",
-      "disposition": "boundary-root-asserted",
-      "note": "test-only hook; same already-asserted localPartialPath"
-    },
-    {
-      "source": "Attr3FootageStageJob.psm1::template",
-      "function": "<top-level>",
-      "line": 323,
-      "kind": "instance-method",
-      "name": "Dispose",
-      "text": "$corruptStream.Dispose()",
-      "disposition": "boundary-root-asserted",
-      "note": "test-only hook; same already-asserted localPartialPath"
-    },
-    {
-      "source": "Attr3FootageStageJob.psm1::template",
-      "function": "<top-level>",
-      "line": 313,
-      "kind": "cmdlet",
-      "name": "Remove-Item",
-      "text": "Remove-Item -LiteralPath $localPartialPath -Force -Confirm:$false -ErrorAction SilentlyContinue",
-      "disposition": "boundary-root-asserted",
-      "note": "cleans up this attempt's own local partial under the root-asserted targetPath chain"
-    },
-    {
-      "source": "Attr3FootageStageJob.psm1::template",
-      "function": "<top-level>",
-      "line": 367,
-      "kind": "cmdlet",
-      "name": "Remove-Item",
-      "text": "Remove-Item -LiteralPath $targetPath -Force -Confirm:$false -ErrorAction Stop",
-      "disposition": "boundary-root-asserted",
-      "note": "targetPath already root-asserted earlier in this per-part iteration"
-    },
-    {
-      "source": "Attr3FootageStageJob.psm1::template",
-      "function": "<top-level>",
-      "line": 370,
-      "kind": "cmdlet",
-      "name": "Test-Path",
-      "text": "Test-Path -LiteralPath $targetPath -PathType Leaf -ErrorAction Stop",
-      "disposition": "boundary-root-asserted",
-      "note": "targetPath already root-asserted earlier in this per-part iteration"
-    },
-    {
-      "source": "AttrCudaOwnerFootage.psm1",
-      "function": "Send-AttrCudaOwnerFootagePartToStaging",
-      "line": 168,
-      "kind": "cmdlet",
-      "name": "Test-Path",
-      "text": "Test-Path -LiteralPath $StagingDirectory -PathType Container -ErrorAction Stop",
-      "disposition": "boundary-root-asserted",
-      "note": "runs only after StagingDirectory = Assert-AttrCudaNoLinkBelowRoot(...) succeeded at the top of this function"
-    },
-    {
-      "source": "AttrCudaOwnerFootage.psm1",
-      "function": "Send-AttrCudaOwnerFootagePartToStaging",
-      "line": 169,
-      "kind": "cmdlet",
-      "name": "New-Item",
-      "text": "New-Item -ItemType Directory -Path $StagingDirectory -Force -ErrorAction Stop",
-      "disposition": "boundary-root-asserted",
-      "note": "StagingDirectory already asserted above"
-    },
-    {
-      "source": "AttrCudaOwnerFootage.psm1",
-      "function": "Send-AttrCudaOwnerFootagePartToStaging",
-      "line": 181,
-      "kind": "cmdlet",
-      "name": "Test-Path",
-      "text": "Test-Path -LiteralPath $finalPath -PathType Leaf -ErrorAction Stop",
-      "disposition": "boundary-root-asserted",
-      "note": "finalPath is a direct child of the already-asserted StagingDirectory"
-    },
-    {
-      "source": "AttrCudaOwnerFootage.psm1",
-      "function": "Send-AttrCudaOwnerFootagePartToStaging",
-      "line": 202,
-      "kind": "static-method",
-      "name": "Open",
-      "text": "[IO.File]::Open($SourcePath, [IO.FileMode]::Open, [IO.FileAccess]::Read, [IO.FileShare]::Read)",
-      "disposition": "boundary-root-asserted",
-      "note": "SourcePath link-safety is the caller's contract: attr3-footage-stage.ps1 step 3 asserts every part's source chain before calling this function (documented in this function's own header)"
-    },
-    {
-      "source": "AttrCudaOwnerFootage.psm1",
-      "function": "Send-AttrCudaOwnerFootagePartToStaging",
-      "line": 207,
-      "kind": "static-method",
-      "name": "Open",
-      "text": "[IO.File]::Open($partialPath, [IO.FileMode]::CreateNew, [IO.FileAccess]::Write, [IO.FileShare]::None)",
-      "disposition": "boundary-root-asserted",
-      "note": "partialPath is a direct child of the already-asserted StagingDirectory"
-    },
-    {
-      "source": "AttrCudaOwnerFootage.psm1",
-      "function": "Send-AttrCudaOwnerFootagePartToStaging",
-      "line": 215,
-      "kind": "instance-method",
-      "name": "CopyTo",
-      "text": "$sourceStream.CopyTo($destStream)",
-      "disposition": "boundary-root-asserted",
-      "note": "operates on streams opened from the already-asserted StagingDirectory"
-    },
-    {
-      "source": "AttrCudaOwnerFootage.psm1",
-      "function": "Send-AttrCudaOwnerFootagePartToStaging",
-      "line": 216,
-      "kind": "instance-method",
-      "name": "Flush",
-      "text": "$destStream.Flush()",
-      "disposition": "boundary-root-asserted",
-      "note": "operates on streams opened from the already-asserted StagingDirectory"
-    },
-    {
-      "source": "AttrCudaOwnerFootage.psm1",
-      "function": "Send-AttrCudaOwnerFootagePartToStaging",
-      "line": 225,
-      "kind": "instance-method",
-      "name": "Dispose",
-      "text": "$sourceStream.Dispose()",
-      "disposition": "boundary-root-asserted",
-      "note": "releases a stream opened from the already-asserted StagingDirectory"
-    },
-    {
-      "source": "AttrCudaOwnerFootage.psm1",
-      "function": "Send-AttrCudaOwnerFootagePartToStaging",
-      "line": 237,
-      "kind": "instance-method",
-      "name": "Dispose",
-      "text": "$destStream.Dispose()",
-      "disposition": "boundary-root-asserted",
-      "note": "releases a stream opened from the already-asserted StagingDirectory"
-    },
-    {
-      "source": "AttrCudaOwnerFootage.psm1",
-      "function": "Send-AttrCudaOwnerFootagePartToStaging",
-      "line": 243,
-      "kind": "instance-method",
-      "name": "Dispose",
-      "text": "$destStream.Dispose()",
-      "disposition": "boundary-root-asserted",
-      "note": "releases a stream opened from the already-asserted StagingDirectory"
-    },
-    {
-      "source": "AttrCudaOwnerFootage.psm1",
-      "function": "Send-AttrCudaOwnerFootagePartToStaging",
-      "line": 244,
-      "kind": "instance-method",
-      "name": "Dispose",
-      "text": "$sourceStream.Dispose()",
-      "disposition": "boundary-root-asserted",
-      "note": "releases a stream opened from the already-asserted StagingDirectory"
-    },
-    {
-      "source": "AttrCudaOwnerFootage.psm1",
-      "function": "Send-AttrCudaOwnerFootagePartToStaging",
-      "line": 246,
-      "kind": "cmdlet",
-      "name": "Remove-Item",
-      "text": "Remove-Item -LiteralPath $partialPath -Force -Confirm:$false -ErrorAction SilentlyContinue",
-      "disposition": "boundary-root-asserted",
-      "note": "partialPath is a direct child of the already-asserted StagingDirectory"
-    },
-    {
-      "source": "AttrCudaOwnerFootage.psm1",
-      "function": "Send-AttrCudaOwnerFootagePartToStaging",
-      "line": 250,
-      "kind": "instance-method",
-      "name": "Dispose",
-      "text": "$sourceStream.Dispose()",
-      "disposition": "boundary-root-asserted",
-      "note": "releases a stream opened from the already-asserted StagingDirectory"
-    },
-    {
-      "source": "AttrCudaOwnerFootage.psm1",
-      "function": "Send-AttrCudaOwnerFootagePartToStaging",
-      "line": 251,
-      "kind": "instance-method",
-      "name": "Dispose",
-      "text": "$destStream.Dispose()",
-      "disposition": "boundary-root-asserted",
-      "note": "releases a stream opened from the already-asserted StagingDirectory"
-    },
-    {
-      "source": "AttrCudaOwnerFootage.psm1",
-      "function": "Send-AttrCudaOwnerFootagePartToStaging",
-      "line": 258,
-      "kind": "cmdlet",
-      "name": "Remove-Item",
-      "text": "Remove-Item -LiteralPath $partialPath -Force -Confirm:$false -ErrorAction SilentlyContinue",
-      "disposition": "boundary-root-asserted",
-      "note": "partialPath is a direct child of the already-asserted StagingDirectory"
-    },
-    {
-      "source": "AttrCudaOwnerFootage.psm1",
-      "function": "Send-AttrCudaOwnerFootagePartToStaging",
-      "line": 263,
-      "kind": "static-method",
-      "name": "Move",
-      "text": "[IO.File]::Move($partialPath, $finalPath, $false)",
-      "disposition": "boundary-root-asserted",
-      "note": "both paths are direct children of the already-asserted StagingDirectory"
-    },
-    {
-      "source": "AttrCudaOwnerFootage.psm1",
-      "function": "Send-AttrCudaOwnerFootagePartToStaging",
-      "line": 268,
-      "kind": "cmdlet",
-      "name": "Remove-Item",
-      "text": "Remove-Item -LiteralPath $partialPath -Force -Confirm:$false -ErrorAction SilentlyContinue",
-      "disposition": "boundary-root-asserted",
-      "note": "partialPath is a direct child of the already-asserted StagingDirectory"
-    },
-    {
-      "source": "AttrCudaOwnerFootage.psm1",
-      "function": "Send-AttrCudaOwnerFootagePartToStaging",
-      "line": 272,
-      "kind": "cmdlet",
-      "name": "Remove-Item",
-      "text": "Remove-Item -LiteralPath $partialPath -Force -Confirm:$false -ErrorAction SilentlyContinue",
-      "disposition": "boundary-root-asserted",
-      "note": "partialPath is a direct child of the already-asserted StagingDirectory"
-    },
-    {
-      "source": "AttrCudaOwnerFootage.psm1",
-      "function": "Get-AttrCudaFileIdentity",
-      "line": 391,
-      "kind": "static-method",
-      "name": "CreateFileW",
-      "text": "[AttrCudaWin32.NativeMethods]::CreateFileW( $Path, $genericRead, $shareAll, [IntPtr]::Zero, $openExisting, $backupSemant",
-      "disposition": "read-only-fixed",
-      "note": "metadata-only Win32 read (GetFileInformationByHandle via a GENERIC_READ handle); discloses identity/attributes only, never content, and is immediately closed -- this is the identity-proof primitive itself, not link containment (see New-AttrCudaOwnerFootageLink's own cross-volume + file-index check)"
-    },
-    {
-      "source": "AttrCudaOwnerFootage.psm1",
-      "function": "Get-AttrCudaFileIdentity",
-      "line": 398,
-      "kind": "static-method",
-      "name": "GetFileInformationByHandle",
-      "text": "[AttrCudaWin32.NativeMethods]::GetFileInformationByHandle($handle, [ref]$info)",
-      "disposition": "read-only-fixed",
-      "note": "metadata-only Win32 read; see CreateFileW row above"
-    },
-    {
-      "source": "AttrCudaOwnerFootage.psm1",
-      "function": "Get-AttrCudaFileIdentity",
-      "line": 409,
-      "kind": "static-method",
-      "name": "CloseHandle",
-      "text": "[AttrCudaWin32.NativeMethods]::CloseHandle($handle)",
-      "disposition": "read-only-fixed",
-      "note": "releases the Win32 handle; no data involved"
-    },
-    {
-      "source": "AttrCudaOwnerFootage.psm1",
-      "function": "New-AttrCudaOwnerFootageLink",
-      "line": 447,
-      "kind": "cmdlet",
-      "name": "New-Item",
-      "text": "New-Item -ItemType HardLink -Path $linkPath -Value $SourcePath -ErrorAction Stop",
-      "disposition": "job-private-temp",
-      "note": "linkPath is inside the private per-job owner-footage workspace (this module's own header: 'the private per-job directory')"
-    },
-    {
-      "source": "AttrCudaOwnerFootage.psm1",
-      "function": "Open-AttrCudaReadOnlyHandle",
-      "line": 478,
-      "kind": "static-method",
-      "name": "Open",
-      "text": "[IO.File]::Open($Path, [IO.FileMode]::Open, [IO.FileAccess]::Read, [IO.FileShare]::Read)",
-      "disposition": "job-private-temp",
-      "note": "Path is the private per-job hard link just created and identity-confirmed"
-    },
-    {
-      "source": "AttrCudaOwnerFootage.psm1",
-      "function": "Close-AttrCudaOwnerFootageWorkspace",
-      "line": 502,
-      "kind": "instance-method",
-      "name": "Dispose",
-      "text": "$handle.Dispose()",
-      "disposition": "job-private-temp",
-      "note": "disposes the held-open handle on the private per-job link"
-    },
-    {
-      "source": "AttrCudaOwnerFootage.psm1",
-      "function": "Close-AttrCudaOwnerFootageWorkspace",
-      "line": 505,
-      "kind": "cmdlet",
-      "name": "Test-Path",
-      "text": "Test-Path -LiteralPath $Directory",
-      "disposition": "job-private-temp",
-      "note": "Directory is the private per-job owner-footage workspace"
-    },
-    {
-      "source": "AttrCudaOwnerFootage.psm1",
-      "function": "Close-AttrCudaOwnerFootageWorkspace",
-      "line": 508,
-      "kind": "cmdlet",
-      "name": "Get-ChildItem",
-      "text": "Get-ChildItem -LiteralPath $Directory -File -ErrorAction SilentlyContinue",
-      "disposition": "job-private-temp",
-      "note": "Directory is the private per-job owner-footage workspace"
-    },
-    {
-      "source": "AttrCudaOwnerFootage.psm1",
-      "function": "Close-AttrCudaOwnerFootageWorkspace",
-      "line": 522,
-      "kind": "cmdlet",
-      "name": "Remove-Item",
-      "text": "Remove-Item -LiteralPath $entry.FullName -Force -Confirm:$false -ErrorAction Stop",
-      "disposition": "job-private-temp",
-      "note": "entry came from enumerating the private per-job workspace, matched by name AND by NumberOfLinks>=2 (never the last name of the owner's bytes)"
-    },
-    {
-      "source": "attr3-footage-stage.ps1",
-      "function": "<top-level>",
-      "line": 196,
-      "kind": "cmdlet",
-      "name": "Resolve-Path",
-      "text": "Resolve-Path (Join-Path $PSScriptRoot '..\\..\\..')",
-      "disposition": "read-only-fixed",
-      "note": "fixed relative to $PSScriptRoot, this script's own tracked location -- never caller input"
     },
     {
       "source": "attr3-footage-stage.ps1",
@@ -527,16 +307,6 @@
       "kind": "cmdlet",
       "name": "Test-Path",
       "text": "Test-Path -LiteralPath $emitPath -PathType Leaf",
-      "disposition": "job-private-temp",
-      "note": "emitPath is a fresh GUID-named temp file this process creates and deletes itself"
-    },
-    {
-      "source": "attr3-footage-stage.ps1",
-      "function": "<top-level>",
-      "line": 321,
-      "kind": "static-method",
-      "name": "ReadAllBytes",
-      "text": "[IO.File]::ReadAllBytes($emitPath)",
       "disposition": "job-private-temp",
       "note": "emitPath is a fresh GUID-named temp file this process creates and deletes itself"
     },
@@ -572,6 +342,16 @@
     },
     {
       "source": "attr3-footage-stage.ps1",
+      "function": "<top-level>",
+      "line": 321,
+      "kind": "static-method",
+      "name": "ReadAllBytes",
+      "text": "[IO.File]::ReadAllBytes($emitPath)",
+      "disposition": "job-private-temp",
+      "note": "emitPath is a fresh GUID-named temp file this process creates and deletes itself"
+    },
+    {
+      "source": "attr3-footage-stage.ps1",
       "function": "Remove-Attr3FootageStageAttemptResidue",
       "line": 473,
       "kind": "static-method",
@@ -579,6 +359,206 @@
       "text": "[IO.Directory]::Delete($shareStageDir, $false)",
       "disposition": "boundary-root-asserted",
       "note": "$shareStageDir's own chain is proved link-free by Assert-AttrCudaNoLinkBelowRoot immediately above, in the same function; ATTR3-FOOTAGE-STAGE-1 round 9: non-recursive, non-prompting .NET primitive replacing a Remove-Item whose own -Confirm:$false suppressed the prompt that used to be the only thing stopping it from silently recursing into a non-empty directory"
+    },
+    {
+      "source": "Attr3FootageStageJob.psm1",
+      "function": "New-Attr3FootageStageJob",
+      "line": 745,
+      "kind": "cmdlet",
+      "name": "Test-Path",
+      "text": "Test-Path -LiteralPath $OutDir",
+      "disposition": "job-private-temp",
+      "note": "OutDir is a fresh per-run temp directory this run creates itself"
+    },
+    {
+      "source": "Attr3FootageStageJob.psm1",
+      "function": "New-Attr3FootageStageJob",
+      "line": 745,
+      "kind": "cmdlet",
+      "name": "New-Item",
+      "text": "New-Item -ItemType Directory -Path $OutDir -Force",
+      "disposition": "job-private-temp",
+      "note": "OutDir is a fresh per-run temp directory this run creates itself"
+    },
+    {
+      "source": "Attr3FootageStageJob.psm1",
+      "function": "New-Attr3FootageStageJob",
+      "line": 746,
+      "kind": "cmdlet",
+      "name": "Resolve-Path",
+      "text": "Resolve-Path -LiteralPath $OutDir",
+      "disposition": "job-private-temp",
+      "note": "OutDir is a fresh per-run temp directory this run creates itself"
+    },
+    {
+      "source": "Attr3FootageStageJob.psm1",
+      "function": "New-Attr3FootageStageJob",
+      "line": 748,
+      "kind": "static-method",
+      "name": "WriteAllText",
+      "text": "[IO.File]::WriteAllText($jobPath, $text, [Text.UTF8Encoding]::new($false))",
+      "disposition": "job-private-temp",
+      "note": "jobPath is under the job-private OutDir"
+    },
+    {
+      "source": "Attr3FootageStageJob.psm1::template",
+      "function": "Remove-StageOwnName",
+      "line": 108,
+      "kind": "cmdlet",
+      "name": "Test-Path",
+      "text": "Test-Path -LiteralPath $Path",
+      "disposition": "read-only-fixed",
+      "note": "existence check only, when no identity was recorded for a name (the answer is 'absent' or a leftover record); nothing is deleted on this path -- the delete is Remove-AttrCudaFileById with a recorded identity"
+    },
+    {
+      "source": "Attr3FootageStageJob.psm1::template",
+      "function": "<top-level>",
+      "line": 200,
+      "kind": "cmdlet",
+      "name": "Test-Path",
+      "text": "Test-Path -LiteralPath $targetPath -PathType Leaf -ErrorAction Stop",
+      "disposition": "boundary-root-asserted",
+      "note": "runs only after Assert-AttrCudaNoLinkBelowRoot(TrustedRoot=driveRoot, Path=targetPath) succeeded (TARGET_PATH_UNSAFE gate)"
+    },
+    {
+      "source": "Attr3FootageStageJob.psm1::template",
+      "function": "<top-level>",
+      "line": 406,
+      "kind": "cmdlet",
+      "name": "Test-Path",
+      "text": "Test-Path -LiteralPath $targetPath -PathType Leaf -ErrorAction Stop",
+      "disposition": "boundary-root-asserted",
+      "note": "targetPath already root-asserted earlier in this per-part iteration"
+    },
+    {
+      "source": "Attr3FootageStageJob.psm1::template",
+      "function": "<top-level>",
+      "line": 289,
+      "kind": "static-method",
+      "name": "Open",
+      "text": "[IO.File]::Open($stagedPath, [IO.FileMode]::Open, [IO.FileAccess]::Read, [IO.FileShare]::Read)",
+      "disposition": "boundary-root-asserted",
+      "note": "stagedPath already proven link-free via Assert-AttrCudaNoLinkBelowRoot(TrustedRoot=StageDir) earlier this iteration"
+    },
+    {
+      "source": "Attr3FootageStageJob.psm1::template",
+      "function": "<top-level>",
+      "line": 296,
+      "kind": "static-method",
+      "name": "Open",
+      "text": "[IO.File]::Open($localPartialPath, [IO.FileMode]::CreateNew, [IO.FileAccess]::Write, [IO.FileShare]::None)",
+      "disposition": "boundary-root-asserted",
+      "note": "localPartialPath is a direct child of targetDir, itself under the root-asserted targetPath chain"
+    },
+    {
+      "source": "Attr3FootageStageJob.psm1::template",
+      "function": "<top-level>",
+      "line": 307,
+      "kind": "instance-method",
+      "name": "CopyTo",
+      "text": "$localSrcStream.CopyTo($localDstStream)",
+      "disposition": "boundary-root-asserted",
+      "note": "both streams opened from already-asserted paths above"
+    },
+    {
+      "source": "Attr3FootageStageJob.psm1::template",
+      "function": "<top-level>",
+      "line": 308,
+      "kind": "instance-method",
+      "name": "Flush",
+      "text": "$localDstStream.Flush()",
+      "disposition": "boundary-root-asserted",
+      "note": "both streams opened from already-asserted paths above"
+    },
+    {
+      "source": "Attr3FootageStageJob.psm1::template",
+      "function": "<top-level>",
+      "line": 320,
+      "kind": "instance-method",
+      "name": "Dispose",
+      "text": "$localSrcStream.Dispose()",
+      "disposition": "boundary-root-asserted",
+      "note": "releases a handle opened from an already-asserted path"
+    },
+    {
+      "source": "Attr3FootageStageJob.psm1::template",
+      "function": "<top-level>",
+      "line": 330,
+      "kind": "instance-method",
+      "name": "Dispose",
+      "text": "$localDstStream.Dispose()",
+      "disposition": "boundary-root-asserted",
+      "note": "releases a handle opened from an already-asserted path"
+    },
+    {
+      "source": "Attr3FootageStageJob.psm1::template",
+      "function": "<top-level>",
+      "line": 358,
+      "kind": "static-method",
+      "name": "Open",
+      "text": "[IO.File]::Open($localPartialPath, [IO.FileMode]::Append, [IO.FileAccess]::Write, [IO.FileShare]::None)",
+      "disposition": "boundary-root-asserted",
+      "note": "test-only hook (-1 unless a test sets -TestHookCorruptAfterVerifyPartIndex); same already-asserted localPartialPath"
+    },
+    {
+      "source": "Attr3FootageStageJob.psm1::template",
+      "function": "<top-level>",
+      "line": 359,
+      "kind": "instance-method",
+      "name": "WriteByte",
+      "text": "$corruptStream.WriteByte(0)",
+      "disposition": "boundary-root-asserted",
+      "note": "test-only hook; same already-asserted localPartialPath"
+    },
+    {
+      "source": "Attr3FootageStageJob.psm1::template",
+      "function": "<top-level>",
+      "line": 359,
+      "kind": "instance-method",
+      "name": "Dispose",
+      "text": "$corruptStream.Dispose()",
+      "disposition": "boundary-root-asserted",
+      "note": "test-only hook; same already-asserted localPartialPath"
+    },
+    {
+      "source": "Attr3FootagePresenceJob.psm1",
+      "function": "New-Attr3FootagePresenceJob",
+      "line": 298,
+      "kind": "cmdlet",
+      "name": "Test-Path",
+      "text": "Test-Path -LiteralPath $OutDir",
+      "disposition": "job-private-temp",
+      "note": "OutDir is a fresh per-run temp directory this run creates itself"
+    },
+    {
+      "source": "Attr3FootagePresenceJob.psm1",
+      "function": "New-Attr3FootagePresenceJob",
+      "line": 298,
+      "kind": "cmdlet",
+      "name": "New-Item",
+      "text": "New-Item -ItemType Directory -Path $OutDir -Force",
+      "disposition": "job-private-temp",
+      "note": "OutDir is a fresh per-run temp directory this run creates itself"
+    },
+    {
+      "source": "AttrCudaOwnerFootage.psm1",
+      "function": "New-AttrCudaOwnerFootageView",
+      "line": 557,
+      "kind": "instance-method",
+      "name": "Dispose",
+      "text": "$destStream.Dispose()",
+      "disposition": "boundary-root-asserted",
+      "note": "releases a stream opened from the already-asserted StagingDirectory"
+    },
+    {
+      "source": "AttrCudaOwnerFootage.psm1",
+      "function": "Close-AttrCudaOwnerFootageWorkspace",
+      "line": 692,
+      "kind": "instance-method",
+      "name": "Dispose",
+      "text": "$handle.Dispose()",
+      "disposition": "job-private-temp",
+      "note": "disposes a held handle (a pin on an original or a read handle on a view entry); releases only"
     }
   ]
 }
