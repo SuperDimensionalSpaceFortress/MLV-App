@@ -272,6 +272,105 @@ class TreeModeTests(K9Base):
         self.assertEqual(p.returncode, 1)
         self.assertIn("C3", parse_verdict(p.stdout.decode())[3].split(","))
 
+    # -- r2: sol r1 blockers 1 and 2 (C3 pointer readability, whitespace-bearing pointers) ------
+    def _c3(self, mech: str, files: dict[str, str] | None = None) -> subprocess.CompletedProcess:
+        payload = {"agents/factory-kernel-instance.md": instance_map(mech=mech)}
+        payload.update(files or {})
+        sha = self.fx.commit(payload)
+        return self.fx.k9("tree", sha)
+
+    def test_c3_unreadable_pointer_blob_exits_2_never_pass(self):
+        # sol r1 blocker 1: the pointer resolves in the tree listing, but its blob cannot be read.
+        sha = self.fx.commit({"tools/session-checkpoint.py": "print('unique pointer blob r2')\n"})
+        self.fx.remove_loose(self.fx.out("rev-parse", "HEAD:tools/session-checkpoint.py"))
+        p = self.fx.k9("tree", sha)
+        self.assertEqual(p.returncode, 2, p.stdout.decode() + p.stderr.decode())
+        self.assertEqual(parse_verdict(p.stdout.decode())[:2], ("UNKNOWN", "none"))
+
+    def test_c3_unreadable_second_pointer_blob_exits_2(self):
+        # every resolved pointer is read, not only the first one
+        p0 = self._c3(f"{GREEN_MECH}, `tools/extra-pointer.py`", {"tools/extra-pointer.py": "print('extra r2')\n"})
+        self.assertEqual(p0.returncode, 0, p0.stdout.decode())
+        self.fx.remove_loose(self.fx.out("rev-parse", "HEAD:tools/extra-pointer.py"))
+        p = self.fx.k9("tree", "HEAD")
+        self.assertEqual(p.returncode, 2, p.stdout.decode() + p.stderr.decode())
+
+    def test_c3_unreadable_pointer_blob_exits_2_in_pre_push_mode(self):
+        sha = self.fx.commit({"tools/session-checkpoint.py": "print('unique pre-push blob r2')\n"})
+        self.fx.remove_loose(self.fx.out("rev-parse", "HEAD:tools/session-checkpoint.py"))
+        line = f"refs/heads/master {sha} refs/heads/master {self.base}\n"
+        p = self.fx.k9("pre-push", "origin", "url", input=line)
+        self.assertEqual(p.returncode, 2, p.stdout.decode() + p.stderr.decode())
+
+    def test_c3_whitespace_pointer_that_does_not_exist_is_red(self):
+        # sol r1 blocker 2: `tools/nonexistent path.py` beside valid pointers used to PASS
+        p = self._c3(f"{GREEN_MECH}, `tools/nonexistent path.py`")
+        self.assertEqual(p.returncode, 1, p.stdout.decode())
+        verdict, _, _, failed = parse_verdict(p.stdout.decode())
+        self.assertEqual((verdict, failed), ("RED", "C3"))
+        self.assertIn("tools/nonexistent path.py", p.stdout.decode())
+
+    def test_c3_whitespace_variants_are_all_checked(self):
+        variants = {
+            "tab": "`tools/non\texistent.py`",
+            "two spaces": "`tools/non  existent.py`",
+            "leading space": "` tools/nonexistent.py`",
+            "trailing space": "`tools/nonexistent.py `",
+            "both ends": "`  tools/nonexistent.py  `",
+            "space in a directory": "`tools/no dir/nonexistent.py`",
+        }
+        for name, span in variants.items():
+            with self.subTest(name):
+                p = self._c3(f"{GREEN_MECH}, {span}")
+                self.assertEqual(p.returncode, 1, p.stdout.decode())
+                self.assertEqual(parse_verdict(p.stdout.decode())[3], "C3")
+
+    def test_c3_tracked_pointer_with_spaces_resolves(self):
+        p = self._c3(
+            f"{GREEN_MECH}, `tools/my tool.py`, ` tools/other tool.py `",
+            {"tools/my tool.py": "print('a')\n", "tools/other tool.py": "print('b')\n"},
+        )
+        self.assertEqual(p.returncode, 0, p.stdout.decode())
+        self.assertIn("3 tracked pointer(s) resolve", p.stdout.decode())
+
+    def test_c3_only_a_whitespace_pointer_resolves_is_not_vacuous(self):
+        p = self._c3("`tools/only tool.py`", {"tools/only tool.py": "print('c')\n"})
+        self.assertEqual(p.returncode, 0, p.stdout.decode())
+
+    def test_c3_whitespace_pointer_wrong_case_is_red(self):
+        p = self._c3(f"{GREEN_MECH}, `Tools/My Tool.py`", {"tools/my tool.py": "print('a')\n"})
+        self.assertEqual(p.returncode, 1, p.stdout.decode())
+        self.assertIn("tools/my tool.py", p.stdout.decode())
+
+    def test_c3_unreadable_whitespace_pointer_blob_exits_2(self):
+        self._c3(f"{GREEN_MECH}, `tools/my tool.py`", {"tools/my tool.py": "print('unique spaced r2')\n"})
+        self.fx.remove_loose(self.fx.out("rev-parse", "HEAD:tools/my tool.py"))
+        p = self.fx.k9("tree", "HEAD")
+        self.assertEqual(p.returncode, 2, p.stdout.decode() + p.stderr.decode())
+
+    def test_c3_pointer_to_a_directory_is_red_not_a_blob(self):
+        # a pointer whose path names a tree object (a directory with a dotted name), not a blob
+        p = self._c3(f"{GREEN_MECH}, `tools/pkg.d`", {"tools/pkg.d/inner.py": "print('d')\n"})
+        self.assertEqual(p.returncode, 1, p.stdout.decode())
+        self.assertEqual(parse_verdict(p.stdout.decode())[3], "C3")
+        p = self._c3(f"{GREEN_MECH}, `tools/pkg dir.d`", {"tools/pkg dir.d/inner.py": "print('d')\n"})
+        self.assertEqual(p.returncode, 1, p.stdout.decode())
+
+    def test_c3_anchored_and_line_suffixed_pointers_are_judged(self):
+        # fable H5: `path#anchor` and `path:12` were skipped, not judged
+        for span in ("`tools/missing.py#L1`", "`tools/missing.py:12`", "`tools/missing.py:12-20`",
+                     "`tools/missing path.py#top`"):
+            with self.subTest(span):
+                p = self._c3(f"{GREEN_MECH}, {span}")
+                self.assertEqual(p.returncode, 1, p.stdout.decode())
+                self.assertEqual(parse_verdict(p.stdout.decode())[3], "C3")
+        p = self._c3(f"{GREEN_MECH}, `tools/session-checkpoint.py#L1`, `tools/session-checkpoint.py:3`")
+        self.assertEqual(p.returncode, 0, p.stdout.decode())
+
+    def test_c3_command_span_without_a_path_shape_is_not_a_pointer(self):
+        p = self._c3(f"{GREEN_MECH}, `python -m tools.repo_hygiene.k9_witness tree HEAD`, `-Status`, `a b`")
+        self.assertEqual(p.returncode, 0, p.stdout.decode())
+
     def test_t5_full_sha_then_guid_in_k9_row_are_red_c4(self):
         derived = {
             "full sha": "0123456789abcdef0123456789abcdef01234567",
@@ -653,6 +752,13 @@ class InstallerTests(unittest.TestCase):
         p = self.install()
         self.assertEqual(p.returncode, 0, p.stdout.decode() + p.stderr.decode())
         self.assertTrue((alt / "pre-push").exists())
+
+    def test_unreadable_hook_path_is_unknown_exit_2_not_a_traceback(self):
+        # fable H2: an OSError while reading the hook used to exit 1 (RED's code) with no verdict line
+        self.hook.mkdir(parents=True)
+        p = self.install()
+        self.assertEqual(p.returncode, 2, p.stdout.decode() + p.stderr.decode())
+        self.assertEqual(parse_verdict(p.stdout.decode())[0], "UNKNOWN")
 
 
 if __name__ == "__main__":

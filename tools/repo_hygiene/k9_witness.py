@@ -148,6 +148,31 @@ def _is_file(entry: tuple[str, str, str] | None) -> bool:
     return entry is not None and entry[1] == "blob" and entry[0] in FILE_MODES
 
 
+POINTER_SUFFIX = re.compile(r"(#\S*|:\d+(-\d+)?)$")
+POINTER_EXTENSION = re.compile(r"\.[A-Za-z0-9_-]+$")
+
+
+def _pointer_token(
+    span: str, entries: dict[str, tuple[str, str, str]]
+) -> tuple[str | None, tuple[str, str, str] | None]:
+    """Judge one backticked span whole (whitespace inside it is part of the path).
+
+    Returns (path, entry). entry is the tree entry when the path is a regular-file blob, else
+    None. path is None when the span is not path-shaped (it needs a `/` and a file extension).
+    A tracked file named exactly like the span wins; otherwise surrounding whitespace and a
+    trailing `#anchor` or `:line[-line]` suffix are dropped before the lookup.
+    """
+    stripped = span.strip()
+    candidates = [span, stripped, POINTER_SUFFIX.sub("", stripped)]
+    for cand in candidates:
+        if _is_file(entries.get(cand)):
+            return cand, entries[cand]
+    name = candidates[-1]
+    if "/" not in name or not POINTER_EXTENSION.search(name):
+        return None, None
+    return name, None
+
+
 def _lines(text: str) -> list[str]:
     return text.replace("\r\n", "\n").replace("\r", "\n").split("\n")
 
@@ -207,13 +232,20 @@ def judge_tree(repo: str, tree: str) -> dict:
     if len(k9_rows) != 1:
         notes.append("no single K9 row to read")
     else:
-        for tok in re.findall(r"`([^`]+)`", k9_rows[0][1]):
-            if "/" not in tok or re.search(r"\s", tok) or not re.search(r"\.[A-Za-z0-9_-]+$", tok):
+        verified: set[str] = set()
+        for span in re.findall(r"`([^`]+)`", k9_rows[0][1]):
+            tok, hit = _pointer_token(span, entries)
+            if tok is None:
                 continue
             if tok.startswith((".claude-state/", "~/")) or re.match(r"^[A-Za-z]:[\\/]", tok):
                 board_local.append(tok)
                 continue
-            if _is_file(entries.get(tok)):
+            if hit is not None:
+                # Present in the listing is not readable: read the blob through git and let any
+                # failure raise (exit 2) rather than count the pointer as resolved.
+                if hit[2] not in verified:
+                    git(repo, "cat-file", "blob", hit[2])
+                    verified.add(hit[2])
                 tracked_ok += 1
                 continue
             twins = [p for p in by_fold.get(tok.casefold(), []) if p != tok]
@@ -517,7 +549,7 @@ def main(argv: list[str] | None = None) -> int:
     try:
         args = build_parser().parse_args(argv)
         return args.func(args)
-    except (WitnessError, UnicodeDecodeError) as exc:
+    except (WitnessError, UnicodeDecodeError, OSError) as exc:  # OSError: an unwritable/unreadable hook
         print(f"UNKNOWN: {exc}")
         print(f"k9 witness could not judge: {exc}", file=sys.stderr)
         print(verdict_line("UNKNOWN", "none", 0, []))
