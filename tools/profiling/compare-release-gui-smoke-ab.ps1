@@ -534,6 +534,25 @@ function Get-DisplayComparability {
             before = $BeforeDisplay; after = $AfterDisplay
         }
     }
+    # DISPLAY-SMOKE-FAILED-LOG-PRESERVE-1 (origin PR #191): a block that says it was never measured
+    # (the attribution job's pre-smoke block, `phase` = 'pre-smoke' / `measured` = $false, published
+    # when a smoke run failed before its display log could be read) is identity UNKNOWN even if
+    # every other identity field is populated -- it describes the venue BEFORE the run, not the
+    # screen the leg presented on. Property lookups go through PSObject.Properties so a runner
+    # result.json block (no such fields) is unaffected.
+    foreach ($side in @([pscustomobject]@{ name = 'before'; block = $BeforeDisplay },
+            [pscustomobject]@{ name = 'after'; block = $AfterDisplay })) {
+        $phaseProperty = $side.block.PSObject.Properties['phase']
+        $measuredProperty = $side.block.PSObject.Properties['measured']
+        if (($null -ne $phaseProperty -and [string]$phaseProperty.Value -eq 'pre-smoke') -or
+            ($null -ne $measuredProperty -and $measuredProperty.Value -eq $false)) {
+            return [pscustomobject]@{
+                status = 'unknown'; reasonCode = 'DISPLAY_IDENTITY_UNKNOWN'
+                detail = "$($side.name) leg display block was not measured (pre-smoke: the smoke run failed before the app reported a display), so its identity is not knowable"
+                before = $BeforeDisplay; after = $AfterDisplay
+            }
+        }
+    }
     # Round 2 (sol PRE-REVIEW #2 BLOCKER c): identity is name+manufacturer+model+serial. A block
     # from a runner that predates those fields does not carry the properties at all -- unknown,
     # never "absent equals absent".
