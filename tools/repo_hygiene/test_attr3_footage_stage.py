@@ -1252,7 +1252,11 @@ class SameJobIdRulingPremiseTests(unittest.TestCase):
     an automated or concurrent invocation, so a fixed id there cannot collide with itself.
     """
 
-    KNOWN_PRODUCTION_CALLERS = {GENERATOR}
+    # DUAL-VENUE-EVIDENCE-1: Invoke-VenueLeg.ps1 is the second tracked automated caller. Re-examined
+    # against this ruling: every submission carries a fresh JobId (a per-run UTC stamp plus a
+    # -health/-regsnap/-regrestore/leg suffix), it never resubmits a JobId, and um-run's claim-first
+    # ownership (above) makes a collision safe by construction anyway.
+    KNOWN_PRODUCTION_CALLERS = {GENERATOR, ROOT / "tools" / "profiling" / "dual-venue" / "Invoke-VenueLeg.ps1"}
 
     def _production_um_run_references(self) -> set[Path]:
         proc = subprocess.run(
