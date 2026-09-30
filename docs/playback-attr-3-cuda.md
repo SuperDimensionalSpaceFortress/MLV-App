@@ -214,7 +214,10 @@ second name (a file with a single link is never deleted, so an app sidecar stays
 directory). A refusal is logged path-free and leaves everything in place: a leftover link directory
 is acceptable, a deleted name of the owner's footage is not.
 `attr3-footage-presence-job.ps1 -BindProof -WorkRoot <dir>` emits a bounded job that runs exactly
-this link/hold/one-hash/binding path with no playback, for proving it on a venue. (The fixture route in
+this link/hold/one-hash/binding path with no playback, for proving it on a venue. `-WorkRoot` is
+resolved to its long path before it is validated (an 8.3 alias such as `C:\Users\RUNNER~1\...` is
+expanded, a `..` segment is refused, and the resolved value must still be a plain drive-absolute
+path with no quote or `~`). (The fixture route in
 section 4b instead requires the clip path to sit directly in the agent cache, name that clip id,
 and exist, then hashes it against `-FixtureSha256`, failing closed at
 `FIXTURE_CONTENT_MISMATCH`, exit 17, on a mismatch.) The job also verifies all three package

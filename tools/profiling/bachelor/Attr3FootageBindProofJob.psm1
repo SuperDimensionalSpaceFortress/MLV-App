@@ -25,6 +25,81 @@ if (-not (Get-Command -Name 'Assert-AttrCudaSafeArtifactName' -ErrorAction Silen
     Import-Module (Join-Path $PSScriptRoot 'AttrCudaArtifacts.psm1') -Global -ErrorAction Stop -Verbose:$false
 }
 
+function Get-Attr3BindProofLongPath {
+    # Expand every 8.3 alias in an absolute path to its long name. GetLongPathNameW needs the path
+    # to exist, so the deepest existing ancestor is expanded and the not-yet-existing tail (which
+    # cannot be an alias) is appended unchanged.
+    param([Parameter(Mandatory = $true)][string]$FullPath)
+
+    if (-not ('Attr3BindProofNative' -as [type])) {
+        Add-Type -TypeDefinition @"
+using System;
+using System.Runtime.InteropServices;
+using System.Text;
+public static class Attr3BindProofNative {
+    [DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
+    public static extern uint GetLongPathNameW(string shortPath, StringBuilder longPath, uint cch);
+}
+"@
+    }
+    $existing = $FullPath
+    $tail = [System.Collections.Generic.List[string]]::new()
+    while ($existing -and -not (Test-Path -LiteralPath $existing)) {
+        $tail.Insert(0, (Split-Path -Leaf $existing))
+        $existing = Split-Path -Parent $existing
+    }
+    if (-not $existing) { throw "ATTR3_BINDPROOF_WORKROOT_UNRESOLVABLE no ancestor of the work root exists" }
+    $buffer = [System.Text.StringBuilder]::new(1024)
+    $needed = [Attr3BindProofNative]::GetLongPathNameW($existing, $buffer, [uint32]$buffer.Capacity)
+    if ($needed -gt $buffer.Capacity) {
+        $buffer = [System.Text.StringBuilder]::new([int]$needed + 1)
+        $needed = [Attr3BindProofNative]::GetLongPathNameW($existing, $buffer, [uint32]$buffer.Capacity)
+    }
+    if ($needed -eq 0) { throw "ATTR3_BINDPROOF_WORKROOT_UNRESOLVABLE the long name of an ancestor could not be read" }
+    $resolved = $buffer.ToString()
+    foreach ($leaf in $tail) { $resolved = Join-Path $resolved $leaf }
+    $resolved
+}
+
+function Resolve-Attr3BindProofWorkRoot {
+    # -WorkRoot is validated HERE, on its resolved long path, and not by a parameter-level
+    # ValidatePattern. The final pattern (no '~', no quote) is what keeps the emitted job's
+    # single-quoted literal safe, but a hosted runner's temp directory is spelled with an 8.3
+    # alias (C:\Users\RUNNER~1\...), which a pattern on the RAW argument refuses although it names
+    # an ordinary directory. Order: refuse traversal on the raw text, normalise, expand the
+    # aliases, prove the expansion rewrote only alias segments, then apply the strict pattern.
+    param([Parameter(Mandatory = $true)][string]$WorkRoot)
+
+    if ($WorkRoot -match '[\x00-\x1f]' -or $WorkRoot -notmatch '^[A-Za-z]:[\\/]') {
+        throw "ATTR3_BINDPROOF_WORKROOT_INVALID the work root must be a drive-absolute path"
+    }
+    foreach ($segment in ($WorkRoot -split '[\\/]')) {
+        if ($segment -eq '..') { throw "ATTR3_BINDPROOF_WORKROOT_TRAVERSAL the work root may not contain a '..' segment" }
+    }
+    $full = [IO.Path]::GetFullPath($WorkRoot).TrimEnd('\')
+    $long = (Get-Attr3BindProofLongPath -FullPath $full).TrimEnd('\')
+
+    # The expansion may only rewrite alias segments (those containing '~'); any other difference
+    # (bar letter case) means the path did not resolve to what the caller named.
+    $fullSegments = @($full -split '\\')
+    $longSegments = @($long -split '\\')
+    $redirected = $fullSegments.Count -ne $longSegments.Count
+    if (-not $redirected) {
+        for ($i = 0; $i -lt $fullSegments.Count; $i++) {
+            if (-not $fullSegments[$i].Contains('~') `
+                    -and -not $fullSegments[$i].Equals($longSegments[$i], [StringComparison]::OrdinalIgnoreCase)) {
+                $redirected = $true
+                break
+            }
+        }
+    }
+    if ($redirected) { throw "ATTR3_BINDPROOF_WORKROOT_REDIRECTED the work root did not resolve to the path named" }
+    if ($long -notmatch '^[A-Za-z]:\\[A-Za-z0-9 _.\\-]+$') {
+        throw "ATTR3_BINDPROOF_WORKROOT_INVALID the resolved work root has a character outside the allowed set"
+    }
+    $long
+}
+
 function New-Attr3FootageBindProofJob {
     <#
     .SYNOPSIS
@@ -48,11 +123,11 @@ function New-Attr3FootageBindProofJob {
 
         [Parameter(Mandatory = $true)][string]$OutDir,
 
-        [Parameter(Mandatory = $true)]
-        [ValidatePattern('^[A-Za-z]:\\[A-Za-z0-9 _.\\-]+$')]
-        [string]$WorkRoot
+        # No ValidatePattern: see Resolve-Attr3BindProofWorkRoot (8.3 aliases are expanded first).
+        [Parameter(Mandatory = $true)][string]$WorkRoot
     )
 
+    $WorkRoot = Resolve-Attr3BindProofWorkRoot -WorkRoot $WorkRoot
     if ($Parts.Count -eq 0) { throw "ATTR3_BINDPROOF_NO_PARTS zero parts supplied for '$ClipId'" }
     foreach ($part in $Parts) {
         $path = [string]$part.path
