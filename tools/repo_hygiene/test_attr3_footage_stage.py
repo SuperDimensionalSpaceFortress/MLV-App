@@ -691,7 +691,7 @@ class FootageStageJobTests(unittest.TestCase):
         self.assertEqual(record["kind"], "target")
         self.assertTrue(record["leftover"])
         self.assertEqual(record["verifyStatus"], "LENGTH_MISMATCH")
-        self.assertEqual(os.path.normcase(record["leftoverPath"]), os.path.normcase(str(self.targets[0])))
+        self.assertTrue(os.path.samefile(record["leftoverPath"], self.targets[0]))
         self.assertNotIn(str(self.targets[0]), run.stdout + run.stderr)
         # Part 1 (never corrupted) still places cleanly in the SAME run.
         self.assertIn("PART=1 STATUS=PLACED", run.stdout)
@@ -758,7 +758,7 @@ class FootageStageJobTests(unittest.TestCase):
         self.assertFalse(self.targets[0].exists())
         record = self.leftover_records(job_id)[f"{job_id}-part0-local-partial.json"]
         self.assertEqual(record["kind"], "local-partial")
-        self.assertEqual(os.path.normcase(record["leftoverPath"]), os.path.normcase(str(partial)))
+        self.assertTrue(os.path.samefile(record["leftoverPath"], partial))
         self.assertIn("PART=1 STATUS=PLACED", run.stdout)
 
     def test_a_refused_publish_leaves_the_partial_and_the_occupant_untouched(self) -> None:
