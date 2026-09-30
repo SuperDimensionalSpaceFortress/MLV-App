@@ -617,8 +617,16 @@ def _trusted_system_curl_identity(repo_root: Path, config: Dict[str, Any]) -> Di
             raise HygieneError("system curl path chain has an absent or NULL discretionary ACL")
         if trust.get("signatureStatus") != "Valid" or "O=Microsoft Corporation" not in str(trust.get("signerSubject") or ""):
             raise HygieneError("system curl does not have a valid Microsoft signature")
-        if any(item.get("unsafeWriteGrants") for item in path_trust):
-            raise HygieneError("system curl path chain grants replacement authority to the current token or a broad principal")
+        unsafe_grants = [
+            f"{item.get('path')}: {grant.get('sid')} {grant.get('rights')}"
+            for item in path_trust
+            for grant in item.get("unsafeWriteGrants") or []
+        ]
+        if unsafe_grants:
+            raise HygieneError(
+                "system curl path chain grants replacement authority to the current token or a broad principal: "
+                + "; ".join(unsafe_grants)
+            )
     else:
         trust = {
             "pathTrust": _trusted_unix_curl_path_chain(client),
