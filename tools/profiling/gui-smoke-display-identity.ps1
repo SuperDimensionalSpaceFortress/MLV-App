@@ -85,7 +85,7 @@ function ConvertFrom-GuiSmokeDisplayLog {
     matching line is kept, in log order.
     .OUTPUTS
     [pscustomobject] { screensCollected (bool); screens (array of {index,name,manufacturer,model,
-    serial,geometryX,geometryY,width,height,physicalWidth,physicalHeight,devicePixelRatio,
+    serial,device,geometryX,geometryY,width,height,physicalWidth,physicalHeight,devicePixelRatio,
     refreshHz,primary}); screensError; target ({name,reason,candidates,fallback,preferred,
     preferredMatched} or $null); targetError; placement ({mode,screenName,verified,windowX,
     windowY,windowWidth,windowHeight,previewWidth,previewHeight,targetScreenName,
@@ -93,6 +93,12 @@ function ConvertFrom-GuiSmokeDisplayLog {
     placementError }. manufacturer/model/serial read $null on a display_screen line that predates
     them; targetScreenName/presentationScreenName/presentationPhysical* and
     preferred/preferredMatched read $null on a line that predates them.
+    `name` is whatever QScreen::name() reported -- on a monitor with an EDID name that is the
+    FRIENDLY name ("PA329C"), NOT the GDI device name (measured on UM, Qt 6.10.2; see
+    tests/fixtures/display/um-qscreen-windows-mapping-20260930.txt). `device` is the Windows GDI
+    device (\\.\DISPLAYn) the app DERIVED for that screen from its native origin and physical size
+    (platform/qt/DisplayDeviceMapping.h): "" when it could not be established uniquely, $null on a
+    line that predates the field. It is the bridge to the Windows inventory; `name` is not.
     #>
     [CmdletBinding()]
     param(
@@ -135,6 +141,7 @@ function ConvertFrom-GuiSmokeDisplayLog {
                 manufacturer = $(if ($f.ContainsKey('manufacturer')) { [string]$f['manufacturer'] } else { $null })
                 model = $(if ($f.ContainsKey('model')) { [string]$f['model'] } else { $null })
                 serial = $(if ($f.ContainsKey('serial')) { [string]$f['serial'] } else { $null })
+                device = $(if ($f.ContainsKey('device')) { [string]$f['device'] } else { $null })
                 geometryX = $f['geometry'].x
                 geometryY = $f['geometry'].y
                 width = $f['geometry'].width
@@ -237,13 +244,19 @@ function Find-GuiSmokeDisplayScreen {
     <#
     .SYNOPSIS
     The ONE lookup rule for "the display_screen record for this screen name": case-insensitive
-    name match, and when several records carry the name the LAST one wins.
+    name match; one screen logged again (same index) is the LAST record; two DIFFERENT screens
+    (distinct indexes) that carry the name are ambiguous and match nothing.
     .DESCRIPTION
     Every consumer that resolves a screen name to its display_screen record -- this file's
     Get-GuiSmokeDisplayIdentity and the attribution job's Build-AttrCudaDisplayBlock (target and
     presentation blocks) -- goes through this function, so one summary.json can never carry two
     different refresh/size values for one screen name (UM-DISPLAY-SELECT-AND-LOG-1 round 4,
     fable DISPLAY-BLOCK-LOOKUP-LAST-WINS-1). Returns $null when no record carries the name.
+    UM-DISPLAY-QT-WINDOWS-MAPPING-PROOF-1: QScreen::name() is the EDID friendly name on a monitor
+    that has one, and two monitors of one model share it -- the app logs only that name in
+    display_target/window_placement, so a name that belongs to more than one attached screen cannot
+    say WHICH one presented. That is the third state ($null, never "whichever came last", which would
+    publish the other monitor's serial and refresh); Get-GuiSmokeDisplayIdentity names the reason.
     #>
     [CmdletBinding()]
     param(
@@ -256,10 +269,15 @@ function Find-GuiSmokeDisplayScreen {
     )
 
     $found = $null
+    $indexes = @{}
     if ([string]::IsNullOrEmpty($Name)) { return $null }
     foreach ($candidate in @($Screens)) {
-        if ($null -ne $candidate -and [string]$candidate.name -ieq $Name) { $found = $candidate }
+        if ($null -ne $candidate -and [string]$candidate.name -ieq $Name) {
+            $found = $candidate
+            $indexes[[string]$candidate.index] = $true
+        }
     }
+    if ($indexes.Count -gt 1) { return $null }
     return $found
 }
 
@@ -280,7 +298,8 @@ function Get-GuiSmokeDisplayIdentity {
     for a display with no EDID descriptor, and two different displays that reuse one device name
     would then agree on every "field" and compare 'same'. Empty means identity UNKNOWN, so the
     comparison is refused and the reason names the empty fields. When two display_screen lines
-    carry the same name (case-insensitively) the LAST one wins (Find-GuiSmokeDisplayScreen).
+    carry the same name (case-insensitively) at the SAME index the LAST one wins; at DISTINCT
+    indexes the name is ambiguous and the identity is unknown (Find-GuiSmokeDisplayScreen).
     .OUTPUTS
     [pscustomobject] { presentationScreenName; presentationManufacturer; presentationModel;
     presentationSerial; physicalWidth; physicalHeight; refreshHzRounded; dpr; windowMode;
@@ -309,8 +328,16 @@ function Get-GuiSmokeDisplayIdentity {
             $screen = Find-GuiSmokeDisplayScreen -Screens $Selection.screens -Name ([string]$placement.presentationScreenName)
             if ($null -eq $screen) {
                 # A presentation screen with no matching display_screen record is identity UNKNOWN
-                # -- refresh/DPR/model/serial are all unknowable.
-                $unknownReason = 'presentation screen has no matching gui_smoke.display_screen line'
+                # -- refresh/DPR/model/serial are all unknowable. A name shared by several attached
+                # screens is UNKNOWN too (Find-GuiSmokeDisplayScreen), with its own reason.
+                $sameName = @(@($Selection.screens) | Where-Object { $null -ne $_ -and [string]$_.name -ieq [string]$placement.presentationScreenName })
+                if ($sameName.Count -gt 1) {
+                    $unknownReason = 'presentation screen name is shared by ' + $sameName.Count + ' attached screens (indexes ' +
+                        (($sameName | ForEach-Object { [string]$_.index } | Sort-Object -Unique) -join ',') +
+                        '): the name cannot tell them apart, so identity is not knowable'
+                } else {
+                    $unknownReason = 'presentation screen has no matching gui_smoke.display_screen line'
+                }
             } elseif ($null -eq $screen.manufacturer -or $null -eq $screen.model -or $null -eq $screen.serial) {
                 $unknownReason = 'presentation screen display_screen line predates manufacturer/model/serial (identity not knowable)'
             } else {
