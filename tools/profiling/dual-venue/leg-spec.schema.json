@@ -1,0 +1,73 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "mlv-app/dual-venue-leg/v1",
+  "title": "Dual-Venue leg spec",
+  "description": "A leg is defined ONCE and run by each venue whenever it is free (P1). legSpecSha256 in a receipt is the sha256 of this file's exact bytes, so editing a leg makes a new subject.",
+  "type": "object",
+  "required": ["schema", "legId", "card", "legType", "clipId", "backends", "scaleFactor", "timeouts", "criteria"],
+  "additionalProperties": false,
+  "properties": {
+    "schema": { "const": "mlv-app/dual-venue-leg/v1" },
+    "legId": { "type": "string", "pattern": "^[a-z0-9][a-z0-9-]{1,62}$" },
+    "card": { "type": "string", "pattern": "^[A-Z0-9][A-Z0-9-]{1,80}$", "description": "The card that declares this leg; venues.json roles are keyed by it." },
+    "legType": { "enum": ["speed", "look"] },
+    "clipId": { "type": "string", "description": "A tracked fixture id (tiny_dual_iso | large_dual_iso) or an owner clip id. An owner clip id is refused by the runner until CROSS-VOLUME-2 lands." },
+    "backends": {
+      "type": "array", "minItems": 1, "uniqueItems": true,
+      "items": { "enum": ["cuda", "cpu"] },
+      "description": "Every playback leg runs as cuda AND cpu on EVERY venue (Amendment 1 A1). 'gl' is reserved and not yet runnable."
+    },
+    "scaleFactor": { "type": "integer", "minimum": 1, "maximum": 16 },
+    "generatorArgs": {
+      "type": "object", "additionalProperties": false,
+      "properties": {
+        "telemetryArm": { "enum": ["HEAVY", "LIGHT"] },
+        "cpuQuiescenceThresholdPercent": { "type": "number", "exclusiveMinimum": 0, "maximum": 100 }
+      },
+      "description": "Generator arguments other than -Venue/-Backend/-ScaleFactor/-SourceCommit/-BuildManifestSha256/-ClipId (the runner sets those)."
+    },
+    "timeouts": {
+      "type": "object", "required": ["queueWaitSec", "extraClaimedWaitSec"], "additionalProperties": false,
+      "properties": {
+        "queueWaitSec": { "type": "integer", "minimum": 30, "maximum": 86400 },
+        "extraClaimedWaitSec": { "type": "integer", "minimum": 0, "maximum": 86400 }
+      }
+    },
+    "look": {
+      "type": "object", "required": ["contactSheetFrames", "lookFlavor"], "additionalProperties": false,
+      "properties": {
+        "contactSheetFrames": { "type": "integer", "minimum": 1, "maximum": 60 },
+        "lookFlavor": { "enum": ["classic", "cinematic"], "default": "classic" }
+      },
+      "description": "Required when legType is 'look'. Look Assist is FORCED on for a look leg (Amendment 1 A2)."
+    },
+    "criteria": {
+      "type": "object", "required": ["acceptance", "supplementary"], "additionalProperties": false,
+      "description": "Per venue ROLE (P3) and per backend: criteria evaluated against the metrics copied verbatim from summary.json. An empty list is informational (no gating).",
+      "properties": {
+        "acceptance": { "$ref": "#/$defs/perBackend" },
+        "supplementary": { "$ref": "#/$defs/perBackend" }
+      }
+    }
+  },
+  "allOf": [
+    { "if": { "properties": { "legType": { "const": "look" } } }, "then": { "required": ["look"] } }
+  ],
+  "$defs": {
+    "perBackend": {
+      "type": "object", "additionalProperties": false,
+      "properties": { "cuda": { "$ref": "#/$defs/criteriaList" }, "cpu": { "$ref": "#/$defs/criteriaList" } }
+    },
+    "criteriaList": {
+      "type": "array",
+      "items": {
+        "type": "object", "required": ["metric", "op", "value"], "additionalProperties": false,
+        "properties": {
+          "metric": { "type": "string" },
+          "op": { "enum": ["eq", "ne", "gt", "ge", "lt", "le"] },
+          "value": {}
+        }
+      }
+    }
+  }
+}

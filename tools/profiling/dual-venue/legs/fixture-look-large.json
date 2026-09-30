@@ -1,0 +1,32 @@
+{
+  "schema": "mlv-app/dual-venue-leg/v1",
+  "legId": "fixture-look-large",
+  "card": "DUAL-VENUE-EVIDENCE-1",
+  "legType": "look",
+  "clipId": "large_dual_iso",
+  "backends": ["cuda", "cpu"],
+  "scaleFactor": 4,
+  "generatorArgs": { "telemetryArm": "LIGHT", "cpuQuiescenceThresholdPercent": 95 },
+  "timeouts": { "queueWaitSec": 900, "extraClaimedWaitSec": 600 },
+  "look": { "contactSheetFrames": 6, "lookFlavor": "classic" },
+  "criteria": {
+    "acceptance": {
+      "cuda": [
+        { "metric": "lookAssistForced", "op": "eq", "value": true },
+        { "metric": "gpuFramesTotal", "op": "gt", "value": 0 }
+      ],
+      "cpu": [
+        { "metric": "lookAssistForced", "op": "eq", "value": true }
+      ]
+    },
+    "supplementary": {
+      "cuda": [
+        { "metric": "lookAssistForced", "op": "eq", "value": true },
+        { "metric": "gpuFramesTotal", "op": "gt", "value": 0 }
+      ],
+      "cpu": [
+        { "metric": "lookAssistForced", "op": "eq", "value": true }
+      ]
+    }
+  }
+}

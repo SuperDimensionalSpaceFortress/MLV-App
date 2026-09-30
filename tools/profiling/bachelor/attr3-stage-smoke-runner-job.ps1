@@ -373,5 +373,5 @@ Write-Output "RESULT=SMOKE_RUNNER_STAGE_JOB_EMITTED SOURCE=$SourceCommit CLOSURE
     cacheDirName = $CacheDirName
     files = @($closureEntries | ForEach-Object { [ordered]@{ name = $_.name; sha256 = $_.sha256 } })
     agentRoot = $AgentRoot
-    cacheDirPath = (Join-Path (Join-Path $AgentRoot 'cache') $CacheDirName)
+    cacheDirPath = ([IO.Path]::Combine([IO.Path]::Combine($AgentRoot, 'cache'), $CacheDirName))
 }

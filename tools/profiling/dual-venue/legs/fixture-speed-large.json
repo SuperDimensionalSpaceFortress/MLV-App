@@ -1,0 +1,29 @@
+{
+  "schema": "mlv-app/dual-venue-leg/v1",
+  "legId": "fixture-speed-large",
+  "card": "DUAL-VENUE-EVIDENCE-1",
+  "legType": "speed",
+  "clipId": "large_dual_iso",
+  "backends": ["cuda", "cpu"],
+  "scaleFactor": 4,
+  "generatorArgs": { "telemetryArm": "HEAVY" },
+  "timeouts": { "queueWaitSec": 900, "extraClaimedWaitSec": 600 },
+  "criteria": {
+    "acceptance": {
+      "cuda": [
+        { "metric": "rows", "op": "gt", "value": 0 },
+        { "metric": "gpuFramesTotal", "op": "gt", "value": 0 },
+        { "metric": "cpuFrames", "op": "eq", "value": 0 }
+      ],
+      "cpu": []
+    },
+    "supplementary": {
+      "cuda": [
+        { "metric": "rows", "op": "gt", "value": 0 },
+        { "metric": "gpuFramesTotal", "op": "gt", "value": 0 },
+        { "metric": "cpuFrames", "op": "eq", "value": 0 }
+      ],
+      "cpu": []
+    }
+  }
+}
