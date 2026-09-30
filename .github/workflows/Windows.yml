@@ -195,7 +195,6 @@ jobs:
             python -m tools.repo_hygiene.extract_vendored_native_payload --repo-root "${{ github.workspace }}" --payload-id ffmpeg-windows-x86_64 --archive-reference ffmpegWin64.zip --output-dir "${{ env.SOURCE_DIR }}\build\release" --verify-installed
 
     - name: Install verified RAW2MLV
-      shell: pwsh -NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -Command "$ErrorActionPreference = 'Stop'; $PSNativeCommandUseErrorActionPreference = $true; . '{0}'"
       run:  |
             python -m tools.repo_hygiene.extract_vendored_native_payload --repo-root "${{ github.workspace }}" --payload-id raw2mlv-windows-x86-compat --archive-reference raw2mlvWin64.zip --output-dir "${{ env.SOURCE_DIR }}\build\release" --verify-installed
             dir ${{ env.SOURCE_DIR }}\build\release

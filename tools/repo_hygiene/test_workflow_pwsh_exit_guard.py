@@ -15,7 +15,13 @@ statement in a pwsh-executed block must be guarded by the fail-closed prologue
 
 either placed before the first native command in the block or carried by the step's
 (or job's) ``shell:`` template, or be followed directly by a ``$LASTEXITCODE`` check, or
-be the final statement of the block (its status is then the step status).
+be the final statement of the block (its status is then the step status). Under the runner's
+own wrapper (default shell, plain ``shell: pwsh``) the last NATIVE command also counts as
+final, because the wrapper exits with ``$LASTEXITCODE``.
+
+A ``shell:`` key on a step that hosts a payload-integrity marker is rejected by
+``vendored_native_payloads._executable_workflow_marker`` as fail-open, so such steps must stay on the
+default shell; that is sound only while they run a single native command.
 
 The workflows use the ``shell:`` route: a project hook (NA-6) reads any edit to a ``run:``
 body as a removed test step, and the aqt retry blocks must keep seeing a failing native
@@ -84,7 +90,14 @@ def _logical_lines(body: list[str]) -> list[tuple[int, str]]:
     return logical
 
 
-def unguarded_native_statements(body: list[str]) -> list[str]:
+def _wrapper_exits_with_lastexitcode(shell: str | None) -> bool:
+    """The runner's own pwsh wrapper (default shell or plain ``shell: pwsh``) appends
+    ``exit $LASTEXITCODE``, so the LAST native command decides the step status even when
+    cmdlets follow it. A custom ``-Command`` template appends nothing: the last statement decides."""
+    return shell is None or shell.strip().lower() in ("pwsh", "powershell")
+
+
+def unguarded_native_statements(body: list[str], wrapper_exit_code: bool = False) -> list[str]:
     logical = _logical_lines(body)
     native_positions = [i for i, (_, text) in enumerate(logical) if _NATIVE_STATEMENT.match(text)]
     if not native_positions:
@@ -97,7 +110,9 @@ def unguarded_native_statements(body: list[str]) -> list[str]:
     offenders = []
     for position in native_positions:
         text = logical[position][1]
-        is_final = position == len(logical) - 1
+        is_final = position == len(logical) - 1 or (
+            wrapper_exit_code and position == native_positions[-1]
+        )
         checked = "$LASTEXITCODE" in text or (
             position + 1 < len(logical) and "$LASTEXITCODE" in logical[position + 1][1]
         )
@@ -210,7 +225,7 @@ def audit_workflow_text(text: str) -> list[tuple[str, str, str]]:
             shell = step_shell if step_shell is not None else default_shell
             if not _is_pwsh(shell, windows_job) or _shell_carries_prologue(shell):
                 continue
-            for statement in unguarded_native_statements(body):
+            for statement in unguarded_native_statements(body, _wrapper_exits_with_lastexitcode(shell)):
                 findings.append((job, name or "<unnamed>", statement))
     return findings
 
@@ -292,6 +307,21 @@ class WorkflowPwshExitGuardTests(unittest.TestCase):
         self.assertEqual([], audit_workflow_text(_synthetic("python -m unittest a\n")))
         self.assertEqual([], audit_workflow_text(_synthetic(masked, runs_on="ubuntu-latest")), "bash -e")
         self.assertEqual([], audit_workflow_text(_synthetic(masked, shell="bash")))
+
+    def test_default_wrapper_exits_with_the_last_native_status_custom_template_does_not(self) -> None:
+        trailing_cmdlet = "python -m x --verify-installed\ndir out\n"
+        self.assertEqual([], audit_workflow_text(_synthetic(trailing_cmdlet)), "wrapper: exit $LASTEXITCODE")
+        self.assertEqual([], audit_workflow_text(_synthetic(trailing_cmdlet, shell="pwsh")))
+        self.assertEqual(
+            1,
+            len(audit_workflow_text(_synthetic(trailing_cmdlet, shell="pwsh -NoLogo -Command \". '{0}'\""))),
+            "a custom template reports the trailing cmdlet's status, masking the native failure",
+        )
+        self.assertEqual(
+            1,
+            len(audit_workflow_text(_synthetic("python a\npython b\ndir out\n"))),
+            "an EARLIER native command is still masked by a later passing one",
+        )
 
     def test_audit_accepts_only_a_complete_guarded_shell_template(self) -> None:
         masked = "python -m unittest a\npython -m unittest b\n"
