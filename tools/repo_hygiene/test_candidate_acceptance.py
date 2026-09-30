@@ -1,9 +1,11 @@
 from __future__ import annotations
 
+import ctypes
 import hashlib
 import io
 import json
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -797,6 +799,8 @@ class CandidateAcceptanceTests(unittest.TestCase):
             client.write_bytes(b"unsigned-test-client")
             add_rule = (
                 _PS_STAGE_TRACE +
+                "$ErrorActionPreference='Stop';"
+                "Import-Module ($PSHOME+'\\Modules\\Microsoft.PowerShell.Security\\Microsoft.PowerShell.Security.psd1');T 'import';"
                 "$acl=Get-Acl -LiteralPath $env:MLVAPP_SYSTEM_CURL_PATH;T 'get-acl';"
                 "$sid=[System.Security.Principal.SecurityIdentifier]::new('S-1-5-4');"
                 "$rule=[System.Security.AccessControl.FileSystemAccessRule]::new("
@@ -807,6 +811,9 @@ class CandidateAcceptanceTests(unittest.TestCase):
             )
             env = _minimal_system_child_environment()
             env["MLVAPP_SYSTEM_CURL_PATH"] = str(client)
+            # Pinned like production and like the null-DACL fixture, so Get-Acl cannot autoload
+            # through a hosted image's large machine PSModulePath (a suspected stall source).
+            env["PSModulePath"] = r"C:\Windows\System32\WindowsPowerShell\v1.0\Modules"
             _run_windows_acl_probe(
                 self, "enabled-group fixture: add S-1-5-4 write ACE",
                 [str(powershell), "-NoLogo", "-NoProfile", "-NonInteractive", "-Command", add_rule], env=env,
@@ -824,9 +831,75 @@ class CandidateAcceptanceTests(unittest.TestCase):
             self.assertFalse(parent_trust["ownerTrusted"])
             self.assertTrue(any(item["unsafeWriteGrants"] for item in trust["pathTrust"][:-1]))
 
+    def test_trust_probe_reports_module_evidence_even_when_the_token_grants_replacement(self) -> None:
+        # The runner shape, simulated: the protected-module pinning holds but the token (an elevated
+        # admin) holds Delete on the real curl path chain. The PROBE (process + module pinning) must
+        # succeed so module-shadowing can be tested on any host, while the IDENTITY verdict must
+        # still refuse -- the ACL policy is never loosened to make a host pass.
+        from tools.repo_hygiene.candidate_acceptance import _trusted_system_curl_identity, _windows_curl_trust_probe
+
+        with tempfile.TemporaryDirectory() as temp:
+            client = Path(temp) / "curl.exe"
+            client.write_bytes(b"x")
+            root = r"C:\Windows\System32\WindowsPowerShell\v1.0\Modules"
+            chain = [
+                {"path": p, "ownerSid": "S-1-5-18", "ownerTrusted": True, "daclPresent": True,
+                 "daclNull": False, "unsafeWriteGrants": grants}
+                for p, grants in (
+                    ("C:\\", [{"sid": "S-1-5-32-544", "rights": "FullControl"}]),
+                    ("C:\\Windows", [{"sid": "S-1-5-32-544", "rights": "Modify, Synchronize"}]),
+                    ("C:\\Windows\\System32", []),
+                    (str(client), []),
+                )
+            ]
+            runner = {
+                "returncode": 0, "timedOut": False, "outputCapped": False, "cpuStalled": False, "stderr": "",
+                "stdout": json.dumps({
+                    "modulePath": r"C:\Program Files\WindowsPowerShell\Modules;" + root,
+                    "loadedModulePaths": [root + r"\Microsoft.PowerShell.Security\Microsoft.PowerShell.Security.psd1"],
+                    "signatureStatus": "Valid",
+                    "signerSubject": "CN=Microsoft Windows, O=Microsoft Corporation",
+                    "signerThumbprint": "A" * 40,
+                    "pathTrust": chain,
+                }),
+            }
+            with mock.patch(
+                "tools.repo_hygiene.candidate_acceptance._system_curl_path", return_value=client
+            ), mock.patch(
+                "tools.repo_hygiene.brokered_closeout.run_bounded_closeout_process", return_value=runner,
+            ):
+                trust = _windows_curl_trust_probe(self.repo_root, self.config, client)
+                self.assertEqual(root.casefold() + "\\microsoft.powershell.security\\microsoft.powershell.security.psd1",
+                                 trust["loadedModulePaths"][0].casefold())
+                with self.assertRaisesRegex(
+                    HygieneError, r"grants replacement authority.*C:\\: S-1-5-32-544 FullControl"
+                ):
+                    _trusted_system_curl_identity(self.repo_root, self.config)
+
+    @unittest.skipUnless(os.name == "nt", "Windows token-explained host verdict")
+    def test_windows_system_curl_host_verdict_is_explained_by_the_token(self) -> None:
+        # The REAL host chain is refused exactly when the current token is an elevated admin (the
+        # default Administrators ACEs on C:\ and C:\Windows carry Delete). A hosted runner token is
+        # elevated; a normal developer session is not. Any refusal that the elevated-Administrators
+        # grant does not explain -- a broad principal, a NULL DACL, another failure -- stays a failure.
+        from tools.repo_hygiene.candidate_acceptance import _trusted_system_curl_identity
+
+        elevated = bool(ctypes.windll.shell32.IsUserAnAdmin())
+        try:
+            _trusted_system_curl_identity(ROOT, self.config)
+        except HygieneError as exc:
+            message = str(exc)
+            self.assertIn("grants replacement authority", message, message)
+            flagged = set(re.findall(r": (S-1-[\d-]+|NULL_DACL) ", message))
+            self.assertTrue(flagged, message)
+            self.assertTrue(elevated, "refused on a NON-elevated token: " + message)
+            self.assertEqual({"S-1-5-32-544"}, flagged, message)
+        else:
+            print(f"[curl-trust] host verdict: clean (elevated={elevated})", file=sys.stderr)
+
     @unittest.skipUnless(os.name == "nt", "Windows protected-module bootstrap")
     def test_windows_system_curl_trust_rejects_user_module_shadowing(self) -> None:
-        from tools.repo_hygiene.candidate_acceptance import _trusted_system_curl_identity
+        from tools.repo_hygiene.candidate_acceptance import _windows_curl_trust_probe, _system_curl_path
 
         powershell = Path(r"C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe")
         with tempfile.TemporaryDirectory() as temp:
@@ -846,9 +919,11 @@ class CandidateAcceptanceTests(unittest.TestCase):
                 env=hostile_env,
             )
             self.assertEqual('{"forged":true}', baseline.stdout.strip())
+            # The PROBE is the production process + module-pinning stage; the ACL verdict on the
+            # host's real curl chain is asserted separately (host_verdict_is_explained_by_the_token),
+            # so this defence is exercised on every host, elevated or not.
             with mock.patch.dict(os.environ, {"PSModulePath": str(attacker_root)}):
-                identity = _trusted_system_curl_identity(ROOT, self.config)
-            trust = identity["trust"]
+                trust = _windows_curl_trust_probe(ROOT, self.config, _system_curl_path())
             self.assertNotIn(str(attacker_root).casefold(), trust["modulePath"].casefold())
             protected_modules = "c:\\windows\\system32\\windowspowershell\\v1.0\\modules\\"
             self.assertTrue(all(str(path).casefold().startswith(protected_modules) for path in trust["loadedModulePaths"]))
