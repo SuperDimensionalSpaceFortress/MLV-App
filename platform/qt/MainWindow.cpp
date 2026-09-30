@@ -53,6 +53,7 @@ extern "C" {
 #include <QScrollBar>
 #include <QScreen>
 #include <QWindow>
+#include "DisplayDeviceMapping.h"
 #include <QMimeData>
 #include <QUrl>
 #include <QVBoxLayout>
@@ -85,27 +86,41 @@ static QString bool01( bool value )
     return value ? QStringLiteral("1") : QStringLiteral("0");
 }
 
+// UM-DISPLAY-QT-WINDOWS-MAPPING-PROOF-1: the Windows GDI device (\\.\DISPLAYn) of a QScreen, or an
+// empty string when it cannot be established uniquely (never a guess). Measured on UM: QScreen::name()
+// is the EDID friendly name ("PA329C"), NOT the GDI name, so the device is derived from the screen's
+// native origin + physical size -- see DisplayDeviceMapping.h. Non-Windows builds have no GDI device.
+static QString playbackSmokeScreenGdiDevice( QScreen *screen )
+{
+#ifdef Q_OS_WIN
+    if( !screen ) return QString();
+    const QRect geo = screen->geometry();
+    const double dpr = screen->devicePixelRatio();
+    return DisplayDeviceMapping::gdiDeviceForScreen(
+        geo.topLeft(), QSize( qRound( geo.width() * dpr ), qRound( geo.height() * dpr ) ),
+        DisplayDeviceMapping::enumerateGdiMonitors() );
+#else
+    Q_UNUSED( screen );
+    return QString();
+#endif
+}
+
 // UM-DISPLAY-SELECT-AND-LOG-1 round 1c (measured topology, project-memory
 // um-display-topology-lg-tv-denon-fallback-20260926.md): case-insensitive match against
 // name/model/manufacturer, in that order -- the field that matched is returned (for logging
 // which one it was), never guessed. An empty substring or a null screen never matches.
+// Round 2 (sol PRE-REVIEW #2 BLOCKER a): the job resolves the preferred Windows monitor name to
+// its GDI device name (\\.\DISPLAYn) and passes THAT; it is compared for equality (never falling
+// through to the substring fields) against the DERIVED GDI device -- NOT QScreen::name(), which on
+// a monitor with an EDID name is the friendly name (UM-DISPLAY-QT-WINDOWS-MAPPING-PROOF-1). The
+// rules live in DisplayDeviceMapping.h so console_tests pins them with the recorded UM values.
 static QString playbackSmokeDisplayPreferenceMatchedField( QScreen *screen, const QString &preferSubstring )
 {
     if( !screen || preferSubstring.isEmpty() ) return QString();
-    // Round 2 (sol PRE-REVIEW #2 BLOCKER a): the job resolves the preferred Windows monitor
-    // name to its GDI device name (\\.\DISPLAYn -- exactly what QScreen::name() reports on
-    // Windows, with an empty model on the measured UM topology) and passes THAT. A device-name
-    // preference is compared for equality and never falls through to the substring fields, so
-    // \\.\DISPLAY1 cannot also select \\.\DISPLAY10.
-    if( preferSubstring.startsWith( QStringLiteral( "\\\\.\\" ) ) )
-    {
-        if( screen->name().compare( preferSubstring, Qt::CaseInsensitive ) == 0 ) return QStringLiteral("device_name");
-        return QString();
-    }
-    if( screen->name().contains( preferSubstring, Qt::CaseInsensitive ) ) return QStringLiteral("name");
-    if( screen->model().contains( preferSubstring, Qt::CaseInsensitive ) ) return QStringLiteral("model");
-    if( screen->manufacturer().contains( preferSubstring, Qt::CaseInsensitive ) ) return QStringLiteral("manufacturer");
-    return QString();
+    return DisplayDeviceMapping::preferenceMatchedField(
+        screen->name(), screen->model(), screen->manufacturer(),
+        preferSubstring.startsWith( QStringLiteral( "\\\\.\\" ) ) ? playbackSmokeScreenGdiDevice( screen ) : QString(),
+        preferSubstring );
 }
 
 static QString fingerprintDisplayValue( const QJsonObject &fingerprint,
@@ -23436,7 +23451,7 @@ void MainWindow::logPlaybackSmokeDisplayInventory( void ) const
             << QStringLiteral(
                    "gui_smoke.display_screen index=%1 name=\"%2\" manufacturer=\"%3\" "
                    "model=\"%4\" serial=\"%5\" geometry=%6,%7 %8x%9 physical=%10x%11 "
-                   "dpr=%12 refresh_hz=%13 primary=%14" )
+                   "dpr=%12 refresh_hz=%13 primary=%14 device=\"%15\"" )
                    .arg( i )
                    .arg( s->name() )
                    .arg( s->manufacturer() )
@@ -23450,7 +23465,8 @@ void MainWindow::logPlaybackSmokeDisplayInventory( void ) const
                    .arg( physicalHeight )
                    .arg( dpr, 0, 'f', 2 )
                    .arg( s->refreshRate(), 0, 'f', 3 )
-                   .arg( bool01( s == primary ) );
+                   .arg( bool01( s == primary ) )
+                   .arg( playbackSmokeScreenGdiDevice( s ) );
     }
 }
 
@@ -23706,7 +23722,8 @@ bool MainWindow::enterPlaybackSmokeFullscreen( QScreen *target )
     }
 
     const bool verified = mainVerified && gpuVerified;
-    if( !presentationScreen ) presentationScreen = QApplication::primaryScreen();
+    // UM-DISPLAY-QT-WINDOWS-MAPPING-PROOF-1 round 2: no screen at all is logged as "none" / 0x0 below,
+    // never replaced by the primary screen -- a default must not stand in for a measured presentation.
     const double presentationDpr = presentationScreen ? presentationScreen->devicePixelRatio() : 1.0;
     const QSize presentationPhysical = presentationScreen
         ? QSize( qRound( presentationScreen->geometry().width() * presentationDpr ),

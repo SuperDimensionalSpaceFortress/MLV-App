@@ -51,6 +51,7 @@ SOURCES += \
     $$REPO_ROOT/tests/console/test_playback_smoke_foreground_wiring.cpp \
     $$REPO_ROOT/tests/console/test_playback_smoke_fullscreen_wiring.cpp \
     $$REPO_ROOT/tests/console/test_gui_smoke_display_select_wiring.cpp \
+    $$REPO_ROOT/tests/console/test_display_device_mapping.cpp \
     $$REPO_ROOT/tests/console/test_playback_fullscreen_ui_wiring.cpp \
     $$REPO_ROOT/tests/console/test_playback_display_wake_wiring.cpp \
     $$REPO_ROOT/tests/console/test_pre_dualiso_telemetry_reset_wiring.cpp \
@@ -94,7 +95,8 @@ HEADERS += \
     $$REPO_ROOT/platform/qt/PlaybackAchievedScalePolicy.h \
     $$REPO_ROOT/platform/qt/PlaybackLookaheadLoopPositionPolicy.h \
     $$REPO_ROOT/platform/qt/PlaybackFpsMeterPolicy.h \
-    $$REPO_ROOT/platform/qt/GpuTexturePresentAvailabilityPolicy.h
+    $$REPO_ROOT/platform/qt/GpuTexturePresentAvailabilityPolicy.h \
+    $$REPO_ROOT/platform/qt/DisplayDeviceMapping.h
 
 win32{
     WINDOWS_TEST_RUNTIME_DEPLOY = $$relative_path($$REPO_ROOT/tools/testing/deploy-windows-test-runtime.ps1, $$OUT_PWD)

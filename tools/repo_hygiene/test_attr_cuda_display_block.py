@@ -382,7 +382,10 @@ class TemplateDisplayBlockExecutionTests(_ProbeCase):
             "    screensError = $null\n"
             "    target = [ordered]@{ name='\\\\.\\DISPLAY1'; reason='max_physical_pixels'; candidates=2; fallback=$false }\n"
             "    targetError = $null\n"
-            "    placement = [ordered]@{ mode='fullscreen'; previewWidth=3840; previewHeight=2160 }\n"
+            # UM-DISPLAY-QT-WINDOWS-MAPPING-2: a placement must NAME the screen it presented on; without
+            # presentationScreenName the presentation is UNKNOWN (the target no longer stands in).
+            "    placement = [ordered]@{ mode='fullscreen'; previewWidth=3840; previewHeight=2160; "
+            "presentationScreenName='\\\\.\\DISPLAY1' }\n"
             "    placementError = $null\n"
             "}\n"
             "$block = Build-AttrCudaDisplayBlock -WindowsInventory $inv -Venue 'ultra-magnus' "
@@ -426,7 +429,8 @@ class TemplateDisplayBlockExecutionTests(_ProbeCase):
             "    screensError = $null\n"
             "    target = [ordered]@{ name='\\\\.\\DISPLAY1'; reason='max_physical_pixels'; candidates=1; fallback=$true }\n"
             "    targetError = $null\n"
-            "    placement = [ordered]@{ mode='windowed'; previewWidth=2560; previewHeight=1440 }\n"
+            "    placement = [ordered]@{ mode='windowed'; previewWidth=2560; previewHeight=1440; "
+            "presentationScreenName='\\\\.\\DISPLAY1' }\n"
             "    placementError = $null\n"
             "}\n"
             "$block = Build-AttrCudaDisplayBlock -WindowsInventory $inv -Venue 'ultra-magnus' "
@@ -451,7 +455,8 @@ class TemplateDisplayBlockExecutionTests(_ProbeCase):
             "    screensError = $null\n"
             "    target = [ordered]@{ name='\\\\.\\DISPLAY1'; reason='max_physical_pixels'; candidates=1; fallback=$false }\n"
             "    targetError = $null\n"
-            "    placement = [ordered]@{ mode='fullscreen'; previewWidth=3840; previewHeight=2160 }\n"
+            "    placement = [ordered]@{ mode='fullscreen'; previewWidth=3840; previewHeight=2160; "
+            "presentationScreenName='\\\\.\\DISPLAY1' }\n"
             "    placementError = $null\n"
             "}\n"
             "$block = Build-AttrCudaDisplayBlock -WindowsInventory $inv -Venue 'ultra-magnus' "
@@ -548,7 +553,10 @@ class TemplateDisplayBlockExecutionTests(_ProbeCase):
             "    target = [ordered]@{ name='\\\\.\\DISPLAY1'; reason='max_physical_pixels'; candidates=1; fallback=$false }\n"
             "    targetError = $null\n"
             "    placement = [ordered]@{ mode='fullscreen'; previewWidth=3840; previewHeight=2160; "
-            "verified=$true; targetScreenName='X'; presentationScreenName='X'; "
+            # Round 2: the presentation must NAME the screen it presented on. This fixture used to say 'X'
+            # (a name no display_screen line carries) and passed only because the target silently stood in
+            # for the unresolved presentation -- the very fallback sol's r1 blocker removed.
+            "verified=$true; targetScreenName='\\\\.\\DISPLAY1'; presentationScreenName='\\\\.\\DISPLAY1'; "
             "presentationPhysicalWidth=3840; presentationPhysicalHeight=2160 }\n"
             "    placementError = $null\n"
             "}\n"
@@ -559,9 +567,10 @@ class TemplateDisplayBlockExecutionTests(_ProbeCase):
         self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
         self.assertIn("DISPLAY=\\\\.\\DISPLAY1 RES=3840x2160@60 DEGRADED=0 PREVIEW=3840x2160", proc.stdout)
 
-    def test_a_legacy_placement_with_no_presentation_field_falls_back_to_the_target(self) -> None:
-        # Pre-round-1c behavior preserved for a legacy binary/log that never logged
-        # presentation_screen=.
+    def test_a_legacy_placement_with_no_presentation_field_is_unknown_never_the_target(self) -> None:
+        # UM-DISPLAY-QT-WINDOWS-MAPPING-2: this used to pin the pre-round-1c behaviour (the target
+        # stands in for a legacy log that never logged presentation_screen=). That fallback is deleted:
+        # no target, preference or default stands in for a measured presentation.
         proc = self.run_probe(
             "$inv = [pscustomobject]@{ collected = $true; devices = @([pscustomobject]@{ "
             "deviceName='\\\\.\\DISPLAY1'; modeCollected=$true; width=3840; height=2160 }); error = $null }\n"
@@ -581,8 +590,10 @@ class TemplateDisplayBlockExecutionTests(_ProbeCase):
             "REASON=$($block.presentationUnknownReason)\"\n"
         )
         self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
-        self.assertIn("DISPLAY=\\\\.\\DISPLAY1 RES=3840x2160@60 DEGRADED=0 PREVIEW=3840x2160", proc.stdout)
+        self.assertIn("DISPLAY=unknown RES=unknown DEGRADED=unknown PREVIEW=3840x2160", proc.stdout)
+        self.assertNotIn("DISPLAY1 RES=", proc.stdout)
         self.assertIn("PRESENTATION_NULL=True", proc.stdout)
+        self.assertIn("presentation_screen", proc.stdout)  # the reason names the missing field
 
     def test_before_the_smoke_log_is_available_every_field_reads_unknown(self) -> None:
         proc = self.run_probe(
@@ -603,7 +614,8 @@ class TemplateDisplayBlockExecutionTests(_ProbeCase):
             "    screensError = $null\n"
             "    target = [ordered]@{ name='\\\\.\\DISPLAY1'; reason='max_physical_pixels'; candidates=1; fallback=$false }\n"
             "    targetError = $null\n"
-            "    placement = [ordered]@{ mode='fullscreen'; previewWidth=1920; previewHeight=1080 }\n"
+            "    placement = [ordered]@{ mode='fullscreen'; previewWidth=1920; previewHeight=1080; "
+            "presentationScreenName='\\\\.\\DISPLAY1' }\n"
             "    placementError = $null\n"
             "}\n"
             "$block = Build-AttrCudaDisplayBlock -WindowsInventory $inv -Venue 'bachelor' "
@@ -623,8 +635,10 @@ class PresentationWindowsMappingTests(_ProbeCase):
     (b) DEGRADED may be asserted only when the screen the leg ACTUALLY presented on maps to a
     Windows device whose mode was readable -- "some other device was readable" is not
     corroboration. (a) The venue's preferred monitor is named by its Windows monitorName
-    ('ASUS PA329C'), but Qt reports GDI device names (\\\\.\\DISPLAYn) with no model, so the job
-    must resolve monitorName -> deviceName from the Windows inventory before the app sees it.
+    ('ASUS PA329C'), so the job must resolve monitorName -> deviceName (\\\\.\\DISPLAYn) from the
+    Windows inventory before the app sees it. (The original wording here said Qt reports GDI device
+    names; measured on UM it reports the EDID friendly name instead -- see
+    test_um_display_qt_windows_mapping.py -- so the app derives each screen's GDI device itself.)
     """
 
     def setUp(self) -> None:

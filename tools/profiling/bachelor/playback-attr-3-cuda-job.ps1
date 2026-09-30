@@ -1234,8 +1234,9 @@ function Build-AttrCudaDisplayBlock {
     # so a name mismatch between Qt and Win32 device naming can never produce a wrong target size.
     $targetPhysical = $null
     if ($null -ne $targetInfo) {
-        # ONE lookup rule with the identity block: Find-GuiSmokeDisplayScreen (last record wins,
-        # case-insensitive) -- round 4, fable DISPLAY-BLOCK-LOOKUP-LAST-WINS-1.
+        # ONE lookup rule with the identity block: Find-GuiSmokeDisplayScreen (case-insensitive; a
+        # screen re-logged at the same index is last-wins, a name shared by two distinct indexes
+        # matches nothing) -- round 4, fable DISPLAY-BLOCK-LOOKUP-LAST-WINS-1.
         $targetPhysical = Find-GuiSmokeDisplayScreen -Screens $screens -Name ([string]$targetInfo.name)
     }
     $targetBlock = $null
@@ -1275,15 +1276,29 @@ function Build-AttrCudaDisplayBlock {
             refreshHz = $presentationPhysical.refreshHz
         }
     } elseif ($null -ne $presentationName) {
-        $presentationUnknownReason = 'no gui_smoke.display_screen line matched the presentation screen name'
+        # Two attached screens of one model share a Qt name, so the name alone cannot say which one
+        # presented (Find-GuiSmokeDisplayScreen returns $null for that) -- a distinct reason, because
+        # "no line matched" would send a reader looking for a missing log line.
+        $sameNamePresentation = @(@($screens) | Where-Object { $null -ne $_ -and [string]$_.name -ieq [string]$presentationName })
+        if ($sameNamePresentation.Count -gt 1) {
+            $presentationUnknownReason = 'presentation screen name is shared by ' + $sameNamePresentation.Count +
+                ' attached screens (indexes ' + (($sameNamePresentation | ForEach-Object { [string]$_.index } | Sort-Object -Unique) -join ',') +
+                '): the name cannot tell them apart'
+        } else {
+            $presentationUnknownReason = 'no gui_smoke.display_screen line matched the presentation screen name'
+        }
     } elseif ($appKnown) {
         $presentationUnknownReason = 'smoke log has no presentation_screen field (legacy binary, or window_placement did not match)'
     } else {
         $presentationUnknownReason = 'smoke log not yet available'
     }
-    # The value actually measured against -- presentation when knowable, else the intended
-    # target (the pre-round-1c behavior, kept as the fallback for a legacy binary/log).
-    $effectiveBlock = if ($presentationBlock) { $presentationBlock } else { $targetBlock }
+    # UM-DISPLAY-QT-WINDOWS-MAPPING-2 (class scope of the PROOF-1 sol r1/r2 blockers): NO target,
+    # preference or default stands in for the PRESENTATION -- not for an ambiguous, unmapped or "none"
+    # one (r1), and not for an absent one on a legacy log line either (r2: a legacy line's verified=1
+    # only says the window matched the target's size, it does not say which screen it was on). The
+    # device lookup, displayDegraded and the RESULT tail's DISPLAY=/RES= below read ONLY
+    # $presentationBlock / $presentationPhysical, so every unresolved state is UNKNOWN with
+    # $presentationUnknownReason. $targetBlock is published as the target and used for nothing else.
 
     # UM-DISPLAY-SELECT-AND-LOG-1 round 1c (sol BLOCKER 2 / opus design-review hardening): the
     # verdict must be blind to the app's own report the moment the INDEPENDENT Windows-API
@@ -1291,18 +1306,34 @@ function Build-AttrCudaDisplayBlock {
     # $false, or collected=$true with zero devices / no device whose mode was readable (both
     # plausible in the headless/Session-0 contexts this fleet has hit before).
     # Round 2 (sol PRE-REVIEW #2 BLOCKER b): "some Windows device was readable" is not
-    # corroboration -- the screen the leg ACTUALLY presented on (the effective block's name, a GDI
-    # device name on Windows) must map to a Windows device whose own mode was readable, else the
+    # corroboration -- the screen the leg ACTUALLY presented on (the presentation block's screen,
+    # located through the device the app derived for it; the Qt name is an EDID friendly name on
+    # a monitor that has one) must map to a Windows device whose own mode was readable, else the
     # verdict is unknown. status: mapped | unreadable (device found, mode not) | unmapped (no
-    # device carries that name) | unknown (no presentation/target name at all).
+    # inventory device is the one derived) | unknown (no resolvable presentation: ambiguous,
+    # unmapped, none or absent -- the target never stands in, see above).
     # (Locals, then one literal: the publish-write lint R5 refuses member assignment in this template.)
     $presentationDeviceStatus = 'unknown'
     $presentationDeviceName = $null
     $presentationMonitorName = $null
     $windowsAnyModeCollected = $false
-    if ($effectiveBlock -and $effectiveBlock.name) {
+    # UM-DISPLAY-QT-WINDOWS-MAPPING-PROOF-1: the Qt NAME is not the GDI device name on a monitor that
+    # has an EDID name (measured on UM: "PA329C", "LG TV"), so matching it against deviceName left this
+    # status permanently 'unmapped' there. The device to look up is the one the APP derived for that
+    # screen (display_screen device=, from native origin + physical size); the name is used only when
+    # it IS a GDI device name (a monitor with no EDID name, or a log that predates device=) and never
+    # when it contradicts the derived device. No lookup device at all -> 'unmapped', never a guess.
+    $derivedDevice = if ($presentationPhysical) { [string]$presentationPhysical.device } else { '' }
+    $nameIsDevice = ($presentationBlock -and ([string]$presentationBlock.name).StartsWith('\\.\'))
+    $lookupDevice = $null
+    if (-not [string]::IsNullOrWhiteSpace($derivedDevice)) {
+        if (-not $nameIsDevice -or ([string]$presentationBlock.name -ieq $derivedDevice)) { $lookupDevice = $derivedDevice }
+    } elseif ($nameIsDevice) {
+        $lookupDevice = [string]$presentationBlock.name
+    }
+    if ($presentationBlock -and $presentationBlock.name) {
         $mappedDevice = @($WindowsInventory.devices | Where-Object {
-            $_.deviceName -and ([string]$_.deviceName -ieq [string]$effectiveBlock.name)
+            $lookupDevice -and $_.deviceName -and ([string]$_.deviceName -ieq $lookupDevice)
         }) | Select-Object -First 1
         if ($null -eq $mappedDevice) {
             $presentationDeviceStatus = 'unmapped'
@@ -1319,8 +1350,8 @@ function Build-AttrCudaDisplayBlock {
     }
     $presentationWindowsDevice = [ordered]@{ status = $presentationDeviceStatus; deviceName = $presentationDeviceName; monitorName = $presentationMonitorName }
     $degraded = Get-AttrCudaDisplayDegradedState `
-        -TargetWidth $(if ($effectiveBlock) { $effectiveBlock.width } else { $null }) `
-        -TargetHeight $(if ($effectiveBlock) { $effectiveBlock.height } else { $null }) `
+        -TargetWidth $(if ($presentationBlock) { $presentationBlock.width } else { $null }) `
+        -TargetHeight $(if ($presentationBlock) { $presentationBlock.height } else { $null }) `
         -ExpectedWidth $ExpectedWidth -ExpectedHeight $ExpectedHeight `
         -WindowsCollected ([bool]$WindowsInventory.collected) -WindowsAnyModeCollected $windowsAnyModeCollected
 
@@ -1377,13 +1408,14 @@ function Get-AttrCudaDisplayResultTail([object]$DisplayBlock) {
     # been parsed). Third state (item e): a $null target/preview reads 'unknown', never a guessed
     # value and never folded into a passing/zero reading.
     # Round 1c (sol BLOCKER 3 job-side gap): DISPLAY=/RES= report the ACTUAL presentation
-    # screen once known, falling back to the intended target only when presentation is not
-    # knowable (a legacy binary/log) -- never the reverse, which is exactly the failure sol
-    # flagged: a rejected move whose RESULT line still named the 4K target.
-    $effective = if ($DisplayBlock.presentation) { $DisplayBlock.presentation } else { $DisplayBlock.target }
-    $displayName = if ($effective) { $effective.name } else { 'unknown' }
-    $res = if ($effective) {
-        "$($effective.width)x$($effective.height)@$($effective.refreshHz)"
+    # screen once known, and NOTHING ELSE: an ambiguous, unmapped, "none" or absent (legacy log)
+    # presentation reads unknown, never the intended target (UM-DISPLAY-QT-WINDOWS-MAPPING-2 --
+    # sol's r1/r2 blockers). The reverse is exactly the failure sol flagged: a rejected move whose
+    # RESULT line still named the 4K target.
+    $presented = $DisplayBlock.presentation
+    $displayName = if ($presented) { $presented.name } else { 'unknown' }
+    $res = if ($presented) {
+        "$($presented.width)x$($presented.height)@$($presented.refreshHz)"
     } else { 'unknown' }
     $degradedField =
         if ($DisplayBlock.displayDegraded -eq $true) { '1' }
@@ -1738,8 +1770,10 @@ if ($measurementVenue -eq 'ultra-magnus') {
     $displayPreferSubstring = 'PA329C'
 }
 # Round 2 (sol PRE-REVIEW #2 BLOCKER a): the substring names the MONITOR as Windows reports it;
-# Qt reports GDI device names with no model, so resolve monitorName -> deviceName here (from the
-# same independent inventory) and hand the app THAT. Non-mapped outcomes keep the substring.
+# Resolve monitorName -> GDI deviceName here (from the same independent inventory) and hand the
+# app THAT; the app matches it against the device it derives per QScreen (display_screen device=),
+# because QScreen::name() is the EDID friendly name on a monitor that has one, not the GDI name
+# (UM-DISPLAY-QT-WINDOWS-MAPPING-PROOF-1). Non-mapped outcomes keep the substring.
 $displayPreferResolution = Resolve-AttrCudaPreferredDisplay -WindowsInventory $windowsDisplayInventory -Substring $displayPreferSubstring
 $displayPreferArgument = $displayPreferResolution.argument
 # -AppSelection $null until the smoke log is parsed further down -- appScreens/target/mode/
