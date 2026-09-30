@@ -551,74 +551,95 @@ def _system_curl_path() -> Path:
     return resolved
 
 
+def _windows_curl_trust_probe(repo_root: Path, config: Dict[str, Any], client: Path) -> Dict[str, Any]:
+    """Run the protected-module trust probe and verify its own integrity (process exit, evidence
+    shape, pinned module path, modules loaded only from the protected root).
+
+    This is the stage BEFORE the ACL/signature policy: it says the probe ran untampered, not that
+    the curl path chain is safe. _trusted_system_curl_identity applies the policy on top of it.
+    """
+
+    powershell = Path(r"C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe")
+    if not powershell.is_file():
+        raise HygieneError("Windows system PowerShell is unavailable for curl trust verification")
+    from .brokered_closeout import run_bounded_closeout_process
+
+    trust_env = _minimal_system_child_environment()
+    trust_env["MLVAPP_SYSTEM_CURL_PATH"] = str(client)
+    trust_env["PSModulePath"] = r"C:\Windows\System32\WindowsPowerShell\v1.0\Modules"
+    completed = run_bounded_closeout_process(
+        repo_root,
+        config,
+        [
+            str(powershell),
+            "-NoLogo",
+            "-NoProfile",
+            "-NonInteractive",
+            "-ExecutionPolicy",
+            "Bypass",
+            "-Command",
+            _WINDOWS_CURL_TRUST_SCRIPT,
+        ],
+        timeout_ms=30000,
+        max_output_bytes=65536,
+        recovery_command="restore the Microsoft-signed OS curl binary and its protected ACL",
+        normalize_failure_text=False,
+        env=trust_env,
+        resource_overrides={"profile": "provider-verification", "affinityCores": 2},
+    )
+    if completed["returncode"] != 0 or completed.get("timedOut") or completed.get("outputCapped") or completed.get("cpuStalled"):
+        raise HygieneError(f"system curl trust verification failed with exit {completed['returncode']}: {completed['stderr'][-1000:]}")
+    try:
+        trust = json.loads(completed["stdout"])
+    except json.JSONDecodeError as exc:
+        raise HygieneError("system curl trust evidence is malformed") from exc
+    path_trust = trust.get("pathTrust")
+    if not isinstance(path_trust, list) or len(path_trust) < 3:
+        raise HygieneError("system curl path-chain trust evidence is incomplete")
+    expected_module_root = r"C:\Windows\System32\WindowsPowerShell\v1.0\Modules"
+    expected_module_paths = {
+        r"C:\Program Files\WindowsPowerShell\Modules".casefold(),
+        expected_module_root.casefold(),
+    }
+    actual_module_paths = {
+        value.strip().casefold()
+        for value in str(trust.get("modulePath") or "").split(";")
+        if value.strip()
+    }
+    if actual_module_paths != expected_module_paths:
+        raise HygieneError("system curl trust verification used an unpinned PowerShell module path")
+    loaded_modules = trust.get("loadedModulePaths")
+    if not isinstance(loaded_modules, list) or not loaded_modules:
+        raise HygieneError("system curl trust verification did not report its loaded modules")
+    if any(not str(path).casefold().startswith(expected_module_root.casefold() + "\\") for path in loaded_modules):
+        raise HygieneError("system curl trust verification loaded a module outside the protected system root")
+    return trust
+
+
 def _trusted_system_curl_identity(repo_root: Path, config: Dict[str, Any]) -> Dict[str, Any]:
     """Return fail-closed ownership/signature evidence for the OS curl binary."""
 
     client = _system_curl_path()
     trust: Dict[str, Any]
     if os.name == "nt":
-        powershell = Path(r"C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe")
-        if not powershell.is_file():
-            raise HygieneError("Windows system PowerShell is unavailable for curl trust verification")
-        from .brokered_closeout import run_bounded_closeout_process
-
-        trust_env = _minimal_system_child_environment()
-        trust_env["MLVAPP_SYSTEM_CURL_PATH"] = str(client)
-        trust_env["PSModulePath"] = r"C:\Windows\System32\WindowsPowerShell\v1.0\Modules"
-        completed = run_bounded_closeout_process(
-            repo_root,
-            config,
-            [
-                str(powershell),
-                "-NoLogo",
-                "-NoProfile",
-                "-NonInteractive",
-                "-ExecutionPolicy",
-                "Bypass",
-                "-Command",
-                _WINDOWS_CURL_TRUST_SCRIPT,
-            ],
-            timeout_ms=30000,
-            max_output_bytes=65536,
-            recovery_command="restore the Microsoft-signed OS curl binary and its protected ACL",
-            normalize_failure_text=False,
-            env=trust_env,
-            resource_overrides={"profile": "provider-verification", "affinityCores": 2},
-        )
-        if completed["returncode"] != 0 or completed.get("timedOut") or completed.get("outputCapped") or completed.get("cpuStalled"):
-            raise HygieneError(f"system curl trust verification failed with exit {completed['returncode']}: {completed['stderr'][-1000:]}")
-        try:
-            trust = json.loads(completed["stdout"])
-        except json.JSONDecodeError as exc:
-            raise HygieneError("system curl trust evidence is malformed") from exc
-        path_trust = trust.get("pathTrust")
-        if not isinstance(path_trust, list) or len(path_trust) < 3:
-            raise HygieneError("system curl path-chain trust evidence is incomplete")
-        expected_module_root = r"C:\Windows\System32\WindowsPowerShell\v1.0\Modules"
-        expected_module_paths = {
-            r"C:\Program Files\WindowsPowerShell\Modules".casefold(),
-            expected_module_root.casefold(),
-        }
-        actual_module_paths = {
-            value.strip().casefold()
-            for value in str(trust.get("modulePath") or "").split(";")
-            if value.strip()
-        }
-        if actual_module_paths != expected_module_paths:
-            raise HygieneError("system curl trust verification used an unpinned PowerShell module path")
-        loaded_modules = trust.get("loadedModulePaths")
-        if not isinstance(loaded_modules, list) or not loaded_modules:
-            raise HygieneError("system curl trust verification did not report its loaded modules")
-        if any(not str(path).casefold().startswith(expected_module_root.casefold() + "\\") for path in loaded_modules):
-            raise HygieneError("system curl trust verification loaded a module outside the protected system root")
+        trust = _windows_curl_trust_probe(repo_root, config, client)
+        path_trust = trust["pathTrust"]
         if any(not isinstance(item, dict) or not item.get("ownerTrusted") for item in path_trust):
             raise HygieneError("system curl path chain is not owned by Windows or TrustedInstaller")
         if any(item.get("daclPresent") is not True or item.get("daclNull") is not False for item in path_trust):
             raise HygieneError("system curl path chain has an absent or NULL discretionary ACL")
         if trust.get("signatureStatus") != "Valid" or "O=Microsoft Corporation" not in str(trust.get("signerSubject") or ""):
             raise HygieneError("system curl does not have a valid Microsoft signature")
-        if any(item.get("unsafeWriteGrants") for item in path_trust):
-            raise HygieneError("system curl path chain grants replacement authority to the current token or a broad principal")
+        unsafe_grants = [
+            f"{item.get('path')}: {grant.get('sid')} {grant.get('rights')}"
+            for item in path_trust
+            for grant in item.get("unsafeWriteGrants") or []
+        ]
+        if unsafe_grants:
+            raise HygieneError(
+                "system curl path chain grants replacement authority to the current token or a broad principal: "
+                + "; ".join(unsafe_grants)
+            )
     else:
         trust = {
             "pathTrust": _trusted_unix_curl_path_chain(client),
