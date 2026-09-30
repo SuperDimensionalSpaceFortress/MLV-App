@@ -32,7 +32,11 @@ function New-Attr3FootageBindProofJob {
     .DESCRIPTION
     Emitted job exit codes: 0 OWNER_FOOTAGE_BIND_PROVEN, 19 OWNER_FOOTAGE_NOT_VERIFIED, 20
     OWNER_PARTS_NOT_CONTIGUOUS, 21 OWNER_FOOTAGE_LINK_CROSS_VOLUME, 22 OWNER_FOOTAGE_LINK_FAILED,
-    23 OWNER_FOOTAGE_BIND_NOT_PINNED (the held link accepted a write-open), 4 anything else.
+    23 OWNER_FOOTAGE_BIND_NOT_PINNED (the held link accepted a write-open), 24
+    OWNER_FOOTAGE_BIND_MISMATCH (the binding differs from the verified parts), 25
+    OWNER_FOOTAGE_BIND_HASH_READS (not exactly one full read per part), 26
+    OWNER_FOOTAGE_BIND_CLEANUP_INCOMPLETE (the source's link count, the work tree or the link
+    directory was not restored), 4 anything else.
     #>
     [CmdletBinding()]
     param(
@@ -81,7 +85,14 @@ function New-Attr3FootageBindProofJob {
         'Get-AttrCudaOwnerFootageNeutralName', 'Assert-AttrCudaOwnerPartsNaming', 'Get-AttrCudaFileIdentity',
         'New-AttrCudaOwnerFootageLink', 'Open-AttrCudaReadOnlyHandle', 'New-AttrCudaVerifiedClipBinding',
         'Close-AttrCudaOwnerFootageWorkspace', 'Resolve-AttrCudaOwnerFootageDirectory',
-        'Remove-AttrCudaOwnerFootageRelocatedDirectory'))
+        'Remove-AttrCudaOwnerFootageRelocatedDirectory',
+        # UM-OWNER-FOOTAGE-CROSS-VOLUME-1 round 2: the directory pin and the by-handle link delete.
+        'Initialize-AttrCudaPinNativeMethods', 'Get-AttrCudaNoFollowIdentity',
+        'Test-AttrCudaPathAncestorsHaveNoReparsePoint', 'Get-AttrCudaOwnerFootagePinTable',
+        'Get-AttrCudaOwnerFootagePinKey', 'Get-AttrCudaOwnerFootageDirectoryPin',
+        'Register-AttrCudaOwnerFootageDirectoryPin', 'Register-AttrCudaOwnerFootageDirectoryPinBestEffort',
+        'Test-AttrCudaOwnerFootageDirectoryPin', 'Remove-AttrCudaOwnerFootageLinkName',
+        'Remove-AttrCudaOwnerFootageRecordedLinks'))
 
     $template = @'
 $ErrorActionPreference = 'Stop'
@@ -190,6 +201,10 @@ try {
         bindingMatches = $bindingMatches
         writeBlockedWhileHeld = $pinned
     }
+    # Success is gated on every invariant the proof reports (sol r1 hardening), not just on nothing
+    # having thrown: the proof object above is kept so the refusal still shows what was measured.
+    if (-not $bindingMatches) { $token = 'OWNER_FOOTAGE_BIND_MISMATCH'; $exitCode = 24; throw $token }
+    if ($hashReads -ne $verified.Count) { $token = 'OWNER_FOOTAGE_BIND_HASH_READS'; $exitCode = 25; throw $token }
     $exitCode = 0
 } catch {
     if (-not $token) {
@@ -214,6 +229,7 @@ $linksAfter = 'unknown'
 if ($firstSource) { try { $linksAfter = (Get-AttrCudaFileIdentity -Path $firstSource).NumberOfLinks } catch { } }
 $workGone = if ($work) { -not (Test-Path -LiteralPath $work) } else { $true }
 $linkDirGone = if ($linkDir) { -not (Test-Path -LiteralPath $linkDir) } else { $true }
+if ($exitCode -eq 0 -and ($linksAfter -ne 1 -or -not $workGone -or -not $linkDirGone)) { $token = 'OWNER_FOOTAGE_BIND_CLEANUP_INCOMPLETE'; $exitCode = 26 }
 $result = if ($exitCode -eq 0) { 'OWNER_FOOTAGE_BIND_PROVEN' } else { $token }
 if ($proof) { $proof['sourceLinkCountAfterCleanup'] = $linksAfter; $proof['workTreeRemoved'] = $workGone; $proof['linkDirectoryRemoved'] = $linkDirGone }
 Write-Output "RESULT=$result CLIP=$ClipId"

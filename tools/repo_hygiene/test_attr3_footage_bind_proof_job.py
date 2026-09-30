@@ -119,6 +119,21 @@ class FootageBindProofJobTests(unittest.TestCase):
         self.assertEqual(list(self.work_root.iterdir()), [])
         self.assertEqual(os.stat(paths[0]).st_nlink, 1)
 
+    def test_success_is_gated_on_every_reported_invariant(self) -> None:
+        # sol r1 hardening: bindingMatches, hashReads and the cleanup fields are reported AND
+        # enforced -- a proof that reports one of them false must not exit 0 / say PROVEN.
+        text = (BACHELOR / "Attr3FootageBindProofJob.psm1").read_text(encoding="utf-8")
+        success_at = text.index("    $exitCode = 0\n} catch {")
+        for gate in (
+            "if (-not $bindingMatches) { $token = 'OWNER_FOOTAGE_BIND_MISMATCH'; $exitCode = 24; throw $token }",
+            "if ($hashReads -ne $verified.Count) { $token = 'OWNER_FOOTAGE_BIND_HASH_READS'; $exitCode = 25; throw $token }",
+        ):
+            self.assertIn(gate, text)
+            self.assertLess(text.index(gate), success_at, gate)
+        cleanup_gate = "if ($exitCode -eq 0 -and ($linksAfter -ne 1 -or -not $workGone -or -not $linkDirGone))"
+        self.assertIn(cleanup_gate, text)
+        self.assertLess(text.index(cleanup_gate), text.index("$result = if ($exitCode -eq 0)"))
+
 
 if __name__ == "__main__":
     unittest.main()

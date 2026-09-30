@@ -59,12 +59,12 @@ $FsCmdlets = @(
 $FsMethods = @(
     'Open', 'Dispose', 'Close', 'CopyTo', 'Flush', 'Write', 'WriteByte', 'Move', 'Delete', 'Create',
     'ReadAllBytes', 'ReadAllText', 'WriteAllText', 'WriteAllBytes',
-    'CreateFileW', 'GetFileInformationByHandle', 'CloseHandle'
+    'CreateFileW', 'GetFileInformationByHandle', 'SetFileInformationByHandle', 'CloseHandle'
 )
 # Static calls: only against a fixed, small set of I/O types -- otherwise a member NAME this
 # narrow (Open/Create/Move/...) still false-positives on an unrelated type (e.g.
 # [Security.Cryptography.SHA256]::Create()) that happens to share the method name.
-$IoStaticTypes = @('IO.File', 'IO.Directory', 'AttrCudaWin32.NativeMethods')
+$IoStaticTypes = @('IO.File', 'IO.Directory', 'AttrCudaWin32.NativeMethods', 'AttrCudaWin32.PinNativeMethods')
 # Instance calls: PowerShell's AST carries no runtime type for an arbitrary variable, so the same
 # name-only ambiguity applies (e.g. $sha256Alg.Dispose() is a hash algorithm, not a stream). Every
 # real stream/handle variable in these four files is named *Stream or exactly $handle -- an

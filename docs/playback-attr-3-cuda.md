@@ -206,6 +206,13 @@ cross volumes, so when the clip is on another volume than the job's work tree (U
 (`Resolve-AttrCudaOwnerFootageDirectory`, under `<clip drive>\mlvtmp\<job>-owner-clip`, removed at
 the end) -- nothing is copied and every guarantee above is unchanged; parts spanning more than one
 volume, or a relocation that does not land on the clip's volume, still fail closed at exit 21.
+Cleanup of that directory never trusts a path: the directory is identity-pinned when created
+(volume serial + file id, read without following a reparse point), the cleanup refuses unless it is
+still that object and neither it nor any ancestor up to the volume root is a junction or symlink,
+and it deletes only the link names this job recorded creating, by handle, while each still has a
+second name (a file with a single link is never deleted, so an app sidecar stays and keeps the
+directory). A refusal is logged path-free and leaves everything in place: a leftover link directory
+is acceptable, a deleted name of the owner's footage is not.
 `attr3-footage-presence-job.ps1 -BindProof -WorkRoot <dir>` emits a bounded job that runs exactly
 this link/hold/one-hash/binding path with no playback, for proving it on a venue. (The fixture route in
 section 4b instead requires the clip path to sit directly in the agent cache, name that clip id,

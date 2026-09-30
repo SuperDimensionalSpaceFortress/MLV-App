@@ -410,6 +410,303 @@ function Get-AttrCudaFileIdentity {
     }
 }
 
+function Initialize-AttrCudaPinNativeMethods {
+    <#
+    .SYNOPSIS
+    Define, once per process, the Win32 calls the directory pin and the by-handle link delete use.
+    .DESCRIPTION
+    UM-OWNER-FOOTAGE-CROSS-VOLUME-1 round 2. Separate from Get-AttrCudaFileIdentity's own type so
+    that function (and the tests that replace it) stay untouched. Both callers open with
+    FILE_FLAG_OPEN_REPARSE_POINT, so a junction or symlink is examined as itself and never followed.
+    #>
+    [CmdletBinding()]
+    param()
+
+    if ('AttrCudaWin32.PinNativeMethods' -as [type]) { return }
+    $definition = @'
+    [System.Runtime.InteropServices.StructLayout(System.Runtime.InteropServices.LayoutKind.Sequential)]
+    public struct PinIdentity {
+        public uint FileAttributes;
+        public uint CreationTimeLow;
+        public uint CreationTimeHigh;
+        public uint LastAccessTimeLow;
+        public uint LastAccessTimeHigh;
+        public uint LastWriteTimeLow;
+        public uint LastWriteTimeHigh;
+        public uint VolumeSerialNumber;
+        public uint FileSizeHigh;
+        public uint FileSizeLow;
+        public uint NumberOfLinks;
+        public uint FileIndexHigh;
+        public uint FileIndexLow;
+    }
+
+    [System.Runtime.InteropServices.DllImport("kernel32.dll", SetLastError = true, CharSet = System.Runtime.InteropServices.CharSet.Unicode)]
+    public static extern System.IntPtr CreateFileW(string lpFileName, uint dwDesiredAccess, uint dwShareMode, System.IntPtr lpSecurityAttributes, uint dwCreationDisposition, uint dwFlagsAndAttributes, System.IntPtr hTemplateFile);
+
+    [System.Runtime.InteropServices.DllImport("kernel32.dll", SetLastError = true)]
+    public static extern bool GetFileInformationByHandle(System.IntPtr hFile, out PinIdentity lpFileInformation);
+
+    [System.Runtime.InteropServices.DllImport("kernel32.dll", SetLastError = true)]
+    public static extern bool SetFileInformationByHandle(System.IntPtr hFile, int fileInformationClass, ref byte lpFileInformation, uint dwBufferSize);
+
+    [System.Runtime.InteropServices.DllImport("kernel32.dll", SetLastError = true)]
+    public static extern bool CloseHandle(System.IntPtr hObject);
+'@
+    Add-Type -Namespace AttrCudaWin32 -Name PinNativeMethods -MemberDefinition $definition -ErrorAction Stop
+}
+
+function Get-AttrCudaNoFollowIdentity {
+    <#
+    .SYNOPSIS
+    Volume serial, 64-bit file index, live link count and attributes of -Path, read through a
+    handle opened WITHOUT following a reparse point on the final component.
+    .DESCRIPTION
+    UM-OWNER-FOOTAGE-CROSS-VOLUME-1 round 2. Where Get-AttrCudaFileIdentity follows a junction to
+    whatever it points at, this reports the junction ITSELF (IsReparsePoint = true), so a directory
+    that was swapped for a junction is told apart from the directory that was created. Throws
+    ATTRCUDA_FILE_IDENTITY_UNAVAILABLE (never echoing -Path) on any Win32 failure.
+    #>
+    [CmdletBinding()]
+    param([Parameter(Mandatory = $true)][string]$Path)
+
+    Initialize-AttrCudaPinNativeMethods
+    $readAttributes = [uint32]0x80
+    $shareAll = [uint32]7
+    $openExisting = [uint32]3
+    $backupSemanticsOpenReparsePoint = [uint32](0x02000000 -bor 0x00200000)
+    $invalidHandle = [IntPtr]::new(-1)
+
+    $handle = [AttrCudaWin32.PinNativeMethods]::CreateFileW(
+        $Path, $readAttributes, $shareAll, [IntPtr]::Zero, $openExisting, $backupSemanticsOpenReparsePoint, [IntPtr]::Zero)
+    if ($handle -eq $invalidHandle) {
+        throw "ATTRCUDA_FILE_IDENTITY_UNAVAILABLE CreateFileW failed (Win32 error $([Runtime.InteropServices.Marshal]::GetLastWin32Error()))"
+    }
+    try {
+        $info = [AttrCudaWin32.PinNativeMethods+PinIdentity]::new()
+        if (-not [AttrCudaWin32.PinNativeMethods]::GetFileInformationByHandle($handle, [ref]$info)) {
+            throw "ATTRCUDA_FILE_IDENTITY_UNAVAILABLE GetFileInformationByHandle failed (Win32 error $([Runtime.InteropServices.Marshal]::GetLastWin32Error()))"
+        }
+        [pscustomobject]@{
+            VolumeSerialNumber = $info.VolumeSerialNumber
+            FileIndexHigh = $info.FileIndexHigh
+            FileIndexLow = $info.FileIndexLow
+            NumberOfLinks = $info.NumberOfLinks
+            IsReparsePoint = (($info.FileAttributes -band 0x400) -ne 0)
+            IsDirectory = (($info.FileAttributes -band 0x10) -ne 0)
+        }
+    } finally {
+        [void][AttrCudaWin32.PinNativeMethods]::CloseHandle($handle)
+    }
+}
+
+function Test-AttrCudaPathAncestorsHaveNoReparsePoint {
+    <#
+    .SYNOPSIS
+    True only when -Path itself and EVERY ancestor up to the volume root is a real directory
+    entry, not a junction, symlink or other reparse point.
+    .DESCRIPTION
+    UM-OWNER-FOOTAGE-CROSS-VOLUME-1 round 2. Each component is opened without following a reparse
+    point (Get-AttrCudaNoFollowIdentity). Any component that cannot be examined counts as not
+    clean: this answers "may a destructive step trust this path", so unknown is no.
+    #>
+    [CmdletBinding()]
+    param([Parameter(Mandatory = $true)][string]$Path)
+
+    try { $cursor = [IO.Path]::GetFullPath($Path) } catch { return $false }
+    if ($cursor.Length -gt 3) { $cursor = $cursor.TrimEnd('\') }
+    while (-not [string]::IsNullOrEmpty($cursor)) {
+        try { $identity = Get-AttrCudaNoFollowIdentity -Path $cursor } catch { return $false }
+        if ($identity.IsReparsePoint) { return $false }
+        $cursor = [IO.Path]::GetDirectoryName($cursor)
+    }
+    return $true
+}
+
+function Get-AttrCudaOwnerFootagePinTable {
+    <#
+    .SYNOPSIS
+    The per-process table of directory pins (script scope: the module's own when imported, the
+    job script's own when these functions are embedded).
+    #>
+    [CmdletBinding()]
+    param()
+
+    $table = Get-Variable -Name AttrCudaOwnerFootageDirectoryPins -Scope Script -ValueOnly -ErrorAction SilentlyContinue
+    if ($null -eq $table) {
+        $table = @{}
+        Set-Variable -Name AttrCudaOwnerFootageDirectoryPins -Scope Script -Value $table
+    }
+    return ,$table
+}
+
+function Get-AttrCudaOwnerFootagePinKey {
+    [CmdletBinding()]
+    param([Parameter(Mandatory = $true)][string]$Directory)
+    [IO.Path]::GetFullPath($Directory).TrimEnd('\').ToLowerInvariant()
+}
+
+function Get-AttrCudaOwnerFootageDirectoryPin {
+    <#
+    .SYNOPSIS
+    The pin recorded for -Directory when this job created it, or $null.
+    #>
+    [CmdletBinding()]
+    param([Parameter(Mandatory = $true)][string]$Directory)
+
+    $table = Get-AttrCudaOwnerFootagePinTable
+    $key = Get-AttrCudaOwnerFootagePinKey -Directory $Directory
+    if ($table.ContainsKey($key)) { return $table[$key] }
+    return $null
+}
+
+function Register-AttrCudaOwnerFootageDirectoryPin {
+    <#
+    .SYNOPSIS
+    Record the identity (volume serial + 64-bit file id, read without following a reparse point)
+    of a private link directory this job has just created, plus an empty list of the link names
+    the job creates in it. Throws if -Directory is not a real directory.
+    .DESCRIPTION
+    UM-OWNER-FOOTAGE-CROSS-VOLUME-1 round 2. Everything destructive later -- deleting a link name,
+    removing the directory -- first proves the directory it is about to act on is still THIS
+    object. A relocated directory (-Relocated) also has its whole ancestor chain checked for
+    reparse points at cleanup time.
+    #>
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $true)][string]$Directory,
+        [switch]$Relocated
+    )
+
+    $identity = Get-AttrCudaNoFollowIdentity -Path $Directory
+    if ($identity.IsReparsePoint -or -not $identity.IsDirectory) {
+        throw 'ATTRCUDA_OWNER_DIRECTORY_PIN_REFUSED the private directory is not a plain directory'
+    }
+    $pin = [pscustomobject]@{
+        VolumeSerialNumber = $identity.VolumeSerialNumber
+        FileIndexHigh = $identity.FileIndexHigh
+        FileIndexLow = $identity.FileIndexLow
+        Relocated = [bool]$Relocated
+        Links = [System.Collections.Generic.List[object]]::new()
+    }
+    $table = Get-AttrCudaOwnerFootagePinTable
+    $table[(Get-AttrCudaOwnerFootagePinKey -Directory $Directory)] = $pin
+    return $pin
+}
+
+function Test-AttrCudaOwnerFootageDirectoryPin {
+    <#
+    .SYNOPSIS
+    True only when -Directory still is the directory that was pinned: a plain directory (not a
+    junction or symlink) with the pinned volume serial and file id, and -- for a relocated
+    directory, unless -SkipAncestorCheck -- with no reparse point on any ancestor.
+    .DESCRIPTION
+    UM-OWNER-FOOTAGE-CROSS-VOLUME-1 round 2. No pin, an unreadable directory, or any difference
+    is False: the caller then leaves everything in place.
+    #>
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $true)][string]$Directory,
+        [switch]$SkipAncestorCheck
+    )
+
+    $pin = Get-AttrCudaOwnerFootageDirectoryPin -Directory $Directory
+    if ($null -eq $pin) { return $false }
+    try { $now = Get-AttrCudaNoFollowIdentity -Path $Directory } catch { return $false }
+    if ($now.IsReparsePoint -or -not $now.IsDirectory) { return $false }
+    if ($now.VolumeSerialNumber -ne $pin.VolumeSerialNumber -or
+        $now.FileIndexHigh -ne $pin.FileIndexHigh -or
+        $now.FileIndexLow -ne $pin.FileIndexLow) { return $false }
+    if ($pin.Relocated -and -not $SkipAncestorCheck) {
+        if (-not (Test-AttrCudaPathAncestorsHaveNoReparsePoint -Path $Directory)) { return $false }
+    }
+    return $true
+}
+
+function Remove-AttrCudaOwnerFootageLinkName {
+    <#
+    .SYNOPSIS
+    Delete ONE link name, bound to the file object it really is: the name is opened without
+    following a reparse point, and the deletion is requested on that same open handle only when
+    the object is a plain file, has a live link count of 2 or more, and is the very file object
+    this job created the link as (-Record). Returns a status word; deletes nothing otherwise.
+    .DESCRIPTION
+    UM-OWNER-FOOTAGE-CROSS-VOLUME-1 round 2. The handle is opened with DELETE access and without
+    FILE_SHARE_DELETE, so while it is open no other name of the file can be removed: the link
+    count read here cannot drop to 1 before the deletion lands. Statuses: DELETED, ABSENT_OR_BUSY,
+    UNREADABLE, REPARSE, DIRECTORY, LAST_NAME, NOT_CREATED_HERE, DELETE_FAILED.
+    #>
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $true)][string]$Path,
+        [Parameter(Mandatory = $true)][object]$Record
+    )
+
+    Initialize-AttrCudaPinNativeMethods
+    $deleteAndReadAttributes = [uint32](0x00010000 -bor 0x80)
+    $shareReadWrite = [uint32]3
+    $openExisting = [uint32]3
+    $backupSemanticsOpenReparsePoint = [uint32](0x02000000 -bor 0x00200000)
+    $invalidHandle = [IntPtr]::new(-1)
+
+    $handle = [AttrCudaWin32.PinNativeMethods]::CreateFileW(
+        $Path, $deleteAndReadAttributes, $shareReadWrite, [IntPtr]::Zero, $openExisting, $backupSemanticsOpenReparsePoint, [IntPtr]::Zero)
+    if ($handle -eq $invalidHandle) { return 'ABSENT_OR_BUSY' }
+    try {
+        $info = [AttrCudaWin32.PinNativeMethods+PinIdentity]::new()
+        if (-not [AttrCudaWin32.PinNativeMethods]::GetFileInformationByHandle($handle, [ref]$info)) { return 'UNREADABLE' }
+        if (($info.FileAttributes -band 0x400) -ne 0) { return 'REPARSE' }
+        if (($info.FileAttributes -band 0x10) -ne 0) { return 'DIRECTORY' }
+        if ($info.NumberOfLinks -lt 2) { return 'LAST_NAME' }
+        if ($info.VolumeSerialNumber -ne $Record.VolumeSerialNumber -or
+            $info.FileIndexHigh -ne $Record.FileIndexHigh -or
+            $info.FileIndexLow -ne $Record.FileIndexLow) { return 'NOT_CREATED_HERE' }
+        [byte]$deleteFlag = 1
+        if (-not [AttrCudaWin32.PinNativeMethods]::SetFileInformationByHandle($handle, 4, [ref]$deleteFlag, 1)) { return 'DELETE_FAILED' }
+        return 'DELETED'
+    } finally {
+        [void][AttrCudaWin32.PinNativeMethods]::CloseHandle($handle)
+    }
+}
+
+function Remove-AttrCudaOwnerFootageRecordedLinks {
+    <#
+    .SYNOPSIS
+    Delete, from -Directory, exactly the link names this job recorded creating there, each only
+    when Remove-AttrCudaOwnerFootageLinkName finds it still a second name of the same file object.
+    Never enumerates the directory, never recurses, never throws.
+    .DESCRIPTION
+    UM-OWNER-FOOTAGE-CROSS-VOLUME-1 round 2. Before each name the directory is re-proved to be the
+    pinned one (Test-AttrCudaOwnerFootageDirectoryPin, ancestors included for a relocated
+    directory); on any failure everything is left in place. A leftover link directory is
+    acceptable; a deleted name of the owner's footage is not.
+    #>
+    [CmdletBinding()]
+    param([Parameter(Mandatory = $true)][string]$Directory)
+
+    $pin = Get-AttrCudaOwnerFootageDirectoryPin -Directory $Directory
+    if ($null -eq $pin) {
+        Write-Warning 'ATTRCUDA_OWNER_DIRECTORY_NOT_PINNED links left in place'
+        return
+    }
+    foreach ($record in @($pin.Links)) {
+        if (-not (Test-AttrCudaOwnerFootageDirectoryPin -Directory $Directory)) {
+            Write-Warning 'ATTRCUDA_OWNER_DIRECTORY_PIN_MISMATCH links left in place'
+            return
+        }
+        try {
+            $status = Remove-AttrCudaOwnerFootageLinkName -Path (Join-Path $Directory $record.Name) -Record $record
+        } catch {
+            $status = 'ERROR'
+        }
+        if ($status -eq 'LAST_NAME') {
+            Write-Warning 'ATTRCUDA_OWNER_LINK_IS_LAST_NAME left in place'
+        } elseif ($status -ne 'DELETED' -and $status -ne 'ABSENT_OR_BUSY') {
+            Write-Warning "ATTRCUDA_OWNER_LINK_CLEANUP_REFUSED $status left in place"
+        }
+    }
+}
+
 function New-AttrCudaOwnerFootageLink {
     <#
     .SYNOPSIS
@@ -431,6 +728,21 @@ function New-AttrCudaOwnerFootageLink {
         [Parameter(Mandatory = $true)][string]$SourcePath
     )
 
+    # UM-OWNER-FOOTAGE-CROSS-VOLUME-1 round 2: the directory must still be the one pinned when it
+    # was created (a junction planted in its place would make this link land in another folder).
+    # A directory nobody pinned yet -- a direct caller -- is pinned now, refused if it is a
+    # junction or symlink.
+    try {
+        $pin = Get-AttrCudaOwnerFootageDirectoryPin -Directory $Directory
+        if ($null -eq $pin) {
+            $pin = Register-AttrCudaOwnerFootageDirectoryPin -Directory $Directory
+        } elseif (-not (Test-AttrCudaOwnerFootageDirectoryPin -Directory $Directory -SkipAncestorCheck)) {
+            throw 'pin mismatch'
+        }
+    } catch {
+        throw "OWNER_FOOTAGE_LINK_FAILED part $Index private directory is not the one created for this job"
+    }
+
     $directoryIdentity = Get-AttrCudaFileIdentity -Path $Directory
     try {
         $sourceIdentity = Get-AttrCudaFileIdentity -Path $SourcePath
@@ -447,6 +759,20 @@ function New-AttrCudaOwnerFootageLink {
         [void](New-Item -ItemType HardLink -Path $linkPath -Value $SourcePath -ErrorAction Stop)
     } catch {
         throw "OWNER_FOOTAGE_LINK_FAILED part $Index hard link creation failed"
+    }
+
+    # UM-OWNER-FOOTAGE-CROSS-VOLUME-1 round 2: record the file object this name IS the moment it
+    # exists, so cleanup can later delete exactly the names this job created and nothing else.
+    try {
+        $created = Get-AttrCudaNoFollowIdentity -Path $linkPath
+        [void]$pin.Links.Add([pscustomobject]@{
+            Name = $linkName
+            VolumeSerialNumber = $created.VolumeSerialNumber
+            FileIndexHigh = $created.FileIndexHigh
+            FileIndexLow = $created.FileIndexLow
+        })
+    } catch {
+        throw "OWNER_FOOTAGE_LINK_FAILED part $Index link identity could not be recorded"
     }
 
     try {
@@ -482,12 +808,15 @@ function Close-AttrCudaOwnerFootageWorkspace {
     <#
     .SYNOPSIS
     Close every held read-share handle (independently -- one failure never blocks the rest), then
-    delete ONLY the entries in -Directory whose name matches the neutral owner-footage link
-    pattern AND whose live hard-link count is still >= 2, so a link is never the last name of the
-    owner's bytes.
+    delete ONLY the link names this job recorded creating in -Directory, and only while the
+    directory is still the one pinned at creation and each name is still a second name (live
+    hard-link count >= 2) of the file object it was created as, so a link is never the last name
+    of the owner's bytes.
     .DESCRIPTION
-    ATTR3-FOOTAGE-BIND-1 PR-B round 4. Anything else in -Directory (e.g. a sidecar file the app
-    wrote while it had the footage open) is left in place for the job's normal work-tree cleanup.
+    ATTR3-FOOTAGE-BIND-1 PR-B round 4; UM-OWNER-FOOTAGE-CROSS-VOLUME-1 round 2 (recorded names,
+    pinned directory, by-handle delete -- see Remove-AttrCudaOwnerFootageRecordedLinks). Anything
+    else in -Directory (e.g. a sidecar file the app wrote while it had the footage open) is left
+    in place for the job's normal work-tree cleanup.
     Never throws: this runs in a `finally`, where an exception would mask the job's real exit
     code.
     #>
@@ -503,27 +832,10 @@ function Close-AttrCudaOwnerFootageWorkspace {
     }
 
     if ([string]::IsNullOrWhiteSpace($Directory) -or -not (Test-Path -LiteralPath $Directory)) { return }
-    $baseName = 'owner-clip'
-    $neutralPattern = '^' + $baseName + '\.(MLV|M\d{2})$'
-    $entries = @(Get-ChildItem -LiteralPath $Directory -File -ErrorAction SilentlyContinue |
-        Where-Object { $_.Name -match $neutralPattern })
-    foreach ($entry in $entries) {
-        try {
-            $identity = Get-AttrCudaFileIdentity -Path $entry.FullName
-        } catch {
-            Write-Warning 'ATTRCUDA_OWNER_LINK_IDENTITY_UNAVAILABLE_AT_CLEANUP left in place'
-            continue
-        }
-        if ($identity.NumberOfLinks -lt 2) {
-            Write-Warning 'ATTRCUDA_OWNER_LINK_IS_LAST_NAME left in place'
-            continue
-        }
-        try {
-            Remove-Item -LiteralPath $entry.FullName -Force -Confirm:$false -ErrorAction Stop
-        } catch {
-            Write-Warning "ATTRCUDA_OWNER_LINK_CLEANUP_FAILED: $($_.Exception.Message)"
-        }
-    }
+    # UM-OWNER-FOOTAGE-CROSS-VOLUME-1 round 2: no enumeration. Only the names this job recorded
+    # creating in the pinned directory are candidates, each deleted by handle and only while it is
+    # still a second name of the file object it was created as.
+    Remove-AttrCudaOwnerFootageRecordedLinks -Directory $Directory
 }
 
 function New-AttrCudaVerifiedClipBinding {
@@ -594,9 +906,13 @@ function Resolve-AttrCudaOwnerFootageDirectory {
         $preferredVolume = (Get-AttrCudaFileIdentity -Path $PreferredDirectory).VolumeSerialNumber
         $sourceVolumes = @($SourcePath | ForEach-Object { (Get-AttrCudaFileIdentity -Path $_).VolumeSerialNumber } | Select-Object -Unique)
     } catch {
+        Register-AttrCudaOwnerFootageDirectoryPinBestEffort -Directory $PreferredDirectory
         return $PreferredDirectory
     }
-    if ($sourceVolumes.Count -ne 1 -or $sourceVolumes[0] -eq $preferredVolume) { return $PreferredDirectory }
+    if ($sourceVolumes.Count -ne 1 -or $sourceVolumes[0] -eq $preferredVolume) {
+        Register-AttrCudaOwnerFootageDirectoryPinBestEffort -Directory $PreferredDirectory
+        return $PreferredDirectory
+    }
 
     $parent = $RelocatedParent
     if ([string]::IsNullOrWhiteSpace($parent)) {
@@ -610,6 +926,16 @@ function Resolve-AttrCudaOwnerFootageDirectory {
     } catch {
         throw 'OWNER_FOOTAGE_LINK_FAILED no private directory could be prepared on the source volume'
     }
+    # Pin the directory the instant it exists: cleanup later acts only on THIS directory object
+    # (volume serial + file id, read without following a reparse point), never on whatever a path
+    # names by then. A directory that cannot be pinned is not used; it is empty, so removing it
+    # non-recursively cannot touch anything else (and on a junction removes only the junction).
+    try {
+        [void](Register-AttrCudaOwnerFootageDirectoryPin -Directory $relocated -Relocated)
+    } catch {
+        try { [IO.Directory]::Delete($relocated, $false) } catch {}
+        throw 'OWNER_FOOTAGE_LINK_FAILED no private directory could be prepared on the source volume'
+    }
     $onSourceVolume = $false
     try { $onSourceVolume = ((Get-AttrCudaFileIdentity -Path $relocated).VolumeSerialNumber -eq $sourceVolumes[0]) } catch {}
     if (-not $onSourceVolume) {
@@ -619,6 +945,17 @@ function Resolve-AttrCudaOwnerFootageDirectory {
     return $relocated
 }
 
+function Register-AttrCudaOwnerFootageDirectoryPinBestEffort {
+    <#
+    .SYNOPSIS
+    Pin -Directory (the job's own work-tree link directory) without ever throwing; a directory
+    that cannot be pinned is pinned again, or refused, by New-AttrCudaOwnerFootageLink.
+    #>
+    [CmdletBinding()]
+    param([Parameter(Mandatory = $true)][string]$Directory)
+    try { [void](Register-AttrCudaOwnerFootageDirectoryPin -Directory $Directory) } catch {}
+}
+
 function Remove-AttrCudaOwnerFootageRelocatedDirectory {
     <#
     .SYNOPSIS
@@ -626,34 +963,40 @@ function Remove-AttrCudaOwnerFootageRelocatedDirectory {
     (which nothing else cleans up), without ever deleting a name of the owner's bytes.
     .DESCRIPTION
     UM-OWNER-FOOTAGE-CROSS-VOLUME-1. Call it AFTER Close-AttrCudaOwnerFootageWorkspace, which has
-    already removed every neutral link that still has a second name. What remains is either a file
-    the app wrote there (a sidecar: one link, not a reparse point, not a neutral link name) --
-    deleted -- or something this function refuses to touch: a neutral-name entry, anything with a
-    second name, a reparse point, a subdirectory. The directory itself is then removed NON-
-    recursively, so an entry that was left in place keeps the directory in place too. Never throws
-    and never recurses; every warning is path-free.
+    already removed every link name this job created that still has a second name.
+    Round 2 (sol r1 blocker: a junction substituted for this directory, or an ancestor, made the
+    per-entry checks run against the owner's own folder). Now: the directory must still be the
+    object pinned when it was created (volume serial + file id, read without following a reparse
+    point), must not be a reparse point itself, and no ancestor up to the volume root may be one;
+    any failure logs ATTRCUDA_OWNER_RELOCATED_DIRECTORY_REFUSED and leaves EVERYTHING in place.
+    Only the link names recorded at creation are ever deleted, by handle, and only while each has
+    a second name; a file with a single link is never deleted, whatever it is called -- so an app
+    sidecar stays, and keeps the directory. The directory itself is removed NON-recursively. Never
+    enumerates, never recurses, never throws; every warning is path-free. A leftover link
+    directory is acceptable; a deleted name of the owner's footage is not.
     #>
     [CmdletBinding()]
     param([Parameter(Mandatory = $true)][string]$Directory)
 
     if ([string]::IsNullOrWhiteSpace($Directory) -or -not (Test-Path -LiteralPath $Directory)) { return }
-    $neutralPattern = '^owner-clip\.(MLV|M\d{2})$'
-    foreach ($entry in @(Get-ChildItem -LiteralPath $Directory -Force -ErrorAction SilentlyContinue)) {
-        if ($entry.PSIsContainer -or ($entry.Attributes -band [IO.FileAttributes]::ReparsePoint) -or $entry.Name -match $neutralPattern) {
-            Write-Warning 'ATTRCUDA_OWNER_RELOCATED_ENTRY_LEFT_IN_PLACE'
-            continue
-        }
-        try {
-            if ((Get-AttrCudaFileIdentity -Path $entry.FullName).NumberOfLinks -ge 2) {
-                Write-Warning 'ATTRCUDA_OWNER_RELOCATED_ENTRY_HAS_SECOND_NAME left in place'
-                continue
-            }
-            Remove-Item -LiteralPath $entry.FullName -Force -Confirm:$false -ErrorAction Stop
-        } catch {
-            Write-Warning 'ATTRCUDA_OWNER_RELOCATED_ENTRY_CLEANUP_FAILED left in place'
-        }
+    # Refuse unless this is still the directory Resolve-AttrCudaOwnerFootageDirectory created:
+    # same volume serial + file id, itself not a reparse point, and no reparse point on ANY
+    # ancestor up to the volume root. Everything is then left exactly where it is.
+    if (-not (Test-AttrCudaOwnerFootageDirectoryPin -Directory $Directory)) {
+        Write-Warning 'ATTRCUDA_OWNER_RELOCATED_DIRECTORY_REFUSED identity or reparse-point check failed; nothing removed'
+        return
     }
-    try { [IO.Directory]::Delete($Directory, $false) } catch { Write-Warning 'ATTRCUDA_OWNER_RELOCATED_DIRECTORY_NOT_REMOVED' }
+    Remove-AttrCudaOwnerFootageRecordedLinks -Directory $Directory
+    if (-not (Test-AttrCudaOwnerFootageDirectoryPin -Directory $Directory)) {
+        Write-Warning 'ATTRCUDA_OWNER_RELOCATED_DIRECTORY_REFUSED identity or reparse-point check failed; nothing removed'
+        return
+    }
+    try {
+        [IO.Directory]::Delete($Directory, $false)
+        [void](Get-AttrCudaOwnerFootagePinTable).Remove((Get-AttrCudaOwnerFootagePinKey -Directory $Directory))
+    } catch {
+        Write-Warning 'ATTRCUDA_OWNER_RELOCATED_DIRECTORY_NOT_REMOVED'
+    }
 }
 
 Export-ModuleMember -Function `
@@ -664,6 +1007,17 @@ Export-ModuleMember -Function `
     Get-AttrCudaOwnerFootageNeutralName, `
     Assert-AttrCudaOwnerPartsNaming, `
     Get-AttrCudaFileIdentity, `
+    Initialize-AttrCudaPinNativeMethods, `
+    Get-AttrCudaNoFollowIdentity, `
+    Test-AttrCudaPathAncestorsHaveNoReparsePoint, `
+    Get-AttrCudaOwnerFootagePinTable, `
+    Get-AttrCudaOwnerFootagePinKey, `
+    Get-AttrCudaOwnerFootageDirectoryPin, `
+    Register-AttrCudaOwnerFootageDirectoryPin, `
+    Register-AttrCudaOwnerFootageDirectoryPinBestEffort, `
+    Test-AttrCudaOwnerFootageDirectoryPin, `
+    Remove-AttrCudaOwnerFootageLinkName, `
+    Remove-AttrCudaOwnerFootageRecordedLinks, `
     New-AttrCudaOwnerFootageLink, `
     Open-AttrCudaReadOnlyHandle, `
     New-AttrCudaVerifiedClipBinding, `

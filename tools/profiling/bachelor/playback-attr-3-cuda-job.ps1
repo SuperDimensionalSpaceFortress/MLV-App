@@ -623,7 +623,20 @@ $embeddedFunctions = $embeddedFunctions + "`r`n`r`n" + (Get-AttrCudaEmbeddedFunc
     'Close-AttrCudaOwnerFootageWorkspace',
     # UM-OWNER-FOOTAGE-CROSS-VOLUME-1: the private link directory follows the clip's volume.
     'Resolve-AttrCudaOwnerFootageDirectory',
-    'Remove-AttrCudaOwnerFootageRelocatedDirectory'
+    'Remove-AttrCudaOwnerFootageRelocatedDirectory',
+    # UM-OWNER-FOOTAGE-CROSS-VOLUME-1 round 2: the directory pin (identity + ancestor reparse-point
+    # walk, recorded link names) and the by-handle link delete the two cleanups above now use.
+    'Initialize-AttrCudaPinNativeMethods',
+    'Get-AttrCudaNoFollowIdentity',
+    'Test-AttrCudaPathAncestorsHaveNoReparsePoint',
+    'Get-AttrCudaOwnerFootagePinTable',
+    'Get-AttrCudaOwnerFootagePinKey',
+    'Get-AttrCudaOwnerFootageDirectoryPin',
+    'Register-AttrCudaOwnerFootageDirectoryPin',
+    'Register-AttrCudaOwnerFootageDirectoryPinBestEffort',
+    'Test-AttrCudaOwnerFootageDirectoryPin',
+    'Remove-AttrCudaOwnerFootageLinkName',
+    'Remove-AttrCudaOwnerFootageRecordedLinks'
 ))
 
 # --- resolve provenance locally, BEFORE the job ever touches Bachelor -------------

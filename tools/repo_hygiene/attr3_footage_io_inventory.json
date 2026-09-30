@@ -163,7 +163,7 @@
     {
       "source": "Attr3FootageStageJob.psm1::template",
       "function": "<top-level>",
-      "line": 333,
+      "line": 313,
       "kind": "cmdlet",
       "name": "Remove-Item",
       "text": "Remove-Item -LiteralPath $localPartialPath -Force -Confirm:$false -ErrorAction SilentlyContinue",
@@ -203,7 +203,7 @@
     {
       "source": "Attr3FootageStageJob.psm1::template",
       "function": "<top-level>",
-      "line": 313,
+      "line": 333,
       "kind": "cmdlet",
       "name": "Remove-Item",
       "text": "Remove-Item -LiteralPath $localPartialPath -Force -Confirm:$false -ErrorAction SilentlyContinue",
@@ -343,7 +343,7 @@
     {
       "source": "AttrCudaOwnerFootage.psm1",
       "function": "Send-AttrCudaOwnerFootagePartToStaging",
-      "line": 246,
+      "line": 268,
       "kind": "cmdlet",
       "name": "Remove-Item",
       "text": "Remove-Item -LiteralPath $partialPath -Force -Confirm:$false -ErrorAction SilentlyContinue",
@@ -373,7 +373,7 @@
     {
       "source": "AttrCudaOwnerFootage.psm1",
       "function": "Send-AttrCudaOwnerFootagePartToStaging",
-      "line": 258,
+      "line": 272,
       "kind": "cmdlet",
       "name": "Remove-Item",
       "text": "Remove-Item -LiteralPath $partialPath -Force -Confirm:$false -ErrorAction SilentlyContinue",
@@ -393,7 +393,7 @@
     {
       "source": "AttrCudaOwnerFootage.psm1",
       "function": "Send-AttrCudaOwnerFootagePartToStaging",
-      "line": 268,
+      "line": 258,
       "kind": "cmdlet",
       "name": "Remove-Item",
       "text": "Remove-Item -LiteralPath $partialPath -Force -Confirm:$false -ErrorAction SilentlyContinue",
@@ -403,7 +403,7 @@
     {
       "source": "AttrCudaOwnerFootage.psm1",
       "function": "Send-AttrCudaOwnerFootagePartToStaging",
-      "line": 272,
+      "line": 246,
       "kind": "cmdlet",
       "name": "Remove-Item",
       "text": "Remove-Item -LiteralPath $partialPath -Force -Confirm:$false -ErrorAction SilentlyContinue",
@@ -443,7 +443,7 @@
     {
       "source": "AttrCudaOwnerFootage.psm1",
       "function": "New-AttrCudaOwnerFootageLink",
-      "line": 447,
+      "line": 759,
       "kind": "cmdlet",
       "name": "New-Item",
       "text": "New-Item -ItemType HardLink -Path $linkPath -Value $SourcePath -ErrorAction Stop",
@@ -453,7 +453,7 @@
     {
       "source": "AttrCudaOwnerFootage.psm1",
       "function": "Open-AttrCudaReadOnlyHandle",
-      "line": 478,
+      "line": 804,
       "kind": "static-method",
       "name": "Open",
       "text": "[IO.File]::Open($Path, [IO.FileMode]::Open, [IO.FileAccess]::Read, [IO.FileShare]::Read)",
@@ -463,7 +463,7 @@
     {
       "source": "AttrCudaOwnerFootage.psm1",
       "function": "Close-AttrCudaOwnerFootageWorkspace",
-      "line": 502,
+      "line": 831,
       "kind": "instance-method",
       "name": "Dispose",
       "text": "$handle.Dispose()",
@@ -473,32 +473,12 @@
     {
       "source": "AttrCudaOwnerFootage.psm1",
       "function": "Close-AttrCudaOwnerFootageWorkspace",
-      "line": 505,
+      "line": 834,
       "kind": "cmdlet",
       "name": "Test-Path",
       "text": "Test-Path -LiteralPath $Directory",
       "disposition": "job-private-temp",
       "note": "Directory is the private per-job owner-footage workspace"
-    },
-    {
-      "source": "AttrCudaOwnerFootage.psm1",
-      "function": "Close-AttrCudaOwnerFootageWorkspace",
-      "line": 508,
-      "kind": "cmdlet",
-      "name": "Get-ChildItem",
-      "text": "Get-ChildItem -LiteralPath $Directory -File -ErrorAction SilentlyContinue",
-      "disposition": "job-private-temp",
-      "note": "Directory is the private per-job owner-footage workspace"
-    },
-    {
-      "source": "AttrCudaOwnerFootage.psm1",
-      "function": "Close-AttrCudaOwnerFootageWorkspace",
-      "line": 522,
-      "kind": "cmdlet",
-      "name": "Remove-Item",
-      "text": "Remove-Item -LiteralPath $entry.FullName -Force -Confirm:$false -ErrorAction Stop",
-      "disposition": "job-private-temp",
-      "note": "entry came from enumerating the private per-job workspace, matched by name AND by NumberOfLinks>=2 (never the last name of the owner's bytes)"
     },
     {
       "source": "attr3-footage-stage.ps1",
@@ -583,7 +563,7 @@
     {
       "source": "AttrCudaOwnerFootage.psm1",
       "function": "Resolve-AttrCudaOwnerFootageDirectory",
-      "line": 608,
+      "line": 924,
       "kind": "cmdlet",
       "name": "Test-Path",
       "text": "Test-Path -LiteralPath $relocated",
@@ -593,7 +573,7 @@
     {
       "source": "AttrCudaOwnerFootage.psm1",
       "function": "Resolve-AttrCudaOwnerFootageDirectory",
-      "line": 609,
+      "line": 925,
       "kind": "cmdlet",
       "name": "New-Item",
       "text": "New-Item -ItemType Directory -Path $relocated -ErrorAction Stop",
@@ -603,7 +583,7 @@
     {
       "source": "AttrCudaOwnerFootage.psm1",
       "function": "Remove-AttrCudaOwnerFootageRelocatedDirectory",
-      "line": 639,
+      "line": 981,
       "kind": "cmdlet",
       "name": "Test-Path",
       "text": "Test-Path -LiteralPath $Directory",
@@ -612,28 +592,8 @@
     },
     {
       "source": "AttrCudaOwnerFootage.psm1",
-      "function": "Remove-AttrCudaOwnerFootageRelocatedDirectory",
-      "line": 641,
-      "kind": "cmdlet",
-      "name": "Get-ChildItem",
-      "text": "Get-ChildItem -LiteralPath $Directory -Force -ErrorAction SilentlyContinue",
-      "disposition": "job-private-temp",
-      "note": "enumerates the relocated private workspace one level (no -Recurse) to classify each entry before any delete"
-    },
-    {
-      "source": "AttrCudaOwnerFootage.psm1",
-      "function": "Remove-AttrCudaOwnerFootageRelocatedDirectory",
-      "line": 651,
-      "kind": "cmdlet",
-      "name": "Remove-Item",
-      "text": "Remove-Item -LiteralPath $entry.FullName -Force -Confirm:$false -ErrorAction Stop",
-      "disposition": "job-private-temp",
-      "note": "deletes only a non-reparse, non-neutral-name file with exactly one link (an app sidecar); a neutral name, a second name, a reparse point or a subdirectory is left in place"
-    },
-    {
-      "source": "AttrCudaOwnerFootage.psm1",
       "function": "Resolve-AttrCudaOwnerFootageDirectory",
-      "line": 616,
+      "line": 936,
       "kind": "static-method",
       "name": "Delete",
       "text": "[IO.Directory]::Delete($relocated, $false)",
@@ -642,13 +602,93 @@
     },
     {
       "source": "AttrCudaOwnerFootage.psm1",
+      "function": "Resolve-AttrCudaOwnerFootageDirectory",
+      "line": 942,
+      "kind": "static-method",
+      "name": "Delete",
+      "text": "[IO.Directory]::Delete($relocated, $false)",
+      "disposition": "job-private-temp",
+      "note": "removes only the empty directory this call just created (non-recursive) when it could not be pinned or is proved to be on the wrong volume; on a junction it would remove only the junction"
+    },
+    {
+      "source": "AttrCudaOwnerFootage.psm1",
       "function": "Remove-AttrCudaOwnerFootageRelocatedDirectory",
-      "line": 656,
+      "line": 995,
       "kind": "static-method",
       "name": "Delete",
       "text": "[IO.Directory]::Delete($Directory, $false)",
       "disposition": "job-private-temp",
       "note": "removes the relocated private workspace non-recursively, so any entry left in place keeps the directory in place"
+    },
+    {
+      "source": "AttrCudaOwnerFootage.psm1",
+      "function": "Remove-AttrCudaOwnerFootageLinkName",
+      "line": 668,
+      "kind": "static-method",
+      "name": "CloseHandle",
+      "text": "[AttrCudaWin32.PinNativeMethods]::CloseHandle($handle)",
+      "disposition": "job-private-temp",
+      "note": "releases the Win32 handle; the deletion lands here"
+    },
+    {
+      "source": "AttrCudaOwnerFootage.psm1",
+      "function": "Remove-AttrCudaOwnerFootageLinkName",
+      "line": 665,
+      "kind": "static-method",
+      "name": "SetFileInformationByHandle",
+      "text": "[AttrCudaWin32.PinNativeMethods]::SetFileInformationByHandle($handle, 4, [ref]$deleteFlag, 1)",
+      "disposition": "job-private-temp",
+      "note": "the ONLY delete of a link name: requested on the very handle whose identity was just checked (plain file, link count >= 2, file id equal to the one recorded at creation), so the object checked is the object deleted"
+    },
+    {
+      "source": "AttrCudaOwnerFootage.psm1",
+      "function": "Remove-AttrCudaOwnerFootageLinkName",
+      "line": 657,
+      "kind": "static-method",
+      "name": "GetFileInformationByHandle",
+      "text": "[AttrCudaWin32.PinNativeMethods]::GetFileInformationByHandle($handle, [ref]$info)",
+      "disposition": "job-private-temp",
+      "note": "reads the opened object's own attributes, link count and file id BEFORE any deletion; refuses a reparse point, a directory, a link count below 2, or a file id that is not the one recorded at creation"
+    },
+    {
+      "source": "AttrCudaOwnerFootage.psm1",
+      "function": "Remove-AttrCudaOwnerFootageLinkName",
+      "line": 652,
+      "kind": "static-method",
+      "name": "CreateFileW",
+      "text": "[AttrCudaWin32.PinNativeMethods]::CreateFileW( $Path, $deleteAndReadAttributes, $shareReadWrite, [IntPtr]::Zero, $openEx",
+      "disposition": "job-private-temp",
+      "note": "opens ONE recorded link name without following a reparse point (DELETE + FILE_READ_ATTRIBUTES, no FILE_SHARE_DELETE); the name comes from the record New-AttrCudaOwnerFootageLink made, never from enumeration, and the caller has just re-proved the pinned directory"
+    },
+    {
+      "source": "AttrCudaOwnerFootage.psm1",
+      "function": "Get-AttrCudaNoFollowIdentity",
+      "line": 487,
+      "kind": "static-method",
+      "name": "GetFileInformationByHandle",
+      "text": "[AttrCudaWin32.PinNativeMethods]::GetFileInformationByHandle($handle, [ref]$info)",
+      "disposition": "read-only-fixed",
+      "note": "metadata-only Win32 read; see the CreateFileW row above"
+    },
+    {
+      "source": "AttrCudaOwnerFootage.psm1",
+      "function": "Get-AttrCudaNoFollowIdentity",
+      "line": 480,
+      "kind": "static-method",
+      "name": "CreateFileW",
+      "text": "[AttrCudaWin32.PinNativeMethods]::CreateFileW( $Path, $readAttributes, $shareAll, [IntPtr]::Zero, $openExisting, $backup",
+      "disposition": "read-only-fixed",
+      "note": "metadata-only Win32 read (FILE_READ_ATTRIBUTES, FILE_FLAG_OPEN_REPARSE_POINT, so a junction is examined as itself and never followed); discloses identity/attributes only, never content, and is immediately closed"
+    },
+    {
+      "source": "AttrCudaOwnerFootage.psm1",
+      "function": "Get-AttrCudaNoFollowIdentity",
+      "line": 499,
+      "kind": "static-method",
+      "name": "CloseHandle",
+      "text": "[AttrCudaWin32.PinNativeMethods]::CloseHandle($handle)",
+      "disposition": "read-only-fixed",
+      "note": "releases the Win32 handle; no data involved"
     }
   ]
 }
