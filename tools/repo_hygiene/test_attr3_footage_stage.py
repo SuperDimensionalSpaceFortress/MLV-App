@@ -27,6 +27,7 @@ import subprocess
 import tempfile
 import time
 import unittest
+from collections.abc import Iterable
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -1180,6 +1181,37 @@ class QueueWaitBoundTests(unittest.TestCase):
 # (not load-bearing here, but cheap) while removing its text from the scan.
 _PS_BLOCK_COMMENT_RX = re.compile(r"<#.*?#>", re.S)
 
+# Only a SCRIPT can build a path to um-run.ps1 and invoke it. A prose document (.md/.txt) that names
+# the file -- e.g. a review note describing its submission seam -- is not a caller, and counting it
+# turned every new design note into a false "new caller" (ATTR3-ADMIT-CONTENT-PIN-1-check-use-
+# windows.md). Restricting the scan to script suffixes narrows what counts as a document, not what
+# counts as a caller: every script that names um-run.ps1 on a non-comment line is still caught.
+_UM_RUN_CALLER_SUFFIXES = frozenset({".ps1", ".psm1", ".py", ".cmd", ".bat"})
+_BATCH_COMMENT_PREFIXES = ("rem ", "rem\t", "::")
+
+
+def _um_run_caller_paths(root: Path, rels: Iterable[str]) -> set[Path]:
+    referencing: set[Path] = set()
+    for rel in rels:
+        rel = rel.strip()
+        if not rel:
+            continue
+        if rel.startswith("tools/repo_hygiene/") or rel.startswith("tools/testing/"):
+            continue
+        path = root / rel
+        if path == UM_RUN or path.suffix.lower() not in _UM_RUN_CALLER_SUFFIXES:
+            continue
+        text = path.read_text(encoding="utf-8")
+        stripped = _PS_BLOCK_COMMENT_RX.sub(lambda m: "\n" * m.group(0).count("\n"), text)
+        for line in stripped.splitlines():
+            head = line.strip().lower()
+            if head.startswith("#") or head.startswith(_BATCH_COMMENT_PREFIXES):
+                continue
+            if "um-run.ps1" in line:
+                referencing.add(path)
+                break
+    return referencing
+
 
 @unittest.skipIf(PWSH is None, "pwsh is not on PATH")
 @unittest.skipUnless(os.name == "nt", "the emitted job targets a Windows measurement host")
@@ -1228,25 +1260,7 @@ class SameJobIdRulingPremiseTests(unittest.TestCase):
             cwd=ROOT, capture_output=True, text=True,
         )
         self.assertIn(proc.returncode, (0, 1), proc.stdout + proc.stderr)
-        referencing: set[Path] = set()
-        for rel in proc.stdout.splitlines():
-            rel = rel.strip()
-            if not rel:
-                continue
-            if rel.startswith("tools/repo_hygiene/") or rel.startswith("tools/testing/"):
-                continue
-            path = ROOT / rel
-            if path == UM_RUN:
-                continue
-            text = path.read_text(encoding="utf-8")
-            stripped = _PS_BLOCK_COMMENT_RX.sub(lambda m: "\n" * m.group(0).count("\n"), text)
-            for line in stripped.splitlines():
-                if line.strip().startswith("#"):
-                    continue
-                if "um-run.ps1" in line:
-                    referencing.add(path)
-                    break
-        return referencing
+        return _um_run_caller_paths(ROOT, proc.stdout.splitlines())
 
     def test_the_generator_is_the_only_tracked_non_test_caller_that_builds_a_path_to_um_run(self) -> None:
         callers = self._production_um_run_references()
@@ -1256,6 +1270,44 @@ class SameJobIdRulingPremiseTests(unittest.TestCase):
             "the ruled-on caller -- the round-9 same-JobId scope ruling does not cover it and "
             "must be re-examined before it is trusted for this file: " + repr(sorted(callers)),
         )
+
+    def _scan_synthetic(self, files: dict[str, str]) -> set[str]:
+        tmp_dir = tempfile.TemporaryDirectory(prefix="umrunscan-")
+        self.addCleanup(tmp_dir.cleanup)
+        tmp = Path(tmp_dir.name)
+        for rel, text in files.items():
+            (tmp / rel).parent.mkdir(parents=True, exist_ok=True)
+            (tmp / rel).write_text(text, encoding="utf-8")
+        found = _um_run_caller_paths(tmp, list(files))
+        return {p.relative_to(tmp).as_posix() for p in found}
+
+    def test_scan_catches_a_script_that_builds_a_path_to_um_run_in_code(self) -> None:
+        hits = self._scan_synthetic({
+            "tools/profiling/new-caller.ps1": "$um = Join-Path $PSScriptRoot 'um-run.ps1'\n& $um -JobId x\n",
+            "tools/profiling/new_caller.py": "UM = ROOT / 'tools' / 'profiling' / 'um-run.ps1'\n",
+            "tools/profiling/new-caller.cmd": "call um-run.ps1 -JobId x\n",
+            "tools/profiling/new-module.psm1": "function Go { & (Join-Path $R 'um-run.ps1') }\n",
+        })
+        self.assertEqual(hits, {
+            "tools/profiling/new-caller.ps1", "tools/profiling/new_caller.py",
+            "tools/profiling/new-caller.cmd", "tools/profiling/new-module.psm1",
+        })
+
+    def test_scan_ignores_prose_documents_that_only_mention_um_run(self) -> None:
+        # A .md/.txt note cannot build or invoke a path; only script files can be a caller.
+        hits = self._scan_synthetic({
+            "tools/profiling/notes.md": "`um-run.ps1` carries no hash of the job script.\n",
+            "tools/profiling/notes.txt": "see um-run.ps1 for the seam\n",
+            "tools/profiling/real-caller.ps1": "& (Join-Path $PSScriptRoot 'um-run.ps1')\n",
+        })
+        self.assertEqual(hits, {"tools/profiling/real-caller.ps1"})
+
+    def test_scan_still_ignores_script_comments_and_block_comments(self) -> None:
+        hits = self._scan_synthetic({
+            "tools/profiling/commented.ps1": "# then submit with um-run.ps1\n<#\num-run.ps1 in a doc block\n#>\n",
+            "tools/profiling/commented.cmd": "rem then submit with um-run.ps1\n:: um-run.ps1\n",
+        })
+        self.assertEqual(hits, set())
 
     def _assert_two_calls_mint_distinct_fresh_jobids(
         self, module: Path, function: str, clip_id: str, id_prefix: str, *, pass_agent_root: bool,

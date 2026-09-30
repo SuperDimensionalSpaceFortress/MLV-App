@@ -1,11 +1,16 @@
 from __future__ import annotations
 
+import ctypes
 import hashlib
+import io
 import json
 import os
+import re
 import shutil
 import subprocess
+import sys
 import tempfile
+import time
 import unittest
 from pathlib import Path
 from unittest import mock
@@ -46,6 +51,49 @@ TARGET = "1" * 40
 FEATURE = "2" * 40
 REQUIRED = ["content-self", "content-stranger-1", "content-stranger-2", "hosted-tests", "hosted-codeql"]
 ROOT = Path(__file__).resolve().parents[2]
+
+# The Windows curl-trust tests drive powershell.exe to build an ACL fixture and then to run the
+# production probe against it. A call that does not return means the property under test was NEVER
+# CHECKED -- that is UNKNOWN, not a pass and not a plain error -- so it fails as a typed
+# WindowsAclProbeUnknown carrying the partial output and the elapsed time. The only escape is the
+# named flag below, which a maintainer sets by hand on a host known to stall; CI never sets it
+# (pinned by WindowsAclProbeTimeoutTests), and using it logs a line rather than passing quietly.
+ALLOW_UNKNOWN_ACL_PROBE_ENV = "MLV_ALLOW_UNKNOWN_WINDOWS_ACL_PROBE"
+WINDOWS_ACL_PROBE_TIMEOUT_SECONDS = 180
+# Stage markers for the fixture scripts' own stderr: when a probe stalls, the partial stderr in the
+# UNKNOWN message says which statement it was inside instead of just "timed out".
+_PS_STAGE_TRACE = (
+    "$sw=[Diagnostics.Stopwatch]::StartNew();"
+    "function T($m){[Console]::Error.WriteLine('stage '+$m+' '+$sw.ElapsedMilliseconds+'ms')};"
+)
+
+
+class WindowsAclProbeUnknown(AssertionError):
+    """A powershell.exe ACL probe did not return in time: the check did not run."""
+
+
+def _run_windows_acl_probe(test: unittest.TestCase, what: str, command: list[str], *, env: dict[str, str],
+                           timeout: float = WINDOWS_ACL_PROBE_TIMEOUT_SECONDS) -> subprocess.CompletedProcess:
+    started = time.monotonic()
+    try:
+        completed = subprocess.run(
+            command, check=True, capture_output=True, text=True, timeout=timeout, env=env,
+        )
+    except subprocess.TimeoutExpired as exc:
+        def _text(value: object) -> str:
+            return value.decode("utf-8", "replace") if isinstance(value, bytes) else str(value or "")
+
+        detail = (
+            f"UNKNOWN: powershell probe '{what}' did not return within {timeout}s; the property it "
+            f"guards was NOT checked. partial stdout={_text(exc.stdout)[-600:]!r} "
+            f"partial stderr={_text(exc.stderr)[-600:]!r}"
+        )
+        if os.environ.get(ALLOW_UNKNOWN_ACL_PROBE_ENV) == "1":
+            print(f"[curl-trust] SKIPPED-UNKNOWN via {ALLOW_UNKNOWN_ACL_PROBE_ENV}=1: {detail}", file=sys.stderr)
+            test.skipTest(detail)
+        raise WindowsAclProbeUnknown(detail) from exc
+    print(f"[curl-trust] probe '{what}' returned in {time.monotonic() - started:.1f}s", file=sys.stderr)
+    return completed
 
 
 class CandidateAcceptanceTests(unittest.TestCase):
@@ -732,7 +780,13 @@ class CandidateAcceptanceTests(unittest.TestCase):
                 "tools.repo_hygiene.brokered_closeout.run_bounded_closeout_process",
                 side_effect=[unsafe, unsigned],
             ):
-                with self.assertRaisesRegex(HygieneError, "grants replacement authority"):
+                # The refusal names WHICH path grants WHICH principal what, so a failure on an
+                # unfamiliar host (an elevated CI token, a non-default C:\ ACL) is diagnosable
+                # from its own message instead of needing a re-run under a debugger.
+                with self.assertRaisesRegex(
+                    HygieneError,
+                    r"grants replacement authority.*curl\.exe: S-1-5-4 WriteData",
+                ):
                     _trusted_system_curl_identity(self.repo_root, self.config)
                 with self.assertRaisesRegex(HygieneError, "valid Microsoft signature"):
                     _trusted_system_curl_identity(self.repo_root, self.config)
@@ -744,30 +798,29 @@ class CandidateAcceptanceTests(unittest.TestCase):
             client = Path(temp) / "curl.exe"
             client.write_bytes(b"unsigned-test-client")
             add_rule = (
-                "$acl=Get-Acl -LiteralPath $env:MLVAPP_SYSTEM_CURL_PATH;"
+                _PS_STAGE_TRACE +
+                "$ErrorActionPreference='Stop';"
+                "Import-Module ($PSHOME+'\\Modules\\Microsoft.PowerShell.Security\\Microsoft.PowerShell.Security.psd1');T 'import';"
+                "$acl=Get-Acl -LiteralPath $env:MLVAPP_SYSTEM_CURL_PATH;T 'get-acl';"
                 "$sid=[System.Security.Principal.SecurityIdentifier]::new('S-1-5-4');"
                 "$rule=[System.Security.AccessControl.FileSystemAccessRule]::new("
                 "$sid,[System.Security.AccessControl.FileSystemRights]::WriteData,"
                 "[System.Security.AccessControl.AccessControlType]::Allow);"
-                "$null=$acl.AddAccessRule($rule);"
-                "Set-Acl -LiteralPath $env:MLVAPP_SYSTEM_CURL_PATH -AclObject $acl"
+                "$null=$acl.AddAccessRule($rule);T 'add-rule';"
+                "Set-Acl -LiteralPath $env:MLVAPP_SYSTEM_CURL_PATH -AclObject $acl;T 'set-acl'"
             )
             env = _minimal_system_child_environment()
             env["MLVAPP_SYSTEM_CURL_PATH"] = str(client)
-            subprocess.run(
-                [str(powershell), "-NoLogo", "-NoProfile", "-NonInteractive", "-Command", add_rule],
-                check=True,
-                capture_output=True,
-                text=True,
-                timeout=30,
-                env=env,
+            # Pinned like production and like the null-DACL fixture, so Get-Acl cannot autoload
+            # through a hosted image's large machine PSModulePath (a suspected stall source).
+            env["PSModulePath"] = r"C:\Windows\System32\WindowsPowerShell\v1.0\Modules"
+            _run_windows_acl_probe(
+                self, "enabled-group fixture: add S-1-5-4 write ACE",
+                [str(powershell), "-NoLogo", "-NoProfile", "-NonInteractive", "-Command", add_rule], env=env,
             )
-            completed = subprocess.run(
+            completed = _run_windows_acl_probe(
+                self, "enabled-group fixture: production trust script",
                 [str(powershell), "-NoLogo", "-NoProfile", "-NonInteractive", "-Command", _WINDOWS_CURL_TRUST_SCRIPT],
-                check=True,
-                capture_output=True,
-                text=True,
-                timeout=30,
                 env=env,
             )
             trust = json.loads(completed.stdout)
@@ -778,9 +831,76 @@ class CandidateAcceptanceTests(unittest.TestCase):
             self.assertFalse(parent_trust["ownerTrusted"])
             self.assertTrue(any(item["unsafeWriteGrants"] for item in trust["pathTrust"][:-1]))
 
+    @unittest.skipUnless(os.name == "nt", "Windows trust probe needs the system powershell.exe")
+    def test_trust_probe_reports_module_evidence_even_when_the_token_grants_replacement(self) -> None:
+        # The runner shape, simulated: the protected-module pinning holds but the token (an elevated
+        # admin) holds Delete on the real curl path chain. The PROBE (process + module pinning) must
+        # succeed so module-shadowing can be tested on any host, while the IDENTITY verdict must
+        # still refuse -- the ACL policy is never loosened to make a host pass.
+        from tools.repo_hygiene.candidate_acceptance import _trusted_system_curl_identity, _windows_curl_trust_probe
+
+        with tempfile.TemporaryDirectory() as temp:
+            client = Path(temp) / "curl.exe"
+            client.write_bytes(b"x")
+            root = r"C:\Windows\System32\WindowsPowerShell\v1.0\Modules"
+            chain = [
+                {"path": p, "ownerSid": "S-1-5-18", "ownerTrusted": True, "daclPresent": True,
+                 "daclNull": False, "unsafeWriteGrants": grants}
+                for p, grants in (
+                    ("C:\\", [{"sid": "S-1-5-32-544", "rights": "FullControl"}]),
+                    ("C:\\Windows", [{"sid": "S-1-5-32-544", "rights": "Modify, Synchronize"}]),
+                    ("C:\\Windows\\System32", []),
+                    (str(client), []),
+                )
+            ]
+            runner = {
+                "returncode": 0, "timedOut": False, "outputCapped": False, "cpuStalled": False, "stderr": "",
+                "stdout": json.dumps({
+                    "modulePath": r"C:\Program Files\WindowsPowerShell\Modules;" + root,
+                    "loadedModulePaths": [root + r"\Microsoft.PowerShell.Security\Microsoft.PowerShell.Security.psd1"],
+                    "signatureStatus": "Valid",
+                    "signerSubject": "CN=Microsoft Windows, O=Microsoft Corporation",
+                    "signerThumbprint": "A" * 40,
+                    "pathTrust": chain,
+                }),
+            }
+            with mock.patch(
+                "tools.repo_hygiene.candidate_acceptance._system_curl_path", return_value=client
+            ), mock.patch(
+                "tools.repo_hygiene.brokered_closeout.run_bounded_closeout_process", return_value=runner,
+            ):
+                trust = _windows_curl_trust_probe(self.repo_root, self.config, client)
+                self.assertEqual(root.casefold() + "\\microsoft.powershell.security\\microsoft.powershell.security.psd1",
+                                 trust["loadedModulePaths"][0].casefold())
+                with self.assertRaisesRegex(
+                    HygieneError, r"grants replacement authority.*C:\\: S-1-5-32-544 FullControl"
+                ):
+                    _trusted_system_curl_identity(self.repo_root, self.config)
+
+    @unittest.skipUnless(os.name == "nt", "Windows token-explained host verdict")
+    def test_windows_system_curl_host_verdict_is_explained_by_the_token(self) -> None:
+        # The REAL host chain is refused exactly when the current token is an elevated admin (the
+        # default Administrators ACEs on C:\ and C:\Windows carry Delete). A hosted runner token is
+        # elevated; a normal developer session is not. Any refusal that the elevated-Administrators
+        # grant does not explain -- a broad principal, a NULL DACL, another failure -- stays a failure.
+        from tools.repo_hygiene.candidate_acceptance import _trusted_system_curl_identity
+
+        elevated = bool(ctypes.windll.shell32.IsUserAnAdmin())
+        try:
+            _trusted_system_curl_identity(ROOT, self.config)
+        except HygieneError as exc:
+            message = str(exc)
+            self.assertIn("grants replacement authority", message, message)
+            flagged = set(re.findall(r": (S-1-[\d-]+|NULL_DACL) ", message))
+            self.assertTrue(flagged, message)
+            self.assertTrue(elevated, "refused on a NON-elevated token: " + message)
+            self.assertEqual({"S-1-5-32-544"}, flagged, message)
+        else:
+            print(f"[curl-trust] host verdict: clean (elevated={elevated})", file=sys.stderr)
+
     @unittest.skipUnless(os.name == "nt", "Windows protected-module bootstrap")
     def test_windows_system_curl_trust_rejects_user_module_shadowing(self) -> None:
-        from tools.repo_hygiene.candidate_acceptance import _trusted_system_curl_identity
+        from tools.repo_hygiene.candidate_acceptance import _windows_curl_trust_probe, _system_curl_path
 
         powershell = Path(r"C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe")
         with tempfile.TemporaryDirectory() as temp:
@@ -794,18 +914,17 @@ class CandidateAcceptanceTests(unittest.TestCase):
             )
             hostile_env = _minimal_system_child_environment()
             hostile_env["PSModulePath"] = str(attacker_root)
-            baseline = subprocess.run(
+            baseline = _run_windows_acl_probe(
+                self, "module-shadowing baseline",
                 [str(powershell), "-NoLogo", "-NoProfile", "-NonInteractive", "-Command", "@{safe=$true} | ConvertTo-Json -Compress"],
-                check=True,
-                capture_output=True,
-                text=True,
-                timeout=30,
                 env=hostile_env,
             )
             self.assertEqual('{"forged":true}', baseline.stdout.strip())
+            # The PROBE is the production process + module-pinning stage; the ACL verdict on the
+            # host's real curl chain is asserted separately (host_verdict_is_explained_by_the_token),
+            # so this defence is exercised on every host, elevated or not.
             with mock.patch.dict(os.environ, {"PSModulePath": str(attacker_root)}):
-                identity = _trusted_system_curl_identity(ROOT, self.config)
-            trust = identity["trust"]
+                trust = _windows_curl_trust_probe(ROOT, self.config, _system_curl_path())
             self.assertNotIn(str(attacker_root).casefold(), trust["modulePath"].casefold())
             protected_modules = "c:\\windows\\system32\\windowspowershell\\v1.0\\modules\\"
             self.assertTrue(all(str(path).casefold().startswith(protected_modules) for path in trust["loadedModulePaths"]))
@@ -820,29 +939,23 @@ class CandidateAcceptanceTests(unittest.TestCase):
             env["MLVAPP_SYSTEM_CURL_PATH"] = str(client)
             env["PSModulePath"] = r"C:\Windows\System32\WindowsPowerShell\v1.0\Modules"
             null_dacl = (
+                _PS_STAGE_TRACE +
                 "$ErrorActionPreference='Stop';"
-                "Import-Module ($PSHOME+'\\Modules\\Microsoft.PowerShell.Security\\Microsoft.PowerShell.Security.psd1');"
-                "$acl=Get-Acl -LiteralPath $env:MLVAPP_SYSTEM_CURL_PATH;"
+                "Import-Module ($PSHOME+'\\Modules\\Microsoft.PowerShell.Security\\Microsoft.PowerShell.Security.psd1');T 'import';"
+                "$acl=Get-Acl -LiteralPath $env:MLVAPP_SYSTEM_CURL_PATH;T 'get-acl';"
                 "$owner=([Security.Principal.NTAccount]$acl.Owner).Translate([Security.Principal.SecurityIdentifier]).Value;"
                 "$raw=[Security.AccessControl.RawSecurityDescriptor]::new(('O:{0}G:{0}' -f $owner));"
                 "[byte[]]$bytes=New-Object byte[] $raw.BinaryLength;"
-                "$raw.GetBinaryForm($bytes,0);$acl.SetSecurityDescriptorBinaryForm($bytes);"
-                "Set-Acl -LiteralPath $env:MLVAPP_SYSTEM_CURL_PATH -AclObject $acl"
+                "$raw.GetBinaryForm($bytes,0);$acl.SetSecurityDescriptorBinaryForm($bytes);T 'build-null-dacl';"
+                "Set-Acl -LiteralPath $env:MLVAPP_SYSTEM_CURL_PATH -AclObject $acl;T 'set-acl'"
             )
-            subprocess.run(
-                [str(powershell), "-NoLogo", "-NoProfile", "-NonInteractive", "-Command", null_dacl],
-                check=True,
-                capture_output=True,
-                text=True,
-                timeout=30,
-                env=env,
+            _run_windows_acl_probe(
+                self, "null-dacl fixture: strip DACL",
+                [str(powershell), "-NoLogo", "-NoProfile", "-NonInteractive", "-Command", null_dacl], env=env,
             )
-            completed = subprocess.run(
+            completed = _run_windows_acl_probe(
+                self, "null-dacl fixture: production trust script",
                 [str(powershell), "-NoLogo", "-NoProfile", "-NonInteractive", "-Command", _WINDOWS_CURL_TRUST_SCRIPT],
-                check=True,
-                capture_output=True,
-                text=True,
-                timeout=30,
                 env=env,
             )
             trust = json.loads(completed.stdout)
@@ -1502,6 +1615,53 @@ class CandidateAcceptanceTests(unittest.TestCase):
             ["git", *args], cwd=repo, check=True, text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE
         )
         return completed.stdout
+
+
+class WindowsAclProbeTimeoutTests(unittest.TestCase):
+    """A stalled powershell.exe ACL probe is UNKNOWN and fails; it never passes or vanishes quietly."""
+
+    COMMAND = ["powershell.exe", "-Command", "x"]
+
+    def _stalled(self, *, stdout: object = b"", stderr: object = b"stage get-acl 41ms"):
+        return mock.patch(
+            "tools.repo_hygiene.test_candidate_acceptance.subprocess.run",
+            side_effect=subprocess.TimeoutExpired(self.COMMAND, 3, output=stdout, stderr=stderr),
+        )
+
+    def test_a_timeout_fails_as_typed_unknown_with_partial_output(self) -> None:
+        with mock.patch.dict(os.environ, {}, clear=False) as env:
+            env.pop(ALLOW_UNKNOWN_ACL_PROBE_ENV, None)
+            with self._stalled(), self.assertRaises(WindowsAclProbeUnknown) as ctx:
+                _run_windows_acl_probe(self, "fixture", self.COMMAND, env={}, timeout=3)
+        message = str(ctx.exception)
+        self.assertIn("UNKNOWN", message)
+        self.assertIn("NOT checked", message)
+        self.assertIn("stage get-acl 41ms", message)
+        self.assertIsInstance(ctx.exception, AssertionError)  # reported as a failure, not a skip
+
+    def test_the_named_flag_skips_only_when_set_and_logs_the_skip(self) -> None:
+        for value in ("0", "", "true"):
+            with mock.patch.dict(os.environ, {ALLOW_UNKNOWN_ACL_PROBE_ENV: value}):
+                with self._stalled(), self.assertRaises(WindowsAclProbeUnknown):
+                    _run_windows_acl_probe(self, "fixture", self.COMMAND, env={}, timeout=3)
+        log = io.StringIO()
+        with mock.patch.dict(os.environ, {ALLOW_UNKNOWN_ACL_PROBE_ENV: "1"}), mock.patch("sys.stderr", log):
+            with self._stalled(), self.assertRaises(unittest.SkipTest):
+                _run_windows_acl_probe(self, "fixture", self.COMMAND, env={}, timeout=3)
+        self.assertIn("SKIPPED-UNKNOWN", log.getvalue())
+        self.assertIn(ALLOW_UNKNOWN_ACL_PROBE_ENV, log.getvalue())
+
+    def test_a_probe_that_returns_is_passed_through(self) -> None:
+        done = subprocess.CompletedProcess(self.COMMAND, 0, stdout="{}", stderr="")
+        with mock.patch("tools.repo_hygiene.test_candidate_acceptance.subprocess.run", return_value=done):
+            self.assertIs(done, _run_windows_acl_probe(self, "fixture", self.COMMAND, env={}, timeout=3))
+
+    def test_no_workflow_sets_the_skip_flag(self) -> None:
+        offenders = [
+            path.name for path in sorted((ROOT / ".github" / "workflows").glob("*.y*ml"))
+            if ALLOW_UNKNOWN_ACL_PROBE_ENV in path.read_text(encoding="utf-8")
+        ]
+        self.assertEqual([], offenders, "CI must never enable the UNKNOWN-probe skip")
 
 
 if __name__ == "__main__":
