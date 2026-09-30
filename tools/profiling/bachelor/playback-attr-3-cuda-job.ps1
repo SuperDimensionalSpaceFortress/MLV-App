@@ -597,7 +597,10 @@ $embeddedFunctions = Get-AttrCudaEmbeddedFunctionSource -Name @(
     'Get-AttrCudaMeasurementVenue',
     'Resolve-AttrCudaPreferredDisplay',
     'Get-AttrCudaDisplayDegradedState',
-    'Get-AttrCudaGuiSmokeDisplaySelection'
+    'Get-AttrCudaGuiSmokeDisplaySelection',
+    # DISPLAY-SMOKE-FAILED-LOG-PRESERVE-1: locates the display log a FAILED smoke run left behind
+    # (no result.json) and parses it with the shared parser; calls Get-AttrCudaGuiSmokeDisplaySelection.
+    'Find-AttrCudaFailedSmokeDisplayLog'
 )
 # ATTR3-FOOTAGE-BIND-1 PR-B round 4b: the private verified-part directory (one hard link per
 # verified part, under a neutral name derived from its index, so nothing downstream -- the smoke
@@ -1321,6 +1324,10 @@ function Build-AttrCudaDisplayBlock {
         # fires before the smoke log exists (SMOKE_RUN_FAILED, VENUE_NOT_QUIESCENT, ...) publishes a
         # 'pre-smoke' block -- the app never reported anything, so nothing in it was measured.
         phase = $(if ($appKnown) { 'post-smoke' } else { 'pre-smoke' })
+        # DISPLAY-SMOKE-FAILED-LOG-PRESERVE-1: the same fact as a boolean a consumer can key on. $false
+        # means the app never reported a display for this leg (its log was unavailable or unlocatable),
+        # so no field below is a measurement of the presented screen and A/B must treat it as unknown.
+        measured = $appKnown
         windowsDisplaysCollected = [bool]$WindowsInventory.collected
         windowsDisplays = $WindowsInventory.devices
         windowsDisplaysError = $WindowsInventory.error
@@ -1337,7 +1344,9 @@ function Build-AttrCudaDisplayBlock {
         # Round 3 (opus-blocker-1): the identity the smoke runner's result.json publishes and the
         # comparator consumes, from the SAME shared parser (ConvertFrom-GuiSmokeDisplayLog /
         # Get-GuiSmokeDisplayIdentity, embedded below) -- $null until the smoke log is available.
-        presentationIdentity = $(if ($appKnown) { Get-GuiSmokeDisplayIdentity -Selection $AppSelection } else { $null })
+        # A pre-smoke block carries the parser's identity-UNKNOWN record (identityUnknownReason set),
+        # not $null -- the third state a consumer keying on identityUnknownReason already understands.
+        presentationIdentity = $(Get-GuiSmokeDisplayIdentity -Selection $AppSelection)
         # Round 2 (sol PRE-REVIEW #2 BLOCKER a): how the venue's preferred monitor name was
         # resolved to the device name handed to the app (mapped|ambiguous|absent|unknown|none).
         preferredWindowsMapping = $PreferredResolution
@@ -1976,6 +1985,9 @@ if (-not $keepAliveHealthBeforeSmokeLaunch.healthy) {
 }
 $smokeRc = $null
 $smokeLaunchException = $null
+# DISPLAY-SMOKE-FAILED-LOG-PRESERVE-1: the launch instant bounds which run-log directory and lines
+# Find-AttrCudaFailedSmokeDisplayLog may consider if this run fails before writing result.json.
+$smokeLaunchedAtUtc = (Get-Date).ToUniversalTime()
 Write-JobTrace 'step smoke-launch start (app launch + load + playback)'
 try {
     & "$env:ProgramFiles\PowerShell\7\pwsh.exe" -NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -Command $cmd 1> (Join-Path $legOut 'smoke-stdout.txt') 2> (Join-Path $legOut 'smoke-stderr.txt')
@@ -2025,6 +2037,17 @@ if ($null -ne $smokeLaunchException -or $smokeRc -ne 0 -or -not (Test-Path -Lite
             $smokeLaunchExceptionMessage = $smokeLaunchExceptionMessage.Substring(0, $MaxSmokeLaunchExceptionChars)
         }
     }
+    # DISPLAY-SMOKE-FAILED-LOG-PRESERVE-1 (origin PR #191): $displayBlock here is the PRE-smoke block
+    # (phase=pre-smoke, measured=false). If the failed run DID leave the app's display log -- the
+    # runner writes it before result.json -- parse it with the same shared parser and publish the
+    # post-smoke/measured block instead. Not located unambiguously => the pre-smoke block stays,
+    # never a guess; displayLogRecovery says which and why.
+    $failedSmokeDisplayLog = Find-AttrCudaFailedSmokeDisplayLog -LegOut $legOut -LaunchedAtUtc $smokeLaunchedAtUtc
+    if ($failedSmokeDisplayLog.found) {
+        $displayBlock = Build-AttrCudaDisplayBlock -WindowsInventory $windowsDisplayInventory `
+            -Venue $measurementVenue -ExpectedWidth $expectedDisplayWidth -ExpectedHeight $expectedDisplayHeight `
+            -AppSelection $failedSmokeDisplayLog.selection -PreferredResolution $displayPreferResolution
+    }
     $smokeFailure = [ordered]@{
         schema='playback-attr-3-cuda-venue.v1'; result='SMOKE_RUN_FAILED'
         fixtureRehearsal=$FixtureRehearsal
@@ -2037,6 +2060,7 @@ if ($null -ne $smokeLaunchException -or $smokeRc -ne 0 -or -not (Test-Path -Lite
         presentMonKillError=$presentMonStop.killError
         presentMonWaitError=$presentMonStop.waitError
         display=$displayBlock
+        displayLogRecovery=[ordered]@{ found=$failedSmokeDisplayLog.found; logPath=$failedSmokeDisplayLog.logPath; reason=$failedSmokeDisplayLog.reason }
         sourceCommit=$SourceCommit; clipId=$ClipId; artifactRoot=$Pub
     }
     Save-Json $smokeFailure (Join-Path $Pub 'summary.json')

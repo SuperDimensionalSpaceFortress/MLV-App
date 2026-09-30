@@ -3249,6 +3249,87 @@ function Get-AttrCudaGuiSmokeDisplaySelection {
     ConvertFrom-GuiSmokeDisplayLog -LogText $LogText
 }
 
+function Find-AttrCudaFailedSmokeDisplayLog {
+    <#
+    .SYNOPSIS
+    DISPLAY-SMOKE-FAILED-LOG-PRESERVE-1 (origin PR #191): locates the app log a FAILED smoke run left
+    behind -- with no result.json to point at it -- and parses its display lines with the one shared
+    parser, so a SMOKE_RUN_FAILED leg can publish a post-smoke/measured display block when the app
+    really did report one.
+    .DESCRIPTION
+    run-release-gui-smoke.ps1 creates `logs-<stem>-<32-hex nonce>` next to its -Output file (the
+    job's result.json, so <stem> is 'result') and the app writes mlvapp-*.log into it; only the
+    runner's LATER result.json + `<output>.run.log` snapshot are missing after a failure. Never
+    guessed: the directory must (a) match that exact name shape, (b) have been CREATED at or after
+    the launch instant (a leftover from an earlier run is stale), and (c) be the ONLY such
+    directory (two candidates are ambiguous -- reported, not resolved by picking one). In it the
+    newest mlvapp-*.log is read (the runner's own choice) and only lines timestamped at or after the
+    launch instant (-2 s, the runner's own window) are kept. found is $true only when the parsed
+    selection carries at least one display screen, target or placement -- a log that says nothing
+    about the display leaves the caller pre-smoke. Never throws.
+    .OUTPUTS
+    [pscustomobject] { found (bool); reason (string, why not found); logPath; selection (the
+    Get-AttrCudaGuiSmokeDisplaySelection result, or $null) }.
+    #>
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$LegOut,
+
+        [Parameter(Mandatory = $true)]
+        [datetime]$LaunchedAtUtc,
+
+        [string]$ResultStem = 'result'
+    )
+
+    $result = [pscustomobject]@{ found = $false; reason = $null; logPath = $null; selection = $null }
+    try {
+        $since = $LaunchedAtUtc.ToUniversalTime().AddSeconds(-2)
+        $dirs = @()
+        if (Test-Path -LiteralPath $LegOut -PathType Container) {
+            $namePattern = '^logs-' + [regex]::Escape($ResultStem) + '-[0-9a-f]{32}$'
+            $dirs = @(Get-ChildItem -LiteralPath $LegOut -Directory -ErrorAction Stop |
+                Where-Object { $_.Name -match $namePattern -and $_.CreationTimeUtc -ge $since })
+        }
+        if ($dirs.Count -eq 0) {
+            $result.reason = 'no logs-<stem>-<nonce> directory was created since the smoke launch'
+            return $result
+        }
+        if ($dirs.Count -gt 1) {
+            $result.reason = "ambiguous: $($dirs.Count) logs-<stem>-<nonce> directories were created since the smoke launch"
+            return $result
+        }
+        $logFile = @(Get-ChildItem -LiteralPath $dirs[0].FullName -Filter 'mlvapp-*.log' -File -ErrorAction Stop |
+            Sort-Object LastWriteTimeUtc -Descending | Select-Object -First 1)
+        if ($logFile.Count -eq 0) {
+            $result.reason = 'the run log directory holds no mlvapp-*.log'
+            return $result
+        }
+        $kept = New-Object System.Collections.Generic.List[string]
+        foreach ($line in Get-Content -LiteralPath $logFile[0].FullName) {
+            $stamp = [regex]::Match([string]$line, '^\[(?<ts>[^\]]+)\]')
+            if (-not $stamp.Success) { continue }
+            $parsed = [datetime]::MinValue
+            $styles = [System.Globalization.DateTimeStyles]::AssumeUniversal -bor [System.Globalization.DateTimeStyles]::AdjustToUniversal
+            if (-not [datetime]::TryParse($stamp.Groups['ts'].Value, [System.Globalization.CultureInfo]::InvariantCulture, $styles, [ref]$parsed)) { continue }
+            if ($parsed -ge $since) { $kept.Add([string]$line) }
+        }
+        $selection = Get-AttrCudaGuiSmokeDisplaySelection -LogText ($kept.ToArray() -join "`n")
+        if (-not ($selection.screensCollected -or $null -ne $selection.target -or $null -ne $selection.placement)) {
+            $result.reason = 'the run log was located but carries no gui_smoke.display_* line since the smoke launch (display never reported)'
+            return $result
+        }
+        $result.found = $true
+        $result.logPath = $logFile[0].FullName
+        $result.selection = $selection
+    } catch {
+        $result.found = $false
+        $result.selection = $null
+        $result.reason = 'display-log recovery failed: ' + $_.Exception.GetType().Name
+    }
+    return $result
+}
+
 # CUDA-PERF-DISPLAY-WAKE-1. OWNER (2026-09-25): "if display is asleep just wake it. its just the
 # blank screensaver". Measured legs on Bachelor kept ending DISPLAY_ASLEEP (presented but
 # displayed 0) while the interactive session's blank screensaver was up. These three functions
@@ -4956,4 +5037,5 @@ Export-ModuleMember -Function `
     Get-AttrCudaMeasurementVenue, `
     Resolve-AttrCudaPreferredDisplay, `
     Get-AttrCudaDisplayDegradedState, `
-    Get-AttrCudaGuiSmokeDisplaySelection
+    Get-AttrCudaGuiSmokeDisplaySelection, `
+    Find-AttrCudaFailedSmokeDisplayLog
