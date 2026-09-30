@@ -482,18 +482,56 @@ class TargetNeverStandsInForPresentationTests(_PwshCase):
         self.assertIs(b["displayDegraded"], True)
         self.assertIn("DISPLAY=DELL RES=1920x1080@60 DEGRADED=1", b["resultTail"])
 
-    def test_a_legacy_line_with_no_presentation_field_keeps_the_target_only_when_the_app_verified_it(self) -> None:
-        legacy = ('gui_smoke.window_placement mode=fullscreen screen="LG TV" verified={v} window=0,0 2560x1440 '
+    LEGACY = ('gui_smoke.window_placement mode=fullscreen screen="{target}" verified={v} window=0,0 2560x1440 '
+              'preview=3840x2160')
+
+    def test_a_legacy_line_with_no_presentation_field_is_unknown_even_when_it_says_verified_1(self) -> None:
+        # MUTATION CAUGHT: any branch that lets the target (or a default) fill in for an absent presentation.
+        # This test used to pin the OPPOSITE (target kept when verified=1); that fallback is deleted (class
+        # scope of UM-DISPLAY-QT-WINDOWS-MAPPING-2: no target/preference/default stands in for a MEASURED
+        # presentation, anywhere).
+        for verified in (1, 0):
+            b = self.block(self.SCREENS + [_target("LG TV"), self.LEGACY.format(target="LG TV", v=verified)],
+                           enum_rows=self.INVENTORY)
+            self.assert_presentation_unknown(b)
+            self.assertIn("presentation_screen", b["presentationUnknownReason"])
+            self.assertNotIn("presentationFallbackToTarget", b)
+
+    def test_sols_r2_repro_edidless_display_and_a_legacy_verified_line_do_not_borrow_the_targets_device(self) -> None:
+        # sol r2 BLOCKER: a readable 3840x2160 Windows DISPLAY1; an EDID-less display_screen named DISPLAY1
+        # with no device= field; display_target=DISPLAY1; legacy window_placement verified=1 with no
+        # presentation_screen=. On df3b05ba this published {mapped, DISPLAY1}, displayDegraded=false and
+        # DISPLAY=DISPLAY1 RES=3840x2160@60 DEGRADED=0 -- the target standing in for an unmeasured presentation.
+        screen = (f'gui_smoke.display_screen index=0 name="{D1}" manufacturer="" model="" serial="" '
+                  'geometry=0,0 3840x2160 physical=3840x2160 dpr=1.00 refresh_hz=60.000 primary=1')
+        legacy = (f'gui_smoke.window_placement mode=fullscreen screen="{D1}" verified=1 window=0,0 3840x2160 '
                   'preview=3840x2160')
-        kept = self.block(self.SCREENS + [_target("LG TV"), legacy.format(v=1)], enum_rows=self.INVENTORY)
-        self.assertIsNone(kept["presentation"])
-        self.assertIs(kept["presentationFallbackToTarget"], True)
-        self.assertEqual(kept["presentationWindowsDevice"]["deviceName"], D2)
-        self.assertIn("DISPLAY=LG TV RES=3840x2160@60 DEGRADED=0", kept["resultTail"])
-        # verified=0 on a legacy line: the app itself says the window is NOT on the target -> unknown.
-        refused = self.block(self.SCREENS + [_target("LG TV"), legacy.format(v=0)], enum_rows=self.INVENTORY)
-        self.assert_presentation_unknown(refused)
-        self.assertIs(refused["presentationFallbackToTarget"], False)
+        b = self.block([screen, _target(D1), legacy], enum_rows=[_enum_row(D1, "Generic PnP Monitor", 3840, 2160)])
+        self.assertIsNone(b["presentation"])
+        self.assertTrue(b["presentationUnknownReason"])
+        self.assertEqual(b["presentationWindowsDevice"]["status"], "unknown")
+        self.assertIsNone(b["presentationWindowsDevice"]["deviceName"])
+        self.assertIsNone(b["presentationWindowsDevice"]["monitorName"])
+        self.assertEqual(b["displayDegraded"], "unknown")
+        self.assertIn("DISPLAY=unknown RES=unknown DEGRADED=unknown", b["resultTail"])
+        self.assertNotIn("presentationFallbackToTarget", b)
+        # The target block is still reported AS the target; it is only barred from being the presentation.
+        self.assertEqual(b["target"]["name"], D1)
+
+    def test_the_result_tail_reads_only_the_presentation_never_the_target(self) -> None:
+        # A block whose presentation is null but which carries a resolvable target (and even a stale
+        # fallback flag from an older writer) must still read UNKNOWN in the tail.
+        job_text = JOB_SCRIPT.read_text(encoding="utf-8").replace("\r\n", "\n")
+        tail = _extract_function(job_text, "Get-AttrCudaDisplayResultTail")
+        out = self._json(
+            tail + "\n"
+            "$b = [ordered]@{ presentation = $null; presentationFallbackToTarget = $true\n"
+            "    target = [ordered]@{ name = 'LG TV'; width = 3840; height = 2160; refreshHz = 60 }\n"
+            "    displayDegraded = $false; preview = $null; preferredMatched = 'none' }\n"
+            "ConvertTo-Json -InputObject ([pscustomobject]@{ tail = (Get-AttrCudaDisplayResultTail $b) }) -Compress\n"
+        )
+        self.assertTrue(out["tail"].startswith("DISPLAY=unknown RES=unknown "), out["tail"])
+        self.assertNotIn("LG TV", out["tail"])
 
     def test_no_window_placement_line_at_all_leaves_the_presentation_unknown_not_the_target(self) -> None:
         b = self.block(self.SCREENS + [_target("LG TV")], enum_rows=self.INVENTORY)
