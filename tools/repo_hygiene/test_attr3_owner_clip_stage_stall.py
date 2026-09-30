@@ -499,7 +499,7 @@ class CompleteChainSingleReadTests(_PwshCase):
         # PLAYBACK-CLIP-LENGTH-ENFORCE-1: the REAL runner now reads the first part's 52-byte header and
         # refuses anything that is not a >= 20 s clip before it hashes or launches. This test is about how
         # many times the BYTES are read, so part 0 carries a genuine ~30 s header in front of its random body.
-        self.data = [mlvi_header(FRAMES_30S_AT_23976) + os.urandom(700_000), os.urandom(4_321)]
+        self.data = [mlvi_header(FRAMES_30S_AT_23976) + os.urandom(700_000 - 52), os.urandom(4_321)]
         self.parts = [
             self.clip_dir / ("owner-clip" + _BASE_EXT),
             self.clip_dir / ("owner-clip" + _CONT_EXT),

@@ -310,7 +310,7 @@ PLAYBACK_LAUNCH_ALLOWLIST: dict[str, str] = {
 }
 
 GATE_CALL = re.compile(r"Test-GuiSmokeClipLength\b")
-GATE_SOURCE = re.compile(r"gui-smoke-clip-length\.ps1")
+GATE_SOURCE = re.compile(r"gui-smoke-length-gate\.ps1")
 # A playback LAUNCH: the smoke-playback verb used as an argument. `--gui-smoke-playback --help` is the
 # feature probe (answered by the app without playing anything) and a comment mentions the word freely.
 LAUNCH_TOKEN = re.compile(r"--gui-smoke-playback(?!\s+--help)")

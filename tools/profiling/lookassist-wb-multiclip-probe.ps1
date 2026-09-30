@@ -42,8 +42,9 @@ elseif (Test-Path $ClipDir) {
         Sort-Object Length | Select-Object -First $MaxClips -Expand FullName
 }
 if ($IncludeFixture) {
-    $fx = Join-Path $repoRoot "tests\fixtures\clips\large_dual_iso.mlv"
-    if (Test-Path $fx) { $clipList = @($fx) + $clipList }
+    # PLAYBACK-CLIP-LENGTH-ENFORCE-1 (owner rule 2026-09-30): the tracked fixture is 16 frames (0.67 s) and
+    # is never PLAYED; run-release-gui-smoke.ps1 would refuse it (CLIP_TOO_SHORT) and looping it is forbidden.
+    throw "-IncludeFixture is refused: the tracked fixture is far under 20 s (CLIP_TOO_SHORT); pass real >= 20 s footage via -Clips."
 }
 if (-not $clipList -or $clipList.Count -eq 0) { throw "No clips found (-Clips or -ClipDir '$ClipDir')." }
 
