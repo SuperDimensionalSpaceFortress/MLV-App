@@ -108,6 +108,9 @@ jobs:
       - name: Check pinned instruction tokens
         run: python tools/docs/check_pinned_tokens.py
 
+      - name: K9 pushed-tree resumability witness
+        run: python -m tools.repo_hygiene.k9_witness tree HEAD
+
       - name: Run coordination and self-healing guardrails
         if: runner.os == 'Windows'
         shell: pwsh
