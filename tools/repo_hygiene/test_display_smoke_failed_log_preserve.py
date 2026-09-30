@@ -105,6 +105,8 @@ class _ProbeCase(unittest.TestCase):
         script = self.tmp / "probe.ps1"
         script.write_text(
             "$ErrorActionPreference = 'Stop'\n"
+            # $env:TEMP is null on Linux: hand the probe the test's own temp dir instead.
+            f"$TestTmp = '{self.tmp}'\n"
             f"Import-Module '{MODULE}' -Force\n" + body,
             encoding="utf-8",
         )
@@ -118,7 +120,7 @@ class _ProbeCase(unittest.TestCase):
 # PowerShell fragment: a leg output dir, a launch instant a second in the past, and a helper that
 # writes an app log (timestamped NOW, i.e. after the launch instant) into a nonced logs dir.
 _LEG_SETUP = r"""
-$legOut = Join-Path $env:TEMP ('leg-' + [Guid]::NewGuid().ToString('N'))
+$legOut = Join-Path $TestTmp ('leg-' + [Guid]::NewGuid().ToString('N'))
 New-Item -ItemType Directory -Path $legOut | Out-Null
 $launched = (Get-Date).ToUniversalTime().AddSeconds(-1)
 function New-AppLog([string]$Nonce, [string[]]$Payloads, [string]$Name = 'mlvapp-1.log', [double]$AgeSeconds = 0) {
@@ -171,11 +173,15 @@ class FindFailedSmokeDisplayLogTests(_ProbeCase):
         self.assertIn("ambiguous", out["reason"])
 
     def test_a_directory_that_predates_the_launch_is_stale_never_used(self) -> None:
-        # MUTATION CAUGHT: dropping the creation-time-after-launch guard.
-        body = (f"$d = New-AppLog '{NONCE_A}' {_ps_lines(list(DISPLAY_LINES))}\n"
-                "(Get-Item -LiteralPath $d).CreationTimeUtc = (Get-Date).ToUniversalTime().AddHours(-2)\n")
+        # MUTATION CAUGHT: dropping the creation-time-after-launch guard. The launch instant is moved
+        # two hours AFTER the directory was created (setting CreationTimeUtc is a no-op on Linux, so
+        # the directory's own time is never edited). The reason text pins WHICH guard refused it: with
+        # the directory guard gone the per-line window would still refuse, but with a different reason.
+        body = (f"[void](New-AppLog '{NONCE_A}' {_ps_lines(list(DISPLAY_LINES))})\n"
+                "$launched = (Get-Date).ToUniversalTime().AddHours(2)\n")
         out = self.find(body)
         self.assertFalse(out["found"], out)
+        self.assertIn("no logs-", out["reason"])
 
     def test_log_lines_older_than_the_launch_are_excluded(self) -> None:
         # MUTATION CAUGHT: dropping the per-line timestamp window (the app log can rotate/aggregate).
