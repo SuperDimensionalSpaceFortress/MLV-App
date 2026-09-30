@@ -548,7 +548,10 @@ class TemplateDisplayBlockExecutionTests(_ProbeCase):
             "    target = [ordered]@{ name='\\\\.\\DISPLAY1'; reason='max_physical_pixels'; candidates=1; fallback=$false }\n"
             "    targetError = $null\n"
             "    placement = [ordered]@{ mode='fullscreen'; previewWidth=3840; previewHeight=2160; "
-            "verified=$true; targetScreenName='X'; presentationScreenName='X'; "
+            # Round 2: the presentation must NAME the screen it presented on. This fixture used to say 'X'
+            # (a name no display_screen line carries) and passed only because the target silently stood in
+            # for the unresolved presentation -- the very fallback sol's r1 blocker removed.
+            "verified=$true; targetScreenName='\\\\.\\DISPLAY1'; presentationScreenName='\\\\.\\DISPLAY1'; "
             "presentationPhysicalWidth=3840; presentationPhysicalHeight=2160 }\n"
             "    placementError = $null\n"
             "}\n"

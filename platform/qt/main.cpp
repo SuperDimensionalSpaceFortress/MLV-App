@@ -1333,7 +1333,7 @@ static int runGuiPlaybackSmoke(QApplication &app)
     // friendly name on a monitor that has one, not the GDI name (UM-DISPLAY-QT-WINDOWS-MAPPING-PROOF-1).
     const QCommandLineOption displayPreferOpt(
         QStringLiteral("display-prefer"),
-        QStringLiteral("Case-insensitive substring (matched against name/model/manufacturer) that tie-breaks among displays already tied for the most physical pixels. No effect on the pixel comparison itself."),
+        QStringLiteral("Case-insensitive substring (matched against name/model/manufacturer), or a Windows GDI device name (\\\\.\\DISPLAYn) compared for equality with the device derived for each screen, that tie-breaks among displays already tied for the most physical pixels. No effect on the pixel comparison itself."),
         QStringLiteral("substring"));
     parser.addOption(displayPreferOpt);
 

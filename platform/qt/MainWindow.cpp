@@ -23722,7 +23722,8 @@ bool MainWindow::enterPlaybackSmokeFullscreen( QScreen *target )
     }
 
     const bool verified = mainVerified && gpuVerified;
-    if( !presentationScreen ) presentationScreen = QApplication::primaryScreen();
+    // UM-DISPLAY-QT-WINDOWS-MAPPING-PROOF-1 round 2: no screen at all is logged as "none" / 0x0 below,
+    // never replaced by the primary screen -- a default must not stand in for a measured presentation.
     const double presentationDpr = presentationScreen ? presentationScreen->devicePixelRatio() : 1.0;
     const QSize presentationPhysical = presentationScreen
         ? QSize( qRound( presentationScreen->geometry().width() * presentationDpr ),

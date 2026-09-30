@@ -284,7 +284,7 @@ JOB_SCRIPT = ROOT / "tools" / "profiling" / "bachelor" / "playback-attr-3-cuda-j
 
 
 def _extract_function(text: str, name: str) -> str:
-    start = text.index(f"function {name} {{")
+    start = re.search(rf"^function {re.escape(name)}\b", text, re.M).start()
     depth = 0
     i = text.index("{", start)
     j = i
@@ -307,17 +307,19 @@ class JobPresentationDeviceMappingTests(_PwshCase):
     'unknown'. It now maps by the app's derived `device`, with the name as a fallback only when the
     name itself is a GDI device name -- and anything else stays 'unmapped' / 'unknown'."""
 
-    def block(self, lines: list[str], venue: str = "ultra-magnus") -> dict:
+    def block(self, lines: list[str], venue: str = "ultra-magnus", enum_rows: list | None = None) -> dict:
         log = self.tmp / "smoke.log"
         log.write_text("\n".join(lines) + "\n", encoding="utf-8")
         enum = self.tmp / "enum.json"
-        enum.write_text(json.dumps(_json_section("ENUM_DISPLAY_DEVICES")), encoding="utf-8")
+        rows = enum_rows if enum_rows is not None else _json_section("ENUM_DISPLAY_DEVICES")
+        enum.write_text(json.dumps(rows), encoding="utf-8")
         job_text = JOB_SCRIPT.read_text(encoding="utf-8").replace("\r\n", "\n")
         build = _extract_function(job_text, "Build-AttrCudaDisplayBlock")
+        tail = _extract_function(job_text, "Get-AttrCudaDisplayResultTail")
         return self._json(
             f"Import-Module '{MODULE}' -Force\n"
             f". '{SHARED}'\n"
-            + build + "\n"
+            + build + "\n" + tail + "\n"
             f"$rows = @(Get-Content -Raw '{enum}' | ConvertFrom-Json)\n"
             "$devices = @($rows | Where-Object { $_.attached } | ForEach-Object {\n"
             "    [pscustomobject]@{ deviceName = $_.deviceName; monitorName = $_.monitors[0].deviceString\n"
@@ -325,6 +327,7 @@ class JobPresentationDeviceMappingTests(_PwshCase):
             "$inv = [pscustomobject]@{ collected = $true; devices = $devices; error = $null }\n"
             f"$sel = Get-AttrCudaGuiSmokeDisplaySelection -LogText ([IO.File]::ReadAllText('{log}'))\n"
             f"$b = Build-AttrCudaDisplayBlock -WindowsInventory $inv -Venue '{venue}' -ExpectedWidth 3840 -ExpectedHeight 2160 -AppSelection $sel\n"
+            "$b['resultTail'] = Get-AttrCudaDisplayResultTail $b\n"
             "ConvertTo-Json -InputObject $b -Depth 8 -Compress\n"
         )
 
@@ -368,6 +371,133 @@ class JobPresentationDeviceMappingTests(_PwshCase):
         b = self.block([line, _target(D1), _placement(D1)])
         self.assertEqual(b["presentationWindowsDevice"]["status"], "unmapped")
         self.assertEqual(b["displayDegraded"], "unknown")
+
+
+def _split_placement(target: str, presentation: str, physical: str, verified: int = 0) -> str:
+    return (
+        f'gui_smoke.window_placement mode=fullscreen screen="{target}" verified={verified} window=0,0 2560x1440 '
+        f'preview={physical} target_screen="{target}" presentation_screen="{presentation}" '
+        f'presentation_physical={physical}'
+    )
+
+
+def _screen(index: int, name: str, model: str, serial: str, geometry: str, physical: str, device: str,
+            refresh: str = "60.000") -> str:
+    return (
+        f'gui_smoke.display_screen index={index} name="{name}" manufacturer="ASUSTek COMPUTER INC" '
+        f'model="{model}" serial="{serial}" geometry={geometry} physical={physical} dpr=1.00 '
+        f'refresh_hz={refresh} primary={1 if index == 0 else 0} device="{device}"'
+    )
+
+
+def _enum_row(device: str, monitor: str, width: int, height: int) -> dict:
+    return {"deviceName": device, "attached": True, "primary": False, "modeCollected": True, "posX": 0,
+            "posY": 0, "width": width, "height": height, "refreshHz": 60,
+            "monitors": [{"deviceName": device + "\\Monitor0", "deviceString": monitor}]}
+
+
+D3 = "\\\\.\\DISPLAY3"
+
+
+@requires_pwsh
+class TargetNeverStandsInForPresentationTests(_PwshCase):
+    """Round 2 (sol r1 BLOCKER): an ambiguous or unmapped PRESENTATION stays UNKNOWN. The intended
+    TARGET is where the leg was meant to run, not where it ran -- it may be a different, unique screen
+    with its own Windows device and its own (passing) resolution, so letting it fill in for an
+    unresolved presentation publishes a wrong device and a not-degraded verdict."""
+
+    # sol's exact 3-display repro: one unique LG TV (3840x2160, DISPLAY2) and two same-model PA329C
+    # screens at 1920x1080 (DISPLAY1 / DISPLAY3) that share a Qt name, so the name cannot say which one
+    # presented.
+    SCREENS = [
+        _screen(0, "LG TV", "LG TV", "16843009", "0,0 3840x2160", "3840x2160", D2),
+        _screen(1, "PA329C", "PA329C", "SERIALONE", "3840,0 1920x1080", "1920x1080", D1),
+        _screen(2, "PA329C", "PA329C", "SERIALTWO", "5760,0 1920x1080", "1920x1080", D3),
+    ]
+    INVENTORY = [
+        _enum_row(D1, "ASUS PA329C(DisplayPort)", 1920, 1080),
+        _enum_row(D2, "Generic PnP Monitor", 3840, 2160),
+        _enum_row(D3, "ASUS PA329C(DisplayPort)", 1920, 1080),
+    ]
+
+    block = JobPresentationDeviceMappingTests.block  # the same executed-job harness, without re-running its tests
+
+    def three(self, placement: str) -> dict:
+        return self.block(self.SCREENS + [_target("LG TV"), placement], enum_rows=self.INVENTORY)
+
+    def assert_presentation_unknown(self, b: dict) -> None:
+        self.assertIsNone(b["presentation"])
+        self.assertTrue(b["presentationUnknownReason"])
+        self.assertNotEqual(b["presentationWindowsDevice"]["status"], "mapped")
+        self.assertIsNone(b["presentationWindowsDevice"]["deviceName"])
+        self.assertIsNone(b["presentationWindowsDevice"]["monitorName"])
+        self.assertEqual(b["displayDegraded"], "unknown")
+        self.assertIn("DISPLAY=unknown RES=unknown DEGRADED=unknown", b["resultTail"])
+        self.assertNotIn("LG TV", b["resultTail"])
+
+    def test_sols_repro_an_ambiguous_presentation_does_not_borrow_the_targets_device_or_verdict(self) -> None:
+        # MUTATION CAUGHT: $effectiveBlock / $effectiveRecord falling back to the target. Before the fix
+        # this published presentationWindowsDevice={mapped, DISPLAY2} and displayDegraded=false.
+        b = self.three(_split_placement("LG TV", "PA329C", "1920x1080", verified=0))
+        self.assert_presentation_unknown(b)
+        self.assertIn("shared by 2 attached screens", b["presentationUnknownReason"])
+        # The target itself is still reported as the target -- it is only barred from being the presentation.
+        self.assertEqual(b["target"]["name"], "LG TV")
+
+    def test_an_unmapped_presentation_no_display_screen_line_stays_unknown_not_the_target(self) -> None:
+        b = self.three(_split_placement("LG TV", "Ghost Monitor", "1920x1080", verified=0))
+        self.assert_presentation_unknown(b)
+
+    def test_a_presentation_screen_logged_as_none_stays_unknown_not_the_target(self) -> None:
+        b = self.three(_split_placement("LG TV", "none", "0x0", verified=0))
+        self.assert_presentation_unknown(b)
+
+    def test_a_presentation_equal_to_the_target_is_that_screen_and_maps_to_its_device(self) -> None:
+        b = self.three(_split_placement("LG TV", "LG TV", "3840x2160", verified=1))
+        self.assertEqual(b["presentation"]["name"], "LG TV")
+        self.assertEqual(b["presentationWindowsDevice"]["status"], "mapped")
+        self.assertEqual(b["presentationWindowsDevice"]["deviceName"], D2)
+        self.assertIs(b["displayDegraded"], False)
+        self.assertIn("DISPLAY=LG TV RES=3840x2160@60 DEGRADED=0", b["resultTail"])
+
+    def test_a_presentation_mapped_uniquely_by_the_origin_and_size_derivation_uses_its_own_device(self) -> None:
+        # Two attached screens with distinct names (the recorded UM topology): the leg was meant for the
+        # LG TV but presented on the PA329C. The PA329C's own derived device and size are published --
+        # not the LG TV's.
+        b = self.block(_qt_screen_lines() + [_target("LG TV"), _split_placement("LG TV", "PA329C", "3840x2160")])
+        self.assertEqual(b["presentation"]["name"], "PA329C")
+        self.assertEqual(b["presentationWindowsDevice"]["status"], "mapped")
+        self.assertEqual(b["presentationWindowsDevice"]["deviceName"], D1)
+        self.assertEqual(b["presentationWindowsDevice"]["monitorName"], "ASUS PA329C(DisplayPort)")
+        self.assertIn("DISPLAY=PA329C RES=3840x2160@59.997", b["resultTail"])
+
+    def test_the_presentations_own_small_resolution_is_degraded_even_when_the_target_is_4k(self) -> None:
+        # The presentation resolves uniquely (a third, distinctly named 1080p screen); the verdict is about
+        # THAT screen (degraded), not the 4K target it was supposed to be on.
+        screens = self.SCREENS[:1] + [_screen(1, "DELL", "DELL", "D1", "3840,0 1920x1080", "1920x1080", D1)]
+        inventory = [_enum_row(D1, "Dell", 1920, 1080), _enum_row(D2, "Generic PnP Monitor", 3840, 2160)]
+        b = self.block(screens + [_target("LG TV"), _split_placement("LG TV", "DELL", "1920x1080")],
+                       enum_rows=inventory)
+        self.assertEqual(b["presentationWindowsDevice"]["deviceName"], D1)
+        self.assertIs(b["displayDegraded"], True)
+        self.assertIn("DISPLAY=DELL RES=1920x1080@60 DEGRADED=1", b["resultTail"])
+
+    def test_a_legacy_line_with_no_presentation_field_keeps_the_target_only_when_the_app_verified_it(self) -> None:
+        legacy = ('gui_smoke.window_placement mode=fullscreen screen="LG TV" verified={v} window=0,0 2560x1440 '
+                  'preview=3840x2160')
+        kept = self.block(self.SCREENS + [_target("LG TV"), legacy.format(v=1)], enum_rows=self.INVENTORY)
+        self.assertIsNone(kept["presentation"])
+        self.assertIs(kept["presentationFallbackToTarget"], True)
+        self.assertEqual(kept["presentationWindowsDevice"]["deviceName"], D2)
+        self.assertIn("DISPLAY=LG TV RES=3840x2160@60 DEGRADED=0", kept["resultTail"])
+        # verified=0 on a legacy line: the app itself says the window is NOT on the target -> unknown.
+        refused = self.block(self.SCREENS + [_target("LG TV"), legacy.format(v=0)], enum_rows=self.INVENTORY)
+        self.assert_presentation_unknown(refused)
+        self.assertIs(refused["presentationFallbackToTarget"], False)
+
+    def test_no_window_placement_line_at_all_leaves_the_presentation_unknown_not_the_target(self) -> None:
+        b = self.block(self.SCREENS + [_target("LG TV")], enum_rows=self.INVENTORY)
+        self.assert_presentation_unknown(b)
 
 
 if __name__ == "__main__":

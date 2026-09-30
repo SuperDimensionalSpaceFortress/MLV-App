@@ -298,7 +298,8 @@ function Get-GuiSmokeDisplayIdentity {
     for a display with no EDID descriptor, and two different displays that reuse one device name
     would then agree on every "field" and compare 'same'. Empty means identity UNKNOWN, so the
     comparison is refused and the reason names the empty fields. When two display_screen lines
-    carry the same name (case-insensitively) the LAST one wins (Find-GuiSmokeDisplayScreen).
+    carry the same name (case-insensitively) at the SAME index the LAST one wins; at DISTINCT
+    indexes the name is ambiguous and the identity is unknown (Find-GuiSmokeDisplayScreen).
     .OUTPUTS
     [pscustomobject] { presentationScreenName; presentationManufacturer; presentationModel;
     presentationSerial; physicalWidth; physicalHeight; refreshHzRounded; dpr; windowMode;
