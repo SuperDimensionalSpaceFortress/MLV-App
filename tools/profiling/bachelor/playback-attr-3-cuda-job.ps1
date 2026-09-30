@@ -620,7 +620,10 @@ $embeddedFunctions = $embeddedFunctions + "`r`n`r`n" + (Get-AttrCudaEmbeddedFunc
     'Open-AttrCudaReadOnlyHandle',
     # BACHELOR-OWNER-CLIP-STAGE-STALL-1 round 1f: the runner's carried-identity file (see its header).
     'New-AttrCudaVerifiedClipBinding',
-    'Close-AttrCudaOwnerFootageWorkspace'
+    'Close-AttrCudaOwnerFootageWorkspace',
+    # UM-OWNER-FOOTAGE-CROSS-VOLUME-1: the private link directory follows the clip's volume.
+    'Resolve-AttrCudaOwnerFootageDirectory',
+    'Remove-AttrCudaOwnerFootageRelocatedDirectory'
 ))
 
 # --- resolve provenance locally, BEFORE the job ever touches Bachelor -------------
@@ -826,6 +829,10 @@ $VerifiedClipBindingPath = ''
 # ATTR3-FOOTAGE-BIND-1 PR-B round 4: set by the owner branch below; stays $null/empty for a
 # fixture run, so the `finally` around the smoke run further down is a no-op for one.
 $OwnerClipDir = $null
+$OwnerClipRelocated = $false
+# Empty in production (the relocated directory then sits under '<clip drive root>mlvtmp'); a test
+# sets it to keep the relocation inside its own temp tree.
+$OwnerClipRelocatedParent = ''
 $ownerLinkHandles = [System.Collections.Generic.List[object]]::new()
 
 # --- verifiers, embedded VERBATIM from tools/profiling/bachelor/AttrCudaArtifacts.psm1 --------
@@ -1544,6 +1551,29 @@ if ($FixtureRehearsal) {
     }
 
     $OwnerClipDir = New-AttrCudaDirectory -Path (Join-Path $Work 'owner-clip')
+    # UM-OWNER-FOOTAGE-CROSS-VOLUME-1: a hard link cannot cross volumes, and the consent-pinned clip
+    # can sit on another volume than this job's work tree (Ultra-Magnus: clip on C:, work tree on
+    # G:). The private link directory then lives on the CLIP's volume instead -- nothing is copied
+    # and the same-file-object proof, the held read-share handle and the single identity hash
+    # below are unchanged; New-AttrCudaOwnerFootageLink still refuses any part that ends up on a
+    # different volume than its directory.
+    try {
+        $ownerLinkDirectory = Resolve-AttrCudaOwnerFootageDirectory -PreferredDirectory $OwnerClipDir -SourcePath @($ownerAssertedParts | ForEach-Object { $_.path }) -RelocatedParent $OwnerClipRelocatedParent
+    } catch {
+        $dirToken = (([string]$_.Exception.Message) -split '\s+')[0]
+        if ($dirToken -ne 'OWNER_FOOTAGE_LINK_CROSS_VOLUME') { $dirToken = 'OWNER_FOOTAGE_LINK_FAILED' }
+        $dirRefusal = [ordered]@{
+            schema='playback-attr-3-cuda-venue.v1'; result=$dirToken
+            fixtureRehearsal=$FixtureRehearsal
+            displayWake=$displayWake
+            sourceCommit=$SourceCommit; clipId=$ClipId; artifactRoot=$Pub
+        }
+        Save-Json $dirRefusal (Join-Path $Pub 'summary.json')
+        Write-Output "RESULT=$dirToken ARTIFACTS=$Pub"
+        exit $(if ($dirToken -eq 'OWNER_FOOTAGE_LINK_CROSS_VOLUME') { 21 } else { 22 })
+    }
+    if ($ownerLinkDirectory -ne $OwnerClipDir) { $OwnerClipRelocated = $true }
+    $OwnerClipDir = $ownerLinkDirectory
     $ownerVerifiedParts = [System.Collections.Generic.List[object]]::new()
     # ATTR3-FOOTAGE-BIND-1 PR-B round 5 (astra major): the cleanup `try` now wraps this ENTIRE
     # loop -- creating every link, opening every held handle, and re-verifying every link's
@@ -1586,6 +1616,7 @@ if ($FixtureRehearsal) {
         # link entries that exist with a live link count >= 2 -- never throws, so the refusal
         # below is always reached.
         Close-AttrCudaOwnerFootageWorkspace -Handles $ownerLinkHandles -Directory $OwnerClipDir
+        if ($OwnerClipRelocated) { Remove-AttrCudaOwnerFootageRelocatedDirectory -Directory $OwnerClipDir }
         $message = $_.Exception.Message
         if ($message -match '^OWNER_FOOTAGE_NOT_VERIFIED status=(\S+)$') {
             $relinkRefusal = [ordered]@{
@@ -2760,6 +2791,7 @@ exit 0
 } finally {
     if ($OwnerClipDir) {
         Close-AttrCudaOwnerFootageWorkspace -Handles $ownerLinkHandles -Directory $OwnerClipDir
+        if ($OwnerClipRelocated) { Remove-AttrCudaOwnerFootageRelocatedDirectory -Directory $OwnerClipDir }
     }
     # CUDA-PERF-DISPLAY-WAKE-2: stop the periodic keep-alive first -- releases its background
     # Runspace -- before releasing the execution-state request itself, on every exit path from

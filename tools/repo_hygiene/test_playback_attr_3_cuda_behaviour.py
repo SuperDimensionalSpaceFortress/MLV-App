@@ -1708,7 +1708,7 @@ class OwnerFootagePrivateDirectoryLeakAndRefusalTests(_PwshCase):
         ]
         return json.dumps(baked)
 
-    def _run_owner_content_check(self, *, parts, pub: Path, work: Path) -> subprocess.CompletedProcess:
+    def _run_owner_content_check(self, *, parts, pub: Path, work: Path, preamble: str = "", tail: str = "") -> subprocess.CompletedProcess:
         pub.mkdir(parents=True)
         work.mkdir(parents=True, exist_ok=True)
         block = self._extract_content_check()
@@ -1718,6 +1718,7 @@ class OwnerFootagePrivateDirectoryLeakAndRefusalTests(_PwshCase):
             "$ErrorActionPreference = 'Stop'\n"
             f"Import-Module '{MODULE}' -Force\n"
             f"Import-Module '{OWNER_FOOTAGE_MODULE}' -Force\n"
+            + preamble +
             "$FixtureRehearsal = $false\n"
             f"$OwnerPartsJson = '{owner_parts_json}'\n"
             "$ClipId = 'FIX-OWNER-LEAK-0001'\n"
@@ -1730,10 +1731,47 @@ class OwnerFootagePrivateDirectoryLeakAndRefusalTests(_PwshCase):
             "}\n"
             "function Write-JobTrace([string]$Message) { }\n"
             + block + "\n"
-            "Write-Output ('CLIPPATH=' + $clipPath)\n",
+            "Write-Output ('CLIPPATH=' + $clipPath)\n"
+            + tail,
             encoding="utf-8",
         )
         return _run_pwsh_file(script)
+
+    def _simulated_second_volume_preamble(self, *, work: Path, relocated_parent: Path, extra_volumes=None) -> str:
+        """PowerShell that makes Get-AttrCudaFileIdentity report a second volume for everything
+        under -work (the job work tree: the 'G:' of the Ultra-Magnus defect) while every other
+        path -- the owner's source, and the relocated directory -- reports the first ('C:').
+        Everything but the volume serial (file index, live link count) is the REAL value, so the
+        link itself is a real hard link and its same-file-object proof is really exercised.
+        -extra_volumes maps a path prefix to a serial, checked first (a longer prefix wins)."""
+        extra = ""
+        for prefix, serial in (extra_volumes or {}).items():
+            extra += f"    if ($full.StartsWith('{prefix}', [StringComparison]::OrdinalIgnoreCase)) {{ $serial = {serial} }}\n"
+        relocated_parent.mkdir(parents=True, exist_ok=True)
+        return (
+            "$mod = Get-Module AttrCudaOwnerFootage\n"
+            "$global:AttrCudaRealIdentity = & $mod { ${function:Get-AttrCudaFileIdentity} }\n"
+            f"$global:AttrCudaTestWorkRoot = '{work}'\n"
+            "& $mod {\n"
+            "    Set-Item -Path function:Get-AttrCudaFileIdentity -Value {\n"
+            "        param([string]$Path)\n"
+            "        $real = & $global:AttrCudaRealIdentity -Path $Path\n"
+            "        $full = [IO.Path]::GetFullPath($Path)\n"
+            "        $serial = if ($full.StartsWith($global:AttrCudaTestWorkRoot, [StringComparison]::OrdinalIgnoreCase)) { 222 } else { 111 }\n"
+            + extra +
+            "        [pscustomobject]@{ VolumeSerialNumber = $serial; FileIndexHigh = $real.FileIndexHigh; FileIndexLow = $real.FileIndexLow; NumberOfLinks = $real.NumberOfLinks }\n"
+            "    }\n"
+            "}\n"
+            f"$OwnerClipRelocatedParent = '{relocated_parent}'\n"
+        )
+
+    def _one_part(self, name: str, payload: bytes):
+        src_dir = self.tmp / f"{name}-source"
+        src_dir.mkdir()
+        part_path = src_dir / ("source" + "." + "MLV")
+        part_path.write_bytes(payload)
+        part = {"index": 0, "path": str(part_path).replace("\\", "/"), "length": len(payload), "sha256": hashlib.sha256(payload).hexdigest()}
+        return part_path, part
 
     def _build_cmd(self, *, clip_path: str) -> str:
         block = self._extract_cmd_build()
@@ -1895,6 +1933,186 @@ class OwnerFootagePrivateDirectoryLeakAndRefusalTests(_PwshCase):
         self.assertIn("THREW OWNER_FOOTAGE_LINK_CROSS_VOLUME", proc.stdout)
         # No hard link was left behind by the refused attempt.
         self.assertEqual(list(directory.iterdir()), [])
+
+    # ---- UM-OWNER-FOOTAGE-CROSS-VOLUME-1: the clip's volume is not the work tree's volume ---------
+
+    def test_cross_volume_source_links_into_a_private_directory_on_the_source_volume(self) -> None:
+        # Before this card the run below ended RESULT=OWNER_FOOTAGE_LINK_CROSS_VOLUME (exit 21):
+        # the private directory always sat under the work tree. Now it follows the clip's volume,
+        # the link is still a REAL hard link to the same file object, and nothing is copied.
+        payload = b"cross volume relocation bytes " * 40
+        part_path, part = self._one_part("owner-relocate", payload)
+        pub = self.tmp / "agent" / "outbox" / "owner-relocate.artifacts"
+        work = self.tmp / "work"
+        relocated_parent = self.tmp / "on-the-clip-volume"
+
+        proc = self._run_owner_content_check(
+            parts=[part], pub=pub, work=work,
+            preamble=self._simulated_second_volume_preamble(work=work, relocated_parent=relocated_parent),
+        )
+
+        self.assertEqual(proc.returncode, 0, f"{proc.stdout}\n{proc.stderr}")
+        self.assertNotIn("OWNER_FOOTAGE_LINK_CROSS_VOLUME", proc.stdout)
+        marker = "CLIPPATH="
+        clip_path = Path(next(line for line in proc.stdout.splitlines() if line.startswith(marker))[len(marker):])
+        # The link lives on the clip's side, never under the work tree, and only it lives there.
+        self.assertEqual(clip_path.parent.parent, relocated_parent)
+        self.assertFalse(str(clip_path).lower().startswith(str(work).lower()))
+        self.assertEqual([p.name for p in clip_path.parent.iterdir()], [clip_path.name])
+        # Same file object as the owner's part, not a copy: one hard link, same bytes, two names.
+        self.assertTrue(os.path.samefile(clip_path, part_path))
+        self.assertEqual(clip_path.read_bytes(), payload)
+        self.assertEqual(os.stat(part_path).st_nlink, 2)
+
+    def test_same_volume_source_keeps_the_private_directory_under_the_work_tree(self) -> None:
+        payload = b"same volume unchanged bytes " * 40
+        part_path, part = self._one_part("owner-same-volume", payload)
+        pub = self.tmp / "agent" / "outbox" / "owner-same-volume.artifacts"
+        work = self.tmp / "work"
+
+        proc = self._run_owner_content_check(parts=[part], pub=pub, work=work)
+
+        self.assertEqual(proc.returncode, 0, f"{proc.stdout}\n{proc.stderr}")
+        self.assertEqual(sorted(p.name for p in (work / ("owner-" + "clip")).iterdir()), ["owner-" + "clip" + "." + "MLV"])
+
+    def test_parts_on_two_different_volumes_are_still_refused_as_cross_volume(self) -> None:
+        # No single directory can hold a link to a part on each of two volumes, so this stays the
+        # existing refusal (exit 21) -- relocation never papers over it.
+        base_extension = "." + "MLV"
+        continuation_extension = "." + "M00"
+        src_a = self.tmp / "owner-two-volumes-a"
+        src_b = self.tmp / "owner-two-volumes-b"
+        src_a.mkdir()
+        src_b.mkdir()
+        part0_bytes = b"two volumes part zero " * 20
+        part1_bytes = b"two volumes part one " * 20
+        part0_path = src_a / ("source" + base_extension)
+        part1_path = src_b / ("source" + continuation_extension)
+        part0_path.write_bytes(part0_bytes)
+        part1_path.write_bytes(part1_bytes)
+        parts = [
+            {"index": 0, "path": str(part0_path).replace("\\", "/"), "length": len(part0_bytes), "sha256": hashlib.sha256(part0_bytes).hexdigest()},
+            {"index": 1, "path": str(part1_path).replace("\\", "/"), "length": len(part1_bytes), "sha256": hashlib.sha256(part1_bytes).hexdigest()},
+        ]
+        pub = self.tmp / "agent" / "outbox" / "owner-two-volumes.artifacts"
+        work = self.tmp / "work"
+
+        proc = self._run_owner_content_check(
+            parts=parts, pub=pub, work=work,
+            preamble=self._simulated_second_volume_preamble(
+                work=work, relocated_parent=self.tmp / "on-the-clip-volume", extra_volumes={str(src_b): 333}),
+        )
+
+        self.assertEqual(proc.returncode, 21, f"{proc.stdout}\n{proc.stderr}")
+        self.assertIn("RESULT=OWNER_FOOTAGE_LINK_CROSS_VOLUME", proc.stdout)
+        summary = json.loads((pub / "summary.json").read_text(encoding="utf-8"))
+        self.assertEqual(summary["result"], "OWNER_FOOTAGE_LINK_CROSS_VOLUME")
+
+    def test_a_relocated_directory_that_lands_on_the_wrong_volume_is_refused_and_removed(self) -> None:
+        # The relocation parent is a junction to another volume (simulated): the directory created
+        # there is NOT on the clip's volume, so it is removed again and the leg is refused.
+        payload = b"wrong volume relocation bytes " * 20
+        part_path, part = self._one_part("owner-wrong-volume", payload)
+        pub = self.tmp / "agent" / "outbox" / "owner-wrong-volume.artifacts"
+        work = self.tmp / "work"
+        relocated_parent = self.tmp / "on-another-volume"
+
+        proc = self._run_owner_content_check(
+            parts=[part], pub=pub, work=work,
+            preamble=self._simulated_second_volume_preamble(
+                work=work, relocated_parent=relocated_parent, extra_volumes={str(relocated_parent): 999}),
+        )
+
+        self.assertEqual(proc.returncode, 21, f"{proc.stdout}\n{proc.stderr}")
+        self.assertIn("RESULT=OWNER_FOOTAGE_LINK_CROSS_VOLUME", proc.stdout)
+        self.assertEqual(list(relocated_parent.iterdir()), [])
+        self.assertEqual(os.stat(part_path).st_nlink, 1)
+
+    def test_a_swap_between_verify_and_launch_cannot_change_what_the_relocated_link_serves(self) -> None:
+        # The identity guarantee is the point. After the relocated link is verified and held: the
+        # file's CONTENT cannot be rewritten through either name (a write-open is refused -- the
+        # very probe the smoke runner uses to honour the verified binding), and swapping the
+        # SOURCE NAME for a different file (NTFS lets one name be replaced while another name of
+        # the file is open) changes nothing the app can see, because the app opens the LINK, which
+        # stays bound to the file object that was hashed. Both hold across volumes exactly as on
+        # one volume.
+        payload = b"swap after verify bytes " * 40
+        part_path, part = self._one_part("owner-swap", payload)
+        decoy_bytes = b"a different file that must never become the clip"
+        decoy = self.tmp / "decoy.bin"
+        decoy.write_bytes(decoy_bytes)
+        pub = self.tmp / "agent" / "outbox" / "owner-swap.artifacts"
+        work = self.tmp / "work"
+        relocated_parent = self.tmp / "on-the-clip-volume"
+        tail = (
+            f"$src = '{part_path}'\n"
+            f"$decoy = '{decoy}'\n"
+            "function Try-Op([string]$Name, [scriptblock]$Op) { try { & $Op; Write-Output ($Name + '=ALLOWED') } catch { Write-Output ($Name + '=REFUSED') } }\n"
+            "Try-Op 'WRITE_SRC' { $h = [IO.File]::Open($src, [IO.FileMode]::Open, [IO.FileAccess]::Write, [IO.FileShare]::ReadWrite); $h.Dispose() }\n"
+            "Try-Op 'WRITE_LINK' { $h = [IO.File]::Open($clipPath, [IO.FileMode]::Open, [IO.FileAccess]::Write, [IO.FileShare]::ReadWrite); $h.Dispose() }\n"
+            "Try-Op 'REPLACE_SRC_NAME' { [IO.File]::Move($decoy, $src, $true) }\n"
+            "Write-Output ('LINK_SHA=' + (Get-FileHash -LiteralPath $clipPath -Algorithm SHA256).Hash.ToLowerInvariant())\n"
+            "Close-AttrCudaOwnerFootageWorkspace -Handles $ownerLinkHandles -Directory (Split-Path -Parent $clipPath) 3>$null\n"
+        )
+
+        proc = self._run_owner_content_check(
+            parts=[part], pub=pub, work=work,
+            preamble=self._simulated_second_volume_preamble(work=work, relocated_parent=relocated_parent),
+            tail=tail,
+        )
+
+        self.assertEqual(proc.returncode, 0, f"{proc.stdout}\n{proc.stderr}")
+        self.assertIn("WRITE_SRC=REFUSED", proc.stdout)
+        self.assertIn("WRITE_LINK=REFUSED", proc.stdout)
+        self.assertIn("REPLACE_SRC_NAME=ALLOWED", proc.stdout)  # the swap itself happened ...
+        self.assertEqual(part_path.read_bytes(), decoy_bytes)
+        # ... and the link still serves exactly the bytes that were hashed.
+        self.assertIn(f"LINK_SHA={hashlib.sha256(payload).hexdigest()}", proc.stdout)
+
+    def test_relocated_directory_cleanup_removes_sidecars_but_never_a_name_of_the_owners_bytes(self) -> None:
+        payload = b"relocated cleanup bytes " * 40
+        part_path, part = self._one_part("owner-cleanup", payload)
+        pub = self.tmp / "agent" / "outbox" / "owner-cleanup.artifacts"
+        work = self.tmp / "work"
+        relocated_parent = self.tmp / "on-the-clip-volume"
+        tail = (
+            "$dir = Split-Path -Parent $clipPath\n"
+            "Set-Content -LiteralPath (Join-Path $dir 'app-sidecar.txt') -Value 'written by the app'\n"
+            "Close-AttrCudaOwnerFootageWorkspace -Handles $ownerLinkHandles -Directory $dir\n"
+            "Remove-AttrCudaOwnerFootageRelocatedDirectory -Directory $dir\n"
+            "Write-Output ('DIR_EXISTS=' + (Test-Path -LiteralPath $dir))\n"
+        )
+
+        proc = self._run_owner_content_check(
+            parts=[part], pub=pub, work=work,
+            preamble=self._simulated_second_volume_preamble(work=work, relocated_parent=relocated_parent),
+            tail=tail,
+        )
+
+        self.assertEqual(proc.returncode, 0, f"{proc.stdout}\n{proc.stderr}")
+        self.assertIn("DIR_EXISTS=False", proc.stdout)
+        self.assertEqual(list(relocated_parent.iterdir()), [])
+        self.assertEqual(part_path.read_bytes(), payload)
+        self.assertEqual(os.stat(part_path).st_nlink, 1)
+
+    def test_relocated_directory_cleanup_leaves_the_last_name_of_the_owners_bytes_in_place(self) -> None:
+        # Close leaves a neutral-name entry whose live link count is 1 (the owner's other name is
+        # gone) -- the relocated-directory cleanup must not delete that either, nor the directory.
+        directory = self.tmp / "relocated-last-name"
+        directory.mkdir()
+        last_name = directory / ("owner-" + "clip" + "." + "MLV")
+        last_name.write_bytes(b"the only name left of these bytes")
+        script = self.tmp / "relocated-last-name-probe.ps1"
+        script.write_text(
+            "$ErrorActionPreference = 'Stop'\n"
+            f"Import-Module '{MODULE}' -Force\n"
+            f"Import-Module '{OWNER_FOOTAGE_MODULE}' -Force\n"
+            f"Remove-AttrCudaOwnerFootageRelocatedDirectory -Directory '{directory}' 3>$null\n",
+            encoding="utf-8",
+        )
+        proc = _run_pwsh_file(script)
+        self.assertEqual(proc.returncode, 0, f"{proc.stdout}\n{proc.stderr}")
+        self.assertEqual(last_name.read_bytes(), b"the only name left of these bytes")
 
     def test_identity_mismatch_after_link_creation_is_refused(self) -> None:
         base_extension = "." + "MLV"
@@ -5449,9 +5667,11 @@ class DisplayWakeJobOrderingTests(unittest.TestCase):
         # PRESENTMON-HARNESS-ROBUSTNESS-1) adds a 20th: the PRESENTMON_UNAVAILABLE early exit when
         # Start-PresentMonCapture itself throws on spawn, before this branch's own wake existed on
         # master -- displayWake=$displayWake was added to that block to match every sibling site.
+        # UM-OWNER-FOOTAGE-CROSS-VOLUME-1 adds a 21st: the refusal when no private link directory
+        # can be prepared on the clip's volume (OWNER_FOOTAGE_LINK_CROSS_VOLUME/_FAILED, no part yet).
         summary_writes = body.count("(Join-Path $Pub 'summary.json')")
         display_wake_fields = body.count("displayWake=$displayWake") + body.count("displayWake = $displayWake")
-        self.assertEqual(20, summary_writes, "a summary.json write site was added/removed after the wake")
+        self.assertEqual(21, summary_writes, "a summary.json write site was added/removed after the wake")
         # +1: the success path also stamps displayWake into evidence-manifest.json, a second file.
         self.assertEqual(summary_writes + 1, display_wake_fields)
 

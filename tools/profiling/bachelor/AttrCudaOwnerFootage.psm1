@@ -556,7 +556,109 @@ function New-AttrCudaVerifiedClipBinding {
     } | ConvertTo-Json -Depth 4
 }
 
+function Resolve-AttrCudaOwnerFootageDirectory {
+    <#
+    .SYNOPSIS
+    Choose the private directory the verified parts are hard-linked into: -PreferredDirectory when
+    every source part is on its volume, else a fresh job-unique directory on the SOURCE parts'
+    volume. Returns the directory's full path. UM-OWNER-FOOTAGE-CROSS-VOLUME-1.
+    .DESCRIPTION
+    A hard link cannot cross volumes, and the clip's location is a frozen constant of the
+    consent table, so on a venue whose job work tree is on another volume than the clip (Ultra-
+    Magnus: clip on C:, agent share and scratch on G:) New-AttrCudaOwnerFootageLink used to refuse
+    every owner leg with OWNER_FOOTAGE_LINK_CROSS_VOLUME. The private directory is only a place to
+    hold the neutral-name links, so it moves to the clip's volume instead: nothing is copied, no
+    check is loosened, and every guarantee stays exactly where it was -- the link is still a hard
+    link to the SAME file object (New-AttrCudaOwnerFootageLink proves volume + 64-bit file index
+    after creating it), the job still holds a FileShare.Read handle on it, hashes it once, and hands
+    that verified binding to the runner. The volume check in New-AttrCudaOwnerFootageLink is
+    untouched and still runs for every part.
+    Falls back to -PreferredDirectory (so that check still refuses, as before) when a source's
+    identity cannot be read, or when the parts themselves span more than one volume -- no single
+    directory can hold links to those. The relocated directory is created here, must not already
+    exist, is named after the job's own unique work-tree leaf plus 'owner-clip', and is proved to
+    sit on the source volume (a junction planted at its parent would fail this) before it is
+    returned; a directory that fails the proof is removed (it is empty) and OWNER_FOOTAGE_LINK_-
+    CROSS_VOLUME is thrown. -RelocatedParent overrides the default parent, '<source drive root>
+    mlvtmp' (the same scratch root the venues already use), and exists so a test can keep the
+    relocation inside its own temp tree. Never echoes a source or directory path.
+    #>
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $true)][string]$PreferredDirectory,
+        [Parameter(Mandatory = $true)][string[]]$SourcePath,
+        [string]$RelocatedParent = ''
+    )
+
+    try {
+        $preferredVolume = (Get-AttrCudaFileIdentity -Path $PreferredDirectory).VolumeSerialNumber
+        $sourceVolumes = @($SourcePath | ForEach-Object { (Get-AttrCudaFileIdentity -Path $_).VolumeSerialNumber } | Select-Object -Unique)
+    } catch {
+        return $PreferredDirectory
+    }
+    if ($sourceVolumes.Count -ne 1 -or $sourceVolumes[0] -eq $preferredVolume) { return $PreferredDirectory }
+
+    $parent = $RelocatedParent
+    if ([string]::IsNullOrWhiteSpace($parent)) {
+        $parent = Join-Path ([IO.Path]::GetPathRoot([IO.Path]::GetFullPath($SourcePath[0]))) 'mlvtmp'
+    }
+    $leaf = (Split-Path -Leaf (Split-Path -Parent ([IO.Path]::GetFullPath($PreferredDirectory)))) + '-owner-clip'
+    $relocated = Join-Path $parent $leaf
+    try {
+        if (Test-Path -LiteralPath $relocated) { throw 'occupied' }
+        [void](New-Item -ItemType Directory -Path $relocated -ErrorAction Stop)
+    } catch {
+        throw 'OWNER_FOOTAGE_LINK_FAILED no private directory could be prepared on the source volume'
+    }
+    $onSourceVolume = $false
+    try { $onSourceVolume = ((Get-AttrCudaFileIdentity -Path $relocated).VolumeSerialNumber -eq $sourceVolumes[0]) } catch {}
+    if (-not $onSourceVolume) {
+        try { [IO.Directory]::Delete($relocated, $false) } catch {}
+        throw 'OWNER_FOOTAGE_LINK_CROSS_VOLUME the source volume has no usable private directory'
+    }
+    return $relocated
+}
+
+function Remove-AttrCudaOwnerFootageRelocatedDirectory {
+    <#
+    .SYNOPSIS
+    Delete a directory Resolve-AttrCudaOwnerFootageDirectory relocated OUT of the job work tree
+    (which nothing else cleans up), without ever deleting a name of the owner's bytes.
+    .DESCRIPTION
+    UM-OWNER-FOOTAGE-CROSS-VOLUME-1. Call it AFTER Close-AttrCudaOwnerFootageWorkspace, which has
+    already removed every neutral link that still has a second name. What remains is either a file
+    the app wrote there (a sidecar: one link, not a reparse point, not a neutral link name) --
+    deleted -- or something this function refuses to touch: a neutral-name entry, anything with a
+    second name, a reparse point, a subdirectory. The directory itself is then removed NON-
+    recursively, so an entry that was left in place keeps the directory in place too. Never throws
+    and never recurses; every warning is path-free.
+    #>
+    [CmdletBinding()]
+    param([Parameter(Mandatory = $true)][string]$Directory)
+
+    if ([string]::IsNullOrWhiteSpace($Directory) -or -not (Test-Path -LiteralPath $Directory)) { return }
+    $neutralPattern = '^owner-clip\.(MLV|M\d{2})$'
+    foreach ($entry in @(Get-ChildItem -LiteralPath $Directory -Force -ErrorAction SilentlyContinue)) {
+        if ($entry.PSIsContainer -or ($entry.Attributes -band [IO.FileAttributes]::ReparsePoint) -or $entry.Name -match $neutralPattern) {
+            Write-Warning 'ATTRCUDA_OWNER_RELOCATED_ENTRY_LEFT_IN_PLACE'
+            continue
+        }
+        try {
+            if ((Get-AttrCudaFileIdentity -Path $entry.FullName).NumberOfLinks -ge 2) {
+                Write-Warning 'ATTRCUDA_OWNER_RELOCATED_ENTRY_HAS_SECOND_NAME left in place'
+                continue
+            }
+            Remove-Item -LiteralPath $entry.FullName -Force -Confirm:$false -ErrorAction Stop
+        } catch {
+            Write-Warning 'ATTRCUDA_OWNER_RELOCATED_ENTRY_CLEANUP_FAILED left in place'
+        }
+    }
+    try { [IO.Directory]::Delete($Directory, $false) } catch { Write-Warning 'ATTRCUDA_OWNER_RELOCATED_DIRECTORY_NOT_REMOVED' }
+}
+
 Export-ModuleMember -Function `
+    Resolve-AttrCudaOwnerFootageDirectory, `
+    Remove-AttrCudaOwnerFootageRelocatedDirectory, `
     Get-AttrCudaOwnerFootageStagingName, `
     Send-AttrCudaOwnerFootagePartToStaging, `
     Get-AttrCudaOwnerFootageNeutralName, `

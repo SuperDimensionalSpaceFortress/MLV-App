@@ -579,6 +579,76 @@
       "text": "[IO.Directory]::Delete($shareStageDir, $false)",
       "disposition": "boundary-root-asserted",
       "note": "$shareStageDir's own chain is proved link-free by Assert-AttrCudaNoLinkBelowRoot immediately above, in the same function; ATTR3-FOOTAGE-STAGE-1 round 9: non-recursive, non-prompting .NET primitive replacing a Remove-Item whose own -Confirm:$false suppressed the prompt that used to be the only thing stopping it from silently recursing into a non-empty directory"
+    },
+    {
+      "source": "AttrCudaOwnerFootage.psm1",
+      "function": "Resolve-AttrCudaOwnerFootageDirectory",
+      "line": 608,
+      "kind": "cmdlet",
+      "name": "Test-Path",
+      "text": "Test-Path -LiteralPath $relocated",
+      "disposition": "job-private-temp",
+      "note": "relocated is a job-unique path this call is about to create; an occupied path is refused, never reused"
+    },
+    {
+      "source": "AttrCudaOwnerFootage.psm1",
+      "function": "Resolve-AttrCudaOwnerFootageDirectory",
+      "line": 609,
+      "kind": "cmdlet",
+      "name": "New-Item",
+      "text": "New-Item -ItemType Directory -Path $relocated -ErrorAction Stop",
+      "disposition": "job-private-temp",
+      "note": "creates the fresh, job-unique private link directory on the source volume; New-Item without -Force cannot adopt an existing one"
+    },
+    {
+      "source": "AttrCudaOwnerFootage.psm1",
+      "function": "Remove-AttrCudaOwnerFootageRelocatedDirectory",
+      "line": 639,
+      "kind": "cmdlet",
+      "name": "Test-Path",
+      "text": "Test-Path -LiteralPath $Directory",
+      "disposition": "job-private-temp",
+      "note": "Directory is the relocated private per-job owner-footage workspace"
+    },
+    {
+      "source": "AttrCudaOwnerFootage.psm1",
+      "function": "Remove-AttrCudaOwnerFootageRelocatedDirectory",
+      "line": 641,
+      "kind": "cmdlet",
+      "name": "Get-ChildItem",
+      "text": "Get-ChildItem -LiteralPath $Directory -Force -ErrorAction SilentlyContinue",
+      "disposition": "job-private-temp",
+      "note": "enumerates the relocated private workspace one level (no -Recurse) to classify each entry before any delete"
+    },
+    {
+      "source": "AttrCudaOwnerFootage.psm1",
+      "function": "Remove-AttrCudaOwnerFootageRelocatedDirectory",
+      "line": 651,
+      "kind": "cmdlet",
+      "name": "Remove-Item",
+      "text": "Remove-Item -LiteralPath $entry.FullName -Force -Confirm:$false -ErrorAction Stop",
+      "disposition": "job-private-temp",
+      "note": "deletes only a non-reparse, non-neutral-name file with exactly one link (an app sidecar); a neutral name, a second name, a reparse point or a subdirectory is left in place"
+    },
+    {
+      "source": "AttrCudaOwnerFootage.psm1",
+      "function": "Resolve-AttrCudaOwnerFootageDirectory",
+      "line": 616,
+      "kind": "static-method",
+      "name": "Delete",
+      "text": "[IO.Directory]::Delete($relocated, $false)",
+      "disposition": "job-private-temp",
+      "note": "removes only the empty directory this call just created (non-recursive) when it is proved to be on the wrong volume"
+    },
+    {
+      "source": "AttrCudaOwnerFootage.psm1",
+      "function": "Remove-AttrCudaOwnerFootageRelocatedDirectory",
+      "line": 656,
+      "kind": "static-method",
+      "name": "Delete",
+      "text": "[IO.Directory]::Delete($Directory, $false)",
+      "disposition": "job-private-temp",
+      "note": "removes the relocated private workspace non-recursively, so any entry left in place keeps the directory in place"
     }
   ]
 }

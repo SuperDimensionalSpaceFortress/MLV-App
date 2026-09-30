@@ -54,12 +54,21 @@ param(
     [Parameter(Mandatory = $true)]
     [string]$OutDir,
 
-    [string]$RepoRoot = (Resolve-Path (Join-Path $PSScriptRoot '..\..\..')).Path
+    [string]$RepoRoot = (Resolve-Path (Join-Path $PSScriptRoot '..\..\..')).Path,
+
+    # UM-OWNER-FOOTAGE-CROSS-VOLUME-1: emit the bounded owner-footage BIND PROOF instead of the
+    # presence probe -- the attribution job's link/hold/identity-hash path with no playback (see
+    # Attr3FootageBindProofJob.psm1). -WorkRoot places its work tree, which is what makes the
+    # clip's volume and the work tree's volume differ on Ultra-Magnus (e.g. G:\Temp\mlv-gpu-profile).
+    [switch]$BindProof,
+
+    [string]$WorkRoot = 'C:\mlvtmp'
 )
 
 $ErrorActionPreference = 'Stop'
 Import-Module (Join-Path $PSScriptRoot 'AttrCudaArtifacts.psm1') -Force
 Import-Module (Join-Path $PSScriptRoot 'Attr3FootagePresenceJob.psm1') -Force
+Import-Module (Join-Path $PSScriptRoot 'Attr3FootageBindProofJob.psm1') -Force
 
 $RepoRoot = (Resolve-Path -LiteralPath $RepoRoot).Path
 
@@ -124,4 +133,8 @@ $parts = @($resolved.parts)
 # Job-TEXT construction lives entirely in Attr3FootagePresenceJob.psm1 (round 2, defect 3): this
 # is the only call in this generator that builds or writes the emitted job, and it is also the
 # only call a test invokes directly, with fabricated parts, to exercise the same logic.
-New-Attr3FootagePresenceJob -ClipId $ClipId -Parts $parts -OutDir $OutDir
+if ($BindProof) {
+    New-Attr3FootageBindProofJob -ClipId $ClipId -Parts $parts -OutDir $OutDir -WorkRoot $WorkRoot
+} else {
+    New-Attr3FootagePresenceJob -ClipId $ClipId -Parts $parts -OutDir $OutDir
+}

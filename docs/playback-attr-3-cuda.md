@@ -200,7 +200,14 @@ path; every reader-facing output carries only the part's index and status. Any n
 or a failure creating/opening/re-verifying a private link, fails closed (`OWNER_FOOTAGE_NOT_VERIFIED`
 exit 19, `OWNER_FOOTAGE_LINK_CROSS_VOLUME` exit 21, or `OWNER_FOOTAGE_LINK_FAILED` exit 22),
 closing whatever handles were already held and removing whatever private links were already
-created, before PresentMon starts, before deploy, and before the smoke child. (The fixture route in
+created, before PresentMon starts, before deploy, and before the smoke child. A hard link cannot
+cross volumes, so when the clip is on another volume than the job's work tree (Ultra-Magnus: clip on
+`C:`, agent share and scratch on `G:`) the private directory is created on the CLIP's volume instead
+(`Resolve-AttrCudaOwnerFootageDirectory`, under `<clip drive>\mlvtmp\<job>-owner-clip`, removed at
+the end) -- nothing is copied and every guarantee above is unchanged; parts spanning more than one
+volume, or a relocation that does not land on the clip's volume, still fail closed at exit 21.
+`attr3-footage-presence-job.ps1 -BindProof -WorkRoot <dir>` emits a bounded job that runs exactly
+this link/hold/one-hash/binding path with no playback, for proving it on a venue. (The fixture route in
 section 4b instead requires the clip path to sit directly in the agent cache, name that clip id,
 and exist, then hashes it against `-FixtureSha256`, failing closed at
 `FIXTURE_CONTENT_MISMATCH`, exit 17, on a mismatch.) The job also verifies all three package
