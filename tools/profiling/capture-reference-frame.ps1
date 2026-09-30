@@ -84,7 +84,7 @@ foreach ($k in $ExtraEnv.Keys) { Set-Item -Path ("env:" + $k) -Value ([string]$E
 # same clip-length gate run-release-gui-smoke.ps1 does (>= 20 s of footage, window never exceeds it).
 # A pinned-frame capture (-PresentedFrames N) has no wall-clock window (-Seconds is only its fail-closed
 # timeout), so only the 20 s floor applies there. Exit 41 CLIP_TOO_SHORT / 42 CLIP_LENGTH_UNKNOWN.
-. (Join-Path $PSScriptRoot 'gui-smoke-clip-length.ps1')
+. (Join-Path $PSScriptRoot 'gui-smoke-length-gate.ps1')
 $clipLengthGate = Test-GuiSmokeClipLength -Path $Clip -WindowSeconds $(if ($PresentedFrames -gt 0) { 0 } else { $Seconds })
 if ($clipLengthGate.verdict -ne 'OK') {
     Write-Output "CAPTURE: REFUSED - $($clipLengthGate.message)"

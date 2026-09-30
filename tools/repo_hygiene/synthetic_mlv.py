@@ -1,6 +1,6 @@
 """Synthetic MLV files with a REAL 52-byte MLVI file header (PLAYBACK-CLIP-LENGTH-ENFORCE-1).
 
-The clip-length gate (tools/profiling/gui-smoke-clip-length.ps1) reads nothing but that header, so a
+The clip-length gate (tools/profiling/gui-smoke-length-gate.ps1) reads nothing but that header, so a
 test needs exactly those 52 bytes -- never footage. ``mlv_file_hdr_t`` in src/mlv/mlv.h:
 
     fileMagic[4] blockSize u32 versionString[8] fileGuid u64 fileNum u16 fileCount u16

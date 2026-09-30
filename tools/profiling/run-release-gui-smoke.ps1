@@ -126,7 +126,7 @@ $validationWarnings = @()
 . (Join-Path $PSScriptRoot 'gui-smoke-color-artifact-scan.ps1')
 . (Join-Path $PSScriptRoot 'gui-smoke-gpu-texture-route-validation.ps1')
 . (Join-Path $PSScriptRoot 'gui-smoke-display-identity.ps1')
-. (Join-Path $PSScriptRoot 'gui-smoke-clip-length.ps1')
+. (Join-Path $PSScriptRoot 'gui-smoke-length-gate.ps1')
 Import-Module (Join-Path $PSScriptRoot 'gui-smoke-process-boundary.psm1') -Force
 . (Join-Path $PSScriptRoot 'provenance-stamp.ps1')
 

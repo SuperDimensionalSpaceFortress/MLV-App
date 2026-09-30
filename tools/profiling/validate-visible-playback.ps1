@@ -50,7 +50,7 @@ if ($Seconds -lt $needSeconds) { $Seconds = $needSeconds }
 # PLAYBACK-CLIP-LENGTH-ENFORCE-1 (owner rule 2026-09-30): this launches the app directly, so it runs
 # the same clip-length gate run-release-gui-smoke.ps1 does. A clip under 20 s, or shorter than the
 # play window, is refused (exit 41 CLIP_TOO_SHORT / 42 CLIP_LENGTH_UNKNOWN); --loop is never passed.
-. (Join-Path $PSScriptRoot 'gui-smoke-clip-length.ps1')
+. (Join-Path $PSScriptRoot 'gui-smoke-length-gate.ps1')
 $clipLengthGate = Test-GuiSmokeClipLength -Path $clip -WindowSeconds $Seconds
 if ($clipLengthGate.verdict -ne 'OK') {
     [Console]::Error.WriteLine("PLAYBACK-CLIP-LENGTH-ENFORCE-1: $($clipLengthGate.message)")

@@ -489,7 +489,7 @@ if (-not $isFixtureRehearsal) {
 # clip's bytes are never opened by this generator and the resolver records no frame count, so the
 # owner arm is enforced by the same gate inside the emitted job's run-release-gui-smoke.ps1 call,
 # which reads the clip's header at the venue before anything launches.
-. (Join-Path $PSScriptRoot '..\gui-smoke-clip-length.ps1')
+. (Join-Path $PSScriptRoot '..\gui-smoke-length-gate.ps1')
 if ($isFixtureRehearsal) {
     $fixtureHeaderPath = Join-Path $RepoRoot ('tests' + [IO.Path]::DirectorySeparatorChar + 'fixtures' + [IO.Path]::DirectorySeparatorChar + 'clips' + [IO.Path]::DirectorySeparatorChar + $ClipId + $FixtureClipExtension)
     $fixtureLengthGate = Test-GuiSmokeClipLength -Path $fixtureHeaderPath -WindowSeconds $PlaySeconds

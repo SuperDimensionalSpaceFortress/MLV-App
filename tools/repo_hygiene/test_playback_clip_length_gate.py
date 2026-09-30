@@ -7,7 +7,7 @@ RULE: any leg that PLAYS the app on a venue uses >= 20 s of real footage, over a
 exceeds the clip, and never loops. The 2026-09-22 edition of the rule lived only in prose (its
 enforcement card was never built), so every new lane re-broke it. This file is the enforcement:
 
-  1. the gate itself (tools/profiling/gui-smoke-clip-length.ps1) refuses a short / empty / unreadable
+  1. the gate itself (tools/profiling/gui-smoke-length-gate.ps1) refuses a short / empty / unreadable
      clip, typed and fail-closed, and accepts a ~30 s one -- header check only, no app launch;
   2. the runner (the one choke point every venue playback leg goes through) applies it, never passes
      --loop by default, and refuses -AllowLoop for anything that could be playback evidence;
@@ -40,7 +40,7 @@ from tools.repo_hygiene.synthetic_mlv import (
 
 ROOT = Path(__file__).resolve().parents[2]
 PROFILING = ROOT / "tools" / "profiling"
-GATE = PROFILING / "gui-smoke-clip-length.ps1"
+GATE = PROFILING / "gui-smoke-length-gate.ps1"
 RUNNER = PROFILING / "run-release-gui-smoke.ps1"
 JOB_GENERATOR = PROFILING / "bachelor" / "playback-attr-3-cuda-job.ps1"
 MAIN_WINDOW = ROOT / "platform" / "qt" / "MainWindow.cpp"
@@ -293,7 +293,7 @@ class JobGeneratorContractTests(unittest.TestCase):
 
     def test_a_fixture_id_is_refused_at_generation_with_the_shared_verdict(self) -> None:
         text = JOB_GENERATOR.read_text(encoding="utf-8")
-        self.assertIn("gui-smoke-clip-length.ps1", text)
+        self.assertIn("gui-smoke-length-gate.ps1", text)
         self.assertIn("PLAYBACK_ATTR3_$($fixtureLengthGate.message)", text)
 
 
@@ -357,7 +357,7 @@ class PlaybackLauncherScanTests(unittest.TestCase):
         self.assertEqual(
             offenders, [],
             "these tools launch `--gui-smoke-playback` without going through "
-            "tools/profiling/gui-smoke-clip-length.ps1 (Test-GuiSmokeClipLength) or run-release-gui-smoke.ps1, "
+            "tools/profiling/gui-smoke-length-gate.ps1 (Test-GuiSmokeClipLength) or run-release-gui-smoke.ps1, "
             "and are not on PLAYBACK_LAUNCH_ALLOWLIST. A playback leg needs >= 20 s of footage and must "
             "never loop (owner rule 2026-09-30): route it through run-release-gui-smoke.ps1.",
         )
@@ -379,7 +379,7 @@ class PlaybackLauncherScanTests(unittest.TestCase):
 
     def test_the_runner_really_applies_the_gate_before_it_launches(self) -> None:
         text = RUNNER.read_text(encoding="utf-8")
-        self.assertIn("gui-smoke-clip-length.ps1", text)
+        self.assertIn("gui-smoke-length-gate.ps1", text)
         self.assertLess(text.index("Test-GuiSmokeClipLength"), text.index('"--gui-smoke-playback",'))
 
     def test_the_direct_launchers_run_the_gate(self) -> None:
@@ -398,7 +398,7 @@ class PlaybackLauncherScanTests(unittest.TestCase):
 
     def test_the_smoke_runner_closure_carries_the_gate(self) -> None:
         text = (PROFILING / "bachelor" / "AttrCudaArtifacts.psm1").read_text(encoding="utf-8")
-        self.assertIn("'tools/profiling/gui-smoke-clip-length.ps1'", text)
+        self.assertIn("'tools/profiling/gui-smoke-length-gate.ps1'", text)
 
 
 if __name__ == "__main__":
