@@ -1277,9 +1277,24 @@ function Build-AttrCudaDisplayBlock {
     $presentationDeviceName = $null
     $presentationMonitorName = $null
     $windowsAnyModeCollected = $false
+    # UM-DISPLAY-QT-WINDOWS-MAPPING-PROOF-1: the Qt NAME is not the GDI device name on a monitor that
+    # has an EDID name (measured on UM: "PA329C", "LG TV"), so matching it against deviceName left this
+    # status permanently 'unmapped' there. The device to look up is the one the APP derived for that
+    # screen (display_screen device=, from native origin + physical size); the name is used only when
+    # it IS a GDI device name (a monitor with no EDID name, or a log that predates device=) and never
+    # when it contradicts the derived device. No lookup device at all -> 'unmapped', never a guess.
+    $effectiveRecord = if ($presentationBlock) { $presentationPhysical } else { $targetPhysical }
+    $derivedDevice = if ($effectiveRecord) { [string]$effectiveRecord.device } else { '' }
+    $nameIsDevice = ($effectiveBlock -and ([string]$effectiveBlock.name).StartsWith('\\.\'))
+    $lookupDevice = $null
+    if (-not [string]::IsNullOrWhiteSpace($derivedDevice)) {
+        if (-not $nameIsDevice -or ([string]$effectiveBlock.name -ieq $derivedDevice)) { $lookupDevice = $derivedDevice }
+    } elseif ($nameIsDevice) {
+        $lookupDevice = [string]$effectiveBlock.name
+    }
     if ($effectiveBlock -and $effectiveBlock.name) {
         $mappedDevice = @($WindowsInventory.devices | Where-Object {
-            $_.deviceName -and ([string]$_.deviceName -ieq [string]$effectiveBlock.name)
+            $lookupDevice -and $_.deviceName -and ([string]$_.deviceName -ieq $lookupDevice)
         }) | Select-Object -First 1
         if ($null -eq $mappedDevice) {
             $presentationDeviceStatus = 'unmapped'
@@ -1685,8 +1700,10 @@ if ($measurementVenue -eq 'ultra-magnus') {
     $displayPreferSubstring = 'PA329C'
 }
 # Round 2 (sol PRE-REVIEW #2 BLOCKER a): the substring names the MONITOR as Windows reports it;
-# Qt reports GDI device names with no model, so resolve monitorName -> deviceName here (from the
-# same independent inventory) and hand the app THAT. Non-mapped outcomes keep the substring.
+# Resolve monitorName -> GDI deviceName here (from the same independent inventory) and hand the
+# app THAT; the app matches it against the device it derives per QScreen (display_screen device=),
+# because QScreen::name() is the EDID friendly name on a monitor that has one, not the GDI name
+# (UM-DISPLAY-QT-WINDOWS-MAPPING-PROOF-1). Non-mapped outcomes keep the substring.
 $displayPreferResolution = Resolve-AttrCudaPreferredDisplay -WindowsInventory $windowsDisplayInventory -Substring $displayPreferSubstring
 $displayPreferArgument = $displayPreferResolution.argument
 # -AppSelection $null until the smoke log is parsed further down -- appScreens/target/mode/

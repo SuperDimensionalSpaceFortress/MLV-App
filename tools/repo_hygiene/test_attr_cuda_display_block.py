@@ -623,8 +623,10 @@ class PresentationWindowsMappingTests(_ProbeCase):
     (b) DEGRADED may be asserted only when the screen the leg ACTUALLY presented on maps to a
     Windows device whose mode was readable -- "some other device was readable" is not
     corroboration. (a) The venue's preferred monitor is named by its Windows monitorName
-    ('ASUS PA329C'), but Qt reports GDI device names (\\\\.\\DISPLAYn) with no model, so the job
-    must resolve monitorName -> deviceName from the Windows inventory before the app sees it.
+    ('ASUS PA329C'), so the job must resolve monitorName -> deviceName (\\\\.\\DISPLAYn) from the
+    Windows inventory before the app sees it. (The original wording here said Qt reports GDI device
+    names; measured on UM it reports the EDID friendly name instead -- see
+    test_um_display_qt_windows_mapping.py -- so the app derives each screen's GDI device itself.)
     """
 
     def setUp(self) -> None:
