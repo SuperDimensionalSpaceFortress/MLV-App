@@ -7116,6 +7116,7 @@ _CLAIM_CARRIERS_PINNED = (
     "tools/profiling/bachelor/Attr3FootagePresenceJob.psm1",
     "tools/profiling/bachelor/Attr3FootageStageJob.psm1",
     "tools/profiling/bachelor/attr3-footage-presence-job.ps1",
+    "tools/profiling/bachelor/attr3-footage-read-rate-job.ps1",
     "tools/profiling/bachelor/playback-attr-3-cuda-job.ps1",
     "tools/repo_hygiene/test_attr3_footage_presence_job.py",
     "tools/repo_hygiene/test_mlv_never_authorized.py",

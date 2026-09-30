@@ -526,6 +526,36 @@ function Close-AttrCudaOwnerFootageWorkspace {
     }
 }
 
+function New-AttrCudaVerifiedClipBinding {
+    <#
+    .SYNOPSIS
+    The JSON text the smoke runner reads through -VerifiedClipBindingPath: one {path,length,sha256}
+    per owner part whose FULL content read just PASSed on a handle this job still holds.
+    .DESCRIPTION
+    BACHELOR-OWNER-CLIP-STAGE-STALL-1 round 1f. The job reads each part in full exactly once (the
+    identity hash, on the private link, through the read-share handle). This carries that verified
+    identity to the runner so the runner records it instead of reading the clip again: the runner
+    honours an entry only while the file still has the bound length AND is still pinned by that
+    handle (a write-open is refused), so the file the app opens is the file that was hashed.
+    Only ever call this with parts whose identity check returned PASS; the caller owns that.
+    Paths are the private neutral link paths -- never the owner's own directory -- and the file is
+    written under the job's own work tree, never into the published artifact directory.
+    #>
+    [CmdletBinding()]
+    param([Parameter(Mandatory = $true)][object[]]$Parts)
+
+    [ordered]@{
+        schema = 'gui-smoke-verified-clip-binding.v1'
+        parts = @($Parts | ForEach-Object {
+            [ordered]@{
+                path = [IO.Path]::GetFullPath([string]$_.path)
+                length = [int64]$_.length
+                sha256 = ([string]$_.sha256).ToLowerInvariant()
+            }
+        })
+    } | ConvertTo-Json -Depth 4
+}
+
 Export-ModuleMember -Function `
     Get-AttrCudaOwnerFootageStagingName, `
     Send-AttrCudaOwnerFootagePartToStaging, `
@@ -534,4 +564,5 @@ Export-ModuleMember -Function `
     Get-AttrCudaFileIdentity, `
     New-AttrCudaOwnerFootageLink, `
     Open-AttrCudaReadOnlyHandle, `
+    New-AttrCudaVerifiedClipBinding, `
     Close-AttrCudaOwnerFootageWorkspace

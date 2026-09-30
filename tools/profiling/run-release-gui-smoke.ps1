@@ -88,6 +88,18 @@ param(
     [switch]$LaunchOnlyProbe,
     [ValidateRange(0.0, 1.0)]
     [double]$MaxSkippedOrUnpresentedRatio = 0.5,
+    # BACHELOR-OWNER-CLIP-STAGE-STALL-1 round 1f (sol BLOCKER): the owner-clip job already read every
+    # part of the clip in full ONCE, on a handle it still holds (FileShare.Read), and hashed it. It
+    # hands that verified identity here -- a JSON file of {schema, parts:[{path,length,sha256}]} --
+    # so this runner records it instead of reading the clip again (its own small-block re-hash ran
+    # at 0.55 MB/s on the measurement host, before the app was even launched and outside
+    # -ProcessTimeoutMs). A part's entry is honoured ONLY while the file still has that length AND
+    # is still pinned by the job's read-share handle (a write-open is refused); anything else falls
+    # back to one traced large-block read of that part. Blank = no binding, every part is read.
+    [string]$VerifiedClipBindingPath = "",
+    # Path-free trace lines (one per step of any read this runner still performs), appended and
+    # flushed as they happen. Blank = no trace.
+    [string]$TracePath = "",
     [double]$HostLoadCpuPercentBar = 75,
     [int]$HostLoadTopProcessCount = 8,
     # PLAYBACK-MEASURE-HOST-LOAD-GATE-1 round 3: cadence for interior host-load sampling while the
@@ -929,6 +941,125 @@ function Get-ScreenshotImageMetadata {
     }
 }
 
+# BACHELOR-OWNER-CLIP-STAGE-STALL-1 round 1f. Every content read this runner still makes of a
+# launch input goes through Get-GuiSmokeFileSha256: ONE sequential large-block pass (the built-in
+# hash cmdlet reads 4 KiB blocks -- 0.55 MB/s on the measurement host, even warm), each pass
+# bracketed by trace lines so a slow read is attributed instead of silent. The same reader lives in
+# tools/profiling/bachelor/AttrCudaArtifacts.psm1 (Get-AttrCudaFileSha256Blocks) for the job; the
+# runner is staged to the venue as a pinned closure with no access to that module, so it carries
+# its own copy of the ~20 lines rather than a new closure dependency.
+function Add-GuiSmokeTraceLine([string]$Message) {
+    if ([string]::IsNullOrWhiteSpace($TracePath)) { return }
+    try {
+        $directory = [IO.Path]::GetDirectoryName($TracePath)
+        if (-not [IO.Directory]::Exists($directory)) { [void][IO.Directory]::CreateDirectory($directory) }
+        $line = [DateTime]::UtcNow.ToString('yyyy-MM-ddTHH:mm:ss.fffZ') + ' ' + ($Message -replace '[\r\n]+', ' ') + [Environment]::NewLine
+        [IO.File]::AppendAllText($TracePath, $line, [Text.UTF8Encoding]::new($false))
+    } catch {
+        return
+    }
+}
+
+function Get-GuiSmokeFileSha256 {
+    param(
+        [Parameter(Mandatory = $true)][string]$Path,
+        [string]$Label = 'runner-hash',
+        [int]$BlockBytes = 4194304
+    )
+
+    $stopwatch = [Diagnostics.Stopwatch]::StartNew()
+    $stream = [IO.FileStream]::new($Path, [IO.FileMode]::Open, [IO.FileAccess]::Read, [IO.FileShare]::Read, $BlockBytes, [IO.FileOptions]::SequentialScan)
+    $incremental = [Security.Cryptography.IncrementalHash]::CreateHash([Security.Cryptography.HashAlgorithmName]::SHA256)
+    $total = [int64]0
+    $hex = $null
+    try {
+        Add-GuiSmokeTraceLine "$Label start bytes=$($stream.Length) blockBytes=$BlockBytes"
+        $buffer = [byte[]]::new($BlockBytes)
+        while ($true) {
+            $read = $stream.Read($buffer, 0, $BlockBytes)
+            if ($read -le 0) { break }
+            $incremental.AppendData($buffer, 0, $read)
+            $total += $read
+        }
+        # Uppercase: the shape the built-in hash cmdlet's .Hash always had, which every consumer of
+        # this runner's evidence already reads.
+        $hex = [BitConverter]::ToString($incremental.GetHashAndReset()).Replace('-', '')
+    } finally {
+        $incremental.Dispose()
+        $stream.Dispose()
+    }
+    $seconds = [Math]::Max(0.001, $stopwatch.Elapsed.TotalSeconds)
+    Add-GuiSmokeTraceLine ("$Label done bytes=$total seconds={0:N1} MBps={1:N1}" -f $seconds, ($total / 1048576.0 / $seconds))
+    $hex
+}
+
+# True only when the file is currently held open by somebody who denies writers -- proven by
+# asking for a write-capable open that tolerates every other sharer and being REFUSED with a
+# sharing violation (Win32 32). Opening for write with FileMode.Open never truncates or alters the
+# file; if the open unexpectedly succeeds it is closed at once and the file is reported unpinned.
+function Test-GuiSmokeFileWriteBlocked([string]$Path) {
+    $probe = $null
+    try {
+        $probe = [IO.File]::Open($Path, [IO.FileMode]::Open, [IO.FileAccess]::Write, [IO.FileShare]::ReadWrite)
+        return $false
+    } catch [System.IO.IOException] {
+        return (($_.Exception.HResult -band 0xFFFF) -eq 32)
+    } catch {
+        return $false
+    } finally {
+        if ($probe) { $probe.Dispose() }
+    }
+}
+
+# The job's verified clip identity (see -VerifiedClipBindingPath). A malformed or missing file is
+# "no binding", never an error: every part is then simply read.
+function Read-GuiSmokeVerifiedClipBinding([string]$Path) {
+    if ([string]::IsNullOrWhiteSpace($Path)) { return @() }
+    try {
+        $doc = [IO.File]::ReadAllText($Path) | ConvertFrom-Json
+        if ($doc.schema -ne 'gui-smoke-verified-clip-binding.v1') {
+            Add-GuiSmokeTraceLine 'clip-binding rejected (unknown schema); every part will be read'
+            return @()
+        }
+        return @($doc.parts)
+    } catch {
+        Add-GuiSmokeTraceLine 'clip-binding rejected (unreadable); every part will be read'
+        return @()
+    }
+}
+
+# One clip part's {path,length,sha256}. The sha256 comes from the job's binding WITHOUT reading the
+# file when (a) the binding names this exact path, (b) the file still has the bound length and (c)
+# the job's read-share handle still pins it -- so the file the app opens is byte-for-byte the file
+# the job hashed, exactly as strongly as before. Otherwise the part is read once, in large blocks,
+# with trace lines.
+function Get-GuiSmokeClipPartBinding([string]$Path, [object[]]$VerifiedParts, [string]$Label) {
+    $item = Get-Item -LiteralPath $Path
+    $length = [long]$item.Length
+    $claim = @($VerifiedParts | Where-Object {
+        $_ -and ([string]$_.path).Equals($item.FullName, [StringComparison]::OrdinalIgnoreCase)
+    }) | Select-Object -First 1
+    if ($claim -and
+        ([string]$claim.sha256) -match '^[0-9a-fA-F]{64}$' -and
+        [long]$claim.length -eq $length -and
+        (Test-GuiSmokeFileWriteBlocked -Path $item.FullName)) {
+        Add-GuiSmokeTraceLine "$Label identity carried from the job's verified read (held handle, length $length); no read"
+        return [pscustomobject]@{
+            path = $item.FullName
+            length = $length
+            sha256 = ([string]$claim.sha256).ToUpperInvariant()
+        }
+    }
+    if ($claim) {
+        Add-GuiSmokeTraceLine "$Label carried identity refused (length or held handle no longer matches); reading"
+    }
+    [pscustomobject]@{
+        path = $item.FullName
+        length = $length
+        sha256 = Get-GuiSmokeFileSha256 -Path $item.FullName -Label "$Label-identity-hash"
+    }
+}
+
 function Get-EvidenceFileBinding {
     param(
         [string]$Path,
@@ -946,7 +1077,7 @@ function Get-EvidenceFileBinding {
     [pscustomobject]@{
         path = $resolvedPath
         length = $item.Length
-        sha256 = (Get-FileHash -LiteralPath $resolvedPath -Algorithm SHA256).Hash
+        sha256 = Get-GuiSmokeFileSha256 -Path $resolvedPath -Label "evidence-$Label-hash"
     }
 }
 
@@ -1193,16 +1324,21 @@ function Get-GuiSmokeImmutableFileBinding([string]$Path) {
     [pscustomobject]@{
         path = $item.FullName
         length = [long]$item.Length
-        sha256 = (Get-FileHash -LiteralPath $item.FullName -Algorithm SHA256).Hash
+        sha256 = Get-GuiSmokeFileSha256 -Path $item.FullName -Label 'launch-input-hash'
     }
 }
 
 $exeStamp = Get-MlvAppBuildStamp -ExePath $exe
 $clipBaseName = [IO.Path]::GetFileNameWithoutExtension($inputPath)
+# The clip's parts are bound HERE, once (the capture-time evidence below reuses this object
+# instead of reading the clip a second time). See -VerifiedClipBindingPath.
+$verifiedClipParts = @(Read-GuiSmokeVerifiedClipBinding -Path $VerifiedClipBindingPath)
+$clipPartIndex = 0
 $clipParts = @(Get-ChildItem -LiteralPath (Split-Path -Parent $inputPath) -File | Where-Object {
     $_.BaseName -ceq $clipBaseName -and $_.Extension -match '^\.M(?:LV|\d\d)$'
 } | Sort-Object @{ Expression = { if ($_.Extension -ieq '.MLV') { -1 } else { [int]$_.Extension.Substring(2) } } } | ForEach-Object {
-    Get-GuiSmokeImmutableFileBinding -Path $_.FullName
+    Get-GuiSmokeClipPartBinding -Path $_.FullName -VerifiedParts $verifiedClipParts -Label "clip-part$clipPartIndex"
+    $clipPartIndex++
 })
 # The multipart binding is EVIDENCE ABOUT A REAL LAUNCH. Under -DryRun nothing launches and
 # $launchInputBindings is never consumed (its only reader is the evidence object emitted after
@@ -1215,7 +1351,7 @@ $launchInputBindings = [pscustomobject]@{
     executable = [pscustomobject]@{
         path = $exe
         length = [long](Get-Item -LiteralPath $exe).Length
-        sha256 = (Get-FileHash -LiteralPath $exe -Algorithm SHA256).Hash
+        sha256 = Get-GuiSmokeFileSha256 -Path $exe -Label 'launch-exe-hash'
         embeddedCommit = $exeStamp.sha
         dirty = $exeStamp.dirty
         stampFound = [bool]$exeStamp.found
@@ -1595,6 +1731,7 @@ if ($DryRun) {
             legacyGuiSmokeOptions = [bool]$LegacyGuiSmokeOptions
             processTimeoutMs = $effectiveProcessTimeoutMs
         }
+        clipBindings = $clipParts
         output = $outputPath
     }
     if ($RequireFreshScreenshotRender) {
@@ -1625,7 +1762,14 @@ for ($argumentIndex = 0; $argumentIndex -lt $arguments.Count; ++$argumentIndex) 
 }
 $captureInputBindings = [pscustomobject]@{
     executable = Get-EvidenceFileBinding -Path $exe -Label "executable"
-    clip = Get-EvidenceFileBinding -Path $inputPath -Label "clip"
+    # The root part's binding taken at launch-input time above (verified by the job's held handle, or
+    # read once with trace lines) -- never a second read of the clip: this used to hash it again in
+    # small blocks just before the process started, outside the process timeout.
+    clip = [pscustomobject]@{
+        path = $clipParts[0].path
+        length = $clipParts[0].length
+        sha256 = $clipParts[0].sha256
+    }
     receipt = if ($receiptPath) {
         Get-EvidenceFileBinding -Path $receiptPath -Label "receipt"
     } else { $null }
