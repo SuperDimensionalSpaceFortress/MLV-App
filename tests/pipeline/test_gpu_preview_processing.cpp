@@ -7,6 +7,8 @@
 
 #include "../../platform/qt/GpuPreviewProcessing.h"
 #include "../../src/processing/raw_processing.h"
+#include "../../src/debug/StageTiming.h"
+#include "../../src/batch/WorkerThreadCount.h"
 
 #include <QtGlobal>
 #include <algorithm>
@@ -15,6 +17,7 @@
 #include <cstring>
 #include <functional>
 #include <string>
+#include <thread>
 #include <vector>
 
 static void assert_gpu_preview_fixture_ready(MlvPipelineFixture & fixture)
@@ -328,14 +331,414 @@ TEST(GpuPreviewProcessing, OffscreenResourcesSurviveRepeatedSoftwareGlRuns)
     }
 }
 
-TEST(GpuPreviewProcessing, DisplayShaderDoesNotUseShadowsHighlightsFrameState)
+TEST(GpuPreviewProcessing, DisplayShaderUsesShadowsHighlightsFrameStateWhenApplied)
 {
+    /* CUDA-PLAYBACK-LOOK-PARITY-1: the live display shader now applies
+     * shadows/highlights (shadowsHighlightsBlurTexture/shadowsHighlightsCurve
+     * branch in gpuPreviewProcessingDisplayFragmentShaderSource), so it must
+     * request the same per-frame frame-state as the subset shader -- this
+     * governs RenderFrameThread's gpuTexNrDisplayLutOnlyShStateBypass gate. */
     GpuPreviewProcessingConfig config;
     config.enabled = true;
     config.applyShadowsHighlights = true;
 
     ASSERT_TRUE(gpuPreviewProcessingNeedsShadowsHighlightsFrameState(config));
-    ASSERT_TRUE(!gpuPreviewProcessingDisplayShaderUsesShadowsHighlightsFrameState(config));
+    ASSERT_TRUE(gpuPreviewProcessingDisplayShaderUsesShadowsHighlightsFrameState(config));
+
+    GpuPreviewProcessingConfig disabled;
+    disabled.enabled = true;
+    disabled.applyShadowsHighlights = false;
+    ASSERT_TRUE(!gpuPreviewProcessingDisplayShaderUsesShadowsHighlightsFrameState(disabled));
+
+    GpuPreviewProcessingConfig notEnabled;
+    notEnabled.enabled = false;
+    notEnabled.applyShadowsHighlights = true;
+    ASSERT_TRUE(!gpuPreviewProcessingDisplayShaderUsesShadowsHighlightsFrameState(notEnabled));
+}
+
+TEST(GpuPreviewProcessing, ShadowsHighlightsBlurTextureUpdateReportsDropWhenFrameStateMissing)
+{
+    /* CUDA-PLAYBACK-LOOK-PARITY-1 round-1 v2.1 contract: "no silent drop" --
+     * this is the function RenderFrameThread's caller (GpuDisplayWindow /
+     * GpuDisplayViewport) relies on to know whether S/H actually reached the
+     * screen for this frame. It must report the miss via its return value AND
+     * leave shadowsHighlightsBlurReady false, without touching GL at all, so
+     * this runs unconditionally (no GPU/context requirement, no SKIP_TEST). */
+    GpuPreviewProcessingConfig config;
+    config.enabled = true;
+    config.applyShadowsHighlights = true;
+    /* shadowsHighlightsBlur left empty / shadowsHighlightsFrameStateReady left
+     * false -> gpuPreviewProcessingHasShadowsHighlightsFrameState(config, ...)
+     * is false, exactly the state RenderFrameThread leaves the config in when
+     * gpuTexNrDisplayLutOnlyShStateBypass was still true (fast frame-state
+     * refresh never ran) or the refresh itself failed. */
+
+    GpuPreviewProcessingLutTextureSet lutSet;
+    const bool updated = gpuPreviewProcessingUpdateShadowsHighlightsBlurTexture(
+        lutSet, config, 8, 6);
+    ASSERT_TRUE(!updated);
+    ASSERT_TRUE(!lutSet.shadowsHighlightsBlurReady);
+    ASSERT_TRUE(lutSet.shadowsHighlightsBlur == nullptr);
+
+    gpuPreviewProcessingDestroyLutTextureSet(lutSet);
+}
+
+/* CPU-vs-GPU parity harness for the DISPLAY shader (mirrors
+ * assert_gpu_offscreen_matches_cpu_reference above, but through
+ * gpuPreviewProcessingApplyDisplayGpuOffscreen / the shared production
+ * display-shader binding path instead of the subset offscreen path). */
+static void assert_gpu_display_offscreen_matches_cpu_reference(
+    MlvPipelineFixture & fixture,
+    const GpuPreviewProcessingConfig & config,
+    const char * label)
+{
+    ASSERT_TRUE(config.enabled);
+
+    qputenv("MLVAPP_GPU_PREVIEW_ALLOW_SOFTWARE", QByteArray("1"));
+
+    const GpuPreviewProcessingBackendAvailability availability =
+        gpuPreviewProcessingProbeGpuBackend();
+    if (!availability.available)
+    {
+        ASSERT_TRUE(gpu_preview_skip_reason_is_known(availability.reason));
+        SKIP_TEST(availability.reason.toStdString());
+    }
+
+    const std::vector<uint16_t> debayered = fixture.renderDebayeredFrame16(0);
+    ASSERT_TRUE(!debayered.empty());
+    const int pixel_count = fixture.width() * fixture.height();
+    ASSERT_EQ(static_cast<size_t>(pixel_count) * 3u, debayered.size());
+
+    /* The CPU oracle must be scoped to exactly what the DISPLAY shader
+     * implements. `config.applyCreativeCurves`/`applyToning`/`applySaturation`/
+     * `applyHueVs` are gated by the SAME `allow_creative_adjustments` master
+     * switch this harness's callers use to unlock contrast/vibrance/S-H
+     * (raw_processing.h's `processingAllowCreativeAdjustments`), so building
+     * `config` for a display-shader test also flips those four on -- but the
+     * DISPLAY shader (docs/cuda-playback-look-parity.md's "two shaders" table)
+     * never implements them; only the SUBSET shader does. Comparing against an
+     * unscoped CPU reference silently pulls in the post-gamma creative-curves
+     * stage's output (whatever pre_calc_curve_r/gcurve_* currently are) and
+     * fails this parity check for a reason that has nothing to do with the
+     * display shader's own correctness. */
+    GpuPreviewProcessingConfig display_scoped_config = config;
+    display_scoped_config.applyCreativeCurves = false;
+    display_scoped_config.applyToning = false;
+    display_scoped_config.applySaturation = false;
+    display_scoped_config.applyHueVs = false;
+
+    std::vector<uint16_t> cpu_output(debayered.size(), 0);
+    gpuPreviewProcessingApplyCpuReference(display_scoped_config, debayered.data(),
+                                          cpu_output.data(), fixture.width(), fixture.height());
+
+    std::vector<uint16_t> gpu_output(debayered.size(), 0);
+    QString reason;
+    QString renderer;
+    const bool ok = gpuPreviewProcessingApplyDisplayGpuOffscreen(
+        config, debayered.data(), gpu_output.data(),
+        fixture.width(), fixture.height(), &reason, &renderer);
+    if (!ok)
+    {
+        ASSERT_TRUE(gpu_preview_skip_reason_is_known(reason));
+        SKIP_TEST(reason.toStdString());
+    }
+
+    /* Same provisional software-GL-calibrated tolerance rationale as the
+     * subset harness above: the display shader's contrast/S-H/vibrance GLSL
+     * is a direct port of the same formulas, so the same LUT-boundary float
+     * ULP drift is expected, not a logic bug. */
+    const frame_compare_result_t result = compare_frames_u16(
+        cpu_output.data(), gpu_output.data(),
+        fixture.width(), fixture.height(), 3, /*per_pixel_tolerance=*/2);
+    const frame_tolerance_verdict_t verdict = evaluate_frame_tolerance(
+        result, debayered.size(),
+        /*max_abs_diff_threshold=*/16, /*max_mismatch_fraction=*/0.03);
+
+    test_artifacts::record(std::string("gpu_preview_display.gpu_parity.") + label + ".renderer",
+                           renderer.toStdString());
+    test_artifacts::record(std::string("gpu_preview_display.gpu_parity.") + label + ".compare",
+                           frame_compare_summary(result));
+
+    if (!verdict.passed)
+    {
+        ::minitest::fail(__FILE__, __LINE__,
+                         std::string("Display-shader GPU offscreen vs CPU reference parity (")
+                             + label + ")",
+                         verdict.detail);
+    }
+}
+
+TEST(GpuPreviewProcessing, DisplayShaderContrastPivotMatchesCpuReference)
+{
+    /* Round-1 scope: contrast+pivot was silently dropped by the live display
+     * shader (only levels/matrix/gamma were applied). Mutation-sensitive: a
+     * broken/missing inLoopContrastCurve binding or a wrong luma weight in the
+     * GLSL port would fail this against the CPU reference, and the neutral-vs-
+     * non-neutral output-change assertion below would fail if the contrast
+     * stage were a no-op. */
+    MlvPipelineFixture fixture;
+    assert_gpu_preview_fixture_ready(fixture);
+    configure_gpu_preview_supported_subset(fixture);
+    processingObject_t * processing = fixture.processing();
+    processingAllowCreativeAdjustments(processing);
+    processingSetSimpleContrast(processing, 0.14);
+    processingSetPivot(processing, 0.46);
+
+    QString reason;
+    ASSERT_TRUE(gpuPreviewProcessingIsSupported(processing, &reason));
+    const GpuPreviewProcessingConfig config = gpuPreviewProcessingBuildConfig(processing, &reason);
+    ASSERT_TRUE(config.enabled);
+    ASSERT_TRUE(config.applyInLoopContrast);
+    ASSERT_TRUE(!config.applyShadowsHighlights);
+    ASSERT_TRUE(!config.applyVibrance);
+
+    const std::vector<uint16_t> debayered = fixture.renderDebayeredFrame16(0);
+    std::vector<uint16_t> neutral_output(debayered.size(), 0);
+    GpuPreviewProcessingConfig neutral_config = config;
+    neutral_config.applyInLoopContrast = false;
+    gpuPreviewProcessingApplyCpuReference(neutral_config, debayered.data(),
+                                          neutral_output.data(), fixture.width(), fixture.height());
+    std::vector<uint16_t> contrast_output(debayered.size(), 0);
+    gpuPreviewProcessingApplyCpuReference(config, debayered.data(),
+                                          contrast_output.data(), fixture.width(), fixture.height());
+    ASSERT_TRUE(neutral_output != contrast_output);
+
+    assert_gpu_display_offscreen_matches_cpu_reference(fixture, config, "contrast_pivot");
+}
+
+TEST(GpuPreviewProcessing, DisplayShaderVibranceMatchesCpuReference)
+{
+    /* Round-1 scope: vibrance was silently dropped by the live display
+     * shader. */
+    MlvPipelineFixture fixture;
+    assert_gpu_preview_fixture_ready(fixture);
+    configure_gpu_preview_supported_subset(fixture);
+    processingObject_t * processing = fixture.processing();
+    processingAllowCreativeAdjustments(processing);
+    processingSetVibrance(processing, 1.03);
+
+    QString reason;
+    ASSERT_TRUE(gpuPreviewProcessingIsSupported(processing, &reason));
+    const GpuPreviewProcessingConfig config = gpuPreviewProcessingBuildConfig(processing, &reason);
+    ASSERT_TRUE(config.enabled);
+    ASSERT_TRUE(config.applyVibrance);
+    ASSERT_TRUE(!config.applyInLoopContrast);
+    ASSERT_TRUE(!config.applyShadowsHighlights);
+
+    assert_gpu_display_offscreen_matches_cpu_reference(fixture, config, "vibrance");
+}
+
+TEST(GpuPreviewProcessing, DisplayShaderShadowsHighlightsMatchesCpuReference)
+{
+    /* Round-1 scope, priority item: the fast S/H frame-state path
+     * (RenderFrameThread's gpuTexNrFastShFrameState*) was always bypassed for
+     * the live display shader (gpuTexNrDisplayLutOnlyShStateBypass), so the
+     * blur it computes never reached the screen. */
+    MlvPipelineFixture fixture;
+    assert_gpu_preview_fixture_ready(fixture);
+    const GpuPreviewProcessingConfig config =
+        build_shadows_highlights_config_with_frame_state(fixture);
+    ASSERT_TRUE(config.applyShadowsHighlights);
+    ASSERT_TRUE(!config.applyInLoopContrast);
+    ASSERT_TRUE(!config.applyVibrance);
+
+    assert_gpu_display_offscreen_matches_cpu_reference(fixture, config, "shadows_highlights");
+}
+
+TEST(GpuPreviewProcessing, DisplayShaderCombinedLookAssistPresetMatchesCpuReference)
+{
+    /* Combined round-1 defect class check, modeled on the owner's reported
+     * night preset (contrast=14 pivot=46 shadows=32 highlights=-26
+     * vibrance=3): every one of these must now reach the live display shader
+     * together, not just individually. */
+    MlvPipelineFixture fixture;
+    assert_gpu_preview_fixture_ready(fixture);
+    configure_gpu_preview_supported_subset(fixture);
+    processingObject_t * processing = fixture.processing();
+    processingAllowCreativeAdjustments(processing);
+    processingSetSimpleContrast(processing, 0.14);
+    processingSetPivot(processing, 0.46);
+    processingSetShadows(processing, 0.32);
+    processingSetHighlights(processing, -0.26);
+    processingSetVibrance(processing, 1.03);
+
+    QString reason;
+    ASSERT_TRUE(gpuPreviewProcessingIsSupported(processing, &reason));
+    GpuPreviewProcessingConfig config = gpuPreviewProcessingBuildConfig(processing, &reason);
+    ASSERT_TRUE(config.enabled);
+    ASSERT_TRUE(config.applyInLoopContrast);
+    ASSERT_TRUE(config.applyShadowsHighlights);
+    ASSERT_TRUE(config.applyVibrance);
+    ASSERT_TRUE(!gpuPreviewProcessingHasShadowsHighlightsFrameState(
+        config, fixture.width(), fixture.height()));
+
+    const std::vector<uint16_t> refreshed = fixture.renderFrame16(0, /*threads=*/1);
+    ASSERT_TRUE(!refreshed.empty());
+    ASSERT_TRUE(gpuPreviewProcessingAttachFrameState(
+        &config, processing, fixture.width(), fixture.height(), &reason));
+    ASSERT_TRUE(gpuPreviewProcessingHasShadowsHighlightsFrameState(
+        config, fixture.width(), fixture.height()));
+
+    assert_gpu_display_offscreen_matches_cpu_reference(fixture, config, "night_preset_combined");
+}
+
+TEST(GpuPreviewProcessing, DisplayShaderFastPathFrameCostBudget)
+{
+    /* Round-2 item 3: measure, don't guess, the per-frame cost the fast S/H
+     * frame-state path now actually pays on the live CUDA texture-present
+     * path now that gpuTexNrDisplayLutOnlyShStateBypass no longer refuses it.
+     * Debayer + blur refresh are CPU-only production functions
+     * (debayerBasicU16, processingRefreshShadowsHighlightsBlurFromRgb16) run
+     * at this fixture's real 1808x2268 size, so these numbers are directly
+     * comparable to steady-state production cost on THIS host regardless of
+     * GPU. Measured at TWO thread counts: this test binary's own forced
+     * single-threaded mode (test_runtime::force_single_threaded_pipeline(),
+     * installed in main() for determinism -- mlvappEffectivePlaybackWorkerThread
+     * Count() reports 1 under it, which is a worst-case bound, not what real
+     * playback uses) and this host's hardware_concurrency(), which
+     * RenderFrameThread.cpp:4027's mlvappEffectivePlaybackWorkerThreadCount()
+     * would actually pick outside this test binary (both functions take
+     * `threads` as an explicit parameter, so passing either bypasses the
+     * process-wide single-thread lock safely -- no global state is touched).
+     * The blur-texture-upload and display-shader-draw numbers below are
+     * DIFFERENT in kind: they go through the public
+     * gpuPreviewProcessingApplyDisplayGpuOffscreen() entry point, which (unlike
+     * the live GpuDisplayWindow/GpuDisplayViewport presenters) creates a fresh
+     * GL context, program and LUT-texture set on every call instead of reusing
+     * signature-cached ones -- there is no lighter-weight public surface to
+     * benchmark against, so this is reported as an upper bound, not a
+     * steady-state estimate, and it runs through llvmpipe (software) on this
+     * box, not real hardware. */
+    MlvPipelineFixture fixture;
+    assert_gpu_preview_fixture_ready(fixture);
+    const GpuPreviewProcessingConfig config =
+        build_shadows_highlights_config_with_frame_state(fixture);
+    ASSERT_TRUE(config.applyShadowsHighlights);
+
+    const int w = fixture.width();
+    const int h = fixture.height();
+    std::vector<uint16_t> rawBayer(static_cast<std::size_t>(w) * static_cast<std::size_t>(h));
+    ASSERT_EQ(0, getMlvRawFrameUint16(fixture.video(), 0, rawBayer.data()));
+
+    const int iterations = 20;
+    std::vector<uint16_t> rgb16(static_cast<std::size_t>(w) * static_cast<std::size_t>(h) * 3u);
+    auto measure_fast_sh_cost = [&](int threads, std::vector<double> * debayerMs, std::vector<double> * refreshMs)
+    {
+        for (int i = 0; i < iterations; ++i)
+        {
+            const double debayerStart = mlv_stage_timing_now();
+            debayerBasicU16(rgb16.data(), rawBayer.data(), w, h, threads, /*bit_shift=*/0);
+            debayerMs->push_back((mlv_stage_timing_now() - debayerStart) * 1000.0);
+
+            /* Match RenderFrameThread.cpp:4152-4178 exactly: the refresh's
+             * cost depends heavily on preview-mode state -- at scale 1, the
+             * quarterres RBF path is only selected when preview mode is on
+             * and aggressive preview mode is off
+             * (processing_standard_x1_shadows_highlights_quarterres_enabled(),
+             * raw_processing.c:264-286) -- so calling this function without
+             * that state produces a number that does not match what the live
+             * path pays. */
+            const int previousPreviewMode = processingPlaybackPreviewModeEnabled();
+            const int previousAggressivePreviewMode = processingPlaybackAggressivePreviewModeEnabled();
+            const int previousPreviewScaleFactor = processingPlaybackPreviewScaleFactor();
+            processingSetPlaybackPreviewMode( 1 );
+            processingSetPlaybackAggressivePreviewMode(
+                mlvPlaybackAggressivePreviewMode() != 0 ? 1 : 0 );
+            processingSetPlaybackPreviewScaleFactor( 1 );
+            const double refreshStart = mlv_stage_timing_now();
+            const int refreshed = processingRefreshShadowsHighlightsBlurFromRgb16(
+                fixture.processing(), rgb16.data(), w, h, threads, /*forceExportPolicy=*/0);
+            refreshMs->push_back((mlv_stage_timing_now() - refreshStart) * 1000.0);
+            processingSetPlaybackPreviewScaleFactor( previousPreviewScaleFactor );
+            processingSetPlaybackAggressivePreviewMode( previousAggressivePreviewMode );
+            processingSetPlaybackPreviewMode( previousPreviewMode );
+            ASSERT_NE(0, refreshed);
+        }
+    };
+
+    const int singleThreadedCount = mlvappEffectivePlaybackWorkerThreadCount();
+    std::vector<double> debayerMsSingle;
+    std::vector<double> refreshMsSingle;
+    measure_fast_sh_cost(singleThreadedCount, &debayerMsSingle, &refreshMsSingle);
+
+    const int multiThreadedCount = qBound(
+        1, static_cast<int>(std::thread::hardware_concurrency()), 16);
+    std::vector<double> debayerMsMulti;
+    std::vector<double> refreshMsMulti;
+    if (multiThreadedCount > singleThreadedCount)
+    {
+        measure_fast_sh_cost(multiThreadedCount, &debayerMsMulti, &refreshMsMulti);
+    }
+
+    QString reason;
+    QString renderer;
+    std::vector<uint16_t> gpuOutput(static_cast<std::size_t>(w) * static_cast<std::size_t>(h) * 3u);
+    qputenv("MLVAPP_GPU_PREVIEW_ALLOW_SOFTWARE", QByteArray("1"));
+    const bool warm = gpuPreviewProcessingApplyDisplayGpuOffscreen(
+        config, rgb16.data(), gpuOutput.data(), w, h, &reason, &renderer);
+    std::vector<double> displayDrawMs;
+    if (warm)
+    {
+        for (int i = 0; i < iterations; ++i)
+        {
+            const double drawStart = mlv_stage_timing_now();
+            const bool ok = gpuPreviewProcessingApplyDisplayGpuOffscreen(
+                config, rgb16.data(), gpuOutput.data(), w, h, &reason, &renderer);
+            displayDrawMs.push_back((mlv_stage_timing_now() - drawStart) * 1000.0);
+            ASSERT_TRUE(ok);
+        }
+    }
+
+    auto percentile = [](std::vector<double> values, double fraction) -> double
+    {
+        if (values.empty()) return 0.0;
+        std::sort(values.begin(), values.end());
+        const std::size_t index = static_cast<std::size_t>(
+            std::min<double>(values.size() - 1, std::floor(fraction * (values.size() - 1) + 0.5)));
+        return values[index];
+    };
+
+    constexpr double kFrameBudgetMs = 40.0;
+    auto record_fast_sh_cost = [&](const char * prefix, int threads,
+                                   const std::vector<double> & debayerMs,
+                                   const std::vector<double> & refreshMs)
+    {
+        const double debayerP50 = percentile(debayerMs, 0.50);
+        const double debayerP90 = percentile(debayerMs, 0.90);
+        const double refreshP50 = percentile(refreshMs, 0.50);
+        const double refreshP90 = percentile(refreshMs, 0.90);
+        const double combinedP50 = debayerP50 + refreshP50;
+        const double combinedP90 = debayerP90 + refreshP90;
+        const std::string base = std::string("gpu_preview_display.frame_cost.") + prefix + ".";
+        test_artifacts::record(base + "threads", std::to_string(threads));
+        test_artifacts::record(base + "fast_sh_debayer_ms_p50", std::to_string(debayerP50));
+        test_artifacts::record(base + "fast_sh_debayer_ms_p90", std::to_string(debayerP90));
+        test_artifacts::record(base + "fast_sh_refresh_ms_p50", std::to_string(refreshP50));
+        test_artifacts::record(base + "fast_sh_refresh_ms_p90", std::to_string(refreshP90));
+        test_artifacts::record(base + "fast_sh_combined_ms_p50", std::to_string(combinedP50));
+        test_artifacts::record(base + "fast_sh_combined_ms_p90", std::to_string(combinedP90));
+        test_artifacts::record(base + "fast_sh_combined_budget_share_p90",
+                               std::to_string(combinedP90 / kFrameBudgetMs));
+    };
+    record_fast_sh_cost("single_threaded", singleThreadedCount, debayerMsSingle, refreshMsSingle);
+    if (!debayerMsMulti.empty())
+    {
+        record_fast_sh_cost("multi_threaded", multiThreadedCount, debayerMsMulti, refreshMsMulti);
+    }
+    if (!displayDrawMs.empty())
+    {
+        const double drawP50 = percentile(displayDrawMs, 0.50);
+        const double drawP90 = percentile(displayDrawMs, 0.90);
+        test_artifacts::record("gpu_preview_display.frame_cost.software_gl_full_offscreen_call_ms_p50",
+                               std::to_string(drawP50));
+        test_artifacts::record("gpu_preview_display.frame_cost.software_gl_full_offscreen_call_ms_p90",
+                               std::to_string(drawP90));
+        test_artifacts::record("gpu_preview_display.frame_cost.software_gl_renderer", renderer.toStdString());
+    }
+    else
+    {
+        test_artifacts::record("gpu_preview_display.frame_cost.software_gl_skipped_reason", reason.toStdString());
+    }
 }
 
 TEST(GpuPreviewProcessing, ExposureStopsChangesSubsetConfigAndStableOutput)
