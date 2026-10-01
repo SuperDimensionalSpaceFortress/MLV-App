@@ -273,7 +273,15 @@ param(
     [ValidateRange(0, 7200)]
     [int]$FixedPreLaunchSeconds = 0,
     [ValidateRange(0, 7200)]
-    [int]$PostRunSeconds = 0
+    [int]$PostRunSeconds = 0,
+
+    # PLAYBACK-CLIP-LENGTH-ENFORCE-1 (owner rule 2026-09-30): the settled-playback window the emitted
+    # job passes to run-release-gui-smoke.ps1 as -Seconds (it used to be a hard-coded 40). The
+    # runner refuses, before launching, any clip shorter than max(20, this); a fixture id is refused
+    # HERE, at generation, because both tracked fixtures are far under 20 s and are never played on
+    # a venue. Floor 20: a play window under the owner's 20 s minimum is not a playback test.
+    [ValidateRange(20, 3600)]
+    [int]$PlaySeconds = 25
 )
 
 $ErrorActionPreference = 'Stop'
@@ -476,6 +484,21 @@ if (-not $isFixtureRehearsal) {
     if ($ownerPartsForJob.Count -eq 1) { $ownerPartsJson = "[$ownerPartsJson]" }
 }
 
+# PLAYBACK-CLIP-LENGTH-ENFORCE-1: refuse at GENERATION time, with the runner's own typed verdict
+# (one shared implementation), when the clip's known length cannot cover the play window. A fixture
+# id's length is read from its TRACKED header under -RepoRoot (52 bytes, never the footage); an owner
+# clip's bytes are never opened by this generator and the resolver records no frame count, so the
+# owner arm is enforced by the same gate inside the emitted job's run-release-gui-smoke.ps1 call,
+# which reads the clip's header at the venue before anything launches.
+. (Join-Path $PSScriptRoot '..\gui-smoke-length-gate.ps1')
+if ($isFixtureRehearsal) {
+    $fixtureHeaderPath = Join-Path $RepoRoot ('tests' + [IO.Path]::DirectorySeparatorChar + 'fixtures' + [IO.Path]::DirectorySeparatorChar + 'clips' + [IO.Path]::DirectorySeparatorChar + $ClipId + $FixtureClipExtension)
+    $fixtureLengthGate = Test-GuiSmokeClipLength -Path $fixtureHeaderPath -WindowSeconds $PlaySeconds
+    if ($fixtureLengthGate.verdict -ne 'OK') {
+        throw "PLAYBACK_ATTR3_$($fixtureLengthGate.message)"
+    }
+}
+
 # ATTR3-FOOTAGE-BIND-1 PR-B round 6 (astra major): the owner arm's -AgentRoot shape check runs
 # HERE -- after the complete owner-id decision (flag refusals, RepoRoot resolution, the resolver
 # call and its own typed refusal) -- never before it. -AgentRoot plays no part in reaching the
@@ -616,7 +639,9 @@ $embeddedFunctions = Get-AttrCudaEmbeddedFunctionSource -Name @(
     'Get-AttrCudaGuiSmokeDisplaySelection',
     # DISPLAY-SMOKE-FAILED-LOG-PRESERVE-1: locates the display log a FAILED smoke run left behind
     # (no result.json) and parses it with the shared parser; calls Get-AttrCudaGuiSmokeDisplaySelection.
-    'Find-AttrCudaFailedSmokeDisplayLog'
+    'Find-AttrCudaFailedSmokeDisplayLog',
+    # PLAYBACK-CLIP-LENGTH-ENFORCE-3: the receipt oracle (source_advanced >= required_source_frames, native pace, no wrap).
+    'Get-AttrCudaSourceFramesVerdict'
 )
 # ATTR3-FOOTAGE-BIND-1 PR-B round 4b: the private verified-part directory (one view entry per
 # verified part -- since OWNER-FOOTAGE-NO-HARDLINK-1 a symbolic link or a byte copy, never a hard
@@ -786,6 +811,9 @@ $timeBudgetArgs = @{}
 if ($ColdReadMBps -gt 0.0) { $timeBudgetArgs['ColdReadMBps'] = $ColdReadMBps }
 if ($FixedPreLaunchSeconds -gt 0) { $timeBudgetArgs['FixedPreLaunchSeconds'] = $FixedPreLaunchSeconds }
 if ($PostRunSeconds -gt 0) { $timeBudgetArgs['PostRunSeconds'] = $PostRunSeconds }
+# PLAYBACK-CLIP-LENGTH-ENFORCE-1: the smoke-process timeout keeps the old 40 s play allowance as a
+# floor (extra slack only; the default baked timeout is unchanged) and grows with a longer -PlaySeconds.
+$timeBudgetArgs['PlaySeconds'] = [int][Math]::Max(40, $PlaySeconds)
 $timeBudget = Get-AttrCudaLegTimeBudget -InputBytes $clipBytesForBudget @timeBudgetArgs
 
 # --- job body template (placeholders are substituted below; the body itself never
@@ -838,6 +866,7 @@ $Trace = Join-Path $Root "logs\$JobId.trace.txt"
 $PresentMonTimedSeconds = __PRESENTMON_TIMED_SECONDS__
 $PresentMonTerminateOnProcExit = __PRESENTMON_TERMINATE_ON_PROC_EXIT__
 $SmokeProcessTimeoutMs = __SMOKE_PROCESS_TIMEOUT_MS__
+$PlaySeconds = __PLAY_SECONDS__
 # BACHELOR-OWNER-CLIP-STAGE-STALL-1 round 1f: true only when the smoke runner COMMITTED at this leg's
 # -SourceCommit declares -VerifiedClipBindingPath and -TracePath (decided by the generator from those
 # committed bytes -- the venue has no checkout). A runner without them would reject the parameters
@@ -1766,13 +1795,12 @@ if ((Get-Sha $exePath 'deployed-exe-hash') -ne $cacheExeSha -or (Get-Sha $reconD
 Write-JobTrace 'step deploy done'
 
 reg add "HKCU\Software\Microsoft\DirectX\UserGpuPreferences" /v "$exePath" /t REG_SZ /d "GpuPreference=2;" /f | Out-Null
-reg add "HKCU\Software\magiclantern.MLVApp\MLVApp" /v playbackProcessingSubset /t REG_DWORD /d 1 /f | Out-Null
-reg add "HKCU\Software\magiclantern.MLVApp\MLVApp" /v zebras /t REG_DWORD /d 0 /f | Out-Null
-reg add "HKCU\Software\magiclantern.MLVApp\MLVApp" /v caching /t REG_DWORD /d 0 /f | Out-Null
-reg add "HKCU\Software\magiclantern.MLVApp\MLVApp\Playback" /v QualityMode /t REG_DWORD /d 1 /f | Out-Null
-reg add "HKCU\Software\magiclantern.MLVApp\MLVApp\Playback" /v PreviewMode /t REG_DWORD /d 0 /f | Out-Null
-reg add "HKCU\Software\magiclantern.MLVApp\MLVApp\Playback" /v ScaleFactorOverride /t REG_DWORD /d 0 /f | Out-Null
-reg add "HKCU\Software\magiclantern.MLVApp\MLVApp\Playback" /v PreviewResolution /t REG_DWORD /d 0 /f | Out-Null
+# PLAYBACK-CLIP-LENGTH-ENFORCE-4 (ATTR3-DEAD-REGISTRY-SEED-1): this job used to seed seven app settings under the
+# venue's HKCU app key. An automation run (the smoke the job launches) reads a RUN-SCOPED settings store and never
+# that key, so the seeds changed nothing but the venue's own saved settings. Every value it wrote is what the app
+# already uses: processing subset (the runner/app option default is Subset), zebras and caching off, QualityMode 1
+# (HighQuality), PreviewMode 0 (SharpSmooth), ScaleFactorOverride 0 (auto), PreviewResolution 0 (Auto) -- pinned in
+# tools/repo_hygiene/test_playback_evidence_completeness.py against the app's compiled defaults.
 
 # UM-DISPLAY-SELECT-AND-LOG-1 item 2/2a: the Windows view of every active display, captured before
 # any measurement (the CPU quiescence sample below, then the smoke run) -- independent of Qt, and
@@ -1922,7 +1950,7 @@ $envs = @(
 # default.
 $envList = "'" + ($envs -join "','") + "'"
 function ConvertTo-PsSingleQuoted([string]$Value) { "'" + $Value.Replace("'", "''") + "'" }
-$cmd = "& $(ConvertTo-PsSingleQuoted $smoke) -ExePath $(ConvertTo-PsSingleQuoted $exePath) -Input $(ConvertTo-PsSingleQuoted $clipPath) -Output $(ConvertTo-PsSingleQuoted $resultPath) -Seconds 40 -StartFrame 0 -SettleMs 2500 -ProcessTimeoutMs $SmokeProcessTimeoutMs -ScaleFactor 4 -UsePersistedPlaybackSettings -RequireLookAssist:`$false -Scope none -FrameTelemetry -PreserveExperimentalEnvironment -ExtraEnvironment @($envList)"
+$cmd = "& $(ConvertTo-PsSingleQuoted $smoke) -ExePath $(ConvertTo-PsSingleQuoted $exePath) -Input $(ConvertTo-PsSingleQuoted $clipPath) -Output $(ConvertTo-PsSingleQuoted $resultPath) -Seconds $PlaySeconds -StartFrame 0 -SettleMs 2500 -ProcessTimeoutMs $SmokeProcessTimeoutMs -ScaleFactor 4 -UsePersistedPlaybackSettings -RequireLookAssist:`$false -Scope none -FrameTelemetry -PreserveExperimentalEnvironment -ExtraEnvironment @($envList)"
 if ($RunnerAcceptsVerifiedClipBinding) {
     # BACHELOR-OWNER-CLIP-STAGE-STALL-1 round 1f: the runner's own remaining reads are traced into
     # this job's trace file, and (owner run) it takes the identity verified above instead of re-reading.
@@ -1946,7 +1974,10 @@ $contactSheetDir = $null
 if ($ContactSheetEnabled) {
     $contactSheetDir = Join-Path $Work 'contact-sheet'
     New-Item -ItemType Directory -Path $contactSheetDir -Force | Out-Null
-    $contactSheetAdditionalArgs = "@('--contact-sheet-dir', $(ConvertTo-PsSingleQuoted $contactSheetDir), '--contact-sheet-frames', '$ContactSheetFrameCount')"
+    # PLAYBACK-CLIP-LENGTH-ENFORCE-2 (owner rule 2026-09-30): ALWAYS seek mode. The app's default
+    # playback-mode contact sheet is a second Play of the measured span (a replay) and is refused
+    # (REPLAY_REFUSED); the seek capture never plays. Its sidecars record playback_path=false.
+    $contactSheetAdditionalArgs = "@('--contact-sheet-dir', $(ConvertTo-PsSingleQuoted $contactSheetDir), '--contact-sheet-frames', '$ContactSheetFrameCount', '--contact-sheet-seek-mode')"
     $cmd = "$cmd -AdditionalArgs $contactSheetAdditionalArgs"
 }
 # CUDA-PERF-DISPLAY-IDENTITY-HARNESS-1/2/3 (sol BLOCKER 2 / fable HARDENING, direction corrected
@@ -2154,11 +2185,21 @@ if ($null -ne $smokeLaunchException -or $smokeRc -ne 0 -or -not (Test-Path -Lite
             -Venue $measurementVenue -ExpectedWidth $expectedDisplayWidth -ExpectedHeight $expectedDisplayHeight `
             -AppSelection $failedSmokeDisplayLog.selection -PreferredResolution $displayPreferResolution
     }
+    # PLAYBACK-CLIP-LENGTH-ENFORCE-2: the TYPED reason a clip-length / loop / replay gate refused (or
+    # invalidated) the run, as its own summary field -- not only a substring of the stderr tail. Exit codes:
+    # 41 CLIP_TOO_SHORT / PLAY_WINDOW_TOO_SHORT, 42 CLIP_LENGTH_UNKNOWN, 43 INVALID_LOOPED, 44
+    # PASS_THROUGH_REFUSED, 14 the app's own play gate (CLIP_TOO_SHORT or REPLAY_REFUSED); NONE otherwise.
+    $smokeRefusalReason = 'NONE'
+    if (@(14, 41, 42, 43, 44) -contains [int]$smokeRc) {
+        $smokeRefusalReason = if ($smokeStderrTail -match '(PLAY_WINDOW_TOO_SHORT|PLAY_DURATION_TOO_SHORT|PLAY_PACE_TOO_SLOW|CLIP_TOO_SHORT|CLIP_LENGTH_UNKNOWN|INVALID_SOURCE_FRAMES|INVALID_LOOPED|SOURCE_FRAMES_SHORT|PLAY_SAFETY_TIMEOUT|REPLAY_REFUSED|PASS_THROUGH_REFUSED)') { $Matches[1] }
+                                else { "EXIT_$([int]$smokeRc)" }
+    }
     $smokeFailure = [ordered]@{
         schema='playback-attr-3-cuda-venue.v1'; result='SMOKE_RUN_FAILED'
         fixtureRehearsal=$FixtureRehearsal
         displayWake=$displayWake
         smokeExitCode=$smokeRc; smokeResultPresent=(Test-Path -LiteralPath $resultPath)
+        smokeRefusalReason=$smokeRefusalReason
         smokeStderrTail=$smokeStderrTail
         smokeLaunchExceptionType=$smokeLaunchExceptionType
         smokeLaunchExceptionMessage=$smokeLaunchExceptionMessage
@@ -2379,6 +2420,40 @@ if (-not $verdict.admitted) {
     Save-Json $refusal (Join-Path $Pub 'summary.json')
     Write-Output "RESULT=BACKEND_NOT_AVAILABLE CUDA_BACKEND_AVAILABLE=$($verdict.cudaBackendAvailable) R16_AVAILABLE=$($verdict.r16Available) R16_REASON=`"$($verdict.r16Reason)`" $(Get-AttrCudaDisplayResultTail $displayBlock) ARTIFACTS=$Pub"
     exit $verdict.exitCode
+}
+
+# PLAYBACK-CLIP-LENGTH-ENFORCE-3 RECEIPT ORACLE: "20 s of real footage" is a SOURCE-FRAME quantity. The measured
+# session's own playback_smoke.summary says how many distinct source frames the engine advanced and how many
+# the admitted Play had to; a receipt with fewer (or none, or a run paced by a persisted fps override, or a
+# wrapped timeline) is INVALID, never MEASUREMENT_CAPTURED -- whatever the smoke runner's exit code said.
+$sourceFramesSummaryLine = $null
+foreach ($candidateLine in ($rawLog -split "`r?`n")) {
+    if ($candidateLine -match ('playback_smoke\.summary session=' + [regex]::Escape([string]$measuredSmokeSessionId) + '(\s|$)')) {
+        $sourceFramesSummaryLine = $candidateLine
+    }
+}
+$sourceFramesVerdict = Get-AttrCudaSourceFramesVerdict -SummaryLine $sourceFramesSummaryLine -ExpectedRunNonce $runLog.runNonce
+$sourceFramesWrapped = [bool]$sourceFramesVerdict.wrapped
+$sourceFramesBlock = [ordered]@{
+    oracle = 'source_advanced >= required_source_frames, wrapped=0, native pace, no fps override'
+    sourceAdvanced = $sourceFramesVerdict.sourceAdvanced
+    requiredSourceFrames = $sourceFramesVerdict.requiredSourceFrames
+    wrapped = $sourceFramesWrapped
+    failures = @($sourceFramesVerdict.failures)
+}
+if ($sourceFramesVerdict.invalid) {
+    [void](Publish-AttrCudaContactSheetRawCaptures -Enabled $ContactSheetEnabled -SourceDir $contactSheetDir -PubRoot $Pub)
+    $sourceFramesRefusal = [ordered]@{
+        schema='playback-attr-3-cuda-venue.v1'; result='SOURCE_FRAMES_INVALID'
+        fixtureRehearsal=$FixtureRehearsal
+        displayWake=$displayWake
+        smokeRefusalReason=$(if ($sourceFramesWrapped) { 'INVALID_LOOPED' } else { 'INVALID_SOURCE_FRAMES' })
+        sourceFrames=$sourceFramesBlock
+        display=$displayBlock; sourceCommit=$SourceCommit; clipId=$ClipId; artifactRoot=$Pub
+    }
+    Save-Json $sourceFramesRefusal (Join-Path $Pub 'summary.json')
+    Write-Output "RESULT=SOURCE_FRAMES_INVALID SOURCE_ADVANCED=$($sourceFramesVerdict.sourceAdvanced) REQUIRED_SOURCE_FRAMES=$($sourceFramesVerdict.requiredSourceFrames) WRAPPED=$sourceFramesWrapped ARTIFACTS=$Pub"
+    exit 29
 }
 
 $gpuSummary = Get-LastGpuSummary $rawLog $measuredSmokeSessionId
@@ -2695,6 +2770,7 @@ $manifest = [ordered]@{
         topCpuProcesses=$topCpuProcesses
     }
     frameRows = $rows.Count
+    sourceFrames = $sourceFramesBlock
     smokeRunLog = [ordered]@{ path=$runLog.path; sha256=$runLog.sha256; bytes=$runLog.bytes; runNonce=$runLog.runNonce; source=$runLog.source }
     diagnostics = $diagnostics
     gpuSummary = $gpuSummary
@@ -2718,6 +2794,7 @@ Save-Json ([ordered]@{
     sourceCommit = $SourceCommit
     clipId = $ClipId
     rows = $rows.Count
+    sourceFrames = $sourceFramesBlock
     gpuFramesTotal = $gpuFramesTotal
     cpuFrames = $gpuSummary.cpuFrames
     presentMonSamples = $pmRows.Count
@@ -2937,6 +3014,7 @@ $text = Expand-AttrCudaTemplate -Template $template -Tokens ([ordered]@{
     TELEMETRY_ARM = $TelemetryArm
     DISABLE_PAINT_PER_SUBMIT = $disablePaintPerSubmitLiteral
     SMOKE_PROCESS_TIMEOUT_MS = [string]$timeBudget.smokeProcessTimeoutMs
+    PLAY_SECONDS = [string]$PlaySeconds
     RUNNER_ACCEPTS_VERIFIED_CLIP_BINDING = $runnerAcceptsVerifiedClipBindingLiteral
     PRESENTMON_TIMED_SECONDS = $(if ($isFixtureRehearsal) { '55' } else { [string][int][math]::Ceiling($timeBudget.smokeProcessTimeoutMs / 1000.0) })
     PRESENTMON_TERMINATE_ON_PROC_EXIT = $(if ($isFixtureRehearsal) { '$false' } else { '$true' })

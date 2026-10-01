@@ -24,6 +24,11 @@ param(
 )
 
 $ErrorActionPreference = "Stop"
+# PLAYBACK-CLIP-LENGTH-ENFORCE-1 round 2 (sol B3): this wrapper can make the app PLAY the clip
+# (--exercise-play-action, and the Look Assist settle's warm-up play) with any -AdditionalArgs it is
+# handed, so it goes through the same gate as run-release-gui-smoke.ps1. A pure decode benchmark
+# (--profile-playback without a play-capable option) presents no playback and is not gated.
+. (Join-Path $PSScriptRoot 'gui-smoke-length-gate.ps1')
 
 function Resolve-FileSystemProviderPath {
     param(
@@ -101,8 +106,51 @@ try {
     $env:QT_QPA_PLATFORM_PLUGIN_PATH = $platformDir
     $env:QT_PLUGIN_PATH = $exeDir
 
+    # The gates run BEFORE anything launches (and before the -DryRun report), typed and path-free:
+    #   exit 44 PASS_THROUGH_REFUSED   exit 41 CLIP_TOO_SHORT   exit 42 CLIP_LENGTH_UNKNOWN
+    $passThroughGate = Test-GuiSmokePassThroughArguments -Arguments $AdditionalArgs -Context 'profile'
+    if ($passThroughGate.verdict -ne 'OK') {
+        [Console]::Error.WriteLine("PLAYBACK-CLIP-LENGTH-ENFORCE-1: $($passThroughGate.message)")
+        exit 44
+    }
+    $environmentGate = Test-GuiSmokeEnvironmentEntries -Entries $ExtraEnvironment
+    if ($environmentGate.verdict -ne 'OK') {
+        [Console]::Error.WriteLine("PLAYBACK-CLIP-LENGTH-ENFORCE-1: $($environmentGate.message)")
+        exit 44
+    }
+    $parentEnvironmentGate = Test-GuiSmokeParentEnvironment
+    if ($parentEnvironmentGate.verdict -ne 'OK') {
+        [Console]::Error.WriteLine("PLAYBACK-CLIP-LENGTH-ENFORCE-2: $($parentEnvironmentGate.message)")
+        exit 44
+    }
+    $clipLengthGate = 'NOT_PLAYING'
+    if ($passThroughGate.playCapable) {
+        if ([string]::IsNullOrWhiteSpace($ClipPath)) {
+            [Console]::Error.WriteLine("PLAYBACK-CLIP-LENGTH-ENFORCE-1: CLIP_LENGTH_UNKNOWN (reason=no_input)")
+            exit 42
+        }
+        # ENFORCE-2: the app gates the window from the CURRENT position (--start-frame) to the cut-out at
+        # >= 20 s, so the wrapper requires the same: 20 s must remain after -StartFrame.
+        $profileClipGate = Test-GuiSmokeClipLength -Path (Resolve-FileSystemProviderPath -Path $ClipPath) -WindowSeconds 20 -StartFrame $StartFrame
+        if ($profileClipGate.verdict -ne 'OK') {
+            [Console]::Error.WriteLine("PLAYBACK-CLIP-LENGTH-ENFORCE-1: $($profileClipGate.message)")
+            exit (Get-GuiSmokeGateExitCode -Verdict $profileClipGate.verdict)
+        }
+        $clipLengthGate = 'OK'
+    }
+    # ENFORCE-4 r2 (fable H1): the Look Assist settle / toggle options only Play in Auto quality mode. In any other mode the
+    # run could only end in exit 43 (programmatic_play_admitted=0) AFTER the whole run, so it is refused up front, typed
+    # (after the length gate: a clip that is too short is refused first, exactly as before).
+    $modeGate = Test-GuiSmokeProfileModeAdmitsPlay -Arguments $AdditionalArgs -QualityMode $QualityMode -ExtraEnvironment $ExtraEnvironment
+    if ($modeGate.verdict -ne 'OK') {
+        [Console]::Error.WriteLine("PLAYBACK-CLIP-LENGTH-ENFORCE-4: $($modeGate.message)")
+        exit 44
+    }
+
     if ($DryRun) {
         [pscustomobject]@{
+            clipLengthGate = $clipLengthGate
+            playCapable = [bool]$passThroughGate.playCapable
             exePath = $exe
             qtQpaPlatform = $env:QT_QPA_PLATFORM
             qtQpaPlatformPluginPath = $env:QT_QPA_PLATFORM_PLUGIN_PATH
@@ -129,6 +177,19 @@ try {
     $outputDir = Split-Path -Parent $outputPath
     if (-not [string]::IsNullOrWhiteSpace($outputDir)) {
         New-Item -ItemType Directory -Force -Path $outputDir | Out-Null
+    }
+    # ENFORCE-4 r2 (sol BLOCKER): "a receipt counts only if THIS invocation of the app wrote it, for THIS run". A play-capable
+    # profile (1) sets any pre-existing -Output aside BEFORE launching (renamed STALE-<utc>-<name>, never destroyed), (2) hands
+    # the app a per-run nonce that it echoes on the receipt, and (3) judges only a receipt that carries it and was written
+    # after the launch. Without this, `--exercise-play-action --help` (exit 0 before any write) was judged on the PREVIOUS run's
+    # valid receipt and reported success having played nothing.
+    $runNonce = New-GuiSmokeRunNonce
+    if ($passThroughGate.playCapable) {
+        $asideResult = Move-GuiSmokeStaleReceiptAside -Path $outputPath
+        if (-not $asideResult.ok) {
+            [Console]::Error.WriteLine("PLAYBACK-CLIP-LENGTH-ENFORCE-4: $($asideResult.message)")
+            exit 43
+        }
     }
 
     $arguments = @(
@@ -194,10 +255,44 @@ try {
         [void]$envBlock.Remove("MLVAPP_GPU_PLAYBACK_RECON_BACKEND")
     }
     Add-EnvironmentPairs -Target $envBlock -Pairs $ExtraEnvironment
+    # set AFTER -ExtraEnvironment: a caller cannot choose the nonce the receipt is judged against
+    $envBlock["MLVAPP_RUN_NONCE"] = $runNonce
 
+    $launchedUtc = [DateTime]::UtcNow
     $process = [System.Diagnostics.Process]::Start($startInfo)
-    $process.WaitForExit()
-    exit $process.ExitCode
+    if (-not $passThroughGate.playCapable) {
+        # A pure decode benchmark presents no playback: nothing to prove about footage.
+        $process.WaitForExit()
+        exit $process.ExitCode
+    }
+    # PLAYBACK-CLIP-LENGTH-ENFORCE-3 round 2 (fable H3): a profile that PLAYS (--exercise-play-action / the Look Assist
+    # settle) reports a result only if the app's own receipt proves its engine consumed the source frames of the window.
+    # The wrapper never ends the app on a clock of its own: the wait below is the app's wall-clock ceiling for a whole
+    # profile run (the Play itself ends on source-frame consumption inside the app, typed on failure); a process still
+    # running past it is killed and the result is INVALID (PLAY_SAFETY_TIMEOUT). An exit code of 0 is NOT enough: a binary
+    # that predates ENFORCE-3 exits 0 after a wall-clock hold, and writes no source_advanced, so it fails here.
+    $profileKilled = $false
+    if (-not $process.WaitForExit(3600000)) {
+        $profileKilled = $true
+        try { $process.Kill($true) } catch { try { $process.Kill() } catch {} }
+        [void]$process.WaitForExit(5000)
+    }
+    if (-not $profileKilled -and $process.ExitCode -ne 0) { exit $process.ExitCode }   # the app's own typed refusal / failure
+    $profileSummary = Get-GuiSmokeProfileReceiptSummary -Path $outputPath
+    # ENFORCE-4: -RequireAdmission. This wrapper only reaches here for a PLAY-CAPABLE profile, so a receipt without
+    # programmatic_play_admitted (a master-era binary writes none) is INVALID, never "nothing was played".
+    $profileVerdict = Get-GuiSmokeEvidencePlayVerdict -Summary $profileSummary `
+        -ExitCode $(if ($profileKilled) { $null } else { $process.ExitCode }) -KilledByLauncher $profileKilled -WindowSeconds 20 `
+        -RequireAdmission $true -ExpectedRunNonce $runNonce -ReceiptPath $outputPath -LaunchedUtc $launchedUtc
+    if ($profileVerdict.invalid) {
+        # fable H2: the rejected receipt is renamed <name>.INVALID<ext> (and stamped "invalid": true), so an offline reader
+        # of -Output cannot mistake it for evidence.
+        [void](Set-GuiSmokeReceiptInvalid -Path $outputPath -Failures $profileVerdict.failures)
+        foreach ($failure in $profileVerdict.failures) { [Console]::Error.WriteLine("PLAYBACK-CLIP-LENGTH-ENFORCE-3: $failure") }
+        [Console]::Error.WriteLine("PLAYBACK-CLIP-LENGTH-ENFORCE-3: INVALID -- this profile is not playback evidence (exit 43).")
+        exit $profileVerdict.exitCode
+    }
+    exit 0
 }
 finally {
     $env:QT_QPA_PLATFORM = $previousPlatform

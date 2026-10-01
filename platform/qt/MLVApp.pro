@@ -367,6 +367,7 @@ macx: SOURCES += ../cocoa/avf_lib/avf_lib.m
 HEADERS += MainWindow.h \
            ClipLifecycleBarrier.h \
            CrashForensics.h \
+           AutomationSettings.h \
            PlaybackFrameRange.h \
            PlaybackFpsMeterPolicy.h \
            DisplayDeviceMapping.h \

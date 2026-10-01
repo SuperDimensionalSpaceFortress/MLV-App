@@ -283,7 +283,33 @@ TEST(PlaybackDisplayWakeWiring, SummaryLineExportsScreensaverBlockedCount)
     ASSERT_FALSE(body.isEmpty());
 
     ASSERT_TRUE(body.indexOf(QStringLiteral("screensaver_blocked_count=%")) >= 0);
+    // No trailing ';': PLAYBACK-CLIP-LENGTH-ENFORCE-1 appended wrapped/total_frames/clip_seconds
+    // after this argument, so it is no longer the last .arg() of the chain.
     const int argAt = body.indexOf(QStringLiteral(
-        ".arg( static_cast<qulonglong>( m_playbackScreensaverBlockedCount ) );"));
+        ".arg( static_cast<qulonglong>( m_playbackScreensaverBlockedCount ) )"));
     ASSERT_TRUE(argAt >= 0);
+}
+
+TEST(PlaybackClipLengthEnforce, SummaryAndGateLinesExportWrappedAndClipLength)
+{
+    // PLAYBACK-CLIP-LENGTH-ENFORCE-1 (owner rule 2026-09-30): the runtime backstop. The runner
+    // turns wrapped=1 into INVALID_LOOPED, so the app must print it (and the clip length the
+    // measured window played) on BOTH the summary and the gate line.
+    const QString source = readRepoFile(QStringLiteral("platform/qt/MainWindow.cpp"));
+    const QString body = functionBody(source,
+        QStringLiteral("void MainWindow::finishPlaybackSmokeTelemetry( const char *reason )"),
+        QStringLiteral("bool MainWindow::primePlaybackCacheOnPlayStart( void )"));
+    ASSERT_FALSE(body.isEmpty());
+
+    ASSERT_TRUE(body.indexOf(QStringLiteral("wrapped=%68 total_frames=%69 clip_seconds=%70 wrap_count=%71 jump_to_first_count=%72 restart_count=%73")) >= 0);
+    ASSERT_TRUE(body.indexOf(QStringLiteral("wrapped=%7 total_frames=%8 clip_seconds=%9 wrap_count=%10 jump_to_first_count=%11 restart_count=%12")) >= 0);
+    // Both lines read the engine wrap recorder (process-cumulative, counted in the engine's own wrap
+    // branches), never the presented-frame heuristic alone.
+    ASSERT_EQ(2, countOccurrences(body, QStringLiteral(".arg( bool01( m_playbackWrapRecorder.wrapped() ) )")));
+    // PLAYBACK-CLIP-LENGTH-ENFORCE-2: wrap_count = engine wraps + jump-to-first + restarts (any replay).
+    ASSERT_EQ(2, countOccurrences(body, QStringLiteral(".arg( m_playbackWrapRecorder.replayCount() )")));
+    ASSERT_EQ(2, countOccurrences(body, QStringLiteral(".arg( m_playbackWrapRecorder.jumpToFirstCount )")));
+    ASSERT_EQ(2, countOccurrences(body, QStringLiteral(".arg( m_playbackWrapRecorder.restartCount )")));
+    ASSERT_EQ(2, countOccurrences(body, QStringLiteral(".arg( smokeClipTotalFrames )")));
+    ASSERT_EQ(2, countOccurrences(body, QStringLiteral(".arg( smokeClipSeconds, 0, 'f', 3 )")));
 }

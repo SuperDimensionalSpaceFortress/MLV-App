@@ -895,6 +895,8 @@ Local AVX2 builds are already supported for x86 hosts via:
 - [`docs/15-test-fixtures.md`](15-test-fixtures.md) — the
   `tiny_dual_iso.mlv` and `large_dual_iso.mlv` fixtures the perf harness
   benchmarks.
+- [`docs/playback-clip-length-rule.md`](playback-clip-length-rule.md) — the venue playback rule: >= 20 s
+  of real footage, a window that never exceeds the clip, never a loop (typed refusals, exit 41/42/43).
 - `tests/perf/baselines.json` — the local baselines file consumed by
   `--require-baseline` and `--update-baseline`.
 - `tests/perf/run_runtime_profile.ps1` — the local profiling wrapper.

@@ -5,7 +5,7 @@ param(
     [string]$ClipPath = "C:\temp\MLV\M16-1327.MLV",
     [string]$Receipt = "receipts\FastProxy.marxml",
     [string]$OutputRoot = "",
-    [int]$Seconds = 10,
+    [int]$Seconds = 20,   # ENFORCE-2: the play window is >= 20 s (was 10); the runner refuses a shorter one
     [int]$SettleMs = 1000,
     [int]$ValidationSampleEvery = 10,
     [string]$QualityMode = "4",

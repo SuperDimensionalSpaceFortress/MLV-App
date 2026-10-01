@@ -794,15 +794,20 @@ class AttributionJobOwnerClipRefusalTests(unittest.TestCase):
             )
             self.assertFalse(out_file.exists())
 
-    def test_a_fixture_id_is_still_emitted(self) -> None:
+    def test_a_fixture_id_is_refused_at_generation_because_the_tracked_fixture_is_too_short(self) -> None:
+        # PLAYBACK-CLIP-LENGTH-ENFORCE-1 (owner rule 2026-09-30): this used to assert the fixture job was
+        # EMITTED, i.e. that a 2-frame clip could be played on a venue (and looped to fill the window).
+        # It is now refused at generation with the runner's own typed verdict, and nothing is written.
+        # The fixture arm's emission is still exercised by the behaviour suite against a synthetic
+        # >= 20 s stand-in header in its throwaway repo.
         import tempfile
 
         with tempfile.TemporaryDirectory() as tmp:
             out_file = Path(tmp) / "fixture.job.ps1"
             proc = self._generate("tiny_dual_iso", out_file)
-            self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
-            self.assertTrue(out_file.exists())
-            self.assertIn("$FixtureRehearsal = $true", out_file.read_text(encoding="utf-8"))
+            self.assertNotEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+            self.assertIn("CLIP_TOO_SHORT", normalize_pwsh_message_text(proc.stdout + proc.stderr))
+            self.assertFalse(out_file.exists())
 
 
 class OwnerDecisionOrderingAstTests(unittest.TestCase):

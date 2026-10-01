@@ -18,6 +18,23 @@ param(
 
 $ErrorActionPreference = "Stop"
 
+# PLAYBACK-CLIP-LENGTH-ENFORCE-1 round 2 (sol B3): this launcher forwards -AdditionalArgs to the app, so
+# it must never be the way a play mode (--gui-smoke-playback, --profile-playback, --exercise-play-action,
+# --loop, a lifecycle-stress clip switch, ...) reaches a clip with no length gate. Refused, typed, exit 44.
+. (Join-Path $PSScriptRoot 'gui-smoke-length-gate.ps1')
+$passThroughGate = Test-GuiSmokePassThroughArguments -Arguments $AdditionalArgs -Context 'launcher'
+if ($passThroughGate.verdict -ne 'OK') {
+    [Console]::Error.WriteLine("PLAYBACK-CLIP-LENGTH-ENFORCE-1: $($passThroughGate.message)")
+    exit 44
+}
+# ENFORCE-2: this opens the GUI on a clip, so an MLVAPP_AUTOPLAY_* variable inherited from the parent
+# environment would Play it with no tool-side gate (the app's own gate is the backstop, not the plan).
+$parentEnvironmentGate = Test-GuiSmokeParentEnvironment
+if ($parentEnvironmentGate.verdict -ne 'OK') {
+    [Console]::Error.WriteLine("PLAYBACK-CLIP-LENGTH-ENFORCE-2: $($parentEnvironmentGate.message)")
+    exit 44
+}
+
 if ($ValidationSampleEvery -lt 1) {
     throw "-ValidationSampleEvery must be >= 1."
 }
