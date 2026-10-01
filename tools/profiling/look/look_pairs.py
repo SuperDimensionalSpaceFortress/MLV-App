@@ -46,6 +46,9 @@ def plan_pairs(subject_a, subject_b, frame_ids, seed, controls=1):
     units (identical image both sides, 2 orderings each) drawn from seed-chosen (subject, frame) pairs."""
     if subject_a["name"] == subject_b["name"]:
         raise ValueError("a pair needs two different subjects")
+    # Canonical order (by name) so the arrangement is a function of the seed alone, never of which subject the
+    # caller happened to pass first: the same seed reproduces the same answer key from either call shape.
+    subject_a, subject_b = sorted((subject_a, subject_b), key=lambda s: s["name"])
     common = [f for f in frame_ids if f in subject_a["frames"] and f in subject_b["frames"]]
     missing = [f for f in frame_ids if f not in common]
     if not common:

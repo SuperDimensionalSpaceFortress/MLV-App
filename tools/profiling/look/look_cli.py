@@ -219,6 +219,9 @@ def cmd_build_session(args):
     fa = _prepare_subject_frames(name_a, dir_a, prep, cfg)
     fb = _prepare_subject_frames(name_b, dir_b, prep, cfg)
     keep = _common_crop(fa, fb, args.common_crop_tolerance_px)
+    if args.frame_ids:
+        wanted = [int(x) for x in args.frame_ids.split(",")]
+        keep = [i for i in wanted if i in keep]
     if args.max_frames:
         keep = keep[:args.max_frames]
     paths = look_pairs.build_session(
@@ -311,6 +314,7 @@ def main(argv=None):
     s.add_argument("--out-dir", required=True)
     s.add_argument("--controls", type=int, default=1)
     s.add_argument("--max-frames", type=int)
+    s.add_argument("--frame-ids", help="comma-separated frame indices to judge (default: every shared frame)")
     s.add_argument("--common-crop-tolerance-px", type=int, default=2)
     s.add_argument("--config")
     s.set_defaults(fn=cmd_build_session)

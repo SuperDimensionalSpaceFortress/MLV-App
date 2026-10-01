@@ -12,7 +12,7 @@ You are not told how, and which one is which is not available to you. Judge only
 
 Rules that keep this blind:
 - Do not guess which picture came from which process. Do not reason about "the usual look of" any
-  software, backend or preset. Only pixels count.
+  software or preset. Only pixels count.
 - Position means nothing. The same pair is shown again with left and right swapped; a preference that
   just follows a side is discarded.
 - If the two pictures are indistinguishable to you, say `tie`. A forced guess is worse than a tie.
