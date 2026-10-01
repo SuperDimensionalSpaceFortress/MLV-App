@@ -5,6 +5,39 @@ apply path through `processingObject_t` / `GpuPreviewProcessingConfig` to whiche
 live CUDA texture-present fast path (`GpuDisplayWindow` / `GpuDisplayViewport`
 `presentGpuPlaybackReconAmazePostWbTexture*`) actually draws with, per file:line evidence.
 
+## PARTIAL PARITY, NOT FULL PARITY (read before relying on this document)
+
+This work makes the live CUDA display shader apply **contrast+pivot, shadows/highlights and
+vibrance**. It does **not** make CUDA playback match CPU Look Assist in general. The live
+DISPLAY shader still **skips** each of the following (the SUBSET/offscreen shader and the CPU
+path apply them; the live CUDA fast path does not):
+
+- creative curves (`applyCreativeCurves`: contrast-curve LUT, gradation Y/R/G/B)
+- toning (`applyToning`)
+- saturation (`applySaturation`)
+- hue-vs / luma-vs curves (`applyHueVs`)
+- chroma smooth (`applyChroma`, see "DISCLOSED-OPEN" below)
+
+Found while landing (LAND-2, grep of `previewApply*` uniforms in
+`gpuPreviewProcessingDisplayFragmentShaderSource` vs `gpuPreviewProcessingSubsetFragmentShaderSource`
+in `platform/qt/GpuPreviewProcessing.cpp`): the display shader declares only
+`previewApplyInLoopContrast`, `previewApplyShadowsHighlights`, `previewApplyVibrance` and
+`previewApplyGamutCompression`. The subset shader additionally has `previewApplyAgx`,
+`previewApplyGradient`, `previewApplyGradientContrast`, `previewApplyHighlightRecon`,
+`previewApplyLut` and `previewApplyVignette`, which are therefore also absent from the display
+shader source. Whether any of those is covered by another stage on the live CUDA path was not
+traced in this work; treat them as not applied until CUDA-LOOK-DISPLAY-STAGES-1 proves otherwise.
+
+The CPU oracle in `tests/pipeline/test_gpu_preview_processing.cpp`
+(`assert_gpu_display_offscreen_matches_cpu_reference`) is **restricted to the subset the display
+shader implements**: it forces `applyCreativeCurves`, `applyToning`, `applySaturation` and
+`applyHueVs` off before the CPU reference call. The `DisplayShader*MatchesCpuReference` tests
+therefore prove parity **for that subset only**; they say nothing about the stages above. A
+preset that uses any of them will still look different on live CUDA than on CPU.
+
+These gaps belong to the follow-up card **CUDA-LOOK-DISPLAY-STAGES-1**. No document, commit
+message or PR for this work may claim full CUDA/CPU Look Assist parity.
+
 ## The two shaders
 
 `platform/qt/GpuPreviewProcessing.cpp` builds two GLSL fragment shaders from one
@@ -176,6 +209,27 @@ round 1's "not measured" gap now have local numbers, added by
   without exposing more of `GpuPreviewProcessing.cpp`'s internals, which this round did not do.
   Real per-frame GPU numbers need the bachelor bench (`bench-plan.md`) on actual hardware, which is
   exactly what item 5 exists for — this box cannot produce a trustworthy substitute for that.
+
+### Re-measured at landing (LAND-2, merged tree on master d489e09a)
+
+`GpuPreviewProcessing.DisplayShaderFastPathFrameCostBudget`, run three times back to back on the
+merged build (i9-13900KS, 16 logical CPUs, a shared VM with other lanes active; renderer
+`llvmpipe (LLVM 5.0.1, 256 bits)`, no hardware GL). Combined debayer + S/H blur refresh, ms:
+
+| run | 16 threads p50 / p90 | 1 thread p50 / p90 |
+|---|---|---|
+| 1 | 43.1 / 60.2 | 49.7 / 62.0 |
+| 2 | 33.1 / 40.8 | 46.1 / 55.5 |
+| 3 | 31.2 / 35.2 | 35.5 / 48.9 |
+
+Against the 40 ms budget this is 88-150% (16 threads, p90) and 122-155% (1 thread, p90): worse
+than the 25.0 ms / 41.9 ms measured on the branch, and noisy run to run. The cause was not
+isolated: the host was shared and loaded, so these numbers cannot be called a regression in the
+code nor cleared as noise. The test records the figures and asserts no budget, so it passes
+either way. The single-threaded and low-core-count S/H cost therefore stays DISCLOSED-OPEN, and
+a quiet-host or bachelor-hardware measurement is still needed before claiming it fits the frame
+budget. The software-GL offscreen call measured p50 520-624 ms / p90 658-792 ms, still not a
+usable GPU figure for the reasons given above.
 
 ## DISCLOSED-OPEN (round-1 v2.1 contract: no silent drop)
 
