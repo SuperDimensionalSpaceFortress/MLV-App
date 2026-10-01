@@ -476,7 +476,8 @@ class VisiblePlaybackRunBindingTests(_BindingCase):
         self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
         self.assertEqual(len(list(out.glob("STALE-*cap-000.png"))), 1)
         self.assertFalse((out / "cap-000.png").exists())
-        self.assertRegex(proc.stdout, r"captures\s*:\s*0\b")
+        # Format-List colours its property names on a CI runner (ANSI escapes between the name and the value): strip them first
+        self.assertRegex(re.sub(r"\x1b\[[0-9;]*m", "", proc.stdout), r"captures\s*:\s*0\b")
 
 
 # The CLASS pin: every launcher the scan sees starting the app for an evidence Play (the same derived set the receipt-oracle
