@@ -3,9 +3,9 @@
   "configVersion": 1,
   "note": "Every threshold is {value, reason}. A bare number is rejected by look_config.py: a threshold with no reason is a guess. All values are PROVISIONAL until a judged corpus exists to calibrate against (DESIGN.md AMENDMENT 2 B3/B5); the floor GATES, the model judges only REFINE (bus TRAPS s8: blinded agent image calls can sit near chance).",
   "letterbox": {
-    "detect": {
-      "value": true,
-      "reason": "A playback capture can include black window bars (the UM CUDA fixture tiles are 16:9 with ~17% black bars while the CPU tiles are content-only). Counting those bars as 'crushed shadows' fails every CUDA frame on geometry, not on look, and makes CUDA-vs-CPU pairs incomparable."
+    "auto_exclude_symmetric": {
+      "value": false,
+      "reason": "OFF by default. A playback capture can include black window bars (the UM CUDA fixture tiles are 16:9 with ~25% black bars while the CPU tiles are content-only), and counting them as 'crushed shadows' fails the frame on geometry, not on look. But pixels alone cannot tell a capture bar from a genuinely crushed region of the scene: round-1 review produced both a one-sided and a symmetric dark band that read as bars and let a crushed frame PASS. So nothing is hidden from the floor unless the caller DECLARES it (--letterbox-bars top=N,bottom=N) or opts in to symmetric auto-detection (--letterbox auto-symmetric); the choice is written into every frame verdict. Undeclared, the full frame is measured, so a barred capture fails 'crushed shadows' loudly instead of passing quietly."
     },
     "bar_max_code": {
       "value": 4,
@@ -17,7 +17,11 @@
     },
     "max_excluded_pct": {
       "value": 50.0,
-      "reason": "If detection would discard more than half of the frame it is more likely a genuinely dark frame than a letterbox; refuse to exclude and say so in the verdict instead of silently shrinking the measured area."
+      "reason": "If an exclusion (declared or auto-symmetric) would discard more than half of the frame it is more likely a genuinely dark frame than a letterbox; refuse to exclude, measure the full frame and say so in the verdict instead of silently shrinking the measured area."
+    },
+    "symmetry_tolerance_px": {
+      "value": 2,
+      "reason": "Auto-symmetric detection applies bars only when the two opposite bars (top and bottom, or left and right) differ by at most this many pixels; a thumbnail resample can leave one anti-aliased edge row on one side. A dark band on ONE side only is scene content (crushed sky, a black stage, a dark foreground reaching an edge), never a bar."
     }
   },
   "frame": {
@@ -52,6 +56,14 @@
     "skin_hue_drift_deg_max": {
       "value": 5.0,
       "reason": "DESIGN.md B3: skin-hue drift <= ~5 degrees where skin is present. A drift needs a baseline (the same frame without the look, or the other backend): absolute skin hue varies by subject, so with no reference frame the check is NOT_APPLICABLE and the absolute offset is only reported."
+    },
+    "skin_region_retain_fraction": {
+      "value": 0.5,
+      "reason": "When the BASELINE has a usable skin-tone region, the subject must keep at least this fraction of that region's share of the frame. A look that pushes skin out of the colour box (green, magenta, grey) empties the subject's own mask; reading that as 'no skin, not applicable' would let the worst colour shift pass, so a lost or shrunken region is a FAIL."
+    },
+    "skin_baseline_crop_tolerance_px": {
+      "value": 4,
+      "reason": "Drift is measured over the BASELINE's skin mask when the two active areas match after a centre crop of at most this many pixels per axis (a downscaled thumbnail keeps an anti-aliased edge row). Beyond that the mask cannot be aligned and the drift falls back to each frame's own region, which the verdict records (maskBasis)."
     }
   },
   "skin": {
@@ -140,6 +152,12 @@
     "alpha": {
       "value": 0.05,
       "reason": "Two-sided exact binomial p-value below which a judge's left/right split is flagged as slot bias."
+    }
+  },
+  "judge_validity": {
+    "min_consistent_units": {
+      "value": 4,
+      "reason": "A judge's preference is readable only with at least this many real units whose two orderings agree. Under a coin-flip judge a unanimous 3-unit vote happens 25% of the time and a 2-unit one 50%; 4 is the smallest floor that rules out the degenerate sessions. It is NOT a significance claim: a 4-0 vote still has an exact two-sided p of 0.125, which the entry reports as votePValue."
     }
   },
   "judge_disagreement": {

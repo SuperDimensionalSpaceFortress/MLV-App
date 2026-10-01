@@ -3,15 +3,20 @@
 
     python tools/profiling/look/look_cli.py tiles        --sheet S.png --out-dir D --prefix cuda --count 6
     python tools/profiling/look/look_cli.py floor        --frames-dir D [--baseline-dir B] --label cuda --out V.json
+                                                         [--letterbox auto-symmetric | --letterbox-bars top=34,bottom=34]
     python tools/profiling/look/look_cli.py pair-metrics --a-dir A --b-dir B --scope shader-subset --out V.json
+                                                         [--letterbox auto-symmetric] [--a-letterbox-bars ..] [--b-letterbox-bars ..]
     python tools/profiling/look/look_cli.py verify-rubric
     python tools/profiling/look/look_cli.py probe-codex [--live-vision-dir DIR]
     python tools/profiling/look/look_cli.py build-session --a cuda=DIR --b cpu=DIR --seed N --out-dir SESS
+                                                         [--letterbox auto-symmetric] [--a-letterbox-bars ..] [--b-letterbox-bars ..]
     python tools/profiling/look/look_cli.py judge        --session-dir SESS --runner claude:MODEL --producer-model M
-    python tools/profiling/look/look_cli.py tally        --session-dir SESS --results R.json --out T.json
+    python tools/profiling/look/look_cli.py tally        --session-dir SESS --results R.json --producer-model M --out T.json
+    python tools/profiling/look/look_cli.py judge-disagreement --entries T1.json T2.json [--out D.json]
 
-Exit codes: 0 verdict PASS/REPORTED (or a non-verdict command succeeded); 1 verdict FAIL; 2 verdict INCOMPLETE or a
-structural error. A verdict is data first: the JSON is written even when the exit code is non-zero.
+Exit codes: 0 verdict PASS/REPORTED, a usable tally, or a non-verdict command that succeeded; 1 verdict FAIL;
+2 verdict INCOMPLETE, a structural error, or a tally entry that is NOT usable (its JSON is still written).
+A verdict is data first: the JSON is written even when the exit code is non-zero.
 """
 import argparse
 import datetime
@@ -103,13 +108,23 @@ def _exit_for(outcome):
     return {"PASS": 0, "REPORTED": 0, "FAIL": 1}.get(outcome, 2)
 
 
+def _policy(cfg, mode, bars_spec):
+    """The caller's letterbox decision for ONE capture (see look_metrics.make_letterbox_policy)."""
+    import look_metrics
+
+    declared = look_metrics.parse_declared_bars(bars_spec) if bars_spec else None
+    return look_metrics.make_letterbox_policy(cfg, mode=mode, declared=declared)
+
+
 def cmd_floor(args):
     import look_metrics
 
     cfg, meta = look_config.load_config(args.config)
+    policy = _policy(cfg, args.letterbox, args.letterbox_bars)
     frames = look_metrics.index_frames(args.frames_dir)
     baselines = look_metrics.index_frames(args.baseline_dir) if args.baseline_dir else {}
-    verdict = look_metrics.evaluate_sheet(frames, cfg, meta, label=args.label, references=baselines)
+    verdict = look_metrics.evaluate_sheet(frames, cfg, meta, label=args.label, references=baselines,
+                                          letterbox_policy=policy)
     verdict["createdUtc"] = _now()
     verdict["source"] = args.source_note
     _write_json(args.out, verdict)
@@ -125,7 +140,10 @@ def cmd_pair_metrics(args):
     overrides = _apply_overrides(cfg, args)
     a = look_metrics.index_frames(args.a_dir)
     b = look_metrics.index_frames(args.b_dir)
-    verdict = look_metrics.compare_sheets(a, b, cfg, meta, args.scope, args.a_label, args.b_label, overrides)
+    verdict = look_metrics.compare_sheets(
+        a, b, cfg, meta, args.scope, args.a_label, args.b_label, overrides,
+        letterbox_policy_a=_policy(cfg, args.letterbox, args.a_letterbox_bars),
+        letterbox_policy_b=_policy(cfg, args.letterbox, args.b_letterbox_bars))
     verdict["createdUtc"] = _now()
     verdict["source"] = args.source_note
     _write_json(args.out, verdict)
@@ -170,9 +188,11 @@ def _parse_subject(spec):
     return name, directory
 
 
-def _prepare_subject_frames(name, directory, out_dir, cfg):
-    """Active-area crop (letterbox bars are a tell for which backend rendered a frame) into out_dir; returns
-    {frame index: path}. Source frames stay untouched."""
+def _prepare_subject_frames(name, directory, out_dir, cfg, policy=None):
+    """Crop what the caller DECLARED (or opted in to auto-detecting symmetrically) as letterbox bars -- a bar is a
+    tell for which backend rendered a frame -- into out_dir; returns {frame index: path}. Undeclared dark bands are
+    left in the picture, so the judges also see a crushed region instead of having it cropped away. Source frames
+    stay untouched."""
     import numpy as np
     import look_metrics
     from PIL import Image
@@ -181,23 +201,29 @@ def _prepare_subject_frames(name, directory, out_dir, cfg):
     os.makedirs(out_dir, exist_ok=True)
     for index, path in look_metrics.index_frames(directory).items():
         arr = look_metrics.load_rgb(path)
-        active = look_metrics.crop_active(arr, look_metrics.detect_letterbox(arr, cfg))
+        active = look_metrics.crop_active(arr, look_metrics.detect_letterbox(arr, cfg, policy))
         target = os.path.join(out_dir, f"{name}-{index:02d}.png")
         Image.fromarray(np.ascontiguousarray(active), "RGB").save(target)
         prepared[index] = target
     return prepared
 
 
-def _common_crop(a_frames, b_frames, tolerance_px):
-    """Centre-crop each shared frame pair to a common size when the sizes differ by <= tolerance; drop the rest."""
+def _common_crop(a_frames, b_frames, tolerance_px, name_a="a", name_b="b"):
+    """Centre-crop each shared frame pair to a common size when the sizes differ by <= tolerance. Returns
+    (kept indices, dropped) where dropped = [{"frameId", "reason"}]: a frame that is not kept is never silent."""
     import numpy as np
     from PIL import Image
 
-    keep = []
+    keep, dropped = [], []
+    for index in sorted(set(a_frames) ^ set(b_frames)):
+        only = name_a if index in a_frames else name_b
+        dropped.append({"frameId": index, "reason": f"UNSHARED: frame exists only in {only}"})
     for index in sorted(set(a_frames) & set(b_frames)):
         with Image.open(a_frames[index]) as ia, Image.open(b_frames[index]) as ib:
             wa, ha, wb, hb = ia.width, ia.height, ib.width, ib.height
         if abs(wa - wb) > tolerance_px or abs(ha - hb) > tolerance_px:
+            dropped.append({"frameId": index, "reason": (
+                f"CROP_TOLERANCE_EXCEEDED: {name_a} {wa}x{ha} vs {name_b} {wb}x{hb}, tolerance {tolerance_px}px")})
             continue
         if (wa, ha) != (wb, hb):
             w, h = min(wa, wb), min(ha, hb)
@@ -207,7 +233,7 @@ def _common_crop(a_frames, b_frames, tolerance_px):
                 t, l = (arr.shape[0] - h) // 2, (arr.shape[1] - w) // 2
                 Image.fromarray(np.ascontiguousarray(arr[t:t + h, l:l + w]), "RGB").save(frames[index])
         keep.append(index)
-    return keep
+    return keep, dropped
 
 
 def cmd_build_session(args):
@@ -216,18 +242,29 @@ def cmd_build_session(args):
     name_a, dir_a = _parse_subject(args.a)
     name_b, dir_b = _parse_subject(args.b)
     prep = os.path.join(args.out_dir, "source-frames")
-    fa = _prepare_subject_frames(name_a, dir_a, prep, cfg)
-    fb = _prepare_subject_frames(name_b, dir_b, prep, cfg)
-    keep = _common_crop(fa, fb, args.common_crop_tolerance_px)
+    fa = _prepare_subject_frames(name_a, dir_a, prep, cfg, _policy(cfg, args.letterbox, args.a_letterbox_bars))
+    fb = _prepare_subject_frames(name_b, dir_b, prep, cfg, _policy(cfg, args.letterbox, args.b_letterbox_bars))
+    keep, dropped = _common_crop(fa, fb, args.common_crop_tolerance_px, name_a, name_b)
     if args.frame_ids:
         wanted = [int(x) for x in args.frame_ids.split(",")]
+        dropped += [{"frameId": i, "reason": "NOT_IN_--frame-ids"} for i in keep if i not in wanted]
+        known = {d["frameId"] for d in dropped} | set(keep)
+        dropped += [{"frameId": i, "reason": "REQUESTED_BUT_NOT_PRESENT_IN_EITHER_SUBJECT"}
+                    for i in wanted if i not in known]
         keep = [i for i in wanted if i in keep]
     if args.max_frames:
+        dropped += [{"frameId": i, "reason": f"BEYOND_--max-frames={args.max_frames}"} for i in keep[args.max_frames:]]
         keep = keep[:args.max_frames]
     paths = look_pairs.build_session(
         {"name": name_a, "frames": fa}, {"name": name_b, "frames": fb}, keep, args.seed, args.out_dir,
-        lock["rubricSha256"], controls=args.controls, created_utc=_now())
-    print(json.dumps({"frames": keep, "files": {k: os.path.basename(v) for k, v in paths.items()}}))
+        lock["rubricSha256"], controls=args.controls, positive_controls=args.positive_controls,
+        created_utc=_now(), dropped_frames=dropped, crop_tolerance_px=args.common_crop_tolerance_px)
+    dropped_sorted = sorted(dropped, key=lambda d: d["frameId"])
+    if dropped_sorted:
+        print(f"[look_cli] WARNING {len(dropped_sorted)} frame(s) were NOT judged: "
+              + "; ".join(f"{d['frameId']} ({d['reason']})" for d in dropped_sorted), file=sys.stderr)
+    print(json.dumps({"frames": keep, "droppedFrames": dropped_sorted,
+                      "files": {k: os.path.basename(v) for k, v in paths.items()}}))
     return 0
 
 
@@ -242,11 +279,24 @@ def _runner_from_spec(spec, args):
 
 def cmd_judge(args):
     runner = _runner_from_spec(args.runner, args)
-    look_judges.assert_not_producer(runner.model, args.producer_model)
+    look_judges.assert_not_producer(runner.model, args.producer_model)  # the alias-table, family-level guard
     summary = look_judges.run_session(
         args.session_dir, runner, workers=args.workers, deadline_s=args.deadline_s, max_items=args.max_items)
     print(json.dumps(summary))
     return 0 if summary["remaining"] == 0 and summary["errors"] == 0 else 2
+
+
+def _current_image_digests(session_dir):
+    """{itemId: sha256 of the pair image as it is on disk NOW}. An item whose image is missing maps to None, which
+    never equals a recorded digest, so a deleted image reads as a changed one."""
+    manifest = _read_json(os.path.join(session_dir, "judge_manifest.json"))
+    digests = {}
+    for entry in manifest["items"]:
+        try:
+            digests[entry["itemId"]] = look_judges.sha256_file(os.path.join(session_dir, entry["image"]))
+        except OSError:
+            digests[entry["itemId"]] = None
+    return digests
 
 
 def cmd_tally(args):
@@ -254,14 +304,30 @@ def cmd_tally(args):
     session = _read_json(os.path.join(args.session_dir, "session.json"))
     results = _read_json(args.results)
     cfg, _ = look_config.load_config(args.config)
-    entry = look_tally.tally(key, results["items"], results["judge"], session, cfg["slot_bias"], args.cross_family_status)
+    entry = look_tally.tally(
+        key, results["items"], results["judge"], session, cfg,
+        current_image_sha256=_current_image_digests(args.session_dir), forbidden_models=args.producer_model,
+        cross_family_status=args.cross_family_status)
     entry["errorsDuringJudging"] = results.get("errors", {})
+    entry["staleRejectedAtJudging"] = results.get("staleRejected", {})
     entry["createdUtc"] = _now()
     _write_json(args.out, entry)
     print(f"tally {entry['judgeId']}: winner={entry['preference']['winner']} usable={entry['usable']} "
           f"consistentUnits={entry['preference']['consistentUnits']} flips={entry['preference']['discardedFlips']} "
-          f"control={entry['controlResult']['outcome']} slotBias={entry['slotTally']['slotBias']}")
-    return 0
+          f"control={entry['controlResult']['outcome']} positiveControl={entry['positiveControlResult']['outcome']} "
+          f"slotBias={entry['slotTally']['slotBias']} unusableReasons={entry['unusableReasons']}")
+    return 0 if entry["usable"] else 2
+
+
+def cmd_judge_disagreement(args):
+    cfg, _ = look_config.load_config(args.config)
+    entries = [_read_json(path) for path in args.entries]
+    verdict = look_tally.judge_disagreement(entries, cfg["judge_disagreement"]["third_judge_points"])
+    verdict["createdUtc"] = _now()
+    if args.out:
+        _write_json(args.out, verdict)
+    print(json.dumps({k: verdict[k] for k in ("thirdJudgeNeeded", "thresholdPoints", "comparable", "unusableJudges")}))
+    return 0 if verdict["comparable"] else 2
 
 
 def main(argv=None):
@@ -276,6 +342,11 @@ def main(argv=None):
     s.add_argument("--cols", type=int, default=4)
     s.set_defaults(fn=cmd_tiles)
 
+    letterbox_help = ("what the floor may hide: `off` measures the full frame; `auto-symmetric` excludes dark bands "
+                      "only when top/bottom (or left/right) match within the config's symmetry tolerance. "
+                      "Default: the config's letterbox.auto_exclude_symmetric (off as shipped).")
+    bars_help = "bars you KNOW exist on this capture, e.g. top=34,bottom=34 (each must really be dark, else refused)"
+
     s = sub.add_parser("floor")
     s.add_argument("--frames-dir", required=True)
     s.add_argument("--baseline-dir")
@@ -283,6 +354,8 @@ def main(argv=None):
     s.add_argument("--out", required=True)
     s.add_argument("--config")
     s.add_argument("--source-note", default="")
+    s.add_argument("--letterbox", choices=["off", "auto-symmetric"], help=letterbox_help)
+    s.add_argument("--letterbox-bars", help=bars_help)
     s.set_defaults(fn=cmd_floor)
 
     s = sub.add_parser("pair-metrics")
@@ -293,6 +366,9 @@ def main(argv=None):
     s.add_argument("--scope", required=True, choices=["shader-subset", "full-look"])
     s.add_argument("--out", required=True)
     s.add_argument("--config")
+    s.add_argument("--letterbox", choices=["off", "auto-symmetric"], help=letterbox_help)
+    s.add_argument("--a-letterbox-bars", help="A side: " + bars_help)
+    s.add_argument("--b-letterbox-bars", help="B side: " + bars_help)
     s.add_argument("--geometry-tolerance-px", type=int)
     s.add_argument("--override-reason")
     s.add_argument("--source-note", default="")
@@ -313,6 +389,11 @@ def main(argv=None):
     s.add_argument("--seed", required=True)
     s.add_argument("--out-dir", required=True)
     s.add_argument("--controls", type=int, default=1)
+    s.add_argument("--positive-controls", type=int, default=1,
+                   help="units of original-vs-known-degradation the judge must prefer the original on (0 makes the session unusable)")
+    s.add_argument("--letterbox", choices=["off", "auto-symmetric"], help=letterbox_help)
+    s.add_argument("--a-letterbox-bars", help="A side: " + bars_help)
+    s.add_argument("--b-letterbox-bars", help="B side: " + bars_help)
     s.add_argument("--max-frames", type=int)
     s.add_argument("--frame-ids", help="comma-separated frame indices to judge (default: every shared frame)")
     s.add_argument("--common-crop-tolerance-px", type=int, default=2)
@@ -337,7 +418,15 @@ def main(argv=None):
     s.add_argument("--out", required=True)
     s.add_argument("--config")
     s.add_argument("--cross-family-status")
+    s.add_argument("--producer-model", action="append", default=[], required=True,
+                   help="model id of the look's producer or the hub; repeatable; the tally re-applies the guard")
     s.set_defaults(fn=cmd_tally)
+
+    s = sub.add_parser("judge-disagreement")
+    s.add_argument("--entries", nargs="+", required=True, help="tally entry JSON files, one per judge")
+    s.add_argument("--out")
+    s.add_argument("--config")
+    s.set_defaults(fn=cmd_judge_disagreement)
 
     args = p.parse_args(argv)
     try:

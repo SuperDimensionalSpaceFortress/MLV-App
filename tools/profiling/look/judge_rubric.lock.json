@@ -1,8 +1,8 @@
 {
   "schema": "mlv-app/look-rubric-lock/v1",
-  "rubricId": "look-rubric-v1",
+  "rubricId": "look-rubric-v2",
   "rubricFile": "judge_rubric.md",
-  "rubricSha256": "fda89733923d8a8f716682c2b38ce29a4711ccee5b036f2074bda43aa5fe9b90",
+  "rubricSha256": "f16195b0078d707228495f2d4cda09871d80a6588798b0bf15f9311ae16c8fb3",
   "criteria": [
     "tonal_separation",
     "highlight_rolloff",

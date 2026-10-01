@@ -12,17 +12,30 @@ RUNNERS
 CROSS-FAMILY (K6): select_second_judge() returns a Codex judge only when the image probe passed; otherwise it
 returns a second Claude model and the status CROSS_FAMILY_UNAVAILABLE, which look_tally copies into the entry.
 
-JUDGES ARE NEVER THE PRODUCER OR THE HUB: assert_not_producer() refuses a judge whose model matches a
-producer/hub model id the caller names.
+JUDGES ARE NEVER THE PRODUCER OR THE HUB: assert_not_producer() refuses a judge whose model FAMILY matches the
+family of a producer/hub model the caller names. Both sides go through ONE alias table (opus / sonnet / fable /
+haiku <-> claude-<family>-<version>, any date suffix, any [1m]-style tag), so `sonnet` and `claude-sonnet-5-5`
+are the same thing and any version of the producer's family is refused. A name that cannot be placed in a family
+is refused too (fail closed), and the Codex default resolves to the real model name in config.toml.
+
+BOUNDED: every judge or probe subprocess runs through run_bounded(), which kills the WHOLE process tree on timeout
+(taskkill /T /F on Windows, where `claude` and `codex` are npm .cmd shims and a plain kill reaches only cmd.exe;
+a process group elsewhere), so a hung judge cannot outlive its timeout.
 
 BLINDING: each item runs in its own temp directory containing only `pair.png`; the prompt is the frozen rubric
 plus a fixed instruction. Nothing about subjects, backends, flavors or seeds is ever in a prompt or a path.
+
+STALE RESULTS: run_session re-judges any item whose stored verdict was made against a different image digest or a
+different rubric digest, refuses a results file that belongs to another judge identity, and refuses to start
+when the images on disk no longer match the session's recorded digests.
 """
 import concurrent.futures
 import hashlib
 import json
 import os
+import re
 import shutil
+import signal
 import subprocess
 import tempfile
 import threading
@@ -56,24 +69,141 @@ class JudgeError(RuntimeError):
     pass
 
 
+ANTHROPIC_FAMILIES = ("opus", "sonnet", "fable", "haiku")
+CODEX_DEFAULT_MODEL = "codex-default"  # recorded only when config.toml names no model: the real model is UNKNOWN
+
+
+def model_family_key(model):
+    """THE alias table. Canonical family of a model name, or None when the name cannot be placed.
+
+        ('anthropic', 'sonnet')        sonnet, Sonnet 5.5, claude-sonnet-5-5, claude-sonnet-5-5-20261001,
+                                       us.anthropic.claude-sonnet-5-5-v1:0, sonnet[1m] ...
+        ('openai', root, trim)         gpt-6.1-sol -> ('openai', 'gpt', 'sol'); gpt-5.5 -> ('openai', 'gpt', '');
+                                       o3 -> ('openai', 'o', ''); codex-mini -> ('openai', 'codex', 'mini')
+        ('openai', '*', '')            `codex`, `openai`, `codex-default` (the lane's unresolved default): any OpenAI model
+    """
+    text = re.sub(r"\[[^\]]*\]", "", (model or "").strip().lower())
+    tokens = [t for t in re.split(r"[^a-z0-9]+", text) if t]
+    if not tokens:
+        return None
+    families = {t for t in tokens if t in ANTHROPIC_FAMILIES}
+    if len(families) == 1 and not any(t in ("gpt", "codex", "openai") for t in tokens):
+        return ("anthropic", next(iter(families)))
+    if families:
+        return None  # two families in one name, or a Claude family beside an OpenAI token: ambiguous
+    if tokens == ["claude"]:
+        return None  # a Claude model with no family cannot be compared
+    if tokens[0] in ("openai", "chatgpt") or tokens == ["codex"] or tokens[:2] == ["codex", "default"]:
+        return ("openai", "*", "")
+    root = None
+    if tokens[0].startswith("gpt"):
+        root = "gpt"
+    elif re.fullmatch(r"o\d+", tokens[0]):
+        root = "o"
+    elif tokens[0] == "codex":
+        root = "codex"
+    if root is None:
+        return None
+    trim = next((t for t in tokens[1:] if t.isalpha()), "")
+    return ("openai", root, trim)
+
+
 def family_of(model):
-    m = (model or "").lower()
-    if m.startswith(("claude", "opus", "sonnet", "haiku", "fable")):
-        return "anthropic"
-    if m.startswith(("gpt", "o1", "o3", "o4", "codex")):
-        return "openai"
-    return "unknown"
+    key = model_family_key(model)
+    return "unknown" if key is None else key[0]
+
+
+def _same_family(a, b):
+    if a[0] != b[0]:
+        return False
+    if a[0] == "anthropic":
+        return a[1] == b[1]
+    if "*" in (a[1], b[1]):
+        return True
+    return a[1] == b[1] and (a[2] == b[2] or "" in (a[2], b[2]))
 
 
 def assert_not_producer(judge_model, forbidden_models):
-    """Raise ProducerJudgeError when the judge's model is one the caller lists as the producer or the hub."""
-    jm = (judge_model or "").strip().lower()
-    if not jm:
+    """Raise ProducerJudgeError when the judge's model FAMILY is the family of a producer or hub model the caller
+    lists. Fails closed: an unnamed judge, an unrecognised judge or producer name, and an empty forbidden list all
+    raise, because none of them can prove independence."""
+    if not (judge_model or "").strip():
         raise ProducerJudgeError("a judge must name its model")
-    for bad in forbidden_models or ():
-        b = (bad or "").strip().lower()
-        if b and (jm == b or jm.startswith(b) or b.startswith(jm)):
-            raise ProducerJudgeError(f"judge model {judge_model!r} is the producer/hub model {bad!r}")
+    forbidden = [b for b in (forbidden_models or ()) if (b or "").strip()]
+    if not forbidden:
+        raise ProducerJudgeError("no producer/hub model was named, so the judge's independence cannot be checked")
+    judge_key = model_family_key(judge_model)
+    if judge_key is None:
+        raise ProducerJudgeError(
+            f"judge model {judge_model!r} cannot be placed in a model family; use opus/sonnet/fable/haiku, "
+            "claude-<family>-<version> or a gpt/o/codex model name")
+    for bad in forbidden:
+        bad_key = model_family_key(bad)
+        if bad_key is None:
+            raise ProducerJudgeError(f"producer/hub model {bad!r} cannot be placed in a model family")
+        if _same_family(judge_key, bad_key):
+            raise ProducerJudgeError(
+                f"judge model {judge_model!r} is in the family of the producer/hub model {bad!r} ({judge_key})")
+
+
+def resolve_codex_default_model(codex_home=None):
+    """The model `codex exec` uses when -m is absent: the top-level `model = "..."` of config.toml, else None."""
+    home = codex_home or os.environ.get("CODEX_HOME") or os.path.join(os.path.expanduser("~"), ".codex")
+    try:
+        with open(os.path.join(home, "config.toml"), "r", encoding="utf-8") as handle:
+            for line in handle:
+                stripped = line.strip()
+                if stripped.startswith("["):
+                    break  # a table header: top-level keys are over
+                match = re.match(r'model\s*=\s*"([^"]+)"\s*(#.*)?$', stripped)
+                if match:
+                    return match.group(1)
+    except OSError:
+        pass
+    return None
+
+
+def _kill_tree(proc):
+    """Kill proc AND everything it started. On Windows the claude/codex CLIs are npm .cmd shims: killing cmd.exe
+    leaves the real CLI alive holding our pipes, so the tree must go."""
+    if os.name == "nt":
+        try:
+            subprocess.run(["taskkill", "/T", "/F", "/PID", str(proc.pid)], capture_output=True, timeout=30)
+        except (OSError, subprocess.SubprocessError):
+            pass
+    else:
+        try:
+            os.killpg(proc.pid, signal.SIGKILL)
+        except (OSError, ProcessLookupError):
+            pass
+    try:
+        proc.kill()
+    except OSError:
+        pass
+
+
+def run_bounded(argv, input_text=None, cwd=None, timeout=300, grace_s=5):
+    """subprocess.run replacement whose timeout covers the whole process tree. Returns a CompletedProcess; raises
+    subprocess.TimeoutExpired (after killing the tree) so callers keep their existing except clause. Never waits
+    longer than ~timeout + grace_s, even when a grandchild still holds the pipes."""
+    kwargs = {"stdin": subprocess.PIPE if input_text is not None else subprocess.DEVNULL,
+              "stdout": subprocess.PIPE, "stderr": subprocess.PIPE, "cwd": cwd,
+              "text": True, "encoding": "utf-8", "errors": "replace"}
+    if os.name == "nt":
+        kwargs["creationflags"] = subprocess.CREATE_NEW_PROCESS_GROUP
+    else:
+        kwargs["start_new_session"] = True
+    proc = subprocess.Popen(argv, **kwargs)
+    try:
+        out, err = proc.communicate(input=input_text, timeout=timeout)
+    except subprocess.TimeoutExpired:
+        _kill_tree(proc)
+        try:
+            out, err = proc.communicate(timeout=grace_s)
+        except subprocess.TimeoutExpired:
+            out = err = ""  # a survivor still holds a pipe; its reader threads are daemons, so we just leave
+        raise subprocess.TimeoutExpired(argv, timeout, output=out, stderr=err)
+    return subprocess.CompletedProcess(argv, proc.returncode, out, err)
 
 
 def build_prompt(rubric_text, codex=False):
@@ -174,12 +304,12 @@ class ClaudeCliJudge(JudgeRunner):
     def judge_image(self, png_path, rubric_text):
         work = _neutral_workdir(png_path)
         try:
-            proc = subprocess.run(
-                self.command(), input=build_prompt(rubric_text), cwd=work, capture_output=True, text=True,
-                encoding="utf-8", timeout=self.timeout_s,
-            )
+            proc = run_bounded(self.command(), input_text=build_prompt(rubric_text), cwd=work,
+                               timeout=self.timeout_s)
         except subprocess.TimeoutExpired as exc:
-            raise JudgeError(f"claude timed out after {self.timeout_s}s") from exc
+            raise JudgeError(f"claude timed out after {self.timeout_s}s (process tree killed)") from exc
+        except OSError as exc:
+            raise JudgeError(f"claude could not start: {exc}") from exc
         finally:
             _remove_workdir(work)
         if proc.returncode != 0:
@@ -196,8 +326,13 @@ class ClaudeCliJudge(JudgeRunner):
 
 
 class CodexExecJudge(JudgeRunner):
-    def __init__(self, model=None, judge_id=None, codex_exe=None, timeout_s=300):
-        self.model = model or "codex-default"
+    """`model=None` means 'the Codex default': it is resolved to the real model name from config.toml (so the
+    entry records what actually judged, and the producer guard can compare it), and only when config.toml names
+    none is it recorded as `codex-default`, which the guard treats as ANY OpenAI model."""
+
+    def __init__(self, model=None, judge_id=None, codex_exe=None, timeout_s=300, codex_home=None):
+        self.default_resolved = model is None and resolve_codex_default_model(codex_home) is not None
+        self.model = model or resolve_codex_default_model(codex_home) or CODEX_DEFAULT_MODEL
         self.family = "openai"
         self.judge_id = judge_id or f"codex-exec:{self.model}"
         self.codex_exe = codex_exe or shutil.which("codex") or "codex"
@@ -207,7 +342,7 @@ class CodexExecJudge(JudgeRunner):
         # The prompt goes on stdin: --image is variadic and would swallow a trailing positional prompt.
         cmd = [self.codex_exe, "exec", "--image", png_path, "--sandbox", "read-only", "--skip-git-repo-check",
                "--ephemeral", "-C", work, "-o", out_file]
-        if self.model != "codex-default":
+        if self.model != CODEX_DEFAULT_MODEL:
             cmd[2:2] = ["-m", self.model]
         return cmd
 
@@ -215,16 +350,17 @@ class CodexExecJudge(JudgeRunner):
         work = _neutral_workdir(png_path)
         out_file = os.path.join(work, "last-message.txt")
         try:
-            proc = subprocess.run(
-                self.command(os.path.join(work, "pair.png"), out_file, work), input=build_prompt(rubric_text, True),
-                cwd=work, capture_output=True, text=True, encoding="utf-8", timeout=self.timeout_s,
-            )
+            proc = run_bounded(
+                self.command(os.path.join(work, "pair.png"), out_file, work),
+                input_text=build_prompt(rubric_text, True), cwd=work, timeout=self.timeout_s)
             text = ""
             if os.path.isfile(out_file):
                 with open(out_file, "r", encoding="utf-8", errors="replace") as handle:
                     text = handle.read()
         except subprocess.TimeoutExpired as exc:
-            raise JudgeError(f"codex timed out after {self.timeout_s}s") from exc
+            raise JudgeError(f"codex timed out after {self.timeout_s}s (process tree killed)") from exc
+        except OSError as exc:
+            raise JudgeError(f"codex could not start: {exc}") from exc
         finally:
             _remove_workdir(work)
         if proc.returncode != 0:
@@ -244,9 +380,9 @@ def probe_codex_image_support(codex_exe=None, timeout_s=60):
     if not exe:
         return {"status": CROSS_FAMILY_UNAVAILABLE, "reason": "codex executable not found"}
     try:
-        proc = subprocess.run([exe, "--version"], capture_output=True, text=True, timeout=timeout_s)
+        proc = run_bounded([exe, "--version"], timeout=timeout_s)
         version = (proc.stdout or proc.stderr).strip()
-        proc = subprocess.run([exe, "exec", "--help"], capture_output=True, text=True, timeout=timeout_s)
+        proc = run_bounded([exe, "exec", "--help"], timeout=timeout_s)
     except (OSError, subprocess.TimeoutExpired) as exc:
         return {"status": CROSS_FAMILY_UNAVAILABLE, "reason": f"{type(exc).__name__}: {exc}"}
     help_text = proc.stdout + proc.stderr
@@ -268,16 +404,16 @@ def probe_codex_vision(png_path, expected_word, codex_exe=None, model=None, time
     prompt = ("Look at the attached image. A single square sits on a plain background. Reply with ONLY the "
               "English name of the square's colour, in lower case, and nothing else.")
     try:
-        proc = subprocess.run(
-            judge.command(os.path.join(work, "pair.png"), out_file, work), input=prompt, cwd=work,
-            capture_output=True, text=True, encoding="utf-8", timeout=timeout_s,
-        )
+        proc = run_bounded(judge.command(os.path.join(work, "pair.png"), out_file, work), input_text=prompt,
+                           cwd=work, timeout=timeout_s)
         text = ""
         if os.path.isfile(out_file):
             with open(out_file, "r", encoding="utf-8", errors="replace") as handle:
                 text = handle.read()
     except subprocess.TimeoutExpired:
         return {"status": CROSS_FAMILY_FLAG_ONLY, "reason": f"vision probe timed out after {timeout_s}s"}
+    except OSError as exc:
+        return {"status": CROSS_FAMILY_FLAG_ONLY, "reason": f"vision probe could not start: {exc}"}
     finally:
         _remove_workdir(work)
     if proc.returncode != 0:
@@ -311,6 +447,11 @@ def _load_json(path, default=None):
         return default
 
 
+def sha256_file(path):
+    with open(path, "rb") as handle:
+        return hashlib.sha256(handle.read()).hexdigest()
+
+
 def results_path(session_dir, judge_id):
     safe = "".join(c if c.isalnum() or c in "-_." else "_" for c in judge_id)
     return os.path.join(session_dir, f"verdicts-{safe}.json")
@@ -318,7 +459,9 @@ def results_path(session_dir, judge_id):
 
 def run_session(session_dir, runner, workers=3, deadline_s=500, max_items=None, rubric_path=None, lock_path=None):
     """Judge every item of a built session with `runner`. REFUSES unless the rubric still matches its lock AND
-    the session recorded that same digest before judging. Resumable: items already answered are skipped."""
+    the session recorded that same digest before judging AND the images on disk are the ones the session recorded.
+    Resumable, but a stored verdict is only kept while it still describes the CURRENT image and the CURRENT
+    rubric: anything else is thrown away (and listed under `staleRejected`) and the item is judged again."""
     lock = look_config.verify_rubric_lock(rubric_path, lock_path)
     session = _load_json(os.path.join(session_dir, "session.json"))
     manifest = _load_json(os.path.join(session_dir, "judge_manifest.json"))
@@ -327,12 +470,37 @@ def run_session(session_dir, runner, workers=3, deadline_s=500, max_items=None, 
     if session.get("rubricSha256") != lock["rubricSha256"]:
         raise look_config.RubricLockError(
             "session recorded a different rubric digest than the lock: judging refused (rubric changed after freeze)")
+    current = {}
+    for entry in manifest["items"]:
+        try:
+            current[entry["itemId"]] = sha256_file(os.path.join(session_dir, entry["image"]))
+        except OSError as exc:
+            raise JudgeError(f"pair image of item {entry['itemId']} is unreadable: {exc}") from exc
+    if sorted(current.values()) != sorted(session.get("imageSha256s") or []):
+        raise JudgeError("the pair images on disk do not match the digests the session recorded: "
+                         "the session was changed after it was built; rebuild it")
     rubric_text = look_config.load_rubric_text(rubric_path)
     out_path = results_path(session_dir, runner.judge_id)
-    doc = _load_json(out_path) or {
+    existing = _load_json(out_path)
+    if existing is not None and existing.get("judge") != runner.identity():
+        raise JudgeError(f"{out_path} belongs to judge {existing.get('judge')!r}, not {runner.identity()!r}: "
+                         "refusing to mix verdicts from different judge identities")
+    doc = existing or {
         "schema": "mlv-app/look-judge-results/v1", "judge": runner.identity(),
         "rubricSha256": lock["rubricSha256"], "items": {}, "errors": {},
     }
+    stale = {}
+    for item_id, stored in list(doc["items"].items()):
+        if item_id not in current:
+            stale[item_id] = "ITEM_NOT_IN_THIS_SESSION"
+        elif stored.get("imageSha256") != current[item_id]:
+            stale[item_id] = "IMAGE_DIGEST_DIFFERS_FROM_CURRENT_IMAGE"
+        elif stored.get("rubricSha256") != lock["rubricSha256"]:
+            stale[item_id] = "RUBRIC_DIGEST_DIFFERS_FROM_LOCK"
+    for item_id in stale:
+        del doc["items"][item_id]
+    doc["rubricSha256"] = lock["rubricSha256"]
+    doc["staleRejected"] = {**doc.get("staleRejected", {}), **stale}
     todo = [it for it in manifest["items"] if it["itemId"] not in doc["items"]]
     if max_items is not None:
         todo = todo[:max_items]
@@ -341,11 +509,14 @@ def run_session(session_dir, runner, workers=3, deadline_s=500, max_items=None, 
 
     def one(entry):
         png = os.path.join(session_dir, entry["image"])
-        verdict = runner.judge_image(png, rubric_text)
-        verdict = dict(verdict)
+        digest = sha256_file(png)
+        if digest != current[entry["itemId"]]:
+            raise JudgeError("the pair image changed after the session check")
+        verdict = dict(runner.judge_image(png, rubric_text))
+        if sha256_file(png) != digest:
+            raise JudgeError("the pair image changed while it was being judged")
         verdict["rubricSha256"] = lock["rubricSha256"]
-        with open(png, "rb") as image_handle:
-            verdict["imageSha256"] = hashlib.sha256(image_handle.read()).hexdigest()
+        verdict["imageSha256"] = digest
         return verdict
 
     with concurrent.futures.ThreadPoolExecutor(max_workers=max(1, workers)) as pool:
@@ -364,6 +535,8 @@ def run_session(session_dir, runner, workers=3, deadline_s=500, max_items=None, 
                         doc["errors"][entry["itemId"]] = f"{type(exc).__name__}: {exc}"
                     with open(out_path, "w", encoding="utf-8", newline="\n") as handle:
                         json.dump(doc, handle, indent=2)
+    with open(out_path, "w", encoding="utf-8", newline="\n") as handle:  # also records a run that judged nothing new
+        json.dump(doc, handle, indent=2)
     remaining = [it["itemId"] for it in manifest["items"] if it["itemId"] not in doc["items"]]
     return {"resultsPath": out_path, "judged": len(doc["items"]), "errors": len(doc["errors"]),
-            "remaining": len(remaining), "judge": runner.identity()}
+            "remaining": len(remaining), "staleRejected": len(stale), "judge": runner.identity()}

@@ -2,11 +2,18 @@
 """LOOK-METRICS-JUDGE-1: falsifier tests for the objective look floor (tools/profiling/look/look_metrics.py).
 
 Every image here is SYNTHETIC with a KNOWN-by-construction answer (a patch that is exactly 5% white, a
-brightness offset of exactly +5 codes, a skin patch rotated by a known hue). Needs numpy + Pillow, which the
-hosted repo-hygiene CI image does not install (see test_playback_attr_3_cuda_contact_sheet.py for the same
-guard); the pure-stdlib half of the harness is covered by test_look_judge_harness.py, which CI does run.
+brightness offset of exactly +5 codes, a skin patch rotated by a known hue). Needs numpy + Pillow, which hosted
+CI installs from .github/requirements/repo-hygiene.txt (pinned with hashes), so these tests RUN there on both
+OSes; they skip only on a developer host without the packages, and test_look_judge_harness.CiPinsTests fails
+if they would be skipped in CI. The pure-stdlib half of the harness is covered by test_look_judge_harness.py.
+
+The round-1 reproductions (a one-sided / symmetric dark band that hid a crushed frame, skin pushed out of the
+colour box reading NOT_APPLICABLE, a bare pair threshold turning a geometry refusal into PASS) are pinned here.
 """
+import contextlib
 import importlib.util
+import io
+import json
 import os
 import sys
 import tempfile
@@ -116,10 +123,14 @@ class FloorMetricTests(unittest.TestCase):
         v = lm.evaluate_frame(np.zeros((4, 4), dtype=np.uint8), self.cfg)
         self.assertEqual(v["outcome"], lm.NOT_EVALUABLE)
 
-    def test_verdict_binds_to_the_config_digest(self):
+    def test_verdict_binds_to_the_config_digest_and_carries_its_version(self):
         sheet = lm.evaluate_sheet({0: _gradient()}, self.cfg, self.meta, label="x")
         self.assertEqual(sheet["config"]["configSha256"], self.meta["configSha256"])
+        self.assertEqual(sheet["config"]["configVersion"], 1)  # round 1 wrote null here
         self.assertEqual(sheet["schema"], lm.SCHEMA_FRAME_SHEET)
+        pair = lm.compare_sheets({0: _gradient()}, {0: _gradient()}, self.cfg, self.meta, "shader-subset")
+        self.assertEqual(pair["config"]["configVersion"], 1)
+        self.assertEqual(sheet["letterboxPolicy"]["mode"], "off")
 
 
 @unittest.skipUnless(_HAS_DEPS, "numpy/Pillow are not installed on this host")
@@ -127,61 +138,143 @@ class LetterboxTests(unittest.TestCase):
     def setUp(self):
         self.cfg, self.meta = look_config.load_config()
 
-    def _barred(self):
+    def _barred(self, top=20, bottom=20):
         arr = _gradient(100, 100)
-        arr[:20] = 0
-        arr[-20:] = 0
+        if top:
+            arr[:top] = 0
+        if bottom:
+            arr[-bottom:] = 0
         return arr
 
-    def test_black_bars_are_found_and_excluded_from_every_percentage(self):
+    def _auto(self):
+        return lm.make_letterbox_policy(self.cfg, mode="auto-symmetric")
+
+    # -- nothing is hidden unless the caller says so ---------------------------------------------------
+    def test_the_shipped_default_hides_nothing_so_a_barred_frame_fails_loudly(self):
         v = lm.evaluate_frame(self._barred(), self.cfg)
         lb = v["geometry"]["letterbox"]
-        self.assertEqual((lb["top"], lb["bottom"], lb["left"], lb["right"]), (20, 20, 0, 0))
+        self.assertEqual((lb["top"], lb["bottom"], lb["left"], lb["right"]), (0, 0, 0, 0))
+        self.assertEqual(lb["provenance"], "NONE")
+        self.assertEqual(lb["candidate"], {"top": 20, "bottom": 20, "left": 0, "right": 0})  # seen, not hidden
+        self.assertIn("UNDECLARED_DARK_BANDS_MEASURED_AS_SCENE", lb["notes"])
+        self.assertAlmostEqual(v["metrics"]["crushed_shadow_pct"], 40.0, places=3)
+        self.assertEqual(v["outcome"], lm.FAIL)
+        sheet = lm.evaluate_sheet({0: self._barred()}, self.cfg, self.meta)
+        self.assertEqual(sheet["framesWithDarkBandsMeasuredAsScene"], [0])
+
+    def test_round1_repro_symmetric_crushed_scene_content_no_longer_passes(self):
+        # Sol B4: 100x100, code-8 picture with the first and last 20 rows crushed to zero, NO capture bars.
+        arr = _flat(100, 100, (8, 8, 8))
+        arr[:20] = 0
+        arr[-20:] = 0
+        v = lm.evaluate_frame(arr, self.cfg)
+        self.assertAlmostEqual(v["metrics"]["crushed_shadow_pct"], 40.0, places=3)
+        self.assertEqual(v["checks"]["crushed_shadow"]["outcome"], lm.FAIL)
+        self.assertEqual(v["outcome"], lm.FAIL)
+
+    def test_round1_repro_one_sided_dark_band_no_longer_passes_even_with_auto_symmetric_opted_in(self):
+        # Fable B1: arr[:40] = 0 on a gradient. A band on ONE edge is scene content, whatever the policy.
+        arr = _gradient(100, 100)
+        arr[:40] = 0
+        for policy in (None, self._auto()):
+            v = lm.evaluate_frame(arr, self.cfg, letterbox_policy=policy)
+            self.assertAlmostEqual(v["metrics"]["crushed_shadow_pct"], 40.0, places=3)
+            self.assertEqual(v["outcome"], lm.FAIL)
+            self.assertEqual(v["geometry"]["letterbox"]["top"], 0)
+        self.assertIn("ONE_SIDED_DARK_BAND_IS_SCENE_CONTENT",
+                      lm.evaluate_frame(arr, self.cfg, letterbox_policy=self._auto())["geometry"]["letterbox"]["notes"])
+
+    def test_declared_bars_are_excluded_and_recorded_as_declared(self):
+        policy = lm.make_letterbox_policy(self.cfg, declared={"top": 20, "bottom": 20})
+        v = lm.evaluate_frame(self._barred(), self.cfg, letterbox_policy=policy)
+        lb = v["geometry"]["letterbox"]
+        self.assertEqual((lb["top"], lb["bottom"]), (20, 20))
+        self.assertEqual(lb["provenance"], "DECLARED")
         self.assertAlmostEqual(lb["excludedPct"], 40.0, places=3)
         self.assertEqual(v["metrics"]["crushed_shadow_pct"], 0.0)
+        self.assertAlmostEqual(v["metrics"]["crushed_shadow_pct_full_frame"], 40.0, places=3)  # the hidden share is on record
         self.assertEqual(v["outcome"], lm.PASS)
         self.assertEqual((v["geometry"]["activeHeight"], v["geometry"]["activeWidth"]), (60, 100))
 
-    def test_without_detection_the_same_frame_fails_crushed_shadows(self):
-        cfg = look_config.load_config()[0]
-        cfg["letterbox"]["detect"] = False
-        v = lm.evaluate_frame(self._barred(), cfg)
-        self.assertAlmostEqual(v["metrics"]["crushed_shadow_pct"], 40.0, places=3)
+    def test_declared_bars_that_are_not_actually_dark_are_refused_and_the_full_frame_is_measured(self):
+        policy = lm.make_letterbox_policy(self.cfg, declared={"top": 30, "bottom": 20})  # only 20 rows are dark
+        v = lm.evaluate_frame(self._barred(), self.cfg, letterbox_policy=policy)
+        self.assertEqual(v["geometry"]["letterbox"]["refused"], "DECLARED_BARS_NOT_DARK")
+        self.assertEqual(v["geometry"]["activeHeight"], 100)
         self.assertEqual(v["outcome"], lm.FAIL)
-        self.assertEqual(v["geometry"]["letterbox"]["refused"], "DETECTION_DISABLED")
 
-    def test_pillarbox_is_found_too(self):
+    def test_a_declaration_cannot_hide_a_dark_scene_it_was_never_true_of(self):
+        arr = _gradient(100, 100)  # no dark rows at all
+        policy = lm.make_letterbox_policy(self.cfg, declared={"top": 10, "bottom": 10})
+        self.assertEqual(lm.evaluate_frame(arr, self.cfg, letterbox_policy=policy)["geometry"]["letterbox"]["refused"],
+                         "DECLARED_BARS_NOT_DARK")
+
+    def test_auto_symmetric_is_an_explicit_opt_in_that_excludes_symmetric_bars_within_the_tolerance(self):
+        v = lm.evaluate_frame(self._barred(), self.cfg, letterbox_policy=self._auto())
+        lb = v["geometry"]["letterbox"]
+        self.assertEqual((lb["top"], lb["bottom"], lb["provenance"]), (20, 20, "AUTO_SYMMETRIC"))
+        self.assertEqual(v["outcome"], lm.PASS)
+        tol = self.cfg["letterbox"]["symmetry_tolerance_px"]
+        near = lm.detect_letterbox(self._barred(20, 20 + tol), self.cfg, self._auto())
+        self.assertEqual((near["top"], near["bottom"]), (20, 20 + tol))
+        far = lm.detect_letterbox(self._barred(20, 20 + tol + 1), self.cfg, self._auto())
+        self.assertEqual((far["top"], far["bottom"], far["provenance"]), (0, 0, "NONE"))
+
+    def test_the_config_can_turn_auto_symmetric_on_but_the_shipped_value_is_off(self):
+        cfg = look_config.load_config()[0]
+        self.assertFalse(lm.make_letterbox_policy(cfg)["mode"] == "auto-symmetric")
+        cfg["letterbox"]["auto_exclude_symmetric"] = True
+        self.assertEqual(lm.make_letterbox_policy(cfg)["mode"], "auto-symmetric")
+        self.assertEqual(lm.evaluate_frame(self._barred(), cfg)["outcome"], lm.PASS)
+
+    def test_pillarbox_is_found_too_under_the_opt_in_and_never_one_sided(self):
         arr = _gradient(100, 100)
         arr[:, :10] = 0
         arr[:, -10:] = 0
-        lb = lm.evaluate_frame(arr, self.cfg)["geometry"]["letterbox"]
+        lb = lm.evaluate_frame(arr, self.cfg, letterbox_policy=self._auto())["geometry"]["letterbox"]
         self.assertEqual((lb["left"], lb["right"]), (10, 10))
+        one = _gradient(100, 100)
+        one[:, :10] = 0
+        lb = lm.evaluate_frame(one, self.cfg, letterbox_policy=self._auto())["geometry"]["letterbox"]
+        self.assertEqual((lb["left"], lb["right"]), (0, 0))
 
     def test_an_all_black_frame_is_not_cropped_to_nothing(self):
-        v = lm.evaluate_frame(_flat(50, 50, (0, 0, 0)), self.cfg)
+        v = lm.evaluate_frame(_flat(50, 50, (0, 0, 0)), self.cfg, letterbox_policy=self._auto())
         self.assertEqual(v["geometry"]["letterbox"]["refused"], "ALL_BLACK_FRAME")
         self.assertEqual(v["outcome"], lm.FAIL)  # 100 % crushed
 
     def test_an_implausible_exclusion_is_refused_as_a_dark_frame(self):
         arr = _gradient(100, 100)
-        arr[:70] = 0  # 70 % black: more likely a dark frame than a letterbox
-        v = lm.evaluate_frame(arr, self.cfg)
-        self.assertEqual(v["geometry"]["letterbox"]["refused"], "EXCLUSION_IMPLAUSIBLE_PROBABLY_DARK_FRAME")
-        self.assertEqual(v["geometry"]["activeHeight"], 100)
-        self.assertEqual(v["outcome"], lm.FAIL)
+        arr[:35] = 0
+        arr[-35:] = 0  # 70 % black, symmetric: still more likely a dark frame than a letterbox
+        for policy in (self._auto(), lm.make_letterbox_policy(self.cfg, declared={"top": 35, "bottom": 35})):
+            v = lm.evaluate_frame(arr, self.cfg, letterbox_policy=policy)
+            self.assertEqual(v["geometry"]["letterbox"]["refused"], "EXCLUSION_IMPLAUSIBLE_PROBABLY_DARK_FRAME")
+            self.assertEqual(v["geometry"]["activeHeight"], 100)
+            self.assertEqual(v["outcome"], lm.FAIL)
 
     def test_ringing_next_to_a_bar_within_the_bar_code_still_counts_as_bar(self):
-        arr = _gradient(100, 100)
-        arr[:20] = 0
+        arr = self._barred()
         arr[19] = 3  # <= bar_max_code (4)
-        lb = lm.detect_letterbox(arr, self.cfg)
-        self.assertEqual(lb["top"], 20)
+        arr[-20] = 3
+        lb = lm.detect_letterbox(arr, self.cfg, self._auto())
+        self.assertEqual((lb["top"], lb["bottom"]), (20, 20))
 
     def test_a_real_dark_row_is_not_a_bar(self):
         arr = _gradient(100, 100)
         arr[:5] = 0
         arr[5, 40:60] = 90  # one lit pixel run: the row is content
-        self.assertEqual(lm.detect_letterbox(arr, self.cfg)["top"], 5)
+        self.assertEqual(lm.detect_letterbox(arr, self.cfg)["candidate"]["top"], 5)
+
+    def test_policy_and_bar_spec_parsing_refuse_nonsense(self):
+        self.assertEqual(lm.parse_declared_bars("top=34,bottom=34"), {"top": 34, "bottom": 34})
+        for bad in ("", "top", "top=x", "middle=3", "top=-1"):
+            with self.assertRaises(ValueError):
+                lm.parse_declared_bars(bad)
+        with self.assertRaises(ValueError):
+            lm.make_letterbox_policy(self.cfg, mode="always")
+        with self.assertRaises(ValueError):
+            lm.make_letterbox_policy(self.cfg, declared={"top": -2})
 
 
 @unittest.skipUnless(_HAS_DEPS, "numpy/Pillow are not installed on this host")
@@ -199,11 +292,97 @@ class SkinTests(unittest.TestCase):
         self.assertEqual(int(mask.sum()), 900)
         self.assertFalse(mask[0, 0])
 
-    def test_no_skin_region_is_not_applicable_never_a_pass(self):
+    def test_no_skin_region_in_the_baseline_is_not_applicable_never_a_pass(self):
         base = _flat(80, 80, (90, 110, 160))
         v = lm.evaluate_frame(base, self.cfg, reference=base)
         self.assertEqual(v["checks"]["skin_hue_drift"]["outcome"], lm.NOT_APPLICABLE)
-        self.assertEqual(v["checks"]["skin_hue_drift"]["reason"], "NO_SKIN_TONE_REGION_IN_FRAME")
+        self.assertEqual(v["checks"]["skin_hue_drift"]["reason"], "NO_SKIN_TONE_REGION_IN_BASELINE")
+
+    def test_round1_repro_skin_pushed_out_of_the_colour_box_is_a_FAIL_not_NOT_APPLICABLE(self):
+        # Sol B5 / Fable B2: the baseline has a 9 % skin region; the subject moves ONLY that patch.
+        base = self._skin_scene((224, 172, 140))
+        for label, rgb in (("blue (sol)", (140, 172, 224)), ("green (fable)", (150, 200, 150)),
+                           ("magenta (fable)", (224, 150, 190)), ("grey", (128, 128, 128))):
+            with self.subTest(label):
+                v = lm.evaluate_frame(self._skin_scene(rgb), self.cfg, reference=base)
+                check = v["checks"]["skin_hue_drift"]
+                self.assertEqual(check["outcome"], lm.FAIL)
+                self.assertEqual(check["reason"], "SKIN_REGION_LOST_OR_SHRUNK")
+                self.assertEqual(v["outcome"], lm.FAIL)
+                self.assertIn("skin_hue_drift", v["failedChecks"])
+                self.assertEqual(check["baselineRegionPct"], 9.0)
+                self.assertEqual(check["subjectRegionPct"], 0.0)
+
+    def test_a_100_degree_drift_can_no_longer_pass_while_a_6_degree_one_fails(self):
+        base = self._skin_scene((224, 172, 140))
+        far = lm.evaluate_frame(self._skin_scene((150, 200, 150)), self.cfg, reference=base)
+        near = lm.evaluate_frame(self._skin_scene((224, 150, 140)), self.cfg, reference=base)
+        self.assertEqual((far["outcome"], near["outcome"]), (lm.FAIL, lm.FAIL))
+
+    def test_a_sheet_with_a_lost_skin_region_fails_and_counts_the_check_as_applied(self):
+        base = self._skin_scene((224, 172, 140))
+        sheet = lm.evaluate_sheet({0: self._skin_scene((140, 172, 224))}, self.cfg, self.meta, references={0: base})
+        self.assertEqual(sheet["outcome"], lm.FAIL)
+        self.assertEqual(sheet["skinCheck"], {"appliedToFrames": 1, "ofFrames": 1})
+
+    def test_only_part_of_the_skin_moving_is_caught_by_measuring_over_the_baselines_mask(self):
+        base = self._skin_scene((224, 172, 140))
+        half = base.copy()
+        half[30:60, 45:60] = (150, 200, 150)  # half the patch turns green; the other half keeps its own hue
+        v = lm.evaluate_frame(half, self.cfg, reference=base)
+        check = v["checks"]["skin_hue_drift"]
+        self.assertEqual(check["maskBasis"], "BASELINE_MASK")
+        self.assertEqual(check["outcome"], lm.FAIL)
+        self.assertGreater(check["value"], 30.0)  # the subject's own mask alone would have read ~0
+
+    def test_a_shrunken_region_below_the_retain_fraction_fails_and_one_above_it_is_measured(self):
+        base = self._skin_scene((224, 172, 140))
+        shrunk = self._skin_scene((224, 172, 140))
+        shrunk[30:60, 50:60] = (90, 110, 160)  # a third of the patch gone: 6 % left of 9 %, above retain 0.5
+        kept = lm.evaluate_frame(shrunk, self.cfg, reference=base)["checks"]["skin_hue_drift"]
+        self.assertEqual(kept["maskBasis"], "BASELINE_MASK")  # kept, so the drift over the baseline's pixels is measured
+        self.assertNotIn("reason", kept)
+        self.assertEqual(kept["outcome"], lm.FAIL)            # ... and the pixels that stopped being skin show as drift
+        shrunk[30:60, 33:60] = (90, 110, 160)  # 0.9 % left of 9 %: below the 4.5 % that must be kept
+        lost = lm.evaluate_frame(shrunk, self.cfg, reference=base)["checks"]["skin_hue_drift"]
+        self.assertEqual((lost["outcome"], lost["reason"]), (lm.FAIL, "SKIN_REGION_LOST_OR_SHRUNK"))
+
+    def test_the_retain_fraction_is_the_configs(self):
+        base = self._skin_scene((224, 172, 140))
+        shrunk = self._skin_scene((224, 172, 140))
+        shrunk[30:60, 33:60] = (90, 110, 160)
+        self.assertEqual(lm.evaluate_frame(shrunk, self.cfg, reference=base)["checks"]["skin_hue_drift"]["reason"],
+                         "SKIN_REGION_LOST_OR_SHRUNK")
+        cfg = look_config.load_config()[0]
+        cfg["frame"]["skin_region_retain_fraction"] = 0.05
+        relaxed = lm.evaluate_frame(shrunk, cfg, reference=base)["checks"]["skin_hue_drift"]
+        self.assertNotIn("reason", relaxed)  # no longer 'lost': the config decided
+        self.assertEqual(relaxed["maskBasis"], "BASELINE_MASK")
+
+    def test_a_baseline_that_was_given_but_cannot_be_read_is_not_evaluable_never_not_applicable(self):
+        v = lm.evaluate_frame(self._skin_scene((224, 172, 140)), self.cfg,
+                              reference=os.path.join(tempfile.gettempdir(), "no-such-baseline.png"))
+        self.assertEqual(v["outcome"], lm.NOT_EVALUABLE)
+        self.assertIn("BASELINE_UNREADABLE", v["error"])
+        sheet = lm.evaluate_sheet({0: self._skin_scene((224, 172, 140))}, self.cfg, self.meta,
+                                  references={0: np.zeros((4, 4), dtype=np.uint8)})
+        self.assertEqual(sheet["outcome"], lm.INCOMPLETE)
+
+    def test_frames_that_cannot_be_aligned_fall_back_to_each_frames_own_region_and_say_so(self):
+        base = self._skin_scene((224, 172, 140))
+        wide = np.concatenate([base, base[:, :20]], axis=1)  # 20 px wider than the tolerance allows
+        v = lm.evaluate_frame(wide, self.cfg, reference=base)
+        self.assertEqual(v["checks"]["skin_hue_drift"]["maskBasis"], "OWN_MASK_SHAPES_DIFFER")
+        self.assertEqual(v["checks"]["skin_hue_drift"]["outcome"], lm.PASS)
+        lost = self._skin_scene((140, 172, 224))
+        lost = np.concatenate([lost, lost[:, :20]], axis=1)
+        self.assertEqual(lm.evaluate_frame(lost, self.cfg, reference=base)["checks"]["skin_hue_drift"]["outcome"], lm.FAIL)
+
+    def test_a_thumbnail_one_row_taller_than_the_baseline_is_still_aligned(self):
+        base = self._skin_scene((224, 172, 140))
+        taller = np.concatenate([base, base[-2:]], axis=0)  # +2 rows: inside the 4 px crop tolerance
+        check = lm.evaluate_frame(taller, self.cfg, reference=base)["checks"]["skin_hue_drift"]
+        self.assertEqual((check["maskBasis"], check["outcome"]), ("BASELINE_MASK", lm.PASS))
 
     def test_without_a_baseline_the_skin_check_is_not_applicable(self):
         v = lm.evaluate_frame(self._skin_scene((224, 172, 140)), self.cfg)
@@ -392,13 +571,48 @@ class PairMetricTests(unittest.TestCase):
         self.assertEqual(v["geometry"]["centreCroppedTo"], [96, 62])
         self.assertEqual(v["outcome"], lm.PASS)  # a[1:63] is exactly the centre of a
 
-    def test_letterbox_bars_do_not_break_pairing(self):
+    def test_declared_or_symmetric_letterbox_bars_do_not_break_pairing_but_undeclared_ones_do(self):
         content = _gradient(60, 100)
         barred = np.zeros((100, 100, 3), dtype=np.uint8)
         barred[20:80] = content
-        v = lm.compare_frames(content, barred, self.cfg, "shader-subset")
-        self.assertEqual(v["geometry"]["bActive"], [100, 60])
-        self.assertEqual(v["outcome"], lm.PASS)
+        undeclared = lm.compare_frames(content, barred, self.cfg, "shader-subset")
+        self.assertEqual(undeclared["outcome"], lm.GEOMETRY_MISMATCH)  # nothing was hidden to make it match
+        declared = lm.compare_frames(
+            content, barred, self.cfg, "shader-subset",
+            letterbox_policy_b=lm.make_letterbox_policy(self.cfg, declared={"top": 20, "bottom": 20}))
+        self.assertEqual(declared["geometry"]["bActive"], [100, 60])
+        self.assertEqual(declared["geometry"]["bLetterbox"]["provenance"], "DECLARED")
+        self.assertEqual(declared["outcome"], lm.PASS)
+        auto = lm.compare_frames(
+            content, barred, self.cfg, "shader-subset",
+            letterbox_policy_b=lm.make_letterbox_policy(self.cfg, mode="auto-symmetric"))
+        self.assertEqual(auto["outcome"], lm.PASS)
+        sheet = lm.compare_sheets({0: content}, {0: barred}, self.cfg, self.meta, "shader-subset",
+                                  letterbox_policy_b=lm.make_letterbox_policy(self.cfg, mode="auto-symmetric"))
+        self.assertEqual(sheet["outcome"], lm.PASS)
+        self.assertEqual(sheet["letterboxPolicy"]["b"]["mode"], "auto-symmetric")
+
+    def test_round1_repro_a_bare_geometry_tolerance_can_no_longer_turn_a_mismatch_into_a_pass(self):
+        # Sol B6: pair.geometry_tolerance_px bare 16 made 64x96 vs 80x96 compare as PASS. The loader refuses it now,
+        # and with the shipped 0 the same pair is a typed GEOMETRY_MISMATCH.
+        ramp = _gradient(96, 80)
+        self.assertEqual(lm.compare_frames(ramp[:, :64], ramp, self.cfg, "shader-subset")["outcome"], lm.GEOMETRY_MISMATCH)
+        with tempfile.TemporaryDirectory() as tmp:
+            import json
+            with open(look_config.CONFIG_PATH, "r", encoding="utf-8") as handle:
+                doc = json.load(handle)
+            doc["pair"]["geometry_tolerance_px"] = 16
+            path = os.path.join(tmp, "cfg.json")
+            with open(path, "w", encoding="utf-8") as handle:
+                json.dump(doc, handle)
+            with self.assertRaises(look_config.ConfigError):
+                look_config.load_config(path)
+            doc["pair"]["geometry_tolerance_px"] = {"value": 0, "reason": "r"}
+            doc["pair"]["mismatch_channel_tolerance"] = 3
+            with open(path, "w", encoding="utf-8") as handle:
+                json.dump(doc, handle)
+            with self.assertRaises(look_config.ConfigError):
+                look_config.load_config(path)
 
     def test_unknown_scope_is_refused(self):
         with self.assertRaises(ValueError):
@@ -428,6 +642,81 @@ class PairMetricTests(unittest.TestCase):
                                   overrides={"pair.geometry_tolerance_px": {"from": 0, "to": 2, "reason": "r"}})
         self.assertEqual(sheet["config"]["overrides"]["pair.geometry_tolerance_px"]["to"], 2)
         self.assertEqual(sheet["config"]["configSha256"], self.meta["configSha256"])
+
+
+@unittest.skipUnless(_HAS_DEPS, "numpy/Pillow are not installed on this host")
+class FloorCliTests(unittest.TestCase):
+    """The CLI makes the caller say what may be hidden: undeclared bars FAIL, declared ones are excluded and recorded."""
+
+    def _run(self, argv):
+        import look_cli
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            return look_cli.main(argv), out.getvalue()
+
+    def _dir(self, tmp, name, arr):
+        directory = os.path.join(tmp, name)
+        os.makedirs(directory)
+        Image.fromarray(arr, "RGB").save(os.path.join(directory, f"{name}-frame-00.png"))
+        return directory
+
+    def test_floor_cli_undeclared_bars_fail_declared_bars_pass_and_both_are_on_record(self):
+        barred = _gradient(100, 100)
+        barred[:20] = 0
+        barred[-20:] = 0
+        with tempfile.TemporaryDirectory() as tmp:
+            frames = self._dir(tmp, "cuda", barred)
+            out = os.path.join(tmp, "v.json")
+            code, _ = self._run(["floor", "--frames-dir", frames, "--label", "x", "--out", out])
+            self.assertEqual(code, 1)  # FAIL: crushed shadows, loudly
+            with open(out, "r", encoding="utf-8") as handle:
+                self.assertEqual(json.load(handle)["framesWithDarkBandsMeasuredAsScene"], [0])
+            code, _ = self._run(["floor", "--frames-dir", frames, "--label", "x", "--out", out,
+                                 "--letterbox-bars", "top=20,bottom=20"])
+            self.assertEqual(code, 0)
+            with open(out, "r", encoding="utf-8") as handle:
+                verdict = json.load(handle)
+            self.assertEqual(verdict["frames"][0]["geometry"]["letterbox"]["provenance"], "DECLARED")
+            self.assertEqual(verdict["letterboxPolicy"]["declared"], {"top": 20, "bottom": 20, "left": 0, "right": 0})
+            code, _ = self._run(["floor", "--frames-dir", frames, "--label", "x", "--out", out,
+                                 "--letterbox", "auto-symmetric"])
+            self.assertEqual(code, 0)
+
+    def test_floor_cli_a_one_sided_band_fails_whatever_the_flags(self):
+        arr = _gradient(100, 100)
+        arr[:40] = 0
+        with tempfile.TemporaryDirectory() as tmp:
+            frames = self._dir(tmp, "cuda", arr)
+            out = os.path.join(tmp, "v.json")
+            self.assertEqual(self._run(["floor", "--frames-dir", frames, "--label", "x", "--out", out])[0], 1)
+            self.assertEqual(self._run(["floor", "--frames-dir", frames, "--label", "x", "--out", out,
+                                        "--letterbox", "auto-symmetric"])[0], 1)
+            code, _ = self._run(["floor", "--frames-dir", frames, "--label", "x", "--out", out,
+                                 "--letterbox-bars", "top=40"])
+            self.assertEqual(code, 0)  # the caller may declare it: that is an explicit, recorded choice
+
+    def test_floor_cli_skin_lost_against_a_baseline_exits_one(self):
+        base = _flat(100, 100, (90, 110, 160))
+        base[30:60, 30:60] = (224, 172, 140)
+        moved = base.copy()
+        moved[30:60, 30:60] = (140, 172, 224)
+        with tempfile.TemporaryDirectory() as tmp:
+            frames, baseline = self._dir(tmp, "sub", moved), self._dir(tmp, "base", base)
+            out = os.path.join(tmp, "v.json")
+            code, _ = self._run(["floor", "--frames-dir", frames, "--baseline-dir", baseline, "--label", "x",
+                                 "--out", out])
+            self.assertEqual(code, 1)
+
+    def test_pair_metrics_cli_per_side_declaration(self):
+        content = _gradient(60, 100)
+        barred = np.zeros((100, 100, 3), dtype=np.uint8)
+        barred[20:80] = content
+        with tempfile.TemporaryDirectory() as tmp:
+            a, b = self._dir(tmp, "cpu", content), self._dir(tmp, "cuda", barred)
+            out = os.path.join(tmp, "p.json")
+            base = ["pair-metrics", "--a-dir", a, "--b-dir", b, "--scope", "shader-subset", "--out", out]
+            self.assertEqual(self._run(base)[0], 2)  # GEOMETRY_MISMATCH -> INCOMPLETE
+            self.assertEqual(self._run(base + ["--b-letterbox-bars", "top=20,bottom=20"])[0], 0)
 
 
 if __name__ == "__main__":

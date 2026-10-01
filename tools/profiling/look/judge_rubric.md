@@ -1,4 +1,4 @@
-# Look Assist blind judging rubric -- look-rubric-v1 (FROZEN)
+# Look Assist blind judging rubric -- look-rubric-v2 (FROZEN)
 
 This file is hashed (sha256 of its exact bytes, LF line endings) BEFORE any judging. The digest is
 recorded in `judge_rubric.lock.json` and in every judging session; a verdict that quotes a different
@@ -33,12 +33,12 @@ Use whole numbers. 3 is "acceptable, nothing special". Do not hand out 5 casuall
 - 5: highlights compress smoothly toward white, keep texture and colour, no visible clipping edge.
 
 ### skin -- do people look healthy and natural? (score `null` when no person/skin is visible in the picture)
-- 1: skin is visibly green, magenta, grey, orange or waxy.
+- 1: skin is visibly not a natural skin colour for any person or light, or looks waxy.
 - 3: skin is plausible but a little off in hue, brightness or saturation.
 - 5: skin looks natural and flattering for the scene's light, with believable shading.
 
 ### colour_cast -- is the overall colour balance right for this scene?
-- 1: a strong cast over the whole frame (e.g. lavender, teal or yellow wash) that the scene does not justify; neutrals are not neutral.
+- 1: a strong single-colour cast over the whole frame that the scene does not justify; neutrals are not neutral.
 - 3: a mild cast, or a deliberate-looking tint that is not clearly justified.
 - 5: neutrals read neutral; any warmth or coolness is plausibly the scene's own light.
 

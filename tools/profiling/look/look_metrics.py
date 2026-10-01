@@ -18,17 +18,21 @@ WHAT IT MEASURES (all on the ACTIVE area -- see letterbox below)
 THE RULES IT ENCODES
     * Typed terminals, zero partial credit. A frame is PASS | FAIL | NOT_EVALUABLE; a sheet is PASS only if
       every frame is PASS. An empty sheet or one unreadable frame is INCOMPLETE, never PASS.
-    * N/A is never a pass. With no skin-tone region (or no baseline frame) the skin check is NOT_APPLICABLE
-      and the sheet verdict says how many frames it actually applied to.
-    * Letterbox-aware. A playback capture can include black window bars (the Ultra-Magnus CUDA fixture tiles
-      are 16:9 with ~17% black bars; the CPU tiles are content-only). Bars are excluded from every percentage
-      and the exclusion is written into the verdict, otherwise every CUDA frame fails 'crushed shadows' on
-      geometry rather than look. A would-be exclusion of more than 50% is refused as 'probably a dark frame'.
+    * N/A is never a pass. With no baseline frame, or a baseline with no skin-tone region, the skin check is
+      NOT_APPLICABLE and the sheet verdict says how many frames it actually applied to. A baseline that HAS a
+      skin region while the subject has lost it (or kept less than skin_region_retain_fraction of it) is a FAIL:
+      a look that pushes skin out of the colour box is the worst drift, never "not applicable".
+    * Nothing is hidden from the floor unless the caller says so. A playback capture can include black window
+      bars (the Ultra-Magnus CUDA fixture tiles are 16:9 with ~25% black bars; the CPU tiles are content-only),
+      but pixels alone cannot tell a bar from a crushed region of the scene. Bars are excluded only when the
+      caller DECLARES them (--letterbox-bars) or opts in to SYMMETRIC auto-detection (--letterbox auto-symmetric,
+      with a stated tolerance); a one-sided dark band is always scene content. Undeclared, the full frame is
+      measured. Whichever applies is written into every frame verdict (mode, provenance, candidate bands).
     * Thresholds live in ONE tracked file with a reason per value (look_floor_config.json); a verdict carries
-      the config's sha256 and any override that was applied.
+      the config's sha256, its version and any override that was applied.
 
-Requires Pillow + numpy (the same dependency make-contact-sheet.py already has). Pure-stdlib pieces live in
-look_config.py / look_tally.py so CI images without numpy still prove them.
+Requires Pillow + numpy (pinned, with hashes, in .github/requirements/repo-hygiene.txt, so the pixel tests run
+in hosted CI). Pure-stdlib pieces live in look_config.py / look_tally.py so the judging path needs neither.
 """
 import importlib.util
 import math
@@ -84,30 +88,99 @@ def load_rgb(source):
     return np.ascontiguousarray(arr[:, :, :3])
 
 
-def detect_letterbox(arr, cfg):
-    """Find black bars touching the frame edges. Returns a dict; 'active' is (top, bottom, left, right) crop
-    sizes that were APPLIED (all zero when nothing was detected or the exclusion was refused)."""
+LETTERBOX_MODES = ("off", "auto-symmetric")
+_SIDES = ("top", "bottom", "left", "right")
+
+
+def make_letterbox_policy(cfg, mode=None, declared=None):
+    """The caller's decision about what the floor may hide. mode defaults from the config (OFF as shipped);
+    `declared` is an explicit {top,bottom,left,right} (px, missing sides 0) naming bars the caller KNOWS exist."""
+    policy = {"mode": "auto-symmetric" if cfg["letterbox"]["auto_exclude_symmetric"] else "off", "declared": None}
+    if mode is not None:
+        if mode not in LETTERBOX_MODES:
+            raise ValueError(f"letterbox mode must be one of {LETTERBOX_MODES}, got {mode!r}")
+        policy["mode"] = mode
+    if declared is not None:
+        clean = {}
+        for side in _SIDES:
+            value = declared.get(side, 0)
+            if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+                raise ValueError(f"declared letterbox {side} must be a non-negative integer, got {value!r}")
+            clean[side] = value
+        extra = set(declared) - set(_SIDES)
+        if extra:
+            raise ValueError(f"declared letterbox has unknown sides {sorted(extra)}")
+        policy["declared"] = clean
+    return policy
+
+
+def parse_declared_bars(spec):
+    """'top=34,bottom=34' -> {'top': 34, 'bottom': 34}. Anything else is refused."""
+    declared = {}
+    for part in (spec or "").split(","):
+        name, _, value = part.strip().partition("=")
+        if name not in _SIDES or not value.strip().isdigit():
+            raise ValueError(f"--letterbox-bars wants top=N,bottom=N,left=N,right=N; got {spec!r}")
+        declared[name] = int(value)
+    if not declared:
+        raise ValueError("--letterbox-bars names no side")
+    return declared
+
+
+def _leading_run(flags):
+    return int(np.argmin(flags)) if not flags.all() else len(flags)
+
+
+def _decide_axis(cand_lo, cand_hi, declared_pair, mode, tolerance):
+    """(lo, hi, provenance, note) for one axis. Only a DECLARED pair, or a SYMMETRIC pair under the auto opt-in,
+    is ever applied; everything else is left in the measured area."""
+    if declared_pair is not None:
+        lo, hi = declared_pair
+        if lo > cand_lo or hi > cand_hi:
+            return 0, 0, "NONE", "DECLARED_BARS_NOT_DARK"
+        return lo, hi, ("DECLARED" if (lo or hi) else "NONE"), None
+    if not (cand_lo or cand_hi):
+        return 0, 0, "NONE", None
+    if mode != "auto-symmetric":
+        return 0, 0, "NONE", "UNDECLARED_DARK_BANDS_MEASURED_AS_SCENE"
+    if cand_lo > 0 and cand_hi > 0 and abs(cand_lo - cand_hi) <= tolerance:
+        return cand_lo, cand_hi, "AUTO_SYMMETRIC", None
+    return 0, 0, "NONE", "ONE_SIDED_DARK_BAND_IS_SCENE_CONTENT"
+
+
+def detect_letterbox(arr, cfg, policy=None):
+    """Find dark bands touching the frame edges and decide which ones may be excluded. Returns a dict whose
+    top/bottom/left/right are the crop sizes APPLIED (all zero unless the policy allowed an exclusion);
+    'candidate' always lists the dark bands that were SEEN, applied or not, so nothing is hidden silently."""
     lb = cfg["letterbox"]
+    policy = policy or make_letterbox_policy(cfg)
     height, width = arr.shape[:2]
-    result = {"detected": False, "top": 0, "bottom": 0, "left": 0, "right": 0, "excludedPct": 0.0, "refused": None}
-    if not lb["detect"]:
-        result["refused"] = "DETECTION_DISABLED"
-        return result
+    result = {
+        "mode": policy["mode"], "provenance": "NONE", "detected": False, "top": 0, "bottom": 0, "left": 0,
+        "right": 0, "excludedPct": 0.0, "refused": None, "notes": [],
+        "candidate": {"top": 0, "bottom": 0, "left": 0, "right": 0},
+        "declared": policy.get("declared"), "symmetryTolerancePx": int(lb["symmetry_tolerance_px"]),
+    }
     bar_max = int(lb["bar_max_code"])
     row_is_bar = arr.max(axis=(1, 2)) <= bar_max
     if row_is_bar.all():
         result["refused"] = "ALL_BLACK_FRAME"
         return result
-
-    def leading(flags):
-        return int(np.argmin(flags)) if not flags.all() else len(flags)
-
-    top = leading(row_is_bar)
-    bottom = leading(row_is_bar[::-1])
+    declared = policy.get("declared")
+    tol = int(lb["symmetry_tolerance_px"])
+    top_c, bottom_c = _leading_run(row_is_bar), _leading_run(row_is_bar[::-1])
+    top, bottom, prov_v, note_v = _decide_axis(
+        top_c, bottom_c, (declared["top"], declared["bottom"]) if declared else None, policy["mode"], tol)
     rows = arr[top:height - bottom]
     col_is_bar = rows.max(axis=(0, 2)) <= bar_max
-    left = leading(col_is_bar)
-    right = leading(col_is_bar[::-1])
+    left_c, right_c = _leading_run(col_is_bar), _leading_run(col_is_bar[::-1])
+    left, right, prov_h, note_h = _decide_axis(
+        left_c, right_c, (declared["left"], declared["right"]) if declared else None, policy["mode"], tol)
+    result["candidate"] = {"top": top_c, "bottom": bottom_c, "left": left_c, "right": right_c}
+    result["notes"] = [n for n in (note_v, note_h) if n]
+    if "DECLARED_BARS_NOT_DARK" in result["notes"]:
+        result["refused"] = "DECLARED_BARS_NOT_DARK"
+        return result
     active_h = height - top - bottom
     active_w = width - left - right
     if min(active_h, active_w) < int(lb["min_active_px"]):
@@ -118,8 +191,10 @@ def detect_letterbox(arr, cfg):
         result["refused"] = "EXCLUSION_IMPLAUSIBLE_PROBABLY_DARK_FRAME"
         result["excludedPct"] = round(excluded, 4)
         return result
+    applied = bool(top or bottom or left or right)
+    provenance = "DECLARED" if "DECLARED" in (prov_v, prov_h) else ("AUTO_SYMMETRIC" if applied else "NONE")
     result.update(
-        {"detected": bool(top or bottom or left or right), "top": top, "bottom": bottom, "left": left,
+        {"detected": applied, "provenance": provenance, "top": top, "bottom": bottom, "left": left,
          "right": right, "excludedPct": round(excluded, 4)}
     )
     return result
@@ -192,7 +267,62 @@ def skin_summary(active, cfg):
     if usable:
         hue, _, _ = rgb_to_hsv(active)
         hue_deg = round(circular_mean_deg(hue[mask]), 4)
-    return {"regionPct": round(pct, 4), "usable": usable, "meanHueDeg": hue_deg}
+    return {"regionPct": round(pct, 4), "usable": usable, "meanHueDeg": hue_deg, "mask": mask}
+
+
+def _centre_align(a, b, tolerance_px):
+    """Centre-crop two H x W x 3 arrays to their common size when each axis differs by <= tolerance_px; None otherwise."""
+    dh, dw = abs(a.shape[0] - b.shape[0]), abs(a.shape[1] - b.shape[1])
+    if dh > tolerance_px or dw > tolerance_px:
+        return None
+    h, w = min(a.shape[0], b.shape[0]), min(a.shape[1], b.shape[1])
+
+    def centre(x):
+        t, left = (x.shape[0] - h) // 2, (x.shape[1] - w) // 2
+        return x[t:t + h, left:left + w]
+
+    return centre(a), centre(b)
+
+
+def skin_drift_check(active, ref_active, cfg):
+    """Skin-hue drift of `active` against a baseline that is known to HAVE a usable skin-tone region.
+
+    The subject cannot dodge the check by losing the region: a subject whose region is empty, below the minimum
+    share, or smaller than skin_region_retain_fraction of the baseline's is a FAIL. Drift is measured over the
+    BASELINE's mask (the same pixels in both frames) whenever the two active areas align after a small centre
+    crop, so a look that moves only some of the skin out of the colour box still shows as drift."""
+    frame_cfg = cfg["frame"]
+    threshold = frame_cfg["skin_hue_drift_deg_max"]
+    ref_skin = skin_summary(ref_active, cfg)
+    skin = skin_summary(active, cfg)
+    detail = {"baselineRegionPct": ref_skin["regionPct"], "subjectRegionPct": skin["regionPct"],
+              "retainFraction": float(frame_cfg["skin_region_retain_fraction"]), "threshold": threshold,
+              "comparator": "<="}
+    if not ref_skin["usable"] or not bool(ref_skin["mask"].any()):
+        detail.update({"outcome": NOT_APPLICABLE, "reason": "NO_SKIN_TONE_REGION_IN_BASELINE"})
+        return detail, skin
+    retained = skin["regionPct"] >= detail["retainFraction"] * ref_skin["regionPct"]
+    if not retained or skin["regionPct"] <= 0.0:
+        detail.update({"outcome": FAIL, "reason": "SKIN_REGION_LOST_OR_SHRUNK", "value": None})
+        return detail, skin
+    aligned = _centre_align(active, ref_active, int(frame_cfg["skin_baseline_crop_tolerance_px"]))
+    if aligned is not None:
+        sub, ref = aligned
+        mask = skin_tone_region(ref, cfg)
+        hue_sub, _, _ = rgb_to_hsv(sub)
+        hue_ref, _, _ = rgb_to_hsv(ref)
+        sub_mean, ref_mean = circular_mean_deg(hue_sub[mask]), circular_mean_deg(hue_ref[mask])
+        basis = "BASELINE_MASK"
+    else:
+        if not skin["usable"]:
+            detail.update({"outcome": FAIL, "reason": "SKIN_REGION_LOST_OR_SHRUNK", "value": None})
+            return detail, skin
+        sub_mean, ref_mean, basis = skin["meanHueDeg"], ref_skin["meanHueDeg"], "OWN_MASK_SHAPES_DIFFER"
+    check = _check(hue_distance_deg(sub_mean, ref_mean), threshold, "<=")
+    detail.update(check)
+    detail.update({"baselineMeanHueDeg": round(ref_mean, 4), "subjectMeanHueDeg": round(sub_mean, 4),
+                   "maskBasis": basis})
+    return detail, skin
 
 
 # ---------------------------------------------------------------------------------------------------------
@@ -205,15 +335,24 @@ def _check(value, threshold, comparator):
             "outcome": PASS if ok else FAIL}
 
 
-def evaluate_frame(source, cfg, reference=None, frame_id=None):
-    """Floor verdict for ONE frame. `reference` (optional) is the baseline frame for the skin-hue drift."""
+def evaluate_frame(source, cfg, reference=None, frame_id=None, letterbox_policy=None):
+    """Floor verdict for ONE frame. `reference` (optional) is the baseline frame for the skin-hue drift.
+    `letterbox_policy` (make_letterbox_policy) says what the caller allows the floor to exclude; default OFF."""
     verdict = {"frameId": frame_id, "outcome": NOT_EVALUABLE, "checks": {}, "metrics": {}, "geometry": {}}
     try:
         arr = load_rgb(source)
     except Exception as exc:  # unreadable / wrong type: a typed terminal, never a silent skip
         verdict["error"] = f"{type(exc).__name__}: {exc}"
         return verdict
-    letterbox = detect_letterbox(arr, cfg)
+    ref_arr = None
+    if reference is not None:
+        try:
+            ref_arr = load_rgb(reference)
+        except Exception as exc:  # a baseline that was GIVEN but cannot be read is not "no baseline"
+            verdict["error"] = f"BASELINE_UNREADABLE: {type(exc).__name__}: {exc}"
+            return verdict
+    policy = letterbox_policy or make_letterbox_policy(cfg)
+    letterbox = detect_letterbox(arr, cfg, policy)
     active = crop_active(arr, letterbox)
     verdict["geometry"] = {
         "width": int(arr.shape[1]), "height": int(arr.shape[0]),
@@ -245,26 +384,15 @@ def evaluate_frame(source, cfg, reference=None, frame_id=None):
     skin = skin_summary(active, cfg)
     metrics["skin_tone_region_pct"] = skin["regionPct"]
     metrics["skin_tone_mean_hue_deg"] = skin["meanHueDeg"]
-    skin_check = {"outcome": NOT_APPLICABLE, "threshold": frame_cfg["skin_hue_drift_deg_max"], "comparator": "<="}
-    if reference is None:
-        skin_check["reason"] = "NO_BASELINE_FRAME"
-    elif not skin["usable"]:
-        skin_check["reason"] = "NO_SKIN_TONE_REGION_IN_FRAME"
+    metrics["crushed_shadow_pct_full_frame"] = _contact_sheet().channel_stats(
+        Image.fromarray(arr, "RGB"))["crushed_black_pct"]
+    if ref_arr is None:
+        skin_check = {"outcome": NOT_APPLICABLE, "threshold": frame_cfg["skin_hue_drift_deg_max"],
+                      "comparator": "<=", "reason": "NO_BASELINE_FRAME"}
     else:
-        try:
-            ref_arr = load_rgb(reference)
-            ref_active = crop_active(ref_arr, detect_letterbox(ref_arr, cfg))
-            ref_skin = skin_summary(ref_active, cfg)
-        except Exception as exc:
-            ref_skin = None
-            skin_check["reason"] = f"BASELINE_UNREADABLE: {type(exc).__name__}"
-        if ref_skin is not None:
-            if not ref_skin["usable"]:
-                skin_check["reason"] = "NO_SKIN_TONE_REGION_IN_BASELINE"
-            else:
-                drift = hue_distance_deg(skin["meanHueDeg"], ref_skin["meanHueDeg"])
-                skin_check = _check(drift, frame_cfg["skin_hue_drift_deg_max"], "<=")
-                skin_check["baselineMeanHueDeg"] = ref_skin["meanHueDeg"]
+        ref_policy = {"mode": policy["mode"], "declared": None}  # a declaration describes the SUBJECT's capture
+        ref_active = crop_active(ref_arr, detect_letterbox(ref_arr, cfg, ref_policy))
+        skin_check, _ = skin_drift_check(active, ref_active, cfg)
     checks["skin_hue_drift"] = skin_check
 
     verdict["metrics"] = {k: (round(v, 6) if isinstance(v, float) else v) for k, v in metrics.items()}
@@ -294,12 +422,14 @@ def _config_block(meta, overrides):
             "overrides": overrides or {}}
 
 
-def evaluate_sheet(frames, cfg, meta, label="", references=None, overrides=None):
+def evaluate_sheet(frames, cfg, meta, label="", references=None, overrides=None, letterbox_policy=None):
     """Sheet verdict. `frames` = {index: path-or-array}; `references` = {index: baseline} for the skin drift."""
     references = references or {}
+    policy = letterbox_policy or make_letterbox_policy(cfg)
     frame_verdicts = []
     for index in sorted(frames):
-        v = evaluate_frame(frames[index], cfg, reference=references.get(index), frame_id=index)
+        v = evaluate_frame(frames[index], cfg, reference=references.get(index), frame_id=index,
+                           letterbox_policy=policy)
         if isinstance(frames[index], str) and os.path.isfile(frames[index]):
             v["imageSha256"] = look_config.sha256_file(frames[index])
         frame_verdicts.append(v)
@@ -313,10 +443,13 @@ def evaluate_sheet(frames, cfg, meta, label="", references=None, overrides=None)
         outcome = FAIL
     else:
         outcome = PASS
+    undeclared = [v["frameId"] for v in frame_verdicts
+                  if v.get("geometry", {}).get("letterbox", {}).get("notes")]
     return {
         "schema": SCHEMA_FRAME_SHEET, "kind": "floor-sheet", "subject": label, "outcome": outcome,
         "frameCount": len(frame_verdicts), "counts": counts,
         "skinCheck": {"appliedToFrames": skin_applicable, "ofFrames": len(frame_verdicts)},
+        "letterboxPolicy": policy, "framesWithDarkBandsMeasuredAsScene": undeclared,
         "config": _config_block(meta, overrides), "frames": frame_verdicts,
     }
 
@@ -384,8 +517,9 @@ def pair_metrics(a_rgb, b_rgb, mismatch_tol):
     }
 
 
-def compare_frames(a_src, b_src, cfg, scope, frame_id=None):
-    """Pair verdict for one frame index. a = reference backend, b = subject backend (named by the caller)."""
+def compare_frames(a_src, b_src, cfg, scope, frame_id=None, letterbox_policy_a=None, letterbox_policy_b=None):
+    """Pair verdict for one frame index. a = reference backend, b = subject backend (named by the caller).
+    Each side has its own letterbox policy (a declaration describes ONE capture); default OFF."""
     if scope not in cfg["pair"]["scopes"]:
         raise ValueError(f"unknown scope {scope!r}; known: {sorted(cfg['pair']['scopes'])}")
     scope_cfg = cfg["pair"]["scopes"][scope]
@@ -395,9 +529,11 @@ def compare_frames(a_src, b_src, cfg, scope, frame_id=None):
     except Exception as exc:
         out["error"] = f"{type(exc).__name__}: {exc}"
         return out
-    a = crop_active(a_full, detect_letterbox(a_full, cfg))
-    b = crop_active(b_full, detect_letterbox(b_full, cfg))
-    out["geometry"] = {"aActive": [int(a.shape[1]), int(a.shape[0])], "bActive": [int(b.shape[1]), int(b.shape[0])]}
+    lb_a = detect_letterbox(a_full, cfg, letterbox_policy_a)
+    lb_b = detect_letterbox(b_full, cfg, letterbox_policy_b)
+    a, b = crop_active(a_full, lb_a), crop_active(b_full, lb_b)
+    out["geometry"] = {"aActive": [int(a.shape[1]), int(a.shape[0])], "bActive": [int(b.shape[1]), int(b.shape[0])],
+                       "aLetterbox": lb_a, "bLetterbox": lb_b}
     tol = int(cfg["pair"]["geometry_tolerance_px"])
     dh, dw = abs(a.shape[0] - b.shape[0]), abs(a.shape[1] - b.shape[1])
     if dh > tol or dw > tol:
@@ -432,12 +568,14 @@ def compare_frames(a_src, b_src, cfg, scope, frame_id=None):
     return out
 
 
-def compare_sheets(a_frames, b_frames, cfg, meta, scope, a_label="a", b_label="b", overrides=None):
+def compare_sheets(a_frames, b_frames, cfg, meta, scope, a_label="a", b_label="b", overrides=None,
+                   letterbox_policy_a=None, letterbox_policy_b=None):
     """Pair two frame sets by index. Any unpaired index, or any frame that could not be compared, makes the
     sheet INCOMPLETE -- a missing side is never read as agreement (DESIGN.md P2)."""
     indices = sorted(set(a_frames) | set(b_frames))
     unpaired = [i for i in indices if i not in a_frames or i not in b_frames]
-    verdicts = [compare_frames(a_frames[i], b_frames[i], cfg, scope, frame_id=i)
+    verdicts = [compare_frames(a_frames[i], b_frames[i], cfg, scope, frame_id=i,
+                               letterbox_policy_a=letterbox_policy_a, letterbox_policy_b=letterbox_policy_b)
                 for i in indices if i not in unpaired]
     gated = bool(cfg["pair"]["scopes"][scope]["gated"])
     broken = [v for v in verdicts if v["outcome"] in (INCOMPLETE, GEOMETRY_MISMATCH)]
@@ -461,6 +599,8 @@ def compare_sheets(a_frames, b_frames, cfg, meta, scope, a_label="a", b_label="b
     return {
         "schema": SCHEMA_PAIR, "kind": "pair-sheet", "scope": scope, "gated": gated, "outcome": outcome,
         "reference": a_label, "subject": b_label, "unpairedIndices": unpaired,
+        "letterboxPolicy": {"a": letterbox_policy_a or make_letterbox_policy(cfg),
+                            "b": letterbox_policy_b or make_letterbox_policy(cfg)},
         "thresholdsMetOnAllFrames": all(v.get("thresholdsMet") for v in verdicts) if verdicts else False,
         "aggregate": agg, "config": _config_block(meta, overrides), "frames": verdicts,
     }
