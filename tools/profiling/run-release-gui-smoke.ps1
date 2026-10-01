@@ -1884,6 +1884,9 @@ else {
     [void]$envBlock.Remove("MLVAPP_GPU_PLAYBACK_RECON_BACKEND")
 }
 Add-EnvironmentPairs -Target $envBlock -Pairs $ExtraEnvironment
+# ENFORCE-4 r2 (sol BLOCKER): the per-run nonce the app echoes on its playback_smoke.summary (run_nonce=); the loop verdict below
+# judges only a summary that carries it. Set AFTER -ExtraEnvironment so a caller cannot choose the nonce it is judged against.
+$envBlock["MLVAPP_RUN_NONCE"] = $runNonce
 if (-not $PreserveExperimentalEnvironment) {
     foreach ($name in $experimentalEnvironmentToClear) {
         [void]$envBlock.Remove($name)
@@ -1898,6 +1901,13 @@ $preLaunchSystemCpuSettle = Wait-SystemCpuSettle `
 # -SubjectNotYetStarted also makes Get-HostLoadSnapshot take its system-times counters AFTER its evidence
 # collection, i.e. immediately before Process.Start below, so the first interval starts at leg start.
 $hostLoadBefore = Get-HostLoadSnapshot -TopProcessCount $HostLoadTopProcessCount -SubjectNotYetStarted
+# ENFORCE-4 r2: any result an EARLIER run left at -Output is set aside (STALE-<utc>-<name>, never destroyed) before the launch, so a
+# run that dies before it writes its own result cannot leave a previous run's passing one for a reader to trust.
+$asideResult = Move-GuiSmokeStaleReceiptAside -Path $outputPath
+if (-not $asideResult.ok) {
+    [Console]::Error.WriteLine("PLAYBACK-CLIP-LENGTH-ENFORCE-4: $($asideResult.message)")
+    exit 43
+}
 $startUtc = [datetime]::UtcNow
 $process = [System.Diagnostics.Process]::Start($startInfo)
 $screenshotCapture = $null
@@ -2474,7 +2484,7 @@ $loopFpsOverride = Get-ObjectPropertyValue $playbackSummary "fps_override"
 $invalidLooped = $false
 $invalidSourceFrames = $false
 $gateFrames = Get-ObjectPropertyValue $clipLengthGate "frames"
-$loopVerdict = Get-GuiSmokeLoopVerdict -Summary $playbackSummary -WindowSeconds $Seconds -LaunchOnlyProbe ([bool]$LaunchOnlyProbe) -ClipFrames $(if ($null -ne $gateFrames) { [int64]$gateFrames } else { [int64]0 })
+$loopVerdict = Get-GuiSmokeLoopVerdict -Summary $playbackSummary -WindowSeconds $Seconds -ExpectedRunNonce $runNonce -LaunchOnlyProbe ([bool]$LaunchOnlyProbe) -ClipFrames $(if ($null -ne $gateFrames) { [int64]$gateFrames } else { [int64]0 })
 # PLAYBACK-CLIP-LENGTH-ENFORCE-4: a summary without wrapped / wrap_count (a build that predates the wrap fields) is no
 # longer a WARNING that falls back to the header-based checks: the loop verdict above fails it (RECEIPT_FIELD_ABSENT,
 # INVALID_LOOPED, exit 43). "The app was silent" is never "the app did not wrap".
@@ -3015,6 +3025,12 @@ if ($RequireFreshScreenshotRender) {
         -NotePropertyValue $screenshotProvenance
 }
 
+if ($loopVerdict.invalid -and -not $LaunchOnlyProbe) {
+    # fable H2: the result file itself says it is INVALID evidence (the exit code is 43), so an offline reader of -Output
+    # cannot mistake the run for a pass.
+    $result | Add-Member -NotePropertyName invalid -NotePropertyValue $true -Force
+    $result | Add-Member -NotePropertyName invalid_reasons -NotePropertyValue @($loopVerdict.failures) -Force
+}
 $result | ConvertTo-Json -Depth 20 | Set-Content -LiteralPath $outputPath -Encoding UTF8
 $result | ConvertTo-Json -Depth 8
 $scriptExitCode = 0

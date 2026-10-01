@@ -138,6 +138,14 @@ try {
         }
         $clipLengthGate = 'OK'
     }
+    # ENFORCE-4 r2 (fable H1): the Look Assist settle / toggle options only Play in Auto quality mode. In any other mode the
+    # run could only end in exit 43 (programmatic_play_admitted=0) AFTER the whole run, so it is refused up front, typed
+    # (after the length gate: a clip that is too short is refused first, exactly as before).
+    $modeGate = Test-GuiSmokeProfileModeAdmitsPlay -Arguments $AdditionalArgs -QualityMode $QualityMode -ExtraEnvironment $ExtraEnvironment
+    if ($modeGate.verdict -ne 'OK') {
+        [Console]::Error.WriteLine("PLAYBACK-CLIP-LENGTH-ENFORCE-4: $($modeGate.message)")
+        exit 44
+    }
 
     if ($DryRun) {
         [pscustomobject]@{
@@ -169,6 +177,19 @@ try {
     $outputDir = Split-Path -Parent $outputPath
     if (-not [string]::IsNullOrWhiteSpace($outputDir)) {
         New-Item -ItemType Directory -Force -Path $outputDir | Out-Null
+    }
+    # ENFORCE-4 r2 (sol BLOCKER): "a receipt counts only if THIS invocation of the app wrote it, for THIS run". A play-capable
+    # profile (1) sets any pre-existing -Output aside BEFORE launching (renamed STALE-<utc>-<name>, never destroyed), (2) hands
+    # the app a per-run nonce that it echoes on the receipt, and (3) judges only a receipt that carries it and was written
+    # after the launch. Without this, `--exercise-play-action --help` (exit 0 before any write) was judged on the PREVIOUS run's
+    # valid receipt and reported success having played nothing.
+    $runNonce = New-GuiSmokeRunNonce
+    if ($passThroughGate.playCapable) {
+        $asideResult = Move-GuiSmokeStaleReceiptAside -Path $outputPath
+        if (-not $asideResult.ok) {
+            [Console]::Error.WriteLine("PLAYBACK-CLIP-LENGTH-ENFORCE-4: $($asideResult.message)")
+            exit 43
+        }
     }
 
     $arguments = @(
@@ -234,7 +255,10 @@ try {
         [void]$envBlock.Remove("MLVAPP_GPU_PLAYBACK_RECON_BACKEND")
     }
     Add-EnvironmentPairs -Target $envBlock -Pairs $ExtraEnvironment
+    # set AFTER -ExtraEnvironment: a caller cannot choose the nonce the receipt is judged against
+    $envBlock["MLVAPP_RUN_NONCE"] = $runNonce
 
+    $launchedUtc = [DateTime]::UtcNow
     $process = [System.Diagnostics.Process]::Start($startInfo)
     if (-not $passThroughGate.playCapable) {
         # A pure decode benchmark presents no playback: nothing to prove about footage.
@@ -259,8 +283,11 @@ try {
     # programmatic_play_admitted (a master-era binary writes none) is INVALID, never "nothing was played".
     $profileVerdict = Get-GuiSmokeEvidencePlayVerdict -Summary $profileSummary `
         -ExitCode $(if ($profileKilled) { $null } else { $process.ExitCode }) -KilledByLauncher $profileKilled -WindowSeconds 20 `
-        -RequireAdmission $true
+        -RequireAdmission $true -ExpectedRunNonce $runNonce -ReceiptPath $outputPath -LaunchedUtc $launchedUtc
     if ($profileVerdict.invalid) {
+        # fable H2: the rejected receipt is renamed <name>.INVALID<ext> (and stamped "invalid": true), so an offline reader
+        # of -Output cannot mistake it for evidence.
+        [void](Set-GuiSmokeReceiptInvalid -Path $outputPath -Failures $profileVerdict.failures)
         foreach ($failure in $profileVerdict.failures) { [Console]::Error.WriteLine("PLAYBACK-CLIP-LENGTH-ENFORCE-3: $failure") }
         [Console]::Error.WriteLine("PLAYBACK-CLIP-LENGTH-ENFORCE-3: INVALID -- this profile is not playback evidence (exit 43).")
         exit $profileVerdict.exitCode

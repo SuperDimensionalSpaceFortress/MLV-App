@@ -49,6 +49,7 @@ from tools.repo_hygiene.test_playback_clip_length_gate import (
     PROFILING,
     PWSH,
     ROOT,
+    RUN_NONCE,
     RUNNER,
     _pwsh,
     _q,
@@ -182,7 +183,7 @@ class AbsentFieldIsInvalidInTheAttributionJobCopyTests(unittest.TestCase):
     def _module_verdict(self, line: str) -> dict:
         proc = _pwsh(
             f"Import-Module {_q(MODULE)} -Force -DisableNameChecking; "
-            f"$v = Get-AttrCudaSourceFramesVerdict -SummaryLine {_q(line)}; "
+            f"$v = Get-AttrCudaSourceFramesVerdict -SummaryLine {_q(line)} -ExpectedRunNonce {_q(RUN_NONCE)}; "
             "[pscustomobject]@{ invalid = [bool]$v.invalid; failures = @($v.failures) } | ConvertTo-Json -Compress")
         self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
         return json.loads(proc.stdout)
@@ -233,7 +234,9 @@ class AbsentFieldIsInvalidOnTheProfileReceiptTests(oracle_tests._LauncherCase):
                       "play_action_smoke_elapsed_ms": 5000.0, "measured_frames": 3, "total_frames": 984}
         for option in ("--exercise-play-action", "--exercise-look-assist-settle", "--exercise-look-assist-toggle"):
             with self.subTest(option=option):
-                proc = self.run_wrapper(dict(master_era), option=option)
+                # settle / toggle only Play in Auto quality mode (r2 fable H1: any other mode is refused before launch)
+                proc = self.run_wrapper(dict(master_era), option=option,
+                                        quality_mode=None if option == "--exercise-play-action" else "auto")
                 self.assertEqual(proc.returncode, EXIT_INVALID, proc.stdout + proc.stderr)
 
     def test_no_admitted_play_on_a_play_capable_profile_is_invalid_not_not_played(self) -> None:
@@ -270,6 +273,7 @@ class RunnerAbsentWrapFieldsAreAFailureTests(unittest.TestCase):
             "function Get-ObjectPropertyValue { param($Object, $Name) "
             "if ($null -ne $Object -and $Object.PSObject.Properties[$Name]) { $Object.$Name } else { $null } }\n"
             f"$playbackSummary = Convert-PlaybackLogLineToObject {_q(line)}\n"
+            f"$runNonce = {_q(RUN_NONCE)}; "
             "$Seconds = 24; $LaunchOnlyProbe = $false; $validationFailures = @(); $validationWarnings = @(); "
             "$clipLengthGate = [pscustomobject]@{ frames = 984 }\n"
             f"{block}\n"
@@ -855,14 +859,17 @@ class AppVerdictLatchPinTests(unittest.TestCase):
         self.assertRegex(main, r"return\s+guiExitCode\s*!=\s*0\s*\?\s*guiExitCode\s*:\s*w\.automationVerdictExitCode\(\)\s*;")
         latch = HEADER.read_text(encoding="utf-8")
         self.assertIn("class AutomationVerdictLatch", latch)
-        self.assertRegex(latch, r"void\s+armPending\(\)\s*\{\s*m_exitCode\s*=\s*kFailExitCode;\s*\}")
+        self.assertRegex(latch, r"void\s+armPending\(\)\s*\{\s*m_armed\s*=\s*true;\s*m_exitCode\s*=\s*kFailExitCode;\s*\}")
         self.assertRegex(latch, r"void\s+resolve\(\s*PlayStopState state\s*\)\s*\{\s*m_exitCode\s*=\s*state\s*==\s*PlayStopState::Reached\s*\?\s*0\s*:\s*kFailExitCode;\s*\}")
 
     def test_the_header_tests_cover_the_latch(self) -> None:
         tests = (ROOT / "tests" / "console" / "test_playback_frame_range.cpp").read_text(encoding="utf-8")
         for name in ("AnUnarmedLatchIsExitZeroBecauseNoAutomationPlayWasRequested", "ARequestedPlayThatIsNeverResolvedExitsFailingNotZero",
-                     "OnlyReachedClearsTheLatch", "ARefusalAndALateRearmBothFailClosed", "ARefusalAloneFailsAnUnarmedLatch"):
+                     "OnlyReachedClearsTheLatch", "ARefusalAndALateRearmBothFailClosed", "ARefusalAloneFailsAnUnarmedLatch",
+                     "ArmedIsStickyAndSurvivesAReachedVerdict", "ARefusalAloneArmsTheLatch"):
             self.assertIn(f"AutomationVerdictLatch, {name}", tests)
+        for name in ("AValidNonceIsEchoedVerbatim", "UnsetOrMalformedIsTheNoNonceToken"):
+            self.assertIn(f"RunNonce, {name}", tests)
 
 
 if __name__ == "__main__":

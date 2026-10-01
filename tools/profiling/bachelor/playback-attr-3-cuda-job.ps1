@@ -2432,7 +2432,7 @@ foreach ($candidateLine in ($rawLog -split "`r?`n")) {
         $sourceFramesSummaryLine = $candidateLine
     }
 }
-$sourceFramesVerdict = Get-AttrCudaSourceFramesVerdict -SummaryLine $sourceFramesSummaryLine
+$sourceFramesVerdict = Get-AttrCudaSourceFramesVerdict -SummaryLine $sourceFramesSummaryLine -ExpectedRunNonce $runLog.runNonce
 $sourceFramesWrapped = [bool]$sourceFramesVerdict.wrapped
 $sourceFramesBlock = [ordered]@{
     oracle = 'source_advanced >= required_source_frames, wrapped=0, native pace, no fps override'

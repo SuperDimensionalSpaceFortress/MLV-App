@@ -9,6 +9,7 @@
 #include <algorithm>
 #include <cmath>
 #include <cstdint>
+#include <string>
 
 namespace playback_frame_range {
 
@@ -507,12 +508,38 @@ public:
     static constexpr int kFailExitCode = 14;
     int exitCode() const { return m_exitCode; }
     bool pending() const { return m_exitCode != 0; }
-    void armPending() { m_exitCode = kFailExitCode; }
-    void fail() { m_exitCode = kFailExitCode; }
+    // ENFORCE-4 r2 (fable H3): STICKY. True from the moment an automation Play was requested and for the rest of the
+    // process, even after the verdict resolved Reached. Automation runs never block on a prompt: closeEvent skips the
+    // "save the session?" dialog while this is true (that dialog is what kept the autoplay hook from exiting offscreen).
+    bool armed() const { return m_armed; }
+    void armPending() { m_armed = true; m_exitCode = kFailExitCode; }
+    void fail() { m_armed = true; m_exitCode = kFailExitCode; }
     void resolve( PlayStopState state ) { m_exitCode = state == PlayStopState::Reached ? 0 : kFailExitCode; }
 private:
     int m_exitCode = 0;
+    bool m_armed = false;
 };
+
+// ENFORCE-4 r2 (sol BLOCKER, "a receipt counts only if THIS invocation of the app wrote it, for THIS run"): a launcher
+// hands the app a per-run nonce (MLVAPP_RUN_NONCE) and the app echoes it on every receipt it writes (the profile JSON's
+// metadata.run_nonce, the playback_smoke.summary run_nonce=). The launcher accepts the receipt only when the echoed
+// nonce is the one it generated, so a receipt left by an earlier run, or by an app that exited 0 without playing
+// (--help), can never be judged. An unset or malformed nonce is written as noRunNonce(), which no launcher generates.
+inline const char *noRunNonce() { return "none"; }
+
+inline std::string sanitizeRunNonce( const char *raw )
+{
+    if( raw == nullptr ) return noRunNonce();
+    const std::string value( raw );
+    // the nonce is printed on a whitespace-delimited log line and into JSON: letters and digits only, 8..64 of them
+    if( value.size() < 8 || value.size() > 64 ) return noRunNonce();
+    for( char c : value )
+    {
+        const bool alnum = ( c >= '0' && c <= '9' ) || ( c >= 'a' && c <= 'z' ) || ( c >= 'A' && c <= 'Z' );
+        if( !alnum ) return noRunNonce();
+    }
+    return value;
+}
 
 } // namespace playback_frame_range
 

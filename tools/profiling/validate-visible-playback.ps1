@@ -68,6 +68,29 @@ if ($clipLengthGate.verdict -ne 'OK') {
     exit (Get-GuiSmokeGateExitCode -Verdict $clipLengthGate.verdict)
 }
 
+# ENFORCE-4 r2 (sol BLOCKER): "a receipt counts only if THIS invocation of the app wrote it, for THIS run". Frames and the
+# INVALID marker an earlier run left in -OutDir are set aside BEFORE the launch (renamed STALE-<utc>-<name>, never destroyed:
+# they would otherwise be counted as this run's filmstrip), and the app is handed a per-run nonce that it echoes on its
+# playback_smoke.summary; only a summary carrying it is judged.
+function Set-VisibleRunInvalid {
+    # fable H2: the frames of an INVALID run are renamed (cap-NNN.INVALID.png) and the directory is marked (INVALID.json), so an
+    # offline reader of -OutDir cannot mistake the filmstrip for evidence.
+    param([string[]]$Failures)
+    foreach ($capture in @(Get-ChildItem -LiteralPath $OutDir -File -ErrorAction SilentlyContinue | Where-Object { $_.Name -match '^cap-\d{3}\.png$' })) {
+        [void](Set-GuiSmokeReceiptInvalid -Path $capture.FullName -Failures $Failures)
+    }
+    Write-GuiSmokeInvalidMarker -Directory $OutDir -Failures $Failures
+}
+$runNonce = New-GuiSmokeRunNonce
+foreach ($staleFile in @(Get-ChildItem -LiteralPath $OutDir -File -ErrorAction SilentlyContinue |
+                         Where-Object { $_.Name -match '^cap-\d{3}\.png$' -or $_.Name -ceq 'INVALID.json' })) {
+    $asideResult = Move-GuiSmokeStaleReceiptAside -Path $staleFile.FullName
+    if (-not $asideResult.ok) {
+        [Console]::Error.WriteLine("PLAYBACK-CLIP-LENGTH-ENFORCE-4: $($asideResult.message)")
+        exit 43
+    }
+}
+
 $settleCpuMaxMs = 45000   # the app's CPU-settle cap; the process budget below adds it
 $argList = @(
     "--gui-smoke-playback",
@@ -95,6 +118,7 @@ $psi.EnvironmentVariables["PATH"] = $QtBinPrepend + ";" + $psi.EnvironmentVariab
 $psi.EnvironmentVariables["MLVAPP_PLAYBACK_SCALE_FACTOR"] = $ScaleFactor
 $psi.EnvironmentVariables["MLVAPP_PLAYBACK_QUALITY_MODE"] = "auto"
 $psi.EnvironmentVariables["MLVAPP_CRASH_FORENSICS_LOG_DIR"] = $logRoot
+$psi.EnvironmentVariables["MLVAPP_RUN_NONCE"] = $runNonce
 
 Write-Host "[live-filmstrip] launching: $exe (scale=$ScaleFactor, seconds=$Seconds, lookAssist=$([bool](-not $NoLookAssist)))"
 $proc = [System.Diagnostics.Process]::new()
@@ -154,7 +178,7 @@ $playbackSummary = Read-GuiSmokePlaybackSummaryFromLogDir -LogDir $logRoot -Sinc
 $appExitCode = if ($killedByLauncher) { $null } else { $proc.ExitCode }
 $clipFrames = if ($null -ne $clipLengthGate.frames) { [int64]$clipLengthGate.frames } else { [int64]0 }
 $playbackVerdict = Get-GuiSmokeEvidencePlayVerdict -Summary $playbackSummary -ExitCode $appExitCode `
-    -KilledByLauncher $killedByLauncher -WindowSeconds $Seconds -ClipFrames $clipFrames -AppMessage $appStderr
+    -KilledByLauncher $killedByLauncher -WindowSeconds $Seconds -ClipFrames $clipFrames -AppMessage $appStderr -ExpectedRunNonce $runNonce
 
 # Quantify the cast per frame (R/G/B mean + warmCool + greenAxis).
 Write-Host "[live-filmstrip] balance trace:"
@@ -173,6 +197,7 @@ try { & $balanceScript -Dirs $OutDir } catch { Write-Warning "[live-filmstrip] b
 } | Format-List
 
 if ($playbackVerdict.invalid) {
+    Set-VisibleRunInvalid -Failures $playbackVerdict.failures
     foreach ($failure in $playbackVerdict.failures) { [Console]::Error.WriteLine("PLAYBACK-CLIP-LENGTH-ENFORCE-3: $failure") }
     [Console]::Error.WriteLine("PLAYBACK-CLIP-LENGTH-ENFORCE-3: INVALID -- the filmstrip above is not playback evidence (exit 43).")
     exit $playbackVerdict.exitCode

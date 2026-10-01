@@ -87,6 +87,16 @@ static QString bool01( bool value )
     return value ? QStringLiteral("1") : QStringLiteral("0");
 }
 
+// PLAYBACK-CLIP-LENGTH-ENFORCE-4 r2 (sol BLOCKER): the per-run nonce the launcher handed this process
+// (MLVAPP_RUN_NONCE), echoed on every receipt the app writes (playback_smoke.summary run_nonce=, the profile JSON's
+// metadata.run_nonce). A launcher accepts a receipt only when this is the nonce IT generated for THIS run, so a
+// receipt left by an earlier run, or by an app that exited 0 without playing, is never judged. Unset or malformed is
+// written as the no-nonce token, which no launcher generates.
+static QString automationRunNonce()
+{
+    return QString::fromStdString( playback_frame_range::sanitizeRunNonce( qgetenv( "MLVAPP_RUN_NONCE" ).constData() ) );
+}
+
 // UM-DISPLAY-QT-WINDOWS-MAPPING-PROOF-1: the Windows GDI device (\\.\DISPLAYn) of a QScreen, or an
 // empty string when it cannot be established uniquely (never a guess). Measured on UM: QScreen::name()
 // is the EDID friendly name ("PA329C"), NOT the GDI name, so the device is derived from the screen's
@@ -2842,7 +2852,8 @@ MainWindow::MainWindow(int &argc, char **argv, QWidget *parent) :
                                 .arg( QString::fromLatin1( m_programmaticPlayLedger.lastRefusalReason ) )
                                 .arg( autoplaySeconds ) );
                         m_automationVerdict.fail();
-                        if( autoplayExit ) QTimer::singleShot( 400, this, [](){ qApp->quit(); } );
+                        if( autoplayExit )
+                            QTimer::singleShot( 400, this, [](){ qApp->exit( playback_frame_range::AutomationVerdictLatch::kFailExitCode ); } );
                         return;
                     }
                     logInteractionEvent( QStringLiteral("autoplay.play"),
@@ -3596,8 +3607,11 @@ void MainWindow::closeEvent(QCloseEvent *event)
     ui->actionPlay->setChecked( false );
     on_actionPlay_triggered( false );
 
+    // ENFORCE-4 r2 (fable H3): an automation run (the MLVAPP_AUTOPLAY_SECONDS hook; the latch is sticky) NEVER blocks on a
+    // prompt. In Qt 6 qApp->quit() sends this close event, so this dialog kept an unattended autoplay run from exiting
+    // at all (it was killed at the launcher's bound, its latched exit code never observed).
     //If user wants to be asked
-    if( ui->actionAskForSavingOnQuit->isChecked() && SESSION_CLIP_COUNT != 0 )
+    if( !m_automationVerdict.armed() && ui->actionAskForSavingOnQuit->isChecked() && SESSION_CLIP_COUNT != 0 )
     {
         //Ask before quit
         QMessageBox::StandardButton ret = QMessageBox::warning( this, APPNAME, tr( "Do you want to save the current session?" ),
@@ -8453,6 +8467,8 @@ int MainWindow::runHeadlessPlaybackProfile(const PlaybackProfileOptions & option
     metadata.insert( QStringLiteral("programmatic_play_admitted"), m_programmaticPlayLedger.admitted );
     metadata.insert( QStringLiteral("programmatic_play_refused"), m_programmaticPlayLedger.refused );
     metadata.insert( QStringLiteral("play_wrap_count"), m_playbackWrapRecorder.replayCount() );
+    // ENFORCE-4 r2: binds this receipt to the invocation that wrote it (see automationRunNonce()).
+    metadata.insert( QStringLiteral("run_nonce"), automationRunNonce() );
     // PLAYBACK-CLIP-LENGTH-ENFORCE-3: the profile receipt carries the same source-frame oracle as the smoke summary.
     metadata.insert( QStringLiteral("source_advanced"), static_cast<qint64>( m_sourceAdvance.consumed() ) );
     metadata.insert( QStringLiteral("required_source_frames"), static_cast<qint64>( m_playRequiredSourceFrames ) );
@@ -26871,7 +26887,8 @@ void MainWindow::finishPlaybackSmokeTelemetry( const char *reason )
                "gpu_texture_route_scale_clamp_requested_scale=%66 "
                "screensaver_blocked_count=%67 "
                "wrapped=%68 total_frames=%69 clip_seconds=%70 wrap_count=%71 jump_to_first_count=%72 restart_count=%73 "
-               "source_advanced=%74 required_source_frames=%75 native_fps=%76 pace_fps=%77 fps_override=%78 source_start_frame=%79" )
+               "source_advanced=%74 required_source_frames=%75 native_fps=%76 pace_fps=%77 fps_override=%78 source_start_frame=%79 "
+               "run_nonce=%80" )
                .arg( static_cast<qulonglong>( m_playbackSmokeSessionId ) )
                .arg( QString::fromLatin1( reason ? reason : "unknown" ) )
                .arg( elapsedMs, 0, 'f', 3 )
@@ -26970,7 +26987,9 @@ void MainWindow::finishPlaybackSmokeTelemetry( const char *reason )
                .arg( smokeClipFps, 0, 'f', 3 )
                .arg( m_playPaceFps, 0, 'f', 3 )
                .arg( bool01( m_fpsOverride && !m_automationPacingIsolated ) )
-               .arg( static_cast<qlonglong>( m_sourceAdvance.startFrame ) );
+               .arg( static_cast<qlonglong>( m_sourceAdvance.startFrame ) )
+               // ENFORCE-4 r2: binds this receipt to the invocation that wrote it (see automationRunNonce()).
+               .arg( automationRunNonce() );
 
     qInfo().noquote()
         << QStringLiteral(

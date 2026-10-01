@@ -1042,3 +1042,47 @@ TEST( AutomationVerdictLatch, ARefusalAloneFailsAnUnarmedLatch )
     ASSERT_EQ( 14, latch.exitCode() );
     ASSERT_TRUE( latch.pending() );
 }
+
+TEST( AutomationVerdictLatch, ArmedIsStickyAndSurvivesAReachedVerdict )
+{
+    // r2 (fable H3): closeEvent skips the save-session prompt for an automation run, so "armed" must outlive the
+    // verdict: a Reached latch is no longer pending, but the process was still an automation run.
+    AutomationVerdictLatch latch;
+    ASSERT_FALSE( latch.armed() );
+    latch.armPending();
+    ASSERT_TRUE( latch.armed() );
+    latch.resolve( PlayStopState::Reached );
+    ASSERT_FALSE( latch.pending() );
+    ASSERT_TRUE( latch.armed() );
+}
+
+TEST( AutomationVerdictLatch, ARefusalAloneArmsTheLatch )
+{
+    AutomationVerdictLatch latch;
+    latch.fail();
+    ASSERT_TRUE( latch.armed() );
+    ASSERT_TRUE( latch.pending() );
+}
+
+TEST( RunNonce, AValidNonceIsEchoedVerbatim )
+{
+    ASSERT_EQ( std::string( "n0123456789abcdef0123456789abcdef" ),
+               playback_frame_range::sanitizeRunNonce( "n0123456789abcdef0123456789abcdef" ) );
+    ASSERT_EQ( std::string( "ABCdef12" ), playback_frame_range::sanitizeRunNonce( "ABCdef12" ) );                 // the 8-char floor
+}
+
+TEST( RunNonce, UnsetOrMalformedIsTheNoNonceToken )
+{
+    // A launcher never generates "none", so a receipt from an app that was not handed (or mangled) the nonce can never
+    // match one.
+    const std::string none = playback_frame_range::noRunNonce();
+    ASSERT_EQ( std::string( "none" ), none );
+    ASSERT_EQ( none, playback_frame_range::sanitizeRunNonce( nullptr ) );
+    ASSERT_EQ( none, playback_frame_range::sanitizeRunNonce( "" ) );
+    ASSERT_EQ( none, playback_frame_range::sanitizeRunNonce( "short" ) );                                         // < 8
+    ASSERT_EQ( none, playback_frame_range::sanitizeRunNonce( std::string( 65, 'a' ).c_str() ) );                  // > 64
+    ASSERT_EQ( none, playback_frame_range::sanitizeRunNonce( "has space in it" ) );                               // would split the log line
+    ASSERT_EQ( none, playback_frame_range::sanitizeRunNonce( "quote\"injection12" ) );                            // would break the JSON
+    ASSERT_EQ( none, playback_frame_range::sanitizeRunNonce( "key=value12345678" ) );                             // would forge a log field
+    ASSERT_EQ( std::string( 64, 'a' ), playback_frame_range::sanitizeRunNonce( std::string( 64, 'a' ).c_str() ) ); // the 64-char ceiling
+}

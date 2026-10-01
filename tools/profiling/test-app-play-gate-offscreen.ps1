@@ -47,7 +47,7 @@ New-Item -ItemType Directory -Force -Path $work | Out-Null
 
 function Invoke-GateEntry {
     param([string]$Name, [string[]]$Arguments, [hashtable]$Environment = @{},
-          [Nullable[int]]$ExpectExit, [string]$ExpectToken, [switch]$MayNotExit, [string]$OutputPath = '',
+          [Nullable[int]]$ExpectExit, [string]$ExpectToken, [string]$OutputPath = '',
           [string[]]$ExtraTokens = @(), [string[]]$ForbiddenTokens = @())
     $logDir = Join-Path $work $Name
     New-Item -ItemType Directory -Force -Path $logDir | Out-Null
@@ -62,8 +62,10 @@ function Invoke-GateEntry {
         $stderrPath = Join-Path $logDir 'stderr.txt'
         $proc = Start-Process -FilePath $Exe -ArgumentList $Arguments -NoNewWindow -PassThru `
             -RedirectStandardOutput (Join-Path $logDir 'stdout.txt') -RedirectStandardError $stderrPath
-        # The autoplay hook's own refusal path does not always quit the app, so that entry is bounded short.
-        $exited = $proc.WaitForExit($(if ($MayNotExit) { 25 } else { $TimeoutSeconds }) * 1000)
+        # ENFORCE-4 r2 (fable H3): EVERY entry must exit by itself inside the bound, and its exit code is asserted. The autoplay hook
+        # used to be killed at a short bound (exit -1, code never observed) because qApp->quit() sent a close event and
+        # closeEvent blocked on the save-session prompt; an automation run now never prompts and exits with the latched code.
+        $exited = $proc.WaitForExit($TimeoutSeconds * 1000)
         if (-not $exited) { try { $proc.Kill() } catch { } }
     } finally {
         foreach ($key in $envNames) { [Environment]::SetEnvironmentVariable($key, $saved[$key]) }
@@ -78,11 +80,11 @@ function Invoke-GateEntry {
     $tokenSeen = ($stderr -match [regex]::Escape($ExpectToken)) -or ($logText -match [regex]::Escape($ExpectToken))
     foreach ($extra in $ExtraTokens) { if (-not (($stderr -match [regex]::Escape($extra)) -or ($logText -match [regex]::Escape($extra)))) { $tokenSeen = $false } }
     foreach ($forbidden in $ForbiddenTokens) { if (($stderr -match [regex]::Escape($forbidden)) -or ($logText -match [regex]::Escape($forbidden))) { $tokenSeen = $false } }
-    $exitOk = if ($MayNotExit) { $true } else { ($exitCode -eq [int]$ExpectExit) }
+    $exitOk = ($exitCode -eq [int]$ExpectExit)
     $jsonWritten = ($OutputPath -ne '') -and (Test-Path -LiteralPath $OutputPath)
     $ok = $exitOk -and $tokenSeen -and (-not $playStarted) -and (-not $jsonWritten)
     [pscustomobject]@{
-        entry = $Name; exit = $exitCode; expectedExit = $(if ($MayNotExit) { 'n/a' } else { $ExpectExit })
+        entry = $Name; exit = $exitCode; expectedExit = $ExpectExit
         typedReason = $ExpectToken; reasonSeen = $tokenSeen; playToggledOn = $playStarted; outputWritten = $jsonWritten
         refusedBeforePlay = $ok
     }
@@ -101,7 +103,9 @@ $results += Invoke-GateEntry -Name 'gui-smoke-presented-frames-pin' -ExpectExit 
 $loopSwitch = '--' + 'lo' + 'op'
 $results += Invoke-GateEntry -Name 'gui-smoke-loop-argument' -ExpectExit 2 -ExpectToken 'is refused: no venue playback may' `
     -Arguments @('--gui-smoke-playback', '--input', $fixture, '--seconds', '25', $loopSwitch)
-$results += Invoke-GateEntry -Name 'autoplay-env-hook' -MayNotExit -ExpectToken 'play_gate.refused site=autoplay' `
+# The autoplay hook's latched verdict is the process exit code: a refused (or short, or timed-out, or closed) autoplay exits 14,
+# and only a Play that consumed its window (Reached, which needs a >= 20 s clip these tracked fixtures cannot be) exits 0.
+$results += Invoke-GateEntry -Name 'autoplay-env-hook' -ExpectExit 14 -ExpectToken 'play_gate.refused site=autoplay' `
     -Arguments @($fixture) `
     -Environment @{ MLVAPP_AUTOPLAY_SECONDS = '2'; MLVAPP_AUTOPLAY_LOOP = '1'; MLVAPP_AUTOPLAY_SETTLE_MS = '500'; MLVAPP_AUTOPLAY_EXIT = '1' }
 
@@ -125,7 +129,7 @@ $results += Invoke-GateEntry -Name 'profile-autoplay-env-refused' -ExpectExit 14
 $results += Invoke-GateEntry -Name 'gui-smoke-f3-repair-disabled' -ExpectExit 14 -ExpectToken 'CLIP_TOO_SHORT' `
     -Arguments @('--gui-smoke-playback', '--input', $fixture, '--seconds', '25') `
     -Environment @{ MLVAPP_F3_DISABLE_CUT_RANGE_REPAIR = '1' }
-$results += Invoke-GateEntry -Name 'autoplay-env-hook-24s-on-a-short-clip' -MayNotExit -ExpectToken 'play_gate.refused site=autoplay' `
+$results += Invoke-GateEntry -Name 'autoplay-env-hook-24s-on-a-short-clip' -ExpectExit 14 -ExpectToken 'play_gate.refused site=autoplay' `
     -Arguments @($fixture) `
     -Environment @{ MLVAPP_AUTOPLAY_SECONDS = '24'; MLVAPP_AUTOPLAY_SETTLE_MS = '500'; MLVAPP_AUTOPLAY_EXIT = '1' }
 
@@ -164,6 +168,50 @@ if ($PersistedOverrideProbe) {
     } else {
         Write-Output 'real HKCU settings untouched by the probe (before == after)'
     }
+}
+
+# ---- ENFORCE-4 r2 (sol BLOCKER): the app echoes the launcher's per-run nonce on the receipt it writes ------------------------------
+# A decode-only profile plays nothing, so it may run on the tracked short fixture. The nonce the launcher hands the app
+# (MLVAPP_RUN_NONCE) must come back on the receipt (metadata.run_nonce); no nonce, or a malformed one, comes back as `none`,
+# which no launcher generates -- so a receipt an earlier run (or an app that was never handed the nonce) wrote cannot be judged.
+function Invoke-NonceEntry {
+    param([string]$Name, [string]$Nonce, [string]$Expect)
+    $logDir = Join-Path $work $Name
+    New-Item -ItemType Directory -Force -Path $logDir | Out-Null
+    $receipt = Join-Path $logDir 'profile-decode.json'
+    $envNames = @('QT_QPA_PLATFORM', 'MLVAPP_CRASH_FORENSICS_LOG_DIR', 'MLVAPP_RUN_NONCE')
+    $saved = @{}
+    foreach ($key in $envNames) { $saved[$key] = [Environment]::GetEnvironmentVariable($key) }
+    try {
+        [Environment]::SetEnvironmentVariable('QT_QPA_PLATFORM', 'offscreen')
+        [Environment]::SetEnvironmentVariable('MLVAPP_CRASH_FORENSICS_LOG_DIR', $logDir)
+        [Environment]::SetEnvironmentVariable('MLVAPP_RUN_NONCE', $(if ($Nonce) { $Nonce } else { $null }))
+        $proc = Start-Process -FilePath $Exe -NoNewWindow -PassThru `
+            -ArgumentList @('--profile-playback', '--input', $fixture, '--output', $receipt, '--frames', '2') `
+            -RedirectStandardOutput (Join-Path $logDir 'stdout.txt') -RedirectStandardError (Join-Path $logDir 'stderr.txt')
+        $exited = $proc.WaitForExit($TimeoutSeconds * 1000)
+        if (-not $exited) { try { $proc.Kill() } catch { } }
+    } finally {
+        foreach ($key in $envNames) { [Environment]::SetEnvironmentVariable($key, $saved[$key]) }
+    }
+    $written = $null
+    if (Test-Path -LiteralPath $receipt) {
+        try { $written = [string]((Get-Content -LiteralPath $receipt -Raw | ConvertFrom-Json).metadata.run_nonce) } catch { $written = $null }
+    }
+    [pscustomobject]@{ entry = $Name; exit = $(if ($exited) { $proc.ExitCode } else { -1 }); expectedExit = 0
+                       typedReason = "run_nonce=$Expect"; reasonSeen = ($written -ceq $Expect); playToggledOn = $false
+                       outputWritten = ($null -ne $written); refusedBeforePlay = ($exited -and $proc.ExitCode -eq 0 -and $written -ceq $Expect) }
+}
+$nonceResults = @()
+$nonceResults += Invoke-NonceEntry -Name 'receipt-echoes-the-run-nonce' -Nonce 'nprobe0123456789abcdef0123456789ab' -Expect 'nprobe0123456789abcdef0123456789ab'
+$nonceResults += Invoke-NonceEntry -Name 'receipt-without-a-nonce-says-none' -Nonce '' -Expect 'none'
+$nonceResults += Invoke-NonceEntry -Name 'receipt-with-a-malformed-nonce-says-none' -Nonce 'bad nonce"x=1' -Expect 'none'
+Write-Output 'receipt nonce echo (a decode-only profile, no Play):'
+$nonceResults | Format-Table -AutoSize | Out-String | Write-Output
+$nonceFailed = @($nonceResults | Where-Object { -not $_.refusedBeforePlay })
+if ($nonceFailed.Count -gt 0) {
+    Write-Output ("PLAY-GATE-OFFSCREEN: FAIL - the receipt did not echo the run nonce: " + (($nonceFailed | ForEach-Object { $_.entry }) -join ', '))
+    exit 1
 }
 
 $results | Format-Table -AutoSize | Out-String | Write-Output

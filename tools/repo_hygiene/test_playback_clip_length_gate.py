@@ -462,20 +462,27 @@ def _literal_template(text: str, anchor: str) -> str:
     return "".join(re.findall(r'"((?:[^"\\]|\\.)*)"', text[literal_start:end]))
 
 
+# ENFORCE-4 r2 (sol BLOCKER): every receipt carries the launcher's per-run nonce. Tests that judge a summary line stand in
+# for the launcher: the line they build carries RUN_NONCE (unless a case overrides run_nonce) and the verdict they run is
+# handed the same RUN_NONCE as the nonce THIS run generated.
+RUN_NONCE = "n0123456789abcdef0123456789abcdef"
+
+
 def _summary_line(**values: object) -> str:
     """The app's REAL playback_smoke.summary format (read from MainWindow.cpp, not retyped here) with
-    every placeholder filled: `values` by key name, everything else 0."""
+    every placeholder filled: `values` by key name, everything else 0 (run_nonce: RUN_NONCE)."""
     template = _literal_template(MAIN_WINDOW.read_text(encoding="utf-8"), "playback_smoke.summary session=%1")
     keys = dict(re.findall(r"(\w+)=%(\d+)", template))
-    by_index = {int(index): str(values.get(key, 0)) for key, index in keys.items()}
+    by_index = {int(index): str(values.get(key, RUN_NONCE if key == "run_nonce" else 0)) for key, index in keys.items()}
     return re.sub(r"%(\d+)", lambda m: by_index.get(int(m.group(1)), "0"), template)
 
 
-def _loop_verdict(line: str, window: float, launch_only: bool = False, gate: Path = GATE, clip_frames: int = 0) -> dict:
+def _loop_verdict(line: str, window: float, launch_only: bool = False, gate: Path = GATE, clip_frames: int = 0,
+                  nonce: str = RUN_NONCE) -> dict:
     """Runs the shared parser + Get-GuiSmokeLoopVerdict (the code the runner calls) on a summary line."""
     proc = _pwsh(
         f". {_q(gate)}; $s = Convert-PlaybackLogLineToObject {_q(line)}; "
-        f"Get-GuiSmokeLoopVerdict -Summary $s -WindowSeconds {window} "
+        f"Get-GuiSmokeLoopVerdict -Summary $s -WindowSeconds {window} -ExpectedRunNonce {_q(nonce)} "
         f"-LaunchOnlyProbe ${'true' if launch_only else 'false'} -ClipFrames {clip_frames} "
         "| ConvertTo-Json -Compress -Depth 4")
     assert proc.returncode == 0, proc.stdout + proc.stderr
@@ -659,6 +666,7 @@ class RuntimeBackstopBehaviourTests(unittest.TestCase):
             "function Get-ObjectPropertyValue { param($Object, $Name) "
             "if ($null -ne $Object -and $Object.PSObject.Properties[$Name]) { $Object.$Name } else { $null } }\n"
             f"$playbackSummary = Convert-PlaybackLogLineToObject {_q(_summary_line(**summary_fields))}\n"
+            f"$runNonce = {_q(RUN_NONCE)}; "
             "$Seconds = 24; $LaunchOnlyProbe = $false; $validationFailures = @(); $validationWarnings = @(); "
             "$clipLengthGate = [pscustomobject]@{ frames = 720 }\n"
             f"{block}\n"
@@ -754,7 +762,7 @@ class SourceFramesOracleParityTests(unittest.TestCase):
     def _gate_invalid(self, line: str) -> bool:
         proc = _pwsh(
             f". {_q(GATE)}; $s = Convert-PlaybackLogLineToObject {_q(line)}; "
-            "$v = Get-GuiSmokeSourceFramesVerdict -Summary $s; "
+            f"$v = Get-GuiSmokeSourceFramesVerdict -Summary $s -ExpectedRunNonce {_q(RUN_NONCE)}; "
             "$w = (($s.PSObject.Properties['wrapped'] -and [int]$s.wrapped -ne 0) -or "
             "($s.PSObject.Properties['wrap_count'] -and [int64]$s.wrap_count -gt 0)); "
             "[pscustomobject]@{ invalid = ($v.invalid -or $w) } | ConvertTo-Json -Compress")
@@ -764,7 +772,7 @@ class SourceFramesOracleParityTests(unittest.TestCase):
     def _module_invalid(self, line: str) -> bool:
         proc = _pwsh(
             f"Import-Module {_q(self.MODULE)} -Force -DisableNameChecking; "
-            f"$v = Get-AttrCudaSourceFramesVerdict -SummaryLine {_q(line)}; "
+            f"$v = Get-AttrCudaSourceFramesVerdict -SummaryLine {_q(line)} -ExpectedRunNonce {_q(RUN_NONCE)}; "
             "[pscustomobject]@{ invalid = [bool]$v.invalid } | ConvertTo-Json -Compress")
         self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
         return json.loads(proc.stdout)["invalid"]
@@ -800,6 +808,7 @@ class SourceFramesOracleParityTests(unittest.TestCase):
                 f"$Pub = {_q(pub)}\n"
                 f"$rawLog = {_q(raw_log)}\n"
                 "$measuredSmokeSessionId = '7'; $FixtureRehearsal = $false; $displayWake = [ordered]@{}; $displayBlock = $null\n"
+                f"$runLog = [pscustomobject]@{{ runNonce = {_q(RUN_NONCE)} }}\n"
                 "$SourceCommit = ('1' * 40); $ClipId = 'clip'; $ContactSheetEnabled = $false; $contactSheetDir = ''\n"
                 "function Publish-AttrCudaContactSheetRawCaptures { param($Enabled, $SourceDir, $PubRoot) }\n"
                 "function Save-Json($Object, [string]$Path) { [IO.File]::WriteAllText($Path, ($Object | ConvertTo-Json -Depth 20)) }\n"
@@ -843,7 +852,7 @@ class SourceFramesOracleParityTests(unittest.TestCase):
             "guard disabled": ("if ($sourceFramesVerdict.invalid) {", "if ($false -and $sourceFramesVerdict.invalid) {"),
             "guard inverted": ("if ($sourceFramesVerdict.invalid) {", "if (-not $sourceFramesVerdict.invalid) {"),
             "any session's line accepted": ("[regex]::Escape([string]$measuredSmokeSessionId)", "''"),
-            "verdict ignored": ("$sourceFramesVerdict = Get-AttrCudaSourceFramesVerdict -SummaryLine $sourceFramesSummaryLine",
+            "verdict ignored": ("$sourceFramesVerdict = Get-AttrCudaSourceFramesVerdict -SummaryLine $sourceFramesSummaryLine -ExpectedRunNonce $runLog.runNonce",
                                 "$sourceFramesVerdict = [pscustomobject]@{ invalid = $false; wrapped = $false; failures = @(); sourceAdvanced = 0; requiredSourceFrames = 0 }"),
         }
         for name, (needle, replacement) in mutations.items():

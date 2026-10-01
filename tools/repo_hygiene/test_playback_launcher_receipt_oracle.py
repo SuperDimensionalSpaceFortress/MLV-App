@@ -26,6 +26,7 @@ import re
 import shutil
 import stat
 import subprocess
+import sys
 import tempfile
 import unittest
 from pathlib import Path
@@ -43,6 +44,7 @@ from tools.repo_hygiene.test_playback_clip_length_gate import (
     PROFILING,
     PWSH,
     ROOT,
+    RUN_NONCE,
     _launches_play,
     _pwsh,
     _q,
@@ -82,12 +84,14 @@ def _pre_enforce_3_line() -> str:
 
 
 def _oracle(summary_line: str | None, *, exit_code: object = 0, killed: bool = False, message: str = "",
-            gate: Path = GATE, window: float = 25.0) -> dict:
-    """Runs Get-GuiSmokeEvidencePlayVerdict on a parsed summary line (None = the app wrote none)."""
+            gate: Path = GATE, window: float = 25.0, nonce: str | None = RUN_NONCE) -> dict:
+    """Runs Get-GuiSmokeEvidencePlayVerdict on a parsed summary line (None = the app wrote none). `nonce` is the run nonce
+    THIS run generated (None = the launcher bound none, which must be INVALID)."""
     summary = "$null" if summary_line is None else f"(Convert-PlaybackLogLineToObject {_q(summary_line)})"
     code = "$null" if exit_code is None else str(int(exit_code))
+    nonce_argument = "" if nonce is None else f"-ExpectedRunNonce {_q(nonce)} "
     proc = _pwsh(
-        f". {_q(gate)}; Get-GuiSmokeEvidencePlayVerdict -Summary {summary} -ExitCode {code} "
+        f". {_q(gate)}; Get-GuiSmokeEvidencePlayVerdict -Summary {summary} -ExitCode {code} {nonce_argument}"
         f"-KilledByLauncher ${'true' if killed else 'false'} -WindowSeconds {window} -AppMessage {_q(message)} "
         "| Select-Object invalid, failures, exitCode | ConvertTo-Json -Compress -Depth 4")
     assert proc.returncode == 0, proc.stdout + proc.stderr
@@ -231,27 +235,67 @@ class ReceiptReadersTests(unittest.TestCase):
 
 # ---- 2. each direct launcher, executed against a fake app ------------------------------------------------------------
 
-def _make_fake_app(tmp: Path, *, exit_code: int, copies: tuple[tuple[Path, str], ...] = (), stderr_text: str = "") -> Path:
+# The stand-in app's behaviour, run by the interpreter that runs these tests (so it needs no shell dialect).
+# ENFORCE-4 r2: a real app ECHOES the launcher's per-run nonce (MLVAPP_RUN_NONCE) on every receipt it writes, so the stand-in
+# does too: `nonce_mode` 'echo' replaces the default test nonce in what it writes with the nonce it was handed, 'stale' leaves
+# the default (a receipt some EARLIER run wrote), 'absent' omits it (a build that predates the nonce). It writes each file
+# NEW (a fresh modification time), as an app does. `silent_on_help` models the app's --help branch: exit 0, write nothing.
+_FAKE_APP_IMPL = r'''
+import json, os, re, sys
+spec = json.load(open(sys.argv[1], encoding="utf-8"))
+args = sys.argv[2:]
+if spec.get("silent_on_help") and any(a in ("--help", "-h") for a in args):
+    sys.exit(0)
+nonce = os.environ.get("MLVAPP_RUN_NONCE", "")
+log_dir = os.environ.get("MLVAPP_CRASH_FORENSICS_LOG_DIR", "")
+mode = spec.get("nonce_mode", "echo")
+for source, destination in spec["copies"]:
+    data = open(source, "rb").read()
+    destination = destination.replace("%MLVAPP_CRASH_FORENSICS_LOG_DIR%", log_dir).replace("$MLVAPP_CRASH_FORENSICS_LOG_DIR", log_dir)
+    try:
+        text = data.decode("utf-8")
+    except UnicodeDecodeError:
+        text = None
+    if text is not None:
+        if destination.lower().endswith(".json"):
+            document = json.loads(text)
+            metadata = document.get("metadata")
+            if isinstance(metadata, dict) and "run_nonce" in metadata:
+                if mode == "echo":
+                    metadata["run_nonce"] = nonce
+                elif mode == "absent":
+                    del metadata["run_nonce"]
+            text = json.dumps(document)
+        elif mode == "echo":
+            text = text.replace(spec["default_nonce"], nonce)
+        elif mode == "absent":
+            text = re.sub(r"\s*run_nonce=\S+", "", text)
+        data = text.encode("utf-8")
+    with open(destination, "wb") as handle:
+        handle.write(data)
+if spec.get("stderr"):
+    sys.stderr.write(spec["stderr"] + "\n")
+sys.exit(int(spec["exit_code"]))
+'''
+
+
+def _make_fake_app(tmp: Path, *, exit_code: int, copies: tuple[tuple[Path, str], ...] = (), stderr_text: str = "",
+                   nonce_mode: str = "echo", silent_on_help: bool = False) -> Path:
     """A stand-in for MLVApp.exe: copies the given files to the given destinations (shell expressions that may name the
-    MLVAPP_CRASH_FORENSICS_LOG_DIR the launcher exports), optionally writes to stderr, exits with `exit_code`."""
+    MLVAPP_CRASH_FORENSICS_LOG_DIR the launcher exports), echoing the run nonce per `nonce_mode`, optionally writes to
+    stderr, exits with `exit_code`."""
+    impl = tmp / "fake_app_impl.py"
+    impl.write_text(_FAKE_APP_IMPL, encoding="utf-8")
+    spec = tmp / "fake_app_spec.json"
+    spec.write_text(json.dumps({"exit_code": exit_code, "stderr": stderr_text, "nonce_mode": nonce_mode, "silent_on_help": silent_on_help,
+                                "default_nonce": RUN_NONCE, "copies": [[str(source), destination] for source, destination in copies]}),
+                    encoding="utf-8")
     if os.name == "nt":
         path = tmp / "fake_app.cmd"
-        lines = ["@echo off"]
-        for source, destination in copies:
-            lines.append(f'copy /y "{source}" "{destination}" >nul')
-        if stderr_text:
-            lines.append(f"echo {stderr_text} 1>&2")
-        lines.append(f"exit /b {exit_code}")
-        path.write_text("\r\n".join(lines) + "\r\n", encoding="ascii")
+        path.write_text(f'@echo off\r\n"{sys.executable}" "{impl}" "{spec}" %*\r\nexit /b %errorlevel%\r\n', encoding="ascii")
     else:
         path = tmp / "fake_app.sh"
-        lines = ["#!/bin/sh"]
-        for source, destination in copies:
-            lines.append(f'cp "{source}" "{destination}"')
-        if stderr_text:
-            lines.append(f"echo {stderr_text} 1>&2")
-        lines.append(f"exit {exit_code}")
-        path.write_text("\n".join(lines) + "\n", encoding="ascii")
+        path.write_text(f'#!/bin/sh\nexec "{sys.executable}" "{impl}" "{spec}" "$@"\n', encoding="ascii")
         path.chmod(path.stat().st_mode | stat.S_IXUSR | stat.S_IXGRP | stat.S_IXOTH)
     return path
 
@@ -293,8 +337,11 @@ class CaptureReferenceFrameLauncherTests(_LauncherCase):
     def run_capture(self, line: str | None, exit_code: int = 0, stderr_text: str = "", script: Path = CAPTURE) -> tuple[subprocess.CompletedProcess, Path]:
         out = self.tmp / "capture-out"
         out.mkdir(exist_ok=True)
-        (out / "reference-frame.png").write_bytes(b"\0" * 65536)   # the fake app cannot draw: pre-seed the grab
-        fake = _make_fake_app(self.tmp, exit_code=exit_code, copies=self.log_template(line), stderr_text=stderr_text)
+        # the fake app cannot draw: it writes a stand-in grab itself (the launcher sets any pre-existing grab aside before launch)
+        grab = self.tmp / "grab.template"
+        grab.write_bytes(b"\0" * 65536)
+        fake = _make_fake_app(self.tmp, exit_code=exit_code, copies=self.log_template(line) + ((grab, str(out / "reference-frame.png")),),
+                              stderr_text=stderr_text)
         proc = subprocess.run(
             [PWSH, "-NoLogo", "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-File", str(script),
              "-Exe", str(fake), "-Clip", str(self.clip), "-OutDir", str(out), "-Seconds", "25", "-SettleMs", "100",
@@ -350,10 +397,10 @@ class ProfileWrapperLauncherTests(_LauncherCase):
     """run-release-playback-profile.ps1 with a play-capable option: the profile receipt must prove the footage."""
 
     GOOD_METADATA = {"source_advanced": 480, "required_source_frames": 480, "native_fps": 23.976, "pace_fps": 23.976,
-                     "fps_override_active": False, "play_wrap_count": 0, "programmatic_play_admitted": 1}
+                     "fps_override_active": False, "play_wrap_count": 0, "programmatic_play_admitted": 1, "run_nonce": RUN_NONCE}
 
     def run_wrapper(self, metadata: dict | None, exit_code: int = 0, option: str = "--exercise-play-action",
-                    script: Path = PROFILE_WRAPPER) -> subprocess.CompletedProcess:
+                    script: Path = PROFILE_WRAPPER, quality_mode: str | None = None) -> subprocess.CompletedProcess:
         bin_dir = self.tmp / "bin"
         (bin_dir / "platforms").mkdir(parents=True, exist_ok=True)
         (bin_dir / "platforms" / "qwindows.dll").write_bytes(b"stand-in")
@@ -368,8 +415,9 @@ class ProfileWrapperLauncherTests(_LauncherCase):
         fake = _make_fake_app(self.tmp, exit_code=exit_code, copies=copies)
         target = bin_dir / fake.name
         shutil.copy(fake, target)
+        quality = f"-QualityMode {_q(quality_mode)} " if quality_mode else ""
         command = (f"& {_q(script)} -RepoRoot {_q(ROOT)} -ExePath {_q(target)} -Input {_q(self.clip)} "
-                   f"-Output {_q(output)} -Frames 3 -AdditionalArgs @({_q(option)}); exit $LASTEXITCODE")
+                   f"-Output {_q(output)} -Frames 3 {quality}-AdditionalArgs @({_q(option)}); exit $LASTEXITCODE")
         return subprocess.run([PWSH, "-NoLogo", "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-Command", command],
                               capture_output=True, text=True, timeout=240)
 

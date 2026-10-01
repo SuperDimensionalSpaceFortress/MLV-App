@@ -105,7 +105,22 @@ PINNED_STOP_STATEMENTS = {
         "if( qEnvironmentVariableIntValue( \"MLVAPP_AUTOPLAY_SECONDS\" ) > 0 ) m_automationVerdict.armPending(); "
         "if( argc > 1 ) {",
         "m_automationVerdict.resolve( autoplayState );",
-        "m_automationVerdict.fail(); if( autoplayExit ) QTimer::singleShot( 400, this, [](){ qApp->quit(); } ); return;",
+        # r2 (fable H3): the refusal exits with qApp->exit( 14 ) -- never qApp->quit(), which in Qt 6 sends the close event
+        # (and, before r2, its blocking save-session prompt) -- so an unattended refused autoplay really exits non-zero.
+        "m_automationVerdict.fail(); if( autoplayExit ) QTimer::singleShot( 400, this, [](){ "
+        "qApp->exit( playback_frame_range::AutomationVerdictLatch::kFailExitCode ); } ); return;",
+    ),
+    # r2 (fable H3): an automation run never blocks on the save-session prompt (the latch is sticky: armed() outlives a
+    # Reached verdict). Without this guard qApp->quit() / a close event waits on a dialog nobody can answer.
+    "MainWindow::closeEvent": (
+        "if( !m_automationVerdict.armed() && ui->actionAskForSavingOnQuit->isChecked() && SESSION_CLIP_COUNT != 0 ) {",
+    ),
+    # r2 (sol BLOCKER): every receipt the app writes echoes the launcher's per-run nonce, so a launcher can tell this
+    # run's receipt from a stale one. The summary line carries run_nonce= (last field) and the profile JSON carries
+    # metadata.run_nonce; both come from automationRunNonce() (the sanitised MLVAPP_RUN_NONCE).
+    "MainWindow::finishPlaybackSmokeTelemetry": (
+        "\"run_nonce=%80\" )",
+        ".arg( automationRunNonce() );",
     ),
     "MainWindow::runHeadlessPlaybackProfile": (
         "const qint64 autoSettleSafetyMs = playback_frame_range::playSafetyMs( m_playRequestedSeconds ); "
@@ -121,6 +136,8 @@ PINNED_STOP_STATEMENTS = {
         "== playback_frame_range::PlayStopState::Continue ) { qApp->processEvents( QEventLoop::AllEvents ); "
         "QThread::msleep( 10 ); } playActionEndedEarly = playActionState == playback_frame_range::PlayStopState::EndedEarly;",
         "isolateAutomationPacing( \"profile-entry\" );",
+        # r2 (sol BLOCKER): the profile JSON echoes the launcher's per-run nonce (see finishPlaybackSmokeTelemetry below).
+        "metadata.insert( QStringLiteral(\"run_nonce\"), automationRunNonce() );",
     ),
     "MainWindow::runGuiPlaybackSmoke": (
         "measuredState = programmaticPlayState( playbackClock.elapsed(), measuredSafetyMs ); "
@@ -751,7 +768,7 @@ def _scan_header_members(text: str) -> list[str]:
 # assignment, an escape, a second resolve, a clear) fails the scan.
 PINNED_LATCH_CALLS = {"armPending": 1, "fail": 1, "resolve": 1}
 _LATCH_USE = re.compile(r"\bm_automationVerdict\b")
-_LATCH_READ = re.compile(r"\s*\.\s*(?:exitCode|pending)\s*\(\s*\)")
+_LATCH_READ = re.compile(r"\s*\.\s*(?:exitCode|pending|armed)\s*\(\s*\)")
 _LATCH_CALL = re.compile(r"\s*\.\s*(armPending|fail|resolve)\s*\(")
 
 

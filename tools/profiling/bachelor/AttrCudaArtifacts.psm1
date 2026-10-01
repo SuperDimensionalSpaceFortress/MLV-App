@@ -5770,7 +5770,7 @@ function ConvertTo-AttrCudaResultLineSafeText {
 # makes for the smoke runner (the emitted job cannot dot-source that file); a class test executes both on one table.
 function Get-AttrCudaSourceFramesVerdict {
     [CmdletBinding()]
-    param([AllowNull()][AllowEmptyString()][string]$SummaryLine)
+    param([AllowNull()][AllowEmptyString()][string]$SummaryLine, [AllowNull()][AllowEmptyString()][string]$ExpectedRunNonce = '')
     $fields = @{}
     if (-not [string]::IsNullOrWhiteSpace($SummaryLine)) {
         foreach ($match in [regex]::Matches($SummaryLine, '(?<k>[A-Za-z0-9_]+)=(?<v>\S+)')) {
@@ -5778,6 +5778,18 @@ function Get-AttrCudaSourceFramesVerdict {
         }
     }
     $failures = @()
+    # ENFORCE-4 r2 (sol BLOCKER): the receipt must be THIS run's. The nonce the app echoed on the summary line must be the one
+    # the smoke runner generated for the run whose log this job read ($runLog.runNonce); a missing, mismatched or unbound nonce
+    # is INVALID (the same rule as Get-GuiSmokeRunNonceFailure in gui-smoke-length-gate.ps1).
+    if ($fields.Count -gt 0) {
+        if ([string]::IsNullOrWhiteSpace($ExpectedRunNonce)) {
+            $failures += "RECEIPT_NOT_THIS_RUN: the job bound no run nonce to the log it read, so no receipt can be shown to be this run's."
+        } elseif (-not $fields.ContainsKey('run_nonce') -or [string]::IsNullOrWhiteSpace([string]$fields['run_nonce'])) {
+            $failures += 'RECEIPT_NOT_THIS_RUN: the summary line carries no run_nonce (a build that predates it); it cannot be shown to be this run''s.'
+        } elseif ([string]$fields['run_nonce'] -cne $ExpectedRunNonce) {
+            $failures += 'RECEIPT_NOT_THIS_RUN: the summary line''s run_nonce is not the nonce the smoke runner generated for this run; an earlier run wrote it.'
+        }
+    }
     $advanced = $null
     $required = $null
     if ($fields.ContainsKey('source_advanced')) { $advanced = [int64]$fields['source_advanced'] }
@@ -5810,11 +5822,16 @@ function Get-AttrCudaSourceFramesVerdict {
     if ($fields.Count -gt 0 -and $fields.ContainsKey('fps_override') -and [int]$fields['fps_override'] -ne 0) {
         $failures += 'INVALID_SOURCE_FRAMES: the run was paced by a persisted fps override; evidence is paced at the footage native fps.'
     }
-    if ($fields.ContainsKey('native_fps') -and $fields.ContainsKey('pace_fps')) {
-        $native = [double]::Parse($fields['native_fps'], [Globalization.CultureInfo]::InvariantCulture)
+    if ($fields.ContainsKey('pace_fps')) {
         $pace = [double]::Parse($fields['pace_fps'], [Globalization.CultureInfo]::InvariantCulture)
-        if ($native -gt 0 -and $pace -gt 0 -and [Math]::Abs($pace - $native) -gt (0.005 * $native)) {
-            $failures += "INVALID_SOURCE_FRAMES: the engine paced at pace_fps=$pace but the footage native fps is $native; 20 s of wall clock is not 20 s of footage."
+        if ($pace -le 0) {
+            # ENFORCE-4 r2 (fable H5): a PRESENT pace that is not positive is unknown, never "pace unchecked".
+            $failures += "INVALID_SOURCE_FRAMES: pace_fps=$pace; a present engine pace that is not positive is unknown, so wall clock cannot be tied to the footage played."
+        } elseif ($fields.ContainsKey('native_fps')) {
+            $native = [double]::Parse($fields['native_fps'], [Globalization.CultureInfo]::InvariantCulture)
+            if ($native -gt 0 -and [Math]::Abs($pace - $native) -gt (0.005 * $native)) {
+                $failures += "INVALID_SOURCE_FRAMES: the engine paced at pace_fps=$pace but the footage native fps is $native; 20 s of wall clock is not 20 s of footage."
+            }
         }
     }
     $wrapped = $false

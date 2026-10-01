@@ -211,6 +211,43 @@ The attribution job no longer seeds the venue's registry (`reg add HKCU\Software
 run reads a run-scoped settings store, so the seeds were dead, and every value they wrote is the app's own default
 (`AttributionJobRegistrySeedTests` pins that against the compiled defaults).
 
+### ENFORCE-4 round 2: a receipt counts only if THIS invocation of the app wrote it, for THIS run
+
+sol's round-1 key found the next member of the same family: `run-release-playback-profile.ps1` read `-Output` and judged
+whatever it found, so a receipt a PREVIOUS run left behind (valid, every field present) was accepted when the app exited 0
+without playing (`--exercise-play-action --help` returns 0 before it writes anything). The class is closed in every
+launcher that judges a receipt, with three independent layers (each one alone rejects the repro; the tests remove each in
+turn and a stale receipt is accepted only with all removed):
+
+1. **Set aside.** A pre-existing receipt or output (`-Output`, `reference-frame.png` and its candidate manifest, last run's
+   `cap-NNN.png`, the runner's result JSON) is renamed `STALE-<utc>-<name>` BEFORE the launch (`Move-GuiSmokeStaleReceiptAside`;
+   never deleted, and a stale file that cannot be moved stops the launch with exit 43).
+2. **Nonce.** The launcher generates `New-GuiSmokeRunNonce` (`n` + a GUID), hands it to the app as `MLVAPP_RUN_NONCE`
+   (set after `-ExtraEnvironment`, so a caller cannot choose it), the app echoes it on every receipt it writes
+   (`playback_smoke.summary` `run_nonce=`, the profile JSON `metadata.run_nonce`; unset or malformed is written as `none`,
+   which no launcher generates), and the oracle accepts a receipt only when it carries the nonce THIS launch generated
+   (`RECEIPT_NOT_THIS_RUN`, exit 43). A missing or mismatched nonce, a launcher that bound none, and an app that exited 0 and
+   wrote no receipt are all INVALID. Both oracle copies (the gate's and the attribution job's embedded one, which compares
+   against the nonce of the run log it read) carry the rule.
+3. **Freshness.** A receipt FILE last written before the launch is INVALID (`Get-GuiSmokeReceiptStaleFailure`).
+
+On any INVALID the rejected receipt is renamed `<name>.INVALID<ext>` (a JSON one is also stamped `"invalid": true` with
+`invalid_reasons`), and a directory of captures gets an `INVALID.json` marker, so an offline reader cannot mistake it for
+evidence; the runner's own result JSON carries the same stamp. `RunBindingScanTests` derives every launcher that starts the
+app for an evidence Play and requires all three layers in each (a new launcher with the oracle but no binding fails).
+
+Also closed in round 2: a Look Assist settle / toggle profile without Auto playback quality mode (the only mode in which its
+warm-up Play is admitted) is refused up front, typed `PASS_THROUGH_REFUSED ... needs_auto_quality_mode_to_admit_a_play`
+(exit 44), instead of ending in exit 43 after the whole run; a PRESENT `pace_fps` <= 0 is INVALID in both oracle copies;
+every consumer pin now matches the failing action in the BODY of its exit check (`CONSUMER_FAILING_ACTION`: emptying a body
+fails the scan, which the header-only pins of round 1 survived).
+
+**The autoplay hook now exits observably.** The offscreen probe used to kill the two autoplay entries at its bound (exit -1,
+latched code never observed). Qt 6's `qApp->quit()` sends the close event and `closeEvent` blocked on the "save the
+session?" prompt; an automation run (the latch is sticky: `armed()`) never prompts any more, and the refusal exits with
+`qApp->exit( 14 )`. The probe asserts exit 14 for both entries (observed live), plus that a profile receipt echoes the
+launcher's nonce, and `none` when it is unset or malformed. Exit 0 is only for `Reached`, which needs a >= 20 s clip.
+
 Disclosed, not closed (ENFORCE-4): the four historical binaries `measure-wb-solve-distribution.ps1` bisects across all
 predate the receipt fields, so today every run of them is INVALID by design (the script is a bisect list, not
 evidence, until they are rebuilt with the receipt). `compare-output-budget.ps1` still asks the runner for a 1 s window,

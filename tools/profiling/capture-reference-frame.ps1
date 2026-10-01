@@ -109,6 +109,17 @@ if ($clipLengthGate.verdict -ne 'OK') {
 }
 
 $shot = Join-Path $OutDir 'reference-frame.png'
+# ENFORCE-4 r2 (sol BLOCKER): "a receipt counts only if THIS invocation of the app wrote it, for THIS run". Last run's grab and
+# candidate manifest are set aside BEFORE the launch (renamed STALE-<utc>-<name>, never destroyed): a stale PNG used to satisfy
+# `Test-Path $shot` when the app exited 0 without drawing. The app is handed a per-run nonce that it echoes on its
+# playback_smoke.summary, and only a summary carrying it is judged. Set AFTER -ExtraEnv so a caller cannot choose it.
+$runNonce = New-GuiSmokeRunNonce
+$env:MLVAPP_RUN_NONCE = $runNonce
+$applied += 'MLVAPP_RUN_NONCE'
+foreach ($staleReceipt in @($shot, (Join-Path $OutDir 'reference-frame-candidate.json'))) {
+    $asideResult = Move-GuiSmokeStaleReceiptAside -Path $staleReceipt
+    if (-not $asideResult.ok) { Write-Output "CAPTURE: INVALID - $($asideResult.message)"; exit 43 }
+}
 # --loop is DELIBERATELY ABSENT when the frame is pinned: looping wraps the timeline and
 # reintroduces exactly the which-frame ambiguity --presented-frames exists to remove.
 $playArgs = @('--gui-smoke-playback','--input',$Clip,'--scope','none','--no-zebras',
@@ -155,9 +166,13 @@ if (-not $captureKilled -and $captureExitCode -ne 0) {
 $captureSummary = Read-GuiSmokePlaybackSummaryFromLogDir -LogDir $OutDir -SinceUtc $captureStartedUtc
 $captureFrames = if ($null -ne $clipLengthGate.frames) { [int64]$clipLengthGate.frames } else { [int64]0 }
 $captureVerdict = Get-GuiSmokeEvidencePlayVerdict -Summary $captureSummary -ExitCode $captureExitCode `
-    -KilledByLauncher $captureKilled -WindowSeconds $Seconds -ClipFrames $captureFrames
+    -KilledByLauncher $captureKilled -WindowSeconds $Seconds -ClipFrames $captureFrames -ExpectedRunNonce $runNonce
 if ($captureVerdict.invalid) {
     Write-Output ("CAPTURE: INVALID - " + (($captureVerdict.failures) -join ' | '))
+    # fable H2: the grab of an INVALID run is renamed <name>.INVALID.png and the directory is marked, so an offline reader
+    # cannot mistake either for a reference candidate.
+    [void](Set-GuiSmokeReceiptInvalid -Path $shot -Failures $captureVerdict.failures)
+    Write-GuiSmokeInvalidMarker -Directory $OutDir -Failures $captureVerdict.failures
     exit $captureVerdict.exitCode
 }
 if (-not (Test-Path -LiteralPath $shot)) { Write-Output "CAPTURE: FAILED - no frame written"; exit 5 }

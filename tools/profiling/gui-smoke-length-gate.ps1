@@ -386,7 +386,11 @@ function Convert-PlaybackLogLineToObject {
 
         $intValue = 0L
         $doubleValue = 0.0
-        if ([long]::TryParse($rawValue, [ref]$intValue)) {
+        if ($key -ceq 'run_nonce') {
+            # ENFORCE-4 r2: a nonce is an opaque STRING, never a number (an all-digit one must keep its digits).
+            $result[$key] = $rawValue
+        }
+        elseif ([long]::TryParse($rawValue, [ref]$intValue)) {
             $result[$key] = $intValue
         }
         elseif ([double]::TryParse(
@@ -419,6 +423,156 @@ function Get-GuiSmokeAbsentReceiptFields {
     return $missing
 }
 
+# ---------------------------------------------------------------------------------------------------
+# PLAYBACK-CLIP-LENGTH-ENFORCE-4 round 2 -- "a receipt counts only if it was written by THIS invocation of the app, for
+# THIS run" (sol r1 BLOCKER: the profile launcher read -Output and judged a PREVIOUS run's valid receipt when the app exited
+# 0 without playing, e.g. --exercise-play-action --help). Three layers, each sufficient alone against the stale-receipt repro:
+#   1. SET ASIDE: any pre-existing receipt / output is renamed (STALE-<utc>-<name>, never destroyed) BEFORE the launch, so
+#      what a reader finds afterwards is something this run wrote, or nothing;
+#   2. NONCE: the launcher generates a per-run nonce, hands it to the app (MLVAPP_RUN_NONCE), and the app echoes it on every
+#      receipt it writes; a missing, mismatched or unbound nonce is INVALID (RECEIPT_NOT_THIS_RUN, exit 43);
+#   3. FRESHNESS: a receipt FILE last written before the launch is INVALID.
+# On any INVALID the rejected receipt is renamed <name>.INVALID<ext> (a JSON one is also stamped "invalid": true), so an offline
+# reader cannot mistake it for evidence. ASCII only.
+# ---------------------------------------------------------------------------------------------------
+
+$script:GuiSmokeRunNonceEnvironmentName = 'MLVAPP_RUN_NONCE'
+$script:GuiSmokeReceiptClockSlackSeconds = 2   # file-system timestamp granularity
+# Profile options whose Play is a Look Assist warm-up: it only happens in Auto playback quality mode (fable H1).
+$script:PlaybackProfileSettleOptions = @('exercise-look-assist-settle', 'exercise-look-assist-toggle')
+
+function New-GuiSmokeRunNonce {
+    # 'n' + a GUID: always a STRING token (Convert-PlaybackLogLineToObject turns an all-digit token into a number), letters
+    # and digits only (the app's sanitizeRunNonce accepts 8..64 of them and writes anything else as `none`).
+    return 'n' + [Guid]::NewGuid().ToString('N')
+}
+
+function Get-GuiSmokeRunNonceFailure {
+    <#
+    .SYNOPSIS
+    $null when -Summary carries the nonce THIS launch generated; otherwise the RECEIPT_NOT_THIS_RUN failure text. A launcher
+    that bound no nonce (-ExpectedRunNonce empty) can show no receipt to be its own, so it fails too. A null summary is
+    reported by the oracle's own no-receipt failure.
+    #>
+    param([AllowNull()]$Summary, [AllowNull()][string]$ExpectedRunNonce = '')
+    if ($null -eq $Summary) { return $null }
+    if ([string]::IsNullOrWhiteSpace($ExpectedRunNonce)) {
+        return "RECEIPT_NOT_THIS_RUN: the launcher bound no run nonce to this run, so no receipt can be shown to be this run's."
+    }
+    $receiptNonce = if ($Summary.PSObject.Properties['run_nonce']) { $Summary.run_nonce } else { $null }
+    if ([string]::IsNullOrWhiteSpace([string]$receiptNonce)) {
+        return "RECEIPT_NOT_THIS_RUN: the receipt carries no run_nonce (a build that predates the run nonce, or an app that was not handed one); it cannot be shown to be this run's."
+    }
+    if ([string]$receiptNonce -cne $ExpectedRunNonce) {
+        return "RECEIPT_NOT_THIS_RUN: the receipt's run_nonce ($receiptNonce) is not the nonce this launch handed the app; an earlier run (or another process) wrote it."
+    }
+    return $null
+}
+
+function Get-GuiSmokeReceiptStaleFailure {
+    # A receipt FILE last written before the launch is not this run's. $null when it is fresh (or absent: no receipt is
+    # reported by the oracle itself).
+    param([Parameter(Mandatory = $true)][string]$Path, [AllowNull()][object]$LaunchedUtc = $null)
+    if (-not (Test-Path -LiteralPath $Path -PathType Leaf)) { return $null }
+    if ($null -eq $LaunchedUtc) {
+        return "RECEIPT_NOT_THIS_RUN: the launcher recorded no launch time, so the receipt file's age cannot be judged."
+    }
+    $written = (Get-Item -LiteralPath $Path).LastWriteTimeUtc
+    if ($written -lt ([datetime]$LaunchedUtc).AddSeconds(-$script:GuiSmokeReceiptClockSlackSeconds)) {
+        return "RECEIPT_NOT_THIS_RUN: the receipt file was last written $($written.ToString('o')), before this launch ($(([datetime]$LaunchedUtc).ToString('o')))."
+    }
+    return $null
+}
+
+function Move-GuiSmokeStaleReceiptAside {
+    <#
+    .SYNOPSIS
+    Layer 1: renames a PRE-EXISTING receipt / output to STALE-<utc>-<name> in the same directory before the launch (never
+    deletes it: it may be somebody's evidence). Returns [pscustomobject]@{ ok; moved; asidePath; message }; ok=$false means
+    the stale file could not be moved and the launcher must not run.
+    #>
+    param([Parameter(Mandatory = $true)][string]$Path)
+    $none = { param($okValue, $text) [pscustomobject]@{ ok = $okValue; moved = $false; asidePath = $null; message = $text } }
+    if (-not (Test-Path -LiteralPath $Path)) { return (& $none $true 'OK') }
+    if (Test-Path -LiteralPath $Path -PathType Container) {
+        return (& $none $false 'RECEIPT_NOT_THIS_RUN: the receipt path is a directory, not a file this run can own.')
+    }
+    try {
+        $directory = Split-Path -Parent $Path
+        $stamp = [DateTime]::UtcNow.ToString('yyyyMMddTHHmmssfff') + '-' + [Guid]::NewGuid().ToString('N').Substring(0, 6)
+        $aside = Join-Path $directory ("STALE-$stamp-" + (Split-Path -Leaf $Path))
+        Move-Item -LiteralPath $Path -Destination $aside -ErrorAction Stop
+        return [pscustomobject]@{ ok = $true; moved = $true; asidePath = $aside; message = 'OK' }
+    } catch {
+        return (& $none $false 'RECEIPT_NOT_THIS_RUN: a receipt from an earlier run exists at the output path and could not be set aside, so nothing this run writes could be told from it.')
+    }
+}
+
+function Set-GuiSmokeReceiptInvalid {
+    <#
+    .SYNOPSIS
+    Quarantine of a rejected receipt (fable H2): renames <dir>\<name><ext> to <name>.INVALID<ext> (numbered when that exists;
+    nothing is overwritten) and, for a JSON receipt, stamps "invalid": true and "invalid_reasons". Returns the new path, or
+    $null when there was nothing to rename or the rename failed. Never throws: the caller is about to exit 43 anyway.
+    #>
+    param([Parameter(Mandatory = $true)][string]$Path, [string[]]$Failures = @())
+    try {
+        if (-not (Test-Path -LiteralPath $Path -PathType Leaf)) { return $null }
+        $directory = Split-Path -Parent $Path
+        $stem = [IO.Path]::GetFileNameWithoutExtension($Path)
+        $extension = [IO.Path]::GetExtension($Path)
+        $target = Join-Path $directory ("$stem.INVALID$extension")
+        $counter = 1
+        while (Test-Path -LiteralPath $target) { $target = Join-Path $directory ("$stem.INVALID.$counter$extension"); $counter++ }
+        Move-Item -LiteralPath $Path -Destination $target -ErrorAction Stop
+        if ($extension -ieq '.json') {
+            try {
+                $document = Get-Content -LiteralPath $target -Raw | ConvertFrom-Json
+                $document | Add-Member -NotePropertyName invalid -NotePropertyValue $true -Force
+                $document | Add-Member -NotePropertyName invalid_reasons -NotePropertyValue @($Failures | ForEach-Object { [string]$_ }) -Force
+                [IO.File]::WriteAllText($target, ($document | ConvertTo-Json -Depth 64), (New-Object System.Text.UTF8Encoding($false)))
+            } catch { }   # the rename alone already keeps a reader from trusting it
+        }
+        return $target
+    } catch { return $null }
+}
+
+function Write-GuiSmokeInvalidMarker {
+    # <Directory>\INVALID.json: the run that produced everything in this directory is INVALID evidence, and why. Best effort.
+    param([Parameter(Mandatory = $true)][string]$Directory, [string[]]$Failures = @())
+    try {
+        $document = [ordered]@{ invalid = $true; utc = [DateTime]::UtcNow.ToString('o'); reasons = @($Failures | ForEach-Object { [string]$_ }) }
+        [IO.File]::WriteAllText((Join-Path $Directory 'INVALID.json'), ($document | ConvertTo-Json -Depth 4), (New-Object System.Text.UTF8Encoding($false)))
+    } catch { }
+}
+
+function Test-GuiSmokeProfileModeAdmitsPlay {
+    <#
+    .SYNOPSIS
+    fable H1: the Look Assist settle / toggle options only Play (their warm-up) in AUTO playback quality mode. In any other mode
+    the app admits no Play and writes programmatic_play_admitted=0, so the run could only end in exit 43 AFTER the whole run.
+    Refused UP FRONT instead, typed and path-free (PASS_THROUGH_REFUSED, exit 44). -QualityMode is the effective mode (the
+    wrapper's -QualityMode, overridden by a later MLVAPP_PLAYBACK_QUALITY_MODE=<mode> in -ExtraEnvironment).
+    #>
+    param([string[]]$Arguments = @(), [string]$QualityMode = '', [string[]]$ExtraEnvironment = @())
+    $effective = $QualityMode
+    foreach ($entry in @($ExtraEnvironment)) {
+        foreach ($pair in ([string]$entry -split ',')) {
+            if ($pair.Trim() -match '^(?i)MLVAPP_PLAYBACK_QUALITY_MODE\s*=(?<mode>.*)$') { $effective = $Matches['mode'] }
+        }
+    }
+    $result = [pscustomobject]@{ verdict = 'OK'; option = ''; message = 'OK' }
+    foreach ($name in (Get-GuiSmokePassThroughOptionNames -Arguments $Arguments)) {
+        if ($script:PlaybackProfileSettleOptions -contains $name -and ([string]$effective).Trim() -ine 'auto') {
+            $result.verdict = 'PASS_THROUGH_REFUSED'
+            $result.option = $name
+            $result.message = "PASS_THROUGH_REFUSED (option=$name reason=needs_auto_quality_mode_to_admit_a_play)"
+            return $result
+        }
+    }
+    return $result
+}
+
 function Get-GuiSmokeSourceFramesVerdict {
     <#
     .SYNOPSIS
@@ -429,10 +583,14 @@ function Get-GuiSmokeSourceFramesVerdict {
     requirement is unknown, source_advanced is under it, the run was paced by a persisted fps override, or the
     engine's pace differs from the clip's native fps. ENFORCE-4: EVERY field it judges must be PRESENT -- an absent
     native_fps / pace_fps / fps_override is INVALID (RECEIPT_FIELD_ABSENT), not "no override" / "pace unchecked".
+    ENFORCE-4 r2: the receipt must also be THIS run's (-ExpectedRunNonce, RECEIPT_NOT_THIS_RUN), and a PRESENT pace_fps <= 0 is
+    INVALID (the engine's pace is unknown, so wall clock cannot be tied to footage).
     Returns [pscustomobject]@{ invalid; failures; sourceAdvanced; requiredSourceFrames }.
     #>
-    param([AllowNull()]$Summary)
+    param([AllowNull()]$Summary, [AllowNull()][string]$ExpectedRunNonce = '')
     $failures = @()
+    $nonceFailure = Get-GuiSmokeRunNonceFailure -Summary $Summary -ExpectedRunNonce $ExpectedRunNonce
+    if ($null -ne $nonceFailure) { $failures += $nonceFailure }
     $prop = { param($name) if ($null -ne $Summary -and $Summary.PSObject.Properties[$name]) { $Summary.$name } else { $null } }
     $advanced = & $prop 'source_advanced'
     $required = & $prop 'required_source_frames'
@@ -466,8 +624,10 @@ function Get-GuiSmokeSourceFramesVerdict {
     if ($null -ne $Summary -and $null -ne $fpsOverride -and [int]$fpsOverride -ne 0) {
         $failures += "INVALID_SOURCE_FRAMES: the run was paced by a persisted fps override (fps_override=$fpsOverride); evidence is paced at the clip's native fps."
     }
-    if ($null -ne $Summary -and $null -ne $nativeFps -and $null -ne $paceFps -and
-        [double]$nativeFps -gt 0 -and [double]$paceFps -gt 0 -and
+    if ($null -ne $Summary -and $null -ne $paceFps -and [double]$paceFps -le 0) {
+        $failures += "INVALID_SOURCE_FRAMES: pace_fps=$paceFps; a present engine pace that is not positive is unknown, so wall clock cannot be tied to the footage played."
+    } elseif ($null -ne $Summary -and $null -ne $nativeFps -and $null -ne $paceFps -and
+        [double]$nativeFps -gt 0 -and
         [Math]::Abs([double]$paceFps - [double]$nativeFps) -gt (0.005 * [double]$nativeFps)) {
         $failures += "INVALID_SOURCE_FRAMES: the engine paced at pace_fps=$paceFps but the clip's native fps is native_fps=$nativeFps; 20 s of wall clock is not 20 s of footage."
     }
@@ -494,7 +654,9 @@ function Get-GuiSmokeLoopVerdict {
         [AllowNull()]$Summary,
         [Parameter(Mandatory = $true)][double]$WindowSeconds,
         [bool]$LaunchOnlyProbe = $false,
-        [int64]$ClipFrames = 0
+        [int64]$ClipFrames = 0,
+        # ENFORCE-4 r2: the per-run nonce THIS launch handed the app; the receipt must echo it (RECEIPT_NOT_THIS_RUN).
+        [AllowNull()][string]$ExpectedRunNonce = ''
     )
     $failures = @()
     $prop = { param($name) if ($null -ne $Summary -and $Summary.PSObject.Properties[$name]) { $Summary.$name } else { $null } }
@@ -533,7 +695,7 @@ function Get-GuiSmokeLoopVerdict {
             $failures += "INVALID_LOOPED: the app reports clip_seconds=$clipSeconds, under max($($script:GuiSmokeMinClipSeconds), window=$WindowSeconds)."
         }
         # ENFORCE-3: the source-frame oracle (source_advanced >= required_source_frames, native pace, no override).
-        $sourceFramesVerdict = Get-GuiSmokeSourceFramesVerdict -Summary $Summary
+        $sourceFramesVerdict = Get-GuiSmokeSourceFramesVerdict -Summary $Summary -ExpectedRunNonce $ExpectedRunNonce
         $failures += @($sourceFramesVerdict.failures)
     }
     return [pscustomobject]@{ invalid = ($failures.Count -gt 0); failures = $failures }
@@ -594,6 +756,9 @@ function Get-GuiSmokeProfileReceiptSummary {
     $m = $document.metadata
     $get = { param($name) if ($m.PSObject.Properties[$name]) { $m.$name } else { $null } }
     $summary = [ordered]@{}
+    # ENFORCE-4 r2: the per-run nonce the app echoed; absent stays absent (RECEIPT_NOT_THIS_RUN downstream).
+    $receiptNonce = & $get 'run_nonce'
+    if ($null -ne $receiptNonce) { $summary['run_nonce'] = [string]$receiptNonce }
     foreach ($pair in @(@('source_advanced', 'source_advanced'), @('required_source_frames', 'required_source_frames'),
                         @('native_fps', 'native_fps'), @('pace_fps', 'pace_fps'), @('wrap_count', 'play_wrap_count'))) {
         $value = & $get $pair[1]
@@ -628,9 +793,18 @@ function Get-GuiSmokeEvidencePlayVerdict {
         [double]$WindowSeconds = $script:GuiSmokeMinClipSeconds,
         [int64]$ClipFrames = 0,
         [string]$AppMessage = '',
-        [bool]$RequireAdmission = $false
+        [bool]$RequireAdmission = $false,
+        # ENFORCE-4 r2: the receipt must be THIS run's. -ExpectedRunNonce is the nonce this launch generated and handed the app
+        # (an empty one is itself INVALID); -ReceiptPath / -LaunchedUtc (a profile receipt FILE) add the freshness layer.
+        [AllowNull()][string]$ExpectedRunNonce = '',
+        [string]$ReceiptPath = '',
+        [AllowNull()][object]$LaunchedUtc = $null
     )
     $failures = @()
+    if (-not [string]::IsNullOrWhiteSpace($ReceiptPath)) {
+        $staleFailure = Get-GuiSmokeReceiptStaleFailure -Path $ReceiptPath -LaunchedUtc $LaunchedUtc
+        if ($null -ne $staleFailure) { $failures += $staleFailure }
+    }
     if ($KilledByLauncher) {
         $failures += "PLAY_SAFETY_TIMEOUT: the launcher had to end the app itself; a Play ended by a clock the app did not choose is never playback evidence."
     } elseif ($null -eq $ExitCode) {
@@ -649,7 +823,7 @@ function Get-GuiSmokeEvidencePlayVerdict {
             $failures += "PLAY_NOT_ADMITTED: programmatic_play_admitted=$($Summary.play_admitted) on a play-capable run; nothing was played, so there is no footage to prove."
         }
     }
-    $loop = Get-GuiSmokeLoopVerdict -Summary $Summary -WindowSeconds $WindowSeconds -ClipFrames $ClipFrames
+    $loop = Get-GuiSmokeLoopVerdict -Summary $Summary -WindowSeconds $WindowSeconds -ClipFrames $ClipFrames -ExpectedRunNonce $ExpectedRunNonce
     $failures += @($loop.failures)
     return [pscustomobject]@{ invalid = ($failures.Count -gt 0); failures = $failures; exitCode = 43; summary = $Summary }
 }
