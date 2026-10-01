@@ -1,0 +1,151 @@
+{
+  "schema": "mlv-app/look-floor-config/v1",
+  "configVersion": 1,
+  "note": "Every threshold is {value, reason}. A bare number is rejected by look_config.py: a threshold with no reason is a guess. All values are PROVISIONAL until a judged corpus exists to calibrate against (DESIGN.md AMENDMENT 2 B3/B5); the floor GATES, the model judges only REFINE (bus TRAPS s8: blinded agent image calls can sit near chance).",
+  "letterbox": {
+    "detect": {
+      "value": true,
+      "reason": "A playback capture can include black window bars (the UM CUDA fixture tiles are 16:9 with ~17% black bars while the CPU tiles are content-only). Counting those bars as 'crushed shadows' fails every CUDA frame on geometry, not on look, and makes CUDA-vs-CPU pairs incomparable."
+    },
+    "bar_max_code": {
+      "value": 4,
+      "reason": "A band counts as a bar only if its brightest channel code is <= this value on EVERY pixel of the band. 4 (not 0) tolerates resampling ringing at the bar edge on downscaled thumbnails; a real picture row is never that dark across its full width unless it is a bar."
+    },
+    "min_active_px": {
+      "value": 16,
+      "reason": "Never crop to nothing: below this many remaining rows/columns the frame is treated as having no detectable letterbox."
+    },
+    "max_excluded_pct": {
+      "value": 50.0,
+      "reason": "If detection would discard more than half of the frame it is more likely a genuinely dark frame than a letterbox; refuse to exclude and say so in the verdict instead of silently shrinking the measured area."
+    }
+  },
+  "frame": {
+    "clipped_highlight_pct_max": {
+      "value": 1.0,
+      "reason": "DESIGN.md B3: clipped highlights <= 1% of the active frame. Definition reuses make-contact-sheet.py channel_stats (luma >= 254 on 8-bit) so the number is comparable with every existing stats sidecar."
+    },
+    "crushed_shadow_pct_max": {
+      "value": 2.0,
+      "reason": "DESIGN.md B3: crushed shadows <= 2% of the active frame. Definition reuses make-contact-sheet.py channel_stats (luma <= 1 on 8-bit); measured on the active area so letterbox bars do not count."
+    },
+    "mean_saturation_max": {
+      "value": 0.55,
+      "reason": "Saturation ceiling (a): mean HSV saturation over the active frame. Natural footage and a restrained grade sit well below this; a Look Assist mapping that pushes the MEAN past 0.55 is oversaturating the whole frame. Provisional: the two tracked fixtures read ~0.08."
+    },
+    "oversaturated_pixel_pct_max": {
+      "value": 3.0,
+      "reason": "Saturation ceiling (b): share of pixels with HSV saturation >= oversaturated_sat_min AND value >= oversaturated_value_min. A small neon highlight is legitimate; more than 3% of the frame is a colour blow-out that the mean alone can hide."
+    },
+    "oversaturated_sat_min": {
+      "value": 0.9,
+      "reason": "HSV saturation at or above which a pixel counts as oversaturated for oversaturated_pixel_pct_max."
+    },
+    "oversaturated_value_min": {
+      "value": 0.15,
+      "reason": "Pixels darker than this HSV value are excluded from the oversaturation count: saturation of near-black pixels is sensor noise amplified by the HSV division, not colour."
+    },
+    "skin_min_pixel_pct": {
+      "value": 1.0,
+      "reason": "A skin-tone region smaller than 1% of the active frame is too few pixels to give a stable mean hue; the skin check is then NOT_APPLICABLE (never a pass)."
+    },
+    "skin_hue_drift_deg_max": {
+      "value": 5.0,
+      "reason": "DESIGN.md B3: skin-hue drift <= ~5 degrees where skin is present. A drift needs a baseline (the same frame without the look, or the other backend): absolute skin hue varies by subject, so with no reference frame the check is NOT_APPLICABLE and the absolute offset is only reported."
+    }
+  },
+  "skin": {
+    "cb_range": {
+      "value": [77, 127],
+      "reason": "Chai & Ngan (1999) YCbCr skin-tone chroma box, Cb axis."
+    },
+    "cr_range": {
+      "value": [133, 173],
+      "reason": "Chai & Ngan (1999) YCbCr skin-tone chroma box, Cr axis."
+    },
+    "min_luma": {
+      "value": 40,
+      "reason": "Chroma of very dark pixels is noise; excluded from the skin-tone region."
+    },
+    "hue_range_deg": {
+      "value": [0, 50],
+      "reason": "HSV hue window that real skin occupies; intersected with the YCbCr box to reject colours that only satisfy the chroma box (e.g. desaturated greens)."
+    },
+    "sat_range": {
+      "value": [0.1, 0.8],
+      "reason": "HSV saturation window of skin; excludes greys and fully saturated oranges."
+    }
+  },
+  "pair": {
+    "geometry_tolerance_px": {
+      "value": 0,
+      "reason": "CUDA and CPU frames of one clip at one scale must have identical active-area geometry; a different size means a different render or crop and the pair is GEOMETRY_MISMATCH, not a number. The fixture demo (downscaled thumbnails) overrides this explicitly and the override is written into the verdict."
+    },
+    "mismatch_channel_tolerance": {
+      "value": 3,
+      "reason": "A pixel is a MISMATCH when any channel differs by more than this many 8-bit codes. Float-on-GPU vs integer-on-CPU rounding across a chain of look stages lands within a few codes; larger differences are real stage differences."
+    },
+    "scopes": {
+      "shader-subset": {
+        "gated": {
+          "value": true,
+          "reason": "A3: the stages the display shader implements must match the CPU render tightly, so this scope GATES."
+        },
+        "mean_abs_delta_max": {
+          "value": 1.5,
+          "reason": "Per-channel mean absolute difference, 8-bit codes: rounding-level agreement."
+        },
+        "max_abs_delta_max": {
+          "value": null,
+          "reason": "Reported, not gated: a single outlier pixel (an edge, a hot pixel) dominates the maximum; mismatch_fraction_max gates instead."
+        },
+        "mismatch_fraction_max": {
+          "value": 0.02,
+          "reason": "At most 2% of pixels may differ by more than mismatch_channel_tolerance."
+        },
+        "ssim_min": {
+          "value": 0.985,
+          "reason": "Luma SSIM (Gaussian 11x11, sigma 1.5, K1=0.01, K2=0.03): two renders of the same stages should be structurally near-identical."
+        }
+      },
+      "full-look": {
+        "gated": {
+          "value": false,
+          "reason": "A3: REPORTED, not gated, until the CUDA display shader carries every look stage (L2 CUDA-LOOK-DISPLAY-STAGES-1). The verdict still says whether the shader-subset numbers would have been met."
+        },
+        "mean_abs_delta_max": {
+          "value": 1.5,
+          "reason": "Same reference numbers as shader-subset, shown so the gap to the gated bar is visible."
+        },
+        "max_abs_delta_max": {
+          "value": null,
+          "reason": "Reported only; see shader-subset."
+        },
+        "mismatch_fraction_max": {
+          "value": 0.02,
+          "reason": "Same reference number as shader-subset."
+        },
+        "ssim_min": {
+          "value": 0.985,
+          "reason": "Same reference number as shader-subset."
+        }
+      }
+    }
+  },
+  "slot_bias": {
+    "min_choices": {
+      "value": 6,
+      "reason": "Below 6 non-tie slot choices a binomial test cannot separate a biased judge from a coin; the tally reports INSUFFICIENT_N instead of a verdict on the judge."
+    },
+    "alpha": {
+      "value": 0.05,
+      "reason": "Two-sided exact binomial p-value below which a judge's left/right split is flagged as slot bias."
+    }
+  },
+  "judge_disagreement": {
+    "third_judge_points": {
+      "value": 1.0,
+      "reason": "DESIGN.md B4: two judges more than 1 rubric point apart (on any criterion, for any subject) need a third judge."
+    }
+  }
+}

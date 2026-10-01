@@ -20,3 +20,6 @@ tools/coordination/demote-factory-bridge.ps1 text eol=lf
 tools/coordination/set-required-checks.ps1 text eol=lf
 tools/coordination/Test-ProductRatioGuard.ps1 text eol=lf
 tools/coordination/freeze-factory-cards.py text eol=lf
+tools/profiling/look/judge_rubric.md text eol=lf
+tools/profiling/look/judge_rubric.lock.json text eol=lf
+tools/profiling/look/look_floor_config.json text eol=lf

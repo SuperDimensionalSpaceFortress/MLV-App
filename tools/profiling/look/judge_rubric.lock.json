@@ -1,0 +1,14 @@
+{
+  "schema": "mlv-app/look-rubric-lock/v1",
+  "rubricId": "look-rubric-v1",
+  "rubricFile": "judge_rubric.md",
+  "rubricSha256": "130ef3853657b63581acd6aacc4df162527ce6ea1117616d6c509a815261deed",
+  "criteria": [
+    "tonal_separation",
+    "highlight_rolloff",
+    "skin",
+    "colour_cast",
+    "scene_read"
+  ],
+  "note": "sha256 over the bytes of the rubric file with CRLF folded to LF (also pinned to LF by .gitattributes). A different digest is a different rubric: bump rubricId, re-lock, and re-judge from scratch."
+}
