@@ -834,8 +834,8 @@ function Get-VenueEvidenceReport {
             # A receipt file that cannot be placed in any leg withholds the whole card it could belong to.
             foreach ($b in $newest.cardWide) {
                 if (-not (Test-VeCardWideApplies -Barrier $b -Card $AcceptanceFor -Venues $acceptVenues -LegId $LegId)) { continue }
-                $withheld.Add([ordered]@{ legId = $(if ($b.legs) { $b.legs[0] } else { '*' }); backend = $null; lookFlavor = $null; subjectDigest = $null
-                        venue = $(if ($b.venues) { $b.venues[0] } else { '*' }); receiptId = $null; scope = 'CARD'
+                $withheld.Add([ordered]@{ legId = $(if ($b.legs) { @($b.legs)[0] } else { '*' }); backend = $null; lookFlavor = $null; subjectDigest = $null
+                        venue = $(if ($b.venues) { @($b.venues)[0] } else { '*' }); receiptId = $null; scope = 'CARD'
                         reason = $(if ($null -eq $b.finished) { 'UNORDERABLE_MALFORMED_RECEIPT' } else { 'UNKEYABLE_MALFORMED_RECEIPT' })
                         blockedBy = @($b.path); supersededSignal = @() })
             }

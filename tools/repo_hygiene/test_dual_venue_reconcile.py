@@ -1530,7 +1530,9 @@ class BarrierKeyingTests(_AcceptBase):
                 (self.root / CARD / LEG / BACH / "garbage.json").write_text("{ nope", encoding="utf-8")
                 proc, rep = self.acc()
                 self.assert_not_current(proc, rep, "UNORDERABLE_MALFORMED_RECEIPT")
-                self.assertEqual(rep["acceptance"]["withheld"][0]["scope"], "CARD")
+                w = rep["acceptance"]["withheld"][0]
+                self.assertEqual((w["scope"], w["legId"], w["venue"]), ("CARD", LEG, BACH))  # whole names, not first letters
+                self.assertIn("leg=%s" % LEG, self.run_tool("-AcceptanceFor", CARD).stdout)
 
     def test_an_unreadable_backend_makes_the_barrier_unkeyable_not_flavorless(self) -> None:
         self.put(make_receipt(venue=BACH, backend="cuda", outcome="PASS", finished=NEW))
