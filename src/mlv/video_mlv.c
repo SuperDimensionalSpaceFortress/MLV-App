@@ -6342,14 +6342,63 @@ static int mlv_preview_direct8_input_is_cheap(mlvObject_t * video, int normalize
     return 1;
 }
 
-/* The playback dispatch decision, exactly as getMlvProcessedFrame8Scaled makes
- * it (receipt capability AND input cheapness at the effective scale). Exposed so
- * the GPU display path can follow the CPU route instead of re-deriving it. */
-int mlvPreviewPlaybackUsesDirect8Route(mlvObject_t * video, int scaleFactor)
+/* The dispatch expression itself, evaluated in the CALLER's preview envelope:
+ * getMlvProcessedFrame8_with_scale uses it for the playback AND the export entry
+ * (export runs with preview mode off, where the input is always cheap). */
+static int mlv_dispatch_uses_direct8(mlvObject_t * video, int normalizedScale)
 {
-    const int normalizedScale = mlv_effective_playback_scale_factor(video, scaleFactor);
     return mlv_can_use_direct_processed_frame8_path(video)
         && mlv_preview_direct8_input_is_cheap(video, normalizedScale);
+}
+
+/* The playback dispatch decision, exactly as getMlvProcessedFrame8Scaled makes
+ * it (receipt capability AND input cheapness at the effective scale), plus the
+ * pre-camera clamp of the route that decision picks. Exposed so the GPU display
+ * path follows the CPU route instead of re-deriving it.
+ *
+ * It ESTABLISHES the playback-preview envelope itself (save, set, restore) the
+ * way getMlvProcessedFrame8_with_scale and the processed8 prefetch worker do:
+ * every engine entry that renders playback frames evaluates this gate with
+ * preview mode ON, playing or paused. The caller's thread-local envelope is
+ * irrelevant -- the GPU/CUDA host renders OutputDebayered16, where the render
+ * thread's PlaybackPreviewModeGuard leaves preview mode OFF, and the gate is
+ * unconditionally "cheap" in that state (mlv_preview_direct8_input_is_cheap).
+ *
+ * `phase3RawEntry` != 0: the frame would be rendered from Phase 3 decoded /
+ * reconstructed raw (getMlvProcessedFrame8ScaledFromRaw16 / ...FromReconnedRaw16).
+ * Those entries gate on receipt eligibility ALONE and only at scale > 1 (they
+ * return 0 at scale 1, handing the frame to getMlvProcessedFrame8Scaled), so at
+ * scale > 1 the cheapness gate does not apply to them -- a Dual ISO clip outside
+ * HQ recon is refused by the dispatch but takes direct8 through them. */
+int mlvPreviewPlaybackCpuRoute(mlvObject_t * video,
+                               int scaleFactor,
+                               int phase3RawEntry,
+                               int * preCameraClamp)
+{
+    const int previous_preview_mode = processingPlaybackPreviewModeEnabled();
+    const int previous_aggressive_preview_mode =
+        processingPlaybackAggressivePreviewModeEnabled();
+    const int previous_preview_scale_factor =
+        processingPlaybackPreviewScaleFactor();
+    const int normalizedScale = mlv_effective_playback_scale_factor(video, scaleFactor);
+    processingSetPlaybackPreviewMode(1);
+    processingSetPlaybackAggressivePreviewMode(mlvPlaybackAggressivePreviewMode());
+    processingSetPlaybackPreviewScaleFactor(normalizedScale);
+
+    const int direct8Route = (phase3RawEntry && normalizedScale > 1)
+        ? mlv_can_use_direct_processed_frame8_path(video)
+        : mlv_dispatch_uses_direct8(video, normalizedScale);
+    if (preCameraClamp)
+    {
+        *preCameraClamp = (video && video->processing)
+            ? processingCpuRoutePreCameraClamps(video->processing, direct8Route)
+            : 1;
+    }
+
+    processingSetPlaybackPreviewScaleFactor(previous_preview_scale_factor);
+    processingSetPlaybackAggressivePreviewMode(previous_aggressive_preview_mode);
+    processingSetPlaybackPreviewMode(previous_preview_mode);
+    return direct8Route;
 }
 
 /* Round-4 item 2: never let the direct8 kernel write the caller's buffer in
@@ -7295,7 +7344,7 @@ static void getMlvProcessedFrame8_with_scale(mlvObject_t * video,
     const int out_h  = (normalizedScale > 1) ? (full_h / normalizedScale) : full_h;
     uint64_t rgb_frame_size = (uint64_t)out_w * (uint64_t)out_h * 3u;
     uint16_t * processed_frame = NULL;
-    const int direct8PathActive = mlvPreviewPlaybackUsesDirect8Route(video, scaleFactor);
+    const int direct8PathActive = mlv_dispatch_uses_direct8(video, normalizedScale);
     /* Processed8 prefetch can run even when the foreground direct8 path
      * stays conservative; the worker only warms the cache and does not
      * change the pixels we present. */

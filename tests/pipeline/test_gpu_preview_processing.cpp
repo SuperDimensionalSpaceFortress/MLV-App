@@ -6,6 +6,7 @@
 #include "mlv_pipeline_fixture.h"
 
 #include "../../platform/qt/GpuPreviewProcessing.h"
+#include "../../platform/qt/GpuPreviewHostRoute.h"
 #include "../../src/processing/raw_processing.h"
 #include "../../src/debug/StageTiming.h"
 #include "../../src/batch/WorkerThreadCount.h"
@@ -14,6 +15,7 @@
 #include <QtGlobal>
 #include <algorithm>
 #include <array>
+#include <cctype>
 #include <cmath>
 #include <cstdlib>
 #include <cstring>
@@ -1322,6 +1324,54 @@ TEST(GpuPreviewProcessing, Direct8AnchoredLocalToneMatchesDirect8Route)
     }
 }
 
+/* The thread-local preview state, saved and restored around a test. */
+struct ThreadPreviewStateRestore
+{
+    int mode = processingPlaybackPreviewModeEnabled();
+    int aggressive = processingPlaybackAggressivePreviewModeEnabled();
+    int scale = processingPlaybackPreviewScaleFactor();
+    ~ThreadPreviewStateRestore()
+    {
+        processingSetPlaybackPreviewScaleFactor(scale);
+        processingSetPlaybackAggressivePreviewMode(aggressive);
+        processingSetPlaybackPreviewMode(mode);
+    }
+};
+
+/* The GUI-selected preview resolution (proxy level) and its env kill switch,
+ * restored on scope exit. -1 = Auto (the default), 0 = Full, 1 = Half. */
+struct ProxyLevelScope
+{
+    explicit ProxyLevelScope(int level)
+        : previousLevel(mlvPlaybackProxyLevel())
+        , hadEnv(qEnvironmentVariableIsSet("MLVAPP_DISABLE_HALFRES_X1_PREVIEW"))
+        , previousEnv(qgetenv("MLVAPP_DISABLE_HALFRES_X1_PREVIEW"))
+    {
+        qunsetenv("MLVAPP_DISABLE_HALFRES_X1_PREVIEW");
+        mlvSetPlaybackProxyLevel(level);
+    }
+    ~ProxyLevelScope()
+    {
+        mlvSetPlaybackProxyLevel(previousLevel);
+        if (hadEnv) qputenv("MLVAPP_DISABLE_HALFRES_X1_PREVIEW", previousEnv);
+    }
+    int previousLevel;
+    bool hadEnv;
+    QByteArray previousEnv;
+};
+
+/* Dual-ISO mode of the fixture clip, restored on scope exit. */
+struct DualIsoModeScope
+{
+    DualIsoModeScope(mlvObject_t * v, int mode) : video(v), previous(v->llrawproc->dual_iso)
+    {
+        llrpSetDualIsoMode(video, mode);
+    }
+    ~DualIsoModeScope() { llrpSetDualIsoMode(video, previous); }
+    mlvObject_t * video;
+    int previous;
+};
+
 /* Real clip frame through the whole direct8 render (getMlvProcessedFrame8 picks
  * direct8 for an eligible receipt outside preview mode) against the shader. The
  * tiny clip is dark, so this cross-checks the plumbing (debayer inputs, levels,
@@ -1342,7 +1392,11 @@ static void assert_real_frame_matches_direct8_render(const char * label,
 
     const std::vector<uint8_t> primed = fixture.renderFrame8(0, /*threads=*/1);
     ASSERT_TRUE(!primed.empty());
-    ASSERT_TRUE(mlvPreviewPlaybackUsesDirect8Route(fixture.video(), 1) != 0);
+    /* fixture.renderFrame8 is the unscaled (export / single-frame) entry: preview
+     * mode off, where the cheapness gate always passes, so an eligible receipt
+     * IS the direct8 render. (The playback route of this HQ Dual ISO clip is
+     * covered by the HostRoute* tests.) */
+    ASSERT_TRUE(processingCanUseDirect8BitOutput(processing) != 0);
 
     QString reason;
     GpuPreviewProcessingConfig config = gpuPreviewProcessingBuildConfig(processing, &reason);
@@ -1397,9 +1451,10 @@ static void reset_route_state(MlvPipelineFixture & fixture)
 
 TEST(GpuPreviewProcessing, CpuRouteSelectionMatchesEnginePredicates)
 {
-    /* The host (RenderFrameThread) passes the shader mvPreviewPlaybackUsesDirect8Route
-     * and gpuPreviewProcessingApplyCpuRoute turns it into the clamp flag. This pins
-     * both against the engine's own predicates over states the shader cannot render
+    /* The host (RenderFrameThread) asks the engine for its route through
+     * gpuPreviewHostCpuRoute, which also returns the clamp flag of that route.
+     * This pins both against the engine's own predicates over states the shader
+     * cannot render
      * (saturation, AgX, LUT, sharpen ...) -- there only the ROUTE is asserted, not
      * pixels, because those stages are not ported. */
     MlvPipelineFixture fixture;
@@ -1442,9 +1497,19 @@ TEST(GpuPreviewProcessing, CpuRouteSelectionMatchesEnginePredicates)
         {
             ::minitest::fail(__FILE__, __LINE__, "direct8 eligibility of " + label, "engine disagrees with the table");
         }
-        /* the playback dispatch predicate, outside preview mode (input always cheap) */
-        ASSERT_EQ(0, processingPlaybackPreviewModeEnabled());
-        ASSERT_EQ(direct8, mlvPreviewPlaybackUsesDirect8Route(fixture.video(), 1) != 0);
+        /* The host's route (gpuPreviewHostCpuRoute -- the real call-site code, the
+         * thread's preview mode left OFF as on the CUDA path) at preview
+         * resolution Full, where the cheapness gate passes: the route is exactly
+         * eligibility, and the flag it carries is the engine's for that route.
+         * The cheapness REFUSALS are the HostRoute* tests below. */
+        {
+            ThreadPreviewStateRestore restore;
+            processingSetPlaybackPreviewMode(0);
+            ProxyLevelScope full(0);
+            const GpuPreviewHostCpuRoute hostRoute = gpuPreviewHostCpuRoute(fixture.video(), 1, false);
+            ASSERT_EQ(direct8, hostRoute.direct8);
+            ASSERT_EQ(processingCpuRoutePreCameraClamps(processing, direct8 ? 1 : 0) != 0, hostRoute.preCameraClamp);
+        }
 
         for (const bool route : { true, false })
         {
@@ -1463,32 +1528,8 @@ TEST(GpuPreviewProcessing, CpuRouteSelectionMatchesEnginePredicates)
         }
     }
 
-    /* Preview mode: the cheapness gate may refuse direct8 (x1 reduced proxy,
-     * dual-ISO outside HQ recon) but never grants it to an ineligible receipt. */
-    struct PreviewModeRestore
-    {
-        ~PreviewModeRestore() { processingSetPlaybackPreviewMode(0); }
-    } previewModeRestore;
-    reset_route_state(fixture);
-    processingSetSharpening(fixture.processing(), 0.5);
-    processingSetPlaybackPreviewMode(1);
-    for (const int scale : { 1, 2, 4, 8 })
-    {
-        const int route = mlvPreviewPlaybackUsesDirect8Route(fixture.video(), scale);
-        std::cout << "[CPU-ROUTE] sharpen_neutral preview scale=" << scale << " direct8=" << route << "\n";
-        ASSERT_EQ(0, route);
-    }
-    processingSetSharpening(fixture.processing(), 0.0);
-    for (const int scale : { 1, 2, 4, 8 })
-    {
-        const bool routeDirect8 = mlvPreviewPlaybackUsesDirect8Route(fixture.video(), scale) != 0;
-        std::cout << "[CPU-ROUTE] eligible neutral preview scale=" << scale << " direct8=" << routeDirect8 << "\n";
-        GpuPreviewProcessingConfig config;
-        config.enabled = true;
-        gpuPreviewProcessingApplyCpuRoute(&config, fixture.processing(), routeDirect8);
-        /* neutral: direct8 -> unclamped; refused -> 16-bit basic-matrix branch -> unclamped too */
-        ASSERT_TRUE(!config.preCameraClamp);
-    }
+    /* The cheapness gate (x1 reduced proxy, dual-ISO outside HQ recon) and the
+     * route it picks at every preview resolution are the HostRoute* tests. */
 }
 
 /* S/H blur freshness per viewport route (fable r2
@@ -1575,6 +1616,64 @@ static std::vector<std::pair<std::string, std::string>> viewport_present_route_b
     return routes;
 }
 
+/* True when a route body (starting at its '{', comments and strings blanked)
+ * uploads or invalidates the S/H blur ON THE MAIN PATH (fable r1
+ * CUDA-LOOK-VIEWPORT-ROUTE-CONTRACT-PLACEMENT-1): at the function's top brace
+ * level (not inside an if / else / loop / lambda block), as a full statement
+ * (not the body of a brace-less if), and not after an unconditional top-level
+ * `return`. Conditional early-outs (a refused present) sit inside `if` blocks,
+ * so they do not count as a reason to move the call. */
+static bool blur_call_is_on_main_path(const std::string & body)
+{
+    static const std::string kCalls[] = { "gpuPreviewProcessingUpdateShadowsHighlightsBlurTexture(",
+                                          "gpuPreviewProcessingMarkShadowsHighlightsBlurStale(" };
+    auto isWordChar = [](char c) { return std::isalnum(static_cast<unsigned char>(c)) || c == '_'; };
+    int depth = 0;
+    bool unreachable = false;
+    char previous = '{';   /* previous non-space character */
+    for (size_t at = 0; at < body.size(); ++at)
+    {
+        const char c = body[at];
+        if (std::isspace(static_cast<unsigned char>(c))) continue;
+        const bool wordStart = isWordChar(c) && (at == 0 || !isWordChar(body[at - 1]));
+        if (depth == 1 && wordStart)
+        {
+            const bool statementStart = previous == ';' || previous == '{' || previous == '}';
+            if (statementStart && body.compare(at, 6, "return") == 0 && !isWordChar(body[at + 6]))
+            {
+                unreachable = true;
+            }
+            for (const std::string & call : kCalls)
+            {
+                if (body.compare(at, call.size(), call) == 0 && statementStart && !unreachable) return true;
+            }
+        }
+        if (c == '{') ++depth;
+        else if (c == '}') --depth;
+        previous = c;
+    }
+    return false;
+}
+
+TEST(GpuPreviewProcessing, ViewportRouteContractCheckerAcceptsOnlyTheMainPath)
+{
+    /* The checker's own mutation test: each placement fable r1 named as slipping
+     * past a substring search must now be rejected. */
+    const std::string stale = "gpuPreviewProcessingMarkShadowsHighlightsBlurStale(&m_lutSet);";
+    const std::string upload = "gpuPreviewProcessingUpdateShadowsHighlightsBlurTexture(m_lutSet, o, w, h);";
+    ASSERT_TRUE(blur_call_is_on_main_path("{ a(); " + stale + " update(); }"));
+    ASSERT_TRUE(blur_call_is_on_main_path("{ a(); " + upload + " return true; }"));
+    ASSERT_TRUE(blur_call_is_on_main_path("{ if (!p) { return false; } " + stale + " return true; }"));
+    ASSERT_TRUE(!blur_call_is_on_main_path("{ a(); update(); }"));
+    ASSERT_TRUE(!blur_call_is_on_main_path("{ if (false) { " + stale + " } }"));
+    ASSERT_TRUE(!blur_call_is_on_main_path("{ if (x) { " + upload + " } }"));
+    ASSERT_TRUE(!blur_call_is_on_main_path("{ if (x) " + stale + " }"));
+    ASSERT_TRUE(!blur_call_is_on_main_path("{ if (x) { a(); } else " + stale + " }"));
+    ASSERT_TRUE(!blur_call_is_on_main_path("{ return; " + stale + " }"));
+    ASSERT_TRUE(!blur_call_is_on_main_path("{ auto f = [&]() { " + stale + " }; f(); }"));
+    ASSERT_TRUE(!blur_call_is_on_main_path("{ for (;;) { " + stale + " break; } }"));
+}
+
 TEST(GpuPreviewProcessing, ViewportPresentRoutesNeverBindAStaleShadowsHighlightsBlur)
 {
     QString path = qEnvironmentVariable("MLVAPP_TEST_VIEWPORT_SOURCE"); /* red-first override */
@@ -1589,10 +1688,7 @@ TEST(GpuPreviewProcessing, ViewportPresentRoutesNeverBindAStaleShadowsHighlights
     for (const auto & route : routes)
     {
         names.push_back(route.first);
-        const bool uploadsBlur = route.second.find("gpuPreviewProcessingUpdateShadowsHighlightsBlurTexture(") != std::string::npos;
-        const bool marksStale = route.second.find("gpuPreviewProcessingMarkShadowsHighlightsBlurStale(") != std::string::npos
-            || route.second.find("shadowsHighlightsBlurReady = false") != std::string::npos;
-        if (!uploadsBlur && !marksStale) stale += " " + route.first;
+        if (!blur_call_is_on_main_path(route.second)) stale += " " + route.first;
     }
     for (const char * expected : { "setPresentedImage", "setPresentedRgb16", "setPresentedBayer16",
                                    "setPresentedGpuPlaybackReconTexture",
@@ -1607,8 +1703,9 @@ TEST(GpuPreviewProcessing, ViewportPresentRoutesNeverBindAStaleShadowsHighlights
     }
     if (!stale.empty())
     {
-        ::minitest::fail(__FILE__, __LINE__, "every viewport present route uploads or invalidates the S/H blur",
-                         "routes that do neither:" + stale);
+        ::minitest::fail(__FILE__, __LINE__,
+                         "every viewport present route uploads or invalidates the S/H blur on its main path",
+                         "routes without a top-level, reachable upload/invalidate statement:" + stale);
     }
     /* the one route that uploads must NOT also be marked stale afterwards */
     for (const auto & route : routes)
@@ -1618,6 +1715,397 @@ TEST(GpuPreviewProcessing, ViewportPresentRoutesNeverBindAStaleShadowsHighlights
             ASSERT_TRUE(route.second.find("gpuPreviewProcessingMarkShadowsHighlightsBlurStale(") == std::string::npos);
         }
     }
+}
+
+/* ---- CALL-SITE route tests (CUDA-PLAYBACK-LOOK-PARITY-2 round 2) ----
+ *
+ * The class these close: "the route the CUDA host hands the shader equals the
+ * route the CPU engine actually takes for the SAME clip, scale, settings AND
+ * playback/preview state". They drive gpuPreviewHostCpuRoute -- the header-only
+ * helper RenderFrameThread::drawFrame calls, nothing else -- with the thread's
+ * playback-preview state left the way the CUDA path leaves it (OFF: the frame is
+ * OutputDebayered16, where PlaybackPreviewModeGuard is not enabled), never by
+ * setting the preview mode by hand the way the predicate test above does. */
+
+/* One host answer, asserted against a hand-derived engine expectation, in the
+ * CUDA thread state (preview OFF) AND in the playback envelope the CPU render
+ * thread uses (preview ON): the answer must be the same and the thread's state
+ * must come back untouched. */
+static void assert_host_route(MlvPipelineFixture & fixture,
+                              const char * label,
+                              int scale,
+                              bool expectDirect8,
+                              bool expectPreCameraClamp,
+                              bool phase3Raw = false)
+{
+    ThreadPreviewStateRestore restore;
+    for (const int threadPreviewMode : { 0, 1 })
+    {
+        processingSetPlaybackPreviewMode(threadPreviewMode);
+        processingSetPlaybackAggressivePreviewMode(0);
+        processingSetPlaybackPreviewScaleFactor(scale);
+        const GpuPreviewHostCpuRoute route = gpuPreviewHostCpuRoute(fixture.video(), scale, phase3Raw);
+        std::cout << "[HOST-ROUTE] " << label << " scale=" << scale << " thread_preview=" << threadPreviewMode
+                  << " direct8=" << route.direct8 << " preCameraClamp=" << route.preCameraClamp << "\n";
+        if (route.direct8 != expectDirect8 || route.preCameraClamp != expectPreCameraClamp)
+        {
+            ::minitest::fail(__FILE__, __LINE__,
+                             std::string("host route for ") + label + " at x" + std::to_string(scale)
+                                 + " (thread preview mode " + std::to_string(threadPreviewMode) + ")",
+                             std::string("host says direct8=") + (route.direct8 ? "1" : "0")
+                                 + " clamp=" + (route.preCameraClamp ? "1" : "0")
+                                 + "; the engine takes direct8=" + (expectDirect8 ? "1" : "0")
+                                 + " clamp=" + (expectPreCameraClamp ? "1" : "0"));
+        }
+        ASSERT_EQ(threadPreviewMode, processingPlaybackPreviewModeEnabled());
+        ASSERT_EQ(0, processingPlaybackAggressivePreviewModeEnabled());
+        ASSERT_EQ(scale, processingPlaybackPreviewScaleFactor());
+    }
+}
+
+/* Vibrance-only on a direct8-eligible receipt: direct8 does not clamp before the
+ * camera matrix, the generic 16-bit loop does. */
+static void set_vibrance_only_receipt(MlvPipelineFixture & fixture)
+{
+    reset_route_state(fixture);
+    processingAllowCreativeAdjustments(fixture.processing());
+    processingSetVibrance(fixture.processing(), 1.03);
+    ASSERT_TRUE(processingCanUseDirect8BitOutput(fixture.processing()) != 0);
+}
+
+TEST(GpuPreviewProcessing, HostRouteFollowsTheEngineEnvelopeForHqDualIsoAtX1)
+{
+    /* fable r1 BLOCKER. The fixture clip is HQ Dual ISO. In the playback envelope
+     * the engine REFUSES direct8 at x1 while the reduced x1 proxy would engage
+     * (preview resolution Auto or Half) and takes it at Full; the host must
+     * report the engine's route, with the thread in the state the CUDA path
+     * leaves it. These are the cheapness-REFUSAL fixtures (sol H1): an eligible
+     * receipt whose route is the 16-bit loop only because of the cheapness gate,
+     * so dropping that term fails here. */
+    MlvPipelineFixture fixture;
+    assert_gpu_preview_fixture_ready(fixture);
+    set_vibrance_only_receipt(fixture);
+    ASSERT_TRUE(llrpHQDualIso(fixture.video()) != 0);
+
+    for (const int level : { -1, 1 })   /* Auto (the default) and Half */
+    {
+        ProxyLevelScope proxy(level);
+        assert_host_route(fixture, level < 0 ? "hq_dual_iso_vibrance_preview_auto" : "hq_dual_iso_vibrance_preview_half",
+                          1, /*direct8=*/false, /*clamp=*/true);
+    }
+    {
+        ProxyLevelScope proxy(0);   /* Full: no proxy, direct8 keeps its priority */
+        assert_host_route(fixture, "hq_dual_iso_vibrance_preview_full", 1, /*direct8=*/true, /*clamp=*/false);
+    }
+    {
+        ProxyLevelScope proxy(-1);  /* the x2 / x4 proxies are not what the gate refuses */
+        assert_host_route(fixture, "hq_dual_iso_vibrance_scaled", 2, /*direct8=*/true, /*clamp=*/false);
+        assert_host_route(fixture, "hq_dual_iso_vibrance_scaled", 4, /*direct8=*/true, /*clamp=*/false);
+    }
+}
+
+TEST(GpuPreviewProcessing, HostRouteRefusesDirect8ForDualIsoOutsideHqRecon)
+{
+    /* The second cheapness clause: Dual ISO clips outside HQ recon (preview
+     * processing, dual_iso == 2) are refused at every scale, even at preview
+     * resolution Full and for a receipt direct8 could otherwise run. */
+    MlvPipelineFixture fixture;
+    assert_gpu_preview_fixture_ready(fixture);
+    set_vibrance_only_receipt(fixture);
+    ASSERT_TRUE(fixture.video()->llrawproc->diso_validity != 0);
+
+    ProxyLevelScope proxy(0);
+    for (const int scale : { 1, 2, 4 })
+    {
+        assert_host_route(fixture, "hq_dual_iso_baseline", scale, /*direct8=*/true, /*clamp=*/false);
+    }
+    DualIsoModeScope previewRecon(fixture.video(), 2);
+    ASSERT_TRUE(llrpHQDualIso(fixture.video()) == 0);
+    for (const int scale : { 1, 2, 4 })
+    {
+        assert_host_route(fixture, "dual_iso_outside_hq_recon", scale, /*direct8=*/false, /*clamp=*/true);
+    }
+    /* ... but a frame the CPU renders from Phase 3 raw goes through the raw
+     * entries, which check eligibility alone and only at scale > 1: direct8 at
+     * x2 / x4 despite the refusal, and the dispatch (refusal) at x1. */
+    assert_host_route(fixture, "dual_iso_outside_hq_recon_phase3_raw", 1, /*direct8=*/false, /*clamp=*/true, /*phase3Raw=*/true);
+    for (const int scale : { 2, 4 })
+    {
+        assert_host_route(fixture, "dual_iso_outside_hq_recon_phase3_raw", scale,
+                          /*direct8=*/true, /*clamp=*/false, /*phase3Raw=*/true);
+    }
+}
+
+TEST(GpuPreviewProcessing, HostRouteForPhase3RawFramesFollowsTheRawEntriesNotTheDispatch)
+{
+    MlvPipelineFixture fixture;
+    assert_gpu_preview_fixture_ready(fixture);
+    set_vibrance_only_receipt(fixture);
+    ProxyLevelScope proxy(-1);
+    /* x1: the raw entries return 0 at scale 1 and the frame goes to the
+     * dispatch, whose cheapness gate refuses direct8 for HQ Dual ISO at Auto */
+    assert_host_route(fixture, "hq_dual_iso_phase3_raw", 1, /*direct8=*/false, /*clamp=*/true, /*phase3Raw=*/true);
+    /* x2 / x4: eligibility alone */
+    for (const int scale : { 2, 4 })
+    {
+        assert_host_route(fixture, "hq_dual_iso_phase3_raw", scale, /*direct8=*/true, /*clamp=*/false, /*phase3Raw=*/true);
+    }
+    /* an ineligible receipt is never direct8, raw entry or not (vibrance is still
+     * on, so the generic loop clamps) */
+    processingSetSharpening(fixture.processing(), 0.5);
+    for (const int scale : { 1, 2, 4 })
+    {
+        assert_host_route(fixture, "sharpen_vibrance_phase3_raw", scale, /*direct8=*/false, /*clamp=*/true, /*phase3Raw=*/true);
+    }
+}
+
+TEST(GpuPreviewProcessing, HostRouteForReceiptsDirect8CannotRunIsAlwaysTheSixteenBitLoop)
+{
+    MlvPipelineFixture fixture;
+    assert_gpu_preview_fixture_ready(fixture);
+    ProxyLevelScope proxy(0);
+
+    reset_route_state(fixture);
+    processingSetSharpening(fixture.processing(), 0.5);
+    for (const int scale : { 1, 2, 4 })
+    {
+        assert_host_route(fixture, "sharpen_neutral", scale, /*direct8=*/false, /*clamp=*/false); /* basic-matrix branch */
+    }
+    reset_route_state(fixture);
+    processingAllowCreativeAdjustments(fixture.processing());
+    processingSetVibrance(fixture.processing(), 1.2);
+    fixture.processing()->use_cam_matrix = 0;
+    for (const int scale : { 1, 2, 4 })
+    {
+        assert_host_route(fixture, "no_camera_matrix_vibrance", scale, /*direct8=*/false, /*clamp=*/true);
+    }
+    /* contrast: both routes clamp, so only the route differs */
+    reset_route_state(fixture);
+    processingAllowCreativeAdjustments(fixture.processing());
+    processingSetSimpleContrast(fixture.processing(), 0.2);
+    assert_host_route(fixture, "contrast_full_res", 1, /*direct8=*/true, /*clamp=*/true);
+    {
+        ProxyLevelScope previewAuto(-1);
+        assert_host_route(fixture, "contrast_preview_auto", 1, /*direct8=*/false, /*clamp=*/true);
+    }
+}
+
+TEST(GpuPreviewProcessing, HostRouteAndTelemetryComeFromTheSingleEngineCallSite)
+{
+    /* Every place in the Qt host that computes the route or the clamp flag must
+     * go through gpuPreviewHostCpuRoute (which asks the engine inside the
+     * playback-preview envelope). A second, local evaluation is exactly how the
+     * fable r1 blocker arose: the predicate ran with the render thread's own
+     * (CUDA: off) preview state. Pinned at the source, enumerating the host. */
+    const QStringList sources = { "platform/qt/RenderFrameThread.cpp", "platform/qt/MainWindow.cpp",
+                                  "platform/qt/GpuDisplayViewport.cpp", "platform/qt/GpuDisplayWindow.cpp",
+                                  "platform/qt/GpuPreviewProcessing.cpp", "platform/qt/GpuPreviewHostRoute.h" };
+    std::string offenders;
+    int helperCalls = 0;
+    for (const QString & path : sources)
+    {
+        QFile file(path);
+        ASSERT_TRUE(file.open(QIODevice::ReadOnly));
+        const std::string body = cpp_body_without_comments_and_strings(file.readAll().toStdString());
+        const bool isHelper = path.endsWith("GpuPreviewHostRoute.h");
+        const bool isProcessing = path.endsWith("GpuPreviewProcessing.cpp");
+        for (const char * forbidden : { "mlvPreviewPlaybackCpuRoute(",
+                                        "processingCpuRoutePreCameraClamps(", "gpuPreviewProcessingApplyCpuRoute(" })
+        {
+            if (body.find(forbidden) == std::string::npos) continue;
+            const std::string name(forbidden);
+            const bool allowed = (isHelper && name == "mlvPreviewPlaybackCpuRoute(")
+                || (isProcessing && (name == "processingCpuRoutePreCameraClamps(" || name == "gpuPreviewProcessingApplyCpuRoute("));
+            if (!allowed) offenders += " " + path.toStdString() + ":" + name;
+        }
+        if (!isHelper)
+        {
+            for (size_t at = body.find("gpuPreviewHostCpuRoute("); at != std::string::npos;
+                 at = body.find("gpuPreviewHostCpuRoute(", at + 1))
+            {
+                ++helperCalls;
+            }
+        }
+    }
+    if (!offenders.empty())
+    {
+        ::minitest::fail(__FILE__, __LINE__, "the Qt host evaluates the CPU route only through gpuPreviewHostCpuRoute",
+                         "direct evaluations outside the helper:" + offenders);
+    }
+    ASSERT_EQ(1, helperCalls);   /* the one call site: RenderFrameThread::drawFrame */
+
+    /* the telemetry keys read the engine's route (strings are blanked above) */
+    QFile raw(QStringLiteral("platform/qt/RenderFrameThread.cpp"));
+    ASSERT_TRUE(raw.open(QIODevice::ReadOnly));
+    const QString text = QString::fromUtf8(raw.readAll());
+    const int directAt = text.indexOf(QStringLiteral("QStringLiteral(\"gpu_preview_processing_cpu_route_direct8\")"));
+    ASSERT_TRUE(directAt > 0);
+    ASSERT_TRUE(text.mid(directAt, 160).contains(QStringLiteral("cpuRoute.direct8")));
+    /* the call site tells the engine whether the frame consumed Phase 3 raw */
+    const int callAt = text.indexOf(QStringLiteral("gpuPreviewHostCpuRoute("));
+    ASSERT_TRUE(callAt > 0);
+    ASSERT_TRUE(text.mid(callAt, 160).contains(QStringLiteral("decodedRawFrame != nullptr")));
+    const int clampAt = text.indexOf(QStringLiteral("QStringLiteral(\"gpu_preview_processing_pre_camera_clamp\")"));
+    ASSERT_TRUE(clampAt > 0);
+    ASSERT_TRUE(text.mid(clampAt, 160).contains(QStringLiteral("cpuRoute.preCameraClamp")));
+}
+
+/* ---- 16-bit-route and ineligible-state PIXEL cells (sol H1 / fable H2) ----
+ *
+ * Route chosen by the HOST helper, flag applied by the host helper, frame
+ * rendered by the display shader and by the engine route that helper named:
+ * direct8 -> applyProcessingObject8, otherwise apply_processing_object (the
+ * generic 16-bit loop). Both compared in 8-bit codes at the direct8 budget
+ * (tolerance 1 / max 3 / 0.1%). The shader does not render the unported stages
+ * (docs/cuda-playback-look-parity.md), so only renderable states are cells. */
+struct HostPixelCell
+{
+    const char * label;
+    double kelvin;
+    double tint;
+    double vibrance;       /* 1.0 = off */
+    double saturation;     /* 1.0 = off */
+    bool useCameraMatrix;
+    const int * flatLeveled; /* non-null: a flat leveled frame instead of the ramp */
+    double maxDiagonal;
+    int proxyLevel;        /* -1 Auto, 0 Full */
+    bool expectDirect8;
+    bool expectPreCameraClamp;
+    /* The DISPLAY shader does not render saturation (disclosed unported stage,
+     * docs/cuda-playback-look-parity.md). When set, the engine reference is the
+     * SAME route with the saturation stage neutralised -- on an in-range pixel,
+     * so the clamp cannot hide anything -- and the sat-on delta is printed as the
+     * boundary, not gated. The host's route and flag are asserted either way. */
+    bool saturationUnported = false;
+};
+
+static const int kInRangeLeveled[3] = { 20000, 30000, 25000 };   /* no WB over-range at 6500 K */
+
+static void run_host_pixel_cell(MlvPipelineFixture & fixture, const HostPixelCell & cell)
+{
+    reset_route_state(fixture);
+    processingObject_t * processing = fixture.processing();
+    processingAllowCreativeAdjustments(processing);
+    neutralize_unported_creative_stages(processing);
+    processingSetWhiteBalance(processing, cell.kelvin, cell.tint);
+    processingSetVibrance(processing, cell.vibrance);
+    processingSetSaturation(processing, cell.saturation);
+    processing->use_cam_matrix = cell.useCameraMatrix ? 1 : 0;
+    (void)fixture.renderDebayeredFrame16(0);
+
+    QString reason;
+    ASSERT_TRUE(gpuPreviewProcessingIsSupported(processing, &reason));
+    GpuPreviewProcessingConfig config = gpuPreviewProcessingBuildConfig(processing, &reason);
+    ASSERT_TRUE(config.enabled);
+    ASSERT_TRUE(config.useCameraMatrix == cell.useCameraMatrix);
+
+    ThreadPreviewStateRestore restore;
+    processingSetPlaybackPreviewMode(0);   /* the CUDA render thread's state */
+    ProxyLevelScope proxy(cell.proxyLevel);
+    const GpuPreviewHostCpuRoute route = gpuPreviewHostCpuRoute(fixture.video(), 1, false);
+    gpuPreviewHostApplyCpuRoute(&config, route);
+    std::cout << "[HOST-PIXEL] " << cell.label << " host direct8=" << route.direct8
+              << " preCameraClamp=" << route.preCameraClamp << "\n";
+    ASSERT_EQ(cell.expectDirect8, route.direct8);
+    ASSERT_EQ(cell.expectPreCameraClamp, route.preCameraClamp);
+
+    int width = 0;
+    int height = 0;
+    const std::vector<uint16_t> frame = cell.flatLeveled
+        ? make_flat_leveled_frame(processing, cell.flatLeveled, &width, &height)
+        : make_synthetic_ramp_frame(processing, cell.maxDiagonal, &width, &height);
+
+    auto engineOnRoute = [&]() {
+        return route.direct8
+            ? run_direct8_engine_on_frame(processing, frame, width, height)
+            : engine16_as_8bit(run_production_engine_on_frame(processing, frame, width, height));
+    };
+    std::vector<uint8_t> engine8 = engineOnRoute();
+    if (cell.saturationUnported)
+    {
+        ASSERT_EQ(size_t(0), count_wb_overrange_samples(processing, frame)); /* the clamp cannot hide the stage */
+        const DisplayVsEngine8Result boundary = compare_display_with_engine8(config, frame, engine8, width, height);
+        std::cout << "[UNPORTED-BOUNDARY] " << cell.label << " saturation stage (display shader skips it): "
+                  << boundary.summary << "\n";
+        processingSetSaturation(processing, 1.0);
+        engine8 = engineOnRoute();
+    }
+    const std::string label = std::string("host_") + cell.label + (route.direct8 ? ".direct8" : ".as16bit");
+    assert_gpu_display_matches_direct8_engine(label.c_str(), config, frame, engine8, width, height);
+}
+
+TEST(GpuPreviewProcessing, HostRoutedSixteenBitPixelCellsMatchTheEngineWithinOneCode)
+{
+    /* The 16-bit route is what CUDA playback of an HQ Dual ISO clip at preview
+     * resolution Auto runs on the CPU. fable r1 repro: leveled [27000,61000,
+     * 60000], vibrance 1.03, contrast 0, S/H 0, WB 6500 -- the generic loop
+     * clamps before the camera matrix (the round-1 shader did not on this route
+     * and was 6 codes off). */
+    MlvPipelineFixture fixture;
+    assert_gpu_preview_fixture_ready(fixture);
+    static const HostPixelCell kCells[] = {
+        /* label                          K      tint  vib   sat   cam    flat            ramp      proxy direct8 clamp */
+        { "fable_r1_vibrance_pixel_6500K", 6500.0,  0.0, 1.03, 1.00, true,  kSolR2LeveledB, 0.0,      -1, false, true },
+        { "sol_r2_pixel_a_vibrance_6500K", 6500.0,  0.0, 1.03, 1.00, true,  kSolR2LeveledA, 0.0,      -1, false, true },
+        { "vibrance_ramp_wb6500",          6500.0,  0.0, 1.03, 1.00, true,  nullptr,        130000.0, -1, false, true },
+        { "vibrance_big_ramp_wb2500",      2500.0, 30.0, 1.30, 1.00, true,  nullptr,        130000.0, -1, false, true },
+        /* saturation-only: the stage itself is unported (see HostPixelCell) */
+        { "saturation_only_inrange_up",    6500.0,  0.0, 1.00, 1.25, true,  kInRangeLeveled, 0.0,     -1, false, true,  true },
+        { "saturation_only_inrange_down",  6500.0,  0.0, 1.00, 0.70, true,  kInRangeLeveled, 0.0,     -1, false, true,  true },
+        { "no_camera_matrix_vibrance",     6500.0,  0.0, 1.20, 1.00, false, nullptr,        130000.0, -1, false, true },
+        { "no_camera_matrix_vibrance_px",  6500.0,  0.0, 1.20, 1.00, false, kSolR2LeveledB, 0.0,      -1, false, true },
+        /* neutral: the 16-bit loop's basic-matrix branch does not clamp */
+        { "neutral_ramp_wb6500_16bit",     6500.0,  0.0, 1.00, 1.00, true,  nullptr,        130000.0, -1, false, false },
+        /* the same states at preview resolution Full are the direct8 route */
+        { "fable_r1_vibrance_pixel_full",  6500.0,  0.0, 1.03, 1.00, true,  kSolR2LeveledB, 0.0,       0, true,  false },
+        { "saturation_only_inrange_full",  6500.0,  0.0, 1.00, 1.25, true,  kInRangeLeveled, 0.0,      0, true,  false, true },
+    };
+    for (const HostPixelCell & cell : kCells)
+    {
+        run_host_pixel_cell(fixture, cell);
+    }
+}
+
+TEST(GpuPreviewProcessing, LutTextureCacheKeyIncludesTheRawLutsWithoutMovingTheSignature)
+{
+    /* fable r1 CUDA-LOOK-RAW-LUT-SIGNATURE-UNCLAMPED-ROUTE-1. For a neutral
+     * receipt `signature` does not hash the unclamped (raw) diagonal LUTs (that
+     * would move the pinned golden signatures), so two configs whose clamped
+     * LUTs agree and raw LUTs differ share a signature. The texture cache must
+     * still tell them apart, because the unclamped route feeds the raw LUT
+     * straight into the camera matrix. */
+    MlvPipelineFixture fixture;
+    assert_gpu_preview_fixture_ready(fixture);
+    reset_route_state(fixture);
+    QString reason;
+    const GpuPreviewProcessingConfig base = gpuPreviewProcessingBuildConfig(fixture.processing(), &reason);
+    ASSERT_TRUE(base.enabled);
+    ASSERT_TRUE(!base.applyInLoopContrast && !base.applyShadowsHighlights);
+    ASSERT_TRUE(base.rawLutSignature != 0);
+    ASSERT_EQ(base.rawLutSignature, gpuPreviewProcessingRawLutSignature(base));
+
+    GpuPreviewProcessingConfig other = base;
+    ASSERT_TRUE(other.matrixLutRawG.size() > 64);
+    other.matrixLutRawG.data()[64] ^= 0x01;   /* a raw LUT the clamped LUTs do not see */
+    other.rawLutSignature = gpuPreviewProcessingRawLutSignature(other);
+    ASSERT_EQ(base.signature, other.signature);                   /* the old key cannot tell them apart ... */
+    ASSERT_TRUE(base.rawLutSignature != other.rawLutSignature);   /* ... the new one can */
+
+    GpuPreviewProcessingLutTextureSet set;
+    set.signatureValid = true;
+    set.signature = base.signature;
+    set.rawLutSignature = base.rawLutSignature;
+    ASSERT_TRUE(gpuPreviewProcessingLutTextureSetKeyMatches(set, base));
+    ASSERT_TRUE(!gpuPreviewProcessingLutTextureSetKeyMatches(set, other));
+    set.signatureValid = false;
+    ASSERT_TRUE(!gpuPreviewProcessingLutTextureSetKeyMatches(set, base));
+
+    /* a real raw-LUT change reaches the key: a degenerate (negative-gain) tint */
+    processingSetWhiteBalance(fixture.processing(), 10000.0, -30.0);
+    (void)fixture.renderDebayeredFrame16(0);
+    const GpuPreviewProcessingConfig tinted = gpuPreviewProcessingBuildConfig(fixture.processing(), &reason);
+    ASSERT_TRUE(tinted.enabled);
+    ASSERT_TRUE(tinted.rawLutSignature != base.rawLutSignature);
 }
 
 TEST(GpuPreviewProcessing, MarkShadowsHighlightsBlurStaleClearsOnlyTheReadyFlag)

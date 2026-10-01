@@ -2310,6 +2310,7 @@ void gpuPreviewProcessingDestroyLutTextureSet(GpuPreviewProcessingLutTextureSet 
     set.contrastCurve = nullptr;
     set.shadowsHighlightsCurve = nullptr;
     set.signature = 0;
+    set.rawLutSignature = 0;
     set.signatureValid = false;
     /* The blur texture is per-frame content, tracked independently of
      * signature -- destroyed here too since the whole set (and its GL
@@ -2334,8 +2335,7 @@ void gpuPreviewProcessingUpdateLutTextureSet(GpuPreviewProcessingLutTextureSet &
         gpuPreviewProcessingDestroyLutTextureSet(set);
         return;
     }
-    if ( set.signatureValid
-      && set.signature == config.signature
+    if ( gpuPreviewProcessingLutTextureSetKeyMatches(set, config)
       && set.levels && set.matrixR && set.matrixG && set.matrixB && set.gamma
       && set.contrastCurve && set.shadowsHighlightsCurve )
     {
@@ -2438,7 +2438,16 @@ void gpuPreviewProcessingUpdateLutTextureSet(GpuPreviewProcessingLutTextureSet &
     }
 
     set.signature = config.signature;
+    set.rawLutSignature = config.rawLutSignature;
     set.signatureValid = true;
+}
+
+bool gpuPreviewProcessingLutTextureSetKeyMatches(const GpuPreviewProcessingLutTextureSet & set,
+                                                 const GpuPreviewProcessingConfig & config)
+{
+    return set.signatureValid
+        && set.signature == config.signature
+        && set.rawLutSignature == config.rawLutSignature;
 }
 
 bool gpuPreviewProcessingLutTextureSetReady(const GpuPreviewProcessingLutTextureSet & set,
@@ -3089,10 +3098,12 @@ GpuPreviewProcessingConfig gpuPreviewProcessingBuildConfig(
     hash = fnv1a64_append(hash, &config.applyVignette, sizeof(config.applyVignette));
     hash = fnv1a64_append(hash, &config.vignetteStrength, sizeof(config.vignetteStrength));
     hash = fnv1a64_append(hash, config.vignetteMask.constData(), static_cast<size_t>(config.vignetteMask.size()));
-    /* The unclamped diagonal-matrix LUTs only change the picture when contrast or
-     * shadows/highlights multiply them before the 16-bit clamp. Hashing them
-     * only then keeps every other config's signature (and the pinned golden
-     * signatures) exactly as it was. */
+    /* The unclamped diagonal-matrix LUTs change the picture through contrast or
+     * shadows/highlights (which multiply them before the 16-bit clamp). Hashing
+     * them only then keeps every other config's signature (and the pinned golden
+     * signatures) exactly as it was. They ALSO reach the camera matrix directly on
+     * the unclamped CPU route, so the texture caches additionally key on
+     * config.rawLutSignature (set below), which is not part of `signature`. */
     if ( config.applyInLoopContrast || config.applyShadowsHighlights )
     {
         hash = fnv1a64_append(hash, config.matrixLutRawR.constData(), static_cast<size_t>(config.matrixLutRawR.size()));
@@ -3142,7 +3153,17 @@ GpuPreviewProcessingConfig gpuPreviewProcessingBuildConfig(
     hash = fnv1a64_append(hash, config.gradationLutG.constData(), static_cast<size_t>(config.gradationLutG.size()));
     hash = fnv1a64_append(hash, config.gradationLutB.constData(), static_cast<size_t>(config.gradationLutB.size()));
     config.signature = hash;
+    config.rawLutSignature = gpuPreviewProcessingRawLutSignature(config);
     return config;
+}
+
+uint64_t gpuPreviewProcessingRawLutSignature(const GpuPreviewProcessingConfig & config)
+{
+    uint64_t hash = 1469598103934665603ull;
+    hash = fnv1a64_append(hash, config.matrixLutRawR.constData(), static_cast<size_t>(config.matrixLutRawR.size()));
+    hash = fnv1a64_append(hash, config.matrixLutRawG.constData(), static_cast<size_t>(config.matrixLutRawG.size()));
+    hash = fnv1a64_append(hash, config.matrixLutRawB.constData(), static_cast<size_t>(config.matrixLutRawB.size()));
+    return hash;
 }
 
 bool gpuPreviewProcessingNeedsShadowsHighlightsFrameState(

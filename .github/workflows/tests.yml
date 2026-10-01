@@ -532,7 +532,7 @@ jobs:
           $glDll = Join-Path $env:QT_ROOT_DIR "bin\opengl32sw.dll"
           if (-not (Test-Path -LiteralPath $glDll)) { throw "opengl32sw.dll missing from the Qt install ($glDll); display parity cannot run" }
           Copy-Item -LiteralPath $glDll -Destination (Split-Path $exe) -Force
-          $filter = 'GpuPreviewProcessing.EngineAnchored*:GpuPreviewProcessing.DisplayShaderContrastPivotMatchesProductionEngine:GpuPreviewProcessing.DisplayShaderVibranceMatchesProductionEngine:GpuPreviewProcessing.DisplayShaderShadowsHighlightsMatchesProductionEngine:GpuPreviewProcessing.DisplayShaderCombinedLookAssistPresetMatchesProductionEngine:GpuPreviewProcessing.Direct8Anchored*:GpuPreviewProcessing.ShadowsHighlightsKillSwitchBypassRestoresPreFixLook'
+          $filter = 'GpuPreviewProcessing.EngineAnchored*:GpuPreviewProcessing.DisplayShaderContrastPivotMatchesProductionEngine:GpuPreviewProcessing.DisplayShaderVibranceMatchesProductionEngine:GpuPreviewProcessing.DisplayShaderShadowsHighlightsMatchesProductionEngine:GpuPreviewProcessing.DisplayShaderCombinedLookAssistPresetMatchesProductionEngine:GpuPreviewProcessing.Direct8Anchored*:GpuPreviewProcessing.HostRoute*:GpuPreviewProcessing.ShadowsHighlightsKillSwitchBypassRestoresPreFixLook'
           $outputPath = Join-Path $env:RUNNER_TEMP "pipeline-tests-display-parity.txt"
           $psi = [System.Diagnostics.ProcessStartInfo]::new()
           $psi.FileName = $exe
@@ -558,8 +558,8 @@ jobs:
           $summary = [regex]::Match($combined, '\[SUMMARY\] tests=(\d+) assertions=\d+ skipped=(\d+) failed=(\d+)')
           if (-not $summary.Success) { throw "display parity: no [SUMMARY] line in the output" }
           if ([int]$summary.Groups[2].Value -ne 0 -or [int]$summary.Groups[3].Value -ne 0) { throw "display parity: skipped or failed tests in the summary" }
-          if ([int]$summary.Groups[1].Value -lt 16) { throw "display parity ran only $($summary.Groups[1].Value) tests; expected at least 16" }
-          if (([regex]::Matches($combined, '\[DIRECT8-PARITY\]')).Count -lt 20) { throw "display parity: fewer than 20 direct8 comparisons were recorded" }
+          if ([int]$summary.Groups[1].Value -lt 22) { throw "display parity ran only $($summary.Groups[1].Value) tests; expected at least 22" }
+          if (([regex]::Matches($combined, '\[DIRECT8-PARITY\]')).Count -lt 36) { throw "display parity: fewer than 36 direct8 comparisons were recorded" }
 
       - name: Upload pipeline crash forensics
         if: always() && needs.protected-check-route.outputs.product == 'true'

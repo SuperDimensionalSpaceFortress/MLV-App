@@ -2069,7 +2069,9 @@ void GpuDisplayViewport::setPresentationOptions(const PresentationOptions &optio
     const bool processingSignatureChanged =
         m_presentationOptions.previewProcessing.enabled != options.previewProcessing.enabled
         || m_presentationOptions.previewProcessing.signature
-            != options.previewProcessing.signature;
+            != options.previewProcessing.signature
+        || m_presentationOptions.previewProcessing.rawLutSignature
+            != options.previewProcessing.rawLutSignature;
     m_samplingModeDirty = m_samplingModeDirty || samplingChanged;
     if ( processingSignatureChanged )
     {

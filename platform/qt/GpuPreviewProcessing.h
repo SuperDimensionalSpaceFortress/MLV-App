@@ -113,7 +113,17 @@ struct GpuPreviewProcessingConfig
     QByteArray hueVsLumaCurve;
     QByteArray lumaVsSaturationCurve;
     uint64_t signature = 0;
+    /* The unclamped diagonal-matrix LUTs (matrixLutRaw*) feed the camera matrix
+     * directly on the unclamped CPU route (preCameraClamp == false), whatever the
+     * contrast / shadows-highlights state, and are uploaded in the matrix LUT
+     * textures. `signature` hashes them only when contrast or S/H is on (so the
+     * pinned golden signatures never move), so the TEXTURE caches key on this
+     * second hash as well; see gpuPreviewProcessingRawLutSignature. */
+    uint64_t rawLutSignature = 0;
 };
+
+/* Hash of the three unclamped matrix LUTs, always (not gated like `signature`). */
+uint64_t gpuPreviewProcessingRawLutSignature(const GpuPreviewProcessingConfig & config);
 
 const char * gpuPreviewProcessingEnvironmentVariableName(void);
 bool gpuPreviewProcessingRequestedByEnvironment(void);
@@ -155,9 +165,10 @@ bool gpuPreviewProcessingHasShadowsHighlightsFrameState(
     int height);
 /* Declares the DISPLAY PARITY REFERENCE: the display shader reproduces the CPU
  * preview route for the current state. direct8Route is the engine's own
- * dispatch decision (mlvPreviewPlaybackUsesDirect8Route: direct8-eligible AND
- * input cheap at the playback scale); the clamp flag is then asked of the
- * engine (processingCpuRoutePreCameraClamps), never re-derived here. */
+ * route decision (mlvPreviewPlaybackCpuRoute, reached through
+ * gpuPreviewHostCpuRoute: direct8-eligible AND input cheap at the playback
+ * scale); the clamp flag is then asked of the engine
+ * (processingCpuRoutePreCameraClamps), never re-derived here. */
 void gpuPreviewProcessingApplyCpuRoute(GpuPreviewProcessingConfig * config,
                                        const processingObject_t * processing,
                                        bool direct8Route);
@@ -219,6 +230,7 @@ struct GpuPreviewProcessingLutTextureSet
     QOpenGLTexture * contrastCurve = nullptr;
     QOpenGLTexture * shadowsHighlightsCurve = nullptr;
     uint64_t signature = 0;
+    uint64_t rawLutSignature = 0;   /* config.rawLutSignature the matrix textures were built from */
     bool signatureValid = false;
     /* The shadows/highlights BLUR texture is per-FRAME content (the spatial
      * low-pass of the current frame), not per-settings-signature, so it is
@@ -266,6 +278,10 @@ void gpuPreviewProcessingDestroyLutTextureSet(GpuPreviewProcessingLutTextureSet 
  * false. Safe to call every frame. */
 void gpuPreviewProcessingUpdateLutTextureSet(GpuPreviewProcessingLutTextureSet & set,
                                              const GpuPreviewProcessingConfig & config);
+/* True when the set was built from exactly this config's LUT content: both
+ * `signature` and `rawLutSignature` match (the texture cache key). */
+bool gpuPreviewProcessingLutTextureSetKeyMatches(const GpuPreviewProcessingLutTextureSet & set,
+                                                 const GpuPreviewProcessingConfig & config);
 bool gpuPreviewProcessingLutTextureSetReady(const GpuPreviewProcessingLutTextureSet & set,
                                             const GpuPreviewProcessingConfig & config);
 /* CUDA-PLAYBACK-LOOK-PARITY-1: uploads/refreshes the per-frame shadows/

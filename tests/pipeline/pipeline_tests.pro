@@ -131,6 +131,7 @@ HEADERS += \
     $$REPO_ROOT/src/debug/StageTimingCsvSink.h \
     $$REPO_ROOT/platform/qt/GpuDebayer.h \
     $$REPO_ROOT/platform/qt/GpuPreviewProcessing.h \
+    $$REPO_ROOT/platform/qt/GpuPreviewHostRoute.h \
     $$REPO_ROOT/tests/pipeline/ojph_decoder_test_stub.h \
     $$REPO_ROOT/tests/pipeline/mlv_pipeline_fixture.h \
     $$REPO_ROOT/tests/pipeline/backend_parametric_fixture.h \

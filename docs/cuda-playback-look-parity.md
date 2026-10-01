@@ -69,15 +69,11 @@ at the current scale** — the direct-8-bit kernel when the receipt is eligible 
 ### What the shader does now
 
 `GpuPreviewProcessingConfig::preCameraClamp` (uniform `previewPreCameraClamp`) selects the
-behaviour per frame. The host does **not** re-derive the predicates:
-`RenderFrameThread` asks `mlvPreviewPlaybackUsesDirect8Route(video, playbackScale)` — the exact
-`can_use_direct8 && input_is_cheap(effective scale)` expression `getMlvProcessedFrame8Scaled`
-dispatches on, factored out of it — and `gpuPreviewProcessingApplyCpuRoute` turns that into the flag
-through `processingCpuRoutePreCameraClamps(processing, direct8Route)` in `raw_processing.c`, which
-reads the same terms as the kernel (direct8: `AgX || contrast || S/H`) and the same predicate as the
-fast branch (generic: `!(basic-matrix && !AgX)`). The flag is applied per frame (the route depends
-on scale and input, which the cached config cannot know) and is recorded in telemetry as
-`gpu_preview_processing_cpu_route_direct8` / `gpu_preview_processing_pre_camera_clamp`.
+behaviour per frame. The host does **not** re-derive the predicates: `RenderFrameThread` calls
+`gpuPreviewHostCpuRoute`, which asks the engine for the route and the flag, per frame (the route
+depends on scale and input); telemetry `gpu_preview_processing_cpu_route_direct8` /
+`..._pre_camera_clamp`. Contract, states, Phase 3, tests:
+[cuda-playback-look-parity-route.md](cuda-playback-look-parity-route.md).
 
 - clamped route: `pix = floor(clamp(diagonal * expo, 0, 65535))`, gamma index `floor(clamp(pix))`
   (as before);
@@ -96,12 +92,13 @@ off and on), a bare pivot, vibrance 1.03 / 1.60 / 0.70 at 6500 K, 2500 K tint +3
 sol r2's two repro pixels, sol r1 / fable r1's pixels with vibrance and with contrast, contrast
 alone (three settings, three WBs), shadows alone, highlights alone, both, contrast + vibrance, the
 night preset at 3000 K and 6500 K (the S/H blur is the kernel's own, attached the way production
-attaches it), and two real-clip frames through the whole direct8 render. 27 comparisons, all within
-1 code of direct8 (the 16-bit comparisons within the old budget).
+attaches it), and two real-clip frames through the whole direct8 render. 38 `[DIRECT8-PARITY]`
+comparisons across the step's tests, all within 1 code of the route they name (the 16-bit
+comparisons of the older cells within the old budget).
 `CpuRouteSelectionMatchesEnginePredicates` pins, over states the shader cannot render
 (saturation, AgX, sharpen, LUT, filter, grain, no camera matrix), that the host's route choice and
-the clamp flag equal what the engine source says, and that the playback dispatch never grants
-direct8 to an ineligible receipt in preview mode.
+the clamp flag equal what the engine source says; the `HostRoute*` tests pin the cheapness
+refusals and the call site.
 
 **Red-first.** `Direct8AnchoredLegacyUnconditionalClampIsDetected` forces `preCameraClamp = true`
 (exactly the shader of #212 at 8e928529) on sol r2's second repro and requires the direct8
@@ -141,12 +138,11 @@ runner that has only that GL skipped everything. Now: every display-parity test 
 subset probe says), FAILS when it does not render on a backend the probe calls working, and, when
 nothing renders, SKIPS on a developer box but FAILS if `MLVAPP_REQUIRE_DISPLAY_PARITY_GL=1`.
 The Product Oracles job has a dedicated step, "Display parity (software GL required, never
-skipped)", that forces `QT_OPENGL=software` with that variable set, runs the 6 engine-anchored, 4 real-frame
-and 5 direct8-anchored tests plus the kill-switch render test (16), and fails on any skip,
-failure, fewer than 16 tests or fewer than 20 direct8 comparisons. The same configuration (Qt's
-`opengl32sw.dll`, `QT_OPENGL=software`) was run locally: 12 tests / 673 assertions / 0 skipped /
-0 failed, about 2 minutes. The existing shards still run these tests without forcing a GL (they
-skip where there is none); the new step is what proves they ran.
+skipped)", that forces `QT_OPENGL=software` with that variable set, runs the engine-anchored,
+real-frame, direct8-anchored and `HostRoute*` tests plus the kill-switch render test (22), and fails
+on any skip, failure, fewer than 22 tests or fewer than 36 direct8 comparisons. The same
+configuration (Qt's `opengl32sw.dll`, `QT_OPENGL=software`) was run locally: 22 tests / 1040
+assertions / 0 skipped / 0 failed. The shards still skip where there is no GL; the new step proves the tests ran.
 
 ## The two shaders
 
@@ -248,8 +244,7 @@ differs from the S/H-applied frame. The per-frame eligibility terms (texture-pre
    `config.enabled && config.applyShadowsHighlights` — flips `gpuTexNrDisplayLutOnlyShStateBypass`
    off whenever S/H is actually requested, so the existing fast-blur computation's result reaches
    `slot.presentationContext.gpuPreviewProcessingConfig.shadowsHighlightsBlur`.
-2. `gpuPreviewProcessingDisplayFragmentShaderSource` gained the exact GLSL port (byte-identical
-   formulas, ported verbatim) of:
+2. `gpuPreviewProcessingDisplayFragmentShaderSource` gained a GLSL port of:
    - the SUBSET shader's `previewApplyInLoopContrast` branch (contrast+pivot, luma-weighted
      `(R*4+G*11+B)/16` multiply against `inLoopContrastCurve`), applied to `matrixApplied`
      pre-gamma, in the same relative position as the SUBSET shader (before the WB/gamut step);
@@ -432,7 +427,7 @@ pivot 0.46, leveled `[27000,61000,43000]`) gave GLSL `[64090,64346,64293]` again
   signature, and the pinned golden signatures, are unchanged.
 - The matrix LUT textures carry the raw value in G/B (`raw + 2^20 = G + 65536*B`); R stays the
   16-bit clamped value, so nothing that reads `.r` changed. `sampleMatrixRaw` rebuilds it.
-- Display shader (and the offscreen subset shader, which shares the code): contrast and S/H luma from
+- Display shader (not the subset shader): contrast and S/H luma from
   the raw diagonal; one `expoCorrection`; `pix = floor(clamp(diagonal * expoCorrection, 0, 65535))`;
   camera matrix and gamut compression in code units; `gammaIndex = floor(clamp(pix, 0, 65535))` and a
   gamma read by integer index (the engine truncates, the round-1 shader rounded the index);
@@ -559,8 +554,7 @@ LUT-boundary rounding; no other cause is claimed.
 
 - `src/processing/raw_processing.c` / `.h` — `processingCpuRoutePreCameraClamps` (reads the direct8
   kernel's and the basic-matrix branch's own predicates).
-- `src/mlv/video_mlv.c` / `.h` — `mlvPreviewPlaybackUsesDirect8Route`, the playback dispatch
-  predicate factored out of `getMlvProcessedFrame8Scaled` (which now calls it).
+- `src/mlv/video_mlv.c` / `.h` — `mlvPreviewPlaybackCpuRoute`; `platform/qt/GpuPreviewHostRoute.h`.
 - `platform/qt/GpuPreviewProcessing.h` / `.cpp` — `preCameraClamp`, `previewPreCameraClamp` uniform and
   the display shader's two route-dependent lines, `gpuPreviewProcessingApplyCpuRoute`,
   `gpuPreviewProcessingMarkShadowsHighlightsBlurStale`.
