@@ -11,6 +11,7 @@
 #include "GpuDebayer.h"
 #include "Phase3Breadcrumbs.h"
 #include "PlaybackFrameRange.h"
+#include "GpuPreviewHostRoute.h"
 #include "PlaybackQualityPolicy.h"
 #include "ReconWorker.h"
 
@@ -591,15 +592,18 @@ bool gpuPlaybackReconFastShadowsHighlightsFrameStateEnabled()
     return enabled;
 }
 
-bool gpuPlaybackReconDisplayLutOnlySkipShadowsHighlightsFrameStateEnabled()
+/* MLVAPP_GPU_TEX_NR_DISPLAY_LUT_ONLY_SKIP_SH_STATE: unset = default (S/H applied
+ * by the display shader), "0" = never bypass, anything else = KILL SWITCH that
+ * forces the S/H frame-state bypass. The decision itself lives in
+ * gpuPreviewProcessingDisplayShadowsHighlightsFrameStateBypassed so the pipeline
+ * tests exercise the same function (CUDA-PLAYBACK-LOOK-PARITY-1-LAND r2). */
+bool gpuPlaybackReconDisplayShadowsHighlightsFrameStateBypassed(
+    const GpuPreviewProcessingConfig & config)
 {
-    static const bool enabled =
-        !qEnvironmentVariableIsSet(
-            "MLVAPP_GPU_TEX_NR_DISPLAY_LUT_ONLY_SKIP_SH_STATE" )
-        || qEnvironmentVariable(
-               "MLVAPP_GPU_TEX_NR_DISPLAY_LUT_ONLY_SKIP_SH_STATE" )
-           != QStringLiteral("0");
-    return enabled;
+    static const QString environmentValue =
+        qEnvironmentVariable( "MLVAPP_GPU_TEX_NR_DISPLAY_LUT_ONLY_SKIP_SH_STATE" );
+    return gpuPreviewProcessingDisplayShadowsHighlightsFrameStateBypassed(
+        config, environmentValue );
 }
 
 bool playbackSmokeFrameTelemetryEnabled()
@@ -4102,10 +4106,9 @@ void RenderFrameThread::drawFrame( int slotIndex,
         gpuPreviewProcessingNeedsShadowsHighlightsFrameState(
             m_activePresentationContext.gpuPreviewProcessingConfig);
     const bool gpuTexNrDisplayLutOnlyShStateBypass =
-        gpuPlaybackReconDisplayLutOnlySkipShadowsHighlightsFrameStateEnabled()
-        && gpuTexNrSkipNeedsPreviewFrameState
-        && !gpuPreviewProcessingDisplayShaderUsesShadowsHighlightsFrameState(
+        gpuPlaybackReconDisplayShadowsHighlightsFrameStateBypassed(
             m_activePresentationContext.gpuPreviewProcessingConfig)
+        && gpuTexNrSkipNeedsPreviewFrameState
         && gpuTexNrSkipOutputModeEligible
         && gpuTexNrSkipTextureRequested
         && gpuTexNrSkipScaleEligible
@@ -4648,6 +4651,28 @@ void RenderFrameThread::drawFrame( int slotIndex,
     {
         GpuPreviewProcessingConfig & previewConfig =
             slot.presentationContext.gpuPreviewProcessingConfig;
+        /* CUDA-PLAYBACK-LOOK-PARITY-2: the display shader reproduces the CPU
+         * preview route. gpuPreviewHostCpuRoute asks the engine which route it
+         * takes for THIS receipt at THIS scale. This frame is OutputDebayered16,
+         * so the thread's preview mode is off here; the engine establishes the
+         * playback-preview envelope itself, which is why this must not be
+         * replaced by a local predicate. The flag is per-frame because the route
+         * depends on scale and input, which the cached config cannot know. */
+        {
+            const GpuPreviewHostCpuRoute cpuRoute =
+                gpuPreviewHostCpuRoute( m_pMlvObject, playbackScaleFactor,
+                                        decodedRawFrame != nullptr );
+            gpuPreviewHostApplyCpuRoute( &previewConfig, cpuRoute );
+            gpuPreviewHostApplyCpuRoute(
+                &slot.presentationContext.gpuPresentationOptions.previewProcessing,
+                cpuRoute );
+            slot.stageTimingTelemetry.insert(
+                QStringLiteral("gpu_preview_processing_cpu_route_direct8"),
+                cpuRoute.direct8 );
+            slot.stageTimingTelemetry.insert(
+                QStringLiteral("gpu_preview_processing_pre_camera_clamp"),
+                cpuRoute.preCameraClamp );
+        }
         const bool shadowsHighlightsFrameStateRequested =
             gpuPreviewProcessingNeedsShadowsHighlightsFrameState(previewConfig);
         slot.stageTimingTelemetry.insert(

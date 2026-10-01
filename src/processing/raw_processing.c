@@ -2546,6 +2546,41 @@ int processingCanUseDirect8BitOutput(const processingObject_t * processing)
     return processing_can_use_direct_8bit_output(processing);
 }
 
+/* Whether the CPU route a frame takes clamps the diagonal (WB) matrix output to
+ * 16 bits and truncates it to uint16 BEFORE the camera matrix. The GPU display
+ * shader mirrors the route the CPU preview would run, so it asks the engine
+ * instead of re-deriving the predicates.
+ *
+ *   direct8Route != 0: the direct-8-bit kernel (raw_processing_8bit_kernel.inc).
+ *       It stores pix as uint16 before the camera matrix only
+ *       `if( apply_agx || apply_local_tone )`, with apply_local_tone =
+ *       contrast || shadows/highlights (same terms as the kernel's own locals;
+ *       they are also the terms processing_direct8_requires_shared_kernel keeps
+ *       the intrinsics kernel away from). Otherwise it feeds the unclamped
+ *       float diagonal value straight into the camera matrix.
+ *   direct8Route == 0: the generic 16-bit loop, which always stores
+ *       pix[i] = (uint16_t)LIMIT16(..) before the camera matrix -- except its
+ *       basic-matrix fast branch (processing_can_use_basic_matrix_fast_path
+ *       && !AgX, the same expression as use_basic_matrix_fast_path), which does
+ *       not clamp and is only reachable when creative and local tone are
+ *       neutral. */
+int processingCpuRoutePreCameraClamps(const processingObject_t * processing, int direct8Route)
+{
+    if( !processing ) return 1;
+
+    if( direct8Route )
+    {
+        const int apply_contrast =
+            processing->allow_creative_adjustments != 0
+            && ( processing->contrast <= -0.01 || processing->contrast >= 0.01 );
+        const int apply_shadows_highlights =
+            processing_has_direct8_shadow_highlight_adjustments(processing);
+        return processing->AgX != 0 || apply_contrast || apply_shadows_highlights;
+    }
+
+    return !( processing_can_use_basic_matrix_fast_path(processing) && !processing->AgX );
+}
+
 static void processing_set_direct8_incompatibility_reason(const char * reason)
 {
     if (!reason || !reason[0])

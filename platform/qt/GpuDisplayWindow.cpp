@@ -725,6 +725,14 @@ bool GpuDisplayWindow::setPresentedGpuPlaybackReconAmazePostWbTexture(
             "GPU window playback recon texture-present refused: LUT texture upload failed "
             "for a linear post-WB-undo texture (trace=gpu_window_recon_lut_upload_failed)"));
     }
+    // CUDA-PLAYBACK-LOOK-PARITY-1: refresh the per-frame shadows/highlights blur
+    // texture every present call (its content changes every frame, unlike the
+    // signature-cached LUTs above). A miss here (frame-state not ready, or the
+    // upload itself failing) is a soft degrade -- previewApplyShadowsHighlights
+    // is bound false for this frame by gpuPreviewProcessingBindDisplayUniformsAndTextures
+    // rather than refusing the whole recon presentation.
+    gpuPreviewProcessingUpdateShadowsHighlightsBlurTexture(
+        m_lutSet, previewProcessing, texWidth, texHeight );
 
     if ( !m_texture
       || m_texture->width() != texWidth
