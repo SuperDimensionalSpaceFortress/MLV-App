@@ -990,7 +990,9 @@ class ProducerGuardTests(TmpCase):
                                  ("codex:gpt-6.1-sol", "gpt-6.1-sol")):
             with self.subTest(runner):
                 stderr = io.StringIO()
-                with contextlib.redirect_stderr(stderr):
+                # if the guard ever let this through, a real CLI would be started: make that a loud failure instead
+                with mock.patch.object(look_judges, "run_bounded", side_effect=AssertionError("judge was started")), \
+                        contextlib.redirect_stderr(stderr):
                     code = look_cli.main(["judge", "--session-dir", fx.dir, "--runner", runner,
                                           "--producer-model", producer])
                 self.assertEqual(code, 2)
@@ -1255,6 +1257,26 @@ class BuildSessionCliTests(TmpCase):
         code, out2, _, _ = self._build(["--letterbox", "auto-symmetric"], a=a, b=b)
         with Image.open(os.path.join(out, "source-frames", "aa-00.png")) as im:
             self.assertEqual(im.size, (48, 48))  # one-sided stays even when auto-symmetric is opted in
+
+    def test_undeclared_symmetric_bands_are_not_cropped_either_unless_the_caller_opts_in(self):
+        import numpy as np
+        from PIL import Image
+        a = self._frames("aa", {0: (48, 48)})
+        path = os.path.join(a, "aa-frame-00.png")
+        with Image.open(path) as im:
+            arr = np.asarray(im.convert("RGB")).copy()
+        arr[:10] = 0
+        arr[-10:] = 0
+        Image.fromarray(arr, "RGB").save(path)
+        b = self._frames("bb", {0: (48, 48)})
+        code, out, _, stderr = self._build(a=a, b=b)
+        self.assertEqual(code, 0, stderr)
+        with Image.open(os.path.join(out, "source-frames", "aa-00.png")) as im:
+            self.assertEqual(im.size, (48, 48))  # the judges see exactly what the floor measures
+        code, out, _, stderr = self._build(["--letterbox", "auto-symmetric", "--common-crop-tolerance-px", "40"], a=a, b=b)
+        self.assertEqual(code, 0, stderr)
+        with Image.open(os.path.join(out, "source-frames", "aa-00.png")) as im:
+            self.assertEqual(im.size[1], 28)  # opted in: the symmetric bands are cropped (and cropped to a common size)
 
     def test_declared_bars_are_cropped_from_the_judge_images(self):
         import numpy as np
