@@ -568,8 +568,9 @@ TEST( PlayableWindow, TheSmokePlayRequestIsTheSoonerOfTheTimeoutAndThePresentedF
     // SMALLER of the two (the pre-fix code took the larger and let a 5 s timeout hide behind a 25 s target).
     ASSERT_NEAR( 5.0, smokePlayRequestSeconds( 5000, 600, kFps ), 1e-9 );
     ASSERT_NEAR( 20.0, smokePlayRequestSeconds( 40000, 480, kFps ), 1e-9 );
-    // A target with an unknown fps fails closed to 0 s (refused by the floor).
-    ASSERT_NEAR( 0.0, smokePlayRequestSeconds( 40000, 480, 0.0 ), 1e-9 );
+    // A target with an unknown fps fails closed to a window the floor refuses.
+    const double unknownFps = 0.0;
+    ASSERT_FALSE( evaluatePlayableWindow( 0, 1, 720, 720, kFps, smokePlayRequestSeconds( 40000, 480, unknownFps ) ).ok );
     // The pre-existing 100 ms floor on the timeout is kept.
     ASSERT_NEAR( 0.1, smokePlayRequestSeconds( 1, 0, kFps ), 1e-9 );
 }
