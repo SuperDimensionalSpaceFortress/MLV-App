@@ -366,7 +366,7 @@ function Get-GuiSmokeRefusalReason {
     #>
     param([int]$ExitCode, [string]$Message = '')
     if (@(14, 41, 42, 43, 44) -notcontains $ExitCode) { return 'NONE' }
-    if ($Message -match '(PLAY_WINDOW_TOO_SHORT|CLIP_TOO_SHORT|CLIP_LENGTH_UNKNOWN|INVALID_LOOPED|REPLAY_REFUSED|PASS_THROUGH_REFUSED)') {
+    if ($Message -match '(PLAY_WINDOW_TOO_SHORT|PLAY_DURATION_TOO_SHORT|PLAY_PACE_TOO_SLOW|CLIP_TOO_SHORT|CLIP_LENGTH_UNKNOWN|INVALID_SOURCE_FRAMES|INVALID_LOOPED|SOURCE_FRAMES_SHORT|PLAY_SAFETY_TIMEOUT|REPLAY_REFUSED|PASS_THROUGH_REFUSED)') {
         return $Matches[1]
     }
     return "EXIT_$ExitCode"
@@ -401,6 +401,48 @@ function Convert-PlaybackLogLineToObject {
         }
     }
     [pscustomobject]$result
+}
+
+function Get-GuiSmokeSourceFramesVerdict {
+    <#
+    .SYNOPSIS
+    PLAYBACK-CLIP-LENGTH-ENFORCE-3 RECEIPT ORACLE. "20 s of real footage" is a SOURCE-FRAME quantity: the app
+    counts the distinct source frames its engine advanced (source_advanced) and the frames the admitted Play had
+    to consume (required_source_frames = ceil(window x NATIVE fps)) on playback_smoke.summary. A receipt is
+    INVALID_SOURCE_FRAMES -- never a PASS -- when the counter is absent (a build that cannot prove it), the
+    requirement is unknown, source_advanced is under it, the run was paced by a persisted fps override, or the
+    engine's pace differs from the clip's native fps. Returns [pscustomobject]@{ invalid; failures;
+    sourceAdvanced; requiredSourceFrames }.
+    #>
+    param([AllowNull()]$Summary)
+    $failures = @()
+    $prop = { param($name) if ($null -ne $Summary -and $Summary.PSObject.Properties[$name]) { $Summary.$name } else { $null } }
+    $advanced = & $prop 'source_advanced'
+    $required = & $prop 'required_source_frames'
+    $nativeFps = & $prop 'native_fps'
+    $paceFps = & $prop 'pace_fps'
+    $fpsOverride = & $prop 'fps_override'
+    if ($null -eq $Summary) {
+        $failures += "INVALID_SOURCE_FRAMES: the run produced no playback_smoke.summary, so no source frames can be proven."
+    } elseif ($null -eq $advanced -or $null -eq $required) {
+        $failures += "INVALID_SOURCE_FRAMES: playback_smoke.summary carries no source_advanced / required_source_frames (a build that predates PLAYBACK-CLIP-LENGTH-ENFORCE-3); the footage played cannot be proven."
+    } elseif ([int64]$required -le 0) {
+        $failures += "INVALID_SOURCE_FRAMES: required_source_frames=$required; the admitted window is unknown."
+    } elseif ([int64]$advanced -lt [int64]$required) {
+        $failures += "INVALID_SOURCE_FRAMES: the engine advanced source_advanced=$advanced distinct source frames but the Play had to consume required_source_frames=$required; under 20 s of real footage is never playback evidence."
+    }
+    if ($null -ne $Summary -and $null -ne $fpsOverride -and [int]$fpsOverride -ne 0) {
+        $failures += "INVALID_SOURCE_FRAMES: the run was paced by a persisted fps override (fps_override=$fpsOverride); evidence is paced at the clip's native fps."
+    }
+    if ($null -ne $Summary -and $null -ne $nativeFps -and $null -ne $paceFps -and
+        [double]$nativeFps -gt 0 -and [double]$paceFps -gt 0 -and
+        [Math]::Abs([double]$paceFps - [double]$nativeFps) -gt (0.005 * [double]$nativeFps)) {
+        $failures += "INVALID_SOURCE_FRAMES: the engine paced at pace_fps=$paceFps but the clip's native fps is native_fps=$nativeFps; 20 s of wall clock is not 20 s of footage."
+    }
+    return [pscustomobject]@{
+        invalid = ($failures.Count -gt 0); failures = $failures
+        sourceAdvanced = $advanced; requiredSourceFrames = $required
+    }
 }
 
 function Get-GuiSmokeLoopVerdict {
@@ -452,6 +494,9 @@ function Get-GuiSmokeLoopVerdict {
             [double]$clipSeconds -lt [Math]::Max($script:GuiSmokeMinClipSeconds, $WindowSeconds)) {
             $failures += "INVALID_LOOPED: the app reports clip_seconds=$clipSeconds, under max($($script:GuiSmokeMinClipSeconds), window=$WindowSeconds)."
         }
+        # ENFORCE-3: the source-frame oracle (source_advanced >= required_source_frames, native pace, no override).
+        $sourceFramesVerdict = Get-GuiSmokeSourceFramesVerdict -Summary $Summary
+        $failures += @($sourceFramesVerdict.failures)
     }
     return [pscustomobject]@{ invalid = ($failures.Count -gt 0); failures = $failures }
 }

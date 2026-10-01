@@ -639,7 +639,9 @@ $embeddedFunctions = Get-AttrCudaEmbeddedFunctionSource -Name @(
     'Get-AttrCudaGuiSmokeDisplaySelection',
     # DISPLAY-SMOKE-FAILED-LOG-PRESERVE-1: locates the display log a FAILED smoke run left behind
     # (no result.json) and parses it with the shared parser; calls Get-AttrCudaGuiSmokeDisplaySelection.
-    'Find-AttrCudaFailedSmokeDisplayLog'
+    'Find-AttrCudaFailedSmokeDisplayLog',
+    # PLAYBACK-CLIP-LENGTH-ENFORCE-3: the receipt oracle (source_advanced >= required_source_frames, native pace, no wrap).
+    'Get-AttrCudaSourceFramesVerdict'
 )
 # ATTR3-FOOTAGE-BIND-1 PR-B round 4b: the private verified-part directory (one view entry per
 # verified part -- since OWNER-FOOTAGE-NO-HARDLINK-1 a symbolic link or a byte copy, never a hard
@@ -2190,7 +2192,7 @@ if ($null -ne $smokeLaunchException -or $smokeRc -ne 0 -or -not (Test-Path -Lite
     # PASS_THROUGH_REFUSED, 14 the app's own play gate (CLIP_TOO_SHORT or REPLAY_REFUSED); NONE otherwise.
     $smokeRefusalReason = 'NONE'
     if (@(14, 41, 42, 43, 44) -contains [int]$smokeRc) {
-        $smokeRefusalReason = if ($smokeStderrTail -match '(PLAY_WINDOW_TOO_SHORT|CLIP_TOO_SHORT|CLIP_LENGTH_UNKNOWN|INVALID_LOOPED|REPLAY_REFUSED|PASS_THROUGH_REFUSED)') { $Matches[1] }
+        $smokeRefusalReason = if ($smokeStderrTail -match '(PLAY_WINDOW_TOO_SHORT|PLAY_DURATION_TOO_SHORT|PLAY_PACE_TOO_SLOW|CLIP_TOO_SHORT|CLIP_LENGTH_UNKNOWN|INVALID_SOURCE_FRAMES|INVALID_LOOPED|SOURCE_FRAMES_SHORT|PLAY_SAFETY_TIMEOUT|REPLAY_REFUSED|PASS_THROUGH_REFUSED)') { $Matches[1] }
                                 else { "EXIT_$([int]$smokeRc)" }
     }
     $smokeFailure = [ordered]@{
@@ -2419,6 +2421,40 @@ if (-not $verdict.admitted) {
     Save-Json $refusal (Join-Path $Pub 'summary.json')
     Write-Output "RESULT=BACKEND_NOT_AVAILABLE CUDA_BACKEND_AVAILABLE=$($verdict.cudaBackendAvailable) R16_AVAILABLE=$($verdict.r16Available) R16_REASON=`"$($verdict.r16Reason)`" $(Get-AttrCudaDisplayResultTail $displayBlock) ARTIFACTS=$Pub"
     exit $verdict.exitCode
+}
+
+# PLAYBACK-CLIP-LENGTH-ENFORCE-3 RECEIPT ORACLE: "20 s of real footage" is a SOURCE-FRAME quantity. The measured
+# session's own playback_smoke.summary says how many distinct source frames the engine advanced and how many
+# the admitted Play had to; a receipt with fewer (or none, or a run paced by a persisted fps override, or a
+# wrapped timeline) is INVALID, never MEASUREMENT_CAPTURED -- whatever the smoke runner's exit code said.
+$sourceFramesSummaryLine = $null
+foreach ($candidateLine in ($rawLog -split "`r?`n")) {
+    if ($candidateLine -match ('playback_smoke\.summary session=' + [regex]::Escape([string]$measuredSmokeSessionId) + '(\s|$)')) {
+        $sourceFramesSummaryLine = $candidateLine
+    }
+}
+$sourceFramesVerdict = Get-AttrCudaSourceFramesVerdict -SummaryLine $sourceFramesSummaryLine
+$sourceFramesWrapped = [bool]$sourceFramesVerdict.wrapped
+$sourceFramesBlock = [ordered]@{
+    oracle = 'source_advanced >= required_source_frames, wrapped=0, native pace, no fps override'
+    sourceAdvanced = $sourceFramesVerdict.sourceAdvanced
+    requiredSourceFrames = $sourceFramesVerdict.requiredSourceFrames
+    wrapped = $sourceFramesWrapped
+    failures = @($sourceFramesVerdict.failures)
+}
+if ($sourceFramesVerdict.invalid) {
+    [void](Publish-AttrCudaContactSheetRawCaptures -Enabled $ContactSheetEnabled -SourceDir $contactSheetDir -PubRoot $Pub)
+    $sourceFramesRefusal = [ordered]@{
+        schema='playback-attr-3-cuda-venue.v1'; result='SOURCE_FRAMES_INVALID'
+        fixtureRehearsal=$FixtureRehearsal
+        displayWake=$displayWake
+        smokeRefusalReason=$(if ($sourceFramesWrapped) { 'INVALID_LOOPED' } else { 'INVALID_SOURCE_FRAMES' })
+        sourceFrames=$sourceFramesBlock
+        display=$displayBlock; sourceCommit=$SourceCommit; clipId=$ClipId; artifactRoot=$Pub
+    }
+    Save-Json $sourceFramesRefusal (Join-Path $Pub 'summary.json')
+    Write-Output "RESULT=SOURCE_FRAMES_INVALID SOURCE_ADVANCED=$($sourceFramesVerdict.sourceAdvanced) REQUIRED_SOURCE_FRAMES=$($sourceFramesVerdict.requiredSourceFrames) WRAPPED=$sourceFramesWrapped ARTIFACTS=$Pub"
+    exit 29
 }
 
 $gpuSummary = Get-LastGpuSummary $rawLog $measuredSmokeSessionId
@@ -2735,6 +2771,7 @@ $manifest = [ordered]@{
         topCpuProcesses=$topCpuProcesses
     }
     frameRows = $rows.Count
+    sourceFrames = $sourceFramesBlock
     smokeRunLog = [ordered]@{ path=$runLog.path; sha256=$runLog.sha256; bytes=$runLog.bytes; runNonce=$runLog.runNonce; source=$runLog.source }
     diagnostics = $diagnostics
     gpuSummary = $gpuSummary
@@ -2758,6 +2795,7 @@ Save-Json ([ordered]@{
     sourceCommit = $SourceCommit
     clipId = $ClipId
     rows = $rows.Count
+    sourceFrames = $sourceFramesBlock
     gpuFramesTotal = $gpuFramesTotal
     cpuFrames = $gpuSummary.cpuFrames
     presentMonSamples = $pmRows.Count

@@ -501,9 +501,38 @@ LOOP_VERDICT_CASES = [
 ]
 
 
+# PLAYBACK-CLIP-LENGTH-ENFORCE-3: a run that consumed its source frames at the clip's native pace. Every row that
+# is not ABOUT the source-frame oracle carries it, so each row isolates one cause.
+GOOD_SOURCE = dict(source_advanced=480, required_source_frames=480, native_fps=23.976, pace_fps=23.976, fps_override=0)
+
+SOURCE_FRAME_CASES = [
+    # sol r2's repro as the app would have reported it: fpsOverride=12 on a 24 fps clip, a 20 s wall-clock stop.
+    (dict(wrapped=0, wrap_count=0, total_frames=720, clip_seconds=30.03, presented_frames=240,
+          source_advanced=241, required_source_frames=480, native_fps=24.0, pace_fps=12.0, fps_override=1), 24, False, True),
+    (dict(wrapped=0, wrap_count=0, total_frames=720, clip_seconds=30.03, presented_frames=500,
+          source_advanced=479, required_source_frames=480), 24, False, True),
+    (dict(wrapped=0, wrap_count=0, total_frames=720, clip_seconds=30.03, presented_frames=500,
+          source_advanced=480, required_source_frames=480), 24, False, False),
+    (dict(wrapped=0, wrap_count=0, total_frames=720, clip_seconds=30.03, presented_frames=500,
+          source_advanced=900, required_source_frames=0), 24, False, True),
+    (dict(wrapped=0, wrap_count=0, total_frames=720, clip_seconds=30.03, presented_frames=500, fps_override=1), 24, False, True),
+    (dict(wrapped=0, wrap_count=0, total_frames=720, clip_seconds=30.03, presented_frames=500,
+          native_fps=24.0, pace_fps=12.0), 24, False, True),
+    (dict(wrapped=0, wrap_count=0, total_frames=720, clip_seconds=30.03, presented_frames=500,
+          native_fps=24.0, pace_fps=24.05), 24, False, False),
+    # wrapped stays invalid even with every source frame counted
+    (dict(wrapped=1, wrap_count=1, total_frames=720, clip_seconds=30.03, presented_frames=500,
+          source_advanced=480, required_source_frames=480), 24, False, True),
+    # a launch-only probe never plays: no source frames is exactly right
+    (dict(wrapped=0, wrap_count=0, total_frames=720, clip_seconds=30.03, presented_frames=0,
+          source_advanced=0, required_source_frames=0), 24, True, False),
+]
+LOOP_VERDICT_CASES.extend(SOURCE_FRAME_CASES)
+
+
 def _case(row):
     fields, window, launch_only, expected, *rest = row
-    return fields, window, launch_only, expected, (rest[0] if rest else 0)
+    return {**GOOD_SOURCE, **fields}, window, launch_only, expected, (rest[0] if rest else 0)
 
 
 @requires_pwsh
@@ -526,10 +555,32 @@ class RuntimeBackstopBehaviourTests(unittest.TestCase):
                 verdict = _loop_verdict(_summary_line(**fields), window, launch_only, clip_frames=clip_frames)
                 self.assertEqual(verdict["invalid"], expected, verdict)
 
-    def test_a_summary_without_the_fields_is_not_a_wrap(self) -> None:
-        # A binary that predates the fields: the pre-launch gate is its control, and the runner's
-        # existing synthetic-log contract tests feed summaries without them.
-        self.assertFalse(_loop_verdict("playback_smoke.summary session=1 presented_frames=900", 24)["invalid"])
+    def test_a_summary_without_the_source_frame_fields_is_invalid(self) -> None:
+        # ENFORCE-3: a build that cannot report source_advanced / required_source_frames cannot prove the footage
+        # played; the receipt oracle fails closed (it used to wave such a build through with a warning).
+        verdict = _loop_verdict("playback_smoke.summary session=1 presented_frames=900", 24)
+        self.assertTrue(verdict["invalid"], verdict)
+        self.assertIn("INVALID_SOURCE_FRAMES", json.dumps(verdict))
+        # ... and a launch-only probe, which never plays, needs none.
+        self.assertFalse(_loop_verdict("playback_smoke.summary session=1 presented_frames=0", 24, launch_only=True)["invalid"])
+
+    def test_the_absent_fields_check_is_mutation_tested(self) -> None:
+        source = GATE.read_text(encoding="utf-8")
+        needle = "} elseif ($null -eq $advanced -or $null -eq $required) {"
+        self.assertIn(needle, source)
+        mutated = self.tmp_gate(source.replace(needle, "} elseif ($false) {"))
+        line = "playback_smoke.summary session=1 presented_frames=900"
+        self.assertTrue(_loop_verdict(line, 24)["invalid"])
+        # with the check gone the verdict no longer names the absent fields (the absent-summary branch is the only
+        # other way to fail), so the mutation is visible
+        self.assertNotIn("carries no source_advanced", json.dumps(_loop_verdict(line, 24, gate=mutated)))
+
+    def test_the_app_summary_and_gate_lines_carry_the_source_frame_fields(self) -> None:
+        text = MAIN_WINDOW.read_text(encoding="utf-8")
+        for anchor in ("playback_smoke.summary session=%1", "playback_smoke.gate session=%1"):
+            template = _literal_template(text, anchor)
+            for key in ("source_advanced", "required_source_frames", "native_fps", "pace_fps", "fps_override"):
+                self.assertRegex(template, rf"\b{key}=%\d+", template)
 
     def test_the_decision_code_is_mutation_tested(self) -> None:
         # Sol's two mutations (invert the wrapped check; disable the enclosing guard) plus the other
@@ -543,6 +594,12 @@ class RuntimeBackstopBehaviourTests(unittest.TestCase):
             "verdict never invalid": ("invalid = ($failures.Count -gt 0)", "invalid = $false"),
             "presented-over-clip check inverted": ("[int64]$presented -gt $ClipFrames", "[int64]$presented -le $ClipFrames"),
             "last-before-first check inverted": ("[int64]$lastPresented -lt [int64]$firstPresented", "[int64]$lastPresented -gt [int64]$firstPresented"),
+            # ENFORCE-3: the source-frame oracle
+            "source short check inverted": ("[int64]$advanced -lt [int64]$required", "[int64]$advanced -ge [int64]$required"),
+            "unknown requirement accepted": ("[int64]$required -le 0", "[int64]$required -lt 0"),
+            "fps override ignored": ("[int]$fpsOverride -ne 0", "[int]$fpsOverride -eq 0"),
+            "pace comparison inverted": ("-gt (0.005 * [double]$nativeFps)", "-le (0.005 * [double]$nativeFps)"),
+            "source verdict dropped": ("$failures += @($sourceFramesVerdict.failures)", "$null = @($sourceFramesVerdict.failures)"),
         }
         for name, (needle, replacement) in mutations.items():
             with self.subTest(name):
@@ -605,16 +662,18 @@ class RuntimeBackstopBehaviourTests(unittest.TestCase):
             "$Seconds = 24; $LaunchOnlyProbe = $false; $validationFailures = @(); $validationWarnings = @(); "
             "$clipLengthGate = [pscustomobject]@{ frames = 720 }\n"
             f"{block}\n"
-            "[pscustomobject]@{ invalidLooped = [bool]$invalidLooped; failures = @($validationFailures).Count } "
-            "| ConvertTo-Json -Compress")
+            "[pscustomobject]@{ invalidLooped = [bool]$invalidLooped; invalidSourceFrames = [bool]$invalidSourceFrames; "
+            "failures = @($validationFailures).Count } | ConvertTo-Json -Compress")
         self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
         return json.loads(proc.stdout)
 
     def test_the_runners_verdict_application_is_executed_and_every_guard_mutation_is_caught(self) -> None:
         text = RUNNER.read_text(encoding="utf-8")
         block = self._application_block(text)
-        wrapped = dict(wrapped=1, wrap_count=1, total_frames=720, clip_seconds=30.03, presented_frames=500)
-        clean = dict(wrapped=0, wrap_count=0, total_frames=720, clip_seconds=30.03, presented_frames=500)
+        wrapped = dict(wrapped=1, wrap_count=1, total_frames=720, clip_seconds=30.03, presented_frames=500, **GOOD_SOURCE)
+        clean = dict(wrapped=0, wrap_count=0, total_frames=720, clip_seconds=30.03, presented_frames=500, **GOOD_SOURCE)
+        # sol r2: 20 s of wall clock under a 12 fps override = 240 source frames of the 480 required
+        short = dict(clean, source_advanced=240, native_fps=24.0, pace_fps=12.0, fps_override=1)
         # The real block: a wrap makes the run INVALID_LOOPED with its failure recorded; a clean run does not.
         got = self._run_application_block(block, **wrapped)
         self.assertTrue(got["invalidLooped"], got)
@@ -622,6 +681,12 @@ class RuntimeBackstopBehaviourTests(unittest.TestCase):
         got = self._run_application_block(block, **clean)
         self.assertFalse(got["invalidLooped"], got)
         self.assertEqual(got["failures"], 0, got)
+        got = self._run_application_block(block, **short)
+        self.assertTrue(got["invalidLooped"], got)           # exit 43, never a PASS
+        self.assertTrue(got["invalidSourceFrames"], got)
+        self.assertGreaterEqual(got["failures"], 1, got)
+        got = self._run_application_block(block, **wrapped)
+        self.assertFalse(got["invalidSourceFrames"], got)    # a wrap is INVALID_LOOPED, not a source-frame shortfall
 
         # Mutations of the APPLICATION guard (fable/sol r2: the old test pinned text, so these survived).
         mutations = {
@@ -629,6 +694,7 @@ class RuntimeBackstopBehaviourTests(unittest.TestCase):
             "guard inverted": ("if ($loopVerdict.invalid) {", "if (-not $loopVerdict.invalid) {"),
             "invalid flag never set": ("$invalidLooped = -not $LaunchOnlyProbe", "$invalidLooped = $false"),
             "failures dropped": ("$validationFailures += $loopVerdict.failures", "$null = $loopVerdict.failures"),
+            "source-frame flag never set": ("$invalidSourceFrames = (-not $LaunchOnlyProbe) -and", "$invalidSourceFrames = $false -and"),
             "verdict ignored": ("$loopVerdict = Get-GuiSmokeLoopVerdict -Summary $playbackSummary",
                                 "$loopVerdict = [pscustomobject]@{ invalid = $false; failures = @() }; "
                                 "$null = Get-GuiSmokeLoopVerdict -Summary $playbackSummary"),
@@ -638,10 +704,11 @@ class RuntimeBackstopBehaviourTests(unittest.TestCase):
                 self.assertIn(needle, block, f"mutation anchor vanished: {name}")
                 mutated = block.replace(needle, replacement, 1)
                 survived = True
-                for fields, expected_invalid in ((wrapped, True), (clean, False)):
+                for fields, expected_invalid in ((wrapped, True), (clean, False), (short, True)):
                     outcome = self._run_application_block(mutated, **fields)
                     if outcome["invalidLooped"] != expected_invalid or \
-                            (expected_invalid and outcome["failures"] < 1):
+                            (expected_invalid and outcome["failures"] < 1) or \
+                            (fields is short and not outcome["invalidSourceFrames"]):
                         survived = False
                 self.assertFalse(survived, f"guard mutation '{name}' survived the application test")
 
@@ -674,6 +741,132 @@ class RuntimeBackstopBehaviourTests(unittest.TestCase):
         self.assertIn("autoplay.loop_ignored", window)
         self.assertIn('programmaticPlay( "autoplay", autoplaySeconds )', window)
         self.assertIn('QStringLiteral("reason=%1 window_seconds=%2")', window)
+
+
+@requires_pwsh
+class SourceFramesOracleParityTests(unittest.TestCase):
+    """ENFORCE-3: the attribution job cannot dot-source the gate (the emitted-template lint forbids it), so it embeds
+    Get-AttrCudaSourceFramesVerdict from AttrCudaArtifacts.psm1. Both implementations are EXECUTED on the same
+    summary lines and must agree -- one rule, two carriers."""
+
+    MODULE = ROOT / "tools" / "profiling" / "bachelor" / "AttrCudaArtifacts.psm1"
+
+    def _gate_invalid(self, line: str) -> bool:
+        proc = _pwsh(
+            f". {_q(GATE)}; $s = Convert-PlaybackLogLineToObject {_q(line)}; "
+            "$v = Get-GuiSmokeSourceFramesVerdict -Summary $s; "
+            "$w = (($s.PSObject.Properties['wrapped'] -and [int]$s.wrapped -ne 0) -or "
+            "($s.PSObject.Properties['wrap_count'] -and [int64]$s.wrap_count -gt 0)); "
+            "[pscustomobject]@{ invalid = ($v.invalid -or $w) } | ConvertTo-Json -Compress")
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        return json.loads(proc.stdout)["invalid"]
+
+    def _module_invalid(self, line: str) -> bool:
+        proc = _pwsh(
+            f"Import-Module {_q(self.MODULE)} -Force -DisableNameChecking; "
+            f"$v = Get-AttrCudaSourceFramesVerdict -SummaryLine {_q(line)}; "
+            "[pscustomobject]@{ invalid = [bool]$v.invalid } | ConvertTo-Json -Compress")
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        return json.loads(proc.stdout)["invalid"]
+
+    def test_both_carriers_agree_on_every_source_frame_row_and_on_an_absent_summary(self) -> None:
+        for row in SOURCE_FRAME_CASES:
+            fields, _window, launch_only, expected, _frames = _case(row)
+            if launch_only:
+                continue   # a launch-only probe never reaches the oracle
+            with self.subTest(fields=fields):
+                line = _summary_line(**fields)
+                self.assertEqual(self._gate_invalid(line), expected, line)
+                self.assertEqual(self._module_invalid(line), expected, line)
+        absent = "playback_smoke.summary session=1 presented_frames=900"
+        self.assertTrue(self._gate_invalid(absent))
+        self.assertTrue(self._module_invalid(absent))
+        self.assertTrue(self._module_invalid(""))
+
+    def _job_oracle_block(self) -> str:
+        job = JOB_GENERATOR.read_text(encoding="utf-8")
+        start = job.index("$sourceFramesSummaryLine = $null")
+        end = job.index("$gpuSummary = Get-LastGpuSummary $rawLog $measuredSmokeSessionId", start)
+        return job[start:end]
+
+    def _run_job_block(self, block: str, raw_log: str) -> tuple[int, dict]:
+        with tempfile.TemporaryDirectory(prefix="job-oracle-") as tmp:
+            pub = Path(tmp) / "pub"
+            pub.mkdir()
+            script = Path(tmp) / "probe.ps1"
+            script.write_text(
+                "$ErrorActionPreference = 'Stop'\n"
+                f"Import-Module {_q(SourceFramesOracleParityTests.MODULE)} -Force -DisableNameChecking\n"
+                f"$Pub = {_q(pub)}\n"
+                f"$rawLog = {_q(raw_log)}\n"
+                "$measuredSmokeSessionId = '7'; $FixtureRehearsal = $false; $displayWake = [ordered]@{}; $displayBlock = $null\n"
+                "$SourceCommit = ('1' * 40); $ClipId = 'clip'; $ContactSheetEnabled = $false; $contactSheetDir = ''\n"
+                "function Publish-AttrCudaContactSheetRawCaptures { param($Enabled, $SourceDir, $PubRoot) }\n"
+                "function Save-Json($Object, [string]$Path) { [IO.File]::WriteAllText($Path, ($Object | ConvertTo-Json -Depth 20)) }\n"
+                + block + "\nWrite-Output 'RESULT=FELL_THROUGH'\n",
+                encoding="utf-8")
+            proc = _pwsh(f"& {_q(script)}; exit $LASTEXITCODE")
+            summary_path = pub / "summary.json"
+            summary = json.loads(summary_path.read_text(encoding="utf-8")) if summary_path.exists() else {}
+            if proc.returncode == 0:
+                self.assertIn("RESULT=FELL_THROUGH", proc.stdout, proc.stdout + proc.stderr)
+            elif proc.returncode != 29:
+                self.fail(f"job oracle probe exited {proc.returncode}: {proc.stdout}{proc.stderr}")
+            return proc.returncode, summary
+
+    def test_the_jobs_oracle_block_is_executed_and_mutation_tested(self) -> None:
+        block = self._job_oracle_block()
+
+        def line(**extra: object) -> str:
+            fields = {**GOOD_SOURCE, "wrapped": 0, "wrap_count": 0, **extra}
+            return _summary_line(**fields).replace("session=0", "session=7", 1)
+
+        good = line()
+        short = line(source_advanced=241, native_fps=24.0, pace_fps=12.0, fps_override=1)
+        wrapped = line(wrapped=1, wrap_count=1)
+        other_session = short.replace("session=7", "session=8", 1)
+        # the last line FOR THE MEASURED SESSION decides; another session's short line is not this run's evidence
+        code, summary = self._run_job_block(block, good + "\n" + other_session)
+        self.assertEqual(code, 0, summary)
+        code, summary = self._run_job_block(block, short)
+        self.assertEqual(code, 29)
+        self.assertEqual(summary["result"], "SOURCE_FRAMES_INVALID")
+        self.assertEqual(summary["smokeRefusalReason"], "INVALID_SOURCE_FRAMES")
+        self.assertEqual(summary["sourceFrames"]["sourceAdvanced"], 241)
+        self.assertEqual(summary["sourceFrames"]["requiredSourceFrames"], 480)
+        code, summary = self._run_job_block(block, wrapped)
+        self.assertEqual(code, 29)
+        self.assertEqual(summary["smokeRefusalReason"], "INVALID_LOOPED")
+        code, summary = self._run_job_block(block, "")
+        self.assertEqual(code, 29)                      # no summary line for the session at all -> fail closed
+        mutations = {
+            "guard disabled": ("if ($sourceFramesVerdict.invalid) {", "if ($false -and $sourceFramesVerdict.invalid) {"),
+            "guard inverted": ("if ($sourceFramesVerdict.invalid) {", "if (-not $sourceFramesVerdict.invalid) {"),
+            "any session's line accepted": ("[regex]::Escape([string]$measuredSmokeSessionId)", "''"),
+            "verdict ignored": ("$sourceFramesVerdict = Get-AttrCudaSourceFramesVerdict -SummaryLine $sourceFramesSummaryLine",
+                                "$sourceFramesVerdict = [pscustomobject]@{ invalid = $false; wrapped = $false; failures = @(); sourceAdvanced = 0; requiredSourceFrames = 0 }"),
+        }
+        for name, (needle, replacement) in mutations.items():
+            with self.subTest(name):
+                self.assertIn(needle, block, f"mutation anchor vanished: {name}")
+                mutated = block.replace(needle, replacement, 1)
+                verdicts = [
+                    self._run_job_block(mutated, short)[0] == 29,
+                    self._run_job_block(mutated, good + "\n" + other_session)[0] == 0,
+                ]
+                self.assertFalse(all(verdicts), f"job oracle mutation '{name}' survived")
+
+    def test_the_job_calls_the_embedded_oracle_before_any_backend_verdict(self) -> None:
+        job = JOB_GENERATOR.read_text(encoding="utf-8")
+        self.assertIn("'Get-AttrCudaSourceFramesVerdict'", job)       # embedded into the emitted job
+        oracle_at = job.index("Get-AttrCudaSourceFramesVerdict -SummaryLine")
+        # after the backend-availability gate (a run that never used CUDA says so first), before any number is read
+        self.assertGreater(oracle_at, job.index("$verdict = Get-AttrCudaEligibilityVerdict"))
+        self.assertLess(oracle_at, job.index("$gpuSummary = Get-LastGpuSummary $rawLog $measuredSmokeSessionId"))
+        self.assertLess(oracle_at, job.index("RESULT=$resultVerb"))
+        self.assertIn("exit 29", job[oracle_at:oracle_at + 2500])
+        self.assertIn("result='SOURCE_FRAMES_INVALID'", job)
+        self.assertEqual(job.count("sourceFrames = $sourceFramesBlock"), 2)   # evidence manifest and summary.json
 
 
 class JobGeneratorContractTests(unittest.TestCase):
@@ -1270,14 +1463,21 @@ class AppPlayGateStaticClassTests(unittest.TestCase):
         self.assertIn("constexpr int kMinPlayWindowMs = 20000;", header)
         for name in ("evaluatePlayableWindow", "ProgrammaticPlayLedger", "noteJumpToFirst", "noteRestart",
                      "engineCutRangeForPlay", "smokePlayRequestSeconds", "stressSwitchReachesFloor",
-                     "playHoldReachedFloor", "PLAY_DURATION_TOO_SHORT"):
+                     "PLAY_DURATION_TOO_SHORT", "SourceFrameAdvanceCounter", "requiredSourceFrames",
+                     "evaluatePlayStop", "playSafetyMs", "PLAY_PACE_TOO_SLOW", "SOURCE_FRAMES_SHORT",
+                     "PLAY_SAFETY_TIMEOUT"):
             self.assertIn(name, header)
+        self.assertNotIn("playHoldReachedFloor", header)   # the wall-clock hold predicate is retired
         tests = (ROOT / "tests" / "console" / "test_playback_frame_range.cpp").read_text(encoding="utf-8")
         for name in ("PlayableWindow", "ProgrammaticPlayLedger"):
             self.assertIn(f"TEST( {name}, ", tests)
         for name in ("SolB1ARequestedWindowUnderTheFloor", "SolB3WithTheCollapsedRangeRepairDisabled",
                      "TheLifecycleStressSwitchMayOnlyHappenAfterTheTwentySecondFloor",
-                     "AnExerciseModeMayStopPlayOnlyOnceTheFloorHasElapsed"):
+                     "NoWallClockPredicateRemainsThatCanCallAPlayLongEnough",
+                     "SolR2ReproTheOldWallClockRuleStopsAtTwentySecondsAfterTenSecondsOfFootage",
+                     "TheSameRunUnderTheNewRuleIsRefusedBeforePlayAtTheEnginesRealPace",
+                     "ALoopingEngineNeverReachesTheRequirementByReplayingFootage",
+                     "AWrapOrABackwardStepNeverAddsAndNeverCountsFramesTwice"):
             self.assertIn(name, tests)
 
     # -- mutation tests: the scan must go red on a deliberately broken tree ------------------------------
@@ -1436,18 +1636,20 @@ class AppPlayGateStaticClassTests(unittest.TestCase):
         self.assertIn("PLAY_DURATION_TOO_SHORT (--seconds=", main)
         self.assertRegex(main, r"seconds \+ 1e-9 < playback_frame_range::kMinPlayWindowSeconds")
 
-    def test_b2_every_automation_mode_that_stops_play_early_holds_the_floor_first(self) -> None:
+    def test_b2_every_automation_mode_waits_for_the_engines_source_frame_count(self) -> None:
+        # ENFORCE-3: the ENFORCE-2 wall-clock floor (playHoldReachedFloor) is retired. Each automation mode waits on
+        # programmaticPlayState (the engine's counted source frames); the exact statements are pinned in
+        # app_play_scan.PINNED_STOP_STATEMENTS and the wait loops in PINNED_WAIT_LOOPS (both mutation-tested below).
         _, code = strip_cpp(self.sources[self.MAIN_WINDOW])
-        settle = _function_body(self.sources[self.MAIN_WINDOW], "auto settleLookAssistForProfile = [&]")
-        self.assertTrue(settle, "settle lambda not found")
-        self.assertIn("playHoldReachedFloor( autoSettleClock.elapsed() )", settle)
-        self.assertNotIn("elapsed() < 12000", settle)
-        play_action = code[code.index("playActionClock.start();"):code.index("playActionSmokeElapsedMs = playActionClock.elapsed();")]
-        self.assertIn("playHoldReachedFloor( playActionClock.elapsed() )", play_action)
+        self.assertNotIn("playHoldReachedFloor", code)
+        for pinned in ("programmaticPlayState( autoSettleClock.elapsed(), autoSettleSafetyMs )",
+                       "programmaticPlayState( playActionClock.elapsed(), playActionSafetyMs )",
+                       "programmaticPlayState( playbackClock.elapsed(), measuredSafetyMs )",
+                       "programmaticPlayState( autoplayClock->elapsed(),"):
+            self.assertEqual(code.count(pinned), 1, pinned)
         self.assertNotIn("playActionTimeout", code)
-        self.assertNotRegex(play_action, r"playActionLoop\.(exec|quit)")
-        # the lifecycle stress switch: only at/after the floor, refused below it, default 20 s
-        self.assertIn("playback_frame_range::playHoldReachedFloor( playbackClock.elapsed() )", code)
+        # the lifecycle stress switch: only once the engine counted the source frames, refused below 20 s at launch
+        self.assertIn("&& programmaticPlayConsumed()", code)
         self.assertIn("!playback_frame_range::stressSwitchReachesFloor( options.stressSwitchAtMs )", code)
         header = (ROOT / "platform" / "qt" / "MainWindow.h").read_text(encoding="utf-8")
         self.assertRegex(header, r"int stressSwitchAtMs = 20000;")
@@ -1455,8 +1657,9 @@ class AppPlayGateStaticClassTests(unittest.TestCase):
         self.assertIn("stressSwitchReachesFloor(stressSwitchAtMs)", main)
         self.assertRegex(main, r'QStringLiteral\("20000"\)')
         self.assertNotRegex(main, r'QStringLiteral\("1000"\)\);\s*parser\.addOption\(stressSwitchAtMsOpt\)')
-        # a measured Play that ended under the floor is a typed failure, never a pass
+        # a measured Play that did not consume the source frames is a typed failure, never a pass
         self.assertIn('programmaticStop( "gui-smoke-measured-early-end" )', code)
+        self.assertIn("playStopFailureReason( measuredState )", code)
 
     def test_b2_the_play_window_is_timed_from_the_moment_play_has_started(self) -> None:
         _, code = strip_cpp(self.sources[self.MAIN_WINDOW])
@@ -1467,7 +1670,7 @@ class AppPlayGateStaticClassTests(unittest.TestCase):
         _, code = strip_cpp(self.sources[self.MAIN_WINDOW])
         body = _function_body(self.sources[self.MAIN_WINDOW], "playback_frame_range::PlayableWindowVerdict MainWindow::checkPlayableWindow(")
         self.assertIn("!f3CutRangeRepairDisabledByEnvironment()", body)
-        mutated = self._mutated("!f3CutRangeRepairDisabledByEnvironment() );", "true );")
+        mutated = self._mutated("!f3CutRangeRepairDisabledByEnvironment(),", "true,")
         mutated_body = _function_body(mutated[self.MAIN_WINDOW], "playback_frame_range::PlayableWindowVerdict MainWindow::checkPlayableWindow(")
         self.assertNotIn("f3CutRangeRepairDisabledByEnvironment", mutated_body)
         # the knob is the ONLY environment variable that touches the cut range anywhere in platform/qt
@@ -1476,6 +1679,89 @@ class AppPlayGateStaticClassTests(unittest.TestCase):
             for name in re.findall(r"MLVAPP_[A-Z0-9_]*(?:CUT_RANGE|CUTRANGE|CUT_IN|CUT_OUT)[A-Z0-9_]*", strip_cpp(text)[1]):
                 range_knobs.add(name)
         self.assertEqual(range_knobs, {"MLVAPP_F3_DISABLE_CUT_RANGE_REPAIR"})
+
+    # -- PLAYBACK-CLIP-LENGTH-ENFORCE-3: the source-frame class, pinned and mutation-tested -------------------
+
+    def _enforce3_mutations(self) -> dict[str, dict[str, str]]:
+        """name -> a deliberately broken copy of the real sources the scan must flag."""
+        restart = "playbackClock.restart();"
+        loop_body = (r"(== playback_frame_range::PlayStopState::Continue \)\s*\{)"
+                     r"(\s*qApp->processEvents\( QEventLoop::AllEvents \);\s*QThread::msleep\( 10 \);)")
+        return {
+            # sol r2 hardening: a raw stop inserted after the clock restart (the exact repro)
+            "raw setChecked(false) after playbackClock.restart()":
+                self._mutated(restart, restart + "\n    ui->actionPlay->setChecked( false );"),
+            "raw on_actionPlay_triggered(false) after the restart":
+                self._mutated(restart, restart + "\n    on_actionPlay_triggered( false );"),
+            "a conditional raw stop on a wall clock":
+                self._mutated(restart, restart + "\n    if( playbackClock.elapsed() > 5000 ) ui->actionPlay->setChecked( false );"),
+            "a new programmaticStop site": self._mutated(restart, restart + '\n    programmaticStop( "a-new-early-stop" );'),
+            # sol r2 hardening: COMPLETE request expressions
+            "settle request divided by 20":
+                self._mutated_re(r'(programmaticPlay\(\s*"profile-look-assist-settle"\s*,\s*playback_frame_range::kMinPlayWindowSeconds)',
+                                 r"\1 / 20.0"),
+            "play-action request minus 19":
+                self._mutated_re(r'(programmaticPlay\(\s*"profile-exercise-play-action"\s*,\s*playback_frame_range::kMinPlayWindowSeconds)',
+                                 r"\1 - 19"),
+            "autoplay request times zero": self._mutated("programmaticPlay( \"autoplay\", autoplaySeconds )",
+                                                          "programmaticPlay( \"autoplay\", autoplaySeconds * 0 )"),
+            "smoke request widened": self._mutated_re(
+                r'(playback_frame_range::smokePlayRequestSeconds\(\s*options\.durationMs,\s*options\.targetPresentedFrames,\s*presentedTargetFps\s*\))',
+                r"\1 + 100.0"),
+            # sol r2 hardening: an extra exit condition inside a hold loop
+            "an extra break in the settle hold loop": self._mutated_re(loop_body, r"\1 if( m_lastLookAssistDiagnosticsValid ) break; \2"),
+            # the wall clock comes back
+            "a wall-clock wait loop on the Play action":
+                self._mutated(restart, restart + "\n    while( playbackClock.elapsed() < 20000 && ui->actionPlay->isChecked() ) { qApp->processEvents(); }"),
+            "the retired wall-clock predicate":
+                self._mutated(restart, restart + "\n    const bool wallClockFloor = playHoldReachedFloor( playbackClock.elapsed() );"),
+            "the measured loop ignores an engine that ended early":
+                self._mutated("|| measuredState == playback_frame_range::PlayStopState::EndedEarly\n", "\n"),
+            # the engine counts, the gate paces, the stop waits
+            "the presented-frames stop no longer waits for the source frames": self._mutated_re(
+                r"\n\s*&& programmaticPlayConsumed\(\)\s*// ENFORCE-3: N presented frames[^\n]*", ""),
+            "the gate is not told the engine pace": self._mutated("enginePaceFps > 0.0 ? enginePaceFps : -1.0 );", "0.0 );"),
+            "the engine tick stops feeding the counter (non-drop)":
+                self._mutated("m_sourceAdvance.noteEngineTick( sourcePositionBeforeTick,", "(void)( sourcePositionBeforeTick,"),
+            "the engine tick stops feeding the counter (drop-frame)":
+                self._mutated("m_sourceAdvance.noteEngineTick( sourcePositionBeforeDropTick,", "(void)( sourcePositionBeforeDropTick,"),
+            "getFramerate reads the persisted override again":
+                self._mutated("if( m_fpsOverride && !m_automationPacingIsolated ) return m_frameRate;",
+                              "if( m_fpsOverride ) return m_frameRate;"),
+            "the smoke entry no longer isolates pacing": self._mutated('isolateAutomationPacing( "gui-smoke-entry" );', ""),
+            "the profile entry no longer isolates pacing": self._mutated('isolateAutomationPacing( "profile-entry" );', ""),
+            "the autoplay hook no longer isolates pacing": self._mutated('isolateAutomationPacing( "autoplay" );', ""),
+            "the gate stops resetting the counter for its Play": self._mutated(
+                "m_sourceAdvance = playback_frame_range::SourceFrameAdvanceCounter();", ""),
+            "the gate stops recording the required frames": self._mutated(
+                "m_playRequiredSourceFrames = verdict.requiredFrames;", ""),
+            "programmaticPlayConsumed always true": self._mutated(
+                "return m_playRequiredSourceFrames > 0 && m_sourceAdvance.consumed() >= m_playRequiredSourceFrames;",
+                "return true;"),
+            "the autoplay poll stops without asking the engine": self._mutated(
+                "if( autoplayState == playback_frame_range::PlayStopState::Continue ) return;", ""),
+        }
+
+    def test_enforce3_every_source_frame_mutation_is_caught(self) -> None:
+        for name, mutated in self._enforce3_mutations().items():
+            with self.subTest(name):
+                problems = scan_app_play_sources(mutated)
+                self.assertTrue(problems, f"the scan did not go red on: {name}")
+
+    def test_enforce3_sol_r2_repro_the_old_scan_returned_nothing(self) -> None:
+        # Red-first: the f9998815 scan (a raw setChecked(false) was a "safe form" anywhere) is reproduced as the
+        # property it lacked -- the mutation above must be caught by NAMING the function, not by luck.
+        restart = "playbackClock.restart();"
+        problems = scan_app_play_sources(
+            self._mutated(restart, restart + "\n    ui->actionPlay->setChecked( false );"))
+        self.assertTrue(any("MainWindow::runGuiPlaybackSmoke" in p and "(2, 0, 2)" in p for p in problems), problems)
+
+    def test_enforce3_the_reviewed_stop_table_covers_every_stop_in_the_real_sources(self) -> None:
+        from tools.repo_hygiene.app_play_scan import REVIEWED_PLAY_STOPS
+        for function in ("MainWindow::MainWindow", "MainWindow::runGuiPlaybackSmoke",
+                         "MainWindow::runHeadlessPlaybackProfile", "MainWindow::notePlaybackSmokePresentedFrame",
+                         "MainWindow::playbackHandling", "MainWindow::programmaticPlay"):
+            self.assertIn(function, REVIEWED_PLAY_STOPS)
 
     def test_fable_the_autoplay_hook_cannot_arm_in_a_smoke_or_profile_run(self) -> None:
         main = strip_cpp(self.sources[self.MAIN])[1]

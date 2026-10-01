@@ -1106,6 +1106,16 @@ private:
     playback_frame_range::ProgrammaticPlayLedger m_programmaticPlayLedger;
     int m_playStartsInProcess = 0;
     QString m_lastPlayGateRefusalMessage;
+    // PLAYBACK-CLIP-LENGTH-ENFORCE-3 (owner rule 2026-10-01): "20 s of real footage" is a SOURCE-FRAME quantity.
+    // The engine tick (playbackHandling, every backend) feeds m_sourceAdvance; programmaticPlay() records how many
+    // frames the admitted Play must consume (m_playRequiredSourceFrames); every automation stop waits on
+    // programmaticPlayState(). m_automationPacingIsolated makes getFramerate() ignore the venue's persisted
+    // fpsOverride/frameRate for automation runs (smoke, profile, autoplay) -- evidence never reads venue pacing.
+    playback_frame_range::SourceFrameAdvanceCounter m_sourceAdvance;
+    int64_t m_playRequiredSourceFrames = 0;
+    double m_playRequestedSeconds = 0.0;
+    double m_playPaceFps = 0.0;
+    bool m_automationPacingIsolated = false;
     // Contact-sheet capture-during-playback (CUDA-PLAYBACK-CONTACT-SHEET-1 r1b): an un-timed
     // SECOND playback pass, run after the measured interval closes and playback_smoke telemetry
     // has finished, so every grab below is of a genuinely presented playback frame -- never a
@@ -1699,6 +1709,12 @@ private:
     bool programmaticPlay( const char *site, double requestedSeconds );
     void programmaticStop( const char *site );
     void forceLoopOffForAutomation( const char *site );
+    // ENFORCE-3: the one decision every automation Play wait makes (reached / ended early / safety timeout /
+    // keep going) and the "required source frames consumed" predicate the presented-frames stop and the
+    // lifecycle stress share. See playback_frame_range::evaluatePlayStop.
+    playback_frame_range::PlayStopState programmaticPlayState( qint64 elapsedMs, qint64 safetyMs ) const;
+    bool programmaticPlayConsumed() const;
+    void isolateAutomationPacing( const char *site );
     int normalizePlaybackRequestedFrame( int requestedFrame, const char *where );
     void initRawBlackAndWhite( void );
     double getHorizontalStretchFactor( bool downScale );

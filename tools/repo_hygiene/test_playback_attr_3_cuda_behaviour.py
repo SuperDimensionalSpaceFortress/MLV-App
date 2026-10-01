@@ -5659,9 +5659,11 @@ class DisplayWakeJobOrderingTests(unittest.TestCase):
         # single site, now OWNER_FOOTAGE_VIEW_NO_SPACE / _FAILED / _CHANGED by token). Round 2 adds a
         # 22nd: OWNER_WORK_NOT_CLEAN (exit 28), the typed refusal when the start-of-run sweep left an
         # entry the job did not create (a legacy neutral entry, an unjournalled file) -- 21 grows to 22.
+        # PLAYBACK-CLIP-LENGTH-ENFORCE-3 adds a 23rd: SOURCE_FRAMES_INVALID (exit 29), the receipt oracle that ends the
+        # leg when the measured session did not advance its required source frames (or wrapped, or was override-paced).
         summary_writes = body.count("(Join-Path $Pub 'summary.json')")
         display_wake_fields = body.count("displayWake=$displayWake") + body.count("displayWake = $displayWake")
-        self.assertEqual(22, summary_writes, "a summary.json write site was added/removed after the wake")
+        self.assertEqual(23, summary_writes, "a summary.json write site was added/removed after the wake")
         # +1: the success path also stamps displayWake into evidence-manifest.json, a second file.
         self.assertEqual(summary_writes + 1, display_wake_fields)
 

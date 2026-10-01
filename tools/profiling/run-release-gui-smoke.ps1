@@ -2463,7 +2463,14 @@ $loopWrappedRaw = Get-ObjectPropertyValue $playbackSummary "wrapped"
 $loopTotalFrames = Get-ObjectPropertyValue $playbackSummary "total_frames"
 $loopClipSeconds = Get-ObjectPropertyValue $playbackSummary "clip_seconds"
 $loopWrapCount = Get-ObjectPropertyValue $playbackSummary "wrap_count"
+# PLAYBACK-CLIP-LENGTH-ENFORCE-3: the source-frame oracle's inputs, recorded on the receipt either way.
+$loopSourceAdvanced = Get-ObjectPropertyValue $playbackSummary "source_advanced"
+$loopRequiredSourceFrames = Get-ObjectPropertyValue $playbackSummary "required_source_frames"
+$loopNativeFps = Get-ObjectPropertyValue $playbackSummary "native_fps"
+$loopPaceFps = Get-ObjectPropertyValue $playbackSummary "pace_fps"
+$loopFpsOverride = Get-ObjectPropertyValue $playbackSummary "fps_override"
 $invalidLooped = $false
+$invalidSourceFrames = $false
 $gateFrames = Get-ObjectPropertyValue $clipLengthGate "frames"
 $loopVerdict = Get-GuiSmokeLoopVerdict -Summary $playbackSummary -WindowSeconds $Seconds -LaunchOnlyProbe ([bool]$LaunchOnlyProbe) -ClipFrames $(if ($null -ne $gateFrames) { [int64]$gateFrames } else { [int64]0 })
 if (-not $LaunchOnlyProbe -and $null -ne $playbackSummary -and ($null -eq $loopWrappedRaw -or $null -eq $loopWrapCount)) {
@@ -2472,7 +2479,11 @@ if (-not $LaunchOnlyProbe -and $null -ne $playbackSummary -and ($null -eq $loopW
     $validationWarnings += "BACKSTOP_FIELDS_MISSING: playback_smoke.summary carries no wrapped/wrap_count (a build that predates PLAYBACK-CLIP-LENGTH-ENFORCE-1 round 2); wrap detection fell back to the header-based checks only."
 }
 if ($loopVerdict.invalid) {
+    # Exit 43 = INVALID evidence, never a PASS: INVALID_LOOPED (the timeline wrapped) and ENFORCE-3's
+    # INVALID_SOURCE_FRAMES (fewer than ceil(window x native fps) distinct source frames were advanced, or the
+    # run was paced by anything but the clip's native fps) are both decided by Get-GuiSmokeLoopVerdict.
     $invalidLooped = -not $LaunchOnlyProbe
+    $invalidSourceFrames = (-not $LaunchOnlyProbe) -and (@($loopVerdict.failures | Where-Object { $_ -like 'INVALID_SOURCE_FRAMES*' }).Count -gt 0)
     $validationFailures += $loopVerdict.failures
 }
 if ($LaunchOnlyProbe -and ($playbackStartLine -or $summaryLine)) {
@@ -2806,6 +2817,14 @@ $result = [pscustomobject]@{
         runtimeTotalFrames = $loopTotalFrames
         runtimeClipSeconds = $loopClipSeconds
         invalidLooped = $invalidLooped
+        # PLAYBACK-CLIP-LENGTH-ENFORCE-3: "20 s" is ceil(window x native fps) distinct SOURCE frames the engine
+        # advanced -- counted by the app, never inferred from a wall clock.
+        sourceAdvanced = $loopSourceAdvanced
+        requiredSourceFrames = $loopRequiredSourceFrames
+        runtimeNativeFps = $loopNativeFps
+        runtimePaceFps = $loopPaceFps
+        runtimeFpsOverride = $loopFpsOverride
+        invalidSourceFrames = $invalidSourceFrames
     }
     playbackFps = [pscustomobject]@{
         requestedPlaybackSeconds = $Seconds

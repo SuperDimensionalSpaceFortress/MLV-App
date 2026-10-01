@@ -5761,6 +5761,58 @@ function ConvertTo-AttrCudaResultLineSafeText {
     $Text.Replace('"', "'")
 }
 
+# PLAYBACK-CLIP-LENGTH-ENFORCE-3 RECEIPT ORACLE for the attribution job. "20 s of real footage" is a SOURCE-FRAME
+# quantity: the measured session's playback_smoke.summary line carries source_advanced (the distinct source frames
+# the engine advanced) and required_source_frames (ceil(window x NATIVE fps)). The result is INVALID -- never a
+# measurement -- when the line is absent, either figure is missing, the requirement is unknown, source_advanced is
+# under it, the run was paced by a persisted fps override, the engine paced at anything but the clip's native fps,
+# or the timeline wrapped. The decision is the SAME one gui-smoke-length-gate.ps1's Get-GuiSmokeSourceFramesVerdict
+# makes for the smoke runner (the emitted job cannot dot-source that file); a class test executes both on one table.
+function Get-AttrCudaSourceFramesVerdict {
+    [CmdletBinding()]
+    param([AllowNull()][AllowEmptyString()][string]$SummaryLine)
+    $fields = @{}
+    if (-not [string]::IsNullOrWhiteSpace($SummaryLine)) {
+        foreach ($match in [regex]::Matches($SummaryLine, '(?<k>[A-Za-z0-9_]+)=(?<v>\S+)')) {
+            $fields[$match.Groups['k'].Value] = $match.Groups['v'].Value
+        }
+    }
+    $failures = @()
+    $advanced = $null
+    $required = $null
+    if ($fields.ContainsKey('source_advanced')) { $advanced = [int64]$fields['source_advanced'] }
+    if ($fields.ContainsKey('required_source_frames')) { $required = [int64]$fields['required_source_frames'] }
+    if ($fields.Count -eq 0) {
+        $failures += 'INVALID_SOURCE_FRAMES: the run produced no playback_smoke.summary for the measured session, so no source frames can be proven.'
+    } elseif ($null -eq $advanced -or $null -eq $required) {
+        $failures += 'INVALID_SOURCE_FRAMES: playback_smoke.summary carries no source_advanced / required_source_frames (a build that predates PLAYBACK-CLIP-LENGTH-ENFORCE-3); the footage played cannot be proven.'
+    } elseif ($required -le 0) {
+        $failures += "INVALID_SOURCE_FRAMES: required_source_frames=$required; the admitted window is unknown."
+    } elseif ($advanced -lt $required) {
+        $failures += "INVALID_SOURCE_FRAMES: the engine advanced source_advanced=$advanced distinct source frames but the Play had to consume required_source_frames=$required; under 20 s of real footage is never playback evidence."
+    }
+    if ($fields.Count -gt 0 -and $fields.ContainsKey('fps_override') -and [int]$fields['fps_override'] -ne 0) {
+        $failures += 'INVALID_SOURCE_FRAMES: the run was paced by a persisted fps override; evidence is paced at the clip native fps.'
+    }
+    if ($fields.ContainsKey('native_fps') -and $fields.ContainsKey('pace_fps')) {
+        $native = [double]::Parse($fields['native_fps'], [Globalization.CultureInfo]::InvariantCulture)
+        $pace = [double]::Parse($fields['pace_fps'], [Globalization.CultureInfo]::InvariantCulture)
+        if ($native -gt 0 -and $pace -gt 0 -and [Math]::Abs($pace - $native) -gt (0.005 * $native)) {
+            $failures += "INVALID_SOURCE_FRAMES: the engine paced at pace_fps=$pace but the clip native fps is $native; 20 s of wall clock is not 20 s of footage."
+        }
+    }
+    $wrapped = $false
+    if ($fields.ContainsKey('wrapped') -and [int]$fields['wrapped'] -ne 0) { $wrapped = $true }
+    if ($fields.ContainsKey('wrap_count') -and [int64]$fields['wrap_count'] -gt 0) { $wrapped = $true }
+    [pscustomobject]@{
+        invalid = ($failures.Count -gt 0 -or $wrapped)
+        failures = $failures
+        wrapped = $wrapped
+        sourceAdvanced = $advanced
+        requiredSourceFrames = $required
+    }
+}
+
 Export-ModuleMember -Function `
     Get-AttrCudaArtifactNames, `
     New-AttrCudaBuildInfoHeader, `
@@ -5842,4 +5894,5 @@ Export-ModuleMember -Function `
     Resolve-AttrCudaPreferredDisplay, `
     Get-AttrCudaDisplayDegradedState, `
     Get-AttrCudaGuiSmokeDisplaySelection, `
-    Find-AttrCudaFailedSmokeDisplayLog
+    Find-AttrCudaFailedSmokeDisplayLog, `
+    Get-AttrCudaSourceFramesVerdict

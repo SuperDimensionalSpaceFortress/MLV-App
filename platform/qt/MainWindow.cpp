@@ -2796,6 +2796,10 @@ MainWindow::MainWindow(int &argc, char **argv, QWidget *parent) :
 
         if( !startupFiles.empty() )
         {
+            // PLAYBACK-CLIP-LENGTH-ENFORCE-3: the autoplay hook is automation -- it never reads the venue's
+            // persisted fpsOverride / drop-frame setting. Isolated BEFORE the clip opens, so the playback timer
+            // the open starts runs at the clip's native fps.
+            if( qEnvironmentVariableIntValue( "MLVAPP_AUTOPLAY_SECONDS" ) > 0 ) isolateAutomationPacing( "autoplay" );
             openMlvSet( startupFiles );
 
             // Automation hook (test/headless): MLVAPP_AUTOPLAY_SECONDS auto-plays the opened clip via
@@ -2837,12 +2841,37 @@ MainWindow::MainWindow(int &argc, char **argv, QWidget *parent) :
                         QStringLiteral("seconds=%1 playing=%2")
                             .arg( autoplaySeconds )
                             .arg( ui->actionPlay->isChecked() ? 1 : 0 ) );
-                    QTimer::singleShot( autoplaySeconds * 1000, this, [this, autoplayExit]()
+                    // ENFORCE-3: the hook stops when the engine has CONSUMED the source frames the admitted window
+                    // required (programmaticPlayState), never on a wall clock. The wall clock is the safety net: its
+                    // expiry (or a Play the engine ended first) is a typed failure and exit code 14.
+                    auto autoplayClock = std::make_shared<QElapsedTimer>();
+                    autoplayClock->start();
+                    QTimer *autoplayPoll = new QTimer( this );
+                    autoplayPoll->setInterval( 50 );
+                    connect( autoplayPoll, &QTimer::timeout, this,
+                             [this, autoplayPoll, autoplayClock, autoplayExit]()
                     {
+                        const playback_frame_range::PlayStopState autoplayState =
+                            programmaticPlayState( autoplayClock->elapsed(), playback_frame_range::playSafetyMs( m_playRequestedSeconds ) );
+                        if( autoplayState == playback_frame_range::PlayStopState::Continue ) return;
+                        autoplayPoll->stop();
+                        autoplayPoll->deleteLater();
                         if( ui->actionPlay->isChecked() ) { ui->actionPlay->setChecked( false ); on_actionPlay_triggered( false ); }
-                        logInteractionEvent( QStringLiteral("autoplay.stop"), QString() );
-                        if( autoplayExit ) QTimer::singleShot( 400, this, [](){ qApp->quit(); } );
+                        logInteractionEvent( QStringLiteral("autoplay.stop"),
+                            QStringLiteral("state=%1 source_advanced=%2 required_source_frames=%3 elapsed_ms=%4")
+                                .arg( QString::fromLatin1( playback_frame_range::playStopFailureReason( autoplayState ) ).isEmpty()
+                                          ? QStringLiteral("REACHED")
+                                          : QString::fromLatin1( playback_frame_range::playStopFailureReason( autoplayState ) ) )
+                                .arg( static_cast<qlonglong>( m_sourceAdvance.consumed() ) )
+                                .arg( static_cast<qlonglong>( m_playRequiredSourceFrames ) )
+                                .arg( autoplayClock->elapsed() ) );
+                        if( autoplayExit )
+                        {
+                            const int autoplayExitCode = autoplayState == playback_frame_range::PlayStopState::Reached ? 0 : 14;
+                            QTimer::singleShot( 400, this, [autoplayExitCode](){ qApp->exit( autoplayExitCode ); } );
+                        }
                     } );
+                    autoplayPoll->start();
                 } );
             }
         }
@@ -7057,6 +7086,7 @@ int MainWindow::runHeadlessPlaybackProfile(const PlaybackProfileOptions & option
     // PLAYBACK-CLIP-LENGTH-ENFORCE-2: Loop is forced OFF at every automation entry (it is never persisted
     // and starts unchecked, but a test entry must not depend on that).
     forceLoopOffForAutomation( "profile-entry" );
+    isolateAutomationPacing( "profile-entry" );
 
     m_lookAssistUnsettledAnalysisCount = 0;
     m_lookAssistAutoWarmupDeferralCount = 0;
@@ -7887,23 +7917,25 @@ int MainWindow::runHeadlessPlaybackProfile(const PlaybackProfileOptions & option
 
             QElapsedTimer autoSettleClock;
             autoSettleClock.start();
-            bool settlePlayEndedEarly = false;
-            while( !playback_frame_range::playHoldReachedFloor( autoSettleClock.elapsed() ) )
+            // ENFORCE-3: the settle holds Play until the engine has CONSUMED the source frames of the 20 s window
+            // (programmaticPlayState), not until 20000 ms of wall clock; the wall clock is only the safety net.
+            const qint64 autoSettleSafetyMs = playback_frame_range::playSafetyMs( m_playRequestedSeconds );
+            playback_frame_range::PlayStopState autoSettleState = playback_frame_range::PlayStopState::Continue;
+            while( ( autoSettleState = programmaticPlayState( autoSettleClock.elapsed(), autoSettleSafetyMs ) )
+                   == playback_frame_range::PlayStopState::Continue )
             {
                 qApp->processEvents( QEventLoop::AllEvents );
-                if( !ui->actionPlay->isChecked() )
-                {
-                    settlePlayEndedEarly = true;   // the engine / a user stopped it: fail closed, never pretend
-                    break;
-                }
                 QThread::msleep( 10 );
             }
             programmaticStop( "profile-look-assist-settle" );
-            if( settlePlayEndedEarly )
+            if( autoSettleState != playback_frame_range::PlayStopState::Reached )
             {
                 lookAssistSettleSmokeStable = false;
                 lookAssistSettleSmokeFailure = QStringLiteral(
-                    "PLAY_DURATION_TOO_SHORT (the Look Assist settle Play ended before the 20 s floor; elapsed_ms=%1)" )
+                    "%1 (the Look Assist settle Play did not consume the required source frames; source_advanced=%2 required_source_frames=%3 elapsed_ms=%4)" )
+                    .arg( QString::fromLatin1( playback_frame_range::playStopFailureReason( autoSettleState ) ) )
+                    .arg( static_cast<qlonglong>( m_sourceAdvance.consumed() ) )
+                    .arg( static_cast<qlonglong>( m_playRequiredSourceFrames ) )
                     .arg( autoSettleClock.elapsed() );
                 trace(label + QStringLiteral("-auto-playback-settle-failed: ") + lookAssistSettleSmokeFailure);
                 return false;
@@ -8243,19 +8275,20 @@ int MainWindow::runHeadlessPlaybackProfile(const PlaybackProfileOptions & option
         playActionSmokeStarted = playActionAdmitted && ui->actionPlay->isChecked();
         qApp->processEvents( QEventLoop::AllEvents );
         bool playActionEndedEarly = false;
+        playback_frame_range::PlayStopState playActionState = playback_frame_range::PlayStopState::Continue;
         if( playActionSmokeStarted )
         {
-            while( !playback_frame_range::playHoldReachedFloor( playActionClock.elapsed() ) )
+            // ENFORCE-3: hold until the engine has CONSUMED the source frames of the 20 s window; a Play the
+            // engine ended first is EndedEarly and the wall clock is only the safety net (a typed failure).
+            const qint64 playActionSafetyMs = playback_frame_range::playSafetyMs( m_playRequestedSeconds );
+            while( ( playActionState = programmaticPlayState( playActionClock.elapsed(), playActionSafetyMs ) )
+                   == playback_frame_range::PlayStopState::Continue )
             {
                 qApp->processEvents( QEventLoop::AllEvents );
-                if( !ui->actionPlay->isChecked() )
-                {
-                    playActionEndedEarly = true;   // stopped by the engine or a user before the floor
-                    break;
-                }
                 QThread::msleep( 10 );
             }
-            playActionSmokeTimedOut = !playActionEndedEarly;   // the 20 s hold elapsed (not a timeout failure)
+            playActionEndedEarly = playActionState == playback_frame_range::PlayStopState::EndedEarly;
+            playActionSmokeTimedOut = playActionState == playback_frame_range::PlayStopState::SafetyTimeout;
         }
         playActionSmokeElapsedMs = playActionClock.elapsed();
         playActionSmokeFinalFrame = ui->horizontalSliderPosition->value();
@@ -8282,10 +8315,13 @@ int MainWindow::runHeadlessPlaybackProfile(const PlaybackProfileOptions & option
         {
             playActionSmokeFailure = QStringLiteral("Play action did not enter checked state.");
         }
-        else if( playActionEndedEarly )
+        else if( playActionState != playback_frame_range::PlayStopState::Reached )
         {
             playActionSmokeFailure = QStringLiteral(
-                "PLAY_DURATION_TOO_SHORT (the play-action Play ended before the 20 s floor; elapsed_ms=%1)" )
+                "%1 (the play-action Play did not consume the required source frames; source_advanced=%2 required_source_frames=%3 elapsed_ms=%4)" )
+                .arg( QString::fromLatin1( playback_frame_range::playStopFailureReason( playActionState ) ) )
+                .arg( static_cast<qlonglong>( m_sourceAdvance.consumed() ) )
+                .arg( static_cast<qlonglong>( m_playRequiredSourceFrames ) )
                 .arg( playActionSmokeElapsedMs );
         }
         else if( !playActionSmokeFrameAdvanced )
@@ -8405,6 +8441,12 @@ int MainWindow::runHeadlessPlaybackProfile(const PlaybackProfileOptions & option
     metadata.insert( QStringLiteral("programmatic_play_admitted"), m_programmaticPlayLedger.admitted );
     metadata.insert( QStringLiteral("programmatic_play_refused"), m_programmaticPlayLedger.refused );
     metadata.insert( QStringLiteral("play_wrap_count"), m_playbackWrapRecorder.replayCount() );
+    // PLAYBACK-CLIP-LENGTH-ENFORCE-3: the profile receipt carries the same source-frame oracle as the smoke summary.
+    metadata.insert( QStringLiteral("source_advanced"), static_cast<qint64>( m_sourceAdvance.consumed() ) );
+    metadata.insert( QStringLiteral("required_source_frames"), static_cast<qint64>( m_playRequiredSourceFrames ) );
+    metadata.insert( QStringLiteral("native_fps"), m_pMlvObject ? static_cast<double>( getMlvFramerate( m_pMlvObject ) ) : 0.0 );
+    metadata.insert( QStringLiteral("pace_fps"), m_playPaceFps );
+    metadata.insert( QStringLiteral("fps_override_active"), m_fpsOverride && !m_automationPacingIsolated );
     metadata.insert( QStringLiteral("play_action_smoke_started"), playActionSmokeStarted );
     metadata.insert( QStringLiteral("play_action_smoke_frame_advanced"), playActionSmokeFrameAdvanced );
     metadata.insert( QStringLiteral("play_action_smoke_timed_out"), playActionSmokeTimedOut );
@@ -8736,6 +8778,7 @@ int MainWindow::runGuiPlaybackSmoke(const GuiPlaybackSmokeOptions & options)
     m_lookAssistAutoWarmupDeferralCount = 0;
     // PLAYBACK-CLIP-LENGTH-ENFORCE-2: Loop is forced OFF at every automation entry, before anything else.
     forceLoopOffForAutomation( "gui-smoke-entry" );
+    isolateAutomationPacing( "gui-smoke-entry" );
 
     if( options.inputPath.isEmpty() )
     {
@@ -8920,6 +8963,8 @@ int MainWindow::runGuiPlaybackSmoke(const GuiPlaybackSmokeOptions & options)
         ui->actionDropFrameMode->setChecked( options.dropFrame );
         m_frameChanged = true;
     }
+    // PLAYBACK-CLIP-LENGTH-ENFORCE-3: --drop-frame-mode persisted means the pinned automation baseline (ON, set by
+    // isolateAutomationPacing at entry), never the venue's saved setting.
 
     /* Visible GUI smoke is supposed to exercise the real playback lane, not
      * the receipt-only fallback. Opt the smoke into the playback policy so
@@ -9717,15 +9762,23 @@ int MainWindow::runGuiPlaybackSmoke(const GuiPlaybackSmokeOptions & options)
     };
 
     const int durationMs = qMax( 100, options.durationMs );
-    while( playbackClock.elapsed() < durationMs && ui->actionPlay->isChecked() )
+    // PLAYBACK-CLIP-LENGTH-ENFORCE-3: the measured Play ends when the engine has CONSUMED the source frames the
+    // admitted window required (programmaticPlayState) -- NOT when --seconds of wall clock have passed. The wall
+    // clock (the window it asked for + a fixed margin, plus the stress switch time when that is requested) is only
+    // the safety net, and its expiry is a typed failure below, never a pass.
+    const qint64 measuredSafetyMs = playback_frame_range::playSafetyMs( m_playRequestedSeconds )
+        + ( options.exerciseClipLifecycleStress ? qMax( 0, options.stressSwitchAtMs ) : 0 );
+    playback_frame_range::PlayStopState measuredState = playback_frame_range::PlayStopState::Continue;
+    for( ;; )
     {
         qApp->processEvents( QEventLoop::AllEvents );
-        // ENFORCE-2 round 2 (sol B2): the switch STOPS Play on the first clip, so it only ever happens once
-        // Play has run the 20 s floor (the stress option is also refused below 20000 ms at launch).
+        // ENFORCE-2 round 2 (sol B2) / ENFORCE-3: the switch STOPS Play on the first clip, so it only ever happens
+        // once the engine has consumed the required source frames (and not before --stress-switch-at-ms, which the
+        // app refuses below 20000 at launch); a Play the engine already ended is attempted too, to fail typed.
         if( options.exerciseClipLifecycleStress
          && !stressAttempted
-         && playback_frame_range::playHoldReachedFloor( playbackClock.elapsed() )
-         && playbackClock.elapsed() >= qMax( 0, options.stressSwitchAtMs ) )
+         && programmaticPlayConsumed()
+         && ( playbackClock.elapsed() >= qMax( 0, options.stressSwitchAtMs ) || !ui->actionPlay->isChecked() ) )
         {
             stressOk = runClipLifecycleStress();
             logInteractionEvent(
@@ -9762,6 +9815,14 @@ int MainWindow::runGuiPlaybackSmoke(const GuiPlaybackSmokeOptions & options)
                     << stressFailure << ".\n";
                 return 10;
             }
+        }
+        measuredState = programmaticPlayState( playbackClock.elapsed(), measuredSafetyMs );
+        if( measuredState == playback_frame_range::PlayStopState::SafetyTimeout
+         || measuredState == playback_frame_range::PlayStopState::EndedEarly
+         || ( measuredState == playback_frame_range::PlayStopState::Reached
+              && !( options.exerciseClipLifecycleStress && !stressAttempted ) ) )
+        {
+            break;
         }
         if( midSessionExposureChangeEnabled
          && !midSessionExposureChangeApplied
@@ -9806,16 +9867,17 @@ int MainWindow::runGuiPlaybackSmoke(const GuiPlaybackSmokeOptions & options)
         QThread::msleep( 10 );
     }
     const qint64 playedMs = playbackClock.elapsed();
-    // ENFORCE-2 round 2: a measured Play that ended before the 20 s floor (the engine stopped it, or the
-    // presented-frames target was somehow met early) is never reported as a pass -- fail closed, typed.
-    // One frame period of slack covers a presented-frames target of exactly 20 s of frames.
-    if( !playback_frame_range::playHoldReachedFloor(
-            playedMs + static_cast<qint64>( 1000.0 / qMax( 1.0, presentedTargetFps ) + 1.0 ) ) )
+    // ENFORCE-3: a measured Play that did not CONSUME the required source frames -- the engine ended it first
+    // (SOURCE_FRAMES_SHORT) or the safety net expired (PLAY_SAFETY_TIMEOUT) -- is never a pass: typed, exit 14.
+    // (This replaces the ENFORCE-2 wall-clock "played_ms >= 20000" check, which a persisted fpsOverride defeated.)
+    if( measuredState != playback_frame_range::PlayStopState::Reached )
     {
         m_playbackSmokeFullscreenLossLatchArmed = false;
         programmaticStop( "gui-smoke-measured-early-end" );
-        err << "[GUI-SMOKE] ERROR: PLAY_DURATION_TOO_SHORT (played_ms=" << playedMs
-            << " window=" << playback_frame_range::kMinPlayWindowMs << ")\n";
+        err << "[GUI-SMOKE] ERROR: " << playback_frame_range::playStopFailureReason( measuredState )
+            << " (source_advanced=" << static_cast<qlonglong>( m_sourceAdvance.consumed() )
+            << " required_source_frames=" << static_cast<qlonglong>( m_playRequiredSourceFrames )
+            << " played_ms=" << playedMs << ")\n";
         return 14;
     }
     // Disarm right at loop exit -- before the guard's eventual leavePlaybackSmokeFullscreen()
@@ -10964,6 +11026,7 @@ void MainWindow::playbackHandling(int timeDiff)
                 //Loop, goto cut in
                 // PLAYBACK-CLIP-LENGTH-ENFORCE-1 round 2: THE engine wrap -- counted here, not inferred.
                 m_playbackWrapRecorder.noteEngineWrap();
+                m_sourceAdvance.noteEngineTick( ui->horizontalSliderPosition->value(), cutInFrame, true );
                 m_playbackInternalSliderAdvance = true;
                 ui->horizontalSliderPosition->setValue( cutInFrame );
                 m_playbackInternalSliderAdvance = false;
@@ -10993,9 +11056,13 @@ void MainWindow::playbackHandling(int timeDiff)
                 //Normal mode: next frame
                 if( !ui->actionDropFrameMode->isChecked() )
                 {
+                    // PLAYBACK-CLIP-LENGTH-ENFORCE-3: every source frame the engine advances is counted (the
+                    // slider value AFTER setValue, so a clamp at the slider maximum is not counted as footage).
+                    const double sourcePositionBeforeTick = ui->horizontalSliderPosition->value();
                     m_playbackInternalSliderAdvance = true;
                     ui->horizontalSliderPosition->setValue( ui->horizontalSliderPosition->value() + 1 );
                     m_playbackInternalSliderAdvance = false;
+                    m_sourceAdvance.noteEngineTick( sourcePositionBeforeTick, ui->horizontalSliderPosition->value(), false );
                     m_newPosDropMode = ui->horizontalSliderPosition->value(); //track it also, for mode changing
                     m_frameChanged = true;
                 }
@@ -11006,12 +11073,16 @@ void MainWindow::playbackHandling(int timeDiff)
                 //loop wraps back by the cut range width, or clamps to the last frame -- see
                 //PlaybackFrameRange.h for the BLOCKER note on why the wrapped case can never
                 //return the range's last frame)
+                const double sourcePositionBeforeDropTick = m_newPosDropMode;
                 const playback_frame_range::DropFrameTickResult dropFrameTick =
                     playback_frame_range::advanceDropFrameTick(
                         m_newPosDropMode, getFramerate() * (double)timeDiff / 1000.0,
                         ui->spinBoxCutIn->value(), ui->spinBoxCutOut->value(),
                         ui->actionLoop->isChecked() );
                 m_newPosDropMode = dropFrameTick.position;
+                // PLAYBACK-CLIP-LENGTH-ENFORCE-3: the drop-frame engine's source-frame advance (dropped frames
+                // still advance the timeline; a wrap never counts).
+                m_sourceAdvance.noteEngineTick( sourcePositionBeforeDropTick, dropFrameTick.position, dropFrameTick.wrapped );
                 // PLAYBACK-CLIP-LENGTH-ENFORCE-1 round 2: the drop-frame engine wrap, counted where it happens.
                 if( dropFrameTick.wrapped ) m_playbackWrapRecorder.noteEngineWrap();
                 //Sync audio
@@ -11952,7 +12023,9 @@ void MainWindow::writeSettings()
     QSettings set( QSettings::UserScope, "magiclantern.MLVApp", "MLVApp" );
     set.setValue( "mainWindowGeometry", saveGeometry() );
     //set.setValue( "mainWindowState", saveState() ); // docks, toolbars, etc...
-    set.setValue( "dragFrameMode", ui->actionDropFrameMode->isChecked() );
+    // PLAYBACK-CLIP-LENGTH-ENFORCE-3: an automation run pins drop-frame ON for its own pacing; that pin is never
+    // written back over the venue's saved choice.
+    if( !m_automationPacingIsolated ) set.setValue( "dragFrameMode", ui->actionDropFrameMode->isChecked() );
     set.setValue( "audioOutput", ui->actionAudioOutput->isChecked() );
     set.setValue( "zebras", ui->actionShowZebras->isChecked() );
     set.setValue( "fastOpen", ui->actionFastOpen->isChecked() );
@@ -18106,7 +18179,10 @@ void MainWindow::setPreviewMode( void )
 //Get the framerate. Override or Original
 double MainWindow::getFramerate( void )
 {
-    if( m_fpsOverride ) return m_frameRate;
+    // PLAYBACK-CLIP-LENGTH-ENFORCE-3: an automation run (GUI smoke, profile, autoplay hook) never reads the
+    // venue's persisted fpsOverride / frameRate -- evidence paces at the clip's native fps. The persisted values
+    // stay untouched (m_fpsOverride is still what the export settings dialog shows and writes back).
+    if( m_fpsOverride && !m_automationPacingIsolated ) return m_frameRate;
     else return getMlvFramerate( m_pMlvObject );
 }
 
@@ -26428,6 +26504,7 @@ void MainWindow::notePlaybackSmokePresentedFrame(
 
     if( m_playbackSmokeTargetPresentedFrames > 0
      && m_playbackSmokePresentedFrames >= m_playbackSmokeTargetPresentedFrames
+     && programmaticPlayConsumed()   // ENFORCE-3: N presented frames are not N source frames (repaints, drops)
      && ui->actionPlay->isChecked() )
     {
         // Accumulate the target frame before stopping. setChecked(false)
@@ -26786,7 +26863,8 @@ void MainWindow::finishPlaybackSmokeTelemetry( const char *reason )
                "gpu_texture_route_scale_clamp_active=%65 "
                "gpu_texture_route_scale_clamp_requested_scale=%66 "
                "screensaver_blocked_count=%67 "
-               "wrapped=%68 total_frames=%69 clip_seconds=%70 wrap_count=%71 jump_to_first_count=%72 restart_count=%73" )
+               "wrapped=%68 total_frames=%69 clip_seconds=%70 wrap_count=%71 jump_to_first_count=%72 restart_count=%73 "
+               "source_advanced=%74 required_source_frames=%75 native_fps=%76 pace_fps=%77 fps_override=%78 source_start_frame=%79" )
                .arg( static_cast<qulonglong>( m_playbackSmokeSessionId ) )
                .arg( QString::fromLatin1( reason ? reason : "unknown" ) )
                .arg( elapsedMs, 0, 'f', 3 )
@@ -26876,7 +26954,16 @@ void MainWindow::finishPlaybackSmokeTelemetry( const char *reason )
                .arg( smokeClipSeconds, 0, 'f', 3 )
                .arg( m_playbackWrapRecorder.replayCount() )   // engine wraps + jump-to-first + restarts
                .arg( m_playbackWrapRecorder.jumpToFirstCount )
-               .arg( m_playbackWrapRecorder.restartCount );
+               .arg( m_playbackWrapRecorder.restartCount )
+               // PLAYBACK-CLIP-LENGTH-ENFORCE-3: the source-frame oracle -- the distinct source frames the engine
+               // advanced, and how many the admitted Play had to. The runner turns source_advanced <
+               // required_source_frames into INVALID, never a PASS.
+               .arg( static_cast<qlonglong>( m_sourceAdvance.consumed() ) )
+               .arg( static_cast<qlonglong>( m_playRequiredSourceFrames ) )
+               .arg( smokeClipFps, 0, 'f', 3 )
+               .arg( m_playPaceFps, 0, 'f', 3 )
+               .arg( bool01( m_fpsOverride && !m_automationPacingIsolated ) )
+               .arg( static_cast<qlonglong>( m_sourceAdvance.startFrame ) );
 
     qInfo().noquote()
         << QStringLiteral(
@@ -27503,7 +27590,8 @@ void MainWindow::finishPlaybackSmokeTelemetry( const char *reason )
         << QStringLiteral(
                "playback_smoke.gate session=%1 verdict=%2 frames_presented=%3 "
                "decode_requests_issued=%4 parity_match_count=%5 frames_expected=%6 "
-               "wrapped=%7 total_frames=%8 clip_seconds=%9 wrap_count=%10 jump_to_first_count=%11 restart_count=%12" )
+               "wrapped=%7 total_frames=%8 clip_seconds=%9 wrap_count=%10 jump_to_first_count=%11 restart_count=%12 "
+               "source_advanced=%13 required_source_frames=%14 native_fps=%15 pace_fps=%16 fps_override=%17" )
                .arg( static_cast<qulonglong>( m_playbackSmokeSessionId ) )
                .arg( static_cast<int>( gateVerdict ) )
                .arg( m_playbackSmokePresentedFrames )
@@ -27515,7 +27603,12 @@ void MainWindow::finishPlaybackSmokeTelemetry( const char *reason )
                .arg( smokeClipSeconds, 0, 'f', 3 )
                .arg( m_playbackWrapRecorder.replayCount() )   // engine wraps + jump-to-first + restarts
                .arg( m_playbackWrapRecorder.jumpToFirstCount )
-               .arg( m_playbackWrapRecorder.restartCount );
+               .arg( m_playbackWrapRecorder.restartCount )
+               .arg( static_cast<qlonglong>( m_sourceAdvance.consumed() ) )
+               .arg( static_cast<qlonglong>( m_playRequiredSourceFrames ) )
+               .arg( smokeClipFps, 0, 'f', 3 )
+               .arg( m_playPaceFps, 0, 'f', 3 )
+               .arg( bool01( m_fpsOverride && !m_automationPacingIsolated ) );
 
     // Window foreground state at session begin and at this gate, plus how many times the
     // whole application lost the OS foreground during the session (event-driven via
@@ -27690,6 +27783,9 @@ void MainWindow::on_actionPlay_toggled(bool checked)
         // PLAYBACK-CLIP-LENGTH-ENFORCE-2: every Play start after the first in this process is a restart,
         // whatever started it; counted so a replay can never pass as a clean measured run.
         if( ++m_playStartsInProcess > 1 ) m_playbackWrapRecorder.noteRestart();
+        // PLAYBACK-CLIP-LENGTH-ENFORCE-3: the FIRST Play start of the process arms the source-frame counter at the
+        // effective start position; a later start never restarts it (programmaticPlay resets it before its one Play).
+        m_sourceAdvance.begin( ui->horizontalSliderPosition->value() );
         // CUDA-PERF-DISPLAY-WAKE-1: acquired before beginPlaybackSmokeTelemetry() so the
         // playback_smoke.display_required line it emits reports the state already in effect.
         // CUDA-PERF-DISPLAY-WAKE-2: capture the acquisition OUTCOME (the Win32 return value),
@@ -27747,13 +27843,18 @@ playback_frame_range::PlayableWindowVerdict MainWindow::checkPlayableWindow( con
     // ENFORCE-2 round 2 (sol B3): measure the range the ENGINE plays -- with MLVAPP_F3_DISABLE_CUT_RANGE_REPAIR
     // set the play path leaves a collapsed / inverted range alone (normalizePlaybackCutRangeForLoadedClip), so
     // the gate must not assume the repair either. This is the one knob that changes the effective range.
+    // ENFORCE-3: the engine's REAL pace (getFramerate(): a persisted fpsOverride when pacing is not isolated)
+    // goes into the verdict -- the window must be consumable at that pace inside the safety budget, else the
+    // Play is refused before it starts. An unusable pace (<= 0) is passed as -1 and fails closed.
+    const double enginePaceFps = getFramerate();
     return playback_frame_range::evaluatePlayableWindow(
         ui->horizontalSliderPosition->value(),
         ui->spinBoxCutIn->value(),
         ui->spinBoxCutOut->value(),
         totalFrames, fps, requestedSeconds,
         playback_frame_range::kMinPlayWindowSeconds,
-        !f3CutRangeRepairDisabledByEnvironment() );
+        !f3CutRangeRepairDisabledByEnvironment(),
+        enginePaceFps > 0.0 ? enginePaceFps : -1.0 );
 }
 
 bool MainWindow::programmaticPlay( const char *site, double requestedSeconds )
@@ -27764,7 +27865,13 @@ bool MainWindow::programmaticPlay( const char *site, double requestedSeconds )
     // never toggles it off); one that fails is refused and stopped, like any other refusal.
     const bool alreadyPlaying = ui->actionPlay->isChecked();
     const playback_frame_range::PlayableWindowVerdict verdict = checkPlayableWindow( site, requestedSeconds );
-    if( alreadyPlaying && verdict.ok ) return true;
+    if( alreadyPlaying && verdict.ok )
+    {
+        m_playRequiredSourceFrames = std::max( m_playRequiredSourceFrames, verdict.requiredFrames );
+        m_playRequestedSeconds = std::max( m_playRequestedSeconds, requestedSeconds );
+        m_playPaceFps = verdict.paceFps;
+        return true;
+    }
 
     if( !m_programmaticPlayLedger.admit( verdict ) )
     {
@@ -27776,6 +27883,16 @@ bool MainWindow::programmaticPlay( const char *site, double requestedSeconds )
                 "PLAY_DURATION_TOO_SHORT (requested=%1 window=%2; site=%3)" )
                 .arg( verdict.requestedSeconds, 0, 'f', 3 )
                 .arg( playback_frame_range::kMinPlayWindowSeconds, 0, 'f', 3 )
+                .arg( QString::fromLatin1( site ) );
+        }
+        else if( reason == QLatin1String( "PLAY_PACE_TOO_SLOW" ) )
+        {
+            m_lastPlayGateRefusalMessage = QStringLiteral(
+                "PLAY_PACE_TOO_SLOW (engine pace=%1 fps needs %2 s for %3 source frames; budget=%4 s; site=%5)" )
+                .arg( verdict.paceFps, 0, 'f', 3 )
+                .arg( verdict.wallNeededSeconds, 0, 'f', 3 )
+                .arg( static_cast<qlonglong>( verdict.requiredFrames ) )
+                .arg( verdict.wallBudgetSeconds, 0, 'f', 3 )
                 .arg( QString::fromLatin1( site ) );
         }
         else if( reason == QLatin1String( "REPLAY_REFUSED" ) )
@@ -27799,27 +27916,41 @@ bool MainWindow::programmaticPlay( const char *site, double requestedSeconds )
         }
         logInteractionEvent(
             QStringLiteral("play_gate.refused"),
-            QStringLiteral("site=%1 reason=%2 scope=%3 clip_seconds=%4 playable_seconds=%5 required_seconds=%6 position=%7 cut_in=%8 cut_out=%9")
+            QStringLiteral("site=%1 reason=%2 scope=%3 clip_seconds=%4 playable_seconds=%5 required_seconds=%6 position=%7 cut_in=%8 cut_out=%9 required_source_frames=%10 playable_frames=%11 pace_fps=%12 wall_needed_seconds=%13 wall_budget_seconds=%14")
                 .arg( QString::fromLatin1( site ), reason, QString::fromLatin1( verdict.scope ) )
                 .arg( verdict.clipSeconds, 0, 'f', 3 )
                 .arg( verdict.playableSeconds, 0, 'f', 3 )
                 .arg( verdict.requiredSeconds, 0, 'f', 3 )
                 .arg( ui->horizontalSliderPosition->value() )
                 .arg( ui->spinBoxCutIn->value() )
-                .arg( ui->spinBoxCutOut->value() ) );
+                .arg( ui->spinBoxCutOut->value() )
+                .arg( static_cast<qlonglong>( verdict.requiredFrames ) )
+                .arg( verdict.playableFrames )
+                .arg( verdict.paceFps, 0, 'f', 3 )
+                .arg( verdict.wallNeededSeconds, 0, 'f', 3 )
+                .arg( verdict.wallBudgetSeconds, 0, 'f', 3 ) );
         return false;
     }
 
     logInteractionEvent(
         QStringLiteral("play_gate.admitted"),
-        QStringLiteral("site=%1 clip_seconds=%2 playable_seconds=%3 required_seconds=%4 position=%5 cut_in=%6 cut_out=%7")
+        QStringLiteral("site=%1 clip_seconds=%2 playable_seconds=%3 required_seconds=%4 position=%5 cut_in=%6 cut_out=%7 required_source_frames=%8 playable_frames=%9 pace_fps=%10")
             .arg( QString::fromLatin1( site ) )
             .arg( verdict.clipSeconds, 0, 'f', 3 )
             .arg( verdict.playableSeconds, 0, 'f', 3 )
             .arg( verdict.requiredSeconds, 0, 'f', 3 )
             .arg( ui->horizontalSliderPosition->value() )
             .arg( ui->spinBoxCutIn->value() )
-            .arg( ui->spinBoxCutOut->value() ) );
+            .arg( ui->spinBoxCutOut->value() )
+            .arg( static_cast<qlonglong>( verdict.requiredFrames ) )
+            .arg( verdict.playableFrames )
+            .arg( verdict.paceFps, 0, 'f', 3 ) );
+    // ENFORCE-3: the admitted Play must CONSUME verdict.requiredFrames distinct source frames; the counter is
+    // reset here so it measures THIS Play (the toggled handler arms it at the effective start position).
+    m_sourceAdvance = playback_frame_range::SourceFrameAdvanceCounter();
+    m_playRequiredSourceFrames = verdict.requiredFrames;
+    m_playRequestedSeconds = requestedSeconds;
+    m_playPaceFps = verdict.paceFps;
     ui->actionPlay->trigger();   // allowlisted: the gate's own Play
     return true;
 }
@@ -27829,6 +27960,34 @@ void MainWindow::programmaticStop( const char *site )
 {
     Q_UNUSED( site );
     if( ui->actionPlay->isChecked() ) ui->actionPlay->trigger();   // allowlisted: stop only (action is checked)
+}
+
+// ENFORCE-3: the ONE decision every automation Play wait makes. A wall clock alone is never a pass.
+playback_frame_range::PlayStopState MainWindow::programmaticPlayState( qint64 elapsedMs, qint64 safetyMs ) const
+{
+    return playback_frame_range::evaluatePlayStop(
+        m_sourceAdvance.consumed(), m_playRequiredSourceFrames, ui->actionPlay->isChecked(), elapsedMs, safetyMs );
+}
+
+bool MainWindow::programmaticPlayConsumed() const
+{
+    return m_playRequiredSourceFrames > 0 && m_sourceAdvance.consumed() >= m_playRequiredSourceFrames;
+}
+
+// ENFORCE-3: an automation run never reads the venue's persisted pacing. getFramerate() ignores fpsOverride /
+// frameRate from here on, and drop-frame mode is pinned ON (the smoke applies its explicit --drop-frame-mode
+// afterwards; the persisted "dragFrameMode" is never the evidence's pacing).
+void MainWindow::isolateAutomationPacing( const char *site )
+{
+    m_automationPacingIsolated = true;
+    if( !ui->actionDropFrameMode->isChecked() ) ui->actionDropFrameMode->setChecked( true );
+    logInteractionEvent(
+        QStringLiteral("automation.pacing_isolated"),
+        QStringLiteral("site=%1 persisted_fps_override=%2 persisted_frame_rate=%3 drop_frame=%4")
+            .arg( QString::fromLatin1( site ) )
+            .arg( bool01( m_fpsOverride ) )
+            .arg( m_frameRate, 0, 'f', 3 )
+            .arg( bool01( ui->actionDropFrameMode->isChecked() ) ) );
 }
 
 // Automation entries only ever turn Loop OFF; nothing in the app turns it on by itself.

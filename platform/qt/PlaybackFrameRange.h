@@ -224,9 +224,104 @@ inline double smokePlayRequestSeconds( int durationMs, int targetPresentedFrames
 // The lifecycle stress switch STOPS Play on the first clip, so it may only happen once Play has run the floor.
 inline bool stressSwitchReachesFloor( int switchAtMs ) { return switchAtMs >= kMinPlayWindowMs; }
 
-// An exercise mode that ends its own Play (the Look Assist settle, the play-action smoke) holds Play at least
-// until the floor has elapsed.
-inline bool playHoldReachedFloor( int64_t elapsedMs ) { return elapsedMs >= kMinPlayWindowMs; }
+// ---------------------------------------------------------------------------------------------------------
+// PLAYBACK-CLIP-LENGTH-ENFORCE-3 (owner rule 2026-10-01): "20 s of real footage" is a SOURCE-FRAME quantity.
+//
+// ENFORCE-2 measured "20 s" three different ways: admission with the clip's native fps, the engine with
+// getFramerate() (a persisted fpsOverride changes it), and every automation STOP with a wall clock. With
+// fpsOverride=12 on a 24 fps clip a run stopped after 20 s of wall clock having covered ~10 s of footage.
+// Now the engine COUNTS the distinct source frames it has advanced (SourceFrameAdvanceCounter, fed from the
+// engine tick), admission demands a window holding ceil(20 x native fps) of them that the engine can consume at
+// its REAL pace, and every automation stop waits for the count (evaluatePlayStop). A wall clock survives only
+// as a safety net whose expiry is a typed FAILURE, never a pass. Wrap / backward steps are never counted.
+// ---------------------------------------------------------------------------------------------------------
+
+// ceil(seconds x fps): the number of source frames that make `seconds` of footage. 0 for an unknown fps or
+// window, which can never be "reached" (fail closed).
+inline int64_t requiredSourceFrames( double nativeFps, double footageSpan )
+{
+    if( !( nativeFps > 0.0 ) || !( footageSpan > 0.0 ) ) return 0;
+    return static_cast<int64_t>( std::ceil( footageSpan * nativeFps - 1e-9 ) );
+}
+
+// SourceFrameAdvanceCounter -- monotonic, process-cumulative (the FIRST Play start arms it; a later start never
+// restarts it, so a replay cannot launder the count). consumed() is the number of DISTINCT source frames the
+// engine has put the playhead on since the measured Play began, the start frame included: n frames are n/fps
+// seconds of footage, and the range [position, cut-out] holds exactly (cut-out - position + 1) of them.
+struct SourceFrameAdvanceCounter
+{
+    bool armed = false;
+    int64_t startFrame = 0;
+    int64_t highWater = 0;            // highest frame index reached; frames at or below it are never counted again
+    int64_t forwardSteps = 0;         // distinct frames advanced beyond the start frame
+    int wrapOrBackwardTicks = 0;      // ticks the engine moved backwards / wrapped: never counted as footage
+    int beginsIgnored = 0;
+    int externalJumpRebases = 0;      // the playhead was moved by something other than an engine tick (a seek)
+
+    void begin( int64_t position )
+    {
+        if( armed ) { ++beginsIgnored; return; }
+        armed = true;
+        startFrame = highWater = position;
+    }
+    // One engine tick: the playhead moved from oldPosition to newPosition (fractional in drop-frame mode).
+    void noteEngineTick( double oldPosition, double newPosition, bool wrapped )
+    {
+        if( !armed ) return;
+        if( wrapped || newPosition < oldPosition ) { ++wrapOrBackwardTicks; return; }
+        const int64_t oldFrame = static_cast<int64_t>( std::floor( oldPosition + 1e-9 ) );
+        const int64_t newFrame = static_cast<int64_t>( std::floor( newPosition + 1e-9 ) );
+        // The playhead sat ABOVE every frame this counter has seen when the tick began: something other than the
+        // engine moved it (a seek, a snap at Play start). That jump is not footage played -- count restarts from
+        // where the playhead really was, so a jump can only ever under-count, never inflate the total.
+        if( oldFrame > highWater )
+        {
+            ++externalJumpRebases;
+            startFrame = highWater = oldFrame;
+            forwardSteps = 0;
+        }
+        if( newFrame > highWater )
+        {
+            forwardSteps += newFrame - highWater;
+            highWater = newFrame;
+        }
+    }
+    int64_t consumed() const { return armed ? forwardSteps + 1 : 0; }
+};
+
+// The wall-clock safety net every automation wait carries. It is NOT the stop: running into it is a typed
+// failure (PLAY_SAFETY_TIMEOUT). The runner's own process budget (--seconds + 30 s) is longer than this.
+constexpr int kPlaySafetyMarginMs = 15000;
+inline int64_t playSafetyMs( double requestedSeconds )
+{
+    return static_cast<int64_t>( std::max( 0.0, requestedSeconds ) * 1000.0 ) + kPlaySafetyMarginMs;
+}
+
+enum class PlayStopState { Continue, Reached, EndedEarly, SafetyTimeout };
+
+// The ONE decision every automation Play wait makes. Reached (the source frames were consumed) wins over
+// everything, including a Play that ended on that very frame; a Play that ended first is EndedEarly; a wall
+// clock that ran out first is SafetyTimeout. required <= 0 can never be reached.
+inline PlayStopState evaluatePlayStop( int64_t consumed, int64_t required, bool playStillRunning,
+                                       int64_t elapsedMs, int64_t safetyMs )
+{
+    if( required > 0 && consumed >= required ) return PlayStopState::Reached;
+    if( !playStillRunning ) return PlayStopState::EndedEarly;
+    if( elapsedMs >= safetyMs ) return PlayStopState::SafetyTimeout;
+    return PlayStopState::Continue;
+}
+
+inline const char *playStopFailureReason( PlayStopState state )
+{
+    switch( state )
+    {
+    case PlayStopState::Reached: return "";
+    case PlayStopState::EndedEarly: return "SOURCE_FRAMES_SHORT";
+    case PlayStopState::SafetyTimeout: return "PLAY_SAFETY_TIMEOUT";
+    case PlayStopState::Continue: break;
+    }
+    return "PLAY_STATE_UNRESOLVED";
+}
 
 struct PlayableWindowVerdict
 {
@@ -245,7 +340,15 @@ struct PlayableWindowVerdict
     int positionFrame = 0;     // 0-based, clamped
     int lastPlayableFrame = 0; // 0-based inclusive: the cut-out frame
     int playableFrames = 0;    // frames positionFrame..lastPlayableFrame inclusive
+    // ENFORCE-3: the same window in the unit the engine counts.
+    int64_t requiredFrames = 0;        // ceil(max(floor, requested) x NATIVE fps)
+    double paceFps = 0.0;              // the engine's real pace (getFramerate(): a persisted override included)
+    double wallNeededSeconds = 0.0;    // wall clock the engine needs for requiredFrames at paceFps
+    double wallBudgetSeconds = 0.0;    // wall clock the caller's safety net allows
 };
+
+// paceFps default: "the engine runs at the clip's native fps" (tests, and callers with no override).
+constexpr double kPaceIsNative = 0.0;
 
 // engineCutRangeForPlay -- the range the engine ACTUALLY plays. With the collapsed-range repair enabled (the
 // normal state) it is normalizeCutRange(..., repair = true). MLVAPP_F3_DISABLE_CUT_RANGE_REPAIR switches the
@@ -268,10 +371,15 @@ inline CutRange engineCutRangeForPlay( int cutIn, int cutOut, int totalFrames, b
 // The range is the one the engine plays (engineCutRangeForPlay; the collapsed-range repair is on unless
 // the caller says the engine has it disabled), so the window measured here is the window that would really
 // play. requestedSeconds is the window the CALLER will hold Play for; it must itself reach floorSeconds.
+//
+// ENFORCE-3: the window is measured in SOURCE FRAMES at the clip's NATIVE fps (ceil(20 x fps) of them), and
+// the engine must be able to consume them at its ACTUAL pace (paceFps = getFramerate(), a persisted fpsOverride
+// included) inside the caller's wall-clock safety budget -- else PLAY_PACE_TOO_SLOW, before Play. Advancing
+// from the start frame to the Nth frame takes N-1 steps, so wallNeeded = (required - 1) / pace.
 inline PlayableWindowVerdict evaluatePlayableWindow(
     int positionFrame, int cutIn, int cutOut, int totalFrames, double fps,
     double requestedSeconds, double floorSeconds = kMinPlayWindowSeconds,
-    bool collapsedRangeRepairEnabled = true )
+    bool collapsedRangeRepairEnabled = true, double paceFps = kPaceIsNative )
 {
     PlayableWindowVerdict v;
     v.requiredSeconds = std::max( floorSeconds, requestedSeconds );
@@ -297,15 +405,29 @@ inline PlayableWindowVerdict evaluatePlayableWindow(
         ? v.lastPlayableFrame - v.positionFrame + 1
         : 0;
     v.playableSeconds = static_cast<double>( v.playableFrames ) / fps;
+    v.requiredFrames = requiredSourceFrames( fps, v.requiredSeconds );
+    // Pace: the engine must be able to consume requiredFrames inside the caller's safety budget. Computed before
+    // any verdict so even a refusal reports the pace the gate measured with.
+    v.paceFps = paceFps == kPaceIsNative ? fps : paceFps;
+    v.wallBudgetSeconds = static_cast<double>( playSafetyMs( requestedSeconds ) ) / 1000.0;
+    v.wallNeededSeconds = v.paceFps > 0.0
+        ? static_cast<double>( std::max<int64_t>( 0, v.requiredFrames - 1 ) ) / v.paceFps
+        : 0.0;
 
-    if( v.playableSeconds + 1e-9 >= v.requiredSeconds )
+    if( v.playableFrames < v.requiredFrames )
     {
-        v.ok = true;
-        v.reason = "";
+        v.reason = "CLIP_TOO_SHORT";
+        v.scope = v.clipSeconds + 1e-9 < v.requiredSeconds ? "clip" : "cut_range";
         return v;
     }
-    v.reason = "CLIP_TOO_SHORT";
-    v.scope = v.clipSeconds + 1e-9 < v.requiredSeconds ? "clip" : "cut_range";
+    if( !( v.paceFps > 0.0 ) || v.wallNeededSeconds > v.wallBudgetSeconds + 1e-9 )
+    {
+        v.reason = "PLAY_PACE_TOO_SLOW";
+        v.scope = "pace";
+        return v;
+    }
+    v.ok = true;
+    v.reason = "";
     return v;
 }
 

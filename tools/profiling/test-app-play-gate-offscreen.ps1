@@ -27,7 +27,11 @@ param(
     [string]$RepoRoot = (Split-Path (Split-Path $PSScriptRoot -Parent) -Parent),
     [int]$TimeoutSeconds = 90,
     # Directories prepended to PATH so a non-deployed build finds its Qt / MinGW DLLs (exit 0xC0000135 otherwise).
-    [string[]]$DllDirs = @()
+    [string[]]$DllDirs = @(),
+    # PLAYBACK-CLIP-LENGTH-ENFORCE-3: also prove, against the REAL persisted QSettings of this user (HKCU
+    # Software\magiclantern.MLVApp\MLVApp), that an automation run ignores a saved fpsOverride=true/frameRate=12.
+    # The two values are written for the probe and the original values are put back in a finally block.
+    [switch]$PersistedOverrideProbe
 )
 $ErrorActionPreference = 'Stop'
 $DllDirs = @($DllDirs | ForEach-Object { $_ -split ',' } | Where-Object { $_ })   # -File passes 'a','b' as one comma-joined string
@@ -43,7 +47,8 @@ New-Item -ItemType Directory -Force -Path $work | Out-Null
 
 function Invoke-GateEntry {
     param([string]$Name, [string[]]$Arguments, [hashtable]$Environment = @{},
-          [Nullable[int]]$ExpectExit, [string]$ExpectToken, [switch]$MayNotExit, [string]$OutputPath = '')
+          [Nullable[int]]$ExpectExit, [string]$ExpectToken, [switch]$MayNotExit, [string]$OutputPath = '',
+          [string[]]$ExtraTokens = @(), [string[]]$ForbiddenTokens = @())
     $logDir = Join-Path $work $Name
     New-Item -ItemType Directory -Force -Path $logDir | Out-Null
     $saved = @{}
@@ -71,6 +76,8 @@ function Invoke-GateEntry {
     }
     $playStarted = $logText -match 'play\.toggled\.begin checked=1'
     $tokenSeen = ($stderr -match [regex]::Escape($ExpectToken)) -or ($logText -match [regex]::Escape($ExpectToken))
+    foreach ($extra in $ExtraTokens) { if (-not (($stderr -match [regex]::Escape($extra)) -or ($logText -match [regex]::Escape($extra)))) { $tokenSeen = $false } }
+    foreach ($forbidden in $ForbiddenTokens) { if (($stderr -match [regex]::Escape($forbidden)) -or ($logText -match [regex]::Escape($forbidden))) { $tokenSeen = $false } }
     $exitOk = if ($MayNotExit) { $true } else { ($exitCode -eq [int]$ExpectExit) }
     $jsonWritten = ($OutputPath -ne '') -and (Test-Path -LiteralPath $OutputPath)
     $ok = $exitOk -and $tokenSeen -and (-not $playStarted) -and (-not $jsonWritten)
@@ -121,6 +128,33 @@ $results += Invoke-GateEntry -Name 'gui-smoke-f3-repair-disabled' -ExpectExit 14
 $results += Invoke-GateEntry -Name 'autoplay-env-hook-24s-on-a-short-clip' -MayNotExit -ExpectToken 'play_gate.refused site=autoplay' `
     -Arguments @($fixture) `
     -Environment @{ MLVAPP_AUTOPLAY_SECONDS = '24'; MLVAPP_AUTOPLAY_SETTLE_MS = '500'; MLVAPP_AUTOPLAY_EXIT = '1' }
+
+# ---- ENFORCE-3: a persisted fpsOverride must not change what an automation run measures ---------------------
+# The venue's saved fpsOverride=true / frameRate=12 used to pace the engine at 12 fps while the gate and every
+# stop counted 24 fps footage. Automation now ignores both (isolateAutomationPacing); the app logs what it found
+# persisted and the pace the gate measured with, and that pace must be the clip's native fps, never 12.
+if ($PersistedOverrideProbe) {
+    $settingsKey = 'HKCU:\Software\magiclantern.MLVApp\MLVApp'
+    $savedOverride = (Get-ItemProperty -LiteralPath $settingsKey -Name fpsOverride -ErrorAction SilentlyContinue).fpsOverride
+    $savedRate = (Get-ItemProperty -LiteralPath $settingsKey -Name frameRate -ErrorAction SilentlyContinue).frameRate
+    try {
+        Set-ItemProperty -LiteralPath $settingsKey -Name fpsOverride -Value 'true'
+        Set-ItemProperty -LiteralPath $settingsKey -Name frameRate -Value '12'
+        $results += Invoke-GateEntry -Name 'gui-smoke-persisted-fps-override-12' -ExpectExit 14 -ExpectToken 'CLIP_TOO_SHORT' `
+            -ExtraTokens @('automation.pacing_isolated site=gui-smoke-entry persisted_fps_override=1 persisted_frame_rate=12.000') `
+            -ForbiddenTokens @('pace_fps=12.000') `
+            -Arguments @('--gui-smoke-playback', '--input', $fixture, '--seconds', '25')
+        $results += Invoke-GateEntry -Name 'profile-persisted-fps-override-12' -ExpectExit 14 -ExpectToken 'CLIP_TOO_SHORT' `
+            -ExtraTokens @('automation.pacing_isolated site=profile-entry persisted_fps_override=1 persisted_frame_rate=12.000') `
+            -ForbiddenTokens @('pace_fps=12.000') -OutputPath $profileOutput `
+            -Arguments @('--profile-playback', '--input', $fixture, '--output', $profileOutput, '--frames', '3', '--exercise-play-action')
+    } finally {
+        if ($null -ne $savedOverride) { Set-ItemProperty -LiteralPath $settingsKey -Name fpsOverride -Value $savedOverride }
+        if ($null -ne $savedRate) { Set-ItemProperty -LiteralPath $settingsKey -Name frameRate -Value $savedRate }
+        Write-Output ("persisted settings restored: fpsOverride={0} frameRate={1}" -f
+            (Get-ItemProperty -LiteralPath $settingsKey -Name fpsOverride).fpsOverride, (Get-ItemProperty -LiteralPath $settingsKey -Name frameRate).frameRate)
+    }
+}
 
 $results | Format-Table -AutoSize | Out-String | Write-Output
 $failed = @($results | Where-Object { -not $_.refusedBeforePlay })
