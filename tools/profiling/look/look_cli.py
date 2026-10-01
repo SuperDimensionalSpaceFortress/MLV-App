@@ -393,6 +393,20 @@ def _current_image_digests(session_dir):
     return digests
 
 
+def _explicit_path(value, flag):
+    """An explicitly GIVEN path that is empty is a request that is not there (an unset variable in a wrapper), never
+    'use the shipped one'."""
+    if value is not None and not str(value).strip():
+        raise ValueError(f"{flag} was given empty: name the file, or omit the flag to use the shipped one")
+    return value
+
+
+def _verified_lock(args):
+    """The rubric lock verified NOW: the shipped one, or the --rubric / --rubric-lock the caller named."""
+    return look_config.verify_rubric_lock(_explicit_path(args.rubric, "--rubric"),
+                                          _explicit_path(args.rubric_lock, "--rubric-lock"))
+
+
 def _load_secrets(args):
     """(answer_key, full session, seal dict-or-None). A sealed session is opened from memory with the seal key (the
     seal must verify, or this raises). An UNSEALED session is read as plaintext so the diagnosis can still be written,
@@ -413,7 +427,7 @@ def cmd_tally(args):
     key, session, seal = _load_secrets(args)
     results = _read_json(args.results)
     cfg, meta = look_config.load_config(args.config)
-    lock = look_config.verify_rubric_lock(args.rubric, args.rubric_lock)  # the CURRENT lock, or the one named explicitly
+    lock = _verified_lock(args)  # the CURRENT lock, or the one named explicitly
     if seal is not None:
         seal["resultsSealSha256"] = results.get("sealSha256")
     entry = look_tally.tally(
@@ -435,7 +449,7 @@ def cmd_tally(args):
 def cmd_judge_disagreement(args):
     cfg, _ = look_config.load_config(args.config)
     entries = [_read_json(path) for path in args.entries]
-    lock = look_config.verify_rubric_lock(args.rubric, args.rubric_lock)  # the CURRENT lock, or the one named explicitly
+    lock = _verified_lock(args)  # the CURRENT lock, or the one named explicitly
     verdict = look_tally.judge_disagreement(entries, cfg["judge_disagreement"]["third_judge_points"], rubric_lock=lock,
                                             require_cross_family=args.require_cross_family)
     verdict["createdUtc"] = _now()

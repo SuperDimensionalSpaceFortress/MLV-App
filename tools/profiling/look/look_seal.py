@@ -282,6 +282,9 @@ def extract_all(session_dir, key_hex, dest_dir):
 def key_from_args(explicit=None, key_file=None, environ=None):
     """The seal key for tally/extract: --seal-key, else --seal-key-file, else the environment. None when none is given."""
     environ = os.environ if environ is None else environ
+    for value, flag in ((explicit, "--seal-key"), (key_file, "--seal-key-file")):
+        if value is not None and not str(value).strip():  # given and empty: a request that is not there, not "not given"
+            raise SealError(f"{flag} was given empty: pass the key (or the file that holds it), or omit the flag")
     if explicit:
         return explicit
     if key_file:

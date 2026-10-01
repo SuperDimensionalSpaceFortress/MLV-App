@@ -137,6 +137,13 @@ def _check_key(answer_key, session, current_image_sha256):
             malformed.append(item["itemId"])
     if len(subjects) != 2:
         malformed.append("<subjects>")
+    # Real units whose two sides are the very same bytes (a copied folder presented as a second subject, or a genuine
+    # bit-exact parity). Not a reason by itself, but it is on the record: such a unit cannot show a preference.
+    identical = sorted({item["unitId"] for item in answer_key["items"]
+                        if item["kind"] == "real" and item["left"].get("sourceSha256") is not None
+                        and item["left"].get("sourceSha256") == item["right"].get("sourceSha256")})
+    if identical:
+        details["realUnitsWithIdenticalSources"] = identical
     if malformed:
         reasons.append("KEY_SUBJECTS_MALFORMED")
         details["itemsWithMalformedSubjects"] = malformed

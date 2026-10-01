@@ -1175,6 +1175,79 @@ class SealedBuildCliTests(H.TmpCase):
         self.assertFalse(os.path.exists(os.path.join(out, "answer_key.json")))
 
 
+class EmptyExplicitArgumentTests(H.TmpCase):
+    """An explicitly GIVEN argument that is empty is a request that is not there, never 'use the default' (fable H1's
+    class): --rubric, --rubric-lock, --seal-key and --seal-key-file as well as --baseline-dir and --config."""
+
+    def setUp(self):
+        super().setUp()
+        self.fx = H.Fixture(self.tmp, sealed=True)
+        self.summary = look_judges.run_session(self.fx.dir, H.sealed_runner(self.fx.judge_fn(H.faithful("cpu"))))
+        self.entry_path = os.path.join(self.tmp, "e.json")
+        H.write_json(self.entry_path, H.second_judge(self.fx.tally(self.fx.answers(H.faithful("cpu")))))
+
+    def _tally(self, *extra):
+        out = os.path.join(self.tmp, "t.json")
+        stderr = io.StringIO()
+        with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(stderr):
+            code = look_cli.main(["tally", "--session-dir", self.fx.dir, "--results", self.summary["resultsPath"],
+                                  "--out", out, "--producer-model", "claude-sonnet-5-5", *extra])
+        return code, os.path.isfile(out), stderr.getvalue()
+
+    def test_an_empty_rubric_or_lock_path_is_an_error_not_the_shipped_one(self):
+        for flag in ("--rubric", "--rubric-lock"):
+            for empty in ("", "  "):
+                with self.subTest(flag=flag, empty=empty):
+                    code, wrote, stderr = self._tally(*H.seal_args(self.fx), flag, empty)
+                    self.assertEqual((code, wrote), (2, False))
+                    self.assertIn("given empty", stderr)
+        self.assertEqual(self._tally(*H.seal_args(self.fx))[:2], (0, True))  # omitting the flag is the shipped lock
+
+    def test_disagreement_refuses_an_empty_rubric_or_lock_path_too(self):
+        for flag in ("--rubric", "--rubric-lock"):
+            with self.subTest(flag):
+                stderr = io.StringIO()
+                with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(stderr):
+                    code = look_cli.main(["judge-disagreement", "--entries", self.entry_path, self.entry_path, flag, ""])
+                self.assertEqual(code, 2)
+                self.assertIn("given empty", stderr.getvalue())
+
+    def test_an_empty_seal_key_or_key_file_is_an_error_not_a_fallback_to_the_environment(self):
+        with mock.patch.dict(os.environ, {look_seal.KEY_ENV: self.fx.seal_key}):  # a good key IS available in the env
+            for flag in ("--seal-key", "--seal-key-file"):
+                with self.subTest(flag):
+                    code, wrote, stderr = self._tally(flag, "")
+                    self.assertEqual((code, wrote), (2, False))
+                    self.assertIn("given empty", stderr)
+            self.assertEqual(self._tally()[:2], (0, True))  # not given: the environment's key is used
+        for kwargs in ({"explicit": ""}, {"key_file": ""}, {"explicit": "  "}):
+            with self.assertRaises(look_seal.SealError):
+                look_seal.key_from_args(environ={look_seal.KEY_ENV: FAKE_KEY}, **kwargs)
+
+
+class IdenticalSourceUnitsTests(H.TmpCase):
+    """One folder copied and presented as a second subject cannot show a preference; the entry says so."""
+
+    def test_real_units_whose_two_sides_are_the_same_bytes_are_recorded_in_the_entry(self):
+        def same_bytes(tmp, name, frames, tag="v1"):
+            out = {}
+            for f in frames:
+                path = os.path.join(tmp, f"{name}-{tag}-{f}.src")
+                with open(path, "wb") as handle:
+                    handle.write(f"identical|{f}".encode("ascii"))
+                out[f] = path
+            return out
+
+        with mock.patch.object(H, "_sources", same_bytes):
+            fx = H.Fixture(self.tmp, subdir="copied")
+        entry = fx.tally(fx.answers(lambda item: "tie" if item["kind"] != "positive_control"
+                                    else H.faithful("cpu")(item)))
+        self.assertEqual(entry["integrity"]["realUnitsWithIdenticalSources"], [f"real-{i}" for i in range(5)])
+        honest = H.Fixture(self.tmp, subdir="honest")
+        self.assertNotIn("realUnitsWithIdenticalSources",
+                         honest.tally(honest.answers(H.faithful("cpu")))["integrity"])
+
+
 class CaptureConfigDigestTests(H.TmpCase):
     """fable H7: a null or malformed capture.configSha256 never passes the capture checks."""
 

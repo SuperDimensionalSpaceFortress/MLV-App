@@ -220,6 +220,10 @@ a Codex that cannot be confined is `CROSS_FAMILY_UNAVAILABLE` with the reason, n
   by `isolation-canary` for both runners on this host, with a control that shows the decoys ARE readable without the
   confinement. It is proved for the CLI versions measured (claude 2.1.286, codex-cli 0.159.3); re-run the canary after
   upgrading either. The operator's own capture folders are outside what the harness seals (see *Enforced judge isolation*).
+* An explicitly given but **empty** `--baseline-dir`, `--config`, `--rubric`, `--rubric-lock`, `--seal-key` or
+  `--seal-key-file` is an error, never "use the default". A folder copied and passed as a second subject is refused only
+  when it is the same directory; a byte-identical copy cannot be told from a genuine bit-exact parity, so the entry lists
+  those units under `integrity.realUnitsWithIdenticalSources` (they cannot show a preference) instead of guessing.
 * Sealing hides the key from a judge; it does not prove which model answered. A results file is still what the runner
   recorded, and anyone who holds the seal key AND can edit the results and images can forge a session (consistency, not
   provenance, as before).
