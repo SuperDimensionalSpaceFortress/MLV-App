@@ -31,9 +31,10 @@ FULL_SESSION_MEMBER = "session.full.json"
 ANSWER_KEY_MEMBER = "answer_key.json"
 # What a judge-facing directory must NOT contain once sealed (the plaintext secrets build_session writes).
 PLAINTEXT_SECRETS = ("answer_key.json", "source-frames", "degraded-sources")
-PUBLIC_SESSION_FIELDS = ("schema", "rubricSha256", "orderSeed", "itemCount", "imageSha256s", "createdUtc", "gutter",
+# The seed is NOT public: with it and the pair images a reader could re-derive each item's kind, ordering and slot.
+PUBLIC_SESSION_FIELDS = ("schema", "rubricSha256", "itemCount", "imageSha256s", "createdUtc", "gutter",
                          "itemIdBinding", "emittedTwiceOrderSwapped")
-IDENTITY_FIELDS = ("rubricSha256", "orderSeed", "itemCount", "imageSha256s")
+IDENTITY_FIELDS = ("rubricSha256", "itemCount", "imageSha256s")
 _CHUNK = 1 << 20
 _HEX = frozenset("0123456789abcdef")
 
@@ -177,7 +178,8 @@ def read_members(path, key_hex, wanted=None, sink=None):
 
 def session_state(session_dir):
     """What a judge could find in this directory: is it sealed, and is any plaintext secret still there?"""
-    present = [name for name in PLAINTEXT_SECRETS if os.path.exists(os.path.join(session_dir, name))]
+    names = {entry.lower() for entry in os.listdir(session_dir)}  # case-folded: `Answer_Key.json` is the answer key too
+    present = [name for name in PLAINTEXT_SECRETS if name.lower() in names]
     sealed = os.path.isfile(sealed_path(session_dir))
     return {"sealed": sealed, "plaintextPresent": present,
             "sealSha256": _sha256_file(sealed_path(session_dir)) if sealed else None}
@@ -264,10 +266,21 @@ def open_sealed(session_dir, key_hex):
     return key, full, seal_sha
 
 
+def canon_path(path):
+    """THE path comparison key: real path, case-folded on a case-insensitive host (a differently cased spelling of one
+    Windows directory is the same directory). Every 'is this the same / inside that' check goes through it."""
+    return os.path.normcase(os.path.realpath(path))
+
+
+def path_inside(path, directory):
+    """True when `path` is `directory` or lies under it."""
+    here, there = canon_path(directory), canon_path(path)
+    return there == here or there.startswith(here + os.sep)
+
+
 def extract_all(session_dir, key_hex, dest_dir):
     """Audit helper: write every sealed member under dest_dir (which must not be inside the session directory)."""
-    here, there = os.path.realpath(session_dir), os.path.realpath(dest_dir)
-    if there == here or there.startswith(here + os.sep):
+    if path_inside(dest_dir, session_dir):
         raise SealError("extract outside the session directory: a judge may read it")
 
     def sink(name):

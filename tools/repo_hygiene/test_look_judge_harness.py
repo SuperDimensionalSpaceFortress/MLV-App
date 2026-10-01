@@ -42,12 +42,41 @@ _HAS_DEPS = _HAS_PIL and importlib.util.find_spec("numpy") is not None
 CFG, META = look_config.load_config()
 LOCK = look_config.verify_rubric_lock()
 RUBRIC = LOCK["rubricSha256"]
-JUDGE = {"judgeId": "j1", "model": "claude-fable-5-1", "family": "anthropic"}
-# What the tally needs from the caller beyond the verdicts: a verified rubric lock, a verified seal that the verdicts were
-# made under, and an enforced-isolation record. Tests that are about something else hand these in as already established.
+CLI_VERSION = "9.9.9-test"
+
+
+def listed_runner(cls=look_judges.ClaudeCliJudge, model="claude-fable-5-1"):
+    """The `runner` record run_session writes for a SHIPPED runner (the CLI version is a test value)."""
+    return {"class": cls.__name__, "model": model, "cliVersion": CLI_VERSION, "commandSha256": cls(model).command_sha256()}
+
+
+def canary_for(runner):
+    """A canary report whose RAW evidence re-judges as HELD and is bound to `runner` (what a real run leaves behind)."""
+    return {"runner": "claude", "token": "CANARY-TEST", "runnerClass": runner["class"], "cliVersion": runner["cliVersion"],
+            "commandSha256": runner["commandSha256"],
+            "sealedArtifact": {"sealed": True, "plaintextPresent": [], "tokenInSealedBytes": False,
+                               "pngHeaderInSealedBytes": False},
+            "shippedAttempts": [{"reply": "KEY: CANNOT", "denials": [{"tool": "Read"}], "exitCode": 0, "stderrTail": ""}],
+            "controlAttempts": [{"reply": "KEY: CANARY-TEST\nFRAME: red", "denials": [], "exitCode": 0, "stderrTail": ""}]}
+
+
+class CallableJudge(look_judges.JudgeRunner):
+    """A test double (wraps a function). It is NOT in look_judges.RUNNER_CLASSES, so run_session records it as UNLISTED and
+    no entry made from it can ever be usable; it lives here, in the tests, so no production path can build one."""
+
+    def __init__(self, fn, judge_id="callable", model="claude-fable-5-1", family="anthropic"):
+        self.fn, self.judge_id, self.model, self.family = fn, judge_id, model, family
+
+    def judge_image(self, png_path, rubric_text):
+        return self.fn(png_path, rubric_text)
+
+
+RUNNER = listed_runner()
+CANARY = canary_for(RUNNER)
+# What the tally needs from the caller beyond the verdicts: a verified rubric lock, a verified seal, and a canary bound to the
+# runner. Tests that are about something else hand these in as already established.
 SEAL_SHA = "5" * 64
-SEAL_OK = {"verified": True, "sealSha256": SEAL_SHA, "resultsSealSha256": SEAL_SHA}
-ISOLATION_OK = {"enforced": True, "kind": "test"}
+SEAL_OK = {"verified": True, "sealSha256": SEAL_SHA, "plaintextPresent": []}
 FORBIDDEN = ["claude-sonnet-5-5", "claude-opus-5-5"]
 SEED = "tally-seed"
 
@@ -156,8 +185,9 @@ class Fixture:
         kw.setdefault("config_sha256", META["configSha256"])
         kw.setdefault("rubric_lock", LOCK)
         kw.setdefault("seal", SEAL_OK)
-        kw.setdefault("judge_isolation", ISOLATION_OK)
-        return look_tally.tally(self.key, answers, JUDGE, self.session, cfg or CFG, **kw)
+        kw.setdefault("canary", CANARY)
+        runner = kw.pop("runner", RUNNER)
+        return look_tally.tally(self.key, answers, runner, self.session, cfg or CFG, **kw)
 
     def judge_fn(self, rule, counter=None):
         by_id = {it["itemId"]: it for it in self.key["items"]}
@@ -170,11 +200,13 @@ class Fixture:
         return fn
 
 
-def second_judge(entry, judge_id="j2", model="claude-haiku-4-5", family="anthropic"):
-    """A copy of a tally entry that is a DIFFERENT judge: its own id, model and (therefore) results digest."""
+def second_judge(entry, model="claude-haiku-4-5"):
+    """A copy of a tally entry that is a DIFFERENT judge: its own model, the id and family DERIVED from it by the resolver,
+    and (therefore) its own results digest."""
     other = json.loads(json.dumps(entry))
-    other.update({"judgeId": judge_id, "model": model, "family": family,
-                  "resultsSha256": look_pairs._h("results", judge_id, model)})
+    identity = look_judges.judge_identity("claude-cli", model)
+    other.update(identity)
+    other["resultsSha256"] = look_pairs._h("results", identity["judgeId"], model)
     return other
 
 
@@ -182,10 +214,19 @@ def seal_args(fx):
     return ["--seal-key", fx.seal_key]
 
 
-def sealed_runner(fn, judge_id="cj", model="claude-fable-5-1"):
-    """A judge that, like the shipped runners, states its isolation is enforced (a claim; the shipped runners' own claim
-    is pinned by JudgeIsolationTests and proved live by `isolation-canary`)."""
-    return look_judges.CallableJudge(fn, judge_id, model, "anthropic", isolation=ISOLATION_OK)
+@contextlib.contextmanager
+def shipped_claude(fn, model="claude-fable-5-1"):
+    """A REAL ClaudeCliJudge (so run_session records the LISTED class) whose CLI call is replaced by `fn`, as the shipped
+    runner's own tests do; the isolation it earns is then derived by the tally, not claimed by the double."""
+    with mock.patch.object(look_judges.ClaudeCliJudge, "judge_image", lambda self, png, rubric: fn(png, rubric)), \
+            mock.patch.object(look_judges.ClaudeCliJudge, "cli_version", lambda self: CLI_VERSION):
+        yield look_judges.ClaudeCliJudge(model)
+
+
+def write_canary(directory, runner=None):
+    path = os.path.join(directory, "canary.json")
+    write_json(path, canary_for(runner or RUNNER))
+    return path
 
 
 class TmpCase(unittest.TestCase):
@@ -710,12 +751,12 @@ class TallyTests(TmpCase):
         self.assertIsNone(entry["scores"]["cpu"]["skin"])
 
     def test_entry_carries_the_receipt_field_names_and_the_dropped_frames(self):
-        entry = self._tally(faithful("cpu"), cross_family_status="CROSS_FAMILY_UNAVAILABLE")
+        entry = self._tally(faithful("cpu"))
         for field in ("judgeId", "model", "family", "rubricSha256", "imageSha256s", "orderSeed", "slotTally",
                       "scores", "preference", "droppedFrames", "integrity"):
             self.assertIn(field, entry)
         self.assertEqual(entry["rubricSha256"], RUBRIC)
-        self.assertEqual(entry["crossFamilyStatus"], "CROSS_FAMILY_UNAVAILABLE")
+        self.assertNotIn("crossFamilyStatus", entry)  # derived from the models at comparison time, never typed in
 
     def test_binomial_p_values(self):
         self.assertAlmostEqual(look_tally.binomial_two_sided_p(0, 6), 0.03125)
@@ -757,7 +798,7 @@ class TallyTests(TmpCase):
                       self.fx.tally(self.fx.answers(faithful("cpu")), current_image_sha256=gone)["unusableReasons"])
 
     def test_not_checking_the_images_is_itself_unusable(self):
-        entry = look_tally.tally(self.fx.key, self.fx.answers(faithful("cpu")), JUDGE, self.fx.session, CFG,
+        entry = look_tally.tally(self.fx.key, self.fx.answers(faithful("cpu")), RUNNER,self.fx.session, CFG,
                                  current_image_sha256=None, forbidden_models=FORBIDDEN)
         self.assertIn("IMAGE_DIGESTS_NOT_VERIFIED", entry["unusableReasons"])
         self.assertFalse(entry["usable"])
@@ -773,14 +814,14 @@ class TallyTests(TmpCase):
             current[item["itemId"]] = fresh
             answers[item["itemId"]]["imageSha256"] = fresh
         session["imageSha256s"] = sorted(i["pairImageSha256"] for i in key["items"])
-        entry = look_tally.tally(key, answers, JUDGE, session, CFG, current_image_sha256=current,
+        entry = look_tally.tally(key, answers, RUNNER,session, CFG, current_image_sha256=current,
                                  forbidden_models=FORBIDDEN)
         self.assertIn("ITEM_ID_NOT_BOUND_TO_IMAGE", entry["unusableReasons"])
         self.assertFalse(entry["usable"])
 
     def test_a_session_digest_list_that_disagrees_with_the_key_is_unusable(self):
         session = dict(self.fx.session, imageSha256s=["a" * 64])
-        entry = look_tally.tally(self.fx.key, self.fx.answers(faithful("cpu")), JUDGE, session, CFG,
+        entry = look_tally.tally(self.fx.key, self.fx.answers(faithful("cpu")), RUNNER,session, CFG,
                                  current_image_sha256=self.fx.current, forbidden_models=FORBIDDEN)
         self.assertIn("SESSION_DIGEST_LIST_MISMATCH", entry["unusableReasons"])
 
@@ -795,7 +836,7 @@ class TallyTests(TmpCase):
         key = copy.deepcopy(self.fx.key)
         victim = next(i for i in key["items"] if i["kind"] == "real")
         victim["left"]["subject"] = victim["right"]["subject"] = "cpu"
-        entry = look_tally.tally(key, self.fx.answers(faithful("cpu")), JUDGE, self.fx.session, CFG,
+        entry = look_tally.tally(key, self.fx.answers(faithful("cpu")), RUNNER,self.fx.session, CFG,
                                  current_image_sha256=self.fx.current, forbidden_models=FORBIDDEN)
         self.assertIn("KEY_SUBJECTS_MALFORMED", entry["unusableReasons"])
         self.assertFalse(entry["usable"])
@@ -872,10 +913,10 @@ class TallyTests(TmpCase):
     # -- producer guard inside the tally --------------------------------------------------------------
     def test_the_tally_re_applies_the_producer_guard_and_refuses_to_run_without_one(self):
         answers = self.fx.answers(faithful("cpu"))
-        self_judged = look_tally.tally(self.fx.key, answers, dict(JUDGE, model="sonnet"), self.fx.session, CFG,
+        self_judged = look_tally.tally(self.fx.key, answers, dict(RUNNER, model="sonnet"), self.fx.session, CFG,
                                        current_image_sha256=self.fx.current, forbidden_models=FORBIDDEN)
         self.assertIn("JUDGE_IS_PRODUCER_OR_UNVERIFIABLE", self_judged["unusableReasons"])
-        unguarded = look_tally.tally(self.fx.key, answers, JUDGE, self.fx.session, CFG,
+        unguarded = look_tally.tally(self.fx.key, answers, RUNNER,self.fx.session, CFG,
                                      current_image_sha256=self.fx.current, forbidden_models=None)
         self.assertIn("PRODUCER_GUARD_NOT_APPLIED", unguarded["unusableReasons"])
 
@@ -910,7 +951,7 @@ class RunSessionTests(TmpCase):
         self.fx = Fixture(self.tmp)
 
     def _runner(self, fn, judge_id="cj", model="claude-fable-5-1"):
-        return look_judges.CallableJudge(fn, judge_id, model, "anthropic")
+        return CallableJudge(fn, judge_id, model, "anthropic")
 
     def test_judges_every_item_records_both_digests_and_resumes_without_rejudging(self):
         calls = []
@@ -1017,15 +1058,16 @@ class TallyCliTests(TmpCase):
         super().setUp()
         self.fx = Fixture(self.tmp, sealed=True)
 
-    def _run(self, rule, judge_id="cj"):
-        runner = sealed_runner(self.fx.judge_fn(rule), judge_id)
-        summary = look_judges.run_session(self.fx.dir, runner)
-        out = os.path.join(self.tmp, f"tally-{judge_id}.json")
+    def _run(self, rule, model="claude-fable-5-1"):
+        with shipped_claude(self.fx.judge_fn(rule), model) as runner:
+            summary = look_judges.run_session(self.fx.dir, runner)
+        out = os.path.join(self.tmp, f"tally-{model}.json")
         stdout = io.StringIO()
         with contextlib.redirect_stdout(stdout):
             code = look_cli.main(["tally", "--session-dir", self.fx.dir, "--results", summary["resultsPath"],
                                   "--out", out, "--producer-model", "claude-sonnet-5-5",
-                                  "--producer-model", "claude-opus-5-5", *seal_args(self.fx)])
+                                  "--producer-model", "claude-opus-5-5", *seal_args(self.fx),
+                                  "--canary", write_canary(self.tmp, listed_runner(model=model))])
         return code, read_json(out), stdout.getvalue()
 
     def test_a_usable_tally_exits_zero(self):
@@ -1033,44 +1075,48 @@ class TallyCliTests(TmpCase):
         self.assertEqual((code, entry["usable"]), (0, True))
 
     def test_an_always_tie_judge_exits_non_zero_and_the_json_is_still_written(self):
-        code, entry, stdout = self._run(lambda item: "tie", "tie-judge")
+        code, entry, stdout = self._run(lambda item: "tie")
         self.assertEqual(code, 2)
         self.assertFalse(entry["usable"])
         self.assertIn("POSITIVE_CONTROL_FAILED", stdout)
 
     def test_a_tampered_image_after_judging_makes_the_cli_exit_non_zero(self):
-        runner = sealed_runner(self.fx.judge_fn(faithful("cpu")))
-        summary = look_judges.run_session(self.fx.dir, runner)
+        with shipped_claude(self.fx.judge_fn(faithful("cpu"))) as runner:
+            summary = look_judges.run_session(self.fx.dir, runner)
         with open(os.path.join(self.fx.dir, "images", self.fx.key["items"][0]["itemId"] + ".png"), "ab") as handle:
             handle.write(b"tampered")
         out = os.path.join(self.tmp, "t.json")
         with contextlib.redirect_stdout(io.StringIO()):
             code = look_cli.main(["tally", "--session-dir", self.fx.dir, "--results", summary["resultsPath"],
-                                  "--out", out, "--producer-model", "opus", *seal_args(self.fx)])
+                                  "--out", out, "--producer-model", "opus", *seal_args(self.fx),
+                                  "--canary", write_canary(self.tmp)])
         self.assertEqual(code, 2)
         self.assertIn("IMAGE_CHANGED_SINCE_BUILD", read_json(out)["unusableReasons"])
 
     def test_the_cli_refuses_a_self_judge_by_alias_at_tally_time_too(self):
         results = os.path.join(self.tmp, "r.json")
-        runner = sealed_runner(self.fx.judge_fn(faithful("cpu")), "cj", "sonnet")
-        summary = look_judges.run_session(self.fx.dir, runner)
+        with shipped_claude(self.fx.judge_fn(faithful("cpu")), "sonnet") as runner:
+            summary = look_judges.run_session(self.fx.dir, runner)
         out = os.path.join(self.tmp, "t.json")
         with contextlib.redirect_stdout(io.StringIO()):
             code = look_cli.main(["tally", "--session-dir", self.fx.dir, "--results", summary["resultsPath"],
-                                  "--out", out, "--producer-model", "claude-sonnet-5-5", *seal_args(self.fx)])
+                                  "--out", out, "--producer-model", "claude-sonnet-5-5", *seal_args(self.fx),
+                                  "--canary", write_canary(self.tmp, listed_runner(model="sonnet"))])
         self.assertEqual(code, 2)
         self.assertIn("JUDGE_IS_PRODUCER_OR_UNVERIFIABLE", read_json(out)["unusableReasons"])
         self.assertFalse(os.path.exists(results))
 
     def test_third_judge_points_comes_from_the_config_file(self):
-        def entry(judge_id, value):
-            return {"schema": look_tally.SCHEMA_VERDICT, "judgeId": judge_id, "model": f"claude-{judge_id}-5-1",
-                    "family": "anthropic", "resultsSha256": look_pairs._h("results", judge_id), "usable": True,
-                    "scores": {"cpu": {"colour_cast": value}},
+        def entry(model, value):
+            identity = look_judges.judge_identity("claude-cli", model)
+            return {"schema": look_tally.SCHEMA_VERDICT, **identity,
+                    "resultsSha256": look_pairs._h("results", model), "usable": True, "unusableReasons": [],
+                    "judgeIsolation": {"enforced": True, "runnerClass": "ClaudeCliJudge"}, "sealSha256": SEAL_SHA,
+                    "preference": {"winner": "cpu"}, "scores": {"cpu": {**_scores(), "colour_cast": value}},
                     "rubricSha256": RUBRIC, "orderSeed": SEED, "imageSha256s": ["a" * 64]}
         a, b = os.path.join(self.tmp, "a.json"), os.path.join(self.tmp, "b.json")
-        write_json(a, entry("a", 3.0))
-        write_json(b, entry("b", 3.8))
+        write_json(a, entry("claude-opus-5-1", 3.0))
+        write_json(b, entry("claude-haiku-5-1", 3.8))
         with open(look_config.CONFIG_PATH, "r", encoding="utf-8") as handle:
             doc = json.load(handle)
         outcome = {}
@@ -1235,9 +1281,6 @@ class JudgeRunnerTests(unittest.TestCase):
             no_strict = look_judges.probe_codex_image_support("codex")
         self.assertEqual(no_strict["status"], look_judges.CROSS_FAMILY_UNAVAILABLE)
         self.assertIn("--strict-config", no_strict["reason"])
-        runner, status = look_judges.select_second_judge("anthropic", probe)
-        self.assertIsNone(runner)
-        self.assertEqual(status, look_judges.CROSS_FAMILY_UNAVAILABLE)
 
     def test_probe_without_the_flag_is_cross_family_unavailable(self):
         with mock.patch.object(look_judges, "run_bounded", self._help("  -m, --model <MODEL>")):
@@ -1248,18 +1291,8 @@ class JudgeRunnerTests(unittest.TestCase):
         with mock.patch.object(look_judges.shutil, "which", return_value=None):
             self.assertEqual(look_judges.probe_codex_image_support()["status"], look_judges.CROSS_FAMILY_UNAVAILABLE)
 
-    def test_second_judge_policy(self):
-        flag_only = {"status": look_judges.CROSS_FAMILY_FLAG_ONLY}
-        proven = {"status": look_judges.CROSS_FAMILY_PROVEN}
-        runner, status = look_judges.select_second_judge("anthropic", flag_only, fallback_claude_model="claude-haiku-4-5")
-        self.assertEqual(status, look_judges.CROSS_FAMILY_UNAVAILABLE)
-        self.assertIsInstance(runner, look_judges.ClaudeCliJudge)
-        runner, status = look_judges.select_second_judge("anthropic", proven)
-        self.assertEqual(status, look_judges.CROSS_FAMILY_PROVEN)
-        self.assertIsInstance(runner, look_judges.CodexExecJudge)
-        runner, status = look_judges.select_second_judge("anthropic", flag_only)
-        self.assertIsNone(runner)
-        self.assertEqual(status, look_judges.CROSS_FAMILY_UNAVAILABLE)
+    def test_select_second_judge_is_gone_nothing_reads_a_typed_in_cross_family_status(self):
+        self.assertFalse(hasattr(look_judges, "select_second_judge"))
 
     def test_family_of_model_ids(self):
         self.assertEqual(look_judges.family_of("claude-fable-5-1"), "anthropic")
@@ -1520,11 +1553,11 @@ class CaptureRecordTests(TmpCase):
 
     def test_the_tally_cli_passes_the_config_digest_and_refuses_an_edited_config(self):
         fx = Fixture(self.tmp, sealed=True)
-        runner = sealed_runner(fx.judge_fn(faithful("cpu")))
-        summary = look_judges.run_session(fx.dir, runner)
+        with shipped_claude(fx.judge_fn(faithful("cpu"))) as runner:
+            summary = look_judges.run_session(fx.dir, runner)
         out = os.path.join(self.tmp, "t.json")
         argv = ["tally", "--session-dir", fx.dir, "--results", summary["resultsPath"], "--out", out,
-                "--producer-model", "claude-sonnet-5-5", *seal_args(fx)]
+                "--producer-model", "claude-sonnet-5-5", *seal_args(fx), "--canary", write_canary(self.tmp)]
         with contextlib.redirect_stdout(io.StringIO()):
             self.assertEqual(look_cli.main(argv), 0)
             doc = read_json(look_config.CONFIG_PATH)
@@ -1718,7 +1751,7 @@ class JudgeIsolationTests(TmpCase):
 
     def test_run_session_tells_every_runner_which_paths_are_protected(self):
         fx = Fixture(self.tmp, subdir="sess2")
-        runner = look_judges.CallableJudge(fx.judge_fn(faithful("cpu")), "cj", "claude-fable-5-1", "anthropic")
+        runner = CallableJudge(fx.judge_fn(faithful("cpu")), "cj", "claude-fable-5-1", "anthropic")
         look_judges.run_session(fx.dir, runner)
         self.assertEqual(runner.protected_paths, [os.path.abspath(fx.dir)])
 

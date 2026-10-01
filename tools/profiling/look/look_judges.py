@@ -1,44 +1,24 @@
 #!/usr/bin/env python3
-"""Judge-runner interface for blind model judging (DESIGN.md AMENDMENT 2 B4). Pure standard library.
+"""Judge runners for blind model judging (DESIGN.md AMENDMENT 2 B4). Pure standard library. README.md has the detail.
 
-RUNNERS
-    ClaudeCliJudge   a Claude lane: `claude -p` in a throw-away directory that holds ONLY the one pair image,
-                     with the Read tool (Read renders a PNG to the model). Headless, one bounded process per item.
-    CodexExecJudge   a Codex lane: `codex exec --image <png>` (read-only sandbox). probe_codex_image_support()
-                     reads `codex exec --help` for the flag; probe_codex_vision() proves it LIVE on a synthetic
-                     image (so "the flag exists" is never reported as "Codex can see").
-    CallableJudge    wraps a function; used by tests and by any lane that judges out of process.
+    ClaudeCliJudge   `claude -p` in a throw-away directory holding ONLY the pair image, with a Read tool confined to it.
+    CodexExecJudge   `codex exec --image <png>` with every tool that could read a file switched off.
 
-CROSS-FAMILY (K6): select_second_judge() returns a Codex judge only when the image probe passed; otherwise it
-returns a second Claude model and the status CROSS_FAMILY_UNAVAILABLE, which look_tally copies into the entry.
+ONE RESOLVER: canonical_model() is the only place a model name is interpreted (an alias table: `sonnet` = `claude-sonnet-5-5`,
+any version of a family is that family; gpt / o / codex names for OpenAI). Every identity check goes through it: the producer
+guard, the judgeId, and the duplicate-model and family checks of judge-disagreement. A name it cannot place is refused.
 
-JUDGES ARE NEVER THE PRODUCER OR THE HUB: assert_not_producer() refuses a judge whose model FAMILY matches the
-family of a producer/hub model the caller names. Both sides go through ONE alias table (opus / sonnet / fable /
-haiku <-> claude-<family>-<version>, any date suffix, any [1m]-style tag), so `sonnet` and `claude-sonnet-5-5`
-are the same thing and any version of the producer's family is refused. A name that cannot be placed in a family
-is refused too (fail closed), and the Codex default resolves to the real model name in config.toml.
+ONE CLOSED SET: only RUNNER_CLASSES can produce a usable entry. run_session records WHICH CLASS ran (runner_record), measured
+by the harness; look_tally DERIVES identity and isolation from it (derived_identity, derive_isolation). A results file's own
+claims about isolation, enforcement or the seal are never read, and any other runner is recorded UNLISTED and never usable.
 
-BOUNDED: every judge or probe subprocess runs through run_bounded(), which kills the WHOLE process tree on timeout
-(taskkill /T /F on Windows, where `claude` and `codex` are npm .cmd shims and a plain kill reaches only cmd.exe;
-a process group elsewhere), so a hung judge cannot outlive its timeout.
+ISOLATION is removed, not requested: the secrets are sealed (look_seal.py) before any judge runs, the seal key is scrubbed from
+the judge's environment, the shipped runners refuse an unsealed session, and the isolation canary (look_canary.py) proves it
+live, bound to the CLI version and command it ran. Every subprocess runs through run_bounded(), which kills the WHOLE process
+tree on timeout (the Windows CLIs are .cmd shims). Each item runs in its own temp dir holding only `pair.png`.
 
-BLINDING: each item runs in its own temp directory containing only `pair.png`; the prompt is the frozen rubric
-plus a fixed instruction. Nothing about subjects, backends, flavors or seeds is ever in a prompt or a path.
-
-ENFORCED ISOLATION (round 2): a judge CLI is a general agent, so flags that ask it not to read are not enough.
-    1. The secrets are not on disk in the clear: build-session seals the answer key, the full session record, the
-       source frames and the degraded sources into one file (look_seal.py) under a per-session key the judge never
-       receives. The shipped runners REFUSE a session directory that is not sealed or still holds a plaintext secret.
-    2. The key is scrubbed from the judge's environment (and the judge commands refuse to start with it set).
-    3. The Codex judge has its tools switched off (shell, unified exec, image viewer, code mode, browser, apps,
-       plugins, sub-agents ...): it can only look at the attached picture. The Claude judge keeps the Read tool,
-       confined to its working directory by --restricted, and any permission denial rejects the verdict.
-    4. `look_cli.py isolation-canary` proves 1-3 LIVE against a canary outside the scratch dir, with a control run
-       that shows the canary IS readable when the confinement is removed.
-
-STALE RESULTS: run_session re-judges any item whose stored verdict was made against a different image digest or a
-different rubric digest, refuses a results file that belongs to another judge identity, and refuses to start
-when the images on disk no longer match the session's recorded digests.
+STALE RESULTS: run_session re-judges any item whose stored verdict was made against another image, rubric or runner (class,
+CLI version, command), refuses a results file of another judge identity, and refuses a session whose images changed.
 """
 import concurrent.futures
 import hashlib
@@ -92,16 +72,20 @@ ANTHROPIC_FAMILIES = ("opus", "sonnet", "fable", "haiku")
 CODEX_DEFAULT_MODEL = "codex-default"  # recorded only when config.toml names no model: the real model is UNKNOWN
 
 
-def model_family_key(model):
-    """THE alias table. Canonical family of a model name, or None when the name cannot be placed.
+def canonical_model(model):
+    """THE resolver: the canonical identity of a model name, or None when the name cannot be placed (never a guess).
 
         ('anthropic', 'sonnet')        sonnet, Sonnet 5.5, claude-sonnet-5-5, claude-sonnet-5-5-20261001,
                                        us.anthropic.claude-sonnet-5-5-v1:0, sonnet[1m] ...
         ('openai', root, trim)         gpt-6.1-sol -> ('openai', 'gpt', 'sol'); gpt-5.5 -> ('openai', 'gpt', '');
                                        o3 -> ('openai', 'o', ''); codex-mini -> ('openai', 'codex', 'mini')
         ('openai', '*', '')            `codex`, `openai`, `codex-default` (the lane's unresolved default): any OpenAI model
-    """
-    text = re.sub(r"\[[^\]]*\]", "", (model or "").strip().lower())
+
+    Two names are the same model exactly when same_canonical() says so; a version is not part of the identity, so two
+    versions of one family are one model here (the conservative direction for a duplicate check)."""
+    if not isinstance(model, str):
+        return None
+    text = re.sub(r"\[[^\]]*\]", "", model.strip().lower())
     tokens = [t for t in re.split(r"[^a-z0-9]+", text) if t]
     if not tokens:
         return None
@@ -127,12 +111,22 @@ def model_family_key(model):
     return ("openai", root, trim)
 
 
+def canonical_text(model):
+    """The canonical identity as one string ('anthropic:sonnet'), for ids; None when the name cannot be placed."""
+    key = canonical_model(model)
+    return None if key is None else ":".join(part for part in key if part)
+
+
 def family_of(model):
-    key = model_family_key(model)
+    key = canonical_model(model)
     return "unknown" if key is None else key[0]
 
 
-def _same_family(a, b):
+def same_canonical(a, b):
+    """True when two canonical_model() results are one model. Neither may be None: an unplaceable name is never 'the
+    same' or 'different', the caller must refuse it first."""
+    if a is None or b is None:
+        raise ValueError("an unrecognised model has no identity to compare")
     if a[0] != b[0]:
         return False
     if a[0] == "anthropic":
@@ -142,27 +136,32 @@ def _same_family(a, b):
     return a[1] == b[1] and (a[2] == b[2] or "" in (a[2], b[2]))
 
 
+def require_canonical(model, what="model"):
+    key = canonical_model(model)
+    if key is None:
+        raise ProducerJudgeError(
+            f"{what} {model!r} cannot be placed in a model family; use opus/sonnet/fable/haiku, "
+            "claude-<family>-<version> or a gpt/o/codex model name")
+    return key
+
+
 def assert_not_producer(judge_model, forbidden_models):
-    """Raise ProducerJudgeError when the judge's model FAMILY is the family of a producer or hub model the caller
+    """Raise ProducerJudgeError when the judge's model is the model (family) of a producer or hub model the caller
     lists. Fails closed: an unnamed judge, an unrecognised judge or producer name, and an empty forbidden list all
     raise, because none of them can prove independence."""
-    if not (judge_model or "").strip():
+    if not (isinstance(judge_model, str) and judge_model.strip()):
         raise ProducerJudgeError("a judge must name its model")
-    forbidden = [b for b in (forbidden_models or ()) if (b or "").strip()]
+    if isinstance(forbidden_models, str):
+        forbidden_models = [forbidden_models]
+    forbidden = [b for b in (forbidden_models or ()) if isinstance(b, str) and b.strip()]
     if not forbidden:
         raise ProducerJudgeError("no producer/hub model was named, so the judge's independence cannot be checked")
-    judge_key = model_family_key(judge_model)
-    if judge_key is None:
-        raise ProducerJudgeError(
-            f"judge model {judge_model!r} cannot be placed in a model family; use opus/sonnet/fable/haiku, "
-            "claude-<family>-<version> or a gpt/o/codex model name")
+    judge_key = require_canonical(judge_model, "judge model")
     for bad in forbidden:
-        bad_key = model_family_key(bad)
-        if bad_key is None:
-            raise ProducerJudgeError(f"producer/hub model {bad!r} cannot be placed in a model family")
-        if _same_family(judge_key, bad_key):
+        bad_key = require_canonical(bad, "producer/hub model")
+        if same_canonical(judge_key, bad_key):
             raise ProducerJudgeError(
-                f"judge model {judge_model!r} is in the family of the producer/hub model {bad!r} ({judge_key})")
+                f"judge model {judge_model!r} is the model of the producer/hub model {bad!r} ({judge_key})")
 
 
 def resolve_codex_default_model(codex_home=None):
@@ -280,55 +279,35 @@ def extract_json_object(text):
 
 
 class JudgeRunner:
-    """Interface: judge_image(png_path) -> the parsed verdict dict (left/right/preference). Raises JudgeError."""
+    """Interface: judge_image(png_path) -> the parsed verdict dict (left/right/preference). Raises JudgeError.
+    A runner OUTSIDE RUNNER_CLASSES (a test double, an out-of-process lane) can be run by run_session, but its entry is
+    never usable: usability is derived from the class that ran, never from anything the runner says about itself."""
 
     judge_id = "unset"
     model = "unset"
     family = "unknown"
     protected_paths = ()  # run_session sets this to the session dir; the scratch dir may not overlap it
-    requires_sealed = True  # a runner that is a general agent may only run next to a SEALED session (look_seal.py)
 
     def identity(self):
         return {"judgeId": self.judge_id, "model": self.model, "family": self.family}
-
-    def isolation_record(self):
-        """What run_session writes into the results file and look_tally reads back: whether this runner's isolation is
-        enforced by the harness, and a digest of the exact confinement it asks for."""
-        return {"enforced": False, "kind": "unspecified"}
 
     def judge_image(self, png_path, rubric_text):  # pragma: no cover - interface
         raise NotImplementedError
 
 
-class CallableJudge(JudgeRunner):
-    """Wraps a function (tests, or a lane that judges out of process). The harness cannot enforce what such a judge can
-    read, so it records `enforced: False` unless the caller states otherwise with `isolation` (a claim, not a proof)."""
-
-    requires_sealed = False
-
-    def __init__(self, fn, judge_id="callable", model="callable", family="test", isolation=None):
-        self.fn, self.judge_id, self.model, self.family = fn, judge_id, model, family
-        self._isolation = isolation
-
-    def isolation_record(self):
-        return dict(self._isolation) if self._isolation else {"enforced": False, "kind": "callable"}
-
-    def judge_image(self, png_path, rubric_text):
-        return self.fn(png_path, rubric_text)
-
-
-def _canon(path):
-    return os.path.normcase(os.path.realpath(path))
+def judge_identity(kind, model):
+    """{judgeId, model, family} DERIVED from the runner kind and the resolved model: the id is the canonical identity, so
+    one model under two spellings is one judge. Raises ProducerJudgeError for a model that cannot be placed."""
+    key = require_canonical(model, "judge model")
+    return {"judgeId": f"{kind}:{canonical_text(model)}", "model": model, "family": key[0]}
 
 
 def assert_isolated(work, protected_paths):
     """Raise JudgeError when the judge's scratch dir is, contains, or sits inside any protected path (the session
     directory: answer_key.json, source-frames/, sibling items). A scratch dir that overlaps the session cannot be
     isolated from it, whatever flags the CLI is given."""
-    here = _canon(work)
     for protected in protected_paths or ():
-        other = _canon(protected)
-        if here == other or here.startswith(other + os.sep) or other.startswith(here + os.sep):
+        if look_seal.path_inside(work, protected) or look_seal.path_inside(protected, work):
             raise JudgeError(f"the judge's scratch dir {work!r} overlaps the protected path {protected!r}: "
                              "the judge could read what it must not see; set TMP/TEMP somewhere else")
 
@@ -366,30 +345,61 @@ def _template_digest(argv):
     return hashlib.sha256(json.dumps(list(argv)).encode("utf-8")).hexdigest()
 
 
-class ClaudeCliJudge(JudgeRunner):
-    def __init__(self, model, judge_id=None, claude_exe=None, timeout_s=300, extra_args=None):
+class _CliJudge(JudgeRunner):
+    """What the two shipped runners share: a resolved identity, an executable, and the two facts the tally binds a
+    canary to (the CLI's own version and the digest of the confinement command template)."""
+
+    kind = "unset"
+
+    def _init_identity(self, model, exe, timeout_s):
         self.model = model
-        self.family = family_of(model)
-        self.judge_id = judge_id or f"claude-cli:{model}"
-        self.claude_exe = claude_exe or shutil.which("claude") or "claude"
+        identity = judge_identity(self.kind, model)
+        self.judge_id, self.family = identity["judgeId"], identity["family"]
+        self.exe = exe
         self.timeout_s = timeout_s
-        self.extra_args = list(extra_args or [])
+
+    def argv_template(self):  # pragma: no cover - interface
+        raise NotImplementedError
+
+    def command_sha256(self):
+        """Digest of the confined command with the model and the per-call paths left as placeholders: it describes the
+        confinement, not which model or which temp dir a call used."""
+        return _template_digest(self.argv_template()[1:])
+
+    def cli_version(self):
+        """What `<cli> --version` prints, measured now. Raises JudgeError when it cannot be measured."""
+        try:
+            proc = run_bounded([self.exe, "--version"], timeout=60)
+        except (OSError, subprocess.TimeoutExpired) as exc:
+            raise JudgeError(f"{self.kind}: could not read the CLI version: {type(exc).__name__}: {exc}") from exc
+        text = (proc.stdout or proc.stderr or "").strip()
+        if proc.returncode != 0 or not text:
+            raise JudgeError(f"{self.kind}: `--version` exited {proc.returncode} with no version text")
+        return text[:200]
+
+
+class ClaudeCliJudge(_CliJudge):
+    kind = "claude-cli"
+
+    def __init__(self, model, claude_exe=None, timeout_s=300):
+        self._init_identity(model, claude_exe or shutil.which("claude") or "claude", timeout_s)
+
+    def _argv(self, model, confined):
+        return ([self.exe, "-p", "--model", model, "--tools", "Read", "--allowedTools", "Read"]
+                + (list(CLAUDE_CONFINEMENT_ARGS) if confined else [])
+                + ["--no-session-persistence", "--disable-slash-commands", "--output-format", "json"])
+
+    def argv_template(self):
+        return self._argv("<model>", True)
 
     def command(self, confined=True):
         """ISOLATION: --restricted ignores the user's, the project's and the local settings and confines the file
         tools to the working directory (which holds only pair.png); --safe-mode switches off CLAUDE.md, hooks,
         skills, plugins and MCP servers; --strict-mcp-config with no --mcp-config means no MCP server at all; no
-        --add-dir widens the roots. A CLI too old to know a flag exits non-zero (JudgeError), it does not run
-        unconfined. `confined=False` exists ONLY for the isolation canary's control run (look_cli isolation-canary):
-        judge_image never calls it."""
-        return ([self.claude_exe, "-p", "--model", self.model, "--tools", "Read", "--allowedTools", "Read"]
-                + (list(CLAUDE_CONFINEMENT_ARGS) if confined else [])
-                + ["--no-session-persistence", "--disable-slash-commands", "--output-format", "json"]
-                + self.extra_args)
-
-    def isolation_record(self):
-        return {"enforced": True, "kind": "claude-cli", "tools": ["Read"], "confinement": list(CLAUDE_CONFINEMENT_ARGS),
-                "commandSha256": _template_digest(self.command()[1:]), "sealRequired": True}
+        --add-dir widens the roots, and there is no way to pass the CLI extra arguments. A CLI too old to know a flag
+        exits non-zero (JudgeError), it does not run unconfined. `confined=False` exists ONLY for the isolation canary's
+        control run (look_cli isolation-canary): judge_image never calls it."""
+        return self._argv(self.model, confined)
 
     def judge_image(self, png_path, rubric_text):
         assert_no_seal_key_in_environment()
@@ -423,18 +433,16 @@ class ClaudeCliJudge(JudgeRunner):
         return verdict
 
 
-class CodexExecJudge(JudgeRunner):
+class CodexExecJudge(_CliJudge):
     """`model=None` means 'the Codex default': it is resolved to the real model name from config.toml (so the
     entry records what actually judged, and the producer guard can compare it), and only when config.toml names
-    none is it recorded as `codex-default`, which the guard treats as ANY OpenAI model."""
+    none is it recorded as `codex-default`, which the resolver treats as ANY OpenAI model."""
 
-    def __init__(self, model=None, judge_id=None, codex_exe=None, timeout_s=300, codex_home=None):
-        self.default_resolved = model is None and resolve_codex_default_model(codex_home) is not None
-        self.model = model or resolve_codex_default_model(codex_home) or CODEX_DEFAULT_MODEL
-        self.family = "openai"
-        self.judge_id = judge_id or f"codex-exec:{self.model}"
-        self.codex_exe = codex_exe or shutil.which("codex") or "codex"
-        self.timeout_s = timeout_s
+    kind = "codex-exec"
+
+    def __init__(self, model=None, codex_exe=None, timeout_s=300, codex_home=None):
+        self._init_identity(model or resolve_codex_default_model(codex_home) or CODEX_DEFAULT_MODEL,
+                            codex_exe or shutil.which("codex") or "codex", timeout_s)
 
     def _isolation_args(self):
         args = ["--ignore-user-config", "--ignore-rules", "--strict-config"]
@@ -442,7 +450,13 @@ class CodexExecJudge(JudgeRunner):
             args += ["--disable", feature]
         return args + ["-c", "web_search=disabled"]
 
+    def argv_template(self):
+        return self._argv("<model>", "<png>", "<out>", "<work>", True)
+
     def command(self, png_path, out_file, work, confined=True):
+        return self._argv(self.model, png_path, out_file, work, confined)
+
+    def _argv(self, model, png_path, out_file, work, confined):
         # The prompt goes on stdin: --image is variadic and would swallow a trailing positional prompt.
         # ISOLATION: the read-only sandbox lets a shell read ANY file the user can (Codex maps it to read access at the
         # filesystem root, and view_image takes an absolute path), so no sandbox flag is relied on. The tools that could
@@ -451,17 +465,13 @@ class CodexExecJudge(JudgeRunner):
         # rather than run with a tool on. --ignore-user-config / --ignore-rules keep the user's config.toml, rules and
         # MCP servers out; that is safe for the model choice because the model is passed with -m whenever it is known
         # (see __init__). `confined=False` exists ONLY for the isolation canary's control run; judge_image never uses it.
-        cmd = [self.codex_exe, "exec", "--image", png_path, "--sandbox", "read-only", "--skip-git-repo-check"]
+        cmd = [self.exe, "exec", "--image", png_path, "--sandbox", "read-only", "--skip-git-repo-check"]
         if confined:
             cmd += self._isolation_args()
         cmd += ["--ephemeral", "-C", work, "-o", out_file]
-        if self.model != CODEX_DEFAULT_MODEL:
-            cmd[2:2] = ["-m", self.model]
+        if model != CODEX_DEFAULT_MODEL:
+            cmd[2:2] = ["-m", model]
         return cmd
-
-    def isolation_record(self):
-        return {"enforced": True, "kind": "codex-exec", "toolsDisabled": list(CODEX_DISABLED_FEATURES),
-                "commandSha256": _template_digest(self.command("<png>", "<out>", "<work>")[1:]), "sealRequired": True}
 
     def judge_image(self, png_path, rubric_text):
         assert_no_seal_key_in_environment()
@@ -487,6 +497,64 @@ class CodexExecJudge(JudgeRunner):
         verdict = extract_json_object(text or proc.stdout)
         verdict["_raw"] = (text or proc.stdout)[:2000]
         return verdict
+
+
+# THE CLOSED SET: the only runners whose entries can ever be usable. Everything below is derived from the class that ran.
+RUNNER_CLASSES = {cls.__name__: cls for cls in (ClaudeCliJudge, CodexExecJudge)}
+
+
+def runner_record(runner):
+    """What run_session writes about the runner, measured by the harness: the CLASS (named only when it is exactly a
+    member of RUNNER_CLASSES; anything else is UNLISTED:<module>.<class>, so a look-alike cannot borrow a listed name),
+    the model it was asked to use and, for a listed runner, the CLI version and the digest of the confinement command."""
+    cls = type(runner)
+    if RUNNER_CLASSES.get(cls.__name__) is not cls:
+        return {"class": f"UNLISTED:{cls.__module__}.{cls.__qualname__}", "model": getattr(runner, "model", None),
+                "cliVersion": None, "commandSha256": None}
+    return {"class": cls.__name__, "model": runner.model, "cliVersion": runner.cli_version(),
+            "commandSha256": runner.command_sha256()}
+
+
+def _record(record):
+    return record if isinstance(record, dict) else {}
+
+
+def derived_identity(record):
+    """{judgeId, model, family} for a recorded runner, DERIVED (never read from the results file): the kind comes from the
+    class, the id and the family from the resolver. Anything unplaceable reads `unlisted` / `unrecognised` / `unknown`."""
+    rec = _record(record)
+    name = rec.get("class")
+    cls = RUNNER_CLASSES.get(name) if isinstance(name, str) else None
+    model = rec.get("model") if isinstance(rec.get("model"), str) else ""
+    key = canonical_model(model)
+    return {"judgeId": f"{cls.kind if cls else 'unlisted'}:{canonical_text(model) or 'unrecognised'}",
+            "model": model, "family": "unknown" if key is None else key[0]}
+
+
+def derive_isolation(record):
+    """The tally's OWN derivation of the judge's isolation from the recorded runner. Returns (isolation, reasons).
+    The class must be in RUNNER_CLASSES, the model must resolve, the recorded command digest must equal the one this
+    code computes for that class, and a CLI version must have been measured; nothing here reads a claim of the form
+    'isolated' or 'enforced'. `enforced` is left False: the tally sets it once every other reason is also absent."""
+    rec = _record(record)
+    name = rec.get("class")
+    iso = {"runnerClass": name if isinstance(name, str) else None, "enforced": False}
+    cls = RUNNER_CLASSES.get(name) if isinstance(name, str) else None
+    if cls is None:
+        return iso, ["RUNNER_NOT_ALLOWLISTED"]
+    model = rec.get("model")
+    if canonical_model(model) is None:
+        return iso, ["JUDGE_MODEL_UNRECOGNISED"]
+    expected = cls(model).command_sha256()
+    reasons = []
+    if rec.get("commandSha256") != expected:
+        reasons.append("RUNNER_COMMAND_DIFFERS_FROM_SHIPPED")
+    version = rec.get("cliVersion")
+    if not (isinstance(version, str) and version.strip()):
+        version = None
+        reasons.append("CLI_VERSION_NOT_RECORDED")
+    iso.update({"kind": cls.kind, "model": model, "commandSha256": expected, "cliVersion": version})
+    return iso, reasons
 
 
 # ---------------------------------------------------------------------------------------------------------
@@ -555,16 +623,6 @@ def probe_codex_vision(png_path, expected_word, codex_exe=None, model=None, time
             "answer": answer[:200], "model": judge.model}
 
 
-def select_second_judge(primary_family, probe, codex_model=None, fallback_claude_model=None):
-    """Policy: a Codex judge only when the image probe is PROVEN; otherwise a second Claude model (a different
-    one from the primary judge) and CROSS_FAMILY_UNAVAILABLE. Returns (runner_or_None, status)."""
-    if probe.get("status") == CROSS_FAMILY_PROVEN and primary_family != "openai":
-        return CodexExecJudge(model=codex_model), CROSS_FAMILY_PROVEN
-    if fallback_claude_model:
-        return ClaudeCliJudge(fallback_claude_model), CROSS_FAMILY_UNAVAILABLE
-    return None, CROSS_FAMILY_UNAVAILABLE
-
-
 # ---------------------------------------------------------------------------------------------------------
 # session runner
 # ---------------------------------------------------------------------------------------------------------
@@ -580,6 +638,9 @@ def _load_json(path, default=None):
 def sha256_file(path):
     with open(path, "rb") as handle:
         return hashlib.sha256(handle.read()).hexdigest()
+
+
+RESULTS_SCHEMA = "mlv-app/look-judge-results/v2"
 
 
 def results_path(session_dir, judge_id):
@@ -610,16 +671,15 @@ def run_session(session_dir, runner, workers=3, deadline_s=500, max_items=None, 
         raise JudgeError("the pair images on disk do not match the digests the session recorded: "
                          "the session was changed after it was built; rebuild it")
     rubric_text = look_config.load_rubric_text(rubric_path)
-    state = look_seal.session_state(session_dir)
-    if runner.requires_sealed:
+    if RUNNER_CLASSES.get(type(runner).__name__) is type(runner):
+        # A shipped runner is a general agent: it only ever runs next to a SEALED session. (Any other runner is not
+        # checked, and does not need to be: its entry is unusable whatever it does.)
         assert_no_seal_key_in_environment()
         try:
             look_seal.assert_judgeable(session_dir)
         except look_seal.SealError as exc:
             raise JudgeError(str(exc)) from exc
-    judged_under_seal = state["sealed"] and not state["plaintextPresent"]
-    seal_sha = state["sealSha256"] if judged_under_seal else None
-    isolation = runner.isolation_record()
+    record = runner_record(runner)  # measured by the harness; the tally re-derives everything it needs from it
     runner.protected_paths = [os.path.abspath(session_dir)]  # the judge's scratch dir may never overlap the session
     out_path = results_path(session_dir, runner.judge_id)
     existing = _load_json(out_path)
@@ -627,17 +687,16 @@ def run_session(session_dir, runner, workers=3, deadline_s=500, max_items=None, 
         raise JudgeError(f"{out_path} belongs to judge {existing.get('judge')!r}, not {runner.identity()!r}: "
                          "refusing to mix verdicts from different judge identities")
     doc = existing or {
-        "schema": "mlv-app/look-judge-results/v1", "judge": runner.identity(),
+        "schema": RESULTS_SCHEMA, "judge": runner.identity(),
         "rubricSha256": lock["rubricSha256"], "items": {}, "errors": {},
     }
     stale = {}
-    # Verdicts made before the session was sealed, or under another confinement, were made by a judge that could have
-    # read the key: they are thrown away and judged again, never carried into a sealed run.
-    changed_conditions = existing is not None and (existing.get("sealSha256") != seal_sha
-                                                   or existing.get("isolation") != isolation)
+    # Verdicts made by another class, CLI version or confinement command are thrown away and judged again, never carried
+    # into this run: the entry must describe ONE runner.
+    changed_conditions = existing is not None and existing.get("runner") != record
     for item_id, stored in list(doc["items"].items()):
         if changed_conditions:
-            stale[item_id] = "SEAL_OR_ISOLATION_DIFFERS_FROM_CURRENT_RUN"
+            stale[item_id] = "RUNNER_DIFFERS_FROM_CURRENT_RUN"
         elif item_id not in current:
             stale[item_id] = "ITEM_NOT_IN_THIS_SESSION"
         elif stored.get("imageSha256") != current[item_id]:
@@ -646,11 +705,10 @@ def run_session(session_dir, runner, workers=3, deadline_s=500, max_items=None, 
             stale[item_id] = "RUBRIC_DIGEST_DIFFERS_FROM_LOCK"
     for item_id in stale:
         del doc["items"][item_id]
+    doc["schema"] = RESULTS_SCHEMA
     doc["rubricSha256"] = lock["rubricSha256"]
-    doc["sealSha256"] = seal_sha
-    doc["judgedUnderSeal"] = judged_under_seal
-    doc["isolation"] = isolation
-    doc["staleRejected"] ={**doc.get("staleRejected", {}), **stale}
+    doc["runner"] = record
+    doc["staleRejected"] = {**doc.get("staleRejected", {}), **stale}
     todo = [it for it in manifest["items"] if it["itemId"] not in doc["items"]]
     if max_items is not None:
         todo = todo[:max_items]

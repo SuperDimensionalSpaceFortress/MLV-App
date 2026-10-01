@@ -183,6 +183,22 @@ class SealedSessionTests(H.TmpCase):
         self.assertTrue(public["sealed"])
         self.assertEqual(public["rubricSha256"], H.RUBRIC)
 
+    def test_the_public_session_does_not_carry_the_order_seed(self):
+        # fable r2 H3: with the seed and the pair images a reader re-derives each item's kind, ordering and slot
+        self._seal()
+        with open(os.path.join(self.fx.dir, "session.json"), "r", encoding="utf-8") as handle:
+            text = handle.read()
+        self.assertNotIn("orderSeed", text)
+        self.assertNotIn(H.SEED, text)
+        self.assertNotIn("orderSeed", look_seal.PUBLIC_SESSION_FIELDS)
+        key, full, _ = look_seal.open_sealed(self.fx.dir, self.key_hex)  # ... and the seal still holds it
+        self.assertEqual((key["orderSeed"], full["orderSeed"]), (H.SEED, H.SEED))
+        for name in os.listdir(self.fx.dir):  # nor does any other judge-readable file in the session directory
+            path = os.path.join(self.fx.dir, name)
+            if os.path.isfile(path) and name != "sealed.bin":
+                with open(path, "rb") as handle:
+                    self.assertNotIn(H.SEED.encode("ascii"), handle.read(), name)
+
     def test_the_sealed_bytes_carry_neither_the_key_nor_the_source_frames_in_the_clear(self):
         self._seal()
         with open(os.path.join(self.fx.dir, "sealed.bin"), "rb") as handle:
@@ -218,7 +234,7 @@ class SealedSessionTests(H.TmpCase):
         self._seal()
         path = os.path.join(self.fx.dir, "session.json")
         original = H.read_json(path)
-        for field, value in (("rubricSha256", "0" * 64), ("orderSeed", "other"), ("itemCount", 99),
+        for field, value in (("rubricSha256", "0" * 64), ("itemCount", 99),
                              ("imageSha256s", ["1" * 64]), ("sealSha256", "2" * 64), ("sealed", False)):
             with self.subTest(field):
                 H.write_json(path, dict(original, **{field: value}))
@@ -248,88 +264,97 @@ class SealedSessionTests(H.TmpCase):
 
     def test_a_judge_runner_refuses_a_session_that_is_not_sealed_and_never_calls_the_judge(self):
         calls = []
-        runner = H.sealed_runner(self.fx.judge_fn(H.faithful("cpu"), calls))
-        runner.requires_sealed = True  # what the shipped Claude / Codex runners are
-        with self.assertRaises(look_judges.JudgeError) as caught:
-            look_judges.run_session(self.fx.dir, runner)
+        with H.shipped_claude(self.fx.judge_fn(H.faithful("cpu"), calls)) as runner:  # a shipped runner: it needs a seal
+            with self.assertRaises(look_judges.JudgeError) as caught:
+                look_judges.run_session(self.fx.dir, runner)
         self.assertIn("not sealed", str(caught.exception))
         self.assertEqual(calls, [])
 
     def test_a_judge_runner_refuses_plaintext_secrets_left_next_to_the_sealed_file(self):
         self._seal()
-        for name in ("answer_key.json", "source-frames", "degraded-sources"):
+        for name in ("answer_key.json", "source-frames", "degraded-sources", "ANSWER_KEY.JSON"):
             with self.subTest(name):
                 path = os.path.join(self.fx.dir, name)
-                if name == "answer_key.json":
+                if name.lower() == "answer_key.json":
                     _write_bytes(path, b"{}")
                 else:
                     os.makedirs(path)
                 calls = []
-                runner = H.sealed_runner(self.fx.judge_fn(H.faithful("cpu"), calls))
-                runner.requires_sealed = True
-                with self.assertRaises(look_judges.JudgeError) as caught:
-                    look_judges.run_session(self.fx.dir, runner)
+                with H.shipped_claude(self.fx.judge_fn(H.faithful("cpu"), calls)) as runner:
+                    with self.assertRaises(look_judges.JudgeError) as caught:
+                        look_judges.run_session(self.fx.dir, runner)
                 self.assertIn("plaintext", str(caught.exception))
                 self.assertEqual(calls, [])
-                if name == "answer_key.json":
+                if name.lower() == "answer_key.json":
                     os.remove(path)
                 else:
                     os.rmdir(path)
 
-    def test_a_sealed_session_runs_and_the_results_record_the_seal_and_the_isolation(self):
+    def test_a_sealed_session_runs_and_the_results_record_the_runner_class_not_a_claim_of_isolation(self):
         self._seal()
         calls = []
-        runner = H.sealed_runner(self.fx.judge_fn(H.faithful("cpu"), calls))
-        runner.requires_sealed = True
-        summary = look_judges.run_session(self.fx.dir, runner)
+        with H.shipped_claude(self.fx.judge_fn(H.faithful("cpu"), calls)) as runner:
+            summary = look_judges.run_session(self.fx.dir, runner)
         self.assertEqual(summary["errors"], 0)
         doc = H.read_json(summary["resultsPath"])
-        self.assertEqual(doc["sealSha256"], look_seal.session_state(self.fx.dir)["sealSha256"])
-        self.assertTrue(doc["judgedUnderSeal"])
-        self.assertEqual(doc["isolation"], H.ISOLATION_OK)
+        self.assertEqual(doc["runner"], H.RUNNER)  # class, model, CLI version and command digest, measured by the harness
+        for claim in ("isolation", "sealSha256", "judgedUnderSeal", "enforced"):
+            self.assertNotIn(claim, doc)  # nothing in the file for a tally to be tempted to believe
 
-    def test_results_made_on_a_plaintext_session_say_so(self):
-        summary = look_judges.run_session(self.fx.dir, look_judges.CallableJudge(self.fx.judge_fn(H.faithful("cpu"))))
+    def test_a_runner_outside_the_closed_set_is_recorded_as_unlisted_whatever_it_calls_itself(self):
+        summary = look_judges.run_session(self.fx.dir, H.CallableJudge(self.fx.judge_fn(H.faithful("cpu"))))
         doc = H.read_json(summary["resultsPath"])
-        self.assertIsNone(doc["sealSha256"])
-        self.assertFalse(doc["judgedUnderSeal"])
-        self.assertEqual(doc["isolation"], {"enforced": False, "kind": "callable"})
+        self.assertTrue(doc["runner"]["class"].startswith("UNLISTED:"), doc["runner"])
+        self.assertIsNone(doc["runner"]["cliVersion"])
 
-    def test_verdicts_made_before_the_session_was_sealed_are_judged_again_not_carried_over(self):
-        calls = []
-        runner = H.sealed_runner(self.fx.judge_fn(H.faithful("cpu"), calls))
-        look_judges.run_session(self.fx.dir, runner)  # judged while the key was lying in the directory
-        self.assertEqual(len(calls), 14)
-        self._seal()
-        again = look_judges.run_session(self.fx.dir, runner)
-        self.assertEqual((len(calls), again["staleRejected"]), (28, 14))
-        doc = H.read_json(again["resultsPath"])
-        self.assertEqual(set(doc["staleRejected"].values()), {"SEAL_OR_ISOLATION_DIFFERS_FROM_CURRENT_RUN"})
-        self.assertTrue(doc["judgedUnderSeal"])
-        once_more = look_judges.run_session(self.fx.dir, runner)  # and a run under unchanged conditions keeps its verdicts
-        self.assertEqual((len(calls), once_more["staleRejected"]), (28, 0))
+        class ClaudeCliJudge(H.CallableJudge):  # a look-alike borrowing the listed NAME
+            pass
+        liar = ClaudeCliJudge(self.fx.judge_fn(H.faithful("cpu")), "liar", "claude-fable-5-1", "anthropic")
+        self.assertTrue(look_judges.runner_record(liar)["class"].startswith("UNLISTED:"))
+        sub = type("Sub", (look_judges.ClaudeCliJudge,), {})("claude-fable-5-1")  # nor can a subclass of a listed one
+        self.assertTrue(look_judges.runner_record(sub)["class"].startswith("UNLISTED:"))
 
-    def test_a_changed_isolation_record_also_invalidates_stored_verdicts(self):
+    def test_verdicts_stored_for_another_cli_version_or_command_are_judged_again(self):
         self._seal()
         calls = []
-        runner = look_judges.CallableJudge(self.fx.judge_fn(H.faithful("cpu"), calls), "cj", "claude-fable-5-1",
-                                           "anthropic", isolation={"enforced": True, "kind": "a"})
-        look_judges.run_session(self.fx.dir, runner)
-        runner._isolation = {"enforced": True, "kind": "b"}
-        self.assertEqual(look_judges.run_session(self.fx.dir, runner)["staleRejected"], 14)
+        with H.shipped_claude(self.fx.judge_fn(H.faithful("cpu"), calls)) as runner:
+            look_judges.run_session(self.fx.dir, runner)
+            self.assertEqual(look_judges.run_session(self.fx.dir, runner)["staleRejected"], 0)  # unchanged: kept
+            with mock.patch.object(look_judges.ClaudeCliJudge, "cli_version", lambda self: "9.9.10-upgraded"):
+                again = look_judges.run_session(self.fx.dir, runner)
+        self.assertEqual((again["staleRejected"], len(calls)), (14, 28))
+        self.assertEqual(set(H.read_json(again["resultsPath"])["staleRejected"].values()),
+                         {"RUNNER_DIFFERS_FROM_CURRENT_RUN"})
 
     def test_the_seal_key_in_the_environment_stops_a_real_judge_before_anything_runs(self):
         self._seal()
         calls = []
-        runner = H.sealed_runner(self.fx.judge_fn(H.faithful("cpu"), calls))
-        runner.requires_sealed = True
-        with mock.patch.dict(os.environ, {look_seal.KEY_ENV: self.key_hex}):
-            with self.assertRaises(look_judges.JudgeError):
-                look_judges.run_session(self.fx.dir, runner)
-            with self.assertRaises(look_judges.JudgeError):
-                look_judges.assert_no_seal_key_in_environment()
+        with H.shipped_claude(self.fx.judge_fn(H.faithful("cpu"), calls)) as runner:
+            with mock.patch.dict(os.environ, {look_seal.KEY_ENV: self.key_hex}):
+                with self.assertRaises(look_judges.JudgeError):
+                    look_judges.run_session(self.fx.dir, runner)
+                with self.assertRaises(look_judges.JudgeError):
+                    look_judges.assert_no_seal_key_in_environment()
         self.assertEqual(calls, [])
         look_judges.assert_no_seal_key_in_environment({})
+
+    def test_every_path_comparison_is_case_folded_on_a_case_insensitive_host(self):  # fable r2 H4
+        session = os.path.join(self.tmp, "Sess")
+        key_file = os.path.join(self.tmp, "sess", "k.txt")  # neither exists: the typed case is all there is
+        with mock.patch.object(os.path, "normcase", lambda p: p.lower()):  # what ntpath does on Windows
+            self.assertTrue(look_seal.path_inside(key_file, session))
+            self.assertEqual(look_seal.canon_path(session), look_seal.canon_path(os.path.join(self.tmp, "SESS")))
+            with self.assertRaises(ValueError):
+                look_cli._refuse_key_file_in_session(key_file, session)
+            with self.assertRaises(ValueError):
+                look_cli._refuse_same_directory(session, os.path.join(self.tmp, "SESS"), "x")
+            with self.assertRaises(look_seal.SealError):
+                look_seal.extract_all(session, self.key_hex, key_file)
+            with self.assertRaises(look_judges.JudgeError):
+                look_judges.assert_isolated(os.path.join(self.tmp, "SESS", "work"), [session])
+        with mock.patch.object(os.path, "normcase", lambda p: p):  # a case-sensitive host: two different directories
+            self.assertFalse(look_seal.path_inside(key_file, session))
+            look_cli._refuse_key_file_in_session(key_file, session)
 
     def test_extract_all_writes_the_members_but_never_inside_the_session(self):
         self._seal()
@@ -345,8 +370,9 @@ class SealedSessionTests(H.TmpCase):
 
 
 class SealedTallyGateTests(H.TmpCase):
-    """The tally refuses a judge that could have read the key, a seal it cannot verify, and an isolation it was not told
-    was enforced. API first, then the CLI path that carries the key."""
+    """The tally refuses a judge that could have read the key, a seal it cannot verify, and an isolation it could not derive.
+    API first, then the CLI path that carries the key. NOTHING here reads an `isolation` / `enforced` / `sealSha256` claim
+    from the judge side: the seal comes from sealed.bin and the key, the isolation from the runner CLASS."""
 
     def setUp(self):
         super().setUp()
@@ -362,44 +388,95 @@ class SealedTallyGateTests(H.TmpCase):
         self.assertEqual(entry["preference"]["winner"], "UNUSABLE")
 
     def test_an_unverified_or_malformed_seal_is_unusable(self):
-        for bad in ({"verified": False, "sealSha256": H.SEAL_SHA, "resultsSealSha256": H.SEAL_SHA},
-                    {"verified": True, "sealSha256": "short", "resultsSealSha256": "short"},
-                    {"verified": True, "resultsSealSha256": H.SEAL_SHA}, "yes", []):
+        for bad in ({"verified": False, "sealSha256": H.SEAL_SHA, "plaintextPresent": []},
+                    {"verified": True, "sealSha256": "short", "plaintextPresent": []},
+                    {"verified": True, "plaintextPresent": []}, "yes", []):
             with self.subTest(bad=bad):
                 self.assertIn("SEAL_NOT_VERIFIED", self.fx.tally(self._answers(), seal=bad)["unusableReasons"])
 
-    def test_verdicts_made_under_another_or_no_seal_are_unusable(self):
-        for results_seal in (None, "6" * 64):
-            with self.subTest(results_seal=results_seal):
-                entry = self.fx.tally(self._answers(), seal=dict(H.SEAL_OK, resultsSealSha256=results_seal))
-                self.assertIn("JUDGED_WITHOUT_OR_AFTER_SEAL", entry["unusableReasons"])
-                self.assertNotIn("SEAL_NOT_VERIFIED", entry["unusableReasons"])
+    def test_a_plaintext_secret_beside_the_seal_at_tally_time_is_unusable(self):
+        entry = self.fx.tally(self._answers(), seal=dict(H.SEAL_OK, plaintextPresent=["answer_key.json"]))
+        self.assertEqual(entry["unusableReasons"], ["PLAINTEXT_SECRETS_BESIDE_THE_SEAL"])
 
-    def test_isolation_that_is_not_recorded_as_enforced_is_unusable(self):
-        for bad in (None, {}, {"enforced": False}, {"enforced": "true"}, {"kind": "codex-exec"}, "enforced"):
-            with self.subTest(bad=bad):
-                entry = self.fx.tally(self._answers(), judge_isolation=bad)
-                self.assertIn("JUDGE_ISOLATION_NOT_ENFORCED", entry["unusableReasons"])
-                self.assertFalse(entry["usable"])
-
-    def test_a_clean_entry_records_the_seal_and_the_isolation_it_was_judged_under(self):
+    def test_the_isolation_is_derived_from_the_runner_class_and_recorded_with_the_command_and_cli_version(self):
         entry = self.fx.tally(self._answers())
         self.assertTrue(entry["usable"], entry["unusableReasons"])
         self.assertEqual(entry["sealSha256"], H.SEAL_SHA)
-        self.assertEqual(entry["judgeIsolation"], H.ISOLATION_OK)
+        iso = entry["judgeIsolation"]
+        self.assertEqual((iso["enforced"], iso["runnerClass"], iso["kind"], iso["cliVersion"]),
+                         (True, "ClaudeCliJudge", "claude-cli", H.CLI_VERSION))
+        self.assertEqual(iso["commandSha256"], look_judges.ClaudeCliJudge("claude-fable-5-1").command_sha256())
+        codex = H.listed_runner(look_judges.CodexExecJudge, "gpt-6.1-sol")
+        entry = self.fx.tally(self._answers(), runner=codex, canary=H.canary_for(codex))
+        self.assertTrue(entry["usable"], entry["unusableReasons"])
+        self.assertEqual((entry["judgeIsolation"]["kind"], entry["family"], entry["judgeId"]),
+                         ("codex-exec", "openai", "codex-exec:openai:gpt:sol"))
 
-    # -- through the CLI, with a real seal ------------------------------------------------------------------
-    def _judge(self, runner=None):
-        runner = runner or H.sealed_runner(self.fx.judge_fn(H.faithful("cpu")))
-        return look_judges.run_session(self.fx.dir, runner)
+    def test_a_runner_outside_the_closed_set_is_never_usable_whatever_it_says(self):  # sol r2 B1, at the API
+        for cls in ("UNLISTED:test.CallableJudge", "CallableJudge", "ClaudeCliJudge ", "claudeclijudge", None, 7, ""):
+            with self.subTest(cls=cls):
+                runner = dict(H.RUNNER, **{"class": cls, "isolation": {"enforced": True, "kind": "external"},
+                                           "enforced": True})
+                entry = self.fx.tally(self._answers(), runner=runner)
+                self.assertEqual(entry["unusableReasons"], ["RUNNER_NOT_ALLOWLISTED"])
+                self.assertEqual(entry["preference"]["winner"], "UNUSABLE")
+                self.assertFalse(entry["judgeIsolation"]["enforced"])
+        self.assertEqual(set(look_judges.RUNNER_CLASSES), {"ClaudeCliJudge", "CodexExecJudge"})
+        self.assertFalse(hasattr(look_judges, "CallableJudge"))  # the double lives in the tests; no production path builds one
 
-    def _tally(self, summary, extra=(), fx=None):
+    def test_a_listed_class_whose_recorded_command_or_version_is_not_the_shipped_one_is_unusable(self):
+        for field, value, reason in (("commandSha256", "0" * 64, "RUNNER_COMMAND_DIFFERS_FROM_SHIPPED"),
+                                     ("commandSha256", None, "RUNNER_COMMAND_DIFFERS_FROM_SHIPPED"),
+                                     ("cliVersion", None, "CLI_VERSION_NOT_RECORDED"),
+                                     ("cliVersion", "  ", "CLI_VERSION_NOT_RECORDED")):
+            with self.subTest(field=field, value=value):
+                entry = self.fx.tally(self._answers(), runner=dict(H.RUNNER, **{field: value}))
+                self.assertIn(reason, entry["unusableReasons"])
+                self.assertFalse(entry["judgeIsolation"]["enforced"])
+        entry = self.fx.tally(self._answers(), runner=dict(H.RUNNER, model="mystery"))
+        self.assertIn("JUDGE_MODEL_UNRECOGNISED", entry["unusableReasons"])
+        self.assertIn("JUDGE_IS_PRODUCER_OR_UNVERIFIABLE", entry["unusableReasons"])
+        self.assertEqual(self.fx.tally(self._answers(), runner=None)["unusableReasons"][0], "RUNNER_NOT_ALLOWLISTED")
+
+    def test_the_identity_is_derived_not_read(self):
+        runner = dict(H.RUNNER, judgeId="someone-else", family="openai", model="claude-sonnet-5-5-20261001")
+        entry = self.fx.tally(self._answers(), runner=runner, forbidden_models=["claude-opus-5-5"])
+        self.assertEqual((entry["judgeId"], entry["family"]), ("claude-cli:anthropic:sonnet", "anthropic"))
+
+    # -- the canary is bound to THIS run ----------------------------------------------------------------------
+    def test_without_a_canary_bound_to_this_class_cli_version_and_command_the_entry_is_unusable(self):
+        cases = (("no canary", None, ["ISOLATION_CANARY_MISSING"]),
+                 ("empty report", {}, ["ISOLATION_CANARY_MISSING"]),
+                 ("not a report", "held", ["ISOLATION_CANARY_MISSING"]),
+                 ("another CLI version", dict(H.CANARY, cliVersion="9.9.8-older"), ["ISOLATION_CANARY_FOR_ANOTHER_CLI_VERSION"]),
+                 ("another command", dict(H.CANARY, commandSha256="0" * 64), ["ISOLATION_CANARY_FOR_ANOTHER_COMMAND"]),
+                 ("another runner", dict(H.CANARY, runnerClass="CodexExecJudge"), ["ISOLATION_CANARY_FOR_ANOTHER_RUNNER"]))
+        for name, canary, expected in cases:
+            with self.subTest(name):
+                entry = self.fx.tally(self._answers(), canary=canary)
+                self.assertEqual(entry["unusableReasons"], expected)
+                self.assertFalse(entry["judgeIsolation"]["enforced"])
+
+    def test_a_canary_that_says_held_but_whose_evidence_does_not_is_unusable(self):
+        # the outcome / leaked / controlProvedReadable fields of a report are NEVER read: the raw evidence is re-judged
+        leaky = json.loads(json.dumps(H.CANARY))
+        leaky["shippedAttempts"][0]["reply"] = "KEY: CANARY-TEST"
+        liar = dict(leaky, outcome=look_canary.HELD, leaked=[], controlProvedReadable=True, judgeTried=True)
+        self.assertEqual(self.fx.tally(self._answers(), canary=liar)["unusableReasons"], ["ISOLATION_CANARY_NOT_HELD"])
+
+    # -- through the CLI, with a real seal --------------------------------------------------------------------
+    def _judge(self):
+        with H.shipped_claude(self.fx.judge_fn(H.faithful("cpu"))) as runner:
+            return look_judges.run_session(self.fx.dir, runner)
+
+    def _tally(self, summary, extra=(), fx=None, canary="auto"):
         fx = fx or self.fx
         out = os.path.join(self.tmp, "t.json")
         stderr = io.StringIO()
+        canary_args = ["--canary", H.write_canary(self.tmp)] if canary == "auto" else []
         with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(stderr):
             code = look_cli.main(["tally", "--session-dir", fx.dir, "--results", summary["resultsPath"], "--out", out,
-                                  "--producer-model", "claude-sonnet-5-5", *extra])
+                                  "--producer-model", "claude-sonnet-5-5", *canary_args, *extra])
         return code, (H.read_json(out) if os.path.isfile(out) else None), stderr.getvalue()
 
     def test_the_cli_tally_needs_the_key_and_the_key_must_be_right(self):
@@ -412,6 +489,10 @@ class SealedTallyGateTests(H.TmpCase):
         code, entry, _ = self._tally(summary, H.seal_args(self.fx))
         self.assertEqual((code, entry["usable"]), (0, True))
 
+    def test_the_cli_tally_without_a_canary_report_is_unusable(self):
+        code, entry, _ = self._tally(self._judge(), H.seal_args(self.fx), canary=None)
+        self.assertEqual((code, entry["unusableReasons"]), (2, ["ISOLATION_CANARY_MISSING"]))
+
     def test_the_key_may_come_from_a_file_or_the_environment(self):
         summary = self._judge()
         path = os.path.join(self.tmp, "key.txt")
@@ -422,37 +503,49 @@ class SealedTallyGateTests(H.TmpCase):
 
     def test_a_plaintext_session_tallies_unusable_whatever_the_verdicts_say(self):
         fx = H.Fixture(self.tmp, subdir="plain")
-        summary = look_judges.run_session(fx.dir, H.sealed_runner(fx.judge_fn(H.faithful("cpu"))))
+        summary = look_judges.run_session(fx.dir, H.CallableJudge(fx.judge_fn(H.faithful("cpu"))))
         code, entry, _ = self._tally(summary, fx=fx)
         self.assertEqual(code, 2)
         self.assertIn("SEAL_NOT_VERIFIED", entry["unusableReasons"])
         self.assertEqual(entry["preference"]["winner"], "UNUSABLE")
 
-    def test_a_judge_that_ran_while_the_key_was_lying_in_the_directory_is_unusable_even_if_sealed_afterwards(self):
+    def test_a_judge_that_ran_while_the_key_was_lying_in_the_directory_can_only_be_an_unlisted_runner_and_is_unusable(self):
         fx = H.Fixture(self.tmp, subdir="late", sealed=False)
-        summary = look_judges.run_session(fx.dir, H.sealed_runner(fx.judge_fn(H.faithful("cpu"))))
+        calls = []
+        with H.shipped_claude(fx.judge_fn(H.faithful("cpu"), calls)) as runner:  # a shipped runner will not start here
+            with self.assertRaises(look_judges.JudgeError):
+                look_judges.run_session(fx.dir, runner)
+        self.assertEqual(calls, [])
+        summary = look_judges.run_session(fx.dir, H.CallableJudge(fx.judge_fn(H.faithful("cpu"))))  # only a double can
         fx.seal_key = look_seal.new_key()
         look_seal.seal_session(fx.dir, fx.seal_key)  # sealed only AFTER the judge had run
         code, entry, _ = self._tally(summary, H.seal_args(fx), fx=fx)
-        self.assertEqual(code, 2)
-        self.assertIn("JUDGED_WITHOUT_OR_AFTER_SEAL", entry["unusableReasons"])
+        self.assertEqual((code, entry["unusableReasons"]), (2, ["RUNNER_NOT_ALLOWLISTED"]))
         self.assertEqual(entry["preference"]["winner"], "UNUSABLE")
 
-    def test_a_judge_whose_isolation_the_harness_did_not_enforce_is_unusable_on_a_sealed_session(self):
-        summary = self._judge(look_judges.CallableJudge(self.fx.judge_fn(H.faithful("cpu")), "cj", "claude-fable-5-1",
-                                                        "anthropic"))
-        code, entry, _ = self._tally(summary, H.seal_args(self.fx))
-        self.assertEqual(code, 2)
-        self.assertEqual(entry["unusableReasons"], ["JUDGE_ISOLATION_NOT_ENFORCED"])
-
-    def test_a_seal_that_does_not_name_the_results_is_unusable(self):
-        summary = self._judge()
+    def test_sols_repro_a_runner_that_asserts_its_own_isolation_is_not_usable_through_the_unchanged_cli(self):
+        # r2 B1: an unconfined callable judge read the key during its callback and claimed isolation={"enforced": true}.
+        summary = look_judges.run_session(self.fx.dir, H.CallableJudge(self.fx.judge_fn(H.faithful("cpu"))))
         doc = H.read_json(summary["resultsPath"])
-        doc["sealSha256"] = "7" * 64
-        H.write_json(summary["resultsPath"], doc)
+        doc.update({"isolation": {"enforced": True, "kind": "external"}, "sealSha256": look_seal.session_state(self.fx.dir)["sealSha256"],
+                    "judgedUnderSeal": True})
+        doc["runner"]["isolation"] = {"enforced": True}
+        H.write_json(summary["resultsPath"], doc)  # and the file even forges the very fields the old tally read
         code, entry, _ = self._tally(summary, H.seal_args(self.fx))
-        self.assertEqual(code, 2)
-        self.assertIn("JUDGED_WITHOUT_OR_AFTER_SEAL", entry["unusableReasons"])
+        self.assertEqual((code, entry["unusableReasons"]), (2, ["RUNNER_NOT_ALLOWLISTED"]))
+        self.assertEqual(entry["preference"]["winner"], "UNUSABLE")
+        self.assertEqual(entry["preference"]["withheldWinner"], "cpu")
+
+    def test_a_results_file_that_is_not_the_v2_shape_is_a_typed_refusal_not_a_traceback(self):
+        summary = self._judge()
+        for broken in ({}, {"schema": "mlv-app/look-judge-results/v1", "items": {}, "judge": {}},
+                       {"schema": look_judges.RESULTS_SCHEMA, "judge": {}, "runner": {}},
+                       {"schema": look_judges.RESULTS_SCHEMA, "items": {}, "judge": {}}, []):
+            with self.subTest(broken=broken):
+                H.write_json(summary["resultsPath"], broken)
+                code, entry, stderr = self._tally(summary, H.seal_args(self.fx))
+                self.assertEqual((code, entry), (2, None))
+                self.assertIn("judge results file", stderr)
 
 
 class RubricLockTallyTests(H.TmpCase):
@@ -494,14 +587,18 @@ class RubricLockTallyTests(H.TmpCase):
         out = os.path.join(self.tmp, "t.json")
         with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
             code = look_cli.main(["tally", "--session-dir", fx.dir, "--results", summary["resultsPath"], "--out", out,
-                                  "--producer-model", "claude-sonnet-5-5", *H.seal_args(fx), *extra])
+                                  "--producer-model", "claude-sonnet-5-5", *H.seal_args(fx),
+                                  "--canary", H.write_canary(self.tmp), *extra])
         return code, (H.read_json(out) if os.path.isfile(out) else None)
+
+    def _judge(self, fx, **kw):
+        with H.shipped_claude(fx.judge_fn(H.faithful("cpu"))) as runner:
+            return look_judges.run_session(fx.dir, runner, **kw)
 
     def test_sols_repro_a_separately_locked_session_is_unusable_under_the_shipped_lock(self):
         rubric, lock_path, lock = self._other_rubric()
         fx = H.Fixture(self.tmp, sealed=True, rubric=lock["rubricSha256"])
-        summary = look_judges.run_session(fx.dir, H.sealed_runner(fx.judge_fn(H.faithful("cpu"))),
-                                          rubric_path=rubric, lock_path=lock_path)
+        summary = self._judge(fx, rubric_path=rubric, lock_path=lock_path)
         self.assertEqual(summary["errors"], 0)
         code, entry = self._tally_cli(fx, summary)  # the default: the lock that ships
         self.assertEqual(code, 2)
@@ -512,8 +609,7 @@ class RubricLockTallyTests(H.TmpCase):
     def test_an_explicitly_passed_lock_that_equals_the_sessions_and_the_verdicts_digest_is_accepted(self):
         rubric, lock_path, lock = self._other_rubric()
         fx = H.Fixture(self.tmp, sealed=True, rubric=lock["rubricSha256"])
-        summary = look_judges.run_session(fx.dir, H.sealed_runner(fx.judge_fn(H.faithful("cpu"))),
-                                          rubric_path=rubric, lock_path=lock_path)
+        summary = self._judge(fx, rubric_path=rubric, lock_path=lock_path)
         code, entry = self._tally_cli(fx, summary, ["--rubric", rubric, "--rubric-lock", lock_path])
         self.assertEqual((code, entry["usable"]), (0, True))
         self.assertEqual(entry["rubricLockSha256"], lock["rubricSha256"])
@@ -521,7 +617,7 @@ class RubricLockTallyTests(H.TmpCase):
     def test_an_explicit_lock_that_the_session_does_not_match_is_unusable(self):
         rubric, lock_path, lock = self._other_rubric()
         fx = H.Fixture(self.tmp, sealed=True)  # frozen under the SHIPPED rubric
-        summary = look_judges.run_session(fx.dir, H.sealed_runner(fx.judge_fn(H.faithful("cpu"))))
+        summary = self._judge(fx)
         code, entry = self._tally_cli(fx, summary, ["--rubric", rubric, "--rubric-lock", lock_path])
         self.assertEqual(code, 2)
         self.assertEqual(entry["unusableReasons"], ["SESSION_RUBRIC_DIFFERS_FROM_LOCK"])
@@ -539,7 +635,7 @@ class RubricLockTallyTests(H.TmpCase):
         with open(rubric, "ab") as handle:
             handle.write(b"edited after the freeze")
         fx = H.Fixture(self.tmp, sealed=True)
-        summary = look_judges.run_session(fx.dir, H.sealed_runner(fx.judge_fn(H.faithful("cpu"))))
+        summary = self._judge(fx)
         code, entry = self._tally_cli(fx, summary, ["--rubric", rubric, "--rubric-lock", lock_path])
         self.assertEqual((code, entry), (2, None))
         path = os.path.join(self.tmp, "e.json")
@@ -564,7 +660,7 @@ class RubricLockTallyTests(H.TmpCase):
         verdict = look_tally.judge_disagreement([a, b], 1.0, rubric_lock=H.LOCK)
         self.assertFalse(verdict["comparable"])
         self.assertEqual(verdict["rubricLockProblems"],
-                         [{"code": "ENTRY_RUBRIC_DIFFERS_FROM_LOCK", "judges": ["j1", "j2"]}])
+                         [{"code": "ENTRY_RUBRIC_DIFFERS_FROM_LOCK", "judges": [a["judgeId"], b["judgeId"]]}])
         self.assertEqual(verdict["sessionMismatches"], [])
 
     def test_the_disagreement_cli_checks_the_shipped_lock(self):
@@ -582,7 +678,8 @@ class RubricLockTallyTests(H.TmpCase):
 
 
 class DistinctJudgesTests(H.TmpCase):
-    """sol B2 / fable H5: a comparison needs TWO DIFFERENT judges. One judge counted twice agrees with itself."""
+    """A comparison needs TWO DIFFERENT judges, whatever spelling their model names use, and the SAME score grid. One judge
+    counted twice agrees with itself; a criterion only one of them scored must never read as agreement."""
 
     def setUp(self):
         super().setUp()
@@ -600,24 +697,47 @@ class DistinctJudgesTests(H.TmpCase):
     def test_two_different_judges_are_comparable(self):
         verdict = self._verdict(self.a, self.b)
         self.assertTrue(verdict["comparable"], verdict)
-        self.assertEqual(verdict["identityProblems"], [])
+        self.assertEqual((verdict["identityProblems"], verdict["coverageProblems"]), ([], []))
         self.assertFalse(verdict["thirdJudgeNeeded"])
 
-    def test_the_same_entry_twice_is_not_a_comparison(self):  # sol's exact repro: judge-disagreement --entries T.json T.json
+    def test_the_same_entry_twice_is_not_a_comparison(self):  # sol r1's exact repro: judge-disagreement --entries T.json T.json
         verdict = self._verdict(self.a, self.a)
         self.assertFalse(verdict["comparable"])
         self.assertEqual(sorted(self._codes(verdict)), ["DUPLICATE_JUDGE_ID", "DUPLICATE_MODEL", "DUPLICATE_RESULTS"])
         self.assertIsNone(verdict["thirdJudgeNeeded"])  # not a reassuring False
 
-    def test_one_judge_id_under_two_models_or_one_model_under_two_ids_is_not_a_comparison(self):
-        same_id = H.second_judge(self.a, judge_id=self.a["judgeId"])
-        self.assertEqual(self._codes(self._verdict(self.a, same_id)), ["DUPLICATE_JUDGE_ID"])
-        same_model = H.second_judge(self.a, model=self.a["model"])
-        self.assertEqual(self._codes(self._verdict(self.a, same_model)), ["DUPLICATE_MODEL"])
+    def test_sols_r2_repro_one_model_under_two_spellings_is_one_model(self):
+        spellings = ("sonnet", "claude-sonnet-5-5", "Claude Sonnet 5.5", "CLAUDE-SONNET-5-5-20261001", " sonnet[1m] ",
+                     "us.anthropic.claude-sonnet-5-5-v1:0", "claude-sonnet-4-5")
+        base = H.second_judge(self.a, model="sonnet")
+        for spelling in spellings:
+            with self.subTest(spelling):
+                other = H.second_judge(self.a, model=spelling)  # its own results digest; the id is derived, so it equals
+                self.assertIn("DUPLICATE_MODEL", self._codes(self._verdict(base, other)))
+                self.assertFalse(self._verdict(base, other)["comparable"])
+                # and a hand-edited, DIFFERENT judgeId cannot make the same model two judges either
+                other["judgeId"] = "claude-cli:" + spelling
+                codes = self._codes(self._verdict(base, other))
+                self.assertIn("DUPLICATE_MODEL", codes)
 
-    def test_identity_is_compared_after_trimming_and_case_folding(self):
-        sneaky = H.second_judge(self.a, judge_id=" J1 ", model=self.a["model"].upper())
-        self.assertEqual(sorted(self._codes(self._verdict(self.a, sneaky))), ["DUPLICATE_JUDGE_ID", "DUPLICATE_MODEL"])
+    def test_the_duplicate_model_check_also_covers_the_other_family(self):
+        sol, luna = (H.second_judge(self.a, model=m) for m in ("gpt-6.1-sol", "gpt-6.1-luna"))
+        self.assertTrue(self._verdict(sol, luna)["comparable"])  # two OpenAI models that are not one model
+        for same in ("gpt-6.1-sol", "GPT-6.1-SOL", "gpt-6.2-sol", "gpt-6.1", "codex-default", "codex", "openai"):
+            with self.subTest(same):
+                self.assertIn("DUPLICATE_MODEL", self._codes(self._verdict(sol, H.second_judge(self.a, model=same))))
+
+    def test_one_judge_id_under_two_models_or_one_model_under_two_ids_is_not_a_comparison(self):
+        same_id = dict(self.b, judgeId=self.a["judgeId"])
+        self.assertIn("DUPLICATE_JUDGE_ID", self._codes(self._verdict(self.a, same_id)))
+        self.assertIn("JUDGE_ID_DOES_NOT_MATCH_MODEL", self._codes(self._verdict(self.a, same_id)))
+        same_model = H.second_judge(self.a, model=self.a["model"])
+        self.assertEqual(sorted(self._codes(self._verdict(self.a, same_model))), ["DUPLICATE_JUDGE_ID", "DUPLICATE_MODEL"])
+
+    def test_the_judge_id_must_be_the_one_the_resolver_derives_from_the_model(self):
+        for bad in ("fable", "claude-cli:fable", "claude-cli:claude-haiku-4-5", " ", None, 7):
+            with self.subTest(bad=bad):
+                self.assertIn("JUDGE_ID_DOES_NOT_MATCH_MODEL", self._codes(self._verdict(self.a, dict(self.b, judgeId=bad))))
 
     def test_a_copied_results_file_under_a_new_name_is_not_a_second_judge(self):
         copied = H.second_judge(self.a)
@@ -626,43 +746,44 @@ class DistinctJudgesTests(H.TmpCase):
 
     def test_fewer_than_two_entries_is_not_a_comparison(self):
         for entries in ([], [self.a]):
-            verdict = self._verdict(*entries)
+            verdict = self._verdict(*entries) if entries else look_tally.judge_disagreement([], 1.0, rubric_lock=H.LOCK)
             self.assertFalse(verdict["comparable"])
-            self.assertEqual(self._codes(verdict), ["FEWER_THAN_TWO_JUDGES"])
 
     def test_missing_identity_fields_are_not_comparable(self):
-        for field, code in (("judgeId", "JUDGEID_MISSING"), ("model", "MODEL_MISSING"),
-                            ("resultsSha256", "RESULTS_DIGEST_MISSING")):
+        for field, code in (("model", "MODEL_UNRECOGNISED"), ("judgeId", "JUDGE_ID_DOES_NOT_MATCH_MODEL"),
+                            ("resultsSha256", "RESULTS_DIGEST_MISSING"), ("family", "FAMILY_DOES_NOT_MATCH_MODEL")):
             with self.subTest(field):
                 broken = json.loads(json.dumps(self.b))
                 del broken[field]
                 verdict = self._verdict(self.a, broken)
                 self.assertFalse(verdict["comparable"])
                 self.assertIn(code, self._codes(verdict))
-        blank = dict(self.b, judgeId="  ")
-        self.assertIn("JUDGEID_MISSING", self._codes(self._verdict(self.a, blank)))
 
-    def test_a_claimed_cross_family_comparison_needs_two_model_families(self):
-        claimed = dict(self.a, crossFamilyStatus=look_judges.CROSS_FAMILY_PROVEN)
-        same_family = H.second_judge(self.a)
-        verdict = self._verdict(claimed, same_family)
+    def test_an_unrecognised_model_is_refused_in_every_spelling_with_no_claim_needed(self):
+        for model in ("mystery", "", "   ", None, 5, ["sonnet"], {"m": "sonnet"}, "sonnet5", "sonnetsonnet", "sonnet opus",
+                      "gpt-5 sonnet", "claude", "ｓｏｎｎｅｔ", "sonnеt", "claude-sonet-5-5"):
+            with self.subTest(model=model):
+                odd = dict(self.b, model=model)
+                verdict = self._verdict(self.a, odd)
+                self.assertFalse(verdict["comparable"])
+                self.assertIn("MODEL_UNRECOGNISED", self._codes(verdict))
+
+    def test_the_family_is_derived_from_the_model_always_not_only_when_cross_family_is_claimed(self):
+        liar = dict(self.b, family="openai")  # a Claude model that says it is OpenAI; nobody claimed cross-family
+        verdict = self._verdict(self.a, liar)
         self.assertFalse(verdict["comparable"])
-        self.assertEqual(self._codes(verdict), ["CROSS_FAMILY_CLAIMED_BUT_NOT_DISTINCT_FAMILIES"])
-        verdict = self._verdict(self.a, same_family, require_cross_family=True)
-        self.assertEqual(self._codes(verdict), ["CROSS_FAMILY_CLAIMED_BUT_NOT_DISTINCT_FAMILIES"])
-        self.assertTrue(self._verdict(self.a, same_family)["comparable"])  # not claimed: one family is fine
-        openai = H.second_judge(self.a, judge_id="codex-1", model="gpt-6.1-sol", family="openai")
-        self.assertTrue(self._verdict(claimed, openai)["comparable"])
+        self.assertEqual(self._codes(verdict), ["FAMILY_DOES_NOT_MATCH_MODEL"])
+        self.assertEqual(self._codes(self._verdict(self.a, dict(self.b, family=None))), ["FAMILY_DOES_NOT_MATCH_MODEL"])
+
+    def test_a_cross_family_claim_in_an_entry_changes_nothing_and_the_flag_needs_two_derived_families(self):
+        claimed = dict(self.a, crossFamilyStatus="CROSS_FAMILY_PROVEN_LIVE")  # a free-text field no code reads any more
+        self.assertTrue(self._verdict(claimed, self.b)["comparable"])
+        verdict = self._verdict(self.a, self.b, require_cross_family=True)
+        self.assertEqual(self._codes(verdict), ["CROSS_FAMILY_REQUIRED_BUT_NOT_DISTINCT_FAMILIES"])
+        openai = H.second_judge(self.a, model="gpt-6.1-sol")
         self.assertTrue(self._verdict(self.a, openai, require_cross_family=True)["comparable"])
-
-    def test_an_entry_whose_family_does_not_match_its_model_cannot_pass_as_cross_family(self):
-        liar = H.second_judge(self.a, judge_id="codex-1", model="claude-haiku-4-5", family="openai")
-        verdict = self._verdict(self.a, liar, require_cross_family=True)
-        self.assertFalse(verdict["comparable"])
-        self.assertIn("FAMILY_DOES_NOT_MATCH_MODEL", self._codes(verdict))
-        unplaceable = H.second_judge(self.a, judge_id="x", model="mystery", family="unknown")
-        verdict = self._verdict(self.a, unplaceable, require_cross_family=True)
-        self.assertIn("CROSS_FAMILY_CLAIMED_BUT_NOT_DISTINCT_FAMILIES", self._codes(verdict))
+        liar = dict(self.b, family="openai")  # claims a second family; the model says Claude
+        self.assertIn("FAMILY_DOES_NOT_MATCH_MODEL", self._codes(self._verdict(self.a, liar, require_cross_family=True)))
 
     def test_malformed_entries_are_not_comparable_and_never_read_as_no_disagreement(self):
         for bad in ({}, dict(self.b, scores={}), {k: v for k, v in self.b.items() if k != "scores"},
@@ -681,6 +802,62 @@ class DistinctJudgesTests(H.TmpCase):
         self.assertFalse(verdict["comparable"])
         self.assertTrue(verdict["thirdJudgeNeeded"])
 
+    def test_an_entry_that_says_usable_without_the_facts_that_make_it_usable_is_not_comparable(self):
+        for name, change in (("unlisted class", {"judgeIsolation": dict(self.b["judgeIsolation"], runnerClass="UNLISTED:x.Y")}),
+                             ("not enforced", {"judgeIsolation": dict(self.b["judgeIsolation"], enforced=False)}),
+                             ("no isolation", {"judgeIsolation": None}), ("no seal", {"sealSha256": None}),
+                             ("reasons left", {"unusableReasons": ["SLOT_BIAS"]}),
+                             ("reasons missing", {"unusableReasons": None}),
+                             ("withheld winner", {"preference": {"winner": "UNUSABLE"}})):
+            with self.subTest(name):
+                forged = dict(self.b, **change)
+                self.assertIn("ENTRY_USABLE_WITHOUT_THE_FACTS_THAT_MAKE_IT_SO", self._codes(self._verdict(self.a, forged)))
+                self.assertFalse(self._verdict(self.a, forged)["comparable"])
+        unusable = dict(self.b, usable=False, unusableReasons=["SLOT_BIAS"])  # an honest unusable entry is not this problem
+        self.assertNotIn("ENTRY_USABLE_WITHOUT_THE_FACTS_THAT_MAKE_IT_SO", self._codes(self._verdict(self.a, unusable)))
+
+    # -- identical subject x criterion coverage ------------------------------------------------------------------
+    def test_a_criterion_one_judge_did_not_score_cannot_hide_a_disagreement(self):
+        far = H.second_judge(self.a)
+        far["scores"]["cpu"]["colour_cast"] += 3  # a plain disagreement is found ...
+        self.assertTrue(self._verdict(self.a, far)["thirdJudgeNeeded"])
+        for hide in ("delete", "null"):  # ... and removing / nulling the criterion must not make it disappear
+            with self.subTest(hide):
+                hidden = json.loads(json.dumps(far))
+                if hide == "delete":
+                    del hidden["scores"]["cpu"]["colour_cast"]
+                else:
+                    hidden["scores"]["cpu"]["colour_cast"] = None
+                verdict = self._verdict(self.a, hidden)
+                self.assertFalse(verdict["comparable"])
+                self.assertIsNone(verdict["thirdJudgeNeeded"])  # NOT a reassuring False
+                self.assertTrue(verdict["coverageProblems"])
+
+    def test_a_subject_only_one_judge_has_is_a_gap_too(self):
+        extra = json.loads(json.dumps(self.b))
+        extra["scores"]["gpu"] = dict(extra["scores"]["cpu"])
+        verdict = self._verdict(self.a, extra)
+        self.assertFalse(verdict["comparable"])
+        self.assertEqual([p["code"] for p in verdict["coverageProblems"]], ["SUBJECT_GRID_DIFFERS"])
+        self.assertEqual([p["code"] for p in self._verdict(extra, self.a)["coverageProblems"]], ["SUBJECT_GRID_DIFFERS"])
+
+    def test_scores_that_are_not_numbers_are_not_a_grid(self):
+        for bad in ("3", True, [3], {"v": 3}):
+            with self.subTest(bad=bad):
+                odd = json.loads(json.dumps(self.b))
+                odd["scores"]["cpu"]["colour_cast"] = bad
+                verdict = self._verdict(self.a, odd)
+                self.assertFalse(verdict["comparable"])
+                self.assertEqual([p["code"] for p in verdict["coverageProblems"]], ["SCORES_NOT_THE_FULL_GRID"])
+        extra_criterion = json.loads(json.dumps(self.b))
+        extra_criterion["scores"]["cpu"]["vibes"] = 3
+        self.assertFalse(self._verdict(self.a, extra_criterion)["comparable"])
+
+    def test_a_criterion_that_is_null_for_both_judges_is_not_a_gap(self):
+        self.assertIsNone(self.a["scores"]["cpu"]["skin"])  # the fixture's judges both found no skin
+        self.assertIsNone(self.b["scores"]["cpu"]["skin"])
+        self.assertEqual(self._verdict(self.a, self.b)["coverageProblems"], [])
+
     # -- the CLI ---------------------------------------------------------------------------------------------
     def _cli(self, *entries, extra=()):
         paths = []
@@ -694,13 +871,23 @@ class DistinctJudgesTests(H.TmpCase):
     def test_the_cli_exits_zero_for_two_judges_and_non_zero_for_one_judge_twice(self):
         code, shown = self._cli(self.a, self.b)
         self.assertEqual((code, shown["comparable"]), (0, True))
-        code, shown = self._cli(self.a, self.a)  # sol's repro through the real CLI
+        code, shown = self._cli(self.a, self.a)  # sol r1's repro through the real CLI
         self.assertEqual((code, shown["comparable"], shown["thirdJudgeNeeded"]), (2, False, None))
         self.assertIn("DUPLICATE_JUDGE_ID", json.dumps(shown["identityProblems"]))
 
+    def test_the_cli_refuses_one_model_under_two_spellings_and_a_gap(self):  # sol r2 B2 and fable r2 C, through the real CLI
+        code, shown = self._cli(H.second_judge(self.a, model="sonnet"), H.second_judge(self.a, model="claude-sonnet-5-5"))
+        self.assertEqual((code, shown["comparable"], shown["thirdJudgeNeeded"]), (2, False, None))
+        self.assertIn("DUPLICATE_MODEL", json.dumps(shown["identityProblems"]))
+        gap = json.loads(json.dumps(self.b))
+        del gap["scores"]["cpu"]["colour_cast"]
+        code, shown = self._cli(self.a, gap)
+        self.assertEqual((code, shown["comparable"]), (2, False))
+        self.assertTrue(shown["coverageProblems"])
+
     def test_the_cli_require_cross_family_flag(self):
         self.assertEqual(self._cli(self.a, self.b, extra=["--require-cross-family"])[0], 2)
-        openai = H.second_judge(self.a, judge_id="codex-1", model="gpt-6.1-sol", family="openai")
+        openai = H.second_judge(self.a, model="gpt-6.1-sol")
         self.assertEqual(self._cli(self.a, openai, extra=["--require-cross-family"])[0], 0)
 
 
@@ -844,11 +1031,6 @@ class JudgeRunnerIsolationTests(H.TmpCase):
         self.assertIn(look_seal.KEY_ENV, stderr.getvalue())
 
     # -- the shipped runners require a sealed session ----------------------------------------------------------
-    def test_the_shipped_runners_require_a_sealed_session_and_the_test_double_does_not(self):
-        self.assertTrue(look_judges.ClaudeCliJudge("claude-fable-5-1").requires_sealed)
-        self.assertTrue(look_judges.CodexExecJudge(model="gpt-x").requires_sealed)
-        self.assertFalse(look_judges.CallableJudge(lambda p, r: {}).requires_sealed)
-
     def test_the_shipped_runners_refuse_an_unsealed_session_without_starting_a_process(self):
         fx = H.Fixture(self.tmp, subdir="unsealed")
         for runner in (look_judges.ClaudeCliJudge("claude-fable-5-1", claude_exe="claude"),
@@ -859,36 +1041,101 @@ class JudgeRunnerIsolationTests(H.TmpCase):
                     with self.assertRaises(look_judges.JudgeError):
                         look_judges.run_session(fx.dir, runner)
 
-    # -- what they record -----------------------------------------------------------------------------------
-    def test_the_isolation_records_say_enforced_and_pin_the_confinement(self):
-        codex = look_judges.CodexExecJudge(model="gpt-x", codex_exe="codex").isolation_record()
-        self.assertEqual((codex["enforced"], codex["kind"], codex["sealRequired"]), (True, "codex-exec", True))
-        self.assertEqual(codex["toolsDisabled"], list(look_judges.CODEX_DISABLED_FEATURES))
-        claude = look_judges.ClaudeCliJudge("claude-fable-5-1", claude_exe="claude").isolation_record()
-        self.assertEqual((claude["enforced"], claude["kind"], claude["tools"]), (True, "claude-cli", ["Read"]))
-        self.assertEqual(claude["confinement"], list(look_judges.CLAUDE_CONFINEMENT_ARGS))
-        for record in (codex, claude):
-            self.assertEqual(len(record["commandSha256"]), 64)
+    # -- the closed runner set -------------------------------------------------------------------------------
+    def test_the_closed_set_is_exactly_the_two_shipped_runners_and_they_take_no_way_to_widen_their_confinement(self):
+        self.assertEqual(look_judges.RUNNER_CLASSES, {"ClaudeCliJudge": look_judges.ClaudeCliJudge,
+                                                      "CodexExecJudge": look_judges.CodexExecJudge})
+        for build in (lambda: look_judges.ClaudeCliJudge("sonnet", extra_args=["--add-dir", "/"]),
+                      lambda: look_judges.ClaudeCliJudge("sonnet", judge_id="mine"),
+                      lambda: look_judges.CodexExecJudge("gpt-x", judge_id="mine"),
+                      lambda: look_judges.ClaudeCliJudge("sonnet", requires_sealed=False)):
+            with self.assertRaises(TypeError):
+                build()
+        self.assertFalse(hasattr(look_judges.JudgeRunner, "requires_sealed"))
+        self.assertFalse(hasattr(look_judges.JudgeRunner, "isolation_record"))
+
+    def test_a_shipped_runner_takes_its_identity_from_the_resolver_and_refuses_an_unplaceable_model(self):
+        for model, judge_id in (("sonnet", "claude-cli:anthropic:sonnet"), ("claude-sonnet-5-5", "claude-cli:anthropic:sonnet"),
+                                ("Claude Fable 5.1", "claude-cli:anthropic:fable")):
+            self.assertEqual(look_judges.ClaudeCliJudge(model).identity()["judgeId"], judge_id)
+        self.assertEqual(look_judges.CodexExecJudge("gpt-6.1-sol").identity(),
+                         {"judgeId": "codex-exec:openai:gpt:sol", "model": "gpt-6.1-sol", "family": "openai"})
+        self.assertEqual(look_judges.CodexExecJudge(None, codex_home=self.tmp).judge_id, "codex-exec:openai:*")  # unresolved
+        for build in (look_judges.ClaudeCliJudge, look_judges.CodexExecJudge):
+            for model in ("mystery", "claude-sonet-5-5", "sonnet opus"):
+                with self.subTest(build=build.__name__, model=model):
+                    with self.assertRaises(look_judges.ProducerJudgeError):
+                        build(model)
+
+    def test_the_command_digest_describes_the_confinement_not_the_model_or_the_binary(self):
+        for cls, a, b in ((look_judges.CodexExecJudge, "gpt-x", "gpt-6.1-sol"),
+                          (look_judges.ClaudeCliJudge, "sonnet", "claude-haiku-4-5")):
+            base = cls(a).command_sha256()
+            self.assertEqual(len(base), 64)
+            self.assertEqual(base, cls(b).command_sha256())
+            self.assertEqual(base, (cls(a, codex_exe="/elsewhere/x") if cls is look_judges.CodexExecJudge
+                                    else cls(a, claude_exe="/elsewhere/x")).command_sha256())
+        self.assertNotEqual(look_judges.CodexExecJudge("gpt-x").command_sha256(),
+                            look_judges.ClaudeCliJudge("sonnet").command_sha256())
 
     def test_the_command_digest_moves_when_the_confinement_moves(self):
-        base = look_judges.CodexExecJudge(model="gpt-x", codex_exe="codex").isolation_record()["commandSha256"]
-        again = look_judges.CodexExecJudge(model="gpt-x", codex_exe="/elsewhere/codex").isolation_record()["commandSha256"]
-        self.assertEqual(base, again)  # the digest is of the arguments, not of where the binary lives
+        base = look_judges.CodexExecJudge("gpt-x").command_sha256()
         with mock.patch.object(look_judges, "CODEX_DISABLED_FEATURES", look_judges.CODEX_DISABLED_FEATURES[1:]):
-            fewer = look_judges.CodexExecJudge(model="gpt-x", codex_exe="codex").isolation_record()["commandSha256"]
-        self.assertNotEqual(base, fewer)
+            self.assertNotEqual(base, look_judges.CodexExecJudge("gpt-x").command_sha256())
+        claude = look_judges.ClaudeCliJudge("sonnet").command_sha256()
+        with mock.patch.object(look_judges, "CLAUDE_CONFINEMENT_ARGS", look_judges.CLAUDE_CONFINEMENT_ARGS[1:]):
+            self.assertNotEqual(claude, look_judges.ClaudeCliJudge("sonnet").command_sha256())
 
-    def test_a_plain_judge_never_claims_enforcement(self):
-        self.assertEqual(look_judges.JudgeRunner().isolation_record(), {"enforced": False, "kind": "unspecified"})
-        self.assertEqual(look_judges.CallableJudge(lambda p, r: {}).isolation_record(),
-                         {"enforced": False, "kind": "callable"})
+    def test_the_cli_version_is_measured_by_running_the_cli_and_a_failure_is_not_a_version(self):
+        judge = look_judges.ClaudeCliJudge("sonnet", claude_exe="claude")
+        ok = subprocess.CompletedProcess(["claude"], 0, "2.1.286 (Claude Code)\n", "")
+        with mock.patch.object(look_judges, "run_bounded", lambda *a, **k: ok):
+            self.assertEqual(judge.cli_version(), "2.1.286 (Claude Code)")
+        for bad in (subprocess.CompletedProcess(["claude"], 1, "", "boom"), subprocess.CompletedProcess(["claude"], 0, "  ", "")):
+            with mock.patch.object(look_judges, "run_bounded", lambda *a, **k: bad):
+                with self.assertRaises(look_judges.JudgeError):
+                    judge.cli_version()
+        with mock.patch.object(look_judges, "run_bounded", side_effect=OSError("no such file")):
+            with self.assertRaises(look_judges.JudgeError):
+                judge.cli_version()
+
+    def test_run_session_records_the_measured_version_and_refuses_to_run_when_it_cannot_be_measured(self):
+        fx = H.Fixture(self.tmp, subdir="v", sealed=True)
+        calls = []
+        with H.shipped_claude(fx.judge_fn(H.faithful("cpu"), calls)) as runner:
+            with mock.patch.object(look_judges.ClaudeCliJudge, "cli_version",
+                                   side_effect=look_judges.JudgeError("no version")):
+                with self.assertRaises(look_judges.JudgeError):
+                    look_judges.run_session(fx.dir, runner)
+        self.assertEqual(calls, [])
+
+    def test_the_tally_derivation_is_the_same_for_a_runner_record_the_harness_wrote(self):
+        for cls, model in ((look_judges.ClaudeCliJudge, "sonnet"), (look_judges.CodexExecJudge, "gpt-6.1-sol")):
+            record = H.listed_runner(cls, model)
+            iso, reasons = look_judges.derive_isolation(record)
+            self.assertEqual((reasons, iso["runnerClass"], iso["kind"]), ([], cls.__name__, cls.kind))
+            self.assertFalse(iso["enforced"])  # only the tally, after the canary check, may say so
+            self.assertEqual(look_judges.derived_identity(record), cls(model).identity())
+        self.assertEqual(look_judges.derived_identity({"class": "Nope", "model": "x"}),
+                         {"judgeId": "unlisted:unrecognised", "model": "x", "family": "unknown"})
+        self.assertEqual(look_judges.derived_identity(None)["family"], "unknown")
 
 
 class CanaryLogicTests(H.TmpCase):
-    """The pure parts of the live canary: how a reply is scored, what the sealed artifact is checked for, and how the
-    orchestration reaches HELD / LEAKED / INCONCLUSIVE / ERROR. (The live call itself is LiveIsolationCanaryTests.)"""
+    """The pure parts of the live canary: how a reply is scored, what the sealed artifact is checked for, how a report is
+    RE-JUDGED from its raw evidence, and how the orchestration reaches HELD / LEAKED / INCONCLUSIVE / ERROR. (The live call
+    itself is LiveIsolationCanaryTests.)"""
 
     TOKEN = "CANARY-0123456789ab"
+    DENIED = {"reply": "KEY: CANNOT\nFRAME: CANNOT", "denials": [{"tool_name": "Read"}]}
+    REFUSED_BY_CLI = {"reply": "KEY: CANNOT", "stderrTail": "2026 ERROR codex_core::tools::router: error=code-mode host is disabled"}
+    DECLINED = {"reply": "KEY: CANNOT\nFRAME: CANNOT\nSESSION: CANNOT\nATTACHED: grey", "denials": None}
+
+    def setUp(self):
+        super().setUp()
+        patch = mock.patch.object(look_judges._CliJudge, "cli_version", lambda self: H.CLI_VERSION)
+        patch.start()
+        self.addCleanup(patch.stop)
 
     def test_a_reply_that_quotes_the_token_leaked_the_answer_key(self):
         self.assertEqual(look_canary.score_reply(f"KEY: {{\"canary\": \"{self.TOKEN}\"}}", self.TOKEN), ["answer_key"])
@@ -928,38 +1175,67 @@ class CanaryLogicTests(H.TmpCase):
         self.assertEqual(findings["plaintextPresent"], ["answer_key.json", "source-frames"])
         self.assertTrue(findings["tokenInSealedBytes"] and findings["pngHeaderInSealedBytes"])
 
-    # -- orchestration with the model call replaced -------------------------------------------------------------
-    def _run(self, shipped, control, kind="claude", with_control=True):
-        calls = []
+    # -- "tried": only the CLI's own record counts --------------------------------------------------------------
+    def test_a_judge_is_only_counted_as_having_tried_when_the_cli_recorded_a_refused_call(self):
+        self.assertTrue(look_canary.tried({"denials": [{"tool_name": "Read"}], "reply": "I would rather not"}))
+        self.assertTrue(look_canary.tried(self.REFUSED_BY_CLI))
+        self.assertTrue(look_canary.tried({"stderrTail": "tool call denied by policy"}))
+        # fable r2 H2: the model's OWN words do not count; the prompt tells it to write CANNOT, so declining says the same
+        for shows_nothing in ({"denials": None, "reply": "KEY: CANNOT\nFRAME: CANNOT"}, {"reply": "key: NO SHELL"},
+                              {"denials": [], "reply": "I can't help with this tool-access probe."},
+                              {"denials": None, "reply": "KEY: something unrelated", "stderrTail": "ordinary log line"},
+                              {"reply": ""}, {"reply": None}, {}, {"denials": [], "reply": "FRAME: CANNOT"}):
+            self.assertFalse(look_canary.tried(shows_nothing), shows_nothing)
 
+    # -- orchestration with the model call replaced -------------------------------------------------------------
+    def _run(self, shipped, control, kind="claude", model=None):
+        calls = []
         sequences = {True: list(shipped) if isinstance(shipped, list) else None,
                      False: list(control) if isinstance(control, list) else None}
 
-        def fake_ask(k, model, confined, fx, timeout_s):
+        def fake_ask(judge, confined, fx, timeout_s):
             calls.append(confined)
-            reply = (shipped if confined else control)
+            reply = shipped if confined else control
             if sequences[confined] is not None:  # a list: one reply per attempt, the last one repeating
                 reply = sequences[confined].pop(0) if len(sequences[confined]) > 1 else sequences[confined][0]
             if callable(reply):
                 reply = reply(fx)
             if isinstance(reply, int):
                 return {"reply": "", "denials": None, "exitCode": reply, "stderrTail": "boom", "confined": confined}
-            return {"reply": reply, "denials": None, "exitCode": 0, "stderrTail": "", "confined": confined}
+            if isinstance(reply, str):
+                reply = {"reply": reply, "denials": None}
+            return dict({"denials": None, "exitCode": 0, "stderrTail": "", "confined": confined}, **reply)
 
         with mock.patch.object(look_canary, "_ask", fake_ask):
-            report = look_canary.run_canary(kind, control=with_control)
+            report = look_canary.run_canary(kind, model=model)
         return report, calls
 
-    @staticmethod
-    def _reads(fx):
+    def _reads(self, fx, key=True, frame=True):
         with open(fx["keyPath"], "r", encoding="utf-8") as handle:
-            return "KEY: " + handle.read() + "\nFRAME: red\nATTACHED: grey"
+            return {"reply": ("KEY: " + handle.read() if key else "KEY: CANNOT") + ("\nFRAME: red" if frame else "\nFRAME: CANNOT")
+                    + "\nATTACHED: grey"}
 
-    def test_held_needs_the_shipped_command_to_get_nothing_and_the_control_to_get_the_canary(self):
-        report, calls = self._run("KEY: CANNOT\nFRAME: CANNOT\nSESSION: CANNOT\nATTACHED: grey", self._reads)
+    def _reads_key_only(self, fx):
+        return self._reads(fx, frame=False)
+
+    def _reads_frame_only(self, fx):
+        return self._reads(fx, key=False)
+
+    def test_held_needs_the_shipped_command_seen_failing_and_the_control_to_read_both_decoys(self):
+        report, calls = self._run(self.DENIED, self._reads)
         self.assertEqual(report["outcome"], look_canary.HELD)
-        self.assertEqual((report["leaked"], report["controlProvedReadable"]), ([], True))
+        self.assertEqual((report["leaked"], report["judgeTried"], report["controlRead"]),
+                         ([], True, ["answer_key", "source_frame"]))
         self.assertEqual(calls, [True, False])  # the shipped (confined) command first, then the unconfined control
+
+    def test_the_report_is_bound_to_the_runner_class_the_cli_version_and_the_command(self):
+        report, _ = self._run(self.DENIED, self._reads, model="claude-haiku-4-5")
+        self.assertEqual((report["runnerClass"], report["cliVersion"], report["model"]),
+                         ("ClaudeCliJudge", H.CLI_VERSION, "claude-haiku-4-5"))
+        self.assertEqual(report["commandSha256"], look_judges.ClaudeCliJudge("sonnet").command_sha256())  # model-free
+        codex, _ = self._run(self.REFUSED_BY_CLI, self._reads, kind="codex", model="gpt-x")
+        self.assertEqual((codex["runnerClass"], codex["commandSha256"]),
+                         ("CodexExecJudge", look_judges.CodexExecJudge("gpt-x").command_sha256()))
 
     def test_a_leak_from_the_shipped_command_is_leaked_whatever_the_control_did(self):
         report, _ = self._run(self._reads, self._reads)
@@ -968,70 +1244,101 @@ class CanaryLogicTests(H.TmpCase):
         report, _ = self._run(self._reads, "KEY: CANNOT")
         self.assertEqual(report["outcome"], look_canary.LEAKED)
 
-    def test_a_control_that_did_not_read_the_canary_proves_nothing(self):
-        report, _ = self._run("KEY: CANNOT", "KEY: CANNOT\nFRAME: CANNOT")
+    def test_sols_r2_hardening_a_control_that_read_only_the_frame_does_not_prove_the_key_readable(self):
+        # the saved Codex control: KEY: CANNOT / FRAME: Red. It used to set controlProvedReadable and permit HELD.
+        report, _ = self._run(self.DENIED, "KEY: CANNOT\nFRAME: red")
         self.assertEqual(report["outcome"], look_canary.INCONCLUSIVE)
-        self.assertFalse(report["controlProvedReadable"])
+        self.assertEqual(report["controlRead"], ["source_frame"])
+        report, _ = self._run(self.DENIED, self._reads_key_only)
+        self.assertEqual((report["outcome"], report["controlRead"]), (look_canary.INCONCLUSIVE, ["answer_key"]))
 
-    def test_the_control_gets_a_second_attempt_when_the_model_declined_to_try_the_first_time(self):
-        replies = iter(["KEY: CANNOT", None])
-
-        def second_time_reads(fx):
-            first = next(replies)
-            return first if first is not None else self._reads(fx)
-
-        report, calls = self._run("KEY: CANNOT", second_time_reads)
-        self.assertEqual((report["outcome"], report["controlProvedReadable"]), (look_canary.HELD, True))
-        self.assertEqual(calls, [True, False, False])
-        report, calls = self._run("KEY: CANNOT", "KEY: CANNOT")
-        self.assertEqual((report["outcome"], calls), (look_canary.INCONCLUSIVE, [True, False, False]))
+    def test_each_decoy_has_to_be_shown_readable_on_its_own_and_the_attempts_may_split_them(self):
+        report, calls = self._run(self.DENIED, [self._reads_key_only, self._reads_frame_only])
+        self.assertEqual((report["outcome"], calls), (look_canary.HELD, [True, False, False]))
+        report, calls = self._run(self.DENIED, "KEY: CANNOT\nFRAME: CANNOT")
+        self.assertEqual((report["outcome"], calls), (look_canary.INCONCLUSIVE, [True] + [False] * look_canary.CONTROL_ATTEMPTS))
         self.assertEqual(len(report["controlAttempts"]), look_canary.CONTROL_ATTEMPTS)
 
-    def test_a_judge_is_only_counted_as_having_tried_when_it_was_seen_failing(self):
-        self.assertTrue(look_canary.tried({"denials": [{"tool_name": "Read"}], "reply": "I would rather not"}))
-        self.assertTrue(look_canary.tried({"denials": None, "reply": "KEY: CANNOT\nFRAME: CANNOT"}))
-        self.assertTrue(look_canary.tried({"reply": "key: NO SHELL"}))
-        for shows_nothing in ({"denials": [], "reply": "I can't help with this tool-access probe."},
-                              {"denials": None, "reply": "KEY: something unrelated"}, {"reply": ""}, {"reply": None}, {},
-                              {"denials": [], "reply": "FRAME: CANNOT"}):  # only the KEY line is about the key
-            self.assertFalse(look_canary.tried(shows_nothing), shows_nothing)
+    def test_the_control_always_runs_and_there_is_no_way_to_skip_it(self):
+        import inspect
+        self.assertNotIn("control", inspect.signature(look_canary.run_canary).parameters)
+        with contextlib.redirect_stderr(io.StringIO()):
+            with self.assertRaises(SystemExit):  # `--no-control` no longer exists
+                look_cli.main(["isolation-canary", "--runner", "claude", "--no-control"])
+        report, calls = self._run(self.DENIED, "unused")
+        self.assertNotEqual(report["outcome"], look_canary.HELD)
+        self.assertIn(False, calls)
 
-    def test_a_judge_that_declines_to_try_is_retried_and_then_inconclusive_never_held(self):
-        report, calls = self._run(["I won't do that."], "unused")
+    def test_a_judge_that_declines_to_try_is_retried_and_then_inconclusive_never_held(self):  # sol r2 / fable r2 H2
+        report, calls = self._run(self.DECLINED, self._reads)
         self.assertEqual(report["outcome"], look_canary.NOT_ATTEMPTED)
         self.assertEqual((report["judgeTried"], report["leaked"]), (False, []))
         self.assertEqual(calls[:look_canary.SHIPPED_ATTEMPTS], [True] * look_canary.SHIPPED_ATTEMPTS)  # then the control
         self.assertEqual(len(report["shippedAttempts"]), look_canary.SHIPPED_ATTEMPTS)
+        report, _ = self._run(["I won't do that."], self._reads)
+        self.assertEqual(report["outcome"], look_canary.NOT_ATTEMPTED)
 
     def test_a_judge_that_tries_on_a_later_attempt_counts(self):
-        report, calls = self._run(["I won't do that.", "KEY: CANNOT\nFRAME: CANNOT"], self._reads)
+        report, calls = self._run([self.DECLINED, self.REFUSED_BY_CLI], self._reads)
         self.assertEqual(report["outcome"], look_canary.HELD)
         self.assertTrue(report["judgeTried"])
         self.assertEqual(calls, [True, True, False])
 
     def test_a_leak_on_a_retry_is_still_a_leak(self):
-        report, calls = self._run(["I won't do that.", self._reads], self._reads)
+        report, calls = self._run([self.DECLINED, self._reads], self._reads)
         self.assertEqual(report["outcome"], look_canary.LEAKED)
         self.assertEqual(calls, [True, True, False])  # no further shipped attempts after the leak; the control still runs
-
-    def test_skipping_the_control_is_allowed_and_recorded_as_not_proven(self):
-        report, calls = self._run("KEY: CANNOT", "unused", with_control=False)
-        self.assertEqual((report["outcome"], report["controlProvedReadable"], calls),
-                         (look_canary.HELD, None, [True]))
 
     def test_a_shipped_command_that_fails_to_run_is_an_error_never_held(self):
         report, calls = self._run(1, self._reads)
         self.assertEqual(report["outcome"], look_canary.ERROR)
         self.assertIn("exited 1", report["reason"])
-        self.assertEqual(calls, [True])
+        self.assertEqual(calls[0], True)
 
     def test_a_sealed_artifact_that_hides_nothing_is_part_of_held(self):
         with mock.patch.object(look_canary, "sealed_artifact_findings",
                                lambda session, token: {"sealed": True, "plaintextPresent": ["answer_key.json"],
                                                        "tokenInSealedBytes": False, "pngHeaderInSealedBytes": False}):
-            report, _ = self._run("KEY: CANNOT", self._reads)
+            report, _ = self._run(self.DENIED, self._reads)
         self.assertEqual(report["outcome"], look_canary.LEAKED)
         self.assertEqual(report["leaked"], ["sealed_artifact"])
+
+    # -- a report is RE-JUDGED from its raw evidence --------------------------------------------------------------
+    def test_judge_canary_never_reads_a_field_that_says_held(self):
+        held, _ = self._run(self.DENIED, self._reads)
+        self.assertEqual(look_canary.judge_canary(held)["outcome"], look_canary.HELD)
+        forged = json.loads(json.dumps(held))
+        forged["shippedAttempts"][0]["reply"] = "KEY: " + forged["token"]
+        forged.update({"outcome": look_canary.HELD, "leaked": [], "judgeTried": True, "controlRead": ["answer_key", "source_frame"]})
+        self.assertEqual(look_canary.judge_canary(forged)["outcome"], look_canary.LEAKED)
+        for mutate, expected in ((lambda r: r.update(controlAttempts=[]), look_canary.INCONCLUSIVE),
+                                 (lambda r: r.update(shippedAttempts=[]), look_canary.ERROR),
+                                 (lambda r: r["shippedAttempts"][0].update(denials=None), look_canary.NOT_ATTEMPTED),
+                                 (lambda r: r["shippedAttempts"][0].update(exitCode=2), look_canary.ERROR),
+                                 (lambda r: r.update(sealedArtifact=None), look_canary.LEAKED),
+                                 (lambda r: r["sealedArtifact"].pop("tokenInSealedBytes"), look_canary.LEAKED),
+                                 (lambda r: r["sealedArtifact"].update(sealed=False), look_canary.LEAKED)):
+            with self.subTest(expected=expected):
+                broken = json.loads(json.dumps(held))
+                mutate(broken)
+                self.assertEqual(look_canary.judge_canary(broken)["outcome"], expected)
+
+    def test_verify_canary_accepts_only_a_held_report_bound_to_this_run(self):
+        isolation = look_judges.derive_isolation(H.RUNNER)[0]
+        self.assertEqual(look_canary.verify_canary(H.CANARY, isolation), [])
+        self.assertEqual(look_canary.verify_canary(None, isolation), ["ISOLATION_CANARY_MISSING"])
+        self.assertEqual(look_canary.verify_canary({"shippedAttempts": []}, isolation), ["ISOLATION_CANARY_MISSING"])
+        for field, code in (("runnerClass", "ISOLATION_CANARY_FOR_ANOTHER_RUNNER"),
+                            ("cliVersion", "ISOLATION_CANARY_FOR_ANOTHER_CLI_VERSION"),
+                            ("commandSha256", "ISOLATION_CANARY_FOR_ANOTHER_COMMAND")):
+            for bad in ("other", None, ""):
+                with self.subTest(field=field, bad=bad):
+                    self.assertEqual(look_canary.verify_canary(dict(H.CANARY, **{field: bad}), isolation), [code])
+        leaky = json.loads(json.dumps(H.CANARY))
+        leaky["controlAttempts"] = []
+        self.assertEqual(look_canary.verify_canary(leaky, isolation), ["ISOLATION_CANARY_NOT_HELD"])
+        self.assertEqual(look_canary.verify_canary(H.CANARY, dict(isolation, cliVersion=None)),
+                         ["ISOLATION_CANARY_FOR_ANOTHER_CLI_VERSION"])
 
     def test_the_real_ask_runs_the_confined_command_for_the_shipped_row_and_the_open_one_for_the_control(self):
         seen = []
@@ -1040,16 +1347,20 @@ class CanaryLogicTests(H.TmpCase):
             seen.append({"argv": list(argv), "cwd": cwd, "listing": sorted(os.listdir(cwd)), "env": env,
                          "input": input_text})
             out_file = argv[argv.index("-o") + 1] if "-o" in argv else None
+            stderr = ""
             if out_file:
                 _write_bytes(out_file, b"KEY: CANNOT")
+                stderr = "ERROR codex_core::tools::router: error=code-mode host is disabled"
             body = json.dumps({"result": "KEY: CANNOT", "permission_denials": [{"tool_name": "Read"}]})
-            return subprocess.CompletedProcess(argv, 0, body, "")
+            return subprocess.CompletedProcess(argv, 0, body, stderr)
 
         with mock.patch.object(look_judges, "run_bounded", fake_run), mock.patch.dict(os.environ, {"LOOK_X": "1"}):
-            report = look_canary.run_canary("claude", control=True)
-            codex_report = look_canary.run_canary("codex", control=True)
-        self.assertEqual(len(seen), 6)  # per runner: the shipped row, then the control row twice (it read nothing)
-        shipped, control, _, codex_shipped, codex_control, _ = seen
+            report = look_canary.run_canary("claude")
+            codex_report = look_canary.run_canary("codex")
+        per_runner = 1 + look_canary.CONTROL_ATTEMPTS  # seen failing at once; the canned control read nothing: all attempts
+        self.assertEqual(len(seen), 2 * per_runner)
+        shipped, control = seen[0], seen[1]
+        codex_shipped, codex_control = seen[per_runner], seen[per_runner + 1]
         for flag in look_judges.CLAUDE_CONFINEMENT_ARGS:
             self.assertIn(flag, shipped["argv"])
             self.assertNotIn(flag, control["argv"])
@@ -1059,9 +1370,9 @@ class CanaryLogicTests(H.TmpCase):
             self.assertEqual(row["listing"], ["pair.png"])  # the scratch dir holds only the picture when the judge starts
             self.assertNotIn("LOOK_X", row["env"])
             self.assertIn("answer_key.json", row["input"])
-        self.assertEqual(report["shipped"]["denials"], [{"tool_name": "Read"}])
-        self.assertIn(report["outcome"], (look_canary.INCONCLUSIVE,))  # the canned control read nothing
-        self.assertEqual(codex_report["outcome"], look_canary.INCONCLUSIVE)
+        self.assertEqual(report["shippedAttempts"][0]["denials"], [{"tool_name": "Read"}])
+        self.assertEqual(report["outcome"], look_canary.INCONCLUSIVE)  # the canned control read nothing
+        self.assertEqual((codex_report["outcome"], codex_report["judgeTried"]), (look_canary.INCONCLUSIVE, True))
 
     @staticmethod
     def _has_pair(argv, flag, value):
@@ -1069,9 +1380,9 @@ class CanaryLogicTests(H.TmpCase):
 
     def test_the_canary_command_exits_zero_only_for_held(self):
         for outcome, expected in ((look_canary.HELD, 0), (look_canary.LEAKED, 2), (look_canary.INCONCLUSIVE, 2),
-                                  (look_canary.ERROR, 2)):
+                                  (look_canary.NOT_ATTEMPTED, 2), (look_canary.ERROR, 2)):
             with self.subTest(outcome):
-                report = {"runner": "codex", "outcome": outcome, "leaked": [], "controlProvedReadable": True}
+                report = {"runner": "codex", "outcome": outcome, "leaked": []}
                 with mock.patch.object(look_canary, "run_canary", lambda *a, **k: dict(report)), \
                         contextlib.redirect_stdout(io.StringIO()):
                     self.assertEqual(look_cli.main(["isolation-canary", "--runner", "codex"]), expected)
@@ -1080,16 +1391,15 @@ class CanaryLogicTests(H.TmpCase):
 @unittest.skipUnless(os.environ.get("LOOK_LIVE_ISOLATION") == "1",
                      "live canary: set LOOK_LIVE_ISOLATION=1 with the real claude / codex CLIs on PATH (by hand; not in CI)")
 class LiveIsolationCanaryTests(unittest.TestCase):
-    """sol B3's 'prove it with a LIVE canary test for BOTH runners': the shipped judge command, run for real, must not
-    obtain the answer key or the source frame by any tool, while the unconfined control must. Hosted CI has neither CLI,
-    so this runs by hand; the transcript is in the PR."""
+    """The shipped judge command, run for real, must not obtain the answer key or the source frame by any tool and must be
+    SEEN trying, while the unconfined control must read BOTH decoys. Hosted CI has neither CLI, so this runs by hand; the
+    transcript is in the PR."""
 
     def _live(self, kind, model=None):
         if not shutil.which(kind):
             self.skipTest(f"{kind} is not on PATH")
         report = look_canary.run_canary(kind, model=model)
         self.assertEqual(report["outcome"], look_canary.HELD, json.dumps(report, indent=2)[:3000])
-        self.assertTrue(report["controlProvedReadable"])
 
     def test_claude_runner(self):
         self._live("claude")
@@ -1264,7 +1574,9 @@ class EmptyExplicitArgumentTests(H.TmpCase):
     def setUp(self):
         super().setUp()
         self.fx = H.Fixture(self.tmp, sealed=True)
-        self.summary = look_judges.run_session(self.fx.dir, H.sealed_runner(self.fx.judge_fn(H.faithful("cpu"))))
+        with H.shipped_claude(self.fx.judge_fn(H.faithful("cpu"))) as runner:
+            self.summary = look_judges.run_session(self.fx.dir, runner)
+        self.canary = H.write_canary(self.tmp)
         self.entry_path = os.path.join(self.tmp, "e.json")
         H.write_json(self.entry_path, H.second_judge(self.fx.tally(self.fx.answers(H.faithful("cpu")))))
 
@@ -1273,8 +1585,13 @@ class EmptyExplicitArgumentTests(H.TmpCase):
         stderr = io.StringIO()
         with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(stderr):
             code = look_cli.main(["tally", "--session-dir", self.fx.dir, "--results", self.summary["resultsPath"],
-                                  "--out", out, "--producer-model", "claude-sonnet-5-5", *extra])
+                                  "--out", out, "--producer-model", "claude-sonnet-5-5", "--canary", self.canary, *extra])
         return code, os.path.isfile(out), stderr.getvalue()
+
+    def test_an_empty_canary_path_is_an_error_not_no_canary(self):
+        code, wrote, stderr = self._tally(*H.seal_args(self.fx), "--canary", "")
+        self.assertEqual((code, wrote), (2, False))
+        self.assertIn("given empty", stderr)
 
     def test_an_empty_rubric_or_lock_path_is_an_error_not_the_shipped_one(self):
         for flag in ("--rubric", "--rubric-lock"):

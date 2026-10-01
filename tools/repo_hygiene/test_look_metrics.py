@@ -858,63 +858,137 @@ class RequestedBaselineTests(_InputHelpers):
 
 @unittest.skipUnless(_HAS_DEPS, "numpy/Pillow are not installed on this host")
 class FrameIndexTests(_InputHelpers):
-    """LOOK-METRICS-JUDGE-2 item 2: index_frames never silently skips a file in a supplied directory, and a
-    supplied directory that yields no frame is an error."""
+    """LOOK-METRICS-JUDGE-3 item 2: a frames directory is ALL OR NOTHING. Every entry is a text sidecar or a numbered PNG that
+    decodes; anything else refuses the WHOLE directory with a typed reason per offender. There is no list of image extensions
+    or signatures to fall behind a new format (sol r2 B3: a valid PCX frame was ignored and the sheet PASSed)."""
 
-    def test_mis_named_png_without_digits_is_reported_and_blocks_the_floor(self):
+    def _refused(self, directory):
+        with self.assertRaises(lm.FrameIndexError) as caught:
+            lm.index_frames(directory)
+        return {r["name"]: r["code"] for r in caught.exception.reasons}
+
+    def _put(self, directory, name, data):
+        with open(os.path.join(directory, name), "wb") as handle:
+            handle.write(data)
+
+    def test_sols_r2_repro_a_valid_pcx_frame_beside_a_neutral_png_refuses_the_directory_not_a_pass(self):
         with tempfile.TemporaryDirectory() as tmp:
-            subject = self._dir(tmp, "sub", {"cuda-00.png": self.original, "cuda-final.png": self.moved})
-            index = lm.index_frames(subject)
-            self.assertEqual(sorted(index), [0])
-            self.assertEqual([(s["name"], s["reason"], s["blocking"]) for s in index.skipped],
-                             [("cuda-final.png", "NO_DIGITS_IN_NAME", True)])
+            subject = self._dir(tmp, "sub", {"f-00.png": _flat(64, 64, (110, 118, 125))})
+            Image.fromarray(_flat(64, 64, (0, 0, 0)), "RGB").save(os.path.join(subject, "f-01.pcx"))  # valid, all black
+            self.assertEqual(self._refused(subject), {"f-01.pcx": "NOT_A_PNG"})
             code, verdict, _ = self._floor(tmp, subject, None)
-            self.assertEqual((code, verdict["outcome"]), (2, lm.INCOMPLETE))
-            self.assertEqual([r["code"] for r in verdict["incompleteReasons"]], ["FRAME_FILES_NOT_INDEXED"])
-            self.assertEqual(verdict["inputs"]["frames"]["skipped"][0]["name"], "cuda-final.png")
+            self.assertEqual((code, verdict), (2, None))  # no verdict at all: nothing to read as a pass
+            out = os.path.join(tmp, "v.json")
+            self.assertEqual(self._run(["floor", "--frames-dir", subject, "--label", "x", "--out", out])[0], 2)
+            self.assertFalse(os.path.exists(out))
 
-    def test_a_non_png_image_is_reported_and_blocks_but_a_sidecar_is_only_listed(self):
+    def test_every_foreign_image_format_refuses_the_directory_whatever_it_is_called(self):
+        formats = ("PCX", "JPEG", "BMP", "GIF", "TGA", "TIFF", "PPM", "ICO", "WEBP")
         with tempfile.TemporaryDirectory() as tmp:
-            subject = self._dir(tmp, "sub", {"f-00.png": self.original, "f-01.jpg": self.original})
-            with open(os.path.join(subject, "notes.txt"), "w") as handle:
-                handle.write("x")
-            os.makedirs(os.path.join(subject, "old"))
-            index = lm.index_frames(subject)
-            by_name = {s["name"]: s for s in index.skipped}
-            self.assertEqual((by_name["f-01.jpg"]["reason"], by_name["f-01.jpg"]["blocking"]), ("NOT_A_PNG", True))
-            self.assertEqual((by_name["notes.txt"]["reason"], by_name["notes.txt"]["blocking"]), ("NOT_A_FRAME_FILE", False))
-            self.assertEqual((by_name["old"]["reason"], by_name["old"]["blocking"]), ("NOT_A_FILE", False))
-            code, verdict, _ = self._floor(tmp, subject, None)
-            self.assertEqual((code, verdict["outcome"]), (2, lm.INCOMPLETE))
+            for number, fmt in enumerate(formats):
+                for name in (f"f-01.{fmt.lower()}", "f-01", "f-01.dat", f"f-01.{fmt.lower()}.png", "f-01.PNG"):
+                    with self.subTest(fmt=fmt, name=name):
+                        subject = self._dir(tmp, f"sub-{number}-{abs(hash(name))}", {"f-00.png": self.original})
+                        try:
+                            Image.fromarray(self.moved, "RGB").save(os.path.join(subject, name), format=fmt)
+                        except (KeyError, ValueError, OSError):
+                            self.skipTest(f"this Pillow cannot write {fmt}")
+                        self.assertEqual(self._refused(subject), {name: "NOT_A_PNG"})
 
-    def test_sidecars_alone_do_not_block_but_are_listed_in_the_verdict(self):
+    def test_a_png_that_does_not_decode_or_is_not_one_refuses_the_directory(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            good = self._dir(tmp, "good", {"f-00.png": self.original})
+            with open(os.path.join(good, "f-00.png"), "rb") as handle:
+                png = handle.read()
+            for name, data, code in (("truncated", png[:len(png) // 2], "PNG_DOES_NOT_DECODE"),
+                                     ("signature-only", png[:8], "NOT_A_PNG"),
+                                     ("garbage", b"\x00" * 64, "NOT_A_PNG"), ("empty", b"", "NOT_A_PNG"),
+                                     ("text", b"not a picture", "NOT_A_PNG")):
+                with self.subTest(name):
+                    subject = self._dir(tmp, f"sub-{name}", {"f-00.png": self.original})
+                    self._put(subject, "f-01.png", data)
+                    self.assertEqual(self._refused(subject), {"f-01.png": code})
+
+    def test_what_is_not_a_regular_file_and_what_has_no_unique_number_refuses_the_directory(self):
         with tempfile.TemporaryDirectory() as tmp:
             subject = self._dir(tmp, "sub", {"f-00.png": self.original})
-            with open(os.path.join(subject, "notes.txt"), "w") as handle:
-                handle.write("x")
+            os.makedirs(os.path.join(subject, "old"))
+            self.assertEqual(self._refused(subject), {"old": "NOT_A_REGULAR_FILE"})
+            subject = self._dir(tmp, "nodigits", {"f-00.png": self.original, "cuda-final.png": self.moved})
+            self.assertEqual(self._refused(subject), {"cuda-final.png": "NO_NUMERIC_INDEX"})
+            subject = self._dir(tmp, "dup", {"a-00.png": self.original, "b-00.png": self.moved})
+            with self.assertRaises(lm.FrameIndexError) as caught:
+                lm.index_frames(subject)
+            self.assertEqual(caught.exception.reasons,
+                             [{"name": "b-00.png", "code": "DUPLICATE_FRAME_INDEX", "index": 0, "takenBy": "a-00.png"}])
+            subject = self._dir(tmp, "bak", {"f-00.png": self.original})
+            with open(os.path.join(subject, "f-00.png"), "rb") as handle:
+                self._put(subject, "f-00.png.bak", handle.read())
+            self.assertEqual(self._refused(subject), {"f-00.png.bak": "DUPLICATE_FRAME_INDEX"})  # a copy of a frame is not a sidecar
+
+    def test_every_offender_is_named_in_one_refusal(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            subject = self._dir(tmp, "sub", {"f-00.png": self.original})
+            Image.fromarray(self.moved, "RGB").save(os.path.join(subject, "f-01.jpg"))
+            self._put(subject, "readme", b"hello")
+            os.makedirs(os.path.join(subject, "nested"))
+            self.assertEqual(self._refused(subject), {"f-01.jpg": "NOT_A_PNG", "nested": "NOT_A_REGULAR_FILE",
+                                                      "readme": "NOT_A_PNG"})
+            with self.assertRaises(lm.FrameIndexError) as caught:
+                lm.index_frames(subject)
+            for name in ("f-01.jpg", "nested", "readme"):
+                self.assertIn(name, str(caught.exception))
+
+    def test_a_png_is_a_frame_by_what_it_decodes_to_not_by_its_extension(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            subject = self._dir(tmp, "sub", {"f-00.png": self.original})
+            with open(os.path.join(subject, "f-00.png"), "rb") as handle:
+                self._put(subject, "frame-07.dat", handle.read())
+            self.assertEqual(sorted(lm.index_frames(subject)), [0, 7])
+
+    def test_text_sidecars_are_allowed_and_recorded_with_their_digest_never_ignored_unseen(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            subject = self._dir(tmp, "sub", {"f-00.png": self.original})
+            for name, text in (("notes.txt", "BMW service notes\n"), ("capture.JSON", '{"fps": 24}'), ("README.md", "# frames\n")):
+                with open(os.path.join(subject, name), "w", encoding="utf-8") as handle:
+                    handle.write(text)
+            index = lm.index_frames(subject)
+            self.assertEqual(sorted(index), [0])
+            self.assertEqual([s["name"] for s in index.sidecars], ["README.md", "capture.JSON", "notes.txt"])
+            self.assertTrue(all(len(s["sha256"]) == 64 for s in index.sidecars))
             code, verdict, _ = self._floor(tmp, subject, None)
             self.assertEqual((code, verdict["outcome"]), (0, lm.PASS))
-            self.assertEqual([s["name"] for s in verdict["inputs"]["frames"]["skipped"]], ["notes.txt"])
+            self.assertEqual([s["name"] for s in verdict["inputs"]["frames"]["sidecars"]],
+                             ["README.md", "capture.JSON", "notes.txt"])
 
-    def test_two_files_with_one_index_are_ambiguous_and_block(self):
+    def test_a_picture_cannot_hide_under_a_sidecar_name(self):
         with tempfile.TemporaryDirectory() as tmp:
-            subject = self._dir(tmp, "sub", {"a-00.png": self.original, "b-00.png": self.moved})
-            index = lm.index_frames(subject)
-            self.assertEqual(sorted(index), [0])
-            self.assertEqual([(s["name"], s["reason"].split(":")[0]) for s in index.skipped],
-                             [("b-00.png", "DUPLICATE_FRAME_INDEX")])
-            code, verdict, _ = self._floor(tmp, subject, None)
-            self.assertEqual((code, verdict["outcome"]), (2, lm.INCOMPLETE))
+            good = self._dir(tmp, "good", {"f-00.png": self.original})
+            with open(os.path.join(good, "f-00.png"), "rb") as handle:
+                png = handle.read()
+            bmp = os.path.join(tmp, "x.bmp")
+            Image.fromarray(self.moved, "RGB").save(bmp)
+            with open(bmp, "rb") as handle:
+                bmp_bytes = handle.read()
+            for name, data, code in (("f-01.txt", png, "SIDECAR_NOT_TEXT"), ("f-01.md", bmp_bytes, "SIDECAR_NOT_TEXT"),
+                                     ("f-01.json", b"P6\n1 1\n255\n\x00\x00\x00", "SIDECAR_NOT_TEXT"),
+                                     ("f-01.TXT", b"\xff\xfe\xfa not utf-8", "SIDECAR_NOT_TEXT"),
+                                     ("f-01.txt", b"x" * ((1 << 20) + 1), "SIDECAR_TOO_LARGE")):
+                with self.subTest(name=name, code=code):
+                    subject = self._dir(tmp, f"sub-{abs(hash((name, code)))}", {"f-00.png": self.original})
+                    self._put(subject, name, data)
+                    self.assertEqual(self._refused(subject), {name: code})
 
-    def test_a_mis_named_baseline_file_blocks_too(self):
+    def test_only_json_txt_and_md_are_sidecars(self):
         with tempfile.TemporaryDirectory() as tmp:
-            subject = self._dir(tmp, "sub", {"f-00.png": self.original})
-            baseline = self._dir(tmp, "base", {"f-00.png": self.original, "baseline-final.png": self.original})
-            code, verdict, _ = self._floor(tmp, subject, baseline)
-            self.assertEqual((code, verdict["outcome"]), (2, lm.INCOMPLETE))
-            self.assertIn("BASELINE_FILES_NOT_INDEXED", [r["code"] for r in verdict["incompleteReasons"]])
+            for name in ("log.csv", "readme", "Thumbs.db", "desktop.ini", "notes.rtf", "frame.xmp"):
+                with self.subTest(name):
+                    subject = self._dir(tmp, f"sub-{name}", {"f-00.png": self.original})
+                    self._put(subject, name, b"plain text\n")
+                    self.assertEqual(self._refused(subject), {name: "NOT_A_PNG"})
+        self.assertEqual(lm.SIDECAR_EXTENSIONS, (".json", ".txt", ".md"))
 
-    def test_a_directory_that_yields_zero_frames_is_an_error_everywhere(self):
+    def test_a_directory_that_yields_zero_frames_is_refused_everywhere(self):
         with tempfile.TemporaryDirectory() as tmp:
             empty = self._dir(tmp, "empty", {})
             only_text = os.path.join(tmp, "text")
@@ -923,10 +997,11 @@ class FrameIndexTests(_InputHelpers):
                 handle.write("x")
             ok = self._dir(tmp, "ok", {"f-00.png": self.original})
             missing = os.path.join(tmp, "no-such-dir")
+            self.assertEqual(self._refused(empty), {empty: "NO_FRAME"})
+            self.assertEqual(self._refused(only_text), {only_text: "NO_FRAME"})
+            self.assertEqual(self._refused(missing), {missing: "NOT_A_DIRECTORY"})
             for bad in (empty, only_text, missing):
                 with self.subTest(bad=os.path.basename(bad)):
-                    with self.assertRaises(lm.FrameIndexError):
-                        lm.index_frames(bad)
                     out = os.path.join(tmp, "v.json")
                     self.assertEqual(self._run(["floor", "--frames-dir", bad, "--label", "x", "--out", out])[0], 2)
                     self.assertEqual(self._run(["floor", "--frames-dir", ok, "--baseline-dir", bad, "--label", "x",
@@ -935,6 +1010,25 @@ class FrameIndexTests(_InputHelpers):
                                                 "shader-subset", "--out", out])[0], 2)
                     self.assertEqual(self._run(["pair-metrics", "--a-dir", ok, "--b-dir", bad, "--scope",
                                                 "shader-subset", "--out", out])[0], 2)
+
+    def test_the_same_refusal_applies_to_the_baseline_to_both_pair_sides_and_to_build_session(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            ok = self._dir(tmp, "ok", {"f-00.png": self.original})
+            other = self._dir(tmp, "other", {"f-00.png": self.moved})
+            bad = self._dir(tmp, "bad", {"f-00.png": self.original})
+            Image.fromarray(self.moved, "RGB").save(os.path.join(bad, "f-01.pcx"))
+            out = os.path.join(tmp, "v.json")
+            self.assertEqual(self._run(["floor", "--frames-dir", ok, "--baseline-dir", bad, "--label", "x", "--out", out])[0], 2)
+            self.assertEqual(self._run(["pair-metrics", "--a-dir", bad, "--b-dir", other, "--scope", "shader-subset",
+                                        "--out", out])[0], 2)
+            self.assertEqual(self._run(["pair-metrics", "--a-dir", ok, "--b-dir", bad, "--scope", "shader-subset",
+                                        "--out", out])[0], 2)
+            self.assertFalse(os.path.exists(out))
+            for argv in (["--a", f"aa={bad}", "--b", f"bb={other}"], ["--a", f"aa={ok}", "--b", f"bb={bad}"]):
+                session = os.path.join(tmp, f"sess-{abs(hash(tuple(argv)))}")
+                code, _ = self._run(["build-session", *argv, "--seed", "s", "--out-dir", session, "--no-seal"])
+                self.assertEqual(code, 2)
+                self.assertFalse(os.path.exists(os.path.join(session, "judge_manifest.json")))  # no half-built session
 
     def test_a_directory_compared_with_itself_is_refused_not_measured_as_perfect_agreement(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -946,18 +1040,12 @@ class FrameIndexTests(_InputHelpers):
                                         "--out", out])[0], 2)
             self.assertFalse(os.path.exists(out))
 
-    def test_pair_metrics_blocks_on_a_mis_named_file_on_either_side(self):
-        with tempfile.TemporaryDirectory() as tmp:
-            a = self._dir(tmp, "a", {"f-00.png": self.original})
-            b = self._dir(tmp, "b", {"f-00.png": self.original, "g-last.png": self.original})
-            out = os.path.join(tmp, "p.json")
-            code, _ = self._run(["pair-metrics", "--a-dir", a, "--b-dir", b, "--scope", "shader-subset", "--out", out])
-            self.assertEqual(code, 2)
-            with open(out, "r", encoding="utf-8") as handle:
-                verdict = json.load(handle)
-            self.assertEqual(verdict["outcome"], lm.INCOMPLETE)
-            self.assertEqual([r["code"] for r in verdict["incompleteReasons"]], ["B_FILES_NOT_INDEXED"])
-            self.assertEqual(verdict["inputs"]["b"]["skipped"][0]["name"], "g-last.png")
+    def test_the_extension_and_signature_tables_are_gone(self):
+        for name in ("_IMAGE_EXTENSIONS", "_IMAGE_SIGNATURES", "_PNM_HEAD", "_has_image_signature", "_file_reasons"):
+            self.assertFalse(hasattr(lm, name), name)
+        self.assertFalse(hasattr(lm.FrameIndex, "blocking_files"))
+        self.assertFalse(hasattr(lm.FrameIndex(os.curdir), "skipped"))
+
 
 
 @unittest.skipUnless(_HAS_DEPS, "numpy/Pillow are not installed on this host")
@@ -1006,65 +1094,6 @@ class RoundTwoRequestedInputTests(_InputHelpers):
         detail, _ = lm.skin_drift_check(self.original, flat, self.cfg)
         self.assertEqual(detail["outcome"], lm.NOT_EVALUABLE)
 
-    # -- H8: any image-like file blocks ----------------------------------------------------------------------
-    IMAGE_LIKE = (".tga", ".jp2", ".heic", ".avif", ".jxl", ".hdr", ".raw", ".tif", ".tiff", ".exr", ".webp", ".bmp",
-                  ".jpg", ".jpeg", ".dng", ".cr2", ".nef", ".arw", ".gif", ".heif", ".j2k", ".dds", ".psd", ".qoi",
-                  ".TGA", ".JXL")
-
-    def test_every_image_like_extension_blocks_and_is_typed(self):
-        with tempfile.TemporaryDirectory() as tmp:
-            for number, ext in enumerate(self.IMAGE_LIKE):
-                with self.subTest(ext=ext):
-                    subject = self._dir(tmp, f"sub{number}", {"f-00.png": self.original})
-                    with open(os.path.join(subject, f"f-01{ext}"), "wb") as handle:
-                        handle.write(b"not really an image")
-                    index = lm.index_frames(subject)
-                    skipped = {s["name"]: s for s in index.skipped}[f"f-01{ext}"]
-                    self.assertEqual((skipped["reason"], skipped["blocking"]), ("NOT_A_PNG", True))
-                    code, verdict, _ = self._floor(tmp, subject, None)
-                    self.assertEqual((code, verdict["outcome"]), (2, lm.INCOMPLETE))
-
-    def test_an_image_is_recognised_by_its_bytes_whatever_it_is_called(self):
-        png = os.path.join(self._dir(self._tmp_dir(), "p", {"x-00.png": self.original}), "x-00.png")
-        with open(png, "rb") as handle:
-            png_bytes = handle.read()
-        samples = {
-            "frame-03": png_bytes,
-            "frame-04.dat": b"\xff\xd8\xff\xe0" + b"\x00" * 20,
-            "frame-05.bin": b"RIFF\x24\x00\x00\x00WEBPVP8 " + b"\x00" * 8,
-            "frame-06.x": b"\x00\x00\x00\x18ftypheic" + b"\x00" * 8,
-            "frame-07.y": b"\x00\x00\x00\x1cftypavif" + b"\x00" * 8,
-            "frame-08.z": b"BM" + b"\x36\x00\x00\x00" + b"\x00\x00\x00\x00" + b"\x36\x00\x00\x00",
-            "frame-09.w": b"P6\n640 480\n255\n",
-            "frame-10.v": b"\xff\x0a" + b"\x00" * 8,
-            "frame-11.u": b"#?RADIANCE\nFORMAT=32-bit_rle_rgbe\n",
-            "frame-12.t": b"II*\x00\x08\x00\x00\x00",
-        }
-        for name, content in samples.items():
-            with self.subTest(name):
-                tmp = self._tmp_dir()
-                subject = self._dir(tmp, "sub", {"f-00.png": self.original})
-                with open(os.path.join(subject, name), "wb") as handle:
-                    handle.write(content)
-                skipped = {s["name"]: s for s in lm.index_frames(subject).skipped}[name]
-                self.assertTrue(skipped["blocking"], skipped)
-                self.assertEqual(skipped["reason"], "NOT_A_PNG")
-
-    def test_text_sidecars_that_merely_start_with_magic_letters_do_not_block(self):
-        tmp = self._tmp_dir()
-        subject = self._dir(tmp, "sub", {"f-00.png": self.original})
-        for name, text in (("notes.txt", "BMW service notes\n"), ("plan.txt", "P1 plan: review the grade\n"),
-                           ("readme", "PF is a pretty long abbreviation\n"), ("log.csv", "frame,sha\n0,abc\n")):
-            with open(os.path.join(subject, name), "w", encoding="utf-8") as handle:
-                handle.write(text)
-        index = lm.index_frames(subject)
-        self.assertEqual(index.blocking_files(), [])
-        self.assertEqual(sorted(s["name"] for s in index.skipped), ["log.csv", "notes.txt", "plan.txt", "readme"])
-
-    def _tmp_dir(self):
-        holder = tempfile.TemporaryDirectory()
-        self.addCleanup(holder.cleanup)
-        return holder.name
 
 
 if __name__ == "__main__":

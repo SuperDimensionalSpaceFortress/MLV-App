@@ -1,20 +1,23 @@
-# Look Assist objective floor + blind judge harness (LOOK-METRICS-JUDGE-1, hardened by -2)
+# Look Assist objective floor + blind judge harness (LOOK-METRICS-JUDGE-1, hardened by -2 and -3)
 
 Design of record: DUAL-VENUE DESIGN.md AMENDMENT 1 (A3 metrics) and AMENDMENT 2 (B3 objective floor, B4 model
 judging, B5 judged matrix). Owner ruling 2026-09-30: models judge aesthetics; the owner is optional; nothing
 waits on him. Bus evidence (TRAPS s8) says a model judging a blinded image pair can sit near chance, so
 **the metrics GATE and the judges only REFINE**: a frame that fails the floor is not rescued by a judge.
 
-**The rule the whole harness is built around:** no path lets an *unjudged, stale, incomplete, biased, self-judged
-or hidden* result read as PASS / usable. Round 2 closed this as a class; the sections below say how.
+**The rule the whole harness is built around: nothing is usable unless the harness itself proved it.** A result is
+never accepted because something *said* it was fine, and an input is never accepted with part of it silently gone.
+LOOK-METRICS-JUDGE-3 enforces that by DELETING the surfaces where a claim could stand in for a proof:
 
-**LOOK-METRICS-JUDGE-2 widens the class to REQUESTED INPUTS:** an input the caller asked for that is absent,
-unmatched, unparseable or mis-named (a baseline directory without a subject's frame, a `frame-final.png` with no
-index, a frame lost at build time) is never read as agreement, N/A-as-pass, PASS or usable. It is `INCOMPLETE` (or
-`unusable`) with a typed reason, the same way on the floor, in pair metrics, in `build-session` and in the tally.
-Round 2 adds the last members of the class: a result under **another rubric than the lock verified now**, **one judge
-counted twice**, **a judge that could read the answer key**, an **explicitly empty** argument, and a **copy of one
-directory** presented as two subjects. Each is `unusable` / not `comparable` / an error with a typed reason.
+* **Isolation is derived, never read.** `run_session` records which runner CLASS ran; the tally derives identity and
+  isolation from that class (only `ClaudeCliJudge` / `CodexExecJudge` can ever be usable) and never reads an
+  `isolation`, `enforced` or `sealSha256` from a results file. The seal is verified against `sealed.bin` and the key;
+  the isolation canary is **bound to the CLI version and command** of the run it vouches for.
+* **Frame directories are all-or-nothing.** Every entry is a numbered PNG that decodes or a text sidecar; anything
+  else refuses the whole directory. There is no list of image extensions or signatures to fall behind a new format.
+* **One model resolver** (`look_judges.canonical_model`) feeds every identity check; an unrecognised name is refused.
+* **judge-disagreement needs the same subject x criterion grid** in both entries, so a missing criterion cannot hide a
+  disagreement.
 
 ## Layout
 
@@ -22,13 +25,13 @@ directory** presented as two subjects. Each is `unusable` / not `comparable` / a
 |---|---|---|
 | `look_floor_config.json` | every threshold, each as `{value, reason}`, at every depth; provisional until a judged corpus exists | - |
 | `look_config.py` | loads/validates the config (a bare number ANYWHERE, a missing required threshold or an empty reason is refused); rubric digest + lock | stdlib |
-| `look_metrics.py` | per-frame floor, letterbox policy, skin-tone drift, SSIM, CUDA-vs-CPU pair metrics, typed verdicts | numpy, Pillow |
+| `look_metrics.py` | per-frame floor, letterbox policy, skin-tone drift, SSIM, CUDA-vs-CPU pair metrics, typed verdicts, the all-or-nothing frame index | numpy, Pillow |
 | `judge_rubric.md` + `judge_rubric.lock.json` | the FROZEN rubric (anchored 1-5 x5 criteria, then pairwise, no defect colour named) and its sha256 | - |
 | `look_pairs.py` | blind pair builder: image-bound opaque ids, mid-grey gutter, seed-decided slots, order-swapped twice, negative + positive controls | stdlib (+ Pillow to draw) |
-| `look_judges.py` | `ClaudeCliJudge`, `CodexExecJudge` (tools switched off), probes, family-level producer guard, process-tree-bounded runner, session runner (sealed-session gate, env scrub) | stdlib |
-| `look_seal.py` | seals the answer key, full session, source frames and degraded sources into `sealed.bin` under a per-session key the judge never gets | stdlib |
-| `look_canary.py` | the LIVE isolation canary: the shipped judge command must not obtain a decoy key or source frame by any tool, and an unconfined control must | stdlib |
-| `look_tally.py` | image/rubric/key integrity, rubric-lock + seal + isolation gates, flips, slot bias, both controls, completeness, consistent-unit floor, `model_verdicts[]` entry, third-judge rule (two DIFFERENT judges) | stdlib |
+| `look_judges.py` | the model resolver, the two shipped runners (`ClaudeCliJudge`, `CodexExecJudge`, tools off / confined), the closed runner set and its derivations, probes, process-tree-bounded runner, session runner | stdlib |
+| `look_seal.py` | seals the answer key, full session, source frames and degraded sources into `sealed.bin` under a per-session key the judge never gets; the one path comparison | stdlib |
+| `look_canary.py` | the LIVE isolation canary: the shipped judge command must not obtain a decoy key or source frame by any tool, an unconfined control must read BOTH; a report is re-judged from its raw evidence and bound to class, CLI version and command | stdlib |
+| `look_tally.py` | image/rubric/key integrity, rubric-lock + seal + derived-isolation gates, flips, slot bias, both controls, completeness, `model_verdicts[]` entry, third-judge rule (two DIFFERENT judges, one score grid) | stdlib |
 | `look_cli.py` | `tiles`, `floor`, `pair-metrics`, `verify-rubric`, `probe-codex`, `build-session`, `judge`, `tally`, `judge-disagreement`, `unseal`, `isolation-canary` | - |
 
 ## The objective floor (gates)
@@ -72,15 +75,18 @@ flags independently); it records the policy per subject, every frame's letterbox
 and the config sha256 under `capture` in `session.json`, `answer_key.json` and the tally entry, so a session built
 with exclusion on is never indistinguishable from one built without it.
 
-**Frame directories are never skipped silently.** `index_frames` lists every entry it did not place under `skipped`
-(and in the verdict's `inputs`). An image file that could have been a frame but was not indexed (a `.png` with no
-digits in its name, a `.jpg` / `.tga` / `.jp2` / `.heic` / `.avif` / `.jxl` / `.hdr` / `.tif` / `.exr` / `.webp` / `.bmp` /
-camera-raw file, any other image-like extension, **or a file whose first bytes are an image container whatever it is
-called**, a second file claiming an index already taken) is *blocking*: the sheet is `INCOMPLETE`
-(`FRAME_FILES_NOT_INDEXED`, `BASELINE_FILES_NOT_INDEXED`, `A_FILES_NOT_INDEXED`, `B_FILES_NOT_INDEXED`). A sidecar such
-as `notes.txt` is only listed. A directory that is missing or yields **zero** frames is an error (exit 2), and so is comparing a directory with itself
-(`floor --baseline-dir` equal to `--frames-dir`, `pair-metrics` with `--a-dir` equal to `--b-dir`, `build-session` with
-`--a` and `--b` naming one directory): that always "agrees".
+**A frames directory is all or nothing.** `index_frames` accepts a directory only when EVERY entry is either a text
+sidecar (`.json`, `.txt`, `.md`; no NUL, valid UTF-8, at most 1 MiB, recorded under `inputs.*.sidecars` with its sha256) or
+a regular file that **decodes completely as a PNG** and carries a numeric index (the last run of digits in its name,
+unique in the directory). Anything else -- a sub-directory, a JPEG / PCX / TGA / anything that is not a PNG, a truncated
+PNG, a PNG with no digits, a second file for one index, a `.csv`, a picture renamed `f-01.txt` -- refuses the **whole**
+directory (exit 2, no verdict written) with a typed reason per offender (`NOT_A_PNG`, `PNG_DOES_NOT_DECODE`,
+`NO_NUMERIC_INDEX`, `DUPLICATE_FRAME_INDEX`, `NOT_A_REGULAR_FILE`, `SIDECAR_NOT_TEXT`, `SIDECAR_TOO_LARGE`, `NO_FRAME`),
+all named in one message. Sol r2 B3 found a valid `f-01.pcx` ignored while the sheet PASSed; the fix is not a longer
+extension list, it is that no entry can be ignored. The same rule governs `--frames-dir`, `--baseline-dir`, both
+`pair-metrics` sides and both `build-session` subjects. A directory that is missing or yields **zero** frames is refused,
+and so is comparing a directory with itself (`floor --baseline-dir` equal to `--frames-dir`, `pair-metrics` with `--a-dir`
+equal to `--b-dir`, `build-session` with `--a` and `--b` naming one directory): that always "agrees".
 
 Per CUDA/CPU pair: per-channel mean / max / signed delta, mismatch fraction, luma SSIM (numpy implementation:
 Gaussian 11x11, sigma 1.5). `SCOPE=shader-subset` is **gated**; `SCOPE=full-look` is **REPORTED** and never
@@ -107,36 +113,45 @@ Typed terminals, no partial credit: frame `PASS|FAIL|NOT_EVALUABLE`; sheet `PASS
    `droppedFramePolicy` (`lossFrameIds`, `selectionFrameIds`, `allowance`). A build with a loss and no
    `--allow-dropped-frames REASON` writes the session, marks it, and **exits 2**; the tally calls it
    `UNACKNOWLEDGED_DROPPED_FRAMES`. With the allowance the reason is recorded in the session and the tally entry
-   (`droppedFrameAllowance`). A subject directory with an image file that cannot be indexed is refused outright.
+   (`droppedFrameAllowance`). A subject directory the all-or-nothing index refuses stops the build.
    **`capture`** (config sha256 + version, letterbox policy per subject, each frame's source/prepared size and
    letterbox decision, every common crop) is written to `session.json` and `answer_key.json` and copied into the entry.
    **Sealed by default:** the answer key, the full session record, the prepared source frames and the degraded
    sources go into `sealed.bin` (see *Enforced judge isolation* below) and `session.json` is rewritten as a minimal public
-   record (rubric digest, seed, image digests: no subject names). The per-session **seal key is written to the file you
+   record (rubric digest, image digests: no subject names and **no seed**, from which kind, ordering and slot could be
+   re-derived). The per-session **seal key is written to the file you
    name with `--seal-key-file`** (required; a file that does not exist yet, never inside the session, written before
    anything is sealed and removed again if sealing fails) **and is never printed**, so it cannot land in a log or a
    transcript; `--no-seal` leaves the secrets in the clear for debugging, and then no real judge will run and the tally
    is unusable. `unseal` extracts a sealed session for audit (never into the session directory).
 3. `look_cli.py judge --session-dir SESS --runner claude:MODEL|codex:MODEL --producer-model M ...` -- each item runs
    in a fresh temp dir holding only `pair.png`, in a subprocess whose **whole process tree** is killed on timeout
-   (the Windows `claude` / `codex` npm shims are `.cmd` files; a plain kill left the real CLI running). The judge may
-   not be in the **model family** of any `--producer-model` (one alias table: `sonnet` = `claude-sonnet-5-5` = any
-   sonnet; names that cannot be placed fail closed; the Codex default is resolved to the real model from
-   `config.toml`, and an unresolvable one counts as any OpenAI model). It refuses to run if the rubric changed after
-   the lock, if the session recorded another digest, or if the images on disk differ from the session's digests; it
-   **re-judges** any stored verdict made against another image or rubric **or made before the session was sealed / under
-   another confinement**, and refuses a results file from another judge. A real runner **refuses a session that is not
-   sealed or still holds a plaintext secret, and refuses to start when `LOOK_SEAL_KEY` is in its environment**. The
-   results file records the seal digest, whether the judging was under the seal, and the runner's isolation record.
-4. `look_cli.py tally --session-dir SESS --results R.json --producer-model M --seal-key K --out T.json` -- one
-   `model_verdicts[]` entry. The key opens `sealed.bin` from memory; without it, or with a wrong key, there is no entry
-   (exit 2). **`usable` is true only if every one of these holds** (each is a named `unusableReasons` entry):
+   (the Windows `claude` / `codex` npm shims are `.cmd` files; a plain kill left the real CLI running). Only those two
+   runner classes exist for the CLI (`look_judges.RUNNER_CLASSES`); there is no `--judge-id` and no way to pass the CLI
+   extra arguments, so the judge id is `<kind>:<canonical model>` and the confinement is the one that ships. The judge may
+   not be the **model** of any `--producer-model` (the resolver: `sonnet` = `claude-sonnet-5-5` = any sonnet; a name it
+   cannot place is refused; the Codex default is resolved to the real model from `config.toml`, and an unresolvable one
+   counts as any OpenAI model). It refuses to run if the rubric changed after the lock, if the session recorded another
+   digest, or if the images on disk differ from the session's digests; it **re-judges** any stored verdict made against
+   another image or rubric **or by another runner class, CLI version or confinement command**, and refuses a results
+   file from another judge. A shipped runner **refuses a session that is not sealed or still holds a plaintext secret
+   (any letter case), and refuses to start when `LOOK_SEAL_KEY` is in its environment**. The results file
+   (`mlv-app/look-judge-results/v2`) records the runner CLASS, model, the measured CLI version and the command digest.
+   It records no claim about isolation, enforcement or the seal: there is nothing there for a tally to believe.
+4. `look_cli.py tally --session-dir SESS --results R.json --producer-model M --canary C.json --seal-key K --out T.json` --
+   one `model_verdicts[]` entry. The key opens `sealed.bin` from memory; without it, or with a wrong key, there is no
+   entry (exit 2). **`usable` is true only if every one of these holds** (each is a named `unusableReasons` entry):
    **the session was frozen under the rubric lock verified now** -- the shipped lock, or `--rubric` / `--rubric-lock`
    named explicitly, whose digest the session AND every verdict must equal (`RUBRIC_LOCK_NOT_VERIFIED`,
-   `SESSION_RUBRIC_DIFFERS_FROM_LOCK`); **the seal verified and the verdicts were made under that same seal**
-   (`SEAL_NOT_VERIFIED`, `JUDGED_WITHOUT_OR_AFTER_SEAL`); **the runner's isolation was enforced by the harness**
-   (`JUDGE_ISOLATION_NOT_ENFORCED`; a plain callable judge never claims it); a null or malformed `capture.configSha256`
-   is `CAPTURE_CONFIG_SHA_NOT_RECORDED`;
+   `SESSION_RUBRIC_DIFFERS_FROM_LOCK`); **the seal verifies against `sealed.bin` and the key, with no plaintext secret
+   beside it** (`SEAL_NOT_VERIFIED`, `PLAINTEXT_SECRETS_BESIDE_THE_SEAL`); **the runner class is in the closed set**
+   (`RUNNER_NOT_ALLOWLISTED`: a test double, an out-of-process lane or anything unlisted is never usable), its model
+   resolves (`JUDGE_MODEL_UNRECOGNISED`), its recorded command digest equals the one this code computes for that class
+   (`RUNNER_COMMAND_DIFFERS_FROM_SHIPPED`) and a CLI version was measured (`CLI_VERSION_NOT_RECORDED`); **a `--canary`
+   report that re-judges as HELD from its raw evidence and was made for the same class, CLI version and command**
+   (`ISOLATION_CANARY_MISSING`, `ISOLATION_CANARY_NOT_HELD`, `ISOLATION_CANARY_FOR_ANOTHER_RUNNER`,
+   `..._CLI_VERSION`, `..._COMMAND`); the judge's identity (`judgeId`, `family`) is derived from the class and the
+   resolver, never read; a null or malformed `capture.configSha256` is `CAPTURE_CONFIG_SHA_NOT_RECORDED`;
    every key item has a valid verdict (`INCOMPLETE_ITEMS`); every verdict quotes the key's image digest, the image on
    disk still hashes to it and the item id is derived from it (`IMAGE_CHANGED_SINCE_BUILD`, `ITEM_ID_NOT_BOUND_TO_IMAGE`);
    the results name no unknown item; **every** negative-control item was answered `tie` (a missing or invalid one is
@@ -149,87 +164,95 @@ Typed terminals, no partial credit: frame `PASS|FAIL|NOT_EVALUABLE`; sheet `PASS
    `CONFIG_DIFFERS_FROM_SESSION`); every lost frame has a recorded allowance (`UNACKNOWLEDGED_DROPPED_FRAMES`,
    `DROPPED_FRAME_POLICY_MISMATCH`); and the producer guard was applied and passed. Order-flipping votes are discarded. **A winner is shown only on a usable
    entry** (otherwise `winner` is `UNUSABLE` and the computed one sits in `withheldWinner`), and **the CLI exits 2
-   whenever the entry is unusable** (the JSON is still written).
+   whenever the entry is unusable** (the JSON is still written). A results file that is not the v2 shape is a typed
+   refusal (exit 2), not a traceback.
 5. `look_cli.py judge-disagreement --entries T1.json T2.json` -- a third judge is needed when two judges are more than
    `judge_disagreement.third_judge_points` (config) apart. A comparison is `comparable` (exit 0) only when **all** hold:
    every entry is a usable tally entry with scores; the entries share the same `rubricSha256`, `orderSeed` and image set
-   (`sessionMismatches`); every entry's rubric equals the **current rubric lock** (`rubricLockProblems`); and they are
-   **two different judges** (`identityProblems`): distinct `judgeId`s, distinct `model`s (compared trimmed and
-   case-folded) and distinct `resultsSha256` -- the same file passed twice, one judge under two names, or a copied
-   results file is `DUPLICATE_*`, never agreement. When cross-family is claimed (an entry says
-   `CROSS_FAMILY_PROVEN_LIVE`, or `--require-cross-family`) at least two model families must take part, each family
-   derived from the model rather than trusted from the entry. A comparison that is not one answers
-   `thirdJudgeNeeded: null`, never a reassuring `false`. Every config value is type- and range-checked at load (a
-   reasoned string `"false"` is refused).
+   (`sessionMismatches`); every entry's rubric equals the **current rubric lock** (`rubricLockProblems`); they are
+   **two different judges** (`identityProblems`): **every** model goes through `canonical_model`, always -- an
+   unrecognised model is `MODEL_UNRECOGNISED`, two spellings of one model (`sonnet`, `claude-sonnet-5-5`, any version of
+   a family) are `DUPLICATE_MODEL`, and each entry's `family` and `judgeId` must be the ones the resolver derives from
+   its model; distinct `resultsSha256`; an entry that says `usable` must also carry the facts that make it so
+   (`ENTRY_USABLE_WITHOUT_THE_FACTS_THAT_MAKE_IT_SO`); `--require-cross-family` needs two derived families (a free-text
+   cross-family status no longer exists); and they cover **the same subject x criterion grid**
+   (`coverageProblems`): a criterion one judge scored and the other did not, or a subject only one has, is a gap
+   (`COVERAGE_DIFFERS`, `SUBJECT_GRID_DIFFERS`, `SCORES_NOT_THE_FULL_GRID`), never agreement. A comparison that is not
+   one answers `thirdJudgeNeeded: null`, never a reassuring `false`. Every config value is type- and range-checked at
+   load (a reasoned string `"false"` is refused).
 
-### Enforced judge isolation (sol B3 / fable H2)
+### Judge isolation: removed, derived, and proved live
 
 A judge CLI is a general agent: it can run a shell, view images by absolute path and read anything its user can read.
-Asking it not to (flags, a prompt, "read-only") is policy. Round 2 makes the secrets **unreachable at judge time**:
+Asking it not to (flags, a prompt, "read-only") is policy. The harness makes the secrets **unreachable at judge time**
+and then **derives** what it concludes from facts it can check, instead of reading what a runner or a results file says:
 
-1. **Sealed artifact.** `build-session` writes the answer key, the full session record (capture, drops, subject names), the
-   prepared source frames (`cuda-00.png`...) and the degraded sources into one file, `sealed.bin`: HMAC-SHA256-CTR
-   (stdlib; encrypt-then-MAC, fresh nonce) under a random per-session key that is written to a file you name (never printed) and **never written into
-   the session directory**. What stays beside it is what a judge may see: the pair images, the judge-facing manifest and
-   a minimal public `session.json`. A tampered, truncated or swapped file, or the wrong key, opens nothing.
+1. **Sealed artifact.** `build-session` writes the answer key, the full session record (capture, drops, subject names, the
+   order seed), the prepared source frames (`cuda-00.png`...) and the degraded sources into one file, `sealed.bin`:
+   HMAC-SHA256-CTR (stdlib; encrypt-then-MAC, fresh nonce) under a random per-session key that is written to a file you
+   name (never printed) and **never written into the session directory**. What stays beside it is what a judge may see:
+   the pair images, the judge-facing manifest and a minimal public `session.json`. A tampered, truncated or swapped file,
+   or the wrong key, opens nothing.
 2. **The key never reaches a judge.** The judge commands refuse to start when `LOOK_SEAL_KEY` is in their environment; the
    judge process gets an environment without it (and without any `LOOK_*` variable). `tally` takes the key.
 3. **Tools off, not asked off.** The Codex judge runs with `shell_tool`, `unified_exec`, `view_image`, `code_mode_host`,
    `browser_use`, `computer_use`, `apps`, `plugins`, `skill_search`, `hooks`, `memories`, `multi_agent(_v2)`, `goals`,
-   `sleep_tool` and web search disabled, `--strict-config` (a CLI that no longer knows one of them fails instead of running
-   with the tool on) and `--ignore-user-config --ignore-rules`: it can only look at the attached picture. `probe-codex`
-   reports `CROSS_FAMILY_UNAVAILABLE` (recorded in the entry) for a Codex that cannot be confined, so it is not run
-   unblinded. The Claude judge keeps only `Read`, confined to its scratch directory by `--restricted --safe-mode
-   --strict-mcp-config`, and **any `permission_denials` entry (or a reply without the list) rejects the verdict** (recorded
-   as an item error, never scored).
-4. **The tally refuses a judge that could have read the key.** Verdicts made before the session was sealed, under another
-   seal, or by a runner whose isolation the harness did not enforce are unusable; `run_session` also throws away any stored
-   verdict from before a seal or confinement change and judges it again.
-5. **Live proof, both runners:** `look_cli.py isolation-canary --runner claude|codex` builds decoys named like the real
-   secrets (an `answer_key.json` holding a random token, a plainly red `source-frames/cuda-00.png`) plus a real sealed
-   session, asks the **shipped** judge command to obtain them by every tool it has, and requires it to fail *after being
-seen to try* (a refused tool call or a "cannot" on the KEY line; a judge that merely declines to try is retried, then
-`INCONCLUSIVE_JUDGE_DID_NOT_TRY`); a **control**
-   run with the confinement removed must succeed (a control that did not read the decoys proves nothing:
-   `INCONCLUSIVE`, not held). The sealed artifact is checked too (no plaintext beside it; neither the token nor a PNG
-   header in its bytes). The transcripts are in the PR; the scoring logic and orchestration are unit-tested in CI, the
-   live call is not (hosted CI has neither CLI).
+   `sleep_tool` and web search disabled, `--strict-config` and `--ignore-user-config --ignore-rules`: it can only look
+   at the attached picture. The Claude judge keeps only `Read`, confined to its scratch directory by `--restricted
+   --safe-mode --strict-mcp-config`, and **any `permission_denials` entry (or a reply without the list) rejects the
+   verdict** (recorded as an item error, never scored).
+4. **The tally derives the isolation** (`look_judges.derive_isolation`) from the runner class `run_session` recorded: the
+   class must be in `RUNNER_CLASSES` (an exact type check, so a look-alike or a subclass is `UNLISTED:...`), the recorded
+   confinement command digest must equal the one computed here, and the canary must match (below). Only then does the
+   entry say `judgeIsolation.enforced`. A runner that merely *asserts* isolation -- sol r2's unconfined callable judge --
+   cannot be usable: there is no such runner in the production tree, and its class would not be in the set.
+5. **Live proof, both runners:** `look_cli.py isolation-canary --runner claude|codex [--out C.json]` builds decoys named
+   like the real secrets (an `answer_key.json` holding a random token, a plainly red `source-frames/cuda-00.png`) plus a
+   real sealed session and asks the **shipped** judge command to obtain them by every tool it has. It must fail *after
+   being seen to try*: only the CLI's own record counts (Claude's `permission_denials`, or a refused tool call in stderr);
+   the model's own "CANNOT" does not, because the prompt tells it to write that. A judge that does not attempt is retried,
+   then `INCONCLUSIVE_JUDGE_DID_NOT_TRY`. A **control** with the confinement removed (always run; there is no
+   `--no-control`) must read **both** decoys, each on its own, or the outcome is `INCONCLUSIVE`. The sealed artifact is
+   checked too. The report carries the raw evidence plus `runnerClass`, `cliVersion` and `commandSha256`;
+   `look_canary.judge_canary` re-derives the outcome from that evidence and `verify_canary` requires it to match the run
+   being tallied, so a canary measured on one CLI version does not vouch for another. The scoring and orchestration are
+   unit-tested in CI; the live call is not (hosted CI has neither CLI) and runs by hand, transcript in the PR.
 
 What this does **not** cover, stated plainly: (a) the *operator's own* capture folders (the directories you passed to
 `--a` / `--b`) are not the harness's to seal; they are out of the Codex judge's reach because it has no tool that can open
-a file, and out of the Claude judge's reach because `--restricted` confines `Read` to the scratch directory, both proved
-live, but a future CLI that changes what its flags do would need the canary re-run; (b) the pair images and manifest are
-visible to the judge by design (a judge able to list the session directory would see sibling orderings of the same
-unit: that affects the flip test, not which subject is which); (c) a judge that can run arbitrary code *outside* these CLIs
-is outside this guarantee (an out-of-process `CallableJudge` lane records `enforced: false` and its tally is unusable).
+a file, and out of the Claude judge's reach because `--restricted` confines `Read` to the scratch directory; a future CLI
+that changes what its flags do is caught only by re-running the canary, which the version binding now forces; (b) the pair
+images and manifest are visible to the judge by design (a judge able to list the session directory would see sibling
+orderings of the same unit: that affects the flip test, not which subject is which); (c) an out-of-process judge lane is
+outside this guarantee: it is not in the closed set, so its entry is never usable; (d) the canary report and the tally
+entries are files the harness writes: whoever can edit them can forge them, as they could edit this code. What is verified
+is internal consistency and the binding to the run, not provenance.
 
 ### Cross-family (K6)
 
 `look_cli.py probe-codex` reads `codex exec --help` for `--image` (`CROSS_FAMILY_FLAG_PRESENT_NOT_PROVEN`), and with
 `--live-vision-dir` makes ONE bounded call on a synthetic image whose answer exists only in its pixels
-(`CROSS_FAMILY_PROVEN_LIVE`). `look_judges.select_second_judge` returns a Codex judge only when the probe is
-proven; otherwise a second Claude model and `CROSS_FAMILY_UNAVAILABLE`, which the entry carries. The probe also lists
-`codex features list` and requires every tool switch the judge relies on (`CODEX_DISABLED_FEATURES`) plus `--strict-config`:
-a Codex that cannot be confined is `CROSS_FAMILY_UNAVAILABLE` with the reason, never run unblinded.
+(`CROSS_FAMILY_PROVEN_LIVE`). The probe also lists `codex features list` and requires every tool switch the judge relies
+on (`CODEX_DISABLED_FEATURES`) plus `--strict-config`: a Codex that cannot be confined is `CROSS_FAMILY_UNAVAILABLE` with
+the reason. Whether two judges are cross-family is **derived from their models** at `judge-disagreement` time; no entry
+carries a typed-in status any more.
 
 ## Honest limits
 
 * Thresholds are provisional; every one says why it is the number it is, and none has been calibrated on a judged corpus.
 * The skin check is a colour region, not a face detector (sand and deck can land in it); that is why it is a drift
   against a baseline of the same scene, never an absolute.
-* A judge's identity in the results file is what the runner recorded; the tally cannot prove which model actually
-  answered, only that it was not a producer/hub family.
-* Judge isolation is **enforced** (sealed secrets, tools switched off, key scrubbed from the environment) and proved live
-  by `isolation-canary` for both runners on this host, with a control that shows the decoys ARE readable without the
-  confinement. It is proved for the CLI versions measured (claude 2.1.286, codex-cli 0.159.3); re-run the canary after
-  upgrading either. The operator's own capture folders are outside what the harness seals (see *Enforced judge isolation*).
-* An explicitly given but **empty** `--baseline-dir`, `--config`, `--rubric`, `--rubric-lock`, `--seal-key` or
+* A judge's model is the one the operator asked the CLI for, resolved by `canonical_model`; the tally cannot prove which
+  model actually answered, only that it was not a producer/hub model. Sealing hides the key from a judge; anyone who holds
+  the seal key AND can edit the results and images can forge a session (consistency, not provenance).
+* Judge isolation is **enforced** (sealed secrets, tools switched off, key scrubbed from the environment) and **derived**
+  by the tally from the runner class and a canary bound to the CLI version and command it measured. A CLI upgrade
+  therefore makes every older canary unusable until `isolation-canary` is re-run. The operator's own capture folders are
+  outside what the harness seals (see *Judge isolation*).
+* An explicitly given but **empty** `--baseline-dir`, `--config`, `--rubric`, `--rubric-lock`, `--canary`, `--seal-key` or
   `--seal-key-file` is an error, never "use the default". A folder copied and passed as a second subject is refused only
   when it is the same directory; a byte-identical copy cannot be told from a genuine bit-exact parity, so the entry lists
   those units under `integrity.realUnitsWithIdenticalSources` (they cannot show a preference) instead of guessing.
-* Sealing hides the key from a judge; it does not prove which model answered. A results file is still what the runner
-  recorded, and anyone who holds the seal key AND can edit the results and images can forge a session (consistency, not
-  provenance, as before).
 * A requested baseline whose frames contain **no skin region** is recorded (`REQUESTED_NOT_APPLICABLE`), not failed:
   there is nothing to drift. Read the status, not just PASS.
 * `min_consistent_units` is a floor against degenerate sessions, not a significance claim (`votePValue` is reported).

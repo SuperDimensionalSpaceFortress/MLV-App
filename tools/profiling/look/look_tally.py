@@ -28,6 +28,10 @@ THE RULES (DESIGN.md AMENDMENT 2 B4, hardened in round 2)
     * A verdict quoting a different rubric digest than the session's frozen one is rejected, not scored.
     * The judge may not be the producer or the hub (look_judges.assert_not_producer), and the guard having not
       been applied is itself a reason (PRODUCER_GUARD_NOT_APPLIED).
+    * NOTHING IS USABLE UNLESS THE HARNESS PROVED IT. The seal is verified against sealed.bin and the key, the judge's
+      identity and isolation are DERIVED from the recorded runner CLASS (only ClaudeCliJudge / CodexExecJudge can be
+      usable), and the isolation canary must be bound to that class, CLI version and command. No field of the results
+      file that says "isolated", "enforced" or names a seal is read.
     * Every threshold comes from the config the caller passes; there is no built-in default to fall back to.
     * Metrics gate; this entry only refines (bus TRAPS s8). `usable` says whether the judge's preference may be
       read at all.
@@ -39,6 +43,7 @@ import hashlib
 import json
 import math
 
+import look_canary
 import look_config
 import look_judges
 import look_pairs
@@ -198,18 +203,25 @@ def _check_rubric_lock(rubric_lock, session):
     return []
 
 
-def _check_seal(seal, judge_isolation):
-    """The judge must have run next to a SEALED session (no key, no source frames to read) under isolation the harness
-    enforced. `seal` = {"verified", "sealSha256", "resultsSealSha256"} as established by the caller from sealed.bin and
-    the results file; anything else is a judge that could have read the key."""
-    reasons = []
+def _check_seal(seal):
+    """The session must be SEALED (no key, no source frames in the clear) and the seal verified against the key NOW.
+    `seal` = {"verified", "sealSha256", "plaintextPresent"} as established by the caller from sealed.bin itself; nothing
+    in a results file is consulted. A plaintext secret beside the seal is a session a judge could have read."""
     if not (isinstance(seal, dict) and seal.get("verified") is True and _is_sha256(seal.get("sealSha256"))):
-        reasons.append("SEAL_NOT_VERIFIED")
-    elif seal.get("resultsSealSha256") != seal["sealSha256"]:
-        reasons.append("JUDGED_WITHOUT_OR_AFTER_SEAL")
-    if not (isinstance(judge_isolation, dict) and judge_isolation.get("enforced") is True):
-        reasons.append("JUDGE_ISOLATION_NOT_ENFORCED")
-    return reasons
+        return ["SEAL_NOT_VERIFIED"]
+    if seal.get("plaintextPresent"):
+        return ["PLAINTEXT_SECRETS_BESIDE_THE_SEAL"]
+    return []
+
+
+def _check_isolation(runner, canary):
+    """(isolation, reasons): DERIVED from the recorded runner class (look_judges.derive_isolation) and the canary report
+    bound to it. A results file's own isolation / enforced claims are not read; they are not even in the file."""
+    isolation, reasons = look_judges.derive_isolation(runner)
+    if isolation.get("kind"):  # a listed class: the canary must have been run against THIS CLI version and command
+        reasons = reasons + look_canary.verify_canary(canary, isolation)
+    isolation["enforced"] = not reasons
+    return isolation, reasons
 
 
 def _check_drops(answer_key, session):
@@ -235,13 +247,16 @@ def _check_drops(answer_key, session):
     return reasons, (allowance if acknowledged and derived["lossFrameIds"] else None)
 
 
-def tally(answer_key, item_verdicts, judge, session, cfg, current_image_sha256=None, forbidden_models=None,
-          cross_family_status=None, config_sha256=None, rubric_lock=None, seal=None, judge_isolation=None):
+def tally(answer_key, item_verdicts, runner, session, cfg, current_image_sha256=None, forbidden_models=None,
+          config_sha256=None, rubric_lock=None, seal=None, canary=None):
     """Build one model_verdicts[] entry.
 
     answer_key           the answer_key.json dict
     item_verdicts        {itemId: {"left":..,"right":..,"preference":..,"rubricSha256":..,"imageSha256":..}}
-    judge                {"judgeId","model","family"}
+    runner               the results file's `runner` record (look_judges.runner_record): the class that ran, the model it
+                         was asked for, the CLI version and the command digest. The judge identity (judgeId, family) and
+                         the isolation are DERIVED from it here; the entry is never usable for a class outside
+                         look_judges.RUNNER_CLASSES
     session              the session.json dict (carries the frozen rubricSha256, the seed and the image digests)
     cfg                  the loaded floor config (look_config.load_config()[0]); every threshold is read from it
     current_image_sha256 {itemId: sha256 of the pair image as it is on disk NOW}; None leaves the entry unusable
@@ -250,10 +265,13 @@ def tally(answer_key, item_verdicts, judge, session, cfg, current_image_sha256=N
                          built with, and None leaves the entry unusable (the config was not verified)
     rubric_lock          the rubric lock dict verified NOW (look_config.verify_rubric_lock(), or an explicit lock); the
                          session's rubricSha256 must equal it, and None leaves the entry unusable
-    seal                 {"verified", "sealSha256", "resultsSealSha256"}: the session is sealed, the seal verified, and the
-                         verdicts were made under that same seal; None leaves the entry unusable
-    judge_isolation      the results file's isolation record; it must say `enforced: true`; None leaves it unusable
+    seal                 {"verified", "sealSha256", "plaintextPresent"}, established by the caller from sealed.bin and the
+                         key: the session is sealed, the seal verifies, and no secret sits beside it; None leaves the
+                         entry unusable
+    canary               the isolation-canary report (look_canary.run_canary) for THIS runner class, CLI version and
+                         command; look_canary.verify_canary re-judges its raw evidence; None leaves the entry unusable
     """
+    judge = look_judges.derived_identity(runner)
     slot_cfg = cfg["slot_bias"]
     min_choices = int(slot_cfg["min_choices"])
     alpha = float(slot_cfg["alpha"])
@@ -267,7 +285,9 @@ def tally(answer_key, item_verdicts, judge, session, cfg, current_image_sha256=N
     details.update(key_details)
     unusable.extend(_check_capture(answer_key, session, config_sha256))
     unusable.extend(_check_rubric_lock(rubric_lock, session))
-    unusable.extend(_check_seal(seal, judge_isolation))
+    unusable.extend(_check_seal(seal))
+    isolation, isolation_reasons = _check_isolation(runner, canary)
+    unusable.extend(isolation_reasons)
     drop_reasons, drop_allowance = _check_drops(answer_key, session)
     unusable.extend(drop_reasons)
 
@@ -433,13 +453,12 @@ def tally(answer_key, item_verdicts, judge, session, cfg, current_image_sha256=N
     return {
         "schema": SCHEMA_VERDICT,
         "judgeId": judge["judgeId"], "model": judge["model"], "family": judge["family"],
-        "crossFamilyStatus": cross_family_status,
         "rubricSha256": frozen,
         "rubricLockSha256": rubric_lock.get("rubricSha256") if isinstance(rubric_lock, dict) else None,
         "rubricId": rubric_lock.get("rubricId") if isinstance(rubric_lock, dict) else None,
         "resultsSha256": hashlib.sha256(json.dumps(item_verdicts, sort_keys=True).encode("utf-8")).hexdigest(),
-        "sealSha256": seal.get("sealSha256") if isinstance(seal, dict) else None,
-        "judgeIsolation": judge_isolation,
+        "sealSha256": seal.get("sealSha256") if isinstance(seal, dict) and seal.get("verified") is True else None,
+        "judgeIsolation": isolation,
         "imageSha256s": list(session["imageSha256s"]),
         "orderSeed": session["orderSeed"],
         "capture": session.get("capture"),
@@ -473,38 +492,85 @@ def tally(answer_key, item_verdicts, judge, session, cfg, current_image_sha256=N
     }
 
 
-def _norm(value):
-    return str(value).strip().lower() if isinstance(value, (str, int)) and str(value).strip() else None
-
-
 def identity_problems(entries, require_cross_family=False):
     """Typed reasons the entries are not TWO DIFFERENT JUDGES. One judge counted twice (the same file passed twice, two
-    files with one judgeId or model, a copied results file under a new name) agrees with itself by construction, so it
-    is never a comparison. Distinct judgeIds AND distinct models AND distinct results are all required; when cross-family
-    is claimed (an entry says CROSS_FAMILY_PROVEN_LIVE, or the caller requires it) at least two model families must
-    take part, with each entry's family derived from its model, not trusted from the entry."""
+    files with one judgeId or model, one model under two spellings, a copied results file under a new name) agrees with
+    itself by construction, so it is never a comparison. EVERY model goes through look_judges.canonical_model, always: an
+    unrecognised model is refused, two entries whose models resolve to one model are DUPLICATE_MODEL, and each entry's
+    family and judgeId must be the ones the resolver derives from its model (not whatever the entry says)."""
     problems = []
     if len(entries) < 2:
         problems.append({"code": "FEWER_THAN_TWO_JUDGES", "entries": len(entries)})
-    for field, code in (("judgeId", "DUPLICATE_JUDGE_ID"), ("model", "DUPLICATE_MODEL")):
-        values = [_norm(e.get(field)) for e in entries]
-        if any(v is None for v in values):
-            problems.append({"code": f"{field.upper()}_MISSING"})
-        elif len(set(values)) != len(values):
-            problems.append({"code": code, "values": sorted(v for v in set(values) if values.count(v) > 1)})
+    keys = []
+    for position, entry in enumerate(entries):
+        model = entry.get("model")
+        key = look_judges.canonical_model(model)
+        keys.append(key)
+        if key is None:
+            problems.append({"code": "MODEL_UNRECOGNISED", "position": position, "model": model})
+            continue
+        if entry.get("family") != key[0]:
+            problems.append({"code": "FAMILY_DOES_NOT_MATCH_MODEL", "position": position})
+        judge_id = entry.get("judgeId")
+        if not (isinstance(judge_id, str) and judge_id.partition(":")[2] == look_judges.canonical_text(model)):
+            problems.append({"code": "JUDGE_ID_DOES_NOT_MATCH_MODEL", "position": position})
+        # An entry is a file: `usable` alone proves nothing. It may only say usable if it also carries the facts a usable
+        # entry is made of (nothing left in unusableReasons, a verified seal, an isolation derived for a listed class).
+        isolation = entry.get("judgeIsolation")
+        if entry.get("usable") is True and not (
+                entry.get("unusableReasons") == [] and isinstance(isolation, dict) and isolation.get("enforced") is True
+                and isolation.get("runnerClass") in look_judges.RUNNER_CLASSES and _is_sha256(entry.get("sealSha256"))
+                and (entry.get("preference") or {}).get("winner") != UNUSABLE_WINNER):
+            problems.append({"code": "ENTRY_USABLE_WITHOUT_THE_FACTS_THAT_MAKE_IT_SO", "position": position})
+    ids = [e.get("judgeId") for e in entries]
+    if len({str(i) for i in ids}) != len(ids):
+        problems.append({"code": "DUPLICATE_JUDGE_ID"})
+    placed = [k for k in keys if k is not None]
+    if any(look_judges.same_canonical(placed[i], placed[j]) for i in range(len(placed)) for j in range(i + 1, len(placed))):
+        problems.append({"code": "DUPLICATE_MODEL"})
     results = [e.get("resultsSha256") for e in entries]
     if any(not _is_sha256(r) for r in results):
         problems.append({"code": "RESULTS_DIGEST_MISSING"})
     elif len(set(results)) != len(results):
         problems.append({"code": "DUPLICATE_RESULTS"})
-    claimed = require_cross_family or any(e.get("crossFamilyStatus") == look_judges.CROSS_FAMILY_PROVEN for e in entries)
-    if claimed:
-        families = {look_judges.family_of(e.get("model")) for e in entries}
-        if "unknown" in families or len(families) < 2:
-            problems.append({"code": "CROSS_FAMILY_CLAIMED_BUT_NOT_DISTINCT_FAMILIES", "families": sorted(families)})
-        for e in entries:
-            if e.get("family") != look_judges.family_of(e.get("model")):
-                problems.append({"code": "FAMILY_DOES_NOT_MATCH_MODEL", "judgeId": e.get("judgeId")})
+    if require_cross_family and len({k[0] for k in placed}) < 2:
+        problems.append({"code": "CROSS_FAMILY_REQUIRED_BUT_NOT_DISTINCT_FAMILIES",
+                         "families": sorted({k[0] for k in placed})})
+    return problems
+
+
+def _score_grid(entry):
+    """({(subject, criterion)} the entry carries, {(subject, criterion)} it actually scored), or None when its scores are
+    not the full subject x criterion grid of real numbers / nulls."""
+    shape, scored = set(), set()
+    for subject, criteria in entry["scores"].items():
+        if not isinstance(criteria, dict) or set(criteria) != set(look_config.CRITERIA):
+            return None
+        for criterion, value in criteria.items():
+            shape.add((subject, criterion))
+            if value is None:
+                continue
+            if isinstance(value, bool) or not isinstance(value, (int, float)):
+                return None
+            scored.add((subject, criterion))
+    return shape, scored
+
+
+def coverage_problems(entries):
+    """Two judges are only comparable on the SAME subject x criterion grid: a criterion one judge scored and the other did
+    not, or a subject only one of them has, is a gap, and a gap must never read as agreement."""
+    grids = [_score_grid(e) for e in entries]
+    bad = [i for i, g in enumerate(grids) if g is None]
+    if bad:
+        return [{"code": "SCORES_NOT_THE_FULL_GRID", "positions": bad}]
+    problems = []
+    for position, grid in enumerate(grids[1:], start=1):
+        for code, index in (("SUBJECT_GRID_DIFFERS", 0), ("COVERAGE_DIFFERS", 1)):
+            if grid[index] != grids[0][index]:
+                problems.append({"code": code, "position": position,
+                                 "only_in_first": sorted(grids[0][index] - grid[index]),
+                                 "only_in_this": sorted(grid[index] - grids[0][index])})
+                break  # a different subject set also differs in what was scored: one reason per entry is enough
     return problems
 
 
@@ -518,26 +584,26 @@ def judge_disagreement(entries, points, rubric_lock=None, require_cross_family=F
     the config (judge_disagreement.third_judge_points); there is no default. The result says whether every entry
     was usable: a comparison that includes an unusable judge is reported but is not `comparable`.
 
-    `comparable` additionally needs: two DIFFERENT judges (identity_problems), every entry a tally entry with scores,
-    the same session identity, and every entry's rubric equal to the rubric lock the caller verified NOW (`rubric_lock`;
-    None leaves the comparison not comparable)."""
+    `comparable` additionally needs: two DIFFERENT judges (identity_problems), the SAME score grid in every entry
+    (coverage_problems), every entry a tally entry with scores, the same session identity, and every entry's rubric equal
+    to the rubric lock the caller verified NOW (`rubric_lock`; None leaves the comparison not comparable)."""
     malformed = [i for i, e in enumerate(entries) if _malformed(e)]
     if malformed:
         return {"thirdJudgeNeeded": None, "thresholdPoints": points, "details": [], "unusableJudges": [],
                 "sessionMismatches": [], "identityProblems": [{"code": "MALFORMED_ENTRY", "positions": malformed}],
-                "rubricLockProblems": [], "comparable": False}
+                "coverageProblems": [], "rubricLockProblems": [], "comparable": False}
+    coverage = coverage_problems(entries)
     details = []
-    for i in range(len(entries)):
-        for j in range(i + 1, len(entries)):
-            a, b = entries[i], entries[j]
-            for subject, criteria in a["scores"].items():
-                for criterion, a_value in criteria.items():
-                    b_value = b["scores"].get(subject, {}).get(criterion)
-                    if a_value is None or b_value is None:
-                        continue
-                    if abs(a_value - b_value) > points:
-                        details.append({"judges": [a["judgeId"], b["judgeId"]], "subject": subject,
-                                        "criterion": criterion, "values": [a_value, b_value]})
+    if not coverage:  # on one grid every pair below is a real comparison; off it, a gap would be skipped, not compared
+        for i in range(len(entries)):
+            for j in range(i + 1, len(entries)):
+                a, b = entries[i], entries[j]
+                for subject, criteria in a["scores"].items():
+                    for criterion, a_value in criteria.items():
+                        b_value = b["scores"][subject][criterion]
+                        if a_value is not None and abs(a_value - b_value) > points:
+                            details.append({"judges": [a["judgeId"], b["judgeId"]], "subject": subject,
+                                            "criterion": criterion, "values": [a_value, b_value]})
     unusable = [e["judgeId"] for e in entries if not e.get("usable")]
     mismatches = session_mismatches(entries)
     identity = identity_problems(entries, require_cross_family)
@@ -548,11 +614,12 @@ def judge_disagreement(entries, points, rubric_lock=None, require_cross_family=F
         off = [e["judgeId"] for e in entries if e.get("rubricSha256") != rubric_lock["rubricSha256"]]
         if off:
             lock_problems.append({"code": "ENTRY_RUBRIC_DIFFERS_FROM_LOCK", "judges": off})
-    comparable = not unusable and not mismatches and not identity and not lock_problems
+    comparable = not unusable and not mismatches and not identity and not coverage and not lock_problems
     # A comparison that is not one has NO answer to "is a third judge needed": None, never a reassuring False.
     return {"thirdJudgeNeeded": bool(details) if (comparable or details) else None, "thresholdPoints": points,
             "details": details, "unusableJudges": unusable, "sessionMismatches": mismatches,
-            "identityProblems": identity, "rubricLockProblems": lock_problems, "comparable": comparable}
+            "identityProblems": identity, "coverageProblems": coverage, "rubricLockProblems": lock_problems,
+            "comparable": comparable}
 
 
 SESSION_IDENTITY_FIELDS = ("rubricSha256", "orderSeed", "imageSha256s")

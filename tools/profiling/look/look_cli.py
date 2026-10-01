@@ -13,7 +13,7 @@
                                                          --seal-key-file K.txt | --no-seal     (sealed by default; the key goes to K.txt, never printed)
     python tools/profiling/look/look_cli.py judge        --session-dir SESS --runner claude:MODEL --producer-model M
     python tools/profiling/look/look_cli.py tally        --session-dir SESS --results R.json --producer-model M --out T.json
-                                                         --seal-key K | --seal-key-file K.txt | env LOOK_SEAL_KEY
+                                                         --canary C.json --seal-key K | --seal-key-file K.txt | env LOOK_SEAL_KEY
     python tools/profiling/look/look_cli.py judge-disagreement --entries T1.json T2.json [--out D.json] [--require-cross-family]
     python tools/profiling/look/look_cli.py unseal       --session-dir SESS --out-dir AUDIT --seal-key K
     python tools/profiling/look/look_cli.py isolation-canary --runner claude|codex [--out R.json]
@@ -128,7 +128,7 @@ def _policy(cfg, mode, bars_spec):
 
 def _refuse_same_directory(first, second, what):
     """Comparing a directory with itself is perfect agreement by construction, so it is refused, not measured."""
-    if os.path.normcase(os.path.realpath(first)) == os.path.normcase(os.path.realpath(second)):
+    if look_seal.canon_path(first) == look_seal.canon_path(second):
         raise ValueError(f"{what}: both sides are the same directory ({first!r}); a frame set always agrees with itself")
 
 
@@ -225,11 +225,7 @@ def _prepare_subject_frames(name, directory, out_dir, cfg, policy=None):
 
     prepared, records = {}, []
     os.makedirs(out_dir, exist_ok=True)
-    index = look_metrics.index_frames(directory)
-    blocking = index.blocking_files()
-    if blocking:  # a frame that cannot be indexed is a frame the judges would never see
-        raise look_metrics.FrameIndexError(
-            f"{directory!r} holds image files that cannot be placed as frames: {blocking}")
+    index = look_metrics.index_frames(directory)  # all or nothing: a frame the judges would never see refuses the directory
     for number, path in index.items():
         arr = look_metrics.load_rgb(path)
         letterbox = look_metrics.detect_letterbox(arr, cfg, policy)
@@ -355,8 +351,7 @@ def cmd_build_session(args):
 
 def _refuse_key_file_in_session(key_file, session_dir):
     """A key file inside the session directory is a key the judge can read."""
-    here, there = os.path.realpath(session_dir), os.path.realpath(key_file)
-    if there == here or there.startswith(here + os.sep):
+    if look_seal.path_inside(key_file, session_dir):
         raise ValueError(f"--seal-key-file {key_file!r} is inside the session directory: a judge could read it")
 
 
@@ -379,9 +374,9 @@ def _write_key_file(path, key_hex):
 def _runner_from_spec(spec, args):
     kind, _, model = spec.partition(":")
     if kind == "claude":
-        return look_judges.ClaudeCliJudge(model, judge_id=args.judge_id, timeout_s=args.item_timeout_s)
+        return look_judges.ClaudeCliJudge(model, timeout_s=args.item_timeout_s)
     if kind == "codex":
-        return look_judges.CodexExecJudge(model or None, judge_id=args.judge_id, timeout_s=args.item_timeout_s)
+        return look_judges.CodexExecJudge(model or None, timeout_s=args.item_timeout_s)
     raise SystemExit(f"--runner must be claude:MODEL or codex:MODEL, got {spec!r}")
 
 
@@ -424,8 +419,9 @@ def _verified_lock(args):
 
 def _load_secrets(args):
     """(answer_key, full session, seal dict-or-None). A sealed session is opened from memory with the seal key (the
-    seal must verify, or this raises). An UNSEALED session is read as plaintext so the diagnosis can still be written,
-    but it carries no seal: the entry is unusable (SEAL_NOT_VERIFIED), whatever the verdicts say."""
+    seal must verify, or this raises); the seal facts come from sealed.bin and the directory, never from a results file.
+    An UNSEALED session is read as plaintext so the diagnosis can still be written, but it carries no seal: the entry is
+    unusable (SEAL_NOT_VERIFIED), whatever the verdicts say."""
     sealed_file = os.path.isfile(look_seal.sealed_path(args.session_dir))
     key_hex = look_seal.key_from_args(args.seal_key, args.seal_key_file)
     if sealed_file:
@@ -433,23 +429,32 @@ def _load_secrets(args):
             raise ValueError(f"{args.session_dir!r} is sealed: pass the key in build-session's --seal-key-file "
                              f"(--seal-key, --seal-key-file or {look_seal.KEY_ENV})")
         key, session, seal_sha = look_seal.open_sealed(args.session_dir, key_hex)
-        return key, session, {"verified": True, "sealSha256": seal_sha}
+        return key, session, {"verified": True, "sealSha256": seal_sha,
+                              "plaintextPresent": look_seal.session_state(args.session_dir)["plaintextPresent"]}
     return (_read_json(os.path.join(args.session_dir, "answer_key.json")),
             _read_json(os.path.join(args.session_dir, "session.json")), None)
 
 
+def _read_results(path):
+    """A judge results file as run_session writes it (v2), or a typed refusal: the keys the tally reads must be there."""
+    results = _read_json(path)
+    if not (isinstance(results, dict) and results.get("schema") == look_judges.RESULTS_SCHEMA
+            and isinstance(results.get("items"), dict) and isinstance(results.get("runner"), dict)):
+        raise ValueError(f"{path!r} is not a {look_judges.RESULTS_SCHEMA} judge results file (schema, items and runner "
+                         "are required): re-run `judge` with this version")
+    return results
+
+
 def cmd_tally(args):
     key, session, seal = _load_secrets(args)
-    results = _read_json(args.results)
+    results = _read_results(args.results)
     cfg, meta = look_config.load_config(args.config)
     lock = _verified_lock(args)  # the CURRENT lock, or the one named explicitly
-    if seal is not None:
-        seal["resultsSealSha256"] = results.get("sealSha256")
+    canary = _read_json(_explicit_path(args.canary, "--canary")) if args.canary is not None else None
     entry = look_tally.tally(
-        key, results["items"], results["judge"], session, cfg,
+        key, results["items"], results["runner"], session, cfg,
         current_image_sha256=_current_image_digests(args.session_dir), forbidden_models=args.producer_model,
-        cross_family_status=args.cross_family_status, config_sha256=meta["configSha256"],
-        rubric_lock=lock, seal=seal, judge_isolation=results.get("isolation"))
+        config_sha256=meta["configSha256"], rubric_lock=lock, seal=seal, canary=canary)
     entry["errorsDuringJudging"] = results.get("errors", {})
     entry["staleRejectedAtJudging"] = results.get("staleRejected", {})
     entry["createdUtc"] = _now()
@@ -474,7 +479,8 @@ def cmd_judge_disagreement(args):
     if args.out:
         _write_json(args.out, verdict)
     print(json.dumps({k: verdict[k] for k in ("thirdJudgeNeeded", "thresholdPoints", "comparable", "unusableJudges",
-                                              "sessionMismatches", "identityProblems", "rubricLockProblems")}))
+                                              "sessionMismatches", "identityProblems", "coverageProblems",
+                                              "rubricLockProblems")}))
     return 0 if verdict["comparable"] else 2
 
 
@@ -492,12 +498,11 @@ def cmd_unseal(args):
 def cmd_isolation_canary(args):
     import look_canary
 
-    report = look_canary.run_canary(args.runner, timeout_s=args.timeout_s, control=not args.no_control, model=args.model,
-                                    base_dir=args.canary_dir)
+    report = look_canary.run_canary(args.runner, timeout_s=args.timeout_s, model=args.model, base_dir=args.canary_dir)
     report["createdUtc"] = _now()
     if args.out:
         _write_json(args.out, report)
-    print(json.dumps({k: report[k] for k in ("runner", "outcome", "leaked", "controlProvedReadable")}))
+    print(json.dumps({k: report.get(k) for k in ("runner", "outcome", "leaked", "judgeTried", "controlRead", "cliVersion")}))
     return 0 if report["outcome"] == look_canary.HELD else 2
 
 
@@ -582,7 +587,6 @@ def main(argv=None):
     s = sub.add_parser("judge")
     s.add_argument("--session-dir", required=True)
     s.add_argument("--runner", required=True)
-    s.add_argument("--judge-id")
     s.add_argument("--producer-model", action="append", default=[], required=True,
                    help="model id of the look's producer or the hub; repeatable; the judge may not match")
     s.add_argument("--workers", type=int, default=3)
@@ -596,7 +600,9 @@ def main(argv=None):
     s.add_argument("--results", required=True)
     s.add_argument("--out", required=True)
     s.add_argument("--config")
-    s.add_argument("--cross-family-status")
+    s.add_argument("--canary", help="the isolation-canary report (look_cli isolation-canary --out) for the runner class, CLI "
+                                    "version and command this run used; without one, or with one for another version, the "
+                                    "entry is unusable")
     s.add_argument("--seal-key", help="the seal key itself (prefer --seal-key-file or env LOOK_SEAL_KEY: argv is visible "
                                       "in process lists and logs)")
     s.add_argument("--seal-key-file")
@@ -631,7 +637,6 @@ def main(argv=None):
     s.add_argument("--out")
     s.add_argument("--canary-dir", help="where to make the decoys and the sealed session (default: the temp dir)")
     s.add_argument("--timeout-s", type=int, default=230)
-    s.add_argument("--no-control", action="store_true", help="skip the unconfined control run (the proof is then weaker)")
     s.set_defaults(fn=cmd_isolation_canary)
 
     args = p.parse_args(argv)

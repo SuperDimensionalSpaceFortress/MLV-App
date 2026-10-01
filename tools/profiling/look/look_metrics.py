@@ -421,109 +421,108 @@ def evaluate_frame(source, cfg, reference=None, frame_id=None, letterbox_policy=
 
 
 class FrameIndexError(ValueError):
-    """A supplied frames directory that cannot be used at all: missing, not a directory, or yielding no frame."""
+    """A supplied frames directory that is REFUSED, WHOLE: it is missing, not a directory, holds no frame, or holds ANY entry
+    that is neither a numbered PNG frame nor a text sidecar. `reasons` is [{"name", "code", ...}] for every offender; the
+    message names them all. A directory is never measured with part of it ignored."""
+
+    def __init__(self, message, reasons=()):
+        super().__init__(message)
+        self.reasons = list(reasons)
 
 
-# An image file that could have been a frame. Skipping one is never silent AND never harmless: the sheet is INCOMPLETE.
-_IMAGE_EXTENSIONS = (
-    ".png", ".jpg", ".jpeg", ".jpe", ".jfif", ".jp2", ".j2k", ".jpf", ".jpx", ".jxl", ".bmp", ".dib", ".tif", ".tiff",
-    ".webp", ".gif", ".apng", ".avif", ".avifs", ".heic", ".heif", ".hif", ".tga", ".targa", ".icb", ".vda", ".vst",
-    ".exr", ".hdr", ".pic", ".dds", ".psd", ".ico", ".ppm", ".pgm", ".pbm", ".pnm", ".pam", ".pfm", ".sgi", ".rgb",
-    ".rgba", ".bw", ".qoi",
-    # camera raw and video-still formats
-    ".dng", ".raw", ".cr2", ".cr3", ".crw", ".nef", ".nrw", ".arw", ".srf", ".sr2", ".orf", ".rw2", ".raf", ".pef",
-    ".srw", ".3fr", ".erf", ".kdc", ".mrw", ".x3f", ".rwl", ".iiq", ".braw", ".ari")
-
-
-# Leading bytes of common image containers, so a frame named `frame-07` or `frame-07.dat` is still seen as an image.
-_IMAGE_SIGNATURES = (b"\x89PNG\r\n\x1a\n", b"\xff\xd8\xff", b"GIF87a", b"GIF89a", b"II*\x00", b"MM\x00*",
-                     b"II+\x00", b"MM\x00+", b"\x00\x00\x00\x0cjP  ", b"\xff\x4f\xff\x51", b"\xff\x0a",
-                     b"\x00\x00\x00\x0cJXL ", b"#?RADIANCE", b"#?RGBE", b"v/1\x01", b"8BPS", b"DDS ", b"qoif",
-                     b"\x01\xda")
-_PNM_HEAD = re.compile(rb"P[1-7fF](?:[ \t\r\n]|#[^\n]*\n)+\d+")  # magic, whitespace/comment, then the width digits
-
-
-def _has_image_signature(path):
-    """True when the first bytes are those of an image container. Two-letter text-like magics (BMP's `BM`, PNM's `P6`)
-    are only believed with their second structural check, so a `notes.txt` that starts with those letters is not one."""
-    try:
-        with open(path, "rb") as handle:
-            head = handle.read(48)
-    except OSError:
-        return False
-    if head[:4] == b"RIFF" and head[8:12] == b"WEBP":
-        return True
-    if head[4:8] == b"ftyp" and head[8:12] in (b"heic", b"heix", b"hevc", b"mif1", b"msf1", b"avif", b"avis"):
-        return True
-    if head[:2] == b"BM" and len(head) >= 10 and head[6:10] == b"\x00\x00\x00\x00":
-        return True
-    if _PNM_HEAD.match(head):
-        return True
-    return any(head.startswith(sig) for sig in _IMAGE_SIGNATURES)
+# The ONLY files a frames directory may hold besides its frames: notes the operator keeps beside them. Their bytes must be
+# text (no NUL, valid UTF-8, at most SIDECAR_MAX_BYTES), so a picture cannot hide under one of these names; each is
+# recorded in the verdict's inputs with its digest, never ignored unseen.
+SIDECAR_EXTENSIONS = (".json", ".txt", ".md")
+SIDECAR_MAX_BYTES = 1 << 20
 
 
 class FrameIndex(dict):
-    """{index: path} that also remembers every entry of the directory it did NOT index (`skipped`), so a
-    mis-named or non-PNG frame can never just vanish from a sheet. A skipped entry is blocking when it could
-    have been a frame (an image file, or a second file claiming an index already taken); a sidecar such as a
-    notes file is listed but does not block."""
+    """{index: path} for the frames of a directory, plus the sidecars recorded beside them."""
 
-    def __init__(self, directory):
+    def __init__(self, directory, sidecars=()):
         super().__init__()
         self.directory = directory
-        self.skipped = []
-
-    def _skip(self, name, reason, blocking):
-        self.skipped.append({"name": name, "reason": reason, "blocking": blocking})
-
-    def blocking_files(self):
-        return [s["name"] for s in self.skipped if s["blocking"]]
+        self.sidecars = list(sidecars)
 
     def summary(self):
         return {"directory": self.directory, "indexedFrames": len(self), "indices": sorted(self),
-                "skipped": [dict(s) for s in self.skipped]}
+                "sidecars": [dict(s) for s in self.sidecars]}
+
+
+def _sidecar_problem(path):
+    try:
+        if os.path.getsize(path) > SIDECAR_MAX_BYTES:
+            return "SIDECAR_TOO_LARGE"
+        with open(path, "rb") as handle:
+            data = handle.read()
+        if b"\x00" in data:
+            return "SIDECAR_NOT_TEXT"
+        data.decode("utf-8")
+    except UnicodeDecodeError:
+        return "SIDECAR_NOT_TEXT"
+    except OSError:
+        return "UNREADABLE"
+    return None
+
+
+def _png_problem(path):
+    """None when `path` decodes, completely, as a PNG; else the typed reason it does not."""
+    try:
+        with Image.open(path) as image:
+            if image.format != "PNG":
+                return "NOT_A_PNG"
+            image.load()
+    except (Image.UnidentifiedImageError, Image.DecompressionBombError):
+        return "NOT_A_PNG"
+    except (OSError, ValueError, SyntaxError):
+        return "PNG_DOES_NOT_DECODE"
+    return None
 
 
 def index_frames(directory):
-    """FrameIndex ({index: path}) for the PNGs of a frames dir; the index is the LAST run of digits in the stem.
-    Nothing in the directory is skipped silently (see FrameIndex.skipped), and a directory that is missing or
-    yields zero frames raises FrameIndexError."""
+    """FrameIndex ({index: path}) for a frames dir, ALL OR NOTHING. Every entry must be either a text sidecar
+    (SIDECAR_EXTENSIONS) or a regular file that decodes as a PNG and has a numeric index (the LAST run of digits in its
+    stem, unique in the directory). Anything else (a sub-directory, a JPEG, a PCX, a truncated PNG, a PNG without digits,
+    a second file for one index) refuses the WHOLE directory with a typed reason per offender (FrameIndexError.reasons).
+    A missing directory or one with no frame is refused too."""
     if not os.path.isdir(directory):
-        raise FrameIndexError(f"frames directory {directory!r} does not exist or is not a directory")
+        raise FrameIndexError(f"frames directory {directory!r} does not exist or is not a directory",
+                              [{"name": directory, "code": "NOT_A_DIRECTORY"}])
     found = FrameIndex(directory)
-    owner = {}
+    reasons, owner = [], {}
     for name in sorted(os.listdir(directory)):
-        if not os.path.isfile(os.path.join(directory, name)):
-            found._skip(name, "NOT_A_FILE", False)
-            continue
+        path = os.path.join(directory, name)
         stem, ext = os.path.splitext(name)
-        ext = ext.lower()
-        if ext != ".png":
-            # An allowlist of names is not enough (a frame can carry any extension, or none): also look at the bytes.
-            is_image = ext in _IMAGE_EXTENSIONS or _has_image_signature(os.path.join(directory, name))
-            found._skip(name, "NOT_A_PNG" if is_image else "NOT_A_FRAME_FILE", is_image)
-            continue
-        digits = re.findall(r"\d+", stem)
-        if not digits:
-            found._skip(name, "NO_DIGITS_IN_NAME", True)
-            continue
-        index = int(digits[-1])
-        if index in owner:
-            found._skip(name, f"DUPLICATE_FRAME_INDEX: index {index} is already taken by {owner[index]}", True)
-            continue
-        owner[index] = name
-        found[index] = os.path.join(directory, name)
-    if not found:
+        if not os.path.isfile(path):
+            reasons.append({"name": name, "code": "NOT_A_REGULAR_FILE"})
+        elif ext.lower() in SIDECAR_EXTENSIONS:
+            problem = _sidecar_problem(path)
+            if problem:
+                reasons.append({"name": name, "code": problem})
+            else:
+                found.sidecars.append({"name": name, "sha256": look_config.sha256_file(path)})
+        else:
+            problem = _png_problem(path)
+            digits = re.findall(r"\d+", stem)
+            if problem:
+                reasons.append({"name": name, "code": problem})
+            elif not digits:
+                reasons.append({"name": name, "code": "NO_NUMERIC_INDEX"})
+            elif int(digits[-1]) in owner:
+                reasons.append({"name": name, "code": "DUPLICATE_FRAME_INDEX", "index": int(digits[-1]),
+                                "takenBy": owner[int(digits[-1])]})
+            else:
+                owner[int(digits[-1])] = name
+                found[int(digits[-1])] = path
+    if not found and not reasons:
+        reasons.append({"name": directory, "code": "NO_FRAME"})
+    if reasons:
         raise FrameIndexError(
-            f"frames directory {directory!r} yielded no frame (skipped: "
-            f"{[s['name'] + ' ' + s['reason'] for s in found.skipped] or 'directory is empty'})")
+            f"frames directory {directory!r} is refused whole: "
+            + "; ".join(f"{r['name']} ({r['code']})" for r in reasons)
+            + ". Every entry must be a numbered PNG frame or a .json/.txt/.md text sidecar.", reasons)
     return found
-
-
-def _file_reasons(index, code):
-    """incompleteReasons entries for the blocking skips of a FrameIndex (plain dicts carry none)."""
-    files = index.blocking_files() if isinstance(index, FrameIndex) else []
-    return [{"code": code, "files": files}] if files else []
 
 
 def _summary(index):
@@ -574,7 +573,7 @@ def evaluate_sheet(frames, cfg, meta, label="", references=None, overrides=None,
     skin_applicable = sum(1 for c in skin_checks.values() if c.get("outcome") in (PASS, FAIL))
     missing = sorted(i for i in frames if requested and i not in references)
     extra = sorted(i for i in references if requested and i not in frames)
-    reasons = _file_reasons(frames, "FRAME_FILES_NOT_INDEXED") + _file_reasons(ref_index, "BASELINE_FILES_NOT_INDEXED")
+    reasons = []
     if not frame_verdicts:
         reasons.append({"code": "NO_FRAMES"})
     if missing:
@@ -730,7 +729,7 @@ def compare_sheets(a_frames, b_frames, cfg, meta, scope, a_label="a", b_label="b
                 for i in indices if i not in unpaired]
     gated = bool(cfg["pair"]["scopes"][scope]["gated"])
     broken = [v for v in verdicts if v["outcome"] in (INCOMPLETE, GEOMETRY_MISMATCH)]
-    reasons = _file_reasons(a_frames, "A_FILES_NOT_INDEXED") + _file_reasons(b_frames, "B_FILES_NOT_INDEXED")
+    reasons = []
     if not verdicts:
         reasons.append({"code": "NO_FRAMES"})
     if unpaired:
