@@ -564,7 +564,7 @@ class CompleteChainSingleReadTests(_PwshCase):
             "try {\n"
             f"    $out = & '{RUNNER}' -RepoRoot '{ROOT}' -ExePath '{exe}' -Input '{self.parts[0]}' "
             f"-Output '{self.tmp / 'result.json'}' "
-            + ("-DryRun " if dry else "-ProcessTimeoutMs 8000 -Seconds 1 ")   # ENFORCE-2: the play window is >= 20 s (the stub never plays)
+            + ("-DryRun " if dry else "-ProcessTimeoutMs 8000 -Seconds 20 ")   # ENFORCE-2: the play window is >= 20 s (the stub never plays)
             + f"-TracePath '{self.runner_trace}' "
             + (f"-VerifiedClipBindingPath '{self.binding}'" if bind else "")
             # A stub launcher never plays anything, so a full run ends in the runner's own validation
