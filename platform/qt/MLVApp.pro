@@ -312,7 +312,8 @@ SOURCES += \
     ../../src/batch/MlvTrim.cpp \
     ../../src/batch/BatchLogger.cpp \
     ../../src/batch/ReceiptLoader.cpp \
-    ../../src/batch/ReceiptApplier.cpp
+    ../../src/batch/ReceiptApplier.cpp \
+    ../../src/batch/LookAssistAnalysis.cpp
 
 jpeg2k_enabled {
     OPENJPH = ../../src/mlv/OpenJPH
@@ -521,7 +522,8 @@ HEADERS += MainWindow.h \
     ../../src/batch/MlvTrim.h \
     ../../src/batch/BatchLogger.h \
     ../../src/batch/ReceiptLoader.h \
-    ../../src/batch/ReceiptApplier.h
+    ../../src/batch/ReceiptApplier.h \
+    ../../src/batch/LookAssistAnalysis.h
 
 jpeg2k_enabled {
     HEADERS += \

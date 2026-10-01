@@ -20,6 +20,7 @@ SOURCES += \
     $$REPO_ROOT/src/batch/BatchRenderedVideoPlan.cpp \
     $$REPO_ROOT/src/batch/BatchLogger.cpp \
     $$REPO_ROOT/src/batch/ReceiptLoader.cpp \
+    $$REPO_ROOT/src/batch/LookAssistAnalysis.cpp \
     $$REPO_ROOT/src/batch/ReceiptApplier.cpp \
     $$REPO_ROOT/tests/console/stubs/pipeline_stubs.cpp \
     $$REPO_ROOT/tests/console/test_main.cpp \
@@ -41,6 +42,7 @@ SOURCES += \
     $$REPO_ROOT/tests/console/test_playback_quality_auto_mode.cpp \
     $$REPO_ROOT/tests/console/test_receipt_loader.cpp \
     $$REPO_ROOT/tests/console/test_receipt_applier.cpp \
+    $$REPO_ROOT/tests/console/test_look_assist_scene.cpp \
     $$REPO_ROOT/tests/console/test_rendered_video_runner.cpp \
     $$REPO_ROOT/tests/console/test_sync_download_waiter.cpp \
     $$REPO_ROOT/tests/console/test_download_manager.cpp \

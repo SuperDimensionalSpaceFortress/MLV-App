@@ -54,6 +54,7 @@ SOURCES += \
     $$REPO_ROOT/src/dng/dng.c \
     $$REPO_ROOT/src/batch/BatchLogger.cpp \
     $$REPO_ROOT/src/batch/ReceiptLoader.cpp \
+    $$REPO_ROOT/src/batch/LookAssistAnalysis.cpp \
     $$REPO_ROOT/src/batch/ReceiptApplier.cpp \
     $$REPO_ROOT/src/librtprocess/src/include/librtprocesswrapper.cpp \
     $$REPO_ROOT/src/librtprocess/src/demosaic/ahd.cc \
