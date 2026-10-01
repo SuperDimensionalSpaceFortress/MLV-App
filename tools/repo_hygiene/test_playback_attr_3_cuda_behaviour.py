@@ -5614,10 +5614,12 @@ class DisplayWakeJobOrderingTests(unittest.TestCase):
         # master -- displayWake=$displayWake was added to that block to match every sibling site.
         # OWNER-FOOTAGE-NO-HARDLINK-1 adds a 21st: OWNER_FOOTAGE_VIEW_CHANGED, the last look at the
         # owner-footage views right before the smoke launch (the old owner-link failure site stays a
-        # single site, now OWNER_FOOTAGE_VIEW_NO_SPACE / _FAILED / _CHANGED by token).
+        # single site, now OWNER_FOOTAGE_VIEW_NO_SPACE / _FAILED / _CHANGED by token). Round 2 adds a
+        # 22nd: OWNER_WORK_NOT_CLEAN (exit 28), the typed refusal when the start-of-run sweep left an
+        # entry the job did not create (a legacy neutral entry, an unjournalled file) -- 21 grows to 22.
         summary_writes = body.count("(Join-Path $Pub 'summary.json')")
         display_wake_fields = body.count("displayWake=$displayWake") + body.count("displayWake = $displayWake")
-        self.assertEqual(21, summary_writes, "a summary.json write site was added/removed after the wake")
+        self.assertEqual(22, summary_writes, "a summary.json write site was added/removed after the wake")
         # +1: the success path also stamps displayWake into evidence-manifest.json, a second file.
         self.assertEqual(summary_writes + 1, display_wake_fields)
 
