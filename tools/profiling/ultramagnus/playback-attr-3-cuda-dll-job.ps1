@@ -147,7 +147,15 @@ $embeddedFunctions = Get-AttrCudaEmbeddedFunctionSource -Name @(
     'Initialize-AttrCudaFileIdNative',
     'ConvertTo-AttrCudaFileIdObject',
     'Get-AttrCudaFileId',
-    'Remove-AttrCudaFileById'
+    'Remove-AttrCudaFileByProof',
+    'Remove-AttrCudaFileById',
+    # OWNER-FOOTAGE-NO-HARDLINK-2: the creator journal and the proofs every delete stands on.
+    'Add-AttrCudaOwnedRecord',
+    'Read-AttrCudaOwnedJournal',
+    'Get-AttrCudaOwnershipProof',
+    'New-AttrCudaOwnedRoot',
+    'New-AttrCudaOwnedFileStream',
+    'Remove-AttrCudaInputFileByContent'
 )
 
 # --- job body template (placeholders are substituted below; the body itself never touches
@@ -173,6 +181,8 @@ $CudartName = 'cudart64_12.dll'
 $Archive = Join-Path $AgentRoot "inbox\$JobId-source.zip"
 $Work = Join-Path $AgentRoot "work\$JobId"
 $Pub = Join-Path $AgentRoot "outbox\$JobId.artifacts"
+# OWNER-FOOTAGE-NO-HARDLINK-2: the creator record of everything this job makes under $AgentRoot.
+$OwnedJournal = Join-Path $AgentRoot '.attrcuda-owned.jsonl'
 $ReconDllName = 'igpu_recon_cuda.dll'
 $AmazeDllName = 'igpu_amaze_debayer_cuda.dll'
 
@@ -255,13 +265,16 @@ if ($VerifyOnly) {
     exit 0
 }
 
-Remove-AttrCudaTree -TrustedRoot $AgentRoot -Path $Work
-Remove-AttrCudaTree -TrustedRoot $AgentRoot -Path $Pub
-New-Item -ItemType Directory -Path $Work -Force | Out-Null
-# The outbox is created explicitly (never as a side effect of -Force on a deeper path), so its
-# parent is checked for links like every other directory this job creates.
+# Each container is created explicitly, parent first (never as a side effect of -Force on a deeper
+# path), so every one of them is link-checked. The work and outbox trees are created FRESH and
+# recorded: a tree already standing at either name that this job's journal does not prove (an older
+# build's) is moved aside and left, never deleted; one an earlier run recorded is swept by proof.
+[void](New-AttrCudaDirectory -Path (Join-Path $AgentRoot 'work'))
 [void](New-AttrCudaDirectory -Path (Join-Path $AgentRoot 'outbox'))
-[void](New-AttrCudaDirectory -Path $Pub)
+$workRoot = New-AttrCudaOwnedRoot -TrustedRoot $AgentRoot -Path $Work -OwnedJournal $OwnedJournal
+$pubRoot = New-AttrCudaOwnedRoot -TrustedRoot $AgentRoot -Path $Pub -OwnedJournal $OwnedJournal
+if ($workRoot.Quarantined -ne '') { Say "SCRATCH an unproven tree stood at the work path; left untouched at $($workRoot.Quarantined)" }
+if ($pubRoot.Quarantined -ne '') { Say "SCRATCH an unproven tree stood at the outbox path; left untouched at $($pubRoot.Quarantined)" }
 $PubReady = $true
 Expand-Archive -LiteralPath $Archive -DestinationPath $Work -Force
 $StepLog['sourceExpand'] = 0
@@ -427,8 +440,8 @@ if (Test-Path -LiteralPath $archSidecar) {
 $partials = @()
 function Remove-JobPartials {
     # Files only: never -Recurse, never through a link (sol PR #133 r3; see Remove-AttrCudaPartialFile).
-    foreach ($p in $script:partials) { [void](Remove-AttrCudaPartialFile -TrustedRoot $AgentRoot -Path $p) }
-    [void](Remove-AttrCudaPartialFile -TrustedRoot $AgentRoot -Path (Join-Path $Pub "$ManifestName.partial"))
+    foreach ($p in $script:partials) { [void](Remove-AttrCudaPartialFile -TrustedRoot $AgentRoot -Path $p -OwnedJournal $OwnedJournal) }
+    [void](Remove-AttrCudaPartialFile -TrustedRoot $AgentRoot -Path (Join-Path $Pub "$ManifestName.partial") -OwnedJournal $OwnedJournal)
 }
 
 $files = [System.Collections.Specialized.OrderedDictionary]::new()
@@ -438,7 +451,7 @@ try {
         $sourcePath = [string]$item.source
         $partial = Join-Path $Pub "$name.partial"
         $script:partials += $partial
-        [void](Publish-AttrCudaFileCopy -Source $sourcePath -Destination $partial)
+        [void](Publish-AttrCudaFileCopy -Source $sourcePath -Destination $partial -OwnedJournal $OwnedJournal)
         $expected = Get-ShaLower $sourcePath
         if ((Get-ShaLower $partial) -ne $expected) { throw "sha256 did not round-trip for $name" }
         $files[$name] = $expected
@@ -482,7 +495,7 @@ $manifest = [ordered]@{
 }
 try {
     [void](Assert-AttrCudaWritableFileSlot -Path (Join-Path $Pub $ManifestName))
-    [void](Publish-AttrCudaText -Path (Join-Path $Pub "$ManifestName.partial") -Value ($manifest | ConvertTo-Json -Depth 12))
+    [void](Publish-AttrCudaText -Path (Join-Path $Pub "$ManifestName.partial") -Value ($manifest | ConvertTo-Json -Depth 12) -OwnedJournal $OwnedJournal)
     [void](Publish-AttrCudaFileMove -Source (Join-Path $Pub "$ManifestName.partial") -Destination (Join-Path $Pub $ManifestName))
 } catch {
     Remove-JobPartials

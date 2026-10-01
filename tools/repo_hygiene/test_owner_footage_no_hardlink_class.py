@@ -55,7 +55,9 @@ SCANNED_SUFFIXES = {
 
 HARD_LINK_TEXT_PATTERNS = (
     r"\bCreateHardLink\w*",
-    r"-(?:ItemType|Type|It|I)\s*:?\s*['\"]?HardLink\b",
+    # -ItemType and every unambiguous prefix PowerShell binds to it (-I, -It, -Ite, -Item, -ItemT ...), plus the
+    # -Type alias and its prefixes (-T, -Ty, -Typ).
+    r"-(?:I(?:t(?:e(?:m(?:T(?:y(?:p(?:e)?)?)?)?)?)?)?|T(?:y(?:p(?:e)?)?)?)\s*:?\s*['\"]?HardLink\b",
     r"['\"]HardLink['\"]",
     r"\bcreate_hard_link\b",
     r"\bfs\.link(?:Sync)?\b",
@@ -98,6 +100,29 @@ def _strip_hash_comments(text: str) -> list[str]:
                 break
         out.append(line[:cut].strip())
     return out
+
+
+def _join_backtick_continuations(lines: list[str]) -> list[tuple[int, str]]:
+    """(first line number, statement) with PowerShell backtick continuations joined onto their first line."""
+    joined: list[tuple[int, str]] = []
+    pending: tuple[int, str] | None = None
+    for number, line in enumerate(lines, start=1):
+        if pending is not None:
+            first, text = pending
+            text = text.rstrip("`").rstrip() + " " + line
+            if line.endswith("`"):
+                pending = (first, text)
+            else:
+                joined.append((first, text))
+                pending = None
+            continue
+        if line.endswith("`"):
+            pending = (number, line)
+        else:
+            joined.append((number, line))
+    if pending is not None:
+        joined.append(pending)
+    return joined
 
 
 def _is_test_source(path: Path) -> bool:
@@ -152,7 +177,9 @@ def hard_link_hits(path: Path) -> list[tuple[int, str]]:
                 if isinstance(node, ast.Constant) and isinstance(node.value, str) and HARD_LINK_TEXT_RE.search(node.value):
                     hits.append((node.lineno, node.value.strip()[:120]))
             return sorted(set(hits))
-    for number, line in enumerate(_strip_hash_comments(text), start=1):
+    # A PowerShell backtick continuation puts the parameter name and its value on different physical lines
+    # (`New-Item -ItemType `<newline>    HardLink ...`): join them first so a split spelling is still one statement.
+    for number, line in _join_backtick_continuations(_strip_hash_comments(text)):
         if line and HARD_LINK_TEXT_RE.search(line):
             hits.append((number, line))
     return hits
@@ -207,6 +234,10 @@ class NoHardLinkCreationTests(unittest.TestCase):
             "fs.linkSync(a, b)",
             "cp -al a b",
             "ln a b",
+            "New-Item -Item HardLink -Path $a -Value $b",
+            "New-Item -ItemT HardLink -Path $a -Value $b",
+            "New-Item -Ty HardLink -Path $a -Value $b",
+            "New-Item -Typ:HardLink -Path $a -Value $b",
         ]
         for line in must_hit_text:
             self.assertTrue(HARD_LINK_TEXT_RE.search(line), f"the scan missed: {line}")
@@ -245,6 +276,25 @@ class NoHardLinkCreationTests(unittest.TestCase):
             for n in ast.walk(tree) if isinstance(n, ast.Call)
         ]
         self.assertEqual(sorted(name for name in names if name in HARD_LINK_PY_ATTRIBUTES), ["hardlink_to", "link", "link_to"])
+
+    def test_a_backtick_continued_spelling_is_still_caught(self) -> None:
+        # sol r2 (OWNER-NO-HARDLINK-CONTINUATION-GUARD-1): the scanner examined physical lines, so a
+        # continuation between -ItemType and an UNQUOTED HardLink returned no hit.
+        import tempfile
+
+        samples = {
+            "split_after_param.ps1": "New-Item -ItemType `\n    HardLink -Path $a -Value $b\n",
+            "split_before_value.ps1": "New-Item `\n    -ItemType HardLink `\n    -Path $a `\n    -Value $b\n",
+            "split_prefix.ps1": "New-Item -Item `\n    HardLink -Path $a -Value $b\n",
+        }
+        with tempfile.TemporaryDirectory() as tmp:
+            for name, source in samples.items():
+                path = Path(tmp) / name
+                path.write_text(source, encoding="utf-8")
+                self.assertTrue(hard_link_hits(path), f"the scan missed a continued spelling: {name}")
+            clean = Path(tmp) / "clean.ps1"
+            clean.write_text("New-Item -ItemType `\n    SymbolicLink -Path $a -Target $b\n", encoding="utf-8")
+            self.assertEqual(hard_link_hits(clean), [])
 
     def test_the_scan_now_walks_the_native_and_ci_roots_too(self) -> None:
         roots = {path.relative_to(ROOT).parts[0] for path in _tool_sources()}
@@ -495,9 +545,9 @@ class NoHardLinkInvariantWiringTests(unittest.TestCase):
 # ---- 3. deletes on the paths that can hold an owner-footage name or a job copy of one ---------------
 
 # Every source whose runtime can reach a view entry, a staged copy, a job scratch tree that holds one, or
-# the share-side slot of one. (The build-route jobs -- assembler, stage, DLL-pair, fixture, smoke-runner,
-# compile -- never receive an owner-footage path and are not listed; they use Remove-AttrCudaTree's
-# no-journal mode, which is per-entry handle deletes with no recursive pathname delete.)
+# the share-side slot of one. (The build-route jobs -- assembler, stage, DLL-pair, fixture, smoke-runner --
+# are guarded by test_owner_footage_delete_class.py instead: Remove-AttrCudaTree has NO journal-less mode any
+# more, so they create their trees fresh (New-AttrCudaOwnedRoot) and delete only what that record proves.)
 OWNER_CAPABLE_DELETE_SOURCES = (
     BACHELOR / "attr3-footage-stage.ps1",
     BACHELOR / "Attr3FootageStageJob.psm1",

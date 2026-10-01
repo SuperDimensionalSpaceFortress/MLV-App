@@ -2144,9 +2144,10 @@ class OwnerFootagePrivateDirectoryLeakAndRefusalTests(_PwshCase):
         self.assertTrue(legacy_linked.exists())
         self.assertTrue(second_name.exists())
         self.assertEqual(second_name.read_bytes(), b"pretend this is a name of owner bytes")
-        # The build-scratch tree mode still refuses a tree holding a second name outright...
+        # OWNER-FOOTAGE-NO-HARDLINK-2: there is no journal-less mode any more -- the call cannot be made...
         sweep = self.run_with_module(_guard(f"Remove-AttrCudaTree -TrustedRoot '{self.tmp}' -Path '{work}'"))
-        self.assert_throws(sweep, "ATTRCUDA_TREE_HAS_HARD_LINK")
+        self.assertIn("missing mandatory parameters", sweep.stdout + sweep.stderr)
+        self.assertTrue(legacy_lone.exists() and legacy_linked.exists())
         # ...and the journalled sweep removes nothing it did not create and keeps the directories.
         sweep = self.run_with_module(
             f"$r = Remove-AttrCudaTree -TrustedRoot '{self.tmp}' -Path '{work}' -OwnedJournal '{journal}'\n"
@@ -4326,7 +4327,7 @@ class LinkSafeCleanupTests(_PwshCase):
         partial.mkdir()
         self.plant_junction(partial)
         proc = self.run_with_module(
-            f"Write-Output ('removed=' + (Remove-AttrCudaPartialFile -TrustedRoot '{self.root}' -Path '{partial}'))\n"
+            f"Write-Output ('removed=' + (Remove-AttrCudaPartialFile -TrustedRoot '{self.root}' -Path '{partial}' -OwnedJournal '{self.root / 'j.jsonl'}'))\n"
         )
         self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
         self.assertIn("removed=False", proc.stdout)
@@ -4336,29 +4337,40 @@ class LinkSafeCleanupTests(_PwshCase):
     def test_a_partial_that_is_itself_a_junction_is_left_and_its_target_survives(self) -> None:
         link = self.plant_junction(self.root, "build.json.partial")
         proc = self.run_with_module(
-            f"Write-Output ('removed=' + (Remove-AttrCudaPartialFile -TrustedRoot '{self.root}' -Path '{link}'))\n"
+            f"Write-Output ('removed=' + (Remove-AttrCudaPartialFile -TrustedRoot '{self.root}' -Path '{link}' -OwnedJournal '{self.root / 'j.jsonl'}'))\n"
         )
         self.assertIn("removed=False", proc.stdout)
         self.assertEqual(self.sentinel.read_bytes(), b"must survive")
 
-    def test_a_plain_partial_file_is_removed(self) -> None:
+    def test_a_plain_partial_file_the_job_created_is_removed(self) -> None:
+        # OWNER-FOOTAGE-NO-HARDLINK-2: removed because the job CREATED it through the journalled publish,
+        # not because it is a plain file.
         partial = self.root / "exe.partial"
-        partial.write_bytes(b"half written")
         proc = self.run_with_module(
-            f"Write-Output ('removed=' + (Remove-AttrCudaPartialFile -TrustedRoot '{self.root}' -Path '{partial}'))\n"
+            f"[void](Publish-AttrCudaText -Path '{partial}' -Value 'half written' -OwnedJournal '{self.root / 'j.jsonl'}')\n"
+            f"Write-Output ('removed=' + (Remove-AttrCudaPartialFile -TrustedRoot '{self.root}' -Path '{partial}' -OwnedJournal '{self.root / 'j.jsonl'}'))\n"
         )
-        self.assertIn("removed=True", proc.stdout)
+        self.assertIn("removed=True", proc.stdout, proc.stdout + proc.stderr)
         self.assertFalse(partial.exists())
 
-    def test_a_work_tree_containing_a_junction_is_refused_whole(self) -> None:
+    def test_a_work_tree_containing_a_junction_never_follows_it_and_leaves_what_it_cannot_prove(self) -> None:
+        # Was "refused whole" (a throw). The junction is now an entry like any other: never followed,
+        # never deleted, reported LEFT_NOT_A_FILE; nothing the journal does not prove goes either.
         work = self.root / "work"
         (work / "nested").mkdir(parents=True)
         (work / "nested" / "file.txt").write_bytes(b"x")
         self.plant_junction(work / "nested")
-        proc = self.run_with_module(_guard(f"Remove-AttrCudaTree -TrustedRoot '{self.root}' -Path '{work}'"))
-        self.assert_throws(proc, "ATTRCUDA_TREE_HAS_REPARSE_POINT")
+        proc = self.run_with_module(
+            f"$r = Remove-AttrCudaTree -TrustedRoot '{self.root}' -Path '{work}' -OwnedJournal '{self.root / 'j.jsonl'}'\n"
+            "Write-Output ('LEFT=' + ((@($r.Left | ForEach-Object { $_.Token }) | Sort-Object) -join ','))\n"
+            "Write-Output ('TREE_REMOVED=' + $r.TreeRemoved)\n"
+        )
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        # the junction itself and the plain file are both unproven here: both LEFT, neither followed
+        self.assertIn("LEFT=LEFT_UNOWNED,LEFT_UNOWNED", proc.stdout)
+        self.assertIn("TREE_REMOVED=False", proc.stdout)
         self.assertEqual(self.sentinel.read_bytes(), b"must survive")
-        self.assertTrue((work / "nested" / "file.txt").exists(), "a refused tree must be left intact")
+        self.assertTrue((work / "nested" / "file.txt").exists(), "a tree the journal does not prove must be left intact")
 
     def test_a_tree_reached_through_a_linked_ancestor_is_refused_and_the_target_survives(self) -> None:
         # sol PR #133 r6: AgentRoot\outbox is a junction to an outside directory holding <job>.artifacts.
@@ -4366,19 +4378,19 @@ class LinkSafeCleanupTests(_PwshCase):
         (self.outside / "job.artifacts" / "keep.txt").write_bytes(b"outside the agent root")
         self.plant_junction(self.root, "outbox")
         target = self.root / "outbox" / "job.artifacts"
-        proc = self.run_with_module(_guard(f"Remove-AttrCudaTree -TrustedRoot '{self.root}' -Path '{target}'"))
+        proc = self.run_with_module(_guard(f"Remove-AttrCudaTree -TrustedRoot '{self.root}' -Path '{target}' -OwnedJournal '{self.root / 'j.jsonl'}'"))
         self.assert_throws(proc, "ATTRCUDA_ANCESTOR_IS_LINK")
         self.assertEqual((self.outside / "job.artifacts" / "keep.txt").read_bytes(), b"outside the agent root")
 
     def test_an_absent_tree_under_a_linked_ancestor_is_still_refused(self) -> None:
         self.plant_junction(self.root, "work")
         missing = self.root / "work" / "never-created"
-        proc = self.run_with_module(_guard(f"Remove-AttrCudaTree -TrustedRoot '{self.root}' -Path '{missing}'"))
+        proc = self.run_with_module(_guard(f"Remove-AttrCudaTree -TrustedRoot '{self.root}' -Path '{missing}' -OwnedJournal '{self.root / 'j.jsonl'}'"))
         self.assert_throws(proc, "ATTRCUDA_ANCESTOR_IS_LINK")
 
     def test_a_path_outside_the_trusted_root_is_refused(self) -> None:
         escaping = str(self.root) + "\\..\\outside"
-        proc = self.run_with_module(_guard(f"Remove-AttrCudaTree -TrustedRoot '{self.root}' -Path '{escaping}'"))
+        proc = self.run_with_module(_guard(f"Remove-AttrCudaTree -TrustedRoot '{self.root}' -Path '{escaping}' -OwnedJournal '{self.root / 'j.jsonl'}'"))
         self.assert_throws(proc, "ATTRCUDA_PATH_NOT_UNDER_ROOT")
         self.assertEqual(self.sentinel.read_bytes(), b"must survive")
 
@@ -4424,18 +4436,23 @@ class LinkSafeCleanupTests(_PwshCase):
         self.plant_junction(self.root, "inbox")
         side = self.root / "inbox" / "side.zip"
         proc = self.run_with_module(
-            f"Write-Output ('removed=' + (Remove-AttrCudaPartialFile -TrustedRoot '{self.root}' -Path '{side}'))\n"
+            f"Write-Output ('removed=' + (Remove-AttrCudaPartialFile -TrustedRoot '{self.root}' -Path '{side}' -OwnedJournal '{self.root / 'j.jsonl'}'))\n"
         )
         self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
         self.assertIn("removed=False", proc.stdout)
         self.assertEqual((self.outside / "side.zip").read_bytes(), b"outside the agent root")
 
-    def test_a_link_free_work_tree_is_removed(self) -> None:
+    def test_a_link_free_work_tree_the_job_created_fresh_is_removed(self) -> None:
         work = self.root / "work"
+        made = self.run_with_module(f"[void](New-AttrCudaOwnedRoot -TrustedRoot '{self.root}' -Path '{work}' -OwnedJournal '{self.root / 'j.jsonl'}')\n")
+        self.assertEqual(made.returncode, 0, made.stdout + made.stderr)
         (work / "a" / "b").mkdir(parents=True)
         (work / "a" / "b" / "f.txt").write_bytes(b"x")
-        proc = self.run_with_module(f"Remove-AttrCudaTree -TrustedRoot '{self.root}' -Path '{work}'\n")
+        proc = self.run_with_module(
+            f"$r = Remove-AttrCudaTree -TrustedRoot '{self.root}' -Path '{work}' -OwnedJournal '{self.root / 'j.jsonl'}'\n"
+            "Write-Output ('TREE_REMOVED=' + $r.TreeRemoved)\n")
         self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        self.assertIn("TREE_REMOVED=True", proc.stdout)
         self.assertFalse(work.exists())
 
     def test_a_slot_that_is_a_junction_is_refused_before_anything_is_written(self) -> None:

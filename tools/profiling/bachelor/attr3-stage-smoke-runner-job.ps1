@@ -148,6 +148,8 @@ $ClosureEntries = __CLOSURE_ENTRIES__
 $Cache = Join-Path $AgentRoot 'cache'
 $Work = Join-Path $AgentRoot "work\$JobId"
 $Pub = Join-Path $AgentRoot "outbox\$JobId.artifacts"
+# OWNER-FOOTAGE-NO-HARDLINK-2: the creator record of everything this job makes under $AgentRoot.
+$OwnedJournal = Join-Path $AgentRoot '.attrcuda-owned.jsonl'
 
 function Say([string]$Message) { Write-Output "[$JobId] $Message" }
 function Get-ShaLower([string]$Path) { (Get-FileHash -LiteralPath $Path -Algorithm SHA256).Hash.ToLowerInvariant() }
@@ -256,13 +258,16 @@ if ($VerifyOnly) {
     exit 0
 }
 
-Remove-AttrCudaTree -TrustedRoot $AgentRoot -Path $Work
 # Each container is created explicitly, parent first (never as a side effect of -Force on a
 # deeper path), so every one of them is link-checked like the directories this job publishes into.
+# The work and outbox trees are created FRESH and recorded: a tree already standing at either name
+# that this job's journal does not prove is moved aside and left, never deleted.
 [void](New-AttrCudaDirectory -Path (Join-Path $AgentRoot 'work'))
-[void](New-AttrCudaDirectory -Path $Work)
 [void](New-AttrCudaDirectory -Path (Join-Path $AgentRoot 'outbox'))
-[void](New-AttrCudaDirectory -Path $Pub)
+$workRoot = New-AttrCudaOwnedRoot -TrustedRoot $AgentRoot -Path $Work -OwnedJournal $OwnedJournal
+$pubRoot = New-AttrCudaOwnedRoot -TrustedRoot $AgentRoot -Path $Pub -OwnedJournal $OwnedJournal
+if ($workRoot.Quarantined -ne '') { Say "SCRATCH an unproven tree stood at the work path; left untouched at $($workRoot.Quarantined)" }
+if ($pubRoot.Quarantined -ne '') { Say "SCRATCH an unproven tree stood at the outbox path; left untouched at $($pubRoot.Quarantined)" }
 [void](New-AttrCudaDirectory -Path $Cache)
 $PubReady = $true
 
@@ -286,16 +291,15 @@ if (Test-Path -LiteralPath $cacheDirPath) {
 # pre-removal below is defensive only (the GUID-suffixed name should never already exist) and,
 # unlike the old shared deterministic name, can never remove a concurrent invocation's own
 # in-progress partial directory.
-Remove-AttrCudaTree -TrustedRoot $AgentRoot -Path $partialDirPath
-[void](New-AttrCudaDirectory -Path $partialDirPath)
+[void](New-AttrCudaOwnedRoot -TrustedRoot $AgentRoot -Path $partialDirPath -OwnedJournal $OwnedJournal)
 try {
     foreach ($entry in $ClosureEntries) {
         $entryPath = Join-Path $partialDirPath $entry.name
-        [void](Publish-AttrCudaBytes -Path $entryPath -Bytes $decoded[$entry.name])
+        [void](Publish-AttrCudaBytes -Path $entryPath -Bytes $decoded[$entry.name] -OwnedJournal $OwnedJournal)
         if ((Get-ShaLower $entryPath) -ne $entry.sha256) { throw "sha256 did not round-trip into the cache for $($entry.name)" }
     }
 } catch {
-    Remove-AttrCudaTree -TrustedRoot $AgentRoot -Path $partialDirPath
+    [void](Remove-AttrCudaTree -TrustedRoot $AgentRoot -Path $partialDirPath -OwnedJournal $OwnedJournal)
     Complete-Failed 20 'publishPartial' $_.Exception.Message
 }
 $StepLog['publishPartial'] = 0
@@ -309,7 +313,7 @@ try {
     # other writer left it. Re-verify it to tell "a concurrent publisher already finished this
     # exact closure" (this run is simply done) from "something else is there" (fail closed at the
     # same code the pre-flight check above uses for that).
-    Remove-AttrCudaTree -TrustedRoot $AgentRoot -Path $partialDirPath
+    [void](Remove-AttrCudaTree -TrustedRoot $AgentRoot -Path $partialDirPath -OwnedJournal $OwnedJournal)
     if ($null -eq (Get-AttrCudaClosureDirectoryMismatch -Dir $cacheDirPath -Entries $ClosureEntries)) {
         Complete-AlreadyStaged -CacheDirPathValue $cacheDirPath
     }
@@ -347,7 +351,15 @@ $embeddedFunctions = Get-AttrCudaEmbeddedFunctionSource -Name @(
     'Initialize-AttrCudaFileIdNative',
     'ConvertTo-AttrCudaFileIdObject',
     'Get-AttrCudaFileId',
-    'Remove-AttrCudaFileById'
+    'Remove-AttrCudaFileByProof',
+    'Remove-AttrCudaFileById',
+    # OWNER-FOOTAGE-NO-HARDLINK-2: the creator journal and the proofs every delete stands on.
+    'Add-AttrCudaOwnedRecord',
+    'Read-AttrCudaOwnedJournal',
+    'Get-AttrCudaOwnershipProof',
+    'New-AttrCudaOwnedRoot',
+    'New-AttrCudaOwnedFileStream',
+    'Remove-AttrCudaInputFileByContent'
 )
 
 $jobPath = Join-Path $OutDir "$jobId.job.ps1"

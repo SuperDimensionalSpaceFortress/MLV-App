@@ -247,6 +247,19 @@ function ConvertTo-Attr3FootageStageSafeOutput {
         }
         if ($line -match '^RESULT=([A-Z][A-Z0-9_]*) CLIP=([A-Za-z0-9][A-Za-z0-9_.-]{0,63}) PARTS=(\d+)$' -and $Matches[2] -ceq $ClipId) {
             $safeLines.Add("SUBMITTER RESULT=$($Matches[1]) PARTS=$($Matches[3])")
+            continue
+        }
+        # OWNER-FOOTAGE-NO-HARDLINK-2 (fable r2, OWNER-STAGE-LEFTOVER-SURFACE-1): a name the agent job LEFT
+        # (a staged copy it could not prove or delete) is recorded by the job as a fixed-shape line with a
+        # part index, a lower-case kind and a LEFT_* token -- never a path. It is forwarded, so a stranded
+        # copy is visible to the submitter instead of vanishing behind RESULT=FOOTAGE_STAGED.
+        if ($line -match '^LEFTOVER PART=(\d+) KIND=([a-z]+) RESULT=(LEFT_[A-Z_]+)$') {
+            $safeLines.Add("LEFTOVER PART=$($Matches[1]) KIND=$($Matches[2]) RESULT=$($Matches[3])")
+            continue
+        }
+        # The agent's own re-read of the staged copy's identity (see the stage job): MATCH or MISMATCH.
+        if ($line -match '^SMB_ID_RECHECK PART=(\d+) RESULT=(MATCH|MISMATCH)$') {
+            $safeLines.Add("SMB_ID_RECHECK PART=$($Matches[1]) RESULT=$($Matches[2])")
         }
     }
     return ,@($safeLines)
@@ -439,11 +452,16 @@ $shareStageDir = Join-Path $shareStageRoot $job.jobId
 # handle) -- never by pathname, because a pathname delete removes whatever name the path now means,
 # including a hard link to an owner's recording planted at the slot after it was created.
 $createdShareSlots = New-Object System.Collections.Generic.List[object]
+# OWNER-FOOTAGE-NO-HARDLINK-2 (sol r2 hardening): the durable creator journal of this attempt's share-side
+# slots, kept in the attempt's own staging directory. Send-AttrCudaOwnerFootagePartToStaging records each
+# slot there from its creating handle before a byte is copied.
+$shareJournal = Join-Path $shareStageDir '.attrcuda-owned.jsonl'
 function Remove-Attr3FootageStageAttemptResidue {
     # A slot that is no longer the object this attempt created (LEFT_ID_MISMATCH), that gained a second
     # name (LEFT_MULTI_LINK) or that could not be opened (LEFT_UNAVAILABLE) is LEFT where it is and
     # reported with a fixed token -- never a path (ATTR3-FOOTAGE-STAGE-1 round 10: no path in any
     # branch) -- and nothing here ever adopts an identity it did not record at creation.
+    $residueLeft = $false
     foreach ($createdSlot in $createdShareSlots) {
         $removeToken = 'LEFT_UNAVAILABLE'
         try {
@@ -453,8 +471,20 @@ function Remove-Attr3FootageStageAttemptResidue {
             $removeToken = 'LEFT_UNAVAILABLE'
         }
         if ($removeToken -ne 'DELETED' -and $removeToken -ne 'ABSENT') {
+            $residueLeft = $true
             Write-Output "ATTR3_STAGE_RESIDUE_LEFT_IN_PLACE a created part slot could not be removed and was left in place RESULT=$removeToken"
         }
+    }
+    # The journal goes only when every slot it describes is gone, and only by the identity it recorded for
+    # ITSELF when it was created (never by looking at the name).
+    if (-not $residueLeft) {
+        try {
+            $journalData = Read-AttrCudaOwnedJournal -Journal $shareJournal
+            if ($null -ne $journalData.Self) {
+                $selfId = [pscustomobject]@{ VolumeSerialNumber = [uint32]$journalData.Self.v; FileIndexHigh = [uint32]$journalData.Self.h; FileIndexLow = [uint32]$journalData.Self.l }
+                [void](Remove-AttrCudaFileById -Path $shareJournal -FileId $selfId)
+            }
+        } catch { }
     }
     # Every created part slot is already gone (or was never this attempt's), so $shareStageDir
     # itself is removed only if that leaves it empty. Re-proves the chain link-free first (the
@@ -494,6 +524,7 @@ function Remove-Attr3FootageStageAttemptResidue {
 #        FOOTAGE_STAGED for every part it was given -- removes only the slots THIS ATTEMPT itself
 #        created (see $createdShareSlots above), and the directory itself if that leaves it empty.
 $attemptFailed = $false
+$stagedLeftoverCount = 0
 $stagedIdentities = @{}
 try {
     foreach ($part in $needsWork) {
@@ -503,7 +534,8 @@ try {
                 -StagingDirectory $shareStageDir `
                 -Index ([int]$part.index) `
                 -ExpectedLength ([int64]$part.length) `
-                -ExpectedSha256 ([string]$part.sha256)
+                -ExpectedSha256 ([string]$part.sha256) `
+                -OwnedJournal $shareJournal
         } catch {
             # ATTR3-FOOTAGE-STAGE-1 round 8 (astra major 2): the underlying exception's own
             # .Message is NEVER folded in here any more -- Send-AttrCudaOwnerFootagePartToStaging
@@ -576,6 +608,7 @@ try {
     # shapes, re-emitted from their own matched groups.
     $safeJobOutput = ConvertTo-Attr3FootageStageSafeOutput -Text (@($result.stdout, $result.stderr) -join "`n") -ClipId $ClipId
     foreach ($safeLine in $safeJobOutput) { Write-Output $safeLine }
+    $stagedLeftoverCount = @($safeJobOutput | Where-Object { $_ -like 'LEFTOVER *' }).Count
 
     if ($result.exitCode -ne 0) { $attemptFailed = $true }
 } catch {
@@ -590,6 +623,12 @@ if ($attemptFailed) {
     exit 1
 }
 
+# A copy the agent job left (and said so) is part of the result line itself: FOOTAGE_STAGED with LEFTOVERS=n
+# is still exit 0 (the footage is placed), but never silently the same line as a clean run.
+if ($stagedLeftoverCount -gt 0) {
+    Write-Output "RESULT=FOOTAGE_STAGED CLIP=$ClipId PARTS=$($parts.Count) JOB=$($job.jobId) LEFTOVERS=$stagedLeftoverCount"
+    exit 0
+}
 Write-Output "RESULT=FOOTAGE_STAGED CLIP=$ClipId PARTS=$($parts.Count) JOB=$($job.jobId)"
 exit 0
 } catch {

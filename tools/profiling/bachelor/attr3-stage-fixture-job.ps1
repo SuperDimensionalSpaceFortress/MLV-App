@@ -115,6 +115,8 @@ $Cache = Join-Path $AgentRoot 'cache'
 $Inbox = Join-Path $AgentRoot 'inbox'
 $Work = Join-Path $AgentRoot "work\$JobId"
 $Pub = Join-Path $AgentRoot "outbox\$JobId.artifacts"
+# OWNER-FOOTAGE-NO-HARDLINK-2: the creator record of everything this job makes under $AgentRoot.
+$OwnedJournal = Join-Path $AgentRoot '.attrcuda-owned.jsonl'
 
 function Say([string]$Message) { Write-Output "[$JobId] $Message" }
 function Get-ShaLower([string]$Path) { (Get-FileHash -LiteralPath $Path -Algorithm SHA256).Hash.ToLowerInvariant() }
@@ -157,7 +159,9 @@ function Complete-Failed([int]$Code, [string]$Step, [string]$Message) {
 # NonOverwriting catch below). Both must still remove the inbox copy through the guarded
 # remover, and both must fail closed rather than record a cleanup failure as success.
 function Complete-AlreadyStaged([string]$CachePathValue) {
-    $inboxRemoved = Remove-AttrCudaPartialFile -TrustedRoot $AgentRoot -Path $side
+    # The inbox copy arrived from the submitter (no creating handle to record): removed only if its
+    # bytes, read through the deleting handle, are the content-pinned fixture bytes.
+    $inboxRemoved = Remove-AttrCudaInputFileByContent -TrustedRoot $AgentRoot -Path $side -ExpectedSha256 $FixtureSha256
     if (-not $inboxRemoved) {
         $StepLog['inboxCleanup'] = 1
         Complete-Failed 22 'inboxCleanup' "could not remove staged inbox copy: $FixtureName"
@@ -219,13 +223,16 @@ if ($VerifyOnly) {
     exit 0
 }
 
-Remove-AttrCudaTree -TrustedRoot $AgentRoot -Path $Work
 # Each container is created explicitly, parent first (never as a side effect of -Force on a deeper
-# path), so every one of them is link-checked like the directories this job publishes into.
+# path), so every one of them is link-checked like the directories this job publishes into. The work
+# and outbox trees are created FRESH and recorded; a tree already standing at either name that this
+# job's journal does not prove is moved aside and left, never deleted.
 [void](New-AttrCudaDirectory -Path (Join-Path $AgentRoot 'work'))
-[void](New-AttrCudaDirectory -Path $Work)
 [void](New-AttrCudaDirectory -Path (Join-Path $AgentRoot 'outbox'))
-[void](New-AttrCudaDirectory -Path $Pub)
+$workRoot = New-AttrCudaOwnedRoot -TrustedRoot $AgentRoot -Path $Work -OwnedJournal $OwnedJournal
+$pubRoot = New-AttrCudaOwnedRoot -TrustedRoot $AgentRoot -Path $Pub -OwnedJournal $OwnedJournal
+if ($workRoot.Quarantined -ne '') { Say "SCRATCH an unproven tree stood at the work path; left untouched at $($workRoot.Quarantined)" }
+if ($pubRoot.Quarantined -ne '') { Say "SCRATCH an unproven tree stood at the outbox path; left untouched at $($pubRoot.Quarantined)" }
 [void](New-AttrCudaDirectory -Path $Cache)
 $PubReady = $true
 
@@ -243,10 +250,10 @@ if (Test-Path -LiteralPath $cachePath -PathType Leaf) {
 }
 
 try {
-    [void](Publish-AttrCudaFileCopy -Source $side -Destination $partialPath)
+    [void](Publish-AttrCudaFileCopy -Source $side -Destination $partialPath -OwnedJournal $OwnedJournal)
     if ((Get-ShaLower $partialPath) -ne $FixtureSha256) { throw "sha256 did not round-trip into the cache for $FixtureName" }
 } catch {
-    [void](Remove-AttrCudaPartialFile -TrustedRoot $AgentRoot -Path $partialPath)
+    [void](Remove-AttrCudaPartialFile -TrustedRoot $AgentRoot -Path $partialPath -OwnedJournal $OwnedJournal)
     Complete-Failed 20 'publishPartial' $_.Exception.Message
 }
 $StepLog['publishPartial'] = 0
@@ -260,7 +267,7 @@ try {
     # as some other writer left it. Re-hash it to tell "a concurrent publisher already finished
     # this exact fixture" (this run's job is simply done) from "something else is there" (fail
     # closed at the same exit code the pre-flight check uses for that).
-    [void](Remove-AttrCudaPartialFile -TrustedRoot $AgentRoot -Path $partialPath)
+    [void](Remove-AttrCudaPartialFile -TrustedRoot $AgentRoot -Path $partialPath -OwnedJournal $OwnedJournal)
     if ((Test-Path -LiteralPath $cachePath -PathType Leaf) -and (Get-ShaLower $cachePath) -eq $FixtureSha256) {
         Complete-AlreadyStaged -CachePathValue $cachePath
     }
@@ -271,7 +278,7 @@ $StepLog['publishRename'] = 0
 # The inbox copy is removed only after the cache publish is complete, so an interrupted run leaves
 # the inbox intact and is simply re-runnable. sol, PR #139 r1 MINOR: the remover's boolean result
 # used to be discarded here, so a refused cleanup was still recorded as inboxCleanup=0/success.
-$inboxRemoved = Remove-AttrCudaPartialFile -TrustedRoot $AgentRoot -Path $side
+$inboxRemoved = Remove-AttrCudaInputFileByContent -TrustedRoot $AgentRoot -Path $side -ExpectedSha256 $FixtureSha256
 if (-not $inboxRemoved) {
     $StepLog['inboxCleanup'] = 1
     Complete-Failed 22 'inboxCleanup' "could not remove staged inbox copy: $FixtureName"
@@ -305,7 +312,15 @@ $embeddedFunctions = Get-AttrCudaEmbeddedFunctionSource -Name @(
     'Initialize-AttrCudaFileIdNative',
     'ConvertTo-AttrCudaFileIdObject',
     'Get-AttrCudaFileId',
-    'Remove-AttrCudaFileById'
+    'Remove-AttrCudaFileByProof',
+    'Remove-AttrCudaFileById',
+    # OWNER-FOOTAGE-NO-HARDLINK-2: the creator journal and the proofs every delete stands on.
+    'Add-AttrCudaOwnedRecord',
+    'Read-AttrCudaOwnedJournal',
+    'Get-AttrCudaOwnershipProof',
+    'New-AttrCudaOwnedRoot',
+    'New-AttrCudaOwnedFileStream',
+    'Remove-AttrCudaInputFileByContent'
 )
 
 if (-not (Test-Path -LiteralPath $OutDir)) { [void](New-Item -ItemType Directory -Path $OutDir -Force) }

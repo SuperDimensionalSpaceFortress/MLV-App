@@ -257,7 +257,8 @@ the mechanism, not by narrowing another check:
    share-side slots, and `Send-AttrCudaOwnerFootagePartToStaging`'s partial. No owner-footage-
    capable source deletes by pathname or recursively; `tools/repo_hygiene/test_owner_footage_no_
    hardlink_class.py` fails on `Remove-Item -Recurse`, `Remove-AttrCudaPartialFile` and any
-   `Remove-AttrCudaTree` call without `-OwnedJournal` in them.
+   `Remove-AttrCudaTree` call without `-OwnedJournal` in them. **Round 3 (OWNER-FOOTAGE-NO-HARDLINK-2):
+   ownership proof is mandatory at EVERY delete site, not just these** -- see item 7.
 5. **Nothing opens an original, a view entry or a staged copy for write.** The class guard also
    fails on `FileMode.Create/Truncate/OpenOrCreate/Append`, `FileAccess.Write/ReadWrite`,
    `File.WriteAll*/AppendAll*/Create/Replace`, `Set-Content/Out-File/Add-Content/Clear-Content`,
@@ -270,11 +271,51 @@ the mechanism, not by narrowing another check:
    directory only when empty, and **leaves and reports everything else** -- the directories above a
    left entry stay. The job then refuses the run with a typed, path-free `OWNER_WORK_NOT_CLEAN`
    (exit 28) instead of carrying on into a work directory it did not empty; nothing waits on a
-   human for it, the hub reads the typed line and the owner decides later. The build-route jobs'
-   scratch (assembler, stage, DLL-pair, fixture, smoke-runner, compile) never receives an owner-
-   footage path and uses the no-journal mode: refuse up front on a reparse point or a second name,
-   then per-entry handle deletes (never `Remove-Item -Recurse`), and `ATTRCUDA_TREE_NOT_EMPTIED`
-   if anything could not go.
+   human for it, the hub reads the typed line and the owner decides later.
+7. **No delete-capable function can ever adopt a first-seen identity: the proof is a mandatory
+   argument.** (OWNER-FOOTAGE-NO-HARDLINK-2; PR #211 was parked on this. Its `Remove-AttrCudaTree` had an
+   optional `-OwnedJournal` and, without one, read each file's *current* identity and handed it to the
+   delete as authority; the assembler called it that way on `OutDir\.work-<sha12>`, where an older
+   bind-proof job could have left an owner-clip hard link that had become the last name of an owner
+   recording. No adversary is needed for that.) Now `Remove-AttrCudaFileByProof` is the one function that
+   sets a delete disposition, and each of its parameter sets makes one proof mandatory -- `-FileId` (the
+   identity read off the handle that *created* the file), `-NotBeforeFileTime` (the name lies in a
+   directory this job created fresh and recorded, and the object itself was created after that
+   directory: a hard link to older bytes keeps the older object's creation time) or `-ExpectedSha256`
+   (a submitted input the job did not create, removed only if the bytes read through the deleting
+   handle are the bytes it verified). There is no parameter set without a proof. On top of it:
+   `Remove-AttrCudaTree`, `Remove-AttrCudaPartialFile` and `New-AttrCudaOwnedRoot` take `-OwnedJournal`
+   as a **mandatory** parameter with no default; `Remove-AttrCudaInputFileByContent` takes
+   `-ExpectedSha256`. A name the journal does not prove is `LEFT_UNOWNED` -- left, recorded, never
+   adopted. The build-route jobs (assembler, stage, DLL-pair, fixture, smoke-runner) write trees whose
+   files are made by child tools (qmake, make, nvcc, expand-archive), so no per-file creating handle
+   exists; their work and outbox trees are created **fresh and recorded** (`New-AttrCudaOwnedRoot`: the
+   directory must not exist, must be empty and must carry a creation time of now) and the sweep deletes
+   inside one only what was created after it. A tree already standing at the name that the journal does
+   not prove -- a legacy `.work-<sha12>` or `work\<job>` an older build left -- is **moved aside** to
+   `<name>.unproven-<utc>-<id>` (a rename deletes no name of any file inside it), a warning records it, and
+   a fresh tree is created; an unproven tree is never deleted. Disk cost, stated: such a tree stays until a
+   human clears it. Every `.partial` a job makes is created through `Publish-AttrCuda* -OwnedJournal`
+   (CreateNew, identity journalled from the creating handle before any byte is written), and the inbox
+   side-files the stage and fixture jobs remove after publishing are removed by content hash. The
+   journal itself is created with CreateNew, records its own identity first, is refused if it is a link or
+   has a second name, and is deleted only by that identity. `tools/repo_hygiene/test_owner_footage_delete_
+   class.py` fails on a delete-capable function with an optional, defaulted or missing ownership
+   argument, on any caller that omits the proof, on an unclassified delete-capable function, on any
+   pathname delete in the attribution family that is not allowlisted with a reason, and on any recursive
+   delete under `tools/profiling` that is not allowlisted with the reason its tree cannot hold a footage
+   name (the retired compile job's two raw `Remove-Item -Recurse` calls became a refusal). Real-NTFS
+   proofs, including sol r2's repro through the real assembler script:
+   `test_owner_footage_no_delete_without_proof.py`.
+8. **The staging route (round 3 folds).** The CLI forwards the agent job's `LEFTOVER PART= KIND=
+   RESULT=` lines and prints `RESULT=FOOTAGE_STAGED ... LEFTOVERS=n` when a copy was left (still exit 0:
+   the footage is placed), so a stranded staged copy is visible instead of silent. The agent job re-reads
+   the staged copy's identity off the handle it opened itself (`SMB_ID_RECHECK PART= RESULT=MATCH|
+   MISMATCH`) and deletes only when that equals the submitter's record; a disagreement is never papered
+   over by adopting the id seen on the agent side (that would be first-seen adoption) -- the copy is left.
+   The creator identity of each share-side slot and of the target-volume partial reaches disk at
+   creation (`Send-AttrCudaOwnerFootagePartToStaging -OwnedJournal`, the stage job's
+   `Add-AttrCudaOwnedRecord -AllowOutside`), before any byte is copied.
 
 **Threat model (hub-declared 2026-10-01, forward-only; it waives none of sol's r1 blockers).**
 *In scope:* our own tools; **legacy artifacts our older builds left** -- #200-era hard links under
@@ -296,8 +337,10 @@ leaves the staged copy, `LEFT_ID_MISMATCH` -- but strands staged bytes on the sh
 no creating handle, so its identity is read by name the instant after it is created (symlink views
 are not live on any venue today); files the *app* writes into the job work directory are not
 creator-recorded, so the journalled sweep leaves them (`LEFT_UNOWNED`) -- the work directory carries
-a per-run stamp, so a normal run never sweeps one; and the build-route no-journal mode accepts a
-first-seen identity for scratch into which no owner path ever flows. Hard links that already exist
+a per-run stamp, so a normal run never sweeps one; and the fresh-root proof of a build job's tree
+rests on creation times (a tool that sets a file's creation time to before the tree existed makes its
+own file `LEFT_PREDATES_ROOT`, which strands that tree until a human clears it -- safe, not silent). Hard
+links that already exist
 on bachelor from older builds are never deleted by any job; they are reported and left for an owner
 decision. The symlink arm could not be exercised on the development host (no Developer Mode), so it
 is proven on the Windows CI runners and by bachelor's own capability probe, not here.

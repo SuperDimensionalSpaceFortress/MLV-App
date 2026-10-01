@@ -170,6 +170,7 @@ function Send-AttrCudaOwnerFootagePartToStaging {
         [Parameter(Mandatory = $true)][int]$Index,
         [Parameter(Mandatory = $true)][int64]$ExpectedLength,
         [Parameter(Mandatory = $true)][string]$ExpectedSha256,
+        [Parameter(Mandatory = $true)][string]$OwnedJournal,
         [switch]$TestHookForceDisposeThrow
     )
 
@@ -230,6 +231,11 @@ function Send-AttrCudaOwnerFootagePartToStaging {
             $destStream = [IO.File]::Open($partialPath, [IO.FileMode]::CreateNew, [IO.FileAccess]::Write, [IO.FileShare]::None)
             $weCreatedPartial = $true
             $partialId = Get-AttrCudaFileId -Stream $destStream
+            # OWNER-FOOTAGE-NO-HARDLINK-2 (sol r2 hardening): the creator record reaches DISK now, from this
+            # creating handle, before a single byte is copied -- a sender killed mid-copy leaves a record, not
+            # just a slot nothing may delete. -OwnedJournal is the staging directory's journal (the CLI passes
+            # it); a record that cannot be written is a copy failure and the partial is removed by this id.
+            Add-AttrCudaOwnedRecord -Journal $OwnedJournal -Path $partialPath -FileId $partialId
         } catch [IO.IOException] {
             throw "OWNER_FOOTAGE_STAGE_PARTIAL_EXISTS part $Index a partial copy already occupies the slot"
         } catch {
@@ -293,6 +299,15 @@ function Send-AttrCudaOwnerFootagePartToStaging {
     } catch {
         & $removePartial
         throw "OWNER_FOOTAGE_STAGE_COPY_FAILED part $Index could not publish the staged part"
+    }
+
+    # The same identity now names the FINAL slot too: recorded durably under that name as well, so a sender
+    # killed after the rename (before the CLI re-emits the job) still leaves a record for the slot it made.
+    try {
+        Add-AttrCudaOwnedRecord -Journal $OwnedJournal -Path $finalPath -FileId $partialId
+    } catch {
+        [void](Remove-AttrCudaFileById -Path $finalPath -FileId $partialId)
+        throw "OWNER_FOOTAGE_STAGE_COPY_FAILED part $Index could not record the staged part"
     }
 
     # Id is the identity read off OUR OWN CreateNew handle above; it survives the publish rename, so it

@@ -179,9 +179,10 @@ class FileIdentityReaderTests(_PwshCase):
 
 @requires_pwsh
 class ScratchTreeRefusesASecondNameTests(_PwshCase):
-    def test_a_tree_holding_a_second_name_of_a_file_is_refused_whole_and_both_names_survive(self) -> None:
+    def test_a_tree_holding_a_second_name_of_a_file_is_left_whole_and_both_names_survive(self) -> None:
         # sol r2 repro 1 (the assembler's recursive scratch delete over a tree that holds a name of
-        # the owner's bytes): the tree delete removed that name on fork/master. Now it refuses.
+        # the owner's bytes): the tree delete removed that name on fork/master. Now nothing the
+        # journal does not prove is touched, and a second name is reported as such.
         owner_original = self.tmp / "owner" / "original.bin"
         owner_original.parent.mkdir()
         owner_original.write_bytes(PAYLOAD)
@@ -190,20 +191,36 @@ class ScratchTreeRefusesASecondNameTests(_PwshCase):
         inside = scratch / "owner-clip" / "a-name-of-the-owners-bytes.bin"
         os.link(owner_original, inside)
 
-        proc = self.run_with_module(_guard(f"Remove-AttrCudaTree -TrustedRoot '{self.tmp / 'scratch'}' -Path '{scratch}'"))
+        proc = self.run_with_module(
+            f"$r = Remove-AttrCudaTree -TrustedRoot '{self.tmp / 'scratch'}' -Path '{scratch}' "
+            f"-OwnedJournal '{self.tmp / 'scratch' / 'none.jsonl'}'\n"
+            "Write-Output ('LEFT=' + (($r.Left | ForEach-Object { $_.Token }) -join ','))\n"
+            "Write-Output ('TREE_REMOVED=' + $r.TreeRemoved)\n")
 
-        self.assert_throws(proc, "ATTRCUDA_TREE_HAS_HARD_LINK")
+        self.assertEqual(proc.returncode, 0, f"{proc.stdout}\n{proc.stderr}")
+        self.assertIn("LEFT=LEFT_MULTI_LINK", proc.stdout)
+        self.assertIn("TREE_REMOVED=False", proc.stdout)
         self.assertEqual(owner_original.read_bytes(), PAYLOAD)
         self.assertEqual(inside.read_bytes(), PAYLOAD)
+        self.assertEqual(os.stat(owner_original).st_nlink, 2)
 
-    def test_a_tree_of_lone_files_is_still_removed(self) -> None:
+    def test_a_tree_of_lone_files_nobody_proved_is_left_not_removed(self) -> None:
+        # The old test asserted the opposite ("a tree of lone files is still removed"): that is the
+        # first-seen adoption this card removes. A lone plain file proves nothing about who made it.
         scratch = self.tmp / "scratch" / ".work-lone"
         (scratch / "a" / "b").mkdir(parents=True)
         (scratch / "a" / "b" / "f.bin").write_bytes(b"x")
         (scratch / "g.bin").write_bytes(b"y")
-        proc = self.run_with_module(f"Remove-AttrCudaTree -TrustedRoot '{self.tmp / 'scratch'}' -Path '{scratch}'\n")
+        proc = self.run_with_module(
+            f"$r = Remove-AttrCudaTree -TrustedRoot '{self.tmp / 'scratch'}' -Path '{scratch}' "
+            f"-OwnedJournal '{self.tmp / 'scratch' / 'none.jsonl'}'\n"
+            "Write-Output ('REMOVED=' + $r.Removed)\n"
+            "Write-Output ('LEFT=' + (($r.Left | ForEach-Object { $_.Token }) -join ','))\n")
         self.assertEqual(proc.returncode, 0, f"{proc.stdout}\n{proc.stderr}")
-        self.assertFalse(scratch.exists())
+        self.assertIn("REMOVED=0", proc.stdout)
+        self.assertIn("LEFT=LEFT_UNOWNED,LEFT_UNOWNED", proc.stdout)
+        self.assertEqual((scratch / "a" / "b" / "f.bin").read_bytes(), b"x")
+        self.assertEqual((scratch / "g.bin").read_bytes(), b"y")
 
     def test_a_copy_view_directory_survives_a_recursive_sweep_with_the_original_intact(self) -> None:
         # The view directory the job builds (copy mode) holds a separate file, so the sweep that

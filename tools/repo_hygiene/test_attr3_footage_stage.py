@@ -79,7 +79,7 @@ class SendPartToStagingTests(unittest.TestCase):
         script = (
             f"Import-Module '{OWNER_FOOTAGE_MODULE}' -Force; "
             f"Send-AttrCudaOwnerFootagePartToStaging -SourcePath '{source}' "
-            f"-StagingDirectory '{stage_dir}' -Index {index} -ExpectedLength {length} "
+            f"-StagingDirectory '{stage_dir}' -OwnedJournal '{stage_dir}/.attrcuda-owned.jsonl' -Index {index} -ExpectedLength {length} "
             f"-ExpectedSha256 '{sha256}'{hook}"
         )
         return _run(["-Command", script])
@@ -92,7 +92,8 @@ class SendPartToStagingTests(unittest.TestCase):
         self.assertTrue(final.is_file())
         self.assertEqual(final.read_bytes(), self.content)
         # No extension, and no leftover .partial.
-        self.assertEqual(sorted(p.name for p in stage_dir.iterdir()), ["part-0"])
+        # the slot, plus the attempt directory's durable creator journal (written from the creating handle)
+        self.assertEqual(sorted(p.name for p in stage_dir.iterdir()), [".attrcuda-owned.jsonl", "part-0"])
 
     def test_idempotent_rerun_is_a_noop_and_does_not_error(self) -> None:
         stage_dir = self.share / "job2"
@@ -337,6 +338,34 @@ class FootageStageJobTests(unittest.TestCase):
             self.assertNotIn(TOKEN, text)
 
     # ---- generator: orchestration order, never a bare template -----------------------------
+
+    def test_the_cli_forwards_a_left_copy_and_never_a_path(self) -> None:
+        # OWNER-FOOTAGE-NO-HARDLINK-2 (fable r2, OWNER-STAGE-LEFTOVER-SURFACE-1): the output allowlist used to
+        # forward only PART=/RESULT= lines, so a copy the agent job LEFT vanished behind RESULT=FOOTAGE_STAGED.
+        script = (
+            f"$genText = [IO.File]::ReadAllText('{GENERATOR}'); "
+            "$t=$null; $e=$null; "
+            "$ast = [System.Management.Automation.Language.Parser]::ParseInput($genText, [ref]$t, [ref]$e); "
+            "$fn = $ast.FindAll({ param($n) $n -is [System.Management.Automation.Language.FunctionDefinitionAst] -and "
+            "$n.Name -eq 'ConvertTo-Attr3FootageStageSafeOutput' }, $true) | Select-Object -First 1; "
+            "if (-not $fn) { throw 'FUNCTION_NOT_FOUND' }; "
+            "Invoke-Expression $fn.Extent.Text; "
+            "$text = @('PART=0 STATUS=PLACED', 'LEFTOVER PART=0 KIND=staged RESULT=LEFT_ID_MISMATCH', "
+            "'LEFTOVER PART=1 KIND=staged RESULT=C:\\secret\\path', 'LEFTOVER C:\\secret\\x', "
+            "'SMB_ID_RECHECK PART=0 RESULT=MISMATCH', 'SMB_ID_RECHECK PART=1 RESULT=C:\\x') -join [Environment]::NewLine; "
+            "ConvertTo-Attr3FootageStageSafeOutput -Text $text -ClipId 'CLIP-1' | ForEach-Object { Write-Output $_ }"
+        )
+        proc = _run(["-Command", script])
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        lines = [line.strip() for line in proc.stdout.splitlines() if line.strip()]
+        self.assertEqual(lines, [
+            "PART=0 STATUS=PLACED",
+            "LEFTOVER PART=0 KIND=staged RESULT=LEFT_ID_MISMATCH",
+            "SMB_ID_RECHECK PART=0 RESULT=MISMATCH",
+        ])
+        cli = GENERATOR.read_text(encoding="utf-8")
+        self.assertIn("LEFTOVERS=$stagedLeftoverCount", cli)
+        self.assertLess(cli.index("LEFTOVERS=$stagedLeftoverCount"), cli.rindex("RESULT=FOOTAGE_STAGED CLIP=$ClipId"))
 
     def test_generator_calls_the_module_not_a_local_template(self) -> None:
         text = GENERATOR.read_text(encoding="utf-8")
@@ -671,6 +700,81 @@ class FootageStageJobTests(unittest.TestCase):
         self.assertNotIn("stagedId", parts[0])
         self.assertEqual(parts[1]["stagedId"], {"v": 4000000000, "h": 7, "l": 4294967295})
         self._assert_no_token(again.stdout, again.stderr)
+
+    # ---- OWNER-FOOTAGE-NO-HARDLINK-2 folds: the agent re-reads the staged identity ---------------
+
+    def test_the_agent_rereads_the_staged_identity_off_its_own_handle_and_a_match_is_cleaned(self) -> None:
+        proc = self.build()
+        job = self.job_path(proc)
+        stage_dir = self.stage_dir(job.name[: -len(".job.ps1")])
+        self.stage_all_parts(stage_dir)
+        run = self.run_job(job)
+        self.assertEqual(run.returncode, 0, run.stdout + run.stderr)
+        self.assertIn("SMB_ID_RECHECK PART=0 RESULT=MATCH", run.stdout)
+        self.assertIn("SMB_ID_RECHECK PART=1 RESULT=MATCH", run.stdout)
+        self.assertNotIn("RESULT=MISMATCH", run.stdout)
+        self.assertFalse((stage_dir / "part-0").exists())
+        self.assertFalse((stage_dir / "part-1").exists())
+        self.assertNotIn("LEFTOVER", run.stdout)
+
+    def test_a_staged_id_the_agent_does_not_see_is_never_papered_over_by_adopting_the_agents_own(self) -> None:
+        # The record is what authorises the delete. When the id the submitter recorded is not the id the agent
+        # reads off its own handle (an SMB id that is not the local id, or a slot swapped since), adopting the
+        # agent's value would be first-seen adoption: the copy is left and the line says MISMATCH.
+        proc = self.build()
+        job = self.job_path(proc)
+        stage_dir = self.stage_dir(job.name[: -len(".job.ps1")])
+        self.stage_all_parts(stage_dir)
+        ids = self._creator_ids[stage_dir.name]
+        ids["part-0"] = {"v": ids["part-0"]["v"], "h": ids["part-0"]["h"], "l": ids["part-0"]["l"] + 7}
+        run = self.run_job(job)
+        self.assertEqual(run.returncode, 0, run.stdout + run.stderr)
+        self.assertIn("SMB_ID_RECHECK PART=0 RESULT=MISMATCH", run.stdout)
+        self.assertIn("SMB_ID_RECHECK PART=1 RESULT=MATCH", run.stdout)
+        self.assertIn("LEFTOVER PART=0 KIND=staged RESULT=LEFT_ID_MISMATCH", run.stdout)
+        self.assertEqual((stage_dir / "part-0").read_bytes(), self.content[0], "an unproven staged copy was deleted")
+        self.assertFalse((stage_dir / "part-1").exists())
+
+    def test_loopback_smb_the_id_off_the_submitters_creating_handle_is_the_id_the_agent_rereads(self) -> None:
+        # The venue question fable r2 raised (OWNER-STAGE-SMB-ID-VENUE-PROOF-1), measured end to end over the
+        # drive's administrative share: the SUBMITTER creates the slot through \\localhost\<drive>$ and records
+        # the id off that handle; the AGENT then reads the same object locally. They must agree -- and the job
+        # reports it (SMB_ID_RECHECK ... MATCH) so a disagreement on the real share is visible, not silent.
+        proc = self.build()
+        job = self.job_path(proc)
+        job_id = job.name[: -len(".job.ps1")]
+        stage_dir = self.stage_dir(job_id)
+        drive = stage_dir.drive
+        unc_dir = Path("\\\\localhost\\" + drive[0] + "$" + str(stage_dir)[len(drive):])
+        try:
+            reachable = unc_dir.exists()
+        except OSError:
+            reachable = False
+        if not reachable:
+            self.skipTest("the administrative share is not reachable on this host")
+        ids = {}
+        for index, content in enumerate(self.content):
+            source = self.tmp / f"loopback-source-{index}.raw"
+            source.write_bytes(content)
+            send = _run(["-Command",
+                f"$ErrorActionPreference = 'Stop'; Import-Module '{ARTIFACTS_MODULE}' -Force; "
+                f"Import-Module '{OWNER_FOOTAGE_MODULE}' -Force; "
+                f"$r = Send-AttrCudaOwnerFootagePartToStaging -SourcePath '{source}' -StagingDirectory '{unc_dir}' "
+                f"-OwnedJournal '{unc_dir}\\.attrcuda-owned.jsonl' -Index {index} -ExpectedLength {len(content)} "
+                f"-ExpectedSha256 '{_sha256(content)}'; "
+                "Write-Output ('ID=' + $r.Id.VolumeSerialNumber + ':' + $r.Id.FileIndexHigh + ':' + $r.Id.FileIndexLow)"])
+            if send.returncode != 0:
+                self.skipTest("could not create a file over the administrative share: " + send.stderr.strip()[:120])
+            v, h, l = next(x for x in send.stdout.splitlines() if x.startswith("ID=")).split("=", 1)[1].split(":")
+            ids[f"part-{index}"] = {"v": int(v), "h": int(h), "l": int(l)}
+        self._creator_ids = {job_id: ids}
+        run = self.run_job(job)
+        self.assertEqual(run.returncode, 0, run.stdout + run.stderr)
+        self.assertIn("SMB_ID_RECHECK PART=0 RESULT=MATCH", run.stdout)
+        self.assertIn("SMB_ID_RECHECK PART=1 RESULT=MATCH", run.stdout)
+        self.assertNotIn("LEFTOVER", run.stdout)
+        self.assertFalse((stage_dir / "part-0").exists())
+        self.assertFalse((stage_dir / "part-1").exists())
 
     def test_a_clean_run_reports_no_leftovers(self) -> None:
         proc = self.build()
@@ -1115,7 +1219,7 @@ class EndToEndTransferIdempotenceTests(unittest.TestCase):
         # Like the real CLI: each slot's identity is recorded off the creating handle (.Id) and the job is
         # re-emitted under the same id carrying them (OWNER-FOOTAGE-NO-HARDLINK-1 round 2).
         transfers = "$stagedIdentities = @{}\n" + "\n".join(
-            f"$sent = Send-AttrCudaOwnerFootagePartToStaging -SourcePath '{src}' -StagingDirectory $shareStageDir "
+            f"$sent = Send-AttrCudaOwnerFootagePartToStaging -SourcePath '{src}' -StagingDirectory $shareStageDir -OwnedJournal (Join-Path $shareStageDir '.attrcuda-owned.jsonl') "
             f"-Index {part['index']} -ExpectedLength {part['length']} -ExpectedSha256 '{part['sha256']}'\n"
             f"if ($sent.Created) {{ $stagedIdentities[{part['index']}] = $sent.Id }}"
             for src, part in zip(self.source, self.parts)
@@ -1203,7 +1307,7 @@ class EndToEndTransferIdempotenceTests(unittest.TestCase):
             f"$job = New-Attr3FootageStageJob -ClipId 'FIX-E2E-0001' -Parts $parts -OutDir '{stage_out_dir_1}' -AgentRoot '{self.share}'\n"
             f"$shareStageDir = Join-Path '{self.share}' ('footage-stage\\' + $job.jobId)\n"
             # Only part 0 is staged -- part 1's transfer never happens this attempt.
-            f"Send-AttrCudaOwnerFootagePartToStaging -SourcePath '{self.source[0]}' -StagingDirectory $shareStageDir "
+            f"Send-AttrCudaOwnerFootagePartToStaging -SourcePath '{self.source[0]}' -StagingDirectory $shareStageDir -OwnedJournal (Join-Path $shareStageDir '.attrcuda-owned.jsonl') "
             f"-Index 0 -ExpectedLength {len(self.content[0])} -ExpectedSha256 '{_sha256(self.content[0])}' | Out-Null\n"
             f"$r = & '{UM_RUN}' -ScriptPath $job.jobFile -JobId $job.jobId -AgentShare '{self.share}' "
             "-TimeoutSec 60 -PollSeconds 1\n"
@@ -1242,7 +1346,7 @@ class EndToEndTransferIdempotenceTests(unittest.TestCase):
             f"$parts = @(Get-Content -LiteralPath '{parts_json_path_2}' -Raw | ConvertFrom-Json)\n"
             f"$job = New-Attr3FootageStageJob -ClipId 'FIX-E2E-0001' -Parts $parts -OutDir '{stage_out_dir_2}' -AgentRoot '{self.share}'\n"
             f"$shareStageDir = Join-Path '{self.share}' ('footage-stage\\' + $job.jobId)\n"
-            f"Send-AttrCudaOwnerFootagePartToStaging -SourcePath '{self.source[1]}' -StagingDirectory $shareStageDir "
+            f"Send-AttrCudaOwnerFootagePartToStaging -SourcePath '{self.source[1]}' -StagingDirectory $shareStageDir -OwnedJournal (Join-Path $shareStageDir '.attrcuda-owned.jsonl') "
             f"-Index 1 -ExpectedLength {len(self.content[1])} -ExpectedSha256 '{_sha256(self.content[1])}' | Out-Null\n"
             f"$r = & '{UM_RUN}' -ScriptPath $job.jobFile -JobId $job.jobId -AgentShare '{self.share}' "
             "-TimeoutSec 60 -PollSeconds 1\n"
@@ -1272,7 +1376,7 @@ class EndToEndTransferIdempotenceTests(unittest.TestCase):
             f"Import-Module '{ARTIFACTS_MODULE}' -Force\n"
             f"Import-Module '{OWNER_FOOTAGE_MODULE}' -Force\n"
             f"$result = Send-AttrCudaOwnerFootagePartToStaging -SourcePath '{self.source[0]}' "
-            f"-StagingDirectory '{share_stage_dir}' -Index 0 -ExpectedLength {len(self.content[0])} "
+            f"-StagingDirectory '{share_stage_dir}' -OwnedJournal '{share_stage_dir}/.attrcuda-owned.jsonl' -Index 0 -ExpectedLength {len(self.content[0])} "
             f"-ExpectedSha256 '{_sha256(self.content[0])}'\n"
             "Write-Output ('CREATED=' + $result.Created)\n"
             "Write-Output ('PATH=' + $result.Path)\n"
@@ -1295,7 +1399,7 @@ class EndToEndTransferIdempotenceTests(unittest.TestCase):
             f"Import-Module '{ARTIFACTS_MODULE}' -Force\n"
             f"Import-Module '{OWNER_FOOTAGE_MODULE}' -Force\n"
             f"Send-AttrCudaOwnerFootagePartToStaging -SourcePath '{self.source[1]}' "
-            f"-StagingDirectory '{share_stage_dir}' -Index 1 -ExpectedLength {len(self.content[1])} "
+            f"-StagingDirectory '{share_stage_dir}' -OwnedJournal '{share_stage_dir}/.attrcuda-owned.jsonl' -Index 1 -ExpectedLength {len(self.content[1])} "
             f"-ExpectedSha256 '{'0' * 64}'\n"
         )
         self.assertNotEqual(proc1.returncode, 0)
@@ -1308,8 +1412,12 @@ class EndToEndTransferIdempotenceTests(unittest.TestCase):
             f"Import-Module '{ARTIFACTS_MODULE}' -Force\n"
             f"$token = Remove-AttrCudaFileById -Path '{created_path}' -FileId ([pscustomobject]@{{ VolumeSerialNumber = [uint32]{created_id[0]}; FileIndexHigh = [uint32]{created_id[1]}; FileIndexLow = [uint32]{created_id[2]} }})\n"
             "Write-Output ('TOKEN=' + $token)\n"
+            # the attempt directory also holds the durable creator journal; like the real CLI cleanup it goes
+            # last, only by the identity it recorded for ITSELF at creation
+            f"$j = Read-AttrCudaOwnedJournal -Journal '{share_stage_dir}/.attrcuda-owned.jsonl'\n"
+            "[void](Remove-AttrCudaFileById -Path (Join-Path $j.Dir '.attrcuda-owned.jsonl') -FileId ([pscustomobject]@{ VolumeSerialNumber = [uint32]$j.Self.v; FileIndexHigh = [uint32]$j.Self.h; FileIndexLow = [uint32]$j.Self.l }))\n"
             f"if ((Test-Path -LiteralPath '{share_stage_dir}' -PathType Container -ErrorAction SilentlyContinue)) "
-            f"{{ Remove-Item -LiteralPath '{share_stage_dir}' -Force -Confirm:$false -ErrorAction SilentlyContinue }}\n"
+            f"{{ [IO.Directory]::Delete('{share_stage_dir}', $false) }}\n"
         )
         self.assertEqual(cleanup.returncode, 0, cleanup.stdout + cleanup.stderr)
         self.assertIn("TOKEN=DELETED", cleanup.stdout)
@@ -1751,7 +1859,7 @@ class NoPathInAnyBranchTests(unittest.TestCase):
         script.write_text(
             "$ErrorActionPreference = 'Stop'\n"
             f"Import-Module '{ARTIFACTS_MODULE}' -Force\n"
-            f"[void](Remove-AttrCudaPartialFile -TrustedRoot '{root}' -Path '{occupied}' -WarningAction SilentlyContinue)\n"
+            f"[void](Remove-AttrCudaPartialFile -TrustedRoot '{root}' -Path '{occupied}' -OwnedJournal '{root / 'none.jsonl'}' -WarningAction SilentlyContinue)\n"
             "Write-Output 'DONE'\n",
             encoding="utf-8",
         )

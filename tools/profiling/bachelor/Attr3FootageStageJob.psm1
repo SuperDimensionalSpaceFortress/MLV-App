@@ -292,7 +292,10 @@ function New-Attr3FootageStageJob {
         'Initialize-AttrCudaFileIdNative',
         'ConvertTo-AttrCudaFileIdObject',
         'Get-AttrCudaFileId',
-        'Remove-AttrCudaFileById'
+        'Remove-AttrCudaFileByProof',
+        'Remove-AttrCudaFileById',
+        # OWNER-FOOTAGE-NO-HARDLINK-2: the durable creator record of the target-volume partial.
+        'Add-AttrCudaOwnedRecord'
     )
 
     # --- job body template (placeholders are substituted below; the body itself never touches
@@ -333,6 +336,9 @@ $TestHookForceDisposeThrowPartIndex = __TEST_HOOK_FORCE_DISPOSE_THROW_PART_INDEX
 # -TestHookForceArbitraryThrowPartIndex set -- see New-Attr3FootageStageJob's own header.
 $TestHookForceArbitraryThrowPartIndex = __TEST_HOOK_FORCE_ARBITRARY_THROW_PART_INDEX__
 $StageDir = Join-Path $AgentRoot ("footage-stage\" + $JobId)
+# OWNER-FOOTAGE-NO-HARDLINK-2: the staging directory's creator journal (the submitter writes its slot records
+# there; this job adds the target-volume partial's, by absolute path, from its own creating handle).
+$StageJournal = Join-Path $StageDir '.attrcuda-owned.jsonl'
 
 function Say([string]$Message) { Write-Output "[$JobId] $Message" }
 
@@ -595,6 +601,30 @@ foreach ($rawPart in $RawParts) {
         } else {
             try {
                 $localSrcStream = [IO.File]::Open($stagedPath, [IO.FileMode]::Open, [IO.FileAccess]::Read, [IO.FileShare]::Read)
+                # OWNER-FOOTAGE-NO-HARDLINK-2 (fable r2, OWNER-STAGE-SMB-ID-VENUE-PROOF-1): the identity the
+                # submitter recorded crossed SMB; this is the AGENT'S OWN read of it, off the handle this job
+                # just opened, and it is what the delete below is made against -- but only when it AGREES
+                # with the submitter's record (an agreement is the submitter's creating handle and this
+                # handle naming one object). A disagreement -- an SMB id that is not the local id, or a slot
+                # swapped since -- is never papered over by adopting the id seen here: the copy is left
+                # (LEFT_ID_MISMATCH) and the line below says which it was.
+                if ($null -ne $stagedId) {
+                    $agentSeenId = $null
+                    try { $agentSeenId = Get-AttrCudaFileId -Stream $localSrcStream } catch { $agentSeenId = $null }
+                    if ($null -ne $agentSeenId -and
+                        $agentSeenId.VolumeSerialNumber -eq $stagedId.VolumeSerialNumber -and
+                        $agentSeenId.FileIndexHigh -eq $stagedId.FileIndexHigh -and
+                        $agentSeenId.FileIndexLow -eq $stagedId.FileIndexLow) {
+                        $stagedId = [pscustomobject]@{
+                            VolumeSerialNumber = $agentSeenId.VolumeSerialNumber
+                            FileIndexHigh = $agentSeenId.FileIndexHigh
+                            FileIndexLow = $agentSeenId.FileIndexLow
+                        }
+                        Write-Output "SMB_ID_RECHECK PART=$index RESULT=MATCH"
+                    } else {
+                        Write-Output "SMB_ID_RECHECK PART=$index RESULT=MISMATCH"
+                    }
+                }
             } catch {
                 $localCopyFailed = $true
             }
@@ -604,6 +634,9 @@ foreach ($rawPart in $RawParts) {
                 $localDstStream = [IO.File]::Open($localPartialPath, [IO.FileMode]::CreateNew, [IO.FileAccess]::Write, [IO.FileShare]::None)
                 $weCreatedLocalPartial = $true
                 $localPartialId = Get-AttrCudaFileId -Stream $localDstStream
+                # OWNER-FOOTAGE-NO-HARDLINK-2 (sol r2 hardening): durable, from the creating handle, before a
+                # byte is copied. A job killed mid-copy leaves a record naming exactly this partial.
+                try { Add-AttrCudaOwnedRecord -Journal $StageJournal -Path $localPartialPath -FileId $localPartialId -AllowOutside } catch { }
             } catch [IO.IOException] {
                 $localPartialExists = $true
             } catch {

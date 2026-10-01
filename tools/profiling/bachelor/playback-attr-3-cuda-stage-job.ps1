@@ -130,7 +130,15 @@ $embeddedFunctions = Get-AttrCudaEmbeddedFunctionSource -Name @(
     'Initialize-AttrCudaFileIdNative',
     'ConvertTo-AttrCudaFileIdObject',
     'Get-AttrCudaFileId',
-    'Remove-AttrCudaFileById'
+    'Remove-AttrCudaFileByProof',
+    'Remove-AttrCudaFileById',
+    # OWNER-FOOTAGE-NO-HARDLINK-2: the creator journal and the proofs every delete stands on.
+    'Add-AttrCudaOwnedRecord',
+    'Read-AttrCudaOwnedJournal',
+    'Get-AttrCudaOwnershipProof',
+    'New-AttrCudaOwnedRoot',
+    'New-AttrCudaOwnedFileStream',
+    'Remove-AttrCudaInputFileByContent'
 )
 
 if (-not (Test-Path -LiteralPath $OutDir)) { New-Item -ItemType Directory -Path $OutDir -Force | Out-Null }
@@ -155,6 +163,9 @@ $Cache = Join-Path $AgentRoot 'cache'
 $Inbox = Join-Path $AgentRoot 'inbox'
 $Work = Join-Path $AgentRoot "work\$JobId"
 $Pub = Join-Path $AgentRoot "outbox\$JobId.artifacts"
+# OWNER-FOOTAGE-NO-HARDLINK-2: the creator record of everything this job makes under $AgentRoot. No
+# delete below ever adopts a name because it looks like this job's.
+$OwnedJournal = Join-Path $AgentRoot '.attrcuda-owned.jsonl'
 
 function Say([string]$Message) { Write-Output "[$JobId] $Message" }
 function Get-ShaLower([string]$Path) { (Get-FileHash -LiteralPath $Path -Algorithm SHA256).Hash.ToLowerInvariant() }
@@ -300,13 +311,16 @@ if ($VerifyOnly) {
     exit 0
 }
 
-Remove-AttrCudaTree -TrustedRoot $AgentRoot -Path $Work
-Remove-AttrCudaTree -TrustedRoot $AgentRoot -Path $Pub
-New-Item -ItemType Directory -Path $Work -Force | Out-Null
-# The outbox is created explicitly (never as a side effect of -Force on a deeper path), so its
-# parent is checked for links like every other directory this job creates.
+# Each container is created explicitly, parent first (never as a side effect of -Force on a deeper
+# path), so every one of them is link-checked. The work and outbox trees are created FRESH and
+# recorded: a tree already standing at either name that this job's journal does not prove (an older
+# build's) is moved aside and left, never deleted; one an earlier run recorded is swept by proof.
+[void](New-AttrCudaDirectory -Path (Join-Path $AgentRoot 'work'))
 [void](New-AttrCudaDirectory -Path (Join-Path $AgentRoot 'outbox'))
-[void](New-AttrCudaDirectory -Path $Pub)
+$workRoot = New-AttrCudaOwnedRoot -TrustedRoot $AgentRoot -Path $Work -OwnedJournal $OwnedJournal
+$pubRoot = New-AttrCudaOwnedRoot -TrustedRoot $AgentRoot -Path $Pub -OwnedJournal $OwnedJournal
+if ($workRoot.Quarantined -ne '') { Say "SCRATCH an unproven tree stood at the work path; left untouched at $($workRoot.Quarantined)" }
+if ($pubRoot.Quarantined -ne '') { Say "SCRATCH an unproven tree stood at the outbox path; left untouched at $($pubRoot.Quarantined)" }
 [void](New-AttrCudaDirectory -Path $Cache)
 $PubReady = $true
 
@@ -326,13 +340,13 @@ function Remove-JobPartials {
     # Files only: a .partial occupied by a directory or a link is LEFT IN PLACE and reported, never
     # recursed into (sol PR #133 r3: -Recurse can follow a junction out of the cache). It cannot
     # prompt, because Remove-AttrCudaPartialFile never asks Remove-Item to delete a container.
-    foreach ($p in $script:partialPaths) { [void](Remove-AttrCudaPartialFile -TrustedRoot $AgentRoot -Path $p) }
+    foreach ($p in $script:partialPaths) { [void](Remove-AttrCudaPartialFile -TrustedRoot $AgentRoot -Path $p -OwnedJournal $OwnedJournal) }
 }
 
 try {
     foreach ($item in $sideFiles) {
         $partial = [string]$item.partialPath
-        [void](Publish-AttrCudaFileCopy -Source ([string]$item.path) -Destination $partial)
+        [void](Publish-AttrCudaFileCopy -Source ([string]$item.path) -Destination $partial -OwnedJournal $OwnedJournal)
         if ((Get-ShaLower $partial) -ne [string]$item.sha256) { throw "sha256 did not round-trip into the cache for $($item.name)" }
     }
 } catch {
@@ -353,7 +367,7 @@ $StepLog['publishRename'] = 0
 
 try {
     [void](Assert-AttrCudaWritableFileSlot -Path $manifestCachePath)
-    [void](Publish-AttrCudaFileCopy -Source $manifestSide -Destination $manifestPartialPath)
+    [void](Publish-AttrCudaFileCopy -Source $manifestSide -Destination $manifestPartialPath -OwnedJournal $OwnedJournal)
     if ((Get-ShaLower $manifestPartialPath) -ne $ManifestSha256) { throw "sha256 did not round-trip into the cache for $ManifestName" }
     [void](Publish-AttrCudaFileMove -Source $manifestPartialPath -Destination $manifestCachePath)
 } catch {
@@ -367,8 +381,12 @@ $StepLog['publishManifest'] = 0
 # complete, so an interrupted run leaves the inbox intact and is simply re-runnable.
 # Plain-file removal only (never a directory, never through a link): the same guarded helper.
 # The ancestor chain from $AgentRoot is re-checked at deletion time (sol PR #133 r8: a linked inbox).
-foreach ($item in $sideFiles) { [void](Remove-AttrCudaPartialFile -TrustedRoot $AgentRoot -Path ([string]$item.path)) }
-[void](Remove-AttrCudaPartialFile -TrustedRoot $AgentRoot -Path $manifestSide)
+# These inbox files arrived from the submitter, so no creating handle exists to record. The proof is
+# their CONTENT: each is removed only if the bytes read through the deleting handle are the very
+# bytes this job verified and published (Remove-AttrCudaInputFileByContent); a name that is
+# anything else is left.
+foreach ($item in $sideFiles) { [void](Remove-AttrCudaInputFileByContent -TrustedRoot $AgentRoot -Path ([string]$item.path) -ExpectedSha256 ([string]$item.sha256)) }
+[void](Remove-AttrCudaInputFileByContent -TrustedRoot $AgentRoot -Path $manifestSide -ExpectedSha256 $ManifestSha256)
 $StepLog['inboxCleanup'] = 0
 # $item.path and $manifestSide are the values Assert-AttrCudaDirectChild returned: a full path
 # already proved to sit directly in the inbox. This is the Remove-Item the traversal finding was

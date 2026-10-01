@@ -171,10 +171,15 @@ function Complete-Failed([int]$Code, [string]$Step, [string]$Message) {
 
 Say "START source=$SourceCommit arch=$CudaArch"
 if (-not (Test-Path -LiteralPath $Archive)) { Complete-Failed 3 'sourceArchive' "missing: $Archive" }
-if (Test-Path -LiteralPath $Work) { Remove-Item -LiteralPath $Work -Recurse -Force }
-if (Test-Path -LiteralPath $Pub) { Remove-Item -LiteralPath $Pub -Recurse -Force }
-New-Item -ItemType Directory -Path $Work -Force | Out-Null
-New-Item -ItemType Directory -Path $Pub -Force | Out-Null
+# OWNER-FOOTAGE-NO-HARDLINK-2: the two raw `Remove-Item -Recurse` deletes of $Work and $Pub that stood
+# here are gone. This body is UNRUN (the generator throws above); a revival must embed
+# New-AttrCudaOwnedRoot from AttrCudaArtifacts.psm1 and create both trees FRESH through it. A tree
+# that already stands at either name is refused, never deleted by pathname.
+if ((Test-Path -LiteralPath $Work) -or (Test-Path -LiteralPath $Pub)) {
+    Complete-Failed 5 'workTreeStanding' "a tree already stands at $Work or $Pub; this body does not delete trees by pathname"
+}
+New-Item -ItemType Directory -Path $Work | Out-Null
+New-Item -ItemType Directory -Path $Pub | Out-Null
 Expand-Archive -LiteralPath $Archive -DestinationPath $Work -Force
 $StepLog['sourceExpand'] = 0
 

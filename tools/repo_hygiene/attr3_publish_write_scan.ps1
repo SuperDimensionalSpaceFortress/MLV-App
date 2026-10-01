@@ -16,8 +16,9 @@
 #   R2 arguments     New-Item (-Path; -ItemType literally Directory|File; no -Name), Expand-Archive
 #                    (-DestinationPath), Export-Csv (-LiteralPath) and Start-Process (each -Redirect*)
 #                    name a destination provable under $Work; no positional use; no splatting;
-#                    ForEach-Object takes script blocks only; the -TrustedRoot of Remove-AttrCudaTree
-#                    and Remove-AttrCudaPartialFile is literally $AgentRoot or 'C:\mlvtmp'.
+#                    ForEach-Object takes script blocks only; the -TrustedRoot of Remove-AttrCudaTree,
+#                    Remove-AttrCudaPartialFile, Remove-AttrCudaInputFileByContent and
+#                    New-AttrCudaOwnedRoot is literally $AgentRoot or 'C:\mlvtmp'.
 #   R3 dynamic calls `&` only on a literal ending in .exe or an allowlisted child-executable variable;
 #                    no dot-sourcing.
 #   R4 .NET          allowlisted static members and instance method names only.
@@ -291,7 +292,7 @@ function Invoke-Scan([string]$Source, [string]$Text, [string[]]$ModuleFunctions)
                 Add-Violation $Source $command 'R2' "New-Item must name -ItemType 'Directory' or 'File' literally"
             }
         }
-        if ($name -ceq 'Remove-AttrCudaTree' -or $name -ceq 'Remove-AttrCudaPartialFile') {
+        if (@('Remove-AttrCudaTree', 'Remove-AttrCudaPartialFile', 'Remove-AttrCudaInputFileByContent', 'New-AttrCudaOwnedRoot') -ccontains $name) {
             $roots = Get-NamedArguments $command @('TrustedRoot')
             $rootOk = $roots.Count -eq 1 -and $null -ne $roots[0] -and (
                 ($roots[0] -is [System.Management.Automation.Language.VariableExpressionAst] -and $roots[0].VariablePath.UserPath -ceq 'AgentRoot') -or

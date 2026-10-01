@@ -168,12 +168,12 @@ class StagingCliResidueCleanupTests(_Synthetic):
         sha = hashlib.sha256(source.read_bytes()).hexdigest()
         stage = self.tmp / "share" / "footage-stage" / "job-1"
         proc = self.run_with_module(
-            f"$r = Send-AttrCudaOwnerFootagePartToStaging -SourcePath '{source}' -StagingDirectory '{stage}' -Index 0 "
+            f"$r = Send-AttrCudaOwnerFootagePartToStaging -SourcePath '{source}' -StagingDirectory '{stage}' -OwnedJournal (Join-Path '{stage}' '.attrcuda-owned.jsonl') -Index 0 "
             f"-ExpectedLength {source.stat().st_size} -ExpectedSha256 '{sha}'\n"
             "$now = Get-AttrCudaFileId -Path $r.Path\n"
             "Write-Output ('CREATED=' + $r.Created)\n"
             "Write-Output ('ID_MATCHES_FINAL_SLOT=' + (($r.Id.VolumeSerialNumber -eq $now.VolumeSerialNumber) -and ($r.Id.FileIndexHigh -eq $now.FileIndexHigh) -and ($r.Id.FileIndexLow -eq $now.FileIndexLow)))\n"
-            f"$again = Send-AttrCudaOwnerFootagePartToStaging -SourcePath '{source}' -StagingDirectory '{stage}' -Index 0 "
+            f"$again = Send-AttrCudaOwnerFootagePartToStaging -SourcePath '{source}' -StagingDirectory '{stage}' -OwnedJournal (Join-Path '{stage}' '.attrcuda-owned.jsonl') -Index 0 "
             f"-ExpectedLength {source.stat().st_size} -ExpectedSha256 '{sha}'\n"
             "Write-Output ('SECOND_CREATED=' + $again.Created)\n"
             "Write-Output ('SECOND_ID_IS_NULL=' + ($null -eq $again.Id))\n")
@@ -182,6 +182,52 @@ class StagingCliResidueCleanupTests(_Synthetic):
         self.assertIn("ID_MATCHES_FINAL_SLOT=True", proc.stdout)
         self.assertIn("SECOND_CREATED=False", proc.stdout)
         self.assertIn("SECOND_ID_IS_NULL=True", proc.stdout)
+
+
+@requires_pwsh
+class StagingDurableCreatorRecordTests(_Synthetic):
+    """sol r2 hardening (OWNER-STAGING-DURABLE-CREATOR-JOURNAL-1): the creator identity of a share-side slot
+    reaches DISK from the creating handle before any byte is copied -- a sender killed or failed mid-copy
+    leaves a record, not just a slot nothing may delete."""
+
+    def test_a_send_that_fails_after_creating_its_partial_still_leaves_the_creator_record(self) -> None:
+        source = self.tmp / "source.raw"
+        source.write_bytes(b"synthetic part bytes " * 40)
+        sha = hashlib.sha256(source.read_bytes()).hexdigest()
+        stage = self.tmp / "share" / "footage-stage" / "job-1"
+        journal = stage / ".attrcuda-owned.jsonl"
+        proc = self.run_with_module(_guard(
+            f"Send-AttrCudaOwnerFootagePartToStaging -SourcePath '{source}' -StagingDirectory '{stage}' "
+            f"-OwnedJournal '{journal}' -Index 0 -ExpectedLength {source.stat().st_size} "
+            f"-ExpectedSha256 '{sha}' -TestHookForceDisposeThrow"))
+        self.assertIn("THREW OWNER_FOOTAGE_STAGE_COPY_FAILED", proc.stdout, f"{proc.stdout}\n{proc.stderr}")
+        self.assertFalse((stage / "part-0.partial").exists(), "the failed send left its partial behind")
+        records = [json.loads(line) for line in journal.read_text(encoding="utf-8").splitlines()]
+        named = [r for r in records if r.get("k") != "self"]
+        self.assertEqual([r["p"] for r in named], ["part-0.partial"], "the record was not written at creation")
+
+    def test_a_successful_send_records_the_partial_and_the_final_slot_under_one_identity(self) -> None:
+        source = self.tmp / "source2.raw"
+        source.write_bytes(b"synthetic part bytes " * 40)
+        sha = hashlib.sha256(source.read_bytes()).hexdigest()
+        stage = self.tmp / "share" / "footage-stage" / "job-2"
+        journal = stage / ".attrcuda-owned.jsonl"
+        self.run_with_module(
+            f"[void](Send-AttrCudaOwnerFootagePartToStaging -SourcePath '{source}' -StagingDirectory '{stage}' "
+            f"-OwnedJournal '{journal}' -Index 0 -ExpectedLength {source.stat().st_size} -ExpectedSha256 '{sha}')\n")
+        named = [json.loads(line) for line in journal.read_text(encoding="utf-8").splitlines()]
+        named = [r for r in named if r.get("k") != "self"]
+        self.assertEqual([r["p"] for r in named], ["part-0.partial", "part-0"])
+        self.assertEqual((named[0]["v"], named[0]["h"], named[0]["l"]), (named[1]["v"], named[1]["h"], named[1]["l"]))
+
+    def test_the_staging_journal_is_required(self) -> None:
+        source = self.tmp / "source3.raw"
+        source.write_bytes(b"x" * 64)
+        proc = self.run_with_module(
+            f"Send-AttrCudaOwnerFootagePartToStaging -SourcePath '{source}' -StagingDirectory '{self.tmp / 'stage3'}' "
+            f"-Index 0 -ExpectedLength 64 -ExpectedSha256 '{'0' * 64}'\n")
+        self.assertNotEqual(proc.returncode, 0)
+        self.assertFalse((self.tmp / "stage3").exists(), "a send without a journal created something")
 
 
 @requires_pwsh
@@ -229,29 +275,48 @@ class HandleDeleteTests(_Synthetic):
         self.assertFalse(os.access(owner, os.W_OK), "the owner's read-only flag must not be cleared")
 
     def test_the_build_route_partial_cleanup_leaves_a_name_swapped_for_a_hard_link(self) -> None:
-        # Remove-AttrCudaPartialFile (build-route .partial slots) is no longer a pathname delete either.
+        # Remove-AttrCudaPartialFile (build-route .partial slots) is no longer a pathname delete either:
+        # the partial was created through Publish-AttrCudaText -OwnedJournal (identity journalled from
+        # the creating handle); the name is then swapped for a hard link to an old recording.
         root = self.tmp / "out"
         root.mkdir()
         owner = self.tmp / "owner-original.bin"
         owner.write_bytes(OLD_RECORDING)
         partial = root / "thing.partial"
+        journal = root / ".attrcuda-owned.jsonl"
+        made = self.run_with_module(f"[void](Publish-AttrCudaText -Path '{partial}' -Value 'x' -OwnedJournal '{journal}')\n")
+        self.assertEqual(made.returncode, 0, f"{made.stdout}\n{made.stderr}")
+        os.remove(partial)
         os.link(owner, partial)
         proc = self.run_with_module(
-            f"$ok = Remove-AttrCudaPartialFile -TrustedRoot '{root}' -Path '{partial}' -WarningAction SilentlyContinue\n"
+            f"$ok = Remove-AttrCudaPartialFile -TrustedRoot '{root}' -Path '{partial}' -OwnedJournal '{journal}' -WarningAction SilentlyContinue\n"
             "Write-Output ('REMOVED=' + $ok)\n")
         self.assertIn("REMOVED=False", proc.stdout, f"{proc.stdout}\n{proc.stderr}")
         self.assertEqual(owner.read_bytes(), OLD_RECORDING)
         self.assertEqual(partial.read_bytes(), OLD_RECORDING)
 
-    def test_a_lone_build_route_partial_is_still_removed(self) -> None:
+    def test_a_lone_build_route_partial_the_job_created_is_still_removed(self) -> None:
         root = self.tmp / "out2"
+        root.mkdir()
+        partial = root / "thing.partial"
+        journal = root / ".attrcuda-owned.jsonl"
+        proc = self.run_with_module(
+            f"[void](Publish-AttrCudaText -Path '{partial}' -Value 'x' -OwnedJournal '{journal}')\n"
+            f"$ok = Remove-AttrCudaPartialFile -TrustedRoot '{root}' -Path '{partial}' -OwnedJournal '{journal}'\nWrite-Output ('REMOVED=' + $ok)\n")
+        self.assertIn("REMOVED=True", proc.stdout, f"{proc.stdout}\n{proc.stderr}")
+        self.assertFalse(partial.exists())
+
+    def test_a_partial_nobody_journalled_is_left_even_when_it_is_a_lone_plain_file(self) -> None:
+        # The fail-open default is gone: a name that merely LOOKS like the job's .partial is not the job's.
+        root = self.tmp / "out3"
         root.mkdir()
         partial = root / "thing.partial"
         partial.write_bytes(b"x")
         proc = self.run_with_module(
-            f"$ok = Remove-AttrCudaPartialFile -TrustedRoot '{root}' -Path '{partial}'\nWrite-Output ('REMOVED=' + $ok)\n")
-        self.assertIn("REMOVED=True", proc.stdout, f"{proc.stdout}\n{proc.stderr}")
-        self.assertFalse(partial.exists())
+            f"$ok = Remove-AttrCudaPartialFile -TrustedRoot '{root}' -Path '{partial}' -OwnedJournal '{root / 'none.jsonl'}' -WarningAction SilentlyContinue\n"
+            "Write-Output ('REMOVED=' + $ok)\n")
+        self.assertIn("REMOVED=False", proc.stdout, f"{proc.stdout}\n{proc.stderr}")
+        self.assertTrue(partial.exists())
 
 
 @requires_pwsh
@@ -266,7 +331,11 @@ class JournalTests(_Synthetic):
             f"Add-AttrCudaOwnedRecord -Journal '{journal}' -Path '{made}' -FileId ({_id_literal(fields)})\n"
             f"Add-AttrCudaOwnedRecord -Journal '{journal}' -Path '{made}' -FileId ({_id_literal(fields)}) -IsReparsePoint\n")
         self.assertEqual(proc.returncode, 0, f"{proc.stdout}\n{proc.stderr}")
-        lines = [json.loads(line) for line in journal.read_text(encoding="utf-8").splitlines()]
+        every = [json.loads(line) for line in journal.read_text(encoding="utf-8").splitlines()]
+        # the journal is created with CreateNew and records its OWN identity first (k = self), so even the
+        # journal is only ever deleted by a creator-recorded identity
+        self.assertEqual(every[0]["k"], "self")
+        lines = every[1:]
         self.assertEqual(len(lines), 2)
         self.assertEqual(lines[0]["p"], "owner-clip\\a.bin")
         self.assertEqual(
@@ -309,7 +378,8 @@ class JournalTests(_Synthetic):
         proc = _run_pwsh_file(script)
         self.assertEqual(proc.returncode, 0, f"{proc.stdout}\n{proc.stderr}")
         entry_low = int(next(line for line in proc.stdout.splitlines() if line.startswith("ENTRY="))[len("ENTRY="):])
-        record = json.loads(journal.read_text(encoding="utf-8").splitlines()[0])
+        records = [json.loads(line) for line in journal.read_text(encoding="utf-8").splitlines()]
+        record = next(r for r in records if r.get("k") != "self")
         self.assertEqual(record["l"], entry_low)
         self.assertEqual(record["p"], "owner-" + "clip" + "\\" + "owner-" + "clip" + BASE_EXTENSION)
         self.assertEqual(original.read_bytes(), OLD_RECORDING)
@@ -432,38 +502,6 @@ class JournalledTreeTests(_Synthetic):
 
 
 @requires_pwsh
-class BuildScratchTreeTests(_Synthetic):
-    """The no-journal mode the build-route jobs use: per-entry handle deletes, never Remove-Item -Recurse."""
-
-    def test_a_tree_with_a_read_only_file_and_nested_directories_is_removed(self) -> None:
-        root = self.tmp / "scratch-root"
-        work = root / ".work-x"
-        (work / "a" / "b").mkdir(parents=True)
-        locked = work / "a" / "b" / "ro.bin"
-        locked.write_bytes(b"x")
-        os.chmod(locked, 0o444)
-        (work / "g.bin").write_bytes(b"y")
-        proc = self.run_with_module(f"Remove-AttrCudaTree -TrustedRoot '{root}' -Path '{work}'\n")
-        self.assertEqual(proc.returncode, 0, f"{proc.stdout}\n{proc.stderr}")
-        self.assertFalse(work.exists())
-
-    def test_a_file_that_cannot_be_deleted_fails_loudly_and_the_rest_of_the_tree_is_consistent(self) -> None:
-        root = self.tmp / "scratch-root2"
-        work = root / ".work-y"
-        work.mkdir(parents=True)
-        held = work / "held.bin"
-        held.write_bytes(b"held")
-        (work / "other.bin").write_bytes(b"other")
-        proc = self.run_with_module(
-            f"$h = [IO.File]::Open('{held}', [IO.FileMode]::Open, [IO.FileAccess]::Read, [IO.FileShare]::Read)\n"
-            + _guard(f"Remove-AttrCudaTree -TrustedRoot '{root}' -Path '{work}'")
-            + "$h.Dispose()\n")
-        self.assert_throws(proc, "ATTRCUDA_TREE_NOT_EMPTIED")
-        self.assertTrue(held.exists())
-        self.assertFalse((work / "other.bin").exists())
-
-
-@requires_pwsh
 class LongPathTests(_Synthetic):
     """fable r1 (ATTRCUDA-FILE-ID-LONG-PATH-1): the identity primitives take the extended-length prefix, so
     a scratch tree holding a 260+ character path is still deleted, not refused."""
@@ -472,6 +510,9 @@ class LongPathTests(_Synthetic):
 
     def _long_tree(self) -> tuple[Path, Path]:
         root = self.tmp / "long-root"
+        made = self.run_with_module(
+            f"[void](New-AttrCudaOwnedRoot -TrustedRoot '{self.tmp}' -Path '{root}' -OwnedJournal '{self.tmp / '.long-owned.jsonl'}')\n")
+        self.assertEqual(made.returncode, 0, f"{made.stdout}\n{made.stderr}")
         deep = root
         while len(str(deep)) < 300:
             deep = deep / ("segment-" + "x" * 24)
@@ -489,7 +530,8 @@ class LongPathTests(_Synthetic):
         proc = self.run_with_module(
             f"$id = Get-AttrCudaFileId -Path '{leaf}'\n"
             "Write-Output ('LINKS=' + $id.NumberOfLinks)\n"
-            f"Remove-AttrCudaTree -TrustedRoot '{self.tmp}' -Path '{root}'\n"
+            f"$r = Remove-AttrCudaTree -TrustedRoot '{self.tmp}' -Path '{root}' -OwnedJournal '{self.tmp / '.long-owned.jsonl'}'\n"
+            "Write-Output ('LEFT=' + @($r.Left).Count)\n"
             "Write-Output 'SWEPT'\n")
         self.assertEqual(proc.returncode, 0, f"{proc.stdout}\n{proc.stderr}")
         self.assertIn("LINKS=1", proc.stdout)

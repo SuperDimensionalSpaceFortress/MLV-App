@@ -527,11 +527,15 @@ $embeddedFunctions = Get-AttrCudaEmbeddedFunctionSource -Name @(
     'Initialize-AttrCudaFileIdNative',
     'ConvertTo-AttrCudaFileIdObject',
     'Get-AttrCudaFileId',
+    'Remove-AttrCudaFileByProof',
     'Remove-AttrCudaFileById',
     # OWNER-FOOTAGE-NO-HARDLINK-1 round 2: the creator-recorded ownership journal. Every view entry
     # and probe file is journalled from its creating handle; Remove-AttrCudaTree -OwnedJournal
-    # deletes only what the journal names.
+    # deletes only what the journal names (OWNER-FOOTAGE-NO-HARDLINK-2: the journal is MANDATORY there,
+    # and Read-AttrCudaOwnedJournal / Get-AttrCudaOwnershipProof are how it is read and resolved).
     'Add-AttrCudaOwnedRecord',
+    'Read-AttrCudaOwnedJournal',
+    'Get-AttrCudaOwnershipProof',
     # ATTR3-FOOTAGE-BIND-1 PR-B: the owner-clip content gate. Test-AttrCudaFootagePart is the
     # SAME function Attr3FootagePresenceJob.psm1 embeds for its own probe -- one definition,
     # spliced verbatim into both, never two copies that can drift apart.
