@@ -252,6 +252,7 @@ class JudgeRunner:
     judge_id = "unset"
     model = "unset"
     family = "unknown"
+    protected_paths = ()  # run_session sets this to the session dir; the scratch dir may not overlap it
 
     def identity(self):
         return {"judgeId": self.judge_id, "model": self.model, "family": self.family}
@@ -268,9 +269,31 @@ class CallableJudge(JudgeRunner):
         return self.fn(png_path, rubric_text)
 
 
-def _neutral_workdir(png_path):
-    """A fresh temp dir holding ONLY pair.png, so the judge cannot see sibling items or the answer key."""
+def _canon(path):
+    return os.path.normcase(os.path.realpath(path))
+
+
+def assert_isolated(work, protected_paths):
+    """Raise JudgeError when the judge's scratch dir is, contains, or sits inside any protected path (the session
+    directory: answer_key.json, source-frames/, sibling items). A scratch dir that overlaps the session cannot be
+    isolated from it, whatever flags the CLI is given."""
+    here = _canon(work)
+    for protected in protected_paths or ():
+        other = _canon(protected)
+        if here == other or here.startswith(other + os.sep) or other.startswith(here + os.sep):
+            raise JudgeError(f"the judge's scratch dir {work!r} overlaps the protected path {protected!r}: "
+                             "the judge could read what it must not see; set TMP/TEMP somewhere else")
+
+
+def _neutral_workdir(png_path, protected_paths=()):
+    """A fresh temp dir holding ONLY pair.png, so the judge cannot see sibling items or the answer key. Refuses
+    (before anything is copied) when that dir would overlap a protected path."""
     work = tempfile.mkdtemp(prefix="lookjudge-")
+    try:
+        assert_isolated(work, protected_paths)
+    except JudgeError:
+        _remove_workdir(work)
+        raise
     shutil.copyfile(png_path, os.path.join(work, "pair.png"))
     return work
 
@@ -298,11 +321,17 @@ class ClaudeCliJudge(JudgeRunner):
         self.extra_args = list(extra_args or [])
 
     def command(self):
+        """ISOLATION: --restricted ignores the user's, the project's and the local settings and confines the file
+        tools to the working directory (which holds only pair.png); --safe-mode switches off CLAUDE.md, hooks,
+        skills, plugins and MCP servers; --strict-mcp-config with no --mcp-config means no MCP server at all; no
+        --add-dir widens the roots. A CLI too old to know a flag exits non-zero (JudgeError), it does not run
+        unconfined."""
         return [self.claude_exe, "-p", "--model", self.model, "--tools", "Read", "--allowedTools", "Read",
+                "--restricted", "--safe-mode", "--strict-mcp-config",
                 "--no-session-persistence", "--disable-slash-commands", "--output-format", "json"] + self.extra_args
 
     def judge_image(self, png_path, rubric_text):
-        work = _neutral_workdir(png_path)
+        work = _neutral_workdir(png_path, self.protected_paths)
         try:
             proc = run_bounded(self.command(), input_text=build_prompt(rubric_text), cwd=work,
                                timeout=self.timeout_s)
@@ -340,14 +369,17 @@ class CodexExecJudge(JudgeRunner):
 
     def command(self, png_path, out_file, work):
         # The prompt goes on stdin: --image is variadic and would swallow a trailing positional prompt.
+        # ISOLATION: -C pins the working root to the scratch dir that holds only pair.png; --ignore-user-config and
+        # --ignore-rules keep the user's config.toml and rules (and anything they point at) out of the run. That is
+        # safe for the model choice because the model is passed with -m whenever it is known (see __init__).
         cmd = [self.codex_exe, "exec", "--image", png_path, "--sandbox", "read-only", "--skip-git-repo-check",
-               "--ephemeral", "-C", work, "-o", out_file]
+               "--ignore-user-config", "--ignore-rules", "--ephemeral", "-C", work, "-o", out_file]
         if self.model != CODEX_DEFAULT_MODEL:
             cmd[2:2] = ["-m", self.model]
         return cmd
 
     def judge_image(self, png_path, rubric_text):
-        work = _neutral_workdir(png_path)
+        work = _neutral_workdir(png_path, self.protected_paths)
         out_file = os.path.join(work, "last-message.txt")
         try:
             proc = run_bounded(
@@ -480,6 +512,7 @@ def run_session(session_dir, runner, workers=3, deadline_s=500, max_items=None, 
         raise JudgeError("the pair images on disk do not match the digests the session recorded: "
                          "the session was changed after it was built; rebuild it")
     rubric_text = look_config.load_rubric_text(rubric_path)
+    runner.protected_paths = [os.path.abspath(session_dir)]  # the judge's scratch dir may never overlap the session
     out_path = results_path(session_dir, runner.judge_id)
     existing = _load_json(out_path)
     if existing is not None and existing.get("judge") != runner.identity():

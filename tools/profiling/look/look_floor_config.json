@@ -55,7 +55,7 @@
     },
     "skin_hue_drift_deg_max": {
       "value": 5.0,
-      "reason": "DESIGN.md B3: skin-hue drift <= ~5 degrees where skin is present. A drift needs a baseline (the same frame without the look, or the other backend): absolute skin hue varies by subject, so with no reference frame the check is NOT_APPLICABLE and the absolute offset is only reported."
+      "reason": "DESIGN.md B3: skin-hue drift <= ~5 degrees where skin is present. A drift needs a baseline (the same frame without the look, or the other backend): absolute skin hue varies by subject, so when NO baseline was requested the check is NOT_APPLICABLE and the absolute offset is only reported; when a baseline WAS requested (--baseline-dir) a subject frame without its baseline frame is NOT_EVALUABLE and the sheet INCOMPLETE, never a pass."
     },
     "skin_region_retain_fraction": {
       "value": 0.5,
@@ -63,7 +63,7 @@
     },
     "skin_baseline_crop_tolerance_px": {
       "value": 4,
-      "reason": "Drift is measured over the BASELINE's skin mask when the two active areas match after a centre crop of at most this many pixels per axis (a downscaled thumbnail keeps an anti-aliased edge row). Beyond that the mask cannot be aligned and the drift falls back to each frame's own region, which the verdict records (maskBasis)."
+      "reason": "Drift is measured over the BASELINE's skin mask when the two active areas match after a centre crop of at most this many pixels per axis (a downscaled thumbnail keeps an anti-aliased edge row). Beyond that the two masks cannot be laid over each other and the skin check is NOT_EVALUABLE (SKIN_MASKS_NOT_ALIGNABLE, so the sheet is INCOMPLETE): comparing each frame's own region instead could miss a partial skin move."
     }
   },
   "skin": {
@@ -158,6 +158,10 @@
     "min_consistent_units": {
       "value": 4,
       "reason": "A judge's preference is readable only with at least this many real units whose two orderings agree. Under a coin-flip judge a unanimous 3-unit vote happens 25% of the time and a 2-unit one 50%; 4 is the smallest floor that rules out the degenerate sessions. It is NOT a significance claim: a 4-0 vote still has an exact two-sided p of 0.125, which the entry reports as votePValue."
+    },
+    "max_discarded_unit_fraction": {
+      "value": 0.34,
+      "reason": "Ceiling on the share of judged real units whose votes were discarded (an order flip, or a tie in one ordering and a pick in the other). A judge that follows the picture discards none; one that follows the slot discards about half. Without a ceiling, 4 agreeing units beside 4 flipped ones was 'usable' because the slot test is diluted by the agreeing votes (round-2 review, fable H3). 0.34 admits 4 agreeing + 2 discarded (1/3, the mild case seen in the round-2 demo) and refuses 4 + 4 (1/2). Provisional and uncalibrated, like every threshold here."
     }
   },
   "judge_disagreement": {

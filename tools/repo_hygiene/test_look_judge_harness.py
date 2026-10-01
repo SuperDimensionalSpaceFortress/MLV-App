@@ -69,12 +69,21 @@ def _sources(tmp, name, frames, tag="v1"):
     return out
 
 
-def build_fake_session(tmp, tag="v1", frames=range(5), controls=1, positive=1, subdir="session", **kw):
+def fake_capture(names=("cuda", "cpu")):
+    """What look_cli records about how the frames were prepared (policy, crops, config digest)."""
+    return {"configSha256": META["configSha256"], "configVersion": META["configVersion"],
+            "letterboxPolicy": {n: {"mode": "off", "declared": None} for n in names},
+            "frameCrops": [], "commonCrops": [], "commonCropTolerancePx": 2}
+
+
+def build_fake_session(tmp, tag="v1", frames=range(5), controls=1, positive=1, subdir="session", extra_frame_ids=(),
+                       **kw):
     out = os.path.join(tmp, subdir)
     a = {"name": "cuda", "frames": _sources(tmp, "cuda", frames, tag)}
     b = {"name": "cpu", "frames": _sources(tmp, "cpu", frames, tag)}
-    look_pairs.build_session(a, b, list(frames), SEED, out, RUBRIC, controls=controls, positive_controls=positive,
-                             compose=_fake_compose, degrade=_fake_degrade, **kw)
+    kw.setdefault("capture", fake_capture())
+    look_pairs.build_session(a, b, list(frames) + list(extra_frame_ids), SEED, out, RUBRIC, controls=controls,
+                             positive_controls=positive, compose=_fake_compose, degrade=_fake_degrade, **kw)
     return out
 
 
@@ -130,10 +139,11 @@ class Fixture:
     def answers(self, rule):
         return {it["itemId"]: verdict_for(it, rule(it)) for it in self.key["items"]}
 
-    def tally(self, answers, **kw):
+    def tally(self, answers, cfg=None, **kw):
         kw.setdefault("current_image_sha256", self.current)
         kw.setdefault("forbidden_models", FORBIDDEN)
-        return look_tally.tally(self.key, answers, JUDGE, self.session, CFG, **kw)
+        kw.setdefault("config_sha256", META["configSha256"])
+        return look_tally.tally(self.key, answers, JUDGE, self.session, cfg or CFG, **kw)
 
     def judge_fn(self, rule, counter=None):
         by_id = {it["itemId"]: it for it in self.key["items"]}
@@ -222,6 +232,66 @@ class ConfigTests(TmpCase):
         with self.assertRaises(look_config.ConfigError):
             look_config.validate_config(doc)
 
+    # -- LOOK-METRICS-JUDGE-2 item 5 (fable H6): a {value, reason} with the WRONG TYPE of value is refused ----------
+    _WRONG = {
+        "bool": ["false", "true", 1, 0, None, [True]],
+        "int": ["3", 3.5, True, None, [3]],
+        "number": ["1.0", True, None, [1.0]],
+        "number_or_null": ["1.0", True, [1.0]],
+        "range2": ["[0, 50]", [0], [1, 2, 3], [50, 0], ["a", "b"], [True, 1], None, 5],
+    }
+
+    def _set(self, doc, path, value):
+        node = doc
+        parts = path.split(".")
+        for part in parts[:-1]:
+            node = node[part]
+        node[parts[-1]]["value"] = value
+
+    def test_every_required_threshold_has_a_declared_type(self):
+        self.assertEqual(set(look_config.THRESHOLD_TYPES), set(look_config.REQUIRED_THRESHOLDS))
+
+    def test_a_wrongly_typed_value_is_refused_at_EVERY_threshold(self):
+        for path, spec in look_config.THRESHOLD_TYPES.items():
+            for bad in self._WRONG[spec[0]]:
+                with self.subTest(path=path, bad=bad):
+                    doc = self._doc()
+                    self._set(doc, path, bad)
+                    with self.assertRaises(look_config.ConfigError):
+                        look_config.validate_config(doc)
+
+    def test_fable_r2_repro_a_reasoned_string_false_does_not_turn_symmetric_exclusion_on(self):
+        doc = self._doc()
+        doc["letterbox"]["auto_exclude_symmetric"] = {"value": "false", "reason": "x"}
+        path = os.path.join(self.tmp, "cfg.json")
+        write_json(path, doc)
+        with self.assertRaises(look_config.ConfigError):
+            look_config.load_config(path)
+
+    def test_out_of_range_values_are_refused(self):
+        for path, bad in (("slot_bias.alpha", 0), ("slot_bias.alpha", 1), ("slot_bias.alpha", 2),
+                          ("frame.skin_region_retain_fraction", 1.5), ("frame.skin_region_retain_fraction", -0.1),
+                          ("slot_bias.min_choices", 0), ("letterbox.bar_max_code", 300),
+                          ("pair.geometry_tolerance_px", -1), ("pair.scopes.shader-subset.ssim_min", 2),
+                          ("judge_validity.min_consistent_units", 0),
+                          ("judge_validity.max_discarded_unit_fraction", 1.01),
+                          ("frame.clipped_highlight_pct_max", 101), ("skin.sat_range", [0.5, 1.5]),
+                          ("judge_disagreement.third_judge_points", 0)):
+            with self.subTest(path=path, bad=bad):
+                doc = self._doc()
+                self._set(doc, path, bad)
+                with self.assertRaises(look_config.ConfigError):
+                    look_config.validate_config(doc)
+
+    def test_the_shipped_config_satisfies_its_own_type_spec_and_null_is_allowed_only_where_declared(self):
+        doc = self._doc()
+        look_config.validate_config(doc)
+        self._set(doc, "pair.scopes.shader-subset.max_abs_delta_max", 12)
+        look_config.validate_config(doc)
+        self._set(doc, "pair.scopes.shader-subset.mismatch_fraction_max", None)
+        with self.assertRaises(look_config.ConfigError):
+            look_config.validate_config(doc)
+
     def test_design_thresholds_are_the_ruled_ones_and_the_version_reaches_meta(self):
         self.assertEqual(CFG["frame"]["clipped_highlight_pct_max"], 1.0)  # B3: <= 1%
         self.assertEqual(CFG["frame"]["crushed_shadow_pct_max"], 2.0)     # B3: <= 2%
@@ -299,6 +369,77 @@ class CiPinsTests(unittest.TestCase):
                 at = next(i for i, ln in enumerate(lines) if ln.startswith(f"{package}=="))
                 self.assertTrue(lines[at].endswith("\\"))
                 self.assertTrue(lines[at + 1].strip().startswith("--hash=sha256:"))
+
+    # -- LOOK-METRICS-JUDGE-2 item 6 (fable H5): the dispatch-only build workflows install the same lock ----------------
+    _RUNNER_PLATFORM = {   # runner label -> substrings that identify a wheel the runner's pip can install
+        "windows-latest": ("win_amd64",),
+        "ubuntu-24.04": ("manylinux", "x86_64"),
+        "ubuntu-latest": ("manylinux", "x86_64"),
+        "macos-15-intel": ("macosx", "x86_64"),
+        "macos-15": ("macosx", "arm64"),
+    }
+
+    def _proof(self):
+        return json.loads(self._read("tools", "profiling", "look", "ci_wheel_proof.json"))
+
+    def _lock_hash_count(self, package):
+        lines = self._read(".github", "requirements", "repo-hygiene.txt").splitlines()
+        at = next(i for i, ln in enumerate(lines) if ln.lower().startswith(f"{package}=="))
+        count = 0
+        for ln in lines[at:]:
+            if count and not ln.startswith(" "):
+                break
+            count += ln.count("--hash=sha256:")
+        return count
+
+    def test_every_runner_that_installs_the_hygiene_lock_is_covered_by_the_wheel_proof(self):
+        import re
+        proof = self._proof()
+        workflows = os.path.join(_REPO_ROOT, ".github", "workflows")
+        installers, labels = [], set()
+        for name in sorted(os.listdir(workflows)):
+            text = self._read(".github", "workflows", name) if name.endswith(".yml") else ""
+            if not any("repo-hygiene.txt" in ln and "pip install" in ln for ln in text.splitlines()):
+                continue
+            installers.append(name)
+            labels |= set(re.findall(r"runs-on:\s*([A-Za-z0-9._-]+)", text))
+            for group in re.findall(r"^\s+os:\s*\[([^\]]+)\]", text, re.M):
+                labels |= {x.strip() for x in group.split(",")}
+        self.assertEqual(len(installers), 5)  # tests.yml + the four dispatch-only build workflows
+        labels = {l for l in labels if "$" not in l and "{" not in l}
+        self.assertTrue({"windows-latest", "ubuntu-24.04", "macos-15-intel", "macos-15"} <= labels, labels)
+        for label in sorted(labels):
+            with self.subTest(runner=label):
+                self.assertIn(label, self._RUNNER_PLATFORM, "a new runner needs its numpy/Pillow wheels proven")
+                tags = self._RUNNER_PLATFORM[label]
+                for package in ("numpy", "pillow"):
+                    wheels = proof["packages"][package]["cp313Wheels"]
+                    self.assertTrue(any(all(t in w for t in tags) for w in wheels), (package, tags))
+
+    def test_the_lock_hashes_every_file_the_proof_lists_so_no_runner_falls_back_to_a_source_build(self):
+        proof = self._proof()
+        for package in ("numpy", "pillow"):
+            with self.subTest(package):
+                self.assertEqual(proof["packages"][package]["version"],
+                                 next(ln for ln in self._read(".github", "requirements", "repo-hygiene.txt").splitlines()
+                                      if ln.lower().startswith(f"{package}==")).split("==")[1].split()[0])
+                self.assertEqual(self._lock_hash_count(package), proof["packages"][package]["allFilesCount"])
+        self.assertTrue(self._read(".python-version").strip().startswith("3.13"))
+
+    def test_every_installer_uses_only_binary_and_require_hashes(self):
+        workflows = os.path.join(_REPO_ROOT, ".github", "workflows")
+        for name in sorted(os.listdir(workflows)):
+            text = self._read(".github", "workflows", name) if name.endswith(".yml") else ""
+            for line in text.splitlines():
+                if "repo-hygiene.txt" in line and "pip install" in line:
+                    with self.subTest(workflow=name):
+                        self.assertIn("--only-binary=:all:", line)
+                        self.assertIn("--require-hashes", line)
+
+    def test_the_readme_no_longer_claims_judges_see_exactly_what_the_floor_measured(self):
+        readme = self._read("tools", "profiling", "look", "README.md")
+        self.assertNotIn("so the judges see exactly what the floor measured", readme)
+        self.assertIn("capture", readme)
 
     def test_in_hosted_ci_the_pixel_dependencies_are_installed_so_nothing_is_skipped(self):
         if os.environ.get("GITHUB_ACTIONS") == "true":
@@ -664,8 +805,7 @@ class TallyTests(TmpCase):
         self.assertEqual(entry["preference"]["winner"], "UNUSABLE")
         lowered = copy.deepcopy(CFG)
         lowered["judge_validity"]["min_consistent_units"] = 3
-        entry = look_tally.tally(fx.key, fx.answers(faithful("cpu")), JUDGE, fx.session, lowered,
-                                 current_image_sha256=fx.current, forbidden_models=FORBIDDEN)
+        entry = fx.tally(fx.answers(faithful("cpu")), cfg=lowered)
         self.assertTrue(entry["usable"], entry["unusableReasons"])  # the config, not a constant, decides
 
     # -- the positive control -------------------------------------------------------------------------
@@ -893,7 +1033,8 @@ class TallyCliTests(TmpCase):
 
     def test_third_judge_points_comes_from_the_config_file(self):
         def entry(judge_id, value):
-            return {"judgeId": judge_id, "usable": True, "scores": {"cpu": {"colour_cast": value}}}
+            return {"judgeId": judge_id, "usable": True, "scores": {"cpu": {"colour_cast": value}},
+                    "rubricSha256": RUBRIC, "orderSeed": SEED, "imageSha256s": ["a" * 64]}
         a, b = os.path.join(self.tmp, "a.json"), os.path.join(self.tmp, "b.json")
         write_json(a, entry("a", 3.0))
         write_json(b, entry("b", 3.8))
@@ -1191,7 +1332,340 @@ class PairImageTests(TmpCase):
             self.assertEqual(im.getpixel((look_pairs.MARGIN_PX + 5, look_pairs.MARGIN_PX + 2 + 5)), (250, 0, 0))
 
 
-@unittest.skipUnless(_HAS_PIL, "Pillow is not installed on this host")
+LOSS =[{"frameId": 9, "reason": "UNSHARED: frame exists only in cuda"}]
+
+
+class DroppedFrameTests(TmpCase):
+    """LOOK-METRICS-JUDGE-2 item 3: a session built with LOST frames is marked so, and the tally treats an
+    unacknowledged loss as unusable unless an allowance (with a reason) is recorded in the session and the entry.
+    Frames the caller chose to leave out (--frame-ids, --max-frames) are a selection, not a loss."""
+
+    def _fx(self, **kw):
+        return Fixture(self.tmp, **kw)
+
+    def test_the_session_marks_lost_frames_and_the_allowance_is_absent_by_default(self):
+        fx = self._fx(dropped_frames=LOSS)
+        self.assertEqual(fx.session["droppedFramePolicy"],
+                         {"lossFrameIds": [9], "selectionFrameIds": [], "allowance": None})
+
+    def test_an_unacknowledged_loss_makes_a_faithful_judge_unusable_and_withholds_the_winner(self):
+        fx = self._fx(dropped_frames=LOSS)
+        entry = fx.tally(fx.answers(faithful("cpu")))
+        self.assertFalse(entry["usable"])
+        self.assertIn("UNACKNOWLEDGED_DROPPED_FRAMES", entry["unusableReasons"])
+        self.assertEqual(entry["preference"]["winner"], "UNUSABLE")
+        self.assertEqual(entry["droppedFrames"], LOSS)
+
+    def test_an_explicit_allowance_recorded_with_a_reason_makes_it_usable_and_travels_in_the_entry(self):
+        fx = self._fx(dropped_frames=LOSS, drop_allowance="frame 9 was never captured on the CUDA side (owner-known)")
+        entry = fx.tally(fx.answers(faithful("cpu")))
+        self.assertTrue(entry["usable"], entry["unusableReasons"])
+        self.assertEqual(entry["droppedFrameAllowance"]["reason"], "frame 9 was never captured on the CUDA side (owner-known)")
+        self.assertEqual(entry["droppedFrameAllowance"]["frameIds"], [9])
+        self.assertEqual(entry["droppedFrames"], LOSS)
+
+    def test_a_blank_allowance_is_refused_at_build_time(self):
+        for blank in ("", "   ", 5):
+            with self.subTest(blank=blank):
+                with self.assertRaises(ValueError):
+                    build_fake_session(self.tmp, subdir=f"s-{blank!r}".replace("'", ""), dropped_frames=LOSS,
+                                       drop_allowance=blank)
+
+    def test_a_blank_allowance_edited_into_the_session_does_not_count(self):
+        fx = self._fx(dropped_frames=LOSS, drop_allowance="ok")
+        fx.session["droppedFramePolicy"]["allowance"]["reason"] = "  "
+        entry = fx.tally(fx.answers(faithful("cpu")))
+        self.assertIn("UNACKNOWLEDGED_DROPPED_FRAMES", entry["unusableReasons"])
+
+    def test_an_allowance_that_does_not_cover_every_lost_frame_does_not_count(self):
+        fx = self._fx(dropped_frames=LOSS, drop_allowance="ok")
+        fx.session["droppedFramePolicy"]["allowance"]["frameIds"] = []
+        entry = fx.tally(fx.answers(faithful("cpu")))
+        self.assertIn("UNACKNOWLEDGED_DROPPED_FRAMES", entry["unusableReasons"])
+
+    def test_chosen_exclusions_are_a_selection_not_a_loss(self):
+        fx = self._fx(dropped_frames=[{"frameId": 7, "reason": "NOT_IN_--frame-ids"},
+                                      {"frameId": 8, "reason": "BEYOND_--max-frames=5"}])
+        self.assertEqual(fx.session["droppedFramePolicy"]["lossFrameIds"], [])
+        self.assertEqual(fx.session["droppedFramePolicy"]["selectionFrameIds"], [7, 8])
+        entry = fx.tally(fx.answers(faithful("cpu")))
+        self.assertTrue(entry["usable"], entry["unusableReasons"])
+
+    def test_an_unknown_drop_reason_is_a_loss_not_a_selection(self):
+        fx = self._fx(dropped_frames=[{"frameId": 7, "reason": "SOMETHING_NEW"}])
+        self.assertEqual(fx.session["droppedFramePolicy"]["lossFrameIds"], [7])
+
+    def test_a_requested_frame_missing_from_a_subject_is_a_loss(self):
+        fx = self._fx(extra_frame_ids=[99])  # asked for, present in neither subject: the plan drops it
+        self.assertEqual([d["reason"] for d in fx.key["droppedFrames"]], ["NOT_IN_BOTH_SUBJECTS"])
+        self.assertEqual(fx.session["droppedFramePolicy"]["lossFrameIds"], [99])
+        self.assertIn("UNACKNOWLEDGED_DROPPED_FRAMES", fx.tally(fx.answers(faithful("cpu")))["unusableReasons"])
+
+    def test_erasing_the_loss_from_the_session_is_caught_against_the_key(self):
+        fx = self._fx(dropped_frames=LOSS)
+        fx.session["droppedFramePolicy"]["lossFrameIds"] = []
+        entry = fx.tally(fx.answers(faithful("cpu")))
+        self.assertFalse(entry["usable"])
+        self.assertIn("DROPPED_FRAME_POLICY_MISMATCH", entry["unusableReasons"])
+
+    def test_a_session_with_no_recorded_policy_cannot_prove_nothing_was_dropped(self):
+        fx = self._fx()
+        del fx.session["droppedFramePolicy"]
+        entry = fx.tally(fx.answers(faithful("cpu")))
+        self.assertIn("DROPPED_FRAME_POLICY_NOT_RECORDED", entry["unusableReasons"])
+
+    def test_a_session_with_nothing_dropped_is_usable(self):
+        fx = self._fx()
+        self.assertTrue(fx.tally(fx.answers(faithful("cpu")))["usable"])
+        self.assertEqual(fx.session["droppedFramePolicy"]["lossFrameIds"], [])
+
+
+class CaptureRecordTests(TmpCase):
+    """LOOK-METRICS-JUDGE-2 item 5: the letterbox policy, the per-frame crops and the config digest used to prepare
+    the judged frames are recorded in session.json, answer_key.json and the tally entry, and a tally run against a
+    different config than the session was built with is unusable."""
+
+    def test_session_and_key_carry_the_capture_record_and_the_entry_copies_it(self):
+        fx = Fixture(self.tmp)
+        self.assertEqual(fx.session["capture"], fake_capture())
+        self.assertEqual(fx.key["capture"], fx.session["capture"])
+        entry = fx.tally(fx.answers(faithful("cpu")))
+        self.assertTrue(entry["usable"], entry["unusableReasons"])
+        self.assertEqual(entry["capture"], fx.session["capture"])
+        self.assertEqual(entry["configSha256"], META["configSha256"])
+        self.assertEqual(entry["sessionConfigSha256"], META["configSha256"])
+
+    def test_a_session_without_a_capture_record_is_unusable(self):
+        fx = Fixture(self.tmp)
+        fx.session["capture"] = None
+        self.assertIn("CAPTURE_NOT_RECORDED", fx.tally(fx.answers(faithful("cpu")))["unusableReasons"])
+        for missing in ("configSha256", "letterboxPolicy", "frameCrops", "commonCrops"):
+            with self.subTest(missing):
+                fx2 = Fixture(self.tmp, subdir=f"s-{missing}")
+                del fx2.session["capture"][missing]
+                self.assertIn("CAPTURE_NOT_RECORDED", fx2.tally(fx2.answers(faithful("cpu")))["unusableReasons"])
+
+    def test_a_key_whose_capture_differs_from_the_sessions_is_unusable(self):
+        fx = Fixture(self.tmp)
+        fx.key["capture"]["letterboxPolicy"]["cuda"] = {"mode": "auto-symmetric", "declared": None}
+        self.assertIn("CAPTURE_SESSION_KEY_MISMATCH", fx.tally(fx.answers(faithful("cpu")))["unusableReasons"])
+
+    def test_tallying_under_another_config_than_the_session_was_built_with_is_unusable(self):
+        fx = Fixture(self.tmp)
+        entry = fx.tally(fx.answers(faithful("cpu")), config_sha256="0" * 64)
+        self.assertIn("CONFIG_DIFFERS_FROM_SESSION", entry["unusableReasons"])
+        self.assertEqual(entry["preference"]["winner"], "UNUSABLE")
+
+    def test_not_passing_the_config_digest_is_itself_unusable(self):
+        fx = Fixture(self.tmp)
+        entry = fx.tally(fx.answers(faithful("cpu")), config_sha256=None)
+        self.assertIn("CONFIG_SHA_NOT_VERIFIED", entry["unusableReasons"])
+
+    def test_the_tally_cli_passes_the_config_digest_and_refuses_an_edited_config(self):
+        fx = Fixture(self.tmp)
+        runner = look_judges.CallableJudge(fx.judge_fn(faithful("cpu")), "cj", "claude-fable-5-1", "anthropic")
+        summary = look_judges.run_session(fx.dir, runner)
+        out = os.path.join(self.tmp, "t.json")
+        argv = ["tally", "--session-dir", fx.dir, "--results", summary["resultsPath"], "--out", out,
+                "--producer-model", "claude-sonnet-5-5"]
+        with contextlib.redirect_stdout(io.StringIO()):
+            self.assertEqual(look_cli.main(argv), 0)
+            doc = read_json(look_config.CONFIG_PATH)
+            doc["slot_bias"]["alpha"]["value"] = 0.2  # a tweak that would change which judges are 'biased'
+            cfg_path = os.path.join(self.tmp, "edited.json")
+            write_json(cfg_path, doc)
+            self.assertEqual(look_cli.main(argv + ["--config", cfg_path]), 2)
+        self.assertIn("CONFIG_DIFFERS_FROM_SESSION", read_json(out)["unusableReasons"])
+
+
+class FlipCeilingTests(TmpCase):
+    """LOOK-METRICS-JUDGE-2 item 5 (fable H3): a judge that follows the slot on many units is not usable merely
+    because four units happen to agree. The ceiling is a config value with a reason."""
+
+    @staticmethod
+    def _rule(consistent_below, flip_style="left"):
+        def rule(item):
+            if item["kind"] != "real" or item["frame"] < consistent_below:
+                return faithful("cpu")(item)
+            if flip_style == "tie-split":
+                return "tie" if item["order"] == 1 else faithful("cpu")(item)
+            return "left"
+        return rule
+
+    def test_four_agreeing_units_beside_four_flips_are_unusable(self):
+        fx = Fixture(self.tmp, frames=range(8))
+        entry = fx.tally(fx.answers(self._rule(4)))
+        self.assertEqual((entry["preference"]["consistentUnits"], entry["preference"]["discardedFlips"]), (4, 4))
+        self.assertFalse(entry["usable"])
+        self.assertIn("TOO_MANY_DISCARDED_UNITS", entry["unusableReasons"])
+        self.assertEqual(entry["preference"]["discardedUnitFraction"], 0.5)
+        self.assertEqual(entry["preference"]["maxDiscardedUnitFraction"], CFG["judge_validity"]["max_discarded_unit_fraction"])
+
+    def test_tie_splits_count_toward_the_ceiling_too(self):
+        fx = Fixture(self.tmp, frames=range(8))
+        entry = fx.tally(fx.answers(self._rule(4, "tie-split")))
+        self.assertEqual(entry["preference"]["discardedTieSplits"], 4)
+        self.assertIn("TOO_MANY_DISCARDED_UNITS", entry["unusableReasons"])
+
+    def test_two_flips_beside_four_agreeing_units_sit_at_the_ceiling_and_pass(self):
+        fx = Fixture(self.tmp, frames=range(6))
+        entry = fx.tally(fx.answers(self._rule(4)))
+        self.assertEqual(entry["preference"]["discardedFlips"], 2)
+        self.assertNotIn("TOO_MANY_DISCARDED_UNITS", entry["unusableReasons"])
+        self.assertTrue(entry["usable"], entry["unusableReasons"])
+
+    def test_the_ceiling_is_the_configs_not_a_constant(self):
+        fx = Fixture(self.tmp, frames=range(8))
+        loose = copy.deepcopy(CFG)
+        loose["judge_validity"]["max_discarded_unit_fraction"] = 0.6
+        self.assertTrue(fx.tally(fx.answers(self._rule(4)), cfg=loose)["usable"])
+        tight = copy.deepcopy(CFG)
+        tight["judge_validity"]["max_discarded_unit_fraction"] = 0.0
+        fx6 = Fixture(self.tmp, frames=range(6), subdir="s6")
+        self.assertIn("TOO_MANY_DISCARDED_UNITS", fx6.tally(fx6.answers(self._rule(4)), cfg=tight)["unusableReasons"])
+
+    def test_a_clean_judge_has_a_zero_fraction(self):
+        fx = Fixture(self.tmp)
+        self.assertEqual(fx.tally(fx.answers(faithful("cpu")))["preference"]["discardedUnitFraction"], 0.0)
+
+
+class DisagreementSessionTests(TmpCase):
+    """LOOK-METRICS-JUDGE-2 item 5: judge-disagreement only compares entries that judged the SAME session and rubric."""
+
+    def setUp(self):
+        super().setUp()
+        self.fx = Fixture(self.tmp)
+        self.a = self.fx.tally(self.fx.answers(faithful("cpu")))
+        self.b = json.loads(json.dumps(self.a))
+        self.b["judgeId"] = "j2"
+
+    def test_entries_from_one_session_and_rubric_are_comparable(self):
+        verdict = look_tally.judge_disagreement([self.a, self.b], 1.0)
+        self.assertTrue(verdict["comparable"])
+        self.assertEqual(verdict["sessionMismatches"], [])
+
+    def test_a_different_rubric_seed_or_image_set_is_not_comparable(self):
+        for field, value in (("rubricSha256", "f" * 64), ("orderSeed", "another-seed"), ("imageSha256s", ["a" * 64])):
+            with self.subTest(field):
+                other = json.loads(json.dumps(self.b))
+                other[field] = value
+                verdict = look_tally.judge_disagreement([self.a, other], 1.0)
+                self.assertFalse(verdict["comparable"])
+                self.assertEqual(verdict["sessionMismatches"], [field])
+
+    def test_an_entry_missing_the_session_fields_is_not_comparable(self):
+        other = json.loads(json.dumps(self.b))
+        del other["rubricSha256"]
+        verdict = look_tally.judge_disagreement([self.a, other], 1.0)
+        self.assertFalse(verdict["comparable"])
+        self.assertIn("rubricSha256", verdict["sessionMismatches"])
+
+    def test_the_cli_exits_non_zero_for_entries_of_different_sessions(self):
+        paths = []
+        for name, doc in (("a", self.a), ("b", dict(self.b, orderSeed="other"))):
+            paths.append(os.path.join(self.tmp, name + ".json"))
+            write_json(paths[-1], doc)
+        with contextlib.redirect_stdout(io.StringIO()) as out:
+            code = look_cli.main(["judge-disagreement", "--entries", *paths])
+        self.assertEqual(code, 2)
+        self.assertIn("orderSeed", out.getvalue())
+
+
+class JudgeIsolationTests(TmpCase):
+    """LOOK-METRICS-JUDGE-2 item 5 (fable H4, sol hardening): the judge process runs in a directory that holds only
+    pair.png, with the file tools confined to it and no inherited settings or MCP servers, and it refuses to run if
+    that directory could contain (or sit inside) the session. The CLIs' own enforcement is a live property, proved
+    once by hand (see the PR); what CI pins is that this lane asks for it and that nothing about the session leaks."""
+
+    def setUp(self):
+        super().setUp()
+        self.session = os.path.join(self.tmp, "session")
+        os.makedirs(os.path.join(self.session, "source-frames"))
+        for name in ("answer_key.json", os.path.join("source-frames", "cuda-00.png")):
+            with open(os.path.join(self.session, name), "wb") as handle:
+                handle.write(b"CANARY-ANSWER-KEY")
+        self.png = os.path.join(self.session, "pair.png")
+        with open(self.png, "wb") as handle:
+            handle.write(b"PNG-BYTES")
+        self.seen = {}
+
+    def _fake_run(self, stdout_doc):
+        def fake(argv, input_text=None, cwd=None, timeout=300, grace_s=5):
+            self.seen.update(argv=list(argv), cwd=cwd, listing=sorted(os.listdir(cwd)), input=input_text)
+            return subprocess.CompletedProcess(argv, 0, stdout_doc, "")
+        return fake
+
+    def _verdict_json(self):
+        return json.dumps({"left": _scores(), "right": _scores(), "preference": "tie"})
+
+    def _assert_nothing_leaks(self):
+        blob = json.dumps(self.seen["argv"]) + (self.seen["input"] or "")
+        for needle in (self.session, "answer_key", "source-frames", "CANARY"):
+            self.assertNotIn(needle, blob)
+        cwd = os.path.realpath(self.seen["cwd"])
+        sess = os.path.realpath(self.session)
+        self.assertFalse(cwd == sess or cwd.startswith(sess + os.sep) or sess.startswith(cwd + os.sep))
+
+    def test_claude_runs_in_a_directory_holding_only_pair_png_with_confined_tools_and_no_inherited_context(self):
+        judge = look_judges.ClaudeCliJudge("claude-fable-5-1", claude_exe="claude")
+        judge.protected_paths = [self.session]
+        with mock.patch.object(look_judges, "run_bounded",
+                               self._fake_run(json.dumps({"result": self._verdict_json()}))):
+            judge.judge_image(self.png, "RUBRIC")
+        self.assertEqual(self.seen["listing"], ["pair.png"])
+        argv = self.seen["argv"]
+        for flag in ("--restricted", "--safe-mode", "--strict-mcp-config", "--disable-slash-commands",
+                     "--no-session-persistence"):
+            self.assertIn(flag, argv)
+        self.assertNotIn("--mcp-config", argv)
+        self.assertNotIn("--add-dir", argv)
+        self.assertEqual(argv[argv.index("--tools") + 1], "Read")
+        self.assertEqual(argv[argv.index("--allowedTools") + 1], "Read")
+        self._assert_nothing_leaks()
+
+    def test_codex_runs_in_a_directory_holding_only_pair_png_with_no_user_config_or_rules(self):
+        judge = look_judges.CodexExecJudge(model="gpt-x", codex_exe="codex")
+        judge.protected_paths = [self.session]
+        with mock.patch.object(look_judges, "run_bounded", self._fake_run("")):
+            with self.assertRaises(look_judges.JudgeError):  # no verdict JSON in the canned reply: fine, we read argv
+                judge.judge_image(self.png, "RUBRIC")
+        self.assertEqual(self.seen["listing"], ["pair.png"])
+        argv = self.seen["argv"]
+        for flag in ("--ignore-user-config", "--ignore-rules", "--ephemeral"):
+            self.assertIn(flag, argv)
+        self.assertEqual(argv[argv.index("-C") + 1], self.seen["cwd"])
+        self.assertEqual(argv[argv.index("--sandbox") + 1], "read-only")
+        self.assertNotIn("--add-dir", argv)
+        self._assert_nothing_leaks()
+
+    def test_a_scratch_dir_inside_the_session_is_refused_before_any_process_starts(self):
+        for judge in (look_judges.ClaudeCliJudge("claude-fable-5-1", claude_exe="claude"),
+                      look_judges.CodexExecJudge(model="gpt-x", codex_exe="codex")):
+            with self.subTest(type(judge).__name__):
+                judge.protected_paths = [self.session]
+                started = []
+                with mock.patch.object(look_judges, "run_bounded", lambda *a, **k: started.append(1)), \
+                        mock.patch.object(tempfile, "tempdir", os.path.join(self.session, "source-frames")):
+                    with self.assertRaises(look_judges.JudgeError):
+                        judge.judge_image(self.png, "RUBRIC")
+                self.assertEqual(started, [])
+
+    def test_assert_isolated_refuses_a_scratch_dir_that_contains_is_inside_or_is_a_protected_path(self):
+        scratch = os.path.join(self.tmp, "scratch")
+        for protected in (os.path.join(scratch, "nested"), scratch, self.tmp):
+            with self.subTest(protected=os.path.relpath(protected, self.tmp)):
+                with self.assertRaises(look_judges.JudgeError):
+                    look_judges.assert_isolated(scratch, [protected])
+        look_judges.assert_isolated(scratch, [os.path.join(self.tmp, "elsewhere")])  # disjoint: fine
+
+    def test_run_session_tells_every_runner_which_paths_are_protected(self):
+        fx = Fixture(self.tmp, subdir="sess2")
+        runner = look_judges.CallableJudge(fx.judge_fn(faithful("cpu")), "cj", "claude-fable-5-1", "anthropic")
+        look_judges.run_session(fx.dir, runner)
+        self.assertEqual(runner.protected_paths, [os.path.abspath(fx.dir)])
+
+
+@unittest.skipUnless(_HAS_DEPS, "numpy/Pillow are not installed on this host")
 class BuildSessionCliTests(TmpCase):
     """ITEM 8: a frame that is not judged is recorded with a reason, never silently dropped; ITEM 4 for build-session."""
 
@@ -1218,7 +1692,8 @@ class BuildSessionCliTests(TmpCase):
 
     def test_dropped_frames_are_recorded_with_reasons_and_the_crop_tolerance(self):
         code, out, stdout, stderr = self._build(["--common-crop-tolerance-px", "2"])
-        self.assertEqual(code, 0, stderr)
+        self.assertEqual(code, 2, stderr)  # frames were LOST and nobody acknowledged it (item 3); the files are still written
+        self.assertIn("UNACKNOWLEDGED", stderr)
         key, session = read_json(os.path.join(out, "answer_key.json")), read_json(os.path.join(out, "session.json"))
         reasons = {d["frameId"]: d["reason"] for d in session["droppedFrames"]}
         self.assertEqual(sorted(reasons), [1, 2])
@@ -1277,6 +1752,85 @@ class BuildSessionCliTests(TmpCase):
         self.assertEqual(code, 0, stderr)
         with Image.open(os.path.join(out, "source-frames", "aa-00.png")) as im:
             self.assertEqual(im.size[1], 28)  # opted in: the symmetric bands are cropped (and cropped to a common size)
+
+    def _bar_the_frame(self, directory, name, rows):
+        import numpy as np
+        from PIL import Image
+        path = os.path.join(directory, f"{name}-frame-00.png")
+        with Image.open(path) as im:
+            arr = np.asarray(im.convert("RGB")).copy()
+        arr[:rows] = 0
+        arr[-rows:] = 0
+        Image.fromarray(arr, "RGB").save(path)
+
+    def test_the_session_records_policy_per_frame_crops_common_crops_and_the_config_digest(self):
+        a = self._frames("aa", {0: (48, 48)})
+        self._bar_the_frame(a, "aa", 10)
+        b = self._frames("bb", {0: (50, 28)})  # 2 px wider than aa's 28-row content: a common crop is needed
+        code, out, _, stderr = self._build(["--letterbox", "auto-symmetric"], a=a, b=b)
+        self.assertEqual(code, 0, stderr)
+        session, key = read_json(os.path.join(out, "session.json")), read_json(os.path.join(out, "answer_key.json"))
+        cap = session["capture"]
+        self.assertEqual(key["capture"], cap)
+        self.assertEqual(cap["configSha256"], META["configSha256"])
+        self.assertEqual(cap["configVersion"], META["configVersion"])
+        self.assertEqual(cap["letterboxPolicy"]["aa"]["mode"], "auto-symmetric")
+        self.assertEqual(cap["letterboxPolicy"]["bb"]["mode"], "auto-symmetric")
+        crop = next(c for c in cap["frameCrops"] if c["subject"] == "aa")
+        self.assertEqual((crop["frameId"], crop["sourceSize"], crop["preparedSize"]), (0, [48, 48], [48, 28]))
+        self.assertEqual((crop["letterbox"]["provenance"], crop["letterbox"]["top"], crop["letterbox"]["bottom"]),
+                         ("AUTO_SYMMETRIC", 10, 10))
+        self.assertEqual(crop["letterbox"]["candidate"]["top"], 10)
+        uncropped = next(c for c in cap["frameCrops"] if c["subject"] == "bb")
+        self.assertEqual(uncropped["letterbox"]["provenance"], "NONE")
+        self.assertEqual(cap["commonCrops"], [{"frameId": 0, "from": {"aa": [48, 28], "bb": [50, 28]}, "to": [48, 28]}])
+        self.assertEqual(cap["commonCropTolerancePx"], 2)
+
+    def test_a_default_build_records_that_nothing_was_hidden(self):
+        a = self._frames("aa", {0: (48, 48)})
+        self._bar_the_frame(a, "aa", 10)
+        b = self._frames("bb", {0: (48, 48)})
+        code, out, _, stderr = self._build(a=a, b=b)
+        self.assertEqual(code, 0, stderr)
+        cap = read_json(os.path.join(out, "session.json"))["capture"]
+        self.assertEqual(cap["letterboxPolicy"]["aa"], {"mode": "off", "declared": None})
+        crop = next(c for c in cap["frameCrops"] if c["subject"] == "aa")
+        self.assertEqual((crop["sourceSize"], crop["preparedSize"]), ([48, 48], [48, 48]))
+        self.assertEqual(crop["letterbox"]["provenance"], "NONE")
+        self.assertEqual(crop["letterbox"]["candidate"]["top"], 10)  # the dark band was SEEN and left in the picture
+        self.assertEqual(cap["commonCrops"], [])
+
+    def test_declared_bars_are_recorded_as_declared_per_subject(self):
+        a = self._frames("aa", {0: (48, 48)})
+        self._bar_the_frame(a, "aa", 10)
+        b = self._frames("bb", {0: (48, 28)})
+        code, out, _, stderr = self._build(["--a-letterbox-bars", "top=10,bottom=10"], a=a, b=b)
+        self.assertEqual(code, 0, stderr)
+        cap = read_json(os.path.join(out, "session.json"))["capture"]
+        self.assertEqual(cap["letterboxPolicy"]["aa"]["declared"], {"top": 10, "bottom": 10, "left": 0, "right": 0})
+        self.assertIsNone(cap["letterboxPolicy"]["bb"]["declared"])
+
+    def test_allow_dropped_frames_records_the_reason_and_lets_the_build_exit_zero(self):
+        code, out, _, stderr = self._build(["--allow-dropped-frames", "bb never captured frame 2 on this run"])
+        self.assertEqual(code, 0, stderr)
+        policy = read_json(os.path.join(out, "session.json"))["droppedFramePolicy"]
+        self.assertEqual(policy["lossFrameIds"], [1, 2])
+        self.assertEqual(policy["allowance"], {"reason": "bb never captured frame 2 on this run", "frameIds": [1, 2]})
+
+    def test_a_frame_file_the_indexer_cannot_place_stops_the_build(self):
+        a = self._frames("aa", {0: (48, 32)})
+        b = self._frames("bb", {0: (48, 32)})
+        import shutil as _shutil
+        _shutil.copyfile(os.path.join(a, "aa-frame-00.png"), os.path.join(a, "aa-final.png"))  # no digits: not a frame
+        code, out, _, stderr = self._build(a=a, b=b)
+        self.assertEqual(code, 2)
+        self.assertIn("aa-final.png", stderr)
+        self.assertFalse(os.path.exists(os.path.join(out, "session.json")))
+
+    def test_a_blank_allow_dropped_frames_is_refused(self):
+        code, out, _, stderr = self._build(["--allow-dropped-frames", "  "])
+        self.assertEqual(code, 2)
+        self.assertFalse(os.path.exists(os.path.join(out, "session.json")))
 
     def test_declared_bars_are_cropped_from_the_judge_images(self):
         import numpy as np

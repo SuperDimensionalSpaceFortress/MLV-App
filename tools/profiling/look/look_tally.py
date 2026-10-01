@@ -160,8 +160,48 @@ def _check_key(answer_key, session, current_image_sha256):
     return reasons, details, bad
 
 
+def _check_capture(answer_key, session, config_sha256):
+    """How the judged frames were prepared (config digest, letterbox policy, per-frame crops) must be on record in
+    BOTH the session and the key, identical, and the config used now must be the one the session was built with."""
+    reasons = []
+    capture = session.get("capture")
+    if not isinstance(capture, dict) or any(k not in capture for k in look_pairs.CAPTURE_REQUIRED_KEYS):
+        reasons.append("CAPTURE_NOT_RECORDED")
+    elif answer_key.get("capture") != capture:
+        reasons.append("CAPTURE_SESSION_KEY_MISMATCH")
+    if config_sha256 is None:
+        reasons.append("CONFIG_SHA_NOT_VERIFIED")
+    elif isinstance(capture, dict) and capture.get("configSha256") is not None \
+            and capture["configSha256"] != config_sha256:
+        reasons.append("CONFIG_DIFFERS_FROM_SESSION")
+    return reasons
+
+
+def _check_drops(answer_key, session):
+    """Frames that were not judged: the session's recorded policy must match what the key says was dropped, and every
+    LOST frame (not a chosen exclusion) needs a recorded allowance with a reason that covers it.
+    Returns (reasons, allowance-or-None)."""
+    policy = session.get("droppedFramePolicy")
+    if not isinstance(policy, dict):
+        return ["DROPPED_FRAME_POLICY_NOT_RECORDED"], None
+    dropped = answer_key.get("droppedFrames") or []
+    derived = look_pairs.drop_policy(dropped)
+    reasons = []
+    if (policy.get("lossFrameIds") != derived["lossFrameIds"]
+            or policy.get("selectionFrameIds") != derived["selectionFrameIds"]
+            or session.get("droppedFrames") != dropped):
+        reasons.append("DROPPED_FRAME_POLICY_MISMATCH")
+    allowance = policy.get("allowance")
+    acknowledged = (isinstance(allowance, dict) and isinstance(allowance.get("reason"), str)
+                    and bool(allowance["reason"].strip())
+                    and set(allowance.get("frameIds") or []) >= set(derived["lossFrameIds"]))
+    if derived["lossFrameIds"] and not acknowledged:
+        reasons.append("UNACKNOWLEDGED_DROPPED_FRAMES")
+    return reasons, (allowance if acknowledged and derived["lossFrameIds"] else None)
+
+
 def tally(answer_key, item_verdicts, judge, session, cfg, current_image_sha256=None, forbidden_models=None,
-          cross_family_status=None):
+          cross_family_status=None, config_sha256=None):
     """Build one model_verdicts[] entry.
 
     answer_key           the answer_key.json dict
@@ -171,17 +211,23 @@ def tally(answer_key, item_verdicts, judge, session, cfg, current_image_sha256=N
     cfg                  the loaded floor config (look_config.load_config()[0]); every threshold is read from it
     current_image_sha256 {itemId: sha256 of the pair image as it is on disk NOW}; None leaves the entry unusable
     forbidden_models     the producer/hub model ids; None leaves the entry unusable (the guard was not applied)
+    config_sha256        sha256 of the config the caller is tallying under; it must equal the one the session was
+                         built with, and None leaves the entry unusable (the config was not verified)
     """
     slot_cfg = cfg["slot_bias"]
     min_choices = int(slot_cfg["min_choices"])
     alpha = float(slot_cfg["alpha"])
     min_consistent = int(cfg["judge_validity"]["min_consistent_units"])
+    max_discarded = float(cfg["judge_validity"]["max_discarded_unit_fraction"])
     frozen = session["rubricSha256"]
     unusable, details = [], {}
 
     key_reasons, key_details, bad_images = _check_key(answer_key, session, current_image_sha256)
     unusable.extend(key_reasons)
     details.update(key_details)
+    unusable.extend(_check_capture(answer_key, session, config_sha256))
+    drop_reasons, drop_allowance = _check_drops(answer_key, session)
+    unusable.extend(drop_reasons)
 
     by_unit = {}
     for item in answer_key["items"]:
@@ -327,6 +373,10 @@ def tally(answer_key, item_verdicts, judge, session, cfg, current_image_sha256=N
         unusable.append("SLOT_BIAS")
     if consistent_units < min_consistent:
         unusable.append("TOO_FEW_CONSISTENT_UNITS")
+    judged_units = consistent_units + flips + tie_splits
+    discarded_fraction = (flips + tie_splits) / float(judged_units) if judged_units else 0.0
+    if discarded_fraction > max_discarded:
+        unusable.append("TOO_MANY_DISCARDED_UNITS")
     if forbidden_models is None:
         unusable.append("PRODUCER_GUARD_NOT_APPLIED")
     else:
@@ -345,6 +395,11 @@ def tally(answer_key, item_verdicts, judge, session, cfg, current_image_sha256=N
         "rubricSha256": frozen,
         "imageSha256s": list(session["imageSha256s"]),
         "orderSeed": session["orderSeed"],
+        "capture": session.get("capture"),
+        "configSha256": config_sha256,
+        "sessionConfigSha256": (session.get("capture") or {}).get("configSha256"),
+        "droppedFramePolicy": session.get("droppedFramePolicy"),
+        "droppedFrameAllowance": drop_allowance,
         "slotTally": {
             "real": real_slots, "control": control_slots, "positiveControl": positive_slots,
             "nonTieChoices": n_choices, "leftOfNonTie": non_tie_left, "pValue": round(p_value, 6),
@@ -360,6 +415,7 @@ def tally(answer_key, item_verdicts, judge, session, cfg, current_image_sha256=N
             "votes": votes, "votePValue": None if vote_p is None else round(vote_p, 6),
             "consistentUnits": consistent_units, "minConsistentUnits": min_consistent,
             "discardedFlips": flips, "discardedTieSplits": tie_splits, "unjudgedUnits": unjudged,
+            "discardedUnitFraction": round(discarded_fraction, 6), "maxDiscardedUnitFraction": max_discarded,
         },
         "invalidVerdicts": invalid,
         "integrity": details,
@@ -387,5 +443,25 @@ def judge_disagreement(entries, points):
                         details.append({"judges": [a["judgeId"], b["judgeId"]], "subject": subject,
                                         "criterion": criterion, "values": [a_value, b_value]})
     unusable = [e["judgeId"] for e in entries if not e.get("usable")]
+    mismatches = session_mismatches(entries)
     return {"thirdJudgeNeeded": bool(details), "thresholdPoints": points, "details": details,
-            "unusableJudges": unusable, "comparable": len(entries) >= 2 and not unusable}
+            "unusableJudges": unusable, "sessionMismatches": mismatches,
+            "comparable": len(entries) >= 2 and not unusable and not mismatches}
+
+
+SESSION_IDENTITY_FIELDS = ("rubricSha256", "orderSeed", "imageSha256s")
+
+
+def session_mismatches(entries):
+    """The identity fields on which the entries do NOT agree (or that an entry lacks). Two judges' scores are only
+    comparable when they judged the same session under the same frozen rubric; imageSha256s compare as sets."""
+    def ident(entry, field):
+        value = entry.get(field)
+        return sorted(value) if field == "imageSha256s" and isinstance(value, list) else value
+
+    bad = []
+    for field in SESSION_IDENTITY_FIELDS:
+        values = [ident(e, field) for e in entries]
+        if any(v is None for v in values) or any(v != values[0] for v in values[1:]):
+            bad.append(field)
+    return bad

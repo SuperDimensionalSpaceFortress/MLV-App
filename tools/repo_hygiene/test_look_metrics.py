@@ -323,7 +323,7 @@ class SkinTests(unittest.TestCase):
         base = self._skin_scene((224, 172, 140))
         sheet = lm.evaluate_sheet({0: self._skin_scene((140, 172, 224))}, self.cfg, self.meta, references={0: base})
         self.assertEqual(sheet["outcome"], lm.FAIL)
-        self.assertEqual(sheet["skinCheck"], {"appliedToFrames": 1, "ofFrames": 1})
+        self.assertEqual((sheet["skinCheck"]["appliedToFrames"], sheet["skinCheck"]["ofFrames"]), (1, 1))
 
     def test_only_part_of_the_skin_moving_is_caught_by_measuring_over_the_baselines_mask(self):
         base = self._skin_scene((224, 172, 140))
@@ -368,15 +368,27 @@ class SkinTests(unittest.TestCase):
                                   references={0: np.zeros((4, 4), dtype=np.uint8)})
         self.assertEqual(sheet["outcome"], lm.INCOMPLETE)
 
-    def test_frames_that_cannot_be_aligned_fall_back_to_each_frames_own_region_and_say_so(self):
+    def test_frames_that_cannot_be_aligned_are_NOT_EVALUABLE_never_compared_on_their_own_regions(self):
+        # LOOK-METRICS-JUDGE-2 item 4 (fable r2 note): the old fallback compared each frame's OWN mask, which can
+        # miss a partial skin move. An unalignable pair now makes the frame (and the sheet) INCOMPLETE.
         base = self._skin_scene((224, 172, 140))
         wide = np.concatenate([base, base[:, :20]], axis=1)  # 20 px wider than the tolerance allows
         v = lm.evaluate_frame(wide, self.cfg, reference=base)
-        self.assertEqual(v["checks"]["skin_hue_drift"]["maskBasis"], "OWN_MASK_SHAPES_DIFFER")
-        self.assertEqual(v["checks"]["skin_hue_drift"]["outcome"], lm.PASS)
-        lost = self._skin_scene((140, 172, 224))
-        lost = np.concatenate([lost, lost[:, :20]], axis=1)
-        self.assertEqual(lm.evaluate_frame(lost, self.cfg, reference=base)["checks"]["skin_hue_drift"]["outcome"], lm.FAIL)
+        check = v["checks"]["skin_hue_drift"]
+        self.assertEqual((check["outcome"], check["reason"]), (lm.NOT_EVALUABLE, "SKIN_MASKS_NOT_ALIGNABLE"))
+        self.assertEqual(v["outcome"], lm.NOT_EVALUABLE)
+        sheet = lm.evaluate_sheet({0: wide}, self.cfg, self.meta, references={0: base})
+        self.assertEqual(sheet["outcome"], lm.INCOMPLETE)
+        self.assertEqual([r["code"] for r in sheet["incompleteReasons"]], ["FRAME_NOT_EVALUABLE"])
+
+    def test_a_partial_skin_move_on_unalignable_frames_cannot_pass(self):
+        base = self._skin_scene((224, 172, 140))
+        half = base.copy()
+        half[30:60, 45:60] = (150, 200, 150)  # half the patch moves; the other half keeps its own hue
+        half = np.concatenate([half, half[:, :20]], axis=1)
+        v = lm.evaluate_frame(half, self.cfg, reference=base)
+        self.assertNotEqual(v["outcome"], lm.PASS)
+        self.assertNotIn("maskBasis", v["checks"]["skin_hue_drift"])
 
     def test_a_thumbnail_one_row_taller_than_the_baseline_is_still_aligned(self):
         base = self._skin_scene((224, 172, 140))
@@ -416,7 +428,7 @@ class SkinTests(unittest.TestCase):
         skin = self._skin_scene((224, 172, 140))
         none = _flat(80, 80, (90, 110, 160))
         sheet = lm.evaluate_sheet({0: skin, 1: none}, self.cfg, self.meta, references={0: skin, 1: none})
-        self.assertEqual(sheet["skinCheck"], {"appliedToFrames": 1, "ofFrames": 2})
+        self.assertEqual((sheet["skinCheck"]["appliedToFrames"], sheet["skinCheck"]["ofFrames"]), (1, 2))
         self.assertEqual(sheet["outcome"], lm.PASS)  # N/A frames do not fail the sheet, and are never counted as passes
 
 
@@ -717,6 +729,235 @@ class FloorCliTests(unittest.TestCase):
             base = ["pair-metrics", "--a-dir", a, "--b-dir", b, "--scope", "shader-subset", "--out", out]
             self.assertEqual(self._run(base)[0], 2)  # GEOMETRY_MISMATCH -> INCOMPLETE
             self.assertEqual(self._run(base + ["--b-letterbox-bars", "top=20,bottom=20"])[0], 0)
+
+
+def _skin_scene(rgb):
+    arr = _flat(100, 100, (90, 110, 160))
+    arr[30:60, 30:60] = rgb  # 9 % skin-tone region
+    return arr
+
+
+class _InputHelpers(unittest.TestCase):
+    """Shared fixtures for the requested-input tests (no tests of its own)."""
+
+    def setUp(self):
+        self.cfg, self.meta = look_config.load_config()
+        self.original = _skin_scene((224, 172, 140))
+        self.moved = _skin_scene((140, 172, 224))  # skin pushed out of the colour box
+
+    def _run(self, argv):
+        import look_cli
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out), contextlib.redirect_stderr(io.StringIO()):
+            return look_cli.main(argv), out.getvalue()
+
+    def _dir(self, tmp, name, files):
+        directory = os.path.join(tmp, name)
+        os.makedirs(directory)
+        for filename, arr in files.items():
+            Image.fromarray(arr, "RGB").save(os.path.join(directory, filename))
+        return directory
+
+    def _floor(self, tmp, subject, baseline):
+        out = os.path.join(tmp, "v.json")
+        argv = ["floor", "--frames-dir", subject, "--label", "x", "--out", out]
+        if baseline is not None:
+            argv += ["--baseline-dir", baseline]
+        code, stdout = self._run(argv)
+        verdict = None
+        if os.path.isfile(out):
+            with open(out, "r", encoding="utf-8") as handle:
+                verdict = json.load(handle)
+        return code, verdict, stdout
+
+@unittest.skipUnless(_HAS_DEPS, "numpy/Pillow are not installed on this host")
+class RequestedBaselineTests(_InputHelpers):
+    """LOOK-METRICS-JUDGE-2 item 1 (sol r2 blocker): a baseline that was REQUESTED but has no frame for a subject
+    index never reads as agreement. Floor, sheet and CLI all say INCOMPLETE with a typed reason."""
+
+    # -- sol r2's exact repro ----------------------------------------------------------------------------
+    def test_sol_r2_repro_baseline_dir_without_the_subjects_frame_index_is_INCOMPLETE_not_PASS(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            subject = self._dir(tmp, "sub", {"frame-01.png": self.moved})
+            wrong = self._dir(tmp, "base-wrong", {"frame-00.png": self.original})
+            right = self._dir(tmp, "base-right", {"frame-01.png": self.original})
+            code, verdict, _ = self._floor(tmp, subject, wrong)
+            self.assertEqual(code, 2)
+            self.assertEqual(verdict["outcome"], lm.INCOMPLETE)
+            reasons = {r["code"]: r for r in verdict["incompleteReasons"]}
+            self.assertEqual(reasons["BASELINE_MISSING_FRAMES"]["indices"], [1])
+            self.assertEqual(reasons["BASELINE_FRAMES_WITHOUT_SUBJECT"]["indices"], [0])
+            check = verdict["frames"][0]["checks"]["skin_hue_drift"]
+            self.assertEqual((check["outcome"], check["reason"]),
+                             (lm.NOT_EVALUABLE, "BASELINE_REQUESTED_BUT_NO_FRAME_FOR_INDEX"))
+            self.assertTrue(verdict["baseline"]["requested"])
+            code, verdict, _ = self._floor(tmp, subject, right)
+            self.assertEqual((code, verdict["outcome"]), (1, lm.FAIL))  # the matching baseline catches it
+
+    def test_every_subject_frame_must_have_its_baseline_frame(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            subject = self._dir(tmp, "sub", {"f-00.png": self.original, "f-01.png": self.original})
+            partial = self._dir(tmp, "base", {"f-00.png": self.original})
+            code, verdict, _ = self._floor(tmp, subject, partial)
+            self.assertEqual((code, verdict["outcome"]), (2, lm.INCOMPLETE))
+            self.assertEqual(verdict["counts"][lm.PASS], 1)  # the matched frame is still reported as measured
+            full = self._dir(tmp, "base-full", {"f-00.png": self.original, "f-01.png": self.original})
+            code, verdict, _ = self._floor(tmp, subject, full)
+            self.assertEqual((code, verdict["outcome"]), (0, lm.PASS))
+            self.assertEqual(verdict["incompleteReasons"], [])
+
+    def test_baseline_frames_that_have_no_subject_frame_are_reported_and_incomplete(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            subject = self._dir(tmp, "sub", {"f-00.png": self.original})
+            baseline = self._dir(tmp, "base", {"f-00.png": self.original, "f-07.png": self.original})
+            code, verdict, _ = self._floor(tmp, subject, baseline)
+            self.assertEqual((code, verdict["outcome"]), (2, lm.INCOMPLETE))
+            self.assertEqual(verdict["baseline"]["baselineIndicesWithoutSubjectFrame"], [7])
+
+    def test_evaluate_frame_with_a_requested_but_absent_baseline_is_not_evaluable(self):
+        v = lm.evaluate_frame(self.moved, self.cfg, baseline_requested=True)
+        self.assertEqual(v["outcome"], lm.NOT_EVALUABLE)
+        self.assertEqual(v["checks"]["skin_hue_drift"]["reason"], "BASELINE_REQUESTED_BUT_NO_FRAME_FOR_INDEX")
+        self.assertIn("luma_p50", v["metrics"])  # the other measurements are not thrown away
+        plain = lm.evaluate_frame(self.moved, self.cfg)  # nothing requested: the old, disclosed N/A
+        self.assertEqual(plain["checks"]["skin_hue_drift"]["reason"], "NO_BASELINE_FRAME")
+        self.assertEqual(plain["outcome"], lm.PASS)
+
+    def test_a_requested_baseline_with_no_frames_at_all_is_incomplete_through_evaluate_sheet(self):
+        sheet = lm.evaluate_sheet({0: self.moved}, self.cfg, self.meta, references={}, baseline_requested=True)
+        self.assertEqual(sheet["outcome"], lm.INCOMPLETE)
+        self.assertEqual(sheet["baseline"]["framesMissingBaseline"], [0])
+
+    def test_no_baseline_requested_is_recorded_as_such_and_never_as_applied(self):
+        sheet = lm.evaluate_sheet({0: self.moved}, self.cfg, self.meta)
+        self.assertEqual(sheet["outcome"], lm.PASS)
+        self.assertFalse(sheet["baseline"]["requested"])
+        self.assertEqual(sheet["skinCheck"]["status"], "NOT_REQUESTED")
+
+    def test_a_requested_baseline_with_no_skin_region_is_recorded_not_applicable_and_not_silent(self):
+        plain = _flat(100, 100, (90, 110, 160))
+        with tempfile.TemporaryDirectory() as tmp:
+            subject = self._dir(tmp, "sub", {"f-00.png": plain})
+            baseline = self._dir(tmp, "base", {"f-00.png": plain})
+            code, verdict, stdout = self._floor(tmp, subject, baseline)
+            self.assertEqual((code, verdict["outcome"]), (0, lm.PASS))
+            skin = verdict["skinCheck"]
+            self.assertEqual(skin["status"], "REQUESTED_NOT_APPLICABLE")
+            self.assertEqual(skin["appliedToFrames"], 0)
+            self.assertEqual(skin["notApplicableFrames"], {"0": "NO_SKIN_TONE_REGION_IN_BASELINE"})
+            self.assertTrue(verdict["frames"][0]["checks"]["skin_hue_drift"]["baselineRequested"])
+            self.assertIn("REQUESTED_NOT_APPLICABLE", stdout)  # the console line says it too
+
+    def test_a_requested_baseline_that_is_applied_says_so(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            subject = self._dir(tmp, "sub", {"f-00.png": self.original})
+            baseline = self._dir(tmp, "base", {"f-00.png": self.original})
+            _, verdict, _ = self._floor(tmp, subject, baseline)
+            self.assertEqual(verdict["skinCheck"]["status"], "APPLIED")
+
+
+@unittest.skipUnless(_HAS_DEPS, "numpy/Pillow are not installed on this host")
+class FrameIndexTests(_InputHelpers):
+    """LOOK-METRICS-JUDGE-2 item 2: index_frames never silently skips a file in a supplied directory, and a
+    supplied directory that yields no frame is an error."""
+
+    def test_mis_named_png_without_digits_is_reported_and_blocks_the_floor(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            subject = self._dir(tmp, "sub", {"cuda-00.png": self.original, "cuda-final.png": self.moved})
+            index = lm.index_frames(subject)
+            self.assertEqual(sorted(index), [0])
+            self.assertEqual([(s["name"], s["reason"], s["blocking"]) for s in index.skipped],
+                             [("cuda-final.png", "NO_DIGITS_IN_NAME", True)])
+            code, verdict, _ = self._floor(tmp, subject, None)
+            self.assertEqual((code, verdict["outcome"]), (2, lm.INCOMPLETE))
+            self.assertEqual([r["code"] for r in verdict["incompleteReasons"]], ["FRAME_FILES_NOT_INDEXED"])
+            self.assertEqual(verdict["inputs"]["frames"]["skipped"][0]["name"], "cuda-final.png")
+
+    def test_a_non_png_image_is_reported_and_blocks_but_a_sidecar_is_only_listed(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            subject = self._dir(tmp, "sub", {"f-00.png": self.original, "f-01.jpg": self.original})
+            with open(os.path.join(subject, "notes.txt"), "w") as handle:
+                handle.write("x")
+            os.makedirs(os.path.join(subject, "old"))
+            index = lm.index_frames(subject)
+            by_name = {s["name"]: s for s in index.skipped}
+            self.assertEqual((by_name["f-01.jpg"]["reason"], by_name["f-01.jpg"]["blocking"]), ("NOT_A_PNG", True))
+            self.assertEqual((by_name["notes.txt"]["reason"], by_name["notes.txt"]["blocking"]), ("NOT_A_FRAME_FILE", False))
+            self.assertEqual((by_name["old"]["reason"], by_name["old"]["blocking"]), ("NOT_A_FILE", False))
+            code, verdict, _ = self._floor(tmp, subject, None)
+            self.assertEqual((code, verdict["outcome"]), (2, lm.INCOMPLETE))
+
+    def test_sidecars_alone_do_not_block_but_are_listed_in_the_verdict(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            subject = self._dir(tmp, "sub", {"f-00.png": self.original})
+            with open(os.path.join(subject, "notes.txt"), "w") as handle:
+                handle.write("x")
+            code, verdict, _ = self._floor(tmp, subject, None)
+            self.assertEqual((code, verdict["outcome"]), (0, lm.PASS))
+            self.assertEqual([s["name"] for s in verdict["inputs"]["frames"]["skipped"]], ["notes.txt"])
+
+    def test_two_files_with_one_index_are_ambiguous_and_block(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            subject = self._dir(tmp, "sub", {"a-00.png": self.original, "b-00.png": self.moved})
+            index = lm.index_frames(subject)
+            self.assertEqual(sorted(index), [0])
+            self.assertEqual([(s["name"], s["reason"].split(":")[0]) for s in index.skipped],
+                             [("b-00.png", "DUPLICATE_FRAME_INDEX")])
+            code, verdict, _ = self._floor(tmp, subject, None)
+            self.assertEqual((code, verdict["outcome"]), (2, lm.INCOMPLETE))
+
+    def test_a_mis_named_baseline_file_blocks_too(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            subject = self._dir(tmp, "sub", {"f-00.png": self.original})
+            baseline = self._dir(tmp, "base", {"f-00.png": self.original, "baseline-final.png": self.original})
+            code, verdict, _ = self._floor(tmp, subject, baseline)
+            self.assertEqual((code, verdict["outcome"]), (2, lm.INCOMPLETE))
+            self.assertIn("BASELINE_FILES_NOT_INDEXED", [r["code"] for r in verdict["incompleteReasons"]])
+
+    def test_a_directory_that_yields_zero_frames_is_an_error_everywhere(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            empty = self._dir(tmp, "empty", {})
+            only_text = os.path.join(tmp, "text")
+            os.makedirs(only_text)
+            with open(os.path.join(only_text, "a.txt"), "w") as handle:
+                handle.write("x")
+            ok = self._dir(tmp, "ok", {"f-00.png": self.original})
+            missing = os.path.join(tmp, "no-such-dir")
+            for bad in (empty, only_text, missing):
+                with self.subTest(bad=os.path.basename(bad)):
+                    with self.assertRaises(lm.FrameIndexError):
+                        lm.index_frames(bad)
+                    out = os.path.join(tmp, "v.json")
+                    self.assertEqual(self._run(["floor", "--frames-dir", bad, "--label", "x", "--out", out])[0], 2)
+                    self.assertEqual(self._run(["floor", "--frames-dir", ok, "--baseline-dir", bad, "--label", "x",
+                                                "--out", out])[0], 2)
+                    self.assertEqual(self._run(["pair-metrics", "--a-dir", bad, "--b-dir", ok, "--scope",
+                                                "shader-subset", "--out", out])[0], 2)
+                    self.assertEqual(self._run(["pair-metrics", "--a-dir", ok, "--b-dir", bad, "--scope",
+                                                "shader-subset", "--out", out])[0], 2)
+
+    def test_a_directory_compared_with_itself_is_refused_not_measured_as_perfect_agreement(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            same = self._dir(tmp, "same", {"f-00.png": self.moved})
+            out = os.path.join(tmp, "v.json")
+            self.assertEqual(self._run(["floor", "--frames-dir", same, "--baseline-dir", same, "--label", "x",
+                                        "--out", out])[0], 2)
+            self.assertEqual(self._run(["pair-metrics", "--a-dir", same, "--b-dir", same, "--scope", "shader-subset",
+                                        "--out", out])[0], 2)
+            self.assertFalse(os.path.exists(out))
+
+    def test_pair_metrics_blocks_on_a_mis_named_file_on_either_side(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            a = self._dir(tmp, "a", {"f-00.png": self.original})
+            b = self._dir(tmp, "b", {"f-00.png": self.original, "g-last.png": self.original})
+            out = os.path.join(tmp, "p.json")
+            code, _ = self._run(["pair-metrics", "--a-dir", a, "--b-dir", b, "--scope", "shader-subset", "--out", out])
+            self.assertEqual(code, 2)
+            with open(out, "r", encoding="utf-8") as handle:
+                verdict = json.load(handle)
+            self.assertEqual(verdict["outcome"], lm.INCOMPLETE)
+            self.assertEqual([r["code"] for r in verdict["incompleteReasons"]], ["B_FILES_NOT_INDEXED"])
+            self.assertEqual(verdict["inputs"]["b"]["skipped"][0]["name"], "g-last.png")
 
 
 if __name__ == "__main__":

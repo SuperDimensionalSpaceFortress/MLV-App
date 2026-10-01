@@ -160,8 +160,30 @@ def _write_json(path, doc):
         handle.write("\n")
 
 
+# Frames the CALLER chose to leave out. Everything else that is not judged is a LOSS (an unshared frame, a frame
+# outside the crop tolerance, a requested id no subject has ...) and needs an explicit, recorded allowance. An
+# unrecognised reason is a loss: the selection list is an allowlist.
+SELECTION_DROP_REASONS = ("NOT_IN_--frame-ids", "BEYOND_--max-frames")
+CAPTURE_REQUIRED_KEYS = ("configSha256", "letterboxPolicy", "frameCrops", "commonCrops")
+
+
+def drop_is_selection(reason):
+    return str(reason).startswith(SELECTION_DROP_REASONS)
+
+
+def drop_policy(dropped, allowance=None):
+    """What the session says about frames that were not judged: the ids lost, the ids the caller chose to omit,
+    and the allowance (a reason, covering exactly the lost ids) if one was given. Used by build_session to WRITE the
+    policy and by look_tally to RE-DERIVE it from the answer key."""
+    loss = sorted({d["frameId"] for d in dropped if not drop_is_selection(d.get("reason"))})
+    selection = sorted({d["frameId"] for d in dropped if drop_is_selection(d.get("reason"))} - set(loss))
+    return {"lossFrameIds": loss, "selectionFrameIds": selection,
+            "allowance": None if allowance is None else {"reason": allowance, "frameIds": loss}}
+
+
 def build_session(subject_a, subject_b, frame_ids, seed, out_dir, rubric_sha256, controls=1, positive_controls=1,
-                  created_utc=None, dropped_frames=None, crop_tolerance_px=None, compose=None, degrade=None):
+                  created_utc=None, dropped_frames=None, crop_tolerance_px=None, compose=None, degrade=None,
+                  capture=None, drop_allowance=None):
     """Write pair images + the three JSON files into out_dir; return their paths.
 
     judge_manifest.json   judge-facing: item ids + image file names. Nothing else.
@@ -172,8 +194,15 @@ def build_session(subject_a, subject_b, frame_ids, seed, out_dir, rubric_sha256,
     `dropped_frames` = [{"frameId", "reason"}] the caller already removed (unshared, outside the crop tolerance,
     not requested ...); the plan adds the frames missing from a subject. A dropped frame is never silent.
 
+    `capture` is how the frames were PREPARED (config digest, letterbox policy per subject, per-frame crops, common
+    crops); it is written to session.json and answer_key.json and look_tally refuses a session that has none.
+    `drop_allowance` is the explicit, reasoned acknowledgement that frames in the LOSS class were not judged; without
+    one the tally calls the session unusable.
+
     `compose` / `degrade` default to the Pillow drawers; tests inject byte-level fakes so the whole binding logic
     (ids bound to image digests, key, session) runs on hosts and in tests that draw no pixels."""
+    if drop_allowance is not None and (not isinstance(drop_allowance, str) or not drop_allowance.strip()):
+        raise ValueError("a dropped-frame allowance needs a non-empty reason (a string saying why the loss is acceptable)")
     compose = compose or compose_pair_image
     degrade = degrade or degrade_image
     plan = plan_pairs(subject_a, subject_b, frame_ids, seed, controls=controls, positive_controls=positive_controls)
@@ -208,6 +237,7 @@ def build_session(subject_a, subject_b, frame_ids, seed, out_dir, rubric_sha256,
     dropped = list(plan["droppedFrames"]) + [dict(d) for d in (dropped_frames or [])]
     manifest = {"schema": SCHEMA_JUDGE_MANIFEST, "items": judge_items}
     key = {"schema": SCHEMA_ANSWER_KEY, "orderSeed": seed, "subjects": [subject_a["name"], subject_b["name"]],
+           "capture": capture,
            "droppedFrameIds": sorted({d["frameId"] for d in dropped}), "droppedFrames": dropped, "items": key_items,
            "positiveControl": {"original": POSITIVE_ORIGINAL, "degraded": POSITIVE_DEGRADED,
                                "contrast": DEGRADE_CONTRAST, "tintRgb": list(DEGRADE_TINT_RGB),
@@ -219,6 +249,7 @@ def build_session(subject_a, subject_b, frame_ids, seed, out_dir, rubric_sha256,
         "emittedTwiceOrderSwapped": True, "controlUnits": controls, "positiveControlUnits": positive_controls,
         "itemIdBinding": "sha256(seed|item|unit|order|pairImageSha256)[:12]",
         "commonCropTolerancePx": crop_tolerance_px, "droppedFrames": dropped,
+        "droppedFramePolicy": drop_policy(dropped, drop_allowance), "capture": capture,
     }
     paths = {}
     for fname, doc in (("judge_manifest.json", manifest), ("answer_key.json", key), ("session.json", session)):

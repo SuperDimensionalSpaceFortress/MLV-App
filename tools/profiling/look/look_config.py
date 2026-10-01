@@ -53,9 +53,54 @@ REQUIRED_THRESHOLDS = (
     "pair.scopes.full-look.max_abs_delta_max", "pair.scopes.full-look.mismatch_fraction_max",
     "pair.scopes.full-look.ssim_min",
     "slot_bias.min_choices", "slot_bias.alpha",
-    "judge_validity.min_consistent_units",
+    "judge_validity.min_consistent_units", "judge_validity.max_discarded_unit_fraction",
     "judge_disagreement.third_judge_points",
 )
+
+# The TYPE (and range) of every threshold's value: (kind, low, high, exclusive). A reasoned string "false" is truthy,
+# so an untyped validator let it switch letterbox exclusion ON; a bool is an int in Python, so `True` would pass for a
+# pixel count. kinds: bool | int | number | number_or_null | range2 (a [low, high] pair of numbers, low <= high).
+# `exclusive`: False = closed bounds; True = both open (alpha must be strictly inside (0, 1)); "low-open" = only the
+# lower bound is open (a disagreement threshold of exactly 0 would demand a third judge for every pair).
+THRESHOLD_TYPES = {
+    "letterbox.auto_exclude_symmetric": ("bool", None, None, False),
+    "letterbox.bar_max_code": ("int", 0, 255, False),
+    "letterbox.min_active_px": ("int", 1, None, False),
+    "letterbox.max_excluded_pct": ("number", 0, 100, False),
+    "letterbox.symmetry_tolerance_px": ("int", 0, None, False),
+    "frame.clipped_highlight_pct_max": ("number", 0, 100, False),
+    "frame.crushed_shadow_pct_max": ("number", 0, 100, False),
+    "frame.mean_saturation_max": ("number", 0, 1, False),
+    "frame.oversaturated_pixel_pct_max": ("number", 0, 100, False),
+    "frame.oversaturated_sat_min": ("number", 0, 1, False),
+    "frame.oversaturated_value_min": ("number", 0, 1, False),
+    "frame.skin_min_pixel_pct": ("number", 0, 100, False),
+    "frame.skin_hue_drift_deg_max": ("number", 0, 180, False),
+    "frame.skin_region_retain_fraction": ("number", 0, 1, False),
+    "frame.skin_baseline_crop_tolerance_px": ("int", 0, None, False),
+    "skin.cb_range": ("range2", 0, 255, False),
+    "skin.cr_range": ("range2", 0, 255, False),
+    "skin.min_luma": ("number", 0, 255, False),
+    "skin.hue_range_deg": ("range2", 0, 360, False),
+    "skin.sat_range": ("range2", 0, 1, False),
+    "pair.geometry_tolerance_px": ("int", 0, None, False),
+    "pair.mismatch_channel_tolerance": ("int", 0, 255, False),
+    "pair.scopes.shader-subset.gated": ("bool", None, None, False),
+    "pair.scopes.shader-subset.mean_abs_delta_max": ("number", 0, 255, False),
+    "pair.scopes.shader-subset.max_abs_delta_max": ("number_or_null", 0, 255, False),
+    "pair.scopes.shader-subset.mismatch_fraction_max": ("number", 0, 1, False),
+    "pair.scopes.shader-subset.ssim_min": ("number", -1, 1, False),
+    "pair.scopes.full-look.gated": ("bool", None, None, False),
+    "pair.scopes.full-look.mean_abs_delta_max": ("number", 0, 255, False),
+    "pair.scopes.full-look.max_abs_delta_max": ("number_or_null", 0, 255, False),
+    "pair.scopes.full-look.mismatch_fraction_max": ("number", 0, 1, False),
+    "pair.scopes.full-look.ssim_min": ("number", -1, 1, False),
+    "slot_bias.min_choices": ("int", 1, None, False),
+    "slot_bias.alpha": ("number", 0, 1, True),
+    "judge_validity.min_consistent_units": ("int", 1, None, False),
+    "judge_validity.max_discarded_unit_fraction": ("number", 0, 1, False),
+    "judge_disagreement.third_judge_points": ("number", 0, 4, "low-open"),
+}
 
 
 class ConfigError(ValueError):
@@ -117,7 +162,46 @@ def validate_config(doc):
     missing = [path for path in REQUIRED_THRESHOLDS if path not in present]
     if missing:
         raise ConfigError(f"config is missing required thresholds: {missing}")
+    values = dict(leaves)
+    for path, spec in THRESHOLD_TYPES.items():
+        _check_type(path, values[path]["value"], spec)
     return leaves
+
+
+def _is_number(value):
+    return isinstance(value, (int, float)) and not isinstance(value, bool) and value == value  # not a bool, not NaN
+
+
+def _in_bounds(path, value, low, high, exclusive):
+    below = low is not None and (value <= low if exclusive in (True, "low-open") else value < low)
+    above = high is not None and (value >= high if exclusive is True else value > high)
+    if below or above:
+        raise ConfigError(f"threshold {path!r} value {value!r} is outside its allowed range "
+                          f"{'(' if exclusive in (True, 'low-open') else '['}{low}, {high}{')' if exclusive is True else ']'}")
+
+
+def _check_type(path, value, spec):
+    """ConfigError unless `value` has the declared type and lies in the declared range. A string is never a number
+    or a bool, a bool is never a number, and null is allowed only for number_or_null."""
+    kind, low, high, exclusive = spec
+    if kind == "bool":
+        if not isinstance(value, bool):
+            raise ConfigError(f"threshold {path!r} must be true or false (a JSON boolean), got {value!r}")
+    elif kind == "int":
+        if isinstance(value, bool) or not isinstance(value, int):
+            raise ConfigError(f"threshold {path!r} must be an integer, got {value!r}")
+        _in_bounds(path, value, low, high, exclusive)
+    elif kind == "number" or (kind == "number_or_null" and value is not None):
+        if not _is_number(value):
+            raise ConfigError(f"threshold {path!r} must be a number{' or null' if kind == 'number_or_null' else ''}, got {value!r}")
+        _in_bounds(path, value, low, high, exclusive)
+    elif kind == "range2":
+        if not (isinstance(value, list) and len(value) == 2 and all(_is_number(v) for v in value)):
+            raise ConfigError(f"threshold {path!r} must be a [low, high] pair of numbers, got {value!r}")
+        if value[0] > value[1]:
+            raise ConfigError(f"threshold {path!r} has low > high: {value!r}")
+        for bound in value:
+            _in_bounds(path, bound, low, high, False)
 
 
 def _flatten_values(node, top=True):

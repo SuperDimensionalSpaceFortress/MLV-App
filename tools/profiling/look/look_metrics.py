@@ -314,10 +314,12 @@ def skin_drift_check(active, ref_active, cfg):
         sub_mean, ref_mean = circular_mean_deg(hue_sub[mask]), circular_mean_deg(hue_ref[mask])
         basis = "BASELINE_MASK"
     else:
-        if not skin["usable"]:
-            detail.update({"outcome": FAIL, "reason": "SKIN_REGION_LOST_OR_SHRUNK", "value": None})
-            return detail, skin
-        sub_mean, ref_mean, basis = skin["meanHueDeg"], ref_skin["meanHueDeg"], "OWN_MASK_SHAPES_DIFFER"
+        # Two frames that cannot be laid over each other have no common set of pixels, and comparing each frame's
+        # OWN region would let a partial skin move through. Say so instead of guessing.
+        detail.update({"outcome": NOT_EVALUABLE, "reason": "SKIN_MASKS_NOT_ALIGNABLE", "value": None,
+                       "subjectActive": [int(active.shape[1]), int(active.shape[0])],
+                       "baselineActive": [int(ref_active.shape[1]), int(ref_active.shape[0])]})
+        return detail, skin
     check = _check(hue_distance_deg(sub_mean, ref_mean), threshold, "<=")
     detail.update(check)
     detail.update({"baselineMeanHueDeg": round(ref_mean, 4), "subjectMeanHueDeg": round(sub_mean, 4),
@@ -335,9 +337,12 @@ def _check(value, threshold, comparator):
             "outcome": PASS if ok else FAIL}
 
 
-def evaluate_frame(source, cfg, reference=None, frame_id=None, letterbox_policy=None):
+def evaluate_frame(source, cfg, reference=None, frame_id=None, letterbox_policy=None, baseline_requested=False):
     """Floor verdict for ONE frame. `reference` (optional) is the baseline frame for the skin-hue drift.
+    `baseline_requested` says the caller ASKED for a baseline comparison: with no `reference` the skin check is then
+    NOT_EVALUABLE (BASELINE_REQUESTED_BUT_NO_FRAME_FOR_INDEX), never the benign NOT_APPLICABLE of "nobody asked".
     `letterbox_policy` (make_letterbox_policy) says what the caller allows the floor to exclude; default OFF."""
+    baseline_requested = bool(baseline_requested or reference is not None)
     verdict = {"frameId": frame_id, "outcome": NOT_EVALUABLE, "checks": {}, "metrics": {}, "geometry": {}}
     try:
         arr = load_rgb(source)
@@ -386,35 +391,103 @@ def evaluate_frame(source, cfg, reference=None, frame_id=None, letterbox_policy=
     metrics["skin_tone_mean_hue_deg"] = skin["meanHueDeg"]
     metrics["crushed_shadow_pct_full_frame"] = _contact_sheet().channel_stats(
         Image.fromarray(arr, "RGB"))["crushed_black_pct"]
-    if ref_arr is None:
+    if ref_arr is None and baseline_requested:
+        skin_check = {"outcome": NOT_EVALUABLE, "threshold": frame_cfg["skin_hue_drift_deg_max"],
+                      "comparator": "<=", "reason": "BASELINE_REQUESTED_BUT_NO_FRAME_FOR_INDEX"}
+    elif ref_arr is None:
         skin_check = {"outcome": NOT_APPLICABLE, "threshold": frame_cfg["skin_hue_drift_deg_max"],
                       "comparator": "<=", "reason": "NO_BASELINE_FRAME"}
     else:
         ref_policy = {"mode": policy["mode"], "declared": None}  # a declaration describes the SUBJECT's capture
         ref_active = crop_active(ref_arr, detect_letterbox(ref_arr, cfg, ref_policy))
         skin_check, _ = skin_drift_check(active, ref_active, cfg)
+    skin_check["baselineRequested"] = baseline_requested
     checks["skin_hue_drift"] = skin_check
 
     verdict["metrics"] = {k: (round(v, 6) if isinstance(v, float) else v) for k, v in metrics.items()}
     verdict["checks"] = checks
     failed = sorted(name for name, c in checks.items() if c["outcome"] == FAIL)
+    unevaluable = sorted(name for name, c in checks.items() if c["outcome"] == NOT_EVALUABLE)
     verdict["failedChecks"] = failed
-    verdict["outcome"] = FAIL if failed else PASS
+    verdict["unevaluableChecks"] = unevaluable
+    # A concrete FAIL stands; otherwise a check that could not be run keeps the frame from reading as a pass.
+    verdict["outcome"] = FAIL if failed else (NOT_EVALUABLE if unevaluable else PASS)
     return verdict
 
 
+class FrameIndexError(ValueError):
+    """A supplied frames directory that cannot be used at all: missing, not a directory, or yielding no frame."""
+
+
+# An image file that could have been a frame. Skipping one is never silent AND never harmless: the sheet is INCOMPLETE.
+_IMAGE_EXTENSIONS = (".png", ".jpg", ".jpeg", ".bmp", ".tif", ".tiff", ".webp", ".gif", ".exr", ".dng", ".ppm", ".pgm")
+
+
+class FrameIndex(dict):
+    """{index: path} that also remembers every entry of the directory it did NOT index (`skipped`), so a
+    mis-named or non-PNG frame can never just vanish from a sheet. A skipped entry is blocking when it could
+    have been a frame (an image file, or a second file claiming an index already taken); a sidecar such as a
+    notes file is listed but does not block."""
+
+    def __init__(self, directory):
+        super().__init__()
+        self.directory = directory
+        self.skipped = []
+
+    def _skip(self, name, reason, blocking):
+        self.skipped.append({"name": name, "reason": reason, "blocking": blocking})
+
+    def blocking_files(self):
+        return [s["name"] for s in self.skipped if s["blocking"]]
+
+    def summary(self):
+        return {"directory": self.directory, "indexedFrames": len(self), "indices": sorted(self),
+                "skipped": [dict(s) for s in self.skipped]}
+
+
 def index_frames(directory):
-    """{index: path} for the PNGs of a frames dir; the index is the LAST run of digits in the stem."""
-    found = {}
+    """FrameIndex ({index: path}) for the PNGs of a frames dir; the index is the LAST run of digits in the stem.
+    Nothing in the directory is skipped silently (see FrameIndex.skipped), and a directory that is missing or
+    yields zero frames raises FrameIndexError."""
+    if not os.path.isdir(directory):
+        raise FrameIndexError(f"frames directory {directory!r} does not exist or is not a directory")
+    found = FrameIndex(directory)
+    owner = {}
     for name in sorted(os.listdir(directory)):
+        if not os.path.isfile(os.path.join(directory, name)):
+            found._skip(name, "NOT_A_FILE", False)
+            continue
         stem, ext = os.path.splitext(name)
-        if ext.lower() != ".png":
+        ext = ext.lower()
+        if ext != ".png":
+            is_image = ext in _IMAGE_EXTENSIONS
+            found._skip(name, "NOT_A_PNG" if is_image else "NOT_A_FRAME_FILE", is_image)
             continue
         digits = re.findall(r"\d+", stem)
         if not digits:
+            found._skip(name, "NO_DIGITS_IN_NAME", True)
             continue
-        found[int(digits[-1])] = os.path.join(directory, name)
+        index = int(digits[-1])
+        if index in owner:
+            found._skip(name, f"DUPLICATE_FRAME_INDEX: index {index} is already taken by {owner[index]}", True)
+            continue
+        owner[index] = name
+        found[index] = os.path.join(directory, name)
+    if not found:
+        raise FrameIndexError(
+            f"frames directory {directory!r} yielded no frame (skipped: "
+            f"{[s['name'] + ' ' + s['reason'] for s in found.skipped] or 'directory is empty'})")
     return found
+
+
+def _file_reasons(index, code):
+    """incompleteReasons entries for the blocking skips of a FrameIndex (plain dicts carry none)."""
+    files = index.blocking_files() if isinstance(index, FrameIndex) else []
+    return [{"code": code, "files": files}] if files else []
+
+
+def _summary(index):
+    return index.summary() if isinstance(index, FrameIndex) else None
 
 
 def _config_block(meta, overrides):
@@ -422,33 +495,71 @@ def _config_block(meta, overrides):
             "overrides": overrides or {}}
 
 
-def evaluate_sheet(frames, cfg, meta, label="", references=None, overrides=None, letterbox_policy=None):
-    """Sheet verdict. `frames` = {index: path-or-array}; `references` = {index: baseline} for the skin drift."""
+def _skin_status(requested, verdicts, applied):
+    """One word for what the skin check amounted to on this sheet, so 'requested but not applicable' is never
+    mistaken for 'checked and fine'."""
+    if not requested:
+        return "NOT_REQUESTED"
+    checks = [v["checks"].get("skin_hue_drift", {}) for v in verdicts]
+    if any(c.get("outcome") == NOT_EVALUABLE for c in checks) or any(v["outcome"] == NOT_EVALUABLE for v in verdicts):
+        return "INCOMPLETE"
+    if applied == 0:
+        return "REQUESTED_NOT_APPLICABLE"
+    return "APPLIED" if applied == len(verdicts) else "APPLIED_PARTIAL"
+
+
+def evaluate_sheet(frames, cfg, meta, label="", references=None, overrides=None, letterbox_policy=None,
+                   baseline_requested=False):
+    """Sheet verdict. `frames` = {index: path-or-array}; `references` = {index: baseline} for the skin drift.
+
+    `baseline_requested` (also implied by a non-empty `references`) says the caller ASKED for a baseline comparison.
+    Then a subject frame without a baseline frame, a baseline frame without a subject frame, and any image file
+    the frame indexer could not place are all INCOMPLETE with a typed entry in `incompleteReasons`: a requested
+    input that is missing never reads as agreement."""
+    requested = bool(baseline_requested or references)
+    ref_index = references
     references = references or {}
     policy = letterbox_policy or make_letterbox_policy(cfg)
     frame_verdicts = []
     for index in sorted(frames):
         v = evaluate_frame(frames[index], cfg, reference=references.get(index), frame_id=index,
-                           letterbox_policy=policy)
+                           letterbox_policy=policy, baseline_requested=requested)
         if isinstance(frames[index], str) and os.path.isfile(frames[index]):
             v["imageSha256"] = look_config.sha256_file(frames[index])
         frame_verdicts.append(v)
     counts = {PASS: 0, FAIL: 0, NOT_EVALUABLE: 0}
     for v in frame_verdicts:
         counts[v["outcome"]] += 1
-    skin_applicable = sum(1 for v in frame_verdicts if v["checks"].get("skin_hue_drift", {}).get("outcome") in (PASS, FAIL))
-    if not frame_verdicts or counts[NOT_EVALUABLE]:
-        outcome = INCOMPLETE
-    elif counts[FAIL]:
-        outcome = FAIL
-    else:
-        outcome = PASS
+    skin_checks = {v["frameId"]: v["checks"].get("skin_hue_drift", {}) for v in frame_verdicts}
+    skin_applicable = sum(1 for c in skin_checks.values() if c.get("outcome") in (PASS, FAIL))
+    missing = sorted(i for i in frames if requested and i not in references)
+    extra = sorted(i for i in references if requested and i not in frames)
+    reasons = _file_reasons(frames, "FRAME_FILES_NOT_INDEXED") + _file_reasons(ref_index, "BASELINE_FILES_NOT_INDEXED")
+    if not frame_verdicts:
+        reasons.append({"code": "NO_FRAMES"})
+    if missing:
+        reasons.append({"code": "BASELINE_MISSING_FRAMES", "indices": missing})
+    if extra:
+        reasons.append({"code": "BASELINE_FRAMES_WITHOUT_SUBJECT", "indices": extra})
+    not_evaluable = [v["frameId"] for v in frame_verdicts if v["outcome"] == NOT_EVALUABLE and v["frameId"] not in missing]
+    if not_evaluable:
+        reasons.append({"code": "FRAME_NOT_EVALUABLE", "indices": not_evaluable})
+    outcome = INCOMPLETE if reasons else (FAIL if counts[FAIL] else PASS)
     undeclared = [v["frameId"] for v in frame_verdicts
                   if v.get("geometry", {}).get("letterbox", {}).get("notes")]
     return {
         "schema": SCHEMA_FRAME_SHEET, "kind": "floor-sheet", "subject": label, "outcome": outcome,
+        "incompleteReasons": reasons,
         "frameCount": len(frame_verdicts), "counts": counts,
-        "skinCheck": {"appliedToFrames": skin_applicable, "ofFrames": len(frame_verdicts)},
+        "skinCheck": {
+            "status": _skin_status(requested, frame_verdicts, skin_applicable),
+            "appliedToFrames": skin_applicable, "ofFrames": len(frame_verdicts),
+            "notApplicableFrames": {str(i): c.get("reason") for i, c in skin_checks.items()
+                                    if c.get("outcome") == NOT_APPLICABLE},
+        },
+        "baseline": {"requested": requested, "framesMissingBaseline": missing,
+                     "baselineIndicesWithoutSubjectFrame": extra},
+        "inputs": {"frames": _summary(frames), "baseline": _summary(ref_index)},
         "letterboxPolicy": policy, "framesWithDarkBandsMeasuredAsScene": undeclared,
         "config": _config_block(meta, overrides), "frames": frame_verdicts,
     }
@@ -579,7 +690,14 @@ def compare_sheets(a_frames, b_frames, cfg, meta, scope, a_label="a", b_label="b
                 for i in indices if i not in unpaired]
     gated = bool(cfg["pair"]["scopes"][scope]["gated"])
     broken = [v for v in verdicts if v["outcome"] in (INCOMPLETE, GEOMETRY_MISMATCH)]
-    if not verdicts or unpaired or broken:
+    reasons = _file_reasons(a_frames, "A_FILES_NOT_INDEXED") + _file_reasons(b_frames, "B_FILES_NOT_INDEXED")
+    if not verdicts:
+        reasons.append({"code": "NO_FRAMES"})
+    if unpaired:
+        reasons.append({"code": "UNPAIRED_INDICES", "indices": unpaired})
+    if broken:
+        reasons.append({"code": "FRAME_NOT_COMPARABLE", "indices": [v["frameId"] for v in broken]})
+    if reasons:
         outcome = INCOMPLETE
     elif not gated:
         outcome = REPORTED
@@ -598,6 +716,7 @@ def compare_sheets(a_frames, b_frames, cfg, meta, scope, a_label="a", b_label="b
             }
     return {
         "schema": SCHEMA_PAIR, "kind": "pair-sheet", "scope": scope, "gated": gated, "outcome": outcome,
+        "incompleteReasons": reasons, "inputs": {"a": _summary(a_frames), "b": _summary(b_frames)},
         "reference": a_label, "subject": b_label, "unpairedIndices": unpaired,
         "letterboxPolicy": {"a": letterbox_policy_a or make_letterbox_policy(cfg),
                             "b": letterbox_policy_b or make_letterbox_policy(cfg)},

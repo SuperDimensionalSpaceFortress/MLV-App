@@ -108,6 +108,11 @@ def _exit_for(outcome):
     return {"PASS": 0, "REPORTED": 0, "FAIL": 1}.get(outcome, 2)
 
 
+def _reasons_text(verdict):
+    reasons = verdict.get("incompleteReasons") or []
+    return " incompleteReasons=" + json.dumps(reasons) if reasons else ""
+
+
 def _policy(cfg, mode, bars_spec):
     """The caller's letterbox decision for ONE capture (see look_metrics.make_letterbox_policy)."""
     import look_metrics
@@ -116,20 +121,31 @@ def _policy(cfg, mode, bars_spec):
     return look_metrics.make_letterbox_policy(cfg, mode=mode, declared=declared)
 
 
+def _refuse_same_directory(first, second, what):
+    """Comparing a directory with itself is perfect agreement by construction, so it is refused, not measured."""
+    if os.path.normcase(os.path.realpath(first)) == os.path.normcase(os.path.realpath(second)):
+        raise ValueError(f"{what}: both sides are the same directory ({first!r}); a frame set always agrees with itself")
+
+
 def cmd_floor(args):
     import look_metrics
 
     cfg, meta = look_config.load_config(args.config)
     policy = _policy(cfg, args.letterbox, args.letterbox_bars)
+    if args.baseline_dir:
+        _refuse_same_directory(args.frames_dir, args.baseline_dir, "floor --baseline-dir")
     frames = look_metrics.index_frames(args.frames_dir)
+    # A baseline dir that was GIVEN is a baseline that was REQUESTED: whatever it lacks is missing, not "not asked for".
     baselines = look_metrics.index_frames(args.baseline_dir) if args.baseline_dir else {}
     verdict = look_metrics.evaluate_sheet(frames, cfg, meta, label=args.label, references=baselines,
-                                          letterbox_policy=policy)
+                                          letterbox_policy=policy, baseline_requested=bool(args.baseline_dir))
     verdict["createdUtc"] = _now()
     verdict["source"] = args.source_note
     _write_json(args.out, verdict)
+    skin = verdict["skinCheck"]
     print(f"floor {args.label}: {verdict['outcome']} frames={verdict['frameCount']} counts={verdict['counts']} "
-          f"skinCheckApplied={verdict['skinCheck']['appliedToFrames']}/{verdict['skinCheck']['ofFrames']}")
+          f"skinCheck={skin['status']} applied={skin['appliedToFrames']}/{skin['ofFrames']}"
+          + _reasons_text(verdict))
     return _exit_for(verdict["outcome"])
 
 
@@ -138,6 +154,7 @@ def cmd_pair_metrics(args):
 
     cfg, meta = look_config.load_config(args.config)
     overrides = _apply_overrides(cfg, args)
+    _refuse_same_directory(args.a_dir, args.b_dir, "pair-metrics")
     a = look_metrics.index_frames(args.a_dir)
     b = look_metrics.index_frames(args.b_dir)
     verdict = look_metrics.compare_sheets(
@@ -150,7 +167,8 @@ def cmd_pair_metrics(args):
     agg = verdict["aggregate"] or {}
     print(f"pair-metrics {args.a_label} vs {args.b_label} scope={args.scope}: {verdict['outcome']} "
           f"thresholdsMetOnAllFrames={verdict['thresholdsMetOnAllFrames']} "
-          f"meanSsim={agg.get('meanSsimLuma')} meanMismatch={agg.get('meanMismatchFraction')}")
+          f"meanSsim={agg.get('meanSsimLuma')} meanMismatch={agg.get('meanMismatchFraction')}"
+          + _reasons_text(verdict))
     return _exit_for(verdict["outcome"])
 
 
@@ -197,24 +215,36 @@ def _prepare_subject_frames(name, directory, out_dir, cfg, policy=None):
     import look_metrics
     from PIL import Image
 
-    prepared = {}
+    prepared, records = {}, []
     os.makedirs(out_dir, exist_ok=True)
-    for index, path in look_metrics.index_frames(directory).items():
+    index = look_metrics.index_frames(directory)
+    blocking = index.blocking_files()
+    if blocking:  # a frame that cannot be indexed is a frame the judges would never see
+        raise look_metrics.FrameIndexError(
+            f"{directory!r} holds image files that cannot be placed as frames: {blocking}")
+    for number, path in index.items():
         arr = look_metrics.load_rgb(path)
-        active = look_metrics.crop_active(arr, look_metrics.detect_letterbox(arr, cfg, policy))
-        target = os.path.join(out_dir, f"{name}-{index:02d}.png")
+        letterbox = look_metrics.detect_letterbox(arr, cfg, policy)
+        active = look_metrics.crop_active(arr, letterbox)
+        target = os.path.join(out_dir, f"{name}-{number:02d}.png")
         Image.fromarray(np.ascontiguousarray(active), "RGB").save(target)
-        prepared[index] = target
-    return prepared
+        prepared[number] = target
+        records.append({
+            "subject": name, "frameId": number, "sourceSize": [int(arr.shape[1]), int(arr.shape[0])],
+            "preparedSize": [int(active.shape[1]), int(active.shape[0])],
+            "letterbox": {k: letterbox[k] for k in ("mode", "provenance", "top", "bottom", "left", "right",
+                                                    "excludedPct", "refused", "notes", "candidate", "declared")}})
+    return prepared, records
 
 
 def _common_crop(a_frames, b_frames, tolerance_px, name_a="a", name_b="b"):
     """Centre-crop each shared frame pair to a common size when the sizes differ by <= tolerance. Returns
-    (kept indices, dropped) where dropped = [{"frameId", "reason"}]: a frame that is not kept is never silent."""
+    (kept indices, dropped, crops) where dropped = [{"frameId", "reason"}] (a frame that is not kept is never
+    silent) and crops = [{"frameId", "from": {name: [w, h]}, "to": [w, h]}] for every pair that was cropped."""
     import numpy as np
     from PIL import Image
 
-    keep, dropped = [], []
+    keep, dropped, crops = [], [], []
     for index in sorted(set(a_frames) ^ set(b_frames)):
         only = name_a if index in a_frames else name_b
         dropped.append({"frameId": index, "reason": f"UNSHARED: frame exists only in {only}"})
@@ -232,19 +262,28 @@ def _common_crop(a_frames, b_frames, tolerance_px, name_a="a", name_b="b"):
                     arr = np.asarray(im.convert("RGB"))
                 t, l = (arr.shape[0] - h) // 2, (arr.shape[1] - w) // 2
                 Image.fromarray(np.ascontiguousarray(arr[t:t + h, l:l + w]), "RGB").save(frames[index])
+            crops.append({"frameId": index, "from": {name_a: [wa, ha], name_b: [wb, hb]}, "to": [w, h]})
         keep.append(index)
-    return keep, dropped
+    return keep, dropped, crops
 
 
 def cmd_build_session(args):
-    cfg, _ = look_config.load_config(args.config)
+    cfg, meta = look_config.load_config(args.config)
     lock = look_config.verify_rubric_lock()  # the digest is recorded BEFORE any image exists
+    allowance = args.allow_dropped_frames
+    if allowance is not None and not allowance.strip():
+        raise ValueError("--allow-dropped-frames needs a reason (say why losing those frames is acceptable)")
     name_a, dir_a = _parse_subject(args.a)
     name_b, dir_b = _parse_subject(args.b)
     prep = os.path.join(args.out_dir, "source-frames")
-    fa = _prepare_subject_frames(name_a, dir_a, prep, cfg, _policy(cfg, args.letterbox, args.a_letterbox_bars))
-    fb = _prepare_subject_frames(name_b, dir_b, prep, cfg, _policy(cfg, args.letterbox, args.b_letterbox_bars))
-    keep, dropped = _common_crop(fa, fb, args.common_crop_tolerance_px, name_a, name_b)
+    policy_a = _policy(cfg, args.letterbox, args.a_letterbox_bars)
+    policy_b = _policy(cfg, args.letterbox, args.b_letterbox_bars)
+    fa, records_a = _prepare_subject_frames(name_a, dir_a, prep, cfg, policy_a)
+    fb, records_b = _prepare_subject_frames(name_b, dir_b, prep, cfg, policy_b)
+    keep, dropped, common_crops = _common_crop(fa, fb, args.common_crop_tolerance_px, name_a, name_b)
+    capture = {"configSha256": meta["configSha256"], "configVersion": meta["configVersion"],
+               "letterboxPolicy": {name_a: policy_a, name_b: policy_b}, "frameCrops": records_a + records_b,
+               "commonCrops": common_crops, "commonCropTolerancePx": args.common_crop_tolerance_px}
     if args.frame_ids:
         wanted = [int(x) for x in args.frame_ids.split(",")]
         dropped += [{"frameId": i, "reason": "NOT_IN_--frame-ids"} for i in keep if i not in wanted]
@@ -258,13 +297,20 @@ def cmd_build_session(args):
     paths = look_pairs.build_session(
         {"name": name_a, "frames": fa}, {"name": name_b, "frames": fb}, keep, args.seed, args.out_dir,
         lock["rubricSha256"], controls=args.controls, positive_controls=args.positive_controls,
-        created_utc=_now(), dropped_frames=dropped, crop_tolerance_px=args.common_crop_tolerance_px)
+        created_utc=_now(), dropped_frames=dropped, crop_tolerance_px=args.common_crop_tolerance_px,
+        capture=capture, drop_allowance=allowance)
     dropped_sorted = sorted(dropped, key=lambda d: d["frameId"])
     if dropped_sorted:
         print(f"[look_cli] WARNING {len(dropped_sorted)} frame(s) were NOT judged: "
               + "; ".join(f"{d['frameId']} ({d['reason']})" for d in dropped_sorted), file=sys.stderr)
     print(json.dumps({"frames": keep, "droppedFrames": dropped_sorted,
                       "files": {k: os.path.basename(v) for k, v in paths.items()}}))
+    lost = look_pairs.drop_policy(dropped)["lossFrameIds"]
+    if lost and allowance is None:
+        print(f"[look_cli] ERROR UNACKNOWLEDGED_DROPPED_FRAMES: frames {lost} were lost, not chosen. The session is "
+              "written and marked, and look_tally will call it unusable; rebuild with the frames fixed, or pass "
+              "--allow-dropped-frames REASON to record why the loss is acceptable.", file=sys.stderr)
+        return 2
     return 0
 
 
@@ -303,11 +349,11 @@ def cmd_tally(args):
     key = _read_json(os.path.join(args.session_dir, "answer_key.json"))
     session = _read_json(os.path.join(args.session_dir, "session.json"))
     results = _read_json(args.results)
-    cfg, _ = look_config.load_config(args.config)
+    cfg, meta = look_config.load_config(args.config)
     entry = look_tally.tally(
         key, results["items"], results["judge"], session, cfg,
         current_image_sha256=_current_image_digests(args.session_dir), forbidden_models=args.producer_model,
-        cross_family_status=args.cross_family_status)
+        cross_family_status=args.cross_family_status, config_sha256=meta["configSha256"])
     entry["errorsDuringJudging"] = results.get("errors", {})
     entry["staleRejectedAtJudging"] = results.get("staleRejected", {})
     entry["createdUtc"] = _now()
@@ -326,7 +372,8 @@ def cmd_judge_disagreement(args):
     verdict["createdUtc"] = _now()
     if args.out:
         _write_json(args.out, verdict)
-    print(json.dumps({k: verdict[k] for k in ("thirdJudgeNeeded", "thresholdPoints", "comparable", "unusableJudges")}))
+    print(json.dumps({k: verdict[k] for k in ("thirdJudgeNeeded", "thresholdPoints", "comparable", "unusableJudges",
+                                              "sessionMismatches")}))
     return 0 if verdict["comparable"] else 2
 
 
@@ -397,6 +444,9 @@ def main(argv=None):
     s.add_argument("--max-frames", type=int)
     s.add_argument("--frame-ids", help="comma-separated frame indices to judge (default: every shared frame)")
     s.add_argument("--common-crop-tolerance-px", type=int, default=2)
+    s.add_argument("--allow-dropped-frames", metavar="REASON",
+                   help="acknowledge that frames were LOST (unshared, outside the crop tolerance, requested but absent) "
+                        "and why that is acceptable; without it the session is marked and the tally calls it unusable")
     s.add_argument("--config")
     s.set_defaults(fn=cmd_build_session)
 
