@@ -752,12 +752,42 @@ TEST( SourceFrameCounter, ASeekThatIsNotAnEngineTickIsNeverCountedAsFootage )
     // Something (a seek, a snap at Play start) moved the playhead to 400; the next engine tick starts from there.
     counter.noteEngineTick( 400.0, 401.0, false );
     ASSERT_EQ( 1, counter.externalJumpRebases );
-    ASSERT_EQ( 2, counter.consumed() );                        // 400 and 401 are on screen; frames 2..399 were never played
-    ASSERT_EQ( 400, counter.startFrame );
+    // r2 (sol H1): the frames the engine really advanced BEFORE the seek stay counted (0, 1 and now 401); the jump
+    // itself (frames 2..399, never played) is not. consumed() never goes down.
+    ASSERT_EQ( 3, counter.consumed() );
+    ASSERT_EQ( 0, counter.startFrame );                        // the Play still started at frame 0
     // A jump BACK is not a rebase: those frames were already counted or never will be.
     counter.noteEngineTick( 100.0, 101.0, false );
     ASSERT_EQ( 1, counter.externalJumpRebases );
-    ASSERT_EQ( 2, counter.consumed() );
+    ASSERT_EQ( 3, counter.consumed() );
+}
+
+TEST( SourceFrameCounter, SolH1ConsumedNeverDecreasesAcrossForwardSeeksAndNeverCountsTheJump )
+{
+    SourceFrameAdvanceCounter counter;
+    counter.begin( 0 );
+    int64_t last = counter.consumed();
+    for( int f = 0; f < 100; ++f )
+    {
+        counter.noteEngineTick( f, f + 1.0, false );
+        ASSERT_TRUE( counter.consumed() >= last );
+        last = counter.consumed();
+    }
+    ASSERT_EQ( 101, counter.consumed() );
+    // Three forward seeks, each followed by engine ticks: the count only ever grows, by the ticks alone.
+    const int seeks[] = { 300, 500, 700 };
+    for( const int base : seeks )
+    {
+        for( int f = base; f < base + 10; ++f )
+        {
+            counter.noteEngineTick( f, f + 1.0, false );
+            ASSERT_TRUE( counter.consumed() >= last );
+            last = counter.consumed();
+        }
+    }
+    ASSERT_EQ( 3, counter.externalJumpRebases );
+    ASSERT_EQ( 131, counter.consumed() );                      // 101 + 3 x 10 ticks; 600 frames of jumps are not footage
+    ASSERT_TRUE( counter.consumed() < 701 );
 }
 
 TEST( SourceFrameCounter, ASecondBeginDoesNotRestartTheCount )
@@ -790,11 +820,55 @@ TEST( PlayStopDecision, ReachedEndedEarlySafetyTimeoutAndContinueAreTyped )
                std::string( playback_frame_range::playStopFailureReason( PlayStopState::SafetyTimeout ) ) );
 }
 
-TEST( PlayStopDecision, TheSafetyNetIsTheRequestedWindowPlusAFixedMargin )
+TEST( PlayStopDecision, TheSafetyNetScalesWithTheMinimumSustainedPaceNotAFixedMargin )
 {
-    ASSERT_EQ( 35000, playSafetyMs( 20.0 ) );
-    ASSERT_EQ( 39000, playSafetyMs( 24.0 ) );
+    // r2 (fable H1): requested / 0.5 + 15 s -- a venue holding half the native pace can still finish.
+    ASSERT_EQ( 55000, playSafetyMs( 20.0 ) );
+    ASSERT_EQ( 63000, playSafetyMs( 24.0 ) );
+    ASSERT_EQ( 95000, playSafetyMs( 40.0 ) );
     ASSERT_TRUE( playSafetyMs( 20.0 ) > playback_frame_range::kMinPlayWindowMs );
+    ASSERT_TRUE( playSafetyMs( 20.0 ) >= static_cast<int64_t>( 20000 / playback_frame_range::kMinSustainedPaceFraction ) );
+}
+
+TEST( PlayStopDecision, ARunTooSlowToFinishInsideTheBudgetEndsEarlyWithTheTypedPaceToken )
+{
+    const int64_t budget = playSafetyMs( 20.0 );
+    // 50 frames in 9 s -> 480 frames would need ~88 s: doomed, so it ends NOW as PLAY_PACE_TOO_SLOW (not at 55 s).
+    ASSERT_TRUE( evaluatePlayStop( 50, 480, true, 9000, budget ) == PlayStopState::PaceTooSlow );
+    ASSERT_EQ( std::string( "PLAY_PACE_TOO_SLOW" ),
+               std::string( playback_frame_range::playStopFailureReason( PlayStopState::PaceTooSlow ) ) );
+    // 150 frames in 9 s projects to ~29 s: fine, keep going.
+    ASSERT_TRUE( evaluatePlayStop( 150, 480, true, 9000, budget ) == PlayStopState::Continue );
+    // Not trusted before the probe window, nor on a single frame (a slow first frame is not a pace).
+    ASSERT_TRUE( evaluatePlayStop( 2, 480, true, playback_frame_range::kPaceProbeMs - 1, budget ) == PlayStopState::Continue );
+    ASSERT_TRUE( evaluatePlayStop( 1, 480, true, 20000, budget ) == PlayStopState::Continue );
+    // The hard timeout still wins when both would apply, and Reached still beats everything.
+    ASSERT_TRUE( evaluatePlayStop( 50, 480, true, budget, budget ) == PlayStopState::SafetyTimeout );
+    ASSERT_TRUE( evaluatePlayStop( 480, 480, true, 9000, budget ) == PlayStopState::Reached );
+    // A run exactly at half pace finishes inside the budget and is never called too slow on the way.
+    const EngineRun half = runEngine( 0, 1, 720, 12.0, 480, budget );
+    ASSERT_TRUE( half.state == PlayStopState::Reached );
+    ASSERT_TRUE( half.consumed >= 480 );
+    // A run at a quarter of the pace is stopped early with the pace token, well before the safety timeout.
+    const EngineRun slow = runEngine( 0, 1, 720, 6.0, 480, budget );
+    ASSERT_TRUE( slow.state == PlayStopState::PaceTooSlow );
+    ASSERT_TRUE( slow.elapsedMs < budget );
+    ASSERT_TRUE( slow.consumed < 480 );
+}
+
+TEST( LookAssistSettle, ASecondSettleNeverAsksForAnotherPlayBecauseTheProcessAdmitsExactlyOne )
+{
+    using playback_frame_range::lookAssistSettleNeedsOwnPlay;
+    ASSERT_TRUE( lookAssistSettleNeedsOwnPlay( 0 ) );          // the load settle: it owns the one Play
+    ASSERT_FALSE( lookAssistSettleNeedsOwnPlay( 1 ) );         // the recheck settle after the off/on toggle
+    ASSERT_FALSE( lookAssistSettleNeedsOwnPlay( 2 ) );
+    // The ledger agrees: a second admitted Play is REPLAY_REFUSED, so asking for one would be exit 14 every time.
+    playback_frame_range::ProgrammaticPlayLedger ledger;
+    const PlayableWindowVerdict ok = evaluatePlayableWindow( 0, 1, 720, 720, 24.0, 20.0 );
+    ASSERT_TRUE( ledger.admit( ok ) );
+    ASSERT_FALSE( ledger.admit( ok ) );
+    ASSERT_EQ( std::string( "REPLAY_REFUSED" ), std::string( ledger.lastRefusalReason ) );
+    ASSERT_FALSE( lookAssistSettleNeedsOwnPlay( ledger.admitted ) );
 }
 
 // sol r2 BLOCKER, reproduced: a persisted fpsOverride=12 on a 24 fps, 720-frame clip.
@@ -811,16 +885,18 @@ TEST( SourceFrameEngine, SolR2ReproTheOldWallClockRuleStopsAtTwentySecondsAfterT
 
 TEST( SourceFrameEngine, TheSameRunUnderTheNewRuleIsRefusedBeforePlayAtTheEnginesRealPace )
 {
-    // Admission at the engine's actual pace: 479 further frames at 12 fps need 39.9 s of wall clock, and the
-    // caller's budget for a 20 s request is 35 s -> refused BEFORE Play, typed.
-    const PlayableWindowVerdict v = evaluatePlayableWindow( 0, 1, 720, 720, 24.0, 20.0, 20.0, true, 12.0 );
+    // Admission at the engine's actual pace: 479 further frames at 8 fps need 59.9 s of wall clock, and the
+    // caller's budget for a 20 s request is 55 s (r2: requested / 0.5 + 15 s) -> refused BEFORE Play, typed.
+    const PlayableWindowVerdict v = evaluatePlayableWindow( 0, 1, 720, 720, 24.0, 20.0, 20.0, true, 8.0 );
     ASSERT_FALSE( v.ok );
     ASSERT_EQ( std::string( "PLAY_PACE_TOO_SLOW" ), std::string( v.reason ) );
     ASSERT_EQ( std::string( "pace" ), std::string( v.scope ) );
     ASSERT_EQ( 480, v.requiredFrames );
     ASSERT_TRUE( v.wallNeededSeconds > v.wallBudgetSeconds );
     // The 24 s request of the repro (--seconds 24) is refused for the same reason.
-    ASSERT_FALSE( evaluatePlayableWindow( 0, 1, 720, 720, 24.0, 24.0, 20.0, true, 12.0 ).ok );
+    ASSERT_FALSE( evaluatePlayableWindow( 0, 1, 720, 720, 24.0, 24.0, 20.0, true, 8.0 ).ok );
+    // Exactly the minimum sustained pace (half of native) is admitted -- and must then consume all 480 frames.
+    ASSERT_TRUE( evaluatePlayableWindow( 0, 1, 720, 720, 24.0, 20.0, 20.0, true, 12.0 ).ok );
 }
 
 TEST( SourceFrameEngine, ASlowPaceThatStillFitsTheBudgetIsAdmittedAndMustConsumeEverySourceFrame )
@@ -872,9 +948,11 @@ TEST( SourceFrameEngine, ARangeEndingBeforeTheRequirementEndsEarlyNeverAsAPass )
 TEST( SourceFrameEngine, ALoopingEngineNeverReachesTheRequirementByReplayingFootage )
 {
     // Loop on a 100-frame range: the position wraps, the counter ignores the replayed footage, so 480 is never
-    // consumed -- the run ends on the safety timeout (typed), and the wrap is visible.
+    // consumed -- the run ends typed (PLAY_PACE_TOO_SLOW once the projection is doomed, else the safety timeout),
+    // never Reached, and the wrap is visible.
     const EngineRun run = runEngine( 0, 1, 100, 24.0, 480, playSafetyMs( 20.0 ), 0, true );
-    ASSERT_TRUE( run.state == PlayStopState::SafetyTimeout );
+    ASSERT_TRUE( run.state == PlayStopState::SafetyTimeout || run.state == PlayStopState::PaceTooSlow );
+    ASSERT_FALSE( run.state == PlayStopState::Reached );
     ASSERT_TRUE( run.consumed <= 100 );
     ASSERT_TRUE( run.wrapped );
 }

@@ -26,6 +26,7 @@
 #include <QProcess>
 #include <QRegularExpression>
 #include <QSettings>
+#include "AutomationSettings.h"
 #include <QStandardPaths>
 #include <QString>
 #include <QSysInfo>
@@ -311,9 +312,7 @@ int boundedProfilingSettingInt(const char *settingKey,
                                int minimum,
                                int maximum)
 {
-    QSettings set(QSettings::UserScope,
-                  QStringLiteral("magiclantern.MLVApp"),
-                  QStringLiteral("MLVApp"));
+    auto setStore = automation_settings::openAppSettings(); QSettings &set = *setStore;
     bool ok = false;
     int value = set.value(QString::fromLatin1(settingKey), defaultValue).toInt(&ok);
     if (!ok) value = defaultValue;
@@ -324,9 +323,7 @@ int boundedProfilingSettingInt(const char *settingKey,
 
 bool profilingSettingEnabled(const char *settingKey)
 {
-    QSettings set(QSettings::UserScope,
-                  QStringLiteral("magiclantern.MLVApp"),
-                  QStringLiteral("MLVApp"));
+    auto setStore = automation_settings::openAppSettings(); QSettings &set = *setStore;
     return set.value(QString::fromLatin1(settingKey), false).toBool();
 }
 
@@ -675,18 +672,14 @@ void publishMachineFingerprintEnvironment()
 
 bool performanceFieldLogSettingsEnabled()
 {
-    QSettings set(QSettings::UserScope,
-                  QStringLiteral("magiclantern.MLVApp"),
-                  QStringLiteral("MLVApp"));
+    auto setStore = automation_settings::openAppSettings(); QSettings &set = *setStore;
     return set.value(QString::fromLatin1(kPerformanceFieldLogSetting), false)
         .toBool();
 }
 
 void setPerformanceFieldLogSettingsEnabled(bool enabled)
 {
-    QSettings set(QSettings::UserScope,
-                  QStringLiteral("magiclantern.MLVApp"),
-                  QStringLiteral("MLVApp"));
+    auto setStore = automation_settings::openAppSettings(); QSettings &set = *setStore;
     set.setValue(QString::fromLatin1(kPerformanceFieldLogSetting), enabled);
     set.sync();
 }
@@ -746,9 +739,7 @@ bool cudaPlaybackProfilingSettingsEnabled()
 
 void setCudaPlaybackProfilingSettingsEnabled(bool enabled)
 {
-    QSettings set(QSettings::UserScope,
-                  QStringLiteral("magiclantern.MLVApp"),
-                  QStringLiteral("MLVApp"));
+    auto setStore = automation_settings::openAppSettings(); QSettings &set = *setStore;
     set.setValue(QString::fromLatin1(kCudaPlaybackProfilingSetting), enabled);
     set.sync();
 }
@@ -832,9 +823,7 @@ void setDngAsyncCompressionProfilingSettings(bool enabled,
                                              int queueDepth,
                                              int threadCount)
 {
-    QSettings set(QSettings::UserScope,
-                  QStringLiteral("magiclantern.MLVApp"),
-                  QStringLiteral("MLVApp"));
+    auto setStore = automation_settings::openAppSettings(); QSettings &set = *setStore;
     const int boundedQueueDepth = qBound(1, queueDepth, 8);
     const int boundedThreadCount = qBound(1, threadCount, 4);
     set.setValue(QString::fromLatin1(kDngAsyncCompressionProfilingSetting),

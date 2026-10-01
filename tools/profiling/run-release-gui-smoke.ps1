@@ -1723,8 +1723,10 @@ $effectiveExpectedVisualScaleRequest = if ($ExpectedVisualScaleRequest -eq -2) {
     $ExpectedVisualScaleRequest
 }
 
+# ENFORCE-3 r2: the app's own wall-clock safety net for the window is requested / 0.5 + 15 s (it ends the Play with a
+# typed failure inside it), so the runner's process budget starts from that, never from the bare window.
 $derivedProcessTimeoutMs = [Math]::Ceiling(
-    ([Math]::Max(0.0, $Seconds) * 1000.0) +
+    (Get-GuiSmokePlaySafetyMs -Seconds $Seconds) +
     [Math]::Max(0, $SettleMs) +
     [Math]::Max(0, $SettleCpuMaxMs) +
     [Math]::Max(0, $ScreenshotDelayMs) +

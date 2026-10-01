@@ -28,9 +28,9 @@ param(
     [int]$TimeoutSeconds = 90,
     # Directories prepended to PATH so a non-deployed build finds its Qt / MinGW DLLs (exit 0xC0000135 otherwise).
     [string[]]$DllDirs = @(),
-    # PLAYBACK-CLIP-LENGTH-ENFORCE-3: also prove, against the REAL persisted QSettings of this user (HKCU
-    # Software\magiclantern.MLVApp\MLVApp), that an automation run ignores a saved fpsOverride=true/frameRate=12.
-    # The two values are written for the probe and the original values are put back in a finally block.
+    # PLAYBACK-CLIP-LENGTH-ENFORCE-3: also prove that an automation run ignores a saved fpsOverride=true/frameRate=12.
+    # r2: the override is seeded into the run's OWN settings store (an INI file in a directory of this script's),
+    # never into the user's real settings, and the probe checks that the real settings did not change.
     [switch]$PersistedOverrideProbe
 )
 $ErrorActionPreference = 'Stop'
@@ -131,28 +131,38 @@ $results += Invoke-GateEntry -Name 'autoplay-env-hook-24s-on-a-short-clip' -MayN
 
 # ---- ENFORCE-3: a persisted fpsOverride must not change what an automation run measures ---------------------
 # The venue's saved fpsOverride=true / frameRate=12 used to pace the engine at 12 fps while the gate and every
-# stop counted 24 fps footage. Automation now ignores both (isolateAutomationPacing); the app logs what it found
-# persisted and the pace the gate measured with, and that pace must be the clip's native fps, never 12.
+# stop counted 24 fps footage. r2 (sol H2 / fable H5): an automation run now reads a RUN-SCOPED settings store
+# (platform/qt/AutomationSettings.h), never the venue's, so this probe seeds the override into THAT store only --
+# an INI file in the run's own directory, handed to the app through MLVAPP_AUTOMATION_SETTINGS_DIR -- and the
+# user's real settings (HKCU) are never written. The app still loads the seeded value (the second line of defence,
+# isolateAutomationPacing, is what is being proven) and must pace at the clip's native fps, never 12.
 if ($PersistedOverrideProbe) {
-    $settingsKey = 'HKCU:\Software\magiclantern.MLVApp\MLVApp'
-    $savedOverride = (Get-ItemProperty -LiteralPath $settingsKey -Name fpsOverride -ErrorAction SilentlyContinue).fpsOverride
-    $savedRate = (Get-ItemProperty -LiteralPath $settingsKey -Name frameRate -ErrorAction SilentlyContinue).frameRate
-    try {
-        Set-ItemProperty -LiteralPath $settingsKey -Name fpsOverride -Value 'true'
-        Set-ItemProperty -LiteralPath $settingsKey -Name frameRate -Value '12'
-        $results += Invoke-GateEntry -Name 'gui-smoke-persisted-fps-override-12' -ExpectExit 14 -ExpectToken 'CLIP_TOO_SHORT' `
-            -ExtraTokens @('automation.pacing_isolated site=gui-smoke-entry persisted_fps_override=1 persisted_frame_rate=12.000') `
-            -ForbiddenTokens @('pace_fps=12.000') `
-            -Arguments @('--gui-smoke-playback', '--input', $fixture, '--seconds', '25')
-        $results += Invoke-GateEntry -Name 'profile-persisted-fps-override-12' -ExpectExit 14 -ExpectToken 'CLIP_TOO_SHORT' `
-            -ExtraTokens @('automation.pacing_isolated site=profile-entry persisted_fps_override=1 persisted_frame_rate=12.000') `
-            -ForbiddenTokens @('pace_fps=12.000') -OutputPath $profileOutput `
-            -Arguments @('--profile-playback', '--input', $fixture, '--output', $profileOutput, '--frames', '3', '--exercise-play-action')
-    } finally {
-        if ($null -ne $savedOverride) { Set-ItemProperty -LiteralPath $settingsKey -Name fpsOverride -Value $savedOverride }
-        if ($null -ne $savedRate) { Set-ItemProperty -LiteralPath $settingsKey -Name frameRate -Value $savedRate }
-        Write-Output ("persisted settings restored: fpsOverride={0} frameRate={1}" -f
-            (Get-ItemProperty -LiteralPath $settingsKey -Name fpsOverride).fpsOverride, (Get-ItemProperty -LiteralPath $settingsKey -Name frameRate).frameRate)
+    $realKey = 'HKCU:\Software\magiclantern.MLVApp\MLVApp'
+    $realBefore = if (Test-Path -LiteralPath $realKey) { (Get-ItemProperty -LiteralPath $realKey | Select-Object fpsOverride, frameRate, dragFrameMode | ConvertTo-Json -Compress) } else { '(absent)' }
+    $storeDir = Join-Path $work 'run-scoped-settings'
+    New-Item -ItemType Directory -Force -Path $storeDir | Out-Null
+    [IO.File]::WriteAllText((Join-Path $storeDir 'MLVApp.ini'), "[General]`r`nfpsOverride=true`r`nframeRate=12`r`ndragFrameMode=false`r`n")
+    $results += Invoke-GateEntry -Name 'gui-smoke-persisted-fps-override-12' -ExpectExit 14 -ExpectToken 'CLIP_TOO_SHORT' `
+        -Environment @{ MLVAPP_AUTOMATION_SETTINGS_DIR = $storeDir } `
+        -ExtraTokens @('automation.pacing_isolated site=gui-smoke-entry persisted_fps_override=1 persisted_frame_rate=12.000', 'settings_store=run_scoped') `
+        -ForbiddenTokens @('pace_fps=12.000', 'settings_store=venue_NOT_ISOLATED') `
+        -Arguments @('--gui-smoke-playback', '--input', $fixture, '--seconds', '25')
+    $results += Invoke-GateEntry -Name 'profile-persisted-fps-override-12' -ExpectExit 14 -ExpectToken 'CLIP_TOO_SHORT' `
+        -Environment @{ MLVAPP_AUTOMATION_SETTINGS_DIR = $storeDir } `
+        -ExtraTokens @('automation.pacing_isolated site=profile-entry persisted_fps_override=1 persisted_frame_rate=12.000', 'settings_store=run_scoped') `
+        -ForbiddenTokens @('pace_fps=12.000', 'settings_store=venue_NOT_ISOLATED') -OutputPath $profileOutput `
+        -Arguments @('--profile-playback', '--input', $fixture, '--output', $profileOutput, '--frames', '3', '--exercise-play-action')
+    # An entry with NO seeded store: the run gets a fresh empty one, so nothing persisted is even read.
+    $results += Invoke-GateEntry -Name 'gui-smoke-fresh-run-scoped-store-reads-nothing' -ExpectExit 14 -ExpectToken 'CLIP_TOO_SHORT' `
+        -ExtraTokens @('automation.pacing_isolated site=gui-smoke-entry persisted_fps_override=0', 'settings_store=run_scoped') `
+        -ForbiddenTokens @('settings_store=venue_NOT_ISOLATED') `
+        -Arguments @('--gui-smoke-playback', '--input', $fixture, '--seconds', '25')
+    $realAfter = if (Test-Path -LiteralPath $realKey) { (Get-ItemProperty -LiteralPath $realKey | Select-Object fpsOverride, frameRate, dragFrameMode | ConvertTo-Json -Compress) } else { '(absent)' }
+    if ($realAfter -ne $realBefore) {
+        $results += [pscustomobject]@{ entry = 'real-settings-untouched'; exit = 'n/a'; expectedExit = 'n/a'; typedReason = 'HKCU unchanged'
+                                       reasonSeen = $false; playToggledOn = $false; outputWritten = $false; refusedBeforePlay = $false }
+    } else {
+        Write-Output 'real HKCU settings untouched by the probe (before == after)'
     }
 }
 

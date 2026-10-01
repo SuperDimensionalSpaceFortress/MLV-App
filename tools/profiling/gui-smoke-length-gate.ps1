@@ -500,3 +500,103 @@ function Get-GuiSmokeLoopVerdict {
     }
     return [pscustomobject]@{ invalid = ($failures.Count -gt 0); failures = $failures }
 }
+
+# ---------------------------------------------------------------------------------------------------
+# PLAYBACK-CLIP-LENGTH-ENFORCE-3 round 2 -- THE RECEIPT ORACLE FOR EVERY LAUNCHER THAT STARTS THE APP FOR AN
+# EVIDENCE PLAY ITSELF (fable BLOCKER + H3). "No tracked tool or app path can end an evidence Play -- or report a
+# normal result -- having consumed < 20 s of source footage, without the result being INVALID." The app counts the
+# source frames its engine advanced; a launcher may not stop the app on a clock of its own, and may not trust the
+# app's exit code alone (a binary that predates ENFORCE-3 exits 0 after a wall-clock hold). Instead it
+#   1. WAITS for the app to end its own Play (a kill by the launcher is a typed PLAY_SAFETY_TIMEOUT failure), and
+#   2. reads the app's playback_smoke.summary (or the profile receipt's metadata) and applies
+#      Get-GuiSmokeEvidencePlayVerdict: no summary, no source_advanced, source_advanced < required_source_frames,
+#      a wrap, an fps override or a non-native pace is INVALID (exit 43), never a normal result.
+# tools/repo_hygiene/test_playback_clip_length_gate.py pins which launchers carry this and mutation-tests it.
+# ---------------------------------------------------------------------------------------------------
+
+# Mirrors platform/qt/PlaybackFrameRange.h (kMinSustainedPaceFraction, kPlaySafetyMarginMs); a parity test compares them.
+$script:GuiSmokeMinSustainedPaceFraction = 0.5
+$script:GuiSmokePlaySafetyMarginMs = 15000
+
+function Get-GuiSmokePlaySafetyMs {
+    # The wall-clock safety net of an evidence Play of `Seconds` of footage: requested / 0.5 + 15 s. The app ends the
+    # Play on its own typed failure inside this; a launcher's own process budget is this plus the open/settle time.
+    param([Parameter(Mandatory = $true)][double]$Seconds)
+    return [int64][Math]::Ceiling([Math]::Max(0.0, $Seconds) * 1000.0 / $script:GuiSmokeMinSustainedPaceFraction) + $script:GuiSmokePlaySafetyMarginMs
+}
+
+function Read-GuiSmokePlaybackSummaryFromLogDir {
+    # The last playback_smoke.summary line of the newest app log in -LogDir written at or after -SinceUtc, parsed
+    # like the runner parses it. $null when there is none (an app that never finished its session writes none).
+    param([Parameter(Mandatory = $true)][string]$LogDir, [datetime]$SinceUtc = [datetime]::new(2000, 1, 1, 0, 0, 0, [DateTimeKind]::Utc))
+    if (-not (Test-Path -LiteralPath $LogDir -PathType Container)) { return $null }
+    # two seconds of slack for file-system timestamp granularity; MinValue (no lower bound) cannot be moved back
+    $threshold = if ($SinceUtc.Ticks -gt 100000000) { $SinceUtc.AddSeconds(-2) } else { $SinceUtc }
+    $logs = @(Get-ChildItem -LiteralPath $LogDir -Filter 'mlvapp-*.log' -File -ErrorAction SilentlyContinue |
+        Where-Object { $_.LastWriteTimeUtc -ge $threshold } | Sort-Object LastWriteTimeUtc -Descending)
+    foreach ($log in $logs) {
+        $line = @(Get-Content -LiteralPath $log.FullName -ErrorAction SilentlyContinue |
+            Where-Object { $_ -like '*playback_smoke.summary*' } | Select-Object -Last 1)
+        if ($line.Count -gt 0 -and $line[0]) { return (Convert-PlaybackLogLineToObject -Line ([string]$line[0])) }
+    }
+    return $null
+}
+
+function Get-GuiSmokeProfileReceiptSummary {
+    # The profile receipt (--profile-playback --output <json>) carries the same oracle fields in its metadata; shaped
+    # here like a playback_smoke.summary so ONE decision (Get-GuiSmokeLoopVerdict) judges both. $null when the receipt
+    # is missing / unreadable / has no metadata. play_performed is $false when no programmatic Play was admitted
+    # (a profile that never played claims no footage).
+    param([Parameter(Mandatory = $true)][string]$Path)
+    if (-not (Test-Path -LiteralPath $Path -PathType Leaf)) { return $null }
+    try { $document = Get-Content -LiteralPath $Path -Raw | ConvertFrom-Json } catch { return $null }
+    if ($null -eq $document -or $null -eq $document.PSObject.Properties['metadata'] -or $null -eq $document.metadata) { return $null }
+    $m = $document.metadata
+    $get = { param($name) if ($m.PSObject.Properties[$name]) { $m.$name } else { $null } }
+    $summary = [ordered]@{}
+    foreach ($pair in @(@('source_advanced', 'source_advanced'), @('required_source_frames', 'required_source_frames'),
+                        @('native_fps', 'native_fps'), @('pace_fps', 'pace_fps'), @('wrap_count', 'play_wrap_count'))) {
+        $value = & $get $pair[1]
+        if ($null -ne $value) { $summary[$pair[0]] = $value }
+    }
+    $override = & $get 'fps_override_active'
+    if ($null -ne $override) { $summary['fps_override'] = [int][bool]$override }
+    $admitted = & $get 'programmatic_play_admitted'
+    $summary['play_performed'] = ($null -ne $admitted -and [int]$admitted -gt 0)
+    return [pscustomobject]$summary
+}
+
+function Get-GuiSmokeEvidencePlayVerdict {
+    <#
+    .SYNOPSIS
+    The verdict a launcher gives an evidence Play it started itself. Returns [pscustomobject]@{ invalid; failures;
+    exitCode; summary }. invalid when the launcher had to kill the app (PLAY_SAFETY_TIMEOUT), the app did not exit
+    (PLAY_NOT_FINISHED), exited non-zero (APP_EXIT_NONZERO with the typed reason), or the receipt fails
+    Get-GuiSmokeLoopVerdict (no summary, no source_advanced, source_advanced < required_source_frames, a wrap, an fps
+    override, a non-native pace). exitCode is 43 for every INVALID verdict.
+    #>
+    param(
+        [AllowNull()]$Summary,
+        [AllowNull()][object]$ExitCode,
+        [bool]$KilledByLauncher = $false,
+        [double]$WindowSeconds = $script:GuiSmokeMinClipSeconds,
+        [int64]$ClipFrames = 0,
+        [string]$AppMessage = ''
+    )
+    $failures = @()
+    if ($KilledByLauncher) {
+        $failures += "PLAY_SAFETY_TIMEOUT: the launcher had to end the app itself; a Play ended by a clock the app did not choose is never playback evidence."
+    } elseif ($null -eq $ExitCode) {
+        $failures += "PLAY_NOT_FINISHED: the app never reported an exit code, so the footage it played cannot be proven."
+    } elseif ([int]$ExitCode -ne 0) {
+        $reason = Get-GuiSmokeRefusalReason -ExitCode ([int]$ExitCode) -Message $AppMessage
+        $failures += "APP_EXIT_NONZERO: the app exited $ExitCode ($reason); a Play the app did not finish is never playback evidence."
+    }
+    $performed = $true
+    if ($null -ne $Summary -and $Summary.PSObject.Properties['play_performed']) { $performed = [bool]$Summary.play_performed }
+    if ($performed) {
+        $loop = Get-GuiSmokeLoopVerdict -Summary $Summary -WindowSeconds $WindowSeconds -ClipFrames $ClipFrames
+        $failures += @($loop.failures)
+    }
+    return [pscustomobject]@{ invalid = ($failures.Count -gt 0); failures = $failures; exitCode = 43; summary = $Summary }
+}

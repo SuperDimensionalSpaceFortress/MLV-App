@@ -44,8 +44,8 @@ never gated.
 | Programmatic entry (`platform/qt/MainWindow.cpp`) | Gated how |
 |---|---|
 | autoplay hook, `MLVAPP_AUTOPLAY_*` (constructor lambda, normal GUI only) | Loop forced off, `programmaticPlay("autoplay", seconds)` (< 20 s is `PLAY_DURATION_TOO_SHORT`); `autoplay.refused reason=<typed>`; `MLVAPP_AUTOPLAY_LOOP` ignored. The smoke / profile windows are built with `argv = { appName }` so the hook cannot arm there, and a smoke / profile launch carrying `MLVAPP_AUTOPLAY_SECONDS` is refused up front (`AUTOPLAY_REFUSED_IN_AUTOMATION`, exit 14) |
-| profile Look Assist settle (`--exercise-look-assist-settle/-toggle`) | `programmaticPlay("profile-look-assist-settle", 20)`; **Loop is no longer enabled**; Play is HELD for the full 20 s (it used to stop at 12 s or when the diagnostics settled); a Play that ends earlier is a typed failure; refusal returns exit 14 |
-| profile `--exercise-play-action` | `programmaticPlay("profile-exercise-play-action", 20)`; exit 14 before Play; Play is HELD for 20 s (it used to stop at the first advancing frame / 5 s) |
+| profile Look Assist settle (`--exercise-look-assist-settle/-toggle`) | `programmaticPlay("profile-look-assist-settle", 20)`; **Loop is no longer enabled**; Play is held until the engine has CONSUMED ceil(20 x native fps) source frames (ENFORCE-3; it used to stop at 12 s or when the diagnostics settled); a Play that ends earlier is a typed failure; the toggle exercise's recheck settle never asks for a second Play (the process admits one); refusal returns exit 14 |
+| profile `--exercise-play-action` | `programmaticPlay("profile-exercise-play-action", 20)`; exit 14 before Play; Play is held until the source frames are consumed (it used to stop at the first advancing frame / 5 s) |
 | GUI-smoke Look Assist warm-up (was ~8961-8989) | **REMOVED.** No warm-up Play, no Loop: Look Assist warms during the measured pass |
 | GUI-smoke measured Play | `programmaticPlay("gui-smoke-measured", min(--seconds, presented-frames / fps))` (the sooner of the two ends Play, so that is the window); `--seconds` < 20 is refused at parse (`PLAY_DURATION_TOO_SHORT`, exit 14); a `--presented-frames` target under 20 s of frames is `PLAY_WINDOW_TOO_SHORT`; the clock starts once Play has started, so the whole window is played; a Play that ends under the floor is a typed failure, never a pass |
 | clip-lifecycle stress | the Play is stopped at the switch, so the switch may only happen after the 20 s floor (`--stress-switch-at-ms` default 20000, below that refused `PLAY_DURATION_TOO_SHORT`; the runner exits 41); the second clip is opened, seeked and closed but **never played**; the **restart Play is REMOVED** (it would be a replay) |
@@ -79,13 +79,101 @@ evaluated the window and admitted it; it is mutation-tested (`tools/repo_hygiene
 |---|---|---|
 | `tools/profiling/gui-smoke-length-gate.ps1` | Reads the 52-byte `MLVI` header: frame count, `fps = nom/denom`; spanned sets are summed and must be complete. The **play window** (and a `-TargetPresentedFrames` early stop) must itself be >= 20 s (`-ClipOnly` is the opt-out for callers that play nothing) | `CLIP_TOO_SHORT`, `PLAY_WINDOW_TOO_SHORT`, `CLIP_LENGTH_UNKNOWN` |
 | `run-release-gui-smoke.ps1` (choke point) | Gate first; `--loop` never produced, `-AllowLoop` gone; pass-through (`-AdditionalArgs`, `-ExtraEnvironment`) and an **inherited** `MLVAPP_AUTOPLAY_*` refused; the verdict is applied after the run | exit 41 / 42 / 44 / 43 |
-| `run-release-playback-profile.ps1`, `validate-visible-playback.ps1`, `capture-reference-frame.ps1`, `start-release-cuda-playback.ps1` | Same gate and the inherited-autoplay refusal; `capture-reference-frame.ps1` defaults to a pinned frame at `ceil(20 * fps)` presented frames | exit 41 / 42 / 44 |
+| `run-release-playback-profile.ps1`, `validate-visible-playback.ps1`, `capture-reference-frame.ps1`, `start-release-cuda-playback.ps1` | Same gate and the inherited-autoplay refusal; `capture-reference-frame.ps1` defaults to a pinned frame at `ceil(20 * fps)` presented frames; ENFORCE-3 r2: each (except the interactive `start-release-cuda-playback.ps1`) also applies the receipt oracle | exit 41 / 42 / 44; 43 INVALID |
 | export launchers (`run-release-cdng-export-profile.ps1`, `run-release-cuda-dng-export.ps1`) | refuse every play-capable pass-through option | exit 44 |
 | `bachelor/playback-attr-3-cuda-job.ps1` | `-PlaySeconds` (floor 20); fixture ids refused at generation; the job summary carries the typed `smokeRefusalReason` | `PLAYBACK_ATTR3_...` |
 | runtime backstop | `PlaybackWrapRecorder`; `playback_smoke.summary/.gate` carry `wrapped`, `wrap_count`, `jump_to_first_count`, `restart_count`; the runner's `Get-GuiSmokeLoopVerdict` (executed and mutation-tested, including the runner's application of it) | `INVALID_LOOPED`, exit 43 |
 | `test_playback_clip_length_gate.py` scan | fails if any script under `tools/` / `.github/` names a play token (also **composed**: `'a' + 'b'`, `-f`, `-join`, backticks) or launches the exe forwarding caller arguments, without the gate or a listed allowlist entry | CI red |
 
 Typed verdicts never name the clip path.
+
+## ENFORCE-3 (owner rule 2026-10-01): 20 s means 20 s of SOURCE FRAMES
+
+ENFORCE-2 measured "20 s" three different ways -- admission with the clip's native fps, the engine with
+`getFramerate()` (a persisted `fpsOverride` changes it), and every automation stop with a wall clock -- so a venue whose
+saved override was 12 fps stopped after 20 s of wall clock having covered ~10 s of footage. The unit is now the SOURCE
+FRAME:
+
+- The engine **counts** the distinct source frames it advanced (`SourceFrameAdvanceCounter`, fed from the engine tick in
+  `playbackHandling`, every backend). `consumed()` is monotonic and never decreases: a wrap or backward step is never
+  counted, a forward jump that is not an engine tick (a seek, a snap at Play start) is never counted *and never erases
+  what was counted*, a second `begin()` is ignored.
+- A Play must consume `required_source_frames = ceil(max(20, requested) x NATIVE fps)`. Admission requires a window
+  holding that many frames **and** an engine pace that can consume them inside the safety budget.
+- Every automation stop waits on `programmaticPlayState` (source frames consumed). A wall clock survives only as the
+  safety net, and its expiry is a typed failure. The net **scales with the pace the venue must sustain**:
+  `requested / kMinSustainedPaceFraction (0.5) + kPlaySafetyMarginMs (15 s)`, i.e. 55 s for a 20 s window. A venue that
+  holds under half the native pace is refused up front when its engine pace is known (`PLAY_PACE_TOO_SLOW`, before
+  Play) and ends early with the **same** token when the pace only shows once Play runs (the measured pace cannot reach
+  the requirement inside the budget; judged after 8 s of Play and two frames) -- never a run that can only time out.
+- The summary (`playback_smoke.summary`) and the profile receipt carry `source_advanced`, `required_source_frames`,
+  `native_fps`, `pace_fps`, `fps_override`; the receipt oracle turns anything short of the requirement into
+  `INVALID_SOURCE_FRAMES`, never a pass.
+
+### Typed refusals and exit codes
+
+| Token | Where | Exit |
+|---|---|---|
+| `PLAY_DURATION_TOO_SHORT`, `CLIP_TOO_SHORT`, `CLIP_LENGTH_UNKNOWN`, `PLAY_WINDOW_TOO_SHORT` | the app's gate, before Play (ENFORCE-2) | 14 |
+| `PLAY_PACE_TOO_SLOW` | refused before Play (pace known and under the minimum), or the run ended early because the measured pace cannot reach the requirement | 14 |
+| `SOURCE_FRAMES_SHORT` | the engine ended the Play (end of range, jump) before the requirement | 14 |
+| `PLAY_SAFETY_TIMEOUT` | the safety net expired; typed, never a pass | 14 |
+| `REPLAY_REFUSED` | a second programmatic Play in the process | 14 |
+| `AUTOPLAY_REFUSED_IN_AUTOMATION` | a smoke / profile launch carrying `MLVAPP_AUTOPLAY_SECONDS` | 14 |
+| `SETTINGS_ISOLATION_FAILED` | the run-scoped settings store could not be created | 14 |
+| the autoplay hook (normal GUI) | refused / ended early / timed out: latched and returned as the **process exit code** even without `MLVAPP_AUTOPLAY_EXIT`; a Play that was already running when the hook asked is **reset and measured from now** | 14 |
+| `INVALID_SOURCE_FRAMES`, `INVALID_LOOPED` | the runner / launchers' receipt oracle (`Get-GuiSmokeLoopVerdict`, `Get-GuiSmokeEvidencePlayVerdict`) | exit 43 |
+| `PLAY_SAFETY_TIMEOUT` (launcher kill), `PLAY_NOT_FINISHED`, `APP_EXIT_NONZERO` | `Get-GuiSmokeEvidencePlayVerdict`: the launcher had to kill the app, the app never reported an exit code, or exited non-zero | exit 43 |
+| `SOURCE_FRAMES_INVALID` | the attribution job's oracle (`Get-AttrCudaSourceFramesVerdict`) | exit 29 |
+
+### Pacing isolation: the venue's persisted pacing is never read
+
+`QSettings( UserScope, org, app )` is always the native store, so the app cannot be redirected from outside; every
+settings open goes through `automation_settings::openAppSettings()` (`platform/qt/AutomationSettings.h`). An automation
+run (`--gui-smoke-playback`, `--profile-playback`, the `MLVAPP_AUTOPLAY_*` hook) calls `automation_settings::isolate()`
+**before the first `QSettings` anywhere** (`main.cpp`) and reads and writes an INI file in a directory of its own: a fresh
+temp directory removed at exit, or the one named by `MLVAPP_AUTOMATION_SETTINGS_DIR` (the offscreen probe seeds
+`fpsOverride=true` / `frameRate=12` there; it never writes the user's real settings and checks they did not change).
+A run that cannot create its store does not start (`SETTINGS_ISOLATION_FAILED`). `isolateAutomationPacing()` stays as the
+second line of defence: `getFramerate()` ignores the override, drop-frame mode is pinned on, and the pin is never written
+back. The run therefore applies the app's compiled defaults, not the venue's other persisted options either, and
+`capture-reference-frame.ps1` records `appSettings.store = run_scoped` instead of reading the user's registry hive.
+The static class test fails on any raw `QSettings( UserScope|SystemScope, ... )` in `platform/qt` outside that header.
+
+### Launchers that start the app for an evidence Play carry the receipt oracle
+
+No tool may end an evidence Play on a clock of its own or trust the app's exit code alone (a binary that predates
+ENFORCE-3 exits 0 after a wall-clock hold and writes no `source_advanced`). Each launcher below WAITS for the app to end
+its own Play (its only budget is the app's safety net plus open / settle time; a process still running past it is killed
+and reported as `PLAY_SAFETY_TIMEOUT`), then reads the app's receipt and applies the one decision in
+`tools/profiling/gui-smoke-length-gate.ps1`:
+
+| Launcher | Receipt it reads | On INVALID |
+|---|---|---|
+| `run-release-gui-smoke.ps1` (the choke point; its process budget is `Get-GuiSmokePlaySafetyMs` + open / settle) | `playback_smoke.summary` | exit 43 (`validation.ok = false`) |
+| `validate-visible-playback.ps1` (the filmstrip capturer; it used to kill the app after `SettleMs + Captures x IntervalMs`, ~14 s) | `playback_smoke.summary` in its log dir | exit 43 |
+| `capture-reference-frame.ps1` | `playback_smoke.summary` in `-OutDir`; the manifest records `sourceFrames` | exit 43 (a non-zero app exit stays exit 4) |
+| `run-release-playback-profile.ps1` (a play-capable option) | `metadata` of the `--output` profile receipt (`play_performed` is false when nothing was admitted) | exit 43 |
+| `lookassist-wb-determinism.ps1`, `lookassist-wb-multiclip-probe.ps1` (consumers of the runner) | the runner's exit code | row marked `RUN_INVALID`, never a measurement |
+| `bachelor/playback-attr-3-cuda-job.ps1` | the measured session's summary line | exit 29 |
+
+`tools/repo_hygiene/test_playback_launcher_receipt_oracle.py` EXECUTES the oracle and each direct launcher against a fake
+app (exit 0 with a short count, no summary, a pre-ENFORCE-3 summary, a wrap, an override all come out INVALID),
+mutation-tests the launchers (take the oracle out and the scenario that proved it changes), and scans `tools/` and
+`.github/`: every script that can make the app play carries the oracle (acted on, not merely named) or is on a reasoned
+exemption list, and a script that kills the app must pass the kill into the verdict. `app_play_scan.py` pins that
+`m_sourceAdvance` and `m_playRequiredSourceFrames` are WRITTEN only at the reviewed sites, by function and count (the
+three engine ticks, the first Play start, the gate's reset), and that `main.cpp` isolates the settings store before the
+first `QSettings` and returns the autoplay verdict as the exit code; all of it is mutation-tested.
+
+Disclosed, not closed: a **human** pressing Play in the interactive app is outside the class (it is not automation, and
+its Play is never evidence). In drop-frame mode a tick after a GUI-thread stall advances the timeline by wall clock and
+those unpresented frames count as consumed -- the owner's "source frames advanced" definition. No allowed automation run
+has been observed consuming its frames (the tracked fixtures are 16 and 2 frames; no other clip may be opened here): that
+is covered by the engine simulation, the pinned wiring and the executed oracle, and a venue sitting is the observation.
+The Look Assist toggle exercise's recheck settle could not be run offscreen for the same reason; it is fixed by
+construction (`lookAssistSettleNeedsOwnPlay`: the process admits one Play, so a second settle waits for the diagnostics
+of the first instead of asking for another, which would be `REPLAY_REFUSED`) and unit-tested.
 
 ## Limits, stated plainly
 
@@ -101,7 +189,7 @@ Typed verdicts never name the clip path.
 - The Auto-quality Look Assist warm-up is no longer a separate Play, so in Auto the measured pass includes the
   `WarmupHq` samples; contact sheets are seek-mode (`playback_path=false`) until a capture-during-the-measured-pass
   path exists. Both are the price of "no replay".
-- No automation mode stops Play early any more: each requests >= 20 s and holds it (see the table above). The
+- No automation mode stops Play on a clock any more: each requests >= 20 s and waits for the engine's source-frame count (ENFORCE-3 below). The
   live offscreen proof (`test-app-play-gate-offscreen.ps1`) can only drive the refused paths, because the
   tracked fixtures are shorter than 20 s and no other clip may be created or opened; the allowed paths (each
   plays >= 20 s) are covered by the pure unit tests and the static pins, and need a venue sitting to observe.

@@ -13,6 +13,7 @@
 #include "ExportProcess.h"
 #include "DualIsoLevelSyncPolicy.h"
 #include "PlaybackFpsMeterPolicy.h"
+#include "AutomationSettings.h"
 #include "PlaybackFrameRange.h"
 #include "PlaybackGatePolicy.h"
 #include "PlaybackPrepPresentationPolicy.h"
@@ -2834,6 +2835,7 @@ MainWindow::MainWindow(int &argc, char **argv, QWidget *parent) :
                             QStringLiteral("reason=%1 window_seconds=%2")
                                 .arg( QString::fromLatin1( m_programmaticPlayLedger.lastRefusalReason ) )
                                 .arg( autoplaySeconds ) );
+                        m_automationVerdictExitCode = 14;
                         if( autoplayExit ) QTimer::singleShot( 400, this, [](){ qApp->quit(); } );
                         return;
                     }
@@ -2857,6 +2859,9 @@ MainWindow::MainWindow(int &argc, char **argv, QWidget *parent) :
                         autoplayPoll->stop();
                         autoplayPoll->deleteLater();
                         if( ui->actionPlay->isChecked() ) { ui->actionPlay->setChecked( false ); on_actionPlay_triggered( false ); }
+                        // r2 (fable H6): without MLVAPP_AUTOPLAY_EXIT the app stays open, but the verdict is latched and
+                        // becomes the process exit code (main.cpp), so a short or timed-out autoplay is never exit 0.
+                        m_automationVerdictExitCode = autoplayState == playback_frame_range::PlayStopState::Reached ? 0 : 14;
                         logInteractionEvent( QStringLiteral("autoplay.stop"),
                             QStringLiteral("state=%1 source_advanced=%2 required_source_frames=%3 elapsed_ms=%4")
                                 .arg( QString::fromLatin1( playback_frame_range::playStopFailureReason( autoplayState ) ).isEmpty()
@@ -2878,7 +2883,7 @@ MainWindow::MainWindow(int &argc, char **argv, QWidget *parent) :
     }
 
     //Update check, if autocheck enabled, once a day
-    QSettings set( QSettings::UserScope, "magiclantern.MLVApp", "MLVApp" );
+    auto setStore = automation_settings::openAppSettings(); QSettings &set = *setStore;
     QString date = set.value( "lastUpdateCheck", QString( "" ) ).toString();
     if( ui->actionAutoCheckForUpdates->isChecked() && date != QDate::currentDate().toString() )
     {
@@ -7880,7 +7885,8 @@ int MainWindow::runHeadlessPlaybackProfile(const PlaybackProfileOptions & option
         if( m_playbackQualityMode == static_cast<int>( PlaybackQualityMode::Auto )
          && m_playbackQualityAutoDecisionReason
                 == PlaybackQualityAutoDecisionReason::WarmupHq
-         && !m_lastLookAssistDiagnosticsValid )
+         && !m_lastLookAssistDiagnosticsValid
+         && playback_frame_range::lookAssistSettleNeedsOwnPlay( m_programmaticPlayLedger.admitted ) )
         {
             trace(label + QStringLiteral("-auto-playback-settle-begin reason=%1 samples=%2")
                   .arg( QString::fromLatin1(
@@ -9819,6 +9825,7 @@ int MainWindow::runGuiPlaybackSmoke(const GuiPlaybackSmokeOptions & options)
         measuredState = programmaticPlayState( playbackClock.elapsed(), measuredSafetyMs );
         if( measuredState == playback_frame_range::PlayStopState::SafetyTimeout
          || measuredState == playback_frame_range::PlayStopState::EndedEarly
+         || measuredState == playback_frame_range::PlayStopState::PaceTooSlow
          || ( measuredState == playback_frame_range::PlayStopState::Reached
               && !( options.exerciseClipLifecycleStress && !stressAttempted ) ) )
         {
@@ -11917,7 +11924,7 @@ void MainWindow::initLib( void )
 //Read some settings from registry
 void MainWindow::readSettings()
 {
-    QSettings set( QSettings::UserScope, "magiclantern.MLVApp", "MLVApp" );
+    auto setStore = automation_settings::openAppSettings(); QSettings &set = *setStore;
     restoreGeometry( set.value( "mainWindowGeometry" ).toByteArray() );
     //restoreState( set.value( "mainWindowState" ).toByteArray() ); // create docks, toolbars, etc...
     if( set.value( "dragFrameMode", true ).toBool() ) ui->actionDropFrameMode->setChecked( true );
@@ -12020,7 +12027,7 @@ void MainWindow::readSettings()
 //Save some settings to registry
 void MainWindow::writeSettings()
 {
-    QSettings set( QSettings::UserScope, "magiclantern.MLVApp", "MLVApp" );
+    auto setStore = automation_settings::openAppSettings(); QSettings &set = *setStore;
     set.setValue( "mainWindowGeometry", saveGeometry() );
     //set.setValue( "mainWindowState", saveState() ); // docks, toolbars, etc...
     // PLAYBACK-CLIP-LENGTH-ENFORCE-3: an automation run pins drop-frame ON for its own pacing; that pin is never
@@ -20624,9 +20631,7 @@ void MainWindow::initPlaybackQualityFromSettings( void )
      * the QSettings choice when no env var is set. */
     setDualIsoPlaybackPreferHqMean23Fallback(&MainWindow::dualIsoPlaybackPreferHqMean23GuiFallback);
 
-    QSettings set( QSettings::UserScope,
-                   PlaybackQualitySettings::kOrganization(),
-                   PlaybackQualitySettings::kApplication() );
+    auto setStore = automation_settings::openAppSettings(); QSettings &set = *setStore;
     int rawMode = set.value( PlaybackQualitySettings::kKeyQualityMode(),
                              PlaybackQualitySettings::kDefaultQualityMode() ).toInt();
     if ( rawMode < 0 || rawMode > 4 )
@@ -20888,9 +20893,7 @@ void MainWindow::initPlaybackPreviewResolutionFromSettings( void )
 
 void MainWindow::initPlaybackScaleFactorFromSettings( void )
 {
-    QSettings set( QSettings::UserScope,
-                   PlaybackQualitySettings::kOrganization(),
-                   PlaybackQualitySettings::kApplication() );
+    auto setStore = automation_settings::openAppSettings(); QSettings &set = *setStore;
     int rawScale = set.value( PlaybackQualitySettings::kKeyScaleFactorOverride(),
                               PlaybackQualitySettings::kDefaultScaleFactorOverride() ).toInt();
     if ( rawScale != 0 && rawScale != 1 && rawScale != 2 && rawScale != 4 && rawScale != 8 )
@@ -20984,9 +20987,7 @@ void MainWindow::applyPlaybackScaleFactorOverride( int scaleFactor, bool persist
 
     if ( persist )
     {
-        QSettings set( QSettings::UserScope,
-                       PlaybackQualitySettings::kOrganization(),
-                       PlaybackQualitySettings::kApplication() );
+        auto setStore = automation_settings::openAppSettings(); QSettings &set = *setStore;
         set.setValue( PlaybackQualitySettings::kKeyScaleFactorOverride(), scaleFactor );
     }
 
@@ -27867,8 +27868,13 @@ bool MainWindow::programmaticPlay( const char *site, double requestedSeconds )
     const playback_frame_range::PlayableWindowVerdict verdict = checkPlayableWindow( site, requestedSeconds );
     if( alreadyPlaying && verdict.ok )
     {
-        m_playRequiredSourceFrames = std::max( m_playRequiredSourceFrames, verdict.requiredFrames );
-        m_playRequestedSeconds = std::max( m_playRequestedSeconds, requestedSeconds );
+        // ENFORCE-3 r2 (fable H6): a Play this gate did not start has been counting since whoever started it; adopting
+        // that count would credit footage played before the window was evaluated. The counter is RESET and re-armed at
+        // the current position, so the adopted Play is measured -- from here -- against the window just admitted.
+        m_sourceAdvance = playback_frame_range::SourceFrameAdvanceCounter();
+        m_sourceAdvance.begin( ui->horizontalSliderPosition->value() );
+        m_playRequiredSourceFrames = verdict.requiredFrames;
+        m_playRequestedSeconds = requestedSeconds;
         m_playPaceFps = verdict.paceFps;
         return true;
     }
@@ -27983,11 +27989,12 @@ void MainWindow::isolateAutomationPacing( const char *site )
     if( !ui->actionDropFrameMode->isChecked() ) ui->actionDropFrameMode->setChecked( true );
     logInteractionEvent(
         QStringLiteral("automation.pacing_isolated"),
-        QStringLiteral("site=%1 persisted_fps_override=%2 persisted_frame_rate=%3 drop_frame=%4")
+        QStringLiteral("site=%1 persisted_fps_override=%2 persisted_frame_rate=%3 drop_frame=%4 settings_store=%5")
             .arg( QString::fromLatin1( site ) )
             .arg( bool01( m_fpsOverride ) )
             .arg( m_frameRate, 0, 'f', 3 )
-            .arg( bool01( ui->actionDropFrameMode->isChecked() ) ) );
+            .arg( bool01( ui->actionDropFrameMode->isChecked() ) )
+            .arg( automation_settings::isolated() ? QStringLiteral("run_scoped") : QStringLiteral("venue_NOT_ISOLATED") ) );
 }
 
 // Automation entries only ever turn Loop OFF; nothing in the app turns it on by itself.
@@ -31507,7 +31514,7 @@ void MainWindow::on_actionCheckForUpdates_triggered( void )
     CUpdaterDialog dialog( this, mlvAppUpdateReleasesUrl(), GITVERSION, false );
     dialog.exec();
 
-    QSettings set( QSettings::UserScope, "magiclantern.MLVApp", "MLVApp" );
+    auto setStore = automation_settings::openAppSettings(); QSettings &set = *setStore;
     set.setValue( "lastUpdateCheck", QDate::currentDate().toString() );
 
     checkFocusPixelUpdate();
@@ -31521,7 +31528,7 @@ void MainWindow::updateCheck(void)
     else checkFocusPixelUpdate();
     delete pUpdater;
 
-    QSettings set( QSettings::UserScope, "magiclantern.MLVApp", "MLVApp" );
+    auto setStore = automation_settings::openAppSettings(); QSettings &set = *setStore;
     set.setValue( "lastUpdateCheck", QDate::currentDate().toString() );
 }
 

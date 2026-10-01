@@ -84,6 +84,15 @@ for ($rep = 1; $rep -le $Reps; $rep++) {
         '-Output', $resultPath
     )
     & pwsh.exe -NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -File $smoke @smokeArgs *> $logPath
+    # ENFORCE-3 r2: the runner is the receipt oracle (exit 43 = INVALID: the engine did not consume the source frames of
+    # the window, or wrapped, or was paced by an override; any other non-zero = the app's typed failure). A run that is
+    # not a clean pass is never a measurement, whatever result.json happens to hold.
+    $smokeExit = $LASTEXITCODE
+    if ($smokeExit -ne 0) {
+        Write-Host ("  rep {0}: runner exit {1} (INVALID / typed failure) -- not a measurement (see {2})" -f $rep, $smokeExit, $logPath) -ForegroundColor Yellow
+        $rows += [pscustomobject]@{ rep = $rep; ok = $false; reason = "runner exit $smokeExit" }
+        continue
+    }
     if (-not (Test-Path -LiteralPath $resultPath)) {
         Write-Host ("  rep {0}: no result.json (see {1})" -f $rep, $logPath) -ForegroundColor Yellow
         $rows += [pscustomobject]@{ rep = $rep; ok = $false; reason = "no result.json" }

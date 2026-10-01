@@ -272,13 +272,13 @@ struct SourceFrameAdvanceCounter
         const int64_t oldFrame = static_cast<int64_t>( std::floor( oldPosition + 1e-9 ) );
         const int64_t newFrame = static_cast<int64_t>( std::floor( newPosition + 1e-9 ) );
         // The playhead sat ABOVE every frame this counter has seen when the tick began: something other than the
-        // engine moved it (a seek, a snap at Play start). That jump is not footage played -- count restarts from
-        // where the playhead really was, so a jump can only ever under-count, never inflate the total.
+        // engine moved it (a seek, a snap at Play start). That jump is not footage played, so the high-water mark is
+        // REBASED to where the playhead really was and the jump itself is never counted -- but the frames the engine
+        // really advanced before it stay counted (r2, sol H1): consumed() is monotonic and never decreases.
         if( oldFrame > highWater )
         {
             ++externalJumpRebases;
-            startFrame = highWater = oldFrame;
-            forwardSteps = 0;
+            highWater = oldFrame;
         }
         if( newFrame > highWater )
         {
@@ -290,24 +290,46 @@ struct SourceFrameAdvanceCounter
 };
 
 // The wall-clock safety net every automation wait carries. It is NOT the stop: running into it is a typed
-// failure (PLAY_SAFETY_TIMEOUT). The runner's own process budget (--seconds + 30 s) is longer than this.
+// failure (PLAY_SAFETY_TIMEOUT). It SCALES with the pace the venue must sustain (r2, fable H1): the engine is only
+// required to hold kMinSustainedPaceFraction of the clip's native fps, so the budget for `requested` seconds of
+// footage is requested / kMinSustainedPaceFraction + kPlaySafetyMarginMs. A venue below that floor is refused up front
+// when its engine pace is known (evaluatePlayableWindow: PLAY_PACE_TOO_SLOW) and ends early with the SAME typed token
+// when the pace only shows once Play runs (playPaceProjectsPastBudget) -- never a run that can only time out.
+// The runner's own process budget (gui-smoke-length-gate.ps1 Get-GuiSmokePlaySafetyMs) uses the same formula.
+constexpr double kMinSustainedPaceFraction = 0.5;
 constexpr int kPlaySafetyMarginMs = 15000;
+constexpr int64_t kPaceProbeMs = 8000;   // the measured pace is only trusted after this much Play wall clock
 inline int64_t playSafetyMs( double requestedSeconds )
 {
-    return static_cast<int64_t>( std::max( 0.0, requestedSeconds ) * 1000.0 ) + kPlaySafetyMarginMs;
+    return static_cast<int64_t>( std::max( 0.0, requestedSeconds ) / kMinSustainedPaceFraction * 1000.0 )
+         + kPlaySafetyMarginMs;
 }
 
-enum class PlayStopState { Continue, Reached, EndedEarly, SafetyTimeout };
+// True when the pace MEASURED so far (consumed frames over elapsed Play wall clock) cannot reach `required` frames
+// inside the safety budget: the run is already doomed, so it ends now with PLAY_PACE_TOO_SLOW instead of waiting for
+// the timeout. Needs at least two frames (one step) and kPaceProbeMs of Play, so a slow first frame is not a verdict.
+inline bool playPaceProjectsPastBudget( int64_t consumed, int64_t required, int64_t elapsedMs, int64_t safetyMs )
+{
+    if( required <= 1 || consumed < 2 || elapsedMs < kPaceProbeMs ) return false;
+    const double stepsDone = static_cast<double>( consumed - 1 );
+    const double stepsNeeded = static_cast<double>( required - 1 );
+    const double projectedMs = static_cast<double>( elapsedMs ) * stepsNeeded / stepsDone;
+    return projectedMs > static_cast<double>( safetyMs );
+}
+
+enum class PlayStopState { Continue, Reached, EndedEarly, SafetyTimeout, PaceTooSlow };
 
 // The ONE decision every automation Play wait makes. Reached (the source frames were consumed) wins over
 // everything, including a Play that ended on that very frame; a Play that ended first is EndedEarly; a wall
-// clock that ran out first is SafetyTimeout. required <= 0 can never be reached.
+// clock that ran out first is SafetyTimeout; a pace that cannot make it in time is PaceTooSlow. required <= 0 can
+// never be reached.
 inline PlayStopState evaluatePlayStop( int64_t consumed, int64_t required, bool playStillRunning,
                                        int64_t elapsedMs, int64_t safetyMs )
 {
     if( required > 0 && consumed >= required ) return PlayStopState::Reached;
     if( !playStillRunning ) return PlayStopState::EndedEarly;
     if( elapsedMs >= safetyMs ) return PlayStopState::SafetyTimeout;
+    if( playPaceProjectsPastBudget( consumed, required, elapsedMs, safetyMs ) ) return PlayStopState::PaceTooSlow;
     return PlayStopState::Continue;
 }
 
@@ -318,6 +340,7 @@ inline const char *playStopFailureReason( PlayStopState state )
     case PlayStopState::Reached: return "";
     case PlayStopState::EndedEarly: return "SOURCE_FRAMES_SHORT";
     case PlayStopState::SafetyTimeout: return "PLAY_SAFETY_TIMEOUT";
+    case PlayStopState::PaceTooSlow: return "PLAY_PACE_TOO_SLOW";
     case PlayStopState::Continue: break;
     }
     return "PLAY_STATE_UNRESOLVED";
@@ -466,6 +489,12 @@ struct ProgrammaticPlayLedger
         return true;
     }
 };
+
+// r2 (fable H7): the Look Assist settle's warm-up Play is a programmatic Play, and the process admits exactly one. The
+// toggle exercise settles twice (load, then recheck after the off/on click); the second settle must NOT ask for another
+// Play -- it would be REPLAY_REFUSED (exit 14) and the Auto mode could never pass. It waits for the diagnostics the
+// first Play's warm-up already produced instead; if they are not valid it fails typed on the diagnostics wait.
+inline bool lookAssistSettleNeedsOwnPlay( int admittedPlays ) { return admittedPlays < 1; }
 
 } // namespace playback_frame_range
 

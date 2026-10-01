@@ -117,7 +117,8 @@ if ($PresentedFrames -gt 0) { $playArgs += @('--presented-frames',[string]$Prese
 # PLAYBACK-CLIP-LENGTH-ENFORCE-1 (owner rule 2026-09-30): the old time-based fallback passed --loop.
 # Looping is never allowed; a time-based capture plays once over a window the clip outlasts.
 $playArgs += @('--screenshot-output',$shot)
-$proc = Start-Process -FilePath $Exe -NoNewWindow -PassThru -Wait `
+$captureStartedUtc = [DateTime]::UtcNow
+$proc = Start-Process -FilePath $Exe -NoNewWindow -PassThru `
     -ArgumentList $playArgs `
     -RedirectStandardOutput (Join-Path $OutDir 'capture.out.txt') `
     -RedirectStandardError  (Join-Path $OutDir 'capture.err.txt')
@@ -125,10 +126,40 @@ $proc = Start-Process -FilePath $Exe -NoNewWindow -PassThru -Wait `
 # A FAILED LAUNCH LEAVES $proc NULL and every downstream check silently passes against nothing.
 # Measured 2026-09-03: an exe that died 0xC0000135 in the loader still produced a manifest full of
 # stale numbers because nothing asserted the process had started.
-if ($null -eq $proc -or $null -eq $proc.ExitCode) {
+if ($null -eq $proc) {
     Write-Output "CAPTURE: FAILED - process-never-started ($Exe)"; exit 4
 }
-if ($proc.ExitCode -ne 0) { Write-Output "CAPTURE: FAILED - exe exited $($proc.ExitCode)"; exit 4 }
+$null = $proc.Handle   # cache the handle so ExitCode survives the process (Start-Process -PassThru quirk)
+# PLAYBACK-CLIP-LENGTH-ENFORCE-3 round 2 (fable H3): this script never ends the Play on a clock of its own either.
+# The APP ends it when its engine has consumed the source frames of the window (a pinned frame included); the
+# only wait below is the app's own wall-clock safety net (requested / 0.5 + 15 s) plus open + settle time. A process
+# still running past it is killed and the capture is INVALID (PLAY_SAFETY_TIMEOUT), never a candidate.
+$captureBudgetMs = (Get-GuiSmokePlaySafetyMs -Seconds $Seconds) + $SettleMs + 60000
+$captureKilled = $false
+if (-not $proc.WaitForExit($captureBudgetMs)) {
+    $captureKilled = $true
+    try { $proc.Kill($true) } catch { try { $proc.Kill() } catch {} }
+    [void]$proc.WaitForExit(5000)
+}
+$captureExitCode = if ($captureKilled) { $null } else { $proc.ExitCode }
+if (-not $captureKilled -and $null -eq $captureExitCode) {
+    Write-Output "CAPTURE: FAILED - process-never-started ($Exe)"; exit 4
+}
+if (-not $captureKilled -and $captureExitCode -ne 0) {
+    $captureStderr = Get-Content -LiteralPath (Join-Path $OutDir 'capture.err.txt') -Raw -ErrorAction SilentlyContinue
+    Write-Output ("CAPTURE: FAILED - exe exited {0} ({1})" -f $captureExitCode, (Get-GuiSmokeRefusalReason -ExitCode $captureExitCode -Message ([string]$captureStderr)))
+    exit 4
+}
+# The receipt oracle (gui-smoke-length-gate.ps1): the app's playback_smoke.summary must show that the engine consumed
+# the source frames of the window at native pace (a binary that predates ENFORCE-3 writes no source_advanced and fails).
+$captureSummary = Read-GuiSmokePlaybackSummaryFromLogDir -LogDir $OutDir -SinceUtc $captureStartedUtc
+$captureFrames = if ($null -ne $clipLengthGate.frames) { [int64]$clipLengthGate.frames } else { [int64]0 }
+$captureVerdict = Get-GuiSmokeEvidencePlayVerdict -Summary $captureSummary -ExitCode $captureExitCode `
+    -KilledByLauncher $captureKilled -WindowSeconds $Seconds -ClipFrames $captureFrames
+if ($captureVerdict.invalid) {
+    Write-Output ("CAPTURE: INVALID - " + (($captureVerdict.failures) -join ' | '))
+    exit $captureVerdict.exitCode
+}
 if (-not (Test-Path -LiteralPath $shot)) { Write-Output "CAPTURE: FAILED - no frame written"; exit 5 }
 
 $img = Get-Item -LiteralPath $shot
@@ -150,23 +181,15 @@ if (-not $Commit) {
 # gap let a false claim about which code path the captures exercised stand for a full
 # iteration; the value cost one probe to read. QSettings(UserScope,"magiclantern.MLVApp",
 # "MLVApp") maps to HKCU on Windows (MainWindow.cpp restore/save of these exact keys).
-$appSettings = [ordered]@{ hive = 'HKCU:\Software\magiclantern.MLVApp\MLVApp'; user = $env:USERNAME }
-try {
-    if (Test-Path $appSettings.hive) {
-        $k = Get-ItemProperty -Path $appSettings.hive -ErrorAction Stop
-        foreach ($n in @('playbackProcessingSubset','playbackDebayerMode','caching','resizeEnable','resizeWidth')) {
-            $appSettings[$n] = if ($k.PSObject.Properties.Name -contains $n) { [string]$k.$n } else { '(unset)' }
-        }
-        $appSettings.present = $true
-    } else {
-        # Absent hive is NOT the same as defaults: it means this user has never run the GUI, so
-        # the app will apply its own compiled defaults. Say which, rather than implying a reading.
-        $appSettings.present = $false
-        $appSettings.note = 'no hive for this user - app will use compiled defaults, values NOT read'
-    }
-} catch {
-    $appSettings.present = 'error'
-    $appSettings.note = ('could not read: ' + $_.Exception.Message)
+# ENFORCE-3 round 2: an automation run no longer inherits the user's persisted configuration. The app opens a
+# RUN-SCOPED settings store (platform/qt/AutomationSettings.h), so a saved fpsOverride / frameRate / dragFrameMode is
+# never even read -- and neither is any other persisted option: the run applies the app's compiled defaults. The
+# record says so instead of implying a reading of the user's HKCU hive.
+$appSettings = [ordered]@{
+    user    = $env:USERNAME
+    store   = 'run_scoped'
+    present = $false
+    note    = 'automation run: run-scoped settings store, venue settings NOT inherited, app compiled defaults applied'
 }
 
 $manifest = [ordered]@{
@@ -198,7 +221,12 @@ $manifest = [ordered]@{
         appLog          = (Get-ChildItem -LiteralPath $OutDir -Filter 'mlvapp-*.log' -ErrorAction SilentlyContinue |
                            Sort-Object LastWriteTimeUtc -Descending | Select-Object -First 1 -ExpandProperty Name)
     }
-    exitCode    = $proc.ExitCode
+    exitCode    = $captureExitCode
+    sourceFrames = [ordered]@{
+        sourceAdvanced       = $captureSummary.source_advanced
+        requiredSourceFrames = $captureSummary.required_source_frames
+        verdict              = 'VALID'
+    }
 }
 $mf = Join-Path $OutDir 'reference-frame-candidate.json'
 $manifest | ConvertTo-Json -Depth 8 | Set-Content -LiteralPath $mf -Encoding utf8

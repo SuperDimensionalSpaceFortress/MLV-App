@@ -23,6 +23,13 @@ ENFORCE-3 (sol r2 hardening, owner rule 2026-10-01 "20 s means 20 s of source fr
 * that no wall clock decides a Play (``playHoldReachedFloor`` is gone; no ``while`` mixes ``elapsed()`` and the
   Play action), and that the engine tick feeds the counter and the gate is given the engine's real pace.
 
+ENFORCE-3 round 2 (fable H2) adds the WRITE PINS: ``m_sourceAdvance`` and ``m_playRequiredSourceFrames`` -- the two
+values every automation stop and every receipt is judged by -- may be WRITTEN only at the reviewed sites below, by
+function and count; any other write, escape by pointer / reference / swap, or extra ``noteEngineTick`` fails the scan.
+The same scan covers the process-level pins in ``main.cpp`` (run-scoped settings isolation before the first
+QSettings, the autoplay verdict as the exit code) and the settings factory (no raw ``QSettings( UserScope, ...)``
+anywhere in ``platform/qt`` outside ``AutomationSettings.h``).
+
 Violations are returned as ``path:line: message`` strings; an empty list means the class is closed.
 """
 
@@ -91,6 +98,8 @@ PINNED_STOP_STATEMENTS = {
         "autoplayPoll->deleteLater(); if( ui->actionPlay->isChecked() ) { ui->actionPlay->setChecked( false ); "
         "on_actionPlay_triggered( false ); }",
         "isolateAutomationPacing( \"autoplay\" );",
+        "m_automationVerdictExitCode = autoplayState == playback_frame_range::PlayStopState::Reached ? 0 : 14;",
+        "m_automationVerdictExitCode = 14; if( autoplayExit ) QTimer::singleShot( 400, this, [](){ qApp->quit(); } ); return;",
     ),
     "MainWindow::runHeadlessPlaybackProfile": (
         "const qint64 autoSettleSafetyMs = playback_frame_range::playSafetyMs( m_playRequestedSeconds ); "
@@ -99,6 +108,8 @@ PINNED_STOP_STATEMENTS = {
         "== playback_frame_range::PlayStopState::Continue ) { qApp->processEvents( QEventLoop::AllEvents ); "
         "QThread::msleep( 10 ); } programmaticStop( \"profile-look-assist-settle\" ); "
         "if( autoSettleState != playback_frame_range::PlayStopState::Reached )",
+        "&& !m_lastLookAssistDiagnosticsValid && playback_frame_range::lookAssistSettleNeedsOwnPlay( "
+        "m_programmaticPlayLedger.admitted ) ) {",
         "const qint64 playActionSafetyMs = playback_frame_range::playSafetyMs( m_playRequestedSeconds ); "
         "while( ( playActionState = programmaticPlayState( playActionClock.elapsed(), playActionSafetyMs ) ) "
         "== playback_frame_range::PlayStopState::Continue ) { qApp->processEvents( QEventLoop::AllEvents ); "
@@ -109,6 +120,7 @@ PINNED_STOP_STATEMENTS = {
         "measuredState = programmaticPlayState( playbackClock.elapsed(), measuredSafetyMs ); "
         "if( measuredState == playback_frame_range::PlayStopState::SafetyTimeout "
         "|| measuredState == playback_frame_range::PlayStopState::EndedEarly "
+        "|| measuredState == playback_frame_range::PlayStopState::PaceTooSlow "
         "|| ( measuredState == playback_frame_range::PlayStopState::Reached "
         "&& !( options.exerciseClipLifecycleStress && !stressAttempted ) ) ) { break; }",
         "if( measuredState != playback_frame_range::PlayStopState::Reached ) { "
@@ -131,6 +143,9 @@ PINNED_STOP_STATEMENTS = {
     "MainWindow::programmaticPlay": (
         "m_sourceAdvance = playback_frame_range::SourceFrameAdvanceCounter(); "
         "m_playRequiredSourceFrames = verdict.requiredFrames;",
+        "if( alreadyPlaying && verdict.ok ) { m_sourceAdvance = playback_frame_range::SourceFrameAdvanceCounter(); "
+        "m_sourceAdvance.begin( ui->horizontalSliderPosition->value() ); m_playRequiredSourceFrames = verdict.requiredFrames; "
+        "m_playRequestedSeconds = requestedSeconds; m_playPaceFps = verdict.paceFps; return true; }",
     ),
     "MainWindow::getFramerate": (
         "if( m_fpsOverride && !m_automationPacingIsolated ) return m_frameRate;",
@@ -497,6 +512,8 @@ def scan_app_play_sources(sources: dict[str, str]) -> list[str]:
         if marker not in main_keep:
             problems.append(f"missing Loop-off at an automation entry: {marker}")
     problems.extend(_scan_stop_sites(main_blank, main_keep))
+    problems.extend(_scan_counter_writes(main_blank, main_keep))
+    problems.extend(_scan_main_pins(sources.get("platform/qt/main.cpp", "")))
     # Interactive handlers are never gated.
     for signature in ("void MainWindow::on_actionPlay_triggered(bool checked)",
                       "void MainWindow::on_actionPlay_toggled(bool checked)"):
@@ -569,3 +586,133 @@ def _scan_stop_sites(blank: str, keep: str) -> list[str]:
         if found != feeds:
             problems.append(f"{function}: the engine tick feeds the source-frame counter {found}x, pinned {feeds}")
     return problems
+
+
+# ENFORCE-3 round 2 (fable H2): the WRITE PINS. m_sourceAdvance (the engine's source-frame count) and
+# m_playRequiredSourceFrames (what the admitted Play must consume) decide every stop and every receipt, so they may be
+# written only here, by enclosing function and kind: ``reset`` = ``m_sourceAdvance = SourceFrameAdvanceCounter();``,
+# ``begin`` = ``m_sourceAdvance.begin(``, ``tick`` = ``m_sourceAdvance.noteEngineTick(``, ``required`` =
+# ``m_playRequiredSourceFrames = verdict.requiredFrames;``. Reads (``.consumed()``, ``.startFrame``) are free.
+PINNED_COUNTER_WRITES = {
+    "MainWindow::programmaticPlay": {"reset": 2, "begin": 1, "required": 2},   # the admitted Play + the adopted running Play
+    "MainWindow::on_actionPlay_toggled": {"begin": 1},                          # the FIRST Play start arms the counter
+    "MainWindow::playbackHandling": {"tick": 3},                                # the three engine position advances
+}
+_ADV_USE = re.compile(r"\bm_sourceAdvance\b")
+_ADV_READ = re.compile(r"\s*\.\s*(?:consumed\s*\(\s*\)|startFrame\b(?!\s*(?:=(?!=)|[-+*/%&|^]=|\+\+|--)))")
+_ADV_BEGIN = re.compile(r"\s*\.\s*begin\s*\(")
+_ADV_TICK = re.compile(r"\s*\.\s*noteEngineTick\s*\(")
+_ADV_RESET = re.compile(r"\s*=(?!=)\s*playback_frame_range::SourceFrameAdvanceCounter\s*\(\s*\)\s*;")
+_REQ_USE = re.compile(r"\bm_playRequiredSourceFrames\b")
+_REQ_WRITE_AFTER = re.compile(r"\s*(?:=(?!=)|[-+*/%&|^]=|\+\+|--)")
+_REQ_ASSIGN_OK = re.compile(r"\s*=\s*verdict\.requiredFrames\s*;")
+_ESCAPE_BEFORE = re.compile(r"(?:(?<!&)&\s*(?:\w+\s*=\s*)?|\b(?:swap|exchange|move)\s*\(\s*|\+\+\s*|--\s*)$")
+
+
+def _scan_counter_writes(blank: str, keep: str) -> list[str]:
+    problems: list[str] = []
+    if not blank:
+        return problems
+    spans = function_spans(blank)
+    found: dict[str, dict[str, int]] = {}
+
+    def note(function: str, kind: str) -> None:
+        found.setdefault(function, {}).setdefault(kind, 0)
+        found[function][kind] += 1
+
+    for match in _ADV_USE.finditer(blank):
+        function = _enclosing(spans, match.start())
+        before = blank[max(0, match.start() - 12):match.start()]
+        after = blank[match.end():match.end() + 80]
+        line = _line_of(blank, match.start())
+        if _ESCAPE_BEFORE.search(before):
+            problems.append(f"platform/qt/MainWindow.cpp:{line}: m_sourceAdvance escapes by pointer / reference / swap / "
+                            f"increment in {function}; the counter may only be read or written at the pinned sites")
+        elif _ADV_READ.match(after):
+            continue
+        elif _ADV_BEGIN.match(after):
+            note(function, "begin")
+        elif _ADV_TICK.match(after):
+            note(function, "tick")
+        elif _ADV_RESET.match(after):
+            note(function, "reset")
+        else:
+            problems.append(f"platform/qt/MainWindow.cpp:{line}: unreviewed use of m_sourceAdvance in {function}: "
+                            f"{_normalise(blank[match.start():match.start() + 70])}")
+    for match in _REQ_USE.finditer(blank):
+        function = _enclosing(spans, match.start())
+        before = blank[max(0, match.start() - 24):match.start()]
+        after = blank[match.end():match.end() + 60]
+        line = _line_of(blank, match.start())
+        if _ESCAPE_BEFORE.search(before):
+            problems.append(f"platform/qt/MainWindow.cpp:{line}: m_playRequiredSourceFrames escapes by pointer / reference / "
+                            f"swap / increment in {function}")
+        elif _REQ_WRITE_AFTER.match(after):
+            if _REQ_ASSIGN_OK.match(after):
+                note(function, "required")
+            else:
+                problems.append(f"platform/qt/MainWindow.cpp:{line}: m_playRequiredSourceFrames written in {function} other "
+                                f"than `= verdict.requiredFrames;`: {_normalise(blank[match.start():match.start() + 70])}")
+    for function, kinds in sorted(found.items()):
+        expected = PINNED_COUNTER_WRITES.get(function)
+        if expected is None:
+            problems.append(f"unreviewed write of the source-frame counter / requirement in {function}: {dict(sorted(kinds.items()))}")
+        elif kinds != expected:
+            problems.append(f"source-frame counter writes in {function} are {dict(sorted(kinds.items()))} but the reviewed pin is {expected}")
+    for function, expected in PINNED_COUNTER_WRITES.items():
+        if function not in found:
+            problems.append(f"reviewed source-frame counter write site vanished from {function} (pin {expected})")
+    return problems
+
+
+# main.cpp: the process-level pins. Each statement (comment-stripped, whitespace-normalised, literals kept) must occur
+# exactly once in main.cpp.
+PINNED_MAIN_STATEMENTS = (
+    # an automation run opens a RUN-SCOPED settings store before anything reads a setting (and fails closed without one)
+    "const bool automationRun = hasPlaybackProfileFlag(argc, argv) || hasGuiPlaybackSmokeFlag(argc, argv) "
+    "|| qEnvironmentVariableIntValue(\"MLVAPP_AUTOPLAY_SECONDS\") > 0;",
+    "automationSettingsDir = automation_settings::isolate( QString::fromLocal8Bit(qgetenv(\"MLVAPP_AUTOMATION_SETTINGS_DIR\")), "
+    "&automationSettingsDirCreated);",
+    "if (automationSettingsDir.isEmpty()) {",
+    # the autoplay hook's verdict is the process exit code even when the app is closed by hand
+    "const int guiExitCode = a.exec(); return guiExitCode != 0 ? guiExitCode : w.automationVerdictExitCode();",
+)
+
+
+def _scan_main_pins(text: str) -> list[str]:
+    if not text:
+        return []
+    _, keep = strip_cpp(text)
+    body = _normalise(keep)
+    # qt-style call spacing differs: compare with every space after "(" and before ")" collapsed on both sides.
+    squash = lambda s: re.sub(r"\(\s+", "(", re.sub(r"\s+\)", ")", s))
+    haystack = squash(body)
+    problems = []
+    for statement in PINNED_MAIN_STATEMENTS:
+        occurrences = haystack.count(squash(statement))
+        if occurrences != 1:
+            problems.append(f"platform/qt/main.cpp: pinned statement occurs {occurrences}x (must be exactly once): {statement[:100]}...")
+    isolate_at = haystack.find("automation_settings::isolate(")
+    install_at = haystack.find("CrashForensics::install(")
+    if isolate_at < 0 or install_at < 0 or isolate_at > install_at:
+        problems.append("platform/qt/main.cpp: the run-scoped settings store must be opened BEFORE CrashForensics::install "
+                        "(the first QSettings anywhere)")
+    return problems
+
+
+# Every QSettings in platform/qt opens through automation_settings::openAppSettings(); a raw
+# QSettings( UserScope|SystemScope, ... ) would read the venue's store in an automation run.
+_RAW_APP_SETTINGS = re.compile(r"\bQSettings\s*(?:\w+\s*)?\(\s*QSettings\s*::\s*(?:User|System)Scope\b")
+
+
+def find_raw_app_settings(files: dict[str, str]) -> list[str]:
+    """rel path -> source text of platform/qt files; returns ``path:line`` of every raw app-settings construction
+    outside platform/qt/AutomationSettings.h (the one factory)."""
+    offenders: list[str] = []
+    for rel, text in sorted(files.items()):
+        if rel.endswith("AutomationSettings.h"):
+            continue
+        blank, _ = strip_cpp(text)
+        for match in _RAW_APP_SETTINGS.finditer(blank):
+            offenders.append(f"{rel}:{_line_of(blank, match.start())}")
+    return offenders

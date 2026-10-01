@@ -10,6 +10,7 @@
 #include "CrashForensics.h"
 #include "Phase3Mode.h"
 #include "PlaybackFrameRange.h"
+#include "AutomationSettings.h"
 #include "../../src/batch/BatchContext.h"
 #include "../../src/batch/BatchRunner.h"
 #include "../../src/batch/BatchLogger.h"
@@ -1706,6 +1707,33 @@ int main(int argc, char *argv[])
         QStringLiteral("%1.%2.%3.%4")
             .arg(VERSION_MAJOR).arg(VERSION_MINOR)
             .arg(VERSION_PATCH).arg(VERSION_BUILD));
+
+    // PLAYBACK-CLIP-LENGTH-ENFORCE-3 round 2 (sol H2 / fable H5): an automation run uses a RUN-SCOPED settings store,
+    // so the venue's persisted pacing (fpsOverride / frameRate / dragFrameMode) is never even read and nothing the run
+    // saves reaches the owner's interactive settings. Done before the first QSettings anywhere (CrashForensics too).
+    // Fail closed: an automation run that cannot get its own store does not start.
+    const bool automationRun = hasPlaybackProfileFlag(argc, argv) || hasGuiPlaybackSmokeFlag(argc, argv)
+        || qEnvironmentVariableIntValue("MLVAPP_AUTOPLAY_SECONDS") > 0;
+    bool automationSettingsDirCreated = false;
+    QString automationSettingsDir;
+    if (automationRun)
+    {
+        automationSettingsDir = automation_settings::isolate(
+            QString::fromLocal8Bit(qgetenv("MLVAPP_AUTOMATION_SETTINGS_DIR")), &automationSettingsDirCreated);
+        if (automationSettingsDir.isEmpty())
+        {
+            QTextStream(stderr) << "[GUI-SMOKE] ERROR: SETTINGS_ISOLATION_FAILED "
+                                   "(the run-scoped settings store could not be created; an automation run never uses the venue's settings)\n";
+            return 14;
+        }
+    }
+    struct AutomationSettingsCleanup
+    {
+        QString dir;
+        bool remove = false;
+        ~AutomationSettingsCleanup() { if (remove && !dir.isEmpty()) QDir(dir).removeRecursively(); }
+    } automationSettingsCleanup{automationSettingsDir, automationSettingsDirCreated};
+
     CrashForensics::install(argc, argv);
     CrashForensics::logStartupMetadata();
     phase3InitKillSwitches();
@@ -1857,5 +1885,8 @@ int main(int argc, char *argv[])
     MainWindow w(argc, argv);
     w.show();
 
-    return a.exec();
+    // ENFORCE-3 r2 (fable H6): the autoplay hook's verdict is the exit code even when the app was left open and
+    // closed by hand (MLVAPP_AUTOPLAY_EXIT unset): a short or timed-out autoplay is never exit 0.
+    const int guiExitCode = a.exec();
+    return guiExitCode != 0 ? guiExitCode : w.automationVerdictExitCode();
 }

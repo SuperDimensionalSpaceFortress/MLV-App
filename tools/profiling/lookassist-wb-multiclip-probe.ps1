@@ -70,10 +70,12 @@ foreach ($clip in $clipList) {
     $cdir = Join-Path $OutDir $name
     New-Item -ItemType Directory -Force -Path $cdir | Out-Null
     Write-Host "[wb-matrix] probing $name ..." -ForegroundColor Cyan
+    $smokeExit = -1
     try {
         & pwsh.exe -NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -File $smoke `
             -RepoRoot $repoRoot -ExePath $exe -Input $clip -ScaleFactor $ScaleFactor -ExpectedScaleRequest $ScaleFactor `
             -CaptureScreenshot -Seconds $Seconds -Output (Join-Path $cdir "$name.json") *> (Join-Path $cdir "run.log")
+        $smokeExit = $LASTEXITCODE
     } catch { }
     $temp='?';$tint='?';$scene='?';$floor='?'
     $log = Get-ChildItem (Join-Path $cdir "logs") -Filter 'mlvapp-*.log' -ErrorAction SilentlyContinue | Sort-Object LastWriteTime | Select-Object -Last 1
@@ -90,9 +92,14 @@ foreach ($clip in $clipList) {
     $win = Get-ChildItem $cdir -Recurse -Filter '*-window.png' -ErrorAction SilentlyContinue | Select-Object -First 1
     $cast = if ($win) { Get-FrameCast $win.FullName } else { $null }
     $tintFlag = if ($tint -ne '?' -and [int]$tint -le -12) {'GREEN'} elseif ($tint -ne '?' -and [int]$tint -ge 12) {'MAGENTA'} else {'neutral-ish'}
+    # ENFORCE-3 r2: the runner is the receipt oracle; a clip whose Play did not pass (exit 43 INVALID or any typed
+    # failure) is reported as RUN_INVALID, never as a normal row of the matrix.
+    if ($smokeExit -ne 0) {
+        $temp = '?'; $tint = '?'; $scene = '?'; $floor = '?'; $tintFlag = "RUN_INVALID(runner exit $smokeExit)"; $cast = $null
+    }
     $rows += [pscustomobject]@{
         Clip=$name; Temp=$temp; Tint=$tint; TintFlag=$tintFlag; Scene=$scene; Floor=$floor
-        FrameGreenAxis=($cast.greenAxis); FrameWarmCool=($cast.warmCool)
+        FrameGreenAxis=($cast.greenAxis); FrameWarmCool=($cast.warmCool); RunnerExit=$smokeExit
     }
 }
 

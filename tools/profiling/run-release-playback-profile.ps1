@@ -236,8 +236,33 @@ try {
     Add-EnvironmentPairs -Target $envBlock -Pairs $ExtraEnvironment
 
     $process = [System.Diagnostics.Process]::Start($startInfo)
-    $process.WaitForExit()
-    exit $process.ExitCode
+    if (-not $passThroughGate.playCapable) {
+        # A pure decode benchmark presents no playback: nothing to prove about footage.
+        $process.WaitForExit()
+        exit $process.ExitCode
+    }
+    # PLAYBACK-CLIP-LENGTH-ENFORCE-3 round 2 (fable H3): a profile that PLAYS (--exercise-play-action / the Look Assist
+    # settle) reports a result only if the app's own receipt proves its engine consumed the source frames of the window.
+    # The wrapper never ends the app on a clock of its own: the wait below is the app's wall-clock ceiling for a whole
+    # profile run (the Play itself ends on source-frame consumption inside the app, typed on failure); a process still
+    # running past it is killed and the result is INVALID (PLAY_SAFETY_TIMEOUT). An exit code of 0 is NOT enough: a binary
+    # that predates ENFORCE-3 exits 0 after a wall-clock hold, and writes no source_advanced, so it fails here.
+    $profileKilled = $false
+    if (-not $process.WaitForExit(3600000)) {
+        $profileKilled = $true
+        try { $process.Kill($true) } catch { try { $process.Kill() } catch {} }
+        [void]$process.WaitForExit(5000)
+    }
+    if (-not $profileKilled -and $process.ExitCode -ne 0) { exit $process.ExitCode }   # the app's own typed refusal / failure
+    $profileSummary = Get-GuiSmokeProfileReceiptSummary -Path $outputPath
+    $profileVerdict = Get-GuiSmokeEvidencePlayVerdict -Summary $profileSummary `
+        -ExitCode $(if ($profileKilled) { $null } else { $process.ExitCode }) -KilledByLauncher $profileKilled -WindowSeconds 20
+    if ($profileVerdict.invalid) {
+        foreach ($failure in $profileVerdict.failures) { [Console]::Error.WriteLine("PLAYBACK-CLIP-LENGTH-ENFORCE-3: $failure") }
+        [Console]::Error.WriteLine("PLAYBACK-CLIP-LENGTH-ENFORCE-3: INVALID -- this profile is not playback evidence (exit 43).")
+        exit $profileVerdict.exitCode
+    }
+    exit 0
 }
 finally {
     $env:QT_QPA_PLATFORM = $previousPlatform
