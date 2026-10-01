@@ -22,6 +22,14 @@ extern "C" int processingHasShadowsHighlightsAdjustments(const processingObject_
     return 0;
 }
 
+/* GpuPreviewProcessing.cpp's gpuPreviewProcessingApplyCpuRoute asks the engine
+ * (CUDA-PLAYBACK-LOOK-PARITY-2); the GUI harness links no engine. 1 = the
+ * display shader's historical unconditional pre-camera clamp. */
+extern "C" int processingCpuRoutePreCameraClamps(const processingObject_t *, int)
+{
+    return 1;
+}
+
 extern "C" int processingGetShadowsHighlightsBlurData(
     const processingObject_t *,
     const uint16_t **data,

@@ -380,6 +380,7 @@ HEADERS += MainWindow.h \
            DualIsoPatternMapping.h \
            GpuDebayer.h \
            GpuPreviewProcessing.h \
+           GpuPreviewHostRoute.h \
     GpuDisplayViewport.h \
     GpuDisplayWindow.h \
     ../../src/debayer/debayer.h \
