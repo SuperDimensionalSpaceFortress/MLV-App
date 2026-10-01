@@ -1484,9 +1484,50 @@ function Assert-AttrCudaWritableFileSlot {
         if ($existing.PSIsContainer -or $isReparse) {
             throw "ATTRCUDA_SLOT_OCCUPIED $full is a directory or reparse point; refusing to write through it"
         }
+        # OWNER-FOOTAGE-NO-HARDLINK-2: a name that is one of several names of one file object is never
+        # the slot's own stale output (every file this tree publishes has exactly one name), so it is
+        # refused rather than removed. The remaining pathname remove is the replace-in-place of a
+        # fixed, derived PUBLISH name (a canonical artifact name, result.json, a job log): it is
+        # allowlisted by name in tools/repo_hygiene/test_owner_footage_no_hardlink_class.py with the
+        # reason such a name cannot be a neutral owner-footage name.
+        try { $occupant = Get-AttrCudaFileId -Path $full } catch { throw "ATTRCUDA_SLOT_OCCUPANT_UNREADABLE $full" }
+        if ($occupant.NumberOfLinks -gt 1) {
+            throw "ATTRCUDA_SLOT_OCCUPIED_MULTI_LINK $full has $($occupant.NumberOfLinks) names; refusing to remove one of them"
+        }
         Remove-Item -LiteralPath $full -Force -Confirm:$false
     }
     return $full
+}
+
+function New-AttrCudaOwnedFileStream {
+    <#
+    .SYNOPSIS
+    Create a NEW file (FileMode.CreateNew), journal the identity read off that very creating handle,
+    and only then hand the stream back for writing.
+    .DESCRIPTION
+    OWNER-FOOTAGE-NO-HARDLINK-2. This is how a job comes to OWN a file it deletes later: the record
+    is made from the creating handle, durably, before a byte is written. If the record cannot be
+    made the file is removed by the identity just read (the stream closed first) and this throws, so
+    a caller never holds an unrecorded file it made. The caller must have cleared the slot
+    (Assert-AttrCudaWritableFileSlot); a name that is occupied makes CreateNew throw.
+    #>
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $true)][string]$Path,
+        [Parameter(Mandatory = $true)][string]$OwnedJournal
+    )
+
+    $stream = [IO.FileStream]::new($Path, [IO.FileMode]::CreateNew, [IO.FileAccess]::Write, [IO.FileShare]::Read, 65536)
+    $id = $null
+    try {
+        $id = Get-AttrCudaFileId -Stream $stream
+        Add-AttrCudaOwnedRecord -Journal $OwnedJournal -Path $Path -FileId $id
+    } catch {
+        $stream.Dispose()
+        if ($null -ne $id) { [void](Remove-AttrCudaFileById -Path $Path -FileId $id) }
+        throw
+    }
+    return $stream
 }
 
 function Publish-AttrCudaText {
@@ -1494,15 +1535,27 @@ function Publish-AttrCudaText {
     .SYNOPSIS
     The ONLY way an emitted job writes text outside its job-owned work tree: slot check and write
     in one call, so a guard can never be separated from the write it guards (sol PR #133 r5).
+    .DESCRIPTION
+    -OwnedJournal (OWNER-FOOTAGE-NO-HARDLINK-2): when given, the file is created with CreateNew and its
+    identity is journalled from the creating handle before the text is written, so the job can later
+    delete it by proof (Remove-AttrCudaPartialFile -OwnedJournal). Without it nothing is recorded and
+    a later delete helper will leave the name.
     #>
     [CmdletBinding()]
     param(
         [Parameter(Mandatory = $true)][string]$Path,
-        [Parameter(Mandatory = $true)][AllowEmptyString()][AllowNull()][object]$Value
+        [Parameter(Mandatory = $true)][AllowEmptyString()][AllowNull()][object]$Value,
+        [string]$OwnedJournal = ''
     )
 
     $slot = Assert-AttrCudaWritableFileSlot -Path $Path
     $text = if ($null -eq $Value) { '' } else { (@($Value) | ForEach-Object { [string]$_ }) -join [Environment]::NewLine }
+    if ($OwnedJournal -ne '') {
+        $bytes = [Text.UTF8Encoding]::new($false).GetBytes($text + [Environment]::NewLine)
+        $stream = New-AttrCudaOwnedFileStream -Path $slot -OwnedJournal $OwnedJournal
+        try { $stream.Write($bytes, 0, $bytes.Length); $stream.Flush($true) } finally { $stream.Dispose() }
+        return $slot
+    }
     [IO.File]::WriteAllText($slot, $text + [Environment]::NewLine, [Text.UTF8Encoding]::new($false))
     return $slot
 }
@@ -1824,10 +1877,16 @@ function Publish-AttrCudaBytes {
     [CmdletBinding()]
     param(
         [Parameter(Mandatory = $true)][string]$Path,
-        [Parameter(Mandatory = $true)][AllowEmptyCollection()][byte[]]$Bytes
+        [Parameter(Mandatory = $true)][AllowEmptyCollection()][byte[]]$Bytes,
+        [string]$OwnedJournal = ''
     )
 
     $slot = Assert-AttrCudaWritableFileSlot -Path $Path
+    if ($OwnedJournal -ne '') {
+        $stream = New-AttrCudaOwnedFileStream -Path $slot -OwnedJournal $OwnedJournal
+        try { $stream.Write($Bytes, 0, $Bytes.Length); $stream.Flush($true) } finally { $stream.Dispose() }
+        return $slot
+    }
     [IO.File]::WriteAllBytes($slot, $Bytes)
     return $slot
 }
@@ -1836,14 +1895,32 @@ function Publish-AttrCudaFileCopy {
     <#
     .SYNOPSIS
     Copy a file to a destination outside the job-owned work tree, slot-checked in the same call.
+    .DESCRIPTION
+    -OwnedJournal (OWNER-FOOTAGE-NO-HARDLINK-2): when given, the destination is created with CreateNew,
+    its identity is journalled from the creating handle BEFORE any byte is copied, and the bytes are
+    streamed in -- so the job can later delete exactly this file by proof
+    (Remove-AttrCudaPartialFile -OwnedJournal), including after a copy that failed half way. Without
+    it Copy-Item runs as before and nothing is recorded (a later delete helper will leave the name).
     #>
     [CmdletBinding()]
     param(
         [Parameter(Mandatory = $true)][string]$Source,
-        [Parameter(Mandatory = $true)][string]$Destination
+        [Parameter(Mandatory = $true)][string]$Destination,
+        [string]$OwnedJournal = ''
     )
 
     $slot = Assert-AttrCudaWritableFileSlot -Path $Destination
+    if ($OwnedJournal -ne '') {
+        $out = New-AttrCudaOwnedFileStream -Path $slot -OwnedJournal $OwnedJournal
+        try {
+            $in = [IO.File]::Open($Source, [IO.FileMode]::Open, [IO.FileAccess]::Read, [IO.FileShare]::Read)
+            try { $in.CopyTo($out) } finally { $in.Dispose() }
+            $out.Flush($true)
+        } finally {
+            $out.Dispose()
+        }
+        return $slot
+    }
     Copy-Item -LiteralPath $Source -Destination $slot -Force
     return $slot
 }
@@ -2035,21 +2112,31 @@ function New-AttrCudaDirectory {
 function Remove-AttrCudaPartialFile {
     <#
     .SYNOPSIS
-    Delete one .partial path only if it is a plain FILE; never recurse, never follow a link.
+    Delete one .partial path only if it is a plain FILE this job PROVABLY created; never recurse,
+    never follow a link, never adopt a name because it looks like ours.
     .DESCRIPTION
     sol, PR #133 r3: `Remove-Item -Recurse` on a .partial path that is occupied by a directory can
     traverse an NTFS junction inside it and delete the junction's TARGET, outside the job root
     (PowerShell/PowerShell#26913). A .partial is only ever written as a file, so anything else --
     a directory, a symlink, a junction -- is left exactly where it is and reported. Returns $true
-    when the path is absent or was a file that is now gone, $false when it was refused.
+    when the path is absent or was a file that is now gone, $false when it was left.
     sol, PR #133 r8: the ANCESTOR chain from -TrustedRoot is checked too (a plain file reached
     through a linked inbox/cache/outbox is outside the root). A refusal never throws: this runs in
     cleanup and failure paths, where an exception would mask the job's real exit code.
+    OWNER-FOOTAGE-NO-HARDLINK-2: -OwnedJournal is MANDATORY and has no default. The name is deleted
+    only on the journal's proof (Get-AttrCudaOwnershipProof): the identity recorded from the handle
+    that CREATED it (Publish-AttrCuda* -OwnedJournal), or a fresh root this job journalled that
+    contains it; either is then checked on the one share-none deleting handle
+    (Remove-AttrCudaFileByProof). A name the journal does not prove -- including one that merely
+    looks like this job's .partial -- is LEFT_UNOWNED: a warning, nothing deleted, $false. The old
+    behaviour (read the name's identity and use it as the authority) is gone: that is how the last
+    name of an owner recording left by an older build would have been deleted.
     #>
     [CmdletBinding()]
     param(
         [Parameter(Mandatory = $true)][string]$TrustedRoot,
-        [Parameter(Mandatory = $true)][string]$Path
+        [Parameter(Mandatory = $true)][string]$Path,
+        [Parameter(Mandatory = $true)][string]$OwnedJournal
     )
 
     try {
@@ -2065,8 +2152,66 @@ function Remove-AttrCudaPartialFile {
         Write-Warning "ATTRCUDA_PARTIAL_NOT_A_FILE left in place (directory or reparse point): $Path"
         return $false
     }
-    Remove-Item -LiteralPath $Path -Force -Confirm:$false -ErrorAction SilentlyContinue
-    return (-not (Test-Path -LiteralPath $Path))
+    try {
+        $journalData = Read-AttrCudaOwnedJournal -Journal $OwnedJournal
+        $proof = Get-AttrCudaOwnershipProof -Journal $journalData -Path $Path -RootCache @{}
+        if ($null -eq $proof) {
+            $token = 'LEFT_UNOWNED'
+        } elseif ($proof.Kind -eq 'file') {
+            $token = Remove-AttrCudaFileByProof -Path $Path -FileId $proof.FileId -ExpectReparsePoint:$proof.ExpectReparsePoint
+        } else {
+            $token = Remove-AttrCudaFileByProof -Path $Path -NotBeforeFileTime $proof.NotBeforeFileTime
+        }
+    } catch {
+        $token = 'LEFT_UNAVAILABLE'
+    }
+    if ($token -eq 'DELETED' -or $token -eq 'ABSENT') { return $true }
+    Write-Warning "ATTRCUDA_PARTIAL_LEFT $token left in place: $Path"
+    return $false
+}
+
+function Remove-AttrCudaInputFileByContent {
+    <#
+    .SYNOPSIS
+    Remove a SUBMITTED INPUT file a job did not create (a build package or tracked fixture left in
+    its inbox), only if its bytes -- read through the deleting handle -- are exactly the bytes the
+    job already verified; otherwise leave it. Returns $true when absent or gone, $false when left.
+    .DESCRIPTION
+    OWNER-FOOTAGE-NO-HARDLINK-2. An inbox file arrives from the submitter, so there is no creating
+    handle to record. The proof is its CONTENT: -ExpectedSha256 is the hash the job verified the file
+    against (the manifest-bound package hash, the content-pinned fixture hash); the deleting handle
+    is share-none, so the bytes hashed are the bytes removed, and a name that is anything else --
+    owner footage included -- is left (LEFT_CONTENT_MISMATCH). Mandatory arguments, no default.
+    Same refusals as Remove-AttrCudaPartialFile (ancestor links, directory, reparse point); never
+    throws.
+    #>
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $true)][string]$TrustedRoot,
+        [Parameter(Mandatory = $true)][string]$Path,
+        [Parameter(Mandatory = $true)][string]$ExpectedSha256
+    )
+
+    try {
+        $Path = Assert-AttrCudaNoLinkBelowRoot -TrustedRoot $TrustedRoot -Path $Path
+    } catch {
+        Write-Warning "ATTRCUDA_INPUT_OUTSIDE_TRUSTED_ROOT left in place: $($_.Exception.Message)"
+        return $false
+    }
+    $item = Get-Item -LiteralPath $Path -Force -ErrorAction SilentlyContinue
+    if ($null -eq $item) { return $true }
+    if ($item.PSIsContainer -or (($item.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0)) {
+        Write-Warning "ATTRCUDA_INPUT_NOT_A_FILE left in place (directory or reparse point): $Path"
+        return $false
+    }
+    try {
+        $token = Remove-AttrCudaFileByProof -Path $Path -ExpectedSha256 $ExpectedSha256.ToLowerInvariant()
+    } catch {
+        $token = 'LEFT_UNAVAILABLE'
+    }
+    if ($token -eq 'DELETED' -or $token -eq 'ABSENT') { return $true }
+    Write-Warning "ATTRCUDA_INPUT_LEFT $token left in place: $Path"
+    return $false
 }
 
 function Assert-AttrCudaNoLinkBelowRoot {
@@ -2107,38 +2252,680 @@ function Assert-AttrCudaNoLinkBelowRoot {
     return $full
 }
 
+function Add-AttrCudaOwnedRecord {
+    <#
+    .SYNOPSIS
+    Append ONE creator-recorded ownership line to a job's journal, durably, before the caller does
+    anything else with the file (or directory) it just created.
+    .DESCRIPTION
+    OWNER-FOOTAGE-NO-HARDLINK-1/2. Ownership of a name is a fact about how it came to exist, never
+    about what a scan later finds: the ONLY things a job may delete are the ones it created itself,
+    and it proves that by reading the volume serial + 64-bit file index off the very handle that
+    CREATED the object (Get-AttrCudaFileId -Stream, FileMode.CreateNew) and journalling that identity
+    here. An identity first SEEN later -- by a sweep, by an adoption pass -- never confers ownership:
+    a name that merely looks like ours may be the last name of old footage (a hard link an older
+    build left, whose other name the owner has since replaced), and NumberOfLinks = 1 cannot tell the
+    difference.
+    The line is {p = path relative to the journal's directory, v/h/l = the identity, r = the name is a
+    symbolic link this caller created}. -Kind root journals a DIRECTORY this job created fresh
+    (New-AttrCudaOwnedRoot) and adds c = its creation FILETIME, the bound for the created-after proof;
+    -Kind gone retires a root record. The journal file is itself created with CreateNew and its own
+    identity is the first line it carries (k = self), so even the journal is deleted only by a
+    creator-recorded identity. The append is flushed through to disk before this returns, a sharing
+    violation from another job appending is retried for ten seconds, a journal that is a link or has
+    a second name is refused BEFORE a byte is written, and a failure THROWS: a caller that cannot
+    record a file it just made must remove it by identity and fail, not carry on holding an
+    unrecorded file.
+    #>
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $true)][string]$Journal,
+        [Parameter(Mandatory = $true)][string]$Path,
+        $FileId = $null,
+        [switch]$IsReparsePoint,
+        [ValidateSet('file', 'root', 'gone')][string]$Kind = 'file',
+        [switch]$AllowOutside
+    )
+
+    $journalFull = [IO.Path]::GetFullPath($Journal)
+    $journalDir = [IO.Path]::GetDirectoryName($journalFull).TrimEnd('\')
+    $full = [IO.Path]::GetFullPath($Path)
+    $inside = $full.StartsWith($journalDir + '\', [StringComparison]::OrdinalIgnoreCase)
+    # -AllowOutside (a durable creator record for a file made on ANOTHER directory tree, e.g. the staging
+    # job's target-volume partial) journals the ABSOLUTE path; the default still refuses a path that is
+    # not under the journal's own directory.
+    if (-not $inside -and -not $AllowOutside) {
+        throw 'ATTRCUDA_OWNED_RECORD_OUTSIDE_JOURNAL_DIRECTORY the recorded path is not under the journal directory'
+    }
+    if ($Kind -ne 'gone' -and $null -eq $FileId) {
+        throw 'ATTRCUDA_OWNED_RECORD_NO_IDENTITY a file or root record needs the identity read off its creating handle'
+    }
+    $record = [ordered]@{ p = $(if ($inside) { $full.Substring($journalDir.Length + 1) } else { $full }) }
+    if ($Kind -eq 'gone') {
+        $record['k'] = 'gone'
+    } else {
+        $record['v'] = [uint32]$FileId.VolumeSerialNumber
+        $record['h'] = [uint32]$FileId.FileIndexHigh
+        $record['l'] = [uint32]$FileId.FileIndexLow
+        $record['r'] = [bool]$IsReparsePoint
+        if ($Kind -eq 'root') {
+            $record['k'] = 'root'
+            $record['c'] = [int64]$FileId.CreationFileTime
+        }
+    }
+    $encoding = [Text.UTF8Encoding]::new($false)
+    $bytes = $encoding.GetBytes(($record | ConvertTo-Json -Compress) + "`n")
+    $existing = Get-Item -LiteralPath $journalFull -Force -ErrorAction SilentlyContinue
+    if ($null -ne $existing -and (($existing.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0)) {
+        throw 'ATTRCUDA_OWNED_JOURNAL_IS_LINK the journal name is a reparse point; nothing was written'
+    }
+    # APPEND-ONLY access (FILE_APPEND_DATA without FILE_WRITE_DATA, through CreateFileW): every write lands at the
+    # CURRENT end of file, atomically, whoever else appends. FileMode.Append only seeks to the end when the handle
+    # is OPENED, so two jobs appending at once would overwrite each other's record.
+    Initialize-AttrCudaFileIdNative
+    $appendAccess = [uint32](0x00000004 -bor 0x00000080 -bor 0x00100000)
+    $writeThrough = [uint32]2147483648
+    $deadline = [DateTime]::UtcNow.AddSeconds(10)
+    while ($true) {
+        $stream = $null
+        try {
+            $created = $false
+            $handle = [AttrCudaWin32.FileIdNative]::CreateFileW($journalFull, $appendAccess, [uint32]3, [IntPtr]::Zero, [uint32]1, $writeThrough, [IntPtr]::Zero)
+            if ($handle -ne [IntPtr]::new(-1)) {
+                $created = $true
+            } else {
+                $createError = [Runtime.InteropServices.Marshal]::GetLastWin32Error()
+                if ($createError -ne 80 -and $createError -ne 183) { throw "ATTRCUDA_OWNED_JOURNAL_UNAVAILABLE CreateFileW failed (Win32 error $createError)" }
+                $handle = [AttrCudaWin32.FileIdNative]::CreateFileW($journalFull, $appendAccess, [uint32]3, [IntPtr]::Zero, [uint32]3, $writeThrough, [IntPtr]::Zero)
+                if ($handle -eq [IntPtr]::new(-1)) { throw "ATTRCUDA_OWNED_JOURNAL_BUSY CreateFileW failed (Win32 error $([Runtime.InteropServices.Marshal]::GetLastWin32Error()))" }
+            }
+            $stream = [IO.FileStream]::new([Microsoft.Win32.SafeHandles.SafeFileHandle]::new($handle, $true), [IO.FileAccess]::Write, 1, $false)
+            $own = Get-AttrCudaFileId -Stream $stream
+            if ($own.IsDirectory -or $own.NumberOfLinks -ne 1) {
+                throw 'ATTRCUDA_OWNED_JOURNAL_HAS_SECOND_NAME the journal has more than one name; nothing was written'
+            }
+            if ($created) {
+                $selfLine = ([ordered]@{ p = ''; k = 'self'; v = [uint32]$own.VolumeSerialNumber; h = [uint32]$own.FileIndexHigh; l = [uint32]$own.FileIndexLow } | ConvertTo-Json -Compress) + "`n"
+                $selfBytes = $encoding.GetBytes($selfLine)
+                $stream.Write($selfBytes, 0, $selfBytes.Length)
+            }
+            $stream.Write($bytes, 0, $bytes.Length)
+            $stream.Flush($true)
+            return
+        } catch {
+            if ($_.Exception.Message.StartsWith('ATTRCUDA_OWNED_JOURNAL_IS_LINK') -or $_.Exception.Message.StartsWith('ATTRCUDA_OWNED_JOURNAL_HAS_SECOND_NAME') -or [DateTime]::UtcNow -gt $deadline) { throw }
+            Start-Sleep -Milliseconds 100
+        } finally {
+            if ($null -ne $stream) { $stream.Dispose() }
+        }
+    }
+}
+
+function Read-AttrCudaOwnedJournal {
+    <#
+    .SYNOPSIS
+    Read a job's creator journal (Add-AttrCudaOwnedRecord) into { Dir; Files; Roots; Self }, keyed by
+    the lower-cased path relative to the journal's directory. A missing journal is an EMPTY one, which
+    proves nothing and therefore authorises no delete. Malformed lines are skipped.
+    #>
+    [CmdletBinding()]
+    param([Parameter(Mandatory = $true)][string]$Journal)
+
+    $journalFull = [IO.Path]::GetFullPath($Journal)
+    $files = @{}
+    $roots = @{}
+    $self = $null
+    if (Test-Path -LiteralPath $journalFull -PathType Leaf) {
+        $stream = [IO.File]::Open($journalFull, [IO.FileMode]::Open, [IO.FileAccess]::Read, [IO.FileShare]::ReadWrite)
+        try {
+            $reader = [IO.StreamReader]::new($stream, [Text.Encoding]::UTF8)
+            try {
+                while ($null -ne ($line = $reader.ReadLine())) {
+                    if ([string]::IsNullOrWhiteSpace($line)) { continue }
+                    try { $record = $line | ConvertFrom-Json } catch { continue }
+                    $kind = if ($null -ne $record.PSObject.Properties['k']) { [string]$record.k } else { '' }
+                    $key = ([string]$record.p).ToLowerInvariant()
+                    if ($kind -eq 'self') { $self = $record; continue }
+                    if ($kind -eq 'gone') { $roots.Remove($key); continue }
+                    if ($kind -eq 'root') { $roots[$key] = $record; continue }
+                    $files[$key] = $record
+                }
+            } finally {
+                $reader.Dispose()
+            }
+        } finally {
+            $stream.Dispose()
+        }
+    }
+    [pscustomobject]@{
+        Dir = [IO.Path]::GetDirectoryName($journalFull).TrimEnd('\')
+        Files = $files
+        Roots = $roots
+        Self = $self
+    }
+}
+
+function Get-AttrCudaOwnershipProof {
+    <#
+    .SYNOPSIS
+    Resolve the proof the journal holds for ONE path: a creator-recorded file identity, or an
+    attested fresh root that contains it; $null when the journal proves nothing.
+    .DESCRIPTION
+    OWNER-FOOTAGE-NO-HARDLINK-2. This NEVER reads the name's own identity and treats it as authority.
+    A file record (written from the creating handle) wins. Otherwise the path must lie inside a
+    directory this job created fresh and journalled (k = root) AND that directory must still be the
+    very object that was recorded (its identity and creation time are re-read and compared here, so a
+    directory swapped in under the name attests nothing). -RootCache memoises that check per call.
+    #>
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $true)]$Journal,
+        [Parameter(Mandatory = $true)][string]$Path,
+        [Parameter(Mandatory = $true)][hashtable]$RootCache
+    )
+
+    $full = [IO.Path]::GetFullPath($Path)
+    if (-not $full.StartsWith($Journal.Dir + '\', [StringComparison]::OrdinalIgnoreCase)) {
+        # a record made with -AllowOutside is keyed by its absolute path; no root attests an outside path
+        $outsideKey = $full.ToLowerInvariant()
+        if (-not $Journal.Files.ContainsKey($outsideKey)) { return $null }
+        $outside = $Journal.Files[$outsideKey]
+        return [pscustomobject]@{
+            Kind = 'file'
+            FileId = [pscustomobject]@{ VolumeSerialNumber = [uint32]$outside.v; FileIndexHigh = [uint32]$outside.h; FileIndexLow = [uint32]$outside.l }
+            ExpectReparsePoint = [bool]$outside.r
+            NotBeforeFileTime = [int64]0
+        }
+    }
+    $key = $full.Substring($Journal.Dir.Length + 1).ToLowerInvariant()
+    if ($Journal.Files.ContainsKey($key)) {
+        $record = $Journal.Files[$key]
+        return [pscustomobject]@{
+            Kind = 'file'
+            FileId = [pscustomobject]@{ VolumeSerialNumber = [uint32]$record.v; FileIndexHigh = [uint32]$record.h; FileIndexLow = [uint32]$record.l }
+            ExpectReparsePoint = [bool]$record.r
+            NotBeforeFileTime = [int64]0
+        }
+    }
+    foreach ($rootKey in @($Journal.Roots.Keys)) {
+        if (-not $key.StartsWith($rootKey + '\', [StringComparison]::Ordinal)) { continue }
+        if (-not $RootCache.ContainsKey($rootKey)) {
+            $record = $Journal.Roots[$rootKey]
+            $holds = $false
+            try {
+                $now = Get-AttrCudaFileId -Path (Join-Path $Journal.Dir ([string]$record.p))
+                $holds = ($now.IsDirectory -and -not $now.IsReparsePoint -and
+                    $now.VolumeSerialNumber -eq [uint32]$record.v -and
+                    $now.FileIndexHigh -eq [uint32]$record.h -and
+                    $now.FileIndexLow -eq [uint32]$record.l -and
+                    $now.CreationFileTime -eq [int64]$record.c)
+            } catch {
+                $holds = $false
+            }
+            $RootCache[$rootKey] = $holds
+        }
+        if ($RootCache[$rootKey]) {
+            return [pscustomobject]@{
+                Kind = 'root'
+                FileId = $null
+                ExpectReparsePoint = $false
+                NotBeforeFileTime = [int64]$Journal.Roots[$rootKey].c
+            }
+        }
+    }
+    return $null
+}
+
 function Remove-AttrCudaTree {
     <#
     .SYNOPSIS
-    Recursively delete a job-owned directory under a trusted root, refusing if ANY component between
-    the root and the directory, or any entry inside it, is a reparse point.
+    Empty and remove a job-owned directory under a trusted root WITHOUT a recursive pathname delete:
+    every file goes through Remove-AttrCudaFileByProof (check and delete on one handle), directories
+    go only when empty, and anything the journal does not PROVE is this job's is left where it is.
     .DESCRIPTION
-    The ancestor chain is checked FIRST (Assert-AttrCudaNoLinkBelowRoot), even when the directory is
-    absent, so a linked parent can never steer the delete (sol PR #133 r6). The walk then does not
-    descend into reparse points; if one is found the function throws ATTRCUDA_TREE_HAS_REPARSE_POINT
-    and deletes nothing. Only a tree proved free of links is handed to Remove-Item -Recurse.
+    OWNER-FOOTAGE-NO-HARDLINK-2: -OwnedJournal is MANDATORY and has no default; there is no mode in
+    which this function reads a file's current identity and treats it as authority (the previous
+    no-journal mode did exactly that, and a legacy bind-proof hard link under a build job's scratch
+    tree that had become the last name of an owner recording would have been deleted). A file is
+    deleted only when the journal proves it:
+      * a file record (Add-AttrCudaOwnedRecord, written at creation from the creating handle) names
+        it AND its identity on the deleting handle is the recorded one; or
+      * it lies inside a directory this job created fresh and journalled (New-AttrCudaOwnedRoot)
+        that is still the recorded object, AND the file's own creation time is not before that
+        directory's (a hard link to older bytes keeps the old creation time) -- see
+        Remove-AttrCudaFileByProof.
+    In both cases the object must also have exactly one name. Everything else is LEFT and reported:
+    LEFT_UNOWNED (the journal proves nothing: never adopted), LEFT_MULTI_LINK, LEFT_ID_MISMATCH,
+    LEFT_PREDATES_ROOT, LEFT_NOT_A_FILE, LEFT_UNAVAILABLE; the directories above it stay. Returns
+    { Removed; Left = @({ Name; Rel; Token }); TreeRemoved } and throws nothing about leftovers: the
+    caller decides what a non-empty result means. The ancestor chain is checked FIRST
+    (Assert-AttrCudaNoLinkBelowRoot), even when the directory is absent (sol PR #133 r6). When the
+    journal itself lives inside the tree it is removed last, by the identity it recorded for itself.
     #>
     [CmdletBinding()]
     param(
         [Parameter(Mandatory = $true)][string]$TrustedRoot,
-        [Parameter(Mandatory = $true)][string]$Path
+        [Parameter(Mandatory = $true)][string]$Path,
+        [Parameter(Mandatory = $true)][string]$OwnedJournal
     )
 
     $Path = Assert-AttrCudaNoLinkBelowRoot -TrustedRoot $TrustedRoot -Path $Path
     $root = Get-Item -LiteralPath $Path -Force -ErrorAction SilentlyContinue
-    if ($null -eq $root) { return }
+    if ($null -eq $root) { return [pscustomobject]@{ Removed = 0; Left = @(); TreeRemoved = $true } }
+
+    $journalFull = [IO.Path]::GetFullPath($OwnedJournal)
+    $journalData = Read-AttrCudaOwnedJournal -Journal $journalFull
+    $rootCache = @{}
+    $journalInside = $journalFull.StartsWith($Path + '\', [StringComparison]::OrdinalIgnoreCase)
+
+    # Enumerate once, without descending into a reparse point.
+    $ordered = [System.Collections.Generic.List[System.IO.FileSystemInfo]]::new()
     $stack = [System.Collections.Generic.Stack[System.IO.FileSystemInfo]]::new()
     $stack.Push($root)
     while ($stack.Count -gt 0) {
         $entry = $stack.Pop()
-        if (($entry.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) {
-            throw "ATTRCUDA_TREE_HAS_REPARSE_POINT $($entry.FullName) (refusing to delete $Path)"
-        }
-        if ($entry -is [System.IO.DirectoryInfo]) {
+        [void]$ordered.Add($entry)
+        $isReparse = (($entry.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0)
+        if ($entry -is [System.IO.DirectoryInfo] -and -not $isReparse) {
             foreach ($child in $entry.EnumerateFileSystemInfos()) { $stack.Push($child) }
         }
     }
-    Remove-Item -LiteralPath $Path -Recurse -Force -Confirm:$false
+
+    $removed = 0
+    $left = [System.Collections.Generic.List[object]]::new()
+    for ($i = $ordered.Count - 1; $i -ge 1; $i--) {
+        $entry = $ordered[$i]
+        $isReparse = (($entry.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0)
+        if ($journalInside -and [string]::Equals($entry.FullName, $journalFull, [StringComparison]::OrdinalIgnoreCase)) { continue }
+        if ($entry -is [System.IO.DirectoryInfo] -and -not $isReparse) {
+            try { [IO.Directory]::Delete($entry.FullName, $false) } catch { }
+            continue
+        }
+        $rel = ''
+        if ($entry.FullName.StartsWith($Path + '\', [StringComparison]::OrdinalIgnoreCase)) { $rel = $entry.FullName.Substring($Path.Length + 1) }
+        $proof = Get-AttrCudaOwnershipProof -Journal $journalData -Path $entry.FullName -RootCache $rootCache
+        if ($null -eq $proof) {
+            $token = 'LEFT_UNOWNED'
+            try { if ((Get-AttrCudaFileId -Path $entry.FullName).NumberOfLinks -gt 1) { $token = 'LEFT_MULTI_LINK' } } catch { }
+        } elseif ($proof.Kind -eq 'file') {
+            $token = Remove-AttrCudaFileByProof -Path $entry.FullName -FileId $proof.FileId -ExpectReparsePoint:$proof.ExpectReparsePoint
+        } elseif ($isReparse) {
+            $token = 'LEFT_NOT_A_FILE'
+        } else {
+            $token = Remove-AttrCudaFileByProof -Path $entry.FullName -NotBeforeFileTime $proof.NotBeforeFileTime
+        }
+        if ($token -eq 'DELETED' -or $token -eq 'ABSENT') { $removed++ } else {
+            [void]$left.Add([pscustomobject]@{ Name = $entry.Name; Rel = $rel; Token = $token })
+        }
+    }
+
+    # The journal is this job's own bookkeeping file: it goes last, only when it lives inside this
+    # tree and nothing else is left standing that it describes, and only by the identity it recorded
+    # for ITSELF when it was created.
+    if ($journalInside -and $left.Count -eq 0 -and $null -ne $journalData.Self -and (Test-Path -LiteralPath $journalFull -PathType Leaf)) {
+        $selfId = [pscustomobject]@{ VolumeSerialNumber = [uint32]$journalData.Self.v; FileIndexHigh = [uint32]$journalData.Self.h; FileIndexLow = [uint32]$journalData.Self.l }
+        $journalToken = Remove-AttrCudaFileById -Path $journalFull -FileId $selfId
+        if ($journalToken -ne 'DELETED' -and $journalToken -ne 'ABSENT') {
+            [void]$left.Add([pscustomobject]@{ Name = [IO.Path]::GetFileName($journalFull); Rel = $journalFull.Substring($Path.Length + 1); Token = $journalToken })
+        }
+    }
+    if ($left.Count -eq 0) {
+        try { [IO.Directory]::Delete($root.FullName, $false) } catch { }
+    }
+    [pscustomobject]@{ Removed = $removed; Left = @($left); TreeRemoved = (-not (Test-Path -LiteralPath $Path)) }
+}
+
+function New-AttrCudaOwnedRoot {
+    <#
+    .SYNOPSIS
+    Create a job's scratch/publish directory FRESH, record its creation, and return the path: a
+    directory that already stands under that name is never adopted and never deleted unproven.
+    .DESCRIPTION
+    OWNER-FOOTAGE-NO-HARDLINK-2. Build jobs write into trees whose files are made by child tools
+    (qmake, make, nvcc, expand-archive), so no per-file creating handle exists. Ownership is instead
+    proved at the TREE: this function creates the directory itself (it must not exist, must be empty,
+    and its own creation time must be "now", so a directory someone else made is refused), journals
+    its identity + creation FILETIME (Add-AttrCudaOwnedRecord -Kind root), and Remove-AttrCudaTree
+    later deletes inside it only what was created after it (Remove-AttrCudaFileByProof
+    -NotBeforeFileTime) with one name. A pre-existing directory at the name is handled by PROOF, not
+    by looks: one this journal recorded as a fresh root (an earlier run of this code) is swept through
+    Remove-AttrCudaTree; anything else -- a legacy tree an older build left, which may hold a hard
+    link that is now the last name of an owner recording -- is MOVED ASIDE to
+    '<name>.unproven-<utc>-<id>' (a rename deletes no name of any file inside it) and a warning
+    records it, then the fresh directory is created. A tree that could not be fully swept is moved
+    aside the same way. Returns { Path; Swept; Quarantined }.
+    #>
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $true)][string]$TrustedRoot,
+        [Parameter(Mandatory = $true)][string]$Path,
+        [Parameter(Mandatory = $true)][string]$OwnedJournal
+    )
+
+    $full = Assert-AttrCudaNoLinkBelowRoot -TrustedRoot $TrustedRoot -Path $Path
+    $parent = Get-Item -LiteralPath ([IO.Path]::GetDirectoryName($full)) -Force -ErrorAction SilentlyContinue
+    if ($null -eq $parent -or -not $parent.PSIsContainer) { throw "ATTRCUDA_DIR_PARENT_MISSING $full" }
+    if (($parent.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) { throw "ATTRCUDA_DIR_PARENT_IS_LINK $($parent.FullName)" }
+
+    $swept = 0
+    $quarantined = ''
+    $standing = Get-Item -LiteralPath $full -Force -ErrorAction SilentlyContinue
+    if ($null -ne $standing) {
+        if (-not $standing.PSIsContainer) { throw "ATTRCUDA_ROOT_OCCUPIED $full is a file" }
+        $result = Remove-AttrCudaTree -TrustedRoot $TrustedRoot -Path $full -OwnedJournal $OwnedJournal
+        $swept = [int]$result.Removed
+        if (-not $result.TreeRemoved) {
+            $stamp = [DateTime]::UtcNow.ToString('yyyyMMddTHHmmssZ')
+            $quarantined = "$full.unproven-$stamp-$([guid]::NewGuid().ToString('N').Substring(0, 8))"
+            [IO.Directory]::Move($full, $quarantined)
+            Write-Warning "ATTRCUDA_ROOT_QUARANTINED a standing tree could not be proved this job's ($(@($result.Left).Count) entries left); moved aside, nothing deleted: $quarantined"
+        }
+        Add-AttrCudaOwnedRecord -Journal $OwnedJournal -Path $full -Kind gone
+    }
+    $notBefore = [DateTime]::UtcNow.ToFileTimeUtc() - 20000000L
+    [void](New-Item -ItemType Directory -Path $full)
+    $id = Get-AttrCudaFileId -Path $full
+    $children = @(Get-ChildItem -LiteralPath $full -Force -ErrorAction SilentlyContinue)
+    if (-not $id.IsDirectory -or $id.IsReparsePoint -or $id.CreationFileTime -lt $notBefore -or $children.Count -gt 0) {
+        throw "ATTRCUDA_ROOT_NOT_FRESH $full was not created by this call; it is not recorded and will not be deleted"
+    }
+    Add-AttrCudaOwnedRecord -Journal $OwnedJournal -Path $full -FileId $id -Kind root
+    [pscustomobject]@{ Path = $full; Swept = $swept; Quarantined = $quarantined }
+}
+
+function Initialize-AttrCudaFileIdNative {
+    <#
+    .SYNOPSIS
+    Define (once per process) the Win32 surface the file-identity functions below share:
+    CreateFileW, GetFileInformationByHandle, SetFileInformationByHandle (delete-on-close
+    disposition only) and CloseHandle.
+    .DESCRIPTION
+    OWNER-FOOTAGE-NO-HARDLINK-1: ONE definition, so Get-AttrCudaFileId and Remove-AttrCudaFileById
+    (and, through them, Remove-AttrCudaTree) never define the same native type twice with
+    different members -- a second Add-Type for an already-defined name would silently keep the
+    FIRST definition and lose the members only the second one declared. Idempotent; footage-neutral.
+    #>
+    [CmdletBinding()]
+    param()
+
+    if ('AttrCudaWin32.FileIdNative' -as [type]) { return }
+    $definition = @'
+    [System.Runtime.InteropServices.StructLayout(System.Runtime.InteropServices.LayoutKind.Sequential)]
+    public struct FileIdInfo {
+        public uint FileAttributes;
+        public uint CreationTimeLow;
+        public uint CreationTimeHigh;
+        public uint LastAccessTimeLow;
+        public uint LastAccessTimeHigh;
+        public uint LastWriteTimeLow;
+        public uint LastWriteTimeHigh;
+        public uint VolumeSerialNumber;
+        public uint FileSizeHigh;
+        public uint FileSizeLow;
+        public uint NumberOfLinks;
+        public uint FileIndexHigh;
+        public uint FileIndexLow;
+    }
+
+    [System.Runtime.InteropServices.StructLayout(System.Runtime.InteropServices.LayoutKind.Sequential)]
+    public struct FileDispositionInfo {
+        [System.Runtime.InteropServices.MarshalAs(System.Runtime.InteropServices.UnmanagedType.U1)]
+        public bool DeleteFile;
+    }
+
+    [System.Runtime.InteropServices.StructLayout(System.Runtime.InteropServices.LayoutKind.Sequential)]
+    public struct FileBasicInfo {
+        public long CreationTime;
+        public long LastAccessTime;
+        public long LastWriteTime;
+        public long ChangeTime;
+        public uint FileAttributes;
+    }
+
+    [System.Runtime.InteropServices.DllImport("kernel32.dll", SetLastError = true)]
+    public static extern bool SetFileInformationByHandle(System.IntPtr hFile, int fileInformationClass, ref FileBasicInfo lpFileInformation, uint dwBufferSize);
+
+    [System.Runtime.InteropServices.DllImport("kernel32.dll", SetLastError = true, CharSet = System.Runtime.InteropServices.CharSet.Unicode)]
+    public static extern System.IntPtr CreateFileW(string lpFileName, uint dwDesiredAccess, uint dwShareMode, System.IntPtr lpSecurityAttributes, uint dwCreationDisposition, uint dwFlagsAndAttributes, System.IntPtr hTemplateFile);
+
+    [System.Runtime.InteropServices.DllImport("kernel32.dll", SetLastError = true)]
+    public static extern bool GetFileInformationByHandle(System.IntPtr hFile, out FileIdInfo lpFileInformation);
+
+    [System.Runtime.InteropServices.DllImport("kernel32.dll", SetLastError = true)]
+    public static extern bool SetFileInformationByHandle(System.IntPtr hFile, int fileInformationClass, ref FileDispositionInfo lpFileInformation, uint dwBufferSize);
+
+    [System.Runtime.InteropServices.DllImport("kernel32.dll", SetLastError = true)]
+    public static extern bool CloseHandle(System.IntPtr hObject);
+'@
+    Add-Type -Namespace AttrCudaWin32 -Name FileIdNative -MemberDefinition $definition -ErrorAction Stop
+}
+
+function ConvertTo-AttrCudaFileIdObject {
+    <#
+    .SYNOPSIS
+    Shape a GetFileInformationByHandle result: volume serial, 64-bit file index (high/low), live
+    hard-link count, attributes, and the two attribute bits callers branch on.
+    #>
+    [CmdletBinding()]
+    param([Parameter(Mandatory = $true)]$Info)
+
+    [pscustomobject]@{
+        VolumeSerialNumber = $Info.VolumeSerialNumber
+        FileIndexHigh = $Info.FileIndexHigh
+        FileIndexLow = $Info.FileIndexLow
+        NumberOfLinks = $Info.NumberOfLinks
+        FileAttributes = $Info.FileAttributes
+        IsDirectory = (($Info.FileAttributes -band [uint32]0x10) -ne 0)
+        IsReparsePoint = (($Info.FileAttributes -band [uint32]0x400) -ne 0)
+        CreationFileTime = [int64](([uint64]$Info.CreationTimeHigh -shl 32) -bor [uint64]$Info.CreationTimeLow)
+    }
+}
+
+function Get-AttrCudaFileId {
+    <#
+    .SYNOPSIS
+    Return the Win32 file identity (volume serial, 64-bit file index, live hard-link count,
+    attributes) of a path -- by default of the NAME ITSELF, never following a symbolic link or
+    junction -- or of an open FileStream's own handle.
+    .DESCRIPTION
+    OWNER-FOOTAGE-NO-HARDLINK-1. -Path opens with FILE_READ_ATTRIBUTES only (no data access, so it
+    conflicts with no other handle's share mode and never blocks or is blocked by a reader or
+    writer) and FILE_FLAG_OPEN_REPARSE_POINT unless -FollowLinks is given, so a symlink reports its
+    OWN identity and IsReparsePoint = $true rather than its target's. -FollowLinks reports the
+    target's. -Stream reads the identity off the stream's own handle -- race-free, because no path
+    is resolved at all: it is the identity of the very file object the stream holds.
+    Exactly one of -Path / -Stream is required. Throws ATTRCUDA_FILE_ID_UNAVAILABLE on any Win32
+    failure; the message never echoes the path.
+    #>
+    [CmdletBinding()]
+    param(
+        [string]$Path = '',
+        [System.IO.FileStream]$Stream = $null,
+        [switch]$FollowLinks
+    )
+
+    if (([string]::IsNullOrEmpty($Path)) -eq ($null -eq $Stream)) {
+        throw 'ATTRCUDA_FILE_ID_UNAVAILABLE exactly one of -Path / -Stream is required'
+    }
+    Initialize-AttrCudaFileIdNative
+
+    $handle = [IntPtr]::Zero
+    $ownsHandle = $false
+    if ($null -ne $Stream) {
+        $handle = $Stream.SafeFileHandle.DangerousGetHandle()
+    } else {
+        $readAttributes = [uint32]0x80
+        $shareAll = [uint32]0x00000007
+        $openExisting = [uint32]3
+        $flags = [uint32]0x02000000
+        if (-not $FollowLinks) { $flags = [uint32]($flags -bor [uint32]0x00200000) }
+        # fable r1 (ATTRCUDA-FILE-ID-LONG-PATH-1): CreateFileW refuses a path of 260+ characters unless it
+        # carries the extended-length prefix, and Remove-Item -Recurse used to succeed there where the
+        # identity-checked tree delete would otherwise refuse with ATTRCUDA_TREE_FILE_ID_UNAVAILABLE.
+        $nativePath = $Path
+        if ($nativePath.Length -ge 240 -and -not $nativePath.StartsWith('\\?\')) {
+            $nativePath = [IO.Path]::GetFullPath($nativePath)
+            if ($nativePath.StartsWith('\\')) { $nativePath = '\\?\UNC\' + $nativePath.Substring(2) } else { $nativePath = '\\?\' + $nativePath }
+        }
+        $handle = [AttrCudaWin32.FileIdNative]::CreateFileW(
+            $nativePath, $readAttributes, $shareAll, [IntPtr]::Zero, $openExisting, $flags, [IntPtr]::Zero)
+        if ($handle -eq [IntPtr]::new(-1)) {
+            throw "ATTRCUDA_FILE_ID_UNAVAILABLE CreateFileW failed (Win32 error $([Runtime.InteropServices.Marshal]::GetLastWin32Error()))"
+        }
+        $ownsHandle = $true
+    }
+    try {
+        $info = [AttrCudaWin32.FileIdNative+FileIdInfo]::new()
+        if (-not [AttrCudaWin32.FileIdNative]::GetFileInformationByHandle($handle, [ref]$info)) {
+            throw "ATTRCUDA_FILE_ID_UNAVAILABLE GetFileInformationByHandle failed (Win32 error $([Runtime.InteropServices.Marshal]::GetLastWin32Error()))"
+        }
+        ConvertTo-AttrCudaFileIdObject -Info $info
+    } finally {
+        if ($ownsHandle) { [void][AttrCudaWin32.FileIdNative]::CloseHandle($handle) }
+    }
+}
+
+function Remove-AttrCudaFileByProof {
+    <#
+    .SYNOPSIS
+    Delete ONE name, only against a PROOF the caller must supply; check and delete are one handle.
+    Returns a fixed token; never throws. There is no mode without a proof.
+    .DESCRIPTION
+    OWNER-FOOTAGE-NO-HARDLINK-2: this is the ONLY function in the tree that sets a delete disposition,
+    and its parameter sets each make exactly one kind of proof MANDATORY (none is defaulted, and no
+    parameter set exists without one). A pathname is not an identity: between "this is my file" and
+    "delete it" another process can replace the name with a hard link to something that matters, so
+    the name is opened (FILE_FLAG_OPEN_REPARSE_POINT -- a symlink is opened as itself), share mode
+    NONE, with DELETE access, every check is made on THAT handle, and the disposition is set on it.
+    The three proofs, and what each can prove:
+      -FileId <id>           CREATOR-RECORDED identity (volume serial + 64-bit file index read off the
+                             handle that CREATED the file, Get-AttrCudaFileId -Stream). The object
+                             on the name must be that exact one. Use -ExpectReparsePoint to delete a
+                             symbolic link this caller created (the link only, never its target).
+      -NotBeforeFileTime <n> the name is inside a directory this job CREATED FRESH and recorded
+                             (New-AttrCudaOwnedRoot); an object whose own creation time predates that
+                             directory cannot have been made by this job -- a hard link to an older
+                             file carries the OLD file's creation time -- so it is left
+                             (LEFT_PREDATES_ROOT). Never an identity read off the name.
+      -ExpectedSha256 <hex>  CONTENT proof for a SUBMITTED INPUT the job did not create (a build
+                             package or tracked fixture that was verified against its committed
+                             hash): the bytes read through the deleting handle must hash to it, so a
+                             name that is anything else -- owner footage included -- is left.
+    Every set also requires: a plain file (not a directory, not a reparse point unless
+    -ExpectReparsePoint) with exactly ONE name. Tokens: DELETED, ABSENT, LEFT_ID_MISMATCH,
+    LEFT_PREDATES_ROOT, LEFT_CONTENT_MISMATCH, LEFT_MULTI_LINK, LEFT_NOT_A_FILE, LEFT_UNAVAILABLE.
+    Anything but DELETED or ABSENT leaves the name exactly where it is.
+    #>
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $true)][string]$Path,
+        [Parameter(Mandatory = $true, ParameterSetName = 'ById')]$FileId,
+        [Parameter(ParameterSetName = 'ById')][switch]$ExpectReparsePoint,
+        [Parameter(Mandatory = $true, ParameterSetName = 'CreatedAfter')][long]$NotBeforeFileTime,
+        [Parameter(Mandatory = $true, ParameterSetName = 'Content')][ValidatePattern('^[0-9a-f]{64}$')][string]$ExpectedSha256
+    )
+
+    try {
+        Initialize-AttrCudaFileIdNative
+        $set = $PSCmdlet.ParameterSetName
+        $access = [uint64]0x00010000 -bor [uint64]0x80 -bor [uint64]0x100
+        # The content proof reads the bytes through the SAME handle that deletes them (GENERIC_READ).
+        if ($set -eq 'Content') { $access = $access -bor [uint64]2147483648 }
+        # Share mode 0: while this handle is open nobody else can open the name to read, write, delete
+        # or rename it, so what is read below is what is deleted.
+        $shareNone = [uint32]0
+        $openExisting = [uint32]3
+        $flags = [uint32](0x02000000 -bor 0x00200000)
+        $nativePath = $Path
+        if ($nativePath.Length -ge 240 -and -not $nativePath.StartsWith('\\?\')) {
+            $nativePath = [IO.Path]::GetFullPath($nativePath)
+            if ($nativePath.StartsWith('\\')) { $nativePath = '\\?\UNC\' + $nativePath.Substring(2) } else { $nativePath = '\\?\' + $nativePath }
+        }
+        $handle = [AttrCudaWin32.FileIdNative]::CreateFileW(
+            $nativePath, [uint32]$access, $shareNone, [IntPtr]::Zero, $openExisting, $flags, [IntPtr]::Zero)
+        if ($handle -eq [IntPtr]::new(-1)) {
+            $error32 = [Runtime.InteropServices.Marshal]::GetLastWin32Error()
+            if ($error32 -eq 2 -or $error32 -eq 3) { return 'ABSENT' }
+            return 'LEFT_UNAVAILABLE'
+        }
+        try {
+            $info = [AttrCudaWin32.FileIdNative+FileIdInfo]::new()
+            if (-not [AttrCudaWin32.FileIdNative]::GetFileInformationByHandle($handle, [ref]$info)) { return 'LEFT_UNAVAILABLE' }
+            $id = ConvertTo-AttrCudaFileIdObject -Info $info
+            if ($id.IsDirectory) { return 'LEFT_NOT_A_FILE' }
+            if ($set -eq 'ById') {
+                if ($id.IsReparsePoint -ne [bool]$ExpectReparsePoint) {
+                    if ($id.IsReparsePoint) { return 'LEFT_NOT_A_FILE' }
+                    return 'LEFT_ID_MISMATCH'
+                }
+                if ($id.VolumeSerialNumber -ne $FileId.VolumeSerialNumber -or
+                    $id.FileIndexHigh -ne $FileId.FileIndexHigh -or
+                    $id.FileIndexLow -ne $FileId.FileIndexLow) { return 'LEFT_ID_MISMATCH' }
+            } else {
+                if ($id.IsReparsePoint) { return 'LEFT_NOT_A_FILE' }
+                if ($set -eq 'CreatedAfter' -and $id.CreationFileTime -lt $NotBeforeFileTime) { return 'LEFT_PREDATES_ROOT' }
+            }
+            if ($id.NumberOfLinks -ne 1) { return 'LEFT_MULTI_LINK' }
+            if ($set -eq 'Content') {
+                $sha = [Security.Cryptography.SHA256]::Create()
+                try {
+                    $safe = [Microsoft.Win32.SafeHandles.SafeFileHandle]::new($handle, $false)
+                    $stream = [IO.FileStream]::new($safe, [IO.FileAccess]::Read, 65536, $false)
+                    try {
+                        $digest = ([BitConverter]::ToString($sha.ComputeHash($stream)) -replace '-', '').ToLowerInvariant()
+                    } finally {
+                        $stream.Dispose()
+                    }
+                } finally {
+                    $sha.Dispose()
+                }
+                if ($digest -ne $ExpectedSha256) { return 'LEFT_CONTENT_MISMATCH' }
+            }
+            $disposition = [AttrCudaWin32.FileIdNative+FileDispositionInfo]::new()
+            $disposition.DeleteFile = $true
+            if (-not [AttrCudaWin32.FileIdNative]::SetFileInformationByHandle($handle, 4, [ref]$disposition, [uint32]1)) {
+                # A read-only file refuses the delete disposition. It is the verified object (proof and
+                # one name checked above, on this handle), so clear the flag on THIS handle -- never by
+                # path -- and retry once.
+                $readOnly = [uint32]1
+                if (($id.FileAttributes -band $readOnly) -eq 0) { return 'LEFT_UNAVAILABLE' }
+                $basic = [AttrCudaWin32.FileIdNative+FileBasicInfo]::new()
+                $newAttributes = [uint32]($id.FileAttributes -band (-bnot $readOnly))
+                if ($newAttributes -eq 0) { $newAttributes = [uint32]0x80 }
+                $basic.FileAttributes = $newAttributes
+                if (-not [AttrCudaWin32.FileIdNative]::SetFileInformationByHandle($handle, 0, [ref]$basic, [uint32]40)) { return 'LEFT_UNAVAILABLE' }
+                if (-not [AttrCudaWin32.FileIdNative]::SetFileInformationByHandle($handle, 4, [ref]$disposition, [uint32]1)) { return 'LEFT_UNAVAILABLE' }
+            }
+            return 'DELETED'
+        } finally {
+            [void][AttrCudaWin32.FileIdNative]::CloseHandle($handle)
+        }
+    } catch {
+        return 'LEFT_UNAVAILABLE'
+    }
+}
+
+function Remove-AttrCudaFileById {
+    <#
+    .SYNOPSIS
+    Delete ONE name, only if it is still the exact file object this caller recorded when it created
+    it, and that object still has exactly one name. Returns a fixed token; never throws.
+    .DESCRIPTION
+    OWNER-FOOTAGE-NO-HARDLINK-1/2. The creator-recorded-identity proof of Remove-AttrCudaFileByProof
+    (which holds the whole mechanism and its token list): -FileId is MANDATORY, read off the handle
+    that created the file; a caller that never recorded one has no way to call this. The caller must
+    already have closed its own handles to the name (the delete handle is share-none).
+    -ExpectReparsePoint is for deleting a symbolic link this caller created: the link is opened as
+    itself, its own identity is compared, and ONLY the link is removed -- never its target.
+    #>
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $true)][string]$Path,
+        [Parameter(Mandatory = $true)]$FileId,
+        [switch]$ExpectReparsePoint
+    )
+
+    Remove-AttrCudaFileByProof -Path $Path -FileId $FileId -ExpectReparsePoint:$ExpectReparsePoint
 }
 
 function Resolve-AttrCudaSmokeRunLog {
@@ -5011,8 +5798,19 @@ Export-ModuleMember -Function `
     Publish-AttrCudaDirectoryMoveNonOverwriting, `
     New-AttrCudaDirectory, `
     Remove-AttrCudaPartialFile, `
+    Remove-AttrCudaInputFileByContent, `
     Assert-AttrCudaNoLinkBelowRoot, `
     Remove-AttrCudaTree, `
+    New-AttrCudaOwnedRoot, `
+    New-AttrCudaOwnedFileStream, `
+    Add-AttrCudaOwnedRecord, `
+    Read-AttrCudaOwnedJournal, `
+    Get-AttrCudaOwnershipProof, `
+    Initialize-AttrCudaFileIdNative, `
+    ConvertTo-AttrCudaFileIdObject, `
+    Get-AttrCudaFileId, `
+    Remove-AttrCudaFileByProof, `
+    Remove-AttrCudaFileById, `
     Resolve-AttrCudaSmokeRunLog, `
     Get-AttrCudaLastEligibilityLine, `
     Get-AttrCudaEligibilityVerdict, `

@@ -109,6 +109,71 @@ class StageFixtureJobTests(unittest.TestCase):
         self.assertEqual(sorted(p.name for p in self.cache.iterdir()), [])
         self.assertEqual(sorted(p.name for p in self.inbox.iterdir()), [self.clip.name])
 
+    def test_a_legacy_tree_that_is_the_last_name_of_an_old_recording_is_moved_aside_never_deleted(self) -> None:
+        # OWNER-FOOTAGE-NO-HARDLINK-2: the emitted job used to start with Remove-AttrCudaTree on work\\<jobId>,
+        # which adopted the first-seen identity of whatever it found. Here an OLDER build left a neutral hard link
+        # under that tree and the owner then re-recorded the original, so the link is the LAST name of the old
+        # recording with one link -- indistinguishable from a file this job made. It must survive, and the run
+        # must still complete in a fresh tree.
+        proc = self.generate()
+        job = self.job_path(proc)
+        job_id = job.name[: -len(".job.ps1")]
+        self.drop_side_file()
+        owner_home = self.tmp / "owner-home"
+        owner_home.mkdir()
+        original = owner_home / "original.bin"
+        original.write_bytes(b"SYNTHETIC OLD RECORDING " * 20)
+        legacy_dir = self.agent / "work" / job_id / "proof-1" / "owner-clip"
+        legacy_dir.mkdir(parents=True)
+        legacy = legacy_dir / "owner-clip.bin"
+        os.link(original, legacy)
+        os.remove(original)
+        original.write_bytes(b"the owner's new recording")
+        self.assertEqual(os.stat(legacy).st_nlink, 1)
+
+        run = self.run_job(job)
+
+        self.assertEqual(run.returncode, 0, run.stdout + run.stderr)
+        self.assertIn("RESULT=FIXTURE_STAGE_OK", run.stdout)
+        moved = sorted((self.agent / "work").glob(f"{job_id}.unproven-*"))
+        self.assertEqual(len(moved), 1, sorted(p.name for p in (self.agent / "work").iterdir()))
+        survivor = moved[0] / "proof-1" / "owner-clip" / "owner-clip.bin"
+        self.assertEqual(survivor.read_bytes(), b"SYNTHETIC OLD RECORDING " * 20, "the last name of the old recording was deleted")
+        self.assertTrue((self.agent / "work" / job_id).is_dir(), "the run works in a fresh tree at the same name")
+        self.assertTrue((self.cache / self.clip.name).is_file())
+
+        # a second run sweeps the tree THIS code recorded (by proof) and moves nothing more aside
+        self.drop_side_file()
+        again = self.run_job(job)
+        self.assertEqual(again.returncode, 0, again.stdout + again.stderr)
+        self.assertEqual(len(sorted((self.agent / "work").glob(f"{job_id}.unproven-*"))), 1)
+        self.assertEqual(survivor.read_bytes(), b"SYNTHETIC OLD RECORDING " * 20)
+
+    def test_a_legacy_outbox_tree_is_moved_aside_the_same_way(self) -> None:
+        proc = self.generate()
+        job = self.job_path(proc)
+        job_id = job.name[: -len(".job.ps1")]
+        self.drop_side_file()
+        legacy_pub = self.agent / "outbox" / f"{job_id}.artifacts"
+        legacy_pub.mkdir(parents=True)
+        (legacy_pub / "stale-result.json").write_bytes(b"{}")
+        run = self.run_job(job)
+        self.assertEqual(run.returncode, 0, run.stdout + run.stderr)
+        moved = sorted((self.agent / "outbox").glob(f"{job_id}.artifacts.unproven-*"))
+        self.assertEqual(len(moved), 1)
+        self.assertEqual((moved[0] / "stale-result.json").read_bytes(), b"{}")
+        self.assertTrue((self.agent / "outbox" / f"{job_id}.artifacts" / "result.json").is_file())
+
+    def test_an_inbox_name_that_is_not_the_verified_clip_bytes_is_left_even_though_its_hash_was_never_the_issue(self) -> None:
+        # The inbox removal is a CONTENT proof. A tampered side file never reaches it (the hash gate stops the
+        # run first), so prove the primitive directly on this job's own embedded text: bytes that are not the
+        # pinned fixture bytes -- a hard link to something else that happens to sit at the name -- are left.
+        proc = self.generate()
+        job = self.job_path(proc)
+        text = job.read_text(encoding="utf-8")
+        self.assertIn("Remove-AttrCudaInputFileByContent -TrustedRoot $AgentRoot -Path $side -ExpectedSha256 $FixtureSha256", text)
+        self.assertNotIn("Remove-AttrCudaPartialFile -TrustedRoot $AgentRoot -Path $side", text)
+
     def test_a_complete_run_publishes_the_clip_and_empties_the_inbox(self) -> None:
         proc = self.generate()
         job = self.job_path(proc)

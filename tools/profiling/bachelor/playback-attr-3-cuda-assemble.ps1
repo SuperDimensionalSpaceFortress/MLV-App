@@ -97,8 +97,15 @@ if ($LASTEXITCODE -ne 0) { Complete-Failed 2 'sourceCommit' "not a commit known 
 if (-not (Test-Path -LiteralPath $OutDir)) { New-Item -ItemType Directory -Path $OutDir -Force | Out-Null }
 $OutDir = (Resolve-Path -LiteralPath $OutDir).Path
 $Work = Join-Path $OutDir ".work-$($names.shortSha)"
-Remove-AttrCudaTree -TrustedRoot $OutDir -Path $Work
-New-Item -ItemType Directory -Path $Work -Force | Out-Null
+# OWNER-FOOTAGE-NO-HARDLINK-2: nothing here is deleted on a guess. $OwnedJournal is the creator
+# record of everything this script made under $OutDir; the scratch tree is created FRESH and
+# recorded. A tree already standing at $Work that this journal does not prove (an older build's
+# .work-<sha>, which could hold a hard link that is now the last name of an owner recording) is
+# MOVED ASIDE to .work-<sha>.unproven-* and left, never deleted; one an earlier run of this code
+# recorded is swept by proof. The first-seen identity of a file is never delete authority.
+$OwnedJournal = Join-Path $OutDir '.attrcuda-owned.jsonl'
+$workRoot = New-AttrCudaOwnedRoot -TrustedRoot $OutDir -Path $Work -OwnedJournal $OwnedJournal
+if ($workRoot.Quarantined -ne '') { Say "SCRATCH an unproven tree stood at the work path; left untouched at $($workRoot.Quarantined)" }
 
 # Job-owned TEMP under the work dir, set before any child process (qmake, mingw32-make,
 # windeployqt, the launch probe) so none of them writes into the ambient machine TEMP.
@@ -322,16 +329,15 @@ $partialManifestPath = Join-Path $OutDir "$($names.buildManifestName).partial"
 function Remove-RunPartials {
     # Files only: never -Recurse, never through a link (sol PR #133 r3; see Remove-AttrCudaPartialFile).
     foreach ($item in $script:publishSet) {
-        [void](Remove-AttrCudaPartialFile -TrustedRoot $OutDir -Path (Join-Path $OutDir "$($item.name).partial"))
+        [void](Remove-AttrCudaPartialFile -TrustedRoot $OutDir -Path (Join-Path $OutDir "$($item.name).partial") -OwnedJournal $script:OwnedJournal)
     }
-    [void](Remove-AttrCudaPartialFile -TrustedRoot $OutDir -Path $script:partialManifestPath)
+    [void](Remove-AttrCudaPartialFile -TrustedRoot $OutDir -Path $script:partialManifestPath -OwnedJournal $script:OwnedJournal)
 }
 
 try {
     foreach ($item in $publishSet) {
         $partial = Join-Path $OutDir "$($item.name).partial"
-        [void](Assert-AttrCudaWritableFileSlot -Path $partial)
-        Copy-Item -LiteralPath ([string]$item.source) -Destination $partial -Force
+        [void](Publish-AttrCudaFileCopy -Source ([string]$item.source) -Destination $partial -OwnedJournal $OwnedJournal)
         if ((Get-ShaLower $partial) -ne [string]$item.sha) { throw "sha256 did not round-trip for $($item.name)" }
     }
 } catch {
@@ -383,9 +389,8 @@ $buildManifest = [ordered]@{
     assembledAtUtc = (Get-Date).ToUniversalTime().ToString('o')
 }
 try {
-    [void](Assert-AttrCudaWritableFileSlot -Path $partialManifestPath)
     [void](Assert-AttrCudaWritableFileSlot -Path (Join-Path $OutDir $names.buildManifestName))
-    $buildManifest | ConvertTo-Json -Depth 12 | Set-Content -LiteralPath $partialManifestPath -Encoding UTF8
+    [void](Publish-AttrCudaText -Path $partialManifestPath -Value ($buildManifest | ConvertTo-Json -Depth 12) -OwnedJournal $OwnedJournal)
     Move-Item -LiteralPath $partialManifestPath -Destination (Join-Path $OutDir $names.buildManifestName) -Force
 } catch {
     Remove-RunPartials
