@@ -1317,6 +1317,13 @@ bool GpuDisplayViewport::setPresentedGpuPlaybackReconTexture(
 
     setPresentationOptions(options);
     updateProcessingTexturesIfNeeded();
+    // CUDA-PLAYBACK-LOOK-PARITY-1-LAND r2 (fable r1 hardening): this raw-Bayer16 route
+    // never refreshes the per-frame shadows/highlights blur, and it samples the frame
+    // y-flipped while the blur lookup is not. The LUT set is shared with the AMaZE
+    // route, so a blur left over from an earlier AMaZE present would otherwise be
+    // bound as if it belonged to this frame. Mark it not-ready: previewApplyShadows
+    // Highlights binds false for this frame (a disclosed gap, not a stale look).
+    m_lutSet.shadowsHighlightsBlurReady = false;
 
     // FAIL CLOSED (GPU-TEXNR-S1-DARK-GREEN-1 round 4, fable minor): this raw-Bayer16
     // route feeds the same shared display shader/LUT set as the AMaZE route, whose

@@ -22,6 +22,20 @@ struct GpuPreviewProcessingConfig
     QByteArray matrixLutR;
     QByteArray matrixLutG;
     QByteArray matrixLutB;
+    /* UNCLAMPED diagonal-matrix (WB) LUTs, int32[65536] each, in 16-bit code
+     * units. matrixLut{R,G,B} above is the same table clamped to 16 bits; the
+     * engine keeps the full value because contrast and shadows/highlights read
+     * their luma from it and multiply it BEFORE clamping (pix = (uint16_t)LIMIT16
+     * (pm[...] * expo_correction), raw_processing.c ~3420). A WB-boosted channel
+     * reaches several times 65535 (blue x2.86 at 3000 K), so the clamped copy
+     * cannot reproduce the engine once the factor is not 1. Values are limited
+     * to [-2^20, 2^20-1] (more than 16x over-range; a degenerate tint gives a
+     * negative green gain, which the engine also keeps) so the 4R+11G+B luma sum
+     * stays exactly representable in float32 on the GPU. Empty = fall back to
+     * the clamped LUT (hand-built configs). */
+    QByteArray matrixLutRawR;
+    QByteArray matrixLutRawG;
+    QByteArray matrixLutRawB;
     QByteArray gammaLut;
     bool applyCreativeCurves = false;
     bool applyToning = false;
@@ -100,6 +114,14 @@ QByteArray gpuPreviewProcessingVertexShaderSource(void);
 QByteArray gpuPreviewProcessingDisplayFragmentShaderSource(void);
 QByteArray gpuPreviewProcessingSubsetFragmentShaderSource(void);
 QByteArray gpuPreviewProcessingPackLookupTextureRgba16(const QByteArray & sourceLut);
+/* Matrix-LUT variant: R = the 16-bit clamped value (what every shader that
+ * does not need the over-range reads), G = low 16 bits and B = bits 16..19 of
+ * the unclamped value, so the display shader can rebuild it exactly
+ * (raw + 2^20 = G + B*65536, in code units; the bias keeps negative gains
+ * representable). rawLut (int32[65536]) may be empty, in which case raw = the
+ * clamped value. */
+QByteArray gpuPreviewProcessingPackMatrixLookupTextureRgba16(const QByteArray & clampedLut,
+                                                             const QByteArray & rawLut);
 bool gpuPreviewProcessingRendererIsSoftware(const QString & rendererDescription);
 bool gpuPreviewProcessingIsSupported(const processingObject_t * processing,
                                      QString * reason = nullptr);
@@ -110,6 +132,16 @@ bool gpuPreviewProcessingNeedsShadowsHighlightsFrameState(
     const GpuPreviewProcessingConfig & config);
 bool gpuPreviewProcessingDisplayShaderUsesShadowsHighlightsFrameState(
     const GpuPreviewProcessingConfig & config);
+/* Whether the fast shadows/highlights frame-state path is bypassed for the live
+ * display shader (RenderFrameThread's gpuTexNrDisplayLutOnlyShStateBypass, minus
+ * its per-frame eligibility terms). skipShStateEnvironmentValue is
+ * qEnvironmentVariable("MLVAPP_GPU_TEX_NR_DISPLAY_LUT_ONLY_SKIP_SH_STATE"): null
+ * (unset) = bypass only if the display shader cannot apply S/H, which is never
+ * now; "0" = never bypass; any other value = KILL SWITCH, force the bypass so the
+ * S/H display path can be A/B'd on hardware. False when S/H is not requested. */
+bool gpuPreviewProcessingDisplayShadowsHighlightsFrameStateBypassed(
+    const GpuPreviewProcessingConfig & config,
+    const QString & skipShStateEnvironmentValue);
 bool gpuPreviewProcessingHasShadowsHighlightsFrameState(
     const GpuPreviewProcessingConfig & config,
     int width,

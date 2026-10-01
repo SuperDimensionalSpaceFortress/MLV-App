@@ -12,6 +12,7 @@
 
 #include <QtGlobal>
 #include <algorithm>
+#include <array>
 #include <cmath>
 #include <cstdlib>
 #include <cstring>
@@ -383,19 +384,177 @@ TEST(GpuPreviewProcessing, ShadowsHighlightsBlurTextureUpdateReportsDropWhenFram
     gpuPreviewProcessingDestroyLutTextureSet(lutSet);
 }
 
-/* CPU-vs-GPU parity harness for the DISPLAY shader (mirrors
- * assert_gpu_offscreen_matches_cpu_reference above, but through
- * gpuPreviewProcessingApplyDisplayGpuOffscreen / the shared production
- * display-shader binding path instead of the subset offscreen path). */
-static void assert_gpu_display_offscreen_matches_cpu_reference(
-    MlvPipelineFixture & fixture,
-    const GpuPreviewProcessingConfig & config,
-    const char * label)
+/* ---- ENGINE-ANCHORED display-shader parity (CUDA-PLAYBACK-LOOK-PARITY-1-LAND r2) ----
+ *
+ * Round 1 compared the display shader with gpuPreviewProcessingApplyCpuReference,
+ * an in-file C++ mirror written alongside the shader (those four mirror tests
+ * are gone). A mirror shares its author's assumptions, so round 1 passed while
+ * both sides clamped the WB-boosted matrix value BEFORE the contrast /
+ * shadows-highlights multiply, which the shipped engine does not do (and used
+ * the blue-channel Reinhard curve for green in the gamut stage, where the
+ * engine uses the plain one). The tests below instead call the PRODUCTION
+ * engine (apply_processing_object, or getMlvProcessedFrame16 where the shadows /
+ * highlights blur has to come from the engine's own refresh) on the same
+ * debayered frame the GPU display shader receives. Only these tests may be
+ * cited as "parity with the production engine".
+ *
+ * The mirror is kept (it is MainWindow's CPU fallback and the subset shader's
+ * oracle) and now follows the engine's pre-camera order too, but it still
+ * ROUNDS the post-camera gamma index where the engine and the display shader
+ * truncate, because the pinned golden hashes depend on that rounding. It is
+ * therefore not an engine oracle at the 1-LSB level and no test claims it is.
+ *
+ * Engine path they anchor to: the generic 16-bit loop in raw_processing.c
+ * (contrast / shadows-highlights / vibrance make the creative adjustments
+ * non-neutral, which rules out the basic-matrix fast path). That loop applies
+ * pix = (uint16_t)LIMIT16(unclamped diagonal-matrix value * expo_correction)
+ * BEFORE the camera matrix, with the contrast and shadows-highlights luma taken
+ * from the UNclamped diagonal-matrix values. The direct-8-bit kernel
+ * (raw_processing_8bit_kernel.inc) omits that clamp and truncation unless AgX
+ * or local tone is active; docs/cuda-playback-look-parity.md records it as an
+ * engine-internal inconsistency this card does not resolve. */
+
+/* Rounding budget between the engine (integer LUT indexing with truncation,
+ * float32 / double accumulation on the CPU) and the display shader (float32 on
+ * the GPU). Measured on this branch (llvmpipe; the cases of
+ * docs/cuda-playback-look-parity.md "Engine-anchored parity"): the synthetic
+ * sweeps differ from the engine by at most 9 codes (typically 1-3, mean 0.14),
+ * the real clip frame by at most 19 codes with at most 8.7e-5 of its samples
+ * above 4. The bounds below leave about 1.7x on the worst case (a different GL
+ * driver rounds differently) and 11x on the fraction, and sit more than an
+ * order of magnitude under the defects they exist to catch (round 1 measured
+ * 900-13,000 codes on over-ranged pixels). */
+static constexpr uint16_t kEngineParityPerSampleTolerance = 4;
+static constexpr uint16_t kEngineParityMaxAbsDiff = 32;
+static constexpr double kEngineParityMismatchFraction = 0.001;
+
+static std::vector<uint16_t> run_production_engine_on_frame(processingObject_t * processing,
+                                                            const std::vector<uint16_t> & debayered,
+                                                            int width,
+                                                            int height)
+{
+    /* apply_processing_object applies the levels LUT to its input in place, so
+     * it gets a private copy and the GPU keeps the pristine frame. */
+    std::vector<uint16_t> engine_input = debayered;
+    std::vector<uint16_t> engine_output(debayered.size(), 0);
+    std::vector<uint16_t> engine_blur(debayered.size(), 0);
+    apply_processing_object(processing, width, height,
+                            engine_input.data(), engine_output.data(),
+                            engine_blur.data(), processing->gradient_mask,
+                            processing->vignette_mask, nullptr);
+    return engine_output;
+}
+
+/* Smallest input sample whose leveled value reaches `target` (the levels LUT is
+ * monotone), so synthetic frames can be written in leveled units. */
+static uint16_t input_sample_for_leveled_value(const processingObject_t * processing, int target)
+{
+    const uint16_t * levels = processing->pre_calc_levels;
+    int low = 0;
+    int high = 65535;
+    while (low < high)
+    {
+        const int mid = (low + high) / 2;
+        if (levels[mid] >= target) high = mid; else low = mid + 1;
+    }
+    return static_cast<uint16_t>(low);
+}
+
+/* Counts samples whose diagonal-matrix (WB) value exceeds 16 bits, i.e. the
+ * pixels where clamping before versus after the exposure multiply differs. */
+static size_t count_wb_overrange_samples(const processingObject_t * processing,
+                                         const std::vector<uint16_t> & debayered)
+{
+    size_t count = 0;
+    for (size_t index = 0; index < debayered.size(); ++index)
+    {
+        const int channel = static_cast<int>(index % 3u);
+        const uint16_t level = processing->pre_calc_levels[debayered[index]];
+        if (processing->pre_calc_matrix[channel * 4][level] > 65535) ++count;
+    }
+    return count;
+}
+
+/* Input sample that lands on diagonal-matrix (WB-applied, pre-exposure) value
+ * `target` for `channel`: the smallest leveled value whose pre_calc_matrix entry
+ * reaches it (the LUT is monotone), written back through the levels inverse.
+ * Targets are expressed AFTER the WB multiply so a frame stays near-neutral
+ * (in-gamut) at every white balance, which is what real scenes look like. */
+static uint16_t input_sample_for_diagonal_value(const processingObject_t * processing,
+                                                int channel,
+                                                double target)
+{
+    const int32_t * matrix = processing->pre_calc_matrix[channel * 4];
+    int low = 0;
+    int high = 65535;
+    while (low < high)
+    {
+        const int mid = (low + high) / 2;
+        if (matrix[mid] >= target) high = mid; else low = mid + 1;
+    }
+    return input_sample_for_leveled_value(processing, low);
+}
+
+/* Smooth synthetic frame: x is a geometric luminance ramp in diagonal-matrix
+ * space (500 .. maxDiagonal codes, so it crosses 16 bits), y adds a +-25%
+ * red/blue chroma swing around neutral. Smooth, so the engine's blur and the
+ * pixel agree and shadows/highlights is exercised across its whole curve. */
+static std::vector<uint16_t> make_synthetic_ramp_frame(const processingObject_t * processing,
+                                                       double maxDiagonal,
+                                                       int * width,
+                                                       int * height)
+{
+    constexpr int kWidth = 128;
+    constexpr int kHeight = 64;
+    *width = kWidth;
+    *height = kHeight;
+    std::vector<uint16_t> frame(static_cast<size_t>(kWidth) * kHeight * 3u);
+    for (int y = 0; y < kHeight; ++y)
+    {
+        const double swing = 0.25 * std::sin(6.283185307179586 * y / kHeight);
+        const double factors[3] = { 1.0 + swing, 1.0, 1.0 - 0.8 * swing };
+        for (int x = 0; x < kWidth; ++x)
+        {
+            const double luminance = 500.0 * std::pow(maxDiagonal / 500.0, x / double(kWidth - 1));
+            for (int channel = 0; channel < 3; ++channel)
+            {
+                frame[(static_cast<size_t>(y) * kWidth + x) * 3u + channel] =
+                    input_sample_for_diagonal_value(processing, channel, luminance * factors[channel]);
+            }
+        }
+    }
+    return frame;
+}
+
+/* Flat frame holding one pixel given in LEVELED units (the units review used). */
+static std::vector<uint16_t> make_flat_leveled_frame(const processingObject_t * processing,
+                                                     const int leveled[3],
+                                                     int * width,
+                                                     int * height)
+{
+    *width = 16;
+    *height = 16;
+    std::vector<uint16_t> frame(static_cast<size_t>(16) * 16 * 3u);
+    for (size_t index = 0; index < frame.size(); ++index)
+        frame[index] = input_sample_for_leveled_value(processing, leveled[index % 3u]);
+    return frame;
+}
+
+/* Runs the display shader and compares with the engine's output. A GL
+ * backend that cannot be created at all SKIPS; once the backend probe says GL
+ * works, a display-shader failure FAILS (it used to skip, which hid a broken
+ * shader as a skipped test). */
+static void assert_gpu_display_matches_production_engine(const char * label,
+                                                         const GpuPreviewProcessingConfig & config,
+                                                         const std::vector<uint16_t> & debayered,
+                                                         const std::vector<uint16_t> & engine_output,
+                                                         int width,
+                                                         int height)
 {
     ASSERT_TRUE(config.enabled);
+    ASSERT_EQ(debayered.size(), engine_output.size());
 
     qputenv("MLVAPP_GPU_PREVIEW_ALLOW_SOFTWARE", QByteArray("1"));
-
     const GpuPreviewProcessingBackendAvailability availability =
         gpuPreviewProcessingProbeGpuBackend();
     if (!availability.available)
@@ -404,187 +563,478 @@ static void assert_gpu_display_offscreen_matches_cpu_reference(
         SKIP_TEST(availability.reason.toStdString());
     }
 
-    const std::vector<uint16_t> debayered = fixture.renderDebayeredFrame16(0);
-    ASSERT_TRUE(!debayered.empty());
-    const int pixel_count = fixture.width() * fixture.height();
-    ASSERT_EQ(static_cast<size_t>(pixel_count) * 3u, debayered.size());
-
-    /* The CPU oracle must be scoped to exactly what the DISPLAY shader
-     * implements. `config.applyCreativeCurves`/`applyToning`/`applySaturation`/
-     * `applyHueVs` are gated by the SAME `allow_creative_adjustments` master
-     * switch this harness's callers use to unlock contrast/vibrance/S-H
-     * (raw_processing.h's `processingAllowCreativeAdjustments`), so building
-     * `config` for a display-shader test also flips those four on -- but the
-     * DISPLAY shader (docs/cuda-playback-look-parity.md's "two shaders" table)
-     * never implements them; only the SUBSET shader does. Comparing against an
-     * unscoped CPU reference silently pulls in the post-gamma creative-curves
-     * stage's output (whatever pre_calc_curve_r/gcurve_* currently are) and
-     * fails this parity check for a reason that has nothing to do with the
-     * display shader's own correctness. */
-    GpuPreviewProcessingConfig display_scoped_config = config;
-    display_scoped_config.applyCreativeCurves = false;
-    display_scoped_config.applyToning = false;
-    display_scoped_config.applySaturation = false;
-    display_scoped_config.applyHueVs = false;
-
-    std::vector<uint16_t> cpu_output(debayered.size(), 0);
-    gpuPreviewProcessingApplyCpuReference(display_scoped_config, debayered.data(),
-                                          cpu_output.data(), fixture.width(), fixture.height());
-
     std::vector<uint16_t> gpu_output(debayered.size(), 0);
     QString reason;
     QString renderer;
-    const bool ok = gpuPreviewProcessingApplyDisplayGpuOffscreen(
-        config, debayered.data(), gpu_output.data(),
-        fixture.width(), fixture.height(), &reason, &renderer);
-    if (!ok)
+    if (!gpuPreviewProcessingApplyDisplayGpuOffscreen(config, debayered.data(), gpu_output.data(),
+                                                      width, height, &reason, &renderer))
     {
-        ASSERT_TRUE(gpu_preview_skip_reason_is_known(reason));
-        SKIP_TEST(reason.toStdString());
+        ::minitest::fail(__FILE__, __LINE__,
+                         std::string("display shader offscreen render failed on a working GL backend (")
+                             + label + ")",
+                         reason.toStdString());
     }
 
-    /* Same provisional software-GL-calibrated tolerance rationale as the
-     * subset harness above: the display shader's contrast/S-H/vibrance GLSL
-     * is a direct port of the same formulas, so the same LUT-boundary float
-     * ULP drift is expected, not a logic bug. */
     const frame_compare_result_t result = compare_frames_u16(
-        cpu_output.data(), gpu_output.data(),
-        fixture.width(), fixture.height(), 3, /*per_pixel_tolerance=*/2);
+        engine_output.data(), gpu_output.data(), width, height, 3, kEngineParityPerSampleTolerance);
     const frame_tolerance_verdict_t verdict = evaluate_frame_tolerance(
-        result, debayered.size(),
-        /*max_abs_diff_threshold=*/16, /*max_mismatch_fraction=*/0.03);
-
-    test_artifacts::record(std::string("gpu_preview_display.gpu_parity.") + label + ".renderer",
+        result, debayered.size(), kEngineParityMaxAbsDiff, kEngineParityMismatchFraction);
+    const std::string summary = frame_compare_summary(result);
+    std::cout << "[ENGINE-PARITY] " << label << ": " << summary << "\n";
+    test_artifacts::record(std::string("gpu_preview_display.engine_parity.") + label + ".renderer",
                            renderer.toStdString());
-    test_artifacts::record(std::string("gpu_preview_display.gpu_parity.") + label + ".compare",
-                           frame_compare_summary(result));
-
+    test_artifacts::record(std::string("gpu_preview_display.engine_parity.") + label + ".compare", summary);
     if (!verdict.passed)
     {
         ::minitest::fail(__FILE__, __LINE__,
-                         std::string("Display-shader GPU offscreen vs CPU reference parity (")
-                             + label + ")",
+                         std::string("Display shader vs PRODUCTION ENGINE parity (") + label + ")",
                          verdict.detail);
     }
 }
 
-TEST(GpuPreviewProcessing, DisplayShaderContrastPivotMatchesCpuReference)
+struct EngineSweepCase
 {
-    /* Round-1 scope: contrast+pivot was silently dropped by the live display
-     * shader (only levels/matrix/gamma were applied). Mutation-sensitive: a
-     * broken/missing inLoopContrastCurve binding or a wrong luma weight in the
-     * GLSL port would fail this against the CPU reference, and the neutral-vs-
-     * non-neutral output-change assertion below would fail if the contrast
-     * stage were a no-op. */
-    MlvPipelineFixture fixture;
-    assert_gpu_preview_fixture_ready(fixture);
+    const char * label;
+    double kelvin;
+    double tint;
+    double contrast;
+    double pivot;
+    double vibrance;
+    double maxDiagonal; /* top of the synthetic luminance ramp, in diagonal-matrix codes */
+};
+
+/* The receipt carries a dark/light S-curve (ds/dr/ls/lr) that the ENGINE applies
+ * as soon as creative adjustments are allowed. The display shader does not
+ * implement the creative-curve stages (docs/cuda-playback-look-parity.md "two
+ * shaders" table), so an engine-anchored comparison must switch that curve off
+ * or it would measure an unported stage instead of the ones this card ports. */
+static void neutralize_unported_creative_stages(processingObject_t * processing)
+{
+    processingSetContrast(processing, 0.7, 0.0, 0.5, 0.0, 0.0);
+}
+
+/* Configures the fixture's processing object for one sweep case. */
+static void configure_engine_sweep_case(MlvPipelineFixture & fixture, const EngineSweepCase & sweep)
+{
     configure_gpu_preview_supported_subset(fixture);
     processingObject_t * processing = fixture.processing();
     processingAllowCreativeAdjustments(processing);
-    processingSetSimpleContrast(processing, 0.14);
-    processingSetPivot(processing, 0.46);
+    neutralize_unported_creative_stages(processing);
+    processingSetWhiteBalance(processing, sweep.kelvin, sweep.tint);
+    if (sweep.contrast != 0.0)
+    {
+        processingSetSimpleContrast(processing, sweep.contrast);
+        processingSetPivot(processing, sweep.pivot);
+    }
+    if (sweep.vibrance != 1.0) processingSetVibrance(processing, sweep.vibrance);
+    (void)fixture.renderDebayeredFrame16(0); /* settle LUTs exactly like the mirror tests */
+}
+
+static void run_engine_anchored_synthetic_case(const EngineSweepCase & sweep)
+{
+    MlvPipelineFixture fixture;
+    assert_gpu_preview_fixture_ready(fixture);
+    configure_engine_sweep_case(fixture, sweep);
+    processingObject_t * processing = fixture.processing();
+
+    QString reason;
+    ASSERT_TRUE(gpuPreviewProcessingIsSupported(processing, &reason));
+    const GpuPreviewProcessingConfig config = gpuPreviewProcessingBuildConfig(processing, &reason);
+    ASSERT_TRUE(config.enabled);
+    ASSERT_TRUE(!config.applyShadowsHighlights);
+
+    int width = 0;
+    int height = 0;
+    const std::vector<uint16_t> frame =
+        make_synthetic_ramp_frame(processing, sweep.maxDiagonal, &width, &height);
+    const std::vector<uint16_t> engine = run_production_engine_on_frame(processing, frame, width, height);
+    assert_gpu_display_matches_production_engine(sweep.label, config, frame, engine, width, height);
+}
+
+static void run_engine_anchored_flat_pixel_case(const char * label,
+                                                double kelvin,
+                                                double contrast,
+                                                double pivot,
+                                                const int leveled[3],
+                                                bool requireWbOverrange)
+{
+    MlvPipelineFixture fixture;
+    assert_gpu_preview_fixture_ready(fixture);
+    configure_engine_sweep_case(fixture, { label, kelvin, 0.0, contrast, pivot, 1.0, 0.0 });
+    processingObject_t * processing = fixture.processing();
 
     QString reason;
     ASSERT_TRUE(gpuPreviewProcessingIsSupported(processing, &reason));
     const GpuPreviewProcessingConfig config = gpuPreviewProcessingBuildConfig(processing, &reason);
     ASSERT_TRUE(config.enabled);
     ASSERT_TRUE(config.applyInLoopContrast);
-    ASSERT_TRUE(!config.applyShadowsHighlights);
-    ASSERT_TRUE(!config.applyVibrance);
 
-    const std::vector<uint16_t> debayered = fixture.renderDebayeredFrame16(0);
-    std::vector<uint16_t> neutral_output(debayered.size(), 0);
-    GpuPreviewProcessingConfig neutral_config = config;
-    neutral_config.applyInLoopContrast = false;
-    gpuPreviewProcessingApplyCpuReference(neutral_config, debayered.data(),
-                                          neutral_output.data(), fixture.width(), fixture.height());
-    std::vector<uint16_t> contrast_output(debayered.size(), 0);
-    gpuPreviewProcessingApplyCpuReference(config, debayered.data(),
-                                          contrast_output.data(), fixture.width(), fixture.height());
-    ASSERT_TRUE(neutral_output != contrast_output);
-
-    assert_gpu_display_offscreen_matches_cpu_reference(fixture, config, "contrast_pivot");
+    int width = 0;
+    int height = 0;
+    const std::vector<uint16_t> frame = make_flat_leveled_frame(processing, leveled, &width, &height);
+    if (requireWbOverrange)
+    {
+        ASSERT_TRUE(count_wb_overrange_samples(processing, frame) > 0);
+    }
+    const std::vector<uint16_t> engine = run_production_engine_on_frame(processing, frame, width, height);
+    assert_gpu_display_matches_production_engine(label, config, frame, engine, width, height);
 }
 
-TEST(GpuPreviewProcessing, DisplayShaderVibranceMatchesCpuReference)
+TEST(GpuPreviewProcessing, EngineAnchoredSolR1ReproContrastOverrangeMatchesEngine)
 {
-    /* Round-1 scope: vibrance was silently dropped by the live display
-     * shader. */
+    /* Sol r1 BLOCKER repro: Canon 5D3 matrix (tiny_dual_iso), WB 6500/tint 0,
+     * Rec709, contrast 0.14 pivot 0.46, every other stage off. The leveled
+     * pixel [27000,61000,43000] becomes [63818,61000,63520] after the diagonal
+     * matrix and the contrast factor (1.0957) pushes two channels past 16 bits,
+     * where the engine clamps and truncates BEFORE the camera matrix. Sol's
+     * numbers: GLSL [64090,64346,64293] vs CPU [60454,64592,61692]. */
+    const int kSolLeveled[3] = { 27000, 61000, 43000 };
+    run_engine_anchored_flat_pixel_case("sol_r1_flat_pixel_6500K", 6500.0, 0.14, 0.46, kSolLeveled, false);
+}
+
+TEST(GpuPreviewProcessing, EngineAnchoredFableR1WbOverrangeHighlightMatchesEngine)
+{
+    /* Fable r1 repro: at 3000 K the blue multiplier is ~2.86, so a leveled blue
+     * of 30000 is ~85900 BEFORE the exposure multiply. The engine multiplies the
+     * unclamped value and clamps afterwards; the round-1 shader clamped the
+     * matrix LUT to 16 bits first. Contrast supplies a factor below 1. */
+    const int kFableLeveled[3] = { 30000, 30000, 30000 };
+    run_engine_anchored_flat_pixel_case("fable_r1_flat_pixel_3000K", 3000.0, -0.30, 0.5, kFableLeveled, true);
+    run_engine_anchored_synthetic_case({ "fable_r1_ramp_3000K", 3000.0, 0.0, -0.30, 0.5, 1.0, 130000.0 });
+}
+
+TEST(GpuPreviewProcessing, EngineAnchoredContrastVibranceWbSweepMatchesEngine)
+{
+    /* Sweep over contrast / pivot / vibrance and WB extremes, one fixture and
+     * one GL context per case. Contrast is the stage that multiplies the WB
+     * boosted value, vibrance runs after gamma; both are covered alone and
+     * together at cool, neutral and warm WB. The ramp reaches 130000 diagonal
+     * codes, i.e. twice the 16-bit range. */
+    static const EngineSweepCase kCases[] = {
+        { "wb6500_contrast_pos",       6500.0,   0.0,  0.14, 0.46, 1.0,  130000.0 },
+        { "wb6500_contrast_neg",       6500.0,   0.0, -0.30, 0.50, 1.0,  130000.0 },
+        { "wb6500_contrast_strong",    6500.0,   0.0,  0.60, 0.30, 1.0,  130000.0 },
+        { "wb2500_contrast_pos",       2500.0,   0.0,  0.14, 0.46, 1.0,  130000.0 },
+        { "wb2500_contrast_strong",    2500.0,  30.0,  0.60, 0.30, 1.0,  130000.0 },
+        { "wb3000_contrast_neg",       3000.0,   0.0, -0.30, 0.50, 1.0,  130000.0 },
+        { "wb10000_contrast_pos",     10000.0,   0.0,  0.14, 0.46, 1.0,  130000.0 },
+        { "wb10000_contrast_strong",  10000.0, -30.0,  0.60, 0.70, 1.0,  130000.0 },
+        { "wb6500_vibrance_up",        6500.0,   0.0,  0.0,  0.50, 1.03, 130000.0 },
+        { "wb6500_vibrance_big",       6500.0,   0.0,  0.0,  0.50, 1.60, 130000.0 },
+        { "wb6500_vibrance_down",      6500.0,   0.0,  0.0,  0.50, 0.70, 130000.0 },
+        { "wb2500_vibrance_up",        2500.0,   0.0,  0.0,  0.50, 1.30, 130000.0 },
+        { "wb3000_contrast_vibrance",  3000.0,   0.0,  0.14, 0.46, 1.03, 130000.0 },
+        { "wb10000_contrast_vibrance", 10000.0,  0.0,  0.60, 0.30, 1.60, 130000.0 },
+    };
+    for (const EngineSweepCase & sweep : kCases)
+    {
+        run_engine_anchored_synthetic_case(sweep);
+    }
+}
+
+TEST(GpuPreviewProcessing, EngineAnchoredNeutralStagesMatchEngineRoundingFloor)
+{
+    /* Control: contrast a hair non-neutral (0.02, which keeps the engine on the
+     * generic loop this card anchors to; fully neutral stages would route the
+     * engine through its basic-matrix fast path, which has no pre-camera clamp
+     * at all) and the ramp capped at 60000 diagonal codes so almost nothing
+     * over-ranges. This is the rounding floor the tolerances above are
+     * justified by. */
+    run_engine_anchored_synthetic_case({ "rounding_floor_wb5600", 5600.0, 0.0, 0.02, 0.5, 1.0, 60000.0 });
+}
+
+/* Engine-anchored shadows/highlights on a synthetic ramp: the engine's own blur
+ * refresh (processingRefreshShadowsHighlightsBlurFromRgb16, the function the
+ * live fast path calls) builds the blur, apply_processing_object consumes it,
+ * and the GPU gets the very same buffer through the production attach path. */
+static void run_engine_anchored_synthetic_shadows_highlights_case(const char * label,
+                                                                  double kelvin,
+                                                                  double shadows,
+                                                                  double highlights,
+                                                                  double contrast,
+                                                                  double pivot,
+                                                                  double vibrance,
+                                                                  double maxDiagonal)
+{
     MlvPipelineFixture fixture;
     assert_gpu_preview_fixture_ready(fixture);
-    configure_gpu_preview_supported_subset(fixture);
+    configure_engine_sweep_case(fixture, { label, kelvin, 0.0, contrast, pivot, vibrance, maxDiagonal });
     processingObject_t * processing = fixture.processing();
-    processingAllowCreativeAdjustments(processing);
-    processingSetVibrance(processing, 1.03);
-
-    QString reason;
-    ASSERT_TRUE(gpuPreviewProcessingIsSupported(processing, &reason));
-    const GpuPreviewProcessingConfig config = gpuPreviewProcessingBuildConfig(processing, &reason);
-    ASSERT_TRUE(config.enabled);
-    ASSERT_TRUE(config.applyVibrance);
-    ASSERT_TRUE(!config.applyInLoopContrast);
-    ASSERT_TRUE(!config.applyShadowsHighlights);
-
-    assert_gpu_display_offscreen_matches_cpu_reference(fixture, config, "vibrance");
-}
-
-TEST(GpuPreviewProcessing, DisplayShaderShadowsHighlightsMatchesCpuReference)
-{
-    /* Round-1 scope, priority item: the fast S/H frame-state path
-     * (RenderFrameThread's gpuTexNrFastShFrameState*) was always bypassed for
-     * the live display shader (gpuTexNrDisplayLutOnlyShStateBypass), so the
-     * blur it computes never reached the screen. */
-    MlvPipelineFixture fixture;
-    assert_gpu_preview_fixture_ready(fixture);
-    const GpuPreviewProcessingConfig config =
-        build_shadows_highlights_config_with_frame_state(fixture);
-    ASSERT_TRUE(config.applyShadowsHighlights);
-    ASSERT_TRUE(!config.applyInLoopContrast);
-    ASSERT_TRUE(!config.applyVibrance);
-
-    assert_gpu_display_offscreen_matches_cpu_reference(fixture, config, "shadows_highlights");
-}
-
-TEST(GpuPreviewProcessing, DisplayShaderCombinedLookAssistPresetMatchesCpuReference)
-{
-    /* Combined round-1 defect class check, modeled on the owner's reported
-     * night preset (contrast=14 pivot=46 shadows=32 highlights=-26
-     * vibrance=3): every one of these must now reach the live display shader
-     * together, not just individually. */
-    MlvPipelineFixture fixture;
-    assert_gpu_preview_fixture_ready(fixture);
-    configure_gpu_preview_supported_subset(fixture);
-    processingObject_t * processing = fixture.processing();
-    processingAllowCreativeAdjustments(processing);
-    processingSetSimpleContrast(processing, 0.14);
-    processingSetPivot(processing, 0.46);
-    processingSetShadows(processing, 0.32);
-    processingSetHighlights(processing, -0.26);
-    processingSetVibrance(processing, 1.03);
+    processingSetShadows(processing, shadows);
+    processingSetHighlights(processing, highlights);
+    (void)fixture.renderDebayeredFrame16(0);
 
     QString reason;
     ASSERT_TRUE(gpuPreviewProcessingIsSupported(processing, &reason));
     GpuPreviewProcessingConfig config = gpuPreviewProcessingBuildConfig(processing, &reason);
     ASSERT_TRUE(config.enabled);
-    ASSERT_TRUE(config.applyInLoopContrast);
     ASSERT_TRUE(config.applyShadowsHighlights);
-    ASSERT_TRUE(config.applyVibrance);
-    ASSERT_TRUE(!gpuPreviewProcessingHasShadowsHighlightsFrameState(
-        config, fixture.width(), fixture.height()));
 
-    const std::vector<uint16_t> refreshed = fixture.renderFrame16(0, /*threads=*/1);
-    ASSERT_TRUE(!refreshed.empty());
-    ASSERT_TRUE(gpuPreviewProcessingAttachFrameState(
-        &config, processing, fixture.width(), fixture.height(), &reason));
-    ASSERT_TRUE(gpuPreviewProcessingHasShadowsHighlightsFrameState(
-        config, fixture.width(), fixture.height()));
+    int width = 0;
+    int height = 0;
+    const std::vector<uint16_t> frame = make_synthetic_ramp_frame(processing, maxDiagonal, &width, &height);
+    ASSERT_TRUE(count_wb_overrange_samples(processing, frame) > 0);
 
-    assert_gpu_display_offscreen_matches_cpu_reference(fixture, config, "night_preset_combined");
+    std::vector<uint16_t> refresh_input = frame;
+    ASSERT_TRUE(processingRefreshShadowsHighlightsBlurFromRgb16(
+                    processing, refresh_input.data(), width, height, /*threads=*/1,
+                    /*forceExportPolicy=*/1) != 0);
+    const uint16_t * blur = nullptr;
+    int blur_width = 0;
+    int blur_height = 0;
+    int curve_index_mask = 0;
+    ASSERT_TRUE(processingGetShadowsHighlightsBlurData(processing, &blur, &blur_width, &blur_height,
+                                                       &curve_index_mask) != 0);
+    ASSERT_EQ(width, blur_width);
+    ASSERT_EQ(height, blur_height);
+    std::vector<uint16_t> engine_blur(blur, blur + static_cast<size_t>(width) * height * 3u);
+    ASSERT_TRUE(gpuPreviewProcessingAttachFrameState(&config, processing, width, height, &reason));
+
+    std::vector<uint16_t> engine_input = frame;
+    std::vector<uint16_t> engine(frame.size(), 0);
+    apply_processing_object(processing, width, height, engine_input.data(), engine.data(),
+                            engine_blur.data(), processing->gradient_mask,
+                            processing->vignette_mask, nullptr);
+    assert_gpu_display_matches_production_engine(label, config, frame, engine, width, height);
 }
 
-TEST(GpuPreviewProcessing, DisplayShaderFastPathFrameCostBudget)
+TEST(GpuPreviewProcessing, EngineAnchoredShadowsHighlightsWbOverrangeMatchesEngine)
 {
-    /* Round-2 item 3: measure, don't guess, the per-frame cost the fast S/H
+    /* Fable r1: highlights -26 (factor ~0.85 in the bright part of the curve)
+     * on WB-overranged blue, plus shadows +32, at 3000 K and at 6500 K. */
+    run_engine_anchored_synthetic_shadows_highlights_case(
+        "sh_ramp_wb3000", 3000.0, 0.32, -0.26, 0.0, 0.5, 1.0, 130000.0);
+    run_engine_anchored_synthetic_shadows_highlights_case(
+        "sh_ramp_wb6500", 6500.0, 0.32, -0.26, 0.0, 0.5, 1.0, 130000.0);
+    run_engine_anchored_synthetic_shadows_highlights_case(
+        "sh_ramp_wb3000_strong", 3000.0, 0.60, -0.60, 0.0, 0.5, 1.0, 130000.0);
+}
+
+TEST(GpuPreviewProcessing, EngineAnchoredNightPresetMatchesEngine)
+{
+    /* The owner's night preset (contrast 14 pivot 46 shadows 32 highlights -26
+     * vibrance 3) at tungsten and daylight WB, on the over-ranging ramp. */
+    run_engine_anchored_synthetic_shadows_highlights_case(
+        "night_preset_ramp_wb3000", 3000.0, 0.32, -0.26, 0.14, 0.46, 1.03, 130000.0);
+    run_engine_anchored_synthetic_shadows_highlights_case(
+        "night_preset_ramp_wb6500", 6500.0, 0.32, -0.26, 0.14, 0.46, 1.03, 130000.0);
+}
+
+
+/* Real-clip frame through the WHOLE production render (getMlvProcessedFrame16:
+ * debayer, blur refresh, apply_processing_object) against the display shader.
+ * The config is built AFTER the priming render because the engine only
+ * refreshes its LUTs (contrast curve, matrix, gamma) inside a render; a config
+ * built before it would carry the pre-settings LUTs. Returns the engine frame. */
+static std::vector<uint16_t> assert_gpu_display_matches_engine_on_real_frame(
+    MlvPipelineFixture & fixture,
+    const char * label,
+    bool expectContrast,
+    bool expectShadowsHighlights,
+    bool expectVibrance)
+{
+    processingObject_t * processing = fixture.processing();
+    QString reason;
+    ASSERT_TRUE(gpuPreviewProcessingIsSupported(processing, &reason));
+    const std::vector<uint16_t> primed = fixture.renderFrame16(0, /*threads=*/1);
+    ASSERT_TRUE(!primed.empty());
+
+    GpuPreviewProcessingConfig config = gpuPreviewProcessingBuildConfig(processing, &reason);
+    ASSERT_TRUE(config.enabled);
+    ASSERT_TRUE(config.applyInLoopContrast == expectContrast);
+    ASSERT_TRUE(config.applyShadowsHighlights == expectShadowsHighlights);
+    ASSERT_TRUE(config.applyVibrance == expectVibrance);
+    if (config.applyShadowsHighlights)
+    {
+        ASSERT_TRUE(gpuPreviewProcessingAttachFrameState(
+            &config, processing, fixture.width(), fixture.height(), &reason));
+    }
+
+    std::vector<uint16_t> engine = fixture.renderFrame16(0, /*threads=*/1);
+    const std::vector<uint16_t> debayered = fixture.renderDebayeredFrame16(0);
+    ASSERT_EQ(debayered.size(), engine.size());
+    assert_gpu_display_matches_production_engine(label, config, debayered, engine,
+                                                 fixture.width(), fixture.height());
+    return engine;
+}
+
+TEST(GpuPreviewProcessing, DisplayShaderContrastPivotMatchesProductionEngine)
+{
+    /* Contrast + pivot was silently dropped by the live display shader in the
+     * original defect. A no-op contrast stage would leave the engine frame
+     * equal to the neutral frame, which the last assertion forbids. */
+    MlvPipelineFixture fixture;
+    assert_gpu_preview_fixture_ready(fixture);
+    configure_gpu_preview_supported_subset(fixture);
+    processingObject_t * processing = fixture.processing();
+    processingAllowCreativeAdjustments(processing);
+    neutralize_unported_creative_stages(processing);
+    const std::vector<uint16_t> neutral = fixture.renderFrame16(0, /*threads=*/1);
+
+    processingSetSimpleContrast(processing, 0.14);
+    processingSetPivot(processing, 0.46);
+    const std::vector<uint16_t> engine = assert_gpu_display_matches_engine_on_real_frame(
+        fixture, "real_frame_contrast_pivot", true, false, false);
+    ASSERT_TRUE(neutral != engine);
+}
+
+TEST(GpuPreviewProcessing, DisplayShaderVibranceMatchesProductionEngine)
+{
+    MlvPipelineFixture fixture;
+    assert_gpu_preview_fixture_ready(fixture);
+    configure_gpu_preview_supported_subset(fixture);
+    processingObject_t * processing = fixture.processing();
+    processingAllowCreativeAdjustments(processing);
+    neutralize_unported_creative_stages(processing);
+    const std::vector<uint16_t> neutral = fixture.renderFrame16(0, /*threads=*/1);
+
+    processingSetVibrance(processing, 1.03);
+    const std::vector<uint16_t> engine = assert_gpu_display_matches_engine_on_real_frame(
+        fixture, "real_frame_vibrance", false, false, true);
+    ASSERT_TRUE(neutral != engine);
+}
+
+TEST(GpuPreviewProcessing, DisplayShaderShadowsHighlightsMatchesProductionEngine)
+{
+    /* The fast S/H frame-state path was always bypassed for the live display
+     * shader (gpuTexNrDisplayLutOnlyShStateBypass), so the blur it computes
+     * never reached the screen. The blur here is the engine's own. */
+    MlvPipelineFixture fixture;
+    assert_gpu_preview_fixture_ready(fixture);
+    configure_gpu_preview_supported_subset(fixture);
+    processingObject_t * processing = fixture.processing();
+    processingAllowCreativeAdjustments(processing);
+    neutralize_unported_creative_stages(processing);
+    const std::vector<uint16_t> neutral = fixture.renderFrame16(0, /*threads=*/1);
+
+    processingSetShadows(processing, 0.32);
+    processingSetHighlights(processing, -0.26);
+    const std::vector<uint16_t> engine = assert_gpu_display_matches_engine_on_real_frame(
+        fixture, "real_frame_shadows_highlights", false, true, false);
+    ASSERT_TRUE(neutral != engine);
+}
+
+TEST(GpuPreviewProcessing, DisplayShaderCombinedLookAssistPresetMatchesProductionEngine)
+{
+    /* The owner's reported night preset (contrast=14 pivot=46 shadows=32
+     * highlights=-26 vibrance=3) must reach the live display shader together,
+     * not just individually. */
+    MlvPipelineFixture fixture;
+    assert_gpu_preview_fixture_ready(fixture);
+    configure_gpu_preview_supported_subset(fixture);
+    processingObject_t * processing = fixture.processing();
+    processingAllowCreativeAdjustments(processing);
+    neutralize_unported_creative_stages(processing);
+    const std::vector<uint16_t> neutral = fixture.renderFrame16(0, /*threads=*/1);
+
+    processingSetSimpleContrast(processing, 0.14);
+    processingSetPivot(processing, 0.46);
+    processingSetShadows(processing, 0.32);
+    processingSetHighlights(processing, -0.26);
+    processingSetVibrance(processing, 1.03);
+    const std::vector<uint16_t> engine = assert_gpu_display_matches_engine_on_real_frame(
+        fixture, "real_frame_night_preset_combined", true, true, true);
+    ASSERT_TRUE(neutral != engine);
+}
+
+TEST(GpuPreviewProcessing, ShadowsHighlightsKillSwitchForcesDisplayBypass)
+{
+    /* Round 1 lost the MLVAPP_GPU_TEX_NR_DISPLAY_LUT_ONLY_SKIP_SH_STATE kill
+     * switch: the bypass was ANDed with "the display shader cannot apply S/H",
+     * which became false the moment the shader learned to. The decision is now
+     * one function shared by RenderFrameThread and this test. */
+    MlvPipelineFixture fixture;
+    assert_gpu_preview_fixture_ready(fixture);
+    const GpuPreviewProcessingConfig config = build_shadows_highlights_config_with_frame_state(fixture);
+    ASSERT_TRUE(config.applyShadowsHighlights);
+
+    /* default (variable unset = null QString): the display shader applies S/H */
+    ASSERT_TRUE(!gpuPreviewProcessingDisplayShadowsHighlightsFrameStateBypassed(config, QString()));
+    /* "0" never bypasses */
+    ASSERT_TRUE(!gpuPreviewProcessingDisplayShadowsHighlightsFrameStateBypassed(config, QStringLiteral("0")));
+    /* any other value is the kill switch */
+    ASSERT_TRUE(gpuPreviewProcessingDisplayShadowsHighlightsFrameStateBypassed(config, QStringLiteral("1")));
+    ASSERT_TRUE(gpuPreviewProcessingDisplayShadowsHighlightsFrameStateBypassed(config, QStringLiteral("yes")));
+    ASSERT_TRUE(gpuPreviewProcessingDisplayShadowsHighlightsFrameStateBypassed(config, QStringLiteral("")));
+
+    /* nothing to bypass when S/H is not requested or the config is disabled */
+    GpuPreviewProcessingConfig noShadowsHighlights = config;
+    noShadowsHighlights.applyShadowsHighlights = false;
+    ASSERT_TRUE(!gpuPreviewProcessingDisplayShadowsHighlightsFrameStateBypassed(
+        noShadowsHighlights, QStringLiteral("1")));
+    GpuPreviewProcessingConfig disabled = config;
+    disabled.enabled = false;
+    ASSERT_TRUE(!gpuPreviewProcessingDisplayShadowsHighlightsFrameStateBypassed(
+        disabled, QStringLiteral("1")));
+}
+
+TEST(GpuPreviewProcessing, ShadowsHighlightsKillSwitchBypassRestoresPreFixLook)
+{
+    /* What the bypass does on screen: RenderFrameThread skips attaching the S/H
+     * frame state, the blur texture is never ready, and the display shader
+     * leaves S/H out -- the pre-fix look, which is the A/B baseline. Without
+     * the kill switch the attached frame state makes S/H visibly change the
+     * frame. */
+    qputenv("MLVAPP_GPU_PREVIEW_ALLOW_SOFTWARE", QByteArray("1"));
+    const GpuPreviewProcessingBackendAvailability availability = gpuPreviewProcessingProbeGpuBackend();
+    if (!availability.available)
+    {
+        SKIP_TEST(availability.reason.toStdString());
+    }
+
+    MlvPipelineFixture fixture;
+    assert_gpu_preview_fixture_ready(fixture);
+    configure_engine_sweep_case(fixture, { "kill_switch", 6500.0, 0.0, 0.0, 0.5, 1.0, 60000.0 });
+    processingObject_t * processing = fixture.processing();
+    processingSetShadows(processing, 0.60);
+    processingSetHighlights(processing, -0.60);
+    (void)fixture.renderDebayeredFrame16(0);
+
+    QString reason;
+    GpuPreviewProcessingConfig withState = gpuPreviewProcessingBuildConfig(processing, &reason);
+    ASSERT_TRUE(withState.enabled);
+    ASSERT_TRUE(withState.applyShadowsHighlights);
+    const GpuPreviewProcessingConfig bypassed = withState;   /* frame state never attached */
+    int width = 0;
+    int height = 0;
+    const std::vector<uint16_t> frame = make_synthetic_ramp_frame(processing, 60000.0, &width, &height);
+    std::vector<uint16_t> refresh_input = frame;
+    ASSERT_TRUE(processingRefreshShadowsHighlightsBlurFromRgb16(
+                    processing, refresh_input.data(), width, height, 1, 1) != 0);
+    ASSERT_TRUE(gpuPreviewProcessingAttachFrameState(&withState, processing, width, height, &reason));
+    GpuPreviewProcessingConfig shadowsHighlightsOff = bypassed;
+    shadowsHighlightsOff.applyShadowsHighlights = false;
+
+    auto render = [&](const GpuPreviewProcessingConfig & config) {
+        std::vector<uint16_t> out(frame.size(), 0);
+        QString why;
+        QString renderer;
+        if (!gpuPreviewProcessingApplyDisplayGpuOffscreen(config, frame.data(), out.data(), width, height, &why, &renderer))
+        {
+            ::minitest::fail(__FILE__, __LINE__, "display offscreen render", why.toStdString());
+        }
+        return out;
+    };
+    const std::vector<uint16_t> applied = render(withState);
+    const std::vector<uint16_t> bypassedOut = render(bypassed);
+    const std::vector<uint16_t> baseline = render(shadowsHighlightsOff);
+    ASSERT_TRUE(bypassedOut == baseline);
+    ASSERT_TRUE(applied != baseline);
+}
+
+TEST(GpuPreviewProcessing, DisplayShaderFastPathFrameCostInformational)
+{
+    /* INFORMATIONAL, not a budget: this test records numbers and asserts only
+     * the invariants of the measurement itself (every iteration was timed, the
+     * per-iteration PAIRED cost is never below either component, and the paired
+     * percentiles are ordered). It deliberately does NOT assert the 40 ms frame
+     * budget: the numbers come from a shared CI host and software GL, which
+     * cannot prove or refute steady-state CUDA cadence. The hardware A/B
+     * (shadows/highlights on versus the MLVAPP_GPU_TEX_NR_DISPLAY_LUT_ONLY_SKIP_SH_STATE
+     * kill switch, quiet host, real GPU, play-through cadence) is the follow-up
+     * card CUDA-LOOK-SH-COST-HARDWARE-MEASURE-1, which needs a venue.
+     *
+     * Round-2 item 3: measure, don't guess, the per-frame cost the fast S/H
      * frame-state path now actually pays on the live CUDA texture-present
      * path now that gpuTexNrDisplayLutOnlyShStateBypass no longer refuses it.
      * Debayer + blur refresh are CPU-only production functions
@@ -620,9 +1070,16 @@ TEST(GpuPreviewProcessing, DisplayShaderFastPathFrameCostBudget)
     std::vector<uint16_t> rawBayer(static_cast<std::size_t>(w) * static_cast<std::size_t>(h));
     ASSERT_EQ(0, getMlvRawFrameUint16(fixture.video(), 0, rawBayer.data()));
 
-    const int iterations = 20;
+    const int iterations = 12;
     std::vector<uint16_t> rgb16(static_cast<std::size_t>(w) * static_cast<std::size_t>(h) * 3u);
-    auto measure_fast_sh_cost = [&](int threads, std::vector<double> * debayerMs, std::vector<double> * refreshMs)
+    /* Every iteration's debayer and refresh are timed on the SAME frame, and
+     * their sum is stored per iteration, so the percentiles reported below are
+     * percentiles of the real per-frame cost. (Round 1 added the p90 of the
+     * debayer samples to the p90 of the refresh samples, which is not the p90
+     * of their sum: two samples sets [1x8, 30x2] and [30x2, 1x8] sum to a paired
+     * p90 of 31 while their independent p90s add to 60.) */
+    auto measure_fast_sh_cost = [&](int threads, std::vector<double> * debayerMs, std::vector<double> * refreshMs,
+                                    std::vector<double> * pairedMs)
     {
         for (int i = 0; i < iterations; ++i)
         {
@@ -649,6 +1106,7 @@ TEST(GpuPreviewProcessing, DisplayShaderFastPathFrameCostBudget)
             const int refreshed = processingRefreshShadowsHighlightsBlurFromRgb16(
                 fixture.processing(), rgb16.data(), w, h, threads, /*forceExportPolicy=*/0);
             refreshMs->push_back((mlv_stage_timing_now() - refreshStart) * 1000.0);
+            pairedMs->push_back(debayerMs->back() + refreshMs->back());
             processingSetPlaybackPreviewScaleFactor( previousPreviewScaleFactor );
             processingSetPlaybackAggressivePreviewMode( previousAggressivePreviewMode );
             processingSetPlaybackPreviewMode( previousPreviewMode );
@@ -659,15 +1117,17 @@ TEST(GpuPreviewProcessing, DisplayShaderFastPathFrameCostBudget)
     const int singleThreadedCount = mlvappEffectivePlaybackWorkerThreadCount();
     std::vector<double> debayerMsSingle;
     std::vector<double> refreshMsSingle;
-    measure_fast_sh_cost(singleThreadedCount, &debayerMsSingle, &refreshMsSingle);
+    std::vector<double> pairedMsSingle;
+    measure_fast_sh_cost(singleThreadedCount, &debayerMsSingle, &refreshMsSingle, &pairedMsSingle);
 
     const int multiThreadedCount = qBound(
         1, static_cast<int>(std::thread::hardware_concurrency()), 16);
     std::vector<double> debayerMsMulti;
     std::vector<double> refreshMsMulti;
+    std::vector<double> pairedMsMulti;
     if (multiThreadedCount > singleThreadedCount)
     {
-        measure_fast_sh_cost(multiThreadedCount, &debayerMsMulti, &refreshMsMulti);
+        measure_fast_sh_cost(multiThreadedCount, &debayerMsMulti, &refreshMsMulti, &pairedMsMulti);
     }
 
     QString reason;
@@ -679,7 +1139,7 @@ TEST(GpuPreviewProcessing, DisplayShaderFastPathFrameCostBudget)
     std::vector<double> displayDrawMs;
     if (warm)
     {
-        for (int i = 0; i < iterations; ++i)
+        for (int i = 0; i < 8; ++i)
         {
             const double drawStart = mlv_stage_timing_now();
             const bool ok = gpuPreviewProcessingApplyDisplayGpuOffscreen(
@@ -701,29 +1161,47 @@ TEST(GpuPreviewProcessing, DisplayShaderFastPathFrameCostBudget)
     constexpr double kFrameBudgetMs = 40.0;
     auto record_fast_sh_cost = [&](const char * prefix, int threads,
                                    const std::vector<double> & debayerMs,
-                                   const std::vector<double> & refreshMs)
+                                   const std::vector<double> & refreshMs,
+                                   const std::vector<double> & pairedMs)
     {
-        const double debayerP50 = percentile(debayerMs, 0.50);
+        /* Measurement invariants (the only assertions in this test). */
+        ASSERT_EQ(static_cast<std::size_t>(iterations), pairedMs.size());
+        ASSERT_EQ(pairedMs.size(), debayerMs.size());
+        ASSERT_EQ(pairedMs.size(), refreshMs.size());
+        for (std::size_t i = 0; i < pairedMs.size(); ++i)
+        {
+            ASSERT_TRUE(debayerMs[i] > 0.0 && refreshMs[i] > 0.0);
+            ASSERT_TRUE(pairedMs[i] >= debayerMs[i] && pairedMs[i] >= refreshMs[i]);
+        }
         const double debayerP90 = percentile(debayerMs, 0.90);
-        const double refreshP50 = percentile(refreshMs, 0.50);
         const double refreshP90 = percentile(refreshMs, 0.90);
-        const double combinedP50 = debayerP50 + refreshP50;
-        const double combinedP90 = debayerP90 + refreshP90;
+        const double pairedP50 = percentile(pairedMs, 0.50);
+        const double pairedP90 = percentile(pairedMs, 0.90);
+        const double pairedP99 = percentile(pairedMs, 0.99);
+        /* Each sample of the sum is >= the matching component, so every order
+         * statistic of the sums is >= the same order statistic of a component. */
+        ASSERT_TRUE(pairedP90 >= debayerP90 && pairedP90 >= refreshP90);
+        ASSERT_TRUE(pairedP50 <= pairedP90 && pairedP90 <= pairedP99);
+
         const std::string base = std::string("gpu_preview_display.frame_cost.") + prefix + ".";
         test_artifacts::record(base + "threads", std::to_string(threads));
-        test_artifacts::record(base + "fast_sh_debayer_ms_p50", std::to_string(debayerP50));
+        test_artifacts::record(base + "fast_sh_debayer_ms_p50", std::to_string(percentile(debayerMs, 0.50)));
         test_artifacts::record(base + "fast_sh_debayer_ms_p90", std::to_string(debayerP90));
-        test_artifacts::record(base + "fast_sh_refresh_ms_p50", std::to_string(refreshP50));
+        test_artifacts::record(base + "fast_sh_refresh_ms_p50", std::to_string(percentile(refreshMs, 0.50)));
         test_artifacts::record(base + "fast_sh_refresh_ms_p90", std::to_string(refreshP90));
-        test_artifacts::record(base + "fast_sh_combined_ms_p50", std::to_string(combinedP50));
-        test_artifacts::record(base + "fast_sh_combined_ms_p90", std::to_string(combinedP90));
-        test_artifacts::record(base + "fast_sh_combined_budget_share_p90",
-                               std::to_string(combinedP90 / kFrameBudgetMs));
+        test_artifacts::record(base + "fast_sh_paired_frame_ms_p50", std::to_string(pairedP50));
+        test_artifacts::record(base + "fast_sh_paired_frame_ms_p90", std::to_string(pairedP90));
+        test_artifacts::record(base + "fast_sh_paired_frame_ms_p99", std::to_string(pairedP99));
+        test_artifacts::record(base + "fast_sh_paired_budget_share_p90",
+                               std::to_string(pairedP90 / kFrameBudgetMs));
+        std::cout << "[FRAME-COST] " << prefix << " threads=" << threads
+                  << " paired_ms p50=" << pairedP50 << " p90=" << pairedP90 << " p99=" << pairedP99
+                  << " (informational; budget " << kFrameBudgetMs << " ms)\n";
     };
-    record_fast_sh_cost("single_threaded", singleThreadedCount, debayerMsSingle, refreshMsSingle);
+    record_fast_sh_cost("single_threaded", singleThreadedCount, debayerMsSingle, refreshMsSingle, pairedMsSingle);
     if (!debayerMsMulti.empty())
     {
-        record_fast_sh_cost("multi_threaded", multiThreadedCount, debayerMsMulti, refreshMsMulti);
+        record_fast_sh_cost("multi_threaded", multiThreadedCount, debayerMsMulti, refreshMsMulti, pairedMsMulti);
     }
     if (!displayDrawMs.empty())
     {

@@ -28,12 +28,22 @@ in `platform/qt/GpuPreviewProcessing.cpp`): the display shader declares only
 shader source. Whether any of those is covered by another stage on the live CUDA path was not
 traced in this work; treat them as not applied until CUDA-LOOK-DISPLAY-STAGES-1 proves otherwise.
 
-The CPU oracle in `tests/pipeline/test_gpu_preview_processing.cpp`
-(`assert_gpu_display_offscreen_matches_cpu_reference`) is **restricted to the subset the display
-shader implements**: it forces `applyCreativeCurves`, `applyToning`, `applySaturation` and
-`applyHueVs` off before the CPU reference call. The `DisplayShader*MatchesCpuReference` tests
-therefore prove parity **for that subset only**; they say nothing about the stages above. A
-preset that uses any of them will still look different on live CUDA than on CPU.
+**What "parity" means here (round 2).** Round 1 compared the display shader with the in-file C++
+mirror `gpuPreviewProcessingApplyCpuReference` and called that CPU parity. A mirror written next to
+the shader shares its author's assumptions: both sides clamped the WB-boosted matrix value to 16
+bits *before* the contrast / shadows-highlights multiply, which the shipped engine does not do, so
+the tests passed while the shipped colour was wrong (sol r1 BLOCKER; fable r1 hardening). Round 2
+removed those mirror tests and replaced them with **engine-anchored** tests that call the
+production engine (`apply_processing_object`, or the whole `getMlvProcessedFrame16` render where the
+shadows/highlights blur must come from the engine's own refresh) on the same debayered frame the
+display shader receives. **Only the engine-anchored tests (`GpuPreviewProcessing.EngineAnchored*`
+and `GpuPreviewProcessing.DisplayShader*MatchesProductionEngine`) prove "parity with the production
+engine", and only for contrast+pivot, shadows/highlights, vibrance and the WB / camera-matrix /
+gamut / gamma chain they depend on**, with the creative-curve stages switched off in the engine
+(`neutralize_unported_creative_stages`) because the display shader does not implement them. They
+say nothing about the stages listed above. A preset that uses any of those will still look
+different on live CUDA than on CPU. See "Engine-anchored parity (round 2)" below for the engine
+path they anchor to, the measured residuals and what is still not covered.
 
 These gaps belong to the follow-up card **CUDA-LOOK-DISPLAY-STAGES-1**. No document, commit
 message or PR for this work may claim full CUDA/CPU Look Assist parity.
@@ -107,14 +117,30 @@ required together; see "Fix" below.
 
 ## `env` gate referenced by the hub finding
 
-`MLVAPP_GPU_TEX_NR_DISPLAY_LUT_ONLY_SKIP_SH_STATE`
-(`RenderFrameThread.cpp:582-584`, backing `gpuPlaybackReconDisplayLutOnlySkipShadowsHighlightsFrameStateEnabled()`)
-is a *separate*, independently-gated bypass, defaulting to the code-gate above
-(`gpuPreviewProcessingDisplayShaderUsesShadowsHighlightsFrameState`) but overridable via env for
-diagnostics. It is untouched by this round: with the shader now consuming S/H, setting this env
-var to force the bypass is still a valid way to A/B the display-LUT-only fast path against the
-full one, and both `gpuTexNrDisplayLutOnlyShStateBypass`'s inputs are still ANDed together
-(`RenderFrameThread.cpp:4078-4086`).
+`MLVAPP_GPU_TEX_NR_DISPLAY_LUT_ONLY_SKIP_SH_STATE`.
+
+**Round 1 claimed this variable was still a valid A/B switch. It was not** (fable r1 hardening):
+`gpuTexNrDisplayLutOnlyShStateBypass` was `envEnabled && needsFrameState &&
+!displayShaderUsesShadowsHighlightsFrameState && ...`, and the fix above made
+`displayShaderUsesShadowsHighlightsFrameState` true whenever S/H is requested, so no value of the
+variable could force the bypass any more. **Round 2 restored a working kill switch**, as one pure
+function, `gpuPreviewProcessingDisplayShadowsHighlightsFrameStateBypassed(config, envValue)`, that
+`RenderFrameThread` (`gpuPlaybackReconDisplayShadowsHighlightsFrameStateBypassed`) and the pipeline
+tests both call:
+
+| `MLVAPP_GPU_TEX_NR_DISPLAY_LUT_ONLY_SKIP_SH_STATE` | S/H requested | result |
+|---|---|---|
+| unset (default) | yes | **not bypassed**: the display shader applies S/H (the fix) |
+| `0` | yes | never bypassed |
+| any other value, including set-but-empty | yes | **KILL SWITCH: bypass forced**, S/H is left out of the display shader and its CPU cost is not paid |
+| any | no / config disabled | nothing to bypass |
+
+`GpuPreviewProcessing.ShadowsHighlightsKillSwitchForcesDisplayBypass` tests the table;
+`ShadowsHighlightsKillSwitchBypassRestoresPreFixLook` renders through the display shader and proves a
+bypassed frame is byte-identical to the S/H-off frame (the pre-fix look, i.e. the A/B baseline) and
+differs from the S/H-applied frame. The per-frame eligibility terms (texture-present requested, scale
+1, candidate, output mode) are unchanged. The hardware A/B itself is not done: it needs a venue
+(follow-up card CUDA-LOOK-SH-COST-HARDWARE-MEASURE-1, below).
 
 ## Fix (this round)
 
@@ -149,14 +175,20 @@ full one, and both `gpuTexNrDisplayLutOnlyShStateBypass`'s inputs are still ANDe
    frame texture itself samples for that fragment. See the in-source comment on
    `gpuPreviewProcessingApplyDisplayGpuOffscreen` for the derivation and the test-only quad this
    required.
-6. A **soft-degrade** contract, not a hard refusal: if the contrast/S-H curve texture upload or
-   the per-frame blur upload fails, `gpuPreviewProcessingBindDisplayUniformsAndTextures` binds
-   that one stage's `previewApply*` uniform to `0.0` for this frame — never destroys the whole
-   recon presentation over a look-parity miss (levels/matrix/gamma keep drawing). This differs
-   from how the 5 core LUTs fail (hard refusal, matching the pre-existing
-   GPU-TEXNR-S1-DARK-GREEN-1 FAIL CLOSED policy for those) because a levels/matrix/gamma failure
-   produces a wrong-color image (the incident that policy exists to prevent), while a
-   contrast/S-H/vibrance miss produces a still-correct, merely flatter image.
+6. Failure contract (corrected in round 2; round 1 called it a soft degrade for all three
+   textures, which is wrong for two of them): only the **per-frame S/H blur texture** degrades
+   softly. If its upload fails, `gpuPreviewProcessingBindDisplayUniformsAndTextures` binds
+   `previewApplyShadowsHighlights` to `0.0` for that frame and the rest keeps drawing. A failure
+   creating or uploading the **contrast or S/H curve texture** destroys the whole LUT set
+   (`gpuPreviewProcessingUpdateLutTextureSet`) and the recon presentation is **refused**
+   (fail-closed, like the 5 core LUTs, per GPU-TEXNR-S1-DARK-GREEN-1). The header comment on
+   `gpuPreviewProcessingUpdateShadowsHighlightsBlurTexture` also says callers must record the drop;
+   both presenters currently discard its return value, which stays DISCLOSED-OPEN below.
+7. (round 2) The raw-Bayer16 route of `GpuDisplayViewport` shares the LUT set and program with the
+   AMaZE route but never refreshes the S/H blur and samples the frame y-flipped, so after an AMaZE
+   present with S/H on, a Bayer16 frame would have bound a stale blur (fable r1). That route now
+   marks `shadowsHighlightsBlurReady = false` and draws without S/H (a disclosed gap, not a stale
+   look). Not traced: whether `MainWindow` can alternate the two routes in one session.
 
 ## Cost measured / not measured (round 2 update)
 
@@ -173,7 +205,9 @@ Round 2 now has a working local GL backend (round 1 reported none — `platform/
 had been built against a stray Qt 5.15.2 kit rather than the project's pinned Qt 6.10.2 + MinGW 13.1,
 which is why offscreen GL context creation failed; see `docs/10-build-windows.md`), so both halves of
 round 1's "not measured" gap now have local numbers, added by
-`GpuPreviewProcessing.DisplayShaderFastPathFrameCostBudget`
+`GpuPreviewProcessing.DisplayShaderFastPathFrameCostBudget` (renamed
+`...CostInformational` in LAND r2; its p90 figures below are sums of independent p90s, see the
+caveat under "Re-measured at landing")
 (`tests/pipeline/test_gpu_preview_processing.cpp`):
 
 - **CPU fast S/H refresh (trustworthy, host-independent)** — `debayerBasicU16` +
@@ -212,9 +246,17 @@ round 1's "not measured" gap now have local numbers, added by
 
 ### Re-measured at landing (LAND-2, merged tree on master d489e09a)
 
-`GpuPreviewProcessing.DisplayShaderFastPathFrameCostBudget`, run three times back to back on the
-merged build (i9-13900KS, 16 logical CPUs, a shared VM with other lanes active; renderer
-`llvmpipe (LLVM 5.0.1, 256 bits)`, no hardware GL). Combined debayer + S/H blur refresh, ms:
+**Caveat added in round 2 (sol r1 hardening):** every "combined p90" in this document and in the
+earlier test output is the p90 of the debayer samples **plus** the p90 of the refresh samples, which
+is not the p90 of the per-frame total (two sample sets `[1 x8, 30 x2]` and `[30 x2, 1 x8]` pair to a
+p90 of 31 ms while their independent p90s add to 60 ms). The numbers below are therefore an upper
+bound on the real per-frame figure, not a measurement of it. The paired figures are in "Paired
+re-measure" after this table.
+
+`GpuPreviewProcessing.DisplayShaderFastPathFrameCostBudget` (since renamed, see below), run three
+times back to back on the merged build (i9-13900KS, 16 logical CPUs, a shared VM with other lanes
+active; renderer `llvmpipe (LLVM 5.0.1, 256 bits)`, no hardware GL). Sum of independent p90s,
+debayer + S/H blur refresh, ms:
 
 | run | 16 threads p50 / p90 | 1 thread p50 / p90 |
 |---|---|---|
@@ -230,6 +272,131 @@ either way. The single-threaded and low-core-count S/H cost therefore stays DISC
 a quiet-host or bachelor-hardware measurement is still needed before claiming it fits the frame
 budget. The software-GL offscreen call measured p50 520-624 ms / p90 658-792 ms, still not a
 usable GPU figure for the reasons given above.
+
+### Paired re-measure (LAND r2) and what the cost test now is
+
+The test is renamed `GpuPreviewProcessing.DisplayShaderFastPathFrameCostInformational` because it
+never asserted the budget its old name promised. It now times the debayer and the refresh on the
+**same iteration**, stores their sum per iteration, and reports percentiles of that paired cost
+(`fast_sh_paired_frame_ms_p50/p90/p99`). Its only assertions are the measurement's own invariants:
+every iteration was timed, each paired sample is at least either component, the paired p90 is at
+least either component's p90, and p50 <= p90 <= p99. Iterations were cut from 20 to 12 (and the
+software-GL calls from 21 to 9) to bound its time inside the 240 s shard cap.
+
+One run on this loaded shared VM (llvmpipe, other lanes active, so it is neither a regression nor a
+clearance): 16 threads **paired** p50 31.0 / p90 44.0 / p99 47.2 ms; 1 thread paired p50 38.6 /
+p90 44.0 / p99 53.4 ms, against a 40 ms frame budget. Still over budget at p90 on this host. **Not
+established by any of this**: steady-state CUDA play-through cadence with S/H on, the real GPU cost
+of the new full-frame 8-bytes-per-pixel CPU pack and synchronous GL upload the blur needs per
+frame (`gpuPreviewProcessingUpdateShadowsHighlightsBlurTexture`, 32.8 MB at 1808x2268), and the
+effect of the kill switch on frame time. That evidence needs a quiet host with a real GPU and is the
+follow-up card **CUDA-LOOK-SH-COST-HARDWARE-MEASURE-1** (needs a venue; not started here). Remedies
+to try there if the hardware A/B shows a cost: upload RGB16 without the RGBA repack, or use a PBO.
+
+## Engine-anchored parity (LAND r2)
+
+### What the engine really does (the two review readings are one statement)
+
+Sol r1 read the engine as "pre-camera clamp and uint16 truncation"; fable r1 read it as "multiplies
+the UNclamped WB-boosted value and clamps afterwards". Both describe the same lines. In the generic
+16-bit loop (`raw_processing.c` ~3243-3422) `pm0/pm4/pm8[level]` are the **unclamped** int32
+diagonal-matrix values (blue is x2.86 at 3000 K, so `pre_calc_matrix[8][30000]` = 85,899);
+`expo_correction` (vignette x shadows/highlights x contrast, accumulated in double) multiplies them
+in float; and only then does `pix[i] = LIMIT16(...)` clamp and store to `uint16_t`, which truncates.
+The contrast index `cval = (4R+11G+B)>>4` ("Contrast on untouched pixel", ~3283) and the
+shadows/highlights index (from the blur through the same unclamped `pm` tables, ~3263) are taken from
+the **unclamped** values and clamped only as a curve index (`LIMIT16`). The camera matrix, gamut
+compression, `pix = LIMIT16(result)` (truncating) and `pre_calc_gamma[pix]` follow.
+
+Round 1 clamped the LUT to 16 bits in `gpuPreviewProcessingBuildConfig` and multiplied after, in the
+shader AND in the C++ mirror, so every pixel whose WB-boosted channel or whose factor-scaled channel
+passed 65535 took a different path through the camera matrix: sol's repro (WB 6500, contrast 0.14
+pivot 0.46, leveled `[27000,61000,43000]`) gave GLSL `[64090,64346,64293]` against the engine's
+`[60454,64592,61692]`.
+
+### What changed
+
+- `GpuPreviewProcessingConfig::matrixLutRaw{R,G,B}`: the unclamped `pre_calc_matrix` diagonal as
+  signed int32 limited to [-2^20, 2^20-1] (more than 16x over-range, so the 4R+11G+B luma sum is
+  exact in float32; a degenerate tint gives a negative green gain, which the engine keeps in its luma
+  sums). They enter `config.signature` **only** when contrast or S/H is on, so every other config's
+  signature, and the pinned golden signatures, are unchanged.
+- The matrix LUT textures carry the raw value in G/B (`raw + 2^20 = G + 65536*B`); R stays the
+  16-bit clamped value, so nothing that reads `.r` changed. `sampleMatrixRaw` rebuilds it.
+- Display shader (and the offscreen subset shader, which shares the code): contrast and S/H luma from
+  the raw diagonal; one `expoCorrection`; `pix = floor(clamp(diagonal * expoCorrection, 0, 65535))`;
+  camera matrix and gamut compression in code units; `gammaIndex = floor(clamp(pix, 0, 65535))` and a
+  gamma read by integer index (the engine truncates, the round-1 shader rounded the index);
+  vibrance reads its input rounded. The C++ mirror follows the same pre-camera order
+  (`matrixRawValue`, double `expoCorrection`, `floor(clamp16(...))`).
+- Found by the sweep and fixed in all three: the gamut compression used the **blue-channel** Reinhard
+  curve for green; the engine uses the plain `ReinhardTonemap_f` for green, the red curve for red
+  and the blue curve for blue (`raw_processing.c` ~3523). The two curves differ for every green
+  below luma, so this moved warm and saturated pixels (the fable repro was 923 codes off with the
+  clamp order fixed and this not).
+- The unchanged parts of the mirror: it still **rounds** the post-camera gamma index where the
+  engine and the display shader truncate, because `tiny_dual_iso.gpu_preview_subset.*` golden
+  hashes depend on that rounding and the golden artifact must not move. So the mirror (MainWindow's
+  CPU fallback, and the offscreen subset shader's oracle) agrees with the engine on the pre-camera
+  order but is **not** an engine oracle at the 1-LSB level (measured up to 18 codes, mean 1.4, on
+  the ramp frames), and no test claims it is.
+- Golden: `TinyDualIsoReceiptSubsetGoldenOutputIsStable` and the other six producers still produce
+  the tracked 15 keys byte-for-byte (proof in the run summary).
+
+### Evidence
+
+Red on the round-1 source (`1446c8ac` production code, engine-anchored tests only added), llvmpipe:
+`sol_r1_flat_pixel_6500K` max diff **1016** codes (gpu == mirror `[52213,52280,52265]`, engine
+`[51197,52344,51552]`), `fable_r1_flat_pixel_3000K` max **923**, the 6500 K contrast ramp max
+**1620** (the run logs are in the lane run folder, `red6.out.txt`). After: `sol_r1_flat_pixel_6500K`
+**0**, `fable_r1_flat_pixel_3000K` **0**, and the sweep below.
+
+| case (`EngineAnchored*`, 128x64 ramp to 130,000 diagonal codes unless noted) | max diff (codes) | mean |
+|---|---|---|
+| contrast +0.14/0.46, -0.30/0.50, +0.60/0.30 at 6500 K | 2 / 3 / 3 | 0.14 |
+| contrast at 2500 K (+0.14, +0.60 tint +30) | 1 / 7 | 0.13-0.14 |
+| contrast at 3000 K (-0.30), 10000 K (+0.14; +0.60 tint -30) | 2 / 4 / 9 | 0.14-0.15 |
+| vibrance 1.03, 1.60, 0.70 at 6500 K; 1.30 at 2500 K | 2 / 2 / 2 / 3 | 0.15-0.66 |
+| contrast + vibrance at 3000 K and 10000 K | 2 / 2 | 0.61-0.63 |
+| rounding floor (contrast 0.02, ramp capped at 60,000) | 5 | 0.16 |
+| S/H +32/-26 at 3000 K and 6500 K; +60/-60 at 3000 K (engine blur) | 2 / 3 / 7 | 0.14-0.15 |
+| night preset (contrast 14/46, S/H 32/-26, vibrance 3) at 3000 K and 6500 K | 5 / 3 | 0.64-0.66 |
+| real clip frame (1808x2268, whole `getMlvProcessedFrame16` render): contrast / vibrance / S/H / combined | 13 / 17 / 19 / 18 | 0.19 / 0.68 / 0.30 / 0.77 |
+
+Tolerances (`kEngineParity*`): 4 codes per sample, 32 max, 0.1% of samples above 4. They were set
+from these measurements (worst case 19 on the real frame, 9 on the sweeps; worst fraction of samples
+above 4 is 8.7e-5 on the real frame and 1.6e-4 on a ramp), with 1.7x on the worst case for a
+different GL driver, not from the old mirror tolerances. They sit more than an order of magnitude
+under the defects they catch (900-13,000 codes). The residual is float32/double accumulation and
+LUT-boundary rounding; no other cause is claimed.
+
+### Not covered / engine-internal findings (open, nothing here resolves them)
+
+- **The engine is not self-consistent about the pre-camera clamp.** The generic 16-bit loop clamps
+  and truncates as above. The direct-8-bit kernel (`raw_processing_8bit_kernel.inc` ~178-198) does
+  neither unless AgX or local tone is active, and the basic-matrix fast path (neutral creative
+  adjustments, `raw_processing.c` ~3139-3177) passes the unclamped value into the camera matrix too.
+  The display shader follows the generic loop, which is what sol and fable cited and what
+  `getMlvProcessedFrame16` runs. Where the 8-bit playback kernel is eligible, CPU playback may
+  therefore differ from the 16-bit loop (and from this shader) for over-ranged pixels. **Not
+  measured** here. The tests keep contrast >= 0.02 so the engine stays on the generic loop; with
+  fully neutral creative adjustments and an over-ranging WB the display shader (clamping, as on
+  master) differs from the engine's fast path. Follow-up card: CUDA-LOOK-ENGINE-KERNEL-CLAMP-DIVERGENCE-1.
+- The engine casts a negative float to `uint32_t` in the fast path and kernel (undefined; observed
+  `gamma[65535]` for an out-of-gamut blue), while the generic loop clamps first. The display shader
+  clamps.
+- At degenerate white balance (tint beyond the UI range) the gamut compression is ill-conditioned
+  near luma 0: the mirror differs from the engine by up to 1,938 codes there, the display shader by
+  9. That is a property of the input, not a coverage claim.
+- The tiny clip is dark (maximum leveled value ~7,400), so WB over-range is exercised on synthetic
+  frames built in diagonal-matrix space, not on real footage. Real-frame tests anchor the stage
+  order on real texture only.
+- llvmpipe only: no hardware GL, no CUDA. The same tests run on the 4090 are a venue item.
+- Still not implemented by the display shader (unchanged): see the list at the top.
+- Hosted CI skip behaviour: `assert_gpu_display_matches_production_engine` SKIPS only when the GL
+  backend probe fails; once it passes, a display-shader failure FAILS (round 1's helpers skipped on
+  any message containing "shader" or "offscreen", which hid a broken shader as a skip). Whether the
+  hosted runner skips these tests is read from its log, not assumed.
 
 ## DISCLOSED-OPEN (round-1 v2.1 contract: no silent drop)
 
@@ -264,7 +431,29 @@ usable GPU figure for the reasons given above.
   texture-present block reads and inserts into `readyFrame.stageTimingTelemetry`, mirroring the
   existing `texturePresentReason` pattern.
 
-## Files changed this round
+## Follow-up cards (named here, none started)
+
+- **CUDA-LOOK-SH-COST-HARDWARE-MEASURE-1** (needs a venue): quiet host, real GPU, S/H on versus the
+  kill switch, play-through cadence and per-frame cost of the blur pack/upload.
+- **CUDA-LOOK-DISPLAY-STAGES-1**: creative curves, toning, saturation, hue-vs, chroma smooth, and
+  the subset-only stages (AgX, gradient, highlight recon, LUT, vignette).
+- **CUDA-LOOK-ENGINE-KERNEL-CLAMP-DIVERGENCE-1**: the engine's direct-8-bit kernel and basic-matrix
+  fast path omit the pre-camera clamp/truncation the generic loop applies; measure CPU playback
+  against the 16-bit loop on over-ranged footage and decide which behaviour is the contract.
+- Surface the S/H blur-texture drop to telemetry (both presenters discard the return value).
+
+## Files changed (LAND r2 on top of round 1)
+
+- `platform/qt/GpuPreviewProcessing.h` / `.cpp` — raw diagonal LUTs and their texture packing,
+  display/subset shader and mirror pre-camera order, exact gamma truncation in the display shader,
+  green gamut tonemap, `gpuPreviewProcessingDisplayShadowsHighlightsFrameStateBypassed`.
+- `platform/qt/RenderFrameThread.cpp` — the bypass gate calls that function (kill switch restored).
+- `platform/qt/GpuDisplayViewport.cpp` — Bayer16 route no longer binds a stale blur.
+- `tests/pipeline/test_gpu_preview_processing.cpp` — mirror display tests replaced by
+  engine-anchored ones, kill-switch tests, paired cost percentiles.
+- `tests/fixtures/golden/pipeline_hashes.provenance.json` — source pin rebind only (see the PR).
+
+## Files changed in round 1
 
 - `platform/qt/GpuPreviewProcessing.h` / `.cpp` — shader source, LUT-texture-set fields, new
   per-frame blur-texture update function, gate flip, new

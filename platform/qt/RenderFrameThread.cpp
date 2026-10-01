@@ -591,15 +591,18 @@ bool gpuPlaybackReconFastShadowsHighlightsFrameStateEnabled()
     return enabled;
 }
 
-bool gpuPlaybackReconDisplayLutOnlySkipShadowsHighlightsFrameStateEnabled()
+/* MLVAPP_GPU_TEX_NR_DISPLAY_LUT_ONLY_SKIP_SH_STATE: unset = default (S/H applied
+ * by the display shader), "0" = never bypass, anything else = KILL SWITCH that
+ * forces the S/H frame-state bypass. The decision itself lives in
+ * gpuPreviewProcessingDisplayShadowsHighlightsFrameStateBypassed so the pipeline
+ * tests exercise the same function (CUDA-PLAYBACK-LOOK-PARITY-1-LAND r2). */
+bool gpuPlaybackReconDisplayShadowsHighlightsFrameStateBypassed(
+    const GpuPreviewProcessingConfig & config)
 {
-    static const bool enabled =
-        !qEnvironmentVariableIsSet(
-            "MLVAPP_GPU_TEX_NR_DISPLAY_LUT_ONLY_SKIP_SH_STATE" )
-        || qEnvironmentVariable(
-               "MLVAPP_GPU_TEX_NR_DISPLAY_LUT_ONLY_SKIP_SH_STATE" )
-           != QStringLiteral("0");
-    return enabled;
+    static const QString environmentValue =
+        qEnvironmentVariable( "MLVAPP_GPU_TEX_NR_DISPLAY_LUT_ONLY_SKIP_SH_STATE" );
+    return gpuPreviewProcessingDisplayShadowsHighlightsFrameStateBypassed(
+        config, environmentValue );
 }
 
 bool playbackSmokeFrameTelemetryEnabled()
@@ -4102,10 +4105,9 @@ void RenderFrameThread::drawFrame( int slotIndex,
         gpuPreviewProcessingNeedsShadowsHighlightsFrameState(
             m_activePresentationContext.gpuPreviewProcessingConfig);
     const bool gpuTexNrDisplayLutOnlyShStateBypass =
-        gpuPlaybackReconDisplayLutOnlySkipShadowsHighlightsFrameStateEnabled()
-        && gpuTexNrSkipNeedsPreviewFrameState
-        && !gpuPreviewProcessingDisplayShaderUsesShadowsHighlightsFrameState(
+        gpuPlaybackReconDisplayShadowsHighlightsFrameStateBypassed(
             m_activePresentationContext.gpuPreviewProcessingConfig)
+        && gpuTexNrSkipNeedsPreviewFrameState
         && gpuTexNrSkipOutputModeEligible
         && gpuTexNrSkipTextureRequested
         && gpuTexNrSkipScaleEligible

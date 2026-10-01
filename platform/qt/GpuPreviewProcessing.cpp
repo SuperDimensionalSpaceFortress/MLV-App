@@ -94,6 +94,45 @@ const uint16_t * lutValues(const QByteArray & bytes)
     return reinterpret_cast<const uint16_t *>(bytes.constData());
 }
 
+/* Cap for the unclamped diagonal-matrix LUT (see GpuPreviewProcessingConfig::
+ * matrixLutRawR): 20 bits keeps the engine's (4R+11G+B) luma sum below 2^24, so
+ * float32 on the GPU holds it exactly. */
+constexpr int32_t kMatrixRawMax = (1 << 20) - 1;
+/* A degenerate white balance (a tint far past the UI range) gives a NEGATIVE
+ * green gain; the engine keeps the negative value in its luma sums and clamps
+ * only the curve index and the final pixel, so the raw LUT is signed. The
+ * texture stores raw + kMatrixRawBias (always >= 0). */
+constexpr int32_t kMatrixRawMin = -(1 << 20);
+constexpr int32_t kMatrixRawBias = 1 << 20;
+constexpr int kMatrixLutBytes = static_cast<int>(65536u * sizeof(int32_t));
+
+/* The engine's pre_calc_matrix[0|4|8][level] -- UNclamped, in 16-bit code
+ * units. Falls back to the clamped uint16 LUT for a hand-built config that did
+ * not fill the raw copy. */
+int32_t matrixRawValue(const GpuPreviewProcessingConfig & config, int channel, int index)
+{
+    const QByteArray & raw = (channel == 0) ? config.matrixLutRawR
+                           : (channel == 1) ? config.matrixLutRawG
+                                            : config.matrixLutRawB;
+    if ( raw.size() >= kMatrixLutBytes )
+    {
+        return reinterpret_cast<const int32_t *>(raw.constData())[index];
+    }
+    const QByteArray & clamped = (channel == 0) ? config.matrixLutR
+                               : (channel == 1) ? config.matrixLutG
+                                                : config.matrixLutB;
+    if ( clamped.size() < static_cast<int>(65536u * sizeof(uint16_t)) )
+    {
+        return 0;
+    }
+    return static_cast<int32_t>(lutValues(clamped)[index]);
+}
+
+int levelIndexFromNormalized(float normalized)
+{
+    return std::max(0, std::min(65535, static_cast<int>(normalized * 65535.0f + 0.5f)));
+}
+
 uint16_t sampleLut(const QByteArray & lutBytes, float normalized)
 {
     if ( lutBytes.size() < static_cast<int>(65536u * sizeof(uint16_t)) )
@@ -176,12 +215,12 @@ float sampleShadowsHighlightsFactor(const GpuPreviewProcessingConfig & config,
     }
     else
     {
-        const int32_t blurR =
-            static_cast<int32_t>(lutValues(config.matrixLutR)[blur[0]]);
-        const int32_t blurG =
-            static_cast<int32_t>(lutValues(config.matrixLutG)[blur[1]]);
-        const int32_t blurB =
-            static_cast<int32_t>(lutValues(config.matrixLutB)[blur[2]]);
+        /* The engine reads the UNclamped diagonal-matrix values here
+         * (raw_processing.c ~3263 pm0/pm4/pm8[bpix]) and clamps only the final
+         * curve index. */
+        const int32_t blurR = matrixRawValue(config, 0, blur[0]);
+        const int32_t blurG = matrixRawValue(config, 1, blur[1]);
+        const int32_t blurB = matrixRawValue(config, 2, blur[2]);
         bval = ((blurR << 2) + (blurG * 11) + blurB) >> 4;
     }
 
@@ -266,9 +305,13 @@ void applyPreviewGamutCompression(float wb[3], const float rgbToY[3])
     for (int channel = 0; channel < 3; ++channel)
     {
         const float yToMinChannel = (y != 0.0f) ? ((y - wb[channel]) / y) : 0.0f;
-        const float tonemapped = (channel == 0)
-            ? reinhardForColour(yToMinChannel)
-            : reinhardForBlue(yToMinChannel);
+        /* The engine uses the plain Reinhard tonemap for green (channel 1), the
+         * red curve for channel 0 and the blue curve for channel 2
+         * (raw_processing.c ~3523, and the same split in the fast path and
+         * 8-bit kernel). */
+        const float tonemapped = (channel == 0) ? reinhardForColour(yToMinChannel)
+                               : (channel == 1) ? reinhardTonemap(yToMinChannel)
+                                                : reinhardForBlue(yToMinChannel);
         gamutReference[channel] = -(tonemapped * y) + y;
     }
     const float gamutMin =
@@ -474,14 +517,25 @@ void applyPreviewProcessingPixel(const GpuPreviewProcessingConfig & config,
             sampleLut(config.levelsLut, inputPixel[channel] / 65535.0f) / 65535.0f;
     }
 
+    /* UNclamped diagonal-matrix (WB) values, the engine's pm0/pm4/pm8[level]:
+     * contrast and shadows/highlights read their luma from these and multiply
+     * them before anything clamps (raw_processing.c ~3263-3420). */
+    int32_t diagonal[3];
+    for (int channel = 0; channel < 3; ++channel)
+    {
+        diagonal[channel] = matrixRawValue(config, channel, levelIndexFromNormalized(color[channel]));
+    }
     float matrixApplied[3];
-    matrixApplied[0] = sampleNormalizedLut(config.matrixLutR, color[0]);
-    matrixApplied[1] = sampleNormalizedLut(config.matrixLutG, color[1]);
-    matrixApplied[2] = sampleNormalizedLut(config.matrixLutB, color[2]);
 
     /* tmp1 for highlight reconstruction = the diagonal-matrix green BEFORE the
-     * vignette/contrast expo multiplies (raw_processing.c:3008 tmp1 = wb_g). */
-    const float reconMatrixGreen = matrixApplied[1];
+     * vignette/contrast expo multiplies (raw_processing.c:3008 tmp1 = wb_g),
+     * clamped to 16 bits by LIMIT16 (raw_processing.c:3422). */
+    const float reconMatrixGreen =
+        std::max(0, std::min(diagonal[1], 65535)) / 65535.0f;
+
+    /* The engine accumulates expo_correction in double: vignette x shadows/
+     * highlights x contrast. */
+    double expoCorrection = 1.0;
 
     /* The gradient layer reuses the SHARED expo_correction (vignette x base
      * in-loop-contrast) and the base luma index cval. Capture them here. */
@@ -509,9 +563,7 @@ void applyPreviewProcessingPixel(const GpuPreviewProcessingConfig & config,
             const double base = 1.0 + (static_cast<double>(m) * config.vignetteStrength / 128.0);
             const float vfactor = static_cast<float>(std::pow(base, 4.0));
             sharedVignetteFactor = vfactor;
-            matrixApplied[0] *= vfactor;
-            matrixApplied[1] *= vfactor;
-            matrixApplied[2] *= vfactor;
+            expoCorrection *= vfactor;
         }
     }
 
@@ -519,38 +571,37 @@ void applyPreviewProcessingPixel(const GpuPreviewProcessingConfig & config,
     {
         sharedShadowsHighlightsFactor =
             sampleShadowsHighlightsFactor(config, pixelIndex);
+        expoCorrection *= sharedShadowsHighlightsFactor;
     }
 
     if ( config.applyInLoopContrast || config.applyGradientContrast )
     {
         /* In-loop simple-contrast factor (raw_processing.c:2941-2954): a per-pixel
          * exposure multiply by contrast_curve[cval], where cval is the integer
-         * luma (4R+11G+B)>>4 of the matrix-applied (pre camera-WB) pixel. Applied
-         * to the matrix value before the camera matrix and gamma, matching
-         * pix0 = wb_r * expo_correction. The cval is also shared by the gradient
+         * luma (4R+11G+B)>>4 of the UNTOUCHED diagonal-matrix pixel ("Contrast on
+         * untouched pixel", raw_processing.c ~3283): no vignette, no shadows/
+         * highlights, and no 16-bit clamp. The cval is also shared by the gradient
          * layer (base contrast feeds the shared expo_correction; gradient contrast
          * uses the same index into its own curve), so it is computed whenever
          * either the base or the gradient contrast is active. */
-        const int32_t matR = static_cast<int32_t>(matrixApplied[0] * 65535.0f + 0.5f);
-        const int32_t matG = static_cast<int32_t>(matrixApplied[1] * 65535.0f + 0.5f);
-        const int32_t matB = static_cast<int32_t>(matrixApplied[2] * 65535.0f + 0.5f);
-        sharedCval = ((matR << 2) + (matG * 11) + matB) >> 4;
+        sharedCval = ((diagonal[0] << 2) + (diagonal[1] * 11) + diagonal[2]) >> 4;
         sharedHaveCval = true;
         if ( config.applyInLoopContrast )
         {
             const float factor = sampleInLoopContrastFactor(config.inLoopContrastCurve, sharedCval);
             sharedContrastFactor = factor;
-            matrixApplied[0] *= factor;
-            matrixApplied[1] *= factor;
-            matrixApplied[2] *= factor;
+            expoCorrection *= factor;
         }
     }
 
-    if ( config.applyShadowsHighlights )
+    /* pix = (uint16_t)LIMIT16((float)(wb * expo_correction)) -- the engine
+     * multiplies the UNclamped diagonal value, then clamps and truncates to
+     * uint16 BEFORE the camera matrix (raw_processing.c ~3420). */
+    for (int channel = 0; channel < 3; ++channel)
     {
-        matrixApplied[0] *= sharedShadowsHighlightsFactor;
-        matrixApplied[1] *= sharedShadowsHighlightsFactor;
-        matrixApplied[2] *= sharedShadowsHighlightsFactor;
+        const float scaled = static_cast<float>(
+            static_cast<double>(static_cast<float>(diagonal[channel])) * expoCorrection);
+        matrixApplied[channel] = std::floor(clamp16(scaled)) / 65535.0f;
     }
 
     if ( config.applyHighlightReconstruction )
@@ -566,9 +617,12 @@ void applyPreviewProcessingPixel(const GpuPreviewProcessingConfig & config,
          * subset models the float-3x3 fast path, a structural delta already inside
          * the parity tolerance for the vignette/AgX slices. LIMIT16 is clamp-only;
          * the (uint16) cast truncates toward zero (floor on the clamped value). */
-        const float p0 = std::floor(clamp16(matrixApplied[0] * 65535.0f));
-        const float p1 = std::floor(clamp16(matrixApplied[1] * 65535.0f));
-        const float p2 = std::floor(clamp16(matrixApplied[2] * 65535.0f));
+        /* matrixApplied is already the truncated uint16 pix[] / 65535, so
+         * rounding recovers the integer exactly (floor would misread a value
+         * the float division left a hair below). */
+        const float p0 = std::floor(clamp16(matrixApplied[0] * 65535.0f + 0.5f));
+        const float p1 = std::floor(clamp16(matrixApplied[1] * 65535.0f + 0.5f));
+        const float p2 = std::floor(clamp16(matrixApplied[2] * 65535.0f + 0.5f));
         const float tmp1 = std::floor(clamp16(reconMatrixGreen * 65535.0f + 0.5f));
         bool replace = false;
         if ( config.highlightReconDualIso )
@@ -1462,6 +1516,33 @@ QByteArray gpuPreviewProcessingDisplayFragmentShaderSource(void)
         "    vec2 uv = (vec2(x, y) + vec2(0.5)) / vec2(256.0, 256.0);\n"
         "    return texture2D(lut, uv).r;\n"
         "}\n"
+        /* CUDA-PLAYBACK-LOOK-PARITY-1-LAND r2: the UNCLAMPED diagonal-matrix
+         * (WB) value in 16-bit code units. The matrix LUT textures carry the
+         * 16-bit clamped value in R (what sampleU16Lut reads) and the full
+         * value split across G (low 16 bits) and B (bits 16..19), see
+         * gpuPreviewProcessingPackMatrixLookupTextureRgba16. The engine
+         * multiplies this unclamped value by the contrast / shadows-highlights
+         * factors and clamps afterwards, so a WB-boosted channel above 65535
+         * must survive until then. */
+        "float sampleMatrixRaw(sampler2D lut, float value)\n"
+        "{\n"
+        "    float clamped = clamp(value, 0.0, 1.0);\n"
+        "    float index = floor(clamped * 65535.0 + 0.5);\n"
+        "    float x = mod(index, 256.0);\n"
+        "    float y = floor(index / 256.0);\n"
+        "    vec2 uv = (vec2(x, y) + vec2(0.5)) / vec2(256.0, 256.0);\n"
+        "    vec4 texel = texture2D(lut, uv);\n"
+        "    return floor(texel.g * 65535.0 + 0.5) + floor(texel.b * 65535.0 + 0.5) * 65536.0 - 1048576.0;\n"
+        "}\n"
+        /* LUT read by INTEGER index (the engine's pre_calc_gamma[pix[i]]). */
+        "float sampleU16LutIndex(sampler2D lut, float index)\n"
+        "{\n"
+        "    float i = clamp(index, 0.0, 65535.0);\n"
+        "    float x = mod(i, 256.0);\n"
+        "    float y = floor(i / 256.0);\n"
+        "    vec2 uv = (vec2(x, y) + vec2(0.5)) / vec2(256.0, 256.0);\n"
+        "    return texture2D(lut, uv).r;\n"
+        "}\n"
         "float sampleContrastCurve(sampler2D curve, float idx)\n"
         "{\n"
         "    float i = clamp(idx, 0.0, 65535.0);\n"
@@ -1493,8 +1574,8 @@ QByteArray gpuPreviewProcessingDisplayFragmentShaderSource(void)
         "        return color;\n"
         "    }\n"
         "    vec3 leveled = vec3(sampleU16Lut(levelsLut, color.r), sampleU16Lut(levelsLut, color.g), sampleU16Lut(levelsLut, color.b));\n"
-        "    vec3 matrixApplied = vec3(sampleU16Lut(matrixLutR, leveled.r), sampleU16Lut(matrixLutG, leveled.g), sampleU16Lut(matrixLutB, leveled.b));\n"
-        "    float shadowsHighlightsF = 1.0;\n"
+        "    vec3 diagonal = vec3(sampleMatrixRaw(matrixLutR, leveled.r), sampleMatrixRaw(matrixLutG, leveled.g), sampleMatrixRaw(matrixLutB, leveled.b));\n"
+        "    float expoCorrection = 1.0;\n"
         "    if (previewApplyShadowsHighlights > 0.5)\n"
         "    {\n"
         /* CUDA-PLAYBACK-LOOK-PARITY-1: this display shader's vTexCoord is NOT
@@ -1510,49 +1591,53 @@ QByteArray gpuPreviewProcessingDisplayFragmentShaderSource(void)
         "        float shBval = shBlur.r;\n"
         "        if (previewShadowsHighlightsCurveIndexMask <= 0.5)\n"
         "        {\n"
-        "            float shR = floor(sampleU16Lut(matrixLutR, shBlur.r / 65535.0) * 65535.0 + 0.5);\n"
-        "            float shG = floor(sampleU16Lut(matrixLutG, shBlur.g / 65535.0) * 65535.0 + 0.5);\n"
-        "            float shB = floor(sampleU16Lut(matrixLutB, shBlur.b / 65535.0) * 65535.0 + 0.5);\n"
+        "            float shR = sampleMatrixRaw(matrixLutR, shBlur.r / 65535.0);\n"
+        "            float shG = sampleMatrixRaw(matrixLutG, shBlur.g / 65535.0);\n"
+        "            float shB = sampleMatrixRaw(matrixLutB, shBlur.b / 65535.0);\n"
         "            shBval = floor((shR * 4.0 + shG * 11.0 + shB) / 16.0);\n"
         "        }\n"
-        "        shadowsHighlightsF = sampleContrastCurve(shadowsHighlightsCurve, shBval);\n"
+        "        expoCorrection *= sampleContrastCurve(shadowsHighlightsCurve, shBval);\n"
         "    }\n"
         "    if (previewApplyInLoopContrast > 0.5)\n"
         "    {\n"
-        "        vec3 m16 = floor(matrixApplied * 65535.0 + 0.5);\n"
-        "        float cval = floor((m16.r * 4.0 + m16.g * 11.0 + m16.b) / 16.0);\n"
-        "        matrixApplied *= sampleContrastCurve(inLoopContrastCurve, cval);\n"
+        "        float cval = floor((diagonal.r * 4.0 + diagonal.g * 11.0 + diagonal.b) / 16.0);\n"
+        "        expoCorrection *= sampleContrastCurve(inLoopContrastCurve, cval);\n"
         "    }\n"
-        "    if (previewApplyShadowsHighlights > 0.5)\n"
-        "    {\n"
-        "        matrixApplied *= shadowsHighlightsF;\n"
-        "    }\n"
+        /* The engine multiplies the UNclamped diagonal value by expo_correction
+         * and stores pix[i] = (uint16_t)LIMIT16(...) -- clamp, then truncate --
+         * BEFORE the camera matrix (raw_processing.c ~3420). */
+        "    vec3 pix = floor(clamp(diagonal * expoCorrection, 0.0, 65535.0));\n"
+        /* From here on `pix` is in 16-bit CODE units, like the engine's uint16
+         * pix[]. The ratios in the gamut compression are scale-invariant; only
+         * the near-zero-denominator guard is scaled (1e-8 * 65535). */
         "    if (previewUseCameraMatrix > 0.5)\n"
         "    {\n"
-        "        vec3 wbApplied = vec3(dot(previewProperWbRow0, matrixApplied), dot(previewProperWbRow1, matrixApplied), dot(previewProperWbRow2, matrixApplied));\n"
+        "        vec3 wbApplied = vec3(dot(previewProperWbRow0, pix), dot(previewProperWbRow1, pix), dot(previewProperWbRow2, pix));\n"
         "        if (previewApplyGamutCompression > 0.5)\n"
         "        {\n"
         "            float Y = dot(previewRgbToY, wbApplied);\n"
         "            float minChannel = min(min(wbApplied.r, wbApplied.g), wbApplied.b);\n"
         "            vec3 gamutReference = vec3(-(reinhardForColour((Y != 0.0) ? ((Y - wbApplied.r) / Y) : 0.0) * Y) + Y,\n"
-        "                                      -(reinhardForBlue((Y != 0.0) ? ((Y - wbApplied.g) / Y) : 0.0) * Y) + Y,\n"
+        "                                      -(reinhardTonemap((Y != 0.0) ? ((Y - wbApplied.g) / Y) : 0.0) * Y) + Y,\n"
         "                                      -(reinhardForBlue((Y != 0.0) ? ((Y - wbApplied.b) / Y) : 0.0) * Y) + Y);\n"
         "            float gamutMin = min(min(gamutReference.r, gamutReference.g), gamutReference.b);\n"
         "            float desaturateFactor = 1.0;\n"
         "            float denom = Y - minChannel;\n"
-        "            if (Y > 0.0 && abs(denom) > 0.00000001)\n"
+        "            if (Y > 0.0 && abs(denom) > 0.00065535)\n"
         "            {\n"
         "                desaturateFactor = (Y - gamutMin) / denom;\n"
         "            }\n"
         "            wbApplied = (wbApplied - vec3(Y)) * desaturateFactor + vec3(Y);\n"
         "        }\n"
-        "        matrixApplied = wbApplied;\n"
+        "        pix = wbApplied;\n"
         "    }\n"
-        "    matrixApplied = clamp(matrixApplied, 0.0, 1.0);\n"
-        "    vec3 result = vec3(sampleU16Lut(gammaLut, matrixApplied.r), sampleU16Lut(gammaLut, matrixApplied.g), sampleU16Lut(gammaLut, matrixApplied.b));\n"
+        /* Engine: pix[i] = LIMIT16(result) stored to uint16 (truncation), then
+         * pre_calc_gamma[pix[i]] (raw_processing.c ~3498, ~3555). */
+        "    vec3 gammaIndex = floor(clamp(pix, 0.0, 65535.0));\n"
+        "    vec3 result = vec3(sampleU16LutIndex(gammaLut, gammaIndex.r), sampleU16LutIndex(gammaLut, gammaIndex.g), sampleU16LutIndex(gammaLut, gammaIndex.b));\n"
         "    if (previewApplyVibrance > 0.5)\n"
         "    {\n"
-        "        vec3 vv = result * 65535.0;\n"
+        "        vec3 vv = floor(result * 65535.0 + 0.5);\n"
         "        float vibY = floor((vv.r * 4.0 + vv.g * 11.0 + vv.b) / 16.0);\n"
         "        vec3 vpix0 = truncToZero((vv - vec3(vibY)) * previewVibrance) + vec3(vibY);\n"
         "        if (previewVibrance > 1.0)\n"
@@ -1688,6 +1773,18 @@ QByteArray gpuPreviewProcessingSubsetFragmentShaderSource(void)
         "    vec2 uv = (vec2(x, y) + vec2(0.5)) / vec2(256.0, 256.0);\n"
         "    return texture2D(lut, uv).r;\n"
         "}\n"
+        /* Unclamped diagonal-matrix value in 16-bit code units; see the display
+         * shader's sampleMatrixRaw. */
+        "float sampleMatrixRaw(sampler2D lut, float value)\n"
+        "{\n"
+        "    float clamped = clamp(value, 0.0, 1.0);\n"
+        "    float index = floor(clamped * 65535.0 + 0.5);\n"
+        "    float x = mod(index, 256.0);\n"
+        "    float y = floor(index / 256.0);\n"
+        "    vec2 uv = (vec2(x, y) + vec2(0.5)) / vec2(256.0, 256.0);\n"
+        "    vec4 texel = texture2D(lut, uv);\n"
+        "    return floor(texel.g * 65535.0 + 0.5) + floor(texel.b * 65535.0 + 0.5) * 65536.0 - 1048576.0;\n"
+        "}\n"
         "float sampleHueVsCurve(sampler2D curve, float idx)\n"
         "{\n"
         "    float i = clamp(idx, 0.0, 35999.0);\n"
@@ -1780,9 +1877,10 @@ QByteArray gpuPreviewProcessingSubsetFragmentShaderSource(void)
         "        return color;\n"
         "    }\n"
         "    vec3 leveled = vec3(sampleU16Lut(levelsLut, color.r), sampleU16Lut(levelsLut, color.g), sampleU16Lut(levelsLut, color.b));\n"
-        "    vec3 matrixApplied = vec3(sampleU16Lut(matrixLutR, leveled.r), sampleU16Lut(matrixLutG, leveled.g), sampleU16Lut(matrixLutB, leveled.b));\n"
-        "    float reconMatrixGreen = matrixApplied.g;\n"
+        "    vec3 diagonal = vec3(sampleMatrixRaw(matrixLutR, leveled.r), sampleMatrixRaw(matrixLutG, leveled.g), sampleMatrixRaw(matrixLutB, leveled.b));\n"
+        "    float reconMatrixGreen = clamp(diagonal.g, 0.0, 65535.0) / 65535.0;\n"
         "    float shadowsHighlightsF = 1.0;\n"
+        "    float expoCorrection = 1.0;\n"
         "    if (previewApplyVignette > 0.5)\n"
         "    {\n"
         "        vec2 fc = vec2(vTexCoord.x, 1.0 - vTexCoord.y) * frameSize;\n"
@@ -1794,7 +1892,7 @@ QByteArray gpuPreviewProcessingSubsetFragmentShaderSource(void)
         "            float m = texture2D(vignetteMask, (vec2(mx, my) + vec2(0.5)) / frameSize).r;\n"
         "            float base = 1.0 + (m * previewVignetteStrength / 128.0);\n"
         "            float b2 = base * base;\n"
-        "            matrixApplied *= b2 * b2;\n"
+        "            expoCorrection *= b2 * b2;\n"
         "        }\n"
         "    }\n"
         "    if (previewApplyShadowsHighlights > 0.5)\n"
@@ -1804,28 +1902,27 @@ QByteArray gpuPreviewProcessingSubsetFragmentShaderSource(void)
         "        float shBval = shBlur.r;\n"
         "        if (previewShadowsHighlightsCurveIndexMask <= 0.5)\n"
         "        {\n"
-        "            float shR = floor(sampleU16Lut(matrixLutR, shBlur.r / 65535.0) * 65535.0 + 0.5);\n"
-        "            float shG = floor(sampleU16Lut(matrixLutG, shBlur.g / 65535.0) * 65535.0 + 0.5);\n"
-        "            float shB = floor(sampleU16Lut(matrixLutB, shBlur.b / 65535.0) * 65535.0 + 0.5);\n"
+        "            float shR = sampleMatrixRaw(matrixLutR, shBlur.r / 65535.0);\n"
+        "            float shG = sampleMatrixRaw(matrixLutG, shBlur.g / 65535.0);\n"
+        "            float shB = sampleMatrixRaw(matrixLutB, shBlur.b / 65535.0);\n"
         "            shBval = floor((shR * 4.0 + shG * 11.0 + shB) / 16.0);\n"
         "        }\n"
         "        shadowsHighlightsF = sampleContrastCurve(shadowsHighlightsCurve, shBval);\n"
+        "        expoCorrection *= shadowsHighlightsF;\n"
         "    }\n"
         "    if (previewApplyInLoopContrast > 0.5)\n"
         "    {\n"
-        "        vec3 m16 = floor(matrixApplied * 65535.0 + 0.5);\n"
-        "        float cval = floor((m16.r * 4.0 + m16.g * 11.0 + m16.b) / 16.0);\n"
-        "        matrixApplied *= sampleContrastCurve(inLoopContrastCurve, cval);\n"
+        "        float cval = floor((diagonal.r * 4.0 + diagonal.g * 11.0 + diagonal.b) / 16.0);\n"
+        "        expoCorrection *= sampleContrastCurve(inLoopContrastCurve, cval);\n"
         "    }\n"
-        "    if (previewApplyShadowsHighlights > 0.5)\n"
-        "    {\n"
-        "        matrixApplied *= shadowsHighlightsF;\n"
-        "    }\n"
+        /* Engine: pix[i] = (uint16_t)LIMIT16(unclamped wb * expo_correction),
+         * before the camera matrix (raw_processing.c ~3420). */
+        "    vec3 matrixApplied = floor(clamp(diagonal * expoCorrection, 0.0, 65535.0)) / 65535.0;\n"
         "    if (previewApplyHighlightRecon > 0.5)\n"
         "    {\n"
-        "        float p0 = floor(clamp(matrixApplied.r * 65535.0, 0.0, 65535.0));\n"
-        "        float p1 = floor(clamp(matrixApplied.g * 65535.0, 0.0, 65535.0));\n"
-        "        float p2 = floor(clamp(matrixApplied.b * 65535.0, 0.0, 65535.0));\n"
+        "        float p0 = floor(clamp(matrixApplied.r * 65535.0 + 0.5, 0.0, 65535.0));\n"
+        "        float p1 = floor(clamp(matrixApplied.g * 65535.0 + 0.5, 0.0, 65535.0));\n"
+        "        float p2 = floor(clamp(matrixApplied.b * 65535.0 + 0.5, 0.0, 65535.0));\n"
         "        float tmp1 = floor(clamp(reconMatrixGreen * 65535.0 + 0.5, 0.0, 65535.0));\n"
         "        bool replace = false;\n"
         "        if (previewHighlightReconDualIso > 0.5)\n"
@@ -1848,7 +1945,7 @@ QByteArray gpuPreviewProcessingSubsetFragmentShaderSource(void)
         "            float Y = dot(previewRgbToY, wbApplied);\n"
         "            float minChannel = min(min(wbApplied.r, wbApplied.g), wbApplied.b);\n"
         "            vec3 gamutReference = vec3(-(reinhardForColour((Y != 0.0) ? ((Y - wbApplied.r) / Y) : 0.0) * Y) + Y,\n"
-        "                                      -(reinhardForBlue((Y != 0.0) ? ((Y - wbApplied.g) / Y) : 0.0) * Y) + Y,\n"
+        "                                      -(reinhardTonemap((Y != 0.0) ? ((Y - wbApplied.g) / Y) : 0.0) * Y) + Y,\n"
         "                                      -(reinhardForBlue((Y != 0.0) ? ((Y - wbApplied.b) / Y) : 0.0) * Y) + Y);\n"
         "            float gamutMin = min(min(gamutReference.r, gamutReference.g), gamutReference.b);\n"
         "            float desaturateFactor = 1.0;\n"
@@ -1893,9 +1990,7 @@ QByteArray gpuPreviewProcessingSubsetFragmentShaderSource(void)
         "        float gradContrastF = 1.0;\n"
         "        if (previewApplyInLoopContrast > 0.5 || previewApplyGradientContrast > 0.5)\n"
         "        {\n"
-        "            vec3 bm = vec3(sampleU16Lut(matrixLutR, leveled.r), sampleU16Lut(matrixLutG, leveled.g), sampleU16Lut(matrixLutB, leveled.b)) * vigF;\n"
-        "            vec3 bm16 = floor(bm * 65535.0 + 0.5);\n"
-        "            float gcval = floor((bm16.r * 4.0 + bm16.g * 11.0 + bm16.b) / 16.0);\n"
+        "            float gcval = floor((diagonal.r * 4.0 + diagonal.g * 11.0 + diagonal.b) / 16.0);\n"
         "            if (previewApplyInLoopContrast > 0.5) baseContrastF = sampleContrastCurve(inLoopContrastCurve, gcval);\n"
         "            if (previewApplyGradientContrast > 0.5) gradContrastF = sampleContrastCurve(gradientContrastCurve, gcval);\n"
         "        }\n"
@@ -1925,7 +2020,7 @@ QByteArray gpuPreviewProcessingSubsetFragmentShaderSource(void)
         "                float Y = dot(previewRgbToY, gw);\n"
         "                float minC = min(min(gw.r, gw.g), gw.b);\n"
         "                vec3 gref = vec3(-(reinhardForColour((Y != 0.0) ? ((Y - gw.r) / Y) : 0.0) * Y) + Y,\n"
-        "                                 -(reinhardForBlue((Y != 0.0) ? ((Y - gw.g) / Y) : 0.0) * Y) + Y,\n"
+        "                                 -(reinhardTonemap((Y != 0.0) ? ((Y - gw.g) / Y) : 0.0) * Y) + Y,\n"
         "                                 -(reinhardForBlue((Y != 0.0) ? ((Y - gw.b) / Y) : 0.0) * Y) + Y);\n"
         "                float gmin = min(min(gref.r, gref.g), gref.b);\n"
         "                float gdes = 1.0;\n"
@@ -1974,7 +2069,7 @@ QByteArray gpuPreviewProcessingSubsetFragmentShaderSource(void)
         "    }\n"
         "    if (previewApplyVibrance > 0.5)\n"
         "    {\n"
-        "        vec3 vv = result * 65535.0;\n"
+        "        vec3 vv = floor(result * 65535.0 + 0.5);\n"
         "        float vibY = floor((vv.r * 4.0 + vv.g * 11.0 + vv.b) / 16.0);\n"
         "        vec3 vpix0 = truncToZero((vv - vec3(vibY)) * previewVibrance) + vec3(vibY);\n"
         "        if (previewVibrance > 1.0)\n"
@@ -2089,6 +2184,36 @@ QByteArray gpuPreviewProcessingPackLookupTextureRgba16(const QByteArray & source
     return packed;
 }
 
+QByteArray gpuPreviewProcessingPackMatrixLookupTextureRgba16(const QByteArray & clampedLut,
+                                                             const QByteArray & rawLut)
+{
+    QByteArray packed(kLutTextureEdge * kLutTextureEdge * 4 * static_cast<int>(sizeof(uint16_t)),
+                      Qt::Uninitialized);
+    std::memset(packed.data(), 0, static_cast<size_t>(packed.size()));
+    if ( clampedLut.size() < static_cast<int>(65536u * sizeof(uint16_t)) )
+    {
+        return packed;
+    }
+
+    const uint16_t * clampedValues = reinterpret_cast<const uint16_t *>(clampedLut.constData());
+    const int32_t * rawValues = rawLut.size() >= kMatrixLutBytes
+        ? reinterpret_cast<const int32_t *>(rawLut.constData())
+        : nullptr;
+    uint16_t * destValues = reinterpret_cast<uint16_t *>(packed.data());
+    for (int index = 0; index < 65536; ++index)
+    {
+        const int32_t raw = rawValues
+            ? std::max<int32_t>(kMatrixRawMin, std::min<int32_t>(kMatrixRawMax, rawValues[index]))
+            : static_cast<int32_t>(clampedValues[index]);
+        const int32_t biased = raw + kMatrixRawBias;
+        destValues[index * 4 + 0] = clampedValues[index];
+        destValues[index * 4 + 1] = static_cast<uint16_t>(biased & 0xFFFF);
+        destValues[index * 4 + 2] = static_cast<uint16_t>(biased >> 16);
+        destValues[index * 4 + 3] = 65535;
+    }
+    return packed;
+}
+
 bool gpuPreviewProcessingEnsureDisplayProgram(QOpenGLShaderProgram *& program,
                                               QObject * shaderParent)
 {
@@ -2194,9 +2319,9 @@ void gpuPreviewProcessingUpdateLutTextureSet(GpuPreviewProcessingLutTextureSet &
     }
 
     const QByteArray levelsBytes = gpuPreviewProcessingPackLookupTextureRgba16(config.levelsLut);
-    const QByteArray matrixRBytes = gpuPreviewProcessingPackLookupTextureRgba16(config.matrixLutR);
-    const QByteArray matrixGBytes = gpuPreviewProcessingPackLookupTextureRgba16(config.matrixLutG);
-    const QByteArray matrixBBytes = gpuPreviewProcessingPackLookupTextureRgba16(config.matrixLutB);
+    const QByteArray matrixRBytes = gpuPreviewProcessingPackMatrixLookupTextureRgba16(config.matrixLutR, config.matrixLutRawR);
+    const QByteArray matrixGBytes = gpuPreviewProcessingPackMatrixLookupTextureRgba16(config.matrixLutG, config.matrixLutRawG);
+    const QByteArray matrixBBytes = gpuPreviewProcessingPackMatrixLookupTextureRgba16(config.matrixLutB, config.matrixLutRawB);
     const QByteArray gammaBytes = gpuPreviewProcessingPackLookupTextureRgba16(config.gammaLut);
     /* Neutral (all-1.0 / all-0.0-with-index-mask-off) curves when the
      * corresponding stage is off, matching packContrastCurveR32F's own
@@ -2649,11 +2774,20 @@ GpuPreviewProcessingConfig gpuPreviewProcessingBuildConfig(
     uint16_t * matrixR = reinterpret_cast<uint16_t *>(config.matrixLutR.data());
     uint16_t * matrixG = reinterpret_cast<uint16_t *>(config.matrixLutG.data());
     uint16_t * matrixB = reinterpret_cast<uint16_t *>(config.matrixLutB.data());
+    config.matrixLutRawR.resize(kMatrixLutBytes);
+    config.matrixLutRawG.resize(kMatrixLutBytes);
+    config.matrixLutRawB.resize(kMatrixLutBytes);
+    int32_t * rawR = reinterpret_cast<int32_t *>(config.matrixLutRawR.data());
+    int32_t * rawG = reinterpret_cast<int32_t *>(config.matrixLutRawG.data());
+    int32_t * rawB = reinterpret_cast<int32_t *>(config.matrixLutRawB.data());
     for (int index = 0; index < 65536; ++index)
     {
         matrixR[index] = static_cast<uint16_t>(qBound(0, processing->pre_calc_matrix[0][index], 65535));
         matrixG[index] = static_cast<uint16_t>(qBound(0, processing->pre_calc_matrix[4][index], 65535));
         matrixB[index] = static_cast<uint16_t>(qBound(0, processing->pre_calc_matrix[8][index], 65535));
+        rawR[index] = qBound<int32_t>(kMatrixRawMin, processing->pre_calc_matrix[0][index], kMatrixRawMax);
+        rawG[index] = qBound<int32_t>(kMatrixRawMin, processing->pre_calc_matrix[4][index], kMatrixRawMax);
+        rawB[index] = qBound<int32_t>(kMatrixRawMin, processing->pre_calc_matrix[8][index], kMatrixRawMax);
     }
     config.gammaLut = QByteArray(
         reinterpret_cast<const char *>(processing->pre_calc_gamma),
@@ -2921,6 +3055,16 @@ GpuPreviewProcessingConfig gpuPreviewProcessingBuildConfig(
     hash = fnv1a64_append(hash, &config.applyVignette, sizeof(config.applyVignette));
     hash = fnv1a64_append(hash, &config.vignetteStrength, sizeof(config.vignetteStrength));
     hash = fnv1a64_append(hash, config.vignetteMask.constData(), static_cast<size_t>(config.vignetteMask.size()));
+    /* The unclamped diagonal-matrix LUTs only change the picture when contrast or
+     * shadows/highlights multiply them before the 16-bit clamp. Hashing them
+     * only then keeps every other config's signature (and the pinned golden
+     * signatures) exactly as it was. */
+    if ( config.applyInLoopContrast || config.applyShadowsHighlights )
+    {
+        hash = fnv1a64_append(hash, config.matrixLutRawR.constData(), static_cast<size_t>(config.matrixLutRawR.size()));
+        hash = fnv1a64_append(hash, config.matrixLutRawG.constData(), static_cast<size_t>(config.matrixLutRawG.size()));
+        hash = fnv1a64_append(hash, config.matrixLutRawB.constData(), static_cast<size_t>(config.matrixLutRawB.size()));
+    }
     hash = fnv1a64_append(hash, &config.applyShadowsHighlights, sizeof(config.applyShadowsHighlights));
     hash = fnv1a64_append(hash, &config.shadowsHighlightsCurveIndexMask, sizeof(config.shadowsHighlightsCurveIndexMask));
     hash = fnv1a64_append(hash, config.shadowsHighlightsCurve.constData(), static_cast<size_t>(config.shadowsHighlightsCurve.size()));
@@ -2985,6 +3129,28 @@ bool gpuPreviewProcessingDisplayShaderUsesShadowsHighlightsFrameState(
      * here means the fast S/H frame-state refresh actually runs and its
      * result reaches the presenter instead of being silently skipped. */
     return config.enabled && config.applyShadowsHighlights;
+}
+
+bool gpuPreviewProcessingDisplayShadowsHighlightsFrameStateBypassed(
+    const GpuPreviewProcessingConfig & config,
+    const QString & skipShStateEnvironmentValue)
+{
+    if ( !gpuPreviewProcessingNeedsShadowsHighlightsFrameState(config) )
+    {
+        return false;
+    }
+    /* A null QString is "variable not set" (qEnvironmentVariable's contract);
+     * set-but-empty is a non-null empty string and counts as set. */
+    if ( skipShStateEnvironmentValue.isNull() )
+    {
+        /* Default: bypass only when the display shader cannot apply S/H. It now
+         * can, so the default is NOT bypassed -- the fix this card lands. */
+        return !gpuPreviewProcessingDisplayShaderUsesShadowsHighlightsFrameState(config);
+    }
+    /* "0" always disables the bypass; any other value is the kill switch that
+     * FORCES it even though the shader could apply S/H, so a hardware A/B of
+     * the S/H display path (CUDA-LOOK-SH-COST-HARDWARE-MEASURE-1) is possible. */
+    return skipShStateEnvironmentValue != QStringLiteral("0");
 }
 
 bool gpuPreviewProcessingHasShadowsHighlightsFrameState(
@@ -3395,9 +3561,9 @@ bool gpuPreviewProcessingApplyGpuOffscreen(const GpuPreviewProcessingConfig & co
 
     const QByteArray packedFrame = packRgb16Texture(inputRgb16, width * height);
     const QByteArray levelsBytes = gpuPreviewProcessingPackLookupTextureRgba16(config.levelsLut);
-    const QByteArray matrixRBytes = gpuPreviewProcessingPackLookupTextureRgba16(config.matrixLutR);
-    const QByteArray matrixGBytes = gpuPreviewProcessingPackLookupTextureRgba16(config.matrixLutG);
-    const QByteArray matrixBBytes = gpuPreviewProcessingPackLookupTextureRgba16(config.matrixLutB);
+    const QByteArray matrixRBytes = gpuPreviewProcessingPackMatrixLookupTextureRgba16(config.matrixLutR, config.matrixLutRawR);
+    const QByteArray matrixGBytes = gpuPreviewProcessingPackMatrixLookupTextureRgba16(config.matrixLutG, config.matrixLutRawG);
+    const QByteArray matrixBBytes = gpuPreviewProcessingPackMatrixLookupTextureRgba16(config.matrixLutB, config.matrixLutRawB);
     const QByteArray gammaBytes = gpuPreviewProcessingPackLookupTextureRgba16(config.gammaLut);
     const QByteArray contrastBytes = gpuPreviewProcessingPackLookupTextureRgba16(
         config.applyCreativeCurves ? config.contrastCurveLut : config.gammaLut);
