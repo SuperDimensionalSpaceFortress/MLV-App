@@ -12,6 +12,7 @@
 #include "ExportDimensions.h"
 #include "ExportProcess.h"
 #include "../../src/batch/LookAssistAnalysis.h"
+#include "../../src/batch/ReceiptApplier.h"
 #include "DualIsoLevelSyncPolicy.h"
 #include "PlaybackFpsMeterPolicy.h"
 #include "PlaybackFrameRange.h"
@@ -9520,6 +9521,10 @@ int MainWindow::runGuiPlaybackSmoke(const GuiPlaybackSmokeOptions & options)
                     ui->checkBoxLookAssistEnable->isChecked() );
                 frameJson.insert( QStringLiteral("look_assist_scene"),
                     m_lastLookAssistDiagnosticsValid ? m_lastLookAssistScene : QString() );
+                frameJson.insert( QStringLiteral("look_assist_wb_source"),
+                    m_lastLookAssistDiagnosticsValid ? m_lastLookAssistAutoWhiteBalanceSource : QString() );
+                frameJson.insert( QStringLiteral("look_assist_wb_decision"),
+                    m_lastLookAssistDiagnosticsValid ? m_lastLookAssistAutoWhiteBalanceDecision : QString() );
                 frameJson.insert( QStringLiteral("look_assist_exposure"),
                     ui->horizontalSliderExposure->value() );
                 frameJson.insert( QStringLiteral("look_assist_contrast"),
@@ -15260,16 +15265,26 @@ void MainWindow::applyLookAssistToReceipt( ReceiptSettings *receipt,
                              m_pMlvObject->EXPO.isoValue,
                              static_cast<double>( m_pMlvObject->EXPO.shutterValue ),
                              m_pMlvObject->LENS.aperture );
+    {
+        int asShotTemperature = 6000;
+        int asShotTint = 0;
+        const bool hasAsShot = ReceiptApplier::asShotWhiteBalanceControls(
+            m_pMlvObject, &asShotTemperature, &asShotTint );
+        lookAssistSetAsShotWhiteBalance( &stats, hasAsShot, asShotTemperature, asShotTint );
+    }
     const LookAssistScene scene = classifyLookAssistScene( stats );
     const bool floorLiftedNightThumbnail =
         lookAssistIsFloorLiftedNightThumbnail( scene, stats );
-    const int colorDownscaleFactor = floorLiftedNightThumbnail
+    // Colour is read from the rendered picture whenever the RAW thumbnail is a flat floor,
+    // whatever the scene (shared rule; the night-only flag above stays for the night rescue).
+    const bool processedColorWanted = lookAssistShouldAnalyzeProcessedColor( scene, stats );
+    const int colorDownscaleFactor = processedColorWanted
                                    ? qMax( 3, downscaleFactor / 3 )
                                    : downscaleFactor;
     const int colorWidth = raw_w / colorDownscaleFactor;
     const int colorHeight = raw_h / colorDownscaleFactor;
     const bool canAnalyzeProcessedColor =
-        floorLiftedNightThumbnail && colorWidth > 0 && colorHeight > 0;
+        processedColorWanted && colorWidth > 0 && colorHeight > 0;
     if( canAnalyzeProcessedColor
      && toolButtonChromaSmoothCurrentIndex() == 0
      && restrictedLosslessDualIsoOutputWhiteLevel() > getMlvOriginalWhiteLevel( m_pMlvObject ) )
@@ -15285,11 +15300,28 @@ void MainWindow::applyLookAssistToReceipt( ReceiptSettings *receipt,
     if( canAnalyzeProcessedColor )
     {
         processedThumbnail.resize( colorWidth * colorHeight * 3 );
-        get_area_average_downscale_thumnail( m_pMlvObject,
-                                             analysisFrame,
-                                             colorDownscaleFactor,
-                                             qMax( 1, mlvappEffectiveWorkerThreadCount() ),
-                                             reinterpret_cast<unsigned char *>( processedThumbnail.data() ) );
+        bool renderedAtPresetExposure = false;
+        if( scene != LookAssistScene::Night )
+        {
+            // Daylight: judge colour at the exposure Look Assist is about to apply, so the
+            // neutral-patch search sees the picture the user will see whatever exposure the
+            // receipt currently holds (the night path keeps the receipt's exposure, as before).
+            renderedAtPresetExposure = ReceiptApplier::processedThumbnailAtExposure(
+                m_pMlvObject,
+                analysisFrame,
+                colorDownscaleFactor,
+                qMax( 1, mlvappEffectiveWorkerThreadCount() ),
+                presetForLookAssistScene( scene, stats ).exposure / 100.0,
+                reinterpret_cast<unsigned char *>( processedThumbnail.data() ) );
+        }
+        if( !renderedAtPresetExposure )
+        {
+            get_area_average_downscale_thumnail( m_pMlvObject,
+                                                 analysisFrame,
+                                                 colorDownscaleFactor,
+                                                 qMax( 1, mlvappEffectiveWorkerThreadCount() ),
+                                                 reinterpret_cast<unsigned char *>( processedThumbnail.data() ) );
+        }
         processedColorStats = analyzeLookAssistThumbnail(
                     reinterpret_cast<const unsigned char *>( processedThumbnail.constData() ),
                     colorWidth,
@@ -15653,7 +15685,9 @@ void MainWindow::applyLookAssistToReceipt( ReceiptSettings *receipt,
                                                                 baseTemperature,
                                                                 baseTint,
                                                                 autoWhiteBalanceTemperature,
-                                                                autoWhiteBalanceTint ) )
+                                                                autoWhiteBalanceTint,
+                                                                lookAssistDaylightSolveIsUndamped(
+                                                                    statsCopy, sceneCopy, useProcessedColorStatsCopy ) ) )
                 {
                     autoWhiteBalanceDamping =
                         lookAssistAutoWhiteBalanceDampingFactor(
@@ -15663,6 +15697,8 @@ void MainWindow::applyLookAssistToReceipt( ReceiptSettings *receipt,
                             autoWhiteBalanceTemperature,
                             autoWhiteBalanceTint,
                             sceneCopy );
+                    if( lookAssistDaylightSolveIsUndamped( statsCopy, sceneCopy, useProcessedColorStatsCopy ) )
+                        autoWhiteBalanceDamping = 1.0;
                     if( autoWhiteBalanceDamping < 0.999 )
                     {
                         autoWhiteBalanceTemperature =
@@ -15691,6 +15727,19 @@ void MainWindow::applyLookAssistToReceipt( ReceiptSettings *receipt,
                 {
                     autoWhiteBalanceSource   = QStringLiteral("rejected-extreme-color-cast");
                     autoWhiteBalanceDecision = QStringLiteral("rejected-unstable");
+                }
+            }
+            if( !autoWhiteBalanceValid )
+            {
+                // No neutral patch we can trust: the clip's recorded white balance is the prior (daylight only).
+                int priorTemperature = baseTemperature;
+                int priorTint = baseTint;
+                if( lookAssistAsShotPrior( statsCopy, sceneCopy, &priorTemperature, &priorTint ) )
+                {
+                    autoWhiteBalanceSource   = QStringLiteral("as-shot-prior");
+                    autoWhiteBalanceDecision = QStringLiteral("prior");
+                    preset.temperatureDelta = priorTemperature - baseTemperature;
+                    preset.tintDelta        = priorTint - baseTint;
                 }
             }
 
@@ -16218,7 +16267,9 @@ void MainWindow::applyLookAssistToReceipt( ReceiptSettings *receipt,
                                                         baseTemperature,
                                                         baseTint,
                                                         autoWhiteBalanceTemperature,
-                                                        autoWhiteBalanceTint ) )
+                                                        autoWhiteBalanceTint,
+                                                        lookAssistDaylightSolveIsUndamped(
+                                                            stats, scene, useProcessedColorStats ) ) )
         {
             autoWhiteBalanceDamping =
                 lookAssistAutoWhiteBalanceDampingFactor(
@@ -16228,6 +16279,8 @@ void MainWindow::applyLookAssistToReceipt( ReceiptSettings *receipt,
                     autoWhiteBalanceTemperature,
                     autoWhiteBalanceTint,
                     scene );
+            if( lookAssistDaylightSolveIsUndamped( stats, scene, useProcessedColorStats ) )
+                autoWhiteBalanceDamping = 1.0;
             if( autoWhiteBalanceDamping < 0.999 )
             {
                 autoWhiteBalanceTemperature =
@@ -16256,6 +16309,19 @@ void MainWindow::applyLookAssistToReceipt( ReceiptSettings *receipt,
         {
             autoWhiteBalanceSource = QStringLiteral("rejected-extreme-color-cast");
             autoWhiteBalanceDecision = QStringLiteral("rejected-unstable");
+        }
+    }
+    if( !autoWhiteBalanceValid )
+    {
+        // No neutral patch we can trust: the clip's recorded white balance is the prior (daylight only).
+        int priorTemperature = baseTemperature;
+        int priorTint = baseTint;
+        if( lookAssistAsShotPrior( stats, scene, &priorTemperature, &priorTint ) )
+        {
+            autoWhiteBalanceSource = QStringLiteral("as-shot-prior");
+            autoWhiteBalanceDecision = QStringLiteral("prior");
+            preset.temperatureDelta = priorTemperature - baseTemperature;
+            preset.tintDelta = priorTint - baseTint;
         }
     }
     int temperature = 0;
@@ -25922,6 +25988,10 @@ void MainWindow::noteContactSheetPresentedFrame(
         ui->checkBoxLookAssistEnable->isChecked() );
     frameJson.insert( QStringLiteral("look_assist_scene"),
         m_lastLookAssistDiagnosticsValid ? m_lastLookAssistScene : QString() );
+    frameJson.insert( QStringLiteral("look_assist_wb_source"),
+        m_lastLookAssistDiagnosticsValid ? m_lastLookAssistAutoWhiteBalanceSource : QString() );
+    frameJson.insert( QStringLiteral("look_assist_wb_decision"),
+        m_lastLookAssistDiagnosticsValid ? m_lastLookAssistAutoWhiteBalanceDecision : QString() );
     frameJson.insert( QStringLiteral("look_assist_exposure"),
         ui->horizontalSliderExposure->value() );
     frameJson.insert( QStringLiteral("look_assist_contrast"),

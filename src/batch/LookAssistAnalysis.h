@@ -48,6 +48,11 @@ struct LookAssistStats
     // Display statistics alone cannot tell an under-exposed daylight clip from a night scene.
     bool hasSceneEv100 = false;
     double sceneEv100 = 0.0;
+    // The clip's recorded (as-shot) white balance, mapped to the app's temperature / tint controls
+    // (tint in receipt units). Only a PRIOR: used when no neutral patch can be trusted.
+    bool hasAsShotWb = false;
+    int asShotTemperature = 6000;
+    int asShotTint = 0;
 };
 
 struct LookAssistPreset
@@ -94,10 +99,14 @@ bool lookAssistSceneIsDaylightByMetadata( const LookAssistStats &stats );
 
 LookAssistScene classifyLookAssistScene( const LookAssistStats &stats );
 
-/* Colour-temperature / tint window a solved white balance must stay inside. Daylight scenes live
- * on the daylight locus; a "neutral patch" that solves outside it (pale water, a tinted wall)
- * is not neutral. Other scenes keep the full range, exactly as before. Tint is in receipt units
- * (tenths of the processing tint). */
+void lookAssistSetAsShotWhiteBalance( LookAssistStats *stats, bool valid, int temperature, int tint );
+
+/* Colour-temperature / tint window a solved white balance is clamped into (clamped, never rejected).
+ * Daylight scenes (by the recorded exposure) cannot be tungsten: below 4800 K or past +10 tint a
+ * "neutral patch" is not neutral. The warm end is the slider's own 10000 K: open shade under a blue
+ * sky is legitimately 7500-10000 K, and the tracked daylight fixture's neutral deck solves at
+ * 9990 K / tint -35 (a 7500 K ceiling left the deck at Lab chroma 17 against 4.8 at the solution).
+ * Other scenes keep the full range, exactly as before. Tint is in receipt units (tenths). */
 struct LookAssistWhiteBalanceBounds
 {
     int minTemperature = 2000;
@@ -108,7 +117,23 @@ struct LookAssistWhiteBalanceBounds
 LookAssistWhiteBalanceBounds lookAssistWhiteBalanceBounds( const LookAssistStats &stats, LookAssistScene scene );
 void lookAssistClampWhiteBalance( const LookAssistWhiteBalanceBounds &bounds, int *temperature, int *tint );
 
+/* A daylight clip whose white balance was solved from a neutral patch of the RENDERED picture applies
+ * that solution undamped (clamped into the daylight bounds). The generic damping hedges a patch that
+ * is not quite neutral by pulling only part of the way, which left the daylight deck lavender
+ * (8594 K / -23 against the solved 9990 K / -35). Non-daylight scenes and raw-thumbnail patches keep
+ * the damping exactly as before. */
+bool lookAssistDaylightSolveIsUndamped( const LookAssistStats &stats, LookAssistScene scene, bool solvedOnProcessedPicture );
+
+/* The as-shot white balance as the fallback when no neutral patch can be trusted (none found, or the
+ * solution was rejected). Daylight-by-metadata scenes only; clamped into the daylight bounds. */
+bool lookAssistAsShotPrior( const LookAssistStats &stats, LookAssistScene scene, int *temperature, int *tint );
+
+/* The RAW thumbnail is a flat floor (dual-ISO/raw preview lift): unusable for colour, any scene. */
+bool lookAssistIsFlatFloorRawThumbnail( const LookAssistStats &stats );
+/* Flat floor AND night: the night-only exposure/shadow rescue. Stays night-only. */
 bool lookAssistIsFloorLiftedNightThumbnail( LookAssistScene scene, const LookAssistStats &stats );
+/* Colour must come from the rendered (processed) picture. Scene-independent by design. */
+bool lookAssistShouldAnalyzeProcessedColor( LookAssistScene scene, const LookAssistStats &stats );
 bool lookAssistIsFlatNoiseFloorThumbnail( LookAssistScene scene, const LookAssistStats &stats );
 int lookAssistExposureForTarget( double sourceValue, double targetValue, int fallback );
 bool lookAssistHasNeutralBalanceSamples( const LookAssistStats &stats );
@@ -125,7 +150,8 @@ bool lookAssistAutoWhiteBalanceSolutionIsStable( const LookAssistAutoWhiteBalanc
                                                  int baseTemperature,
                                                  int baseTint,
                                                  int candidateTemperature,
-                                                 int candidateTint );
+                                                 int candidateTint,
+                                                 bool daylightSolve = false );
 
 double lookAssistAutoWhiteBalanceDampingFactor( const LookAssistAutoWhiteBalancePatch &patch,
                                                 int baseTemperature,

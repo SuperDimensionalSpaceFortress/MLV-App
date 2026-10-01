@@ -189,18 +189,25 @@ TEST(LookAssistScene, WhiteBalanceStaysNeutralAndInsideTheDaylightWindow)
         return std::vector<int>{ 108, 118, 128 }; } ), 100, 4000, 400 );
     ASSERT_TRUE( presetForLookAssistScene( classifyLookAssistScene( cool ), cool ).temperatureDelta > 0 );
 
-    // The daylight window: what the fixture used to receive (8594 K, tint -23) is clamped back
-    // onto the daylight locus; a plausible solve is left alone; unknown-exposure clips are untouched.
+    // The daylight window (clamp, never reject): a daylight clip cannot be tungsten (<4800 K) nor
+    // carry a strong magenta tint (>+10); the warm end is the slider's own 10000 K because open
+    // shade is legitimately 7500-10000 K. The window is MEASURED, not guessed: the fixture's neutral
+    // deck solves at 9990 K / tint -35 (Lab chroma 4.8 rendered); the earlier 7500 K / tint -10
+    // ceiling left it at chroma 17.3 and the 8594 K / -23 damped solve at 11.5 (lavender).
     const LookAssistStats fixture = withEv( fixtureRawStats(), 100, 465, 560 );
     const LookAssistWhiteBalanceBounds day = lookAssistWhiteBalanceBounds( fixture, LookAssistScene::Shade );
     ASSERT_EQ( 4800, day.minTemperature );
-    ASSERT_EQ( 7500, day.maxTemperature );
-    ASSERT_EQ( -10, day.minTint );
+    ASSERT_EQ( 10000, day.maxTemperature );
+    ASSERT_EQ( -35, day.minTint );
     ASSERT_EQ( 10, day.maxTint );
-    int temperature = 8594, tint = -23;
+    int temperature = 9990, tint = -35;   // the fixture's solved neutral deck: left alone
     lookAssistClampWhiteBalance( day, &temperature, &tint );
-    ASSERT_EQ( 7500, temperature );
-    ASSERT_EQ( -10, tint );
+    ASSERT_EQ( 9990, temperature );
+    ASSERT_EQ( -35, tint );
+    temperature = 3000; tint = 30;        // tungsten-and-magenta in a daylight scene: clamped, not rejected
+    lookAssistClampWhiteBalance( day, &temperature, &tint );
+    ASSERT_EQ( 4800, temperature );
+    ASSERT_EQ( 10, tint );
     temperature = 6150; tint = -4;
     lookAssistClampWhiteBalance( day, &temperature, &tint );
     ASSERT_EQ( 6150, temperature );
@@ -210,6 +217,108 @@ TEST(LookAssistScene, WhiteBalanceStaysNeutralAndInsideTheDaylightWindow)
     lookAssistClampWhiteBalance( unknown, &temperature, &tint );
     ASSERT_EQ( 8594, temperature );
     ASSERT_EQ( -23, tint );
+}
+
+TEST(LookAssistScene, ProcessedColourIsAnalysedForAnyFlatFloorThumbnailNotJustNight)
+{
+    // The defect: colour was read from the rendered picture only when the scene was NIGHT, so the day
+    // the classifier stopped calling the daylight fixture night, no white balance ran on rendered
+    // pixels and the base 6000 K stood (deck chroma 11.5 -> 22.4).
+    const LookAssistStats flatDay = withEv( fixtureRawStats(), 100, 465, 560 );
+    ASSERT_TRUE( lookAssistIsFlatFloorRawThumbnail( flatDay ) );
+    const LookAssistScene day = classifyLookAssistScene( flatDay );
+    ASSERT_TRUE( day == LookAssistScene::Shade );
+    ASSERT_TRUE( lookAssistShouldAnalyzeProcessedColor( day, flatDay ) );
+    // The night-only rescue stays night-only.
+    ASSERT_FALSE( lookAssistIsFloorLiftedNightThumbnail( day, flatDay ) );
+    ASSERT_TRUE( lookAssistIsFloorLiftedNightThumbnail( LookAssistScene::Night, fixtureRawStats() ) );
+    ASSERT_TRUE( lookAssistShouldAnalyzeProcessedColor( LookAssistScene::Night, fixtureRawStats() ) );
+
+    // A usable thumbnail (real tonal spread) keeps reading colour from the RAW thumbnail.
+    const LookAssistStats usable = withEv( analyzeFrame( 64, 64, []( int x, int ) {
+        return std::vector<int>{ 40 + x, 50 + x, 60 + x }; } ), 100, 4000, 400 );
+    ASSERT_FALSE( lookAssistIsFlatFloorRawThumbnail( usable ) );
+    ASSERT_FALSE( lookAssistShouldAnalyzeProcessedColor( classifyLookAssistScene( usable ), usable ) );
+}
+
+TEST(LookAssistScene, DaylightFlatFloorGetsNoNightRescueExposure)
+{
+    // The night rescue measures the floor-lifted spread (median - p05 + 2). If that leaked into a
+    // daylight clip, a 2-count spread would ask for a huge exposure.
+    LookAssistStats tinySpread = withEv( fixtureRawStats(), 100, 465, 560 );
+    tinySpread.p05 = 36; tinySpread.dynamicRange = tinySpread.p95 - tinySpread.p05;   // spread of 1 count
+    const LookAssistScene day = classifyLookAssistScene( tinySpread );
+    ASSERT_TRUE( day == LookAssistScene::Shade );
+    const LookAssistPreset p = presetForLookAssistScene( day, tinySpread );
+    ASSERT_TRUE( p.exposure > 0 );
+    ASSERT_TRUE( p.exposure <= 180 );
+    // Independent of the spread: p05 anywhere in the flat band gives the same daylight exposure.
+    for( double p05 : { 18.0, 25.0, 30.0, 35.0, 36.0 } )
+    {
+        LookAssistStats s = tinySpread;
+        s.p05 = p05; s.dynamicRange = s.p95 - s.p05;
+        ASSERT_EQ( p.exposure, presetForLookAssistScene( classifyLookAssistScene( s ), s ).exposure );
+    }
+    // The same statistics read as night DO get the (much larger) rescue.
+    ASSERT_TRUE( presetForLookAssistScene( LookAssistScene::Night, fixtureRawStats() ).exposure > p.exposure );
+}
+
+TEST(LookAssistScene, DaylightSolveIsUndampedOnlyFromTheRenderedPicture)
+{
+    const LookAssistStats day = withEv( fixtureRawStats(), 100, 465, 560 );
+    ASSERT_TRUE( lookAssistDaylightSolveIsUndamped( day, LookAssistScene::Shade, true ) );
+    ASSERT_FALSE( lookAssistDaylightSolveIsUndamped( day, LookAssistScene::Shade, false ) );   // raw patch: hedge as before
+    ASSERT_FALSE( lookAssistDaylightSolveIsUndamped( day, LookAssistScene::Night, true ) );
+    ASSERT_FALSE( lookAssistDaylightSolveIsUndamped( fixtureRawStats(), LookAssistScene::Night, true ) );
+    ASSERT_FALSE( lookAssistDaylightSolveIsUndamped( fixtureRawStats(), LookAssistScene::Shade, true ) );   // no exposure metadata
+}
+
+TEST(LookAssistScene, DaylightSolveIsNotRejectedByTheThumbnailBrightnessCoinFlip)
+{
+    // The fixture's neutral-deck patch, measured in the real app: chroma 12-13, blue-amber +12..13,
+    // luma 199.97 (receipt exposure) or 208.9 (exposure normalised). The correct solution is
+    // 9990 K / tint -35 from base 6000 K / 0. The generic two-axis-swing rule rejected it from the
+    // brighter of the two (luma >= 200) and accepted it from the dimmer: a coin flip on brightness.
+    LookAssistAutoWhiteBalancePatch dim;
+    dim.valid = true; dim.luma = 199.965; dim.chroma = 13.0; dim.greenAxis = -6.5; dim.blueAmberAxis = 13.0;
+    LookAssistAutoWhiteBalancePatch bright = dim;
+    bright.luma = 208.891; bright.chroma = 12.0; bright.greenAxis = -6.0; bright.blueAmberAxis = 12.0;
+    ASSERT_TRUE( lookAssistAutoWhiteBalanceSolutionIsStable( dim, 6000, 0, 9990, -35 ) );
+    ASSERT_FALSE( lookAssistAutoWhiteBalanceSolutionIsStable( bright, 6000, 0, 9990, -35 ) );   // generic rule, unchanged
+    // A daylight solve from the rendered picture is bounded by the window instead: both accepted.
+    ASSERT_TRUE( lookAssistAutoWhiteBalanceSolutionIsStable( dim, 6000, 0, 9990, -35, true ) );
+    ASSERT_TRUE( lookAssistAutoWhiteBalanceSolutionIsStable( bright, 6000, 0, 9990, -35, true ) );
+    // ... but the green-clamp / cooling guards still apply to it.
+    LookAssistAutoWhiteBalancePatch neutralBright = bright;
+    neutralBright.luma = 215.0; neutralBright.chroma = 5.0;
+    ASSERT_FALSE( lookAssistAutoWhiteBalanceSolutionIsStable( neutralBright, 6000, 0, 6500, -35, true ) );
+    ASSERT_FALSE( lookAssistAutoWhiteBalanceSolutionIsStable( LookAssistAutoWhiteBalancePatch(), 6000, 0, 9990, -35, true ) );
+}
+
+TEST(LookAssistScene, AsShotWhiteBalanceIsTheDaylightFallbackPrior)
+{
+    LookAssistStats s = withEv( fixtureRawStats(), 100, 465, 560 );
+    int temperature = 0, tint = 0;
+    // No recorded white balance: no prior.
+    ASSERT_FALSE( lookAssistAsShotPrior( s, LookAssistScene::Shade, &temperature, &tint ) );
+    lookAssistSetAsShotWhiteBalance( &s, true, 5500, -3 );
+    ASSERT_TRUE( lookAssistAsShotPrior( s, LookAssistScene::Shade, &temperature, &tint ) );
+    ASSERT_EQ( 5500, temperature );
+    ASSERT_EQ( -3, tint );
+    // A tungsten as-shot on a daylight clip is clamped into the daylight bounds, not trusted raw.
+    lookAssistSetAsShotWhiteBalance( &s, true, 3200, 30 );
+    ASSERT_TRUE( lookAssistAsShotPrior( s, LookAssistScene::Shade, &temperature, &tint ) );
+    ASSERT_EQ( 4800, temperature );
+    ASSERT_EQ( 10, tint );
+    // Never for night / artificial light / clips without daylight metadata.
+    ASSERT_FALSE( lookAssistAsShotPrior( s, LookAssistScene::Night, &temperature, &tint ) );
+    ASSERT_FALSE( lookAssistAsShotPrior( s, LookAssistScene::ArtificialLights, &temperature, &tint ) );
+    LookAssistStats noMeta = fixtureRawStats();
+    lookAssistSetAsShotWhiteBalance( &noMeta, true, 5500, 0 );
+    ASSERT_FALSE( lookAssistAsShotPrior( noMeta, LookAssistScene::Shade, &temperature, &tint ) );
+    lookAssistSetAsShotWhiteBalance( &s, false, 5500, 0 );
+    ASSERT_FALSE( s.hasAsShotWb );
+    ASSERT_FALSE( lookAssistAsShotPrior( s, LookAssistScene::Shade, &temperature, &tint ) );
 }
 
 TEST(LookAssistScene, ClipsWithoutExposureMetadataClassifyExactlyAsBefore)
@@ -261,6 +370,9 @@ TEST(LookAssistScene, CpuAndCudaShareOneClassifier)
         ASSERT_TRUE( source.contains( QStringLiteral("lookAssistSetSceneEv100(") ) );
         ASSERT_TRUE( source.contains( QStringLiteral("lookAssistWhiteBalanceBounds(") ) );
         ASSERT_TRUE( source.contains( QStringLiteral("lookAssistClampWhiteBalance(") ) );
+        ASSERT_TRUE( source.contains( QStringLiteral("lookAssistShouldAnalyzeProcessedColor(") ) );
+        ASSERT_TRUE( source.contains( QStringLiteral("lookAssistDaylightSolveIsUndamped(") ) );
+        ASSERT_TRUE( source.contains( QStringLiteral("lookAssistAsShotPrior(") ) );
         ASSERT_TRUE( source.contains( QStringLiteral("presetForLookAssistScene(") ) );
         // A definition (return type at line start, body follows) would be a second implementation.
         const QRegularExpression ownDefinition( QStringLiteral(

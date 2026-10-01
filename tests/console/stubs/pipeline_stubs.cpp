@@ -149,6 +149,25 @@ void processingSetWhiteBalance(processingObject_t * processing, double WBKelvin,
     processing->wb_multipliers[2] = 1.0;
 }
 
+processingObject_t * processingCloneForAnalysis(const processingObject_t *)
+{
+    return nullptr; /* ReceiptApplier::processedThumbnailAtExposure() then reports "not rendered" */
+}
+
+void processingFreeClone(processingObject_t *) {}
+
+void processingSetExposureStops(processingObject_t * processing, double exposureStops)
+{
+    if (processing) {
+        processing->exposure_stops = exposureStops;
+    }
+}
+
+int processingWhiteBalanceControlsForAsShotNeutral(const double[3], int *, int *)
+{
+    return 0; /* console tests never open a clip; ReceiptApplier falls back to the WBAL kelvin */
+}
+
 void getMlvRawFrameFloat(mlvObject_t *, uint64_t, float *) {}
 int getMlvRawFrameProcessedUint16(mlvObject_t *, uint64_t, uint16_t *, int * bit_shift)
 {
@@ -185,6 +204,14 @@ void get_area_average_downscale_raw_thumnail(mlvObject_t * video, int, int downs
 void get_area_average_downscale_thumnail(mlvObject_t * video, int, int downscale_factor, int, unsigned char * out_buffer)
 {
     fill_stub_thumbnail(video, downscale_factor, out_buffer);
+}
+
+int get_area_average_downscale_thumnail_with_processing(mlvObject_t * video, int, int downscale_factor, int,
+                                                        processingObject_t *, const mlv_processed_thumbnail_settings_t *,
+                                                        unsigned char * out_buffer)
+{
+    fill_stub_thumbnail(video, downscale_factor, out_buffer);
+    return 1;
 }
 
 void findMlvWhiteBalance(mlvObject_t *, uint64_t, int, int, int * wbTemp, int * wbTint, int)

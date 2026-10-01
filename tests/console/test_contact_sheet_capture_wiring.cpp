@@ -147,6 +147,8 @@ TEST(ContactSheetCaptureWiring, EachSidecarCarriesTheFieldsTheComposerAndOwnerNe
         "texture_source", "path", "look_assist_enabled", "look_assist_scene",
         "look_assist_exposure", "look_assist_contrast", "look_assist_pivot",
         "look_assist_temperature", "look_assist_tint", "settled", "saved",
+        // LOOK-ASSIST-SCENE-CLASSIFY-1 r1c: where the balance came from, so a sheet can assert it.
+        "look_assist_wb_source", "look_assist_wb_decision",
     };
     for (const char * field : kRequiredFields) {
         const QString needle = QStringLiteral("QStringLiteral(\"%1\")").arg(QString::fromLatin1(field));

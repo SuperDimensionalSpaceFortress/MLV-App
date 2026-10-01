@@ -174,19 +174,49 @@ bool lookAssistSceneIsDaylightByMetadata( const LookAssistStats &stats )
     return stats.hasSceneEv100 && stats.sceneEv100 >= kLookAssistDaylightEv100;
 }
 
+void lookAssistSetAsShotWhiteBalance( LookAssistStats *stats, bool valid, int temperature, int tint )
+{
+    if( !stats ) return;
+    stats->hasAsShotWb = valid;
+    stats->asShotTemperature = valid ? temperature : 6000;
+    stats->asShotTint = valid ? tint : 0;
+}
+
+static bool lookAssistIsDaylightScene( const LookAssistStats &stats, LookAssistScene scene )
+{
+    return scene != LookAssistScene::Night
+        && scene != LookAssistScene::ArtificialLights
+        && lookAssistSceneIsDaylightByMetadata( stats );
+}
+
 LookAssistWhiteBalanceBounds lookAssistWhiteBalanceBounds( const LookAssistStats &stats, LookAssistScene scene )
 {
     LookAssistWhiteBalanceBounds bounds;
-    if( scene != LookAssistScene::Night
-     && scene != LookAssistScene::ArtificialLights
-     && lookAssistSceneIsDaylightByMetadata( stats ) )
+    if( lookAssistIsDaylightScene( stats, scene ) )
     {
         bounds.minTemperature = 4800;
-        bounds.maxTemperature = 7500;
-        bounds.minTint = -10;
+        bounds.maxTemperature = 10000;
+        bounds.minTint = -35;
         bounds.maxTint = 10;
     }
     return bounds;
+}
+
+bool lookAssistDaylightSolveIsUndamped( const LookAssistStats &stats, LookAssistScene scene, bool solvedOnProcessedPicture )
+{
+    return solvedOnProcessedPicture && lookAssistIsDaylightScene( stats, scene );
+}
+
+bool lookAssistAsShotPrior( const LookAssistStats &stats, LookAssistScene scene, int *temperature, int *tint )
+{
+    if( !temperature || !tint || !stats.hasAsShotWb || !lookAssistIsDaylightScene( stats, scene ) )
+        return false;
+    int priorTemperature = stats.asShotTemperature;
+    int priorTint = stats.asShotTint;
+    lookAssistClampWhiteBalance( lookAssistWhiteBalanceBounds( stats, scene ), &priorTemperature, &priorTint );
+    *temperature = priorTemperature;
+    *tint = priorTint;
+    return true;
 }
 
 void lookAssistClampWhiteBalance( const LookAssistWhiteBalanceBounds &bounds, int *temperature, int *tint )
@@ -214,15 +244,31 @@ LookAssistScene classifyLookAssistScene( const LookAssistStats &stats )
     return LookAssistScene::Shade;
 }
 
-bool lookAssistIsFloorLiftedNightThumbnail( LookAssistScene scene, const LookAssistStats &stats )
+bool lookAssistIsFlatFloorRawThumbnail( const LookAssistStats &stats )
 {
     // Settled Dual ISO/raw preview paths can lift near-black thumbnails to a
-    // flat floor around 32, even when the scene still needs night rescue.
-    return scene == LookAssistScene::Night &&
-           stats.median >= 24.0 &&
+    // flat floor around 32. That thumbnail carries no usable colour or tonal
+    // information whatever the scene is; this test is about the PICTURE, not the scene.
+    return stats.median >= 24.0 &&
            stats.p05 >= 18.0 &&
            stats.p95 <= 70.0 &&
            stats.dynamicRange <= 24.0;
+}
+
+bool lookAssistIsFloorLiftedNightThumbnail( LookAssistScene scene, const LookAssistStats &stats )
+{
+    // The night-only rescue: a flat floor in a scene that really is night.
+    return scene == LookAssistScene::Night && lookAssistIsFlatFloorRawThumbnail( stats );
+}
+
+bool lookAssistShouldAnalyzeProcessedColor( LookAssistScene scene, const LookAssistStats &stats )
+{
+    // Colour has to be read from the RENDERED picture whenever the RAW thumbnail is a flat floor.
+    // This used to ride on the night-only test above, so the day the classifier correctly stopped
+    // calling a daylight clip "night" no white balance was solved on rendered pixels at all and
+    // the base 6000 K stood (deck cast chroma 11.5 -> 22.4).
+    (void)scene;
+    return lookAssistIsFlatFloorRawThumbnail( stats );
 }
 
 bool lookAssistIsFlatNoiseFloorThumbnail( LookAssistScene scene, const LookAssistStats &stats )
@@ -325,7 +371,8 @@ bool lookAssistAutoWhiteBalanceSolutionIsStable(
         int baseTemperature,
         int baseTint,
         int candidateTemperature,
-        int candidateTint )
+        int candidateTint,
+        bool daylightSolve )
 {
     if( !patch.valid ) return false;
 
@@ -363,8 +410,14 @@ bool lookAssistAutoWhiteBalanceSolutionIsStable(
         return false;
     }
 
+    // A large two-axis move off a bright, slightly coloured patch is distrusted -- except for a
+    // daylight solve from the rendered picture, which is clamped into the daylight bounds instead.
+    // Here the rule was a coin flip on the thumbnail's brightness: the daylight fixture's patch
+    // (chroma 12-13, luma 199.97 -> 208.9 with the exposure normalisation) sat on its edge and the
+    // same correct solution (9990 K / tint -35, deck chroma 4.8) was accepted or rejected.
     const bool implausibleDualAxisSwing =
-        fabs( static_cast<double>( tintDelta ) ) >= 34.0
+        !daylightSolve
+        && fabs( static_cast<double>( tintDelta ) ) >= 34.0
         && qAbs( temperatureDelta ) >= 1800
         && patch.chroma >= 12.0
         && patch.luma >= 200.0;

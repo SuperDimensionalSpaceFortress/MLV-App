@@ -504,6 +504,52 @@ void ReceiptApplier::applyToMlv(ReceiptSettings *receipt,
     resetMlvCachedFrame( mlvObject );
 }
 
+bool ReceiptApplier::asShotWhiteBalanceControls(mlvObject_t *mlvObject, int *temperature, int *tint)
+{
+    if( !mlvObject || !temperature || !tint ) return false;
+
+    const double neutral[3] = {
+        static_cast<double>( getMlvWbRgain( mlvObject ) ) / 1024.0,
+        static_cast<double>( getMlvWbGgain( mlvObject ) ) / 1024.0,
+        static_cast<double>( getMlvWbBgain( mlvObject ) ) / 1024.0
+    };
+    int solvedTemperature = 6000;
+    int solvedTint = 0;
+    if( neutral[0] > 0.0 && neutral[1] > 0.0 && neutral[2] > 0.0
+     && processingWhiteBalanceControlsForAsShotNeutral( neutral, &solvedTemperature, &solvedTint ) )
+    {
+        *temperature = solvedTemperature;
+        *tint = solvedTint;
+        return true;
+    }
+    const int kelvin = static_cast<int>( getMlvWbKelvin( mlvObject ) );
+    if( kelvin >= 2000 && kelvin <= 10000 )
+    {
+        *temperature = kelvin;
+        *tint = 0;
+        return true;
+    }
+    return false;
+}
+
+bool ReceiptApplier::processedThumbnailAtExposure(mlvObject_t *mlvObject,
+                                                  int frameIndex,
+                                                  int downscaleFactor,
+                                                  int cpuCores,
+                                                  double exposureStops,
+                                                  unsigned char *outBuffer)
+{
+    if( !mlvObject || !mlvObject->processing || !outBuffer || downscaleFactor <= 0 ) return false;
+
+    processingObject_t *clone = processingCloneForAnalysis( mlvObject->processing );
+    if( !clone ) return false;
+    processingSetExposureStops( clone, exposureStops );
+    const int rendered = get_area_average_downscale_thumnail_with_processing(
+        mlvObject, frameIndex, downscaleFactor, qMax( 1, cpuCores ), clone, nullptr, outBuffer );
+    processingFreeClone( clone );
+    return rendered != 0;
+}
+
 bool ReceiptApplier::applyHeadlessLookAssist(ReceiptSettings *receipt,
                                              mlvObject_t *mlvObject,
                                              processingObject_t *processingObject,
@@ -602,16 +648,23 @@ bool ReceiptApplier::applyHeadlessLookAssist(ReceiptSettings *receipt,
                              mlvObject->EXPO.isoValue,
                              static_cast<double>( mlvObject->EXPO.shutterValue ),
                              mlvObject->LENS.aperture );
+    {
+        int asShotTemperature = 6000;
+        int asShotTint = 0;
+        const bool hasAsShot = asShotWhiteBalanceControls( mlvObject, &asShotTemperature, &asShotTint );
+        lookAssistSetAsShotWhiteBalance( &stats, hasAsShot, asShotTemperature, asShotTint );
+    }
     const LookAssistScene scene = classifyLookAssistScene( stats );
-    const bool floorLiftedNightThumbnail =
-        lookAssistIsFloorLiftedNightThumbnail( scene, stats );
-    const int colorDownscaleFactor = floorLiftedNightThumbnail
+    // Same scene-independent rule as the GUI: colour comes from the rendered picture whenever
+    // the RAW thumbnail is a flat floor.
+    const bool processedColorWanted = lookAssistShouldAnalyzeProcessedColor( scene, stats );
+    const int colorDownscaleFactor = processedColorWanted
                                    ? qMax( 3, downscaleFactor / 3 )
                                    : downscaleFactor;
     const int colorWidth = raw_w / colorDownscaleFactor;
     const int colorHeight = raw_h / colorDownscaleFactor;
     const bool canAnalyzeProcessedColor =
-        floorLiftedNightThumbnail && colorWidth > 0 && colorHeight > 0;
+        processedColorWanted && colorWidth > 0 && colorHeight > 0;
     bool chromaSmoothAutoApplied = false;
     if( canAnalyzeProcessedColor
      && receipt->chromaSmooth() == 0
@@ -631,12 +684,25 @@ bool ReceiptApplier::applyHeadlessLookAssist(ReceiptSettings *receipt,
     if( canAnalyzeProcessedColor )
     {
         processedThumbnail.resize( colorWidth * colorHeight * 3 );
-        get_area_average_downscale_thumnail(
-            mlvObject,
-            frameIndex,
-            colorDownscaleFactor,
-            1,
-            reinterpret_cast<unsigned char *>( processedThumbnail.data() ) );
+        unsigned char *processedOut = reinterpret_cast<unsigned char *>( processedThumbnail.data() );
+        bool renderedAtPresetExposure = false;
+        if( scene != LookAssistScene::Night )
+        {
+            // Daylight: judge colour at the exposure Look Assist is about to apply (the night
+            // path keeps the receipt's current exposure, exactly as before).
+            const double presetStops = presetForLookAssistScene( scene, stats ).exposure / 100.0;
+            renderedAtPresetExposure = processedThumbnailAtExposure(
+                mlvObject, frameIndex, colorDownscaleFactor, 1, presetStops, processedOut );
+        }
+        if( !renderedAtPresetExposure )
+        {
+            get_area_average_downscale_thumnail(
+                mlvObject,
+                frameIndex,
+                colorDownscaleFactor,
+                1,
+                processedOut );
+        }
         processedColorStats = analyzeLookAssistThumbnail(
             reinterpret_cast<const unsigned char *>( processedThumbnail.constData() ),
             colorWidth,
@@ -711,7 +777,9 @@ bool ReceiptApplier::applyHeadlessLookAssist(ReceiptSettings *receipt,
                                                         baseTemperature,
                                                         baseTint,
                                                         autoWhiteBalanceTemperature,
-                                                        autoWhiteBalanceTint ) )
+                                                        autoWhiteBalanceTint,
+                                                        lookAssistDaylightSolveIsUndamped(
+                                                            stats, scene, useProcessedColorStats ) ) )
         {
             autoWhiteBalanceDamping =
                 lookAssistAutoWhiteBalanceDampingFactor(
@@ -721,6 +789,8 @@ bool ReceiptApplier::applyHeadlessLookAssist(ReceiptSettings *receipt,
                     autoWhiteBalanceTemperature,
                     autoWhiteBalanceTint,
                     scene );
+            if( lookAssistDaylightSolveIsUndamped( stats, scene, useProcessedColorStats ) )
+                autoWhiteBalanceDamping = 1.0;
             if( autoWhiteBalanceDamping < 0.999 )
             {
                 autoWhiteBalanceTemperature =
@@ -749,6 +819,19 @@ bool ReceiptApplier::applyHeadlessLookAssist(ReceiptSettings *receipt,
         {
             autoWhiteBalanceSource = QStringLiteral("rejected-extreme-color-cast");
             autoWhiteBalanceDecision = QStringLiteral("rejected-unstable");
+        }
+    }
+    if( !autoWhiteBalanceValid )
+    {
+        // No neutral patch we can trust: the clip's recorded white balance is the prior (daylight only).
+        int priorTemperature = baseTemperature;
+        int priorTint = baseTint;
+        if( lookAssistAsShotPrior( stats, scene, &priorTemperature, &priorTint ) )
+        {
+            autoWhiteBalanceSource = QStringLiteral("as-shot-prior");
+            autoWhiteBalanceDecision = QStringLiteral("prior");
+            preset.temperatureDelta = priorTemperature - baseTemperature;
+            preset.tintDelta = priorTint - baseTint;
         }
     }
 
