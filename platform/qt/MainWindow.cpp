@@ -15473,6 +15473,17 @@ void MainWindow::applyLookAssistToReceipt( ReceiptSettings *receipt,
                     reinterpret_cast<const unsigned char *>( processedThumbnail.constData() ),
                     colorWidth,
                     colorHeight );
+        logInteractionEvent(
+            QStringLiteral("look_assist.daylight_evidence_render"),
+            QStringLiteral("stops=%1 median=%2 p05=%3 p95=%4 midtone_fraction=%5 corroborates=%6 ev100=%7 frame=%8")
+                .arg( exposureStops, 0, 'f', 2 )
+                .arg( out->median, 0, 'f', 1 )
+                .arg( out->p05, 0, 'f', 1 )
+                .arg( out->p95, 0, 'f', 1 )
+                .arg( out->midtoneFraction, 0, 'f', 3 )
+                .arg( bool01( lookAssistPictureCorroboratesDaylight( *out ) ) )
+                .arg( stats.sceneEv100, 0, 'f', 2 )
+                .arg( analysisFrame ) );
         return true;
     };
     const LookAssistScene scene = resolveLookAssistScene( &stats, renderProcessed );

@@ -53,7 +53,7 @@ struct LookAssistStats
     // Fraction of pixels in the mid-tone band (luma 40..215): "a lit picture", not "a dark field
     // with a small bright region".
     double midtoneFraction = 0.0;
-    // The RENDERED picture, at the camera's own exposure, is a lit daylight picture (set only by
+    // The RENDERED picture, at the exposure the daylight verdict would apply, is a lit daylight picture (set only by
     // resolveLookAssistScene). The recorded exposure alone is NOT proof of daylight: a night moon
     // shot at ISO 200, 1/500 s, f/7.1 records EV100 13.6 over a black sky.
     bool daylightPictureEvidence = false;
@@ -117,11 +117,11 @@ bool lookAssistIsDaylightScene( const LookAssistStats &stats, LookAssistScene sc
  * speak), and the exposure is daylight-bright: the picture has to be consulted. */
 bool lookAssistDaylightNeedsPictureEvidence( const LookAssistStats &stats, LookAssistScene legacyScene );
 
-/* The picture rendered at the camera's own exposure (no Look Assist exposure) is a lit daylight
- * picture: mostly mid-tones around a mid median, not a dark field with a small bright region.
- * The tracked fixture renders median 78-85, 88-99 % mid-tones; a moon over a black sky renders
- * almost entirely below luma 40. */
-bool lookAssistPictureCorroboratesDaylight( const LookAssistStats &processedAtCameraExposure );
+/* The picture rendered at the exposure the daylight verdict would apply (the Shade preset's lift) is a
+ * lit daylight picture: mostly mid-tones around a mid median, not a dark field with a small bright
+ * region. The tracked fixture renders median 77-147 with 95-99 % mid-tones at its lift; a moon over a
+ * black sky stays almost entirely below luma 40 whatever the lift. */
+bool lookAssistPictureCorroboratesDaylight( const LookAssistStats &processedAtPlannedExposure );
 
 /* Without picture evidence the classification is exactly the legacy one. */
 LookAssistScene classifyLookAssistScene( const LookAssistStats &stats );
@@ -130,8 +130,8 @@ LookAssistScene classifyLookAssistScene( const LookAssistStats &stats );
 typedef std::function<bool( double exposureStops, LookAssistStats *processedStats )> LookAssistRenderFn;
 
 /* classifyLookAssistScene plus the one picture check: when the exposure says daylight but the flat
- * RAW thumbnail cannot confirm it, the processed picture is rendered at the camera's exposure and
- * must corroborate; otherwise the legacy verdict (night rescue included) stands. Sets
+ * RAW thumbnail cannot confirm it, the processed picture is rendered at the exposure the daylight
+ * verdict would apply and must corroborate; otherwise the legacy verdict (night rescue included) stands. Sets
  * stats->daylightPictureEvidence. The same call for GUI and headless, CPU and CUDA. */
 LookAssistScene resolveLookAssistScene( LookAssistStats *stats, const LookAssistRenderFn &renderProcessed );
 

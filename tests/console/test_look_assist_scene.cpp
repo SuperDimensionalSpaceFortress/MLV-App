@@ -170,7 +170,7 @@ TEST(LookAssistScene, DaylightNeedsThePictureNotJustTheExposure)
     ASSERT_TRUE( classifyLookAssistScene( moonRaw ) == LookAssistScene::Night );     // legacy verdict
     ASSERT_TRUE( lookAssistDaylightNeedsPictureEvidence( moonRaw, LookAssistScene::Night ) );
 
-    // Black sky (luma 6..10) with a small bright disc: rendered at the camera's exposure.
+    // Black sky (luma 6..10) with a small bright disc: rendered at the lift the daylight verdict would apply.
     int moonRenders = 0;
     double moonStops = -1.0;
     LookAssistStats moon = moonRaw;
@@ -181,7 +181,12 @@ TEST(LookAssistScene, DaylightNeedsThePictureNotJustTheExposure)
             return ( ( x - 32 ) * ( x - 32 ) + ( y - 20 ) * ( y - 20 ) < 30 ) ? 238 : 6 + ( x + y ) % 5; } );
         return true; } );
     ASSERT_EQ( 1, moonRenders );
-    ASSERT_NEAR( 0.0, moonStops, 1e-9 );   // judged at the CAMERA's exposure, not at a Look Assist lift
+    // Judged at the exposure the daylight verdict WOULD apply (the Shade preset's lift of this floor).
+    LookAssistStats hypothesis = moonRaw;
+    hypothesis.daylightPictureEvidence = true;
+    const double plannedStops = presetForLookAssistScene( LookAssistScene::Shade, hypothesis ).exposure / 100.0;
+    ASSERT_TRUE( plannedStops > 1.0 && plannedStops <= 1.8 );
+    ASSERT_NEAR( plannedStops, moonStops, 1e-9 );
     ASSERT_TRUE( moonScene == LookAssistScene::Night );
     ASSERT_FALSE( moon.daylightPictureEvidence );
     ASSERT_FALSE( lookAssistIsDaylightScene( moon, moonScene ) );
@@ -196,18 +201,37 @@ TEST(LookAssistScene, DaylightNeedsThePictureNotJustTheExposure)
     ASSERT_EQ( presetForLookAssistScene( LookAssistScene::Night, moonRaw ).exposure,
                presetForLookAssistScene( moonScene, moon ).exposure );
 
-    // A night noise floor lifted by the pipeline (everything luma ~50, narrow) is not daylight either.
+    // A night noise floor lifted by the pipeline (everything luma ~36..50, narrow, below the lit band) is
+    // not daylight either; nor is a picture that is lit over only a small part of the frame.
     LookAssistStats noise = moonRaw;
     ASSERT_TRUE( resolveLookAssistScene( &noise, []( double, LookAssistStats *out ) {
-        *out = renderedPicture( 64, 64, []( int x, int y ) { return 44 + ( x * 3 + y ) % 9; } );
+        *out = renderedPicture( 64, 64, []( int x, int y ) { return 36 + ( x * 3 + y ) % 15; } );
+        return true; } ) == LookAssistScene::Night );
+    LookAssistStats stage = moonRaw;   // a lit stage: 15 % of the frame bright mid-tones, the rest black
+    ASSERT_TRUE( resolveLookAssistScene( &stage, []( double, LookAssistStats *out ) {
+        *out = renderedPicture( 64, 64, []( int x, int ) { return x < 10 ? 140 : 8; } );
         return true; } ) == LookAssistScene::Night );
 
-    // The tracked fixture's picture at the camera's exposure: median 78-85, 88-99 % mid-tones.
+    // The band, by its edges: lit means >= 60 % mid-tones AND a median of 55..190.
+    LookAssistStats edge;
+    edge.midtoneFraction = 0.9; edge.median = 56.0;
+    ASSERT_TRUE( lookAssistPictureCorroboratesDaylight( edge ) );
+    edge.median = 54.0;
+    ASSERT_FALSE( lookAssistPictureCorroboratesDaylight( edge ) );
+    edge.median = 120.0; edge.midtoneFraction = 0.55;
+    ASSERT_FALSE( lookAssistPictureCorroboratesDaylight( edge ) );
+    edge.midtoneFraction = 0.65;
+    ASSERT_TRUE( lookAssistPictureCorroboratesDaylight( edge ) );
+    edge.median = 200.0;
+    ASSERT_FALSE( lookAssistPictureCorroboratesDaylight( edge ) );
+
+    // The tracked fixture's picture at its lift: median 77 (app profile render) / ~116 (app playback
+    // render) / 140-147 (headless), 95-99 % mid-tones.
     LookAssistStats fixture = withEv( fixtureRawStats(), 100, 465, 560 );
     int fixtureRenders = 0;
     const LookAssistScene fixtureScene = resolveLookAssistScene( &fixture, [&]( double, LookAssistStats *out ) {
         ++fixtureRenders;
-        *out = renderedPicture( 64, 64, []( int x, int y ) { return 78 + ( x + 2 * y ) % 24; } );
+        *out = renderedPicture( 64, 64, []( int x, int y ) { return 70 + ( x + 2 * y ) % 24; } );
         return true; } );
     ASSERT_EQ( 1, fixtureRenders );
     ASSERT_TRUE( fixtureScene == LookAssistScene::Shade );

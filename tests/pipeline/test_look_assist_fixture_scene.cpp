@@ -142,13 +142,22 @@ TEST(LookAssistFixtureScene, EveryTrackedFixtureClipReadsAsDaylightNotNight)
             ASSERT_TRUE( classifyLookAssistScene( stats ) == LookAssistScene::Night );
             ASSERT_TRUE( lookAssistDaylightNeedsPictureEvidence( stats, LookAssistScene::Night ) );
 
-            // The rendered picture at the camera's exposure is a lit picture (measured: median 78-85,
-            // 88-99 % in the mid-tones; the check needs >= 60 % and median 60..190): real margin.
+            // The rendered picture at the lift the daylight verdict would apply is a lit picture (measured
+            // headless: median 140-147, 95-99 % mid-tones; real app, CPU render: median ~116; the check
+            // needs >= 60 % mid-tones and median 55..190): real margin on both sides.
+            LookAssistStats hypothesis = stats;
+            hypothesis.daylightPictureEvidence = true;
+            const double plannedStops = presetForLookAssistScene( LookAssistScene::Shade, hypothesis ).exposure / 100.0;
             LookAssistStats picture;
-            ASSERT_TRUE( processedPictureStats( fixture.video(), frame, 0.0, &picture ) );
+            ASSERT_TRUE( processedPictureStats( fixture.video(), frame, plannedStops, &picture ) );
             ASSERT_TRUE( picture.midtoneFraction >= 0.85 );
-            ASSERT_TRUE( picture.median >= 70.0 && picture.median <= 100.0 );
+            ASSERT_TRUE( picture.median >= 100.0 && picture.median <= 175.0 );
             ASSERT_TRUE( lookAssistPictureCorroboratesDaylight( picture ) );
+            // ... while the same picture UNLIFTED is not what the check judges (it is the lift that
+            // separates a dim day from a dark field): at the camera's exposure it is much darker.
+            LookAssistStats unlifted;
+            ASSERT_TRUE( processedPictureStats( fixture.video(), frame, 0.0, &unlifted ) );
+            ASSERT_TRUE( unlifted.median < picture.median );
 
             LookAssistStats resolved = stats;
             const LookAssistScene scene = resolveLookAssistScene(

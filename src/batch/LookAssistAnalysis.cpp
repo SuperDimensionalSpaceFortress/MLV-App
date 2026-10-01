@@ -262,14 +262,19 @@ bool lookAssistDaylightNeedsPictureEvidence( const LookAssistStats &stats, LookA
         && ( legacyScene == LookAssistScene::Night || legacyScene == LookAssistScene::ArtificialLights );
 }
 
-bool lookAssistPictureCorroboratesDaylight( const LookAssistStats &processedAtCameraExposure )
+bool lookAssistPictureCorroboratesDaylight( const LookAssistStats &processedAtPlannedExposure )
 {
-    // Camera settings that say "bright" over a picture that is mostly dark is a bright SUBJECT in a
-    // dark scene (moon, lit stage, car lights), not daylight. A daylight exposure renders a lit
-    // picture: most pixels in the mid-tones around a mid median.
-    return processedAtCameraExposure.midtoneFraction >= 0.60
-        && processedAtCameraExposure.median >= 60.0
-        && processedAtCameraExposure.median <= 190.0;
+    // The Shade preset lifts a flat RAW thumbnail towards a mid-grey picture (target median 112). If the
+    // exposure is right that the scene is daylight, the RENDERED picture at that lift is a lit picture:
+    // most pixels in the mid-tones, median around the target. Camera settings that say "bright" over a
+    // picture that stays dark after the lift is a bright SUBJECT in a dark scene (moon, lit stage, car
+    // lights): its sky does not scale with the lift. The camera's own exposure is not a usable judge (the
+    // app's default render of the tracked daylight fixture is median 31 there). Measured at the lift on
+    // the tracked fixture: median 77 / 98.7 % mid-tones in the app's profile render, ~116 in the playback
+    // render, 140-147 headless -- so the floor sits well under all three and well over a dark field.
+    return processedAtPlannedExposure.midtoneFraction >= 0.60
+        && processedAtPlannedExposure.median >= 55.0
+        && processedAtPlannedExposure.median <= 190.0;
 }
 
 LookAssistScene resolveLookAssistScene( LookAssistStats *stats, const LookAssistRenderFn &renderProcessed )
@@ -279,8 +284,12 @@ LookAssistScene resolveLookAssistScene( LookAssistStats *stats, const LookAssist
     LookAssistScene scene = classifyLookAssistScene( *stats );
     if( renderProcessed && lookAssistDaylightNeedsPictureEvidence( *stats, scene ) )
     {
+        // Judge the daylight hypothesis at the exposure it would apply (the Shade preset's lift).
+        LookAssistStats hypothesis = *stats;
+        hypothesis.daylightPictureEvidence = true;
+        const double plannedStops = presetForLookAssistScene( classifyLookAssistScene( hypothesis ), hypothesis ).exposure / 100.0;
         LookAssistStats processed;
-        if( renderProcessed( 0.0, &processed ) && lookAssistPictureCorroboratesDaylight( processed ) )
+        if( renderProcessed( plannedStops, &processed ) && lookAssistPictureCorroboratesDaylight( processed ) )
         {
             stats->daylightPictureEvidence = true;
             scene = classifyLookAssistScene( *stats );
