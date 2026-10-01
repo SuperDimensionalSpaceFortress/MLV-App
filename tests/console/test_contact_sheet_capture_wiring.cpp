@@ -102,7 +102,8 @@ TEST(ContactSheetCaptureWiring, CaptureRunsStrictlyAfterPlaybackStopsAndAfterThe
     ASSERT_FALSE(smokeBody.isEmpty());
 
     const int timedLoopAt = smokeBody.indexOf(
-        QStringLiteral("while( playbackClock.elapsed() < durationMs && ui->actionPlay->isChecked() )"));
+        QStringLiteral("for( ;; )"),
+        smokeBody.indexOf(QStringLiteral("playback_frame_range::PlayStopState measuredState")));
     const int stopPlaybackAt = smokeBody.indexOf(QStringLiteral("ui->actionPlay->setChecked( false );"));
     const int idleDrainAt = smokeBody.indexOf(
         QStringLiteral("for( int attempt = 0; attempt < 400 && m_pRenderThread && !m_pRenderThread->isIdle(); ++attempt )"),
@@ -514,7 +515,8 @@ TEST(ContactSheetCaptureWiring, MeasuredSessionMarkerIsLoggedOnceRightAfterTheMe
     const int markerGuardAt = smokeBody.indexOf(
         QStringLiteral("if( !m_playbackSmokeMeasuredSessionLogged )"), measuredTriggerAt);
     const int timedLoopAt = smokeBody.indexOf(
-        QStringLiteral("while( playbackClock.elapsed() < durationMs && ui->actionPlay->isChecked() )"));
+        QStringLiteral("for( ;; )"),
+        smokeBody.indexOf(QStringLiteral("playback_frame_range::PlayStopState measuredState")));
     ASSERT_TRUE(measuredTriggerAt >= 0);
     ASSERT_TRUE(markerGuardAt > measuredTriggerAt);
     ASSERT_TRUE(timedLoopAt > markerGuardAt);

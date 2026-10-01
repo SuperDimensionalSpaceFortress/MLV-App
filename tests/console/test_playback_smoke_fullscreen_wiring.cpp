@@ -357,7 +357,8 @@ TEST(PlaybackSmokeFullscreenWiring, FullscreenLossMidSessionFailsClosedAfterTheD
     ASSERT_FALSE(smokeBody.isEmpty());
 
     const int loopAt = smokeBody.indexOf(
-        QStringLiteral("while( playbackClock.elapsed() < durationMs && ui->actionPlay->isChecked() )"));
+        QStringLiteral("for( ;; )"),
+        smokeBody.indexOf(QStringLiteral("playback_frame_range::PlayStopState measuredState")));
     ASSERT_TRUE(loopAt >= 0);
     const int playedMsAt = smokeBody.indexOf(
         QStringLiteral("const qint64 playedMs = playbackClock.elapsed();"), loopAt);
@@ -468,7 +469,8 @@ TEST(PlaybackSmokeFullscreenWiring, LatchIsDisarmedAtLoopExitBeforeTheGateCheckA
     ASSERT_FALSE(smokeBody.isEmpty());
 
     const int loopAt = smokeBody.indexOf(
-        QStringLiteral("while( playbackClock.elapsed() < durationMs && ui->actionPlay->isChecked() )"));
+        QStringLiteral("for( ;; )"),
+        smokeBody.indexOf(QStringLiteral("playback_frame_range::PlayStopState measuredState")));
     const int playedMsAt = smokeBody.indexOf(
         QStringLiteral("const qint64 playedMs = playbackClock.elapsed();"), loopAt);
     const int disarmAt = smokeBody.indexOf(
