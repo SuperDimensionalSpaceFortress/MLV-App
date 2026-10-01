@@ -528,6 +528,10 @@ $embeddedFunctions = Get-AttrCudaEmbeddedFunctionSource -Name @(
     'ConvertTo-AttrCudaFileIdObject',
     'Get-AttrCudaFileId',
     'Remove-AttrCudaFileById',
+    # OWNER-FOOTAGE-NO-HARDLINK-1 round 2: the creator-recorded ownership journal. Every view entry
+    # and probe file is journalled from its creating handle; Remove-AttrCudaTree -OwnedJournal
+    # deletes only what the journal names.
+    'Add-AttrCudaOwnedRecord',
     # ATTR3-FOOTAGE-BIND-1 PR-B: the owner-clip content gate. Test-AttrCudaFootagePart is the
     # SAME function Attr3FootagePresenceJob.psm1 embeds for its own probe -- one definition,
     # spliced verbatim into both, never two copies that can drift apart.
@@ -961,9 +965,37 @@ foreach ($check in @(
 # identity-checked primitive, so the recursive sweep below never meets a reparse point -- and never
 # reaches a hard link: an entry with a second name is left and the sweep then REFUSES the tree
 # (Remove-AttrCudaTree throws ATTRCUDA_TREE_HAS_HARD_LINK) rather than deleting it.
+#
+# OWNER-FOOTAGE-NO-HARDLINK-1 round 2 (hub ruling; sol r1 blockers 2 and 3): ownership is CREATOR-
+# RECORDED. Every file this job makes under $Work that a later step may delete (the view entries and
+# the capability-probe files) is created with CreateNew / without -Force, its identity read from the
+# creating handle, and journalled to $OwnerJournal before anything else is done with it. The start
+# sweep below deletes ONLY journalled entries (Remove-AttrCudaTree -OwnedJournal); an entry nobody
+# journalled -- in particular a neutral-named one a pre-#211 build left, which may be the LAST name of
+# old footage once the owner has replaced the original -- is refused and recorded, never deleted and
+# never adopted, and the directories above it stay. $Work carries a per-run stamp, so this sweep
+# normally finds nothing at all; it exists for a same-second rerun and for the legacy case.
+$OwnerJournal = Join-Path $Work '.attrcuda-owned.jsonl'
 [void](Assert-AttrCudaNoLinkBelowRoot -TrustedRoot 'C:\mlvtmp' -Path (Join-Path $Work 'owner-clip'))
-[void](Clear-AttrCudaOwnerFootageLeftovers -Directory (Join-Path $Work 'owner-clip'))
-Remove-AttrCudaTree -TrustedRoot 'C:\mlvtmp' -Path $Work
+$ownerLeftovers = @(Clear-AttrCudaOwnerFootageLeftovers -Directory (Join-Path $Work 'owner-clip') -Journal $OwnerJournal)
+$workSweep = Remove-AttrCudaTree -TrustedRoot 'C:\mlvtmp' -Path $Work -OwnedJournal $OwnerJournal
+if ($ownerLeftovers.Count -gt 0 -or $workSweep.Left.Count -gt 0) {
+    # Typed, path-free, and nothing waits on it: the hub reads the tokens; the owner decides later.
+    $workLeft = @($ownerLeftovers | ForEach-Object { [ordered]@{ kind = 'view-entry'; token = [string]$_ } }) +
+        @($workSweep.Left | ForEach-Object { [ordered]@{ kind = 'scratch-entry'; token = [string]$_.Token } })
+    [void](New-AttrCudaDirectory -Path (Join-Path $Root 'outbox'))
+    [void](New-AttrCudaDirectory -Path $Pub)
+    $workNotClean = [ordered]@{
+        schema='playback-attr-3-cuda-venue.v1'; result='OWNER_WORK_NOT_CLEAN'
+        fixtureRehearsal=$FixtureRehearsal
+        displayWake=$displayWake
+        left=@($workLeft)
+        sourceCommit=$SourceCommit; clipId=$ClipId; artifactRoot=$Pub
+    }
+    Save-Json $workNotClean (Join-Path $Pub 'summary.json')
+    Write-Output "RESULT=OWNER_WORK_NOT_CLEAN LEFT=$($workLeft.Count) ARTIFACTS=$Pub"
+    exit 28
+}
 New-Item -ItemType Directory -Path $Work -Force | Out-Null
 $Scratch = Join-Path $Work '.job-tmp'
 New-Item -ItemType Directory -Path $Scratch -Force | Out-Null
@@ -1602,7 +1634,7 @@ if ($FixtureRehearsal) {
 
     $OwnerClipDir = New-AttrCudaDirectory -Path (Join-Path $Work 'owner-clip')
     $ownerVerifiedParts = [System.Collections.Generic.List[object]]::new()
-    $ownerViewCapability = Test-AttrCudaSymlinkCapability -Directory $OwnerClipDir
+    $ownerViewCapability = Test-AttrCudaSymlinkCapability -Directory $OwnerClipDir -Journal $OwnerJournal
     $ownerViewMode = if ($ownerViewCapability.Capable) { 'symlink' } else { 'copy' }
     Write-JobTrace "footage view mode=$ownerViewMode capability=$($ownerViewCapability.Result)"
     $part = $null
@@ -1625,7 +1657,7 @@ if ($FixtureRehearsal) {
             # the original while a measurement reads its view.
             $pin = Open-AttrCudaReadOnlyHandle -Path $part.path
             [void]$ownerViewHandles.Add($pin)
-            $view = New-AttrCudaOwnerFootageView -Directory $OwnerClipDir -Index $part.index -SourcePath $part.path -PinStream $pin -Mode $ownerViewMode
+            $view = New-AttrCudaOwnerFootageView -Directory $OwnerClipDir -Index $part.index -SourcePath $part.path -PinStream $pin -Mode $ownerViewMode -Journal $OwnerJournal
             [void]$ownerViews.Add($view)
             [void]$ownerViewHandles.Add($view.ViewStream)
             $linkPath = $view.Path
@@ -2614,6 +2646,9 @@ $manifest = [ordered]@{
     sourceCommit = $SourceCommit
     clipId = $ClipId
     fixtureRehearsal = $FixtureRehearsal
+    # OWNER-FOOTAGE-NO-HARDLINK-1 round 2 (fable r1 hardening): whether the app read a verified COPY of the clip on the
+    # scratch volume or the original through a symbolic link -- it matters when pairing runs across venues.
+    ownerViewMode = $(if ($FixtureRehearsal) { $null } else { $ownerViewMode })
     # CUDA-PERF-DISPLAY-WAKE-1: the wake attempt made before MLVApp launched for this leg.
     displayWake = $displayWake
     telemetryArm = $TelemetryArm
@@ -2674,6 +2709,7 @@ Save-Json $manifest (Join-Path $Pub 'evidence-manifest.json')
 Save-Json ([ordered]@{
     result = $(if ($FixtureRehearsal) { 'FIXTURE_REHEARSAL_CAPTURED' } else { 'MEASUREMENT_CAPTURED' })
     fixtureRehearsal = $FixtureRehearsal
+    ownerViewMode = $(if ($FixtureRehearsal) { $null } else { $ownerViewMode })
     displayWake = $displayWake
     sourceCommit = $SourceCommit
     clipId = $ClipId

@@ -146,7 +146,8 @@ $embeddedFunctions = Get-AttrCudaEmbeddedFunctionSource -Name @(
     # name (Get-AttrCudaFileId reads the live link count); these three are what it stands on.
     'Initialize-AttrCudaFileIdNative',
     'ConvertTo-AttrCudaFileIdObject',
-    'Get-AttrCudaFileId'
+    'Get-AttrCudaFileId',
+    'Remove-AttrCudaFileById'
 )
 
 # --- job body template (placeholders are substituted below; the body itself never touches

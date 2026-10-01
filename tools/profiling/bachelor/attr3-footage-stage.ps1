@@ -432,23 +432,34 @@ $shareStageDir = Join-Path $shareStageRoot $job.jobId
 # attempt's to delete). This replaces the round 4 directory-pattern sweep
 # (Remove-AttrCudaOwnerFootageStagingResidue), which enumerated and deleted every part-<n>-shaped
 # entry in the directory regardless of which attempt actually wrote it.
-$createdSharePaths = New-Object System.Collections.Generic.List[string]
+# OWNER-FOOTAGE-NO-HARDLINK-1 round 2 (hub ruling; sol r1 blocker 1): each entry is { Path; Id }, where
+# Id is the volume serial + file index Send-AttrCudaOwnerFootagePartToStaging read off ITS OWN CreateNew
+# handle when it created the slot. Cleanup deletes a slot only through that identity
+# (Remove-AttrCudaFileById: share mode none, identity and a link count of one checked on the deleting
+# handle) -- never by pathname, because a pathname delete removes whatever name the path now means,
+# including a hard link to an owner's recording planted at the slot after it was created.
+$createdShareSlots = New-Object System.Collections.Generic.List[object]
 function Remove-Attr3FootageStageAttemptResidue {
-    # ATTR3-FOOTAGE-STAGE-1 round 10 (path disclosure): Remove-AttrCudaPartialFile
-    # (AttrCudaArtifacts.psm1) Write-Warnings the real path on a refused removal
-    # (ATTRCUDA_PARTIAL_OUTSIDE_TRUSTED_ROOT / ATTRCUDA_PARTIAL_NOT_A_FILE) -- suppressed here the
-    # same way Attr3FootageStageJob.psm1's own Record-PartResult already suppresses it, and a
-    # refusal is reported with a fixed token instead, never the path or the return value alone.
-    foreach ($createdPath in $createdSharePaths) {
-        $partialRemoved = Remove-AttrCudaPartialFile -TrustedRoot $shareStageRoot -Path $createdPath -WarningAction SilentlyContinue
-        if (-not $partialRemoved) {
-            Write-Output 'ATTR3_STAGE_RESIDUE_LEFT_IN_PLACE a created part slot could not be removed and was left in place'
+    # A slot that is no longer the object this attempt created (LEFT_ID_MISMATCH), that gained a second
+    # name (LEFT_MULTI_LINK) or that could not be opened (LEFT_UNAVAILABLE) is LEFT where it is and
+    # reported with a fixed token -- never a path (ATTR3-FOOTAGE-STAGE-1 round 10: no path in any
+    # branch) -- and nothing here ever adopts an identity it did not record at creation.
+    foreach ($createdSlot in $createdShareSlots) {
+        $removeToken = 'LEFT_UNAVAILABLE'
+        try {
+            [void](Assert-AttrCudaNoLinkBelowRoot -TrustedRoot $shareStageRoot -Path $createdSlot.Path)
+            $removeToken = Remove-AttrCudaFileById -Path $createdSlot.Path -FileId $createdSlot.Id
+        } catch {
+            $removeToken = 'LEFT_UNAVAILABLE'
+        }
+        if ($removeToken -ne 'DELETED' -and $removeToken -ne 'ABSENT') {
+            Write-Output "ATTR3_STAGE_RESIDUE_LEFT_IN_PLACE a created part slot could not be removed and was left in place RESULT=$removeToken"
         }
     }
     # Every created part slot is already gone (or was never this attempt's), so $shareStageDir
     # itself is removed only if that leaves it empty. Re-proves the chain link-free first (the
     # individual removals above already did, for each created path, but only when
-    # $createdSharePaths is non-empty).
+    # $createdShareSlots is non-empty).
     #
     # ATTR3-FOOTAGE-STAGE-1 round 9 (astra major): a plain `Remove-Item -Force -Confirm:$false`
     # here used to be trusted to behave like "delete only if empty" because Remove-Item without
@@ -481,8 +492,9 @@ function Remove-Attr3FootageStageAttemptResidue {
 #        (sol minor / astra 5: no stranded parts): any failure anywhere in this block -- a
 #        transfer error, a submit error, or the job itself reporting anything other than
 #        FOOTAGE_STAGED for every part it was given -- removes only the slots THIS ATTEMPT itself
-#        created (see $createdSharePaths above), and the directory itself if that leaves it empty.
+#        created (see $createdShareSlots above), and the directory itself if that leaves it empty.
 $attemptFailed = $false
+$stagedIdentities = @{}
 try {
     foreach ($part in $needsWork) {
         try {
@@ -500,8 +512,21 @@ try {
             # there; this catch adds nothing but the part index to a fixed token of its own.
             throw "ATTR3_FOOTAGE_STAGE_TRANSFER_FAILED part $($part.index)"
         }
-        if ($sendResult.Created) { $createdSharePaths.Add($sendResult.Path) }
+        if ($sendResult.Created) {
+            $createdShareSlots.Add([pscustomobject]@{ Path = $sendResult.Path; Id = $sendResult.Id })
+            $stagedIdentities[[int]$part.index] = $sendResult.Id
+        }
         Write-Output "TRANSFER PART=$($part.index) STATUS=STAGED"
+    }
+
+    # OWNER-FOOTAGE-NO-HARDLINK-1 round 2: the agent job deletes a staged copy only through the identity
+    # THIS process recorded when it created the slot, so the job is re-emitted -- under the same job id
+    # (it names the staging directory just written into) -- now carrying those identities. A part whose
+    # slot this attempt did not create has none, and the job leaves that slot alone (LEFT_UNOWNED).
+    try {
+        $job = New-Attr3FootageStageJob -ClipId $ClipId -Parts $needsWork -OutDir $stageOutDir -AgentRoot $AgentRootOnHost -ExistingJobId $job.jobId -StagedIdentities $stagedIdentities
+    } catch {
+        throw 'ATTR3_FOOTAGE_STAGE_JOB_REEMIT_FAILED the stage job could not be re-emitted with the recorded identities'
     }
 
     # ATTR3-FOOTAGE-STAGE-1 round 3 (no-path-in-any-branch): any exception um-run.ps1 itself

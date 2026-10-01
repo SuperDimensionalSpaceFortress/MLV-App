@@ -2059,8 +2059,22 @@ function Remove-AttrCudaPartialFile {
         Write-Warning "ATTRCUDA_PARTIAL_NOT_A_FILE left in place (directory or reparse point): $Path"
         return $false
     }
-    Remove-Item -LiteralPath $Path -Force -Confirm:$false -ErrorAction SilentlyContinue
-    return (-not (Test-Path -LiteralPath $Path))
+    # OWNER-FOOTAGE-NO-HARDLINK-1 round 2: NOT a pathname delete. The name's identity is read and the
+    # delete is made through ONE handle (Remove-AttrCudaFileById: DELETE access, share none, identity
+    # and a link count of one re-checked on that handle), so a name swapped for a hard link to
+    # anything else between this read and the delete is left, never removed. This function only ever
+    # reaches build-route .partial slots that the same job created; a staged owner-footage part is
+    # deleted by its CREATOR-RECORDED identity instead (Remove-AttrCudaFileById with the id read off
+    # the creating handle) and never comes through here.
+    try {
+        $seen = Get-AttrCudaFileId -Path $Path
+        $token = Remove-AttrCudaFileById -Path $Path -FileId $seen
+    } catch {
+        $token = 'LEFT_UNAVAILABLE'
+    }
+    if ($token -eq 'DELETED' -or $token -eq 'ABSENT') { return $true }
+    Write-Warning "ATTRCUDA_PARTIAL_LEFT $token left in place: $Path"
+    return $false
 }
 
 function Assert-AttrCudaNoLinkBelowRoot {
@@ -2101,56 +2115,207 @@ function Assert-AttrCudaNoLinkBelowRoot {
     return $full
 }
 
+function Add-AttrCudaOwnedRecord {
+    <#
+    .SYNOPSIS
+    Append ONE creator-recorded ownership line to a job's journal, durably, before the caller does
+    anything else with the file it just created.
+    .DESCRIPTION
+    OWNER-FOOTAGE-NO-HARDLINK-1 round 2 (hub ruling). Ownership of a name is a fact about how it came
+    to exist, never about what a scan later finds: the ONLY files a job may delete are the ones it
+    created itself, and it proves that by reading the file object's volume serial + 64-bit file index
+    off the very handle that CREATED it (Get-AttrCudaFileId -Stream, FileMode.CreateNew) and
+    journalling that identity here. An identity first SEEN later -- by a sweep, by an adoption pass --
+    never confers ownership: a name that merely looks like ours may be the last name of old footage
+    (a hard link an older build left, whose other name the owner has since replaced), and
+    NumberOfLinks = 1 cannot tell the difference.
+    The line is {p = path relative to the journal's directory, v/h/l = the identity, r = the name is a
+    symbolic link this caller created}. The append is flushed through to disk before this returns,
+    and a failure THROWS: a caller that cannot record a file it just made must remove it by identity
+    and fail, not carry on holding an unrecorded file. Remove-AttrCudaTree -OwnedJournal reads this.
+    #>
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $true)][string]$Journal,
+        [Parameter(Mandatory = $true)][string]$Path,
+        [Parameter(Mandatory = $true)]$FileId,
+        [switch]$IsReparsePoint
+    )
+
+    $journalDir = [IO.Path]::GetDirectoryName([IO.Path]::GetFullPath($Journal)).TrimEnd('\')
+    $full = [IO.Path]::GetFullPath($Path)
+    if (-not $full.StartsWith($journalDir + '\', [StringComparison]::OrdinalIgnoreCase)) {
+        throw 'ATTRCUDA_OWNED_RECORD_OUTSIDE_JOURNAL_DIRECTORY the recorded path is not under the journal directory'
+    }
+    $line = ([ordered]@{
+        p = $full.Substring($journalDir.Length + 1)
+        v = [uint32]$FileId.VolumeSerialNumber
+        h = [uint32]$FileId.FileIndexHigh
+        l = [uint32]$FileId.FileIndexLow
+        r = [bool]$IsReparsePoint
+    } | ConvertTo-Json -Compress) + "`n"
+    $bytes = [Text.UTF8Encoding]::new($false).GetBytes($line)
+    $stream = [IO.FileStream]::new([IO.Path]::GetFullPath($Journal), [IO.FileMode]::Append, [IO.FileAccess]::Write, [IO.FileShare]::Read, 4096, [IO.FileOptions]::WriteThrough)
+    try {
+        $stream.Write($bytes, 0, $bytes.Length)
+        $stream.Flush($true)
+    } finally {
+        $stream.Dispose()
+    }
+}
+
 function Remove-AttrCudaTree {
     <#
     .SYNOPSIS
-    Recursively delete a job-owned directory under a trusted root, refusing if ANY component between
-    the root and the directory, or any entry inside it, is a reparse point.
+    Empty and remove a job-owned directory under a trusted root WITHOUT a recursive pathname delete:
+    every file goes through Remove-AttrCudaFileById (check and delete on one handle), directories go
+    only when empty, and anything that is not provably this job's is left where it is.
     .DESCRIPTION
     The ancestor chain is checked FIRST (Assert-AttrCudaNoLinkBelowRoot), even when the directory is
-    absent, so a linked parent can never steer the delete (sol PR #133 r6). The walk then does not
-    descend into reparse points; if one is found the function throws ATTRCUDA_TREE_HAS_REPARSE_POINT
-    and deletes nothing. Only a tree proved free of links is handed to Remove-Item -Recurse.
-    OWNER-FOOTAGE-NO-HARDLINK-1: a FILE with a second hard link is a link too. A recursive delete
-    removes every name under the tree, so a name in here that is also a name of a file OUTSIDE the
-    tree -- and possibly its last -- would be destroyed with the tree. The walk therefore reads each
-    file's live link count (Get-AttrCudaFileId, the name itself, never followed) and throws
-    ATTRCUDA_TREE_HAS_HARD_LINK, deleting nothing, when any file has more than one name; a file
-    whose identity cannot be read throws ATTRCUDA_TREE_FILE_ID_UNAVAILABLE. No code in this
-    repository creates such a link (tools/repo_hygiene/test_owner_footage_no_hardlink_class.py), so
-    this is the backstop for one that arrived some other way.
+    absent, so a linked parent can never steer the delete (sol PR #133 r6).
+    OWNER-FOOTAGE-NO-HARDLINK-1 round 2 (sol r1 blocker 3). The previous shape scanned the tree and
+    then handed it to `Remove-Item -Recurse`: the scan's link count was stale by the time the delete
+    ran, and a one-link file that is the LAST name of old footage (a legacy hard link, after the
+    owner replaced the original) passed it. There is no scan-then-delete interval any more, and no
+    Remove-Item at all.
+      -OwnedJournal <path>   JOURNALLED mode, the only mode any tree that can hold an owner-footage
+        name or a job copy of one may use. A file is deleted only when the journal (Add-AttrCudaOwned-
+        Record, written at creation from the creating handle) names it AND its identity on the
+        deleting handle is the journalled one AND it has exactly one name. Every other entry is
+        LEFT and reported -- LEFT_UNOWNED (not journalled: never adopted), LEFT_MULTI_LINK, LEFT_ID_
+        MISMATCH, LEFT_NOT_A_FILE, LEFT_UNAVAILABLE -- and the directories above it stay. Returns
+        { Removed; Left = @({ Name; Rel; Token }); TreeRemoved }; throws nothing about leftovers, the
+        caller decides what a non-empty result means.
+      (no journal)           BUILD-SCRATCH mode, for the build-route jobs' own scratch (assembler,
+        stage, DLL-pair, fixture, smoke-runner), into which no owner-footage path ever flows and which
+        no legacy owner artifact ever lived in. Refuses the whole tree up front, deleting nothing, if
+        it holds a reparse point (ATTRCUDA_TREE_HAS_REPARSE_POINT), a file whose identity cannot be
+        read, or a file with a second name (ATTRCUDA_TREE_HAS_HARD_LINK); then deletes file by file
+        through the same handle primitive (a name swapped for a hard link after the up-front read is
+        left, not deleted) and throws ATTRCUDA_TREE_NOT_EMPTIED if anything could not go. Returns
+        nothing, as before. Residual, stated: first-seen identity is accepted here, which is why no
+        owner-footage-capable caller may use this mode (tools/repo_hygiene/test_owner_footage_
+        no_hardlink_class.py pins it).
     #>
     [CmdletBinding()]
     param(
         [Parameter(Mandatory = $true)][string]$TrustedRoot,
-        [Parameter(Mandatory = $true)][string]$Path
+        [Parameter(Mandatory = $true)][string]$Path,
+        [string]$OwnedJournal = ''
     )
 
     $Path = Assert-AttrCudaNoLinkBelowRoot -TrustedRoot $TrustedRoot -Path $Path
+    $journalled = -not [string]::IsNullOrEmpty($OwnedJournal)
     $root = Get-Item -LiteralPath $Path -Force -ErrorAction SilentlyContinue
-    if ($null -eq $root) { return }
+    if ($null -eq $root) {
+        if ($journalled) { return [pscustomobject]@{ Removed = 0; Left = @(); TreeRemoved = $true } }
+        return
+    }
+
+    $journalFull = ''
+    $journalDir = ''
+    $records = @{}
+    if ($journalled) {
+        $journalFull = [IO.Path]::GetFullPath($OwnedJournal)
+        $journalDir = [IO.Path]::GetDirectoryName($journalFull).TrimEnd('\')
+        if (Test-Path -LiteralPath $journalFull -PathType Leaf) {
+            foreach ($line in [IO.File]::ReadAllLines($journalFull)) {
+                if ([string]::IsNullOrWhiteSpace($line)) { continue }
+                try { $record = $line | ConvertFrom-Json } catch { continue }
+                $records[([string]$record.p).ToLowerInvariant()] = $record
+            }
+        }
+    }
+
+    # Enumerate once, without descending into a reparse point.
+    $ordered = [System.Collections.Generic.List[System.IO.FileSystemInfo]]::new()
     $stack = [System.Collections.Generic.Stack[System.IO.FileSystemInfo]]::new()
     $stack.Push($root)
     while ($stack.Count -gt 0) {
         $entry = $stack.Pop()
-        if (($entry.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) {
-            throw "ATTRCUDA_TREE_HAS_REPARSE_POINT $($entry.FullName) (refusing to delete $Path)"
-        }
-        if ($entry -is [System.IO.DirectoryInfo]) {
+        [void]$ordered.Add($entry)
+        $isReparse = (($entry.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0)
+        if ($entry -is [System.IO.DirectoryInfo] -and -not $isReparse) {
             foreach ($child in $entry.EnumerateFileSystemInfos()) { $stack.Push($child) }
-        } else {
-            $fileId = $null
-            try {
-                $fileId = Get-AttrCudaFileId -Path $entry.FullName
-            } catch {
-                throw "ATTRCUDA_TREE_FILE_ID_UNAVAILABLE $($entry.FullName) (refusing to delete $Path)"
+        }
+    }
+
+    if (-not $journalled) {
+        foreach ($entry in $ordered) {
+            if (($entry.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) {
+                throw "ATTRCUDA_TREE_HAS_REPARSE_POINT $($entry.FullName) (refusing to delete $Path)"
             }
-            if ($fileId.NumberOfLinks -gt 1) {
-                throw "ATTRCUDA_TREE_HAS_HARD_LINK $($entry.FullName) has $($fileId.NumberOfLinks) names (refusing to delete $Path)"
+            if ($entry -isnot [System.IO.DirectoryInfo]) {
+                $fileId = $null
+                try {
+                    $fileId = Get-AttrCudaFileId -Path $entry.FullName
+                } catch {
+                    throw "ATTRCUDA_TREE_FILE_ID_UNAVAILABLE $($entry.FullName) (refusing to delete $Path)"
+                }
+                if ($fileId.NumberOfLinks -gt 1) {
+                    throw "ATTRCUDA_TREE_HAS_HARD_LINK $($entry.FullName) has $($fileId.NumberOfLinks) names (refusing to delete $Path)"
+                }
             }
         }
     }
-    Remove-Item -LiteralPath $Path -Recurse -Force -Confirm:$false
+
+    $removed = 0
+    $left = [System.Collections.Generic.List[object]]::new()
+    $failedToken = ''
+    for ($i = $ordered.Count - 1; $i -ge 1; $i--) {
+        $entry = $ordered[$i]
+        $isReparse = (($entry.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0)
+        if ($journalled -and [string]::Equals($entry.FullName, $journalFull, [StringComparison]::OrdinalIgnoreCase)) { continue }
+        if ($entry -is [System.IO.DirectoryInfo] -and -not $isReparse) {
+            try { [IO.Directory]::Delete($entry.FullName, $false) } catch { }
+            continue
+        }
+        $token = ''
+        if ($journalled) {
+            $rel = ''
+            if ($entry.FullName.StartsWith($journalDir + '\', [StringComparison]::OrdinalIgnoreCase)) { $rel = $entry.FullName.Substring($journalDir.Length + 1) }
+            $record = $null
+            if ($rel -ne '') { $record = $records[$rel.ToLowerInvariant()] }
+            if ($null -eq $record) {
+                $token = 'LEFT_UNOWNED'
+                try { if ((Get-AttrCudaFileId -Path $entry.FullName).NumberOfLinks -gt 1) { $token = 'LEFT_MULTI_LINK' } } catch { }
+            } else {
+                $recorded = [pscustomobject]@{ VolumeSerialNumber = [uint32]$record.v; FileIndexHigh = [uint32]$record.h; FileIndexLow = [uint32]$record.l }
+                $token = Remove-AttrCudaFileById -Path $entry.FullName -FileId $recorded -ExpectReparsePoint:([bool]$record.r)
+            }
+            if ($token -eq 'DELETED' -or $token -eq 'ABSENT') { $removed++ } else {
+                [void]$left.Add([pscustomobject]@{ Name = $entry.Name; Rel = $rel; Token = $token })
+            }
+        } else {
+            try {
+                $seen = Get-AttrCudaFileId -Path $entry.FullName
+                $token = Remove-AttrCudaFileById -Path $entry.FullName -FileId $seen
+            } catch {
+                $token = 'LEFT_UNAVAILABLE'
+            }
+            if ($token -eq 'DELETED' -or $token -eq 'ABSENT') { $removed++ } elseif ($failedToken -eq '') { $failedToken = $token }
+        }
+    }
+
+    # The journal is this job's own bookkeeping file at a fixed name: it goes last, and only when
+    # nothing else is left standing that it describes.
+    if ($journalled -and $left.Count -eq 0 -and (Test-Path -LiteralPath $journalFull -PathType Leaf)) {
+        try {
+            $journalId = Get-AttrCudaFileId -Path $journalFull
+            [void](Remove-AttrCudaFileById -Path $journalFull -FileId $journalId)
+        } catch { }
+    }
+    if ($journalled -or $failedToken -eq '') {
+        try { [IO.Directory]::Delete($root.FullName, $false) } catch { }
+    }
+    $treeRemoved = -not (Test-Path -LiteralPath $Path)
+    if ($journalled) {
+        return [pscustomobject]@{ Removed = $removed; Left = @($left); TreeRemoved = $treeRemoved }
+    }
+    if (-not $treeRemoved) {
+        $reason = if ($failedToken -ne '') { $failedToken } else { 'LEFT_UNAVAILABLE' }
+        throw "ATTRCUDA_TREE_NOT_EMPTIED $reason (refusing to report $Path removed)"
+    }
 }
 
 function Initialize-AttrCudaFileIdNative {
@@ -2192,6 +2357,18 @@ function Initialize-AttrCudaFileIdNative {
         [System.Runtime.InteropServices.MarshalAs(System.Runtime.InteropServices.UnmanagedType.U1)]
         public bool DeleteFile;
     }
+
+    [System.Runtime.InteropServices.StructLayout(System.Runtime.InteropServices.LayoutKind.Sequential)]
+    public struct FileBasicInfo {
+        public long CreationTime;
+        public long LastAccessTime;
+        public long LastWriteTime;
+        public long ChangeTime;
+        public uint FileAttributes;
+    }
+
+    [System.Runtime.InteropServices.DllImport("kernel32.dll", SetLastError = true)]
+    public static extern bool SetFileInformationByHandle(System.IntPtr hFile, int fileInformationClass, ref FileBasicInfo lpFileInformation, uint dwBufferSize);
 
     [System.Runtime.InteropServices.DllImport("kernel32.dll", SetLastError = true, CharSet = System.Runtime.InteropServices.CharSet.Unicode)]
     public static extern System.IntPtr CreateFileW(string lpFileName, uint dwDesiredAccess, uint dwShareMode, System.IntPtr lpSecurityAttributes, uint dwCreationDisposition, uint dwFlagsAndAttributes, System.IntPtr hTemplateFile);
@@ -2266,8 +2443,16 @@ function Get-AttrCudaFileId {
         $openExisting = [uint32]3
         $flags = [uint32]0x02000000
         if (-not $FollowLinks) { $flags = [uint32]($flags -bor [uint32]0x00200000) }
+        # fable r1 (ATTRCUDA-FILE-ID-LONG-PATH-1): CreateFileW refuses a path of 260+ characters unless it
+        # carries the extended-length prefix, and Remove-Item -Recurse used to succeed there where the
+        # identity-checked tree delete would otherwise refuse with ATTRCUDA_TREE_FILE_ID_UNAVAILABLE.
+        $nativePath = $Path
+        if ($nativePath.Length -ge 240 -and -not $nativePath.StartsWith('\\?\')) {
+            $nativePath = [IO.Path]::GetFullPath($nativePath)
+            if ($nativePath.StartsWith('\\')) { $nativePath = '\\?\UNC\' + $nativePath.Substring(2) } else { $nativePath = '\\?\' + $nativePath }
+        }
         $handle = [AttrCudaWin32.FileIdNative]::CreateFileW(
-            $Path, $readAttributes, $shareAll, [IntPtr]::Zero, $openExisting, $flags, [IntPtr]::Zero)
+            $nativePath, $readAttributes, $shareAll, [IntPtr]::Zero, $openExisting, $flags, [IntPtr]::Zero)
         if ($handle -eq [IntPtr]::new(-1)) {
             throw "ATTRCUDA_FILE_ID_UNAVAILABLE CreateFileW failed (Win32 error $([Runtime.InteropServices.Marshal]::GetLastWin32Error()))"
         }
@@ -2300,7 +2485,7 @@ function Remove-AttrCudaFileById {
     disposition on the same handle. The caller must already have closed its own handles to the
     name (a DELETE open honours their share mode).
     Tokens: DELETED, ABSENT, LEFT_ID_MISMATCH (a different object now owns the name),
-    LEFT_LINKED (the object has another name, so this delete could be one of its last),
+    LEFT_MULTI_LINK (the object has another name, so this delete could be one of its last),
     LEFT_NOT_A_FILE (a directory, or a reparse point when -ExpectReparsePoint is not given),
     LEFT_UNAVAILABLE (any other failure, including a sharing violation). Anything but DELETED or
     ABSENT leaves the name exactly where it is; the caller records it and moves on.
@@ -2318,11 +2503,25 @@ function Remove-AttrCudaFileById {
         Initialize-AttrCudaFileIdNative
         $deleteAccess = [uint32]0x00010000
         $readAttributes = [uint32]0x80
-        $shareAll = [uint32]0x00000007
+        $writeAttributes = [uint32]0x100
+        # Share mode 0 (round 2): while this handle is open NOBODY else can open the name -- not to
+        # read, not to write, not to delete or rename it, and not to add a hard link to it (creating
+        # a link opens the existing file) -- so the link count read below stays true until the delete
+        # lands. With FILE_SHARE_DELETE-style sharing another process could add a second name between
+        # the check and the delete.
+        $shareNone = [uint32]0
         $openExisting = [uint32]3
         $flags = [uint32](0x02000000 -bor 0x00200000)
+        # fable r1 (ATTRCUDA-FILE-ID-LONG-PATH-1): CreateFileW refuses a path of 260+ characters unless it
+        # carries the extended-length prefix, and Remove-Item -Recurse used to succeed there where the
+        # identity-checked tree delete would otherwise refuse with ATTRCUDA_TREE_FILE_ID_UNAVAILABLE.
+        $nativePath = $Path
+        if ($nativePath.Length -ge 240 -and -not $nativePath.StartsWith('\\?\')) {
+            $nativePath = [IO.Path]::GetFullPath($nativePath)
+            if ($nativePath.StartsWith('\\')) { $nativePath = '\\?\UNC\' + $nativePath.Substring(2) } else { $nativePath = '\\?\' + $nativePath }
+        }
         $handle = [AttrCudaWin32.FileIdNative]::CreateFileW(
-            $Path, [uint32]($deleteAccess -bor $readAttributes), $shareAll, [IntPtr]::Zero, $openExisting, $flags, [IntPtr]::Zero)
+            $nativePath, [uint32]($deleteAccess -bor $readAttributes -bor $writeAttributes), $shareNone, [IntPtr]::Zero, $openExisting, $flags, [IntPtr]::Zero)
         if ($handle -eq [IntPtr]::new(-1)) {
             $error32 = [Runtime.InteropServices.Marshal]::GetLastWin32Error()
             if ($error32 -eq 2 -or $error32 -eq 3) { return 'ABSENT' }
@@ -2340,10 +2539,22 @@ function Remove-AttrCudaFileById {
             if ($id.VolumeSerialNumber -ne $FileId.VolumeSerialNumber -or
                 $id.FileIndexHigh -ne $FileId.FileIndexHigh -or
                 $id.FileIndexLow -ne $FileId.FileIndexLow) { return 'LEFT_ID_MISMATCH' }
-            if ($id.NumberOfLinks -ne 1) { return 'LEFT_LINKED' }
+            if ($id.NumberOfLinks -ne 1) { return 'LEFT_MULTI_LINK' }
             $disposition = [AttrCudaWin32.FileIdNative+FileDispositionInfo]::new()
             $disposition.DeleteFile = $true
-            if (-not [AttrCudaWin32.FileIdNative]::SetFileInformationByHandle($handle, 4, [ref]$disposition, [uint32]1)) { return 'LEFT_UNAVAILABLE' }
+            if (-not [AttrCudaWin32.FileIdNative]::SetFileInformationByHandle($handle, 4, [ref]$disposition, [uint32]1)) {
+                # A read-only file refuses the delete disposition. It is the verified object (identity
+                # and one name checked above, on this handle), so clear the flag on THIS handle -- never
+                # by path -- and retry once.
+                $readOnly = [uint32]1
+                if (($id.FileAttributes -band $readOnly) -eq 0) { return 'LEFT_UNAVAILABLE' }
+                $basic = [AttrCudaWin32.FileIdNative+FileBasicInfo]::new()
+                $newAttributes = [uint32]($id.FileAttributes -band (-bnot $readOnly))
+                if ($newAttributes -eq 0) { $newAttributes = [uint32]0x80 }
+                $basic.FileAttributes = $newAttributes
+                if (-not [AttrCudaWin32.FileIdNative]::SetFileInformationByHandle($handle, 0, [ref]$basic, [uint32]40)) { return 'LEFT_UNAVAILABLE' }
+                if (-not [AttrCudaWin32.FileIdNative]::SetFileInformationByHandle($handle, 4, [ref]$disposition, [uint32]1)) { return 'LEFT_UNAVAILABLE' }
+            }
             return 'DELETED'
         } finally {
             [void][AttrCudaWin32.FileIdNative]::CloseHandle($handle)
@@ -5225,6 +5436,7 @@ Export-ModuleMember -Function `
     Remove-AttrCudaPartialFile, `
     Assert-AttrCudaNoLinkBelowRoot, `
     Remove-AttrCudaTree, `
+    Add-AttrCudaOwnedRecord, `
     Initialize-AttrCudaFileIdNative, `
     ConvertTo-AttrCudaFileIdObject, `
     Get-AttrCudaFileId, `

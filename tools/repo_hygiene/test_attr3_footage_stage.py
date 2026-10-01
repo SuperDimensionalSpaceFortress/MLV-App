@@ -285,10 +285,51 @@ class FootageStageJobTests(unittest.TestCase):
         return d
 
     def stage_all_parts(self, stage_dir: Path) -> None:
+        # OWNER-FOOTAGE-NO-HARDLINK-1 round 2: this test plays the SUBMITTER, who creates each slot and
+        # records its identity at creation (Send-AttrCudaOwnerFootagePartToStaging returns it as .Id);
+        # the job it then runs deletes a staged copy only through that recorded identity.
         for i, content in enumerate(self.content):
             (stage_dir / f"part-{i}").write_bytes(content)
+        self._creator_ids = getattr(self, "_creator_ids", {})
+        self._creator_ids[stage_dir.name] = self._read_ids(stage_dir)
+
+    def _read_ids(self, stage_dir: Path) -> dict:
+        names = [f"part-{i}" for i in range(len(self.content))]
+        script = (
+            "$ErrorActionPreference = 'Stop'\n"
+            f"Import-Module '{ARTIFACTS_MODULE}' -Force\n"
+            "$o = [ordered]@{}\n"
+            + "".join(
+                f"$i = Get-AttrCudaFileId -Path '{stage_dir / n}'; $o['{n}'] = @{{ v = [int64]$i.VolumeSerialNumber; h = [int64]$i.FileIndexHigh; l = [int64]$i.FileIndexLow }}\n"
+                for n in names
+            )
+            + "$o | ConvertTo-Json -Compress -Depth 4\n"
+        )
+        proc = _run(["-Command", script])
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        return json.loads(proc.stdout.strip().splitlines()[-1])
+
+    def _with_creator_ids(self, job: Path) -> None:
+        """Rewrite the job spec in place to carry the creator-recorded identities (what the real CLI does
+        by re-emitting the job under the same id after its transfers)."""
+        ids = getattr(self, "_creator_ids", {}).get(job.name[: -len(".job.ps1")])
+        if not ids:
+            return
+        text = job.read_text(encoding="utf-8")
+        match = re.search(r"^\$PartsJson = '(.*)'$", text, re.MULTILINE)
+        self.assertIsNotNone(match)
+        parts = json.loads(match.group(1))
+        for part in parts:
+            recorded = ids.get(f"part-{part['index']}")
+            if recorded:
+                part["stagedId"] = recorded
+        job.write_text(
+            text[: match.start(1)] + json.dumps(parts, separators=(",", ":")) + text[match.end(1):],
+            encoding="utf-8",
+        )
 
     def run_job(self, job: Path) -> subprocess.CompletedProcess:
+        self._with_creator_ids(job)
         return _run(["-File", str(job)])
 
     def _assert_no_token(self, *texts: str) -> None:
@@ -547,15 +588,89 @@ class FootageStageJobTests(unittest.TestCase):
 
         self.assertEqual(run.returncode, 0, run.stdout + run.stderr)
         self.assertIn("PART=0 STATUS=PLACED", run.stdout)
-        self.assertIn("LEFTOVER PART=0 KIND=staged RESULT=LEFT_NO_IDENTITY", run.stdout)
+        self.assertIn("LEFTOVER PART=0 KIND=staged RESULT=LEFT_ID_MISMATCH", run.stdout)
         self.assertTrue((stage_dir / "part-0").is_file())
         self.assertEqual(owner_original.read_bytes(), self.content[0])
         self.assertEqual((stage_dir / "part-0").read_bytes(), self.content[0])
         self.assertEqual(os.stat(owner_original).st_nlink, 2)
         self.assertFalse((stage_dir / "part-1").exists(), "a lone staged copy is still cleaned")
         payload = json.loads(run.stdout.strip().splitlines()[-1])
-        self.assertEqual(payload["leftovers"], [{"index": 0, "kind": "staged", "result": "LEFT_NO_IDENTITY"}])
+        self.assertEqual(payload["leftovers"], [{"index": 0, "kind": "staged", "result": "LEFT_ID_MISMATCH"}])
         self._assert_no_token(run.stdout, run.stderr)
+
+    def test_a_staged_slot_that_is_the_last_name_of_old_footage_is_never_adopted_or_deleted(self) -> None:
+        # sol r1 blocker 2 (OWNER-FOOTAGE-NO-HARDLINK-1 round 2): the job used to ADOPT the first-seen
+        # identity of a one-name staged slot. Here part-0's slot is a hard link to an old recording whose
+        # other name is gone (the owner re-recorded the original) -- one name, bytes that hash to the
+        # expected content -- so the first-seen rule read it as "a copy this job may delete" and removed
+        # the last name of the old recording. The slot's identity now comes from the SUBMITTER's record
+        # of what it created; this one is a different file object, so it is LEFT and recorded.
+        proc = self.build()
+        job = self.job_path(proc)
+        stage_dir = self.stage_dir(job.name[: -len(".job.ps1")])
+        self.stage_all_parts(stage_dir)
+        old_recording = self.tmp / "old-recording.raw"
+        old_recording.write_bytes(self.content[0])
+        (stage_dir / "part-0").unlink()
+        os.link(old_recording, stage_dir / "part-0")
+        old_recording.unlink()
+        old_recording.write_bytes(b"the owner's new recording at the same name")
+        self.assertEqual(os.stat(stage_dir / "part-0").st_nlink, 1)
+
+        run = self.run_job(job)
+
+        self.assertEqual(run.returncode, 0, run.stdout + run.stderr)
+        self.assertIn("PART=0 STATUS=PLACED", run.stdout)
+        self.assertIn("LEFTOVER PART=0 KIND=staged RESULT=LEFT_ID_MISMATCH", run.stdout)
+        self.assertEqual((stage_dir / "part-0").read_bytes(), self.content[0], "the last name of the old recording was deleted")
+        self.assertFalse((stage_dir / "part-1").exists(), "the slot the submitter created is still cleaned")
+        self._assert_no_token(run.stdout, run.stderr)
+
+    def test_without_a_recorded_identity_no_staged_slot_is_ever_deleted_not_even_a_lone_one(self) -> None:
+        # A part the submitter did not create (no stagedId in the spec) is not the job's to delete, and
+        # nothing is adopted by looking at the file: both slots survive and are recorded LEFT_UNOWNED.
+        proc = self.build()
+        job = self.job_path(proc)
+        stage_dir = self.stage_dir(job.name[: -len(".job.ps1")])
+        for i, content in enumerate(self.content):
+            (stage_dir / f"part-{i}").write_bytes(content)
+
+        run = self.run_job(job)
+
+        self.assertEqual(run.returncode, 0, run.stdout + run.stderr)
+        self.assertIn("LEFTOVER PART=0 KIND=staged RESULT=LEFT_UNOWNED", run.stdout)
+        self.assertIn("LEFTOVER PART=1 KIND=staged RESULT=LEFT_UNOWNED", run.stdout)
+        for i, content in enumerate(self.content):
+            self.assertEqual((stage_dir / f"part-{i}").read_bytes(), content)
+        payload = json.loads(run.stdout.strip().splitlines()[-1])
+        self.assertEqual(
+            payload["leftovers"],
+            [{"index": 0, "kind": "staged", "result": "LEFT_UNOWNED"}, {"index": 1, "kind": "staged", "result": "LEFT_UNOWNED"}])
+
+    def test_the_job_can_be_re_emitted_under_the_same_id_carrying_the_recorded_identities(self) -> None:
+        proc = self.build()
+        job = self.job_path(proc)
+        job_id = job.name[: -len(".job.ps1")]
+        before = job.read_text(encoding="utf-8")
+        parts_json_path = self.tmp / "parts-reemit.json"
+        parts_json_path.write_text(json.dumps(self.parts_payload), encoding="utf-8")
+        script = (
+            f"Import-Module '{STAGE_MODULE}' -Force; "
+            f"$parts = @(Get-Content -LiteralPath '{parts_json_path}' -Raw | ConvertFrom-Json); "
+            "$ids = @{ 1 = [pscustomobject]@{ VolumeSerialNumber = 4000000000; FileIndexHigh = 7; FileIndexLow = 4294967295 } }; "
+            f"New-Attr3FootageStageJob -ClipId '{self.clip_id}' -Parts $parts -OutDir '{self.out}' "
+            f"-AgentRoot '{self.agent_root}' -ExistingJobId '{job_id}' -StagedIdentities $ids"
+        )
+        again = _run(["-Command", script])
+        self.assertEqual(again.returncode, 0, again.stdout + again.stderr)
+        self.assertEqual(sorted(p.name for p in self.out.glob("*.job.ps1")), [job.name], "same id, same file")
+        text = job.read_text(encoding="utf-8")
+        self.assertNotEqual(text, before)
+        match = re.search(r"^\$PartsJson = '(.*)'$", text, re.MULTILINE)
+        parts = json.loads(match.group(1))
+        self.assertNotIn("stagedId", parts[0])
+        self.assertEqual(parts[1]["stagedId"], {"v": 4000000000, "h": 7, "l": 4294967295})
+        self._assert_no_token(again.stdout, again.stderr)
 
     def test_a_clean_run_reports_no_leftovers(self) -> None:
         proc = self.build()
@@ -997,10 +1112,16 @@ class EndToEndTransferIdempotenceTests(unittest.TestCase):
         stage_out_dir = self.tmp / f"stage-out-{time.monotonic_ns()}"
         parts_json_path = self.tmp / f"stage-parts-{time.monotonic_ns()}.json"
         parts_json_path.write_text(json.dumps(self.parts), encoding="utf-8")
-        transfers = "\n".join(
-            f"Send-AttrCudaOwnerFootagePartToStaging -SourcePath '{src}' -StagingDirectory $shareStageDir "
-            f"-Index {part['index']} -ExpectedLength {part['length']} -ExpectedSha256 '{part['sha256']}' | Out-Null"
+        # Like the real CLI: each slot's identity is recorded off the creating handle (.Id) and the job is
+        # re-emitted under the same id carrying them (OWNER-FOOTAGE-NO-HARDLINK-1 round 2).
+        transfers = "$stagedIdentities = @{}\n" + "\n".join(
+            f"$sent = Send-AttrCudaOwnerFootagePartToStaging -SourcePath '{src}' -StagingDirectory $shareStageDir "
+            f"-Index {part['index']} -ExpectedLength {part['length']} -ExpectedSha256 '{part['sha256']}'\n"
+            f"if ($sent.Created) {{ $stagedIdentities[{part['index']}] = $sent.Id }}"
             for src, part in zip(self.source, self.parts)
+        ) + (
+            f"\n$job = New-Attr3FootageStageJob -ClipId 'FIX-E2E-0001' -Parts $parts -OutDir '{stage_out_dir}' "
+            f"-AgentRoot '{self.share}' -ExistingJobId $job.jobId -StagedIdentities $stagedIdentities"
         )
         return self._run_ps1(
             "$ErrorActionPreference = 'Stop'\n"
@@ -1155,6 +1276,7 @@ class EndToEndTransferIdempotenceTests(unittest.TestCase):
             f"-ExpectedSha256 '{_sha256(self.content[0])}'\n"
             "Write-Output ('CREATED=' + $result.Created)\n"
             "Write-Output ('PATH=' + $result.Path)\n"
+            "Write-Output ('ID=' + $result.Id.VolumeSerialNumber + ':' + $result.Id.FileIndexHigh + ':' + $result.Id.FileIndexLow)\n"
         )
         self.assertEqual(proc0.returncode, 0, proc0.stdout + proc0.stderr)
         self.assertIn("CREATED=True", proc0.stdout)
@@ -1162,6 +1284,9 @@ class EndToEndTransferIdempotenceTests(unittest.TestCase):
         created_path = next(
             line.split("PATH=", 1)[1] for line in proc0.stdout.splitlines() if line.startswith("PATH=")
         )
+        created_id = next(
+            line.split("ID=", 1)[1] for line in proc0.stdout.splitlines() if line.startswith("ID=")
+        ).split(":")
 
         # Part 1's transfer fails source verification (wrong expected hash) -- the CLI's own step
         # 5 throws ATTR3_FOOTAGE_STAGE_TRANSFER_FAILED here and never reaches the submit step.
@@ -1181,11 +1306,13 @@ class EndToEndTransferIdempotenceTests(unittest.TestCase):
         cleanup = self._run_ps1(
             "$ErrorActionPreference = 'Stop'\n"
             f"Import-Module '{ARTIFACTS_MODULE}' -Force\n"
-            f"[void](Remove-AttrCudaPartialFile -TrustedRoot '{share_stage_root}' -Path '{created_path}')\n"
+            f"$token = Remove-AttrCudaFileById -Path '{created_path}' -FileId ([pscustomobject]@{{ VolumeSerialNumber = [uint32]{created_id[0]}; FileIndexHigh = [uint32]{created_id[1]}; FileIndexLow = [uint32]{created_id[2]} }})\n"
+            "Write-Output ('TOKEN=' + $token)\n"
             f"if ((Test-Path -LiteralPath '{share_stage_dir}' -PathType Container -ErrorAction SilentlyContinue)) "
             f"{{ Remove-Item -LiteralPath '{share_stage_dir}' -Force -Confirm:$false -ErrorAction SilentlyContinue }}\n"
         )
         self.assertEqual(cleanup.returncode, 0, cleanup.stdout + cleanup.stderr)
+        self.assertIn("TOKEN=DELETED", cleanup.stdout)
         self.assertFalse(share_stage_dir.exists())
 
 
@@ -1567,7 +1694,7 @@ class NoPathInAnyBranchTests(unittest.TestCase):
         # Remove-Attr3FootageStageAttemptResidue -- deleting this attempt's own already-staged
         # share-side parts while the very message it emits says the agent may still be reading
         # them. Remove-Attr3FootageStageAttemptResidue is extracted here too (real function, real
-        # $createdSharePaths naming a REAL staged file) so that if a future edit reintroduces that
+        # $createdShareSlots naming a REAL staged file) so that if a future edit reintroduces that
         # call on this branch, the staged file is actually deleted and this test actually fails --
         # not merely a text assertion that the call is absent.
         share_stage_root = self.tmp / "unresolved-share-stage-root"
@@ -1584,7 +1711,7 @@ class NoPathInAnyBranchTests(unittest.TestCase):
             "Invoke-Expression $residueFnAst.Extent.Text\n"
             f"$shareStageRoot = '{share_stage_root}'\n"
             f"$shareStageDir = '{share_stage_dir}'\n"
-            f"$createdSharePaths = @('{staged_part}')\n"
+            f"$createdShareSlots = @([pscustomobject]@{{ Path = '{staged_part}'; Id = (Get-AttrCudaFileId -Path '{staged_part}') }})\n"
         )
         proc = self._run_submit_catch_harness(
             "throw 'UNRESOLVED: demo was claimed by the agent and has kept proving liveness'",
@@ -1644,7 +1771,7 @@ class NoPathInAnyBranchTests(unittest.TestCase):
         # which drives Remove-AttrCudaPartialFile itself with -WarningAction supplied at the call
         # site by the TEST), this drives the REAL Remove-Attr3FootageStageAttemptResidue function --
         # extracted via AST from the tracked generator, exactly like the round 9 tests above -- with
-        # $createdSharePaths populated with a path Remove-AttrCudaPartialFile will refuse (a
+        # $createdShareSlots populated with a path Remove-AttrCudaPartialFile will refuse (a
         # directory occupying the would-be part slot, ATTRCUDA_PARTIAL_NOT_A_FILE). Before round 10
         # the function's own call to Remove-AttrCudaPartialFile carried no -WarningAction, so the
         # helper's Write-Warning (naming $createdPath in full) reached this process's own streams
@@ -1665,7 +1792,7 @@ class NoPathInAnyBranchTests(unittest.TestCase):
             f"Import-Module '{ARTIFACTS_MODULE}' -Force; "
             f"$shareStageRoot = '{share_stage_root}'; "
             f"$shareStageDir = '{share_stage_dir}'; "
-            f"$createdSharePaths = @('{occupied_slot}'); "
+            f"$createdShareSlots = @([pscustomobject]@{{ Path = '{occupied_slot}'; Id = (Get-AttrCudaFileId -Path '{occupied_slot}') }}); "
             "Invoke-Expression $fn.Extent.Text; "
             "Remove-Attr3FootageStageAttemptResidue"
         )
@@ -1691,7 +1818,7 @@ class NoPathInAnyBranchTests(unittest.TestCase):
         # anyway, which is exactly the un-owned-content deletion this function exists to avoid
         # (only what THIS ATTEMPT itself created -- see the function's own header). Extracted via
         # AST, the same technique this file already uses for ConvertTo-Attr3FootageStageSafeOutput
-        # and the outer catch block: a leftover child this attempt's own $createdSharePaths never
+        # and the outer catch block: a leftover child this attempt's own $createdShareSlots never
         # tracked must keep the directory in place, never prompt (a prompt would hang this
         # -NonInteractive process rather than pass), and be reported with a fixed token that never
         # names the directory or the leftover file.
@@ -1711,7 +1838,7 @@ class NoPathInAnyBranchTests(unittest.TestCase):
             f"Import-Module '{ARTIFACTS_MODULE}' -Force; "
             f"$shareStageRoot = '{share_stage_root}'; "
             f"$shareStageDir = '{share_stage_dir}'; "
-            "$createdSharePaths = @(); "
+            "$createdShareSlots = @(); "
             "Invoke-Expression $fn.Extent.Text; "
             "Remove-Attr3FootageStageAttemptResidue"
         )
@@ -1746,7 +1873,7 @@ class NoPathInAnyBranchTests(unittest.TestCase):
             f"Import-Module '{ARTIFACTS_MODULE}' -Force; "
             f"$shareStageRoot = '{share_stage_root}'; "
             f"$shareStageDir = '{share_stage_dir}'; "
-            "$createdSharePaths = @(); "
+            "$createdShareSlots = @(); "
             "Invoke-Expression $fn.Extent.Text; "
             "Remove-Attr3FootageStageAttemptResidue"
         )

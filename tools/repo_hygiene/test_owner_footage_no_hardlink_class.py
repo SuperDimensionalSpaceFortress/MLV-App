@@ -48,11 +48,19 @@ THIS_FILE = Path(__file__).resolve()
 
 # ---- 1. hard-link creation --------------------------------------------------------------------
 
-SCANNED_SUFFIXES = {".ps1", ".psm1", ".py", ".cs", ".cmd", ".bat", ".sh", ".js", ".mjs", ".yml", ".yaml"}
+SCANNED_SUFFIXES = {
+    ".ps1", ".psm1", ".py", ".cs", ".cmd", ".bat", ".sh", ".js", ".mjs", ".yml", ".yaml",
+    ".c", ".cc", ".cpp", ".cxx", ".h", ".hpp",
+}
 
 HARD_LINK_TEXT_PATTERNS = (
     r"\bCreateHardLink\w*",
-    r"-ItemType\s+HardLink\b",
+    r"-(?:ItemType|Type|It|I)\s*:?\s*['\"]?HardLink\b",
+    r"['\"]HardLink['\"]",
+    r"\bcreate_hard_link\b",
+    r"\bfs\.link(?:Sync)?\b",
+    r"\bcp\s+(?:-\w*\s+)*-\w*l\w*\b",
+    r"(?<![\w$.\-])ln\s+(?!-\w*s)[\w./\"'$~-]+\s+[\w./\"'$~-]+",
     r"\bNew-HardLink\b",
     r"\bfsutil(?:\.exe)?\s+hardlink\b",
     r"\bmklink(?:\.exe)?\s+/[hH]\b",
@@ -96,16 +104,22 @@ def _is_test_source(path: Path) -> bool:
     return path.name.startswith("test_") or "tests" in path.relative_to(ROOT).parts
 
 
+HARD_LINK_SCAN_ROOTS = (TOOLS, ROOT / "platform", ROOT / "src", ROOT / ".github")
+
+
 def _tool_sources() -> list[Path]:
     found = []
-    for path in sorted(TOOLS.rglob("*")):
-        if not path.is_file() or path.suffix.lower() not in SCANNED_SUFFIXES:
+    for scan_root in HARD_LINK_SCAN_ROOTS:
+        if not scan_root.is_dir():
             continue
-        if {"__pycache__", "node_modules", ".git"} & set(path.parts):
-            continue
-        if path.resolve() == THIS_FILE or _is_test_source(path):
-            continue
-        found.append(path)
+        for path in sorted(scan_root.rglob("*")):
+            if not path.is_file() or path.suffix.lower() not in SCANNED_SUFFIXES:
+                continue
+            if {"__pycache__", "node_modules", ".git", "third_party", "3rdparty"} & set(path.parts):
+                continue
+            if path.resolve() == THIS_FILE or _is_test_source(path):
+                continue
+            found.append(path)
     return found
 
 
@@ -124,6 +138,17 @@ def hard_link_hits(path: Path) -> list[tuple[int, str]]:
                     name = func.attr if isinstance(func, ast.Attribute) else func.id if isinstance(func, ast.Name) else ""
                     if name in HARD_LINK_PY_ATTRIBUTES:
                         hits.append((node.lineno, ast.unparse(node)))
+                    # getattr(os, "link") and friends
+                    if name == "getattr" and any(
+                            isinstance(arg, ast.Constant) and arg.value in HARD_LINK_PY_ATTRIBUTES for arg in node.args):
+                        hits.append((node.lineno, ast.unparse(node)))
+                # `os.link` passed as a reference (shutil.copytree(copy_function=os.link))
+                if (isinstance(node, ast.Attribute) and node.attr in HARD_LINK_PY_ATTRIBUTES
+                        and isinstance(node.value, ast.Name) and node.value.id in {"os", "pathlib", "ctypes", "kernel32"}):
+                    hits.append((node.lineno, ast.unparse(node)))
+                # mklink /H split across argv list elements
+                if isinstance(node, ast.Constant) and isinstance(node.value, str) and node.value.lower() == "/h":
+                    hits.append((node.lineno, repr(node.value)))
                 if isinstance(node, ast.Constant) and isinstance(node.value, str) and HARD_LINK_TEXT_RE.search(node.value):
                     hits.append((node.lineno, node.value.strip()[:120]))
             return sorted(set(hits))
@@ -148,6 +173,11 @@ class NoHardLinkCreationTests(unittest.TestCase):
             "link or a verified byte copy, or list the exact file in HARD_LINK_ALLOWED with the reason it "
             "cannot reach owner footage.")
 
+    def test_the_ledger_publish_keeps_exactly_its_one_hard_link_call(self) -> None:
+        # HARD_LINK_ALLOWED is keyed by file; a SECOND call in that file must not ride the allowance.
+        ledger = ROOT / "tools" / "coordination" / "record_workstream_completion.py"
+        self.assertEqual(len({number for number, _ in hard_link_hits(ledger)}), 1, hard_link_hits(ledger))
+
     def test_every_named_hard_link_exception_still_matches(self) -> None:
         present = {path.relative_to(ROOT).as_posix() for path in _tool_sources() if hard_link_hits(path)}
         stale = sorted(key for key in HARD_LINK_ALLOWED if key not in present)
@@ -168,6 +198,15 @@ class NoHardLinkCreationTests(unittest.TestCase):
             "cmd /c mklink /H $a $b",
             "$info = [FileLinkInformation]::new()",
             "NtSetInformationFile($h, $io, $p, 24, 11)",
+            "New-Item -ItemType 'HardLink' -Path $a -Value $b",
+            "New-Item -ItemType:HardLink -Path $a -Value $b",
+            "New-Item -Type HardLink -Path $a -Value $b",
+            "New-Item -I HardLink -Path $a -Value $b",
+            "$kind = 'HardLink'",
+            "std::filesystem::create_hard_link(a, b);",
+            "fs.linkSync(a, b)",
+            "cp -al a b",
+            "ln a b",
         ]
         for line in must_hit_text:
             self.assertTrue(HARD_LINK_TEXT_RE.search(line), f"the scan missed: {line}")
@@ -177,9 +216,28 @@ class NoHardLinkCreationTests(unittest.TestCase):
             "$hardLinkCount = 2",
             "Get-AttrCudaFileId -Path $a",
             "mklink $a $b",
+            "ln -s a b",
+            "cp a b",
         ):
             self.assertFalse(HARD_LINK_TEXT_RE.search(line), f"false positive: {line}")
-        # the Python side is structural, not textual
+        # the Python side is structural, not textual (references, getattr and split argv count too)
+        for referenced in (
+            "import os, shutil\nshutil.copytree('a', 'b', copy_function=os.link)\n",
+            "import os\ngetattr(os, 'link')('a', 'b')\n",
+            "import subprocess\nsubprocess.run(['cmd', '/c', 'mklink', '/H', 'a', 'b'])\n",
+        ):
+            tree = ast.parse(referenced)
+            found = []
+            for node in ast.walk(tree):
+                if (isinstance(node, ast.Attribute) and node.attr in HARD_LINK_PY_ATTRIBUTES
+                        and isinstance(node.value, ast.Name) and node.value.id in {"os", "pathlib", "ctypes", "kernel32"}):
+                    found.append(node)
+                if isinstance(node, ast.Call) and isinstance(node.func, ast.Name) and node.func.id == "getattr" and any(
+                        isinstance(arg, ast.Constant) and arg.value in HARD_LINK_PY_ATTRIBUTES for arg in node.args):
+                    found.append(node)
+                if isinstance(node, ast.Constant) and isinstance(node.value, str) and node.value.lower() == "/h":
+                    found.append(node)
+            self.assertTrue(found, f"the structural scan would miss: {referenced!r}")
         source = "import os\nfrom pathlib import Path\nos.link('a', 'b')\nPath('a').hardlink_to('b')\nPath('a').link_to('b')\n"
         tree = ast.parse(source)
         names = [
@@ -187,6 +245,11 @@ class NoHardLinkCreationTests(unittest.TestCase):
             for n in ast.walk(tree) if isinstance(n, ast.Call)
         ]
         self.assertEqual(sorted(name for name in names if name in HARD_LINK_PY_ATTRIBUTES), ["hardlink_to", "link", "link_to"])
+
+    def test_the_scan_now_walks_the_native_and_ci_roots_too(self) -> None:
+        roots = {path.relative_to(ROOT).parts[0] for path in _tool_sources()}
+        self.assertIn("tools", roots)
+        self.assertTrue({"platform", "src", ".github"} & roots, "the native / CI roots are outside the scan")
 
     def test_the_scan_covers_the_sources_the_owner_jobs_are_built_from(self) -> None:
         scanned = {path.name for path in _tool_sources()}
@@ -216,7 +279,13 @@ WRITE_PRIMITIVES = (
     r"\[(?:System\.)?IO\.File\]::(?:WriteAll\w+|AppendAll\w+|Create|CreateText|AppendText|Replace|OpenWrite)\b",
     r"\b(?:Set|Add|Clear)-Content\b",
     r"\bOut-File\b",
-    r"\bCopy-Item\b[^\n]*-Force",
+    r"\bCopy-Item\b",
+    r"\[(?:System\.)?IO\.File\]::Copy\s*\(",
+    r"\bStreamWriter\b",
+    r"\bTee-Object\b",
+    r"\bExport-(?!ModuleMember\b)\w+\b",
+    r"-Redirect(?:StandardOutput|StandardError)\b",
+    r"(?:\.|::)Open\s*\([^)]*['\"](?:Truncate|Append|Create|OpenOrCreate)['\"]",
     r"\bNew-Item\b(?![^\n]*-ItemType\s+Directory)[^\n]*-Force",
     r"\bSet-ItemProperty\b",
     r"\bWriteByte\b",
@@ -262,6 +331,12 @@ WRITE_ALLOWED = {
         "the smoke child's stdout / stderr redirected into two fixed-name files under $legOut, the job's own "
         "per-leg output directory inside $Pub (created by this job a few lines above, unique per job); not a "
         "view entry and not an owner path.",
+    ("playback-attr-3-cuda-job.ps1", "$rows | Export-Csv -LiteralPath (Join-Path $legOut 'probe-timeline.csv') -NoTypeInformation"):
+        "the probe timeline CSV, a fixed-name file in $legOut -- the job's own per-leg output directory inside $Pub, "
+        "created by this job and unique per job; the rows are the job's own measurements, and the path names no "
+        "owner path and no view entry.",
+    ("playback-attr-3-cuda-job.ps1", "$pmRows | Export-Csv -LiteralPath (Join-Path $legOut 'presentmon-series.csv') -NoTypeInformation"):
+        "the PresentMon series CSV, a fixed-name file in the same per-leg output directory; not an owner path.",
     # ---- Attr3FootageStageJob.psm1 -------------------------------------------------------------
     ("Attr3FootageStageJob.psm1", "$localDstStream = [IO.File]::Open($localPartialPath, [IO.FileMode]::CreateNew, [IO.FileAccess]::Write, [IO.FileShare]::None)"):
         "the target-volume partial, created by THIS attempt with CreateNew under a per-attempt name carrying the "
@@ -359,6 +434,13 @@ class NoWriteThroughOwnerFootageTests(unittest.TestCase):
             "Clear-Content -LiteralPath $p",
             "'x' | Out-File $p",
             "Copy-Item -LiteralPath $a -Destination $b -Force",
+            "Copy-Item -LiteralPath $a -Destination $b",
+            "[IO.File]::Copy($a, $b, $true)",
+            "$w = [IO.StreamWriter]::new($p)",
+            "$x | Tee-Object -FilePath $p",
+            "$x | Export-Csv -Path $p",
+            "Start-Process x -RedirectStandardOutput $p",
+            "$s = [IO.File]::Open($p, 'Truncate')",
             "New-Item -ItemType File -Path $p -Force",
             "$stream.SetLength(0)",
             "$stream.WriteByte(0)",
@@ -408,6 +490,118 @@ class NoHardLinkInvariantWiringTests(unittest.TestCase):
                 self.assertNotIn("Remove-AttrCudaPartialFile", code)
                 self.assertNotIn("[IO.File]::Delete", code)
                 self.assertIn("Remove-AttrCudaFileById", code)
+
+
+# ---- 3. deletes on the paths that can hold an owner-footage name or a job copy of one ---------------
+
+# Every source whose runtime can reach a view entry, a staged copy, a job scratch tree that holds one, or
+# the share-side slot of one. (The build-route jobs -- assembler, stage, DLL-pair, fixture, smoke-runner,
+# compile -- never receive an owner-footage path and are not listed; they use Remove-AttrCudaTree's
+# no-journal mode, which is per-entry handle deletes with no recursive pathname delete.)
+OWNER_CAPABLE_DELETE_SOURCES = (
+    BACHELOR / "attr3-footage-stage.ps1",
+    BACHELOR / "Attr3FootageStageJob.psm1",
+    BACHELOR / "AttrCudaOwnerFootage.psm1",
+    BACHELOR / "playback-attr-3-cuda-job.ps1",
+)
+
+RECURSIVE_DELETE_RE = re.compile(
+    r"\b(?:Remove-Item|ri|rm|rmdir|del|erase|rd)\b[^\n|;]*?\s-(?:r|re|rec|recu|recur|recurs|recurse)\b"
+    r"|\[(?:System\.)?IO\.Directory\]::Delete\([^)]*,\s*\$true\s*\)"
+    r"|\bRemoveDirectory\w*\b.*\brecurs",
+    re.IGNORECASE,
+)
+PATHNAME_PARTIAL_DELETE_RE = re.compile(r"\bRemove-AttrCudaPartialFile\b")
+TREE_CALL_RE = re.compile(r"\bRemove-AttrCudaTree\b[^\n]*")
+
+
+def _delete_violations(name: str, code_lines: list[str]) -> list[str]:
+    found = []
+    for number, line in enumerate(code_lines, start=1):
+        if not line:
+            continue
+        if RECURSIVE_DELETE_RE.search(line):
+            found.append(f"{name}:{number}: a recursive pathname delete: {line}")
+        if PATHNAME_PARTIAL_DELETE_RE.search(line):
+            found.append(f"{name}:{number}: Remove-AttrCudaPartialFile (a pathname delete) on an owner-capable path: {line}")
+        for call in TREE_CALL_RE.findall(line):
+            if call.strip().startswith("Remove-AttrCudaTree,") or "OwnedJournal" in call:
+                continue
+            if re.fullmatch(r"['\"]?Remove-AttrCudaTree['\"]?,?", line.strip()):
+                continue  # a name in an embed list, not a call
+            if re.match(r"Remove-AttrCudaTree\s*$", call.strip()) or "function" in line.lower():
+                continue
+            found.append(f"{name}:{number}: Remove-AttrCudaTree without -OwnedJournal (first-seen adoption): {line}")
+    return found
+
+
+class NoPathnameDeleteOnOwnerCapablePathsTests(unittest.TestCase):
+    """OWNER-FOOTAGE-NO-HARDLINK-1 round 2 (hub ruling, sol r1 blockers 1 and 3): on every path that can
+    hold an owner-footage name or a job copy of one there is no recursive pathname delete, no
+    Remove-AttrCudaPartialFile, and every tree delete is JOURNALLED -- it removes only what the job
+    recorded at creation. The behaviour is proven on real NTFS in test_owner_footage_creator_ownership.py;
+    this keeps a later edit from putting a pathname delete back."""
+
+    def test_no_owner_capable_source_deletes_by_pathname_or_recursively(self) -> None:
+        violations = []
+        for path in OWNER_CAPABLE_DELETE_SOURCES:
+            self.assertTrue(path.is_file(), path)
+            violations += _delete_violations(path.name, _strip_hash_comments(path.read_text(encoding="utf-8")))
+        self.assertEqual(violations, [], "\n".join(violations))
+
+    def test_the_owner_job_sweeps_its_work_tree_only_through_the_journal(self) -> None:
+        code = "\n".join(_strip_hash_comments((BACHELOR / "playback-attr-3-cuda-job.ps1").read_text(encoding="utf-8")))
+        self.assertIn("Remove-AttrCudaTree -TrustedRoot 'C:\\mlvtmp' -Path $Work -OwnedJournal $OwnerJournal", code)
+        self.assertIn("Clear-AttrCudaOwnerFootageLeftovers -Directory (Join-Path $Work 'owner-clip') -Journal $OwnerJournal", code)
+        # a left entry refuses the run with a typed, path-free result instead of carrying on into it
+        self.assertIn("OWNER_WORK_NOT_CLEAN", code)
+
+    def test_the_staging_cli_deletes_its_slots_only_by_the_identity_it_recorded_at_creation(self) -> None:
+        code = "\n".join(_strip_hash_comments((BACHELOR / "attr3-footage-stage.ps1").read_text(encoding="utf-8")))
+        self.assertIn("Remove-AttrCudaFileById -Path $createdSlot.Path -FileId $createdSlot.Id", code)
+        self.assertIn("Id = $sendResult.Id", code)
+        self.assertNotIn("createdSharePaths", code)
+
+    def test_the_stage_job_never_adopts_a_first_seen_identity(self) -> None:
+        text = (BACHELOR / "Attr3FootageStageJob.psm1").read_text(encoding="utf-8")
+        start = text.index("$template = @'")
+        template = "\n".join(_strip_hash_comments(text[start: text.index("\n'@", start)]))
+        # the staged copy's identity comes from the spec; no Get-AttrCudaFileId -Path anywhere in the job
+        self.assertIn("$rawPart.PSObject.Properties['stagedId']", template)
+        self.assertNotIn("Get-AttrCudaFileId -Path", template)
+        self.assertNotIn("seenStagedId", template)
+
+    def test_the_leftover_sweep_deletes_only_journalled_entries(self) -> None:
+        text = (BACHELOR / "AttrCudaOwnerFootage.psm1").read_text(encoding="utf-8")
+        start = text.index("function Clear-AttrCudaOwnerFootageLeftovers")
+        body = "\n".join(_strip_hash_comments(text[start: text.index("function Close-AttrCudaOwnerFootageWorkspace")]))
+        self.assertNotIn("Get-AttrCudaFileId -Path $entry.FullName", body)
+        self.assertIn("LEFT_LEGACY", body)
+        self.assertIn("$records[", body)
+
+    def test_the_scanner_catches_what_it_claims_to(self) -> None:
+        must_hit = [
+            "Remove-Item -LiteralPath $p -Recurse -Force",
+            "Remove-Item $p -r -Force",
+            "Remove-Item -Force -Recurse -LiteralPath $p",
+            "rm -Recurse $p",
+            "[IO.Directory]::Delete($p, $true)",
+            "[void](Remove-AttrCudaPartialFile -TrustedRoot $r -Path $p)",
+            "Remove-AttrCudaTree -TrustedRoot 'C:\\mlvtmp' -Path $Work",
+            "$x = Remove-AttrCudaTree -TrustedRoot $a -Path $b",
+        ]
+        for line in must_hit:
+            self.assertTrue(_delete_violations("probe", [line]), f"the scan missed: {line}")
+        must_not_hit = [
+            "Remove-Item -LiteralPath $emitPath -Force",
+            "[IO.Directory]::Delete($shareStageDir, $false)",
+            "Remove-AttrCudaTree -TrustedRoot 'C:\\mlvtmp' -Path $Work -OwnedJournal $OwnerJournal",
+            "Remove-AttrCudaFileById -Path $p -FileId $id",
+            "Remove-AttrCudaTree, `",
+            "'Remove-AttrCudaTree',",
+        ]
+        for line in must_not_hit:
+            self.assertEqual(_delete_violations("probe", [line]), [], f"false positive: {line}")
 
 
 if __name__ == "__main__":

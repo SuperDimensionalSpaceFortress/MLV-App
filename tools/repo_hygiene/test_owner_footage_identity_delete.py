@@ -110,7 +110,7 @@ class IdentityCheckedDeleteTests(_PwshCase):
         other_name = self.tmp / "the-second-name"
         os.link(partial, other_name)
 
-        self.assertEqual(self._remove(partial, fields), "LEFT_LINKED")
+        self.assertEqual(self._remove(partial, fields), "LEFT_MULTI_LINK")
 
         self.assertEqual(partial.read_bytes(), b"a partial with a second name")
         self.assertEqual(other_name.read_bytes(), b"a partial with a second name")
@@ -222,16 +222,19 @@ class ScratchTreeRefusesASecondNameTests(_PwshCase):
             f"Import-Module '{MODULE}' -Force\n"
             f"Import-Module '{OWNER_FOOTAGE_MODULE}' -Force\n"
             f"$pin = Open-AttrCudaReadOnlyHandle -Path '{original}'\n"
-            f"$view = New-AttrCudaOwnerFootageView -Directory '{view_dir}' -Index 0 -SourcePath '{original}' -PinStream $pin -Mode copy\n"
+            f"$view = New-AttrCudaOwnerFootageView -Directory '{view_dir}' -Index 0 -SourcePath '{original}' -PinStream $pin -Mode copy -Journal '{work / '.attrcuda-owned.jsonl'}'\n"
             "Close-AttrCudaOwnerFootageWorkspace -Handles @($view.ViewStream, $pin) -Views @()\n"
-            # The view entry is left in place on purpose (-Views @()): the sweep must cope with it.
-            f"Remove-AttrCudaTree -TrustedRoot '{self.tmp / 'scratch'}' -Path '{work}'\n"
+            # The view entry is left in place on purpose (-Views @()): the journalled sweep must remove it
+            # (it created it and journalled it) and nothing else.
+            f"$swept = Remove-AttrCudaTree -TrustedRoot '{self.tmp / 'scratch'}' -Path '{work}' -OwnedJournal '{work / '.attrcuda-owned.jsonl'}'\n"
+            "Write-Output ('LEFT=' + $swept.Left.Count)\n"
             "Write-Output 'SWEPT'\n",
             encoding="utf-8",
         )
         proc = _run_pwsh_file(script)
         self.assertEqual(proc.returncode, 0, f"{proc.stdout}\n{proc.stderr}")
         self.assertIn("SWEPT", proc.stdout)
+        self.assertIn("LEFT=0", proc.stdout)
         self.assertFalse(work.exists())
         self.assertEqual(original.read_bytes(), PAYLOAD)
         self.assertEqual(os.stat(original).st_nlink, 1)
@@ -247,7 +250,7 @@ class SymlinkCapabilityProbeTests(_PwshCase):
             f"Import-Module '{OWNER_FOOTAGE_MODULE}' -Force\n"
             "$mod = Get-Module AttrCudaOwnerFootage\n"
             + mock
-            + f"$r = Test-AttrCudaSymlinkCapability -Directory '{directory}'\n"
+            + f"$r = Test-AttrCudaSymlinkCapability -Directory '{directory}' -Journal '{directory.parent / 'probe-journal.jsonl'}'\n"
             "Write-Output ('RESULT=' + $r.Result)\n"
             "Write-Output ('CAPABLE=' + $r.Capable)\n",
             encoding="utf-8",
@@ -391,7 +394,7 @@ class SymlinkViewTests(_PwshCase):
             f"Import-Module '{MODULE}' -Force\n"
             f"Import-Module '{OWNER_FOOTAGE_MODULE}' -Force\n"
             f"$pin = Open-AttrCudaReadOnlyHandle -Path '{original}'\n"
-            f"$view = New-AttrCudaOwnerFootageView -Directory '{directory}' -Index 0 -SourcePath '{original}' -PinStream $pin -Mode symlink\n"
+            f"$view = New-AttrCudaOwnerFootageView -Directory '{directory}' -Index 0 -SourcePath '{original}' -PinStream $pin -Mode symlink -Journal '{directory.parent / 'view-journal.jsonl'}'\n"
             "Write-Output ('MODE=' + $view.Mode)\n"
             "try { Assert-AttrCudaOwnerFootageViewsIntact -Views @($view); Write-Output 'INTACT' } catch { Write-Output ('THREW ' + $_.Exception.Message) }\n"
             # The held view handle makes a swap of the link refused where the OS enforces it; a swap that
@@ -418,8 +421,10 @@ class SymlinkViewTests(_PwshCase):
         directory.mkdir()
         leftover = directory / ("owner-" + "clip" + base_extension)
         os.symlink(original, leftover)
+        journal = self.tmp / "leftover-journal.jsonl"
         proc = self.run_with_module(
-            f"$left = @(Clear-AttrCudaOwnerFootageLeftovers -Directory '{directory}' -WarningAction SilentlyContinue)\n"
+            f"Add-AttrCudaOwnedRecord -Journal '{journal}' -Path '{leftover}' -FileId (Get-AttrCudaFileId -Path '{leftover}') -IsReparsePoint\n"
+            f"$left = @(Clear-AttrCudaOwnerFootageLeftovers -Directory '{directory}' -Journal '{journal}' -WarningAction SilentlyContinue)\n"
             "Write-Output ('LEFT=' + ($left -join ','))\n")
         self.assertEqual(proc.returncode, 0, f"{proc.stdout}\n{proc.stderr}")
         self.assertTrue(proc.stdout.strip().endswith("LEFT="), proc.stdout)

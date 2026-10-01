@@ -173,7 +173,20 @@ function New-Attr3FootageStageJob {
         # (see this template's own opening comment) is the backstop for exactly that: the thrown
         # exception's own .Message never reaches this job's output, only the fixed
         # RESULT=FOOTAGE_STAGE_JOB_ERROR token.
-        [int]$TestHookForceArbitraryThrowPartIndex = -1
+        [int]$TestHookForceArbitraryThrowPartIndex = -1,
+
+        # OWNER-FOOTAGE-NO-HARDLINK-1 round 2 (hub ruling; sol r1 blocker 2): the SUBMITTER's record of
+        # the staged copies it CREATED -- {index -> {VolumeSerialNumber; FileIndexHigh; FileIndexLow}},
+        # each read off the submitter's own CreateNew handle (Send-AttrCudaOwnerFootagePartToStaging
+        # returns it as .Id). The emitted job deletes a staged copy ONLY through that identity, on the
+        # deleting handle; a part with no entry here (a slot the submitter did not create) is never
+        # deleted -- LEFT_UNOWNED -- and no identity is ever adopted by looking at the file later.
+        [hashtable]$StagedIdentities = $null,
+
+        # Re-emit the job under the SAME id (the per-job staging directory is named from it, and the
+        # submitter had to know the directory to transfer into it before it knew the identities).
+        [ValidatePattern('^$|^attr3-footage-stage-[A-Za-z0-9][A-Za-z0-9_.-]{0,63}-[0-9a-f]{12}-[0-9a-f]{10}$')]
+        [string]$ExistingJobId = ''
     )
 
     if ($Parts.Count -eq 0) {
@@ -205,13 +218,26 @@ function New-Attr3FootageStageJob {
     # Re-serialised, compact and key-ordered, so the embedded literal is deterministic and never
     # carries the caller's own incidental whitespace or key order. `path` never appears here --
     # only `pathBase64` does.
-    $partsForJob = @($Parts | Sort-Object { [int]$_.index } | ForEach-Object {
+    $partsForHash = @($Parts | Sort-Object { [int]$_.index } | ForEach-Object {
         [ordered]@{
             index = [int]$_.index
             pathBase64 = [Convert]::ToBase64String([Text.Encoding]::UTF8.GetBytes([string]$_.path))
             length = [int64]$_.length
             sha256 = [string]$_.sha256
         }
+    })
+    $partsForJob = @($partsForHash | ForEach-Object {
+        $row = [ordered]@{}
+        foreach ($key in $_.Keys) { $row[$key] = $_[$key] }
+        if ($null -ne $StagedIdentities -and $null -ne $StagedIdentities[[int]$_.index]) {
+            $recorded = $StagedIdentities[[int]$_.index]
+            $row['stagedId'] = [ordered]@{
+                v = [int64][uint32]$recorded.VolumeSerialNumber
+                h = [int64][uint32]$recorded.FileIndexHigh
+                l = [int64][uint32]$recorded.FileIndexLow
+            }
+        }
+        $row
     })
     $partsJson = $partsForJob | ConvertTo-Json -Compress -Depth 5
     # ConvertTo-Json -Compress on a single-element array still yields a bare object, never
@@ -222,7 +248,7 @@ function New-Attr3FootageStageJob {
     # of this module, is) -- reported separately as sourceSha256 below. It is NOT the job id: the
     # caller uses the RETURNED jobId (below) to name the per-job staging directory on the agent
     # share, so nothing requires the id itself to be content-derived.
-    $canonicalPayload = ([ordered]@{ clipId = $ClipId; parts = $partsForJob }) | ConvertTo-Json -Compress -Depth 5
+    $canonicalPayload = ([ordered]@{ clipId = $ClipId; parts = $partsForHash }) | ConvertTo-Json -Compress -Depth 5
     $sha256Alg = [Security.Cryptography.SHA256]::Create()
     try {
         $sourceSha256 = [BitConverter]::ToString(
@@ -240,6 +266,7 @@ function New-Attr3FootageStageJob {
     # regardless of content; $sourceSha256 (still reported) remains the stable audit/dedup key.
     $attemptNonce = [guid]::NewGuid().ToString('N').Substring(0, 10)
     $jobId = "attr3-footage-stage-$ClipId-$($sourceSha256.Substring(0, 12))-$attemptNonce"
+    if (-not [string]::IsNullOrEmpty($ExistingJobId)) { $jobId = $ExistingJobId }
     [void](Assert-AttrCudaSafeArtifactName -Name "$jobId.job.ps1")
 
     # ATTR3-FOOTAGE-STAGE-1: Test-AttrCudaFootagePart is the ONE shared per-part content
@@ -367,15 +394,16 @@ if (-not $stagingChainSafe) {
 # identity -- between "this is the file I made" and "delete it", another process can replace the
 # name with a hard link to something that matters, and a path-based delete then removes that name.
 # Every delete below goes through Remove-AttrCudaFileById with the identity (volume serial + 64-bit
-# file index) recorded when the name was created (the target-volume partial, read off this job's own
-# CreateNew handle; it survives the publish rename, so it also identifies the placed target) or
-# first seen (the staged copy, accepted only with exactly one name): the name is opened, checked
-# against that identity and a link count of one ON THE SAME HANDLE, and only then deleted. Anything
-# else is LEFT where it is and recorded -- a line `LEFTOVER PART= KIND= RESULT=` and, in the final
-# JSON, a `leftovers` entry carrying only the part index, the kind and a fixed token, never a path.
+# file index) recorded when the name was CREATED -- the target-volume partial, read off this job's own
+# CreateNew handle (it survives the publish rename, so it also identifies the placed target), and the
+# staged copy, read off the submitter's CreateNew handle and carried in the spec: the name is opened
+# with share mode none, checked against that identity and a link count of one ON THE SAME HANDLE, and
+# only then deleted. An identity first SEEN here is never adopted. Anything else is LEFT where it is
+# and recorded -- a line `LEFTOVER PART= KIND= RESULT=` and, in the final JSON, a `leftovers` entry
+# carrying only the part index, the kind and a fixed token, never a path.
 $leftovers = New-Object System.Collections.Generic.List[object]
 function Remove-StageOwnName([string]$Path, $FileId, [int]$Index, [string]$Kind) {
-    $token = 'LEFT_NO_IDENTITY'
+    $token = 'LEFT_UNOWNED'
     if ($null -ne $FileId) {
         $token = Remove-AttrCudaFileById -Path $Path -FileId $FileId
     } else {
@@ -439,15 +467,21 @@ foreach ($rawPart in $RawParts) {
         continue
     }
 
-    # OWNER-FOOTAGE-NO-HARDLINK-1: the staged copy's identity, recorded the first time it is seen
-    # (the NAME itself, never followed) and ONLY when it is a plain file with exactly one name. A
-    # staged copy with a second name is not ours to delete whatever its bytes are -- it could be a
-    # hard link to a file that matters -- so it gets no identity and every cleanup below leaves it.
-    try {
-        $seenStagedId = Get-AttrCudaFileId -Path $stagedPath
-        if (-not $seenStagedId.IsDirectory -and -not $seenStagedId.IsReparsePoint -and $seenStagedId.NumberOfLinks -eq 1) { $stagedId = $seenStagedId }
-    } catch {
-        $stagedId = $null
+    # OWNER-FOOTAGE-NO-HARDLINK-1 round 2 (hub ruling; sol r1 blocker 2): the staged copy's identity is
+    # the one the SUBMITTER recorded off its own CreateNew handle when it created the slot, carried in
+    # the job spec as stagedId -- never one read here by looking at whatever now sits at the name. The
+    # first version adopted the first-seen identity of any one-name file; a one-name file at this slot
+    # may be the LAST name of an old recording (a hard link whose other name the owner replaced), and
+    # NumberOfLinks = 1 cannot tell it from a copy. A part with no recorded identity is never deleted
+    # (LEFT_UNOWNED); one whose identity differs from the record, or that gained a second name, is left
+    # by Remove-AttrCudaFileById on the deleting handle (LEFT_ID_MISMATCH / LEFT_MULTI_LINK).
+    $stagedIdProperty = $rawPart.PSObject.Properties['stagedId']
+    if ($null -ne $stagedIdProperty -and $null -ne $stagedIdProperty.Value) {
+        $stagedId = [pscustomobject]@{
+            VolumeSerialNumber = [uint32]$stagedIdProperty.Value.v
+            FileIndexHigh = [uint32]$stagedIdProperty.Value.h
+            FileIndexLow = [uint32]$stagedIdProperty.Value.l
+        }
     }
 
     $stageStatus = Test-AttrCudaFootagePart -Path $stagedPath -ExpectedLength $expectedLength -ExpectedSha256 $expectedSha256

@@ -346,7 +346,8 @@ $embeddedFunctions = Get-AttrCudaEmbeddedFunctionSource -Name @(
     # name (Get-AttrCudaFileId reads the live link count); these three are what it stands on.
     'Initialize-AttrCudaFileIdNative',
     'ConvertTo-AttrCudaFileIdObject',
-    'Get-AttrCudaFileId'
+    'Get-AttrCudaFileId',
+    'Remove-AttrCudaFileById'
 )
 
 $jobPath = Join-Path $OutDir "$jobId.job.ps1"

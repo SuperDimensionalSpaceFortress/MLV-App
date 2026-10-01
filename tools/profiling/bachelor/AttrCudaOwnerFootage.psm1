@@ -121,7 +121,10 @@ function Send-AttrCudaOwnerFootagePartToStaging {
     this call cannot silently pass. -StagingDirectory is created if absent. Every filesystem
     call after the initial copy is wrapped so no exception text -- which can carry a path --
     ever escapes; only a distinguishable OWNER_FOOTAGE_STAGE_* token, and the part -Index, is
-    ever thrown. Idempotent: a final slot already holding bytes matching -ExpectedLength/
+    ever thrown. OWNER-FOOTAGE-NO-HARDLINK-1 round 2: the result also carries Id, the volume serial +
+    file index read off this call's own CreateNew handle ($null when Created is $false -- a slot this
+    call did not create is not this call's to delete, and nothing later may adopt it).
+    Idempotent: a final slot already holding bytes matching -ExpectedLength/
     -ExpectedSha256 is left alone and this returns without copying again; a final slot holding
     DIFFERENT bytes throws OWNER_FOOTAGE_STAGE_CONFLICT rather than overwriting it.
     Throws OWNER_FOOTAGE_STAGE_COPY_FAILED, OWNER_FOOTAGE_STAGE_VERIFY_FAILED (the share-side
@@ -197,7 +200,7 @@ function Send-AttrCudaOwnerFootagePartToStaging {
     }
     if ($finalExists) {
         $existingStatus = Test-AttrCudaFootagePart -Path $finalPath -ExpectedLength $ExpectedLength -ExpectedSha256 $ExpectedSha256
-        if ($existingStatus -eq 'PASS') { return [pscustomobject]@{ Path = $finalPath; Created = $false } }
+        if ($existingStatus -eq 'PASS') { return [pscustomobject]@{ Path = $finalPath; Created = $false; Id = $null } }
         throw "OWNER_FOOTAGE_STAGE_CONFLICT part $Index is already staged with different bytes"
     }
 
@@ -285,14 +288,17 @@ function Send-AttrCudaOwnerFootagePartToStaging {
         # already there rather than assume either outcome.
         $racedStatus = Test-AttrCudaFootagePart -Path $finalPath -ExpectedLength $ExpectedLength -ExpectedSha256 $ExpectedSha256
         & $removePartial
-        if ($racedStatus -eq 'PASS') { return [pscustomobject]@{ Path = $finalPath; Created = $false } }
+        if ($racedStatus -eq 'PASS') { return [pscustomobject]@{ Path = $finalPath; Created = $false; Id = $null } }
         throw "OWNER_FOOTAGE_STAGE_CONFLICT part $Index is already staged with different bytes"
     } catch {
         & $removePartial
         throw "OWNER_FOOTAGE_STAGE_COPY_FAILED part $Index could not publish the staged part"
     }
 
-    return [pscustomobject]@{ Path = $finalPath; Created = $true }
+    # Id is the identity read off OUR OWN CreateNew handle above; it survives the publish rename, so it
+    # names the final slot. The caller (the staging CLI) deletes the slot only through it, and hands it
+    # to the agent job, which deletes the staged copy only through it (OWNER-FOOTAGE-NO-HARDLINK-1 r2).
+    return [pscustomobject]@{ Path = $finalPath; Created = $true; Id = $partialId }
 }
 
 function Get-AttrCudaOwnerFootageNeutralName {
@@ -398,7 +404,13 @@ function Test-AttrCudaSymlinkCapability {
     probe says SYMLINK_CAPABLE and the symlink is used.
     #>
     [CmdletBinding()]
-    param([Parameter(Mandatory = $true)][string]$Directory)
+    param(
+        [Parameter(Mandatory = $true)][string]$Directory,
+        # Round 2: both probe files are journalled the moment they are created, so a run killed inside
+        # the probe leaves entries the journalled sweep can remove by identity (it used to leave a
+        # `.symlink-probe-link-*` that nothing could clear).
+        [Parameter(Mandatory = $true)][string]$Journal
+    )
 
     $suffix = [Guid]::NewGuid().ToString('N')
     $targetPath = Join-Path $Directory ".symlink-probe-target-$suffix"
@@ -410,6 +422,7 @@ function Test-AttrCudaSymlinkCapability {
     try {
         $stream = [IO.File]::Open($targetPath, [IO.FileMode]::CreateNew, [IO.FileAccess]::Write, [IO.FileShare]::None)
         $targetId = Get-AttrCudaFileId -Stream $stream
+        Add-AttrCudaOwnedRecord -Journal $Journal -Path $targetPath -FileId $targetId
         # 4097 bytes of 0x01: longer than any symlink's own reparse-data size, so a length that
         # follows the link and one that does not cannot coincide.
         $probeBytes = New-Object byte[] 4097
@@ -420,6 +433,10 @@ function Test-AttrCudaSymlinkCapability {
 
         New-AttrCudaFileSymlink -LinkPath $linkPath -TargetPath $targetPath
         $linkId = Get-AttrCudaFileId -Path $linkPath
+        # A symbolic link has no creating handle to read; its own identity is read by name the instant
+        # after New-AttrCudaFileSymlink created it (no -Force: it cannot have replaced anything) and
+        # journalled before anything else happens to it.
+        Add-AttrCudaOwnedRecord -Journal $Journal -Path $linkPath -FileId $linkId -IsReparsePoint:$linkId.IsReparsePoint
         $followed = Get-AttrCudaFileId -Path $linkPath -FollowLinks
         if ($linkId.IsReparsePoint -and
             $followed.VolumeSerialNumber -eq $targetId.VolumeSerialNumber -and
@@ -526,7 +543,10 @@ function New-AttrCudaOwnerFootageView {
         [Parameter(Mandatory = $true)][int]$Index,
         [Parameter(Mandatory = $true)][string]$SourcePath,
         [Parameter(Mandatory = $true)][System.IO.FileStream]$PinStream,
-        [Parameter(Mandatory = $true)][ValidateSet('symlink', 'copy')][string]$Mode
+        [Parameter(Mandatory = $true)][ValidateSet('symlink', 'copy')][string]$Mode,
+        # Round 2: the entry is journalled from its creating handle BEFORE a byte is copied into it
+        # (Add-AttrCudaOwnedRecord); the journalled sweep deletes only what this names.
+        [Parameter(Mandatory = $true)][string]$Journal
     )
 
     $viewPath = Join-Path $Directory (Get-AttrCudaOwnerFootageNeutralName -Index $Index)
@@ -540,6 +560,7 @@ function New-AttrCudaOwnerFootageView {
         if ($Mode -eq 'symlink') {
             New-AttrCudaFileSymlink -LinkPath $viewPath -TargetPath ([IO.Path]::GetFullPath($SourcePath))
             $entryId = Get-AttrCudaFileId -Path $viewPath
+            Add-AttrCudaOwnedRecord -Journal $Journal -Path $viewPath -FileId $entryId -IsReparsePoint:$entryId.IsReparsePoint
             if (-not $entryId.IsReparsePoint -or $entryId.NumberOfLinks -ne 1) {
                 $reason = 'view entry is not a lone symbolic link'
                 throw $reason
@@ -550,6 +571,7 @@ function New-AttrCudaOwnerFootageView {
         } else {
             $destStream = [IO.File]::Open($viewPath, [IO.FileMode]::CreateNew, [IO.FileAccess]::Write, [IO.FileShare]::None)
             $entryId = Get-AttrCudaFileId -Stream $destStream
+            Add-AttrCudaOwnedRecord -Journal $Journal -Path $viewPath -FileId $entryId
             $reason = 'view copy failed'
             [void]$PinStream.Seek(0, [IO.SeekOrigin]::Begin)
             $PinStream.CopyTo($destStream, 4194304)
@@ -641,20 +663,29 @@ function Assert-AttrCudaOwnerFootageViewsIntact {
 function Clear-AttrCudaOwnerFootageLeftovers {
     <#
     .SYNOPSIS
-    At job start: remove the neutral view entries an earlier run of this job left in -Directory
-    (a killed job never reached its cleanup), each through the identity-checked primitive, so the
-    job-start scratch sweep has no reparse point or extra name to trip on. Never throws.
+    At job start: remove the neutral view entries an earlier run of THIS job id left in -Directory
+    (a killed job never reached its cleanup) -- but ONLY the ones the job's own creation journal names,
+    each through the identity-checked primitive. A neutral-named entry the journal does NOT name is
+    refused and reported, never deleted and never adopted. Never throws.
     .DESCRIPTION
-    OWNER-FOOTAGE-NO-HARDLINK-1. A leftover symlink is deleted as itself (its own identity read off
-    the name and handed straight to Remove-AttrCudaFileById with -ExpectReparsePoint), so its
-    target is untouched; a leftover copy is deleted only while it still has exactly one name. An
-    entry that has more than one name -- a hard link left by an older build of this job -- is NOT
-    deleted: it is reported and left, and the scratch sweep that follows then refuses the tree
-    (ATTRCUDA_TREE_HAS_HARD_LINK) instead of deleting it. Returns the tokens of entries that could
-    not be removed; empty when everything went or nothing was there.
+    OWNER-FOOTAGE-NO-HARDLINK-1 round 2 (sol r1 blocker 2, hub ruling). The first version of this
+    function read the CURRENT identity of every neutral-named entry and deleted it when it had one
+    name. That is first-seen adoption: a legacy entry -- a hard link an older build (#200-era) left
+    here, named exactly like a view -- becomes the LAST name of old footage the moment the owner
+    deletes, moves or re-records the original (an editor's safe-save, a OneDrive restore), and
+    NumberOfLinks = 1 then reads as "mine". Ownership is now creator-recorded: Add-AttrCudaOwnedRecord
+    journals each entry from its creating handle, and only a journalled entry whose identity on the
+    deleting handle is the journalled one, with one name, is removed (a symlink as itself,
+    -ExpectReparsePoint from the record). Returns one token per entry that was left:
+    LEFT_LEGACY (a neutral-named entry nobody journalled -- the typed line that tells the hub it exists
+    and needs an owner decision; nothing waits on it), or the Remove-AttrCudaFileById token. Empty
+    when everything went or nothing was there.
     #>
     [CmdletBinding()]
-    param([Parameter(Mandatory = $true)][string]$Directory)
+    param(
+        [Parameter(Mandatory = $true)][string]$Directory,
+        [Parameter(Mandatory = $true)][string]$Journal
+    )
 
     $left = [System.Collections.Generic.List[string]]::new()
     try {
@@ -666,12 +697,35 @@ function Clear-AttrCudaOwnerFootageLeftovers {
         Write-Warning 'ATTRCUDA_OWNER_LEFTOVER_DIRECTORY_IS_LINK left in place'
         return @('LEFT_NOT_A_FILE')
     }
+    $journalFull = [IO.Path]::GetFullPath($Journal)
+    $journalDir = [IO.Path]::GetDirectoryName($journalFull).TrimEnd('\')
+    $records = @{}
+    try {
+        if (Test-Path -LiteralPath $journalFull -PathType Leaf) {
+            foreach ($line in [IO.File]::ReadAllLines($journalFull)) {
+                if ([string]::IsNullOrWhiteSpace($line)) { continue }
+                try { $record = $line | ConvertFrom-Json } catch { continue }
+                $records[([string]$record.p).ToLowerInvariant()] = $record
+            }
+        }
+    } catch {
+        $records = @{}
+    }
     $neutralPattern = '^owner-clip\.(MLV|M\d{2})$'
     foreach ($entry in @(Get-ChildItem -LiteralPath $Directory -Force -ErrorAction SilentlyContinue |
             Where-Object { $_.Name -match $neutralPattern })) {
+        $record = $null
+        if ($entry.FullName.StartsWith($journalDir + '\', [StringComparison]::OrdinalIgnoreCase)) {
+            $record = $records[$entry.FullName.Substring($journalDir.Length + 1).ToLowerInvariant()]
+        }
+        if ($null -eq $record) {
+            Write-Warning 'ATTRCUDA_OWNER_LEFTOVER_LEFT LEFT_LEGACY'
+            [void]$left.Add('LEFT_LEGACY')
+            continue
+        }
         try {
-            $id = Get-AttrCudaFileId -Path $entry.FullName
-            $token = Remove-AttrCudaFileById -Path $entry.FullName -FileId $id -ExpectReparsePoint:$id.IsReparsePoint
+            $recorded = [pscustomobject]@{ VolumeSerialNumber = [uint32]$record.v; FileIndexHigh = [uint32]$record.h; FileIndexLow = [uint32]$record.l }
+            $token = Remove-AttrCudaFileById -Path $entry.FullName -FileId $recorded -ExpectReparsePoint:([bool]$record.r)
         } catch {
             $token = 'LEFT_UNAVAILABLE'
         }

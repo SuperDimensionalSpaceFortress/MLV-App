@@ -129,7 +129,8 @@ $embeddedFunctions = Get-AttrCudaEmbeddedFunctionSource -Name @(
     # name (Get-AttrCudaFileId reads the live link count); these three are what it stands on.
     'Initialize-AttrCudaFileIdNative',
     'ConvertTo-AttrCudaFileIdObject',
-    'Get-AttrCudaFileId'
+    'Get-AttrCudaFileId',
+    'Remove-AttrCudaFileById'
 )
 
 if (-not (Test-Path -LiteralPath $OutDir)) { New-Item -ItemType Directory -Path $OutDir -Force | Out-Null }

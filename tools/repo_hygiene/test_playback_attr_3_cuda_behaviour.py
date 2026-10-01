@@ -1555,6 +1555,7 @@ class AttributionJobOwnerContentAuthenticationTests(_PwshCase):
             f"$SourceCommit = '{'d' * 40}'\n"
             f"$Pub = '{pub}'\n"
             f"$Work = '{work}'\n"
+            "$OwnerJournal = Join-Path $Work '.attrcuda-owned.jsonl'\n"
             "$ownerViewHandles = [System.Collections.Generic.List[object]]::new()\n"
             "$ownerViews = [System.Collections.Generic.List[object]]::new()\n"
             "function Save-Json($Object, [string]$Path) {\n"
@@ -1730,6 +1731,7 @@ class OwnerFootagePrivateDirectoryLeakAndRefusalTests(_PwshCase):
             f"$SourceCommit = '{'d' * 40}'\n"
             f"$Pub = '{pub}'\n"
             f"$Work = '{work}'\n"
+            "$OwnerJournal = Join-Path $Work '.attrcuda-owned.jsonl'\n"
             "$ownerViewHandles = [System.Collections.Generic.List[object]]::new()\n"
             "$ownerViews = [System.Collections.Generic.List[object]]::new()\n"
             "function Save-Json($Object, [string]$Path) {\n"
@@ -1891,7 +1893,7 @@ class OwnerFootagePrivateDirectoryLeakAndRefusalTests(_PwshCase):
         # elevated) on a host that can.
         return (
             "Set-Item -Path function:Test-AttrCudaSymlinkCapability -Value {\n"
-            "    param([string]$Directory)\n"
+            "    param([string]$Directory, [string]$Journal)\n"
             "    [pscustomobject]@{ Capable = $false; Result = 'SYMLINK_UNAVAILABLE' }\n"
             "}\n"
         )
@@ -1939,7 +1941,7 @@ class OwnerFootagePrivateDirectoryLeakAndRefusalTests(_PwshCase):
         probe = self.tmp / "symlink-capability-probe"
         probe.mkdir()
         capability = self.run_with_module(
-            f"Write-Output ('CAPABILITY=' + (Test-AttrCudaSymlinkCapability -Directory '{probe}').Result)\n")
+            f"Write-Output ('CAPABILITY=' + (Test-AttrCudaSymlinkCapability -Directory '{probe}' -Journal '{probe.parent / 'probe-journal.jsonl'}').Result)\n")
         self.assertEqual(capability.returncode, 0, f"{capability.stdout}\n{capability.stderr}")
         self.assertEqual(list(probe.iterdir()), [], "the capability probe left a file behind")
         if "CAPABILITY=SYMLINK_CAPABLE" not in capability.stdout:
@@ -2087,7 +2089,7 @@ class OwnerFootagePrivateDirectoryLeakAndRefusalTests(_PwshCase):
             f"Import-Module '{MODULE}' -Force\n"
             f"Import-Module '{OWNER_FOOTAGE_MODULE}' -Force\n"
             f"$pin = Open-AttrCudaReadOnlyHandle -Path '{original}'\n"
-            f"$view = New-AttrCudaOwnerFootageView -Directory '{directory}' -Index 0 -SourcePath '{original}' -PinStream $pin -Mode copy\n"
+            f"$view = New-AttrCudaOwnerFootageView -Directory '{directory}' -Index 0 -SourcePath '{original}' -PinStream $pin -Mode copy -Journal '{directory.parent / 'changed-journal.jsonl'}'\n"
             "try { Assert-AttrCudaOwnerFootageViewsIntact -Views @($view); Write-Output 'INTACT' } catch { Write-Output ('THREW ' + $_.Exception.Message) }\n"
             # Tamper with the RECORD, as a swapped entry would present: a different file index.
             "$forged = [pscustomobject]@{ Index = $view.Index; Path = $view.Path; Mode = $view.Mode; PinId = $view.PinId; ViewStream = $view.ViewStream;\n"
@@ -2106,33 +2108,57 @@ class OwnerFootagePrivateDirectoryLeakAndRefusalTests(_PwshCase):
         self.assertIn("ENTRIES_AFTER_CLOSE=0", proc.stdout)
         self.assertEqual(original.read_bytes(), b"changed view original bytes " * 16)
 
-    def test_a_leftover_view_from_a_killed_run_is_cleared_by_identity_and_a_linked_one_is_not(self) -> None:
-        # Clear-AttrCudaOwnerFootageLeftovers: a killed job never reached its cleanup. A lone
-        # leftover copy goes; an entry with a SECOND NAME (a hard link left by an older build) is
-        # reported and left, and Remove-AttrCudaTree then refuses the tree.
+    def test_a_leftover_view_is_cleared_only_if_the_journal_names_it_and_a_legacy_entry_is_left(self) -> None:
+        # Clear-AttrCudaOwnerFootageLeftovers (OWNER-FOOTAGE-NO-HARDLINK-1 round 2, creator-recorded
+        # ownership): a killed job never reached its cleanup, and the next run of the same job id
+        # removes the entries its own journal names -- by identity. A neutral-named entry NOBODY
+        # journalled is a legacy artifact (a pre-#211 hard link) and is LEFT, whatever its link count:
+        # NumberOfLinks = 1 is also what the last name of old footage looks like.
         base_extension = "." + "MLV"
-        directory = self.tmp / "owner-leftovers"
-        directory.mkdir()
-        lone = directory / ("owner-" + "clip" + base_extension)
-        lone.write_bytes(b"a leftover copy")
-        linked = directory / ("owner-" + "clip" + "." + "M00")
-        linked.write_bytes(b"pretend this is a name of owner bytes")
+        work = self.tmp / "owner-leftovers-work"
+        directory = work / "owner-clip"
+        directory.mkdir(parents=True)
+        journal = work / ".attrcuda-owned.jsonl"
+        made = directory / ("owner-" + "clip" + base_extension)
+        # created like the job creates a view: CreateNew, identity from the creating handle, journalled
+        creator = self.run_with_module(
+            f"$s = [IO.File]::Open('{made}', [IO.FileMode]::CreateNew, [IO.FileAccess]::Write, [IO.FileShare]::None)\n"
+            f"Add-AttrCudaOwnedRecord -Journal '{journal}' -Path '{made}' -FileId (Get-AttrCudaFileId -Stream $s)\n"
+            "$s.Dispose()\n")
+        self.assertEqual(creator.returncode, 0, f"{creator.stdout}\n{creator.stderr}")
+        legacy_lone = directory / ("owner-" + "clip" + "." + "M00")
+        legacy_lone.write_bytes(b"a legacy entry nobody journalled -- may be the last name of old footage")
+        legacy_linked = directory / ("owner-" + "clip" + "." + "M01")
+        legacy_linked.write_bytes(b"pretend this is a name of owner bytes")
         second_name = self.tmp / "the-other-name"
-        os.link(linked, second_name)
+        os.link(legacy_linked, second_name)
 
         proc = self.run_with_module(
-            f"$left = @(Clear-AttrCudaOwnerFootageLeftovers -Directory '{directory}' -WarningAction SilentlyContinue)\n"
+            f"$left = @(Clear-AttrCudaOwnerFootageLeftovers -Directory '{directory}' -Journal '{journal}' -WarningAction SilentlyContinue)\n"
             "Write-Output ('LEFT=' + ($left -join ','))\n")
 
         self.assertEqual(proc.returncode, 0, f"{proc.stdout}\n{proc.stderr}")
-        self.assertIn("LEFT=LEFT_LINKED", proc.stdout)
-        self.assertFalse(lone.exists())
-        self.assertTrue(linked.exists())
+        self.assertIn("LEFT=LEFT_LEGACY,LEFT_LEGACY", proc.stdout)
+        self.assertFalse(made.exists(), "the journalled entry this job created is cleared")
+        self.assertTrue(legacy_lone.exists(), "an unjournalled one-name entry is never adopted")
+        self.assertTrue(legacy_linked.exists())
         self.assertTrue(second_name.exists())
         self.assertEqual(second_name.read_bytes(), b"pretend this is a name of owner bytes")
-        sweep = self.run_with_module(_guard(f"Remove-AttrCudaTree -TrustedRoot '{self.tmp}' -Path '{directory}'"))
+        # The build-scratch tree mode still refuses a tree holding a second name outright...
+        sweep = self.run_with_module(_guard(f"Remove-AttrCudaTree -TrustedRoot '{self.tmp}' -Path '{work}'"))
         self.assert_throws(sweep, "ATTRCUDA_TREE_HAS_HARD_LINK")
-        self.assertTrue(linked.exists())
+        # ...and the journalled sweep removes nothing it did not create and keeps the directories.
+        sweep = self.run_with_module(
+            f"$r = Remove-AttrCudaTree -TrustedRoot '{self.tmp}' -Path '{work}' -OwnedJournal '{journal}'\n"
+            "Write-Output ('LEFT=' + (($r.Left | ForEach-Object { $_.Token }) -join ','))\n"
+            "Write-Output ('TREE_REMOVED=' + $r.TreeRemoved)\n")
+        self.assertEqual(sweep.returncode, 0, f"{sweep.stdout}\n{sweep.stderr}")
+        self.assertIn("TREE_REMOVED=False", sweep.stdout)
+        self.assertIn("LEFT_UNOWNED", sweep.stdout)
+        self.assertIn("LEFT_MULTI_LINK", sweep.stdout)
+        self.assertTrue(legacy_lone.exists())
+        self.assertTrue(legacy_linked.exists())
+        self.assertTrue(directory.is_dir())
 
 
 @requires_pwsh
@@ -5575,7 +5601,7 @@ class DisplayWakeJobOrderingTests(unittest.TestCase):
         # job (before footage resolution and package verification), so the failure paths this now
         # covers grew from 9 to 15: SCREENSAVER_SECURE_OWNER_ONLY, FIXTURE_CONTENT_MISMATCH, the
         # two OWNER_FOOTAGE_NOT_VERIFIED sites, OWNER_PARTS_NOT_CONTIGUOUS, the owner-link failure
-        # (OWNER_FOOTAGE_LINK_CROSS_VOLUME/OWNER_FOOTAGE_LINK_FAILED), VENUE_NOT_QUIESCENT,
+        # (OWNER_FOOTAGE_VIEW_FAILED / _VIEW_NO_SPACE / _VIEW_CHANGED), VENUE_NOT_QUIESCENT,
         # SMOKE_RUN_FAILED, SMOKE_LOG_UNAVAILABLE, PRESENTMON_UNAVAILABLE, BACKEND_NOT_AVAILABLE,
         # GPU_RECON_FRAMES_ZERO, CPU_FALLBACK_DETECTED, the displayReport failure including
         # DISPLAY_ASLEEP itself, and the success summary.json. CUDA-PERF-DISPLAY-WAKE-3 round 1
