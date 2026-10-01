@@ -156,7 +156,65 @@ def git(cwd: Path, *args: str, check: bool = True) -> subprocess.CompletedProces
     return result
 
 
+def workflow_job_timeouts(workflow_text: str) -> dict[str, int | None]:
+    """Map each job id to its job-level ``timeout-minutes``, or None when it has none.
+
+    Only a literal integer at job-key indent (4 spaces) is a bound on the job. A
+    step-level timeout (deeper indent), an expression, or a longer number that merely
+    starts with the expected digits is not, so each reads as None or as its own value.
+    """
+    jobs_text = workflow_text[workflow_text.index("\njobs:") :]
+    matches = list(re.finditer(r"(?m)^  ([a-z0-9-]+):\r?$", jobs_text))
+    timeouts: dict[str, int | None] = {}
+    for index, match in enumerate(matches):
+        end = matches[index + 1].start() if index + 1 < len(matches) else len(jobs_text)
+        found = re.search(
+            r"(?m)^    timeout-minutes:[ \t]*(\d+)[ \t]*(?:#.*)?\r?$", jobs_text[match.start() : end]
+        )
+        timeouts[match.group(1)] = int(found.group(1)) if found else None
+    return timeouts
+
+
 class RepoHygieneTests(unittest.TestCase):
+    def test_job_timeout_pin_rejects_an_absent_or_unbounded_deadline(self) -> None:
+        def workflow(job_header: str) -> str:
+            return (
+                "on:\n  pull_request:\n\npermissions:\n  contents: read\n\njobs:\n"
+                "  repo-hygiene-python:\n"
+                "    name: Repo Hygiene Python\n"
+                f"{job_header}"
+                "    runs-on: windows-latest\n"
+                "    steps:\n"
+                "      - name: Run tests\n"
+                "        timeout-minutes: 75\n"
+                "        run: python -m unittest\n"
+            )
+
+        bounded = workflow("    timeout-minutes: 75\n")
+        self.assertEqual(workflow_job_timeouts(bounded), {"repo-hygiene-python": 75})
+        self.assertEqual(
+            workflow_job_timeouts(bounded.replace("\n", "\r\n")), {"repo-hygiene-python": 75}
+        )
+        self.assertEqual(
+            workflow_job_timeouts(workflow("    timeout-minutes: 75  # measured margin\n")),
+            {"repo-hygiene-python": 75},
+        )
+        # Removed: the step-level 75 must not stand in for the missing job-level deadline.
+        self.assertEqual(workflow_job_timeouts(workflow("")), {"repo-hygiene-python": None})
+        # An expression or a value the pin does not name is not the pinned bound.
+        self.assertEqual(
+            workflow_job_timeouts(workflow("    timeout-minutes: ${{ vars.CAP }}\n")),
+            {"repo-hygiene-python": None},
+        )
+        self.assertEqual(
+            workflow_job_timeouts(workflow("    timeout-minutes: 750\n")),
+            {"repo-hygiene-python": 750},
+        )
+        self.assertEqual(
+            workflow_job_timeouts(workflow("    timeout-minutes: 0\n")),
+            {"repo-hygiene-python": 0},
+        )
+
     def setUp(self) -> None:
         self.tempdir = Path(tempfile.mkdtemp(prefix="repo-hygiene-test-"))
         self.repo_counter = 0
@@ -977,22 +1035,15 @@ class RepoHygieneTests(unittest.TestCase):
 
         expected_timeouts = {
             "protected-check-route": 10,
-            "repo-hygiene-python": 45,
+            "repo-hygiene-python": 75,
             "windows-product-oracles": 120,
             "windows-gui-pilot": 60,
             "batch-compile": 30,
         }
         jobs_text = workflow[workflow.index("\njobs:") :]
-        job_matches = list(re.finditer(r"(?m)^  ([a-z0-9-]+):\r?$", jobs_text))
-        self.assertEqual({match.group(1) for match in job_matches}, set(expected_timeouts))
-        for index, match in enumerate(job_matches):
-            end = job_matches[index + 1].start() if index + 1 < len(job_matches) else len(jobs_text)
-            job = jobs_text[match.start() : end]
-            self.assertIn(
-                f"    timeout-minutes: {expected_timeouts[match.group(1)]}",
-                job,
-                f"{match.group(1)} must have an explicit bounded deadline",
-            )
+        # Exact equality on the parsed job-level value, not a substring: a step-level
+        # timeout, an expression, or a longer number must not satisfy a job's pin.
+        self.assertEqual(workflow_job_timeouts(workflow), expected_timeouts)
 
         expected_remote_uses = [
             ("actions/checkout", "fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09", "v5"),
