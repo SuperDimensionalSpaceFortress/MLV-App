@@ -7,12 +7,19 @@
 # Design: .claude-state/fleet-runs/dual-venue-design-20260930/DESIGN.md (P1-P7, AMENDMENT 1/2).
 # Nothing in this file writes to a venue share: share writes go ONLY through tools/profiling/
 # um-run.ps1 (NA-7). Reads of a share (summary.json, the artifact index) are plain reads.
+#
+# Round 2 (owner rule 2026-09-30, docs/playback-clip-length-rule.md): this module never plays the app, never opens a
+# clip and never names a path. A leg is a CLIP ID; Get-DvClipAdmission refuses a fixture (master's length gate) and a
+# clip the venue has no owner-typed consent record for; a PASS/FAIL receipt must carry the receipt oracle's verdict
+# (Get-DvPlaybackEvidence / Test-DvReceiptValid) or it is INVALID.
 
 Set-StrictMode -Version Latest
 
 $script:ReceiptSchema = 'mlv-app/dual-venue-receipt/v1'
 # P4: the ONLY outcomes a receipt may carry.
-$script:OutcomeEnum = @('PASS', 'FAIL', 'VENUE_UNHEALTHY', 'VENUE_NOT_QUIESCENT', 'VENUE_HOST_MISMATCH', 'DEVICE_UNAVAILABLE', 'UNRESOLVED', 'RETRACTED')
+# INVALID (round 2): the leg ran or was captured but the receipt oracle's proof is not in it (under 20 s of source
+# frames, a wrap, a foreign run, a fixture); it carries no signal, exactly like DEVICE_UNAVAILABLE.
+$script:OutcomeEnum = @('PASS', 'FAIL', 'VENUE_UNHEALTHY', 'VENUE_NOT_QUIESCENT', 'VENUE_HOST_MISMATCH', 'DEVICE_UNAVAILABLE', 'UNRESOLVED', 'RETRACTED', 'INVALID')
 
 function Get-DvOutcomeEnum { $script:OutcomeEnum }
 
@@ -134,36 +141,194 @@ function Get-DvVenueRole {
 # --- clips (P7) -----------------------------------------------------------------------------------
 $script:FixtureClipIds = @('tiny_dual_iso', 'large_dual_iso')
 
-function Get-DvTrackedFixture {
-    <#
-    .SYNOPSIS
-    For a clipId that names a TRACKED fixture under tests/fixtures/clips, its path and sha256; else $null.
-    "Tracked" is proven with git ls-files against the repo, not assumed from a name.
-    #>
-    param([string]$ClipId, [string]$RepoRoot)
-    if ($script:FixtureClipIds -cnotcontains $ClipId) { return $null }
-    $relative = "tests/fixtures/clips/$ClipId" + '.' + 'mlv'
-    $tracked = @(& git -C $RepoRoot ls-files --full-name -- $relative 2>$null)
-    if ($LASTEXITCODE -ne 0 -or $tracked.Count -ne 1) { return $null }
-    $full = Join-Path $RepoRoot ($relative -replace '/', '\')
-    if (-not (Test-Path -LiteralPath $full -PathType Leaf)) { return $null }
-    [pscustomobject]@{ clipId = $ClipId; path = $full; sha256 = (Get-DvSha256OfFile $full) }
+$script:ClipIdPattern = '^[A-Za-z]\d{2}-\d{3,4}$'
+$script:ConsentSchema = 'mlv-app/dual-venue-clip-consent/v1'
+$script:ConsentRecordKeys = @('venue', 'clipId', 'ownerLineSha256', 'recordedUtc', 'recordedBy')
+
+function Get-DvProp {
+    # A property of a hashtable OR an object, $null when absent (StrictMode-safe). `return ,` keeps an empty array an
+    # empty array (it is unrolled once by the caller, so a scalar still arrives as a scalar).
+    param($Object, [string]$Name)
+    if ($null -eq $Object) { return $null }
+    if ($Object -is [System.Collections.IDictionary]) {
+        if ($Object.Contains($Name)) { return , $Object[$Name] }
+        return $null
+    }
+    $p = $Object.PSObject.Properties[$Name]
+    if ($null -ne $p) { return , $p.Value }
+    $null
 }
 
-function Test-DvOwnerClipAdmitted {
+function Read-DvClipConsent {
     <#
     .SYNOPSIS
-    Whether a NON-fixture clip may be run. Needs BOTH an owner-typed consent line AND the owner-footage
-    cleanup class being gone (venues.json ownerFootage.cleanupClassGone, false until CROSS-VOLUME-2
-    lands). Until then every owner clip is refused with a typed reason -- a refusal, not an error.
+    Read the tracked, OWNER-WRITTEN per-venue consent file (tools/profiling/dual-venue/venue-clip-consent.json). The
+    hub records an owner-typed CLIP line there as a record keyed by venue + clip id (the line itself only as its
+    sha256); agents never write it and this function only ever reads it. FAIL CLOSED: a missing file, bad JSON, a wrong
+    schema or any record that is not exactly the five reviewed keys (so a path cannot ride along in an extra field)
+    makes the WHOLE file invalid -- unknown consent is no consent.
+    Returns [pscustomobject]@{ ok; reason; records }.
     #>
-    param($Table, [string]$ConsentLine)
+    param([Parameter(Mandatory)][string]$Path, [Parameter(Mandatory)]$Table)
+    $bad = { param($why) [pscustomobject]@{ ok = $false; reason = $why; records = @() } }
+    if (-not (Test-Path -LiteralPath $Path -PathType Leaf)) { return (& $bad 'the consent file is missing') }
+    $text = [IO.File]::ReadAllText($Path)
+    # A consent record names a clip by ID. A drive path or a footage file name anywhere in the file is refused outright.
+    if ($text -match '(?i)[a-z]:[\\/]|\.mlv\b') { return (& $bad 'the consent file carries a path-shaped value') }
+    try { $doc = $text | ConvertFrom-Json } catch { return (& $bad 'the consent file is not valid JSON') }
+    if ([string](Get-DvProp $doc 'schema') -ne $script:ConsentSchema) { return (& $bad "the consent file schema is not $($script:ConsentSchema)") }
+    if ($null -eq $doc.PSObject.Properties['records']) { return (& $bad 'the consent file has no records array') }
+    $venues = @($Table.venues.PSObject.Properties | ForEach-Object { $_.Name })
+    $records = @()
+    foreach ($r in @($doc.records)) {
+        if ($null -eq $r) { return (& $bad 'a consent record is null') }
+        $keys = @($r.PSObject.Properties | ForEach-Object { $_.Name })
+        if ($keys.Count -ne $script:ConsentRecordKeys.Count -or @($keys | Where-Object { $_ -cnotin $script:ConsentRecordKeys }).Count -gt 0) {
+            return (& $bad 'a consent record is not exactly venue, clipId, ownerLineSha256, recordedUtc, recordedBy')
+        }
+        if ([string]$r.venue -cnotin $venues) { return (& $bad 'a consent record names a venue the venue table does not have') }
+        if ([string]$r.clipId -cnotmatch $script:ClipIdPattern) { return (& $bad 'a consent record clipId is not a consented clip id') }
+        if ([string]$r.ownerLineSha256 -cnotmatch '^[0-9a-f]{64}$') { return (& $bad 'a consent record ownerLineSha256 is not 64 lowercase hex') }
+        if ([string]::IsNullOrWhiteSpace([string]$r.recordedUtc) -or [string]::IsNullOrWhiteSpace([string]$r.recordedBy)) { return (& $bad 'a consent record lacks recordedUtc/recordedBy') }
+        $records += $r
+    }
+    [pscustomobject]@{ ok = $true; reason = $null; records = $records }
+}
+
+function Get-DvClipAdmission {
+    <#
+    .SYNOPSIS
+    The ONE gate that decides whether a leg may play a clip on a venue, run BEFORE anything is generated or submitted.
+    A leg is addressed by CONSENTED CLIP ID only (never a path). Refusals are typed and path-free:
+      FIXTURE_REFUSED_<verdict>            a tracked fixture (2 and 16 frames) can never satisfy 20 s of distinct source
+                                           frames; <verdict> is master's own length gate's (CLIP_TOO_SHORT), so a fixture
+                                           is refused by the same gate that refuses a short clip anywhere else, never looped
+      CLIP_ID_INVALID                      not a consented clip id
+      VENUE_CLIP_CONSENT_INVALID           the per-venue consent file is missing/malformed (fail closed)
+      VENUE_CLIP_CONSENT_ABSENT            no owner-typed record for THIS venue + this clip id (consent on one venue
+                                           never implies the other)
+      OWNER_CLIP_REFUSED_PENDING_CROSS_VOLUME_2   the reviewed switch venues.json ownerFootage.cleanupClassGone is false
+    #>
+    param(
+        [Parameter(Mandatory)][string]$ClipId, [Parameter(Mandatory)][string]$Venue, [Parameter(Mandatory)]$Table,
+        [Parameter(Mandatory)][string]$ConsentPath, [Parameter(Mandatory)][string]$RepoRoot
+    )
+    $refuse = { param($token) [pscustomobject]@{ admitted = $false; reason = $token } }
+    if ($script:FixtureClipIds -ccontains $ClipId) {
+        $verdict = 'NOT_A_CONSENTED_CLIP'
+        $gate = Join-Path $PSScriptRoot '..\gui-smoke-length-gate.ps1'
+        $header = Join-Path (Join-Path (Join-Path (Join-Path $RepoRoot 'tests') 'fixtures') 'clips') ($ClipId + '.' + 'mlv')
+        if (Test-Path -LiteralPath $gate -PathType Leaf) {
+            . $gate
+            $g = Test-GuiSmokeClipLength -Path $header -WindowSeconds 20
+            if ($g.verdict -ne 'OK') { $verdict = [string]$g.verdict }
+        }
+        return (& $refuse "FIXTURE_REFUSED_$verdict")
+    }
+    if ($ClipId -cnotmatch $script:ClipIdPattern) { return (& $refuse 'CLIP_ID_INVALID') }
+    $consent = Read-DvClipConsent -Path $ConsentPath -Table $Table
+    if (-not $consent.ok) { return (& $refuse 'VENUE_CLIP_CONSENT_INVALID') }
+    $record = $null
+    foreach ($r in $consent.records) {
+        if ([string]$r.venue -ceq $Venue -and [string]$r.clipId -ceq $ClipId) { $record = $r; break }
+    }
+    if ($null -eq $record) { return (& $refuse 'VENUE_CLIP_CONSENT_ABSENT') }
     $refusal = 'OWNER_CLIP_REFUSED_PENDING_CROSS_VOLUME_2'
     if ($null -ne $Table.PSObject.Properties['ownerFootage']) { $refusal = [string]$Table.ownerFootage.refusal }
     $cleanupGone = ($null -ne $Table.PSObject.Properties['ownerFootage']) -and [bool]$Table.ownerFootage.cleanupClassGone
-    if (-not $cleanupGone) { return [pscustomobject]@{ admitted = $false; reason = $refusal } }
-    if ([string]::IsNullOrWhiteSpace($ConsentLine)) { return [pscustomobject]@{ admitted = $false; reason = 'OWNER_CLIP_REFUSED_NO_CONSENT_LINE' } }
+    if (-not $cleanupGone) { return (& $refuse $refusal) }
     [pscustomobject]@{ admitted = $true; reason = $null }
+}
+
+# --- the receipt oracle's verdict, carried in the receipt (round 2) -------------------------------------
+function Get-DvPlaybackProblems {
+    <#
+    .SYNOPSIS
+    Judge the play-proof block of a receipt. EVERY field must be PRESENT (an absent field is INVALID, never "no wrap" or
+    "pace unchecked"); the verdict is re-derived from the fields, never taken from a stored `valid`. Returns the list of
+    problems (empty = valid). This repeats, at the receipt, the rules master's job oracle
+    (Get-AttrCudaSourceFramesVerdict) already applied: source_advanced >= required_source_frames, no wrap, THIS run's
+    nonce, and a clip that is the leg's clip and not a fixture rehearsal.
+    #>
+    param($Playback, [string]$ExpectedClipId)
+    $reasons = [System.Collections.Generic.List[string]]::new()
+    if ($null -eq $Playback) { $reasons.Add('RECEIPT_FIELD_ABSENT: the receipt carries no source-frame verdict (playback)'); return $reasons.ToArray() }
+    $advanced = $null; $required = $null
+    $parsed = 0L
+    $rawAdvanced = Get-DvProp $Playback 'sourceAdvanced'
+    $rawRequired = Get-DvProp $Playback 'requiredSourceFrames'
+    if ($null -ne $rawAdvanced -and $rawAdvanced -isnot [bool] -and [int64]::TryParse([string]$rawAdvanced, [ref]$parsed)) { $advanced = $parsed }
+    $parsed = 0L
+    if ($null -ne $rawRequired -and $rawRequired -isnot [bool] -and [int64]::TryParse([string]$rawRequired, [ref]$parsed)) { $required = $parsed }
+    if ($null -eq $advanced) { $reasons.Add('RECEIPT_FIELD_ABSENT: source_advanced') }
+    if ($null -eq $required) { $reasons.Add('RECEIPT_FIELD_ABSENT: required_source_frames') }
+    elseif ($required -lt 20) { $reasons.Add("INVALID_SOURCE_FRAMES: required_source_frames=$required is under the 20-frame floor; the admitted Play was shorter than 20 s of footage") }
+    if ($null -ne $advanced -and $null -ne $required) {
+        if ($advanced -lt $required) { $reasons.Add("INVALID_SOURCE_FRAMES: source_advanced=$advanced is under required_source_frames=$required; under 20 s of real footage is never evidence") }
+    }
+    $wrapped = Get-DvProp $Playback 'wrapped'
+    if ($wrapped -isnot [bool]) { $reasons.Add('RECEIPT_FIELD_ABSENT: wrapped') }
+    elseif ($wrapped) { $reasons.Add('INVALID_LOOPED: the timeline wrapped, jumped to the first frame or restarted') }
+    $failures = Get-DvProp $Playback 'failures'
+    if ($null -eq $failures) { $reasons.Add('RECEIPT_FIELD_ABSENT: failures') }
+    else { foreach ($f in @($failures)) { if ($null -ne $f -and [string]$f -ne '') { $reasons.Add("the job's own oracle reported: $f") } } }
+    $nonce = [string](Get-DvProp $Playback 'runNonce')
+    if ($nonce -notmatch '^n[0-9a-f]{32}$') { $reasons.Add('RECEIPT_NOT_THIS_RUN: the receipt carries no well-formed run nonce, so it cannot be shown to be this run''s') }
+    $rehearsal = Get-DvProp $Playback 'fixtureRehearsal'
+    if ($rehearsal -ne $false) { $reasons.Add('FIXTURE_REHEARSAL: the job did not report fixtureRehearsal=false; a fixture rehearsal is never venue playback evidence') }
+    $jobClip = [string](Get-DvProp $Playback 'clipId')
+    if ([string]::IsNullOrWhiteSpace($jobClip)) { $reasons.Add('RECEIPT_FIELD_ABSENT: clipId') }
+    elseif ($jobClip -cne $ExpectedClipId) { $reasons.Add('CLIP_MISMATCH: the job reports a different clip id than the leg names') }
+    $reasons.ToArray()
+}
+
+function Get-DvPlaybackEvidence {
+    <#
+    .SYNOPSIS
+    Build the receipt's `playback` block from the job's summary.json (`sourceFrames`, `fixtureRehearsal`, `clipId`) and
+    evidence manifest (`smokeRunLog.runNonce`), copied verbatim, plus the derived verdict.
+    #>
+    param($Summary, $EvidenceManifest, [Parameter(Mandatory)][string]$ExpectedClipId)
+    $sf = Get-DvProp $Summary 'sourceFrames'
+    $log = Get-DvProp $EvidenceManifest 'smokeRunLog'
+    $pb = [ordered]@{
+        oracle = 'the job receipt oracle (Get-AttrCudaSourceFramesVerdict): source_advanced >= required_source_frames, wrapped=0, native pace, no fps override, this run''s nonce'
+        sourceAdvanced = (Get-DvProp $sf 'sourceAdvanced')
+        requiredSourceFrames = (Get-DvProp $sf 'requiredSourceFrames')
+        wrapped = (Get-DvProp $sf 'wrapped')
+        failures = (Get-DvProp $sf 'failures')
+        runNonce = (Get-DvProp $log 'runNonce')
+        fixtureRehearsal = (Get-DvProp $Summary 'fixtureRehearsal')
+        clipId = (Get-DvProp $Summary 'clipId')
+        valid = $false
+        invalidReasons = @()
+    }
+    $problems = @(Get-DvPlaybackProblems -Playback $pb -ExpectedClipId $ExpectedClipId)
+    $pb['valid'] = ($problems.Count -eq 0)
+    $pb['invalidReasons'] = $problems
+    $pb
+}
+
+function Test-DvReceiptValid {
+    <#
+    .SYNOPSIS
+    Is this receipt a well-formed signal? A receipt that says PASS or FAIL must carry the clip id, the clip's content
+    hash, a um-run RECEIPT and the receipt oracle's verdict (source_advanced, required_source_frames, run nonce, wrap,
+    clip); without them it is INVALID, not PASS/FAIL. Every other outcome carries no signal and needs no proof. Readers
+    (Get-VenueEvidence) call this too; the verdict is re-derived from the fields, never from a stored flag.
+    #>
+    param([Parameter(Mandatory)]$Receipt)
+    $reasons = [System.Collections.Generic.List[string]]::new()
+    $outcome = [string](Get-DvProp $Receipt 'outcome')
+    if ($outcome -in @('PASS', 'FAIL')) {
+        $subject = Get-DvProp $Receipt 'subject'
+        $clipId = [string](Get-DvProp $subject 'clipId')
+        if ([string]::IsNullOrWhiteSpace($clipId)) { $reasons.Add('subject.clipId absent') }
+        if ([string](Get-DvProp $subject 'clipContentSha256') -cnotmatch '^[0-9a-f]{64}$') { $reasons.Add('subject.clipContentSha256 absent or not 64 lowercase hex') }
+        if ([string](Get-DvProp (Get-DvProp $Receipt 'evidence') 'umRunOutcome') -ne 'RECEIPT') { $reasons.Add('evidence.umRunOutcome is not RECEIPT') }
+        foreach ($p in @(Get-DvPlaybackProblems -Playback (Get-DvProp $Receipt 'playback') -ExpectedClipId $clipId)) { $reasons.Add($p) }
+    }
+    [pscustomobject]@{ valid = ($reasons.Count -eq 0); reasons = $reasons.ToArray() }
 }
 
 # --- health (P5) ----------------------------------------------------------------------------------
@@ -310,7 +475,12 @@ function ConvertFrom-DvMarkerLine {
 # --- job result -> typed outcome (P4) -------------------------------------------------------------
 $script:VenueConditionResults = @('SCREENSAVER_SECURE_OWNER_ONLY', 'DISPLAY_WAKE_DISMISS_FAILED', 'KEEPALIVE_FAILED', 'DISPLAY_ASLEEP')
 $script:DeviceUnavailableResults = @('BACKEND_NOT_AVAILABLE')
-$script:CapturedResults = @('MEASUREMENT_CAPTURED', 'FIXTURE_REHEARSAL_CAPTURED')
+# A FIXTURE_REHEARSAL_CAPTURED job is NOT a capture of venue playback (fixtures are never played on a venue); only
+# MEASUREMENT_CAPTURED can become PASS/FAIL. A rehearsal result falls through to FAIL ... and then to INVALID below.
+$script:CapturedResults = @('MEASUREMENT_CAPTURED')
+# The job's typed smoke refusals (generator: $smokeRefusalReason) that mean "this was not >= 20 s of real footage".
+$script:PlayLengthRefusalReasons = @('PLAY_WINDOW_TOO_SHORT', 'PLAY_DURATION_TOO_SHORT', 'PLAY_PACE_TOO_SLOW', 'CLIP_TOO_SHORT', 'CLIP_LENGTH_UNKNOWN',
+    'INVALID_SOURCE_FRAMES', 'INVALID_LOOPED', 'SOURCE_FRAMES_SHORT', 'PLAY_SAFETY_TIMEOUT', 'REPLAY_REFUSED', 'PASS_THROUGH_REFUSED')
 
 function Get-DvResultToken([string]$Stdout) {
     foreach ($line in ($Stdout -split "`r?`n")) {
@@ -325,9 +495,17 @@ function Resolve-DvJobOutcome {
     Map a job's RESULT token to a P4 outcome. Captured -> PASS/FAIL is decided by the caller from the
     leg's criteria (this returns 'CAPTURED'). Venue conditions are venue outcomes, not product FAILs.
     #>
-    param([string]$ResultToken, [int]$ExitCode)
+    param([string]$ResultToken, [int]$ExitCode, [string]$SmokeRefusalReason = '')
     if ([string]::IsNullOrEmpty($ResultToken)) { return [pscustomobject]@{ outcome = 'FAIL'; detail = "job exited $ExitCode with no RESULT line" } }
     if ($ResultToken -in $script:CapturedResults) { return [pscustomobject]@{ outcome = 'CAPTURED'; detail = $ResultToken } }
+    # Round 2: the job's own play-length / source-frame refusals are not product results. A run that could not show >= 20 s
+    # of distinct source frames (short, looped, replayed, foreign, too slow) is INVALID evidence, never a FAIL.
+    $reasonSuffix = $(if ([string]::IsNullOrEmpty($SmokeRefusalReason) -or $SmokeRefusalReason -eq 'NONE') { '' } else { " $SmokeRefusalReason" })
+    if ($ResultToken -eq 'FIXTURE_REHEARSAL_CAPTURED') { return [pscustomobject]@{ outcome = 'INVALID'; detail = 'FIXTURE_REHEARSAL_CAPTURED: a fixture rehearsal is never venue playback evidence' } }
+    if ($ResultToken -eq 'SOURCE_FRAMES_INVALID') { return [pscustomobject]@{ outcome = 'INVALID'; detail = ($ResultToken + $(if ($reasonSuffix) { $reasonSuffix } else { ' INVALID_SOURCE_FRAMES' })) } }
+    if ($reasonSuffix -and $SmokeRefusalReason -in $script:PlayLengthRefusalReasons -and $ResultToken -notin $script:VenueConditionResults -and $ResultToken -notin $script:DeviceUnavailableResults) {
+        return [pscustomobject]@{ outcome = 'INVALID'; detail = ($ResultToken + $reasonSuffix) }
+    }
     if ($ResultToken -eq 'VENUE_NOT_QUIESCENT') { return [pscustomobject]@{ outcome = 'VENUE_NOT_QUIESCENT'; detail = $ResultToken } }
     if ($ResultToken -eq 'VENUE_HOST_MISMATCH') { return [pscustomobject]@{ outcome = 'VENUE_HOST_MISMATCH'; detail = $ResultToken } }
     if ($ResultToken -in $script:DeviceUnavailableResults) { return [pscustomobject]@{ outcome = 'DEVICE_UNAVAILABLE'; detail = $ResultToken } }
@@ -422,6 +600,9 @@ function New-DvReceipt {
         outcomeDetail = $null
         evidence = [ordered]@{ summaryJsonSha256 = $null; evidenceManifestSha256 = $null; artifactIndexPath = $null; umRunOutcome = $null }
         metrics = $null
+        # Round 2: the receipt oracle's verdict (source_advanced / required_source_frames / run nonce / wrap / clip id).
+        # A receipt that says PASS or FAIL without a valid one is INVALID (Test-DvReceiptValid).
+        playback = $null
         look = $null
         registry = $null
         refusal = $null
@@ -439,6 +620,11 @@ function Write-DvReceipt {
     #>
     param([Parameter(Mandatory)]$Receipt, [Parameter(Mandatory)][string]$ReceiptRoot)
     if ($Receipt['outcome'] -notin $script:OutcomeEnum) { throw "DVE_RECEIPT_OUTCOME_INVALID '$($Receipt['outcome'])' is not one of: $($script:OutcomeEnum -join ', ')" }
+    if ($Receipt['outcome'] -in @('PASS', 'FAIL')) {
+        # The writer never records a signal without its proof, whatever the caller believed.
+        $validity = Test-DvReceiptValid -Receipt $Receipt
+        if (-not $validity.valid) { throw "DVE_RECEIPT_INVALID a $($Receipt['outcome']) receipt without a valid receipt-oracle verdict is refused: $($validity.reasons -join '; ')" }
+    }
     if (-not $Receipt['finishedUtc']) { $Receipt['finishedUtc'] = [DateTime]::UtcNow.ToString('o') }
     $dir = Join-Path (Join-Path (Join-Path $ReceiptRoot $Receipt['card']) $Receipt['legId']) $Receipt['venue']['name']
     New-Item -ItemType Directory -Force -Path $dir | Out-Null
@@ -451,6 +637,7 @@ function Write-DvReceipt {
 }
 
 Export-ModuleMember -Function Get-DvOutcomeEnum, ConvertTo-DvCanonicalJson, Get-DvSha256OfBytes, Get-DvSha256OfText, Get-DvSha256OfFile,
-    Get-DvSubjectDigest, Read-DvVenueTable, Get-DvVenueRole, Get-DvTrackedFixture, Test-DvOwnerClipAdmitted, Get-DvHealthVerdict,
+    Get-DvSubjectDigest, Read-DvVenueTable, Get-DvVenueRole, Get-DvProp, Read-DvClipConsent, Get-DvClipAdmission, Get-DvPlaybackProblems,
+    Get-DvPlaybackEvidence, Test-DvReceiptValid, Get-DvHealthVerdict,
     New-DvHealthProbeJobText, ConvertFrom-DvProbeStdout, New-DvRegSnapshotJobText, New-DvRegRestoreJobText, ConvertFrom-DvMarkerLine,
     Get-DvResultToken, Resolve-DvJobOutcome, Test-DvCriteria, Get-DvVerbatimMetrics, New-DvReceipt, Write-DvReceipt

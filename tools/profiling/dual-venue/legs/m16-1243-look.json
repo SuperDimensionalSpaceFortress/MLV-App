@@ -1,9 +1,10 @@
 {
   "schema": "mlv-app/dual-venue-leg/v1",
-  "legId": "fixture-look-large",
+  "legId": "m16-1243-look",
   "card": "DUAL-VENUE-EVIDENCE-1",
   "legType": "look",
-  "clipId": "large_dual_iso",
+  "clipId": "M16-1243",
+  "playSeconds": 25,
   "backends": ["cuda", "cpu"],
   "scaleFactor": 4,
   "generatorArgs": { "telemetryArm": "LIGHT", "cpuQuiescenceThresholdPercent": 95 },

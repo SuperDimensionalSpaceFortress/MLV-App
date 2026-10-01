@@ -3170,13 +3170,11 @@ if ($isCpuBackend -or $ForceLookAssist) {
     $template = Edit-DualVenueTemplate $template '$contactSheetBackendLabel = if ($FixtureRehearsal) { ''fixture'' } else { ''cuda'' }' '$contactSheetBackendLabel = if ($FixtureRehearsal) { "fixture-$Backend" } else { $Backend }'
 }
 if ($ForceLookAssist) {
-    # A2: the venue's persisted "use default receipt" setting is turned off (a default receipt
-    # could reset Look Assist off), and the runner is told Look Assist is REQUIRED -- it fails the
-    # leg closed if Look Assist did not settle and apply. -DisableLookAssist is never passed.
-    $template = Edit-DualVenueTemplate $template 'reg add "HKCU\Software\magiclantern.MLVApp\MLVApp\Playback" /v PreviewResolution /t REG_DWORD /d 0 /f | Out-Null
-' 'reg add "HKCU\Software\magiclantern.MLVApp\MLVApp\Playback" /v PreviewResolution /t REG_DWORD /d 0 /f | Out-Null
-reg add "HKCU\Software\magiclantern.MLVApp\MLVApp" /v defaultReceiptEnabled /t REG_DWORD /d 0 /f | Out-Null
-'
+    # A2: the runner is told Look Assist is REQUIRED -- it fails the leg closed if Look Assist did not
+    # settle and apply. -DisableLookAssist is never passed. Look Assist is FORCED by the job, never inherited
+    # from the venue: since PLAYBACK-CLIP-LENGTH-ENFORCE-4 an automation run reads a run-scoped settings store
+    # (automation_settings::isolate()), so the venue's persisted "use default receipt" setting (which could have
+    # reset Look Assist off) is never read, and this job no longer seeds the venue's registry.
     $template = Edit-DualVenueTemplate $template '-RequireLookAssist:`$false -Scope none' '-RequireLookAssist:`$true -Scope none'
     if ($LookFlavor -ne 'classic') {
         $template = Edit-DualVenueTemplate $template "    'MLVAPP_PLAYBACK_PHASE3_UNATTENDED=1',

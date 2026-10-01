@@ -8,18 +8,23 @@
 # The flow (each step a refusal the code enforces, each refusal a receipt):
 #   1. read the leg spec (legSpecSha256 = sha256 of its bytes) and the venue table; the venue's ROLE
 #      for the leg's card comes from venues.json, never from an argument (P3);
-#   2. refuse an owner clip (only the tracked fixtures run; OWNER_CLIP_REFUSED_PENDING_CROSS_VOLUME_2)
-#      BEFORE anything is submitted (P7);
-#   3. bounded health probe on the venue (P5) -> VENUE_UNHEALTHY, the leg is NOT submitted;
-#   4. P6: the declared -Venue must agree with Get-AttrCudaMeasurementVenue on the host the probe ran
+#   2. ADMIT THE CLIP (round 2, owner rule 2026-09-30): a leg names a CONSENTED CLIP ID, never a path. A tracked
+#      fixture (2 / 16 frames) is refused by master's length gate (FIXTURE_REFUSED_CLIP_TOO_SHORT); a clip this
+#      VENUE has no owner-typed record for in venue-clip-consent.json is refused (VENUE_CLIP_CONSENT_ABSENT);
+#      a play window under 20 s is refused (PLAY_WINDOW_TOO_SHORT); the reviewed cleanup switch must be on
+#      (OWNER_CLIP_REFUSED_PENDING_CROSS_VOLUME_2). All BEFORE anything is generated or submitted;
+#   3. generate the job (tools/profiling/bachelor/playback-attr-3-cuda-job.ps1 -ClipId -PlaySeconds -Venue -Backend ...):
+#      the generator resolves the clip by id and refuses what master's clip-length gate refuses;
+#   4. bounded health probe on the venue (P5) -> VENUE_UNHEALTHY, the leg is NOT submitted;
+#   5. P6: the declared -Venue must agree with Get-AttrCudaMeasurementVenue on the host the probe ran
 #      on, and the host must be the venue table's expectedHost -> VENUE_HOST_MISMATCH;
-#   5. the staged build, fixture and smoke-runner closure must be the ones named (never a different
-#      build) -> DEVICE_UNAVAILABLE;
-#   6. generate the job (tools/profiling/bachelor/playback-attr-3-cuda-job.ps1 -Venue -Backend ...),
-#      snapshot the venue's HKCU magiclantern.MLVApp QSettings, submit THROUGH um-run.ps1 (NA-7),
-#      restore the QSettings afterwards (values are never printed);
-#   7. read summary.json / evidence-manifest.json / artifact-index.json, copy metrics VERBATIM, map the
-#      job's RESULT to a P4 outcome, evaluate the role's criteria, write the receipt.
+#   6. the staged build and smoke-runner closure must be the ones named (never a different build)
+#      -> DEVICE_UNAVAILABLE; snapshot the venue's HKCU magiclantern.MLVApp QSettings, submit THROUGH
+#      um-run.ps1 (NA-7), restore the QSettings afterwards (values are never printed);
+#   7. read summary.json / evidence-manifest.json / artifact-index.json, copy metrics VERBATIM, copy the receipt
+#      oracle's verdict (source_advanced / required_source_frames / run nonce / wrap / clip id) into the receipt,
+#      map the job's RESULT to a P4 outcome, evaluate the role's criteria, write the receipt. A PASS/FAIL without
+#      a valid oracle verdict is INVALID.
 #
 # EXIT CODE IS NEVER EVIDENCE: 0 means "a receipt was written" (whatever its outcome), 2 means the
 # receipt itself could not be written. Read the receipt.
@@ -31,9 +36,9 @@ param(
     [Parameter(Mandatory = $true)][ValidatePattern('^[0-9a-f]{64}$')][string]$BuildManifestSha256,
     [Parameter(Mandatory = $true)][ValidatePattern('^[0-9a-f]{40}$')][string]$SourceCommit,
     [ValidateSet('cuda', 'cpu')][string]$Backend = '',
-    # The owner's typed CLIP line for an owner-clip leg. Refused regardless until the owner-footage
-    # cleanup class is gone (venues.json ownerFootage.cleanupClassGone).
-    [string]$OwnerClipConsentLine = '',
+    # The tracked, OWNER-WRITTEN per-venue consent file (the hub records owner-typed CLIP lines there; agents never
+    # write it). Default: venue-clip-consent.json beside this script. A test seam; production passes none.
+    [string]$ConsentPath = '',
     # Run only the health probe (and P6) and stop: records the venue's state without running the leg.
     [switch]$HealthOnly,
     [string]$Actor = '',
@@ -54,6 +59,7 @@ $here = $PSScriptRoot
 Import-Module (Join-Path $here 'DualVenueRunner.psm1') -Force
 if ([string]::IsNullOrWhiteSpace($RepoRoot)) { $RepoRoot = (Resolve-Path (Join-Path $here '..\..\..')).Path }
 if ([string]::IsNullOrWhiteSpace($VenueTablePath)) { $VenueTablePath = Join-Path $here 'venues.json' }
+if ([string]::IsNullOrWhiteSpace($ConsentPath)) { $ConsentPath = Join-Path $here 'venue-clip-consent.json' }
 if ([string]::IsNullOrWhiteSpace($UmRunScript)) { $UmRunScript = Join-Path $here '..\um-run.ps1' }
 if ([string]::IsNullOrWhiteSpace($GeneratorScript)) { $GeneratorScript = Join-Path $here '..\bachelor\playback-attr-3-cuda-job.ps1' }
 if ([string]::IsNullOrWhiteSpace($ReceiptRoot)) {
@@ -78,6 +84,10 @@ if ($spec.schema -ne 'mlv-app/dual-venue-leg/v1') { throw "DVE_LEG_SPEC_INVALID 
 if ([string]::IsNullOrWhiteSpace($Backend)) { $Backend = [string]@($spec.backends)[0] }
 if ($Backend -notin @($spec.backends)) { throw "DVE_LEG_SPEC_INVALID backend '$Backend' is not one of this leg's backends ($(@($spec.backends) -join ', '))" }
 $isLook = ($spec.legType -eq 'look')
+# The settled-playback window the job passes to the smoke runner (generator -PlaySeconds). The generator's own default
+# is 25; the owner's floor is 20 and is enforced here before anything is submitted.
+$playSeconds = 25
+if ($null -ne $spec.PSObject.Properties['playSeconds']) { $playSeconds = [int]$spec.playSeconds }
 $lookFlavor = $null
 if ($isLook) { $lookFlavor = [string]$spec.look.lookFlavor; if ([string]::IsNullOrWhiteSpace($lookFlavor)) { $lookFlavor = 'classic' } }
 
@@ -145,21 +155,51 @@ $terminal = $null
 $run = $null
 try {
 try {
-    # --- 2. clip admission (P7) -- before anything is generated or submitted ---------------------
-    $fixture = Get-DvTrackedFixture -ClipId ([string]$spec.clipId) -RepoRoot $RepoRoot
-    if ($null -eq $fixture) {
-        $admission = Test-DvOwnerClipAdmitted -Table $table -ConsentLine $OwnerClipConsentLine
-        if (-not $admission.admitted) {
-            $receipt.refusal = [string]$admission.reason
-            # No P4 enum value names a refusal; DEVICE_UNAVAILABLE carries no signal and the typed
-            # reason is in refusal/outcomeDetail. (Schema note for the hub: see the PR description.)
-            Stop-Leg 'DEVICE_UNAVAILABLE' ([string]$admission.reason)
-        }
-        throw 'DVE_OWNER_CLIP_ADMITTED_BUT_UNSUPPORTED this runner only runs tracked fixtures; the owner-clip route is not built yet'
+    # --- 2. clip admission (P7 + the clip-length class) -- before anything is generated or submitted ---------
+    function Stop-Refused([string]$Token) {
+        # No P4 enum value names a refusal; DEVICE_UNAVAILABLE carries no signal and the typed reason is in
+        # refusal / outcomeDetail. Path-free by construction: tokens only.
+        $receipt.refusal = $Token
+        Stop-Leg 'DEVICE_UNAVAILABLE' $Token
     }
-    $receipt.subject.clipContentSha256 = $fixture.sha256
+    if ($playSeconds -lt 20) { Stop-Refused 'PLAY_WINDOW_TOO_SHORT' }
+    $admission = Get-DvClipAdmission -ClipId ([string]$spec.clipId) -Venue $Venue -Table $table -ConsentPath $ConsentPath -RepoRoot $RepoRoot
+    if (-not $admission.admitted) { Stop-Refused ([string]$admission.reason) }
 
-    # --- 3. health probe (P5), bounded -------------------------------------------------------------
+    # --- 3. generate the job (local, no I/O on the venue) ----------------------------------------------
+    # The generator resolves the clip by ID (it refuses a path, a fixture under 20 s, an unknown or unconsented id).
+    # Generating BEFORE the health probe means a resolver refusal submits nothing at all.
+    $jobFile = Join-Path $workDirResolved "$jobStem.job.ps1"
+    $gen = @{
+        SourceCommit = $SourceCommit; BuildManifestSha256 = $BuildManifestSha256; ClipId = [string]$spec.clipId
+        OutFile = $jobFile; RepoRoot = $RepoRoot; PlaySeconds = $playSeconds
+        Venue = $Venue; Backend = $Backend; ScaleFactor = [int]$spec.scaleFactor
+    }
+    if ($VenueTablePath -ne (Join-Path $here 'venues.json')) { $gen['VenueTablePath'] = $VenueTablePath }
+    if ($null -ne $spec.PSObject.Properties['generatorArgs']) {
+        if ($spec.generatorArgs.PSObject.Properties['telemetryArm']) { $gen['TelemetryArm'] = [string]$spec.generatorArgs.telemetryArm }
+        if ($spec.generatorArgs.PSObject.Properties['cpuQuiescenceThresholdPercent']) { $gen['CpuQuiescenceThresholdPercent'] = [double]$spec.generatorArgs.cpuQuiescenceThresholdPercent }
+    }
+    if ($isLook) {
+        $gen['ContactSheet'] = $true; $gen['ContactSheetFrames'] = [int]$spec.look.contactSheetFrames
+        $gen['ForceLookAssist'] = $true; $gen['LookFlavor'] = $lookFlavor
+    }
+    try {
+        $genOut = @(& $GeneratorScript @gen)
+    } catch {
+        # A typed generator refusal (owner id unknown / not consented / clip too short / bad argument) is a refusal
+        # receipt, recorded as its TOKEN only (a message may echo a value). Anything untyped is a runner error.
+        $first = ([string]$_.Exception.Message -split '\s+')[0]
+        if ($first -match '^(PLAYBACK_ATTR3|DUAL_VENUE)_[A-Z0-9_]+$') { Stop-Refused "GENERATOR_REFUSED_$first" }
+        throw
+    }
+    $generated = $genOut[-1]
+    if ($null -ne $generated.PSObject.Properties['fixtureRehearsal'] -and [bool]$generated.fixtureRehearsal) { Stop-Refused 'FIXTURE_REFUSED_GENERATED_AS_REHEARSAL' }
+    $contentSha = [string]$generated.clipContentSha256
+    if ($contentSha -cnotmatch '^[0-9a-f]{64}$') { Stop-Refused 'CLIP_CONTENT_UNBOUND' }
+    $receipt.subject.clipContentSha256 = $contentSha
+
+    # --- 4. health probe (P5), bounded -------------------------------------------------------------
     $probeJob = Join-Path $workDirResolved "$jobStem-health.job.ps1"
     [IO.File]::WriteAllText($probeJob, (New-DvHealthProbeJobText -AgentRoot $agentRoot), [Text.UTF8Encoding]::new($false))
     $probeRun = Submit-VenueJob -ScriptPath $probeJob -JobId "$jobStem-health" -TimeoutSec 120 -QueueSec 120 -ClaimedExtraSec 60
@@ -200,34 +240,13 @@ try {
         Stop-Leg 'UNRESOLVED' 'HEALTH_ONLY_NO_LEG_RUN: the venue is healthy and the host check passed; no leg was submitted, so nothing was measured'
     }
 
-    # --- 5. the staged build / fixture / runner must be exactly the ones named -----------------------
+    # --- 5. the staged build / runner closure must be exactly the ones named -------------------------
+    # (The clip itself is resolved and verified by the job at the venue, by id: the runner never stages, opens or names it.)
     $short = $SourceCommit.Substring(0, 12)
     $cacheShare = $agentShare.TrimEnd('\') + '\cache'
     $buildJson = "$cacheShare\playback-attr-3-cuda-$short-build.json"
     if (-not (Test-Path -LiteralPath $buildJson -PathType Leaf)) { Stop-Leg 'DEVICE_UNAVAILABLE' "BUILD_NOT_STAGED: no build manifest for $short on this venue" }
     if ((Get-DvSha256OfFile $buildJson) -ne $BuildManifestSha256) { Stop-Leg 'DEVICE_UNAVAILABLE' "BUILD_NOT_STAGED: the staged build manifest for $short is not sha256 $BuildManifestSha256 (a different build is never substituted)" }
-    $fixtureCache = "$cacheShare\$($spec.clipId)" + '.' + 'mlv'
-    if (-not (Test-Path -LiteralPath $fixtureCache -PathType Leaf)) { Stop-Leg 'DEVICE_UNAVAILABLE' 'FIXTURE_NOT_STAGED: the fixture is not in this venue''s cache' }
-    if ((Get-DvSha256OfFile $fixtureCache) -ne $fixture.sha256) { Stop-Leg 'DEVICE_UNAVAILABLE' 'FIXTURE_NOT_STAGED: the cached fixture bytes do not match the tracked fixture' }
-
-    # --- 6. generate ------------------------------------------------------------------------------
-    $jobFile = Join-Path $workDirResolved "$jobStem.job.ps1"
-    $gen = @{
-        SourceCommit = $SourceCommit; BuildManifestSha256 = $BuildManifestSha256; ClipId = [string]$spec.clipId
-        FixtureSha256 = $fixture.sha256; OutFile = $jobFile; RepoRoot = $RepoRoot
-        Venue = $Venue; Backend = $Backend; ScaleFactor = [int]$spec.scaleFactor
-    }
-    if ($VenueTablePath -ne (Join-Path $here 'venues.json')) { $gen['VenueTablePath'] = $VenueTablePath }
-    if ($null -ne $spec.PSObject.Properties['generatorArgs']) {
-        if ($spec.generatorArgs.PSObject.Properties['telemetryArm']) { $gen['TelemetryArm'] = [string]$spec.generatorArgs.telemetryArm }
-        if ($spec.generatorArgs.PSObject.Properties['cpuQuiescenceThresholdPercent']) { $gen['CpuQuiescenceThresholdPercent'] = [double]$spec.generatorArgs.cpuQuiescenceThresholdPercent }
-    }
-    if ($isLook) {
-        $gen['ContactSheet'] = $true; $gen['ContactSheetFrames'] = [int]$spec.look.contactSheetFrames
-        $gen['ForceLookAssist'] = $true; $gen['LookFlavor'] = $lookFlavor
-    }
-    $genOut = @(& $GeneratorScript @gen)
-    $generated = $genOut[-1]
     $runnerDir = "$cacheShare\$($generated.smokeRunnerClosureDirName)"
     if (-not (Test-Path -LiteralPath $runnerDir -PathType Container)) { Stop-Leg 'DEVICE_UNAVAILABLE' "SMOKE_RUNNER_NOT_STAGED: $($generated.smokeRunnerClosureDirName) is not in this venue's cache" }
 
@@ -279,7 +298,6 @@ if ($run.umOutcome -ne 'RECEIPT') { Complete-Receipt 'UNRESOLVED' "um-run ended 
 $stdout = [string]$run.result.stdout
 $exitCode = [int]$run.result.exitCode
 $token = Get-DvResultToken $stdout
-$resolved = Resolve-DvJobOutcome -ResultToken $token -ExitCode $exitCode
 
 $artifactsShare = $null
 if ($stdout -match 'ARTIFACTS=(?<p>\S+)') { $artifactsShare = ConvertTo-ShareSidePath $Matches['p'] }
@@ -305,6 +323,14 @@ if ($artifactsShare -and (Test-Path -LiteralPath $artifactsShare -PathType Conta
     $receipt.evidence['localEvidenceDir'] = $evidenceDir
 }
 if ($null -ne $summary) { $receipt.metrics = Get-DvVerbatimMetrics -Summary $summary -EvidenceManifest $manifest }
+# The receipt oracle's verdict, copied from the job's own record (never recomputed from frame rows) and re-judged here.
+$playback = $null
+if ($null -ne $summary) {
+    $playback = Get-DvPlaybackEvidence -Summary $summary -EvidenceManifest $manifest -ExpectedClipId ([string]$spec.clipId)
+    $receipt.playback = $playback
+}
+$smokeRefusalReason = $(if ($null -ne $summary -and $summary.PSObject.Properties['smokeRefusalReason']) { [string]$summary.smokeRefusalReason } else { '' })
+$resolved = Resolve-DvJobOutcome -ResultToken $token -ExitCode $exitCode -SmokeRefusalReason $smokeRefusalReason
 
 # P6 again, from the job's own record: a summary that names a different venue than declared is a mismatch.
 if ($null -ne $summary -and $summary.PSObject.Properties['display'] -and $summary.display -and $summary.display.PSObject.Properties['venue']) {
@@ -351,5 +377,13 @@ if ($outcome -eq 'CAPTURED') {
     if ($sheetMissing) { $outcome = 'FAIL'; $detail = 'CAPTURED but the LOOK leg produced no contact sheet' }
     elseif (-not $verdictCriteria.pass) { $outcome = 'FAIL'; $detail = 'CAPTURED; criteria failed: ' + ($verdictCriteria.failures -join '; ') }
     else { $outcome = 'PASS'; $detail = $(if ($verdictCriteria.informational) { 'CAPTURED; no gating criteria for this role/backend (informational)' } else { 'CAPTURED; every criterion for this role/backend held' }) }
+}
+# A signal needs its proof. A PASS or FAIL whose receipt-oracle verdict is not valid (under 20 s of source frames, a wrap,
+# a foreign run, a fixture, or the verdict simply absent) is INVALID: a FAIL on footage that cannot be shown to be long
+# enough is not a product result either. (Write-DvReceipt refuses such a receipt a second time.)
+if ($outcome -in @('PASS', 'FAIL') -and -not $playback.valid) {
+    $why = $(if ($null -eq $playback) { 'the job wrote no summary.json, so no source-frame proof exists' } else { @($playback.invalidReasons) -join '; ' })
+    $detail = "INVALID: the job result was $outcome ($detail) but the receipt-oracle verdict is not valid: $why"
+    $outcome = 'INVALID'
 }
 Complete-Receipt $outcome $detail

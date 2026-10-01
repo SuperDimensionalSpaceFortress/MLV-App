@@ -1,0 +1,6 @@
+{
+  "schema": "mlv-app/dual-venue-clip-consent/v1",
+  "writtenBy": "OWNER-TYPED CLIP LINES ONLY. The hub appends a record here when the owner types a CLIP line for a venue; agents and producer lanes never write this file. A record is keyed by venue + clip id and carries the owner's line only as its sha256. No path, no footage file name, ever.",
+  "recordShape": { "venue": "bachelor | ultra-magnus", "clipId": "M16-1243", "ownerLineSha256": "<64 lowercase hex>", "recordedUtc": "<ISO-8601>", "recordedBy": "hub" },
+  "records": []
+}
