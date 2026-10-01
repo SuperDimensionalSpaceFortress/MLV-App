@@ -274,8 +274,8 @@ class OwnerClipTemplateTests(unittest.TestCase):
         self.assertIn("-LengthOnly", screen_line)
         self.assertNotIn("-LengthOnly", identity_line)
         self.assertIn("-TracePath $Trace", identity_line)
-        link = _index_of(self.template, "New-AttrCudaOwnerFootageLink -Directory")
-        held = _index_of(self.template, "Open-AttrCudaReadOnlyHandle -Path $linkPath")
+        link = _index_of(self.template, "New-AttrCudaOwnerFootageView -Directory")
+        held = _index_of(self.template, "Open-AttrCudaReadOnlyHandle -Path $part.path")
         self.assertLess(screen, link)
         self.assertLess(held, identity, "the one full read must happen on the held link")
 

@@ -278,7 +278,7 @@ class StageJobTests(unittest.TestCase):
         template = self.text[self.text.index("$template = @'") :]
         safety = template.index("$StepLog['artifactNameSafety'] = 0")
         for mutation in ("Publish-AttrCudaFileCopy -Source", "Publish-AttrCudaFileMove -Source",
-                         "Remove-AttrCudaPartialFile -TrustedRoot $AgentRoot -Path ([string]$item.path)"):
+                         "Remove-AttrCudaInputFileByContent -TrustedRoot $AgentRoot -Path ([string]$item.path)"):
             with self.subTest(mutation=mutation):
                 self.assertLess(safety, template.index(mutation))
         for root, label in (("$Inbox", "inbox"), ("$Cache", "cache")):
@@ -298,7 +298,7 @@ class StageJobTests(unittest.TestCase):
 
     def test_verify_only_stops_before_anything_is_written(self) -> None:
         stop = self.text.index("RESULT=VERIFY_ONLY_OK")
-        self.assertLess(stop, self.text.index("New-Item -ItemType Directory -Path $Work"))
+        self.assertLess(stop, self.text.index("New-AttrCudaOwnedRoot -TrustedRoot $AgentRoot -Path $Work"))
         self.assertLess(stop, self.text.index("$PubReady = $true"))
 
 
