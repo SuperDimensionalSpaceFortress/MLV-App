@@ -12,6 +12,7 @@
 #include <QFileDialog>
 #include <QMessageBox>
 #include <QSettings>
+#include "AutomationSettings.h"
 #include <QDebug>
 #include <QStandardPaths>
 #include "avir/avirthreadpool.h"
@@ -35,7 +36,7 @@ SingleFrameExportDialog::SingleFrameExportDialog(QWidget *parent,
     m_stretchX = stretchX;
     m_stretchY = stretchY;
 
-    QSettings set( QSettings::UserScope, "magiclantern.MLVApp", "MLVApp" );
+    auto setStore = automation_settings::openAppSettings(); QSettings &set = *setStore;
     ui->comboBoxCodec->setCurrentIndex( set.value( "singleFrameExportCodec", 0 ).toUInt() );
     m_lastPath = set.value( "lastSingleFramePath", QDir::homePath() ).toString();
 }
@@ -43,7 +44,7 @@ SingleFrameExportDialog::SingleFrameExportDialog(QWidget *parent,
 //Destructor
 SingleFrameExportDialog::~SingleFrameExportDialog()
 {
-    QSettings set( QSettings::UserScope, "magiclantern.MLVApp", "MLVApp" );
+    auto setStore = automation_settings::openAppSettings(); QSettings &set = *setStore;
     set.setValue( "singleFrameExportCodec", ui->comboBoxCodec->currentIndex() );
     set.setValue( "lastSingleFramePath", m_lastPath );
     delete ui;

@@ -29,6 +29,7 @@ import tempfile
 import unittest
 from pathlib import Path
 
+from tools.repo_hygiene.synthetic_mlv import FRAMES_30S_AT_23976, mlvi_header
 from tools.repo_hygiene.test_playback_attr_3_cuda_behaviour import (
     ATTRIBUTION_GENERATOR,
     MODULE,
@@ -274,8 +275,8 @@ class OwnerClipTemplateTests(unittest.TestCase):
         self.assertIn("-LengthOnly", screen_line)
         self.assertNotIn("-LengthOnly", identity_line)
         self.assertIn("-TracePath $Trace", identity_line)
-        link = _index_of(self.template, "New-AttrCudaOwnerFootageLink -Directory")
-        held = _index_of(self.template, "Open-AttrCudaReadOnlyHandle -Path $linkPath")
+        link = _index_of(self.template, "New-AttrCudaOwnerFootageView -Directory")
+        held = _index_of(self.template, "Open-AttrCudaReadOnlyHandle -Path $part.path")
         self.assertLess(screen, link)
         self.assertLess(held, identity, "the one full read must happen on the held link")
 
@@ -495,7 +496,10 @@ class CompleteChainSingleReadTests(_PwshCase):
         super().setUp()
         self.clip_dir = self.tmp / "owner-clip"
         self.clip_dir.mkdir()
-        self.data = [os.urandom(700_000), os.urandom(4_321)]
+        # PLAYBACK-CLIP-LENGTH-ENFORCE-1: the REAL runner now reads the first part's 52-byte header and
+        # refuses anything that is not a >= 20 s clip before it hashes or launches. This test is about how
+        # many times the BYTES are read, so part 0 carries a genuine ~30 s header in front of its random body.
+        self.data = [mlvi_header(FRAMES_30S_AT_23976) + os.urandom(700_000 - 52), os.urandom(4_321)]
         self.parts = [
             self.clip_dir / ("owner-clip" + _BASE_EXT),
             self.clip_dir / ("owner-clip" + _CONT_EXT),
@@ -560,7 +564,7 @@ class CompleteChainSingleReadTests(_PwshCase):
             "try {\n"
             f"    $out = & '{RUNNER}' -RepoRoot '{ROOT}' -ExePath '{exe}' -Input '{self.parts[0]}' "
             f"-Output '{self.tmp / 'result.json'}' "
-            + ("-DryRun " if dry else "-ProcessTimeoutMs 8000 -Seconds 1 ")
+            + ("-DryRun " if dry else "-ProcessTimeoutMs 8000 -Seconds 20 ")   # ENFORCE-2: the play window is >= 20 s (the stub never plays)
             + f"-TracePath '{self.runner_trace}' "
             + (f"-VerifiedClipBindingPath '{self.binding}'" if bind else "")
             # A stub launcher never plays anything, so a full run ends in the runner's own validation

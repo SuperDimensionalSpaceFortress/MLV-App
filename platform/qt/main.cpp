@@ -9,6 +9,8 @@
 #include "MyApplication.h"
 #include "CrashForensics.h"
 #include "Phase3Mode.h"
+#include "PlaybackFrameRange.h"
+#include "AutomationSettings.h"
 #include "../../src/batch/BatchContext.h"
 #include "../../src/batch/BatchRunner.h"
 #include "../../src/batch/BatchLogger.h"
@@ -1242,7 +1244,7 @@ static int runGuiPlaybackSmoke(QApplication &app)
 
     const QCommandLineOption contactSheetDirOpt(
         QStringLiteral("contact-sheet-dir"),
-        QStringLiteral("Optional directory for a contact-sheet capture pass: N evenly spaced presented frames (PNG + JSON sidecar each), grabbed in an un-timed pass after the measured playback interval. Requires --contact-sheet-frames."),
+        QStringLiteral("Optional directory for a contact-sheet capture pass: N evenly spaced presented frames (PNG + JSON sidecar each), grabbed after the measured playback interval. The default playback-mode pass would REPLAY the span (a second Play) and is refused (REPLAY_REFUSED, owner rule 2026-09-30): pass --contact-sheet-seek-mode. Requires --contact-sheet-frames."),
         QStringLiteral("dir"));
     parser.addOption(contactSheetDirOpt);
 
@@ -1255,7 +1257,7 @@ static int runGuiPlaybackSmoke(QApplication &app)
 
     const QCommandLineOption contactSheetSeekModeOpt(
         QStringLiteral("contact-sheet-seek-mode"),
-        QStringLiteral("Explicit, labelled alternative to the default contact-sheet capture pass: grabs frames by pausing/seeking after playback stops instead of during a genuine second playback pass. A seeked frame is rendered by a different, non-playback path and can show a different look; sidecars from this mode record playback_path=false. Default off."));
+        QStringLiteral("The only contact-sheet capture that never plays: grabs frames by pausing/seeking after playback stops (the default capture would be a second playback pass, i.e. a replay, which is refused). A seeked frame is rendered by a different, non-playback path and can show a different look; sidecars from this mode record playback_path=false."));
     parser.addOption(contactSheetSeekModeOpt);
 
     const QCommandLineOption scopeOpt(
@@ -1316,8 +1318,15 @@ static int runGuiPlaybackSmoke(QApplication &app)
 
     const QCommandLineOption loopPlaybackOpt(
         QStringLiteral("loop"),
-        QStringLiteral("Loop the clip so a short clip plays continuously for the whole --seconds window (default: play once then stop)."));
+        QStringLiteral("REFUSED (owner rule 2026-09-30): no venue playback may loop. Kept declared only so the refusal is typed instead of 'unknown option'."));
     parser.addOption(loopPlaybackOpt);
+
+    // PLAYBACK-CLIP-LENGTH-ENFORCE-1 round 2: a probe that proves the app launches and opens the clip
+    // WITHOUT ever calling Play (the old launch-only probe still played the whole window).
+    const QCommandLineOption launchOnlyOpt(
+        QStringLiteral("launch-only"),
+        QStringLiteral("Open the clip and exit without ever calling Play (a launch probe: zero presented playback frames)."));
+    parser.addOption(launchOnlyOpt);
 
     const QCommandLineOption windowedOpt(
         QStringLiteral("windowed"),
@@ -1350,9 +1359,9 @@ static int runGuiPlaybackSmoke(QApplication &app)
 
     const QCommandLineOption stressSwitchAtMsOpt(
         QStringLiteral("stress-switch-at-ms"),
-        QStringLiteral("Elapsed playback milliseconds before the lifecycle stress sequence starts."),
+        QStringLiteral("Elapsed playback milliseconds before the lifecycle stress sequence starts. The switch stops Play, so it must be at least 20000 (the 20 s play floor)."),
         QStringLiteral("milliseconds"),
-        QStringLiteral("1000"));
+        QStringLiteral("20000"));
     parser.addOption(stressSwitchAtMsOpt);
 
     const QCommandLineOption stressSeekFrameOpt(
@@ -1394,6 +1403,14 @@ static int runGuiPlaybackSmoke(QApplication &app)
         return 0;
     }
 
+    // PLAYBACK-CLIP-LENGTH-ENFORCE-1 round 2: looping is refused HERE, in the app, so a launch that never
+    // went through run-release-gui-smoke.ps1 (a direct exe launch) cannot loop a short clip either.
+    if (parser.isSet(loopPlaybackOpt))
+    {
+        err << "[GUI-SMOKE] ERROR: --loop is refused: no venue playback may loop a clip (owner rule 2026-09-30).\n";
+        return 2;
+    }
+
     if (!parser.isSet(inputOpt))
     {
         err << "[GUI-SMOKE] ERROR: --input is required.\n\n";
@@ -1407,6 +1424,14 @@ static int runGuiPlaybackSmoke(QApplication &app)
     {
         err << "[GUI-SMOKE] ERROR: --seconds must be greater than 0.\n";
         return 2;
+    }
+    // PLAYBACK-CLIP-LENGTH-ENFORCE-2 round 2 (hub ruling): --seconds IS the play window (the measured Play is
+    // stopped after it), so it must itself reach the 20 s floor -- refused here, typed and before any window.
+    if (seconds + 1e-9 < playback_frame_range::kMinPlayWindowSeconds)
+    {
+        err << "[GUI-SMOKE] ERROR: PLAY_DURATION_TOO_SHORT (--seconds=" << seconds
+            << " window=" << playback_frame_range::kMinPlayWindowSeconds << ")\n";
+        return 14;
     }
 
     const int settleMs = parser.value(settleOpt).toInt(&ok);
@@ -1480,6 +1505,22 @@ static int runGuiPlaybackSmoke(QApplication &app)
     if (!ok || stressSwitchAtMs < 0)
     {
         err << "[GUI-SMOKE] ERROR: --stress-switch-at-ms must be 0 or greater.\n";
+        return 2;
+    }
+    // ENFORCE-2 round 2 (sol B2): the lifecycle stress switch STOPS Play on the first clip; before the floor it
+    // would end a Play shorter than 20 s. Refused up front when the mode is requested.
+    if (parser.isSet(exerciseClipLifecycleStressOpt)
+        && !playback_frame_range::stressSwitchReachesFloor(stressSwitchAtMs))
+    {
+        err << "[GUI-SMOKE] ERROR: PLAY_DURATION_TOO_SHORT (--stress-switch-at-ms=" << stressSwitchAtMs
+            << " must be >= " << playback_frame_range::kMinPlayWindowMs << ")\n";
+        return 14;
+    }
+    if (parser.isSet(exerciseClipLifecycleStressOpt)
+        && static_cast<double>(stressSwitchAtMs) > seconds * 1000.0)
+    {
+        err << "[GUI-SMOKE] ERROR: --stress-switch-at-ms=" << stressSwitchAtMs
+            << " is after the end of the --seconds=" << seconds << " play window; the switch would never happen.\n";
         return 2;
     }
 
@@ -1629,7 +1670,8 @@ static int runGuiPlaybackSmoke(QApplication &app)
     options.forceScope = parser.isSet(scopeOpt);
     options.forcePlaybackDebayer = parser.isSet(playbackDebayerOpt);
     options.disableLookAssist = parser.isSet(noLookAssistOpt);
-    options.loopPlayback = parser.isSet(loopPlaybackOpt);
+    options.loopPlayback = false;   // --loop is refused above; nothing sets this
+    options.launchOnly = parser.isSet(launchOnlyOpt);
     options.windowed = parser.isSet(windowedOpt);
     options.displayPreferSubstring = parser.value(displayPreferOpt);
     options.zebras = parser.isSet(zebrasOpt);
@@ -1665,6 +1707,33 @@ int main(int argc, char *argv[])
         QStringLiteral("%1.%2.%3.%4")
             .arg(VERSION_MAJOR).arg(VERSION_MINOR)
             .arg(VERSION_PATCH).arg(VERSION_BUILD));
+
+    // PLAYBACK-CLIP-LENGTH-ENFORCE-3 round 2 (sol H2 / fable H5): an automation run uses a RUN-SCOPED settings store,
+    // so the venue's persisted pacing (fpsOverride / frameRate / dragFrameMode) is never even read and nothing the run
+    // saves reaches the owner's interactive settings. Done before the first QSettings anywhere (CrashForensics too).
+    // Fail closed: an automation run that cannot get its own store does not start.
+    const bool automationRun = hasPlaybackProfileFlag(argc, argv) || hasGuiPlaybackSmokeFlag(argc, argv)
+        || qEnvironmentVariableIntValue("MLVAPP_AUTOPLAY_SECONDS") > 0;
+    bool automationSettingsDirCreated = false;
+    QString automationSettingsDir;
+    if (automationRun)
+    {
+        automationSettingsDir = automation_settings::isolate(
+            QString::fromLocal8Bit(qgetenv("MLVAPP_AUTOMATION_SETTINGS_DIR")), &automationSettingsDirCreated);
+        if (automationSettingsDir.isEmpty())
+        {
+            QTextStream(stderr) << "[GUI-SMOKE] ERROR: SETTINGS_ISOLATION_FAILED "
+                                   "(the run-scoped settings store could not be created; an automation run never uses the venue's settings)\n";
+            return 14;
+        }
+    }
+    struct AutomationSettingsCleanup
+    {
+        QString dir;
+        bool remove = false;
+        ~AutomationSettingsCleanup() { if (remove && !dir.isEmpty()) QDir(dir).removeRecursively(); }
+    } automationSettingsCleanup{automationSettingsDir, automationSettingsDirCreated};
+
     CrashForensics::install(argc, argv);
     CrashForensics::logStartupMetadata();
     phase3InitKillSwitches();
@@ -1738,6 +1807,19 @@ int main(int argc, char *argv[])
         qInfo() << "viewport_ab: AA_ShareOpenGLContexts skipped by request.";
     }
 
+    // PLAYBACK-CLIP-LENGTH-ENFORCE-2 round 2 (fable PLAY-GATE-ALREADY-PLAYING-1): the MLVAPP_AUTOPLAY_* hook is a
+    // normal-GUI feature. The smoke and profile windows are constructed with argv = { appName } only (see
+    // runGuiPlaybackSmoke / runPlaybackProfile), so the hook cannot arm there; a launch that nevertheless
+    // carries the variable is REFUSED, typed and before any window exists, so an inherited autoplay can never
+    // be adopted as an automation mode's own Play.
+    if ((profile_playback || gui_playback_smoke)
+        && qEnvironmentVariableIntValue("MLVAPP_AUTOPLAY_SECONDS") != 0)
+    {
+        QTextStream(stderr) << "[GUI-SMOKE] ERROR: AUTOPLAY_REFUSED_IN_AUTOMATION "
+                               "(MLVAPP_AUTOPLAY_SECONDS is set; the autoplay hook has no place in a smoke or profile run)\n";
+        return 14;
+    }
+
     MyApplication a(argc, argv);
     if (sharedOpenGlContexts)
     {
@@ -1803,5 +1885,8 @@ int main(int argc, char *argv[])
     MainWindow w(argc, argv);
     w.show();
 
-    return a.exec();
+    // ENFORCE-3 r2 (fable H6): the autoplay hook's verdict is the exit code even when the app was left open and
+    // closed by hand (MLVAPP_AUTOPLAY_EXIT unset): a short or timed-out autoplay is never exit 0.
+    const int guiExitCode = a.exec();
+    return guiExitCode != 0 ? guiExitCode : w.automationVerdictExitCode();
 }

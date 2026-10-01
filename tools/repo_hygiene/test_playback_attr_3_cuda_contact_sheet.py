@@ -27,10 +27,17 @@ import sys
 import unittest
 from pathlib import Path
 
+from tools.repo_hygiene.synthetic_mlv import (
+    FRAMES_30S_AT_23976,
+    MLV_EXTENSION,
+    write_synthetic_mlv,
+)
+
 ROOT = Path(__file__).resolve().parents[2]
 # UM-DISPLAY-SELECT-AND-LOG-1 round 3: the shared display-identity parser is a pinned
 # smoke-runner closure sibling AND the job embeds its functions from the committed blob,
 # so a fixture repo must carry its REAL text, not a stand-in.
+_CLIP_LENGTH_TEXT = (Path(__file__).resolve().parents[2] / "tools" / "profiling" / "gui-smoke-length-gate.ps1").read_text(encoding="utf-8")
 _DISPLAY_IDENTITY_TEXT = (Path(__file__).resolve().parents[2] / "tools" / "profiling" / "gui-smoke-display-identity.ps1").read_text(encoding="utf-8")
 
 if str(ROOT) not in sys.path:
@@ -81,7 +88,8 @@ def _make_fixture_repo_pre_contact_sheet_card(path: Path) -> list[str]:
         ". (Join-Path $PSScriptRoot 'provenance-stamp.ps1')\n"
         ". (Join-Path $PSScriptRoot 'gui-smoke-color-artifact-scan.ps1')\n"
         ". (Join-Path $PSScriptRoot 'gui-smoke-gpu-texture-route-validation.ps1')\n"
-        ". (Join-Path $PSScriptRoot 'gui-smoke-display-identity.ps1')\n",
+        ". (Join-Path $PSScriptRoot 'gui-smoke-display-identity.ps1')\n"
+        ". (Join-Path $PSScriptRoot 'gui-smoke-length-gate.ps1')\n",
         encoding="utf-8",
     )
     (path / "tools" / "profiling" / "gui-smoke-screenshot-provenance.ps1").write_text(
@@ -100,6 +108,12 @@ def _make_fixture_repo_pre_contact_sheet_card(path: Path) -> list[str]:
         "# fixture stand-in sibling (dot-sourced directly by the runner)\n", encoding="utf-8"
     )
     (path / "tools" / "profiling" / "gui-smoke-display-identity.ps1").write_text(_DISPLAY_IDENTITY_TEXT, encoding="utf-8")
+    (path / "tools" / "profiling" / "gui-smoke-length-gate.ps1").write_text(_CLIP_LENGTH_TEXT, encoding="utf-8")
+    # PLAYBACK-CLIP-LENGTH-ENFORCE-1: a fixture id is refused at generation unless its tracked header
+    # is >= 20 s, so the throwaway repo carries a synthetic ~30 s header-only stand-in (never footage).
+    for _fixture_stem in ("tiny_dual_iso", "large_dual_iso"):
+        write_synthetic_mlv(path / "tests" / "fixtures" / "clips" / (_fixture_stem + MLV_EXTENSION),
+                            FRAMES_30S_AT_23976)
     # Deliberately OMITTED from the first commit: tools/profiling/make-contact-sheet.py.
     shas = []
     for index, text in enumerate(("first", "second")):

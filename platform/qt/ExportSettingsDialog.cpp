@@ -11,6 +11,7 @@
 #include <QStandardItemModel>
 #include <QStandardItem>
 #include <QSettings>
+#include "AutomationSettings.h"
 #include <QList>
 #include <QDataStream>
 #include <QDebug>
@@ -126,7 +127,7 @@ ExportSettingsDialog::ExportSettingsDialog(QWidget *parent, Scripting *scripting
 #else
     QVariant::fromValue<QList<ExportPreset>>(QList<ExportPreset>{}); // Dummy call for Qt6 https://stackoverflow.com/questions/70974383/qvariantvaluet-fails-to-convert-unless-qvariantfromvaluet-has-been-c
 #endif
-    QSettings set( QSettings::UserScope, "magiclantern.MLVApp", "MLVApp" );
+    auto setStore = automation_settings::openAppSettings(); QSettings &set = *setStore;
     QList<ExportPreset> presetList = set.value( "ExportPresets" ).value<QList<ExportPreset> >();
     ui->listWidget->blockSignals( true );
     for( int i = 0; i < presetList.count(); i++ )
@@ -574,7 +575,7 @@ void ExportSettingsDialog::on_toolButtonAddPreset_clicked()
     qRegisterMetaTypeStreamOperators<QList<ExportPreset> >("QList<ExportPreset>");
 #endif
     //Get existing list
-    QSettings set( QSettings::UserScope, "magiclantern.MLVApp", "MLVApp" );
+    auto setStore = automation_settings::openAppSettings(); QSettings &set = *setStore;
     QList<ExportPreset> presetList = set.value( "ExportPresets" ).value<QList<ExportPreset> >();
     //Build new item
     ExportPreset preset;
@@ -605,7 +606,7 @@ void ExportSettingsDialog::on_toolButtonDeletePreset_clicked()
     qRegisterMetaTypeStreamOperators<QList<ExportPreset> >("QList<ExportPreset>");
 #endif
     //Get existing list
-    QSettings set( QSettings::UserScope, "magiclantern.MLVApp", "MLVApp" );
+    auto setStore = automation_settings::openAppSettings(); QSettings &set = *setStore;
     QList<ExportPreset> presetList = set.value( "ExportPresets" ).value<QList<ExportPreset> >();
 
     int currentItem = ui->listWidget->currentRow();
@@ -624,7 +625,7 @@ void ExportSettingsDialog::on_listWidget_itemChanged(QListWidgetItem *item)
     qRegisterMetaTypeStreamOperators<QList<ExportPreset> >("QList<ExportPreset>");
 #endif
     //Get existing list
-    QSettings set( QSettings::UserScope, "magiclantern.MLVApp", "MLVApp" );
+    auto setStore = automation_settings::openAppSettings(); QSettings &set = *setStore;
     QList<ExportPreset> presetList = set.value( "ExportPresets" ).value<QList<ExportPreset> >();
 
     int currentItem = ui->listWidget->currentRow();
@@ -647,7 +648,7 @@ void ExportSettingsDialog::on_listWidget_itemClicked(QListWidgetItem *item)
     qRegisterMetaTypeStreamOperators<QList<ExportPreset> >("QList<ExportPreset>");
 #endif
     //Get existing list
-    QSettings set( QSettings::UserScope, "magiclantern.MLVApp", "MLVApp" );
+    auto setStore = automation_settings::openAppSettings(); QSettings &set = *setStore;
     QList<ExportPreset> presetList = set.value( "ExportPresets" ).value<QList<ExportPreset> >();
 
     int currentItem = ui->listWidget->currentRow();

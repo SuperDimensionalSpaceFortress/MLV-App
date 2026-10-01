@@ -35,6 +35,12 @@ import tempfile
 import unittest
 from pathlib import Path
 
+from tools.repo_hygiene.synthetic_mlv import (
+    FRAMES_30S_AT_23976,
+    MLV_EXTENSION,
+    write_synthetic_mlv,
+)
+
 
 ROOT = Path(__file__).resolve().parents[2]
 MODULE = ROOT / "tools" / "profiling" / "bachelor" / "AttrCudaArtifacts.psm1"
@@ -57,6 +63,7 @@ PRESENCE_JOB_MODULE = ROOT / "tools" / "profiling" / "bachelor" / "Attr3FootageP
 # UM-DISPLAY-SELECT-AND-LOG-1 round 3: the shared display-identity parser is a pinned
 # smoke-runner closure sibling AND the job embeds its functions from the committed blob,
 # so a fixture repo must carry its REAL text, not a stand-in.
+_CLIP_LENGTH_TEXT = (Path(__file__).resolve().parents[2] / "tools" / "profiling" / "gui-smoke-length-gate.ps1").read_text(encoding="utf-8")
 _DISPLAY_IDENTITY_TEXT = (Path(__file__).resolve().parents[2] / "tools" / "profiling" / "gui-smoke-display-identity.ps1").read_text(encoding="utf-8")
 
 PWSH = shutil.which("pwsh")
@@ -216,7 +223,8 @@ def _make_fixture_repo(path: Path) -> list[str]:
         ". (Join-Path $PSScriptRoot 'provenance-stamp.ps1')\n"
         ". (Join-Path $PSScriptRoot 'gui-smoke-color-artifact-scan.ps1')\n"
         ". (Join-Path $PSScriptRoot 'gui-smoke-gpu-texture-route-validation.ps1')\n"
-        ". (Join-Path $PSScriptRoot 'gui-smoke-display-identity.ps1')\n",
+        ". (Join-Path $PSScriptRoot 'gui-smoke-display-identity.ps1')\n"
+        ". (Join-Path $PSScriptRoot 'gui-smoke-length-gate.ps1')\n",
         encoding="utf-8",
     )
     (path / "tools" / "profiling" / "gui-smoke-screenshot-provenance.ps1").write_text(
@@ -235,6 +243,13 @@ def _make_fixture_repo(path: Path) -> list[str]:
         "# fixture stand-in sibling (dot-sourced directly by the runner)\n", encoding="utf-8"
     )
     (path / "tools" / "profiling" / "gui-smoke-display-identity.ps1").write_text(_DISPLAY_IDENTITY_TEXT, encoding="utf-8")
+    (path / "tools" / "profiling" / "gui-smoke-length-gate.ps1").write_text(_CLIP_LENGTH_TEXT, encoding="utf-8")
+    # PLAYBACK-CLIP-LENGTH-ENFORCE-1: the generator refuses a fixture id whose tracked header is
+    # under 20 s at GENERATION time, so a throwaway repo that exercises the fixture arm carries a
+    # synthetic ~30 s header-only stand-in for each tracked fixture (never real footage).
+    for _fixture_stem in ("tiny_dual_iso", "large_dual_iso"):
+        write_synthetic_mlv(path / "tests" / "fixtures" / "clips" / (_fixture_stem + MLV_EXTENSION),
+                            FRAMES_30S_AT_23976)
     # CUDA-PLAYBACK-CONTACT-SHEET-1 r1b: the attribution generator also resolves this path's
     # committed blob unconditionally (to embed it in the emitted job for the contact-sheet
     # compose step), same reason as the smoke-runner closure comment above -- every test that
@@ -1555,7 +1570,9 @@ class AttributionJobOwnerContentAuthenticationTests(_PwshCase):
             f"$SourceCommit = '{'d' * 40}'\n"
             f"$Pub = '{pub}'\n"
             f"$Work = '{work}'\n"
-            "$ownerLinkHandles = [System.Collections.Generic.List[object]]::new()\n"
+            "$OwnerJournal = Join-Path $Work '.attrcuda-owned.jsonl'\n"
+            "$ownerViewHandles = [System.Collections.Generic.List[object]]::new()\n"
+            "$ownerViews = [System.Collections.Generic.List[object]]::new()\n"
             "function Save-Json($Object, [string]$Path) {\n"
             "    [void](Publish-AttrCudaText -Path $Path -Value ($Object | ConvertTo-Json -Depth 30))\n"
             "}\n"
@@ -1566,10 +1583,12 @@ class AttributionJobOwnerContentAuthenticationTests(_PwshCase):
         )
         return _run_pwsh_file(script)
 
-    def test_both_parts_pass_and_a_private_directory_is_built_from_neutral_hard_links(self) -> None:
-        # ATTR3-FOOTAGE-BIND-1 PR-B round 4: the path this job opens is no longer the owner's own
-        # part path -- it is a neutrally-named HARD LINK under a private directory built inside
-        # $Work, byte-identical to (and the SAME file object as) the verified source part.
+    def test_both_parts_pass_and_a_private_directory_is_built_from_neutral_views(self) -> None:
+        # ATTR3-FOOTAGE-BIND-1 PR-B round 4, restated for OWNER-FOOTAGE-NO-HARDLINK-1: the path this
+        # job opens is no longer the owner's own part path -- it is a neutrally-named VIEW under a
+        # private directory built inside $Work (a symbolic link to the original where the host can
+        # create one, else a byte copy), byte-identical to the verified source part. It is NEVER a hard
+        # link: each original keeps exactly one name, and a copy is a different file object.
         base_extension = "." + "MLV"
         continuation_extension = "." + "M00"
         part0_dir = self.tmp / "owner-content-part0"
@@ -1596,19 +1615,26 @@ class AttributionJobOwnerContentAuthenticationTests(_PwshCase):
         private_dir_name = "owner-" + "clip"
         neutral0 = private_dir_name + base_extension
         neutral1 = private_dir_name + continuation_extension
-        link0_path = work / private_dir_name / neutral0
-        link1_path = work / private_dir_name / neutral1
-        self.assertIn(f"clipPath={link0_path}", proc.stdout)
+        view0_path = work / private_dir_name / neutral0
+        view1_path = work / private_dir_name / neutral1
+        self.assertIn(f"clipPath={view0_path}", proc.stdout)
         # Never the owner's real part path, anywhere in the job's own stdout.
         self.assertNotIn(part0, proc.stdout)
         self.assertNotIn(part1, proc.stdout)
-        self.assertTrue(link0_path.is_file())
-        self.assertTrue(link1_path.is_file())
-        self.assertEqual(link0_path.read_bytes(), part0_bytes)
-        self.assertEqual(link1_path.read_bytes(), part1_bytes)
-        # The SAME file object as its source, not a copy -- proven the same way the job proves it.
-        self.assertEqual(link0_path.stat().st_ino, part0_path.stat().st_ino)
-        self.assertEqual(link1_path.stat().st_ino, part1_path.stat().st_ino)
+        self.assertTrue(view0_path.is_file())
+        self.assertTrue(view1_path.is_file())
+        self.assertEqual(view0_path.read_bytes(), part0_bytes)
+        self.assertEqual(view1_path.read_bytes(), part1_bytes)
+        # NEVER a second name of the owner's bytes: each original still has exactly one name.
+        self.assertEqual(os.stat(part0_path).st_nlink, 1)
+        self.assertEqual(os.stat(part1_path).st_nlink, 1)
+        for view_path, source_path in ((view0_path, part0_path), (view1_path, part1_path)):
+            if view_path.is_symlink():
+                self.assertEqual(Path(os.path.realpath(view_path)), Path(os.path.realpath(source_path)))
+            else:
+                self.assertNotEqual(view_path.stat().st_ino, source_path.stat().st_ino,
+                                    "a copy view must be a different file object from the original")
+                self.assertEqual(os.stat(view_path).st_nlink, 1)
 
     def test_a_mismatched_part_fails_closed_before_the_package_is_touched(self) -> None:
         # STAGE-STALL card: the content hash is no longer a separate up-front pass -- the one full
@@ -1655,19 +1681,15 @@ class AttributionJobOwnerContentAuthenticationTests(_PwshCase):
 
 @requires_pwsh
 class OwnerFootagePrivateDirectoryLeakAndRefusalTests(_PwshCase):
-    """ATTR3-FOOTAGE-BIND-1 PR-B round 4: the leak proof, the sibling-isolation proof, and the
-    cross-volume / identity-mismatch refusal paths for the private per-job directory.
+    """ATTR3-FOOTAGE-BIND-1 PR-B round 4, rebuilt by OWNER-FOOTAGE-NO-HARDLINK-1: the leak proof,
+    the sibling-isolation proof, and the view / pin / refusal paths for the private per-job
+    directory, run through the real attribution-job block against synthetic NTFS folders.
 
-    The cross-volume and identity-mismatch cases are exercised by MOCKING
-    Get-AttrCudaFileIdentity inside AttrCudaOwnerFootage.psm1's own scope (`& $module { Set-Item
-    -Path function:... }`) rather than by requiring a second real volume or a real hardware race --
-    New-AttrCudaOwnerFootageLink is called directly, so this is a statement about the CODE PATH
-    taken when the identity comparison itself reports a mismatch, not about the real OS. The mock
-    and the mocked-from call MUST share one module (round 4b, verified empirically): PowerShell
-    resolves an unqualified command called from within a module function through that module's OWN
-    session-state function table, looked up fresh per call, so Set-Item only takes effect for
-    callers in the SAME module as the function it replaces -- a caller in a module that merely
-    imported the mocked one holds a snapshot from import time and never observes the override.
+    Each part is viewed through a symbolic link where the host may create one and through a
+    verified byte copy otherwise -- NEVER a hard link -- and the original is pinned read-only for
+    the run. The copy path is forced where a test needs it by replacing Test-AttrCudaSymlinkCapability
+    at script scope (the spliced block asks it there), which stands in an ultra-magnus-shaped venue
+    on any host; the symlink path runs only where the host can really create one.
     """
 
     def _extract_content_check(self) -> str:
@@ -1708,7 +1730,7 @@ class OwnerFootagePrivateDirectoryLeakAndRefusalTests(_PwshCase):
         ]
         return json.dumps(baked)
 
-    def _run_owner_content_check(self, *, parts, pub: Path, work: Path) -> subprocess.CompletedProcess:
+    def _run_owner_content_check(self, *, parts, pub: Path, work: Path, prelude: str = "", epilogue: str = "") -> subprocess.CompletedProcess:
         pub.mkdir(parents=True)
         work.mkdir(parents=True, exist_ok=True)
         block = self._extract_content_check()
@@ -1724,13 +1746,17 @@ class OwnerFootagePrivateDirectoryLeakAndRefusalTests(_PwshCase):
             f"$SourceCommit = '{'d' * 40}'\n"
             f"$Pub = '{pub}'\n"
             f"$Work = '{work}'\n"
-            "$ownerLinkHandles = [System.Collections.Generic.List[object]]::new()\n"
+            "$OwnerJournal = Join-Path $Work '.attrcuda-owned.jsonl'\n"
+            "$ownerViewHandles = [System.Collections.Generic.List[object]]::new()\n"
+            "$ownerViews = [System.Collections.Generic.List[object]]::new()\n"
             "function Save-Json($Object, [string]$Path) {\n"
             "    [void](Publish-AttrCudaText -Path $Path -Value ($Object | ConvertTo-Json -Depth 30))\n"
             "}\n"
             "function Write-JobTrace([string]$Message) { }\n"
+            + prelude
             + block + "\n"
-            "Write-Output ('CLIPPATH=' + $clipPath)\n",
+            "Write-Output ('CLIPPATH=' + $clipPath)\n"
+            + epilogue,
             encoding="utf-8",
         )
         return _run_pwsh_file(script)
@@ -1863,157 +1889,292 @@ class OwnerFootagePrivateDirectoryLeakAndRefusalTests(_PwshCase):
         self.assertEqual(proc.returncode, 20, f"{proc.stdout}\n{proc.stderr}")
         self.assertIn("RESULT=OWNER_PARTS_NOT_CONTIGUOUS", proc.stdout)
 
-    def test_cross_volume_refusal_when_source_and_directory_report_different_volumes(self) -> None:
-        base_extension = "." + "MLV"
-        src_dir = self.tmp / "owner-cross-volume-source"
-        src_dir.mkdir()
-        source_path = src_dir / ("source" + base_extension)
-        source_path.write_bytes(b"cross volume refusal bytes")
-        directory = self.tmp / "owner-cross-volume-directory"
-        directory.mkdir()
+    def _part(self, directory: Path, name: str, payload: bytes) -> dict:
+        path = directory / name
+        path.write_bytes(payload)
+        return {
+            "index": None,
+            "path": str(path).replace("\\", "/"),
+            "length": len(payload),
+            "sha256": hashlib.sha256(payload).hexdigest(),
+            "file": path,
+            "bytes": payload,
+        }
 
-        script = self.tmp / "cross-volume-probe.ps1"
-        script.write_text(
-            "$ErrorActionPreference = 'Stop'\n"
-            f"Import-Module '{MODULE}' -Force\n"
-            f"Import-Module '{OWNER_FOOTAGE_MODULE}' -Force\n"
-            "$mod = Get-Module AttrCudaOwnerFootage\n"
-            f"$global:AttrCudaTestSourcePath = '{source_path}'\n"
-            "& $mod {\n"
-            "    Set-Item -Path function:Get-AttrCudaFileIdentity -Value {\n"
-            "        param([string]$Path)\n"
-            "        $serial = if ($Path -eq $global:AttrCudaTestSourcePath) { 111 } else { 222 }\n"
-            "        [pscustomobject]@{ VolumeSerialNumber = $serial; FileIndexHigh = 1; FileIndexLow = 1; NumberOfLinks = 1 }\n"
-            "    }\n"
+    @staticmethod
+    def _force_copy_mode() -> str:
+        # The capability probe is asked at script scope by the spliced block, so replacing it here
+        # stands in a venue that cannot create a symbolic link (ultra-magnus: no Developer Mode, not
+        # elevated) on a host that can.
+        return (
+            "Set-Item -Path function:Test-AttrCudaSymlinkCapability -Value {\n"
+            "    param([string]$Directory, [string]$Journal)\n"
+            "    [pscustomobject]@{ Capable = $false; Result = 'SYMLINK_UNAVAILABLE' }\n"
             "}\n"
-            f"try {{ [void](New-AttrCudaOwnerFootageLink -Directory '{directory}' -Index 0 -SourcePath $global:AttrCudaTestSourcePath); Write-Output 'NO_THROW' }}\n"
-            "catch { Write-Output ('THREW ' + $_.Exception.Message) }\n",
-            encoding="utf-8",
         )
-        proc = _run_pwsh_file(script)
-        self.assertEqual(proc.returncode, 0, f"{proc.stdout}\n{proc.stderr}")
-        self.assertIn("THREW OWNER_FOOTAGE_LINK_CROSS_VOLUME", proc.stdout)
-        # No hard link was left behind by the refused attempt.
-        self.assertEqual(list(directory.iterdir()), [])
 
-    def test_identity_mismatch_after_link_creation_is_refused(self) -> None:
+    def test_copy_mode_builds_a_lone_verified_copy_and_the_original_keeps_its_one_name(self) -> None:
+        # The copy fallback: a separate file with its own file index and exactly one name; the
+        # owner's original is untouched and gains no second name.
         base_extension = "." + "MLV"
-        src_dir = self.tmp / "owner-identity-mismatch-source"
+        src_dir = self.tmp / "owner-copy-source"
         src_dir.mkdir()
-        source_path = src_dir / ("source" + base_extension)
-        source_path.write_bytes(b"identity mismatch refusal bytes")
-        directory = self.tmp / "owner-identity-mismatch-directory"
-        directory.mkdir()
+        part = self._part(src_dir, "source" + base_extension, b"copy mode original bytes " * 64)
+        part["index"] = 0
+        pub = self.tmp / "agent" / "outbox" / "owner-copy.artifacts"
+        work = self.tmp / "work"
 
-        script = self.tmp / "identity-mismatch-probe.ps1"
-        script.write_text(
-            "$ErrorActionPreference = 'Stop'\n"
-            f"Import-Module '{MODULE}' -Force\n"
-            f"Import-Module '{OWNER_FOOTAGE_MODULE}' -Force\n"
-            "$mod = Get-Module AttrCudaOwnerFootage\n"
-            f"$sourcePath = '{source_path}'\n"
-            f"$directory = '{directory}'\n"
-            "$global:AttrCudaTestExpectedLinkPath = Join-Path $directory (Get-AttrCudaOwnerFootageNeutralName -Index 0)\n"
-            "& $mod {\n"
-            "    Set-Item -Path function:Get-AttrCudaFileIdentity -Value {\n"
-            "        param([string]$Path)\n"
-            "        if ($Path -eq $global:AttrCudaTestExpectedLinkPath) {\n"
-            "            [pscustomobject]@{ VolumeSerialNumber = 1; FileIndexHigh = 999; FileIndexLow = 999; NumberOfLinks = 2 }\n"
-            "        } else {\n"
-            "            [pscustomobject]@{ VolumeSerialNumber = 1; FileIndexHigh = 1; FileIndexLow = 1; NumberOfLinks = 1 }\n"
-            "        }\n"
-            "    }\n"
-            "}\n"
-            "try { [void](New-AttrCudaOwnerFootageLink -Directory $directory -Index 0 -SourcePath $sourcePath); Write-Output 'NO_THROW' }\n"
-            "catch { Write-Output ('THREW ' + $_.Exception.Message) }\n",
-            encoding="utf-8",
+        proc = self._run_owner_content_check(
+            parts=[part], pub=pub, work=work, prelude=self._force_copy_mode(),
+            epilogue=(
+                "Write-Output ('VIEWMODE=' + $ownerViewMode)\n"
+                f"$o = Get-AttrCudaFileId -Path '{part['file']}'\n"
+                "$v = Get-AttrCudaFileId -Path $clipPath\n"
+                "Write-Output ('ORIGINAL_LINKS=' + $o.NumberOfLinks)\n"
+                "Write-Output ('VIEW_LINKS=' + $v.NumberOfLinks)\n"
+                "Write-Output ('VIEW_REPARSE=' + $v.IsReparsePoint)\n"
+                "Write-Output ('SAME_OBJECT=' + (($o.VolumeSerialNumber -eq $v.VolumeSerialNumber) -and ($o.FileIndexHigh -eq $v.FileIndexHigh) -and ($o.FileIndexLow -eq $v.FileIndexLow)))\n"
+            ),
         )
-        proc = _run_pwsh_file(script)
-        self.assertEqual(proc.returncode, 0, f"{proc.stdout}\n{proc.stderr}")
-        self.assertIn("THREW OWNER_FOOTAGE_LINK_FAILED", proc.stdout)
 
-    def test_a_handle_acquisition_failure_after_the_first_link_cleans_up_and_refuses(self) -> None:
-        # ATTR3-FOOTAGE-BIND-1 PR-B round 5 (astra major). Part 0 links and its handle opens
-        # normally; part 1's handle acquisition is synthetically failed AFTER part 1's own link
-        # was already created. Proves the round-5 enclosing try/catch (not a per-part try around
-        # New-AttrCudaOwnerFootageLink alone) closes the part-0 handle, deletes BOTH neutral link
-        # entries, leaves the real sources untouched, and reports the typed refusal.
+        self.assertEqual(proc.returncode, 0, f"{proc.stdout}\n{proc.stderr}")
+        self.assertIn("VIEWMODE=copy", proc.stdout)
+        self.assertIn("ORIGINAL_LINKS=1", proc.stdout)
+        self.assertIn("VIEW_LINKS=1", proc.stdout)
+        self.assertIn("VIEW_REPARSE=False", proc.stdout)
+        self.assertIn("SAME_OBJECT=False", proc.stdout)
+        private_dir = work / ("owner-" + "clip")
+        view = private_dir / ("owner-" + "clip" + base_extension)
+        self.assertEqual(view.read_bytes(), part["bytes"])
+        self.assertEqual(part["file"].read_bytes(), part["bytes"])
+        self.assertEqual(os.stat(part["file"]).st_nlink, 1)
+
+    def test_symlink_mode_points_at_the_original_and_adds_no_name_to_it(self) -> None:
+        # Needs a host that may create a symbolic link (Developer Mode or elevated) -- bachelor and
+        # the Windows CI runners; skipped where the job itself would take the copy path.
+        base_extension = "." + "MLV"
+        probe = self.tmp / "symlink-capability-probe"
+        probe.mkdir()
+        capability = self.run_with_module(
+            f"Write-Output ('CAPABILITY=' + (Test-AttrCudaSymlinkCapability -Directory '{probe}' -Journal '{probe.parent / 'probe-journal.jsonl'}').Result)\n")
+        self.assertEqual(capability.returncode, 0, f"{capability.stdout}\n{capability.stderr}")
+        self.assertEqual(list(probe.iterdir()), [], "the capability probe left a file behind")
+        if "CAPABILITY=SYMLINK_CAPABLE" not in capability.stdout:
+            self.skipTest("this host cannot create a symbolic link (no Developer Mode, not elevated)")
+        src_dir = self.tmp / "owner-symlink-source"
+        src_dir.mkdir()
+        part = self._part(src_dir, "source" + base_extension, b"symlink mode original bytes " * 64)
+        part["index"] = 0
+        pub = self.tmp / "agent" / "outbox" / "owner-symlink.artifacts"
+        work = self.tmp / "work"
+
+        proc = self._run_owner_content_check(
+            parts=[part], pub=pub, work=work, epilogue="Write-Output ('VIEWMODE=' + $ownerViewMode)\n")
+
+        self.assertEqual(proc.returncode, 0, f"{proc.stdout}\n{proc.stderr}")
+        self.assertIn("VIEWMODE=symlink", proc.stdout)
+        view = work / ("owner-" + "clip") / ("owner-" + "clip" + base_extension)
+        self.assertTrue(view.is_symlink())
+        self.assertEqual(Path(os.path.realpath(view)), Path(os.path.realpath(part["file"])))
+        self.assertEqual(view.read_bytes(), part["bytes"])
+        self.assertEqual(os.stat(part["file"]).st_nlink, 1)
+
+    def test_the_pin_refuses_a_write_a_rename_and_a_delete_of_the_original_while_held(self) -> None:
+        # Hub ruling item 3: the original is opened read-only with FileShare.Read for the whole
+        # job, so another process cannot truncate, replace, rename or delete it under a run.
+        base_extension = "." + "MLV"
+        src_dir = self.tmp / "owner-pin-source"
+        src_dir.mkdir()
+        part = self._part(src_dir, "source" + base_extension, b"pin proof original bytes " * 64)
+        part["index"] = 0
+        pub = self.tmp / "agent" / "outbox" / "owner-pin.artifacts"
+        work = self.tmp / "work"
+        renamed = src_dir / "renamed-away"
+
+        proc = self._run_owner_content_check(
+            parts=[part], pub=pub, work=work, prelude=self._force_copy_mode(),
+            epilogue=(
+                f"$orig = '{part['file']}'\n"
+                "try { $w = [IO.File]::Open($orig, [IO.FileMode]::Open, [IO.FileAccess]::Write, [IO.FileShare]::ReadWrite); $w.Dispose(); Write-Output 'WRITE_ALLOWED' } catch { Write-Output 'WRITE_REFUSED' }\n"
+                "try { $t = [IO.File]::Open($orig, [IO.FileMode]::Truncate, [IO.FileAccess]::Write, [IO.FileShare]::ReadWrite); $t.Dispose(); Write-Output 'TRUNCATE_ALLOWED' } catch { Write-Output 'TRUNCATE_REFUSED' }\n"
+                f"try {{ [IO.File]::Move($orig, '{renamed}'); Write-Output 'RENAME_ALLOWED' }} catch {{ Write-Output 'RENAME_REFUSED' }}\n"
+                "try { [IO.File]::Delete($orig); Write-Output 'DELETE_ALLOWED' } catch { Write-Output 'DELETE_REFUSED' }\n"
+            ),
+        )
+
+        self.assertEqual(proc.returncode, 0, f"{proc.stdout}\n{proc.stderr}")
+        for token in ("WRITE_REFUSED", "TRUNCATE_REFUSED", "RENAME_REFUSED", "DELETE_REFUSED"):
+            self.assertIn(token, proc.stdout)
+        self.assertTrue(part["file"].is_file())
+        self.assertFalse(renamed.exists())
+        self.assertEqual(part["file"].read_bytes(), part["bytes"])
+
+    def test_no_space_for_the_copy_fallback_refuses_before_anything_is_created(self) -> None:
+        base_extension = "." + "MLV"
+        src_dir = self.tmp / "owner-no-space-source"
+        src_dir.mkdir()
+        part = self._part(src_dir, "source" + base_extension, b"no space bytes")
+        part["index"] = 0
+        pub = self.tmp / "agent" / "outbox" / "owner-no-space.artifacts"
+        work = self.tmp / "work"
+
+        proc = self._run_owner_content_check(
+            parts=[part], pub=pub, work=work,
+            prelude=self._force_copy_mode() + (
+                "Set-Item -Path function:Assert-AttrCudaOwnerFootageCopySpace -Value {\n"
+                "    param($Directory, $Parts)\n"
+                "    throw 'OWNER_FOOTAGE_VIEW_NO_SPACE the job scratch volume cannot hold a copy of every part'\n"
+                "}\n"),
+        )
+
+        self.assertEqual(proc.returncode, 21, f"{proc.stdout}\n{proc.stderr}")
+        self.assertIn("RESULT=OWNER_FOOTAGE_VIEW_NO_SPACE", proc.stdout)
+        summary = json.loads((pub / "summary.json").read_text(encoding="utf-8"))
+        self.assertEqual(summary["result"], "OWNER_FOOTAGE_VIEW_NO_SPACE")
+        self.assertEqual(summary["viewMode"], "copy")
+        self.assertEqual(list((work / ("owner-" + "clip")).iterdir()), [])
+        self.assertEqual(part["file"].read_bytes(), part["bytes"])
+
+    def test_the_copy_space_check_itself_refuses_an_impossible_size(self) -> None:
+        proc = self.run_with_module(_guard(
+            f"Assert-AttrCudaOwnerFootageCopySpace -Directory '{self.tmp}' -Parts @([pscustomobject]@{{ length = [int64]1152921504606846976 }})"))
+        self.assert_throws(proc, "OWNER_FOOTAGE_VIEW_NO_SPACE")
+        proc = self.run_with_module(_guard(
+            f"Assert-AttrCudaOwnerFootageCopySpace -Directory '{self.tmp}' -Parts @([pscustomobject]@{{ length = [int64]10 }})"))
+        self.assertIn("NO_THROW", proc.stdout)
+
+    def test_a_pin_failure_after_the_first_part_cleans_up_and_refuses(self) -> None:
+        # ATTR3-FOOTAGE-BIND-1 PR-B round 5 (astra major), restated for OWNER-FOOTAGE-NO-HARDLINK-1.
+        # Part 0 is pinned and viewed normally; part 1's pin is synthetically failed (a sharing
+        # violation, raised from the script-scope Open-AttrCudaReadOnlyHandle the block calls).
+        # Proves the enclosing try/catch closes the part-0 handles, removes the part-0 view entry
+        # through the identity-checked primitive, leaves both real sources untouched and reports
+        # the typed refusal by index only.
         base_extension = "." + "MLV"
         continuation_extension = "." + "M00"
-        src_dir = self.tmp / "owner-handle-failure-source"
+        src_dir = self.tmp / "owner-pin-failure-source"
         src_dir.mkdir()
-        part0_path = src_dir / ("source" + base_extension)
-        part0_bytes = b"handle failure cleanup part zero " * 40
-        part0_path.write_bytes(part0_bytes)
-        part1_path = src_dir / ("source" + continuation_extension)
-        part1_bytes = b"handle failure cleanup part one"
-        part1_path.write_bytes(part1_bytes)
-        parts = [
-            {"index": 0, "path": str(part0_path).replace("\\", "/"), "length": len(part0_bytes), "sha256": hashlib.sha256(part0_bytes).hexdigest()},
-            {"index": 1, "path": str(part1_path).replace("\\", "/"), "length": len(part1_bytes), "sha256": hashlib.sha256(part1_bytes).hexdigest()},
-        ]
-        pub = self.tmp / "agent" / "outbox" / "owner-handle-failure.artifacts"
+        part0 = self._part(src_dir, "source" + base_extension, b"pin failure part zero " * 40)
+        part0["index"] = 0
+        part1 = self._part(src_dir, "source" + continuation_extension, b"pin failure part one")
+        part1["index"] = 1
+        pub = self.tmp / "agent" / "outbox" / "owner-pin-failure.artifacts"
         work = self.tmp / "work"
-        pub.mkdir(parents=True)
-        work.mkdir(parents=True, exist_ok=True)
-        block = self._extract_content_check()
-        owner_parts_json = self._owner_parts_json(parts).replace("'", "''")
-        script = self.tmp / "owner-handle-failure-probe.ps1"
+
+        proc = self._run_owner_content_check(
+            parts=[part0, part1], pub=pub, work=work,
+            prelude=self._force_copy_mode() + (
+                "Set-Item -Path function:Open-AttrCudaReadOnlyHandle -Value {\n"
+                "    param([string]$Path)\n"
+                "    if ($Path.EndsWith('.M00')) { throw [IO.IOException]::new('SYNTHETIC_PIN_FAILURE') }\n"
+                "    [IO.File]::Open($Path, [IO.FileMode]::Open, [IO.FileAccess]::Read, [IO.FileShare]::Read)\n"
+                "}\n"),
+            epilogue="Write-Output 'UNREACHABLE_NO_THROW'\n",
+        )
+
+        self.assertEqual(proc.returncode, 22, f"{proc.stdout}\n{proc.stderr}")
+        self.assertIn("RESULT=OWNER_FOOTAGE_VIEW_FAILED", proc.stdout)
+        self.assertIn("PART=1", proc.stdout)
+        self.assertNotIn("UNREACHABLE_NO_THROW", proc.stdout)
+        private_dir = work / ("owner-" + "clip")
+        self.assertTrue(private_dir.exists())
+        self.assertEqual(sorted(p.name for p in private_dir.iterdir()), [])
+        self.assertTrue(part0["file"].is_file())
+        self.assertEqual(part0["file"].read_bytes(), part0["bytes"])
+        self.assertTrue(part1["file"].is_file())
+        self.assertEqual(part1["file"].read_bytes(), part1["bytes"])
+        summary = json.loads((pub / "summary.json").read_text(encoding="utf-8"))
+        self.assertEqual(summary["result"], "OWNER_FOOTAGE_VIEW_FAILED")
+        self.assertEqual(summary["partIndex"], 1)
+        dumped = json.dumps(summary)
+        self.assertNotIn(part0["path"], dumped)
+        self.assertNotIn(part1["path"], dumped)
+
+    def test_a_view_that_changed_since_it_was_built_is_refused_by_index_only(self) -> None:
+        base_extension = "." + "MLV"
+        src_dir = self.tmp / "owner-changed-source"
+        src_dir.mkdir()
+        original = src_dir / ("source" + base_extension)
+        original.write_bytes(b"changed view original bytes " * 16)
+        directory = self.tmp / "owner-changed-directory"
+        directory.mkdir()
+        script = self.tmp / "changed-view-probe.ps1"
         script.write_text(
             "$ErrorActionPreference = 'Stop'\n"
             f"Import-Module '{MODULE}' -Force\n"
             f"Import-Module '{OWNER_FOOTAGE_MODULE}' -Force\n"
-            "$FixtureRehearsal = $false\n"
-            f"$OwnerPartsJson = '{owner_parts_json}'\n"
-            "$ClipId = 'FIX-OWNER-HANDLEFAIL-0001'\n"
-            f"$SourceCommit = '{'d' * 40}'\n"
-            f"$Pub = '{pub}'\n"
-            f"$Work = '{work}'\n"
-            "$ownerLinkHandles = [System.Collections.Generic.List[object]]::new()\n"
-            "function Save-Json($Object, [string]$Path) {\n"
-            "    [void](Publish-AttrCudaText -Path $Path -Value ($Object | ConvertTo-Json -Depth 30))\n"
-            "}\n"
-            "function Write-JobTrace([string]$Message) { }\n"
-            # Real handle for part 0's link; synthetic IOException for part 1's -- the block calls
-            # this unqualified at SCRIPT scope (it is spliced in directly, not called from inside
-            # the module), so overriding it here is enough without the module-scope mock trick.
-            "$script:AttrCudaHandleOpenCount = 0\n"
-            "Set-Item -Path function:Open-AttrCudaReadOnlyHandle -Value {\n"
-            "    param([string]$Path)\n"
-            "    $script:AttrCudaHandleOpenCount++\n"
-            "    if ($script:AttrCudaHandleOpenCount -eq 1) {\n"
-            "        return [IO.File]::Open($Path, [IO.FileMode]::Open, [IO.FileAccess]::Read, [IO.FileShare]::Read)\n"
-            "    }\n"
-            "    throw [IO.IOException]::new('SYNTHETIC_HANDLE_ACQUISITION_FAILURE')\n"
-            "}\n"
-            + block + "\n"
-            "Write-Output 'UNREACHABLE_NO_THROW'\n",
+            f"$pin = Open-AttrCudaReadOnlyHandle -Path '{original}'\n"
+            f"$view = New-AttrCudaOwnerFootageView -Directory '{directory}' -Index 0 -SourcePath '{original}' -PinStream $pin -Mode copy -Journal '{directory.parent / 'changed-journal.jsonl'}'\n"
+            "try { Assert-AttrCudaOwnerFootageViewsIntact -Views @($view); Write-Output 'INTACT' } catch { Write-Output ('THREW ' + $_.Exception.Message) }\n"
+            # Tamper with the RECORD, as a swapped entry would present: a different file index.
+            "$forged = [pscustomobject]@{ Index = $view.Index; Path = $view.Path; Mode = $view.Mode; PinId = $view.PinId; ViewStream = $view.ViewStream;\n"
+            "    EntryId = [pscustomobject]@{ VolumeSerialNumber = $view.EntryId.VolumeSerialNumber; FileIndexHigh = $view.EntryId.FileIndexHigh; FileIndexLow = ($view.EntryId.FileIndexLow + 1); NumberOfLinks = 1; IsReparsePoint = $false } }\n"
+            "try { Assert-AttrCudaOwnerFootageViewsIntact -Views @($forged); Write-Output 'FORGED_INTACT' } catch { Write-Output ('THREW ' + $_.Exception.Message) }\n"
+            "Close-AttrCudaOwnerFootageWorkspace -Handles @($view.ViewStream, $pin) -Views @($view)\n"
+            "Write-Output ('ENTRIES_AFTER_CLOSE=' + @(Get-ChildItem -LiteralPath $view.Path.Substring(0, $view.Path.LastIndexOf([char]92)) -Force).Count)\n",
             encoding="utf-8",
         )
         proc = _run_pwsh_file(script)
+        self.assertEqual(proc.returncode, 0, f"{proc.stdout}\n{proc.stderr}")
+        self.assertIn("INTACT", proc.stdout.splitlines()[0])
+        self.assertIn("THREW OWNER_FOOTAGE_VIEW_CHANGED part 0", proc.stdout)
+        self.assertNotIn("FORGED_INTACT", proc.stdout)
+        self.assertNotIn(str(original), proc.stdout)
+        self.assertIn("ENTRIES_AFTER_CLOSE=0", proc.stdout)
+        self.assertEqual(original.read_bytes(), b"changed view original bytes " * 16)
 
-        self.assertEqual(proc.returncode, 22, f"{proc.stdout}\n{proc.stderr}")
-        self.assertIn("RESULT=OWNER_FOOTAGE_LINK_FAILED", proc.stdout)
-        self.assertIn("PART=1", proc.stdout)
-        self.assertNotIn("UNREACHABLE_NO_THROW", proc.stdout)
+    def test_a_leftover_view_is_cleared_only_if_the_journal_names_it_and_a_legacy_entry_is_left(self) -> None:
+        # Clear-AttrCudaOwnerFootageLeftovers (OWNER-FOOTAGE-NO-HARDLINK-1 round 2, creator-recorded
+        # ownership): a killed job never reached its cleanup, and the next run of the same job id
+        # removes the entries its own journal names -- by identity. A neutral-named entry NOBODY
+        # journalled is a legacy artifact (a pre-#211 hard link) and is LEFT, whatever its link count:
+        # NumberOfLinks = 1 is also what the last name of old footage looks like.
+        base_extension = "." + "MLV"
+        work = self.tmp / "owner-leftovers-work"
+        directory = work / "owner-clip"
+        directory.mkdir(parents=True)
+        journal = work / ".attrcuda-owned.jsonl"
+        made = directory / ("owner-" + "clip" + base_extension)
+        # created like the job creates a view: CreateNew, identity from the creating handle, journalled
+        creator = self.run_with_module(
+            f"$s = [IO.File]::Open('{made}', [IO.FileMode]::CreateNew, [IO.FileAccess]::Write, [IO.FileShare]::None)\n"
+            f"Add-AttrCudaOwnedRecord -Journal '{journal}' -Path '{made}' -FileId (Get-AttrCudaFileId -Stream $s)\n"
+            "$s.Dispose()\n")
+        self.assertEqual(creator.returncode, 0, f"{creator.stdout}\n{creator.stderr}")
+        legacy_lone = directory / ("owner-" + "clip" + "." + "M00")
+        legacy_lone.write_bytes(b"a legacy entry nobody journalled -- may be the last name of old footage")
+        legacy_linked = directory / ("owner-" + "clip" + "." + "M01")
+        legacy_linked.write_bytes(b"pretend this is a name of owner bytes")
+        second_name = self.tmp / "the-other-name"
+        os.link(legacy_linked, second_name)
 
-        private_dir_name = "owner-" + "clip"
-        private_dir = work / private_dir_name
-        self.assertTrue(private_dir.exists())
-        self.assertEqual(sorted(p.name for p in private_dir.iterdir()), [])
+        proc = self.run_with_module(
+            f"$left = @(Clear-AttrCudaOwnerFootageLeftovers -Directory '{directory}' -Journal '{journal}' -WarningAction SilentlyContinue)\n"
+            "Write-Output ('LEFT=' + ($left -join ','))\n")
 
-        # The real sources are untouched -- never linked away, never truncated, never renamed.
-        self.assertTrue(part0_path.is_file())
-        self.assertEqual(part0_path.read_bytes(), part0_bytes)
-        self.assertTrue(part1_path.is_file())
-        self.assertEqual(part1_path.read_bytes(), part1_bytes)
-
-        summary = json.loads((pub / "summary.json").read_text(encoding="utf-8"))
-        self.assertEqual(summary["result"], "OWNER_FOOTAGE_LINK_FAILED")
-        self.assertEqual(summary["partIndex"], 1)
-        dumped = json.dumps(summary)
-        self.assertNotIn(str(part0_path).replace("\\", "/"), dumped)
-        self.assertNotIn(str(part1_path).replace("\\", "/"), dumped)
+        self.assertEqual(proc.returncode, 0, f"{proc.stdout}\n{proc.stderr}")
+        self.assertIn("LEFT=LEFT_LEGACY,LEFT_LEGACY", proc.stdout)
+        self.assertFalse(made.exists(), "the journalled entry this job created is cleared")
+        self.assertTrue(legacy_lone.exists(), "an unjournalled one-name entry is never adopted")
+        self.assertTrue(legacy_linked.exists())
+        self.assertTrue(second_name.exists())
+        self.assertEqual(second_name.read_bytes(), b"pretend this is a name of owner bytes")
+        # OWNER-FOOTAGE-NO-HARDLINK-2: there is no journal-less mode any more -- the call cannot be made...
+        sweep = self.run_with_module(_guard(f"Remove-AttrCudaTree -TrustedRoot '{self.tmp}' -Path '{work}'"))
+        self.assertIn("missing mandatory parameters", sweep.stdout + sweep.stderr)
+        self.assertTrue(legacy_lone.exists() and legacy_linked.exists())
+        # ...and the journalled sweep removes nothing it did not create and keeps the directories.
+        sweep = self.run_with_module(
+            f"$r = Remove-AttrCudaTree -TrustedRoot '{self.tmp}' -Path '{work}' -OwnedJournal '{journal}'\n"
+            "Write-Output ('LEFT=' + (($r.Left | ForEach-Object { $_.Token }) -join ','))\n"
+            "Write-Output ('TREE_REMOVED=' + $r.TreeRemoved)\n")
+        self.assertEqual(sweep.returncode, 0, f"{sweep.stdout}\n{sweep.stderr}")
+        self.assertIn("TREE_REMOVED=False", sweep.stdout)
+        self.assertIn("LEFT_UNOWNED", sweep.stdout)
+        self.assertIn("LEFT_MULTI_LINK", sweep.stdout)
+        self.assertTrue(legacy_lone.exists())
+        self.assertTrue(legacy_linked.exists())
+        self.assertTrue(directory.is_dir())
 
 
 @requires_pwsh
@@ -2613,6 +2774,7 @@ SMOKE_RUNNER_CLOSURE_NAMES = (
     "gui-smoke-color-artifact-scan.ps1",
     "gui-smoke-gpu-texture-route-validation.ps1",
     "gui-smoke-display-identity.ps1",
+    "gui-smoke-length-gate.ps1",
 )
 
 
@@ -2621,7 +2783,7 @@ class SmokeRunnerClosureManifestTests(_PwshCase):
     """Get-AttrCudaSmokeRunnerClosureManifest: the EXPLICIT, pinned list that replaced discovery
     (ATTR3-SMOKE-RUNNER-DEPS-1 round 3, NARROW BY REDESIGN)."""
 
-    def test_the_manifest_is_the_seven_pinned_repo_relative_paths_in_order(self) -> None:
+    def test_the_manifest_is_the_eight_pinned_repo_relative_paths_in_order(self) -> None:
         proc = self.run_with_module(
             "Get-AttrCudaSmokeRunnerClosureManifest | ForEach-Object { Write-Output \"PATH=$_\" }\n"
         )
@@ -2637,6 +2799,7 @@ class SmokeRunnerClosureManifestTests(_PwshCase):
                 "tools/profiling/gui-smoke-color-artifact-scan.ps1",
                 "tools/profiling/gui-smoke-gpu-texture-route-validation.ps1",
                 "tools/profiling/gui-smoke-display-identity.ps1",
+                "tools/profiling/gui-smoke-length-gate.ps1",
             ],
         )
 
@@ -2749,6 +2912,7 @@ class ClosureCompletenessTests(_PwshCase):
             "gui-smoke-color-artifact-scan.ps1",
             "gui-smoke-gpu-texture-route-validation.ps1",
             "gui-smoke-display-identity.ps1",
+            "gui-smoke-length-gate.ps1",
         ):
             (path / "tools" / "profiling" / sibling).write_text(f"# {sibling} stand-in\n", encoding="utf-8")
         (path / "tools" / "profiling" / "gui-smoke-process-boundary.psm1").write_text(
@@ -2783,6 +2947,7 @@ class ClosureCompletenessTests(_PwshCase):
             ". (Join-Path $PSScriptRoot 'gui-smoke-color-artifact-scan.ps1')\n"
             ". (Join-Path $PSScriptRoot 'gui-smoke-gpu-texture-route-validation.ps1')\n"
             ". (Join-Path $PSScriptRoot 'gui-smoke-display-identity.ps1')\n"
+            ". (Join-Path $PSScriptRoot 'gui-smoke-length-gate.ps1')\n"
         )
         sha = self._repo_with_runner_text(repo, runner)
         proc = self._assert_complete(repo, sha)
@@ -2900,6 +3065,7 @@ class ClosureCompletenessTests(_PwshCase):
             ". (Join-Path $PSScriptRoot 'gui-smoke-color-artifact-scan.ps1')\n"
             ". (Join-Path $PSScriptRoot 'gui-smoke-gpu-texture-route-validation.ps1')\n"
             ". (Join-Path $PSScriptRoot 'gui-smoke-display-identity.ps1')\n"
+            ". (Join-Path $PSScriptRoot 'gui-smoke-length-gate.ps1')\n"
             "function f([scriptblock]$p) { & $p 1 }\n"
         )
         sha = self._repo_with_runner_text(repo, runner)
@@ -2916,6 +3082,7 @@ class ClosureCompletenessTests(_PwshCase):
             ". (Join-Path $PSScriptRoot 'gui-smoke-color-artifact-scan.ps1')\n"
             ". (Join-Path $PSScriptRoot 'gui-smoke-gpu-texture-route-validation.ps1')\n"
             ". (Join-Path $PSScriptRoot 'gui-smoke-display-identity.ps1')\n"
+            ". (Join-Path $PSScriptRoot 'gui-smoke-length-gate.ps1')\n"
             "$predicate = { param($x) $x -eq 1 }\n"
             "& $predicate 1\n"
         )
@@ -2949,6 +3116,7 @@ class ClosureCompletenessTests(_PwshCase):
             ". (Join-Path $PSScriptRoot 'gui-smoke-color-artifact-scan.ps1')\n"
             ". (Join-Path $PSScriptRoot 'gui-smoke-gpu-texture-route-validation.ps1')\n"
             ". (Join-Path $PSScriptRoot 'gui-smoke-display-identity.ps1')\n"
+            ". (Join-Path $PSScriptRoot 'gui-smoke-length-gate.ps1')\n"
             "Add-Type -AssemblyName System.Drawing\n"
         )
         sha = self._repo_with_runner_text(repo, runner)
@@ -2980,6 +3148,7 @@ class ClosureCompletenessTests(_PwshCase):
             ". (Join-Path $PSScriptRoot 'gui-smoke-color-artifact-scan.ps1')\n"
             ". (Join-Path $PSScriptRoot 'gui-smoke-gpu-texture-route-validation.ps1')\n"
             ". (Join-Path $PSScriptRoot 'gui-smoke-display-identity.ps1')\n"
+            ". (Join-Path $PSScriptRoot 'gui-smoke-length-gate.ps1')\n"
             "$detectorPwsh = 'pwsh.exe'\n"
             "$detectorArgs = @()\n"
             "$detectorOut = & $detectorPwsh @detectorArgs 2>&1\n"
@@ -3017,6 +3186,7 @@ class ClosureCompletenessTests(_PwshCase):
             ". (Join-Path $PSScriptRoot 'gui-smoke-color-artifact-scan.ps1')\n"
             ". (Join-Path $PSScriptRoot 'gui-smoke-gpu-texture-route-validation.ps1')\n"
             ". (Join-Path $PSScriptRoot 'gui-smoke-display-identity.ps1')\n"
+            ". (Join-Path $PSScriptRoot 'gui-smoke-length-gate.ps1')\n"
             "Microsoft.PowerShell.Core\\Import-Module "
             "(Join-Path $PSScriptRoot 'gui-smoke-process-boundary.psm1') -Force\n"
         )
@@ -3096,6 +3266,7 @@ class ClosureCompletenessTests(_PwshCase):
             ". (Join-Path $PSScriptRoot 'gui-smoke-color-artifact-scan.ps1')\n"
             ". (Join-Path $PSScriptRoot 'gui-smoke-gpu-texture-route-validation.ps1')\n"
             ". (Join-Path $PSScriptRoot 'gui-smoke-display-identity.ps1')\n"
+            ". (Join-Path $PSScriptRoot 'gui-smoke-length-gate.ps1')\n"
             "$startInfo = [System.Diagnostics.ProcessStartInfo]::new()\n"
             "$process = [System.Diagnostics.Process]::Start($startInfo)\n"
         )
@@ -4181,7 +4352,7 @@ class LinkSafeCleanupTests(_PwshCase):
         partial.mkdir()
         self.plant_junction(partial)
         proc = self.run_with_module(
-            f"Write-Output ('removed=' + (Remove-AttrCudaPartialFile -TrustedRoot '{self.root}' -Path '{partial}'))\n"
+            f"Write-Output ('removed=' + (Remove-AttrCudaPartialFile -TrustedRoot '{self.root}' -Path '{partial}' -OwnedJournal '{self.root / 'j.jsonl'}'))\n"
         )
         self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
         self.assertIn("removed=False", proc.stdout)
@@ -4191,29 +4362,40 @@ class LinkSafeCleanupTests(_PwshCase):
     def test_a_partial_that_is_itself_a_junction_is_left_and_its_target_survives(self) -> None:
         link = self.plant_junction(self.root, "build.json.partial")
         proc = self.run_with_module(
-            f"Write-Output ('removed=' + (Remove-AttrCudaPartialFile -TrustedRoot '{self.root}' -Path '{link}'))\n"
+            f"Write-Output ('removed=' + (Remove-AttrCudaPartialFile -TrustedRoot '{self.root}' -Path '{link}' -OwnedJournal '{self.root / 'j.jsonl'}'))\n"
         )
         self.assertIn("removed=False", proc.stdout)
         self.assertEqual(self.sentinel.read_bytes(), b"must survive")
 
-    def test_a_plain_partial_file_is_removed(self) -> None:
+    def test_a_plain_partial_file_the_job_created_is_removed(self) -> None:
+        # OWNER-FOOTAGE-NO-HARDLINK-2: removed because the job CREATED it through the journalled publish,
+        # not because it is a plain file.
         partial = self.root / "exe.partial"
-        partial.write_bytes(b"half written")
         proc = self.run_with_module(
-            f"Write-Output ('removed=' + (Remove-AttrCudaPartialFile -TrustedRoot '{self.root}' -Path '{partial}'))\n"
+            f"[void](Publish-AttrCudaText -Path '{partial}' -Value 'half written' -OwnedJournal '{self.root / 'j.jsonl'}')\n"
+            f"Write-Output ('removed=' + (Remove-AttrCudaPartialFile -TrustedRoot '{self.root}' -Path '{partial}' -OwnedJournal '{self.root / 'j.jsonl'}'))\n"
         )
-        self.assertIn("removed=True", proc.stdout)
+        self.assertIn("removed=True", proc.stdout, proc.stdout + proc.stderr)
         self.assertFalse(partial.exists())
 
-    def test_a_work_tree_containing_a_junction_is_refused_whole(self) -> None:
+    def test_a_work_tree_containing_a_junction_never_follows_it_and_leaves_what_it_cannot_prove(self) -> None:
+        # Was "refused whole" (a throw). The junction is now an entry like any other: never followed,
+        # never deleted, reported LEFT_NOT_A_FILE; nothing the journal does not prove goes either.
         work = self.root / "work"
         (work / "nested").mkdir(parents=True)
         (work / "nested" / "file.txt").write_bytes(b"x")
         self.plant_junction(work / "nested")
-        proc = self.run_with_module(_guard(f"Remove-AttrCudaTree -TrustedRoot '{self.root}' -Path '{work}'"))
-        self.assert_throws(proc, "ATTRCUDA_TREE_HAS_REPARSE_POINT")
+        proc = self.run_with_module(
+            f"$r = Remove-AttrCudaTree -TrustedRoot '{self.root}' -Path '{work}' -OwnedJournal '{self.root / 'j.jsonl'}'\n"
+            "Write-Output ('LEFT=' + ((@($r.Left | ForEach-Object { $_.Token }) | Sort-Object) -join ','))\n"
+            "Write-Output ('TREE_REMOVED=' + $r.TreeRemoved)\n"
+        )
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        # the junction itself and the plain file are both unproven here: both LEFT, neither followed
+        self.assertIn("LEFT=LEFT_UNOWNED,LEFT_UNOWNED", proc.stdout)
+        self.assertIn("TREE_REMOVED=False", proc.stdout)
         self.assertEqual(self.sentinel.read_bytes(), b"must survive")
-        self.assertTrue((work / "nested" / "file.txt").exists(), "a refused tree must be left intact")
+        self.assertTrue((work / "nested" / "file.txt").exists(), "a tree the journal does not prove must be left intact")
 
     def test_a_tree_reached_through_a_linked_ancestor_is_refused_and_the_target_survives(self) -> None:
         # sol PR #133 r6: AgentRoot\outbox is a junction to an outside directory holding <job>.artifacts.
@@ -4221,19 +4403,19 @@ class LinkSafeCleanupTests(_PwshCase):
         (self.outside / "job.artifacts" / "keep.txt").write_bytes(b"outside the agent root")
         self.plant_junction(self.root, "outbox")
         target = self.root / "outbox" / "job.artifacts"
-        proc = self.run_with_module(_guard(f"Remove-AttrCudaTree -TrustedRoot '{self.root}' -Path '{target}'"))
+        proc = self.run_with_module(_guard(f"Remove-AttrCudaTree -TrustedRoot '{self.root}' -Path '{target}' -OwnedJournal '{self.root / 'j.jsonl'}'"))
         self.assert_throws(proc, "ATTRCUDA_ANCESTOR_IS_LINK")
         self.assertEqual((self.outside / "job.artifacts" / "keep.txt").read_bytes(), b"outside the agent root")
 
     def test_an_absent_tree_under_a_linked_ancestor_is_still_refused(self) -> None:
         self.plant_junction(self.root, "work")
         missing = self.root / "work" / "never-created"
-        proc = self.run_with_module(_guard(f"Remove-AttrCudaTree -TrustedRoot '{self.root}' -Path '{missing}'"))
+        proc = self.run_with_module(_guard(f"Remove-AttrCudaTree -TrustedRoot '{self.root}' -Path '{missing}' -OwnedJournal '{self.root / 'j.jsonl'}'"))
         self.assert_throws(proc, "ATTRCUDA_ANCESTOR_IS_LINK")
 
     def test_a_path_outside_the_trusted_root_is_refused(self) -> None:
         escaping = str(self.root) + "\\..\\outside"
-        proc = self.run_with_module(_guard(f"Remove-AttrCudaTree -TrustedRoot '{self.root}' -Path '{escaping}'"))
+        proc = self.run_with_module(_guard(f"Remove-AttrCudaTree -TrustedRoot '{self.root}' -Path '{escaping}' -OwnedJournal '{self.root / 'j.jsonl'}'"))
         self.assert_throws(proc, "ATTRCUDA_PATH_NOT_UNDER_ROOT")
         self.assertEqual(self.sentinel.read_bytes(), b"must survive")
 
@@ -4279,18 +4461,23 @@ class LinkSafeCleanupTests(_PwshCase):
         self.plant_junction(self.root, "inbox")
         side = self.root / "inbox" / "side.zip"
         proc = self.run_with_module(
-            f"Write-Output ('removed=' + (Remove-AttrCudaPartialFile -TrustedRoot '{self.root}' -Path '{side}'))\n"
+            f"Write-Output ('removed=' + (Remove-AttrCudaPartialFile -TrustedRoot '{self.root}' -Path '{side}' -OwnedJournal '{self.root / 'j.jsonl'}'))\n"
         )
         self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
         self.assertIn("removed=False", proc.stdout)
         self.assertEqual((self.outside / "side.zip").read_bytes(), b"outside the agent root")
 
-    def test_a_link_free_work_tree_is_removed(self) -> None:
+    def test_a_link_free_work_tree_the_job_created_fresh_is_removed(self) -> None:
         work = self.root / "work"
+        made = self.run_with_module(f"[void](New-AttrCudaOwnedRoot -TrustedRoot '{self.root}' -Path '{work}' -OwnedJournal '{self.root / 'j.jsonl'}')\n")
+        self.assertEqual(made.returncode, 0, made.stdout + made.stderr)
         (work / "a" / "b").mkdir(parents=True)
         (work / "a" / "b" / "f.txt").write_bytes(b"x")
-        proc = self.run_with_module(f"Remove-AttrCudaTree -TrustedRoot '{self.root}' -Path '{work}'\n")
+        proc = self.run_with_module(
+            f"$r = Remove-AttrCudaTree -TrustedRoot '{self.root}' -Path '{work}' -OwnedJournal '{self.root / 'j.jsonl'}'\n"
+            "Write-Output ('TREE_REMOVED=' + $r.TreeRemoved)\n")
         self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        self.assertIn("TREE_REMOVED=True", proc.stdout)
         self.assertFalse(work.exists())
 
     def test_a_slot_that_is_a_junction_is_refused_before_anything_is_written(self) -> None:
@@ -4603,6 +4790,10 @@ class EmbeddedFunctionContractTests(_PwshCase):
             "New-AttrCudaDirectory",
             "Remove-AttrCudaPartialFile",
             "Remove-AttrCudaTree",
+            # OWNER-FOOTAGE-NO-HARDLINK-1: Remove-AttrCudaTree reads each file's link count.
+            "Initialize-AttrCudaFileIdNative",
+            "ConvertTo-AttrCudaFileIdObject",
+            "Get-AttrCudaFileId",
         ),
         ROOT / "tools" / "profiling" / "bachelor" / "playback-attr-3-cuda-stage-job.ps1": (
             "Get-AttrCudaArtifactNames",
@@ -4615,6 +4806,10 @@ class EmbeddedFunctionContractTests(_PwshCase):
             "New-AttrCudaDirectory",
             "Remove-AttrCudaPartialFile",
             "Remove-AttrCudaTree",
+            # OWNER-FOOTAGE-NO-HARDLINK-1: Remove-AttrCudaTree reads each file's link count.
+            "Initialize-AttrCudaFileIdNative",
+            "ConvertTo-AttrCudaFileIdObject",
+            "Get-AttrCudaFileId",
         ),
         ROOT / "tools" / "profiling" / "bachelor" / "attr3-stage-smoke-runner-job.ps1": (
             "Assert-AttrCudaSafeArtifactName",
@@ -4629,6 +4824,10 @@ class EmbeddedFunctionContractTests(_PwshCase):
             "Publish-AttrCudaDirectoryMoveNonOverwriting",
             "New-AttrCudaDirectory",
             "Remove-AttrCudaTree",
+            # OWNER-FOOTAGE-NO-HARDLINK-1: Remove-AttrCudaTree reads each file's link count.
+            "Initialize-AttrCudaFileIdNative",
+            "ConvertTo-AttrCudaFileIdObject",
+            "Get-AttrCudaFileId",
         ),
         ROOT / "tools" / "profiling" / "bachelor" / "playback-attr-3-cuda-job.ps1": (
             "Assert-AttrCudaBuildManifest",
@@ -4642,6 +4841,12 @@ class EmbeddedFunctionContractTests(_PwshCase):
             "Publish-AttrCudaFileMove",
             "New-AttrCudaDirectory",
             "Remove-AttrCudaTree",
+            # OWNER-FOOTAGE-NO-HARDLINK-1: the tree delete's link count read, and the identity-checked
+            # delete the view cleanup uses.
+            "Initialize-AttrCudaFileIdNative",
+            "ConvertTo-AttrCudaFileIdObject",
+            "Get-AttrCudaFileId",
+            "Remove-AttrCudaFileById",
             # UM-DISPLAY-SELECT-AND-LOG-1 round 2b/2: venue-quiescence (CPU busy time, not
             # utility) and the Windows display inventory, both embedded verbatim like every
             # other shared function.
@@ -5438,7 +5643,7 @@ class DisplayWakeJobOrderingTests(unittest.TestCase):
         # job (before footage resolution and package verification), so the failure paths this now
         # covers grew from 9 to 15: SCREENSAVER_SECURE_OWNER_ONLY, FIXTURE_CONTENT_MISMATCH, the
         # two OWNER_FOOTAGE_NOT_VERIFIED sites, OWNER_PARTS_NOT_CONTIGUOUS, the owner-link failure
-        # (OWNER_FOOTAGE_LINK_CROSS_VOLUME/OWNER_FOOTAGE_LINK_FAILED), VENUE_NOT_QUIESCENT,
+        # (OWNER_FOOTAGE_VIEW_FAILED / _VIEW_NO_SPACE / _VIEW_CHANGED), VENUE_NOT_QUIESCENT,
         # SMOKE_RUN_FAILED, SMOKE_LOG_UNAVAILABLE, PRESENTMON_UNAVAILABLE, BACKEND_NOT_AVAILABLE,
         # GPU_RECON_FRAMES_ZERO, CPU_FALLBACK_DETECTED, the displayReport failure including
         # DISPLAY_ASLEEP itself, and the success summary.json. CUDA-PERF-DISPLAY-WAKE-3 round 1
@@ -5449,9 +5654,16 @@ class DisplayWakeJobOrderingTests(unittest.TestCase):
         # PRESENTMON-HARNESS-ROBUSTNESS-1) adds a 20th: the PRESENTMON_UNAVAILABLE early exit when
         # Start-PresentMonCapture itself throws on spawn, before this branch's own wake existed on
         # master -- displayWake=$displayWake was added to that block to match every sibling site.
+        # OWNER-FOOTAGE-NO-HARDLINK-1 adds a 21st: OWNER_FOOTAGE_VIEW_CHANGED, the last look at the
+        # owner-footage views right before the smoke launch (the old owner-link failure site stays a
+        # single site, now OWNER_FOOTAGE_VIEW_NO_SPACE / _FAILED / _CHANGED by token). Round 2 adds a
+        # 22nd: OWNER_WORK_NOT_CLEAN (exit 28), the typed refusal when the start-of-run sweep left an
+        # entry the job did not create (a legacy neutral entry, an unjournalled file) -- 21 grows to 22.
+        # PLAYBACK-CLIP-LENGTH-ENFORCE-3 adds a 23rd: SOURCE_FRAMES_INVALID (exit 29), the receipt oracle that ends the
+        # leg when the measured session did not advance its required source frames (or wrapped, or was override-paced).
         summary_writes = body.count("(Join-Path $Pub 'summary.json')")
         display_wake_fields = body.count("displayWake=$displayWake") + body.count("displayWake = $displayWake")
-        self.assertEqual(20, summary_writes, "a summary.json write site was added/removed after the wake")
+        self.assertEqual(23, summary_writes, "a summary.json write site was added/removed after the wake")
         # +1: the success path also stamps displayWake into evidence-manifest.json, a second file.
         self.assertEqual(summary_writes + 1, display_wake_fields)
 

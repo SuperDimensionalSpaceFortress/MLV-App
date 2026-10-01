@@ -24,6 +24,10 @@
 #include <string>
 #include <vector>
 
+#ifdef Q_OS_WIN
+#include <windows.h>
+#endif
+
 static bool golden_oracle_is_clean(const QString & golden_path, std::string * error_message)
 {
     const QString repo_root = find_repo_root();
@@ -339,6 +343,10 @@ int main(int argc, char ** argv)
     mlvapp_force_singlethread_init();
     test_runtime::prefer_desktop_opengl_on_windows();
 #ifdef Q_OS_WIN
+    // CUDA-PLAYBACK-LOOK-PARITY-1 round 2: a fail-fast crash in this process (e.g. a GL
+    // driver abort) previously raised an interactive WER dialog on the owner's desktop.
+    // Per-process only -- never a system setting -- matching tests/gui/test_gui_smoke.cpp.
+    SetErrorMode(SEM_FAILCRITICALERRORS | SEM_NOGPFAULTERRORBOX | SEM_NOOPENFILEERRORBOX);
     if (qEnvironmentVariableIsEmpty("QT_QPA_PLATFORM")) {
         qputenv("QT_QPA_PLATFORM", QByteArrayLiteral("windows"));
     }

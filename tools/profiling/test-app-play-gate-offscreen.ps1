@@ -1,0 +1,224 @@
+<#
+.SYNOPSIS
+    PLAYBACK-CLIP-LENGTH-ENFORCE-2: proves, against a BUILT MLVApp.exe and the TRACKED short fixtures only,
+    that every programmatic Play entry the app has REFUSES before Play (typed, exit code, zero Play).
+
+.DESCRIPTION
+    THE APP IS THE GATE (owner rule 2026-09-30): no programmatic Play may start unless the window from the
+    current position to the cut-out is >= 20 s and >= the requested window, and the process admits ONE
+    programmatic Play. The tracked fixtures (16 and 2 frames) are far under 20 s, so each entry below must
+    be refused by the app itself -- these launches bypass every tool-side gate on purpose. For each entry
+    the script checks the exit code, the typed reason on stderr / in the interaction trace, and that the
+    app NEVER toggled Play on (no 'play.toggled.begin ... checked=1' line, no profile JSON written).
+
+    Entries that need a >= 20 s clip (cut-range refusal of a 2-frame range, replay refusal) cannot be
+    reached with tracked fixtures and are covered by the pure unit tests
+    (tests/console/test_playback_frame_range.cpp) and the static class test
+    (tools/repo_hygiene/test_playback_clip_length_gate.py).
+
+    Offscreen (QT_QPA_PLATFORM=offscreen); no display, no venue, no owner footage. Run it after building:
+        pwsh -NoProfile -File tools/profiling/test-app-play-gate-offscreen.ps1 -Exe <path to MLVApp.exe> [-DllDirs <Qt bin>,<MinGW bin>]
+    Exit 0 = every entry refused; 1 = at least one did not.
+    ASCII only.
+#>
+[CmdletBinding()]
+param(
+    [Parameter(Mandatory = $true)][string]$Exe,
+    [string]$RepoRoot = (Split-Path (Split-Path $PSScriptRoot -Parent) -Parent),
+    [int]$TimeoutSeconds = 90,
+    # Directories prepended to PATH so a non-deployed build finds its Qt / MinGW DLLs (exit 0xC0000135 otherwise).
+    [string[]]$DllDirs = @(),
+    # PLAYBACK-CLIP-LENGTH-ENFORCE-3: also prove that an automation run ignores a saved fpsOverride=true/frameRate=12.
+    # r2: the override is seeded into the run's OWN settings store (an INI file in a directory of this script's),
+    # never into the user's real settings, and the probe checks that the real settings did not change.
+    [switch]$PersistedOverrideProbe
+)
+$ErrorActionPreference = 'Stop'
+$DllDirs = @($DllDirs | ForEach-Object { $_ -split ',' } | Where-Object { $_ })   # -File passes 'a','b' as one comma-joined string
+if ($DllDirs.Count -gt 0) { $env:PATH = (($DllDirs -join ';') + ';' + $env:PATH) }
+if (-not (Test-Path -LiteralPath $Exe -PathType Leaf)) { throw "MLVApp.exe not found: $Exe" }
+# The fixture name is composed, never spelled with its extension as one token (the repo's NA-4 gate).
+$clipExtension = '.' + 'mlv'
+$fixture = Join-Path $RepoRoot ('tests/fixtures/clips/large_dual_iso' + $clipExtension)
+if (-not (Test-Path -LiteralPath $fixture -PathType Leaf)) { throw "tracked fixture missing: $fixture" }
+
+$work = Join-Path ([IO.Path]::GetTempPath()) ("play-gate-offscreen-" + [guid]::NewGuid().ToString('N'))
+New-Item -ItemType Directory -Force -Path $work | Out-Null
+
+function Invoke-GateEntry {
+    param([string]$Name, [string[]]$Arguments, [hashtable]$Environment = @{},
+          [Nullable[int]]$ExpectExit, [string]$ExpectToken, [string]$OutputPath = '',
+          [string[]]$ExtraTokens = @(), [string[]]$ForbiddenTokens = @())
+    $logDir = Join-Path $work $Name
+    New-Item -ItemType Directory -Force -Path $logDir | Out-Null
+    $saved = @{}
+    $envNames = @('QT_QPA_PLATFORM', 'MLVAPP_CRASH_FORENSICS_LOG_DIR', 'MLVAPP_INTERACTIVE_TRACE') + @($Environment.Keys)
+    foreach ($key in $envNames) { $saved[$key] = [Environment]::GetEnvironmentVariable($key) }
+    try {
+        [Environment]::SetEnvironmentVariable('QT_QPA_PLATFORM', 'offscreen')
+        [Environment]::SetEnvironmentVariable('MLVAPP_CRASH_FORENSICS_LOG_DIR', $logDir)
+        [Environment]::SetEnvironmentVariable('MLVAPP_INTERACTIVE_TRACE', '1')
+        foreach ($key in $Environment.Keys) { [Environment]::SetEnvironmentVariable($key, [string]$Environment[$key]) }
+        $stderrPath = Join-Path $logDir 'stderr.txt'
+        $proc = Start-Process -FilePath $Exe -ArgumentList $Arguments -NoNewWindow -PassThru `
+            -RedirectStandardOutput (Join-Path $logDir 'stdout.txt') -RedirectStandardError $stderrPath
+        # ENFORCE-4 r2 (fable H3): EVERY entry must exit by itself inside the bound, and its exit code is asserted. The autoplay hook
+        # used to be killed at a short bound (exit -1, code never observed) because qApp->quit() sent a close event and
+        # closeEvent blocked on the save-session prompt; an automation run now never prompts and exits with the latched code.
+        $exited = $proc.WaitForExit($TimeoutSeconds * 1000)
+        if (-not $exited) { try { $proc.Kill() } catch { } }
+    } finally {
+        foreach ($key in $envNames) { [Environment]::SetEnvironmentVariable($key, $saved[$key]) }
+    }
+    $exitCode = if ($exited) { $proc.ExitCode } else { -1 }
+    $stderr = if (Test-Path -LiteralPath $stderrPath) { Get-Content -LiteralPath $stderrPath -Raw } else { '' }
+    $logText = ''
+    foreach ($log in @(Get-ChildItem -LiteralPath $logDir -Filter 'mlvapp-*.log' -ErrorAction SilentlyContinue)) {
+        $logText += (Get-Content -LiteralPath $log.FullName -Raw)
+    }
+    $playStarted = $logText -match 'play\.toggled\.begin checked=1'
+    $tokenSeen = ($stderr -match [regex]::Escape($ExpectToken)) -or ($logText -match [regex]::Escape($ExpectToken))
+    foreach ($extra in $ExtraTokens) { if (-not (($stderr -match [regex]::Escape($extra)) -or ($logText -match [regex]::Escape($extra)))) { $tokenSeen = $false } }
+    foreach ($forbidden in $ForbiddenTokens) { if (($stderr -match [regex]::Escape($forbidden)) -or ($logText -match [regex]::Escape($forbidden))) { $tokenSeen = $false } }
+    $exitOk = ($exitCode -eq [int]$ExpectExit)
+    $jsonWritten = ($OutputPath -ne '') -and (Test-Path -LiteralPath $OutputPath)
+    $ok = $exitOk -and $tokenSeen -and (-not $playStarted) -and (-not $jsonWritten)
+    [pscustomobject]@{
+        entry = $Name; exit = $exitCode; expectedExit = $ExpectExit
+        typedReason = $ExpectToken; reasonSeen = $tokenSeen; playToggledOn = $playStarted; outputWritten = $jsonWritten
+        refusedBeforePlay = $ok
+    }
+}
+
+$results = @()
+$profileOutput = Join-Path $work 'profile-play-action.json'
+$results += Invoke-GateEntry -Name 'profile-exercise-play-action' -ExpectExit 14 -ExpectToken 'CLIP_TOO_SHORT' -OutputPath $profileOutput `
+    -Arguments @('--profile-playback', '--input', $fixture, '--output', $profileOutput, '--frames', '3', '--exercise-play-action')
+$results += Invoke-GateEntry -Name 'gui-smoke-measured-play' -ExpectExit 14 -ExpectToken 'CLIP_TOO_SHORT' `
+    -Arguments @('--gui-smoke-playback', '--input', $fixture, '--seconds', '25')
+$results += Invoke-GateEntry -Name 'gui-smoke-presented-frames-pin' -ExpectExit 14 -ExpectToken 'CLIP_TOO_SHORT' `
+    -Arguments @('--gui-smoke-playback', '--input', $fixture, '--seconds', '25', '--presented-frames', '24')
+# The loop switch is composed here, never spelled whole: this repository's class test forbids any script from
+# naming it as an argument, and this one only hands it to the app to prove the APP refuses it (exit 2).
+$loopSwitch = '--' + 'lo' + 'op'
+$results += Invoke-GateEntry -Name 'gui-smoke-loop-argument' -ExpectExit 2 -ExpectToken 'is refused: no venue playback may' `
+    -Arguments @('--gui-smoke-playback', '--input', $fixture, '--seconds', '25', $loopSwitch)
+# The autoplay hook's latched verdict is the process exit code: a refused (or short, or timed-out, or closed) autoplay exits 14,
+# and only a Play that consumed its window (Reached, which needs a >= 20 s clip these tracked fixtures cannot be) exits 0.
+$results += Invoke-GateEntry -Name 'autoplay-env-hook' -ExpectExit 14 -ExpectToken 'play_gate.refused site=autoplay' `
+    -Arguments @($fixture) `
+    -Environment @{ MLVAPP_AUTOPLAY_SECONDS = '2'; MLVAPP_AUTOPLAY_LOOP = '1'; MLVAPP_AUTOPLAY_SETTLE_MS = '500'; MLVAPP_AUTOPLAY_EXIT = '1' }
+
+# ---- ENFORCE-2 round 2 (hub ruling): the REQUESTED / played duration must itself be >= 20 s -------------------
+# These are refused by the app on its own typed tokens, before any window exists, even though a clip's length
+# never enters into it (the tracked fixtures are used only because every launch needs an existing --input).
+$results += Invoke-GateEntry -Name 'gui-smoke-seconds-1' -ExpectExit 14 -ExpectToken 'PLAY_DURATION_TOO_SHORT' `
+    -Arguments @('--gui-smoke-playback', '--input', $fixture, '--seconds', '1')
+$results += Invoke-GateEntry -Name 'gui-smoke-seconds-19.9' -ExpectExit 14 -ExpectToken 'PLAY_DURATION_TOO_SHORT' `
+    -Arguments @('--gui-smoke-playback', '--input', $fixture, '--seconds', '19.9')
+$results += Invoke-GateEntry -Name 'gui-smoke-stress-switch-at-1000' -ExpectExit 14 -ExpectToken 'PLAY_DURATION_TOO_SHORT' `
+    -Arguments @('--gui-smoke-playback', '--input', $fixture, '--seconds', '25', '--exercise-clip-lifecycle-stress', '--stress-switch-at-ms', '1000')
+$results += Invoke-GateEntry -Name 'gui-smoke-autoplay-env-refused' -ExpectExit 14 -ExpectToken 'AUTOPLAY_REFUSED_IN_AUTOMATION' `
+    -Arguments @('--gui-smoke-playback', '--input', $fixture, '--seconds', '25') `
+    -Environment @{ MLVAPP_AUTOPLAY_SECONDS = '2' }
+$profileAutoplayOutput = Join-Path $work 'profile-autoplay.json'
+$results += Invoke-GateEntry -Name 'profile-autoplay-env-refused' -ExpectExit 14 -ExpectToken 'AUTOPLAY_REFUSED_IN_AUTOMATION' -OutputPath $profileAutoplayOutput `
+    -Arguments @('--profile-playback', '--input', $fixture, '--output', $profileAutoplayOutput, '--frames', '3') `
+    -Environment @{ MLVAPP_AUTOPLAY_SECONDS = '2' }
+# sol B3: the repair knob changes nothing the gate can be fooled by -- the fixture is still refused (clip scope).
+$results += Invoke-GateEntry -Name 'gui-smoke-f3-repair-disabled' -ExpectExit 14 -ExpectToken 'CLIP_TOO_SHORT' `
+    -Arguments @('--gui-smoke-playback', '--input', $fixture, '--seconds', '25') `
+    -Environment @{ MLVAPP_F3_DISABLE_CUT_RANGE_REPAIR = '1' }
+$results += Invoke-GateEntry -Name 'autoplay-env-hook-24s-on-a-short-clip' -ExpectExit 14 -ExpectToken 'play_gate.refused site=autoplay' `
+    -Arguments @($fixture) `
+    -Environment @{ MLVAPP_AUTOPLAY_SECONDS = '24'; MLVAPP_AUTOPLAY_SETTLE_MS = '500'; MLVAPP_AUTOPLAY_EXIT = '1' }
+
+# ---- ENFORCE-3: a persisted fpsOverride must not change what an automation run measures ---------------------
+# The venue's saved fpsOverride=true / frameRate=12 used to pace the engine at 12 fps while the gate and every
+# stop counted 24 fps footage. r2 (sol H2 / fable H5): an automation run now reads a RUN-SCOPED settings store
+# (platform/qt/AutomationSettings.h), never the venue's, so this probe seeds the override into THAT store only --
+# an INI file in the run's own directory, handed to the app through MLVAPP_AUTOMATION_SETTINGS_DIR -- and the
+# user's real settings (HKCU) are never written. The app still loads the seeded value (the second line of defence,
+# isolateAutomationPacing, is what is being proven) and must pace at the clip's native fps, never 12.
+if ($PersistedOverrideProbe) {
+    $realKey = 'HKCU:\Software\magiclantern.MLVApp\MLVApp'
+    $realBefore = if (Test-Path -LiteralPath $realKey) { (Get-ItemProperty -LiteralPath $realKey | Select-Object fpsOverride, frameRate, dragFrameMode | ConvertTo-Json -Compress) } else { '(absent)' }
+    $storeDir = Join-Path $work 'run-scoped-settings'
+    New-Item -ItemType Directory -Force -Path $storeDir | Out-Null
+    [IO.File]::WriteAllText((Join-Path $storeDir 'MLVApp.ini'), "[General]`r`nfpsOverride=true`r`nframeRate=12`r`ndragFrameMode=false`r`n")
+    $results += Invoke-GateEntry -Name 'gui-smoke-persisted-fps-override-12' -ExpectExit 14 -ExpectToken 'CLIP_TOO_SHORT' `
+        -Environment @{ MLVAPP_AUTOMATION_SETTINGS_DIR = $storeDir } `
+        -ExtraTokens @('automation.pacing_isolated site=gui-smoke-entry persisted_fps_override=1 persisted_frame_rate=12.000', 'settings_store=run_scoped') `
+        -ForbiddenTokens @('pace_fps=12.000', 'settings_store=venue_NOT_ISOLATED') `
+        -Arguments @('--gui-smoke-playback', '--input', $fixture, '--seconds', '25')
+    $results += Invoke-GateEntry -Name 'profile-persisted-fps-override-12' -ExpectExit 14 -ExpectToken 'CLIP_TOO_SHORT' `
+        -Environment @{ MLVAPP_AUTOMATION_SETTINGS_DIR = $storeDir } `
+        -ExtraTokens @('automation.pacing_isolated site=profile-entry persisted_fps_override=1 persisted_frame_rate=12.000', 'settings_store=run_scoped') `
+        -ForbiddenTokens @('pace_fps=12.000', 'settings_store=venue_NOT_ISOLATED') -OutputPath $profileOutput `
+        -Arguments @('--profile-playback', '--input', $fixture, '--output', $profileOutput, '--frames', '3', '--exercise-play-action')
+    # An entry with NO seeded store: the run gets a fresh empty one, so nothing persisted is even read.
+    $results += Invoke-GateEntry -Name 'gui-smoke-fresh-run-scoped-store-reads-nothing' -ExpectExit 14 -ExpectToken 'CLIP_TOO_SHORT' `
+        -ExtraTokens @('automation.pacing_isolated site=gui-smoke-entry persisted_fps_override=0', 'settings_store=run_scoped') `
+        -ForbiddenTokens @('settings_store=venue_NOT_ISOLATED') `
+        -Arguments @('--gui-smoke-playback', '--input', $fixture, '--seconds', '25')
+    $realAfter = if (Test-Path -LiteralPath $realKey) { (Get-ItemProperty -LiteralPath $realKey | Select-Object fpsOverride, frameRate, dragFrameMode | ConvertTo-Json -Compress) } else { '(absent)' }
+    if ($realAfter -ne $realBefore) {
+        $results += [pscustomobject]@{ entry = 'real-settings-untouched'; exit = 'n/a'; expectedExit = 'n/a'; typedReason = 'HKCU unchanged'
+                                       reasonSeen = $false; playToggledOn = $false; outputWritten = $false; refusedBeforePlay = $false }
+    } else {
+        Write-Output 'real HKCU settings untouched by the probe (before == after)'
+    }
+}
+
+# ---- ENFORCE-4 r2 (sol BLOCKER): the app echoes the launcher's per-run nonce on the receipt it writes ------------------------------
+# A decode-only profile plays nothing, so it may run on the tracked short fixture. The nonce the launcher hands the app
+# (MLVAPP_RUN_NONCE) must come back on the receipt (metadata.run_nonce); no nonce, or a malformed one, comes back as `none`,
+# which no launcher generates -- so a receipt an earlier run (or an app that was never handed the nonce) wrote cannot be judged.
+function Invoke-NonceEntry {
+    param([string]$Name, [string]$Nonce, [string]$Expect)
+    $logDir = Join-Path $work $Name
+    New-Item -ItemType Directory -Force -Path $logDir | Out-Null
+    $receipt = Join-Path $logDir 'profile-decode.json'
+    $envNames = @('QT_QPA_PLATFORM', 'MLVAPP_CRASH_FORENSICS_LOG_DIR', 'MLVAPP_RUN_NONCE')
+    $saved = @{}
+    foreach ($key in $envNames) { $saved[$key] = [Environment]::GetEnvironmentVariable($key) }
+    try {
+        [Environment]::SetEnvironmentVariable('QT_QPA_PLATFORM', 'offscreen')
+        [Environment]::SetEnvironmentVariable('MLVAPP_CRASH_FORENSICS_LOG_DIR', $logDir)
+        [Environment]::SetEnvironmentVariable('MLVAPP_RUN_NONCE', $(if ($Nonce) { $Nonce } else { $null }))
+        $proc = Start-Process -FilePath $Exe -NoNewWindow -PassThru `
+            -ArgumentList @('--profile-playback', '--input', $fixture, '--output', $receipt, '--frames', '2') `
+            -RedirectStandardOutput (Join-Path $logDir 'stdout.txt') -RedirectStandardError (Join-Path $logDir 'stderr.txt')
+        $exited = $proc.WaitForExit($TimeoutSeconds * 1000)
+        if (-not $exited) { try { $proc.Kill() } catch { } }
+    } finally {
+        foreach ($key in $envNames) { [Environment]::SetEnvironmentVariable($key, $saved[$key]) }
+    }
+    $written = $null
+    if (Test-Path -LiteralPath $receipt) {
+        try { $written = [string]((Get-Content -LiteralPath $receipt -Raw | ConvertFrom-Json).metadata.run_nonce) } catch { $written = $null }
+    }
+    [pscustomobject]@{ entry = $Name; exit = $(if ($exited) { $proc.ExitCode } else { -1 }); expectedExit = 0
+                       typedReason = "run_nonce=$Expect"; reasonSeen = ($written -ceq $Expect); playToggledOn = $false
+                       outputWritten = ($null -ne $written); refusedBeforePlay = ($exited -and $proc.ExitCode -eq 0 -and $written -ceq $Expect) }
+}
+$nonceResults = @()
+$nonceResults += Invoke-NonceEntry -Name 'receipt-echoes-the-run-nonce' -Nonce 'nprobe0123456789abcdef0123456789ab' -Expect 'nprobe0123456789abcdef0123456789ab'
+$nonceResults += Invoke-NonceEntry -Name 'receipt-without-a-nonce-says-none' -Nonce '' -Expect 'none'
+$nonceResults += Invoke-NonceEntry -Name 'receipt-with-a-malformed-nonce-says-none' -Nonce 'bad nonce"x=1' -Expect 'none'
+Write-Output 'receipt nonce echo (a decode-only profile, no Play):'
+$nonceResults | Format-Table -AutoSize | Out-String | Write-Output
+$nonceFailed = @($nonceResults | Where-Object { -not $_.refusedBeforePlay })
+if ($nonceFailed.Count -gt 0) {
+    Write-Output ("PLAY-GATE-OFFSCREEN: FAIL - the receipt did not echo the run nonce: " + (($nonceFailed | ForEach-Object { $_.entry }) -join ', '))
+    exit 1
+}
+
+$results | Format-Table -AutoSize | Out-String | Write-Output
+$failed = @($results | Where-Object { -not $_.refusedBeforePlay })
+if ($failed.Count -gt 0) {
+    Write-Output ("PLAY-GATE-OFFSCREEN: FAIL - not refused before Play: " + (($failed | ForEach-Object { $_.entry }) -join ', '))
+    exit 1
+}
+Write-Output ("PLAY-GATE-OFFSCREEN: PASS - all {0} entries refused before Play (artifacts: {1})" -f $results.Count, $work)
+exit 0

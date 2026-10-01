@@ -1192,6 +1192,8 @@ void GpuDisplayViewport::setPresentedImage(const QImage &image, const Presentati
     m_pendingTextureIs16Bit = false;
     m_textureDirty = true;
     setPresentationOptions(options);
+    // CUDA-PLAYBACK-LOOK-PARITY-2 (fable r2): no fresh S/H blur on this route.
+    gpuPreviewProcessingMarkShadowsHighlightsBlurStale(&m_lutSet);
     m_texturePresentationActive = false;
     if ( m_fallbackItem ) m_fallbackItem->setVisible(false);
     update();
@@ -1226,6 +1228,8 @@ void GpuDisplayViewport::setPresentedRgb16(const uint16_t *imageData,
     m_pendingTextureIs16Bit = true;
     m_textureDirty = true;
     setPresentationOptions(options);
+    // CUDA-PLAYBACK-LOOK-PARITY-2 (fable r2): no fresh S/H blur on this route.
+    gpuPreviewProcessingMarkShadowsHighlightsBlurStale(&m_lutSet);
     m_texturePresentationActive = false;
     if ( m_fallbackItem ) m_fallbackItem->setVisible(false);
     update();
@@ -1250,6 +1254,8 @@ void GpuDisplayViewport::setPresentedBayer16(const uint16_t *imageData,
     m_pendingTextureIs16Bit = true;
     m_textureDirty = true;
     setPresentationOptions(options);
+    // CUDA-PLAYBACK-LOOK-PARITY-2 (fable r2): no fresh S/H blur on this route.
+    gpuPreviewProcessingMarkShadowsHighlightsBlurStale(&m_lutSet);
     m_texturePresentationActive = false;
     if ( m_fallbackItem ) m_fallbackItem->setVisible(false);
     update();
@@ -1317,6 +1323,13 @@ bool GpuDisplayViewport::setPresentedGpuPlaybackReconTexture(
 
     setPresentationOptions(options);
     updateProcessingTexturesIfNeeded();
+    // CUDA-PLAYBACK-LOOK-PARITY-1-LAND r2 (fable r1 hardening): this raw-Bayer16 route
+    // never refreshes the per-frame shadows/highlights blur, and it samples the frame
+    // y-flipped while the blur lookup is not. The LUT set is shared with the AMaZE
+    // route, so a blur left over from an earlier AMaZE present would otherwise be
+    // bound as if it belonged to this frame. Mark it not-ready: previewApplyShadows
+    // Highlights binds false for this frame (a disclosed gap, not a stale look).
+    gpuPreviewProcessingMarkShadowsHighlightsBlurStale(&m_lutSet);
 
     // FAIL CLOSED (GPU-TEXNR-S1-DARK-GREEN-1 round 4, fable minor): this raw-Bayer16
     // route feeds the same shared display shader/LUT set as the AMaZE route, whose
@@ -1531,6 +1544,12 @@ bool GpuDisplayViewport::setPresentedGpuPlaybackReconAmazePostWbTexture(
 
     setPresentationOptions(options);
     updateProcessingTexturesIfNeeded();
+    // CUDA-PLAYBACK-LOOK-PARITY-1: refresh the per-frame shadows/highlights blur
+    // texture every present call, same as GpuDisplayWindow -- its content changes
+    // every frame, unlike the signature-cached LUTs above. A miss is a soft
+    // degrade (previewApplyShadowsHighlights bound false for this frame).
+    gpuPreviewProcessingUpdateShadowsHighlightsBlurTexture(
+        m_lutSet, previewProcessing, width, height );
 
     // FAIL CLOSED (GPU-TEXNR-S1-DARK-GREEN-1 round 3, sol major): the options-usable
     // check above only proves the LUT *source bytes* were big enough to attempt an
@@ -1830,6 +1849,9 @@ bool GpuDisplayViewport::setPresentedAmazePostWbTexture(const float *rawFrame,
 
     setPresentationOptions(options);
     updateProcessingTexturesIfNeeded();
+    // CUDA-PLAYBACK-LOOK-PARITY-2 (fable r2): this AMaZE route uploads no S/H blur
+    // (only setPresentedGpuPlaybackReconAmazePostWbTexture does).
+    gpuPreviewProcessingMarkShadowsHighlightsBlurStale(&m_lutSet);
 
     if ( !m_texture
       || m_texture->width() != width
@@ -2047,7 +2069,9 @@ void GpuDisplayViewport::setPresentationOptions(const PresentationOptions &optio
     const bool processingSignatureChanged =
         m_presentationOptions.previewProcessing.enabled != options.previewProcessing.enabled
         || m_presentationOptions.previewProcessing.signature
-            != options.previewProcessing.signature;
+            != options.previewProcessing.signature
+        || m_presentationOptions.previewProcessing.rawLutSignature
+            != options.previewProcessing.rawLutSignature;
     m_samplingModeDirty = m_samplingModeDirty || samplingChanged;
     if ( processingSignatureChanged )
     {
