@@ -366,7 +366,7 @@ TEST( PlayableWindow, EveryTrackedReceiptCutRangeIsRefusedOnAThirtySecondClip )
     const int cutOuts[] = { 2, 4, 6, 16, 143, 283, 461 };
     for( const int cutOut : cutOuts )
     {
-        const PlayableWindowVerdict v = evaluatePlayableWindow( 0, 1, cutOut, kFrames30s, kFps, 0.0 );
+        const PlayableWindowVerdict v = evaluatePlayableWindow( 0, 1, cutOut, kFrames30s, kFps, 20.0 );
         ASSERT_FALSE( v.ok );
         ASSERT_EQ( std::string( "cut_range" ), std::string( v.scope ) );
     }
@@ -375,19 +375,19 @@ TEST( PlayableWindow, EveryTrackedReceiptCutRangeIsRefusedOnAThirtySecondClip )
 TEST( PlayableWindow, ATwentySecondWindowFromTheCurrentPositionIsAdmittedAndOneFrameLessIsNot )
 {
     // 480 frames = exactly 20 s at 24 fps.
-    PlayableWindowVerdict v = evaluatePlayableWindow( 0, 1, 480, 720, kFps, 0.0 );
+    PlayableWindowVerdict v = evaluatePlayableWindow( 0, 1, 480, 720, kFps, 20.0 );
     ASSERT_TRUE( v.ok );
     ASSERT_EQ( 480, v.playableFrames );
     ASSERT_EQ( std::string( "" ), std::string( v.reason ) );
 
-    v = evaluatePlayableWindow( 0, 1, 479, 720, kFps, 0.0 );
+    v = evaluatePlayableWindow( 0, 1, 479, 720, kFps, 20.0 );
     ASSERT_FALSE( v.ok );
 
     // Position-aware: the same full range is refused when the position is 1 frame in (479 frames left).
-    v = evaluatePlayableWindow( 1, 1, 480, 720, kFps, 0.0 );
+    v = evaluatePlayableWindow( 1, 1, 480, 720, kFps, 20.0 );
     ASSERT_FALSE( v.ok );
     ASSERT_EQ( 479, v.playableFrames );
-    v = evaluatePlayableWindow( 1, 1, 481, 720, kFps, 0.0 );
+    v = evaluatePlayableWindow( 1, 1, 481, 720, kFps, 20.0 );
     ASSERT_TRUE( v.ok );
 }
 
@@ -406,38 +406,38 @@ TEST( PlayableWindow, ThePlayheadAtTheLastFrameIsRefusedBecauseTheJumpToFirstFra
 {
     // on_actionPlay_triggered jumps to the first frame when Play is pressed on the last frame; from the last
     // frame the window is ONE frame, so a programmatic Play there is refused rather than replayed.
-    const PlayableWindowVerdict v = evaluatePlayableWindow( 719, 1, 720, 720, kFps, 0.0 );
+    const PlayableWindowVerdict v = evaluatePlayableWindow( 719, 1, 720, 720, kFps, 20.0 );
     ASSERT_FALSE( v.ok );
     ASSERT_EQ( 1, v.playableFrames );
     // And past the cut out (position beyond Out) nothing is left at all.
-    ASSERT_EQ( 0, evaluatePlayableWindow( 400, 1, 300, 720, kFps, 0.0 ).playableFrames );
+    ASSERT_EQ( 0, evaluatePlayableWindow( 400, 1, 300, 720, kFps, 20.0 ).playableFrames );
 }
 
 TEST( PlayableWindow, ACollapsedRangeIsMeasuredAsThePlayPathRepairsIt )
 {
     // cutIn == cutOut == 1 is widened to the whole clip by the play path (normalizeCutRange repair=true), so
     // the window the gate measures is the clip, not one frame: a 30 s clip is admitted, the 2-frame fixture not.
-    ASSERT_TRUE( evaluatePlayableWindow( 0, 1, 1, 720, kFps, 0.0 ).ok );
-    ASSERT_FALSE( evaluatePlayableWindow( 0, 1, 1, 2, kFps, 0.0 ).ok );
+    ASSERT_TRUE( evaluatePlayableWindow( 0, 1, 1, 720, kFps, 20.0 ).ok );
+    ASSERT_FALSE( evaluatePlayableWindow( 0, 1, 1, 2, kFps, 20.0 ).ok );
 }
 
 TEST( PlayableWindow, TheTrackedFixturesAreRefusedWhateverTheCutRange )
 {
     // 2 and 16 frames (tiny_dual_iso / large_dual_iso): clip-scope refusal.
-    PlayableWindowVerdict v = evaluatePlayableWindow( 0, 1, 2, 2, 24.0, 0.0 );
+    PlayableWindowVerdict v = evaluatePlayableWindow( 0, 1, 2, 2, 24.0, 20.0 );
     ASSERT_FALSE( v.ok );
     ASSERT_EQ( std::string( "clip" ), std::string( v.scope ) );
-    v = evaluatePlayableWindow( 0, 1, 16, 16, 23.976, 0.0 );
+    v = evaluatePlayableWindow( 0, 1, 16, 16, 23.976, 20.0 );
     ASSERT_FALSE( v.ok );
     ASSERT_EQ( std::string( "clip" ), std::string( v.scope ) );
 }
 
 TEST( PlayableWindow, AnUnknownClipFailsClosedWithATypedReason )
 {
-    PlayableWindowVerdict v = evaluatePlayableWindow( 0, 1, 720, 0, kFps, 0.0 );
+    PlayableWindowVerdict v = evaluatePlayableWindow( 0, 1, 720, 0, kFps, 20.0 );
     ASSERT_FALSE( v.ok );
     ASSERT_EQ( std::string( "CLIP_LENGTH_UNKNOWN" ), std::string( v.reason ) );
-    v = evaluatePlayableWindow( 0, 1, 720, 720, 0.0, 0.0 );
+    v = evaluatePlayableWindow( 0, 1, 720, 720, 0.0, 20.0 );
     ASSERT_FALSE( v.ok );
     ASSERT_EQ( std::string( "CLIP_LENGTH_UNKNOWN" ), std::string( v.reason ) );
 }
@@ -528,4 +528,108 @@ TEST( PlayableWindow, APresentedFramesTargetIsAPlayWindowAndMustReachTheFloorToo
     ASSERT_FALSE( presentedFramesTargetReachesFloor( 480, 29.97 ) );   // 16 s
     // An unknown frame rate fails closed.
     ASSERT_FALSE( presentedFramesTargetReachesFloor( 1000, 0.0 ) );
+}
+
+// ---------------------------------------------------------------------------------------------------------
+// PLAYBACK-CLIP-LENGTH-ENFORCE-2 round 2 (hub ruling): the REQUESTED / played duration of every programmatic
+// Play must itself be >= 20 s -- not only the available window. A refusal is typed and happens before Play.
+// ---------------------------------------------------------------------------------------------------------
+TEST( PlayableWindow, SolB1ARequestedWindowUnderTheFloorIsRefusedEvenWhenTheAvailableFootageIsLong )
+{
+    // sol r1 B1 repro: evaluatePlayableWindow(0, 1, 720, 720, 24, 1) was ok (30 s available vs a raised
+    // 20 s bar) while the caller's own 1 s stop timer ended Play after one second.
+    const PlayableWindowVerdict v = evaluatePlayableWindow( 0, 1, 720, 720, 24.0, 1.0 );
+    ASSERT_FALSE( v.ok );
+    ASSERT_EQ( std::string( "PLAY_DURATION_TOO_SHORT" ), std::string( v.reason ) );
+    ASSERT_EQ( std::string( "requested" ), std::string( v.scope ) );
+}
+
+TEST( PlayableWindow, TheRequestedWindowFloorIsExactAndZeroMeansNoWindowAtAll )
+{
+    ASSERT_FALSE( evaluatePlayableWindow( 0, 1, 720, 720, kFps, 0.0 ).ok );     // "no timer" is not 20 s
+    ASSERT_FALSE( evaluatePlayableWindow( 0, 1, 720, 720, kFps, 5.0 ).ok );
+    ASSERT_FALSE( evaluatePlayableWindow( 0, 1, 720, 720, kFps, 19.999 ).ok );
+    ASSERT_TRUE( evaluatePlayableWindow( 0, 1, 720, 720, kFps, 20.0 ).ok );
+    ASSERT_TRUE( evaluatePlayableWindow( 0, 1, 720, 720, kFps, 24.0 ).ok );
+    ASSERT_FALSE( evaluatePlayableWindow( 0, 1, 720, 720, kFps, -3.0 ).ok );
+    // The ledger never admits a short request either, and a short request does not use up the one Play.
+    ProgrammaticPlayLedger ledger;
+    ASSERT_FALSE( ledger.admit( evaluatePlayableWindow( 0, 1, 720, 720, kFps, 1.0 ) ) );
+    ASSERT_EQ( std::string( "PLAY_DURATION_TOO_SHORT" ), std::string( ledger.lastRefusalReason ) );
+    ASSERT_EQ( 0, ledger.admitted );
+}
+
+TEST( PlayableWindow, TheSmokePlayRequestIsTheSoonerOfTheTimeoutAndThePresentedFramesTarget )
+{
+    using playback_frame_range::smokePlayRequestSeconds;
+    // No target: the --seconds timeout is the window.
+    ASSERT_NEAR( 24.0, smokePlayRequestSeconds( 24000, 0, kFps ), 1e-9 );
+    // A target ends Play as soon as it is met, or at the timeout if that comes first: the window is the
+    // SMALLER of the two (the pre-fix code took the larger and let a 5 s timeout hide behind a 25 s target).
+    ASSERT_NEAR( 5.0, smokePlayRequestSeconds( 5000, 600, kFps ), 1e-9 );
+    ASSERT_NEAR( 20.0, smokePlayRequestSeconds( 40000, 480, kFps ), 1e-9 );
+    // A target with an unknown fps fails closed to 0 s (refused by the floor).
+    ASSERT_NEAR( 0.0, smokePlayRequestSeconds( 40000, 480, 0.0 ), 1e-9 );
+    // The pre-existing 100 ms floor on the timeout is kept.
+    ASSERT_NEAR( 0.1, smokePlayRequestSeconds( 1, 0, kFps ), 1e-9 );
+}
+
+// sol B3 / fable PLAY-GATE-F3-REPAIR-DIVERGENCE-1: the gate must measure the range the ENGINE plays.
+TEST( PlayableWindow, SolB3WithTheCollapsedRangeRepairDisabledAOneFrameRangeIsRefused )
+{
+    // 720 frames, receipt cutIn=cutOut=1, MLVAPP_F3_DISABLE_CUT_RANGE_REPAIR=1: the engine leaves the range at
+    // one frame (it refuses to widen it) and Play reaches the stop path at once.
+    const PlayableWindowVerdict off = evaluatePlayableWindow( 0, 1, 1, 720, kFps, 20.0, 20.0, false );
+    ASSERT_FALSE( off.ok );
+    ASSERT_EQ( std::string( "cut_range" ), std::string( off.scope ) );
+    ASSERT_EQ( 1, off.playableFrames );
+    // Repair enabled (the default and the normal engine state): the same receipt plays the whole clip.
+    ASSERT_TRUE( evaluatePlayableWindow( 0, 1, 1, 720, kFps, 20.0, 20.0, true ).ok );
+    ASSERT_TRUE( evaluatePlayableWindow( 0, 1, 1, 720, kFps, 20.0 ).ok );
+}
+
+TEST( PlayableWindow, FableCutInEqualsCutOutFiveOnAThirtySecondClipPlaysFiveFramesWhenRepairIsDisabled )
+{
+    const PlayableWindowVerdict off = evaluatePlayableWindow( 0, 5, 5, 720, kFps, 24.0, 20.0, false );
+    ASSERT_FALSE( off.ok );
+    ASSERT_EQ( 5, off.playableFrames );   // frames 0..4: playbackHandling stops at slider >= cutOut - 1
+    const PlayableWindowVerdict on = evaluatePlayableWindow( 0, 5, 5, 720, kFps, 24.0, 20.0, true );
+    ASSERT_TRUE( on.ok );
+}
+
+TEST( PlayableWindow, WithTheRepairDisabledAnInvertedRangeIsMeasuredAsTheEngineStopsIt )
+{
+    // cutOut < cutIn: with repair the Play path widens it to the clip end; without it the engine stops at
+    // slider >= cutOut - 1, so the window is what lies before the raw cut-out only.
+    ASSERT_TRUE( evaluatePlayableWindow( 0, 400, 100, 720, kFps, 20.0, 20.0, true ).ok );
+    const PlayableWindowVerdict off = evaluatePlayableWindow( 0, 400, 100, 720, kFps, 20.0, 20.0, false );
+    ASSERT_FALSE( off.ok );
+    ASSERT_EQ( 100, off.playableFrames );
+    // A range that is already fine is the same either way.
+    ASSERT_TRUE( evaluatePlayableWindow( 0, 1, 720, 720, kFps, 20.0, 20.0, false ).ok );
+}
+
+// sol B2: the lifecycle stress switch stops Play, so it may only happen after the floor.
+TEST( PlayableWindow, TheLifecycleStressSwitchMayOnlyHappenAfterTheTwentySecondFloor )
+{
+    using playback_frame_range::kMinPlayWindowMs;
+    using playback_frame_range::stressSwitchReachesFloor;
+    ASSERT_EQ( 20000, kMinPlayWindowMs );
+    ASSERT_FALSE( stressSwitchReachesFloor( 0 ) );
+    ASSERT_FALSE( stressSwitchReachesFloor( 1000 ) );      // the pre-fix default: Play stopped after ~1 s
+    ASSERT_FALSE( stressSwitchReachesFloor( 19999 ) );
+    ASSERT_TRUE( stressSwitchReachesFloor( 20000 ) );
+    ASSERT_TRUE( stressSwitchReachesFloor( 24000 ) );
+    ASSERT_FALSE( stressSwitchReachesFloor( -1 ) );
+}
+
+// sol B2: a hold for a Play that an exercise mode ends early (Look Assist settle, play-action smoke).
+TEST( PlayableWindow, AnExerciseModeMayStopPlayOnlyOnceTheFloorHasElapsed )
+{
+    using playback_frame_range::playHoldReachedFloor;
+    ASSERT_FALSE( playHoldReachedFloor( 0 ) );
+    ASSERT_FALSE( playHoldReachedFloor( 12000 ) );   // the old Look Assist settle deadline
+    ASSERT_FALSE( playHoldReachedFloor( 5000 ) );    // the old play-action timeout
+    ASSERT_FALSE( playHoldReachedFloor( 19999 ) );
+    ASSERT_TRUE( playHoldReachedFloor( 20000 ) );
 }

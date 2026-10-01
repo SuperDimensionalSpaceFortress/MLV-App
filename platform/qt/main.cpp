@@ -9,6 +9,7 @@
 #include "MyApplication.h"
 #include "CrashForensics.h"
 #include "Phase3Mode.h"
+#include "PlaybackFrameRange.h"
 #include "../../src/batch/BatchContext.h"
 #include "../../src/batch/BatchRunner.h"
 #include "../../src/batch/BatchLogger.h"
@@ -1357,9 +1358,9 @@ static int runGuiPlaybackSmoke(QApplication &app)
 
     const QCommandLineOption stressSwitchAtMsOpt(
         QStringLiteral("stress-switch-at-ms"),
-        QStringLiteral("Elapsed playback milliseconds before the lifecycle stress sequence starts."),
+        QStringLiteral("Elapsed playback milliseconds before the lifecycle stress sequence starts. The switch stops Play, so it must be at least 20000 (the 20 s play floor)."),
         QStringLiteral("milliseconds"),
-        QStringLiteral("1000"));
+        QStringLiteral("20000"));
     parser.addOption(stressSwitchAtMsOpt);
 
     const QCommandLineOption stressSeekFrameOpt(
@@ -1422,6 +1423,14 @@ static int runGuiPlaybackSmoke(QApplication &app)
     {
         err << "[GUI-SMOKE] ERROR: --seconds must be greater than 0.\n";
         return 2;
+    }
+    // PLAYBACK-CLIP-LENGTH-ENFORCE-2 round 2 (hub ruling): --seconds IS the play window (the measured Play is
+    // stopped after it), so it must itself reach the 20 s floor -- refused here, typed and before any window.
+    if (seconds + 1e-9 < playback_frame_range::kMinPlayWindowSeconds)
+    {
+        err << "[GUI-SMOKE] ERROR: PLAY_DURATION_TOO_SHORT (--seconds=" << seconds
+            << " window=" << playback_frame_range::kMinPlayWindowSeconds << ")\n";
+        return 14;
     }
 
     const int settleMs = parser.value(settleOpt).toInt(&ok);
@@ -1495,6 +1504,22 @@ static int runGuiPlaybackSmoke(QApplication &app)
     if (!ok || stressSwitchAtMs < 0)
     {
         err << "[GUI-SMOKE] ERROR: --stress-switch-at-ms must be 0 or greater.\n";
+        return 2;
+    }
+    // ENFORCE-2 round 2 (sol B2): the lifecycle stress switch STOPS Play on the first clip; before the floor it
+    // would end a Play shorter than 20 s. Refused up front when the mode is requested.
+    if (parser.isSet(exerciseClipLifecycleStressOpt)
+        && !playback_frame_range::stressSwitchReachesFloor(stressSwitchAtMs))
+    {
+        err << "[GUI-SMOKE] ERROR: PLAY_DURATION_TOO_SHORT (--stress-switch-at-ms=" << stressSwitchAtMs
+            << " must be >= " << playback_frame_range::kMinPlayWindowMs << ")\n";
+        return 14;
+    }
+    if (parser.isSet(exerciseClipLifecycleStressOpt)
+        && static_cast<double>(stressSwitchAtMs) > seconds * 1000.0)
+    {
+        err << "[GUI-SMOKE] ERROR: --stress-switch-at-ms=" << stressSwitchAtMs
+            << " is after the end of the --seconds=" << seconds << " play window; the switch would never happen.\n";
         return 2;
     }
 
@@ -1752,6 +1777,19 @@ int main(int argc, char *argv[])
     if (abNoShareContexts)
     {
         qInfo() << "viewport_ab: AA_ShareOpenGLContexts skipped by request.";
+    }
+
+    // PLAYBACK-CLIP-LENGTH-ENFORCE-2 round 2 (fable PLAY-GATE-ALREADY-PLAYING-1): the MLVAPP_AUTOPLAY_* hook is a
+    // normal-GUI feature. The smoke and profile windows are constructed with argv = { appName } only (see
+    // runGuiPlaybackSmoke / runPlaybackProfile), so the hook cannot arm there; a launch that nevertheless
+    // carries the variable is REFUSED, typed and before any window exists, so an inherited autoplay can never
+    // be adopted as an automation mode's own Play.
+    if ((profile_playback || gui_playback_smoke)
+        && qEnvironmentVariableIntValue("MLVAPP_AUTOPLAY_SECONDS") != 0)
+    {
+        QTextStream(stderr) << "[GUI-SMOKE] ERROR: AUTOPLAY_REFUSED_IN_AUTOMATION "
+                               "(MLVAPP_AUTOPLAY_SECONDS is set; the autoplay hook has no place in a smoke or profile run)\n";
+        return 14;
     }
 
     MyApplication a(argc, argv);

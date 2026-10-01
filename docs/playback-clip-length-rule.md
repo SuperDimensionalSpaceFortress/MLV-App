@@ -12,9 +12,12 @@ Any leg that **plays** the app - speed, pacing, smoothness, a LOOK / contact she
 (Bachelor, Ultra-Magnus, CUDA or CPU) uses **at least 20 s of real footage**, over a play window that
 **never exceeds the clip**, and **never loops or replays**.
 
-The class this file pins: **no programmatic Play starts unless the window from the CURRENT position to the
-receipt's cut-out is >= 20 s AND >= the requested window; the process admits ONE programmatic Play; Loop is
-never enabled by automation; and every wrap, jump-to-first-frame and restart is counted and invalidates the run.**
+The class this file pins: **every programmatic Play in the app plays >= 20 s of real footage from the effective
+range - never less, never looping, never replaying - or is refused BEFORE Play.** Concretely: the window the caller
+REQUESTS (the time its own stop timer / hold lets Play run) must itself be >= 20 s (`PLAY_DURATION_TOO_SHORT`), the
+footage from the CURRENT position to the cut-out the ENGINE will play must be >= that window, the process admits
+ONE programmatic Play, Loop is never enabled by automation, no automation mode stops Play before the 20 s floor,
+and every wrap, jump-to-first-frame and restart is counted and invalidates the run.
 
 The tracked fixtures (`tiny_dual_iso`, 2 frames; `large_dual_iso`, 16 frames, about 0.1-0.7 s) are for unit
 tests and non-playing checks only. They are never played on a venue.
@@ -27,7 +30,12 @@ before the cut-range refusal ran, and a direct `MLVApp.exe --profile-playback --
 app-side gate at all. Now `MainWindow::programmaticPlay(site, requestedSeconds)` is the ONLY place the app
 triggers Play on its own behalf. It evaluates `playback_frame_range::evaluatePlayableWindow` (pure, unit-tested
 in `tests/console/test_playback_frame_range.cpp`): the cut range is normalized exactly as the Play path does,
-the window is measured from the live slider position to the cut-out, and it must be `>= max(20 s, requested)`.
+the window is measured from the live slider position to the cut-out, and it must be `>= max(20 s, requested)` -
+and the **requested** window must itself be `>= 20 s` (a caller that asks for 1 s is refused even on a 30 s clip).
+The range measured is the one the **engine** plays: with `MLVAPP_F3_DISABLE_CUT_RANGE_REPAIR` set the engine
+leaves a collapsed or inverted range alone, so the gate does too (`engineCutRangeForPlay`); that is the only
+environment variable in `platform/qt` that touches the cut range, and the tools refuse it as well. The caller's
+window is evaluated even when Play is already running (an already-running Play is never adopted).
 A `ProgrammaticPlayLedger` then admits the first programmatic Play of the process and refuses every later one
 (`REPLAY_REFUSED`: restart, re-Play, stress switch, contact-sheet replay). Refusals are typed, path-free, exit 14,
 and happen **before Play** (zero presented frames). User input (`on_actionPlay_triggered`, the Loop menu) is
@@ -35,12 +43,12 @@ never gated.
 
 | Programmatic entry (`platform/qt/MainWindow.cpp`) | Gated how |
 |---|---|
-| autoplay hook, `MLVAPP_AUTOPLAY_*` (constructor lambda, ~2826) | Loop forced off, `programmaticPlay("autoplay", seconds)`; `autoplay.refused reason=<typed>`; `MLVAPP_AUTOPLAY_LOOP` ignored |
-| profile Look Assist settle (`--exercise-look-assist-settle/-toggle`, ~7865) | `programmaticPlay("profile-look-assist-settle", 12)`; **Loop is no longer enabled**; refusal returns exit 14 |
-| profile `--exercise-play-action` (~8232) | `programmaticPlay("profile-exercise-play-action")`; exit 14 before Play |
+| autoplay hook, `MLVAPP_AUTOPLAY_*` (constructor lambda, normal GUI only) | Loop forced off, `programmaticPlay("autoplay", seconds)` (< 20 s is `PLAY_DURATION_TOO_SHORT`); `autoplay.refused reason=<typed>`; `MLVAPP_AUTOPLAY_LOOP` ignored. The smoke / profile windows are built with `argv = { appName }` so the hook cannot arm there, and a smoke / profile launch carrying `MLVAPP_AUTOPLAY_SECONDS` is refused up front (`AUTOPLAY_REFUSED_IN_AUTOMATION`, exit 14) |
+| profile Look Assist settle (`--exercise-look-assist-settle/-toggle`) | `programmaticPlay("profile-look-assist-settle", 20)`; **Loop is no longer enabled**; Play is HELD for the full 20 s (it used to stop at 12 s or when the diagnostics settled); a Play that ends earlier is a typed failure; refusal returns exit 14 |
+| profile `--exercise-play-action` | `programmaticPlay("profile-exercise-play-action", 20)`; exit 14 before Play; Play is HELD for 20 s (it used to stop at the first advancing frame / 5 s) |
 | GUI-smoke Look Assist warm-up (was ~8961-8989) | **REMOVED.** No warm-up Play, no Loop: Look Assist warms during the measured pass |
-| GUI-smoke measured Play (~9437) | `programmaticPlay("gui-smoke-measured", max(--seconds, presented-frames / fps))`; a `--presented-frames` target under 20 s of frames is `PLAY_WINDOW_TOO_SHORT` |
-| clip-lifecycle stress (~9601, ~9673) | the Play is stopped at the switch; the **restart Play is REMOVED** (it would be a replay) |
+| GUI-smoke measured Play | `programmaticPlay("gui-smoke-measured", min(--seconds, presented-frames / fps))` (the sooner of the two ends Play, so that is the window); `--seconds` < 20 is refused at parse (`PLAY_DURATION_TOO_SHORT`, exit 14); a `--presented-frames` target under 20 s of frames is `PLAY_WINDOW_TOO_SHORT`; the clock starts once Play has started, so the whole window is played; a Play that ends under the floor is a typed failure, never a pass |
+| clip-lifecycle stress | the Play is stopped at the switch, so the switch may only happen after the 20 s floor (`--stress-switch-at-ms` default 20000, below that refused `PLAY_DURATION_TOO_SHORT`; the runner exits 41); the second clip is opened, seeked and closed but **never played**; the **restart Play is REMOVED** (it would be a replay) |
 | contact-sheet playback pass (was ~10322, up to 50 re-Plays) | **REMOVED.** The default pass refuses with `REPLAY_REFUSED`; `--contact-sheet-seek-mode` (no Play) is the only capture, and the attr-3 job now passes it |
 | Play pressed on the last frame (`on_actionPlay_triggered`, ~23248) | counted by the wrap recorder (`jump_to_first_count`); the position-aware window already refuses a programmatic Play there |
 | any Play start after the first (`on_actionPlay_toggled`, ~27635) | counted (`restart_count`); `wrap_count = engine wraps + jump-to-first + restarts`, any > 0 is `INVALID_LOOPED` |
@@ -49,8 +57,21 @@ never gated.
 `tools/profiling/test-app-play-gate-offscreen.ps1 -Exe <MLVApp.exe>` launches the tracked short fixture through
 each entry reachable offscreen and asserts the app refuses before Play. The static class test
 (`test_playback_clip_length_gate.py`, `AppPlayGateStaticClassTests`) fails on any `actionPlay->trigger()` /
-Loop-enable outside the allowlisted lines, on a programmatic Play site nobody reviewed, and on a gate that
-triggers Play before it evaluated the window and admitted it; it is mutation-tested.
+any other use of the Play or Loop action (alias, split line, variable `setChecked`, `invokeMethod`, a synthesized
+Space key) outside three PINNED helper bodies - no `allowlisted:` comment can exempt a line - on a programmatic
+Play / Stop site or requested-window expression nobody reviewed, and on a gate that triggers Play before it
+evaluated the window and admitted it; it is mutation-tested (`tools/repo_hygiene/app_play_scan.py`).
+
+### Every automation path that ends Play on its own clock, and its resolution
+
+| Path | Resolution |
+|---|---|
+| `--seconds` / `MLVAPP_AUTOPLAY_SECONDS` timer under 20 s | refused before Play (`PLAY_DURATION_TOO_SHORT`) |
+| `--presented-frames` early stop | the sooner of timeout and target is the window; refused under 20 s |
+| lifecycle stress switch (stopped Play at ~1 s by default) | switch only at >= 20 s, default 20000 ms; second Play still refused (`REPLAY_REFUSED`) |
+| profile Look Assist settle (stopped at 12 s) | requests and holds 20 s |
+| `--exercise-play-action` (stopped at the first frame / 5 s) | requests and holds 20 s |
+| a Play the engine ends early (end of range, jump) | the wait loops fail closed (`PLAY_DURATION_TOO_SHORT`) rather than report a pass |
 
 ## Where else it is enforced
 
@@ -62,7 +83,7 @@ triggers Play before it evaluated the window and admitted it; it is mutation-tes
 | export launchers (`run-release-cdng-export-profile.ps1`, `run-release-cuda-dng-export.ps1`) | refuse every play-capable pass-through option | exit 44 |
 | `bachelor/playback-attr-3-cuda-job.ps1` | `-PlaySeconds` (floor 20); fixture ids refused at generation; the job summary carries the typed `smokeRefusalReason` | `PLAYBACK_ATTR3_...` |
 | runtime backstop | `PlaybackWrapRecorder`; `playback_smoke.summary/.gate` carry `wrapped`, `wrap_count`, `jump_to_first_count`, `restart_count`; the runner's `Get-GuiSmokeLoopVerdict` (executed and mutation-tested, including the runner's application of it) | `INVALID_LOOPED`, exit 43 |
-| `test_playback_clip_length_gate.py` scan | fails if any script under `tools/` / `.github/` names a play token (also **composed**: `'a' + 'b'`, `-f`, `-join`, backticks) or launches the exe forwarding caller arguments, without the gate or a commented allowlist entry | CI red |
+| `test_playback_clip_length_gate.py` scan | fails if any script under `tools/` / `.github/` names a play token (also **composed**: `'a' + 'b'`, `-f`, `-join`, backticks) or launches the exe forwarding caller arguments, without the gate or a listed allowlist entry | CI red |
 
 Typed verdicts never name the clip path.
 
@@ -80,8 +101,10 @@ Typed verdicts never name the clip path.
 - The Auto-quality Look Assist warm-up is no longer a separate Play, so in Auto the measured pass includes the
   `WarmupHq` samples; contact sheets are seek-mode (`playback_path=false`) until a capture-during-the-measured-pass
   path exists. Both are the price of "no replay".
-- `--presented-frames` runs and `--exercise-play-action` stop early by design; the rule is on the window the
-  Play MAY cover (>= 20 s from the position), and for `--presented-frames` also on the frames requested.
+- No automation mode stops Play early any more: each requests >= 20 s and holds it (see the table above). The
+  live offscreen proof (`test-app-play-gate-offscreen.ps1`) can only drive the refused paths, because the
+  tracked fixtures are shorter than 20 s and no other clip may be created or opened; the allowed paths (each
+  plays >= 20 s) are covered by the pure unit tests and the static pins, and need a venue sitting to observe.
 
 ## Allowlist of legitimate `--loop`
 

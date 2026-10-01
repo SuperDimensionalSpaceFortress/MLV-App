@@ -183,7 +183,9 @@ public:
         bool forceDropFrame = false;
         bool exerciseClipLifecycleStress = false;
         QString stressSwitchInputPath;
-        int stressSwitchAtMs = 1000;
+        // ENFORCE-2 round 2: the switch stops Play on the first clip, so it may not happen before the
+        // 20 s play floor (playback_frame_range::kMinPlayWindowMs); runGuiPlaybackSmoke refuses less.
+        int stressSwitchAtMs = 20000;
         int stressSeekFrame = 8;
         // UM-DISPLAY-SELECT-AND-LOG-1: when true, the smoke session is placed and maximized
         // (deterministic size) on the chosen target display instead of going full screen --

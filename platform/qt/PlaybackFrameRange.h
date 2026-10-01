@@ -204,40 +204,93 @@ struct PlaybackWrapRecorder
 // window covers: from the last frame the window is one frame, so it is refused.
 // ---------------------------------------------------------------------------------------------------------
 constexpr double kMinPlayWindowSeconds = 20.0;
+constexpr int kMinPlayWindowMs = 20000;   // kMinPlayWindowSeconds, in the milliseconds the wait loops count
+
+// ENFORCE-2 round 2 (hub ruling): the window the caller REQUESTS -- the time its own stop timer / exercise loop
+// lets Play run -- must itself reach the floor; having 20 s of footage available is not enough. Every
+// automation mode that ends Play on its own clock asks for the window it will really hold.
+//
+// smokePlayRequestSeconds: the GUI smoke's Play ends at the SOONER of its --seconds timeout and its
+// --presented-frames target (N / fps), so that is the window it requests. Unknown fps with a target fails
+// closed to 0 s, which the floor refuses. The timeout keeps its pre-existing 100 ms minimum.
+inline double smokePlayRequestSeconds( int durationMs, int targetPresentedFrames, double fps )
+{
+    const double timeoutSeconds = std::max( 100, durationMs ) / 1000.0;
+    if( targetPresentedFrames <= 0 ) return timeoutSeconds;
+    if( !( fps > 0.0 ) ) return 0.0;
+    return std::min( timeoutSeconds, static_cast<double>( targetPresentedFrames ) / fps );
+}
+
+// The lifecycle stress switch STOPS Play on the first clip, so it may only happen once Play has run the floor.
+inline bool stressSwitchReachesFloor( int switchAtMs ) { return switchAtMs >= kMinPlayWindowMs; }
+
+// An exercise mode that ends its own Play (the Look Assist settle, the play-action smoke) holds Play at least
+// until the floor has elapsed.
+inline bool playHoldReachedFloor( int64_t elapsedMs ) { return elapsedMs >= kMinPlayWindowMs; }
 
 struct PlayableWindowVerdict
 {
     bool ok = false;
-    // "" when ok; otherwise a typed reason: CLIP_LENGTH_UNKNOWN | CLIP_TOO_SHORT | REPLAY_REFUSED.
+    // "" when ok; otherwise a typed reason: CLIP_LENGTH_UNKNOWN | CLIP_TOO_SHORT | PLAY_DURATION_TOO_SHORT |
+    // REPLAY_REFUSED.
     const char *reason = "CLIP_LENGTH_UNKNOWN";
     // "clip" when the whole clip is shorter than the requirement, "cut_range" when the clip is long enough
-    // but the span from the current position to the cut-out is not. Empty when ok / unknown.
+    // but the span from the current position to the cut-out is not, "requested" when the caller's own play
+    // window is under the floor. Empty when ok / unknown.
     const char *scope = "";
     double clipSeconds = 0.0;
     double playableSeconds = 0.0;
     double requiredSeconds = kMinPlayWindowSeconds;
+    double requestedSeconds = 0.0;   // the window the caller asked to hold Play for
     int positionFrame = 0;     // 0-based, clamped
     int lastPlayableFrame = 0; // 0-based inclusive: the cut-out frame
     int playableFrames = 0;    // frames positionFrame..lastPlayableFrame inclusive
 };
 
+// engineCutRangeForPlay -- the range the engine ACTUALLY plays. With the collapsed-range repair enabled (the
+// normal state) it is normalizeCutRange(..., repair = true). MLVAPP_F3_DISABLE_CUT_RANGE_REPAIR switches the
+// engine's play path to leave the spin boxes untouched (normalizePlaybackCutRangeForLoadedClip returns early),
+// so playbackHandling then stops at slider >= the RAW cut-out - 1: no widening of a one-frame or inverted
+// range, only the clip end clamps it.
+inline CutRange engineCutRangeForPlay( int cutIn, int cutOut, int totalFrames, bool repairEnabled )
+{
+    if( repairEnabled ) return normalizeCutRange( cutIn, cutOut, totalFrames, true );
+    CutRange raw;
+    if( totalFrames <= 0 ) return raw;
+    raw.valid = true;
+    raw.cutIn = std::max( 1, std::min( cutIn, totalFrames ) );
+    raw.cutOut = std::max( 1, std::min( cutOut, totalFrames ) );
+    return raw;
+}
+
 // evaluatePlayableWindow -- pure. positionFrame is the 0-based slider position; cutIn/cutOut are the raw
 // spinBoxCutIn/spinBoxCutOut values (1-based, Out inclusive: playbackHandling stops at slider >= cutOut-1).
-// The range is normalized exactly as the Play path would (normalizeCutRange with the collapsed-range repair),
-// so the window measured here is the window that would really play.
+// The range is the one the engine plays (engineCutRangeForPlay; the collapsed-range repair is on unless
+// the caller says the engine has it disabled), so the window measured here is the window that would really
+// play. requestedSeconds is the window the CALLER will hold Play for; it must itself reach floorSeconds.
 inline PlayableWindowVerdict evaluatePlayableWindow(
     int positionFrame, int cutIn, int cutOut, int totalFrames, double fps,
-    double requestedSeconds, double floorSeconds = kMinPlayWindowSeconds )
+    double requestedSeconds, double floorSeconds = kMinPlayWindowSeconds,
+    bool collapsedRangeRepairEnabled = true )
 {
     PlayableWindowVerdict v;
     v.requiredSeconds = std::max( floorSeconds, requestedSeconds );
+    v.requestedSeconds = requestedSeconds;
+    if( !( requestedSeconds + 1e-9 >= floorSeconds ) )
+    {
+        // The caller's own play window (its stop timer / hold) is under the floor: refused before Play,
+        // whatever the clip -- 20 s of footage being available does not make a 1 s Play a 20 s Play.
+        v.reason = "PLAY_DURATION_TOO_SHORT";
+        v.scope = "requested";
+        return v;
+    }
     if( totalFrames <= 0 || !( fps > 0.0 ) )
     {
         return v; // CLIP_LENGTH_UNKNOWN, fail closed
     }
 
     v.clipSeconds = static_cast<double>( totalFrames ) / fps;
-    const CutRange range = normalizeCutRange( cutIn, cutOut, totalFrames, true );
+    const CutRange range = engineCutRangeForPlay( cutIn, cutOut, totalFrames, collapsedRangeRepairEnabled );
     v.positionFrame = clampFrameIndex( positionFrame, totalFrames );
     v.lastPlayableFrame = lastFrameIndex( range );
     v.playableFrames = v.lastPlayableFrame >= v.positionFrame

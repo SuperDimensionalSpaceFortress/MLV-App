@@ -71,7 +71,7 @@ param(
     [switch]$DisableLookAssist,
     [switch]$ExerciseClipLifecycleStress,
     [string]$StressSwitchInput = "",
-    [int]$StressSwitchAtMs = 1000,
+    [int]$StressSwitchAtMs = 20000,
     [int]$StressSeekFrame = 8,
     [switch]$EnablePhase3QualityModes,
     [string]$StageLog = "",
@@ -1336,7 +1336,14 @@ if (-not $LaunchOnlyProbe) {
         [Console]::Error.WriteLine("PLAYBACK-CLIP-LENGTH-ENFORCE-1: $($clipLengthGate.message)")
         exit (Get-GuiSmokeGateExitCode -Verdict $clipLengthGate.verdict)
     }
-    # The lifecycle-stress leg switches to a SECOND clip mid-play: it is played too, so it is gated too
+    # ENFORCE-2 round 2 (sol B2): the lifecycle-stress switch STOPS Play on the first clip (the second clip is
+    # opened, seeked and closed, never played), so it may only happen after the 20 s floor. The default is
+    # 20000 ms; anything shorter would end a Play under the floor and is refused: exit 41 PLAY_WINDOW_TOO_SHORT.
+    if ($ExerciseClipLifecycleStress -and $StressSwitchAtMs -lt $script:GuiSmokeMinPlayWindowMs) {
+        [Console]::Error.WriteLine("PLAYBACK-CLIP-LENGTH-ENFORCE-2: PLAY_WINDOW_TOO_SHORT (stress-switch-at-ms=$StressSwitchAtMs window=$($script:GuiSmokeMinPlayWindowMs))")
+        exit (Get-GuiSmokeGateExitCode -Verdict 'PLAY_WINDOW_TOO_SHORT')
+    }
+    # The lifecycle-stress leg switches to a SECOND clip mid-play: it is gated too
     # (floor only -- the switch clip is not played for the whole window).
     if ($ExerciseClipLifecycleStress -and -not [string]::IsNullOrWhiteSpace($StressSwitchInput)) {
         $stressClipGate = Test-GuiSmokeClipLength -Path (Resolve-Path -LiteralPath $StressSwitchInput).ProviderPath -WindowSeconds 0 -ClipOnly

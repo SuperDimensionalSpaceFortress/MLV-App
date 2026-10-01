@@ -2802,11 +2802,11 @@ MainWindow::MainWindow(int &argc, char **argv, QWidget *parent) :
             // the REAL Play action on the NORMAL event loop after a settle delay, then stops - so
             // automation drives playback without synthesizing keystrokes or stealing window focus.
             // Pairs with MLVAPP_PLAYBACK_SCALE_FACTOR / MLVAPP_PLAYBACK_AGGRESSIVE_PREVIEW.
-            //   MLVAPP_AUTOPLAY_SECONDS   >0 enables; seconds to play after settling
+            //   MLVAPP_AUTOPLAY_SECONDS   >0 enables; seconds to play after settling (must be >= 20:
+            //                             a shorter window is refused by the Play gate, before Play)
             //   MLVAPP_AUTOPLAY_SETTLE_MS settle delay before Play (default 2500)
             //   MLVAPP_AUTOPLAY_EXIT      >0 quits the app shortly after the auto-stop
-            //   MLVAPP_AUTOPLAY_LOOP      >0 enables loop playback (a short clip then plays
-            //                             continuously for the whole capture window)
+            //   MLVAPP_AUTOPLAY_LOOP      IGNORED (loud): no venue playback may loop
             const int autoplaySeconds = qEnvironmentVariableIntValue( "MLVAPP_AUTOPLAY_SECONDS" );
             if( autoplaySeconds > 0 )
             {
@@ -7859,11 +7859,15 @@ int MainWindow::runHeadlessPlaybackProfile(const PlaybackProfileOptions & option
                   .arg( static_cast<qulonglong>(
                       m_playbackQualityAutoDecisionSampleCount ) ));
             // PLAYBACK-CLIP-LENGTH-ENFORCE-2 (owner rule 2026-09-30): this Play goes through the shared
-            // gate (>= 20 s from the CURRENT position to the cut-out, and >= the 12 s settle wait) and
-            // NEVER enables Loop -- the pre-ENFORCE-2 code forced Loop on here and could wrap a 2-frame
-            // cut range for 12 s. A refusal happens before Play; the caller returns the typed exit code.
+            // gate (>= 20 s from the CURRENT position to the cut-out) and NEVER enables Loop -- the
+            // pre-ENFORCE-2 code forced Loop on here and could wrap a 2-frame cut range for 12 s.
+            // Round 2 (hub ruling): the settle also HOLDS Play for the full 20 s floor before it stops it
+            // (it used to stop at a 12 s deadline or as soon as the diagnostics settled), and requests that
+            // 20 s window, so no settle Play is shorter than the floor. A refusal happens before Play; the
+            // caller returns the typed exit code.
             forceLoopOffForAutomation( "profile-look-assist-settle" );
-            if( !programmaticPlay( "profile-look-assist-settle", 12.0 ) )
+            if( !programmaticPlay( "profile-look-assist-settle",
+                                   playback_frame_range::kMinPlayWindowSeconds ) )
             {
                 lookAssistSettleSmokeStable = false;
                 lookAssistSettleSmokeFailure = m_lastPlayGateRefusalMessage;
@@ -7883,14 +7887,27 @@ int MainWindow::runHeadlessPlaybackProfile(const PlaybackProfileOptions & option
 
             QElapsedTimer autoSettleClock;
             autoSettleClock.start();
-            while( autoSettleClock.elapsed() < 12000
-                && ui->checkBoxLookAssistEnable->isChecked()
-                && !m_lastLookAssistDiagnosticsValid )
+            bool settlePlayEndedEarly = false;
+            while( !playback_frame_range::playHoldReachedFloor( autoSettleClock.elapsed() ) )
             {
                 qApp->processEvents( QEventLoop::AllEvents );
+                if( !ui->actionPlay->isChecked() )
+                {
+                    settlePlayEndedEarly = true;   // the engine / a user stopped it: fail closed, never pretend
+                    break;
+                }
                 QThread::msleep( 10 );
             }
             programmaticStop( "profile-look-assist-settle" );
+            if( settlePlayEndedEarly )
+            {
+                lookAssistSettleSmokeStable = false;
+                lookAssistSettleSmokeFailure = QStringLiteral(
+                    "PLAY_DURATION_TOO_SHORT (the Look Assist settle Play ended before the 20 s floor; elapsed_ms=%1)" )
+                    .arg( autoSettleClock.elapsed() );
+                trace(label + QStringLiteral("-auto-playback-settle-failed: ") + lookAssistSettleSmokeFailure);
+                return false;
+            }
             qApp->processEvents( QEventLoop::AllEvents );
             trace(label + QStringLiteral("-auto-playback-settle-end diagnostics_valid=%1 reason=%2 samples=%3 elapsed_ms=%4")
                   .arg( bool01( m_lastLookAssistDiagnosticsValid ) )
@@ -8196,14 +8213,13 @@ int MainWindow::runHeadlessPlaybackProfile(const PlaybackProfileOptions & option
         playActionSmokeInitialFrame = ui->horizontalSliderPosition->value();
         playActionSmokeFinalFrame = playActionSmokeInitialFrame;
         QElapsedTimer playActionClock;
-        QEventLoop playActionLoop;
-        QTimer playActionTimeout;
-        playActionTimeout.setSingleShot( true );
+        // The frameReady context object: a plain QObject, since nothing runs a nested event loop here any more.
+        QObject playActionContext;
 
         QMetaObject::Connection readyConnection = connect(
             this,
             &MainWindow::frameReady,
-            &playActionLoop,
+            &playActionContext,
             [&]()
             {
                 ++playActionSmokeFrameReadyCount;
@@ -8211,32 +8227,35 @@ int MainWindow::runHeadlessPlaybackProfile(const PlaybackProfileOptions & option
                 if( playActionSmokeFinalFrame != playActionSmokeInitialFrame )
                 {
                     playActionSmokeFrameAdvanced = true;
-                    playActionLoop.quit();
                 }
-            } );
-        QMetaObject::Connection timeoutConnection = connect(
-            &playActionTimeout,
-            &QTimer::timeout,
-            &playActionLoop,
-            [&]()
-            {
-                playActionSmokeTimedOut = true;
-                playActionLoop.quit();
             } );
 
         playActionClock.start();
-        playActionTimeout.start( 5000 );
         // PLAYBACK-CLIP-LENGTH-ENFORCE-2: the direct `MLVApp.exe --profile-playback --exercise-play-action`
         // launch is gated HERE, in the app: the window from the current position (the start frame, set
         // above) to the cut-out must be >= 20 s, else Play is never triggered (typed exit 14, zero frames).
+        // Round 2 (hub ruling): the exercise requests the 20 s floor and HOLDS Play for all of it -- it used to
+        // stop at the first advancing frame or a 5 s timeout, a Play of well under 20 s.
         forceLoopOffForAutomation( "profile-exercise-play-action" );
-        const bool playActionAdmitted = programmaticPlay( "profile-exercise-play-action", 0.0 );
+        const bool playActionAdmitted = programmaticPlay( "profile-exercise-play-action",
+                                                          playback_frame_range::kMinPlayWindowSeconds );
         playActionGateRefused = !playActionAdmitted;
         playActionSmokeStarted = playActionAdmitted && ui->actionPlay->isChecked();
         qApp->processEvents( QEventLoop::AllEvents );
-        if( playActionSmokeStarted && !playActionSmokeFrameAdvanced )
+        bool playActionEndedEarly = false;
+        if( playActionSmokeStarted )
         {
-            playActionLoop.exec();
+            while( !playback_frame_range::playHoldReachedFloor( playActionClock.elapsed() ) )
+            {
+                qApp->processEvents( QEventLoop::AllEvents );
+                if( !ui->actionPlay->isChecked() )
+                {
+                    playActionEndedEarly = true;   // stopped by the engine or a user before the floor
+                    break;
+                }
+                QThread::msleep( 10 );
+            }
+            playActionSmokeTimedOut = !playActionEndedEarly;   // the 20 s hold elapsed (not a timeout failure)
         }
         playActionSmokeElapsedMs = playActionClock.elapsed();
         playActionSmokeFinalFrame = ui->horizontalSliderPosition->value();
@@ -8252,7 +8271,6 @@ int MainWindow::runHeadlessPlaybackProfile(const PlaybackProfileOptions & option
         }
         m_frameStillDrawing = m_pRenderThread && !m_pRenderThread->isIdle();
         disconnect( readyConnection );
-        disconnect( timeoutConnection );
         playActionSmokeCutInAfter = ui->spinBoxCutIn->value();
         playActionSmokeCutOutAfter = ui->spinBoxCutOut->value();
 
@@ -8264,10 +8282,16 @@ int MainWindow::runHeadlessPlaybackProfile(const PlaybackProfileOptions & option
         {
             playActionSmokeFailure = QStringLiteral("Play action did not enter checked state.");
         }
+        else if( playActionEndedEarly )
+        {
+            playActionSmokeFailure = QStringLiteral(
+                "PLAY_DURATION_TOO_SHORT (the play-action Play ended before the 20 s floor; elapsed_ms=%1)" )
+                .arg( playActionSmokeElapsedMs );
+        }
         else if( !playActionSmokeFrameAdvanced )
         {
             playActionSmokeFailure =
-                QStringLiteral("Play action did not advance the frame before timeout; frameReady=%1 initial=%2 final=%3 timed_out=%4")
+                QStringLiteral("Play action did not advance the frame within the 20 s hold; frameReady=%1 initial=%2 final=%3 timed_out=%4")
                     .arg( playActionSmokeFrameReadyCount )
                     .arg( playActionSmokeInitialFrame )
                     .arg( playActionSmokeFinalFrame )
@@ -8805,7 +8829,19 @@ int MainWindow::runGuiPlaybackSmoke(const GuiPlaybackSmokeOptions & options)
             return 14;
         }
     }
-    // The lifecycle-stress leg switches to a SECOND clip mid-play, which is played too: read its MLVI
+    // ENFORCE-2 round 2 (sol B2): the lifecycle-stress leg STOPS the first clip's Play at the switch (the second
+    // clip is opened, seeked and closed but never played), so the switch may only happen after the 20 s floor.
+    // Also refused in main.cpp at parse time; refused here for any other way of building the options.
+    if( options.exerciseClipLifecycleStress
+     && !playback_frame_range::stressSwitchReachesFloor( options.stressSwitchAtMs ) )
+    {
+        ++m_programmaticPlayLedger.refused;
+        m_programmaticPlayLedger.lastRefusalReason = "PLAY_DURATION_TOO_SHORT";
+        err << "[GUI-SMOKE] ERROR: PLAY_DURATION_TOO_SHORT (stress-switch-at-ms=" << options.stressSwitchAtMs
+            << " window=" << playback_frame_range::kMinPlayWindowMs << ")\n";
+        return 14;
+    }
+    // The lifecycle-stress leg switches to a SECOND clip mid-play: read its MLVI
     // header (mlv_file_hdr_t: frame count @36, fps nom/denom @44/@48) and apply the 20 s floor. A spanned
     // or unreadable header is refused fail-closed (the runner sums spanned sets; a direct launch need not).
     if( options.exerciseClipLifecycleStress
@@ -9432,10 +9468,12 @@ int MainWindow::runGuiPlaybackSmoke(const GuiPlaybackSmokeOptions & options)
                    ? options.targetPresentedFrames / presentedTargetFps : 0.0, 'f', 3 ) << ")\n";
         return 14;
     }
-    const double presentedTargetSeconds = ( options.targetPresentedFrames > 0 && presentedTargetFps > 0.0 )
-        ? options.targetPresentedFrames / presentedTargetFps : 0.0;
+    // ENFORCE-2 round 2: the measured Play ends at the SOONER of the --seconds timeout and the presented-frames
+    // target, so that sooner figure is the window it requests -- and must itself reach the 20 s floor (the old
+    // code requested the LARGER of the two and let a short timeout hide behind a long target).
     if( !programmaticPlay( "gui-smoke-measured",
-                           qMax( qMax( 100, options.durationMs ) / 1000.0, presentedTargetSeconds ) ) )
+                           playback_frame_range::smokePlayRequestSeconds(
+                               options.durationMs, options.targetPresentedFrames, presentedTargetFps ) ) )
     {
         m_playbackSmokeFullscreenLossLatchArmed = false;
         err << "[GUI-SMOKE] ERROR: " << m_lastPlayGateRefusalMessage << "\n";
@@ -9447,6 +9485,10 @@ int MainWindow::runGuiPlaybackSmoke(const GuiPlaybackSmokeOptions & options)
         err << "[GUI-SMOKE] ERROR: Play action did not enter checked state.\n";
         return 7;
     }
+    // ENFORCE-2 round 2: Play is fully started here (the trigger above includes the start-up preroll), so the
+    // play window is timed from NOW -- the measured Play then runs the whole requested window rather than the
+    // window minus its own start-up cost. Every later wait / switch / verdict below counts from this point.
+    playbackClock.restart();
 
     // HARDENING (CUDA-PLAYBACK-CONTACT-SHEET-2): bind the explicit measured-session marker to
     // THIS trigger -- the one that starts the measured timed loop -- rather than to whichever
@@ -9678,8 +9720,11 @@ int MainWindow::runGuiPlaybackSmoke(const GuiPlaybackSmokeOptions & options)
     while( playbackClock.elapsed() < durationMs && ui->actionPlay->isChecked() )
     {
         qApp->processEvents( QEventLoop::AllEvents );
+        // ENFORCE-2 round 2 (sol B2): the switch STOPS Play on the first clip, so it only ever happens once
+        // Play has run the 20 s floor (the stress option is also refused below 20000 ms at launch).
         if( options.exerciseClipLifecycleStress
          && !stressAttempted
+         && playback_frame_range::playHoldReachedFloor( playbackClock.elapsed() )
          && playbackClock.elapsed() >= qMax( 0, options.stressSwitchAtMs ) )
         {
             stressOk = runClipLifecycleStress();
@@ -9761,6 +9806,18 @@ int MainWindow::runGuiPlaybackSmoke(const GuiPlaybackSmokeOptions & options)
         QThread::msleep( 10 );
     }
     const qint64 playedMs = playbackClock.elapsed();
+    // ENFORCE-2 round 2: a measured Play that ended before the 20 s floor (the engine stopped it, or the
+    // presented-frames target was somehow met early) is never reported as a pass -- fail closed, typed.
+    // One frame period of slack covers a presented-frames target of exactly 20 s of frames.
+    if( !playback_frame_range::playHoldReachedFloor(
+            playedMs + static_cast<qint64>( 1000.0 / qMax( 1.0, presentedTargetFps ) + 1.0 ) ) )
+    {
+        m_playbackSmokeFullscreenLossLatchArmed = false;
+        programmaticStop( "gui-smoke-measured-early-end" );
+        err << "[GUI-SMOKE] ERROR: PLAY_DURATION_TOO_SHORT (played_ms=" << playedMs
+            << " window=" << playback_frame_range::kMinPlayWindowMs << ")\n";
+        return 14;
+    }
     // Disarm right at loop exit -- before the guard's eventual leavePlaybackSmokeFullscreen()
     // teardown runs, so restoring normal chrome at session end is never itself counted.
     m_playbackSmokeFullscreenLossLatchArmed = false;
@@ -27687,23 +27744,41 @@ playback_frame_range::PlayableWindowVerdict MainWindow::checkPlayableWindow( con
     const bool haveClip = m_fileLoaded && m_pMlvObject;
     const int totalFrames = haveClip ? static_cast<int>( getMlvFrames( m_pMlvObject ) ) : 0;
     const double fps = haveClip ? static_cast<double>( getMlvFramerate( m_pMlvObject ) ) : 0.0;
+    // ENFORCE-2 round 2 (sol B3): measure the range the ENGINE plays -- with MLVAPP_F3_DISABLE_CUT_RANGE_REPAIR
+    // set the play path leaves a collapsed / inverted range alone (normalizePlaybackCutRangeForLoadedClip), so
+    // the gate must not assume the repair either. This is the one knob that changes the effective range.
     return playback_frame_range::evaluatePlayableWindow(
         ui->horizontalSliderPosition->value(),
         ui->spinBoxCutIn->value(),
         ui->spinBoxCutOut->value(),
-        totalFrames, fps, requestedSeconds );
+        totalFrames, fps, requestedSeconds,
+        playback_frame_range::kMinPlayWindowSeconds,
+        !f3CutRangeRepairDisabledByEnvironment() );
 }
 
 bool MainWindow::programmaticPlay( const char *site, double requestedSeconds )
 {
-    // A Play that is already running was not started by this call (the user did); never toggle it off.
-    if( ui->actionPlay->isChecked() ) return true;
-
+    // ENFORCE-2 round 2 (fable PLAY-GATE-ALREADY-PLAYING-1): the caller's window is evaluated even when Play is
+    // already running, so an already-running Play is never adopted as the caller's measured Play on the
+    // strength of "it is playing". A running Play that passes is left alone (this call did not start it and
+    // never toggles it off); one that fails is refused and stopped, like any other refusal.
+    const bool alreadyPlaying = ui->actionPlay->isChecked();
     const playback_frame_range::PlayableWindowVerdict verdict = checkPlayableWindow( site, requestedSeconds );
+    if( alreadyPlaying && verdict.ok ) return true;
+
     if( !m_programmaticPlayLedger.admit( verdict ) )
     {
+        if( alreadyPlaying ) programmaticStop( site );
         const QString reason = QString::fromLatin1( m_programmaticPlayLedger.lastRefusalReason );
-        if( reason == QLatin1String( "REPLAY_REFUSED" ) )
+        if( reason == QLatin1String( "PLAY_DURATION_TOO_SHORT" ) )
+        {
+            m_lastPlayGateRefusalMessage = QStringLiteral(
+                "PLAY_DURATION_TOO_SHORT (requested=%1 window=%2; site=%3)" )
+                .arg( verdict.requestedSeconds, 0, 'f', 3 )
+                .arg( playback_frame_range::kMinPlayWindowSeconds, 0, 'f', 3 )
+                .arg( QString::fromLatin1( site ) );
+        }
+        else if( reason == QLatin1String( "REPLAY_REFUSED" ) )
         {
             m_lastPlayGateRefusalMessage = QStringLiteral(
                 "REPLAY_REFUSED (a programmatic Play was already admitted in this process; site=%1)" )

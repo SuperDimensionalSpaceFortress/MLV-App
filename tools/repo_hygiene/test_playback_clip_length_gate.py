@@ -245,6 +245,32 @@ class ClipLengthGateTests(_TmpCase):
                          "PASS_THROUGH_REFUSED")
         self.assertEqual(check({}, "Test-GuiSmokeParentEnvironment -Environment @{ MLVAPP_SOMETHING_ELSE = '1' }")["verdict"], "OK")
 
+    def test_enforce_2_r2_sol_b3_the_cut_range_repair_knob_is_refused_in_every_environment_surface(self) -> None:
+        # The engine can switch the collapsed-range repair off (MLVAPP_F3_DISABLE_CUT_RANGE_REPAIR); the app's gate
+        # follows the knob, and the tools additionally refuse it so no evidence run depends on that agreement.
+        def run(call: str, env_extra: dict | None = None) -> dict:
+            env = {k: v for k, v in os.environ.items()
+                   if not k.upper().startswith(("MLVAPP_AUTOPLAY_", "MLVAPP_F3_"))}
+            env.update(env_extra or {})
+            proc = subprocess.run(
+                [PWSH, "-NoLogo", "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-Command",
+                 f". {_q(GATE)}; {call} | ConvertTo-Json -Compress"],
+                capture_output=True, text=True, timeout=120, env=env)
+            self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+            return json.loads(proc.stdout)
+        for entry in ("MLVAPP_F3_DISABLE_CUT_RANGE_REPAIR=1", "mlvapp_f3_disable_cut_range_repair=0",
+                      "A=1,MLVAPP_F3_DISABLE_CUT_RANGE_REPAIR=true"):
+            with self.subTest(entry):
+                refused = run(f"Test-GuiSmokeEnvironmentEntries -Entries @({_q(entry)})")
+                self.assertEqual(refused["verdict"], "PASS_THROUGH_REFUSED")
+                self.assertEqual(refused["message"], "PASS_THROUGH_REFUSED (env=MLVAPP_F3_DISABLE_CUT_RANGE_REPAIR "
+                                                     "reason=changes_the_effective_play_range)")
+        self.assertEqual(run("Test-GuiSmokeEnvironmentEntries -Entries @('MLVAPP_PLAYBACK_SCALE_FACTOR=4')")["verdict"], "OK")
+        inherited = run("Test-GuiSmokeParentEnvironment", {"MLVAPP_F3_DISABLE_CUT_RANGE_REPAIR": "1"})
+        self.assertEqual(inherited["verdict"], "PASS_THROUGH_REFUSED")
+        self.assertIn("inherited_variable_changes_the_effective_play_range", inherited["message"])
+        self.assertEqual(run("Test-GuiSmokeParentEnvironment")["verdict"], "OK")
+
 
 @requires_pwsh
 @requires_windows
@@ -394,6 +420,24 @@ class RunnerChokePointTests(_TmpCase):
         self.assertEqual(refused.returncode, EXIT_TOO_SHORT, refused.stdout + refused.stderr)
         accepted = self.run_runner_ps(thirty, f"-ExerciseClipLifecycleStress -StressSwitchInput {_q(thirty)}")
         self.assertEqual(accepted.returncode, 0, accepted.stdout + accepted.stderr)
+
+    def test_enforce_2_r2_sol_b2_the_lifecycle_stress_switch_may_not_stop_play_before_the_floor(self) -> None:
+        thirty = self.clip("thirty", FRAMES_30S_AT_23976)
+        for at_ms in (0, 1000, 19999):
+            with self.subTest(at_ms):
+                refused = self.run_runner_ps(
+                    thirty, f"-ExerciseClipLifecycleStress -StressSwitchInput {_q(thirty)} -StressSwitchAtMs {at_ms}")
+                self.assertEqual(refused.returncode, EXIT_TOO_SHORT, refused.stdout + refused.stderr)
+                self.assertIn("PLAY_WINDOW_TOO_SHORT (stress-switch-at-ms=", refused.stderr)
+        for at_ms in (20000, 24000):
+            with self.subTest(at_ms):
+                accepted = self.run_runner_ps(
+                    thirty, f"-Seconds 25 -ExerciseClipLifecycleStress -StressSwitchInput {_q(thirty)} -StressSwitchAtMs {at_ms}")
+                self.assertEqual(accepted.returncode, 0, accepted.stdout + accepted.stderr)
+        # the DEFAULT is the floor, so a bare -ExerciseClipLifecycleStress is admitted and passes 20000 on
+        proc = self.run_runner(thirty, "-ExerciseClipLifecycleStress", "-StressSwitchInput", str(thirty))
+        arguments = self.dry_run_arguments(proc)
+        self.assertEqual(arguments[arguments.index("--stress-switch-at-ms") + 1], "20000")
 
     # ---- round 2 (sol B2): a launch-only probe must not play ---------------------------------------
 
@@ -891,7 +935,7 @@ def _tool_files() -> list[Path]:
                 continue
             # ONLY python unit-test modules (and this test's support code) are exempt: they NAME these
             # tokens as strings. A test-*.ps1 or test_* script that LAUNCHES the app is scanned like any other.
-            if path.suffix.lower() == ".py" and (path.name.lower().startswith("test_") or path.name == "synthetic_mlv.py"):
+            if path.suffix.lower() == ".py" and (path.name.lower().startswith("test_") or path.name in ("synthetic_mlv.py", "app_play_scan.py")):
                 continue
             files.append(path)
     return files
@@ -1137,10 +1181,10 @@ class PlaybackLauncherScanTests(unittest.TestCase):
 #
 # The app's every programmatic Play goes through MainWindow::programmaticPlay (window gate + one-Play
 # ledger); user-input handlers are never gated. This scan fails on:
-#   * any actionPlay->trigger()/toggle()/setChecked(true)/setPlaying/on_actionPlay_triggered(true) outside
-#     a line carrying an explicit `allowlisted:` comment (the gate's own Play, and a stop of a checked Play);
-#   * any Loop-enable (actionLoop->trigger()/toggle()/setChecked(true)) outside the one allowlisted line in
-#     forceLoopOffForAutomation (which only ever UNCHECKS), anywhere in platform/qt or src;
+#   * ANY use of the Play action other than isChecked()/setChecked(false), outside the three PINNED helper bodies
+#     (programmaticPlay's structure, programmaticStop and forceLoopOffForAutomation's exact text) -- a trigger, an
+#     alias, a split line, a variable setChecked, invokeMethod, a synthesized key. No comment can exempt a line;
+#   * any Loop use other than isChecked() outside the one pinned unchecker, anywhere in platform/qt or src;
 #   * any programmaticPlay( call whose site is not in the reviewed set, so a NEW programmatic Play cannot
 #     appear without updating this list (and therefore being reviewed);
 #   * a programmaticPlay body that triggers Play before it has evaluated the window and admitted it to the
@@ -1149,116 +1193,53 @@ class PlaybackLauncherScanTests(unittest.TestCase):
 # The scan is a pure function over {path: text} so the test can MUTATE the real sources in memory and
 # require the scan to go red (a scan that passes on a deliberately broken tree is worthless).
 
-PLAY_SOURCES = ("platform/qt/MainWindow.cpp", "platform/qt/main.cpp")
-REVIEWED_PROGRAMMATIC_PLAY_SITES = {
-    "autoplay",                          # MLVAPP_AUTOPLAY_* hook (constructor)
-    "profile-look-assist-settle",        # --profile-playback --exercise-look-assist-settle / -toggle
-    "profile-exercise-play-action",      # --profile-playback --exercise-play-action
-    "gui-smoke-measured",                # --gui-smoke-playback measured Play
-}
-# Entry functions that must force Loop OFF (the autoplay hook is a lambda in the MainWindow constructor).
-LOOP_OFF_ENTRY_MARKERS = (
-    'forceLoopOffForAutomation( "autoplay" )',
-    'forceLoopOffForAutomation( "profile-entry" )',
-    'forceLoopOffForAutomation( "profile-look-assist-settle" )',
-    'forceLoopOffForAutomation( "profile-exercise-play-action" )',
-    'forceLoopOffForAutomation( "gui-smoke-entry" )',
-    'forceLoopOffForAutomation( "gui-smoke-measured" )',
+# The scanner itself lives in tools/repo_hygiene/app_play_scan.py (ENFORCE-2 round 2: exact pins, a real tokenizer,
+# whole-text matching; no `allowlisted:` comment can exempt a line any more).
+from tools.repo_hygiene.app_play_scan import (  # noqa: E402
+    LOOP_OFF_ENTRY_MARKERS,
+    PINNED_HELPER_BODIES,
+    PLAY_SOURCES,
+    REVIEWED_PROGRAMMATIC_PLAY_SITES,
+    REVIEWED_PROGRAMMATIC_STOP_SITES,
+    function_body as _function_body,
+    scan_app_play_sources,
+    strip_cpp,
 )
 
-_PLAY_START = re.compile(
-    r"actionPlay\s*->\s*(?:trigger|toggle|activate)\s*\(|actionPlay\s*->\s*setChecked\s*\(\s*true"
-    r"|on_actionPlay_triggered\s*\(\s*true|setPlaying\s*\(")
-_LOOP_ENABLE = re.compile(
-    r"actionLoop\s*->\s*(?:trigger|toggle|activate)\s*\(|actionLoop\s*->\s*setChecked\s*\(\s*true")
-_GATED_CALL = re.compile(r'programmaticPlay\s*\(\s*"([^"]+)"')
-
-
-def _cpp_code_lines(text: str) -> list[tuple[int, str, str]]:
-    """(line number, code with // comments stripped, the original line) for every line."""
-    out = []
-    for number, line in enumerate(text.splitlines(), start=1):
-        code = line.split("//", 1)[0]
-        out.append((number, code, line))
-    return out
-
-
-def _function_body(text: str, signature: str) -> str:
-    at = text.find(signature)
-    if at < 0:
-        return ""
-    brace = text.index("{", at)
-    depth = 0
-    for index in range(brace, len(text)):
-        if text[index] == "{":
-            depth += 1
-        elif text[index] == "}":
-            depth -= 1
-            if depth == 0:
-                return text[brace:index + 1]
-    return ""
-
-
-def scan_app_play_sources(sources: dict[str, str]) -> list[str]:
-    """Returns one string per violation; empty means the app-side play gate class is closed."""
-    problems: list[str] = []
-    sites_seen: set[str] = set()
-    for path, text in sources.items():
-        for number, code, line in _cpp_code_lines(text):
-            if _PLAY_START.search(code) and "allowlisted:" not in line:
-                problems.append(f"{path}:{number}: un-allowlisted programmatic Play start: {line.strip()}")
-            if _LOOP_ENABLE.search(code) and "allowlisted:" not in line:
-                problems.append(f"{path}:{number}: un-allowlisted Loop toggle: {line.strip()}")
-            for site in _GATED_CALL.findall(code):
-                sites_seen.add(site)
-    main_window = sources.get("platform/qt/MainWindow.cpp", "")
-    if sites_seen != REVIEWED_PROGRAMMATIC_PLAY_SITES:
-        problems.append(
-            f"programmaticPlay sites {sorted(sites_seen)} != reviewed {sorted(REVIEWED_PROGRAMMATIC_PLAY_SITES)}")
-    body = _function_body(main_window, "bool MainWindow::programmaticPlay(")
-    if not body:
-        problems.append("MainWindow::programmaticPlay not found")
-    else:
-        trigger_at = body.find("actionPlay->trigger()")
-        for needed in ("checkPlayableWindow(", "m_programmaticPlayLedger.admit("):
-            at = body.find(needed)
-            if at < 0 or trigger_at < 0 or at > trigger_at:
-                problems.append(f"programmaticPlay must call {needed} before it triggers Play")
-        if "return false" not in body[:trigger_at if trigger_at > 0 else len(body)]:
-            problems.append("programmaticPlay has no refusal path before the Play trigger")
-    for marker in LOOP_OFF_ENTRY_MARKERS:
-        if marker not in main_window:
-            problems.append(f"missing Loop-off at an automation entry: {marker}")
-    # The gate's own helper must be the only Loop toggle, and must only ever uncheck.
-    loop_body = _function_body(main_window, "void MainWindow::forceLoopOffForAutomation(")
-    if "if( !ui->actionLoop->isChecked() ) return;" not in loop_body:
-        problems.append("forceLoopOffForAutomation must return early unless Loop is checked (it only unchecks)")
-    # Interactive handlers are never gated.
-    for signature in ("void MainWindow::on_actionPlay_triggered(bool checked)",
-                      "void MainWindow::on_actionPlay_toggled(bool checked)"):
-        if "programmaticPlay(" in _function_body(main_window, signature):
-            problems.append(f"{signature} is a user-input handler and must not be gated")
-    return problems
+_BUILD_DIR_NAMES = {"moc", "obj", "rcc", "ui", "release", "debug"}
+_PLAY_RELEVANT = re.compile(
+    r"actionPlay|actionLoop|setPlaying|invokeMethod|QKeyEvent|Key_Space|postEvent|sendEvent|"
+    r"sendSpontaneousEvent|programmaticPlay|programmaticStop|QTest\s*::\s*key|keyClick")
 
 
 def _load_play_sources() -> dict[str, str]:
     sources = {path: (ROOT / path).read_text(encoding="utf-8") for path in PLAY_SOURCES}
-    # Every other C++ translation unit under platform/qt and src that names the Play action at all.
+    # Every other C++ translation unit under platform/qt and src that can reach the Play / Loop action at all.
+    # Generated and build output (a shadow or in-tree build dir, uic's ui_*.h) is not source.
     for base in ("platform/qt", "src"):
         for candidate in sorted((ROOT / base).rglob("*")):
             if candidate.suffix not in (".cpp", ".h", ".hpp", ".c") or not candidate.is_file():
                 continue
-            relative = candidate.relative_to(ROOT).as_posix()
-            if relative in sources:
+            relative = candidate.relative_to(ROOT)
+            parts = {part.lower() for part in relative.parts[:-1]}
+            if any(part.startswith("build") or part in _BUILD_DIR_NAMES for part in parts):
                 continue
-            text = candidate.read_text(encoding="utf-8", errors="replace")
-            if "actionPlay" in text or "actionLoop" in text or "setPlaying" in text:
-                sources[relative] = text
+            if relative.name.startswith("ui_") or relative.name.startswith("moc_") or relative.name.startswith("qrc_"):
+                continue
+            key = relative.as_posix()
+            if key in sources:
+                continue
+            body = candidate.read_text(encoding="utf-8", errors="replace")
+            if _PLAY_RELEVANT.search(body):
+                sources[key] = body
     return sources
 
 
 class AppPlayGateStaticClassTests(unittest.TestCase):
     """5. The static class test: no programmatic Play and no Loop-enable outside the reviewed gate."""
+
+    MAIN_WINDOW = "platform/qt/MainWindow.cpp"
+    MAIN = "platform/qt/main.cpp"
 
     @classmethod
     def setUpClass(cls) -> None:
@@ -1267,9 +1248,10 @@ class AppPlayGateStaticClassTests(unittest.TestCase):
     def test_the_real_sources_are_clean(self) -> None:
         self.assertEqual(scan_app_play_sources(self.sources), [])
 
-    def test_every_programmatic_play_site_is_reviewed_and_ordered_before_the_gate_is_trusted(self) -> None:
-        text = self.sources["platform/qt/MainWindow.cpp"]
-        self.assertEqual(set(_GATED_CALL.findall(text)), REVIEWED_PROGRAMMATIC_PLAY_SITES)
+    def test_no_generated_or_build_output_is_scanned(self) -> None:
+        for path in self.sources:
+            self.assertNotIn("/build", path.lower())
+            self.assertFalse(Path(path).name.startswith("ui_"), path)
 
     def test_the_actions_are_not_persisted_or_declared_checked(self) -> None:
         # Loop starts unchecked and nothing persists it: a test entry never inherits a looping GUI.
@@ -1277,70 +1259,159 @@ class AppPlayGateStaticClassTests(unittest.TestCase):
         loop = ui[ui.index('<action name="actionLoop">'):]
         loop = loop[:loop.index("</action>")]
         self.assertNotRegex(loop, r'<property name="checked">\s*<bool>true</bool>')
-        text = self.sources["platform/qt/MainWindow.cpp"]
-        for line in text.splitlines():
-            code = line.split("//", 1)[0]
-            if "actionLoop" in code and re.search(r"setValue|QSettings|settings\.", code):
+        _, code = strip_cpp(self.sources[self.MAIN_WINDOW])
+        for line in code.splitlines():
+            if "actionLoop" in line and re.search(r"setValue|QSettings|settings\.", line):
                 self.fail(f"Loop appears to be persisted: {line.strip()}")
 
     def test_the_pure_window_logic_lives_in_the_unit_tested_header(self) -> None:
         header = (ROOT / "platform" / "qt" / "PlaybackFrameRange.h").read_text(encoding="utf-8")
         self.assertIn("constexpr double kMinPlayWindowSeconds = 20.0;", header)
-        for name in ("evaluatePlayableWindow", "ProgrammaticPlayLedger", "noteJumpToFirst", "noteRestart"):
+        self.assertIn("constexpr int kMinPlayWindowMs = 20000;", header)
+        for name in ("evaluatePlayableWindow", "ProgrammaticPlayLedger", "noteJumpToFirst", "noteRestart",
+                     "engineCutRangeForPlay", "smokePlayRequestSeconds", "stressSwitchReachesFloor",
+                     "playHoldReachedFloor", "PLAY_DURATION_TOO_SHORT"):
             self.assertIn(name, header)
         tests = (ROOT / "tests" / "console" / "test_playback_frame_range.cpp").read_text(encoding="utf-8")
         for name in ("PlayableWindow", "ProgrammaticPlayLedger"):
             self.assertIn(f"TEST( {name}, ", tests)
+        for name in ("SolB1ARequestedWindowUnderTheFloor", "SolB3WithTheCollapsedRangeRepairDisabled",
+                     "TheLifecycleStressSwitchMayOnlyHappenAfterTheTwentySecondFloor",
+                     "AnExerciseModeMayStopPlayOnlyOnceTheFloorHasElapsed"):
+            self.assertIn(name, tests)
 
     # -- mutation tests: the scan must go red on a deliberately broken tree ------------------------------
 
-    def _mutated(self, old: str, new: str, path: str = "platform/qt/MainWindow.cpp") -> dict[str, str]:
+    def _mutated(self, old: str, new: str, path: str = MAIN_WINDOW, count: int = 1) -> dict[str, str]:
         text = self.sources[path]
         self.assertIn(old, text, "mutation anchor missing: the scan test needs updating with the source")
         mutated = dict(self.sources)
-        mutated[path] = text.replace(old, new, 1)
+        mutated[path] = text.replace(old, new, count)
         return mutated
 
-    def test_mutation_a_bare_play_trigger_in_an_automation_path_is_caught(self) -> None:
-        mutated = self._mutated('forceLoopOffForAutomation( "gui-smoke-measured" );',
-                                'forceLoopOffForAutomation( "gui-smoke-measured" );\n    ui->actionPlay->trigger();')
+    def _mutated_re(self, pattern: str, replacement: str, path: str = MAIN_WINDOW) -> dict[str, str]:
+        text = self.sources[path]
+        mutated_text, count = re.subn(pattern, replacement, text, count=1)
+        self.assertEqual(count, 1, "mutation pattern missing: the scan test needs updating with the source")
+        mutated = dict(self.sources)
+        mutated[path] = mutated_text
+        return mutated
+
+    def _inject_after_measured_loop_off(self, injected: str) -> dict[str, str]:
+        anchor = 'forceLoopOffForAutomation( "gui-smoke-measured" );'
+        return self._mutated(anchor, anchor + "\n    " + injected)
+
+    def _assert_caught(self, mutated: dict[str, str], needle: str = "") -> None:
         problems = scan_app_play_sources(mutated)
-        self.assertTrue(any("un-allowlisted programmatic Play start" in p for p in problems), problems)
+        self.assertTrue(problems, "the scan did not go red on a deliberately broken tree")
+        if needle:
+            self.assertTrue(any(needle in p for p in problems), problems)
+
+    def test_mutation_a_bare_play_trigger_in_an_automation_path_is_caught(self) -> None:
+        self._assert_caught(self._inject_after_measured_loop_off("ui->actionPlay->trigger();"), "Play action")
 
     def test_mutation_a_loop_enable_is_caught(self) -> None:
-        mutated = self._mutated('forceLoopOffForAutomation( "gui-smoke-measured" );',
-                                'forceLoopOffForAutomation( "gui-smoke-measured" );\n    ui->actionLoop->setChecked( true );')
-        problems = scan_app_play_sources(mutated)
-        self.assertTrue(any("un-allowlisted Loop toggle" in p for p in problems), problems)
+        self._assert_caught(self._inject_after_measured_loop_off("ui->actionLoop->setChecked( true );"), "Loop action")
 
     def test_mutation_a_new_programmatic_play_site_must_be_reviewed(self) -> None:
-        mutated = self._mutated('programmaticPlay( "autoplay", autoplaySeconds )',
-                                'programmaticPlay( "autoplay-two", autoplaySeconds )')
-        problems = scan_app_play_sources(mutated)
-        self.assertTrue(any("programmaticPlay sites" in p for p in problems), problems)
+        self._assert_caught(self._mutated('programmaticPlay( "autoplay", autoplaySeconds )',
+                                          'programmaticPlay( "autoplay-two", autoplaySeconds )'), "programmaticPlay sites")
+
+    def test_mutation_a_second_call_at_a_reviewed_site_is_caught(self) -> None:
+        self._assert_caught(self._inject_after_measured_loop_off(
+            'programmaticPlay( "gui-smoke-measured", playback_frame_range::smokePlayRequestSeconds( 1, 0, 24.0 ) );'),
+            "programmaticPlay sites")
+
+    def test_mutation_a_short_requested_window_at_a_site_is_caught(self) -> None:
+        # hub ruling: every caller requests a window that itself reaches the floor.
+        for site in ("profile-exercise-play-action", "profile-look-assist-settle"):
+            with self.subTest(site):
+                self._assert_caught(self._mutated_re(
+                    r'(programmaticPlay\(\s*"' + site + r'"\s*,\s*)playback_frame_range::kMinPlayWindowSeconds',
+                    r'\g<1>0.0'), "requested window")
+        self._assert_caught(self._mutated_re(
+            r'(programmaticPlay\(\s*"gui-smoke-measured"\s*,\s*)playback_frame_range::smokePlayRequestSeconds\(',
+            r'\g<1>qMax( 100, options.durationMs ) / 1000.0 + ( 0 * playback_frame_range::smokePlayRequestSeconds('),
+            "requested window")
+
+    def test_mutation_a_new_programmatic_stop_site_must_be_reviewed(self) -> None:
+        self._assert_caught(self._inject_after_measured_loop_off('programmaticStop( "a-new-early-stop" );'),
+                            "programmaticStop sites")
 
     def test_mutation_removing_the_ledger_or_the_window_check_from_the_gate_is_caught(self) -> None:
-        for anchor in ("m_programmaticPlayLedger.admit(", "checkPlayableWindow( site, requestedSeconds );"):
+        for anchor in ("m_programmaticPlayLedger.admit( verdict )", "checkPlayableWindow( site, requestedSeconds )"):
             with self.subTest(anchor):
-                text = self.sources["platform/qt/MainWindow.cpp"]
-                body = _function_body(text, "bool MainWindow::programmaticPlay(")
+                body = _function_body(self.sources[self.MAIN_WINDOW], "bool MainWindow::programmaticPlay(")
                 self.assertIn(anchor, body)
-                mutated_body = body.replace(anchor, "true; /* mutated */", 1)
-                mutated = dict(self.sources)
-                mutated["platform/qt/MainWindow.cpp"] = text.replace(body, mutated_body, 1)
-                problems = scan_app_play_sources(mutated)
-                self.assertTrue(any("programmaticPlay must call" in p for p in problems), problems)
+                mutated = self._mutated(anchor, "true /* mutated */", count=1)
+                self._assert_caught(mutated, "programmaticPlay must")
+
+    def test_mutation_disabling_the_ledger_guard_with_false_and_is_caught(self) -> None:
+        # sol hardening: `false &&` used to leave the substring the old scan looked for.
+        self._assert_caught(self._mutated("if( !m_programmaticPlayLedger.admit( verdict ) )",
+                                          "if( false && !m_programmaticPlayLedger.admit( verdict ) )"),
+                            "programmaticPlay must contain")
+
+    def test_mutation_restoring_the_already_playing_early_return_is_caught(self) -> None:
+        # fable PLAY-GATE-ALREADY-PLAYING-1: an already-running Play must not skip the caller's window check.
+        self._assert_caught(self._mutated("const bool alreadyPlaying = ui->actionPlay->isChecked();",
+                                          "if( ui->actionPlay->isChecked() ) return true;\n"
+                                          "    const bool alreadyPlaying = false;"),
+                            "already-running Play")
 
     def test_mutation_gating_the_interactive_handler_is_caught(self) -> None:
-        mutated = self._mutated("//Play button pressed\nvoid MainWindow::on_actionPlay_triggered(bool checked)\n{",
-                                "//Play button pressed\nvoid MainWindow::on_actionPlay_triggered(bool checked)\n{\n    programmaticPlay( \"x\", 0.0 );")
-        problems = scan_app_play_sources(mutated)
-        self.assertTrue(any("user-input handler" in p for p in problems), problems)
+        self._assert_caught(self._mutated_re(
+            r'(void MainWindow::on_actionPlay_triggered\(bool checked\)\s*\{)',
+            r'\1 programmaticPlay( "x", 0.0 );'), "user-input handler")
 
     def test_mutation_dropping_a_loop_off_at_an_entry_is_caught(self) -> None:
-        mutated = self._mutated('forceLoopOffForAutomation( "gui-smoke-entry" );', "")
-        problems = scan_app_play_sources(mutated)
-        self.assertTrue(any("missing Loop-off" in p for p in problems), problems)
+        self._assert_caught(self._mutated('forceLoopOffForAutomation( "gui-smoke-entry" );', ""), "missing Loop-off")
+
+    def test_mutation_the_pinned_helper_bodies_cannot_grow_a_second_trigger(self) -> None:
+        self._assert_caught(self._mutated(
+            "if( ui->actionPlay->isChecked() ) ui->actionPlay->trigger();",
+            "if( ui->actionPlay->isChecked() ) ui->actionPlay->trigger();\n    ui->actionPlay->trigger();"),
+            "pinned helper body changed")
+        self._assert_caught(self._mutated("ui->actionLoop->trigger();", "ui->actionLoop->trigger();\n    ui->actionLoop->trigger();"),
+                            "pinned helper body changed")
+
+    # -- sol hardening: the evasions a free-text `allowlisted:` comment and a per-line regex let through ---
+
+    def test_an_allowlisted_comment_no_longer_exempts_anything(self) -> None:
+        for injected in ("ui->actionPlay->trigger();   // allowlisted: new warm-up",
+                         "ui->actionLoop->trigger();   // allowlisted: nothing to see",
+                         "ui->actionPlay->trigger(); /* allowlisted: x */"):
+            with self.subTest(injected):
+                self._assert_caught(self._inject_after_measured_loop_off(injected), "action")
+
+    def test_every_evasion_sol_and_fable_listed_is_caught(self) -> None:
+        evasions = {
+            "trigger split across lines": "ui->actionPlay\n        ->trigger();",
+            "setChecked of a variable": "const bool warm = true;\n    ui->actionPlay->setChecked( warm );",
+            "setChecked( 1 )": "ui->actionPlay->setChecked( 1 );",
+            "an alias of the action": "QAction *playAlias = ui->actionPlay;\n    playAlias->trigger();",
+            "invokeMethod on the handler": 'QMetaObject::invokeMethod( this, "on_actionPlay_triggered", Q_ARG( bool, true ) );',
+            "invokeMethod on the action": 'QMetaObject::invokeMethod( ui->actionPlay, "trigger" );',
+            "a // inside a string earlier on the line": 'const QString s = "//"; ui->actionPlay->trigger();',
+            "a block comment before the call": "/* quiet */ ui->actionPlay->trigger();",
+            "a synthesized Space key": "QKeyEvent press( QEvent::KeyPress, Qt::Key_Space, Qt::NoModifier );",
+            "a posted key event": "QCoreApplication::postEvent( this, nullptr );",
+            "the Play handler called directly": "on_actionPlay_triggered( true );",
+            "the toggled handler called directly": "on_actionPlay_toggled( true );",
+            "setPlaying": "setPlaying( true );",
+            "a Loop alias": "QAction *loopAlias = ui->actionLoop;",
+            "Loop setChecked of a variable": "ui->actionLoop->setChecked( m_wantLoop );",
+        }
+        for name, injected in evasions.items():
+            with self.subTest(name):
+                self._assert_caught(self._inject_after_measured_loop_off(injected))
+
+    def test_the_tokenizer_is_not_fooled_by_comments_or_strings(self) -> None:
+        blank, keep = strip_cpp('a = "//"; b(); // c\n/* d */ e = \'x\'; f = R"x(//)x";\n')
+        self.assertIn("b();", blank)
+        self.assertNotIn("c", blank.replace("b", "").replace("e", "").replace("f", "").replace("a", ""))
+        self.assertIn('"//"', keep)
+        self.assertEqual(blank.count("\n"), 2)
 
     def test_the_scan_finds_the_original_pre_enforce_2_tree_red(self) -> None:
         # The ENFORCE-1 head (767219f0) plays through bare actionPlay->trigger() and enables Loop in its
@@ -1352,8 +1423,69 @@ class AppPlayGateStaticClassTests(unittest.TestCase):
                 "                ui->actionPlay->trigger();\n            }\n",
         }
         problems = scan_app_play_sources(excerpt)
-        self.assertTrue(any("Loop toggle" in p for p in problems), problems)
-        self.assertTrue(any("Play start" in p for p in problems), problems)
+        self.assertTrue(any("Loop action" in p for p in problems), problems)
+        self.assertTrue(any("Play action" in p for p in problems), problems)
+
+    # -- ENFORCE-2 round 2: pins for each blocker's resolution -------------------------------------------
+
+    def test_b1_every_caller_requests_a_window_that_reaches_the_floor(self) -> None:
+        _, code = strip_cpp(self.sources[self.MAIN_WINDOW])
+        # the gate evaluates the request with the unit-tested rule; the shared helper rejects < 20 s
+        self.assertIn("checkPlayableWindow( site, requestedSeconds )", code)
+        main = strip_cpp(self.sources[self.MAIN])[1]
+        self.assertIn("PLAY_DURATION_TOO_SHORT (--seconds=", main)
+        self.assertRegex(main, r"seconds \+ 1e-9 < playback_frame_range::kMinPlayWindowSeconds")
+
+    def test_b2_every_automation_mode_that_stops_play_early_holds_the_floor_first(self) -> None:
+        _, code = strip_cpp(self.sources[self.MAIN_WINDOW])
+        settle = _function_body(self.sources[self.MAIN_WINDOW], "auto settleLookAssistForProfile = [&]")
+        self.assertTrue(settle, "settle lambda not found")
+        self.assertIn("playHoldReachedFloor( autoSettleClock.elapsed() )", settle)
+        self.assertNotIn("elapsed() < 12000", settle)
+        play_action = code[code.index("playActionClock.start();"):code.index("playActionSmokeElapsedMs = playActionClock.elapsed();")]
+        self.assertIn("playHoldReachedFloor( playActionClock.elapsed() )", play_action)
+        self.assertNotIn("playActionTimeout", code)
+        self.assertNotRegex(play_action, r"playActionLoop\.(exec|quit)")
+        # the lifecycle stress switch: only at/after the floor, refused below it, default 20 s
+        self.assertIn("playback_frame_range::playHoldReachedFloor( playbackClock.elapsed() )", code)
+        self.assertIn("!playback_frame_range::stressSwitchReachesFloor( options.stressSwitchAtMs )", code)
+        header = (ROOT / "platform" / "qt" / "MainWindow.h").read_text(encoding="utf-8")
+        self.assertRegex(header, r"int stressSwitchAtMs = 20000;")
+        main = strip_cpp(self.sources[self.MAIN])[1]
+        self.assertIn("stressSwitchReachesFloor(stressSwitchAtMs)", main)
+        self.assertRegex(main, r'QStringLiteral\("20000"\)')
+        self.assertNotRegex(main, r'QStringLiteral\("1000"\)\);\s*parser\.addOption\(stressSwitchAtMsOpt\)')
+        # a measured Play that ended under the floor is a typed failure, never a pass
+        self.assertIn('programmaticStop( "gui-smoke-measured-early-end" )', code)
+
+    def test_b2_the_play_window_is_timed_from_the_moment_play_has_started(self) -> None:
+        _, code = strip_cpp(self.sources[self.MAIN_WINDOW])
+        after_play = code[code.index('"gui-smoke-measured",'):]
+        self.assertIn("playbackClock.restart();", after_play[:2500])
+
+    def test_b3_the_gate_measures_the_range_the_engine_plays(self) -> None:
+        _, code = strip_cpp(self.sources[self.MAIN_WINDOW])
+        body = _function_body(self.sources[self.MAIN_WINDOW], "playback_frame_range::PlayableWindowVerdict MainWindow::checkPlayableWindow(")
+        self.assertIn("!f3CutRangeRepairDisabledByEnvironment()", body)
+        mutated = self._mutated("!f3CutRangeRepairDisabledByEnvironment() );", "true );")
+        mutated_body = _function_body(mutated[self.MAIN_WINDOW], "playback_frame_range::PlayableWindowVerdict MainWindow::checkPlayableWindow(")
+        self.assertNotIn("f3CutRangeRepairDisabledByEnvironment", mutated_body)
+        # the knob is the ONLY environment variable that touches the cut range anywhere in platform/qt
+        range_knobs = set()
+        for path, text in self.sources.items():
+            for name in re.findall(r"MLVAPP_[A-Z0-9_]*(?:CUT_RANGE|CUTRANGE|CUT_IN|CUT_OUT)[A-Z0-9_]*", strip_cpp(text)[1]):
+                range_knobs.add(name)
+        self.assertEqual(range_knobs, {"MLVAPP_F3_DISABLE_CUT_RANGE_REPAIR"})
+
+    def test_fable_the_autoplay_hook_cannot_arm_in_a_smoke_or_profile_run(self) -> None:
+        main = strip_cpp(self.sources[self.MAIN])[1]
+        # the windows are built with argv = { appName } only, so the startup-file hook cannot arm ...
+        self.assertEqual(len(re.findall(r"char \*smokeArgv\[\] = \{ appName\.data\(\), nullptr \};", main)), 1)
+        self.assertEqual(len(re.findall(r"char \*profileArgv\[\] = \{ appName\.data\(\), nullptr \};", main)), 1)
+        # ... and a launch that carries the variable is refused, typed, before any window exists
+        self.assertIn("AUTOPLAY_REFUSED_IN_AUTOMATION", main)
+        self.assertRegex(main, r'\(profile_playback \|\| gui_playback_smoke\)\s*&&\s*qEnvironmentVariableIntValue\("MLVAPP_AUTOPLAY_SECONDS"\) != 0')
+        self.assertLess(main.index("AUTOPLAY_REFUSED_IN_AUTOMATION"), main.index("MyApplication a(argc, argv);"))
 
 
 if __name__ == "__main__":

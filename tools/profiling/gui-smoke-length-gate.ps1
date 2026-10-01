@@ -26,6 +26,12 @@
 # repository's own NA-4 PreToolUse gate even in source text that names no real clip.
 
 $script:GuiSmokeMinClipSeconds = 20.0
+$script:GuiSmokeMinPlayWindowMs = 20000   # the same floor in ms: the lifecycle-stress switch stops Play, so it may not come sooner
+# Environment variables that change the range the ENGINE plays, so the app's gate and the engine could disagree
+# (PLAYBACK-CLIP-LENGTH-ENFORCE-2 round 2, sol B3). Enumerated from platform/qt: MLVAPP_F3_DISABLE_CUT_RANGE_REPAIR is
+# the only knob that touches the cut range (MainWindow.cpp f3CutRangeRepairDisabledByEnvironment); the others that
+# mention playback (scale, quality, threads, lookahead, timer poll, preroll) change speed or quality, never the range.
+$script:GuiSmokeRangeChangingEnvironment = @('MLVAPP_F3_DISABLE_CUT_RANGE_REPAIR')
 $script:GuiSmokeMlviHeaderBytes = 52
 $script:GuiSmokeFirstPartExtension = '.' + 'MLV'
 
@@ -294,6 +300,13 @@ function Test-GuiSmokeEnvironmentEntries {
                 $result.message = "PASS_THROUGH_REFUSED (env=$key reason=autoplay_hook_has_no_length_gate)"
                 return $result
             }
+            $pairKey = ($pair.Trim() -split '=', 2)[0].Trim().ToUpperInvariant()
+            if ($script:GuiSmokeRangeChangingEnvironment -contains $pairKey) {
+                $result.verdict = 'PASS_THROUGH_REFUSED'
+                $result.option = $pairKey
+                $result.message = "PASS_THROUGH_REFUSED (env=$pairKey reason=changes_the_effective_play_range)"
+                return $result
+            }
         }
     }
     return $result
@@ -331,6 +344,13 @@ function Test-GuiSmokeParentEnvironment {
             $result.verdict = 'PASS_THROUGH_REFUSED'
             $result.option = $key
             $result.message = "PASS_THROUGH_REFUSED (env=$key reason=inherited_autoplay_hook_has_no_length_gate)"
+            return $result
+        }
+        if ($script:GuiSmokeRangeChangingEnvironment -contains ([string]$name).ToUpperInvariant()) {
+            $key = ([string]$name).ToUpperInvariant()
+            $result.verdict = 'PASS_THROUGH_REFUSED'
+            $result.option = $key
+            $result.message = "PASS_THROUGH_REFUSED (env=$key reason=inherited_variable_changes_the_effective_play_range)"
             return $result
         }
     }

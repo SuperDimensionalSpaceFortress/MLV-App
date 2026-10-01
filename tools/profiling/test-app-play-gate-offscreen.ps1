@@ -98,6 +98,30 @@ $results += Invoke-GateEntry -Name 'autoplay-env-hook' -MayNotExit -ExpectToken 
     -Arguments @($fixture) `
     -Environment @{ MLVAPP_AUTOPLAY_SECONDS = '2'; MLVAPP_AUTOPLAY_LOOP = '1'; MLVAPP_AUTOPLAY_SETTLE_MS = '500'; MLVAPP_AUTOPLAY_EXIT = '1' }
 
+# ---- ENFORCE-2 round 2 (hub ruling): the REQUESTED / played duration must itself be >= 20 s -------------------
+# These are refused by the app on its own typed tokens, before any window exists, even though a clip's length
+# never enters into it (the tracked fixtures are used only because every launch needs an existing --input).
+$results += Invoke-GateEntry -Name 'gui-smoke-seconds-1' -ExpectExit 14 -ExpectToken 'PLAY_DURATION_TOO_SHORT' `
+    -Arguments @('--gui-smoke-playback', '--input', $fixture, '--seconds', '1')
+$results += Invoke-GateEntry -Name 'gui-smoke-seconds-19.9' -ExpectExit 14 -ExpectToken 'PLAY_DURATION_TOO_SHORT' `
+    -Arguments @('--gui-smoke-playback', '--input', $fixture, '--seconds', '19.9')
+$results += Invoke-GateEntry -Name 'gui-smoke-stress-switch-at-1000' -ExpectExit 14 -ExpectToken 'PLAY_DURATION_TOO_SHORT' `
+    -Arguments @('--gui-smoke-playback', '--input', $fixture, '--seconds', '25', '--exercise-clip-lifecycle-stress', '--stress-switch-at-ms', '1000')
+$results += Invoke-GateEntry -Name 'gui-smoke-autoplay-env-refused' -ExpectExit 14 -ExpectToken 'AUTOPLAY_REFUSED_IN_AUTOMATION' `
+    -Arguments @('--gui-smoke-playback', '--input', $fixture, '--seconds', '25') `
+    -Environment @{ MLVAPP_AUTOPLAY_SECONDS = '2' }
+$profileAutoplayOutput = Join-Path $work 'profile-autoplay.json'
+$results += Invoke-GateEntry -Name 'profile-autoplay-env-refused' -ExpectExit 14 -ExpectToken 'AUTOPLAY_REFUSED_IN_AUTOMATION' -OutputPath $profileAutoplayOutput `
+    -Arguments @('--profile-playback', '--input', $fixture, '--output', $profileAutoplayOutput, '--frames', '3') `
+    -Environment @{ MLVAPP_AUTOPLAY_SECONDS = '2' }
+# sol B3: the repair knob changes nothing the gate can be fooled by -- the fixture is still refused (clip scope).
+$results += Invoke-GateEntry -Name 'gui-smoke-f3-repair-disabled' -ExpectExit 14 -ExpectToken 'CLIP_TOO_SHORT' `
+    -Arguments @('--gui-smoke-playback', '--input', $fixture, '--seconds', '25') `
+    -Environment @{ MLVAPP_F3_DISABLE_CUT_RANGE_REPAIR = '1' }
+$results += Invoke-GateEntry -Name 'autoplay-env-hook-24s-on-a-short-clip' -MayNotExit -ExpectToken 'play_gate.refused site=autoplay' `
+    -Arguments @($fixture) `
+    -Environment @{ MLVAPP_AUTOPLAY_SECONDS = '24'; MLVAPP_AUTOPLAY_SETTLE_MS = '500'; MLVAPP_AUTOPLAY_EXIT = '1' }
+
 $results | Format-Table -AutoSize | Out-String | Write-Output
 $failed = @($results | Where-Object { -not $_.refusedBeforePlay })
 if ($failed.Count -gt 0) {
