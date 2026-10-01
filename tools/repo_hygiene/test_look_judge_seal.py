@@ -852,6 +852,11 @@ class DistinctJudgesTests(H.TmpCase):
         extra_criterion = json.loads(json.dumps(self.b))
         extra_criterion["scores"]["cpu"]["vibes"] = 3
         self.assertFalse(self._verdict(self.a, extra_criterion)["comparable"])
+        both = json.loads(json.dumps(self.a))  # ... and the SAME unknown criterion in both is still not the grid
+        both["scores"]["cpu"]["vibes"] = 3
+        verdict = self._verdict(both, extra_criterion)
+        self.assertEqual((verdict["comparable"], [p["code"] for p in verdict["coverageProblems"]]),
+                         (False, ["SCORES_NOT_THE_FULL_GRID"]))
 
     def test_a_criterion_that_is_null_for_both_judges_is_not_a_gap(self):
         self.assertIsNone(self.a["scores"]["cpu"]["skin"])  # the fixture's judges both found no skin

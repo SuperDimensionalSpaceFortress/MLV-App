@@ -1294,11 +1294,12 @@ class JudgeRunnerTests(unittest.TestCase):
     def test_select_second_judge_is_gone_nothing_reads_a_typed_in_cross_family_status(self):
         self.assertFalse(hasattr(look_judges, "select_second_judge"))
 
-    def test_family_of_model_ids(self):
-        self.assertEqual(look_judges.family_of("claude-fable-5-1"), "anthropic")
-        self.assertEqual(look_judges.family_of("opus"), "anthropic")
-        self.assertEqual(look_judges.family_of("gpt-5"), "openai")
-        self.assertEqual(look_judges.family_of("mystery"), "unknown")
+    def test_the_resolver_places_model_ids_in_a_family_and_refuses_what_it_cannot_place(self):
+        self.assertEqual(look_judges.canonical_model("claude-fable-5-1"), ("anthropic", "fable"))
+        self.assertEqual(look_judges.canonical_model("opus"), ("anthropic", "opus"))
+        self.assertEqual(look_judges.canonical_model("gpt-5")[0], "openai")
+        self.assertIsNone(look_judges.canonical_model("mystery"))
+        self.assertFalse(hasattr(look_judges, "family_of"))  # one resolver; nothing else interprets a model name
 
 
 class BoundedSubprocessTests(TmpCase):

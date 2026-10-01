@@ -227,7 +227,10 @@ def run_canary(kind, timeout_s=230, model=None, base_dir=None):
     """Run the live canary for `kind` in ("claude", "codex"). See the module docstring. `base_dir` is where the decoys
     and the sealed session are made (default: the system temp dir); it must be outside the judge's scratch directory."""
     token = "CANARY-" + secrets.token_hex(6)
-    base = tempfile.mkdtemp(prefix="lookcanary-", dir=base_dir)
+    # makedirs, not mkdtemp: mkdtemp's owner-only ACL (Python 3.13+ on Windows) would also lock out the CLI's own sandbox
+    # user, and then the unconfined control could not read the decoys even when nothing confines it.
+    base = os.path.join(base_dir or tempfile.gettempdir(), "lookcanary-" + secrets.token_hex(4))
+    os.makedirs(base)
     report = {"runner": kind, "token": token, "outcome": ERROR, "leaked": [], "runnerClass": None, "cliVersion": None,
               "commandSha256": None, "shippedAttempts": [], "controlAttempts": []}
     try:

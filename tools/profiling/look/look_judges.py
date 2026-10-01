@@ -117,11 +117,6 @@ def canonical_text(model):
     return None if key is None else ":".join(part for part in key if part)
 
 
-def family_of(model):
-    key = canonical_model(model)
-    return "unknown" if key is None else key[0]
-
-
 def same_canonical(a, b):
     """True when two canonical_model() results are one model. Neither may be None: an unplaceable name is never 'the
     same' or 'different', the caller must refuse it first."""
