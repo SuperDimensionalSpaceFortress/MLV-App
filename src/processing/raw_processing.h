@@ -36,6 +36,11 @@ void processingGamutRgbToY(int colour_gamut, double out_rgb_to_Y[3]);
  * the engine global directly. */
 void processingAgxMatrices(double out_forward[9], double out_inverse[9]);
 int processingHasShadowsHighlightsAdjustments(const processingObject_t * processing);
+/* Nonzero when the CPU route (direct8 kernel when direct8Route != 0, else the
+ * generic 16-bit loop) clamps + truncates the WB-matrix output to uint16 before
+ * the camera matrix. See the definition for the exact predicates. Inside the
+ * extern "C" block because the GPU-preview TU calls it. */
+int processingCpuRoutePreCameraClamps(const processingObject_t * processing, int direct8Route);
 int processingGetShadowsHighlightsBlurData(const processingObject_t * processing,
                                            const uint16_t ** data,
                                            int * width,

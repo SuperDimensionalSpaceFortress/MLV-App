@@ -170,6 +170,21 @@ void getMlvProcessedFrame8Scaled(mlvObject_t * video,
                                  uint8_t * outputFrame,
                                  int threads,
                                  int scaleFactor);
+/* Nonzero when playback preview of the CURRENT receipt at `scaleFactor` takes the
+ * direct-8-bit CPU route (the one the CUDA display path replaces): the receipt
+ * is direct8-eligible AND the direct8 input is cheap for the effective scale.
+ * It is the very predicate getMlvProcessedFrame8Scaled dispatches on, and it
+ * sets up that dispatch's playback-preview envelope itself (preview mode on,
+ * restored on return), so the answer does not depend on the caller's
+ * thread-local preview state. `phase3RawEntry` != 0 answers for a frame the CPU
+ * would render from Phase 3 raw (the ...FromRaw16 / ...FromReconnedRaw16 entries),
+ * which skip the cheapness gate at scale > 1. Also returns, through
+ * `preCameraClamp` (may be NULL), whether the chosen route clamps the WB-matrix
+ * output before the camera matrix (processingCpuRoutePreCameraClamps). */
+int mlvPreviewPlaybackCpuRoute(mlvObject_t * video,
+                               int scaleFactor,
+                               int phase3RawEntry,
+                               int * preCameraClamp);
 /* Render-thread-only playback helpers: both REQUIRE an active playback-preview
  * envelope (RenderFrameThread's PlaybackPreviewModeGuard) -- they inherit the
  * preview mode + preview scale factor and manage only the aggressive sub-flag,
