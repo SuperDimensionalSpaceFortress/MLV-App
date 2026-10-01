@@ -24,7 +24,8 @@ param(
     [int]$ScaleFactor = 2,            # FIXED scale -- determinism is measured at one scale
     [int]$Reps = 5,
     [int]$StartFrame = 10,
-    [int]$Seconds = 12,       # RULE 2026-06-26 (Layi): generous playback window (~2x the old 6s). This
+    [int]$Seconds = 20,       # ENFORCE-2 (owner rule 2026-09-30): the play window is >= 20 s (was 12; the runner
+                              # refuses a shorter one, PLAY_WINDOW_TOO_SHORT). RULE 2026-06-26 (Layi): generous playback window. This
                               # gate is record-only + multi-rep, so doubled (not tripled) to keep the
                               # N-rep x 2-mode chain manageable while still giving MLV real play time.
     [int]$SettleMs = 4000,
