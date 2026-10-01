@@ -70,7 +70,10 @@ jobs:
   repo-hygiene-python:
     name: Repo Hygiene Python (${{ matrix.os }})
     runs-on: ${{ matrix.os }}
-    timeout-minutes: 45
+    # Windows green runs span 28-46 min (median 41; five runs were cut off at the old
+    # 45-min cap with no test failing); ubuntu finishes in 6-12 min. 75 leaves ~1.8x
+    # the median for runner variance and suite growth while staying a real bound.
+    timeout-minutes: 75
     strategy:
       fail-fast: false
       matrix:
