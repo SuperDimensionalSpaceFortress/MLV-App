@@ -704,6 +704,10 @@ CONSUMER_FAILING_ACTION: dict[str, tuple[tuple[str, int], ...]] = {
         (r"if\s*\(\$importResult\.exitCode\s+-ne\s+0\)\s*\{\s*(?P<act>Add-Failure\s+\$failures)", 2),),
     "tools/profiling/export-release-cuda-dogfood-kit.ps1": (
         (r"\$proofExit\s*=\s*\$LASTEXITCODE[\s\S]*?(?P<act>\bexit\s+\$proofExit\b)", 1),),
+    # DUAL-VENUE-EVIDENCE-1 r2: a printed capture whose job exited non-zero is downgraded to INVALID.
+    "tools/profiling/dual-venue/Invoke-VenueLeg.ps1": (
+        (r"\$exitCode\s*=\s*\[int\]\$run\.result\.exitCode[\s\S]*?if\s*\(\$exitCode\s+-ne\s+0\s+-and\s+\$resolved\.outcome\s+-eq\s+'CAPTURED'\)\s*\{\s*"
+         r"(?P<act>\$resolved\s*=\s*\[pscustomobject\]@\{\s*outcome\s*=\s*'INVALID')", 1),),
 }
 
 

@@ -265,6 +265,7 @@ switch ($cfg.mainMode) {
     'retracted'  { throw 'RETRACTED: stub queue ceiling reached; withdrawn from the inbox' }
     'unresolved' { throw 'UNRESOLVED: stub agent may still own the job' }
     'backend'    { return [pscustomobject]@{ exitCode = 13; stdout = 'RESULT=BACKEND_NOT_AVAILABLE ARTIFACTS=' + $cfg.artifactsAgentPath } }
+    'captured-nonzero' { return [pscustomobject]@{ exitCode = 1; stdout = 'RESULT=MEASUREMENT_CAPTURED ARTIFACTS=' + $cfg.artifactsAgentPath } }
     'source-frames-invalid' { return [pscustomobject]@{ exitCode = 29; stdout = 'RESULT=SOURCE_FRAMES_INVALID SOURCE_ADVANCED=12 REQUIRED_SOURCE_FRAMES=600 WRAPPED=True ARTIFACTS=' + $cfg.artifactsAgentPath } }
     default      { return [pscustomobject]@{ exitCode = 0; stdout = 'RESULT=MEASUREMENT_CAPTURED ARTIFACTS=' + $cfg.artifactsAgentPath } }
 }
@@ -820,6 +821,17 @@ class ReceiptOracleVerdictTests(RunnerHarness, unittest.TestCase):
         self.assertIn("SOURCE_FRAMES_INVALID", receipt["outcomeDetail"])
         self.assertIn("INVALID_LOOPED", receipt["outcomeDetail"])
 
+    def test_a_capture_that_contradicts_its_own_exit_code_is_invalid(self) -> None:
+        # The runner ACTS on the job's exit code (master's consumer scan pins this statement): a printed capture with a
+        # non-zero exit is not evidence.
+        self.write_artifacts()
+        proc, receipt, _ = self.run_leg("ultra-magnus", self.write_spec(), main_mode="captured-nonzero")
+        self.assertEqual(receipt["outcome"], "INVALID")
+        self.assertIn("exited 1", receipt["outcomeDetail"])
+        mutated = self.mutated_runner([("Invoke-VenueLeg.ps1", "if ($exitCode -ne 0 -and $resolved.outcome -eq 'CAPTURED') {", "if ($false) {")])
+        _, receipt, _ = self.run_leg("ultra-magnus", self.write_spec(), main_mode="captured-nonzero", dv=mutated)
+        self.assertEqual(receipt["outcome"], "PASS", "with the exit-code check removed the contradictory capture passes -- so the check is guarded")
+
     def test_a_smoke_refusal_of_the_play_window_is_invalid_not_a_product_fail(self) -> None:
         # The job ended in its own length/pace refusal (exit 28-ish, RESULT=SMOKE_RUN_FAILED, smokeRefusalReason=...).
         self.write_artifacts(source_frames=False, summary={"result": "SMOKE_RUN_FAILED", "smokeRefusalReason": "PLAY_WINDOW_TOO_SHORT"})
@@ -939,6 +951,83 @@ class PlayWindowTests(RunnerHarness, unittest.TestCase):
         mutated = self.mutated_runner([("Invoke-VenueLeg.ps1", "if ($playSeconds -lt 20) {", "if ($false) {")])
         _, receipt, submitted = self.run_leg("ultra-magnus", self.write_spec(play_seconds=1), dv=mutated)
         self.assertNotEqual(submitted, [])
+
+
+# ---------------------------------------------------------------------------------------------------
+def _valid_look_receipt(backend: str, frames_dir: Path, clip: str = OWNER_CLIP, with_playback: bool = True) -> dict:
+    receipt = {
+        "receiptId": f"r-{backend}", "card": "DUAL-VENUE-EVIDENCE-1", "legId": "m16-1243-look", "outcome": "PASS",
+        "subject": {"backend": backend, "buildManifestSha256": "ab" * 32, "legSpecSha256": "cd" * 32, "clipId": clip,
+                    "clipContentSha256": CLIP_CONTENT_SHA, "lookFlavor": "classic"},
+        "venue": {"name": "ultra-magnus", "hostName": "ULTRA-MAGNUS", "gpuNames": ["RTX 4090"]},
+        "evidence": {"umRunOutcome": "RECEIPT"},
+        "look": {"contactSheet": {"rawFramesDir": str(frames_dir)}},
+        "playback": None,
+    }
+    if with_playback:
+        receipt["playback"] = {"sourceAdvanced": 960, "requiredSourceFrames": 600, "wrapped": False, "failures": [], "runNonce": NONCE,
+                               "fixtureRehearsal": False, "clipId": clip}
+    return receipt
+
+
+@requires_windows_pwsh
+class SheetPairStaysLocalTests(unittest.TestCase):
+    """Every leg now plays an owner clip, so a paired sheet is a sheet of OWNER footage: it is written only under a
+    .claude-state directory and only from receipts that are themselves valid evidence."""
+
+    def setUp(self) -> None:
+        self._tmp = tempfile.TemporaryDirectory(prefix="dve-pair-")
+        self.addCleanup(self._tmp.cleanup)
+        self.tmp = Path(self._tmp.name)
+        self.frames = {b: self.tmp / b for b in ("cuda", "cpu")}
+        for d in self.frames.values():
+            d.mkdir()
+
+    def pair(self, out: Path, **kwargs):
+        paths = []
+        for backend in ("cuda", "cpu"):
+            path = self.tmp / f"{backend}.json"
+            path.write_text(json.dumps(_valid_look_receipt(backend, self.frames[backend], **kwargs)), encoding="utf-8")
+            paths.append(path)
+        return run_pwsh(["-File", str(DV / "New-VenueSheetPair.ps1"), "-CudaReceipt", str(paths[0]), "-CpuReceipt", str(paths[1]), "-OutDir", str(out)])
+
+    def test_a_sheet_outside_a_claude_state_directory_is_refused(self) -> None:
+        proc = self.pair(self.tmp / "published")
+        self.assertNotEqual(proc.returncode, 0)
+        self.assertIn("PAIR_OWNER_SHEET_MUST_STAY_LOCAL", proc.stdout + proc.stderr)
+        self.assertFalse((self.tmp / "published").exists(), "nothing is written for a refused pair")
+
+    def test_a_receipt_without_the_oracle_verdict_cannot_be_paired(self) -> None:
+        proc = self.pair(self.tmp / ".claude-state" / "sheets", with_playback=False)
+        self.assertNotEqual(proc.returncode, 0)
+        self.assertIn("PAIR_RECEIPT_INVALID", proc.stdout + proc.stderr)
+
+    def test_a_fixture_or_a_path_is_not_a_consented_clip_for_a_sheet(self) -> None:
+        for clip in FIXTURE_IDS:
+            proc = self.pair(self.tmp / ".claude-state" / "sheets", clip=clip)
+            self.assertNotEqual(proc.returncode, 0)
+            self.assertIn("PAIR_NOT_A_CONSENTED_CLIP", proc.stdout + proc.stderr)
+
+    def test_a_valid_pair_under_claude_state_is_composed_and_marked_local(self) -> None:
+        try:
+            import PIL, numpy  # noqa: F401
+            from PIL import Image
+        except ImportError:
+            self.skipTest("Pillow + numpy are required")
+        for backend, colour in (("cuda", (200, 40, 40)), ("cpu", (40, 40, 200))):
+            for i in (0, 1):
+                Image.new("RGB", (64, 36), colour).save(self.frames[backend] / f"frame-{i:02d}.png")
+                (self.frames[backend] / f"frame-{i:02d}.json").write_text(json.dumps({
+                    "index": i, "saved": True, "display_frame": i * 3, "elapsed_ms": i * 40.0, "path": f"frame-{i:02d}.png",
+                    "look_assist_enabled": True, "look_assist_scene": "night"}), encoding="utf-8")
+        out = self.tmp / ".claude-state" / "sheets"
+        proc = self.pair(out)
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        record = json.loads(next(out.glob("sheet-pair-*.json")).read_text(encoding="utf-8"))
+        self.assertTrue(record["ownerFootage"])
+        self.assertIn("never committed", record["localOnly"])
+        self.assertIsNone(record["owner_verdict"])
+        self.assertEqual(record["model_verdicts"], [])
 
 
 # ---------------------------------------------------------------------------------------------------

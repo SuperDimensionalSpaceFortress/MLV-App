@@ -10,8 +10,10 @@
 #   pwsh -NoProfile -File tools\profiling\dual-venue\New-VenueSheetPair.ps1 `
 #       -CudaReceipt <cuda receipt.json> -CpuReceipt <cpu receipt.json> -OutDir <dir>
 #
-# Owner-footage receipts never reach here: the runner refuses owner clips, and this script refuses
-# any receipt whose clip is not a tracked fixture id, so an owner sheet cannot be assembled by it.
+# Round 2: every leg plays a CONSENTED OWNER CLIP (fixtures are never venue playback clips), so the sheet is a sheet
+# of OWNER footage. It stays LOCAL: -OutDir must sit under a `.claude-state` directory (gitignored; never committed,
+# PR-attached, bus-published or published as an artifact), and only a receipt that is itself valid evidence
+# (Test-DvReceiptValid: PASS/FAIL with the receipt oracle's >= 20 s verdict) can be paired.
 [CmdletBinding()]
 param(
     [Parameter(Mandatory = $true)][string]$CudaReceipt,
@@ -25,10 +27,17 @@ $cuda = [IO.File]::ReadAllText((Resolve-Path -LiteralPath $CudaReceipt).Path) | 
 $cpu = [IO.File]::ReadAllText((Resolve-Path -LiteralPath $CpuReceipt).Path) | ConvertFrom-Json
 
 if ($cuda.subject.backend -ne 'cuda' -or $cpu.subject.backend -ne 'cpu') { throw 'PAIR_BACKENDS_WRONG the first receipt must be the cuda backend and the second the cpu backend' }
+# The sheet is owner footage: it may only be written where it stays local.
+$outFull = [IO.Path]::GetFullPath($OutDir)
+if (@($outFull.Split([char[]]@('\', '/')) | Where-Object { $_ -ceq '.claude-state' }).Count -eq 0) {
+    throw 'PAIR_OWNER_SHEET_MUST_STAY_LOCAL -OutDir must be under a .claude-state directory; a sheet of owner footage is never committed, attached or published'
+}
 foreach ($r in $cuda, $cpu) {
     if ($r.outcome -ne 'PASS' -and $r.outcome -ne 'FAIL') { throw "PAIR_RECEIPT_INCOMPLETE receipt $($r.receiptId) is $($r.outcome), not PASS/FAIL" }
+    $validity = Test-DvReceiptValid -Receipt $r
+    if (-not $validity.valid) { throw "PAIR_RECEIPT_INVALID receipt $($r.receiptId) is not valid evidence: $(@($validity.reasons) -join '; ')" }
     if ($null -eq $r.look -or $null -eq $r.look.contactSheet -or -not $r.look.contactSheet.rawFramesDir) { throw "PAIR_NO_FRAMES receipt $($r.receiptId) carries no raw contact-sheet frames" }
-    if (@('tiny_dual_iso', 'large_dual_iso') -cnotcontains [string]$r.subject.clipId) { throw 'PAIR_NOT_A_FIXTURE only tracked fixtures can be paired into a sheet' }
+    if ([string]$r.subject.clipId -cnotmatch '^[A-Za-z]\d{2}-\d{3,4}$') { throw 'PAIR_NOT_A_CONSENTED_CLIP only a consented clip id (never a fixture or a path) can be paired into a sheet' }
 }
 foreach ($f in 'buildManifestSha256', 'legSpecSha256', 'clipId', 'clipContentSha256', 'lookFlavor') {
     if ([string]$cuda.subject.$f -ne [string]$cpu.subject.$f) { throw "PAIR_SUBJECT_DIFFERS the receipts differ in subject.$f" }
@@ -51,6 +60,8 @@ $record = [ordered]@{
     schema = 'mlv-app/dual-venue-sheet-pair/v1'
     venue = $venue; card = $cuda.card; legId = $cuda.legId; lookFlavor = $flavor
     lookFlavorHonored = 'unknown'
+    ownerFootage = $true
+    localOnly = 'never committed, attached to a PR, published to the bus or as an artifact'
     cudaReceiptId = $cuda.receiptId; cpuReceiptId = $cpu.receiptId
     sheet = [ordered]@{ path = $sheet; sha256 = (Get-DvSha256OfFile $sheet); statsPath = $stats; statsSha256 = (Get-DvSha256OfFile $stats) }
     pairedBy = 'frame_index'

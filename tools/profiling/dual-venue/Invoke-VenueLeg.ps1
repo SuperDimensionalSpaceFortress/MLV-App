@@ -2,7 +2,7 @@
 # DUAL-VENUE-EVIDENCE-1 (C2). RUN THIS ON THE VM. Methodology: docs/dual-venue-evidence.md.
 #
 #   pwsh -NoProfile -File tools\profiling\dual-venue\Invoke-VenueLeg.ps1 `
-#       -Venue ultra-magnus -LegSpec tools\profiling\dual-venue\legs\fixture-look-large.json `
+#       -Venue ultra-magnus -LegSpec tools\profiling\dual-venue\legs\m16-1243-look.json `
 #       -SourceCommit <40-hex> -BuildManifestSha256 <64-hex> -Backend cpu
 #
 # The flow (each step a refusal the code enforces, each refusal a receipt):
@@ -331,6 +331,11 @@ if ($null -ne $summary) {
 }
 $smokeRefusalReason = $(if ($null -ne $summary -and $summary.PSObject.Properties['smokeRefusalReason']) { [string]$summary.smokeRefusalReason } else { '' })
 $resolved = Resolve-DvJobOutcome -ResultToken $token -ExitCode $exitCode -SmokeRefusalReason $smokeRefusalReason
+# A consumer of an evidence launcher ACTS on its exit code (master's consumer scan pins this statement): a job that prints a
+# capture and then exits non-zero contradicts itself, so its capture is not evidence.
+if ($exitCode -ne 0 -and $resolved.outcome -eq 'CAPTURED') {
+    $resolved = [pscustomobject]@{ outcome = 'INVALID'; detail = "$($resolved.detail) but the job exited $exitCode; a capture that disagrees with its own exit code is not evidence" }
+}
 
 # P6 again, from the job's own record: a summary that names a different venue than declared is a mismatch.
 if ($null -ne $summary -and $summary.PSObject.Properties['display'] -and $summary.display -and $summary.display.PSObject.Properties['venue']) {

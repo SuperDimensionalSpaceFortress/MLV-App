@@ -334,6 +334,10 @@ CONSUMER_ACTS_ON_EXIT: dict[str, str] = {
         r"if\s*\(\$importResult\.exitCode\s+-ne\s+0\)[\s\S]*?if\s*\(\$importResult\.exitCode\s+-ne\s+0\)",
     "tools/profiling/export-release-cuda-dogfood-kit.ps1":
         r"\$proofExit\s*=\s*\$LASTEXITCODE[\s\S]*?\bexit\s+\$proofExit\b",
+    # DUAL-VENUE-EVIDENCE-1 r2: submits the attribution job through um-run and reads the job's exit code; a capture that
+    # contradicts its own exit code is INVALID (Resolve-DvJobOutcome), and a PASS/FAIL also needs the oracle's verdict.
+    "tools/profiling/dual-venue/Invoke-VenueLeg.ps1":
+        r"\$exitCode\s*=\s*\[int\]\$run\.result\.exitCode[\s\S]*?if\s*\(\$exitCode\s+-ne\s+0\s+-and\s+\$resolved\.outcome\s+-eq\s+'CAPTURED'\)\s*\{",
 }
 
 # Scripts that NAME an evidence launcher (or a consumer) and are not consumers that publish a result. Each reason is read
