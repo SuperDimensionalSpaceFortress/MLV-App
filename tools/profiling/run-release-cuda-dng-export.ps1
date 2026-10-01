@@ -23,6 +23,16 @@ param(
 )
 
 $ErrorActionPreference = "Stop"
+
+# PLAYBACK-CLIP-LENGTH-ENFORCE-1 round 2 (sol B3): this launcher forwards -AdditionalArgs to the app, so
+# it must never be the way a play mode (--gui-smoke-playback, --profile-playback, --exercise-play-action,
+# --loop, a lifecycle-stress clip switch, ...) reaches a clip with no length gate. Refused, typed, exit 44.
+. (Join-Path $PSScriptRoot 'gui-smoke-length-gate.ps1')
+$passThroughGate = Test-GuiSmokePassThroughArguments -Arguments $AdditionalArgs -Context 'launcher'
+if ($passThroughGate.verdict -ne 'OK') {
+    [Console]::Error.WriteLine("PLAYBACK-CLIP-LENGTH-ENFORCE-1: $($passThroughGate.message)")
+    exit 44
+}
 . (Join-Path $PSScriptRoot "cuda-backend-architecture.ps1")
 
 if ($MaxFrames -lt 0) {

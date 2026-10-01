@@ -28,6 +28,7 @@
 #include <QItemSelectionModel>
 #include <QToolButton>
 #include "SessionModel.h"
+#include "PlaybackFrameRange.h"
 #include "../../src/mlv_include.h"
 #include "InfoDialog.h"
 #include "StatusDialog.h"
@@ -145,8 +146,8 @@ public:
         int startFrame = 0;
         int durationMs = 8000;
         int targetPresentedFrames = 0; // test-only: stop after exactly N fresh presentations; durationMs remains the timeout
-        bool loopPlayback = false;   // --loop: loop the clip so a SHORT clip plays the whole durationMs
-                                     // window (else it plays once, stops, and the wait loop exits early).
+        bool loopPlayback = false;   // never true: --loop is refused in main.cpp (owner rule 2026-09-30)
+        bool launchOnly = false;     // --launch-only: open the clip and return without ever calling Play
         int settleMs = 2500;
         double settleCpuPercent = -1.0;
         int settleCpuStableMs = 1000;
@@ -1093,6 +1094,9 @@ private:
     // that wraps mid-measurement would sample only whatever arbitrary sub-range it happened to
     // land on at the end -- different on every host. See runGuiPlaybackSmoke's span snapshot.
     bool m_playbackSmokeWrapped = false;
+    // PLAYBACK-CLIP-LENGTH-ENFORCE-1 round 2: the engine's own wrap count (process-cumulative, never reset:
+    // a wrap during a warm-up play is a wrap) -- see playback_frame_range::PlaybackWrapRecorder.
+    playback_frame_range::PlaybackWrapRecorder m_playbackWrapRecorder;
     // Contact-sheet capture-during-playback (CUDA-PLAYBACK-CONTACT-SHEET-1 r1b): an un-timed
     // SECOND playback pass, run after the measured interval closes and playback_smoke telemetry
     // has finished, so every grab below is of a genuinely presented playback frame -- never a

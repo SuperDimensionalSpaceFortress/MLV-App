@@ -136,3 +136,231 @@ function Test-GuiSmokeClipLength {
     }
     return $out
 }
+
+# ---------------------------------------------------------------------------------------------------
+# PLAYBACK-CLIP-LENGTH-ENFORCE-1 round 2 -- the rest of the CLASS: no ARGUMENT, MODE or LAUNCHER may
+# make a venue play a clip under 20 s or loop. ASCII only.
+# ---------------------------------------------------------------------------------------------------
+
+# Every option the app's `--gui-smoke-playback` parser (platform/qt/main.cpp runGuiPlaybackSmoke)
+# declares, classified. 'refuse' = a pass-through argument that could loop the clip, change the clip
+# or the play window, or start a different playback mode, so the runner REFUSES it (the runner owns
+# the window and the clip through its own parameters, which the length gate checks). 'allow' = it
+# cannot change what is played or for how long. tools/repo_hygiene/test_playback_clip_length_gate.py
+# compares this table with the options main.cpp really declares: a NEW app option fails that test
+# until it is classified here, so a new loop/mode flag cannot slip past the gate unnoticed.
+$script:GuiSmokeOptionPolicy = @{
+    'h' = 'allow'; 'help' = 'allow'
+    'gui-smoke-playback' = 'refuse'            # the runner passes it itself; a second one is a mode change
+    'i' = 'refuse'; 'input' = 'refuse'         # the clip (the gate checked the runner's -Input, not this)
+    'r' = 'allow'; 'receipt' = 'allow'
+    'seconds' = 'refuse'                       # the play window the gate checked
+    'start-frame' = 'refuse'                   # the window is measured from here
+    'presented-frames' = 'refuse'              # ends the play window early
+    'drop-frame-mode' = 'allow'
+    'settle-ms' = 'allow'; 'settle-cpu-percent' = 'allow'; 'settle-cpu-stable-ms' = 'allow'; 'settle-cpu-max-ms' = 'allow'
+    'screenshot-output' = 'allow'; 'window-screenshot-output' = 'allow'
+    'contact-sheet-dir' = 'allow'; 'contact-sheet-frames' = 'allow'; 'contact-sheet-seek-mode' = 'allow'
+    'scope' = 'allow'; 'playback-debayer' = 'allow'; 'playback-processing' = 'allow'
+    'gpu-viewport' = 'allow'; 'gpu-preview-processing' = 'allow'; 'gpu-bilinear-debayer' = 'allow'
+    'gpu-amaze-debayer' = 'allow'; 'gpu-amaze-texture-present' = 'allow'
+    'no-look-assist' = 'allow'
+    'loop' = 'refuse'                          # LOOPING: never (owner rule 2026-09-30)
+    'launch-only' = 'refuse'                   # the runner passes it itself, only under -LaunchOnlyProbe
+    'windowed' = 'allow'; 'display-prefer' = 'allow'
+    'exercise-clip-lifecycle-stress' = 'refuse'  # plays a SECOND clip; the runner's own switch is gated
+    'stress-switch-input' = 'refuse'; 'stress-switch-at-ms' = 'refuse'; 'stress-seek-frame' = 'refuse'
+    'enable-phase3-quality-modes' = 'allow'; 'zebras' = 'allow'; 'no-zebras' = 'allow'; 'stage-log' = 'allow'
+}
+
+# The same for the headless `--profile-playback` parser (runPlaybackProfile), used by
+# run-release-playback-profile.ps1. 'play' = the option makes the profile PLAY the clip (the real Play
+# action, or the Look Assist settle's warm-up play), so it is allowed only after the clip passes the
+# length gate. 'refuse' = a mode/clip change the wrapper owns.
+$script:PlaybackProfileOptionPolicy = @{
+    'h' = 'allow'; 'help' = 'allow'
+    'profile-playback' = 'refuse'
+    'i' = 'refuse'; 'input' = 'refuse'
+    'o' = 'allow'; 'output' = 'allow'; 'r' = 'allow'; 'receipt' = 'allow'
+    'frames' = 'allow'; 'start-frame' = 'allow'; 'frame-step' = 'allow'
+    'scope' = 'allow'; 'playback-debayer' = 'allow'; 'playback-processing' = 'allow'; 'zebras' = 'allow'
+    'raw-cache-mb' = 'allow'; 'cache-cpu-cores' = 'allow'; 'threads' = 'allow'; 'fast-open' = 'allow'
+    'gpu-viewport' = 'allow'; 'gpu-preview-processing' = 'allow'; 'gpu-bilinear-debayer' = 'allow'; 'gpu-amaze-debayer' = 'allow'
+    'show-window' = 'allow'; 'wait-for-paint' = 'allow'
+    'exercise-play-action' = 'play'
+    'exercise-look-assist-toggle' = 'play'
+    'exercise-look-assist-settle' = 'play'
+    'exercise-scale-toggle' = 'allow'; 'exercise-scale-toggle-from' = 'allow'
+    'stage-log' = 'allow'
+}
+
+# Options refused in EVERY context even if a future parser starts declaring them: anything that loops,
+# starts a different mode, or is the launch-only marker.
+$script:GuiSmokeAlwaysRefusedOptions = @('loop', 'gui-smoke-playback', 'profile-playback', 'launch-only', 'autoplay')
+
+function Get-GuiSmokePassThroughOptionNames {
+    <#
+    .SYNOPSIS
+    The option NAMES a pass-through argument list would hand the app, however they are spelled: any
+    leading '-', '--' or '/', any case, '--name=value', several tokens in one element, comma-joined.
+    A value token (no leading dash/slash) names nothing.
+    #>
+    param([string[]]$Arguments = @())
+    $names = @()
+    foreach ($element in @($Arguments)) {
+        if ($null -eq $element) { continue }
+        foreach ($token in ([string]$element -split '[\s,;]+')) {
+            if ($token -notmatch '^[-/]+(?<name>[^=\s]+)') { continue }
+            $names += $Matches['name'].ToLowerInvariant()
+        }
+    }
+    return $names
+}
+
+function Test-GuiSmokePassThroughArguments {
+    <#
+    .SYNOPSIS
+    The pass-through gate. Context 'gui-smoke' (run-release-gui-smoke.ps1 -AdditionalArgs) or 'profile'
+    (run-release-playback-profile.ps1 -AdditionalArgs) or 'launcher' (the interactive / --batch launchers
+    that forward -AdditionalArgs to the exe and must NEVER be handed a play mode: every play-capable or
+    mode-changing option is refused, anything else rides through). Returns [pscustomobject]@{ verdict; option;
+    message; playCapable }. verdict is OK | PASS_THROUGH_REFUSED. Fail closed: an option this policy
+    does not know is refused too, so a mistyped or new flag never rides through. Path-free messages.
+    #>
+    param(
+        [string[]]$Arguments = @(),
+        [Parameter(Mandatory = $true)][ValidateSet('gui-smoke', 'profile', 'launcher')][string]$Context
+    )
+    $policy = if ($Context -eq 'gui-smoke') { $script:GuiSmokeOptionPolicy } else { $script:PlaybackProfileOptionPolicy }
+    if ($Context -eq 'launcher') {
+        # Only the options that make the app PLAY or change its mode are refused; the launcher's own
+        # modes (--batch export, a plain GUI open) never play, so every other option is harmless.
+        $policy = @{}
+        foreach ($launcherRefused in @('exercise-play-action', 'exercise-look-assist-toggle', 'exercise-look-assist-settle',
+                                       'exercise-clip-lifecycle-stress', 'stress-switch-input')) {
+            $policy[$launcherRefused] = 'refuse'
+        }
+    }
+    $result = [pscustomobject]@{ verdict = 'OK'; option = ''; message = 'OK'; playCapable = $false }
+    foreach ($name in (Get-GuiSmokePassThroughOptionNames -Arguments $Arguments)) {
+        $kind = if ($script:GuiSmokeAlwaysRefusedOptions -contains $name) { 'refuse' }
+                elseif ($policy.ContainsKey($name)) { $policy[$name] }
+                elseif ($Context -eq 'launcher') { 'allow' }
+                else { 'unknown' }
+        if ($kind -eq 'play') { $result.playCapable = $true; continue }
+        if ($kind -eq 'allow') { continue }
+        $why = if ($kind -eq 'unknown') { 'unclassified' } else { 'loop_or_clip_or_window_control' }
+        $result.verdict = 'PASS_THROUGH_REFUSED'
+        $result.option = $name
+        $result.message = "PASS_THROUGH_REFUSED (option=$name reason=$why)"
+        return $result
+    }
+    return $result
+}
+
+function Test-GuiSmokeEnvironmentEntries {
+    <#
+    .SYNOPSIS
+    Refuses an -ExtraEnvironment KEY=VALUE entry that arms the app's own autoplay/loop automation hook
+    (MLVAPP_AUTOPLAY_*): it plays whatever clip is opened, with no length gate and optionally looping.
+    #>
+    param([string[]]$Entries = @())
+    $result = [pscustomobject]@{ verdict = 'OK'; option = ''; message = 'OK' }
+    foreach ($entry in @($Entries)) {
+        if ([string]::IsNullOrWhiteSpace($entry)) { continue }
+        foreach ($pair in ([string]$entry -split ',')) {
+            if ($pair.Trim() -match '^(?i)MLVAPP_AUTOPLAY_[A-Z0-9_]*\s*=') {
+                $key = ($pair.Trim() -split '=', 2)[0].Trim().ToUpperInvariant()
+                $result.verdict = 'PASS_THROUGH_REFUSED'
+                $result.option = $key
+                $result.message = "PASS_THROUGH_REFUSED (env=$key reason=autoplay_hook_has_no_length_gate)"
+                return $result
+            }
+        }
+    }
+    return $result
+}
+
+function Convert-PlaybackLogLineToObject {
+    # key=value / key="quoted value" tokens of one app log line, as a PSCustomObject. Integers and
+    # doubles are converted; everything else stays a string. Shared so the loop verdict below is tested
+    # against the SAME parser the runner uses on the app's real playback_smoke.summary line.
+    param([string]$Line)
+
+    $result = [ordered]@{}
+    $matches = [regex]::Matches($Line, '(?<key>[A-Za-z0-9_]+)=(?<value>"[^"]*"|\S+)')
+    foreach ($match in $matches) {
+        $key = $match.Groups["key"].Value
+        $rawValue = $match.Groups["value"].Value.Trim('"')
+
+        $intValue = 0L
+        $doubleValue = 0.0
+        if ([long]::TryParse($rawValue, [ref]$intValue)) {
+            $result[$key] = $intValue
+        }
+        elseif ([double]::TryParse(
+            $rawValue,
+            [System.Globalization.NumberStyles]::Float,
+            [System.Globalization.CultureInfo]::InvariantCulture,
+            [ref]$doubleValue)) {
+            $result[$key] = $doubleValue
+        }
+        else {
+            $result[$key] = $rawValue
+        }
+    }
+    [pscustomobject]$result
+}
+
+function Get-GuiSmokeLoopVerdict {
+    <#
+    .SYNOPSIS
+    The RUNTIME BACKSTOP decision, run on the app's parsed playback_smoke.summary object. Returns
+    [pscustomobject]@{ invalid; failures }. invalid is $true when the app's own timeline wrapped
+    (wrapped=1, or any wrap_count > 0 -- the count is taken in the engine's actual wrap branches and
+    outranks the presented-frame heuristic behind wrapped), or when the app reports a clip shorter than
+    max(20 s, window). A launch-only probe never plays, so a wrap or any presented frame there is
+    itself a failure. A binary that predates the wrap fields reports $null for each, so the app's own
+    wrap signal is silent for it; two checks that need nothing from the app then still apply, from the
+    clip's header frame count (-ClipFrames, 0 = unknown): more frames presented than the clip holds, or a
+    last presented frame BEFORE the first, can only mean the timeline went round again.
+    #>
+    param(
+        [AllowNull()]$Summary,
+        [Parameter(Mandatory = $true)][double]$WindowSeconds,
+        [bool]$LaunchOnlyProbe = $false,
+        [int64]$ClipFrames = 0
+    )
+    $failures = @()
+    $prop = { param($name) if ($null -ne $Summary -and $Summary.PSObject.Properties[$name]) { $Summary.$name } else { $null } }
+    $wrapped = & $prop 'wrapped'
+    $wrapCount = & $prop 'wrap_count'
+    $totalFrames = & $prop 'total_frames'
+    $clipSeconds = & $prop 'clip_seconds'
+    $presented = & $prop 'presented_frames'
+    $firstPresented = & $prop 'first_presented_frame'
+    $lastPresented = & $prop 'last_presented_frame'
+    if ($LaunchOnlyProbe) {
+        if (($null -ne $presented -and [int64]$presented -gt 0) -or
+            ($null -ne $wrapped -and [int]$wrapped -ne 0) -or
+            ($null -ne $wrapCount -and [int64]$wrapCount -gt 0)) {
+            $failures += "LAUNCH_ONLY_PROBE_PLAYED: a launch-only probe must present zero playback frames and never wrap (presented_frames=$presented wrapped=$wrapped wrap_count=$wrapCount)."
+        }
+    } else {
+        if (($null -ne $wrapped -and [int]$wrapped -ne 0) -or
+            ($null -ne $wrapCount -and [int64]$wrapCount -gt 0)) {
+            $failures += "INVALID_LOOPED: the playback timeline wrapped (wrapped=$wrapped wrap_count=$wrapCount total_frames=$totalFrames clip_seconds=$clipSeconds); a looped short clip is never playback evidence."
+        }
+        if ($ClipFrames -gt 0 -and $null -ne $presented -and [int64]$presented -gt $ClipFrames) {
+            $failures += "INVALID_LOOPED: $presented frames were presented from a clip of $ClipFrames frames; the timeline went round again."
+        }
+        if ($null -ne $firstPresented -and $null -ne $lastPresented -and [int64]$lastPresented -lt [int64]$firstPresented) {
+            $failures += "INVALID_LOOPED: the last presented frame ($lastPresented) is before the first ($firstPresented); the timeline wrapped."
+        }
+        if ($null -ne $clipSeconds -and [double]$clipSeconds -gt 0 -and
+            [double]$clipSeconds -lt [Math]::Max($script:GuiSmokeMinClipSeconds, $WindowSeconds)) {
+            $failures += "INVALID_LOOPED: the app reports clip_seconds=$clipSeconds, under max($($script:GuiSmokeMinClipSeconds), window=$WindowSeconds)."
+        }
+    }
+    return [pscustomobject]@{ invalid = ($failures.Count -gt 0); failures = $failures }
+}

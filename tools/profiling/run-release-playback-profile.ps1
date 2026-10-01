@@ -24,6 +24,11 @@ param(
 )
 
 $ErrorActionPreference = "Stop"
+# PLAYBACK-CLIP-LENGTH-ENFORCE-1 round 2 (sol B3): this wrapper can make the app PLAY the clip
+# (--exercise-play-action, and the Look Assist settle's warm-up play) with any -AdditionalArgs it is
+# handed, so it goes through the same gate as run-release-gui-smoke.ps1. A pure decode benchmark
+# (--profile-playback without a play-capable option) presents no playback and is not gated.
+. (Join-Path $PSScriptRoot 'gui-smoke-length-gate.ps1')
 
 function Resolve-FileSystemProviderPath {
     param(
@@ -101,8 +106,37 @@ try {
     $env:QT_QPA_PLATFORM_PLUGIN_PATH = $platformDir
     $env:QT_PLUGIN_PATH = $exeDir
 
+    # The gates run BEFORE anything launches (and before the -DryRun report), typed and path-free:
+    #   exit 44 PASS_THROUGH_REFUSED   exit 41 CLIP_TOO_SHORT   exit 42 CLIP_LENGTH_UNKNOWN
+    $passThroughGate = Test-GuiSmokePassThroughArguments -Arguments $AdditionalArgs -Context 'profile'
+    if ($passThroughGate.verdict -ne 'OK') {
+        [Console]::Error.WriteLine("PLAYBACK-CLIP-LENGTH-ENFORCE-1: $($passThroughGate.message)")
+        exit 44
+    }
+    $environmentGate = Test-GuiSmokeEnvironmentEntries -Entries $ExtraEnvironment
+    if ($environmentGate.verdict -ne 'OK') {
+        [Console]::Error.WriteLine("PLAYBACK-CLIP-LENGTH-ENFORCE-1: $($environmentGate.message)")
+        exit 44
+    }
+    $clipLengthGate = 'NOT_PLAYING'
+    if ($passThroughGate.playCapable) {
+        if ([string]::IsNullOrWhiteSpace($ClipPath)) {
+            [Console]::Error.WriteLine("PLAYBACK-CLIP-LENGTH-ENFORCE-1: CLIP_LENGTH_UNKNOWN (reason=no_input)")
+            exit 42
+        }
+        # Floor only (window 0): the play action runs for a few frames, never a measured window.
+        $profileClipGate = Test-GuiSmokeClipLength -Path (Resolve-FileSystemProviderPath -Path $ClipPath) -WindowSeconds 0 -StartFrame $StartFrame
+        if ($profileClipGate.verdict -ne 'OK') {
+            [Console]::Error.WriteLine("PLAYBACK-CLIP-LENGTH-ENFORCE-1: $($profileClipGate.message)")
+            exit $(if ($profileClipGate.verdict -eq 'CLIP_TOO_SHORT') { 41 } else { 42 })
+        }
+        $clipLengthGate = 'OK'
+    }
+
     if ($DryRun) {
         [pscustomobject]@{
+            clipLengthGate = $clipLengthGate
+            playCapable = [bool]$passThroughGate.playCapable
             exePath = $exe
             qtQpaPlatform = $env:QT_QPA_PLATFORM
             qtQpaPlatformPluginPath = $env:QT_QPA_PLATFORM_PLUGIN_PATH

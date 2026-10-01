@@ -20,10 +20,8 @@ param(
     # of real footage once and never loops (a looped 16-frame clip is not a playback result).
     # -NoLoop is kept only so existing callers still bind; it is now a no-op.
     [switch]$NoLoop,
-    # The ONLY way to pass --loop. Refused unless -LaunchOnlyProbe (a run that cannot produce playback
-    # evidence); allowlist of legitimate uses: NONE tracked. Anything else that plays the app must go
-    # through the clip-length gate below with a clip that outlasts the window.
-    [switch]$AllowLoop,
+    # (-AllowLoop was REMOVED in PLAYBACK-CLIP-LENGTH-ENFORCE-1 round 2: no evidence run can ever
+    # loop, and no tracked caller ever needed it. Nothing in this runner can produce --loop.)
     [double]$SettleCpuPercent = 10,
     [int]$SettleCpuStableMs = 1000,
     [int]$SettleCpuMaxMs = 45000,
@@ -116,10 +114,17 @@ param(
     # interior sampling and reproduces round 2's bracket-only behaviour exactly.
     [ValidateRange(0, 60000)]
     [int]$HostLoadSampleIntervalMs = 4000,
-    [switch]$DryRun
+    [switch]$DryRun,
+    # A parameter this runner does not declare (a REMOVED one such as -AllowLoop, or a typo) lands here
+    # instead of silently binding to a positional parameter; it is refused loudly just below.
+    [Parameter(ValueFromRemainingArguments = $true)]
+    [string[]]$UnrecognizedArguments = @()
 )
 
 $ErrorActionPreference = "Stop"
+if ($UnrecognizedArguments.Count -gt 0) {
+    throw "Unrecognized or removed argument(s): $($UnrecognizedArguments -join ' '). (a removed parameter, or a typo; no run may loop.)"
+}
 $settledValidationRecommendedSeconds = 30
 $validationWarnings = @()
 . (Join-Path $PSScriptRoot 'gui-smoke-screenshot-provenance.ps1')
@@ -170,22 +175,28 @@ if ($ExerciseClipLifecycleStress -and $DetectPlaybackArtifacts) {
 if ($ArtifactCadenceAdvisory -and -not $DetectPlaybackArtifacts) {
     throw "-ArtifactCadenceAdvisory requires -DetectPlaybackArtifacts."
 }
-if ($AllowLoop -and $NoLoop) {
-    throw "-AllowLoop and -NoLoop contradict each other."
-}
-if ($AllowLoop -and -not $LaunchOnlyProbe) {
-    throw "-AllowLoop is refused: looping a clip is never playback evidence (owner rule 2026-09-30). It is permitted only with -LaunchOnlyProbe."
-}
 if ($LegacyGuiSmokeOptions) {
-    if ($AllowLoop) {
-        throw "-LegacyGuiSmokeOptions cannot be combined with -AllowLoop because the pinned legacy CLI has no --loop option."
-    }
     if ($DropFrameMode -ne "persisted") {
         throw "-LegacyGuiSmokeOptions supports only the legacy persisted drop-frame default."
     }
     if ($DisableLookAssist -and [string]::IsNullOrWhiteSpace($Receipt)) {
         throw "-LegacyGuiSmokeOptions requires a receipt that explicitly disables Look Assist when -DisableLookAssist is requested."
     }
+}
+
+# PLAYBACK-CLIP-LENGTH-ENFORCE-1 round 2 (sol B1): the pass-through surfaces are gated BEFORE anything
+# else runs. -AdditionalArgs and -ExtraEnvironment reach the app verbatim, so a pass-through
+# --loop (any spelling), a second clip, a play-window control, or an MLVAPP_AUTOPLAY_* hook would play
+# a short clip or loop it past every check below. Refused typed and path-free, exit 44.
+$passThroughGate = Test-GuiSmokePassThroughArguments -Arguments $AdditionalArgs -Context 'gui-smoke'
+if ($passThroughGate.verdict -ne 'OK') {
+    [Console]::Error.WriteLine("PLAYBACK-CLIP-LENGTH-ENFORCE-1: $($passThroughGate.message)")
+    exit 44
+}
+$environmentGate = Test-GuiSmokeEnvironmentEntries -Entries $ExtraEnvironment
+if ($environmentGate.verdict -ne 'OK') {
+    [Console]::Error.WriteLine("PLAYBACK-CLIP-LENGTH-ENFORCE-1: $($environmentGate.message)")
+    exit 44
 }
 
 if ($UsePersistedPlaybackSettings) {
@@ -221,33 +232,8 @@ if (($CaptureScreenshot -or $FrameTelemetry) -and $Seconds -lt $settledValidatio
     )
 }
 
-function Convert-PlaybackLogLineToObject {
-    param([string]$Line)
-
-    $result = [ordered]@{}
-    $matches = [regex]::Matches($Line, '(?<key>[A-Za-z0-9_]+)=(?<value>"[^"]*"|\S+)')
-    foreach ($match in $matches) {
-        $key = $match.Groups["key"].Value
-        $rawValue = $match.Groups["value"].Value.Trim('"')
-
-        $intValue = 0L
-        $doubleValue = 0.0
-        if ([long]::TryParse($rawValue, [ref]$intValue)) {
-            $result[$key] = $intValue
-        }
-        elseif ([double]::TryParse(
-            $rawValue,
-            [System.Globalization.NumberStyles]::Float,
-            [System.Globalization.CultureInfo]::InvariantCulture,
-            [ref]$doubleValue)) {
-            $result[$key] = $doubleValue
-        }
-        else {
-            $result[$key] = $rawValue
-        }
-    }
-    [pscustomobject]$result
-}
+# Convert-PlaybackLogLineToObject lives in gui-smoke-length-gate.ps1 (dot-sourced above): the runtime
+# loop verdict is tested against this very parser.
 
 function Get-LogTimestampUtc {
     param([string]$Line)
@@ -1331,13 +1317,24 @@ $inputPath =
 # goes through this runner, so a clip that is too short to be played for the requested window is
 # refused HERE, before anything is hashed, staged or launched. Typed, path-free, fail-closed:
 #   exit 41 CLIP_TOO_SHORT (clip=<s> window=<s>)   exit 42 CLIP_LENGTH_UNKNOWN (reason=<token>)
-# The only exemption is -AllowLoop, which itself requires -LaunchOnlyProbe (no playback evidence).
+# The only exemption is -LaunchOnlyProbe, and a launch-only probe is launched with --launch-only: the app
+# opens the clip and NEVER calls Play (round 2, sol B2), and the verdict below fails the run if a single
+# playback frame was presented anyway. Nothing exempts a run from the gate by letting it loop.
 $clipLengthGate = [pscustomobject]@{ verdict = 'SKIPPED_LAUNCH_ONLY_PROBE'; message = 'SKIPPED_LAUNCH_ONLY_PROBE' }
-if (-not $AllowLoop) {
+if (-not $LaunchOnlyProbe) {
     $clipLengthGate = Test-GuiSmokeClipLength -Path $inputPath -WindowSeconds $Seconds -StartFrame $StartFrame
     if ($clipLengthGate.verdict -ne 'OK') {
         [Console]::Error.WriteLine("PLAYBACK-CLIP-LENGTH-ENFORCE-1: $($clipLengthGate.message)")
         exit $(if ($clipLengthGate.verdict -eq 'CLIP_TOO_SHORT') { 41 } else { 42 })
+    }
+    # The lifecycle-stress leg switches to a SECOND clip mid-play: it is played too, so it is gated too
+    # (floor only -- the switch clip is not played for the whole window).
+    if ($ExerciseClipLifecycleStress -and -not [string]::IsNullOrWhiteSpace($StressSwitchInput)) {
+        $stressClipGate = Test-GuiSmokeClipLength -Path (Resolve-Path -LiteralPath $StressSwitchInput).ProviderPath -WindowSeconds 0
+        if ($stressClipGate.verdict -ne 'OK') {
+            [Console]::Error.WriteLine("PLAYBACK-CLIP-LENGTH-ENFORCE-1: stress-switch clip $($stressClipGate.message)")
+            exit $(if ($stressClipGate.verdict -eq 'CLIP_TOO_SHORT') { 41 } else { 42 })
+        }
     }
 }
 $smokeReceiptPath = if ([string]::IsNullOrWhiteSpace($Receipt)) {
@@ -1444,9 +1441,10 @@ $arguments += @(
     "--settle-cpu-max-ms", [string]$SettleCpuMaxMs
 )
 # PLAYBACK-CLIP-LENGTH-ENFORCE-1: the 2026-06-26 rule ("loop short clips so they fill -Seconds") is
-# SUPERSEDED by the owner rule of 2026-09-30. --loop is passed ONLY under the explicit -AllowLoop
-# (itself refused unless -LaunchOnlyProbe); the default argument list never contains it.
-if ($AllowLoop) { $arguments += "--loop" }
+# SUPERSEDED by the owner rule of 2026-09-30: this runner never produces the app's loop option, and
+# -AdditionalArgs cannot carry it (refused above). A launch-only probe says so to the app, which then
+# opens the clip, settles, and exits without ever calling Play.
+if ($LaunchOnlyProbe) { $arguments += "--launch-only" }
 if (-not [string]::IsNullOrWhiteSpace($Receipt)) {
     $arguments += @("--receipt", $smokeReceiptPath)
 }
@@ -2440,23 +2438,29 @@ if ($RequireCpuSettled -and
     $validationFailures += "System CPU did not settle before launching MLVApp."
 }
 # PLAYBACK-CLIP-LENGTH-ENFORCE-1: RUNTIME BACKSTOP. Whatever the pre-launch header check said, a run
-# in which the app's own timeline wrapped (wrapped=1 on playback_smoke.summary) looped the clip and is
-# INVALID_LOOPED -- never a PASS, exit 43. A reported clip length under the floor/window is refused
-# the same way (a header that lied). A binary that predates these fields reports $null: not a wrap.
+# in which the app's own timeline wrapped (the engine's wrap_count, or wrapped=1, on
+# playback_smoke.summary) looped the clip and is INVALID_LOOPED -- never a PASS, exit 43. A reported
+# clip length under the floor/window is refused the same way (a header that lied). The DECISION lives
+# in gui-smoke-length-gate.ps1 (Get-GuiSmokeLoopVerdict) so the class test executes it, mutation-tested,
+# against the app's real summary format. A launch-only probe must not have played at all.
 $loopWrappedRaw = Get-ObjectPropertyValue $playbackSummary "wrapped"
 $loopTotalFrames = Get-ObjectPropertyValue $playbackSummary "total_frames"
 $loopClipSeconds = Get-ObjectPropertyValue $playbackSummary "clip_seconds"
+$loopWrapCount = Get-ObjectPropertyValue $playbackSummary "wrap_count"
 $invalidLooped = $false
-if (-not $LaunchOnlyProbe) {
-    if ($null -ne $loopWrappedRaw -and [int]$loopWrappedRaw -ne 0) {
-        $invalidLooped = $true
-        $validationFailures += "INVALID_LOOPED: the playback timeline wrapped (wrapped=1, total_frames=$loopTotalFrames clip_seconds=$loopClipSeconds); a looped short clip is never playback evidence."
-    }
-    if ($null -ne $loopClipSeconds -and [double]$loopClipSeconds -gt 0 -and
-        [double]$loopClipSeconds -lt [Math]::Max($script:GuiSmokeMinClipSeconds, $Seconds)) {
-        $invalidLooped = $true
-        $validationFailures += "INVALID_LOOPED: the app reports clip_seconds=$loopClipSeconds, under max($($script:GuiSmokeMinClipSeconds), window=$Seconds)."
-    }
+$gateFrames = Get-ObjectPropertyValue $clipLengthGate "frames"
+$loopVerdict = Get-GuiSmokeLoopVerdict -Summary $playbackSummary -WindowSeconds $Seconds -LaunchOnlyProbe ([bool]$LaunchOnlyProbe) -ClipFrames $(if ($null -ne $gateFrames) { [int64]$gateFrames } else { [int64]0 })
+if (-not $LaunchOnlyProbe -and $null -ne $playbackSummary -and ($null -eq $loopWrappedRaw -or $null -eq $loopWrapCount)) {
+    # A binary that predates the wrap fields cannot report its own wraps; only the header-based checks
+    # (presented frames vs the clip's frame count, last before first) stand in for the app's signal.
+    $validationWarnings += "BACKSTOP_FIELDS_MISSING: playback_smoke.summary carries no wrapped/wrap_count (a build that predates PLAYBACK-CLIP-LENGTH-ENFORCE-1 round 2); wrap detection fell back to the header-based checks only."
+}
+if ($loopVerdict.invalid) {
+    $invalidLooped = -not $LaunchOnlyProbe
+    $validationFailures += $loopVerdict.failures
+}
+if ($LaunchOnlyProbe -and ($playbackStartLine -or $summaryLine)) {
+    $validationFailures += "LAUNCH_ONLY_PROBE_PLAYED: the app logged a playback session during a launch-only probe."
 }
 if (-not $LaunchOnlyProbe) {
     if ($null -eq $presentedFrames) {
@@ -2774,14 +2778,15 @@ $result = [pscustomobject]@{
         }
     }
     # PLAYBACK-CLIP-LENGTH-ENFORCE-1: what the length gate decided before launch and what the app's
-    # own summary said afterwards (wrapped/total_frames/clip_seconds). loopAllowed is true only for
-    # a -LaunchOnlyProbe, which is never playback evidence.
+    # own summary said afterwards (wrapped/wrap_count/total_frames/clip_seconds). loopAllowed is always
+    # false: no run may loop.
     clipLength = [pscustomobject]@{
         gate = $clipLengthGate.verdict
         clipSeconds = Get-ObjectPropertyValue $clipLengthGate "clipSeconds"
         requiredSeconds = Get-ObjectPropertyValue $clipLengthGate "requiredSeconds"
-        loopAllowed = [bool]$AllowLoop
+        loopAllowed = $false
         runtimeWrapped = $loopWrappedRaw
+        runtimeWrapCount = $loopWrapCount
         runtimeTotalFrames = $loopTotalFrames
         runtimeClipSeconds = $loopClipSeconds
         invalidLooped = $invalidLooped
@@ -2982,10 +2987,12 @@ if ($processExitCode -ne 0) {
     $scriptExitCode = $processExitCode
 }
 elseif ($validationFailures.Count -gt 0) {
-    foreach ($failure in $validationFailures) {
-        Write-Error $failure
-    }
+    # The exit code is assigned BEFORE the first Write-Error: under $ErrorActionPreference = "Stop" the
+    # first Write-Error terminates the script, which used to leave exit 43 (INVALID_LOOPED) unreachable.
     $scriptExitCode = if ($invalidLooped) { 43 } else { 2 }
+    foreach ($failure in $validationFailures) {
+        Write-Error $failure -ErrorAction Continue
+    }
 }
 }
 finally {

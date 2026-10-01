@@ -1316,8 +1316,15 @@ static int runGuiPlaybackSmoke(QApplication &app)
 
     const QCommandLineOption loopPlaybackOpt(
         QStringLiteral("loop"),
-        QStringLiteral("Loop the clip so a short clip plays continuously for the whole --seconds window (default: play once then stop)."));
+        QStringLiteral("REFUSED (owner rule 2026-09-30): no venue playback may loop. Kept declared only so the refusal is typed instead of 'unknown option'."));
     parser.addOption(loopPlaybackOpt);
+
+    // PLAYBACK-CLIP-LENGTH-ENFORCE-1 round 2: a probe that proves the app launches and opens the clip
+    // WITHOUT ever calling Play (the old launch-only probe still played the whole window).
+    const QCommandLineOption launchOnlyOpt(
+        QStringLiteral("launch-only"),
+        QStringLiteral("Open the clip and exit without ever calling Play (a launch probe: zero presented playback frames)."));
+    parser.addOption(launchOnlyOpt);
 
     const QCommandLineOption windowedOpt(
         QStringLiteral("windowed"),
@@ -1392,6 +1399,14 @@ static int runGuiPlaybackSmoke(QApplication &app)
     {
         out << parser.helpText() << "\n";
         return 0;
+    }
+
+    // PLAYBACK-CLIP-LENGTH-ENFORCE-1 round 2: looping is refused HERE, in the app, so a launch that never
+    // went through run-release-gui-smoke.ps1 (a direct exe launch) cannot loop a short clip either.
+    if (parser.isSet(loopPlaybackOpt))
+    {
+        err << "[GUI-SMOKE] ERROR: --loop is refused: no venue playback may loop a clip (owner rule 2026-09-30).\n";
+        return 2;
     }
 
     if (!parser.isSet(inputOpt))
@@ -1629,7 +1644,8 @@ static int runGuiPlaybackSmoke(QApplication &app)
     options.forceScope = parser.isSet(scopeOpt);
     options.forcePlaybackDebayer = parser.isSet(playbackDebayerOpt);
     options.disableLookAssist = parser.isSet(noLookAssistOpt);
-    options.loopPlayback = parser.isSet(loopPlaybackOpt);
+    options.loopPlayback = false;   // --loop is refused above; nothing sets this
+    options.launchOnly = parser.isSet(launchOnlyOpt);
     options.windowed = parser.isSet(windowedOpt);
     options.displayPreferSubstring = parser.value(displayPreferOpt);
     options.zebras = parser.isSet(zebrasOpt);

@@ -167,6 +167,24 @@ inline bool isContactSheetLoopWrapTransition(
     return backwardJump >= loopWidth - kOvershootToleranceFrames;
 }
 
+// PlaybackWrapRecorder -- PLAYBACK-CLIP-LENGTH-ENFORCE-1 round 2 (sol BLOCKER 4): the runtime backstop
+// against a looped clip. The AUTHORITATIVE signal is noteEngineWrap(), called from the engine's own wrap
+// branches in MainWindow::playbackHandling (the Loop branch that jumps the slider back to cutIn, and
+// advanceDropFrameTick's `wrapped` result). The presented-frame heuristic (noteInferredWrap(), from
+// isContactSheetLoopWrapTransition) is kept only as a SECOND signal: it misses a genuine wrap whenever
+// dropped frames near the boundary make the last presented frame lie more than 8 frames short of the
+// range end (e.g. 700 -> 0 over a 0..719 range jumps back by 700, under the 711 threshold).
+// wrapped() is true if EITHER fired, so a wrap can never escape on the strength of the heuristic alone.
+struct PlaybackWrapRecorder
+{
+    int engineWraps = 0;
+    bool inferredWrap = false;
+
+    void noteEngineWrap() { ++engineWraps; }
+    void noteInferredWrap() { inferredWrap = true; }
+    bool wrapped() const { return engineWraps > 0 || inferredWrap; }
+};
+
 } // namespace playback_frame_range
 
 #endif // PLAYBACKFRAMERANGE_H

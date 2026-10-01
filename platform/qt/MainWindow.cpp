@@ -2816,7 +2816,25 @@ MainWindow::MainWindow(int &argc, char **argv, QWidget *parent) :
                 const bool autoplayLoop = qEnvironmentVariableIntValue( "MLVAPP_AUTOPLAY_LOOP" ) > 0;
                 QTimer::singleShot( autoplaySettleMs, this, [this, autoplaySeconds, autoplayExit, autoplayLoop]()
                 {
-                    if( autoplayLoop && !ui->actionLoop->isChecked() ) ui->actionLoop->trigger();
+                    // PLAYBACK-CLIP-LENGTH-ENFORCE-1 round 2 (owner rule 2026-09-30): the autoplay hook
+                    // never loops (MLVAPP_AUTOPLAY_LOOP is ignored, loud) and never plays a clip under
+                    // 20 s or one that cannot outlast the autoplay window.
+                    if( autoplayLoop )
+                        logInteractionEvent( QStringLiteral("autoplay.loop_ignored"),
+                            QStringLiteral("reason=no_venue_playback_may_loop") );
+                    const int autoplayFrames = m_pMlvObject ? static_cast<int>( getMlvFrames( m_pMlvObject ) ) : 0;
+                    const double autoplayFps = m_pMlvObject ? static_cast<double>( getMlvFramerate( m_pMlvObject ) ) : 0.0;
+                    const double autoplayClipSeconds =
+                        ( autoplayFrames > 0 && autoplayFps > 0.0 ) ? autoplayFrames / autoplayFps : 0.0;
+                    if( autoplayClipSeconds < qMax( 20.0, static_cast<double>( autoplaySeconds ) ) )
+                    {
+                        logInteractionEvent( QStringLiteral("autoplay.refused"),
+                            QStringLiteral("reason=CLIP_TOO_SHORT clip_seconds=%1 window_seconds=%2")
+                                .arg( autoplayClipSeconds, 0, 'f', 3 ).arg( autoplaySeconds ) );
+                        if( autoplayExit ) QTimer::singleShot( 400, this, [](){ qApp->quit(); } );
+                        return;
+                    }
+                    if( ui->actionLoop->isChecked() ) ui->actionLoop->trigger();
                     if( !ui->actionPlay->isChecked() ) ui->actionPlay->trigger();
                     logInteractionEvent( QStringLiteral("autoplay.play"),
                         QStringLiteral("seconds=%1 playing=%2")
@@ -8732,6 +8750,66 @@ int MainWindow::runGuiPlaybackSmoke(const GuiPlaybackSmokeOptions & options)
         return 4;
     }
 
+    // PLAYBACK-CLIP-LENGTH-ENFORCE-1 round 2: a launch-only probe opens the clip and returns. It NEVER
+    // reaches the Play trigger, the Look Assist warm-up play, or anything else below (sol B2).
+    if( options.launchOnly )
+    {
+        qInfo().noquote() << QStringLiteral(
+            "gui_smoke.launch_only played=0 presented_frames=0 frames=%1" )
+            .arg( getMlvFrames( m_pMlvObject ) );
+        return 0;
+    }
+
+    // PLAYBACK-CLIP-LENGTH-ENFORCE-1 round 2 (owner rule 2026-09-30): the app's own length gate, for a
+    // launch that bypassed tools/profiling/run-release-gui-smoke.ps1 (a direct exe launch). The clip must
+    // be at least 20 s and must outlast the play window measured from --start-frame; path-free message.
+    {
+        const int guardFrames = static_cast<int>( getMlvFrames( m_pMlvObject ) );
+        const double guardFps = static_cast<double>( getMlvFramerate( m_pMlvObject ) );
+        const double guardClipSeconds =
+            ( guardFrames > 0 && guardFps > 0.0 ) ? guardFrames / guardFps : 0.0;
+        const double guardWindowSeconds = qMax( 100, options.durationMs ) / 1000.0;
+        const double guardRemainingSeconds = guardFps > 0.0
+            ? guardClipSeconds - qMax( 0, options.startFrame ) / guardFps
+            : 0.0;
+        const double guardRequiredSeconds = qMax( 20.0, guardWindowSeconds );
+        if( guardClipSeconds < 20.0 || guardRemainingSeconds < guardWindowSeconds )
+        {
+            err << "[GUI-SMOKE] ERROR: CLIP_TOO_SHORT (clip="
+                << QString::number( guardRemainingSeconds < guardClipSeconds
+                                        ? guardRemainingSeconds : guardClipSeconds, 'f', 3 )
+                << " window=" << QString::number( guardRequiredSeconds, 'f', 3 ) << ")\n";
+            return 14;
+        }
+    }
+    // The lifecycle-stress leg switches to a SECOND clip mid-play, which is played too: read its MLVI
+    // header (mlv_file_hdr_t: frame count @36, fps nom/denom @44/@48) and apply the 20 s floor. A spanned
+    // or unreadable header is refused fail-closed (the runner sums spanned sets; a direct launch need not).
+    if( options.exerciseClipLifecycleStress
+     && QFileInfo( options.stressSwitchInputPath ).absoluteFilePath()
+            != inputInfo.absoluteFilePath() )
+    {
+        QFile stressHeaderFile( options.stressSwitchInputPath );
+        QByteArray stressHeader;
+        if( stressHeaderFile.open( QIODevice::ReadOnly ) ) stressHeader = stressHeaderFile.read( 52 );
+        const auto u16 = [&stressHeader]( int at ) -> quint32 {
+            return static_cast<quint8>( stressHeader[at] )
+                 | ( static_cast<quint32>( static_cast<quint8>( stressHeader[at + 1] ) ) << 8 );
+        };
+        const auto u32 = [&u16]( int at ) -> quint32 { return u16( at ) | ( u16( at + 2 ) << 16 ); };
+        const bool stressHeaderOk = stressHeader.size() == 52 && stressHeader.startsWith( "MLVI" );
+        const double stressFps = stressHeaderOk && u32( 48 ) > 0
+            ? u32( 44 ) / static_cast<double>( u32( 48 ) ) : 0.0;
+        const double stressSeconds = stressFps > 0.0 ? u32( 36 ) / stressFps : 0.0;
+        if( !stressHeaderOk || u16( 26 ) > 1 || stressSeconds < 20.0 )
+        {
+            err << "[GUI-SMOKE] ERROR: "
+                << ( stressHeaderOk && u16( 26 ) <= 1 ? "CLIP_TOO_SHORT" : "CLIP_LENGTH_UNKNOWN" )
+                << " (stress switch clip)\n";
+            return 14;
+        }
+    }
+
     if( !options.receiptPath.isEmpty() )
     {
         ReceiptSettings receipt;
@@ -9162,11 +9240,10 @@ int MainWindow::runGuiPlaybackSmoke(const GuiPlaybackSmokeOptions & options)
     preambleClock.start();
     m_playbackSmokeTargetPresentedFrames =
         qMax( 0, options.targetPresentedFrames );
-    // RULE 2026-06-26 (Layi): with --loop, check actionLoop BEFORE Play so a short clip (e.g. 16 frames)
-    // replays continuously and actionPlay stays checked for the whole durationMs window -- otherwise the
-    // clip plays once, the engine unchecks Play at clip-end, and the wait loop below exits early ("MLV
-    // playback stopping too early"). Frame-matched A/B callers omit --loop so both legs stop on the same frame.
-    if( options.loopPlayback && !ui->actionLoop->isChecked() ) ui->actionLoop->trigger();
+    // OWNER RULE 2026-09-30 SUPERSEDES the 2026-06-26 "loop short clips" rule that lived here: a venue
+    // playback never loops. Loop is forced OFF before the measured Play, so a persisted GUI Loop setting
+    // cannot loop it either (the Look Assist warm-up above restores the persisted state afterwards).
+    if( ui->actionLoop->isChecked() ) ui->actionLoop->trigger();
 
     // UM-DISPLAY-SELECT-AND-LOG-1: a leg must never silently benchmark whatever screen the
     // window's persisted geometry happened to leave it on -- log every attached display,
@@ -9331,6 +9408,25 @@ int MainWindow::runGuiPlaybackSmoke(const GuiPlaybackSmokeOptions & options)
     // cannot count against the measured interval.
     m_playbackSmokeFullscreenLostCount = 0;
     m_playbackSmokeFullscreenLossLatchArmed = true;
+
+    // PLAYBACK-CLIP-LENGTH-ENFORCE-1 round 2: the footage that will actually PLAY is the cut range (a
+    // receipt can carry a narrow In/Out) from the current position to Out, not the whole clip. With Loop
+    // forced off it would stop early, i.e. play a short range -- refuse before Play, path-free.
+    {
+        const double rangeFps = static_cast<double>( getMlvFramerate( m_pMlvObject ) );
+        const double playableSeconds = rangeFps > 0.0
+            ? ( ui->spinBoxCutOut->value() - ui->horizontalSliderPosition->value() ) / rangeFps   // frames pos..Out-1, as the gate counts
+            : 0.0;
+        const double windowSeconds = qMax( 100, options.durationMs ) / 1000.0;
+        if( playableSeconds < windowSeconds )
+        {
+            m_playbackSmokeFullscreenLossLatchArmed = false;
+            err << "[GUI-SMOKE] ERROR: CLIP_TOO_SHORT (cut range: playable="
+                << QString::number( playableSeconds, 'f', 3 )
+                << " window=" << QString::number( windowSeconds, 'f', 3 ) << ")\n";
+            return 14;
+        }
+    }
 
     ui->actionPlay->trigger();
     qApp->processEvents( QEventLoop::AllEvents );
@@ -9561,9 +9657,7 @@ int MainWindow::runGuiPlaybackSmoke(const GuiPlaybackSmokeOptions & options)
             return false;
         }
 
-        if( !options.loopPlayback && ui->actionLoop->isChecked() )
-            ui->actionLoop->trigger();
-        else if( options.loopPlayback && !ui->actionLoop->isChecked() )
+        if( ui->actionLoop->isChecked() )   // never loops (owner rule 2026-09-30)
             ui->actionLoop->trigger();
         if( !ui->actionPlay->isChecked() )
         {
@@ -10892,6 +10986,8 @@ void MainWindow::playbackHandling(int timeDiff)
                     ? requestedCutInFrame
                     : clampedCutInFrame;
                 //Loop, goto cut in
+                // PLAYBACK-CLIP-LENGTH-ENFORCE-1 round 2: THE engine wrap -- counted here, not inferred.
+                m_playbackWrapRecorder.noteEngineWrap();
                 m_playbackInternalSliderAdvance = true;
                 ui->horizontalSliderPosition->setValue( cutInFrame );
                 m_playbackInternalSliderAdvance = false;
@@ -10940,6 +11036,8 @@ void MainWindow::playbackHandling(int timeDiff)
                         ui->spinBoxCutIn->value(), ui->spinBoxCutOut->value(),
                         ui->actionLoop->isChecked() );
                 m_newPosDropMode = dropFrameTick.position;
+                // PLAYBACK-CLIP-LENGTH-ENFORCE-1 round 2: the drop-frame engine wrap, counted where it happens.
+                if( dropFrameTick.wrapped ) m_playbackWrapRecorder.noteEngineWrap();
                 //Sync audio
                 if( dropFrameTick.wrapped && ui->actionAudioOutput->isChecked() )
                 {
@@ -23828,6 +23926,9 @@ void MainWindow::beginPlaybackSmokeTelemetry( void )
     m_playbackSmokeParityMatchCount = 0;
     m_playbackSmokeFirstPresentedFrame = -1;
     m_playbackSmokeLastPresentedFrame = -1;
+    // Per-session flag (the contact-sheet span reads it). The engine wrap recorder is NOT reset here: it
+    // is process-cumulative, so a wrap during a warm-up play (Look Assist Auto-warmup settle) still
+    // reaches the summary's wrapped=/wrap_count= fields.
     m_playbackSmokeWrapped = false;
     m_playbackSmokeStartRequestSerial = m_nextRenderRequestSerial;
     m_playbackSmokeStartDecodeRequestsIssued =
@@ -24172,7 +24273,10 @@ void MainWindow::notePlaybackSmokePresentedFrame(
             static_cast<int>( displayFrame ) ) )
     {
         m_playbackSmokeWrapped = true;
+        m_playbackWrapRecorder.noteInferredWrap();   // second signal only; see PlaybackWrapRecorder
     }
+    // The engine's own wrap count (playbackHandling) is the authority; the inference above can only add.
+    if( m_playbackWrapRecorder.engineWraps > 0 ) m_playbackSmokeWrapped = true;
 
     m_playbackSmokeLastPresentedTime = now;
     m_playbackSmokeLastPresentedFrame = static_cast<int>( displayFrame );
@@ -26704,7 +26808,7 @@ void MainWindow::finishPlaybackSmokeTelemetry( const char *reason )
                "gpu_texture_route_scale_clamp_active=%65 "
                "gpu_texture_route_scale_clamp_requested_scale=%66 "
                "screensaver_blocked_count=%67 "
-               "wrapped=%68 total_frames=%69 clip_seconds=%70" )
+               "wrapped=%68 total_frames=%69 clip_seconds=%70 wrap_count=%71" )
                .arg( static_cast<qulonglong>( m_playbackSmokeSessionId ) )
                .arg( QString::fromLatin1( reason ? reason : "unknown" ) )
                .arg( elapsedMs, 0, 'f', 3 )
@@ -26789,9 +26893,10 @@ void MainWindow::finishPlaybackSmokeTelemetry( const char *reason )
                // PLAYBACK-CLIP-LENGTH-ENFORCE-1 (owner rule 2026-09-30): the runtime backstop. A
                // venue playback leg never loops a short clip; the runner turns wrapped=1 into
                // INVALID_LOOPED and never a PASS, whatever the pre-launch length check said.
-               .arg( bool01( m_playbackSmokeWrapped ) )
+               .arg( bool01( m_playbackWrapRecorder.wrapped() ) )
                .arg( smokeClipTotalFrames )
-               .arg( smokeClipSeconds, 0, 'f', 3 );
+               .arg( smokeClipSeconds, 0, 'f', 3 )
+               .arg( m_playbackWrapRecorder.engineWraps );
 
     qInfo().noquote()
         << QStringLiteral(
@@ -27418,16 +27523,17 @@ void MainWindow::finishPlaybackSmokeTelemetry( const char *reason )
         << QStringLiteral(
                "playback_smoke.gate session=%1 verdict=%2 frames_presented=%3 "
                "decode_requests_issued=%4 parity_match_count=%5 frames_expected=%6 "
-               "wrapped=%7 total_frames=%8 clip_seconds=%9" )
+               "wrapped=%7 total_frames=%8 clip_seconds=%9 wrap_count=%10" )
                .arg( static_cast<qulonglong>( m_playbackSmokeSessionId ) )
                .arg( static_cast<int>( gateVerdict ) )
                .arg( m_playbackSmokePresentedFrames )
                .arg( static_cast<qulonglong>( decodeRequestsIssuedDelta ) )
                .arg( m_playbackSmokeParityMatchCount )
                .arg( m_playbackSmokeTargetPresentedFrames )
-               .arg( bool01( m_playbackSmokeWrapped ) )
+               .arg( bool01( m_playbackWrapRecorder.wrapped() ) )
                .arg( smokeClipTotalFrames )
-               .arg( smokeClipSeconds, 0, 'f', 3 );
+               .arg( smokeClipSeconds, 0, 'f', 3 )
+               .arg( m_playbackWrapRecorder.engineWraps );
 
     // Window foreground state at session begin and at this gate, plus how many times the
     // whole application lost the OS foreground during the session (event-driven via

@@ -242,3 +242,92 @@ TEST( PlaybackFrameRange, LoopWrapTransitionAcceptsTheDropFrameOvershootCase )
         /*loopActive=*/true, /*cutInFrame=*/0, /*cutOutFrame=*/60,
         /*lastPresentedFrame=*/58, /*displayFrame=*/1 ) );
 }
+
+// ---- PLAYBACK-CLIP-LENGTH-ENFORCE-1 round 2 (sol BLOCKER 4): the wrap is RECORDED where it happens ----
+//
+// The presented-frame heuristic misses a genuine wrap when dropped frames leave the last presented
+// frame short of the range end: over 0..719 a presented 700 followed by a presented 0 jumps back by
+// 700, under the 711 (width 719 - tolerance 8) threshold. The engine's own wrap branch cannot miss it.
+
+TEST( PlaybackWrapRecorder, DroppedFramesBeforeTheWrapStillRecordAnEngineWrap )
+{
+    const int cutIn = 1, cutOut = 720;               // spin-box values (1-based): frames 0..719
+    playback_frame_range::PlaybackWrapRecorder recorder;
+
+    // The last presented frame is 700; the next drop-frame tick advances 19 frames at once (the 19
+    // in between are dropped), carrying the position to the range end, so the engine wraps to 0.
+    const playback_frame_range::DropFrameTickResult tick =
+        playback_frame_range::advanceDropFrameTick( 700.0, 19.0, cutIn, cutOut, /*loopEnabled=*/true );
+    ASSERT_TRUE( tick.wrapped );
+    ASSERT_EQ( 0, static_cast<int>( tick.position ) );
+    if( tick.wrapped ) recorder.noteEngineWrap();   // exactly what MainWindow::playbackHandling does
+
+    // The heuristic alone (the r1 backstop) calls this "not a wrap": that is the escape.
+    ASSERT_FALSE( playback_frame_range::isContactSheetLoopWrapTransition(
+        /*loopActive=*/true, cutIn - 1, cutOut - 1,
+        /*lastPresentedFrame=*/700, /*displayFrame=*/static_cast<int>( tick.position ) ) );
+    ASSERT_FALSE( recorder.inferredWrap );
+
+    // The recorder reports wrapped=1 regardless.
+    ASSERT_TRUE( recorder.wrapped() );
+    ASSERT_EQ( 1, recorder.engineWraps );
+}
+
+TEST( PlaybackWrapRecorder, ALongLoopingRunCountsEveryWrapItMakes )
+{
+    const int cutIn = 1, cutOut = 720;
+    playback_frame_range::PlaybackWrapRecorder recorder;
+    double position = 0.0;
+    int wrapsSeen = 0;
+    // 1.7 frames per tick (a fast host dropping frames): 1300 ticks cover ~2210 frames = ~3 laps of 719.
+    for( int tick = 0; tick < 1300; ++tick )
+    {
+        const playback_frame_range::DropFrameTickResult step =
+            playback_frame_range::advanceDropFrameTick( position, 1.7, cutIn, cutOut, true );
+        position = step.position;
+        if( step.wrapped ) { recorder.noteEngineWrap(); ++wrapsSeen; }
+    }
+    ASSERT_EQ( 3, wrapsSeen );
+    ASSERT_EQ( 3, recorder.engineWraps );
+    ASSERT_TRUE( recorder.wrapped() );
+}
+
+TEST( PlaybackWrapRecorder, ARunThatNeverReachesTheEndOrCannotLoopRecordsNothing )
+{
+    const int cutIn = 1, cutOut = 720;
+    playback_frame_range::PlaybackWrapRecorder shortRun;   // 24 s of a 30 s clip: never reaches the end
+    double position = 0.0;
+    for( int tick = 0; tick < 340; ++tick )
+    {
+        const playback_frame_range::DropFrameTickResult step =
+            playback_frame_range::advanceDropFrameTick( position, 1.7, cutIn, cutOut, true );
+        position = step.position;
+        if( step.wrapped ) shortRun.noteEngineWrap();
+    }
+    ASSERT_FALSE( shortRun.wrapped() );
+
+    playback_frame_range::PlaybackWrapRecorder noLoop;      // Loop off: clamps at the last frame, no wrap
+    position = 700.0;
+    for( int tick = 0; tick < 50; ++tick )
+    {
+        const playback_frame_range::DropFrameTickResult step =
+            playback_frame_range::advanceDropFrameTick( position, 19.0, cutIn, cutOut, false );
+        position = step.position;
+        if( step.wrapped ) noLoop.noteEngineWrap();
+    }
+    ASSERT_FALSE( noLoop.wrapped() );
+    ASSERT_EQ( 719, static_cast<int>( position ) );
+}
+
+TEST( PlaybackWrapRecorder, TheHeuristicCanStillAddASignalButNeverRemoveOne )
+{
+    playback_frame_range::PlaybackWrapRecorder recorder;
+    recorder.noteInferredWrap();
+    ASSERT_TRUE( recorder.wrapped() );
+    ASSERT_EQ( 0, recorder.engineWraps );
+
+    playback_frame_range::PlaybackWrapRecorder engineOnly;
+    engineOnly.noteEngineWrap();
+    ASSERT_TRUE( engineOnly.wrapped() );
+    ASSERT_FALSE( engineOnly.inferredWrap );
+}
