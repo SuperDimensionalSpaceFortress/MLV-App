@@ -132,7 +132,7 @@ class ReceiptOracleFunctionTests(unittest.TestCase):
             "a launcher kill is forgiven": ("if ($KilledByLauncher) {", "if ($false) {"),
             "a missing exit code is forgiven": ("} elseif ($null -eq $ExitCode) {", "} elseif ($false) {"),
             "a non-zero exit is forgiven": ("} elseif ([int]$ExitCode -ne 0) {", "} elseif ($false) {"),
-            "the receipt oracle is skipped": ("if ($performed) {", "if ($false) {"),
+            "the receipt oracle is skipped": ("$failures += @($loop.failures)", "$null = @($loop.failures)"),
             "the verdict is never invalid": ("invalid = ($failures.Count -gt 0); failures = $failures; exitCode = 43",
                                              "invalid = $false; failures = $failures; exitCode = 43"),
         }
@@ -201,7 +201,9 @@ class ReceiptReadersTests(unittest.TestCase):
             "fps_override_active": False, "play_wrap_count": 0, "programmatic_play_admitted": 1}})
         self.assertEqual(summary["source_advanced"], 480)
         self.assertEqual(summary["fps_override"], 0)
-        self.assertTrue(summary["play_performed"])
+        self.assertEqual(summary["wrapped"], 0)          # derived from play_wrap_count; absent when that is absent
+        self.assertEqual(summary["play_admitted"], 1)
+        self.assertNotIn("play_performed", summary)       # ENFORCE-4: the reader never infers `not played`
 
     def test_a_missing_or_metadata_less_receipt_reads_as_none_and_is_invalid(self) -> None:
         self.assertIsNone(self._profile_summary({"frames": []}))
@@ -209,13 +211,15 @@ class ReceiptReadersTests(unittest.TestCase):
                      "(Get-GuiSmokeEvidencePlayVerdict -Summary $s -ExitCode 0).invalid")
         self.assertEqual(proc.stdout.strip(), "True", proc.stdout + proc.stderr)
 
-    def test_a_profile_that_never_played_claims_no_footage(self) -> None:
+    def test_a_play_capable_profile_that_admitted_nothing_is_invalid_not_not_played(self) -> None:
+        # ENFORCE-4: this wrapper only reads the receipt of a PLAY-CAPABLE profile, so nothing admitted is not "a profile
+        # that never played" (the ENFORCE-3 reading, which let a master-era receipt through) -- it is INVALID.
         summary = self._profile_summary({"metadata": {"programmatic_play_admitted": 0, "required_source_frames": 0}})
-        self.assertFalse(summary["play_performed"])
+        self.assertEqual(summary["play_admitted"], 0)
         path = self.tmp / "profile.json"
         proc = _pwsh(f". {_q(GATE)}; $s = Get-GuiSmokeProfileReceiptSummary -Path {_q(path)}; "
-                     "(Get-GuiSmokeEvidencePlayVerdict -Summary $s -ExitCode 0).invalid")
-        self.assertEqual(proc.stdout.strip(), "False", proc.stdout + proc.stderr)
+                     "(Get-GuiSmokeEvidencePlayVerdict -Summary $s -ExitCode 0 -RequireAdmission $true).invalid")
+        self.assertEqual(proc.stdout.strip(), "True", proc.stdout + proc.stderr)
 
     def test_a_profile_receipt_that_predates_enforce_3_is_invalid_when_it_played(self) -> None:
         self._profile_summary({"metadata": {"programmatic_play_admitted": 1}})
@@ -695,10 +699,12 @@ class CounterWritePinTests(unittest.TestCase):
                 ("&& playback_frame_range::lookAssistSettleNeedsOwnPlay( m_programmaticPlayLedger.admitted ) )", ")"),
             "the smoke loop no longer breaks on a too-slow pace":
                 ("         || measuredState == playback_frame_range::PlayStopState::PaceTooSlow\n", ""),
-            "the autoplay verdict is no longer latched":
-                ("m_automationVerdictExitCode = autoplayState == playback_frame_range::PlayStopState::Reached ? 0 : 14;", ""),
+            "the autoplay verdict is no longer resolved":
+                ("m_automationVerdict.resolve( autoplayState );", ""),
             "the autoplay refusal is no longer latched":
-                ("m_automationVerdictExitCode = 14;\n", ""),
+                ("m_automationVerdict.fail();\n", ""),
+            "the autoplay verdict is no longer armed":
+                ("m_automationVerdict.armPending();", ""),
         }
         for name, (old, new) in cases.items():
             with self.subTest(name):

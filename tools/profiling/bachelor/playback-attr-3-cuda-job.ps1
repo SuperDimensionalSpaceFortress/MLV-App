@@ -1795,13 +1795,12 @@ if ((Get-Sha $exePath 'deployed-exe-hash') -ne $cacheExeSha -or (Get-Sha $reconD
 Write-JobTrace 'step deploy done'
 
 reg add "HKCU\Software\Microsoft\DirectX\UserGpuPreferences" /v "$exePath" /t REG_SZ /d "GpuPreference=2;" /f | Out-Null
-reg add "HKCU\Software\magiclantern.MLVApp\MLVApp" /v playbackProcessingSubset /t REG_DWORD /d 1 /f | Out-Null
-reg add "HKCU\Software\magiclantern.MLVApp\MLVApp" /v zebras /t REG_DWORD /d 0 /f | Out-Null
-reg add "HKCU\Software\magiclantern.MLVApp\MLVApp" /v caching /t REG_DWORD /d 0 /f | Out-Null
-reg add "HKCU\Software\magiclantern.MLVApp\MLVApp\Playback" /v QualityMode /t REG_DWORD /d 1 /f | Out-Null
-reg add "HKCU\Software\magiclantern.MLVApp\MLVApp\Playback" /v PreviewMode /t REG_DWORD /d 0 /f | Out-Null
-reg add "HKCU\Software\magiclantern.MLVApp\MLVApp\Playback" /v ScaleFactorOverride /t REG_DWORD /d 0 /f | Out-Null
-reg add "HKCU\Software\magiclantern.MLVApp\MLVApp\Playback" /v PreviewResolution /t REG_DWORD /d 0 /f | Out-Null
+# PLAYBACK-CLIP-LENGTH-ENFORCE-4 (ATTR3-DEAD-REGISTRY-SEED-1): this job used to seed seven app settings under the
+# venue's HKCU app key. An automation run (the smoke the job launches) reads a RUN-SCOPED settings store and never
+# that key, so the seeds changed nothing but the venue's own saved settings. Every value it wrote is what the app
+# already uses: processing subset (the runner/app option default is Subset), zebras and caching off, QualityMode 1
+# (HighQuality), PreviewMode 0 (SharpSmooth), ScaleFactorOverride 0 (auto), PreviewResolution 0 (Auto) -- pinned in
+# tools/repo_hygiene/test_playback_evidence_completeness.py against the app's compiled defaults.
 
 # UM-DISPLAY-SELECT-AND-LOG-1 item 2/2a: the Windows view of every active display, captured before
 # any measurement (the CPU quiescence sample below, then the smoke run) -- independent of Qt, and

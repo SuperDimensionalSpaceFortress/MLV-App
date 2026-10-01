@@ -5785,11 +5785,27 @@ function Get-AttrCudaSourceFramesVerdict {
     if ($fields.Count -eq 0) {
         $failures += 'INVALID_SOURCE_FRAMES: the run produced no playback_smoke.summary for the measured session, so no source frames can be proven.'
     } elseif ($null -eq $advanced -or $null -eq $required) {
-        $failures += 'INVALID_SOURCE_FRAMES: playback_smoke.summary carries no source_advanced / required_source_frames (a build that predates ENFORCE-3); the footage played cannot be proven.'
+        $failures += 'INVALID_SOURCE_FRAMES: RECEIPT_FIELD_ABSENT: playback_smoke.summary carries no source_advanced / required_source_frames (a build that predates ENFORCE-3); the footage played cannot be proven.'
     } elseif ($required -le 0) {
         $failures += "INVALID_SOURCE_FRAMES: required_source_frames=$required; the admitted window is unknown."
     } elseif ($advanced -lt $required) {
         $failures += "INVALID_SOURCE_FRAMES: the engine advanced source_advanced=$advanced distinct source frames but the Play had to consume required_source_frames=$required; under 20 s of real footage is never playback evidence."
+    }
+    # ENFORCE-4: the oracle re-derives the 20 s floor itself (see Get-GuiSmokeSourceFramesVerdict): a requirement under
+    # ceil(20 s x native fps) was admitted for less than 20 s of footage, and a native fps of 0 cannot measure 20 s.
+    if ($fields.ContainsKey('native_fps')) {
+        $nativeForFloor = [double]::Parse($fields['native_fps'], [Globalization.CultureInfo]::InvariantCulture)
+        if ($nativeForFloor -le 0) {
+            $failures += "INVALID_SOURCE_FRAMES: native_fps=$nativeForFloor; the native frame rate is unknown, so 20 s of footage cannot be measured."
+        } elseif ($null -ne $required -and $required -gt 0 -and $required -lt [int64][Math]::Ceiling(20.0 * $nativeForFloor - 0.02)) {
+            $failures += "INVALID_SOURCE_FRAMES: required_source_frames=$required is under ceil(20 s x native_fps=$nativeForFloor); the Play was admitted for less than 20 s of footage."
+        }
+    }
+    # ENFORCE-4: evidence is valid only when EVERY field the oracle judges is PRESENT. A summary that does not carry the
+    # pace / override / wrap fields (a build that predates them) is INVALID, not "no override" / "pace unchecked" / "no wrap".
+    $absentFields = @('native_fps', 'pace_fps', 'fps_override', 'wrapped', 'wrap_count' | Where-Object { $fields.Count -gt 0 -and -not $fields.ContainsKey($_) })
+    if ($absentFields.Count -gt 0) {
+        $failures += "INVALID_SOURCE_FRAMES: RECEIPT_FIELD_ABSENT: playback_smoke.summary carries no $($absentFields -join ' / '); the run's pace, override and wrapping cannot be proven."
     }
     if ($fields.Count -gt 0 -and $fields.ContainsKey('fps_override') -and [int]$fields['fps_override'] -ne 0) {
         $failures += 'INVALID_SOURCE_FRAMES: the run was paced by a persisted fps override; evidence is paced at the footage native fps.'

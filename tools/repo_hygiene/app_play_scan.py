@@ -38,6 +38,8 @@ from __future__ import annotations
 import re
 
 PLAY_SOURCES = ("platform/qt/MainWindow.cpp", "platform/qt/main.cpp")
+# ENFORCE-4: the header is scanned for the pinned members only (see PINNED_HEADER_USES), never by the whole-text Play scans.
+HEADER_SOURCE = "platform/qt/MainWindow.h"
 
 # Every programmaticPlay( call site, with how many times it may appear and the COMPLETE (whitespace-normalised)
 # REQUESTED-window expression it passes. A NEW site, a duplicated site, or ANY change to the request expression --
@@ -98,8 +100,12 @@ PINNED_STOP_STATEMENTS = {
         "autoplayPoll->deleteLater(); if( ui->actionPlay->isChecked() ) { ui->actionPlay->setChecked( false ); "
         "on_actionPlay_triggered( false ); }",
         "isolateAutomationPacing( \"autoplay\" );",
-        "m_automationVerdictExitCode = autoplayState == playback_frame_range::PlayStopState::Reached ? 0 : 14;",
-        "m_automationVerdictExitCode = 14; if( autoplayExit ) QTimer::singleShot( 400, this, [](){ qApp->quit(); } ); return;",
+        # ENFORCE-4: the autoplay verdict is a fail-closed latch -- armed failing when the hook is requested (before
+        # the clip opens), cleared ONLY by resolve( Reached ) after the engine consumed the window.
+        "if( qEnvironmentVariableIntValue( \"MLVAPP_AUTOPLAY_SECONDS\" ) > 0 ) m_automationVerdict.armPending(); "
+        "if( argc > 1 ) {",
+        "m_automationVerdict.resolve( autoplayState );",
+        "m_automationVerdict.fail(); if( autoplayExit ) QTimer::singleShot( 400, this, [](){ qApp->quit(); } ); return;",
     ),
     "MainWindow::runHeadlessPlaybackProfile": (
         "const qint64 autoSettleSafetyMs = playback_frame_range::playSafetyMs( m_playRequestedSeconds ); "
@@ -448,6 +454,8 @@ def scan_app_play_sources(sources: dict[str, str]) -> list[str]:
 
     # ---- every file: the whole-text scans ----------------------------------------------------------------
     for path, text in sources.items():
+        if path == HEADER_SOURCE:
+            continue
         blank, keep = (main_blank, main_keep) if path == "platform/qt/MainWindow.cpp" else strip_cpp(text)
         spans = allowed_spans if path == "platform/qt/MainWindow.cpp" else []
 
@@ -513,6 +521,9 @@ def scan_app_play_sources(sources: dict[str, str]) -> list[str]:
             problems.append(f"missing Loop-off at an automation entry: {marker}")
     problems.extend(_scan_stop_sites(main_blank, main_keep))
     problems.extend(_scan_counter_writes(main_blank, main_keep))
+    problems.extend(_scan_budget_writes(main_blank))
+    problems.extend(_scan_verdict_latch(main_blank))
+    problems.extend(_scan_header_members(sources.get(HEADER_SOURCE, "")))
     problems.extend(_scan_main_pins(sources.get("platform/qt/main.cpp", "")))
     # Interactive handlers are never gated.
     for signature in ("void MainWindow::on_actionPlay_triggered(bool checked)",
@@ -662,6 +673,117 @@ def _scan_counter_writes(blank: str, keep: str) -> list[str]:
     for function, expected in PINNED_COUNTER_WRITES.items():
         if function not in found:
             problems.append(f"reviewed source-frame counter write site vanished from {function} (pin {expected})")
+    return problems
+
+
+# ENFORCE-4 (fable hardening COUNTER-PIN-SCOPE-1): the SAFETY BUDGET (m_playRequestedSeconds, which every wait derives
+# its wall-clock net from) and the engine pace (m_playPaceFps, which the admission and the receipt oracle read) are
+# written only at the two reviewed programmaticPlay sites (the adopted running Play, the admitted Play), each from the
+# gate's own values. Anywhere else -- a stray `m_playRequestedSeconds = 3600;` after the gate -- fails the scan.
+# member -> (the only allowed assignment, {function: count})
+PINNED_BUDGET_WRITES = {
+    "m_playRequestedSeconds": (re.compile(r"\s*=\s*requestedSeconds\s*;"), {"MainWindow::programmaticPlay": 2}),
+    "m_playPaceFps": (re.compile(r"\s*=\s*verdict\.paceFps\s*;"), {"MainWindow::programmaticPlay": 2}),
+}
+_SCALAR_WRITE_AFTER = re.compile(r"\s*(?:=(?!=)|[-+*/%&|^]=|<<=|>>=|\+\+|--)")
+
+
+def _scan_budget_writes(blank: str) -> list[str]:
+    problems: list[str] = []
+    if not blank:
+        return problems
+    spans = function_spans(blank)
+    for member, (allowed, pins) in PINNED_BUDGET_WRITES.items():
+        found: dict[str, int] = {}
+        for match in re.finditer(rf"\b{member}\b", blank):
+            function = _enclosing(spans, match.start())
+            line = _line_of(blank, match.start())
+            before = blank[max(0, match.start() - 24):match.start()]
+            after = blank[match.end():match.end() + 60]
+            if _ESCAPE_BEFORE.search(before):
+                problems.append(f"platform/qt/MainWindow.cpp:{line}: {member} escapes by pointer / reference / swap / increment in {function}")
+            elif _SCALAR_WRITE_AFTER.match(after):
+                if allowed.match(after):
+                    found[function] = found.get(function, 0) + 1
+                else:
+                    problems.append(f"platform/qt/MainWindow.cpp:{line}: {member} written in {function} other than the reviewed "
+                                    f"assignment: {_normalise(blank[match.start():match.start() + 70])}")
+        if found != pins:
+            problems.append(f"{member} writes are {dict(sorted(found.items()))} but the reviewed pin is {pins}")
+    return problems
+
+
+# ENFORCE-4 (fable COUNTER-PIN-SCOPE-1): the pins above scan MainWindow.cpp; the HEADER is scanned too. In
+# platform/qt/MainWindow.h every use of a pinned member is its declaration or a read-only accessor -- an inline method
+# that assigns the budget, the pace, the counter or the latch from the header would otherwise escape every write pin.
+PINNED_HEADER_USES = {
+    "m_sourceAdvance": (re.compile(r"\s*;"), 1),                                            # the declaration
+    "m_playRequiredSourceFrames": (re.compile(r"\s*=\s*0\s*;"), 1),
+    "m_playRequestedSeconds": (re.compile(r"\s*=\s*0\.0\s*;"), 1),
+    "m_playPaceFps": (re.compile(r"\s*=\s*0\.0\s*;"), 1),
+    "m_automationVerdict": (re.compile(r"\s*;|\s*\.\s*exitCode\s*\(\s*\)\s*;"), 2),      # the declaration + the exit-code accessor
+}
+
+
+def _scan_header_members(text: str) -> list[str]:
+    problems: list[str] = []
+    if not text:
+        return problems
+    blank, _ = strip_cpp(text)
+    for member, (allowed, expected) in PINNED_HEADER_USES.items():
+        found = 0
+        for match in re.finditer(rf"\b{member}\b", blank):
+            after = blank[match.end():match.end() + 40]
+            if allowed.match(after) and not _ESCAPE_BEFORE.search(blank[max(0, match.start() - 24):match.start()]):
+                found += 1
+            else:
+                problems.append(f"platform/qt/MainWindow.h:{_line_of(blank, match.start())}: {member} used in the header other than "
+                                f"its declaration / read-only accessor: {_normalise(blank[match.start():match.start() + 70])}")
+        if found != expected:
+            problems.append(f"platform/qt/MainWindow.h: {member} has {found} reviewed use(s), pinned {expected}")
+    return problems
+
+
+# ENFORCE-4 (fable/sol r2 blocker, AUTOPLAY-VERDICT-LATCH-FAIL-CLOSED-1): the autoplay verdict LATCH. It may be ARMED
+# failing once (the request, in the MainWindow constructor), FAILED once (the refusal), RESOLVED once (the poll, from
+# the engine's PlayStopState) and READ (.exitCode() / .pending()); the retired `m_automationVerdictExitCode` int -- which
+# started at 0 and was set only by the poll timer, so a close beat it -- may not come back. Anything else (an
+# assignment, an escape, a second resolve, a clear) fails the scan.
+PINNED_LATCH_CALLS = {"armPending": 1, "fail": 1, "resolve": 1}
+_LATCH_USE = re.compile(r"\bm_automationVerdict\b")
+_LATCH_READ = re.compile(r"\s*\.\s*(?:exitCode|pending)\s*\(\s*\)")
+_LATCH_CALL = re.compile(r"\s*\.\s*(armPending|fail|resolve)\s*\(")
+
+
+def _scan_verdict_latch(blank: str) -> list[str]:
+    problems: list[str] = []
+    if not blank:
+        return problems
+    spans = function_spans(blank)
+    for match in re.finditer(r"\bm_automationVerdictExitCode\b", blank):
+        problems.append(f"platform/qt/MainWindow.cpp:{_line_of(blank, match.start())}: the retired int verdict "
+                        "m_automationVerdictExitCode (set only by a timer) is back; use the fail-closed AutomationVerdictLatch")
+    calls: dict[str, int] = {}
+    for match in _LATCH_USE.finditer(blank):
+        function = _enclosing(spans, match.start())
+        line = _line_of(blank, match.start())
+        before = blank[max(0, match.start() - 12):match.start()]
+        after = blank[match.end():match.end() + 60]
+        if _ESCAPE_BEFORE.search(before):
+            problems.append(f"platform/qt/MainWindow.cpp:{line}: m_automationVerdict escapes by pointer / reference / swap in {function}")
+        elif _LATCH_READ.match(after):
+            continue
+        elif _LATCH_CALL.match(after):
+            call = _LATCH_CALL.match(after).group(1)
+            if function != "MainWindow::MainWindow":
+                problems.append(f"platform/qt/MainWindow.cpp:{line}: m_automationVerdict.{call}() in {function}; the latch is driven "
+                                "only by the autoplay hook in the MainWindow constructor")
+            calls[call] = calls.get(call, 0) + 1
+        else:
+            problems.append(f"platform/qt/MainWindow.cpp:{line}: unreviewed use of m_automationVerdict in {function}: "
+                            f"{_normalise(blank[match.start():match.start() + 70])}")
+    if calls != PINNED_LATCH_CALLS:
+        problems.append(f"m_automationVerdict calls are {dict(sorted(calls.items()))} but the reviewed pin is {PINNED_LATCH_CALLS}")
     return problems
 
 

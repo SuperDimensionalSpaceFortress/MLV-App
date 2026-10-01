@@ -403,6 +403,22 @@ function Convert-PlaybackLogLineToObject {
     [pscustomobject]$result
 }
 
+function Get-GuiSmokeAbsentReceiptFields {
+    <#
+    .SYNOPSIS
+    PLAYBACK-CLIP-LENGTH-ENFORCE-4. The receipt oracle's FIELD-ABSENCE rule: evidence is valid only when every required
+    field is PRESENT. A field a build does not write (a master-era binary writes none of the ENFORCE-1..3 fields) is
+    ABSENT -- never "not played", never "no override", never "pace unchecked", never "no wrap". Returns the names, in the
+    order given, of the -Names that -Summary does not carry (all of them for a null summary).
+    #>
+    param([AllowNull()]$Summary, [Parameter(Mandatory = $true)][string[]]$Names)
+    $missing = @()
+    foreach ($name in $Names) {
+        if ($null -eq $Summary -or -not $Summary.PSObject.Properties[$name] -or $null -eq $Summary.$name) { $missing += $name }
+    }
+    return $missing
+}
+
 function Get-GuiSmokeSourceFramesVerdict {
     <#
     .SYNOPSIS
@@ -411,8 +427,9 @@ function Get-GuiSmokeSourceFramesVerdict {
     to consume (required_source_frames = ceil(window x NATIVE fps)) on playback_smoke.summary. A receipt is
     INVALID_SOURCE_FRAMES -- never a PASS -- when the counter is absent (a build that cannot prove it), the
     requirement is unknown, source_advanced is under it, the run was paced by a persisted fps override, or the
-    engine's pace differs from the clip's native fps. Returns [pscustomobject]@{ invalid; failures;
-    sourceAdvanced; requiredSourceFrames }.
+    engine's pace differs from the clip's native fps. ENFORCE-4: EVERY field it judges must be PRESENT -- an absent
+    native_fps / pace_fps / fps_override is INVALID (RECEIPT_FIELD_ABSENT), not "no override" / "pace unchecked".
+    Returns [pscustomobject]@{ invalid; failures; sourceAdvanced; requiredSourceFrames }.
     #>
     param([AllowNull()]$Summary)
     $failures = @()
@@ -425,11 +442,26 @@ function Get-GuiSmokeSourceFramesVerdict {
     if ($null -eq $Summary) {
         $failures += "INVALID_SOURCE_FRAMES: the run produced no playback_smoke.summary, so no source frames can be proven."
     } elseif ($null -eq $advanced -or $null -eq $required) {
-        $failures += "INVALID_SOURCE_FRAMES: playback_smoke.summary carries no source_advanced / required_source_frames (a build that predates PLAYBACK-CLIP-LENGTH-ENFORCE-3); the footage played cannot be proven."
+        $missingCount = @(Get-GuiSmokeAbsentReceiptFields -Summary $Summary -Names @('source_advanced', 'required_source_frames'))
+        $failures += "INVALID_SOURCE_FRAMES: RECEIPT_FIELD_ABSENT: playback_smoke.summary carries no $($missingCount -join ' / ') (a build that predates PLAYBACK-CLIP-LENGTH-ENFORCE-3 writes neither); the footage played cannot be proven."
     } elseif ([int64]$required -le 0) {
         $failures += "INVALID_SOURCE_FRAMES: required_source_frames=$required; the admitted window is unknown."
     } elseif ([int64]$advanced -lt [int64]$required) {
         $failures += "INVALID_SOURCE_FRAMES: the engine advanced source_advanced=$advanced distinct source frames but the Play had to consume required_source_frames=$required; under 20 s of real footage is never playback evidence."
+    }
+    # ENFORCE-4: the oracle re-derives the 20 s floor itself and does not trust the app's own requirement. A receipt
+    # whose required_source_frames is under ceil(20 s x native fps) (the 0.02 absorbs the fps printed to 3 decimals) was
+    # admitted for less than 20 s of footage, and a native_fps of 0 cannot say what 20 s is.
+    if ($null -ne $Summary -and $null -ne $nativeFps -and [double]$nativeFps -le 0) {
+        $failures += "INVALID_SOURCE_FRAMES: native_fps=$nativeFps; the clip's native frame rate is unknown, so 20 s of footage cannot be measured."
+    } elseif ($null -ne $Summary -and $null -ne $nativeFps -and $null -ne $required -and [int64]$required -gt 0 -and
+              [int64]$required -lt [int64][Math]::Ceiling($script:GuiSmokeMinClipSeconds * [double]$nativeFps - 0.02)) {
+        $failures += "INVALID_SOURCE_FRAMES: required_source_frames=$required is under ceil(20 s x native_fps=$nativeFps); the Play was admitted for less than 20 s of source footage."
+    }
+    # ENFORCE-4: the pace and override fields are REQUIRED, not optional extras of a source-frame count.
+    $absent = @(Get-GuiSmokeAbsentReceiptFields -Summary $Summary -Names @('native_fps', 'pace_fps', 'fps_override'))
+    if ($null -ne $Summary -and $absent.Count -gt 0) {
+        $failures += "INVALID_SOURCE_FRAMES: RECEIPT_FIELD_ABSENT: the receipt carries no $($absent -join ' / '); a run whose pace or override cannot be read is not proven to have played the footage at its native fps."
     }
     if ($null -ne $Summary -and $null -ne $fpsOverride -and [int]$fpsOverride -ne 0) {
         $failures += "INVALID_SOURCE_FRAMES: the run was paced by a persisted fps override (fps_override=$fpsOverride); evidence is paced at the clip's native fps."
@@ -453,8 +485,8 @@ function Get-GuiSmokeLoopVerdict {
     (wrapped=1, or any wrap_count > 0 -- the count is taken in the engine's actual wrap branches and
     outranks the presented-frame heuristic behind wrapped), or when the app reports a clip shorter than
     max(20 s, window). A launch-only probe never plays, so a wrap or any presented frame there is
-    itself a failure. A binary that predates the wrap fields reports $null for each, so the app's own
-    wrap signal is silent for it; two checks that need nothing from the app then still apply, from the
+    itself a failure. A binary that predates the wrap fields reports $null for each, and since ENFORCE-4 that is
+    INVALID (RECEIPT_FIELD_ABSENT), not "no wrap". Two checks that need nothing from the app also apply, from the
     clip's header frame count (-ClipFrames, 0 = unknown): more frames presented than the clip holds, or a
     last presented frame BEFORE the first, can only mean the timeline went round again.
     #>
@@ -480,6 +512,12 @@ function Get-GuiSmokeLoopVerdict {
             $failures += "LAUNCH_ONLY_PROBE_PLAYED: a launch-only probe must present zero playback frames and never wrap (presented_frames=$presented wrapped=$wrapped wrap_count=$wrapCount)."
         }
     } else {
+        # ENFORCE-4: the app's own wrap signal must be PRESENT. A build that predates the wrap fields cannot say it did
+        # not wrap; "silent" is not "no wrap". (The header-based checks below remain as a second, independent signal.)
+        $absent = @(Get-GuiSmokeAbsentReceiptFields -Summary $Summary -Names @('wrapped', 'wrap_count'))
+        if ($absent.Count -gt 0) {
+            $failures += "INVALID_LOOPED: RECEIPT_FIELD_ABSENT: the receipt carries no $($absent -join ' / '); a run whose wrapping cannot be read is never playback evidence."
+        }
         if (($null -ne $wrapped -and [int]$wrapped -ne 0) -or
             ($null -ne $wrapCount -and [int64]$wrapCount -gt 0)) {
             $failures += "INVALID_LOOPED: the playback timeline wrapped (wrapped=$wrapped wrap_count=$wrapCount total_frames=$totalFrames clip_seconds=$clipSeconds); a looped short clip is never playback evidence."
@@ -545,8 +583,10 @@ function Read-GuiSmokePlaybackSummaryFromLogDir {
 function Get-GuiSmokeProfileReceiptSummary {
     # The profile receipt (--profile-playback --output <json>) carries the same oracle fields in its metadata; shaped
     # here like a playback_smoke.summary so ONE decision (Get-GuiSmokeLoopVerdict) judges both. $null when the receipt
-    # is missing / unreadable / has no metadata. play_performed is $false when no programmatic Play was admitted
-    # (a profile that never played claims no footage).
+    # is missing / unreadable / has no metadata. A field the receipt does not write stays ABSENT in the summary
+    # (ENFORCE-4): this reader is only ever called for a PLAY-CAPABLE profile, so an absent admission is "cannot prove
+    # it played", never "did not play" (the ENFORCE-3 reader inferred play_performed=false from it, so a master-era
+    # binary's receipt -- which has no admission field -- skipped the oracle and exited 0).
     param([Parameter(Mandatory = $true)][string]$Path)
     if (-not (Test-Path -LiteralPath $Path -PathType Leaf)) { return $null }
     try { $document = Get-Content -LiteralPath $Path -Raw | ConvertFrom-Json } catch { return $null }
@@ -561,8 +601,10 @@ function Get-GuiSmokeProfileReceiptSummary {
     }
     $override = & $get 'fps_override_active'
     if ($null -ne $override) { $summary['fps_override'] = [int][bool]$override }
+    # the receipt has the engine's wrap COUNT only; "wrapped" is derived from it, and absent when the count is absent
+    if ($summary.Contains('wrap_count')) { $summary['wrapped'] = [int]([int64]$summary['wrap_count'] -gt 0) }
     $admitted = & $get 'programmatic_play_admitted'
-    $summary['play_performed'] = ($null -ne $admitted -and [int]$admitted -gt 0)
+    if ($null -ne $admitted) { $summary['play_admitted'] = [int64]$admitted }
     return [pscustomobject]$summary
 }
 
@@ -573,7 +615,11 @@ function Get-GuiSmokeEvidencePlayVerdict {
     exitCode; summary }. invalid when the launcher had to kill the app (PLAY_SAFETY_TIMEOUT), the app did not exit
     (PLAY_NOT_FINISHED), exited non-zero (APP_EXIT_NONZERO with the typed reason), or the receipt fails
     Get-GuiSmokeLoopVerdict (no summary, no source_advanced, source_advanced < required_source_frames, a wrap, an fps
-    override, a non-native pace). exitCode is 43 for every INVALID verdict.
+    override, a non-native pace, ANY required field absent). exitCode is 43 for every INVALID verdict.
+    ENFORCE-4: there is no "not played" escape. A launcher that started the app for an evidence Play gets the
+    receipt oracle unconditionally; -RequireAdmission (the profile wrapper) additionally requires the receipt to
+    carry play_admitted and for it to be > 0 -- an absent admission is RECEIPT_FIELD_ABSENT, an admission of 0 is
+    PLAY_NOT_ADMITTED, and both are INVALID.
     #>
     param(
         [AllowNull()]$Summary,
@@ -581,7 +627,8 @@ function Get-GuiSmokeEvidencePlayVerdict {
         [bool]$KilledByLauncher = $false,
         [double]$WindowSeconds = $script:GuiSmokeMinClipSeconds,
         [int64]$ClipFrames = 0,
-        [string]$AppMessage = ''
+        [string]$AppMessage = '',
+        [bool]$RequireAdmission = $false
     )
     $failures = @()
     if ($KilledByLauncher) {
@@ -592,11 +639,17 @@ function Get-GuiSmokeEvidencePlayVerdict {
         $reason = Get-GuiSmokeRefusalReason -ExitCode ([int]$ExitCode) -Message $AppMessage
         $failures += "APP_EXIT_NONZERO: the app exited $ExitCode ($reason); a Play the app did not finish is never playback evidence."
     }
-    $performed = $true
-    if ($null -ne $Summary -and $Summary.PSObject.Properties['play_performed']) { $performed = [bool]$Summary.play_performed }
-    if ($performed) {
-        $loop = Get-GuiSmokeLoopVerdict -Summary $Summary -WindowSeconds $WindowSeconds -ClipFrames $ClipFrames
-        $failures += @($loop.failures)
+    if ($RequireAdmission) {
+        $absentAdmission = @(Get-GuiSmokeAbsentReceiptFields -Summary $Summary -Names @('play_admitted'))
+        if ($null -eq $Summary) {
+            $failures += "RECEIPT_FIELD_ABSENT: no receipt, so no Play admission can be proven."
+        } elseif ($absentAdmission.Count -gt 0) {
+            $failures += "RECEIPT_FIELD_ABSENT: the receipt carries no programmatic_play_admitted; a build that does not write it cannot prove an evidence Play was admitted."
+        } elseif ([int64]$Summary.play_admitted -le 0) {
+            $failures += "PLAY_NOT_ADMITTED: programmatic_play_admitted=$($Summary.play_admitted) on a play-capable run; nothing was played, so there is no footage to prove."
+        }
     }
+    $loop = Get-GuiSmokeLoopVerdict -Summary $Summary -WindowSeconds $WindowSeconds -ClipFrames $ClipFrames
+    $failures += @($loop.failures)
     return [pscustomobject]@{ invalid = ($failures.Count -gt 0); failures = $failures; exitCode = 43; summary = $Summary }
 }

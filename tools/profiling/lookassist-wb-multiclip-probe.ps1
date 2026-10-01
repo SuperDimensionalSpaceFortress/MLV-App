@@ -109,3 +109,12 @@ $matrix = [pscustomobject]@{ schema='mlvapp.lookassist-wb-multiclip.v1'; capture
 $matrix | ConvertTo-Json -Depth 5 | Set-Content -LiteralPath (Join-Path $OutDir 'wb-matrix.json') -Encoding UTF8
 "matrix -> $(Join-Path $OutDir 'wb-matrix.json')"
 "NOTE: a WB fix must reduce the GREEN clips' tint toward 0 WITHOUT regressing the MAGENTA/neutral clips -- diff this matrix before vs after."
+# PLAYBACK-CLIP-LENGTH-ENFORCE-4: labelling a row RUN_INVALID is not enough -- a matrix with an INVALID row is not a
+# cross-clip measurement, so the SCRIPT fails (exit 43) after the matrix and its labelled rows are written for the reader.
+$invalidRows = @($rows | Where-Object { $_.RunnerExit -ne 0 })
+if ($invalidRows.Count -gt 0) {
+    [Console]::Error.WriteLine("lookassist-wb-multiclip-probe: $($invalidRows.Count) of $($rows.Count) run(s) were not valid playback evidence (runner exit " +
+        (($invalidRows | ForEach-Object { $_.RunnerExit }) -join ', ') + "); the matrix is NOT a measurement. exit 43.")
+    exit 43
+}
+exit 0

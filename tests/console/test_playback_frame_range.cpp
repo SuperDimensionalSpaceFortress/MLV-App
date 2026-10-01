@@ -981,3 +981,64 @@ TEST( SourceFrameAdmission, ADefaultPaceMeansTheNativeFpsAndAZeroPaceFailsClosed
     ASSERT_FALSE( v.ok );                                                                          // an unusable pace
     ASSERT_EQ( std::string( "PLAY_PACE_TOO_SLOW" ), std::string( v.reason ) );
 }
+
+using playback_frame_range::AutomationVerdictLatch;
+
+// ENFORCE-4 (fable/sol r2 blocker: an autoplay closed mid-Play exited 0): the hook's exit verdict is a LATCH that is
+// armed FAILING the moment an automation Play is requested and cleared only by consumption (Reached).
+TEST( AutomationVerdictLatch, AnUnarmedLatchIsExitZeroBecauseNoAutomationPlayWasRequested )
+{
+    const AutomationVerdictLatch latch;
+    ASSERT_EQ( 0, latch.exitCode() );
+    ASSERT_FALSE( latch.pending() );
+}
+
+TEST( AutomationVerdictLatch, ARequestedPlayThatIsNeverResolvedExitsFailingNotZero )
+{
+    // The app is closed (closeEvent -> quit) before the poll timer resolves anything: still 14.
+    AutomationVerdictLatch latch;
+    latch.armPending();
+    ASSERT_EQ( 14, latch.exitCode() );
+    ASSERT_TRUE( latch.pending() );
+}
+
+TEST( AutomationVerdictLatch, OnlyReachedClearsTheLatch )
+{
+    for( PlayStopState state : { PlayStopState::Continue, PlayStopState::EndedEarly, PlayStopState::SafetyTimeout,
+                                 PlayStopState::PaceTooSlow } )
+    {
+        AutomationVerdictLatch latch;
+        latch.armPending();
+        latch.resolve( state );
+        ASSERT_EQ( 14, latch.exitCode() );
+    }
+    AutomationVerdictLatch reached;
+    reached.armPending();
+    reached.resolve( PlayStopState::Reached );
+    ASSERT_EQ( 0, reached.exitCode() );
+    ASSERT_FALSE( reached.pending() );
+}
+
+TEST( AutomationVerdictLatch, ARefusalAndALateRearmBothFailClosed )
+{
+    AutomationVerdictLatch refused;
+    refused.armPending();
+    refused.fail();
+    ASSERT_EQ( 14, refused.exitCode() );
+    // A resolved-Reached latch that is armed again (a second automation Play) is failing again until it resolves.
+    AutomationVerdictLatch again;
+    again.armPending();
+    again.resolve( PlayStopState::Reached );
+    again.armPending();
+    ASSERT_EQ( 14, again.exitCode() );
+}
+
+TEST( AutomationVerdictLatch, ARefusalAloneFailsAnUnarmedLatch )
+{
+    // The refusal path must stand on its own: fail() is what the hook calls when programmaticPlay refuses, and it must
+    // leave the process failing whether or not armPending() ran first.
+    AutomationVerdictLatch latch;
+    latch.fail();
+    ASSERT_EQ( 14, latch.exitCode() );
+    ASSERT_TRUE( latch.pending() );
+}

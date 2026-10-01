@@ -1116,9 +1116,11 @@ private:
     double m_playRequestedSeconds = 0.0;
     double m_playPaceFps = 0.0;
     bool m_automationPacingIsolated = false;
+    // ENFORCE-4: the autoplay hook's verdict is a fail-closed LATCH (PlaybackFrameRange.h): armed failing (14) when the hook
+    // is installed, cleared only by consumption (Reached). Closing the app before the poll resolves exits 14, never 0.
     // r2 (fable H6): the autoplay hook's verdict (0 = consumed the window, 14 = refused / ended early / timed out),
     // returned by main() as the process exit code even when MLVAPP_AUTOPLAY_EXIT is not set.
-    int m_automationVerdictExitCode = 0;
+    playback_frame_range::AutomationVerdictLatch m_automationVerdict;
     // Contact-sheet capture-during-playback (CUDA-PLAYBACK-CONTACT-SHEET-1 r1b): an un-timed
     // SECOND playback pass, run after the measured interval closes and playback_smoke telemetry
     // has finished, so every grab below is of a genuinely presented playback frame -- never a
@@ -1718,7 +1720,7 @@ private:
     playback_frame_range::PlayStopState programmaticPlayState( qint64 elapsedMs, qint64 safetyMs ) const;
     bool programmaticPlayConsumed() const;
 public:
-    int automationVerdictExitCode() const { return m_automationVerdictExitCode; }
+    int automationVerdictExitCode() const { return m_automationVerdict.exitCode(); }
 private:
     void isolateAutomationPacing( const char *site );
     int normalizePlaybackRequestedFrame( int requestedFrame, const char *where );

@@ -153,8 +153,8 @@ and reported as `PLAY_SAFETY_TIMEOUT`), then reads the app's receipt and applies
 | `run-release-gui-smoke.ps1` (the choke point; its process budget is `Get-GuiSmokePlaySafetyMs` + open / settle) | `playback_smoke.summary` | exit 43 (`validation.ok = false`) |
 | `validate-visible-playback.ps1` (the filmstrip capturer; it used to kill the app after `SettleMs + Captures x IntervalMs`, ~14 s) | `playback_smoke.summary` in its log dir | exit 43 |
 | `capture-reference-frame.ps1` | `playback_smoke.summary` in `-OutDir`; the manifest records `sourceFrames` | exit 43 (a non-zero app exit stays exit 4) |
-| `run-release-playback-profile.ps1` (a play-capable option) | `metadata` of the `--output` profile receipt (`play_performed` is false when nothing was admitted) | exit 43 |
-| `lookassist-wb-determinism.ps1`, `lookassist-wb-multiclip-probe.ps1` (consumers of the runner) | the runner's exit code | row marked `RUN_INVALID`, never a measurement |
+| `run-release-playback-profile.ps1` (a play-capable option) | `metadata` of the `--output` profile receipt: `programmatic_play_admitted` must be PRESENT and > 0 (ENFORCE-4: an absent field is INVALID, never "nothing was played") plus every oracle field | exit 43 |
+| `lookassist-wb-determinism.ps1`, `lookassist-wb-multiclip-probe.ps1`, `measure-wb-solve-distribution.ps1` (consumers; see ENFORCE-4) | the launcher's exit code | an invalid run is excluded and the SCRIPT exits 43 |
 | `bachelor/playback-attr-3-cuda-job.ps1` | the measured session's summary line | exit 29 |
 
 `tools/repo_hygiene/test_playback_launcher_receipt_oracle.py` EXECUTES the oracle and each direct launcher against a fake
@@ -165,6 +165,56 @@ exemption list, and a script that kills the app must pass the kill into the verd
 `m_sourceAdvance` and `m_playRequiredSourceFrames` are WRITTEN only at the reviewed sites, by function and count (the
 three engine ticks, the first Play start, the gate's reset), and that `main.cpp` isolates the settings store before the
 first `QSettings` and returns the autoplay verdict as the exit code; all of it is mutation-tested.
+
+## ENFORCE-4: evidence is valid only when every receipt field is PRESENT and every verdict is CONSUMED
+
+PR #217 (ENFORCE-3) was parked after its second key round for one root cause: its scans tested the PRESENCE of a gate,
+not the CONSUMPTION of a verdict or the ABSENCE of a field. Three ways to report success on < 20 s of source footage got
+through, each closed here and each pinned by a test that uses the TRUE legacy receipt shape (the fields a master-era
+binary writes are omitted, never zeroed):
+
+| Hole | Closed by | Pinned in |
+|---|---|---|
+| an absent `programmatic_play_admitted` read as "no Play happened", so a master-era profile receipt skipped the oracle and exited 0 | the profile reader never infers `play_performed`; `Get-GuiSmokeEvidencePlayVerdict -RequireAdmission` (the wrapper) fails an absent admission `RECEIPT_FIELD_ABSENT` and an admission of 0 `PLAY_NOT_ADMITTED`; both exit 43 | `test_playback_evidence_completeness.py` (`AbsentFieldIsInvalidOnTheProfileReceiptTests`) |
+| `native_fps` / `pace_fps` / `fps_override` / `wrapped` / `wrap_count` absent read as "pace unchecked" / "no override" / "no wrap"; the runner only WARNED on absent wrap fields | `Get-GuiSmokeAbsentReceiptFields`: every field the oracle judges must be present or the receipt is `INVALID_SOURCE_FRAMES` / `INVALID_LOOPED` (`RECEIPT_FIELD_ABSENT`); the runner's `BACKSTOP_FIELDS_MISSING` warning is gone; the attribution job's embedded copy follows the same rule | one test per field in each reader (log summary, profile receipt, the job's copy, the runner's application) |
+| `measure-wb-solve-distribution.ps1` ignored `capture-reference-frame.ps1`'s exit code, counted runs by `capture.err.txt`, published statistics from INVALID captures and pointed at a staged copy of the launcher | reads `$LASTEXITCODE` for every run; a non-zero exit (or no trace file) is an invalid run, excluded, counted in `invalidRuns`, and the script exits 43 (a missing build also fails); it uses the tracked launcher and names no footage (`-ClipPath` is the caller's) | `MeasureWbSolveDistributionTests` (executed against a fake launcher) |
+| `lookassist-wb-multiclip-probe.ps1` only labelled a row; `lookassist-wb-determinism.ps1` published a verdict from the reps that happened to pass | the probe exits 43 after writing its labelled matrix; the determinism verdict is `INVALID` (exit 43) when any rep was rejected | `WbProbeConsumersFailTheScriptTests` (executed against a fake runner) |
+| an autoplay closed mid-Play exited 0 (`m_automationVerdictExitCode` started at 0 and was set only by a poll timer) | `playback_frame_range::AutomationVerdictLatch`: armed FAILING (14) when `MLVAPP_AUTOPLAY_SECONDS` is requested, before anything can end the process, cleared only by `resolve( Reached )` after the engine consumed the window; `main.cpp` returns it as the exit code | `AutomationVerdictLatch.*` in `tests/console/test_playback_frame_range.cpp`; `AppVerdictLatchPinTests` |
+
+### Every consumer of an evidence launcher acts on its exit code (scan)
+
+`test_playback_evidence_completeness.py` derives every script under `tools/` that names an evidence launcher
+(`run-release-gui-smoke.ps1`, `capture-reference-frame.ps1`, `validate-visible-playback.ps1`,
+`run-release-playback-profile.ps1`) or a consumer that already acts on one (so a caller of a caller is found too). Each is
+either **pinned** with the statement that reads and acts on the callee's exit code -- deleting that statement makes the scan
+fail (mutation-tested, one mutation per consumer) -- or **exempt** with a written reason (a text mention, a refusal-only
+self-test). A new consumer is neither, so it fails until a reviewer classifies it.
+
+| Consumer | Acts on the exit code by |
+|---|---|
+| `tools/gates/compare-output-budget.ps1` | `$LASTEXITCODE -ne 0` after the runner: INDETERMINATE report, exit 5 |
+| `lookassist-wb-determinism.ps1` | a rejected rep: the verdict is `INVALID`, exit 43 |
+| `lookassist-wb-multiclip-probe.ps1` | a non-zero runner exit: row `RUN_INVALID`, script exit 43 |
+| `measure-wb-solve-distribution.ps1` | a non-zero capture exit: run excluded, script exit 43 |
+| `review-dualiso-fullres-recon.ps1` | `Assert-GuiSmokeChildEvidenceReady -ExitCode`: exit 2 |
+| `run-non-dual-iso-guard-smoke.ps1` | a non-zero smoke exit is a failure; status `failed`, exit 2 |
+| `run-release-cuda-playback-ab.ps1` | baseline / candidate exit codes are proof failures |
+| `run-ultramagnus-p3-validation.ps1` | a non-zero smoke exit is a clip failure |
+| `bachelor/playback-attr-3-cuda-job.ps1` | a non-zero runner exit is `SMOKE_RUN_FAILED` |
+| `run-shipping-guard-smoke.ps1`, `run-local-cuda-playback-dng-smoke.ps1`, `invoke-ultramagnus-p3-evidence.ps1`, `export-release-cuda-dogfood-kit.ps1` | callers of the consumers above: each turns a child's exit code into its own status / exit |
+
+`app_play_scan.py` also pins every WRITE of the autoplay latch (one arm in the constructor, one fail, one resolve; the
+retired `m_automationVerdictExitCode` int cannot return), of the safety budget `m_playRequestedSeconds` and of the engine
+pace `m_playPaceFps` (only the two reviewed `programmaticPlay` sites, from the gate's own values); mutation-tested.
+
+The attribution job no longer seeds the venue's registry (`reg add HKCU\Software\magiclantern.MLVApp ...`): an automation
+run reads a run-scoped settings store, so the seeds were dead, and every value they wrote is the app's own default
+(`AttributionJobRegistrySeedTests` pins that against the compiled defaults).
+
+Disclosed, not closed (ENFORCE-4): the four historical binaries `measure-wb-solve-distribution.ps1` bisects across all
+predate the receipt fields, so today every run of them is INVALID by design (the script is a bisect list, not
+evidence, until they are rebuilt with the receipt). `compare-output-budget.ps1` still asks the runner for a 1 s window,
+which the runner refuses (INDETERMINATE: fail closed; card OUTPUT-BUDGET-WINDOW-20S-1).
 
 Disclosed, not closed: a **human** pressing Play in the interactive app is outside the class (it is not automation, and
 its Play is never evidence). In drop-frame mode a tick after a GUI-thread stall advances the timeline by wall clock and

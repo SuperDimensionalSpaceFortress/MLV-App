@@ -255,8 +255,11 @@ try {
     }
     if (-not $profileKilled -and $process.ExitCode -ne 0) { exit $process.ExitCode }   # the app's own typed refusal / failure
     $profileSummary = Get-GuiSmokeProfileReceiptSummary -Path $outputPath
+    # ENFORCE-4: -RequireAdmission. This wrapper only reaches here for a PLAY-CAPABLE profile, so a receipt without
+    # programmatic_play_admitted (a master-era binary writes none) is INVALID, never "nothing was played".
     $profileVerdict = Get-GuiSmokeEvidencePlayVerdict -Summary $profileSummary `
-        -ExitCode $(if ($profileKilled) { $null } else { $process.ExitCode }) -KilledByLauncher $profileKilled -WindowSeconds 20
+        -ExitCode $(if ($profileKilled) { $null } else { $process.ExitCode }) -KilledByLauncher $profileKilled -WindowSeconds 20 `
+        -RequireAdmission $true
     if ($profileVerdict.invalid) {
         foreach ($failure in $profileVerdict.failures) { [Console]::Error.WriteLine("PLAYBACK-CLIP-LENGTH-ENFORCE-3: $failure") }
         [Console]::Error.WriteLine("PLAYBACK-CLIP-LENGTH-ENFORCE-3: INVALID -- this profile is not playback evidence (exit 43).")

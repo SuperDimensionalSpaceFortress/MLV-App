@@ -2783,6 +2783,12 @@ MainWindow::MainWindow(int &argc, char **argv, QWidget *parent) :
     //Connect Export Handler
     connect( this, SIGNAL(exportReady()), this, SLOT(exportHandler()) );
 
+    // ENFORCE-4: an autoplay request is armed FAILING here, before anything can end the process, and is cleared only
+    // when the engine has consumed the requested window (the autoplay poll below, resolve( Reached )). An app closed
+    // during the settle delay, before the Play is admitted, with no clip to play, or mid-Play exits non-zero
+    // (main.cpp returns this latch), never 0.
+    if( qEnvironmentVariableIntValue( "MLVAPP_AUTOPLAY_SECONDS" ) > 0 ) m_automationVerdict.armPending();
+
     //"Open with" for Windows or scripts
     if( argc > 1 )
     {
@@ -2835,7 +2841,7 @@ MainWindow::MainWindow(int &argc, char **argv, QWidget *parent) :
                             QStringLiteral("reason=%1 window_seconds=%2")
                                 .arg( QString::fromLatin1( m_programmaticPlayLedger.lastRefusalReason ) )
                                 .arg( autoplaySeconds ) );
-                        m_automationVerdictExitCode = 14;
+                        m_automationVerdict.fail();
                         if( autoplayExit ) QTimer::singleShot( 400, this, [](){ qApp->quit(); } );
                         return;
                     }
@@ -2861,7 +2867,7 @@ MainWindow::MainWindow(int &argc, char **argv, QWidget *parent) :
                         if( ui->actionPlay->isChecked() ) { ui->actionPlay->setChecked( false ); on_actionPlay_triggered( false ); }
                         // r2 (fable H6): without MLVAPP_AUTOPLAY_EXIT the app stays open, but the verdict is latched and
                         // becomes the process exit code (main.cpp), so a short or timed-out autoplay is never exit 0.
-                        m_automationVerdictExitCode = autoplayState == playback_frame_range::PlayStopState::Reached ? 0 : 14;
+                        m_automationVerdict.resolve( autoplayState );
                         logInteractionEvent( QStringLiteral("autoplay.stop"),
                             QStringLiteral("state=%1 source_advanced=%2 required_source_frames=%3 elapsed_ms=%4")
                                 .arg( QString::fromLatin1( playback_frame_range::playStopFailureReason( autoplayState ) ).isEmpty()

@@ -15,7 +15,7 @@
 #
 # Verdict: STABLE (all spreads within tolerance AND the safety guard fires consistently) => a fix has
 # made the auto-WB deterministic. UNSTABLE otherwise (the current 60130e3f baseline is UNSTABLE).
-# Exit: 0 = STABLE ; 1 = UNSTABLE ; 2 = error / insufficient data.
+# Exit: 0 = STABLE ; 1 = UNSTABLE ; 2 = error / insufficient data ; 43 = INVALID (a rep was not valid playback evidence).
 param(
     [string]$RepoRoot = ".",
     [string]$ExePath = "",            # default: the deployed build-release exe
@@ -132,10 +132,16 @@ for ($rep = 1; $rep -le $Reps; $rep++) {
 }
 
 $good = @($rows | Where-Object { $_.ok })
+# PLAYBACK-CLIP-LENGTH-ENFORCE-4: a rep the runner refused (exit 43 INVALID, or any typed failure) is not a draw to drop.
+# A STABLE/UNSTABLE verdict computed from the reps that happened to pass is a cherry-picked verdict, so ANY rejected rep
+# makes the whole verdict INVALID (exit 43), reported with the reps that did run.
+$rejectedReps = @($rows | Where-Object { $_.reason -like 'runner exit *' })
 if ($good.Count -lt 2) {
     Write-Host "ERROR: fewer than 2 valid reps -- cannot assess determinism." -ForegroundColor Red
-    $report = [ordered]@{ schema = "mlvapp.lookassist-wb-determinism.v1"; verdict = "ERROR"; reason = "insufficient valid reps"; reps = $rows }
+    $insufficientVerdict = if ($rejectedReps.Count -gt 0) { "INVALID" } else { "ERROR" }
+    $report = [ordered]@{ schema = "mlvapp.lookassist-wb-determinism.v1"; verdict = $insufficientVerdict; reason = "insufficient valid reps"; validReps = $good.Count; invalidReps = $rejectedReps.Count; reps = $rows }
     $report | ConvertTo-Json -Depth 6 | Set-Content -LiteralPath (Join-Path $OutputRoot "determinism-verdict.json") -Encoding UTF8
+    if ($rejectedReps.Count -gt 0) { exit 43 }
     exit 2
 }
 
@@ -165,6 +171,7 @@ $checks = [ordered]@{
 $allPass = $safetyConsistent
 foreach ($k in @('patchX','patchY','rawTemp','rawTint','finalTemp','finalTint')) { if (-not $checks[$k].pass) { $allPass = $false } }
 $verdict = if ($allPass) { "STABLE" } else { "UNSTABLE" }
+if ($rejectedReps.Count -gt 0) { $verdict = "INVALID" }
 
 $report = [ordered]@{
     schema = "mlvapp.lookassist-wb-determinism.v1"
@@ -176,6 +183,7 @@ $report = [ordered]@{
     mode = $(if ($SyncMode) { 'sync' } else { 'async' })
     reps = $Reps
     validReps = $good.Count
+    invalidReps = $rejectedReps.Count
     checks = $checks
     tolerances = [ordered]@{ patchPx = $PatchTolerancePx; rawTempK = $RawTempToleranceK; rawTint = $RawTintTolerance; finalTempK = $FinalTempToleranceK; finalTint = $FinalTintTolerance }
     rows = $rows
@@ -191,4 +199,5 @@ Write-Host ("spreads  patchX {0} / patchY {1} (tol {2}px)  rawWB {3}K/{4} (tol {
 Write-Host ("safety guard values across reps: {0} ({1})" -f ($safetySet -join ', '), $(if ($safetyConsistent) { 'consistent' } else { 'INCONSISTENT' }))
 $color = if ($verdict -eq 'STABLE') { 'Green' } else { 'Red' }
 Write-Host ("VERDICT: {0}  (report: {1})" -f $verdict, $reportPath) -ForegroundColor $color
+if ($verdict -eq 'INVALID') { Write-Host ("ERROR: {0} rep(s) were not valid playback evidence (runner exit non-zero); the verdict is INVALID, not a determinism result." -f $rejectedReps.Count) -ForegroundColor Red; exit 43 }
 if ($verdict -eq 'STABLE') { exit 0 } else { exit 1 }

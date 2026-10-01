@@ -2475,11 +2475,9 @@ $invalidLooped = $false
 $invalidSourceFrames = $false
 $gateFrames = Get-ObjectPropertyValue $clipLengthGate "frames"
 $loopVerdict = Get-GuiSmokeLoopVerdict -Summary $playbackSummary -WindowSeconds $Seconds -LaunchOnlyProbe ([bool]$LaunchOnlyProbe) -ClipFrames $(if ($null -ne $gateFrames) { [int64]$gateFrames } else { [int64]0 })
-if (-not $LaunchOnlyProbe -and $null -ne $playbackSummary -and ($null -eq $loopWrappedRaw -or $null -eq $loopWrapCount)) {
-    # A binary that predates the wrap fields cannot report its own wraps; only the header-based checks
-    # (presented frames vs the clip's frame count, last before first) stand in for the app's signal.
-    $validationWarnings += "BACKSTOP_FIELDS_MISSING: playback_smoke.summary carries no wrapped/wrap_count (a build that predates PLAYBACK-CLIP-LENGTH-ENFORCE-1 round 2); wrap detection fell back to the header-based checks only."
-}
+# PLAYBACK-CLIP-LENGTH-ENFORCE-4: a summary without wrapped / wrap_count (a build that predates the wrap fields) is no
+# longer a WARNING that falls back to the header-based checks: the loop verdict above fails it (RECEIPT_FIELD_ABSENT,
+# INVALID_LOOPED, exit 43). "The app was silent" is never "the app did not wrap".
 if ($loopVerdict.invalid) {
     # Exit 43 = INVALID evidence, never a PASS: INVALID_LOOPED (the timeline wrapped) and ENFORCE-3's
     # INVALID_SOURCE_FRAMES (fewer than ceil(window x native fps) distinct source frames were advanced, or the

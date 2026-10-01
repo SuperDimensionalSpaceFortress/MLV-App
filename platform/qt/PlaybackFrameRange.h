@@ -496,6 +496,24 @@ struct ProgrammaticPlayLedger
 // first Play's warm-up already produced instead; if they are not valid it fails typed on the diagnostics wait.
 inline bool lookAssistSettleNeedsOwnPlay( int admittedPlays ) { return admittedPlays < 1; }
 
+// ENFORCE-4: the exit verdict of an automation Play (the MLVAPP_AUTOPLAY_SECONDS hook). It is a LATCH that fails
+// CLOSED: armPending() the moment the Play is requested (before it is even admitted) leaves it failing (kFailExitCode),
+// and only consumption -- resolve( Reached ) -- clears it. The process exit code is read from it (main.cpp), so an app
+// that is closed (closeEvent -> quit) before the poll resolves, or that never gets to the poll, exits non-zero: a
+// verdict that starts at 0 and is set by a timer is a verdict a close beats.
+class AutomationVerdictLatch
+{
+public:
+    static constexpr int kFailExitCode = 14;
+    int exitCode() const { return m_exitCode; }
+    bool pending() const { return m_exitCode != 0; }
+    void armPending() { m_exitCode = kFailExitCode; }
+    void fail() { m_exitCode = kFailExitCode; }
+    void resolve( PlayStopState state ) { m_exitCode = state == PlayStopState::Reached ? 0 : kFailExitCode; }
+private:
+    int m_exitCode = 0;
+};
+
 } // namespace playback_frame_range
 
 #endif // PLAYBACKFRAMERANGE_H
