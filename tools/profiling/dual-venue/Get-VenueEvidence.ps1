@@ -6,11 +6,17 @@ Dual-Venue Evidence reconciler (C3): reads per-venue receipts and reports them W
 Receipts (schema mlv-app/dual-venue-receipt/v1) live at
 <root>\<card>\<legId>\<venue>\<receiptId>.json and are never edited. This tool only reads them:
   * each receipt is validated; a malformed one is reported as MALFORMED and never counted;
-  * receipts group by card, leg and SUBJECT DIGEST; receipts of different digests are never compared;
-  * per venue the LATEST receipt (finishedUtc; an exact tie goes to the non-signal, then FAIL, then PASS, then receiptId) is shown with its role and outcome;
-    a refused run (looped, too short, ...) is that venue's latest attempt too, so the pair is INCOMPLETE with its reason;
-  * a pair is COMPLETE only when every venue in the card's roles has a PASS/FAIL receipt at that digest,
-    otherwise INCOMPLETE with the reason (missing | UNRESOLVED | RETRACTED | VENUE_UNHEALTHY | ...);
+  * ONE SELECTION FOR BOTH MODES: Get-VeNewestAttempts picks, over EVERY receipt of the root (never a filtered subset), the
+    NEWEST ATTEMPT per leg (card, legId, backend, lookFlavor, venue) and its VALIDATED STATE (PASS/FAIL only when valid:
+    clip >= 20 s, wrapped = 0, role authoritative, host detected; everything else is a typed non-signal state).
+    Acceptance mode and report mode read only that; neither selects, orders or judges completeness on its own.
+  * pairs (report mode) are per card, leg and SUBJECT DIGEST of the newest attempts; receipts of different digests are never compared;
+  * per venue the NEWEST attempt (finishedUtc; an exact tie goes to the non-signal, then FAIL, then PASS, then receiptId) is shown with its role and state;
+    a refused run (looped, too short, ...), an UNVERIFIED_CLIP_LENGTH run or a receipt file that failed validation is that
+    venue's newest attempt too, so the pair is INCOMPLETE with its reason, never COMPLETE on an older PASS;
+  * a pair is COMPLETE only when every venue in the card's roles has a validated PASS/FAIL as its NEWEST attempt, at that digest,
+    otherwise INCOMPLETE with the reason (missing | UNRESOLVED | RETRACTED | VENUE_UNHEALTHY | MALFORMED_NEWER_RECEIPT |
+    NEWEST_ATTEMPT_AT_OTHER_DIGEST | UNVERIFIED_CLIP_LENGTH | ...);
     the cross-venue delta is printed only for COMPLETE pairs and is labelled DIAGNOSTIC (P2: no merged verdict);
   * -AcceptanceFor <card> returns only receipts whose venue role is `acceptance` for that card (P3), or
     NO_ACCEPTANCE_EVIDENCE. A role recorded in a receipt that disagrees with venues.json is refused (ROLE_MISMATCH).
@@ -19,15 +25,19 @@ Receipts (schema mlv-app/dual-venue-receipt/v1) live at
     reason CARD_NOT_IN_VENUE_TABLE. Report mode (no -AcceptanceFor) still shows recorded roles, marked UNVERIFIED.
   * ONLY THE NEWEST ATTEMPT PER LEG DECIDES (leg = card, legId, backend, lookFlavor, venue). Every receipt of a leg
     takes part in recency: valid PASS/FAIL, refused ones (INVALID_LOOPED, INVALID_CLIP_TOO_SHORT, VENUE_DETECTION_MISMATCH,
-    ROLE_MISMATCH, DUPLICATE_RECEIPT_ID), withheld ones (UNRESOLVED, RETRACTED, VENUE_UNHEALTHY, ...), and receipt files
-    that cannot be parsed (MALFORMED_NEWER_RECEIPT when the file has a readable finish time at least as new as the newest
-    parsed receipt; UNORDERABLE_MALFORMED_RECEIPT when it has none). If the newest attempt is not a clean PASS/FAIL the
-    leg is WITHHELD (reason named, the superseded PASS listed under supersededSignal) and the CARD is non-green:
-    status NO_ACCEPTANCE_EVIDENCE, reason NEWEST_ATTEMPT_WITHHELD. There is never a fallback to an older receipt.
+    ROLE_MISMATCH, DUPLICATE_RECEIPT_ID), withheld ones (UNRESOLVED, RETRACTED, VENUE_UNHEALTHY, ...; a terminal reached
+    before a run may carry metrics null), and receipt files that failed validation. A failed file whose own card, leg,
+    venue, backend, lookFlavor and finish time are all readable is an attempt of ITS OWN leg (MALFORMED_NEWER_RECEIPT when
+    it is that leg's newest); one whose identity or finish time is not readable cannot be placed, so it withholds the
+    whole card (UNKEYABLE_MALFORMED_RECEIPT, or UNORDERABLE_MALFORMED_RECEIPT when it has no usable finish time).
+    If the newest attempt is not a clean PASS/FAIL the leg is WITHHELD (reason named, the superseded PASS listed under
+    supersededSignal) and the CARD is non-green: status NO_ACCEPTANCE_EVIDENCE, reason NEWEST_ATTEMPT_WITHHELD.
+    There is never a fallback to an older receipt.
   * acceptance without -SubjectDigest/-BuildManifestSha256 lets the newest attempt speak at whatever digest it has
     (older digests are listed under olderDigests, never as evidence) and says so; each receipt shows
-    buildManifestSha256, legSpecSha256, clipId, backend, lookFlavor and its outcome history. With a filter the newest
-    attempt INSIDE the filter decides, and a newer attempt outside it is named under newerOutsideFilter.
+    buildManifestSha256, legSpecSha256, clipId, backend, lookFlavor and its outcome history. A filter NEVER changes
+    which attempt is newest: it only asks whether each leg's newest attempt is at the requested subject/build, and a leg
+    whose newest attempt is elsewhere is WITHHELD (NEWER_ATTEMPT_OUTSIDE_FILTER), never answered from an older receipt.
   * a blank argument (-AcceptanceFor '', -SubjectDigest '', -LegId '', ...) is an error (exit 1), never "report mode"
     or "no filter". A *.json anywhere under the receipts root is seen; one misfiled off the layout is MALFORMED.
   * playback evidence rule (owner, 2026-09-30): a PASS/FAIL receipt counts only with metrics.clipSeconds >= 20
@@ -52,10 +62,11 @@ Limit the report to one leg.
 .PARAMETER AcceptanceFor
 Acceptance query for one card.
 .PARAMETER SubjectDigest
-Acceptance only: report receipts at exactly this subject digest (64-hex). Bad format is a tool error (exit 1).
+Acceptance only: require each leg's NEWEST attempt to be at exactly this subject digest (64-hex); a leg whose newest
+attempt is elsewhere is withheld. Bad format is a tool error (exit 1).
 .PARAMETER BuildManifestSha256
-Acceptance only: report receipts whose subject.buildManifestSha256 equals this (64-hex), to bind evidence to the
-candidate build. Combine with -SubjectDigest to require both.
+Acceptance only: require each leg's NEWEST attempt to carry this subject.buildManifestSha256 (64-hex), to bind evidence
+to the candidate build. Combine with -SubjectDigest to require both.
 .PARAMETER Json
 Emit the report as JSON (schema mlv-app/dual-venue-evidence-report/v1).
 .PARAMETER MaxReceipts

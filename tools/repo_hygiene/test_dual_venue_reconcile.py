@@ -22,6 +22,8 @@ from __future__ import annotations
 
 import hashlib
 import json
+import random
+import re
 import shutil
 import subprocess
 import tempfile
@@ -283,7 +285,8 @@ class PairingTests(_Base):
         for digest, present, absent in ((DIGEST_1, BACH, UM), (DIGEST_2, UM, BACH)):
             g = self.group(rep, digest)
             self.assertEqual(g["pair"]["state"], "INCOMPLETE")
-            self.assertIn({"venue": absent, "reason": "missing"}, g["pair"]["reasons"])
+            # each venue's NEWEST attempt is at the other digest: said so, never paired and never an older receipt
+            self.assertIn({"venue": absent, "reason": "NEWEST_ATTEMPT_AT_OTHER_DIGEST"}, g["pair"]["reasons"])
             self.assertNotIn("delta", g)
             self.assertIsNotNone(g["venues"][present]["latest"])
             self.assertIsNone(g["venues"][absent]["latest"])
@@ -424,14 +427,20 @@ class MalformedTests(_Base):
         g = self.group(rep)
         self.assertEqual(g["venues"][BACH]["history"]["total"], 1)
         self.assertIsNone(g["venues"][UM]["latest"])
-        self.assertIn({"venue": UM, "reason": "missing"}, g["pair"]["reasons"])
+        # UM's newest attempt is a malformed file, and several unreadable files withhold the whole card
+        self.assertEqual(g["pair"]["state"], "INCOMPLETE")
+        self.assertIn({"venue": UM, "reason": "MALFORMED_NEWER_RECEIPT"}, g["pair"]["reasons"])
         self.assertIn("MALFORMED", self.run_tool().stdout)
 
-    def test_a_malformed_newer_receipt_never_displaces_a_valid_one(self) -> None:
+    def test_a_malformed_newer_receipt_is_the_newest_attempt_and_never_lets_the_older_pass_be_latest(self) -> None:
+        # DVE-RECONCILE-2 r2: this was pinned the OTHER way ("never displaces a valid one"), which is how report mode
+        # kept showing an older PASS as latest after a newer attempt that could not be read.
         self.put(make_receipt(venue=BACH, outcome="PASS", finished="2026-09-30T08:00:00Z"))
         self.put(make_receipt(venue=BACH, outcome="FAIL", finished="2026-09-30T12:00:00Z", digest="bad"))
-        g = self.group(self.report())
-        self.assertEqual(g["venues"][BACH]["latest"]["outcome"], "PASS")
+        # the newest attempt has no readable digest, so the pair is shown at digest null: the older PASS is not offered
+        g = self.group(self.report(), digest=None)
+        self.assertIsNone(g["venues"][BACH]["latest"])
+        self.assertEqual(g["venues"][BACH]["status"], "MALFORMED_NEWER_RECEIPT")
 
     def test_receipt_filed_under_the_wrong_venue_folder_is_malformed(self) -> None:
         r = make_receipt(venue=BACH, outcome="PASS")
@@ -578,12 +587,18 @@ class AcceptanceTests(_Base):
         rep = json.loads(proc.stdout)
         self.assertEqual(rep["acceptance"]["receipts"], [])
         self.assertEqual(rep["acceptance"]["withheld"][0]["subjectDigest"], DIGEST_2)
-        # ... but a reader who pins the old digest explicitly still gets it, as a filtered answer.
+        # ... and pinning the old digest does NOT bring it back: the newest attempt is at another digest, so the leg is
+        # withheld (DVE-RECONCILE-2 r2: this used to return the old PASS, exit 0).
         pinned = self.run_tool("-Json", "-AcceptanceFor", CARD, "-SubjectDigest", DIGEST_1)
-        self.assertEqual(pinned.returncode, 0, pinned.stdout)
+        self.assertEqual(pinned.returncode, 2, pinned.stdout)
         prep = json.loads(pinned.stdout)
         self.assertEqual(prep["acceptance"]["digestSelection"], "FILTERED")
-        self.assertEqual([r["subjectDigest"] for r in prep["acceptance"]["receipts"]], [DIGEST_1])
+        self.assertEqual(prep["acceptance"]["receipts"], [])
+        self.assertEqual([w["reason"] for w in prep["acceptance"]["withheld"]], ["NEWER_ATTEMPT_OUTSIDE_FILTER"])
+        # pinning the digest the newest attempt is at answers about THAT attempt (here UNRESOLVED: withheld)
+        newest = self.run_tool("-Json", "-AcceptanceFor", CARD, "-SubjectDigest", DIGEST_2)
+        self.assertEqual(newest.returncode, 2, newest.stdout)
+        self.assertEqual([w["reason"] for w in json.loads(newest.stdout)["acceptance"]["withheld"]], ["UNRESOLVED"])
 
     def test_digest_selection_is_per_leg_and_per_backend(self) -> None:
         self.put(make_receipt(venue=BACH, leg="leg-a", outcome="PASS", digest=DIGEST_1, finished="2026-09-30T08:00:00Z"))
@@ -597,18 +612,30 @@ class AcceptanceTests(_Base):
     def test_subject_digest_filter_selects_that_digest_only(self) -> None:
         self.put(make_receipt(venue=BACH, outcome="PASS", digest=DIGEST_1, finished="2026-09-30T08:00:00Z"))
         self.put(make_receipt(venue=BACH, outcome="FAIL", digest=DIGEST_2, finished="2026-09-30T11:00:00Z"))
-        upper = DIGEST_1.upper()
-        rep = json.loads(self.run_tool("-Json", "-AcceptanceFor", CARD, "-SubjectDigest", upper).stdout)
-        self.assertEqual([(r["subjectDigest"], r["outcome"]) for r in rep["acceptance"]["receipts"]], [(DIGEST_1, "PASS")])
+        # DVE-RECONCILE-2 r2: the filter never picks among attempts. Pinning the older digest finds the newest attempt is
+        # elsewhere (the FAIL at DIGEST_2) and withholds; pinning the newest digest (any case) answers it.
+        proc = self.run_tool("-Json", "-AcceptanceFor", CARD, "-SubjectDigest", DIGEST_1.upper())
+        self.assertEqual(proc.returncode, 2, proc.stdout)
+        rep = json.loads(proc.stdout)
+        self.assertEqual(rep["acceptance"]["receipts"], [])
+        self.assertEqual([w["reason"] for w in rep["acceptance"]["withheld"]], ["NEWER_ATTEMPT_OUTSIDE_FILTER"])
+        proc = self.run_tool("-Json", "-AcceptanceFor", CARD, "-SubjectDigest", DIGEST_2.upper())
+        self.assertEqual(proc.returncode, 3, proc.stdout)
+        rep = json.loads(proc.stdout)
+        self.assertEqual([(r["subjectDigest"], r["outcome"]) for r in rep["acceptance"]["receipts"]], [(DIGEST_2, "FAIL")])
 
     def test_build_manifest_filter_binds_evidence_to_the_candidate_build(self) -> None:
         build_old, build_new = "1" * 64, "2" * 64
         self.put(make_receipt(venue=BACH, outcome="PASS", digest=DIGEST_1, build=build_old, finished="2026-09-30T08:00:00Z"))
         self.put(make_receipt(venue=BACH, outcome="PASS", digest=DIGEST_2, build=build_new, finished="2026-09-30T09:00:00Z"))
-        rep = json.loads(self.run_tool("-Json", "-AcceptanceFor", CARD, "-BuildManifestSha256", build_old).stdout)
-        self.assertEqual([r["buildManifestSha256"] for r in rep["acceptance"]["receipts"]], [build_old])
-        none = self.run_tool("-Json", "-AcceptanceFor", CARD, "-BuildManifestSha256", "9" * 64)
-        self.assertEqual(none.returncode, 2, none.stdout)
+        # the candidate build is the NEWEST one: pinning it answers; pinning the older build (whose newest attempt has
+        # been superseded) or a build that never ran withholds -- the filter never falls back to an older receipt
+        rep = json.loads(self.run_tool("-Json", "-AcceptanceFor", CARD, "-BuildManifestSha256", build_new).stdout)
+        self.assertEqual([r["buildManifestSha256"] for r in rep["acceptance"]["receipts"]], [build_new])
+        for pinned in (build_old, "9" * 64):
+            none = self.run_tool("-Json", "-AcceptanceFor", CARD, "-BuildManifestSha256", pinned)
+            self.assertEqual(none.returncode, 2, none.stdout)
+            self.assertEqual(json.loads(none.stdout)["acceptance"]["receipts"], [])
 
     def test_both_filters_must_match(self) -> None:
         self.put(make_receipt(venue=BACH, outcome="PASS", digest=DIGEST_1, build="1" * 64))
@@ -996,18 +1023,31 @@ class NewestReceiptDecidesTests(_AcceptBase):
         proc2, rep2 = self.acc("-BuildManifestSha256", "2" * 64)
         self.assert_not_current(proc2, rep2, "INVALID_LOOPED")
 
-    def test_pinning_the_older_subject_is_an_explicit_answer_and_names_the_newer_attempt_outside_the_filter(self) -> None:
-        # A reader who pins the OLD build asks about that build only; the newer attempt at another digest is never
-        # silent: it is listed under newerOutsideFilter.
-        self.put(make_receipt(venue=BACH, outcome="PASS", digest=DIGEST_1, build="1" * 64, finished=OLD))
+    def test_pinning_the_older_subject_never_restores_it_the_leg_is_withheld_and_names_the_newer_attempt(self) -> None:
+        # sol r1 blocker 1: pinning the OLD build/digest used to return the old PASS as ACCEPTANCE_EVIDENCE, exit 0,
+        # with the newer invalid attempt reduced to a note. A filter only asks "is the newest attempt at this subject?".
+        old = make_receipt(venue=BACH, outcome="PASS", digest=DIGEST_1, build="1" * 64, finished=OLD)
+        self.put(old)
         newer = make_receipt(venue=BACH, outcome="FAIL", digest=DIGEST_2, build="2" * 64, finished=NEW, wrapped=1)
         self.put(newer)
-        proc, rep = self.acc("-BuildManifestSha256", "1" * 64)
-        self.assertEqual(proc.returncode, 0, proc.stdout)
-        self.assertEqual(rep["acceptance"]["digestSelection"], "FILTERED")
-        self.assertEqual([r["subjectDigest"] for r in rep["acceptance"]["receipts"]], [DIGEST_1])
-        self.assertEqual([n["receiptId"] for n in rep["acceptance"]["newerOutsideFilter"]], [newer["receiptId"]])
-        self.assertIn("newer attempt", self.run_tool("-AcceptanceFor", CARD, "-BuildManifestSha256", "1" * 64).stdout.lower())
+        for extra in (("-BuildManifestSha256", "1" * 64), ("-SubjectDigest", DIGEST_1),
+                      ("-SubjectDigest", DIGEST_1, "-BuildManifestSha256", "1" * 64)):
+            with self.subTest(filters=extra):
+                proc, rep = self.acc(*extra)
+                self.assert_not_current(proc, rep, "NEWER_ATTEMPT_OUTSIDE_FILTER")
+                self.assertEqual(rep["acceptance"]["digestSelection"], "FILTERED")
+                self.assertEqual(rep["acceptance"]["receipts"], [])
+                w = rep["acceptance"]["withheld"][0]
+                self.assertEqual((w["receiptId"], w["newestState"], w["newestBuildManifestSha256"]),
+                                 (newer["receiptId"], "INVALID_LOOPED", "2" * 64))
+                self.assertEqual(w["supersededSignal"], [old["receiptId"]])
+                human = self.run_tool("-AcceptanceFor", CARD, *extra)
+                self.assertEqual(human.returncode, 2, human.stdout)
+                self.assertIn("NO_ACCEPTANCE_EVIDENCE", human.stdout)
+                self.assertIn("NEWER_ATTEMPT_OUTSIDE_FILTER", human.stdout)
+        # pinning the NEWEST attempt's build answers about that attempt: the refusal
+        proc, rep = self.acc("-BuildManifestSha256", "2" * 64)
+        self.assert_not_current(proc, rep, "INVALID_LOOPED")
 
     def test_a_newer_valid_pass_after_an_invalid_run_is_current_evidence(self) -> None:
         self.put(make_receipt(venue=BACH, outcome="FAIL", finished=OLD, wrapped=1))
@@ -1099,14 +1139,15 @@ class MalformedNewerReceiptTests(_AcceptBase):
         r["venue"]["name"] = "laptop-2"
         self.put(r, rel=Path(CARD) / LEG / "laptop-2" / f"{r['receiptId']}.json")
         proc, rep = self.acc()
-        self.assert_not_current(proc, rep, "MALFORMED_NEWER_RECEIPT")
+        self.assert_not_current(proc, rep, "UNKEYABLE_MALFORMED_RECEIPT")
 
     def test_a_receipt_filed_under_the_wrong_venue_folder_still_blocks_the_venue_it_claims(self) -> None:
         self._old_pass()
         r = make_receipt(venue=BACH, outcome="FAIL", finished=NEW)
         self.put(r, rel=Path(CARD) / LEG / UM / f"{r['receiptId']}.json")
         proc, rep = self.acc()
-        self.assert_not_current(proc, rep, "MALFORMED_NEWER_RECEIPT")
+        # folder says ultra-magnus, content says bachelor: no single leg owns it, so it withholds the card
+        self.assert_not_current(proc, rep, "UNKEYABLE_MALFORMED_RECEIPT")
 
     def test_a_receipt_filed_at_the_wrong_depth_is_not_invisible(self) -> None:
         self._old_pass()
@@ -1167,7 +1208,7 @@ class MalformedNewerReceiptTests(_AcceptBase):
         r["subject"]["lookFlavor"] = 5
         self.put(r)
         proc, rep = self.acc()
-        self.assert_not_current(proc, rep, "MALFORMED_NEWER_RECEIPT")
+        self.assert_not_current(proc, rep, "UNKEYABLE_MALFORMED_RECEIPT")  # its flavor, hence its leg, is unreadable
 
 
 @requires_pwsh
@@ -1321,6 +1362,535 @@ class NoOtherFallbackTests(_AcceptBase):
         self.put(old)
         proc, rep = self.acc()
         self.assert_not_current(proc, rep, "INVALID_LOOPED")
+
+
+# ---------------------------------------------------------------------------------------------------------------
+# DUAL-VENUE-RECONCILE-2 round 2: STRUCTURAL fix. One function (Get-VeNewestAttempts) decides the newest attempt per
+# leg and its validated state, over EVERY receipt; acceptance and report both consume only that.
+# ---------------------------------------------------------------------------------------------------------------
+
+
+@requires_pwsh
+class ReportModeParityTests(_AcceptBase):
+    """sol r1 blockers 2 and 3: report mode applied different rules from acceptance."""
+
+    def _both_pass(self) -> None:
+        self.put(make_receipt(venue=BACH, outcome="PASS", finished=OLD))
+        self.put(make_receipt(venue=UM, outcome="PASS", finished=OLD))
+
+    def _assert_incomplete(self, rep: dict, reason: str, human: str) -> dict:
+        g = self.group(rep)
+        self.assertEqual(g["pair"]["state"], "INCOMPLETE", json.dumps(g, indent=2))
+        self.assertIn({"venue": BACH, "reason": reason}, g["pair"]["reasons"])
+        self.assertNotIn("delta", g)
+        self.assertEqual(g["venues"][BACH]["status"], reason)
+        self.assertNotIn("DIAGNOSTIC delta", human)
+        self.assertIn("INCOMPLETE", human)
+        self.assertNotIn("pair: COMPLETE", human)
+        return g
+
+    def test_a_newer_malformed_receipt_makes_the_pair_incomplete_not_complete_on_the_older_pass(self) -> None:
+        self._both_pass()
+        r = make_receipt(venue=BACH, outcome="FAIL", finished=NEW)
+        del r["subject"]["clipContentSha256"]
+        self.put(r)
+        g = self._assert_incomplete(self.report(), "MALFORMED_NEWER_RECEIPT", self.run_tool().stdout)
+        self.assertIsNone(g["venues"][BACH]["latest"])  # the older PASS is not "latest"
+        proc, rep = self.acc()  # acceptance agrees
+        self.assert_not_current(proc, rep, "MALFORMED_NEWER_RECEIPT")
+
+    def test_a_newest_unverified_clip_length_does_not_supply_signal_to_the_pair(self) -> None:
+        self._both_pass()
+        self.put(make_receipt(venue=BACH, outcome="PASS", finished=NEW, clip_seconds=None))
+        g = self._assert_incomplete(self.report(), "UNVERIFIED_CLIP_LENGTH", self.run_tool().stdout)
+        self.assertEqual(g["venues"][BACH]["latest"]["clipLength"], "UNVERIFIED_CLIP_LENGTH")
+        proc, rep = self.acc()
+        self.assert_not_current(proc, rep, "UNVERIFIED_CLIP_LENGTH")
+
+    def test_a_newest_unverified_wrapped_field_does_not_supply_signal_either(self) -> None:
+        self._both_pass()
+        self.put(make_receipt(venue=BACH, outcome="FAIL", finished=NEW, wrapped=None))
+        self._assert_incomplete(self.report(), "UNVERIFIED_CLIP_LENGTH", self.run_tool().stdout)
+
+    def test_an_unreadable_file_in_a_leg_folder_makes_every_pair_of_the_card_incomplete(self) -> None:
+        self._both_pass()
+        (self.root / CARD / LEG / BACH / "garbage.json").write_text("{ not json", encoding="utf-8")
+        g = self.group(self.report())
+        self.assertEqual(g["pair"]["state"], "INCOMPLETE")
+        self.assertEqual(g["pair"]["reasons"][0]["reason"], "UNORDERABLE_MALFORMED_RECEIPT")
+        self.assertNotIn("delta", g)
+        self.assertNotIn("pair: COMPLETE", self.run_tool().stdout)
+
+    def test_a_malformed_attempt_of_a_wrong_digest_still_withholds_the_pair_at_every_digest(self) -> None:
+        # the malformed file has no usable digest, so it cannot be "at another digest": it blocks the leg whatever group
+        self.put(make_receipt(venue=BACH, outcome="PASS", digest=DIGEST_1, finished=OLD))
+        self.put(make_receipt(venue=UM, outcome="PASS", digest=DIGEST_1, finished=OLD))
+        self.put(make_receipt(venue=UM, outcome="PASS", digest=DIGEST_2, finished=NEW))
+        bad = make_receipt(venue=BACH, outcome="PASS", digest="bad", finished=NEW)
+        self.put(bad)
+        rep = self.report()
+        self.assertEqual([g["pair"]["state"] for g in rep["groups"]], ["INCOMPLETE"] * len(rep["groups"]))
+        self.assertTrue(rep["groups"])
+
+    def test_a_complete_pair_needs_every_expected_venue_newest_at_one_digest(self) -> None:
+        self.put(make_receipt(venue=BACH, outcome="PASS", digest=DIGEST_1, finished=OLD))
+        self.put(make_receipt(venue=UM, outcome="PASS", digest=DIGEST_1, finished=OLD))
+        self.assertEqual(self.group(self.report())["pair"]["state"], "COMPLETE")
+        # bachelor then runs a NEWER subject: the pair at DIGEST_1 is no longer current for bachelor
+        self.put(make_receipt(venue=BACH, outcome="PASS", digest=DIGEST_2, finished=NEW))
+        rep = self.report()
+        g1 = self.group(rep, DIGEST_1)
+        self.assertEqual(g1["pair"]["state"], "INCOMPLETE")
+        self.assertIn({"venue": BACH, "reason": "NEWEST_ATTEMPT_AT_OTHER_DIGEST"}, g1["pair"]["reasons"])
+        self.assertIsNone(g1["venues"][BACH]["latest"])
+        self.assertEqual(self.group(rep, DIGEST_2)["pair"]["state"], "INCOMPLETE")
+
+
+@requires_pwsh
+class FilterNeverChangesNewestTests(_AcceptBase):
+    """sol r1 blocker 1, exactly: a subject/build filter partitioned attempts BEFORE recency."""
+
+    A, B = "a" * 64, "b" * 64
+
+    def test_filtering_by_the_old_digest_or_build_never_returns_the_old_pass(self) -> None:
+        old = make_receipt(venue=BACH, outcome="PASS", digest=self.A, build="1" * 64, finished=OLD, clip_seconds=25, wrapped=0)
+        new = make_receipt(venue=BACH, outcome="FAIL", digest=self.B, build="2" * 64, finished=NEW, wrapped=1)
+        self.put(old)
+        self.put(new)
+        proc, rep = self.acc()
+        self.assert_not_current(proc, rep, "INVALID_LOOPED")  # unfiltered: exit 2
+        for extra in (("-SubjectDigest", self.A), ("-BuildManifestSha256", "1" * 64),
+                      ("-SubjectDigest", self.A, "-BuildManifestSha256", "1" * 64)):
+            with self.subTest(filters=extra):
+                proc, rep = self.acc(*extra)
+                self.assert_not_current(proc, rep, "NEWER_ATTEMPT_OUTSIDE_FILTER")
+                self.assertEqual(rep["acceptance"]["receipts"], [])
+                self.assertNotIn(old["receiptId"], json.dumps(rep["acceptance"]["receipts"]))
+                human = self.run_tool("-AcceptanceFor", CARD, *extra)
+                self.assertEqual(human.returncode, 2, human.stdout)
+                self.assertNotIn("ACCEPTANCE for CARD-A: ACCEPTANCE_EVIDENCE", human.stdout)
+
+    def test_a_filter_naming_neither_attempt_withholds_too(self) -> None:
+        self.put(make_receipt(venue=BACH, outcome="PASS", digest=self.A, build="1" * 64, finished=OLD))
+        for extra in (("-SubjectDigest", "c" * 64), ("-BuildManifestSha256", "9" * 64)):
+            proc, rep = self.acc(*extra)
+            self.assert_not_current(proc, rep, "NEWER_ATTEMPT_OUTSIDE_FILTER")
+
+    def test_the_filter_that_names_the_newest_attempt_still_reads_its_validated_state(self) -> None:
+        self.put(make_receipt(venue=BACH, outcome="PASS", digest=self.A, build="1" * 64, finished=OLD))
+        self.put(make_receipt(venue=BACH, outcome="PASS", digest=self.B, build="2" * 64, finished=NEW))
+        proc, rep = self.acc("-SubjectDigest", self.B, "-BuildManifestSha256", "2" * 64)
+        self.assertEqual(proc.returncode, 0, proc.stdout)
+        self.assertEqual([r["subjectDigest"] for r in rep["acceptance"]["receipts"]], [self.B])
+
+    def test_a_filter_cannot_hide_a_newer_malformed_attempt(self) -> None:
+        self.put(make_receipt(venue=BACH, outcome="PASS", digest=self.A, build="1" * 64, finished=OLD))
+        self.put(make_receipt(venue=BACH, outcome="FAIL", digest="bad", build="2" * 64, finished=NEW))
+        for extra in ((), ("-SubjectDigest", self.A), ("-BuildManifestSha256", "1" * 64)):
+            with self.subTest(filters=extra):
+                proc, rep = self.acc(*extra)
+                self.assert_not_current(proc, rep, "MALFORMED_NEWER_RECEIPT")
+
+
+@requires_pwsh
+class BarrierKeyingTests(_AcceptBase):
+    """fable r1 DVE-BARRIER-SIBLING-LEG-1 and the barrier ordering edges."""
+
+    def _reset(self) -> None:
+        shutil.rmtree(self.root)
+        self.root.mkdir()
+
+    def test_a_malformed_receipt_withholds_its_own_backend_leg_never_matched_by_a_sibling(self) -> None:
+        for cpu_time, cuda_time in ((OLD, NEW), (NEW, OLD)):  # run order must not decide the answer
+            with self.subTest(cpu=cpu_time, cuda=cuda_time):
+                self._reset()
+                bad = make_receipt(venue=BACH, backend="cpu", outcome="FAIL", finished=cpu_time, digest="bad")
+                self.put(bad)
+                self.put(make_receipt(venue=BACH, backend="cuda", outcome="PASS", finished=cuda_time))
+                proc, rep = self.acc()
+                self.assert_not_current(proc, rep, "MALFORMED_NEWER_RECEIPT")
+                cpu = [w for w in rep["acceptance"]["withheld"] if w["backend"] == "cpu"]
+                self.assertEqual(len(cpu), 1, json.dumps(rep["acceptance"], indent=2))
+                self.assertIn(bad["receiptId"], cpu[0]["blockedBy"][0])
+                # the healthy cuda leg is still listed, but the card is not accepted
+                self.assertEqual([r["backend"] for r in rep["acceptance"]["receipts"]], ["cuda"])
+
+    def test_a_malformed_receipt_withholds_its_own_flavor_leg_never_matched_by_a_sibling(self) -> None:
+        self.put(make_receipt(venue=BACH, look_flavor="classic", outcome="FAIL", finished=OLD, digest="bad"))
+        self.put(make_receipt(venue=BACH, look_flavor="cinematic", outcome="PASS", finished=NEW))
+        proc, rep = self.acc()
+        self.assert_not_current(proc, rep, "MALFORMED_NEWER_RECEIPT")
+        self.assertEqual([w["lookFlavor"] for w in rep["acceptance"]["withheld"]], ["classic"])
+
+    def test_an_unkeyable_malformed_file_withholds_the_whole_card_whatever_the_times(self) -> None:
+        for sibling_time in (OLD, NEW):
+            with self.subTest(sibling=sibling_time):
+                self._reset()
+                self.put(make_receipt(venue=BACH, backend="cuda", outcome="PASS", finished=sibling_time))
+                (self.root / CARD / LEG / BACH / "garbage.json").write_text("{ nope", encoding="utf-8")
+                proc, rep = self.acc()
+                self.assert_not_current(proc, rep, "UNORDERABLE_MALFORMED_RECEIPT")
+                self.assertEqual(rep["acceptance"]["withheld"][0]["scope"], "CARD")
+
+    def test_an_unreadable_backend_makes_the_barrier_unkeyable_not_flavorless(self) -> None:
+        self.put(make_receipt(venue=BACH, backend="cuda", outcome="PASS", finished=NEW))
+        bad = make_receipt(venue=BACH, outcome="PASS", finished=OLD)
+        bad["subject"]["backend"] = "vulkan"
+        self.put(bad)
+        proc, rep = self.acc()
+        self.assert_not_current(proc, rep, "UNKEYABLE_MALFORMED_RECEIPT")
+
+    def test_a_malformed_receipt_of_a_supplementary_venue_or_another_card_or_leg_does_not_withhold(self) -> None:
+        self.put(make_receipt(venue=BACH, outcome="PASS", finished=OLD))
+        (self.root / CARD / LEG / UM).mkdir(parents=True)
+        (self.root / CARD / LEG / UM / "garbage.json").write_text("{ nope", encoding="utf-8")  # UM is supplementary
+        (self.root / "CARD-B" / LEG / BACH).mkdir(parents=True)
+        (self.root / "CARD-B" / LEG / BACH / "garbage.json").write_text("{ nope", encoding="utf-8")
+        proc, rep = self.acc()
+        self.assertEqual(proc.returncode, 0, proc.stdout)
+        # a leg-scoped answer is not withheld by a file that names another leg
+        (self.root / CARD / "leg-other" / BACH).mkdir(parents=True)
+        (self.root / CARD / "leg-other" / BACH / "garbage.json").write_text("{ nope", encoding="utf-8")
+        proc, rep = self.acc("-LegId", LEG)
+        self.assertEqual(proc.returncode, 0, proc.stdout)
+        proc, rep = self.acc()
+        self.assert_not_current(proc, rep, "UNORDERABLE_MALFORMED_RECEIPT")
+
+    def test_a_malformed_receipt_finished_at_the_same_instant_as_the_pass_withholds(self) -> None:
+        # the barrier comparison is a tie rule (fail-closed), not "strictly newer"
+        self.put(make_receipt(venue=BACH, outcome="PASS", finished=NEW, receipt_id="zzzz-pass"))
+        self.put(make_receipt(venue=BACH, outcome="FAIL", finished=NEW, digest="bad", receipt_id="aaaa-bad"))
+        proc, rep = self.acc()
+        self.assert_not_current(proc, rep, "MALFORMED_NEWER_RECEIPT")
+
+    def test_a_receipt_finished_before_it_started_is_unorderable_not_ordered_by_that_finish(self) -> None:
+        self.put(make_receipt(venue=BACH, outcome="PASS", finished=NEW))
+        self.put(make_receipt(venue=BACH, outcome="FAIL", started="2026-09-30T23:00:00Z", finished=OLD))
+        proc, rep = self.acc()
+        # finished (08:00) is older than the PASS (09:00), but it is not an instant anyone can order by
+        self.assert_not_current(proc, rep, "UNORDERABLE_MALFORMED_RECEIPT")
+
+
+@requires_pwsh
+class NonRunTerminalMetricsTests(_AcceptBase):
+    """fable r1 DVE-RECEIPT-NONRUN-METRICS-NULL-1: a terminal reached before a run has no measurements."""
+
+    NON_RUN = ("VENUE_UNHEALTHY", "VENUE_NOT_QUIESCENT", "VENUE_HOST_MISMATCH", "DEVICE_UNAVAILABLE", "UNRESOLVED", "RETRACTED")
+
+    def _null_metrics(self, outcome: str, **kw) -> dict:
+        r = make_receipt(outcome=outcome, **kw)
+        r["metrics"] = None
+        return r
+
+    def test_a_pre_run_terminal_with_null_metrics_is_a_well_formed_receipt(self) -> None:
+        for outcome in self.NON_RUN:
+            with self.subTest(outcome=outcome):
+                shutil.rmtree(self.root)
+                self.root.mkdir()
+                self.put(self._null_metrics(outcome, venue=BACH, detected=UM if outcome == "VENUE_HOST_MISMATCH" else None))
+                proc, rep = self.acc()
+                self.assertEqual(rep["counts"]["malformed"], 0, json.dumps(rep["malformed"]))
+                self.assertEqual(rep["counts"]["valid"], 1)
+                self.assert_not_current(proc, rep, outcome)  # its TYPED reason, not MALFORMED_NEWER_RECEIPT
+
+    def test_a_pre_run_terminal_with_the_metrics_key_absent_is_well_formed_too(self) -> None:
+        r = make_receipt(venue=BACH, outcome="UNRESOLVED")
+        del r["metrics"]
+        self.put(r)
+        proc, rep = self.acc()
+        self.assertEqual(rep["counts"]["malformed"], 0)
+        self.assert_not_current(proc, rep, "UNRESOLVED")
+
+    def test_pass_and_fail_still_need_a_metrics_object(self) -> None:
+        for outcome in ("PASS", "FAIL"):
+            for bad in (None, 5, "x", [1]):
+                with self.subTest(outcome=outcome, metrics=bad):
+                    shutil.rmtree(self.root)
+                    self.root.mkdir()
+                    r = make_receipt(venue=BACH, outcome=outcome)
+                    r["metrics"] = bad
+                    self.put(r)
+                    proc, rep = self.acc()
+                    self.assertEqual(rep["counts"]["malformed"], 1)
+                    self.assert_not_current(proc, rep)
+
+    def test_a_non_object_non_null_metrics_is_malformed_even_for_a_pre_run_terminal(self) -> None:
+        r = make_receipt(venue=BACH, outcome="UNRESOLVED")
+        r["metrics"] = 5
+        self.put(r)
+        self.assertEqual(self.report()["counts"]["malformed"], 1)
+
+    def test_the_sibling_backend_scenario_with_runner_shaped_receipts(self) -> None:
+        # fable's repro, as EVIDENCE-1 writes it: cpu VENUE_UNHEALTHY (metrics null) and a cuda PASS, one legId. It read
+        # ACCEPTANCE_EVIDENCE exit 0 when the cpu receipt was the older one; now the answer never depends on run order.
+        for cpu_time, cuda_time in ("2026-09-30T08:30:00Z", NEW), (NEW, OLD):
+            with self.subTest(cpu=cpu_time, cuda=cuda_time):
+                shutil.rmtree(self.root)
+                self.root.mkdir()
+                self.put(self._null_metrics("VENUE_UNHEALTHY", venue=BACH, backend="cpu", finished=cpu_time))
+                self.put(make_receipt(venue=BACH, backend="cuda", outcome="PASS", finished=cuda_time))
+                proc, rep = self.acc()
+                self.assert_not_current(proc, rep, "VENUE_UNHEALTHY")
+                self.assertEqual([w["backend"] for w in rep["acceptance"]["withheld"]], ["cpu"])
+                self.assertEqual(rep["counts"]["malformed"], 0)
+
+
+class SingleSelectionPathTests(unittest.TestCase):
+    """Hub ruling C: there is exactly one selection / latest / completeness code path. Deleting a second one is not
+    enough if somebody re-adds it, so the module text is asserted."""
+
+    @classmethod
+    def setUpClass(cls) -> None:
+        cls.text = MODULE.read_text(encoding="utf-8")
+        # drop comments (block and line) so prose can neither satisfy nor break a count
+        no_block = re.sub(r"<#.*?#>", "", cls.text, flags=re.S)
+        cls.code = "\n".join(re.sub(r"(?<![\w'\"$])#.*$", "", ln) for ln in no_block.splitlines())
+
+    def _body(self, name: str) -> str:
+        m = re.search(r"^function " + re.escape(name) + r" \{.*?^\}", self.code, re.S | re.M)
+        self.assertIsNotNone(m, name)
+        return m.group(0)
+
+    def test_the_newest_attempt_function_is_defined_once_and_called_once(self) -> None:
+        self.assertEqual(len(re.findall(r"^function Get-VeNewestAttempts\b", self.code, re.M)), 1)
+        self.assertEqual(len(re.findall(r"Get-VeNewestAttempts\s+-Participants", self.code)), 1)
+        # ...from the report function, before the acceptance / report split, so both modes read the same value
+        body = self._body("Get-VenueEvidenceReport")
+        self.assertEqual(len(re.findall(r"Get-VeNewestAttempts", body)), 1)
+        self.assertLess(body.index("Get-VeNewestAttempts"), body.index("if ($AcceptanceFor) {"))
+
+    def test_ordering_and_picking_the_last_attempt_happen_only_inside_it(self) -> None:
+        self.assertEqual(len(re.findall(r"Sort-VeReceipts", self.code)), 2)  # its definition and one call
+        self.assertIn("Sort-VeReceipts", self._body("Get-VeNewestAttempts"))
+        self.assertEqual(len(re.findall(r"Count - 1\]", self.code)), 1)
+        self.assertEqual(self.code.count("[-1]"), 0)
+        self.assertEqual(len(re.findall(r"\.finished\.UtcTicks", self.code)), 2)  # the comparison inside Sort-VeReceipts, nowhere else
+        self.assertEqual(len(re.findall(r"Select-Object -Last|Measure-Object -Maximum|Sort-Object finished", self.code)), 0)
+
+    def test_the_validated_state_has_one_definition_and_is_assigned_once(self) -> None:
+        self.assertEqual(len(re.findall(r"^function Get-VeValidatedState\b", self.code, re.M)), 1)
+        self.assertEqual(len(re.findall(r"Get-VeValidatedState\s+-Record", self.code)), 1)
+        self.assertEqual(len(re.findall(r"\$r\.state = ", self.code)), 1)
+        self.assertEqual(len(re.findall(r"\$\w+\.refusal = ", self.code)), 1)
+
+    def test_a_leg_key_is_built_in_one_place_and_the_modes_do_not_re_group(self) -> None:
+        self.assertEqual(self.code.count("-join '|'"), 1)
+        self.assertIn("-join '|'", self._body("Get-VeLegKey"))
+        body = self._body("Get-VenueEvidenceReport")
+        # neither mode partitions receipts itself: they read legs from the one function
+        self.assertNotIn("$participants", body)
+        self.assertNotIn("$structural | Where-Object", body)
+        self.assertNotIn("Sort-VeReceipts", body)
+        self.assertEqual(len(re.findall(r"\$newest\.legs", body)), 2)  # one loop per mode
+
+    def test_completeness_is_a_pure_function_of_each_legs_validated_state(self) -> None:
+        body = self._body("Get-VenueEvidenceReport")
+        # report mode never re-derives status from the receipt's own outcome or refusal
+        self.assertNotIn("$eff", body)
+        self.assertNotIn(".refusal)", body)
+        self.assertNotIn("$_.outcome -in", body)
+
+
+@requires_pwsh
+class NewestAttemptPropertyTests(_AcceptBase):
+    """For random receipt sets x filters, an INDEPENDENT oracle (plain Python over the generated attempts) and both modes
+    agree on the newest attempt and its state for every leg. One pwsh process runs every scenario."""
+
+    SCENARIOS = 60
+    BASE_SEED = 20260930
+    LEGS = [("l1", None, None), ("l1", "cuda", None), ("l2", None, "classic"), ("l2", "cpu", "classic")]
+    DIGESTS = [hashlib.sha256(f"prop-{i}".encode()).hexdigest() for i in range(3)]
+    BUILDS = ["1" * 64, "2" * 64]
+    KINDS = {  # kind -> (weight, expected state | None for a malformed attempt)
+        "pass": (30, "PASS"), "fail": (14, "FAIL"), "loop": (6, "INVALID_LOOPED"), "short": (5, "INVALID_CLIP_TOO_SHORT"),
+        "unver": (5, "UNVERIFIED_CLIP_LENGTH"), "unres": (4, "UNRESOLVED"), "unhealthy": (4, "VENUE_UNHEALTHY"),
+        "retract": (3, "RETRACTED"), "detect": (4, "VENUE_DETECTION_MISMATCH"), "malformed": (8, None),
+    }
+
+    def _receipt(self, kind: str, venue: str, **common) -> dict:
+        other = UM if venue == BACH else BACH
+        if kind == "pass":
+            return make_receipt(venue=venue, outcome="PASS", **common)
+        if kind == "fail":
+            return make_receipt(venue=venue, outcome="FAIL", **common)
+        if kind == "loop":
+            return make_receipt(venue=venue, outcome="FAIL", wrapped=1, **common)
+        if kind == "short":
+            return make_receipt(venue=venue, outcome="PASS", clip_seconds=3, **common)
+        if kind == "unver":
+            return make_receipt(venue=venue, outcome="PASS", clip_seconds=None, **common)
+        if kind == "unres":
+            return make_receipt(venue=venue, outcome="UNRESOLVED", **common)
+        if kind == "unhealthy":  # as the runner writes it: no run, so metrics null
+            r = make_receipt(venue=venue, outcome="VENUE_UNHEALTHY", **common)
+            r["metrics"] = None
+            return r
+        if kind == "retract":
+            return make_receipt(venue=venue, outcome="RETRACTED", **common)
+        if kind == "detect":
+            return make_receipt(venue=venue, outcome="PASS", detected=other, **common)
+        r = make_receipt(venue=venue, outcome="PASS", **common)  # malformed but fully keyable
+        del r["subject"]["clipContentSha256"]
+        return r
+
+    def _scenario(self, rng: random.Random, folder: Path) -> dict:
+        root = folder / "receipts"
+        root.mkdir(parents=True)
+        n = rng.randint(1, 14)
+        minutes = rng.sample(range(1, 58), n)  # distinct finish times: "newest" is never an exact tie
+        names = list(self.KINDS)
+        weights = [self.KINDS[k][0] for k in names]
+        attempts = []
+        for i, minute in enumerate(minutes):
+            leg, backend, flavor = rng.choice(self.LEGS)
+            venue = rng.choice([BACH, BACH, UM])
+            kind = rng.choices(names, weights)[0]
+            digest, build = rng.choice(self.DIGESTS), rng.choice(self.BUILDS)
+            rid = f"{folder.name}-r{i}"
+            r = self._receipt(kind, venue, leg=leg, backend=backend, look_flavor=flavor, digest=digest, build=build,
+                              finished=f"2026-09-30T08:{minute:02d}:00Z", receipt_id=rid)
+            path = root / CARD / leg / venue / f"{rid}.json"
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text(json.dumps(r), encoding="utf-8")
+            attempts.append(dict(leg=(leg, backend, flavor), venue=venue, minute=minute, state=self.KINDS[kind][1],
+                                 id=rid, digest=digest, build=build))
+        garbage = []
+        if rng.random() < 0.2:  # a file that cannot be read at all, sitting in a leg folder
+            leg, venue = rng.choice(["l1", "l2"]), rng.choice([BACH, UM])
+            path = root / CARD / leg / venue / "garbage.json"
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text("{ nope", encoding="utf-8")
+            garbage.append(dict(leg=leg, venue=venue))
+        flt = {}
+        pick = rng.choice(["none", "none", "digest", "build", "leg"])
+        if pick == "digest":
+            flt["SubjectDigest"] = rng.choice(self.DIGESTS)
+        elif pick == "build":
+            flt["BuildManifestSha256"] = rng.choice(self.BUILDS)
+        elif pick == "leg":
+            flt["LegId"] = rng.choice(["l1", "l2"])
+        (folder / "filters.json").write_text(json.dumps(flt), encoding="utf-8")
+        return dict(attempts=attempts, garbage=garbage, flt=flt)
+
+    @staticmethod
+    def _newest(attempts: list) -> dict:
+        return max(attempts, key=lambda a: a["minute"])
+
+    def _oracle_acceptance(self, sc: dict, flt: dict) -> tuple:
+        by_leg: dict = {}
+        for a in sc["attempts"]:
+            if a["venue"] == BACH:
+                by_leg.setdefault(a["leg"], []).append(a)
+        expect = {}
+        for leg, lst in by_leg.items():
+            if flt.get("LegId") and leg[0] != flt["LegId"]:
+                continue
+            top = self._newest(lst)
+            if top["state"] is None:
+                state, rid = "MALFORMED_NEWER_RECEIPT", None
+            elif (flt.get("SubjectDigest") and top["digest"] != flt["SubjectDigest"]) or \
+                    (flt.get("BuildManifestSha256") and top["build"] != flt["BuildManifestSha256"]):
+                state, rid = "NEWER_ATTEMPT_OUTSIDE_FILTER", top["id"]
+            else:
+                state, rid = top["state"], top["id"]
+            expect[leg] = (state, rid)
+        card_wide = [g for g in sc["garbage"] if g["venue"] == BACH and (not flt.get("LegId") or g["leg"] == flt["LegId"])]
+        green = (not card_wide) and bool(expect) and all(s in ("PASS", "FAIL") for s, _ in expect.values())
+        return expect, bool(card_wide), green
+
+    def _check_acceptance(self, ctx: str, acc: dict, sc: dict, flt: dict) -> dict:
+        expect, card_wide, green = self._oracle_acceptance(sc, flt)
+        a = acc["acceptance"]
+        got = {}
+        for r in a["receipts"]:
+            got[(r["legId"], r["backend"], r["lookFlavor"])] = (r["outcome"], r["receiptId"])
+        wide = [w for w in a["withheld"] if w.get("scope") == "CARD"]
+        for w in a["withheld"]:
+            if w.get("scope") != "CARD":
+                got[(w["legId"], w["backend"], w["lookFlavor"])] = (w["reason"], w["receiptId"])
+        self.assertEqual(got, expect, f"{ctx}: per-leg newest attempt/state differs from the oracle\n{json.dumps(a, indent=1)}")
+        self.assertEqual(bool(wide), card_wide, ctx)
+        self.assertEqual(a["status"] == "ACCEPTANCE_EVIDENCE", green, f"{ctx}: status {a['status']}")
+        return got
+
+    def _check_report(self, ctx: str, rep: dict, sc: dict) -> None:
+        newest: dict = {}
+        for a in sc["attempts"]:
+            newest.setdefault(a["leg"], {})
+            cur = newest[a["leg"]].get(a["venue"])
+            if cur is None or a["minute"] > cur["minute"]:
+                newest[a["leg"]][a["venue"]] = a
+        groups = rep["groups"]
+        self.assertEqual(len({(g["legId"], g["backend"], g["lookFlavor"], g["subjectDigest"]) for g in groups}), len(groups), ctx)
+        for leg, per_venue in newest.items():
+            digests = sorted({v["digest"] for v in per_venue.values() if v["state"] is not None}) or [None]
+            found = [g for g in groups if (g["legId"], g["backend"], g["lookFlavor"]) == leg]
+            self.assertEqual(sorted((g["subjectDigest"] for g in found), key=str), sorted(digests, key=str), ctx)
+            for g in found:
+                complete = not sc["garbage"]
+                for v in (BACH, UM):
+                    row, a = g["venues"][v], per_venue.get(v)
+                    if a is None:
+                        self.assertEqual(row["status"], "missing", ctx)
+                        complete = False
+                    elif a["state"] is None:
+                        self.assertEqual((row["status"], row["latest"]), ("MALFORMED_NEWER_RECEIPT", None), ctx)
+                        complete = False
+                    elif a["digest"] != g["subjectDigest"]:
+                        self.assertEqual((row["status"], row["latest"]), ("NEWEST_ATTEMPT_AT_OTHER_DIGEST", None), ctx)
+                        complete = False
+                    else:
+                        self.assertEqual((row["status"], row["latest"]["receiptId"]), (a["state"], a["id"]), ctx)
+                        complete = complete and a["state"] in ("PASS", "FAIL")
+                self.assertEqual(g["pair"]["state"], "COMPLETE" if complete else "INCOMPLETE", f"{ctx}: {json.dumps(g, indent=1)}")
+                self.assertEqual("delta" in g, complete, ctx)
+
+    def test_acceptance_and_report_agree_with_an_independent_oracle_on_every_leg(self) -> None:
+        base = self.tmp / "prop"
+        scenarios = {}
+        for i in range(self.SCENARIOS):
+            name = f"s{i:03d}"
+            scenarios[name] = self._scenario(random.Random(self.BASE_SEED + i), base / name)
+        script = self.tmp / "batch.ps1"
+        script.write_text(
+            "param($Base, $Module, $Table)\n"
+            "Import-Module $Module -Force\n"
+            "$result = [ordered]@{}\n"
+            "foreach ($d in (Get-ChildItem -LiteralPath $Base -Directory | Sort-Object Name)) {\n"
+            "  $root = Join-Path $d.FullName 'receipts'\n"
+            "  $flt = Get-Content -LiteralPath (Join-Path $d.FullName 'filters.json') -Raw | ConvertFrom-Json -AsHashtable\n"
+            "  $acc = Get-VenueEvidenceReport -ReceiptsRoot $root -VenueTablePath $Table -AcceptanceFor 'CARD-A' @flt\n"
+            "  $unf = Get-VenueEvidenceReport -ReceiptsRoot $root -VenueTablePath $Table -AcceptanceFor 'CARD-A'\n"
+            "  $rep = Get-VenueEvidenceReport -ReceiptsRoot $root -VenueTablePath $Table\n"
+            "  $result[$d.Name] = [ordered]@{ acc = $acc; unf = $unf; rep = $rep }\n"
+            "}\n"
+            "ConvertTo-Json -InputObject $result -Depth 30 | Set-Content -LiteralPath (Join-Path $Base 'out.json') -Encoding utf8\n",
+            encoding="utf-8")
+        proc = subprocess.run([PWSH, "-NoLogo", "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-File", str(script),
+                               "-Base", str(base), "-Module", str(MODULE), "-Table", str(self.table)],
+                              capture_output=True, text=True, timeout=600)
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        out = json.loads((base / "out.json").read_text(encoding="utf-8"))
+        self.assertEqual(len(out), self.SCENARIOS)
+        agreed = 0
+        for i in range(self.SCENARIOS):
+            name = f"s{i:03d}"
+            sc, res = scenarios[name], out[name]
+            ctx = f"scenario {name} (seed {self.BASE_SEED + i}) filters={sc['flt']}"
+            self._check_acceptance(ctx + " [filtered]", res["acc"], sc, sc["flt"])
+            unf = self._check_acceptance(ctx + " [unfiltered]", res["unf"], sc, {})
+            self._check_report(ctx + " [report]", res["rep"], sc)
+            # acceptance and report agree with EACH OTHER on the newest attempt and its state (bachelor is the acceptance venue)
+            for (leg, backend, flavor), (state, rid) in unf.items():
+                rows = [g["venues"][BACH] for g in res["rep"]["groups"] if (g["legId"], g["backend"], g["lookFlavor"]) == (leg, backend, flavor)]
+                self.assertTrue(rows, ctx)
+                if rid is None:
+                    self.assertTrue(all(r["status"] == state for r in rows), ctx)
+                else:
+                    mine = [r for r in rows if r["latest"] is not None]
+                    self.assertEqual([(r["status"], r["latest"]["receiptId"]) for r in mine], [(state, rid)], ctx)
+                agreed += 1
+        self.assertGreater(agreed, 20, "the generator produced too few acceptance legs to mean anything")
 
 
 if __name__ == "__main__":
