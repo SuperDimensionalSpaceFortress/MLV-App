@@ -6342,6 +6342,16 @@ static int mlv_preview_direct8_input_is_cheap(mlvObject_t * video, int normalize
     return 1;
 }
 
+/* The playback dispatch decision, exactly as getMlvProcessedFrame8Scaled makes
+ * it (receipt capability AND input cheapness at the effective scale). Exposed so
+ * the GPU display path can follow the CPU route instead of re-deriving it. */
+int mlvPreviewPlaybackUsesDirect8Route(mlvObject_t * video, int scaleFactor)
+{
+    const int normalizedScale = mlv_effective_playback_scale_factor(video, scaleFactor);
+    return mlv_can_use_direct_processed_frame8_path(video)
+        && mlv_preview_direct8_input_is_cheap(video, normalizedScale);
+}
+
 /* Round-4 item 2: never let the direct8 kernel write the caller's buffer in
  * place across the full render duration. The playback caller hands the LIVE
  * presented frame buffer down here; the row-parallel kernel writes it over
@@ -7285,8 +7295,7 @@ static void getMlvProcessedFrame8_with_scale(mlvObject_t * video,
     const int out_h  = (normalizedScale > 1) ? (full_h / normalizedScale) : full_h;
     uint64_t rgb_frame_size = (uint64_t)out_w * (uint64_t)out_h * 3u;
     uint16_t * processed_frame = NULL;
-    const int direct8PathActive = mlv_can_use_direct_processed_frame8_path(video)
-        && mlv_preview_direct8_input_is_cheap(video, normalizedScale);
+    const int direct8PathActive = mlvPreviewPlaybackUsesDirect8Route(video, scaleFactor);
     /* Processed8 prefetch can run even when the foreground direct8 path
      * stays conservative; the worker only warms the cache and does not
      * change the pixels we present. */

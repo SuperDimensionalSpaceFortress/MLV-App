@@ -1192,6 +1192,8 @@ void GpuDisplayViewport::setPresentedImage(const QImage &image, const Presentati
     m_pendingTextureIs16Bit = false;
     m_textureDirty = true;
     setPresentationOptions(options);
+    // CUDA-PLAYBACK-LOOK-PARITY-2 (fable r2): no fresh S/H blur on this route.
+    gpuPreviewProcessingMarkShadowsHighlightsBlurStale(&m_lutSet);
     m_texturePresentationActive = false;
     if ( m_fallbackItem ) m_fallbackItem->setVisible(false);
     update();
@@ -1226,6 +1228,8 @@ void GpuDisplayViewport::setPresentedRgb16(const uint16_t *imageData,
     m_pendingTextureIs16Bit = true;
     m_textureDirty = true;
     setPresentationOptions(options);
+    // CUDA-PLAYBACK-LOOK-PARITY-2 (fable r2): no fresh S/H blur on this route.
+    gpuPreviewProcessingMarkShadowsHighlightsBlurStale(&m_lutSet);
     m_texturePresentationActive = false;
     if ( m_fallbackItem ) m_fallbackItem->setVisible(false);
     update();
@@ -1250,6 +1254,8 @@ void GpuDisplayViewport::setPresentedBayer16(const uint16_t *imageData,
     m_pendingTextureIs16Bit = true;
     m_textureDirty = true;
     setPresentationOptions(options);
+    // CUDA-PLAYBACK-LOOK-PARITY-2 (fable r2): no fresh S/H blur on this route.
+    gpuPreviewProcessingMarkShadowsHighlightsBlurStale(&m_lutSet);
     m_texturePresentationActive = false;
     if ( m_fallbackItem ) m_fallbackItem->setVisible(false);
     update();
@@ -1323,7 +1329,7 @@ bool GpuDisplayViewport::setPresentedGpuPlaybackReconTexture(
     // route, so a blur left over from an earlier AMaZE present would otherwise be
     // bound as if it belonged to this frame. Mark it not-ready: previewApplyShadows
     // Highlights binds false for this frame (a disclosed gap, not a stale look).
-    m_lutSet.shadowsHighlightsBlurReady = false;
+    gpuPreviewProcessingMarkShadowsHighlightsBlurStale(&m_lutSet);
 
     // FAIL CLOSED (GPU-TEXNR-S1-DARK-GREEN-1 round 4, fable minor): this raw-Bayer16
     // route feeds the same shared display shader/LUT set as the AMaZE route, whose
@@ -1843,6 +1849,9 @@ bool GpuDisplayViewport::setPresentedAmazePostWbTexture(const float *rawFrame,
 
     setPresentationOptions(options);
     updateProcessingTexturesIfNeeded();
+    // CUDA-PLAYBACK-LOOK-PARITY-2 (fable r2): this AMaZE route uploads no S/H blur
+    // (only setPresentedGpuPlaybackReconAmazePostWbTexture does).
+    gpuPreviewProcessingMarkShadowsHighlightsBlurStale(&m_lutSet);
 
     if ( !m_texture
       || m_texture->width() != width

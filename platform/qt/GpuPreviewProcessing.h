@@ -15,6 +15,13 @@ struct GpuPreviewProcessingConfig
     bool enabled = false;
     bool useCameraMatrix = false;
     bool applyGamutCompression = false;
+    /* The LIVE DISPLAY shader's pre-camera clamp (see
+     * gpuPreviewProcessingApplyCpuRoute): true clamps + truncates the WB-matrix
+     * output to uint16 before the camera matrix like the generic 16-bit loop,
+     * false feeds it unclamped like the direct-8-bit kernel without AgX/local
+     * tone. Default true = the historical shader behaviour. Not part of the
+     * signature: it is a uniform, not a texture. */
+    bool preCameraClamp = true;
     float sourceExposureStops = 0.0f;
     float properWbMatrix[9] = { 0.0f };
     float rgbToY[3] = { 0.0f };
@@ -146,6 +153,14 @@ bool gpuPreviewProcessingHasShadowsHighlightsFrameState(
     const GpuPreviewProcessingConfig & config,
     int width,
     int height);
+/* Declares the DISPLAY PARITY REFERENCE: the display shader reproduces the CPU
+ * preview route for the current state. direct8Route is the engine's own
+ * dispatch decision (mlvPreviewPlaybackUsesDirect8Route: direct8-eligible AND
+ * input cheap at the playback scale); the clamp flag is then asked of the
+ * engine (processingCpuRoutePreCameraClamps), never re-derived here. */
+void gpuPreviewProcessingApplyCpuRoute(GpuPreviewProcessingConfig * config,
+                                       const processingObject_t * processing,
+                                       bool direct8Route);
 bool gpuPreviewProcessingAttachFrameState(GpuPreviewProcessingConfig * config,
                                           const processingObject_t * processing,
                                           int width,
@@ -215,6 +230,14 @@ struct GpuPreviewProcessingLutTextureSet
     int shadowsHighlightsBlurHeight = 0;
     bool shadowsHighlightsBlurReady = false;
 };
+
+/* A presenter route that does NOT upload a fresh per-frame shadows/highlights
+ * blur must call this, so the display shader binds S/H off for that frame
+ * instead of sampling a blur left over from an earlier route (the LUT set is
+ * shared between the routes of one presenter). Routes that DO upload one go
+ * through gpuPreviewProcessingUpdateShadowsHighlightsBlurTexture, which sets
+ * the flag itself. */
+void gpuPreviewProcessingMarkShadowsHighlightsBlurStale(GpuPreviewProcessingLutTextureSet * set);
 
 /* Per-presenter display knobs for gpuPreviewProcessingBindDisplayUniformsAndTextures,
  * beyond the GpuPreviewProcessingConfig itself. */

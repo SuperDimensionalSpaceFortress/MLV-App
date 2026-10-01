@@ -1406,6 +1406,7 @@ QByteArray gpuPreviewProcessingDisplayFragmentShaderSource(void)
         "uniform float previewProcessingEnabled;\n"
         "uniform float previewUseCameraMatrix;\n"
         "uniform float previewApplyGamutCompression;\n"
+        "uniform float previewPreCameraClamp;\n"
         "uniform vec3 previewProperWbRow0;\n"
         "uniform vec3 previewProperWbRow1;\n"
         "uniform vec3 previewProperWbRow2;\n"
@@ -1606,10 +1607,22 @@ QByteArray gpuPreviewProcessingDisplayFragmentShaderSource(void)
         "        float cval = floor((diagonal.r * 4.0 + diagonal.g * 11.0 + diagonal.b) / 16.0);\n"
         "        expoCorrection *= sampleContrastCurve(inLoopContrastCurve, cval);\n"
         "    }\n"
-        /* The engine multiplies the UNclamped diagonal value by expo_correction
-         * and stores pix[i] = (uint16_t)LIMIT16(...) -- clamp, then truncate --
-         * BEFORE the camera matrix (raw_processing.c ~3420). */
-        "    vec3 pix = floor(clamp(diagonal * expoCorrection, 0.0, 65535.0));\n"
+        /* CUDA-PLAYBACK-LOOK-PARITY-2: the DECLARED PARITY REFERENCE is the CPU
+         * preview route (direct8 when the receipt is eligible and the input is
+         * cheap, else the generic 16-bit loop); previewPreCameraClamp is that
+         * route's behaviour, decided by the engine (processingCpuRoutePreCameraClamps).
+         * Clamped route: the engine multiplies the UNclamped diagonal value by
+         * expo_correction and stores pix[i] = (uint16_t)LIMIT16(...) -- clamp, then
+         * truncate -- BEFORE the camera matrix (generic loop raw_processing.c ~3420;
+         * direct8 kernel only with AgX or contrast/S-H, raw_processing_8bit_kernel.inc
+         * ~189-197). Unclamped route (direct8 with none of them, or the 16-bit
+         * basic-matrix branch): the float diagonal value goes straight into the
+         * camera matrix. */
+        "    vec3 pix = diagonal * expoCorrection;\n"
+        "    if (previewPreCameraClamp > 0.5)\n"
+        "    {\n"
+        "        pix = floor(clamp(pix, 0.0, 65535.0));\n"
+        "    }\n"
         /* From here on `pix` is in 16-bit CODE units, like the engine's uint16
          * pix[]. The ratios in the gamut compression are scale-invariant; only
          * the near-zero-denominator guard is scaled (1e-8 * 65535). */
@@ -1634,9 +1647,21 @@ QByteArray gpuPreviewProcessingDisplayFragmentShaderSource(void)
         "        }\n"
         "        pix = wbApplied;\n"
         "    }\n"
-        /* Engine: pix[i] = LIMIT16(result) stored to uint16 (truncation), then
-         * pre_calc_gamma[pix[i]] (raw_processing.c ~3498, ~3555). */
+        /* Clamped route: pix[i] = LIMIT16(result) stored to uint16 (truncation),
+         * then pre_calc_gamma[pix[i]] (raw_processing.c ~3498, ~3555).
+         * Unclamped route: pre_calc_gamma[LIMIT16((uint32_t)result)]
+         * (raw_processing_8bit_kernel.inc ~287, and the intrinsics kernel
+         * deliberately): truncation toward zero, and a result at or below -1 wraps
+         * to a huge uint32 which LIMIT16 turns into 65535 -- reproduced, not
+         * "fixed"; the gamut step keeps real pixels from reaching it. */
         "    vec3 gammaIndex = floor(clamp(pix, 0.0, 65535.0));\n"
+        "    if (previewPreCameraClamp <= 0.5)\n"
+        "    {\n"
+        "        vec3 truncated = truncToZero(pix);\n"
+        "        gammaIndex = vec3(truncated.r < 0.0 ? 65535.0 : min(truncated.r, 65535.0),\n"
+        "                          truncated.g < 0.0 ? 65535.0 : min(truncated.g, 65535.0),\n"
+        "                          truncated.b < 0.0 ? 65535.0 : min(truncated.b, 65535.0));\n"
+        "    }\n"
         "    vec3 result = vec3(sampleU16LutIndex(gammaLut, gammaIndex.r), sampleU16LutIndex(gammaLut, gammaIndex.g), sampleU16LutIndex(gammaLut, gammaIndex.b));\n"
         "    if (previewApplyVibrance > 0.5)\n"
         "    {\n"
@@ -2296,6 +2321,11 @@ void gpuPreviewProcessingDestroyLutTextureSet(GpuPreviewProcessingLutTextureSet 
     set.shadowsHighlightsBlurReady = false;
 }
 
+void gpuPreviewProcessingMarkShadowsHighlightsBlurStale(GpuPreviewProcessingLutTextureSet * set)
+{
+    if ( set ) set->shadowsHighlightsBlurReady = false;
+}
+
 void gpuPreviewProcessingUpdateLutTextureSet(GpuPreviewProcessingLutTextureSet & set,
                                              const GpuPreviewProcessingConfig & config)
 {
@@ -2525,6 +2555,7 @@ void gpuPreviewProcessingBindDisplayUniformsAndTextures(
     program->setUniformValue("previewProcessingEnabled", lutsReady ? 1.0f : 0.0f);
     program->setUniformValue("previewUseCameraMatrix", config.useCameraMatrix ? 1.0f : 0.0f);
     program->setUniformValue("previewApplyGamutCompression", config.applyGamutCompression ? 1.0f : 0.0f);
+    program->setUniformValue("previewPreCameraClamp", config.preCameraClamp ? 1.0f : 0.0f);
     program->setUniformValue("previewProperWbRow0",
                              QVector3D(config.properWbMatrix[0], config.properWbMatrix[1], config.properWbMatrix[2]));
     program->setUniformValue("previewProperWbRow1",
@@ -3177,6 +3208,15 @@ bool gpuPreviewProcessingHasShadowsHighlightsFrameState(
             == static_cast<int>(pixelCount * 3u * sizeof(uint16_t))
         && config.shadowsHighlightsCurve.size()
             == static_cast<int>(65536u * sizeof(float));
+}
+
+void gpuPreviewProcessingApplyCpuRoute(GpuPreviewProcessingConfig * config,
+                                       const processingObject_t * processing,
+                                       bool direct8Route)
+{
+    if ( !config ) return;
+    config->preCameraClamp =
+        processingCpuRoutePreCameraClamps(processing, direct8Route ? 1 : 0) != 0;
 }
 
 bool gpuPreviewProcessingAttachFrameState(GpuPreviewProcessingConfig * config,

@@ -513,6 +513,54 @@ jobs:
             exit $LASTEXITCODE
           }
 
+      # CUDA-PLAYBACK-LOOK-PARITY-2 (fable r2 CUDA-LOOK-ENGINE-PARITY-HOSTED-NOT-SKIPPED-1):
+      # the display-shader parity tests SKIP when no GL backend can be created, and the
+      # shards above run them without forcing one, so a runner without a usable GL turned
+      # the whole parity claim into skipped tests (no hosted log ever showed them running).
+      # This step is the job that CLAIMS parity: it forces Mesa software GL (opengl32sw,
+      # installed with Qt) and sets MLVAPP_REQUIRE_DISPLAY_PARITY_GL=1, which turns an
+      # unavailable backend into a test FAILURE, then refuses any skip and any run that
+      # executed too few tests.
+      - name: Display parity (software GL required, never skipped)
+        if: needs.protected-check-route.outputs.product == 'true'
+        env:
+          QT_OPENGL: software
+          MLVAPP_REQUIRE_DISPLAY_PARITY_GL: "1"
+        run: |
+          $env:PATH = "$env:QT_ROOT_DIR\bin;$env:MINGW_ROOT\bin;$env:PATH"
+          $exe = (Resolve-Path "tests\build-ci-pipeline\release\pipeline_tests.exe").Path
+          $glDll = Join-Path $env:QT_ROOT_DIR "bin\opengl32sw.dll"
+          if (-not (Test-Path -LiteralPath $glDll)) { throw "opengl32sw.dll missing from the Qt install ($glDll); display parity cannot run" }
+          Copy-Item -LiteralPath $glDll -Destination (Split-Path $exe) -Force
+          $filter = 'GpuPreviewProcessing.EngineAnchored*:GpuPreviewProcessing.DisplayShaderContrastPivotMatchesProductionEngine:GpuPreviewProcessing.DisplayShaderVibranceMatchesProductionEngine:GpuPreviewProcessing.DisplayShaderShadowsHighlightsMatchesProductionEngine:GpuPreviewProcessing.DisplayShaderCombinedLookAssistPresetMatchesProductionEngine:GpuPreviewProcessing.Direct8Anchored*:GpuPreviewProcessing.ShadowsHighlightsKillSwitchBypassRestoresPreFixLook'
+          $outputPath = Join-Path $env:RUNNER_TEMP "pipeline-tests-display-parity.txt"
+          $psi = [System.Diagnostics.ProcessStartInfo]::new()
+          $psi.FileName = $exe
+          $psi.WorkingDirectory = $env:GITHUB_WORKSPACE
+          $psi.UseShellExecute = $false
+          $psi.RedirectStandardOutput = $true
+          $psi.RedirectStandardError = $true
+          [void]$psi.ArgumentList.Add("--gtest_filter=$filter")
+          $process = [System.Diagnostics.Process]::new()
+          $process.StartInfo = $psi
+          if (-not $process.Start()) { throw "failed to start the display parity run" }
+          $stdoutTask = $process.StandardOutput.ReadToEndAsync()
+          $stderrTask = $process.StandardError.ReadToEndAsync()
+          $timedOut = -not $process.WaitForExit(900000)
+          if ($timedOut) { try { $process.Kill($true) } catch { } }
+          $process.WaitForExit()
+          $combined = $stdoutTask.GetAwaiter().GetResult() + $stderrTask.GetAwaiter().GetResult()
+          Set-Content -Path $outputPath -Value $combined -Encoding utf8
+          Write-Output $combined
+          if ($timedOut) { throw "display parity run exceeded 900 seconds (output retained)" }
+          if ($process.ExitCode -ne 0) { throw "display parity run failed (exit $($process.ExitCode))" }
+          if ($combined -match '\[SKIP\]') { throw "display parity: a test SKIPPED; the parity claim is not proven" }
+          $summary = [regex]::Match($combined, '\[SUMMARY\] tests=(\d+) assertions=\d+ skipped=(\d+) failed=(\d+)')
+          if (-not $summary.Success) { throw "display parity: no [SUMMARY] line in the output" }
+          if ([int]$summary.Groups[2].Value -ne 0 -or [int]$summary.Groups[3].Value -ne 0) { throw "display parity: skipped or failed tests in the summary" }
+          if ([int]$summary.Groups[1].Value -lt 16) { throw "display parity ran only $($summary.Groups[1].Value) tests; expected at least 16" }
+          if (([regex]::Matches($combined, '\[DIRECT8-PARITY\]')).Count -lt 20) { throw "display parity: fewer than 20 direct8 comparisons were recorded" }
+
       - name: Upload pipeline crash forensics
         if: always() && needs.protected-check-route.outputs.product == 'true'
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7

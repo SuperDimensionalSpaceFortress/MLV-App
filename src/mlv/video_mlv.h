@@ -170,6 +170,12 @@ void getMlvProcessedFrame8Scaled(mlvObject_t * video,
                                  uint8_t * outputFrame,
                                  int threads,
                                  int scaleFactor);
+/* Nonzero when playback preview of the CURRENT receipt at `scaleFactor` takes the
+ * direct-8-bit CPU route (the one the CUDA display path replaces): the receipt
+ * is direct8-eligible AND the direct8 input is cheap for the effective scale.
+ * It is the very predicate getMlvProcessedFrame8Scaled dispatches on. Reads
+ * the global playback-preview mode, so call it inside the playback envelope. */
+int mlvPreviewPlaybackUsesDirect8Route(mlvObject_t * video, int scaleFactor);
 /* Render-thread-only playback helpers: both REQUIRE an active playback-preview
  * envelope (RenderFrameThread's PlaybackPreviewModeGuard) -- they inherit the
  * preview mode + preview scale factor and manage only the aggressive sub-flag,

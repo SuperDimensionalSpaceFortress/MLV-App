@@ -10,6 +10,7 @@
 #include "../../src/debug/StageTiming.h"
 #include "../../src/batch/WorkerThreadCount.h"
 
+#include <QFile>
 #include <QtGlobal>
 #include <algorithm>
 #include <array>
@@ -404,15 +405,20 @@ TEST(GpuPreviewProcessing, ShadowsHighlightsBlurTextureUpdateReportsDropWhenFram
  * truncate, because the pinned golden hashes depend on that rounding. It is
  * therefore not an engine oracle at the 1-LSB level and no test claims it is.
  *
- * Engine path they anchor to: the generic 16-bit loop in raw_processing.c
+ * Engine path THIS block anchors to: the generic 16-bit loop in raw_processing.c
  * (contrast / shadows-highlights / vibrance make the creative adjustments
  * non-neutral, which rules out the basic-matrix fast path). That loop applies
  * pix = (uint16_t)LIMIT16(unclamped diagonal-matrix value * expo_correction)
  * BEFORE the camera matrix, with the contrast and shadows-highlights luma taken
- * from the UNclamped diagonal-matrix values. The direct-8-bit kernel
- * (raw_processing_8bit_kernel.inc) omits that clamp and truncation unless AgX
- * or local tone is active; docs/cuda-playback-look-parity.md records it as an
- * engine-internal inconsistency this card does not resolve. */
+ * from the UNclamped diagonal-matrix values. These tests run the shader as the
+ * 16-bit route (config.preCameraClamp stays at its default, true).
+ *
+ * The direct-8-bit kernel (raw_processing_8bit_kernel.inc) omits that clamp and
+ * truncation unless AgX or local tone is active. It is the DECLARED PARITY
+ * REFERENCE (CUDA-PLAYBACK-LOOK-PARITY-2): the "Direct8Anchored*" tests below
+ * call applyProcessingObject8 and drive the shader's route flag the way the app
+ * does. The two CPU routes still disagree with each other; making them
+ * byte-identical is the separate card CPU-DIRECT8-16BIT-CLAMP-UNIFY. */
 
 /* Rounding budget between the engine (integer LUT indexing with truncation,
  * float32 / double accumulation on the CPU) and the display shader (float32 on
@@ -540,10 +546,64 @@ static std::vector<uint16_t> make_flat_leveled_frame(const processingObject_t * 
     return frame;
 }
 
-/* Runs the display shader and compares with the engine's output. A GL
- * backend that cannot be created at all SKIPS; once the backend probe says GL
- * works, a display-shader failure FAILS (it used to skip, which hid a broken
- * shader as a skipped test). */
+/* CUDA-PLAYBACK-LOOK-PARITY-2 (fable r2 CUDA-LOOK-ENGINE-PARITY-HOSTED-NOT-SKIPPED-1):
+ * the display-parity tests used to SKIP whenever no GL backend could be
+ * created, so a hosted runner without a usable GL silently turned the whole
+ * parity claim into skipped tests. A job that claims parity sets
+ * MLVAPP_REQUIRE_DISPLAY_PARITY_GL=1 (the dedicated "display parity" step in
+ * .github/workflows/tests.yml); with it set an unavailable backend FAILS with
+ * the probe's reason instead of skipping. Unset (a developer box without GL)
+ * keeps the skip. */
+static bool display_parity_gl_required(void)
+{
+    return qEnvironmentVariableIntValue("MLVAPP_REQUIRE_DISPLAY_PARITY_GL") != 0;
+}
+
+/* Renders `frame` through the LIVE DISPLAY shader offscreen and returns the
+ * renderer string. Backend policy, in one place for every display-parity test:
+ *   - the render works: proceed (whatever the subset-shader probe says -- that
+ *     probe builds the much larger offscreen subset program, which a software GL
+ *     such as Qt's bundled Mesa 11.2 opengl32sw refuses with "Too many fragment
+ *     shader texture samplers" although the display shader, which binds 9
+ *     samplers, runs fine; see docs/cuda-playback-look-parity.md);
+ *   - the render fails although the probe says GL works: a display-shader bug,
+ *     FAIL (it used to skip, which hid a broken shader as a skipped test);
+ *   - the render fails and the probe says no backend: SKIP on a developer box,
+ *     FAIL when MLVAPP_REQUIRE_DISPLAY_PARITY_GL is set. */
+static QString render_display_for_parity(const GpuPreviewProcessingConfig & config,
+                                         const uint16_t * frame,
+                                         uint16_t * output,
+                                         int width,
+                                         int height)
+{
+    qputenv("MLVAPP_GPU_PREVIEW_ALLOW_SOFTWARE", QByteArray("1"));
+    const GpuPreviewProcessingBackendAvailability availability = gpuPreviewProcessingProbeGpuBackend();
+    QString reason;
+    QString renderer;
+    if (gpuPreviewProcessingApplyDisplayGpuOffscreen(config, frame, output, width, height, &reason, &renderer))
+    {
+        return renderer;
+    }
+    if (availability.available)
+    {
+        ::minitest::fail(__FILE__, __LINE__,
+                         "display shader offscreen render failed on a working GL backend",
+                         reason.toStdString());
+    }
+    const std::string detail = "probe: " + availability.reason.toStdString() + "; display render: " + reason.toStdString();
+    if (display_parity_gl_required())
+    {
+        ::minitest::fail(__FILE__, __LINE__,
+                         "MLVAPP_REQUIRE_DISPLAY_PARITY_GL is set but the display shader cannot run; "
+                         "the display parity claim would be skipped, not proven",
+                         detail);
+    }
+    ASSERT_TRUE(gpu_preview_skip_reason_is_known(availability.reason));
+    SKIP_TEST(detail);
+}
+
+/* Runs the display shader and compares with the engine's output (backend
+ * policy: render_display_for_parity). */
 static void assert_gpu_display_matches_production_engine(const char * label,
                                                          const GpuPreviewProcessingConfig & config,
                                                          const std::vector<uint16_t> & debayered,
@@ -554,26 +614,9 @@ static void assert_gpu_display_matches_production_engine(const char * label,
     ASSERT_TRUE(config.enabled);
     ASSERT_EQ(debayered.size(), engine_output.size());
 
-    qputenv("MLVAPP_GPU_PREVIEW_ALLOW_SOFTWARE", QByteArray("1"));
-    const GpuPreviewProcessingBackendAvailability availability =
-        gpuPreviewProcessingProbeGpuBackend();
-    if (!availability.available)
-    {
-        ASSERT_TRUE(gpu_preview_skip_reason_is_known(availability.reason));
-        SKIP_TEST(availability.reason.toStdString());
-    }
-
     std::vector<uint16_t> gpu_output(debayered.size(), 0);
-    QString reason;
-    QString renderer;
-    if (!gpuPreviewProcessingApplyDisplayGpuOffscreen(config, debayered.data(), gpu_output.data(),
-                                                      width, height, &reason, &renderer))
-    {
-        ::minitest::fail(__FILE__, __LINE__,
-                         std::string("display shader offscreen render failed on a working GL backend (")
-                             + label + ")",
-                         reason.toStdString());
-    }
+    const QString renderer =
+        render_display_for_parity(config, debayered.data(), gpu_output.data(), width, height);
 
     const frame_compare_result_t result = compare_frames_u16(
         engine_output.data(), gpu_output.data(), width, height, 3, kEngineParityPerSampleTolerance);
@@ -937,6 +980,658 @@ TEST(GpuPreviewProcessing, DisplayShaderCombinedLookAssistPresetMatchesProductio
     ASSERT_TRUE(neutral != engine);
 }
 
+/* ---- DIRECT8-ANCHORED display-shader parity (CUDA-PLAYBACK-LOOK-PARITY-2) ----
+ *
+ * DECLARED PARITY REFERENCE: the direct-8-bit preview route -- what CPU preview
+ * runs when the receipt is direct8-eligible and the input is cheap, i.e. the
+ * route CUDA playback replaces. These tests call the real applyProcessingObject8
+ * (the shared C kernel for contrast / S-H / vibrance / saturation / AgX, the
+ * intrinsics kernel for neutral receipts on an AVX2 host, exactly the dispatch
+ * the app makes) and compare its 8-bit output with the display shader's output
+ * (>> 8) for the SAME debayered frame, with the shader's route flag set the way
+ * the host sets it (gpuPreviewProcessingApplyCpuRoute).
+ *
+ * Where the CPU would NOT take direct8 (a state the kernel cannot run, or an
+ * input the cheapness gate refuses) it takes the generic 16-bit loop, which has
+ * its own pre-camera behaviour; every cell therefore ALSO runs the shader as
+ * that route against apply_processing_object. The two CPU routes disagree with
+ * each other on over-ranged highlights when only vibrance (or nothing) is on;
+ * the 8-bit-vs-16-bit delta of every cell is printed and recorded as
+ * INFORMATION (the card that unifies the CPU routes is
+ * CPU-DIRECT8-16BIT-CLAMP-UNIFY). */
+
+/* Budget between the direct8 kernel (integer LUTs, float32/double CPU) and the
+ * display shader (float32 GPU), in 8-bit codes. A one-code flip at a rounding
+ * boundary is allowed per sample; the defects this exists to catch are an order
+ * of magnitude larger (sol r2: [255,230,243] against [245,239,240]). */
+static constexpr uint8_t kDirect8ParityPerSampleTolerance = 1;
+static constexpr uint16_t kDirect8ParityMaxAbsDiff = 3;
+static constexpr double kDirect8ParityMismatchFraction = 0.001;
+
+static std::vector<uint8_t> run_direct8_engine_on_frame(processingObject_t * processing,
+                                                        const std::vector<uint16_t> & debayered,
+                                                        int width,
+                                                        int height)
+{
+    /* applyProcessingObject8 applies the levels LUT to its input in place. */
+    std::vector<uint16_t> engine_input = debayered;
+    std::vector<uint8_t> engine_output(debayered.size(), 0);
+    ASSERT_TRUE(processingCanUseDirect8BitOutput(processing) != 0);
+    applyProcessingObject8(processing, width, height,
+                           engine_input.data(), engine_output.data(),
+                           /*threads=*/1, /*imageChanged=*/1, /*frameIndex=*/0);
+    return engine_output;
+}
+
+struct DisplayVsEngine8Result
+{
+    frame_compare_result_t compare;
+    frame_tolerance_verdict_t verdict;
+    std::string summary;
+    QString renderer;
+};
+
+/* Runs the display shader offscreen and compares its output (>> 8) with an
+ * 8-bit engine frame. Backend policy as require_display_parity_backend_or_skip. */
+static DisplayVsEngine8Result compare_display_with_engine8(const GpuPreviewProcessingConfig & config,
+                                                           const std::vector<uint16_t> & debayered,
+                                                           const std::vector<uint8_t> & engine8,
+                                                           int width,
+                                                           int height)
+{
+    ASSERT_TRUE(config.enabled);
+    ASSERT_EQ(debayered.size(), engine8.size());
+    std::vector<uint16_t> gpu_output(debayered.size(), 0);
+    DisplayVsEngine8Result out{};
+    out.renderer = render_display_for_parity(config, debayered.data(), gpu_output.data(), width, height);
+    std::vector<uint8_t> gpu8(gpu_output.size());
+    for (size_t index = 0; index < gpu_output.size(); ++index)
+    {
+        gpu8[index] = static_cast<uint8_t>(gpu_output[index] >> 8);
+    }
+    out.compare = compare_frames_u8(engine8.data(), gpu8.data(), width, height, 3,
+                                    kDirect8ParityPerSampleTolerance);
+    out.verdict = evaluate_frame_tolerance(out.compare, debayered.size(),
+                                           kDirect8ParityMaxAbsDiff, kDirect8ParityMismatchFraction);
+    out.summary = frame_compare_summary(out.compare);
+    return out;
+}
+
+static void assert_gpu_display_matches_direct8_engine(const char * label,
+                                                      const GpuPreviewProcessingConfig & config,
+                                                      const std::vector<uint16_t> & debayered,
+                                                      const std::vector<uint8_t> & engine8,
+                                                      int width,
+                                                      int height)
+{
+    const DisplayVsEngine8Result result =
+        compare_display_with_engine8(config, debayered, engine8, width, height);
+    std::cout << "[DIRECT8-PARITY] " << label << " preCameraClamp=" << (config.preCameraClamp ? 1 : 0)
+              << ": " << result.summary << "\n";
+    test_artifacts::record(std::string("gpu_preview_display.direct8_parity.") + label + ".renderer",
+                           result.renderer.toStdString());
+    test_artifacts::record(std::string("gpu_preview_display.direct8_parity.") + label + ".compare",
+                           result.summary);
+    if (!result.verdict.passed)
+    {
+        ::minitest::fail(__FILE__, __LINE__,
+                         std::string("Display shader vs DIRECT8 route parity (") + label + ")",
+                         result.verdict.detail);
+    }
+}
+
+/* The 16-bit engine's output as 8-bit, for the informational CPU-route delta. */
+static std::vector<uint8_t> engine16_as_8bit(const std::vector<uint16_t> & engine16)
+{
+    std::vector<uint8_t> out(engine16.size());
+    for (size_t index = 0; index < engine16.size(); ++index)
+    {
+        out[index] = static_cast<uint8_t>(engine16[index] >> 8);
+    }
+    return out;
+}
+
+struct RouteCell
+{
+    const char * label;
+    double kelvin;
+    double tint;
+    bool allowCreative;   /* processingAllowCreativeAdjustments (vibrance etc. are inert without it) */
+    double contrast;      /* simple contrast; 0 = off */
+    double pivot;
+    double shadows;
+    double highlights;
+    double vibrance;      /* 1.0 = off */
+    double maxDiagonal;   /* top of the synthetic ramp (diagonal-matrix codes); ignored for flat cells */
+    const int * flatLeveled; /* non-null: a flat frame in LEVELED units instead of the ramp */
+    bool direct8Clamp;    /* hand-derived from raw_processing_8bit_kernel.inc: AgX || contrast || S/H */
+    bool generic16Clamp;  /* hand-derived from raw_processing.c: always, except the basic-matrix branch */
+};
+
+static void configure_route_cell(MlvPipelineFixture & fixture, const RouteCell & cell)
+{
+    configure_gpu_preview_supported_subset(fixture);
+    processingObject_t * processing = fixture.processing();
+    if (cell.allowCreative)
+    {
+        processingAllowCreativeAdjustments(processing);
+        neutralize_unported_creative_stages(processing);
+    }
+    processingSetWhiteBalance(processing, cell.kelvin, cell.tint);
+    processingSetSimpleContrast(processing, cell.contrast);
+    processingSetPivot(processing, cell.pivot);
+    processingSetShadows(processing, cell.shadows);
+    processingSetHighlights(processing, cell.highlights);
+    processingSetVibrance(processing, cell.vibrance);
+    (void)fixture.renderDebayeredFrame16(0); /* settle LUTs exactly like the other engine-anchored tests */
+}
+
+static void run_route_cell(MlvPipelineFixture & fixture, const RouteCell & cell, bool requireOverrange = false)
+{
+    configure_route_cell(fixture, cell);
+    processingObject_t * processing = fixture.processing();
+
+    QString reason;
+    ASSERT_TRUE(gpuPreviewProcessingIsSupported(processing, &reason));
+    const GpuPreviewProcessingConfig base = gpuPreviewProcessingBuildConfig(processing, &reason);
+    ASSERT_TRUE(base.enabled);
+    const bool localTone = cell.contrast != 0.0 || cell.shadows != 0.0 || cell.highlights != 0.0;
+    ASSERT_TRUE(base.applyShadowsHighlights == (cell.shadows != 0.0 || cell.highlights != 0.0));
+
+    int width = 0;
+    int height = 0;
+    std::vector<uint16_t> frame;
+    if (cell.flatLeveled)
+    {
+        frame = make_flat_leveled_frame(processing, cell.flatLeveled, &width, &height);
+    }
+    else
+    {
+        frame = make_synthetic_ramp_frame(processing, cell.maxDiagonal, &width, &height);
+    }
+    const size_t overrange = count_wb_overrange_samples(processing, frame);
+    std::cout << "[CELL] " << cell.label << " wb-overranged samples=" << overrange << "\n";
+    if (requireOverrange)
+    {
+        ASSERT_TRUE(overrange > 0);
+    }
+
+    /* ---- route 1: direct8 (the declared parity reference) ---- */
+    ASSERT_TRUE(processingCanUseDirect8BitOutput(processing) != 0);
+    ASSERT_EQ(cell.direct8Clamp, processingCpuRoutePreCameraClamps(processing, 1) != 0);
+    ASSERT_EQ(localTone, cell.direct8Clamp);   /* these cells carry no AgX */
+    const std::vector<uint8_t> engine8 = run_direct8_engine_on_frame(processing, frame, width, height);
+
+    GpuPreviewProcessingConfig direct8Config = base;
+    if (direct8Config.applyShadowsHighlights)
+    {
+        /* the blur the direct8 kernel itself just computed */
+        ASSERT_TRUE(gpuPreviewProcessingAttachFrameState(&direct8Config, processing, width, height, &reason));
+    }
+    gpuPreviewProcessingApplyCpuRoute(&direct8Config, processing, /*direct8Route=*/true);
+    ASSERT_EQ(cell.direct8Clamp, direct8Config.preCameraClamp);
+    assert_gpu_display_matches_direct8_engine(cell.label, direct8Config, frame, engine8, width, height);
+
+    /* ---- route 2: the generic 16-bit loop (what the CPU runs when direct8 is
+     * refused for this scale/input), gated wherever the CPU would choose it ---- */
+    ASSERT_EQ(cell.generic16Clamp, processingCpuRoutePreCameraClamps(processing, 0) != 0);
+    GpuPreviewProcessingConfig generic16Config = base;
+    std::vector<uint16_t> engine_blur(frame.size(), 0);
+    if (generic16Config.applyShadowsHighlights)
+    {
+        std::vector<uint16_t> refresh_input = frame;
+        ASSERT_TRUE(processingRefreshShadowsHighlightsBlurFromRgb16(
+                        processing, refresh_input.data(), width, height, /*threads=*/1,
+                        /*forceExportPolicy=*/1) != 0);
+        const uint16_t * blur = nullptr;
+        int blur_width = 0;
+        int blur_height = 0;
+        int curve_index_mask = 0;
+        ASSERT_TRUE(processingGetShadowsHighlightsBlurData(processing, &blur, &blur_width, &blur_height,
+                                                           &curve_index_mask) != 0);
+        engine_blur.assign(blur, blur + static_cast<size_t>(width) * height * 3u);
+        ASSERT_TRUE(gpuPreviewProcessingAttachFrameState(&generic16Config, processing, width, height, &reason));
+    }
+    gpuPreviewProcessingApplyCpuRoute(&generic16Config, processing, /*direct8Route=*/false);
+    ASSERT_EQ(cell.generic16Clamp, generic16Config.preCameraClamp);
+    std::vector<uint16_t> engine16_input = frame;
+    std::vector<uint16_t> engine16(frame.size(), 0);
+    apply_processing_object(processing, width, height, engine16_input.data(), engine16.data(),
+                            engine_blur.data(), processing->gradient_mask,
+                            processing->vignette_mask, nullptr);
+    const std::string label16 = std::string(cell.label) + ".as16bit";
+    assert_gpu_display_matches_production_engine(label16.c_str(), generic16Config, frame, engine16, width, height);
+
+    /* ---- INFORMATION, not a gate: how far apart the two CPU routes are here ---- */
+    const std::vector<uint8_t> engine16_8 = engine16_as_8bit(engine16);
+    const frame_compare_result_t routeDelta =
+        compare_frames_u8(engine8.data(), engine16_8.data(), width, height, 3, 1);
+    const std::string routeDeltaSummary = frame_compare_summary(routeDelta);
+    std::cout << "[CPU-ROUTE-DELTA] " << cell.label << " direct8 vs 16-bit (info): " << routeDeltaSummary
+              << " (intrin=" << processingFastPathAvx2IntrinActive() << ")\n";
+    test_artifacts::record(std::string("gpu_preview_display.cpu_route_delta.") + cell.label, routeDeltaSummary);
+}
+
+static const int kSolR2LeveledA[3] = { 40000, 61000, 43000 };
+static const int kSolR2LeveledB[3] = { 27000, 61000, 60000 };
+static const int kSolR1Leveled[3]  = { 27000, 61000, 43000 };
+static const int kFableR1Leveled[3] = { 30000, 30000, 30000 };
+
+TEST(GpuPreviewProcessing, Direct8AnchoredSolR2VibranceOnlyReproMatchesDirect8Route)
+{
+    /* sol r2 BLOCKER: Canon 5D3 matrix, WB 6500/tint 0, Rec709, vibrance 1.03,
+     * contrast / S-H / AgX off. Leveled [40000,61000,43000] gives a diagonal of
+     * [94545,61000,63520]; the direct8 kernel (no local tone, no AgX) feeds that
+     * UNclamped into the camera matrix, where the round-2 shader's unconditional
+     * clamp gave a different colour. Sol's source arithmetic put the gap at ~10
+     * 8-bit codes; the real kernels measure 3 codes (pixel A) and 6 codes (pixel
+     * B, leveled [27000,61000,60000]) -- the [CPU-ROUTE-DELTA] lines compare the
+     * 16-bit route with the kernel, which is what the legacy flag reproduced. */
+    MlvPipelineFixture fixture;
+    assert_gpu_preview_fixture_ready(fixture);
+    run_route_cell(fixture, { "sol_r2_repro_a_vibrance_6500K", 6500.0, 0.0, true, 0.0, 0.5, 0.0, 0.0, 1.03,
+                              0.0, kSolR2LeveledA, false, true }, /*requireOverrange=*/true);
+    run_route_cell(fixture, { "sol_r2_repro_b_vibrance_6500K", 6500.0, 0.0, true, 0.0, 0.5, 0.0, 0.0, 1.03,
+                              0.0, kSolR2LeveledB, false, true }, /*requireOverrange=*/true);
+}
+
+TEST(GpuPreviewProcessing, Direct8AnchoredLegacyUnconditionalClampIsDetected)
+{
+    /* RED-FIRST proof, kept as a regression: the round-2 shader clamped before
+     * the camera matrix unconditionally, i.e. exactly config.preCameraClamp =
+     * true. Forcing that on sol's vibrance-only repro must FAIL the direct8
+     * comparison (it is what failed on 8e928529); the host-chosen flag passes
+     * (Direct8AnchoredSolR2VibranceOnlyReproMatchesDirect8Route). */
+    MlvPipelineFixture fixture;
+    assert_gpu_preview_fixture_ready(fixture);
+    const RouteCell cell = { "legacy_clamp_probe", 6500.0, 0.0, true, 0.0, 0.5, 0.0, 0.0, 1.03,
+                             0.0, kSolR2LeveledB, false, true };
+    configure_route_cell(fixture, cell);
+    processingObject_t * processing = fixture.processing();
+    QString reason;
+    GpuPreviewProcessingConfig config = gpuPreviewProcessingBuildConfig(processing, &reason);
+    ASSERT_TRUE(config.enabled);
+    int width = 0;
+    int height = 0;
+    const std::vector<uint16_t> frame = make_flat_leveled_frame(processing, cell.flatLeveled, &width, &height);
+    const std::vector<uint8_t> engine8 = run_direct8_engine_on_frame(processing, frame, width, height);
+
+    config.preCameraClamp = true; /* the round-2 behaviour */
+    const DisplayVsEngine8Result legacy = compare_display_with_engine8(config, frame, engine8, width, height);
+    std::cout << "[DIRECT8-PARITY] legacy_clamp_probe preCameraClamp=1 (expected to FAIL): " << legacy.summary << "\n";
+    ASSERT_TRUE(!legacy.verdict.passed);
+    ASSERT_TRUE(legacy.compare.max_abs_diff >= 4); /* measured 6 on this pixel */
+
+    gpuPreviewProcessingApplyCpuRoute(&config, processing, /*direct8Route=*/true);
+    ASSERT_TRUE(!config.preCameraClamp);
+    const DisplayVsEngine8Result routed = compare_display_with_engine8(config, frame, engine8, width, height);
+    ASSERT_TRUE(routed.verdict.passed);
+}
+
+TEST(GpuPreviewProcessing, Direct8AnchoredNeutralAndVibranceMatchDirect8Route)
+{
+    /* Controls with NO local tone: the direct8 kernel does not clamp before the
+     * camera matrix. Neutral (creative off and on), vibrance up / big / down at
+     * cool, neutral and warm WB, a bare pivot (inert without contrast) and the
+     * r1 repros' pixels with vibrance. The ramp reaches twice the 16-bit range. */
+    MlvPipelineFixture fixture;
+    assert_gpu_preview_fixture_ready(fixture);
+    static const RouteCell kCells[] = {
+        { "neutral_creative_off_wb6500",  6500.0,  0.0, false, 0.0, 0.5, 0.0, 0.0, 1.00, 130000.0, nullptr, false, false },
+        { "neutral_creative_off_wb3000",  3000.0,  0.0, false, 0.0, 0.5, 0.0, 0.0, 1.00, 130000.0, nullptr, false, false },
+        { "neutral_creative_on_wb2500",   2500.0, 30.0, true,  0.0, 0.5, 0.0, 0.0, 1.00, 130000.0, nullptr, false, false },
+        { "pivot_only_wb6500",            6500.0,  0.0, true,  0.0, 0.30, 0.0, 0.0, 1.00, 130000.0, nullptr, false, false },
+        { "vibrance_up_wb6500",           6500.0,  0.0, true,  0.0, 0.5, 0.0, 0.0, 1.03, 130000.0, nullptr, false, true },
+        { "vibrance_big_wb6500",          6500.0,  0.0, true,  0.0, 0.5, 0.0, 0.0, 1.60, 130000.0, nullptr, false, true },
+        { "vibrance_down_wb6500",         6500.0,  0.0, true,  0.0, 0.5, 0.0, 0.0, 0.70, 130000.0, nullptr, false, true },
+        { "vibrance_up_wb2500_tint30",    2500.0, 30.0, true,  0.0, 0.5, 0.0, 0.0, 1.30, 130000.0, nullptr, false, true },
+        { "vibrance_up_wb10000_tint-30", 10000.0, -30.0, true, 0.0, 0.5, 0.0, 0.0, 1.30, 130000.0, nullptr, false, true },
+        { "vibrance_sol_r1_pixel_6500K",  6500.0,  0.0, true,  0.0, 0.5, 0.0, 0.0, 1.03, 0.0, kSolR1Leveled, false, true },
+        { "vibrance_fable_r1_pixel_3000K", 3000.0, 0.0, true,  0.0, 0.5, 0.0, 0.0, 1.03, 0.0, kFableR1Leveled, false, true },
+    };
+    for (const RouteCell & cell : kCells)
+    {
+        run_route_cell(fixture, cell);
+    }
+}
+
+TEST(GpuPreviewProcessing, Direct8AnchoredLocalToneMatchesDirect8Route)
+{
+    /* Local tone (contrast, shadows / highlights) makes the direct8 kernel store
+     * the exposure-adjusted value as uint16 before the camera matrix, like the
+     * 16-bit loop, so both routes clamp. Alone, paired, with vibrance, the
+     * round-1 repros and the owner's night preset. S/H blur is the kernel's own. */
+    MlvPipelineFixture fixture;
+    assert_gpu_preview_fixture_ready(fixture);
+    static const RouteCell kCells[] = {
+        { "contrast_pos_wb6500",          6500.0,  0.0, true,  0.14, 0.46, 0.0, 0.0, 1.00, 130000.0, nullptr, true, true },
+        { "contrast_neg_wb3000",          3000.0,  0.0, true, -0.30, 0.50, 0.0, 0.0, 1.00, 130000.0, nullptr, true, true },
+        { "contrast_strong_wb2500_tint30", 2500.0, 30.0, true,  0.60, 0.30, 0.0, 0.0, 1.00, 130000.0, nullptr, true, true },
+        { "contrast_sol_r1_pixel_6500K",  6500.0,  0.0, true,  0.14, 0.46, 0.0, 0.0, 1.00, 0.0, kSolR1Leveled, true, true },
+        { "contrast_fable_r1_pixel_3000K", 3000.0, 0.0, true, -0.30, 0.50, 0.0, 0.0, 1.00, 0.0, kFableR1Leveled, true, true },
+        { "shadows_only_wb3000",          3000.0,  0.0, true,  0.0, 0.5, 0.32, 0.0, 1.00, 130000.0, nullptr, true, true },
+        { "highlights_only_wb6500",       6500.0,  0.0, true,  0.0, 0.5, 0.0, -0.26, 1.00, 130000.0, nullptr, true, true },
+        { "shadows_highlights_wb3000",    3000.0,  0.0, true,  0.0, 0.5, 0.32, -0.26, 1.00, 130000.0, nullptr, true, true },
+        { "contrast_and_vibrance_wb3000", 3000.0,  0.0, true,  0.14, 0.46, 0.0, 0.0, 1.03, 130000.0, nullptr, true, true },
+        { "night_preset_wb3000",          3000.0,  0.0, true,  0.14, 0.46, 0.32, -0.26, 1.03, 130000.0, nullptr, true, true },
+        { "night_preset_wb6500",          6500.0,  0.0, true,  0.14, 0.46, 0.32, -0.26, 1.03, 130000.0, nullptr, true, true },
+    };
+    for (const RouteCell & cell : kCells)
+    {
+        run_route_cell(fixture, cell);
+    }
+}
+
+/* Real clip frame through the whole direct8 render (getMlvProcessedFrame8 picks
+ * direct8 for an eligible receipt outside preview mode) against the shader. The
+ * tiny clip is dark, so this cross-checks the plumbing (debayer inputs, levels,
+ * gamma) rather than over-range behaviour. */
+static void assert_real_frame_matches_direct8_render(const char * label,
+                                                     double vibrance,
+                                                     double contrast)
+{
+    MlvPipelineFixture fixture;
+    assert_gpu_preview_fixture_ready(fixture);
+    configure_gpu_preview_supported_subset(fixture);
+    processingObject_t * processing = fixture.processing();
+    processingAllowCreativeAdjustments(processing);
+    neutralize_unported_creative_stages(processing);
+    processingSetSimpleContrast(processing, contrast);
+    processingSetPivot(processing, 0.46);
+    processingSetVibrance(processing, vibrance);
+
+    const std::vector<uint8_t> primed = fixture.renderFrame8(0, /*threads=*/1);
+    ASSERT_TRUE(!primed.empty());
+    ASSERT_TRUE(mlvPreviewPlaybackUsesDirect8Route(fixture.video(), 1) != 0);
+
+    QString reason;
+    GpuPreviewProcessingConfig config = gpuPreviewProcessingBuildConfig(processing, &reason);
+    ASSERT_TRUE(config.enabled);
+    gpuPreviewProcessingApplyCpuRoute(&config, processing, /*direct8Route=*/true);
+    const std::vector<uint8_t> engine8 = fixture.renderFrame8(0, /*threads=*/1);
+    const std::vector<uint16_t> debayered = fixture.renderDebayeredFrame16(0);
+    ASSERT_EQ(debayered.size(), engine8.size());
+    assert_gpu_display_matches_direct8_engine(label, config, debayered, engine8,
+                                              fixture.width(), fixture.height());
+}
+
+TEST(GpuPreviewProcessing, Direct8AnchoredRealFrameMatchesDirect8Render)
+{
+    assert_real_frame_matches_direct8_render("real_frame_direct8_vibrance", 1.03, 0.0);
+    assert_real_frame_matches_direct8_render("real_frame_direct8_contrast_vibrance", 1.03, 0.14);
+}
+
+/* What the CPU does for one processing state, derived by hand from the engine
+ * source (not from the function under test). */
+struct RouteStateExpectation
+{
+    const char * label;
+    std::function<void(processingObject_t *)> apply;
+    bool direct8Eligible;      /* processing_can_use_direct_8bit_output */
+    bool direct8Clamp;         /* kernel: AgX || contrast || S/H */
+    bool generic16Clamp;       /* generic loop, minus the basic-matrix branch */
+};
+
+/* Back to a direct8-eligible, fully neutral receipt (creative adjustments off,
+ * camera matrix on, no LUT / filter / grain / sharpening / AgX). */
+static void reset_route_state(MlvPipelineFixture & fixture)
+{
+    configure_gpu_preview_supported_subset(fixture);
+    processingObject_t * processing = fixture.processing();
+    processingAllowCreativeAdjustments(processing);
+    neutralize_unported_creative_stages(processing);
+    processingSetSimpleContrast(processing, 0.0);
+    processingSetPivot(processing, 0.5);
+    processingSetShadows(processing, 0.0);
+    processingSetHighlights(processing, 0.0);
+    processingSetVibrance(processing, 1.0);
+    processingSetSaturation(processing, 1.0);
+    processingDontAllowCreativeAdjustments(processing);
+    processing->use_cam_matrix = 1;
+    processing->lut_on = 0;
+    processing->filter_on = 0;
+    processing->grainStrength = 0;
+    processingSetSharpening(processing, 0.0);
+    processingDisableAgX(processing);
+}
+
+TEST(GpuPreviewProcessing, CpuRouteSelectionMatchesEnginePredicates)
+{
+    /* The host (RenderFrameThread) passes the shader mvPreviewPlaybackUsesDirect8Route
+     * and gpuPreviewProcessingApplyCpuRoute turns it into the clamp flag. This pins
+     * both against the engine's own predicates over states the shader cannot render
+     * (saturation, AgX, LUT, sharpen ...) -- there only the ROUTE is asserted, not
+     * pixels, because those stages are not ported. */
+    MlvPipelineFixture fixture;
+    assert_gpu_preview_fixture_ready(fixture);
+
+    const std::vector<RouteStateExpectation> states = {
+        { "neutral", [](processingObject_t *) {}, true, false, false },
+        { "vibrance", [](processingObject_t * p) { processingAllowCreativeAdjustments(p); processingSetVibrance(p, 1.2); },
+          true, false, true },
+        { "saturation", [](processingObject_t * p) { processingAllowCreativeAdjustments(p); processingSetSaturation(p, 1.2); },
+          true, false, true },
+        { "contrast", [](processingObject_t * p) { processingAllowCreativeAdjustments(p); processingSetSimpleContrast(p, 0.2); },
+          true, true, true },
+        { "shadows_highlights", [](processingObject_t * p) { processingAllowCreativeAdjustments(p); processingSetShadows(p, 0.3); },
+          true, true, true },
+        { "agx_neutral", [](processingObject_t * p) { processingEnableAgX(p); }, true, true, true },
+        { "agx_vibrance", [](processingObject_t * p) { processingEnableAgX(p); processingAllowCreativeAdjustments(p); processingSetVibrance(p, 1.2); },
+          true, true, true },
+        /* direct8-INELIGIBLE: the CPU runs the generic 16-bit loop */
+        { "sharpen_neutral", [](processingObject_t * p) { processingSetSharpening(p, 0.5); }, false, false, false },
+        { "sharpen_vibrance", [](processingObject_t * p) { processingAllowCreativeAdjustments(p); processingSetVibrance(p, 1.2); processingSetSharpening(p, 0.5); },
+          false, false, true },
+        { "lut_on_vibrance", [](processingObject_t * p) { processingAllowCreativeAdjustments(p); processingSetVibrance(p, 1.2); p->lut_on = 1; },
+          false, false, true },
+        { "filter_on_neutral", [](processingObject_t * p) { p->filter_on = 1; }, false, false, false },
+        { "grain_contrast", [](processingObject_t * p) { processingAllowCreativeAdjustments(p); processingSetSimpleContrast(p, 0.2); p->grainStrength = 5; },
+          false, true, true },
+        { "no_camera_matrix", [](processingObject_t * p) { p->use_cam_matrix = 0; }, false, false, true },
+    };
+
+    for (const RouteStateExpectation & state : states)
+    {
+        processingObject_t * processing = fixture.processing();
+        reset_route_state(fixture);
+        state.apply(processing);
+
+        const std::string label(state.label);
+        const bool direct8 = processingCanUseDirect8BitOutput(processing) != 0;
+        if (direct8 != state.direct8Eligible)
+        {
+            ::minitest::fail(__FILE__, __LINE__, "direct8 eligibility of " + label, "engine disagrees with the table");
+        }
+        /* the playback dispatch predicate, outside preview mode (input always cheap) */
+        ASSERT_EQ(0, processingPlaybackPreviewModeEnabled());
+        ASSERT_EQ(direct8, mlvPreviewPlaybackUsesDirect8Route(fixture.video(), 1) != 0);
+
+        for (const bool route : { true, false })
+        {
+            GpuPreviewProcessingConfig config;
+            config.enabled = true;
+            gpuPreviewProcessingApplyCpuRoute(&config, processing, route);
+            const bool expected = route ? state.direct8Clamp : state.generic16Clamp;
+            if (config.preCameraClamp != expected)
+            {
+                ::minitest::fail(__FILE__, __LINE__,
+                                 "pre-camera clamp for " + label + (route ? " (direct8 route)" : " (16-bit route)"),
+                                 std::string("host flag ") + (config.preCameraClamp ? "1" : "0")
+                                     + " but the engine source says " + (expected ? "1" : "0"));
+            }
+            ASSERT_EQ(config.preCameraClamp, processingCpuRoutePreCameraClamps(processing, route ? 1 : 0) != 0);
+        }
+    }
+
+    /* Preview mode: the cheapness gate may refuse direct8 (x1 reduced proxy,
+     * dual-ISO outside HQ recon) but never grants it to an ineligible receipt. */
+    struct PreviewModeRestore
+    {
+        ~PreviewModeRestore() { processingSetPlaybackPreviewMode(0); }
+    } previewModeRestore;
+    reset_route_state(fixture);
+    processingSetSharpening(fixture.processing(), 0.5);
+    processingSetPlaybackPreviewMode(1);
+    for (const int scale : { 1, 2, 4, 8 })
+    {
+        const int route = mlvPreviewPlaybackUsesDirect8Route(fixture.video(), scale);
+        std::cout << "[CPU-ROUTE] sharpen_neutral preview scale=" << scale << " direct8=" << route << "\n";
+        ASSERT_EQ(0, route);
+    }
+    processingSetSharpening(fixture.processing(), 0.0);
+    for (const int scale : { 1, 2, 4, 8 })
+    {
+        const bool routeDirect8 = mlvPreviewPlaybackUsesDirect8Route(fixture.video(), scale) != 0;
+        std::cout << "[CPU-ROUTE] eligible neutral preview scale=" << scale << " direct8=" << routeDirect8 << "\n";
+        GpuPreviewProcessingConfig config;
+        config.enabled = true;
+        gpuPreviewProcessingApplyCpuRoute(&config, fixture.processing(), routeDirect8);
+        /* neutral: direct8 -> unclamped; refused -> 16-bit basic-matrix branch -> unclamped too */
+        ASSERT_TRUE(!config.preCameraClamp);
+    }
+}
+
+/* S/H blur freshness per viewport route (fable r2
+ * CUDA-LOOK-SH-BLUR-STALE-OTHER-VIEWPORT-ROUTES-1). GpuDisplayViewport cannot be
+ * instantiated headlessly (tests/gui is the only harness that can, and it does
+ * not paint these routes), so this pins the SOURCE contract the way
+ * test_async_preupload_pipeline pins its call sites: every public presentation
+ * route of the viewport either uploads a fresh blur
+ * (gpuPreviewProcessingUpdateShadowsHighlightsBlurTexture) or marks the shared
+ * LUT set's blur stale (gpuPreviewProcessingMarkShadowsHighlightsBlurStale),
+ * and the set of routes is enumerated so a new one must make the same choice. */
+static std::string cpp_body_without_comments_and_strings(const std::string & text)
+{
+    std::string out;
+    out.reserve(text.size());
+    size_t index = 0;
+    while (index < text.size())
+    {
+        const char c = text[index];
+        if (c == '/' && index + 1 < text.size() && text[index + 1] == '/')
+        {
+            while (index < text.size() && text[index] != '\n') ++index;
+        }
+        else if (c == '/' && index + 1 < text.size() && text[index + 1] == '*')
+        {
+            index += 2;
+            while (index + 1 < text.size() && !(text[index] == '*' && text[index + 1] == '/')) ++index;
+            index += 2;
+        }
+        else if (c == '"')
+        {
+            ++index;
+            while (index < text.size() && text[index] != '"')
+            {
+                if (text[index] == '\\') ++index;
+                ++index;
+            }
+            ++index;
+            out.push_back(' ');
+        }
+        else
+        {
+            out.push_back(c);
+            ++index;
+        }
+    }
+    return out;
+}
+
+/* name -> body of every `GpuDisplayViewport::setPresented*` definition. */
+static std::vector<std::pair<std::string, std::string>> viewport_present_route_bodies(const std::string & source)
+{
+    std::vector<std::pair<std::string, std::string>> routes;
+    const std::string marker = "GpuDisplayViewport::setPresented";
+    size_t from = 0;
+    while (true)
+    {
+        const size_t at = source.find(marker, from);
+        if (at == std::string::npos) break;
+        from = at + marker.size();
+        const size_t nameEnd = source.find('(', at);
+        if (nameEnd == std::string::npos) break;
+        const std::string name = source.substr(at + 20, nameEnd - (at + 20)); /* skip "GpuDisplayViewport::" */
+        int depth = 1;
+        size_t cursor = nameEnd + 1;
+        while (cursor < source.size() && depth > 0)
+        {
+            if (source[cursor] == '(') ++depth;
+            else if (source[cursor] == ')') --depth;
+            ++cursor;
+        }
+        while (cursor < source.size() && source[cursor] != '{' && source[cursor] != ';') ++cursor;
+        if (cursor >= source.size() || source[cursor] == ';') continue; /* declaration only */
+        int braces = 0;
+        size_t end = cursor;
+        for (; end < source.size(); ++end)
+        {
+            if (source[end] == '{') ++braces;
+            else if (source[end] == '}' && --braces == 0) break;
+        }
+        routes.emplace_back(name, source.substr(cursor, end - cursor + 1));
+        from = end;
+    }
+    return routes;
+}
+
+TEST(GpuPreviewProcessing, ViewportPresentRoutesNeverBindAStaleShadowsHighlightsBlur)
+{
+    QString path = qEnvironmentVariable("MLVAPP_TEST_VIEWPORT_SOURCE"); /* red-first override */
+    if (path.isEmpty()) path = QStringLiteral("platform/qt/GpuDisplayViewport.cpp");
+    QFile file(path);
+    ASSERT_TRUE(file.open(QIODevice::ReadOnly));
+    const std::string source = cpp_body_without_comments_and_strings(file.readAll().toStdString());
+
+    const auto routes = viewport_present_route_bodies(source);
+    std::vector<std::string> names;
+    std::string stale;
+    for (const auto & route : routes)
+    {
+        names.push_back(route.first);
+        const bool uploadsBlur = route.second.find("gpuPreviewProcessingUpdateShadowsHighlightsBlurTexture(") != std::string::npos;
+        const bool marksStale = route.second.find("gpuPreviewProcessingMarkShadowsHighlightsBlurStale(") != std::string::npos
+            || route.second.find("shadowsHighlightsBlurReady = false") != std::string::npos;
+        if (!uploadsBlur && !marksStale) stale += " " + route.first;
+    }
+    for (const char * expected : { "setPresentedImage", "setPresentedRgb16", "setPresentedBayer16",
+                                   "setPresentedGpuPlaybackReconTexture",
+                                   "setPresentedGpuPlaybackReconAmazePostWbTexture",
+                                   "setPresentedAmazePostWbTexture" })
+    {
+        if (std::find(names.begin(), names.end(), std::string(expected)) == names.end())
+        {
+            ::minitest::fail(__FILE__, __LINE__, std::string("viewport route enumerated: ") + expected,
+                             "not found; update this test together with the route");
+        }
+    }
+    if (!stale.empty())
+    {
+        ::minitest::fail(__FILE__, __LINE__, "every viewport present route uploads or invalidates the S/H blur",
+                         "routes that do neither:" + stale);
+    }
+    /* the one route that uploads must NOT also be marked stale afterwards */
+    for (const auto & route : routes)
+    {
+        if (route.first == "setPresentedGpuPlaybackReconAmazePostWbTexture")
+        {
+            ASSERT_TRUE(route.second.find("gpuPreviewProcessingMarkShadowsHighlightsBlurStale(") == std::string::npos);
+        }
+    }
+}
+
+TEST(GpuPreviewProcessing, MarkShadowsHighlightsBlurStaleClearsOnlyTheReadyFlag)
+{
+    GpuPreviewProcessingLutTextureSet set;
+    set.shadowsHighlightsBlurReady = true;
+    set.shadowsHighlightsBlurWidth = 8;
+    set.shadowsHighlightsBlurHeight = 6;
+    gpuPreviewProcessingMarkShadowsHighlightsBlurStale(&set);
+    ASSERT_TRUE(!set.shadowsHighlightsBlurReady);
+    ASSERT_EQ(8, set.shadowsHighlightsBlurWidth);
+    gpuPreviewProcessingMarkShadowsHighlightsBlurStale(nullptr); /* tolerated */
+}
+
 TEST(GpuPreviewProcessing, ShadowsHighlightsKillSwitchForcesDisplayBypass)
 {
     /* Round 1 lost the MLVAPP_GPU_TEX_NR_DISPLAY_LUT_ONLY_SKIP_SH_STATE kill
@@ -975,13 +1670,6 @@ TEST(GpuPreviewProcessing, ShadowsHighlightsKillSwitchBypassRestoresPreFixLook)
      * leaves S/H out -- the pre-fix look, which is the A/B baseline. Without
      * the kill switch the attached frame state makes S/H visibly change the
      * frame. */
-    qputenv("MLVAPP_GPU_PREVIEW_ALLOW_SOFTWARE", QByteArray("1"));
-    const GpuPreviewProcessingBackendAvailability availability = gpuPreviewProcessingProbeGpuBackend();
-    if (!availability.available)
-    {
-        SKIP_TEST(availability.reason.toStdString());
-    }
-
     MlvPipelineFixture fixture;
     assert_gpu_preview_fixture_ready(fixture);
     configure_engine_sweep_case(fixture, { "kill_switch", 6500.0, 0.0, 0.0, 0.5, 1.0, 60000.0 });
@@ -1007,12 +1695,7 @@ TEST(GpuPreviewProcessing, ShadowsHighlightsKillSwitchBypassRestoresPreFixLook)
 
     auto render = [&](const GpuPreviewProcessingConfig & config) {
         std::vector<uint16_t> out(frame.size(), 0);
-        QString why;
-        QString renderer;
-        if (!gpuPreviewProcessingApplyDisplayGpuOffscreen(config, frame.data(), out.data(), width, height, &why, &renderer))
-        {
-            ::minitest::fail(__FILE__, __LINE__, "display offscreen render", why.toStdString());
-        }
+        (void)render_display_for_parity(config, frame.data(), out.data(), width, height);
         return out;
     };
     const std::vector<uint16_t> applied = render(withState);

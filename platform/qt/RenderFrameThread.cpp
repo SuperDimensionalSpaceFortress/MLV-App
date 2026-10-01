@@ -4650,6 +4650,29 @@ void RenderFrameThread::drawFrame( int slotIndex,
     {
         GpuPreviewProcessingConfig & previewConfig =
             slot.presentationContext.gpuPreviewProcessingConfig;
+        /* CUDA-PLAYBACK-LOOK-PARITY-2: the display shader reproduces the CPU
+         * preview route. Ask the engine which route it would take for THIS
+         * receipt at THIS scale (the playback-preview guard above is still in
+         * scope) and hand the shader the matching pre-camera clamp. The flag is
+         * per-frame because the route depends on scale and input, which the
+         * cached config cannot know. */
+        {
+            const bool cpuRouteIsDirect8 = m_pMlvObject
+                && mlvPreviewPlaybackUsesDirect8Route( m_pMlvObject, playbackScaleFactor ) != 0;
+            const processingObject_t * routeProcessing =
+                m_pMlvObject ? m_pMlvObject->processing : nullptr;
+            gpuPreviewProcessingApplyCpuRoute( &previewConfig, routeProcessing, cpuRouteIsDirect8 );
+            gpuPreviewProcessingApplyCpuRoute(
+                &slot.presentationContext.gpuPresentationOptions.previewProcessing,
+                routeProcessing,
+                cpuRouteIsDirect8 );
+            slot.stageTimingTelemetry.insert(
+                QStringLiteral("gpu_preview_processing_cpu_route_direct8"),
+                cpuRouteIsDirect8 );
+            slot.stageTimingTelemetry.insert(
+                QStringLiteral("gpu_preview_processing_pre_camera_clamp"),
+                previewConfig.preCameraClamp );
+        }
         const bool shadowsHighlightsFrameStateRequested =
             gpuPreviewProcessingNeedsShadowsHighlightsFrameState(previewConfig);
         slot.stageTimingTelemetry.insert(
