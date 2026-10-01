@@ -193,13 +193,13 @@ TEST(ContactSheetCaptureWiring, PlaybackModeIsARefusedReplayAndNeverStartsAnothe
     ASSERT_FALSE(replayBranch.contains(QStringLiteral("m_contactSheetCaptureActive = true;")));
     ASSERT_FALSE(replayBranch.contains(QStringLiteral("actionPlay")));
     ASSERT_FALSE(replayBranch.contains(QStringLiteral("actionLoop")));
-    ASSERT_FALSE(replayBranch.contains(QStringLiteral("programmaticPlay")));
+    ASSERT_FALSE(replayBranch.contains(QStringLiteral("programmaticPlay(")));   // the ledger counters are fine; a Play CALL is not
     // The restart machinery is gone from the whole smoke body.
     ASSERT_FALSE(smokeBody.contains(QStringLiteral("contactSheetMaxRestarts")));
     ASSERT_FALSE(smokeBody.contains(QStringLiteral("gui-smoke-contact-sheet-restart")));
     // ... and the refusal sits strictly after the measured interval's stop + idle drain.
     const int stopPlaybackAt = smokeBody.indexOf(QStringLiteral("ui->actionPlay->setChecked( false );"));
-    const int refusalAt = smokeBody.indexOf(QStringLiteral("REPLAY_REFUSED"));
+    const int refusalAt = smokeBody.indexOf(QStringLiteral("REPLAY_REFUSED: the playback-mode contact sheet"));
     ASSERT_TRUE(stopPlaybackAt >= 0);
     ASSERT_TRUE(refusalAt > stopPlaybackAt);
 }

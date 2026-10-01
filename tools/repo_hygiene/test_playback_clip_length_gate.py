@@ -849,6 +849,9 @@ PLAYBACK_LAUNCH_ALLOWLIST: dict[str, str] = {
         "decode-only `--profile-playback` benchmark with a FIXED argument list: no pass-through, no Play action.",
     "tools/profiling/ssh-gpu-probe.ps1":
         "decode-only `--profile-playback` probe with a FIXED argument list: no pass-through, no Play action.",
+    "tools/profiling/test-app-play-gate-offscreen.ps1":
+        "ENFORCE-2 proof script: launches ONLY the tracked 16-frame fixture through every programmatic Play "
+        "entry, deliberately bypassing the tool-side gates, and asserts the APP refuses before Play (exit 14 / 2).",
 }
 DECODE_ONLY = {rel for rel in PLAYBACK_LAUNCH_ALLOWLIST if rel.endswith(("capability.ps1", "magnus-profile.ps1", "probe.ps1"))}
 
@@ -1065,6 +1068,18 @@ class PlaybackLauncherScanTests(unittest.TestCase):
             if LOOP_TOKEN.search("\n".join(_code_lines(path))):
                 offenders.append(path.relative_to(ROOT).as_posix())
         self.assertEqual(offenders, [], "a playback launcher passes --loop; nothing may")
+
+    def test_every_launcher_that_can_play_refuses_an_inherited_autoplay_variable(self) -> None:
+        # ENFORCE-2: -ExtraEnvironment was already refused; an MLVAPP_AUTOPLAY_* variable inherited from the
+        # PARENT environment reaches the app the same way and must be refused by every playing launcher.
+        for name in ("run-release-gui-smoke.ps1", "run-release-playback-profile.ps1", "validate-visible-playback.ps1",
+                     "capture-reference-frame.ps1", "start-release-cuda-playback.ps1"):
+            with self.subTest(name):
+                code = "\n".join(_code_lines(PROFILING / name))
+                self.assertRegex(
+                    code,
+                    r"\$parentEnvironmentGate\s*=\s*Test-GuiSmokeParentEnvironment\b[^\n]*\n(?:[^\n]*\n){0,3}?[^\n]*\bexit 44\b"
+                    if name != "capture-reference-frame.ps1" else r"Test-GuiSmokeParentEnvironment\b[\s\S]{0,400}?\bexit 44\b")
 
     def test_every_allowlist_entry_still_exists_and_names_a_reason(self) -> None:
         for rel, reason in PLAYBACK_LAUNCH_ALLOWLIST.items():

@@ -27,6 +27,13 @@ if ($passThroughGate.verdict -ne 'OK') {
     [Console]::Error.WriteLine("PLAYBACK-CLIP-LENGTH-ENFORCE-1: $($passThroughGate.message)")
     exit 44
 }
+# ENFORCE-2: this opens the GUI on a clip, so an MLVAPP_AUTOPLAY_* variable inherited from the parent
+# environment would Play it with no tool-side gate (the app's own gate is the backstop, not the plan).
+$parentEnvironmentGate = Test-GuiSmokeParentEnvironment
+if ($parentEnvironmentGate.verdict -ne 'OK') {
+    [Console]::Error.WriteLine("PLAYBACK-CLIP-LENGTH-ENFORCE-2: $($parentEnvironmentGate.message)")
+    exit 44
+}
 
 if ($ValidationSampleEvery -lt 1) {
     throw "-ValidationSampleEvery must be >= 1."
