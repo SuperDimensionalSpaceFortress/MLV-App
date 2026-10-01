@@ -960,5 +960,112 @@ class FrameIndexTests(_InputHelpers):
             self.assertEqual(verdict["inputs"]["b"]["skipped"][0]["name"], "g-last.png")
 
 
+@unittest.skipUnless(_HAS_DEPS, "numpy/Pillow are not installed on this host")
+class RoundTwoRequestedInputTests(_InputHelpers):
+    """LOOK-METRICS-JUDGE-2 round 2 (fable H1, H6, H8 and the empty --config note): the last ways a REQUESTED input could
+    read as 'not requested' or as a pass."""
+
+    # -- H1: an explicitly empty argument is a REQUEST that is not there --------------------------------------
+    def test_an_explicitly_empty_baseline_dir_is_an_error_not_no_baseline(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            subject = self._dir(tmp, "sub", {"f-00.png": self.moved})
+            out = os.path.join(tmp, "v.json")
+            code, _ = self._run(["floor", "--frames-dir", subject, "--baseline-dir", "", "--label", "x", "--out", out])
+            self.assertEqual(code, 2)
+            self.assertFalse(os.path.exists(out))  # not a PASS with skinCheck NOT_REQUESTED
+            code, verdict, _ = self._floor(tmp, subject, None)  # the real "no baseline asked for" is unchanged
+            self.assertEqual((code, verdict["skinCheck"]["status"]), (0, "NOT_REQUESTED"))
+
+    def test_an_empty_config_path_is_refused_not_replaced_by_the_shipped_config(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            subject = self._dir(tmp, "sub", {"f-00.png": self.original})
+            out = os.path.join(tmp, "v.json")
+            code, _ = self._run(["floor", "--frames-dir", subject, "--label", "x", "--out", out, "--config", ""])
+            self.assertEqual(code, 2)
+            self.assertFalse(os.path.exists(out))
+            with self.assertRaises(look_config.ConfigError):
+                look_config.load_config("")
+
+    # -- H6: skin in the subject, none in the requested baseline ----------------------------------------------
+    def test_a_baseline_without_skin_against_a_subject_with_skin_is_incomplete_not_not_applicable(self):
+        flat = _flat(100, 100, (90, 110, 160))
+        with tempfile.TemporaryDirectory() as tmp:
+            subject = self._dir(tmp, "sub", {"f-00.png": self.original})
+            wrong_scene = self._dir(tmp, "base", {"f-00.png": flat})
+            code, verdict, stdout = self._floor(tmp, subject, wrong_scene)
+            self.assertEqual((code, verdict["outcome"]), (2, lm.INCOMPLETE))
+            check = verdict["frames"][0]["checks"]["skin_hue_drift"]
+            self.assertEqual((check["outcome"], check["reason"]), (lm.NOT_EVALUABLE, "SKIN_IN_SUBJECT_BUT_NOT_IN_BASELINE"))
+            self.assertEqual(verdict["skinCheck"]["status"], "INCOMPLETE")
+            self.assertEqual(verdict["counts"][lm.PASS], 0)
+
+    def test_a_baseline_and_subject_that_both_hold_no_skin_stay_not_applicable(self):
+        flat = _flat(100, 100, (90, 110, 160))
+        detail, _ = lm.skin_drift_check(flat, flat, self.cfg)
+        self.assertEqual((detail["outcome"], detail["reason"]), (lm.NOT_APPLICABLE, "NO_SKIN_TONE_REGION_IN_BASELINE"))
+        detail, _ = lm.skin_drift_check(self.original, flat, self.cfg)
+        self.assertEqual(detail["outcome"], lm.NOT_EVALUABLE)
+
+    # -- H8: any image-like file blocks ----------------------------------------------------------------------
+    IMAGE_LIKE = (".tga", ".jp2", ".heic", ".avif", ".jxl", ".hdr", ".raw", ".tif", ".tiff", ".exr", ".webp", ".bmp",
+                  ".jpg", ".jpeg", ".dng", ".cr2", ".nef", ".arw", ".gif", ".heif", ".j2k", ".dds", ".psd", ".qoi",
+                  ".TGA", ".JXL")
+
+    def test_every_image_like_extension_blocks_and_is_typed(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            for number, ext in enumerate(self.IMAGE_LIKE):
+                with self.subTest(ext=ext):
+                    subject = self._dir(tmp, f"sub{number}", {"f-00.png": self.original})
+                    with open(os.path.join(subject, f"f-01{ext}"), "wb") as handle:
+                        handle.write(b"not really an image")
+                    index = lm.index_frames(subject)
+                    skipped = {s["name"]: s for s in index.skipped}[f"f-01{ext}"]
+                    self.assertEqual((skipped["reason"], skipped["blocking"]), ("NOT_A_PNG", True))
+                    code, verdict, _ = self._floor(tmp, subject, None)
+                    self.assertEqual((code, verdict["outcome"]), (2, lm.INCOMPLETE))
+
+    def test_an_image_is_recognised_by_its_bytes_whatever_it_is_called(self):
+        png = os.path.join(self._dir(self._tmp_dir(), "p", {"x-00.png": self.original}), "x-00.png")
+        with open(png, "rb") as handle:
+            png_bytes = handle.read()
+        samples = {
+            "frame-03": png_bytes,
+            "frame-04.dat": b"\xff\xd8\xff\xe0" + b"\x00" * 20,
+            "frame-05.bin": b"RIFF\x24\x00\x00\x00WEBPVP8 " + b"\x00" * 8,
+            "frame-06.x": b"\x00\x00\x00\x18ftypheic" + b"\x00" * 8,
+            "frame-07.y": b"\x00\x00\x00\x1cftypavif" + b"\x00" * 8,
+            "frame-08.z": b"BM" + b"\x36\x00\x00\x00" + b"\x00\x00\x00\x00" + b"\x36\x00\x00\x00",
+            "frame-09.w": b"P6\n640 480\n255\n",
+            "frame-10.v": b"\xff\x0a" + b"\x00" * 8,
+            "frame-11.u": b"#?RADIANCE\nFORMAT=32-bit_rle_rgbe\n",
+            "frame-12.t": b"II*\x00\x08\x00\x00\x00",
+        }
+        for name, content in samples.items():
+            with self.subTest(name):
+                tmp = self._tmp_dir()
+                subject = self._dir(tmp, "sub", {"f-00.png": self.original})
+                with open(os.path.join(subject, name), "wb") as handle:
+                    handle.write(content)
+                skipped = {s["name"]: s for s in lm.index_frames(subject).skipped}[name]
+                self.assertTrue(skipped["blocking"], skipped)
+                self.assertEqual(skipped["reason"], "NOT_A_PNG")
+
+    def test_text_sidecars_that_merely_start_with_magic_letters_do_not_block(self):
+        tmp = self._tmp_dir()
+        subject = self._dir(tmp, "sub", {"f-00.png": self.original})
+        for name, text in (("notes.txt", "BMW service notes\n"), ("plan.txt", "P1 plan: review the grade\n"),
+                           ("readme", "PF is a pretty long abbreviation\n"), ("log.csv", "frame,sha\n0,abc\n")):
+            with open(os.path.join(subject, name), "w", encoding="utf-8") as handle:
+                handle.write(text)
+        index = lm.index_frames(subject)
+        self.assertEqual(index.blocking_files(), [])
+        self.assertEqual(sorted(s["name"] for s in index.skipped), ["log.csv", "notes.txt", "plan.txt", "readme"])
+
+    def _tmp_dir(self):
+        holder = tempfile.TemporaryDirectory()
+        self.addCleanup(holder.cleanup)
+        return holder.name
+
+
 if __name__ == "__main__":
     unittest.main()

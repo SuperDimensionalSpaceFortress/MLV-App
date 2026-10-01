@@ -25,6 +25,17 @@ a process group elsewhere), so a hung judge cannot outlive its timeout.
 BLINDING: each item runs in its own temp directory containing only `pair.png`; the prompt is the frozen rubric
 plus a fixed instruction. Nothing about subjects, backends, flavors or seeds is ever in a prompt or a path.
 
+ENFORCED ISOLATION (round 2): a judge CLI is a general agent, so flags that ask it not to read are not enough.
+    1. The secrets are not on disk in the clear: build-session seals the answer key, the full session record, the
+       source frames and the degraded sources into one file (look_seal.py) under a per-session key the judge never
+       receives. The shipped runners REFUSE a session directory that is not sealed or still holds a plaintext secret.
+    2. The key is scrubbed from the judge's environment (and the judge commands refuse to start with it set).
+    3. The Codex judge has its tools switched off (shell, unified exec, image viewer, code mode, browser, apps,
+       plugins, sub-agents ...): it can only look at the attached picture. The Claude judge keeps the Read tool,
+       confined to its working directory by --restricted, and any permission denial rejects the verdict.
+    4. `look_cli.py isolation-canary` proves 1-3 LIVE against a canary outside the scratch dir, with a control run
+       that shows the canary IS readable when the confinement is removed.
+
 STALE RESULTS: run_session re-judges any item whose stored verdict was made against a different image digest or a
 different rubric digest, refuses a results file that belongs to another judge identity, and refuses to start
 when the images on disk no longer match the session's recorded digests.
@@ -42,6 +53,7 @@ import threading
 import time
 
 import look_config
+import look_seal
 
 CROSS_FAMILY_UNAVAILABLE = "CROSS_FAMILY_UNAVAILABLE"
 CROSS_FAMILY_PROVEN = "CROSS_FAMILY_PROVEN_LIVE"
@@ -68,6 +80,13 @@ class ProducerJudgeError(ValueError):
 class JudgeError(RuntimeError):
     pass
 
+
+# Codex features switched off for the judge: every one that gives the model a way to read, run or reach anything but
+# the attached picture. Proven live (look_cli isolation-canary): with these off the model reports it has no shell and no
+# image viewer, and with them on (the canary's control run) it reads a canary outside its directory.
+CODEX_DISABLED_FEATURES = ("shell_tool", "unified_exec", "view_image", "code_mode_host", "browser_use", "computer_use",
+                           "apps", "plugins", "skill_search", "hooks", "memories", "multi_agent", "multi_agent_v2",
+                           "goals", "sleep_tool")
 
 ANTHROPIC_FAMILIES = ("opus", "sonnet", "fable", "haiku")
 CODEX_DEFAULT_MODEL = "codex-default"  # recorded only when config.toml names no model: the real model is UNKNOWN
@@ -182,12 +201,26 @@ def _kill_tree(proc):
         pass
 
 
-def run_bounded(argv, input_text=None, cwd=None, timeout=300, grace_s=5):
+def judge_environment(environ=None):
+    """The environment a judge process gets: the caller's, minus the seal key and every other LOOK_* variable. The key
+    is the one thing that turns sealed.bin back into the answer key, so a judge must never inherit it."""
+    environ = os.environ if environ is None else environ
+    return {k: v for k, v in environ.items() if k != look_seal.KEY_ENV and not k.upper().startswith("LOOK_")}
+
+
+def assert_no_seal_key_in_environment(environ=None):
+    environ = os.environ if environ is None else environ
+    if environ.get(look_seal.KEY_ENV):
+        raise JudgeError(f"{look_seal.KEY_ENV} is set in the environment of the judging process: a judge must not be "
+                         "started where the seal key is reachable; unset it and pass the key only to `tally`")
+
+
+def run_bounded(argv, input_text=None, cwd=None, timeout=300, grace_s=5, env=None):
     """subprocess.run replacement whose timeout covers the whole process tree. Returns a CompletedProcess; raises
     subprocess.TimeoutExpired (after killing the tree) so callers keep their existing except clause. Never waits
-    longer than ~timeout + grace_s, even when a grandchild still holds the pipes."""
+    longer than ~timeout + grace_s, even when a grandchild still holds the pipes. `env` replaces the environment."""
     kwargs = {"stdin": subprocess.PIPE if input_text is not None else subprocess.DEVNULL,
-              "stdout": subprocess.PIPE, "stderr": subprocess.PIPE, "cwd": cwd,
+              "stdout": subprocess.PIPE, "stderr": subprocess.PIPE, "cwd": cwd, "env": env,
               "text": True, "encoding": "utf-8", "errors": "replace"}
     if os.name == "nt":
         kwargs["creationflags"] = subprocess.CREATE_NEW_PROCESS_GROUP
@@ -253,17 +286,32 @@ class JudgeRunner:
     model = "unset"
     family = "unknown"
     protected_paths = ()  # run_session sets this to the session dir; the scratch dir may not overlap it
+    requires_sealed = True  # a runner that is a general agent may only run next to a SEALED session (look_seal.py)
 
     def identity(self):
         return {"judgeId": self.judge_id, "model": self.model, "family": self.family}
+
+    def isolation_record(self):
+        """What run_session writes into the results file and look_tally reads back: whether this runner's isolation is
+        enforced by the harness, and a digest of the exact confinement it asks for."""
+        return {"enforced": False, "kind": "unspecified"}
 
     def judge_image(self, png_path, rubric_text):  # pragma: no cover - interface
         raise NotImplementedError
 
 
 class CallableJudge(JudgeRunner):
-    def __init__(self, fn, judge_id="callable", model="callable", family="test"):
+    """Wraps a function (tests, or a lane that judges out of process). The harness cannot enforce what such a judge can
+    read, so it records `enforced: False` unless the caller states otherwise with `isolation` (a claim, not a proof)."""
+
+    requires_sealed = False
+
+    def __init__(self, fn, judge_id="callable", model="callable", family="test", isolation=None):
         self.fn, self.judge_id, self.model, self.family = fn, judge_id, model, family
+        self._isolation = isolation
+
+    def isolation_record(self):
+        return dict(self._isolation) if self._isolation else {"enforced": False, "kind": "callable"}
 
     def judge_image(self, png_path, rubric_text):
         return self.fn(png_path, rubric_text)
@@ -311,6 +359,13 @@ def _remove_workdir(work):
         pass
 
 
+CLAUDE_CONFINEMENT_ARGS = ("--restricted", "--safe-mode", "--strict-mcp-config")
+
+
+def _template_digest(argv):
+    return hashlib.sha256(json.dumps(list(argv)).encode("utf-8")).hexdigest()
+
+
 class ClaudeCliJudge(JudgeRunner):
     def __init__(self, model, judge_id=None, claude_exe=None, timeout_s=300, extra_args=None):
         self.model = model
@@ -320,21 +375,28 @@ class ClaudeCliJudge(JudgeRunner):
         self.timeout_s = timeout_s
         self.extra_args = list(extra_args or [])
 
-    def command(self):
+    def command(self, confined=True):
         """ISOLATION: --restricted ignores the user's, the project's and the local settings and confines the file
         tools to the working directory (which holds only pair.png); --safe-mode switches off CLAUDE.md, hooks,
         skills, plugins and MCP servers; --strict-mcp-config with no --mcp-config means no MCP server at all; no
         --add-dir widens the roots. A CLI too old to know a flag exits non-zero (JudgeError), it does not run
-        unconfined."""
-        return [self.claude_exe, "-p", "--model", self.model, "--tools", "Read", "--allowedTools", "Read",
-                "--restricted", "--safe-mode", "--strict-mcp-config",
-                "--no-session-persistence", "--disable-slash-commands", "--output-format", "json"] + self.extra_args
+        unconfined. `confined=False` exists ONLY for the isolation canary's control run (look_cli isolation-canary):
+        judge_image never calls it."""
+        return ([self.claude_exe, "-p", "--model", self.model, "--tools", "Read", "--allowedTools", "Read"]
+                + (list(CLAUDE_CONFINEMENT_ARGS) if confined else [])
+                + ["--no-session-persistence", "--disable-slash-commands", "--output-format", "json"]
+                + self.extra_args)
+
+    def isolation_record(self):
+        return {"enforced": True, "kind": "claude-cli", "tools": ["Read"], "confinement": list(CLAUDE_CONFINEMENT_ARGS),
+                "commandSha256": _template_digest(self.command()[1:]), "sealRequired": True}
 
     def judge_image(self, png_path, rubric_text):
+        assert_no_seal_key_in_environment()
         work = _neutral_workdir(png_path, self.protected_paths)
         try:
             proc = run_bounded(self.command(), input_text=build_prompt(rubric_text), cwd=work,
-                               timeout=self.timeout_s)
+                               timeout=self.timeout_s, env=judge_environment())
         except subprocess.TimeoutExpired as exc:
             raise JudgeError(f"claude timed out after {self.timeout_s}s (process tree killed)") from exc
         except OSError as exc:
@@ -349,6 +411,13 @@ class ClaudeCliJudge(JudgeRunner):
             raise JudgeError(f"claude output is not JSON: {proc.stdout[:200]!r}") from exc
         if outer.get("is_error"):
             raise JudgeError(f"claude reported an error: {str(outer.get('result'))[:400]}")
+        denials = outer.get("permission_denials")
+        if not isinstance(denials, list):
+            raise JudgeError("claude's reply carries no permission_denials list: cannot verify the judge stayed in its "
+                             "directory, so the verdict is rejected")
+        if denials:  # the judge TRIED to reach something it may not: the verdict is not trusted, and the attempt is recorded
+            raise JudgeError(f"claude was denied {len(denials)} tool call(s) (a read outside its directory?): "
+                             f"{json.dumps(denials)[:400]}; verdict rejected")
         verdict = extract_json_object(str(outer.get("result", "")))
         verdict["_raw"] = str(outer.get("result", ""))[:2000]
         return verdict
@@ -367,24 +436,42 @@ class CodexExecJudge(JudgeRunner):
         self.codex_exe = codex_exe or shutil.which("codex") or "codex"
         self.timeout_s = timeout_s
 
-    def command(self, png_path, out_file, work):
+    def _isolation_args(self):
+        args = ["--ignore-user-config", "--ignore-rules", "--strict-config"]
+        for feature in CODEX_DISABLED_FEATURES:
+            args += ["--disable", feature]
+        return args + ["-c", "web_search=disabled"]
+
+    def command(self, png_path, out_file, work, confined=True):
         # The prompt goes on stdin: --image is variadic and would swallow a trailing positional prompt.
-        # ISOLATION: -C pins the working root to the scratch dir that holds only pair.png; --ignore-user-config and
-        # --ignore-rules keep the user's config.toml and rules (and anything they point at) out of the run. That is
-        # safe for the model choice because the model is passed with -m whenever it is known (see __init__).
-        cmd = [self.codex_exe, "exec", "--image", png_path, "--sandbox", "read-only", "--skip-git-repo-check",
-               "--ignore-user-config", "--ignore-rules", "--ephemeral", "-C", work, "-o", out_file]
+        # ISOLATION: the read-only sandbox lets a shell read ANY file the user can (Codex maps it to read access at the
+        # filesystem root, and view_image takes an absolute path), so no sandbox flag is relied on. The tools that could
+        # read a file are switched off instead (CODEX_DISABLED_FEATURES): the judge can only look at the attached
+        # picture. --strict-config / an unknown --disable make a CLI that no longer knows one of these fail loudly
+        # rather than run with a tool on. --ignore-user-config / --ignore-rules keep the user's config.toml, rules and
+        # MCP servers out; that is safe for the model choice because the model is passed with -m whenever it is known
+        # (see __init__). `confined=False` exists ONLY for the isolation canary's control run; judge_image never uses it.
+        cmd = [self.codex_exe, "exec", "--image", png_path, "--sandbox", "read-only", "--skip-git-repo-check"]
+        if confined:
+            cmd += self._isolation_args()
+        cmd += ["--ephemeral", "-C", work, "-o", out_file]
         if self.model != CODEX_DEFAULT_MODEL:
             cmd[2:2] = ["-m", self.model]
         return cmd
 
+    def isolation_record(self):
+        return {"enforced": True, "kind": "codex-exec", "toolsDisabled": list(CODEX_DISABLED_FEATURES),
+                "commandSha256": _template_digest(self.command("<png>", "<out>", "<work>")[1:]), "sealRequired": True}
+
     def judge_image(self, png_path, rubric_text):
+        assert_no_seal_key_in_environment()
         work = _neutral_workdir(png_path, self.protected_paths)
         out_file = os.path.join(work, "last-message.txt")
         try:
             proc = run_bounded(
                 self.command(os.path.join(work, "pair.png"), out_file, work),
-                input_text=build_prompt(rubric_text, True), cwd=work, timeout=self.timeout_s)
+                input_text=build_prompt(rubric_text, True), cwd=work, timeout=self.timeout_s,
+                env=judge_environment())
             text = ""
             if os.path.isfile(out_file):
                 with open(out_file, "r", encoding="utf-8", errors="replace") as handle:
@@ -415,15 +502,26 @@ def probe_codex_image_support(codex_exe=None, timeout_s=60):
         proc = run_bounded([exe, "--version"], timeout=timeout_s)
         version = (proc.stdout or proc.stderr).strip()
         proc = run_bounded([exe, "exec", "--help"], timeout=timeout_s)
+        help_text = proc.stdout + proc.stderr
+        features = run_bounded([exe, "features", "list"], timeout=timeout_s)
     except (OSError, subprocess.TimeoutExpired) as exc:
         return {"status": CROSS_FAMILY_UNAVAILABLE, "reason": f"{type(exc).__name__}: {exc}"}
-    help_text = proc.stdout + proc.stderr
     has_flag = "--image" in help_text
+    known = {line.split()[0] for line in (features.stdout or "").splitlines() if line.split()}
+    unknown = [f for f in CODEX_DISABLED_FEATURES if f not in known]
+    # The judge's isolation IS its disabled tools: a Codex that no longer knows one of them cannot be confined, so it
+    # does not judge (the runner would fail on the unknown --disable anyway; this records WHY, up front).
+    isolatable = not unknown and "--strict-config" in help_text
+    if has_flag and not isolatable:
+        reason = (f"isolation cannot be enforced: this Codex does not list the features {unknown}" if unknown
+                  else "isolation cannot be enforced: `codex exec --help` lists no --strict-config")
+    else:
+        reason = None if has_flag else "`codex exec --help` lists no image-input option"
     return {
-        "status": CROSS_FAMILY_FLAG_ONLY if has_flag else CROSS_FAMILY_UNAVAILABLE,
+        "status": CROSS_FAMILY_FLAG_ONLY if (has_flag and isolatable) else CROSS_FAMILY_UNAVAILABLE,
         "codexVersion": version, "imageFlag": "--image" if has_flag else None,
         "helpSha256": hashlib.sha256(help_text.encode("utf-8")).hexdigest(),
-        "reason": None if has_flag else "`codex exec --help` lists no image-input option",
+        "isolationFeaturesUnknown": unknown, "reason": reason,
     }
 
 
@@ -437,7 +535,7 @@ def probe_codex_vision(png_path, expected_word, codex_exe=None, model=None, time
               "English name of the square's colour, in lower case, and nothing else.")
     try:
         proc = run_bounded(judge.command(os.path.join(work, "pair.png"), out_file, work), input_text=prompt,
-                           cwd=work, timeout=timeout_s)
+                           cwd=work, timeout=timeout_s, env=judge_environment())
         text = ""
         if os.path.isfile(out_file):
             with open(out_file, "r", encoding="utf-8", errors="replace") as handle:
@@ -512,6 +610,16 @@ def run_session(session_dir, runner, workers=3, deadline_s=500, max_items=None, 
         raise JudgeError("the pair images on disk do not match the digests the session recorded: "
                          "the session was changed after it was built; rebuild it")
     rubric_text = look_config.load_rubric_text(rubric_path)
+    state = look_seal.session_state(session_dir)
+    if runner.requires_sealed:
+        assert_no_seal_key_in_environment()
+        try:
+            look_seal.assert_judgeable(session_dir)
+        except look_seal.SealError as exc:
+            raise JudgeError(str(exc)) from exc
+    judged_under_seal = state["sealed"] and not state["plaintextPresent"]
+    seal_sha = state["sealSha256"] if judged_under_seal else None
+    isolation = runner.isolation_record()
     runner.protected_paths = [os.path.abspath(session_dir)]  # the judge's scratch dir may never overlap the session
     out_path = results_path(session_dir, runner.judge_id)
     existing = _load_json(out_path)
@@ -523,8 +631,14 @@ def run_session(session_dir, runner, workers=3, deadline_s=500, max_items=None, 
         "rubricSha256": lock["rubricSha256"], "items": {}, "errors": {},
     }
     stale = {}
+    # Verdicts made before the session was sealed, or under another confinement, were made by a judge that could have
+    # read the key: they are thrown away and judged again, never carried into a sealed run.
+    changed_conditions = existing is not None and (existing.get("sealSha256") != seal_sha
+                                                   or existing.get("isolation") != isolation)
     for item_id, stored in list(doc["items"].items()):
-        if item_id not in current:
+        if changed_conditions:
+            stale[item_id] = "SEAL_OR_ISOLATION_DIFFERS_FROM_CURRENT_RUN"
+        elif item_id not in current:
             stale[item_id] = "ITEM_NOT_IN_THIS_SESSION"
         elif stored.get("imageSha256") != current[item_id]:
             stale[item_id] = "IMAGE_DIGEST_DIFFERS_FROM_CURRENT_IMAGE"
@@ -533,7 +647,10 @@ def run_session(session_dir, runner, workers=3, deadline_s=500, max_items=None, 
     for item_id in stale:
         del doc["items"][item_id]
     doc["rubricSha256"] = lock["rubricSha256"]
-    doc["staleRejected"] = {**doc.get("staleRejected", {}), **stale}
+    doc["sealSha256"] = seal_sha
+    doc["judgedUnderSeal"] = judged_under_seal
+    doc["isolation"] = isolation
+    doc["staleRejected"] ={**doc.get("staleRejected", {}), **stale}
     todo = [it for it in manifest["items"] if it["itemId"] not in doc["items"]]
     if max_items is not None:
         todo = todo[:max_items]

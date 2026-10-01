@@ -215,7 +215,10 @@ def _flatten_values(node, top=True):
 def load_config(path=None):
     """Return (values, meta). values mirrors the JSON with each leaf replaced by its value; meta carries the
     file sha256 (so a verdict binds to the exact thresholds it was judged against), the path and the version."""
-    path = path or CONFIG_PATH
+    if path is None:
+        path = CONFIG_PATH
+    elif not str(path).strip():  # an empty --config (an unset variable in a wrapper) is not "use the shipped one"
+        raise ConfigError("an empty config path was given: name the config file, or omit --config for the shipped one")
     with open(path, "rb") as handle:
         raw = handle.read().replace(b"\r\n", b"\n")
     doc = json.loads(raw.decode("utf-8"))

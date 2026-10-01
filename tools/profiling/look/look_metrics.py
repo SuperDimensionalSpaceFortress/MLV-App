@@ -299,6 +299,11 @@ def skin_drift_check(active, ref_active, cfg):
               "retainFraction": float(frame_cfg["skin_region_retain_fraction"]), "threshold": threshold,
               "comparator": "<="}
     if not ref_skin["usable"] or not bool(ref_skin["mask"].any()):
+        if skin["usable"] and bool(skin["mask"].any()):
+            # The subject HAS a skin region the requested baseline does not: the baseline is not the same scene (or has
+            # been crushed to nothing), so "nothing to drift" would be a false comfort. Not evaluable, never N/A-as-pass.
+            detail.update({"outcome": NOT_EVALUABLE, "reason": "SKIN_IN_SUBJECT_BUT_NOT_IN_BASELINE", "value": None})
+            return detail, skin
         detail.update({"outcome": NOT_APPLICABLE, "reason": "NO_SKIN_TONE_REGION_IN_BASELINE"})
         return detail, skin
     retained = skin["regionPct"] >= detail["retainFraction"] * ref_skin["regionPct"]
@@ -420,7 +425,41 @@ class FrameIndexError(ValueError):
 
 
 # An image file that could have been a frame. Skipping one is never silent AND never harmless: the sheet is INCOMPLETE.
-_IMAGE_EXTENSIONS = (".png", ".jpg", ".jpeg", ".bmp", ".tif", ".tiff", ".webp", ".gif", ".exr", ".dng", ".ppm", ".pgm")
+_IMAGE_EXTENSIONS = (
+    ".png", ".jpg", ".jpeg", ".jpe", ".jfif", ".jp2", ".j2k", ".jpf", ".jpx", ".jxl", ".bmp", ".dib", ".tif", ".tiff",
+    ".webp", ".gif", ".apng", ".avif", ".avifs", ".heic", ".heif", ".hif", ".tga", ".targa", ".icb", ".vda", ".vst",
+    ".exr", ".hdr", ".pic", ".dds", ".psd", ".ico", ".ppm", ".pgm", ".pbm", ".pnm", ".pam", ".pfm", ".sgi", ".rgb",
+    ".rgba", ".bw", ".qoi",
+    # camera raw and video-still formats
+    ".dng", ".raw", ".cr2", ".cr3", ".crw", ".nef", ".nrw", ".arw", ".srf", ".sr2", ".orf", ".rw2", ".raf", ".pef",
+    ".srw", ".3fr", ".erf", ".kdc", ".mrw", ".x3f", ".rwl", ".iiq", ".braw", ".ari")
+
+
+# Leading bytes of common image containers, so a frame named `frame-07` or `frame-07.dat` is still seen as an image.
+_IMAGE_SIGNATURES = (b"\x89PNG\r\n\x1a\n", b"\xff\xd8\xff", b"GIF87a", b"GIF89a", b"II*\x00", b"MM\x00*",
+                     b"II+\x00", b"MM\x00+", b"\x00\x00\x00\x0cjP  ", b"\xff\x4f\xff\x51", b"\xff\x0a",
+                     b"\x00\x00\x00\x0cJXL ", b"#?RADIANCE", b"#?RGBE", b"v/1\x01", b"8BPS", b"DDS ", b"qoif",
+                     b"\x01\xda")
+_PNM_HEAD = re.compile(rb"P[1-7fF](?:[ \t\r\n]|#[^\n]*\n)+\d+")  # magic, whitespace/comment, then the width digits
+
+
+def _has_image_signature(path):
+    """True when the first bytes are those of an image container. Two-letter text-like magics (BMP's `BM`, PNM's `P6`)
+    are only believed with their second structural check, so a `notes.txt` that starts with those letters is not one."""
+    try:
+        with open(path, "rb") as handle:
+            head = handle.read(48)
+    except OSError:
+        return False
+    if head[:4] == b"RIFF" and head[8:12] == b"WEBP":
+        return True
+    if head[4:8] == b"ftyp" and head[8:12] in (b"heic", b"heix", b"hevc", b"mif1", b"msf1", b"avif", b"avis"):
+        return True
+    if head[:2] == b"BM" and len(head) >= 10 and head[6:10] == b"\x00\x00\x00\x00":
+        return True
+    if _PNM_HEAD.match(head):
+        return True
+    return any(head.startswith(sig) for sig in _IMAGE_SIGNATURES)
 
 
 class FrameIndex(dict):
@@ -460,7 +499,8 @@ def index_frames(directory):
         stem, ext = os.path.splitext(name)
         ext = ext.lower()
         if ext != ".png":
-            is_image = ext in _IMAGE_EXTENSIONS
+            # An allowlist of names is not enough (a frame can carry any extension, or none): also look at the bytes.
+            is_image = ext in _IMAGE_EXTENSIONS or _has_image_signature(os.path.join(directory, name))
             found._skip(name, "NOT_A_PNG" if is_image else "NOT_A_FRAME_FILE", is_image)
             continue
         digits = re.findall(r"\d+", stem)

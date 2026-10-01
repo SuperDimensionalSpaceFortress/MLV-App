@@ -33,14 +33,21 @@ import look_cli  # noqa: E402
 import look_config  # noqa: E402
 import look_judges  # noqa: E402
 import look_pairs  # noqa: E402
+import look_seal  # noqa: E402
 import look_tally  # noqa: E402
 
 _HAS_PIL = importlib.util.find_spec("PIL") is not None
 _HAS_DEPS = _HAS_PIL and importlib.util.find_spec("numpy") is not None
 
 CFG, META = look_config.load_config()
-RUBRIC = look_config.verify_rubric_lock()["rubricSha256"]
+LOCK = look_config.verify_rubric_lock()
+RUBRIC = LOCK["rubricSha256"]
 JUDGE = {"judgeId": "j1", "model": "claude-fable-5-1", "family": "anthropic"}
+# What the tally needs from the caller beyond the verdicts: a verified rubric lock, a verified seal that the verdicts were
+# made under, and an enforced-isolation record. Tests that are about something else hand these in as already established.
+SEAL_SHA = "5" * 64
+SEAL_OK = {"verified": True, "sealSha256": SEAL_SHA, "resultsSealSha256": SEAL_SHA}
+ISOLATION_OK = {"enforced": True, "kind": "test"}
 FORBIDDEN = ["claude-sonnet-5-5", "claude-opus-5-5"]
 SEED = "tally-seed"
 
@@ -77,12 +84,12 @@ def fake_capture(names=("cuda", "cpu")):
 
 
 def build_fake_session(tmp, tag="v1", frames=range(5), controls=1, positive=1, subdir="session", extra_frame_ids=(),
-                       **kw):
+                       rubric=None, **kw):
     out = os.path.join(tmp, subdir)
     a = {"name": "cuda", "frames": _sources(tmp, "cuda", frames, tag)}
     b = {"name": "cpu", "frames": _sources(tmp, "cpu", frames, tag)}
     kw.setdefault("capture", fake_capture())
-    look_pairs.build_session(a, b, list(frames) + list(extra_frame_ids), SEED, out, RUBRIC, controls=controls,
+    look_pairs.build_session(a, b, list(frames) + list(extra_frame_ids), SEED, out, rubric or RUBRIC, controls=controls,
                              positive_controls=positive, compose=_fake_compose, degrade=_fake_degrade, **kw)
     return out
 
@@ -130,11 +137,15 @@ def slot_follower(side):
 class Fixture:
     """A built fake session, its key/session dicts and a way to answer it."""
 
-    def __init__(self, tmp, **kw):
+    def __init__(self, tmp, sealed=False, **kw):
         self.dir = build_fake_session(tmp, **kw)
         self.key = read_json(os.path.join(self.dir, "answer_key.json"))
         self.session = read_json(os.path.join(self.dir, "session.json"))
         self.current = current_digests(self.dir)
+        self.seal_key = None
+        if sealed:  # what `build-session` does by default: the secrets move into sealed.bin, session.json goes public
+            self.seal_key = look_seal.new_key()
+            look_seal.seal_session(self.dir, self.seal_key)
 
     def answers(self, rule):
         return {it["itemId"]: verdict_for(it, rule(it)) for it in self.key["items"]}
@@ -143,6 +154,9 @@ class Fixture:
         kw.setdefault("current_image_sha256", self.current)
         kw.setdefault("forbidden_models", FORBIDDEN)
         kw.setdefault("config_sha256", META["configSha256"])
+        kw.setdefault("rubric_lock", LOCK)
+        kw.setdefault("seal", SEAL_OK)
+        kw.setdefault("judge_isolation", ISOLATION_OK)
         return look_tally.tally(self.key, answers, JUDGE, self.session, cfg or CFG, **kw)
 
     def judge_fn(self, rule, counter=None):
@@ -154,6 +168,24 @@ class Fixture:
             item = by_id[os.path.basename(png)[:-4]]
             return {"left": _scores(), "right": _scores(), "preference": rule(item)}
         return fn
+
+
+def second_judge(entry, judge_id="j2", model="claude-haiku-4-5", family="anthropic"):
+    """A copy of a tally entry that is a DIFFERENT judge: its own id, model and (therefore) results digest."""
+    other = json.loads(json.dumps(entry))
+    other.update({"judgeId": judge_id, "model": model, "family": family,
+                  "resultsSha256": look_pairs._h("results", judge_id, model)})
+    return other
+
+
+def seal_args(fx):
+    return ["--seal-key", fx.seal_key]
+
+
+def sealed_runner(fn, judge_id="cj", model="claude-fable-5-1"):
+    """A judge that, like the shipped runners, states its isolation is enforced (a claim; the shipped runners' own claim
+    is pinned by JudgeIsolationTests and proved live by `isolation-canary`)."""
+    return look_judges.CallableJudge(fn, judge_id, model, "anthropic", isolation=ISOLATION_OK)
 
 
 class TmpCase(unittest.TestCase):
@@ -850,21 +882,20 @@ class TallyTests(TmpCase):
     # -- disagreement ---------------------------------------------------------------------------------
     def test_judges_more_than_the_configured_points_apart_need_a_third(self):
         base = self._tally(faithful("cpu"))
-        other = json.loads(json.dumps(base))
-        other["judgeId"] = "j2"
-        self.assertFalse(look_tally.judge_disagreement([base, other], 1.0)["thirdJudgeNeeded"])
+        other = second_judge(base)
+        self.assertFalse(look_tally.judge_disagreement([base, other], 1.0, rubric_lock=LOCK)["thirdJudgeNeeded"])
         other["scores"]["cpu"]["colour_cast"] = base["scores"]["cpu"]["colour_cast"] + 1.5
-        verdict = look_tally.judge_disagreement([base, other], 1.0)
+        verdict = look_tally.judge_disagreement([base, other], 1.0, rubric_lock=LOCK)
         self.assertTrue(verdict["thirdJudgeNeeded"])
         self.assertTrue(verdict["comparable"])
         self.assertEqual(verdict["details"][0]["criterion"], "colour_cast")
         other["scores"]["cpu"]["colour_cast"] = base["scores"]["cpu"]["colour_cast"] + 1.0  # exactly 1: not "more than"
-        self.assertFalse(look_tally.judge_disagreement([base, other], 1.0)["thirdJudgeNeeded"])
-        self.assertTrue(look_tally.judge_disagreement([base, other], 0.5)["thirdJudgeNeeded"])
+        self.assertFalse(look_tally.judge_disagreement([base, other], 1.0, rubric_lock=LOCK)["thirdJudgeNeeded"])
+        self.assertTrue(look_tally.judge_disagreement([base, other], 0.5, rubric_lock=LOCK)["thirdJudgeNeeded"])
 
     def test_a_comparison_that_includes_an_unusable_judge_is_not_comparable(self):
-        good, bad = self._tally(faithful("cpu")), self._tally(lambda item: "tie")
-        verdict = look_tally.judge_disagreement([good, bad], 1.0)
+        good, bad = self._tally(faithful("cpu")), second_judge(self._tally(lambda item: "tie"))
+        verdict = look_tally.judge_disagreement([good, bad], 1.0, rubric_lock=LOCK)
         self.assertFalse(verdict["comparable"])
         self.assertEqual(verdict["unusableJudges"], [bad["judgeId"]])
 
@@ -984,17 +1015,17 @@ class TallyCliTests(TmpCase):
 
     def setUp(self):
         super().setUp()
-        self.fx = Fixture(self.tmp)
+        self.fx = Fixture(self.tmp, sealed=True)
 
     def _run(self, rule, judge_id="cj"):
-        runner = look_judges.CallableJudge(self.fx.judge_fn(rule), judge_id, "claude-fable-5-1", "anthropic")
+        runner = sealed_runner(self.fx.judge_fn(rule), judge_id)
         summary = look_judges.run_session(self.fx.dir, runner)
         out = os.path.join(self.tmp, f"tally-{judge_id}.json")
         stdout = io.StringIO()
         with contextlib.redirect_stdout(stdout):
             code = look_cli.main(["tally", "--session-dir", self.fx.dir, "--results", summary["resultsPath"],
                                   "--out", out, "--producer-model", "claude-sonnet-5-5",
-                                  "--producer-model", "claude-opus-5-5"])
+                                  "--producer-model", "claude-opus-5-5", *seal_args(self.fx)])
         return code, read_json(out), stdout.getvalue()
 
     def test_a_usable_tally_exits_zero(self):
@@ -1008,32 +1039,34 @@ class TallyCliTests(TmpCase):
         self.assertIn("POSITIVE_CONTROL_FAILED", stdout)
 
     def test_a_tampered_image_after_judging_makes_the_cli_exit_non_zero(self):
-        runner = look_judges.CallableJudge(self.fx.judge_fn(faithful("cpu")), "cj", "claude-fable-5-1", "anthropic")
+        runner = sealed_runner(self.fx.judge_fn(faithful("cpu")))
         summary = look_judges.run_session(self.fx.dir, runner)
         with open(os.path.join(self.fx.dir, "images", self.fx.key["items"][0]["itemId"] + ".png"), "ab") as handle:
             handle.write(b"tampered")
         out = os.path.join(self.tmp, "t.json")
         with contextlib.redirect_stdout(io.StringIO()):
             code = look_cli.main(["tally", "--session-dir", self.fx.dir, "--results", summary["resultsPath"],
-                                  "--out", out, "--producer-model", "opus"])
+                                  "--out", out, "--producer-model", "opus", *seal_args(self.fx)])
         self.assertEqual(code, 2)
         self.assertIn("IMAGE_CHANGED_SINCE_BUILD", read_json(out)["unusableReasons"])
 
     def test_the_cli_refuses_a_self_judge_by_alias_at_tally_time_too(self):
         results = os.path.join(self.tmp, "r.json")
-        runner = look_judges.CallableJudge(self.fx.judge_fn(faithful("cpu")), "cj", "sonnet", "anthropic")
+        runner = sealed_runner(self.fx.judge_fn(faithful("cpu")), "cj", "sonnet")
         summary = look_judges.run_session(self.fx.dir, runner)
         out = os.path.join(self.tmp, "t.json")
         with contextlib.redirect_stdout(io.StringIO()):
             code = look_cli.main(["tally", "--session-dir", self.fx.dir, "--results", summary["resultsPath"],
-                                  "--out", out, "--producer-model", "claude-sonnet-5-5"])
+                                  "--out", out, "--producer-model", "claude-sonnet-5-5", *seal_args(self.fx)])
         self.assertEqual(code, 2)
         self.assertIn("JUDGE_IS_PRODUCER_OR_UNVERIFIABLE", read_json(out)["unusableReasons"])
         self.assertFalse(os.path.exists(results))
 
     def test_third_judge_points_comes_from_the_config_file(self):
         def entry(judge_id, value):
-            return {"judgeId": judge_id, "usable": True, "scores": {"cpu": {"colour_cast": value}},
+            return {"schema": look_tally.SCHEMA_VERDICT, "judgeId": judge_id, "model": f"claude-{judge_id}-5-1",
+                    "family": "anthropic", "resultsSha256": look_pairs._h("results", judge_id), "usable": True,
+                    "scores": {"cpu": {"colour_cast": value}},
                     "rubricSha256": RUBRIC, "orderSeed": SEED, "imageSha256s": ["a" * 64]}
         a, b = os.path.join(self.tmp, "a.json"), os.path.join(self.tmp, "b.json")
         write_json(a, entry("a", 3.0))
@@ -1170,17 +1203,41 @@ class JudgeRunnerTests(unittest.TestCase):
         self.assertIn("--skip-git-repo-check", cmd)
         self.assertEqual(cmd[-2:], ["-o", "/w/out.txt"])
 
-    def _help(self, text, version="codex-cli 9.9"):
+    ALL_FEATURES = "".join(f"{name}  stable  true\n" for name in look_judges.CODEX_DISABLED_FEATURES)
+
+    def _help(self, text, version="codex-cli 9.9", features=None):
+        features = self.ALL_FEATURES if features is None else features
+
         def fake(argv, **kwargs):
-            body = version if "--version" in argv else text
+            body = version if "--version" in argv else (features if "features" in argv else text)
             return subprocess.CompletedProcess(argv, 0, stdout=body, stderr="")
         return fake
 
     def test_probe_reports_flag_present_but_not_proven(self):
-        with mock.patch.object(look_judges, "run_bounded", self._help("  -i, --image <FILE>...  attach")):
+        with mock.patch.object(look_judges, "run_bounded",
+                               self._help("  -i, --image <FILE>...  attach\n      --strict-config  strict")):
             probe = look_judges.probe_codex_image_support("codex")
         self.assertEqual(probe["status"], look_judges.CROSS_FAMILY_FLAG_ONLY)
         self.assertEqual(probe["imageFlag"], "--image")
+        self.assertEqual(probe["isolationFeaturesUnknown"], [])
+
+    def test_a_codex_that_cannot_be_confined_is_cross_family_unavailable_not_run_unblinded(self):
+        """B3: when a Codex no longer lists one of the tool switches the judge relies on (or has no --strict-config),
+        the runner must not be offered at all: CROSS_FAMILY_UNAVAILABLE, with the reason recorded."""
+        help_text = "  -i, --image <FILE>...  attach\n      --strict-config  strict"
+        without_shell = "".join(f"{n}  stable  true\n" for n in look_judges.CODEX_DISABLED_FEATURES if n != "shell_tool")
+        with mock.patch.object(look_judges, "run_bounded", self._help(help_text, features=without_shell)):
+            probe = look_judges.probe_codex_image_support("codex")
+        self.assertEqual(probe["status"], look_judges.CROSS_FAMILY_UNAVAILABLE)
+        self.assertEqual(probe["isolationFeaturesUnknown"], ["shell_tool"])
+        self.assertIn("isolation cannot be enforced", probe["reason"])
+        with mock.patch.object(look_judges, "run_bounded", self._help("  -i, --image <FILE>...  attach")):
+            no_strict = look_judges.probe_codex_image_support("codex")
+        self.assertEqual(no_strict["status"], look_judges.CROSS_FAMILY_UNAVAILABLE)
+        self.assertIn("--strict-config", no_strict["reason"])
+        runner, status = look_judges.select_second_judge("anthropic", probe)
+        self.assertIsNone(runner)
+        self.assertEqual(status, look_judges.CROSS_FAMILY_UNAVAILABLE)
 
     def test_probe_without_the_flag_is_cross_family_unavailable(self):
         with mock.patch.object(look_judges, "run_bounded", self._help("  -m, --model <MODEL>")):
@@ -1462,12 +1519,12 @@ class CaptureRecordTests(TmpCase):
         self.assertIn("CONFIG_SHA_NOT_VERIFIED", entry["unusableReasons"])
 
     def test_the_tally_cli_passes_the_config_digest_and_refuses_an_edited_config(self):
-        fx = Fixture(self.tmp)
-        runner = look_judges.CallableJudge(fx.judge_fn(faithful("cpu")), "cj", "claude-fable-5-1", "anthropic")
+        fx = Fixture(self.tmp, sealed=True)
+        runner = sealed_runner(fx.judge_fn(faithful("cpu")))
         summary = look_judges.run_session(fx.dir, runner)
         out = os.path.join(self.tmp, "t.json")
         argv = ["tally", "--session-dir", fx.dir, "--results", summary["resultsPath"], "--out", out,
-                "--producer-model", "claude-sonnet-5-5"]
+                "--producer-model", "claude-sonnet-5-5", *seal_args(fx)]
         with contextlib.redirect_stdout(io.StringIO()):
             self.assertEqual(look_cli.main(argv), 0)
             doc = read_json(look_config.CONFIG_PATH)
@@ -1536,11 +1593,10 @@ class DisagreementSessionTests(TmpCase):
         super().setUp()
         self.fx = Fixture(self.tmp)
         self.a = self.fx.tally(self.fx.answers(faithful("cpu")))
-        self.b = json.loads(json.dumps(self.a))
-        self.b["judgeId"] = "j2"
+        self.b = second_judge(self.a)
 
     def test_entries_from_one_session_and_rubric_are_comparable(self):
-        verdict = look_tally.judge_disagreement([self.a, self.b], 1.0)
+        verdict = look_tally.judge_disagreement([self.a, self.b], 1.0, rubric_lock=LOCK)
         self.assertTrue(verdict["comparable"])
         self.assertEqual(verdict["sessionMismatches"], [])
 
@@ -1549,14 +1605,14 @@ class DisagreementSessionTests(TmpCase):
             with self.subTest(field):
                 other = json.loads(json.dumps(self.b))
                 other[field] = value
-                verdict = look_tally.judge_disagreement([self.a, other], 1.0)
+                verdict = look_tally.judge_disagreement([self.a, other], 1.0, rubric_lock=LOCK)
                 self.assertFalse(verdict["comparable"])
                 self.assertEqual(verdict["sessionMismatches"], [field])
 
     def test_an_entry_missing_the_session_fields_is_not_comparable(self):
         other = json.loads(json.dumps(self.b))
         del other["rubricSha256"]
-        verdict = look_tally.judge_disagreement([self.a, other], 1.0)
+        verdict = look_tally.judge_disagreement([self.a, other], 1.0, rubric_lock=LOCK)
         self.assertFalse(verdict["comparable"])
         self.assertIn("rubricSha256", verdict["sessionMismatches"])
 
@@ -1590,13 +1646,16 @@ class JudgeIsolationTests(TmpCase):
         self.seen = {}
 
     def _fake_run(self, stdout_doc):
-        def fake(argv, input_text=None, cwd=None, timeout=300, grace_s=5):
-            self.seen.update(argv=list(argv), cwd=cwd, listing=sorted(os.listdir(cwd)), input=input_text)
+        def fake(argv, input_text=None, cwd=None, timeout=300, grace_s=5, env=None):
+            self.seen.update(argv=list(argv), cwd=cwd, listing=sorted(os.listdir(cwd)), input=input_text, env=env)
             return subprocess.CompletedProcess(argv, 0, stdout_doc, "")
         return fake
 
     def _verdict_json(self):
         return json.dumps({"left": _scores(), "right": _scores(), "preference": "tie"})
+
+    def _claude_reply(self, denials=()):
+        return json.dumps({"result": self._verdict_json(), "permission_denials": list(denials)})
 
     def _assert_nothing_leaks(self):
         blob = json.dumps(self.seen["argv"]) + (self.seen["input"] or "")
@@ -1609,8 +1668,7 @@ class JudgeIsolationTests(TmpCase):
     def test_claude_runs_in_a_directory_holding_only_pair_png_with_confined_tools_and_no_inherited_context(self):
         judge = look_judges.ClaudeCliJudge("claude-fable-5-1", claude_exe="claude")
         judge.protected_paths = [self.session]
-        with mock.patch.object(look_judges, "run_bounded",
-                               self._fake_run(json.dumps({"result": self._verdict_json()}))):
+        with mock.patch.object(look_judges, "run_bounded", self._fake_run(self._claude_reply())):
             judge.judge_image(self.png, "RUBRIC")
         self.assertEqual(self.seen["listing"], ["pair.png"])
         argv = self.seen["argv"]
@@ -1680,14 +1738,16 @@ class BuildSessionCliTests(TmpCase):
             Image.fromarray(arr, "RGB").save(os.path.join(directory, f"{name}-frame-{index:02d}.png"))
         return directory
 
-    def _build(self, extra=(), a=None, b=None):
+    def _build(self, extra=(), a=None, b=None, sealed=False):
+        """`sealed=False` passes --no-seal so the tests can read the plaintext session; the sealed default is covered by
+        SealedSessionTests."""
         a = a or self._frames("aa", {0: (48, 32), 1: (48, 32), 2: (48, 32)})
         b = b or self._frames("bb", {0: (48, 32), 1: (58, 32)})  # frame 1 is 10 px wider; frame 2 is missing
         out = os.path.join(self.tmp, "sess")
         stderr, stdout = io.StringIO(), io.StringIO()
         with contextlib.redirect_stderr(stderr), contextlib.redirect_stdout(stdout):
             code = look_cli.main(["build-session", "--a", f"aa={a}", "--b", f"bb={b}", "--seed", "s",
-                                  "--out-dir", out, *extra])
+                                  "--out-dir", out, *(() if sealed else ("--no-seal",)), *extra])
         return code, out, stdout.getvalue(), stderr.getvalue()
 
     def test_dropped_frames_are_recorded_with_reasons_and_the_crop_tolerance(self):

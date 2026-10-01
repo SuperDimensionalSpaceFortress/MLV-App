@@ -10,9 +10,13 @@
     python tools/profiling/look/look_cli.py probe-codex [--live-vision-dir DIR]
     python tools/profiling/look/look_cli.py build-session --a cuda=DIR --b cpu=DIR --seed N --out-dir SESS
                                                          [--letterbox auto-symmetric] [--a-letterbox-bars ..] [--b-letterbox-bars ..]
+                                                         [--seal-key-file K.txt | --no-seal]   (sealed by default; key printed once)
     python tools/profiling/look/look_cli.py judge        --session-dir SESS --runner claude:MODEL --producer-model M
     python tools/profiling/look/look_cli.py tally        --session-dir SESS --results R.json --producer-model M --out T.json
-    python tools/profiling/look/look_cli.py judge-disagreement --entries T1.json T2.json [--out D.json]
+                                                         --seal-key K | --seal-key-file K.txt | env LOOK_SEAL_KEY
+    python tools/profiling/look/look_cli.py judge-disagreement --entries T1.json T2.json [--out D.json] [--require-cross-family]
+    python tools/profiling/look/look_cli.py unseal       --session-dir SESS --out-dir AUDIT --seal-key K
+    python tools/profiling/look/look_cli.py isolation-canary --runner claude|codex [--out R.json]
 
 Exit codes: 0 verdict PASS/REPORTED, a usable tally, or a non-verdict command that succeeded; 1 verdict FAIL;
 2 verdict INCOMPLETE, a structural error, or a tally entry that is NOT usable (its JSON is still written).
@@ -31,6 +35,7 @@ if HERE not in sys.path:
 import look_config  # noqa: E402
 import look_judges  # noqa: E402
 import look_pairs  # noqa: E402
+import look_seal  # noqa: E402
 import look_tally  # noqa: E402
 
 # contact-sheet geometry written by make-contact-sheet.py (HEADER_HEIGHT, TILE_PADDING, TILE_TARGET_WIDTH,
@@ -132,13 +137,16 @@ def cmd_floor(args):
 
     cfg, meta = look_config.load_config(args.config)
     policy = _policy(cfg, args.letterbox, args.letterbox_bars)
-    if args.baseline_dir:
+    # "Given" is `is not None`, never truthiness: `--baseline-dir ""` (an unset variable in a wrapper script) is a
+    # baseline that was REQUESTED and is not there, so it is an error, not "no baseline asked for".
+    requested = args.baseline_dir is not None
+    if requested:
         _refuse_same_directory(args.frames_dir, args.baseline_dir, "floor --baseline-dir")
     frames = look_metrics.index_frames(args.frames_dir)
     # A baseline dir that was GIVEN is a baseline that was REQUESTED: whatever it lacks is missing, not "not asked for".
-    baselines = look_metrics.index_frames(args.baseline_dir) if args.baseline_dir else {}
+    baselines = look_metrics.index_frames(args.baseline_dir) if requested else {}
     verdict = look_metrics.evaluate_sheet(frames, cfg, meta, label=args.label, references=baselines,
-                                          letterbox_policy=policy, baseline_requested=bool(args.baseline_dir))
+                                          letterbox_policy=policy, baseline_requested=requested)
     verdict["createdUtc"] = _now()
     verdict["source"] = args.source_note
     _write_json(args.out, verdict)
@@ -275,6 +283,12 @@ def cmd_build_session(args):
         raise ValueError("--allow-dropped-frames needs a reason (say why losing those frames is acceptable)")
     name_a, dir_a = _parse_subject(args.a)
     name_b, dir_b = _parse_subject(args.b)
+    _refuse_same_directory(dir_a, dir_b, "build-session")  # one directory under two names: every real pair is identical
+    key_hex = None
+    if not args.no_seal:
+        key_hex = look_seal.new_key()
+        if args.seal_key_file:
+            _refuse_key_file_in_session(args.seal_key_file, args.out_dir)
     prep = os.path.join(args.out_dir, "source-frames")
     policy_a = _policy(cfg, args.letterbox, args.a_letterbox_bars)
     policy_b = _policy(cfg, args.letterbox, args.b_letterbox_bars)
@@ -303,8 +317,24 @@ def cmd_build_session(args):
     if dropped_sorted:
         print(f"[look_cli] WARNING {len(dropped_sorted)} frame(s) were NOT judged: "
               + "; ".join(f"{d['frameId']} ({d['reason']})" for d in dropped_sorted), file=sys.stderr)
-    print(json.dumps({"frames": keep, "droppedFrames": dropped_sorted,
-                      "files": {k: os.path.basename(v) for k, v in paths.items()}}))
+    out = {"frames": keep, "droppedFrames": dropped_sorted, "files": {k: os.path.basename(v) for k, v in paths.items()}}
+    if key_hex is None:
+        print("[look_cli] WARNING --no-seal: the answer key and the source frames are in the session directory in "
+              "the clear. A real judge refuses this session and a tally of it is unusable (SEAL_NOT_VERIFIED).",
+              file=sys.stderr)
+        out["sealed"] = False
+    else:
+        sealed = look_seal.seal_session(args.out_dir, key_hex)
+        out.update({"sealed": True, "sealSha256": sealed["sealSha256"], "sealedMembers": len(sealed["members"])})
+        if args.seal_key_file:
+            _write_key_file(args.seal_key_file, key_hex)
+            out["sealKeyFile"] = args.seal_key_file
+        else:
+            out["sealKey"] = key_hex
+        print(f"[look_cli] SEALED: the answer key and source frames are in {look_seal.SEALED_NAME}, readable only with "
+              "the seal key. Keep the key OUT of the judge's environment (judge refuses LOOK_SEAL_KEY); pass it to "
+              f"`tally` with --seal-key / --seal-key-file / {look_seal.KEY_ENV}.", file=sys.stderr)
+    print(json.dumps(out))
     lost = look_pairs.drop_policy(dropped)["lossFrameIds"]
     if lost and allowance is None:
         print(f"[look_cli] ERROR UNACKNOWLEDGED_DROPPED_FRAMES: frames {lost} were lost, not chosen. The session is "
@@ -312,6 +342,23 @@ def cmd_build_session(args):
               "--allow-dropped-frames REASON to record why the loss is acceptable.", file=sys.stderr)
         return 2
     return 0
+
+
+def _refuse_key_file_in_session(key_file, session_dir):
+    """A key file inside the session directory is a key the judge can read."""
+    here, there = os.path.realpath(session_dir), os.path.realpath(key_file)
+    if there == here or there.startswith(here + os.sep):
+        raise ValueError(f"--seal-key-file {key_file!r} is inside the session directory: a judge could read it")
+
+
+def _write_key_file(path, key_hex):
+    os.makedirs(os.path.dirname(os.path.abspath(path)), exist_ok=True)
+    with open(path, "w", encoding="utf-8", newline="\n") as handle:
+        handle.write(key_hex + "\n")
+    try:
+        os.chmod(path, 0o600)
+    except OSError:
+        pass
 
 
 def _runner_from_spec(spec, args):
@@ -324,6 +371,7 @@ def _runner_from_spec(spec, args):
 
 
 def cmd_judge(args):
+    look_judges.assert_no_seal_key_in_environment()  # fail before anything starts: the judge must not inherit the key
     runner = _runner_from_spec(args.runner, args)
     look_judges.assert_not_producer(runner.model, args.producer_model)  # the alias-table, family-level guard
     summary = look_judges.run_session(
@@ -345,15 +393,34 @@ def _current_image_digests(session_dir):
     return digests
 
 
+def _load_secrets(args):
+    """(answer_key, full session, seal dict-or-None). A sealed session is opened from memory with the seal key (the
+    seal must verify, or this raises). An UNSEALED session is read as plaintext so the diagnosis can still be written,
+    but it carries no seal: the entry is unusable (SEAL_NOT_VERIFIED), whatever the verdicts say."""
+    sealed_file = os.path.isfile(look_seal.sealed_path(args.session_dir))
+    key_hex = look_seal.key_from_args(args.seal_key, args.seal_key_file)
+    if sealed_file:
+        if not key_hex:
+            raise ValueError(f"{args.session_dir!r} is sealed: pass the seal key build-session printed "
+                             f"(--seal-key, --seal-key-file or {look_seal.KEY_ENV})")
+        key, session, seal_sha = look_seal.open_sealed(args.session_dir, key_hex)
+        return key, session, {"verified": True, "sealSha256": seal_sha}
+    return (_read_json(os.path.join(args.session_dir, "answer_key.json")),
+            _read_json(os.path.join(args.session_dir, "session.json")), None)
+
+
 def cmd_tally(args):
-    key = _read_json(os.path.join(args.session_dir, "answer_key.json"))
-    session = _read_json(os.path.join(args.session_dir, "session.json"))
+    key, session, seal = _load_secrets(args)
     results = _read_json(args.results)
     cfg, meta = look_config.load_config(args.config)
+    lock = look_config.verify_rubric_lock(args.rubric, args.rubric_lock)  # the CURRENT lock, or the one named explicitly
+    if seal is not None:
+        seal["resultsSealSha256"] = results.get("sealSha256")
     entry = look_tally.tally(
         key, results["items"], results["judge"], session, cfg,
         current_image_sha256=_current_image_digests(args.session_dir), forbidden_models=args.producer_model,
-        cross_family_status=args.cross_family_status, config_sha256=meta["configSha256"])
+        cross_family_status=args.cross_family_status, config_sha256=meta["configSha256"],
+        rubric_lock=lock, seal=seal, judge_isolation=results.get("isolation"))
     entry["errorsDuringJudging"] = results.get("errors", {})
     entry["staleRejectedAtJudging"] = results.get("staleRejected", {})
     entry["createdUtc"] = _now()
@@ -368,13 +435,38 @@ def cmd_tally(args):
 def cmd_judge_disagreement(args):
     cfg, _ = look_config.load_config(args.config)
     entries = [_read_json(path) for path in args.entries]
-    verdict = look_tally.judge_disagreement(entries, cfg["judge_disagreement"]["third_judge_points"])
+    lock = look_config.verify_rubric_lock(args.rubric, args.rubric_lock)  # the CURRENT lock, or the one named explicitly
+    verdict = look_tally.judge_disagreement(entries, cfg["judge_disagreement"]["third_judge_points"], rubric_lock=lock,
+                                            require_cross_family=args.require_cross_family)
     verdict["createdUtc"] = _now()
     if args.out:
         _write_json(args.out, verdict)
     print(json.dumps({k: verdict[k] for k in ("thirdJudgeNeeded", "thresholdPoints", "comparable", "unusableJudges",
-                                              "sessionMismatches")}))
+                                              "sessionMismatches", "identityProblems", "rubricLockProblems")}))
     return 0 if verdict["comparable"] else 2
+
+
+def cmd_unseal(args):
+    """Audit only: write the sealed members (answer key, full session, source frames) under --out-dir, which may not be
+    inside the session directory. Needs the seal key."""
+    key_hex = look_seal.key_from_args(args.seal_key, args.seal_key_file)
+    if not key_hex:
+        raise ValueError("unseal needs the seal key")
+    look_seal.extract_all(args.session_dir, key_hex, args.out_dir)
+    print(json.dumps({"extractedTo": args.out_dir}))
+    return 0
+
+
+def cmd_isolation_canary(args):
+    import look_canary
+
+    report = look_canary.run_canary(args.runner, timeout_s=args.timeout_s, control=not args.no_control, model=args.model,
+                                    base_dir=args.canary_dir)
+    report["createdUtc"] = _now()
+    if args.out:
+        _write_json(args.out, report)
+    print(json.dumps({k: report[k] for k in ("runner", "outcome", "leaked", "controlProvedReadable")}))
+    return 0 if report["outcome"] == look_canary.HELD else 2
 
 
 def main(argv=None):
@@ -447,6 +539,10 @@ def main(argv=None):
     s.add_argument("--allow-dropped-frames", metavar="REASON",
                    help="acknowledge that frames were LOST (unshared, outside the crop tolerance, requested but absent) "
                         "and why that is acceptable; without it the session is marked and the tally calls it unusable")
+    s.add_argument("--seal-key-file", help="write the seal key here (outside the session dir) instead of printing it")
+    s.add_argument("--no-seal", action="store_true",
+                   help="leave the answer key and source frames in the clear (debugging only: a real judge refuses "
+                        "the session and its tally is unusable)")
     s.add_argument("--config")
     s.set_defaults(fn=cmd_build_session)
 
@@ -468,6 +564,11 @@ def main(argv=None):
     s.add_argument("--out", required=True)
     s.add_argument("--config")
     s.add_argument("--cross-family-status")
+    s.add_argument("--seal-key", help="the key build-session printed (or --seal-key-file / env LOOK_SEAL_KEY)")
+    s.add_argument("--seal-key-file")
+    s.add_argument("--rubric", help="rubric file to verify against --rubric-lock (default: the shipped rubric)")
+    s.add_argument("--rubric-lock", help="rubric lock to verify against (default: the shipped lock); the session's "
+                                         "recorded rubric digest must equal it")
     s.add_argument("--producer-model", action="append", default=[], required=True,
                    help="model id of the look's producer or the hub; repeatable; the tally re-applies the guard")
     s.set_defaults(fn=cmd_tally)
@@ -476,7 +577,28 @@ def main(argv=None):
     s.add_argument("--entries", nargs="+", required=True, help="tally entry JSON files, one per judge")
     s.add_argument("--out")
     s.add_argument("--config")
+    s.add_argument("--rubric")
+    s.add_argument("--rubric-lock")
+    s.add_argument("--require-cross-family", action="store_true",
+                   help="the comparison is claimed to be cross-family: the judges must be in different model families "
+                        "(also assumed when an entry says CROSS_FAMILY_PROVEN_LIVE)")
     s.set_defaults(fn=cmd_judge_disagreement)
+
+    s = sub.add_parser("unseal")
+    s.add_argument("--session-dir", required=True)
+    s.add_argument("--out-dir", required=True)
+    s.add_argument("--seal-key")
+    s.add_argument("--seal-key-file")
+    s.set_defaults(fn=cmd_unseal)
+
+    s = sub.add_parser("isolation-canary")
+    s.add_argument("--runner", required=True, choices=["claude", "codex"])
+    s.add_argument("--model")
+    s.add_argument("--out")
+    s.add_argument("--canary-dir", help="where to make the decoys and the sealed session (default: the temp dir)")
+    s.add_argument("--timeout-s", type=int, default=230)
+    s.add_argument("--no-control", action="store_true", help="skip the unconfined control run (the proof is then weaker)")
+    s.set_defaults(fn=cmd_isolation_canary)
 
     args = p.parse_args(argv)
     try:
