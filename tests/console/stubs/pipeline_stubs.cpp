@@ -165,7 +165,7 @@ void processingSetExposureStops(processingObject_t * processing, double exposure
 
 int processingWhiteBalanceControlsForAsShotNeutral(const double[3], int *, int *)
 {
-    return 0; /* console tests never open a clip; ReceiptApplier falls back to the WBAL kelvin */
+    return 0; /* console tests never open a clip; only WB_CUSTOM DNG sequences reach the fit (pipeline test covers it) */
 }
 
 void getMlvRawFrameFloat(mlvObject_t *, uint64_t, float *) {}

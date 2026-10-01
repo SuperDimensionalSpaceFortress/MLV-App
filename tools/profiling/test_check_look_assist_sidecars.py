@@ -17,6 +17,7 @@ def sidecar(**overrides):
         "look_assist_temperature": 9990,
         "look_assist_tint": -35,
         "saved": True,
+        "settled": True,
     }
     base.update(overrides)
     return base
@@ -43,6 +44,17 @@ class CheckLookAssistSidecars(unittest.TestCase):
         self.assertTrue(chk.check([("f", sidecar(look_assist_temperature=3200))]))
         self.assertTrue(chk.check([("f", sidecar(look_assist_tint=25))]))
 
+    def test_unsettled_or_rejected_decisions_fail(self):
+        # Sol r1: a rejected-unstable decision on an unsettled sidecar used to pass.
+        self.assertTrue(chk.check([("f", sidecar(settled=False))]))
+        self.assertTrue(chk.check([("f", sidecar())] + [("g", {k: v for k, v in sidecar().items() if k != "settled"})]))
+        rejected = chk.check([("f", sidecar(look_assist_wb_decision="rejected-unstable"))])
+        self.assertTrue(any("look_assist_wb_decision" in f for f in rejected))
+        for decision in ("none", "candidate", "rejected-safety-fallback", None):
+            self.assertTrue(chk.check([("f", sidecar(look_assist_wb_decision=decision))]), decision)
+        for decision in ("accepted", "accepted-damped", "prior"):
+            self.assertEqual([], chk.check([("f", sidecar(look_assist_wb_decision=decision))]), decision)
+
     def test_look_assist_off_and_too_few_frames_fail(self):
         self.assertTrue(chk.check([("f", sidecar(look_assist_enabled=False))]))
         self.assertTrue(chk.check([("f", sidecar())], min_frames=2))
@@ -59,6 +71,30 @@ class CheckLookAssistSidecars(unittest.TestCase):
             self.assertEqual(1, chk.main([directory]))
         with tempfile.TemporaryDirectory() as empty:
             self.assertEqual(2, chk.main([empty]))
+
+
+class DeckPictureGate(unittest.TestCase):
+    def _frame(self, directory, rgb):
+        try:
+            from PIL import Image
+        except ImportError:
+            self.skipTest("Pillow not installed")
+        Image.new("RGB", (80, 40), rgb).save(os.path.join(directory, "frame-00.png"))
+        with open(os.path.join(directory, "frame-00.json"), "w", encoding="utf-8") as handle:
+            json.dump(sidecar(), handle)
+
+    def test_neutral_deck_passes_and_lavender_deck_fails(self):
+        with tempfile.TemporaryDirectory() as directory:
+            self._frame(directory, (128, 128, 128))
+            self.assertEqual(0, chk.main([directory, "--deck-chroma-max", "6"]))
+        with tempfile.TemporaryDirectory() as directory:
+            self._frame(directory, (140, 118, 150))   # lavender: the master / r1 picture
+            self.assertEqual(1, chk.main([directory, "--deck-chroma-max", "6"]))
+
+    def test_the_picture_gate_is_off_unless_asked_for(self):
+        with tempfile.TemporaryDirectory() as directory:
+            self._frame(directory, (140, 118, 150))
+            self.assertEqual(0, chk.main([directory]))
 
 
 if __name__ == "__main__":

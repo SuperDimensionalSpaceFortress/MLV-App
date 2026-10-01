@@ -56,6 +56,7 @@ LookAssistStats analyzeLookAssistThumbnail( const unsigned char *rgb, int width,
     int balanceHistogramG[256] = { 0 };
     int balanceHistogramB[256] = { 0 };
     const int totalSamples = width * height;
+    int midtoneSamples = 0;
     double visibleRTotal = 0.0;
     double visibleGTotal = 0.0;
     double visibleBTotal = 0.0;
@@ -69,6 +70,7 @@ LookAssistStats analyzeLookAssistThumbnail( const unsigned char *rgb, int width,
         const int b = rgb[base + 2];
         const int luma = qBound( 0, ( 54 * r + 183 * g + 19 * b ) >> 8, 255 );
         histogram[luma]++;
+        if( luma >= 40 && luma <= 215 ) ++midtoneSamples;
         histogramR[r]++;
         histogramG[g]++;
         histogramB[b]++;
@@ -102,6 +104,7 @@ LookAssistStats analyzeLookAssistThumbnail( const unsigned char *rgb, int width,
         }
     }
 
+    stats.midtoneFraction = (double)midtoneSamples / (double)totalSamples;
     stats.median = lookAssistPercentile( histogram, totalSamples, 0.50 );
     stats.p05 = lookAssistPercentile( histogram, totalSamples, 0.05 );
     stats.p95 = lookAssistPercentile( histogram, totalSamples, 0.95 );
@@ -169,9 +172,14 @@ void lookAssistSetSceneEv100( LookAssistStats *stats,
 // Open shade is ~EV100 12; a window-lit interior tops out near 10. 11 splits them with margin.
 static const double kLookAssistDaylightEv100 = 11.0;
 
-bool lookAssistSceneIsDaylightByMetadata( const LookAssistStats &stats )
+bool lookAssistExposureIsDaylightBright( const LookAssistStats &stats )
 {
     return stats.hasSceneEv100 && stats.sceneEv100 >= kLookAssistDaylightEv100;
+}
+
+bool lookAssistSceneIsDaylight( const LookAssistStats &stats )
+{
+    return lookAssistExposureIsDaylightBright( stats ) && stats.daylightPictureEvidence;
 }
 
 void lookAssistSetAsShotWhiteBalance( LookAssistStats *stats, bool valid, int temperature, int tint )
@@ -182,11 +190,11 @@ void lookAssistSetAsShotWhiteBalance( LookAssistStats *stats, bool valid, int te
     stats->asShotTint = valid ? tint : 0;
 }
 
-static bool lookAssistIsDaylightScene( const LookAssistStats &stats, LookAssistScene scene )
+bool lookAssistIsDaylightScene( const LookAssistStats &stats, LookAssistScene scene )
 {
     return scene != LookAssistScene::Night
         && scene != LookAssistScene::ArtificialLights
-        && lookAssistSceneIsDaylightByMetadata( stats );
+        && lookAssistSceneIsDaylight( stats );
 }
 
 LookAssistWhiteBalanceBounds lookAssistWhiteBalanceBounds( const LookAssistStats &stats, LookAssistScene scene )
@@ -230,8 +238,10 @@ LookAssistScene classifyLookAssistScene( const LookAssistStats &stats )
     if( stats.p95 >= 220.0 || stats.clipHigh > 0.015 )
         return LookAssistScene::BrightSun;
 
-    // The recorded exposure says this is daylight: a dark picture is under-exposure, not night.
-    if( lookAssistSceneIsDaylightByMetadata( stats ) )
+    // The recorded exposure says daylight AND the rendered picture agrees (resolveLookAssistScene):
+    // a dark RAW thumbnail is then under-exposure / a raw floor, not night. The exposure alone
+    // never gets here -- a night moon records a daylight EV over a black sky.
+    if( lookAssistSceneIsDaylight( stats ) )
         return LookAssistScene::Shade;
 
     if( stats.median < 60.0 )
@@ -242,6 +252,41 @@ LookAssistScene classifyLookAssistScene( const LookAssistStats &stats )
     }
 
     return LookAssistScene::Shade;
+}
+
+bool lookAssistDaylightNeedsPictureEvidence( const LookAssistStats &stats, LookAssistScene legacyScene )
+{
+    return !stats.daylightPictureEvidence
+        && lookAssistExposureIsDaylightBright( stats )
+        && lookAssistIsFlatFloorRawThumbnail( stats )
+        && ( legacyScene == LookAssistScene::Night || legacyScene == LookAssistScene::ArtificialLights );
+}
+
+bool lookAssistPictureCorroboratesDaylight( const LookAssistStats &processedAtCameraExposure )
+{
+    // Camera settings that say "bright" over a picture that is mostly dark is a bright SUBJECT in a
+    // dark scene (moon, lit stage, car lights), not daylight. A daylight exposure renders a lit
+    // picture: most pixels in the mid-tones around a mid median.
+    return processedAtCameraExposure.midtoneFraction >= 0.60
+        && processedAtCameraExposure.median >= 60.0
+        && processedAtCameraExposure.median <= 190.0;
+}
+
+LookAssistScene resolveLookAssistScene( LookAssistStats *stats, const LookAssistRenderFn &renderProcessed )
+{
+    if( !stats ) return LookAssistScene::Night;
+    stats->daylightPictureEvidence = false;
+    LookAssistScene scene = classifyLookAssistScene( *stats );
+    if( renderProcessed && lookAssistDaylightNeedsPictureEvidence( *stats, scene ) )
+    {
+        LookAssistStats processed;
+        if( renderProcessed( 0.0, &processed ) && lookAssistPictureCorroboratesDaylight( processed ) )
+        {
+            stats->daylightPictureEvidence = true;
+            scene = classifyLookAssistScene( *stats );
+        }
+    }
+    return scene;
 }
 
 bool lookAssistIsFlatFloorRawThumbnail( const LookAssistStats &stats )
@@ -263,12 +308,16 @@ bool lookAssistIsFloorLiftedNightThumbnail( LookAssistScene scene, const LookAss
 
 bool lookAssistShouldAnalyzeProcessedColor( LookAssistScene scene, const LookAssistStats &stats )
 {
-    // Colour has to be read from the RENDERED picture whenever the RAW thumbnail is a flat floor.
-    // This used to ride on the night-only test above, so the day the classifier correctly stopped
-    // calling a daylight clip "night" no white balance was solved on rendered pixels at all and
-    // the base 6000 K stood (deck cast chroma 11.5 -> 22.4).
-    (void)scene;
-    return lookAssistIsFlatFloorRawThumbnail( stats );
+    // Colour has to be read from the RENDERED picture when the RAW thumbnail is a flat floor AND the
+    // scene is one whose floor-lifted balance is understood: night (the rescue, unchanged) or a
+    // daylight picture (corroborated by the render). This used to ride on the night-only test above,
+    // so the day the classifier correctly stopped calling the daylight fixture "night" no white
+    // balance was solved on rendered pixels at all and the base 6000 K stood (deck cast chroma
+    // 11.5 -> 22.4). Flat-floor artificial-lights / bright-sun clips WITHOUT daylight evidence stay
+    // exactly as on master (raw-thumbnail balance, no processed analysis, no auto chroma smoothing):
+    // none of the night-only fail-closed guards cover them, so the gate is not widened to them.
+    return lookAssistIsFlatFloorRawThumbnail( stats )
+        && ( scene == LookAssistScene::Night || lookAssistIsDaylightScene( stats, scene ) );
 }
 
 bool lookAssistIsFlatNoiseFloorThumbnail( LookAssistScene scene, const LookAssistStats &stats )
@@ -366,6 +415,13 @@ LookAssistAutoWhiteBalancePatch findLookAssistAutoWhiteBalancePatch(
     return best;
 }
 
+bool lookAssistDaylightPatchIsNeutralEnough( const LookAssistAutoWhiteBalancePatch &patch )
+{
+    return patch.valid
+        && patch.chroma <= qMax( 10.0, patch.luma * 0.09 )
+        && fabs( patch.blueAmberAxis ) <= 20.0;
+}
+
 bool lookAssistAutoWhiteBalanceSolutionIsStable(
         const LookAssistAutoWhiteBalancePatch &patch,
         int baseTemperature,
@@ -375,6 +431,9 @@ bool lookAssistAutoWhiteBalanceSolutionIsStable(
         bool daylightSolve )
 {
     if( !patch.valid ) return false;
+    // A daylight solve skips the swing rejection below, so it must come from a patch that can be
+    // neutral under daylight, not a pale-blue sky / water surface.
+    if( daylightSolve && !lookAssistDaylightPatchIsNeutralEnough( patch ) ) return false;
 
     const int temperatureDelta = candidateTemperature - baseTemperature;
     const int tintDelta = candidateTint - baseTint;
@@ -457,6 +516,89 @@ double lookAssistAutoWhiteBalanceDampingFactor(
         factor = qMin( factor, 0.70 );
     }
     return factor;
+}
+
+LookAssistWhiteBalanceResolution resolveLookAssistWhiteBalance( const LookAssistWhiteBalanceRequest &request,
+                                                                const LookAssistWhiteBalanceSolveFn &solve,
+                                                                LookAssistPreset *preset )
+{
+    LookAssistWhiteBalanceResolution out;
+    if( !request.stats || !preset ) return out;
+    const LookAssistStats &stats = *request.stats;
+    const LookAssistAutoWhiteBalancePatch &patch = request.patch;
+    const int baseTemperature = request.baseTemperature;
+    const int baseTint = request.baseTint;
+    const bool undamped = lookAssistDaylightSolveIsUndamped( stats, request.scene, request.solvedOnProcessedPicture );
+
+    int solvedTemperature = baseTemperature;
+    int solvedTint = baseTint;
+    if( patch.valid )
+    {
+        out.source = request.solvedOnProcessedPicture ? QStringLiteral("processed-neutral-patch")
+                                                      : QStringLiteral("raw-neutral-patch");
+        out.decision = QStringLiteral("candidate");
+        if( solve ) solve( patch.rawX, patch.rawY, &solvedTemperature, &solvedTint );
+        solvedTemperature = qBound( request.minTemperature, solvedTemperature, request.maxTemperature );
+        solvedTint = qBound( request.minTint, solvedTint, request.maxTint );
+        solvedTint = qBound( -35, solvedTint, 18 );   // the solver's own rails, unchanged
+        out.candidateTemperature = solvedTemperature;
+        out.candidateTint = solvedTint;
+        if( lookAssistAutoWhiteBalanceSolutionIsStable( patch, baseTemperature, baseTint,
+                                                        solvedTemperature, solvedTint, undamped ) )
+        {
+            out.damping = undamped
+                ? 1.0
+                : lookAssistAutoWhiteBalanceDampingFactor( patch, baseTemperature, baseTint,
+                                                           solvedTemperature, solvedTint, request.scene );
+            if( out.damping < 0.999 )
+            {
+                solvedTemperature = qBound( request.minTemperature,
+                                            baseTemperature + qRound( ( solvedTemperature - baseTemperature ) * out.damping ),
+                                            request.maxTemperature );
+                solvedTint = qBound( request.minTint,
+                                     baseTint + qRound( ( solvedTint - baseTint ) * out.damping ),
+                                     request.maxTint );
+                out.decision = QStringLiteral("accepted-damped");
+            }
+            else
+            {
+                out.decision = QStringLiteral("accepted");
+            }
+            preset->temperatureDelta = solvedTemperature - baseTemperature;
+            preset->tintDelta = solvedTint - baseTint;
+            out.autoValid = true;
+        }
+        else
+        {
+            out.source = QStringLiteral("rejected-extreme-color-cast");
+            out.decision = QStringLiteral("rejected-unstable");
+        }
+        out.solvedTemperature = solvedTemperature;
+        out.solvedTint = solvedTint;
+    }
+    if( !out.autoValid )
+    {
+        // No neutral patch we can trust: the clip's recorded white balance (mode-aware) is the
+        // prior, daylight only. Everything else keeps the colour-balance default in the preset.
+        int priorTemperature = baseTemperature;
+        int priorTint = baseTint;
+        if( lookAssistAsShotPrior( stats, request.scene, &priorTemperature, &priorTint ) )
+        {
+            out.source = QStringLiteral("as-shot-prior");
+            out.decision = QStringLiteral("prior");
+            preset->temperatureDelta = priorTemperature - baseTemperature;
+            preset->tintDelta = priorTint - baseTint;
+        }
+    }
+
+    int temperature = qBound( request.minTemperature, baseTemperature + preset->temperatureDelta, request.maxTemperature );
+    int tint = qBound( request.minTint, baseTint + preset->tintDelta, request.maxTint );
+    lookAssistClampWhiteBalance( lookAssistWhiteBalanceBounds( stats, request.scene ), &temperature, &tint );
+    preset->temperatureDelta = temperature - baseTemperature;
+    preset->tintDelta = tint - baseTint;
+    out.temperature = temperature;
+    out.tint = tint;
+    return out;
 }
 
 int lookAssistDisplayTargetMedianForScene( LookAssistScene scene )

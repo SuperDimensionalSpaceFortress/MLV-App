@@ -508,28 +508,42 @@ bool ReceiptApplier::asShotWhiteBalanceControls(mlvObject_t *mlvObject, int *tem
 {
     if( !mlvObject || !temperature || !tint ) return false;
 
-    const double neutral[3] = {
-        static_cast<double>( getMlvWbRgain( mlvObject ) ) / 1024.0,
-        static_cast<double>( getMlvWbGgain( mlvObject ) ) / 1024.0,
-        static_cast<double>( getMlvWbBgain( mlvObject ) ) / 1024.0
-    };
-    int solvedTemperature = 6000;
-    int solvedTint = 0;
-    if( neutral[0] > 0.0 && neutral[1] > 0.0 && neutral[2] > 0.0
-     && processingWhiteBalanceControlsForAsShotNeutral( neutral, &solvedTemperature, &solvedTint ) )
+    // The ONE mode-aware decoder of WBAL (MainWindow::setWhiteBalanceFromMlv calls this; there is no
+    // second copy). The header's contract: kelvin is valid only in WB_KELVIN and the wbgain_* neutral
+    // only in WB_CUSTOM, so each field is read only in the mode that populates it. A stale custom-WB
+    // slot under another mode is never consulted.
+    *tint = 0;
+    switch( getMlvWbMode( mlvObject ) )
     {
-        *temperature = solvedTemperature;
-        *tint = solvedTint;
-        return true;
-    }
-    const int kelvin = static_cast<int>( getMlvWbKelvin( mlvObject ) );
-    if( kelvin >= 2000 && kelvin <= 10000 )
+    case 6: // Custom: fit the retained neutral to the receipt controls (DNG sequences only)
     {
-        *temperature = kelvin;
-        *tint = 0;
-        return true;
+        *temperature = 6000;
+        if( ( mlvObject->MLVI.videoClass & MLV_VIDEO_CLASS_FLAG_DNGSEQ ) == 0 ) break;
+        const double neutral[3] = {
+            static_cast<double>( getMlvWbRgain( mlvObject ) ) / 1024.0,
+            static_cast<double>( getMlvWbGgain( mlvObject ) ) / 1024.0,
+            static_cast<double>( getMlvWbBgain( mlvObject ) ) / 1024.0
+        };
+        int fittedTemperature = 6000;
+        int fittedTint = 0;
+        if( processingWhiteBalanceControlsForAsShotNeutral( neutral, &fittedTemperature, &fittedTint ) )
+        {
+            *temperature = fittedTemperature;
+            *tint = fittedTint;
+        }
+        break;
     }
-    return false;
+    case 1:  *temperature = 5200; break; // Sunny
+    case 8:  *temperature = 7000; break; // Shade
+    case 2:  *temperature = 6000; break; // Cloudy
+    case 3:  *temperature = 3200; break; // Tungsten
+    case 4:  *temperature = 4000; break; // Fluorescent
+    case 5:  *temperature = 6000; break; // Flash
+    case 9:  *temperature = static_cast<int>( getMlvWbKelvin( mlvObject ) ); break; // Kelvin
+    case 0:  // Auto: the app default
+    default: *temperature = 6000; break;
+    }
+    return true;
 }
 
 bool ReceiptApplier::processedThumbnailAtExposure(mlvObject_t *mlvObject,
@@ -654,15 +668,27 @@ bool ReceiptApplier::applyHeadlessLookAssist(ReceiptSettings *receipt,
         const bool hasAsShot = asShotWhiteBalanceControls( mlvObject, &asShotTemperature, &asShotTint );
         lookAssistSetAsShotWhiteBalance( &stats, hasAsShot, asShotTemperature, asShotTint );
     }
-    const LookAssistScene scene = classifyLookAssistScene( stats );
-    // Same scene-independent rule as the GUI: colour comes from the rendered picture whenever
-    // the RAW thumbnail is a flat floor.
-    const bool processedColorWanted = lookAssistShouldAnalyzeProcessedColor( scene, stats );
-    const int colorDownscaleFactor = processedColorWanted
+    // Colour comes from the rendered picture whenever the RAW thumbnail is a flat floor. The same
+    // rendered picture also decides whether the recorded exposure may call the scene daylight.
+    const int colorDownscaleFactor = lookAssistIsFlatFloorRawThumbnail( stats )
                                    ? qMax( 3, downscaleFactor / 3 )
                                    : downscaleFactor;
     const int colorWidth = raw_w / colorDownscaleFactor;
     const int colorHeight = raw_h / colorDownscaleFactor;
+    QByteArray processedThumbnail;
+    auto renderProcessed = [&]( double exposureStops, LookAssistStats *out ) -> bool
+    {
+        if( colorWidth <= 0 || colorHeight <= 0 ) return false;
+        processedThumbnail.resize( colorWidth * colorHeight * 3 );
+        unsigned char *processedOut = reinterpret_cast<unsigned char *>( processedThumbnail.data() );
+        if( !processedThumbnailAtExposure( mlvObject, frameIndex, colorDownscaleFactor, 1, exposureStops, processedOut ) )
+            return false;
+        *out = analyzeLookAssistThumbnail( reinterpret_cast<const unsigned char *>( processedThumbnail.constData() ),
+                                           colorWidth, colorHeight );
+        return true;
+    };
+    const LookAssistScene scene = resolveLookAssistScene( &stats, renderProcessed );
+    const bool processedColorWanted = lookAssistShouldAnalyzeProcessedColor( scene, stats );
     const bool canAnalyzeProcessedColor =
         processedColorWanted && colorWidth > 0 && colorHeight > 0;
     bool chromaSmoothAutoApplied = false;
@@ -680,7 +706,6 @@ bool ReceiptApplier::applyHeadlessLookAssist(ReceiptSettings *receipt,
 
     LookAssistStats processedColorStats;
     bool useProcessedColorStats = false;
-    QByteArray processedThumbnail;
     if( canAnalyzeProcessedColor )
     {
         processedThumbnail.resize( colorWidth * colorHeight * 3 );
@@ -741,107 +766,33 @@ bool ReceiptApplier::applyHeadlessLookAssist(ReceiptSettings *receipt,
             raw_w,
             raw_h );
 
-    bool autoWhiteBalanceValid = false;
-    QString autoWhiteBalanceSource = QStringLiteral("none");
-    QString autoWhiteBalanceDecision = QStringLiteral("none");
-    double autoWhiteBalanceDamping = 1.0;
-    int autoWhiteBalanceTemperature = baseTemperature;
-    int autoWhiteBalanceTint = baseTint;
-    int autoWhiteBalanceCandidateTemperature = baseTemperature;
-    int autoWhiteBalanceCandidateTint = baseTint;
-    if( autoWbPatch.valid )
-    {
-        autoWhiteBalanceSource = useProcessedColorStats
-                               ? QStringLiteral("processed-neutral-patch")
-                               : QStringLiteral("raw-neutral-patch");
-        autoWhiteBalanceDecision = QStringLiteral("candidate");
-        // [Jun-9 WB RESTORE] live solver (was findMlvWhiteBalanceIsolated); same
-        // signature. Batch CLI is single-threaded so the live solver is safe here.
-        findMlvWhiteBalance(
-            mlvObject,
-            static_cast<uint64_t>( frameIndex ),
-            autoWbPatch.rawX,
-            autoWbPatch.rawY,
-            &autoWhiteBalanceTemperature,
-            &autoWhiteBalanceTint,
-            0 );
-        autoWhiteBalanceTemperature =
-            qBound( 2000, autoWhiteBalanceTemperature, 10000 );
-        autoWhiteBalanceTint =
-            qBound( -100, autoWhiteBalanceTint, 100 );
-        autoWhiteBalanceTint =
-            qBound( -35, autoWhiteBalanceTint, 18 );
-        autoWhiteBalanceCandidateTemperature = autoWhiteBalanceTemperature;
-        autoWhiteBalanceCandidateTint = autoWhiteBalanceTint;
-        if( lookAssistAutoWhiteBalanceSolutionIsStable( autoWbPatch,
-                                                        baseTemperature,
-                                                        baseTint,
-                                                        autoWhiteBalanceTemperature,
-                                                        autoWhiteBalanceTint,
-                                                        lookAssistDaylightSolveIsUndamped(
-                                                            stats, scene, useProcessedColorStats ) ) )
+    // The one white-balance decision, shared with the GUI (sync and async): solve -> stability ->
+    // damping -> as-shot prior -> clamp. Nothing here re-implements any step.
+    LookAssistWhiteBalanceRequest wbRequest;
+    wbRequest.stats = &stats;
+    wbRequest.scene = scene;
+    wbRequest.patch = autoWbPatch;
+    wbRequest.solvedOnProcessedPicture = useProcessedColorStats;
+    wbRequest.baseTemperature = baseTemperature;
+    wbRequest.baseTint = baseTint;
+    // [Jun-9 WB RESTORE] live solver (was findMlvWhiteBalanceIsolated); same signature.
+    // Batch CLI is single-threaded so the live solver is safe here.
+    const LookAssistWhiteBalanceResolution wb = resolveLookAssistWhiteBalance(
+        wbRequest,
+        [&]( int rawX, int rawY, int *solvedTemperature, int *solvedTint )
         {
-            autoWhiteBalanceDamping =
-                lookAssistAutoWhiteBalanceDampingFactor(
-                    autoWbPatch,
-                    baseTemperature,
-                    baseTint,
-                    autoWhiteBalanceTemperature,
-                    autoWhiteBalanceTint,
-                    scene );
-            if( lookAssistDaylightSolveIsUndamped( stats, scene, useProcessedColorStats ) )
-                autoWhiteBalanceDamping = 1.0;
-            if( autoWhiteBalanceDamping < 0.999 )
-            {
-                autoWhiteBalanceTemperature =
-                    qBound( 2000,
-                            baseTemperature
-                            + qRound( (autoWhiteBalanceTemperature - baseTemperature)
-                                      * autoWhiteBalanceDamping ),
-                            10000 );
-                autoWhiteBalanceTint =
-                    qBound( -100,
-                            baseTint
-                            + qRound( (autoWhiteBalanceTint - baseTint)
-                                      * autoWhiteBalanceDamping ),
-                            100 );
-                autoWhiteBalanceDecision = QStringLiteral("accepted-damped");
-            }
-            else
-            {
-                autoWhiteBalanceDecision = QStringLiteral("accepted");
-            }
-            preset.temperatureDelta = autoWhiteBalanceTemperature - baseTemperature;
-            preset.tintDelta = autoWhiteBalanceTint - baseTint;
-            autoWhiteBalanceValid = true;
-        }
-        else
-        {
-            autoWhiteBalanceSource = QStringLiteral("rejected-extreme-color-cast");
-            autoWhiteBalanceDecision = QStringLiteral("rejected-unstable");
-        }
-    }
-    if( !autoWhiteBalanceValid )
-    {
-        // No neutral patch we can trust: the clip's recorded white balance is the prior (daylight only).
-        int priorTemperature = baseTemperature;
-        int priorTint = baseTint;
-        if( lookAssistAsShotPrior( stats, scene, &priorTemperature, &priorTint ) )
-        {
-            autoWhiteBalanceSource = QStringLiteral("as-shot-prior");
-            autoWhiteBalanceDecision = QStringLiteral("prior");
-            preset.temperatureDelta = priorTemperature - baseTemperature;
-            preset.tintDelta = priorTint - baseTint;
-        }
-    }
-
-    int temperature =
-        qBound( 2000, baseTemperature + preset.temperatureDelta, 10000 );
-    int tint =
-        qBound( -100, baseTint + preset.tintDelta, 100 );
-    // Same plausibility window the GUI applies (shared module): a solved white balance that
-    // leaves the daylight locus is not a neutral patch.
-    lookAssistClampWhiteBalance( lookAssistWhiteBalanceBounds( stats, scene ), &temperature, &tint );
+            findMlvWhiteBalance( mlvObject, static_cast<uint64_t>( frameIndex ), rawX, rawY,
+                                 solvedTemperature, solvedTint, 0 );
+        },
+        &preset );
+    const bool autoWhiteBalanceValid = wb.autoValid;
+    const QString autoWhiteBalanceSource = wb.source;
+    const QString autoWhiteBalanceDecision = wb.decision;
+    const double autoWhiteBalanceDamping = wb.damping;
+    const int autoWhiteBalanceCandidateTemperature = wb.candidateTemperature;
+    const int autoWhiteBalanceCandidateTint = wb.candidateTint;
+    const int temperature = wb.temperature;
+    const int tint = wb.tint;
 
     receipt->setExposure( preset.exposure );
     receipt->setContrast( preset.contrast );
@@ -871,8 +822,8 @@ bool ReceiptApplier::applyHeadlessLookAssist(ReceiptSettings *receipt,
         .arg( autoWhiteBalanceSource )
         .arg( autoWhiteBalanceDecision )
         .arg( autoWhiteBalanceDamping, 0, 'f', 3 )
-        .arg( autoWbPatch.valid ? autoWhiteBalanceCandidateTemperature : 0 )
-        .arg( autoWbPatch.valid ? autoWhiteBalanceCandidateTint : 0 )
+        .arg( autoWhiteBalanceCandidateTemperature )
+        .arg( autoWhiteBalanceCandidateTint )
         .arg( chromaSmoothAutoApplied ? QStringLiteral("true") : QStringLiteral("false") )
         .arg( getMlvBlackLevel( mlvObject ) )
         .arg( getMlvWhiteLevel( mlvObject ) )

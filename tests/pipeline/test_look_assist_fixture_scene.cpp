@@ -57,6 +57,26 @@ LookAssistStats rawThumbnailStats( mlvObject_t *video, int frame )
     return stats;
 }
 
+// The processed picture at an absolute exposure, as statistics: the same call the app's and the
+// headless applier's render callback make (ReceiptApplier::processedThumbnailAtExposure).
+bool processedPictureStats( mlvObject_t *video, int frame, double stops, LookAssistStats *out )
+{
+    const int rawW = video->RAWI.xRes;
+    const int rawH = video->RAWI.yRes;
+    int downscale = 6;
+    if( rawW > 4000 || rawH > 2500 ) downscale = 12;
+    else if( rawW > 2800 || rawH > 1900 ) downscale = 10;
+    else if( rawW > 1800 || rawH > 1200 ) downscale = 8;
+    const int colorDownscale = std::max( 3, downscale / 3 );
+    const int w = rawW / colorDownscale;
+    const int h = rawH / colorDownscale;
+    std::vector<unsigned char> thumbnail( static_cast<size_t>( w ) * h * 3 );
+    if( !ReceiptApplier::processedThumbnailAtExposure( video, frame, colorDownscale, 1, stops, thumbnail.data() ) )
+        return false;
+    *out = analyzeLookAssistThumbnail( thumbnail.data(), w, h );
+    return true;
+}
+
 // CIELAB chroma of the mean colour of a fixed region of the frame: the concrete pool deck, lower
 // left (rows 65-98 %, columns 2-25 %). A physically near-neutral surface, so an ESTIMATE of cast,
 // not a calibrated grey. Same region and maths as the real-app sheet metrics (tools/profiling).
@@ -115,15 +135,35 @@ TEST(LookAssistFixtureScene, EveryTrackedFixtureClipReadsAsDaylightNotNight)
             // Regression guard: the display statistics alone ARE night-like (flat dark floor) ...
             ASSERT_TRUE( stats.median < 60.0 );
             ASSERT_TRUE( stats.dynamicRange <= 24.0 );
-            // ... but the recorded exposure is full daylight, and that decides.
             ASSERT_TRUE( stats.hasSceneEv100 );
             ASSERT_TRUE( stats.sceneEv100 > 15.0 && stats.sceneEv100 < 17.0 );
-            const LookAssistScene scene = classifyLookAssistScene( stats );
+            // ... and the recorded exposure ALONE does not call it daylight (a night moon records the
+            // same kind of EV): the legacy verdict stands until the rendered picture agrees.
+            ASSERT_TRUE( classifyLookAssistScene( stats ) == LookAssistScene::Night );
+            ASSERT_TRUE( lookAssistDaylightNeedsPictureEvidence( stats, LookAssistScene::Night ) );
+
+            // The rendered picture at the camera's exposure is a lit picture (measured: median 78-85,
+            // 88-99 % in the mid-tones; the check needs >= 60 % and median 60..190): real margin.
+            LookAssistStats picture;
+            ASSERT_TRUE( processedPictureStats( fixture.video(), frame, 0.0, &picture ) );
+            ASSERT_TRUE( picture.midtoneFraction >= 0.85 );
+            ASSERT_TRUE( picture.median >= 70.0 && picture.median <= 100.0 );
+            ASSERT_TRUE( lookAssistPictureCorroboratesDaylight( picture ) );
+
+            LookAssistStats resolved = stats;
+            const LookAssistScene scene = resolveLookAssistScene(
+                &resolved, [&]( double stops, LookAssistStats *out ) {
+                    return processedPictureStats( fixture.video(), frame, stops, out ); } );
             ASSERT_TRUE( scene != LookAssistScene::Night );
             ASSERT_TRUE( scene != LookAssistScene::ArtificialLights );
             ASSERT_TRUE( scene == LookAssistScene::Shade );
+            ASSERT_TRUE( resolved.daylightPictureEvidence );
+            const LookAssistScene sceneAgain = resolveLookAssistScene(
+                &resolved, [&]( double stops, LookAssistStats *out ) {
+                    return processedPictureStats( fixture.video(), frame, stops, out ); } );
+            ASSERT_TRUE( sceneAgain == scene );   // idempotent: re-resolving a resolved stats object
             // A flat RAW thumbnail is unusable for colour in ANY scene: the rendered picture is read.
-            ASSERT_TRUE( lookAssistShouldAnalyzeProcessedColor( scene, stats ) );
+            ASSERT_TRUE( lookAssistShouldAnalyzeProcessedColor( scene, resolved ) );
         }
     }
 }
@@ -199,4 +239,115 @@ TEST(LookAssistFixtureScene, HeadlessLookAssistSolvesDaylightWhiteBalanceFromThe
             ASSERT_TRUE( applied_cast <= 6.0 );
         }
     }
+}
+
+TEST(LookAssistFixtureScene, HeadlessKeepsTheLegacyVerdictWhenTheExposureCannotSayDaylight)
+{
+    // The same flat-floor fixture, but the recorded exposure is an ND-filtered daylight shot
+    // (ISO 100, 1/50 s, f/2.8 = EV100 8.6) or absent: nothing can call it daylight, so the verdict is
+    // the one master produced -- night, with the night rescue -- and the daylight machinery stays out.
+    struct Exposure { const char *name; int iso; int shutterUs; int apertureX100; };
+    const Exposure exposures[] = { { "nd-filter", 100, 20000, 280 }, { "no-metadata", 0, 0, 0 } };
+    for( const Exposure &e : exposures )
+    {
+        MlvPipelineFixture fixture;
+        QString error_message;
+        ASSERT_TRUE( fixture.openClipFile( repo_file_path( QStringLiteral("tests/fixtures/clips/tiny_dual_iso.mlv") ), &error_message ) );
+        ASSERT_TRUE( fixture.applyReceipt( &error_message ) );
+        fixture.video()->EXPO.isoValue = e.iso;
+        fixture.video()->EXPO.shutterValue = e.shutterUs;
+        fixture.video()->LENS.aperture = e.apertureX100;
+
+        ReceiptSettings &receipt = fixture.receipt();
+        receipt.setLookAssistEnabled( true );
+        receipt.setLookAssistBaselineValid( false );
+        receipt.setExposure( 0 );
+        receipt.setTemperature( -1 );
+        receipt.setTint( 0 );
+
+        QTemporaryDir temporary_dir;
+        const QString log_path = temporary_dir.filePath( QStringLiteral("look_assist.log") );
+        BatchLogger::init( log_path );
+        const bool applied = ReceiptApplier::applyHeadlessLookAssist(
+            &receipt, fixture.video(), fixture.processing(), 0 );
+        BatchLogger::shutdown();
+        ASSERT_TRUE( applied );
+        QFile log_file( log_path );
+        ASSERT_TRUE( log_file.open( QIODevice::ReadOnly | QIODevice::Text ) );
+        const QByteArray log = log_file.readAll();
+        ASSERT_TRUE( log.contains( "scene=night" ) );
+        ASSERT_FALSE( log.contains( "autoWbSource=as-shot-prior" ) );
+        // The night rescue is on (the daylight window is not): a daylight-bound solve would stay >= 4800 K.
+        ASSERT_TRUE( log.contains( "autoWbDamping=" ) );
+        (void)e.name;
+    }
+}
+
+TEST(LookAssistFixtureScene, AsShotWhiteBalanceDecoderHonoursTheWbMode)
+{
+    // WBAL: kelvin is valid only in WB_KELVIN, the wbgain_* neutral only in WB_CUSTOM (mlv.h). The
+    // decoder is the app's own (MainWindow::setWhiteBalanceFromMlv delegates to it). A populated
+    // custom-WB slot under another mode must never leak into the answer.
+    MlvPipelineFixture fixture;
+    QString error_message;
+    ASSERT_TRUE( fixture.openClipFile( repo_file_path( QStringLiteral("tests/fixtures/clips/tiny_dual_iso.mlv") ), &error_message ) );
+    ASSERT_TRUE( fixture.applyReceipt( &error_message ) );
+    mlvObject_t *video = fixture.video();
+
+    // The clip's own populated custom-WB slot: it fits a real colour temperature (~5270 K / -27 on
+    // this fixture), which is exactly the wrong answer for any mode that is not WB_CUSTOM.
+    video->WBAL.kelvin = 7000;
+    const double neutral[3] = { static_cast<double>( video->WBAL.wbgain_r ) / 1024.0,
+                                static_cast<double>( video->WBAL.wbgain_g ) / 1024.0,
+                                static_cast<double>( video->WBAL.wbgain_b ) / 1024.0 };
+    int fitTemperature = 0, fitTint = 0;
+    ASSERT_TRUE( processingWhiteBalanceControlsForAsShotNeutral( neutral, &fitTemperature, &fitTint ) );
+    ASSERT_TRUE( fitTemperature != 7000 && fitTemperature != 6000 );   // distinguishable from every other answer
+
+    struct Mode { uint32_t mode; int temperature; };
+    const Mode modes[] = {
+        { 0, 6000 },   // WB_AUTO: the app default (never the slot, never kelvin)
+        { 1, 5200 },   // WB_SUNNY
+        { 2, 6000 },   // WB_CLOUDY
+        { 3, 3200 },   // WB_TUNGSTEN
+        { 4, 4000 },   // WB_FLUORESCENT
+        { 5, 6000 },   // WB_FLASH
+        { 8, 7000 },   // WB_SHADE: preset, NOT the populated kelvin field (7000 here by coincidence)
+        { 9, 7000 },   // WB_KELVIN: the kelvin field, NOT the populated custom slot
+        { 77, 6000 },  // unknown mode: default
+    };
+    for( const Mode &m : modes )
+    {
+        video->WBAL.wb_mode = m.mode;
+        video->WBAL.kelvin = ( m.mode == 8 ) ? 4321 : 7000;   // shade must ignore even a different kelvin
+        int temperature = 0, tint = 99;
+        ASSERT_TRUE( ReceiptApplier::asShotWhiteBalanceControls( video, &temperature, &tint ) );
+        ASSERT_EQ( m.temperature, temperature );
+        ASSERT_EQ( 0, tint );
+    }
+    // WB_KELVIN with a different kelvin: follows the field, still ignores the slot.
+    video->WBAL.wb_mode = 9;
+    video->WBAL.kelvin = 4800;
+    int temperature = 0, tint = 99;
+    ASSERT_TRUE( ReceiptApplier::asShotWhiteBalanceControls( video, &temperature, &tint ) );
+    ASSERT_EQ( 4800, temperature );
+    ASSERT_EQ( 0, tint );
+
+    // WB_CUSTOM: the app fits the retained neutral only for DNG sequences; a native MLV keeps the
+    // default (this is what MainWindow::setWhiteBalanceFromMlv always did).
+    video->WBAL.wb_mode = 6;
+    const uint32_t savedClass = video->MLVI.videoClass;
+    video->MLVI.videoClass = savedClass & ~static_cast<uint32_t>( MLV_VIDEO_CLASS_FLAG_DNGSEQ );
+    ASSERT_TRUE( ReceiptApplier::asShotWhiteBalanceControls( video, &temperature, &tint ) );
+    ASSERT_EQ( 6000, temperature );
+    ASSERT_EQ( 0, tint );
+    video->MLVI.videoClass = savedClass | static_cast<uint32_t>( MLV_VIDEO_CLASS_FLAG_DNGSEQ );
+    ASSERT_TRUE( ReceiptApplier::asShotWhiteBalanceControls( video, &temperature, &tint ) );
+    ASSERT_EQ( fitTemperature, temperature );
+    ASSERT_EQ( fitTint, tint );
+    video->MLVI.videoClass = savedClass;
+
+    // Null guards.
+    ASSERT_FALSE( ReceiptApplier::asShotWhiteBalanceControls( nullptr, &temperature, &tint ) );
+    ASSERT_FALSE( ReceiptApplier::asShotWhiteBalanceControls( video, nullptr, &tint ) );
 }

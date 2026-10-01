@@ -64,6 +64,15 @@ LookAssistStats withEv( LookAssistStats s, double iso, double shutterUs, double 
     return s;
 }
 
+// The daylight fixture as the app sees it AFTER the picture check: ISO 100, 1/2150 s, f/5.6 (EV100 16) and
+// a rendered picture that corroborates it (see DaylightNeedsThePictureNotJustTheExposure).
+LookAssistStats daylightFixture()
+{
+    LookAssistStats s = withEv( fixtureRawStats(), 100, 465, 560 );
+    s.daylightPictureEvidence = true;
+    return s;
+}
+
 // Frame of w*h pixels filled by fn(x, y) -> {r,g,b}.
 template<class F>
 LookAssistStats analyzeFrame( int w, int h, F fn )
@@ -77,6 +86,15 @@ LookAssistStats analyzeFrame( int w, int h, F fn )
             p[0] = px[0]; p[1] = px[1]; p[2] = px[2];
         }
     return analyzeLookAssistThumbnail( rgb.data(), w, h );
+}
+
+// The processed picture a render callback would return, built from per-pixel luma (grey).
+template<class F>
+LookAssistStats renderedPicture( int w, int h, F lumaAt )
+{
+    return analyzeFrame( w, h, [&]( int x, int y ) {
+        const int l = lumaAt( x, y );
+        return std::vector<int>{ l, l, l }; } );
 }
 
 QString readRepoFile( const QString &relativePath )
@@ -116,16 +134,21 @@ TEST(LookAssistScene, Ev100FromClipMetadata)
 
 TEST(LookAssistScene, DaylightFixtureIsNotNight)
 {
-    const LookAssistStats fixture = withEv( fixtureRawStats(), 100, 465, 560 );
+    const LookAssistStats fixture = daylightFixture();
     ASSERT_TRUE( fixture.hasSceneEv100 );
-    ASSERT_TRUE( lookAssistSceneIsDaylightByMetadata( fixture ) );
+    ASSERT_TRUE( lookAssistExposureIsDaylightBright( fixture ) );
+    ASSERT_TRUE( lookAssistSceneIsDaylight( fixture ) );
     const LookAssistScene scene = classifyLookAssistScene( fixture );
     ASSERT_TRUE( scene != LookAssistScene::Night );
     ASSERT_TRUE( scene != LookAssistScene::ArtificialLights );
-    ASSERT_TRUE( scene == LookAssistScene::Shade );   // dim picture, daylight exposure: day, under-exposed
+    ASSERT_TRUE( scene == LookAssistScene::Shade );   // dim RAW floor, daylight exposure AND picture: day
 
-    // Same display statistics with NO metadata read exactly as before (the legacy behaviour is
-    // kept for clips that carry no exposure block).
+    // The exposure alone is NOT daylight (a night moon records the same EV): without the picture
+    // evidence the same display statistics read exactly as before.
+    const LookAssistStats exposureOnly = withEv( fixtureRawStats(), 100, 465, 560 );
+    ASSERT_TRUE( lookAssistExposureIsDaylightBright( exposureOnly ) );
+    ASSERT_FALSE( lookAssistSceneIsDaylight( exposureOnly ) );
+    ASSERT_TRUE( classifyLookAssistScene( exposureOnly ) == LookAssistScene::Night );
     ASSERT_TRUE( classifyLookAssistScene( fixtureRawStats() ) == LookAssistScene::Night );
 
     // The preset for the daylight class lifts the picture but is not the night rescue.
@@ -134,6 +157,89 @@ TEST(LookAssistScene, DaylightFixtureIsNotNight)
     ASSERT_TRUE( day.exposure > 0 );
     ASSERT_TRUE( day.exposure <= 180 );
     ASSERT_TRUE( day.shadows < night.shadows );
+}
+
+TEST(LookAssistScene, DaylightNeedsThePictureNotJustTheExposure)
+{
+    // Round-2 blocker (sol): a bright-SUBJECT night shot -- the moon, ISO 200, 1/500 s, f/7.1 -- records
+    // EV100 13.6 over a black sky. Its RAW thumbnail is a flat floor, exactly like the daylight fixture's,
+    // so only the RENDERED picture can tell them apart.
+    const LookAssistStats moonRaw = withEv( fixtureRawStats(), 200, 2000, 710 );
+    ASSERT_NEAR( 13.62, moonRaw.sceneEv100, 0.05 );
+    ASSERT_TRUE( lookAssistIsFlatFloorRawThumbnail( moonRaw ) );
+    ASSERT_TRUE( classifyLookAssistScene( moonRaw ) == LookAssistScene::Night );     // legacy verdict
+    ASSERT_TRUE( lookAssistDaylightNeedsPictureEvidence( moonRaw, LookAssistScene::Night ) );
+
+    // Black sky (luma 6..10) with a small bright disc: rendered at the camera's exposure.
+    int moonRenders = 0;
+    double moonStops = -1.0;
+    LookAssistStats moon = moonRaw;
+    const LookAssistScene moonScene = resolveLookAssistScene( &moon, [&]( double stops, LookAssistStats *out ) {
+        ++moonRenders;
+        moonStops = stops;
+        *out = renderedPicture( 64, 64, []( int x, int y ) {
+            return ( ( x - 32 ) * ( x - 32 ) + ( y - 20 ) * ( y - 20 ) < 30 ) ? 238 : 6 + ( x + y ) % 5; } );
+        return true; } );
+    ASSERT_EQ( 1, moonRenders );
+    ASSERT_NEAR( 0.0, moonStops, 1e-9 );   // judged at the CAMERA's exposure, not at a Look Assist lift
+    ASSERT_TRUE( moonScene == LookAssistScene::Night );
+    ASSERT_FALSE( moon.daylightPictureEvidence );
+    ASSERT_FALSE( lookAssistIsDaylightScene( moon, moonScene ) );
+    // ... so the NIGHT rescue stays on, and no daylight window / prior / undamped solve applies.
+    ASSERT_TRUE( lookAssistIsFloorLiftedNightThumbnail( moonScene, moon ) );
+    ASSERT_TRUE( lookAssistShouldAnalyzeProcessedColor( moonScene, moon ) );
+    ASSERT_EQ( 2000, lookAssistWhiteBalanceBounds( moon, moonScene ).minTemperature );
+    int t = 0, tint = 0;
+    lookAssistSetAsShotWhiteBalance( &moon, true, 5500, 0 );
+    ASSERT_FALSE( lookAssistAsShotPrior( moon, moonScene, &t, &tint ) );
+    ASSERT_FALSE( lookAssistDaylightSolveIsUndamped( moon, moonScene, true ) );
+    ASSERT_EQ( presetForLookAssistScene( LookAssistScene::Night, moonRaw ).exposure,
+               presetForLookAssistScene( moonScene, moon ).exposure );
+
+    // A night noise floor lifted by the pipeline (everything luma ~50, narrow) is not daylight either.
+    LookAssistStats noise = moonRaw;
+    ASSERT_TRUE( resolveLookAssistScene( &noise, []( double, LookAssistStats *out ) {
+        *out = renderedPicture( 64, 64, []( int x, int y ) { return 44 + ( x * 3 + y ) % 9; } );
+        return true; } ) == LookAssistScene::Night );
+
+    // The tracked fixture's picture at the camera's exposure: median 78-85, 88-99 % mid-tones.
+    LookAssistStats fixture = withEv( fixtureRawStats(), 100, 465, 560 );
+    int fixtureRenders = 0;
+    const LookAssistScene fixtureScene = resolveLookAssistScene( &fixture, [&]( double, LookAssistStats *out ) {
+        ++fixtureRenders;
+        *out = renderedPicture( 64, 64, []( int x, int y ) { return 78 + ( x + 2 * y ) % 24; } );
+        return true; } );
+    ASSERT_EQ( 1, fixtureRenders );
+    ASSERT_TRUE( fixtureScene == LookAssistScene::Shade );
+    ASSERT_TRUE( fixture.daylightPictureEvidence );
+    ASSERT_TRUE( lookAssistIsDaylightScene( fixture, fixtureScene ) );
+
+    // ND-filter daylight (ISO 100, 1/50 s, f/2.8 = EV100 8.6): the exposure cannot say daylight, so the
+    // picture is never even consulted and the verdict is the legacy one (no regression vs master).
+    LookAssistStats nd = withEv( fixtureRawStats(), 100, 20000, 280 );
+    ASSERT_FALSE( lookAssistExposureIsDaylightBright( nd ) );
+    int ndRenders = 0;
+    ASSERT_TRUE( resolveLookAssistScene( &nd, [&]( double, LookAssistStats *out ) {
+        ++ndRenders; *out = renderedPicture( 8, 8, []( int, int ) { return 100; } ); return true; } ) == LookAssistScene::Night );
+    ASSERT_EQ( 0, ndRenders );
+
+    // No exposure block, or a render that fails, or no render callback: legacy verdict, nothing guessed.
+    LookAssistStats noMeta = fixtureRawStats();
+    ASSERT_TRUE( resolveLookAssistScene( &noMeta, []( double, LookAssistStats * ) { return true; } ) == LookAssistScene::Night );
+    LookAssistStats failing = withEv( fixtureRawStats(), 100, 465, 560 );
+    ASSERT_TRUE( resolveLookAssistScene( &failing, []( double, LookAssistStats * ) { return false; } ) == LookAssistScene::Night );
+    LookAssistStats noCallback = withEv( fixtureRawStats(), 100, 465, 560 );
+    ASSERT_TRUE( resolveLookAssistScene( &noCallback, LookAssistRenderFn() ) == LookAssistScene::Night );
+
+    // A usable (non-flat) RAW thumbnail is trusted as it is: no picture is rendered for it.
+    LookAssistStats usableDark = withEv( analyzeFrame( 64, 64, []( int x, int ) {
+        return std::vector<int>{ 20 + x / 2, 20 + x / 2, 20 + x / 2 }; } ), 100, 465, 560 );
+    ASSERT_FALSE( lookAssistIsFlatFloorRawThumbnail( usableDark ) );
+    int usableRenders = 0;
+    ASSERT_TRUE( resolveLookAssistScene( &usableDark, [&]( double, LookAssistStats *out ) {
+        ++usableRenders; *out = renderedPicture( 8, 8, []( int, int ) { return 100; } ); return true; } )
+                 == legacyClassify( usableDark ) );
+    ASSERT_EQ( 0, usableRenders );
 }
 
 TEST(LookAssistScene, SyntheticDayNightTungstenMixed)
@@ -194,7 +300,7 @@ TEST(LookAssistScene, WhiteBalanceStaysNeutralAndInsideTheDaylightWindow)
     // shade is legitimately 7500-10000 K. The window is MEASURED, not guessed: the fixture's neutral
     // deck solves at 9990 K / tint -35 (Lab chroma 4.8 rendered); the earlier 7500 K / tint -10
     // ceiling left it at chroma 17.3 and the 8594 K / -23 damped solve at 11.5 (lavender).
-    const LookAssistStats fixture = withEv( fixtureRawStats(), 100, 465, 560 );
+    const LookAssistStats fixture = daylightFixture();
     const LookAssistWhiteBalanceBounds day = lookAssistWhiteBalanceBounds( fixture, LookAssistScene::Shade );
     ASSERT_EQ( 4800, day.minTemperature );
     ASSERT_EQ( 10000, day.maxTemperature );
@@ -224,7 +330,7 @@ TEST(LookAssistScene, ProcessedColourIsAnalysedForAnyFlatFloorThumbnailNotJustNi
     // The defect: colour was read from the rendered picture only when the scene was NIGHT, so the day
     // the classifier stopped calling the daylight fixture night, no white balance ran on rendered
     // pixels and the base 6000 K stood (deck chroma 11.5 -> 22.4).
-    const LookAssistStats flatDay = withEv( fixtureRawStats(), 100, 465, 560 );
+    const LookAssistStats flatDay = daylightFixture();
     ASSERT_TRUE( lookAssistIsFlatFloorRawThumbnail( flatDay ) );
     const LookAssistScene day = classifyLookAssistScene( flatDay );
     ASSERT_TRUE( day == LookAssistScene::Shade );
@@ -241,11 +347,37 @@ TEST(LookAssistScene, ProcessedColourIsAnalysedForAnyFlatFloorThumbnailNotJustNi
     ASSERT_FALSE( lookAssistShouldAnalyzeProcessedColor( classifyLookAssistScene( usable ), usable ) );
 }
 
+TEST(LookAssistScene, FlatFloorGateIsNotWidenedToArtificialLightsOrBrightSun)
+{
+    // Flat-floor artificial-lights / bright-sun clips WITHOUT daylight evidence behave exactly as on
+    // master: no processed-colour analysis (and so no auto chroma smoothing, no processed-patch white
+    // balance), because the night-only fail-closed guards do not cover them.
+    for( double median : { 26.0, 33.0, 40.0, 66.0 } )
+        for( double p99 : { 40.0, 190.0, 240.0 } )
+            for( double clipHigh : { 0.0, 0.01, 0.02 } )
+            {
+                LookAssistStats s = fixtureRawStats();
+                s.median = median; s.p05 = 24; s.p95 = 40; s.p99 = p99; s.clipHigh = clipHigh;
+                s.dynamicRange = s.p95 - s.p05;
+                for( bool withExposure : { false, true } )
+                {
+                    const LookAssistStats t = withExposure ? withEv( s, 100, 465, 560 ) : s;   // EV only, no evidence
+                    const LookAssistScene scene = classifyLookAssistScene( t );
+                    ASSERT_TRUE( scene == legacyClassify( s ) );
+                    ASSERT_EQ( lookAssistIsFloorLiftedNightThumbnail( scene, t ),
+                               lookAssistShouldAnalyzeProcessedColor( scene, t ) );   // the master rule
+                }
+            }
+    // The one addition: a flat floor in a corroborated daylight scene.
+    const LookAssistStats day = daylightFixture();
+    ASSERT_TRUE( lookAssistShouldAnalyzeProcessedColor( classifyLookAssistScene( day ), day ) );
+}
+
 TEST(LookAssistScene, DaylightFlatFloorGetsNoNightRescueExposure)
 {
     // The night rescue measures the floor-lifted spread (median - p05 + 2). If that leaked into a
     // daylight clip, a 2-count spread would ask for a huge exposure.
-    LookAssistStats tinySpread = withEv( fixtureRawStats(), 100, 465, 560 );
+    LookAssistStats tinySpread = daylightFixture();
     tinySpread.p05 = 36; tinySpread.dynamicRange = tinySpread.p95 - tinySpread.p05;   // spread of 1 count
     const LookAssistScene day = classifyLookAssistScene( tinySpread );
     ASSERT_TRUE( day == LookAssistScene::Shade );
@@ -265,7 +397,7 @@ TEST(LookAssistScene, DaylightFlatFloorGetsNoNightRescueExposure)
 
 TEST(LookAssistScene, DaylightSolveIsUndampedOnlyFromTheRenderedPicture)
 {
-    const LookAssistStats day = withEv( fixtureRawStats(), 100, 465, 560 );
+    const LookAssistStats day = daylightFixture();
     ASSERT_TRUE( lookAssistDaylightSolveIsUndamped( day, LookAssistScene::Shade, true ) );
     ASSERT_FALSE( lookAssistDaylightSolveIsUndamped( day, LookAssistScene::Shade, false ) );   // raw patch: hedge as before
     ASSERT_FALSE( lookAssistDaylightSolveIsUndamped( day, LookAssistScene::Night, true ) );
@@ -295,9 +427,47 @@ TEST(LookAssistScene, DaylightSolveIsNotRejectedByTheThumbnailBrightnessCoinFlip
     ASSERT_FALSE( lookAssistAutoWhiteBalanceSolutionIsStable( LookAssistAutoWhiteBalancePatch(), 6000, 0, 9990, -35, true ) );
 }
 
+TEST(LookAssistScene, BlueSurfaceIsNotSolvedToTheRailUndamped)
+{
+    // A daylight solve skips the two-axis-swing rejection, so the patch itself must be able to be
+    // neutral. A pale-blue sky / water patch (B-R +30, chroma 30 at luma 202) neutralised would drive
+    // the picture to 10000 K / tint -35 undamped.
+    LookAssistAutoWhiteBalancePatch blue;
+    blue.valid = true; blue.luma = 202.0; blue.chroma = 30.0; blue.greenAxis = -2.0; blue.blueAmberAxis = 30.0;
+    ASSERT_FALSE( lookAssistDaylightPatchIsNeutralEnough( blue ) );
+    ASSERT_FALSE( lookAssistAutoWhiteBalanceSolutionIsStable( blue, 6000, 0, 9990, -35, true ) );
+    LookAssistAutoWhiteBalancePatch paleBlue = blue;   // mildly blue: still not neutral
+    paleBlue.chroma = 20.0; paleBlue.blueAmberAxis = 20.0; paleBlue.luma = 200.0;
+    ASSERT_FALSE( lookAssistDaylightPatchIsNeutralEnough( paleBlue ) );
+    // The tracked deck patch (real app: chroma 12-13, luma 200-209, B-R +12..13) is accepted.
+    LookAssistAutoWhiteBalancePatch deck;
+    deck.valid = true; deck.luma = 199.965; deck.chroma = 13.0; deck.greenAxis = -6.5; deck.blueAmberAxis = 13.0;
+    ASSERT_TRUE( lookAssistDaylightPatchIsNeutralEnough( deck ) );
+    ASSERT_TRUE( lookAssistAutoWhiteBalanceSolutionIsStable( deck, 6000, 0, 9990, -35, true ) );
+    deck.luma = 208.891; deck.chroma = 12.0; deck.blueAmberAxis = 12.0;
+    ASSERT_TRUE( lookAssistAutoWhiteBalanceSolutionIsStable( deck, 6000, 0, 9990, -35, true ) );
+
+    // End to end through the ONE resolution: the solver answers 9990 K / -35 for the blue patch; the
+    // result is the as-shot (mode-aware) base inside the daylight window, NOT the rail.
+    LookAssistStats day = daylightFixture();
+    lookAssistSetAsShotWhiteBalance( &day, true, 6000, 0 );
+    LookAssistWhiteBalanceRequest request;
+    request.stats = &day; request.scene = LookAssistScene::Shade; request.patch = blue;
+    request.solvedOnProcessedPicture = true; request.baseTemperature = 6000; request.baseTint = 0;
+    LookAssistPreset preset = presetForLookAssistScene( LookAssistScene::Shade, day );
+    const LookAssistWhiteBalanceResolution r = resolveLookAssistWhiteBalance(
+        request, []( int, int, int *t, int *tint ) { *t = 9990; *tint = -35; }, &preset );
+    ASSERT_FALSE( r.autoValid );
+    ASSERT_TRUE( r.decision == QStringLiteral("rejected-unstable") || r.decision == QStringLiteral("prior") );
+    ASSERT_TRUE( r.source == QStringLiteral("as-shot-prior") );
+    ASSERT_EQ( 6000, r.temperature );
+    ASSERT_EQ( 0, r.tint );
+    ASSERT_EQ( 9990, r.candidateTemperature );   // reported, never applied
+}
+
 TEST(LookAssistScene, AsShotWhiteBalanceIsTheDaylightFallbackPrior)
 {
-    LookAssistStats s = withEv( fixtureRawStats(), 100, 465, 560 );
+    LookAssistStats s = daylightFixture();
     int temperature = 0, tint = 0;
     // No recorded white balance: no prior.
     ASSERT_FALSE( lookAssistAsShotPrior( s, LookAssistScene::Shade, &temperature, &tint ) );
@@ -339,7 +509,16 @@ TEST(LookAssistScene, ClipsWithoutExposureMetadataClassifyExactlyAsBefore)
                 }
     ASSERT_TRUE( checked > 5000 );
 
-    // With daylight metadata the ONLY change is that night / artificial-lights / shade collapse
+    // Daylight EXPOSURE alone changes nothing (no picture evidence): every verdict is the legacy one.
+    for( int median = 0; median <= 255; median += 5 )
+        for( int p95 = 0; p95 <= 255; p95 += 15 )
+        {
+            LookAssistStats s;
+            s.median = median; s.p95 = p95; s.p99 = p95;
+            ASSERT_TRUE( classifyLookAssistScene( withEv( s, 100, 465, 560 ) ) == legacyClassify( s ) );
+        }
+
+    // With the picture's evidence the ONLY change is that night / artificial-lights / shade collapse
     // to shade (sun stays sun): every bright-sun verdict is preserved.
     for( int median = 0; median <= 255; median += 5 )
         for( int p95 = 0; p95 <= 255; p95 += 15 )
@@ -347,7 +526,9 @@ TEST(LookAssistScene, ClipsWithoutExposureMetadataClassifyExactlyAsBefore)
             LookAssistStats s;
             s.median = median; s.p95 = p95; s.p99 = p95;
             const LookAssistScene before = legacyClassify( s );
-            const LookAssistScene after = classifyLookAssistScene( withEv( s, 100, 465, 560 ) );
+            LookAssistStats day = withEv( s, 100, 465, 560 );
+            day.daylightPictureEvidence = true;
+            const LookAssistScene after = classifyLookAssistScene( day );
             if( before == LookAssistScene::BrightSun ) ASSERT_TRUE( after == LookAssistScene::BrightSun );
             else ASSERT_TRUE( after == LookAssistScene::Shade );
         }
@@ -366,14 +547,18 @@ TEST(LookAssistScene, CpuAndCudaShareOneClassifier)
     for( const QString &source : { applier, window } )
     {
         ASSERT_TRUE( source.contains( QStringLiteral("LookAssistAnalysis.h") ) );
-        ASSERT_TRUE( source.contains( QStringLiteral("classifyLookAssistScene(") ) );
         ASSERT_TRUE( source.contains( QStringLiteral("lookAssistSetSceneEv100(") ) );
-        ASSERT_TRUE( source.contains( QStringLiteral("lookAssistWhiteBalanceBounds(") ) );
-        ASSERT_TRUE( source.contains( QStringLiteral("lookAssistClampWhiteBalance(") ) );
         ASSERT_TRUE( source.contains( QStringLiteral("lookAssistShouldAnalyzeProcessedColor(") ) );
-        ASSERT_TRUE( source.contains( QStringLiteral("lookAssistDaylightSolveIsUndamped(") ) );
-        ASSERT_TRUE( source.contains( QStringLiteral("lookAssistAsShotPrior(") ) );
+        ASSERT_TRUE( source.contains( QStringLiteral("resolveLookAssistScene(") ) );
+        ASSERT_TRUE( source.contains( QStringLiteral("resolveLookAssistWhiteBalance(") ) );
         ASSERT_TRUE( source.contains( QStringLiteral("presetForLookAssistScene(") ) );
+        // The white-balance decision (solve -> stability -> damping -> prior -> clamp) lives ONCE, in
+        // the shared module. A direct call to any step from a consumer is a second orchestration.
+        ASSERT_FALSE( source.contains( QStringLiteral("lookAssistAutoWhiteBalanceSolutionIsStable(") ) );
+        ASSERT_FALSE( source.contains( QStringLiteral("lookAssistAutoWhiteBalanceDampingFactor(") ) );
+        ASSERT_FALSE( source.contains( QStringLiteral("lookAssistDaylightSolveIsUndamped(") ) );
+        ASSERT_FALSE( source.contains( QStringLiteral("lookAssistAsShotPrior(") ) );
+        ASSERT_FALSE( source.contains( QStringLiteral("classifyLookAssistScene(") ) );
         // A definition (return type at line start, body follows) would be a second implementation.
         const QRegularExpression ownDefinition( QStringLiteral(
             "^(static\\s+)?(LookAssistScene|LookAssistPreset|LookAssistStats|LookAssistWhiteBalanceBounds)\\s+"
@@ -386,7 +571,7 @@ TEST(LookAssistScene, CpuAndCudaShareOneClassifier)
     ASSERT_TRUE( readRepoFile( QStringLiteral("tests/pipeline/pipeline_tests.pro") ).contains( QStringLiteral("LookAssistAnalysis.cpp") ) );
 
     // And, as a pure function, the same statistics give the same decision every time.
-    const LookAssistStats s = withEv( fixtureRawStats(), 100, 465, 560 );
+    const LookAssistStats s = daylightFixture();
     const LookAssistScene a = classifyLookAssistScene( s );
     const LookAssistScene b = classifyLookAssistScene( s );
     ASSERT_TRUE( a == b );
@@ -395,4 +580,99 @@ TEST(LookAssistScene, CpuAndCudaShareOneClassifier)
     ASSERT_EQ( pa.exposure, pb.exposure );
     ASSERT_EQ( pa.temperatureDelta, pb.temperatureDelta );
     ASSERT_EQ( pa.tintDelta, pb.tintDelta );
+}
+
+TEST(LookAssistScene, OneWhiteBalanceDecisionForEveryPath)
+{
+    // GUI sync, GUI async and the headless applier differ only in the solver they hand over and the
+    // control ranges. The ranges are the shared constants (MainWindow.ui is pinned to them) ...
+    const QString ui = readRepoFile( QStringLiteral("platform/qt/MainWindow.ui") );
+    ASSERT_FALSE( ui.isEmpty() );
+    auto sliderRange = [&]( const char *name, int *minimum, int *maximum ) {
+        const int at = ui.indexOf( QStringLiteral("name=\"%1\"").arg( QLatin1String( name ) ) );
+        if( at < 0 ) return false;
+        const QRegularExpression min( QStringLiteral("<property name=\"minimum\">\\s*<number>(-?\\d+)</number>") );
+        const QRegularExpression max( QStringLiteral("<property name=\"maximum\">\\s*<number>(-?\\d+)</number>") );
+        const QRegularExpressionMatch a = min.match( ui, at );
+        const QRegularExpressionMatch b = max.match( ui, at );
+        if( !a.hasMatch() || !b.hasMatch() ) return false;
+        *minimum = a.captured( 1 ).toInt();
+        *maximum = b.captured( 1 ).toInt();
+        return true;
+    };
+    int tMin = 0, tMax = 0, nMin = 0, nMax = 0;
+    ASSERT_TRUE( sliderRange( "horizontalSliderTemperature", &tMin, &tMax ) );
+    ASSERT_TRUE( sliderRange( "horizontalSliderTint", &nMin, &nMax ) );
+    ASSERT_EQ( kLookAssistTemperatureMin, tMin );
+    ASSERT_EQ( kLookAssistTemperatureMax, tMax );
+    ASSERT_EQ( kLookAssistTintMin, nMin );
+    ASSERT_EQ( kLookAssistTintMax, nMax );
+
+    // ... so the same input gives the same final white balance whichever path asks (receipt parity).
+    LookAssistStats day = daylightFixture();
+    lookAssistSetAsShotWhiteBalance( &day, true, 7000, 0 );
+    const LookAssistStats night = fixtureRawStats();
+    struct Case { const LookAssistStats *stats; LookAssistScene scene; bool processed; double luma, chroma, blueAmber; int solvedT, solvedTint; };
+    const Case cases[] = {
+        { &day, LookAssistScene::Shade, true, 205.0, 12.0, 12.0, 9990, -35 },   // the deck
+        { &day, LookAssistScene::Shade, true, 202.0, 30.0, 30.0, 9990, -35 },   // blue surface
+        { &day, LookAssistScene::Shade, true, 90.0, 5.0, 2.0, 6100, 4 },        // neutral mid patch
+        { &day, LookAssistScene::Shade, false, 205.0, 12.0, 12.0, 9990, -35 },  // raw patch: damped
+        { &night, LookAssistScene::Night, true, 120.0, 14.0, 8.0, 8594, -23 },
+        { &night, LookAssistScene::Night, false, 120.0, 4.0, 3.0, 5200, 10 },
+    };
+    for( const Case &c : cases )
+        for( int baseT : { 6000, 7000 } )
+            for( bool havePatch : { true, false } )
+            {
+                LookAssistWhiteBalanceRequest headless;
+                headless.stats = c.stats; headless.scene = c.scene; headless.solvedOnProcessedPicture = c.processed;
+                headless.baseTemperature = baseT; headless.baseTint = 0;
+                headless.patch.valid = havePatch;
+                headless.patch.luma = c.luma; headless.patch.chroma = c.chroma;
+                headless.patch.blueAmberAxis = c.blueAmber; headless.patch.greenAxis = -3.0;
+                LookAssistWhiteBalanceRequest gui = headless;   // sync and async: the slider ranges
+                gui.minTemperature = tMin; gui.maxTemperature = tMax; gui.minTint = nMin; gui.maxTint = nMax;
+                int calls = 0;
+                auto solver = [&]( int, int, int *t, int *tint ) { ++calls; *t = c.solvedT; *tint = c.solvedTint; };
+                LookAssistPreset pa = presetForLookAssistScene( c.scene, *c.stats );
+                LookAssistPreset pb = pa;
+                const LookAssistWhiteBalanceResolution a = resolveLookAssistWhiteBalance( headless, solver, &pa );
+                const LookAssistWhiteBalanceResolution b = resolveLookAssistWhiteBalance( gui, solver, &pb );
+                ASSERT_EQ( havePatch ? 2 : 0, calls );
+                ASSERT_EQ( a.temperature, b.temperature );
+                ASSERT_EQ( a.tint, b.tint );
+                ASSERT_EQ( a.autoValid, b.autoValid );
+                ASSERT_TRUE( a.decision == b.decision );
+                ASSERT_TRUE( a.source == b.source );
+                ASSERT_EQ( pa.temperatureDelta, pb.temperatureDelta );
+                ASSERT_EQ( pa.tintDelta, pb.tintDelta );
+                // The preset describes what was applied.
+                ASSERT_EQ( a.temperature, baseT + pa.temperatureDelta );
+                ASSERT_EQ( a.tint, pa.tintDelta );
+            }
+
+    // The deck itself: accepted undamped from the rendered picture, at the solver's answer.
+    LookAssistWhiteBalanceRequest deck;
+    deck.stats = &day; deck.scene = LookAssistScene::Shade; deck.solvedOnProcessedPicture = true;
+    deck.patch.valid = true; deck.patch.luma = 205.0; deck.patch.chroma = 12.0; deck.patch.blueAmberAxis = 12.0;
+    LookAssistPreset preset = presetForLookAssistScene( LookAssistScene::Shade, day );
+    const LookAssistWhiteBalanceResolution r = resolveLookAssistWhiteBalance(
+        deck, []( int, int, int *t, int *tint ) { *t = 9990; *tint = -35; }, &preset );
+    ASSERT_TRUE( r.autoValid );
+    ASSERT_TRUE( r.decision == QStringLiteral("accepted") );
+    ASSERT_EQ( 9990, r.temperature );
+    ASSERT_EQ( -35, r.tint );
+    ASSERT_NEAR( 1.0, r.damping, 1e-9 );
+}
+
+TEST(LookAssistScene, WhiteBalanceDecoderIsSharedWithTheGui)
+{
+    // One mode-aware WBAL decoder (ReceiptApplier::asShotWhiteBalanceControls); the GUI's
+    // setWhiteBalanceFromMlv delegates to it and carries no WBAL switch of its own.
+    const QString window = readRepoFile( QStringLiteral("platform/qt/MainWindow.cpp") );
+    ASSERT_TRUE( window.contains( QStringLiteral("ReceiptApplier::asShotWhiteBalanceControls(") ) );
+    ASSERT_FALSE( window.contains( QStringLiteral("getMlvWbMode(") ) );
+    ASSERT_FALSE( window.contains( QStringLiteral("getMlvWbKelvin(") ) );
+    ASSERT_FALSE( window.contains( QStringLiteral("getMlvWbRgain(") ) );
 }

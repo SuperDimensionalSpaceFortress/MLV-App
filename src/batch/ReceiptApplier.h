@@ -38,8 +38,10 @@ public:
                                         uint32_t analysisFrame);
 
     /* The clip's recorded (as-shot) white balance as the app's temperature / tint controls
-     * (tint in receipt units): the WBAL neutral gains when present, else its kelvin. Used by
-     * Look Assist (GUI and headless) as the fallback when no neutral patch can be trusted. */
+     * (tint in receipt units), decoded by WBAL.wb_mode: kelvin only in WB_KELVIN, the wbgain_* neutral
+     * only in WB_CUSTOM (DNG sequences), presets mapped to their kelvin, default 6000 K. The ONE
+     * decoder: MainWindow::setWhiteBalanceFromMlv calls it, and Look Assist (GUI and headless) uses it
+     * as the fallback prior when no neutral patch can be trusted. */
     static bool asShotWhiteBalanceControls(mlvObject_t *mlvObject,
                                            int *temperature,
                                            int *tint);
