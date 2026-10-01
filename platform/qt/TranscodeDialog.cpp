@@ -13,6 +13,7 @@
 #include <QDebug>
 #include <QProcess>
 #include <QSettings>
+#include "AutomationSettings.h"
 
 //Constructor
 TranscodeDialog::TranscodeDialog(QWidget *parent) :
@@ -26,7 +27,7 @@ TranscodeDialog::TranscodeDialog(QWidget *parent) :
     ui->treeWidget->hideColumn( 1 );
     ui->treeWidget->setColumnWidth( 0, 200 );
 
-    QSettings set( QSettings::UserScope, "magiclantern.MLVApp", "MLVApp" );
+    auto setStore = automation_settings::openAppSettings(); QSettings &set = *setStore;
     m_lastSourcePath = set.value( "lastTranscodeSourcePath", QDir::homePath() ).toString();
     m_lastTargetPath = set.value( "lastTranscodeTargetPath", QDir::homePath() ).toString();
 
@@ -55,7 +56,7 @@ TranscodeDialog::TranscodeDialog(QWidget *parent) :
 //Destructor
 TranscodeDialog::~TranscodeDialog()
 {
-    QSettings set( QSettings::UserScope, "magiclantern.MLVApp", "MLVApp" );
+    auto setStore = automation_settings::openAppSettings(); QSettings &set = *setStore;
     set.setValue( "lastTranscodeSourcePath", m_lastSourcePath );
     set.setValue( "lastTranscodeTargetPath", m_lastTargetPath );
     delete ui;

@@ -3,6 +3,7 @@ import os
 import base64
 import hashlib
 import shutil
+import struct
 import subprocess
 import sys
 from pathlib import Path
@@ -268,6 +269,12 @@ def test_gui_smoke_legacy_option_set_omits_new_cli_flags(tmp_path: Path) -> None
         '<?xml version="1.0"?><receipt version="4"><lookAssistEnabled>0</lookAssistEnabled></receipt>',
         encoding="ascii",
     )
+    # PLAYBACK-CLIP-LENGTH-ENFORCE-1: the runner refuses a clip it cannot prove is >= 20 s from the MLVI
+    # header, so this flag-contract dry run needs a real (header-only, ~30 s) clip, not a stand-in file.
+    clip = tmp_path / ("legacy-options." + "mlv")
+    clip.write_bytes(
+        struct.pack("<4sI8sQHHIHHIIII", b"MLVI", 52, b"v2.0".ljust(8, bytes(1)), 1, 0, 1, 0, 1, 0, 720, 0, 23976, 1000)
+    )
     completed = subprocess.run(
         [
             pwsh,
@@ -283,7 +290,7 @@ def test_gui_smoke_legacy_option_set_omits_new_cli_flags(tmp_path: Path) -> None
             "-ExePath",
             str(GUI_SMOKE_RUNNER),
             "-ClipPath",
-            str(GUI_SMOKE_RUNNER),
+            str(clip),
             "-Output",
             str(tmp_path / "result.json"),
             "-Receipt",

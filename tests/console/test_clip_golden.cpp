@@ -1606,7 +1606,7 @@ TEST(ClipGolden, TinyDualIsoHeadlessPlaybackProfileRestoresLookAssistBaselineAtR
     ASSERT_TRUE(projected_p99 <= 152.0);
 }
 
-TEST(ClipGolden, TinyDualIsoHeadlessPlaybackProfilePlayActionAdvancesFrame)
+TEST(ClipGolden, TinyDualIsoHeadlessPlaybackProfilePlayActionIsRefusedBeforePlayOnAShortClip)
 {
     const QString fixture_path = clip_fixture_path();
     if (!QFileInfo::exists(fixture_path)) {
@@ -1648,29 +1648,15 @@ TEST(ClipGolden, TinyDualIsoHeadlessPlaybackProfilePlayActionAdvancesFrame)
     process.start();
     ASSERT_TRUE(process.waitForStarted());
     ASSERT_TRUE(process.waitForFinished(-1));
-    ASSERT_EQ(0, process.exitCode());
-
-    QFile json_file(output_json);
-    ASSERT_TRUE(json_file.open(QIODevice::ReadOnly | QIODevice::Text));
-    const QJsonDocument document = QJsonDocument::fromJson(json_file.readAll());
-    ASSERT_TRUE(document.isObject());
-
-    const QJsonObject metadata = document.object().value(QStringLiteral("metadata")).toObject();
-    ASSERT_TRUE(metadata.value(QStringLiteral("play_action_smoke_requested")).toBool());
-    ASSERT_TRUE(metadata.value(QStringLiteral("play_action_smoke_started")).toBool());
-    ASSERT_TRUE(metadata.value(QStringLiteral("play_action_smoke_frame_advanced")).toBool());
-    ASSERT_TRUE(!metadata.value(QStringLiteral("play_action_smoke_timed_out")).toBool());
-    ASSERT_TRUE(metadata.value(QStringLiteral("play_action_smoke_frame_ready_count")).toInt() > 0);
-    ASSERT_TRUE(metadata.value(QStringLiteral("play_action_smoke_final_frame")).toInt()
-                > metadata.value(QStringLiteral("play_action_smoke_initial_frame")).toInt());
-    ASSERT_TRUE(metadata.value(QStringLiteral("play_action_smoke_failure")).toString().isEmpty());
-    ASSERT_TRUE(metadata.value(QStringLiteral("diagnostic_log_file")).toString().size() > 0);
-
-    const QJsonArray frames = document.object().value(QStringLiteral("frames")).toArray();
-    ASSERT_EQ(1, frames.size());
+    // PLAYBACK-CLIP-LENGTH-ENFORCE-2 (owner rule 2026-09-30): the app itself refuses to Play a window under
+    // 20 s -- exit code 14, typed CLIP_TOO_SHORT, BEFORE Play: no profile JSON is written and no frame was
+    // ever presented. (This test used to assert that the 2-frame fixture PLAYS and advances a frame.)
+    ASSERT_EQ(14, process.exitCode());
+    ASSERT_TRUE(QString::fromLocal8Bit(process.readAllStandardError()).contains(QStringLiteral("CLIP_TOO_SHORT")));
+    ASSERT_FALSE(QFileInfo::exists(output_json));
 }
 
-TEST(ClipGolden, TinyDualIsoHeadlessPlaybackProfilePlayActionRepairsCollapsedCutOut)
+TEST(ClipGolden, TinyDualIsoHeadlessPlaybackProfilePlayActionOnACollapsedCutOutIsStillRefusedBeforePlay)
 {
     const QString fixture_path = clip_fixture_path();
     if (!QFileInfo::exists(fixture_path)) {
@@ -1710,26 +1696,12 @@ TEST(ClipGolden, TinyDualIsoHeadlessPlaybackProfilePlayActionRepairsCollapsedCut
     process.start();
     ASSERT_TRUE(process.waitForStarted());
     ASSERT_TRUE(process.waitForFinished(-1));
-    ASSERT_EQ(0, process.exitCode());
-
-    QFile json_file(output_json);
-    ASSERT_TRUE(json_file.open(QIODevice::ReadOnly | QIODevice::Text));
-    const QJsonDocument document = QJsonDocument::fromJson(json_file.readAll());
-    ASSERT_TRUE(document.isObject());
-
-    const QJsonObject metadata = document.object().value(QStringLiteral("metadata")).toObject();
-    ASSERT_TRUE(metadata.value(QStringLiteral("play_action_smoke_requested")).toBool());
-    ASSERT_TRUE(metadata.value(QStringLiteral("play_action_smoke_started")).toBool());
-    ASSERT_TRUE(metadata.value(QStringLiteral("play_action_smoke_frame_advanced")).toBool());
-    ASSERT_TRUE(metadata.value(QStringLiteral("play_action_smoke_failure")).toString().isEmpty());
-    ASSERT_EQ(1, metadata.value(QStringLiteral("play_action_smoke_cut_in_after")).toInt());
-    ASSERT_EQ(metadata.value(QStringLiteral("total_frames")).toInt(),
-              metadata.value(QStringLiteral("play_action_smoke_cut_out_after")).toInt());
-    ASSERT_TRUE(metadata.value(QStringLiteral("play_action_smoke_final_frame")).toInt()
-                > metadata.value(QStringLiteral("play_action_smoke_initial_frame")).toInt());
-
-    const QJsonArray frames = document.object().value(QStringLiteral("frames")).toArray();
-    ASSERT_EQ(1, frames.size());
+    // PLAYBACK-CLIP-LENGTH-ENFORCE-2 (owner rule 2026-09-30): the app itself refuses to Play a window under
+    // 20 s -- exit code 14, typed CLIP_TOO_SHORT, BEFORE Play: no profile JSON is written and no frame was
+    // ever presented. (This test used to assert that the 2-frame fixture PLAYS and advances a frame.)
+    ASSERT_EQ(14, process.exitCode());
+    ASSERT_TRUE(QString::fromLocal8Bit(process.readAllStandardError()).contains(QStringLiteral("CLIP_TOO_SHORT")));
+    ASSERT_FALSE(QFileInfo::exists(output_json));
 }
 
 TEST(ClipGolden, TinyDualIsoHeadlessPlaybackProfileCpuBackendProducesJson)

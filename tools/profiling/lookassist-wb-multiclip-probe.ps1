@@ -42,8 +42,9 @@ elseif (Test-Path $ClipDir) {
         Sort-Object Length | Select-Object -First $MaxClips -Expand FullName
 }
 if ($IncludeFixture) {
-    $fx = Join-Path $repoRoot "tests\fixtures\clips\large_dual_iso.mlv"
-    if (Test-Path $fx) { $clipList = @($fx) + $clipList }
+    # PLAYBACK-CLIP-LENGTH-ENFORCE-1 (owner rule 2026-09-30): the tracked fixture is 16 frames (0.67 s) and
+    # is never PLAYED; run-release-gui-smoke.ps1 would refuse it (CLIP_TOO_SHORT) and looping it is forbidden.
+    throw "-IncludeFixture is refused: the tracked fixture is far under 20 s (CLIP_TOO_SHORT); pass real >= 20 s footage via -Clips."
 }
 if (-not $clipList -or $clipList.Count -eq 0) { throw "No clips found (-Clips or -ClipDir '$ClipDir')." }
 
@@ -69,10 +70,12 @@ foreach ($clip in $clipList) {
     $cdir = Join-Path $OutDir $name
     New-Item -ItemType Directory -Force -Path $cdir | Out-Null
     Write-Host "[wb-matrix] probing $name ..." -ForegroundColor Cyan
+    $smokeExit = -1
     try {
         & pwsh.exe -NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -File $smoke `
             -RepoRoot $repoRoot -ExePath $exe -Input $clip -ScaleFactor $ScaleFactor -ExpectedScaleRequest $ScaleFactor `
             -CaptureScreenshot -Seconds $Seconds -Output (Join-Path $cdir "$name.json") *> (Join-Path $cdir "run.log")
+        $smokeExit = $LASTEXITCODE
     } catch { }
     $temp='?';$tint='?';$scene='?';$floor='?'
     $log = Get-ChildItem (Join-Path $cdir "logs") -Filter 'mlvapp-*.log' -ErrorAction SilentlyContinue | Sort-Object LastWriteTime | Select-Object -Last 1
@@ -89,9 +92,14 @@ foreach ($clip in $clipList) {
     $win = Get-ChildItem $cdir -Recurse -Filter '*-window.png' -ErrorAction SilentlyContinue | Select-Object -First 1
     $cast = if ($win) { Get-FrameCast $win.FullName } else { $null }
     $tintFlag = if ($tint -ne '?' -and [int]$tint -le -12) {'GREEN'} elseif ($tint -ne '?' -and [int]$tint -ge 12) {'MAGENTA'} else {'neutral-ish'}
+    # ENFORCE-3 r2: the runner is the receipt oracle; a clip whose Play did not pass (exit 43 INVALID or any typed
+    # failure) is reported as RUN_INVALID, never as a normal row of the matrix.
+    if ($smokeExit -ne 0) {
+        $temp = '?'; $tint = '?'; $scene = '?'; $floor = '?'; $tintFlag = "RUN_INVALID(runner exit $smokeExit)"; $cast = $null
+    }
     $rows += [pscustomobject]@{
         Clip=$name; Temp=$temp; Tint=$tint; TintFlag=$tintFlag; Scene=$scene; Floor=$floor
-        FrameGreenAxis=($cast.greenAxis); FrameWarmCool=($cast.warmCool)
+        FrameGreenAxis=($cast.greenAxis); FrameWarmCool=($cast.warmCool); RunnerExit=$smokeExit
     }
 }
 
@@ -101,3 +109,12 @@ $matrix = [pscustomobject]@{ schema='mlvapp.lookassist-wb-multiclip.v1'; capture
 $matrix | ConvertTo-Json -Depth 5 | Set-Content -LiteralPath (Join-Path $OutDir 'wb-matrix.json') -Encoding UTF8
 "matrix -> $(Join-Path $OutDir 'wb-matrix.json')"
 "NOTE: a WB fix must reduce the GREEN clips' tint toward 0 WITHOUT regressing the MAGENTA/neutral clips -- diff this matrix before vs after."
+# PLAYBACK-CLIP-LENGTH-ENFORCE-4: labelling a row RUN_INVALID is not enough -- a matrix with an INVALID row is not a
+# cross-clip measurement, so the SCRIPT fails (exit 43) after the matrix and its labelled rows are written for the reader.
+$invalidRows = @($rows | Where-Object { $_.RunnerExit -ne 0 })
+if ($invalidRows.Count -gt 0) {
+    [Console]::Error.WriteLine("lookassist-wb-multiclip-probe: $($invalidRows.Count) of $($rows.Count) run(s) were not valid playback evidence (runner exit " +
+        (($invalidRows | ForEach-Object { $_.RunnerExit }) -join ', ') + "); the matrix is NOT a measurement. exit 43.")
+    exit 43
+}
+exit 0

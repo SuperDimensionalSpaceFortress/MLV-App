@@ -43,6 +43,7 @@
 
 #ifdef QT_CORE_LIB
 #include <QSettings>
+#include "AutomationSettings.h"
 #include <QString>
 #include <QStringList>
 #endif
@@ -313,9 +314,7 @@ inline const char * playbackPreviewModeName( PlaybackPreviewMode mode )
 #ifdef QT_CORE_LIB
 inline PlaybackQualityMode playbackQualityModeFromSettings()
 {
-    QSettings set( QSettings::UserScope,
-                   PlaybackQualitySettings::kOrganization(),
-                   PlaybackQualitySettings::kApplication() );
+    auto setStore = automation_settings::openAppSettings(); QSettings &set = *setStore;
     const int raw = set.value( PlaybackQualitySettings::kKeyQualityMode(),
                                PlaybackQualitySettings::kDefaultQualityMode() ).toInt();
     if ( raw < 0 || raw > 4 )
@@ -326,9 +325,7 @@ inline PlaybackQualityMode playbackQualityModeFromSettings()
 
 inline PlaybackPreviewMode playbackPreviewModeFromSettings()
 {
-    QSettings set( QSettings::UserScope,
-                   PlaybackQualitySettings::kOrganization(),
-                   PlaybackQualitySettings::kApplication() );
+    auto setStore = automation_settings::openAppSettings(); QSettings &set = *setStore;
     const int raw = set.value( PlaybackQualitySettings::kKeyPreviewMode(),
                                PlaybackQualitySettings::kDefaultPreviewMode() ).toInt();
     return raw == static_cast<int>( PlaybackPreviewMode::AggressivePerformance )
@@ -338,9 +335,7 @@ inline PlaybackPreviewMode playbackPreviewModeFromSettings()
 
 inline int playbackQualityAutoTargetFpsFromSettings()
 {
-    QSettings set( QSettings::UserScope,
-                   PlaybackQualitySettings::kOrganization(),
-                   PlaybackQualitySettings::kApplication() );
+    auto setStore = automation_settings::openAppSettings(); QSettings &set = *setStore;
     const int raw = set.value( PlaybackQualitySettings::kKeyAutoTargetFps(),
                                PlaybackQualitySettings::kDefaultAutoTargetFps() ).toInt();
     if ( raw == 24 || raw == 30 || raw == 60 ) return raw;
@@ -349,18 +344,14 @@ inline int playbackQualityAutoTargetFpsFromSettings()
 
 inline bool playbackQualityShowIndicatorFromSettings()
 {
-    QSettings set( QSettings::UserScope,
-                   PlaybackQualitySettings::kOrganization(),
-                   PlaybackQualitySettings::kApplication() );
+    auto setStore = automation_settings::openAppSettings(); QSettings &set = *setStore;
     return set.value( PlaybackQualitySettings::kKeyShowQualityIndicator(),
                       PlaybackQualitySettings::kDefaultShowQualityIndicator() ).toBool();
 }
 
 inline bool playbackQualityShowExperimentalPhase3ModesFromSettings()
 {
-    QSettings set( QSettings::UserScope,
-                   PlaybackQualitySettings::kOrganization(),
-                   PlaybackQualitySettings::kApplication() );
+    auto setStore = automation_settings::openAppSettings(); QSettings &set = *setStore;
     return playbackQualityPhase3UnattendedEnvOverride()
         || set.value( PlaybackQualitySettings::kKeyShowExperimentalPhase3Modes(),
                       PlaybackQualitySettings::kDefaultShowExperimentalPhase3Modes() ).toBool();
@@ -368,9 +359,7 @@ inline bool playbackQualityShowExperimentalPhase3ModesFromSettings()
 
 inline bool playbackQualityPhase3AcknowledgedFromSettings()
 {
-    QSettings set( QSettings::UserScope,
-                   PlaybackQualitySettings::kOrganization(),
-                   PlaybackQualitySettings::kApplication() );
+    auto setStore = automation_settings::openAppSettings(); QSettings &set = *setStore;
     return playbackQualityPhase3UnattendedEnvOverride()
         || set.value( PlaybackQualitySettings::kKeyPhase3Acknowledged(),
                       PlaybackQualitySettings::kDefaultPhase3Acknowledged() ).toBool();
@@ -378,27 +367,21 @@ inline bool playbackQualityPhase3AcknowledgedFromSettings()
 
 inline void playbackQualityModeWriteToSettings( PlaybackQualityMode mode )
 {
-    QSettings set( QSettings::UserScope,
-                   PlaybackQualitySettings::kOrganization(),
-                   PlaybackQualitySettings::kApplication() );
+    auto setStore = automation_settings::openAppSettings(); QSettings &set = *setStore;
     set.setValue( PlaybackQualitySettings::kKeyQualityMode(),
                   static_cast<int>( mode ) );
 }
 
 inline void playbackPreviewModeWriteToSettings( PlaybackPreviewMode mode )
 {
-    QSettings set( QSettings::UserScope,
-                   PlaybackQualitySettings::kOrganization(),
-                   PlaybackQualitySettings::kApplication() );
+    auto setStore = automation_settings::openAppSettings(); QSettings &set = *setStore;
     set.setValue( PlaybackQualitySettings::kKeyPreviewMode(),
                   static_cast<int>( mode ) );
 }
 
 inline PlaybackPreviewResolution playbackPreviewResolutionFromSettings()
 {
-    QSettings set( QSettings::UserScope,
-                   PlaybackQualitySettings::kOrganization(),
-                   PlaybackQualitySettings::kApplication() );
+    auto setStore = automation_settings::openAppSettings(); QSettings &set = *setStore;
     const int raw = set.value( PlaybackQualitySettings::kKeyPreviewResolution(),
                                PlaybackQualitySettings::kDefaultPreviewResolution() ).toInt();
     if ( raw < 0 || raw > 3 ) return PlaybackPreviewResolution::Auto;
@@ -407,9 +390,7 @@ inline PlaybackPreviewResolution playbackPreviewResolutionFromSettings()
 
 inline void playbackPreviewResolutionWriteToSettings( PlaybackPreviewResolution res )
 {
-    QSettings set( QSettings::UserScope,
-                   PlaybackQualitySettings::kOrganization(),
-                   PlaybackQualitySettings::kApplication() );
+    auto setStore = automation_settings::openAppSettings(); QSettings &set = *setStore;
     set.setValue( PlaybackQualitySettings::kKeyPreviewResolution(),
                   static_cast<int>( res ) );
 }
@@ -435,35 +416,27 @@ inline void playbackQualityAutoTargetFpsWriteToSettings( int targetFps )
     {
         v = PlaybackQualitySettings::kDefaultAutoTargetFps();
     }
-    QSettings set( QSettings::UserScope,
-                   PlaybackQualitySettings::kOrganization(),
-                   PlaybackQualitySettings::kApplication() );
+    auto setStore = automation_settings::openAppSettings(); QSettings &set = *setStore;
     set.setValue( PlaybackQualitySettings::kKeyAutoTargetFps(), v );
 }
 
 inline void playbackQualityShowIndicatorWriteToSettings( bool show )
 {
-    QSettings set( QSettings::UserScope,
-                   PlaybackQualitySettings::kOrganization(),
-                   PlaybackQualitySettings::kApplication() );
+    auto setStore = automation_settings::openAppSettings(); QSettings &set = *setStore;
     set.setValue( PlaybackQualitySettings::kKeyShowQualityIndicator(),
                   show ? 1 : 0 );
 }
 
 inline void playbackQualityShowExperimentalPhase3ModesWriteToSettings( bool show )
 {
-    QSettings set( QSettings::UserScope,
-                   PlaybackQualitySettings::kOrganization(),
-                   PlaybackQualitySettings::kApplication() );
+    auto setStore = automation_settings::openAppSettings(); QSettings &set = *setStore;
     set.setValue( PlaybackQualitySettings::kKeyShowExperimentalPhase3Modes(),
                   show ? 1 : 0 );
 }
 
 inline void playbackQualityPhase3AcknowledgedWriteToSettings( bool acknowledged )
 {
-    QSettings set( QSettings::UserScope,
-                   PlaybackQualitySettings::kOrganization(),
-                   PlaybackQualitySettings::kApplication() );
+    auto setStore = automation_settings::openAppSettings(); QSettings &set = *setStore;
     set.setValue( PlaybackQualitySettings::kKeyPhase3Acknowledged(),
                   acknowledged ? 1 : 0 );
 }
@@ -498,9 +471,7 @@ inline const char * playbackQualityAutoFallbackEpochKeyForMode( PlaybackQualityM
 
 inline PlaybackQualityTier playbackQualityTierFromSettings( PlaybackQualityMode mode )
 {
-    QSettings set( QSettings::UserScope,
-                   PlaybackQualitySettings::kOrganization(),
-                   PlaybackQualitySettings::kApplication() );
+    auto setStore = automation_settings::openAppSettings(); QSettings &set = *setStore;
     const int raw = set.value( playbackQualityTierKeyForMode( mode ),
                                static_cast<int>( PlaybackQualityTier::Dev ) ).toInt();
     if ( raw < static_cast<int>( PlaybackQualityTier::Dev )
@@ -513,43 +484,33 @@ inline PlaybackQualityTier playbackQualityTierFromSettings( PlaybackQualityMode 
 
 inline qint64 playbackQualityTierEnteredAtFromSettings( PlaybackQualityMode mode )
 {
-    QSettings set( QSettings::UserScope,
-                   PlaybackQualitySettings::kOrganization(),
-                   PlaybackQualitySettings::kApplication() );
+    auto setStore = automation_settings::openAppSettings(); QSettings &set = *setStore;
     return set.value( playbackQualityTierEnteredAtKeyForMode( mode ), 0 ).toLongLong();
 }
 
 inline QStringList playbackQualityValidatedClipsFromSettings( PlaybackQualityMode mode )
 {
-    QSettings set( QSettings::UserScope,
-                   PlaybackQualitySettings::kOrganization(),
-                   PlaybackQualitySettings::kApplication() );
+    auto setStore = automation_settings::openAppSettings(); QSettings &set = *setStore;
     return set.value( playbackQualityValidatedClipsKeyForMode( mode ) ).toString()
         .split( QLatin1Char(','), Qt::SkipEmptyParts );
 }
 
 inline qint64 playbackQualityAutoFallbackEpochFromSettings( PlaybackQualityMode mode )
 {
-    QSettings set( QSettings::UserScope,
-                   PlaybackQualitySettings::kOrganization(),
-                   PlaybackQualitySettings::kApplication() );
+    auto setStore = automation_settings::openAppSettings(); QSettings &set = *setStore;
     return set.value( playbackQualityAutoFallbackEpochKeyForMode( mode ), 0 ).toLongLong();
 }
 
 inline void playbackQualityAutoFallbackEpochWriteToSettings( PlaybackQualityMode mode,
                                                              qint64 epochMs )
 {
-    QSettings set( QSettings::UserScope,
-                   PlaybackQualitySettings::kOrganization(),
-                   PlaybackQualitySettings::kApplication() );
+    auto setStore = automation_settings::openAppSettings(); QSettings &set = *setStore;
     set.setValue( playbackQualityAutoFallbackEpochKeyForMode( mode ), epochMs );
 }
 
 inline qint64 playbackQualityClipPlaytimeSecondsFromSettings( const QString & fingerprint )
 {
-    QSettings set( QSettings::UserScope,
-                   PlaybackQualitySettings::kOrganization(),
-                   PlaybackQualitySettings::kApplication() );
+    auto setStore = automation_settings::openAppSettings(); QSettings &set = *setStore;
     return set.value( QString::fromLatin1( PlaybackQualitySettings::kKeyClipPlaytimePrefix() )
                       + fingerprint, 0 ).toLongLong();
 }
@@ -558,9 +519,7 @@ inline void playbackQualityTierWriteToSettings( PlaybackQualityMode mode,
                                                 PlaybackQualityTier tier,
                                                 qint64 nowMs )
 {
-    QSettings set( QSettings::UserScope,
-                   PlaybackQualitySettings::kOrganization(),
-                   PlaybackQualitySettings::kApplication() );
+    auto setStore = automation_settings::openAppSettings(); QSettings &set = *setStore;
     set.setValue( playbackQualityTierKeyForMode( mode ), static_cast<int>( tier ) );
     set.setValue( playbackQualityTierEnteredAtKeyForMode( mode ), nowMs );
 }
@@ -568,9 +527,7 @@ inline void playbackQualityTierWriteToSettings( PlaybackQualityMode mode,
 inline void playbackQualityValidatedClipsWriteToSettings( PlaybackQualityMode mode,
                                                           const QStringList & fingerprints )
 {
-    QSettings set( QSettings::UserScope,
-                   PlaybackQualitySettings::kOrganization(),
-                   PlaybackQualitySettings::kApplication() );
+    auto setStore = automation_settings::openAppSettings(); QSettings &set = *setStore;
     set.setValue( playbackQualityValidatedClipsKeyForMode( mode ),
                   fingerprints.join( QLatin1Char(',') ) );
 }
@@ -578,9 +535,7 @@ inline void playbackQualityValidatedClipsWriteToSettings( PlaybackQualityMode mo
 inline void playbackQualityClipPlaytimeSecondsWriteToSettings( const QString & fingerprint,
                                                                qint64 seconds )
 {
-    QSettings set( QSettings::UserScope,
-                   PlaybackQualitySettings::kOrganization(),
-                   PlaybackQualitySettings::kApplication() );
+    auto setStore = automation_settings::openAppSettings(); QSettings &set = *setStore;
     set.setValue( QString::fromLatin1( PlaybackQualitySettings::kKeyClipPlaytimePrefix() )
                   + fingerprint, seconds );
 }

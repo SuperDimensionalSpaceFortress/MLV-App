@@ -793,6 +793,11 @@ function Save-AttrCudaCommittedBlobBytes {
 # UM-DISPLAY-SELECT-AND-LOG-1 round 3: added gui-smoke-display-identity.ps1 -- the ONE parser for
 # the app's gui_smoke.display_screen/display_target/window_placement lines, dot-sourced by the
 # runner and embedded verbatim into the attribution job (see that file's header).
+#
+# PLAYBACK-LENGTH-ENFORCE-1: added gui-smoke-length-gate.ps1 -- the runner dot-sources it (the gate that
+# refuses footage under 20 s or shorter than the play window), so the venue's staged closure must
+# carry it or the runner dies at its first dot-source. (The name deliberately avoids the word this
+# build-route module is forbidden to contain: see NoFootageTokensTests.)
 $script:AttrCudaSmokeRunnerClosureManifest = @(
     'tools/profiling/run-release-gui-smoke.ps1',
     'tools/profiling/gui-smoke-screenshot-provenance.ps1',
@@ -800,7 +805,8 @@ $script:AttrCudaSmokeRunnerClosureManifest = @(
     'tools/profiling/gui-smoke-process-boundary.psm1',
     'tools/profiling/gui-smoke-color-artifact-scan.ps1',
     'tools/profiling/gui-smoke-gpu-texture-route-validation.ps1',
-    'tools/profiling/gui-smoke-display-identity.ps1'
+    'tools/profiling/gui-smoke-display-identity.ps1',
+    'tools/profiling/gui-smoke-length-gate.ps1'
 )
 
 function Get-AttrCudaSmokeRunnerClosureManifest {
@@ -5755,6 +5761,91 @@ function ConvertTo-AttrCudaResultLineSafeText {
     $Text.Replace('"', "'")
 }
 
+# ENFORCE-3 RECEIPT ORACLE for the attribution job. "20 s of real footage" is a SOURCE-FRAME
+# quantity: the measured session's playback_smoke.summary line carries source_advanced (the distinct source frames
+# the engine advanced) and required_source_frames (ceil(window x NATIVE fps)). The result is INVALID -- never a
+# measurement -- when the line is absent, either figure is missing, the requirement is unknown, source_advanced is
+# under it, the run was paced by a persisted fps override, the engine paced at anything but the footage's native fps,
+# or the timeline wrapped. The decision is the SAME one gui-smoke-length-gate.ps1's Get-GuiSmokeSourceFramesVerdict
+# makes for the smoke runner (the emitted job cannot dot-source that file); a class test executes both on one table.
+function Get-AttrCudaSourceFramesVerdict {
+    [CmdletBinding()]
+    param([AllowNull()][AllowEmptyString()][string]$SummaryLine, [AllowNull()][AllowEmptyString()][string]$ExpectedRunNonce = '')
+    $fields = @{}
+    if (-not [string]::IsNullOrWhiteSpace($SummaryLine)) {
+        foreach ($match in [regex]::Matches($SummaryLine, '(?<k>[A-Za-z0-9_]+)=(?<v>\S+)')) {
+            $fields[$match.Groups['k'].Value] = $match.Groups['v'].Value
+        }
+    }
+    $failures = @()
+    # ENFORCE-4 r2 (sol BLOCKER): the receipt must be THIS run's. The nonce the app echoed on the summary line must be the one
+    # the smoke runner generated for the run whose log this job read ($runLog.runNonce); a missing, mismatched or unbound nonce
+    # is INVALID (the same rule as Get-GuiSmokeRunNonceFailure in gui-smoke-length-gate.ps1).
+    if ($fields.Count -gt 0) {
+        if ([string]::IsNullOrWhiteSpace($ExpectedRunNonce)) {
+            $failures += "RECEIPT_NOT_THIS_RUN: the job bound no run nonce to the log it read, so no receipt can be shown to be this run's."
+        } elseif (-not $fields.ContainsKey('run_nonce') -or [string]::IsNullOrWhiteSpace([string]$fields['run_nonce'])) {
+            $failures += 'RECEIPT_NOT_THIS_RUN: the summary line carries no run_nonce (a build that predates it); it cannot be shown to be this run''s.'
+        } elseif ([string]$fields['run_nonce'] -cne $ExpectedRunNonce) {
+            $failures += 'RECEIPT_NOT_THIS_RUN: the summary line''s run_nonce is not the nonce the smoke runner generated for this run; an earlier run wrote it.'
+        }
+    }
+    $advanced = $null
+    $required = $null
+    if ($fields.ContainsKey('source_advanced')) { $advanced = [int64]$fields['source_advanced'] }
+    if ($fields.ContainsKey('required_source_frames')) { $required = [int64]$fields['required_source_frames'] }
+    if ($fields.Count -eq 0) {
+        $failures += 'INVALID_SOURCE_FRAMES: the run produced no playback_smoke.summary for the measured session, so no source frames can be proven.'
+    } elseif ($null -eq $advanced -or $null -eq $required) {
+        $failures += 'INVALID_SOURCE_FRAMES: RECEIPT_FIELD_ABSENT: playback_smoke.summary carries no source_advanced / required_source_frames (a build that predates ENFORCE-3); the footage played cannot be proven.'
+    } elseif ($required -le 0) {
+        $failures += "INVALID_SOURCE_FRAMES: required_source_frames=$required; the admitted window is unknown."
+    } elseif ($advanced -lt $required) {
+        $failures += "INVALID_SOURCE_FRAMES: the engine advanced source_advanced=$advanced distinct source frames but the Play had to consume required_source_frames=$required; under 20 s of real footage is never playback evidence."
+    }
+    # ENFORCE-4: the oracle re-derives the 20 s floor itself (see Get-GuiSmokeSourceFramesVerdict): a requirement under
+    # ceil(20 s x native fps) was admitted for less than 20 s of footage, and a native fps of 0 cannot measure 20 s.
+    if ($fields.ContainsKey('native_fps')) {
+        $nativeForFloor = [double]::Parse($fields['native_fps'], [Globalization.CultureInfo]::InvariantCulture)
+        if ($nativeForFloor -le 0) {
+            $failures += "INVALID_SOURCE_FRAMES: native_fps=$nativeForFloor; the native frame rate is unknown, so 20 s of footage cannot be measured."
+        } elseif ($null -ne $required -and $required -gt 0 -and $required -lt [int64][Math]::Ceiling(20.0 * $nativeForFloor - 0.02)) {
+            $failures += "INVALID_SOURCE_FRAMES: required_source_frames=$required is under ceil(20 s x native_fps=$nativeForFloor); the Play was admitted for less than 20 s of footage."
+        }
+    }
+    # ENFORCE-4: evidence is valid only when EVERY field the oracle judges is PRESENT. A summary that does not carry the
+    # pace / override / wrap fields (a build that predates them) is INVALID, not "no override" / "pace unchecked" / "no wrap".
+    $absentFields = @('native_fps', 'pace_fps', 'fps_override', 'wrapped', 'wrap_count' | Where-Object { $fields.Count -gt 0 -and -not $fields.ContainsKey($_) })
+    if ($absentFields.Count -gt 0) {
+        $failures += "INVALID_SOURCE_FRAMES: RECEIPT_FIELD_ABSENT: playback_smoke.summary carries no $($absentFields -join ' / '); the run's pace, override and wrapping cannot be proven."
+    }
+    if ($fields.Count -gt 0 -and $fields.ContainsKey('fps_override') -and [int]$fields['fps_override'] -ne 0) {
+        $failures += 'INVALID_SOURCE_FRAMES: the run was paced by a persisted fps override; evidence is paced at the footage native fps.'
+    }
+    if ($fields.ContainsKey('pace_fps')) {
+        $pace = [double]::Parse($fields['pace_fps'], [Globalization.CultureInfo]::InvariantCulture)
+        if ($pace -le 0) {
+            # ENFORCE-4 r2 (fable H5): a PRESENT pace that is not positive is unknown, never "pace unchecked".
+            $failures += "INVALID_SOURCE_FRAMES: pace_fps=$pace; a present engine pace that is not positive is unknown, so wall clock cannot be tied to the footage played."
+        } elseif ($fields.ContainsKey('native_fps')) {
+            $native = [double]::Parse($fields['native_fps'], [Globalization.CultureInfo]::InvariantCulture)
+            if ($native -gt 0 -and [Math]::Abs($pace - $native) -gt (0.005 * $native)) {
+                $failures += "INVALID_SOURCE_FRAMES: the engine paced at pace_fps=$pace but the footage native fps is $native; 20 s of wall clock is not 20 s of footage."
+            }
+        }
+    }
+    $wrapped = $false
+    if ($fields.ContainsKey('wrapped') -and [int]$fields['wrapped'] -ne 0) { $wrapped = $true }
+    if ($fields.ContainsKey('wrap_count') -and [int64]$fields['wrap_count'] -gt 0) { $wrapped = $true }
+    [pscustomobject]@{
+        invalid = ($failures.Count -gt 0 -or $wrapped)
+        failures = $failures
+        wrapped = $wrapped
+        sourceAdvanced = $advanced
+        requiredSourceFrames = $required
+    }
+}
+
 Export-ModuleMember -Function `
     Get-AttrCudaArtifactNames, `
     New-AttrCudaBuildInfoHeader, `
@@ -5836,4 +5927,5 @@ Export-ModuleMember -Function `
     Resolve-AttrCudaPreferredDisplay, `
     Get-AttrCudaDisplayDegradedState, `
     Get-AttrCudaGuiSmokeDisplaySelection, `
-    Find-AttrCudaFailedSmokeDisplayLog
+    Find-AttrCudaFailedSmokeDisplayLog, `
+    Get-AttrCudaSourceFramesVerdict

@@ -101,7 +101,7 @@ TEST(PlaybackSmokeForegroundWiring, ForegroundRequestRunsBeforeTheMeasuredPlayTr
 
     const int forceAt = smokeBody.indexOf(QStringLiteral("forcePlaybackSmokeWindowForeground();"));
     const int targetFramesAt = smokeBody.indexOf(QStringLiteral("m_playbackSmokeTargetPresentedFrames ="));
-    const int triggerAt = smokeBody.indexOf(QStringLiteral("ui->actionPlay->trigger();"), targetFramesAt);
+    const int triggerAt = smokeBody.indexOf(QStringLiteral("programmaticPlay( \"gui-smoke-measured\""), targetFramesAt);
     ASSERT_TRUE(forceAt >= 0);
     ASSERT_TRUE(targetFramesAt >= 0);
     ASSERT_TRUE(triggerAt > targetFramesAt);

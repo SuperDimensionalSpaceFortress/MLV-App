@@ -28,6 +28,7 @@
 #include <QItemSelectionModel>
 #include <QToolButton>
 #include "SessionModel.h"
+#include "PlaybackFrameRange.h"
 #include "../../src/mlv_include.h"
 #include "InfoDialog.h"
 #include "StatusDialog.h"
@@ -145,8 +146,8 @@ public:
         int startFrame = 0;
         int durationMs = 8000;
         int targetPresentedFrames = 0; // test-only: stop after exactly N fresh presentations; durationMs remains the timeout
-        bool loopPlayback = false;   // --loop: loop the clip so a SHORT clip plays the whole durationMs
-                                     // window (else it plays once, stops, and the wait loop exits early).
+        bool loopPlayback = false;   // never true: --loop is refused in main.cpp (owner rule 2026-09-30)
+        bool launchOnly = false;     // --launch-only: open the clip and return without ever calling Play
         int settleMs = 2500;
         double settleCpuPercent = -1.0;
         int settleCpuStableMs = 1000;
@@ -182,7 +183,9 @@ public:
         bool forceDropFrame = false;
         bool exerciseClipLifecycleStress = false;
         QString stressSwitchInputPath;
-        int stressSwitchAtMs = 1000;
+        // ENFORCE-2 round 2: the switch stops Play on the first clip, so it may not happen before the
+        // 20 s play floor (playback_frame_range::kMinPlayWindowMs); runGuiPlaybackSmoke refuses less.
+        int stressSwitchAtMs = 20000;
         int stressSeekFrame = 8;
         // UM-DISPLAY-SELECT-AND-LOG-1: when true, the smoke session is placed and maximized
         // (deterministic size) on the chosen target display instead of going full screen --
@@ -1093,6 +1096,31 @@ private:
     // that wraps mid-measurement would sample only whatever arbitrary sub-range it happened to
     // land on at the end -- different on every host. See runGuiPlaybackSmoke's span snapshot.
     bool m_playbackSmokeWrapped = false;
+    // PLAYBACK-CLIP-LENGTH-ENFORCE-1 round 2: the engine's own wrap count (process-cumulative, never reset:
+    // a wrap during a warm-up play is a wrap) -- see playback_frame_range::PlaybackWrapRecorder.
+    playback_frame_range::PlaybackWrapRecorder m_playbackWrapRecorder;
+    // PLAYBACK-CLIP-LENGTH-ENFORCE-2: the app-side play gate. One ledger per process: the ONE programmatic
+    // Play admitted (programmaticPlay) and every refusal; m_playStartsInProcess counts every Play start of
+    // any origin so a second start is recorded as a restart (-> INVALID_LOOPED); the message is the last
+    // refusal's path-free text, printed by the caller with its own prefix.
+    playback_frame_range::ProgrammaticPlayLedger m_programmaticPlayLedger;
+    int m_playStartsInProcess = 0;
+    QString m_lastPlayGateRefusalMessage;
+    // PLAYBACK-CLIP-LENGTH-ENFORCE-3 (owner rule 2026-10-01): "20 s of real footage" is a SOURCE-FRAME quantity.
+    // The engine tick (playbackHandling, every backend) feeds m_sourceAdvance; programmaticPlay() records how many
+    // frames the admitted Play must consume (m_playRequiredSourceFrames); every automation stop waits on
+    // programmaticPlayState(). m_automationPacingIsolated makes getFramerate() ignore the venue's persisted
+    // fpsOverride/frameRate for automation runs (smoke, profile, autoplay) -- evidence never reads venue pacing.
+    playback_frame_range::SourceFrameAdvanceCounter m_sourceAdvance;
+    int64_t m_playRequiredSourceFrames = 0;
+    double m_playRequestedSeconds = 0.0;
+    double m_playPaceFps = 0.0;
+    bool m_automationPacingIsolated = false;
+    // ENFORCE-4: the autoplay hook's verdict is a fail-closed LATCH (PlaybackFrameRange.h): armed failing (14) when the hook
+    // is installed, cleared only by consumption (Reached). Closing the app before the poll resolves exits 14, never 0.
+    // r2 (fable H6): the autoplay hook's verdict (0 = consumed the window, 14 = refused / ended early / timed out),
+    // returned by main() as the process exit code even when MLVAPP_AUTOPLAY_EXIT is not set.
+    playback_frame_range::AutomationVerdictLatch m_automationVerdict;
     // Contact-sheet capture-during-playback (CUDA-PLAYBACK-CONTACT-SHEET-1 r1b): an un-timed
     // SECOND playback pass, run after the measured interval closes and playback_smoke telemetry
     // has finished, so every grab below is of a genuinely presented playback frame -- never a
@@ -1679,6 +1707,22 @@ private:
     int toolButtonGCurvesCurrentIndex( void );
     void initCutInOut( int frames );
     bool normalizePlaybackCutRangeForLoadedClip( const char *where );
+    // PLAYBACK-CLIP-LENGTH-ENFORCE-2: THE APP IS THE GATE. Every PROGRAMMATIC Play (autoplay hook, profile
+    // exercise modes, GUI-smoke measured Play) goes through programmaticPlay(); user input handlers
+    // (on_actionPlay_triggered, the Loop menu) are never gated. See PlaybackFrameRange.h.
+    playback_frame_range::PlayableWindowVerdict checkPlayableWindow( const char *site, double requestedSeconds );
+    bool programmaticPlay( const char *site, double requestedSeconds );
+    void programmaticStop( const char *site );
+    void forceLoopOffForAutomation( const char *site );
+    // ENFORCE-3: the one decision every automation Play wait makes (reached / ended early / safety timeout /
+    // keep going) and the "required source frames consumed" predicate the presented-frames stop and the
+    // lifecycle stress share. See playback_frame_range::evaluatePlayStop.
+    playback_frame_range::PlayStopState programmaticPlayState( qint64 elapsedMs, qint64 safetyMs ) const;
+    bool programmaticPlayConsumed() const;
+public:
+    int automationVerdictExitCode() const { return m_automationVerdict.exitCode(); }
+private:
+    void isolateAutomationPacing( const char *site );
     int normalizePlaybackRequestedFrame( int requestedFrame, const char *where );
     void initRawBlackAndWhite( void );
     double getHorizontalStretchFactor( bool downScale );
