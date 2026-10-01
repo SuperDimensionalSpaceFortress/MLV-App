@@ -1141,7 +1141,7 @@ class SealedBuildCliTests(H.TmpCase):
         self.assertEqual(code, 0, stderr)
         shown = json.loads(stdout)
         self.assertTrue(shown["sealed"])
-        self.assertEqual(shown["sealKeyFile"], self.key_file)
+        self.assertNotIn("sealKeyFile", shown)  # not even the path is echoed: nothing about the key is logged
         key_hex = self._key()
         self.assertEqual(len(key_hex), 64)
         self.assertEqual(sorted(os.listdir(out)), ["images", "judge_manifest.json", "sealed.bin", "session.json"])

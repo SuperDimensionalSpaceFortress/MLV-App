@@ -338,12 +338,11 @@ def cmd_build_session(args):
             except OSError:
                 pass
             raise
-        out.update({"sealed": True, "sealSha256": sealed["sealSha256"], "sealedMembers": len(sealed["members"]),
-                    "sealKeyFile": args.seal_key_file})
+        out.update({"sealed": True, "sealSha256": sealed["sealSha256"], "sealedMembers": len(sealed["members"])})
         print(f"[look_cli] SEALED: the answer key and source frames are in {look_seal.SEALED_NAME}, readable only with "
-              f"the key in {args.seal_key_file}. Keep that file OUT of the judge's reach (the judge refuses "
-              f"{look_seal.KEY_ENV} in its environment); give it to `tally` with --seal-key-file (or {look_seal.KEY_ENV}).",
-              file=sys.stderr)
+              "the key in the file you named with --seal-key-file. Keep that file OUT of the judge's reach (the judge "
+              f"refuses {look_seal.KEY_ENV} in its environment); give it to `tally` with --seal-key-file (or "
+              f"{look_seal.KEY_ENV}).", file=sys.stderr)
     print(json.dumps(out))
     lost = look_pairs.drop_policy(dropped)["lossFrameIds"]
     if lost and allowance is None:
@@ -455,11 +454,14 @@ def cmd_tally(args):
     entry["staleRejectedAtJudging"] = results.get("staleRejected", {})
     entry["createdUtc"] = _now()
     _write_json(args.out, entry)
-    print(f"tally {entry['judgeId']}: winner={entry['preference']['winner']} usable={entry['usable']} "
-          f"consistentUnits={entry['preference']['consistentUnits']} flips={entry['preference']['discardedFlips']} "
-          f"control={entry['controlResult']['outcome']} positiveControl={entry['positiveControlResult']['outcome']} "
-          f"slotBias={entry['slotTally']['slotBias']} unusableReasons={entry['unusableReasons']}")
-    return 0 if entry["usable"] else 2
+    # The console line is a view of the entry AS WRITTEN. It is read back from the file on purpose: the in-memory entry
+    # was computed from the unsealed answer key, and nothing derived from that key is ever logged directly.
+    written = _read_json(args.out)
+    print(f"tally {written['judgeId']}: winner={written['preference']['winner']} usable={written['usable']} "
+          f"consistentUnits={written['preference']['consistentUnits']} flips={written['preference']['discardedFlips']} "
+          f"control={written['controlResult']['outcome']} positiveControl={written['positiveControlResult']['outcome']} "
+          f"slotBias={written['slotTally']['slotBias']} unusableReasons={written['unusableReasons']}")
+    return 0 if written["usable"] else 2
 
 
 def cmd_judge_disagreement(args):
