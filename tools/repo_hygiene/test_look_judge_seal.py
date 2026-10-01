@@ -1100,7 +1100,10 @@ class LiveIsolationCanaryTests(unittest.TestCase):
 
 @unittest.skipUnless(_HAS_DEPS, "numpy/Pillow are not installed on this host")
 class SealedBuildCliTests(H.TmpCase):
-    """build-session seals by default, refuses one directory under two names, and prints the key once."""
+    """build-session seals by default, writes the key to the file it is told (never prints it), and refuses one directory
+    under two names."""
+
+    _builds = 0
 
     def _frames(self, name, count=3):
         import numpy as np
@@ -1113,56 +1116,103 @@ class SealedBuildCliTests(H.TmpCase):
             Image.fromarray(arr, "RGB").save(os.path.join(directory, f"{name}-frame-{index:02d}.png"))
         return directory
 
-    def _build(self, extra=(), a=None, b=None, out="sess"):
+    def _build(self, extra=(), a=None, b=None, out="sess", key_file="auto"):
+        """`key_file="auto"` hands build-session a fresh key file outside the session; None passes no flag."""
         a = a or self._frames("aa")
         b = b or self._frames("bb")
         out = os.path.join(self.tmp, out)
+        type(self)._builds += 1
+        if key_file == "auto":
+            key_file = os.path.join(self.tmp, "keys", f"k{type(self)._builds}.txt")
+        self.key_file = key_file
+        flags = ["--seal-key-file", key_file] if key_file is not None else []
         stdout, stderr = io.StringIO(), io.StringIO()
         with contextlib.redirect_stdout(stdout), contextlib.redirect_stderr(stderr):
             code = look_cli.main(["build-session", "--a", f"aa={a}", "--b", f"bb={b}", "--seed", "s", "--out-dir", out,
-                                  *extra])
+                                  *flags, *extra])
         return code, out, stdout.getvalue(), stderr.getvalue()
 
-    def test_the_default_build_is_sealed_and_prints_the_key_once(self):
+    def _key(self):
+        with open(self.key_file, "r", encoding="utf-8") as handle:
+            return handle.read().strip()
+
+    def test_the_default_build_is_sealed_and_the_key_goes_to_the_named_file_and_nowhere_else(self):
         code, out, stdout, stderr = self._build()
         self.assertEqual(code, 0, stderr)
         shown = json.loads(stdout)
         self.assertTrue(shown["sealed"])
-        self.assertEqual(len(shown["sealKey"]), 64)
+        self.assertEqual(shown["sealKeyFile"], self.key_file)
+        key_hex = self._key()
+        self.assertEqual(len(key_hex), 64)
         self.assertEqual(sorted(os.listdir(out)), ["images", "judge_manifest.json", "sealed.bin", "session.json"])
-        key, session, _ = look_seal.open_sealed(out, shown["sealKey"])
+        key, session, _ = look_seal.open_sealed(out, key_hex)
         self.assertEqual(key["subjects"], ["aa", "bb"])
         self.assertEqual(session["capture"]["configSha256"], H.META["configSha256"])
-        members = look_seal.read_members(os.path.join(out, "sealed.bin"), shown["sealKey"])
+        members = look_seal.read_members(os.path.join(out, "sealed.bin"), key_hex)
         self.assertEqual(sorted(n for n in members if n.startswith("source-frames/")),
                          [f"source-frames/{s}-{i:02d}.png" for s in ("aa", "bb") for i in range(3)])
-        for name in os.listdir(out):  # the key is not in the session directory
+        for name in os.listdir(out):  # the key is not in the session directory ...
             path = os.path.join(out, name)
             if os.path.isfile(path):
                 with open(path, "rb") as handle:
-                    self.assertNotIn(shown["sealKey"].encode("ascii"), handle.read())
+                    self.assertNotIn(key_hex.encode("ascii"), handle.read())
+        self.assertNotIn(key_hex, stdout)  # ... and it is never printed (a printed key lands in logs and transcripts)
+        self.assertNotIn(key_hex, stderr)
+        self.assertNotIn("sealKey", shown)
         self.assertIn("SEALED", stderr)
 
-    def test_the_key_goes_to_a_file_outside_the_session_when_asked_and_is_then_not_printed(self):
-        key_file = os.path.join(self.tmp, "keys", "k.txt")
-        code, out, stdout, _ = self._build(["--seal-key-file", key_file])
-        self.assertEqual(code, 0)
-        shown = json.loads(stdout)
-        self.assertNotIn("sealKey", shown)
-        self.assertEqual(shown["sealKeyFile"], key_file)
-        with open(key_file, "r", encoding="utf-8") as handle:
-            look_seal.open_sealed(out, handle.read().strip())
+    def test_a_sealing_build_without_a_key_file_is_refused_before_anything_is_built(self):
+        for blank in (None, "", "  "):
+            with self.subTest(blank=blank):
+                code, out, stdout, stderr = self._build(key_file=blank)
+                self.assertEqual(code, 2)
+                self.assertIn("--seal-key-file", stderr)
+                self.assertIn("never printed", stderr)
+                self.assertFalse(os.path.exists(os.path.join(out, "session.json")))
+                self.assertFalse(os.path.exists(os.path.join(out, "images")))
+
+    def test_an_existing_key_file_is_never_overwritten(self):
+        keep = os.path.join(self.tmp, "keys", "precious.txt")
+        _write_bytes(keep, b"another session's only key\n")
+        code, out, _, stderr = self._build(key_file=keep)
+        self.assertEqual(code, 2)
+        self.assertIn("already exists", stderr)
+        self.assertFalse(os.path.exists(os.path.join(out, "session.json")))  # refused up front, before any build
+        with open(keep, "rb") as handle:
+            self.assertEqual(handle.read(), b"another session's only key\n")
 
     def test_a_key_file_inside_the_session_directory_is_refused(self):
         out = os.path.join(self.tmp, "sess")
         for inside in (os.path.join(out, "key.txt"), os.path.join(out, "images", "key.txt")):
-            code, _, _, stderr = self._build(["--seal-key-file", inside])
+            code, _, _, stderr = self._build(key_file=inside)
             self.assertEqual(code, 2)
             self.assertIn("inside the session directory", stderr)
             self.assertFalse(os.path.exists(os.path.join(out, "session.json")))
+            self.assertFalse(os.path.exists(inside))
+
+    def test_a_failed_seal_leaves_no_key_file_behind(self):
+        with mock.patch.object(look_seal, "seal_session", side_effect=look_seal.SealError("disk full")):
+            code, out, _, stderr = self._build()
+        self.assertEqual(code, 2)
+        self.assertIn("disk full", stderr)
+        self.assertFalse(os.path.exists(self.key_file))  # a key for a session that was never sealed must not linger
+
+    def test_the_key_file_exists_before_the_session_is_sealed(self):
+        seen = {}
+        real = look_seal.seal_session
+
+        def spying(session_dir, key_hex):
+            with open(self.key_file, "r", encoding="utf-8") as handle:
+                seen["key_on_disk_first"] = handle.read().strip() == key_hex
+            return real(session_dir, key_hex)
+
+        with mock.patch.object(look_seal, "seal_session", spying):
+            code, _, _, _ = self._build()
+        self.assertEqual(code, 0)
+        self.assertEqual(seen, {"key_on_disk_first": True})  # a sealed session whose key was lost would be useless
 
     def test_no_seal_leaves_the_secrets_in_the_clear_and_says_so(self):
-        code, out, stdout, stderr = self._build(["--no-seal"])
+        code, out, stdout, stderr = self._build(["--no-seal"], key_file=None)
         self.assertEqual(code, 0)
         self.assertFalse(json.loads(stdout)["sealed"])
         self.assertIn("--no-seal", stderr)
@@ -1186,8 +1236,8 @@ class SealedBuildCliTests(H.TmpCase):
         self.assertEqual(code, 0)
 
     def test_the_unseal_command_audits_a_session_but_not_into_it(self):
-        _, out, stdout, _ = self._build()
-        key = json.loads(stdout)["sealKey"]
+        _, out, _, _ = self._build()
+        key = self._key()
         dest = os.path.join(self.tmp, "audit")
         with contextlib.redirect_stdout(io.StringIO()):
             self.assertEqual(look_cli.main(["unseal", "--session-dir", out, "--out-dir", dest, "--seal-key", key]), 0)

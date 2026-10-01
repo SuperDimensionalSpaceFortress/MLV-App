@@ -10,7 +10,7 @@
     python tools/profiling/look/look_cli.py probe-codex [--live-vision-dir DIR]
     python tools/profiling/look/look_cli.py build-session --a cuda=DIR --b cpu=DIR --seed N --out-dir SESS
                                                          [--letterbox auto-symmetric] [--a-letterbox-bars ..] [--b-letterbox-bars ..]
-                                                         [--seal-key-file K.txt | --no-seal]   (sealed by default; key printed once)
+                                                         --seal-key-file K.txt | --no-seal     (sealed by default; the key goes to K.txt, never printed)
     python tools/profiling/look/look_cli.py judge        --session-dir SESS --runner claude:MODEL --producer-model M
     python tools/profiling/look/look_cli.py tally        --session-dir SESS --results R.json --producer-model M --out T.json
                                                          --seal-key K | --seal-key-file K.txt | env LOOK_SEAL_KEY
@@ -286,9 +286,14 @@ def cmd_build_session(args):
     _refuse_same_directory(dir_a, dir_b, "build-session")  # one directory under two names: every real pair is identical
     key_hex = None
     if not args.no_seal:
+        if not args.seal_key_file or not str(args.seal_key_file).strip():
+            raise ValueError("build-session seals the session and needs --seal-key-file PATH (outside the session "
+                             "directory) to keep the key in; the key is never printed. Or pass --no-seal (debugging only).")
+        _refuse_key_file_in_session(args.seal_key_file, args.out_dir)
+        if os.path.exists(args.seal_key_file):  # checked up front so a long build is not wasted on it
+            raise ValueError(f"--seal-key-file {args.seal_key_file!r} already exists: it may hold another session's "
+                             "only key; name a new file")
         key_hex = look_seal.new_key()
-        if args.seal_key_file:
-            _refuse_key_file_in_session(args.seal_key_file, args.out_dir)
     prep = os.path.join(args.out_dir, "source-frames")
     policy_a = _policy(cfg, args.letterbox, args.a_letterbox_bars)
     policy_b = _policy(cfg, args.letterbox, args.b_letterbox_bars)
@@ -324,16 +329,21 @@ def cmd_build_session(args):
               file=sys.stderr)
         out["sealed"] = False
     else:
-        sealed = look_seal.seal_session(args.out_dir, key_hex)
-        out.update({"sealed": True, "sealSha256": sealed["sealSha256"], "sealedMembers": len(sealed["members"])})
-        if args.seal_key_file:
-            _write_key_file(args.seal_key_file, key_hex)
-            out["sealKeyFile"] = args.seal_key_file
-        else:
-            out["sealKey"] = key_hex
+        _write_key_file(args.seal_key_file, key_hex)  # BEFORE sealing: a sealed session whose key was lost is useless
+        try:
+            sealed = look_seal.seal_session(args.out_dir, key_hex)
+        except BaseException:
+            try:
+                os.remove(args.seal_key_file)  # nothing was sealed with this key, so it must not linger
+            except OSError:
+                pass
+            raise
+        out.update({"sealed": True, "sealSha256": sealed["sealSha256"], "sealedMembers": len(sealed["members"]),
+                    "sealKeyFile": args.seal_key_file})
         print(f"[look_cli] SEALED: the answer key and source frames are in {look_seal.SEALED_NAME}, readable only with "
-              "the seal key. Keep the key OUT of the judge's environment (judge refuses LOOK_SEAL_KEY); pass it to "
-              f"`tally` with --seal-key / --seal-key-file / {look_seal.KEY_ENV}.", file=sys.stderr)
+              f"the key in {args.seal_key_file}. Keep that file OUT of the judge's reach (the judge refuses "
+              f"{look_seal.KEY_ENV} in its environment); give it to `tally` with --seal-key-file (or {look_seal.KEY_ENV}).",
+              file=sys.stderr)
     print(json.dumps(out))
     lost = look_pairs.drop_policy(dropped)["lossFrameIds"]
     if lost and allowance is None:
@@ -352,8 +362,14 @@ def _refuse_key_file_in_session(key_file, session_dir):
 
 
 def _write_key_file(path, key_hex):
+    """Write the seal key to `path`, never over an existing file (it could be another session's only key)."""
     os.makedirs(os.path.dirname(os.path.abspath(path)), exist_ok=True)
-    with open(path, "w", encoding="utf-8", newline="\n") as handle:
+    try:
+        handle = open(path, "x", encoding="utf-8", newline="\n")
+    except FileExistsError as exc:
+        raise ValueError(f"--seal-key-file {path!r} already exists: it may hold another session's only key; "
+                         "name a new file") from exc
+    with handle:
         handle.write(key_hex + "\n")
     try:
         os.chmod(path, 0o600)
@@ -415,7 +431,7 @@ def _load_secrets(args):
     key_hex = look_seal.key_from_args(args.seal_key, args.seal_key_file)
     if sealed_file:
         if not key_hex:
-            raise ValueError(f"{args.session_dir!r} is sealed: pass the seal key build-session printed "
+            raise ValueError(f"{args.session_dir!r} is sealed: pass the key in build-session's --seal-key-file "
                              f"(--seal-key, --seal-key-file or {look_seal.KEY_ENV})")
         key, session, seal_sha = look_seal.open_sealed(args.session_dir, key_hex)
         return key, session, {"verified": True, "sealSha256": seal_sha}
@@ -553,7 +569,8 @@ def main(argv=None):
     s.add_argument("--allow-dropped-frames", metavar="REASON",
                    help="acknowledge that frames were LOST (unshared, outside the crop tolerance, requested but absent) "
                         "and why that is acceptable; without it the session is marked and the tally calls it unusable")
-    s.add_argument("--seal-key-file", help="write the seal key here (outside the session dir) instead of printing it")
+    s.add_argument("--seal-key-file", help="where to write the new seal key (a file that does not exist yet, outside the "
+                                           "session dir). Required unless --no-seal: the key is never printed")
     s.add_argument("--no-seal", action="store_true",
                    help="leave the answer key and source frames in the clear (debugging only: a real judge refuses "
                         "the session and its tally is unusable)")
@@ -578,7 +595,8 @@ def main(argv=None):
     s.add_argument("--out", required=True)
     s.add_argument("--config")
     s.add_argument("--cross-family-status")
-    s.add_argument("--seal-key", help="the key build-session printed (or --seal-key-file / env LOOK_SEAL_KEY)")
+    s.add_argument("--seal-key", help="the seal key itself (prefer --seal-key-file or env LOOK_SEAL_KEY: argv is visible "
+                                      "in process lists and logs)")
     s.add_argument("--seal-key-file")
     s.add_argument("--rubric", help="rubric file to verify against --rubric-lock (default: the shipped rubric)")
     s.add_argument("--rubric-lock", help="rubric lock to verify against (default: the shipped lock); the session's "

@@ -112,10 +112,11 @@ Typed terminals, no partial credit: frame `PASS|FAIL|NOT_EVALUABLE`; sheet `PASS
    letterbox decision, every common crop) is written to `session.json` and `answer_key.json` and copied into the entry.
    **Sealed by default:** the answer key, the full session record, the prepared source frames and the degraded
    sources go into `sealed.bin` (see *Enforced judge isolation* below) and `session.json` is rewritten as a minimal public
-   record (rubric digest, seed, image digests: no subject names). The per-session **seal key is printed once** (or written
-   to `--seal-key-file`, which may not sit inside the session); `--no-seal` leaves the secrets in the clear for debugging,
-   and then no real judge will run and the tally is unusable. `unseal` extracts a sealed session for audit (never into
-   the session directory).
+   record (rubric digest, seed, image digests: no subject names). The per-session **seal key is written to the file you
+   name with `--seal-key-file`** (required; a file that does not exist yet, never inside the session, written before
+   anything is sealed and removed again if sealing fails) **and is never printed**, so it cannot land in a log or a
+   transcript; `--no-seal` leaves the secrets in the clear for debugging, and then no real judge will run and the tally
+   is unusable. `unseal` extracts a sealed session for audit (never into the session directory).
 3. `look_cli.py judge --session-dir SESS --runner claude:MODEL|codex:MODEL --producer-model M ...` -- each item runs
    in a fresh temp dir holding only `pair.png`, in a subprocess whose **whole process tree** is killed on timeout
    (the Windows `claude` / `codex` npm shims are `.cmd` files; a plain kill left the real CLI running). The judge may
@@ -168,7 +169,7 @@ Asking it not to (flags, a prompt, "read-only") is policy. Round 2 makes the sec
 
 1. **Sealed artifact.** `build-session` writes the answer key, the full session record (capture, drops, subject names), the
    prepared source frames (`cuda-00.png`...) and the degraded sources into one file, `sealed.bin`: HMAC-SHA256-CTR
-   (stdlib; encrypt-then-MAC, fresh nonce) under a random per-session key that is printed once and **never written into
+   (stdlib; encrypt-then-MAC, fresh nonce) under a random per-session key that is written to a file you name (never printed) and **never written into
    the session directory**. What stays beside it is what a judge may see: the pair images, the judge-facing manifest and
    a minimal public `session.json`. A tampered, truncated or swapped file, or the wrong key, opens nothing.
 2. **The key never reaches a judge.** The judge commands refuse to start when `LOOK_SEAL_KEY` is in their environment; the

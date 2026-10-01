@@ -6,7 +6,7 @@ Flags that ask the CLI not to are policy. This module makes the secrets *unreada
 tries: after `build-session` the session directory holds only what a judge may see (the pair images, the judge-facing
 manifest, a minimal public session.json) plus ONE sealed file. The answer key, the full session record, the prepared
 source frames and the degraded sources live ONLY inside that file, encrypted and authenticated with a per-session key
-that is printed once at build time and never written into the session directory. The judge commands refuse to start
+that build-session writes to a file the caller names (never printed, never inside the session directory). The judge commands refuse to start
 when the key is in their environment, scrub it from the judge's environment, and refuse a session directory that
 still holds a plaintext secret. `tally` takes the key, verifies the seal and reads the secrets from memory.
 
@@ -49,7 +49,7 @@ def new_key():
 def parse_key(text):
     text = (text or "").strip().lower()
     if len(text) != 64 or not set(text) <= _HEX:
-        raise SealError("the seal key must be 64 hex characters (what build-session printed)")
+        raise SealError("the seal key must be 64 hex characters (the content of build-session's --seal-key-file)")
     return bytes.fromhex(text)
 
 
