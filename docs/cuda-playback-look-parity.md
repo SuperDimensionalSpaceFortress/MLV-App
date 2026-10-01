@@ -329,17 +329,22 @@ pivot 0.46, leveled `[27000,61000,43000]`) gave GLSL `[64090,64346,64293]` again
   gamma read by integer index (the engine truncates, the round-1 shader rounded the index);
   vibrance reads its input rounded. The C++ mirror follows the same pre-camera order
   (`matrixRawValue`, double `expoCorrection`, `floor(clamp16(...))`).
-- Found by the sweep and fixed in all three: the gamut compression used the **blue-channel** Reinhard
-  curve for green; the engine uses the plain `ReinhardTonemap_f` for green, the red curve for red
-  and the blue curve for blue (`raw_processing.c` ~3523). The two curves differ for every green
-  below luma, so this moved warm and saturated pixels (the fable repro was 923 codes off with the
-  clamp order fixed and this not).
-- The unchanged parts of the mirror: it still **rounds** the post-camera gamma index where the
-  engine and the display shader truncate, because `tiny_dual_iso.gpu_preview_subset.*` golden
-  hashes depend on that rounding and the golden artifact must not move. So the mirror (MainWindow's
-  CPU fallback, and the offscreen subset shader's oracle) agrees with the engine on the pre-camera
-  order but is **not** an engine oracle at the 1-LSB level (measured up to 18 codes, mean 1.4, on
-  the ramp frames), and no test claims it is.
+- Found by the sweep and fixed **in the display shader only**: the gamut compression used the
+  **blue-channel** Reinhard curve for green; the engine uses the plain `ReinhardTonemap_f` for
+  green, the red curve for red and the blue curve for blue (`raw_processing.c` ~3523). The two
+  curves differ for every green below luma, so this moved warm and saturated pixels (the fable
+  repro was 923 codes off with the clamp order fixed and this not). The same fix in the C++
+  mirror changed 4 of the 15 pinned golden hashes
+  (`tiny_dual_iso.gpu_preview_subset.{frame0,frame1,exposure_0_75.frame0}` and
+  `preview_processing.cpu.frame0`; the signatures did not move), and the golden artifact must not
+  move, so it was **reverted** in the mirror and the subset shader.
+- The unchanged parts of the mirror and the subset shader (they are tested against each other, and
+  the mirror is MainWindow's CPU fallback): they still **round** the post-camera gamma index where
+  the engine and the display shader truncate, and they keep the blue curve for green in the gamut
+  step, both because the golden hashes depend on them. So they agree with the engine on the
+  pre-camera order (the BLOCKER) but are **not** an engine oracle at the 1-LSB level (up to 18
+  codes, mean 1.4, on the ramp frames, and a visible difference on greens below luma), and no
+  test claims they are. Closing that gap means re-ratifying the golden: CUDA-LOOK-MIRROR-ENGINE-EXACT-1.
 - Golden: `TinyDualIsoReceiptSubsetGoldenOutputIsStable` and the other six producers still produce
   the tracked 15 keys byte-for-byte (proof in the run summary).
 
@@ -437,6 +442,9 @@ LUT-boundary rounding; no other cause is claimed.
   kill switch, play-through cadence and per-frame cost of the blur pack/upload.
 - **CUDA-LOOK-DISPLAY-STAGES-1**: creative curves, toning, saturation, hue-vs, chroma smooth, and
   the subset-only stages (AgX, gradient, highlight recon, LUT, vignette).
+- **CUDA-LOOK-MIRROR-ENGINE-EXACT-1**: make the C++ mirror and the subset shader truncate the
+  post-camera gamma index and use the plain Reinhard curve for green like the engine and the
+  display shader. Moves 4 pinned golden hashes, so it needs a golden re-ratification.
 - **CUDA-LOOK-ENGINE-KERNEL-CLAMP-DIVERGENCE-1**: the engine's direct-8-bit kernel and basic-matrix
   fast path omit the pre-camera clamp/truncation the generic loop applies; measure CPU playback
   against the 16-bit loop on over-ranged footage and decide which behaviour is the contract.
@@ -445,8 +453,8 @@ LUT-boundary rounding; no other cause is claimed.
 ## Files changed (LAND r2 on top of round 1)
 
 - `platform/qt/GpuPreviewProcessing.h` / `.cpp` — raw diagonal LUTs and their texture packing,
-  display/subset shader and mirror pre-camera order, exact gamma truncation in the display shader,
-  green gamut tonemap, `gpuPreviewProcessingDisplayShadowsHighlightsFrameStateBypassed`.
+  display/subset shader and mirror pre-camera order, exact gamma truncation and the plain green
+  gamut tonemap in the display shader only, `gpuPreviewProcessingDisplayShadowsHighlightsFrameStateBypassed`.
 - `platform/qt/RenderFrameThread.cpp` — the bypass gate calls that function (kill switch restored).
 - `platform/qt/GpuDisplayViewport.cpp` — Bayer16 route no longer binds a stale blur.
 - `tests/pipeline/test_gpu_preview_processing.cpp` — mirror display tests replaced by
