@@ -118,17 +118,23 @@ try {
         [Console]::Error.WriteLine("PLAYBACK-CLIP-LENGTH-ENFORCE-1: $($environmentGate.message)")
         exit 44
     }
+    $parentEnvironmentGate = Test-GuiSmokeParentEnvironment
+    if ($parentEnvironmentGate.verdict -ne 'OK') {
+        [Console]::Error.WriteLine("PLAYBACK-CLIP-LENGTH-ENFORCE-2: $($parentEnvironmentGate.message)")
+        exit 44
+    }
     $clipLengthGate = 'NOT_PLAYING'
     if ($passThroughGate.playCapable) {
         if ([string]::IsNullOrWhiteSpace($ClipPath)) {
             [Console]::Error.WriteLine("PLAYBACK-CLIP-LENGTH-ENFORCE-1: CLIP_LENGTH_UNKNOWN (reason=no_input)")
             exit 42
         }
-        # Floor only (window 0): the play action runs for a few frames, never a measured window.
-        $profileClipGate = Test-GuiSmokeClipLength -Path (Resolve-FileSystemProviderPath -Path $ClipPath) -WindowSeconds 0 -StartFrame $StartFrame
+        # ENFORCE-2: the app gates the window from the CURRENT position (--start-frame) to the cut-out at
+        # >= 20 s, so the wrapper requires the same: 20 s must remain after -StartFrame.
+        $profileClipGate = Test-GuiSmokeClipLength -Path (Resolve-FileSystemProviderPath -Path $ClipPath) -WindowSeconds 20 -StartFrame $StartFrame
         if ($profileClipGate.verdict -ne 'OK') {
             [Console]::Error.WriteLine("PLAYBACK-CLIP-LENGTH-ENFORCE-1: $($profileClipGate.message)")
-            exit $(if ($profileClipGate.verdict -eq 'CLIP_TOO_SHORT') { 41 } else { 42 })
+            exit (Get-GuiSmokeGateExitCode -Verdict $profileClipGate.verdict)
         }
         $clipLengthGate = 'OK'
     }

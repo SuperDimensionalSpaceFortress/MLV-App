@@ -1,6 +1,7 @@
 #include "../common/minitest.h"
 #include "../../platform/qt/PlaybackFrameRange.h"
 
+#include <string>
 #include <vector>
 
 TEST( PlaybackFrameRange, ZeroCutRangeRepairsToWholeClip )
@@ -330,4 +331,201 @@ TEST( PlaybackWrapRecorder, TheHeuristicCanStillAddASignalButNeverRemoveOne )
     engineOnly.noteEngineWrap();
     ASSERT_TRUE( engineOnly.wrapped() );
     ASSERT_FALSE( engineOnly.inferredWrap );
+}
+
+// ---------------------------------------------------------------------------------------------------------
+// PLAYBACK-CLIP-LENGTH-ENFORCE-2: the app-side play gate (evaluatePlayableWindow / ProgrammaticPlayLedger)
+// and the widened wrap recorder. All pure -- the GUI's programmaticPlay() is a thin wrapper that feeds these
+// the live slider / cut spin boxes / clip header and triggers Play only when admit() says so.
+// ---------------------------------------------------------------------------------------------------------
+namespace
+{
+const double kFps = 24.0;
+const int kFrames30s = 720;   // 30 s at 24 fps
+using playback_frame_range::evaluatePlayableWindow;
+using playback_frame_range::PlayableWindowVerdict;
+using playback_frame_range::ProgrammaticPlayLedger;
+}
+
+TEST( PlayableWindow, TheRound2BlockerATwoFrameCutRangeOnAThirtySecondClipIsRefused )
+{
+    // fable r2 / sol r2 repro: a 720-frame clip, a receipt with cutIn=1 cutOut=2, -Seconds 24, Look Assist on:
+    // the whole clip is 30 s but only 2 frames would play. The gate must refuse before Play.
+    const PlayableWindowVerdict v = evaluatePlayableWindow( 0, 1, 2, kFrames30s, kFps, 24.0 );
+    ASSERT_FALSE( v.ok );
+    ASSERT_EQ( std::string( "CLIP_TOO_SHORT" ), std::string( v.reason ) );
+    ASSERT_EQ( std::string( "cut_range" ), std::string( v.scope ) );
+    ASSERT_EQ( 2, v.playableFrames );
+    ASSERT_TRUE( v.playableSeconds < 0.1 );
+    ASSERT_TRUE( v.requiredSeconds >= 24.0 );
+}
+
+TEST( PlayableWindow, EveryTrackedReceiptCutRangeIsRefusedOnAThirtySecondClip )
+{
+    // The cut outs the tracked receipts carry (fable r2): 2, 4, 6, 16, 143, 283, 461 -- all under 20 s at 24 fps.
+    const int cutOuts[] = { 2, 4, 6, 16, 143, 283, 461 };
+    for( const int cutOut : cutOuts )
+    {
+        const PlayableWindowVerdict v = evaluatePlayableWindow( 0, 1, cutOut, kFrames30s, kFps, 0.0 );
+        ASSERT_FALSE( v.ok );
+        ASSERT_EQ( std::string( "cut_range" ), std::string( v.scope ) );
+    }
+}
+
+TEST( PlayableWindow, ATwentySecondWindowFromTheCurrentPositionIsAdmittedAndOneFrameLessIsNot )
+{
+    // 480 frames = exactly 20 s at 24 fps.
+    PlayableWindowVerdict v = evaluatePlayableWindow( 0, 1, 480, 720, kFps, 0.0 );
+    ASSERT_TRUE( v.ok );
+    ASSERT_EQ( 480, v.playableFrames );
+    ASSERT_EQ( std::string( "" ), std::string( v.reason ) );
+
+    v = evaluatePlayableWindow( 0, 1, 479, 720, kFps, 0.0 );
+    ASSERT_FALSE( v.ok );
+
+    // Position-aware: the same full range is refused when the position is 1 frame in (479 frames left).
+    v = evaluatePlayableWindow( 1, 1, 480, 720, kFps, 0.0 );
+    ASSERT_FALSE( v.ok );
+    ASSERT_EQ( 479, v.playableFrames );
+    v = evaluatePlayableWindow( 1, 1, 481, 720, kFps, 0.0 );
+    ASSERT_TRUE( v.ok );
+}
+
+TEST( PlayableWindow, TheRequestedWindowRaisesTheBarAboveTwentySeconds )
+{
+    // 30 s clip, a 25 s requested window from frame 0: ok; from frame 130 (only 24.6 s left): refused.
+    ASSERT_TRUE( evaluatePlayableWindow( 0, 1, 720, 720, kFps, 25.0 ).ok );
+    const PlayableWindowVerdict v = evaluatePlayableWindow( 130, 1, 720, 720, kFps, 25.0 );
+    ASSERT_FALSE( v.ok );
+    ASSERT_EQ( std::string( "cut_range" ), std::string( v.scope ) );
+    // A request under the floor never lowers it.
+    ASSERT_FALSE( evaluatePlayableWindow( 0, 1, 100, 720, kFps, 1.0 ).ok );
+}
+
+TEST( PlayableWindow, ThePlayheadAtTheLastFrameIsRefusedBecauseTheJumpToFirstFrameIsAReplay )
+{
+    // on_actionPlay_triggered jumps to the first frame when Play is pressed on the last frame; from the last
+    // frame the window is ONE frame, so a programmatic Play there is refused rather than replayed.
+    const PlayableWindowVerdict v = evaluatePlayableWindow( 719, 1, 720, 720, kFps, 0.0 );
+    ASSERT_FALSE( v.ok );
+    ASSERT_EQ( 1, v.playableFrames );
+    // And past the cut out (position beyond Out) nothing is left at all.
+    ASSERT_EQ( 0, evaluatePlayableWindow( 400, 1, 300, 720, kFps, 0.0 ).playableFrames );
+}
+
+TEST( PlayableWindow, ACollapsedRangeIsMeasuredAsThePlayPathRepairsIt )
+{
+    // cutIn == cutOut == 1 is widened to the whole clip by the play path (normalizeCutRange repair=true), so
+    // the window the gate measures is the clip, not one frame: a 30 s clip is admitted, the 2-frame fixture not.
+    ASSERT_TRUE( evaluatePlayableWindow( 0, 1, 1, 720, kFps, 0.0 ).ok );
+    ASSERT_FALSE( evaluatePlayableWindow( 0, 1, 1, 2, kFps, 0.0 ).ok );
+}
+
+TEST( PlayableWindow, TheTrackedFixturesAreRefusedWhateverTheCutRange )
+{
+    // 2 and 16 frames (tiny_dual_iso / large_dual_iso): clip-scope refusal.
+    PlayableWindowVerdict v = evaluatePlayableWindow( 0, 1, 2, 2, 24.0, 0.0 );
+    ASSERT_FALSE( v.ok );
+    ASSERT_EQ( std::string( "clip" ), std::string( v.scope ) );
+    v = evaluatePlayableWindow( 0, 1, 16, 16, 23.976, 0.0 );
+    ASSERT_FALSE( v.ok );
+    ASSERT_EQ( std::string( "clip" ), std::string( v.scope ) );
+}
+
+TEST( PlayableWindow, AnUnknownClipFailsClosedWithATypedReason )
+{
+    PlayableWindowVerdict v = evaluatePlayableWindow( 0, 1, 720, 0, kFps, 0.0 );
+    ASSERT_FALSE( v.ok );
+    ASSERT_EQ( std::string( "CLIP_LENGTH_UNKNOWN" ), std::string( v.reason ) );
+    v = evaluatePlayableWindow( 0, 1, 720, 720, 0.0, 0.0 );
+    ASSERT_FALSE( v.ok );
+    ASSERT_EQ( std::string( "CLIP_LENGTH_UNKNOWN" ), std::string( v.reason ) );
+}
+
+TEST( ProgrammaticPlayLedger, TheFirstAdmittedPlayIsTheOnlyOneARestartReplayOrStressSwitchIsRefused )
+{
+    ProgrammaticPlayLedger ledger;
+    const PlayableWindowVerdict good = evaluatePlayableWindow( 0, 1, 720, 720, kFps, 24.0 );
+    ASSERT_TRUE( good.ok );
+    ASSERT_TRUE( ledger.admit( good ) );
+    ASSERT_EQ( 1, ledger.admitted );
+
+    // The same perfectly good window a SECOND time (restart, re-Play, stress-switch re-Play, contact-sheet
+    // replay) is REFUSED, not re-gated.
+    ASSERT_FALSE( ledger.admit( good ) );
+    ASSERT_EQ( std::string( "REPLAY_REFUSED" ), std::string( ledger.lastRefusalReason ) );
+    ASSERT_FALSE( ledger.admit( good ) );
+    ASSERT_EQ( 1, ledger.admitted );
+    ASSERT_EQ( 2, ledger.refused );
+}
+
+TEST( ProgrammaticPlayLedger, ARefusedWindowDoesNotUseUpTheProcessesOnePlay )
+{
+    ProgrammaticPlayLedger ledger;
+    ASSERT_FALSE( ledger.admit( evaluatePlayableWindow( 0, 1, 2, 720, kFps, 24.0 ) ) );
+    ASSERT_EQ( std::string( "CLIP_TOO_SHORT" ), std::string( ledger.lastRefusalReason ) );
+    ASSERT_EQ( 0, ledger.admitted );
+    ASSERT_TRUE( ledger.admit( evaluatePlayableWindow( 0, 1, 720, 720, kFps, 24.0 ) ) );
+    ASSERT_EQ( 1, ledger.admitted );
+}
+
+TEST( PlaybackWrapRecorder, JumpToFirstAndRestartsCountAsReplaysAndMakeTheRunInvalid )
+{
+    playback_frame_range::PlaybackWrapRecorder jump;
+    jump.noteJumpToFirst();
+    ASSERT_TRUE( jump.wrapped() );
+    ASSERT_EQ( 1, jump.replayCount() );
+    ASSERT_EQ( 0, jump.engineWraps );
+
+    playback_frame_range::PlaybackWrapRecorder restart;
+    restart.noteRestart();
+    ASSERT_TRUE( restart.wrapped() );
+    ASSERT_EQ( 1, restart.replayCount() );
+
+    playback_frame_range::PlaybackWrapRecorder all;
+    all.noteEngineWrap();
+    all.noteJumpToFirst();
+    all.noteRestart();
+    ASSERT_EQ( 3, all.replayCount() );
+
+    playback_frame_range::PlaybackWrapRecorder clean;   // one Play from frame 0 to the end: nothing recorded
+    ASSERT_FALSE( clean.wrapped() );
+    ASSERT_EQ( 0, clean.replayCount() );
+}
+
+TEST( PlaybackWrapRecorder, MainWindowCountsTheSecondPlayStartAsARestartAndTheLastFramePlayAsAJump )
+{
+    // Mirrors MainWindow::on_actionPlay_toggled (++m_playStartsInProcess > 1 -> noteRestart) and
+    // on_actionPlay_triggered (position+1 >= cutOut -> noteJumpToFirst).
+    playback_frame_range::PlaybackWrapRecorder recorder;
+    int playStarts = 0;
+    const auto pressPlay = [&]( int position, int cutOut )
+    {
+        if( position + 1 >= cutOut ) recorder.noteJumpToFirst();
+        if( ++playStarts > 1 ) recorder.noteRestart();
+    };
+    pressPlay( 0, 720 );
+    ASSERT_FALSE( recorder.wrapped() );   // the one measured Play
+    pressPlay( 0, 720 );                  // a second Play of any origin
+    ASSERT_EQ( 1, recorder.restartCount );
+    pressPlay( 719, 720 );                // pressed on the last frame
+    ASSERT_EQ( 1, recorder.jumpToFirstCount );
+    ASSERT_EQ( 3, recorder.replayCount() );
+}
+
+TEST( PlayableWindow, APresentedFramesTargetIsAPlayWindowAndMustReachTheFloorToo )
+{
+    using playback_frame_range::presentedFramesTargetReachesFloor;
+    // 0 = no early stop: nothing to check.
+    ASSERT_TRUE( presentedFramesTargetReachesFloor( 0, 24.0 ) );
+    // The pinned-frame capture default (24 frames, ~1 s) is a short play and is refused.
+    ASSERT_FALSE( presentedFramesTargetReachesFloor( 24, 24.0 ) );
+    ASSERT_FALSE( presentedFramesTargetReachesFloor( 479, 24.0 ) );
+    // 480 frames at 24 fps is exactly 20 s; 480 at 23.976 is 20.02 s; 500 at 25 fps is 20 s.
+    ASSERT_TRUE( presentedFramesTargetReachesFloor( 480, 24.0 ) );
+    ASSERT_TRUE( presentedFramesTargetReachesFloor( 480, 23.976 ) );
+    ASSERT_TRUE( presentedFramesTargetReachesFloor( 500, 25.0 ) );
+    ASSERT_FALSE( presentedFramesTargetReachesFloor( 480, 29.97 ) );   // 16 s
+    // An unknown frame rate fails closed.
+    ASSERT_FALSE( presentedFramesTargetReachesFloor( 1000, 0.0 ) );
 }

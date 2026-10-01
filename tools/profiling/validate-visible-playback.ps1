@@ -51,10 +51,18 @@ if ($Seconds -lt $needSeconds) { $Seconds = $needSeconds }
 # the same clip-length gate run-release-gui-smoke.ps1 does. A clip under 20 s, or shorter than the
 # play window, is refused (exit 41 CLIP_TOO_SHORT / 42 CLIP_LENGTH_UNKNOWN); --loop is never passed.
 . (Join-Path $PSScriptRoot 'gui-smoke-length-gate.ps1')
+# ENFORCE-2: this script computes its own window; it is never below the 20 s floor, and an inherited
+# MLVAPP_AUTOPLAY_* variable (which plays with no tool gate) is refused.
+if ($Seconds -lt 20) { $Seconds = 20 }
+$parentEnvironmentGate = Test-GuiSmokeParentEnvironment
+if ($parentEnvironmentGate.verdict -ne 'OK') {
+    [Console]::Error.WriteLine("PLAYBACK-CLIP-LENGTH-ENFORCE-2: $($parentEnvironmentGate.message)")
+    exit 44
+}
 $clipLengthGate = Test-GuiSmokeClipLength -Path $clip -WindowSeconds $Seconds
 if ($clipLengthGate.verdict -ne 'OK') {
     [Console]::Error.WriteLine("PLAYBACK-CLIP-LENGTH-ENFORCE-1: $($clipLengthGate.message)")
-    exit $(if ($clipLengthGate.verdict -eq 'CLIP_TOO_SHORT') { 41 } else { 42 })
+    exit (Get-GuiSmokeGateExitCode -Verdict $clipLengthGate.verdict)
 }
 
 $argList = @(

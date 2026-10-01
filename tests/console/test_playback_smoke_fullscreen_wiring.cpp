@@ -130,7 +130,7 @@ TEST(PlaybackSmokeFullscreenWiring, OrderIsForegroundThenFullscreenThenReverifie
     const int fullscreenAt = smokeBody.indexOf(QStringLiteral("enterPlaybackSmokeFullscreen( displayTarget );"), firstForegroundAt);
     const int secondForegroundAt = smokeBody.indexOf(
         QStringLiteral("forcePlaybackSmokeWindowForeground();"), fullscreenAt);
-    const int triggerAt = smokeBody.indexOf(QStringLiteral("ui->actionPlay->trigger();"), secondForegroundAt);
+    const int triggerAt = smokeBody.indexOf(QStringLiteral("programmaticPlay( \"gui-smoke-measured\""), secondForegroundAt);
 
     ASSERT_TRUE(targetFramesAt >= 0);
     ASSERT_TRUE(firstForegroundAt > targetFramesAt);
@@ -296,7 +296,7 @@ TEST(PlaybackSmokeFullscreenWiring, PlaybackClockStartsAfterTheFullscreenPreambl
     const int clockDeclAt = smokeBody.indexOf(
         QStringLiteral("QElapsedTimer playbackClock;"), preambleMsAt);
     const int clockStartAt = smokeBody.indexOf(QStringLiteral("playbackClock.start();"), clockDeclAt);
-    const int triggerAt = smokeBody.indexOf(QStringLiteral("ui->actionPlay->trigger();"), clockStartAt);
+    const int triggerAt = smokeBody.indexOf(QStringLiteral("programmaticPlay( \"gui-smoke-measured\""), clockStartAt);
 
     ASSERT_TRUE(fullscreenAt >= 0);
     ASSERT_TRUE(secondForegroundAt > fullscreenAt);
@@ -329,9 +329,10 @@ TEST(PlaybackSmokeFullscreenWiring, UnverifiedFullscreenFailsClosedBeforeTheTrig
         QStringLiteral(
             "windowedSmoke ? \"windowed_placement_not_verified\" : \"fullscreen_not_verified\""),
         checkAt);
-    // Search for the trigger from the check onward -- an earlier, unrelated
-    // ui->actionPlay->trigger() exists upstream (Look Assist auto-warmup settle).
-    const int triggerAt = smokeBody.indexOf(QStringLiteral("ui->actionPlay->trigger();"), checkAt);
+    // Search for the trigger from the check onward. The measured Play is the shared gate's
+    // programmaticPlay( "gui-smoke-measured" ...; the Look Assist warm-up Play that used to precede
+    // it is gone (PLAYBACK-CLIP-LENGTH-ENFORCE-2).
+    const int triggerAt = smokeBody.indexOf(QStringLiteral("programmaticPlay( \"gui-smoke-measured\""), checkAt);
     ASSERT_TRUE(failCallAt > checkAt);
     ASSERT_TRUE(failCallAt < triggerAt);
 
@@ -449,7 +450,7 @@ TEST(PlaybackSmokeFullscreenWiring, LatchIsArmedOnlyAfterVerificationAndImmediat
         QStringLiteral("m_playbackSmokeFullscreenLostCount = 0;"), clockStartAt);
     const int armAt = smokeBody.indexOf(
         QStringLiteral("m_playbackSmokeFullscreenLossLatchArmed = true;"), resetAt);
-    const int triggerAt = smokeBody.indexOf(QStringLiteral("ui->actionPlay->trigger();"), armAt);
+    const int triggerAt = smokeBody.indexOf(QStringLiteral("programmaticPlay( \"gui-smoke-measured\""), armAt);
 
     ASSERT_TRUE(failCheckAt >= 0);
     ASSERT_TRUE(clockStartAt > failCheckAt);

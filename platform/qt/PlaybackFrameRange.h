@@ -167,22 +167,129 @@ inline bool isContactSheetLoopWrapTransition(
     return backwardJump >= loopWidth - kOvershootToleranceFrames;
 }
 
-// PlaybackWrapRecorder -- PLAYBACK-CLIP-LENGTH-ENFORCE-1 round 2 (sol BLOCKER 4): the runtime backstop
-// against a looped clip. The AUTHORITATIVE signal is noteEngineWrap(), called from the engine's own wrap
-// branches in MainWindow::playbackHandling (the Loop branch that jumps the slider back to cutIn, and
-// advanceDropFrameTick's `wrapped` result). The presented-frame heuristic (noteInferredWrap(), from
-// isContactSheetLoopWrapTransition) is kept only as a SECOND signal: it misses a genuine wrap whenever
-// dropped frames near the boundary make the last presented frame lie more than 8 frames short of the
-// range end (e.g. 700 -> 0 over a 0..719 range jumps back by 700, under the 711 threshold).
-// wrapped() is true if EITHER fired, so a wrap can never escape on the strength of the heuristic alone.
+// PlaybackWrapRecorder -- PLAYBACK-CLIP-LENGTH-ENFORCE-1 round 2 (sol BLOCKER 4), widened in ENFORCE-2: the
+// runtime backstop against a looped or replayed clip. The AUTHORITATIVE wrap signal is noteEngineWrap(), called
+// from the engine's own wrap branches in MainWindow::playbackHandling (the Loop branch that jumps the slider
+// back to cutIn, and advanceDropFrameTick's `wrapped` result). ENFORCE-2 adds the two NON-Loop ways the same
+// footage plays again: noteJumpToFirst() (Play pressed on the last frame jumps to the first frame, in
+// on_actionPlay_triggered) and noteRestart() (any Play start after the first in the process). The
+// presented-frame heuristic (noteInferredWrap(), from isContactSheetLoopWrapTransition) stays only as a SECOND
+// signal: it misses a genuine wrap whenever dropped frames near the boundary make the last presented frame lie
+// more than 8 frames short of the range end (e.g. 700 -> 0 over a 0..719 range jumps back by 700, under the 711
+// threshold). wrapped() is true if ANY of them fired, so a replay can never escape on the strength of one
+// signal alone; replayCount() is the figure the summary reports as wrap_count.
 struct PlaybackWrapRecorder
 {
     int engineWraps = 0;
+    int jumpToFirstCount = 0;
+    int restartCount = 0;
     bool inferredWrap = false;
 
     void noteEngineWrap() { ++engineWraps; }
+    void noteJumpToFirst() { ++jumpToFirstCount; }
+    void noteRestart() { ++restartCount; }
     void noteInferredWrap() { inferredWrap = true; }
-    bool wrapped() const { return engineWraps > 0 || inferredWrap; }
+    int replayCount() const { return engineWraps + jumpToFirstCount + restartCount; }
+    bool wrapped() const { return replayCount() > 0 || inferredWrap; }
+};
+
+// ---------------------------------------------------------------------------------------------------------
+// PLAYBACK-CLIP-LENGTH-ENFORCE-2 (owner rule 2026-09-30): THE APP IS THE GATE.
+//
+// No programmatic Play (autoplay hook, profile exercise modes, GUI-smoke measured Play, ...) may start unless
+// the footage that Play would actually cover -- from the CURRENT position to the receipt's cut-out -- is at
+// least kMinPlayWindowSeconds AND at least the window the caller asked for; and the process admits only ONE
+// programmatic Play (a restart, re-Play, stress switch or contact-sheet replay is refused, never re-gated).
+// Pressing Play on the last frame jumps to the first frame (on_actionPlay_triggered), which the position-aware
+// window covers: from the last frame the window is one frame, so it is refused.
+// ---------------------------------------------------------------------------------------------------------
+constexpr double kMinPlayWindowSeconds = 20.0;
+
+struct PlayableWindowVerdict
+{
+    bool ok = false;
+    // "" when ok; otherwise a typed reason: CLIP_LENGTH_UNKNOWN | CLIP_TOO_SHORT | REPLAY_REFUSED.
+    const char *reason = "CLIP_LENGTH_UNKNOWN";
+    // "clip" when the whole clip is shorter than the requirement, "cut_range" when the clip is long enough
+    // but the span from the current position to the cut-out is not. Empty when ok / unknown.
+    const char *scope = "";
+    double clipSeconds = 0.0;
+    double playableSeconds = 0.0;
+    double requiredSeconds = kMinPlayWindowSeconds;
+    int positionFrame = 0;     // 0-based, clamped
+    int lastPlayableFrame = 0; // 0-based inclusive: the cut-out frame
+    int playableFrames = 0;    // frames positionFrame..lastPlayableFrame inclusive
+};
+
+// evaluatePlayableWindow -- pure. positionFrame is the 0-based slider position; cutIn/cutOut are the raw
+// spinBoxCutIn/spinBoxCutOut values (1-based, Out inclusive: playbackHandling stops at slider >= cutOut-1).
+// The range is normalized exactly as the Play path would (normalizeCutRange with the collapsed-range repair),
+// so the window measured here is the window that would really play.
+inline PlayableWindowVerdict evaluatePlayableWindow(
+    int positionFrame, int cutIn, int cutOut, int totalFrames, double fps,
+    double requestedSeconds, double floorSeconds = kMinPlayWindowSeconds )
+{
+    PlayableWindowVerdict v;
+    v.requiredSeconds = std::max( floorSeconds, requestedSeconds );
+    if( totalFrames <= 0 || !( fps > 0.0 ) )
+    {
+        return v; // CLIP_LENGTH_UNKNOWN, fail closed
+    }
+
+    v.clipSeconds = static_cast<double>( totalFrames ) / fps;
+    const CutRange range = normalizeCutRange( cutIn, cutOut, totalFrames, true );
+    v.positionFrame = clampFrameIndex( positionFrame, totalFrames );
+    v.lastPlayableFrame = lastFrameIndex( range );
+    v.playableFrames = v.lastPlayableFrame >= v.positionFrame
+        ? v.lastPlayableFrame - v.positionFrame + 1
+        : 0;
+    v.playableSeconds = static_cast<double>( v.playableFrames ) / fps;
+
+    if( v.playableSeconds + 1e-9 >= v.requiredSeconds )
+    {
+        v.ok = true;
+        v.reason = "";
+        return v;
+    }
+    v.reason = "CLIP_TOO_SHORT";
+    v.scope = v.clipSeconds + 1e-9 < v.requiredSeconds ? "clip" : "cut_range";
+    return v;
+}
+
+// A --presented-frames target ends playback EARLY, after N presented frames: it is itself a play window of
+// N / fps seconds and must reach the floor (a pinned-frame run of 24 frames would play ~1 s). 0 = no early stop.
+inline bool presentedFramesTargetReachesFloor( int targetPresentedFrames, double fps,
+                                               double floorSeconds = kMinPlayWindowSeconds )
+{
+    if( targetPresentedFrames <= 0 ) return true;
+    return fps > 0.0 && static_cast<double>( targetPresentedFrames ) / fps + 1e-9 >= floorSeconds;
+}
+
+// ProgrammaticPlayLedger -- pure. One per process. admit() is the only way a programmatic Play is allowed:
+// the window must pass AND no programmatic Play may have been admitted before (replay refused).
+struct ProgrammaticPlayLedger
+{
+    int admitted = 0;
+    int refused = 0;
+    const char *lastRefusalReason = "";
+
+    bool admit( const PlayableWindowVerdict &window )
+    {
+        if( !window.ok )
+        {
+            ++refused;
+            lastRefusalReason = window.reason;
+            return false;
+        }
+        if( admitted >= 1 )
+        {
+            ++refused;
+            lastRefusalReason = "REPLAY_REFUSED";
+            return false;
+        }
+        ++admitted;
+        return true;
+    }
 };
 
 } // namespace playback_frame_range

@@ -198,6 +198,13 @@ if ($environmentGate.verdict -ne 'OK') {
     [Console]::Error.WriteLine("PLAYBACK-CLIP-LENGTH-ENFORCE-1: $($environmentGate.message)")
     exit 44
 }
+# ENFORCE-2: an MLVAPP_AUTOPLAY_* variable INHERITED from the parent process (a shell that exported one, a
+# Scheduled Task env block) reaches the app exactly like an -ExtraEnvironment one and plays with no tool gate.
+$parentEnvironmentGate = Test-GuiSmokeParentEnvironment
+if ($parentEnvironmentGate.verdict -ne 'OK') {
+    [Console]::Error.WriteLine("PLAYBACK-CLIP-LENGTH-ENFORCE-2: $($parentEnvironmentGate.message)")
+    exit 44
+}
 
 if ($UsePersistedPlaybackSettings) {
     if (-not $PSBoundParameters.ContainsKey("QualityMode")) {
@@ -1322,18 +1329,20 @@ $inputPath =
 # playback frame was presented anyway. Nothing exempts a run from the gate by letting it loop.
 $clipLengthGate = [pscustomobject]@{ verdict = 'SKIPPED_LAUNCH_ONLY_PROBE'; message = 'SKIPPED_LAUNCH_ONLY_PROBE' }
 if (-not $LaunchOnlyProbe) {
-    $clipLengthGate = Test-GuiSmokeClipLength -Path $inputPath -WindowSeconds $Seconds -StartFrame $StartFrame
+    # ENFORCE-2: the PLAY WINDOW (-Seconds, and -TargetPresentedFrames as an early stop) must itself be
+    # >= 20 s, not only the clip: PLAY_WINDOW_TOO_SHORT.
+    $clipLengthGate = Test-GuiSmokeClipLength -Path $inputPath -WindowSeconds $Seconds -StartFrame $StartFrame -TargetPresentedFrames $TargetPresentedFrames
     if ($clipLengthGate.verdict -ne 'OK') {
         [Console]::Error.WriteLine("PLAYBACK-CLIP-LENGTH-ENFORCE-1: $($clipLengthGate.message)")
-        exit $(if ($clipLengthGate.verdict -eq 'CLIP_TOO_SHORT') { 41 } else { 42 })
+        exit (Get-GuiSmokeGateExitCode -Verdict $clipLengthGate.verdict)
     }
     # The lifecycle-stress leg switches to a SECOND clip mid-play: it is played too, so it is gated too
     # (floor only -- the switch clip is not played for the whole window).
     if ($ExerciseClipLifecycleStress -and -not [string]::IsNullOrWhiteSpace($StressSwitchInput)) {
-        $stressClipGate = Test-GuiSmokeClipLength -Path (Resolve-Path -LiteralPath $StressSwitchInput).ProviderPath -WindowSeconds 0
+        $stressClipGate = Test-GuiSmokeClipLength -Path (Resolve-Path -LiteralPath $StressSwitchInput).ProviderPath -WindowSeconds 0 -ClipOnly
         if ($stressClipGate.verdict -ne 'OK') {
             [Console]::Error.WriteLine("PLAYBACK-CLIP-LENGTH-ENFORCE-1: stress-switch clip $($stressClipGate.message)")
-            exit $(if ($stressClipGate.verdict -eq 'CLIP_TOO_SHORT') { 41 } else { 42 })
+            exit (Get-GuiSmokeGateExitCode -Verdict $stressClipGate.verdict)
         }
     }
 }

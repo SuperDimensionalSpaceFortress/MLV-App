@@ -1242,7 +1242,7 @@ static int runGuiPlaybackSmoke(QApplication &app)
 
     const QCommandLineOption contactSheetDirOpt(
         QStringLiteral("contact-sheet-dir"),
-        QStringLiteral("Optional directory for a contact-sheet capture pass: N evenly spaced presented frames (PNG + JSON sidecar each), grabbed in an un-timed pass after the measured playback interval. Requires --contact-sheet-frames."),
+        QStringLiteral("Optional directory for a contact-sheet capture pass: N evenly spaced presented frames (PNG + JSON sidecar each), grabbed after the measured playback interval. The default playback-mode pass would REPLAY the span (a second Play) and is refused (REPLAY_REFUSED, owner rule 2026-09-30): pass --contact-sheet-seek-mode. Requires --contact-sheet-frames."),
         QStringLiteral("dir"));
     parser.addOption(contactSheetDirOpt);
 
@@ -1255,7 +1255,7 @@ static int runGuiPlaybackSmoke(QApplication &app)
 
     const QCommandLineOption contactSheetSeekModeOpt(
         QStringLiteral("contact-sheet-seek-mode"),
-        QStringLiteral("Explicit, labelled alternative to the default contact-sheet capture pass: grabs frames by pausing/seeking after playback stops instead of during a genuine second playback pass. A seeked frame is rendered by a different, non-playback path and can show a different look; sidecars from this mode record playback_path=false. Default off."));
+        QStringLiteral("The only contact-sheet capture that never plays: grabs frames by pausing/seeking after playback stops (the default capture would be a second playback pass, i.e. a replay, which is refused). A seeked frame is rendered by a different, non-playback path and can show a different look; sidecars from this mode record playback_path=false."));
     parser.addOption(contactSheetSeekModeOpt);
 
     const QCommandLineOption scopeOpt(

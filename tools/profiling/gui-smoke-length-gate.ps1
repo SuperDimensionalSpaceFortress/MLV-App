@@ -10,6 +10,8 @@
 # Typed verdicts (never a path: owner footage is never named in a message):
 #   OK
 #   CLIP_TOO_SHORT       (clip=<s> window=<s>)  clip is shorter than max(20, window) seconds
+#   PLAY_WINDOW_TOO_SHORT (window=<s> required=<s>)  the requested PLAY WINDOW is under 20 s, even
+#                        on a long clip (ENFORCE-2: the window, not only the clip, must be >= 20 s)
 #   CLIP_LENGTH_UNKNOWN  (reason=<token>)       header unreadable / wrong magic / 0 frames / bad fps
 #                                               / spanned set incomplete -- FAIL CLOSED
 #
@@ -103,14 +105,21 @@ function Test-GuiSmokeClipLength {
     <#
     .SYNOPSIS
     The length gate. Returns [pscustomobject]@{ verdict; message; clipSeconds; windowSeconds;
-    requiredSeconds; frames; fps }. verdict is OK | CLIP_TOO_SHORT | CLIP_LENGTH_UNKNOWN.
+    requiredSeconds; frames; fps }. verdict is OK | CLIP_TOO_SHORT | PLAY_WINDOW_TOO_SHORT | CLIP_LENGTH_UNKNOWN.
     A play window may never exceed the footage that remains after -StartFrame.
     #>
     param(
         [Parameter(Mandatory = $true)][string]$Path,
         [Parameter(Mandatory = $true)][double]$WindowSeconds,
         [int]$StartFrame = 0,
-        [double]$MinSeconds = $script:GuiSmokeMinClipSeconds
+        [double]$MinSeconds = $script:GuiSmokeMinClipSeconds,
+        # -ClipOnly: the caller plays NOTHING itself (a decode-only benchmark, a clip that is only opened);
+        # only the clip floor applies. Every caller that plays passes its real -WindowSeconds, and that
+        # window must itself be >= MinSeconds (PLAYBACK-CLIP-LENGTH-ENFORCE-2).
+        [switch]$ClipOnly,
+        # --presented-frames / -TargetPresentedFrames ends the play EARLY after N presented frames, so it is
+        # itself a play window of N / fps seconds and must reach MinSeconds (0 = no early stop).
+        [int]$TargetPresentedFrames = 0
     )
     $inv = [System.Globalization.CultureInfo]::InvariantCulture
     $fmt = { param($v) ([double]$v).ToString('0.###', $inv) }
@@ -126,8 +135,17 @@ function Test-GuiSmokeClipLength {
         return $out
     }
     $remaining = $len.seconds - ([double][Math]::Max(0, $StartFrame) / $len.fps)
+    $presentedWindowSeconds = if ($TargetPresentedFrames -gt 0) { [double]$TargetPresentedFrames / $len.fps } else { 0.0 }
     # Both the 20 s floor (whole clip) and the window (what is left after -StartFrame) must hold.
-    if ($len.seconds -lt $MinSeconds) {
+    if (-not $ClipOnly -and $TargetPresentedFrames -gt 0 -and ($presentedWindowSeconds + 1e-9) -lt $MinSeconds) {
+        $out.verdict = 'PLAY_WINDOW_TOO_SHORT'
+        $out.message = "PLAY_WINDOW_TOO_SHORT (presented_frames=$TargetPresentedFrames window=$(& $fmt $presentedWindowSeconds) required=$(& $fmt $MinSeconds))"
+    } elseif (-not $ClipOnly -and $WindowSeconds -lt $MinSeconds) {
+        # ENFORCE-2: the PLAY WINDOW of an evidence run is >= 20 s too -- a 10 s window on a 30 s clip is
+        # still a run that plays less than 20 s of real footage.
+        $out.verdict = 'PLAY_WINDOW_TOO_SHORT'
+        $out.message = "PLAY_WINDOW_TOO_SHORT (window=$(& $fmt $WindowSeconds) required=$(& $fmt $MinSeconds))"
+    } elseif ($len.seconds -lt $MinSeconds) {
         $out.verdict = 'CLIP_TOO_SHORT'
         $out.message = "CLIP_TOO_SHORT (clip=$(& $fmt $len.seconds) window=$(& $fmt $required))"
     } elseif ($remaining -lt $WindowSeconds) {
@@ -279,6 +297,59 @@ function Test-GuiSmokeEnvironmentEntries {
         }
     }
     return $result
+}
+
+function Get-GuiSmokeGateExitCode {
+    # The runner exit code for a Test-GuiSmokeClipLength verdict: 42 for an unknowable length, 41 for every
+    # "too short" verdict (clip or play window). Callers never re-spell the mapping.
+    param([Parameter(Mandatory = $true)][string]$Verdict)
+    if ($Verdict -eq 'CLIP_LENGTH_UNKNOWN') { return 42 }
+    return 41
+}
+
+function Get-GuiSmokeMinPresentedFrames {
+    # The smallest --presented-frames target that still plays the 20 s floor at this frame rate.
+    param([Parameter(Mandatory = $true)][double]$Fps, [double]$MinSeconds = $script:GuiSmokeMinClipSeconds)
+    return [int][Math]::Ceiling($MinSeconds * $Fps)
+}
+
+function Test-GuiSmokeParentEnvironment {
+    <#
+    .SYNOPSIS
+    Refuses an MLVAPP_AUTOPLAY_* variable INHERITED from the parent process environment (a shell that
+    exported one, or a Scheduled Task env block): the app's autoplay hook reads it and Plays whatever clip
+    the launch opens, with no tool-side length gate. -ExtraEnvironment is checked by
+    Test-GuiSmokeEnvironmentEntries; this covers the case where nothing was passed at all.
+    #>
+    param([hashtable]$Environment = $null)
+    $result = [pscustomobject]@{ verdict = 'OK'; option = ''; message = 'OK' }
+    $names = if ($null -ne $Environment) { @($Environment.Keys) }
+             else { @([System.Environment]::GetEnvironmentVariables().Keys) }
+    foreach ($name in $names) {
+        if ([string]$name -match '^(?i)MLVAPP_AUTOPLAY_') {
+            $key = ([string]$name).ToUpperInvariant()
+            $result.verdict = 'PASS_THROUGH_REFUSED'
+            $result.option = $key
+            $result.message = "PASS_THROUGH_REFUSED (env=$key reason=inherited_autoplay_hook_has_no_length_gate)"
+            return $result
+        }
+    }
+    return $result
+}
+
+function Get-GuiSmokeRefusalReason {
+    <#
+    .SYNOPSIS
+    The typed reason token for a runner exit code (41 CLIP_TOO_SHORT or PLAY_WINDOW_TOO_SHORT, 42
+    CLIP_LENGTH_UNKNOWN, 43 INVALID_LOOPED, 44 PASS_THROUGH_REFUSED, 14 the app's own gate), taking the
+    more specific token out of the message when one is given; 'NONE' for every other exit code.
+    #>
+    param([int]$ExitCode, [string]$Message = '')
+    if (@(14, 41, 42, 43, 44) -notcontains $ExitCode) { return 'NONE' }
+    if ($Message -match '(PLAY_WINDOW_TOO_SHORT|CLIP_TOO_SHORT|CLIP_LENGTH_UNKNOWN|INVALID_LOOPED|REPLAY_REFUSED|PASS_THROUGH_REFUSED)') {
+        return $Matches[1]
+    }
+    return "EXIT_$ExitCode"
 }
 
 function Convert-PlaybackLogLineToObject {

@@ -172,31 +172,36 @@ TEST(ContactSheetCaptureWiring, CliWiresTheSeekModeFlag)
         QStringLiteral("options.contactSheetSeekMode = parser.isSet(contactSheetSeekModeOpt);")));
 }
 
-TEST(ContactSheetCaptureWiring, PlaybackModeRestartsPlaybackOnlyAfterTheMeasuredIntervalAndPlaybackStopAndIdleDrain)
+TEST(ContactSheetCaptureWiring, PlaybackModeIsARefusedReplayAndNeverStartsAnotherPlay)
 {
+    // PLAYBACK-CLIP-LENGTH-ENFORCE-2 (owner rule 2026-09-30): the playback-mode contact sheet used to
+    // restart Play (up to 50 times) after the measured interval -- a REPLAY of footage already played. It
+    // now refuses with a typed reason, never arms the capture, and never touches Play or Loop.
     const QString source = readRepoFile(QStringLiteral("platform/qt/MainWindow.cpp"));
     const QString smokeBody = sliceBetween(source,
         QStringLiteral("int MainWindow::runGuiPlaybackSmoke(const GuiPlaybackSmokeOptions & options)"),
         QStringLiteral("void MainWindow::importNewMlv(QString fileName)"));
     ASSERT_FALSE(smokeBody.isEmpty());
+    // The playback-mode (default) branch: from its distinctive first comment line to the DONE-line log.
+    const QString replayBranch = sliceBetween(smokeBody,
+        QStringLiteral("// PLAYBACK-CLIP-LENGTH-ENFORCE-2 (owner rule 2026-09-30): the playback-mode contact sheet is a"),
+        QStringLiteral("QStringLiteral(\"gui_smoke.contact_sheet\"),"));
+    ASSERT_FALSE(replayBranch.isEmpty());
 
-    const int timedLoopAt = smokeBody.indexOf(
-        QStringLiteral("while( playbackClock.elapsed() < durationMs && ui->actionPlay->isChecked() )"));
+    ASSERT_TRUE(replayBranch.contains(QStringLiteral("REPLAY_REFUSED")));
+    ASSERT_TRUE(replayBranch.contains(QStringLiteral("--contact-sheet-seek-mode")));
+    ASSERT_FALSE(replayBranch.contains(QStringLiteral("m_contactSheetCaptureActive = true;")));
+    ASSERT_FALSE(replayBranch.contains(QStringLiteral("actionPlay")));
+    ASSERT_FALSE(replayBranch.contains(QStringLiteral("actionLoop")));
+    ASSERT_FALSE(replayBranch.contains(QStringLiteral("programmaticPlay")));
+    // The restart machinery is gone from the whole smoke body.
+    ASSERT_FALSE(smokeBody.contains(QStringLiteral("contactSheetMaxRestarts")));
+    ASSERT_FALSE(smokeBody.contains(QStringLiteral("gui-smoke-contact-sheet-restart")));
+    // ... and the refusal sits strictly after the measured interval's stop + idle drain.
     const int stopPlaybackAt = smokeBody.indexOf(QStringLiteral("ui->actionPlay->setChecked( false );"));
-    const int idleDrainAt = smokeBody.indexOf(
-        QStringLiteral("for( int attempt = 0; attempt < 400 && m_pRenderThread && !m_pRenderThread->isIdle(); ++attempt )"),
-        stopPlaybackAt);
-    const int captureActiveAt = smokeBody.indexOf(QStringLiteral("m_contactSheetCaptureActive = true;"));
-    const int restartPlayAt = smokeBody.indexOf(QStringLiteral("ui->actionPlay->trigger();"), captureActiveAt);
-
-    ASSERT_TRUE(timedLoopAt >= 0);
-    ASSERT_TRUE(stopPlaybackAt > timedLoopAt);
-    ASSERT_TRUE(idleDrainAt > stopPlaybackAt);
-    // The playback-mode branch (which sets m_contactSheetCaptureActive and then restarts
-    // playback) lives inside the same capture guard as the seek-mode branch, so it too must
-    // sit strictly after the measured interval's stop + idle-drain -- never inside it.
-    ASSERT_TRUE(captureActiveAt > idleDrainAt);
-    ASSERT_TRUE(restartPlayAt > captureActiveAt);
+    const int refusalAt = smokeBody.indexOf(QStringLiteral("REPLAY_REFUSED"));
+    ASSERT_TRUE(stopPlaybackAt >= 0);
+    ASSERT_TRUE(refusalAt > stopPlaybackAt);
 }
 
 TEST(ContactSheetCaptureWiring, PerPresentedFrameHookIsCalledFromTheSameSiteAsPlaybackSmokeTelemetryAndGatedOnItsOwnFlag)
@@ -286,7 +291,7 @@ TEST(ContactSheetCaptureWiring, SeekModeSidecarRecordsPlaybackPathFalse)
     // first statement instead, which only appears after the seek branch's closing brace.
     const QString seekBranch = sliceBetween(smokeBody,
         QStringLiteral("if( options.contactSheetSeekMode )"),
-        QStringLiteral("m_contactSheetCaptureDir = options.contactSheetDir;"));
+        QStringLiteral("// PLAYBACK-CLIP-LENGTH-ENFORCE-2 (owner rule 2026-09-30): the playback-mode contact sheet is a"));
     ASSERT_FALSE(seekBranch.isEmpty());
     ASSERT_TRUE(seekBranch.contains(
         QStringLiteral("frameJson.insert( QStringLiteral(\"playback_path\"), false );")));
@@ -359,7 +364,7 @@ TEST(ContactSheetCaptureWiring, B2_RestartNeverReArmsPlaybackSmokeTelemetryOrSwa
     ASSERT_TRUE(bareCallAt < 0);
 }
 
-TEST(ContactSheetCaptureWiring, H1_RestartSeekIsBoundedByTheRemainingOverallDeadline)
+TEST(ContactSheetCaptureWiring, H1_SeekAndSettleKeepsItsBoundedTimeoutParameterAndNoRestartSeekRemains)
 {
     const QString source = readRepoFile(QStringLiteral("platform/qt/MainWindow.cpp"));
     const QString smokeBody = sliceBetween(source,
@@ -367,25 +372,14 @@ TEST(ContactSheetCaptureWiring, H1_RestartSeekIsBoundedByTheRemainingOverallDead
         QStringLiteral("void MainWindow::importNewMlv(QString fileName)"));
     ASSERT_FALSE(smokeBody.isEmpty());
 
-    // seekAndSettleLoadedClip gained an optional timeoutMs parameter (default 8000, so every
-    // OTHER call site -- the stress seeks, the seek-mode capture -- is unaffected).
+    // seekAndSettleLoadedClip keeps its optional timeoutMs parameter (default 8000) for the stress seeks
+    // and the seek-mode capture; the contact-sheet RESTART call site that used to pass what remained of
+    // the overall deadline is gone with the replay it served (PLAYBACK-CLIP-LENGTH-ENFORCE-2).
     const int lambdaAt = smokeBody.indexOf(QStringLiteral("auto seekAndSettleLoadedClip = [&]("));
     ASSERT_TRUE(lambdaAt >= 0);
     const QString lambdaHeader = smokeBody.mid(lambdaAt, 400);
     ASSERT_TRUE(lambdaHeader.contains(QStringLiteral("int timeoutMs = 8000")));
-
-    // The restart call site passes what remains of contactSheetPlaybackTimeoutMs, clamped to
-    // [1, 8000] -- never its own fixed 8000ms regardless of how much of the pass is left.
-    const int restartsAt = smokeBody.indexOf(QStringLiteral("const int contactSheetMaxRestarts = 50;"));
-    ASSERT_TRUE(restartsAt >= 0);
-    const int restartTimeoutAt = smokeBody.indexOf(
-        QStringLiteral("const qint64 restartSeekTimeoutMs = qBound("), restartsAt);
-    ASSERT_TRUE(restartTimeoutAt > restartsAt);
-    const int restartSeekCallAt = smokeBody.indexOf(
-        QStringLiteral("seekAndSettleLoadedClip(\n                        sheetStartFrame, \"gui-smoke-contact-sheet-restart\","),
-        restartTimeoutAt);
-    ASSERT_TRUE(restartSeekCallAt > restartTimeoutAt);
-    ASSERT_TRUE(smokeBody.indexOf(QStringLiteral("restartSeekTimeoutMs"), restartSeekCallAt) > restartSeekCallAt);
+    ASSERT_FALSE(smokeBody.contains(QStringLiteral("restartSeekTimeoutMs")));
 }
 
 TEST(ContactSheetCaptureWiring, H2_GpuWindowGrabFailureOrSerialMismatchFailsClosedRatherThanFallingBack)
@@ -433,7 +427,7 @@ TEST(ContactSheetCaptureWiring, H3_SidecarPathFieldIsRelativeNeverAbsolute)
     ASSERT_FALSE(smokeBody.isEmpty());
     const QString seekBranch = sliceBetween(smokeBody,
         QStringLiteral("if( options.contactSheetSeekMode )"),
-        QStringLiteral("m_contactSheetCaptureDir = options.contactSheetDir;"));
+        QStringLiteral("// PLAYBACK-CLIP-LENGTH-ENFORCE-2 (owner rule 2026-09-30): the playback-mode contact sheet is a"));
     ASSERT_FALSE(seekBranch.isEmpty());
     ASSERT_TRUE(seekBranch.contains(
         QStringLiteral("frameJson.insert( QStringLiteral(\"path\"), pngRelativeName );")));
@@ -611,54 +605,31 @@ TEST(ContactSheetCaptureWiring, LoopWrapDetectionIsQualifiedByLoopStateAndJumpSi
         QStringLiteral("static_cast<int>( displayFrame ) < m_playbackSmokeLastPresentedFrame")));
 }
 
-TEST(ContactSheetCaptureWiring, PlaybackModeCaptureForcesDropFrameModeOffForTheDurationOfTheReplay)
+TEST(ContactSheetCaptureWiring, PlaybackModeNoLongerTouchesDropFrameModeBecauseThereIsNoReplay)
 {
+    // The drop-frame force-off existed only to make the capture REPLAY deterministic. The replay is gone
+    // (PLAYBACK-CLIP-LENGTH-ENFORCE-2), so nothing in the smoke body toggles drop-frame mode for it.
     const QString source = readRepoFile(QStringLiteral("platform/qt/MainWindow.cpp"));
     const QString smokeBody = sliceBetween(source,
         QStringLiteral("int MainWindow::runGuiPlaybackSmoke(const GuiPlaybackSmokeOptions & options)"),
         QStringLiteral("void MainWindow::importNewMlv(QString fileName)"));
     ASSERT_FALSE(smokeBody.isEmpty());
+    // The playback-mode (default) branch: from its distinctive first comment line to the DONE-line log.
+    const QString replayBranch = sliceBetween(smokeBody,
+        QStringLiteral("// PLAYBACK-CLIP-LENGTH-ENFORCE-2 (owner rule 2026-09-30): the playback-mode contact sheet is a"),
+        QStringLiteral("QStringLiteral(\"gui_smoke.contact_sheet\"),"));
+    ASSERT_FALSE(replayBranch.isEmpty());
 
-    // BLOCKER fix: drop-frame mode must be captured and forced off BEFORE the un-timed capture
-    // while() loop starts (so playbackHandling takes its deterministic, single-frame-advance
-    // branch for the whole replay), and restored to its prior state AFTER the loop and the
-    // idle-drain wait that follows it, before the timeout/error bookkeeping below reads
-    // m_contactSheetCaptureFramesWritten.
-    const int activeAt = smokeBody.indexOf(QStringLiteral("m_contactSheetCaptureActive = true;"));
-    ASSERT_TRUE(activeAt >= 0);
-    const int forceOffAt = smokeBody.indexOf(
-        QStringLiteral("const bool contactSheetDropFrameModeBefore = ui->actionDropFrameMode->isChecked();"),
-        activeAt);
-    ASSERT_TRUE(forceOffAt > activeAt);
-    const int setCheckedFalseAt = smokeBody.indexOf(
-        QStringLiteral("ui->actionDropFrameMode->setChecked( false );"), forceOffAt);
-    ASSERT_TRUE(setCheckedFalseAt > forceOffAt);
-    const int whileLoopAt = smokeBody.indexOf(QStringLiteral("while( m_contactSheetCaptureActive"), setCheckedFalseAt);
-    ASSERT_TRUE(whileLoopAt > setCheckedFalseAt);
-    const int idleDrainAt = smokeBody.indexOf(
-        QStringLiteral("!m_pRenderThread->isIdle();"), whileLoopAt);
-    ASSERT_TRUE(idleDrainAt > whileLoopAt);
-    const int setCheckedTrueAt = smokeBody.indexOf(
-        QStringLiteral("ui->actionDropFrameMode->setChecked( true );"), idleDrainAt);
-    ASSERT_TRUE(setCheckedTrueAt > idleDrainAt);
-    const int errorBookkeepingAt = smokeBody.indexOf(
-        QStringLiteral("if( m_contactSheetCaptureActive && m_contactSheetCaptureError.isEmpty() )"),
-        setCheckedTrueAt);
-    ASSERT_TRUE(errorBookkeepingAt > setCheckedTrueAt);
+    ASSERT_FALSE(replayBranch.contains(QStringLiteral("actionDropFrameMode")));
+    ASSERT_FALSE(smokeBody.contains(QStringLiteral("contactSheetDropFrameModeBefore")));
 
-    // Both the force-off and the restore must be gated on the SAME captured prior state, so a
-    // run that started with drop-frame mode already off never toggles the action at all.
-    ASSERT_TRUE(smokeBody.contains(
-        QStringLiteral("if( contactSheetDropFrameModeBefore )\n            {\n                ui->actionDropFrameMode->setChecked( false );")));
-    ASSERT_TRUE(smokeBody.contains(
-        QStringLiteral("if( contactSheetDropFrameModeBefore )\n            {\n                ui->actionDropFrameMode->setChecked( true );")));
-
-    // The seek-mode branch never plays at all, so it must not be touched by this fix.
+    // The seek-mode branch never plays at all, so it must not be touched by this either.
     const QString seekBranch = sliceBetween(smokeBody,
         QStringLiteral("if( options.contactSheetSeekMode )"),
-        QStringLiteral("m_contactSheetCaptureDir = options.contactSheetDir;"));
+        QStringLiteral("// PLAYBACK-CLIP-LENGTH-ENFORCE-2 (owner rule 2026-09-30): the playback-mode contact sheet is a"));
     ASSERT_FALSE(seekBranch.isEmpty());
     ASSERT_FALSE(seekBranch.contains(QStringLiteral("actionDropFrameMode")));
+    ASSERT_FALSE(seekBranch.contains(QStringLiteral("actionPlay->trigger")));
 }
 
 TEST(ContactSheetCaptureWiring, ContactSheetTargetFramesAreComputedByTheSharedPureHelper)
@@ -738,7 +709,7 @@ TEST(ContactSheetCaptureWiring, PlaybackModeSidecarAndDoneLineCarrySpanStartEndA
     ASSERT_FALSE(smokeBody.isEmpty());
     const QString seekBranch = sliceBetween(smokeBody,
         QStringLiteral("if( options.contactSheetSeekMode )"),
-        QStringLiteral("m_contactSheetCaptureDir = options.contactSheetDir;"));
+        QStringLiteral("// PLAYBACK-CLIP-LENGTH-ENFORCE-2 (owner rule 2026-09-30): the playback-mode contact sheet is a"));
     ASSERT_FALSE(seekBranch.isEmpty());
     ASSERT_TRUE(seekBranch.contains(
         QStringLiteral("frameJson.insert( QStringLiteral(\"span_start\"), sheetStartFrame );")));
@@ -747,10 +718,8 @@ TEST(ContactSheetCaptureWiring, PlaybackModeSidecarAndDoneLineCarrySpanStartEndA
     ASSERT_TRUE(seekBranch.contains(
         QStringLiteral("frameJson.insert( QStringLiteral(\"span_wrapped\"), contactSheetSpanWrapped );")));
 
-    // The else-branch (playback mode setup) must hand the same span down to the member fields
-    // the hook above reads, so both modes really do agree.
-    ASSERT_TRUE(smokeBody.contains(QStringLiteral("m_contactSheetCaptureEndFrame = sheetEndFrame;")));
-    ASSERT_TRUE(smokeBody.contains(QStringLiteral("m_contactSheetCaptureWrapped = contactSheetSpanWrapped;")));
+    // PLAYBACK-CLIP-LENGTH-ENFORCE-2: the playback-mode branch no longer arms the capture (it is a refused
+    // replay), so it hands nothing to the member fields; the hook's stamping above is dormant but intact.
 
     // The job-level DONE line (gui_smoke.contact_sheet) also carries the wrapped flag, so a
     // reader who only has the raw log (not the per-frame sidecars) can still see it.

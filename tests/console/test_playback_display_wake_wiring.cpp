@@ -301,12 +301,15 @@ TEST(PlaybackClipLengthEnforce, SummaryAndGateLinesExportWrappedAndClipLength)
         QStringLiteral("bool MainWindow::primePlaybackCacheOnPlayStart( void )"));
     ASSERT_FALSE(body.isEmpty());
 
-    ASSERT_TRUE(body.indexOf(QStringLiteral("wrapped=%68 total_frames=%69 clip_seconds=%70 wrap_count=%71")) >= 0);
-    ASSERT_TRUE(body.indexOf(QStringLiteral("wrapped=%7 total_frames=%8 clip_seconds=%9 wrap_count=%10")) >= 0);
+    ASSERT_TRUE(body.indexOf(QStringLiteral("wrapped=%68 total_frames=%69 clip_seconds=%70 wrap_count=%71 jump_to_first_count=%72 restart_count=%73")) >= 0);
+    ASSERT_TRUE(body.indexOf(QStringLiteral("wrapped=%7 total_frames=%8 clip_seconds=%9 wrap_count=%10 jump_to_first_count=%11 restart_count=%12")) >= 0);
     // Both lines read the engine wrap recorder (process-cumulative, counted in the engine's own wrap
     // branches), never the presented-frame heuristic alone.
     ASSERT_EQ(2, countOccurrences(body, QStringLiteral(".arg( bool01( m_playbackWrapRecorder.wrapped() ) )")));
-    ASSERT_EQ(2, countOccurrences(body, QStringLiteral(".arg( m_playbackWrapRecorder.engineWraps )")));
+    // PLAYBACK-CLIP-LENGTH-ENFORCE-2: wrap_count = engine wraps + jump-to-first + restarts (any replay).
+    ASSERT_EQ(2, countOccurrences(body, QStringLiteral(".arg( m_playbackWrapRecorder.replayCount() )")));
+    ASSERT_EQ(2, countOccurrences(body, QStringLiteral(".arg( m_playbackWrapRecorder.jumpToFirstCount )")));
+    ASSERT_EQ(2, countOccurrences(body, QStringLiteral(".arg( m_playbackWrapRecorder.restartCount )")));
     ASSERT_EQ(2, countOccurrences(body, QStringLiteral(".arg( smokeClipTotalFrames )")));
     ASSERT_EQ(2, countOccurrences(body, QStringLiteral(".arg( smokeClipSeconds, 0, 'f', 3 )")));
 }

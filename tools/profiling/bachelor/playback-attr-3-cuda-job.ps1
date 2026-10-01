@@ -1906,7 +1906,10 @@ $contactSheetDir = $null
 if ($ContactSheetEnabled) {
     $contactSheetDir = Join-Path $Work 'contact-sheet'
     New-Item -ItemType Directory -Path $contactSheetDir -Force | Out-Null
-    $contactSheetAdditionalArgs = "@('--contact-sheet-dir', $(ConvertTo-PsSingleQuoted $contactSheetDir), '--contact-sheet-frames', '$ContactSheetFrameCount')"
+    # PLAYBACK-CLIP-LENGTH-ENFORCE-2 (owner rule 2026-09-30): ALWAYS seek mode. The app's default
+    # playback-mode contact sheet is a second Play of the measured span (a replay) and is refused
+    # (REPLAY_REFUSED); the seek capture never plays. Its sidecars record playback_path=false.
+    $contactSheetAdditionalArgs = "@('--contact-sheet-dir', $(ConvertTo-PsSingleQuoted $contactSheetDir), '--contact-sheet-frames', '$ContactSheetFrameCount', '--contact-sheet-seek-mode')"
     $cmd = "$cmd -AdditionalArgs $contactSheetAdditionalArgs"
 }
 # CUDA-PERF-DISPLAY-IDENTITY-HARNESS-1/2/3 (sol BLOCKER 2 / fable HARDENING, direction corrected
@@ -2092,11 +2095,21 @@ if ($null -ne $smokeLaunchException -or $smokeRc -ne 0 -or -not (Test-Path -Lite
             -Venue $measurementVenue -ExpectedWidth $expectedDisplayWidth -ExpectedHeight $expectedDisplayHeight `
             -AppSelection $failedSmokeDisplayLog.selection -PreferredResolution $displayPreferResolution
     }
+    # PLAYBACK-CLIP-LENGTH-ENFORCE-2: the TYPED reason a clip-length / loop / replay gate refused (or
+    # invalidated) the run, as its own summary field -- not only a substring of the stderr tail. Exit codes:
+    # 41 CLIP_TOO_SHORT / PLAY_WINDOW_TOO_SHORT, 42 CLIP_LENGTH_UNKNOWN, 43 INVALID_LOOPED, 44
+    # PASS_THROUGH_REFUSED, 14 the app's own play gate (CLIP_TOO_SHORT or REPLAY_REFUSED); NONE otherwise.
+    $smokeRefusalReason = 'NONE'
+    if (@(14, 41, 42, 43, 44) -contains [int]$smokeRc) {
+        $smokeRefusalReason = if ($smokeStderrTail -match '(PLAY_WINDOW_TOO_SHORT|CLIP_TOO_SHORT|CLIP_LENGTH_UNKNOWN|INVALID_LOOPED|REPLAY_REFUSED|PASS_THROUGH_REFUSED)') { $Matches[1] }
+                                else { "EXIT_$([int]$smokeRc)" }
+    }
     $smokeFailure = [ordered]@{
         schema='playback-attr-3-cuda-venue.v1'; result='SMOKE_RUN_FAILED'
         fixtureRehearsal=$FixtureRehearsal
         displayWake=$displayWake
         smokeExitCode=$smokeRc; smokeResultPresent=(Test-Path -LiteralPath $resultPath)
+        smokeRefusalReason=$smokeRefusalReason
         smokeStderrTail=$smokeStderrTail
         smokeLaunchExceptionType=$smokeLaunchExceptionType
         smokeLaunchExceptionMessage=$smokeLaunchExceptionMessage

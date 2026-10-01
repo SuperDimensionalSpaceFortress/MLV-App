@@ -1097,6 +1097,13 @@ private:
     // PLAYBACK-CLIP-LENGTH-ENFORCE-1 round 2: the engine's own wrap count (process-cumulative, never reset:
     // a wrap during a warm-up play is a wrap) -- see playback_frame_range::PlaybackWrapRecorder.
     playback_frame_range::PlaybackWrapRecorder m_playbackWrapRecorder;
+    // PLAYBACK-CLIP-LENGTH-ENFORCE-2: the app-side play gate. One ledger per process: the ONE programmatic
+    // Play admitted (programmaticPlay) and every refusal; m_playStartsInProcess counts every Play start of
+    // any origin so a second start is recorded as a restart (-> INVALID_LOOPED); the message is the last
+    // refusal's path-free text, printed by the caller with its own prefix.
+    playback_frame_range::ProgrammaticPlayLedger m_programmaticPlayLedger;
+    int m_playStartsInProcess = 0;
+    QString m_lastPlayGateRefusalMessage;
     // Contact-sheet capture-during-playback (CUDA-PLAYBACK-CONTACT-SHEET-1 r1b): an un-timed
     // SECOND playback pass, run after the measured interval closes and playback_smoke telemetry
     // has finished, so every grab below is of a genuinely presented playback frame -- never a
@@ -1683,6 +1690,13 @@ private:
     int toolButtonGCurvesCurrentIndex( void );
     void initCutInOut( int frames );
     bool normalizePlaybackCutRangeForLoadedClip( const char *where );
+    // PLAYBACK-CLIP-LENGTH-ENFORCE-2: THE APP IS THE GATE. Every PROGRAMMATIC Play (autoplay hook, profile
+    // exercise modes, GUI-smoke measured Play) goes through programmaticPlay(); user input handlers
+    // (on_actionPlay_triggered, the Loop menu) are never gated. See PlaybackFrameRange.h.
+    playback_frame_range::PlayableWindowVerdict checkPlayableWindow( const char *site, double requestedSeconds );
+    bool programmaticPlay( const char *site, double requestedSeconds );
+    void programmaticStop( const char *site );
+    void forceLoopOffForAutomation( const char *site );
     int normalizePlaybackRequestedFrame( int requestedFrame, const char *where );
     void initRawBlackAndWhite( void );
     double getHorizontalStretchFactor( bool downScale );

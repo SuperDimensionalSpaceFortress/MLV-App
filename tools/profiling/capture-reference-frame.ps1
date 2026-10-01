@@ -47,7 +47,11 @@ param(
     # --presented-frames stops after exactly N FRESH presented frames ("--seconds remains a
     # fail-closed timeout", main.cpp:1193-1198), so the stop point is a frame index rather than a
     # race against machine speed. 0 restores the old time-based behaviour.
-    [int]$PresentedFrames = 24,
+    # ENFORCE-2 (owner rule 2026-09-30): a pinned-frame run plays N presented frames, so N / fps is a PLAY WINDOW
+    # and must reach 20 s: the old default of 24 frames (~1 s) is refused. -1 (the default) = auto: the
+    # smallest N that plays 20 s at the clip's frame rate (ceil(20 * fps), e.g. 480 at 24 fps). 0 = the
+    # time-based capture (-Seconds, >= 20). Any other N below that floor is refused (exit 41).
+    [int]$PresentedFrames = -1,
     # --presented-frames pins the COUNT of presented frames, NOT the timeline position. With
     # drop-frame pacing on, the timeline advances by wall clock, so a slower build reaches a LATER
     # timeline frame by the same count - and two builds then capture different moments while both
@@ -82,13 +86,26 @@ foreach ($k in $ExtraEnv.Keys) { Set-Item -Path ("env:" + $k) -Value ([string]$E
 
 # PLAYBACK-CLIP-LENGTH-ENFORCE-1 (owner rule 2026-09-30): this launches the app directly, so it runs the
 # same clip-length gate run-release-gui-smoke.ps1 does (>= 20 s of footage, window never exceeds it).
-# A pinned-frame capture (-PresentedFrames N) has no wall-clock window (-Seconds is only its fail-closed
-# timeout), so only the 20 s floor applies there. Exit 41 CLIP_TOO_SHORT / 42 CLIP_LENGTH_UNKNOWN.
+# ENFORCE-2: a pinned-frame capture (-PresentedFrames N) plays N frames, so N / fps is its play window and
+# must itself reach 20 s (-Seconds is its fail-closed timeout and the app counts it as the requested window).
+# Exit 41 CLIP_TOO_SHORT / PLAY_WINDOW_TOO_SHORT, 42 CLIP_LENGTH_UNKNOWN, 44 inherited autoplay hook.
 . (Join-Path $PSScriptRoot 'gui-smoke-length-gate.ps1')
-$clipLengthGate = Test-GuiSmokeClipLength -Path $Clip -WindowSeconds $(if ($PresentedFrames -gt 0) { 0 } else { $Seconds })
+# ENFORCE-2: the play window (-Seconds, and N / fps for a pinned frame) is >= 20 s, not only the clip; an
+# MLVAPP_AUTOPLAY_* variable in the parent environment or in -ExtraEnv (plays with no tool gate) is refused.
+foreach ($envGate in @((Test-GuiSmokeParentEnvironment), (Test-GuiSmokeParentEnvironment -Environment $ExtraEnv))) {
+    if ($envGate.verdict -ne 'OK') {
+        Write-Output "CAPTURE: REFUSED - $($envGate.message)"
+        exit 44
+    }
+}
+if ($PresentedFrames -lt 0) {
+    $capturedLength = Get-GuiSmokeClipLength -Path $Clip
+    $PresentedFrames = if ($capturedLength.known) { Get-GuiSmokeMinPresentedFrames -Fps $capturedLength.fps } else { 0 }
+}
+$clipLengthGate = Test-GuiSmokeClipLength -Path $Clip -WindowSeconds $Seconds -TargetPresentedFrames $PresentedFrames
 if ($clipLengthGate.verdict -ne 'OK') {
     Write-Output "CAPTURE: REFUSED - $($clipLengthGate.message)"
-    exit $(if ($clipLengthGate.verdict -eq 'CLIP_TOO_SHORT') { 41 } else { 42 })
+    exit (Get-GuiSmokeGateExitCode -Verdict $clipLengthGate.verdict)
 }
 
 $shot = Join-Path $OutDir 'reference-frame.png'
