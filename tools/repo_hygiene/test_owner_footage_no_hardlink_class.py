@@ -220,6 +220,7 @@ WRITE_PRIMITIVES = (
     r"\bNew-Item\b(?![^\n]*-ItemType\s+Directory)[^\n]*-Force",
     r"\bSet-ItemProperty\b",
     r"\bWriteByte\b",
+    r"\.Write\s*\(",
     r"\.SetLength\s*\(",
     r"(?<![\w$.-])(?:sc|ac|clc|ni|cpi|copy|cp)(?![\w-])\s+-",
 )
@@ -245,8 +246,8 @@ WRITE_ALLOWED = {
     ("AttrCudaOwnerFootage.psm1", "$stream = [IO.File]::Open($targetPath, [IO.FileMode]::CreateNew, [IO.FileAccess]::Write, [IO.FileShare]::None)"):
         "Test-AttrCudaSymlinkCapability: the throwaway 1-byte probe target, created by this call with CreateNew "
         "under a GUID name inside the job's own view directory.",
-    ("AttrCudaOwnerFootage.psm1", "$stream.WriteByte(1)"):
-        "Test-AttrCudaSymlinkCapability: writes the one probe byte to that same CreateNew handle.",
+    ("AttrCudaOwnerFootage.psm1", "$stream.Write($probeBytes, 0, $probeBytes.Length)"):
+        "Test-AttrCudaSymlinkCapability: writes the 4097 probe bytes to that same CreateNew handle.",
     ("AttrCudaOwnerFootage.psm1", "$destStream = [IO.File]::Open($viewPath, [IO.FileMode]::CreateNew, [IO.FileAccess]::Write, [IO.FileShare]::None)"):
         "New-AttrCudaOwnerFootageView (copy mode): the VIEW COPY, created with CreateNew under the neutral name in "
         "the job-private view directory. It is a separate file object with one name; the original is only READ "
@@ -361,6 +362,7 @@ class NoWriteThroughOwnerFootageTests(unittest.TestCase):
             "New-Item -ItemType File -Path $p -Force",
             "$stream.SetLength(0)",
             "$stream.WriteByte(0)",
+            "$stream.Write($bytes, 0, $bytes.Length)",
             "sc -Path $p -Value x",
             "'x' > $p",
             "'x' >> $p",

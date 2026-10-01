@@ -285,10 +285,147 @@ class SymlinkCapabilityProbeTests(_PwshCase):
         directory.mkdir()
         proc = self._probe(directory)
         self.assertEqual(proc.returncode, 0, f"{proc.stdout}\n{proc.stderr}")
-        self.assertRegex(proc.stdout, r"RESULT=(SYMLINK_CAPABLE|SYMLINK_UNAVAILABLE)")
+        self.assertRegex(proc.stdout, r"RESULT=(SYMLINK_CAPABLE|SYMLINK_UNAVAILABLE|SYMLINK_LENGTH_UNRELIABLE)")
         self.assertEqual(list(directory.iterdir()), [])
         capable = "RESULT=SYMLINK_CAPABLE" in proc.stdout
         self.assertEqual("CAPABLE=True" in proc.stdout, capable)
+
+
+@requires_pwsh
+class SymlinkViewTests(_PwshCase):
+    """The symlink arm, exercised directly on the module functions wherever the host may create a
+    symbolic link (Developer Mode or elevated: bachelor, the Windows CI runners). Skipped elsewhere --
+    the development host (Virtual-Ten) is one of those, so these are proven by CI, not locally.
+
+    They deliberately do NOT go through the attribution job's capability probe: that probe also
+    requires Get-Item .Length to follow a link (SYMLINK_LENGTH_UNRELIABLE otherwise), and the job then
+    takes the copy path. What these prove is the part that has to be right whenever a symlink view IS
+    built: identity of the link vs its target, link-only delete, detection of a swapped link."""
+
+    def setUp(self) -> None:
+        super().setUp()
+        probe_target = self.tmp / "raw-probe-target.bin"
+        probe_target.write_bytes(b"x")
+        try:
+            os.symlink(probe_target, self.tmp / "raw-probe-link.bin")
+        except (OSError, NotImplementedError):
+            self.skipTest("this host cannot create a symbolic link (no Developer Mode, not elevated)")
+
+    def _fields(self, name: str, path: Path, follow: bool = False) -> dict:
+        proc = self.run_with_module(
+            f"$id = Get-AttrCudaFileId -Path '{path}'{' -FollowLinks' if follow else ''}\n"
+            "[pscustomobject]@{ VolumeSerialNumber = $id.VolumeSerialNumber; FileIndexHigh = $id.FileIndexHigh; "
+            "FileIndexLow = $id.FileIndexLow; NumberOfLinks = $id.NumberOfLinks; IsReparsePoint = $id.IsReparsePoint } "
+            "| ConvertTo-Json -Compress\n",
+            name=name,
+        )
+        self.assertEqual(proc.returncode, 0, f"{proc.stdout}\n{proc.stderr}")
+        return json.loads(proc.stdout.strip().splitlines()[-1])
+
+    def test_the_identity_reader_reports_the_link_itself_by_default_and_the_target_when_followed(self) -> None:
+        target = self.tmp / "target.bin"
+        target.write_bytes(PAYLOAD)
+        link = self.tmp / "link.bin"
+        os.symlink(target, link)
+        target_id = self._fields("id-target.ps1", target)
+        link_id = self._fields("id-link.ps1", link)
+        followed = self._fields("id-followed.ps1", link, follow=True)
+        self.assertTrue(link_id["IsReparsePoint"])
+        self.assertFalse(target_id["IsReparsePoint"])
+        self.assertEqual(link_id["NumberOfLinks"], 1)
+        self.assertEqual(target_id["NumberOfLinks"], 1)
+        self.assertNotEqual((link_id["FileIndexHigh"], link_id["FileIndexLow"]), (target_id["FileIndexHigh"], target_id["FileIndexLow"]))
+        self.assertEqual(
+            (followed["VolumeSerialNumber"], followed["FileIndexHigh"], followed["FileIndexLow"]),
+            (target_id["VolumeSerialNumber"], target_id["FileIndexHigh"], target_id["FileIndexLow"]))
+
+    def test_a_symlink_is_deleted_as_itself_and_its_target_survives(self) -> None:
+        target = self.tmp / "owner-original.bin"
+        target.write_bytes(PAYLOAD)
+        link = self.tmp / "view-link.bin"
+        os.symlink(target, link)
+        link_id = self._fields("del-link-id.ps1", link)
+        # Asked to delete a non-link name, a link is refused...
+        proc = self.run_with_module(
+            f"Write-Output ('TOKEN=' + (Remove-AttrCudaFileById -Path '{link}' -FileId ({_id_literal(link_id)})))\n")
+        self.assertIn("TOKEN=LEFT_NOT_A_FILE", proc.stdout, f"{proc.stdout}\n{proc.stderr}")
+        self.assertTrue(link.is_symlink())
+        # ...and asked to delete a link it expects, only the link goes.
+        proc = self.run_with_module(
+            f"Write-Output ('TOKEN=' + (Remove-AttrCudaFileById -Path '{link}' -FileId ({_id_literal(link_id)}) -ExpectReparsePoint))\n")
+        self.assertIn("TOKEN=DELETED", proc.stdout, f"{proc.stdout}\n{proc.stderr}")
+        self.assertFalse(os.path.lexists(link))
+        self.assertEqual(target.read_bytes(), PAYLOAD)
+        self.assertEqual(os.stat(target).st_nlink, 1)
+
+    def test_a_link_swapped_for_another_link_is_left_by_the_identity_check(self) -> None:
+        owner_original = self.tmp / "owner-original.bin"
+        owner_original.write_bytes(PAYLOAD)
+        decoy = self.tmp / "decoy.bin"
+        decoy.write_bytes(b"decoy")
+        link = self.tmp / "view-link.bin"
+        os.symlink(decoy, link)
+        recorded = self._fields("swap-link-id.ps1", link)
+        os.remove(link)
+        os.symlink(owner_original, link)
+        proc = self.run_with_module(
+            f"Write-Output ('TOKEN=' + (Remove-AttrCudaFileById -Path '{link}' -FileId ({_id_literal(recorded)}) -ExpectReparsePoint))\n")
+        self.assertIn("TOKEN=LEFT_ID_MISMATCH", proc.stdout, f"{proc.stdout}\n{proc.stderr}")
+        self.assertTrue(link.is_symlink())
+        self.assertEqual(owner_original.read_bytes(), PAYLOAD)
+
+    def test_a_symlink_view_is_built_checked_detected_when_swapped_and_removed_as_itself(self) -> None:
+        base_extension = "." + "MLV"
+        source_dir = self.tmp / "owner"
+        source_dir.mkdir()
+        original = source_dir / ("source" + base_extension)
+        original.write_bytes(PAYLOAD)
+        decoy = self.tmp / "decoy.bin"
+        decoy.write_bytes(b"decoy")
+        directory = self.tmp / "view-dir"
+        directory.mkdir()
+        view_path = directory / ("owner-" + "clip" + base_extension)
+        script = self.tmp / "symlink-view-roundtrip.ps1"
+        script.write_text(
+            "$ErrorActionPreference = 'Stop'\n"
+            f"Import-Module '{MODULE}' -Force\n"
+            f"Import-Module '{OWNER_FOOTAGE_MODULE}' -Force\n"
+            f"$pin = Open-AttrCudaReadOnlyHandle -Path '{original}'\n"
+            f"$view = New-AttrCudaOwnerFootageView -Directory '{directory}' -Index 0 -SourcePath '{original}' -PinStream $pin -Mode symlink\n"
+            "Write-Output ('MODE=' + $view.Mode)\n"
+            "try { Assert-AttrCudaOwnerFootageViewsIntact -Views @($view); Write-Output 'INTACT' } catch { Write-Output ('THREW ' + $_.Exception.Message) }\n"
+            # The held view handle makes a swap of the link refused where the OS enforces it; a swap that
+            # still lands is DETECTED. Report which, then verify the record either way.
+            f"try {{ [IO.File]::Delete('{view_path}'); Write-Output 'LINK_DELETE_ALLOWED' }} catch {{ Write-Output 'LINK_DELETE_REFUSED' }}\n"
+            "Close-AttrCudaOwnerFootageWorkspace -Handles @($view.ViewStream, $pin) -Views @($view)\n",
+            encoding="utf-8",
+        )
+        proc = _run_pwsh_file(script)
+        self.assertEqual(proc.returncode, 0, f"{proc.stdout}\n{proc.stderr}")
+        self.assertIn("MODE=symlink", proc.stdout)
+        self.assertEqual(proc.stdout.splitlines()[1].strip(), "INTACT", proc.stdout)
+        # Whatever happened to the link, the owner's original is untouched and has exactly one name.
+        self.assertEqual(original.read_bytes(), PAYLOAD)
+        self.assertEqual(os.stat(original).st_nlink, 1)
+        # Close removed the link (by identity) or it was already deleted by the probe above.
+        self.assertFalse(os.path.lexists(view_path), proc.stdout)
+
+    def test_a_leftover_symlink_from_a_killed_run_is_cleared_without_touching_its_target(self) -> None:
+        base_extension = "." + "MLV"
+        original = self.tmp / "owner-original.bin"
+        original.write_bytes(PAYLOAD)
+        directory = self.tmp / "owner-leftover-links"
+        directory.mkdir()
+        leftover = directory / ("owner-" + "clip" + base_extension)
+        os.symlink(original, leftover)
+        proc = self.run_with_module(
+            f"$left = @(Clear-AttrCudaOwnerFootageLeftovers -Directory '{directory}' -WarningAction SilentlyContinue)\n"
+            "Write-Output ('LEFT=' + ($left -join ','))\n")
+        self.assertEqual(proc.returncode, 0, f"{proc.stdout}\n{proc.stderr}")
+        self.assertTrue(proc.stdout.strip().endswith("LEFT="), proc.stdout)
+        self.assertFalse(os.path.lexists(leftover))
+        self.assertEqual(original.read_bytes(), PAYLOAD)
+        self.assertEqual(os.stat(original).st_nlink, 1)
 
 
 if __name__ == "__main__":

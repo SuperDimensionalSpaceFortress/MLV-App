@@ -213,9 +213,16 @@ the mechanism, not by narrowing another check:
    completion ledger's own temp-file publish, which never sees a footage path).
 2. **Each view is a file symbolic link where the venue can create one, else a verified byte copy.**
    The job asks, at run time, with a typed probe (`Test-AttrCudaSymlinkCapability`: create a
-   symlink to a throwaway file, read a byte back through it; `SYMLINK_CAPABLE` or
-   `SYMLINK_UNAVAILABLE`). Measured 2026-09-30: bachelor can (Developer Mode, non-admin agent);
-   ultra-magnus cannot (not elevated, no Developer Mode) and takes the copy path. A symlink is only
+   symlink to a throwaway file, read it back through it, and check that `(Get-Item).Length`
+   through the link is the target's length: `SYMLINK_CAPABLE`, `SYMLINK_UNAVAILABLE` or
+   `SYMLINK_LENGTH_UNRELIABLE`). Measured 2026-09-30: bachelor can create one (Developer Mode,
+   non-admin agent); ultra-magnus cannot (not elevated, no Developer Mode) and takes the copy
+   path. `SYMLINK_LENGTH_UNRELIABLE` was found by Windows CI on the first push: on PowerShell 7
+   `(Get-Item <symlink>).Length` is the LINK's own size, and both `Test-AttrCudaFootagePart` and the
+   smoke runner's clip-part binding read exactly that, so a symlink view failed the length check
+   (`LENGTH_MISMATCH`) and would have recorded a wrong length as launch evidence. A host whose
+   PowerShell reports the link's size therefore takes the copy path until those two readers are
+   made link-aware (follow-up card); where Length follows the link, the symlink is used. A symlink is only
    a pointer -- deleting it by any route removes the link, never the target's bytes. A copy is a
    separate file object with one name -- deleting it is harmless -- created with
    `FileMode.CreateNew`, hash-verified against the consent/stage record before use, refused up

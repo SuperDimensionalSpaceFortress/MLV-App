@@ -32,8 +32,18 @@
     },
     {
       "source": "AttrCudaOwnerFootage.psm1",
+      "function": "Test-AttrCudaSymlinkCapability",
+      "line": 437,
+      "kind": "cmdlet",
+      "name": "Get-Item",
+      "text": "Get-Item -LiteralPath $linkPath -Force",
+      "disposition": "job-private-temp",
+      "note": "the throwaway probe: a GUID-named 4097-byte target created by this call with FileMode.CreateNew inside the job-private view directory, a symlink to it created beside it, and metadata / read-back through that link; both names are removed by identity (Remove-AttrCudaFileById). It is never an owner original or a view entry"
+    },
+    {
+      "source": "AttrCudaOwnerFootage.psm1",
       "function": "Clear-AttrCudaOwnerFootageLeftovers",
-      "line": 652,
+      "line": 670,
       "kind": "cmdlet",
       "name": "Get-ChildItem",
       "text": "Get-ChildItem -LiteralPath $Directory -Force -ErrorAction SilentlyContinue",
@@ -123,20 +133,20 @@
     {
       "source": "AttrCudaOwnerFootage.psm1",
       "function": "Send-AttrCudaOwnerFootagePartToStaging",
-      "line": 182,
-      "kind": "cmdlet",
-      "name": "New-Item",
-      "text": "New-Item -ItemType Directory -Path $StagingDirectory -Force -ErrorAction Stop",
-      "disposition": "boundary-root-asserted",
-      "note": "StagingDirectory already asserted above"
-    },
-    {
-      "source": "AttrCudaOwnerFootage.psm1",
-      "function": "Send-AttrCudaOwnerFootagePartToStaging",
       "line": 269,
       "kind": "instance-method",
       "name": "Dispose",
       "text": "$sourceStream.Dispose()",
+      "disposition": "boundary-root-asserted",
+      "note": "releases a stream opened from the already-asserted StagingDirectory"
+    },
+    {
+      "source": "AttrCudaOwnerFootage.psm1",
+      "function": "Send-AttrCudaOwnerFootagePartToStaging",
+      "line": 270,
+      "kind": "instance-method",
+      "name": "Dispose",
+      "text": "$destStream.Dispose()",
       "disposition": "boundary-root-asserted",
       "note": "releases a stream opened from the already-asserted StagingDirectory"
     },
@@ -153,47 +163,47 @@
     {
       "source": "AttrCudaOwnerFootage.psm1",
       "function": "Test-AttrCudaSymlinkCapability",
-      "line": 403,
+      "line": 411,
       "kind": "static-method",
       "name": "Open",
       "text": "[IO.File]::Open($targetPath, [IO.FileMode]::CreateNew, [IO.FileAccess]::Write, [IO.FileShare]::None)",
       "disposition": "job-private-temp",
-      "note": "the throwaway probe target: a GUID-named file created by this call with FileMode.CreateNew inside the job-private view directory, written one byte, then removed by identity; it is never an owner original or a view entry"
+      "note": "the throwaway probe: a GUID-named 4097-byte target created by this call with FileMode.CreateNew inside the job-private view directory, a symlink to it created beside it, and metadata / read-back through that link; both names are removed by identity (Remove-AttrCudaFileById). It is never an owner original or a view entry"
     },
     {
       "source": "AttrCudaOwnerFootage.psm1",
       "function": "Test-AttrCudaSymlinkCapability",
-      "line": 405,
+      "line": 417,
       "kind": "instance-method",
-      "name": "WriteByte",
-      "text": "$stream.WriteByte(1)",
+      "name": "Write",
+      "text": "$stream.Write($probeBytes, 0, $probeBytes.Length)",
       "disposition": "job-private-temp",
-      "note": "the throwaway probe target: a GUID-named file created by this call with FileMode.CreateNew inside the job-private view directory, written one byte, then removed by identity; it is never an owner original or a view entry"
+      "note": "the throwaway probe: a GUID-named 4097-byte target created by this call with FileMode.CreateNew inside the job-private view directory, a symlink to it created beside it, and metadata / read-back through that link; both names are removed by identity (Remove-AttrCudaFileById). It is never an owner original or a view entry"
     },
     {
       "source": "AttrCudaOwnerFootage.psm1",
       "function": "Test-AttrCudaSymlinkCapability",
-      "line": 406,
-      "kind": "instance-method",
-      "name": "Dispose",
-      "text": "$stream.Dispose()",
-      "disposition": "job-private-temp",
-      "note": "the throwaway probe target: a GUID-named file created by this call with FileMode.CreateNew inside the job-private view directory, written one byte, then removed by identity; it is never an owner original or a view entry"
-    },
-    {
-      "source": "AttrCudaOwnerFootage.psm1",
-      "function": "Test-AttrCudaSymlinkCapability",
-      "line": 426,
+      "line": 418,
       "kind": "instance-method",
       "name": "Dispose",
       "text": "$stream.Dispose()",
       "disposition": "job-private-temp",
-      "note": "the throwaway probe target: a GUID-named file created by this call with FileMode.CreateNew inside the job-private view directory, written one byte, then removed by identity; it is never an owner original or a view entry"
+      "note": "the throwaway probe: a GUID-named 4097-byte target created by this call with FileMode.CreateNew inside the job-private view directory, a symlink to it created beside it, and metadata / read-back through that link; both names are removed by identity (Remove-AttrCudaFileById). It is never an owner original or a view entry"
+    },
+    {
+      "source": "AttrCudaOwnerFootage.psm1",
+      "function": "Test-AttrCudaSymlinkCapability",
+      "line": 444,
+      "kind": "instance-method",
+      "name": "Dispose",
+      "text": "$stream.Dispose()",
+      "disposition": "job-private-temp",
+      "note": "the throwaway probe: a GUID-named 4097-byte target created by this call with FileMode.CreateNew inside the job-private view directory, a symlink to it created beside it, and metadata / read-back through that link; both names are removed by identity (Remove-AttrCudaFileById). It is never an owner original or a view entry"
     },
     {
       "source": "AttrCudaOwnerFootage.psm1",
       "function": "Open-AttrCudaReadOnlyHandle",
-      "line": 447,
+      "line": 465,
       "kind": "static-method",
       "name": "Open",
       "text": "[IO.File]::Open($Path, [IO.FileMode]::Open, [IO.FileAccess]::Read, [IO.FileShare]::Read)",
@@ -203,7 +213,7 @@
     {
       "source": "AttrCudaOwnerFootage.psm1",
       "function": "New-AttrCudaOwnerFootageView",
-      "line": 533,
+      "line": 551,
       "kind": "static-method",
       "name": "Open",
       "text": "[IO.File]::Open($viewPath, [IO.FileMode]::CreateNew, [IO.FileAccess]::Write, [IO.FileShare]::None)",
@@ -213,7 +223,7 @@
     {
       "source": "AttrCudaOwnerFootage.psm1",
       "function": "New-AttrCudaOwnerFootageView",
-      "line": 537,
+      "line": 555,
       "kind": "instance-method",
       "name": "CopyTo",
       "text": "$PinStream.CopyTo($destStream, 4194304)",
@@ -223,7 +233,7 @@
     {
       "source": "AttrCudaOwnerFootage.psm1",
       "function": "New-AttrCudaOwnerFootageView",
-      "line": 538,
+      "line": 556,
       "kind": "instance-method",
       "name": "Flush",
       "text": "$destStream.Flush($true)",
@@ -233,7 +243,7 @@
     {
       "source": "AttrCudaOwnerFootage.psm1",
       "function": "New-AttrCudaOwnerFootageView",
-      "line": 539,
+      "line": 557,
       "kind": "instance-method",
       "name": "Dispose",
       "text": "$destStream.Dispose()",
@@ -243,7 +253,7 @@
     {
       "source": "AttrCudaOwnerFootage.psm1",
       "function": "New-AttrCudaOwnerFootageView",
-      "line": 556,
+      "line": 574,
       "kind": "instance-method",
       "name": "Dispose",
       "text": "$viewStream.Dispose()",
@@ -253,7 +263,17 @@
     {
       "source": "AttrCudaOwnerFootage.psm1",
       "function": "Send-AttrCudaOwnerFootagePartToStaging",
-      "line": 270,
+      "line": 182,
+      "kind": "cmdlet",
+      "name": "New-Item",
+      "text": "New-Item -ItemType Directory -Path $StagingDirectory -Force -ErrorAction Stop",
+      "disposition": "boundary-root-asserted",
+      "note": "StagingDirectory already asserted above"
+    },
+    {
+      "source": "AttrCudaOwnerFootage.psm1",
+      "function": "New-AttrCudaOwnerFootageView",
+      "line": 575,
       "kind": "instance-method",
       "name": "Dispose",
       "text": "$destStream.Dispose()",
@@ -269,16 +289,6 @@
       "text": "Test-Path -LiteralPath $StagingDirectory -PathType Container -ErrorAction Stop",
       "disposition": "boundary-root-asserted",
       "note": "runs only after StagingDirectory = Assert-AttrCudaNoLinkBelowRoot(...) succeeded at the top of this function"
-    },
-    {
-      "source": "Attr3FootagePresenceJob.psm1",
-      "function": "New-Attr3FootagePresenceJob",
-      "line": 301,
-      "kind": "static-method",
-      "name": "WriteAllText",
-      "text": "[IO.File]::WriteAllText($jobPath, $text, [Text.UTF8Encoding]::new($false))",
-      "disposition": "job-private-temp",
-      "note": "jobPath is under the job-private OutDir"
     },
     {
       "source": "Attr3FootagePresenceJob.psm1",
@@ -541,19 +551,19 @@
       "note": "OutDir is a fresh per-run temp directory this run creates itself"
     },
     {
-      "source": "AttrCudaOwnerFootage.psm1",
-      "function": "New-AttrCudaOwnerFootageView",
-      "line": 557,
-      "kind": "instance-method",
-      "name": "Dispose",
-      "text": "$destStream.Dispose()",
-      "disposition": "boundary-root-asserted",
-      "note": "releases a stream opened from the already-asserted StagingDirectory"
+      "source": "Attr3FootagePresenceJob.psm1",
+      "function": "New-Attr3FootagePresenceJob",
+      "line": 301,
+      "kind": "static-method",
+      "name": "WriteAllText",
+      "text": "[IO.File]::WriteAllText($jobPath, $text, [Text.UTF8Encoding]::new($false))",
+      "disposition": "job-private-temp",
+      "note": "jobPath is under the job-private OutDir"
     },
     {
       "source": "AttrCudaOwnerFootage.psm1",
       "function": "Close-AttrCudaOwnerFootageWorkspace",
-      "line": 692,
+      "line": 710,
       "kind": "instance-method",
       "name": "Dispose",
       "text": "$handle.Dispose()",

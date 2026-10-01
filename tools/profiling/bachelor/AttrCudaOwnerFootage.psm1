@@ -377,17 +377,25 @@ function New-AttrCudaFileSymlink {
 function Test-AttrCudaSymlinkCapability {
     <#
     .SYNOPSIS
-    Typed run-time probe: can THIS process create a file symbolic link in -Directory, and does it
-    resolve back to its target? Returns { Capable; Result } with Result SYMLINK_CAPABLE or
-    SYMLINK_UNAVAILABLE. Never throws.
+    Typed run-time probe: can THIS process create a file symbolic link in -Directory, does it
+    resolve back to its target, and does the file-length view the smoke runner uses (Get-Item
+    .Length) report the TARGET's length through it? Returns { Capable; Result } with Result
+    SYMLINK_CAPABLE, SYMLINK_UNAVAILABLE or SYMLINK_LENGTH_UNRELIABLE. Never throws.
     .DESCRIPTION
     OWNER-FOOTAGE-NO-HARDLINK-1. Creating a symbolic link needs either an elevated token or
     Developer Mode; which a venue has is a fact about the venue, so it is asked, not assumed
-    (measured 2026-09-30: bachelor can, ultra-magnus cannot). The probe links a throwaway file this
-    call created itself, proves the link is a reparse point whose followed identity equals the
-    target's and that one byte reads back through it, then removes both names through the
-    identity-checked primitive -- a name that is no longer the object the probe created is left
-    where it is. Nothing here ever names owner footage.
+    (measured 2026-09-30: bachelor can create one, ultra-magnus cannot). The probe links a
+    throwaway file this call created itself, proves the link is a reparse point whose followed
+    identity equals the target's and that its bytes read back through it, then removes both names
+    through the identity-checked primitive -- a name that is no longer the object the probe created
+    is left where it is. Nothing here ever names owner footage.
+    SYMLINK_LENGTH_UNRELIABLE (found by CI on the first push, not by inspection): on PowerShell 7
+    `(Get-Item <symlink>).Length` is the LINK's own size, not the target's. Test-AttrCudaFootagePart
+    and the smoke runner's clip-part binding both read exactly that property, so a symlink view
+    fails the length check (`LENGTH_MISMATCH`) and would record a wrong length as launch evidence.
+    A venue whose PowerShell reports the link's size therefore takes the copy path -- still never a
+    hard link -- until those two readers are made link-aware; where Length follows the link the
+    probe says SYMLINK_CAPABLE and the symlink is used.
     #>
     [CmdletBinding()]
     param([Parameter(Mandatory = $true)][string]$Directory)
@@ -402,7 +410,11 @@ function Test-AttrCudaSymlinkCapability {
     try {
         $stream = [IO.File]::Open($targetPath, [IO.FileMode]::CreateNew, [IO.FileAccess]::Write, [IO.FileShare]::None)
         $targetId = Get-AttrCudaFileId -Stream $stream
-        $stream.WriteByte(1)
+        # 4097 bytes of 0x01: longer than any symlink's own reparse-data size, so a length that
+        # follows the link and one that does not cannot coincide.
+        $probeBytes = New-Object byte[] 4097
+        for ($i = 0; $i -lt $probeBytes.Length; $i++) { $probeBytes[$i] = 1 }
+        $stream.Write($probeBytes, 0, $probeBytes.Length)
         $stream.Dispose()
         $stream = $null
 
@@ -414,10 +426,16 @@ function Test-AttrCudaSymlinkCapability {
             $followed.FileIndexHigh -eq $targetId.FileIndexHigh -and
             $followed.FileIndexLow -eq $targetId.FileIndexLow) {
             $reader = [IO.File]::OpenRead($linkPath)
+            $readable = $false
             try {
-                if ($reader.ReadByte() -eq 1) { $result = 'SYMLINK_CAPABLE' }
+                $readable = ($reader.Length -eq $probeBytes.Length -and $reader.ReadByte() -eq 1)
             } finally {
                 $reader.Dispose()
+            }
+            if ($readable) {
+                # The length the smoke runner and Test-AttrCudaFootagePart see: Get-Item .Length.
+                $seenLength = (Get-Item -LiteralPath $linkPath -Force).Length
+                $result = if ($seenLength -eq $probeBytes.Length) { 'SYMLINK_CAPABLE' } else { 'SYMLINK_LENGTH_UNRELIABLE' }
             }
         }
     } catch {
