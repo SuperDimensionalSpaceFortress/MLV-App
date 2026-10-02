@@ -1,0 +1,37 @@
+{
+  "schema": "mlv-app/dual-venue-venues/v1",
+  "venues": {
+    "bachelor": {
+      "agentShare": "\\\\bachelor\\mlv-agent",
+      "agentRoot": "C:\\mlvtmp\\mlv-agent",
+      "scratchRoot": "C:\\mlvtmp",
+      "expectedHost": "BACHELOR",
+      "health": {
+        "maxPwshColdStartMs": 3000,
+        "maxSmallHashMs": 500,
+        "minFreeDiskGiB": 20,
+        "maxCommitUsedFraction": 0.9
+      }
+    },
+    "ultra-magnus": {
+      "agentShare": "\\\\Ultra-Magnus\\g\\Temp\\mlv-gpu-profile\\agent",
+      "agentRoot": "G:\\Temp\\mlv-gpu-profile\\agent",
+      "scratchRoot": "G:\\Temp\\mlv-gpu-profile",
+      "expectedHost": "ULTRA-MAGNUS",
+      "health": {
+        "maxPwshColdStartMs": 3000,
+        "maxSmallHashMs": 500,
+        "minFreeDiskGiB": 20,
+        "maxCommitUsedFraction": 0.9
+      }
+    }
+  },
+  "roles": {
+    "PLAYBACK-HFR-CONFORM-DEFAULT-1": { "bachelor": "acceptance", "ultra-magnus": "supplementary" }
+  },
+  "defaultRole": "supplementary",
+  "ownerFootage": {
+    "cleanupClassGone": false,
+    "refusal": "OWNER_CLIP_REFUSED_PENDING_CROSS_VOLUME_2"
+  }
+}

@@ -275,6 +275,56 @@ param(
     [ValidateRange(0, 7200)]
     [int]$PostRunSeconds = 0,
 
+    # DUAL-VENUE-EVIDENCE-1 (C1). Which measurement host this job is authored for. 'bachelor' (the
+    # default) is today's behaviour: the emitted job is BYTE-IDENTICAL to what this generator
+    # produced before this card, for every argument set that does not name one of the parameters
+    # below (pinned by test_dual_venue_evidence.py against the pre-card generator). 'ultra-magnus'
+    # keys -AgentRoot and the job's scratch-root safety floor from tools/profiling/dual-venue/
+    # venues.json (the tracked venue table) instead of the bachelor literals, and bakes a
+    # run-time P6 check into the job: the declared venue must agree with
+    # Get-AttrCudaMeasurementVenue on the host that runs it, else the typed terminal
+    # VENUE_HOST_MISMATCH (exit 29) -- a disagreement is a refusal, never a recorded note. A
+    # bachelor job carries no such in-job check (that would change its bytes); Invoke-VenueLeg.ps1
+    # performs the same comparison from the health probe before it submits anything, and again on
+    # the job's own display block afterwards.
+    [ValidateSet('bachelor', 'ultra-magnus')]
+    [string]$Venue = 'bachelor',
+
+    # DUAL-VENUE-EVIDENCE-1 (C1): the CPU-quiescence bar (percent busy TIME) the leg samples
+    # against; was an inline literal 20.0. The default reproduces today's text exactly.
+    [ValidateRange(0.1, 100.0)]
+    [double]$CpuQuiescenceThresholdPercent = 20.0,
+
+    # DUAL-VENUE-EVIDENCE-1 (C1): the scale passed to run-release-gui-smoke.ps1's -ScaleFactor and
+    # recorded in the evidence manifest; was an inline literal 4 (the shipping default).
+    [ValidateRange(1, 16)]
+    [int]$ScaleFactor = 4,
+
+    # DUAL-VENUE-EVIDENCE-1, AMENDMENT 1 A1. 'cuda' (default) is byte-identical to today. 'cpu'
+    # omits every MLVAPP_GPU_* / MLVAPP_EXPERIMENTAL_GPU_* env (and the GL-window/viewport ones
+    # that only serve the GPU path), requires CPU_FRAMES > 0 and GPU frames == 0 (a leg that
+    # reached a GPU path is CPU_BACKEND_PATH_MISMATCH, exit 28), never fires exit 13/14 (those
+    # stay CUDA-only), and treats PresentMon as informational. CPU frame rate is INFORMATIONAL.
+    [ValidateSet('cuda', 'cpu')]
+    [string]$Backend = 'cuda',
+
+    # DUAL-VENUE-EVIDENCE-1, AMENDMENT 1 A2: FORCE Look Assist on for this leg instead of
+    # inheriting whatever the venue's persisted QSettings say. The job disables the venue's
+    # "use default receipt" setting (which could otherwise reset Look Assist off) before the app
+    # launches and runs the smoke runner with -RequireLookAssist:$true, which fails the leg closed
+    # if Look Assist did not settle and apply. Used by LOOK legs (with -ContactSheet).
+    [switch]$ForceLookAssist,
+
+    # DUAL-VENUE-EVIDENCE-1, AMENDMENT 2: the Look Assist flavor a LOOK leg asks for. Passed to the
+    # app as MLVAPP_LOOK_ASSIST_FLAVOR. The app does not read it yet (LOOK-ASSIST-FLAVORS-1 adds
+    # that), so every receipt records lookFlavorHonored=unknown -- never a claim that it applied.
+    # Only emitted for a LOOK leg (-ForceLookAssist); the default 'classic' adds nothing.
+    [ValidateSet('classic', 'cinematic')]
+    [string]$LookFlavor = 'classic',
+
+    # Test seam: the venue table to read instead of tools/profiling/dual-venue/venues.json.
+    [string]$VenueTablePath = '',
+
     # PLAYBACK-CLIP-LENGTH-ENFORCE-1 (owner rule 2026-09-30): the settled-playback window the emitted
     # job passes to run-release-gui-smoke.ps1 as -Seconds (it used to be a hard-coded 40). The
     # runner refuses, before launching, any clip shorter than max(20, this); a fixture id is refused
@@ -285,6 +335,41 @@ param(
 )
 
 $ErrorActionPreference = 'Stop'
+
+# DUAL-VENUE-EVIDENCE-1 (C1). The venue-keyed agent root and scratch root. 'bachelor' never reads
+# the table (its values ARE today's literals, and the test suite pins venues.json to them), so the
+# default path performs no extra I/O and stays byte-identical; 'ultra-magnus' reads it.
+$DefaultAgentRoot = 'C:\mlvtmp\mlv-agent'
+$DefaultScratchRoot = 'C:\mlvtmp'
+function Get-DualVenueEntry([string]$VenueName) {
+    $tablePath = if ([string]::IsNullOrWhiteSpace($VenueTablePath)) { Join-Path $PSScriptRoot '..\dual-venue\venues.json' } else { $VenueTablePath }
+    if (-not (Test-Path -LiteralPath $tablePath -PathType Leaf)) {
+        throw 'DUAL_VENUE_TABLE_MISSING the venue table (tools/profiling/dual-venue/venues.json) was not found'
+    }
+    $table = [IO.File]::ReadAllText($tablePath) | ConvertFrom-Json
+    $entry = $table.venues.$VenueName
+    if ($null -eq $entry) { throw "DUAL_VENUE_UNKNOWN_VENUE the venue table has no entry for '$VenueName'" }
+    $entry
+}
+$venueAgentRoot = $DefaultAgentRoot
+$venueScratchRoot = $DefaultScratchRoot
+$venueExpectedHost = 'BACHELOR'
+$agentRootWasBound = $PSBoundParameters.ContainsKey('AgentRoot')
+function Resolve-DualVenueRoots {
+    if ($Venue -eq 'bachelor') { return }
+    $entry = Get-DualVenueEntry -VenueName $Venue
+    $script:venueAgentRoot = [string]$entry.agentRoot
+    $script:venueScratchRoot = [string]$entry.scratchRoot
+    $script:venueExpectedHost = [string]$entry.expectedHost
+    # The scratch root is baked into single-quoted literals and is a deletion boundary
+    # (Remove-AttrCudaTree -TrustedRoot): same allowlist as -AgentRoot, and the agent root must sit under it.
+    if ($script:venueScratchRoot -notmatch '^[A-Za-z]:\\[A-Za-z0-9 _.\\-]+$' -or $script:venueAgentRoot -notmatch '^[A-Za-z]:\\[A-Za-z0-9 _.\\-]+$' -or
+        -not $script:venueAgentRoot.StartsWith($script:venueScratchRoot + '\', [StringComparison]::OrdinalIgnoreCase) -or
+        $script:venueExpectedHost -notmatch '^[A-Za-z0-9-]+$') {
+        throw 'DUAL_VENUE_TABLE_INVALID the venue table entry has a root or host outside the allowlist, or the agent root is not under the scratch root'
+    }
+    if (-not $script:agentRootWasBound) { $script:AgentRoot = $script:venueAgentRoot }
+}
 
 # --- ATTR3-FOOTAGE-BIND-1 PR-B: resolve an owner-clip id, generator-side only -----------------
 # Mirrors attr3-footage-presence-job.ps1's own resolver invocation (PR-A): the resolver runs as a
@@ -426,6 +511,7 @@ $FixtureClipExtension = '.' + 'mlv'
 # still validates -AgentRoot first, before using it to derive -ClipPath, so it keeps its own
 # order (never echoing the value, for the same reason the ClipPath refusal never does).
 if ($isFixtureRehearsal) {
+    Resolve-DualVenueRoots
     if ($AgentRoot -notmatch '^[A-Za-z]:\\[A-Za-z0-9 _.\\-]+$') {
         throw 'PLAYBACK_ATTR3_AGENTROOT_INVALID -AgentRoot contains characters outside the allowlist'
     }
@@ -433,7 +519,8 @@ if ($isFixtureRehearsal) {
         throw "PLAYBACK_ATTR3_FIXTURE_SHA_REQUIRED -FixtureSha256 must be 64 lowercase hex for a fixture id ('$ClipId'); got '$FixtureSha256'"
     }
     if ([string]::IsNullOrWhiteSpace($ClipPath)) {
-        $ClipPath = Join-Path (Join-Path $AgentRoot 'cache') ($ClipId + $FixtureClipExtension)
+        # [IO.Path]::Combine, not Join-Path: this runs on the VM for a venue whose drive (UM's G:) does not exist here.
+        $ClipPath = [IO.Path]::Combine([IO.Path]::Combine($AgentRoot, 'cache'), ($ClipId + $FixtureClipExtension))
     }
     if ($ClipPath -notmatch '^[A-Za-z]:\\[A-Za-z0-9 _.\\-]+$') {
         throw "PLAYBACK_ATTR3_CLIPPATH_INVALID -ClipPath contains characters outside the allowlist: '$ClipPath'"
@@ -449,6 +536,7 @@ if ($isFixtureRehearsal) {
     if ($PSBoundParameters.ContainsKey('ClipPath')) {
         throw "PLAYBACK_ATTR3_CLIPPATH_REFUSED -ClipPath is refused for an owner clip id ('$ClipId'): the footage path is resolved through tools/gates/resolve_consented_clip.py, never typed by a caller"
     }
+    Resolve-DualVenueRoots
 }
 
 # --- RepoRoot resolution: the ONE I/O statement before the resolver call, wrapped so a failure
@@ -850,7 +938,7 @@ $Root = '__AGENT_ROOT__'
 $Cache = Join-Path $Root 'cache'
 $Stamp = Get-Date -Format 'yyyyMMdd-HHmmss'
 $JobId = "playback-attr-3-cuda-$($SourceCommit.Substring(0,12))-$ClipId-$Stamp"
-$Work = Join-Path 'C:\mlvtmp' $JobId
+$Work = Join-Path '__SCRATCH_ROOT__' $JobId
 $Pub = Join-Path $Root "outbox\$JobId.artifacts"
 # BACHELOR-OWNER-CLIP-STAGE-STALL-1: every pre-launch step appends a timestamped line here as it
 # starts and ends, flushed immediately, so a job the agent kills at its cap (which returns NO
@@ -983,8 +1071,8 @@ $displayWake['keepAliveSetupError'] = $displayWakeKeepAlive.setupError
 # never wiped out from under a live $env:TEMP by a later "recreate $Work" step.
 function Assert-UnderMlvTmp([string]$Path, [string]$Label) {
     $full = [IO.Path]::GetFullPath($Path)
-    if ($full -ne 'C:\mlvtmp' -and $full -notlike 'C:\mlvtmp\*') {
-        throw "job-owned path '$Label' resolves outside C:\mlvtmp: $full"
+    if ($full -ne '__SCRATCH_ROOT__' -and $full -notlike '__SCRATCH_ROOT__\*') {
+        throw "job-owned path '$Label' resolves outside __SCRATCH_ROOT__: $full"
     }
 }
 foreach ($check in @(
@@ -1009,9 +1097,9 @@ foreach ($check in @(
 # never adopted, and the directories above it stay. $Work carries a per-run stamp, so this sweep
 # normally finds nothing at all; it exists for a same-second rerun and for the legacy case.
 $OwnerJournal = Join-Path $Work '.attrcuda-owned.jsonl'
-[void](Assert-AttrCudaNoLinkBelowRoot -TrustedRoot 'C:\mlvtmp' -Path (Join-Path $Work 'owner-clip'))
+[void](Assert-AttrCudaNoLinkBelowRoot -TrustedRoot '__SCRATCH_ROOT__' -Path (Join-Path $Work 'owner-clip'))
 $ownerLeftovers = @(Clear-AttrCudaOwnerFootageLeftovers -Directory (Join-Path $Work 'owner-clip') -Journal $OwnerJournal)
-$workSweep = Remove-AttrCudaTree -TrustedRoot 'C:\mlvtmp' -Path $Work -OwnedJournal $OwnerJournal
+$workSweep = Remove-AttrCudaTree -TrustedRoot '__SCRATCH_ROOT__' -Path $Work -OwnedJournal $OwnerJournal
 if ($ownerLeftovers.Count -gt 0 -or $workSweep.Left.Count -gt 0) {
     # Typed, path-free, and nothing waits on it: the hub reads the tokens; the owner decides later.
     $workLeft = @($ownerLeftovers | ForEach-Object { [ordered]@{ kind = 'view-entry'; token = [string]$_ } }) +
@@ -1865,7 +1953,7 @@ $avgUtility = Get-Mean ($cpuUtilitySamples | Where-Object { $null -ne $_ })
 # which would silently treat "could not measure" as "measured low".
 $cpuTimeUnknown = $cpuTimeSamples.Count -lt 3
 $avgTime = if ($cpuTimeUnknown) { $null } else { Get-Mean $cpuTimeSamples }
-$cpuThresholdPercent = 20.0
+$cpuThresholdPercent = __CPU_QUIESCENCE_THRESHOLD_PERCENT__
 Write-JobTrace "step quiescence-check done cpuTimeMean=$avgTime cpuUtilityMean=$avgUtility cpuTimeUnknown=$cpuTimeUnknown"
 # UM-DISPLAY-SELECT-AND-LOG-1 round 1c (opus design-review hardening item 4): written
 # fail-closed as "-not (<= threshold)", not "-gt threshold" -- a stray NaN that ever reached
@@ -1950,7 +2038,7 @@ $envs = @(
 # default.
 $envList = "'" + ($envs -join "','") + "'"
 function ConvertTo-PsSingleQuoted([string]$Value) { "'" + $Value.Replace("'", "''") + "'" }
-$cmd = "& $(ConvertTo-PsSingleQuoted $smoke) -ExePath $(ConvertTo-PsSingleQuoted $exePath) -Input $(ConvertTo-PsSingleQuoted $clipPath) -Output $(ConvertTo-PsSingleQuoted $resultPath) -Seconds $PlaySeconds -StartFrame 0 -SettleMs 2500 -ProcessTimeoutMs $SmokeProcessTimeoutMs -ScaleFactor 4 -UsePersistedPlaybackSettings -RequireLookAssist:`$false -Scope none -FrameTelemetry -PreserveExperimentalEnvironment -ExtraEnvironment @($envList)"
+$cmd = "& $(ConvertTo-PsSingleQuoted $smoke) -ExePath $(ConvertTo-PsSingleQuoted $exePath) -Input $(ConvertTo-PsSingleQuoted $clipPath) -Output $(ConvertTo-PsSingleQuoted $resultPath) -Seconds $PlaySeconds -StartFrame 0 -SettleMs 2500 -ProcessTimeoutMs $SmokeProcessTimeoutMs -ScaleFactor __SCALE_FACTOR__ -UsePersistedPlaybackSettings -RequireLookAssist:`$false -Scope none -FrameTelemetry -PreserveExperimentalEnvironment -ExtraEnvironment @($envList)"
 if ($RunnerAcceptsVerifiedClipBinding) {
     # BACHELOR-OWNER-CLIP-STAGE-STALL-1 round 1f: the runner's own remaining reads are traced into
     # this job's trace file, and (owner run) it takes the identity verified above instead of re-reading.
@@ -2734,7 +2822,7 @@ $manifest = [ordered]@{
     # A rehearsal cites no consent receipt: the fixtures are repository bytes, and recording the
     # owner-footage receipt here would be misleading provenance (sol, PR #137 r2 minor).
     consentReceipt = $(if ($FixtureRehearsal) { $null } else { $ConsentReceiptFileName })
-    scaleFactor = 4
+    scaleFactor = __SCALE_FACTOR__
     # The authenticated chain, end to end: this manifest's own bytes, and the DLL-pair manifest
     # it names. Neither is a claim the measurement host had to take on trust.
     buildManifest = [ordered]@{ name=$buildManifestName; sha256=$BuildManifestSha256; dllPairManifestSha256=$dllPairManifestSha256 }
@@ -2976,6 +3064,137 @@ exit 0
 }
 '@
 
+# --- DUAL-VENUE-EVIDENCE-1: non-default variants of the template --------------------------------
+# The DEFAULT arguments (bachelor / cuda / no Look Assist forcing) apply NO patch below and the
+# only template differences are the tokens whose default expansion reproduces the text that was
+# previously literal -- that is what keeps today's emitted job byte-identical (pinned by
+# test_dual_venue_evidence.py). A variant (ultra-magnus, cpu backend, forced Look Assist) is the
+# template with exact-text patches; every anchor must match EXACTLY ONCE, so a future edit to the
+# template that moves one fails this generator loudly instead of silently emitting an unpatched job.
+function Edit-DualVenueTemplate([string]$Text, [string]$Old, [string]$New) {
+    $eol = if ($Text.Contains("`r`n")) { "`r`n" } else { "`n" }
+    $oldText = [regex]::Replace($Old, "\r?\n", $eol)
+    $newText = [regex]::Replace($New, "\r?\n", $eol)
+    $first = $Text.IndexOf($oldText, [StringComparison]::Ordinal)
+    if ($first -lt 0) { throw "DUAL_VENUE_TEMPLATE_ANCHOR_MISSING the template no longer contains the variant anchor: $($Old.Split("`n")[0].Trim())" }
+    if ($Text.IndexOf($oldText, $first + 1, [StringComparison]::Ordinal) -ge 0) { throw "DUAL_VENUE_TEMPLATE_ANCHOR_AMBIGUOUS the variant anchor occurs more than once: $($Old.Split("`n")[0].Trim())" }
+    $Text.Substring(0, $first) + $newText + $Text.Substring($first + $oldText.Length)
+}
+
+if ($ForceLookAssist -and -not $ContactSheet) {
+    throw 'DUAL_VENUE_LOOK_REQUIRES_CONTACT_SHEET -ForceLookAssist (a LOOK leg) needs -ContactSheet: the look is judged on the contact sheet'
+}
+$isCpuBackend = ($Backend -eq 'cpu')
+if ($isCpuBackend -and $DisablePaintPerSubmit) {
+    throw 'DUAL_VENUE_CPU_BACKEND_CONFLICT -DisablePaintPerSubmit sets a GPU-window env (MLVAPP_GPU_WINDOW_PAINT_PER_SUBMIT) and is CUDA-path only; it cannot be combined with -Backend cpu'
+}
+$isVariant = ($Venue -ne 'bachelor') -or $isCpuBackend -or [bool]$ForceLookAssist
+if ($isVariant) {
+    $variantVars = "`$Backend = '$Backend'`n`$LookLeg = $(if ($ForceLookAssist) { '$true' } else { '$false' })`n`$LookFlavor = '$LookFlavor'`n`$DeclaredVenue = '$Venue'`n`$ExpectedHostName = '$($venueExpectedHost.Replace("'", "''"))'"
+    $template = Edit-DualVenueTemplate $template '$DisablePaintPerSubmit = __DISABLE_PAINT_PER_SUBMIT__
+' ('$DisablePaintPerSubmit = __DISABLE_PAINT_PER_SUBMIT__
+' + $variantVars + "`n")
+    # P6: the declared venue must agree with the run-time detection on the host that runs the job.
+    $template = Edit-DualVenueTemplate $template "Write-JobTrace 'step display-wake start'
+" @'
+Write-JobTrace 'step venue-host-check'
+$detectedVenue = Get-AttrCudaMeasurementVenue
+$hostNameNow = [string]$env:COMPUTERNAME
+if ($detectedVenue -ne $DeclaredVenue -or $hostNameNow -ine $ExpectedHostName) {
+    [void](New-AttrCudaDirectory -Path (Join-Path $Root 'outbox'))
+    [void](New-AttrCudaDirectory -Path $Pub)
+    Save-Json ([ordered]@{
+        schema='playback-attr-3-cuda-venue.v1'; result='VENUE_HOST_MISMATCH'
+        fixtureRehearsal=$FixtureRehearsal
+        declaredVenue=$DeclaredVenue; detectedVenue=$detectedVenue; hostName=$hostNameNow; expectedHost=$ExpectedHostName
+        sourceCommit=$SourceCommit; clipId=$ClipId; artifactRoot=$Pub
+    }) (Join-Path $Pub 'summary.json')
+    Write-Output "RESULT=VENUE_HOST_MISMATCH DECLARED=$DeclaredVenue DETECTED=$detectedVenue HOST=$hostNameNow EXPECTED_HOST=$ExpectedHostName ARTIFACTS=$Pub"
+    exit 29
+}
+Write-JobTrace 'step display-wake start'
+
+'@
+}
+if ($isCpuBackend) {
+    # A1: no GPU env of any kind. The eligibility-diag env is MLVAPP_GPU_* too, so it goes; the
+    # GL-window/viewport envs only serve the GPU presentation path and go with it.
+    $template = Edit-DualVenueTemplate $template ") + `$telemetryArmEnvs + @(" ") + @(`$telemetryArmEnvs | Where-Object { `$_ -notlike 'MLVAPP_GPU_*' }) + @("
+    $template = Edit-DualVenueTemplate $template "    'MLVAPP_GPU_PLAYBACK_RECON=1',
+    'MLVAPP_GPU_PLAYBACK_RECON_BACKEND=cuda',
+    ('MLVAPP_GPU_PLAYBACK_RECON_DLL=' + `$reconDll),
+    'MLVAPP_GPU_PLAYBACK_RECON_ASYNC_H2D=0',
+    'MLVAPP_EXPERIMENTAL_GPU_PROCESSING=1',
+    'MLVAPP_EXPERIMENTAL_GPU_AMAZE_DEBAYER=1',
+    'MLVAPP_EXPERIMENTAL_GL_WINDOW_VIEWPORT=1',
+    'MLVAPP_VIEWPORT_PRESENT_DIAG=1',
+    'MLVAPP_EXPERIMENTAL_GPU_PLAYBACK_RECON_TEXTURE_PRESENT=1',
+    'MLVAPP_EXPERIMENTAL_GPU_AMAZE_TEXTURE_PRESENT=1',
+    'MLVAPP_GPU_PLAYBACK_RECON_RETAIN_DEVICE_OUTPUT=1',
+" ''
+    # exit 13/14 stay CUDA-only; the cpu leg has its own inverted check (exit 28) just below them.
+    $template = Edit-DualVenueTemplate $template 'if (-not $verdict.admitted) {' 'if ($Backend -ne ''cpu'' -and -not $verdict.admitted) {'
+    $template = Edit-DualVenueTemplate $template 'if ($gpuFramesTotal -le 0) {' 'if ($Backend -ne ''cpu'' -and $gpuFramesTotal -le 0) {'
+    $template = Edit-DualVenueTemplate $template 'if ($gpuSummary.cpuFrames -gt 0) {' 'if ($Backend -ne ''cpu'' -and $gpuSummary.cpuFrames -gt 0) {'
+    $template = Edit-DualVenueTemplate $template '$stats = [ordered]@{}
+' @'
+if ($Backend -eq 'cpu' -and ($gpuSummary.cpuFrames -le 0 -or $gpuFramesTotal -gt 0)) {
+    [void](Publish-AttrCudaContactSheetRawCaptures -Enabled $ContactSheetEnabled -SourceDir $contactSheetDir -PubRoot $Pub)
+    $cpuMismatch = [ordered]@{
+        schema='playback-attr-3-cuda-venue.v1'; result='CPU_BACKEND_PATH_MISMATCH'
+        fixtureRehearsal=$FixtureRehearsal
+        displayWake=$displayWake
+        backend=$Backend
+        gpuSummary=$gpuSummary; gpuFramesTotal=$gpuFramesTotal; display=$displayBlock; sourceCommit=$SourceCommit; clipId=$ClipId; artifactRoot=$Pub
+    }
+    Save-Json $cpuMismatch (Join-Path $Pub 'summary.json')
+    Write-Output "RESULT=CPU_BACKEND_PATH_MISMATCH CPU_FRAMES=$($gpuSummary.cpuFrames) GPU_FRAMES=$gpuFramesTotal $(Get-AttrCudaDisplayResultTail $displayBlock) ARTIFACTS=$Pub"
+    exit 28
+}
+$stats = [ordered]@{}
+
+'@
+    # PresentMon is informational on the cpu backend: a non-OK report is taken through the same
+    # non-gating path the DISPLAY_ASLEEP override already uses, with its status left as 'unavailable'.
+    # (PowerShell's -and/-or have EQUAL precedence, so the cpu clause is its own statement.)
+    $template = Edit-DualVenueTemplate $template '$displayAsleepOverridden =
+    ($displayReport.status -eq ''DISPLAY_ASLEEP'') -and' '$displayAsleepOverridden = [bool]($Backend -eq ''cpu'' -and $displayReport.status -ne ''OK'')
+if (-not $displayAsleepOverridden) { $displayAsleepOverridden =
+    ($displayReport.status -eq ''DISPLAY_ASLEEP'') -and'
+    $template = Edit-DualVenueTemplate $template '    $displayAsleepForegroundVerification.verified
+$displayAsleepOverride = [ordered]@{' '    $displayAsleepForegroundVerification.verified }
+$displayAsleepOverride = [ordered]@{'
+    $template = Edit-DualVenueTemplate $template '"PresentMon reported DISPLAY_ASLEEP (reason: $($displayReport.reason)) -- not trusted " +' '"PresentMon reported $($displayReport.status) (reason: $($displayReport.reason)) on the cpu backend, where PresentMon is informational and never gating. Text below is the cuda-path override note and applies only if the status is DISPLAY_ASLEEP: not trusted " +'
+}
+if ($isCpuBackend -or $ForceLookAssist) {
+    $template = Edit-DualVenueTemplate $template '$contactSheetBackendLabel = if ($FixtureRehearsal) { ''fixture'' } else { ''cuda'' }' '$contactSheetBackendLabel = if ($FixtureRehearsal) { "fixture-$Backend" } else { $Backend }'
+}
+if ($ForceLookAssist) {
+    # A2: the runner is told Look Assist is REQUIRED -- it fails the leg closed if Look Assist did not
+    # settle and apply. -DisableLookAssist is never passed. Look Assist is FORCED by the job, never inherited
+    # from the venue: since PLAYBACK-CLIP-LENGTH-ENFORCE-4 an automation run reads a run-scoped settings store
+    # (automation_settings::isolate()), so the venue's persisted "use default receipt" setting (which could have
+    # reset Look Assist off) is never read, and this job no longer seeds the venue's registry.
+    $template = Edit-DualVenueTemplate $template '-RequireLookAssist:`$false -Scope none' '-RequireLookAssist:`$true -Scope none'
+    if ($LookFlavor -ne 'classic') {
+        $template = Edit-DualVenueTemplate $template "    'MLVAPP_PLAYBACK_PHASE3_UNATTENDED=1',
+" "    'MLVAPP_PLAYBACK_PHASE3_UNATTENDED=1',
+    ('MLVAPP_LOOK_ASSIST_FLAVOR=' + `$LookFlavor),
+"
+    }
+}
+if ($isVariant) {
+    $template = Edit-DualVenueTemplate $template '    cpuFrames = $gpuSummary.cpuFrames
+' '    cpuFrames = $gpuSummary.cpuFrames
+    backend = $Backend
+    declaredVenue = $DeclaredVenue
+    lookLeg = $LookLeg
+    lookAssistForced = $LookLeg
+    lookFlavor = $(if ($LookLeg) { $LookFlavor } else { $null })
+    lookFlavorHonored = $(if ($LookLeg) { ''unknown'' } else { $null })
+'
+}
+
 # ATTR3-FOOTAGE-BIND-1 PR-B round 3 (STRUCTURAL): a single-pass substitution over the WHOLE
 # token map at once -- see Expand-AttrCudaTemplate's own header in AttrCudaArtifacts.psm1.
 # -ConsentReceiptFileName 'a__EMBEDDED_FUNCTIONS__b.json' (and every other underscore-permitting
@@ -3016,6 +3235,10 @@ $text = Expand-AttrCudaTemplate -Template $template -Tokens ([ordered]@{
     SMOKE_PROCESS_TIMEOUT_MS = [string]$timeBudget.smokeProcessTimeoutMs
     PLAY_SECONDS = [string]$PlaySeconds
     RUNNER_ACCEPTS_VERIFIED_CLIP_BINDING = $runnerAcceptsVerifiedClipBindingLiteral
+    # DUAL-VENUE-EVIDENCE-1: each default below expands to exactly the text that was literal before.
+    SCRATCH_ROOT = $venueScratchRoot
+    CPU_QUIESCENCE_THRESHOLD_PERCENT = $CpuQuiescenceThresholdPercent.ToString('0.0###', [Globalization.CultureInfo]::InvariantCulture)
+    SCALE_FACTOR = [string]$ScaleFactor
     PRESENTMON_TIMED_SECONDS = $(if ($isFixtureRehearsal) { '55' } else { [string][int][math]::Ceiling($timeBudget.smokeProcessTimeoutMs / 1000.0) })
     PRESENTMON_TERMINATE_ON_PROC_EXIT = $(if ($isFixtureRehearsal) { '$false' } else { '$true' })
     EMBEDDED_FUNCTIONS = $embeddedFunctions
@@ -3025,11 +3248,35 @@ $outDir = Split-Path -Parent $OutFile
 if ($outDir -and -not (Test-Path -LiteralPath $outDir)) { New-Item -ItemType Directory -Path $outDir -Force | Out-Null }
 [IO.File]::WriteAllText($OutFile, $text, [Text.UTF8Encoding]::new($false))
 
+# DUAL-VENUE-EVIDENCE-1 r2: the clip's CONTENT identity for the receipt's subject digest, from the bytes the resolver
+# already cross-checked (an owner clip) or the caller's authenticated fixture hash. One part: that part's sha256.
+# Several parts: the sha256 of the part sha256s joined by LF in index order. Never a path; not part of the emitted
+# job's bytes.
+$clipContentSha256 = if ($isFixtureRehearsal) {
+    $FixtureSha256.ToLowerInvariant()
+} else {
+    $partShas = @($ownerPartsForJob | Sort-Object { [int]$_.index } | ForEach-Object { ([string]$_.sha256).ToLowerInvariant() })
+    if ($partShas.Count -eq 1) { $partShas[0] } else {
+        $hasher = [System.Security.Cryptography.SHA256]::Create()
+        try { ([BitConverter]::ToString($hasher.ComputeHash([Text.Encoding]::UTF8.GetBytes(($partShas -join "`n")))) -replace '-', '').ToLowerInvariant() } finally { $hasher.Dispose() }
+    }
+}
+
 [pscustomobject]@{
     outFile = $OutFile
     sourceCommit = $SourceCommit
     buildManifestSha256 = $BuildManifestSha256.ToLowerInvariant()
     clipId = $ClipId
+    clipContentSha256 = $clipContentSha256
+    playSeconds = $PlaySeconds
+    fixtureRehearsal = $isFixtureRehearsal
+    # DUAL-VENUE-EVIDENCE-1: what this generation was authored for (not part of the emitted job's bytes).
+    venue = $Venue
+    backend = $Backend
+    forceLookAssist = [bool]$ForceLookAssist
+    lookFlavor = $LookFlavor
+    agentRoot = $AgentRoot
+    scratchRoot = $venueScratchRoot
     exeName = $exeName
     reconName = $reconName
     rangeHeadSha = $SourceCommit

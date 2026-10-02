@@ -601,7 +601,10 @@ class NoPathnameDeleteOnOwnerCapablePathsTests(unittest.TestCase):
 
     def test_the_owner_job_sweeps_its_work_tree_only_through_the_journal(self) -> None:
         code = "\n".join(_strip_hash_comments((BACHELOR / "playback-attr-3-cuda-job.ps1").read_text(encoding="utf-8")))
-        self.assertIn("Remove-AttrCudaTree -TrustedRoot 'C:\\mlvtmp' -Path $Work -OwnedJournal $OwnerJournal", code)
+        # DUAL-VENUE-EVIDENCE-1: the trusted root is the venue's scratch-root TOKEN in the template; the generator expands it
+        # to 'C:\mlvtmp' for the default (bachelor) venue, byte-identically (test_dual_venue_evidence.py pins that against master's
+        # emitted job), and to the venue table's scratch root for another venue.
+        self.assertIn("Remove-AttrCudaTree -TrustedRoot '__SCRATCH_ROOT__' -Path $Work -OwnedJournal $OwnerJournal", code)
         self.assertIn("Clear-AttrCudaOwnerFootageLeftovers -Directory (Join-Path $Work 'owner-clip') -Journal $OwnerJournal", code)
         # a left entry refuses the run with a typed, path-free result instead of carrying on into it
         self.assertIn("OWNER_WORK_NOT_CLEAN", code)
