@@ -384,7 +384,8 @@ function Read-DvClipConsent {
     COMMITTED revision by Resolve-DvAdmissionSources). The hub records the owner's typed CLIP line there; agents never
     write it and this function only ever reads text it is given. A record carries the owner's EXACT line
     ("CLIP <venue>: <clip id>"), its sha256, recordedUtc and recordedBy = 'owner'; the line must name the record's own
-    venue and clip id and hash to ownerLineSha256, so a bare hex string cannot stand in for the owner's words.
+    venue (or that venue name with every hyphen removed, the one admitted alias) and clip id and hash to ownerLineSha256,
+    so a bare hex string cannot stand in for the owner's words.
     FAIL CLOSED: empty text, bad JSON, a wrong schema, or any record that is not exactly the six reviewed keys (so a path
     cannot ride along in an extra field) makes the WHOLE file invalid -- unknown consent is no consent.
     Returns [pscustomobject]@{ ok; reason; records }.
@@ -409,7 +410,10 @@ function Read-DvClipConsent {
         if ([string]$r.clipId -cnotmatch $script:ClipIdPattern) { return (& $bad 'a consent record clipId is not a consented clip id') }
         if ([string]$r.ownerLineSha256 -cnotmatch '^[0-9a-f]{64}$') { return (& $bad 'a consent record ownerLineSha256 is not 64 lowercase hex') }
         $line = [string]$r.ownerLine
-        if ($line -cne ('CLIP ' + [string]$r.venue + ': ' + [string]$r.clipId)) { return (& $bad "a consent record's ownerLine is not the owner's 'CLIP <venue>: <clip id>' line for its own venue and clip") }
+        # The owner's words are never altered. Besides the table's venue name, the one spelling admitted is that same name with every
+        # hyphen removed ("CLIP ultramagnus: M16-1243" for ultra-magnus), case-sensitive and exact; the record's venue stays the table name.
+        $spellings = @([string]$r.venue, ([string]$r.venue).Replace('-', ''))
+        if ($line -cnotin @($spellings | ForEach-Object { 'CLIP ' + $_ + ': ' + [string]$r.clipId })) { return (& $bad "a consent record's ownerLine is not the owner's 'CLIP <venue>: <clip id>' line for its own venue and clip") }
         if ((Get-DvSha256OfText $line) -cne [string]$r.ownerLineSha256) { return (& $bad "a consent record's ownerLineSha256 is not the sha256 of its ownerLine") }
         if ([string]$r.recordedBy -cne 'owner') { return (& $bad "a consent record's recordedBy is not 'owner'") }
         $when = [DateTime]::MinValue
