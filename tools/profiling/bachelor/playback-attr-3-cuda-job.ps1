@@ -1226,6 +1226,38 @@ function Invoke-PresentMonSessionTerminate([string]$SessionName, [int]$TimeoutSe
     [pscustomobject]@{ exitCode = $helperExitCode; timedOut = $timedOut; error = $helperError }
 }
 
+function Split-PresentMonCsvLine([string]$Line) {
+    # Quote-aware split of ONE csv line into fields (a doubled quote inside a quoted field is a literal
+    # quote). openQuote is true when the line ends inside a quoted field, i.e. it was cut off.
+    $fields = [System.Collections.Generic.List[object]]::new()
+    $cur = ''
+    $inQuote = $false
+    for ($i = 0; $i -lt $Line.Length; $i++) {
+        $c = [string]$Line[$i]
+        if ($inQuote) {
+            if ($c -eq '"') {
+                if (($i + 1) -lt $Line.Length -and [string]$Line[$i + 1] -eq '"') {
+                    $cur = $cur + '"'
+                    $i++
+                } else {
+                    $inQuote = $false
+                }
+            } else {
+                $cur = $cur + $c
+            }
+        } elseif ($c -eq '"') {
+            $inQuote = $true
+        } elseif ($c -eq ',') {
+            $fields.Add($cur)
+            $cur = ''
+        } else {
+            $cur = $cur + $c
+        }
+    }
+    $fields.Add($cur)
+    [pscustomobject]@{ fields = @($fields); openQuote = $inQuote }
+}
+
 function Repair-PresentMonCsvTail([string]$Path) {
     # UM-PRESENTMON-STOP-1: a Kill()ed PresentMon loses its unflushed write buffer, so the CSV can end
     # mid-field (both Ultra-Magnus owner captures did). Newline ABSENCE is not proof that the last row is
@@ -1243,29 +1275,6 @@ function Repair-PresentMonCsvTail([string]$Path) {
     if ($null -eq $text -or $text.Length -eq 0 -or $text -match "`n\z") {
         return [pscustomobject]@{ trimmed = $false; unterminatedTail = 'none'; droppedChars = 0; droppedText = $null; repairedPath = $null; headerFieldCount = $null; tailFieldCount = $null; tailReason = $null }
     }
-    $splitFields = {
-        param([string]$Line)
-        $fields = [System.Collections.Generic.List[string]]::new()
-        $sb = [System.Text.StringBuilder]::new()
-        $inQuote = $false
-        for ($i = 0; $i -lt $Line.Length; $i++) {
-            $c = $Line[$i]
-            if ($inQuote) {
-                if ($c -eq '"') {
-                    if (($i + 1) -lt $Line.Length -and $Line[$i + 1] -eq '"') { [void]$sb.Append('"'); $i++ } else { $inQuote = $false }
-                } else { [void]$sb.Append($c) }
-            } elseif ($c -eq '"') {
-                $inQuote = $true
-            } elseif ($c -eq ',') {
-                $fields.Add($sb.ToString())
-                [void]$sb.Clear()
-            } else {
-                [void]$sb.Append($c)
-            }
-        }
-        $fields.Add($sb.ToString())
-        [pscustomobject]@{ fields = @($fields); openQuote = $inQuote }
-    }
     $newlines = [regex]::Matches($text, "`n")
     $keep = if ($newlines.Count -eq 0) { 0 } else { $newlines[$newlines.Count - 1].Index + 1 }
     $tailLine = $text.Substring($keep) -replace '\r\z', ''
@@ -1276,9 +1285,9 @@ function Repair-PresentMonCsvTail([string]$Path) {
     if ($newlines.Count -eq 0) {
         $tailReason = 'no header line (the file has no newline at all)'
     } else {
-        $header = & $splitFields ($text.Substring(0, $newlines[0].Index) -replace '\r\z', '')
+        $header = Split-PresentMonCsvLine ($text.Substring(0, $newlines[0].Index) -replace '\r\z', '')
         $headerFieldCount = $header.fields.Count
-        $tail = & $splitFields $tailLine
+        $tail = Split-PresentMonCsvLine $tailLine
         $tailFieldCount = $tail.fields.Count
         if ($tailLine.Length -eq 0) {
             $tailReason = 'empty last line'
@@ -2975,12 +2984,18 @@ $presentMonJobStopSpanShortfallMs = $null
 $presentMonJobStopCountDeviation = $null
 if ($presentMonStoppedByJob) {
     $swapWindowMatches = if ($appSwapTelemetry.source -eq 'gpu_window_swaps') { @([regex]::Matches($rawLog, 'playback_smoke\.gpu_window_swaps [^\r\n]*?first_swap_utc=(?<first>\S+) last_swap_utc=(?<last>\S+)')) } else { @() }
-    $swapFirstUtc = [datetime]::MinValue
-    $swapLastUtc = [datetime]::MinValue
-    $swapWindowParsed = ($swapWindowMatches.Count -gt 0) -and
-        [datetime]::TryParse($swapWindowMatches[$swapWindowMatches.Count - 1].Groups['first'].Value, [Globalization.CultureInfo]::InvariantCulture, [Globalization.DateTimeStyles]::RoundtripKind, [ref]$swapFirstUtc) -and
-        [datetime]::TryParse($swapWindowMatches[$swapWindowMatches.Count - 1].Groups['last'].Value, [Globalization.CultureInfo]::InvariantCulture, [Globalization.DateTimeStyles]::RoundtripKind, [ref]$swapLastUtc) -and
-        ($swapLastUtc -gt $swapFirstUtc)
+    $swapFirstUtc = $null
+    $swapLastUtc = $null
+    $swapWindowParsed = $false
+    if ($swapWindowMatches.Count -gt 0) {
+        try {
+            $swapFirstUtc = ([datetime]$swapWindowMatches[$swapWindowMatches.Count - 1].Groups['first'].Value).ToUniversalTime()
+            $swapLastUtc = ([datetime]$swapWindowMatches[$swapWindowMatches.Count - 1].Groups['last'].Value).ToUniversalTime()
+            $swapWindowParsed = ($swapLastUtc -gt $swapFirstUtc)
+        } catch {
+            $swapWindowParsed = $false
+        }
+    }
     if (-not $swapWindowParsed) {
         $presentMonJobStopFailedArms += 'job-stop span: the capture was ended by this job and the run log carries no usable playback_smoke.gpu_window_swaps first_swap_utc/last_swap_utc, so coverage of the measured playback cannot be proven'
     } else {
@@ -2995,7 +3010,9 @@ if ($presentMonStoppedByJob) {
     if (-not $presentMonCoverageAvailable) {
         $presentMonJobStopFailedArms += 'job-stop count: the capture was ended by this job and the run log carries no app-side swap count to match the retained presents against'
     } else {
-        $presentMonJobStopCountDeviation = [math]::Abs($presentMonPresentedCount - $presentMonAppSwapCount) / [double]$presentMonAppSwapCount
+        $presentMonCountDifference = $presentMonPresentedCount - $presentMonAppSwapCount
+        if ($presentMonCountDifference -lt 0) { $presentMonCountDifference = -$presentMonCountDifference }
+        $presentMonJobStopCountDeviation = $presentMonCountDifference / [double]$presentMonAppSwapCount
         if ($presentMonJobStopCountDeviation -gt $presentMonJobStopMaxCountDeviation) {
             $presentMonJobStopFailedArms += "job-stop count: the capture was ended by this job and retained $presentMonPresentedCount present(s) against the app's own $presentMonAppSwapCount $presentMonAppSwapSource ($([math]::Round($presentMonJobStopCountDeviation * 100, 1))% apart, above the $([math]::Round($presentMonJobStopMaxCountDeviation * 100, 1))% bound)"
         }
