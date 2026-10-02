@@ -456,8 +456,10 @@ if ($isLook -and $artifactsShare) {
             Copy-Item -LiteralPath $rawShare -Destination (Join-Path $sheetDir 'raw') -Recurse
             $rawLocal = Join-Path $sheetDir 'raw'
             # Hash EVERY captured frame and sidecar into a manifest the receipt names (sol r1 B4): the sheet reader takes only what it lists.
-            $listing = @(Get-ChildItem -LiteralPath $rawLocal -Recurse -Force -File | Sort-Object FullName | ForEach-Object {
-                [ordered]@{ name = $_.FullName.Substring($rawLocal.Length).TrimStart('\'); sha256 = (Get-DvSha256OfFile $_.FullName) } })
+            # Top-level entries by NAME (never by a path prefix: a hosted runner's temp dir is an 8.3 short path whose FullName prefix differs). A
+            # directory is listed as "<name>\" with a zero hash: that is not a plain frame name, so the validator refuses it (nothing nested is ever composed).
+            $listing = @(Get-ChildItem -LiteralPath $rawLocal -Force | Sort-Object Name | ForEach-Object {
+                [ordered]@{ name = $(if ($_.PSIsContainer) { $_.Name + '\' } else { $_.Name }); sha256 = $(if ($_.PSIsContainer) { '0' * 64 } else { (Get-DvSha256OfFile $_.FullName) }) } })
             $framesBytes = [Text.UTF8Encoding]::new($false).GetBytes(([ordered]@{ schema = 'mlv-app/dual-venue-contact-frames/v1'; files = $listing } | ConvertTo-Json -Depth 4) + "`n")
             [IO.File]::WriteAllBytes((Join-Path $evidenceDir 'contact-frames.json'), $framesBytes)
             $receipt.evidence.contactFramesJsonSha256 = Get-DvSha256OfBytes $framesBytes

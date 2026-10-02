@@ -2681,6 +2681,10 @@ class ContactFramesAreHashListedTests(EvidenceFactory, ModuleMutationMixin, unit
     def test_the_runner_hashes_every_captured_frame_into_the_manifest_the_receipt_names(self) -> None:
         # the offline harness drives the REAL Invoke-VenueLeg.ps1 capture path (stub um-run): it must write contact-frames.json and claim it
         self.write_artifacts(sheet=True, raw_frames=True)
+        # a directory inside raw/ (hosted CI regression: the names were once cut from a path PREFIX, and a runner temp dir is an 8.3 short path)
+        nested = self.artifacts / "artifacts" / "contact-sheet" / "raw" / "nested"
+        nested.mkdir()
+        (nested / "deep.png").write_bytes(b"\x89PNG\r\n\x1a\ndeep")
         proc, receipt, _ = self.run_leg("ultra-magnus", self.write_spec(leg_type="look"), extra=["-Backend", "cpu"])
         self.assertIsNotNone(receipt, proc.stdout + proc.stderr)
         claim = receipt["evidence"]["contactFramesJsonSha256"]
@@ -2690,9 +2694,13 @@ class ContactFramesAreHashListedTests(EvidenceFactory, ModuleMutationMixin, unit
         doc = json.loads(manifest.read_text(encoding="utf-8"))
         self.assertEqual(doc["schema"], "mlv-app/dual-venue-contact-frames/v1")
         raw = Path(receipt["evidence"]["localEvidenceDir"]) / "contact-sheet" / "raw"
-        self.assertEqual(sorted(e["name"] for e in doc["files"]), sorted(p.name for p in raw.iterdir()))
+        self.assertEqual(sorted(e["name"] for e in doc["files"]), sorted(p.name + ("\\" if p.is_dir() else "") for p in raw.iterdir()),
+                         "top-level entries by NAME; a directory is listed as '<name>\\' (not a plain frame name, so the validator refuses it)")
         for e in doc["files"]:
-            self.assertEqual(e["sha256"], sha256_of(raw / e["name"]))
+            if not e["name"].endswith("\\"):
+                self.assertEqual(e["sha256"], sha256_of(raw / e["name"]))
+        runner = (DV / "Invoke-VenueLeg.ps1").read_text(encoding="utf-8")
+        self.assertNotIn(".Substring($rawLocal.Length)", runner, "no file name is derived by cutting a path prefix")
 
 
 @requires_windows_pwsh
