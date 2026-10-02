@@ -949,10 +949,16 @@ $Trace = Join-Path $Root "logs\$JobId.trace.txt"
 # fixed 55 s capture ended before playback and the leg failed on an empty capture. An owner leg
 # sizes the capture CEILING from the same derived budget as the smoke process (its own timeout) and
 # asks PresentMon to stop when the app exits (--terminate_on_proc_exit), so the ceiling is never
-# waited out; a fixture leg (tiny file, instant load) keeps the fixed 55 s. The display report
+# waited out. UM-PRESENTMON-STOP-1: that ask is only a hint -- on Ultra-Magnus PresentMon 2.5.1
+# did not exit after MLVApp exited cleanly, and a fixture leg's fixed 55 s ceiling ended the
+# capture 22.9 s BEFORE the app's playback did. Every leg (owner and fixture) now sizes the ceiling
+# from the derived smoke budget, and the job stops the capture itself once the smoke run has
+# confirmed the app exited: Wait-PresentMonCapture terminates this job's NAMED ETW session
+# ($PresentMonSessionName), waits for the flush, and Kill()s only as a fallback. The display report
 # windows the rows to the playback interval, so the idle head of a longer capture is never scored.
 $PresentMonTimedSeconds = __PRESENTMON_TIMED_SECONDS__
 $PresentMonTerminateOnProcExit = __PRESENTMON_TERMINATE_ON_PROC_EXIT__
+$PresentMonSessionName = ''
 $SmokeProcessTimeoutMs = __SMOKE_PROCESS_TIMEOUT_MS__
 $PlaySeconds = __PLAY_SECONDS__
 # BACHELOR-OWNER-CLIP-STAGE-STALL-1 round 1f: true only when the smoke runner COMMITTED at this leg's
@@ -1178,7 +1184,7 @@ function Get-Stats([double[]]$Values) {
 function Start-PresentMonCapture([string]$CsvPath) {
     if (Test-Path -LiteralPath $CsvPath) { throw "PresentMon output already exists: $CsvPath" }
     $pmArgs = @('--process_name', $ExeName, '--output_file', $CsvPath, '--timed', [string]$PresentMonTimedSeconds,
-                '--terminate_after_timed', '--stop_existing_session', '--no_console_stats')
+                '--terminate_after_timed', '--session_name', $PresentMonSessionName, '--stop_existing_session', '--no_console_stats')
     if ($PresentMonTerminateOnProcExit) { $pmArgs += '--terminate_on_proc_exit' }
     # Direct child: inherits this job's TEMP/TMP. -PassThru so the exit code is checked.
     $proc = Start-Process -FilePath (Join-Path $Cache $PresentMonName) -ArgumentList $pmArgs -PassThru -WindowStyle Hidden
@@ -1189,7 +1195,79 @@ function Start-PresentMonCapture([string]$CsvPath) {
     return $proc
 }
 
-function Wait-PresentMonCapture($Proc, [int]$TimeoutSeconds = 35, [int]$KillWaitTimeoutSeconds = 10) {
+function Get-PresentMonSessionName([string]$Id) {
+    # UM-PRESENTMON-STOP-1: one ETW session name per job, so --stop_existing_session and the clean
+    # stop below touch only THIS job's session (PresentMon 2.5.1 --help: names are case-insensitive;
+    # the default "PresentMon" is shared by every capture on the host). Only [A-Za-z0-9_-] survive and
+    # the TAIL of the job id is kept (its timestamp is the unique part), so the name stays short.
+    $safe = [string]$Id -replace '[^A-Za-z0-9_-]', '-'
+    if ($safe.Length -gt 119) { $safe = $safe.Substring($safe.Length - 119) }
+    "MLVAttr3-$safe"
+}
+
+function Invoke-PresentMonSessionTerminate([string]$SessionName, [int]$TimeoutSeconds = 10) {
+    # UM-PRESENTMON-STOP-1: `PresentMon --session_name <name> --terminate_existing_session` stops the
+    # named ETW session and exits (2.5.1 --help). The capturing process then sees its trace end and
+    # flushes its CSV. --no_csv: this helper must never write a CSV of its own.
+    $helperExitCode = $null
+    $timedOut = $false
+    $helperError = $null
+    try {
+        $helper = Start-Process -FilePath (Join-Path $Cache $PresentMonName) -ArgumentList @('--session_name', $SessionName, '--terminate_existing_session', '--no_csv') -PassThru -WindowStyle Hidden
+        if ($helper.WaitForExit($TimeoutSeconds * 1000)) {
+            $helperExitCode = $helper.ExitCode
+        } else {
+            $timedOut = $true
+            try { $helper.Kill() } catch { $helperError = $_.Exception.Message }
+        }
+    } catch {
+        $helperError = $_.Exception.Message
+    }
+    [pscustomobject]@{ exitCode = $helperExitCode; timedOut = $timedOut; error = $helperError }
+}
+
+function Repair-PresentMonCsvTail([string]$Path) {
+    # UM-PRESENTMON-STOP-1: a Kill()ed PresentMon loses its unflushed write buffer, so the CSV can end
+    # mid-field (both Ultra-Magnus owner captures did). PresentMon terminates every row with a newline,
+    # so a file whose last character is not one ends in an incomplete row. The raw capture is NEVER
+    # modified: the complete rows are written to a sibling presentmon-repaired.csv (through the
+    # write-confined Publish-AttrCudaText) and the caller parses and publishes THAT, with the raw file
+    # kept beside it as evidence. The report says exactly what was dropped. A file that ends on a
+    # newline needs no repair (trimmed=$false, repairedPath=$null).
+    $text = Get-Content -LiteralPath $Path -Raw
+    if ($null -eq $text -or $text.Length -eq 0 -or $text -match "`n\z") {
+        return [pscustomobject]@{ trimmed = $false; droppedChars = 0; droppedText = $null; repairedPath = $null }
+    }
+    $newlines = [regex]::Matches($text, "`n")
+    $keep = if ($newlines.Count -eq 0) { 0 } else { $newlines[$newlines.Count - 1].Index + 1 }
+    $droppedText = $text.Substring($keep)
+    $droppedChars = $droppedText.Length
+    if ($droppedText.Length -gt 200) { $droppedText = $droppedText.Substring(0, 200) }
+    # Publish-AttrCudaText ends the file with one newline of its own, so the kept text loses its last one.
+    $kept = $text.Substring(0, $keep) -replace '\r?\n\z', ''
+    $repairedPath = Publish-AttrCudaText -Path (Join-Path (Split-Path -Parent $Path) 'presentmon-repaired.csv') -Value $kept
+    [pscustomobject]@{ trimmed = $true; droppedChars = $droppedChars; droppedText = $droppedText; repairedPath = $repairedPath }
+}
+
+function Wait-PresentMonCapture($Proc, [string]$SessionName = '', [int]$TimeoutSeconds = 10, [int]$KillWaitTimeoutSeconds = 10) {
+    # UM-PRESENTMON-STOP-1: called only once the smoke run has confirmed the app exited, so the capture
+    # is OVER; this no longer waits for PresentMon to notice that itself (on Ultra-Magnus it did not).
+    # With a -SessionName: terminate that named session first, wait up to -TimeoutSeconds for the
+    # process to exit (the CSV is flushed by then), and only then Kill() as a FALLBACK -- reported as
+    # stopMethod='kill_fallback' so the caller drops the cut-off last CSV row. Without one: the
+    # legacy passive wait, then Kill() and PRESENTMON_TIMEOUT.
+    $exitedBeforeStop = [bool]$Proc.HasExited
+    $stopMethod = if ($exitedBeforeStop) { 'already_exited' } elseif ($SessionName -eq '') { 'legacy_wait' } else { 'session_terminate' }
+    $terminate = $null
+    $terminateIssuedUtc = $null
+    if (-not $exitedBeforeStop -and $SessionName -ne '') {
+        $terminateIssuedUtc = (Get-Date).ToUniversalTime().ToString('o')
+        $terminate = Invoke-PresentMonSessionTerminate -SessionName $SessionName
+    }
+    $killUsed = $false
+    $killIssuedUtc = $null
+    $killError = $null
+    $waitError = $null
     if (-not $Proc.WaitForExit($TimeoutSeconds * 1000)) {
         # ATTR3-SMOKE-RUNNER-DEPS-1 (sol, PR #144 major 3, carried to round 3): the empty catch
         # here used to swallow a Kill() failure outright -- a PresentMon that survived both the
@@ -1201,8 +1279,8 @@ function Wait-PresentMonCapture($Proc, [int]$TimeoutSeconds = 35, [int]$KillWait
         # the very next statement could still read false for a process that exits milliseconds
         # later, sending an operator hunting a lingering process that is not there. Wait bounded
         # after Kill(), exactly as Stop-PresentMonCapture already does, before sampling HasExited.
-        $killError = $null
-        $waitError = $null
+        $killUsed = $true
+        $killIssuedUtc = (Get-Date).ToUniversalTime().ToString('o')
         try { $Proc.Kill() } catch { $killError = $_.Exception.Message }
         try {
             if (-not $Proc.WaitForExit($KillWaitTimeoutSeconds * 1000)) {
@@ -1212,11 +1290,28 @@ function Wait-PresentMonCapture($Proc, [int]$TimeoutSeconds = 35, [int]$KillWait
             $waitError = $_.Exception.Message
         }
         $confirmedExited = [bool]$Proc.HasExited
-        $killErrorText = if ($null -eq $killError) { '<none>' } else { $killError }
-        $waitErrorText = if ($null -eq $waitError) { '<none>' } else { $waitError }
-        throw "PRESENTMON_TIMEOUT: did not exit within $TimeoutSeconds s after playback (confirmedExited=$confirmedExited killError=$killErrorText waitError=$waitErrorText)"
+        if ($SessionName -eq '' -or -not $confirmedExited) {
+            $killErrorText = if ($null -eq $killError) { '<none>' } else { $killError }
+            $waitErrorText = if ($null -eq $waitError) { '<none>' } else { $waitError }
+            throw "PRESENTMON_TIMEOUT: did not exit within $TimeoutSeconds s after playback (confirmedExited=$confirmedExited killError=$killErrorText waitError=$waitErrorText)"
+        }
+        $stopMethod = 'kill_fallback'
     }
-    [pscustomobject]@{ status = 'done'; exitCode = $Proc.ExitCode }
+    [pscustomobject]@{
+        status = 'done'
+        exitCode = $Proc.ExitCode
+        sessionName = $SessionName
+        stopMethod = $stopMethod
+        exitedBeforeStop = $exitedBeforeStop
+        terminateIssuedUtc = $terminateIssuedUtc
+        terminateExitCode = $(if ($null -ne $terminate) { $terminate.exitCode } else { $null })
+        terminateTimedOut = $(if ($null -ne $terminate) { [bool]$terminate.timedOut } else { $false })
+        terminateError = $(if ($null -ne $terminate) { $terminate.error } else { $null })
+        killUsed = $killUsed
+        killIssuedUtc = $killIssuedUtc
+        killError = $killError
+        waitError = $waitError
+    }
 }
 
 function Stop-PresentMonCapture($Proc, [int]$TimeoutSeconds = 10) {
@@ -2140,6 +2235,7 @@ if ($ownerViews.Count -gt 0) {
         exit 24
     }
 }
+$PresentMonSessionName = Get-PresentMonSessionName $JobId
 $presentMonPreSpawnUtc = (Get-Date).ToUniversalTime()
 # PRESENTMON-HARNESS-ROBUSTNESS-1: Start-PresentMonCapture throws -- a pre-existing output file,
 # or a PresentMon process that exited nonzero within its own 3s startup check (rc=6 is ETW access
@@ -2148,7 +2244,7 @@ $presentMonPreSpawnUtc = (Get-Date).ToUniversalTime()
 # step before the smoke run (and therefore any app-side measurement) had even started. Typed the
 # same way every other PresentMon failure already is: PRESENTMON_UNAVAILABLE, exit 23.
 $presentMonSpawnError = $null
-Write-JobTrace 'step presentmon-spawn start'
+Write-JobTrace "step presentmon-spawn start session=$PresentMonSessionName"
 try {
     $presentMonProc = Start-PresentMonCapture $presentMonPath
 } catch {
@@ -2395,17 +2491,37 @@ $earlyAppSwapTelemetry = Get-AttrCudaAppSwapTelemetry -LogText $rawLog
 # TimeoutSeconds or a nonzero exit code -- is now a typed PRESENTMON_UNAVAILABLE terminal (the
 # same outcome and exit code Get-AttrCudaPresentMonDisplayReport already returns for a PresentMon
 # that fails during parsing), never an uncaught throw that would have destroyed everything just
-# published. Wait-PresentMonCapture itself is unchanged -- it still throws PRESENTMON_TIMEOUT
-# internally -- only this call site's handling of that throw changed.
+# published. Wait-PresentMonCapture still throws PRESENTMON_TIMEOUT internally when PresentMon
+# survives even the kill fallback -- only this call site's handling of that throw changed.
+# UM-PRESENTMON-STOP-1: the capture is stopped HERE by the job (named-session terminate, kill only as
+# the fallback), because the smoke run has already confirmed the app exited.
 $presentMonWaitError = $null
+$presentMonCleanStop = $null
+$presentMonTailTrim = $null
+Write-JobTrace 'step presentmon-stop start'
 try {
-    $presentMonDoneResult = Wait-PresentMonCapture $presentMonProc
-    if ($presentMonDoneResult.status -ne 'done' -or [int]$presentMonDoneResult.exitCode -ne 0) {
+    $presentMonDoneResult = Wait-PresentMonCapture $presentMonProc -SessionName $PresentMonSessionName
+    $presentMonCleanStop = $presentMonDoneResult
+    # UM-PRESENTMON-STOP-1: a nonzero exit is a failed capture only when PresentMon ended on its own
+    # (timed ceiling or process exit); an exit this job caused -- the named session terminated, or the
+    # kill fallback -- is the end of the capture, and the CSV's own completeness is checked below.
+    $presentMonStoppedByJob = $presentMonDoneResult.stopMethod -in @('session_terminate', 'kill_fallback')
+    if ($presentMonDoneResult.status -ne 'done' -or (-not $presentMonStoppedByJob -and [int]$presentMonDoneResult.exitCode -ne 0)) {
         throw "PresentMon capture invalid status=$($presentMonDoneResult.status) rc=$($presentMonDoneResult.exitCode)"
+    }
+    # The CSV is final once PresentMon has exited: a cut-off last row is dropped before it is published
+    # or parsed. The raw capture is published as presentmon.raw.csv; presentmon.csv is the repaired copy.
+    if (Test-Path -LiteralPath $presentMonPath -PathType Leaf) {
+        $presentMonTailTrim = Repair-PresentMonCsvTail $presentMonPath
+        if ($presentMonTailTrim.trimmed) {
+            [void](Publish-AttrCudaFileCopy -Source $presentMonPath -Destination (Join-Path $Pub 'presentmon.raw.csv'))
+            $presentMonPath = $presentMonTailTrim.repairedPath
+        }
     }
 } catch {
     $presentMonWaitError = $_.Exception.Message
 }
+Write-JobTrace "step presentmon-stop done method=$($presentMonCleanStop.stopMethod) exitedBeforeStop=$($presentMonCleanStop.exitedBeforeStop) exitCode=$($presentMonCleanStop.exitCode) terminateExitCode=$($presentMonCleanStop.terminateExitCode) killUsed=$($presentMonCleanStop.killUsed) csvTailTrimmed=$($presentMonTailTrim.trimmed) error=$presentMonWaitError"
 if ($null -ne $presentMonWaitError) {
     # CUDA-PERF-DISPLAY-IDENTITY-HARNESS-3 (fable HARDENING): a wait failure used to publish
     # neither the partial presentmon.csv (stable here -- Wait-PresentMonCapture kills the process
@@ -2422,6 +2538,8 @@ if ($null -ne $presentMonWaitError) {
         postSpawnUtc=$presentMonPostSpawnUtc.ToString('o')
         processStartUtc=$(if ($null -ne $presentMonProcessStartUtc) { $presentMonProcessStartUtc.ToString('o') } else { $null })
         captureStartUncertaintyMs=$presentMonCaptureStartUncertaintyMs
+        stop=$presentMonCleanStop
+        csvTailTrim=$presentMonTailTrim
     }) (Join-Path $Pub 'presentmon-capture.json')
     $displayFailure = [ordered]@{
         schema='playback-attr-3-cuda-venue.v1'; result='PRESENTMON_UNAVAILABLE'
@@ -2604,6 +2722,8 @@ Save-Json ([ordered]@{
     postSpawnUtc=$presentMonPostSpawnUtc.ToString('o')
     processStartUtc=$(if ($null -ne $presentMonProcessStartUtc) { $presentMonProcessStartUtc.ToString('o') } else { $null })
     captureStartUncertaintyMs=$presentMonCaptureStartUncertaintyMs
+    stop=$presentMonCleanStop
+    csvTailTrim=$presentMonTailTrim
 }) (Join-Path $Pub 'presentmon-capture.json')
 # CUDA-PERF-DISPLAY-IDENTITY-HARNESS-3 (sol+fable HARDENING, direction-corrected anchor -- see
 # the bracket comment above): windowed under BOTH endpoints of the capture-start bracket, never
@@ -3239,8 +3359,10 @@ $text = Expand-AttrCudaTemplate -Template $template -Tokens ([ordered]@{
     SCRATCH_ROOT = $venueScratchRoot
     CPU_QUIESCENCE_THRESHOLD_PERCENT = $CpuQuiescenceThresholdPercent.ToString('0.0###', [Globalization.CultureInfo]::InvariantCulture)
     SCALE_FACTOR = [string]$ScaleFactor
-    PRESENTMON_TIMED_SECONDS = $(if ($isFixtureRehearsal) { '55' } else { [string][int][math]::Ceiling($timeBudget.smokeProcessTimeoutMs / 1000.0) })
-    PRESENTMON_TERMINATE_ON_PROC_EXIT = $(if ($isFixtureRehearsal) { '$false' } else { '$true' })
+    # UM-PRESENTMON-STOP-1: one capture ceiling for every leg -- a fixture leg's fixed 55 s ended its capture
+    # 22.9 s before playback did on Ultra-Magnus. The job stops the capture itself after the app exits.
+    PRESENTMON_TIMED_SECONDS = [string][int][math]::Ceiling($timeBudget.smokeProcessTimeoutMs / 1000.0)
+    PRESENTMON_TERMINATE_ON_PROC_EXIT = '$true'
     EMBEDDED_FUNCTIONS = $embeddedFunctions
 })
 
