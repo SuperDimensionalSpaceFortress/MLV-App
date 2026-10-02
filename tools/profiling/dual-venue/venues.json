@@ -31,7 +31,7 @@
   },
   "defaultRole": "supplementary",
   "ownerFootage": {
-    "cleanupClassGone": false,
+    "cleanupClassGone": true,
     "refusal": "OWNER_CLIP_REFUSED_PENDING_CROSS_VOLUME_2"
   }
 }
