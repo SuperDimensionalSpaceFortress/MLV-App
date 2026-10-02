@@ -1081,10 +1081,11 @@ class ReceiptOracleVerdictTests(RunnerHarness, unittest.TestCase):
         mutated = self.mutated_runner([("Invoke-VenueLeg.ps1", "if ($exitCode -ne 0 -and $resolved.outcome -eq 'CAPTURED') {", "if ($false) {")])
         proc, receipt, _ = self.run_leg("ultra-magnus", self.write_spec(), main_mode="captured-nonzero", dv=mutated)
         # With only the RUNNER's check removed the evidence-bearing writer still refuses: the exit code is a hashed artifact
-        # (um-run.json), so the validator re-derives it. (No receipt is written: exit 2.)
-        self.assertEqual(proc.returncode, 2, proc.stdout + proc.stderr)
+        # (um-run.json), so the validator re-derives it. (DVE-LEG-TERMINALS-1 r2: Complete-Receipt writes that refusal as a typed INVALID, not exit 2 with no receipt.)
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
         self.assertIn("OUTCOME_NOT_DERIVABLE", proc.stdout)
-        self.assertIsNone(receipt)
+        self.assertEqual(receipt["outcome"], "INVALID")
+        self.assertIn("the receipt writer refuses it as a PASS", receipt["outcomeDetail"])
         both = self.mutated_runner([("Invoke-VenueLeg.ps1", "if ($exitCode -ne 0 -and $resolved.outcome -eq 'CAPTURED') {", "if ($false) {"),
                                     ("DualVenueRunner.psm1", "if ($exit -ne 0) { $invalid.Add('OUTCOME_NOT_DERIVABLE: the job printed a capture but exited non-zero;", "if ($false) { $invalid.Add('OUTCOME_NOT_DERIVABLE: the job printed a capture but exited non-zero;")])
         _, receipt, _ = self.run_leg("ultra-magnus", self.write_spec(), main_mode="captured-nonzero", dv=both)
@@ -1148,12 +1149,15 @@ class ReceiptOracleVerdictTests(RunnerHarness, unittest.TestCase):
         self.write_artifacts(line={"source_advanced": 100})
         _, receipt, _ = self.run_leg("ultra-magnus", self.write_spec(), dv=mutated)
         self.assertEqual(receipt["outcome"], "INVALID")
-        # ... and removing only the RUNNER's downgrade, the writer refuses (exit 2, no receipt file for the leg).
+        # ... and removing only the RUNNER's downgrade, the writer refuses the PASS and Complete-Receipt writes that refusal as a typed INVALID that names the reason
+        # (DVE-LEG-TERMINALS-1 r2: it used to be exit 2 with no receipt file for the leg).
         mutated = self.mutated_runner([("Invoke-VenueLeg.ps1", "if ($outcome -in @('PASS', 'FAIL') -and $proofProblems.Count -gt 0) {", "if ($false) {")])
         proc, receipt, _ = self.run_leg("ultra-magnus", self.write_spec(), dv=mutated)
-        self.assertEqual(proc.returncode, 2, proc.stdout + proc.stderr)
-        self.assertIn("DVE_RECEIPT_WRITE_FAILED", proc.stdout)
-        self.assertIsNone(receipt)
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        self.assertNotIn("DVE_RECEIPT_WRITE_FAILED", proc.stdout)
+        self.assertEqual(receipt["outcome"], "INVALID")
+        self.assertIn("the receipt writer refuses it as a PASS", receipt["outcomeDetail"])
+        self.assertIn("INVALID_SOURCE_FRAMES", receipt["outcomeDetail"])
 
 
 @requires_windows_pwsh
