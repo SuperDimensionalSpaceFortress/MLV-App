@@ -182,7 +182,10 @@ class CleanStopExecutedTests(_ProbeCase):
     file appears -- the stubbed session-terminate helper creates it, standing in for PresentMon
     reacting to its ETW session being stopped."""
 
-    def _probe(self, *, terminate_stops_capture: bool, timeout: int = 5, pre_exited: bool = False) -> tuple[dict, list[str]]:
+    def _probe(
+        self, *, terminate_stops_capture: bool, timeout: int = 5, pre_exited: bool = False,
+        terminate_exit_code: int = 0, capture_exit_code: int = 0,
+    ) -> tuple[dict, list[str]]:
         out = self.tmp / "result.json"
         calls = self.tmp / "calls.log"
         sentinel = self.tmp / "stop.flag"
@@ -193,11 +196,11 @@ class CleanStopExecutedTests(_ProbeCase):
             "function Invoke-PresentMonSessionTerminate([string]$SessionName, [int]$TimeoutSeconds = 10) {\n"
             "    Add-Content -LiteralPath $callLog -Value \"terminate $SessionName\"\n"
             "    if ($terminateStopsCapture) { New-Item -ItemType File -Path $sentinel -Force | Out-Null }\n"
-            "    [pscustomobject]@{ exitCode = 0; timedOut = $false; error = $null }\n"
+            f"    [pscustomobject]@{{ exitCode = {terminate_exit_code}; timedOut = $false; error = $null }}\n"
             "}\n"
             + ("New-Item -ItemType File -Path $sentinel -Force | Out-Null\n" if pre_exited else "")
             + "$proc = Start-Process -FilePath 'powershell.exe' -ArgumentList @('-NoProfile','-NonInteractive','-Command', "
-            "\"while (-not (Test-Path -LiteralPath '$sentinel')) { Start-Sleep -Milliseconds 100 }; exit 0\") "
+            f"\"while (-not (Test-Path -LiteralPath '$sentinel')) {{ Start-Sleep -Milliseconds 100 }}; exit {capture_exit_code}\") "
             "-PassThru -WindowStyle Hidden\n"
             + ("[void]$proc.WaitForExit(30000)\n" if pre_exited else "")
             + f"$r = Wait-PresentMonCapture $proc -SessionName 'MLVAttr3-test' -TimeoutSeconds {timeout}\n"
@@ -236,6 +239,36 @@ class CleanStopExecutedTests(_ProbeCase):
         self.assertTrue(result["exitedBeforeStop"])
         self.assertFalse(result["killUsed"])
         self.assertIsNone(result["terminateIssuedUtc"])
+
+    def test_a_successful_terminate_makes_the_stop_job_caused_and_says_so(self) -> None:
+        result, _ = self._probe(terminate_stops_capture=True)
+        self.assertTrue(result["terminateSucceeded"])
+        self.assertTrue(result["stopCausedByJob"])
+
+    def test_a_kill_the_job_issued_is_job_caused_even_when_the_terminate_failed(self) -> None:
+        result, _ = self._probe(terminate_stops_capture=False, timeout=1, terminate_exit_code=1)
+        self.assertEqual(result["stopMethod"], "kill_fallback")
+        self.assertFalse(result["terminateSucceeded"])
+        self.assertTrue(result["stopCausedByJob"])
+
+    def test_a_failed_terminate_followed_by_a_capture_crash_is_not_job_caused(self) -> None:
+        # sol r1 BLOCKER (judge 2): helper rc=1, then the capture dies with an access violation. The
+        # old code labelled the stop session_terminate and the call site then accepted rc -1073741819.
+        result, log = self._probe(terminate_stops_capture=True, terminate_exit_code=1, capture_exit_code=-1073741819)
+        self.assertEqual(log, ["terminate MLVAttr3-test"])
+        self.assertEqual(result["stopMethod"], "exited_after_failed_terminate")
+        self.assertFalse(result["terminateSucceeded"])
+        self.assertFalse(result["stopCausedByJob"])
+        self.assertEqual(result["terminateExitCode"], 1)
+        self.assertEqual(result["exitCode"], -1073741819)
+        self.assertFalse(result["killUsed"])
+
+    def test_the_call_site_accepts_a_nonzero_exit_only_for_a_job_caused_stop(self) -> None:
+        template = _template()
+        start = template.index("$presentMonStoppedByJob = ")
+        block = template[start:template.index("# The CSV is final once PresentMon has exited", start)]
+        self.assertIn("$presentMonStoppedByJob = [bool]$presentMonDoneResult.stopCausedByJob", block)
+        self.assertIn("(-not $presentMonStoppedByJob -and [int]$presentMonDoneResult.exitCode -ne 0)", block)
 
     def test_without_a_session_name_the_legacy_timeout_still_throws(self) -> None:
         proc = self.run_probe(
@@ -278,12 +311,72 @@ class CsvTailRepairExecutedTests(_ProbeCase):
         fragment = b"MLVApp.exe,4242,0xCCC,DXGI,0,512,0,Composed: Fl"
         report, after = self._repair(data + fragment)
         self.assertTrue(report["trimmed"])
+        self.assertEqual(report["unterminatedTail"], "dropped_incomplete")
+        self.assertIn("field(s)", report["tailReason"])
         self.assertEqual(after, data + fragment, "the raw capture must never be modified")
         self.assertEqual(report["droppedChars"], len(fragment))
         self.assertTrue(report["droppedText"].startswith("MLVApp.exe,4242"))
         repaired = Path(report["repairedPath"])
         self.assertEqual(repaired.name, "presentmon-repaired.csv")
         self.assertEqual(repaired.read_bytes(), data)
+
+    @staticmethod
+    def _row_text(**kwargs) -> str:
+        row = _real_csv_row(**kwargs)
+        return ",".join(row[name] for name in REAL_PRESENTMON_HEADER)
+
+    def test_a_complete_last_row_without_its_newline_is_kept_not_dropped(self) -> None:
+        # sol r1 BLOCKER (judge 3): PresentMon 2.5.1 writes the newline separately from the fields, so a
+        # row can be complete in the file while its newline is not. 28 fields, all parseable -> keep it.
+        data = self._csv_bytes(5)
+        last = self._row_text(time_in_ms=42000, between_display_change="4000").encode("utf-8")
+        report, after = self._repair(data + last)
+        self.assertFalse(report["trimmed"])
+        self.assertEqual(report["unterminatedTail"], "kept_complete")
+        self.assertEqual(report["droppedChars"], 0)
+        self.assertEqual(report["headerFieldCount"], 28)
+        self.assertEqual(report["tailFieldCount"], 28)
+        self.assertIsNone(report["repairedPath"])
+        self.assertEqual(after, data + last, "the raw capture must never be modified")
+        self.assertFalse((self.tmp / "presentmon-repaired.csv").exists())
+
+    def test_a_full_field_count_last_row_with_an_unparsable_field_is_dropped(self) -> None:
+        data = self._csv_bytes(5)
+        fields = self._row_text(time_in_ms=42000).split(",")
+        fields[-1] = "N"  # a numeric column cut inside its own NA
+        report, after = self._repair(data + ",".join(fields).encode("utf-8"))
+        self.assertTrue(report["trimmed"])
+        self.assertEqual(report["unterminatedTail"], "dropped_incomplete")
+        self.assertEqual(report["tailFieldCount"], 28)
+        self.assertIn("numeric column", report["tailReason"])
+        self.assertEqual(Path(report["repairedPath"]).read_bytes(), data)
+
+    def test_a_last_row_cut_inside_a_quoted_field_is_dropped(self) -> None:
+        data = self._csv_bytes(3)
+        report, _ = self._repair(data + b'MLVApp.exe,4242,0xCCC,"DXGI,0')
+        self.assertTrue(report["trimmed"])
+        self.assertEqual(report["unterminatedTail"], "dropped_incomplete")
+        self.assertIn("quoted", report["tailReason"])
+
+    def test_a_kept_unterminated_row_is_parsed_into_the_report_with_the_row_present(self) -> None:
+        raw = self.tmp / "presentmon.csv"
+        raw.write_bytes(self._csv_bytes(10) + self._row_text(time_in_ms=15000).encode("utf-8"))
+        result_path = self.tmp / "result.json"
+        result_path.write_text(json.dumps(_result_json()), encoding="utf-8")
+        out = self.tmp / "report.json"
+        proc = self.run_probe(
+            f"$trim = Repair-PresentMonCsvTail '{raw}'\n"
+            "if ($trim.unterminatedTail -ne 'kept_complete') { throw 'expected the row to be kept' }\n"
+            f"$start = [datetime]::Parse('{CAPTURE_START_UTC}', $null, [Globalization.DateTimeStyles]::RoundtripKind)\n"
+            f"$resultJson = Get-Content -LiteralPath '{result_path}' -Raw | ConvertFrom-Json\n"
+            f"Get-AttrCudaPresentMonDisplayReport -CsvPath '{raw}' -ResultJson $resultJson "
+            "-EarliestCaptureStartUtc $start -LatestCaptureStartUtc $start "
+            f"| ConvertTo-Json -Depth 10 | Set-Content -LiteralPath '{out}' -Encoding UTF8\n"
+        )
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        report = json.loads(out.read_text(encoding="utf-8-sig"))
+        self.assertEqual(report["status"], "OK", report)
+        self.assertEqual(report["selectedChain"]["displayedCount"], 11)
 
     def test_a_kill_fallback_csv_with_a_truncated_last_line_still_parses_into_a_report(self) -> None:
         raw = self.tmp / "presentmon.csv"
@@ -305,6 +398,179 @@ class CsvTailRepairExecutedTests(_ProbeCase):
         self.assertEqual(report["status"], "OK", report)
         self.assertEqual(report["selectedChain"]["displayedCount"], 10)
         self.assertEqual(report["selectedChain"]["processId"], TARGET_PID)
+
+
+class FailurePathStopExecutedTests(_ProbeCase):
+    """fable r1 hardening 1: a failure-path stop terminates the job's NAMED session before any Kill()."""
+
+    def _stop(self, *, terminate_stops_capture: bool, session: str = "MLVAttr3-test") -> tuple[dict, list[str]]:
+        out = self.tmp / "stop-result.json"
+        calls = self.tmp / "calls.log"
+        sentinel = self.tmp / "stop.flag"
+        session_arg = f" -SessionName '{session}'" if session else ""
+        body = (
+            f"$sentinel = '{sentinel}'\n"
+            f"$callLog = '{calls}'\n"
+            f"$terminateStopsCapture = ${str(terminate_stops_capture).lower()}\n"
+            "function Invoke-PresentMonSessionTerminate([string]$SessionName, [int]$TimeoutSeconds = 10) {\n"
+            "    Add-Content -LiteralPath $callLog -Value \"terminate $SessionName\"\n"
+            "    if ($terminateStopsCapture) { New-Item -ItemType File -Path $sentinel -Force | Out-Null }\n"
+            "    [pscustomobject]@{ exitCode = 0; timedOut = $false; error = $null }\n"
+            "}\n"
+            "$proc = Start-Process -FilePath 'powershell.exe' -ArgumentList @('-NoProfile','-NonInteractive','-Command', "
+            "\"while (-not (Test-Path -LiteralPath '$sentinel')) { Start-Sleep -Milliseconds 100 }; exit 0\") "
+            "-PassThru -WindowStyle Hidden\n"
+            f"$r = Stop-PresentMonCapture -Proc $proc{session_arg}\n"
+            f"$r | ConvertTo-Json -Depth 5 | Set-Content -LiteralPath '{out}' -Encoding UTF8\n"
+        )
+        proc = self.run_probe(body)
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        log = calls.read_text(encoding="utf-8").splitlines() if calls.exists() else []
+        return json.loads(out.read_text(encoding="utf-8-sig")), log
+
+    def test_a_failure_path_stop_terminates_the_named_session_and_needs_no_kill(self) -> None:
+        result, log = self._stop(terminate_stops_capture=True)
+        self.assertEqual(log, ["terminate MLVAttr3-test"])
+        self.assertTrue(result["confirmedExited"])
+        self.assertIsNone(result["killError"])
+
+    def test_a_failure_path_stop_kills_after_the_terminate_when_the_capture_ignores_it(self) -> None:
+        result, log = self._stop(terminate_stops_capture=False)
+        self.assertEqual(log, ["terminate MLVAttr3-test"])
+        self.assertTrue(result["confirmedExited"], "the Kill() fallback must still end the capture")
+
+    def test_without_a_session_name_the_failure_path_stop_is_the_bare_kill_it_always_was(self) -> None:
+        result, log = self._stop(terminate_stops_capture=True, session="")
+        self.assertEqual(log, [])
+        self.assertTrue(result["confirmedExited"])
+
+    def test_every_failure_path_stop_call_in_the_job_passes_the_session_name(self) -> None:
+        template = _template()
+        for name in ("$presentMonStopOnKeepAliveFailure", "$presentMonStop"):
+            self.assertIn(f"{name} = Stop-PresentMonCapture -Proc $presentMonProc -SessionName $PresentMonSessionName", template)
+        self.assertEqual(template.count("Stop-PresentMonCapture -Proc $presentMonProc -SessionName $PresentMonSessionName"), 3)
+        self.assertNotIn("Stop-PresentMonCapture -Proc $presentMonProc\n", template)
+
+
+def _swap_window_log(swaps: int, *, first: str = "2026-01-01T00:00:02.0000000Z", last: str = "2026-01-01T00:00:42.0000000Z") -> str:
+    # The real playback_smoke.gpu_window_swaps field set (MainWindow.cpp), window = process lifetime
+    # (WINDOW_START_UTC..WINDOW_END_UTC) so the app's swap span is 40000 ms.
+    return (
+        "playback_smoke.gpu_window_swaps session=1 window_active=1 telemetry_enabled=1 "
+        f"swaps={swaps} swap_fps=1.0 max_gap_ms=1.0 max_gap_before_serial=1 max_gap_after_serial=2 "
+        f"frames_presented={swaps} swaps_minus_frames_presented=0 head_gap_ms=1.0 tail_gap_ms=1.0 "
+        f"first_swap_utc={first} last_swap_utc={last}"
+    )
+
+
+@requires_pwsh
+class JobStopSufficiencyExecutedTests(unittest.TestCase):
+    """sol r1 BLOCKER (judge 2): after a stop THIS JOB caused, the capture must prove it covers the
+    measured playback window. The presentMonStatus block is EXECUTED verbatim from the generator against
+    the module's real report output."""
+
+    @classmethod
+    def setUpClass(cls) -> None:
+        text = _generator_text()
+        start = text.index("$presentMonSufficiencyMinIntervalCount = 30")
+        cls.status_source = text[start:text.index("\n\n$dllSha256Lower", start)]
+
+    def setUp(self) -> None:
+        if os.name != "nt":
+            self.skipTest("the ATTR-3 host jobs are Windows-only")
+        self._tmp = tempfile.TemporaryDirectory(prefix="attr3-pmsuff-")
+        self.tmp = Path(os.path.realpath(self._tmp.name))
+        self.addCleanup(self._tmp.cleanup)
+
+    def _csv(self, times: list[float], *, between: dict[float, str] | None = None) -> Path:
+        lines = [",".join(REAL_PRESENTMON_HEADER)]
+        for t in times:
+            row = _real_csv_row(time_in_ms=t, between_display_change=(between or {}).get(t, "50"))
+            lines.append(",".join(row[name] for name in REAL_PRESENTMON_HEADER))
+        path = self.tmp / "presentmon.csv"
+        path.write_text("\r\n".join(lines) + "\r\n", encoding="utf-8")
+        return path
+
+    def _status(self, times: list[float], raw_log: str, *, stopped_by_job: bool, between: dict[float, str] | None = None) -> dict:
+        csv_path = self._csv(times, between=between)
+        result_path = self.tmp / "result.json"
+        result_path.write_text(json.dumps(_result_json()), encoding="utf-8")
+        log_path = self.tmp / "raw.log"
+        log_path.write_text(raw_log, encoding="utf-8")
+        out = self.tmp / "status.json"
+        script = self.tmp / "probe.ps1"
+        script.write_text(
+            "$ErrorActionPreference = 'Stop'\n"
+            f"Import-Module '{MODULE}' -Force\n"
+            f"$captureStart = [datetime]::Parse('{CAPTURE_START_UTC}', $null, [Globalization.DateTimeStyles]::RoundtripKind)\n"
+            f"$resultJson = (Get-Content -LiteralPath '{result_path}' -Raw | ConvertFrom-Json)\n"
+            f"$rawLog = Get-Content -LiteralPath '{log_path}' -Raw\n"
+            "if ($null -eq $rawLog) { $rawLog = '' }\n"
+            f"$presentMonStoppedByJob = ${str(stopped_by_job).lower()}\n"
+            f"$displayReport = Get-AttrCudaPresentMonDisplayReport -CsvPath '{csv_path}' -ResultJson $resultJson "
+            "-EarliestCaptureStartUtc $captureStart -LatestCaptureStartUtc $captureStart\n"
+            "$pmRows = @($displayReport.selectedChainRows)\n"
+            "$pmIntervalRows = @($pmRows | Where-Object { $null -ne $_.msBetweenDisplayChange -and $_.msBetweenDisplayChange -gt 0 })\n"
+            f"{self.status_source}\n"
+            "[pscustomobject]@{ presentMonStatus = $presentMonStatus; presentMonStatusReason = $presentMonStatusReason; "
+            "presented = $presentMonPresentedCount; spanShortfallMs = $presentMonJobStopSpanShortfallMs; "
+            "countDeviation = $presentMonJobStopCountDeviation } | ConvertTo-Json -Depth 5 | "
+            f"Set-Content -LiteralPath '{out}' -Encoding UTF8\n"
+            "Write-Output 'PROBE_DONE'\n",
+            encoding="utf-8",
+        )
+        proc = _run_pwsh_file(script)
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        self.assertIn("PROBE_DONE", proc.stdout, proc.stdout + proc.stderr)
+        return json.loads(out.read_text(encoding="utf-8-sig"))
+
+    @staticmethod
+    def _rows_through(last_ms: float, *, count: int) -> list[float]:
+        return [last_ms - (count - 1 - i) * 50.0 for i in range(count)]
+
+    def test_sol_repro_lost_tail_after_a_job_caused_stop_is_not_ok(self) -> None:
+        # 720 rows at 50 ms through 38000 ms in a 2000-42000 ms window; the app reports 724 swaps; the
+        # tail gap is 4000 ms. The old gate: coverage 0.9945, tail gap under 5 s -> ok.
+        times = self._rows_through(38000.0, count=720)
+        for stopped in (False, True):
+            result = self._status(times, _swap_window_log(724), stopped_by_job=stopped)
+            if not stopped:
+                self.assertEqual(result["presentMonStatus"], "ok", "a capture that ended on its own keeps the old arms")
+            else:
+                self.assertEqual(result["presentMonStatus"], "degraded", result)
+                self.assertIn("job-stop span", result["presentMonStatusReason"])
+                self.assertGreaterEqual(result["spanShortfallMs"], 3900.0)
+
+    def test_a_job_caused_stop_that_covers_the_whole_window_stays_ok(self) -> None:
+        times = self._rows_through(42000.0, count=801)
+        result = self._status(times, _swap_window_log(801), stopped_by_job=True)
+        self.assertEqual(result["presentMonStatus"], "ok", result)
+        self.assertIsNone(result["presentMonStatusReason"])
+        self.assertLessEqual(result["spanShortfallMs"], 1.0)
+        self.assertEqual(result["countDeviation"], 0.0)
+
+    def test_a_job_caused_stop_whose_present_count_misses_the_app_swap_count_is_not_ok(self) -> None:
+        times = self._rows_through(42000.0, count=801)
+        result = self._status(times, _swap_window_log(850), stopped_by_job=True)
+        self.assertEqual(result["presentMonStatus"], "degraded", result)
+        self.assertIn("job-stop count", result["presentMonStatusReason"])
+        self.assertNotIn("job-stop span", result["presentMonStatusReason"])
+
+    def test_a_job_caused_stop_without_swap_window_timestamps_cannot_prove_coverage(self) -> None:
+        times = self._rows_through(42000.0, count=801)
+        gate_only = "playback_smoke.gate session=1 verdict=0 frames_presented=801 decode_requests_issued=801\n"
+        result = self._status(times, gate_only, stopped_by_job=True)
+        self.assertEqual(result["presentMonStatus"], "degraded", result)
+        self.assertIn("cannot be proven", result["presentMonStatusReason"])
+
+    def test_sol_repro_a_complete_final_row_kept_by_the_repair_keeps_the_report_whole(self) -> None:
+        # judge 3 shape end to end: 720 complete 50 ms rows through 38000 ms and a complete final row at
+        # 42000 ms carrying a 4000 ms interval. Kept (not dropped), the capture covers the window.
+        times = self._rows_through(38000.0, count=720) + [42000.0]
+        result = self._status(times, _swap_window_log(721), stopped_by_job=True, between={42000.0: "4000"})
+        self.assertEqual(result["presented"], 721)
+        self.assertEqual(result["presentMonStatus"], "ok", result)
+        self.assertLessEqual(result["spanShortfallMs"], 100.0)
 
 
 if __name__ == "__main__":

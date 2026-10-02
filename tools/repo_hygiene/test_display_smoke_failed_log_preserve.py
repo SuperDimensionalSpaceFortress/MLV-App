@@ -263,7 +263,7 @@ class SmokeRunFailedBranchTests(_ProbeCase):
             + "$displayBlock = Build-AttrCudaDisplayBlock -WindowsInventory $windowsDisplayInventory "
             "-Venue $measurementVenue -ExpectedWidth $expectedDisplayWidth -ExpectedHeight $expectedDisplayHeight "
             "-PreferredResolution $displayPreferResolution\n"
-            + "function Stop-PresentMonCapture($Proc) { [pscustomobject]@{ confirmedExited = $true; killError = $null; waitError = $null } }\n"
+            + "function Stop-PresentMonCapture($Proc, [string]$SessionName = '') { [pscustomobject]@{ confirmedExited = $true; killError = $null; waitError = $null } }\n"
             + "function Save-Json($Object, [string]$Path) { $Object | ConvertTo-Json -Depth 30 | Set-Content -LiteralPath $Path -Encoding UTF8 }\n"
             + setup_log
             + _failure_branch() + "\n"

@@ -1228,25 +1228,91 @@ function Invoke-PresentMonSessionTerminate([string]$SessionName, [int]$TimeoutSe
 
 function Repair-PresentMonCsvTail([string]$Path) {
     # UM-PRESENTMON-STOP-1: a Kill()ed PresentMon loses its unflushed write buffer, so the CSV can end
-    # mid-field (both Ultra-Magnus owner captures did). PresentMon terminates every row with a newline,
-    # so a file whose last character is not one ends in an incomplete row. The raw capture is NEVER
-    # modified: the complete rows are written to a sibling presentmon-repaired.csv (through the
-    # write-confined Publish-AttrCudaText) and the caller parses and publishes THAT, with the raw file
-    # kept beside it as evidence. The report says exactly what was dropped. A file that ends on a
-    # newline needs no repair (trimmed=$false, repairedPath=$null).
+    # mid-field (both Ultra-Magnus owner captures did). Newline ABSENCE is not proof that the last row is
+    # incomplete: PresentMon 2.5.1 writes a row's newline separately from its fields (CsvOutput.cpp), so a
+    # buffer boundary can land between the last field and its newline. The unterminated last line is
+    # judged on its CONTENT: it is COMPLETE (kept) when it has the header's full field count and every
+    # field parses (numeric columns hold a number or NA, the others are non-empty); it is dropped only
+    # when it is genuinely short, ends inside a quote, or does not parse. The raw capture is NEVER
+    # modified: when a row is dropped the complete rows are written to a sibling presentmon-repaired.csv
+    # (through the write-confined Publish-AttrCudaText) and the caller parses and publishes THAT, with the
+    # raw file kept beside it as evidence. A kept row needs no repaired copy (trimmed=$false,
+    # repairedPath=$null). unterminatedTail records which case happened: none (the file ends on a
+    # newline), kept_complete, or dropped_incomplete.
     $text = Get-Content -LiteralPath $Path -Raw
     if ($null -eq $text -or $text.Length -eq 0 -or $text -match "`n\z") {
-        return [pscustomobject]@{ trimmed = $false; droppedChars = 0; droppedText = $null; repairedPath = $null }
+        return [pscustomobject]@{ trimmed = $false; unterminatedTail = 'none'; droppedChars = 0; droppedText = $null; repairedPath = $null; headerFieldCount = $null; tailFieldCount = $null; tailReason = $null }
+    }
+    $splitFields = {
+        param([string]$Line)
+        $fields = [System.Collections.Generic.List[string]]::new()
+        $sb = [System.Text.StringBuilder]::new()
+        $inQuote = $false
+        for ($i = 0; $i -lt $Line.Length; $i++) {
+            $c = $Line[$i]
+            if ($inQuote) {
+                if ($c -eq '"') {
+                    if (($i + 1) -lt $Line.Length -and $Line[$i + 1] -eq '"') { [void]$sb.Append('"'); $i++ } else { $inQuote = $false }
+                } else { [void]$sb.Append($c) }
+            } elseif ($c -eq '"') {
+                $inQuote = $true
+            } elseif ($c -eq ',') {
+                $fields.Add($sb.ToString())
+                [void]$sb.Clear()
+            } else {
+                [void]$sb.Append($c)
+            }
+        }
+        $fields.Add($sb.ToString())
+        [pscustomobject]@{ fields = @($fields); openQuote = $inQuote }
     }
     $newlines = [regex]::Matches($text, "`n")
     $keep = if ($newlines.Count -eq 0) { 0 } else { $newlines[$newlines.Count - 1].Index + 1 }
+    $tailLine = $text.Substring($keep) -replace '\r\z', ''
+    $headerFieldCount = $null
+    $tailFieldCount = $null
+    $tailReason = $null
+    $complete = $false
+    if ($newlines.Count -eq 0) {
+        $tailReason = 'no header line (the file has no newline at all)'
+    } else {
+        $header = & $splitFields ($text.Substring(0, $newlines[0].Index) -replace '\r\z', '')
+        $headerFieldCount = $header.fields.Count
+        $tail = & $splitFields $tailLine
+        $tailFieldCount = $tail.fields.Count
+        if ($tailLine.Length -eq 0) {
+            $tailReason = 'empty last line'
+        } elseif ($tail.openQuote) {
+            $tailReason = 'last line ends inside a quoted field'
+        } elseif ($tailFieldCount -ne $headerFieldCount) {
+            $tailReason = "last line has $tailFieldCount field(s), the header has $headerFieldCount"
+        } else {
+            $bad = $null
+            for ($i = 0; $i -lt $headerFieldCount -and $null -eq $bad; $i++) {
+                $name = $header.fields[$i]
+                $value = $tail.fields[$i]
+                if ($name -match '^(Ms|ProcessID$|SyncInterval$|PresentFlags$|AllowsTearing$|TimeInMs$|CPUStartTimeInMs$|AnimationTime$)') {
+                    [double]$parsed = 0.0
+                    if ($value -ne 'NA' -and -not [double]::TryParse($value, [Globalization.NumberStyles]::Float, [Globalization.CultureInfo]::InvariantCulture, [ref]$parsed)) {
+                        $bad = "numeric column $name holds '$value'"
+                    }
+                } elseif ($value.Length -eq 0) {
+                    $bad = "column $name is empty"
+                }
+            }
+            if ($null -ne $bad) { $tailReason = $bad } else { $complete = $true }
+        }
+    }
+    if ($complete) {
+        return [pscustomobject]@{ trimmed = $false; unterminatedTail = 'kept_complete'; droppedChars = 0; droppedText = $null; repairedPath = $null; headerFieldCount = $headerFieldCount; tailFieldCount = $tailFieldCount; tailReason = 'complete row without its trailing newline: full field count and every field parses' }
+    }
     $droppedText = $text.Substring($keep)
     $droppedChars = $droppedText.Length
     if ($droppedText.Length -gt 200) { $droppedText = $droppedText.Substring(0, 200) }
     # Publish-AttrCudaText ends the file with one newline of its own, so the kept text loses its last one.
     $kept = $text.Substring(0, $keep) -replace '\r?\n\z', ''
     $repairedPath = Publish-AttrCudaText -Path (Join-Path (Split-Path -Parent $Path) 'presentmon-repaired.csv') -Value $kept
-    [pscustomobject]@{ trimmed = $true; droppedChars = $droppedChars; droppedText = $droppedText; repairedPath = $repairedPath }
+    [pscustomobject]@{ trimmed = $true; unterminatedTail = 'dropped_incomplete'; droppedChars = $droppedChars; droppedText = $droppedText; repairedPath = $repairedPath; headerFieldCount = $headerFieldCount; tailFieldCount = $tailFieldCount; tailReason = $tailReason }
 }
 
 function Wait-PresentMonCapture($Proc, [string]$SessionName = '', [int]$TimeoutSeconds = 10, [int]$KillWaitTimeoutSeconds = 10) {
@@ -1257,13 +1323,18 @@ function Wait-PresentMonCapture($Proc, [string]$SessionName = '', [int]$TimeoutS
     # stopMethod='kill_fallback' so the caller drops the cut-off last CSV row. Without one: the
     # legacy passive wait, then Kill() and PRESENTMON_TIMEOUT.
     $exitedBeforeStop = [bool]$Proc.HasExited
-    $stopMethod = if ($exitedBeforeStop) { 'already_exited' } elseif ($SessionName -eq '') { 'legacy_wait' } else { 'session_terminate' }
     $terminate = $null
     $terminateIssuedUtc = $null
     if (-not $exitedBeforeStop -and $SessionName -ne '') {
         $terminateIssuedUtc = (Get-Date).ToUniversalTime().ToString('o')
         $terminate = Invoke-PresentMonSessionTerminate -SessionName $SessionName
     }
+    # A stop is only CAUSED BY THIS JOB when the terminate helper itself succeeded (exit 0, no timeout,
+    # no error) or the job issued the Kill() below. A failed helper followed by an exit leaves the cause
+    # unknown (exited_after_failed_terminate): the capture may have crashed on its own, so the caller
+    # judges it by its exit code like any other self-ended capture.
+    $terminateSucceeded = ($null -ne $terminate) -and ($null -eq $terminate.error) -and (-not $terminate.timedOut) -and ($null -ne $terminate.exitCode) -and ([int]$terminate.exitCode -eq 0)
+    $stopMethod = if ($exitedBeforeStop) { 'already_exited' } elseif ($SessionName -eq '') { 'legacy_wait' } elseif ($terminateSucceeded) { 'session_terminate' } else { 'exited_after_failed_terminate' }
     $killUsed = $false
     $killIssuedUtc = $null
     $killError = $null
@@ -1302,7 +1373,9 @@ function Wait-PresentMonCapture($Proc, [string]$SessionName = '', [int]$TimeoutS
         exitCode = $Proc.ExitCode
         sessionName = $SessionName
         stopMethod = $stopMethod
+        stopCausedByJob = ($stopMethod -in @('session_terminate', 'kill_fallback'))
         exitedBeforeStop = $exitedBeforeStop
+        terminateSucceeded = [bool]$terminateSucceeded
         terminateIssuedUtc = $terminateIssuedUtc
         terminateExitCode = $(if ($null -ne $terminate) { $terminate.exitCode } else { $null })
         terminateTimedOut = $(if ($null -ne $terminate) { [bool]$terminate.timedOut } else { $false })
@@ -1314,7 +1387,10 @@ function Wait-PresentMonCapture($Proc, [string]$SessionName = '', [int]$TimeoutS
     }
 }
 
-function Stop-PresentMonCapture($Proc, [int]$TimeoutSeconds = 10) {
+function Stop-PresentMonCapture($Proc, [int]$TimeoutSeconds = 10, [string]$SessionName = '') {
+    # UM-PRESENTMON-STOP-1 r2 (fable hardening 1): given this job's -SessionName, the NAMED ETW session
+    # is terminated first (best effort, bounded) and the capture gets a short grace to exit on its own
+    # before the Kill(); a bare Kill() leaves its uniquely named session behind and nothing reclaims it.
     # ATTR3-SMOKE-RUNNER-DEPS-1 (D): used only when the smoke run itself is already known to have
     # failed -- PresentMon is stopped, never waited out, so a smoke-side failure is reported as
     # SMOKE_RUN_FAILED and not mis-diagnosed as PRESENTMON_TIMEOUT.
@@ -1325,6 +1401,12 @@ function Stop-PresentMonCapture($Proc, [int]$TimeoutSeconds = 10) {
     # report a stop that did not actually confirm exit instead of silently trusting it.
     $killError = $null
     $waitError = $null
+    $sessionTerminate = $null
+    $graceWaitError = $null
+    if (-not $Proc.HasExited -and $SessionName -ne '') {
+        $sessionTerminate = Invoke-PresentMonSessionTerminate -SessionName $SessionName -TimeoutSeconds 5
+        try { [void]$Proc.WaitForExit(5000) } catch { $graceWaitError = $_.Exception.Message }
+    }
     if (-not $Proc.HasExited) {
         try { $Proc.Kill() } catch { $killError = $_.Exception.Message }
         try {
@@ -1339,6 +1421,8 @@ function Stop-PresentMonCapture($Proc, [int]$TimeoutSeconds = 10) {
         confirmedExited = [bool]$Proc.HasExited
         killError = $killError
         waitError = $waitError
+        sessionTerminate = $sessionTerminate
+        graceWaitError = $graceWaitError
     }
 }
 
@@ -2289,7 +2373,7 @@ $presentMonCaptureStartUncertaintyMs = ($presentMonPostSpawnUtc - $presentMonCap
 $keepAliveHealthBeforeSmokeLaunch = Get-AttrCudaDisplayWakeKeepAliveHealth -Handle $displayWakeKeepAlive
 if (-not $keepAliveHealthBeforeSmokeLaunch.healthy) {
     $displayWake['keepAliveHealth'] = $keepAliveHealthBeforeSmokeLaunch
-    $presentMonStopOnKeepAliveFailure = Stop-PresentMonCapture -Proc $presentMonProc
+    $presentMonStopOnKeepAliveFailure = Stop-PresentMonCapture -Proc $presentMonProc -SessionName $PresentMonSessionName
     $keepAliveRefusal = [ordered]@{
         schema='playback-attr-3-cuda-venue.v1'; result='KEEPALIVE_FAILED'
         fixtureRehearsal=$FixtureRehearsal
@@ -2327,7 +2411,7 @@ Write-JobTrace "step smoke-launch done rc=$smokeRc"
 # PRESENTMON_TIMEOUT is reserved for the one case it actually means: the smoke run succeeded and
 # PresentMon still would not exit.
 if ($null -ne $smokeLaunchException -or $smokeRc -ne 0 -or -not (Test-Path -LiteralPath $resultPath)) {
-    $presentMonStop = Stop-PresentMonCapture -Proc $presentMonProc
+    $presentMonStop = Stop-PresentMonCapture -Proc $presentMonProc -SessionName $PresentMonSessionName
     $smokeStderrPath = Join-Path $legOut 'smoke-stderr.txt'
     $smokeStderrTail = ''
     if (Test-Path -LiteralPath $smokeStderrPath) {
@@ -2432,7 +2516,7 @@ try {
     # PresentMon has not been waited on yet at this point (that now happens further down, after
     # smoke evidence publishes) -- stopped here exactly like the SMOKE_RUN_FAILED branch above,
     # never left to run out its own --timed budget for a run this job is about to fail anyway.
-    $presentMonStop = Stop-PresentMonCapture -Proc $presentMonProc
+    $presentMonStop = Stop-PresentMonCapture -Proc $presentMonProc -SessionName $PresentMonSessionName
     $unavailable = [ordered]@{
         schema='playback-attr-3-cuda-venue.v1'; result='SMOKE_LOG_UNAVAILABLE'
         fixtureRehearsal=$FixtureRehearsal
@@ -2503,9 +2587,12 @@ try {
     $presentMonDoneResult = Wait-PresentMonCapture $presentMonProc -SessionName $PresentMonSessionName
     $presentMonCleanStop = $presentMonDoneResult
     # UM-PRESENTMON-STOP-1: a nonzero exit is a failed capture only when PresentMon ended on its own
-    # (timed ceiling or process exit); an exit this job caused -- the named session terminated, or the
-    # kill fallback -- is the end of the capture, and the CSV's own completeness is checked below.
-    $presentMonStoppedByJob = $presentMonDoneResult.stopMethod -in @('session_terminate', 'kill_fallback')
+    # (timed ceiling or process exit); an exit this job caused -- the named session terminated by a
+    # SUCCESSFUL helper, or the kill fallback -- is the end of the capture. A failed terminate helper
+    # followed by an exit is NOT job-caused (stopMethod exited_after_failed_terminate), so a crash there
+    # is still a failed capture. After a job-caused stop the capture must also PROVE it covers the
+    # measured playback window (job-stop sufficiency arms in the presentMonStatus block below).
+    $presentMonStoppedByJob = [bool]$presentMonDoneResult.stopCausedByJob
     if ($presentMonDoneResult.status -ne 'done' -or (-not $presentMonStoppedByJob -and [int]$presentMonDoneResult.exitCode -ne 0)) {
         throw "PresentMon capture invalid status=$($presentMonDoneResult.status) rc=$($presentMonDoneResult.exitCode)"
     }
@@ -2521,7 +2608,7 @@ try {
 } catch {
     $presentMonWaitError = $_.Exception.Message
 }
-Write-JobTrace "step presentmon-stop done method=$($presentMonCleanStop.stopMethod) exitedBeforeStop=$($presentMonCleanStop.exitedBeforeStop) exitCode=$($presentMonCleanStop.exitCode) terminateExitCode=$($presentMonCleanStop.terminateExitCode) killUsed=$($presentMonCleanStop.killUsed) csvTailTrimmed=$($presentMonTailTrim.trimmed) error=$presentMonWaitError"
+Write-JobTrace "step presentmon-stop done method=$($presentMonCleanStop.stopMethod) exitedBeforeStop=$($presentMonCleanStop.exitedBeforeStop) exitCode=$($presentMonCleanStop.exitCode) terminateExitCode=$($presentMonCleanStop.terminateExitCode) killUsed=$($presentMonCleanStop.killUsed) terminateSucceeded=$($presentMonCleanStop.terminateSucceeded) stopCausedByJob=$($presentMonCleanStop.stopCausedByJob) csvTailTrimmed=$($presentMonTailTrim.trimmed) unterminatedTail=$($presentMonTailTrim.unterminatedTail) error=$presentMonWaitError"
 if ($null -ne $presentMonWaitError) {
     # CUDA-PERF-DISPLAY-IDENTITY-HARNESS-3 (fable HARDENING): a wait failure used to publish
     # neither the partial presentmon.csv (stable here -- Wait-PresentMonCapture kills the process
@@ -2866,7 +2953,56 @@ $presentMonTemporal = Get-AttrCudaTemporalCoverage -TimeInMsValues @($pmInterval
 $presentMonCountSufficient = ($pmIntervalRows.Count -ge $presentMonSufficiencyMinIntervalCount)
 $presentMonCoverageSufficient = ($presentMonCoverageAvailable -and ($presentMonCoverageFraction -ge $presentMonSufficiencyMinCoverageFraction))
 $presentMonTemporalSufficient = [bool]$presentMonTemporal.sufficient
-$presentMonSufficient = $presentMonCountSufficient -and $presentMonCoverageSufficient -and $presentMonTemporalSufficient
+# UM-PRESENTMON-STOP-1 r2 (sol BLOCKER, judge 2): when THIS JOB ended the capture (a successful named
+# terminate, or its own Kill()), the loose arms above (>= 50% coverage, <= 5 s gaps) are not enough --
+# a stop can lose measured data that still clears them (sol's repro: 720 rows through 38000 ms of a
+# 2000-42000 ms window, app swaps 724, tail gap 4000 ms, reported ok with mean 50 ms against a true
+# 55.2 ms). So after a job-caused stop the capture must PROVE it covers the measured playback:
+#   (4) SPAN: the retained positive-interval rows must span the app's own measured swap window
+#       (playback_smoke.gpu_window_swaps first_swap_utc..last_swap_utc) to within
+#       $presentMonJobStopMaxSpanShortfallMs. Both spans are DIFFERENCES, so the check does not depend
+#       on the capture-start clock anchor.
+#   (5) COUNT MATCH: the retained MLVApp presents must match the app's own swap count to within
+#       $presentMonJobStopMaxCountDeviation.
+# Missing evidence (no swap-window timestamps, no swap count) fails the arm: a stop this job caused is
+# never read as a complete capture on the strength of absent data. A capture that ended on its own is
+# unaffected. These two bounds are NOT calibrated on a venue capture yet; the measured values are traced
+# (presentmon-job-stop-sufficiency) so the post-merge falsifier can tighten or relax them on evidence.
+$presentMonJobStopMaxSpanShortfallMs = 1000.0
+$presentMonJobStopMaxCountDeviation = 0.02
+$presentMonJobStopFailedArms = @()
+$presentMonJobStopSpanShortfallMs = $null
+$presentMonJobStopCountDeviation = $null
+if ($presentMonStoppedByJob) {
+    $swapWindowMatches = if ($appSwapTelemetry.source -eq 'gpu_window_swaps') { @([regex]::Matches($rawLog, 'playback_smoke\.gpu_window_swaps [^\r\n]*?first_swap_utc=(?<first>\S+) last_swap_utc=(?<last>\S+)')) } else { @() }
+    $swapFirstUtc = [datetime]::MinValue
+    $swapLastUtc = [datetime]::MinValue
+    $swapWindowParsed = ($swapWindowMatches.Count -gt 0) -and
+        [datetime]::TryParse($swapWindowMatches[$swapWindowMatches.Count - 1].Groups['first'].Value, [Globalization.CultureInfo]::InvariantCulture, [Globalization.DateTimeStyles]::RoundtripKind, [ref]$swapFirstUtc) -and
+        [datetime]::TryParse($swapWindowMatches[$swapWindowMatches.Count - 1].Groups['last'].Value, [Globalization.CultureInfo]::InvariantCulture, [Globalization.DateTimeStyles]::RoundtripKind, [ref]$swapLastUtc) -and
+        ($swapLastUtc -gt $swapFirstUtc)
+    if (-not $swapWindowParsed) {
+        $presentMonJobStopFailedArms += 'job-stop span: the capture was ended by this job and the run log carries no usable playback_smoke.gpu_window_swaps first_swap_utc/last_swap_utc, so coverage of the measured playback cannot be proven'
+    } else {
+        $pmIntervalTimes = @($pmIntervalRows | ForEach-Object { [double]$_.timeInMs } | Sort-Object)
+        $appSwapSpanMs = ($swapLastUtc - $swapFirstUtc).TotalMilliseconds
+        $retainedSpanMs = if ($pmIntervalTimes.Count -ge 2) { $pmIntervalTimes[$pmIntervalTimes.Count - 1] - $pmIntervalTimes[0] } else { 0.0 }
+        $presentMonJobStopSpanShortfallMs = $appSwapSpanMs - $retainedSpanMs
+        if ($presentMonJobStopSpanShortfallMs -gt $presentMonJobStopMaxSpanShortfallMs) {
+            $presentMonJobStopFailedArms += "job-stop span: the capture was ended by this job and its retained rows span $([math]::Round($retainedSpanMs, 0)) ms against the app's own $([math]::Round($appSwapSpanMs, 0)) ms measured swap window ($([math]::Round($presentMonJobStopSpanShortfallMs, 0)) ms short, above the $([math]::Round($presentMonJobStopMaxSpanShortfallMs, 0)) ms bound), so measured data was lost"
+        }
+    }
+    if (-not $presentMonCoverageAvailable) {
+        $presentMonJobStopFailedArms += 'job-stop count: the capture was ended by this job and the run log carries no app-side swap count to match the retained presents against'
+    } else {
+        $presentMonJobStopCountDeviation = [math]::Abs($presentMonPresentedCount - $presentMonAppSwapCount) / [double]$presentMonAppSwapCount
+        if ($presentMonJobStopCountDeviation -gt $presentMonJobStopMaxCountDeviation) {
+            $presentMonJobStopFailedArms += "job-stop count: the capture was ended by this job and retained $presentMonPresentedCount present(s) against the app's own $presentMonAppSwapCount $presentMonAppSwapSource ($([math]::Round($presentMonJobStopCountDeviation * 100, 1))% apart, above the $([math]::Round($presentMonJobStopMaxCountDeviation * 100, 1))% bound)"
+        }
+    }
+}
+$presentMonJobStopSufficient = ($presentMonJobStopFailedArms.Count -eq 0)
+$presentMonSufficient = $presentMonCountSufficient -and $presentMonCoverageSufficient -and $presentMonTemporalSufficient -and $presentMonJobStopSufficient
 $presentMonStatus = if ($presentMonSufficient) { 'ok' } else { 'degraded' }
 $presentMonStatusReason = if ($presentMonSufficient) {
     $null
@@ -2887,6 +3023,7 @@ $presentMonStatusReason = if ($presentMonSufficient) {
     if (-not $presentMonTemporalSufficient) {
         $presentMonFailedArms += "temporal: a $([math]::Round($presentMonTemporal.maxGapMs / 1000.0, 1))s $($presentMonTemporal.gapKind) gap between positive-interval rows exceeds the $([math]::Round($presentMonSufficiencyMaxGapMs / 1000.0, 1))s ceiling"
     }
+    $presentMonFailedArms += $presentMonJobStopFailedArms
     "PresentMon's display-cadence evidence is too thin to corroborate as measured -- $($presentMonFailedArms -join '; ') -- display itself is still confirmed, cadence is not"
 }
 # CUDA-PLAYBACK-PRESENT-CADENCE-2 round 1: the DISPLAY_ASLEEP override above (see
@@ -2922,6 +3059,7 @@ $provenance = [ordered]@{
     telemetryArm = $TelemetryArm
 }
 Save-Json $provenance (Join-Path $Pub 'provenance.json')
+Write-JobTrace "step presentmon-job-stop-sufficiency stoppedByJob=$presentMonStoppedByJob sufficient=$presentMonJobStopSufficient spanShortfallMs=$presentMonJobStopSpanShortfallMs countDeviation=$presentMonJobStopCountDeviation status=$presentMonStatus"
 
 # result.json, smoke-stdout.txt, smoke-stderr.txt, probe-timeline.csv and logs\smoke-run.log were
 # already published above, before PresentMon was ever parsed; presentmon.csv and
