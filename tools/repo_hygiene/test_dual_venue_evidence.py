@@ -45,9 +45,10 @@ DV = ROOT / "tools" / "profiling" / "dual-venue"
 GENERATOR = ROOT / "tools" / "profiling" / "bachelor" / "playback-attr-3-cuda-job.ps1"
 COMPOSER = ROOT / "tools" / "profiling" / "make-contact-sheet.py"
 
-# The fork/master commit whose generator the DEFAULT emitted job must stay byte-identical to (the first master
-# that carries PLAYBACK-CLIP-LENGTH-ENFORCE-4; this card's own merge base for the generator).
-BASELINE_COMMIT = "38ed2d8f96c29df273d1de60f2dfd8a03ab6873a"
+# The commit whose generator the DEFAULT emitted job must stay byte-identical to. UM-PRESENTMON-STOP-1 changed the
+# default job on purpose (per-job PresentMon session name, clean named stop, one capture ceiling for every leg), so
+# this is that card's own commit; it was PLAYBACK-CLIP-LENGTH-ENFORCE-4's merge (38ed2d8f96c2) before it.
+BASELINE_COMMIT = "8c19f442603c109b024839515187469646432481"
 
 PWSH = shutil.which("pwsh")
 requires_windows_pwsh = unittest.skipIf(PWSH is None or sys.platform != "win32", "needs pwsh on Windows")
