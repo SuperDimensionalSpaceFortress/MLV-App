@@ -182,8 +182,25 @@ function Complete-Receipt([string]$Outcome, [string]$Detail) {
     try {
         $path = Write-DvReceipt -Receipt $receipt -ReceiptRoot $ReceiptRoot -RepoRoot $RepoRoot -OfflineTestMode:$OfflineTestMode
     } catch {
-        Write-Output "DVE_RECEIPT_WRITE_FAILED $($_.Exception.Message)"
-        exit 2
+        $refusal = [string]$_.Exception.Message
+        # DVE-LEG-TERMINALS-1 r2: a leg that ran never ends without a receipt. A PASS/FAIL the production validator refuses -- for ANY reason (a backend the counters
+        # contradict, a proof that does not re-derive, ...) -- is written as a typed INVALID instead: the receipt already holds the leg's evidence, and the validator's
+        # own reasons are named in outcomeDetail. Anything else the writer throws (an unwritable path, a repeat receipt id) still ends the run as DVE_RECEIPT_WRITE_FAILED.
+        $invalidPrefix = 'DVE_RECEIPT_INVALID '
+        if ($Outcome -cin @('PASS', 'FAIL') -and $refusal.StartsWith($invalidPrefix, [StringComparison]::Ordinal)) {
+            $receipt.outcome = 'INVALID'
+            $receipt.outcomeDetail = "INVALID: the job result was $Outcome ($Detail) but the receipt writer refuses it as a ${Outcome}: $($refusal.Substring($invalidPrefix.Length))"
+            $Outcome = 'INVALID'
+            try {
+                $path = Write-DvReceipt -Receipt $receipt -ReceiptRoot $ReceiptRoot -RepoRoot $RepoRoot -OfflineTestMode:$OfflineTestMode
+            } catch {
+                Write-Output "DVE_RECEIPT_WRITE_FAILED $($_.Exception.Message)"
+                exit 2
+            }
+        } else {
+            Write-Output "DVE_RECEIPT_WRITE_FAILED $refusal"
+            exit 2
+        }
     }
     Write-Output "DVE_OUTCOME=$Outcome"
     # (the writer relabels an advisory production PASS/FAIL in outcomeDetail and stamps receipt.verification: say so here too)
@@ -378,6 +395,21 @@ if ($artifactsShare -and (Test-Path -LiteralPath $artifactsShare -PathType Conta
         New-Item -ItemType Directory -Force -Path (Join-Path $evidenceDir 'logs') | Out-Null
         Copy-Item -LiteralPath $logShare -Destination (Join-Path $evidenceDir 'logs\smoke-run.log')
     }
+    # DVE-LEG-TERMINALS-1 item 3: a failed smoke run's FULL stdout and stderr (the job publishes them on SMOKE_RUN_FAILED; the typed tail in summary.json is only
+    # the last 4000 chars) are kept beside the rest of the evidence and named by sha256 in the receipt, so the receipt can say why. The located app log of a run
+    # that wrote no result.json is kept the same way. Optional: the job publishes them on SMOKE_RUN_FAILED and on a completed run, so any receipt with artifacts can carry them.
+    foreach ($smokeFile in 'smoke-stderr.txt', 'smoke-stdout.txt') {
+        $smokeSrc = Join-Path $artifactsShare $smokeFile
+        if (Test-Path -LiteralPath $smokeSrc -PathType Leaf) {
+            Copy-Item -LiteralPath $smokeSrc -Destination (Join-Path $evidenceDir $smokeFile)
+            $receipt.evidence[$(if ($smokeFile -ceq 'smoke-stderr.txt') { 'smokeStderrSha256' } else { 'smokeStdoutSha256' })] = Get-DvSha256OfFile (Join-Path $evidenceDir $smokeFile)
+        }
+    }
+    $failedAppLogShare = Join-Path $artifactsShare 'logs\smoke-failed-app.log'
+    if (Test-Path -LiteralPath $failedAppLogShare -PathType Leaf) {
+        New-Item -ItemType Directory -Force -Path (Join-Path $evidenceDir 'logs') | Out-Null
+        Copy-Item -LiteralPath $failedAppLogShare -Destination (Join-Path $evidenceDir 'logs\smoke-failed-app.log')
+    }
     # The job's exit code and RESULT token are not in any file the job wrote: record them as a hashed file too, so the outcome is
     # re-derivable (a capture that exited non-zero is not evidence).
     $umRunLocal = Join-Path $evidenceDir 'um-run.json'
@@ -425,6 +457,16 @@ $resolved = Resolve-DvJobOutcome -ResultToken $token -ExitCode $exitCode -SmokeR
 # capture and then exits non-zero contradicts itself, so its capture is not evidence.
 if ($exitCode -ne 0 -and $resolved.outcome -eq 'CAPTURED') {
     $resolved = [pscustomobject]@{ outcome = 'INVALID'; detail = "$($resolved.detail) but the job exited $exitCode; a capture that disagrees with its own exit code is not evidence" }
+}
+
+# DVE-LEG-TERMINALS-1 item 3: the receipt says why a smoke run failed, and where the evidence that proves it is kept (never a path: tokens and counts only).
+if ($token -ceq 'SMOKE_RUN_FAILED' -and $null -ne $summary) {
+    $smokeExit = $(if ($summary.PSObject.Properties['smokeExitCode']) { [string]$summary.smokeExitCode } else { '' })
+    $kept = @()
+    if ($receipt.evidence['smokeStderrSha256']) { $kept += 'stderr' }
+    if ($receipt.evidence['smokeStdoutSha256']) { $kept += 'stdout' }
+    if ($runLogSha) { $kept += 'run log' }
+    $resolved.detail = "$($resolved.detail): smoke exit $smokeExit; " + $(if ($kept.Count -gt 0) { 'kept as hashed local evidence: ' + ($kept -join ', ') } else { 'no stderr, stdout or run log was published' })
 }
 
 # P6 again, from the job's own record: a summary that names a different venue than declared is a mismatch.
@@ -500,8 +542,9 @@ if ($outcome -eq 'CAPTURED') {
 # a foreign run, a fixture, or the verdict simply absent) is INVALID: a FAIL on footage that cannot be shown to be long
 # enough is not a product result either. A product FAIL the job reached AFTER its oracle passed (GPU_RECON_FRAMES_ZERO,
 # CPU_FALLBACK_DETECTED, CPU_BACKEND_PATH_MISMATCH) carries the same re-derived proof from the run log, so it stays a FAIL; a
-# terminal with no run log (SMOKE_RUN_FAILED, SMOKE_LOG_UNAVAILABLE, ...) has none and is INVALID. (Write-DvReceipt refuses a
-# proofless PASS/FAIL a second time.)
+# terminal with no run log (SMOKE_LOG_UNAVAILABLE, a SMOKE_RUN_FAILED whose run published none, ...) has none and is INVALID (a SMOKE_RUN_FAILED
+# that did publish its run log is INVALID by its result token, whatever the log proves). (Write-DvReceipt refuses a proofless PASS/FAIL a second
+# time, and Complete-Receipt then writes whatever it refuses as a typed INVALID.)
 $proofProblems = @()
 if ($outcome -in @('PASS', 'FAIL')) {
     if ($null -eq $playback) { $proofProblems += 'the job published no summary.json and no run log, so no source-frame proof exists' }
@@ -510,6 +553,10 @@ if ($outcome -in @('PASS', 'FAIL')) {
         if ($resolved.outcome -eq 'CAPTURED' -and -not $playback.jobOracleBlockPresent) { $proofProblems += 'RECEIPT_FIELD_ABSENT: the captured job''s summary.json carries no sourceFrames block (its own oracle did not run)' }
     }
 }
+# DVE-LEG-TERMINALS-1 item 1: a PASS/FAIL the production writer would refuse because the hashed summary names no backend (the PresentMon-wait-failure shape of
+# 2026-10-02 carried no counters) is no signal: the leg ran, so it ends as a typed INVALID receipt that keeps its evidence -- never exit 2 with no receipt.
+$backendNotDerivable = Get-DvBackendNotDerivable -Summary $summary -Backend $Backend -RequireCpuBackendField (-not $OfflineTestMode)
+if ($outcome -in @('PASS', 'FAIL') -and $null -ne $summary -and $null -ne $backendNotDerivable) { $proofProblems += $backendNotDerivable }
 if ($outcome -in @('PASS', 'FAIL') -and $proofProblems.Count -gt 0) {
     $detail = "INVALID: the job result was $outcome ($detail) but the receipt-oracle verdict is not valid: $($proofProblems -join '; ')"
     $outcome = 'INVALID'

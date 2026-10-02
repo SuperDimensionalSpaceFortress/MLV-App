@@ -135,8 +135,14 @@ receipt oracle and refuses to believe a receipt that does not carry the oracle's
     takes the leg's backend from the terminal itself (the two cuda exits 13 / 14 exist only on a cuda leg, exit 28 only on a cpu leg)
     and requires the counters to be the shape that terminal is written under -- a terminal whose counters contradict it is
     `BACKEND_NOT_DERIVABLE`. Its leg type is then *unstated* (`LEG_TYPE_UNSTATED` in `unbound`; the receipt is a `FAIL` derived from
-    the terminal's own result token, never a PASS). `PRESENTMON_UNAVAILABLE` has a top-level `gpuFramesTotal` and is read the same
-    way. Tests use the exact summary shapes the job writes (`real_failure_summary`). The **leg type**
+    the terminal's own result token, never a PASS). `PRESENTMON_UNAVAILABLE` has **three** summary shapes: the display-report failure
+    (a parse failure after the run) carries a top-level `gpuFramesTotal` and the nested `gpuSummary`; the **wait failure** (PresentMon did not
+    exit within 35 s after playback) carries the same two fields since DVE-LEG-TERMINALS-1 (it carried neither before, so a leg that had
+    played got **no receipt at all**: `BACKEND_NOT_DERIVABLE`, the runner exited 2); and the spawn failure (PresentMon never started, before
+    the smoke run) has no run and so no counters. A summary that names no backend can never become an advisory `FAIL`, but it is no longer a
+    refused write either: the runner asks `Get-DvBackendNotDerivable` before it chooses an outcome and ends the leg as a typed `INVALID`
+    (no-signal) receipt that keeps its evidence. Tests use the exact summary shapes the job writes (`real_failure_summary`) and the
+    Ultra-Magnus shapes of 2026-10-02. The **leg type**
     comes from `summary.lookLeg` (a look-run's evidence can no longer verify as the speed leg, nor the reverse: `LEG_TYPE_MISMATCH`),
     plus `lookAssistForced`, the look flavor and `declaredVenue` when the job wrote them.
   * *Typed UNBOUND claims:* `subject.clipContentSha256` is computed by the local generator and written to **no** artifact the venue
@@ -201,10 +207,32 @@ A speed or look leg has `backends: ["cuda","cpu"]`. `-Backend cpu` omits every `
 `MLVAPP_EXPERIMENTAL_GPU_*` environment variable, requires `CPU_FRAMES > 0` and zero GPU frames
 (a leg that reached a GPU path is `CPU_BACKEND_PATH_MISMATCH`, exit 28), never fires the CUDA-only
 exits 13/14, and treats PresentMon as informational. **CPU frame rate is informational** -- it tracks
-cores and storage, not the product's GPU work -- and never gates a card. `backend` is part of the
+cores and storage, not the product's GPU work -- and never gates a card. That includes the smoke runner's own
+playback-quality limit on the **skipped/unpresented-frame ratio** (default 50 %): on Ultra-Magnus the cpu leg of 2026-10-02 was
+failed by it (`SMOKE_RUN_FAILED`, exit 18, 56.17 % > 50 %) with no frame and no sheet. A cpu job passes the runner's own
+`-MaxSkippedOrUnpresentedRatio` at its ceiling (1: the ratio cannot exceed it) so the run is never failed on that ratio, and the
+ratio is recorded as the measured `skippedOrUnpresentedRatio` field of its success summary (a leg spec's cpu criteria may then
+read it, informationally). A cuda job's command is unchanged: its 50 % gate holds. Nothing else is relaxed -- clip length,
+no-loop / no-replay, the run nonce, settings isolation and the backend check are enforced by the runner and the receipt oracle,
+and the job passes no switch that could loosen them. `backend` is part of the
 subject, so a cuda receipt and a cpu receipt are different subjects.
 
 ## LOOK legs and contact sheets
+
+*Contact frames after a PresentMon wait failure (DVE-LEG-TERMINALS-1).* The app captures the contact-sheet frames in a **seek** pass
+(`--contact-sheet-seek-mode`: it never plays) inside the smoke child, after the measured session's own summary line, and PresentMon is
+only waited on once that child has returned. A PresentMon wait failure therefore leaves the captured frames on the venue with nothing to
+re-run; the job now publishes them (`contact-sheet\raw`) plus a `compose-status.txt` marker (`CONTACT_SHEET_COMPOSE_UNAVAILABLE ...`: the sheet
+is not composed on the venue, whose labels need the eligibility verdict this branch exits before). The runner keeps the frames and
+lists them by sha256 in `contact-frames.json`, so `New-VenueSheetPair.ps1` composes the cuda|cpu pair locally from an advisory `FAIL`
+receipt. Nothing measured changes: the publish runs after the smoke child, after the run log and counters are read, and writes only
+under `contact-sheet\`. The other failure terminals (`GPU_RECON_FRAMES_ZERO`, `CPU_FALLBACK_DETECTED`, ...) still publish raw frames
+**without** the marker, so the runner keeps none of them: their frames were drawn by a path the leg's backend label does not describe.
+The wait-failure branch applies the same rule to its own frames (DVE-WAIT-FAILURE-FRAMES-BACKEND-GATE-1): it publishes them, and the marker, only when the run's
+own counters do not contradict the leg -- a cuda leg needs gpu frames and no cpu frame, a cpu leg the inverse -- so a leg that fell back (partly or wholly) never
+lists frames that `New-VenueSheetPair.ps1` would label with a backend the run did not use. Counters that are unavailable do not contradict the leg (that receipt
+is a typed `INVALID`, never a labelled PASS/FAIL).
+The display-report (parse) failure of `PRESENTMON_UNAVAILABLE` does not publish frames yet.
 
 A `legType: "look"` leg takes `look.contactSheetFrames` evenly spaced frames on each backend with
 **Look Assist forced on** (the smoke runner is told Look Assist is *required*, so a leg where it did not
@@ -269,7 +297,7 @@ receipt, its evidence and a contact sheet name or show an owner clip's run and s
 Receipts land in `<main checkout>\.claude-state\dual-venue\receipts\<card>\<legId>\<venue>\<receiptId>.json`,
 append-only (created with `CreateNew`; a repeat is refused, never overwritten). Copied evidence
 (`summary.json`, `evidence-manifest.json`, the launcher's `result.json`, `logs\smoke-run.log`, `um-run.json` -- each sha256 named in
-the receipt -- and the contact sheet) is under `.claude-state\dual-venue\evidence\<receiptId>\`, which in production must sit under
+the receipt -- the contact sheet, and, on a failed smoke run, `smoke-stderr.txt` / `smoke-stdout.txt`) is under `.claude-state\dual-venue\evidence\<receiptId>\`, which in production must sit under
 `.claude-state` too (the run log and result name an owner clip's run; they stay local like the receipt).
 
 ## How to read the evidence
@@ -298,5 +326,8 @@ the receipt -- and the contact sheet) is under `.claude-state\dual-venue\evidenc
 | `BACKEND_NOT_AVAILABLE` | `DEVICE_UNAVAILABLE` |
 | `DISPLAY_ASLEEP`, `KEEPALIVE_FAILED`, `SCREENSAVER_SECURE_OWNER_ONLY`, `DISPLAY_WAKE_DISMISS_FAILED` | `VENUE_UNHEALTHY` (a venue condition, not a product result) |
 | a product failure the job reaches AFTER it published the run log (`GPU_RECON_FRAMES_ZERO`, `CPU_FALLBACK_DETECTED`, `CPU_BACKEND_PATH_MISMATCH`, `PRESENTMON_UNAVAILABLE`) **with a valid receipt-oracle verdict re-derived from that log** | `FAIL`, with the token in `outcomeDetail` (a production receipt for it is written as an **advisory** `FAIL`: its backend is derived from the summary's nested `gpuSummary` counters and its leg type is `LEG_TYPE_UNSTATED`) |
-| any terminal with no run log or a log that does not prove >= 20 s (`SMOKE_RUN_FAILED`, `SMOKE_LOG_UNAVAILABLE`, or one of the failures above on a short, wrapped, foreign or overridden run) | `INVALID` (no proof, no signal) |
+| any terminal with no run log or a log that does not prove >= 20 s (`SMOKE_LOG_UNAVAILABLE`, or one of the failures above on a short, wrapped, foreign or overridden run) | `INVALID` (no proof, no signal) |
+| a PASS/FAIL whose hashed `summary.json` names no backend (e.g. a `PRESENTMON_UNAVAILABLE` whose log has no gpu summary line, or the spawn failure) | `INVALID` (`BACKEND_NOT_DERIVABLE`: the leg ran, so it ends in a typed no-signal receipt, never a refused write) |
+| any PASS/FAIL the production validator refuses for any other reason (e.g. `BACKEND_MISMATCH`: a cuda leg whose run fell back entirely to the cpu path and then lost its PresentMon wait, or a cpu leg whose run reached a gpu path) | `INVALID`, written by the runner (`Complete-Receipt`) with the validator's reasons in `outcomeDetail` and the evidence kept: a leg that ran never ends without a receipt. Only a write that fails for another reason (an unwritable path, a repeat receipt id) still ends as `DVE_RECEIPT_WRITE_FAILED`, exit 2 |
+| `SMOKE_RUN_FAILED` (the smoke runner exited non-zero: a validation gate, a launch failure) -- **in either backend, with or without a run log** | `INVALID`, with `smoke exit <n>` and which pieces of evidence are kept in `outcomeDetail`. The job publishes the runner's **full** `smoke-stdout.txt` / `smoke-stderr.txt`, the launcher's `result.json` (its `validation` block lists every failed check) and the run log (`logs\smoke-run.log`, or `logs\smoke-failed-app.log` when the run wrote no `result.json`); the runner keeps them beside the other evidence and names the two streams by sha256 in `evidence.smokeStderrSha256` / `smokeStdoutSha256`. `summary.smokeEvidence` says which pieces exist and why one does not |
 | um-run `RETRACTED` / `UNRESOLVED` | `RETRACTED` / `UNRESOLVED` |
