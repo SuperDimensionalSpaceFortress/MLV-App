@@ -19,6 +19,7 @@
 #include <QString>
 #include <QTemporaryDir>
 #include <cmath>
+#include <cstring>
 #include <vector>
 
 using namespace lookassist;
@@ -322,6 +323,19 @@ QString receiptLine( ReceiptSettings &r )
         .arg( r.vibrance() ).arg( r.shadows() ).arg( r.highlights() ).arg( r.chromaSmooth() );
 }
 
+// The last "LOOK_ASSIST applied" line of a run, with only the masterScenePass flag taken out. Beyond the receipt it carries
+// everything master's analysis measured on the picture it rendered (balanceRGB, balanceSamples, p05, the patch fields), so two
+// runs that agree here analysed the same picture, not only reached the same receipt.
+QString appliedLineWithoutPassFlag( const QByteArray &log )
+{
+    QString line;
+    for( const QByteArray &candidate : log.split( '\n' ) )
+        if( candidate.contains( "LOOK_ASSIST applied" ) ) line = QString::fromUtf8( candidate );
+    line.remove( QStringLiteral(" masterScenePass=true") );
+    line.remove( QStringLiteral(" masterScenePass=false") );
+    return line;
+}
+
 // Runs the real headless Look Assist on a tracked clip as the no-trusted-patch state leaves it. noExposureMetadata
 // removes the recorded exposure, so nothing can call the clip daylight: that run IS master's analysis.
 // staleWhiteBalance: the processing object holds a 3000 K balance (no patch is found); false = the app default (the
@@ -331,10 +345,13 @@ QString receiptLine( ReceiptSettings &r )
 // masterPassOnly: call master's single pass directly (masterScenePass = true), so the daylight pass is never entered.
 // processingEntry / processingEnd: the live processing object's balance (kelvin / stored render tint) on entry and at
 // the end, so the state a run STARTS from is asserted, not assumed.
+// entryKelvin > 0: the processing object holds that kelvin and entryUiTint (the UI's tint units, as the slider passes it
+// to processingSetWhiteBalance after dividing by 10) on entry, instead of the default / the stale 3000 K.
 bool runHeadlessLookAssist( const char *clipFile, bool noExposureMetadata, QString *receipt, QByteArray *log,
                             bool staleWhiteBalance = true, int existingTemperature = -1, int existingTint = 0,
                             int asShotKelvin = 0, bool masterPassOnly = false,
-                            QString *processingEntry = nullptr, QString *processingEnd = nullptr )
+                            QString *processingEntry = nullptr, QString *processingEnd = nullptr,
+                            int entryKelvin = 0, int entryUiTint = 0 )
 {
     MlvPipelineFixture fixture;
     QString error_message;
@@ -358,13 +375,14 @@ bool runHeadlessLookAssist( const char *clipFile, bool noExposureMetadata, QStri
         fixture.video()->WBAL.kelvin = asShotKelvin;
     }
     if( staleWhiteBalance ) processingSetWhiteBalance( fixture.processing(), 3000, 0.0 );
+    if( entryKelvin > 0 ) processingSetWhiteBalance( fixture.processing(), entryKelvin, entryUiTint / 10.0 );
 
     QTemporaryDir temporary_dir;
     const QString log_path = temporary_dir.filePath( QStringLiteral("look_assist.log") );
     BatchLogger::init( log_path );
     const auto balance = [&]() {
         return QStringLiteral("%1/%2").arg( processingGetWhiteBalanceKelvin( fixture.processing() ), 0, 'f', 3 )
-                                      .arg( processingGetWhiteBalanceTint( fixture.processing() ), 0, 'f', 3 );
+                                      .arg( processingGetWhiteBalanceTint( fixture.processing() ), 0, 'f', 9 );
     };
     if( processingEntry ) *processingEntry = balance();
     const bool applied = ReceiptApplier::applyHeadlessLookAssist( &r, fixture.video(), fixture.processing(), 0,
@@ -525,7 +543,7 @@ TEST(LookAssistFixtureScene, HeadlessFallbackStartsFromMastersProcessingState)
             }
 
             // The starting state is the default 6000 K / 0 in all three, and it is not the receipt's balance.
-            ASSERT_TRUE( entryA == QStringLiteral("6000.000/0.000") );
+            ASSERT_TRUE( entryA == QStringLiteral("6000.000/0.000000000") );
             ASSERT_TRUE( entryB == entryA );
             ASSERT_TRUE( entryF == entryA );
 
@@ -546,9 +564,126 @@ TEST(LookAssistFixtureScene, HeadlessFallbackStartsFromMastersProcessingState)
             ASSERT_TRUE( fallback == direct );
             ASSERT_TRUE( endF == endA );
             ASSERT_TRUE( endF == endB );
+            ASSERT_TRUE( appliedLineWithoutPassFlag( fallbackLog ) == appliedLineWithoutPassFlag( metadataFreeLog ) );
+            ASSERT_TRUE( appliedLineWithoutPassFlag( fallbackLog ) == appliedLineWithoutPassFlag( directLog ) );
             ASSERT_TRUE( fallbackLog.contains( "patchValid=false" ) );
             (void)arm.name;
         }
+    }
+}
+
+TEST(LookAssistFixtureScene, HeadlessFallbackStartsFromMastersProcessingStateAtANonZeroEntryTint)
+{
+    // sol r1, PR #226 (closes LOOK-ASSIST-ENTRY-TINT-RESTORE-COVERAGE-1): the same equality, with the processing object
+    // entering at 6000 K and a non-zero UI tint instead of 6000 K / 0, so the tint half of the restore is pinned, in a state
+    // where the daylight pass's live solver RUNS before it falls back (the receipt-less arm: the processed picture has a
+    // trusted neutral patch, and the solver ends at a different tint). The tints are sol's -12 (stored -0.244662371) and -50
+    // (stored -2.973017788, where a second conversion of the stored tint is large enough to change the picture master
+    // analyses: a first version of this test with only -12 stayed green with the tint restore removed).
+    // Master's behaviour is the no-metadata run and the direct masterScenePass call, each on a fresh object; the fallback
+    // equals both: receipt, live balance (kelvin and stored tint to nine decimals) and the analysis line master measured on
+    // its picture.
+    struct Arm { const char *name; bool switchOff; int asShotKelvin; int existingTemperature; };
+    const Arm arms[] = {
+        { "patch-then-switch-off", true, 0, -1 },
+        { "receipt-balance-then-switch-off", true, 0, 7895 },
+    };
+    const int entryTints[] = { -12, -50 };
+    for( const FixtureClip &clip : kTrackedFixtureClips )
+    {
+        for( const int entryTint : entryTints )
+        {
+            for( const Arm &arm : arms )
+            {
+                const int existingTint = arm.existingTemperature == -1 ? 0 : -12;
+                QString metadataFree, direct, fallback;
+                QByteArray metadataFreeLog, directLog, fallbackLog;
+                QString entryA, endA, entryB, endB, entryF, endF;
+                ASSERT_TRUE( runHeadlessLookAssist( clip.file, true, &metadataFree, &metadataFreeLog, false,
+                                                    arm.existingTemperature, existingTint, arm.asShotKelvin, false,
+                                                    &entryA, &endA, 6000, entryTint ) );
+                ASSERT_TRUE( runHeadlessLookAssist( clip.file, false, &direct, &directLog, false,
+                                                    arm.existingTemperature, existingTint, arm.asShotKelvin, true,
+                                                    &entryB, &endB, 6000, entryTint ) );
+                {
+                    ScopedEnv switchOff( "MLVAPP_LOOK_ASSIST_REFINE_DAYLIGHT", arm.switchOff ? "0" : "1" );
+                    ASSERT_TRUE( runHeadlessLookAssist( clip.file, false, &fallback, &fallbackLog, false,
+                                                        arm.existingTemperature, existingTint, arm.asShotKelvin, false,
+                                                        &entryF, &endF, 6000, entryTint ) );
+                }
+
+                // The entry balance is the UI's tint as the slider stores it, in all three.
+                ASSERT_TRUE( entryA == QStringLiteral("6000.000/%1").arg( -std::pow( std::fabs( entryTint / 100.0 ), 1.75 ) * 10.0, 0, 'f', 9 ) );
+                if( entryTint == -12 ) ASSERT_TRUE( entryA == QStringLiteral("6000.000/-0.244662371") );
+                if( entryTint == -50 ) ASSERT_TRUE( entryA == QStringLiteral("6000.000/-2.973017788") );
+                ASSERT_TRUE( entryB == entryA );
+                ASSERT_TRUE( entryF == entryA );
+
+                ASSERT_TRUE( metadataFreeLog.contains( "masterScenePass=false" ) );
+                ASSERT_FALSE( metadataFreeLog.contains( "daylight_fallback_to_master" ) );
+                ASSERT_TRUE( directLog.contains( "masterScenePass=true" ) );
+                ASSERT_FALSE( directLog.contains( "daylight_fallback_to_master" ) );
+                ASSERT_TRUE( fallbackLog.contains( "daylight_fallback_to_master" ) );
+                ASSERT_TRUE( fallbackLog.contains( "masterScenePass=true" ) );
+
+                // What master's pass starts from, read back from the object at the moment of the recursion: the entry
+                // balance exactly, and no cached debayered frame (the daylight pass's solver left one where it ran).
+                const QStringList entryParts = entryA.split( QLatin1Char('/') );
+                ASSERT_TRUE( fallbackLog.contains( QStringLiteral("daylight_fallback_state kelvin=%1 renderTint=%2 ")
+                                                       .arg( entryParts[0], entryParts[1] ).toUtf8() ) );
+                ASSERT_TRUE( fallbackLog.contains( "cachedFrameAfter=0" ) );
+                if( arm.existingTemperature == -1 ) ASSERT_TRUE( fallbackLog.contains( "cachedFrameBefore=1" ) );
+
+                ASSERT_TRUE( fallback == metadataFree );
+                ASSERT_TRUE( fallback == direct );
+                ASSERT_TRUE( endF == endA );
+                ASSERT_TRUE( endF == endB );
+                ASSERT_TRUE( appliedLineWithoutPassFlag( fallbackLog ) == appliedLineWithoutPassFlag( metadataFreeLog ) );
+                ASSERT_TRUE( appliedLineWithoutPassFlag( fallbackLog ) == appliedLineWithoutPassFlag( directLog ) );
+                (void)arm.name;
+            }
+        }
+    }
+}
+
+TEST(LookAssistFixtureScene, TheLiveWhiteBalanceSolverPutsTheStoredBalanceBackExactly)
+{
+    // sol r1, PR #226: processingFindWhiteBalance searches by setting candidate balances on the live object and then puts
+    // the balance it found back. It passes the STORED render tint to the setter, which converts any tint that differs from
+    // the stored one as a receipt tint -- so the object used to leave the search at a different tint than it entered
+    // with (UI -12: stored -0.244662371 became -0.015135353), and the GUI's fallback into master's pass inherited it.
+    // State: 6000 K / UI tint -12; the solver runs on a trusted patch and ends elsewhere. Every value master's pass reads
+    // -- kelvin, stored tint, the multipliers, the matrices -- must equal a fresh object that never ran the solver.
+    for( const FixtureClip &clip : kTrackedFixtureClips )
+    {
+        MlvPipelineFixture solved, reference;
+        QString error_message;
+        ASSERT_TRUE( solved.openClipFile( repo_file_path( QString::fromLatin1( clip.file ) ), &error_message ) );
+        ASSERT_TRUE( solved.applyReceipt( &error_message ) );
+        ASSERT_TRUE( reference.openClipFile( repo_file_path( QString::fromLatin1( clip.file ) ), &error_message ) );
+        ASSERT_TRUE( reference.applyReceipt( &error_message ) );
+        processingSetWhiteBalance( solved.processing(), 6000, -12 / 10.0 );
+        processingSetWhiteBalance( reference.processing(), 6000, -12 / 10.0 );
+
+        const processingObject_t *s = solved.processing();
+        const processingObject_t *r = reference.processing();
+        ASSERT_TRUE( std::fabs( s->wb_tint - ( -0.244662371 ) ) < 1e-9 );
+        ASSERT_TRUE( s->wb_tint == r->wb_tint );
+
+        int solvedTemperature = 0, solvedTint = 0;
+        findMlvWhiteBalance( solved.video(), 0, solved.width() / 2, solved.height() / 2,
+                             &solvedTemperature, &solvedTint, 0 );
+        // The solve ended somewhere other than the entry balance, so a restore that is wrong has something to get wrong.
+        ASSERT_TRUE( solvedTemperature != 6000 || solvedTint != -12 );
+
+        ASSERT_TRUE( s->kelvin == r->kelvin );
+        ASSERT_TRUE( s->wb_tint == r->wb_tint );
+        for( int c = 0; c < 3; ++c ) ASSERT_TRUE( s->wb_multipliers[c] == r->wb_multipliers[c] );
+        for( int m : { 0, 4, 8 } )
+            ASSERT_TRUE( std::memcmp( s->pre_calc_matrix[m], r->pre_calc_matrix[m], 65536 * sizeof( int32_t ) ) == 0 );
+        // sol's executed arithmetic: the blue multiplier and the blue matrix value at 20000.
+        ASSERT_TRUE( std::fabs( s->wb_multipliers[2] - 1.523314852 ) < 1e-8 );
+        ASSERT_EQ( 30466, s->pre_calc_matrix[8][20000] );
     }
 }
 

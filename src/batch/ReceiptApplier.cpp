@@ -884,6 +884,17 @@ bool ReceiptApplier::applyHeadlessLookAssist(ReceiptSettings *receipt,
         // passed back unchanged, so the stored tint is set first; the multipliers and matrices rebuild from it.
         processingObject->wb_tint = entryRenderTint;
         processingSetWhiteBalance( processingObject, entryKelvin, entryRenderTint );
+        // The daylight pass's solver and analysis renders leave the single cached debayered frame behind; master's pass
+        // debayers its own.
+        const int cachedFrameBefore = mlvObject->current_cached_frame_active;
+        resetMlvCachedFrame( mlvObject );
+        // What master's pass starts from, read back from the object (the tests pin it against the entry state).
+        BatchLogger::out( QStringLiteral(
+            "[BATCH] LOOK_ASSIST daylight_fallback_state kelvin=%1 renderTint=%2 cachedFrameBefore=%3 cachedFrameAfter=%4\n" )
+            .arg( processingGetWhiteBalanceKelvin( processingObject ), 0, 'f', 3 )
+            .arg( processingGetWhiteBalanceTint( processingObject ), 0, 'f', 9 )
+            .arg( cachedFrameBefore )
+            .arg( mlvObject->current_cached_frame_active ) );
         return applyHeadlessLookAssist( receipt, mlvObject, processingObject, analysisFrame, true );
     }
     const bool autoWhiteBalanceValid = wb.autoValid;

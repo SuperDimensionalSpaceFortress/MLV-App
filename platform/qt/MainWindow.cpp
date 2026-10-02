@@ -16452,6 +16452,9 @@ void MainWindow::applyLookAssistToReceipt( ReceiptSettings *receipt,
             toolButtonChromaSmoothChanged();
             receipt->setChromaSmooth( chromaSmoothBefore );
         }
+        // The live solver above leaves the single cached debayered frame behind (its balance is put back by the
+        // solver itself); master's pass debayers its own.
+        resetMlvCachedFrame( m_pMlvObject );
         s_lookAssistMasterScenePass = true;
         applyLookAssistToReceipt( receipt, analysisFrame );
         s_lookAssistMasterScenePass = false;
