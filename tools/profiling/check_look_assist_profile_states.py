@@ -10,7 +10,8 @@ argv of every picture are recorded in each run's COMMANDS.txt and, for the recor
 tests/fixtures/look_assist_profile_runs/pr222-r2/MANIFEST.json). The gate -- the class rule is "never worse
 than master in any render state":
 
-  * every arm ended on a settled receipt: not skipped, not a safety fallback, and not an EARLIER accepted
+  * every arm ended on a settled receipt: no skip event ANYWHERE in the arm's log (before or after the result, with
+    or without reason=, whatever a later fallback / dispatch rebuilt), not a safety fallback, and not an EARLIER accepted
     receipt that a later failed application left standing (sol, PR #222 r1);
   * the receipt is one of two things. DAYLIGHT: scene "shade", a balance solved from / refined on the RENDERED
     picture ("processed-neutral-patch" / "rendered-neutral-patch", accepted), inside the daylight window. Or
@@ -62,17 +63,20 @@ def parse_log_text(text):
 
     One application is what a dispatch / fallback / result sequence builds. A later event that starts a NEW
     application (an async dispatch, a fall-back to master) discards what an earlier one left, and a safety
-    fallback or ANY skip (with or without reason=) replaces it with a failure marker: an accepted receipt from
-    before is not the shipped picture any more.
+    fallback replaces it with a failure marker: an accepted receipt from before is not the shipped picture any
+    more. A skip is different: it invalidates the ARM, not the receipt in hand. It is kept apart from the receipt
+    (which the fallback / dispatch / result events below replace) and stamped back on at the end, so no later
+    event -- a master fallback, an async dispatch, a complete application -- can clear it (sol, PR #224 r1).
     """
     receipt = None
+    skipped = None
     for line in text.splitlines():
         if SAFETY_FALLBACK.search(line):
             receipt = {"safety_fallback": True}
             continue
         skip = APPLY_SKIP.search(line)
         if skip:
-            receipt = {"skipped": skip.group(1) or "no reason logged"}
+            skipped = skipped or skip.group(1) or "no reason logged"   # arm-level marker: the first skip is named
             continue
         if FALLBACK_TO_MASTER.search(line):
             receipt = {"fell_back": True}
@@ -94,6 +98,8 @@ def parse_log_text(text):
         if applied:
             receipt = dict(receipt or {}, source=applied.group(1), decision=applied.group(2),
                            temperature=int(applied.group(3)), tint=int(applied.group(4)), exposure=int(applied.group(5)))
+    if skipped:
+        receipt = dict(receipt or {}, skipped=skipped)
     return receipt
 
 

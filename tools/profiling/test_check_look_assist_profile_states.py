@@ -217,6 +217,70 @@ class DecisionGate(unittest.TestCase):
                 handle.write(reasonless)
             self.assertEqual(1, chk.main([root, "--tag", "t"]))
 
+    def test_a_skip_invalidates_the_arm_whatever_rebuilds_the_receipt_after_it(self):
+        # sol, PR #224 r1: a master fallback and an async dispatch each REPLACE the receipt dictionary, which used to
+        # take the skipped marker with them, so skip -> fallback -> master result passed. The marker is arm-level.
+        reasonless = PREFIX + "look_assist.apply.skip file_loaded=1 mlv=1 receipt=1 enabled=1\n"
+        reasoned = PREFIX + "look_assist.apply.skip reason=clip_lifecycle_mutating\n"
+        fallback = PREFIX + "look_assist.daylight_fallback_to_master reason=no_verified_surface refused_at_base=1 frame=0\n"
+        dispatch = PREFIX + "look_assist.apply.async_dispatch generation=3 frame=0 scene=shade floor_lifted=0\n"
+        async_applied = (PREFIX + "look_assist.apply.auto_wb_async_applied generation=3 valid=1 source=processed-neutral-patch "
+                                  "decision=accepted damping=1.000 awb_temp=9990 awb_tint=-35 final_temp=9990 final_tint=-35 "
+                                  "preset_exp=160 frame=0\n")
+        for skip in (reasonless, reasoned):
+            for text in (skip + fallback + MASTER_TRACE,                      # skip -> master fallback -> master result
+                         skip + dispatch + async_applied,                     # skip -> async dispatch -> async applied
+                         skip + sync_trace() + fallback + MASTER_TRACE,       # skip first, then a whole second application
+                         sync_trace() + skip + fallback + MASTER_TRACE,       # skip in the middle
+                         fallback + MASTER_TRACE + skip,                      # skip after the result
+                         skip + MASTER_TRACE + dispatch + async_applied):     # every reset after it
+                receipt = chk.parse_log_text(text)
+                self.assertTrue(receipt.get("skipped"), text)
+                failures = chk.check_receipt("a", receipt)
+                self.assertTrue(failures and "skipped" in failures[0], text)
+        # the first skip is the one named, and a clean arm still passes
+        named = chk.check_receipt("a", chk.parse_log_text(reasoned + reasonless + MASTER_TRACE))
+        self.assertIn("clip_lifecycle_mutating", named[0])
+        self.assertEqual([], chk.check_receipt("a", chk.parse_log_text(fallback + MASTER_TRACE)))
+        self.assertEqual([], chk.check_receipt("a", chk.parse_log_text(dispatch + async_applied)))
+
+    def test_the_full_checker_fails_every_arm_that_skipped_before_a_fallback_or_dispatch(self):
+        # sol's repro, through the whole checker and the recorded arms: prepend the skip to ONE arm's log, pictures and
+        # subject binding untouched; the recorded arms hold a master fallback, which used to clear it (exit 0).
+        import shutil
+        manifest_sha = None
+        with open(os.path.join(RECORDED, "MANIFEST.json"), "r", encoding="utf-8") as handle:
+            manifest_sha = json.load(handle)["subject_sha"]
+        for skip in ("look_assist.apply.skip file_loaded=1 mlv=1 receipt=1 enabled=1\n",
+                     "look_assist.apply.skip reason=clip_lifecycle_mutating\n"):
+            for clip in chk.DEFAULT_CLIPS:
+                for mode in chk.MODES:
+                    with tempfile.TemporaryDirectory() as root:
+                        for name in os.listdir(RECORDED):
+                            source = os.path.join(RECORDED, name)
+                            if os.path.isdir(source):
+                                shutil.copytree(source, os.path.join(root, name))
+                        self.assertEqual(0, chk.main([root, "--tag", "rec", "--subject-sha", manifest_sha]))
+                        logs = os.path.join(root, "rec-%s-%s" % (clip, mode), "logs")
+                        path = os.path.join(logs, sorted(os.listdir(logs))[0])
+                        with open(path, "r", encoding="utf-8", errors="replace", newline="") as handle:
+                            original = handle.read()
+                        with open(path, "w", encoding="utf-8", newline="") as handle:
+                            handle.write(PREFIX + skip + original)
+                        self.assertEqual(1, chk.main([root, "--tag", "rec", "--subject-sha", manifest_sha]),
+                                         "%s/%s %s" % (clip, mode, skip))
+        # a skip prepended to a synthetic arm that ends on a master fallback, sync and async
+        with tempfile.TemporaryDirectory() as root:
+            fallback = PREFIX + "look_assist.daylight_fallback_to_master reason=no_verified_surface frame=0\n"
+            make_full_set(root, fallback + MASTER_TRACE, applied=(140, 146, 170), master=(140, 146, 170))
+            self.assertEqual(0, chk.main([root, "--tag", "t", "--subject-sha", SHA]))
+            path = os.path.join(root, "t-tiny_dual_iso-sync", "logs", "mlvapp.log")
+            with open(path, "r", encoding="utf-8") as handle:
+                original = handle.read()
+            with open(path, "w", encoding="utf-8") as handle:
+                handle.write(PREFIX + "look_assist.apply.skip file_loaded=1 mlv=1 receipt=1 enabled=1\n" + original)
+            self.assertEqual(1, chk.main([root, "--tag", "t", "--subject-sha", SHA]))
+
     def test_async_receipt_is_read_from_the_async_applied_event(self):
         text = (PREFIX + "look_assist.apply.async_dispatch generation=3 frame=0 scene=shade floor_lifted=0\n"
                 + PREFIX + "look_assist.apply.auto_wb_async_applied generation=3 valid=1 source=processed-neutral-patch "

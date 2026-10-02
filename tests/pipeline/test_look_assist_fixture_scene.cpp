@@ -326,8 +326,11 @@ QString receiptLine( ReceiptSettings &r )
 // removes the recorded exposure, so nothing can call the clip daylight: that run IS master's analysis.
 // staleWhiteBalance: the processing object holds a 3000 K balance (no patch is found); false = the app default (the
 // picture has a trusted neutral patch, the initial-patch state).
+// existingTemperature / existingTint (receipt units; -1 = unset, the 6000 K / 0 base) are the balance the picture is
+// rendered at when Look Assist runs; asShotKelvin > 0 records that kelvin as the clip's own as-shot balance.
 bool runHeadlessLookAssist( const char *clipFile, bool noExposureMetadata, QString *receipt, QByteArray *log,
-                            bool staleWhiteBalance = true )
+                            bool staleWhiteBalance = true, int existingTemperature = -1, int existingTint = 0,
+                            int asShotKelvin = 0 )
 {
     MlvPipelineFixture fixture;
     QString error_message;
@@ -343,8 +346,13 @@ bool runHeadlessLookAssist( const char *clipFile, bool noExposureMetadata, QStri
     r.setLookAssistEnabled( true );
     r.setLookAssistBaselineValid( false );
     r.setExposure( 0 );
-    r.setTemperature( -1 );
-    r.setTint( 0 );
+    r.setTemperature( existingTemperature );
+    r.setTint( existingTint );
+    if( asShotKelvin > 0 )
+    {
+        fixture.video()->WBAL.wb_mode = 9;   // WB_KELVIN: the kelvin field is the as-shot balance
+        fixture.video()->WBAL.kelvin = asShotKelvin;
+    }
     if( staleWhiteBalance ) processingSetWhiteBalance( fixture.processing(), 3000, 0.0 );
 
     QTemporaryDir temporary_dir;
@@ -425,6 +433,46 @@ TEST(LookAssistFixtureScene, HeadlessTakesMastersPathForAnInitialPatchItCannotVe
         ASSERT_TRUE( onLog.contains( "autoWbSource=processed-neutral-patch" ) );
         ASSERT_TRUE( onLog.contains( "initialPatchChecked=true initialPatchRefused=false" ) );
         ASSERT_FALSE( onLog.contains( "daylight_fallback_to_master" ) );
+    }
+}
+
+TEST(LookAssistFixtureScene, HeadlessRefusesABlueAtAsShotInitialPatchThroughTheRealRenderer)
+{
+    // sol H2, PR #224 r1: the refusal of a patch that is near-neutral under the EXISTING balance but blue at the clip's
+    // as-shot balance, through ReceiptApplier's actual renderer (not the console suite's synthetic DeckScene).
+    // The clip records a 4800 K as-shot balance, so the as-shot prior renders the deck blue (the daylight window's
+    // floor); the picture the patch is found on is rendered at the existing 7895 K / -12 balance, where the same deck is
+    // near-neutral and passes the patch search. Switch ON: the initial patch must be judged on the as-shot surface,
+    // refused there, and the clip must take MASTER's damped result for the same state -- not the undamped solve.
+    // Master's own pass of this state is the one the refusal falls back to: the SAME patch, damped (0.65), not the
+    // undamped solve (the candidate, 6360 K / -35 here).
+    for( const FixtureClip &clip : kTrackedFixtureClips )
+    {
+        QString on, off, control;
+        QByteArray onLog, offLog, controlLog;
+        ASSERT_TRUE( runHeadlessLookAssist( clip.file, false, &on, &onLog, false, 7895, -12, 4800 ) );
+        {
+            ScopedEnv switchOff( "MLVAPP_LOOK_ASSIST_REFINE_DAYLIGHT", "0" );
+            ASSERT_TRUE( runHeadlessLookAssist( clip.file, false, &off, &offLog, false, 7895, -12, 4800 ) );
+        }
+        // Control: the same existing balance with the as-shot balance at the daylight default (6000 K), where the same
+        // surface is verified -> the daylight solve stands. The refusal above is the as-shot blue, nothing else.
+        ASSERT_TRUE( runHeadlessLookAssist( clip.file, false, &control, &controlLog, false, 7895, -12, 6000 ) );
+
+        ASSERT_TRUE( onLog.contains( "daylight_fallback_to_master" ) );
+        ASSERT_TRUE( onLog.contains( "reason=initial_patch_unverified refusedAtBase=true" ) );
+        ASSERT_TRUE( onLog.contains( "masterScenePass=true" ) );
+        ASSERT_TRUE( onLog.contains( "scene=night" ) );                        // master's verdict
+        ASSERT_FALSE( onLog.contains( "scene=shade" ) );
+        ASSERT_TRUE( onLog.contains( "autoWbDecision=accepted-damped autoWbDamping=0.650" ) );   // master's damped result
+        ASSERT_TRUE( onLog.contains( "autoWbCandidateTemp=6360 autoWbCandidateTint=-35" ) );
+        ASSERT_FALSE( on.contains( "temp=6360 " ) );                           // not the undamped candidate
+        ASSERT_TRUE( on.contains( "temp=6897 tint=-27 " ) );                   // damped between 7895 K and 6360 K
+        ASSERT_TRUE( on == off );                                              // the switch off lands on the same receipt
+
+        ASSERT_FALSE( controlLog.contains( "daylight_fallback_to_master" ) );
+        ASSERT_TRUE( controlLog.contains( "scene=shade" ) );
+        ASSERT_TRUE( controlLog.contains( "initialPatchChecked=true initialPatchRefused=false" ) );
     }
 }
 
