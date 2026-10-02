@@ -74,13 +74,28 @@ receipt oracle and refuses to believe a receipt that does not carry the oracle's
   whose job exited non-zero, or a captured job that wrote no `sourceFrames` block of its own, is `INVALID` too. A job smoke
   refusal of the length class (`PLAY_WINDOW_TOO_SHORT`, `INVALID_LOOPED`, ...) is `INVALID`, never a product `FAIL`.
   Readers (`Get-VenueEvidence`) must call `Test-DvReceiptValid -RepoRoot <repo> [-EvidenceDir <dir>]` (next bullet).
-* **A receipt is valid ONLY when every claim in it is re-derived from a committed blob or a hashed artifact; no field the
-  receipt asserts about itself is an input** (DUAL-VENUE-EVIDENCE-2; PR #207's validator believed hash *formats* and
+* **PRODUCTION RECEIPTS ARE ADVISORY (DUAL-VENUE-EVIDENCE-2 round 2; the narrowing exit, hub ruling 2026-10-02).** There is no
+  venue-held anchor: nothing the venue signs reaches this repo, and `um-run.json` is written by the runner itself, so a receipt
+  can show that it is consistent with committed consent and with the hashed files it names, but never that those files came from
+  a venue run. `Test-DvReceiptValid` therefore returns, for a production PASS/FAIL receipt that re-derives, `valid = false`,
+  `status = ADVISORY` and the typed reason `VENUE_ANCHOR_ABSENT`; it **never returns `VERIFIED`** for a production receipt and
+  nothing here produces a usable PASS. A receipt that does not re-derive is `INVALID` / `INCOMPLETE` (and also carries the reason).
+  A test pins the advisory result and a mutation that re-enables production PASS fails it. Offline test mode (never evidence)
+  keeps `VERIFIED_OFFLINE_TEST` for the harness. **Production PASS verification is a later card, `DUAL-VENUE-PASS-PROVENANCE-1`,
+  which needs a design step first**: a venue-agent signature over `summary.json`, or a validator that re-reads
+  `\\<venue>\mlv-agent\outbox` by `jobId`. **Declared threat model (forward-only).** *In scope:* our own tools, mislabelling,
+  legacy or other-lane receipts, a wrong-leg or wrong-backend pairing, an edited or stale receipt, a line-ending artefact.
+  *Out of scope, accepted and shown to the owner:* a deliberate forger who writes a whole matching evidence set.
+* **A receipt is advisory only when every claim in it is re-derived from a committed blob or a hashed artifact; no field the
+  receipt asserts about itself is an input to the verdict** (DUAL-VENUE-EVIDENCE-2; PR #207's validator believed hash *formats* and
   self-asserted booleans, so a hand-built production PASS over an empty consent blob validated). `Test-DvReceiptValid` returns
-  `{ valid; status; reasons }`, `status` being `VERIFIED` | `INCOMPLETE` (a piece of evidence is absent: never a PASS/FAIL) |
-  `INVALID` (a claim does not re-derive) | `NO_SIGNAL` (any outcome other than PASS/FAIL). `Write-DvReceipt` runs the **same**
-  validator before it writes a PASS/FAIL, and so does every reader (`New-VenueSheetPair.ps1`, and `Get-VenueEvidence` when
-  RECONCILE-1 builds it; a test pins that every in-tree caller passes `-RepoRoot`).
+  `{ valid; status; reasons; unbound; evidenceDir }`, `status` being `ADVISORY` (production, everything re-derives: **not valid**) |
+  `VERIFIED_OFFLINE_TEST` (offline harness only) | `INCOMPLETE` (a piece of evidence is absent: never a PASS/FAIL) |
+  `INVALID` (a claim does not re-derive) | `NO_SIGNAL` (any outcome other than PASS/FAIL); `VERIFIED` exists in the contract but no
+  production receipt can reach it. `Write-DvReceipt` runs the **same** validator before it writes a PASS/FAIL (an advisory receipt is
+  written and stamped `verification.status = ADVISORY`; anything that does not re-derive is refused), and so does every reader
+  (`New-VenueSheetPair.ps1` accepts exactly `ADVISORY` and says so in its record, and `Get-VenueEvidence` when RECONCILE-1 builds
+  it; a test pins that every in-tree caller passes `-RepoRoot`).
   * *Admission, from git:* `admission.consentBlobSha` and `venueTableBlobSha` must be real **blobs** of the repo (`git cat-file
     -t` says blob; a placeholder hash, a commit or a tree is refused) and be the files committed at `admission.headCommit`;
     the table parses; the consent blob parses with `Read-DvClipConsent` and holds an owner record (`recordedBy: owner`, the
@@ -99,15 +114,42 @@ receipt oracle and refuses to believe a receipt that does not carry the oracle's
     `settingsIsolated` are **derived, never read** -- and checks the evidence's own clip id, venue (`summary.display.venue`) and
     build (`manifest.buildManifest.sha256`), the verbatim `metrics`, the `subject.digest`, and the job's exit code. The
     manifest is optional only on a product-failure terminal (the job writes none); a capture without it is `INCOMPLETE`.
+  * *What the hashed summary binds (round 2):* the **backend** is derived from `summary.json`'s own frame counters, never from
+    `subject.backend` -- `cuda` needs `gpuFramesTotal > 0`; `cpu` needs `cpuFrames > 0` and `gpuFramesTotal == 0` and a `backend`
+    field in the summary (a cpu run is always a variant job) -- a receipt whose backend disagrees is `INVALID`
+    (`BACKEND_MISMATCH` / `BACKEND_NOT_DERIVABLE`), and the leg's criteria are selected by the **derived** backend. The **leg type**
+    comes from `summary.lookLeg` (a look-run's evidence can no longer verify as the speed leg, nor the reverse: `LEG_TYPE_MISMATCH`),
+    plus `lookAssistForced`, the look flavor and `declaredVenue` when the job wrote them.
+  * *Typed UNBOUND claims:* `subject.clipContentSha256` is computed by the local generator and written to **no** artifact the venue
+    returns, and `legId` / `legSpecSha256` name a committed spec that no hashed artifact carries (only the leg *type* is bound). They
+    are recorded -- the validator's `unbound` list (`CLIP_CONTENT_UNBOUND`, `LEG_IDENTITY_UNBOUND`), `verification.unbound` in a
+    written receipt, `unbound` in a sheet-pair record -- and are **never verdict inputs**: they are neither believed nor compared
+    when pairing (the pair is keyed on the bound clip id, build and look flavor).
+  * *Line endings:* the leg spec is identified by the sha256 of its bytes with CRLF folded to LF (`Get-DvLegSpecSha256`), on **both**
+    sides of the committed-spec lookup (the runner hashes the working copy, the lookup hashes the committed blob). On this VM's
+    default checkout (system git `core.autocrlf=true`) the working copy is CRLF while the blob is LF, and a raw-byte comparison would
+    refuse every committed spec as `LEG_SPEC_NOT_COMMITTED`. `.gitattributes` also pins `legs/*.json`, `venue-clip-consent.json` and
+    `venues.json` to `text eol=lf`; the consent file and the venue table are compared through git's own clean filters
+    (`git hash-object`). Tests check out the real shipped files under `core.autocrlf=true` with and without the pin.
   * *Honest limits:* (1) the evidence files are local; nothing signs them on the venue, so a forger who can both commit a
-    consent record **and** write a hash-consistent evidence directory can still build a receipt that verifies -- the control
-    on that is the hub's review of any consent commit and the evidence living only under `.claude-state`. (2) "Committed" is
-    any commit of the repo, not "reviewed master". (3) `subject.clipContentSha256` is bound only through the subject digest:
-    the job does not write it to any artifact, so it cannot be re-derived from the evidence. (4) A product-failure `FAIL`
-    has no manifest, so its build binding is the job's own `summary.json`. A hand-built receipt, a placeholder hash, a
-    self-asserted boolean, an empty consent blob, an uncommitted leg spec and missing evidence never verify.
+    consent record **and** write a hash-consistent evidence directory (or just the evidence directory, once consent is legitimately
+    committed) can still make a receipt re-derive -- which is exactly why a production receipt is advisory, never VERIFIED.
+    (2) "Committed" is any commit of the repo, not "reviewed master" (`admission.headCommit` may be a dangling commit; fable's
+    hardening `DVE-CONSENT-COMMIT-MUST-BE-REVIEWED-1`). (3) `clipContentSha256` and the leg id are UNBOUND (above). (4) A
+    product-failure `FAIL` has no manifest, so its build binding is the job's own `summary.json`. A hand-built receipt, a placeholder
+    hash, a self-asserted boolean, an empty consent blob, an uncommitted leg spec, a relabelled backend or leg, a line-ending
+    difference and missing evidence never *re-derive*, and nothing re-derived is more than advisory.
+* **Raw contact-sheet frames are listed too (round 2).** At capture time the runner hashes every raw frame and sidecar into
+  `contact-frames.json` (`mlv-app/dual-venue-contact-frames/v1`, named in the receipt as `evidence.contactFramesJsonSha256`).
+  A LOOK receipt's validation and `New-VenueSheetPair.ps1` take **only** the files that manifest lists (`Read-DvContactFrames`): an
+  unlisted PNG or sidecar, a listed file that is missing or does not hash to its entry, a non-`*.png`/`*.json` name, a
+  subdirectory or a reparse point is refused (`CONTACT_FRAME_UNLISTED`, `CONTACT_FRAME_HASH_MISMATCH`, `CONTACT_FRAMES_UNLISTED`),
+  and the pair is composed from a staging copy of exactly the bytes that were hashed. Two receipts that share one evidence
+  directory are refused. The pair record says `advisory: true`.
+* **Queued, not done here:** `DUAL-VENUE-PASS-PROVENANCE-1` (venue-held provenance for a production PASS: design first -- a
+  venue-agent signature over `summary.json`, or the validator re-reading `\\<venue>\mlv-agent\outbox` by `jobId`).
 * Limit, stated plainly: a venue sitting is still the observation that a real run reaches its frames; nothing here plays
-  the app, and no venue run has happened.
+  the app, and no venue run has happened. Until DUAL-VENUE-PASS-PROVENANCE-1 lands, no production receipt counts as a PASS.
 
 ## Pieces
 
@@ -123,7 +165,8 @@ receipt oracle and refuses to believe a receipt that does not carry the oracle's
 * `tools/profiling/dual-venue/Invoke-VenueLeg.ps1` -- runs one leg on one venue and **always** writes a
   receipt. `DualVenueRunner.psm1` holds its testable rules.
 * `tools/profiling/dual-venue/New-VenueSheetPair.ps1` -- composes the side-by-side cuda|cpu contact sheet
-  for a LOOK leg from two receipts (`make-contact-sheet.py --pair-dir`, paired by frame index).
+  for a LOOK leg from two **advisory** receipts (`make-contact-sheet.py --pair-dir`, paired by frame index; a diagnostic sheet,
+  never a PASS).
 * `tools/profiling/dual-venue/leg-spec.schema.json` and `legs/*.json` -- the leg specs.
 * `Get-VenueEvidence.ps1` (the reader; built by DUAL-VENUE-RECONCILE-1) -- reads receipts; acceptance
   reads only `-AcceptanceFor <card>`.
@@ -169,7 +212,8 @@ path; the pair is its own record (`mlv-app/dual-venue-sheet-pair/v1`) because re
    over the metrics copied verbatim from the job's `summary.json` (`rows`, `gpuFramesTotal`, `cpuFrames`,
    `lookAssistForced`, `presentMon*`, ...). An empty list is informational. A metric the job did not
    write *fails* the criterion -- a missing number is never a passing number.
-4. `legSpecSha256` is the sha256 of the file's exact bytes, so editing a leg makes a new subject.
+4. `legSpecSha256` is the sha256 of the file's bytes with line endings normalised (CRLF -> LF), so editing a leg makes a new
+   subject and a CRLF checkout does not.
 
 ## How to run a leg on a venue
 

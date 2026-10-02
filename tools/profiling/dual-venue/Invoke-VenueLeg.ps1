@@ -30,6 +30,10 @@
 #      launcher generated), map the job's RESULT to a P4 outcome, evaluate the role's criteria, write the receipt. A
 #      PASS/FAIL without a valid verdict is INVALID.
 #
+# PRODUCTION RECEIPTS ARE ADVISORY (DUAL-VENUE-EVIDENCE-2 round 2): no venue-held anchor exists, so a PASS/FAIL receipt that re-derives is written
+# with verification.status = ADVISORY, outcomeDetail prefixed "ADVISORY (VENUE_ANCHOR_ABSENT; never a usable PASS)", and DVE_VERIFICATION=ADVISORY is
+# printed; Test-DvReceiptValid returns valid=false for it. Production PASS verification is DUAL-VENUE-PASS-PROVENANCE-1 (docs/dual-venue-evidence.md).
+#
 # OFFLINE TEST MODE (-OfflineTestMode, tests only): lets a test supply its own consent file, venue table, generator
 # and um-run stub. It can NEVER submit a job to a venue: -UmRunScript is required and may not be um-run.ps1 (by path or by
 # content), and every venue's agentShare must be a local directory under the OS temp folder (never a UNC share). A receipt
@@ -135,7 +139,9 @@ if ($null -ne $table) {
 }
 
 $specBytes = [IO.File]::ReadAllBytes((Resolve-Path -LiteralPath $LegSpec).Path)
-$legSpecSha256 = Get-DvSha256OfBytes $specBytes
+# Line endings are normalised on BOTH sides of the committed-spec lookup (Get-DvLegSpecSha256): on this VM's default checkout (autocrlf=true) the working
+# copy is CRLF and the committed blob is LF, and a raw-byte hash would refuse every committed spec as LEG_SPEC_NOT_COMMITTED (fable r1 B2).
+$legSpecSha256 = Get-DvLegSpecSha256 $specBytes
 $spec = [Text.Encoding]::UTF8.GetString($specBytes) | ConvertFrom-Json
 if ($spec.schema -ne 'mlv-app/dual-venue-leg/v1') { throw "DVE_LEG_SPEC_INVALID schema is '$($spec.schema)', expected mlv-app/dual-venue-leg/v1" }
 if ([string]::IsNullOrWhiteSpace($Backend)) { $Backend = [string]@($spec.backends)[0] }
@@ -180,7 +186,9 @@ function Complete-Receipt([string]$Outcome, [string]$Detail) {
         exit 2
     }
     Write-Output "DVE_OUTCOME=$Outcome"
-    Write-Output "DVE_DETAIL=$Detail"
+    # (the writer relabels an advisory production PASS/FAIL in outcomeDetail and stamps receipt.verification: say so here too)
+    Write-Output "DVE_DETAIL=$($receipt.outcomeDetail)"
+    if ($null -ne $receipt['verification']) { Write-Output "DVE_VERIFICATION=$($receipt['verification'].status)" }
     Write-Output "DVE_RECEIPT_PATH=$path"
     exit 0
 }
@@ -447,6 +455,12 @@ if ($isLook -and $artifactsShare) {
         if (Test-Path -LiteralPath $rawShare -PathType Container) {
             Copy-Item -LiteralPath $rawShare -Destination (Join-Path $sheetDir 'raw') -Recurse
             $rawLocal = Join-Path $sheetDir 'raw'
+            # Hash EVERY captured frame and sidecar into a manifest the receipt names (sol r1 B4): the sheet reader takes only what it lists.
+            $listing = @(Get-ChildItem -LiteralPath $rawLocal -Recurse -Force -File | Sort-Object FullName | ForEach-Object {
+                [ordered]@{ name = $_.FullName.Substring($rawLocal.Length).TrimStart('\'); sha256 = (Get-DvSha256OfFile $_.FullName) } })
+            $framesBytes = [Text.UTF8Encoding]::new($false).GetBytes(([ordered]@{ schema = 'mlv-app/dual-venue-contact-frames/v1'; files = $listing } | ConvertTo-Json -Depth 4) + "`n")
+            [IO.File]::WriteAllBytes((Join-Path $evidenceDir 'contact-frames.json'), $framesBytes)
+            $receipt.evidence.contactFramesJsonSha256 = Get-DvSha256OfBytes $framesBytes
         }
     }
     if (Test-Path -LiteralPath $sheetShare -PathType Leaf) {

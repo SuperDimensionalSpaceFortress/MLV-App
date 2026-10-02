@@ -16,6 +16,13 @@
 # Test-DvReceiptValid -RepoRoot (DUAL-VENUE-EVIDENCE-2) re-derives its admission from the committed consent / venue-table / leg-spec
 # blobs and its run (>= 20 s of source frames, nonce, wrap, outcome) from the hashed evidence files; a receipt whose evidence is
 # absent is INCOMPLETE and cannot be paired. The raw frames are read from the verified evidence directory, never from a receipt path.
+#
+# Round 2 (formal keys r1): (1) a PRODUCTION receipt is ADVISORY at best (no venue-held anchor: Test-DvReceiptValid returns status ADVISORY, valid=false,
+# VENUE_ANCHOR_ABSENT), so the pair is a DIAGNOSTIC sheet from advisory receipts and its record says so; nothing here is a PASS. Any other status is
+# refused. (2) The backend is derived by the validator from the hashed summary, so a cuda run can no longer be relabelled cpu to pair against itself.
+# (3) Raw frames and sidecars are accepted ONLY as the hashed contact-frames manifest lists them (Read-DvContactFrames); they are staged from the
+# very bytes that were hashed, and anything unlisted is refused. (4) Two receipts that share one evidence directory are refused.
+# (5) subject.clipContentSha256, hostName and gpuNames are UNBOUND (no hashed artifact carries them): they are neither compared nor printed.
 [CmdletBinding()]
 param(
     [Parameter(Mandatory = $true)][string]$CudaReceipt,
@@ -36,32 +43,48 @@ if (@($outFull.Split([char[]]@('\', '/')) | Where-Object { $_ -ceq '.claude-stat
 }
 # The repo whose COMMITTED consent and venue table a receipt is verified against is the one this script lives in (never a caller's).
 $repoRoot = (Resolve-Path (Join-Path $PSScriptRoot '..\..\..')).Path
-$rawDirs = @{}
+$evidenceDirs = @{}
+$listedFrames = @{}
 foreach ($r in $cuda, $cpu) {
     if ($r.outcome -ne 'PASS' -and $r.outcome -ne 'FAIL') { throw "PAIR_RECEIPT_INCOMPLETE receipt $($r.receiptId) is $($r.outcome), not PASS/FAIL" }
     # The evidence-bearing validator: the receipt's admission is re-derived from the committed blobs and its run from the hashed
     # evidence files (a receipt whose evidence is absent is INCOMPLETE). Nothing the receipt says about itself is believed.
     $validity = Test-DvReceiptValid -Receipt $r -RepoRoot $repoRoot
-    if (-not $validity.valid) { throw "PAIR_RECEIPT_$($validity.status) receipt $($r.receiptId) is not valid evidence: $(@($validity.reasons) -join '; ')" }
+    if ($validity.status -cne 'ADVISORY') { throw "PAIR_RECEIPT_$($validity.status) receipt $($r.receiptId) is not valid evidence: $(@($validity.reasons) -join '; ')" }
+    # The leg type is the COMMITTED spec's (found by the validator), not a field of the receipt: only a look leg has a sheet to pair.
+    if ([string]$validity.legType -cne 'look') { throw "PAIR_NOT_A_LOOK_LEG receipt $($r.receiptId) is not a LOOK leg per its committed leg spec; only a look leg's frames can be paired" }
     if ([string]$r.subject.clipId -cnotmatch '^[A-Za-z]\d{2}-\d{3,4}$') { throw 'PAIR_NOT_A_CONSENTED_CLIP only a consented clip id (never a fixture or a path) can be paired into a sheet' }
-    # The frames are read from the verified evidence directory, never from a path the receipt asserts.
-    $raw = Join-Path ([string]$r.evidence.localEvidenceDir) 'contact-sheet\raw'
-    if (-not (Test-Path -LiteralPath $raw -PathType Container)) { throw "PAIR_NO_FRAMES receipt $($r.receiptId) has no raw contact-sheet frames in its evidence directory" }
-    $rawDirs[[string]$r.receiptId] = $raw
+    # The frames are read from the directory the validator verified, and ONLY as the hashed contact-frames manifest lists them.
+    $evDir = [string]$validity.evidenceDir
+    $listed = Read-DvContactFrames -Receipt $r -EvidenceDir $evDir
+    if (-not $listed.ok) { throw "PAIR_FRAMES_NOT_LISTED receipt $($r.receiptId): $(@($listed.reasons) -join '; ')" }
+    $evidenceDirs[[string]$r.receiptId] = [IO.Path]::GetFullPath($evDir).TrimEnd('\').ToLowerInvariant()
+    $listedFrames[[string]$r.receiptId] = $listed
 }
-foreach ($f in 'buildManifestSha256', 'legSpecSha256', 'clipId', 'clipContentSha256', 'lookFlavor') {
+if ($evidenceDirs[[string]$cuda.receiptId] -ceq $evidenceDirs[[string]$cpu.receiptId]) { throw 'PAIR_SHARED_EVIDENCE the two receipts name one evidence directory; a cuda and a cpu leg have separate evidence' }
+foreach ($f in 'buildManifestSha256', 'legSpecSha256', 'clipId', 'lookFlavor') {
     if ([string]$cuda.subject.$f -ne [string]$cpu.subject.$f) { throw "PAIR_SUBJECT_DIFFERS the receipts differ in subject.$f" }
 }
 if ($cuda.venue.name -ne $cpu.venue.name -or $cuda.legId -ne $cpu.legId -or $cuda.card -ne $cpu.card) { throw 'PAIR_VENUE_OR_LEG_DIFFERS the receipts are not the same venue/leg/card' }
 
 $venue = [string]$cuda.venue.name; $flavor = if ($cuda.subject.lookFlavor) { [string]$cuda.subject.lookFlavor } else { 'classic' }
 New-Item -ItemType Directory -Force -Path $OutDir | Out-Null
+# Stage exactly the bytes that were hashed (a frame edited after the check can no longer be composed), one fresh directory per pair.
+$stageRoot = Join-Path (Join-Path $OutDir '.pair-staging') ([guid]::NewGuid().ToString('N'))
+$stageDirs = @{}
+foreach ($label in 'cuda', 'cpu') {
+    $rid = $(if ($label -ceq 'cuda') { [string]$cuda.receiptId } else { [string]$cpu.receiptId })
+    $dir = Join-Path $stageRoot $label
+    New-Item -ItemType Directory -Force -Path $dir | Out-Null
+    foreach ($file in $listedFrames[$rid].files) { [IO.File]::WriteAllBytes((Join-Path $dir $file.name), [byte[]]$file.bytes) }
+    $stageDirs[$label] = $dir
+}
 $sheet = Join-Path $OutDir "sheet-$venue-cuda-vs-cpu-$flavor.png"
 $stats = Join-Path $OutDir "sheet-$venue-cuda-vs-cpu-$flavor.stats.json"
 $composer = Join-Path $PSScriptRoot '..\make-contact-sheet.py'
-$pyArgs = @('-3', $composer, '--frames-dir', $rawDirs[[string]$cuda.receiptId], '--pair-dir', $rawDirs[[string]$cpu.receiptId],
+$pyArgs = @('-3', $composer, '--frames-dir', $stageDirs['cuda'], '--pair-dir', $stageDirs['cpu'],
     '--sheet-out', $sheet, '--stats-out', $stats, '--clip-id', [string]$cuda.subject.clipId,
-    '--host', [string]$cuda.venue.hostName, '--gpu', (@($cuda.venue.gpuNames) -join ' / '), '--build-sha', ([string]$cuda.subject.buildManifestSha256).Substring(0, 12),
+    '--host', $venue, '--build-sha', ([string]$cuda.subject.buildManifestSha256).Substring(0, 12),
     '--left-label', 'cuda', '--right-label', 'cpu', '--cols', '1')
 & py @pyArgs
 if ($LASTEXITCODE -ne 0) { throw "PAIR_COMPOSE_FAILED make-contact-sheet.py exited $LASTEXITCODE" }
@@ -71,6 +94,10 @@ $record = [ordered]@{
     venue = $venue; card = $cuda.card; legId = $cuda.legId; lookFlavor = $flavor
     lookFlavorHonored = 'unknown'
     ownerFootage = $true
+    advisory = $true
+    evidenceStatus = 'ADVISORY'
+    advisoryNote = 'both receipts re-derive from committed consent and hashed run evidence, but no venue-held anchor exists (VENUE_ANCHOR_ABSENT): a diagnostic sheet, never a PASS'
+    unbound = @('subject.clipContentSha256', 'venue.hostName', 'venue.gpuNames')
     localOnly = 'never committed, attached to a PR, published to the bus or as an artifact'
     cudaReceiptId = $cuda.receiptId; cpuReceiptId = $cpu.receiptId
     sheet = [ordered]@{ path = $sheet; sha256 = (Get-DvSha256OfFile $sheet); statsPath = $stats; statsSha256 = (Get-DvSha256OfFile $stats) }
