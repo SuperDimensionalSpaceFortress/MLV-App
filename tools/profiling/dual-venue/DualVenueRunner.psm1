@@ -12,6 +12,11 @@
 # clip and never names a path. A leg is a CLIP ID; Get-DvClipAdmission refuses a fixture (master's length gate) and a
 # clip the venue has no owner-typed consent record for; a PASS/FAIL receipt must carry the receipt oracle's verdict
 # (Get-DvPlaybackEvidence / Test-DvReceiptValid) or it is INVALID.
+#
+# Round 3 (formal keys r1): (1) the verdict is RE-DERIVED from the run's own log + the launcher's result.json and judged against
+# the nonce the real launcher mints (32 lowercase hex), with native fps / pace / override / the 20 s floor in the receipt;
+# (2) production admission reads the consent file and the venue table ONLY as committed at HEAD (Resolve-DvAdmissionSources),
+# each consent record carrying the owner's exact typed line, and the receipt records the blob ids it was admitted on.
 
 Set-StrictMode -Version Latest
 
@@ -19,7 +24,9 @@ $script:ReceiptSchema = 'mlv-app/dual-venue-receipt/v1'
 # P4: the ONLY outcomes a receipt may carry.
 # INVALID (round 2): the leg ran or was captured but the receipt oracle's proof is not in it (under 20 s of source
 # frames, a wrap, a foreign run, a fixture); it carries no signal, exactly like DEVICE_UNAVAILABLE.
-$script:OutcomeEnum = @('PASS', 'FAIL', 'VENUE_UNHEALTHY', 'VENUE_NOT_QUIESCENT', 'VENUE_HOST_MISMATCH', 'DEVICE_UNAVAILABLE', 'UNRESOLVED', 'RETRACTED', 'INVALID')
+# VENUE_TOOLING (round 3): the leg played and its proof is sound, but the VENUE cannot do a post-capture step (a LOOK leg's
+# contact sheet needs Python + Pillow on the venue); it is a venue condition, never a product FAIL.
+$script:OutcomeEnum = @('PASS', 'FAIL', 'VENUE_UNHEALTHY', 'VENUE_NOT_QUIESCENT', 'VENUE_HOST_MISMATCH', 'DEVICE_UNAVAILABLE', 'UNRESOLVED', 'RETRACTED', 'INVALID', 'VENUE_TOOLING')
 
 function Get-DvOutcomeEnum { $script:OutcomeEnum }
 
@@ -112,13 +119,17 @@ function Get-DvSubjectDigest {
 }
 
 # --- venue table (P3) -----------------------------------------------------------------------------
-function Read-DvVenueTable([string]$Path) {
-    if (-not (Test-Path -LiteralPath $Path -PathType Leaf)) { throw "DVE_VENUE_TABLE_MISSING no venue table at the given path" }
-    $table = [IO.File]::ReadAllText($Path) | ConvertFrom-Json
+function ConvertFrom-DvVenueTableText([string]$Text) {
+    try { $table = $Text | ConvertFrom-Json } catch { throw 'DVE_VENUE_TABLE_INVALID the venue table is not valid JSON' }
     foreach ($name in 'venues', 'roles', 'defaultRole') {
         if ($null -eq $table.PSObject.Properties[$name]) { throw "DVE_VENUE_TABLE_INVALID the venue table lacks '$name'" }
     }
     $table
+}
+
+function Read-DvVenueTable([string]$Path) {
+    if (-not (Test-Path -LiteralPath $Path -PathType Leaf)) { throw "DVE_VENUE_TABLE_MISSING no venue table at the given path" }
+    ConvertFrom-DvVenueTableText ([IO.File]::ReadAllText($Path))
 }
 
 function Get-DvVenueRole {
@@ -143,7 +154,11 @@ $script:FixtureClipIds = @('tiny_dual_iso', 'large_dual_iso')
 
 $script:ClipIdPattern = '^[A-Za-z]\d{2}-\d{3,4}$'
 $script:ConsentSchema = 'mlv-app/dual-venue-clip-consent/v1'
-$script:ConsentRecordKeys = @('venue', 'clipId', 'ownerLineSha256', 'recordedUtc', 'recordedBy')
+# A record carries the owner's EXACT typed line ("CLIP <venue>: <clip id>": no path, ever), that line's sha256, when it was
+# recorded and by whom ('owner' only). The line is checked against the record's own venue + clip id and against its hash.
+$script:ConsentRecordKeys = @('venue', 'clipId', 'ownerLine', 'ownerLineSha256', 'recordedUtc', 'recordedBy')
+$script:ConsentRelativePath = 'tools/profiling/dual-venue/venue-clip-consent.json'
+$script:VenueTableRelativePath = 'tools/profiling/dual-venue/venues.json'
 
 function Get-DvProp {
     # A property of a hashtable OR an object, $null when absent (StrictMode-safe). `return ,` keeps an empty array an
@@ -159,23 +174,116 @@ function Get-DvProp {
     $null
 }
 
+# --- where admission reads its inputs from (round 3, sol BLOCKER) ----------------------------------------------------
+function Invoke-DvGit {
+    # Run git in $RepoRoot; returns exit code, stdout BYTES (a blob must not be re-encoded or newline-translated) and stderr.
+    param([Parameter(Mandatory)][string]$RepoRoot, [Parameter(Mandatory)][string[]]$GitArgs)
+    $psi = [System.Diagnostics.ProcessStartInfo]::new('git')
+    $psi.UseShellExecute = $false; $psi.RedirectStandardOutput = $true; $psi.RedirectStandardError = $true; $psi.CreateNoWindow = $true
+    foreach ($a in (@('-C', $RepoRoot) + $GitArgs)) { [void]$psi.ArgumentList.Add($a) }
+    $proc = [System.Diagnostics.Process]::Start($psi)
+    try {
+        $errTask = $proc.StandardError.ReadToEndAsync()
+        $ms = [IO.MemoryStream]::new()
+        $proc.StandardOutput.BaseStream.CopyTo($ms)
+        $proc.WaitForExit()
+        [pscustomobject]@{ exitCode = $proc.ExitCode; bytes = $ms.ToArray(); stderr = $errTask.Result }
+    } finally { $proc.Dispose() }
+}
+
+function Get-DvCommittedFile {
+    <#
+    .SYNOPSIS
+    The bytes of a tracked file AS COMMITTED at HEAD of $RepoRoot (git rev-parse HEAD:<path> + git cat-file blob), refused
+    when the working copy differs from that blob. Returns [pscustomobject]@{ ok; reason; text; blobSha; headSha; lastCommit }.
+    reason is a typed token: ADMISSION_SOURCE_NOT_COMMITTED (no HEAD, or the path is not in HEAD) or
+    ADMISSION_SOURCE_DIRTY (the working copy is not byte-identical to the committed blob, after git's own normalisation).
+    #>
+    param([Parameter(Mandatory)][string]$RepoRoot, [Parameter(Mandatory)][string]$RelativePath)
+    $bad = { param($token) [pscustomobject]@{ ok = $false; reason = $token; text = $null; blobSha = $null; headSha = $null; lastCommit = $null } }
+    $head = Invoke-DvGit -RepoRoot $RepoRoot -GitArgs @('rev-parse', '--verify', 'HEAD')
+    if ($head.exitCode -ne 0) { return (& $bad 'ADMISSION_SOURCE_NOT_COMMITTED') }
+    $headSha = ([Text.Encoding]::ASCII.GetString($head.bytes)).Trim()
+    $blob = Invoke-DvGit -RepoRoot $RepoRoot -GitArgs @('rev-parse', '--verify', "HEAD:$RelativePath")
+    if ($blob.exitCode -ne 0) { return (& $bad 'ADMISSION_SOURCE_NOT_COMMITTED') }
+    $blobSha = ([Text.Encoding]::ASCII.GetString($blob.bytes)).Trim()
+    if ($blobSha -cnotmatch '^[0-9a-f]{40}$') { return (& $bad 'ADMISSION_SOURCE_NOT_COMMITTED') }
+    $workFile = Join-Path $RepoRoot ($RelativePath -replace '/', '\')
+    if (-not (Test-Path -LiteralPath $workFile -PathType Leaf)) { return (& $bad 'ADMISSION_SOURCE_DIRTY') }
+    # hash-object applies the same clean filters git applies on commit, so an unchanged checkout hashes to the committed blob.
+    $work = Invoke-DvGit -RepoRoot $RepoRoot -GitArgs @('hash-object', '--', $workFile)
+    if ($work.exitCode -ne 0 -or ([Text.Encoding]::ASCII.GetString($work.bytes)).Trim() -cne $blobSha) { return (& $bad 'ADMISSION_SOURCE_DIRTY') }
+    $content = Invoke-DvGit -RepoRoot $RepoRoot -GitArgs @('cat-file', 'blob', $blobSha)
+    if ($content.exitCode -ne 0) { return (& $bad 'ADMISSION_SOURCE_NOT_COMMITTED') }
+    $last = Invoke-DvGit -RepoRoot $RepoRoot -GitArgs @('log', '-1', '--format=%H', 'HEAD', '--', $RelativePath)
+    $text = [Text.UTF8Encoding]::new($false).GetString($content.bytes)
+    if ($text.Length -gt 0 -and $text[0] -eq [char]0xFEFF) { $text = $text.Substring(1) }
+    [pscustomobject]@{ ok = $true; reason = $null; text = $text; blobSha = $blobSha; headSha = $headSha
+                       lastCommit = $(if ($last.exitCode -eq 0) { ([Text.Encoding]::ASCII.GetString($last.bytes)).Trim() } else { $null }) }
+}
+
+function Resolve-DvAdmissionSources {
+    <#
+    .SYNOPSIS
+    Where the venue table and the per-venue consent come from. PRODUCTION reads ONLY the tracked files at the COMMITTED
+    revision (HEAD) of the repo, and refuses when the working copy differs: a file an agent or a caller writes anywhere
+    is never consent. A path override (-ConsentPath / -VenueTablePath) exists for tests only and is refused unless
+    -OfflineTestMode is set (and an offline-test receipt is never evidence: Test-DvReceiptValid).
+    Returns [pscustomobject]@{ ok; reason; mode; tableText; consentText; consentBlobSha; venueTableBlobSha; headCommit; consentLastCommit }.
+    #>
+    param([Parameter(Mandatory)][string]$RepoRoot, [string]$ConsentPath = '', [string]$VenueTablePath = '', [switch]$OfflineTestMode)
+    $res = [ordered]@{ ok = $false; reason = $null; mode = $(if ($OfflineTestMode) { 'offline-test' } else { 'production' })
+                       tableText = $null; consentText = $null; consentBlobSha = $null; venueTableBlobSha = $null; headCommit = $null; consentLastCommit = $null }
+    if ($OfflineTestMode) {
+        $consentFile = $(if ([string]::IsNullOrWhiteSpace($ConsentPath)) { Join-Path $RepoRoot ($script:ConsentRelativePath -replace '/', '\') } else { $ConsentPath })
+        $tableFile = $(if ([string]::IsNullOrWhiteSpace($VenueTablePath)) { Join-Path $RepoRoot ($script:VenueTableRelativePath -replace '/', '\') } else { $VenueTablePath })
+        if (-not (Test-Path -LiteralPath $tableFile -PathType Leaf)) { $res.reason = 'VENUE_TABLE_MISSING'; return [pscustomobject]$res }
+        $res.tableText = [IO.File]::ReadAllText($tableFile)
+        # A missing consent file reads as the empty text, which Read-DvClipConsent refuses (fail closed).
+        $res.consentText = $(if (Test-Path -LiteralPath $consentFile -PathType Leaf) { [IO.File]::ReadAllText($consentFile) } else { '' })
+        $res.ok = $true
+        return [pscustomobject]$res
+    }
+    if (-not [string]::IsNullOrWhiteSpace($ConsentPath) -or -not [string]::IsNullOrWhiteSpace($VenueTablePath)) {
+        $res.reason = 'TEST_SEAM_IN_PRODUCTION'; return [pscustomobject]$res
+    }
+    $table = Get-DvCommittedFile -RepoRoot $RepoRoot -RelativePath $script:VenueTableRelativePath
+    if (-not $table.ok) { $res.reason = $table.reason; return [pscustomobject]$res }
+    $consent = Get-DvCommittedFile -RepoRoot $RepoRoot -RelativePath $script:ConsentRelativePath
+    if (-not $consent.ok) { $res.reason = $consent.reason; return [pscustomobject]$res }
+    $res.tableText = $table.text; $res.consentText = $consent.text
+    $res.venueTableBlobSha = $table.blobSha; $res.consentBlobSha = $consent.blobSha
+    $res.headCommit = $consent.headSha; $res.consentLastCommit = $consent.lastCommit
+    $res.ok = $true
+    [pscustomobject]$res
+}
+
+function Test-DvUnderClaudeState {
+    # Owner footage (a contact sheet, a receipt that names it) is only ever written where it stays local: a path with a
+    # `.claude-state` segment (gitignored; never committed, PR-attached, bus-published or published as an artifact).
+    param([Parameter(Mandatory)][string]$Path)
+    $full = [IO.Path]::GetFullPath($Path)
+    @($full.Split([char[]]@('\', '/')) | Where-Object { $_ -ceq '.claude-state' }).Count -gt 0
+}
+
 function Read-DvClipConsent {
     <#
     .SYNOPSIS
-    Read the tracked, OWNER-WRITTEN per-venue consent file (tools/profiling/dual-venue/venue-clip-consent.json). The
-    hub records an owner-typed CLIP line there as a record keyed by venue + clip id (the line itself only as its
-    sha256); agents never write it and this function only ever reads it. FAIL CLOSED: a missing file, bad JSON, a wrong
-    schema or any record that is not exactly the five reviewed keys (so a path cannot ride along in an extra field)
-    makes the WHOLE file invalid -- unknown consent is no consent.
+    Parse the OWNER-WRITTEN per-venue consent file text (tools/profiling/dual-venue/venue-clip-consent.json, read at its
+    COMMITTED revision by Resolve-DvAdmissionSources). The hub records the owner's typed CLIP line there; agents never
+    write it and this function only ever reads text it is given. A record carries the owner's EXACT line
+    ("CLIP <venue>: <clip id>"), its sha256, recordedUtc and recordedBy = 'owner'; the line must name the record's own
+    venue and clip id and hash to ownerLineSha256, so a bare hex string cannot stand in for the owner's words.
+    FAIL CLOSED: empty text, bad JSON, a wrong schema, or any record that is not exactly the six reviewed keys (so a path
+    cannot ride along in an extra field) makes the WHOLE file invalid -- unknown consent is no consent.
     Returns [pscustomobject]@{ ok; reason; records }.
     #>
-    param([Parameter(Mandatory)][string]$Path, [Parameter(Mandatory)]$Table)
+    param([Parameter(Mandatory)][AllowEmptyString()][string]$Text, [Parameter(Mandatory)]$Table)
     $bad = { param($why) [pscustomobject]@{ ok = $false; reason = $why; records = @() } }
-    if (-not (Test-Path -LiteralPath $Path -PathType Leaf)) { return (& $bad 'the consent file is missing') }
-    $text = [IO.File]::ReadAllText($Path)
+    if ([string]::IsNullOrWhiteSpace($Text)) { return (& $bad 'the consent file is missing or empty') }
     # A consent record names a clip by ID. A drive path or a footage file name anywhere in the file is refused outright.
-    if ($text -match '(?i)[a-z]:[\\/]|\.mlv\b') { return (& $bad 'the consent file carries a path-shaped value') }
-    try { $doc = $text | ConvertFrom-Json } catch { return (& $bad 'the consent file is not valid JSON') }
+    if ($Text -match '(?i)[a-z]:[\\/]|\.mlv\b') { return (& $bad 'the consent file carries a path-shaped value') }
+    try { $doc = $Text | ConvertFrom-Json } catch { return (& $bad 'the consent file is not valid JSON') }
     if ([string](Get-DvProp $doc 'schema') -ne $script:ConsentSchema) { return (& $bad "the consent file schema is not $($script:ConsentSchema)") }
     if ($null -eq $doc.PSObject.Properties['records']) { return (& $bad 'the consent file has no records array') }
     $venues = @($Table.venues.PSObject.Properties | ForEach-Object { $_.Name })
@@ -184,12 +292,19 @@ function Read-DvClipConsent {
         if ($null -eq $r) { return (& $bad 'a consent record is null') }
         $keys = @($r.PSObject.Properties | ForEach-Object { $_.Name })
         if ($keys.Count -ne $script:ConsentRecordKeys.Count -or @($keys | Where-Object { $_ -cnotin $script:ConsentRecordKeys }).Count -gt 0) {
-            return (& $bad 'a consent record is not exactly venue, clipId, ownerLineSha256, recordedUtc, recordedBy')
+            return (& $bad 'a consent record is not exactly venue, clipId, ownerLine, ownerLineSha256, recordedUtc, recordedBy')
         }
         if ([string]$r.venue -cnotin $venues) { return (& $bad 'a consent record names a venue the venue table does not have') }
         if ([string]$r.clipId -cnotmatch $script:ClipIdPattern) { return (& $bad 'a consent record clipId is not a consented clip id') }
         if ([string]$r.ownerLineSha256 -cnotmatch '^[0-9a-f]{64}$') { return (& $bad 'a consent record ownerLineSha256 is not 64 lowercase hex') }
-        if ([string]::IsNullOrWhiteSpace([string]$r.recordedUtc) -or [string]::IsNullOrWhiteSpace([string]$r.recordedBy)) { return (& $bad 'a consent record lacks recordedUtc/recordedBy') }
+        $line = [string]$r.ownerLine
+        if ($line -cne ('CLIP ' + [string]$r.venue + ': ' + [string]$r.clipId)) { return (& $bad "a consent record's ownerLine is not the owner's 'CLIP <venue>: <clip id>' line for its own venue and clip") }
+        if ((Get-DvSha256OfText $line) -cne [string]$r.ownerLineSha256) { return (& $bad "a consent record's ownerLineSha256 is not the sha256 of its ownerLine") }
+        if ([string]$r.recordedBy -cne 'owner') { return (& $bad "a consent record's recordedBy is not 'owner'") }
+        $when = [DateTime]::MinValue
+        if (-not [DateTime]::TryParse([string]$r.recordedUtc, [Globalization.CultureInfo]::InvariantCulture, [Globalization.DateTimeStyles]::AdjustToUniversal -bor [Globalization.DateTimeStyles]::AssumeUniversal, [ref]$when)) {
+            return (& $bad 'a consent record recordedUtc is not a timestamp')
+        }
         $records += $r
     }
     [pscustomobject]@{ ok = $true; reason = $null; records = $records }
@@ -211,9 +326,9 @@ function Get-DvClipAdmission {
     #>
     param(
         [Parameter(Mandatory)][string]$ClipId, [Parameter(Mandatory)][string]$Venue, [Parameter(Mandatory)]$Table,
-        [Parameter(Mandatory)][string]$ConsentPath, [Parameter(Mandatory)][string]$RepoRoot
+        [Parameter(Mandatory)][AllowEmptyString()][string]$ConsentText, [Parameter(Mandatory)][string]$RepoRoot
     )
-    $refuse = { param($token) [pscustomobject]@{ admitted = $false; reason = $token } }
+    $refuse = { param($token) [pscustomobject]@{ admitted = $false; reason = $token; ownerLineSha256 = $null; recordedUtc = $null } }
     if ($script:FixtureClipIds -ccontains $ClipId) {
         $verdict = 'NOT_A_CONSENTED_CLIP'
         $gate = Join-Path $PSScriptRoot '..\gui-smoke-length-gate.ps1'
@@ -226,7 +341,7 @@ function Get-DvClipAdmission {
         return (& $refuse "FIXTURE_REFUSED_$verdict")
     }
     if ($ClipId -cnotmatch $script:ClipIdPattern) { return (& $refuse 'CLIP_ID_INVALID') }
-    $consent = Read-DvClipConsent -Path $ConsentPath -Table $Table
+    $consent = Read-DvClipConsent -Text $ConsentText -Table $Table
     if (-not $consent.ok) { return (& $refuse 'VENUE_CLIP_CONSENT_INVALID') }
     $record = $null
     foreach ($r in $consent.records) {
@@ -237,43 +352,123 @@ function Get-DvClipAdmission {
     if ($null -ne $Table.PSObject.Properties['ownerFootage']) { $refusal = [string]$Table.ownerFootage.refusal }
     $cleanupGone = ($null -ne $Table.PSObject.Properties['ownerFootage']) -and [bool]$Table.ownerFootage.cleanupClassGone
     if (-not $cleanupGone) { return (& $refuse $refusal) }
-    [pscustomobject]@{ admitted = $true; reason = $null }
+    [pscustomobject]@{ admitted = $true; reason = $null; ownerLineSha256 = [string](Get-DvProp $record 'ownerLineSha256'); recordedUtc = [string](Get-DvProp $record 'recordedUtc') }
 }
 
-# --- the receipt oracle's verdict, carried in the receipt (round 2) -------------------------------------
+# --- the receipt oracle's verdict, carried in the receipt (round 2) and RE-DERIVED from the run's own log (round 3) -------
+# The run nonce the REAL launcher mints is [Guid]::NewGuid().ToString("N") (tools/profiling/run-release-gui-smoke.ps1:
+# `$runNonce = ...`): 32 lowercase hex, no prefix. The rule accepts exactly that and nothing else; test_dual_venue_evidence.py
+# evaluates the launcher's own expression and feeds it to this rule, so a producer-format change turns a test red.
+$script:RunNoncePattern = '^[0-9a-f]{32}$'
+$script:MinPlaySeconds = 20.0
+
+function ConvertTo-DvInt64 {
+    # $null for absent / a bool / not an integer: an unparsable number is ABSENT, never zero.
+    param($Value)
+    $parsed = 0L
+    if ($null -ne $Value -and $Value -isnot [bool] -and [int64]::TryParse([string]$Value, [Globalization.NumberStyles]::Integer, [Globalization.CultureInfo]::InvariantCulture, [ref]$parsed)) { return $parsed }
+    $null
+}
+
+function ConvertTo-DvDouble {
+    param($Value)
+    $parsed = 0.0
+    if ($null -ne $Value -and $Value -isnot [bool] -and [double]::TryParse([string]$Value, [Globalization.NumberStyles]::Float, [Globalization.CultureInfo]::InvariantCulture, [ref]$parsed)) { return $parsed }
+    $null
+}
+
+function Get-DvSmokeSummaryFields {
+    <#
+    .SYNOPSIS
+    The measured session's `playback_smoke.summary` line out of the app's own run log, as a key/value hashtable, plus whether
+    every `automation.pacing_isolated` line says the run used its run-scoped settings store. The session is chosen exactly the
+    way the job chooses it (the `playback_smoke.measured_session` marker, else the first summary line); the LAST summary line
+    of that session wins.
+    #>
+    param([AllowNull()][AllowEmptyString()][string]$LogText)
+    $fields = @{}
+    $session = $null
+    $isolated = $false
+    if (-not [string]::IsNullOrEmpty($LogText)) {
+        $lines = $LogText -split "`r?`n"
+        foreach ($line in $lines) { if ($line -match 'playback_smoke\.measured_session id=(?<s>\d+)') { $session = $Matches['s']; break } }
+        if ($null -eq $session) { foreach ($line in $lines) { if ($line -match 'playback_smoke\.summary session=(?<s>\d+)') { $session = $Matches['s']; break } } }
+        if ($null -ne $session) {
+            $summaryLine = $null
+            foreach ($line in $lines) { if ($line -match ('playback_smoke\.summary session=' + [regex]::Escape($session) + '(\s|$)')) { $summaryLine = $line } }
+            if ($null -ne $summaryLine) {
+                foreach ($m in [regex]::Matches($summaryLine, '(?<k>[A-Za-z0-9_]+)=(?<v>\S+)')) { $fields[$m.Groups['k'].Value] = $m.Groups['v'].Value }
+            }
+        }
+        # Master isolates an automation run's settings store (the venue's persisted settings are never read or rewritten).
+        # A build that predates that, or a line that says otherwise, leaves the venue's QSettings exposed: not evidence.
+        $iso = @($lines | Where-Object { $_ -match 'interaction_trace event=automation\.pacing_isolated(\s|$)' })
+        $isolated = ($iso.Count -gt 0) -and (@($iso | Where-Object { $_ -notmatch 'settings_store=run_scoped(\s|$)' }).Count -eq 0)
+    }
+    [pscustomobject]@{ session = $session; fields = $fields; settingsIsolated = $isolated }
+}
+
 function Get-DvPlaybackProblems {
     <#
     .SYNOPSIS
     Judge the play-proof block of a receipt. EVERY field must be PRESENT (an absent field is INVALID, never "no wrap" or
     "pace unchecked"); the verdict is re-derived from the fields, never taken from a stored `valid`. Returns the list of
-    problems (empty = valid). This repeats, at the receipt, the rules master's job oracle
-    (Get-AttrCudaSourceFramesVerdict) already applied: source_advanced >= required_source_frames, no wrap, THIS run's
-    nonce, and a clip that is the leg's clip and not a fixture rehearsal.
+    problems (empty = valid). This repeats, at the receipt and from the fields the receipt carries, the rules master's job
+    oracle (Get-AttrCudaSourceFramesVerdict) applies: source_advanced >= required_source_frames >= ceil(20 s x native fps),
+    paced at the native fps with no fps override, no wrap, and the nonce the app echoed on its summary line IS the nonce the
+    launcher generated for this run (both the real launcher's 32-hex format).
     #>
     param($Playback, [string]$ExpectedClipId)
     $reasons = [System.Collections.Generic.List[string]]::new()
     if ($null -eq $Playback) { $reasons.Add('RECEIPT_FIELD_ABSENT: the receipt carries no source-frame verdict (playback)'); return $reasons.ToArray() }
-    $advanced = $null; $required = $null
-    $parsed = 0L
-    $rawAdvanced = Get-DvProp $Playback 'sourceAdvanced'
-    $rawRequired = Get-DvProp $Playback 'requiredSourceFrames'
-    if ($null -ne $rawAdvanced -and $rawAdvanced -isnot [bool] -and [int64]::TryParse([string]$rawAdvanced, [ref]$parsed)) { $advanced = $parsed }
-    $parsed = 0L
-    if ($null -ne $rawRequired -and $rawRequired -isnot [bool] -and [int64]::TryParse([string]$rawRequired, [ref]$parsed)) { $required = $parsed }
+    $advanced = ConvertTo-DvInt64 (Get-DvProp $Playback 'sourceAdvanced')
+    $required = ConvertTo-DvInt64 (Get-DvProp $Playback 'requiredSourceFrames')
+    $native = ConvertTo-DvDouble (Get-DvProp $Playback 'nativeFps')
+    $pace = ConvertTo-DvDouble (Get-DvProp $Playback 'paceFps')
+    $override = ConvertTo-DvInt64 (Get-DvProp $Playback 'fpsOverride')
+    $wrapCount = ConvertTo-DvInt64 (Get-DvProp $Playback 'wrapCount')
     if ($null -eq $advanced) { $reasons.Add('RECEIPT_FIELD_ABSENT: source_advanced') }
     if ($null -eq $required) { $reasons.Add('RECEIPT_FIELD_ABSENT: required_source_frames') }
     elseif ($required -lt 20) { $reasons.Add("INVALID_SOURCE_FRAMES: required_source_frames=$required is under the 20-frame floor; the admitted Play was shorter than 20 s of footage") }
     if ($null -ne $advanced -and $null -ne $required) {
         if ($advanced -lt $required) { $reasons.Add("INVALID_SOURCE_FRAMES: source_advanced=$advanced is under required_source_frames=$required; under 20 s of real footage is never evidence") }
     }
+    # The 20 s floor, derived here from the footage's own frame rate: ceil(20 s x native fps) frames.
+    if ($null -eq $native) { $reasons.Add('RECEIPT_FIELD_ABSENT: native_fps') }
+    elseif ($native -le 0) { $reasons.Add("INVALID_SOURCE_FRAMES: native_fps=$native; the native frame rate is unknown, so 20 s of footage cannot be measured") }
+    elseif ($null -ne $required -and $required -lt [int64][Math]::Ceiling($script:MinPlaySeconds * $native - 0.02)) {
+        $reasons.Add("INVALID_SOURCE_FRAMES: required_source_frames=$required is under ceil(20 s x native_fps=$native); the Play was admitted for less than 20 s of footage")
+    }
+    if ($null -eq $pace) { $reasons.Add('RECEIPT_FIELD_ABSENT: pace_fps') }
+    elseif ($pace -le 0) { $reasons.Add("INVALID_SOURCE_FRAMES: pace_fps=$pace; a present engine pace that is not positive is unknown") }
+    elseif ($null -ne $native -and $native -gt 0 -and [Math]::Abs($pace - $native) -gt (0.005 * $native)) {
+        $reasons.Add("INVALID_SOURCE_FRAMES: the engine paced at pace_fps=$pace but the footage native fps is $native; 20 s of wall clock is not 20 s of footage")
+    }
+    if ($null -eq $override) { $reasons.Add('RECEIPT_FIELD_ABSENT: fps_override') }
+    elseif ($override -ne 0) { $reasons.Add('INVALID_SOURCE_FRAMES: the run was paced by a persisted fps override; evidence is paced at the footage native fps') }
     $wrapped = Get-DvProp $Playback 'wrapped'
     if ($wrapped -isnot [bool]) { $reasons.Add('RECEIPT_FIELD_ABSENT: wrapped') }
     elseif ($wrapped) { $reasons.Add('INVALID_LOOPED: the timeline wrapped, jumped to the first frame or restarted') }
-    $failures = Get-DvProp $Playback 'failures'
-    if ($null -eq $failures) { $reasons.Add('RECEIPT_FIELD_ABSENT: failures') }
-    else { foreach ($f in @($failures)) { if ($null -ne $f -and [string]$f -ne '') { $reasons.Add("the job's own oracle reported: $f") } } }
-    $nonce = [string](Get-DvProp $Playback 'runNonce')
-    if ($nonce -notmatch '^n[0-9a-f]{32}$') { $reasons.Add('RECEIPT_NOT_THIS_RUN: the receipt carries no well-formed run nonce, so it cannot be shown to be this run''s') }
+    if ($null -eq $wrapCount) { $reasons.Add('RECEIPT_FIELD_ABSENT: wrap_count') }
+    elseif ($wrapCount -gt 0) { $reasons.Add("INVALID_LOOPED: wrap_count=$wrapCount") }
+    # THIS run: the nonce the launcher generated (the expected one) must be well-formed (the real launcher's format) and the
+    # app must have echoed exactly it on its summary line (the observed one).
+    $expectedNonce = [string](Get-DvProp $Playback 'expectedRunNonce')
+    $observedNonce = [string](Get-DvProp $Playback 'observedRunNonce')
+    if ($expectedNonce -cnotmatch $script:RunNoncePattern) { $reasons.Add('RECEIPT_NOT_THIS_RUN: the receipt carries no well-formed expected run nonce (the 32-hex nonce the launcher generates), so it cannot be shown to be this run''s') }
+    elseif ($observedNonce -cnotmatch $script:RunNoncePattern) { $reasons.Add('RECEIPT_NOT_THIS_RUN: the app echoed no well-formed run nonce on its summary line') }
+    elseif ($observedNonce -cne $expectedNonce) { $reasons.Add('RECEIPT_NOT_THIS_RUN: the nonce the app echoed is not the nonce the launcher generated for this run; an earlier run wrote the receipt') }
+    $manifestNonce = [string](Get-DvProp $Playback 'manifestRunNonce')
+    if (-not [string]::IsNullOrEmpty($manifestNonce) -and $manifestNonce -cne $expectedNonce) { $reasons.Add('RECEIPT_NOT_THIS_RUN: the evidence manifest binds a different run nonce than the launcher result') }
+    if ((Get-DvProp $Playback 'logShaBound') -ne $true) { $reasons.Add('RECEIPT_FIELD_ABSENT: the run log is not bound to the launcher result by its sha256 (logShaBound)') }
+    if ((Get-DvProp $Playback 'settingsIsolated') -ne $true) { $reasons.Add('SETTINGS_NOT_ISOLATED: the app did not report its run-scoped settings store, so the venue''s persisted settings may have been read or rewritten') }
+    # The job's own oracle block, when the job wrote one, must agree with the log and report no failures.
+    $jobAdvanced = ConvertTo-DvInt64 (Get-DvProp $Playback 'jobSourceAdvanced')
+    $jobRequired = ConvertTo-DvInt64 (Get-DvProp $Playback 'jobRequiredSourceFrames')
+    if (($null -ne $jobAdvanced -and $jobAdvanced -ne $advanced) -or ($null -ne $jobRequired -and $jobRequired -ne $required)) {
+        $reasons.Add('JOB_DISAGREES_WITH_LOG: the job''s source-frame block does not match the playback_smoke.summary line of the run log')
+    }
+    foreach ($f in @(Get-DvProp $Playback 'jobFailures')) { if ($null -ne $f -and [string]$f -ne '') { $reasons.Add("the job's own oracle reported: $f") } }
     $rehearsal = Get-DvProp $Playback 'fixtureRehearsal'
     if ($rehearsal -ne $false) { $reasons.Add('FIXTURE_REHEARSAL: the job did not report fixtureRehearsal=false; a fixture rehearsal is never venue playback evidence') }
     $jobClip = [string](Get-DvProp $Playback 'clipId')
@@ -285,19 +480,43 @@ function Get-DvPlaybackProblems {
 function Get-DvPlaybackEvidence {
     <#
     .SYNOPSIS
-    Build the receipt's `playback` block from the job's summary.json (`sourceFrames`, `fixtureRehearsal`, `clipId`) and
-    evidence manifest (`smokeRunLog.runNonce`), copied verbatim, plus the derived verdict.
+    Build the receipt's `playback` block. The proof is taken from the RUN'S OWN published records, not from a summary the
+    job wrote about itself: the launcher's result.json (the nonce it generated, the sha256 of the run log it snapshotted) and
+    the app's run log (its `playback_smoke.summary` line: source_advanced, required_source_frames, native_fps, pace_fps,
+    fps_override, wrapped, wrap_count and the nonce it echoed). The job's own summary.json / manifest supply the clip id, the
+    rehearsal flag and a cross-check. Present on every job terminal that published the run log, so a product failure after a
+    sound 20 s run (GPU_RECON_FRAMES_ZERO, CPU_FALLBACK_DETECTED, ...) can be a FAIL while a run with no log stays INVALID.
     #>
-    param($Summary, $EvidenceManifest, [Parameter(Mandatory)][string]$ExpectedClipId)
+    param($Summary, $EvidenceManifest, $ResultJson, [AllowNull()][AllowEmptyString()][string]$LogText, [AllowNull()][AllowEmptyString()][string]$LogSha256,
+          [Parameter(Mandatory)][string]$ExpectedClipId)
     $sf = Get-DvProp $Summary 'sourceFrames'
-    $log = Get-DvProp $EvidenceManifest 'smokeRunLog'
+    $manifestLog = Get-DvProp $EvidenceManifest 'smokeRunLog'
+    $evidence = Get-DvProp $ResultJson 'evidence'
+    $declaredSha = [string](Get-DvProp (Get-DvProp $evidence 'runLogSnapshot') 'sha256')
+    $manifestSha = [string](Get-DvProp $manifestLog 'sha256')
+    $parsed = Get-DvSmokeSummaryFields -LogText $LogText
+    $f = $parsed.fields
+    $wrappedField = ConvertTo-DvInt64 $f['wrapped']
+    $bound = (-not [string]::IsNullOrEmpty($LogSha256)) -and ($declaredSha.ToLowerInvariant() -ceq $LogSha256) -and ([string]::IsNullOrEmpty($manifestSha) -or $manifestSha.ToLowerInvariant() -ceq $LogSha256)
     $pb = [ordered]@{
-        oracle = 'the job receipt oracle (Get-AttrCudaSourceFramesVerdict): source_advanced >= required_source_frames, wrapped=0, native pace, no fps override, this run''s nonce'
-        sourceAdvanced = (Get-DvProp $sf 'sourceAdvanced')
-        requiredSourceFrames = (Get-DvProp $sf 'requiredSourceFrames')
-        wrapped = (Get-DvProp $sf 'wrapped')
-        failures = (Get-DvProp $sf 'failures')
-        runNonce = (Get-DvProp $log 'runNonce')
+        oracle = 'source_advanced >= required_source_frames >= ceil(20 s x native fps), paced at native fps, no fps override, no wrap, the app echoed the nonce the launcher generated; all re-derived from the run log'
+        sourceAdvanced = (ConvertTo-DvInt64 $f['source_advanced'])
+        requiredSourceFrames = (ConvertTo-DvInt64 $f['required_source_frames'])
+        nativeFps = (ConvertTo-DvDouble $f['native_fps'])
+        paceFps = (ConvertTo-DvDouble $f['pace_fps'])
+        fpsOverride = (ConvertTo-DvInt64 $f['fps_override'])
+        wrapped = $(if ($null -eq $wrappedField) { $null } else { $wrappedField -ne 0 })
+        wrapCount = (ConvertTo-DvInt64 $f['wrap_count'])
+        expectedRunNonce = $(if ($null -ne (Get-DvProp $evidence 'runNonce')) { [string](Get-DvProp $evidence 'runNonce') } else { $null })
+        observedRunNonce = $(if ($f.ContainsKey('run_nonce')) { [string]$f['run_nonce'] } else { $null })
+        manifestRunNonce = $(if ($null -ne (Get-DvProp $manifestLog 'runNonce')) { [string](Get-DvProp $manifestLog 'runNonce') } else { $null })
+        logSha256 = $(if ([string]::IsNullOrEmpty($LogSha256)) { $null } else { $LogSha256 })
+        logShaBound = $bound
+        settingsIsolated = [bool]$parsed.settingsIsolated
+        jobOracleBlockPresent = ($null -ne $sf)
+        jobSourceAdvanced = (Get-DvProp $sf 'sourceAdvanced')
+        jobRequiredSourceFrames = (Get-DvProp $sf 'requiredSourceFrames')
+        jobFailures = (Get-DvProp $sf 'failures')
         fixtureRehearsal = (Get-DvProp $Summary 'fixtureRehearsal')
         clipId = (Get-DvProp $Summary 'clipId')
         valid = $false
@@ -313,11 +532,14 @@ function Test-DvReceiptValid {
     <#
     .SYNOPSIS
     Is this receipt a well-formed signal? A receipt that says PASS or FAIL must carry the clip id, the clip's content
-    hash, a um-run RECEIPT and the receipt oracle's verdict (source_advanced, required_source_frames, run nonce, wrap,
-    clip); without them it is INVALID, not PASS/FAIL. Every other outcome carries no signal and needs no proof. Readers
-    (Get-VenueEvidence) call this too; the verdict is re-derived from the fields, never from a stored flag.
+    hash, a um-run RECEIPT, the receipt oracle's verdict (source_advanced, required_source_frames, native fps and pace, the
+    expected and observed run nonce, wrap, clip) re-derivable from its own fields, and the admission it was admitted on
+    (production mode, the committed consent-file and venue-table blob ids, the owner line's sha256); without them it is
+    INVALID, not PASS/FAIL. A receipt written in offline test mode is never evidence (unless -AllowOfflineTestMode, which only
+    the test harness passes). Every other outcome carries no signal and needs no proof. Readers (Get-VenueEvidence) call
+    this too; the verdict is re-derived from the fields, never from a stored flag.
     #>
-    param([Parameter(Mandatory)]$Receipt)
+    param([Parameter(Mandatory)]$Receipt, [switch]$AllowOfflineTestMode)
     $reasons = [System.Collections.Generic.List[string]]::new()
     $outcome = [string](Get-DvProp $Receipt 'outcome')
     if ($outcome -in @('PASS', 'FAIL')) {
@@ -326,6 +548,18 @@ function Test-DvReceiptValid {
         if ([string]::IsNullOrWhiteSpace($clipId)) { $reasons.Add('subject.clipId absent') }
         if ([string](Get-DvProp $subject 'clipContentSha256') -cnotmatch '^[0-9a-f]{64}$') { $reasons.Add('subject.clipContentSha256 absent or not 64 lowercase hex') }
         if ([string](Get-DvProp (Get-DvProp $Receipt 'evidence') 'umRunOutcome') -ne 'RECEIPT') { $reasons.Add('evidence.umRunOutcome is not RECEIPT') }
+        $admission = Get-DvProp $Receipt 'admission'
+        $mode = [string](Get-DvProp $admission 'mode')
+        if ($mode -ceq 'production') {
+            foreach ($k in 'consentBlobSha', 'venueTableBlobSha') {
+                if ([string](Get-DvProp $admission $k) -cnotmatch '^[0-9a-f]{40}$') { $reasons.Add("ADMISSION_UNPROVEN: admission.$k is not the git blob id of the committed file") }
+            }
+            if ([string](Get-DvProp $admission 'ownerLineSha256') -cnotmatch '^[0-9a-f]{64}$') { $reasons.Add('ADMISSION_UNPROVEN: admission.ownerLineSha256 is absent') }
+        }
+        elseif ($mode -ceq 'offline-test') {
+            if (-not $AllowOfflineTestMode) { $reasons.Add('OFFLINE_TEST_RECEIPT: a receipt written in offline test mode (caller-supplied consent / venue table / um-run) is never evidence') }
+        }
+        else { $reasons.Add('ADMISSION_UNPROVEN: the receipt records no admission (mode, consent and venue-table blob ids)') }
         foreach ($p in @(Get-DvPlaybackProblems -Playback (Get-DvProp $Receipt 'playback') -ExpectedClipId $clipId)) { $reasons.Add($p) }
     }
     [pscustomobject]@{ valid = ($reasons.Count -eq 0); reasons = $reasons.ToArray() }
@@ -410,67 +644,14 @@ function ConvertFrom-DvProbeStdout([string]$Stdout) {
     $null
 }
 
-# --- registry protection (LESSON from UM-HFR-SUPPLEMENTARY-SMOKE-1) --------------------------------
-function New-DvRegSnapshotJobText {
-    param([Parameter(Mandatory)][string]$AgentRoot, [Parameter(Mandatory)][ValidatePattern('^[A-Za-z0-9._-]+$')][string]$Tag)
-    $root = $AgentRoot.Replace("'", "''")
-    @"
-`$ErrorActionPreference = 'Stop'
-`$dir = Join-Path '$root' 'dve-reg'
-New-Item -ItemType Directory -Force -Path `$dir | Out-Null
-`$snap = Join-Path `$dir '$Tag.reg'
-`$absent = Join-Path `$dir '$Tag.absent'
-reg query 'HKCU\Software\magiclantern.MLVApp' 2>&1 | Out-Null
-if (`$LASTEXITCODE -eq 0) {
-    reg export 'HKCU\Software\magiclantern.MLVApp' `$snap /y 2>&1 | Out-Null
-    if (`$LASTEXITCODE -ne 0) { Write-Output 'DVE_REG_SNAPSHOT ok=False'; exit 3 }
-    Write-Output ('DVE_REG_SNAPSHOT ok=True existed=True sha256=' + (Get-FileHash -LiteralPath `$snap -Algorithm SHA256).Hash.ToLowerInvariant())
-} else {
-    Set-Content -LiteralPath `$absent -Value 'absent' -Encoding ascii
-    Write-Output 'DVE_REG_SNAPSHOT ok=True existed=False sha256=none'
-}
-"@
-}
-
-function New-DvRegRestoreJobText {
-    <# Restores the snapshot taken by New-DvRegSnapshotJobText and verifies it WITHOUT ever printing a value. #>
-    param([Parameter(Mandatory)][string]$AgentRoot, [Parameter(Mandatory)][ValidatePattern('^[A-Za-z0-9._-]+$')][string]$Tag)
-    $root = $AgentRoot.Replace("'", "''")
-    @"
-`$ErrorActionPreference = 'Stop'
-`$dir = Join-Path '$root' 'dve-reg'
-`$snap = Join-Path `$dir '$Tag.reg'
-`$absent = Join-Path `$dir '$Tag.absent'
-`$key = 'HKCU\Software\magiclantern.MLVApp'
-if (Test-Path -LiteralPath `$absent) {
-    reg delete `$key /f 2>&1 | Out-Null
-    reg query `$key 2>&1 | Out-Null
-    Write-Output ('DVE_REG_RESTORE restored=' + (`$LASTEXITCODE -ne 0))
-    exit 0
-}
-if (-not (Test-Path -LiteralPath `$snap)) { Write-Output 'DVE_REG_RESTORE restored=False reason=no-snapshot'; exit 4 }
-reg delete `$key /f 2>&1 | Out-Null
-reg import `$snap 2>&1 | Out-Null
-`$check = Join-Path `$dir ('$Tag' + '.verify.reg')
-reg export `$key `$check /y 2>&1 | Out-Null
-`$same = ((Get-FileHash -LiteralPath `$check -Algorithm SHA256).Hash -eq (Get-FileHash -LiteralPath `$snap -Algorithm SHA256).Hash)
-Remove-Item -LiteralPath `$check -Force -ErrorAction SilentlyContinue
-Write-Output ('DVE_REG_RESTORE restored=' + `$same)
-"@
-}
-
-function ConvertFrom-DvMarkerLine {
-    # 'DVE_REG_RESTORE restored=True' -> @{ restored = 'True' }
-    param([string]$Stdout, [string]$Marker)
-    foreach ($line in ($Stdout -split "`r?`n")) {
-        if ($line.StartsWith($Marker + ' ')) {
-            $h = @{}
-            foreach ($m in [regex]::Matches($line, '(?<k>[A-Za-z0-9_]+)=(?<v>\S+)')) { $h[$m.Groups['k'].Value] = $m.Groups['v'].Value }
-            return $h
-        }
-    }
-    $null
-}
+# --- registry protection: REMOVED (round 3, fable hardening) --------------------------------------
+# Round 2 snapshotted and restored the venue's HKCU\Software\magiclantern.MLVApp QSettings around every leg (two extra um-run
+# submissions, a .reg export of the venue's persisted settings left on the agent share). Master (PLAYBACK-CLIP-LENGTH-ENFORCE-4,
+# platform/qt/main.cpp automation_settings::isolate) now gives an automation run its OWN run-scoped settings store, so the app
+# neither reads nor rewrites the venue's registry. The snapshot protected nothing master does not already guarantee and itself
+# left venue settings on the share. In its place the RECEIPT refuses a run whose log does not say it used the run-scoped store
+# (Get-DvSmokeSummaryFields -> playback.settingsIsolated -> SETTINGS_NOT_ISOLATED), which also covers a build that predates the
+# isolation -- a build the snapshot would have "protected" only after the fact.
 
 # --- job result -> typed outcome (P4) -------------------------------------------------------------
 $script:VenueConditionResults = @('SCREENSAVER_SECURE_OWNER_ONLY', 'DISPLAY_WAKE_DISMISS_FAILED', 'KEEPALIVE_FAILED', 'DISPLAY_ASLEEP')
@@ -604,7 +785,12 @@ function New-DvReceipt {
         # A receipt that says PASS or FAIL without a valid one is INVALID (Test-DvReceiptValid).
         playback = $null
         look = $null
+        # Retired in round 3 (no registry snapshot is taken any more: master isolates an automation run's settings store; the
+        # receipt's playback.settingsIsolated is the proof). The key stays null so a reader written against round 2 still parses.
         registry = $null
+        # Round 3: what the leg was admitted ON (mode production|offline-test, the committed consent-file and venue-table blob
+        # ids, the committing HEAD, the owner line's sha256). A PASS/FAIL without it is INVALID (Test-DvReceiptValid).
+        admission = $null
         refusal = $null
         owner_verdict = $null
         model_verdicts = @()
@@ -618,11 +804,11 @@ function Write-DvReceipt {
     the file with CreateNew -- an existing receipt is NEVER overwritten (append-only; a repeat receiptId throws).
     Returns the path written.
     #>
-    param([Parameter(Mandatory)]$Receipt, [Parameter(Mandatory)][string]$ReceiptRoot)
+    param([Parameter(Mandatory)]$Receipt, [Parameter(Mandatory)][string]$ReceiptRoot, [switch]$OfflineTestMode)
     if ($Receipt['outcome'] -notin $script:OutcomeEnum) { throw "DVE_RECEIPT_OUTCOME_INVALID '$($Receipt['outcome'])' is not one of: $($script:OutcomeEnum -join ', ')" }
     if ($Receipt['outcome'] -in @('PASS', 'FAIL')) {
         # The writer never records a signal without its proof, whatever the caller believed.
-        $validity = Test-DvReceiptValid -Receipt $Receipt
+        $validity = Test-DvReceiptValid -Receipt $Receipt -AllowOfflineTestMode:$OfflineTestMode
         if (-not $validity.valid) { throw "DVE_RECEIPT_INVALID a $($Receipt['outcome']) receipt without a valid receipt-oracle verdict is refused: $($validity.reasons -join '; ')" }
     }
     if (-not $Receipt['finishedUtc']) { $Receipt['finishedUtc'] = [DateTime]::UtcNow.ToString('o') }
@@ -637,7 +823,8 @@ function Write-DvReceipt {
 }
 
 Export-ModuleMember -Function Get-DvOutcomeEnum, ConvertTo-DvCanonicalJson, Get-DvSha256OfBytes, Get-DvSha256OfText, Get-DvSha256OfFile,
-    Get-DvSubjectDigest, Read-DvVenueTable, Get-DvVenueRole, Get-DvProp, Read-DvClipConsent, Get-DvClipAdmission, Get-DvPlaybackProblems,
+    Get-DvSubjectDigest, Read-DvVenueTable, ConvertFrom-DvVenueTableText, Get-DvVenueRole, Get-DvProp, Get-DvCommittedFile, Resolve-DvAdmissionSources,
+    Test-DvUnderClaudeState, Read-DvClipConsent, Get-DvClipAdmission, Get-DvSmokeSummaryFields, Get-DvPlaybackProblems,
     Get-DvPlaybackEvidence, Test-DvReceiptValid, Get-DvHealthVerdict,
-    New-DvHealthProbeJobText, ConvertFrom-DvProbeStdout, New-DvRegSnapshotJobText, New-DvRegRestoreJobText, ConvertFrom-DvMarkerLine,
+    New-DvHealthProbeJobText, ConvertFrom-DvProbeStdout,
     Get-DvResultToken, Resolve-DvJobOutcome, Test-DvCriteria, Get-DvVerbatimMetrics, New-DvReceipt, Write-DvReceipt

@@ -7,7 +7,10 @@
 #
 # The flow (each step a refusal the code enforces, each refusal a receipt):
 #   1. read the leg spec (legSpecSha256 = sha256 of its bytes) and the venue table; the venue's ROLE
-#      for the leg's card comes from venues.json, never from an argument (P3);
+#      for the leg's card comes from venues.json, never from an argument (P3). PRODUCTION reads the venue table
+#      AND the per-venue consent ONLY from the tracked files at the COMMITTED revision (git HEAD) and refuses when
+#      the working copy differs (round 3): a file a caller writes is never consent. The path/script overrides are
+#      test-only and refused unless -OfflineTestMode, which can never reach a venue (see below);
 #   2. ADMIT THE CLIP (round 2, owner rule 2026-09-30): a leg names a CONSENTED CLIP ID, never a path. A tracked
 #      fixture (2 / 16 frames) is refused by master's length gate (FIXTURE_REFUSED_CLIP_TOO_SHORT); a clip this
 #      VENUE has no owner-typed record for in venue-clip-consent.json is refused (VENUE_CLIP_CONSENT_ABSENT);
@@ -19,12 +22,18 @@
 #   5. P6: the declared -Venue must agree with Get-AttrCudaMeasurementVenue on the host the probe ran
 #      on, and the host must be the venue table's expectedHost -> VENUE_HOST_MISMATCH;
 #   6. the staged build and smoke-runner closure must be the ones named (never a different build)
-#      -> DEVICE_UNAVAILABLE; snapshot the venue's HKCU magiclantern.MLVApp QSettings, submit THROUGH
-#      um-run.ps1 (NA-7), restore the QSettings afterwards (values are never printed);
-#   7. read summary.json / evidence-manifest.json / artifact-index.json, copy metrics VERBATIM, copy the receipt
-#      oracle's verdict (source_advanced / required_source_frames / run nonce / wrap / clip id) into the receipt,
-#      map the job's RESULT to a P4 outcome, evaluate the role's criteria, write the receipt. A PASS/FAIL without
-#      a valid oracle verdict is INVALID.
+#      -> DEVICE_UNAVAILABLE; submit THROUGH um-run.ps1 (NA-7). (No registry snapshot is taken any more: master
+#      isolates an automation run's settings store; the receipt proves it from the run log.)
+#   7. read summary.json / evidence-manifest.json / artifact-index.json plus the launcher's result.json and the app's
+#      run log, copy metrics VERBATIM, RE-DERIVE the receipt oracle's verdict from the run log (source_advanced /
+#      required_source_frames / native fps / pace / fps override / wrap / the nonce the app echoed vs the nonce the
+#      launcher generated), map the job's RESULT to a P4 outcome, evaluate the role's criteria, write the receipt. A
+#      PASS/FAIL without a valid verdict is INVALID.
+#
+# OFFLINE TEST MODE (-OfflineTestMode, tests only): lets a test supply its own consent file, venue table, generator
+# and um-run stub. It can NEVER submit a job to a venue: -UmRunScript is required and may not be um-run.ps1 (by path or by
+# content), and every venue's agentShare must be a local directory under the OS temp folder (never a UNC share). A receipt
+# it writes says admission.mode = offline-test and is not evidence (Test-DvReceiptValid refuses it).
 #
 # EXIT CODE IS NEVER EVIDENCE: 0 means "a receipt was written" (whatever its outcome), 2 means the
 # receipt itself could not be written. Read the receipt.
@@ -36,17 +45,19 @@ param(
     [Parameter(Mandatory = $true)][ValidatePattern('^[0-9a-f]{64}$')][string]$BuildManifestSha256,
     [Parameter(Mandatory = $true)][ValidatePattern('^[0-9a-f]{40}$')][string]$SourceCommit,
     [ValidateSet('cuda', 'cpu')][string]$Backend = '',
-    # The tracked, OWNER-WRITTEN per-venue consent file (the hub records owner-typed CLIP lines there; agents never
-    # write it). Default: venue-clip-consent.json beside this script. A test seam; production passes none.
-    [string]$ConsentPath = '',
     # Run only the health probe (and P6) and stop: records the venue's state without running the leg.
     [switch]$HealthOnly,
     [string]$Actor = '',
-    # Where receipts go. Default: <main checkout>\.claude-state\dual-venue\receipts (gitignored).
+    # Where receipts go. Default: <main checkout>\.claude-state\dual-venue\receipts (gitignored). Must sit under a
+    # `.claude-state` directory in production (a receipt and its evidence name an owner clip's run).
     [string]$ReceiptRoot = '',
-    # Where the LOOK sheet is copied as sheet-<venue>-<backend>-<flavor>.png (for showing the owner).
+    # Where the LOOK sheet is copied as sheet-<venue>-<backend>-<flavor>.png (for showing the owner). It is a sheet of OWNER
+    # footage: it must sit under a `.claude-state` directory (the same guard New-VenueSheetPair.ps1 enforces).
     [string]$SheetCopyDir = '',
-    # Test seams (production passes none of these).
+    # TEST SEAMS. Refused unless -OfflineTestMode (production passes none of these): the consent file, the venue table,
+    # the repo root, the work dir, the generator and the um-run script are all things a caller must not be able to swap.
+    [switch]$OfflineTestMode,
+    [string]$ConsentPath = '',
     [string]$VenueTablePath = '',
     [string]$RepoRoot = '',
     [string]$WorkDir = '',
@@ -57,9 +68,26 @@ param(
 $ErrorActionPreference = 'Stop'
 $here = $PSScriptRoot
 Import-Module (Join-Path $here 'DualVenueRunner.psm1') -Force
+
+# --- test seams are closed in production (round 3, sol BLOCKER) -------------------------------------
+foreach ($seam in 'ConsentPath', 'VenueTablePath', 'RepoRoot', 'WorkDir', 'UmRunScript', 'GeneratorScript') {
+    if ($PSBoundParameters.ContainsKey($seam) -and -not $OfflineTestMode) {
+        throw "DVE_TEST_SEAM_IN_PRODUCTION -$seam is a test-only override and is refused without -OfflineTestMode: consent and the venue table are read only from the committed tracked files"
+    }
+}
+if ($OfflineTestMode) {
+    if (-not $PSBoundParameters.ContainsKey('UmRunScript')) { throw 'DVE_OFFLINE_TEST_REQUIRES_STUB_UMRUN offline test mode needs an explicit -UmRunScript stub; the real um-run.ps1 is never a default here' }
+    $realUmRun = [IO.Path]::GetFullPath((Join-Path $here '..\um-run.ps1'))
+    $stubFull = [IO.Path]::GetFullPath((Resolve-Path -LiteralPath $UmRunScript).Path)
+    if ($stubFull -ieq $realUmRun -or ((Test-Path -LiteralPath $realUmRun -PathType Leaf) -and (Get-DvSha256OfFile $stubFull) -eq (Get-DvSha256OfFile $realUmRun))) {
+        throw 'DVE_OFFLINE_TEST_REFUSES_REAL_UMRUN offline test mode can never use um-run.ps1 (by path or content): it would submit a job'
+    }
+}
+if (-not [string]::IsNullOrWhiteSpace($SheetCopyDir) -and -not (Test-DvUnderClaudeState -Path $SheetCopyDir)) {
+    throw 'DVE_SHEET_COPY_MUST_STAY_LOCAL -SheetCopyDir must be under a .claude-state directory; a sheet of owner footage is never committed, attached or published'
+}
+
 if ([string]::IsNullOrWhiteSpace($RepoRoot)) { $RepoRoot = (Resolve-Path (Join-Path $here '..\..\..')).Path }
-if ([string]::IsNullOrWhiteSpace($VenueTablePath)) { $VenueTablePath = Join-Path $here 'venues.json' }
-if ([string]::IsNullOrWhiteSpace($ConsentPath)) { $ConsentPath = Join-Path $here 'venue-clip-consent.json' }
 if ([string]::IsNullOrWhiteSpace($UmRunScript)) { $UmRunScript = Join-Path $here '..\um-run.ps1' }
 if ([string]::IsNullOrWhiteSpace($GeneratorScript)) { $GeneratorScript = Join-Path $here '..\bachelor\playback-attr-3-cuda-job.ps1' }
 if ([string]::IsNullOrWhiteSpace($ReceiptRoot)) {
@@ -68,14 +96,37 @@ if ([string]::IsNullOrWhiteSpace($ReceiptRoot)) {
     $mainRoot = if ($LASTEXITCODE -eq 0 -and $common) { Split-Path -Parent ([string]$common) } else { $RepoRoot }
     $ReceiptRoot = Join-Path $mainRoot '.claude-state\dual-venue\receipts'
 }
+if (-not $OfflineTestMode -and -not (Test-DvUnderClaudeState -Path $ReceiptRoot)) {
+    throw 'DVE_RECEIPT_ROOT_MUST_STAY_LOCAL -ReceiptRoot must be under a .claude-state directory: a receipt and its evidence name an owner clip''s run'
+}
 if ([string]::IsNullOrWhiteSpace($Actor)) { $Actor = "dual-venue-runner@$($env:COMPUTERNAME)" }
 $runStamp = [DateTime]::UtcNow.ToString('yyyyMMddHHmmss')
 
-$table = Read-DvVenueTable -Path $VenueTablePath
-$venueEntry = $table.venues.$Venue
-if ($null -eq $venueEntry) { throw "DVE_UNKNOWN_VENUE the venue table has no entry for '$Venue'" }
-$agentShare = [string]$venueEntry.agentShare
-$agentRoot = [string]$venueEntry.agentRoot
+# --- where admission reads from: the COMMITTED tracked files (production) ---------------------------
+$sources = Resolve-DvAdmissionSources -RepoRoot $RepoRoot -ConsentPath $ConsentPath -VenueTablePath $VenueTablePath -OfflineTestMode:$OfflineTestMode
+$admissionRefusal = $null
+$table = $null
+if (-not $sources.ok) { $admissionRefusal = [string]$sources.reason }
+else {
+    try { $table = ConvertFrom-DvVenueTableText $sources.tableText } catch { $admissionRefusal = 'VENUE_TABLE_INVALID' }
+}
+$venueEntry = $null; $agentShare = ''; $agentRoot = ''
+if ($null -ne $table) {
+    $venueEntry = $table.venues.$Venue
+    if ($null -eq $venueEntry) { throw "DVE_UNKNOWN_VENUE the venue table has no entry for '$Venue'" }
+    $agentShare = [string]$venueEntry.agentShare
+    $agentRoot = [string]$venueEntry.agentRoot
+    if ($OfflineTestMode) {
+        # Offline test mode can never reach a venue: every venue's share must be a LOCAL directory under the OS temp folder.
+        $tempRoots = @([IO.Path]::GetTempPath(), $env:TEMP, $env:TMP) | Where-Object { $_ } | ForEach-Object { [IO.Path]::GetFullPath($_).TrimEnd('\') + '\' }
+        foreach ($v in $table.venues.PSObject.Properties) {
+            $share = [IO.Path]::GetFullPath([string]$v.Value.agentShare)
+            if ($share.StartsWith('\\') -or @($tempRoots | Where-Object { $share.StartsWith($_, [StringComparison]::OrdinalIgnoreCase) }).Count -eq 0) {
+                throw "DVE_OFFLINE_TEST_SHARE_NOT_LOCAL offline test mode needs every venue's agentShare under the OS temp folder (a UNC or real share is refused): '$($v.Name)'"
+            }
+        }
+    }
+}
 
 $specBytes = [IO.File]::ReadAllBytes((Resolve-Path -LiteralPath $LegSpec).Path)
 $legSpecSha256 = Get-DvSha256OfBytes $specBytes
@@ -91,7 +142,8 @@ if ($null -ne $spec.PSObject.Properties['playSeconds']) { $playSeconds = [int]$s
 $lookFlavor = $null
 if ($isLook) { $lookFlavor = [string]$spec.look.lookFlavor; if ([string]::IsNullOrWhiteSpace($lookFlavor)) { $lookFlavor = 'classic' } }
 
-$role = Get-DvVenueRole -Table $table -Card ([string]$spec.card) -Venue $Venue
+$role = $null
+if ($null -ne $table) { $role = Get-DvVenueRole -Table $table -Card ([string]$spec.card) -Venue $Venue }
 $methodRel = 'tools/profiling/dual-venue/Invoke-VenueLeg.ps1'
 $methodBlob = (& git -C $RepoRoot hash-object (Join-Path $here 'Invoke-VenueLeg.ps1') 2>$null)
 $receipt = New-DvReceipt -Card ([string]$spec.card) -LegId ([string]$spec.legId) -DeclaredVenue $Venue -Role $role -Actor $Actor `
@@ -99,6 +151,16 @@ $receipt = New-DvReceipt -Card ([string]$spec.card) -LegId ([string]$spec.legId)
 $receipt.subject.buildManifestSha256 = $BuildManifestSha256
 $receipt.subject.legSpecSha256 = $legSpecSha256
 $receipt.subject.clipId = [string]$spec.clipId
+# What the leg is admitted ON: the committed consent-file and venue-table blob ids (production) -- recorded even for a refusal.
+$receipt.admission = [ordered]@{
+    mode = $sources.mode
+    consentBlobSha = $sources.consentBlobSha
+    venueTableBlobSha = $sources.venueTableBlobSha
+    headCommit = $sources.headCommit
+    consentLastCommit = $sources.consentLastCommit
+    ownerLineSha256 = $null
+    ownerRecordedUtc = $null
+}
 
 function Complete-Receipt([string]$Outcome, [string]$Detail) {
     $receipt.outcome = $Outcome
@@ -106,7 +168,7 @@ function Complete-Receipt([string]$Outcome, [string]$Detail) {
     $receipt.subject.digest = Get-DvSubjectDigest -BuildManifestSha256 $BuildManifestSha256 -LegSpecSha256 $legSpecSha256 `
         -ClipId $spec.clipId -ClipContentSha256 $receipt.subject.clipContentSha256 -Backend $Backend -LookFlavor $lookFlavor
     try {
-        $path = Write-DvReceipt -Receipt $receipt -ReceiptRoot $ReceiptRoot
+        $path = Write-DvReceipt -Receipt $receipt -ReceiptRoot $ReceiptRoot -OfflineTestMode:$OfflineTestMode
     } catch {
         Write-Output "DVE_RECEIPT_WRITE_FAILED $($_.Exception.Message)"
         exit 2
@@ -140,8 +202,8 @@ function ConvertTo-ShareSidePath([string]$AgentSidePath) {
 }
 
 function Stop-Leg([string]$Outcome, [string]$Detail) {
-    # A terminal reached mid-flow. Thrown (not exited) so the QSettings restore in the `finally`
-    # below still runs BEFORE the receipt is written and can be recorded in it.
+    # A terminal reached mid-flow. Thrown (not exited) so every terminal funnels through the one catch below and
+    # Complete-Receipt writes the receipt.
     throw [System.Management.Automation.RuntimeException]::new("DVE_TERMINAL|$Outcome|$Detail")
 }
 
@@ -149,11 +211,8 @@ $workDirResolved = if ([string]::IsNullOrWhiteSpace($WorkDir)) { Join-Path ([IO.
 New-Item -ItemType Directory -Force -Path $workDirResolved | Out-Null
 $jobStem = "dve-$($spec.legId)-$Venue-$Backend-$runStamp"
 
-$snapshotTaken = $false
-$snapshotTag = "$jobStem"
 $terminal = $null
 $run = $null
-try {
 try {
     # --- 2. clip admission (P7 + the clip-length class) -- before anything is generated or submitted ---------
     function Stop-Refused([string]$Token) {
@@ -162,9 +221,13 @@ try {
         $receipt.refusal = $Token
         Stop-Leg 'DEVICE_UNAVAILABLE' $Token
     }
+    # The consent and the venue table must be the COMMITTED ones (production) before anything else is decided.
+    if ($null -ne $admissionRefusal) { Stop-Refused $admissionRefusal }
     if ($playSeconds -lt 20) { Stop-Refused 'PLAY_WINDOW_TOO_SHORT' }
-    $admission = Get-DvClipAdmission -ClipId ([string]$spec.clipId) -Venue $Venue -Table $table -ConsentPath $ConsentPath -RepoRoot $RepoRoot
+    $admission = Get-DvClipAdmission -ClipId ([string]$spec.clipId) -Venue $Venue -Table $table -ConsentText ([string]$sources.consentText) -RepoRoot $RepoRoot
     if (-not $admission.admitted) { Stop-Refused ([string]$admission.reason) }
+    $receipt.admission.ownerLineSha256 = $admission.ownerLineSha256
+    $receipt.admission.ownerRecordedUtc = $admission.recordedUtc
 
     # --- 3. generate the job (local, no I/O on the venue) ----------------------------------------------
     # The generator resolves the clip by ID (it refuses a path, a fixture under 20 s, an unknown or unconsented id).
@@ -175,7 +238,7 @@ try {
         OutFile = $jobFile; RepoRoot = $RepoRoot; PlaySeconds = $playSeconds
         Venue = $Venue; Backend = $Backend; ScaleFactor = [int]$spec.scaleFactor
     }
-    if ($VenueTablePath -ne (Join-Path $here 'venues.json')) { $gen['VenueTablePath'] = $VenueTablePath }
+    if ($OfflineTestMode -and -not [string]::IsNullOrWhiteSpace($VenueTablePath)) { $gen['VenueTablePath'] = $VenueTablePath }
     if ($null -ne $spec.PSObject.Properties['generatorArgs']) {
         if ($spec.generatorArgs.PSObject.Properties['telemetryArm']) { $gen['TelemetryArm'] = [string]$spec.generatorArgs.telemetryArm }
         if ($spec.generatorArgs.PSObject.Properties['cpuQuiescenceThresholdPercent']) { $gen['CpuQuiescenceThresholdPercent'] = [double]$spec.generatorArgs.cpuQuiescenceThresholdPercent }
@@ -250,33 +313,10 @@ try {
     $runnerDir = "$cacheShare\$($generated.smokeRunnerClosureDirName)"
     if (-not (Test-Path -LiteralPath $runnerDir -PathType Container)) { Stop-Leg 'DEVICE_UNAVAILABLE' "SMOKE_RUNNER_NOT_STAGED: $($generated.smokeRunnerClosureDirName) is not in this venue's cache" }
 
-    # --- 6b. protect the venue's QSettings, submit, restore -------------------------------------
-    $snapJob = Join-Path $workDirResolved "$jobStem-regsnap.job.ps1"
-    [IO.File]::WriteAllText($snapJob, (New-DvRegSnapshotJobText -AgentRoot $agentRoot -Tag $snapshotTag), [Text.UTF8Encoding]::new($false))
-    $snapRun = Submit-VenueJob -ScriptPath $snapJob -JobId "$jobStem-regsnap" -TimeoutSec 120 -QueueSec 300 -ClaimedExtraSec 60
-    $snapInfo = if ($snapRun.umOutcome -eq 'RECEIPT') { ConvertFrom-DvMarkerLine -Stdout ([string]$snapRun.result.stdout) -Marker 'DVE_REG_SNAPSHOT' } else { $null }
-    if ($null -eq $snapInfo -or $snapInfo['ok'] -ne 'True') {
-        $receipt.registry = [ordered]@{ snapshotTaken = $false; restored = $null }
-        Stop-Leg 'VENUE_UNHEALTHY' 'leg not submitted: the venue QSettings snapshot could not be taken (the app rewrites per-user settings, so an unprotected run is refused)'
-    }
-    $snapshotTaken = $true
-
+    # --- 6. submit (the venue's settings are isolated by the app; the receipt proves it from the run log) -----
     $timeoutSec = [int]$generated.recommendedJobTimeoutSec + 120
     $run = Submit-VenueJob -ScriptPath $jobFile -JobId $jobStem -TimeoutSec $timeoutSec -QueueSec ([int]$spec.timeouts.queueWaitSec) -ClaimedExtraSec ([int]$spec.timeouts.extraClaimedWaitSec)
     $receipt.evidence.umRunOutcome = $run.umOutcome
-} finally {
-    if ($snapshotTaken) {
-        $restoreJob = Join-Path $workDirResolved "$jobStem-regrestore.job.ps1"
-        [IO.File]::WriteAllText($restoreJob, (New-DvRegRestoreJobText -AgentRoot $agentRoot -Tag $snapshotTag), [Text.UTF8Encoding]::new($false))
-        $restoreRun = Submit-VenueJob -ScriptPath $restoreJob -JobId "$jobStem-regrestore" -TimeoutSec 120 -QueueSec 600 -ClaimedExtraSec 120
-        $restoreInfo = if ($restoreRun.umOutcome -eq 'RECEIPT') { ConvertFrom-DvMarkerLine -Stdout ([string]$restoreRun.result.stdout) -Marker 'DVE_REG_RESTORE' } else { $null }
-        $receipt.registry = [ordered]@{
-            snapshotTaken = $true
-            restored = $(if ($null -ne $restoreInfo) { $restoreInfo['restored'] -eq 'True' } else { $null })
-            restoreUmRunOutcome = $restoreRun.umOutcome
-        }
-    }
-}
 } catch {
     $message = [string]$_.Exception.Message
     if ($message.StartsWith('DVE_TERMINAL|')) {
@@ -302,6 +342,7 @@ $token = Get-DvResultToken $stdout
 $artifactsShare = $null
 if ($stdout -match 'ARTIFACTS=(?<p>\S+)') { $artifactsShare = ConvertTo-ShareSidePath $Matches['p'] }
 $summary = $null; $manifest = $null
+$resultJson = $null; $runLogText = $null; $runLogSha = $null
 $evidenceDir = Join-Path (Split-Path -Parent $ReceiptRoot) ("evidence\" + $receipt.receiptId)
 if ($artifactsShare -and (Test-Path -LiteralPath $artifactsShare -PathType Container)) {
     New-Item -ItemType Directory -Force -Path $evidenceDir | Out-Null
@@ -321,12 +362,25 @@ if ($artifactsShare -and (Test-Path -LiteralPath $artifactsShare -PathType Conta
     }
     $receipt.evidence.artifactIndexPath = $artifactsShare.TrimEnd('\') + '\artifact-index.json'
     $receipt.evidence['localEvidenceDir'] = $evidenceDir
+    # The run's OWN records, read in memory from the share and never copied or printed: the launcher's result.json (the nonce it
+    # generated, the sha256 of the run-log snapshot) and the app's run log (the summary line the proof is re-derived from).
+    $resultShare = Join-Path $artifactsShare 'result.json'
+    if (Test-Path -LiteralPath $resultShare -PathType Leaf) {
+        try { $resultJson = [IO.File]::ReadAllText($resultShare) | ConvertFrom-Json } catch { $resultJson = $null }
+    }
+    $logShare = Join-Path $artifactsShare 'logs\smoke-run.log'
+    if (Test-Path -LiteralPath $logShare -PathType Leaf) {
+        $logBytes = [IO.File]::ReadAllBytes($logShare)
+        $runLogSha = Get-DvSha256OfBytes $logBytes
+        $runLogText = [Text.Encoding]::UTF8.GetString($logBytes)
+    }
 }
 if ($null -ne $summary) { $receipt.metrics = Get-DvVerbatimMetrics -Summary $summary -EvidenceManifest $manifest }
-# The receipt oracle's verdict, copied from the job's own record (never recomputed from frame rows) and re-judged here.
+# The receipt oracle's verdict, RE-DERIVED from the run log and the launcher's result (not from a summary the job wrote about
+# itself) and cross-checked against the job's own block.
 $playback = $null
-if ($null -ne $summary) {
-    $playback = Get-DvPlaybackEvidence -Summary $summary -EvidenceManifest $manifest -ExpectedClipId ([string]$spec.clipId)
+if ($null -ne $summary -or $null -ne $runLogText) {
+    $playback = Get-DvPlaybackEvidence -Summary $summary -EvidenceManifest $manifest -ResultJson $resultJson -LogText $runLogText -LogSha256 $runLogSha -ExpectedClipId ([string]$spec.clipId)
     $receipt.playback = $playback
 }
 $smokeRefusalReason = $(if ($null -ne $summary -and $summary.PSObject.Properties['smokeRefusalReason']) { [string]$summary.smokeRefusalReason } else { '' })
@@ -345,32 +399,46 @@ if ($null -ne $summary -and $summary.PSObject.Properties['display'] -and $summar
     }
 }
 
-# LOOK: copy the job's contact sheet + raw frames locally and bind the sheet by sha256.
+# LOOK: copy the job's contact sheet + raw frames locally and bind the sheet by sha256. A venue that cannot compose the sheet
+# (no Python/Pillow) publishes the raw frames and a compose-status marker; that is a venue condition, kept for local composition.
+$composeUnavailable = $null
 if ($isLook -and $artifactsShare) {
     $sheetShare = Join-Path $artifactsShare 'contact-sheet\sheet.png'
+    $sheetDir = Join-Path $evidenceDir 'contact-sheet'
     $sheetInfo = $null
-    if (Test-Path -LiteralPath $sheetShare -PathType Leaf) {
-        $sheetDir = Join-Path $evidenceDir 'contact-sheet'
+    $rawLocal = $null
+    $rawShare = Join-Path $artifactsShare 'artifacts\contact-sheet\raw'
+    if (-not (Test-Path -LiteralPath $rawShare -PathType Container)) { $rawShare = Join-Path $artifactsShare 'contact-sheet\raw' }
+    $composeShare = Join-Path $artifactsShare 'contact-sheet\compose-status.txt'
+    if ((Test-Path -LiteralPath $sheetShare -PathType Leaf) -or (Test-Path -LiteralPath $composeShare -PathType Leaf)) {
         New-Item -ItemType Directory -Force -Path $sheetDir | Out-Null
-        Copy-Item -LiteralPath $sheetShare -Destination (Join-Path $sheetDir 'sheet.png')
         foreach ($n in 'stats.json', 'compose-status.txt') {
             $s = Join-Path $artifactsShare "contact-sheet\$n"
             if (Test-Path -LiteralPath $s -PathType Leaf) { Copy-Item -LiteralPath $s -Destination (Join-Path $sheetDir $n) }
         }
-        $rawShare = Join-Path $artifactsShare 'artifacts\contact-sheet\raw'
-        if (-not (Test-Path -LiteralPath $rawShare -PathType Container)) { $rawShare = Join-Path $artifactsShare 'contact-sheet\raw' }
-        if (Test-Path -LiteralPath $rawShare -PathType Container) { Copy-Item -LiteralPath $rawShare -Destination (Join-Path $sheetDir 'raw') -Recurse }
+        if (Test-Path -LiteralPath $rawShare -PathType Container) {
+            Copy-Item -LiteralPath $rawShare -Destination (Join-Path $sheetDir 'raw') -Recurse
+            $rawLocal = Join-Path $sheetDir 'raw'
+        }
+    }
+    if (Test-Path -LiteralPath $sheetShare -PathType Leaf) {
+        Copy-Item -LiteralPath $sheetShare -Destination (Join-Path $sheetDir 'sheet.png')
         $sheetLocal = Join-Path $sheetDir 'sheet.png'
-        $sheetInfo = [ordered]@{ path = $sheetLocal; sha256 = (Get-DvSha256OfFile $sheetLocal); bytes = (Get-Item -LiteralPath $sheetLocal).Length; frames = [int]$spec.look.contactSheetFrames; backend = $Backend; rawFramesDir = $(if (Test-Path (Join-Path $sheetDir 'raw')) { Join-Path $sheetDir 'raw' } else { $null }) }
+        $sheetInfo = [ordered]@{ path = $sheetLocal; sha256 = (Get-DvSha256OfFile $sheetLocal); bytes = (Get-Item -LiteralPath $sheetLocal).Length; frames = [int]$spec.look.contactSheetFrames; backend = $Backend; rawFramesDir = $rawLocal }
         if (-not [string]::IsNullOrWhiteSpace($SheetCopyDir)) {
             New-Item -ItemType Directory -Force -Path $SheetCopyDir | Out-Null
             Copy-Item -LiteralPath $sheetLocal -Destination (Join-Path $SheetCopyDir "sheet-$Venue-$Backend-$lookFlavor.png") -Force
         }
+    } elseif (Test-Path -LiteralPath $composeShare -PathType Leaf) {
+        $marker = ([IO.File]::ReadAllText($composeShare) -split "`r?`n")[0]
+        if ($marker -match '^CONTACT_SHEET_COMPOSE_UNAVAILABLE') { $composeUnavailable = $marker }
     }
     $receipt.look = [ordered]@{
         legType = 'look'; lookAssistForced = $true; lookFlavor = $lookFlavor
         lookFlavorHonored = 'unknown'   # the app does not read MLVAPP_LOOK_ASSIST_FLAVOR yet (LOOK-ASSIST-FLAVORS-1)
         contactSheet = $sheetInfo
+        composeStatus = $composeUnavailable
+        rawFramesDir = $(if ($null -eq $sheetInfo) { $rawLocal } else { $null })
     }
 }
 
@@ -379,16 +447,27 @@ if ($outcome -eq 'CAPTURED') {
     $criteria = $spec.criteria.$role.$Backend
     $verdictCriteria = Test-DvCriteria -Criteria $criteria -Metrics $receipt.metrics
     $sheetMissing = $isLook -and ($null -eq $receipt.look -or $null -eq $receipt.look.contactSheet)
-    if ($sheetMissing) { $outcome = 'FAIL'; $detail = 'CAPTURED but the LOOK leg produced no contact sheet' }
+    if ($sheetMissing -and $null -ne $composeUnavailable) { $outcome = 'VENUE_TOOLING'; $detail = "CAPTURED but the venue could not compose the LOOK contact sheet ($composeUnavailable); the raw frames are kept locally for composition elsewhere. A venue condition, not a product result" }
+    elseif ($sheetMissing) { $outcome = 'FAIL'; $detail = 'CAPTURED but the LOOK leg produced no contact sheet' }
     elseif (-not $verdictCriteria.pass) { $outcome = 'FAIL'; $detail = 'CAPTURED; criteria failed: ' + ($verdictCriteria.failures -join '; ') }
     else { $outcome = 'PASS'; $detail = $(if ($verdictCriteria.informational) { 'CAPTURED; no gating criteria for this role/backend (informational)' } else { 'CAPTURED; every criterion for this role/backend held' }) }
 }
 # A signal needs its proof. A PASS or FAIL whose receipt-oracle verdict is not valid (under 20 s of source frames, a wrap,
 # a foreign run, a fixture, or the verdict simply absent) is INVALID: a FAIL on footage that cannot be shown to be long
-# enough is not a product result either. (Write-DvReceipt refuses such a receipt a second time.)
-if ($outcome -in @('PASS', 'FAIL') -and -not $playback.valid) {
-    $why = $(if ($null -eq $playback) { 'the job wrote no summary.json, so no source-frame proof exists' } else { @($playback.invalidReasons) -join '; ' })
-    $detail = "INVALID: the job result was $outcome ($detail) but the receipt-oracle verdict is not valid: $why"
+# enough is not a product result either. A product FAIL the job reached AFTER its oracle passed (GPU_RECON_FRAMES_ZERO,
+# CPU_FALLBACK_DETECTED, CPU_BACKEND_PATH_MISMATCH) carries the same re-derived proof from the run log, so it stays a FAIL; a
+# terminal with no run log (SMOKE_RUN_FAILED, SMOKE_LOG_UNAVAILABLE, ...) has none and is INVALID. (Write-DvReceipt refuses a
+# proofless PASS/FAIL a second time.)
+$proofProblems = @()
+if ($outcome -in @('PASS', 'FAIL')) {
+    if ($null -eq $playback) { $proofProblems += 'the job published no summary.json and no run log, so no source-frame proof exists' }
+    else {
+        $proofProblems += @($playback.invalidReasons)
+        if ($resolved.outcome -eq 'CAPTURED' -and -not $playback.jobOracleBlockPresent) { $proofProblems += 'RECEIPT_FIELD_ABSENT: the captured job''s summary.json carries no sourceFrames block (its own oracle did not run)' }
+    }
+}
+if ($outcome -in @('PASS', 'FAIL') -and $proofProblems.Count -gt 0) {
+    $detail = "INVALID: the job result was $outcome ($detail) but the receipt-oracle verdict is not valid: $($proofProblems -join '; ')"
     $outcome = 'INVALID'
 }
 Complete-Receipt $outcome $detail
