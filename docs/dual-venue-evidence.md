@@ -55,7 +55,15 @@ receipt oracle and refuses to believe a receipt that does not carry the oracle's
   with no record for the clip is refused before submitting (`VENUE_CLIP_CONSENT_ABSENT`) -- consent on Bachelor never
   implies Ultra-Magnus, nor the reverse. A missing, empty or malformed file refuses everything
   (`VENUE_CLIP_CONSENT_INVALID`); a record is exactly six keys, so a path cannot ride along. `venues.json`
-  `ownerFootage.cleanupClassGone` stays a second, reviewed switch (`OWNER_CLIP_REFUSED_PENDING_CROSS_VOLUME_2`). The file
+  `ownerFootage.cleanupClassGone` is a second, reviewed switch, and it is **on** (DVE-OWNER-FOOTAGE-GATE-1): the class it
+  named -- a job deleting, hard-linking or relocating a *name* of owner footage -- is gone on master (no tool creates a hard
+  link to owner footage, a view is a symbolic link or a verified byte copy, the original is pinned `FileShare.Read` for the
+  run, and every delete demands a creator-recorded ownership proof; OWNER-FOOTAGE-NO-HARDLINK-1/-2, PR #214, which
+  superseded the closed UM-OWNER-FOOTAGE-CROSS-VOLUME-2). Switched off, an owner leg refuses with
+  `OWNER_CLIP_REFUSED_PENDING_CROSS_VOLUME_2` (the token is kept for that case).
+  `tools/repo_hygiene/test_dual_venue_owner_footage_gate.py` binds the switch to the guard tests that justify it (it may read
+  true only while each named guard test is still defined and not skipped) and censuses the delete / move primitives of the
+  sources an owner leg runs. The file
   ships with **no records**: every owner leg refuses until the hub records the owner's lines.
   Honest limit: "committed" is not "reviewed" -- any local commit changes `HEAD`. The receipt names the blob ids and the last
   commit that touched the file so a reader can check them against the reviewed history; the control on *who may write a
@@ -213,7 +221,7 @@ path; the pair is its own record (`mlv-app/dual-venue-sheet-pair/v1`) because re
 * Aesthetics are **model-judged** (Amendment 2). Receipts carry `owner_verdict: null` (optional, never
   waited on, never written by the runner) and `model_verdicts: []` (filled by the judge card).
 * **Sheets of owner footage stay local under `.claude-state`** (never committed, attached to a PR, published to
-  the bus or as an artifact) and need CROSS-VOLUME-2 plus the per-venue owner CLIP line. Since fixtures are
+  the bus or as an artifact) and need the per-venue owner CLIP line. Since fixtures are
   never venue playback clips, there are no fixture sheets any more.
 
 ## How to add a leg
@@ -270,10 +278,11 @@ the receipt -- and the contact sheet) is under `.claude-state\dual-venue\evidenc
   A venue that was unhealthy, not quiescent, unreachable or a mismatch leaves the card *open*, not failed.
 * **Supplementary** evidence informs diagnosis -- fails on both: code; fails only on Bachelor: the venue --
   but never closes a card.
-* **Every leg runs an owner clip** (fixtures are refused), so every leg needs CROSS-VOLUME-2 merged *and* the
-  owner's CLIP line for that venue (consent on one venue never implies the other). Until then the runner refuses
-  before submitting anything and writes a receipt with `refusal: VENUE_CLIP_CONSENT_ABSENT` or
-  `OWNER_CLIP_REFUSED_PENDING_CROSS_VOLUME_2`.
+* **Every leg runs an owner clip** (fixtures are refused), so every leg needs the owner's CLIP line for that venue
+  (consent on one venue never implies the other); the owner-footage cleanup switch is already on. Until the line is
+  committed the runner refuses before submitting anything and writes a receipt with
+  `refusal: VENUE_CLIP_CONSENT_ABSENT` (or `OWNER_CLIP_REFUSED_PENDING_CROSS_VOLUME_2` should the switch ever be turned
+  back off).
 * **`INVALID` is not a failure of the product**: the run could not show >= 20 s of distinct source frames (or
   the proof is absent). It carries no signal; the card stays open. Fix the venue or the clip and re-run.
 
