@@ -70,14 +70,14 @@ jobs:
   repo-hygiene-python:
     name: Repo Hygiene Python (${{ matrix.os }})
     runs-on: ${{ matrix.os }}
-    # Windows green runs span 28-46 min (median 41; five runs were cut off at the old
-    # 45-min cap with no test failing); ubuntu finishes in 6-12 min. 75 leaves ~1.8x
-    # the median for runner variance and suite growth while staying a real bound.
+    # ubuntu finishes in 6-12 min. The windows-latest leg of this check is the
+    # aggregator job below: the same suite on one Windows runner took 39-61 min (73.5 on
+    # PR #225), so it is sharded across parallel runners instead of sharing one cap.
     timeout-minutes: 75
     strategy:
       fail-fast: false
       matrix:
-        os: [windows-latest, ubuntu-latest]
+        os: [ubuntu-latest]
 
     steps:
       - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
@@ -98,10 +98,9 @@ jobs:
           python -m pip check
 
       - name: Run repo hygiene Python tests
-        # Guarded pwsh on both matrix legs: the Windows default wrapper ends with only the
-        # LAST command's exit code, so a failing `unittest discover` above a passing
-        # command stayed green there (ubuntu's bash -e failed it). The shell template
-        # fails closed on the first failing native command; the commands below are unchanged.
+        # Guarded pwsh: the default wrapper ends with only the LAST command's exit code,
+        # so a failing `unittest discover` above a passing command could stay green. The
+        # shell template fails closed on the first failing native command.
         shell: pwsh -NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -Command "$ErrorActionPreference = 'Stop'; $PSNativeCommandUseErrorActionPreference = $true; . '{0}'"
         run: |
           # Directory target: a new tools/repo_hygiene/test_*.py file is collected
@@ -120,8 +119,62 @@ jobs:
       - name: K9 pushed-tree resumability witness
         run: python -m tools.repo_hygiene.k9_witness tree HEAD
 
+  repo-hygiene-python-windows-shard:
+    name: Repo Hygiene Python windows shard ${{ matrix.shard }}/5
+    runs-on: windows-latest
+    # One Windows runner took 39-61 min for the whole suite (73.5 min on PR #225, cap 75).
+    # Shards 1-4 each run a quarter of the unittest modules (about 15 min measured) and
+    # shard 5 runs the pytest guardrails plus the remaining steps (about 13 min), so a
+    # shard is expected at 15-20 min including setup. 40 leaves 2x for runner variance.
+    timeout-minutes: 40
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: [1, 2, 3, 4, 5]
+
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+        with:
+          persist-credentials: false
+          fetch-depth: 0
+
+      - name: Set up Python
+        uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6
+        with:
+          python-version-file: ".python-version"
+
+      - name: Install repo hygiene test dependencies
+        shell: pwsh -NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -Command "$ErrorActionPreference = 'Stop'; $PSNativeCommandUseErrorActionPreference = $true; . '{0}'"
+        run: |
+          python -m pip install --disable-pip-version-check --no-input --only-binary=:all: --require-hashes -r .github/requirements/pip.txt
+          python -m pip install --disable-pip-version-check --no-input --only-binary=:all: --require-hashes -r .github/requirements/repo-hygiene.txt
+          python -m pip check
+
+      - name: Prove the unittest shards cover every discovered test
+        # Fails unless shards 1-4 are disjoint, cover every module `unittest discover`
+        # finds, and hold exactly the test count it collects.
+        shell: pwsh -NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -Command "$ErrorActionPreference = 'Stop'; $PSNativeCommandUseErrorActionPreference = $true; . '{0}'"
+        run: python -m tools.repo_hygiene.ci_unittest_shard --of 4 --verify-partition
+
+      - name: Run repo hygiene unittest shard ${{ matrix.shard }}/4
+        if: matrix.shard <= 4
+        shell: pwsh -NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -Command "$ErrorActionPreference = 'Stop'; $PSNativeCommandUseErrorActionPreference = $true; . '{0}'"
+        run: python -m tools.repo_hygiene.ci_unittest_shard --of 4 --shard ${{ matrix.shard }}
+
+      - name: Run repo hygiene tail steps
+        if: matrix.shard == 5
+        shell: pwsh -NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -Command "$ErrorActionPreference = 'Stop'; $PSNativeCommandUseErrorActionPreference = $true; . '{0}'"
+        run: |
+          python -m unittest tools.release.test_release_evidence -v
+          python -m unittest tools.gates.test_output_budget -v
+          python -m tools.repo_hygiene.pipeline_golden_provenance --repo-root .
+          python -m tools.repo_hygiene.vendored_native_payloads --repo-root .
+          python tools/repo-hygiene/hygiene.py --repo-root . verify-policy
+          python tools/docs/check_pinned_tokens.py
+          python -m tools.repo_hygiene.k9_witness tree HEAD
+
       - name: Run coordination and self-healing guardrails
-        if: runner.os == 'Windows'
+        if: matrix.shard == 5
         shell: pwsh
         run: |
           python -m pytest `
@@ -130,7 +183,7 @@ jobs:
             -q
 
       - name: Run demote-factory-bridge refusal-path tests
-        if: runner.os == 'Windows'
+        if: matrix.shard == 5
         shell: pwsh
         run: |
           python -m pytest `
@@ -138,12 +191,29 @@ jobs:
             -q
 
       - name: Verify generated Python dependency locks
-        if: runner.os == 'Windows'
+        if: matrix.shard == 5
         shell: pwsh -NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -Command "$ErrorActionPreference = 'Stop'; $PSNativeCommandUseErrorActionPreference = $true; . '{0}'"
         run: |
           python -m venv "$env:RUNNER_TEMP\python-lock-tools"
           & "$env:RUNNER_TEMP\python-lock-tools\Scripts\python.exe" -m pip install --disable-pip-version-check --no-input --only-binary=:all: --require-hashes -r .github/requirements/lock-tools.txt
           & tools\dependencies\update-python-locks.ps1 -RepoRoot . -Python "$env:RUNNER_TEMP\python-lock-tools\Scripts\python.exe" -Check
+
+  repo-hygiene-python-windows:
+    # Keeps the required status-check name `Repo Hygiene Python (windows-latest)` that
+    # branch protection pins. It passes only when every Windows shard job passed; a
+    # skipped, cancelled or failed shard fails it, so no shard can drop out silently.
+    name: Repo Hygiene Python (windows-latest)
+    needs: repo-hygiene-python-windows-shard
+    if: ${{ always() && !cancelled() }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Require every Windows shard to have passed
+        env:
+          SHARDS_RESULT: ${{ needs.repo-hygiene-python-windows-shard.result }}
+        run: |
+          echo "windows shard matrix result: $SHARDS_RESULT"
+          test "$SHARDS_RESULT" = "success"
 
   windows-product-oracles:
     name: Windows Product Oracles
