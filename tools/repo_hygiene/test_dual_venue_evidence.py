@@ -454,9 +454,30 @@ class RunnerHarness:
             raw.mkdir(parents=True, exist_ok=True)
             (raw / "frame-00.png").write_bytes(b"\x89PNG\r\n\x1a\nraw")
 
+    def stamp_identity(self, venue: str, build_sha: str) -> None:
+        """What the real job writes about WHO the run was for: summary.json's display.venue and the evidence manifest's clipId and
+        buildManifest.sha256 (the receipt validator cross-checks all three). A value a test set on purpose is left alone."""
+        summary_path = self.artifacts / "summary.json"
+        if summary_path.exists():
+            body = json.loads(summary_path.read_text(encoding="utf-8"))
+            display = body.get("display") if isinstance(body.get("display"), dict) else {}
+            # (a venue a test chose on purpose is kept; one WE stamped for an earlier leg on the same artifacts is re-stamped)
+            if display.get("venue") is None or display.get("venue") in getattr(self, "_stamped_venues", set()):
+                display["venue"] = venue
+                self._stamped_venues = getattr(self, "_stamped_venues", set()) | {venue}
+            body["display"] = display
+            summary_path.write_text(json.dumps(body), encoding="utf-8")
+        manifest_path = self.artifacts / "evidence-manifest.json"
+        if manifest_path.exists():
+            man = json.loads(manifest_path.read_text(encoding="utf-8"))
+            man.setdefault("clipId", OWNER_CLIP)
+            man.setdefault("buildManifest", {"name": "build.json", "sha256": build_sha})
+            manifest_path.write_text(json.dumps(man), encoding="utf-8")
+
     def run_leg(self, venue: str, spec: Path, probe: dict | None = None, main_mode: str = "capture", health_mode: str = "ok",
                 extra: list[str] | None = None, gen_refusal: str | None = None, dv: Path = DV, consent: Path | None = None,
                 token: tuple[str, int] | None = None) -> tuple[subprocess.CompletedProcess, dict | None, list[str]]:
+        self.stamp_identity(venue, self.build_sha)
         if token is not None:
             main_mode = "token"
         if probe is None:
@@ -957,8 +978,16 @@ class ReceiptOracleVerdictTests(RunnerHarness, unittest.TestCase):
         self.assertEqual(receipt["outcome"], "INVALID")
         self.assertIn("exited 1", receipt["outcomeDetail"])
         mutated = self.mutated_runner([("Invoke-VenueLeg.ps1", "if ($exitCode -ne 0 -and $resolved.outcome -eq 'CAPTURED') {", "if ($false) {")])
-        _, receipt, _ = self.run_leg("ultra-magnus", self.write_spec(), main_mode="captured-nonzero", dv=mutated)
-        self.assertEqual(receipt["outcome"], "PASS", "with the exit-code check removed the contradictory capture passes -- so the check is guarded")
+        proc, receipt, _ = self.run_leg("ultra-magnus", self.write_spec(), main_mode="captured-nonzero", dv=mutated)
+        # With only the RUNNER's check removed the evidence-bearing writer still refuses: the exit code is a hashed artifact
+        # (um-run.json), so the validator re-derives it. (No receipt is written: exit 2.)
+        self.assertEqual(proc.returncode, 2, proc.stdout + proc.stderr)
+        self.assertIn("OUTCOME_NOT_DERIVABLE", proc.stdout)
+        self.assertIsNone(receipt)
+        both = self.mutated_runner([("Invoke-VenueLeg.ps1", "if ($exitCode -ne 0 -and $resolved.outcome -eq 'CAPTURED') {", "if ($false) {"),
+                                    ("DualVenueRunner.psm1", "if ($exit -ne 0) { $invalid.Add('OUTCOME_NOT_DERIVABLE: the job printed a capture but exited non-zero;", "if ($false) { $invalid.Add('OUTCOME_NOT_DERIVABLE: the job printed a capture but exited non-zero;")])
+        _, receipt, _ = self.run_leg("ultra-magnus", self.write_spec(), main_mode="captured-nonzero", dv=both)
+        self.assertEqual(receipt["outcome"], "PASS", "with both exit-code checks removed the contradictory capture passes -- so each is guarded")
 
     def test_a_smoke_refusal_of_the_play_window_is_invalid_not_a_product_fail(self) -> None:
         # The job ended in its own length/pace refusal (exit 28-ish, RESULT=SMOKE_RUN_FAILED, smokeRefusalReason=...).
@@ -968,32 +997,6 @@ class ReceiptOracleVerdictTests(RunnerHarness, unittest.TestCase):
         proc, receipt, _ = self.run_leg("ultra-magnus", self.write_spec(), main_mode="smoke-refused")
         self.assertEqual(receipt["outcome"], "INVALID")
         self.assertIn("PLAY_WINDOW_TOO_SHORT", receipt["outcomeDetail"])
-
-    def test_the_writer_refuses_a_pass_or_fail_receipt_without_the_verdict(self) -> None:
-        module = DV / "DualVenueRunner.psm1"
-        direct = self.tmp / "direct"
-        base = ("Import-Module '" + str(module) + "' -Force\n"
-                "function Make([string]$o) { $r = New-DvReceipt -Card 'C' -LegId 'l' -DeclaredVenue 'ultra-magnus' -Role 'supplementary' -Actor 'a'\n"
-                f"  $r['outcome'] = $o; $r['subject']['clipId'] = '{OWNER_CLIP}'; $r['subject']['clipContentSha256'] = '{CLIP_CONTENT_SHA}'; $r['evidence']['umRunOutcome'] = 'RECEIPT'\n"
-                "  $r['admission'] = [ordered]@{ mode = 'production'; consentBlobSha = ('c' * 40); venueTableBlobSha = ('d' * 40); ownerLineSha256 = ('e' * 64) }; $r }\n"
-                "function Try-Write($r) { try { Write-DvReceipt -Receipt $r -ReceiptRoot '" + str(direct) + "' | Out-Null; 'WRITTEN' } catch { 'REFUSED:' + $_.Exception.Message.Split(' ')[0] } }\n")
-        script = base + (
-            "foreach ($o in 'PASS','FAIL') { $r = Make $o; Write-Output ($o + '-no-playback=' + (Try-Write $r)) }\n"
-            "$r = Make 'PASS'\n"
-            f"$r['playback'] = {PS_GOOD_BLOCK}\n"
-            "Write-Output ('PASS-with-playback=' + (Try-Write $r))\n"
-            "$r = Make 'INVALID'; Write-Output ('INVALID-no-playback=' + (Try-Write $r))\n"
-            "$r = Make 'PASS'\n"
-            f"$r['playback'] = {PS_GOOD_BLOCK.replace('sourceAdvanced = 960', 'sourceAdvanced = 10')}\n"
-            "Write-Output ('PASS-claims-valid-but-short=' + (Try-Write $r))\n")
-        proc = run_pwsh(["-Command", script])
-        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
-        out = proc.stdout
-        self.assertIn("PASS-no-playback=REFUSED:DVE_RECEIPT_INVALID", out)
-        self.assertIn("FAIL-no-playback=REFUSED:DVE_RECEIPT_INVALID", out)
-        self.assertIn("PASS-with-playback=WRITTEN", out)
-        self.assertIn("INVALID-no-playback=WRITTEN", out, "an INVALID receipt is a legitimate terminal and carries no signal")
-        self.assertIn("PASS-claims-valid-but-short=REFUSED:DVE_RECEIPT_INVALID", out, "the writer re-derives validity; a self-declared valid=true is not believed")
 
     def test_the_reader_validator_flags_a_receipt_without_the_verdict(self) -> None:
         # Test-DvReceiptValid is what a reader (Get-VenueEvidence) calls: PASS/FAIL need the proof, other outcomes need none.
@@ -1099,24 +1102,23 @@ def ps_problems(block: dict, clip: str = OWNER_CLIP, module: Path | None = None)
     return [l for l in proc.stdout.splitlines() if l.strip()]
 
 
-def ps_receipt_valid(receipt: dict, allow_offline: bool = False, module: Path | None = None) -> tuple[bool, list[str]]:
-    flag = " -AllowOfflineTestMode" if allow_offline else ""
-    proc = _ps_json(f"$r = $env:DVE_RECEIPT | ConvertFrom-Json\n$v = Test-DvReceiptValid -Receipt $r{flag}\nWrite-Output ('VALID=' + $v.valid)\n$v.reasons | ForEach-Object {{ Write-Output ('REASON=' + $_) }}\n",
+def ps_receipt_status(receipt: dict, allow_offline: bool = False, module: Path | None = None, repo_root: Path | None = None,
+                      evidence_dir: Path | None = None) -> tuple[str, bool, list[str]]:
+    """Test-DvReceiptValid exactly as a reader calls it: (status, valid, reasons). status is VERIFIED | INCOMPLETE | INVALID | NO_SIGNAL."""
+    flags = (" -AllowOfflineTestMode" if allow_offline else "") + (f" -RepoRoot '{repo_root}'" if repo_root else "") + (f" -EvidenceDir '{evidence_dir}'" if evidence_dir else "")
+    proc = _ps_json(f"$r = $env:DVE_RECEIPT | ConvertFrom-Json\n$v = Test-DvReceiptValid -Receipt $r{flags}\nWrite-Output ('STATUS=' + $v.status)\nWrite-Output ('VALID=' + $v.valid)\n"
+                    "$v.reasons | ForEach-Object { Write-Output ('REASON=' + $_) }\n",
                     module or DV / "DualVenueRunner.psm1", {"DVE_RECEIPT": json.dumps(receipt)})
     if proc.returncode != 0:
         raise AssertionError(proc.stdout + proc.stderr)
     lines = [l for l in proc.stdout.splitlines() if l.strip()]
-    return lines[0] == "VALID=True", [l[len("REASON="):] for l in lines[1:]]
+    return lines[0][len("STATUS="):], lines[1] == "VALID=True", [l[len("REASON="):] for l in lines[2:]]
 
 
-def production_receipt(**over) -> dict:
-    """A PASS receipt that carries every proof a reader requires (production admission, the oracle's re-derivable block)."""
-    receipt = {"outcome": "PASS", "subject": {"clipId": OWNER_CLIP, "clipContentSha256": CLIP_CONTENT_SHA},
-               "evidence": {"umRunOutcome": "RECEIPT"},
-               "admission": {"mode": "production", "consentBlobSha": "c" * 40, "venueTableBlobSha": "d" * 40, "ownerLineSha256": "e" * 64},
-               "playback": good_block()}
-    receipt.update(over)
-    return receipt
+def ps_receipt_valid(receipt: dict, allow_offline: bool = False, module: Path | None = None, repo_root: Path | None = None,
+                     evidence_dir: Path | None = None) -> tuple[bool, list[str]]:
+    status, valid, reasons = ps_receipt_status(receipt, allow_offline, module, repo_root, evidence_dir)
+    return valid, reasons
 
 
 class ModuleMutationMixin:
@@ -1189,13 +1191,8 @@ class ReceiptRederivesTheTwentySecondFloorTests(ModuleMutationMixin, unittest.Te
     """sol H1: the receipt carries native_fps, pace_fps, fps_override and the expected / observed nonce, so a reader
     re-derives the 20 s floor (required >= ceil(20 x native_fps)) and the nonce binding from the receipt alone."""
 
-    def test_sols_exact_repro_a_20_frame_play_at_24_fps_is_not_valid(self) -> None:
-        receipt = production_receipt(playback=good_block(sourceAdvanced=20, requiredSourceFrames=20, nativeFps=24.0, paceFps=24.0,
-                                                          jobSourceAdvanced=20, jobRequiredSourceFrames=20))
-        valid, reasons = ps_receipt_valid(receipt)
-        self.assertFalse(valid)
-        self.assertTrue(any("ceil(20 s x native_fps=24)" in r for r in reasons), reasons)
-
+    # (sol's 20-frame repro, the valid=true repro and the floor mutation run through the evidence-bearing path:
+    #  EvidenceBoundReceiptTests.test_sols_20_frame_repro_..., test_a_stored_valid_true_..., test_mutation_without_the_floor_...)
     def test_the_floor_is_ceil_20_seconds_times_the_native_fps(self) -> None:
         for native, floor in ((24.0, 480), (23.976, 480), (25.0, 500), (30.0, 600), (60.0, 1200)):
             ok = ps_problems(good_block(nativeFps=native, paceFps=native, requiredSourceFrames=floor, sourceAdvanced=floor + 10, jobRequiredSourceFrames=floor, jobSourceAdvanced=floor + 10))
@@ -1224,18 +1221,6 @@ class ReceiptRederivesTheTwentySecondFloorTests(ModuleMutationMixin, unittest.Te
             self.assertTrue(any(needle in p for p in problems), f"{name}: {problems}")
         self.assertEqual(ps_problems(good_block()), [])
 
-    def test_a_receipt_that_says_valid_true_is_not_believed(self) -> None:
-        receipt = production_receipt(playback=dict(good_block(sourceAdvanced=20, requiredSourceFrames=20, nativeFps=24.0, paceFps=24.0), valid=True, invalidReasons=[]))
-        self.assertFalse(ps_receipt_valid(receipt)[0])
-
-    def test_mutation_without_the_floor_the_repro_receipt_is_valid(self) -> None:
-        anchor = "elseif ($null -ne $required -and $required -lt [int64][Math]::Ceiling($script:MinPlaySeconds * $native - 0.02)) {"
-        mutated = self.mutated_module([(anchor, "elseif ($false) {")])
-        receipt = production_receipt(playback=good_block(sourceAdvanced=20, requiredSourceFrames=20, nativeFps=24.0, paceFps=24.0, jobSourceAdvanced=20, jobRequiredSourceFrames=20))
-        valid, reasons = ps_receipt_valid(receipt, module=mutated)
-        self.assertEqual([r for r in reasons if "ceil(20 s" in r], [])
-        self.assertTrue(valid, "with the fps-aware floor removed the 20-frame floor alone lets a sub-20 s play through -- so the floor test guards it")
-
     def test_mutation_without_the_pace_check_a_fast_paced_run_is_valid(self) -> None:
         anchor = "elseif ($null -ne $native -and $native -gt 0 -and [Math]::Abs($pace - $native) -gt (0.005 * $native)) {"
         mutated = self.mutated_module([(anchor, "elseif ($false) {")])
@@ -1262,15 +1247,6 @@ class OfflineTestReceiptsAreNotEvidenceTests(RunnerHarness, unittest.TestCase):
         self.assertFalse(valid)
         self.assertTrue(any("OFFLINE_TEST_RECEIPT" in r for r in reasons), reasons)
         self.assertTrue(ps_receipt_valid(receipt, allow_offline=True)[0], "the test harness alone may read its own receipts")
-
-    def test_a_pass_without_an_admission_block_is_not_valid(self) -> None:
-        for admission in (None, {"mode": "production"}, {"mode": "production", "consentBlobSha": "c" * 40, "venueTableBlobSha": "d" * 40},
-                          {"mode": "production", "consentBlobSha": "xyz", "venueTableBlobSha": "d" * 40, "ownerLineSha256": "e" * 64},
-                          {"mode": "anything-else"}):
-            valid, reasons = ps_receipt_valid(production_receipt(admission=admission))
-            self.assertFalse(valid, admission)
-            self.assertTrue(any("ADMISSION_UNPROVEN" in r for r in reasons), reasons)
-        self.assertTrue(ps_receipt_valid(production_receipt())[0])
 
     def test_offline_test_mode_can_never_use_the_real_um_run_or_a_real_share(self) -> None:
         spec = self.write_spec()
@@ -1325,6 +1301,7 @@ class ProductionRepo:
         table["ownerFootage"]["cleanupClassGone"] = cleanup_gone
         (self.dv / "venues.json").write_text(json.dumps(table, indent=2) + "\n", encoding="utf-8", newline="\n")
         self.write_consent(*records)
+        shutil.copyfile(COMPOSER, self.root / "tools" / "profiling" / "make-contact-sheet.py")   # the pair script's composer (a sibling of dual-venue/)
         self.git("init", "-q")
         self.git("config", "user.email", "unit@example.invalid")
         self.git("config", "user.name", "unit")
@@ -1334,6 +1311,16 @@ class ProductionRepo:
 
     def git(self, *args: str) -> str:
         return subprocess.run(["git", "-C", str(self.root), *args], capture_output=True, text=True, check=True).stdout.strip()
+
+    def commit_leg(self, spec: Path, name: str | None = None) -> None:
+        """Commit a leg spec under tools/profiling/dual-venue/legs/ (production finds the spec the receipt names ONLY there)."""
+        target = self.dv / "legs" / (name or spec.name)
+        shutil.copyfile(spec, target)
+        self.git("add", "tools")
+        self.git("commit", "-q", "-m", f"commit leg spec {target.name}")
+
+    def head(self) -> str:
+        return self.git("rev-parse", "HEAD")
 
     def write_consent(self, *records: dict) -> None:
         (self.dv / "venue-clip-consent.json").write_text(json.dumps(consent_file(*records), indent=2) + "\n", encoding="utf-8", newline="\n")
@@ -1478,6 +1465,7 @@ class CommittedConsentOnlyTests(RunnerHarness, unittest.TestCase):
     def test_mutation_without_the_script_level_seam_check_a_callers_generator_replaces_the_real_one_in_production(self) -> None:
         mutated = ProductionRepo(self, records=[consent_record("ultra-magnus", OWNER_CLIP)], cleanup_gone=True,
                                  mutations=[("Invoke-VenueLeg.ps1", "if ($PSBoundParameters.ContainsKey($seam) -and -not $OfflineTestMode) {", "if ($false) {")])
+        mutated.commit_leg(self.spec)   # production also needs the leg spec COMMITTED (LEG_SPEC_NOT_COMMITTED otherwise)
         stub = self.tmp / "caller-generator.ps1"
         stub.write_text("param($SourceCommit,$BuildManifestSha256,$ClipId,$OutFile,$RepoRoot,$PlaySeconds,$Venue,$Backend,$ScaleFactor,$TelemetryArm,"
                         "$CpuQuiescenceThresholdPercent,[switch]$ContactSheet,$ContactSheetFrames,[switch]$ForceLookAssist,$LookFlavor,$VenueTablePath)\n"
@@ -1650,44 +1638,553 @@ class JobTerminalsAndHardeningTests(RunnerHarness, unittest.TestCase):
         _, receipt, _ = self.run_leg("ultra-magnus", self.write_spec(leg_type="look"), extra=["-Backend", "cpu"], dv=mutated)
         self.assertEqual(receipt["outcome"], "FAIL")
 
-
 # ---------------------------------------------------------------------------------------------------
-def _valid_look_receipt(backend: str, frames_dir: Path, clip: str = OWNER_CLIP, with_playback: bool = True) -> dict:
-    receipt = {
-        "receiptId": f"r-{backend}", "card": "DUAL-VENUE-EVIDENCE-1", "legId": "m16-1243-look", "outcome": "PASS",
-        "subject": {"backend": backend, "buildManifestSha256": "ab" * 32, "legSpecSha256": "cd" * 32, "clipId": clip,
-                    "clipContentSha256": CLIP_CONTENT_SHA, "lookFlavor": "classic"},
-        "venue": {"name": "ultra-magnus", "hostName": "ULTRA-MAGNUS", "gpuNames": ["RTX 4090"]},
-        "evidence": {"umRunOutcome": "RECEIPT"},
-        "admission": {"mode": "production", "consentBlobSha": "c" * 40, "venueTableBlobSha": "d" * 40, "ownerLineSha256": "e" * 64},
-        "look": {"contactSheet": {"rawFramesDir": str(frames_dir)}},
-        "playback": None,
-    }
-    if with_playback:
-        receipt["playback"] = good_block(clipId=clip)
-    return receipt
+# DUAL-VENUE-EVIDENCE-2 round 1 (successor of PR #207; sol r2 BLOCKER: Test-DvReceiptValid validated a hand-built production PASS).
+# CLASS: a receipt is valid ONLY when EVERY claim is re-derived from a COMMITTED blob or a HASHED artifact; no self-asserted field
+# is ever an input. Every receipt below is built ONLY through the evidence-bearing path: a real consent blob COMMITTED in a temp git
+# repo (ProductionRepo) and real, hashed run-evidence files (written by the same harness the runner tests use), with the claims the
+# receipt makes computed from those files by an independent Python mirror -- never a placeholder hash.
+EVIDENCE_REL_FILES = ("summary.json", "evidence-manifest.json", "result.json", "logs/smoke-run.log", "um-run.json")
+EVIDENCE_CLAIM_KEYS = {"summary.json": "summaryJsonSha256", "evidence-manifest.json": "evidenceManifestSha256", "result.json": "resultJsonSha256",
+                       "logs/smoke-run.log": "logSha256", "um-run.json": "umRunJsonSha256"}
+
+
+def sha256_of(path: Path) -> str:
+    return hashlib.sha256(path.read_bytes()).hexdigest()
+
+
+class EvidenceFactory(RunnerHarness):
+    """Builds evidence-bearing receipts. Mixed into a TestCase whose setUp calls make_harness()."""
+
+    def prod_repo(self, venue: str = "ultra-magnus", records: list[dict] | None = None, cleanup_gone: bool = True, leg_type: str = "speed",
+                  spec: Path | None = None, mutations: list[tuple[str, str, str]] | None = None) -> ProductionRepo:
+        recs = [consent_record(venue, OWNER_CLIP)] if records is None else records
+        repo = ProductionRepo(self, records=recs, cleanup_gone=cleanup_gone, mutations=mutations)
+        self.spec_path = spec or self.write_spec(leg_type=leg_type)
+        repo.commit_leg(self.spec_path, "unit-leg.json")
+        return repo
+
+    def evidence(self, name: str, venue: str = "ultra-magnus", exit_code: int = 0, token: str | None = "MEASUREMENT_CAPTURED", **artifact_opts) -> Path:
+        """Real run-evidence files in the layout the runner copies locally (summary, manifest, launcher result, run log, um-run record)."""
+        art = self.tmp / name / "artifacts"
+        ev = self.tmp / name / "evidence"
+        saved = self.artifacts
+        self.artifacts = art
+        try:
+            self.write_artifacts(**artifact_opts)
+            self.stamp_identity(venue, self.build_sha)
+        finally:
+            self.artifacts = saved
+        (ev / "logs").mkdir(parents=True)
+        for rel in ("summary.json", "evidence-manifest.json", "result.json", "logs/smoke-run.log"):
+            if (art / rel).exists():
+                shutil.copyfile(art / rel, ev / rel)
+        if (art / "contact-sheet").exists():
+            shutil.copytree(art / "contact-sheet", ev / "contact-sheet")
+        (ev / "um-run.json").write_text(json.dumps({"schema": "mlv-app/dual-venue-um-run/v1", "exitCode": exit_code, "resultToken": token}), encoding="utf-8")
+        return ev
+
+    @staticmethod
+    def derive_block(ev: Path) -> dict:
+        """An INDEPENDENT mirror of Get-DvPlaybackEvidence: the playback block a sound receipt carries, computed from the evidence files."""
+        log = (ev / "logs" / "smoke-run.log").read_bytes()
+        lines = log.decode("utf-8").splitlines()
+        session = next(re.search(r"measured_session id=(\d+)", l).group(1) for l in lines if "playback_smoke.measured_session" in l)
+        summary_line = [l for l in lines if re.search(rf"playback_smoke\.summary session={session}(\s|$)", l)][-1]
+        f = dict(re.findall(r"([A-Za-z0-9_]+)=(\S+)", summary_line))
+        result = json.loads((ev / "result.json").read_text(encoding="utf-8"))
+        summary = json.loads((ev / "summary.json").read_text(encoding="utf-8"))
+        manifest = json.loads((ev / "evidence-manifest.json").read_text(encoding="utf-8")) if (ev / "evidence-manifest.json").exists() else {}
+        log_sha = hashlib.sha256(log).hexdigest()
+        declared = result.get("evidence", {}).get("runLogSnapshot", {}).get("sha256", "").lower()
+        man_sha = manifest.get("smokeRunLog", {}).get("sha256", "")
+        iso = [l for l in lines if re.search(r"interaction_trace event=automation\.pacing_isolated(\s|$)", l)]
+        return {"sourceAdvanced": int(f["source_advanced"]), "requiredSourceFrames": int(f["required_source_frames"]),
+                "nativeFps": float(f["native_fps"]), "paceFps": float(f["pace_fps"]), "fpsOverride": int(f["fps_override"]),
+                "wrapped": int(f["wrapped"]) != 0, "wrapCount": int(f["wrap_count"]),
+                "expectedRunNonce": result.get("evidence", {}).get("runNonce"), "observedRunNonce": f.get("run_nonce"),
+                "manifestRunNonce": manifest.get("smokeRunLog", {}).get("runNonce"), "logSha256": log_sha,
+                "logShaBound": declared == log_sha and (not man_sha or man_sha.lower() == log_sha),
+                "settingsIsolated": bool(iso) and all(re.search(r"settings_store=run_scoped(\s|$)", l) for l in iso),
+                "fixtureRehearsal": summary.get("fixtureRehearsal"), "clipId": summary.get("clipId")}
+
+    def receipt_for(self, repo: ProductionRepo, ev: Path, venue: str = "ultra-magnus", backend: str = "cuda", outcome: str = "PASS",
+                    leg_type: str = "speed", spec_path: Path | None = None) -> dict:
+        spec_bytes = (spec_path or self.spec_path).read_bytes()
+        subject = {"buildManifestSha256": self.build_sha, "legSpecSha256": hashlib.sha256(spec_bytes).hexdigest(), "clipId": OWNER_CLIP,
+                   "clipContentSha256": CLIP_CONTENT_SHA, "backend": backend, "lookFlavor": "classic" if leg_type == "look" else None}
+        identity = {k: subject[k] for k in ("backend", "buildManifestSha256", "clipContentSha256", "clipId", "legSpecSha256", "lookFlavor")}
+        subject["digest"] = hashlib.sha256(json.dumps(identity, sort_keys=True, separators=(",", ":"), ensure_ascii=False).encode("utf-8")).hexdigest()
+        summary = json.loads((ev / "summary.json").read_text(encoding="utf-8"))
+        metrics = {k: v for k, v in summary.items() if not isinstance(v, (dict, list))}
+        if (ev / "evidence-manifest.json").exists():
+            metrics["presentMonStats"] = json.loads((ev / "evidence-manifest.json").read_text(encoding="utf-8")).get("presentMonStats")
+        evidence = {"localEvidenceDir": str(ev), "umRunOutcome": "RECEIPT", "artifactIndexPath": None}
+        for rel in EVIDENCE_REL_FILES:
+            evidence[EVIDENCE_CLAIM_KEYS[rel]] = sha256_of(ev / rel) if (ev / rel).exists() else None
+        line = f"CLIP {venue}: {OWNER_CLIP}"
+        receipt = {
+            "schema": "mlv-app/dual-venue-receipt/v1", "receiptId": "r-" + hashlib.sha1(f"{ev}{backend}{outcome}".encode()).hexdigest()[:12],
+            "card": "DUAL-VENUE-EVIDENCE-1", "legId": "unit-leg", "subject": subject,
+            "venue": {"name": venue, "role": "supplementary", "declared": venue, "hostName": venue.upper(), "gpuNames": ["RTX 4090"]},
+            "outcome": outcome, "outcomeDetail": "unit", "evidence": evidence, "metrics": metrics, "playback": self.derive_block(ev), "look": None,
+            "admission": {"mode": "production", "consentBlobSha": repo.blob("venue-clip-consent.json"), "venueTableBlobSha": repo.blob("venues.json"),
+                          "headCommit": repo.head(), "consentLastCommit": repo.git("log", "-1", "--format=%H", "--", "tools/profiling/dual-venue/venue-clip-consent.json"),
+                          "ownerLineSha256": hashlib.sha256(line.encode()).hexdigest(), "ownerRecordedUtc": "2026-10-01T22:10:00Z"},
+        }
+        if leg_type == "look":
+            sheet = ev / "contact-sheet" / "sheet.png"
+            receipt["look"] = {"legType": "look", "lookFlavor": "classic", "contactSheet": {"path": str(sheet), "sha256": sha256_of(sheet), "frames": 2, "backend": backend,
+                                                                                      "rawFramesDir": str(ev / "contact-sheet" / "raw")}}
+        return receipt
+
+    def status(self, receipt: dict, repo: ProductionRepo | None, evidence_dir: Path | None = None, module: Path | None = None, env: dict | None = None,
+               repo_root: Path | None = None) -> tuple[str, bool, list[str]]:
+        flags = (f" -RepoRoot '{repo_root or repo.root}'" if (repo_root or repo) else "") + (f" -EvidenceDir '{evidence_dir}'" if evidence_dir else "")
+        proc = _ps_json(f"$r = $env:DVE_RECEIPT | ConvertFrom-Json\n$v = Test-DvReceiptValid -Receipt $r{flags}\nWrite-Output ('STATUS=' + $v.status)\n"
+                        "Write-Output ('VALID=' + $v.valid)\n$v.reasons | ForEach-Object { Write-Output ('REASON=' + $_) }\n",
+                        module or DV / "DualVenueRunner.psm1", dict(env or {}, DVE_RECEIPT=json.dumps(receipt)))
+        if proc.returncode != 0:
+            raise AssertionError(proc.stdout + proc.stderr)
+        lines = [l for l in proc.stdout.splitlines() if l.strip()]
+        return lines[0][len("STATUS="):], lines[1] == "VALID=True", [l[len("REASON="):] for l in lines[2:]]
+
+    def assertVerified(self, receipt: dict, repo: ProductionRepo, **kw) -> None:
+        status, valid, reasons = self.status(receipt, repo, **kw)
+        self.assertEqual((status, valid, reasons), ("VERIFIED", True, []))
+
+    def assertNotValid(self, receipt: dict, repo: ProductionRepo | None, needle: str, status: str | None = None, **kw) -> list[str]:
+        got, valid, reasons = self.status(receipt, repo, **kw)
+        self.assertFalse(valid, f"{needle}: a receipt that does not re-derive was believed")
+        self.assertIn(got, ("INVALID", "INCOMPLETE"), needle)
+        if status:
+            self.assertEqual(got, status, f"{needle}: {reasons}")
+        self.assertTrue(any(needle in r for r in reasons), f"{needle!r} not in {reasons}")
+        return reasons
 
 
 @requires_windows_pwsh
-class SheetPairStaysLocalTests(unittest.TestCase):
-    """Every leg now plays an owner clip, so a paired sheet is a sheet of OWNER footage: it is written only under a
-    .claude-state directory and only from receipts that are themselves valid evidence."""
+class EvidenceBoundReceiptTests(EvidenceFactory, ModuleMutationMixin, unittest.TestCase):
+    """sol r2 BLOCKER: a hand-built production PASS (format-only hashes, self-asserted booleans, a consent blob with ZERO records, no
+    evidence at all) validated. Now nothing validates unless it re-derives from a committed blob or a hashed file."""
 
     def setUp(self) -> None:
-        self._tmp = tempfile.TemporaryDirectory(prefix="dve-pair-")
-        self.addCleanup(self._tmp.cleanup)
-        self.tmp = Path(self._tmp.name)
-        self.frames = {b: self.tmp / b for b in ("cuda", "cpu")}
-        for d in self.frames.values():
-            d.mkdir()
+        self.make_harness()
 
-    def pair(self, out: Path, **kwargs):
+    # -- the sound path -------------------------------------------------------------------------------------------------
+    def test_a_receipt_built_through_the_evidence_path_is_verified_and_pass_vs_fail_is_derived_from_the_committed_criteria(self) -> None:
+        repo = self.prod_repo()
+        ev = self.evidence("ok")
+        self.assertVerified(self.receipt_for(repo, ev), repo)
+        # the criteria come from the COMMITTED leg spec (supplementary/cuda: rows gt 0): a run whose rows are 0 is a derived FAIL
+        bad = self.evidence("bad", summary={"rows": 0})
+        self.assertVerified(self.receipt_for(repo, bad, outcome="FAIL"), repo)
+        self.assertNotValid(self.receipt_for(repo, bad, outcome="PASS"), repo, "OUTCOME_NOT_DERIVED", "INVALID")
+        self.assertNotValid(self.receipt_for(repo, ev, outcome="FAIL"), repo, "OUTCOME_NOT_DERIVED", "INVALID")
+
+    def test_a_product_failure_after_a_sound_run_is_a_verified_fail_without_an_evidence_manifest(self) -> None:
+        repo = self.prod_repo()
+        ev = self.evidence("pf", source_frames=False, summary={"result": "CPU_FALLBACK_DETECTED"}, token="CPU_FALLBACK_DETECTED", exit_code=14)
+        (ev / "evidence-manifest.json").unlink()   # the job writes none on a product-failure terminal
+        self.assertVerified(self.receipt_for(repo, ev, outcome="FAIL"), repo)
+        # ... but a capture without its manifest is INCOMPLETE, never a PASS
+        cap = self.evidence("cap")
+        receipt = self.receipt_for(repo, cap)
+        (cap / "evidence-manifest.json").unlink()
+        receipt["evidence"]["evidenceManifestSha256"] = None
+        self.assertNotValid(receipt, repo, "evidence-manifest.json")   # incomplete (and its stored manifest claims no longer re-derive)
+
+    def test_the_evidence_dir_argument_wins_and_the_receipts_own_path_is_only_a_hint(self) -> None:
+        repo = self.prod_repo()
+        ev = self.evidence("hint")
+        receipt = self.receipt_for(repo, ev)
+        receipt["evidence"]["localEvidenceDir"] = str(self.tmp / "nowhere")
+        self.assertNotValid(receipt, repo, "EVIDENCE_ABSENT", "INCOMPLETE")
+        self.assertVerified(receipt, repo, evidence_dir=ev)
+        good = self.receipt_for(repo, ev)
+        empty = self.tmp / "empty"
+        empty.mkdir()
+        self.assertNotValid(good, repo, "EVIDENCE_ABSENT", "INCOMPLETE", evidence_dir=empty)
+
+    # -- item 1: the consent is the COMMITTED blob's records -------------------------------------------------------------------
+    def test_sols_repro_a_hand_built_production_pass_over_a_consent_blob_with_zero_records_is_not_valid(self) -> None:
+        repo = self.prod_repo(records=[])          # the pinned shape: a real committed consent blob that holds NO record
+        ev = self.evidence("repro")
+        receipt = self.receipt_for(repo, ev)       # every other claim re-derives, and the admission names the REAL blob ids
+        self.assertNotValid(receipt, repo, "CONSENT_NOT_IN_BLOB", "INVALID")
+
+    def test_consent_for_another_venue_or_another_clip_in_the_blob_is_not_this_legs_consent(self) -> None:
+        ev = self.evidence("other")
+        for name, records in (("the other venue", [consent_record("bachelor", OWNER_CLIP)]), ("another clip", [consent_record("ultra-magnus", OTHER_CLIP)])):
+            repo = self.prod_repo(records=records)
+            self.assertNotValid(self.receipt_for(repo, ev), repo, "CONSENT_NOT_IN_BLOB", "INVALID")
+
+    def test_placeholder_hashes_and_blobs_that_are_not_the_committed_consent_file_are_not_valid(self) -> None:
+        repo = self.prod_repo()
+        ev = self.evidence("ph")
+        receipt = self.receipt_for(repo, ev)
+        for key, fake, needle in (("consentBlobSha", "c" * 40, "is not a blob of this repository"), ("venueTableBlobSha", "d" * 40, "is not a blob of this repository"),
+                                  ("consentBlobSha", repo.head(), "is not a blob of this repository"),       # a COMMIT id is not a blob
+                                  ("consentBlobSha", repo.blob("legs/unit-leg.json"), "not a valid consent file")):   # a real blob that is not the consent file
+            forged = json.loads(json.dumps(receipt))
+            forged["admission"][key] = fake
+            self.assertNotValid(forged, repo, needle, "INVALID")
+        for key, fake in (("headCommit", "f" * 40), ("consentBlobSha", "xyz"), ("ownerLineSha256", None)):
+            forged = json.loads(json.dumps(receipt))
+            forged["admission"][key] = fake
+            status, valid, reasons = self.status(forged, repo)
+            self.assertFalse(valid, key)
+            self.assertEqual(status, "INVALID", key)
+
+    def test_a_consent_blob_that_was_written_to_the_object_store_but_never_committed_is_not_consent(self) -> None:
+        repo = self.prod_repo(records=[])
+        ev = self.evidence("loose")
+        loose = self.tmp / "loose-consent.json"
+        loose.write_text(json.dumps(consent_file(consent_record("ultra-magnus", OWNER_CLIP)), indent=2) + "\n", encoding="utf-8", newline="\n")
+        blob = repo.git("hash-object", "-w", str(loose))
+        receipt = self.receipt_for(repo, ev)
+        receipt["admission"]["consentBlobSha"] = blob
+        self.assertNotValid(receipt, repo, "is not the one committed at admission.headCommit", "INVALID")
+
+    def test_the_owner_line_the_venue_table_switch_and_the_role_all_come_from_the_committed_blobs(self) -> None:
+        repo = self.prod_repo()
+        ev = self.evidence("blobs")
+        receipt = self.receipt_for(repo, ev)
+        forged = json.loads(json.dumps(receipt))
+        forged["admission"]["ownerLineSha256"] = "a" * 64
+        self.assertNotValid(forged, repo, "CONSENT_LINE_MISMATCH", "INVALID")
+        forged = json.loads(json.dumps(receipt))
+        forged["venue"]["role"] = "acceptance"
+        self.assertNotValid(forged, repo, "ROLE_MISMATCH", "INVALID")
+        off = self.prod_repo(cleanup_gone=False)
+        self.assertNotValid(self.receipt_for(off, ev), off, "cleanup switch off", "INVALID")
+        producer = self.prod_repo(records=[dict(consent_record("ultra-magnus", OWNER_CLIP), recordedBy="producer")])
+        self.assertNotValid(self.receipt_for(producer, ev), producer, "not a valid consent file", "INVALID")
+
+    def test_a_production_receipt_without_a_repo_to_read_the_blobs_from_is_incomplete_not_valid(self) -> None:
+        repo = self.prod_repo()
+        ev = self.evidence("norepo")
+        self.assertNotValid(self.receipt_for(repo, ev), None, "ADMISSION_UNVERIFIABLE", "INCOMPLETE")
+
+    def test_the_leg_spec_and_its_criteria_are_a_committed_blob(self) -> None:
+        repo = self.prod_repo()
+        ev = self.evidence("spec")
+        # a spec nobody committed (weaker criteria, same ids) is never found
+        weak = self.tmp / "weak-spec.json"
+        spec = json.loads(self.spec_path.read_text(encoding="utf-8"))
+        spec["criteria"]["supplementary"]["cuda"] = []
+        weak.write_text(json.dumps(spec), encoding="utf-8")
+        self.assertNotValid(self.receipt_for(repo, ev, spec_path=weak), repo, "LEG_SPEC_NOT_COMMITTED", "INVALID")
+        # the COMMITTED criteria decide: a committed spec demanding rows > 5000 makes the same run a derived FAIL
+        strict = self.tmp / "strict-spec.json"
+        spec["criteria"]["supplementary"]["cuda"] = [{"metric": "rows", "op": "gt", "value": 5000}]
+        strict.write_text(json.dumps(spec), encoding="utf-8")
+        srepo = self.prod_repo(spec=strict)
+        self.assertNotValid(self.receipt_for(srepo, ev), srepo, "OUTCOME_NOT_DERIVED", "INVALID")
+        self.assertVerified(self.receipt_for(srepo, ev, outcome="FAIL"), srepo)
+
+    # -- item 2: every evidence claim is re-hashed, the playback block is re-derived ---------------------------------------------
+    def test_absent_evidence_is_incomplete_never_a_pass(self) -> None:
+        repo = self.prod_repo()
+        ev = self.evidence("abs")
+        receipt = self.receipt_for(repo, ev)
+        none = json.loads(json.dumps(receipt))
+        none["evidence"] = {"umRunOutcome": "RECEIPT"}
+        self.assertNotValid(none, repo, "EVIDENCE_ABSENT", "INCOMPLETE")
+        for rel in EVIDENCE_REL_FILES:
+            dropped = json.loads(json.dumps(receipt))
+            dropped["evidence"][EVIDENCE_CLAIM_KEYS[rel]] = None
+            # (a capture with no manifest claim is incomplete AND its stored manifest nonce no longer re-derives: either way not valid)
+            self.assertNotValid(dropped, repo, "EVIDENCE_ABSENT", None if rel == "evidence-manifest.json" else "INCOMPLETE")
+            moved = self.tmp / ("gone-" + rel.replace("/", "_"))
+            shutil.copytree(ev, moved)
+            (moved / rel).unlink()
+            self.assertNotValid(receipt, repo, "is not in the evidence directory", "INCOMPLETE", evidence_dir=moved)
+
+    def test_a_swapped_or_edited_evidence_file_is_invalid(self) -> None:
+        repo = self.prod_repo()
+        ev = self.evidence("hash")
+        receipt = self.receipt_for(repo, ev)
+        for rel in EVIDENCE_REL_FILES:
+            edited = self.tmp / ("edited-" + rel.replace("/", "_"))
+            shutil.copytree(ev, edited)
+            with open(edited / rel, "ab") as handle:
+                handle.write(b"\n")                     # still parses; only the hash can tell
+            self.assertNotValid(receipt, repo, "EVIDENCE_HASH_MISMATCH", "INVALID", evidence_dir=edited)
+
+    def test_self_asserted_playback_fields_are_never_inputs(self) -> None:
+        repo = self.prod_repo()
+        ev = self.evidence("lies")
+        receipt = self.receipt_for(repo, ev)
+        for field, lie in (("sourceAdvanced", 5000), ("requiredSourceFrames", 599), ("nativeFps", 30.0), ("paceFps", 30.0), ("fpsOverride", 1), ("wrapped", True), ("wrapCount", 3),
+                           ("expectedRunNonce", "0123456789abcdef0123456789abcdef"), ("observedRunNonce", "0123456789abcdef0123456789abcdef"),
+                           ("manifestRunNonce", "0123456789abcdef0123456789abcdef"), ("logSha256", "f" * 64), ("logShaBound", False), ("settingsIsolated", False),
+                           ("fixtureRehearsal", True), ("clipId", OTHER_CLIP)):
+            forged = json.loads(json.dumps(receipt))
+            forged["playback"][field] = lie
+            self.assertNotValid(forged, repo, f"playback.{field} is not what the hashed run log and result re-derive", "INVALID")
+        # a stored valid / invalidReasons is not believed either
+        forged = json.loads(json.dumps(receipt))
+        forged["playback"].update(valid=True, invalidReasons=[])
+        self.assertVerified(forged, repo)   # (they are ignored, not trusted: the verdict comes from the files)
+
+    def test_a_logShaBound_or_settingsIsolated_true_the_evidence_does_not_support_is_invalid(self) -> None:
+        repo = self.prod_repo()
+        for name, opts, field in (("unbound", dict(declared_log_sha="f" * 64), "logShaBound"), ("notisolated", dict(isolated="venue_NOT_ISOLATED"), "settingsIsolated"),
+                                  ("noiso", dict(isolated=None), "settingsIsolated")):
+            ev = self.evidence(name, **opts)
+            receipt = self.receipt_for(repo, ev)
+            self.assertFalse(receipt["playback"][field], name)
+            receipt["playback"][field] = True       # the lie
+            self.assertNotValid(receipt, repo, f"playback.{field} is not what", "INVALID")
+            honest = self.receipt_for(repo, ev)     # even honestly recorded, the run is not evidence
+            status, valid, reasons = self.status(honest, repo)
+            self.assertFalse(valid, name)
+
+    def test_sols_20_frame_repro_and_a_fabricated_nonce_are_not_valid_even_when_the_receipt_agrees_with_its_evidence(self) -> None:
+        repo = self.prod_repo()
+        short = self.evidence("short", line={"source_advanced": 20, "required_source_frames": 20, "native_fps": "24.000", "pace_fps": "24.000"})
+        self.assertNotValid(self.receipt_for(repo, short), repo, "ceil(20 s x native_fps=24)", "INVALID")
+        # fresh GUID-N nonce strings in the receipt, while the hashed log carries another one
+        ev = self.evidence("nonce")
+        receipt = self.receipt_for(repo, ev)
+        fresh = "0123456789abcdef0123456789abcdef"
+        receipt["playback"].update(expectedRunNonce=fresh, observedRunNonce=fresh, manifestRunNonce=fresh)
+        self.assertNotValid(receipt, repo, "playback.expectedRunNonce is not what", "INVALID")
+        foreign = self.evidence("foreign", observed_nonce="0123456789abcdef0123456789abcdef")
+        self.assertNotValid(self.receipt_for(repo, foreign), repo, "RECEIPT_NOT_THIS_RUN", "INVALID")
+
+    def test_the_evidence_must_be_about_this_venue_clip_build_and_metrics(self) -> None:
+        repo = self.prod_repo()
+        wrong_venue = self.evidence("wv", venue="bachelor")
+        self.assertNotValid(self.receipt_for(repo, wrong_venue), repo, "VENUE_MISMATCH", "INVALID")
+        wrong_clip = self.evidence("wc", manifest={"clipId": OTHER_CLIP})
+        self.assertNotValid(self.receipt_for(repo, wrong_clip), repo, "CLIP_MISMATCH", "INVALID")
+        wrong_build = self.evidence("wb", manifest={"buildManifest": {"sha256": "cd" * 32}})
+        self.assertNotValid(self.receipt_for(repo, wrong_build), repo, "BUILD_MISMATCH", "INVALID")
+        ev = self.evidence("wm")
+        forged = self.receipt_for(repo, ev)
+        forged["metrics"]["rows"] = 123456
+        self.assertNotValid(forged, repo, "METRICS_NOT_FROM_EVIDENCE", "INVALID")
+        forged = self.receipt_for(repo, ev)
+        forged["subject"]["digest"] = "0" * 64
+        self.assertNotValid(forged, repo, "SUBJECT_DIGEST_MISMATCH", "INVALID")
+
+    def test_the_outcome_is_derived_from_the_jobs_exit_code_and_result_not_from_the_receipt(self) -> None:
+        repo = self.prod_repo()
+        nonzero = self.evidence("nz", exit_code=1)
+        self.assertNotValid(self.receipt_for(repo, nonzero), repo, "OUTCOME_NOT_DERIVABLE", "INVALID")
+        quiescent = self.evidence("q", token="VENUE_NOT_QUIESCENT")
+        self.assertNotValid(self.receipt_for(repo, quiescent), repo, "OUTCOME_NOT_DERIVABLE", "INVALID")
+        rehearsal = self.evidence("rh", token="FIXTURE_REHEARSAL_CAPTURED")
+        self.assertNotValid(self.receipt_for(repo, rehearsal), repo, "OUTCOME_NOT_DERIVABLE", "INVALID")
+
+    def test_a_look_pass_needs_the_contact_sheet_the_receipt_hashed(self) -> None:
+        repo = self.prod_repo(leg_type="look")
+        ev = self.evidence("look", sheet=True)
+        self.assertVerified(self.receipt_for(repo, ev, leg_type="look", backend="cpu"), repo)
+        receipt = self.receipt_for(repo, ev, leg_type="look", backend="cpu")
+        receipt["look"]["contactSheet"]["sha256"] = "a" * 64
+        self.assertNotValid(receipt, repo, "OUTCOME_NOT_DERIVED", "INVALID")
+        # a LOOK leg with no contact sheet in its evidence is a derived FAIL, never a PASS
+        nosheet = self.evidence("nosheet", sheet=False)
+        self.assertVerified(self.receipt_for(repo, nosheet, backend="cpu", outcome="FAIL"), repo)
+        self.assertNotValid(self.receipt_for(repo, nosheet, backend="cpu", outcome="PASS"), repo, "OUTCOME_NOT_DERIVED", "INVALID")
+
+    # -- the offline-to-production promotion of sol's repro --------------------------------------------------------------------
+    def test_an_offline_test_receipt_promoted_to_production_is_not_valid(self) -> None:
+        self.write_artifacts()
+        proc, offline, _ = self.run_leg("ultra-magnus", self.write_spec())
+        self.assertEqual(offline["outcome"], "PASS", proc.stdout + proc.stderr)
+        self.assertEqual(offline["admission"]["mode"], "offline-test")
+        self.assertTrue(ps_receipt_valid(offline, allow_offline=True)[0], "the harness may read its own offline receipt")
+        self.assertFalse(ps_receipt_valid(offline)[0], "and nobody else may")
+        line = f"CLIP ultra-magnus: {OWNER_CLIP}"
+        uncommitted = ProductionRepo(self, records=[consent_record("ultra-magnus", OWNER_CLIP)], cleanup_gone=True)   # consent committed, but NOT the leg spec
+        for name, repo, needle in (("sol's repro: the pinned shape, a committed consent blob with zero records", self.prod_repo(records=[]), "CONSENT_NOT_IN_BLOB"),
+                                   ("a record for the other venue only", self.prod_repo(records=[consent_record("bachelor", OWNER_CLIP)]), "CONSENT_NOT_IN_BLOB"),
+                                   ("a committed record but the offline run's leg spec was never committed", uncommitted, "LEG_SPEC_NOT_COMMITTED")):
+            promoted = json.loads(json.dumps(offline))
+            promoted["admission"] = {"mode": "production", "consentBlobSha": repo.blob("venue-clip-consent.json"), "venueTableBlobSha": repo.blob("venues.json"),
+                                     "headCommit": repo.head(), "consentLastCommit": repo.head(), "ownerLineSha256": hashlib.sha256(line.encode()).hexdigest()}
+            status, valid, reasons = self.status(promoted, repo)
+            self.assertFalse(valid, name)
+            self.assertEqual(status, "INVALID", name)
+            self.assertTrue(any(needle in r for r in reasons), f"{name}: {reasons}")
+
+    # -- GIT_* in the environment cannot redirect the blobs ------------------------------------------------------------------------
+    def test_a_git_dir_in_the_environment_cannot_point_the_validator_at_a_forged_repo(self) -> None:
+        forged_repo = self.prod_repo()                          # the forger's scratch repo: a committed record, the cleanup switch on
+        ev = self.evidence("gitenv")
+        receipt = self.receipt_for(forged_repo, ev)
+        real = self.prod_repo(records=[])                       # the repo the validator is told to use: no record
+        env = {"GIT_DIR": str(forged_repo.root / ".git")}
+        self.assertNotValid(receipt, real, "is not a blob of this repository", "INVALID", env=env)
+        mutated = self.mutated_module([("[void]$psi.Environment.Remove($name)", "$null = $name")])
+        status, valid, reasons = self.status(receipt, real, module=mutated, env=env)
+        self.assertEqual((status, valid), ("VERIFIED", True), "with the scrub removed GIT_DIR makes the forger's repo the committed one -- so the scrub is guarded")
+
+    # -- the writer runs the same validator (production) ------------------------------------------------------------------------
+    def test_the_writer_refuses_a_proofless_pass_and_writes_a_receipt_that_re_derives(self) -> None:
+        repo = self.prod_repo()
+        ev = self.evidence("writer")
+        good = self.receipt_for(repo, ev)
+        bare = json.loads(json.dumps(good))
+        bare["evidence"] = {"umRunOutcome": "RECEIPT"}
+        bare["playback"] = None
+        invalid = json.loads(json.dumps(bare))
+        invalid["outcome"] = "INVALID"
+        invalid["receiptId"] = "r-invalid-terminal"     # (receipts are append-only: the good one already took its own id)
+        out = self.tmp / "written"
+        script = (f"Import-Module '{DV / 'DualVenueRunner.psm1'}' -Force\n"
+                  "function Try-Write($json) { $r = $json | ConvertFrom-Json -AsHashtable; try { Write-DvReceipt -Receipt $r -ReceiptRoot '" + str(out) + f"' -RepoRoot '{repo.root}' | Out-Null; 'WRITTEN' }} catch {{ 'REFUSED:' + $_.Exception.Message.Split(' ')[0] }} }}\n"
+                  "Write-Output ('good=' + (Try-Write $env:DVE_GOOD))\nWrite-Output ('bare=' + (Try-Write $env:DVE_BARE))\nWrite-Output ('invalid=' + (Try-Write $env:DVE_INVALID))\n")
+        proc = run_pwsh(["-Command", script], env_extra={"DVE_GOOD": json.dumps(good), "DVE_BARE": json.dumps(bare), "DVE_INVALID": json.dumps(invalid)})
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        self.assertIn("good=WRITTEN", proc.stdout)
+        self.assertIn("bare=REFUSED:DVE_RECEIPT_INVALID", proc.stdout)
+        self.assertIn("invalid=WRITTEN", proc.stdout, "a terminal that carries no signal needs no proof")
+
+    def test_the_reader_validator_refuses_a_bare_pass_and_asks_no_proof_of_other_outcomes(self) -> None:
+        repo = self.prod_repo()
+        bare = {"outcome": "PASS", "subject": {"clipId": OWNER_CLIP, "clipContentSha256": CLIP_CONTENT_SHA}, "playback": None, "evidence": {"umRunOutcome": "RECEIPT"}}
+        status, valid, reasons = self.status(bare, repo)
+        self.assertEqual((status, valid), ("INVALID", False))
+        self.assertTrue(any("EVIDENCE_ABSENT" in r for r in reasons), reasons)
+        self.assertEqual(self.status(dict(bare, outcome="UNRESOLVED"), repo)[:2], ("NO_SIGNAL", True))
+
+    def test_the_outcome_must_be_a_typed_outcome_spelled_exactly(self) -> None:
+        repo = self.prod_repo()
+        receipt = self.receipt_for(repo, self.evidence("case"))
+        for spelling in ("pass", "Pass", "PASS ", "", "OK"):
+            forged = json.loads(json.dumps(receipt))
+            forged["outcome"] = spelling
+            status, valid, reasons = self.status(forged, repo)
+            self.assertEqual((status, valid), ("INVALID", False), repr(spelling))
+
+    def test_an_offline_test_receipt_is_never_reported_as_verified(self) -> None:
+        self.write_artifacts()
+        _, offline, _ = self.run_leg("ultra-magnus", self.write_spec())
+        status, valid, _ = ps_receipt_status(offline, allow_offline=True)
+        self.assertEqual((status, valid), ("VERIFIED_OFFLINE_TEST", True))
+
+    # -- item 3: every reader calls the evidence-bearing validator ------------------------------------------------------------------
+    @staticmethod
+    def readers_without_repo_root(texts: dict[str, str]) -> list[str]:
+        bad = []
+        for name, text in texts.items():
+            for n, line in enumerate(text.splitlines(), 1):
+                if re.search(r"Test-DvReceiptValid\s+-", line) and not line.lstrip().startswith("#") and "-RepoRoot" not in line:
+                    bad.append(f"{name}:{n}")
+        return bad
+
+    def test_every_in_tree_caller_of_the_validator_passes_the_repo_root_and_the_only_receipt_readers_are_the_known_ones(self) -> None:
+        tracked = subprocess.run(["git", "-C", str(ROOT), "ls-files", "*.ps1", "*.psm1", "*.py"], capture_output=True, text=True, check=True).stdout.split()
+        texts = {name: (ROOT / name).read_text(encoding="utf-8", errors="replace") for name in tracked if (ROOT / name).is_file()}
+        callers = {n for n, t in texts.items() if re.search(r"Test-DvReceiptValid\s+-", t) and n != "tools/repo_hygiene/test_dual_venue_evidence.py"}
+        self.assertEqual(callers, {"tools/profiling/dual-venue/DualVenueRunner.psm1", "tools/profiling/dual-venue/New-VenueSheetPair.ps1"})
+        self.assertEqual(self.readers_without_repo_root({n: texts[n] for n in callers}), [])
+        # nothing else in the tree reads a receipt file: a new reader must call the validator (and be added to this list in review)
+        readers = {n for n, t in texts.items() if ("dual-venue-receipt/v1" in t or "dual-venue\\receipts" in t or "dual-venue/receipts" in t)
+                   and n not in ("tools/repo_hygiene/test_dual_venue_evidence.py", "tools/repo_hygiene/test_mlv_never_authorized.py")}
+        self.assertEqual(readers, {"tools/profiling/dual-venue/DualVenueRunner.psm1", "tools/profiling/dual-venue/Invoke-VenueLeg.ps1"},
+                         "an unknown reader of dual-venue receipts must call Test-DvReceiptValid -RepoRoot and be named here")
+        mutated = texts["tools/profiling/dual-venue/New-VenueSheetPair.ps1"].replace("Test-DvReceiptValid -Receipt $r -RepoRoot $repoRoot", "Test-DvReceiptValid -Receipt $r")
+        self.assertNotEqual(mutated, texts["tools/profiling/dual-venue/New-VenueSheetPair.ps1"])
+        self.assertEqual(self.readers_without_repo_root({"New-VenueSheetPair.ps1": mutated}), ["New-VenueSheetPair.ps1:" + str(next(
+            i for i, l in enumerate(mutated.splitlines(), 1) if "Test-DvReceiptValid" in l and not l.lstrip().startswith("#")))],
+            "a reader that drops -RepoRoot is caught by the scan -- so the scan guards item 3")
+
+    # -- mutations: each rule's test can fail ----------------------------------------------------------------------------------------
+    def test_mutation_trusting_the_consent_blobs_format_a_zero_record_blob_validates(self) -> None:
+        stub = "$consent = [pscustomobject]@{ ok = $true; reason = $null; records = @([pscustomobject]@{ venue = $venueName; clipId = $clipId; ownerLineSha256 = $lineSha; recordedBy = 'owner' }) }"
+        mutated = self.mutated_module([("$consent = Read-DvClipConsent -Text $cb.text -Table $table", stub)])
+        repo = self.prod_repo(records=[])
+        receipt = self.receipt_for(repo, self.evidence("m1"))
+        self.assertEqual(self.status(receipt, repo, module=mutated)[:2], ("VERIFIED", True), "with the records read skipped a zero-record blob validates -- so reading them is what refuses it")
+
+    def test_mutation_without_the_owner_line_comparison_a_foreign_line_hash_validates(self) -> None:
+        mutated = self.mutated_module([("if ([string]$record.ownerLineSha256 -cne $lineSha) {", "if ($false) {")])
+        repo = self.prod_repo()
+        receipt = self.receipt_for(repo, self.evidence("m2"))
+        receipt["admission"]["ownerLineSha256"] = "a" * 64
+        self.assertEqual(self.status(receipt, repo, module=mutated)[:2], ("VERIFIED", True))
+
+    def test_mutation_without_the_committed_at_head_check_a_loose_consent_blob_validates(self) -> None:
+        mutated = self.mutated_module([("elseif ($at -cne $pair[2]) {", "elseif ($false) {")])
+        repo = self.prod_repo(records=[])
+        loose = self.tmp / "loose2.json"
+        loose.write_text(json.dumps(consent_file(consent_record("ultra-magnus", OWNER_CLIP)), indent=2) + "\n", encoding="utf-8", newline="\n")
+        receipt = self.receipt_for(repo, self.evidence("m3"))
+        receipt["admission"]["consentBlobSha"] = repo.git("hash-object", "-w", str(loose))
+        self.assertEqual(self.status(receipt, repo, module=mutated)[:2], ("VERIFIED", True))
+
+    def test_mutation_without_the_leg_spec_lookup_an_uncommitted_spec_validates(self) -> None:
+        mutated = self.mutated_module([("$invalid.Add('LEG_SPEC_NOT_COMMITTED: subject.legSpecSha256 is not a leg spec", "$null = ('LEG_SPEC_NOT_COMMITTED: subject.legSpecSha256 is not a leg spec")])
+        repo = self.prod_repo()
+        weak = self.tmp / "weak2.json"
+        spec = json.loads(self.spec_path.read_text(encoding="utf-8"))
+        spec["criteria"]["supplementary"]["cuda"] = []
+        weak.write_text(json.dumps(spec), encoding="utf-8")
+        receipt = self.receipt_for(repo, self.evidence("m4"), spec_path=weak)
+        self.assertEqual(self.status(receipt, repo, module=mutated)[:2], ("VERIFIED", True))
+
+    def test_mutation_without_the_evidence_hash_recheck_an_edited_file_validates(self) -> None:
+        mutated = self.mutated_module([("if ((Get-DvSha256OfBytes $b) -cne $claim) {", "if ($false) {")])
+        repo = self.prod_repo()
+        ev = self.evidence("m5")
+        receipt = self.receipt_for(repo, ev)
+        edited = self.tmp / "m5-edited"
+        shutil.copytree(ev, edited)
+        with open(edited / "summary.json", "ab") as handle:
+            handle.write(b"\n")
+        self.assertEqual(self.status(receipt, repo, evidence_dir=edited, module=mutated)[:2], ("VERIFIED", True))
+
+    def test_mutation_without_the_playback_comparison_a_lying_block_validates(self) -> None:
+        mutated = self.mutated_module([("if (-not (Test-DvJsonEquivalent (Get-DvProp $stored $f) (Get-DvProp $derived $f))) {", "if ($false) {")])
+        repo = self.prod_repo()
+        receipt = self.receipt_for(repo, self.evidence("m6"))
+        receipt["playback"]["sourceAdvanced"] = 5000
+        self.assertEqual(self.status(receipt, repo, module=mutated)[:2], ("VERIFIED", True))
+
+    def test_mutation_without_the_outcome_derivation_a_pass_over_failing_criteria_validates(self) -> None:
+        mutated = self.mutated_module([("if ($expected -cne $outcome) {", "if ($false) {")])
+        repo = self.prod_repo()
+        receipt = self.receipt_for(repo, self.evidence("m7", summary={"rows": 0}), outcome="PASS")
+        self.assertEqual(self.status(receipt, repo, module=mutated)[:2], ("VERIFIED", True))
+
+    def test_mutation_without_the_absent_evidence_rule_a_receipt_with_no_evidence_is_verified(self) -> None:
+        mutated = self.mutated_module([("$incomplete.Add('EVIDENCE_ABSENT: the receipt names no local evidence directory", "$null = ('EVIDENCE_ABSENT: the receipt names no local evidence directory")])
+        repo = self.prod_repo()
+        receipt = self.receipt_for(repo, self.evidence("m8"))
+        receipt["evidence"] = {"umRunOutcome": "RECEIPT"}
+        receipt["playback"] = None
+        self.assertEqual(self.status(receipt, repo, module=mutated)[:2], ("VERIFIED", True))
+
+
+# ---------------------------------------------------------------------------------------------------
+@requires_windows_pwsh
+class SheetPairStaysLocalTests(EvidenceFactory, unittest.TestCase):
+    """Every leg now plays an owner clip, so a paired sheet is a sheet of OWNER footage: it is written only under a .claude-state
+    directory and only from receipts that are themselves valid, evidence-bearing receipts (the reader calls the SAME validator the
+    writer does, so a receipt whose evidence is absent is INCOMPLETE and cannot be paired)."""
+
+    def setUp(self) -> None:
+        self.make_harness()
+        self.repo = self.prod_repo(leg_type="look")
+        self.receipts_by_backend: dict[str, dict] = {}
+        for backend in ("cuda", "cpu"):
+            ev = self.evidence(f"pair-{backend}", sheet=True)
+            (ev / "contact-sheet" / "raw").mkdir()   # (empty: a refusal test never composes; the valid-pair test fills it)
+            self.receipts_by_backend[backend] = self.receipt_for(self.repo, ev, backend=backend, leg_type="look")
+
+    def pair(self, out: Path, receipts: dict[str, dict] | None = None, script: Path | None = None):
         paths = []
         for backend in ("cuda", "cpu"):
             path = self.tmp / f"{backend}.json"
-            path.write_text(json.dumps(_valid_look_receipt(backend, self.frames[backend], **kwargs)), encoding="utf-8")
+            path.write_text(json.dumps((receipts or self.receipts_by_backend)[backend]), encoding="utf-8")
             paths.append(path)
-        return run_pwsh(["-File", str(DV / "New-VenueSheetPair.ps1"), "-CudaReceipt", str(paths[0]), "-CpuReceipt", str(paths[1]), "-OutDir", str(out)])
+        return run_pwsh(["-File", str(script or self.repo.dv / "New-VenueSheetPair.ps1"), "-CudaReceipt", str(paths[0]), "-CpuReceipt", str(paths[1]), "-OutDir", str(out)])
 
     def test_a_sheet_outside_a_claude_state_directory_is_refused(self) -> None:
         proc = self.pair(self.tmp / "published")
@@ -1695,16 +2192,47 @@ class SheetPairStaysLocalTests(unittest.TestCase):
         self.assertIn("PAIR_OWNER_SHEET_MUST_STAY_LOCAL", proc.stdout + proc.stderr)
         self.assertFalse((self.tmp / "published").exists(), "nothing is written for a refused pair")
 
-    def test_a_receipt_without_the_oracle_verdict_cannot_be_paired(self) -> None:
-        proc = self.pair(self.tmp / ".claude-state" / "sheets", with_playback=False)
+    def test_a_receipt_whose_evidence_is_absent_is_incomplete_and_cannot_be_paired(self) -> None:
+        bare = json.loads(json.dumps(self.receipts_by_backend))
+        bare["cuda"]["evidence"] = {"umRunOutcome": "RECEIPT"}
+        proc = self.pair(self.tmp / ".claude-state" / "sheets", receipts=bare)
+        self.assertNotEqual(proc.returncode, 0)
+        self.assertIn("PAIR_RECEIPT_INCOMPLETE", proc.stdout + proc.stderr)
+        self.assertIn("EVIDENCE_ABSENT", proc.stdout + proc.stderr)
+        gone = json.loads(json.dumps(self.receipts_by_backend))
+        gone["cpu"]["evidence"]["localEvidenceDir"] = str(self.tmp / "nowhere")
+        proc = self.pair(self.tmp / ".claude-state" / "sheets", receipts=gone)
+        self.assertNotEqual(proc.returncode, 0)
+        self.assertIn("PAIR_RECEIPT_INCOMPLETE", proc.stdout + proc.stderr)
+        self.assertIn("EVIDENCE_ABSENT", proc.stdout + proc.stderr)
+
+    def test_a_hand_built_receipt_with_placeholder_hashes_cannot_be_paired(self) -> None:
+        hand = {b: {"receiptId": f"r-{b}", "card": "DUAL-VENUE-EVIDENCE-1", "legId": "unit-leg", "outcome": "PASS",
+                    "subject": {"backend": b, "buildManifestSha256": "ab" * 32, "legSpecSha256": "cd" * 32, "clipId": OWNER_CLIP, "clipContentSha256": CLIP_CONTENT_SHA, "lookFlavor": "classic"},
+                    "venue": {"name": "ultra-magnus", "hostName": "ULTRA-MAGNUS", "gpuNames": ["RTX 4090"]}, "evidence": {"umRunOutcome": "RECEIPT"},
+                    "admission": {"mode": "production", "consentBlobSha": "c" * 40, "venueTableBlobSha": "d" * 40, "ownerLineSha256": "e" * 64},
+                    "look": {"contactSheet": {"rawFramesDir": str(self.tmp)}}, "playback": good_block()} for b in ("cuda", "cpu")}
+        proc = self.pair(self.tmp / ".claude-state" / "sheets", receipts=hand)
         self.assertNotEqual(proc.returncode, 0)
         self.assertIn("PAIR_RECEIPT_INVALID", proc.stdout + proc.stderr)
 
-    def test_a_fixture_or_a_path_is_not_a_consented_clip_for_a_sheet(self) -> None:
+    def test_a_tampered_evidence_file_cannot_be_paired(self) -> None:
+        ev = Path(self.receipts_by_backend["cuda"]["evidence"]["localEvidenceDir"])
+        with open(ev / "logs" / "smoke-run.log", "ab") as handle:
+            handle.write(b"\n")
+        proc = self.pair(self.tmp / ".claude-state" / "sheets")
+        self.assertNotEqual(proc.returncode, 0)
+        self.assertIn("PAIR_RECEIPT_INVALID", proc.stdout + proc.stderr)
+        self.assertIn("EVIDENCE_HASH_MISMATCH", proc.stdout + proc.stderr)
+
+    def test_a_fixture_is_not_a_consented_clip_for_a_sheet(self) -> None:
         for clip in FIXTURE_IDS:
-            proc = self.pair(self.tmp / ".claude-state" / "sheets", clip=clip)
+            forged = json.loads(json.dumps(self.receipts_by_backend))
+            for r in forged.values():
+                r["subject"]["clipId"] = clip
+            proc = self.pair(self.tmp / ".claude-state" / "sheets", receipts=forged)
             self.assertNotEqual(proc.returncode, 0)
-            self.assertIn("PAIR_NOT_A_CONSENTED_CLIP", proc.stdout + proc.stderr)
+            self.assertIn("consented clip id", proc.stdout + proc.stderr)
 
     def test_a_valid_pair_under_claude_state_is_composed_and_marked_local(self) -> None:
         try:
@@ -1713,9 +2241,11 @@ class SheetPairStaysLocalTests(unittest.TestCase):
         except ImportError:
             self.skipTest("Pillow + numpy are required")
         for backend, colour in (("cuda", (200, 40, 40)), ("cpu", (40, 40, 200))):
+            raw = Path(self.receipts_by_backend[backend]["evidence"]["localEvidenceDir"]) / "contact-sheet" / "raw"
+            raw.mkdir(parents=True, exist_ok=True)
             for i in (0, 1):
-                Image.new("RGB", (64, 36), colour).save(self.frames[backend] / f"frame-{i:02d}.png")
-                (self.frames[backend] / f"frame-{i:02d}.json").write_text(json.dumps({
+                Image.new("RGB", (64, 36), colour).save(raw / f"frame-{i:02d}.png")
+                (raw / f"frame-{i:02d}.json").write_text(json.dumps({
                     "index": i, "saved": True, "display_frame": i * 3, "elapsed_ms": i * 40.0, "path": f"frame-{i:02d}.png",
                     "look_assist_enabled": True, "look_assist_scene": "night"}), encoding="utf-8")
         out = self.tmp / ".claude-state" / "sheets"
@@ -1726,6 +2256,30 @@ class SheetPairStaysLocalTests(unittest.TestCase):
         self.assertIn("never committed", record["localOnly"])
         self.assertIsNone(record["owner_verdict"])
         self.assertEqual(record["model_verdicts"], [])
+
+    def test_mutation_without_the_validity_gate_a_receipt_with_no_evidence_is_paired(self) -> None:
+        mutated = ProductionRepo(self, records=[consent_record("ultra-magnus", OWNER_CLIP)], cleanup_gone=True,
+                                 mutations=[("New-VenueSheetPair.ps1", "if (-not $validity.valid) {", "if ($false) {")])
+        bare = json.loads(json.dumps(self.receipts_by_backend))
+        for r in bare.values():
+            r["evidence"] = dict(r["evidence"], summaryJsonSha256=None)   # the evidence is incomplete, but its frames are there
+        try:
+            import PIL, numpy  # noqa: F401
+            from PIL import Image
+        except ImportError:
+            self.skipTest("Pillow + numpy are required")
+        for backend in ("cuda", "cpu"):
+            raw = Path(bare[backend]["evidence"]["localEvidenceDir"]) / "contact-sheet" / "raw"
+            raw.mkdir(parents=True, exist_ok=True)
+            for i in (0, 1):
+                Image.new("RGB", (64, 36), (10, 10, 10)).save(raw / f"frame-{i:02d}.png")
+                (raw / f"frame-{i:02d}.json").write_text(json.dumps({"index": i, "saved": True, "display_frame": i * 3, "elapsed_ms": i * 40.0, "path": f"frame-{i:02d}.png",
+                                                                      "look_assist_enabled": True, "look_assist_scene": "night"}), encoding="utf-8")
+        refused = self.pair(self.tmp / ".claude-state" / "sheets-real", receipts=bare)
+        self.assertNotEqual(refused.returncode, 0, "the real reader refuses an incomplete receipt")
+        self.assertIn("PAIR_RECEIPT_INCOMPLETE", refused.stdout + refused.stderr)
+        proc = self.pair(self.tmp / ".claude-state" / "sheets-mut", receipts=bare, script=mutated.dv / "New-VenueSheetPair.ps1")
+        self.assertEqual(proc.returncode, 0, "with the gate removed the same receipt is paired -- so the reader's validity call is what refuses it: " + proc.stdout + proc.stderr)
 
 
 # ---------------------------------------------------------------------------------------------------

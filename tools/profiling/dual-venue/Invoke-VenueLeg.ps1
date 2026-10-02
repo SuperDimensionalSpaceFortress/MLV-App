@@ -99,6 +99,12 @@ if ([string]::IsNullOrWhiteSpace($ReceiptRoot)) {
 if (-not $OfflineTestMode -and -not (Test-DvUnderClaudeState -Path $ReceiptRoot)) {
     throw 'DVE_RECEIPT_ROOT_MUST_STAY_LOCAL -ReceiptRoot must be under a .claude-state directory: a receipt and its evidence name an owner clip''s run'
 }
+# The hashed run evidence (summary, manifest, result, run log, um-run record) goes in a sibling of the receipts directory. It names an
+# owner clip's run too, so in production that directory must ALSO sit under .claude-state (a ReceiptRoot of `.claude-state` itself would not).
+$evidenceBase = Join-Path (Split-Path -Parent $ReceiptRoot) 'evidence'
+if (-not $OfflineTestMode -and -not (Test-DvUnderClaudeState -Path $evidenceBase)) {
+    throw 'DVE_RECEIPT_ROOT_MUST_STAY_LOCAL the evidence directory beside -ReceiptRoot must be under a .claude-state directory: the run evidence names an owner clip''s run'
+}
 if ([string]::IsNullOrWhiteSpace($Actor)) { $Actor = "dual-venue-runner@$($env:COMPUTERNAME)" }
 $runStamp = [DateTime]::UtcNow.ToString('yyyyMMddHHmmss')
 
@@ -168,7 +174,7 @@ function Complete-Receipt([string]$Outcome, [string]$Detail) {
     $receipt.subject.digest = Get-DvSubjectDigest -BuildManifestSha256 $BuildManifestSha256 -LegSpecSha256 $legSpecSha256 `
         -ClipId $spec.clipId -ClipContentSha256 $receipt.subject.clipContentSha256 -Backend $Backend -LookFlavor $lookFlavor
     try {
-        $path = Write-DvReceipt -Receipt $receipt -ReceiptRoot $ReceiptRoot -OfflineTestMode:$OfflineTestMode
+        $path = Write-DvReceipt -Receipt $receipt -ReceiptRoot $ReceiptRoot -RepoRoot $RepoRoot -OfflineTestMode:$OfflineTestMode
     } catch {
         Write-Output "DVE_RECEIPT_WRITE_FAILED $($_.Exception.Message)"
         exit 2
@@ -228,6 +234,12 @@ try {
     if (-not $admission.admitted) { Stop-Refused ([string]$admission.reason) }
     $receipt.admission.ownerLineSha256 = $admission.ownerLineSha256
     $receipt.admission.ownerRecordedUtc = $admission.recordedUtc
+    # In production the leg spec (its criteria decide PASS vs FAIL) must be a spec COMMITTED at the revision the consent was read from:
+    # Test-DvReceiptValid finds it there by its sha256, so a spec the caller wrote could never validate and is refused up front.
+    if (-not $OfflineTestMode) {
+        $committedSpec = Find-DvCommittedLegSpec -RepoRoot $RepoRoot -Commit ([string]$sources.headCommit) -LegSpecSha256 $legSpecSha256
+        if (-not $committedSpec.ok) { Stop-Refused 'LEG_SPEC_NOT_COMMITTED' }
+    }
 
     # --- 3. generate the job (local, no I/O on the venue) ----------------------------------------------
     # The generator resolves the clip by ID (it refuses a path, a fixture under 20 s, an unknown or unconsented id).
@@ -343,15 +355,31 @@ $artifactsShare = $null
 if ($stdout -match 'ARTIFACTS=(?<p>\S+)') { $artifactsShare = ConvertTo-ShareSidePath $Matches['p'] }
 $summary = $null; $manifest = $null
 $resultJson = $null; $runLogText = $null; $runLogSha = $null
-$evidenceDir = Join-Path (Split-Path -Parent $ReceiptRoot) ("evidence\" + $receipt.receiptId)
+$evidenceDir = Join-Path $evidenceBase $receipt.receiptId
 if ($artifactsShare -and (Test-Path -LiteralPath $artifactsShare -PathType Container)) {
     New-Item -ItemType Directory -Force -Path $evidenceDir | Out-Null
-    foreach ($name in 'summary.json', 'evidence-manifest.json', 'artifact-index.json') {
+    # The run's OWN records are copied into the LOCAL evidence directory (under .claude-state in production: they name an owner clip's
+    # run and stay local), hashed THERE, and everything below is parsed from those local copies -- so the receipt's sha256 claims
+    # are over the exact bytes the proof was derived from, and Test-DvReceiptValid can re-hash and re-derive it later.
+    foreach ($name in 'summary.json', 'evidence-manifest.json', 'artifact-index.json', 'result.json') {
         $src = Join-Path $artifactsShare $name
         if (Test-Path -LiteralPath $src -PathType Leaf) { Copy-Item -LiteralPath $src -Destination (Join-Path $evidenceDir $name) }
     }
+    $logShare = Join-Path $artifactsShare 'logs\smoke-run.log'
+    if (Test-Path -LiteralPath $logShare -PathType Leaf) {
+        New-Item -ItemType Directory -Force -Path (Join-Path $evidenceDir 'logs') | Out-Null
+        Copy-Item -LiteralPath $logShare -Destination (Join-Path $evidenceDir 'logs\smoke-run.log')
+    }
+    # The job's exit code and RESULT token are not in any file the job wrote: record them as a hashed file too, so the outcome is
+    # re-derivable (a capture that exited non-zero is not evidence).
+    $umRunLocal = Join-Path $evidenceDir 'um-run.json'
+    $umRunBytes = [Text.UTF8Encoding]::new($false).GetBytes(([ordered]@{ schema = 'mlv-app/dual-venue-um-run/v1'; exitCode = $exitCode; resultToken = $token } | ConvertTo-Json -Compress) + "`n")
+    [IO.File]::WriteAllBytes($umRunLocal, $umRunBytes)
+    $receipt.evidence.umRunJsonSha256 = Get-DvSha256OfBytes $umRunBytes
     $summaryLocal = Join-Path $evidenceDir 'summary.json'
     $manifestLocal = Join-Path $evidenceDir 'evidence-manifest.json'
+    $resultLocal = Join-Path $evidenceDir 'result.json'
+    $logLocal = Join-Path $evidenceDir 'logs\smoke-run.log'
     if (Test-Path -LiteralPath $summaryLocal) {
         $receipt.evidence.summaryJsonSha256 = Get-DvSha256OfFile $summaryLocal
         $summary = [IO.File]::ReadAllText($summaryLocal) | ConvertFrom-Json
@@ -361,17 +389,17 @@ if ($artifactsShare -and (Test-Path -LiteralPath $artifactsShare -PathType Conta
         $manifest = [IO.File]::ReadAllText($manifestLocal) | ConvertFrom-Json
     }
     $receipt.evidence.artifactIndexPath = $artifactsShare.TrimEnd('\') + '\artifact-index.json'
-    $receipt.evidence['localEvidenceDir'] = $evidenceDir
-    # The run's OWN records, read in memory from the share and never copied or printed: the launcher's result.json (the nonce it
-    # generated, the sha256 of the run-log snapshot) and the app's run log (the summary line the proof is re-derived from).
-    $resultShare = Join-Path $artifactsShare 'result.json'
-    if (Test-Path -LiteralPath $resultShare -PathType Leaf) {
-        try { $resultJson = [IO.File]::ReadAllText($resultShare) | ConvertFrom-Json } catch { $resultJson = $null }
+    $receipt.evidence.localEvidenceDir = $evidenceDir
+    # The launcher's result.json (the nonce it generated, the sha256 of the run-log snapshot) and the app's run log (the summary line
+    # the proof is re-derived from).
+    if (Test-Path -LiteralPath $resultLocal -PathType Leaf) {
+        $receipt.evidence.resultJsonSha256 = Get-DvSha256OfFile $resultLocal
+        try { $resultJson = [IO.File]::ReadAllText($resultLocal) | ConvertFrom-Json } catch { $resultJson = $null }
     }
-    $logShare = Join-Path $artifactsShare 'logs\smoke-run.log'
-    if (Test-Path -LiteralPath $logShare -PathType Leaf) {
-        $logBytes = [IO.File]::ReadAllBytes($logShare)
+    if (Test-Path -LiteralPath $logLocal -PathType Leaf) {
+        $logBytes = [IO.File]::ReadAllBytes($logLocal)
         $runLogSha = Get-DvSha256OfBytes $logBytes
+        $receipt.evidence.logSha256 = $runLogSha
         $runLogText = [Text.Encoding]::UTF8.GetString($logBytes)
     }
 }

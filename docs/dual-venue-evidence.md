@@ -73,7 +73,39 @@ receipt oracle and refuses to believe a receipt that does not carry the oracle's
   fails this is `INVALID` (`Invoke-VenueLeg.ps1`) and `Write-DvReceipt` refuses to write it a second time; a printed capture
   whose job exited non-zero, or a captured job that wrote no `sourceFrames` block of its own, is `INVALID` too. A job smoke
   refusal of the length class (`PLAY_WINDOW_TOO_SHORT`, `INVALID_LOOPED`, ...) is `INVALID`, never a product `FAIL`.
-  Readers (`Get-VenueEvidence`) should call `Test-DvReceiptValid`.
+  Readers (`Get-VenueEvidence`) must call `Test-DvReceiptValid -RepoRoot <repo> [-EvidenceDir <dir>]` (next bullet).
+* **A receipt is valid ONLY when every claim in it is re-derived from a committed blob or a hashed artifact; no field the
+  receipt asserts about itself is an input** (DUAL-VENUE-EVIDENCE-2; PR #207's validator believed hash *formats* and
+  self-asserted booleans, so a hand-built production PASS over an empty consent blob validated). `Test-DvReceiptValid` returns
+  `{ valid; status; reasons }`, `status` being `VERIFIED` | `INCOMPLETE` (a piece of evidence is absent: never a PASS/FAIL) |
+  `INVALID` (a claim does not re-derive) | `NO_SIGNAL` (any outcome other than PASS/FAIL). `Write-DvReceipt` runs the **same**
+  validator before it writes a PASS/FAIL, and so does every reader (`New-VenueSheetPair.ps1`, and `Get-VenueEvidence` when
+  RECONCILE-1 builds it; a test pins that every in-tree caller passes `-RepoRoot`).
+  * *Admission, from git:* `admission.consentBlobSha` and `venueTableBlobSha` must be real **blobs** of the repo (`git cat-file
+    -t` says blob; a placeholder hash, a commit or a tree is refused) and be the files committed at `admission.headCommit`;
+    the table parses; the consent blob parses with `Read-DvClipConsent` and holds an owner record (`recordedBy: owner`, the
+    exact `CLIP <venue>: <clip>` line) **for this venue and clip id** whose line sha256 equals `admission.ownerLineSha256`;
+    the committed cleanup switch is on; `venue.role` is the table's. `git` runs with `GIT_DIR`, `GIT_WORK_TREE`,
+    `GIT_INDEX_FILE` and the object-store overrides scrubbed and `--no-replace-objects`, so the environment cannot point it at
+    another repo. A production receipt validated without `-RepoRoot` is `INCOMPLETE`, never VERIFIED.
+  * *The leg, from git:* `subject.legSpecSha256` must name a leg spec **committed under `tools/profiling/dual-venue/legs/`**
+    at `headCommit` (the runner refuses `LEG_SPEC_NOT_COMMITTED` up front in production), and PASS vs FAIL is re-derived
+    from that committed spec's criteria for the venue's role and backend over the evidence's verbatim metrics.
+  * *The run, from hashed files:* the receipt names its `evidence.localEvidenceDir` (only a hint: `-EvidenceDir` wins) and the
+    sha256 of each file there -- `summaryJsonSha256`, `evidenceManifestSha256`, `resultJsonSha256`, `logSha256`,
+    `umRunJsonSha256` (`um-run.json` records the job's exit code and RESULT token). The validator re-hashes every file (an
+    edited one is `INVALID`, an absent one `INCOMPLETE`), re-derives the whole `playback` block with the writer's own parser
+    (`Get-DvPlaybackEvidence`) and requires the receipt's copy to equal it, field by field -- `logShaBound` and
+    `settingsIsolated` are **derived, never read** -- and checks the evidence's own clip id, venue (`summary.display.venue`) and
+    build (`manifest.buildManifest.sha256`), the verbatim `metrics`, the `subject.digest`, and the job's exit code. The
+    manifest is optional only on a product-failure terminal (the job writes none); a capture without it is `INCOMPLETE`.
+  * *Honest limits:* (1) the evidence files are local; nothing signs them on the venue, so a forger who can both commit a
+    consent record **and** write a hash-consistent evidence directory can still build a receipt that verifies -- the control
+    on that is the hub's review of any consent commit and the evidence living only under `.claude-state`. (2) "Committed" is
+    any commit of the repo, not "reviewed master". (3) `subject.clipContentSha256` is bound only through the subject digest:
+    the job does not write it to any artifact, so it cannot be re-derived from the evidence. (4) A product-failure `FAIL`
+    has no manifest, so its build binding is the job's own `summary.json`. A hand-built receipt, a placeholder hash, a
+    self-asserted boolean, an empty consent blob, an uncommitted leg spec and missing evidence never verify.
 * Limit, stated plainly: a venue sitting is still the observation that a real run reaches its frames; nothing here plays
   the app, and no venue run has happened.
 
@@ -168,7 +200,9 @@ receipt, its evidence and a contact sheet name or show an owner clip's run and s
 
 Receipts land in `<main checkout>\.claude-state\dual-venue\receipts\<card>\<legId>\<venue>\<receiptId>.json`,
 append-only (created with `CreateNew`; a repeat is refused, never overwritten). Copied evidence
-(`summary.json`, the manifest, the contact sheet) is under `.claude-state\dual-venue\evidence\<receiptId>\`.
+(`summary.json`, `evidence-manifest.json`, the launcher's `result.json`, `logs\smoke-run.log`, `um-run.json` -- each sha256 named in
+the receipt -- and the contact sheet) is under `.claude-state\dual-venue\evidence\<receiptId>\`, which in production must sit under
+`.claude-state` too (the run log and result name an owner clip's run; they stay local like the receipt).
 
 ## How to read the evidence
 

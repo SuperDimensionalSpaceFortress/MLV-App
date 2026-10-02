@@ -12,8 +12,10 @@
 #
 # Round 2: every leg plays a CONSENTED OWNER CLIP (fixtures are never venue playback clips), so the sheet is a sheet
 # of OWNER footage. It stays LOCAL: -OutDir must sit under a `.claude-state` directory (gitignored; never committed,
-# PR-attached, bus-published or published as an artifact), and only a receipt that is itself valid evidence
-# (Test-DvReceiptValid: PASS/FAIL with the receipt oracle's >= 20 s verdict) can be paired.
+# PR-attached, bus-published or published as an artifact), and only a receipt that is itself valid evidence can be paired:
+# Test-DvReceiptValid -RepoRoot (DUAL-VENUE-EVIDENCE-2) re-derives its admission from the committed consent / venue-table / leg-spec
+# blobs and its run (>= 20 s of source frames, nonce, wrap, outcome) from the hashed evidence files; a receipt whose evidence is
+# absent is INCOMPLETE and cannot be paired. The raw frames are read from the verified evidence directory, never from a receipt path.
 [CmdletBinding()]
 param(
     [Parameter(Mandatory = $true)][string]$CudaReceipt,
@@ -32,12 +34,20 @@ $outFull = [IO.Path]::GetFullPath($OutDir)
 if (@($outFull.Split([char[]]@('\', '/')) | Where-Object { $_ -ceq '.claude-state' }).Count -eq 0) {
     throw 'PAIR_OWNER_SHEET_MUST_STAY_LOCAL -OutDir must be under a .claude-state directory; a sheet of owner footage is never committed, attached or published'
 }
+# The repo whose COMMITTED consent and venue table a receipt is verified against is the one this script lives in (never a caller's).
+$repoRoot = (Resolve-Path (Join-Path $PSScriptRoot '..\..\..')).Path
+$rawDirs = @{}
 foreach ($r in $cuda, $cpu) {
     if ($r.outcome -ne 'PASS' -and $r.outcome -ne 'FAIL') { throw "PAIR_RECEIPT_INCOMPLETE receipt $($r.receiptId) is $($r.outcome), not PASS/FAIL" }
-    $validity = Test-DvReceiptValid -Receipt $r
-    if (-not $validity.valid) { throw "PAIR_RECEIPT_INVALID receipt $($r.receiptId) is not valid evidence: $(@($validity.reasons) -join '; ')" }
-    if ($null -eq $r.look -or $null -eq $r.look.contactSheet -or -not $r.look.contactSheet.rawFramesDir) { throw "PAIR_NO_FRAMES receipt $($r.receiptId) carries no raw contact-sheet frames" }
+    # The evidence-bearing validator: the receipt's admission is re-derived from the committed blobs and its run from the hashed
+    # evidence files (a receipt whose evidence is absent is INCOMPLETE). Nothing the receipt says about itself is believed.
+    $validity = Test-DvReceiptValid -Receipt $r -RepoRoot $repoRoot
+    if (-not $validity.valid) { throw "PAIR_RECEIPT_$($validity.status) receipt $($r.receiptId) is not valid evidence: $(@($validity.reasons) -join '; ')" }
     if ([string]$r.subject.clipId -cnotmatch '^[A-Za-z]\d{2}-\d{3,4}$') { throw 'PAIR_NOT_A_CONSENTED_CLIP only a consented clip id (never a fixture or a path) can be paired into a sheet' }
+    # The frames are read from the verified evidence directory, never from a path the receipt asserts.
+    $raw = Join-Path ([string]$r.evidence.localEvidenceDir) 'contact-sheet\raw'
+    if (-not (Test-Path -LiteralPath $raw -PathType Container)) { throw "PAIR_NO_FRAMES receipt $($r.receiptId) has no raw contact-sheet frames in its evidence directory" }
+    $rawDirs[[string]$r.receiptId] = $raw
 }
 foreach ($f in 'buildManifestSha256', 'legSpecSha256', 'clipId', 'clipContentSha256', 'lookFlavor') {
     if ([string]$cuda.subject.$f -ne [string]$cpu.subject.$f) { throw "PAIR_SUBJECT_DIFFERS the receipts differ in subject.$f" }
@@ -49,7 +59,7 @@ New-Item -ItemType Directory -Force -Path $OutDir | Out-Null
 $sheet = Join-Path $OutDir "sheet-$venue-cuda-vs-cpu-$flavor.png"
 $stats = Join-Path $OutDir "sheet-$venue-cuda-vs-cpu-$flavor.stats.json"
 $composer = Join-Path $PSScriptRoot '..\make-contact-sheet.py'
-$pyArgs = @('-3', $composer, '--frames-dir', $cuda.look.contactSheet.rawFramesDir, '--pair-dir', $cpu.look.contactSheet.rawFramesDir,
+$pyArgs = @('-3', $composer, '--frames-dir', $rawDirs[[string]$cuda.receiptId], '--pair-dir', $rawDirs[[string]$cpu.receiptId],
     '--sheet-out', $sheet, '--stats-out', $stats, '--clip-id', [string]$cuda.subject.clipId,
     '--host', [string]$cuda.venue.hostName, '--gpu', (@($cuda.venue.gpuNames) -join ' / '), '--build-sha', ([string]$cuda.subject.buildManifestSha256).Substring(0, 12),
     '--left-label', 'cuda', '--right-label', 'cpu', '--cols', '1')

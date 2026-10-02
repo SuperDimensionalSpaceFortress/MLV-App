@@ -17,6 +17,16 @@
 # the nonce the real launcher mints (32 lowercase hex), with native fps / pace / override / the 20 s floor in the receipt;
 # (2) production admission reads the consent file and the venue table ONLY as committed at HEAD (Resolve-DvAdmissionSources),
 # each consent record carrying the owner's exact typed line, and the receipt records the blob ids it was admitted on.
+#
+# DUAL-VENUE-EVIDENCE-2 round 1 (sol r2 BLOCKER on PR #207: the validator believed a hand-built production PASS): a receipt is valid
+# ONLY when EVERY claim is re-derived from a COMMITTED blob or a HASHED artifact, and no self-asserted field is ever an input.
+# Test-DvReceiptValid -RepoRoot -EvidenceDir reads the consent / venue-table / leg-spec blobs from git (they must be real blobs, committed
+# at the commit the receipt names), re-hashes the run's evidence files (summary, manifest, launcher result, run log, um-run record) and
+# re-derives the playback block, the metrics and the PASS/FAIL outcome from them with the writer's own parser. Absent evidence is
+# INCOMPLETE. Write-DvReceipt runs the SAME validator, and so does every reader (New-VenueSheetPair.ps1).
+# HONEST LIMIT: this proves a receipt is consistent with committed consent and with the hashed files it names; it cannot prove the
+# files came from a venue run (they are local files; there is no venue-side signature), and "committed" is any commit of this repo,
+# not "reviewed master" (docs/dual-venue-evidence.md).
 
 Set-StrictMode -Version Latest
 
@@ -180,7 +190,11 @@ function Invoke-DvGit {
     param([Parameter(Mandatory)][string]$RepoRoot, [Parameter(Mandatory)][string[]]$GitArgs)
     $psi = [System.Diagnostics.ProcessStartInfo]::new('git')
     $psi.UseShellExecute = $false; $psi.RedirectStandardOutput = $true; $psi.RedirectStandardError = $true; $psi.CreateNoWindow = $true
-    foreach ($a in (@('-C', $RepoRoot) + $GitArgs)) { [void]$psi.ArgumentList.Add($a) }
+    # The repo is the one at $RepoRoot and nothing else: a GIT_DIR / GIT_WORK_TREE / GIT_INDEX_FILE / object-store override in the
+    # caller's environment would point git at a scratch repo whose "committed" files are whatever the caller wrote, and a replace
+    # ref would swap a blob for another one under the same id (--no-replace-objects).
+    foreach ($name in @($psi.Environment.Keys | Where-Object { $_ -match '^GIT_(DIR|WORK_TREE|INDEX_FILE|OBJECT_DIRECTORY|ALTERNATE_OBJECT_DIRECTORIES|COMMON_DIR|NAMESPACE|REPLACE_REF_BASE|NO_REPLACE_OBJECTS)$' })) { [void]$psi.Environment.Remove($name) }
+    foreach ($a in (@('--no-replace-objects', '-C', $RepoRoot) + $GitArgs)) { [void]$psi.ArgumentList.Add($a) }
     $proc = [System.Diagnostics.Process]::Start($psi)
     try {
         $errTask = $proc.StandardError.ReadToEndAsync()
@@ -220,6 +234,67 @@ function Get-DvCommittedFile {
     if ($text.Length -gt 0 -and $text[0] -eq [char]0xFEFF) { $text = $text.Substring(1) }
     [pscustomobject]@{ ok = $true; reason = $null; text = $text; blobSha = $blobSha; headSha = $headSha
                        lastCommit = $(if ($last.exitCode -eq 0) { ([Text.Encoding]::ASCII.GetString($last.bytes)).Trim() } else { $null }) }
+}
+
+function ConvertTo-DvText([byte[]]$Bytes) {
+    $text = [Text.UTF8Encoding]::new($false).GetString($Bytes)
+    if ($text.Length -gt 0 -and $text[0] -eq [char]0xFEFF) { $text = $text.Substring(1) }
+    $text
+}
+
+function Get-DvBlobById {
+    <#
+    .SYNOPSIS
+    The bytes of a git blob NAMED BY ITS ID in the repo at $RepoRoot (git cat-file -t must say blob, then git cat-file blob).
+    A receipt's consentBlobSha / venueTableBlobSha are resolved here, so an id that is not a real blob of this repo (a placeholder
+    hash, a commit, a tree, a blob that was never committed) is refused. Returns [pscustomobject]@{ ok; reason; bytes; text }.
+    #>
+    param([Parameter(Mandatory)][string]$RepoRoot, [Parameter(Mandatory)][AllowEmptyString()][string]$BlobSha)
+    $bad = { param($why) [pscustomobject]@{ ok = $false; reason = $why; bytes = $null; text = $null } }
+    if ($BlobSha -cnotmatch '^[0-9a-f]{40}$') { return (& $bad 'not a 40-hex git object id') }
+    $type = Invoke-DvGit -RepoRoot $RepoRoot -GitArgs @('cat-file', '-t', $BlobSha)
+    if ($type.exitCode -ne 0 -or ([Text.Encoding]::ASCII.GetString($type.bytes)).Trim() -cne 'blob') { return (& $bad 'not a blob of this repository') }
+    $content = Invoke-DvGit -RepoRoot $RepoRoot -GitArgs @('cat-file', 'blob', $BlobSha)
+    if ($content.exitCode -ne 0) { return (& $bad 'the blob could not be read') }
+    [pscustomobject]@{ ok = $true; reason = $null; bytes = $content.bytes; text = (ConvertTo-DvText $content.bytes) }
+}
+
+function Get-DvBlobIdAtCommit {
+    # `git rev-parse <commit>:<path>` -> the blob id, or $null when $Commit is not a commit of this repo or the path is not in it.
+    param([Parameter(Mandatory)][string]$RepoRoot, [Parameter(Mandatory)][string]$Commit, [Parameter(Mandatory)][string]$RelativePath)
+    if ($Commit -cnotmatch '^[0-9a-f]{40}$') { return $null }
+    $kind = Invoke-DvGit -RepoRoot $RepoRoot -GitArgs @('cat-file', '-t', $Commit)
+    if ($kind.exitCode -ne 0 -or ([Text.Encoding]::ASCII.GetString($kind.bytes)).Trim() -cne 'commit') { return $null }
+    $r = Invoke-DvGit -RepoRoot $RepoRoot -GitArgs @('rev-parse', '--verify', "${Commit}:$RelativePath")
+    if ($r.exitCode -ne 0) { return $null }
+    $id = ([Text.Encoding]::ASCII.GetString($r.bytes)).Trim()
+    if ($id -cmatch '^[0-9a-f]{40}$') { $id } else { $null }
+}
+
+$script:LegsRelativeDir = 'tools/profiling/dual-venue/legs'
+
+function Find-DvCommittedLegSpec {
+    <#
+    .SYNOPSIS
+    The leg spec a receipt names, FOUND IN THE COMMITTED TREE: the blob under tools/profiling/dual-venue/legs/ at $Commit whose
+    bytes hash (sha256) to $LegSpecSha256. A spec nobody committed (a hand-written criteria list that always passes) is never found.
+    Returns [pscustomobject]@{ ok; relativePath; blobSha; text }.
+    #>
+    param([Parameter(Mandatory)][string]$RepoRoot, [Parameter(Mandatory)][AllowEmptyString()][string]$Commit, [Parameter(Mandatory)][AllowEmptyString()][string]$LegSpecSha256)
+    $none = [pscustomobject]@{ ok = $false; relativePath = $null; blobSha = $null; text = $null }
+    if ($Commit -cnotmatch '^[0-9a-f]{40}$' -or $LegSpecSha256 -cnotmatch '^[0-9a-f]{64}$') { return $none }
+    $tree = Invoke-DvGit -RepoRoot $RepoRoot -GitArgs @('ls-tree', '-r', '--name-only', $Commit, '--', $script:LegsRelativeDir)
+    if ($tree.exitCode -ne 0) { return $none }
+    foreach ($rel in ([Text.Encoding]::UTF8.GetString($tree.bytes) -split "`n" | Where-Object { $_.Trim() -ne '' -and $_.Trim().EndsWith('.json') })) {
+        $path = $rel.Trim()
+        $id = Get-DvBlobIdAtCommit -RepoRoot $RepoRoot -Commit $Commit -RelativePath $path
+        if ($null -eq $id) { continue }
+        $blob = Get-DvBlobById -RepoRoot $RepoRoot -BlobSha $id
+        if ($blob.ok -and (Get-DvSha256OfBytes $blob.bytes) -ceq $LegSpecSha256) {
+            return [pscustomobject]@{ ok = $true; relativePath = $path; blobSha = $id; text = $blob.text }
+        }
+    }
+    $none
 }
 
 function Resolve-DvAdmissionSources {
@@ -528,41 +603,292 @@ function Get-DvPlaybackEvidence {
     $pb
 }
 
+# --- the evidence a receipt is RE-DERIVED from (DUAL-VENUE-EVIDENCE-2 round 1) -----------------------------------------
+# CLASS: a receipt is valid ONLY when every claim in it is re-derived from a COMMITTED blob or a HASHED artifact; no field the
+# receipt asserts about itself is ever an input. The receipt names its evidence directory and the sha256 of each file in it; the
+# validator re-hashes the files and re-parses them with the SAME parser the writer used, so a hand-built receipt, a placeholder
+# hash, a self-asserted boolean, an empty consent blob or a missing artifact cannot become a PASS/FAIL.
+# claim field in receipt.evidence -> file under the local evidence directory
+$script:EvidenceFileMap = [ordered]@{
+    summaryJsonSha256 = 'summary.json'
+    evidenceManifestSha256 = 'evidence-manifest.json'
+    resultJsonSha256 = 'result.json'
+    logSha256 = 'logs\smoke-run.log'
+    umRunJsonSha256 = 'um-run.json'
+}
+$script:UmRunSchema = 'mlv-app/dual-venue-um-run/v1'
+# The receipt's playback block fields that must equal what is re-derived from the files (a stored valid / invalidReasons is not one).
+$script:PlaybackComparedFields = @('sourceAdvanced', 'requiredSourceFrames', 'nativeFps', 'paceFps', 'fpsOverride', 'wrapped', 'wrapCount',
+    'expectedRunNonce', 'observedRunNonce', 'manifestRunNonce', 'logSha256', 'logShaBound', 'settingsIsolated', 'fixtureRehearsal', 'clipId')
+
+function Test-DvNumber($Value) {
+    ($Value -is [int] -or $Value -is [long] -or $Value -is [double] -or $Value -is [decimal] -or $Value -is [single] -or $Value -is [int16] -or $Value -is [byte] -or $Value -is [uint32] -or $Value -is [uint64])
+}
+
+function Get-DvKeys($Object) {
+    if ($Object -is [System.Collections.IDictionary]) { return @($Object.Keys | ForEach-Object { [string]$_ }) }
+    @($Object.PSObject.Properties | ForEach-Object { $_.Name })
+}
+
+function Test-DvJsonEquivalent {
+    # Structural equality of two parsed-JSON values: numbers compare as doubles (a JSON round trip may turn 900.0 into 900), strings
+    # case-sensitively, objects by key set and member, arrays by order. $null equals only $null.
+    param($A, $B)
+    if ($null -eq $A -or $null -eq $B) { return ($null -eq $A -and $null -eq $B) }
+    if (Test-DvNumber $A) { return ((Test-DvNumber $B) -and ([double]$A -eq [double]$B)) }
+    if ($A -is [bool]) { return (($B -is [bool]) -and $A -eq $B) }
+    if ($A -is [string]) { return (($B -is [string]) -and $A -ceq $B) }
+    $aMap = ($A -is [System.Collections.IDictionary]) -or ($A -is [System.Management.Automation.PSCustomObject])
+    $bMap = ($B -is [System.Collections.IDictionary]) -or ($B -is [System.Management.Automation.PSCustomObject])
+    if ($aMap -or $bMap) {
+        if (-not ($aMap -and $bMap)) { return $false }
+        $ak = @(Get-DvKeys $A | Sort-Object -CaseSensitive); $bk = @(Get-DvKeys $B | Sort-Object -CaseSensitive)
+        if ($ak.Count -ne $bk.Count) { return $false }
+        for ($i = 0; $i -lt $ak.Count; $i++) { if ($ak[$i] -cne $bk[$i]) { return $false } }
+        foreach ($k in $ak) { if (-not (Test-DvJsonEquivalent (Get-DvProp $A $k) (Get-DvProp $B $k))) { return $false } }
+        return $true
+    }
+    if ($A -is [System.Collections.IEnumerable]) {
+        if ($B -isnot [System.Collections.IEnumerable] -or $B -is [string]) { return $false }
+        $al = @($A); $bl = @($B)
+        if ($al.Count -ne $bl.Count) { return $false }
+        for ($i = 0; $i -lt $al.Count; $i++) { if (-not (Test-DvJsonEquivalent $al[$i] $bl[$i])) { return $false } }
+        return $true
+    }
+    ([string]$A) -ceq ([string]$B)
+}
+
+function Read-DvEvidenceSet {
+    <#
+    .SYNOPSIS
+    Re-read the hashed evidence a receipt names. $EvidenceDir (the caller's) wins over the receipt's own evidence.localEvidenceDir; either
+    way the directory is only WHERE to look: every file's sha256 must equal the one the receipt claims, so a swapped file is caught
+    and a directory without the files is INCOMPLETE. Returns [pscustomobject]@{ complete; summary; manifest; result; umRun; logText; logSha;
+    dir; incomplete; invalid } where `complete` means all five files were present, matched their claimed hash and parsed.
+    #>
+    param([Parameter(Mandatory)]$Receipt, [string]$EvidenceDir = '')
+    $incomplete = [System.Collections.Generic.List[string]]::new()
+    $invalid = [System.Collections.Generic.List[string]]::new()
+    $evidence = Get-DvProp $Receipt 'evidence'
+    $dir = $EvidenceDir
+    if ([string]::IsNullOrWhiteSpace($dir)) { $dir = [string](Get-DvProp $evidence 'localEvidenceDir') }
+    $res = [ordered]@{ complete = $false; summary = $null; manifest = $null; result = $null; umRun = $null; logText = $null; logSha = $null; dir = $dir; incomplete = @(); invalid = @() }
+    if ([string]::IsNullOrWhiteSpace($dir)) {
+        $incomplete.Add('EVIDENCE_ABSENT: the receipt names no local evidence directory (evidence.localEvidenceDir) and none was given; nothing can be re-derived')
+    } elseif (-not (Test-Path -LiteralPath $dir -PathType Container)) {
+        $incomplete.Add('EVIDENCE_ABSENT: the local evidence directory the receipt names is not present')
+    } else {
+        $bytes = @{}
+        foreach ($claimKey in $script:EvidenceFileMap.Keys) {
+            $rel = $script:EvidenceFileMap[$claimKey]
+            $claim = [string](Get-DvProp $evidence $claimKey)
+            # The job writes no evidence manifest on a product-failure terminal (GPU_RECON_FRAMES_ZERO, ...): the manifest is optional here and
+            # REQUIRED by Test-DvReceiptValid whenever the job's result is a capture. A claim that IS made must still match its file.
+            if ($claimKey -ceq 'evidenceManifestSha256' -and [string]::IsNullOrEmpty($claim)) { continue }
+            if ($claim -cnotmatch '^[0-9a-f]{64}$') { $incomplete.Add("EVIDENCE_ABSENT: evidence.$claimKey is absent or not 64 lowercase hex"); continue }
+            $file = Join-Path $dir $rel
+            if (-not (Test-Path -LiteralPath $file -PathType Leaf)) { $incomplete.Add("EVIDENCE_ABSENT: $($rel -replace '\\', '/') is not in the evidence directory"); continue }
+            $b = [IO.File]::ReadAllBytes($file)
+            if ((Get-DvSha256OfBytes $b) -cne $claim) { $invalid.Add("EVIDENCE_HASH_MISMATCH: $($rel -replace '\\', '/') does not hash to the sha256 the receipt claims"); continue }
+            $bytes[$claimKey] = $b
+        }
+        if ($incomplete.Count -eq 0 -and $invalid.Count -eq 0) {
+            $parsed = @{}
+            foreach ($pair in @(@('summaryJsonSha256', 'summary'), @('evidenceManifestSha256', 'manifest'), @('resultJsonSha256', 'result'), @('umRunJsonSha256', 'umRun'))) {
+                if (-not $bytes.ContainsKey($pair[0])) { continue }
+                try { $parsed[$pair[1]] = (ConvertTo-DvText $bytes[$pair[0]]) | ConvertFrom-Json -ErrorAction Stop }
+                catch { $invalid.Add("EVIDENCE_UNPARSABLE: $($script:EvidenceFileMap[$pair[0]]) is not valid JSON") }
+            }
+            if ($invalid.Count -eq 0) {
+                $res.summary = $parsed['summary']; $res.result = $parsed['result']; $res.umRun = $parsed['umRun']
+                $res.manifest = $(if ($parsed.ContainsKey('manifest')) { $parsed['manifest'] } else { $null })
+                $res.logText = [Text.Encoding]::UTF8.GetString($bytes['logSha256'])
+                $res.logSha = (Get-DvSha256OfBytes $bytes['logSha256'])
+                $res.complete = $true
+            }
+        }
+    }
+    $res.incomplete = $incomplete.ToArray(); $res.invalid = $invalid.ToArray()
+    [pscustomobject]$res
+}
+
 function Test-DvReceiptValid {
     <#
     .SYNOPSIS
-    Is this receipt a well-formed signal? A receipt that says PASS or FAIL must carry the clip id, the clip's content
-    hash, a um-run RECEIPT, the receipt oracle's verdict (source_advanced, required_source_frames, native fps and pace, the
-    expected and observed run nonce, wrap, clip) re-derivable from its own fields, and the admission it was admitted on
-    (production mode, the committed consent-file and venue-table blob ids, the owner line's sha256); without them it is
-    INVALID, not PASS/FAIL. A receipt written in offline test mode is never evidence (unless -AllowOfflineTestMode, which only
-    the test harness passes). Every other outcome carries no signal and needs no proof. Readers (Get-VenueEvidence) call
-    this too; the verdict is re-derived from the fields, never from a stored flag.
+    Is this receipt valid EVIDENCE? Every claim a PASS/FAIL receipt makes is RE-DERIVED from a committed blob or a hashed artifact; no
+    field the receipt asserts about itself is an input. Returns [pscustomobject]@{ valid; status; reasons } where status is
+    VERIFIED (valid PASS/FAIL), NO_SIGNAL (any other outcome: carries no signal, needs no proof), INCOMPLETE (a piece of
+    evidence is absent: not valid, never a PASS/FAIL) or INVALID (a claim does not re-derive).
+
+    PRODUCTION admission (admission.mode = production; -RepoRoot required):
+      * admission.consentBlobSha / venueTableBlobSha must be real BLOBS of the repo ($RepoRoot) and be the files committed at
+        admission.headCommit; the venue table parses; the consent blob parses with Read-DvClipConsent and holds a record for THIS
+        venue + clip id whose line sha256 equals admission.ownerLineSha256 and whose recordedBy is 'owner'; the committed
+        cleanup switch is on; the venue's role is the table's;
+      * the leg spec named by subject.legSpecSha256 is a blob COMMITTED under tools/profiling/dual-venue/legs/ at headCommit, and
+        the outcome (PASS vs FAIL) is re-derived from the evidence's job result, exit code, verbatim metrics and that spec's criteria.
+    EVIDENCE (every mode that can be evidence): evidence.summaryJsonSha256 / evidenceManifestSha256 / resultJsonSha256 / logSha256 /
+    umRunJsonSha256 are re-hashed from the local evidence directory (-EvidenceDir, else evidence.localEvidenceDir); the whole playback block
+    (source frames, native / pace fps, override, wrap, nonce expected / observed / manifest, log binding, settings isolation, clip,
+    rehearsal) is re-derived from those files by Get-DvPlaybackEvidence -- the writer's own parser -- and the receipt's copy must equal it;
+    the verbatim metrics must equal summary.json's; the evidence's own clip id, venue and build must be the receipt's.
+    A receipt written in offline test mode is never evidence (OFFLINE_TEST_RECEIPT) unless -AllowOfflineTestMode, which only the
+    writer's own offline test path and the test harness pass; that mode still re-derives the evidence but has no committed consent to read.
     #>
-    param([Parameter(Mandatory)]$Receipt, [switch]$AllowOfflineTestMode)
-    $reasons = [System.Collections.Generic.List[string]]::new()
+    param([Parameter(Mandatory)]$Receipt, [string]$RepoRoot = '', [string]$EvidenceDir = '', [switch]$AllowOfflineTestMode)
+    $incomplete = [System.Collections.Generic.List[string]]::new()
+    $invalid = [System.Collections.Generic.List[string]]::new()
     $outcome = [string](Get-DvProp $Receipt 'outcome')
-    if ($outcome -in @('PASS', 'FAIL')) {
-        $subject = Get-DvProp $Receipt 'subject'
-        $clipId = [string](Get-DvProp $subject 'clipId')
-        if ([string]::IsNullOrWhiteSpace($clipId)) { $reasons.Add('subject.clipId absent') }
-        if ([string](Get-DvProp $subject 'clipContentSha256') -cnotmatch '^[0-9a-f]{64}$') { $reasons.Add('subject.clipContentSha256 absent or not 64 lowercase hex') }
-        if ([string](Get-DvProp (Get-DvProp $Receipt 'evidence') 'umRunOutcome') -ne 'RECEIPT') { $reasons.Add('evidence.umRunOutcome is not RECEIPT') }
-        $admission = Get-DvProp $Receipt 'admission'
-        $mode = [string](Get-DvProp $admission 'mode')
-        if ($mode -ceq 'production') {
-            foreach ($k in 'consentBlobSha', 'venueTableBlobSha') {
-                if ([string](Get-DvProp $admission $k) -cnotmatch '^[0-9a-f]{40}$') { $reasons.Add("ADMISSION_UNPROVEN: admission.$k is not the git blob id of the committed file") }
+    # Case-sensitive on purpose: 'pass' / 'PASS ' is not an outcome the writer can produce, so it is neither a signal nor "no signal".
+    if ($outcome -cnotin $script:OutcomeEnum) { return [pscustomobject]@{ valid = $false; status = 'INVALID'; reasons = @('OUTCOME_UNKNOWN: the receipt outcome is not one of the typed outcomes') } }
+    if ($outcome -cnotin @('PASS', 'FAIL')) { return [pscustomobject]@{ valid = $true; status = 'NO_SIGNAL'; reasons = @() } }
+
+    $subject = Get-DvProp $Receipt 'subject'
+    $clipId = [string](Get-DvProp $subject 'clipId')
+    $venueName = [string](Get-DvProp (Get-DvProp $Receipt 'venue') 'name')
+    $card = [string](Get-DvProp $Receipt 'card')
+    $legId = [string](Get-DvProp $Receipt 'legId')
+    $backend = [string](Get-DvProp $subject 'backend')
+    if ([string]::IsNullOrWhiteSpace($clipId)) { $invalid.Add('subject.clipId absent') }
+    elseif ($clipId -cnotmatch $script:ClipIdPattern) { $invalid.Add('subject.clipId is not a consented clip id') }
+    if ([string](Get-DvProp $subject 'clipContentSha256') -cnotmatch '^[0-9a-f]{64}$') { $invalid.Add('subject.clipContentSha256 absent or not 64 lowercase hex') }
+    if ([string]::IsNullOrWhiteSpace($venueName)) { $invalid.Add('venue.name absent') }
+    $digest = Get-DvSubjectDigest -BuildManifestSha256 (Get-DvProp $subject 'buildManifestSha256') -LegSpecSha256 (Get-DvProp $subject 'legSpecSha256') -ClipId (Get-DvProp $subject 'clipId') `
+        -ClipContentSha256 (Get-DvProp $subject 'clipContentSha256') -Backend (Get-DvProp $subject 'backend') -LookFlavor (Get-DvProp $subject 'lookFlavor')
+    if ([string](Get-DvProp $subject 'digest') -cne $digest) { $invalid.Add('SUBJECT_DIGEST_MISMATCH: subject.digest is not the sha256 of the subject fields it carries') }
+
+    # ---- admission: re-derived from COMMITTED blobs ----------------------------------------------------------------------------
+    $admission = Get-DvProp $Receipt 'admission'
+    $mode = [string](Get-DvProp $admission 'mode')
+    $table = $null; $spec = $null; $production = $false
+    if ($mode -ceq 'production') {
+        $production = $true
+        $consentSha = [string](Get-DvProp $admission 'consentBlobSha'); $tableSha = [string](Get-DvProp $admission 'venueTableBlobSha')
+        $headCommit = [string](Get-DvProp $admission 'headCommit'); $lineSha = [string](Get-DvProp $admission 'ownerLineSha256')
+        $formatOk = $true
+        foreach ($pair in @(@('consentBlobSha', $consentSha, '^[0-9a-f]{40}$'), @('venueTableBlobSha', $tableSha, '^[0-9a-f]{40}$'), @('headCommit', $headCommit, '^[0-9a-f]{40}$'), @('ownerLineSha256', $lineSha, '^[0-9a-f]{64}$'))) {
+            if ($pair[1] -cnotmatch $pair[2]) { $invalid.Add("ADMISSION_UNPROVEN: admission.$($pair[0]) is absent or malformed"); $formatOk = $false }
+        }
+        if ($formatOk -and [string]::IsNullOrWhiteSpace($RepoRoot)) {
+            $incomplete.Add('ADMISSION_UNVERIFIABLE: no -RepoRoot was given, so the consent and venue-table blobs cannot be read; a production receipt is not verified by its hash formats')
+        } elseif ($formatOk) {
+            $tb = Get-DvBlobById -RepoRoot $RepoRoot -BlobSha $tableSha
+            if (-not $tb.ok) { $invalid.Add("ADMISSION_UNPROVEN: admission.venueTableBlobSha is $($tb.reason)") }
+            else { try { $table = ConvertFrom-DvVenueTableText $tb.text } catch { $invalid.Add('ADMISSION_UNPROVEN: the committed venue-table blob does not parse') } }
+            $cb = Get-DvBlobById -RepoRoot $RepoRoot -BlobSha $consentSha
+            if (-not $cb.ok) { $invalid.Add("ADMISSION_UNPROVEN: admission.consentBlobSha is $($cb.reason)") }
+            elseif ($null -ne $table) {
+                $consent = Read-DvClipConsent -Text $cb.text -Table $table
+                if (-not $consent.ok) { $invalid.Add("ADMISSION_UNPROVEN: the committed consent blob is not a valid consent file ($($consent.reason))") }
+                else {
+                    $ownRecords = @($consent.records | Where-Object { [string]$_.venue -ceq $venueName -and [string]$_.clipId -ceq $clipId })
+                    if ($ownRecords.Count -eq 0) { $invalid.Add('CONSENT_NOT_IN_BLOB: the committed consent blob holds no owner record for this venue and clip id') }
+                    else {
+                        $record = $ownRecords[0]
+                        if ([string]$record.ownerLineSha256 -cne $lineSha) { $invalid.Add('CONSENT_LINE_MISMATCH: admission.ownerLineSha256 is not the line sha256 of the committed consent record for this venue and clip id') }
+                        if ([string]$record.recordedBy -cne 'owner') { $invalid.Add("CONSENT_NOT_OWNER: the committed consent record is not recordedBy 'owner'") }
+                    }
+                }
             }
-            if ([string](Get-DvProp $admission 'ownerLineSha256') -cnotmatch '^[0-9a-f]{64}$') { $reasons.Add('ADMISSION_UNPROVEN: admission.ownerLineSha256 is absent') }
+            if ($null -ne $table) {
+                if ($null -eq $table.venues.PSObject.Properties[$venueName]) { $invalid.Add('ADMISSION_UNPROVEN: the committed venue table has no entry for this venue') }
+                $gone = ($null -ne $table.PSObject.Properties['ownerFootage']) -and ((Get-DvProp $table.ownerFootage 'cleanupClassGone') -eq $true)
+                if (-not $gone) { $invalid.Add('ADMISSION_UNPROVEN: the committed venue table has the owner-footage cleanup switch off (ownerFootage.cleanupClassGone), so no owner clip could be admitted') }
+                try {
+                    if ((Get-DvVenueRole -Table $table -Card $card -Venue $venueName) -cne [string](Get-DvProp (Get-DvProp $Receipt 'venue') 'role')) { $invalid.Add('ROLE_MISMATCH: venue.role is not the role the committed venue table gives this venue for this card') }
+                } catch { $invalid.Add('ROLE_MISMATCH: the committed venue table gives no valid role for this card') }
+            }
+            # the blobs are the ones committed at the commit the receipt names (a consent blob nobody ever committed is not consent)
+            foreach ($pair in @(@('venue-table', $script:VenueTableRelativePath, $tableSha), @('consent', $script:ConsentRelativePath, $consentSha))) {
+                $at = Get-DvBlobIdAtCommit -RepoRoot $RepoRoot -Commit $headCommit -RelativePath $pair[1]
+                if ($null -eq $at) { $invalid.Add("ADMISSION_UNPROVEN: admission.headCommit is not a commit of this repository that holds the $($pair[0]) file") }
+                elseif ($at -cne $pair[2]) { $invalid.Add("ADMISSION_UNPROVEN: the $($pair[0]) blob in the receipt is not the one committed at admission.headCommit") }
+            }
+            # the leg spec (criteria) is a committed blob too
+            $leg = Find-DvCommittedLegSpec -RepoRoot $RepoRoot -Commit $headCommit -LegSpecSha256 ([string](Get-DvProp $subject 'legSpecSha256'))
+            if (-not $leg.ok) { $invalid.Add('LEG_SPEC_NOT_COMMITTED: subject.legSpecSha256 is not a leg spec committed under tools/profiling/dual-venue/legs/ at admission.headCommit') }
+            else {
+                try { $spec = $leg.text | ConvertFrom-Json -ErrorAction Stop } catch { $invalid.Add('LEG_SPEC_NOT_COMMITTED: the committed leg spec does not parse') }
+                if ($null -ne $spec) {
+                    if ([string](Get-DvProp $spec 'legId') -cne $legId -or [string](Get-DvProp $spec 'card') -cne $card -or [string](Get-DvProp $spec 'clipId') -cne $clipId) { $invalid.Add('LEG_SPEC_MISMATCH: the committed leg spec is for another card, leg or clip than the receipt names') }
+                    $specBackends = @()
+                    if ($null -ne $spec.PSObject.Properties['backends']) { $specBackends = @($spec.backends | ForEach-Object { [string]$_ }) }
+                    if ($backend -cnotin $specBackends) { $invalid.Add('LEG_SPEC_MISMATCH: the receipt backend is not one of the committed leg spec backends') }
+                }
+            }
         }
-        elseif ($mode -ceq 'offline-test') {
-            if (-not $AllowOfflineTestMode) { $reasons.Add('OFFLINE_TEST_RECEIPT: a receipt written in offline test mode (caller-supplied consent / venue table / um-run) is never evidence') }
-        }
-        else { $reasons.Add('ADMISSION_UNPROVEN: the receipt records no admission (mode, consent and venue-table blob ids)') }
-        foreach ($p in @(Get-DvPlaybackProblems -Playback (Get-DvProp $Receipt 'playback') -ExpectedClipId $clipId)) { $reasons.Add($p) }
     }
-    [pscustomobject]@{ valid = ($reasons.Count -eq 0); reasons = $reasons.ToArray() }
+    elseif ($mode -ceq 'offline-test') {
+        if (-not $AllowOfflineTestMode) { $invalid.Add('OFFLINE_TEST_RECEIPT: a receipt written in offline test mode (caller-supplied consent / venue table / um-run) is never evidence') }
+    }
+    else { $invalid.Add('ADMISSION_UNPROVEN: the receipt records no admission (mode, consent and venue-table blob ids)') }
+
+    # ---- the run: re-derived from HASHED files ---------------------------------------------------------------------------------
+    $ev = Read-DvEvidenceSet -Receipt $Receipt -EvidenceDir $EvidenceDir
+    foreach ($m in $ev.incomplete) { $incomplete.Add($m) }
+    foreach ($m in $ev.invalid) { $invalid.Add($m) }
+    if ($ev.complete) {
+        $derived = Get-DvPlaybackEvidence -Summary $ev.summary -EvidenceManifest $ev.manifest -ResultJson $ev.result -LogText $ev.logText -LogSha256 $ev.logSha -ExpectedClipId $clipId
+        $stored = Get-DvProp $Receipt 'playback'
+        if ($null -eq $stored) { $incomplete.Add('RECEIPT_FIELD_ABSENT: the receipt carries no playback block (the source-frame verdict)') }
+        else {
+            foreach ($f in $script:PlaybackComparedFields) {
+                if (-not (Test-DvJsonEquivalent (Get-DvProp $stored $f) (Get-DvProp $derived $f))) { $invalid.Add("PLAYBACK_NOT_FROM_EVIDENCE: playback.$f is not what the hashed run log and result re-derive") }
+            }
+        }
+        foreach ($p in @($derived.invalidReasons)) { if ($null -ne $p -and [string]$p -ne '') { $invalid.Add([string]$p) } }
+        # the evidence's own identity: the clip, the venue and the build the receipt says it is about
+        $jobVenue = [string](Get-DvProp (Get-DvProp $ev.summary 'display') 'venue')
+        if ([string]::IsNullOrWhiteSpace($jobVenue)) { $incomplete.Add('EVIDENCE_ABSENT: summary.json carries no display.venue') }
+        elseif ($jobVenue -cne $venueName) { $invalid.Add('VENUE_MISMATCH: the job''s own summary names a different venue than the receipt') }
+        if ($null -ne $ev.manifest) {
+            $manClip = [string](Get-DvProp $ev.manifest 'clipId')
+            if ([string]::IsNullOrWhiteSpace($manClip)) { $incomplete.Add('EVIDENCE_ABSENT: evidence-manifest.json carries no clipId') }
+            elseif ($manClip -cne $clipId) { $invalid.Add('CLIP_MISMATCH: the evidence manifest names a different clip id than the receipt') }
+            $manBuild = [string](Get-DvProp (Get-DvProp $ev.manifest 'buildManifest') 'sha256')
+            if ([string]::IsNullOrWhiteSpace($manBuild)) { $incomplete.Add('EVIDENCE_ABSENT: evidence-manifest.json carries no buildManifest.sha256') }
+            elseif ($manBuild.ToLowerInvariant() -cne [string](Get-DvProp $subject 'buildManifestSha256')) { $invalid.Add('BUILD_MISMATCH: the evidence manifest binds a different build manifest than the receipt subject') }
+        }
+        $metrics = Get-DvVerbatimMetrics -Summary $ev.summary -EvidenceManifest $ev.manifest
+        if (-not (Test-DvJsonEquivalent (Get-DvProp $Receipt 'metrics') $metrics)) { $invalid.Add('METRICS_NOT_FROM_EVIDENCE: the receipt metrics are not the verbatim metrics of the hashed summary.json / manifest') }
+        if ([string](Get-DvProp $ev.umRun 'schema') -cne $script:UmRunSchema) { $invalid.Add('EVIDENCE_UNPARSABLE: um-run.json is not a dual-venue um-run record') }
+        $exit = ConvertTo-DvInt64 (Get-DvProp $ev.umRun 'exitCode')
+        if ($null -eq $exit) { $invalid.Add('EVIDENCE_UNPARSABLE: um-run.json carries no integer exitCode') }
+
+        # ---- the OUTCOME: re-derived from the job's result, its exit code, the verbatim metrics and the COMMITTED criteria -----------
+        $resolved = $null
+        if ($null -ne $exit) {
+            $resolved = Resolve-DvJobOutcome -ResultToken ([string](Get-DvProp $ev.umRun 'resultToken')) -ExitCode ([int]$exit) -SmokeRefusalReason ([string](Get-DvProp $ev.summary 'smokeRefusalReason'))
+            if ($resolved.outcome -eq 'CAPTURED') {
+                if ($null -eq $ev.manifest) { $incomplete.Add('EVIDENCE_ABSENT: the job captured but evidence-manifest.json (evidence.evidenceManifestSha256) is not in the evidence') }
+                if ($exit -ne 0) { $invalid.Add('OUTCOME_NOT_DERIVABLE: the job printed a capture but exited non-zero; a capture that disagrees with its own exit code is not evidence') }
+                elseif (-not $derived.jobOracleBlockPresent) { $invalid.Add('RECEIPT_FIELD_ABSENT: the captured job''s summary.json carries no sourceFrames block (its own oracle did not run)') }
+            }
+            elseif ($resolved.outcome -ne 'FAIL') { $invalid.Add("OUTCOME_NOT_DERIVABLE: the job's result derives $($resolved.outcome), which is not a PASS/FAIL signal") }
+        }
+        if ($production -and $null -ne $spec -and $null -ne $resolved -and $invalid.Count -eq 0) {
+            $expected = $resolved.outcome
+            if ($expected -eq 'CAPTURED') {
+                $role = [string](Get-DvProp (Get-DvProp $Receipt 'venue') 'role')
+                $criteria = Get-DvProp (Get-DvProp (Get-DvProp $spec 'criteria') $role) $backend
+                $verdict = Test-DvCriteria -Criteria $criteria -Metrics $metrics
+                $sheetOk = $true
+                if ([string](Get-DvProp $spec 'legType') -ceq 'look') {
+                    $sheet = Join-Path $ev.dir 'contact-sheet\sheet.png'
+                    $claimed = [string](Get-DvProp (Get-DvProp (Get-DvProp $Receipt 'look') 'contactSheet') 'sha256')
+                    if (-not ((Test-Path -LiteralPath $sheet -PathType Leaf) -and (Get-DvSha256OfFile $sheet) -ceq $claimed)) { $sheetOk = $false }
+                }
+                $expected = $(if (-not $sheetOk) { 'FAIL' } elseif ($verdict.pass) { 'PASS' } else { 'FAIL' })
+            }
+            if ($expected -cne $outcome) { $invalid.Add("OUTCOME_NOT_DERIVED: the evidence and the committed criteria derive $expected but the receipt says $outcome") }
+        }
+    }
+
+    $reasons = @($invalid.ToArray()) + @($incomplete.ToArray())
+    # An offline-test receipt can only be valid with -AllowOfflineTestMode (the writer's offline path and the test harness): it is never
+    # reported as VERIFIED, so nothing that checks `status -eq 'VERIFIED'` can ever take a stub-run receipt for evidence.
+    $status = $(if ($invalid.Count -gt 0) { 'INVALID' } elseif ($incomplete.Count -gt 0) { 'INCOMPLETE' } elseif ($mode -ceq 'offline-test') { 'VERIFIED_OFFLINE_TEST' } else { 'VERIFIED' })
+    [pscustomobject]@{ valid = ($status -in @('VERIFIED', 'VERIFIED_OFFLINE_TEST')); status = $status; reasons = $reasons }
 }
 
 # --- health (P5) ----------------------------------------------------------------------------------
@@ -779,7 +1105,11 @@ function New-DvReceipt {
         health = [ordered]@{ outcome = $null; pwshColdStartMs = $null; smallHashMs = $null; freeDiskGiB = $null; commitUsedGiB = $null; commitLimitGiB = $null }
         outcome = $null
         outcomeDetail = $null
-        evidence = [ordered]@{ summaryJsonSha256 = $null; evidenceManifestSha256 = $null; artifactIndexPath = $null; umRunOutcome = $null }
+        # Round 1 of DUAL-VENUE-EVIDENCE-2: the receipt names its local evidence directory and the sha256 of EACH file in it
+        # (summary.json, evidence-manifest.json, result.json, logs/smoke-run.log, um-run.json); Test-DvReceiptValid re-hashes them and
+        # re-derives the playback block and the outcome from them. A receipt whose evidence is absent is INCOMPLETE, never PASS/FAIL.
+        evidence = [ordered]@{ summaryJsonSha256 = $null; evidenceManifestSha256 = $null; resultJsonSha256 = $null; logSha256 = $null; umRunJsonSha256 = $null
+                               localEvidenceDir = $null; artifactIndexPath = $null; umRunOutcome = $null }
         metrics = $null
         # Round 2: the receipt oracle's verdict (source_advanced / required_source_frames / run nonce / wrap / clip id).
         # A receipt that says PASS or FAIL without a valid one is INVALID (Test-DvReceiptValid).
@@ -804,12 +1134,13 @@ function Write-DvReceipt {
     the file with CreateNew -- an existing receipt is NEVER overwritten (append-only; a repeat receiptId throws).
     Returns the path written.
     #>
-    param([Parameter(Mandatory)]$Receipt, [Parameter(Mandatory)][string]$ReceiptRoot, [switch]$OfflineTestMode)
+    param([Parameter(Mandatory)]$Receipt, [Parameter(Mandatory)][string]$ReceiptRoot, [string]$RepoRoot = '', [switch]$OfflineTestMode)
     if ($Receipt['outcome'] -notin $script:OutcomeEnum) { throw "DVE_RECEIPT_OUTCOME_INVALID '$($Receipt['outcome'])' is not one of: $($script:OutcomeEnum -join ', ')" }
     if ($Receipt['outcome'] -in @('PASS', 'FAIL')) {
-        # The writer never records a signal without its proof, whatever the caller believed.
-        $validity = Test-DvReceiptValid -Receipt $Receipt -AllowOfflineTestMode:$OfflineTestMode
-        if (-not $validity.valid) { throw "DVE_RECEIPT_INVALID a $($Receipt['outcome']) receipt without a valid receipt-oracle verdict is refused: $($validity.reasons -join '; ')" }
+        # The writer never records a signal without its proof, whatever the caller believed: the SAME evidence-bearing validator a
+        # reader calls re-derives the admission from the committed blobs and the run from the hashed evidence files.
+        $validity = Test-DvReceiptValid -Receipt $Receipt -RepoRoot $RepoRoot -AllowOfflineTestMode:$OfflineTestMode
+        if (-not $validity.valid) { throw "DVE_RECEIPT_INVALID a $($Receipt['outcome']) receipt that does not re-derive from committed consent and hashed run evidence is refused ($($validity.status)): $($validity.reasons -join '; ')" }
     }
     if (-not $Receipt['finishedUtc']) { $Receipt['finishedUtc'] = [DateTime]::UtcNow.ToString('o') }
     $dir = Join-Path (Join-Path (Join-Path $ReceiptRoot $Receipt['card']) $Receipt['legId']) $Receipt['venue']['name']
@@ -825,6 +1156,6 @@ function Write-DvReceipt {
 Export-ModuleMember -Function Get-DvOutcomeEnum, ConvertTo-DvCanonicalJson, Get-DvSha256OfBytes, Get-DvSha256OfText, Get-DvSha256OfFile,
     Get-DvSubjectDigest, Read-DvVenueTable, ConvertFrom-DvVenueTableText, Get-DvVenueRole, Get-DvProp, Get-DvCommittedFile, Resolve-DvAdmissionSources,
     Test-DvUnderClaudeState, Read-DvClipConsent, Get-DvClipAdmission, Get-DvSmokeSummaryFields, Get-DvPlaybackProblems,
-    Get-DvPlaybackEvidence, Test-DvReceiptValid, Get-DvHealthVerdict,
+    Get-DvPlaybackEvidence, Get-DvBlobById, Find-DvCommittedLegSpec, Read-DvEvidenceSet, Test-DvJsonEquivalent, Test-DvReceiptValid, Get-DvHealthVerdict,
     New-DvHealthProbeJobText, ConvertFrom-DvProbeStdout,
     Get-DvResultToken, Resolve-DvJobOutcome, Test-DvCriteria, Get-DvVerbatimMetrics, New-DvReceipt, Write-DvReceipt
