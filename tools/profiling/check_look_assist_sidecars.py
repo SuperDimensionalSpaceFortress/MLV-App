@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """GUI-smoke assertion for Look Assist on the tracked DAYLIGHT fixture (stdlib only).
 
-Reads the frame-NN.json sidecars a `--gui-smoke-playback --contact-sheet-dir` run writes and asserts
+Reads the frame-NN.json sidecars a real-app contact-sheet capture writes (the app's contact-sheet-dir option) and asserts
 what the classifier fix has to deliver *in the real app*, on the path the user sees:
 
   * settled == true and look_assist_wb_decision is an ACCEPTED one ("accepted", "accepted-damped" or
