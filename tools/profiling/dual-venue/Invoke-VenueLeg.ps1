@@ -378,6 +378,21 @@ if ($artifactsShare -and (Test-Path -LiteralPath $artifactsShare -PathType Conta
         New-Item -ItemType Directory -Force -Path (Join-Path $evidenceDir 'logs') | Out-Null
         Copy-Item -LiteralPath $logShare -Destination (Join-Path $evidenceDir 'logs\smoke-run.log')
     }
+    # DVE-LEG-TERMINALS-1 item 3: a failed smoke run's FULL stdout and stderr (the job publishes them on SMOKE_RUN_FAILED; the typed tail in summary.json is only
+    # the last 4000 chars) are kept beside the rest of the evidence and named by sha256 in the receipt, so the receipt can say why. The located app log of a run
+    # that wrote no result.json is kept the same way. Optional: only that terminal publishes them.
+    foreach ($smokeFile in 'smoke-stderr.txt', 'smoke-stdout.txt') {
+        $smokeSrc = Join-Path $artifactsShare $smokeFile
+        if (Test-Path -LiteralPath $smokeSrc -PathType Leaf) {
+            Copy-Item -LiteralPath $smokeSrc -Destination (Join-Path $evidenceDir $smokeFile)
+            $receipt.evidence[$(if ($smokeFile -ceq 'smoke-stderr.txt') { 'smokeStderrSha256' } else { 'smokeStdoutSha256' })] = Get-DvSha256OfFile (Join-Path $evidenceDir $smokeFile)
+        }
+    }
+    $failedAppLogShare = Join-Path $artifactsShare 'logs\smoke-failed-app.log'
+    if (Test-Path -LiteralPath $failedAppLogShare -PathType Leaf) {
+        New-Item -ItemType Directory -Force -Path (Join-Path $evidenceDir 'logs') | Out-Null
+        Copy-Item -LiteralPath $failedAppLogShare -Destination (Join-Path $evidenceDir 'logs\smoke-failed-app.log')
+    }
     # The job's exit code and RESULT token are not in any file the job wrote: record them as a hashed file too, so the outcome is
     # re-derivable (a capture that exited non-zero is not evidence).
     $umRunLocal = Join-Path $evidenceDir 'um-run.json'
@@ -425,6 +440,16 @@ $resolved = Resolve-DvJobOutcome -ResultToken $token -ExitCode $exitCode -SmokeR
 # capture and then exits non-zero contradicts itself, so its capture is not evidence.
 if ($exitCode -ne 0 -and $resolved.outcome -eq 'CAPTURED') {
     $resolved = [pscustomobject]@{ outcome = 'INVALID'; detail = "$($resolved.detail) but the job exited $exitCode; a capture that disagrees with its own exit code is not evidence" }
+}
+
+# DVE-LEG-TERMINALS-1 item 3: the receipt says why a smoke run failed, and where the evidence that proves it is kept (never a path: tokens and counts only).
+if ($token -ceq 'SMOKE_RUN_FAILED' -and $null -ne $summary) {
+    $smokeExit = $(if ($summary.PSObject.Properties['smokeExitCode']) { [string]$summary.smokeExitCode } else { '' })
+    $kept = @()
+    if ($receipt.evidence['smokeStderrSha256']) { $kept += 'stderr' }
+    if ($receipt.evidence['smokeStdoutSha256']) { $kept += 'stdout' }
+    if ($runLogSha) { $kept += 'run log' }
+    $resolved.detail = "$($resolved.detail): smoke exit $smokeExit; " + $(if ($kept.Count -gt 0) { 'kept as hashed local evidence: ' + ($kept -join ', ') } else { 'no stderr, stdout or run log was published' })
 }
 
 # P6 again, from the job's own record: a summary that names a different venue than declared is a mismatch.
@@ -510,6 +535,10 @@ if ($outcome -in @('PASS', 'FAIL')) {
         if ($resolved.outcome -eq 'CAPTURED' -and -not $playback.jobOracleBlockPresent) { $proofProblems += 'RECEIPT_FIELD_ABSENT: the captured job''s summary.json carries no sourceFrames block (its own oracle did not run)' }
     }
 }
+# DVE-LEG-TERMINALS-1 item 1: a PASS/FAIL the production writer would refuse because the hashed summary names no backend (the PresentMon-wait-failure shape of
+# 2026-10-02 carried no counters) is no signal: the leg ran, so it ends as a typed INVALID receipt that keeps its evidence -- never exit 2 with no receipt.
+$backendNotDerivable = Get-DvBackendNotDerivable -Summary $summary -Backend $Backend -RequireCpuBackendField (-not $OfflineTestMode)
+if ($outcome -in @('PASS', 'FAIL') -and $null -ne $summary -and $null -ne $backendNotDerivable) { $proofProblems += $backendNotDerivable }
 if ($outcome -in @('PASS', 'FAIL') -and $proofProblems.Count -gt 0) {
     $detail = "INVALID: the job result was $outcome ($detail) but the receipt-oracle verdict is not valid: $($proofProblems -join '; ')"
     $outcome = 'INVALID'

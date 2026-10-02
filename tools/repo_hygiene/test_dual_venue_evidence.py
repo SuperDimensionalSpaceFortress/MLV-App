@@ -152,13 +152,42 @@ class GeneratorByteIdentityAndVariantTests(unittest.TestCase):
         self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
         return out
 
+    # DVE-LEG-TERMINALS-1: the ONLY text that card adds to the default job is bracketed by these two sentinel lines in the generator (the PresentMon wait-failure
+    # counters and frame publish, and the SMOKE_RUN_FAILED evidence publish: four regions). The default job is byte-identical to the baseline's once exactly those
+    # regions are removed -- so every other byte is still master's, and a region cannot grow past its brackets unnoticed (the count and the shape are pinned below).
+    LEG_TERMINALS_OPEN = "DVE-LEG-TERMINALS-1 >>>"
+    LEG_TERMINALS_CLOSE = "DVE-LEG-TERMINALS-1 <<<"
+
+    @classmethod
+    def strip_leg_terminals_regions(cls, text: str) -> tuple[str, int]:
+        kept: list[str] = []
+        inside = False
+        regions = 0
+        for line in lf(text).split("\n"):
+            if cls.LEG_TERMINALS_OPEN in line:
+                assert not inside, "nested DVE-LEG-TERMINALS-1 region"
+                inside = True
+                regions += 1
+                continue
+            if cls.LEG_TERMINALS_CLOSE in line:
+                assert inside, "unopened DVE-LEG-TERMINALS-1 close"
+                inside = False
+                continue
+            if not inside:
+                kept.append(line)
+        assert not inside, "unclosed DVE-LEG-TERMINALS-1 region"
+        return "\n".join(kept), regions
+
     def assertByteIdenticalToBaseline(self, name: str, extra: list[str]) -> None:
         if not self.baseline_available:
             self.skipTest(f"baseline commit {BASELINE_COMMIT[:12]} is not in this clone")
         new = self.generate(GENERATOR, f"new-{name}.job.ps1", extra)
         old = self.generate(self.baseline_root / "tools" / "profiling" / "bachelor" / "playback-attr-3-cuda-job.ps1", f"old-{name}.job.ps1", extra)
-        self.assertEqual(lf(new.read_text(encoding="utf-8")), lf(old.read_text(encoding="utf-8")),
-                         "the DEFAULT (bachelor/cuda) emitted job changed -- it must stay byte-identical to master's")
+        stripped, regions = self.strip_leg_terminals_regions(new.read_text(encoding="utf-8"))
+        self.assertEqual(regions, 4, "the default job carries exactly the four bracketed DVE-LEG-TERMINALS-1 regions (the wait-failure block and its two summary fields, the smoke-failure block and its one summary field)")
+        self.assertEqual(self.strip_leg_terminals_regions(old.read_text(encoding="utf-8"))[1], 0, "the baseline has none")
+        self.assertEqual(stripped, lf(old.read_text(encoding="utf-8")),
+                         "the DEFAULT (bachelor/cuda) emitted job changed outside DVE-LEG-TERMINALS-1's bracketed regions -- it must stay byte-identical to master's")
 
     def test_default_arguments_emit_a_byte_identical_job(self) -> None:
         self.assertByteIdenticalToBaseline("default", [])
@@ -1604,8 +1633,11 @@ class JobTerminalsAndHardeningTests(RunnerHarness, unittest.TestCase):
     def test_product_failures_after_a_sound_run_are_fail_with_the_proof_in_the_receipt(self) -> None:
         # exactly what the job writes on these terminals (real_failure_summary: key for key): no sourceFrames block, no evidence manifest, and the
         # frame counters only inside gpuSummary
+        # (DVE-LEG-TERMINALS-1: the counters are the ones each terminal means -- a CPU_FALLBACK_DETECTED with no gpu frame and no cpu frame names no backend, and the
+        # runner now ends such a leg as a typed no-signal receipt instead of a FAIL the production writer would refuse)
+        gpu_counters = {"CPU_FALLBACK_DETECTED": {"gpuReconReadbackFrames": 888, "cpuFrames": 12}}
         for token, code in (("GPU_RECON_FRAMES_ZERO", 13), ("CPU_FALLBACK_DETECTED", 14), ("CPU_BACKEND_PATH_MISMATCH", 28)):
-            self.write_artifacts(source_frames=False, exact_summary=real_failure_summary(token), manifest=None)
+            self.write_artifacts(source_frames=False, exact_summary=real_failure_summary(token, **gpu_counters.get(token, {})), manifest=None)
             (self.artifacts / "evidence-manifest.json").unlink()
             proc, receipt, _ = self.run_leg("ultra-magnus", self.write_spec(), token=(token, code))
             self.assertEqual(receipt["outcome"], "FAIL", f"{token}: {receipt['outcomeDetail']}")

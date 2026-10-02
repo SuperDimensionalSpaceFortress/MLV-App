@@ -2282,6 +2282,51 @@ if ($null -ne $smokeLaunchException -or $smokeRc -ne 0 -or -not (Test-Path -Lite
         $smokeRefusalReason = if ($smokeStderrTail -match '(PLAY_WINDOW_TOO_SHORT|PLAY_DURATION_TOO_SHORT|PLAY_PACE_TOO_SLOW|CLIP_TOO_SHORT|CLIP_LENGTH_UNKNOWN|INVALID_SOURCE_FRAMES|INVALID_LOOPED|SOURCE_FRAMES_SHORT|PLAY_SAFETY_TIMEOUT|REPLAY_REFUSED|PASS_THROUGH_REFUSED)') { $Matches[1] }
                                 else { "EXIT_$([int]$smokeRc)" }
     }
+    # DVE-LEG-TERMINALS-1 >>> (the only text this card adds to the default job; test_dual_venue_evidence strips these regions to prove the rest is byte-identical to master's)
+    # DVE-LEG-TERMINALS-1 item 3: a failed smoke run used to publish only the typed tail above (40 lines / 4000 chars of stderr) -- Ultra-Magnus attempt 2
+    # failed with an EMPTY tail and published no result.json and no run log, so nothing said why. The runner's full stdout and stderr, the launcher's result.json (its
+    # validation block lists every failed check) and the run log are published now; each step is its own try so one that cannot be published never costs the
+    # summary below, and smokeEvidence says exactly which pieces exist and why one does not.
+    $smokeStderrPublished = $false; $smokeStderrBytes = $null; $smokeStdoutPublished = $false; $smokeStdoutBytes = $null
+    $smokeResultJsonPublished = $false; $smokeRunLogPublished = $false; $smokeRunLogSource = 'none'; $smokeRunLogReason = $null
+    try {
+        $smokeStdoutPath = Join-Path $legOut 'smoke-stdout.txt'
+        if (Test-Path -LiteralPath $smokeStderrPath -PathType Leaf) {
+            [void](Publish-AttrCudaFileCopy -Source $smokeStderrPath -Destination (Join-Path $Pub 'smoke-stderr.txt'))
+            $smokeStderrPublished = $true
+            $smokeStderrBytes = [int64](Get-ChildItem -LiteralPath $smokeStderrPath -File).Length
+        }
+        if (Test-Path -LiteralPath $smokeStdoutPath -PathType Leaf) {
+            [void](Publish-AttrCudaFileCopy -Source $smokeStdoutPath -Destination (Join-Path $Pub 'smoke-stdout.txt'))
+            $smokeStdoutPublished = $true
+            $smokeStdoutBytes = [int64](Get-ChildItem -LiteralPath $smokeStdoutPath -File).Length
+        }
+        if (Test-Path -LiteralPath $resultPath -PathType Leaf) {
+            [void](Publish-AttrCudaFileCopy -Source $resultPath -Destination (Join-Path $Pub 'result.json'))
+            $smokeResultJsonPublished = $true
+            try {
+                $failedRunLog = Resolve-AttrCudaSmokeRunLog -ResultJsonPath $resultPath -ContainingRoot $Work
+                [void](New-AttrCudaDirectory -Path (Join-Path $Pub 'logs'))
+                [void](Publish-AttrCudaFileCopy -Source $failedRunLog.path -Destination (Join-Path $Pub 'logs\smoke-run.log'))
+                $smokeRunLogPublished = $true
+                $smokeRunLogSource = $failedRunLog.source
+            } catch {
+                $smokeRunLogReason = ConvertTo-AttrCudaResultLineSafeText $_.Exception.Message
+            }
+        } else {
+            $smokeRunLogReason = 'the smoke run wrote no result.json, so no run-log snapshot was bound'
+        }
+        if (-not $smokeRunLogPublished -and $failedSmokeDisplayLog.found) {
+            # the located app log is NOT the bound snapshot, so it never takes the smoke-run.log name
+            [void](New-AttrCudaDirectory -Path (Join-Path $Pub 'logs'))
+            [void](Publish-AttrCudaFileCopy -Source $failedSmokeDisplayLog.logPath -Destination (Join-Path $Pub 'logs\smoke-failed-app.log'))
+            $smokeRunLogPublished = $true
+            $smokeRunLogSource = 'failed-run app log (display recovery)'
+        }
+    } catch {
+        $smokeRunLogReason = ConvertTo-AttrCudaResultLineSafeText ('publishing the failed smoke run''s evidence stopped: ' + $_.Exception.Message)
+    }
+    # DVE-LEG-TERMINALS-1 <<<
     $smokeFailure = [ordered]@{
         schema='playback-attr-3-cuda-venue.v1'; result='SMOKE_RUN_FAILED'
         fixtureRehearsal=$FixtureRehearsal
@@ -2296,6 +2341,12 @@ if ($null -ne $smokeLaunchException -or $smokeRc -ne 0 -or -not (Test-Path -Lite
         presentMonWaitError=$presentMonStop.waitError
         display=$displayBlock
         displayLogRecovery=[ordered]@{ found=$failedSmokeDisplayLog.found; logPath=$failedSmokeDisplayLog.logPath; reason=$failedSmokeDisplayLog.reason }
+        # DVE-LEG-TERMINALS-1 >>>
+        smokeEvidence=[ordered]@{
+            stderrPublished = $smokeStderrPublished; stderrBytes = $smokeStderrBytes; stdoutPublished = $smokeStdoutPublished; stdoutBytes = $smokeStdoutBytes
+            resultJsonPublished = $smokeResultJsonPublished; runLogPublished = $smokeRunLogPublished; runLogSource = $smokeRunLogSource; runLogReason = $smokeRunLogReason
+        }
+        # DVE-LEG-TERMINALS-1 <<<
         sourceCommit=$SourceCommit; clipId=$ClipId; artifactRoot=$Pub
     }
     Save-Json $smokeFailure (Join-Path $Pub 'summary.json')
@@ -2423,6 +2474,36 @@ if ($null -ne $presentMonWaitError) {
         processStartUtc=$(if ($null -ne $presentMonProcessStartUtc) { $presentMonProcessStartUtc.ToString('o') } else { $null })
         captureStartUncertaintyMs=$presentMonCaptureStartUncertaintyMs
     }) (Join-Path $Pub 'presentmon-capture.json')
+    # DVE-LEG-TERMINALS-1 >>> (the only text this card adds to the default job; test_dual_venue_evidence strips these regions to prove the rest is byte-identical to master's)
+    # DVE-LEG-TERMINALS-1 item 1 (hardening DVE-PRESENTMON-WAIT-FAILURE-UNRECEIPTABLE-1): the smoke run's own gpu summary is already in the run log
+    # published above, so this terminal carries the same counters every other failure terminal does (gpuSummary, and the gpuFramesTotal the display-report
+    # branch sums below). Without them a receipt could not derive which backend ran, and the runner wrote NO receipt for a leg that had played (Ultra-Magnus,
+    # 2026-10-02: 478 gpu frames, no cpu fallback, the runner exited 2 with DVE_RECEIPT_WRITE_FAILED). Counters that are genuinely unavailable (no gpu_summary line for the
+    # measured session) stay null here -- never a throw that would publish nothing -- and the runner maps a counter-less terminal to a typed no-signal receipt.
+    $waitFailureGpuSummary = $null
+    $waitFailureGpuFramesTotal = $null
+    try {
+        $waitFailureGpuSummary = Get-LastGpuSummary $rawLog $measuredSmokeSessionId
+        $waitFailureGpuFramesTotal = $waitFailureGpuSummary.gpuReconReadbackFrames + $waitFailureGpuSummary.gpuTextureReadbackFrames + $waitFailureGpuSummary.gpuTextureNoReadbackFrames
+    } catch {
+        $waitFailureGpuSummary = $null
+        $waitFailureGpuFramesTotal = $null
+    }
+    # DVE-LEG-TERMINALS-1 item 4: the app's contact-sheet capture is a SEEK pass inside the smoke child, run after the measured session's own summary line
+    # (--contact-sheet-seek-mode: it never plays), and PresentMon is only waited on once that child has returned -- so a wait failure leaves the captured
+    # frames in $contactSheetDir and nothing to re-run. They are published here (this branch never did, so the leg had no frame at all). Nothing measured can
+    # change: this runs after the smoke child, after the run log and the counters above are read, and writes only under contact-sheet\. The sheet itself is not
+    # composed here (its labels need the eligibility verdict, which this branch exits before); the marker below says so and makes the runner keep the frames.
+    # (its own try: a frame that cannot be published must never cost the typed summary below)
+    try {
+        $waitFailureRawFrames = Publish-AttrCudaContactSheetRawCaptures -Enabled $ContactSheetEnabled -SourceDir $contactSheetDir -PubRoot $Pub
+        if ($null -ne $waitFailureRawFrames -and @(Get-ChildItem -LiteralPath $waitFailureRawFrames -File).Count -gt 0) {
+            [void](Publish-AttrCudaText -Path (Join-Path $Pub 'contact-sheet\compose-status.txt') -Value 'CONTACT_SHEET_COMPOSE_UNAVAILABLE the PresentMon wait failed after the measured playback; the raw frames are published, the sheet was not composed on this venue')
+        }
+    } catch {
+        $waitFailureRawFrames = $null
+    }
+    # DVE-LEG-TERMINALS-1 <<<
     $displayFailure = [ordered]@{
         schema='playback-attr-3-cuda-venue.v1'; result='PRESENTMON_UNAVAILABLE'
         fixtureRehearsal=$FixtureRehearsal
@@ -2437,6 +2518,10 @@ if ($null -ne $presentMonWaitError) {
         # happen here -- carried into this typed refusal too, so a reader is not left guessing
         # whether the app-side run produced any frame telemetry at all.
         frameRows=$rows.Count
+        # DVE-LEG-TERMINALS-1 >>>
+        gpuSummary=$waitFailureGpuSummary
+        gpuFramesTotal=$waitFailureGpuFramesTotal
+        # DVE-LEG-TERMINALS-1 <<<
         sourceCommit=$SourceCommit; clipId=$ClipId; artifactRoot=$Pub
     }
     Save-Json $displayFailure (Join-Path $Pub 'summary.json')
@@ -3133,6 +3218,12 @@ if ($isCpuBackend) {
     'MLVAPP_GPU_PLAYBACK_RECON_RETAIN_DEVICE_OUTPUT=1',
 " ''
     # exit 13/14 stay CUDA-only; the cpu leg has its own inverted check (exit 28) just below them.
+    # DVE-LEG-TERMINALS-1 item 2: docs/dual-venue-evidence.md -- "CPU frame rate is informational ... never gates a card" -- but the smoke runner's own
+    # skipped/unpresented-frame limit (default 0.5, -MaxSkippedOrUnpresentedRatio) failed a cpu leg on Ultra-Magnus (56.17% > 50%: SMOKE_RUN_FAILED, exit 18,
+    # no frame, no sheet). A cpu leg passes the limit's ceiling (the ratio cannot exceed 1), so the runner never fails it on that ratio; the ratio is a measured
+    # field of the success summary (below). A cuda leg's command is untouched. No other gate is relaxed: clip length, loop / replay, nonce and settings isolation
+    # are enforced by the runner and the receipt oracle, and the job passes none of them as a switch.
+    $template = Edit-DualVenueTemplate $template ' -Scope none -FrameTelemetry' ' -Scope none -MaxSkippedOrUnpresentedRatio 1 -FrameTelemetry'
     $template = Edit-DualVenueTemplate $template 'if (-not $verdict.admitted) {' 'if ($Backend -ne ''cpu'' -and -not $verdict.admitted) {'
     $template = Edit-DualVenueTemplate $template 'if ($gpuFramesTotal -le 0) {' 'if ($Backend -ne ''cpu'' -and $gpuFramesTotal -le 0) {'
     $template = Edit-DualVenueTemplate $template 'if ($gpuSummary.cpuFrames -gt 0) {' 'if ($Backend -ne ''cpu'' -and $gpuSummary.cpuFrames -gt 0) {'
@@ -3184,15 +3275,23 @@ if ($ForceLookAssist) {
     }
 }
 if ($isVariant) {
+    # DVE-LEG-TERMINALS-1 item 1: a variant's PresentMon wait-failure summary states its backend like every other variant summary (a cpu run's backend is read from
+    # it); the counters themselves are in the default template.
+    $template = Edit-DualVenueTemplate $template '        gpuFramesTotal=$waitFailureGpuFramesTotal
+' '        gpuFramesTotal=$waitFailureGpuFramesTotal
+        backend=$Backend
+'
+    # DVE-LEG-TERMINALS-1 item 2: a cpu run records the launcher's own skipped/unpresented ratio as a measured field (it no longer gates the run).
+    $cpuRatioField = if ($isCpuBackend) { '    skippedOrUnpresentedRatio = $resultJson.validation.skippedOrUnpresentedRatio' + "`n" } else { '' }
     $template = Edit-DualVenueTemplate $template '    cpuFrames = $gpuSummary.cpuFrames
-' '    cpuFrames = $gpuSummary.cpuFrames
-    backend = $Backend
+' ('    cpuFrames = $gpuSummary.cpuFrames
+' + $cpuRatioField + '    backend = $Backend
     declaredVenue = $DeclaredVenue
     lookLeg = $LookLeg
     lookAssistForced = $LookLeg
     lookFlavor = $(if ($LookLeg) { $LookFlavor } else { $null })
     lookFlavorHonored = $(if ($LookLeg) { ''unknown'' } else { $null })
-'
+')
 }
 
 # ATTR3-FOOTAGE-BIND-1 PR-B round 3 (STRUCTURAL): a single-pass substitution over the WHOLE
