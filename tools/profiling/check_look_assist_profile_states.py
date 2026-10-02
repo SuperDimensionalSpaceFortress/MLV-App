@@ -50,7 +50,9 @@ ASYNC_APPLIED = re.compile(r"look_assist\.apply\.auto_wb_async_applied\b.*?\bsou
 AUTO_WB = re.compile(r"look_assist\.apply\.auto_wb\b.*?\bvalid=(\d) source=(\S+) decision=(\S+)")
 ASYNC_DISPATCH = re.compile(r"look_assist\.apply\.async_dispatch\b.*?\bscene=(\S+)")
 SAFETY_FALLBACK = re.compile(r"look_assist\.apply\.safety_fallback\b")
-APPLY_SKIP = re.compile(r"look_assist\.apply\.skip\b.*?\breason=(\S+)")
+# EVERY skip event, with or without a reason: the app's env-disabled / file / receipt / enabled skip is logged as
+# "file_loaded=1 mlv=1 receipt=1 enabled=1" and has no reason= at all (sol, PR #222 r2).
+APPLY_SKIP = re.compile(r"look_assist\.apply\.skip\b(?:.*?\breason=(\S+))?")
 FALLBACK_TO_MASTER = re.compile(r"look_assist\.daylight_fallback_to_master\b")
 BUILD_SHA = re.compile(r'"build_sha"\s*:\s*"([^"]*)"')
 
@@ -60,8 +62,8 @@ def parse_log_text(text):
 
     One application is what a dispatch / fallback / result sequence builds. A later event that starts a NEW
     application (an async dispatch, a fall-back to master) discards what an earlier one left, and a safety
-    fallback or a skip replaces it with a failure marker: an accepted receipt from before is not the shipped
-    picture any more.
+    fallback or ANY skip (with or without reason=) replaces it with a failure marker: an accepted receipt from
+    before is not the shipped picture any more.
     """
     receipt = None
     for line in text.splitlines():
@@ -70,7 +72,7 @@ def parse_log_text(text):
             continue
         skip = APPLY_SKIP.search(line)
         if skip:
-            receipt = {"skipped": skip.group(1)}
+            receipt = {"skipped": skip.group(1) or "no reason logged"}
             continue
         if FALLBACK_TO_MASTER.search(line):
             receipt = {"fell_back": True}

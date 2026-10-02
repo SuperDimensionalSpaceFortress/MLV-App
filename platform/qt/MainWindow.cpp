@@ -1350,10 +1350,10 @@ static void logLookAssistDaylightRefine( const LookAssistWhiteBalanceResolution 
                                          const QString &path,
                                          int frame )
 {
-    if( !wb.refineAttempted ) return;
+    if( !wb.refineAttempted && !wb.initialPatchChecked ) return;
     logInteractionEvent(
         QStringLiteral("look_assist.daylight_refine"),
-        QStringLiteral("path=%1 refined=%2 patch_acquired=%3 renders=%4 start_temp=%5 start_tint=%6 final_temp=%7 final_tint=%8 start_score=%9 score=%10 blue_amber_axis=%11 green_axis=%12 patch_chroma_found=%13 patch_chroma_at_result=%14 candidate_temp=%15 candidate_tint=%16 preview_mode=%18 preview_scale=%19 legacy=%20 refused_at_base=%21 base_surface_chroma=%22 base_surface_blue_amber=%23 frame=%17")
+        QStringLiteral("path=%1 refined=%2 patch_acquired=%3 renders=%4 start_temp=%5 start_tint=%6 final_temp=%7 final_tint=%8 start_score=%9 score=%10 blue_amber_axis=%11 green_axis=%12 patch_chroma_found=%13 patch_chroma_at_result=%14 candidate_temp=%15 candidate_tint=%16 preview_mode=%18 preview_scale=%19 legacy=%20 refused_at_base=%21 base_surface_chroma=%22 base_surface_blue_amber=%23 initial_patch_checked=%24 initial_patch_refused=%25 initial_refused_at_base=%26 initial_base_chroma=%27 initial_base_blue_amber=%28 initial_final_chroma=%29 frame=%17")
             .arg( path )
             .arg( bool01( wb.refined ) )
             .arg( bool01( wb.refinePatchAcquired ) )
@@ -1376,7 +1376,13 @@ static void logLookAssistDaylightRefine( const LookAssistWhiteBalanceResolution 
             .arg( bool01( wb.legacyBalance ) )
             .arg( bool01( wb.refineRefusedAtBase ) )
             .arg( wb.refineBaseSurfaceChroma, 0, 'f', 2 )
-            .arg( wb.refineBaseSurfaceBlueAmber, 0, 'f', 2 ) );
+            .arg( wb.refineBaseSurfaceBlueAmber, 0, 'f', 2 )
+            .arg( bool01( wb.initialPatchChecked ) )
+            .arg( bool01( wb.initialPatchRefused ) )
+            .arg( bool01( wb.initialPatchRefusedAtBase ) )
+            .arg( wb.initialPatchBaseChroma, 0, 'f', 2 )
+            .arg( wb.initialPatchBaseBlueAmber, 0, 'f', 2 )
+            .arg( wb.initialPatchFinalChroma, 0, 'f', 2 ) );
 }
 
 static QString lookAssistColorCastWarning(
@@ -16435,9 +16441,10 @@ void MainWindow::applyLookAssistToReceipt( ReceiptSettings *receipt,
         // daylight verdict switched on), then run the pass again with the recorded-exposure hypothesis off.
         logInteractionEvent(
             QStringLiteral("look_assist.daylight_fallback_to_master"),
-            QStringLiteral("reason=no_verified_surface refused_at_base=%1 frame=%2")
-                .arg( bool01( wb.refineRefusedAtBase ) )
-                .arg( analysisFrame ) );
+            QStringLiteral("reason=%3 refused_at_base=%1 frame=%2")
+                .arg( bool01( wb.refineRefusedAtBase || wb.initialPatchRefusedAtBase ) )
+                .arg( analysisFrame )
+                .arg( wb.initialPatchRefused ? QStringLiteral("initial_patch_unverified") : QStringLiteral("no_verified_surface") ) );
         if( m_lastLookAssistChromaSmoothAutoApplied )
         {
             const int chromaSmoothBefore = qBound( 0, m_lastLookAssistChromaSmooth, 3 );

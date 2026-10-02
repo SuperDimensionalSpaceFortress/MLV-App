@@ -238,7 +238,8 @@ typedef std::function<bool( double exposureStops, int temperature, int tint, Loo
 
 /* The narrowing switch (hub ruling): false = a corroborated daylight scene with no trusted patch gets MASTER's
  * balance (its colour-balance default plus, in the GUI, its legacy post-balance walk) and renders nothing
- * extra. Flip it to land only the states proven no worse than master. */
+ * extra; an initial patch is then not verifiable either, so that clip is master's too (master's damped solve).
+ * Flip it to land only the states proven no worse than master. */
 static const bool kLookAssistRefineDaylightWithoutPatch = true;
 
 /* The switch as every consumer reads it: the constant, which the environment variable
@@ -308,6 +309,17 @@ struct LookAssistWhiteBalanceResolution
     double refineGreen = 0.0;       // final measured G-(R+B)/2
     double refineStartPatchChroma = 0.0;   // chroma of the acquired surface where it was found
     double refineFinalPatchChroma = 0.0;   // chroma of that SAME surface in the picture rendered at the result
+    // The INITIAL patch of a corroborated daylight clip (the one the consumer found on the picture rendered at the
+    // existing processing white balance), judged on the surface itself: near-neutral and off the blue locus in the
+    // picture rendered at the AS-SHOT prior, and still near-neutral -- no more cast than where it was found -- when
+    // rendered at the solution. checked = the judgement ran; refused = the patch is NOT believed (it failed either
+    // test, or could not be verified at all) and the clip takes MASTER's path (legacyBalance), never the refinement.
+    bool initialPatchChecked = false;
+    bool initialPatchRefused = false;
+    bool initialPatchRefusedAtBase = false;      // refused by the as-shot base picture (not by the verification)
+    double initialPatchBaseChroma = 0.0;         // that surface's chroma / blue-amber in the as-shot base picture
+    double initialPatchBaseBlueAmber = 0.0;
+    double initialPatchFinalChroma = 0.0;        // that SAME surface's chroma in the picture rendered at the solution
 };
 
 typedef std::function<void( int rawX, int rawY, int *temperature, int *tint )> LookAssistWhiteBalanceSolveFn;

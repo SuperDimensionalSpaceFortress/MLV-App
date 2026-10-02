@@ -178,6 +178,45 @@ class DecisionGate(unittest.TestCase):
         self.assertEqual(("night", 6480, -19, 174), tuple(receipt[k] for k in ("scene", "temperature", "tint", "exposure")))
         self.assertEqual([], chk.check_receipt("a", receipt))
 
+    def test_a_reasonless_skip_event_invalidates_the_arm(self):
+        # sol, PR #222 r2: the app's own env-disabled / file / receipt / enabled skip carries NO reason=
+        # (MainWindow "look_assist.apply.skip" with file_loaded= mlv= receipt= enabled=); the checker used to
+        # keep the earlier accepted receipt (and its picture) standing after it.
+        reasonless = PREFIX + "look_assist.apply.skip file_loaded=1 mlv=1 receipt=1 enabled=1\n"
+        env_disabled = PREFIX + "look_assist.apply.skip file_loaded=1 mlv=1 receipt=1 enabled=0\n"
+        accepted = sync_trace()
+        self.assertEqual([], chk.check_receipt("a", chk.parse_log_text(accepted)))
+        for skip in (reasonless, env_disabled):
+            self.assertTrue(chk.check_receipt("a", chk.parse_log_text(accepted + skip)))       # after the accepted application
+            self.assertTrue(chk.check_receipt("a", chk.parse_log_text(skip)))                  # instead of one
+            self.assertTrue(chk.check_receipt("a", chk.parse_log_text(skip + accepted)))       # an arm that ever skipped
+            # master's own analysis is not exempt either
+            self.assertTrue(chk.check_receipt("a", chk.parse_log_text(MASTER_TRACE + skip)))
+        # a reason-bearing skip still fails, and still names its reason
+        failures = chk.check_receipt("a", chk.parse_log_text(accepted + PREFIX + "look_assist.apply.skip reason=empty_stats\n"))
+        self.assertTrue(failures and "empty_stats" in failures[0])
+        # a reason-less one is named as a skip too
+        failures = chk.check_receipt("a", chk.parse_log_text(accepted + reasonless))
+        self.assertTrue(failures and "skipped" in failures[0])
+
+    def test_the_full_checker_exits_non_zero_for_a_stale_arm_after_a_reasonless_skip(self):
+        # sol's repro, through the whole checker: append the real event grammar to a recorded arm's log (its
+        # pictures and subject binding untouched). It used to report PASS; it must fail that arm.
+        reasonless = PREFIX + "look_assist.apply.skip file_loaded=1 mlv=1 receipt=1 enabled=1\n"
+        with tempfile.TemporaryDirectory() as root:
+            make_full_set(root)
+            self.assertEqual(0, chk.main([root, "--tag", "t", "--subject-sha", SHA]))
+            path = os.path.join(root, "t-large_dual_iso-sync", "logs", "mlvapp.log")
+            with open(path, "a", encoding="utf-8") as handle:
+                handle.write(reasonless)
+            self.assertEqual(1, chk.main([root, "--tag", "t", "--subject-sha", SHA]))
+        with tempfile.TemporaryDirectory() as root:
+            make_full_set(root, MASTER_TRACE, applied=(140, 146, 170), master=(140, 146, 170))
+            path = os.path.join(root, "t-tiny_dual_iso-async", "logs", "mlvapp.log")
+            with open(path, "a", encoding="utf-8") as handle:
+                handle.write(reasonless)
+            self.assertEqual(1, chk.main([root, "--tag", "t"]))
+
     def test_async_receipt_is_read_from_the_async_applied_event(self):
         text = (PREFIX + "look_assist.apply.async_dispatch generation=3 frame=0 scene=shade floor_lifted=0\n"
                 + PREFIX + "look_assist.apply.auto_wb_async_applied generation=3 valid=1 source=processed-neutral-patch "

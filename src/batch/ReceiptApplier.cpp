@@ -857,6 +857,13 @@ bool ReceiptApplier::applyHeadlessLookAssist(ReceiptSettings *receipt,
         &preset );
     if( wb.legacyBalance && !masterScenePass )
     {
+        BatchLogger::out( QStringLiteral(
+            "[BATCH] LOOK_ASSIST daylight_fallback_to_master frame=%1 reason=%2 refusedAtBase=%3 initialPatchBaseChroma=%4 initialPatchFinalChroma=%5\n" )
+            .arg( frameIndex )
+            .arg( wb.initialPatchRefused ? QStringLiteral("initial_patch_unverified") : QStringLiteral("no_verified_surface") )
+            .arg( ( wb.refineRefusedAtBase || wb.initialPatchRefusedAtBase ) ? QStringLiteral("true") : QStringLiteral("false") )
+            .arg( wb.initialPatchBaseChroma, 0, 'f', 1 )
+            .arg( wb.initialPatchFinalChroma, 0, 'f', 1 ) );
         // Corroborated daylight that neither an accepted patch nor a VERIFIED surface backs: the verdict is not
         // trusted, so the clip gets MASTER's analysis from the top (its scene verdict, exposure, colour source
         // and balance), never the as-shot prior. Undo the auto chroma smoothing the daylight verdict switched
@@ -895,7 +902,7 @@ bool ReceiptApplier::applyHeadlessLookAssist(ReceiptSettings *receipt,
     resetMlvCachedFrame( mlvObject );
 
     BatchLogger::out( QStringLiteral(
-        "[BATCH] LOOK_ASSIST applied frame=%1 scene=%2 median=%3 p95=%4 p99=%5 exposure=%6 temperature=%7 tint=%8 autoWbValid=%9 autoWbSource=%10 autoWbDecision=%11 autoWbDamping=%12 autoWbCandidateTemp=%13 autoWbCandidateTint=%14 chromaSmoothAuto=%15 rawBlack=%16 rawWhite=%17 p05=%18 clipHigh=%19 balanceRGB=%20/%21/%22 balanceSamples=%23 patchValid=%24 patchLuma=%25 patchChroma=%26 patchBlueAmber=%27 patchGreenAxis=%28 refineRenders=%29 refineStartScore=%30 refineScore=%31 refineBlueAmber=%32 refineGreen=%33 masterScenePass=%34\n" )
+        "[BATCH] LOOK_ASSIST applied frame=%1 scene=%2 median=%3 p95=%4 p99=%5 exposure=%6 temperature=%7 tint=%8 autoWbValid=%9 autoWbSource=%10 autoWbDecision=%11 autoWbDamping=%12 autoWbCandidateTemp=%13 autoWbCandidateTint=%14 chromaSmoothAuto=%15 rawBlack=%16 rawWhite=%17 p05=%18 clipHigh=%19 balanceRGB=%20/%21/%22 balanceSamples=%23 patchValid=%24 patchLuma=%25 patchChroma=%26 patchBlueAmber=%27 patchGreenAxis=%28 refineRenders=%29 refineStartScore=%30 refineScore=%31 refineBlueAmber=%32 refineGreen=%33 masterScenePass=%34 initialPatchChecked=%35 initialPatchRefused=%36 initialPatchBaseChroma=%37 initialPatchFinalChroma=%38\n" )
         .arg( frameIndex )
         .arg( lookAssistSceneName( scene ) )
         .arg( stats.median, 0, 'f', 2 )
@@ -929,7 +936,11 @@ bool ReceiptApplier::applyHeadlessLookAssist(ReceiptSettings *receipt,
         .arg( wb.refineScore, 0, 'f', 2 )
         .arg( wb.refineBlueAmber, 0, 'f', 1 )
         .arg( wb.refineGreen, 0, 'f', 1 )
-        .arg( masterScenePass ? QStringLiteral("true") : QStringLiteral("false") ) );
+        .arg( masterScenePass ? QStringLiteral("true") : QStringLiteral("false") )
+        .arg( wb.initialPatchChecked ? QStringLiteral("true") : QStringLiteral("false") )
+        .arg( wb.initialPatchRefused ? QStringLiteral("true") : QStringLiteral("false") )
+        .arg( wb.initialPatchBaseChroma, 0, 'f', 1 )
+        .arg( wb.initialPatchFinalChroma, 0, 'f', 1 ) );
 
     return true;
 }

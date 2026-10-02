@@ -324,7 +324,10 @@ QString receiptLine( ReceiptSettings &r )
 
 // Runs the real headless Look Assist on a tracked clip as the no-trusted-patch state leaves it. noExposureMetadata
 // removes the recorded exposure, so nothing can call the clip daylight: that run IS master's analysis.
-bool runHeadlessLookAssist( const char *clipFile, bool noExposureMetadata, QString *receipt, QByteArray *log )
+// staleWhiteBalance: the processing object holds a 3000 K balance (no patch is found); false = the app default (the
+// picture has a trusted neutral patch, the initial-patch state).
+bool runHeadlessLookAssist( const char *clipFile, bool noExposureMetadata, QString *receipt, QByteArray *log,
+                            bool staleWhiteBalance = true )
 {
     MlvPipelineFixture fixture;
     QString error_message;
@@ -342,7 +345,7 @@ bool runHeadlessLookAssist( const char *clipFile, bool noExposureMetadata, QStri
     r.setExposure( 0 );
     r.setTemperature( -1 );
     r.setTint( 0 );
-    processingSetWhiteBalance( fixture.processing(), 3000, 0.0 );
+    if( staleWhiteBalance ) processingSetWhiteBalance( fixture.processing(), 3000, 0.0 );
 
     QTemporaryDir temporary_dir;
     const QString log_path = temporary_dir.filePath( QStringLiteral("look_assist.log") );
@@ -387,6 +390,41 @@ TEST(LookAssistFixtureScene, HeadlessWithTheRefinementOffIsMastersAnalysisOnTheF
         ASSERT_FALSE( offLog.contains( "autoWbSource=as-shot-prior" ) );
         ASSERT_FALSE( offLog.contains( "autoWbSource=rendered-neutral-patch" ) );
         ASSERT_TRUE( master == off );
+    }
+}
+
+TEST(LookAssistFixtureScene, HeadlessTakesMastersPathForAnInitialPatchItCannotVerify)
+{
+    // LOOK-ASSIST-SCENE-CLASSIFY-3, through the real headless consumer on the tracked clips, in the state where the
+    // picture HAS a trusted neutral patch (the app's default white balance). With the narrowing switch off the
+    // initial patch cannot be verified, so the clip takes MASTER's path: the consumer re-runs the analysis with the
+    // recorded-exposure daylight hypothesis off, and the receipt equals -- field for field -- what the same clip
+    // gets when nothing can call it daylight (master's own analysis). With the switch on, the same patch is
+    // verified on its own surface (base picture and solution) and keeps the undamped daylight solve.
+    for( const FixtureClip &clip : kTrackedFixtureClips )
+    {
+        QString master, off, on;
+        QByteArray masterLog, offLog, onLog;
+        ASSERT_TRUE( runHeadlessLookAssist( clip.file, true, &master, &masterLog, false ) );
+        {
+            ScopedEnv switchOff( "MLVAPP_LOOK_ASSIST_REFINE_DAYLIGHT", "0" );
+            ASSERT_TRUE( runHeadlessLookAssist( clip.file, false, &off, &offLog, false ) );
+        }
+        ASSERT_TRUE( runHeadlessLookAssist( clip.file, false, &on, &onLog, false ) );
+
+        ASSERT_TRUE( masterLog.contains( "scene=night" ) );
+        ASSERT_TRUE( offLog.contains( "daylight_fallback_to_master" ) );
+        ASSERT_TRUE( offLog.contains( "reason=initial_patch_unverified" ) );
+        ASSERT_TRUE( offLog.contains( "masterScenePass=true" ) );
+        ASSERT_TRUE( offLog.contains( "scene=night" ) );                       // master's verdict, not "shade"
+        ASSERT_FALSE( offLog.contains( "scene=shade" ) );
+        ASSERT_TRUE( master == off );                                           // master's receipt, field for field
+
+        // Switch on: the same clip, the same patch, verified on its own surface -> the daylight solve stands.
+        ASSERT_TRUE( onLog.contains( "scene=shade" ) );
+        ASSERT_TRUE( onLog.contains( "autoWbSource=processed-neutral-patch" ) );
+        ASSERT_TRUE( onLog.contains( "initialPatchChecked=true initialPatchRefused=false" ) );
+        ASSERT_FALSE( onLog.contains( "daylight_fallback_to_master" ) );
     }
 }
 

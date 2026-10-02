@@ -807,6 +807,70 @@ static void refineDaylightFromRenderedPicture( const LookAssistWhiteBalanceReque
     // probes steered the search only; none of them is an answer.
 }
 
+// The INITIAL patch of a corroborated daylight clip: the consumer found it on the picture rendered at the EXISTING
+// processing white balance, so on its own that picture says nothing about what the surface IS -- a surface that is
+// blue at the camera's as-shot balance can be made near-neutral by an existing / custom balance, and would then be
+// solved undamped to the daylight rail (sol, PR #222 r2: 9800 K / -20 where master's damped solve gives 8470 K / -13).
+// So it is judged exactly as the refinement judges a surface it found: near-neutral and off the blue locus in the
+// picture rendered at the AS-SHOT prior (clamped into the daylight window), and -- the SAME pixel -- still
+// near-neutral at the solution and no more cast than where it was found. Anything else, including "cannot be
+// asked" (no renderer, the narrowing switch off, no as-shot balance, a patch that is not a pixel of that picture),
+// is NOT believed: the clip takes MASTER's path. Returns true only for a verified surface.
+static bool initialDaylightPatchIsVerified( const LookAssistWhiteBalanceRequest &request,
+                                            const LookAssistPreset &preset,
+                                            int solvedTemperature,
+                                            int solvedTint,
+                                            LookAssistWhiteBalanceResolution *out )
+{
+    out->initialPatchChecked = true;
+    const LookAssistAutoWhiteBalancePatch &patch = request.patch;
+    if( !request.refineWithoutPatch || !request.renderBalance || !request.stats
+     || request.rawWidth <= 0 || request.rawHeight <= 0 )
+        return false;
+
+    LookAssistWhiteBalanceBounds window = lookAssistWhiteBalanceBounds( *request.stats, request.scene );
+    window.minTemperature = qMax( window.minTemperature, request.minTemperature );
+    window.maxTemperature = qMin( window.maxTemperature, request.maxTemperature );
+    window.minTint = qMax( window.minTint, request.minTint );
+    window.maxTint = qMin( window.maxTint, request.maxTint );
+    if( window.minTemperature > window.maxTemperature || window.minTint > window.maxTint ) return false;
+
+    int priorTemperature = request.baseTemperature;
+    int priorTint = request.baseTint;
+    if( !lookAssistAsShotPrior( *request.stats, request.scene, &priorTemperature, &priorTint ) ) return false;
+    priorTemperature = qBound( window.minTemperature, priorTemperature, window.maxTemperature );
+    priorTint = qBound( window.minTint, priorTint, window.maxTint );
+
+    const double exposureStops = preset.exposure / 100.0;   // the planned exposure the consumer's picture was rendered at
+    LookAssistRenderedPicture base;
+    if( !request.renderBalance( exposureStops, priorTemperature, priorTint, &base ) || base.stats.median <= 0.0 ) return false;
+    // The patch must be a pixel of this very picture: the thumbnail geometry is the one the patch was found in.
+    if( base.width <= 0 || base.height <= 0 || base.downscaleFactor <= 0
+     || base.rgb.size() < (size_t)base.width * (size_t)base.height * 3u
+     || patch.thumbnailX < 0 || patch.thumbnailX >= base.width
+     || patch.thumbnailY < 0 || patch.thumbnailY >= base.height
+     || patch.rawX != qBound( 0, patch.thumbnailX * base.downscaleFactor + base.downscaleFactor / 2, request.rawWidth - 1 )
+     || patch.rawY != qBound( 0, patch.thumbnailY * base.downscaleFactor + base.downscaleFactor / 2, request.rawHeight - 1 ) )
+        return false;
+
+    const LookAssistAutoWhiteBalancePatch baseSurface = lookAssistSurfaceAt( base, patch.thumbnailX, patch.thumbnailY );
+    out->initialPatchBaseChroma = baseSurface.chroma;
+    out->initialPatchBaseBlueAmber = baseSurface.blueAmberAxis;
+    if( !lookAssistDaylightPatchIsNeutralEnough( baseSurface ) ) { out->initialPatchRefusedAtBase = true; return false; }
+
+    // The balance that would be applied: the solution inside the daylight window.
+    const int appliedTemperature = qBound( window.minTemperature, solvedTemperature, window.maxTemperature );
+    const int appliedTint = qBound( window.minTint, solvedTint, window.maxTint );
+    LookAssistRenderedPicture verify;
+    if( !request.renderBalance( exposureStops, appliedTemperature, appliedTint, &verify ) || !lookAssistSamePictureGeometry( base, verify ) )
+        return false;
+    const LookAssistAutoWhiteBalancePatch solutionSurface = lookAssistSurfaceAt( verify, patch.thumbnailX, patch.thumbnailY );
+    out->initialPatchFinalChroma = solutionSurface.valid ? solutionSurface.chroma : 0.0;
+    return solutionSurface.valid
+        && lookAssistDaylightPatchIsNeutralEnough( solutionSurface )
+        && solutionSurface.chroma <= patch.chroma + kRefineVerifyChromaSlack;
+}
+
 LookAssistWhiteBalanceResolution resolveLookAssistWhiteBalance( const LookAssistWhiteBalanceRequest &request,
                                                                 const LookAssistWhiteBalanceSolveFn &solve,
                                                                 LookAssistPreset *preset )
@@ -836,8 +900,19 @@ LookAssistWhiteBalanceResolution resolveLookAssistWhiteBalance( const LookAssist
         solvedTint = qBound( -35, solvedTint, 18 );   // the solver's own rails, unchanged
         out.candidateTemperature = solvedTemperature;
         out.candidateTint = solvedTint;
-        if( lookAssistAutoWhiteBalanceSolutionIsStable( patch, baseTemperature, baseTint,
-                                                        solvedTemperature, solvedTint, undamped ) )
+        const bool stable = lookAssistAutoWhiteBalanceSolutionIsStable( patch, baseTemperature, baseTint,
+                                                                         solvedTemperature, solvedTint, undamped );
+        // An undamped daylight solve is believed only for a surface verified at the as-shot balance and at the
+        // solution; otherwise nothing is accepted here and the clip takes master's path (damped solve, legacy walk).
+        const bool refused = stable && undamped
+                          && !initialDaylightPatchIsVerified( request, *preset, solvedTemperature, solvedTint, &out );
+        if( refused )
+        {
+            out.initialPatchRefused = true;
+            out.source = QStringLiteral("rejected-unverified-surface");
+            out.decision = QStringLiteral("rejected-unverified");
+        }
+        else if( stable )
         {
             out.damping = undamped
                 ? 1.0
@@ -874,7 +949,9 @@ LookAssistWhiteBalanceResolution resolveLookAssistWhiteBalance( const LookAssist
     // to ask -- the balance is MASTER's: its colour-balance default, followed (GUI) by its legacy post-balance
     // walk. Never the as-shot prior alone: that was measured worse than master's look in the real app.
     const bool daylightWithoutPatch = !out.autoValid && lookAssistIsDaylightScene( stats, request.scene );
+    // An initial patch that was refused is master's path outright: the refinement is not a second chance for it.
     const bool canRefine = daylightWithoutPatch
+                        && !out.initialPatchRefused
                         && lookAssistDaylightNeedsRenderedRefinement( stats, request.scene, out, request.refineWithoutPatch )
                         && static_cast<bool>( request.renderBalance );
     if( canRefine )
@@ -925,6 +1002,7 @@ void refineLookAssistDaylightWhiteBalance( const LookAssistWhiteBalanceRequest &
                                            LookAssistWhiteBalanceResolution *resolution )
 {
     if( !request.stats || !preset || !resolution || !request.renderBalance ) return;
+    if( resolution->initialPatchRefused ) return;
     if( !lookAssistDaylightNeedsRenderedRefinement( *request.stats, request.scene, *resolution, request.refineWithoutPatch ) ) return;
     refineDaylightFromRenderedPicture( request, solve, preset, resolution );
     lookAssistFinalizeWhiteBalance( request, preset, resolution );

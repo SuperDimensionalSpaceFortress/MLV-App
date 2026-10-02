@@ -682,18 +682,19 @@ TEST(LookAssistScene, OneWhiteBalanceDecisionForEveryPath)
                 ASSERT_EQ( a.tint, pa.tintDelta );
             }
 
-    // The deck itself: accepted undamped from the rendered picture, at the solver's answer.
+    // The deck itself, with nothing to verify it by (no renderer): an undamped daylight solve is believed only for
+    // a surface verified at the as-shot balance and at the solution (LOOK-ASSIST-SCENE-CLASSIFY-3), so this
+    // clip takes master's path -- the accepted-undamped case is pinned below through the real renderer shape.
     LookAssistWhiteBalanceRequest deck;
     deck.stats = &day; deck.scene = LookAssistScene::Shade; deck.solvedOnProcessedPicture = true;
     deck.patch.valid = true; deck.patch.luma = 205.0; deck.patch.chroma = 12.0; deck.patch.blueAmberAxis = 12.0;
     LookAssistPreset preset = presetForLookAssistScene( LookAssistScene::Shade, day );
     const LookAssistWhiteBalanceResolution r = resolveLookAssistWhiteBalance(
         deck, []( int, int, int *t, int *tint ) { *t = 9990; *tint = -35; }, &preset );
-    ASSERT_TRUE( r.autoValid );
-    ASSERT_TRUE( r.decision == QStringLiteral("accepted") );
-    ASSERT_EQ( 9990, r.temperature );
-    ASSERT_EQ( -35, r.tint );
-    ASSERT_NEAR( 1.0, r.damping, 1e-9 );
+    ASSERT_FALSE( r.autoValid );
+    ASSERT_TRUE( r.legacyBalance );
+    ASSERT_TRUE( r.initialPatchRefused );
+    ASSERT_TRUE( r.temperature != 9990 );
 }
 
 TEST(LookAssistScene, WhiteBalanceDecoderIsSharedWithTheGui)
@@ -841,6 +842,38 @@ void paintPicture( LookAssistRenderedPicture *out, int width, int height, int do
                 out->rgb[( static_cast<size_t>( y ) * width + x ) * 3 + k] = static_cast<unsigned char>( qBound( 0, c[k], 255 ) );
         }
     out->stats = analyzeLookAssistThumbnail( out->rgb.data(), width, height );
+}
+
+// The request a consumer builds when the picture rendered at the EXISTING processing white balance has a neutral
+// patch: the shared patch search ran on that picture, the renderer is the one the real consumers pass.
+LookAssistWhiteBalanceRequest initialPatchRequest( const LookAssistStats *stats, const DeckScene &scene,
+                                                   int existingTemperature, int existingTint )
+{
+    LookAssistWhiteBalanceRequest request = noPatchRequest( stats, scene );
+    request.solvedOnProcessedPicture = true;
+    request.renderBalance = scene.renderer();
+    LookAssistRenderedPicture existing;
+    scene.renderer()( 0.0, existingTemperature, existingTint, &existing );
+    request.patch = findLookAssistAutoWhiteBalancePatch( existing.rgb.data(), existing.width, existing.height,
+                                                         existing.downscaleFactor, request.rawWidth, request.rawHeight );
+    return request;
+}
+
+// What the consumers' MASTER PASS computes for the same input: the clip is re-analysed with the recorded-exposure
+// daylight hypothesis off (the scene is then master's own verdict, so the solve is the damped one).
+LookAssistWhiteBalanceResolution masterPassResolution( const LookAssistWhiteBalanceRequest &daylightRequest,
+                                                       const LookAssistStats &daylightStats,
+                                                       const LookAssistWhiteBalanceSolveFn &solver,
+                                                       LookAssistPreset *preset )
+{
+    LookAssistStats master = daylightStats;
+    master.daylightPictureEvidence = false;
+    const LookAssistScene masterScene = classifyLookAssistScene( master );
+    LookAssistWhiteBalanceRequest request = daylightRequest;
+    request.stats = &master;
+    request.scene = masterScene;
+    *preset = presetForLookAssistScene( masterScene, master );
+    return resolveLookAssistWhiteBalance( request, solver, preset );
 }
 
 void expectMastersBalance( const LookAssistWhiteBalanceResolution &r, const LookAssistStats &stats, int baseTemperature, int baseTint )
@@ -1098,21 +1131,20 @@ TEST(LookAssistScene, TheRefinementRunsOnlyWhereItIsMeantTo)
         resolveLookAssistWhiteBalance( request, scene.solver(), &preset );
         ASSERT_EQ( 0, scene.renders );
     }
-    // A trusted patch was found and accepted: that decision stands, nothing is rendered.
+    // A trusted patch was found and accepted: the refinement (which looks for a patch) does not run, and the
+    // patch is verified on its own surface (LOOK-ASSIST-SCENE-CLASSIFY-3): the base picture and the solution.
     {
-        const LookAssistStats day = daylightWithPrior( 7000, 0 );
-        LookAssistWhiteBalanceRequest request = noPatchRequest( &day, scene );
-        request.solvedOnProcessedPicture = true;
-        request.patch.valid = true; request.patch.luma = 205.0; request.patch.chroma = 12.0; request.patch.blueAmberAxis = 12.0;
-        request.renderBalance = scene.renderer();
+        const LookAssistStats day = daylightWithPrior( 6300, -15 );
+        LookAssistWhiteBalanceRequest request = initialPatchRequest( &day, scene, 6300, -15 );
+        ASSERT_TRUE( request.patch.valid );
+        scene.renders = 0;
         LookAssistPreset preset = presetForLookAssistScene( LookAssistScene::Shade, day );
-        const LookAssistWhiteBalanceResolution r = resolveLookAssistWhiteBalance(
-            request, []( int, int, int *t, int *tint ) { *t = 9990; *tint = -35; }, &preset );
+        const LookAssistWhiteBalanceResolution r = resolveLookAssistWhiteBalance( request, scene.solver(), &preset );
         ASSERT_TRUE( r.autoValid );
         ASSERT_FALSE( r.legacyBalance );
         ASSERT_FALSE( r.refineAttempted );
-        ASSERT_EQ( 0, scene.renders );
-        ASSERT_EQ( 9990, r.temperature );
+        ASSERT_EQ( 2, scene.renders );   // the as-shot base picture and the verification at the solution
+        ASSERT_EQ( 6540, r.temperature );
     }
     // A renderer that fails: master's balance.
     {
@@ -1161,6 +1193,230 @@ TEST(LookAssistScene, TheNarrowingSwitchRestoresMastersBalance)
         ASSERT_TRUE( r.refinePatchAcquired );
         ASSERT_EQ( 6540, r.temperature );
     }
+}
+
+// ---- LOOK-ASSIST-SCENE-CLASSIFY-3: the INITIAL patch is judged on the surface too ----
+//
+// sol, PR #222 r2: the consumers find the initial patch on a picture rendered at the EXISTING processing white
+// balance, so a surface that is blue at the as-shot balance but near-neutral under an existing / custom balance
+// was accepted undamped (9800 K / -20) with no base guard and no same-surface verification, where master's damped
+// solve gives 8470 K / -13. The same two guards the refinement applies now stand in front of that branch; a patch
+// that fails either, or cannot be verified, is not believed and the clip takes MASTER's path.
+TEST(LookAssistScene, ASurfaceThatIsBlueAtTheAsShotBalanceIsNotAcceptedUndampedFromTheInitialPatch)
+{
+    // sol's repro, RUN through the renderer the real consumers pass, in the scene where every surface (water and sky
+    // too) moves with the white balance. Physically neutral only at 9800 K: 124/137/156 at the as-shot 6000 K
+    // (B-R +32), 134/139/146 at the existing 7895 K / -12 balance (chroma 12, B-R +12: it passes the guard THERE).
+    DeckScene scene;
+    scene.neutralTemperature = 9800;
+    const LookAssistStats day = daylightWithPrior( 6000, 0 );
+    LookAssistWhiteBalanceRequest request = initialPatchRequest( &day, scene, 7895, -12 );
+    ASSERT_TRUE( request.patch.valid );
+    ASSERT_TRUE( scene.onDeck( request.patch.thumbnailX, request.patch.thumbnailY ) );
+    ASSERT_TRUE( lookAssistDaylightPatchIsNeutralEnough( request.patch ) );          // what the initial branch believed
+    ASSERT_TRUE( lookAssistAutoWhiteBalanceSolutionIsStable( request.patch, 6000, 0, 9800, -20, true ) );
+
+    scene.renders = 0;
+    LookAssistPreset preset = presetForLookAssistScene( LookAssistScene::Shade, day );
+    const LookAssistWhiteBalanceResolution r = resolveLookAssistWhiteBalance( request, scene.solver(), &preset );
+    // Not 9800 K / -20, and not accepted: refused at the as-shot base picture, no second chance from the refinement.
+    ASSERT_FALSE( r.autoValid );
+    ASSERT_TRUE( r.initialPatchChecked );
+    ASSERT_TRUE( r.initialPatchRefused );
+    ASSERT_TRUE( r.initialPatchRefusedAtBase );
+    ASSERT_TRUE( r.initialPatchBaseBlueAmber > 20.0 );        // measured at BASE: 124/137/156
+    ASSERT_FALSE( r.refineAttempted );
+    ASSERT_EQ( 1, scene.renders );                             // the base picture only; nothing walked or verified
+    ASSERT_EQ( 9800, r.candidateTemperature );                 // reported, never applied
+    ASSERT_TRUE( r.temperature != 9800 );
+    expectMastersBalance( r, day, 6000, 0 );                   // legacyBalance: the consumers re-run master's analysis
+
+    // That master pass: the damped solve of the SAME patch, which is what master applied (sol: 8470 K / -13).
+    LookAssistPreset masterPreset;
+    const LookAssistWhiteBalanceResolution master = masterPassResolution( request, day, scene.solver(), &masterPreset );
+    ASSERT_TRUE( master.autoValid );
+    ASSERT_TRUE( master.decision == QStringLiteral("accepted-damped") );
+    ASSERT_NEAR( 0.65, master.damping, 1e-9 );
+    ASSERT_EQ( 8470, master.temperature );
+    ASSERT_EQ( -13, master.tint );
+    ASSERT_FALSE( master.legacyBalance );
+}
+
+TEST(LookAssistScene, AnInitialPatchThatIsNeutralAtTheAsShotBalanceAndAtTheSolutionKeepsTheUndampedSolve)
+{
+    // The state that IMPROVES on master: a real neutral surface (the deck) found on the initial picture is
+    // near-neutral in the as-shot base picture, solved to its neutral balance, and verified on that same surface.
+    DeckScene scene;
+    const LookAssistStats day = daylightWithPrior( 6300, -15 );
+    LookAssistWhiteBalanceRequest request = initialPatchRequest( &day, scene, 7000, -5 );
+    ASSERT_TRUE( request.patch.valid );
+    scene.renders = 0;
+    LookAssistPreset preset = presetForLookAssistScene( LookAssistScene::Shade, day );
+    const LookAssistWhiteBalanceResolution r = resolveLookAssistWhiteBalance( request, scene.solver(), &preset );
+    ASSERT_TRUE( r.autoValid );
+    ASSERT_TRUE( r.initialPatchChecked );
+    ASSERT_FALSE( r.initialPatchRefused );
+    ASSERT_FALSE( r.legacyBalance );
+    ASSERT_FALSE( r.refineAttempted );
+    ASSERT_TRUE( r.source == QStringLiteral("processed-neutral-patch") );
+    ASSERT_TRUE( r.decision == QStringLiteral("accepted") );
+    ASSERT_NEAR( 1.0, r.damping, 1e-9 );
+    ASSERT_EQ( 6540, r.temperature );
+    ASSERT_EQ( -20, r.tint );
+    ASSERT_EQ( 2, scene.renders );                              // the base picture and the verification
+    ASSERT_EQ( r.temperature, 6000 + preset.temperatureDelta );
+    ASSERT_TRUE( r.initialPatchFinalChroma <= 1.5 );            // that same deck at the solution is neutral
+    ASSERT_TRUE( r.initialPatchBaseChroma <= 10.0 );
+}
+
+TEST(LookAssistScene, AnInitialPatchWhoseSolutionLeavesTheSameSurfaceCastIsRefused)
+{
+    // The base surface is fine, but the solver's answer renders the SAME surface with a cast (a deck of 6540 K
+    // solved to 9990 K / -20): the same-surface verification refuses it -- not the base guard.
+    DeckScene scene;
+    const LookAssistStats day = daylightWithPrior( 6300, -15 );
+    LookAssistWhiteBalanceRequest request = initialPatchRequest( &day, scene, 7000, -5 );
+    ASSERT_TRUE( request.patch.valid );
+    LookAssistPreset preset = presetForLookAssistScene( LookAssistScene::Shade, day );
+    const LookAssistWhiteBalanceResolution r = resolveLookAssistWhiteBalance(
+        request, []( int, int, int *t, int *tint ) { *t = 9990; *tint = -20; }, &preset );
+    ASSERT_FALSE( r.autoValid );
+    ASSERT_TRUE( r.initialPatchRefused );
+    ASSERT_FALSE( r.initialPatchRefusedAtBase );
+    ASSERT_TRUE( r.initialPatchFinalChroma > request.patch.chroma + 0.75 );   // the deck, at the solution, is cast
+    ASSERT_FALSE( r.refineAttempted );
+    ASSERT_TRUE( r.temperature != 9990 );
+    expectMastersBalance( r, day, 6000, 0 );
+}
+
+TEST(LookAssistScene, AnInitialPatchThatCannotBeVerifiedIsMastersNotBelieved)
+{
+    DeckScene scene;
+    const LookAssistStats day = daylightWithPrior( 6300, -15 );
+    // (a) no renderer to ask
+    {
+        LookAssistWhiteBalanceRequest request = initialPatchRequest( &day, scene, 7000, -5 );
+        request.renderBalance = LookAssistRenderBalanceFn();
+        LookAssistPreset preset = presetForLookAssistScene( LookAssistScene::Shade, day );
+        const LookAssistWhiteBalanceResolution r = resolveLookAssistWhiteBalance( request, scene.solver(), &preset );
+        ASSERT_TRUE( r.initialPatchRefused );
+        ASSERT_FALSE( r.autoValid );
+        expectMastersBalance( r, day, 6000, 0 );
+    }
+    // (b) the narrowing switch is off: master's analysis everywhere, an initial patch included
+    {
+        LookAssistWhiteBalanceRequest request = initialPatchRequest( &day, scene, 7000, -5 );
+        request.refineWithoutPatch = false;
+        scene.renders = 0;
+        LookAssistPreset preset = presetForLookAssistScene( LookAssistScene::Shade, day );
+        const LookAssistWhiteBalanceResolution r = resolveLookAssistWhiteBalance( request, scene.solver(), &preset );
+        ASSERT_TRUE( r.initialPatchRefused );
+        ASSERT_EQ( 0, scene.renders );
+        expectMastersBalance( r, day, 6000, 0 );
+    }
+    // (c) a renderer that fails
+    {
+        LookAssistWhiteBalanceRequest request = initialPatchRequest( &day, scene, 7000, -5 );
+        request.renderBalance = []( double, int, int, LookAssistRenderedPicture * ) { return false; };
+        LookAssistPreset preset = presetForLookAssistScene( LookAssistScene::Shade, day );
+        const LookAssistWhiteBalanceResolution r = resolveLookAssistWhiteBalance( request, scene.solver(), &preset );
+        ASSERT_TRUE( r.initialPatchRefused );
+        expectMastersBalance( r, day, 6000, 0 );
+    }
+    // (d) no recorded as-shot balance: there is no as-shot base picture to judge the surface in
+    {
+        const LookAssistStats noPrior = [] { LookAssistStats s = daylightFixture(); lookAssistSetAsShotWhiteBalance( &s, false, 6000, 0 ); return s; }();
+        LookAssistWhiteBalanceRequest request = initialPatchRequest( &noPrior, scene, 7000, -5 );
+        LookAssistPreset preset = presetForLookAssistScene( LookAssistScene::Shade, noPrior );
+        const LookAssistWhiteBalanceResolution r = resolveLookAssistWhiteBalance( request, scene.solver(), &preset );
+        ASSERT_TRUE( r.initialPatchRefused );
+        expectMastersBalance( r, noPrior, 6000, 0 );
+    }
+    // (e) the patch is not a pixel of the picture the renderer returns (a different thumbnail geometry)
+    {
+        LookAssistWhiteBalanceRequest request = initialPatchRequest( &day, scene, 7000, -5 );
+        request.patch.thumbnailX = scene.width + 3;
+        LookAssistPreset preset = presetForLookAssistScene( LookAssistScene::Shade, day );
+        const LookAssistWhiteBalanceResolution r = resolveLookAssistWhiteBalance( request, scene.solver(), &preset );
+        ASSERT_TRUE( r.initialPatchRefused );
+        expectMastersBalance( r, day, 6000, 0 );
+        request.patch.thumbnailX = 0;   // inside the picture, but rawX does not map from it
+        request.patch.rawX = 5;
+        preset = presetForLookAssistScene( LookAssistScene::Shade, day );
+        ASSERT_TRUE( resolveLookAssistWhiteBalance( request, scene.solver(), &preset ).initialPatchRefused );
+    }
+}
+
+TEST(LookAssistScene, TheInitialPatchGateLeavesEveryOtherPathAsItWas)
+{
+    DeckScene scene;
+    // A RAW-thumbnail patch (not solved on the processed picture) is damped as before: nothing is rendered for it.
+    {
+        const LookAssistStats day = daylightWithPrior( 6300, -15 );
+        LookAssistWhiteBalanceRequest request = initialPatchRequest( &day, scene, 7000, -5 );
+        request.solvedOnProcessedPicture = false;
+        scene.renders = 0;
+        LookAssistPreset preset = presetForLookAssistScene( LookAssistScene::Shade, day );
+        const LookAssistWhiteBalanceResolution r = resolveLookAssistWhiteBalance( request, scene.solver(), &preset );
+        ASSERT_FALSE( r.initialPatchChecked );
+        ASSERT_EQ( 0, scene.renders );
+        ASSERT_TRUE( r.autoValid );
+        ASSERT_TRUE( r.source == QStringLiteral("raw-neutral-patch") );
+    }
+    // Night / not corroborated daylight: master's own damped solve, no guard, nothing rendered.
+    {
+        LookAssistStats master = daylightWithPrior( 6300, -15 );
+        master.daylightPictureEvidence = false;
+        const LookAssistScene masterScene = classifyLookAssistScene( master );
+        LookAssistWhiteBalanceRequest request = initialPatchRequest( &master, scene, 7000, -5 );
+        request.scene = masterScene;
+        scene.renders = 0;
+        LookAssistPreset preset = presetForLookAssistScene( masterScene, master );
+        const LookAssistWhiteBalanceResolution r = resolveLookAssistWhiteBalance( request, scene.solver(), &preset );
+        ASSERT_FALSE( r.initialPatchChecked );
+        ASSERT_EQ( 0, scene.renders );
+        ASSERT_TRUE( r.autoValid );
+        ASSERT_TRUE( r.source == QStringLiteral("processed-neutral-patch") );
+        ASSERT_TRUE( r.damping < 0.999 || r.decision == QStringLiteral("accepted") );
+    }
+    // A patch the existing guards already reject (a pale-blue surface) still goes on to the refinement, as in #222.
+    {
+        DeckScene pool;
+        pool.hasDeck = false;
+        pool.hasBlueSurface = true;
+        const LookAssistStats day = daylightWithPrior( 6000, 0 );
+        LookAssistWhiteBalanceRequest request = initialPatchRequest( &day, pool, 12000, -60 );
+        request.patch.valid = true;   // whatever the search found, it is on the pale-blue surface
+        request.patch.thumbnailX = 60; request.patch.thumbnailY = 10;
+        request.patch.rawX = 60 * pool.downscale + pool.downscale / 2;
+        request.patch.rawY = 10 * pool.downscale + pool.downscale / 2;
+        request.patch.luma = 180.0; request.patch.chroma = 32.0; request.patch.blueAmberAxis = 32.0;
+        LookAssistPreset preset = presetForLookAssistScene( LookAssistScene::Shade, day );
+        const LookAssistWhiteBalanceResolution r = resolveLookAssistWhiteBalance( request, pool.solver(), &preset );
+        ASSERT_FALSE( r.initialPatchChecked );   // never "stable": the existing guard answered first
+        ASSERT_TRUE( r.refineAttempted );
+        ASSERT_FALSE( r.initialPatchRefused );
+    }
+}
+
+TEST(LookAssistScene, BothConsumersTakeMastersPassForARefusedInitialPatch)
+{
+    // The consumers need no second branch: a refused initial patch reports legacyBalance, which both of them
+    // already turn into the master pass (the clip re-analysed with the recorded-exposure hypothesis off).
+    const QString applier = readRepoFile( QStringLiteral("src/batch/ReceiptApplier.cpp") );
+    const QString window = readRepoFile( QStringLiteral("platform/qt/MainWindow.cpp") );
+    ASSERT_TRUE( window.contains( QStringLiteral("if( wb.legacyBalance && !s_lookAssistMasterScenePass )") ) );
+    ASSERT_TRUE( applier.contains( QStringLiteral("if( wb.legacyBalance && !masterScenePass )") ) );
+    // The decision lives once, in the shared module (the consumers never judge a patch themselves).
+    const QString analysis = readRepoFile( QStringLiteral("src/batch/LookAssistAnalysis.cpp") );
+    ASSERT_EQ( 1, analysis.count( QStringLiteral("initialDaylightPatchIsVerified( request,") ) );
+    for( const QString &source : { applier, window } )
+    {
+        ASSERT_FALSE( source.contains( QStringLiteral("initialDaylightPatchIsVerified(") ) );
+        ASSERT_TRUE( source.contains( QStringLiteral("resolveLookAssistWhiteBalance(") ) );
+    }
+    // The async worker still passes no renderer, because a corroborated daylight scene never reaches it.
+    ASSERT_TRUE( window.contains( QStringLiteral("lookAssistIsDaylightScene( stats, scene ) || s_lookAssistMasterScenePass") ) );
 }
 
 TEST(LookAssistScene, TheNarrowingSwitchIsTheOnlyGateInFrontOfTheRefinement)
