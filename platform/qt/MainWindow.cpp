@@ -1337,8 +1337,15 @@ static void logInteractionEvent( const QString &event,
 // module (src/batch/LookAssistAnalysis.*), also used by the headless ReceiptApplier.
 using namespace lookassist;
 
-// One trace line for the shared render-based daylight refinement (UI thread; sync logs it directly, async
-// logs it from the queued continuation). Silent when the refinement never ran.
+// True while applyLookAssistToReceipt re-runs itself with the recorded-exposure daylight hypothesis switched off:
+// a corroborated daylight clip that neither an accepted patch nor a VERIFIED surface backs is analysed exactly as
+// master analyses it (its own scene verdict, exposure, colour source, balance and post-balance walk). UI thread only.
+static bool s_lookAssistMasterScenePass = false;
+
+// One trace line for the shared render-based daylight refinement (UI thread, sync path: a corroborated daylight
+// scene never takes the async worker). Silent when the refinement never ran. legacy=1: nothing was acquired
+// and master's balance stands; refused_at_base=1: the best surface of a stepped picture failed the guard on
+// the unstepped base picture (base_surface_* are its measure there).
 static void logLookAssistDaylightRefine( const LookAssistWhiteBalanceResolution &wb,
                                          const QString &path,
                                          int frame )
@@ -1346,7 +1353,7 @@ static void logLookAssistDaylightRefine( const LookAssistWhiteBalanceResolution 
     if( !wb.refineAttempted ) return;
     logInteractionEvent(
         QStringLiteral("look_assist.daylight_refine"),
-        QStringLiteral("path=%1 refined=%2 patch_acquired=%3 renders=%4 start_temp=%5 start_tint=%6 final_temp=%7 final_tint=%8 start_score=%9 score=%10 blue_amber_axis=%11 green_axis=%12 patch_chroma_found=%13 patch_chroma_at_result=%14 candidate_temp=%15 candidate_tint=%16 preview_mode=%18 preview_scale=%19 frame=%17")
+        QStringLiteral("path=%1 refined=%2 patch_acquired=%3 renders=%4 start_temp=%5 start_tint=%6 final_temp=%7 final_tint=%8 start_score=%9 score=%10 blue_amber_axis=%11 green_axis=%12 patch_chroma_found=%13 patch_chroma_at_result=%14 candidate_temp=%15 candidate_tint=%16 preview_mode=%18 preview_scale=%19 legacy=%20 refused_at_base=%21 base_surface_chroma=%22 base_surface_blue_amber=%23 frame=%17")
             .arg( path )
             .arg( bool01( wb.refined ) )
             .arg( bool01( wb.refinePatchAcquired ) )
@@ -1365,7 +1372,11 @@ static void logLookAssistDaylightRefine( const LookAssistWhiteBalanceResolution 
             .arg( wb.candidateTint )
             .arg( frame )
             .arg( processingPlaybackPreviewModeEnabled() )
-            .arg( processingPlaybackPreviewScaleFactor() ) );
+            .arg( processingPlaybackPreviewScaleFactor() )
+            .arg( bool01( wb.legacyBalance ) )
+            .arg( bool01( wb.refineRefusedAtBase ) )
+            .arg( wb.refineBaseSurfaceChroma, 0, 'f', 2 )
+            .arg( wb.refineBaseSurfaceBlueAmber, 0, 'f', 2 ) );
 }
 
 static QString lookAssistColorCastWarning(
@@ -15517,7 +15528,10 @@ void MainWindow::applyLookAssistToReceipt( ReceiptSettings *receipt,
                 .arg( analysisFrame ) );
         return true;
     };
-    const LookAssistScene scene = resolveLookAssistScene( &stats, renderProcessed );
+    // The master pass gives the recorded exposure no say: no picture evidence is asked for, so the scene is
+    // the one master classified (daylight needs the evidence).
+    const LookAssistScene scene = resolveLookAssistScene(
+        &stats, s_lookAssistMasterScenePass ? LookAssistRenderFn() : LookAssistRenderFn( renderProcessed ) );
     const bool floorLiftedNightThumbnail =
         lookAssistIsFloorLiftedNightThumbnail( scene, stats );
     const bool processedColorWanted = lookAssistShouldAnalyzeProcessedColor( scene, stats );
@@ -15691,10 +15705,11 @@ void MainWindow::applyLookAssistToReceipt( ReceiptSettings *receipt,
     // come from the render-based refinement (resolveLookAssistWhiteBalance -> refineLookAssistDaylightWhiteBalance),
     // which renders the LIVE picture, and a detached worker cannot: its isolated render is a different
     // picture (measured on the tracked fixtures: the same 6000 K / tint 0 / 1.6 stops scores 25 on the
-    // worker and 62 live) and a slower one (8 s settle window exceeded on the large clip). Running the one
-    // consumer path guarantees sync and async land on the same white balance, by construction.
-    const bool daylightNeedsLivePicture = kLookAssistRefineDaylightWithoutPatch
-                                       && lookAssistIsDaylightScene( stats, scene );
+    // worker and 62 live) and a slower one (8 s settle window exceeded on the large clip). And when nothing
+    // backs the daylight verdict the clip is re-analysed as master analyses it (the master pass below), which
+    // is a sync-path analysis too. Running the one consumer path guarantees sync and async land on the same
+    // white balance, by construction. The master pass itself stays on the sync path for the same reason.
+    const bool daylightNeedsLivePicture = lookAssistIsDaylightScene( stats, scene ) || s_lookAssistMasterScenePass;
     if( !s_syncMode && !daylightNeedsLivePicture )
     {
         // Capture slider bounds (UI-thread-only values) before dispatch.
@@ -15925,12 +15940,10 @@ void MainWindow::applyLookAssistToReceipt( ReceiptSettings *receipt,
             // Post-balance refinement (canAnalyzeProcessedColor path): the iterative re-render loop of
             // the sync path applies temperature / tint deltas to the processing object between renders,
             // which a worker thread cannot do while the UI thread renders concurrently. It is skipped
-            // here; the preset (exposure + WB) is applied exactly as resolved. The sync path skips the
-            // same loop for a daylight scene (see refinePostBalance): a daylight clip is balanced inside
-            // resolveLookAssistWhiteBalance (patch solve or the shared render-based refinement, rendered
-            // here through the isolated renderer), so all three paths (async, sync, headless) apply the
-            // SAME white balance from the same decision; only a night floor-lifted clip is refined by
-            // the sync path (by at most +-500 K / the night tint cap).
+            // here; the preset (exposure + WB) is applied exactly as resolved, which is master's async
+            // behaviour. A corroborated daylight scene never reaches this worker (daylightNeedsLivePicture:
+            // it takes the sync path, the one place that can render the live picture and re-analyse the clip
+            // as master does when nothing backs the verdict), so everything resolved here is master's.
             r.postColorStatsValid   = false;
             r.postTemperatureDelta  = 0;
             r.postTintDelta         = 0;
@@ -16413,6 +16426,30 @@ void MainWindow::applyLookAssistToReceipt( ReceiptSettings *receipt,
         },
         &preset );
     logLookAssistDaylightRefine( wb, QStringLiteral("sync"), analysisFrame );
+    if( wb.legacyBalance && !s_lookAssistMasterScenePass )
+    {
+        // Corroborated daylight that neither an accepted patch nor a VERIFIED surface backs: the verdict is
+        // not trusted, so the clip gets MASTER's analysis from the top -- its scene verdict, exposure, colour
+        // source, balance and post-balance walk (never the as-shot prior, which measured worse than master's
+        // look in this very state). Undo the one thing this pass changed first (the auto chroma smoothing the
+        // daylight verdict switched on), then run the pass again with the recorded-exposure hypothesis off.
+        logInteractionEvent(
+            QStringLiteral("look_assist.daylight_fallback_to_master"),
+            QStringLiteral("reason=no_verified_surface refused_at_base=%1 frame=%2")
+                .arg( bool01( wb.refineRefusedAtBase ) )
+                .arg( analysisFrame ) );
+        if( m_lastLookAssistChromaSmoothAutoApplied )
+        {
+            const int chromaSmoothBefore = qBound( 0, m_lastLookAssistChromaSmooth, 3 );
+            setToolButtonChromaSmooth( chromaSmoothBefore );
+            toolButtonChromaSmoothChanged();
+            receipt->setChromaSmooth( chromaSmoothBefore );
+        }
+        s_lookAssistMasterScenePass = true;
+        applyLookAssistToReceipt( receipt, analysisFrame );
+        s_lookAssistMasterScenePass = false;
+        return;
+    }
     const bool autoWhiteBalanceValid = wb.autoValid;
     const QString autoWhiteBalanceSource = wb.source;
     const QString autoWhiteBalanceDecision = wb.decision;
@@ -16489,10 +16526,12 @@ void MainWindow::applyLookAssistToReceipt( ReceiptSettings *receipt,
         };
 
         bool adjustedPostBalance = false;
-        // A daylight scene is NOT refined by this night-path loop: resolveLookAssistWhiteBalance already
-        // balanced it from the picture (patch solve, or -- with no trusted patch -- the shared
-        // render-based refinement), identically for sync, async and headless. Refining only this path
-        // (up to +-500 K, kept or reverted by a score) would make the three paths disagree.
+        // A daylight scene is NOT refined by this loop: resolveLookAssistWhiteBalance already balanced it
+        // from the picture (patch solve, or -- with no trusted patch -- a surface the shared render-based
+        // refinement VERIFIED), identically for sync, async and headless: refining only this path (up to
+        // +-500 K, kept or reverted by a score) would make the three paths disagree. A daylight clip that
+        // acquired nothing never gets here: it was re-analysed as master analyses it (the master pass above),
+        // whose scene is not daylight, so THIS is master's own post-balance walk, unchanged.
         const bool daylightScene = lookAssistIsDaylightScene( stats, scene );
         const bool refinePostBalance =
             !daylightScene && ( !autoWhiteBalanceValid || useProcessedColorStats );

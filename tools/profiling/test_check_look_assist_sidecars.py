@@ -68,6 +68,20 @@ class CheckLookAssistSidecars(unittest.TestCase):
             self.assertEqual([], chk.check([("f", sidecar(look_assist_wb_decision=decision))]), decision)
         self.assertTrue(chk.check([("f", sidecar(look_assist_wb_decision="prior"))]))
 
+    def test_masters_own_analysis_is_a_pass_only_when_the_caller_allows_it(self):
+        # PR #222 r2: a daylight verdict nothing verifies falls back to MASTER's analysis (scene night, source none).
+        master = sidecar(look_assist_scene="night", look_assist_wb_source="none", look_assist_wb_decision="none",
+                         look_assist_temperature=6480, look_assist_tint=-19)
+        self.assertTrue(chk.check([("f", master)]))                                   # the improvement gate refuses it
+        self.assertEqual([], chk.check([("f", master)], allow_master_fallback=True))  # the safety gate does not
+        # the half-states never pass, whatever the flag: the label cannot launder the picture
+        for source, decision in (("as-shot-prior", "prior"), ("master-balance", "legacy")):
+            half = sidecar(look_assist_scene="shade", look_assist_wb_source=source, look_assist_wb_decision=decision,
+                           look_assist_temperature=6000, look_assist_tint=0)
+            self.assertTrue(chk.check([("f", half)], allow_master_fallback=True), source)
+        # and a master analysis still has to have settled
+        self.assertTrue(chk.check([("f", dict(master, settled=False))], allow_master_fallback=True))
+
     def test_look_assist_off_and_too_few_frames_fail(self):
         self.assertTrue(chk.check([("f", sidecar(look_assist_enabled=False))]))
         self.assertTrue(chk.check([("f", sidecar())], min_frames=2))

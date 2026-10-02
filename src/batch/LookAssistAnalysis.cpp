@@ -565,9 +565,16 @@ static void lookAssistFinalizeWhiteBalance( const LookAssistWhiteBalanceRequest 
 // the render of the state it runs in, so the refinement reuses it: the patch search needs neutral samples
 // (>= 1 % of the picture), which a picture rendered at a white balance far from the scene's has none of
 // (that is the whole reason no patch was found). So step the RENDERED picture until it has neutral samples,
-// run the same patch search + solver + stability guard on it, and VERIFY by rendering at the solution (the
-// best neutral patch there must be no more cast than where it was found). If no verified patch appears the
-// white balance stays at the as-shot prior: the probes only steer the search, none is an answer.
+// run the same patch search + solver + stability guard on it, and VERIFY by rendering at the solution.
+//
+// What the guards judge is what the SURFACE IS, never how it looks after we have re-balanced: a surface
+// that is neutral only because the walk stepped the white balance until it was (a pale-blue sky / water
+// surface walked to grey is the textbook case) must not be believed. So a candidate surface is identified by
+// its pixel region (the thumbnail geometry is the same in every render) and must pass the near-neutral /
+// not-blue-locus guard on the BASE picture, rendered at the unstepped as-shot prior, too: a surface that is
+// blue-locus at base is never acquired, however neutral it looks after stepping. The verification measures
+// that SAME surface at the solution, not the best patch anywhere. When nothing is acquired the caller falls
+// back to MASTER's balance (resolveLookAssistWhiteBalance); the probes only ever steer the search.
 static const int    kRefineMaxProbes           = 7;      // probe renders after the start picture
 static const double kRefineDeadBand            = 2.0;    // |axis| below this is neutral enough
 static const double kRefineMinImprovement      = 0.25;   // score points a probe must gain to count
@@ -587,6 +594,39 @@ static bool lookAssistPictureHasNeutralSamples( const LookAssistRenderedPicture 
         && picture.height > 0
         && picture.rgb.size() >= (size_t)picture.width * (size_t)picture.height * 3u
         && picture.stats.balanceSamples >= qMax( 32, ( picture.width * picture.height ) / 100 );
+}
+
+// The surface at pixel (x, y) of a rendered picture, measured exactly as the patch search measures a pixel
+// (luma, chroma = max - min, blue-amber, green axis; the thumbnail is already an area average of the frame).
+// This is how a surface found in a STEPPED picture is looked at again in the base picture and in the
+// verification picture: the thumbnail geometry is identical in every render, so the pixel is the same surface.
+static LookAssistAutoWhiteBalancePatch lookAssistSurfaceAt( const LookAssistRenderedPicture &picture, int x, int y )
+{
+    LookAssistAutoWhiteBalancePatch surface;
+    if( picture.width <= 0 || picture.height <= 0
+     || picture.rgb.size() < (size_t)picture.width * (size_t)picture.height * 3u
+     || x < 0 || y < 0 || x >= picture.width || y >= picture.height )
+        return surface;
+    const unsigned char *p = &picture.rgb[( (size_t)y * (size_t)picture.width + (size_t)x ) * 3u];
+    const double r = p[0];
+    const double g = p[1];
+    const double b = p[2];
+    surface.valid = true;
+    surface.thumbnailX = x;
+    surface.thumbnailY = y;
+    surface.luma = ( 54.0 * r + 183.0 * g + 19.0 * b ) / 256.0;
+    surface.chroma = qMax( r, qMax( g, b ) ) - qMin( r, qMin( g, b ) );
+    surface.greenAxis = g - ( r + b ) * 0.5;
+    surface.blueAmberAxis = b - r;
+    return surface;
+}
+
+// Same thumbnail geometry: pixel (x, y) is the same surface in both pictures.
+static bool lookAssistSamePictureGeometry( const LookAssistRenderedPicture &a, const LookAssistRenderedPicture &b )
+{
+    return a.width > 0 && a.width == b.width && a.height == b.height && a.downscaleFactor == b.downscaleFactor
+        && a.rgb.size() >= (size_t)a.width * (size_t)a.height * 3u
+        && b.rgb.size() >= (size_t)b.width * (size_t)b.height * 3u;
 }
 
 static void refineDaylightFromRenderedPicture( const LookAssistWhiteBalanceRequest &request,
@@ -632,6 +672,10 @@ static void refineDaylightFromRenderedPicture( const LookAssistWhiteBalanceReque
     out->refineStartTemperature = startTemperature;
     out->refineStartTint = startTint;
 
+    // The BASE picture: the unstepped render at the as-shot prior. Every candidate surface is judged here too.
+    const LookAssistRenderedPicture basePicture = picture;
+    bool refusedAtBase = false;   // the best surface of a stepped picture is not neutral-enough AT BASE: stop walking
+
     const Point start = pointOf( startTemperature, startTint, picture.stats );
     Point best = start;       // best score seen (steers the probe steps; never an answer by itself)
     out->refineStartScore = start.score;
@@ -650,6 +694,15 @@ static void refineDaylightFromRenderedPicture( const LookAssistWhiteBalanceReque
             request.rawWidth, request.rawHeight );
         if( !patch.valid || !lookAssistDaylightPatchIsNeutralEnough( patch ) ) return false;
 
+        // What the surface IS: the same pixels in the unstepped base picture must be near-neutral and off the
+        // blue sky / water locus as well. A surface that only looks neutral after the walk is never acquired.
+        if( !lookAssistSamePictureGeometry( basePicture, picture ) ) { refusedAtBase = true; return false; }
+        const LookAssistAutoWhiteBalancePatch baseSurface = lookAssistSurfaceAt( basePicture, patch.thumbnailX, patch.thumbnailY );
+        out->refineBaseSurfaceChroma = baseSurface.chroma;
+        out->refineBaseSurfaceBlueAmber = baseSurface.blueAmberAxis;
+        if( !lookAssistDaylightPatchIsNeutralEnough( baseSurface ) ) { refusedAtBase = true; out->refineRefusedAtBase = true; return false; }
+        const LookAssistAutoWhiteBalancePatch foundSurface = lookAssistSurfaceAt( picture, patch.thumbnailX, patch.thumbnailY );
+
         int solvedTemperature = request.baseTemperature;
         int solvedTint = request.baseTint;
         solve( patch.rawX, patch.rawY, &solvedTemperature, &solvedTint );
@@ -667,15 +720,15 @@ static void refineDaylightFromRenderedPicture( const LookAssistWhiteBalanceReque
         LookAssistRenderedPicture verify;
         if( !request.renderBalance( exposureStops, solvedTemperature, solvedTint, &verify ) ) return false;
         ++out->refineRenders;
-        const LookAssistAutoWhiteBalancePatch verifyPatch = findLookAssistAutoWhiteBalancePatch(
-            verify.rgb.data(), verify.width, verify.height, verify.downscaleFactor,
-            request.rawWidth, request.rawHeight );
-        out->refineStartPatchChroma = patch.chroma;
-        out->refineFinalPatchChroma = verifyPatch.valid ? verifyPatch.chroma : 0.0;
-        if( verify.rgb.size() < (size_t)verify.width * (size_t)verify.height * 3u
-         || !verifyPatch.valid
-         || !lookAssistDaylightPatchIsNeutralEnough( verifyPatch )
-         || verifyPatch.chroma > patch.chroma + kRefineVerifyChromaSlack )
+        // Verify the SAME acquired surface at the solution (not the best patch anywhere): it must be
+        // near-neutral there and no more cast than where it was found.
+        if( !lookAssistSamePictureGeometry( picture, verify ) ) return false;
+        const LookAssistAutoWhiteBalancePatch solutionSurface = lookAssistSurfaceAt( verify, patch.thumbnailX, patch.thumbnailY );
+        out->refineStartPatchChroma = foundSurface.chroma;
+        out->refineFinalPatchChroma = solutionSurface.valid ? solutionSurface.chroma : 0.0;
+        if( !solutionSurface.valid
+         || !lookAssistDaylightPatchIsNeutralEnough( solutionSurface )
+         || solutionSurface.chroma > foundSurface.chroma + kRefineVerifyChromaSlack )
             return false;
 
         out->autoValid = true;
@@ -701,7 +754,7 @@ static void refineDaylightFromRenderedPicture( const LookAssistWhiteBalanceReque
     for( int probes = 0;; ++probes )
     {
         if( acquirePatch() ) return;
-        if( probes >= kRefineMaxProbes ) break;
+        if( refusedAtBase || probes >= kRefineMaxProbes ) break;   // a surface refused at base stays refused: stop rendering
 
         const bool moveTemperature = fabs( best.blueAmber ) >= kRefineDeadBand;
         const bool moveTint = fabs( best.green ) >= kRefineDeadBand;
@@ -750,8 +803,8 @@ static void refineDaylightFromRenderedPicture( const LookAssistWhiteBalanceReque
         }
         if( failures >= 3 ) break;
     }
-    // No verified neutral patch anywhere along the walk: the white balance stays where it started (the
-    // as-shot prior). The probes steered the search only; none of them is an answer.
+    // No verified surface along the walk: nothing is acquired and the caller applies MASTER's balance. The
+    // probes steered the search only; none of them is an answer.
 }
 
 LookAssistWhiteBalanceResolution resolveLookAssistWhiteBalance( const LookAssistWhiteBalanceRequest &request,
@@ -762,6 +815,10 @@ LookAssistWhiteBalanceResolution resolveLookAssistWhiteBalance( const LookAssist
     if( !request.stats || !preset ) return out;
     const LookAssistStats &stats = *request.stats;
     const LookAssistAutoWhiteBalancePatch &patch = request.patch;
+    // The colour-balance default the preset arrives with is MASTER's balance for a clip with no trusted patch
+    // (presetForLookAssistScene's statistics-based deltas); the fallback below restores exactly it.
+    const int masterTemperatureDelta = preset->temperatureDelta;
+    const int masterTintDelta = preset->tintDelta;
     const int baseTemperature = request.baseTemperature;
     const int baseTint = request.baseTint;
     const bool undamped = lookAssistDaylightSolveIsUndamped( stats, request.scene, request.solvedOnProcessedPicture );
@@ -812,35 +869,52 @@ LookAssistWhiteBalanceResolution resolveLookAssistWhiteBalance( const LookAssist
         out.solvedTemperature = solvedTemperature;
         out.solvedTint = solvedTint;
     }
-    if( !out.autoValid )
+    // Corroborated daylight and no trusted patch. Only a surface VERIFIED on the rendered picture (see the
+    // refinement) may move the white balance; with none -- or with the narrowing switch off, or no renderer
+    // to ask -- the balance is MASTER's: its colour-balance default, followed (GUI) by its legacy post-balance
+    // walk. Never the as-shot prior alone: that was measured worse than master's look in the real app.
+    const bool daylightWithoutPatch = !out.autoValid && lookAssistIsDaylightScene( stats, request.scene );
+    const bool canRefine = daylightWithoutPatch
+                        && lookAssistDaylightNeedsRenderedRefinement( stats, request.scene, out, request.refineWithoutPatch )
+                        && static_cast<bool>( request.renderBalance );
+    if( canRefine )
     {
-        // No neutral patch we can trust: the clip's recorded white balance (mode-aware) is the
-        // prior, daylight only. Everything else keeps the colour-balance default in the preset.
+        // The as-shot prior is the START of the refinement: the unstepped base picture is rendered there.
         int priorTemperature = baseTemperature;
         int priorTint = baseTint;
         if( lookAssistAsShotPrior( stats, request.scene, &priorTemperature, &priorTint ) )
         {
-            out.source = QStringLiteral("as-shot-prior");
-            out.decision = QStringLiteral("prior");
             preset->temperatureDelta = priorTemperature - baseTemperature;
             preset->tintDelta = priorTint - baseTint;
         }
-
+        lookAssistFinalizeWhiteBalance( request, preset, &out );
+        refineLookAssistDaylightWhiteBalance( request, solve, preset, &out );
+    }
+    if( daylightWithoutPatch && !out.autoValid )
+    {
+        preset->temperatureDelta = masterTemperatureDelta;
+        preset->tintDelta = masterTintDelta;
+        out.legacyBalance = true;
+        out.source = QStringLiteral("master-balance");
+        out.decision = QStringLiteral("legacy");
     }
 
     lookAssistFinalizeWhiteBalance( request, preset, &out );
-
-    // Corroborated daylight and still no trusted patch: the as-shot prior is only a starting point.
-    // Balance it from the RENDERED picture (a no-op unless the consumer supplied a renderer).
-    refineLookAssistDaylightWhiteBalance( request, solve, preset, &out );
     return out;
+}
+
+bool lookAssistRefineDaylightWithoutPatchEnabled()
+{
+    return kLookAssistRefineDaylightWithoutPatch
+        && qEnvironmentVariable( "MLVAPP_LOOK_ASSIST_REFINE_DAYLIGHT" ) != QLatin1String( "0" );
 }
 
 bool lookAssistDaylightNeedsRenderedRefinement( const LookAssistStats &stats,
                                                 LookAssistScene scene,
-                                                const LookAssistWhiteBalanceResolution &resolution )
+                                                const LookAssistWhiteBalanceResolution &resolution,
+                                                bool refineEnabled )
 {
-    return kLookAssistRefineDaylightWithoutPatch
+    return refineEnabled
         && !resolution.autoValid
         && lookAssistIsDaylightScene( stats, scene );
 }
@@ -851,7 +925,7 @@ void refineLookAssistDaylightWhiteBalance( const LookAssistWhiteBalanceRequest &
                                            LookAssistWhiteBalanceResolution *resolution )
 {
     if( !request.stats || !preset || !resolution || !request.renderBalance ) return;
-    if( !lookAssistDaylightNeedsRenderedRefinement( *request.stats, request.scene, *resolution ) ) return;
+    if( !lookAssistDaylightNeedsRenderedRefinement( *request.stats, request.scene, *resolution, request.refineWithoutPatch ) ) return;
     refineDaylightFromRenderedPicture( request, solve, preset, resolution );
     lookAssistFinalizeWhiteBalance( request, preset, resolution );
 }

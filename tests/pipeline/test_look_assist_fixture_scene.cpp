@@ -311,6 +311,85 @@ TEST(LookAssistFixtureScene, HeadlessBalancesDaylightFromTheRenderedPictureWhenN
     }
 }
 
+namespace
+{
+
+// The receipt Look Assist leaves, as one comparable line.
+QString receiptLine( ReceiptSettings &r )
+{
+    return QStringLiteral("exp=%1 contrast=%2 pivot=%3 temp=%4 tint=%5 vibrance=%6 shadows=%7 highlights=%8 chromaSmooth=%9")
+        .arg( r.exposure() ).arg( r.contrast() ).arg( r.pivot() ).arg( r.temperature() ).arg( r.tint() )
+        .arg( r.vibrance() ).arg( r.shadows() ).arg( r.highlights() ).arg( r.chromaSmooth() );
+}
+
+// Runs the real headless Look Assist on a tracked clip as the no-trusted-patch state leaves it. noExposureMetadata
+// removes the recorded exposure, so nothing can call the clip daylight: that run IS master's analysis.
+bool runHeadlessLookAssist( const char *clipFile, bool noExposureMetadata, QString *receipt, QByteArray *log )
+{
+    MlvPipelineFixture fixture;
+    QString error_message;
+    if( !fixture.openClipFile( repo_file_path( QString::fromLatin1( clipFile ) ), &error_message ) ) return false;
+    if( !fixture.applyReceipt( &error_message ) ) return false;
+    if( noExposureMetadata )
+    {
+        fixture.video()->EXPO.isoValue = 0;
+        fixture.video()->EXPO.shutterValue = 0;
+        fixture.video()->LENS.aperture = 0;
+    }
+    ReceiptSettings &r = fixture.receipt();
+    r.setLookAssistEnabled( true );
+    r.setLookAssistBaselineValid( false );
+    r.setExposure( 0 );
+    r.setTemperature( -1 );
+    r.setTint( 0 );
+    processingSetWhiteBalance( fixture.processing(), 3000, 0.0 );
+
+    QTemporaryDir temporary_dir;
+    const QString log_path = temporary_dir.filePath( QStringLiteral("look_assist.log") );
+    BatchLogger::init( log_path );
+    const bool applied = ReceiptApplier::applyHeadlessLookAssist( &r, fixture.video(), fixture.processing(), 0 );
+    BatchLogger::shutdown();
+    QFile log_file( log_path );
+    if( !applied || !log_file.open( QIODevice::ReadOnly | QIODevice::Text ) ) return false;
+    *log = log_file.readAll();
+    *receipt = receiptLine( r );
+    return true;
+}
+
+struct ScopedEnv
+{
+    explicit ScopedEnv( const char *name, const char *value ) : m_name( name ) { qputenv( m_name, value ); }
+    ~ScopedEnv() { qunsetenv( m_name ); }
+    const char *m_name;
+};
+
+} // namespace
+
+TEST(LookAssistFixtureScene, HeadlessWithTheRefinementOffIsMastersAnalysisOnTheFixtureStates)
+{
+    // sol H4 / fable: with the narrowing switch off a corroborated daylight clip that has no trusted patch must
+    // get MASTER's behaviour -- not the as-shot prior, not the daylight preset with master's balance -- on every
+    // tracked clip. Master's analysis is what the SAME clip gets when nothing can call it daylight, so the two
+    // receipts must be equal field for field.
+    for( const FixtureClip &clip : kTrackedFixtureClips )
+    {
+        QString master, off;
+        QByteArray masterLog, offLog;
+        ASSERT_TRUE( runHeadlessLookAssist( clip.file, true, &master, &masterLog ) );
+        {
+            ScopedEnv switchOff( "MLVAPP_LOOK_ASSIST_REFINE_DAYLIGHT", "0" );
+            ASSERT_TRUE( runHeadlessLookAssist( clip.file, false, &off, &offLog ) );
+        }
+        ASSERT_TRUE( masterLog.contains( "scene=night" ) );
+        ASSERT_TRUE( masterLog.contains( "masterScenePass=false" ) );
+        ASSERT_TRUE( offLog.contains( "scene=night" ) );              // master's verdict, not "shade"
+        ASSERT_TRUE( offLog.contains( "masterScenePass=true" ) );     // reached by the fallback, not by luck
+        ASSERT_FALSE( offLog.contains( "autoWbSource=as-shot-prior" ) );
+        ASSERT_FALSE( offLog.contains( "autoWbSource=rendered-neutral-patch" ) );
+        ASSERT_TRUE( master == off );
+    }
+}
+
 TEST(LookAssistFixtureScene, HeadlessKeepsTheLegacyVerdictWhenTheExposureCannotSayDaylight)
 {
     // The same flat-floor fixture, but the recorded exposure is an ND-filtered daylight shot

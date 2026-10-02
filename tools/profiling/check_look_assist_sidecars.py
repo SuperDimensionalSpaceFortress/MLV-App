@@ -15,14 +15,20 @@ what the classifier fix has to deliver *in the real app*, on the path the user s
     was solved at all and the picture went bluer (deck chroma 11.5 -> 22.4); r2 labelled the same base
     balance "as-shot-prior" (deck chroma 18.9 in the real app against master's 13.5).
 
-The decision half needs no numpy/Pillow, so it runs in the repo's pinned CI environment. The PICTURE
-half is opt-in because it needs pixels: `--deck-chroma-max X` measures the CIELAB chroma of the
+Both halves are stdlib-only (look_assist_png decodes the PNG), so they run in the repo's pinned CI environment.
+The PICTURE half is opt-in because it needs pixels: `--deck-chroma-max X` measures the CIELAB chroma of the
 tracked pool deck (a physically near-neutral surface; rows 65-98 %, columns 2-25 % of frame-00) in
 frame-00.png and fails above X. A correct decision with a wrong picture is a regression (r1: scene
-right, deck chroma 11.5 -> 22.4); this is the GUI path's picture gate. Needs Pillow.
+right, deck chroma 11.5 -> 22.4); this is the GUI path's picture gate.
 
-usage: check_look_assist_sidecars.py <contact-sheet-raw-dir> [--min-frames N] [--deck-chroma-max X]
-exit 0 = pass, 1 = assertion failed, 2 = no usable sidecars (or Pillow missing for the picture gate).
+PR #222 r2: a daylight verdict that nothing verifies falls back to MASTER's analysis (scene "night", source
+"none": the picture master produces, never worse than it). That outcome is not this checker's pass -- it is the
+improvement gate -- unless `--allow-master-fallback` says the caller only needs "no worse than master" (the
+picture gate of check_look_assist_profile_states.py is what proves that); the half-states ("as-shot-prior",
+"master-balance" under a shade scene) never pass.
+
+usage: check_look_assist_sidecars.py <contact-sheet-raw-dir> [--min-frames N] [--deck-chroma-max X] [--allow-master-fallback]
+exit 0 = pass, 1 = assertion failed, 2 = no usable sidecars (or an unreadable picture for the picture gate).
 """
 import argparse
 import glob
@@ -30,11 +36,16 @@ import json
 import os
 import sys
 
+import look_assist_png
+
 # "as-shot-prior" / "prior" are deliberately NOT accepted for the tracked daylight fixtures: the clip records
 # no white balance beyond the app default (6000 K / tint 0), which is exactly the regression picture
 # (deck chroma 18.9 in the real app) under a different label. A balance has to have been solved from, or
 # refined on, the rendered picture.
 ALLOWED_WB_SOURCES = ("processed-neutral-patch", "rendered-neutral-patch")
+# Never acceptable, whatever the scene: the as-shot prior at the base balance (PR #221 r2) and a shade verdict
+# carrying master's balance (PR #222 r1's no-surface state, which measured worse than master's look).
+FORBIDDEN_WB_SOURCES = ("as-shot-prior", "prior", "master-balance")
 ACCEPTED_WB_DECISIONS = ("accepted", "accepted-damped")
 DAYLIGHT_TEMPERATURE = (4800, 10000)   # lookAssistWhiteBalanceBounds() for a daylight clip
 DAYLIGHT_TINT = (-35, 10)
@@ -50,7 +61,13 @@ def load_sidecars(directory):
     return sidecars
 
 
-def check(sidecars, min_frames=1):
+def is_master_analysis(scene, source):
+    """The recorded verdict is master's own (the daylight verdict was not trusted and the clip was re-analysed as
+    master analyses it): not daylight, and none of the half-states."""
+    return scene != "shade" and source not in FORBIDDEN_WB_SOURCES
+
+
+def check(sidecars, min_frames=1, allow_master_fallback=False):
     """Return a list of failure strings (empty = pass)."""
     failures = []
     if len(sidecars) < min_frames:
@@ -61,6 +78,8 @@ def check(sidecars, min_frames=1):
             continue
         if data.get("settled") is not True:
             failures.append("%s: settled=%r, want true (captured before Look Assist settled)" % (name, data.get("settled")))
+        if allow_master_fallback and is_master_analysis(data.get("look_assist_scene"), data.get("look_assist_wb_source")):
+            continue   # master's own look; whether it is no worse than master is the picture gate's call
         decision = data.get("look_assist_wb_decision")
         if decision not in ACCEPTED_WB_DECISIONS:
             failures.append("%s: look_assist_wb_decision=%r, want one of %s" % (name, decision, ACCEPTED_WB_DECISIONS))
@@ -81,31 +100,9 @@ def check(sidecars, min_frames=1):
 
 def deck_cast_chroma(png_path):
     """CIELAB chroma of the mean colour of the pool-deck region of one frame (same region and maths as
-    the real-app sheet metrics and the pipeline test). Pillow only; raises ImportError without it."""
-    from PIL import Image  # noqa: WPS433 (deliberately lazy: the decision half must run without it)
-
-    image = Image.open(png_path).convert("RGB")
-    width, height = image.size
-    x0, x1 = int(width * 0.02), int(width * 0.25)
-    y0, y1 = int(height * 0.65), int(height * 0.98)
-    pixels = list(image.crop((x0, y0, x1, y1)).getdata())
-    if not pixels:
-        return float("inf")
-    mean = [sum(pixel[c] for pixel in pixels) / len(pixels) for c in range(3)]
-    linear = []
-    for value in mean:
-        v = value / 255.0
-        linear.append(v / 12.92 if v <= 0.04045 else ((v + 0.055) / 1.055) ** 2.4)
-    x = (0.4124 * linear[0] + 0.3576 * linear[1] + 0.1805 * linear[2]) / 0.95047
-    y = 0.2126 * linear[0] + 0.7152 * linear[1] + 0.0722 * linear[2]
-    z = (0.0193 * linear[0] + 0.1192 * linear[1] + 0.9505 * linear[2]) / 1.08883
-
-    def f(t):
-        return t ** (1.0 / 3.0) if t > 0.008856 else 7.787 * t + 16.0 / 116.0
-
-    a = 500.0 * (f(x) - f(y))
-    b = 200.0 * (f(y) - f(z))
-    return (a * a + b * b) ** 0.5
+    the real-app sheet metrics and the pipeline test). Stdlib only (look_assist_png): the picture half runs in
+    the hosted CI image, which does not pin Pillow. ValueError for a PNG this reader does not support."""
+    return look_assist_png.deck_cast_chroma(png_path)
 
 
 def main(argv=None):
@@ -113,22 +110,21 @@ def main(argv=None):
     parser.add_argument("directory")
     parser.add_argument("--min-frames", type=int, default=1)
     parser.add_argument("--deck-chroma-max", type=float, default=None,
-                        help="also require the deck-region Lab chroma of frame-00.png to be <= this (needs Pillow)")
+                        help="also require the deck-region Lab chroma of frame-00.png to be <= this")
+    parser.add_argument("--allow-master-fallback", action="store_true",
+                        help="accept master's own analysis (scene != shade, source none) as a pass")
     args = parser.parse_args(argv)
     sidecars = load_sidecars(args.directory)
     if not sidecars:
         print("no saved frame-NN.json sidecars in %s" % args.directory)
         return 2
-    failures = check(sidecars, args.min_frames)
+    failures = check(sidecars, args.min_frames, args.allow_master_fallback)
     deck_note = ""
     if args.deck_chroma_max is not None:
         picture = os.path.join(args.directory, "frame-00.png")
         try:
             chroma = deck_cast_chroma(picture)
-        except ImportError:
-            print("Pillow is required for --deck-chroma-max")
-            return 2
-        except OSError as error:
+        except (OSError, ValueError) as error:
             print("cannot read %s: %s" % (picture, error))
             return 2
         deck_note = ", deck chroma %.1f <= %.1f" % (chroma, args.deck_chroma_max)
