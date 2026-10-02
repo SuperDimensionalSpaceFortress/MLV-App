@@ -1,0 +1,131 @@
+{
+  "what": "The real MLVApp (MainWindow) profile-settle run of PR #222 round 2 on the two tracked daylight fixtures, sync and async, recorded for the hosted CI gate (tools/profiling/test_check_look_assist_profile_states.py).",
+  "subject_sha": "b70e599d4684312b56813ec8c1e27dd1d6b6b95b",
+  "subject_note": "The executable was built from this commit (tracked tree clean; untracked scratch files made the stamp's dirty flag 1). The evidence commit that adds this folder differs from it only in files under tests/fixtures/look_assist_profile_runs/.",
+  "exe_sha256": "F33E5FA811DE450C092269A143F60A2D10E721BFBD4BB16D285FAEE013F0DAE5",
+  "exe_stamp": "MLVAPP_BUILDSTAMP_v1|sha=b70e599d4684312b56813ec8c1e27dd1d6b6b95b|dirty=1",
+  "commands": {
+    "build": "pwsh tools\\gen-buildinfo.ps1 -SrcRoot <worktree> -OutHeader <worktree>\\platform\\build\\build_buildinfo.h ; touch platform\\qt\\MainWindow.cpp platform\\qt\\CrashForensics.cpp ; mingw32-make -f Makefile.Release -j2 (in platform\\build) ; python tools\\profiling\\verify_exe_stamp.py platform\\build\\release\\MLVApp.exe --sha <subject>",
+    "profile_run": "MLVApp.exe --profile-playback --input <worktree>\\tests\\fixtures\\clips\\<clip>.mlv --frames 4 --exercise-look-assist-settle --output <dir>\\profile.json  (QT_QPA_PLATFORM=offscreen; async arms set MLVAPP_LOOK_ASSIST_ASYNC=1; no Play action, no loop)",
+    "picture_dump_env": "MLVAPP_LOOK_ASSIST_PICTURE_DUMP=<dir>\\pic (the analysis-thumbnail render at the applied look: pic\\look-assist-final-frame0.png)",
+    "master_look": "MLVAPP_LOOK_ASSIST_PICTURE_DUMP_STATES=master:174,14,46,32,-26,3,6480,-19 (label:exp,contrast,pivot,shadows,highlights,vibrance,temp,tint -- the result the master build logged for these states; pic\\state-master.png is that look rendered by this build in the same state)",
+    "downscale": "Pillow Image.resize((w // 6, h // 6), Image.BOX) of each picture (area average: the deck-region mean is preserved; deck_chroma_source vs deck_chroma_recorded below)",
+    "gate": "python tools/profiling/check_look_assist_profile_states.py tests/fixtures/look_assist_profile_runs/pr222-r2 --tag rec --subject-sha <subject_sha>"
+  },
+  "commands_as_run": "exe: C:\\mlvtmp\\lane-LOOK-ASSIST-SCENE-CLASSIFY-2-20261002\\platform\\build\\release\\MLVApp.exe\nargv: --profile-playback --input \"C:\\mlvtmp\\lane-LOOK-ASSIST-SCENE-CLASSIFY-2-20261002\\tests\\fixtures\\clips\\large_dual_iso.mlv\" --frames 4 --exercise-look-assist-settle --output \"C:\\!Layi Wkspc\\MLV-App\\.claude-state\\fleet-runs\\lane-LOOK-ASSIST-SCENE-CLASSIFY-2-r2-20261002T0430Z\\sheets\\real-app-profile-settle\\r2-large_dual_iso-sync\\profile.json\"\nMLVAPP_LOOK_ASSIST_ASYNC=\nMLVAPP_LOOK_ASSIST_REFINE_DAYLIGHT=\nMLVAPP_LOOK_ASSIST_PICTURE_DUMP=C:\\!Layi Wkspc\\MLV-App\\.claude-state\\fleet-runs\\lane-LOOK-ASSIST-SCENE-CLASSIFY-2-r2-20261002T0430Z\\sheets\\real-app-profile-settle\\r2-large_dual_iso-sync\\pic\nMLVAPP_LOOK_ASSIST_PICTURE_DUMP_STATES=master:174,14,46,32,-26,3,6480,-19\nQT_QPA_PLATFORM=offscreen\n",
+  "picture_metric": "analysis thumbnail (get_area_average_downscale_thumnail, the picture Look Assist judges), NOT the presented frame; see the PR body for the presented-frame figures that could be obtained",
+  "pictures": [
+    {
+      "file": "rec-tiny_dual_iso-sync/pic/look-assist-final-frame0.png",
+      "source_size": [
+        602,
+        756
+      ],
+      "recorded_size": [
+        100,
+        126
+      ],
+      "source_sha256": "038dd9cf36b40f992911b67e71de414e839577a4907033ecca328554d886769f",
+      "deck_chroma_source": 13.447,
+      "deck_chroma_recorded": 13.476
+    },
+    {
+      "file": "rec-tiny_dual_iso-sync/pic/state-master.png",
+      "source_size": [
+        602,
+        756
+      ],
+      "recorded_size": [
+        100,
+        126
+      ],
+      "source_sha256": "038dd9cf36b40f992911b67e71de414e839577a4907033ecca328554d886769f",
+      "deck_chroma_source": 13.447,
+      "deck_chroma_recorded": 13.476
+    },
+    {
+      "file": "rec-tiny_dual_iso-async/pic/look-assist-final-frame0.png",
+      "source_size": [
+        602,
+        756
+      ],
+      "recorded_size": [
+        100,
+        126
+      ],
+      "source_sha256": "038dd9cf36b40f992911b67e71de414e839577a4907033ecca328554d886769f",
+      "deck_chroma_source": 13.447,
+      "deck_chroma_recorded": 13.476
+    },
+    {
+      "file": "rec-tiny_dual_iso-async/pic/state-master.png",
+      "source_size": [
+        602,
+        756
+      ],
+      "recorded_size": [
+        100,
+        126
+      ],
+      "source_sha256": "038dd9cf36b40f992911b67e71de414e839577a4907033ecca328554d886769f",
+      "deck_chroma_source": 13.447,
+      "deck_chroma_recorded": 13.476
+    },
+    {
+      "file": "rec-large_dual_iso-sync/pic/look-assist-final-frame0.png",
+      "source_size": [
+        602,
+        756
+      ],
+      "recorded_size": [
+        100,
+        126
+      ],
+      "source_sha256": "038dd9cf36b40f992911b67e71de414e839577a4907033ecca328554d886769f",
+      "deck_chroma_source": 13.447,
+      "deck_chroma_recorded": 13.476
+    },
+    {
+      "file": "rec-large_dual_iso-sync/pic/state-master.png",
+      "source_size": [
+        602,
+        756
+      ],
+      "recorded_size": [
+        100,
+        126
+      ],
+      "source_sha256": "038dd9cf36b40f992911b67e71de414e839577a4907033ecca328554d886769f",
+      "deck_chroma_source": 13.447,
+      "deck_chroma_recorded": 13.476
+    },
+    {
+      "file": "rec-large_dual_iso-async/pic/look-assist-final-frame0.png",
+      "source_size": [
+        602,
+        756
+      ],
+      "recorded_size": [
+        100,
+        126
+      ],
+      "source_sha256": "038dd9cf36b40f992911b67e71de414e839577a4907033ecca328554d886769f",
+      "deck_chroma_source": 13.447,
+      "deck_chroma_recorded": 13.476
+    },
+    {
+      "file": "rec-large_dual_iso-async/pic/state-master.png",
+      "source_size": [
+        602,
+        756
+      ],
+      "recorded_size": [
+        100,
+        126
+      ],
+      "source_sha256": "038dd9cf36b40f992911b67e71de414e839577a4907033ecca328554d886769f",
+      "deck_chroma_source": 13.447,
+      "deck_chroma_recorded": 13.476
+    }
+  ]
+}

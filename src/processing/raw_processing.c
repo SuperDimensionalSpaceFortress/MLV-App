@@ -5787,7 +5787,10 @@ void processingFindWhiteBalance(processingObject_t *processing, int imageX, int 
     /* deactivate quick matrix build */
     processing->wbFindActive = 0;
 
-    /* set it back to where we began */
+    /* set it back to where we began. oriTint is the STORED (render) tint, and the setter converts whatever differs from
+     * the stored value as a receipt tint, so the search's last candidate would make it convert oriTint a second time
+     * and leave the object at a different tint than it entered with. Put the stored tint back first. */
+    processing->wb_tint = oriTint;
     processingSetWhiteBalance( processing, (double)oriTemp, (double)oriTint );
 
     if( wbValueTrace )

@@ -556,6 +556,10 @@ class RepoHygieneTests(unittest.TestCase):
         batch_runner = (ROOT / "src" / "batch" / "BatchRunner.cpp").read_text(
             encoding="utf-8"
         )
+        # The WBAL (white balance) mode decoder lives ONCE, in ReceiptApplier; MainWindow delegates to it.
+        receipt_applier = (ROOT / "src" / "batch" / "ReceiptApplier.cpp").read_text(
+            encoding="utf-8"
+        )
 
         self.assertIn('#include <inttypes.h>', blender)
         self.assertIn('"Exporting frame %" PRIu64 "/%" PRIu64', blender)
@@ -694,8 +698,9 @@ class RepoHygieneTests(unittest.TestCase):
         self.assertIn("candidate->unique_camera_model", dng_reader)
         self.assertIn("processingWhiteBalanceControlsForAsShotNeutral", raw_processing)
         self.assertIn("best_error > 0.01", raw_processing)
-        self.assertIn("processingWhiteBalanceControlsForAsShotNeutral", main_window)
-        self.assertIn("MLV_VIDEO_CLASS_FLAG_DNGSEQ ) == 0", main_window)
+        self.assertIn("processingWhiteBalanceControlsForAsShotNeutral", receipt_applier)
+        self.assertIn("MLV_VIDEO_CLASS_FLAG_DNGSEQ ) == 0", receipt_applier)
+        self.assertIn("ReceiptApplier::asShotWhiteBalanceControls(", main_window)
         self.assertIn("rawAspectStretchSelectionForRatio", main_window)
         self.assertIn("rawAspectStretchSelectionForRatio", aspect_policy)
         self.assertIn("effectiveStretchFactors", batch_runner)
