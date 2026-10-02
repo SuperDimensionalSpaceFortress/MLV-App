@@ -797,7 +797,7 @@ def _span(start: float, stop: float, step: float) -> list[float]:
 # A venue-shaped timeline (UM owner legs: PresentMon rows begin many seconds before playback and run past
 # it). All instants are UTC ms after the base; PresentMon's TimeInMs is relative to its trace origin, which
 # is only known to lie inside the bracket [capture_start, post_spawn] = [0 ms, 3000 ms] (the job's own
-# `Start-Sleep -Seconds 3` makes that bracket at least 3 s wide). The TRUE origin is VENUE_ANCHOR_MS.
+# PresentMon's startup took 3 s to be observed ready, so the bracket is 3 s wide). The TRUE origin is VENUE_ANCHOR_MS.
 VENUE_CAPTURE_START = _iso(0)
 VENUE_POST_SPAWN = _iso(3000)
 VENUE_ANCHOR_MS = 1000.0
