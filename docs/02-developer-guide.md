@@ -1014,7 +1014,7 @@ All workflows live under `.github/workflows/`.
 
 | Workflow | Trigger | What it does |
 |----------|---------|--------------|
-| [`tests.yml`](../.github/workflows/tests.yml) | `workflow_dispatch`, every `pull_request`, and `push` to `master`. **No `paths` filter** — see the note below. | Five jobs. `protected-check-route` (ubuntu) derives a fail-closed route; `repo-hygiene-python` (ubuntu) and `factory-bridge-regressions` (windows) run independently of it; the windows hygiene suite is five parallel `repo-hygiene-python-windows-shard` runners behind an aggregator job that keeps the required name `Repo Hygiene Python (windows-latest)`; `windows-product-oracles` and `windows-gui-pilot` (both windows) `needs: protected-check-route` and run `console_tests`/`pipeline_tests --check-golden` and `gui_tests` respectively. |
+| [`tests.yml`](../.github/workflows/tests.yml) | `workflow_dispatch`, every `pull_request`, and `push` to `master`. **No `paths` filter** — see the note below. | Seven jobs. `protected-check-route` (ubuntu) derives a fail-closed route; `repo-hygiene-python` (ubuntu), `repo-hygiene-python-windows-shard` (five parallel windows runners) and `batch-compile` (windows) run independently of it; `repo-hygiene-python-windows` (ubuntu) is an aggregator that needs every shard and keeps the required name `Repo Hygiene Python (windows-latest)`; `windows-product-oracles` and `windows-gui-pilot` (both windows) `needs: protected-check-route` and run `console_tests`/`pipeline_tests --check-golden` and `gui_tests` respectively. `factory-bridge-regressions` lives in `factory-bridge.yml`, not here. |
 | [`Windows.yml`](../.github/workflows/Windows.yml) | `workflow_dispatch` on `master` | Release artifact. Chocolatey-installs Qt 5.15.2 + MinGW 8.1 + OpenSSL, runs `qmake` + `make` + `windeployqt`, unpacks `ffmpegWin64.zip` and `raw2mlvWin64.zip` with 7-Zip, uploads `MLVApp.Win64.zip`. |
 | [`Linux.yml`](../.github/workflows/Linux.yml) | `workflow_dispatch` on `master` | Ubuntu 22.04 runner. Installs the apt dependencies listed in [§3.4](#34-linux), runs `qmake` + `make -j8`, unpacks the bundled ffmpeg/raw2mlv, wraps it all with `linuxdeploy` + the Qt plugin to produce `MLVApp.AppImage`. |
 | [`macOS-Intel.yml`](../.github/workflows/macOS-Intel.yml) | `workflow_dispatch` on `master` | macOS 13 runner. `brew install llvm qt5 openssl` (alias to `qt@5`), `qmake -r`, `make -j8`, `macdeployqt -dmg` from `/usr/local/opt/qt@5/bin`. Artifact: `MLV App.dmg`. |
@@ -1027,7 +1027,8 @@ suite runs as five `Repo Hygiene Python windows shard N/5` jobs (not required by
 and the `Repo Hygiene Python (windows-latest)` aggregator that needs all five carries the
 required name. **Five check names are required status checks** on `master`:
 `Repo Hygiene Python (ubuntu-latest)`, `Repo Hygiene Python (windows-latest)`,
-`Factory Bridge Regressions`, `Windows Product Oracles`, `Windows GUI Pilot`.
+`Batch Compile`, `Windows Product Oracles`, `Windows GUI Pilot`. (`Factory Bridge
+Regressions` runs from `factory-bridge.yml` and is no longer required.)
 `Protected Check Route` is deliberately **not** required — the two jobs that
 depend on it already fail closed when it does not produce a usable answer, so
 requiring it as well would add a second way to say the same thing. Protection is

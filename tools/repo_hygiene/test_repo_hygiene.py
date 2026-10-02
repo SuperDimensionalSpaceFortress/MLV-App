@@ -1254,7 +1254,10 @@ class RepoHygieneTests(unittest.TestCase):
         self.assertIn("    needs: repo-hygiene-python-windows-shard", aggregator)
         self.assertIn("needs.repo-hygiene-python-windows-shard.result", aggregator)
         self.assertIn('test "$SHARDS_RESULT" = "success"', aggregator)
-        self.assertIn("    if: ${{ always() && !cancelled() }}", aggregator)
+        # `always()` alone: `!cancelled()` would condition-skip the required check on a run
+        # cancel, and GitHub treats a skipped required check as satisfied.
+        self.assertIn("    if: ${{ always() }}", aggregator.replace("\r\n", "\n"))
+        self.assertNotIn("cancelled()", re.sub(r"(?m)^\s*#.*$", "", aggregator))
         self.assertNotRegex(workflow, r"(?im)^\s*continue-on-error\s*:")
         # The ubuntu leg keeps the required `(ubuntu-latest)` name and no longer carries a
         # Windows leg that would collide with the aggregator's name.
@@ -1272,6 +1275,10 @@ class RepoHygieneTests(unittest.TestCase):
         # shards 1..of run the unittest slices, the last shard runs the tail steps.
         self.assertEqual(len(shard_numbers), of + 1)
         self.assertIn(f"        if: matrix.shard <= {of}\n", shard_job.replace("\r\n", "\n"))
+        # Each unittest leg must run its own slice: a hard-coded index would run one slice
+        # several times while `--verify-partition` (which proves collection) stays green.
+        self.assertIn(f"ci_unittest_shard --of {of} --shard ${{{{ matrix.shard }}}}", shard_job)
+        self.assertNotRegex(shard_job, r"--shard\s+(?!\$\{\{ matrix\.shard \}\})")
         self.assertIn("--of {0} --verify-partition".format(of), shard_job)
         for step in (
             "Run coordination and self-healing guardrails",

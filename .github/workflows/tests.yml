@@ -200,11 +200,13 @@ jobs:
 
   repo-hygiene-python-windows:
     # Keeps the required status-check name `Repo Hygiene Python (windows-latest)` that
-    # branch protection pins. It passes only when every Windows shard job passed; a
-    # skipped, cancelled or failed shard fails it, so no shard can drop out silently.
+    # branch protection pins. It succeeds only when every Windows shard job succeeded: a
+    # failed, timed-out, skipped or cancelled shard makes the check fail. `if: always()`
+    # (not `!cancelled()`) keeps it running when the whole run is cancelled, so a cancel
+    # leaves the required check failed rather than condition-skipped, which GitHub accepts.
     name: Repo Hygiene Python (windows-latest)
     needs: repo-hygiene-python-windows-shard
-    if: ${{ always() && !cancelled() }}
+    if: ${{ always() }}
     runs-on: ubuntu-latest
     timeout-minutes: 5
     steps:
