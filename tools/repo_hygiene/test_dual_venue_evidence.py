@@ -335,6 +335,11 @@ def consent_record(venue: str, clip: str) -> dict:
             "recordedUtc": "2026-10-01T22:10:00Z", "recordedBy": "owner"}
 
 
+def consent_record_line(venue: str, clip: str, line: str) -> dict:
+    """A FAKE consent record whose ownerLine is exactly `line` (tests only), with the matching sha256: for spellings other than the table's."""
+    return dict(consent_record(venue, clip), ownerLine=line, ownerLineSha256=hashlib.sha256(line.encode()).hexdigest())
+
+
 def consent_file(*records: dict) -> dict:
     return {"schema": "mlv-app/dual-venue-clip-consent/v1", "records": list(records)}
 
@@ -814,6 +819,69 @@ class PerVenueConsentGateTests(RunnerHarness, unittest.TestCase):
             _, receipt, submitted = self.run_leg("ultra-magnus", self.write_spec(), consent=path)
             self.assertRefusedBeforeSubmitting(receipt, submitted, "VENUE_CLIP_CONSENT_INVALID")
 
+    # DVE-CONSENT-RECORDS-1: the owner typed "CLIP ultramagnus: M16-1243" (no hyphen) for the venue the table names "ultra-magnus".
+    # The one alias admitted besides the table name is that same name with every hyphen removed, case-sensitive and exact.
+    ALIAS_LINE = f"CLIP ultramagnus: {OWNER_CLIP}"
+
+    def test_the_owners_hyphen_free_ultra_magnus_spelling_is_admitted_for_ultra_magnus_only(self) -> None:
+        alias = consent_record_line("ultra-magnus", OWNER_CLIP, self.ALIAS_LINE)
+        self.assertEqual(alias["venue"], "ultra-magnus", "the record's venue stays the table name")
+        self.write_consent(alias)
+        _, um, _ = self.run_leg("ultra-magnus", self.write_spec())
+        self.assertEqual(um["refusal"], None)
+        self.assertEqual(um["outcome"], "PASS", um["outcomeDetail"])
+        self.assertEqual(um["admission"]["ownerLineSha256"], alias["ownerLineSha256"], "the owner's line is recorded verbatim, by its own hash")
+        _, bachelor, b_sub = self.run_leg("bachelor", self.write_spec())
+        self.assertRefusedBeforeSubmitting(bachelor, b_sub, "VENUE_CLIP_CONSENT_ABSENT")
+
+    def test_the_table_name_spelling_is_still_admitted(self) -> None:
+        self.write_consent(consent_record_line("ultra-magnus", OWNER_CLIP, f"CLIP ultra-magnus: {OWNER_CLIP}"))
+        _, um, _ = self.run_leg("ultra-magnus", self.write_spec())
+        self.assertEqual(um["outcome"], "PASS", um["outcomeDetail"])
+
+    def test_every_other_spelling_of_the_line_is_refused(self) -> None:
+        clip = OWNER_CLIP
+        cases = [
+            ("ultra-magnus", f"CLIP UltraMagnus: {clip}"),
+            ("ultra-magnus", f"CLIP Ultramagnus: {clip}"),
+            ("ultra-magnus", f"CLIP ULTRAMAGNUS: {clip}"),
+            ("ultra-magnus", f"CLIP ultra_magnus: {clip}"),
+            ("ultra-magnus", f"CLIP ultra magnus: {clip}"),
+            ("ultra-magnus", f"CLIP ultra--magnus: {clip}"),
+            ("ultra-magnus", f"CLIP ultramagnu: {clip}"),
+            ("ultra-magnus", f"clip ultramagnus: {clip}"),
+            ("ultra-magnus", f"CLIP  ultramagnus: {clip}"),
+            ("ultra-magnus", f"CLIP ultramagnus:  {clip}"),
+            ("ultra-magnus", f"CLIP ultramagnus : {clip}"),
+            ("ultra-magnus", f"CLIP ultramagnus:{clip}"),
+            ("ultra-magnus", f" CLIP ultramagnus: {clip}"),
+            ("ultra-magnus", f"CLIP ultramagnus: {clip} "),
+            ("ultra-magnus", f"CLIP ultramagnus: {clip}\n"),
+            ("ultra-magnus", f"CLIP ultramagnus: {clip}\\extra"),
+            ("ultra-magnus", f"CLIP ultramagnus: {clip}/extra"),
+            ("ultra-magnus", f"CLIP ultramagnus: {OTHER_CLIP}"),
+            ("ultra-magnus", f"CLIP bachelor: {clip}"),
+            ("bachelor", f"CLIP ultramagnus: {clip}"),
+            ("bachelor", f"CLIP ultra-magnus: {clip}"),
+            ("bachelor", f"CLIP Bachelor: {clip}"),
+        ]
+        for venue, line in cases:
+            self.write_consent(consent_record_line(venue, clip, line))
+            _, receipt, submitted = self.run_leg(venue, self.write_spec())
+            self.assertRefusedBeforeSubmitting(receipt, submitted, "VENUE_CLIP_CONSENT_INVALID")
+
+    def test_mutation_without_the_alias_the_owners_hyphen_free_line_is_refused(self) -> None:
+        mutated = self.mutated_runner([("DualVenueRunner.psm1", "$spellings = @([string]$r.venue, ([string]$r.venue).Replace('-', ''))", "$spellings = @([string]$r.venue)")])
+        self.write_consent(consent_record_line("ultra-magnus", OWNER_CLIP, self.ALIAS_LINE))
+        _, receipt, _ = self.run_leg("ultra-magnus", self.write_spec(), dv=mutated)
+        self.assertEqual(receipt["refusal"], "VENUE_CLIP_CONSENT_INVALID", "without the alias the admit test goes red -- so it guards the alias")
+
+    def test_mutation_a_case_insensitive_line_check_admits_a_wrongly_cased_line(self) -> None:
+        mutated = self.mutated_runner([("DualVenueRunner.psm1", "if ($line -cnotin @($spellings", "if ($line -notin @($spellings")])
+        self.write_consent(consent_record_line("ultra-magnus", OWNER_CLIP, f"CLIP UltraMagnus: {OWNER_CLIP}"))
+        _, receipt, submitted = self.run_leg("ultra-magnus", self.write_spec(), dv=mutated)
+        self.assertNotEqual(submitted, [], "case-insensitive matching admits a mis-cased line -- so the refuse test guards case-sensitivity")
+
     def test_the_owner_clip_still_needs_the_cleanup_class_to_be_gone(self) -> None:
         # Consent is necessary, not sufficient: venues.json ownerFootage.cleanupClassGone stays a reviewed switch.
         self.make_harness(cleanup_class_gone=False)
@@ -850,7 +918,7 @@ class PerVenueConsentGateTests(RunnerHarness, unittest.TestCase):
         for record in tracked["records"]:
             self.assertEqual(set(record), {"venue", "clipId", "ownerLine", "ownerLineSha256", "recordedUtc", "recordedBy"})
             self.assertRegex(record["ownerLineSha256"], r"^[0-9a-f]{64}$")
-            self.assertEqual(record["ownerLine"], f"CLIP {record['venue']}: {record['clipId']}")
+            self.assertIn(record["ownerLine"], [f"CLIP {spelling}: {record['clipId']}" for spelling in (record["venue"], record["venue"].replace("-", ""))])
             self.assertEqual(hashlib.sha256(record["ownerLine"].encode()).hexdigest(), record["ownerLineSha256"])
             self.assertEqual(record["recordedBy"], "owner")
         # The runner and its module only ever READ the file: no cmdlet or .NET call that writes names it.
@@ -1500,7 +1568,7 @@ class CommittedConsentOnlyTests(RunnerHarness, unittest.TestCase):
         self.write_consent(hollow)
         _, receipt, submitted = self.run_leg("ultra-magnus", self.write_spec())
         self.assertEqual(receipt["refusal"], "VENUE_CLIP_CONSENT_INVALID")
-        mutated = self.mutated_runner([("DualVenueRunner.psm1", "if ($line -cne ('CLIP ' + [string]$r.venue + ': ' + [string]$r.clipId)) {", "if ($false) {"),
+        mutated = self.mutated_runner([("DualVenueRunner.psm1", "if ($line -cnotin @($spellings | ForEach-Object { 'CLIP ' + $_ + ': ' + [string]$r.clipId })) {", "if ($false) {"),
                                        ("DualVenueRunner.psm1", "if ((Get-DvSha256OfText $line) -cne [string]$r.ownerLineSha256) {", "if ($false) {"),
                                        ("DualVenueRunner.psm1", "if ([string]$r.recordedBy -cne 'owner') {", "if ($false) {")])
         self.write_artifacts()
@@ -1510,7 +1578,7 @@ class CommittedConsentOnlyTests(RunnerHarness, unittest.TestCase):
     def test_each_owner_line_check_is_needed_on_its_own(self) -> None:
         base = consent_record("ultra-magnus", OWNER_CLIP)
         cases = [
-            ("the line", dict(base, ownerLine="CLIP bachelor: " + OWNER_CLIP, ownerLineSha256=hashlib.sha256(("CLIP bachelor: " + OWNER_CLIP).encode()).hexdigest()), "if ($line -cne ('CLIP ' + [string]$r.venue + ': ' + [string]$r.clipId)) {"),
+            ("the line", dict(base, ownerLine="CLIP bachelor: " + OWNER_CLIP, ownerLineSha256=hashlib.sha256(("CLIP bachelor: " + OWNER_CLIP).encode()).hexdigest()), "if ($line -cnotin @($spellings | ForEach-Object { 'CLIP ' + $_ + ': ' + [string]$r.clipId })) {"),
             ("the hash", dict(base, ownerLineSha256="a" * 64), "if ((Get-DvSha256OfText $line) -cne [string]$r.ownerLineSha256) {"),
             ("the recorder", dict(base, recordedBy="hub"), "if ([string]$r.recordedBy -cne 'owner') {"),
         ]

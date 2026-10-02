@@ -826,11 +826,11 @@ class RepoHygieneTests(unittest.TestCase):
             required_checks,
         )
         self.assertNotEqual(required_checks[0], required_checks[1])
-        self.assertIn("os: [windows-latest, ubuntu-latest]", workflow)
+        # ubuntu is the matrix leg; the windows-latest name is the sharded-check aggregator.
+        self.assertIn("os: [ubuntu-latest]", workflow)
         for required_check in required_checks:
             self.assertIn(required_check, contributing)
-            workflow_name = required_check.replace(" (windows-latest)", " (${{ matrix.os }})")
-            workflow_name = workflow_name.replace(" (ubuntu-latest)", " (${{ matrix.os }})")
+            workflow_name = required_check.replace(" (ubuntu-latest)", " (${{ matrix.os }})")
             self.assertIn(f"name: {workflow_name}", workflow)
 
         self.assertIn("`Windows Product Oracles` runs independently", normalized_contributing)
@@ -914,7 +914,7 @@ class RepoHygieneTests(unittest.TestCase):
         bridge_workflow = (ROOT / ".github" / "workflows" / "factory-bridge.yml").read_text(
             encoding="utf-8"
         )
-        self.assertEqual(workflow.count('python-version-file: ".python-version"'), 5)
+        self.assertEqual(workflow.count('python-version-file: ".python-version"'), 6)
         self.assertEqual(bridge_workflow.count('python-version-file: ".python-version"'), 1)
         # The moved job retains the same locked dependency policy; count both
         # reviewed workflow surfaces so relocation cannot weaken its checks.
@@ -933,7 +933,7 @@ class RepoHygieneTests(unittest.TestCase):
             for line in workflow.splitlines()
             if "-m pip install " in line
         ]
-        self.assertEqual(len(install_lines), 11)
+        self.assertEqual(len(install_lines), 13)
         for line in install_lines:
             for required_flag in (
                 "--disable-pip-version-check",
@@ -945,7 +945,7 @@ class RepoHygieneTests(unittest.TestCase):
                 self.assertIn(required_flag, line, f"unsafe Python install command: {line}")
             lock_path = line.rsplit(" -r ", 1)[1].strip()
             self.assertIn(lock_path, allowed_locks, f"unapproved Python lock: {lock_path}")
-        self.assertEqual(workflow.count("python -m pip check"), 5)
+        self.assertEqual(workflow.count("python -m pip check"), 6)
 
         observed_locks: dict[str, dict[str, str]] = {}
         for relative_path, roots in PYTHON_LOCK_ROOTS.items():
@@ -1041,6 +1041,8 @@ class RepoHygieneTests(unittest.TestCase):
         expected_timeouts = {
             "protected-check-route": 10,
             "repo-hygiene-python": 75,
+            "repo-hygiene-python-windows-shard": 40,
+            "repo-hygiene-python-windows": 5,
             "windows-product-oracles": 120,
             "windows-gui-pilot": 60,
             "batch-compile": 30,
@@ -1053,7 +1055,7 @@ class RepoHygieneTests(unittest.TestCase):
         expected_remote_uses = [
             ("actions/checkout", "fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09", "v5"),
             ("actions/setup-python", "ece7cb06caefa5fff74198d8649806c4678c61a1", "v6"),
-        ] * 5 + [
+        ] * 6 + [
             ("actions/upload-artifact", "043fb46d1a93c77aae656e7c1c64a875d1fc6a0a", "v7"),
         ] * 3
         uses_entries = []
@@ -1092,7 +1094,7 @@ class RepoHygieneTests(unittest.TestCase):
             r"\s+persist-credentials: false\s*$",
             workflow,
         )
-        self.assertEqual(len(checkout_blocks), 5)
+        self.assertEqual(len(checkout_blocks), 6)
 
         aqt_steps = re.findall(
             r"(?ms)^      - name: Install Qt 6\.10\.2 \+ MinGW 13\.1\r?\n"
@@ -1220,6 +1222,7 @@ class RepoHygieneTests(unittest.TestCase):
 
         required_display_names = {
             "Repo Hygiene Python (${{ matrix.os }})",
+            "Repo Hygiene Python (windows-latest)",
             "Batch Compile",
             "Windows Product Oracles",
             "Windows GUI Pilot",
@@ -1235,6 +1238,72 @@ class RepoHygieneTests(unittest.TestCase):
         self.assertIn("Factory Bridge Regressions", bridge_jobs_text)
         self.assertNotRegex(bridge_workflow, r"(?im)^\s*continue-on-error\s*:")
         self.assertIn("  pull_request:\n", bridge_workflow[: bridge_workflow.index("\npermissions:")])
+
+    def test_windows_hygiene_check_is_sharded_behind_the_required_name(self) -> None:
+        workflow = (ROOT / ".github" / "workflows" / "tests.yml").read_text(encoding="utf-8")
+        jobs_text = workflow[workflow.index("\njobs:") :]
+
+        def job(job_id: str) -> str:
+            match = re.search(rf"(?m)^  {re.escape(job_id)}:\r?$", jobs_text)
+            assert match is not None, job_id
+            following = re.search(r"(?m)^  [a-z0-9-]+:\r?$", jobs_text[match.end() :])
+            end = match.end() + following.start() if following else len(jobs_text)
+            return jobs_text[match.start() : end]
+
+        shard_job = job("repo-hygiene-python-windows-shard")
+        aggregator = job("repo-hygiene-python-windows")
+        ubuntu_job = job("repo-hygiene-python")
+
+        # The branch-protection context survives, run by an aggregator that needs every shard.
+        self.assertIn("    name: Repo Hygiene Python (windows-latest)\n", aggregator.replace("\r\n", "\n"))
+        self.assertIn("    needs: repo-hygiene-python-windows-shard", aggregator)
+        self.assertIn("needs.repo-hygiene-python-windows-shard.result", aggregator)
+        self.assertIn('test "$SHARDS_RESULT" = "success"', aggregator)
+        # `always()` alone: `!cancelled()` would condition-skip the required check on a run
+        # cancel, and GitHub treats a skipped required check as satisfied.
+        self.assertIn("    if: ${{ always() }}", aggregator.replace("\r\n", "\n"))
+        self.assertNotIn("cancelled()", re.sub(r"(?m)^\s*#.*$", "", aggregator))
+        self.assertNotRegex(workflow, r"(?im)^\s*continue-on-error\s*:")
+        # The ubuntu leg keeps the required `(ubuntu-latest)` name and no longer carries a
+        # Windows leg that would collide with the aggregator's name.
+        self.assertIn("        os: [ubuntu-latest]", ubuntu_job)
+
+        # Shard count is bound three ways: the matrix, the shard name, and `--of`.
+        matrix = re.search(r"(?m)^        shard: \[([0-9, ]+)\]\r?$", shard_job)
+        self.assertIsNotNone(matrix)
+        shard_numbers = [int(part) for part in matrix.group(1).split(",")]
+        self.assertEqual(shard_numbers, list(range(1, len(shard_numbers) + 1)))
+        self.assertIn(f"windows shard ${{{{ matrix.shard }}}}/{len(shard_numbers)}", shard_job)
+        unittest_shards = {int(n) for n in re.findall(r"ci_unittest_shard --of (\d+)", shard_job)}
+        self.assertEqual(len(unittest_shards), 1)
+        (of,) = unittest_shards
+        # shards 1..of run the unittest slices, the last shard runs the tail steps.
+        self.assertEqual(len(shard_numbers), of + 1)
+        self.assertIn(f"        if: matrix.shard <= {of}\n", shard_job.replace("\r\n", "\n"))
+        # Each unittest leg must run its own slice: a hard-coded index would run one slice
+        # several times while `--verify-partition` (which proves collection) stays green.
+        self.assertIn(f"ci_unittest_shard --of {of} --shard ${{{{ matrix.shard }}}}", shard_job)
+        self.assertNotRegex(shard_job, r"--shard\s+(?!\$\{\{ matrix\.shard \}\})")
+        self.assertIn("--of {0} --verify-partition".format(of), shard_job)
+        for step in (
+            "Run coordination and self-healing guardrails",
+            "Run demote-factory-bridge refusal-path tests",
+            "Verify generated Python dependency locks",
+            "Run repo hygiene tail steps",
+        ):
+            block = shard_job[shard_job.index(f"- name: {step}") :]
+            self.assertIn(f"if: matrix.shard == {of + 1}", block.split("\n      - ")[0])
+        for command in (
+            "tools.release.test_release_evidence",
+            "tools.gates.test_output_budget",
+            "pipeline_golden_provenance",
+            "vendored_native_payloads",
+            "hygiene.py --repo-root . verify-policy",
+            "check_pinned_tokens.py",
+            "k9_witness tree HEAD",
+        ):
+            self.assertIn(command, shard_job)
+            self.assertIn(command, ubuntu_job)
 
     def test_protected_check_router_is_conservative_and_provider_specific(self) -> None:
         provider = classify_paths(
@@ -1747,8 +1816,8 @@ class RepoHygieneTests(unittest.TestCase):
 
         expected_remote_inventory = Counter(
             {
-                ("actions/checkout", "v5"): 10,
-                ("actions/setup-python", "v6"): 10,
+                ("actions/checkout", "v5"): 11,
+                ("actions/setup-python", "v6"): 11,
                 ("actions/upload-artifact", "v7"): 13,
                 ("ConorMacBride/install-package", "v1"): 2,
             }
