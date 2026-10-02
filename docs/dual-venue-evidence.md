@@ -117,7 +117,15 @@ receipt oracle and refuses to believe a receipt that does not carry the oracle's
   * *What the hashed summary binds (round 2):* the **backend** is derived from `summary.json`'s own frame counters, never from
     `subject.backend` -- `cuda` needs `gpuFramesTotal > 0`; `cpu` needs `cpuFrames > 0` and `gpuFramesTotal == 0` and a `backend`
     field in the summary (a cpu run is always a variant job) -- a receipt whose backend disagrees is `INVALID`
-    (`BACKEND_MISMATCH` / `BACKEND_NOT_DERIVABLE`), and the leg's criteria are selected by the **derived** backend. The **leg type**
+    (`BACKEND_MISMATCH` / `BACKEND_NOT_DERIVABLE`), and the leg's criteria are selected by the **derived** backend. A product-failure
+    terminal is read where the job *actually* writes its counters: `GPU_RECON_FRAMES_ZERO`, `CPU_FALLBACK_DETECTED` and
+    `CPU_BACKEND_PATH_MISMATCH` carry them only in the nested `gpuSummary` (`gpuFramesTotal` is the sum of its recon-readback,
+    texture-readback and texture-no-readback counts; preview frames never count) and no `backend` / `lookLeg` field, so the validator
+    takes the leg's backend from the terminal itself (the two cuda exits 13 / 14 exist only on a cuda leg, exit 28 only on a cpu leg)
+    and requires the counters to be the shape that terminal is written under -- a terminal whose counters contradict it is
+    `BACKEND_NOT_DERIVABLE`. Its leg type is then *unstated* (`LEG_TYPE_UNSTATED` in `unbound`; the receipt is a `FAIL` derived from
+    the terminal's own result token, never a PASS). `PRESENTMON_UNAVAILABLE` has a top-level `gpuFramesTotal` and is read the same
+    way. Tests use the exact summary shapes the job writes (`real_failure_summary`). The **leg type**
     comes from `summary.lookLeg` (a look-run's evidence can no longer verify as the speed leg, nor the reverse: `LEG_TYPE_MISMATCH`),
     plus `lookAssistForced`, the look flavor and `declaredVenue` when the job wrote them.
   * *Typed UNBOUND claims:* `subject.clipContentSha256` is computed by the local generator and written to **no** artifact the venue
@@ -166,7 +174,12 @@ receipt oracle and refuses to believe a receipt that does not carry the oracle's
   receipt. `DualVenueRunner.psm1` holds its testable rules.
 * `tools/profiling/dual-venue/New-VenueSheetPair.ps1` -- composes the side-by-side cuda|cpu contact sheet
   for a LOOK leg from two **advisory** receipts (`make-contact-sheet.py --pair-dir`, paired by frame index; a diagnostic sheet,
-  never a PASS).
+  never a PASS). **A sheet shows only the frames this run captured and the manifest lists** (DUAL-VENUE-EVIDENCE-3): a listed sidecar
+  may name no image but its own listed `<stem>.png` (`CONTACT_FRAME_SIDECAR_PATH` at validation; the app writes exactly that name), the
+  pair stages the hashed bytes and hands the composer their sha256 (`--left-listed` / `--right-listed`), and the composer reads only
+  those staged files, verifies each hash at read time (`PAIR_FRAME_HASH_MISMATCH`), refuses an unlisted one (`PAIR_FRAME_NOT_LISTED`)
+  and refuses an absolute, parent-relative or other-frame `path` (`PAIR_SIDECAR_PATH_OUTSIDE_STAGING`) -- it never falls back to a file
+  outside the staging directory, so an edited or stale PNG elsewhere on the VM cannot appear under a receipt's backend label.
 * `tools/profiling/dual-venue/leg-spec.schema.json` and `legs/*.json` -- the leg specs.
 * `Get-VenueEvidence.ps1` (the reader; built by DUAL-VENUE-RECONCILE-1) -- reads receipts; acceptance
   reads only `-AcceptanceFor <card>`.
@@ -272,6 +285,6 @@ the receipt -- and the contact sheet) is under `.claude-state\dual-venue\evidenc
 | `VENUE_HOST_MISMATCH` | `VENUE_HOST_MISMATCH` |
 | `BACKEND_NOT_AVAILABLE` | `DEVICE_UNAVAILABLE` |
 | `DISPLAY_ASLEEP`, `KEEPALIVE_FAILED`, `SCREENSAVER_SECURE_OWNER_ONLY`, `DISPLAY_WAKE_DISMISS_FAILED` | `VENUE_UNHEALTHY` (a venue condition, not a product result) |
-| a product failure the job reaches AFTER it published the run log (`GPU_RECON_FRAMES_ZERO`, `CPU_FALLBACK_DETECTED`, `CPU_BACKEND_PATH_MISMATCH`, `PRESENTMON_UNAVAILABLE`) **with a valid receipt-oracle verdict re-derived from that log** | `FAIL`, with the token in `outcomeDetail` |
+| a product failure the job reaches AFTER it published the run log (`GPU_RECON_FRAMES_ZERO`, `CPU_FALLBACK_DETECTED`, `CPU_BACKEND_PATH_MISMATCH`, `PRESENTMON_UNAVAILABLE`) **with a valid receipt-oracle verdict re-derived from that log** | `FAIL`, with the token in `outcomeDetail` (a production receipt for it is written as an **advisory** `FAIL`: its backend is derived from the summary's nested `gpuSummary` counters and its leg type is `LEG_TYPE_UNSTATED`) |
 | any terminal with no run log or a log that does not prove >= 20 s (`SMOKE_RUN_FAILED`, `SMOKE_LOG_UNAVAILABLE`, or one of the failures above on a short, wrapped, foreign or overridden run) | `INVALID` (no proof, no signal) |
 | um-run `RETRACTED` / `UNRESOLVED` | `RETRACTED` / `UNRESOLVED` |

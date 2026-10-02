@@ -396,7 +396,8 @@ class RunnerHarness:
     def write_artifacts(self, summary: dict | None = None, manifest: dict | None = None, source_frames: dict | None | bool = True,
                         nonce: str | None = NONCE, sheet: bool = False, line: dict | None = None, observed_nonce: str | None | bool = True,
                         manifest_nonce: str | None | bool = True, log: bool = True, result: bool = True, isolated: str | None = "run_scoped",
-                        declared_log_sha: str | None = None, compose_marker: str | None = None, raw_frames: bool = False) -> None:
+                        declared_log_sha: str | None = None, compose_marker: str | None = None, raw_frames: bool = False,
+                        exact_summary: dict | None = None) -> None:
         """Write the job's artifacts the way master's generator does, INCLUDING the run's own records the receipt is re-derived
         from: the launcher's result.json (evidence.runNonce = the nonce it generated, the sha256 of the log snapshot) and
         logs/smoke-run.log (the app's playback_smoke.summary line carrying source_advanced / required_source_frames / native_fps /
@@ -439,6 +440,8 @@ class RunnerHarness:
         elif source_frames is None:
             body["sourceFrames"] = None
         body.update(summary or {})
+        if exact_summary is not None:
+            body = dict(exact_summary)   # a terminal's summary.json is NOT the capture defaults plus a result: it is exactly what the job emits there
         (self.artifacts / "summary.json").write_text(json.dumps(body), encoding="utf-8")
         man_nonce = nonce if manifest_nonce is True else manifest_nonce
         man = {"smokeRunLog": ({"runNonce": man_nonce, "sha256": log_sha} if man_nonce is not None else {"sha256": log_sha}), "presentMonStats": {"p50": 16.6}}
@@ -1531,9 +1534,10 @@ class JobTerminalsAndHardeningTests(RunnerHarness, unittest.TestCase):
         self.make_harness()
 
     def test_product_failures_after_a_sound_run_are_fail_with_the_proof_in_the_receipt(self) -> None:
-        # exactly what the job writes on these terminals: a summary.json WITHOUT a sourceFrames block (and no evidence manifest)
+        # exactly what the job writes on these terminals (real_failure_summary: key for key): no sourceFrames block, no evidence manifest, and the
+        # frame counters only inside gpuSummary
         for token, code in (("GPU_RECON_FRAMES_ZERO", 13), ("CPU_FALLBACK_DETECTED", 14), ("CPU_BACKEND_PATH_MISMATCH", 28)):
-            self.write_artifacts(source_frames=False, summary={"result": token}, manifest=None)
+            self.write_artifacts(source_frames=False, exact_summary=real_failure_summary(token), manifest=None)
             (self.artifacts / "evidence-manifest.json").unlink()
             proc, receipt, _ = self.run_leg("ultra-magnus", self.write_spec(), token=(token, code))
             self.assertEqual(receipt["outcome"], "FAIL", f"{token}: {receipt['outcomeDetail']}")
@@ -1674,6 +1678,31 @@ def stub_raw_frames() -> dict[str, bytes]:
     return {"frame-00.png": b"\x89PNG\r\n\x1a\nraw0", "frame-00.json": json.dumps({"index": 0, "saved": True, "path": "frame-00.png"}).encode("utf-8")}
 
 
+ISO_DATETIME = re.compile(r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(\.\d+)?(Z|[+-]\d{2}:\d{2})?$")
+
+
+def real_failure_summary(token: str, venue: str = "ultra-magnus", **gpu: int) -> dict:
+    """The summary.json the REAL job writes on a product-failure terminal, key for key (playback-attr-3-cuda-job.ps1: GPU_RECON_FRAMES_ZERO
+    ~2557, CPU_FALLBACK_DETECTED ~2568, CPU_BACKEND_PATH_MISMATCH ~3143; the display block is cut to the one field the validator reads).
+    The frame counters live ONLY in the nested gpuSummary (Get-LastGpuSummary's five keys); there is no top-level gpuFramesTotal / cpuFrames, no
+    rows, no sourceFrames, no backend / lookLeg (the variant edit only reaches the success summary) -- except CPU_BACKEND_PATH_MISMATCH, which the
+    cpu variant writes with backend and a top-level gpuFramesTotal (recon + texture readback + texture no-readback)."""
+    gpu_summary = {"cpuFrames": 0, "gpuPreviewFrames": 0, "gpuReconReadbackFrames": 0, "gpuTextureReadbackFrames": 0, "gpuTextureNoReadbackFrames": 0}
+    gpu_summary.update(gpu)
+    body: dict = {"schema": "playback-attr-3-cuda-venue.v1", "result": token, "fixtureRehearsal": False, "displayWake": None}
+    if token == "CPU_BACKEND_PATH_MISMATCH":
+        body["backend"] = "cpu"
+    body["gpuSummary"] = gpu_summary
+    if token == "CPU_BACKEND_PATH_MISMATCH":
+        body["gpuFramesTotal"] = gpu_summary["gpuReconReadbackFrames"] + gpu_summary["gpuTextureReadbackFrames"] + gpu_summary["gpuTextureNoReadbackFrames"]
+    if token == "PRESENTMON_UNAVAILABLE":   # the display-failure branch (~2662): both a top-level gpuFramesTotal and the nested gpuSummary, no backend / lookLeg
+        body.update({"reason": "unit", "presentMonStatus": "unavailable", "chains": [], "presentMonCaptureStartUtc": "2026-10-02T00:00:00.0000000Z", "clockBracket": {},
+                     "diagnostics": {}, "gpuFramesTotal": gpu_summary["gpuReconReadbackFrames"] + gpu_summary["gpuTextureReadbackFrames"] + gpu_summary["gpuTextureNoReadbackFrames"],
+                     "frameRows": 900, "regions": {}})
+    body.update({"display": {"venue": venue}, "sourceCommit": "e" * 40, "clipId": OWNER_CLIP, "artifactRoot": "X:\\stub"})
+    return body
+
+
 class EvidenceFactory(RunnerHarness):
     """Builds evidence-bearing receipts. Mixed into a TestCase whose setUp calls make_harness()."""
 
@@ -1692,7 +1721,9 @@ class EvidenceFactory(RunnerHarness):
         the generator's `$isVariant` job (any venue but bachelor, any cpu run, any look leg) also writes backend / declaredVenue / lookLeg /
         lookAssistForced / lookFlavor. A look leg that kept its contact sheet also keeps its raw frames (`raw_frames`: name -> bytes)."""
         summary = dict(artifact_opts.pop("summary", None) or {})
-        if backend == "cpu":
+        if artifact_opts.get("exact_summary") is not None:
+            summary = {}   # (the exact summary replaces the body whole: no defaults, no variant fields -- the failure branches write none)
+        elif backend == "cpu":
             summary.setdefault("gpuFramesTotal", 0)
             summary.setdefault("cpuFrames", 900)
         if venue != "bachelor" or backend == "cpu" or leg_type == "look":
@@ -1755,7 +1786,8 @@ class EvidenceFactory(RunnerHarness):
         identity = {k: subject[k] for k in ("backend", "buildManifestSha256", "clipContentSha256", "clipId", "legSpecSha256", "lookFlavor")}
         subject["digest"] = hashlib.sha256(json.dumps(identity, sort_keys=True, separators=(",", ":"), ensure_ascii=False).encode("utf-8")).hexdigest()
         summary = json.loads((ev / "summary.json").read_text(encoding="utf-8"))
-        metrics = {k: v for k, v in summary.items() if not isinstance(v, (dict, list))}
+        # (an independent mirror of Get-DvVerbatimMetrics: PowerShell 7's ConvertFrom-Json turns an ISO-8601 string into a DateTime, which is not a metric it copies)
+        metrics = {k: v for k, v in summary.items() if not isinstance(v, (dict, list)) and not (isinstance(v, str) and ISO_DATETIME.match(v))}
         if (ev / "evidence-manifest.json").exists():
             metrics["presentMonStats"] = json.loads((ev / "evidence-manifest.json").read_text(encoding="utf-8")).get("presentMonStats")
         evidence = {"localEvidenceDir": str(ev), "umRunOutcome": "RECEIPT", "artifactIndexPath": None}
@@ -1869,7 +1901,8 @@ class EvidenceBoundReceiptTests(EvidenceFactory, ModuleMutationMixin, unittest.T
 
     def test_a_product_failure_after_a_sound_run_is_a_verified_fail_without_an_evidence_manifest(self) -> None:
         repo = self.prod_repo()
-        ev = self.evidence("pf", source_frames=False, summary={"result": "CPU_FALLBACK_DETECTED"}, token="CPU_FALLBACK_DETECTED", exit_code=14)
+        ev = self.evidence("pf", source_frames=False, exact_summary=real_failure_summary("CPU_FALLBACK_DETECTED", gpuReconReadbackFrames=888, cpuFrames=12),
+                           token="CPU_FALLBACK_DETECTED", exit_code=14)
         (ev / "evidence-manifest.json").unlink()   # the job writes none on a product-failure terminal
         self.assertAdvisory(self.receipt_for(repo, ev, outcome="FAIL"), repo)
         # ... but a capture without its manifest is INCOMPLETE, never a PASS
@@ -2268,8 +2301,9 @@ class SheetPairStaysLocalTests(EvidenceFactory, unittest.TestCase):
         self.repo = self.prod_repo(leg_type="look")
         self.receipts_by_backend = self.build_pair_receipts("pair", real_images=False)
 
-    def build_pair_receipts(self, tag: str, real_images: bool) -> dict[str, dict]:
-        """Both backends' LOOK receipts over evidence whose raw frames are hash-listed in contact-frames.json BEFORE the receipt names it."""
+    def build_pair_receipts(self, tag: str, real_images: bool, cuda_path_for=None) -> dict[str, dict]:
+        """Both backends' LOOK receipts over evidence whose raw frames are hash-listed in contact-frames.json BEFORE the receipt names it.
+        `cuda_path_for(i)` overrides the `path` the cuda side's sidecar i carries (the hash-listed sidecar is what the manifest lists, edited or not)."""
         out: dict[str, dict] = {}
         for backend, colour in (("cuda", (200, 40, 40)), ("cpu", (40, 40, 200))):
             frames = None
@@ -2280,7 +2314,8 @@ class SheetPairStaysLocalTests(EvidenceFactory, unittest.TestCase):
                     buf = io.BytesIO()
                     Image.new("RGB", (64, 36), colour).save(buf, format="PNG")
                     frames[f"frame-{i:02d}.png"] = buf.getvalue()
-                    frames[f"frame-{i:02d}.json"] = json.dumps({"index": i, "saved": True, "display_frame": i * 3, "elapsed_ms": i * 40.0, "path": f"frame-{i:02d}.png",
+                    frames[f"frame-{i:02d}.json"] = json.dumps({"index": i, "saved": True, "display_frame": i * 3, "elapsed_ms": i * 40.0,
+                                                                "path": (cuda_path_for(i) if cuda_path_for and backend == "cuda" else f"frame-{i:02d}.png"),
                                                                 "look_assist_enabled": True, "look_assist_scene": "night"}).encode("utf-8")
             ev = self.evidence(f"{tag}-{backend}", sheet=True, backend=backend, leg_type="look", raw_frames=frames)
             out[backend] = self.receipt_for(self.repo, ev, backend=backend, leg_type="look")
@@ -2373,6 +2408,89 @@ class SheetPairStaysLocalTests(EvidenceFactory, unittest.TestCase):
         self.assertNotEqual(proc.returncode, 0)
         self.assertIn("CONTACT_FRAME_HASH_MISMATCH", proc.stdout + proc.stderr)
         self.assertFalse((self.tmp / ".claude-state" / "sheets").exists(), "nothing is written for a refused pair")
+
+    # -- DUAL-VENUE-EVIDENCE-3 (sol r2 blocker, PR #223): a sheet shows ONLY frames this run captured and the manifest lists ---------------------
+    # sol's repro: a hash-listed sidecar whose `path` names a PNG OUTSIDE staging. The listed PNG is untouched, no listed hash changes, and yet the
+    # composer opened the external file -- so an edited or stale external PNG was composed under the receipt's backend labels.
+    @staticmethod
+    def need_imaging() -> None:
+        try:
+            import PIL, numpy  # noqa: F401
+        except ImportError:
+            raise unittest.SkipTest("Pillow + numpy are required")
+
+    def external_png(self, path: Path, colour: tuple[int, int, int]) -> Path:
+        from PIL import Image
+        path.parent.mkdir(parents=True, exist_ok=True)
+        Image.new("RGB", (64, 36), colour).save(path)
+        return path
+
+    def pair_with_cuda_sidecar_path(self, tag: str, path_for, out_name: str = "sheets"):
+        receipts = self.build_pair_receipts(tag, real_images=True, cuda_path_for=path_for)
+        out = self.tmp / ".claude-state" / out_name
+        return out, self.pair(out, receipts=receipts)
+
+    def test_a_hash_listed_sidecar_that_names_an_absolute_png_outside_staging_is_refused(self) -> None:
+        self.need_imaging()
+        for luma in (20, 220):   # sol's repro: only the external PNG's pixels change; no listed artifact does
+            external = self.external_png(self.tmp / "legacy-captures" / "frame-00.png", (luma, luma, luma))
+            out, proc = self.pair_with_cuda_sidecar_path(f"abs-{luma}", lambda i, p=str(external): p if i == 0 else f"frame-{i:02d}.png", f"sheets-abs-{luma}")
+            self.assertNotEqual(proc.returncode, 0, f"an external PNG (luma {luma}) was composed under the receipt's backend labels: {proc.stdout}{proc.stderr}")
+            self.assertIn("CONTACT_FRAME_SIDECAR_PATH", proc.stdout + proc.stderr)
+            self.assertFalse(out.exists(), "nothing is written for a refused pair")
+
+    def test_a_hash_listed_sidecar_with_a_parent_relative_path_is_refused(self) -> None:
+        self.need_imaging()
+        out = self.tmp / ".claude-state" / "sheets-rel"
+        # the staging dir is <out>\.pair-staging\<guid>\cuda, so three levels up is <out> itself: an external PNG a relative path can reach
+        self.external_png(out / "ext-00.png", (30, 30, 30))
+        for n, ref in enumerate(("../../../ext-00.png", "..\\..\\..\\ext-00.png", "sub/../../../../ext-00.png")):
+            receipts = self.build_pair_receipts(f"rel{n}", real_images=True, cuda_path_for=lambda i, r=ref: r if i == 0 else f"frame-{i:02d}.png")
+            proc = self.pair(out, receipts=receipts)
+            self.assertNotEqual(proc.returncode, 0, f"{ref!r} reached an external PNG: {proc.stdout}{proc.stderr}")
+            self.assertIn("CONTACT_FRAME_SIDECAR_PATH", proc.stdout + proc.stderr)
+            self.assertEqual(list(out.glob("sheet-*")), [], "no sheet is written for a refused pair")
+
+    def test_a_sidecar_may_only_name_its_own_listed_png(self) -> None:
+        self.need_imaging()
+        for n, ref in enumerate(("frame-01.png", "frame-00.PNG", "./frame-00.png", "raw/frame-00.png", "C:frame-00.png", "\\\\host\\share\\frame-00.png")):
+            out, proc = self.pair_with_cuda_sidecar_path(f"own{n}", lambda i, r=ref: r if i == 0 else f"frame-{i:02d}.png", f"sheets-own{n}")
+            self.assertNotEqual(proc.returncode, 0, f"{ref!r} was accepted as the image of frame-00.json: {proc.stdout}{proc.stderr}")
+            self.assertIn("CONTACT_FRAME_SIDECAR_PATH", proc.stdout + proc.stderr)
+
+    def test_the_composer_refuses_what_the_reader_missed_and_the_reader_what_the_composer_missed(self) -> None:
+        # two layers, each enough alone: the reader (Read-DvContactFrames) refuses at validation; the composer refuses at read time. Take one
+        # layer out and the pair is still refused (by the other); take BOTH out and the guard-less pair composes.
+        self.need_imaging()
+        external = self.external_png(self.tmp / "legacy-captures" / "frame-00.png", (90, 90, 90))
+        path_for = lambda i, p=str(external): p if i == 0 else f"frame-{i:02d}.png"   # noqa: E731
+        reader = self.repo.dv / "DualVenueRunner.psm1"
+        composer = self.repo.root / "tools" / "profiling" / "make-contact-sheet.py"
+        reader_text, composer_text = reader.read_text(encoding="utf-8"), composer.read_text(encoding="utf-8")
+        reader_anchor = "if ($refPath -cne ($stem + '.png')) {"
+        composer_anchor = 'if raw not in ("", None) and raw != own:'
+        self.assertEqual(reader_text.count(reader_anchor), 1)
+        self.assertEqual(composer_text.count(composer_anchor), 1)
+        reader.write_text(reader_text.replace(reader_anchor, "if ($false) {"), encoding="utf-8")
+        _, proc = self.pair_with_cuda_sidecar_path("lay1", path_for, "sheets-l1")
+        self.assertNotEqual(proc.returncode, 0, "the composer alone refuses the external reference: " + proc.stdout + proc.stderr)
+        self.assertIn("PAIR_SIDECAR_PATH_OUTSIDE_STAGING", proc.stdout + proc.stderr)
+        reader.write_text(reader_text, encoding="utf-8")
+        composer.write_text(composer_text.replace(composer_anchor, "if False:"), encoding="utf-8")
+        _, proc = self.pair_with_cuda_sidecar_path("lay2", path_for, "sheets-l2")
+        self.assertNotEqual(proc.returncode, 0, "the reader alone refuses the external reference: " + proc.stdout + proc.stderr)
+        self.assertIn("CONTACT_FRAME_SIDECAR_PATH", proc.stdout + proc.stderr)
+        reader.write_text(reader_text.replace(reader_anchor, "if ($false) {"), encoding="utf-8")
+        out, proc = self.pair_with_cuda_sidecar_path("lay3", path_for, "sheets-l3")
+        self.assertEqual(proc.returncode, 0, "with both guards taken out the reference is followed -- so the two guards are what refuse it: " + proc.stdout + proc.stderr)
+
+    def test_the_pair_script_hands_the_composer_the_hashes_it_must_verify_at_read_time(self) -> None:
+        text = (DV / "New-VenueSheetPair.ps1").read_text(encoding="utf-8")
+        for needle in ("'--left-listed'", "'--right-listed'"):
+            self.assertIn(needle, text)
+        composer = COMPOSER.read_text(encoding="utf-8")
+        self.assertIn("--left-listed", composer)
+        self.assertIn("--right-listed", composer)
 
     def test_a_speed_leg_cannot_be_paired_as_a_sheet(self) -> None:
         speed_repo = self.prod_repo(leg_type="speed")
@@ -2618,6 +2736,135 @@ class NarrowedProductionReceiptsAndBoundBackendTests(EvidenceFactory, ModuleMuta
 
 
 @requires_windows_pwsh
+class ProductFailureTerminalsAreReceiptableTests(EvidenceFactory, ModuleMutationMixin, unittest.TestCase):
+    """DUAL-VENUE-EVIDENCE-3 (sol r2 hardening H1 / fable r2 hardening 1, DVE-REAL-PRODUCT-FAILURE-SUMMARY-CONTRACT-1): the backend of a product-failure
+    terminal is derived where the REAL job puts its frame counters (the nested gpuSummary), so the documented advisory FAIL is written, not lost to
+    BACKEND_NOT_DERIVABLE / DVE_RECEIPT_WRITE_FAILED. Every summary here is the job's exact shape (real_failure_summary), not the capture defaults plus a result."""
+
+    def setUp(self) -> None:
+        self.make_harness()
+
+    TERMINALS = (("GPU_RECON_FRAMES_ZERO", 13, "cuda", {}),
+                 ("GPU_RECON_FRAMES_ZERO", 13, "cuda", {"cpuFrames": 900}),                                     # every frame fell to the cpu path
+                 ("CPU_FALLBACK_DETECTED", 14, "cuda", {"gpuReconReadbackFrames": 888, "cpuFrames": 12}),
+                 ("CPU_FALLBACK_DETECTED", 14, "cuda", {"gpuTextureNoReadbackFrames": 5, "cpuFrames": 1}),       # every counter the job sums counts
+                 ("CPU_BACKEND_PATH_MISMATCH", 28, "cpu", {"gpuReconReadbackFrames": 900}),                      # the cpu leg ran the gpu path
+                 ("CPU_BACKEND_PATH_MISMATCH", 28, "cpu", {}),                                                   # ... or produced no cpu frame
+                 ("PRESENTMON_UNAVAILABLE", 23, "cuda", {"gpuReconReadbackFrames": 900}))                        # top-level gpuFramesTotal AND the nested block
+
+    def failure_evidence(self, name: str, token: str, code: int, backend: str = "cuda", leg_type: str = "speed", **gpu: int) -> Path:
+        ev = self.evidence(name, backend=backend, leg_type=leg_type, source_frames=False, exact_summary=real_failure_summary(token, **gpu), token=token, exit_code=code)
+        (ev / "evidence-manifest.json").unlink()   # the job writes none on a product-failure terminal
+        return ev
+
+    def derived_backend(self, summaries: dict[str, dict]) -> dict[str, str]:
+        script = ("$cases = $env:DVE_SUMMARIES | ConvertFrom-Json\nforeach ($p in $cases.PSObject.Properties) {\n"
+                  "  $b = Get-DvDerivedBackend -Summary $p.Value\n  Write-Output ($p.Name + '=' + $(if ($null -eq $b) { '<none>' } else { $b }))\n}\n")
+        proc = _ps_json(script, DV / "DualVenueRunner.psm1", {"DVE_SUMMARIES": json.dumps(summaries)})
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        return dict(l.rsplit("=", 1) for l in proc.stdout.splitlines() if "=" in l)
+
+    def test_the_backend_is_derived_where_the_real_failure_summaries_put_the_counters(self) -> None:
+        cases = {f"{t}/{n}": (real_failure_summary(t, **g), b) for n, (t, _c, b, g) in enumerate(self.TERMINALS)}
+        captured = {"result": "MEASUREMENT_CAPTURED", "gpuFramesTotal": 900, "cpuFrames": 0}
+        cases.update({
+            "captured cuda": (captured, "cuda"),
+            "captured cpu": (dict(captured, gpuFramesTotal=0, cpuFrames=900), "cpu"),
+            "captured zero counters": (dict(captured, gpuFramesTotal=0, cpuFrames=0), "<none>"),
+            "top-level junk is not rescued by a nested block": ({"result": "PRESENTMON_UNAVAILABLE", "gpuFramesTotal": "n/a", "gpuSummary": {"cpuFrames": 0, "gpuReconReadbackFrames": 5, "gpuTextureReadbackFrames": 0, "gpuTextureNoReadbackFrames": 0}}, "<none>"),
+            # a terminal whose counters contradict what that terminal means is not derivable
+            "GPU_RECON_FRAMES_ZERO with gpu frames": (real_failure_summary("GPU_RECON_FRAMES_ZERO", gpuReconReadbackFrames=3), "<none>"),
+            "CPU_FALLBACK_DETECTED with no cpu frames": (real_failure_summary("CPU_FALLBACK_DETECTED", gpuReconReadbackFrames=900), "<none>"),
+            "CPU_FALLBACK_DETECTED with no gpu frames": (real_failure_summary("CPU_FALLBACK_DETECTED", cpuFrames=900), "<none>"),
+            "a counter the job did not write": ({"result": "CPU_FALLBACK_DETECTED", "gpuSummary": {"cpuFrames": 4}}, "<none>"),
+            "CPU_BACKEND_PATH_MISMATCH that did run the cpu path": (real_failure_summary("CPU_BACKEND_PATH_MISMATCH", cpuFrames=900), "<none>")})
+        got = self.derived_backend({k: v[0] for k, v in cases.items()})
+        for label, (_summary, want) in cases.items():
+            self.assertEqual(got.get(label), want, label)
+
+    def test_a_real_failure_terminal_is_an_advisory_fail_for_a_speed_leg_and_a_look_leg(self) -> None:
+        speed_repo = self.prod_repo(leg_type="speed")
+        speed_spec = self.spec_path
+        look_repo = self.prod_repo(leg_type="look")
+        look_spec = self.spec_path
+        cases, labels = [], []
+        for n, (token, code, backend, gpu) in enumerate(self.TERMINALS):
+            for leg, repo, spec in (("speed", speed_repo, speed_spec), ("look", look_repo, look_spec)):
+                ev = self.failure_evidence(f"ft-{leg}-{n}", token, code, backend=backend, leg_type=leg, **gpu)
+                cases.append((repo, self.receipt_for(repo, ev, backend=backend, outcome="FAIL", leg_type=leg, spec_path=spec)))
+                labels.append(f"{leg} {token} {gpu}")
+        for repo in (speed_repo, look_repo):
+            mine = [(i, c) for i, (r, c) in enumerate(cases) if r is repo]
+            for (i, _), got in zip(mine, self.status_batch(repo, [(c, None) for _, c in mine])):
+                self.expect(got, "ADVISORY", labels[i])
+
+    def test_a_failure_terminal_cannot_be_relabelled_contradicted_or_promoted(self) -> None:
+        repo = self.prod_repo()
+        spec = self.spec_path
+        zero = self.failure_evidence("rl-zero", "GPU_RECON_FRAMES_ZERO", 13)
+        mismatch = self.failure_evidence("rl-mm", "CPU_BACKEND_PATH_MISMATCH", 28, backend="cpu", gpuReconReadbackFrames=900)
+        fallback_no_cpu = self.failure_evidence("rl-nocpu", "CPU_FALLBACK_DETECTED", 14, gpuReconReadbackFrames=900)
+        got = self.status_batch(repo, [
+            (self.relabel(self.receipt_for(repo, zero, outcome="FAIL", spec_path=spec), "cpu"), None),
+            (self.relabel(self.receipt_for(repo, mismatch, backend="cpu", outcome="FAIL", spec_path=spec), "cuda"), None),
+            (self.receipt_for(repo, fallback_no_cpu, outcome="FAIL", spec_path=spec), None),
+            (self.receipt_for(repo, zero, outcome="PASS", spec_path=spec), None)])
+        self.expect(got[0], "INVALID", "a cuda terminal relabelled cpu", "BACKEND_MISMATCH")
+        self.expect(got[1], "INVALID", "the cpu terminal relabelled cuda", "BACKEND_MISMATCH")
+        self.expect(got[2], "INVALID", "counters that contradict the terminal", "BACKEND_NOT_DERIVABLE")
+        self.expect(got[3], "INVALID", "a failure terminal claimed as a PASS", "OUTCOME_NOT_DERIVED")
+
+    def relabel(self, receipt: dict, backend: str) -> dict:
+        forged = json.loads(json.dumps(receipt))
+        forged["subject"]["backend"] = backend
+        return redigest(forged)
+
+    def test_the_production_writer_writes_the_failure_receipt_the_docs_promise(self) -> None:
+        # before: BACKEND_NOT_DERIVABLE -> DVE_RECEIPT_INVALID -> the runner printed DVE_RECEIPT_WRITE_FAILED and exited 2 with no receipt at all
+        repo = self.prod_repo()
+        receipts = [self.receipt_for(repo, self.failure_evidence(f"wr{n}", token, code, backend=backend, **gpu), backend=backend, outcome="FAIL")
+                    for n, (token, code, backend, gpu) in enumerate(self.TERMINALS)]
+        out = self.tmp / "written"
+        script = (f"Import-Module '{DV / 'DualVenueRunner.psm1'}' -Force\n$rs = $env:DVE_RECEIPTS | ConvertFrom-Json -AsHashtable\n"
+                  f"foreach ($r in $rs) {{ try {{ Write-DvReceipt -Receipt $r -ReceiptRoot '{out}' -RepoRoot '{repo.root}' | Out-Null; 'WRITTEN' }} catch {{ 'REFUSED:' + $_.Exception.Message }} }}\n")
+        proc = run_pwsh(["-Command", script], env_extra={"DVE_RECEIPTS": json.dumps(receipts)})
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        self.assertEqual([l for l in proc.stdout.splitlines() if l.strip()], ["WRITTEN"] * len(receipts), proc.stdout)
+        for r in receipts:
+            written = json.loads(next(out.rglob(r["receiptId"] + ".json")).read_text(encoding="utf-8"))
+            self.assertEqual(written["outcome"], "FAIL")
+            self.assertEqual(written["verification"]["status"], "ADVISORY")
+            self.assertEqual(self.status(written, repo)[:2], ("ADVISORY", False), "the written failure receipt re-derives, advisory")
+
+    def test_the_docs_say_where_the_failure_terminals_counters_and_leg_type_come_from(self) -> None:
+        doc = (ROOT / "docs" / "dual-venue-evidence.md").read_text(encoding="utf-8")
+        for needle in ("gpuSummary", "GPU_RECON_FRAMES_ZERO", "CPU_FALLBACK_DETECTED", "CPU_BACKEND_PATH_MISMATCH", "LEG_TYPE_UNSTATED"):
+            self.assertIn(needle, doc)
+
+    def test_mutation_without_the_nested_counters_the_failure_terminals_are_not_derivable(self) -> None:
+        mutated = self.mutated_module([("$nested = Get-DvProp $Summary 'gpuSummary'", "$nested = $null")])
+        repo = self.prod_repo()
+        got = self.status_batch(repo, [(self.receipt_for(repo, self.failure_evidence(f"mn{n}", token, code, backend=backend, **gpu), backend=backend, outcome="FAIL"), None)
+                                       for n, (token, code, backend, gpu) in enumerate(self.TERMINALS[:6])], module=mutated)   # (the six that carry ONLY the nested block)
+        for n, g in enumerate(got):
+            self.expect(g, "INVALID", f"terminal {n}", "BACKEND_NOT_DERIVABLE")   # (all ADVISORY in the test above)
+
+    def test_mutation_without_the_terminal_rule_a_cuda_run_that_used_the_cpu_path_is_mislabelled(self) -> None:
+        mutated = self.mutated_module([("if ($terminal -ceq 'GPU_RECON_FRAMES_ZERO') {", "if ($false) {")])
+        repo = self.prod_repo()
+        ev = self.failure_evidence("mt", "GPU_RECON_FRAMES_ZERO", 13, cpuFrames=900)
+        got = self.status_batch(repo, [(self.receipt_for(repo, ev, outcome="FAIL"), None)], module=mutated)[0]
+        self.expect(got, "INVALID", "plain counters read an all-cpu cuda failure as a cpu run", "BACKEND_MISMATCH")
+
+    def test_mutation_without_the_unstated_leg_type_rule_a_look_failure_is_a_leg_type_mismatch(self) -> None:
+        mutated = self.mutated_module([("if ($failureTerminal -and $null -eq (Get-DvProp $ev.summary 'lookLeg')) {", "if ($false) {")])
+        repo = self.prod_repo(leg_type="look")
+        ev = self.failure_evidence("ml", "CPU_FALLBACK_DETECTED", 14, leg_type="look", gpuReconReadbackFrames=888, cpuFrames=12)
+        got = self.status_batch(repo, [(self.receipt_for(repo, ev, outcome="FAIL", leg_type="look"), None)], module=mutated)[0]
+        self.expect(got, "INVALID", "a look leg's failure terminal states no lookLeg", "LEG_TYPE_MISMATCH")
+
+
+@requires_windows_pwsh
 class ContactFramesAreHashListedTests(EvidenceFactory, ModuleMutationMixin, unittest.TestCase):
     """sol r1 B4: a LOOK receipt's raw frames and sidecars are accepted only as the hashed contact-frames manifest lists them."""
 
@@ -2860,6 +3107,161 @@ class SideBySideSheetTests(unittest.TestCase):
                                    "--stats-out", str(base / "s.json")], capture_output=True, text=True)
             self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
             self.assertEqual(json.loads((base / "s.json").read_text(encoding="utf-8"))["schema"], "contact-sheet-stats.v1")
+
+
+# ---------------------------------------------------------------------------------------------------
+class PairComposerReadsOnlyStagedListedFramesTests(unittest.TestCase):
+    """DUAL-VENUE-EVIDENCE-3 (sol r2 blocker, PR #223), at the composer: in pair mode a side reads ONLY the plain files of its own staging directory;
+    a sidecar `path` that is absolute, parent-relative or anything but its own `<stem>.png` is refused (typed), there is no fallback to an external
+    file, and when the caller lists hashes (--left-listed / --right-listed) every file read is verified against its hash AT READ TIME."""
+
+    def setUp(self) -> None:
+        try:
+            import PIL, numpy  # noqa: F401
+        except ImportError:
+            self.skipTest("Pillow + numpy are required")
+        self._tmp = tempfile.TemporaryDirectory(prefix="dve-confine-")
+        self.addCleanup(self._tmp.cleanup)
+        self.base = Path(self._tmp.name)
+
+    def side(self, name: str, colour: tuple[int, int, int], path_for=None, indices=(0, 1)) -> Path:
+        from PIL import Image
+        d = self.base / name
+        d.mkdir()
+        for i in indices:
+            Image.new("RGB", (64, 36), colour).save(d / f"frame-{i:02d}.png")
+            (d / f"frame-{i:02d}.json").write_text(json.dumps({
+                "index": i, "saved": True, "display_frame": i * 3, "elapsed_ms": i * 40.0, "look_assist_enabled": True,
+                "path": path_for(i) if path_for else f"frame-{i:02d}.png"}), encoding="utf-8")
+        return d
+
+    def listing(self, d: Path, name: str) -> Path:
+        files = [{"name": p.name, "sha256": hashlib.sha256(p.read_bytes()).hexdigest()} for p in sorted(d.iterdir()) if p.is_file()]
+        path = self.base / name
+        path.write_text(json.dumps({"files": files}), encoding="utf-8")
+        return path
+
+    def compose(self, left: Path, right: Path, listed: bool = True, composer: Path | None = None, tag: str = "out"):
+        args = [sys.executable, str(composer or COMPOSER), "--frames-dir", str(left), "--pair-dir", str(right), "--sheet-out", str(self.base / f"{tag}.png"),
+                "--stats-out", str(self.base / f"{tag}.json"), "--clip-id", "unit", "--cols", "1"]
+        if listed:
+            args += ["--left-listed", str(self.listing(left, f"{tag}-l.json")), "--right-listed", str(self.listing(right, f"{tag}-r.json"))]
+        return subprocess.run(args, capture_output=True, text=True)
+
+    def external(self, colour: tuple[int, int, int], name: str = "frame-00.png") -> Path:
+        from PIL import Image
+        p = self.base / "legacy-captures" / name
+        p.parent.mkdir(exist_ok=True)
+        Image.new("RGB", (64, 36), colour).save(p)
+        return p
+
+    def test_a_listed_pair_of_plain_staged_frames_composes(self) -> None:
+        proc = self.compose(self.side("l", (200, 40, 40)), self.side("r", (40, 40, 200)))
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        self.assertTrue((self.base / "out.png").is_file())
+
+    def test_an_absolute_sidecar_path_is_refused_in_pair_mode_listed_or_not(self) -> None:
+        for listed in (True, False):
+            for luma in (20, 220):   # the external PNG changes; composing it would change the tile (sol's repro)
+                ext = self.external((luma, luma, luma))
+                left = self.base / f"l-{listed}-{luma}"
+                left = self.side(left.name, (200, 40, 40), path_for=lambda i, p=str(ext): p if i == 0 else f"frame-{i:02d}.png")
+                proc = self.compose(left, self.side(f"r-{listed}-{luma}", (40, 40, 200)), listed=listed, tag=f"abs-{listed}-{luma}")
+                self.assertEqual(proc.returncode, 3, proc.stdout + proc.stderr)
+                self.assertIn("PAIR_SIDECAR_PATH_OUTSIDE_STAGING", proc.stderr)
+                self.assertFalse((self.base / f"abs-{listed}-{luma}.png").exists(), "no sheet is written when a side names an external image")
+
+    def test_a_parent_relative_sidecar_path_is_refused_on_either_side(self) -> None:
+        self.external((50, 50, 50), "ext.png")
+        n = 0
+        for ref in ("../legacy-captures/ext.png", "..\\legacy-captures\\ext.png", "sub/../../legacy-captures/ext.png"):
+            for side_name in ("left", "right"):
+                n += 1
+                bad = lambda i, r=ref: r if i == 0 else f"frame-{i:02d}.png"   # noqa: E731
+                left = self.side(f"pl{n}", (200, 40, 40), path_for=bad if side_name == "left" else None)
+                right = self.side(f"pr{n}", (40, 40, 200), path_for=bad if side_name == "right" else None)
+                proc = self.compose(left, right, tag=f"rel{n}")
+                self.assertEqual(proc.returncode, 3, f"{ref!r} on the {side_name}: {proc.stdout}{proc.stderr}")
+                self.assertIn("PAIR_SIDECAR_PATH_OUTSIDE_STAGING", proc.stderr)
+
+    def test_a_missing_staged_png_is_never_replaced_by_an_external_file(self) -> None:
+        # the old resolver fell back to <frames_dir>/<stem>.png and, before that, to any path the sidecar named: with the staged PNG gone nothing else may stand in
+        ext = self.external((60, 60, 60))
+        left = self.side("l", (200, 40, 40), path_for=lambda i, p=str(ext): p if i == 0 else f"frame-{i:02d}.png")
+        (left / "frame-00.png").unlink()
+        proc = self.compose(left, self.side("r", (40, 40, 200)))
+        self.assertEqual(proc.returncode, 3, proc.stdout + proc.stderr)
+        self.assertIn("PAIR_SIDECAR_PATH_OUTSIDE_STAGING", proc.stderr)
+        # a staged PNG that is simply absent is an UNPAIRED / image-missing tile (as before), never another file's pixels
+        plain = self.side("l2", (200, 40, 40))
+        (plain / "frame-01.png").unlink()   # (frame 0 is the geometry probe: without it the compose has always refused)
+        proc = self.compose(plain, self.side("r2", (40, 40, 200)), listed=False, tag="gone")
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        doc = json.loads((self.base / "gone.json").read_text(encoding="utf-8"))
+        self.assertEqual([t["index"] for t in doc["left"]["tiles"]], [0])
+        self.assertEqual([t["index"] for t in doc["right"]["tiles"]], [0, 1])
+
+    def test_a_staged_file_edited_after_it_was_listed_is_refused_at_read_time(self) -> None:
+        from PIL import Image
+        left, right = self.side("l", (200, 40, 40)), self.side("r", (40, 40, 200))
+        lists = (self.listing(left, "ll.json"), self.listing(right, "rr.json"))
+        Image.new("RGB", (64, 36), (1, 2, 3)).save(left / "frame-00.png")   # swapped after the hash was taken (same name)
+        args = [sys.executable, str(COMPOSER), "--frames-dir", str(left), "--pair-dir", str(right), "--sheet-out", str(self.base / "o.png"),
+                "--stats-out", str(self.base / "o.json"), "--left-listed", str(lists[0]), "--right-listed", str(lists[1])]
+        proc = subprocess.run(args, capture_output=True, text=True)
+        self.assertEqual(proc.returncode, 3, proc.stdout + proc.stderr)
+        self.assertIn("PAIR_FRAME_HASH_MISMATCH", proc.stderr)
+        self.assertFalse((self.base / "o.png").exists())
+
+    def test_an_unlisted_file_in_staging_is_refused(self) -> None:
+        left, right = self.side("l", (200, 40, 40)), self.side("r", (40, 40, 200))
+        lists = (self.listing(left, "ll.json"), self.listing(right, "rr.json"))
+        self.external((9, 9, 9)).replace(right / "frame-07.png")   # a PNG that no manifest line lists, dropped into staging
+        args = [sys.executable, str(COMPOSER), "--frames-dir", str(left), "--pair-dir", str(right), "--sheet-out", str(self.base / "o.png"),
+                "--stats-out", str(self.base / "o.json"), "--left-listed", str(lists[0]), "--right-listed", str(lists[1])]
+        proc = subprocess.run(args, capture_output=True, text=True)
+        self.assertEqual(proc.returncode, 3, proc.stdout + proc.stderr)
+        self.assertIn("PAIR_FRAME_NOT_LISTED", proc.stderr)
+
+    def test_a_listing_is_all_or_nothing(self) -> None:
+        left, right = self.side("l", (200, 40, 40)), self.side("r", (40, 40, 200))
+        args = [sys.executable, str(COMPOSER), "--frames-dir", str(left), "--pair-dir", str(right), "--sheet-out", str(self.base / "o.png"),
+                "--stats-out", str(self.base / "o.json"), "--left-listed", str(self.listing(left, "ll.json"))]
+        proc = subprocess.run(args, capture_output=True, text=True)
+        self.assertNotEqual(proc.returncode, 0, "a listing for one side only would leave the other side's reads unverified")
+
+    def test_single_backend_mode_still_honours_an_absolute_sidecar_path(self) -> None:
+        # (the single-capture sheet is the app's own capture dir read by the owner: unchanged; only the evidence PAIR is confined)
+        ext = self.external((70, 70, 70))
+        d = self.side("solo", (10, 200, 10), path_for=lambda i, p=str(ext): p if i == 0 else f"frame-{i:02d}.png")
+        proc = subprocess.run([sys.executable, str(COMPOSER), "--frames-dir", str(d), "--sheet-out", str(self.base / "s.png"), "--stats-out", str(self.base / "s.json")],
+                              capture_output=True, text=True)
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+
+    # -- mutations: each guard taken out of a COPY of the composer, and the scenario above must change ----------------------------------------
+    def mutated_composer(self, old: str, new: str) -> Path:
+        text = COMPOSER.read_text(encoding="utf-8")
+        self.assertEqual(text.count(old), 1, f"mutation anchor must occur exactly once: {old!r}")
+        path = self.base / "mutated-composer.py"
+        path.write_text(text.replace(old, new), encoding="utf-8")
+        return path
+
+    def test_mutation_without_the_path_confinement_an_external_reference_is_composed(self) -> None:
+        mutated = self.mutated_composer('if raw not in ("", None) and raw != own:', "if False:")
+        ext = self.external((20, 20, 20))
+        left = self.side("l", (200, 40, 40), path_for=lambda i, p=str(ext): p if i == 0 else f"frame-{i:02d}.png")
+        proc = self.compose(left, self.side("r", (40, 40, 200)), composer=mutated)
+        self.assertEqual(proc.returncode, 0, "with the check removed the reference is not refused -- so the real run's refusal is the check: " + proc.stdout + proc.stderr)
+
+    def test_mutation_without_the_read_time_hash_a_swapped_staged_file_is_composed(self) -> None:
+        from PIL import Image
+        mutated = self.mutated_composer("if self.listed is not None and hashlib.sha256(data).hexdigest() != self.listed[name]:", "if False:")
+        left, right = self.side("l", (200, 40, 40)), self.side("r", (40, 40, 200))
+        lists = (self.listing(left, "ll.json"), self.listing(right, "rr.json"))
+        Image.new("RGB", (64, 36), (1, 2, 3)).save(left / "frame-00.png")
+        proc = subprocess.run([sys.executable, str(mutated), "--frames-dir", str(left), "--pair-dir", str(right), "--sheet-out", str(self.base / "o.png"),
+                               "--stats-out", str(self.base / "o.json"), "--left-listed", str(lists[0]), "--right-listed", str(lists[1])], capture_output=True, text=True)
+        self.assertEqual(proc.returncode, 0, "with the hash check removed a file swapped after listing is composed: " + proc.stdout + proc.stderr)
 
 
 # ---------------------------------------------------------------------------------------------------

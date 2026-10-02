@@ -750,12 +750,44 @@ function Read-DvEvidenceSet {
     [pscustomobject]$res
 }
 
+# The product-failure terminals the job writes AFTER its run log is published, as playback-attr-3-cuda-job.ps1 writes them (DUAL-VENUE-EVIDENCE-3,
+# sol r2 H1 / fable r2 hardening 1). Their summary.json is NOT the success summary: the frame counters live only inside the nested `gpuSummary`
+# (Get-LastGpuSummary's keys; there is no top-level gpuFramesTotal / cpuFrames), and the variant's backend / lookLeg fields (written into the SUCCESS
+# summary only) are absent. GPU_RECON_FRAMES_ZERO and CPU_FALLBACK_DETECTED (exits 13 / 14) are guarded `$Backend -ne 'cpu'` in the cpu variant, so
+# they can only come from a cuda leg; CPU_BACKEND_PATH_MISMATCH (exit 28) fires only when `$Backend -eq 'cpu'`.
+# PRESENTMON_UNAVAILABLE (exit 23) carries gpuFramesTotal at top level and gpuSummary beside it, so its backend reads from the plain counters; it is listed
+# here only because its summary, too, states no leg type.
+$script:FailureTerminals = @('GPU_RECON_FRAMES_ZERO', 'CPU_FALLBACK_DETECTED', 'CPU_BACKEND_PATH_MISMATCH', 'PRESENTMON_UNAVAILABLE')
+
+# The frame counters of a hashed summary.json, from where the job put them: the top-level gpuFramesTotal / cpuFrames when the key is there, else the
+# nested gpuSummary (gpuFramesTotal is the sum the job computes: recon readback + texture readback + texture no-readback; gpu_preview frames are not
+# CUDA reconstruction and never count). A top-level key that is present but not an integer is NOT rescued by the nested block. $null = not derivable.
+function Get-DvFrameCounters {
+    param($Summary)
+    $topGpu = Get-DvProp $Summary 'gpuFramesTotal'; $topCpu = Get-DvProp $Summary 'cpuFrames'
+    $nested = Get-DvProp $Summary 'gpuSummary'
+    $gpu = ConvertTo-DvInt64 $topGpu; $cpu = ConvertTo-DvInt64 $topCpu
+    if ($null -eq $topGpu -and $null -ne $nested) {
+        $parts = @(foreach ($k in 'gpuReconReadbackFrames', 'gpuTextureReadbackFrames', 'gpuTextureNoReadbackFrames') { ConvertTo-DvInt64 (Get-DvProp $nested $k) })
+        if ($parts.Count -eq 3 -and @($parts | Where-Object { $null -eq $_ }).Count -eq 0) { $gpu = [int64]($parts[0] + $parts[1] + $parts[2]) }
+    }
+    if ($null -eq $topCpu -and $null -ne $nested) { $cpu = ConvertTo-DvInt64 (Get-DvProp $nested 'cpuFrames') }
+    [pscustomobject]@{ gpu = $gpu; cpu = $cpu }
+}
+
 # The backend a run ACTUALLY used, from the hashed summary.json's own frame counters (fable r1 B1 / sol r1 B2). The receipt's subject.backend is
 # a claim; this is the evidence. cuda: gpuFramesTotal > 0. cpu: cpuFrames > 0 and gpuFramesTotal == 0. Anything else (absent, both zero) is not derivable.
+# A product-failure terminal (see $script:FailureTerminals) is read by what that terminal means: the leg's backend is the one only that terminal can come
+# from, and its counters must be the shape the job writes it under (a terminal whose counters contradict it is not derivable). That is how an all-cpu
+# GPU_RECON_FRAMES_ZERO run (gpu 0, cpu > 0) stays a cuda leg's FAIL instead of reading as a cpu run.
 function Get-DvDerivedBackend {
     param($Summary)
-    $gpu = ConvertTo-DvInt64 (Get-DvProp $Summary 'gpuFramesTotal')
-    $cpu = ConvertTo-DvInt64 (Get-DvProp $Summary 'cpuFrames')
+    $c = Get-DvFrameCounters -Summary $Summary
+    $gpu = $c.gpu; $cpu = $c.cpu
+    $terminal = [string](Get-DvProp $Summary 'result')
+    if ($terminal -ceq 'GPU_RECON_FRAMES_ZERO') { if ($null -ne $gpu -and $gpu -eq 0) { return 'cuda' }; return $null }
+    if ($terminal -ceq 'CPU_FALLBACK_DETECTED') { if ($null -ne $gpu -and $gpu -gt 0 -and $null -ne $cpu -and $cpu -gt 0) { return 'cuda' }; return $null }
+    if ($terminal -ceq 'CPU_BACKEND_PATH_MISMATCH') { if ($null -ne $gpu -and $null -ne $cpu -and ($cpu -le 0 -or $gpu -gt 0)) { return 'cpu' }; return $null }
     if ($null -ne $gpu -and $gpu -gt 0) { return 'cuda' }
     if ($null -ne $gpu -and $gpu -eq 0 -and $null -ne $cpu -and $cpu -gt 0) { return 'cpu' }
     $null
@@ -810,6 +842,17 @@ function Read-DvContactFrames {
         $bytes = [IO.File]::ReadAllBytes($path)
         if ((Get-DvSha256OfBytes $bytes) -cne $entry.sha256) { $reasons.Add("CONTACT_FRAME_HASH_MISMATCH: '$($entry.name)' does not hash to the sha256 the manifest lists"); continue }
         $files.Add([pscustomobject]@{ name = $entry.name; sha256 = $entry.sha256; bytes = $bytes })
+    }
+    # A hash-listed sidecar names its frame's image (`path`); the composer used to follow that name wherever it pointed -- an absolute or parent-relative path
+    # reached a PNG OUTSIDE the listed files, so an edited or stale external image was composed under the receipt's labels with no listed hash changing
+    # (DUAL-VENUE-EVIDENCE-3, sol r2 blocker, PR #223). A sidecar may name no image but its own listed `<stem>.png` (the app writes exactly that name).
+    foreach ($f in @($files | Where-Object { $_.name -clike '*.json' })) {
+        $stem = $f.name.Substring(0, $f.name.Length - '.json'.Length)
+        try { $side = (ConvertTo-DvText $f.bytes) | ConvertFrom-Json -ErrorAction Stop } catch { $reasons.Add("CONTACT_FRAME_SIDECAR_UNPARSABLE: the listed sidecar '$($f.name)' is not valid JSON"); continue }
+        $refPath = [string](Get-DvProp $side 'path')
+        if ($refPath -ne '') {
+            if ($refPath -cne ($stem + '.png')) { $reasons.Add("CONTACT_FRAME_SIDECAR_PATH: the listed sidecar '$($f.name)' names an image other than its own '$stem.png' (an absolute, parent-relative, nested or other-frame path); a sheet shows only the frames the manifest lists") }
+        }
     }
     if ($reasons.Count -eq 0 -and @($files | Where-Object { $_.name -clike '*.png' }).Count -eq 0) { $reasons.Add('CONTACT_FRAMES_UNLISTED: the manifest lists no PNG frame') }
     & $done
@@ -988,7 +1031,7 @@ function Test-DvReceiptValid {
         if ($production) {
             $derivedBackend = Get-DvDerivedBackend -Summary $ev.summary
             $summaryBackend = Get-DvProp $ev.summary 'backend'
-            if ($null -eq $derivedBackend) { $invalid.Add('BACKEND_NOT_DERIVABLE: the hashed summary.json''s frame counters (gpuFramesTotal / cpuFrames) do not say which backend ran (cuda: gpu frames > 0; cpu: cpu frames > 0 and gpu frames 0)') }
+            if ($null -eq $derivedBackend) { $invalid.Add('BACKEND_NOT_DERIVABLE: the hashed summary.json''s frame counters (gpuFramesTotal / cpuFrames, or the nested gpuSummary of a product-failure terminal) do not say which backend ran (cuda: gpu frames > 0; cpu: cpu frames > 0 and gpu frames 0; a failure terminal: the counters its own result token implies)') }
             elseif ($derivedBackend -cne $backend) { $invalid.Add("BACKEND_MISMATCH: the hashed summary's frame counters say the run used the $derivedBackend backend but the receipt says $backend") }
             if ($null -ne $summaryBackend -and [string]$summaryBackend -cne $backend) { $invalid.Add('BACKEND_MISMATCH: the hashed summary.json names another backend than the receipt') }
             elseif ($null -eq $summaryBackend -and $backend -ceq 'cpu') { $invalid.Add('BACKEND_NOT_DERIVABLE: a cpu run''s hashed summary.json carries no backend field') }
@@ -997,7 +1040,12 @@ function Test-DvReceiptValid {
             if ($null -ne $spec) {
                 $specLook = ([string](Get-DvProp $spec 'legType') -ceq 'look')
                 $runLook = ((Get-DvProp $ev.summary 'lookLeg') -eq $true)
-                if ($specLook -ne $runLook) { $invalid.Add('LEG_TYPE_MISMATCH: the hashed summary.json says this run was ' + $(if ($runLook) { 'a LOOK leg' } else { 'not a LOOK leg' }) + ' but the committed leg spec the receipt names is ' + $(if ($specLook) { 'a look leg' } else { 'not a look leg' })) }
+                # a product-failure terminal's summary.json states no lookLeg / lookAssistForced / lookFlavor (the variant edit reaches the SUCCESS summary only), so the
+                # leg type is unstated there, typed and recorded -- not a mismatch. It decides nothing: such a receipt can only be a FAIL derived from the terminal's own
+                # result token (a PASS needs a captured summary, which states all three and is checked below).
+                $failureTerminal = ([string](Get-DvProp $ev.summary 'result') -cin $script:FailureTerminals)
+                if ($failureTerminal -and $null -eq (Get-DvProp $ev.summary 'lookLeg')) { $unbound += 'LEG_TYPE_UNSTATED: a product-failure terminal''s summary.json carries no lookLeg, so the leg type is taken from the committed spec only; the receipt is a FAIL derived from the terminal''s result token' }
+                elseif ($specLook -ne $runLook) { $invalid.Add('LEG_TYPE_MISMATCH: the hashed summary.json says this run was ' + $(if ($runLook) { 'a LOOK leg' } else { 'not a LOOK leg' }) + ' but the committed leg spec the receipt names is ' + $(if ($specLook) { 'a look leg' } else { 'not a look leg' })) }
                 elseif ($specLook) {
                     if ((Get-DvProp $ev.summary 'lookAssistForced') -ne $true) { $invalid.Add('LEG_TYPE_MISMATCH: a look leg''s hashed summary.json does not say lookAssistForced') }
                     $specFlavor = [string](Get-DvProp (Get-DvProp $spec 'look') 'lookFlavor'); if ([string]::IsNullOrWhiteSpace($specFlavor)) { $specFlavor = 'classic' }

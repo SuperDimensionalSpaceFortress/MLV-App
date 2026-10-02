@@ -23,6 +23,9 @@
 # (3) Raw frames and sidecars are accepted ONLY as the hashed contact-frames manifest lists them (Read-DvContactFrames); they are staged from the
 # very bytes that were hashed, and anything unlisted is refused. (4) Two receipts that share one evidence directory are refused.
 # (5) subject.clipContentSha256, hostName and gpuNames are UNBOUND (no hashed artifact carries them): they are neither compared nor printed.
+# DUAL-VENUE-EVIDENCE-3: a sheet shows ONLY the frames this run captured and the manifest lists. A listed sidecar may name no image but its own listed
+# <stem>.png (Read-DvContactFrames refuses an absolute / parent-relative / other path), and the composer reads only the staged files, verifying each against
+# the hash it is handed (--left-listed / --right-listed) at read time; it never falls back to a file outside the staging directory.
 [CmdletBinding()]
 param(
     [Parameter(Mandatory = $true)][string]$CudaReceipt,
@@ -72,17 +75,25 @@ New-Item -ItemType Directory -Force -Path $OutDir | Out-Null
 # Stage exactly the bytes that were hashed (a frame edited after the check can no longer be composed), one fresh directory per pair.
 $stageRoot = Join-Path (Join-Path $OutDir '.pair-staging') ([guid]::NewGuid().ToString('N'))
 $stageDirs = @{}
+$stageListings = @{}
 foreach ($label in 'cuda', 'cpu') {
     $rid = $(if ($label -ceq 'cuda') { [string]$cuda.receiptId } else { [string]$cpu.receiptId })
     $dir = Join-Path $stageRoot $label
     New-Item -ItemType Directory -Force -Path $dir | Out-Null
     foreach ($file in $listedFrames[$rid].files) { [IO.File]::WriteAllBytes((Join-Path $dir $file.name), [byte[]]$file.bytes) }
     $stageDirs[$label] = $dir
+    # The hashes the composer verifies each staged file against AT READ TIME (beside the staging directory, never inside it): it reads only these files,
+    # refuses any other, and refuses a sidecar that names an image outside its own directory (DUAL-VENUE-EVIDENCE-3).
+    $listing = @($listedFrames[$rid].files | ForEach-Object { [ordered]@{ name = $_.name; sha256 = $_.sha256 } })
+    $listingFile = Join-Path $stageRoot "$label.listed.json"
+    [IO.File]::WriteAllBytes($listingFile, [Text.UTF8Encoding]::new($false).GetBytes(([ordered]@{ files = $listing } | ConvertTo-Json -Depth 4)))
+    $stageListings[$label] = $listingFile
 }
 $sheet = Join-Path $OutDir "sheet-$venue-cuda-vs-cpu-$flavor.png"
 $stats = Join-Path $OutDir "sheet-$venue-cuda-vs-cpu-$flavor.stats.json"
 $composer = Join-Path $PSScriptRoot '..\make-contact-sheet.py'
 $pyArgs = @('-3', $composer, '--frames-dir', $stageDirs['cuda'], '--pair-dir', $stageDirs['cpu'],
+    '--left-listed', $stageListings['cuda'], '--right-listed', $stageListings['cpu'],
     '--sheet-out', $sheet, '--stats-out', $stats, '--clip-id', [string]$cuda.subject.clipId,
     '--host', $venue, '--build-sha', ([string]$cuda.subject.buildManifestSha256).Substring(0, 12),
     '--left-label', 'cuda', '--right-label', 'cpu', '--cols', '1')

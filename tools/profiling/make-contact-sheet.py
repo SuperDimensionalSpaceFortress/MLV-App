@@ -46,14 +46,22 @@ USAGE
     both sides' per-tile numbers; it does not grade the look (look metrics are a separate card).
     --left-label/--right-label name the sides; --right-host/--right-gpu/--right-build-sha
     describe the right side (the plain --host/--gpu/--build-sha describe the left).
+    Each side reads ONLY the plain files of its own directory (DUAL-VENUE-EVIDENCE-3): a sidecar whose "path" is
+    anything but its own <stem>.png (absolute, parent-relative, nested, another frame's name) is refused with
+    PAIR_SIDECAR_PATH_OUTSIDE_STAGING, and nothing falls back to a file outside the directory. --left-listed /
+    --right-listed (both or neither) name the hashed files each side may hold: an unlisted file is refused
+    (PAIR_FRAME_NOT_LISTED) and every file read is verified against its sha256 AT READ TIME (PAIR_FRAME_HASH_MISMATCH).
 
     Requires Pillow + numpy (already a tools/profiling dependency; see
     frame_colour_spatial_metrics.py). Exits non-zero only on a structural failure (no
     frames dir, zero usable frames, or a write failure) -- it does not grade the look.
 """
 import argparse
+import hashlib
+import io
 import json
 import os
+import re
 import sys
 from collections import Counter
 from pathlib import Path
@@ -136,6 +144,101 @@ def load_frames(frames_dir):
         frames.append(data)
     frames.sort(key=lambda d: d.get("index", 0))
     return frames
+
+
+class FrameConfinementError(ValueError):
+    """A pair-mode side was asked to read something that is not one of its own staged (and, when listed, hash-verified) files. The message
+    starts with a typed token: PAIR_SIDECAR_PATH_OUTSIDE_STAGING, PAIR_FRAME_NOT_LISTED, PAIR_FRAME_HASH_MISMATCH or PAIR_LISTING_INVALID."""
+
+
+class FrameMissing(FrameConfinementError):
+    """The named plain file is simply not in the staging directory (rendered as an UNPAIRED / image-missing tile, as before)."""
+
+
+_STAGED_NAME = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]*\.(png|json)$")
+
+
+def load_listing(path):
+    """--left-listed / --right-listed: {"files": [{"name": ..., "sha256": ...}]} -> {name: sha256}. Names are plain *.png / *.json file names."""
+    try:
+        doc = json.loads(Path(path).read_text(encoding="utf-8"))
+        entries = doc["files"]
+        listed = {}
+        for entry in entries:
+            name, sha = entry["name"], entry["sha256"]
+            if not isinstance(name, str) or not _STAGED_NAME.match(name) or not isinstance(sha, str) or not re.fullmatch(r"[0-9a-f]{64}", sha) or name in listed:
+                raise ValueError("bad entry")
+            listed[name] = sha
+    except (OSError, ValueError, KeyError, TypeError) as exc:
+        raise FrameConfinementError(f"PAIR_LISTING_INVALID the frame listing {path} is not a list of plain file names with 64-hex sha256: {exc}") from exc
+    return listed
+
+
+class StagedFrames:
+    """The files a pair-mode side may read: the plain files of ONE staging directory and nothing else (DUAL-VENUE-EVIDENCE-3, sol r2 blocker, PR #223).
+    `listed` ({name: sha256}) is the caller's hashed manifest: when given, a file that is not listed is refused and every file read is verified against its
+    hash AT READ TIME (not at some earlier check), so a frame edited between the check and the compose is never composed. `listed=None` still confines
+    the reads to the directory but does not verify bytes."""
+
+    def __init__(self, frames_dir, listed=None):
+        self.dir = Path(frames_dir)
+        self.listed = listed
+        if listed is not None:
+            for entry in sorted(self.dir.iterdir()):
+                if entry.name not in listed:
+                    raise FrameConfinementError(f"PAIR_FRAME_NOT_LISTED '{entry.name}' is in the staging directory but the hashed listing does not list it")
+
+    def read(self, name):
+        if not _STAGED_NAME.match(name):
+            raise FrameConfinementError(f"PAIR_FRAME_NOT_LISTED '{name}' is not a plain staged frame name")
+        path = self.dir / name
+        if not os.path.lexists(path):
+            raise FrameMissing(f"PAIR_FRAME_NOT_LISTED '{name}' is not in the staging directory")
+        if path.is_symlink() or not path.is_file():
+            raise FrameConfinementError(f"PAIR_FRAME_NOT_LISTED '{name}' is not a plain file of the staging directory")
+        if self.listed is not None and name not in self.listed:
+            raise FrameConfinementError(f"PAIR_FRAME_NOT_LISTED '{name}' is not in the hashed listing")
+        data = path.read_bytes()
+        if self.listed is not None and hashlib.sha256(data).hexdigest() != self.listed[name]:
+            raise FrameConfinementError(f"PAIR_FRAME_HASH_MISMATCH '{name}' does not hash to the sha256 the listing names (edited after it was listed)")
+        return data
+
+    def image_name_for(self, sidecar):
+        """The PNG a sidecar's frame is: its OWN `<stem>.png`, in this directory. The app writes `path` as exactly that name; an absolute path, a parent-relative
+        one, a nested one, another frame's name or any other spelling is a reference to something that is not this staged, listed frame."""
+        own = sidecar.get("_stem", "") + ".png"
+        raw = sidecar.get("path", "")
+        if raw not in ("", None) and raw != own:
+            raise FrameConfinementError(f"PAIR_SIDECAR_PATH_OUTSIDE_STAGING {own[:-4]}.json names an image other than its own staged {own}; a pair composes only the frames its staging directory holds")
+        return own
+
+
+def load_staged_frames(staged):
+    """load_frames() for a pair-mode side: sidecars are read through the staged (hash-verified) reader, and each saved sidecar's image reference is confined."""
+    frames = []
+    for name in sorted(p.name for p in staged.dir.glob("frame-*.json")):
+        try:
+            data = json.loads(staged.read(name).decode("utf-8"))
+        except FrameConfinementError:
+            raise
+        except (ValueError, OSError) as exc:
+            print(f"[make-contact-sheet] WARNING: failed to read {name}: {exc}", file=sys.stderr)
+            continue
+        if not isinstance(data, dict) or not data.get("saved", False):
+            continue
+        data["_stem"] = name[:-len(".json")]
+        staged.image_name_for(data)
+        frames.append(data)
+    frames.sort(key=lambda d: d.get("index", 0))
+    return frames
+
+
+def open_staged_image(staged, sidecar):
+    """The frame's image from the staged reader (verified bytes), or None when the staging directory simply does not hold it."""
+    try:
+        return Image.open(io.BytesIO(staged.read(staged.image_name_for(sidecar))))
+    except FrameMissing:
+        return None
 
 
 def channel_stats(image):
@@ -322,30 +425,34 @@ def _unpaired_tile(tile_size, label, font):
     return tile
 
 
-def compose_pair_sheet(left_frames, left_dir, right_frames, right_dir, args):
-    """Side-by-side sheet: rows are frame indices, columns are (left | gutter | right)."""
+def compose_pair_sheet(left_frames, left_dir, right_frames, right_dir, args, left_staged=None, right_staged=None):
+    """Side-by-side sheet: rows are frame indices, columns are (left | gutter | right). Each side reads ONLY the plain files of its own directory
+    (StagedFrames; hash-verified at read time when a listing was given): a sidecar `path` that is absolute, parent-relative or not its own `<stem>.png` is
+    refused, and nothing falls back to a file outside the directory."""
     if not left_frames or not right_frames:
         raise ValueError("side-by-side needs usable (saved=true) frames on BOTH sides")
+    left_staged = left_staged or StagedFrames(left_dir)
+    right_staged = right_staged or StagedFrames(right_dir)
     left_by = _frames_by_index(left_frames)
     right_by = _frames_by_index(right_frames)
     indices = sorted(set(left_by) | set(right_by))
 
-    probe_path = _resolve_frame_image_path(left_frames[0], left_dir)
-    if probe_path is None:
+    probe = open_staged_image(left_staged, left_frames[0])
+    if probe is None:
         raise ValueError("could not resolve the left side's first image")
-    with Image.open(probe_path) as probe:
+    with probe:
         aspect = probe.height / probe.width if probe.width else 1.0
     tile_size = (TILE_TARGET_WIDTH, int(TILE_TARGET_WIDTH * aspect) + TILE_LABEL_HEIGHT)
     font = _load_font(13)
 
-    def side_tile(by_index, frames_dir, index, side_label, stats_out):
+    def side_tile(by_index, staged, index, side_label, stats_out):
         sidecar = by_index.get(index)
         if sidecar is None:
             return _unpaired_tile(tile_size, side_label, font)
-        image_path = _resolve_frame_image_path(sidecar, frames_dir)
-        if image_path is None:
+        image = open_staged_image(staged, sidecar)
+        if image is None:
             return _unpaired_tile(tile_size, side_label + " (image missing)", font)
-        with Image.open(image_path) as full_res:
+        with image as full_res:
             stats = channel_stats(full_res)
             stats["index"] = index
             stats["display_frame"] = sidecar.get("display_frame")
@@ -360,8 +467,8 @@ def compose_pair_sheet(left_frames, left_dir, right_frames, right_dir, args):
     for index in indices:
         rows.append((
             index,
-            side_tile(left_by, left_dir, index, args.left_label, left_stats),
-            side_tile(right_by, right_dir, index, args.right_label, right_stats),
+            side_tile(left_by, left_staged, index, args.left_label, left_stats),
+            side_tile(right_by, right_staged, index, args.right_label, right_stats),
         ))
 
     row_width = tile_size[0] * 2 + PAIR_GUTTER_WIDTH
@@ -421,11 +528,13 @@ def main_pair(args):
     if not args.pair_dir.is_dir():
         print(f"[make-contact-sheet] ERROR: pair dir does not exist: {args.pair_dir}", file=sys.stderr)
         return 2
-    left_frames = load_frames(args.frames_dir)
-    right_frames = load_frames(args.pair_dir)
     try:
+        left_staged = StagedFrames(args.frames_dir, load_listing(args.left_listed) if args.left_listed else None)
+        right_staged = StagedFrames(args.pair_dir, load_listing(args.right_listed) if args.right_listed else None)
+        left_frames = load_staged_frames(left_staged)
+        right_frames = load_staged_frames(right_staged)
         sheet, left_stats, right_stats, unpaired = compose_pair_sheet(
-            left_frames, args.frames_dir, right_frames, args.pair_dir, args)
+            left_frames, args.frames_dir, right_frames, args.pair_dir, args, left_staged, right_staged)
     except ValueError as exc:
         print(f"[make-contact-sheet] ERROR: {exc}", file=sys.stderr)
         return 3
@@ -468,12 +577,18 @@ def main():
     parser.add_argument("--max-bytes", type=int, default=4_000_000)
     parser.add_argument("--pair-dir", type=Path, default=None,
                         help="Side-by-side mode: the RIGHT side's capture dir, paired with --frames-dir by frame index.")
+    parser.add_argument("--left-listed", type=Path, default=None,
+                        help="Side-by-side mode: JSON {\"files\": [{\"name\", \"sha256\"}]} listing the files the left (--frames-dir) staging directory may hold; each is "
+                             "hash-verified when read, and an unlisted file is refused. Both sides' listings or neither.")
+    parser.add_argument("--right-listed", type=Path, default=None, help="Same, for the right (--pair-dir) side.")
     parser.add_argument("--left-label", default="cuda")
     parser.add_argument("--right-label", default="cpu")
     parser.add_argument("--right-host", default="")
     parser.add_argument("--right-gpu", default="")
     parser.add_argument("--right-build-sha", default="")
     args = parser.parse_args()
+    if (args.left_listed is None) != (args.right_listed is None) or (args.left_listed is not None and args.pair_dir is None):
+        parser.error("--left-listed and --right-listed go together, and only with --pair-dir")
 
     if not args.frames_dir.is_dir():
         print(f"[make-contact-sheet] ERROR: frames dir does not exist: {args.frames_dir}", file=sys.stderr)
