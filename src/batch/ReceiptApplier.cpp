@@ -810,6 +810,10 @@ bool ReceiptApplier::applyHeadlessLookAssist(ReceiptSettings *receipt,
                               ? 6000
                               : qBound( 2000, receipt->temperature(), 10000 );
     const int baseTint = qBound( -100, receipt->tint(), 100 );
+    // The balance the live processing object held on entry. This is the first write to it; a fallback to master's pass
+    // puts it back, so that pass renders its picture at the balance master renders it at, not at the receipt's.
+    const double entryKelvin = processingGetWhiteBalanceKelvin( processingObject );
+    const double entryRenderTint = processingGetWhiteBalanceTint( processingObject );
     processingSetWhiteBalance( processingObject, baseTemperature, baseTint / 10.0 );
 
     const unsigned char *autoWbThumbnail =
@@ -876,6 +880,10 @@ bool ReceiptApplier::applyHeadlessLookAssist(ReceiptSettings *receipt,
             llrpResetFpmStatus( mlvObject );
             llrpResetBpmStatus( mlvObject );
         }
+        // Put back the white balance the base write above changed. The setter keeps the stored (render) tint when it is
+        // passed back unchanged, so the stored tint is set first; the multipliers and matrices rebuild from it.
+        processingObject->wb_tint = entryRenderTint;
+        processingSetWhiteBalance( processingObject, entryKelvin, entryRenderTint );
         return applyHeadlessLookAssist( receipt, mlvObject, processingObject, analysisFrame, true );
     }
     const bool autoWhiteBalanceValid = wb.autoValid;

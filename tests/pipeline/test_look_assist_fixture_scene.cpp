@@ -328,9 +328,13 @@ QString receiptLine( ReceiptSettings &r )
 // picture has a trusted neutral patch, the initial-patch state).
 // existingTemperature / existingTint (receipt units; -1 = unset, the 6000 K / 0 base) are the balance the picture is
 // rendered at when Look Assist runs; asShotKelvin > 0 records that kelvin as the clip's own as-shot balance.
+// masterPassOnly: call master's single pass directly (masterScenePass = true), so the daylight pass is never entered.
+// processingEntry / processingEnd: the live processing object's balance (kelvin / stored render tint) on entry and at
+// the end, so the state a run STARTS from is asserted, not assumed.
 bool runHeadlessLookAssist( const char *clipFile, bool noExposureMetadata, QString *receipt, QByteArray *log,
                             bool staleWhiteBalance = true, int existingTemperature = -1, int existingTint = 0,
-                            int asShotKelvin = 0 )
+                            int asShotKelvin = 0, bool masterPassOnly = false,
+                            QString *processingEntry = nullptr, QString *processingEnd = nullptr )
 {
     MlvPipelineFixture fixture;
     QString error_message;
@@ -358,7 +362,14 @@ bool runHeadlessLookAssist( const char *clipFile, bool noExposureMetadata, QStri
     QTemporaryDir temporary_dir;
     const QString log_path = temporary_dir.filePath( QStringLiteral("look_assist.log") );
     BatchLogger::init( log_path );
-    const bool applied = ReceiptApplier::applyHeadlessLookAssist( &r, fixture.video(), fixture.processing(), 0 );
+    const auto balance = [&]() {
+        return QStringLiteral("%1/%2").arg( processingGetWhiteBalanceKelvin( fixture.processing() ), 0, 'f', 3 )
+                                      .arg( processingGetWhiteBalanceTint( fixture.processing() ), 0, 'f', 3 );
+    };
+    if( processingEntry ) *processingEntry = balance();
+    const bool applied = ReceiptApplier::applyHeadlessLookAssist( &r, fixture.video(), fixture.processing(), 0,
+                                                                 masterPassOnly );
+    if( processingEnd ) *processingEnd = balance();
     BatchLogger::shutdown();
     QFile log_file( log_path );
     if( !applied || !log_file.open( QIODevice::ReadOnly | QIODevice::Text ) ) return false;
@@ -441,11 +452,16 @@ TEST(LookAssistFixtureScene, HeadlessRefusesABlueAtAsShotInitialPatchThroughTheR
     // sol H2, PR #224 r1: the refusal of a patch that is near-neutral under the EXISTING balance but blue at the clip's
     // as-shot balance, through ReceiptApplier's actual renderer (not the console suite's synthetic DeckScene).
     // The clip records a 4800 K as-shot balance, so the as-shot prior renders the deck blue (the daylight window's
-    // floor); the picture the patch is found on is rendered at the existing 7895 K / -12 balance, where the same deck is
-    // near-neutral and passes the patch search. Switch ON: the initial patch must be judged on the as-shot surface,
-    // refused there, and the clip must take MASTER's damped result for the same state -- not the undamped solve.
-    // Master's own pass of this state is the one the refusal falls back to: the SAME patch, damped (0.65), not the
-    // undamped solve (the candidate, 6360 K / -35 here).
+    // floor); the daylight pass finds its initial patch on the picture rendered at the daylight exposure with the
+    // processing object's own balance (the default 6000 K / 0; the receipt's 7895 K / -12 is the base the solve starts
+    // from), where the same deck is near-neutral and passes the patch search. Switch ON: the initial patch must be judged on the as-shot surface,
+    // refused there, and the clip must take MASTER's result for the same state -- not the undamped solve (the
+    // candidate, 6360 K / -35 here).
+    // Master's result for this state: the receipt's 7895 K / -12 is NOT the picture master renders (the processing
+    // object holds the default 6000 K / 0 and master renders at that), and that picture has no trusted patch, so master
+    // finds nothing and leaves the receipt's balance alone (night, no decision). The fallback starts from that same
+    // processing state, so it lands there; HeadlessFallbackStartsFromMastersProcessingState compares it with a fresh
+    // master-only run field for field.
     for( const FixtureClip &clip : kTrackedFixtureClips )
     {
         QString on, off, control;
@@ -464,15 +480,75 @@ TEST(LookAssistFixtureScene, HeadlessRefusesABlueAtAsShotInitialPatchThroughTheR
         ASSERT_TRUE( onLog.contains( "masterScenePass=true" ) );
         ASSERT_TRUE( onLog.contains( "scene=night" ) );                        // master's verdict
         ASSERT_FALSE( onLog.contains( "scene=shade" ) );
-        ASSERT_TRUE( onLog.contains( "autoWbDecision=accepted-damped autoWbDamping=0.650" ) );   // master's damped result
-        ASSERT_TRUE( onLog.contains( "autoWbCandidateTemp=6360 autoWbCandidateTint=-35" ) );
+        ASSERT_TRUE( onLog.contains( "autoWbSource=none autoWbDecision=none" ) );   // master: no patch on its picture
+        ASSERT_TRUE( onLog.contains( "patchValid=false" ) );
         ASSERT_FALSE( on.contains( "temp=6360 " ) );                           // not the undamped candidate
-        ASSERT_TRUE( on.contains( "temp=6897 tint=-27 " ) );                   // damped between 7895 K and 6360 K
+        ASSERT_FALSE( on.contains( "temp=6897 " ) );                           // not a damped solve of a patch master never sees
+        ASSERT_TRUE( on.contains( "temp=7895 tint=-12 " ) );                   // master's value: the receipt's balance, untouched
         ASSERT_TRUE( on == off );                                              // the switch off lands on the same receipt
 
         ASSERT_FALSE( controlLog.contains( "daylight_fallback_to_master" ) );
         ASSERT_TRUE( controlLog.contains( "scene=shade" ) );
         ASSERT_TRUE( controlLog.contains( "initialPatchChecked=true initialPatchRefused=false" ) );
+    }
+}
+
+TEST(LookAssistFixtureScene, HeadlessFallbackStartsFromMastersProcessingState)
+{
+    // fable r2, PR #224: the daylight pass writes the receipt's base balance into the live processing object before it
+    // falls back, so master's pass used to render its picture at the RECEIPT's balance. Master renders it at the
+    // balance the object holds on entry (BatchRunner creates it at 6000 K / 0 and applyToMlv never sets one).
+    // State: receipt 7895 K / -12, processing object at its default 6000 K / 0 (staleWhiteBalance = false).
+    //
+    // Master's behaviour here is produced two ways, on a FRESH object each, and neither enters the daylight pass:
+    //  - the no-metadata run: nothing can call the clip daylight, so master's single pass is the only pass there is;
+    //  - the direct call with masterScenePass = true: the same code the fallback re-enters, from a clean start.
+    // The fallback result (switch off: always falls back; switch on with a 4800 K as-shot balance: the initial patch is
+    // refused at the as-shot base) must equal both field for field, including the balance left in the object.
+    struct Arm { const char *name; bool switchOff; int asShotKelvin; };
+    const Arm arms[] = { { "switch-off", true, 0 }, { "switch-on-blue-as-shot", false, 4800 } };
+    for( const FixtureClip &clip : kTrackedFixtureClips )
+    {
+        for( const Arm &arm : arms )
+        {
+            QString metadataFree, direct, fallback;
+            QByteArray metadataFreeLog, directLog, fallbackLog;
+            QString entryA, endA, entryB, endB, entryF, endF;
+            ASSERT_TRUE( runHeadlessLookAssist( clip.file, true, &metadataFree, &metadataFreeLog, false, 7895, -12,
+                                                arm.asShotKelvin, false, &entryA, &endA ) );
+            ASSERT_TRUE( runHeadlessLookAssist( clip.file, false, &direct, &directLog, false, 7895, -12,
+                                                arm.asShotKelvin, true, &entryB, &endB ) );
+            {
+                ScopedEnv switchOff( "MLVAPP_LOOK_ASSIST_REFINE_DAYLIGHT", arm.switchOff ? "0" : "1" );
+                ASSERT_TRUE( runHeadlessLookAssist( clip.file, false, &fallback, &fallbackLog, false, 7895, -12,
+                                                    arm.asShotKelvin, false, &entryF, &endF ) );
+            }
+
+            // The starting state is the default 6000 K / 0 in all three, and it is not the receipt's balance.
+            ASSERT_TRUE( entryA == QStringLiteral("6000.000/0.000") );
+            ASSERT_TRUE( entryB == entryA );
+            ASSERT_TRUE( entryF == entryA );
+
+            // Which path each run took.
+            ASSERT_TRUE( metadataFreeLog.contains( "masterScenePass=false" ) );
+            ASSERT_FALSE( metadataFreeLog.contains( "daylight_fallback_to_master" ) );
+            ASSERT_TRUE( directLog.contains( "masterScenePass=true" ) );
+            ASSERT_FALSE( directLog.contains( "daylight_fallback_to_master" ) );
+            ASSERT_TRUE( fallbackLog.contains( "daylight_fallback_to_master" ) );
+            ASSERT_TRUE( fallbackLog.contains( "masterScenePass=true" ) );
+
+            // Master finds no patch on the 6000 K / 0 picture and leaves the receipt's balance alone.
+            ASSERT_TRUE( metadataFreeLog.contains( "patchValid=false" ) );
+            ASSERT_TRUE( metadataFree.contains( "temp=7895 tint=-12 " ) );
+
+            // The fallback IS master's result: receipt and live balance, field for field.
+            ASSERT_TRUE( fallback == metadataFree );
+            ASSERT_TRUE( fallback == direct );
+            ASSERT_TRUE( endF == endA );
+            ASSERT_TRUE( endF == endB );
+            ASSERT_TRUE( fallbackLog.contains( "patchValid=false" ) );
+            (void)arm.name;
+        }
     }
 }
 
