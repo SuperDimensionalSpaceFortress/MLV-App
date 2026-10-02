@@ -338,6 +338,7 @@ class CleanStopExecutedTests(_ProbeCase):
         self.assertEqual(log, [], "the terminate must not be issued at a process observed dead")
         self.assertEqual(result["stopMethod"], "already_exited")
         self.assertTrue(result["exitedBeforeStop"])
+        self.assertFalse(result["aliveBeforeTerminate"], "the process was NOT observed alive before the terminate")
         self.assertFalse(result["stopCausedByJob"])
         self.assertEqual(result["exitCode"], -1073741819)
         self.assertTrue(result["callSiteRejectsExit"])
@@ -740,6 +741,28 @@ class JobStopSufficiencyExecutedTests(unittest.TestCase):
             result_json=short_process,
         )
         self.assertEqual(own["presentMonStatus"], "ok", "a capture that ended on its own keeps the old arms")
+
+    def test_a_tail_loss_smaller_than_the_anchor_bracket_is_judged_at_the_early_end_of_it(self) -> None:
+        # 1.5 s of tail lost on a 3 s wide bracket: converted at the LATE end the last row would look 1.5 s
+        # AFTER the last swap and pass. The tail claim must hold at the EARLY end, where it is 1.5 s short.
+        times = _venue_times(pre_step=300.0, play_end=43500.0, post=False)
+        log = _swap_window_log(VENUE_SWAPS, first=_iso(VENUE_FIRST_SWAP), last=_iso(VENUE_LAST_SWAP))
+        result = self._status(
+            times, log, stopped_by_job=True, capture_start=VENUE_CAPTURE_START, post_spawn=VENUE_POST_SPAWN,
+            result_json=_result_json(start=_iso(5000), end=_iso(45500)),
+        )
+        self.assertEqual(result["presentMonStatus"], "degraded", result)
+        self.assertIn("job-stop tail", result["presentMonStatusReason"])
+        self.assertAlmostEqual(result["tailGapMs"], 2500.0, delta=1.0)
+
+    def test_a_head_gap_smaller_than_the_anchor_bracket_is_judged_at_the_late_end_of_it(self) -> None:
+        # The first present is truly 1.2 s after the first swap. Converted at the EARLY end it would sit 200 ms
+        # after it and pass; the head claim must hold at the LATE end, where it is 3.2 s after.
+        utc = _span(21200.0, VENUE_LAST_SWAP, 50.0) + _span(45200.0, 57800.0, 200.0)
+        result = self._venue([u - VENUE_ANCHOR_MS for u in utc])
+        self.assertEqual(result["presentMonStatus"], "degraded", result)
+        self.assertIn("job-stop head", result["presentMonStatusReason"])
+        self.assertAlmostEqual(result["headGapMs"], 3200.0, delta=1.0)
 
     # ---- the rest of the arms ------------------------------------------------------------------------
 
