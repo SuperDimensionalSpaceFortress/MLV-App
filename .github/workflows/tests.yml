@@ -70,7 +70,7 @@ jobs:
   repo-hygiene-python:
     name: Repo Hygiene Python (${{ matrix.os }})
     runs-on: ${{ matrix.os }}
-    # ubuntu finishes in 6-12 min. The windows-latest leg of this check is the
+    # ubuntu finishes in 16-24 min. The windows-latest leg of this check is the
     # aggregator job below: the same suite on one Windows runner took 39-61 min (73.5 on
     # PR #225), so it is sharded across parallel runners instead of sharing one cap.
     timeout-minutes: 75
