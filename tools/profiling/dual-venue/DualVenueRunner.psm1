@@ -759,8 +759,9 @@ function Read-DvEvidenceSet {
 # (Get-LastGpuSummary's keys; there is no top-level gpuFramesTotal / cpuFrames), and the variant's backend / lookLeg fields (written into the SUCCESS
 # summary only) are absent. GPU_RECON_FRAMES_ZERO and CPU_FALLBACK_DETECTED (exits 13 / 14) are guarded `$Backend -ne 'cpu'` in the cpu variant, so
 # they can only come from a cuda leg; CPU_BACKEND_PATH_MISMATCH (exit 28) fires only when `$Backend -eq 'cpu'`.
-# PRESENTMON_UNAVAILABLE (exit 23) carries gpuFramesTotal at top level and gpuSummary beside it, so its backend reads from the plain counters; it is listed
-# here only because its summary, too, states no leg type.
+# PRESENTMON_UNAVAILABLE (exit 23) has three shapes: the wait-failure branch carries gpuFramesTotal at top level and gpuSummary beside it (counters that are null
+# when the run log has no summary line), the display-report branch carries gpuFramesTotal, and the spawn-failure branch carries neither. Its backend reads from the
+# plain counters; it is listed here only because its summary, too, states no leg type.
 $script:FailureTerminals = @('GPU_RECON_FRAMES_ZERO', 'CPU_FALLBACK_DETECTED', 'CPU_BACKEND_PATH_MISMATCH', 'PRESENTMON_UNAVAILABLE')
 
 # The frame counters of a hashed summary.json, from where the job put them: the top-level gpuFramesTotal / cpuFrames when the key is there, else the

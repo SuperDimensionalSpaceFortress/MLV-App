@@ -2285,22 +2285,26 @@ if ($null -ne $smokeLaunchException -or $smokeRc -ne 0 -or -not (Test-Path -Lite
     # DVE-LEG-TERMINALS-1 >>> (the only text this card adds to the default job; test_dual_venue_evidence strips these regions to prove the rest is byte-identical to master's)
     # DVE-LEG-TERMINALS-1 item 3: a failed smoke run used to publish only the typed tail above (40 lines / 4000 chars of stderr) -- Ultra-Magnus attempt 2
     # failed with an EMPTY tail and published no result.json and no run log, so nothing said why. The runner's full stdout and stderr, the launcher's result.json (its
-    # validation block lists every failed check) and the run log are published now; each step is its own try so one that cannot be published never costs the
+    # validation block lists every failed check) and the run log are published now; each copy is its own try so one that cannot be published never costs another one or the
     # summary below, and smokeEvidence says exactly which pieces exist and why one does not.
     $smokeStderrPublished = $false; $smokeStderrBytes = $null; $smokeStdoutPublished = $false; $smokeStdoutBytes = $null
     $smokeResultJsonPublished = $false; $smokeRunLogPublished = $false; $smokeRunLogSource = 'none'; $smokeRunLogReason = $null
+    $smokeStdoutPath = Join-Path $legOut 'smoke-stdout.txt'
     try {
-        $smokeStdoutPath = Join-Path $legOut 'smoke-stdout.txt'
         if (Test-Path -LiteralPath $smokeStderrPath -PathType Leaf) {
             [void](Publish-AttrCudaFileCopy -Source $smokeStderrPath -Destination (Join-Path $Pub 'smoke-stderr.txt'))
             $smokeStderrPublished = $true
             $smokeStderrBytes = [int64](Get-ChildItem -LiteralPath $smokeStderrPath -File).Length
         }
+    } catch { }
+    try {
         if (Test-Path -LiteralPath $smokeStdoutPath -PathType Leaf) {
             [void](Publish-AttrCudaFileCopy -Source $smokeStdoutPath -Destination (Join-Path $Pub 'smoke-stdout.txt'))
             $smokeStdoutPublished = $true
             $smokeStdoutBytes = [int64](Get-ChildItem -LiteralPath $smokeStdoutPath -File).Length
         }
+    } catch { }
+    try {
         if (Test-Path -LiteralPath $resultPath -PathType Leaf) {
             [void](Publish-AttrCudaFileCopy -Source $resultPath -Destination (Join-Path $Pub 'result.json'))
             $smokeResultJsonPublished = $true
@@ -2316,6 +2320,10 @@ if ($null -ne $smokeLaunchException -or $smokeRc -ne 0 -or -not (Test-Path -Lite
         } else {
             $smokeRunLogReason = 'the smoke run wrote no result.json, so no run-log snapshot was bound'
         }
+    } catch {
+        $smokeRunLogReason = ConvertTo-AttrCudaResultLineSafeText ('publishing the failed smoke run''s result.json stopped: ' + $_.Exception.Message)
+    }
+    try {
         if (-not $smokeRunLogPublished -and $failedSmokeDisplayLog.found) {
             # the located app log is NOT the bound snapshot, so it never takes the smoke-run.log name
             [void](New-AttrCudaDirectory -Path (Join-Path $Pub 'logs'))
@@ -2324,7 +2332,7 @@ if ($null -ne $smokeLaunchException -or $smokeRc -ne 0 -or -not (Test-Path -Lite
             $smokeRunLogSource = 'failed-run app log (display recovery)'
         }
     } catch {
-        $smokeRunLogReason = ConvertTo-AttrCudaResultLineSafeText ('publishing the failed smoke run''s evidence stopped: ' + $_.Exception.Message)
+        $smokeRunLogReason = ConvertTo-AttrCudaResultLineSafeText ('publishing the failed smoke run''s app log stopped: ' + $_.Exception.Message)
     }
     # DVE-LEG-TERMINALS-1 <<<
     $smokeFailure = [ordered]@{
@@ -2495,10 +2503,19 @@ if ($null -ne $presentMonWaitError) {
     # change: this runs after the smoke child, after the run log and the counters above are read, and writes only under contact-sheet\. The sheet itself is not
     # composed here (its labels need the eligibility verdict, which this branch exits before); the marker below says so and makes the runner keep the frames.
     # (its own try: a frame that cannot be published must never cost the typed summary below)
+    # DVE-WAIT-FAILURE-FRAMES-BACKEND-GATE-1: the frames are published only when the run's OWN counters say they are the leg's backend's frames -- a cuda leg
+    # needs gpu frames and no cpu frame (master keeps no frame for CPU_FALLBACK_DETECTED, and none for an all-cpu run here); the cpu variant swaps in its inverse.
+    # Counters that are unavailable do not contradict the leg (the receipt is then a typed INVALID, never a labelled PASS/FAIL).
+    $waitFailureCountersContradictLeg = $false
+    if ($null -ne $waitFailureGpuSummary -and $null -ne $waitFailureGpuFramesTotal) {
+        $waitFailureCountersContradictLeg = -not ($waitFailureGpuFramesTotal -gt 0 -and [int64]$waitFailureGpuSummary.cpuFrames -le 0)
+    }
     try {
-        $waitFailureRawFrames = Publish-AttrCudaContactSheetRawCaptures -Enabled $ContactSheetEnabled -SourceDir $contactSheetDir -PubRoot $Pub
-        if ($null -ne $waitFailureRawFrames -and @(Get-ChildItem -LiteralPath $waitFailureRawFrames -File).Count -gt 0) {
-            [void](Publish-AttrCudaText -Path (Join-Path $Pub 'contact-sheet\compose-status.txt') -Value 'CONTACT_SHEET_COMPOSE_UNAVAILABLE the PresentMon wait failed after the measured playback; the raw frames are published, the sheet was not composed on this venue')
+        if (-not $waitFailureCountersContradictLeg) {
+            $waitFailureRawFrames = Publish-AttrCudaContactSheetRawCaptures -Enabled $ContactSheetEnabled -SourceDir $contactSheetDir -PubRoot $Pub
+            if ($null -ne $waitFailureRawFrames -and @(Get-ChildItem -LiteralPath $waitFailureRawFrames -File).Count -gt 0) {
+                [void](Publish-AttrCudaText -Path (Join-Path $Pub 'contact-sheet\compose-status.txt') -Value 'CONTACT_SHEET_COMPOSE_UNAVAILABLE the PresentMon wait failed after the measured playback; the raw frames are published, the sheet was not composed on this venue')
+            }
         }
     } catch {
         $waitFailureRawFrames = $null
@@ -3227,6 +3244,8 @@ if ($isCpuBackend) {
     $template = Edit-DualVenueTemplate $template 'if (-not $verdict.admitted) {' 'if ($Backend -ne ''cpu'' -and -not $verdict.admitted) {'
     $template = Edit-DualVenueTemplate $template 'if ($gpuFramesTotal -le 0) {' 'if ($Backend -ne ''cpu'' -and $gpuFramesTotal -le 0) {'
     $template = Edit-DualVenueTemplate $template 'if ($gpuSummary.cpuFrames -gt 0) {' 'if ($Backend -ne ''cpu'' -and $gpuSummary.cpuFrames -gt 0) {'
+    # DVE-WAIT-FAILURE-FRAMES-BACKEND-GATE-1: a cpu leg's frames are vouched by the inverse counters (cpu frames, no gpu frame).
+    $template = Edit-DualVenueTemplate $template '$waitFailureCountersContradictLeg = -not ($waitFailureGpuFramesTotal -gt 0 -and [int64]$waitFailureGpuSummary.cpuFrames -le 0)' '$waitFailureCountersContradictLeg = -not ($waitFailureGpuFramesTotal -le 0 -and [int64]$waitFailureGpuSummary.cpuFrames -gt 0)'
     $template = Edit-DualVenueTemplate $template '$stats = [ordered]@{}
 ' @'
 if ($Backend -eq 'cpu' -and ($gpuSummary.cpuFrames -le 0 -or $gpuFramesTotal -gt 0)) {

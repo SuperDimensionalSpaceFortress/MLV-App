@@ -11,6 +11,10 @@ frame is read or written here).
   3. SMOKE_RUN_FAILED publishes the runner's full stdout and stderr, the launcher's result.json and the run log, and the receipt keeps them;
   4. a PresentMon wait failure after the measured playback still publishes the contact-sheet frames the app's un-timed seek pass captured.
 
+Round 2 (the same class, one case it left open): a PASS/FAIL the production validator refuses -- e.g. BACKEND_MISMATCH, a cuda leg whose app fell back wholly to
+the cpu path and then lost its PresentMon wait -- is written by Complete-Receipt as a typed INVALID that keeps the evidence and names the reasons, never exit 2 with no
+receipt; and the wait-failure branch lists frames only when the run's own counters do not contradict the leg's backend (DVE-WAIT-FAILURE-FRAMES-BACKEND-GATE-1).
+
 The job's failure branches are EXECUTED (the real text, sliced out of the generator's template, run in pwsh against stubs); the runner is executed with
 the same stub um-run the sibling suite uses. Every rule has a mutation test.
 """
@@ -78,6 +82,10 @@ UM_GPU_SUMMARY_LINE = ("[2026-10-02T16:12:29.519Z] [INFO] [0xec40] playback_smok
                        "gpu_recon_readback_frames=0 gpu_texture_readback_frames=0 gpu_texture_no_readback_frames=478")
 UM_CPU_GPU_SUMMARY_LINE = ("[2026-10-02T16:12:29.519Z] [INFO] [0xec40] playback_smoke.gpu_summary session=1 cpu_frames=520 gpu_preview_frames=0 "
                            "gpu_recon_readback_frames=0 gpu_texture_readback_frames=0 gpu_texture_no_readback_frames=0")
+
+
+UM_PARTIAL_GPU_SUMMARY_LINE = ("[2026-10-02T16:12:29.519Z] [INFO] [0xec40] playback_smoke.gpu_summary session=1 cpu_frames=12 gpu_preview_frames=0 "
+                               "gpu_recon_readback_frames=0 gpu_texture_readback_frames=0 gpu_texture_no_readback_frames=466")
 
 
 def um_run_log(gpu_line: str | None = UM_GPU_SUMMARY_LINE) -> str:
@@ -330,6 +338,75 @@ class PresentMonWaitFailureKeepsTheContactFramesTests(SliceHarness, unittest.Tes
 
 
 @requires_windows_pwsh
+class WaitFailureFramesAreGatedOnTheLegsOwnCountersTests(SliceHarness, unittest.TestCase):
+    """DVE-WAIT-FAILURE-FRAMES-BACKEND-GATE-1 (fable PR #231 r1): the wait failure ran before the job's own backend gates, so it listed the captured frames of a cuda
+    look leg that had fallen back to the cpu path -- frames New-VenueSheetPair labels `cuda`. Master keeps no frame for CPU_FALLBACK_DETECTED; neither does this
+    branch now, unless the run's own counters say the frames are the leg's backend's."""
+
+    def setUp(self) -> None:
+        self.make_slice_dir()
+
+    def assert_published(self, pub: Path, published: bool, label: str) -> None:
+        marker = pub / "contact-sheet" / "compose-status.txt"
+        raw = pub / "contact-sheet" / "raw"
+        if published:
+            self.assertTrue(marker.exists() and raw.is_dir(), f"{label}: the frames and the marker are published")
+        else:
+            self.assertFalse(marker.exists(), f"{label}: no marker, so the runner lists no frame")
+            self.assertFalse(raw.exists(), f"{label}: no frame is published")
+
+    def test_a_cuda_leg_publishes_only_when_the_counters_are_gpu_only(self) -> None:
+        cases = {"cuda-healthy": (UM_GPU_SUMMARY_LINE, True), "cuda-all-cpu": (UM_CPU_GPU_SUMMARY_LINE, False), "cuda-partial": (UM_PARTIAL_GPU_SUMMARY_LINE, False)}
+        for name, (line, published) in cases.items():
+            code, summary, pub, out = self.run_wait_failure(name, um_run_log(line), contact_frames=FRAMES)
+            self.assertEqual(code, 23, out)
+            self.assertEqual(summary["result"], "PRESENTMON_UNAVAILABLE")
+            self.assertIsNotNone(summary["gpuSummary"], name)
+            self.assert_published(pub, published, name)
+
+    def test_a_cpu_leg_publishes_only_when_the_counters_are_cpu_only(self) -> None:
+        text = CpuGeneratedJobs.text("cpu")
+        cases = {"cpu-healthy": (UM_CPU_GPU_SUMMARY_LINE, True), "cpu-reached-gpu": (UM_GPU_SUMMARY_LINE, False), "cpu-partial": (UM_PARTIAL_GPU_SUMMARY_LINE, False)}
+        for name, (line, published) in cases.items():
+            code, _summary, pub, out = self.run_wait_failure(name, um_run_log(line), backend="cpu", contact_frames=FRAMES, text=text)
+            self.assertEqual(code, 23, out)
+            self.assert_published(pub, published, name)
+
+    def test_counters_that_are_unavailable_do_not_contradict_the_leg(self) -> None:
+        # no gpu_summary line: the receipt is a typed INVALID (BACKEND_NOT_DERIVABLE), never a labelled PASS/FAIL, so the frames are kept as evidence
+        code, summary, pub, out = self.run_wait_failure("nocounters", um_run_log(None), contact_frames=FRAMES)
+        self.assertEqual(code, 23, out)
+        self.assertIsNone(summary["gpuSummary"])
+        self.assert_published(pub, True, "unavailable counters")
+
+    def test_the_gating_changes_nothing_else_in_the_summary(self) -> None:
+        _c1, withheld, _p1, _o1 = self.run_wait_failure("same-withheld", um_run_log(UM_CPU_GPU_SUMMARY_LINE), contact_frames=FRAMES, rows=7)
+        _c2, off, _p2, _o2 = self.run_wait_failure("same-off", um_run_log(UM_CPU_GPU_SUMMARY_LINE), contact_frames=FRAMES, enabled=False, rows=7)
+        strip = lambda s: {k: v for k, v in s.items() if k not in ("presentMonCaptureStartUtc", "artifactRoot")}
+        self.assertEqual(strip(withheld), strip(off))
+
+    def test_mutation_without_the_gate_a_cpu_fallen_back_cuda_leg_lists_frames_again(self) -> None:
+        gate = "        if (-not $waitFailureCountersContradictLeg) {\n"
+        self.assertEqual(TEMPLATE.count(gate), 1, "the wait-failure branch gates its frames exactly once")
+        mutated = TEMPLATE.replace(gate, "        if ($true) {\n", 1)
+        for name, line in (("mut-all-cpu", UM_CPU_GPU_SUMMARY_LINE), ("mut-partial", UM_PARTIAL_GPU_SUMMARY_LINE)):
+            code, _summary, pub, out = self.run_wait_failure(name, um_run_log(line), contact_frames=FRAMES, text=mutated)
+            self.assertEqual(code, 23, out)
+            self.assert_published(pub, True, name + " (the old behaviour: a cuda label over cpu frames)")
+
+    def test_mutation_without_the_cpu_variant_edit_a_cpu_leg_is_gated_by_the_cuda_rule(self) -> None:
+        text = CpuGeneratedJobs.text("cpu")
+        edited = "-not ($waitFailureGpuFramesTotal -le 0 -and [int64]$waitFailureGpuSummary.cpuFrames -gt 0)"
+        original = "-not ($waitFailureGpuFramesTotal -gt 0 -and [int64]$waitFailureGpuSummary.cpuFrames -le 0)"
+        self.assertEqual(text.count(edited), 1, "the cpu variant swaps in the inverse rule")
+        self.assertEqual(text.count(original), 0)
+        mutated = text.replace(edited, original, 1)
+        code, _summary, pub, out = self.run_wait_failure("mut-cpu", um_run_log(UM_CPU_GPU_SUMMARY_LINE), backend="cpu", contact_frames=FRAMES, text=mutated)
+        self.assertEqual(code, 23, out)
+        self.assert_published(pub, False, "a healthy cpu leg would lose its frames without the variant edit")
+
+
+@requires_windows_pwsh
 class SmokeRunFailedKeepsItsEvidenceTests(SliceHarness, unittest.TestCase):
     """Item 3: attempt 2 on UM failed with an empty stderr tail and no run log, so the receipt could not say why."""
 
@@ -370,6 +447,36 @@ class SmokeRunFailedKeepsItsEvidenceTests(SliceHarness, unittest.TestCase):
         self.assertEqual(code, 18, out)
         self.assertEqual((pub / "logs" / "smoke-failed-app.log").read_text(encoding="utf-8"), located.read_text(encoding="utf-8"))
         self.assertEqual(summary["smokeEvidence"]["runLogSource"], "failed-run app log (display recovery)")
+
+    def test_each_failure_artifact_copy_is_its_own_attempt(self) -> None:
+        # sol PR #231 r1 hardening: one outer try made the first copy that fails skip every later one
+        log = "[2026-10-02T16:12:03.758Z] [INFO] playback_smoke.measured_session id=1\n" + UM_GPU_SUMMARY_LINE + "\n"
+        stderr_copy = "[void](Publish-AttrCudaFileCopy -Source $smokeStderrPath -Destination (Join-Path $Pub 'smoke-stderr.txt'))"
+        self.assertEqual(TEMPLATE.count(stderr_copy), 1)
+        mutated = TEMPLATE.replace(stderr_copy, "[void](Write-Error 'injected sharing violation on stderr' -ErrorAction Stop)", 1)
+        code, summary, pub, out = self.run_smoke_failure("indep", LONG_STDERR_CMD, result_json_with_log=log, text=mutated)
+        self.assertEqual(code, 18, out)
+        self.assertFalse((pub / "smoke-stderr.txt").exists(), "the injected failure took stderr")
+        self.assertTrue((pub / "smoke-stdout.txt").exists(), "stdout is still attempted")
+        self.assertTrue((pub / "result.json").exists(), "result.json is still attempted")
+        self.assertEqual((pub / "logs" / "smoke-run.log").read_text(encoding="utf-8"), log, "and so is the run log")
+        ev = summary["smokeEvidence"]
+        self.assertEqual((ev["stderrPublished"], ev["stdoutPublished"], ev["resultJsonPublished"], ev["runLogPublished"]), (False, True, True, True))
+
+    def test_mutation_with_one_outer_try_the_failure_costs_every_later_copy(self) -> None:
+        # the r1 shape: the copies share ONE try, so a failure in the first skips the rest (re-created here from the committed text)
+        block = smoke_block()
+        start = block.index("    $smokeStdoutPath = Join-Path $legOut 'smoke-stdout.txt'\n")
+        end = block.index("    # DVE-LEG-TERMINALS-1 <<<")
+        one_try = ("    $smokeStdoutPath = Join-Path $legOut 'smoke-stdout.txt'\n    try {\n"
+                   "        [void](Write-Error 'injected sharing violation on stderr' -ErrorAction Stop)\n"
+                   "        if (Test-Path -LiteralPath $smokeStdoutPath -PathType Leaf) { [void](Publish-AttrCudaFileCopy -Source $smokeStdoutPath -Destination (Join-Path $Pub 'smoke-stdout.txt')); $smokeStdoutPublished = $true }\n"
+                   "    } catch { $smokeRunLogReason = 'stopped' }\n")
+        mutated = TEMPLATE.replace(block[start:end], one_try, 1)
+        self.assertNotEqual(mutated, TEMPLATE)
+        code, _summary, pub, out = self.run_smoke_failure("one-try", LONG_STDERR_CMD, text=mutated)
+        self.assertEqual(code, 18, out)
+        self.assertFalse((pub / "smoke-stdout.txt").exists(), "with a single try the failure on stderr costs stdout too -- the independent copies above are what prevent it")
 
     def test_mutations_each_lost_piece_of_evidence_is_lost(self) -> None:
         log = UM_GPU_SUMMARY_LINE + "\n"
@@ -642,6 +749,119 @@ class WaitFailureSummaryIsAnAdvisoryFailInProductionTests(dve.EvidenceFactory, M
         self.assertEqual(proc.stdout.strip(), "WRITTEN", proc.stdout + proc.stderr)
         written = json.loads(next(out.rglob(receipt["receiptId"] + ".json")).read_text(encoding="utf-8"))
         self.assertEqual((written["outcome"], written["verification"]["status"]), ("FAIL", "ADVISORY"))
+
+
+@requires_windows_pwsh
+class ProductionLegNeverEndsWithoutAReceiptTests(dve.EvidenceFactory, ModuleMutationMixin, unittest.TestCase):
+    """DVE-LEG-TERMINALS-1 r2 (sol and fable PR #231 r1, the same blocker): a production cuda leg whose app fell back wholly to the cpu path (all gpu counters 0,
+    cpuFrames > 0) and then lost its PresentMon wait derives `cpu`, the production validator refuses the cuda-labelled FAIL (BACKEND_MISMATCH), and the writer used
+    to throw: Complete-Receipt printed DVE_RECEIPT_WRITE_FAILED and exited 2 -- no receipt, the end state of the Ultra-Magnus runs with a different reason token.
+
+    These tests run the REAL Complete-Receipt (sliced out of Invoke-VenueLeg.ps1) against a PRODUCTION-admission receipt (committed consent, committed leg spec, hashed
+    evidence files, the real Write-DvReceipt and Test-DvReceiptValid) -- the runner's own offline mode skips the validator's backend block, so it cannot show this."""
+
+    def setUp(self) -> None:
+        self.make_harness()
+        self.repo = self.prod_repo()
+
+    def complete(self, receipt: dict, outcome: str, dv: Path = DV, name: str = "w", precreate: bool = False) -> tuple[int, dict | None, str]:
+        script_text = (dv / "Invoke-VenueLeg.ps1").read_text(encoding="utf-8").replace("\r\n", "\n")
+        fn = script_text[script_text.index("function Complete-Receipt("):script_text.index("function Submit-VenueJob(")]
+        out_root = self.tmp / name
+        if precreate:   # the receipt id is already taken: the writer's CreateNew throws something that is NOT a validator refusal
+            taken = out_root / receipt["card"] / receipt["legId"] / receipt["venue"]["name"]
+            taken.mkdir(parents=True)
+            (taken / (receipt["receiptId"] + ".json")).write_text("{}", encoding="utf-8")
+        script = (f"$ErrorActionPreference = 'Stop'\nImport-Module '{dv / 'DualVenueRunner.psm1'}' -Force\n"
+                  "$receipt = $env:DVE_RECEIPT | ConvertFrom-Json -AsHashtable\n"
+                  "$BuildManifestSha256 = $receipt.subject.buildManifestSha256; $legSpecSha256 = $receipt.subject.legSpecSha256\n"
+                  "$spec = [pscustomobject]@{ clipId = $receipt.subject.clipId }; $Backend = $receipt.subject.backend; $lookFlavor = $receipt.subject.lookFlavor\n"
+                  f"$ReceiptRoot = '{out_root}'; $RepoRoot = '{self.repo.root}'; $OfflineTestMode = [switch]$false\n"
+                  + fn + f"\nComplete-Receipt '{outcome}' 'the job result detail'\n")
+        probe = self.tmp / f"{name}.ps1"
+        probe.write_text(script, encoding="utf-8")
+        proc = run_pwsh(["-File", str(probe)], env_extra={"DVE_RECEIPT": json.dumps(receipt)})
+        written = sorted(out_root.rglob(receipt["receiptId"] + ".json")) if out_root.exists() else []
+        body = json.loads(written[-1].read_text(encoding="utf-8")) if written and written[-1].stat().st_size > 2 else None
+        return proc.returncode, body, proc.stdout + proc.stderr
+
+    def failure(self, name: str, summary: dict, backend: str) -> Path:
+        ev = self.evidence(name, backend=backend, source_frames=False, exact_summary=summary, token="PRESENTMON_UNAVAILABLE", exit_code=23)
+        (ev / "evidence-manifest.json").unlink()
+        return ev
+
+    def all_cpu_cuda_receipt(self, name: str = "cuda-all-cpu") -> dict:
+        # the wait-failure summary of a cuda leg whose app ran entirely on the cpu path (UM_CPU_GPU_SUMMARY_LINE's counters): no cuda frame, 520 cpu frames
+        summary = um_wait_failure_with_counters({"cpuFrames": 520, "gpuTextureNoReadbackFrames": 0})
+        return self.receipt_for(self.repo, self.failure(name, summary, "cuda"), backend="cuda", outcome="FAIL")
+
+    def test_an_all_cpu_cuda_leg_that_lost_its_wait_is_a_written_invalid_that_names_the_reason_and_keeps_the_evidence(self) -> None:
+        receipt = self.all_cpu_cuda_receipt()
+        self.expect(self.status_batch(self.repo, [(receipt, None)])[0], "INVALID", "the validator refuses the cuda-labelled FAIL", "BACKEND_MISMATCH")
+        code, written, out = self.complete(receipt, "FAIL")
+        self.assertEqual(code, 0, out)
+        self.assertIsNotNone(written, "a leg that ran always ends with a receipt")
+        self.assertEqual(written["outcome"], "INVALID")
+        self.assertIn("DVE_OUTCOME=INVALID", out)
+        self.assertNotIn("DVE_RECEIPT_WRITE_FAILED", out)
+        self.assertIn("BACKEND_MISMATCH", written["outcomeDetail"], "the validator's own reasons are named")
+        self.assertIn("the job result was FAIL", written["outcomeDetail"])
+        self.assertIn("the job result detail", written["outcomeDetail"])
+        self.assertEqual(written["subject"]["backend"], "cuda", "the label is the leg's, never rewritten")
+        for key in ("summaryJsonSha256", "logSha256", "resultJsonSha256", "umRunJsonSha256", "localEvidenceDir"):
+            self.assertEqual(written["evidence"][key], receipt["evidence"][key], f"the evidence ({key}) is kept")
+        self.assertIsNone(written.get("verification"), "an INVALID is no signal: no verification stamp")
+        self.assertEqual(written["metrics"], receipt["metrics"])
+
+    def test_the_symmetric_cpu_leg_whose_run_reached_a_gpu_path_is_a_written_invalid(self) -> None:
+        summary = um_wait_failure_with_counters(backend="cpu")   # 478 gpu frames on a leg labelled cpu
+        receipt = self.receipt_for(self.repo, self.failure("cpu-gpu", summary, "cpu"), backend="cpu", outcome="FAIL")
+        self.expect(self.status_batch(self.repo, [(receipt, None)])[0], "INVALID", "the validator refuses the cpu-labelled FAIL", "BACKEND_MISMATCH")
+        code, written, out = self.complete(receipt, "FAIL", name="w-cpu")
+        self.assertEqual(code, 0, out)
+        self.assertEqual(written["outcome"], "INVALID")
+        self.assertIn("BACKEND_MISMATCH", written["outcomeDetail"])
+        self.assertEqual(written["subject"]["backend"], "cpu")
+
+    def test_any_other_validator_refusal_is_demoted_the_same_way(self) -> None:
+        receipt = self.all_cpu_cuda_receipt("tamper")
+        receipt["metrics"]["frameRows"] = 99999   # not the verbatim metrics of the hashed summary
+        self.expect(self.status_batch(self.repo, [(receipt, None)])[0], "INVALID", "tampered metrics", "METRICS_NOT_FROM_EVIDENCE")
+        code, written, out = self.complete(receipt, "FAIL", name="w-tamper")
+        self.assertEqual(code, 0, out)
+        self.assertEqual(written["outcome"], "INVALID")
+        self.assertIn("METRICS_NOT_FROM_EVIDENCE", written["outcomeDetail"])
+
+    def test_a_label_consistent_leg_is_unchanged_and_still_an_advisory_fail(self) -> None:
+        receipt = self.receipt_for(self.repo, self.failure("cuda-ok", um_wait_failure_with_counters(), "cuda"), backend="cuda", outcome="FAIL")
+        code, written, out = self.complete(receipt, "FAIL", name="w-ok")
+        self.assertEqual(code, 0, out)
+        self.assertEqual((written["outcome"], written["verification"]["status"]), ("FAIL", "ADVISORY"))
+        self.assertIn("DVE_OUTCOME=FAIL", out)
+
+    def test_a_write_that_fails_for_another_reason_still_ends_as_a_write_failure(self) -> None:
+        receipt = self.receipt_for(self.repo, self.failure("cuda-dup", um_wait_failure_with_counters(), "cuda"), backend="cuda", outcome="FAIL")
+        code, _written, out = self.complete(receipt, "FAIL", name="w-dup", precreate=True)
+        self.assertEqual(code, 2, out)
+        self.assertIn("DVE_RECEIPT_WRITE_FAILED", out, "a repeat receipt id is not a validator refusal: it is never papered over as an INVALID")
+
+    def test_only_a_pass_or_fail_is_demoted(self) -> None:
+        # an outcome that is not PASS/FAIL is never put to the validator, so it is written as it is and never relabelled
+        receipt = self.all_cpu_cuda_receipt("nosig")
+        code, written, out = self.complete(receipt, "VENUE_TOOLING", name="w-nosig")
+        self.assertEqual(code, 0, out)
+        self.assertEqual(written["outcome"], "VENUE_TOOLING")
+        self.assertNotIn("the receipt writer refuses", written["outcomeDetail"])
+
+    def test_mutation_without_the_demotion_the_leg_ends_with_no_receipt_again(self) -> None:
+        guard = "if ($Outcome -cin @('PASS', 'FAIL') -and $refusal.StartsWith($invalidPrefix, [StringComparison]::Ordinal)) {"
+        mutated = self.mutated_runner([("Invoke-VenueLeg.ps1", guard, "if ($false) {")])
+        receipt = self.all_cpu_cuda_receipt("mut")
+        code, written, out = self.complete(receipt, "FAIL", dv=mutated, name="w-mut")
+        self.assertEqual(code, 2, out)
+        self.assertIn("DVE_RECEIPT_WRITE_FAILED", out)
+        self.assertIn("BACKEND_MISMATCH", out)
+        self.assertIsNone(written, "the old behaviour: a leg that had played, no receipt at all (the Ultra-Magnus end state)")
 
 
 @requires_windows_pwsh
