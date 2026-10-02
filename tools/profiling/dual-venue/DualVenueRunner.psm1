@@ -759,8 +759,9 @@ function Read-DvEvidenceSet {
 # (Get-LastGpuSummary's keys; there is no top-level gpuFramesTotal / cpuFrames), and the variant's backend / lookLeg fields (written into the SUCCESS
 # summary only) are absent. GPU_RECON_FRAMES_ZERO and CPU_FALLBACK_DETECTED (exits 13 / 14) are guarded `$Backend -ne 'cpu'` in the cpu variant, so
 # they can only come from a cuda leg; CPU_BACKEND_PATH_MISMATCH (exit 28) fires only when `$Backend -eq 'cpu'`.
-# PRESENTMON_UNAVAILABLE (exit 23) carries gpuFramesTotal at top level and gpuSummary beside it, so its backend reads from the plain counters; it is listed
-# here only because its summary, too, states no leg type.
+# PRESENTMON_UNAVAILABLE (exit 23) has three shapes: the wait-failure branch carries gpuFramesTotal at top level and gpuSummary beside it (counters that are null
+# when the run log has no summary line), the display-report branch carries gpuFramesTotal, and the spawn-failure branch carries neither. Its backend reads from the
+# plain counters; it is listed here only because its summary, too, states no leg type.
 $script:FailureTerminals = @('GPU_RECON_FRAMES_ZERO', 'CPU_FALLBACK_DETECTED', 'CPU_BACKEND_PATH_MISMATCH', 'PRESENTMON_UNAVAILABLE')
 
 # The frame counters of a hashed summary.json, from where the job put them: the top-level gpuFramesTotal / cpuFrames when the key is there, else the
@@ -794,6 +795,20 @@ function Get-DvDerivedBackend {
     if ($terminal -ceq 'CPU_BACKEND_PATH_MISMATCH') { if ($null -ne $gpu -and $null -ne $cpu -and ($cpu -le 0 -or $gpu -gt 0)) { return 'cpu' }; return $null }
     if ($null -ne $gpu -and $gpu -gt 0) { return 'cuda' }
     if ($null -ne $gpu -and $gpu -eq 0 -and $null -ne $cpu -and $cpu -gt 0) { return 'cpu' }
+    $null
+}
+
+$script:BackendNotDerivableMessage = 'BACKEND_NOT_DERIVABLE: the hashed summary.json''s frame counters (gpuFramesTotal / cpuFrames, or the nested gpuSummary of a product-failure terminal) do not say which backend ran (cuda: gpu frames > 0; cpu: cpu frames > 0 and gpu frames 0; a failure terminal: the counters its own result token implies)'
+$script:CpuBackendFieldMissingMessage = 'BACKEND_NOT_DERIVABLE: a cpu run''s hashed summary.json carries no backend field'
+
+# DVE-LEG-TERMINALS-1 item 1: why a PASS/FAIL receipt for this summary cannot name its backend, or $null when it can. Test-DvReceiptValid refuses such a receipt (and
+# Write-DvReceipt then refuses the write: no receipt at all, DVE_RECEIPT_WRITE_FAILED -- a leg that had played, on Ultra-Magnus, 2026-10-02). The runner asks the same
+# question BEFORE it chooses an outcome and ends such a leg as a typed no-signal (INVALID) receipt that keeps its evidence. -RequireCpuBackendField is the production
+# rule (a cpu run's backend is read from the summary's own field); the runner's offline test mode does not enforce it.
+function Get-DvBackendNotDerivable {
+    param($Summary, [string]$Backend, [bool]$RequireCpuBackendField = $false)
+    if ($null -eq (Get-DvDerivedBackend -Summary $Summary)) { return $script:BackendNotDerivableMessage }
+    if ($RequireCpuBackendField -and $Backend -ceq 'cpu' -and $null -eq (Get-DvProp $Summary 'backend')) { return $script:CpuBackendFieldMissingMessage }
     $null
 }
 
@@ -1035,10 +1050,10 @@ function Test-DvReceiptValid {
         if ($production) {
             $derivedBackend = Get-DvDerivedBackend -Summary $ev.summary
             $summaryBackend = Get-DvProp $ev.summary 'backend'
-            if ($null -eq $derivedBackend) { $invalid.Add('BACKEND_NOT_DERIVABLE: the hashed summary.json''s frame counters (gpuFramesTotal / cpuFrames, or the nested gpuSummary of a product-failure terminal) do not say which backend ran (cuda: gpu frames > 0; cpu: cpu frames > 0 and gpu frames 0; a failure terminal: the counters its own result token implies)') }
+            if ($null -eq $derivedBackend) { $invalid.Add($script:BackendNotDerivableMessage) }
             elseif ($derivedBackend -cne $backend) { $invalid.Add("BACKEND_MISMATCH: the hashed summary's frame counters say the run used the $derivedBackend backend but the receipt says $backend") }
             if ($null -ne $summaryBackend -and [string]$summaryBackend -cne $backend) { $invalid.Add('BACKEND_MISMATCH: the hashed summary.json names another backend than the receipt') }
-            elseif ($null -eq $summaryBackend -and $backend -ceq 'cpu') { $invalid.Add('BACKEND_NOT_DERIVABLE: a cpu run''s hashed summary.json carries no backend field') }
+            elseif ($null -eq $summaryBackend -and $backend -ceq 'cpu') { $invalid.Add($script:CpuBackendFieldMissingMessage) }
             $summaryVenue = Get-DvProp $ev.summary 'declaredVenue'
             if ($null -ne $summaryVenue -and [string]$summaryVenue -cne $venueName) { $invalid.Add('VENUE_MISMATCH: the hashed summary.json was declared for another venue than the receipt') }
             if ($null -ne $spec) {
@@ -1223,6 +1238,9 @@ function Resolve-DvJobOutcome {
     # of distinct source frames (short, looped, replayed, foreign, too slow) is INVALID evidence, never a FAIL.
     $reasonSuffix = $(if ([string]::IsNullOrEmpty($SmokeRefusalReason) -or $SmokeRefusalReason -eq 'NONE') { '' } else { " $SmokeRefusalReason" })
     if ($ResultToken -eq 'FIXTURE_REHEARSAL_CAPTURED') { return [pscustomobject]@{ outcome = 'INVALID'; detail = 'FIXTURE_REHEARSAL_CAPTURED: a fixture rehearsal is never venue playback evidence' } }
+    # DVE-LEG-TERMINALS-1 item 3: the smoke run itself failed (a validation gate, a launch failure). With the run log now published the playback proof may be sound, but a failed
+    # run is still no product result in either backend (and carries no counters): INVALID, with the typed cause in the detail.
+    if ($ResultToken -eq 'SMOKE_RUN_FAILED') { return [pscustomobject]@{ outcome = 'INVALID'; detail = ('SMOKE_RUN_FAILED' + $reasonSuffix) } }
     if ($ResultToken -eq 'SOURCE_FRAMES_INVALID') { return [pscustomobject]@{ outcome = 'INVALID'; detail = ($ResultToken + $(if ($reasonSuffix) { $reasonSuffix } else { ' INVALID_SOURCE_FRAMES' })) } }
     if ($reasonSuffix -and $SmokeRefusalReason -in $script:PlayLengthRefusalReasons -and $ResultToken -notin $script:VenueConditionResults -and $ResultToken -notin $script:DeviceUnavailableResults) {
         return [pscustomobject]@{ outcome = 'INVALID'; detail = ($ResultToken + $reasonSuffix) }
@@ -1323,7 +1341,7 @@ function New-DvReceipt {
         # (summary.json, evidence-manifest.json, result.json, logs/smoke-run.log, um-run.json); Test-DvReceiptValid re-hashes them and
         # re-derives the playback block and the outcome from them. A receipt whose evidence is absent is INCOMPLETE, never PASS/FAIL.
         evidence = [ordered]@{ summaryJsonSha256 = $null; evidenceManifestSha256 = $null; resultJsonSha256 = $null; logSha256 = $null; umRunJsonSha256 = $null
-                               contactFramesJsonSha256 = $null; localEvidenceDir = $null; artifactIndexPath = $null; umRunOutcome = $null }
+                               contactFramesJsonSha256 = $null; smokeStderrSha256 = $null; smokeStdoutSha256 = $null; localEvidenceDir = $null; artifactIndexPath = $null; umRunOutcome = $null }
         metrics = $null
         # Round 2: the receipt oracle's verdict (source_advanced / required_source_frames / run nonce / wrap / clip id).
         # A receipt that says PASS or FAIL without a valid one is INVALID (Test-DvReceiptValid).
@@ -1374,7 +1392,7 @@ function Write-DvReceipt {
 }
 
 Export-ModuleMember -Function Get-DvOutcomeEnum, ConvertTo-DvCanonicalJson, Get-DvSha256OfBytes, Get-DvSha256OfText, Get-DvSha256OfFile,
-    ConvertTo-DvLfBytes, Get-DvLegSpecSha256, Get-DvDerivedBackend, Read-DvContactFrames, Get-DvSubjectDigest, Read-DvVenueTable, ConvertFrom-DvVenueTableText, Get-DvVenueRole, Get-DvProp, Get-DvCommittedFile, Resolve-DvAdmissionSources,
+    ConvertTo-DvLfBytes, Get-DvLegSpecSha256, Get-DvDerivedBackend, Get-DvBackendNotDerivable, Read-DvContactFrames, Get-DvSubjectDigest, Read-DvVenueTable, ConvertFrom-DvVenueTableText, Get-DvVenueRole, Get-DvProp, Get-DvCommittedFile, Resolve-DvAdmissionSources,
     Test-DvUnderClaudeState, Read-DvClipConsent, Get-DvClipAdmission, Get-DvSmokeSummaryFields, Get-DvPlaybackProblems,
     Get-DvPlaybackEvidence, Get-DvBlobById, Find-DvCommittedLegSpec, Read-DvEvidenceSet, Test-DvJsonEquivalent, Test-DvReceiptValid, Get-DvHealthVerdict,
     New-DvHealthProbeJobText, ConvertFrom-DvProbeStdout,
