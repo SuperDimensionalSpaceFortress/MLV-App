@@ -38,7 +38,10 @@ receipt oracle and refuses to believe a receipt that does not carry the oracle's
   **owner-written** file. Each record is exactly `venue`, `clipId`, `ownerLine` (the owner's exact typed line,
   `CLIP <venue>: <clip id>`, which contains no path), `ownerLineSha256` (the sha256 of that line), `recordedUtc` and
   `recordedBy: "owner"`; the line must name the record's own venue and clip id and hash to `ownerLineSha256`, so a bare hex
-  string is not the owner's words. Agents and producer lanes never write the file; the hub adds the owner's lines in its
+  string is not the owner's words. **One alias:** the line may spell the venue as the venue table's name (`CLIP ultra-magnus: M16-1243`)
+  or as that same name with every hyphen removed (`CLIP ultramagnus: M16-1243`, which is how the owner typed it). The match is
+  case-sensitive and exact -- `UltraMagnus`, `ultra_magnus`, extra whitespace, a path suffix or another venue's name are all refused --
+  the record's `venue` field stays the table name, and `ownerLine` is stored verbatim (agents never alter the owner's words). Agents and producer lanes never write the file; the hub adds the owner's lines in its
   own reviewed commit. **Production reads the consent file and the venue table ONLY as committed at `HEAD`**
   (`git rev-parse HEAD:<path>` + `git cat-file blob`) and refuses when the working copy differs
   (`ADMISSION_SOURCE_DIRTY`) or the file is not in `HEAD` (`ADMISSION_SOURCE_NOT_COMMITTED`): a file a caller writes
@@ -99,7 +102,7 @@ receipt oracle and refuses to believe a receipt that does not carry the oracle's
   * *Admission, from git:* `admission.consentBlobSha` and `venueTableBlobSha` must be real **blobs** of the repo (`git cat-file
     -t` says blob; a placeholder hash, a commit or a tree is refused) and be the files committed at `admission.headCommit`;
     the table parses; the consent blob parses with `Read-DvClipConsent` and holds an owner record (`recordedBy: owner`, the
-    exact `CLIP <venue>: <clip>` line) **for this venue and clip id** whose line sha256 equals `admission.ownerLineSha256`;
+    exact `CLIP <venue>: <clip>` line, the venue spelled as the table name or hyphen-free) **for this venue and clip id** whose line sha256 equals `admission.ownerLineSha256`;
     the committed cleanup switch is on; `venue.role` is the table's. `git` runs with `GIT_DIR`, `GIT_WORK_TREE`,
     `GIT_INDEX_FILE` and the object-store overrides scrubbed and `--no-replace-objects`, so the environment cannot point it at
     another repo. A production receipt validated without `-RepoRoot` is `INCOMPLETE`, never VERIFIED.
