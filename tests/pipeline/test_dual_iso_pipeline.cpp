@@ -4605,7 +4605,13 @@ TEST(DualIsoPipeline, HeadlessLookAssistGeneratesClipLocalDngDefaults)
     ASSERT_NEAR(static_cast<double>(receipt.temperature()),
                 fixture.processing()->kelvin,
                 0.0001);
-    ASSERT_NEAR(receipt.tint() / 10.0,
+    // processingSetWhiteBalance() stores tint through the non-linear render curve
+    // (sign * (|t|/10)^1.75 * 10 for t = receipt tint / 10); the two only coincide for |t| <= 1.
+    // A daylight clip's solved tint (e.g. -35) is well outside that, so assert the curve.
+    const double receipt_tint_steps = receipt.tint() / 10.0;
+    const double expected_render_tint =
+        std::copysign(std::pow(std::fabs(receipt_tint_steps) / 10.0, 1.75) * 10.0, receipt_tint_steps);
+    ASSERT_NEAR(expected_render_tint,
                 fixture.processing()->wb_tint,
                 0.0001);
 

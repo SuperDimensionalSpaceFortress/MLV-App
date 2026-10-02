@@ -81,6 +81,7 @@ SOURCES += \
     $$REPO_ROOT/src/batch/BatchRunner.cpp \
     $$REPO_ROOT/src/batch/BatchRenderedVideoPlan.cpp \
     $$REPO_ROOT/src/batch/ReceiptLoader.cpp \
+    $$REPO_ROOT/src/batch/LookAssistAnalysis.cpp \
     $$REPO_ROOT/src/batch/ReceiptApplier.cpp \
     $$REPO_ROOT/src/librtprocess/src/include/librtprocesswrapper.cpp \
     $$REPO_ROOT/src/librtprocess/src/demosaic/ahd.cc \
@@ -112,7 +113,8 @@ SOURCES += \
     $$REPO_ROOT/tests/pipeline/test_phase3_infrastructure.cpp \
     $$REPO_ROOT/tests/pipeline/test_upstream_sync_hardening.cpp \
     $$REPO_ROOT/tests/pipeline/test_phase3_parity.cpp \
-    $$REPO_ROOT/tests/pipeline/test_cdng_sequence_export.cpp
+    $$REPO_ROOT/tests/pipeline/test_cdng_sequence_export.cpp \
+    $$REPO_ROOT/tests/pipeline/test_look_assist_fixture_scene.cpp
 
 HEADERS += \
     $$REPO_ROOT/tests/common/minitest.h \
