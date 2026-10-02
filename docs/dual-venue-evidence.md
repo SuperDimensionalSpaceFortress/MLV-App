@@ -1,0 +1,290 @@
+# Dual-Venue Evidence
+
+How the fleet gets hardware evidence from **both** test machines -- Bachelor (the laptop) and
+Ultra-Magnus ("UM", the 4090 tower) -- in one framework, without ever treating them as one machine.
+The venues do **not** run at the same time: each works through its own queue at its own pace and files
+its own receipt. This page is the methodology for people; the code is under
+`tools/profiling/dual-venue/`.
+
+## The seven principles (each is a refusal the code enforces and a test pins)
+
+| | Principle | Where it is enforced |
+|---|---|---|
+| P1 | **Independent venues, shared subject.** A leg is defined once; "paired" means the same *subject digest*, never the same moment. No cross-venue timing is ever a verdict. | `subject.digest` in every receipt |
+| P2 | **No merged verdict.** Each receipt is judged against its own venue. A reconciler shows the two side by side and a *diagnostic* delta only when both are complete. | `Get-VenueEvidence.ps1` (DUAL-VENUE-RECONCILE-1) |
+| P3 | **Venue role is data.** `venues.json` gives each venue a role per card (`acceptance` / `supplementary`); nothing relabels a receipt afterwards. | `venues.json` + `Get-DvVenueRole` |
+| P4 | **Typed terminals, zero partial credit.** The outcome is one of `PASS FAIL VENUE_UNHEALTHY VENUE_NOT_QUIESCENT VENUE_HOST_MISMATCH DEVICE_UNAVAILABLE UNRESOLVED RETRACTED INVALID VENUE_TOOLING`. Only PASS/FAIL carry signal, and a PASS/FAIL without the receipt oracle's verdict, and the admission it was admitted on, is `INVALID` (rounds 2-3). Exit code, silence or output size are never completion evidence. | `Write-DvReceipt` rejects any other value and any proofless PASS/FAIL |
+| P5 | **Health before timing.** A bounded probe (pwsh cold start, write+hash of a fixed 4 MiB buffer, free disk, commit charge) precedes every leg; unhealthy means the leg is **not submitted**. | `Invoke-VenueLeg.ps1` step 4 |
+| P6 | **One source of truth for the venue.** The declared `-Venue` must agree with `Get-AttrCudaMeasurementVenue` on the host that runs the job, else `VENUE_HOST_MISMATCH`. | probe check + in-job guard (exit 29) |
+| P7 | **Safety unchanged.** A leg names a consented clip id and runs only on a venue the owner consented it for; every share write goes through `tools/profiling/um-run.ps1` (NA-7). | `Get-DvClipAdmission` + `Submit-VenueJob` |
+
+## Long clips only (round 2; `docs/playback-clip-length-rule.md`)
+
+Every leg here **plays the app** (speed, LOOK / contact sheet, on cuda and cpu), so the owner's rule applies to
+all of them: at least 20 s of distinct source frames of real footage, never a loop, a replay or a short clip.
+The runner does not re-implement that rule; it routes every playing leg through master's evidence launchers and
+receipt oracle and refuses to believe a receipt that does not carry the oracle's proof.
+
+* **A leg is addressed by a consented clip id, never a path** (`clipId: "M16-1243"`; the leg-spec schema pins the
+  id shape, and `clipPath` is not a property). The runner passes the id to the generator, which resolves it
+  through `tools/gates/resolve_consented_clip.py`; no path appears in a leg, a receipt or a refusal.
+* **Fixtures are not legs.** `tiny_dual_iso` (2 frames) and `large_dual_iso` (16 frames) can never satisfy 20 s.
+  A leg that names one is refused up front, typed `FIXTURE_REFUSED_CLIP_TOO_SHORT` (the verdict of
+  `gui-smoke-length-gate.ps1`, the same gate that refuses a short clip anywhere else), before anything is
+  generated or submitted -- not even the health probe. The two fixture legs of round 1 are gone.
+* **The play window is the spec's `playSeconds`** (default 25, floor 20; under 20 is `PLAY_WINDOW_TOO_SHORT`).
+  The generator refuses a window the clip cannot cover.
+* **Per-venue consent, read only as committed.** `tools/profiling/dual-venue/venue-clip-consent.json` is a tracked,
+  **owner-written** file. Each record is exactly `venue`, `clipId`, `ownerLine` (the owner's exact typed line,
+  `CLIP <venue>: <clip id>`, which contains no path), `ownerLineSha256` (the sha256 of that line), `recordedUtc` and
+  `recordedBy: "owner"`; the line must name the record's own venue and clip id and hash to `ownerLineSha256`, so a bare hex
+  string is not the owner's words. Agents and producer lanes never write the file; the hub adds the owner's lines in its
+  own reviewed commit. **Production reads the consent file and the venue table ONLY as committed at `HEAD`**
+  (`git rev-parse HEAD:<path>` + `git cat-file blob`) and refuses when the working copy differs
+  (`ADMISSION_SOURCE_DIRTY`) or the file is not in `HEAD` (`ADMISSION_SOURCE_NOT_COMMITTED`): a file a caller writes
+  anywhere is never consent, and an uncommitted edit to `venues.json` cannot flip the reviewed switch. The
+  `-ConsentPath`, `-VenueTablePath`, `-RepoRoot`, `-WorkDir`, `-GeneratorScript` and `-UmRunScript` overrides are
+  **test seams, refused (`DVE_TEST_SEAM_IN_PRODUCTION`) unless `-OfflineTestMode`**; offline test mode can never reach a
+  venue (it needs a stub `-UmRunScript` that is not `um-run.ps1` by path or content, and every venue's `agentShare` must be a
+  local directory under the OS temp folder), and the receipt it writes says `admission.mode = offline-test` and is not
+  evidence (`Test-DvReceiptValid` refuses it). The receipt records what it was admitted on: `admission.consentBlobSha`,
+  `admission.venueTableBlobSha`, `admission.headCommit`, `admission.consentLastCommit` and the owner line's sha256. A venue
+  with no record for the clip is refused before submitting (`VENUE_CLIP_CONSENT_ABSENT`) -- consent on Bachelor never
+  implies Ultra-Magnus, nor the reverse. A missing, empty or malformed file refuses everything
+  (`VENUE_CLIP_CONSENT_INVALID`); a record is exactly six keys, so a path cannot ride along. `venues.json`
+  `ownerFootage.cleanupClassGone` stays a second, reviewed switch (`OWNER_CLIP_REFUSED_PENDING_CROSS_VOLUME_2`). The file
+  ships with **no records**: every owner leg refuses until the hub records the owner's lines.
+  Honest limit: "committed" is not "reviewed" -- any local commit changes `HEAD`. The receipt names the blob ids and the last
+  commit that touched the file so a reader can check them against the reviewed history; the control on *who may write a
+  record* is the hub's review of that commit.
+* **The receipt carries a verdict it can re-derive.** The proof is taken from the run's OWN records, not from a summary the job
+  wrote about itself: the launcher's `result.json` (the nonce it generated, the sha256 of the run log it snapshotted) and the
+  app's run log (`logs/smoke-run.log`, the measured session's `playback_smoke.summary` line). The receipt's `playback` block
+  carries `sourceAdvanced`, `requiredSourceFrames`, `nativeFps`, `paceFps`, `fpsOverride`, `wrapped`, `wrapCount`,
+  `expectedRunNonce` (the launcher's), `observedRunNonce` (the one the app echoed), `manifestRunNonce`, `logSha256` /
+  `logShaBound`, `settingsIsolated`, the job's own block for cross-checking, `fixtureRehearsal` and the job's clip id, and
+  `Get-DvPlaybackProblems` re-derives the verdict from those fields alone (`Test-DvReceiptValid` does it for a reader; a
+  stored `valid: true` is never believed): `source_advanced >= required_source_frames >= ceil(20 s x native_fps)`, paced at
+  the native fps (within 0.5 %), no fps override, no wrap, **the app echoed exactly the nonce the launcher generated**, the
+  run log is the snapshot the launcher hashed, the app used its run-scoped settings store, a non-rehearsal run of **this**
+  leg's clip. **The nonce is the one the real launcher mints** -- `[Guid]::NewGuid().ToString("N")` in
+  `tools/profiling/run-release-gui-smoke.ps1`, 32 lowercase hex -- and the tests evaluate that very expression rather than a
+  hand-made constant. **Every field must be present** -- an absent field is `INVALID`, never "no wrap". A PASS/FAIL that
+  fails this is `INVALID` (`Invoke-VenueLeg.ps1`) and `Write-DvReceipt` refuses to write it a second time; a printed capture
+  whose job exited non-zero, or a captured job that wrote no `sourceFrames` block of its own, is `INVALID` too. A job smoke
+  refusal of the length class (`PLAY_WINDOW_TOO_SHORT`, `INVALID_LOOPED`, ...) is `INVALID`, never a product `FAIL`.
+  Readers (`Get-VenueEvidence`) must call `Test-DvReceiptValid -RepoRoot <repo> [-EvidenceDir <dir>]` (next bullet).
+* **PRODUCTION RECEIPTS ARE ADVISORY (DUAL-VENUE-EVIDENCE-2 round 2; the narrowing exit, hub ruling 2026-10-02).** There is no
+  venue-held anchor: nothing the venue signs reaches this repo, and `um-run.json` is written by the runner itself, so a receipt
+  can show that it is consistent with committed consent and with the hashed files it names, but never that those files came from
+  a venue run. `Test-DvReceiptValid` therefore returns, for a production PASS/FAIL receipt that re-derives, `valid = false`,
+  `status = ADVISORY` and the typed reason `VENUE_ANCHOR_ABSENT`; it **never returns `VERIFIED`** for a production receipt and
+  nothing here produces a usable PASS. A receipt that does not re-derive is `INVALID` / `INCOMPLETE` (and also carries the reason).
+  A test pins the advisory result and a mutation that re-enables production PASS fails it. Offline test mode (never evidence)
+  keeps `VERIFIED_OFFLINE_TEST` for the harness. **Production PASS verification is a later card, `DUAL-VENUE-PASS-PROVENANCE-1`,
+  which needs a design step first**: a venue-agent signature over `summary.json`, or a validator that re-reads
+  `\\<venue>\mlv-agent\outbox` by `jobId`. **Declared threat model (forward-only).** *In scope:* our own tools, mislabelling,
+  legacy or other-lane receipts, a wrong-leg or wrong-backend pairing, an edited or stale receipt, a line-ending artefact.
+  *Out of scope, accepted and shown to the owner:* a deliberate forger who writes a whole matching evidence set.
+* **A receipt is advisory only when every claim in it is re-derived from a committed blob or a hashed artifact; no field the
+  receipt asserts about itself is an input to the verdict** (DUAL-VENUE-EVIDENCE-2; PR #207's validator believed hash *formats* and
+  self-asserted booleans, so a hand-built production PASS over an empty consent blob validated). `Test-DvReceiptValid` returns
+  `{ valid; status; reasons; unbound; evidenceDir }`, `status` being `ADVISORY` (production, everything re-derives: **not valid**) |
+  `VERIFIED_OFFLINE_TEST` (offline harness only) | `INCOMPLETE` (a piece of evidence is absent: never a PASS/FAIL) |
+  `INVALID` (a claim does not re-derive) | `NO_SIGNAL` (any outcome other than PASS/FAIL); `VERIFIED` exists in the contract but no
+  production receipt can reach it. `Write-DvReceipt` runs the **same** validator before it writes a PASS/FAIL (an advisory receipt is
+  written and stamped `verification.status = ADVISORY`; anything that does not re-derive is refused), and so does every reader
+  (`New-VenueSheetPair.ps1` accepts exactly `ADVISORY` and says so in its record, and `Get-VenueEvidence` when RECONCILE-1 builds
+  it; a test pins that every in-tree caller passes `-RepoRoot`).
+  * *Admission, from git:* `admission.consentBlobSha` and `venueTableBlobSha` must be real **blobs** of the repo (`git cat-file
+    -t` says blob; a placeholder hash, a commit or a tree is refused) and be the files committed at `admission.headCommit`;
+    the table parses; the consent blob parses with `Read-DvClipConsent` and holds an owner record (`recordedBy: owner`, the
+    exact `CLIP <venue>: <clip>` line) **for this venue and clip id** whose line sha256 equals `admission.ownerLineSha256`;
+    the committed cleanup switch is on; `venue.role` is the table's. `git` runs with `GIT_DIR`, `GIT_WORK_TREE`,
+    `GIT_INDEX_FILE` and the object-store overrides scrubbed and `--no-replace-objects`, so the environment cannot point it at
+    another repo. A production receipt validated without `-RepoRoot` is `INCOMPLETE`, never VERIFIED.
+  * *The leg, from git:* `subject.legSpecSha256` must name a leg spec **committed under `tools/profiling/dual-venue/legs/`**
+    at `headCommit` (the runner refuses `LEG_SPEC_NOT_COMMITTED` up front in production), and PASS vs FAIL is re-derived
+    from that committed spec's criteria for the venue's role and backend over the evidence's verbatim metrics.
+  * *The run, from hashed files:* the receipt names its `evidence.localEvidenceDir` (only a hint: `-EvidenceDir` wins) and the
+    sha256 of each file there -- `summaryJsonSha256`, `evidenceManifestSha256`, `resultJsonSha256`, `logSha256`,
+    `umRunJsonSha256` (`um-run.json` records the job's exit code and RESULT token). The validator re-hashes every file (an
+    edited one is `INVALID`, an absent one `INCOMPLETE`), re-derives the whole `playback` block with the writer's own parser
+    (`Get-DvPlaybackEvidence`) and requires the receipt's copy to equal it, field by field -- `logShaBound` and
+    `settingsIsolated` are **derived, never read** -- and checks the evidence's own clip id, venue (`summary.display.venue`) and
+    build (`manifest.buildManifest.sha256`), the verbatim `metrics`, the `subject.digest`, and the job's exit code. The
+    manifest is optional only on a product-failure terminal (the job writes none); a capture without it is `INCOMPLETE`.
+  * *What the hashed summary binds (round 2):* the **backend** is derived from `summary.json`'s own frame counters, never from
+    `subject.backend` -- `cuda` needs `gpuFramesTotal > 0`; `cpu` needs `cpuFrames > 0` and `gpuFramesTotal == 0` and a `backend`
+    field in the summary (a cpu run is always a variant job) -- a receipt whose backend disagrees is `INVALID`
+    (`BACKEND_MISMATCH` / `BACKEND_NOT_DERIVABLE`), and the leg's criteria are selected by the **derived** backend. A product-failure
+    terminal is read where the job *actually* writes its counters: `GPU_RECON_FRAMES_ZERO`, `CPU_FALLBACK_DETECTED` and
+    `CPU_BACKEND_PATH_MISMATCH` carry them only in the nested `gpuSummary` (`gpuFramesTotal` is the sum of its recon-readback,
+    texture-readback and texture-no-readback counts; preview frames never count) and no `backend` / `lookLeg` field, so the validator
+    takes the leg's backend from the terminal itself (the two cuda exits 13 / 14 exist only on a cuda leg, exit 28 only on a cpu leg)
+    and requires the counters to be the shape that terminal is written under -- a terminal whose counters contradict it is
+    `BACKEND_NOT_DERIVABLE`. Its leg type is then *unstated* (`LEG_TYPE_UNSTATED` in `unbound`; the receipt is a `FAIL` derived from
+    the terminal's own result token, never a PASS). `PRESENTMON_UNAVAILABLE` has a top-level `gpuFramesTotal` and is read the same
+    way. Tests use the exact summary shapes the job writes (`real_failure_summary`). The **leg type**
+    comes from `summary.lookLeg` (a look-run's evidence can no longer verify as the speed leg, nor the reverse: `LEG_TYPE_MISMATCH`),
+    plus `lookAssistForced`, the look flavor and `declaredVenue` when the job wrote them.
+  * *Typed UNBOUND claims:* `subject.clipContentSha256` is computed by the local generator and written to **no** artifact the venue
+    returns, and `legId` / `legSpecSha256` name a committed spec that no hashed artifact carries (only the leg *type* is bound). They
+    are recorded -- the validator's `unbound` list (`CLIP_CONTENT_UNBOUND`, `LEG_IDENTITY_UNBOUND`), `verification.unbound` in a
+    written receipt, `unbound` in a sheet-pair record -- and are **never verdict inputs**: they are neither believed nor compared
+    when pairing (the pair is keyed on the bound clip id, build and look flavor).
+  * *Line endings:* the leg spec is identified by the sha256 of its bytes with CRLF folded to LF (`Get-DvLegSpecSha256`), on **both**
+    sides of the committed-spec lookup (the runner hashes the working copy, the lookup hashes the committed blob). On this VM's
+    default checkout (system git `core.autocrlf=true`) the working copy is CRLF while the blob is LF, and a raw-byte comparison would
+    refuse every committed spec as `LEG_SPEC_NOT_COMMITTED`. `.gitattributes` also pins `legs/*.json`, `venue-clip-consent.json` and
+    `venues.json` to `text eol=lf`; the consent file and the venue table are compared through git's own clean filters
+    (`git hash-object`). Tests check out the real shipped files under `core.autocrlf=true` with and without the pin.
+  * *Honest limits:* (1) the evidence files are local; nothing signs them on the venue, so a forger who can both commit a
+    consent record **and** write a hash-consistent evidence directory (or just the evidence directory, once consent is legitimately
+    committed) can still make a receipt re-derive -- which is exactly why a production receipt is advisory, never VERIFIED.
+    (2) "Committed" is any commit of the repo, not "reviewed master" (`admission.headCommit` may be a dangling commit; fable's
+    hardening `DVE-CONSENT-COMMIT-MUST-BE-REVIEWED-1`). (3) `clipContentSha256` and the leg id are UNBOUND (above). (4) A
+    product-failure `FAIL` has no manifest, so its build binding is the job's own `summary.json`. A hand-built receipt, a placeholder
+    hash, a self-asserted boolean, an empty consent blob, an uncommitted leg spec, a relabelled backend or leg, a line-ending
+    difference and missing evidence never *re-derive*, and nothing re-derived is more than advisory.
+* **Raw contact-sheet frames are listed too (round 2).** At capture time the runner hashes every raw frame and sidecar into
+  `contact-frames.json` (`mlv-app/dual-venue-contact-frames/v1`, named in the receipt as `evidence.contactFramesJsonSha256`).
+  A LOOK receipt's validation and `New-VenueSheetPair.ps1` take **only** the files that manifest lists (`Read-DvContactFrames`): an
+  unlisted PNG or sidecar, a listed file that is missing or does not hash to its entry, a non-`*.png`/`*.json` name, a
+  subdirectory or a reparse point is refused (`CONTACT_FRAME_UNLISTED`, `CONTACT_FRAME_HASH_MISMATCH`, `CONTACT_FRAMES_UNLISTED`),
+  and the pair is composed from a staging copy of exactly the bytes that were hashed. Two receipts that share one evidence
+  directory are refused. The pair record says `advisory: true`.
+* **Queued, not done here:** `DUAL-VENUE-PASS-PROVENANCE-1` (venue-held provenance for a production PASS: design first -- a
+  venue-agent signature over `summary.json`, or the validator re-reading `\\<venue>\mlv-agent\outbox` by `jobId`).
+* Limit, stated plainly: a venue sitting is still the observation that a real run reaches its frames; nothing here plays
+  the app, and no venue run has happened. Until DUAL-VENUE-PASS-PROVENANCE-1 lands, no production receipt counts as a PASS.
+
+## Pieces
+
+* `tools/profiling/dual-venue/venues.json` -- the venue table: share, agent root, scratch root,
+  expected host name, health thresholds, per-card roles, `defaultRole`, and the owner-footage gate.
+  **Changing a role is a reviewed commit, never a runtime flag.**
+* `tools/profiling/bachelor/playback-attr-3-cuda-job.ps1` -- the job generator, now with
+  `-Venue bachelor|ultra-magnus`, `-Backend cuda|cpu`, `-ScaleFactor`, `-CpuQuiescenceThresholdPercent`,
+  `-ForceLookAssist`, `-LookFlavor`. With default arguments its output is **byte-identical** to before
+  (pinned by `tools/repo_hygiene/test_dual_venue_evidence.py` against master's generator at 38ed2d8f, the
+  merge that carried the clip-length enforcement). It also takes `-PlaySeconds` (master's) and returns
+  `clipContentSha256` for the receipt subject.
+* `tools/profiling/dual-venue/Invoke-VenueLeg.ps1` -- runs one leg on one venue and **always** writes a
+  receipt. `DualVenueRunner.psm1` holds its testable rules.
+* `tools/profiling/dual-venue/New-VenueSheetPair.ps1` -- composes the side-by-side cuda|cpu contact sheet
+  for a LOOK leg from two **advisory** receipts (`make-contact-sheet.py --pair-dir`, paired by frame index; a diagnostic sheet,
+  never a PASS). **A sheet shows only the frames this run captured and the manifest lists** (DUAL-VENUE-EVIDENCE-3): a listed sidecar
+  may name no image but its own listed `<stem>.png` (`CONTACT_FRAME_SIDECAR_PATH` at validation; the app writes exactly that name), the
+  pair stages the hashed bytes and hands the composer their sha256 (`--left-listed` / `--right-listed`), and the composer reads only
+  those staged files, verifies each hash at read time (`PAIR_FRAME_HASH_MISMATCH`), refuses an unlisted one (`PAIR_FRAME_NOT_LISTED`)
+  and refuses an absolute, parent-relative or other-frame `path` (`PAIR_SIDECAR_PATH_OUTSIDE_STAGING`) -- it never falls back to a file
+  outside the staging directory, so an edited or stale PNG elsewhere on the VM cannot appear under a receipt's backend label.
+* `tools/profiling/dual-venue/leg-spec.schema.json` and `legs/*.json` -- the leg specs.
+* `Get-VenueEvidence.ps1` (the reader; built by DUAL-VENUE-RECONCILE-1) -- reads receipts; acceptance
+  reads only `-AcceptanceFor <card>`.
+
+## Backends: every playback leg runs as cuda AND cpu on every venue
+
+A speed or look leg has `backends: ["cuda","cpu"]`. `-Backend cpu` omits every `MLVAPP_GPU_*` /
+`MLVAPP_EXPERIMENTAL_GPU_*` environment variable, requires `CPU_FRAMES > 0` and zero GPU frames
+(a leg that reached a GPU path is `CPU_BACKEND_PATH_MISMATCH`, exit 28), never fires the CUDA-only
+exits 13/14, and treats PresentMon as informational. **CPU frame rate is informational** -- it tracks
+cores and storage, not the product's GPU work -- and never gates a card. `backend` is part of the
+subject, so a cuda receipt and a cpu receipt are different subjects.
+
+## LOOK legs and contact sheets
+
+A `legType: "look"` leg takes `look.contactSheetFrames` evenly spaced frames on each backend with
+**Look Assist forced on** (the smoke runner is told Look Assist is *required*, so a leg where it did not
+apply fails closed; an automation run reads a run-scoped settings store, so the venue's persisted settings are
+never inherited). The contact-sheet capture is seek-mode (no Play of its own): the leg's single measured Play
+is the one that covers >= 20 s.
+The job composes a one-backend sheet; `New-VenueSheetPair.ps1` then pairs the two backends' raw frames
+into one `cuda | cpu` sheet, by frame index. Each receipt's `look` block carries the sheet's sha256 and
+path; the pair is its own record (`mlv-app/dual-venue-sheet-pair/v1`) because receipts are never edited.
+
+* `lookFlavor` (`classic` default | `cinematic`) is in the leg spec and the receipt subject and is passed
+  to the app as `MLVAPP_LOOK_ASSIST_FLAVOR`. **The app does not read it yet** (LOOK-ASSIST-FLAVORS-1), so
+  every receipt says `lookFlavorHonored: "unknown"` -- never a claim that it applied.
+* Aesthetics are **model-judged** (Amendment 2). Receipts carry `owner_verdict: null` (optional, never
+  waited on, never written by the runner) and `model_verdicts: []` (filled by the judge card).
+* **Sheets of owner footage stay local under `.claude-state`** (never committed, attached to a PR, published to
+  the bus or as an artifact) and need CROSS-VOLUME-2 plus the per-venue owner CLIP line. Since fixtures are
+  never venue playback clips, there are no fixture sheets any more.
+
+## How to add a leg
+
+1. Copy `legs/m16-1243-speed.json` (or `m16-1243-look.json`); give it a new `legId`, the `card` that needs the
+   evidence and a **consented clip id**. The file validates against `leg-spec.schema.json`. The id needs an
+   owner-typed record for each venue that will run it (see "Long clips only").
+2. Declare the **roles before the first byte** (kernel K5): add the card to `venues.json` `roles`
+   (`bachelor: acceptance`, `ultra-magnus: supplementary` for a card whose acceptance venue is Bachelor).
+   A card the table does not name gets `defaultRole` (`supplementary`) on both venues.
+3. Put the pass criteria per **role** and per **backend** in `criteria`: `{metric, op, value}` triples
+   over the metrics copied verbatim from the job's `summary.json` (`rows`, `gpuFramesTotal`, `cpuFrames`,
+   `lookAssistForced`, `presentMon*`, ...). An empty list is informational. A metric the job did not
+   write *fails* the criterion -- a missing number is never a passing number.
+4. `legSpecSha256` is the sha256 of the file's bytes with line endings normalised (CRLF -> LF), so editing a leg makes a new
+   subject and a CRLF checkout does not.
+
+## How to run a leg on a venue
+
+Stage the **same build** on the venue first (assemble once; stage with `playback-attr-3-cuda-stage-job.ps1`
+and `attr3-stage-smoke-runner-job.ps1` using `-AgentRoot` from `venues.json`). The runner refuses --
+`DEVICE_UNAVAILABLE` -- to substitute a different build. The consented clip is resolved and verified by the job
+at the venue, by id; the runner never stages, opens or names it.
+
+```powershell
+pwsh -NoProfile -File tools\profiling\dual-venue\Invoke-VenueLeg.ps1 `
+    -Venue ultra-magnus -LegSpec tools\profiling\dual-venue\legs\m16-1243-look.json `
+    -SourceCommit <40-hex> -BuildManifestSha256 <64-hex of the staged build.json> -Backend cuda
+```
+
+A refused leg (fixture id, no consent record for this venue, window under 20 s, an unresolvable id) writes a
+receipt with `refusal: <TOKEN>` and `DEVICE_UNAVAILABLE` (no signal) and submits nothing.
+
+Add `-HealthOnly` to probe a venue and stop (the receipt is `UNRESOLVED` -- nothing was measured).
+The last lines print `DVE_OUTCOME=`, `DVE_DETAIL=` and `DVE_RECEIPT_PATH=`. **Read the receipt, not the
+exit code**: exit 0 means "a receipt was written", exit 2 means the receipt itself could not be written.
+
+The runner no longer snapshots the venue's registry (round 3): master gives an automation run its own run-scoped settings
+store, so the app neither reads nor rewrites the venue's `HKCU\Software\magiclantern.MLVApp`. The receipt proves it from the
+run log (`playback.settingsIsolated`; a log that does not say `settings_store=run_scoped` is `INVALID`,
+`SETTINGS_NOT_ISOLATED`, which also refuses a build that predates the isolation). `registry` is kept as a null field so a
+round-2 reader still parses. `-ReceiptRoot` (production) and `-SheetCopyDir` must sit under a `.claude-state` directory: a
+receipt, its evidence and a contact sheet name or show an owner clip's run and stay local.
+
+Receipts land in `<main checkout>\.claude-state\dual-venue\receipts\<card>\<legId>\<venue>\<receiptId>.json`,
+append-only (created with `CreateNew`; a repeat is refused, never overwritten). Copied evidence
+(`summary.json`, `evidence-manifest.json`, the launcher's `result.json`, `logs\smoke-run.log`, `um-run.json` -- each sha256 named in
+the receipt -- and the contact sheet) is under `.claude-state\dual-venue\evidence\<receiptId>\`, which in production must sit under
+`.claude-state` too (the run log and result name an owner clip's run; they stay local like the receipt).
+
+## How to read the evidence
+
+* **Acceptance** reads only receipts whose `venue.role` is `acceptance` for the card, and only `PASS`/`FAIL`.
+  A venue that was unhealthy, not quiescent, unreachable or a mismatch leaves the card *open*, not failed.
+* **Supplementary** evidence informs diagnosis -- fails on both: code; fails only on Bachelor: the venue --
+  but never closes a card.
+* **Every leg runs an owner clip** (fixtures are refused), so every leg needs CROSS-VOLUME-2 merged *and* the
+  owner's CLIP line for that venue (consent on one venue never implies the other). Until then the runner refuses
+  before submitting anything and writes a receipt with `refusal: VENUE_CLIP_CONSENT_ABSENT` or
+  `OWNER_CLIP_REFUSED_PENDING_CROSS_VOLUME_2`.
+* **`INVALID` is not a failure of the product**: the run could not show >= 20 s of distinct source frames (or
+  the proof is absent). It carries no signal; the card stays open. Fix the venue or the clip and re-run.
+
+## Outcome mapping (job `RESULT=` token -> receipt outcome)
+
+| Job result | Outcome |
+|---|---|
+| `MEASUREMENT_CAPTURED` (exit 0, valid oracle verdict, the job's own `sourceFrames` block) | `PASS` or `FAIL` from the role/backend criteria |
+| `MEASUREMENT_CAPTURED` for a LOOK leg whose venue could not compose the contact sheet (`CONTACT_SHEET_COMPOSE_UNAVAILABLE`: no Python + Pillow) | `VENUE_TOOLING` (raw frames kept locally; a venue condition) |
+| `MEASUREMENT_CAPTURED` with a non-zero exit, `FIXTURE_REHEARSAL_CAPTURED`, `SOURCE_FRAMES_INVALID`, or a smoke refusal of the length class (`PLAY_WINDOW_TOO_SHORT`, `CLIP_TOO_SHORT`, `INVALID_LOOPED`, ...); or a PASS/FAIL whose receipt lacks a valid oracle verdict | `INVALID` |
+| `VENUE_NOT_QUIESCENT` | `VENUE_NOT_QUIESCENT` |
+| `VENUE_HOST_MISMATCH` | `VENUE_HOST_MISMATCH` |
+| `BACKEND_NOT_AVAILABLE` | `DEVICE_UNAVAILABLE` |
+| `DISPLAY_ASLEEP`, `KEEPALIVE_FAILED`, `SCREENSAVER_SECURE_OWNER_ONLY`, `DISPLAY_WAKE_DISMISS_FAILED` | `VENUE_UNHEALTHY` (a venue condition, not a product result) |
+| a product failure the job reaches AFTER it published the run log (`GPU_RECON_FRAMES_ZERO`, `CPU_FALLBACK_DETECTED`, `CPU_BACKEND_PATH_MISMATCH`, `PRESENTMON_UNAVAILABLE`) **with a valid receipt-oracle verdict re-derived from that log** | `FAIL`, with the token in `outcomeDetail` (a production receipt for it is written as an **advisory** `FAIL`: its backend is derived from the summary's nested `gpuSummary` counters and its leg type is `LEG_TYPE_UNSTATED`) |
+| any terminal with no run log or a log that does not prove >= 20 s (`SMOKE_RUN_FAILED`, `SMOKE_LOG_UNAVAILABLE`, or one of the failures above on a short, wrapped, foreign or overridden run) | `INVALID` (no proof, no signal) |
+| um-run `RETRACTED` / `UNRESOLVED` | `RETRACTED` / `UNRESOLVED` |

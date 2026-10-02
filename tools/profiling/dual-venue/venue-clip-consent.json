@@ -1,0 +1,6 @@
+{
+  "schema": "mlv-app/dual-venue-clip-consent/v1",
+  "writtenBy": "OWNER-TYPED CLIP LINES ONLY. The hub appends a record here, in its own reviewed commit, when the owner types a CLIP line for a venue; agents and producer lanes never write this file. The runner reads it ONLY as committed at HEAD (git show HEAD:<this path>) and refuses when the working copy differs, so an uncommitted or caller-supplied file is never consent. A record is keyed by venue + clip id and carries the owner's exact typed line (it contains no path), the line's sha256, when it was recorded and 'owner' as recordedBy. No path, no footage file name, ever.",
+  "recordShape": { "venue": "bachelor | ultra-magnus", "clipId": "M16-1243", "ownerLine": "CLIP <venue>: <clipId>  (e.g. CLIP bachelor: M16-1243; the owner's exact words, no path)", "ownerLineSha256": "<sha256 (64 lowercase hex) of ownerLine as UTF-8>", "recordedUtc": "<ISO-8601>", "recordedBy": "owner" },
+  "records": []
+}

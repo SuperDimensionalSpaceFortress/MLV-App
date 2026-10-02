@@ -7109,6 +7109,9 @@ def _derive_claim_carriers(root=REPO_ROOT):
 # return reaches neither side of the equality and fails nothing; see the bounds documented
 # above `_derive_claim_carriers`.
 _CLAIM_CARRIERS_PINNED = (
+    # DUAL-VENUE-EVIDENCE-1 r2: the dual-venue runner and its doc name a consented clip id.  Read: none asserts the
+    # exclusivity claim (the needle below ran clean over each); they describe the per-venue consent gate.
+    "docs/dual-venue-evidence.md",
     "docs/never-authorized.json",
     "tools/gates/resolve_consented_clip.py",
     "tools/gates/verify_consented_footage.py",
@@ -7118,7 +7121,12 @@ _CLAIM_CARRIERS_PINNED = (
     "tools/profiling/bachelor/attr3-footage-presence-job.ps1",
     "tools/profiling/bachelor/attr3-footage-read-rate-job.ps1",
     "tools/profiling/bachelor/playback-attr-3-cuda-job.ps1",
+    "tools/profiling/dual-venue/DualVenueRunner.psm1",
+    "tools/profiling/dual-venue/Invoke-VenueLeg.ps1",
+    "tools/profiling/dual-venue/New-VenueSheetPair.ps1",
+    "tools/profiling/dual-venue/leg-spec.schema.json",
     "tools/repo_hygiene/test_attr3_footage_presence_job.py",
+    "tools/repo_hygiene/test_dual_venue_evidence.py",
     "tools/repo_hygiene/test_mlv_never_authorized.py",
     "tools/repo_hygiene/test_verify_consented_footage.py",
 )
