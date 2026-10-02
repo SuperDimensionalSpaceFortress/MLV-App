@@ -1331,12 +1331,22 @@ function Wait-PresentMonCapture($Proc, [string]$SessionName = '', [int]$TimeoutS
     # process to exit (the CSV is flushed by then), and only then Kill() as a FALLBACK -- reported as
     # stopMethod='kill_fallback' so the caller drops the cut-off last CSV row. Without one: the
     # legacy passive wait, then Kill() and PRESENTMON_TIMEOUT.
+    # UM-PRESENTMON-STOP-2 (sol r2 blocker 2): the job is credited with ending PresentMon only if it
+    # OBSERVED the process alive immediately before its own terminate or Kill(). Both are gated on a fresh
+    # HasExited read taken right before they are issued; a capture seen dead there is a SELF-exit (a crash
+    # code is then judged as one at the call site), however a later Kill() or helper call may report.
     $exitedBeforeStop = [bool]$Proc.HasExited
     $terminate = $null
     $terminateIssuedUtc = $null
+    $aliveBeforeTerminate = $false
     if (-not $exitedBeforeStop -and $SessionName -ne '') {
-        $terminateIssuedUtc = (Get-Date).ToUniversalTime().ToString('o')
-        $terminate = Invoke-PresentMonSessionTerminate -SessionName $SessionName
+        if ($Proc.HasExited) {
+            $exitedBeforeStop = $true
+        } else {
+            $aliveBeforeTerminate = $true
+            $terminateIssuedUtc = (Get-Date).ToUniversalTime().ToString('o')
+            $terminate = Invoke-PresentMonSessionTerminate -SessionName $SessionName
+        }
     }
     # A stop is only CAUSED BY THIS JOB when the terminate helper itself succeeded (exit 0, no timeout,
     # no error) or the job issued the Kill() below. A failed helper followed by an exit leaves the cause
@@ -1345,10 +1355,15 @@ function Wait-PresentMonCapture($Proc, [string]$SessionName = '', [int]$TimeoutS
     $terminateSucceeded = ($null -ne $terminate) -and ($null -eq $terminate.error) -and (-not $terminate.timedOut) -and ($null -ne $terminate.exitCode) -and ([int]$terminate.exitCode -eq 0)
     $stopMethod = if ($exitedBeforeStop) { 'already_exited' } elseif ($SessionName -eq '') { 'legacy_wait' } elseif ($terminateSucceeded) { 'session_terminate' } else { 'exited_after_failed_terminate' }
     $killUsed = $false
+    $aliveBeforeKill = $false
     $killIssuedUtc = $null
     $killError = $null
     $waitError = $null
-    if (-not $Proc.WaitForExit($TimeoutSeconds * 1000)) {
+    # A process that exits between the timed-out wait and the Kill() leaves Kill() a no-op on Windows (.NET
+    # returns without terminating an already-exited process), so "Kill() ran, then the exit was confirmed"
+    # proves nothing about who ended it: the Kill() is issued only at a process observed alive just before.
+    if (-not $Proc.WaitForExit($TimeoutSeconds * 1000) -and -not $Proc.HasExited) {
+        $aliveBeforeKill = $true
         # ATTR3-SMOKE-RUNNER-DEPS-1 (sol, PR #144 major 3, carried to round 3): the empty catch
         # here used to swallow a Kill() failure outright -- a PresentMon that survived both the
         # timeout and the kill attempt left no trace anywhere. Reported the same way
@@ -1384,6 +1399,8 @@ function Wait-PresentMonCapture($Proc, [string]$SessionName = '', [int]$TimeoutS
         stopMethod = $stopMethod
         stopCausedByJob = ($stopMethod -in @('session_terminate', 'kill_fallback'))
         exitedBeforeStop = $exitedBeforeStop
+        aliveBeforeTerminate = $aliveBeforeTerminate
+        aliveBeforeKill = $aliveBeforeKill
         terminateSucceeded = [bool]$terminateSucceeded
         terminateIssuedUtc = $terminateIssuedUtc
         terminateExitCode = $(if ($null -ne $terminate) { $terminate.exitCode } else { $null })
@@ -2962,25 +2979,43 @@ $presentMonTemporal = Get-AttrCudaTemporalCoverage -TimeInMsValues @($pmInterval
 $presentMonCountSufficient = ($pmIntervalRows.Count -ge $presentMonSufficiencyMinIntervalCount)
 $presentMonCoverageSufficient = ($presentMonCoverageAvailable -and ($presentMonCoverageFraction -ge $presentMonSufficiencyMinCoverageFraction))
 $presentMonTemporalSufficient = [bool]$presentMonTemporal.sufficient
-# UM-PRESENTMON-STOP-1 r2 (sol BLOCKER, judge 2): when THIS JOB ended the capture (a successful named
-# terminate, or its own Kill()), the loose arms above (>= 50% coverage, <= 5 s gaps) are not enough --
-# a stop can lose measured data that still clears them (sol's repro: 720 rows through 38000 ms of a
-# 2000-42000 ms window, app swaps 724, tail gap 4000 ms, reported ok with mean 50 ms against a true
-# 55.2 ms). So after a job-caused stop the capture must PROVE it covers the measured playback:
-#   (4) SPAN: the retained positive-interval rows must span the app's own measured swap window
-#       (playback_smoke.gpu_window_swaps first_swap_utc..last_swap_utc) to within
-#       $presentMonJobStopMaxSpanShortfallMs. Both spans are DIFFERENCES, so the check does not depend
-#       on the capture-start clock anchor.
-#   (5) COUNT MATCH: the retained MLVApp presents must match the app's own swap count to within
-#       $presentMonJobStopMaxCountDeviation.
-# Missing evidence (no swap-window timestamps, no swap count) fails the arm: a stop this job caused is
-# never read as a complete capture on the strength of absent data. A capture that ended on its own is
-# unaffected. These two bounds are NOT calibrated on a venue capture yet; the measured values are traced
-# (presentmon-job-stop-sufficiency) so the post-merge falsifier can tighten or relax them on evidence.
-$presentMonJobStopMaxSpanShortfallMs = 1000.0
+# UM-PRESENTMON-STOP-2 (sol r2 blockers + fable r2 hardening 1-2): when THIS JOB ended the capture (a
+# successful named terminate, or its own Kill()) the loose arms above (>= 50% coverage, <= 5 s gaps) are
+# not enough -- a stop can lose measured data that still clears them. So after a job-caused stop the
+# capture must PROVE it covers the app's own measured swap window (playback_smoke.gpu_window_swaps
+# first_swap_utc..last_swap_utc) BY POSITION, not by comparing lengths (rows before the first swap used to
+# cancel an equal length of lost tail):
+#   ANCHOR: PresentMon's TimeInMs is relative to its trace origin, which this job never observes. It is
+#       only known to lie inside the bracket [$presentMonCaptureStartUtc (the OS-reported process start,
+#       or the pre-spawn clock), $presentMonPostSpawnUtc (Start-PresentMonCapture returning)] -- the same
+#       bracket Get-AttrCudaPresentMonDisplayReport windows under. That bracket is NEVER narrower than
+#       3 s (Start-PresentMonCapture sleeps 3 s before returning), so no single UTC conversion is
+#       trustworthy to better than that. Every row is therefore converted under BOTH ends and a coverage
+#       claim is made only when it holds under the WORST end:
+#   (4) HEAD: some retained MLVApp present row lies at or before first_swap + $presentMonJobStopMaxEdgeGapMs
+#       even when the origin is the LATE end of the bracket.
+#   (5) TAIL: some retained row lies at or after last_swap - $presentMonJobStopMaxEdgeGapMs even when the
+#       origin is the EARLY end. Both are sufficient certificates: they can only turn a covered capture
+#       into degraded (needing rows at least as far past the swap window as the bracket is wide, which a
+#       real leg has: the app presents for seconds before playback and after it), never a lost tail into ok.
+#   (6) COUNT: retained presents inside [first_swap, last_swap] against the app's swap count for that same
+#       window (the old count compared the whole PROCESS lifetime to it). The in-window present count is
+#       itself only known to within the rows the bracket makes ambiguous, so it is a range [min, max];
+#       the arm fails only when the count is certainly wrong: max below the swap count (rows lost), or min
+#       above it, by more than $presentMonJobStopMaxCountDeviation.
+# Missing evidence (no swap-window timestamps, no swap count, an inverted bracket) fails the arm: an
+# untrustworthy conversion NEVER yields ok. A capture that ended on its own is unaffected. The bounds are
+# NOT calibrated on a venue capture yet; every measured value is traced (presentmon-job-stop-sufficiency)
+# so the post-merge falsifier can tighten or relax them on evidence.
+$presentMonJobStopMaxEdgeGapMs = 250.0
 $presentMonJobStopMaxCountDeviation = 0.02
 $presentMonJobStopFailedArms = @()
-$presentMonJobStopSpanShortfallMs = $null
+$presentMonJobStopAnchorUncertaintyMs = $null
+$presentMonJobStopHeadGapMs = $null
+$presentMonJobStopTailGapMs = $null
+$presentMonJobStopPresentsMin = $null
+$presentMonJobStopPresentsMax = $null
+$presentMonJobStopWindowSwaps = $null
 $presentMonJobStopCountDeviation = $null
 if ($presentMonStoppedByJob) {
     $swapWindowMatches = if ($appSwapTelemetry.source -eq 'gpu_window_swaps') { @([regex]::Matches($rawLog, 'playback_smoke\.gpu_window_swaps [^\r\n]*?first_swap_utc=(?<first>\S+) last_swap_utc=(?<last>\S+)')) } else { @() }
@@ -2996,25 +3031,45 @@ if ($presentMonStoppedByJob) {
             $swapWindowParsed = $false
         }
     }
+    $presentMonJobStopAnchorUncertaintyMs = ($presentMonPostSpawnUtc - $presentMonCaptureStartUtc).TotalMilliseconds
+    $pmPresentTimes = @($displayReport.selectedPresentTimesMs | ForEach-Object { [double]$_ } | Sort-Object)
     if (-not $swapWindowParsed) {
-        $presentMonJobStopFailedArms += 'job-stop span: the capture was ended by this job and the run log carries no usable playback_smoke.gpu_window_swaps first_swap_utc/last_swap_utc, so coverage of the measured playback cannot be proven'
+        $presentMonJobStopFailedArms += 'job-stop position: the capture was ended by this job and the run log carries no usable playback_smoke.gpu_window_swaps first_swap_utc/last_swap_utc, so coverage of the measured playback cannot be proven'
+    } elseif ($presentMonJobStopAnchorUncertaintyMs -lt 0) {
+        $presentMonJobStopFailedArms += "job-stop anchor: the capture was ended by this job and the capture-start bracket is inverted (post-spawn $($presentMonPostSpawnUtc.ToString('o')) is before capture start $($presentMonCaptureStartUtc.ToString('o'))), so PresentMon's TimeInMs cannot be placed in time and coverage of the measured playback cannot be proven"
+    } elseif ($pmPresentTimes.Count -eq 0) {
+        $presentMonJobStopFailedArms += 'job-stop position: the capture was ended by this job and no retained MLVApp present row is available to place against the measured swap window, so coverage cannot be proven'
     } else {
-        $pmIntervalTimes = @($pmIntervalRows | ForEach-Object { [double]$_.timeInMs } | Sort-Object)
-        $appSwapSpanMs = ($swapLastUtc - $swapFirstUtc).TotalMilliseconds
-        $retainedSpanMs = if ($pmIntervalTimes.Count -ge 2) { $pmIntervalTimes[$pmIntervalTimes.Count - 1] - $pmIntervalTimes[0] } else { 0.0 }
-        $presentMonJobStopSpanShortfallMs = $appSwapSpanMs - $retainedSpanMs
-        if ($presentMonJobStopSpanShortfallMs -gt $presentMonJobStopMaxSpanShortfallMs) {
-            $presentMonJobStopFailedArms += "job-stop span: the capture was ended by this job and its retained rows span $([math]::Round($retainedSpanMs, 0)) ms against the app's own $([math]::Round($appSwapSpanMs, 0)) ms measured swap window ($([math]::Round($presentMonJobStopSpanShortfallMs, 0)) ms short, above the $([math]::Round($presentMonJobStopMaxSpanShortfallMs, 0)) ms bound), so measured data was lost"
+        $pmFirstTimeMs = $pmPresentTimes[0]
+        $pmLastTimeMs = $pmPresentTimes[$pmPresentTimes.Count - 1]
+        # Worst case for the head is the late end of the bracket (the row is as LATE as it can be); worst
+        # case for the tail is the early end (the last row is as EARLY as it can be).
+        $presentMonJobStopHeadGapMs = $pmFirstTimeMs - ($swapFirstUtc - $presentMonPostSpawnUtc).TotalMilliseconds
+        $presentMonJobStopTailGapMs = ($swapLastUtc - $presentMonCaptureStartUtc).TotalMilliseconds - $pmLastTimeMs
+        if ($presentMonJobStopHeadGapMs -gt $presentMonJobStopMaxEdgeGapMs) {
+            $presentMonJobStopFailedArms += "job-stop head: the capture was ended by this job and its earliest retained present cannot be shown to be at or before the app's first swap (it may be $([math]::Round($presentMonJobStopHeadGapMs, 0)) ms after it, above the $([math]::Round($presentMonJobStopMaxEdgeGapMs, 0)) ms bound, with the capture-start bracket $([math]::Round($presentMonJobStopAnchorUncertaintyMs, 0)) ms wide), so the start of the measured swap window is not shown to be covered"
         }
-    }
-    if (-not $presentMonCoverageAvailable) {
-        $presentMonJobStopFailedArms += 'job-stop count: the capture was ended by this job and the run log carries no app-side swap count to match the retained presents against'
-    } else {
-        $presentMonCountDifference = $presentMonPresentedCount - $presentMonAppSwapCount
-        if ($presentMonCountDifference -lt 0) { $presentMonCountDifference = -$presentMonCountDifference }
-        $presentMonJobStopCountDeviation = $presentMonCountDifference / [double]$presentMonAppSwapCount
-        if ($presentMonJobStopCountDeviation -gt $presentMonJobStopMaxCountDeviation) {
-            $presentMonJobStopFailedArms += "job-stop count: the capture was ended by this job and retained $presentMonPresentedCount present(s) against the app's own $presentMonAppSwapCount $presentMonAppSwapSource ($([math]::Round($presentMonJobStopCountDeviation * 100, 1))% apart, above the $([math]::Round($presentMonJobStopMaxCountDeviation * 100, 1))% bound)"
+        if ($presentMonJobStopTailGapMs -gt $presentMonJobStopMaxEdgeGapMs) {
+            $presentMonJobStopFailedArms += "job-stop tail: the capture was ended by this job and its last retained present cannot be shown to be at or after the app's last swap (it may be $([math]::Round($presentMonJobStopTailGapMs, 0)) ms before it, above the $([math]::Round($presentMonJobStopMaxEdgeGapMs, 0)) ms bound, with the capture-start bracket $([math]::Round($presentMonJobStopAnchorUncertaintyMs, 0)) ms wide), so measured data was lost or is not shown to be covered"
+        }
+        if (-not $presentMonCoverageAvailable) {
+            $presentMonJobStopFailedArms += 'job-stop count: the capture was ended by this job and the run log carries no app-side swap count to match the retained presents against'
+        } else {
+            # Present t is inside the swap window under origin a iff first - a <= t <= last - a. Certainly
+            # inside: under every origin in the bracket. Possibly inside: under at least one.
+            $pmCertainFromMs = ($swapFirstUtc - $presentMonCaptureStartUtc).TotalMilliseconds
+            $pmCertainToMs = ($swapLastUtc - $presentMonPostSpawnUtc).TotalMilliseconds
+            $pmPossibleFromMs = ($swapFirstUtc - $presentMonPostSpawnUtc).TotalMilliseconds
+            $pmPossibleToMs = ($swapLastUtc - $presentMonCaptureStartUtc).TotalMilliseconds
+            $presentMonJobStopPresentsMin = @($pmPresentTimes | Where-Object { $_ -ge $pmCertainFromMs -and $_ -le $pmCertainToMs }).Count
+            $presentMonJobStopPresentsMax = @($pmPresentTimes | Where-Object { $_ -ge $pmPossibleFromMs -and $_ -le $pmPossibleToMs }).Count
+            $presentMonJobStopWindowSwaps = $presentMonAppSwapCount
+            $presentMonCountDeficit = if ($presentMonJobStopPresentsMax -lt $presentMonAppSwapCount) { ($presentMonAppSwapCount - $presentMonJobStopPresentsMax) / [double]$presentMonAppSwapCount } else { 0.0 }
+            $presentMonCountExcess = if ($presentMonJobStopPresentsMin -gt $presentMonAppSwapCount) { ($presentMonJobStopPresentsMin - $presentMonAppSwapCount) / [double]$presentMonAppSwapCount } else { 0.0 }
+            $presentMonJobStopCountDeviation = if ($presentMonCountDeficit -gt $presentMonCountExcess) { $presentMonCountDeficit } else { $presentMonCountExcess }
+            if ($presentMonJobStopCountDeviation -gt $presentMonJobStopMaxCountDeviation) {
+                $presentMonJobStopFailedArms += "job-stop count: the capture was ended by this job and retained $($presentMonJobStopPresentsMin)..$($presentMonJobStopPresentsMax) present(s) inside the app's swap window against the app's own $presentMonAppSwapCount $presentMonAppSwapSource for that window ($([math]::Round($presentMonJobStopCountDeviation * 100, 1))% apart, above the $([math]::Round($presentMonJobStopMaxCountDeviation * 100, 1))% bound)"
+            }
         }
     }
 }
@@ -3076,7 +3131,7 @@ $provenance = [ordered]@{
     telemetryArm = $TelemetryArm
 }
 Save-Json $provenance (Join-Path $Pub 'provenance.json')
-Write-JobTrace "step presentmon-job-stop-sufficiency stoppedByJob=$presentMonStoppedByJob sufficient=$presentMonJobStopSufficient spanShortfallMs=$presentMonJobStopSpanShortfallMs countDeviation=$presentMonJobStopCountDeviation status=$presentMonStatus"
+Write-JobTrace "step presentmon-job-stop-sufficiency stoppedByJob=$presentMonStoppedByJob sufficient=$presentMonJobStopSufficient anchorUncertaintyMs=$presentMonJobStopAnchorUncertaintyMs headGapMs=$presentMonJobStopHeadGapMs tailGapMs=$presentMonJobStopTailGapMs presentsInWindow=$($presentMonJobStopPresentsMin)..$($presentMonJobStopPresentsMax) windowSwaps=$presentMonJobStopWindowSwaps countDeviation=$presentMonJobStopCountDeviation status=$presentMonStatus"
 
 # result.json, smoke-stdout.txt, smoke-stderr.txt, probe-timeline.csv and logs\smoke-run.log were
 # already published above, before PresentMon was ever parsed; presentmon.csv and

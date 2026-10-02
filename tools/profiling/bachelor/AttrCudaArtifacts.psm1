@@ -3498,6 +3498,9 @@ function Get-AttrCudaPresentMonDisplayReport {
             windowStartMs = $windowStartMs
             windowEndMs = $windowEndMs
             windowedRows = $windowedRows
+            # UM-PRESENTMON-STOP-2: every MLVApp present (displayed or not) this endpoint admits, as its raw
+            # TimeInMs, so a job-stopped capture can be judged by POSITION against the app's swap window.
+            selectedPresentTimesMs = @($mlvAppRows | ForEach-Object { [double]$_.timeInMs })
             chains = @($chains)
             # Named targetChains, not the more obvious name built from "MLVApp" + "Chains", purely
             # so dot-accessing it below never spells a footage-extension-shaped token: tools/
@@ -3580,6 +3583,7 @@ function Get-AttrCudaPresentMonDisplayReport {
         chains = @($headlineBuild.chains)
         selectedChain = $headlineBuild.selected
         selectedChainRows = $headlineBuild.selectedChainRows
+        selectedPresentTimesMs = $headlineBuild.selectedPresentTimesMs
         clockBracket = $clockBracket
         # PRESENTMON-HARNESS-ROBUSTNESS-2 r1b: the headline endpoint's own window bounds, on the
         # same anchor as selectedChainRows' timeInMs -- see the buildWindow comment above.

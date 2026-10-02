@@ -23,6 +23,7 @@ import shutil
 import subprocess
 import tempfile
 import unittest
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 from tools.repo_hygiene.test_playback_attr_3_cuda_presentmon_display_report import (
@@ -270,6 +271,96 @@ class CleanStopExecutedTests(_ProbeCase):
         self.assertIn("$presentMonStoppedByJob = [bool]$presentMonDoneResult.stopCausedByJob", block)
         self.assertIn("(-not $presentMonStoppedByJob -and [int]$presentMonDoneResult.exitCode -ne 0)", block)
 
+    # UM-PRESENTMON-STOP-2 item 2: the job is credited with ending PresentMon only if the process was
+    # OBSERVED ALIVE immediately before the job's own terminate or Kill(). A fake process object models the
+    # race (a real one cannot be made to exit between two statements): `exits_on_read` / `exits_on_wait`
+    # pick the instant the capture dies on its own; Kill() is a recorded no-op, as .NET's is on Windows
+    # for a process that has already exited.
+    def _race_probe(
+        self, *, exits_on_read: int | None = None, exits_on_wait: int | None = None,
+        terminate_exit_code: int = 1, capture_exit_code: int = -1073741819,
+    ) -> tuple[dict, list[str]]:
+        out = self.tmp / "race.json"
+        calls = self.tmp / "calls.log"
+        body = (
+            f"$global:callLog = '{calls}'\n"
+            "$global:st = @{ reads = 0; waits = 0; exited = $false }\n"
+            f"$global:exitsOnRead = {'$null' if exits_on_read is None else exits_on_read}\n"
+            f"$global:exitsOnWait = {'$null' if exits_on_wait is None else exits_on_wait}\n"
+            "function Invoke-PresentMonSessionTerminate([string]$SessionName, [int]$TimeoutSeconds = 10) {\n"
+            "    Add-Content -LiteralPath $global:callLog -Value \"terminate $SessionName\"\n"
+            f"    [pscustomobject]@{{ exitCode = {terminate_exit_code}; timedOut = $false; error = $null }}\n"
+            "}\n"
+            "$proc = [pscustomobject]@{}\n"
+            "$proc | Add-Member -MemberType ScriptProperty -Name HasExited -Value {\n"
+            "    $global:st.reads++\n"
+            "    if ($null -ne $global:exitsOnRead -and $global:st.reads -ge $global:exitsOnRead) { $global:st.exited = $true }\n"
+            "    $global:st.exited\n"
+            "}\n"
+            f"$proc | Add-Member -MemberType ScriptProperty -Name ExitCode -Value {{ if ($global:st.exited) {{ {capture_exit_code} }} else {{ $null }} }}\n"
+            "$proc | Add-Member -MemberType ScriptMethod -Name WaitForExit -Value {\n"
+            "    param([int]$ms)\n"
+            "    $global:st.waits++\n"
+            "    if ($global:st.exited) { return $true }\n"
+            "    if ($null -ne $global:exitsOnWait -and $global:st.waits -ge $global:exitsOnWait) { $global:st.exited = $true; return $false }\n"
+            "    return $false\n"
+            "}\n"
+            "$proc | Add-Member -MemberType ScriptMethod -Name Kill -Value { Add-Content -LiteralPath $global:callLog -Value 'kill' }\n"
+            "$r = Wait-PresentMonCapture $proc -SessionName 'MLVAttr3-test' -TimeoutSeconds 1 -KillWaitTimeoutSeconds 1\n"
+            "$r | Add-Member -NotePropertyName callSiteRejectsExit -NotePropertyValue "
+            "([bool]($r.status -ne 'done' -or (-not $r.stopCausedByJob -and [int]$r.exitCode -ne 0)))\n"
+            f"$r | ConvertTo-Json -Depth 5 | Set-Content -LiteralPath '{out}' -Encoding UTF8\n"
+        )
+        proc = self.run_probe(body)
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        log = calls.read_text(encoding="utf-8").splitlines() if calls.exists() else []
+        return json.loads(out.read_text(encoding="utf-8-sig")), log
+
+    def test_sol_repro_a_crash_between_the_timed_out_wait_and_the_kill_is_not_labelled_kill_fallback(self) -> None:
+        # sol r2 BLOCKER: the terminate helper fails (rc=1), the first wait times out, and the capture then
+        # dies on its own (access violation) BEFORE the job's Kill() executes. Kill() returns without
+        # effect, the second wait confirms the exit, and the old code called it kill_fallback / job-caused
+        # and accepted the crash code. The job must check the process is still alive before Kill().
+        result, log = self._race_probe(exits_on_wait=1)
+        self.assertEqual(log, ["terminate MLVAttr3-test"], "no Kill() may be issued at an already-exited process")
+        self.assertFalse(result["killUsed"])
+        self.assertNotEqual(result["stopMethod"], "kill_fallback")
+        self.assertEqual(result["stopMethod"], "exited_after_failed_terminate")
+        self.assertFalse(result["stopCausedByJob"])
+        self.assertEqual(result["exitCode"], -1073741819)
+        self.assertTrue(result["callSiteRejectsExit"], "the crash code must reach PRESENTMON_UNAVAILABLE")
+
+    def test_a_capture_that_dies_between_the_entry_check_and_the_terminate_is_not_sent_one(self) -> None:
+        # The terminate is also gated on a fresh liveness read immediately before it is issued: a capture
+        # that crashed in between is a self-exit, and a "successful" helper after the fact credits the
+        # job with a stop it did not cause.
+        result, log = self._race_probe(exits_on_read=2, terminate_exit_code=0)
+        self.assertEqual(log, [], "the terminate must not be issued at a process observed dead")
+        self.assertEqual(result["stopMethod"], "already_exited")
+        self.assertTrue(result["exitedBeforeStop"])
+        self.assertFalse(result["stopCausedByJob"])
+        self.assertEqual(result["exitCode"], -1073741819)
+        self.assertTrue(result["callSiteRejectsExit"])
+
+    def test_a_clean_exit_between_the_wait_and_the_kill_after_a_successful_terminate_stays_job_caused(self) -> None:
+        # The terminate WAS issued at a process observed alive and succeeded; the capture then exited on
+        # its own timing before the Kill(). That is the terminate's doing: no Kill(), job-caused, rc 0.
+        result, log = self._race_probe(exits_on_wait=1, terminate_exit_code=0, capture_exit_code=0)
+        self.assertEqual(log, ["terminate MLVAttr3-test"])
+        self.assertEqual(result["stopMethod"], "session_terminate")
+        self.assertFalse(result["killUsed"])
+        self.assertTrue(result["stopCausedByJob"])
+        self.assertFalse(result["callSiteRejectsExit"])
+
+    def test_the_stop_record_says_whether_the_process_was_alive_before_the_terminate_and_before_the_kill(self) -> None:
+        result, _ = self._probe(terminate_stops_capture=False, timeout=1)
+        self.assertTrue(result["aliveBeforeTerminate"])
+        self.assertTrue(result["aliveBeforeKill"])
+        self.assertEqual(result["stopMethod"], "kill_fallback")
+        result, _ = self._race_probe(exits_on_wait=1)
+        self.assertTrue(result["aliveBeforeTerminate"])
+        self.assertFalse(result["aliveBeforeKill"])
+
     def test_without_a_session_name_the_legacy_timeout_still_throws(self) -> None:
         proc = self.run_probe(
             "$proc = Start-Process -FilePath 'powershell.exe' -ArgumentList @('-NoProfile','-NonInteractive','-Command','Start-Sleep -Seconds 120') "
@@ -452,9 +543,17 @@ class FailurePathStopExecutedTests(_ProbeCase):
         self.assertNotIn("Stop-PresentMonCapture -Proc $presentMonProc\n", template)
 
 
+_BASE = datetime(2026, 1, 1, tzinfo=timezone.utc)
+
+
+def _iso(ms: float) -> str:
+    """UTC instant `ms` milliseconds after 2026-01-01T00:00:00Z, in the 7-digit form the app logs."""
+    return (_BASE + timedelta(milliseconds=ms)).strftime("%Y-%m-%dT%H:%M:%S.%f") + "0Z"
+
+
 def _swap_window_log(swaps: int, *, first: str = "2026-01-01T00:00:02.0000000Z", last: str = "2026-01-01T00:00:42.0000000Z") -> str:
-    # The real playback_smoke.gpu_window_swaps field set (MainWindow.cpp), window = process lifetime
-    # (WINDOW_START_UTC..WINDOW_END_UTC) so the app's swap span is 40000 ms.
+    # The real playback_smoke.gpu_window_swaps field set (MainWindow.cpp). `swaps` is the app's count of
+    # swaps INSIDE first_swap_utc..last_swap_utc (the session window), not a process-lifetime count.
     return (
         "playback_smoke.gpu_window_swaps session=1 window_active=1 telemetry_enabled=1 "
         f"swaps={swaps} swap_fps=1.0 max_gap_ms=1.0 max_gap_before_serial=1 max_gap_after_serial=2 "
@@ -463,11 +562,37 @@ def _swap_window_log(swaps: int, *, first: str = "2026-01-01T00:00:02.0000000Z",
     )
 
 
+def _span(start: float, stop: float, step: float) -> list[float]:
+    """start, start+step, ... up to and including stop (all in ms)."""
+    count = int(round((stop - start) / step)) + 1
+    return [start + i * step for i in range(count)]
+
+
+# A venue-shaped timeline (UM owner legs: PresentMon rows begin many seconds before playback and run past
+# it). All instants are UTC ms after the base; PresentMon's TimeInMs is relative to its trace origin, which
+# is only known to lie inside the bracket [capture_start, post_spawn] = [0 ms, 3000 ms] (the job's own
+# `Start-Sleep -Seconds 3` makes that bracket at least 3 s wide). The TRUE origin is VENUE_ANCHOR_MS.
+VENUE_CAPTURE_START = _iso(0)
+VENUE_POST_SPAWN = _iso(3000)
+VENUE_ANCHOR_MS = 1000.0
+VENUE_PROCESS = _result_json(start=_iso(5000), end=_iso(60000))
+VENUE_FIRST_SWAP = 20000.0
+VENUE_LAST_SWAP = 45000.0
+VENUE_SWAPS = 501  # one swap per 50 ms present, first through last inclusive
+
+
+def _venue_times(*, pre_step: float = 200.0, play_end: float = VENUE_LAST_SWAP, post: bool = True) -> list[float]:
+    utc = _span(6000.0, 19800.0, pre_step) + _span(VENUE_FIRST_SWAP, play_end, 50.0)
+    if post:
+        utc += _span(45200.0, 57800.0, 200.0)
+    return [u - VENUE_ANCHOR_MS for u in utc]
+
+
 @requires_pwsh
 class JobStopSufficiencyExecutedTests(unittest.TestCase):
-    """sol r1 BLOCKER (judge 2): after a stop THIS JOB caused, the capture must prove it covers the
-    measured playback window. The presentMonStatus block is EXECUTED verbatim from the generator against
-    the module's real report output."""
+    """After a stop THIS JOB caused, the capture must prove by POSITION that it covers the app's measured
+    swap window (UM-PRESENTMON-STOP-2). The presentMonStatus block is EXECUTED verbatim from the generator
+    against the module's real report output."""
 
     @classmethod
     def setUpClass(cls) -> None:
@@ -491,10 +616,13 @@ class JobStopSufficiencyExecutedTests(unittest.TestCase):
         path.write_text("\r\n".join(lines) + "\r\n", encoding="utf-8")
         return path
 
-    def _status(self, times: list[float], raw_log: str, *, stopped_by_job: bool, between: dict[float, str] | None = None) -> dict:
+    def _status(
+        self, times: list[float], raw_log: str, *, stopped_by_job: bool, between: dict[float, str] | None = None,
+        capture_start: str = CAPTURE_START_UTC, post_spawn: str | None = None, result_json: dict | None = None,
+    ) -> dict:
         csv_path = self._csv(times, between=between)
         result_path = self.tmp / "result.json"
-        result_path.write_text(json.dumps(_result_json()), encoding="utf-8")
+        result_path.write_text(json.dumps(result_json if result_json is not None else _result_json()), encoding="utf-8")
         log_path = self.tmp / "raw.log"
         log_path.write_text(raw_log, encoding="utf-8")
         out = self.tmp / "status.json"
@@ -502,18 +630,23 @@ class JobStopSufficiencyExecutedTests(unittest.TestCase):
         script.write_text(
             "$ErrorActionPreference = 'Stop'\n"
             f"Import-Module '{MODULE}' -Force\n"
-            f"$captureStart = [datetime]::Parse('{CAPTURE_START_UTC}', $null, [Globalization.DateTimeStyles]::RoundtripKind)\n"
+            "$rt = [Globalization.DateTimeStyles]::RoundtripKind\n"
+            f"$presentMonCaptureStartUtc = [datetime]::Parse('{capture_start}', $null, $rt)\n"
+            f"$presentMonPostSpawnUtc = [datetime]::Parse('{post_spawn or capture_start}', $null, $rt)\n"
             f"$resultJson = (Get-Content -LiteralPath '{result_path}' -Raw | ConvertFrom-Json)\n"
             f"$rawLog = Get-Content -LiteralPath '{log_path}' -Raw\n"
             "if ($null -eq $rawLog) { $rawLog = '' }\n"
             f"$presentMonStoppedByJob = ${str(stopped_by_job).lower()}\n"
             f"$displayReport = Get-AttrCudaPresentMonDisplayReport -CsvPath '{csv_path}' -ResultJson $resultJson "
-            "-EarliestCaptureStartUtc $captureStart -LatestCaptureStartUtc $captureStart\n"
+            "-EarliestCaptureStartUtc $presentMonCaptureStartUtc -LatestCaptureStartUtc $presentMonPostSpawnUtc\n"
             "$pmRows = @($displayReport.selectedChainRows)\n"
             "$pmIntervalRows = @($pmRows | Where-Object { $null -ne $_.msBetweenDisplayChange -and $_.msBetweenDisplayChange -gt 0 })\n"
             f"{self.status_source}\n"
             "[pscustomobject]@{ presentMonStatus = $presentMonStatus; presentMonStatusReason = $presentMonStatusReason; "
-            "presented = $presentMonPresentedCount; spanShortfallMs = $presentMonJobStopSpanShortfallMs; "
+            "presented = $presentMonPresentedCount; headGapMs = $presentMonJobStopHeadGapMs; "
+            "tailGapMs = $presentMonJobStopTailGapMs; anchorUncertaintyMs = $presentMonJobStopAnchorUncertaintyMs; "
+            "presentsMin = $presentMonJobStopPresentsMin; presentsMax = $presentMonJobStopPresentsMax; "
+            "inWindowSwaps = $presentMonJobStopWindowSwaps; "
             "countDeviation = $presentMonJobStopCountDeviation } | ConvertTo-Json -Depth 5 | "
             f"Set-Content -LiteralPath '{out}' -Encoding UTF8\n"
             "Write-Output 'PROBE_DONE'\n",
@@ -524,13 +657,22 @@ class JobStopSufficiencyExecutedTests(unittest.TestCase):
         self.assertIn("PROBE_DONE", proc.stdout, proc.stdout + proc.stderr)
         return json.loads(out.read_text(encoding="utf-8-sig"))
 
+    def _venue(self, times: list[float], swaps: int = VENUE_SWAPS, *, stopped_by_job: bool = True) -> dict:
+        return self._status(
+            times, _swap_window_log(swaps, first=_iso(VENUE_FIRST_SWAP), last=_iso(VENUE_LAST_SWAP)),
+            stopped_by_job=stopped_by_job, capture_start=VENUE_CAPTURE_START, post_spawn=VENUE_POST_SPAWN,
+            result_json=VENUE_PROCESS,
+        )
+
     @staticmethod
     def _rows_through(last_ms: float, *, count: int) -> list[float]:
         return [last_ms - (count - 1 - i) * 50.0 for i in range(count)]
 
-    def test_sol_repro_lost_tail_after_a_job_caused_stop_is_not_ok(self) -> None:
+    # ---- the two reviewers' repros -------------------------------------------------------------------
+
+    def test_sol_r1_repro_lost_tail_after_a_job_caused_stop_is_not_ok(self) -> None:
         # 720 rows at 50 ms through 38000 ms in a 2000-42000 ms window; the app reports 724 swaps; the
-        # tail gap is 4000 ms. The old gate: coverage 0.9945, tail gap under 5 s -> ok.
+        # tail gap is 4000 ms.
         times = self._rows_through(38000.0, count=720)
         for stopped in (False, True):
             result = self._status(times, _swap_window_log(724), stopped_by_job=stopped)
@@ -538,23 +680,93 @@ class JobStopSufficiencyExecutedTests(unittest.TestCase):
                 self.assertEqual(result["presentMonStatus"], "ok", "a capture that ended on its own keeps the old arms")
             else:
                 self.assertEqual(result["presentMonStatus"], "degraded", result)
-                self.assertIn("job-stop span", result["presentMonStatusReason"])
-                self.assertGreaterEqual(result["spanShortfallMs"], 3900.0)
+                self.assertIn("job-stop tail", result["presentMonStatusReason"])
+                self.assertGreaterEqual(result["tailGapMs"], 3900.0)
+
+    def test_fable_r2_repro_rows_before_a_late_first_swap_do_not_hide_an_empty_tail(self) -> None:
+        # fable r2 hardening 1, his exact numbers: sol's lost-tail data with first_swap moved to 00:00:07.
+        # The old length difference read -950 ms and 0.55% and said ok with the last 4 s of the swap
+        # window empty; by position the last row (38000) is 4000 ms short of last_swap (42000).
+        times = self._rows_through(38000.0, count=720)
+        log = _swap_window_log(724, first="2026-01-01T00:00:07.0000000Z")
+        result = self._status(times, log, stopped_by_job=True)
+        self.assertEqual(result["presentMonStatus"], "degraded", result)
+        self.assertIn("job-stop tail", result["presentMonStatusReason"])
+        self.assertAlmostEqual(result["tailGapMs"], 4000.0, delta=1.0)
+        self.assertEqual(self._status(times, log, stopped_by_job=False)["presentMonStatus"], "ok")
+
+    def test_sol_r2_repro_a_lost_slow_tail_inside_both_old_allowances_is_not_ok(self) -> None:
+        # sol r2 blocker 1: 781 rows at 50 ms through 41000 ms, then 13 rows at 70 ms to 41910 ms; the app
+        # reports 794 swaps over 2000..41910 ms. The kill loses the 13 tail rows. The old gate said ok
+        # (shortfall 960 ms < 1000 ms, deviation 1.6% < 2%) and the reported p99 fell from 70 ms to 50 ms.
+        full = _span(2000.0, 41000.0, 50.0) + [41000.0 + 70.0 * k for k in range(1, 14)]
+        self.assertEqual(len(full), 794)
+        log = _swap_window_log(794, first=_iso(2000), last=_iso(41910))
+        complete = self._status(full, log, stopped_by_job=True)
+        self.assertEqual(complete["presentMonStatus"], "ok", complete)
+        lost = self._status(full[:781], log, stopped_by_job=True)
+        self.assertEqual(lost["presentMonStatus"], "degraded", lost)
+        self.assertIn("job-stop tail", lost["presentMonStatusReason"])
+        self.assertAlmostEqual(lost["tailGapMs"], 910.0, delta=1.0)
+
+    def test_sol_r2_calibration_a_complete_capture_with_startup_and_shutdown_presents_stays_ok(self) -> None:
+        # sol r2 hardening / fable r2 hardening 2: 70 presents before the first swap and 64 after the last
+        # are legitimate, so a count over the process lifetime (635) against the in-window swaps (501) read
+        # 27% apart and degraded a COMPLETE capture. The count is now taken inside the swap window.
+        result = self._venue(_venue_times())
+        self.assertEqual(result["presented"], 635, "the lifetime count is still reported")
+        self.assertEqual(result["presentMonStatus"], "ok", result)
+        self.assertIsNone(result["presentMonStatusReason"])
+        self.assertEqual(result["inWindowSwaps"], VENUE_SWAPS)
+        self.assertGreaterEqual(result["presentsMax"], VENUE_SWAPS)
+        self.assertEqual(result["countDeviation"], 0.0)
+        self.assertAlmostEqual(result["anchorUncertaintyMs"], 3000.0, delta=1.0)
+
+    def test_a_venue_shaped_lost_tail_is_not_ok_even_with_a_3_second_wide_anchor_bracket(self) -> None:
+        # Startup presents (47 of them) cancel the lost 2.5 s of tail in the old length arm: shortfall is
+        # negative, the lifetime count 498 is within 1% of 501 swaps, the temporal arm sees 4000 ms.
+        times = _venue_times(pre_step=300.0, play_end=42500.0, post=False)
+        log = _swap_window_log(VENUE_SWAPS, first=_iso(VENUE_FIRST_SWAP), last=_iso(VENUE_LAST_SWAP))
+        short_process = _result_json(start=_iso(5000), end=_iso(45500))
+        gated = self._status(
+            times, log, stopped_by_job=True, capture_start=VENUE_CAPTURE_START, post_spawn=VENUE_POST_SPAWN,
+            result_json=short_process,
+        )
+        self.assertEqual(gated["presentMonStatus"], "degraded", gated)
+        self.assertIn("job-stop tail", gated["presentMonStatusReason"])
+        self.assertGreaterEqual(gated["tailGapMs"], 2500.0)
+        own = self._status(
+            times, log, stopped_by_job=False, capture_start=VENUE_CAPTURE_START, post_spawn=VENUE_POST_SPAWN,
+            result_json=short_process,
+        )
+        self.assertEqual(own["presentMonStatus"], "ok", "a capture that ended on its own keeps the old arms")
+
+    # ---- the rest of the arms ------------------------------------------------------------------------
 
     def test_a_job_caused_stop_that_covers_the_whole_window_stays_ok(self) -> None:
         times = self._rows_through(42000.0, count=801)
         result = self._status(times, _swap_window_log(801), stopped_by_job=True)
         self.assertEqual(result["presentMonStatus"], "ok", result)
         self.assertIsNone(result["presentMonStatusReason"])
-        self.assertLessEqual(result["spanShortfallMs"], 1.0)
+        self.assertLessEqual(result["tailGapMs"], 1.0)
         self.assertEqual(result["countDeviation"], 0.0)
 
-    def test_a_job_caused_stop_whose_present_count_misses_the_app_swap_count_is_not_ok(self) -> None:
-        times = self._rows_through(42000.0, count=801)
-        result = self._status(times, _swap_window_log(850), stopped_by_job=True)
+    def test_a_capture_that_starts_after_the_first_swap_is_not_ok(self) -> None:
+        # Rows begin 2000 ms after the first swap: nothing at or before first_swap + the head bound.
+        times = _span(4000.0, 42000.0, 50.0)
+        result = self._status(times, _swap_window_log(len(times)), stopped_by_job=True)
         self.assertEqual(result["presentMonStatus"], "degraded", result)
-        self.assertIn("job-stop count", result["presentMonStatusReason"])
-        self.assertNotIn("job-stop span", result["presentMonStatusReason"])
+        self.assertIn("job-stop head", result["presentMonStatusReason"])
+        self.assertGreaterEqual(result["headGapMs"], 1900.0)
+
+    def test_a_job_caused_stop_whose_in_window_present_count_misses_the_app_swap_count_is_not_ok(self) -> None:
+        for swaps in (700, 300):  # fewer presents than swaps (lost rows), and more (a count that disagrees)
+            result = self._venue(_venue_times(), swaps)
+            self.assertEqual(result["presentMonStatus"], "degraded", (swaps, result))
+            self.assertIn("job-stop count", result["presentMonStatusReason"])
+            self.assertNotIn("job-stop tail", result["presentMonStatusReason"])
+            self.assertNotIn("job-stop head", result["presentMonStatusReason"])
+            self.assertGreater(result["countDeviation"], 0.02)
 
     def test_a_job_caused_stop_without_swap_window_timestamps_cannot_prove_coverage(self) -> None:
         times = self._rows_through(42000.0, count=801)
@@ -563,6 +775,20 @@ class JobStopSufficiencyExecutedTests(unittest.TestCase):
         self.assertEqual(result["presentMonStatus"], "degraded", result)
         self.assertIn("cannot be proven", result["presentMonStatusReason"])
 
+    def test_an_inverted_capture_start_bracket_cannot_anchor_the_rows_so_the_stop_is_not_ok(self) -> None:
+        # Item 3: when the conversion cannot be trusted the safe answer is degraded, never ok.
+        result = self._status(
+            _venue_times(), _swap_window_log(VENUE_SWAPS, first=_iso(VENUE_FIRST_SWAP), last=_iso(VENUE_LAST_SWAP)),
+            stopped_by_job=True, capture_start=_iso(3000), post_spawn=_iso(0), result_json=VENUE_PROCESS,
+        )
+        self.assertEqual(result["presentMonStatus"], "degraded", result)
+        self.assertIn("job-stop anchor", result["presentMonStatusReason"])
+
+    def test_the_edge_bound_is_small_and_the_count_bound_is_two_percent(self) -> None:
+        source = _generator_text()
+        self.assertIn("$presentMonJobStopMaxEdgeGapMs = 250.0", source)
+        self.assertIn("$presentMonJobStopMaxCountDeviation = 0.02", source)
+
     def test_sol_repro_a_complete_final_row_kept_by_the_repair_keeps_the_report_whole(self) -> None:
         # judge 3 shape end to end: 720 complete 50 ms rows through 38000 ms and a complete final row at
         # 42000 ms carrying a 4000 ms interval. Kept (not dropped), the capture covers the window.
@@ -570,7 +796,7 @@ class JobStopSufficiencyExecutedTests(unittest.TestCase):
         result = self._status(times, _swap_window_log(721), stopped_by_job=True, between={42000.0: "4000"})
         self.assertEqual(result["presented"], 721)
         self.assertEqual(result["presentMonStatus"], "ok", result)
-        self.assertLessEqual(result["spanShortfallMs"], 100.0)
+        self.assertLessEqual(result["tailGapMs"], 100.0)
 
 
 if __name__ == "__main__":
