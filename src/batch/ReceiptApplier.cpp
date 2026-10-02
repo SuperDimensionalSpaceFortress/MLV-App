@@ -12,6 +12,7 @@
 #include <QtGlobal>
 
 #include <cmath>
+#include <cstring>
 
 namespace
 {
@@ -564,6 +565,65 @@ bool ReceiptApplier::processedThumbnailAtExposure(mlvObject_t *mlvObject,
     return rendered != 0;
 }
 
+bool ReceiptApplier::processedThumbnailAtBalance(mlvObject_t *mlvObject,
+                                                 int frameIndex,
+                                                 int downscaleFactor,
+                                                 int cpuCores,
+                                                 double exposureStops,
+                                                 int temperature,
+                                                 int tint,
+                                                 bool isolated,
+                                                 unsigned char *outBuffer)
+{
+    if( !mlvObject || !mlvObject->processing || !outBuffer || downscaleFactor <= 0 ) return false;
+
+    processingObject_t *clone = processingCloneForAnalysis( mlvObject->processing );
+    if( !clone ) return false;
+
+    // Only the two things the analysis varies: the planned exposure in stops (as processedThumbnailAtExposure()
+    // and every other Look Assist analysis render take it -- the patch search, the daylight corroboration,
+    // so a picture rendered here is comparable with them) and the white balance under test. Everything else
+    // is the live processing state, exactly as for those renders.
+    mlv_processed_thumbnail_settings_t settings;
+    memset( &settings, 0, sizeof( settings ) );
+    settings.flags = MLV_PROCESSED_THUMBNAIL_APPLY_WHITE_BALANCE
+                   | MLV_PROCESSED_THUMBNAIL_APPLY_EXPOSURE;
+    settings.white_balance_kelvin = temperature;
+    settings.white_balance_tint = tint / 10.0;
+    settings.exposure_stops = exposureStops;
+
+    const int rendered = isolated
+        ? get_area_average_downscale_thumnail_with_processing_cachefree(
+              mlvObject, frameIndex, downscaleFactor, qMax( 1, cpuCores ), clone, &settings, outBuffer )
+        : get_area_average_downscale_thumnail_with_processing(
+              mlvObject, frameIndex, downscaleFactor, qMax( 1, cpuCores ), clone, &settings, outBuffer );
+    processingFreeClone( clone );
+    return rendered != 0;
+}
+
+LookAssistRenderBalanceFn ReceiptApplier::lookAssistBalanceRenderer(mlvObject_t *mlvObject,
+                                                              int frameIndex,
+                                                              int downscaleFactor,
+                                                              int thumbWidth,
+                                                              int thumbHeight,
+                                                              int cpuCores,
+                                                              bool isolated)
+{
+    return [=]( double exposureStops, int temperature, int tint, LookAssistRenderedPicture *out ) -> bool
+    {
+        if( !out || thumbWidth <= 0 || thumbHeight <= 0 ) return false;
+        out->rgb.assign( static_cast<size_t>( thumbWidth ) * static_cast<size_t>( thumbHeight ) * 3u, 0 );
+        if( !processedThumbnailAtBalance( mlvObject, frameIndex, downscaleFactor, cpuCores, exposureStops,
+                                          temperature, tint, isolated, out->rgb.data() ) )
+            return false;
+        out->width = thumbWidth;
+        out->height = thumbHeight;
+        out->downscaleFactor = downscaleFactor;
+        out->stats = analyzeLookAssistThumbnail( out->rgb.data(), thumbWidth, thumbHeight );
+        return out->stats.median > 0.0;
+    };
+}
+
 bool ReceiptApplier::applyHeadlessLookAssist(ReceiptSettings *receipt,
                                              mlvObject_t *mlvObject,
                                              processingObject_t *processingObject,
@@ -775,6 +835,12 @@ bool ReceiptApplier::applyHeadlessLookAssist(ReceiptSettings *receipt,
     wbRequest.solvedOnProcessedPicture = useProcessedColorStats;
     wbRequest.baseTemperature = baseTemperature;
     wbRequest.baseTint = baseTint;
+    // Corroborated daylight without a trusted patch is balanced from the rendered picture (same shared
+    // refinement as the GUI; the render is the same cache-backed one, single-threaded here).
+    wbRequest.rawWidth = raw_w;
+    wbRequest.rawHeight = raw_h;
+    wbRequest.renderBalance = lookAssistBalanceRenderer( mlvObject, frameIndex, colorDownscaleFactor,
+                                                   colorWidth, colorHeight, 1, false );
     // [Jun-9 WB RESTORE] live solver (was findMlvWhiteBalanceIsolated); same signature.
     // Batch CLI is single-threaded so the live solver is safe here.
     const LookAssistWhiteBalanceResolution wb = resolveLookAssistWhiteBalance(
@@ -809,7 +875,7 @@ bool ReceiptApplier::applyHeadlessLookAssist(ReceiptSettings *receipt,
     resetMlvCachedFrame( mlvObject );
 
     BatchLogger::out( QStringLiteral(
-        "[BATCH] LOOK_ASSIST applied frame=%1 scene=%2 median=%3 p95=%4 p99=%5 exposure=%6 temperature=%7 tint=%8 autoWbValid=%9 autoWbSource=%10 autoWbDecision=%11 autoWbDamping=%12 autoWbCandidateTemp=%13 autoWbCandidateTint=%14 chromaSmoothAuto=%15 rawBlack=%16 rawWhite=%17 p05=%18 clipHigh=%19 balanceRGB=%20/%21/%22 balanceSamples=%23 patchValid=%24 patchLuma=%25 patchChroma=%26 patchBlueAmber=%27 patchGreenAxis=%28\n" )
+        "[BATCH] LOOK_ASSIST applied frame=%1 scene=%2 median=%3 p95=%4 p99=%5 exposure=%6 temperature=%7 tint=%8 autoWbValid=%9 autoWbSource=%10 autoWbDecision=%11 autoWbDamping=%12 autoWbCandidateTemp=%13 autoWbCandidateTint=%14 chromaSmoothAuto=%15 rawBlack=%16 rawWhite=%17 p05=%18 clipHigh=%19 balanceRGB=%20/%21/%22 balanceSamples=%23 patchValid=%24 patchLuma=%25 patchChroma=%26 patchBlueAmber=%27 patchGreenAxis=%28 refineRenders=%29 refineStartScore=%30 refineScore=%31 refineBlueAmber=%32 refineGreen=%33\n" )
         .arg( frameIndex )
         .arg( lookAssistSceneName( scene ) )
         .arg( stats.median, 0, 'f', 2 )
@@ -837,7 +903,12 @@ bool ReceiptApplier::applyHeadlessLookAssist(ReceiptSettings *receipt,
         .arg( autoWbPatch.luma, 0, 'f', 1 )
         .arg( autoWbPatch.chroma, 0, 'f', 1 )
         .arg( autoWbPatch.blueAmberAxis, 0, 'f', 1 )
-        .arg( autoWbPatch.greenAxis, 0, 'f', 1 ) );
+        .arg( autoWbPatch.greenAxis, 0, 'f', 1 )
+        .arg( wb.refineRenders )
+        .arg( wb.refineStartScore, 0, 'f', 2 )
+        .arg( wb.refineScore, 0, 'f', 2 )
+        .arg( wb.refineBlueAmber, 0, 'f', 1 )
+        .arg( wb.refineGreen, 0, 'f', 1 ) );
 
     return true;
 }

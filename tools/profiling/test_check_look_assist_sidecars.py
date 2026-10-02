@@ -26,9 +26,21 @@ def sidecar(**overrides):
 class CheckLookAssistSidecars(unittest.TestCase):
     def test_the_fixed_daylight_decision_passes(self):
         self.assertEqual([], chk.check([("frame-00.json", sidecar())]))
-        self.assertEqual([], chk.check([("frame-00.json", sidecar(look_assist_wb_source="as-shot-prior",
-                                                                  look_assist_temperature=5270,
-                                                                  look_assist_tint=-27))]))
+        for source, decision in (("rendered-neutral-patch", "accepted"), ("processed-neutral-patch", "accepted-damped")):
+            self.assertEqual([], chk.check([("frame-00.json", sidecar(look_assist_wb_source=source,
+                                                                      look_assist_wb_decision=decision,
+                                                                      look_assist_temperature=8950,
+                                                                      look_assist_tint=-35))]), source)
+
+    def test_r2_as_shot_prior_at_the_base_balance_fails(self):
+        # PR #221 r2: scene=shade, source=as-shot-prior, 6000 K / 0 (the app default): deck chroma 18.9 in the
+        # real app against master's 13.5. The label must not launder the base balance.
+        failures = chk.check([("frame-00.json", sidecar(look_assist_wb_source="as-shot-prior",
+                                                        look_assist_wb_decision="prior",
+                                                        look_assist_temperature=6000,
+                                                        look_assist_tint=0))])
+        self.assertTrue(any("look_assist_wb_source" in f for f in failures))
+        self.assertTrue(any("look_assist_wb_decision" in f for f in failures))
 
     def test_r1_regression_right_scene_but_no_balance_solved_fails(self):
         # r1: scene=shade, source=none, base 6000 K / tint 0 stands, the deck goes blue.
@@ -52,8 +64,9 @@ class CheckLookAssistSidecars(unittest.TestCase):
         self.assertTrue(any("look_assist_wb_decision" in f for f in rejected))
         for decision in ("none", "candidate", "rejected-safety-fallback", None):
             self.assertTrue(chk.check([("f", sidecar(look_assist_wb_decision=decision))]), decision)
-        for decision in ("accepted", "accepted-damped", "prior"):
+        for decision in ("accepted", "accepted-damped"):
             self.assertEqual([], chk.check([("f", sidecar(look_assist_wb_decision=decision))]), decision)
+        self.assertTrue(chk.check([("f", sidecar(look_assist_wb_decision="prior"))]))
 
     def test_look_assist_off_and_too_few_frames_fail(self):
         self.assertTrue(chk.check([("f", sidecar(look_assist_enabled=False))]))

@@ -4,15 +4,16 @@
 Reads the frame-NN.json sidecars a real-app contact-sheet capture writes (the app's contact-sheet-dir option) and asserts
 what the classifier fix has to deliver *in the real app*, on the path the user sees:
 
-  * settled == true and look_assist_wb_decision is an ACCEPTED one ("accepted", "accepted-damped" or
-    "prior"): a sidecar captured before Look Assist settled, or after it rejected / fell back, says
-    nothing about the shipped picture (a rejected-unstable decision used to pass this check), AND
+  * settled == true and look_assist_wb_decision is an ACCEPTED one ("accepted" or "accepted-damped"): a
+    sidecar captured before Look Assist settled, or after it rejected / fell back, says nothing about the
+    shipped picture (a rejected-unstable decision used to pass this check), AND
 
   * look_assist_scene == "shade"  -- the daylight clip is not read as night, AND
   * look_assist_wb_source is "processed-neutral-patch" (white balance solved from a neutral patch of
-    the RENDERED picture) or "as-shot-prior" (the clip's recorded balance, when no patch can be
-    trusted) -- never "none". LOOK-ASSIST-SCENE-CLASSIFY-1 r1 had the right scene and source=none:
-    no balance was solved at all and the picture went bluer (deck chroma 11.5 -> 22.4).
+    the RENDERED picture) or "rendered-neutral-patch" (the same patch solve, on a picture re-rendered at
+    a white balance that has neutral samples) -- never "none" and never "as-shot-prior". LOOK-ASSIST-SCENE-CLASSIFY-1 r1 had the right scene and source=none: no balance
+    was solved at all and the picture went bluer (deck chroma 11.5 -> 22.4); r2 labelled the same base
+    balance "as-shot-prior" (deck chroma 18.9 in the real app against master's 13.5).
 
 The decision half needs no numpy/Pillow, so it runs in the repo's pinned CI environment. The PICTURE
 half is opt-in because it needs pixels: `--deck-chroma-max X` measures the CIELAB chroma of the
@@ -29,8 +30,12 @@ import json
 import os
 import sys
 
-ALLOWED_WB_SOURCES = ("processed-neutral-patch", "as-shot-prior")
-ACCEPTED_WB_DECISIONS = ("accepted", "accepted-damped", "prior")
+# "as-shot-prior" / "prior" are deliberately NOT accepted for the tracked daylight fixtures: the clip records
+# no white balance beyond the app default (6000 K / tint 0), which is exactly the regression picture
+# (deck chroma 18.9 in the real app) under a different label. A balance has to have been solved from, or
+# refined on, the rendered picture.
+ALLOWED_WB_SOURCES = ("processed-neutral-patch", "rendered-neutral-patch")
+ACCEPTED_WB_DECISIONS = ("accepted", "accepted-damped")
 DAYLIGHT_TEMPERATURE = (4800, 10000)   # lookAssistWhiteBalanceBounds() for a daylight clip
 DAYLIGHT_TINT = (-35, 10)
 

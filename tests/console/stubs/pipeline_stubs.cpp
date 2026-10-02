@@ -214,6 +214,14 @@ int get_area_average_downscale_thumnail_with_processing(mlvObject_t * video, int
     return 1;
 }
 
+int get_area_average_downscale_thumnail_with_processing_cachefree(mlvObject_t * video, int, int downscale_factor, int,
+                                                                  processingObject_t *, const mlv_processed_thumbnail_settings_t *,
+                                                                  unsigned char * out_buffer)
+{
+    fill_stub_thumbnail(video, downscale_factor, out_buffer);
+    return 1;
+}
+
 void findMlvWhiteBalance(mlvObject_t *, uint64_t, int, int, int * wbTemp, int * wbTint, int)
 {
     if (wbTemp) {

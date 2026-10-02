@@ -1337,6 +1337,37 @@ static void logInteractionEvent( const QString &event,
 // module (src/batch/LookAssistAnalysis.*), also used by the headless ReceiptApplier.
 using namespace lookassist;
 
+// One trace line for the shared render-based daylight refinement (UI thread; sync logs it directly, async
+// logs it from the queued continuation). Silent when the refinement never ran.
+static void logLookAssistDaylightRefine( const LookAssistWhiteBalanceResolution &wb,
+                                         const QString &path,
+                                         int frame )
+{
+    if( !wb.refineAttempted ) return;
+    logInteractionEvent(
+        QStringLiteral("look_assist.daylight_refine"),
+        QStringLiteral("path=%1 refined=%2 patch_acquired=%3 renders=%4 start_temp=%5 start_tint=%6 final_temp=%7 final_tint=%8 start_score=%9 score=%10 blue_amber_axis=%11 green_axis=%12 patch_chroma_found=%13 patch_chroma_at_result=%14 candidate_temp=%15 candidate_tint=%16 preview_mode=%18 preview_scale=%19 frame=%17")
+            .arg( path )
+            .arg( bool01( wb.refined ) )
+            .arg( bool01( wb.refinePatchAcquired ) )
+            .arg( wb.refineRenders )
+            .arg( wb.refineStartTemperature )
+            .arg( wb.refineStartTint )
+            .arg( wb.temperature )
+            .arg( wb.tint )
+            .arg( wb.refineStartScore, 0, 'f', 2 )
+            .arg( wb.refineScore, 0, 'f', 2 )
+            .arg( wb.refineBlueAmber, 0, 'f', 2 )
+            .arg( wb.refineGreen, 0, 'f', 2 )
+            .arg( wb.refineStartPatchChroma, 0, 'f', 2 )
+            .arg( wb.refineFinalPatchChroma, 0, 'f', 2 )
+            .arg( wb.candidateTemperature )
+            .arg( wb.candidateTint )
+            .arg( frame )
+            .arg( processingPlaybackPreviewModeEnabled() )
+            .arg( processingPlaybackPreviewScaleFactor() ) );
+}
+
 static QString lookAssistColorCastWarning(
         bool postColorStatsValid,
         const LookAssistStats &postColorStats,
@@ -15655,7 +15686,16 @@ void MainWindow::applyLookAssistToReceipt( ReceiptSettings *receipt,
     // worker does pure-math analysis + one findMlvWhiteBalance render (safe
     // concurrent read - same access pattern as the processed8 prefetch worker).
     // MLVAPP_LOOK_ASSIST_SYNC=1 bypasses the async path for A/B measurement.
-    if( !s_syncMode )
+    //
+    // A corroborated daylight scene takes the synchronous path below even in async mode: its balance may
+    // come from the render-based refinement (resolveLookAssistWhiteBalance -> refineLookAssistDaylightWhiteBalance),
+    // which renders the LIVE picture, and a detached worker cannot: its isolated render is a different
+    // picture (measured on the tracked fixtures: the same 6000 K / tint 0 / 1.6 stops scores 25 on the
+    // worker and 62 live) and a slower one (8 s settle window exceeded on the large clip). Running the one
+    // consumer path guarantees sync and async land on the same white balance, by construction.
+    const bool daylightNeedsLivePicture = kLookAssistRefineDaylightWithoutPatch
+                                       && lookAssistIsDaylightScene( stats, scene );
+    if( !s_syncMode && !daylightNeedsLivePicture )
     {
         // Capture slider bounds (UI-thread-only values) before dispatch.
         const int tempMin  = ui->horizontalSliderTemperature->minimum();
@@ -15819,6 +15859,8 @@ void MainWindow::applyLookAssistToReceipt( ReceiptSettings *receipt,
             wbRequest.maxTemperature = tempMax;
             wbRequest.minTint = tintMin;
             wbRequest.maxTint = tintMax;
+            // No renderer here on purpose: a corroborated daylight scene never reaches the worker (it takes
+            // the synchronous path, see daylightNeedsLivePicture), so nothing in here renders a picture.
             const LookAssistWhiteBalanceResolution wb = resolveLookAssistWhiteBalance(
                 wbRequest,
                 [&]( int rawX, int rawY, int *solvedTemperature, int *solvedTint )
@@ -15884,9 +15926,11 @@ void MainWindow::applyLookAssistToReceipt( ReceiptSettings *receipt,
             // the sync path applies temperature / tint deltas to the processing object between renders,
             // which a worker thread cannot do while the UI thread renders concurrently. It is skipped
             // here; the preset (exposure + WB) is applied exactly as resolved. The sync path skips the
-            // same loop for a daylight scene (see refinePostBalance), so for a daylight clip all three
-            // paths (async, sync, headless) apply the SAME white balance; only a night floor-lifted
-            // clip is refined by the sync path (by at most +-500 K / the night tint cap).
+            // same loop for a daylight scene (see refinePostBalance): a daylight clip is balanced inside
+            // resolveLookAssistWhiteBalance (patch solve or the shared render-based refinement, rendered
+            // here through the isolated renderer), so all three paths (async, sync, headless) apply the
+            // SAME white balance from the same decision; only a night floor-lifted clip is refined by
+            // the sync path (by at most +-500 K / the night tint cap).
             r.postColorStatsValid   = false;
             r.postTemperatureDelta  = 0;
             r.postTintDelta         = 0;
@@ -16339,6 +16383,13 @@ void MainWindow::applyLookAssistToReceipt( ReceiptSettings *receipt,
     wbRequest.maxTemperature = ui->horizontalSliderTemperature->maximum();
     wbRequest.minTint = ui->horizontalSliderTint->minimum();
     wbRequest.maxTint = ui->horizontalSliderTint->maximum();
+    // Corroborated daylight without a trusted patch is balanced from the rendered picture: the shared
+    // refinement, asked about the picture through the same renderer the async path and headless use.
+    wbRequest.rawWidth = raw_w;
+    wbRequest.rawHeight = raw_h;
+    wbRequest.renderBalance = ReceiptApplier::lookAssistBalanceRenderer(
+        m_pMlvObject, analysisFrame, colorDownscaleFactor, colorWidth, colorHeight,
+        qMax( 1, mlvappEffectiveWorkerThreadCount() ), false );
     const LookAssistWhiteBalanceResolution wb = resolveLookAssistWhiteBalance(
         wbRequest,
         [&]( int rawX, int rawY, int *solvedTemperature, int *solvedTint )
@@ -16361,6 +16412,7 @@ void MainWindow::applyLookAssistToReceipt( ReceiptSettings *receipt,
             }
         },
         &preset );
+    logLookAssistDaylightRefine( wb, QStringLiteral("sync"), analysisFrame );
     const bool autoWhiteBalanceValid = wb.autoValid;
     const QString autoWhiteBalanceSource = wb.source;
     const QString autoWhiteBalanceDecision = wb.decision;
@@ -16430,27 +16482,17 @@ void MainWindow::applyLookAssistToReceipt( ReceiptSettings *receipt,
             return postColorStats.median > 0.0
                 && postColorStats.balanceSamples >= minColorBalanceSamples;
         };
+        // The shared score (LookAssistAnalysis): the one keep-or-revert measure for every refinement.
         auto postBalanceScore = []( const LookAssistStats &candidate ) -> double
         {
-            const double greenAxis =
-                candidate.balanceG
-                - ( ( candidate.balanceR + candidate.balanceB ) * 0.5 );
-            const double blueAmberAxis = candidate.balanceB - candidate.balanceR;
-            const double visibleGreenAxis =
-                candidate.visibleMeanG
-                - ( ( candidate.visibleMeanR + candidate.visibleMeanB ) * 0.5 );
-            return fabs( greenAxis )
-                + ( fabs( blueAmberAxis ) * 0.5 )
-                + ( fabs( visibleGreenAxis ) * 0.7 )
-                + ( candidate.greenArtifactRatio * 700.0 )
-                + ( qMax( 0.0, candidate.greenArtifactMeanAxis - 22.0 ) * 0.7 );
+            return lookAssistBalanceScore( candidate );
         };
 
         bool adjustedPostBalance = false;
-        // A daylight scene is NOT refined here: its balance was solved from the picture rendered at
-        // the exposure about to be applied and is bounded by the daylight window, and the async and
-        // headless paths apply it exactly as resolved. Refining only this path (up to +-500 K, kept
-        // or reverted by a score) made the three paths disagree. Night keeps the refinement.
+        // A daylight scene is NOT refined by this night-path loop: resolveLookAssistWhiteBalance already
+        // balanced it from the picture (patch solve, or -- with no trusted patch -- the shared
+        // render-based refinement), identically for sync, async and headless. Refining only this path
+        // (up to +-500 K, kept or reverted by a score) would make the three paths disagree.
         const bool daylightScene = lookAssistIsDaylightScene( stats, scene );
         const bool refinePostBalance =
             !daylightScene && ( !autoWhiteBalanceValid || useProcessedColorStats );
@@ -16702,6 +16744,68 @@ void MainWindow::applyLookAssistToReceipt( ReceiptSettings *receipt,
         }
         postTemperatureDelta = preset.temperatureDelta - initialTemperatureDelta;
         postTintDelta = preset.tintDelta - initialTintDelta;
+    }
+
+    // [PICTURE-DUMP] env-gated, read-only evidence (MLVAPP_LOOK_ASSIST_PICTURE_DUMP=<dir>): the picture
+    // the app itself renders (live processing, analysis thumbnail) at the look just applied, so a
+    // reviewer can measure the REAL app's result in a state the headless fixture cannot reproduce.
+    // Writes one PNG and never touches the receipt, the sliders or the look.
+    if( canAnalyzeProcessedColor && qEnvironmentVariableIsSet( "MLVAPP_LOOK_ASSIST_PICTURE_DUMP" ) )
+    {
+        QByteArray dumpThumbnail;
+        dumpThumbnail.resize( colorWidth * colorHeight * 3 );
+        get_area_average_downscale_thumnail( m_pMlvObject,
+                                             analysisFrame,
+                                             colorDownscaleFactor,
+                                             qMax( 1, mlvappEffectiveWorkerThreadCount() ),
+                                             reinterpret_cast<unsigned char *>( dumpThumbnail.data() ) );
+        const QString dumpDir = qEnvironmentVariable( "MLVAPP_LOOK_ASSIST_PICTURE_DUMP" );
+        QDir().mkpath( dumpDir );
+        const QImage dumpImage( reinterpret_cast<const uchar *>( dumpThumbnail.constData() ),
+                                colorWidth, colorHeight, colorWidth * 3, QImage::Format_RGB888 );
+        dumpImage.save( QDir( dumpDir ).filePath( QStringLiteral("look-assist-final-frame%1.png").arg( analysisFrame ) ) );
+
+        // Optional: ALSO render explicit looks ("label:exp,contrast,pivot,shadows,highlights,vibrance,temp,tint;...")
+        // on a private clone with the GUI slider mapping, so another build's logged result (e.g. master's) can
+        // be rendered by this app's own pipeline in this very state. Never touches the live look.
+        const QStringList dumpStates = qEnvironmentVariable( "MLVAPP_LOOK_ASSIST_PICTURE_DUMP_STATES" )
+                                           .split( QLatin1Char(';'), Qt::SkipEmptyParts );
+        for( const QString &state : dumpStates )
+        {
+            const QString label = state.section( QLatin1Char(':'), 0, 0 );
+            const QStringList v = state.section( QLatin1Char(':'), 1 ).split( QLatin1Char(','), Qt::SkipEmptyParts );
+            if( label.isEmpty() || v.size() != 8 ) continue;
+            processingObject_t *dumpClone = processingCloneForAnalysis( m_pMlvObject->processing );
+            if( !dumpClone ) continue;
+            mlv_processed_thumbnail_settings_t dumpSettings;
+            memset( &dumpSettings, 0, sizeof( dumpSettings ) );
+            dumpSettings.flags = MLV_PROCESSED_THUMBNAIL_APPLY_WHITE_BALANCE
+                               | MLV_PROCESSED_THUMBNAIL_APPLY_EXPOSURE
+                               | MLV_PROCESSED_THUMBNAIL_APPLY_SIMPLE_CONTRAST
+                               | MLV_PROCESSED_THUMBNAIL_APPLY_PIVOT
+                               | MLV_PROCESSED_THUMBNAIL_APPLY_SHADOWS
+                               | MLV_PROCESSED_THUMBNAIL_APPLY_HIGHLIGHTS
+                               | MLV_PROCESSED_THUMBNAIL_APPLY_VIBRANCE;
+            dumpSettings.exposure_stops = v[0].toInt() / 100.0 + 1.2;
+            dumpSettings.simple_contrast = v[1].toInt() / 100.0;
+            dumpSettings.pivot = v[2].toInt() / 100.0;
+            dumpSettings.shadows = v[3].toInt() * 1.5 / 100.0;
+            dumpSettings.highlights = v[4].toInt() * 1.5 / 100.0;
+            dumpSettings.vibrance = pow( ( v[5].toInt() + 100 ) / 200.0 * 2.0, log( 3.6 ) / log( 2.0 ) );
+            dumpSettings.white_balance_kelvin = v[6].toInt();
+            dumpSettings.white_balance_tint = v[7].toInt() / 10.0;
+            QByteArray stateThumbnail;
+            stateThumbnail.resize( colorWidth * colorHeight * 3 );
+            const int stateRendered = get_area_average_downscale_thumnail_with_processing(
+                m_pMlvObject, analysisFrame, colorDownscaleFactor,
+                qMax( 1, mlvappEffectiveWorkerThreadCount() ), dumpClone, &dumpSettings,
+                reinterpret_cast<unsigned char *>( stateThumbnail.data() ) );
+            processingFreeClone( dumpClone );
+            if( !stateRendered ) continue;
+            const QImage stateImage( reinterpret_cast<const uchar *>( stateThumbnail.constData() ),
+                                     colorWidth, colorHeight, colorWidth * 3, QImage::Format_RGB888 );
+            stateImage.save( QDir( dumpDir ).filePath( QStringLiteral("state-%1.png").arg( label ) ) );
+        }
     }
 
     m_lastLookAssistDiagnosticsValid = true;

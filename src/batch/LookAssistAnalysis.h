@@ -4,6 +4,7 @@
 #include <QString>
 
 #include <functional>
+#include <vector>
 
 /* Look Assist scene analysis, classification and preset math -- the ONE implementation.
  *
@@ -138,7 +139,7 @@ LookAssistScene resolveLookAssistScene( LookAssistStats *stats, const LookAssist
 void lookAssistSetAsShotWhiteBalance( LookAssistStats *stats, bool valid, int temperature, int tint );
 
 /* Colour-temperature / tint window a solved white balance is clamped into (clamped, never rejected).
- * Daylight scenes (by the recorded exposure) cannot be tungsten: below 4800 K or past +10 tint a
+ * Daylight scenes (recorded exposure AND the rendered picture agree) cannot be tungsten: below 4800 K or past +10 tint a
  * "neutral patch" is not neutral. The warm end is the slider's own 10000 K: open shade under a blue
  * sky is legitimately 7500-10000 K, and the tracked daylight fixture's neutral deck solves at
  * 9990 K / tint -35 (a 7500 K ceiling left the deck at Lab chroma 17 against 4.8 at the solution).
@@ -161,14 +162,17 @@ void lookAssistClampWhiteBalance( const LookAssistWhiteBalanceBounds &bounds, in
 bool lookAssistDaylightSolveIsUndamped( const LookAssistStats &stats, LookAssistScene scene, bool solvedOnProcessedPicture );
 
 /* The as-shot white balance as the fallback when no neutral patch can be trusted (none found, or the
- * solution was rejected). Daylight-by-metadata scenes only; clamped into the daylight bounds. */
+ * solution was rejected). Corroborated daylight scenes only; clamped into the daylight bounds. It is only the
+ * START of the render-based refinement (see LookAssistWhiteBalanceRequest::renderLook) when a renderer is
+ * supplied. */
 bool lookAssistAsShotPrior( const LookAssistStats &stats, LookAssistScene scene, int *temperature, int *tint );
 
 /* The RAW thumbnail is a flat floor (dual-ISO/raw preview lift): unusable for colour, any scene. */
 bool lookAssistIsFlatFloorRawThumbnail( const LookAssistStats &stats );
 /* Flat floor AND night: the night-only exposure/shadow rescue. Stays night-only. */
 bool lookAssistIsFloorLiftedNightThumbnail( LookAssistScene scene, const LookAssistStats &stats );
-/* Colour must come from the rendered (processed) picture. Scene-independent by design. */
+/* Colour must come from the rendered (processed) picture: the RAW thumbnail is a flat floor AND the scene
+ * is night (the rescue) or a corroborated daylight picture; every other scene keeps the raw-thumbnail balance. */
 bool lookAssistShouldAnalyzeProcessedColor( LookAssistScene scene, const LookAssistStats &stats );
 bool lookAssistIsFlatNoiseFloorThumbnail( LookAssistScene scene, const LookAssistStats &stats );
 int lookAssistExposureForTarget( double sourceValue, double targetValue, int fallback );
@@ -209,7 +213,33 @@ static const int kLookAssistTemperatureMax = 10000;
 static const int kLookAssistTintMin = -100;
 static const int kLookAssistTintMax = 100;
 
-/* ---- The ONE white-balance decision: solve -> stability -> damping -> as-shot prior -> clamp. ----
+/* How far the rendered picture is from neutral: the post-balance score the sync path has always used
+ * to keep or revert a refinement step (green axis, half the blue-amber axis, the visible-green axis,
+ * green-artifact area). Lower is better. ONE definition for every consumer. */
+double lookAssistBalanceScore( const LookAssistStats &rendered );
+
+/* A rendered picture: the 8-bit RGB thumbnail of the planned look at a white balance, and its statistics.
+ * downscaleFactor is the thumbnail's factor against the RAW frame (the neutral-patch search needs it). */
+struct LookAssistRenderedPicture
+{
+    LookAssistStats stats;
+    std::vector<unsigned char> rgb;
+    int width = 0;
+    int height = 0;
+    int downscaleFactor = 1;
+};
+
+/* Render the planned look (the preset's sliders and this white balance) on a private clone. temperature
+ * in K, tint in receipt units (tenths). Supplied by the consumer (live render on the UI thread /
+ * headless, isolated render on the async worker); the daylight refinement only ever asks it questions
+ * about the picture, always at the exposure the look is about to apply. */
+typedef std::function<bool( double exposureStops, int temperature, int tint, LookAssistRenderedPicture *picture )> LookAssistRenderBalanceFn;
+
+/* The narrowing switch (hub ruling): false = a corroborated daylight scene with no trusted patch keeps the
+ * as-shot prior and renders nothing extra. Flip it to land only the states proven no worse than master. */
+static const bool kLookAssistRefineDaylightWithoutPatch = true;
+
+/* ---- The ONE white-balance decision: solve -> stability -> damping -> as-shot prior -> refine -> clamp. ----
  * GUI sync, GUI async and the headless applier all call this and nothing else; none of them
  * contains the sequence. The caller supplies only what differs between them: the solver (the live
  * one on the UI thread, the isolated one on the worker) and the control ranges. */
@@ -225,6 +255,14 @@ struct LookAssistWhiteBalanceRequest
     int maxTemperature = kLookAssistTemperatureMax;
     int minTint = kLookAssistTintMin;
     int maxTint = kLookAssistTintMax;
+    // RAW frame size (the neutral-patch search maps thumbnail pixels back to RAW coordinates).
+    int rawWidth = 0;
+    int rawHeight = 0;
+    // When set, a corroborated daylight scene WITHOUT a trusted neutral patch is balanced from the
+    // RENDERED picture: the picture is stepped until it has neutral samples, the same patch search and
+    // solver run on it, and the result is verified by rendering at the solution. Unset = the as-shot
+    // prior stands.
+    LookAssistRenderBalanceFn renderBalance;
 };
 
 struct LookAssistWhiteBalanceResolution
@@ -239,15 +277,47 @@ struct LookAssistWhiteBalanceResolution
     int candidateTint = 0;
     int temperature = 6000;         // final, clamped into the scene's window
     int tint = 0;
+    // The render-based refinement (corroborated daylight, no trusted patch). attempted = it ran;
+    // refined = it moved the white balance, always to a verified neutral-patch solution found on a rendered
+    // picture (patchAcquired); with none, the as-shot prior stands and refined is false.
+    bool refineAttempted = false;
+    bool refined = false;
+    bool refinePatchAcquired = false;
+    int refineRenders = 0;
+    int refineStartTemperature = 0;
+    int refineStartTint = 0;
+    double refineStartScore = 0.0;
+    double refineScore = 0.0;       // balance score of the picture at the final white balance
+    double refineBlueAmber = 0.0;   // final measured B-R of the neutral samples
+    double refineGreen = 0.0;       // final measured G-(R+B)/2
+    double refineStartPatchChroma = 0.0;   // chroma of the neutral patch where it was acquired
+    double refineFinalPatchChroma = 0.0;   // chroma of the best neutral patch in the picture rendered at the result
 };
 
 typedef std::function<void( int rawX, int rawY, int *temperature, int *tint )> LookAssistWhiteBalanceSolveFn;
 
 /* preset->temperatureDelta / tintDelta are read (the colour-balance default) and rewritten to
- * final - base, so the preset always describes what was applied. */
+ * final - base, so the preset always describes what was applied. When request.renderBalance is set the
+ * render-based daylight refinement below runs inside this call (GUI sync and headless). */
 LookAssistWhiteBalanceResolution resolveLookAssistWhiteBalance( const LookAssistWhiteBalanceRequest &request,
                                                                 const LookAssistWhiteBalanceSolveFn &solve,
                                                                 LookAssistPreset *preset );
+
+/* The render-based daylight refinement (called by resolveLookAssistWhiteBalance; public so a test can drive
+ * it directly). Does nothing unless request.renderBalance is set, the scene is corroborated daylight and
+ * `resolution` holds no trusted patch. `resolution` and `preset` are updated in place, including the final
+ * clamp. It renders the LIVE picture, so a detached worker must not run it (the GUI sends daylight scenes
+ * down its synchronous path for that reason). */
+void refineLookAssistDaylightWhiteBalance( const LookAssistWhiteBalanceRequest &request,
+                                           const LookAssistWhiteBalanceSolveFn &solve,
+                                           LookAssistPreset *preset,
+                                           LookAssistWhiteBalanceResolution *resolution );
+
+/* True when refineLookAssistDaylightWhiteBalance has work to do for this resolution (corroborated
+ * daylight, no trusted patch, and the narrowing switch is on). */
+bool lookAssistDaylightNeedsRenderedRefinement( const LookAssistStats &stats,
+                                                LookAssistScene scene,
+                                                const LookAssistWhiteBalanceResolution &resolution );
 
 int lookAssistDisplayTargetMedianForScene( LookAssistScene scene );
 

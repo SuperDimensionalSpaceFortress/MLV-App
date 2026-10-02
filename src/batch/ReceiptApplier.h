@@ -4,6 +4,7 @@
 /* C API types — mlvObject_t and processingObject_t are anonymous typedefs,
  * so we must include the full header (forward declaration won't work). */
 #include "../../src/mlv_include.h"
+#include "LookAssistAnalysis.h"
 
 class ReceiptSettings;
 
@@ -57,6 +58,31 @@ public:
                                              int cpuCores,
                                              double exposureStops,
                                              unsigned char *outBuffer);
+
+    /* The same processed thumbnail at an explicit exposure AND white balance (temperature in K, tint in
+     * receipt units), through a private clone. isolated = the cache-free render a detached worker must
+     * use; otherwise the same cache-backed render the GUI and headless applier use for every other Look
+     * Assist thumbnail. The ONE renderer behind the daylight refinement for GUI sync, GUI async and
+     * headless. */
+    static bool processedThumbnailAtBalance(mlvObject_t *mlvObject,
+                                            int frameIndex,
+                                            int downscaleFactor,
+                                            int cpuCores,
+                                            double exposureStops,
+                                            int temperature,
+                                            int tint,
+                                            bool isolated,
+                                            unsigned char *outBuffer);
+
+    /* processedThumbnailAtBalance + analyzeLookAssistThumbnail as the callback the shared white-balance
+     * resolution asks about the picture. */
+    static lookassist::LookAssistRenderBalanceFn lookAssistBalanceRenderer(mlvObject_t *mlvObject,
+                                                                     int frameIndex,
+                                                                     int downscaleFactor,
+                                                                     int thumbWidth,
+                                                                     int thumbHeight,
+                                                                     int cpuCores,
+                                                                     bool isolated);
 
 private:
     ReceiptApplier() = delete; /* Pure static — no instances */

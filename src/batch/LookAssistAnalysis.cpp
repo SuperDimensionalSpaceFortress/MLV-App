@@ -527,6 +527,233 @@ double lookAssistAutoWhiteBalanceDampingFactor(
     return factor;
 }
 
+double lookAssistBalanceScore( const LookAssistStats &rendered )
+{
+    const double greenAxis =
+        rendered.balanceG - ( ( rendered.balanceR + rendered.balanceB ) * 0.5 );
+    const double blueAmberAxis = rendered.balanceB - rendered.balanceR;
+    const double visibleGreenAxis =
+        rendered.visibleMeanG - ( ( rendered.visibleMeanR + rendered.visibleMeanB ) * 0.5 );
+    return fabs( greenAxis )
+        + ( fabs( blueAmberAxis ) * 0.5 )
+        + ( fabs( visibleGreenAxis ) * 0.7 )
+        + ( rendered.greenArtifactRatio * 700.0 )
+        + ( qMax( 0.0, rendered.greenArtifactMeanAxis - 22.0 ) * 0.7 );
+}
+
+// The tail of the decision: the final temperature / tint, clamped into the control range and the scene's
+// window, and the preset rewritten to describe exactly what is applied.
+static void lookAssistFinalizeWhiteBalance( const LookAssistWhiteBalanceRequest &request,
+                                            LookAssistPreset *preset,
+                                            LookAssistWhiteBalanceResolution *out )
+{
+    int temperature = qBound( request.minTemperature, request.baseTemperature + preset->temperatureDelta, request.maxTemperature );
+    int tint = qBound( request.minTint, request.baseTint + preset->tintDelta, request.maxTint );
+    lookAssistClampWhiteBalance( lookAssistWhiteBalanceBounds( *request.stats, request.scene ), &temperature, &tint );
+    preset->temperatureDelta = temperature - request.baseTemperature;
+    preset->tintDelta = tint - request.baseTint;
+    out->temperature = temperature;
+    out->tint = tint;
+}
+
+// ---- Render-based daylight refinement ------------------------------------------------------------------
+//
+// Corroborated daylight, no trusted neutral patch. Why not simply neutralise the rendered picture's
+// median? It includes blue water and sky: on the tracked fixtures the picture median reaches B-R ~ 0 near
+// 10000 K while the concrete deck (the surface that is actually neutral) is then yellow (CIELAB chroma 10.8,
+// against 3.8 at the deck-neutral 6500 K / tint -35). The shared neutral-patch solver IS self-consistent with
+// the render of the state it runs in, so the refinement reuses it: the patch search needs neutral samples
+// (>= 1 % of the picture), which a picture rendered at a white balance far from the scene's has none of
+// (that is the whole reason no patch was found). So step the RENDERED picture until it has neutral samples,
+// run the same patch search + solver + stability guard on it, and VERIFY by rendering at the solution (the
+// best neutral patch there must be no more cast than where it was found). If no verified patch appears the
+// white balance stays at the as-shot prior: the probes only steer the search, none is an answer.
+static const int    kRefineMaxProbes           = 7;      // probe renders after the start picture
+static const double kRefineDeadBand            = 2.0;    // |axis| below this is neutral enough
+static const double kRefineMinImprovement      = 0.25;   // score points a probe must gain to count
+static const double kRefineInitialMiredSlope   = 0.8;    // blue-amber axis units per mired
+static const double kRefineInitialTintSlope    = -0.3;   // green axis units per receipt tint unit
+static const double kRefineMaxMiredStep        = 40.0;
+static const double kRefineMaxTintStep         = 12.0;
+static const double kRefineVerifyChromaSlack   = 0.75;   // the deck at the result may be this much more cast than where found
+
+static double lookAssistMired( int kelvin ) { return 1.0e6 / (double)qMax( 1, kelvin ); }
+static int lookAssistKelvinFromMired( double mired ) { return qRound( 1.0e6 / qMax( 1.0, mired ) ); }
+
+static bool lookAssistPictureHasNeutralSamples( const LookAssistRenderedPicture &picture )
+{
+    return picture.stats.median > 0.0
+        && picture.width > 0
+        && picture.height > 0
+        && picture.rgb.size() >= (size_t)picture.width * (size_t)picture.height * 3u
+        && picture.stats.balanceSamples >= qMax( 32, ( picture.width * picture.height ) / 100 );
+}
+
+static void refineDaylightFromRenderedPicture( const LookAssistWhiteBalanceRequest &request,
+                                               const LookAssistWhiteBalanceSolveFn &solve,
+                                               LookAssistPreset *preset,
+                                               LookAssistWhiteBalanceResolution *out )
+{
+    const LookAssistStats &stats = *request.stats;
+    LookAssistWhiteBalanceBounds window = lookAssistWhiteBalanceBounds( stats, request.scene );
+    window.minTemperature = qMax( window.minTemperature, request.minTemperature );
+    window.maxTemperature = qMin( window.maxTemperature, request.maxTemperature );
+    window.minTint = qMax( window.minTint, request.minTint );
+    window.maxTint = qMin( window.maxTint, request.maxTint );
+    if( window.minTemperature > window.maxTemperature || window.minTint > window.maxTint ) return;
+
+    const double exposureStops = preset->exposure / 100.0;   // the planned exposure every picture is rendered at
+    const int startTemperature = qBound( window.minTemperature, request.baseTemperature + preset->temperatureDelta, window.maxTemperature );
+    const int startTint = qBound( window.minTint, request.baseTint + preset->tintDelta, window.maxTint );
+
+    struct Point
+    {
+        int temperature = 0;
+        int tint = 0;
+        double score = 0.0;
+        double blueAmber = 0.0;
+        double green = 0.0;
+    };
+    auto pointOf = []( int temperature, int tint, const LookAssistStats &s ) -> Point
+    {
+        Point p;
+        p.temperature = temperature;
+        p.tint = tint;
+        p.score = lookAssistBalanceScore( s );
+        p.blueAmber = s.balanceB - s.balanceR;
+        p.green = s.balanceG - ( ( s.balanceR + s.balanceB ) * 0.5 );
+        return p;
+    };
+
+    LookAssistRenderedPicture picture;   // the picture currently held, rendered at (pictureTemperature, pictureTint)
+    if( !request.renderBalance( exposureStops, startTemperature, startTint, &picture ) || picture.stats.median <= 0.0 ) return;
+    out->refineAttempted = true;
+    out->refineRenders = 1;
+    out->refineStartTemperature = startTemperature;
+    out->refineStartTint = startTint;
+
+    const Point start = pointOf( startTemperature, startTint, picture.stats );
+    Point best = start;       // best score seen (steers the probe steps; never an answer by itself)
+    out->refineStartScore = start.score;
+    out->refineScore = start.score;
+    out->refineBlueAmber = start.blueAmber;
+    out->refineGreen = start.green;
+
+    // The held picture has neutral samples: search it for the patch, solve, guard, and verify by rendering
+    // at the solution.
+    auto acquirePatch = [&]() -> bool
+    {
+        if( !solve || request.rawWidth <= 0 || request.rawHeight <= 0 || !lookAssistPictureHasNeutralSamples( picture ) )
+            return false;
+        const LookAssistAutoWhiteBalancePatch patch = findLookAssistAutoWhiteBalancePatch(
+            picture.rgb.data(), picture.width, picture.height, picture.downscaleFactor,
+            request.rawWidth, request.rawHeight );
+        if( !patch.valid || !lookAssistDaylightPatchIsNeutralEnough( patch ) ) return false;
+
+        int solvedTemperature = request.baseTemperature;
+        int solvedTint = request.baseTint;
+        solve( patch.rawX, patch.rawY, &solvedTemperature, &solvedTint );
+        solvedTemperature = qBound( request.minTemperature, solvedTemperature, request.maxTemperature );
+        solvedTint = qBound( request.minTint, solvedTint, request.maxTint );
+        solvedTint = qBound( -35, solvedTint, 18 );   // the solver's own rails, unchanged
+        out->candidateTemperature = solvedTemperature;
+        out->candidateTint = solvedTint;
+        if( !lookAssistAutoWhiteBalanceSolutionIsStable( patch, request.baseTemperature, request.baseTint,
+                                                         solvedTemperature, solvedTint, true ) )
+            return false;
+        solvedTemperature = qBound( window.minTemperature, solvedTemperature, window.maxTemperature );
+        solvedTint = qBound( window.minTint, solvedTint, window.maxTint );
+
+        LookAssistRenderedPicture verify;
+        if( !request.renderBalance( exposureStops, solvedTemperature, solvedTint, &verify ) ) return false;
+        ++out->refineRenders;
+        const LookAssistAutoWhiteBalancePatch verifyPatch = findLookAssistAutoWhiteBalancePatch(
+            verify.rgb.data(), verify.width, verify.height, verify.downscaleFactor,
+            request.rawWidth, request.rawHeight );
+        out->refineStartPatchChroma = patch.chroma;
+        out->refineFinalPatchChroma = verifyPatch.valid ? verifyPatch.chroma : 0.0;
+        if( verify.rgb.size() < (size_t)verify.width * (size_t)verify.height * 3u
+         || !verifyPatch.valid
+         || !lookAssistDaylightPatchIsNeutralEnough( verifyPatch )
+         || verifyPatch.chroma > patch.chroma + kRefineVerifyChromaSlack )
+            return false;
+
+        out->autoValid = true;
+        out->refined = true;
+        out->refinePatchAcquired = true;
+        out->source = QStringLiteral("rendered-neutral-patch");
+        out->decision = QStringLiteral("accepted");
+        out->damping = 1.0;
+        out->solvedTemperature = solvedTemperature;
+        out->solvedTint = solvedTint;
+        out->refineScore = lookAssistBalanceScore( verify.stats );
+        out->refineBlueAmber = verify.stats.balanceB - verify.stats.balanceR;
+        out->refineGreen = verify.stats.balanceG - ( ( verify.stats.balanceR + verify.stats.balanceB ) * 0.5 );
+        preset->temperatureDelta = solvedTemperature - request.baseTemperature;
+        preset->tintDelta = solvedTint - request.baseTint;
+        return true;
+    };
+
+    double miredSlope = kRefineInitialMiredSlope;
+    double tintSlope = kRefineInitialTintSlope;
+    double damp = 1.0;
+    int failures = 0;
+    for( int probes = 0;; ++probes )
+    {
+        if( acquirePatch() ) return;
+        if( probes >= kRefineMaxProbes ) break;
+
+        const bool moveTemperature = fabs( best.blueAmber ) >= kRefineDeadBand;
+        const bool moveTint = fabs( best.green ) >= kRefineDeadBand;
+        if( !moveTemperature && !moveTint ) break;
+        const double dMired = moveTemperature
+            ? qBound( -kRefineMaxMiredStep, ( -best.blueAmber / miredSlope ) * damp, kRefineMaxMiredStep )
+            : 0.0;
+        const double dTint = moveTint
+            ? qBound( -kRefineMaxTintStep, ( -best.green / tintSlope ) * damp, kRefineMaxTintStep )
+            : 0.0;
+        const int nextTemperature = qBound( window.minTemperature,
+                                            lookAssistKelvinFromMired( lookAssistMired( best.temperature ) + dMired ),
+                                            window.maxTemperature );
+        const int nextTint = qBound( window.minTint, best.tint + qRound( dTint ), window.maxTint );
+        if( nextTemperature == best.temperature && nextTint == best.tint ) break;
+
+        LookAssistRenderedPicture next;
+        if( !request.renderBalance( exposureStops, nextTemperature, nextTint, &next ) || next.stats.median <= 0.0 ) break;
+        ++out->refineRenders;
+        const Point candidate = pointOf( nextTemperature, nextTint, next.stats );
+        picture = std::move( next );
+
+        // The measurement is information whether or not the probe is kept: refit the slopes from it.
+        const double dMiredSeen = lookAssistMired( nextTemperature ) - lookAssistMired( best.temperature );
+        if( fabs( dMiredSeen ) >= 3.0 )
+        {
+            const double seen = ( candidate.blueAmber - best.blueAmber ) / dMiredSeen;
+            if( seen > 0.1 && seen < 6.0 ) miredSlope = seen;
+        }
+        const int dTintSeen = nextTint - best.tint;
+        if( qAbs( dTintSeen ) >= 2 )
+        {
+            const double seen = ( candidate.green - best.green ) / (double)dTintSeen;
+            if( seen < -0.03 && seen > -3.0 ) tintSlope = seen;
+        }
+
+        if( candidate.score < best.score - kRefineMinImprovement )
+        {
+            best = candidate;
+            failures = 0;
+        }
+        else
+        {
+            damp *= 0.5;
+            ++failures;
+        }
+        if( failures >= 3 ) break;
+    }
+    // No verified neutral patch anywhere along the walk: the white balance stays where it started (the
+    // as-shot prior). The probes steered the search only; none of them is an answer.
+}
+
 LookAssistWhiteBalanceResolution resolveLookAssistWhiteBalance( const LookAssistWhiteBalanceRequest &request,
                                                                 const LookAssistWhiteBalanceSolveFn &solve,
                                                                 LookAssistPreset *preset )
@@ -598,16 +825,35 @@ LookAssistWhiteBalanceResolution resolveLookAssistWhiteBalance( const LookAssist
             preset->temperatureDelta = priorTemperature - baseTemperature;
             preset->tintDelta = priorTint - baseTint;
         }
+
     }
 
-    int temperature = qBound( request.minTemperature, baseTemperature + preset->temperatureDelta, request.maxTemperature );
-    int tint = qBound( request.minTint, baseTint + preset->tintDelta, request.maxTint );
-    lookAssistClampWhiteBalance( lookAssistWhiteBalanceBounds( stats, request.scene ), &temperature, &tint );
-    preset->temperatureDelta = temperature - baseTemperature;
-    preset->tintDelta = tint - baseTint;
-    out.temperature = temperature;
-    out.tint = tint;
+    lookAssistFinalizeWhiteBalance( request, preset, &out );
+
+    // Corroborated daylight and still no trusted patch: the as-shot prior is only a starting point.
+    // Balance it from the RENDERED picture (a no-op unless the consumer supplied a renderer).
+    refineLookAssistDaylightWhiteBalance( request, solve, preset, &out );
     return out;
+}
+
+bool lookAssistDaylightNeedsRenderedRefinement( const LookAssistStats &stats,
+                                                LookAssistScene scene,
+                                                const LookAssistWhiteBalanceResolution &resolution )
+{
+    return kLookAssistRefineDaylightWithoutPatch
+        && !resolution.autoValid
+        && lookAssistIsDaylightScene( stats, scene );
+}
+
+void refineLookAssistDaylightWhiteBalance( const LookAssistWhiteBalanceRequest &request,
+                                           const LookAssistWhiteBalanceSolveFn &solve,
+                                           LookAssistPreset *preset,
+                                           LookAssistWhiteBalanceResolution *resolution )
+{
+    if( !request.stats || !preset || !resolution || !request.renderBalance ) return;
+    if( !lookAssistDaylightNeedsRenderedRefinement( *request.stats, request.scene, *resolution ) ) return;
+    refineDaylightFromRenderedPicture( request, solve, preset, resolution );
+    lookAssistFinalizeWhiteBalance( request, preset, resolution );
 }
 
 int lookAssistDisplayTargetMedianForScene( LookAssistScene scene )

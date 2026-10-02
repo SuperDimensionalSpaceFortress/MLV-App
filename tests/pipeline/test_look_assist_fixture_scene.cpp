@@ -250,6 +250,67 @@ TEST(LookAssistFixtureScene, HeadlessLookAssistSolvesDaylightWhiteBalanceFromThe
     }
 }
 
+TEST(LookAssistFixtureScene, HeadlessBalancesDaylightFromTheRenderedPictureWhenNoPatchIsTrusted)
+{
+    // PR #221 r2's blocker, through the real headless consumer: corroborated daylight, NO trusted neutral
+    // patch (the analysis picture is rendered at a white balance far from the scene's, so < 1 % of it is
+    // neutral and the patch search falls back to the flat raw thumbnail). r2 kept the as-shot prior
+    // (6000 K / tint 0: deck chroma 12 here, 18.9 in the real app); master's night path reached 6480 K /
+    // tint -19. The shared render-based refinement walks the RENDERED picture to a balance that has neutral
+    // samples, takes the patch from it, solves, and verifies at the solution.
+    for( const FixtureClip &clip : kTrackedFixtureClips )
+    {
+        MlvPipelineFixture fixture;
+        QString error_message;
+        ASSERT_TRUE( fixture.openClipFile( repo_file_path( QString::fromLatin1( clip.file ) ), &error_message ) );
+        ASSERT_TRUE( fixture.applyReceipt( &error_message ) );
+
+        ReceiptSettings &receipt = fixture.receipt();
+        receipt.setLookAssistEnabled( true );
+        receipt.setLookAssistBaselineValid( false );
+        receipt.setExposure( 0 );
+        receipt.setTemperature( -1 );
+        receipt.setTint( 0 );
+        // The stale blue balance the processing object holds when Look Assist runs (the analysis render
+        // inherits it): this is what leaves the picture with no neutral samples.
+        processingSetWhiteBalance( fixture.processing(), 3000, 0.0 );
+
+        QTemporaryDir temporary_dir;
+        const QString log_path = temporary_dir.filePath( QStringLiteral("look_assist.log") );
+        BatchLogger::init( log_path );
+        const bool applied = ReceiptApplier::applyHeadlessLookAssist(
+            &receipt, fixture.video(), fixture.processing(), 0 );
+        BatchLogger::shutdown();
+        ASSERT_TRUE( applied );
+        QFile log_file( log_path );
+        ASSERT_TRUE( log_file.open( QIODevice::ReadOnly | QIODevice::Text ) );
+        const QByteArray log = log_file.readAll();
+
+        ASSERT_TRUE( log.contains( "scene=shade" ) );
+        // Not the prior: the balance was found on a RENDERED picture, by the same patch solve.
+        ASSERT_FALSE( log.contains( "autoWbSource=as-shot-prior" ) );
+        ASSERT_TRUE( log.contains( "autoWbSource=rendered-neutral-patch" ) );
+        ASSERT_TRUE( log.contains( "autoWbValid=true" ) );
+        ASSERT_TRUE( log.contains( "autoWbDamping=1.000" ) );
+        ASSERT_FALSE( log.contains( "refineRenders=0 " ) );   // the refinement ran (and rendered)
+        ASSERT_TRUE( receipt.temperature() >= 4800 && receipt.temperature() <= 10000 );
+        ASSERT_TRUE( receipt.tint() >= -35 && receipt.tint() <= 10 );
+        ASSERT_TRUE( receipt.temperature() != 6000 || receipt.tint() != 0 );   // not the base balance
+
+        // THE PICTURE, per state (headless render, the deck while it is in view): the applied look is no more
+        // cast than the as-shot prior r2 left standing, than master's night-path result, and within 6.
+        const int width = fixture.width();
+        const int height = fixture.height();
+        const int exposure = receipt.exposure();
+        const double applied_cast = deckCastChroma( renderWith( fixture, 0, receipt.temperature(), receipt.tint(), exposure ), width, height );
+        const double prior_cast = deckCastChroma( renderWith( fixture, 0, 6000, 0, exposure ), width, height );
+        const double master_cast = deckCastChroma( renderWith( fixture, 0, 6480, -19, 174 ), width, height );
+        ASSERT_TRUE( applied_cast < prior_cast );
+        ASSERT_TRUE( applied_cast <= master_cast );
+        ASSERT_TRUE( applied_cast <= 6.0 );
+    }
+}
+
 TEST(LookAssistFixtureScene, HeadlessKeepsTheLegacyVerdictWhenTheExposureCannotSayDaylight)
 {
     // The same flat-floor fixture, but the recorded exposure is an ND-filtered daylight shot
