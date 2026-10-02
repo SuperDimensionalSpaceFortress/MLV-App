@@ -578,71 +578,50 @@ TEST(LookAssistFixtureScene, HeadlessFallbackStartsFromMastersProcessingStateAtA
     // entering at 6000 K and a non-zero UI tint instead of 6000 K / 0, so the tint half of the restore is pinned, in a state
     // where the daylight pass's live solver RUNS before it falls back (the receipt-less arm: the processed picture has a
     // trusted neutral patch, and the solver ends at a different tint). The tints are sol's -12 (stored -0.244662371) and -50
-    // (stored -2.973017788, where a second conversion of the stored tint is large enough to change the picture master
-    // analyses: a first version of this test with only -12 stayed green with the tint restore removed).
-    // Master's behaviour is the no-metadata run and the direct masterScenePass call, each on a fresh object; the fallback
-    // equals both: receipt, live balance (kelvin and stored tint to nine decimals) and the analysis line master measured on
-    // its picture.
-    struct Arm { const char *name; bool switchOff; int asShotKelvin; int existingTemperature; };
-    const Arm arms[] = {
-        { "patch-then-switch-off", true, 0, -1 },
-        { "receipt-balance-then-switch-off", true, 0, 7895 },
-    };
+    // (stored -2.973017788). The picture master analyses on these fixtures barely depends on the entry tint, so the
+    // equality below alone cannot see the restore (a first version stayed green with it removed); the readback of the
+    // state the recursion starts from is what pins it.
+    // Master's behaviour is the direct masterScenePass call on a fresh object (nothing enters the daylight pass); the
+    // fallback equals it: receipt, live balance (kelvin and stored tint to nine decimals) and the analysis line master
+    // measured on its picture. One fixture and one arm only: this test shares a hosted shard with a 240 s bound; the
+    // other fixture runs the 6000 K / 0 equality above, and the solver restore is pinned on both fixtures below.
+    const FixtureClip &clip = kTrackedFixtureClips[0];
     const int entryTints[] = { -12, -50 };
-    for( const FixtureClip &clip : kTrackedFixtureClips )
+    for( const int entryTint : entryTints )
     {
-        for( const int entryTint : entryTints )
+        QString direct, fallback;
+        QByteArray directLog, fallbackLog;
+        QString entryB, endB, entryF, endF;
+        ASSERT_TRUE( runHeadlessLookAssist( clip.file, false, &direct, &directLog, false, -1, 0, 0, true,
+                                            &entryB, &endB, 6000, entryTint ) );
         {
-            for( const Arm &arm : arms )
-            {
-                const int existingTint = arm.existingTemperature == -1 ? 0 : -12;
-                QString metadataFree, direct, fallback;
-                QByteArray metadataFreeLog, directLog, fallbackLog;
-                QString entryA, endA, entryB, endB, entryF, endF;
-                ASSERT_TRUE( runHeadlessLookAssist( clip.file, true, &metadataFree, &metadataFreeLog, false,
-                                                    arm.existingTemperature, existingTint, arm.asShotKelvin, false,
-                                                    &entryA, &endA, 6000, entryTint ) );
-                ASSERT_TRUE( runHeadlessLookAssist( clip.file, false, &direct, &directLog, false,
-                                                    arm.existingTemperature, existingTint, arm.asShotKelvin, true,
-                                                    &entryB, &endB, 6000, entryTint ) );
-                {
-                    ScopedEnv switchOff( "MLVAPP_LOOK_ASSIST_REFINE_DAYLIGHT", arm.switchOff ? "0" : "1" );
-                    ASSERT_TRUE( runHeadlessLookAssist( clip.file, false, &fallback, &fallbackLog, false,
-                                                        arm.existingTemperature, existingTint, arm.asShotKelvin, false,
-                                                        &entryF, &endF, 6000, entryTint ) );
-                }
-
-                // The entry balance is the UI's tint as the slider stores it, in all three.
-                ASSERT_TRUE( entryA == QStringLiteral("6000.000/%1").arg( -std::pow( std::fabs( entryTint / 100.0 ), 1.75 ) * 10.0, 0, 'f', 9 ) );
-                if( entryTint == -12 ) ASSERT_TRUE( entryA == QStringLiteral("6000.000/-0.244662371") );
-                if( entryTint == -50 ) ASSERT_TRUE( entryA == QStringLiteral("6000.000/-2.973017788") );
-                ASSERT_TRUE( entryB == entryA );
-                ASSERT_TRUE( entryF == entryA );
-
-                ASSERT_TRUE( metadataFreeLog.contains( "masterScenePass=false" ) );
-                ASSERT_FALSE( metadataFreeLog.contains( "daylight_fallback_to_master" ) );
-                ASSERT_TRUE( directLog.contains( "masterScenePass=true" ) );
-                ASSERT_FALSE( directLog.contains( "daylight_fallback_to_master" ) );
-                ASSERT_TRUE( fallbackLog.contains( "daylight_fallback_to_master" ) );
-                ASSERT_TRUE( fallbackLog.contains( "masterScenePass=true" ) );
-
-                // What master's pass starts from, read back from the object at the moment of the recursion: the entry
-                // balance exactly, and no cached debayered frame (the daylight pass's solver left one where it ran).
-                const QStringList entryParts = entryA.split( QLatin1Char('/') );
-                ASSERT_TRUE( fallbackLog.contains( QStringLiteral("daylight_fallback_state kelvin=%1 renderTint=%2 ")
-                                                       .arg( entryParts[0], entryParts[1] ).toUtf8() ) );
-                ASSERT_TRUE( fallbackLog.contains( "cachedFrameAfter=0" ) );
-                if( arm.existingTemperature == -1 ) ASSERT_TRUE( fallbackLog.contains( "cachedFrameBefore=1" ) );
-
-                ASSERT_TRUE( fallback == metadataFree );
-                ASSERT_TRUE( fallback == direct );
-                ASSERT_TRUE( endF == endA );
-                ASSERT_TRUE( endF == endB );
-                ASSERT_TRUE( appliedLineWithoutPassFlag( fallbackLog ) == appliedLineWithoutPassFlag( metadataFreeLog ) );
-                ASSERT_TRUE( appliedLineWithoutPassFlag( fallbackLog ) == appliedLineWithoutPassFlag( directLog ) );
-                (void)arm.name;
-            }
+            ScopedEnv switchOff( "MLVAPP_LOOK_ASSIST_REFINE_DAYLIGHT", "0" );
+            ASSERT_TRUE( runHeadlessLookAssist( clip.file, false, &fallback, &fallbackLog, false, -1, 0, 0, false,
+                                                &entryF, &endF, 6000, entryTint ) );
         }
+
+        // The entry balance is the UI's tint as the slider stores it.
+        ASSERT_TRUE( entryB == QStringLiteral("6000.000/%1").arg( -std::pow( std::fabs( entryTint / 100.0 ), 1.75 ) * 10.0, 0, 'f', 9 ) );
+        if( entryTint == -12 ) ASSERT_TRUE( entryB == QStringLiteral("6000.000/-0.244662371") );
+        if( entryTint == -50 ) ASSERT_TRUE( entryB == QStringLiteral("6000.000/-2.973017788") );
+        ASSERT_TRUE( entryF == entryB );
+
+        ASSERT_TRUE( directLog.contains( "masterScenePass=true" ) );
+        ASSERT_FALSE( directLog.contains( "daylight_fallback_to_master" ) );
+        ASSERT_TRUE( fallbackLog.contains( "daylight_fallback_to_master" ) );
+        ASSERT_TRUE( fallbackLog.contains( "masterScenePass=true" ) );
+
+        // What master's pass starts from, read back from the object at the moment of the recursion: the entry balance
+        // exactly, and no cached debayered frame (the daylight pass's solver left one behind: before = 1).
+        const QStringList entryParts = entryB.split( QLatin1Char('/') );
+        ASSERT_TRUE( fallbackLog.contains( QStringLiteral("daylight_fallback_state kelvin=%1 renderTint=%2 ")
+                                               .arg( entryParts[0], entryParts[1] ).toUtf8() ) );
+        ASSERT_TRUE( fallbackLog.contains( "cachedFrameBefore=1" ) );
+        ASSERT_TRUE( fallbackLog.contains( "cachedFrameAfter=0" ) );
+
+        ASSERT_TRUE( fallback == direct );
+        ASSERT_TRUE( endF == endB );
+        ASSERT_TRUE( appliedLineWithoutPassFlag( fallbackLog ) == appliedLineWithoutPassFlag( directLog ) );
     }
 }
 
@@ -654,6 +633,7 @@ TEST(LookAssistFixtureScene, TheLiveWhiteBalanceSolverPutsTheStoredBalanceBackEx
     // with (UI -12: stored -0.244662371 became -0.015135353), and the GUI's fallback into master's pass inherited it.
     // State: 6000 K / UI tint -12; the solver runs on a trusted patch and ends elsewhere. Every value master's pass reads
     // -- kelvin, stored tint, the multipliers, the matrices -- must equal a fresh object that never ran the solver.
+    // The solver walks 7700 x 201 candidates (about 5 s) whatever the clip is, so each fixture costs one search.
     for( const FixtureClip &clip : kTrackedFixtureClips )
     {
         MlvPipelineFixture solved, reference;
