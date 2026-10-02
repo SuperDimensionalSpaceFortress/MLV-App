@@ -48,9 +48,10 @@ COMPOSER = ROOT / "tools" / "profiling" / "make-contact-sheet.py"
 # The commit whose generator the DEFAULT emitted job must stay byte-identical to. UM-PRESENTMON-STOP-1 changed the
 # default job on purpose (per-job PresentMon session name, clean named stop, one capture ceiling for every leg; r2:
 # content-judged CSV tail repair, job-stop sufficiency arms, failed-terminate labelling, named terminate on failure
-# paths), so this is that card's own r2 generator commit; it was 8c19f442603c (r1) and before that
-# PLAYBACK-CLIP-LENGTH-ENFORCE-4's merge (38ed2d8f96c2).
-BASELINE_COMMIT = "abc10451ae2ca0e9e043600046539820db34e175"
+# paths); UM-PRESENTMON-STOP-2 changed it again on purpose (position-based job-stop sufficiency arms, alive-before-
+# terminate / alive-before-kill exit attribution), so this is that card's own generator commit; it was abc10451ae2c
+# (UM-PRESENTMON-STOP-1 r2), 8c19f442603c (r1) and before that PLAYBACK-CLIP-LENGTH-ENFORCE-4's merge (38ed2d8f96c2).
+BASELINE_COMMIT = "6567793196bfd6133348a55dea080d9a2e9bcee8"
 
 PWSH = shutil.which("pwsh")
 requires_windows_pwsh = unittest.skipIf(PWSH is None or sys.platform != "win32", "needs pwsh on Windows")
