@@ -1181,14 +1181,84 @@ function Get-Stats([double[]]$Values) {
     }
 }
 
-function Start-PresentMonCapture([string]$CsvPath) {
+function Test-PresentMonTraceReady($Proc) {
+    # UM-PRESENTMON-STOP-2 r2 (sol blocker): has PresentMon finished starting its trace session? PresentMon
+    # 2.5.1 fixes its TimeInMs origin at the END of PMTraceSession::Start() (PresentData/PresentMonTraceSession.cpp:
+    # mStartTimestamp from QPC, after EnableProviders and OpenTraceW), and creates its output CSV lazily at the
+    # first present of the target process (PresentMon/CsvOutput.cpp UpdateCsvT) -- after the app launches -- so
+    # neither the CSV nor its header can say "ready" before the launch. What does: PresentMon creates its message-
+    # only window (class 'PresentMon', title 'PresentMonWnd') BEFORE Start(), but its main thread only pumps that
+    # window's queue once Start() has returned and the consumer and output threads are up (MainThread.cpp). A
+    # cross-thread WM_NULL to that window is therefore answered only AFTER the origin was set, so an answer is a
+    # verified upper bound for it. No window, or no answer in time, is "not ready yet" -- never an assumption.
+    $detail = $null
+    try {
+        if (-not ('MlvPresentMonProbe' -as [type])) {
+            $source = @(
+                'using System;'
+                'using System.Runtime.InteropServices;'
+                'public static class MlvPresentMonProbe {'
+                '  [DllImport("user32.dll", CharSet=CharSet.Unicode)] static extern IntPtr FindWindowExW(IntPtr parent, IntPtr after, string cls, string title);'
+                '  [DllImport("user32.dll")] static extern uint GetWindowThreadProcessId(IntPtr h, out uint pid);'
+                '  [DllImport("user32.dll", CharSet=CharSet.Unicode)] static extern IntPtr SendMessageTimeoutW(IntPtr h, uint msg, IntPtr w, IntPtr l, uint flags, uint timeoutMs, out IntPtr result);'
+                '  public static int Probe(uint pid, uint timeoutMs) {'
+                '    IntPtr h = IntPtr.Zero;'
+                '    while (true) {'
+                '      h = FindWindowExW(new IntPtr(-3), h, "PresentMon", "PresentMonWnd");'
+                '      if (h == IntPtr.Zero) return 0;'
+                '      uint p; GetWindowThreadProcessId(h, out p);'
+                '      if (p != pid) continue;'
+                '      IntPtr r;'
+                '      return SendMessageTimeoutW(h, 0, IntPtr.Zero, IntPtr.Zero, 2, timeoutMs, out r) == IntPtr.Zero ? 2 : 1;'
+                '    }'
+                '  }'
+                '}'
+            ) -join "`n"
+            Add-Type -TypeDefinition $source
+        }
+        $answer = [MlvPresentMonProbe]::Probe([uint32]$Proc.Id, [uint32]200)
+        if ($answer -eq 1) { return [pscustomobject]@{ ready = $true; detail = 'the PresentMon message pump answered' } }
+        $detail = if ($answer -eq 2) { 'the PresentMon message window exists but its main thread is not answering (trace session still starting)' } else { "no PresentMon message window for pid $($Proc.Id) yet" }
+    } catch {
+        $detail = "readiness probe failed: $($_.Exception.Message)"
+    }
+    [pscustomobject]@{ ready = $false; detail = $detail }
+}
+
+function Start-PresentMonCapture([string]$CsvPath, [int]$ReadyTimeoutSeconds = 10) {
     if (Test-Path -LiteralPath $CsvPath) { throw "PresentMon output already exists: $CsvPath" }
     $pmArgs = @('--process_name', $ExeName, '--output_file', $CsvPath, '--timed', [string]$PresentMonTimedSeconds,
                 '--terminate_after_timed', '--session_name', $PresentMonSessionName, '--stop_existing_session', '--no_console_stats')
     if ($PresentMonTerminateOnProcExit) { $pmArgs += '--terminate_on_proc_exit' }
     # Direct child: inherits this job's TEMP/TMP. -PassThru so the exit code is checked.
     $proc = Start-Process -FilePath (Join-Path $Cache $PresentMonName) -ArgumentList $pmArgs -PassThru -WindowStyle Hidden
-    Start-Sleep -Seconds 3
+    # UM-PRESENTMON-STOP-2 r2 (sol blocker): this used to sleep 3 s and check only that the process was alive,
+    # then claimed that instant bounded PresentMon's TimeInMs origin -- but the origin can be set later than
+    # that. Now it waits (bounded) for VERIFIED trace readiness and records the instant that was OBSERVED, taken
+    # after the probe answered, so it is an upper bound for the origin; the app is launched only after it. When
+    # readiness is not observed (a PresentMon that never answers within the bound, or exited cleanly) the bracket
+    # is reported UNVERIFIED rather than assumed: the capture is not aborted, but a stop this job caused can then
+    # only read degraded (job-stop readiness arm). A nonzero exit is still PRESENTMON_FAILED right away.
+    $watch = [System.Diagnostics.Stopwatch]::StartNew()
+    $readyUtc = $null
+    $lastDetail = $null
+    while (-not $proc.HasExited) {
+        $probe = Test-PresentMonTraceReady $proc
+        $lastDetail = $probe.detail
+        if ($probe.ready) {
+            $readyUtc = (Get-Date).ToUniversalTime()
+            break
+        }
+        if ($watch.Elapsed.TotalSeconds -ge $ReadyTimeoutSeconds) { break }
+        Start-Sleep -Milliseconds 100
+    }
+    $script:PresentMonTraceReadiness = [pscustomobject]@{
+        verified = ($null -ne $readyUtc)
+        readyUtc = $readyUtc
+        waitedMs = [int]$watch.Elapsed.TotalMilliseconds
+        timeoutSeconds = $ReadyTimeoutSeconds
+        reason = $(if ($null -ne $readyUtc) { $null } elseif ($proc.HasExited) { "PresentMon exited (rc=$($proc.ExitCode)) before trace readiness was observed" } else { "trace readiness not observed within $ReadyTimeoutSeconds s ($lastDetail)" })
+    }
     if ($proc.HasExited -and $proc.ExitCode -ne 0) {
         throw "PRESENTMON_FAILED rc=$($proc.ExitCode) (6 = ETW access denied: the agent account needs 'Performance Log Users')"
     }
@@ -1390,7 +1460,12 @@ function Wait-PresentMonCapture($Proc, [string]$SessionName = '', [int]$TimeoutS
             $waitErrorText = if ($null -eq $waitError) { '<none>' } else { $waitError }
             throw "PRESENTMON_TIMEOUT: did not exit within $TimeoutSeconds s after playback (confirmedExited=$confirmedExited killError=$killErrorText waitError=$waitErrorText)"
         }
-        $stopMethod = 'kill_fallback'
+        # UM-PRESENTMON-STOP-2 r2 (fable hardening 2): .NET's Kill() ends a process with exit code -1. A capture
+        # that was alive at the liveness read but is shown here with ANY other code died in the one statement
+        # before Kill() ran (Kill() then did nothing), so the job did not end it: it stays attributed as the
+        # terminate left it (session_terminate when that succeeded, else exited_after_failed_terminate) and a
+        # crash code reaches the call site as a failed capture. killUsed / aliveBeforeKill still record the attempt.
+        if ([int]$Proc.ExitCode -eq -1) { $stopMethod = 'kill_fallback' }
     }
     [pscustomobject]@{
         status = 'done'
@@ -2275,8 +2350,9 @@ if ($ContactSheetEnabled) {
 }
 # CUDA-PERF-DISPLAY-IDENTITY-HARNESS-1/2/3 (sol BLOCKER 2 / fable HARDENING, direction corrected
 # HARNESS-3): PresentMon's own TimeInMs=0 origin is its internal trace-session start, which lands
-# somewhere between process creation and Start-PresentMonCapture returning (it blocks up to 3s to
-# confirm the process is still alive) -- neither endpoint of that interval IS the true origin, so
+# somewhere between process creation and the instant its trace readiness is observed (UM-PRESENTMON-STOP-2 r2:
+# Start-PresentMonCapture waits, bounded, for it and records that instant; before r2 it slept 3 s and checked
+# only that the process was alive, which bounded nothing) -- neither endpoint of that interval IS the true origin, so
 # the interval is bracketed instead of guessed at as a single instant. $presentMonProc.StartTime
 # is the OS's own report of when the child process itself began (available without any extra
 # probing); HARNESS-2 anchored windowing on it alone and claimed here that doing so "never
@@ -2379,6 +2455,18 @@ if ($null -ne $presentMonSpawnError) {
     exit 23
 }
 $presentMonPostSpawnUtc = (Get-Date).ToUniversalTime()
+# UM-PRESENTMON-STOP-2 r2 (sol blocker): the bracket's LATE end is the instant PresentMon's trace readiness was
+# OBSERVED (Start-PresentMonCapture, Test-PresentMonTraceReady), which is after its TimeInMs origin was set --
+# not the instant Start-PresentMonCapture returned after a liveness check, which the origin could still follow.
+# The app is launched below, after it. When readiness was not observed the late end stays the return instant
+# (it bounds nothing) and $presentMonTraceReadyVerified is false: a stop this job caused can then only read
+# degraded (the job-stop readiness arm in the presentMonStatus block).
+$presentMonTraceReadiness = $script:PresentMonTraceReadiness
+$presentMonTraceReadyVerified = ($null -ne $presentMonTraceReadiness) -and [bool]$presentMonTraceReadiness.verified -and ($null -ne $presentMonTraceReadiness.readyUtc)
+if ($presentMonTraceReadyVerified) {
+    $presentMonPostSpawnUtc = $presentMonTraceReadiness.readyUtc
+}
+Write-JobTrace "step presentmon-trace-ready verified=$presentMonTraceReadyVerified waitedMs=$($presentMonTraceReadiness.waitedMs) reason=$($presentMonTraceReadiness.reason)"
 $presentMonProcessStartUtc = $null
 try { $presentMonProcessStartUtc = $presentMonProc.StartTime.ToUniversalTime() } catch { $presentMonProcessStartUtc = $null }
 $presentMonCaptureStartUtc = if ($null -ne $presentMonProcessStartUtc) { $presentMonProcessStartUtc } else { $presentMonPreSpawnUtc }
@@ -2651,6 +2739,8 @@ if ($null -ne $presentMonWaitError) {
         postSpawnUtc=$presentMonPostSpawnUtc.ToString('o')
         processStartUtc=$(if ($null -ne $presentMonProcessStartUtc) { $presentMonProcessStartUtc.ToString('o') } else { $null })
         captureStartUncertaintyMs=$presentMonCaptureStartUncertaintyMs
+        traceReadyVerified=$presentMonTraceReadyVerified
+        traceReadiness=$presentMonTraceReadiness
         stop=$presentMonCleanStop
         csvTailTrim=$presentMonTailTrim
     }) (Join-Path $Pub 'presentmon-capture.json')
@@ -2835,6 +2925,8 @@ Save-Json ([ordered]@{
     postSpawnUtc=$presentMonPostSpawnUtc.ToString('o')
     processStartUtc=$(if ($null -ne $presentMonProcessStartUtc) { $presentMonProcessStartUtc.ToString('o') } else { $null })
     captureStartUncertaintyMs=$presentMonCaptureStartUncertaintyMs
+    traceReadyVerified=$presentMonTraceReadyVerified
+    traceReadiness=$presentMonTraceReadiness
     stop=$presentMonCleanStop
     csvTailTrim=$presentMonTailTrim
 }) (Join-Path $Pub 'presentmon-capture.json')
@@ -2987,11 +3079,13 @@ $presentMonTemporalSufficient = [bool]$presentMonTemporal.sufficient
 # cancel an equal length of lost tail):
 #   ANCHOR: PresentMon's TimeInMs is relative to its trace origin, which this job never observes. It is
 #       only known to lie inside the bracket [$presentMonCaptureStartUtc (the OS-reported process start,
-#       or the pre-spawn clock), $presentMonPostSpawnUtc (Start-PresentMonCapture returning)] -- the same
-#       bracket Get-AttrCudaPresentMonDisplayReport windows under. That bracket is NEVER narrower than
-#       3 s (Start-PresentMonCapture sleeps 3 s before returning), so no single UTC conversion is
-#       trustworthy to better than that. Every row is therefore converted under BOTH ends and a coverage
-#       claim is made only when it holds under the WORST end:
+#       or the pre-spawn clock), $presentMonPostSpawnUtc (the instant PresentMon's trace readiness was OBSERVED,
+#       before the app was launched -- see Test-PresentMonTraceReady)] -- the same bracket
+#       Get-AttrCudaPresentMonDisplayReport windows under. The late end is an upper bound for the origin only
+#       when readiness WAS observed ($presentMonTraceReadyVerified); otherwise the bracket is untrusted and a
+#       job-caused stop reads degraded whatever the position arms say. The bracket is as wide as PresentMon's
+#       startup took, so no single UTC conversion is trustworthy to better than that. Every row is therefore
+#       converted under BOTH ends and a coverage claim is made only when it holds under the WORST end:
 #   (4) HEAD: some retained MLVApp present row lies at or before first_swap + $presentMonJobStopMaxEdgeGapMs
 #       even when the origin is the LATE end of the bracket.
 #   (5) TAIL: some retained row lies at or after last_swap - $presentMonJobStopMaxEdgeGapMs even when the
@@ -3033,6 +3127,13 @@ if ($presentMonStoppedByJob) {
     }
     $presentMonJobStopAnchorUncertaintyMs = ($presentMonPostSpawnUtc - $presentMonCaptureStartUtc).TotalMilliseconds
     $pmPresentTimes = @($displayReport.selectedPresentTimesMs | ForEach-Object { [double]$_ } | Sort-Object)
+    # UM-PRESENTMON-STOP-2 r2 (sol blocker): the late end of the bracket is an upper bound for PresentMon's origin
+    # ONLY when its trace readiness was observed before the app was launched. Otherwise the origin may lie after
+    # it, a lost head can read covered, and the position arms below prove nothing: never ok. Unknown (the variable
+    # absent) is not verified.
+    if (-not $presentMonTraceReadyVerified) {
+        $presentMonJobStopFailedArms += "job-stop readiness: the capture was ended by this job and PresentMon's trace readiness was not verified before the app was launched ($(if ($null -ne $presentMonTraceReadiness -and $null -ne $presentMonTraceReadiness.reason) { $presentMonTraceReadiness.reason } else { 'no readiness record' })), so its TimeInMs origin is not bounded by the capture-start bracket and coverage of the measured playback cannot be proven"
+    }
     if (-not $swapWindowParsed) {
         $presentMonJobStopFailedArms += 'job-stop position: the capture was ended by this job and the run log carries no usable playback_smoke.gpu_window_swaps first_swap_utc/last_swap_utc, so coverage of the measured playback cannot be proven'
     } elseif ($presentMonJobStopAnchorUncertaintyMs -lt 0) {
