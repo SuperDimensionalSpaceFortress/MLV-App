@@ -388,12 +388,34 @@ jobs:
           ) | Sort-Object -Unique
           if ($testNames.Count -eq 0) { throw "pipeline test registry discovery returned no tests" }
           $testsPerShard = 12
+          # LookAssistFixtureScene tests render real fixture clips through the headless Look
+          # Assist: 1.6-75 s each locally (about 1.35x that on the hosted runner) and 383 s for
+          # the 11 together. Each runs alone in its own shard, so a shard's bound never depends
+          # on how many of them sort into the same 12-name window (two windows overran 240 s).
+          # Every other window keeps its membership, minus those tests.
+          $soloPattern = '^LookAssistFixtureScene\.'
           $shards = @()
           for ($offset = 0; $offset -lt $testNames.Count; $offset += $testsPerShard) {
             $end = [Math]::Min($offset + $testsPerShard, $testNames.Count)
-            $filter = ($testNames[$offset..($end - 1)] -join ':')
-            $shards += @{ Name = ("exact-{0:D2}" -f [int]($offset / $testsPerShard)); Filter = $filter }
+            $window = @($testNames[$offset..($end - 1)])
+            $windowIndex = [int]($offset / $testsPerShard)
+            $shared = @($window | Where-Object { $_ -notmatch $soloPattern })
+            if ($shared.Count -gt 0) {
+              $shards += @{ Name = ("exact-{0:D2}" -f $windowIndex); Filter = ($shared -join ':') }
+            }
+            $solo = @($window | Where-Object { $_ -match $soloPattern })
+            for ($i = 0; $i -lt $solo.Count; $i++) {
+              $shards += @{ Name = ("exact-{0:D2}-solo{1}" -f $windowIndex, ($i + 1)); Filter = $solo[$i] }
+            }
           }
+          # Coverage proof: every discovered test name is in exactly one shard.
+          $shardedNames = @($shards | ForEach-Object { $_.Filter -split ':' })
+          if ($shardedNames.Count -ne $testNames.Count -or
+              @($shardedNames | Sort-Object -Unique).Count -ne $testNames.Count -or
+              @(Compare-Object $testNames ($shardedNames | Sort-Object -Unique)).Count -ne 0) {
+            throw "pipeline shards do not cover each test exactly once (tests=$($testNames.Count) sharded=$($shardedNames.Count))"
+          }
+          Write-Output ("pipeline shard plan: tests={0} shards={1}" -f $testNames.Count, $shards.Count)
           function Invoke-BoundedPipelineShard {
             param(
               [string]$Name,
