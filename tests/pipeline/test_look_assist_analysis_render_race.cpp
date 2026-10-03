@@ -30,7 +30,9 @@ const char *const kDualIsoFixtureClips[] = {
     "tests/fixtures/clips/large_dual_iso.mlv",
 };
 
-int colorDownscaleFor( mlvObject_t *video )
+// The RAW-thumbnail downscale: the display meter renders at it (even, so it takes the cache-free SCALED
+// source); the colour renders use a third of it (3, which no source scale divides: the full-resolution one).
+int thumbnailDownscaleFor( mlvObject_t *video )
 {
     const int rawW = video->RAWI.xRes;
     const int rawH = video->RAWI.yRes;
@@ -38,13 +40,18 @@ int colorDownscaleFor( mlvObject_t *video )
     if( rawW > 4000 || rawH > 2500 ) downscale = 12;
     else if( rawW > 2800 || rawH > 1900 ) downscale = 10;
     else if( rawW > 1800 || rawH > 1200 ) downscale = 8;
-    return std::max( 3, downscale / 3 );
+    return downscale;
+}
+
+int colorDownscaleFor( mlvObject_t *video )
+{
+    return std::max( 3, thumbnailDownscaleFor( video ) / 3 );
 }
 
 // Every picture a Look Assist analysis takes of one frame, through each primitive the GUI and the headless
 // applier use: the planned-exposure render (scene evidence), the live-state colour render (night colour),
 // the balance renderer both cache-backed and isolated (patch verification / surface search), and the
-// display meter's cache-free render.
+// cache-free render at the colour downscale (full-resolution source) and at the display meter's (scaled).
 struct AnalysisPictures
 {
     std::vector<unsigned char> atExposure;
@@ -52,6 +59,7 @@ struct AnalysisPictures
     std::vector<unsigned char> atBalance;
     std::vector<unsigned char> atBalanceIsolated;
     std::vector<unsigned char> cacheFree;
+    std::vector<unsigned char> displayMeter;
 };
 
 bool renderAnalysisPictures( mlvObject_t *video, int frame, AnalysisPictures *out )
@@ -71,12 +79,20 @@ bool renderAnalysisPictures( mlvObject_t *video, int frame, AnalysisPictures *ou
     if( !ReceiptApplier::processedThumbnailAtBalance( video, frame, cd, 1, 0.5, 6600, 0, true,
                                                       out->atBalanceIsolated.data() ) )
         return false;
+    const int md = thumbnailDownscaleFor( video );
+    out->displayMeter.assign( static_cast<size_t>( video->RAWI.xRes / md ) * ( video->RAWI.yRes / md ) * 3, 0 );
+    // One fresh clone of the live object per render, as each caller takes it.
     processingObject_t *clone = processingCloneForAnalysis( video->processing );
     if( !clone ) return false;
     const int rendered = get_area_average_downscale_thumnail_with_processing_cachefree(
         video, frame, cd, 1, clone, nullptr, out->cacheFree.data() );
     processingFreeClone( clone );
-    return rendered != 0;
+    processingObject_t *meterClone = processingCloneForAnalysis( video->processing );
+    if( !meterClone ) return false;
+    const int meterRendered = get_area_average_downscale_thumnail_with_processing_cachefree(
+        video, frame, md, 1, meterClone, nullptr, out->displayMeter.data() );
+    processingFreeClone( meterClone );
+    return rendered != 0 && meterRendered != 0;
 }
 
 void assertSamePictures( const AnalysisPictures &a, const AnalysisPictures &b )
@@ -86,6 +102,7 @@ void assertSamePictures( const AnalysisPictures &a, const AnalysisPictures &b )
     ASSERT_TRUE( a.atBalance == b.atBalance );
     ASSERT_TRUE( a.atBalanceIsolated == b.atBalanceIsolated );
     ASSERT_TRUE( a.cacheFree == b.cacheFree );
+    ASSERT_TRUE( a.displayMeter == b.displayMeter );
 }
 
 bool openFixture( MlvPipelineFixture &fixture, const char *clip )
