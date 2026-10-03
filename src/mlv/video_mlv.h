@@ -164,6 +164,10 @@ void getMlvProcessedFrame16(mlvObject_t * video, uint64_t frameIndex, uint16_t *
  * built. Check first (no mutation), then sync under a render-idle guard. */
 int mlvProcessingDualIsoBlackWhiteLevelsOutOfSync(mlvObject_t * video);
 void mlvSyncProcessingDualIsoBlackWhiteLevels(mlvObject_t * video);
+/* Analysis renders: give a caller-owned processing clone the clip (receipt) black/white
+ * levels of an HQ Dual ISO clip, whatever render last synced the live object. Never
+ * touches the live object. Returns 1 when it applies (HQ Dual ISO). */
+int mlvSetAnalysisProcessingClipLevels(mlvObject_t * video, processingObject_t * analysis_processing);
 
 void getMlvProcessedFrame8Scaled(mlvObject_t * video,
                                  uint64_t frameIndex,

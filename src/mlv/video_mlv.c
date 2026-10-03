@@ -6283,6 +6283,35 @@ void mlvSyncProcessingDualIsoBlackWhiteLevels(mlvObject_t * video)
     mlv_sync_processing_black_white_levels(video);
 }
 
+/* LOOK-ASSIST-ANALYSIS-RENDER-RACE-1: an analysis render clones the live processing
+ * object. For an HQ Dual ISO clip its black/white levels are the clip's (receipt)
+ * levels until a render syncs them to the recon output (the classic cores per frame,
+ * the GPU route at dispatch time), so the clone's levels -- and on a restricted-range
+ * lossless clip the analysed picture, by ~2.6x -- depended on whether a render had
+ * been dispatched before the analysis ran. Every analysis render now takes the clip
+ * levels explicitly: the state the headless applier always analyses (applyToMlv sets
+ * them) and the GUI analysed in the usual timing, which the Look Assist thresholds
+ * are calibrated on. Not HQ Dual ISO: sync and clip levels agree; left untouched.
+ * The white level tells the two states apart (the recon keeps the black level); a
+ * clone already at the clip white keeps its black level as the raw-black control set
+ * it, fraction included. */
+int mlvSetAnalysisProcessingClipLevels(mlvObject_t * video, processingObject_t * analysis_processing)
+{
+    if (!video || !video->llrawproc || !analysis_processing || !llrpHQDualIso(video)) return 0;
+
+    const int black_level = getMlvBlackLevel(video);
+    const int white_level = getMlvWhiteLevel(video);
+    const int bit_depth = getMlvBitdepth(video);
+    if (bit_depth <= 0 || bit_depth > 16 || white_level <= black_level) return 0;
+
+    const int expected_white_level = (int)((double)(white_level << (16 - bit_depth)) * 0.993);
+    if (analysis_processing->white_level != expected_white_level)
+    {
+        processingSetBlackAndWhiteLevel(analysis_processing, (float)black_level, white_level, bit_depth);
+    }
+    return 1;
+}
+
 static int mlv_can_use_direct_processed_frame8_path(mlvObject_t * video)
 {
     return video
