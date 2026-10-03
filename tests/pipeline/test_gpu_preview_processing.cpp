@@ -3405,6 +3405,30 @@ TEST(GpuPreviewProcessing, EngineAnchoredCreativeChainMatchesEngineOnBothCpuRout
         { "hue_vs_curves",
           [](processingObject_t * p) { fill_test_hue_vs_curves(p); },
           [](const GpuPreviewProcessingConfig & c) { return c.applyHueVs; } },
+        /* r2 (sol blocker): the ramp's clipped highlights reach V == 1, which the
+         * engine used to look up at luma_vs_saturation[36000], one past the table,
+         * while the shader clamps to 35999. Both now read the last entry. */
+        { "luma_vs_saturation_clipped_highlight",
+          [](processingObject_t * p) {
+              /* a plain power transfer (the default x/(1+x) rolloff never reaches
+               * 65535) + 2 stops: the ramp's top reaches gamma 65535 (V == 1) */
+              (void)processingSetTransferFunction(p, const_cast<char *>("pow(x, 1/3.15)"));
+              processingSetExposureStops(p, 2.0);
+              for (int i = 0; i < 36000; ++i) p->luma_vs_saturation[i] = -0.5f;
+              p->luma_vs_saturation_used = 1;
+          },
+          [](const GpuPreviewProcessingConfig & c) { return c.applyHueVs; } },
+        { "hue_vs_luma_boost_past_one",
+          [](processingObject_t * p) {
+              for (int i = 0; i < 36000; ++i)
+              {
+                  p->hue_vs_luma[i] = 0.5f;
+                  p->luma_vs_saturation[i] = -0.5f;
+              }
+              p->hue_vs_luma_used = 1;
+              p->luma_vs_saturation_used = 1;
+          },
+          [](const GpuPreviewProcessingConfig & c) { return c.applyHueVs; } },
         { "agx",
           [](processingObject_t * p) { processingEnableAgX(p); },
           [](const GpuPreviewProcessingConfig & c) { return c.applyAgx; } },
@@ -3615,6 +3639,216 @@ TEST(GpuPreviewProcessing, DisplayShaderRefusalPredicateMatchesConfigFlags)
         p->gradient_enable = 0;
         p->gradient_exposure_stops = 0.0;
     }
+}
+
+TEST(GpuPreviewProcessing, DisplayShaderRefusalInventoryNamesGateRejectedStages)
+{
+    /* GL-free (r2, sol hardening). Stages the older subset gate already rejects
+     * also carry a typed name, so the texture-route fallback reason says WHICH
+     * stage kept playback off the display shader. Each state is rejected by the
+     * gate (the config is disabled, so only the processing predicate can name it). */
+    MlvPipelineFixture fixture;
+    assert_gpu_preview_fixture_ready(fixture);
+
+    struct GateRejectedState
+    {
+        const char * label;
+        std::function<void(processingObject_t *)> apply;
+        const char * expected;
+    };
+    const std::vector<GateRejectedState> states = {
+        { "filter", [](processingObject_t * p) { p->filter_on = 1; }, "filter" },
+        { "rbf_denoise_luma", [](processingObject_t * p) { p->rbfDenoiserLuma = 20; }, "rbf_denoise" },
+        { "rbf_denoise_chroma", [](processingObject_t * p) { p->rbfDenoiserChroma = 20; }, "rbf_denoise" },
+        { "grain", [](processingObject_t * p) { p->grainStrength = 10; }, "grain" },
+        { "ca_correction", [](processingObject_t * p) { p->ca_desaturate = 30; }, "ca_correction" },
+        { "clarity", [](processingObject_t * p) { p->clarity = 0.4; }, "clarity" },
+        { "sharpen_edge_mask", [](processingObject_t * p) {
+              processingSetSharpening(p, 0.5);
+              p->sh_masking = 40;
+          }, "sharpen_edge_mask" },
+        { "sharpen_with_chroma_separation", [](processingObject_t * p) {
+              processingSetSharpening(p, 0.5);
+              p->cs_zone.use_cs = 1;
+          }, "chroma_separation,sharpen_with_chroma_separation" },
+        { "median_window_over_5", [](processingObject_t * p) {
+              p->denoiserStrength = 50;
+              p->denoiserWindow = 7;
+          }, "median_denoise_window" },
+        { "transform_upside_down", [](processingObject_t * p) { processingSetTransformation(p, TR_ROT180); },
+          "transform" },
+    };
+    for (const GateRejectedState & state : states)
+    {
+        configure_gpu_preview_supported_subset(fixture);
+        processingObject_t * p = fixture.processing();
+        p->lut_on = 0;
+        processingSetVignetteStrength(p, 0);
+        p->gradient_mask = nullptr;
+        p->gradient_enable = 0;
+        state.apply(p);
+
+        const std::string label(state.label);
+        QString reason;
+        if (gpuPreviewProcessingIsSupported(p, &reason))
+        {
+            ::minitest::fail(__FILE__, __LINE__, "subset gate accepted " + label, "expected a reject");
+        }
+        ASSERT_TRUE(!gpuPreviewProcessingBuildConfig(p, &reason).enabled);
+        const QStringList stages = gpuPreviewProcessingDisplayShaderRefusedStages(p);
+        const QString named = stages.join(QLatin1Char(','));
+        std::cout << "[DISPLAY-REFUSAL-GATE] " << label << " gate=" << reason.toStdString()
+                  << " stages=" << named.toStdString() << "\n";
+        if (named != QString::fromLatin1(state.expected))
+        {
+            ::minitest::fail(__FILE__, __LINE__, "typed refusal of gate-rejected " + label,
+                             "expected=" + std::string(state.expected) + " got=" + named.toStdString());
+        }
+        ASSERT_TRUE(gpuPreviewProcessingDisplayShaderRefusalReason(stages)
+                    == QStringLiteral("display_shader_refused_stages=") + QString::fromLatin1(state.expected));
+
+        p->filter_on = 0;
+        p->rbfDenoiserLuma = 0;
+        p->rbfDenoiserChroma = 0;
+        p->grainStrength = 0;
+        p->ca_desaturate = 0;
+        p->clarity = 0.0;
+        processingSetSharpening(p, 0.0);
+        p->sh_masking = 0;
+        p->cs_zone.use_cs = 0;
+        p->denoiserStrength = 0;
+        p->denoiserWindow = 0;
+        processingSetTransformation(p, TR_NONE);
+    }
+}
+
+TEST(GpuPreviewProcessing, DisplayShaderRefusesUpsideDownAndTheEngineFallbackRotates)
+{
+    /* GL-free (r2, fable blocker). Upside Down (TR_ROT180) rotates the frame in
+     * applyProcessingObject (get_frame_transformed); the display shader draws a
+     * fixed quad and the CPU subset reference does not rotate. So the subset gate
+     * rejects it: GPU preview processing turns off (mainWindowAllowsGpuPreviewProcessing
+     * needs gpuPreviewProcessingCompatible), which also withdraws the recon
+     * texture route (it needs GPU preview processing), and playback renders
+     * through the engine. Below: the gate rejects with a typed stage, and the
+     * engine picture is the unrotated picture turned 180 degrees. */
+    MlvPipelineFixture fixture;
+    assert_gpu_preview_fixture_ready(fixture);
+    configure_gpu_preview_supported_subset(fixture);
+    processingObject_t * p = fixture.processing();
+    processingAllowCreativeAdjustments(p);
+
+    QString reason;
+    ASSERT_TRUE(gpuPreviewProcessingIsSupported(p, &reason));
+    const std::vector<uint16_t> upright = fixture.renderFrame16(0, /*threads=*/1);
+    ASSERT_TRUE(!upright.empty());
+
+    processingSetTransformation(p, TR_ROT180);
+    ASSERT_TRUE(!gpuPreviewProcessingIsSupported(p, &reason));
+    ASSERT_TRUE(reason.contains(QStringLiteral("transform")));
+    ASSERT_TRUE(!gpuPreviewProcessingBuildConfig(p, &reason).enabled);
+    ASSERT_TRUE(gpuPreviewProcessingDisplayShaderRefusedStages(p) == QStringList{ QStringLiteral("transform") });
+
+    const std::vector<uint16_t> rotated = fixture.renderFrame16(0, /*threads=*/1);
+    processingSetTransformation(p, TR_NONE);
+    ASSERT_EQ(upright.size(), rotated.size());
+    const size_t pixels = upright.size() / 3u;
+    size_t mismatched = 0;
+    size_t moved = 0;
+    for (size_t index = 0; index < pixels; ++index)
+    {
+        const size_t mirror = pixels - 1u - index;
+        for (int channel = 0; channel < 3; ++channel)
+        {
+            const int expected = upright[mirror * 3u + channel];
+            const int actual = rotated[index * 3u + channel];
+            if (std::abs(expected - actual) > 1) ++mismatched;
+            if (std::abs(static_cast<int>(upright[index * 3u + channel]) - actual) > 64) ++moved;
+        }
+    }
+    std::cout << "[ROT180] engine fallback: mismatched_vs_rotated_upright=" << mismatched
+              << " differs_from_unrotated=" << moved << " of " << upright.size() << "\n";
+    ASSERT_EQ(static_cast<size_t>(0), mismatched);
+    ASSERT_TRUE(moved > upright.size() / 10u);   /* the frame really turned */
+}
+
+TEST(GpuPreviewProcessing, EngineHueVsCurveIndexStaysInsideTheTable)
+{
+    /* GL-free (r2, sol blocker). The four hue-vs / luma-vs tables are float[36000].
+     * The engine indexed luma_vs_saturation by V * 36000, so V == 1 (every clipped
+     * highlight) read entry 36000, one past the table, and a hue_vs_luma boost
+     * past V == 1 read further still. The index is now clamped to the last entry,
+     * the value the shader and the CPU reference already read. */
+    ASSERT_EQ(0, processingHueVsCurveIndex(0.0 * 36000.0));          /* V = 0 */
+    ASSERT_EQ(35999, processingHueVsCurveIndex(1.0 * 36000.0));      /* V = 1 */
+    ASSERT_EQ(18000, processingHueVsCurveIndex(0.5 * 36000.0));
+    ASSERT_EQ(35999, processingHueVsCurveIndex(3.0 * 36000.0));      /* boosted V */
+    ASSERT_EQ(35999, processingHueVsCurveIndex(1.0e12));
+    ASSERT_EQ(0, processingHueVsCurveIndex(-5.0));
+    ASSERT_EQ(0, processingHueVsCurveIndex(std::nan("")));
+    ASSERT_EQ(35999, processingHueVsCurveIndex(359.999 * 100.0));    /* hue tables */
+    ASSERT_EQ(35999, processingHueVsCurveIndex(360.0 * 100.0));
+    ASSERT_EQ(12345, processingHueVsCurveIndex(12345.99));           /* truncates, as before */
+
+    /* Behaviour: luma_vs_saturation = -0.5 everywhere makes saturation zero, so
+     * every engine pixel must come out neutral -- including the V == 1 highlights,
+     * which used to keep their colour (the read past the table returned ~0). */
+    MlvPipelineFixture fixture;
+    assert_gpu_preview_fixture_ready(fixture);
+    configure_gpu_preview_supported_subset(fixture);
+    processingObject_t * p = fixture.processing();
+    processingAllowCreativeAdjustments(p);
+    processingSetWhiteBalance(p, 4500.0, 10.0);
+    ASSERT_EQ(0, processingSetTransferFunction(p, const_cast<char *>("pow(x, 1/3.15)")));
+    processingSetExposureStops(p, 2.0);
+    ASSERT_EQ(65535, static_cast<int>(p->pre_calc_gamma[65535]));
+    (void)fixture.renderDebayeredFrame16(0);
+    int width = 0;
+    int height = 0;
+    const std::vector<uint16_t> frame = make_synthetic_ramp_frame(p, 130000.0, &width, &height);
+
+    auto chroma = [](const std::vector<uint16_t> & out, size_t pixel) {
+        const int r = out[pixel * 3u], g = out[pixel * 3u + 1u], b = out[pixel * 3u + 2u];
+        return std::max(r, std::max(g, b)) - std::min(r, std::min(g, b));
+    };
+    const std::vector<uint16_t> plain = run_production_engine_on_frame(p, frame, width, height);
+    /* A plain power transfer (the default x/(1+x) rolloff never reaches 65535) and +2 stops (folded into
+     * the gamma LUT) drive the ramp's top into the gamma ceiling, so the hue-vs
+     * stage sees V == 1; after the creative curves that ceiling is the frame's
+     * brightest output code. */
+    auto top = [](const std::vector<uint16_t> & out, size_t pixel) {
+        return static_cast<int>(std::max(out[pixel * 3u], std::max(out[pixel * 3u + 1u], out[pixel * 3u + 2u])));
+    };
+    int brightest = 0;
+    for (size_t pixel = 0; pixel < plain.size() / 3u; ++pixel) brightest = std::max(brightest, top(plain, pixel));
+    size_t clippedChroma = 0;
+    for (size_t pixel = 0; pixel < plain.size() / 3u; ++pixel)
+    {
+        if (top(plain, pixel) == brightest && chroma(plain, pixel) > 1000) ++clippedChroma;
+    }
+    ASSERT_TRUE(clippedChroma > 50);   /* the ramp really has coloured V == 1 pixels */
+
+    for (int boosted = 0; boosted < 2; ++boosted)
+    {
+        for (int i = 0; i < 36000; ++i)
+        {
+            p->luma_vs_saturation[i] = -0.5f;
+            p->hue_vs_luma[i] = boosted ? 0.5f : 0.0f;
+        }
+        p->luma_vs_saturation_used = 1;
+        p->hue_vs_luma_used = boosted ? 1 : 0;
+        const std::vector<uint16_t> out = run_production_engine_on_frame(p, frame, width, height);
+        size_t coloured = 0;
+        for (size_t pixel = 0; pixel < out.size() / 3u; ++pixel)
+        {
+            if (chroma(out, pixel) > 2) ++coloured;
+        }
+        std::cout << "[HUEVS-INDEX] boosted=" << boosted << " clipped_chroma_pixels_before=" << clippedChroma
+                  << " coloured_after_desaturate=" << coloured << "\n";
+        ASSERT_EQ(static_cast<size_t>(0), coloured);
+    }
+    p->luma_vs_saturation_used = 0;
+    p->hue_vs_luma_used = 0;
 }
 
 TEST(GpuPreviewProcessing, PlaybackTextureRouteRefusalIsWiredIntoThePolicy)

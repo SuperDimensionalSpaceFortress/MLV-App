@@ -3930,7 +3930,9 @@ void apply_processing_object( processingObject_t * processing,
             if( sat > 1.0 ) sat = 1.0;
             // ///////////////////////
 
-            uint16_t hue = (uint16_t)(hsl[0] * 100.0);
+            /* Clamped to the float[36000] tables: V == 1 (and a hue_vs_luma boost
+             * past it) used to index luma_vs_saturation[36000] and beyond. */
+            const int hue = processingHueVsCurveIndex(hsl[0] * 100.0);
 
             hsl[2] *= 1.0 + (processing->hue_vs_luma[hue] * sat * 2);
             if( hsl[2] < 0.0 ) hsl[2] = 0.0;
@@ -3944,7 +3946,7 @@ void apply_processing_object( processingObject_t * processing,
             if( hsl[0] < 0 ) hsl[0] += 360;
             else if( hsl[0] >= 360 ) hsl[0] -= 360;
 
-            uint16_t luma = (uint16_t)((hsl[2]) * 36000.0);
+            const int luma = processingHueVsCurveIndex(hsl[2] * 36000.0);
             hsl[1] *= 1.0 + (processing->luma_vs_saturation[luma] * 2);
             if( hsl[1] < 0.0 ) hsl[1] = 0.0;
 

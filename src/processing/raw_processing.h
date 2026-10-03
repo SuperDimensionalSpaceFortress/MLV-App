@@ -549,6 +549,17 @@ void apply_processing_object(processingObject_t * processing,
                               float *vignetteMask,
                               processing_core_timing_t * core_timing);
 
+/* Index into the float[36000] hue-vs / luma-vs tables (processing_object.h) from
+ * a scaled value (hue * 100 or V * 36000), truncated as before and clamped to the
+ * last entry. V == 1 (any clipped highlight) or a hue_vs_luma boost past 1 used
+ * to read luma_vs_saturation[36000] and beyond. NaN maps to 0. */
+static inline int processingHueVsCurveIndex(double scaled)
+{
+    if( !(scaled > 0.0) ) return 0;
+    if( scaled >= 35999.0 ) return 35999;
+    return (int)scaled;
+}
+
 /* Pass frame buffer and do the transform on it */
 void get_frame_transformed(processingObject_t * processing, uint16_t * frame_buf , uint16_t imageX, uint16_t imageY);
 

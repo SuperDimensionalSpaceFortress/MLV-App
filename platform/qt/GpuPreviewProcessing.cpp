@@ -159,12 +159,11 @@ float sampleNormalizedLut(const QByteArray & lutBytes, float normalized)
 
 /* Hue-vs / luma-vs creative curves are float[36000] in [-1,1]. The CPU
  * reference reads them directly; the GPU uploads each as an R32F texture and
- * samples by the same integer index, so both stay bit-aligned. The luma index
- * is clamped to [0,35999]: hue_vs_luma can boost V (hsv[2]) to >= 1.0, and the
- * production path then indexes luma_vs_saturation[] out of bounds (the array is
- * exactly 36000 entries, and V == 1.0 already yields index 36000). That read is
- * undefined on the CPU, so both this reference and the shader clamp to the last
- * valid sample instead of matching undefined behaviour. */
+ * samples by the same integer index, so both stay bit-aligned. The index is
+ * clamped to [0,35999], as the engine's is (processingHueVsCurveIndex): V == 1.0
+ * yields index 36000 and a hue_vs_luma boost past 1.0 more, which the engine
+ * used to read past the end of luma_vs_saturation[] (fixed in
+ * PLAYBACK-SEEK-RENDER-PARITY-1 r2). */
 constexpr int kHueVsCurveSamples = 36000;
 
 float sampleHueVsCurve(const QByteArray & curveBytes, int index)
@@ -797,8 +796,8 @@ void applyPreviewProcessingPixel(const GpuPreviewProcessingConfig & config,
          * raw_processing.c:3523-3578: RGB->HSV, four signed-curve adjustments
          * indexed by hue (H*100) and luma (V*36000), HSV->RGB, then rounded back
          * to uint16. Float32 mirrors the shader (+/-1 LSB vs the CPU double
-         * pipeline, within engine tolerance). The luma curve index is clamped
-         * (see sampleHueVsCurve) rather than matching the production OOB read. */
+         * pipeline, within engine tolerance). The curve index is clamped to the
+         * table (see sampleHueVsCurve), as the engine's is. */
         float rgb[3];
         for (int channel = 0; channel < 3; ++channel)
         {
@@ -2969,7 +2968,11 @@ QStringList gpuPreviewProcessingDisplayShaderRefusedStages(const GpuPreviewProce
 QStringList gpuPreviewProcessingDisplayShaderRefusedStages(const processingObject_t * processing)
 {
     /* Mirrors gpuPreviewProcessingBuildConfig's stage flags term for term (pinned
-     * by GpuPreviewProcessing.DisplayShaderRefusalPredicateMatchesConfigFlags). */
+     * by GpuPreviewProcessing.DisplayShaderRefusalPredicateMatchesConfigFlags),
+     * then names the stages gpuPreviewProcessingIsSupported rejects outright, so
+     * the texture-route fallback reason says which one kept playback off the
+     * display shader (GpuPreviewProcessing.DisplayShaderRefusalInventoryNamesGateRejectedStages).
+     * The config overload cannot name those: their config is disabled. */
     QStringList stages;
     if ( !processing ) return stages;
     if ( processing->vignette_strength != 0
@@ -3001,6 +3004,22 @@ QStringList gpuPreviewProcessingDisplayShaderRefusedStages(const processingObjec
     {
         stages << QStringLiteral("median_denoise");
     }
+    /* Rejected by gpuPreviewProcessingIsSupported (same predicates). */
+    if ( processing->filter_on ) stages << QStringLiteral("filter");
+    if ( processing->denoiserStrength > 0 && processing->denoiserWindow > 5 )
+    {
+        stages << QStringLiteral("median_denoise_window");
+    }
+    if ( processing->rbfDenoiserLuma > 0 || processing->rbfDenoiserChroma > 0 ) stages << QStringLiteral("rbf_denoise");
+    if ( processing->grainStrength > 0 ) stages << QStringLiteral("grain");
+    if ( processing->ca_desaturate > 0 ) stages << QStringLiteral("ca_correction");
+    if ( processing->sharpen > 0.005 && processing->sh_masking > 0 ) stages << QStringLiteral("sharpen_edge_mask");
+    if ( processing->sharpen > 0.005 && processing->cs_zone.use_cs )
+    {
+        stages << QStringLiteral("sharpen_with_chroma_separation");
+    }
+    if ( std::fabs(processing->clarity) >= 0.01 ) stages << QStringLiteral("clarity");
+    if ( processing->transformation != TR_NONE ) stages << QStringLiteral("transform");
     return stages;
 }
 
@@ -3098,6 +3117,11 @@ bool gpuPreviewProcessingIsSupported(const processingObject_t * processing,
         return reject(QStringLiteral("chroma blur radius exceeds 127"));
     }
     if ( std::fabs(processing->clarity) >= 0.01 ) return reject(QStringLiteral("clarity enabled"));
+    /* Upside Down (TR_ROT180): applyProcessingObject turns the frame before any
+     * stage (get_frame_transformed). Neither shader nor the CPU subset reference
+     * rotates, so reject: GPU preview processing turns off and playback renders
+     * through the engine, which does. */
+    if ( processing->transformation != TR_NONE ) return reject(QStringLiteral("transform (upside down) enabled"));
     /* Shadows/highlights are supported when the caller attaches the current
      * frame's blur mask after the production processing pre-pass has refreshed
      * it. No reject here; gpuPreviewProcessingApplyGpuOffscreen fails closed if
