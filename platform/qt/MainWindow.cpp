@@ -15496,7 +15496,8 @@ void MainWindow::applyLookAssistToReceipt( ReceiptSettings *receipt,
     lookAssistSetSceneEv100( &stats,
                              m_pMlvObject->EXPO.isoValue,
                              static_cast<double>( m_pMlvObject->EXPO.shutterValue ),
-                             m_pMlvObject->LENS.aperture );
+                             m_pMlvObject->LENS.aperture,
+                             m_pMlvObject->DISO.isoValue );
     {
         int asShotTemperature = 6000;
         int asShotTint = 0;
@@ -15544,12 +15545,14 @@ void MainWindow::applyLookAssistToReceipt( ReceiptSettings *receipt,
     };
     // The master pass gives the recorded exposure no say: no picture evidence is asked for, so the scene is
     // the one master classified (daylight needs the evidence).
-    const LookAssistScene scene = resolveLookAssistScene(
+    // Not const: a night verdict that the aperture-bounded exposure rules out and a verified surface backs becomes the
+    // daylight class after the white balance (resolveLookAssistWindowLitInterior below).
+    LookAssistScene scene = resolveLookAssistScene(
         &stats, s_lookAssistMasterScenePass ? LookAssistRenderFn() : LookAssistRenderFn( renderProcessed ) );
     // Observation only: how the verdict and balance were reached, appended to look_assist.apply.result.
     LookAssistDecisionTrace decisionTrace;
     decisionTrace.pictureEvidenceAsked = !s_lookAssistMasterScenePass;
-    const bool floorLiftedNightThumbnail =
+    bool floorLiftedNightThumbnail =
         lookAssistIsFloorLiftedNightThumbnail( scene, stats );
     const bool processedColorWanted = lookAssistShouldAnalyzeProcessedColor( scene, stats );
     const bool canAnalyzeProcessedColor =
@@ -15727,8 +15730,10 @@ void MainWindow::applyLookAssistToReceipt( ReceiptSettings *receipt,
     // worker and 62 live) and a slower one (8 s settle window exceeded on the large clip). And when nothing
     // backs the daylight verdict the clip is re-analysed as master analyses it (the master pass below), which
     // is a sync-path analysis too. Running the one consumer path guarantees sync and async land on the same
-    // white balance, by construction. The master pass itself stays on the sync path for the same reason.
-    const bool daylightNeedsLivePicture = lookAssistIsDaylightScene( stats, scene ) || s_lookAssistMasterScenePass;
+    // white balance, by construction. The master pass itself stays on the sync path for the same reason. So does a night
+    // verdict the aperture-bounded exposure rules out: its check verifies (and may search) on the live picture.
+    const bool daylightNeedsLivePicture = lookAssistIsDaylightScene( stats, scene ) || s_lookAssistMasterScenePass
+                                        || lookAssistNotNightByExposureBoundCandidate( stats, scene );
     if( !s_syncMode && !daylightNeedsLivePicture )
     {
         // Capture slider bounds (UI-thread-only values) before dispatch.
@@ -16473,10 +16478,10 @@ void MainWindow::applyLookAssistToReceipt( ReceiptSettings *receipt,
         s_lookAssistMasterScenePass = false;
         return;
     }
-    // MEASURED, NOT APPLIED (LOOK-ASSIST-WINDOW-LIT-INTERIOR-1): on the owner clip the accepted solve did not verify
-    // (re-rendered at it, its own patch turns amber), so the window-lit reclassification stays off until the verdict
-    // (EV100 bound for a missing aperture) and balance (verified-surface search) follow-ons land. The check runs on
-    // copies and only logs what it measured; this pass's verdict, preset and balance are master's (shared with headless).
+    // The window-lit check runs on copies. By colour alone it is MEASURED, NOT APPLIED (LOOK-ASSIST-WINDOW-LIT-INTERIOR-1:
+    // a colour rule cannot tell the owner clip from a cool-white LED night). It APPLIES only when the aperture-bounded
+    // exposure rules night out and a verified surface backs the balance (LOOK-ASSIST-M16-NOT-NIGHT-1): then the verdict,
+    // stats and preset are the check's (shared with headless), so the night walk below does not run. Never in master's pass.
     LookAssistStats windowLitStats = stats;
     LookAssistScene windowLitScene = scene;
     LookAssistPreset windowLitPreset = preset;
@@ -16486,13 +16491,24 @@ void MainWindow::applyLookAssistToReceipt( ReceiptSettings *receipt,
         windowLitRequest, wb, m_pMlvObject->processing->exposure_stops, &windowLitStats, &windowLitScene, &windowLitPreset,
         useProcessedColorStats ? &processedColorStats : nullptr,
         displayStatsValidUi ? &displayStatsUi : nullptr );
+    const bool windowLitApplied = windowLit.applies && !s_lookAssistMasterScenePass;
+    if( windowLitApplied )
+    {
+        stats = windowLitStats;
+        scene = windowLitScene;
+        preset = windowLitPreset;
+        floorLiftedNightThumbnail = lookAssistIsFloorLiftedNightThumbnail( scene, stats );
+    }
+    lookAssistTraceSurfaceSearch( &decisionTrace, windowLit );
     if( windowLit.candidate )
     {
         logInteractionEvent(
             QStringLiteral("look_assist.window_lit_interior"),
             QStringLiteral("would_reclassify=%1 reason=%2 scene=%3 base_surface_chroma=%4 base_surface_blue_amber=%5 "
                            "solution_surface_chroma=%6 solution_surface_blue_amber=%7 frame=%8 "
-                           "expo_iso=%9 expo_shutter_us=%10 lens_aperture_x100=%11")
+                           "expo_iso=%9 expo_shutter_us=%10 lens_aperture_x100=%11 applied=%12 exposure_bound=%13 "
+                           "recovery_iso=%14 surface_search=%15 search_renders=%16 search_balance=%17/%18 "
+                           "search_surface_chroma=%19 applied_balance=%20/%21")
                 .arg( bool01( windowLit.evidence ) )
                 .arg( windowLit.reason )
                 .arg( lookAssistSceneName( scene ) )
@@ -16504,7 +16520,17 @@ void MainWindow::applyLookAssistToReceipt( ReceiptSettings *receipt,
                 // The raw EXPO / LENS fields behind has_ev100=0: which one is missing decides the follow-on.
                 .arg( static_cast<qulonglong>( m_pMlvObject->EXPO.isoValue ) )
                 .arg( static_cast<qulonglong>( m_pMlvObject->EXPO.shutterValue ) )
-                .arg( static_cast<qulonglong>( m_pMlvObject->LENS.aperture ) ) );
+                .arg( static_cast<qulonglong>( m_pMlvObject->LENS.aperture ) )
+                .arg( bool01( windowLitApplied ) )
+                .arg( bool01( windowLit.exposureBound ) )
+                .arg( static_cast<qulonglong>( m_pMlvObject->DISO.isoValue ) )
+                .arg( windowLit.search.result )
+                .arg( windowLit.search.renders )
+                .arg( windowLit.search.temperature )
+                .arg( windowLit.search.tint )
+                .arg( windowLit.search.surface.chroma, 0, 'f', 1 )
+                .arg( windowLit.appliedTemperature )
+                .arg( windowLit.appliedTint ) );
     }
     const bool autoWhiteBalanceValid = wb.autoValid;
     const QString autoWhiteBalanceSource = wb.source;
