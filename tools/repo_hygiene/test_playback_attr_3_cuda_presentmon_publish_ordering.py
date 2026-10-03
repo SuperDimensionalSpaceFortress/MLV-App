@@ -492,6 +492,14 @@ class EmbeddedFunctionCoverageTests(unittest.TestCase):
         shared_list = text[shared_call:shared_list_end]
         cls.shared_parser_names = re.findall(r"'([A-Za-z]+-[A-Za-z]+)'", shared_list)
 
+        # UM-PRESENTMON-ORPHAN-SWEEP-1: the card's three module helpers are spliced by a FOURTH statement (inside its own sentinel brackets, so the dual-venue byte-identity strip
+        # removes them), after the display-identity try/finally. Its -Name list is parsed out of the generator here and embedded from the working-tree module, so the
+        # helpers the template calls (Get-AttrCudaPresentMonEventsLost, ...) are checked as defined in the emitted job's text too.
+        orphan_marker = text.index("# UM-PRESENTMON-ORPHAN-SWEEP-1: the card's module helpers", shared_call)
+        orphan_list_start = text.index("-Name @(", orphan_marker)
+        orphan_list_end = text.index("\n))", orphan_list_start)
+        cls.orphan_sweep_names = re.findall(r"'([A-Za-z]+-[A-Za-z]+)'", text[orphan_list_start:orphan_list_end])
+
         # The body ONLY -- unlike this file's other classes, which keep the "$template = @'"
         # prefix (harmless there, since they only ever substring-search it) -- because this class
         # feeds the text to PowerShell's own parser, and a bare unterminated "@'" opener with no
@@ -524,6 +532,8 @@ class EmbeddedFunctionCoverageTests(unittest.TestCase):
                 "$embeddedFunctions = $embeddedFunctions + \"`r`n`r`n\" + (Get-AttrCudaEmbeddedFunctionSource "
                 f"-ModulePath '{ROOT / 'tools' / 'profiling' / 'gui-smoke-display-identity.ps1'}' "
                 "-Name $sharedParserNames)\n"
+                "$orphanSweepNames = @(" + ",".join(f"'{n}'" for n in self.orphan_sweep_names) + ")\n"
+                "$embeddedFunctions = $embeddedFunctions + \"`r`n`r`n\" + (Get-AttrCudaEmbeddedFunctionSource -Name $orphanSweepNames)\n"
                 "$definedNames =[System.Collections.Generic.HashSet[string]]::new()\n"
                 "$tokens = $null; $errors = $null\n"
                 "$embeddedAst = [System.Management.Automation.Language.Parser]::ParseInput("

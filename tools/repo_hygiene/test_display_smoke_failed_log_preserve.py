@@ -264,6 +264,8 @@ class SmokeRunFailedBranchTests(_ProbeCase):
             "-Venue $measurementVenue -ExpectedWidth $expectedDisplayWidth -ExpectedHeight $expectedDisplayHeight "
             "-PreferredResolution $displayPreferResolution\n"
             + "function Stop-PresentMonCapture($Proc, [string]$SessionName = '') { [pscustomobject]@{ confirmedExited = $true; killError = $null; waitError = $null } }\n"
+            # UM-PRESENTMON-ORPHAN-SWEEP-1 r2: the branch traces the stop and names the post-Kill terminate (both are job functions, stubbed here like the stop itself)
+            + "function Write-JobTrace([string]$Message) { }\nfunction Format-PresentMonSessionTerminateText($Terminate) { '<stub>' }\n"
             + "function Save-Json($Object, [string]$Path) { $Object | ConvertTo-Json -Depth 30 | Set-Content -LiteralPath $Path -Encoding UTF8 }\n"
             + setup_log
             + _failure_branch() + "\n"

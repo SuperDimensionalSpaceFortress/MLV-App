@@ -2015,6 +2015,289 @@ function Publish-AttrCudaPresentMonCaptureEvidence {
     }
 }
 
+function Get-AttrCudaPresentMonOrphanSessionName {
+    <#
+    .SYNOPSIS
+    The ETW session names in a `logman query -ets` listing that a PresentMon capture of this harness may have left orphaned: the default `PresentMon` and every `MLVAttr3-*`.
+    .DESCRIPTION
+    UM-PRESENTMON-ORPHAN-SWEEP-1 (Ultra-Magnus, 2026-10-03): an orphaned default-named session made every OTHER-named PresentMon session lose all of its events, and a killed
+    capture leaves its own MLVAttr3-* session behind. Only those two shapes are ever candidates -- a name that merely starts with either (PresentMon_other, PresentMonitor2) or
+    contains it (MyMLVAttr3-x) belongs to somebody else and is never listed here. A listing line is `<name> <type> <status>`, so the name must be followed by whitespace; the
+    header, the rule line and the footer never match. Each name is returned once, as the listing spells it (names are case-insensitive to PresentMon and logman). Pure text in,
+    names out: it never runs logman.
+    #>
+    [CmdletBinding()]
+    param(
+        [AllowEmptyString()][string]$ListingText = ''
+    )
+
+    $seen = @{}
+    $names = @()
+    foreach ($line in ($ListingText -split "\r?\n")) {
+        $match = [regex]::Match($line, '^\s*(PresentMon|MLVAttr3-[A-Za-z0-9_-]+)\s+\S', [Text.RegularExpressions.RegexOptions]::IgnoreCase)
+        if (-not $match.Success) { continue }
+        $name = $match.Groups[1].Value
+        if ($seen.ContainsKey($name.ToLowerInvariant())) { continue }
+        $seen[$name.ToLowerInvariant()] = $true
+        $names += $name
+    }
+    return $names
+}
+
+function Get-AttrCudaEtsSessionListing {
+    <#
+    .SYNOPSIS
+    `logman query -ets` run once: its text and exit code. The job's orphan sweep reads the live ETW session list through this, never through a call operator in the scanned template.
+    .DESCRIPTION
+    UM-PRESENTMON-ORPHAN-SWEEP-1. The emitted job template is write-scanned (attr3_publish_write_scan.ps1 R3: `&` only on an allowlisted child executable), so the one
+    external command the sweep needs lives here, in the runtime helper boundary, like the module's other Win32 surface. Read-only: `query` changes nothing. Never throws; a failure
+    to run it is in `error` and leaves `exitCode` null.
+    #>
+    [CmdletBinding()]
+    param(
+        [string]$LogmanPath = '',
+        [int]$TimeoutSeconds = 15
+    )
+
+    $run = Invoke-AttrCudaLogman -Argument @('query', '-ets') -LogmanPath $LogmanPath -TimeoutSeconds $TimeoutSeconds
+    return [ordered]@{ exitCode = $run.exitCode; text = $run.text; timedOut = $run.timedOut; error = $run.error }
+}
+
+function Invoke-AttrCudaLogman {
+    <#
+    .SYNOPSIS
+    One `logman` invocation with a deadline: its exit code, its stdout text, whether it timed out, and any failure to run it. Never throws, never waits longer than -TimeoutSeconds (plus a short drain).
+    .DESCRIPTION
+    UM-SWEEP-LOGMAN-BOUND-1 (fable hardening 3, sol hardening): the orphan sweep makes three queries and one stop per stubborn session before every capture, and a native `logman` that stalls would hold
+    the capture's start until the agent's job budget killed the whole job. The call goes through a child process that is killed (with its tree) when the deadline passes; `timedOut` and `error`
+    then say so and `exitCode` stays null. -LogmanPath is the executable to run (default: logman.exe in the system directory); a test passes a stub, and the default is what the venue runs.
+    #>
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $true)][string[]]$Argument,
+        [string]$LogmanPath = '',
+        [int]$TimeoutSeconds = 15
+    )
+
+    $result = [ordered]@{ exitCode = $null; text = ''; timedOut = $false; error = $null }
+    try {
+        $executable = $LogmanPath
+        if ([string]::IsNullOrEmpty($executable)) { $executable = Join-Path ([Environment]::GetFolderPath('System')) 'logman.exe' }
+        $startInfo = [Diagnostics.ProcessStartInfo]::new($executable)
+        foreach ($item in $Argument) { [void]$startInfo.ArgumentList.Add($item) }
+        $startInfo.UseShellExecute = $false
+        $startInfo.RedirectStandardOutput = $true
+        $startInfo.RedirectStandardError = $true
+        $startInfo.CreateNoWindow = $true
+        $child = [Diagnostics.Process]::Start($startInfo)
+        try {
+            $outTask = $child.StandardOutput.ReadToEndAsync()
+            $errTask = $child.StandardError.ReadToEndAsync()
+            if ($child.WaitForExit($TimeoutSeconds * 1000)) {
+                [void]$outTask.Wait(5000)
+                [void]$errTask.Wait(5000)
+                $result.exitCode = [int]$child.ExitCode
+                if ($outTask.IsCompleted) { $result.text = [string]$outTask.Result }
+            } else {
+                $result.timedOut = $true
+                $result.error = "logman did not exit within $TimeoutSeconds s"
+                try { $child.Kill($true) } catch { $result.error = $result.error + "; Kill() failed: " + $_.Exception.Message }
+                [void]$child.WaitForExit(2000)
+            }
+        } finally {
+            $child.Dispose()
+        }
+    } catch {
+        $result.error = $_.Exception.Message
+    }
+    return $result
+}
+
+function Stop-AttrCudaEtsSession {
+    <#
+    .SYNOPSIS
+    `logman stop <name> -ets` for ONE of this harness's own PresentMon session names (the default `PresentMon` or an `MLVAttr3-*`), refusing every other name; returns the exit code.
+    .DESCRIPTION
+    UM-PRESENTMON-ORPHAN-SWEEP-1: the fallback of the orphan sweep, used only for a session still listed after the pinned PresentMon's own --terminate_existing_session. The name is
+    held to the same shape Get-AttrCudaPresentMonOrphanSessionName lists, so this can never stop somebody else's trace session whatever a caller passes. Never throws.
+    #>
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $true)][string]$SessionName,
+        [string]$LogmanPath = '',
+        [int]$TimeoutSeconds = 15
+    )
+
+    $result = [ordered]@{ exitCode = $null; timedOut = $false; error = $null }
+    if ($SessionName -notmatch '^(?i:PresentMon|MLVAttr3-[A-Za-z0-9_-]+)$') {
+        $result.error = 'refused: not a PresentMon or MLVAttr3-* session name'
+        return $result
+    }
+    $run = Invoke-AttrCudaLogman -Argument @('stop', $SessionName, '-ets') -LogmanPath $LogmanPath -TimeoutSeconds $TimeoutSeconds
+    $result.exitCode = $run.exitCode
+    $result.timedOut = $run.timedOut
+    $result.error = $run.error
+    return $result
+}
+
+function Get-AttrCudaTextEncodingFromHead {
+    <#
+    .SYNOPSIS
+    The text encoding of a stream from its first bytes: UTF-8, UTF-16LE or UTF-16BE, with the length of its BOM and the size of its code unit.
+    .DESCRIPTION
+    UM-PRESENTMON-ORPHAN-SWEEP-1 r2 (sol blocker 3): the diagnostic's real PresentMon stderr files are UTF-16LE with a FF FE BOM (Start-Process redirecting a console child under Windows PowerShell's
+    codepage), so a UTF-8-only read never saw the lost-events warning. A BOM decides (EF BB BF UTF-8, FF FE UTF-16LE, FE FF UTF-16BE); without one, a head whose odd-position bytes are mostly NUL is
+    UTF-16LE (ASCII text in UTF-16 is every second byte zero) and one whose even-position bytes are is UTF-16BE; anything else, ASCII included, is UTF-8. Pure bytes in, an answer out; never throws.
+    #>
+    [CmdletBinding()]
+    param(
+        [AllowEmptyCollection()][byte[]]$Head = @()
+    )
+
+    $utf8 = [pscustomobject]@{ name = 'utf-8'; encoding = [Text.UTF8Encoding]::new($false); bomLength = 0; codeUnitBytes = 1 }
+    $count = $Head.Length
+    if ($count -ge 3 -and $Head[0] -eq 0xEF -and $Head[1] -eq 0xBB -and $Head[2] -eq 0xBF) {
+        return [pscustomobject]@{ name = 'utf-8'; encoding = [Text.UTF8Encoding]::new($false); bomLength = 3; codeUnitBytes = 1 }
+    }
+    if ($count -ge 2 -and $Head[0] -eq 0xFF -and $Head[1] -eq 0xFE) {
+        return [pscustomobject]@{ name = 'utf-16le'; encoding = [Text.UnicodeEncoding]::new($false, $false); bomLength = 2; codeUnitBytes = 2 }
+    }
+    if ($count -ge 2 -and $Head[0] -eq 0xFE -and $Head[1] -eq 0xFF) {
+        return [pscustomobject]@{ name = 'utf-16be'; encoding = [Text.UnicodeEncoding]::new($true, $false); bomLength = 2; codeUnitBytes = 2 }
+    }
+    $pairs = [int][math]::Floor([math]::Min($count, 512) / 2)
+    if ($pairs -ge 2) {
+        $oddNul = 0
+        $evenNul = 0
+        for ($i = 0; $i -lt ($pairs * 2); $i++) {
+            if ($Head[$i] -ne 0) { continue }
+            if (($i % 2) -eq 1) { $oddNul++ } else { $evenNul++ }
+        }
+        if (($oddNul * 2) -ge $pairs) { return [pscustomobject]@{ name = 'utf-16le'; encoding = [Text.UnicodeEncoding]::new($false, $false); bomLength = 0; codeUnitBytes = 2 } }
+        if (($evenNul * 2) -ge $pairs) { return [pscustomobject]@{ name = 'utf-16be'; encoding = [Text.UnicodeEncoding]::new($true, $false); bomLength = 0; codeUnitBytes = 2 } }
+    }
+    return $utf8
+}
+
+function Get-AttrCudaPresentMonEventsLost {
+    <#
+    .SYNOPSIS
+    Whether PresentMon's captured stderr reports lost trace events, as a typed record: detected, how many messages, the largest count reported, and a PRESENTMON_EVENTS_LOST detail.
+    .DESCRIPTION
+    UM-PRESENTMON-ORPHAN-SWEEP-1: with a leftover session on the host, a capture lost 15-17k events per 12 s and wrote no CSV, which read only as "PresentMon output does not
+    exist". PresentMon prints a `warning: N ... events were lost.` line on stderr (the pinned 2.5.1 wording is matched below); this turns that line into a fact the evidence carries. Only the last 256 KB of the stream is read (opened
+    with FileShare.ReadWrite, like the publish: the capturing process may still hold it). Several lines are reported as a message count and the largest N -- they are not summed,
+    because the counts may be cumulative. A missing or unreadable stream detects nothing. Never throws.
+    #>
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $true)][string]$StderrPath
+    )
+
+    $result = [ordered]@{ detected = $false; messages = 0; maxReported = $null; detail = $null }
+    try {
+        if (-not (Test-Path -LiteralPath $StderrPath -PathType Leaf)) { return $result }
+        $in = [IO.File]::Open($StderrPath, [IO.FileMode]::Open, [IO.FileAccess]::Read, [IO.FileShare]::ReadWrite)
+        try {
+            $length = [int64]$in.Length
+            # the encoding is read from the start of the stream (its BOM, else the shape of its bytes) before the tail is cut: PresentMon's stderr as Start-Process redirects it is UTF-16LE with a BOM
+            $headLength = [int][math]::Min($length, [int64]512)
+            $head = New-Object byte[] $headLength
+            $headRead = 0
+            while ($headRead -lt $headLength) {
+                $n = $in.Read($head, $headRead, $headLength - $headRead)
+                if ($n -le 0) { break }
+                $headRead += $n
+            }
+            $encoding = Get-AttrCudaTextEncodingFromHead -Head $head
+            $start = [int64][math]::Max([int64]0, $length - [int64]262144)
+            # a tail that begins between the two bytes of a UTF-16 code unit would read as noise: it starts on the next unit boundary
+            if ($start -gt 0 -and $encoding.codeUnitBytes -gt 1 -and ($start % $encoding.codeUnitBytes) -ne 0) { $start += ($encoding.codeUnitBytes - ($start % $encoding.codeUnitBytes)) }
+            if ($start -eq 0) { $start = [int64][math]::Min($length, [int64]$encoding.bomLength) }
+            [void]$in.Seek($start, [IO.SeekOrigin]::Begin)
+            $keep = [int]($length - $start)
+            $buffer = New-Object byte[] $keep
+            $read = 0
+            while ($read -lt $keep) {
+                $n = $in.Read($buffer, $read, $keep - $read)
+                if ($n -le 0) { break }
+                $read += $n
+            }
+        } finally {
+            $in.Dispose()
+        }
+        $text = $encoding.encoding.GetString($buffer, 0, $read)
+        $largest = [int64]-1
+        $messages = 0
+        foreach ($match in [regex]::Matches($text, '(\d+)\s+ETW events were lost', [Text.RegularExpressions.RegexOptions]::IgnoreCase)) {
+            $messages++
+            $count = [int64]0
+            if ([int64]::TryParse($match.Groups[1].Value, [ref]$count) -and $count -gt $largest) { $largest = $count }
+        }
+        if ($messages -gt 0) {
+            $result.detected = $true
+            $result.messages = $messages
+            if ($largest -ge 0) { $result.maxReported = $largest }
+            $result.detail = "PRESENTMON_EVENTS_LOST: PresentMon reported dropped trace events (largest count $($result.maxReported) in $messages message(s)); a capture that loses its events writes no CSV rows, e.g. when another PresentMon ETW session is left on the host"
+        }
+    } catch {
+        $result.detected = $false
+    }
+    return $result
+}
+
+function Add-AttrCudaPresentMonEventsLostDetail {
+    <#
+    .SYNOPSIS
+    The PresentMon failure reason with the typed PRESENTMON_EVENTS_LOST detail appended when the capture lost events; the reason unchanged otherwise.
+    .DESCRIPTION
+    UM-PRESENTMON-ORPHAN-SWEEP-1: a recurrence of the starved capture must read as its cause in the summary's PresentMon reason, not as the symptom. A reason that already carries the
+    token is never given it twice, and a missing -EventsLost record (the scan did not run) leaves the reason alone.
+    #>
+    [CmdletBinding()]
+    param(
+        [AllowNull()][AllowEmptyString()][string]$Reason,
+        [AllowNull()][object]$EventsLost
+    )
+
+    if ($null -eq $EventsLost) { return $Reason }
+    $detected = $false
+    $detail = $null
+    try {
+        $detected = [bool]$EventsLost.detected
+        $detail = [string]$EventsLost.detail
+    } catch {
+        return $Reason
+    }
+    if (-not $detected -or [string]::IsNullOrEmpty($detail)) { return $Reason }
+    if (-not [string]::IsNullOrEmpty($Reason) -and $Reason.Contains('PRESENTMON_EVENTS_LOST')) { return $Reason }
+    if ([string]::IsNullOrEmpty($Reason)) { return $detail }
+    return "$Reason [$detail]"
+}
+
+function Add-AttrCudaPresentMonEventsLostDetailToReport {
+    <#
+    .SYNOPSIS
+    A PresentMon display report (a pscustomobject with a `reason`) whose reason carries the typed PRESENTMON_EVENTS_LOST detail; the same object when there is nothing to add.
+    .DESCRIPTION
+    UM-PRESENTMON-ORPHAN-SWEEP-1: the display-report failure branch reads `$displayReport.reason` in two places, and the scanned template may not assign to a member (R5), so the
+    report is replaced by a copy (properties and their order unchanged, only `reason` different) -- a plain variable assignment at the call site.
+    #>
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $true)][object]$Report,
+        [AllowNull()][object]$EventsLost
+    )
+
+    $current = [string]$Report.reason
+    $detailed = Add-AttrCudaPresentMonEventsLostDetail -Reason $current -EventsLost $EventsLost
+    if ($detailed -ceq $current) { return $Report }
+    $copy = [ordered]@{}
+    foreach ($property in $Report.PSObject.Properties) { $copy[$property.Name] = $property.Value }
+    $copy['reason'] = $detailed
+    return [pscustomobject]$copy
+}
+
 function Publish-AttrCudaContactSheetRawCaptures {
     <#
     .SYNOPSIS
@@ -6037,6 +6320,14 @@ Export-ModuleMember -Function `
     Publish-AttrCudaFileCopy, `
     Publish-AttrCudaBoundedTextCopy, `
     Publish-AttrCudaPresentMonCaptureEvidence, `
+    Get-AttrCudaPresentMonOrphanSessionName, `
+    Get-AttrCudaPresentMonEventsLost, `
+    Add-AttrCudaPresentMonEventsLostDetail, `
+    Add-AttrCudaPresentMonEventsLostDetailToReport, `
+    Get-AttrCudaEtsSessionListing, `
+    Invoke-AttrCudaLogman, `
+    Get-AttrCudaTextEncodingFromHead, `
+    Stop-AttrCudaEtsSession, `
     Publish-AttrCudaFileMove, `
     Publish-AttrCudaFileMoveNonOverwriting, `
     Publish-AttrCudaDirectoryMoveNonOverwriting, `

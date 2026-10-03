@@ -60,7 +60,13 @@ COMPOSER = ROOT / "tools" / "profiling" / "make-contact-sheet.py"
 # spawn-failure summary), which no bracketed region can express. The pin is therefore that card's own item-1 commit (2f91486c: the DVE-LEG-TERMINALS-1 generator plus item 1
 # and nothing else); the card's remaining default-job text (item 2) is bracketed by its own DVE-PRESENTMON-EVIDENCE-1 sentinels and counted below. Item 1 is pinned by its own
 # tests (test_dve_presentmon_evidence.py), not by byte identity; DVE-LEG-TERMINALS-1's four regions exist in the baseline too, so both sides are stripped of both families.
-BASELINE_COMMIT = "2f91486cab88a6051d98b5c5c55cf15c0b6729d4"
+# UM-PRESENTMON-ORPHAN-SWEEP-1 r1 moves it again, honestly: the pin is now MASTER itself (a29a1ee4, the #233 merge this card branched from), not a card-internal commit. Every
+# line the card adds to the default job (the pre-spawn orphan sweep, the post-Kill() session terminate in both stop paths, the lost-events scan and reason detail, the
+# two capture-json fields, and the module helpers it splices in) is bracketed by its own UM-PRESENTMON-ORPHAN-SWEEP-1 sentinels and counted below, so NO in-place edit of
+# master's text was needed: the DEFAULT job outside the brackets is byte-identical to master's, DVE-LEG-TERMINALS-1 and DVE-PRESENTMON-EVIDENCE-1 included (their regions
+# exist in the baseline now, so both sides are stripped of all three families). The baseline moved from 2f91486c only because master's own DVE-PRESENTMON-EVIDENCE-1
+# items 2-3 (merged since, bracketed) now sit in it.
+BASELINE_COMMIT = "a29a1ee4325423c156c5bde13581a5de233851ae"
 
 PWSH = shutil.which("pwsh")
 requires_windows_pwsh = unittest.skipIf(PWSH is None or sys.platform != "win32", "needs pwsh on Windows")
@@ -175,11 +181,19 @@ class GeneratorByteIdentityAndVariantTests(unittest.TestCase):
     PRESENTMON_EVIDENCE_OPEN = "DVE-PRESENTMON-EVIDENCE-1 >>>"
     PRESENTMON_EVIDENCE_CLOSE = "DVE-PRESENTMON-EVIDENCE-1 <<<"
     PRESENTMON_EVIDENCE_REGIONS = 1
+    # UM-PRESENTMON-ORPHAN-SWEEP-1: every line that card adds to the default job (and the module helpers it splices in) is bracketed by these sentinels; the count is pinned so a
+    # region cannot silently multiply or grow outside its brackets (test_um_presentmon_orphan_sweep.py pins what the regions hold).
+    ORPHAN_SWEEP_OPEN = "UM-PRESENTMON-ORPHAN-SWEEP-1 >>>"
+    ORPHAN_SWEEP_CLOSE = "UM-PRESENTMON-ORPHAN-SWEEP-1 <<<"
+    # 23 = 22 in the job template plus the one module-helper splice; r1 had 16 (15 + 1): r2 adds the per-action liveness helpers and listing retry (one region), the logman-path/timeout variables (inside the existing init region),
+    # the PRESENTMON_TIMEOUT reason detail, and the post-Kill terminate trace + summary field at each of the three Stop call sites.
+    ORPHAN_SWEEP_REGIONS = 23
 
     @classmethod
     def strip_regions(cls, text: str) -> tuple[str, dict[str, int]]:
         """Remove every bracketed region of either sentinel family; return the kept text and the number of regions per family."""
-        families = {"leg-terminals": (cls.LEG_TERMINALS_OPEN, cls.LEG_TERMINALS_CLOSE), "presentmon-evidence": (cls.PRESENTMON_EVIDENCE_OPEN, cls.PRESENTMON_EVIDENCE_CLOSE)}
+        families = {"leg-terminals": (cls.LEG_TERMINALS_OPEN, cls.LEG_TERMINALS_CLOSE), "presentmon-evidence": (cls.PRESENTMON_EVIDENCE_OPEN, cls.PRESENTMON_EVIDENCE_CLOSE),
+                    "orphan-sweep": (cls.ORPHAN_SWEEP_OPEN, cls.ORPHAN_SWEEP_CLOSE)}
         kept: list[str] = []
         inside: str | None = None
         counts = {name: 0 for name in families}
@@ -215,7 +229,9 @@ class GeneratorByteIdentityAndVariantTests(unittest.TestCase):
         self.assertEqual(new_counts["leg-terminals"], 4, "the default job carries exactly the four bracketed DVE-LEG-TERMINALS-1 regions (the wait-failure block and its two summary fields, the smoke-failure block and its one summary field)")
         self.assertEqual(old_counts["leg-terminals"], 4, "the baseline carries the same four")
         self.assertEqual(new_counts["presentmon-evidence"], self.PRESENTMON_EVIDENCE_REGIONS, "the default job carries exactly the pinned number of bracketed DVE-PRESENTMON-EVIDENCE-1 regions")
-        self.assertEqual(old_counts["presentmon-evidence"], 0, "the baseline has none")
+        self.assertEqual(old_counts["presentmon-evidence"], self.PRESENTMON_EVIDENCE_REGIONS, "the baseline (master) carries the same bracketed DVE-PRESENTMON-EVIDENCE-1 region")
+        self.assertEqual(new_counts["orphan-sweep"], self.ORPHAN_SWEEP_REGIONS, "the default job carries exactly the pinned number of bracketed UM-PRESENTMON-ORPHAN-SWEEP-1 regions")
+        self.assertEqual(old_counts["orphan-sweep"], 0, "the baseline has none")
         self.assertEqual(stripped, old_stripped,
                          "the DEFAULT (bachelor/cuda) emitted job changed outside the bracketed regions -- it must stay byte-identical to the pinned baseline")
 

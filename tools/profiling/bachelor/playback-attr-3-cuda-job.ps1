@@ -825,6 +825,19 @@ try {
 } finally {
     if (Test-Path -LiteralPath $displayIdentityTemp) { Remove-Item -LiteralPath $displayIdentityTemp -Force -ErrorAction SilentlyContinue }
 }
+# UM-PRESENTMON-ORPHAN-SWEEP-1: the card's module helpers (the orphan-session name parser and the two logman wrappers, the lost-events scan of PresentMon's stderr, the typed reason detail) are spliced
+# into the job inside their own sentinel brackets, so test_dual_venue_evidence's byte-identity strip removes them with the rest of the card's text and the baseline's embedded functions
+# still compare byte for byte. (The opening sentinel carries the leading line break: the bracket adds no blank line outside itself.)
+$embeddedFunctions = $embeddedFunctions + "`r`n# UM-PRESENTMON-ORPHAN-SWEEP-1 >>>`r`n" + (Get-AttrCudaEmbeddedFunctionSource -Name @(
+    'Get-AttrCudaPresentMonOrphanSessionName',
+    'Get-AttrCudaEtsSessionListing',
+    'Invoke-AttrCudaLogman',
+    'Stop-AttrCudaEtsSession',
+    'Get-AttrCudaTextEncodingFromHead',
+    'Get-AttrCudaPresentMonEventsLost',
+    'Add-AttrCudaPresentMonEventsLostDetail',
+    'Add-AttrCudaPresentMonEventsLostDetailToReport'
+)) +"`r`n# UM-PRESENTMON-ORPHAN-SWEEP-1 <<<"
 $smokeRunnerClosureDigest = Get-AttrCudaClosureDigestHex -Closure $smokeRunnerClosure
 if ($smokeRunnerClosureDigest -notmatch '^[0-9a-f]{64}$') {
     throw "ATTRCUDA_BLOB_SHA_MALFORMED smoke-runner closure digest is not 64 lowercase hex: '$smokeRunnerClosureDigest'"
@@ -1192,6 +1205,16 @@ function Start-PresentMonCapture([string]$CsvPath, [int]$ReadyTimeoutSeconds = 1
     $pmArgs = @('--process_name', $ExeName, '--output_file', $CsvPath, '--timed', [string]$PresentMonTimedSeconds,
                 '--terminate_after_timed', '--session_name', $PresentMonSessionName, '--stop_existing_session', '--no_console_stats')
     if ($PresentMonTerminateOnProcExit) { $pmArgs += '--terminate_on_proc_exit' }
+    # UM-PRESENTMON-ORPHAN-SWEEP-1 >>>
+    # UM-PRESENTMON-ORPHAN-SWEEP-1 item 1: before the spawn, no orphaned PresentMon ETW session may remain (see Invoke-PresentMonOrphanSweep for why, and for when it does not run). The
+    # caller's record table is the opt-in and the evidence (index assignment only, like $presentMonTraceReadiness): a caller that supplies none sweeps nothing.
+    if ($null -ne $presentMonOrphanSweep) {
+        $sweepResult = Invoke-PresentMonOrphanSweep
+        foreach ($key in @($sweepResult.Keys)) { $presentMonOrphanSweep[$key] = $sweepResult[$key] }
+        $sweepActionText = @($sweepResult['actions'] | ForEach-Object { $_.session + ':' + $_.method + ':' + $_.exitCode }) -join ';'
+        Write-JobTrace "step presentmon-orphan-sweep ran=$($sweepResult['ran']) skipped=$($sweepResult['skippedReason']) livePids=$(@($sweepResult['livePresentMonProcessIds']) -join ',') listed=$(@($sweepResult['listed']) -join ',') actions=$sweepActionText aborted=$($sweepResult['abortedReason']) abortedBefore=$($sweepResult['abortedBefore']) remaining=$(@($sweepResult['remaining']) -join ',') newlyListed=$(@($sweepResult['newlyListed']) -join ',') listError=$($sweepResult['listError']) error=$($sweepResult['error'])"
+    }
+    # UM-PRESENTMON-ORPHAN-SWEEP-1 <<<
     # Direct child: inherits this job's TEMP/TMP. -PassThru so the exit code is checked.
     # DVE-PRESENTMON-EVIDENCE-1 item 1: stdout and stderr go to files under this job's own diagnostic dir (the scan proves the targets), so a PresentMon
     # failure keeps its own words.
@@ -1264,6 +1287,120 @@ function Invoke-PresentMonSessionTerminate([string]$SessionName, [int]$TimeoutSe
     [pscustomobject]@{ exitCode = $helperExitCode; timedOut = $timedOut; error = $helperError }
 }
 
+# UM-PRESENTMON-ORPHAN-SWEEP-1 >>> (this card's text in the default job is bracketed like this; test_dual_venue_evidence strips every region to prove the rest is byte-identical to the pinned baseline)
+function Get-PresentMonLiveProcessId() {
+    # the ids of every PresentMon process on the host (any of them may own a capture, and so a session); the sweep asks this before the scan, after it, and before each action it takes
+    return @(Get-Process -Name 'PresentMon*' -ErrorAction SilentlyContinue | ForEach-Object { [int]$_.Id })
+}
+
+function Get-PresentMonLogmanTimeoutSecond() {
+    # UM-SWEEP-LOGMAN-BOUND-1: the deadline of every logman call the sweep makes -- 15 s (a test sets $presentMonLogmanTimeoutSeconds to shorten it)
+    $configured = [int]$presentMonLogmanTimeoutSeconds
+    if ($configured -gt 0) { return $configured }
+    return 15
+}
+
+function Format-PresentMonSessionTerminateText($Terminate) {
+    # r2 (sol blocker 2): the outcome of a PresentMon --terminate_existing_session helper as one line for a reason or a trace; '<not issued>' when none ran
+    if ($null -eq $Terminate) { return '<not issued>' }
+    return "exitCode:$($Terminate.exitCode) timedOut:$($Terminate.timedOut) error:$($Terminate.error)"
+}
+
+function Get-PresentMonEtsListing() {
+    # UM-SWEEP-LISTING-RETRY-1: `logman query -ets` fails now and then with a transient error (UM, 2026-10-03: "GUID passed was not recognized" in two full listings), so a failing listing is asked
+    # for once more before it is believed. Returns the listing the way Get-AttrCudaEtsSessionListing does, plus how many attempts it took.
+    $listing = Get-AttrCudaEtsSessionListing -LogmanPath ([string]$presentMonLogmanPath) -TimeoutSeconds (Get-PresentMonLogmanTimeoutSecond)
+    $attempts = 1
+    if ($null -ne $listing.error -or $listing.exitCode -ne 0) {
+        Start-Sleep -Milliseconds 500
+        $listing = Get-AttrCudaEtsSessionListing -LogmanPath ([string]$presentMonLogmanPath) -TimeoutSeconds (Get-PresentMonLogmanTimeoutSecond)
+        $attempts = 2
+    }
+    return [pscustomobject]@{ exitCode = $listing.exitCode; text = $listing.text; error = $listing.error; timedOut = $listing.timedOut; attempts = $attempts }
+}
+
+function Invoke-PresentMonOrphanSweep() {
+    # UM-PRESENTMON-ORPHAN-SWEEP-1 item 1 (Ultra-Magnus, 2026-10-03): an orphaned default-named PresentMon ETW session made every other-named session lose all of its events, so
+    # no CSV was written; the per-job session name (UM-PRESENTMON-STOP-1) meant --stop_existing_session no longer cleared it. Before a capture starts this terminates the default
+    # `PresentMon` session and every `MLVAttr3-*` session that `logman query -ets` lists -- but ONLY when no PresentMon process is alive on the host: a live one may own a capture,
+    # and a session a live capture owns is never an orphan (the sweep then records that it did not run, and why). Each session goes through the pinned PresentMon's own
+    # --terminate_existing_session (Invoke-PresentMonSessionTerminate, the helper the clean stop already uses); `logman stop <name> -ets` runs only for a session STILL listed after
+    # that, because a failed helper must not leave the orphan this card exists to remove, and what remains afterwards is recorded rather than assumed gone. Never throws and never
+    # blocks the capture: a failure is recorded in the returned table.
+    # r2 (sol blocker 1, fable UM-SWEEP-FALLBACK-SCOPE-1): the sweep acts ONLY on the names in $listed -- the orphan list captured before the second liveness check -- never on a name a later
+    # listing shows (that is another job's capture that started meanwhile, recorded in newlyListed and left alone), and liveness (no PresentMon process) is re-checked immediately before EACH
+    # terminate and EACH logman stop: the first process that appears stops the sweep (abortedReason / abortedBefore) and what is left is still listed in `remaining`.
+    $record = [ordered]@{ ran = $false; skippedReason = $null; abortedReason = $null; abortedBefore = $null; livePresentMonProcessIds = @(); listed = @(); matchingListingLines = @(); listAttempts = 0; actions = @(); remaining = @(); newlyListed = @(); listError = $null; error = $null }
+    try {
+        $live = @(Get-PresentMonLiveProcessId)
+        $record['livePresentMonProcessIds'] = $live
+        if ($live.Count -gt 0) {
+            $record['skippedReason'] = 'presentmon_process_alive'
+            return $record
+        }
+        $listing = Get-PresentMonEtsListing
+        $record['listAttempts'] = $listing.attempts
+        if ($null -ne $listing.error -or $listing.exitCode -ne 0) {
+            $record['listError'] = "logman query -ets exit=$($listing.exitCode) error=$($listing.error) attempts=$($listing.attempts)"
+            return $record
+        }
+        $record['matchingListingLines'] = @(($listing.text -split "\r?\n") | Where-Object { $_ -match 'PresentMon|MLVAttr3-' } | Select-Object -First 20 | ForEach-Object { $_.Trim() })
+        $listed = @(Get-AttrCudaPresentMonOrphanSessionName -ListingText $listing.text)
+        $record['listed'] = $listed
+        # a PresentMon that appeared while the listing ran is a capture that may own a session: nothing is touched
+        $liveNow = @(Get-PresentMonLiveProcessId)
+        if ($liveNow.Count -gt 0) {
+            $record['livePresentMonProcessIds'] = $liveNow
+            $record['skippedReason'] = 'presentmon_process_started_during_sweep'
+            return $record
+        }
+        $record['ran'] = $true
+        $actions = @()
+        $aborted = $false
+        foreach ($name in $listed) {
+            $liveBeforeTerminate = @(Get-PresentMonLiveProcessId)
+            if ($liveBeforeTerminate.Count -gt 0) {
+                $record['livePresentMonProcessIds'] = $liveBeforeTerminate
+                $record['abortedReason'] = 'presentmon_process_started_during_sweep'
+                $record['abortedBefore'] = $name + ':presentmon_terminate'
+                $aborted = $true
+                break
+            }
+            $terminate = Invoke-PresentMonSessionTerminate -SessionName $name -TimeoutSeconds 10
+            $actions += [ordered]@{ session = $name; method = 'presentmon_terminate'; exitCode = $terminate.exitCode; timedOut = [bool]$terminate.timedOut; error = $terminate.error }
+            $record['actions'] = $actions
+        }
+        $afterTerminate = Get-PresentMonEtsListing
+        $afterTerminateNames = @(Get-AttrCudaPresentMonOrphanSessionName -ListingText $afterTerminate.text)
+        # the fallback's candidates are the scan's own names that are still listed; a name only the later listing shows is never one of them
+        $stillListed = @($listed | Where-Object { $afterTerminateNames -contains $_ })
+        if (-not $aborted) {
+            foreach ($name in $stillListed) {
+                $liveBeforeStop = @(Get-PresentMonLiveProcessId)
+                if ($liveBeforeStop.Count -gt 0) {
+                    $record['livePresentMonProcessIds'] = $liveBeforeStop
+                    $record['abortedReason'] = 'presentmon_process_started_during_sweep'
+                    $record['abortedBefore'] = $name + ':logman_stop'
+                    break
+                }
+                $stopResult = Stop-AttrCudaEtsSession -SessionName $name -LogmanPath ([string]$presentMonLogmanPath) -TimeoutSeconds (Get-PresentMonLogmanTimeoutSecond)
+                $actions += [ordered]@{ session = $name; method = 'logman_stop'; exitCode = $stopResult.exitCode; timedOut = [bool]$stopResult.timedOut; error = $stopResult.error }
+                $record['actions'] = $actions
+            }
+        }
+        $afterStop = Get-PresentMonEtsListing
+        $finalNames = @(Get-AttrCudaPresentMonOrphanSessionName -ListingText $afterStop.text)
+        $record['remaining'] = @($listed | Where-Object { $finalNames -contains $_ })
+        $record['newlyListed'] = @($finalNames | Where-Object { $listed -notcontains $_ })
+        if ($null -ne $afterTerminate.error -or $afterTerminate.exitCode -ne 0 -or $null -ne $afterStop.error -or $afterStop.exitCode -ne 0) {
+            $record['listError'] = "a verification listing failed: afterTerminate exit=$($afterTerminate.exitCode) error=$($afterTerminate.error) afterStop exit=$($afterStop.exitCode) error=$($afterStop.error)"
+        }
+    } catch {
+        $record['error'] = $_.Exception.Message
+    }
+    return $record
+}
+# UM-PRESENTMON-ORPHAN-SWEEP-1 <<<
 function Split-PresentMonCsvLine([string]$Line) {
     # Quote-aware split of ONE csv line into fields (a doubled quote inside a quoted field is a literal
     # quote). openQuote is true when the line ends inside a quoted field, i.e. it was cut off.
@@ -1397,6 +1534,9 @@ function Wait-PresentMonCapture($Proc, [string]$SessionName = '', [int]$TimeoutS
     $killIssuedUtc = $null
     $killError = $null
     $waitError = $null
+    # UM-PRESENTMON-ORPHAN-SWEEP-1 >>>
+    $postKillTerminate = $null
+    # UM-PRESENTMON-ORPHAN-SWEEP-1 <<<
     # A process that exits between the timed-out wait and the Kill() leaves Kill() a no-op on Windows (.NET
     # returns without terminating an already-exited process), so "Kill() ran, then the exit was confirmed"
     # proves nothing about who ended it: the Kill() is issued only at a process observed alive just before.
@@ -1422,10 +1562,21 @@ function Wait-PresentMonCapture($Proc, [string]$SessionName = '', [int]$TimeoutS
         } catch {
             $waitError = $_.Exception.Message
         }
+        # UM-PRESENTMON-ORPHAN-SWEEP-1 >>>
+        # UM-PRESENTMON-ORPHAN-SWEEP-1 item 2: a killed controller does not stop its ETW session, and the per-job name means nothing else ever clears it (the diagnostic's inferred second
+        # source of orphans). After a job-issued Kill() the job's OWN named session is terminated again, bounded, whatever the first terminate did; the outcome is recorded below.
+        if ($SessionName -ne '') {
+            $postKillTerminate = Invoke-PresentMonSessionTerminate -SessionName $SessionName -TimeoutSeconds 5
+        }
+        # UM-PRESENTMON-ORPHAN-SWEEP-1 <<<
         $confirmedExited = [bool]$Proc.HasExited
         if ($SessionName -eq '' -or -not $confirmedExited) {
             $killErrorText = if ($null -eq $killError) { '<none>' } else { $killError }
             $waitErrorText = if ($null -eq $waitError) { '<none>' } else { $waitError }
+            # UM-PRESENTMON-ORPHAN-SWEEP-1 >>>
+            # r2 (sol blocker 2, fable UM-STOP-POSTKILL-EVIDENCE-1): this throw is all a reader gets of this stop, so it names the post-Kill session terminate -- a cleanup that failed is visible on the job that caused it.
+            $waitErrorText = $waitErrorText + ' postKillTerminate=' + (Format-PresentMonSessionTerminateText $postKillTerminate)
+            # UM-PRESENTMON-ORPHAN-SWEEP-1 <<<
             throw "PRESENTMON_TIMEOUT: did not exit within $TimeoutSeconds s after playback (confirmedExited=$confirmedExited killError=$killErrorText waitError=$waitErrorText)"
         }
         # UM-PRESENTMON-STOP-2 r2 (fable hardening 2): .NET's Kill() ends a process with exit code -1. A capture
@@ -1453,6 +1604,12 @@ function Wait-PresentMonCapture($Proc, [string]$SessionName = '', [int]$TimeoutS
         killIssuedUtc = $killIssuedUtc
         killError = $killError
         waitError = $waitError
+        # UM-PRESENTMON-ORPHAN-SWEEP-1 >>>
+        postKillTerminateIssued = ($null -ne $postKillTerminate)
+        postKillTerminateExitCode = $(if ($null -ne $postKillTerminate) { $postKillTerminate.exitCode } else { $null })
+        postKillTerminateTimedOut = $(if ($null -ne $postKillTerminate) { [bool]$postKillTerminate.timedOut } else { $false })
+        postKillTerminateError = $(if ($null -ne $postKillTerminate) { $postKillTerminate.error } else { $null })
+        # UM-PRESENTMON-ORPHAN-SWEEP-1 <<<
     }
 }
 
@@ -1472,6 +1629,9 @@ function Stop-PresentMonCapture($Proc, [int]$TimeoutSeconds = 10, [string]$Sessi
     $waitError = $null
     $sessionTerminate = $null
     $graceWaitError = $null
+    # UM-PRESENTMON-ORPHAN-SWEEP-1 >>>
+    $postKillSessionTerminate = $null
+    # UM-PRESENTMON-ORPHAN-SWEEP-1 <<<
     if (-not $Proc.HasExited -and $SessionName -ne '') {
         $sessionTerminate = Invoke-PresentMonSessionTerminate -SessionName $SessionName -TimeoutSeconds 5
         try { [void]$Proc.WaitForExit(5000) } catch { $graceWaitError = $_.Exception.Message }
@@ -1485,6 +1645,13 @@ function Stop-PresentMonCapture($Proc, [int]$TimeoutSeconds = 10, [string]$Sessi
         } catch {
             $waitError = $_.Exception.Message
         }
+        # UM-PRESENTMON-ORPHAN-SWEEP-1 >>>
+        # UM-PRESENTMON-ORPHAN-SWEEP-1 item 2: the same rule as Wait-PresentMonCapture -- after a job-issued Kill() the job's own named session is terminated again, so a killed capture
+        # cannot orphan it (the terminate above ran before the Kill(), and may have failed or found the capture still starting).
+        if ($SessionName -ne '') {
+            $postKillSessionTerminate = Invoke-PresentMonSessionTerminate -SessionName $SessionName -TimeoutSeconds 5
+        }
+        # UM-PRESENTMON-ORPHAN-SWEEP-1 <<<
     }
     [pscustomobject]@{
         confirmedExited = [bool]$Proc.HasExited
@@ -1492,6 +1659,9 @@ function Stop-PresentMonCapture($Proc, [int]$TimeoutSeconds = 10, [string]$Sessi
         waitError = $waitError
         sessionTerminate = $sessionTerminate
         graceWaitError = $graceWaitError
+        # UM-PRESENTMON-ORPHAN-SWEEP-1 >>>
+        postKillSessionTerminate = $postKillSessionTerminate
+        # UM-PRESENTMON-ORPHAN-SWEEP-1 <<<
     }
 }
 
@@ -2406,6 +2576,12 @@ $presentMonSpawnError = $null
 $presentMonTraceReadiness = [ordered]@{ verified = $false; readyUtc = $null; waitedMs = $null; timeoutSeconds = $null; reason = 'Start-PresentMonCapture did not record a readiness observation' }
 # DVE-PRESENTMON-EVIDENCE-1 item 1: Start-PresentMonCapture notes here (index assignment only) that it saw the CSV while waiting for readiness.
 $presentMonStreams = [ordered]@{ csvSeenDuringReadiness = $false }
+# UM-PRESENTMON-ORPHAN-SWEEP-1 >>>
+# UM-PRESENTMON-ORPHAN-SWEEP-1 item 1: Start-PresentMonCapture records its pre-spawn orphan sweep here (index assignment only); the table is also what enables the sweep.
+$presentMonOrphanSweep = [ordered]@{ ran = $false; skippedReason = 'Start-PresentMonCapture did not record a sweep' }
+# UM-SWEEP-LOGMAN-BOUND-1: the logman executable the sweep's wrappers run ('' = the system's logman.exe, bounded by a deadline); the venue leaves it empty, a test points it at a stub.
+$presentMonLogmanPath = ''
+# UM-PRESENTMON-ORPHAN-SWEEP-1 <<<
 Write-JobTrace "step presentmon-spawn start session=$PresentMonSessionName"
 try {
     $presentMonProc = Start-PresentMonCapture $presentMonPath
@@ -2423,6 +2599,9 @@ if ($null -ne $presentMonSpawnError) {
         reason="PresentMon failed to start: $presentMonSpawnError"
         presentMonStatus='unavailable'
         presentMonStreams=$presentMonSpawnEvidence.streams
+        # UM-PRESENTMON-ORPHAN-SWEEP-1 >>>
+        presentMonOrphanSweep=$presentMonOrphanSweep
+        # UM-PRESENTMON-ORPHAN-SWEEP-1 <<<
         chains=@()
         display=$displayBlock
         sourceCommit=$SourceCommit; clipId=$ClipId; artifactRoot=$Pub
@@ -2466,6 +2645,9 @@ $keepAliveHealthBeforeSmokeLaunch = Get-AttrCudaDisplayWakeKeepAliveHealth -Hand
 if (-not $keepAliveHealthBeforeSmokeLaunch.healthy) {
     $displayWake['keepAliveHealth'] = $keepAliveHealthBeforeSmokeLaunch
     $presentMonStopOnKeepAliveFailure = Stop-PresentMonCapture -Proc $presentMonProc -SessionName $PresentMonSessionName
+    # UM-PRESENTMON-ORPHAN-SWEEP-1 >>>
+    Write-JobTrace "step presentmon-stop site=keepalive confirmedExited=$($presentMonStopOnKeepAliveFailure.confirmedExited) postKillTerminate=$(Format-PresentMonSessionTerminateText $presentMonStopOnKeepAliveFailure.postKillSessionTerminate)"
+    # UM-PRESENTMON-ORPHAN-SWEEP-1 <<<
     $keepAliveRefusal = [ordered]@{
         schema='playback-attr-3-cuda-venue.v1'; result='KEEPALIVE_FAILED'
         fixtureRehearsal=$FixtureRehearsal
@@ -2474,6 +2656,9 @@ if (-not $keepAliveHealthBeforeSmokeLaunch.healthy) {
         presentMonConfirmedExited=$presentMonStopOnKeepAliveFailure.confirmedExited
         presentMonKillError=$presentMonStopOnKeepAliveFailure.killError
         presentMonWaitError=$presentMonStopOnKeepAliveFailure.waitError
+        # UM-PRESENTMON-ORPHAN-SWEEP-1 >>>
+        presentMonPostKillSessionTerminate=$presentMonStopOnKeepAliveFailure.postKillSessionTerminate
+        # UM-PRESENTMON-ORPHAN-SWEEP-1 <<<
         sourceCommit=$SourceCommit; clipId=$ClipId; artifactRoot=$Pub
     }
     Save-Json $keepAliveRefusal (Join-Path $Pub 'summary.json')
@@ -2504,6 +2689,9 @@ Write-JobTrace "step smoke-launch done rc=$smokeRc"
 # PresentMon still would not exit.
 if ($null -ne $smokeLaunchException -or $smokeRc -ne 0 -or -not (Test-Path -LiteralPath $resultPath)) {
     $presentMonStop = Stop-PresentMonCapture -Proc $presentMonProc -SessionName $PresentMonSessionName
+    # UM-PRESENTMON-ORPHAN-SWEEP-1 >>>
+    Write-JobTrace "step presentmon-stop site=smoke-run-failed confirmedExited=$($presentMonStop.confirmedExited) postKillTerminate=$(Format-PresentMonSessionTerminateText $presentMonStop.postKillSessionTerminate)"
+    # UM-PRESENTMON-ORPHAN-SWEEP-1 <<<
     $smokeStderrPath = Join-Path $legOut 'smoke-stderr.txt'
     $smokeStderrTail = ''
     if (Test-Path -LiteralPath $smokeStderrPath) {
@@ -2621,6 +2809,9 @@ if ($null -ne $smokeLaunchException -or $smokeRc -ne 0 -or -not (Test-Path -Lite
         presentMonWaitError=$presentMonStop.waitError
         display=$displayBlock
         displayLogRecovery=[ordered]@{ found=$failedSmokeDisplayLog.found; logPath=$failedSmokeDisplayLog.logPath; reason=$failedSmokeDisplayLog.reason }
+        # UM-PRESENTMON-ORPHAN-SWEEP-1 >>>
+        presentMonPostKillSessionTerminate=$presentMonStop.postKillSessionTerminate
+        # UM-PRESENTMON-ORPHAN-SWEEP-1 <<<
         # DVE-LEG-TERMINALS-1 >>>
         smokeEvidence=[ordered]@{
             stderrPublished = $smokeStderrPublished; stderrBytes = $smokeStderrBytes; stdoutPublished = $smokeStdoutPublished; stdoutBytes = $smokeStdoutBytes
@@ -2668,6 +2859,9 @@ try {
     # smoke evidence publishes) -- stopped here exactly like the SMOKE_RUN_FAILED branch above,
     # never left to run out its own --timed budget for a run this job is about to fail anyway.
     $presentMonStop = Stop-PresentMonCapture -Proc $presentMonProc -SessionName $PresentMonSessionName
+    # UM-PRESENTMON-ORPHAN-SWEEP-1 >>>
+    Write-JobTrace "step presentmon-stop site=smoke-log-unavailable confirmedExited=$($presentMonStop.confirmedExited) postKillTerminate=$(Format-PresentMonSessionTerminateText $presentMonStop.postKillSessionTerminate)"
+    # UM-PRESENTMON-ORPHAN-SWEEP-1 <<<
     $unavailable = [ordered]@{
         schema='playback-attr-3-cuda-venue.v1'; result='SMOKE_LOG_UNAVAILABLE'
         fixtureRehearsal=$FixtureRehearsal
@@ -2677,6 +2871,9 @@ try {
         presentMonKillError=$presentMonStop.killError
         presentMonWaitError=$presentMonStop.waitError
         display=$displayBlock
+        # UM-PRESENTMON-ORPHAN-SWEEP-1 >>>
+        presentMonPostKillSessionTerminate=$presentMonStop.postKillSessionTerminate
+        # UM-PRESENTMON-ORPHAN-SWEEP-1 <<<
         sourceCommit=$SourceCommit; clipId=$ClipId; artifactRoot=$Pub
     }
     Save-Json $unavailable (Join-Path $Pub 'summary.json')
@@ -2765,6 +2962,12 @@ Write-JobTrace "step presentmon-stop done method=$($presentMonCleanStop.stopMeth
 # are published (bounded) and the CSV's existence is recorded: a failure that says nothing is the failure this closes. Raw capture path: never the repaired copy.
 $presentMonCaptureEvidence = Publish-AttrCudaPresentMonCaptureEvidence -CsvPath $presentMonRawCsvPath -CsvSeenDuringReadiness ([bool]$presentMonStreams['csvSeenDuringReadiness']) -StdoutPath $presentMonStdoutPath -StderrPath $presentMonStderrPath -PubRoot $Pub
 Write-JobTrace "step presentmon-capture-evidence csvEverExisted=$($presentMonCaptureEvidence.csvEverExisted) csvSizeAtStop=$($presentMonCaptureEvidence.csvSizeAtStop) stdoutBytes=$($presentMonCaptureEvidence.streams.stdout.bytes) stderrBytes=$($presentMonCaptureEvidence.streams.stderr.bytes)"
+# UM-PRESENTMON-ORPHAN-SWEEP-1 >>>
+# UM-PRESENTMON-ORPHAN-SWEEP-1 item 3: a capture whose stderr reports lost trace events (Ultra-Magnus, 2026-10-03: 15-17k per 12 s, no CSV) is a typed fact here, not an unexplained
+# "output does not exist": it goes into presentmon-capture.json and into the PresentMon reason of the failure terminals below.
+$presentMonEventsLost = Get-AttrCudaPresentMonEventsLost -StderrPath $presentMonStderrPath
+Write-JobTrace "step presentmon-events-lost detected=$($presentMonEventsLost.detected) messages=$($presentMonEventsLost.messages) maxReported=$($presentMonEventsLost.maxReported)"
+# UM-PRESENTMON-ORPHAN-SWEEP-1 <<<
 if ($null -ne $presentMonWaitError) {
     # CUDA-PERF-DISPLAY-IDENTITY-HARNESS-3 (fable HARDENING): a wait failure used to publish
     # neither the partial presentmon.csv (stable here -- Wait-PresentMonCapture kills the process
@@ -2788,6 +2991,10 @@ if ($null -ne $presentMonWaitError) {
         csvEverExisted=$presentMonCaptureEvidence.csvEverExisted
         csvSizeAtStop=$presentMonCaptureEvidence.csvSizeAtStop
         streams=$presentMonCaptureEvidence.streams
+        # UM-PRESENTMON-ORPHAN-SWEEP-1 >>>
+        eventsLost=$presentMonEventsLost
+        orphanSweep=$presentMonOrphanSweep
+        # UM-PRESENTMON-ORPHAN-SWEEP-1 <<<
     }) (Join-Path $Pub 'presentmon-capture.json')
     # DVE-LEG-TERMINALS-1 >>> (the only text this card adds to the default job; test_dual_venue_evidence strips these regions to prove the rest is byte-identical to master's)
     # DVE-LEG-TERMINALS-1 item 1 (hardening DVE-PRESENTMON-WAIT-FAILURE-UNRECEIPTABLE-1): the smoke run's own gpu summary is already in the run log
@@ -2828,6 +3035,10 @@ if ($null -ne $presentMonWaitError) {
         $waitFailureRawFrames = $null
     }
     # DVE-LEG-TERMINALS-1 <<<
+    # UM-PRESENTMON-ORPHAN-SWEEP-1 >>>
+    # UM-PRESENTMON-ORPHAN-SWEEP-1 item 3: the typed lost-events detail joins the PresentMon reason (this branch ends the job, so nothing later reads the bare text).
+    $presentMonWaitError = Add-AttrCudaPresentMonEventsLostDetail -Reason $presentMonWaitError -EventsLost $presentMonEventsLost
+    # UM-PRESENTMON-ORPHAN-SWEEP-1 <<<
     $displayFailure = [ordered]@{
         schema='playback-attr-3-cuda-venue.v1'; result='PRESENTMON_UNAVAILABLE'
         fixtureRehearsal=$FixtureRehearsal
@@ -3020,6 +3231,10 @@ Save-Json ([ordered]@{
     csvEverExisted=$presentMonCaptureEvidence.csvEverExisted
     csvSizeAtStop=$presentMonCaptureEvidence.csvSizeAtStop
     streams=$presentMonCaptureEvidence.streams
+    # UM-PRESENTMON-ORPHAN-SWEEP-1 >>>
+    eventsLost=$presentMonEventsLost
+    orphanSweep=$presentMonOrphanSweep
+    # UM-PRESENTMON-ORPHAN-SWEEP-1 <<<
 }) (Join-Path $Pub 'presentmon-capture.json')
 # CUDA-PERF-DISPLAY-IDENTITY-HARNESS-3 (sol+fable HARDENING, direction-corrected anchor -- see
 # the bracket comment above): windowed under BOTH endpoints of the capture-start bracket, never
@@ -3092,6 +3307,10 @@ if ($displayReport.status -ne 'OK' -and -not $displayAsleepOverridden) {
         $parseFailureRawFrames = $null
     }
     # DVE-PRESENTMON-EVIDENCE-1 <<<
+    # UM-PRESENTMON-ORPHAN-SWEEP-1 >>>
+    # UM-PRESENTMON-ORPHAN-SWEEP-1 item 3: a capture that lost its events reads as that cause in the PresentMon reason, not only as "output does not exist" (this branch ends the job).
+    $displayReport = Add-AttrCudaPresentMonEventsLostDetailToReport -Report $displayReport -EventsLost $presentMonEventsLost
+    # UM-PRESENTMON-ORPHAN-SWEEP-1 <<<
     $displayFailure = [ordered]@{
         schema='playback-attr-3-cuda-venue.v1'; result=$displayReport.status
         fixtureRehearsal=$FixtureRehearsal

@@ -425,7 +425,8 @@ class CleanStopExecutedTests(_ProbeCase):
 
     def test_a_capture_that_ignores_the_terminate_is_killed_only_after_the_terminate(self) -> None:
         result, log = self._probe(terminate_stops_capture=False, timeout=1)
-        self.assertEqual(log, ["terminate MLVAttr3-test"])
+        # UM-PRESENTMON-ORPHAN-SWEEP-1 item 2: the job's own session is terminated once more after its Kill() (a killed controller does not stop its ETW session)
+        self.assertEqual(log, ["terminate MLVAttr3-test", "terminate MLVAttr3-test"])
         self.assertEqual(result["stopMethod"], "kill_fallback")
         self.assertTrue(result["killUsed"])
         self.assertIsNone(result["killError"])
@@ -563,7 +564,7 @@ class CleanStopExecutedTests(_ProbeCase):
     # statement between the liveness read and Kill(), whose call then did nothing). That is a self-exit.
     def test_a_kill_fallback_with_net_kills_exit_code_is_the_jobs_kill(self) -> None:
         result, log = self._race_probe(kill_sets_exit=-1)
-        self.assertEqual(log, ["terminate MLVAttr3-test", "kill"])
+        self.assertEqual(log, ["terminate MLVAttr3-test", "kill", "terminate MLVAttr3-test"], "UM-PRESENTMON-ORPHAN-SWEEP-1 item 2: the own session is terminated again after the Kill()")
         self.assertEqual(result["stopMethod"], "kill_fallback")
         self.assertTrue(result["stopCausedByJob"])
         self.assertEqual(result["exitCode"], -1)
@@ -573,7 +574,7 @@ class CleanStopExecutedTests(_ProbeCase):
         # helper rc=1, WaitForExit false, HasExited false, then the capture dies with an access violation before
         # Kill() ran: the old code said kill_fallback / job-caused and accepted the crash code.
         result, log = self._race_probe(kill_sets_exit=-1073741819)
-        self.assertEqual(log, ["terminate MLVAttr3-test", "kill"])
+        self.assertEqual(log, ["terminate MLVAttr3-test", "kill", "terminate MLVAttr3-test"], "UM-PRESENTMON-ORPHAN-SWEEP-1 item 2: a Kill() was issued, so the own session is terminated again")
         self.assertNotEqual(result["stopMethod"], "kill_fallback")
         self.assertEqual(result["stopMethod"], "exited_after_failed_terminate")
         self.assertFalse(result["stopCausedByJob"])
@@ -767,7 +768,7 @@ class FailurePathStopExecutedTests(_ProbeCase):
 
     def test_a_failure_path_stop_kills_after_the_terminate_when_the_capture_ignores_it(self) -> None:
         result, log = self._stop(terminate_stops_capture=False)
-        self.assertEqual(log, ["terminate MLVAttr3-test"])
+        self.assertEqual(log, ["terminate MLVAttr3-test", "terminate MLVAttr3-test"], "UM-PRESENTMON-ORPHAN-SWEEP-1 item 2: the Kill() is followed by a second terminate of the own session")
         self.assertTrue(result["confirmedExited"], "the Kill() fallback must still end the capture")
 
     def test_without_a_session_name_the_failure_path_stop_is_the_bare_kill_it_always_was(self) -> None:
