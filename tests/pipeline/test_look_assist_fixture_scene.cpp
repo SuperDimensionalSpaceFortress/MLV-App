@@ -945,6 +945,23 @@ TEST(LookAssistFixtureScene, HeadlessAppliedLineSaysWhyItChoseItsScene)
         ASSERT_TRUE( line.indexOf( QStringLiteral("initialPatchFinalChroma=") ) < line.indexOf( QStringLiteral(" has_ev100=") ) );
     }
 
+    // LOOK-ASSIST-WINDOW-LIT-INTERIOR-1: the two tracked NIGHT states. Without metadata the verdict is a window-lit
+    // candidate, judged and refused (it stays night; its receipt and picture are pinned above); with metadata (ND
+    // filter) it is never a candidate.
+    {
+        IdentityRun noMeta;
+        ASSERT_TRUE( runIdentityCase( kIdentityCases[2], &noMeta ) );
+        ASSERT_TRUE( noMeta.scene == QStringLiteral("night") );
+        const QString log = QString::fromUtf8( noMeta.log );
+        ASSERT_EQ( 1, log.count( QStringLiteral("LOOK_ASSIST window_lit_interior frame=0 evidence=false reason=") ) );
+        ASSERT_TRUE( log.contains( QStringLiteral(" scene=night ") ) );
+        ASSERT_TRUE( log.contains( QStringLiteral("expoIso=0 expoShutterUs=0 lensApertureX100=0") ) );
+        IdentityRun nd;
+        ASSERT_TRUE( runIdentityCase( kIdentityCases[3], &nd ) );
+        ASSERT_TRUE( nd.scene == QStringLiteral("night") );
+        ASSERT_FALSE( nd.log.contains( "window_lit_interior" ) );
+    }
+
     // The master pass asks for no picture: with every other conjunct holding, the gate is n/a rather than "picture".
     QString receipt;
     QByteArray log;

@@ -909,7 +909,8 @@ bool ReceiptApplier::applyHeadlessLookAssist(ReceiptSettings *receipt,
     {
         BatchLogger::out( QStringLiteral(
             "[BATCH] LOOK_ASSIST window_lit_interior frame=%1 evidence=%2 reason=%3 scene=%4 baseSurfaceChroma=%5 "
-            "baseSurfaceBlueAmber=%6 solutionSurfaceChroma=%7 solutionSurfaceBlueAmber=%8\n" )
+            "baseSurfaceBlueAmber=%6 solutionSurfaceChroma=%7 solutionSurfaceBlueAmber=%8 expoIso=%9 expoShutterUs=%10 "
+            "lensApertureX100=%11\n" )
             .arg( frameIndex )
             .arg( windowLit.evidence ? QStringLiteral("true") : QStringLiteral("false") )
             .arg( windowLit.reason )
@@ -917,7 +918,10 @@ bool ReceiptApplier::applyHeadlessLookAssist(ReceiptSettings *receipt,
             .arg( windowLit.baseSurfaceChroma, 0, 'f', 1 )
             .arg( windowLit.baseSurfaceBlueAmber, 0, 'f', 1 )
             .arg( windowLit.solutionSurfaceChroma, 0, 'f', 1 )
-            .arg( windowLit.solutionSurfaceBlueAmber, 0, 'f', 1 ) );
+            .arg( windowLit.solutionSurfaceBlueAmber, 0, 'f', 1 )
+            .arg( static_cast<qulonglong>( mlvObject->EXPO.isoValue ) )
+            .arg( static_cast<qulonglong>( mlvObject->EXPO.shutterValue ) )
+            .arg( static_cast<qulonglong>( mlvObject->LENS.aperture ) ) );
     }
     const bool autoWhiteBalanceValid = wb.autoValid;
     const QString autoWhiteBalanceSource = wb.source;

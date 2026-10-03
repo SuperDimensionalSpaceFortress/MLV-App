@@ -16480,7 +16480,8 @@ void MainWindow::applyLookAssistToReceipt( ReceiptSettings *receipt,
         logInteractionEvent(
             QStringLiteral("look_assist.window_lit_interior"),
             QStringLiteral("evidence=%1 reason=%2 scene=%3 base_surface_chroma=%4 base_surface_blue_amber=%5 "
-                           "solution_surface_chroma=%6 solution_surface_blue_amber=%7 frame=%8")
+                           "solution_surface_chroma=%6 solution_surface_blue_amber=%7 frame=%8 "
+                           "expo_iso=%9 expo_shutter_us=%10 lens_aperture_x100=%11")
                 .arg( bool01( windowLit.evidence ) )
                 .arg( windowLit.reason )
                 .arg( lookAssistSceneName( scene ) )
@@ -16488,7 +16489,11 @@ void MainWindow::applyLookAssistToReceipt( ReceiptSettings *receipt,
                 .arg( windowLit.baseSurfaceBlueAmber, 0, 'f', 1 )
                 .arg( windowLit.solutionSurfaceChroma, 0, 'f', 1 )
                 .arg( windowLit.solutionSurfaceBlueAmber, 0, 'f', 1 )
-                .arg( analysisFrame ) );
+                .arg( analysisFrame )
+                // The raw EXPO / LENS fields behind has_ev100=0: which one is missing decides the follow-on.
+                .arg( static_cast<qulonglong>( m_pMlvObject->EXPO.isoValue ) )
+                .arg( static_cast<qulonglong>( m_pMlvObject->EXPO.shutterValue ) )
+                .arg( static_cast<qulonglong>( m_pMlvObject->LENS.aperture ) ) );
     }
     const bool autoWhiteBalanceValid = wb.autoValid;
     const QString autoWhiteBalanceSource = wb.source;
