@@ -300,6 +300,12 @@ param(
     [ValidateRange(1, 16)]
     [int]$ScaleFactor = 4,
 
+    # DVE-SCALE2-LOOK-LEG-1 r2: the job passes -UsePersistedPlaybackSettings, which leaves the smoke runner's own scale check off (ExpectedScaleRequest -1). A caller that knows the
+    # scale the app's request will read (the CUDA texture route clamps it to 1 before the runner reads it) passes it here and the check is live. -1 (the default) emits nothing, so the
+    # default job is unchanged. -ExpectedVisualScaleRequest is pinned to -1 so only the summary-line check goes live.
+    [ValidateRange(-1, 16)]
+    [int]$ExpectedScaleRequest = -1,
+
     # DUAL-VENUE-EVIDENCE-1, AMENDMENT 1 A1. 'cuda' (default) is byte-identical to today. 'cpu'
     # omits every MLVAPP_GPU_* / MLVAPP_EXPERIMENTAL_GPU_* env (and the GL-window/viewport ones
     # that only serve the GPU path), requires CPU_FRAMES > 0 and GPU frames == 0 (a leg that
@@ -2524,7 +2530,7 @@ $envs = @(
 # default.
 $envList = "'" + ($envs -join "','") + "'"
 function ConvertTo-PsSingleQuoted([string]$Value) { "'" + $Value.Replace("'", "''") + "'" }
-$cmd = "& $(ConvertTo-PsSingleQuoted $smoke) -ExePath $(ConvertTo-PsSingleQuoted $exePath) -Input $(ConvertTo-PsSingleQuoted $clipPath) -Output $(ConvertTo-PsSingleQuoted $resultPath) -Seconds $PlaySeconds -StartFrame 0 -SettleMs 2500 -ProcessTimeoutMs $SmokeProcessTimeoutMs -ScaleFactor __SCALE_FACTOR__ -UsePersistedPlaybackSettings -RequireLookAssist:`$false -Scope none -FrameTelemetry -PreserveExperimentalEnvironment -ExtraEnvironment @($envList)"
+$cmd = "& $(ConvertTo-PsSingleQuoted $smoke) -ExePath $(ConvertTo-PsSingleQuoted $exePath) -Input $(ConvertTo-PsSingleQuoted $clipPath) -Output $(ConvertTo-PsSingleQuoted $resultPath) -Seconds $PlaySeconds -StartFrame 0 -SettleMs 2500 -ProcessTimeoutMs $SmokeProcessTimeoutMs -ScaleFactor __SCALE_FACTOR__ __EXPECTED_SCALE_ARGS__-UsePersistedPlaybackSettings -RequireLookAssist:`$false -Scope none -FrameTelemetry -PreserveExperimentalEnvironment -ExtraEnvironment @($envList)"
 if ($RunnerAcceptsVerifiedClipBinding) {
     # BACHELOR-OWNER-CLIP-STAGE-STALL-1 round 1f: the runner's own remaining reads are traced into
     # this job's trace file, and (owner run) it takes the identity verified above instead of re-reading.
@@ -4095,6 +4101,7 @@ $text = Expand-AttrCudaTemplate -Template $template -Tokens ([ordered]@{
     SCRATCH_ROOT = $venueScratchRoot
     CPU_QUIESCENCE_THRESHOLD_PERCENT = $CpuQuiescenceThresholdPercent.ToString('0.0###', [Globalization.CultureInfo]::InvariantCulture)
     SCALE_FACTOR = [string]$ScaleFactor
+    EXPECTED_SCALE_ARGS = $(if ($ExpectedScaleRequest -ge 0) { "-ExpectedScaleRequest $ExpectedScaleRequest -ExpectedVisualScaleRequest -1 " } else { '' })
     # UM-PRESENTMON-STOP-1: one capture ceiling for every leg -- a fixture leg's fixed 55 s ended its capture
     # 22.9 s before playback did on Ultra-Magnus. The job stops the capture itself after the app exits.
     PRESENTMON_TIMED_SECONDS = [string][int][math]::Ceiling($timeBudget.smokeProcessTimeoutMs / 1000.0)
