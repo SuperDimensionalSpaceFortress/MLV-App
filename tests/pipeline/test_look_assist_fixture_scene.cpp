@@ -336,6 +336,11 @@ QString appliedLineWithoutPassFlag( const QByteArray &log )
         if( candidate.contains( "LOOK_ASSIST applied" ) ) line = QString::fromUtf8( candidate );
     line.remove( QStringLiteral(" masterScenePass=true") );
     line.remove( QStringLiteral(" masterScenePass=false") );
+    // LOOK-ASSIST-DIAG-LOGGING-1: the appended decision trace records HOW each run reached its verdict (the recorded
+    // exposure, whether a picture was asked for), which legitimately differs between the runs compared here. The
+    // analysis they compare is everything before it.
+    const int trace = line.indexOf( QStringLiteral(" has_ev100=") );
+    if( trace >= 0 ) line.truncate( trace );
     return line;
 }
 
@@ -883,4 +888,67 @@ TEST(LookAssistFixtureScene, DecisionLoggingChangesNeitherThePictureNorTheReceip
         ASSERT_TRUE( runs[i].receipt == QString::fromLatin1( kIdentityPins[i].receipt ) );
         ASSERT_TRUE( runs[i].pictureSha256 == kIdentityPins[i].pictureSha256 );
     }
+}
+
+namespace
+{
+
+// The decision fields at the end of the last "LOOK_ASSIST applied" line of a run ("" when absent).
+QString appliedLineDecisionTail( const QByteArray &log )
+{
+    QString line;
+    for( const QByteArray &candidate : log.split( '\n' ) )
+        if( candidate.contains( "LOOK_ASSIST applied" ) ) line = QString::fromUtf8( candidate ).trimmed();
+    const int at = line.indexOf( QStringLiteral(" has_ev100=") );
+    return at < 0 ? QString() : line.mid( at + 1 );
+}
+
+} // namespace
+
+TEST(LookAssistFixtureScene, HeadlessAppliedLineSaysWhyItChoseItsScene)
+{
+    // The three decisions the M16 night diagnosis could not see, through the real headless Look Assist on the tracked
+    // fixtures: the recorded exposure, which daylight conjunct decided, and that the headless path runs no night walk
+    // and no display meter. The expected tail is the WHOLE field set, so dropping or renaming any field fails here.
+    struct Expect { const char *name; const char *tail; };
+    const Expect expected[] = {
+        // (a) tracked daylight: EV100 16, the rendered picture corroborates
+        { "tiny-daylight",
+          "^has_ev100=1 ev100=16\\.\\d\\d daylight_gate=pass post_walk_ran=0 post_walk_branch=none post_walk_recovery=NA "
+          "display_meter_ran=0 playback_scale=NA$" },
+        { "large-daylight",
+          "^has_ev100=1 ev100=16\\.\\d\\d daylight_gate=pass post_walk_ran=0 post_walk_branch=none post_walk_recovery=NA "
+          "display_meter_ran=0 playback_scale=NA$" },
+        // (b) no metadata: nothing to record, and the first conjunct is what failed
+        { "tiny-no-metadata",
+          "^has_ev100=0 ev100=NA daylight_gate=exposure post_walk_ran=0 post_walk_branch=none post_walk_recovery=NA "
+          "display_meter_ran=0 playback_scale=NA$" },
+        // (c) a flat-floor NIGHT verdict (ND filter: EV100 8.6 over the same flat floor): metadata present, gate exposure
+        { "tiny-nd-filter",
+          "^has_ev100=1 ev100=8\\.\\d\\d daylight_gate=exposure post_walk_ran=0 post_walk_branch=none "
+          "post_walk_recovery=NA display_meter_ran=0 playback_scale=NA$" },
+    };
+    const size_t caseCount = sizeof( kIdentityCases ) / sizeof( kIdentityCases[0] );
+    ASSERT_EQ( caseCount, sizeof( expected ) / sizeof( expected[0] ) );
+    for( size_t i = 0; i < caseCount; ++i )
+    {
+        ASSERT_TRUE( QString::fromLatin1( expected[i].name ) == QString::fromLatin1( kIdentityCases[i].name ) );
+        IdentityRun run;
+        ASSERT_TRUE( runIdentityCase( kIdentityCases[i], &run ) );
+        const QString tail = appliedLineDecisionTail( run.log );
+        ASSERT_FALSE( tail.isEmpty() );
+        ASSERT_TRUE( QRegularExpression( QString::fromLatin1( expected[i].tail ) ).match( tail ).hasMatch() );
+        // Appended only: the line still starts the way it always did and still carries its last original field.
+        const QString line = QString::fromUtf8( run.log );
+        ASSERT_TRUE( line.contains( QStringLiteral("LOOK_ASSIST applied frame=0 scene=") ) );
+        ASSERT_TRUE( line.contains( QStringLiteral("initialPatchFinalChroma=") ) );
+        ASSERT_TRUE( line.indexOf( QStringLiteral("initialPatchFinalChroma=") ) < line.indexOf( QStringLiteral(" has_ev100=") ) );
+    }
+
+    // The master pass asks for no picture: with every other conjunct holding, the gate is n/a rather than "picture".
+    QString receipt;
+    QByteArray log;
+    ASSERT_TRUE( runHeadlessLookAssist( "tests/fixtures/clips/tiny_dual_iso.mlv", false, &receipt, &log, true, -1, 0, 0, true ) );
+    ASSERT_TRUE( log.contains( "masterScenePass=true" ) );
+    ASSERT_TRUE( appliedLineDecisionTail( log ).contains( QStringLiteral("daylight_gate=n/a ") ) );
 }

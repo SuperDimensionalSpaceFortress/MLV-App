@@ -21,6 +21,7 @@
 #include <QFile>
 #include <QRegularExpression>
 #include <QString>
+#include <QStringList>
 #include <QTextStream>
 
 #include <cmath>
@@ -1466,4 +1467,264 @@ TEST(LookAssistScene, EveryConsumerReachesTheRefinementThroughTheOneDecision)
     ASSERT_TRUE( worker > dispatch && workerEnd > worker );
     ASSERT_FALSE( window.mid( worker, workerEnd - worker ).contains( QStringLiteral("renderBalance") ) );
     ASSERT_FALSE( window.mid( worker, workerEnd - worker ).contains( QStringLiteral("lookAssistBalanceRenderer") ) );
+}
+
+// ---------------------------------------------------------------------------------------------------------------
+// LOOK-ASSIST-DIAG-LOGGING-1: the decisions that change the picture leave their inputs in the log. Observation only.
+// ---------------------------------------------------------------------------------------------------------------
+namespace
+{
+
+// The recorded-exposure-bright flat floor of the tracked fixture, resolved with a render callback that answers `luma`
+// (< 0: the callback fails). Returns the stats AFTER resolveLookAssistScene, as the consumers log them.
+LookAssistStats resolvedFlatFloor( const LookAssistStats &raw, int luma, int *renders = nullptr )
+{
+    LookAssistStats s = raw;
+    int count = 0;
+    resolveLookAssistScene( &s, [&]( double, LookAssistStats *out ) {
+        ++count;
+        if( luma < 0 ) return false;
+        *out = renderedPicture( 64, 64, [luma]( int x, int y ) { return luma < 0 ? 0 : luma + ( x + 2 * y ) % 24; } );
+        return true; } );
+    if( renders ) *renders = count;
+    return s;
+}
+
+QString evText( double iso, double shutterUs, double apertureX100 )
+{
+    double ev100 = 0.0;
+    lookAssistSceneEv100( iso, shutterUs, apertureX100, &ev100 );
+    return QString::number( ev100, 'f', 2 );
+}
+
+// The keys of a "k=v k=v ..." field string, in order.
+QStringList fieldKeys( const QString &fields )
+{
+    QStringList keys;
+    for( const QString &token : fields.split( QLatin1Char(' '), Qt::SkipEmptyParts ) )
+        keys << token.section( QLatin1Char('='), 0, 0 );
+    return keys;
+}
+
+const QStringList kDecisionFieldKeys = {
+    QStringLiteral("has_ev100"), QStringLiteral("ev100"), QStringLiteral("daylight_gate"), QStringLiteral("post_walk_ran"),
+    QStringLiteral("post_walk_branch"), QStringLiteral("post_walk_recovery"), QStringLiteral("display_meter_ran"),
+    QStringLiteral("playback_scale") };
+
+} // namespace
+
+TEST(LookAssistScene, DecisionLogNamesTheDaylightGateAndTheExposureInputs)
+{
+    // (a) The tracked daylight fixture: exposure bright, flat floor, legacy night, the rendered picture corroborates.
+    int renders = 0;
+    const LookAssistStats daylight = resolvedFlatFloor( withEv( fixtureRawStats(), 100, 465, 560 ), 70, &renders );
+    ASSERT_EQ( 1, renders );
+    ASSERT_TRUE( daylight.daylightPictureEvidence );
+    LookAssistDecisionTrace asked;
+    asked.pictureEvidenceAsked = true;
+    ASSERT_TRUE( lookAssistDecisionLogFields( daylight, asked )
+                 == QStringLiteral("has_ev100=1 ev100=%1 daylight_gate=pass post_walk_ran=0 post_walk_branch=none "
+                                   "post_walk_recovery=NA display_meter_ran=0 playback_scale=NA")
+                        .arg( evText( 100, 465, 560 ) ) );
+    ASSERT_TRUE( evText( 100, 465, 560 ).startsWith( QStringLiteral("16.") ) );
+
+    // (b) No exposure block: has_ev100=0, the EV is NA, the first conjunct is what failed, and no picture was rendered.
+    const LookAssistStats noMeta = resolvedFlatFloor( fixtureRawStats(), 70, &renders );
+    ASSERT_EQ( 0, renders );
+    ASSERT_TRUE( lookAssistDecisionLogFields( noMeta, asked )
+                 == QStringLiteral("has_ev100=0 ev100=NA daylight_gate=exposure post_walk_ran=0 post_walk_branch=none "
+                                   "post_walk_recovery=NA display_meter_ran=0 playback_scale=NA") );
+
+    // ND-filter daylight (EV100 8.6): the metadata is there, it is just not daylight-bright -> the same gate.
+    const LookAssistStats nd = resolvedFlatFloor( withEv( fixtureRawStats(), 100, 20000, 280 ), 70, &renders );
+    ASSERT_EQ( 0, renders );
+    ASSERT_TRUE( lookAssistDecisionLogFields( nd, asked ).startsWith(
+        QStringLiteral("has_ev100=1 ev100=%1 daylight_gate=exposure ").arg( evText( 100, 20000, 280 ) ) ) );
+    ASSERT_TRUE( evText( 100, 20000, 280 ).startsWith( QStringLiteral("8.") ) );
+
+    // Exposure bright but the RAW thumbnail is usable (not a flat floor): the second conjunct.
+    const LookAssistStats usable = resolvedFlatFloor( withEv( analyzeFrame( 64, 64, []( int x, int ) {
+        return std::vector<int>{ 20 + x / 2, 20 + x / 2, 20 + x / 2 }; } ), 100, 465, 560 ), 70, &renders );
+    ASSERT_EQ( 0, renders );
+    ASSERT_TRUE( lookAssistDecisionLogFields( usable, asked ).contains( QStringLiteral("daylight_gate=flatfloor ") ) );
+
+    // Exposure bright, flat floor, but the legacy verdict is neither night nor artificial lights (a bright flat floor
+    // reads shade): the third conjunct.
+    LookAssistStats brightFloor = fixtureRawStats();
+    brightFloor.median = 64; brightFloor.p05 = 60; brightFloor.p95 = 68; brightFloor.p99 = 69;
+    brightFloor.dynamicRange = 8; brightFloor.medianR = brightFloor.medianG = brightFloor.medianB = 64;
+    brightFloor = withEv( brightFloor, 100, 465, 560 );
+    ASSERT_TRUE( lookAssistIsFlatFloorRawThumbnail( brightFloor ) );
+    ASSERT_TRUE( classifyLookAssistScene( brightFloor ) == LookAssistScene::Shade );
+    const LookAssistStats legacyShade = resolvedFlatFloor( brightFloor, 70, &renders );
+    ASSERT_EQ( 0, renders );
+    ASSERT_TRUE( lookAssistDecisionLogFields( legacyShade, asked ).contains( QStringLiteral("daylight_gate=legacy ") ) );
+
+    // Every non-picture conjunct held and the picture said no (a dark field), or could not say (the render failed):
+    // the last conjunct. With no picture asked for (the master pass) it is n/a, not "picture".
+    const LookAssistStats darkField = resolvedFlatFloor( withEv( fixtureRawStats(), 100, 465, 560 ), 8, &renders );
+    ASSERT_EQ( 1, renders );
+    ASSERT_FALSE( darkField.daylightPictureEvidence );
+    ASSERT_TRUE( lookAssistDecisionLogFields( darkField, asked ).contains( QStringLiteral("daylight_gate=picture ") ) );
+    const LookAssistStats failedRender = resolvedFlatFloor( withEv( fixtureRawStats(), 100, 465, 560 ), -1, &renders );
+    ASSERT_EQ( 1, renders );
+    ASSERT_TRUE( lookAssistDecisionLogFields( failedRender, asked ).contains( QStringLiteral("daylight_gate=picture ") ) );
+    LookAssistStats masterPass = withEv( fixtureRawStats(), 100, 465, 560 );
+    resolveLookAssistScene( &masterPass, LookAssistRenderFn() );
+    LookAssistDecisionTrace notAsked;   // the default trace is the master pass / headless one
+    ASSERT_TRUE( lookAssistDecisionLogFields( masterPass, notAsked ).contains( QStringLiteral("daylight_gate=n/a ") ) );
+    // ... while an earlier failing conjunct is still named in the master pass.
+    ASSERT_TRUE( lookAssistDecisionLogFields( noMeta, notAsked ).contains( QStringLiteral("daylight_gate=exposure ") ) );
+}
+
+TEST(LookAssistScene, DecisionLogRecordsThePostBalanceWalkAndTheDisplayMeter)
+{
+    // (c) A flat-floor NIGHT verdict (the M16 case: no metadata, exposure gate failed) with the GUI's walk run.
+    const LookAssistStats night = resolvedFlatFloor( fixtureRawStats(), 70 );
+    ASSERT_TRUE( classifyLookAssistScene( night ) == LookAssistScene::Night );
+    LookAssistDecisionTrace trace;
+    trace.pictureEvidenceAsked = true;
+    trace.playbackScaleFactor = 4;           // the owner legs force scale 4: the display meter does not run there
+
+    // walk entered, nothing moved
+    trace.postWalkRan = true;
+    ASSERT_TRUE( lookAssistDecisionLogFields( night, trace )
+                 == QStringLiteral("has_ev100=0 ev100=NA daylight_gate=exposure post_walk_ran=1 post_walk_branch=none "
+                                   "post_walk_recovery=NA display_meter_ran=0 playback_scale=4") );
+    // the step loop moved it
+    trace.postWalkBranch = LookAssistPostWalkBranch::Steps;
+    ASSERT_TRUE( lookAssistDecisionLogFields( night, trace ).contains(
+        QStringLiteral("post_walk_ran=1 post_walk_branch=steps post_walk_recovery=NA ") ) );
+    // the green-artifact cleanup raised the tint
+    trace.postWalkBranch = LookAssistPostWalkBranch::Cleanup;
+    ASSERT_TRUE( lookAssistDecisionLogFields( night, trace ).contains(
+        QStringLiteral("post_walk_ran=1 post_walk_branch=cleanup post_walk_recovery=NA ") ) );
+    // the warning-recovery table settled on a pair (the M16 clip: 250 / 22)
+    trace.postWalkBranch = LookAssistPostWalkBranch::Recovery;
+    trace.recoveryTemperatureDelta = 250;
+    trace.recoveryTintDelta = 22;
+    ASSERT_TRUE( lookAssistDecisionLogFields( night, trace ).contains(
+        QStringLiteral("post_walk_ran=1 post_walk_branch=recovery post_walk_recovery=250/22 display_meter_ran=0 playback_scale=4") ) );
+    trace.recoveryTemperatureDelta = -500;
+    trace.recoveryTintDelta = -35;
+    ASSERT_TRUE( lookAssistDecisionLogFields( night, trace ).contains( QStringLiteral("post_walk_recovery=-500/-35 ") ) );
+    // a stale pair is never printed for another branch
+    trace.postWalkBranch = LookAssistPostWalkBranch::Steps;
+    ASSERT_TRUE( lookAssistDecisionLogFields( night, trace ).contains( QStringLiteral("post_walk_recovery=NA ") ) );
+
+    // the display meter ran at scale 2
+    LookAssistDecisionTrace metered;
+    metered.displayMeterRan = true;
+    metered.playbackScaleFactor = 2;
+    ASSERT_TRUE( lookAssistDecisionLogFields( night, metered ).endsWith(
+        QStringLiteral("display_meter_ran=1 playback_scale=2") ) );
+    // ... and a scale with no meter run, or none known
+    metered.displayMeterRan = false;
+    metered.playbackScaleFactor = 1;
+    ASSERT_TRUE( lookAssistDecisionLogFields( night, metered ).endsWith(
+        QStringLiteral("display_meter_ran=0 playback_scale=1") ) );
+}
+
+TEST(LookAssistScene, DecisionLogFieldsAreTheseEightInThisOrder)
+{
+    // Dropping, renaming or reordering any field fails here (and the exact-string tests above).
+    LookAssistDecisionTrace trace;
+    trace.postWalkRan = true;
+    trace.postWalkBranch = LookAssistPostWalkBranch::Recovery;
+    trace.displayMeterRan = true;
+    trace.playbackScaleFactor = 2;
+    for( const LookAssistStats &s : { fixtureRawStats(), daylightFixture() } )
+    {
+        const QString fields = lookAssistDecisionLogFields( s, trace );
+        ASSERT_TRUE( fieldKeys( fields ) == kDecisionFieldKeys );
+        ASSERT_FALSE( fields.startsWith( QLatin1Char(' ') ) );   // the caller owns the separator
+        ASSERT_FALSE( fields.endsWith( QLatin1Char(' ') ) );
+    }
+}
+
+TEST(LookAssistScene, TheGateHelperIsTheDecisionNotACopyOfIt)
+{
+    // lookAssistDaylightNeedsPictureEvidence is now built on lookAssistDaylightGate. Prove it is the same boolean as
+    // the conjunction it replaced (verbatim below) over every combination of the four inputs.
+    const auto previous = []( const LookAssistStats &s, LookAssistScene legacy ) {
+        return !s.daylightPictureEvidence
+            && lookAssistExposureIsDaylightBright( s )
+            && lookAssistIsFlatFloorRawThumbnail( s )
+            && ( legacy == LookAssistScene::Night || legacy == LookAssistScene::ArtificialLights ); };
+
+    LookAssistStats usable = analyzeFrame( 64, 64, []( int x, int ) {
+        return std::vector<int>{ 20 + x / 2, 20 + x / 2, 20 + x / 2 }; } );
+    const LookAssistStats thumbnails[] = { fixtureRawStats(), usable };
+    const double isos[] = { 0.0, 100.0, 1600.0 };
+    const double shutters[] = { 0.0, 465.0, 20000.0 };
+    const LookAssistScene scenes[] = { LookAssistScene::Night, LookAssistScene::ArtificialLights,
+                                       LookAssistScene::Shade, LookAssistScene::BrightSun };
+    int combinations = 0;
+    for( const LookAssistStats &thumbnail : thumbnails )
+        for( double iso : isos )
+            for( double shutter : shutters )
+                for( bool evidence : { false, true } )
+                    for( LookAssistScene legacy : scenes )
+                    {
+                        LookAssistStats s = withEv( thumbnail, iso, shutter, 560 );
+                        s.daylightPictureEvidence = evidence;
+                        ASSERT_TRUE( lookAssistDaylightNeedsPictureEvidence( s, legacy ) == previous( s, legacy ) );
+                        // The named gate agrees: Open exactly when only the picture is left to decide.
+                        ASSERT_TRUE( ( lookAssistDaylightGate( s, legacy ) == LookAssistDaylightGate::Open )
+                                     == ( lookAssistExposureIsDaylightBright( s ) && lookAssistIsFlatFloorRawThumbnail( s )
+                                          && ( legacy == LookAssistScene::Night || legacy == LookAssistScene::ArtificialLights ) ) );
+                        ++combinations;
+                    }
+    ASSERT_EQ( 2 * 3 * 3 * 2 * 4, combinations );
+}
+
+TEST(LookAssistScene, BothConsumersAppendTheDecisionFieldsAndChangeNothingElse)
+{
+    const QString applier = readRepoFile( QStringLiteral("src/batch/ReceiptApplier.cpp") );
+    const QString window = readRepoFile( QStringLiteral("platform/qt/MainWindow.cpp") );
+    ASSERT_FALSE( applier.isEmpty() );
+    ASSERT_FALSE( window.isEmpty() );
+
+    // GUI: the result line keeps every existing field in its order and gains the shared fields at the very end.
+    const QString guiPrefix = QStringLiteral(
+        "analysis=raw scene=%1 median=%2 p05=%3 p95=%4 p99=%5 clip_low=%6 clip_high=%7 balance_samples=%8 preset_exp=%9 "
+        "preset_contrast=%10 preset_pivot=%11 preset_shadows=%12 preset_highlights=%13 preset_vibrance=%14 "
+        "preset_temp_delta=%15 preset_tint_delta=%16 final_temp=%17 final_tint=%18 thumb=%19x%20 downscale=%21 "
+        "color_thumb=%22x%23 color_downscale=%24 frame=%25 last_serial=%26 last_frame=%27 next_serial=%28 %29\")");
+    ASSERT_EQ( 1, window.count( guiPrefix ) );
+    ASSERT_EQ( 1, window.count( QStringLiteral("lookAssistDecisionLogFields( stats, decisionTrace )") ) );
+    const int guiResult = window.indexOf( QStringLiteral("QStringLiteral(\"look_assist.apply.result\")") );
+    ASSERT_TRUE( guiResult > 0 );
+    ASSERT_TRUE( window.indexOf( QStringLiteral("lookAssistDecisionLogFields( stats, decisionTrace )"), guiResult ) > guiResult );
+
+    // Headless: the "applied" line keeps its fields and gains the same shared fields at the end.
+    ASSERT_EQ( 1, applier.count( QStringLiteral("initialPatchBaseChroma=%37 initialPatchFinalChroma=%38 %39\\n\"") ) );
+    ASSERT_EQ( 1, applier.count( QStringLiteral("lookAssistDecisionLogFields( stats, decisionTrace )") ) );
+    ASSERT_TRUE( applier.contains( QStringLiteral("decisionTrace.pictureEvidenceAsked = !masterScenePass;") ) );
+    // The headless applier has no walk and no display meter: it must not claim either.
+    ASSERT_FALSE( applier.contains( QStringLiteral("decisionTrace.postWalk") ) );
+    ASSERT_FALSE( applier.contains( QStringLiteral("decisionTrace.displayMeterRan") ) );
+
+    // GUI: each input is recorded where it is decided, and only there.
+    ASSERT_TRUE( window.contains( QStringLiteral("decisionTrace.pictureEvidenceAsked = !s_lookAssistMasterScenePass;") ) );
+    ASSERT_TRUE( window.contains( QStringLiteral("decisionTrace.playbackScaleFactor = displayMeterPlaybackScaleUi;") ) );
+    ASSERT_TRUE( window.contains( QStringLiteral("const bool useDisplayMeterExposureUi = displayMeterPlaybackScaleUi == 2;") ) );
+    const int meterSamples = window.indexOf( QStringLiteral("displayStatsValidUi = true;") );
+    ASSERT_TRUE( meterSamples > 0 );
+    const int meterRan = window.indexOf( QStringLiteral("decisionTrace.displayMeterRan = true;"), meterSamples );
+    ASSERT_TRUE( meterRan > meterSamples && meterRan - meterSamples < 120 );   // set with the samples, not elsewhere
+    ASSERT_EQ( 1, window.count( QStringLiteral("decisionTrace.displayMeterRan = true;") ) );
+    const int walk = window.indexOf( QStringLiteral("if( refinePostBalance )") );
+    ASSERT_TRUE( walk > 0 );
+    const int walkRan = window.indexOf( QStringLiteral("decisionTrace.postWalkRan = true;"), walk );
+    const int walkSteps = window.indexOf( QStringLiteral("decisionTrace.postWalkBranch = LookAssistPostWalkBranch::Steps;"), walk );
+    const int walkCleanup = window.indexOf( QStringLiteral("decisionTrace.postWalkBranch = LookAssistPostWalkBranch::Cleanup;"), walk );
+    const int walkRecovery = window.indexOf( QStringLiteral("decisionTrace.postWalkBranch = LookAssistPostWalkBranch::Recovery;"), walk );
+    ASSERT_TRUE( walkRan > walk && walkSteps > walkRan && walkCleanup > walkSteps && walkRecovery > walkCleanup );
+    ASSERT_EQ( 1, window.count( QStringLiteral("decisionTrace.postWalkRan = true;") ) );
+    ASSERT_EQ( 1, window.count( QStringLiteral("decisionTrace.recoveryTemperatureDelta = preset.temperatureDelta;") ) );
+    ASSERT_EQ( 1, window.count( QStringLiteral("decisionTrace.recoveryTintDelta = preset.tintDelta;") ) );
+    // The walk's own gate and its recovery table are untouched by this card.
+    ASSERT_TRUE( window.contains( QStringLiteral("!daylightScene && ( !autoWhiteBalanceValid || useProcessedColorStats )") ) );
+    ASSERT_TRUE( window.contains( QStringLiteral("qMakePair( 250, 22 ),") ) );
 }

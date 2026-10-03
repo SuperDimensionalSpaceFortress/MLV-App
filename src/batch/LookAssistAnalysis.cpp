@@ -254,12 +254,68 @@ LookAssistScene classifyLookAssistScene( const LookAssistStats &stats )
     return LookAssistScene::Shade;
 }
 
+LookAssistDaylightGate lookAssistDaylightGate( const LookAssistStats &stats, LookAssistScene legacyScene )
+{
+    if( !lookAssistExposureIsDaylightBright( stats ) ) return LookAssistDaylightGate::Exposure;
+    if( !lookAssistIsFlatFloorRawThumbnail( stats ) ) return LookAssistDaylightGate::FlatFloor;
+    if( legacyScene != LookAssistScene::Night && legacyScene != LookAssistScene::ArtificialLights )
+        return LookAssistDaylightGate::Legacy;
+    return LookAssistDaylightGate::Open;
+}
+
 bool lookAssistDaylightNeedsPictureEvidence( const LookAssistStats &stats, LookAssistScene legacyScene )
 {
     return !stats.daylightPictureEvidence
-        && lookAssistExposureIsDaylightBright( stats )
-        && lookAssistIsFlatFloorRawThumbnail( stats )
-        && ( legacyScene == LookAssistScene::Night || legacyScene == LookAssistScene::ArtificialLights );
+        && lookAssistDaylightGate( stats, legacyScene ) == LookAssistDaylightGate::Open;
+}
+
+QString lookAssistDaylightGateName( const LookAssistStats &resolved, bool pictureEvidenceAsked )
+{
+    if( resolved.daylightPictureEvidence ) return QStringLiteral("pass");
+    // No evidence was granted, so the stats classify exactly as the legacy verdict did.
+    switch( lookAssistDaylightGate( resolved, classifyLookAssistScene( resolved ) ) )
+    {
+    case LookAssistDaylightGate::Exposure:
+        return QStringLiteral("exposure");
+    case LookAssistDaylightGate::FlatFloor:
+        return QStringLiteral("flatfloor");
+    case LookAssistDaylightGate::Legacy:
+        return QStringLiteral("legacy");
+    case LookAssistDaylightGate::Open:
+        break;
+    }
+    return pictureEvidenceAsked ? QStringLiteral("picture") : QStringLiteral("n/a");
+}
+
+QString lookAssistDecisionLogFields( const LookAssistStats &resolved, const LookAssistDecisionTrace &trace )
+{
+    QString branch = QStringLiteral("none");
+    switch( trace.postWalkBranch )
+    {
+    case LookAssistPostWalkBranch::None:
+        break;
+    case LookAssistPostWalkBranch::Steps:
+        branch = QStringLiteral("steps");
+        break;
+    case LookAssistPostWalkBranch::Cleanup:
+        branch = QStringLiteral("cleanup");
+        break;
+    case LookAssistPostWalkBranch::Recovery:
+        branch = QStringLiteral("recovery");
+        break;
+    }
+    const bool recovery = trace.postWalkBranch == LookAssistPostWalkBranch::Recovery;
+    return QStringLiteral("has_ev100=%1 ev100=%2 daylight_gate=%3 post_walk_ran=%4 post_walk_branch=%5 "
+                          "post_walk_recovery=%6 display_meter_ran=%7 playback_scale=%8")
+        .arg( resolved.hasSceneEv100 ? 1 : 0 )
+        .arg( resolved.hasSceneEv100 ? QString::number( resolved.sceneEv100, 'f', 2 ) : QStringLiteral("NA") )
+        .arg( lookAssistDaylightGateName( resolved, trace.pictureEvidenceAsked ) )
+        .arg( trace.postWalkRan ? 1 : 0 )
+        .arg( branch )
+        .arg( recovery ? QStringLiteral("%1/%2").arg( trace.recoveryTemperatureDelta ).arg( trace.recoveryTintDelta )
+                       : QStringLiteral("NA") )
+        .arg( trace.displayMeterRan ? 1 : 0 )
+        .arg( trace.playbackScaleFactor > 0 ? QString::number( trace.playbackScaleFactor ) : QStringLiteral("NA") );
 }
 
 bool lookAssistPictureCorroboratesDaylight( const LookAssistStats &processedAtPlannedExposure )
