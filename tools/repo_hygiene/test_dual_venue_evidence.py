@@ -72,8 +72,8 @@ PWSH = shutil.which("pwsh")
 requires_windows_pwsh = unittest.skipIf(PWSH is None or sys.platform != "win32", "needs pwsh on Windows")
 FIXTURE_IDS = ("tiny_dual_iso", "large_dual_iso")
 OWNER_CLIP = "M16-1243"   # a consented clip ID (an id is not footage); the runner never sees a path
-# Every leg spec shipped under legs/ (DVE-CINEMATIC-LEG-SPEC-1 added the cinematic and scale-2 look legs); the tracked-spec tests loop over all of them.
-SHIPPED_LEGS = ("legs/m16-1243-speed.json", "legs/m16-1243-look.json", "legs/m16-1243-look-cinematic.json", "legs/m16-1243-look-scale2.json")
+# Every leg spec shipped under legs/ (DVE-SCALE2-LOOK-LEG-1 added the scale-2 look leg); the tracked-spec tests loop over all of them.
+SHIPPED_LEGS = ("legs/m16-1243-speed.json", "legs/m16-1243-look.json", "legs/m16-1243-look-scale2.json")
 SHIPPED_LEGS_PS = ", ".join(f"'{rel}'" for rel in SHIPPED_LEGS)
 OTHER_CLIP = "Z99-9999"
 MLV_EXT = "." + "mlv"  # never spelled as one literal token (the NA-4 gate trips on fixture basenames)
@@ -774,10 +774,11 @@ class RunnerReceiptTests(RunnerHarness, unittest.TestCase):
         for expected in ("ForceLookAssist=True", "ContactSheet=True", "LookFlavor=classic", "Backend=cpu"):
             self.assertIn(expected, call)
 
-    def test_a_cinematic_leg_never_claims_the_flavor_was_honoured_because_the_spec_asked_for_it(self) -> None:
-        """DVE-CINEMATIC-LEG-SPEC-1: the receipt's lookFlavor is what the SPEC asked for; lookFlavorHonored may only come from the app.
-        The app reports no flavor today (no reader of MLVAPP_LOOK_ASSIST_FLAVOR, no flavor field in look_assist.apply.result), so a
-        cinematic leg's receipt must stay 'unknown' -- never True, never a string that echoes the spec."""
+    def test_a_spec_asking_for_cinematic_never_claims_the_flavor_was_honoured_because_the_spec_asked_for_it(self) -> None:
+        """DVE-SCALE2-LOOK-LEG-1: the receipt's lookFlavor is what the SPEC asked for; lookFlavorHonored may only come from the app.
+        The app reports no flavor today (no reader of MLVAPP_LOOK_ASSIST_FLAVOR, no flavor field in look_assist.apply.result), so the
+        receipt of a leg asking for cinematic (a synthetic spec here; none is shipped until LOOK-ASSIST-FLAVORS-1) must stay 'unknown'
+        -- never True, never a string that echoes the spec."""
         self.write_artifacts(sheet=True)
         spec = self.write_spec(leg_type="look", flavor="cinematic")
         proc, receipt, _ = self.run_leg("ultra-magnus", spec, extra=["-Backend", "cpu"])
@@ -3474,20 +3475,19 @@ class LegSpecSchemaTests(unittest.TestCase):
             types.add(spec["legType"])
         self.assertEqual(types, {"speed", "look"})
 
-    def test_the_cinematic_and_scale2_look_legs_differ_from_the_classic_leg_only_where_they_must(self) -> None:
+    def test_the_scale2_look_leg_differs_from_the_classic_leg_only_where_it_must(self) -> None:
         load = lambda name: json.loads((DV / "legs" / f"{name}.json").read_text(encoding="utf-8"))
-        classic, cinematic, scale2 = load("m16-1243-look"), load("m16-1243-look-cinematic"), load("m16-1243-look-scale2")
-        for spec in (classic, cinematic, scale2):
+        classic, scale2 = load("m16-1243-look"), load("m16-1243-look-scale2")
+        for spec in (classic, scale2):
             self.jsonschema.validate(spec, self.schema)
         self.assertEqual(classic["look"]["lookFlavor"], "classic")
-        self.assertEqual(cinematic["legId"], "m16-1243-look-cinematic")
-        self.assertEqual(cinematic["look"]["lookFlavor"], "cinematic")
-        self.assertEqual(dict(cinematic, legId=classic["legId"], look=classic["look"]), classic, "the cinematic leg is the Classic leg except legId and lookFlavor")
+        self.assertEqual(scale2["look"]["lookFlavor"], "classic", "no cinematic leg ships until the app can apply a flavor (LOOK-ASSIST-FLAVORS-1)")
+        self.assertFalse((DV / "legs" / "m16-1243-look-cinematic.json").exists(), "a cinematic spec would be labelled cinematic and render Classic")
         self.assertEqual(scale2["legId"], "m16-1243-look-scale2")
         self.assertEqual(scale2["scaleFactor"], 2)
         self.assertEqual(classic["scaleFactor"], 4)
         self.assertEqual(dict(scale2, legId=classic["legId"], scaleFactor=classic["scaleFactor"]), classic, "the scale-2 leg is the Classic leg except legId and scaleFactor")
-        self.assertEqual(len({s["legId"] for s in (classic, cinematic, scale2)}), 3)
+        self.assertNotEqual(classic["legId"], scale2["legId"])
 
     def test_no_shipped_leg_can_play_a_fixture_or_a_short_window(self) -> None:
         # ROUND 2: legs are addressed by consented clip ID, and the tracked fixtures are never a venue playback clip.

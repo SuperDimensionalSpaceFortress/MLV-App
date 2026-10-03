@@ -279,15 +279,17 @@ path; the pair is its own record (`mlv-app/dual-venue-sheet-pair/v1`) because re
 * `lookFlavor` (`classic` default | `cinematic`) is in the leg spec and the receipt subject and is passed
   to the app as `MLVAPP_LOOK_ASSIST_FLAVOR`. **The app does not read it yet** (LOOK-ASSIST-FLAVORS-1), so
   every receipt says `lookFlavorHonored: "unknown"` -- never a claim that it applied.
-  **Audit (DVE-CINEMATIC-LEG-SPEC-1):** nothing in `platform/` or `src/` reads that variable, and the app's
+  **Audit (DVE-SCALE2-LOOK-LEG-1):** nothing in `platform/` or `src/` reads that variable, and the app's
   `look_assist.apply.result` line carries scene / statistics / preset values but **no flavor field**
   (the "Cinematic 1/2/3" entries in `film.h` and the main window are unrelated film filters). So a
-  `cinematic` receipt proves the spec *asked* for that flavor and nothing more; `lookFlavorHonored` stays
+  `cinematic` receipt would prove the spec *asked* for that flavor and nothing more; `lookFlavorHonored` stays
   `unknown` until the app can select a flavor and report the one it applied, at which point the job must
-  record that report (a unit test trips when the app starts reading the variable).
-* Shipped look legs: `m16-1243-look` (Classic, scale 4), `m16-1243-look-cinematic` (identical except
-  `lookFlavor: cinematic`) and `m16-1243-look-scale2` (the Classic leg at `scaleFactor` 2, the only scale at
-  which the display-meter exposure path runs, so it is the leg that shows the owner's playback look).
+  record that report (a unit test trips when the app starts reading the variable). **No cinematic leg spec
+  ships** until LOOK-ASSIST-FLAVORS-1 adds the flavor: a committed spec would produce a sheet labelled
+  cinematic that renders Classic.
+* Shipped look legs: `m16-1243-look` (Classic, scale 4) and `m16-1243-look-scale2` (the Classic leg at
+  `scaleFactor` 2). The scale-2 leg exists because the owner's display-meter exposure path runs only at
+  scale 2, so it is the leg that shows the owner's playback look.
 * Aesthetics are **model-judged** (Amendment 2). Receipts carry `owner_verdict: null` (optional, never
   waited on, never written by the runner) and `model_verdicts: []` (filled by the judge card).
 * **Sheets of owner footage stay local under `.claude-state`** (never committed, attached to a PR, published to
@@ -296,7 +298,7 @@ path; the pair is its own record (`mlv-app/dual-venue-sheet-pair/v1`) because re
 
 ## How to add a leg
 
-1. Copy `legs/m16-1243-speed.json` (or `m16-1243-look.json`, `m16-1243-look-cinematic.json`, `m16-1243-look-scale2.json`); give it a new `legId`, the `card` that needs the
+1. Copy `legs/m16-1243-speed.json` (or `m16-1243-look.json`, `m16-1243-look-scale2.json`); give it a new `legId`, the `card` that needs the
    evidence and a **consented clip id**. The file validates against `leg-spec.schema.json`. The id needs an
    owner-typed record for each venue that will run it (see "Long clips only").
 2. Declare the **roles before the first byte** (kernel K5): add the card to `venues.json` `roles`
