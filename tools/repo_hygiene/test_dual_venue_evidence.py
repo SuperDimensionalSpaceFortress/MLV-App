@@ -185,7 +185,9 @@ class GeneratorByteIdentityAndVariantTests(unittest.TestCase):
     # region cannot silently multiply or grow outside its brackets (test_um_presentmon_orphan_sweep.py pins what the regions hold).
     ORPHAN_SWEEP_OPEN = "UM-PRESENTMON-ORPHAN-SWEEP-1 >>>"
     ORPHAN_SWEEP_CLOSE = "UM-PRESENTMON-ORPHAN-SWEEP-1 <<<"
-    ORPHAN_SWEEP_REGIONS = 16
+    # 23 = 22 in the job template plus the one module-helper splice; r1 had 16 (15 + 1): r2 adds the per-action liveness helpers and listing retry (one region), the logman-path/timeout variables (inside the existing init region),
+    # the PRESENTMON_TIMEOUT reason detail, and the post-Kill terminate trace + summary field at each of the three Stop call sites.
+    ORPHAN_SWEEP_REGIONS = 23
 
     @classmethod
     def strip_regions(cls, text: str) -> tuple[str, dict[str, int]]:

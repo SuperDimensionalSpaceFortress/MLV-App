@@ -245,7 +245,7 @@ seen while the launch waited for trace readiness, or exists at stop), `csvSizeAt
 error), so "the stop was clean and the CSV never appeared" is a fact in the evidence. A PresentMon that exits at startup (rc=6, ETW access denied) publishes the
 same streams from the spawn-failure summary (`presentMonStreams`).
 
-*A leftover PresentMon session cannot starve a capture (UM-PRESENTMON-ORPHAN-SWEEP-1).* On Ultra-Magnus an orphaned default-named `PresentMon` ETW session made every
+*A leftover PresentMon session is swept before a capture (UM-PRESENTMON-ORPHAN-SWEEP-1; that `--terminate_existing_session` ends a consumer-less orphan is not yet proven on the venue -- the logman fallback and `remaining` cover a miss).* On Ultra-Magnus an orphaned default-named `PresentMon` ETW session made every
 other-named session lose all of its events (15-17k "ETW events were lost" per 12 s), so no CSV was written; the per-job `--session_name` meant `--stop_existing_session` no
 longer cleared it. Before the spawn the job now terminates the default `PresentMon` session and every `MLVAttr3-*` session that `logman query -ets` lists, through the pinned
 PresentMon's own `--terminate_existing_session` (`logman stop <name> -ets` only for a session still listed afterwards) -- but only when no PresentMon process is alive on the host
@@ -253,6 +253,15 @@ PresentMon's own `--terminate_existing_session` (`logman stop <name> -ets` only 
 session (both stop paths). `presentmon-capture.json` carries `orphanSweep` (ran, skippedReason, live pids, listed, matching listing lines, every action with its exit code,
 what remains) and `eventsLost` (PresentMon's stderr reported lost events: message count and largest count); the failure terminals' PresentMon reason gains a typed
 `PRESENTMON_EVENTS_LOST` detail, so a recurrence reads as its cause instead of "output does not exist".
+
+The sweep can never stop a live capture or a session it did not list as an orphan (round 2): it acts only on the names listed before its second liveness check -- a name a
+later listing shows (another job's capture starting meanwhile) is recorded as `newlyListed` and left alone -- and it re-checks that no PresentMon process exists immediately
+before **each** terminate and **each** `logman stop`; the first process that appears ends the sweep (`abortedReason` / `abortedBefore`, with `remaining` still derived from a
+final listing). A failing `logman query -ets` is asked for once more (`listAttempts`), a failed middle listing is a recorded verification failure, and every `logman` call runs
+under a 15 s deadline (`timedOut` in the action record). The post-`Kill()` session terminate is published, not only run: `presentMonPostKillSessionTerminate` (exit code,
+timed out, error) in the KEEPALIVE_FAILED, SMOKE_RUN_FAILED and SMOKE_LOG_UNAVAILABLE summaries, in the trace, and as `postKillTerminate=` in the `PRESENTMON_TIMEOUT` reason,
+so a cleanup that failed is visible on the job that caused it. PresentMon's redirected stderr is UTF-16LE with a BOM (the diagnostic's real files); the lost-events scan reads
+UTF-8, UTF-16LE and UTF-16BE, with or without a BOM, and keeps its 256 KB tail on a code-unit boundary.
 
 *CPU legs and a PresentMon wait failure (DVE-PRESENTMON-EVIDENCE-1, hardening DVE-CPU-PRESENTMON-WAIT-GATES-1).* PresentMon is informational on a cpu leg, so a cpu job
 does **not** take the wait-failure terminal: the run continues through its own gates (backend, source frames, playback), the summary carries `presentMonStatus: "unavailable"`

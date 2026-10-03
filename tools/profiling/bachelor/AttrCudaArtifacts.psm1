@@ -2054,12 +2054,59 @@ function Get-AttrCudaEtsSessionListing {
     to run it is in `error` and leaves `exitCode` null.
     #>
     [CmdletBinding()]
-    param()
+    param(
+        [string]$LogmanPath = '',
+        [int]$TimeoutSeconds = 15
+    )
 
-    $result = [ordered]@{ exitCode = $null; text = ''; error = $null }
+    $run = Invoke-AttrCudaLogman -Argument @('query', '-ets') -LogmanPath $LogmanPath -TimeoutSeconds $TimeoutSeconds
+    return [ordered]@{ exitCode = $run.exitCode; text = $run.text; timedOut = $run.timedOut; error = $run.error }
+}
+
+function Invoke-AttrCudaLogman {
+    <#
+    .SYNOPSIS
+    One `logman` invocation with a deadline: its exit code, its stdout text, whether it timed out, and any failure to run it. Never throws, never waits longer than -TimeoutSeconds (plus a short drain).
+    .DESCRIPTION
+    UM-SWEEP-LOGMAN-BOUND-1 (fable hardening 3, sol hardening): the orphan sweep makes three queries and one stop per stubborn session before every capture, and a native `logman` that stalls would hold
+    the capture's start until the agent's job budget killed the whole job. The call goes through a child process that is killed (with its tree) when the deadline passes; `timedOut` and `error`
+    then say so and `exitCode` stays null. -LogmanPath is the executable to run (default: logman.exe in the system directory); a test passes a stub, and the default is what the venue runs.
+    #>
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $true)][string[]]$Argument,
+        [string]$LogmanPath = '',
+        [int]$TimeoutSeconds = 15
+    )
+
+    $result = [ordered]@{ exitCode = $null; text = ''; timedOut = $false; error = $null }
     try {
-        $result.text = [string](& logman query -ets | Out-String)
-        $result.exitCode = [int]$global:LASTEXITCODE
+        $executable = $LogmanPath
+        if ([string]::IsNullOrEmpty($executable)) { $executable = Join-Path ([Environment]::GetFolderPath('System')) 'logman.exe' }
+        $startInfo = [Diagnostics.ProcessStartInfo]::new($executable)
+        foreach ($item in $Argument) { [void]$startInfo.ArgumentList.Add($item) }
+        $startInfo.UseShellExecute = $false
+        $startInfo.RedirectStandardOutput = $true
+        $startInfo.RedirectStandardError = $true
+        $startInfo.CreateNoWindow = $true
+        $child = [Diagnostics.Process]::Start($startInfo)
+        try {
+            $outTask = $child.StandardOutput.ReadToEndAsync()
+            $errTask = $child.StandardError.ReadToEndAsync()
+            if ($child.WaitForExit($TimeoutSeconds * 1000)) {
+                [void]$outTask.Wait(5000)
+                [void]$errTask.Wait(5000)
+                $result.exitCode = [int]$child.ExitCode
+                if ($outTask.IsCompleted) { $result.text = [string]$outTask.Result }
+            } else {
+                $result.timedOut = $true
+                $result.error = "logman did not exit within $TimeoutSeconds s"
+                try { $child.Kill($true) } catch { $result.error = $result.error + "; Kill() failed: " + $_.Exception.Message }
+                [void]$child.WaitForExit(2000)
+            }
+        } finally {
+            $child.Dispose()
+        }
     } catch {
         $result.error = $_.Exception.Message
     }
@@ -2076,21 +2123,60 @@ function Stop-AttrCudaEtsSession {
     #>
     [CmdletBinding()]
     param(
-        [Parameter(Mandatory = $true)][string]$SessionName
+        [Parameter(Mandatory = $true)][string]$SessionName,
+        [string]$LogmanPath = '',
+        [int]$TimeoutSeconds = 15
     )
 
-    $result = [ordered]@{ exitCode = $null; error = $null }
+    $result = [ordered]@{ exitCode = $null; timedOut = $false; error = $null }
     if ($SessionName -notmatch '^(?i:PresentMon|MLVAttr3-[A-Za-z0-9_-]+)$') {
         $result.error = 'refused: not a PresentMon or MLVAttr3-* session name'
         return $result
     }
-    try {
-        & logman stop $SessionName -ets | Out-Null
-        $result.exitCode = [int]$global:LASTEXITCODE
-    } catch {
-        $result.error = $_.Exception.Message
-    }
+    $run = Invoke-AttrCudaLogman -Argument @('stop', $SessionName, '-ets') -LogmanPath $LogmanPath -TimeoutSeconds $TimeoutSeconds
+    $result.exitCode = $run.exitCode
+    $result.timedOut = $run.timedOut
+    $result.error = $run.error
     return $result
+}
+
+function Get-AttrCudaTextEncodingFromHead {
+    <#
+    .SYNOPSIS
+    The text encoding of a stream from its first bytes: UTF-8, UTF-16LE or UTF-16BE, with the length of its BOM and the size of its code unit.
+    .DESCRIPTION
+    UM-PRESENTMON-ORPHAN-SWEEP-1 r2 (sol blocker 3): the diagnostic's real PresentMon stderr files are UTF-16LE with a FF FE BOM (Start-Process redirecting a console child under Windows PowerShell's
+    codepage), so a UTF-8-only read never saw the lost-events warning. A BOM decides (EF BB BF UTF-8, FF FE UTF-16LE, FE FF UTF-16BE); without one, a head whose odd-position bytes are mostly NUL is
+    UTF-16LE (ASCII text in UTF-16 is every second byte zero) and one whose even-position bytes are is UTF-16BE; anything else, ASCII included, is UTF-8. Pure bytes in, an answer out; never throws.
+    #>
+    [CmdletBinding()]
+    param(
+        [AllowEmptyCollection()][byte[]]$Head = @()
+    )
+
+    $utf8 = [pscustomobject]@{ name = 'utf-8'; encoding = [Text.UTF8Encoding]::new($false); bomLength = 0; codeUnitBytes = 1 }
+    $count = $Head.Length
+    if ($count -ge 3 -and $Head[0] -eq 0xEF -and $Head[1] -eq 0xBB -and $Head[2] -eq 0xBF) {
+        return [pscustomobject]@{ name = 'utf-8'; encoding = [Text.UTF8Encoding]::new($false); bomLength = 3; codeUnitBytes = 1 }
+    }
+    if ($count -ge 2 -and $Head[0] -eq 0xFF -and $Head[1] -eq 0xFE) {
+        return [pscustomobject]@{ name = 'utf-16le'; encoding = [Text.UnicodeEncoding]::new($false, $false); bomLength = 2; codeUnitBytes = 2 }
+    }
+    if ($count -ge 2 -and $Head[0] -eq 0xFE -and $Head[1] -eq 0xFF) {
+        return [pscustomobject]@{ name = 'utf-16be'; encoding = [Text.UnicodeEncoding]::new($true, $false); bomLength = 2; codeUnitBytes = 2 }
+    }
+    $pairs = [int][math]::Floor([math]::Min($count, 512) / 2)
+    if ($pairs -ge 2) {
+        $oddNul = 0
+        $evenNul = 0
+        for ($i = 0; $i -lt ($pairs * 2); $i++) {
+            if ($Head[$i] -ne 0) { continue }
+            if (($i % 2) -eq 1) { $oddNul++ } else { $evenNul++ }
+        }
+        if (($oddNul * 2) -ge $pairs) { return [pscustomobject]@{ name = 'utf-16le'; encoding = [Text.UnicodeEncoding]::new($false, $false); bomLength = 0; codeUnitBytes = 2 } }
+        if (($evenNul * 2) -ge $pairs) { return [pscustomobject]@{ name = 'utf-16be'; encoding = [Text.UnicodeEncoding]::new($true, $false); bomLength = 0; codeUnitBytes = 2 } }
+    }
+    return $utf8
 }
 
 function Get-AttrCudaPresentMonEventsLost {
@@ -2114,8 +2200,22 @@ function Get-AttrCudaPresentMonEventsLost {
         $in = [IO.File]::Open($StderrPath, [IO.FileMode]::Open, [IO.FileAccess]::Read, [IO.FileShare]::ReadWrite)
         try {
             $length = [int64]$in.Length
-            $keep = [int][math]::Min($length, [int64]262144)
-            if ($length -gt $keep) { [void]$in.Seek($length - $keep, [IO.SeekOrigin]::Begin) }
+            # the encoding is read from the start of the stream (its BOM, else the shape of its bytes) before the tail is cut: PresentMon's stderr as Start-Process redirects it is UTF-16LE with a BOM
+            $headLength = [int][math]::Min($length, [int64]512)
+            $head = New-Object byte[] $headLength
+            $headRead = 0
+            while ($headRead -lt $headLength) {
+                $n = $in.Read($head, $headRead, $headLength - $headRead)
+                if ($n -le 0) { break }
+                $headRead += $n
+            }
+            $encoding = Get-AttrCudaTextEncodingFromHead -Head $head
+            $start = [int64][math]::Max([int64]0, $length - [int64]262144)
+            # a tail that begins between the two bytes of a UTF-16 code unit would read as noise: it starts on the next unit boundary
+            if ($start -gt 0 -and $encoding.codeUnitBytes -gt 1 -and ($start % $encoding.codeUnitBytes) -ne 0) { $start += ($encoding.codeUnitBytes - ($start % $encoding.codeUnitBytes)) }
+            if ($start -eq 0) { $start = [int64][math]::Min($length, [int64]$encoding.bomLength) }
+            [void]$in.Seek($start, [IO.SeekOrigin]::Begin)
+            $keep = [int]($length - $start)
             $buffer = New-Object byte[] $keep
             $read = 0
             while ($read -lt $keep) {
@@ -2126,7 +2226,7 @@ function Get-AttrCudaPresentMonEventsLost {
         } finally {
             $in.Dispose()
         }
-        $text = [Text.UTF8Encoding]::new($false).GetString($buffer, 0, $read)
+        $text = $encoding.encoding.GetString($buffer, 0, $read)
         $largest = [int64]-1
         $messages = 0
         foreach ($match in [regex]::Matches($text, '(\d+)\s+ETW events were lost', [Text.RegularExpressions.RegexOptions]::IgnoreCase)) {
@@ -6225,6 +6325,8 @@ Export-ModuleMember -Function `
     Add-AttrCudaPresentMonEventsLostDetail, `
     Add-AttrCudaPresentMonEventsLostDetailToReport, `
     Get-AttrCudaEtsSessionListing, `
+    Invoke-AttrCudaLogman, `
+    Get-AttrCudaTextEncodingFromHead, `
     Stop-AttrCudaEtsSession, `
     Publish-AttrCudaFileMove, `
     Publish-AttrCudaFileMoveNonOverwriting, `
