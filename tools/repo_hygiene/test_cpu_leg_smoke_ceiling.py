@@ -50,7 +50,9 @@ from tools.repo_hygiene.test_playback_attr_3_cuda_behaviour import MODULE, _Pwsh
 
 CLAMP_REQUEST = "$timeBudgetArgs['ShareSmokeCeiling'] = $true"
 CLAMP_WARNING = "CPU-LEG-SMOKE-CEILING-1: this cpu leg's smoke timeout is held"
-CLAMP_TRACE_TRUE = "$SmokeCeilingClamped = $true"
+CLAMP_TRACE = "smokeCeilingClamped="                      # what a clamped leg's job first trace line carries and no other job does
+CLAMP_TRACE_EXPRESSION = ('SMOKE_CEILING_TRACE = $(if ($timeBudget.smokeCeilingClamped) { " smokeCeilingClamped=True '
+                          'appReadAllowanceSec=$([int]$timeBudget.appReadAllowanceSec)" } else { \'\' })')
 OWNER_MB = 3238                      # the M16-1243 owner input, rounded (size only)
 CPU_PLAY_SEC = 765                    # Get-GuiSmokePlaySafetyMs -CpuPaceInformational for the 25 s window (see test_cpu_look_leg_pace_abort)
 FIXED_SMOKE_SEC = 60 + CPU_PLAY_SEC + 3 + 30
@@ -84,37 +86,23 @@ def check_generator_text(text: str) -> list[str]:
     # (c) the clamp lines exist only on the CPU-informational path: the warning fires on the derived flag alone, and the job's trace fields are the derived values
     if text.count(CLAMP_WARNING) != 1 or 'if ($timeBudget.smokeCeilingClamped) {\n    Write-Warning ("' + CLAMP_WARNING not in text:
         problems.append("the clamp warning is not guarded by the derived clamp flag alone")
-    if "SMOKE_CEILING_CLAMPED = $(if ($timeBudget.smokeCeilingClamped) { '$true' } else { '$false' })" not in text:
-        problems.append("the job's clamp trace is not the derived flag")
-    if "APP_READ_ALLOWANCE_SEC = [string][int]$timeBudget.appReadAllowanceSec" not in text:
-        problems.append("the job's re-read allowance trace is not the derived allowance")
-    if CLAMP_TRACE_TRUE in text:
-        problems.append("the job template hard-codes a true clamp trace")
-    if 'smokeCeilingClamped=$SmokeCeilingClamped appReadAllowanceSec=$AppReadAllowanceSec"' not in text:
-        problems.append("the job's first trace line does not record the clamp and the allowance")
+    if CLAMP_TRACE_EXPRESSION not in text or text.count(CLAMP_TRACE) != 1:
+        problems.append("the job's clamp trace is not the derived flag alone (a clamped leg traces it, every other leg expands it to nothing)")
+    if 'smokeProcessTimeoutMs=$SmokeProcessTimeoutMs__SMOKE_CEILING_TRACE__"' not in text:
+        problems.append("the job's first trace line does not carry the clamp trace token")
     return problems
-
-
-def job_clamp_trace(text: str) -> tuple[str, int]:
-    """(`$true` / `$false`, seconds) as a generated job declares its clamp trace."""
-    return (re.search(r"(?m)^\$SmokeCeilingClamped = (\$true|\$false)", text).group(1), int(re.search(r"(?m)^\$AppReadAllowanceSec = (\d+)", text).group(1)))
 
 
 def check_unshared_job(text: str, output: str, unshared: dict, cpu_markers_allowed: bool) -> list[str]:
     """(a) / (c) on a job NOT clamped by this card: its budget is exactly the unshared derivation for its input (`unshared` is Get-AttrCudaLegTimeBudget asked WITHOUT
-    -ShareSmokeCeiling for the same input and play seconds), it traces false, and no clamp line or (for CUDA) CPU-informational marker leaked into it."""
+    -ShareSmokeCeiling for the same input and play seconds), and no clamp line or (for CUDA) CPU-informational marker leaked into it."""
     problems = []
     smoke_ms, presentmon_sec = job_timeouts(text)
     if smoke_ms != unshared["smokeProcessTimeoutMs"]:
         problems.append(f"smoke timeout {smoke_ms} ms is not the unshared derivation {unshared['smokeProcessTimeoutMs']} ms")
     if presentmon_sec != math.ceil(unshared["smokeProcessTimeoutMs"] / 1000.0):
         problems.append(f"PresentMon capture {presentmon_sec} s is not derived from the unshared smoke timeout")
-    clamped, allowance = job_clamp_trace(text)
-    if clamped != "$false":
-        problems.append("the job traces a clamped smoke ceiling")
-    if allowance != unshared["identityReadSec"]:
-        problems.append(f"the traced re-read allowance {allowance} s is not the unshared identity read {unshared['identityReadSec']} s")
-    if CLAMP_TRACE_TRUE in text or CLAMP_WARNING in text or CLAMP_WARNING in output:
+    if CLAMP_TRACE in text or CLAMP_WARNING in output:
         problems.append("a clamp line leaked into a leg that cannot clamp")
     if not cpu_markers_allowed:
         problems += [f"a CUDA job carries the CPU-informational marker {marker}" for marker in CPU_PACE_MARKERS if marker in text]
@@ -270,9 +258,9 @@ class SharedSmokeCeilingBudget(_PwshCase):
             "presentmon not derived": ("PRESENTMON_TIMED_SECONDS = [string][int][math]::Ceiling($timeBudget.smokeProcessTimeoutMs / 1000.0)", "PRESENTMON_TIMED_SECONDS = '3600'"),
             "um-run timeout not derived": ("recommendedJobTimeoutSec = $timeBudget.jobTimeoutSec", "recommendedJobTimeoutSec = 9000"),
             "warning not guarded by the flag": ("if ($timeBudget.smokeCeilingClamped) {\n    Write-Warning", "if ($true) {\n    Write-Warning"),
-            "clamp trace not derived": ("SMOKE_CEILING_CLAMPED = $(if ($timeBudget.smokeCeilingClamped) { '$true' } else { '$false' })", "SMOKE_CEILING_CLAMPED = '$true'"),
-            "allowance trace not derived": ("APP_READ_ALLOWANCE_SEC = [string][int]$timeBudget.appReadAllowanceSec", "APP_READ_ALLOWANCE_SEC = '0'"),
-            "first trace line drops the clamp": (' smokeCeilingClamped=$SmokeCeilingClamped appReadAllowanceSec=$AppReadAllowanceSec"', '"'),
+            "clamp trace always on": (CLAMP_TRACE_EXPRESSION, 'SMOKE_CEILING_TRACE = " smokeCeilingClamped=True appReadAllowanceSec=0"'),
+            "clamp trace not derived from the flag": ("SMOKE_CEILING_TRACE = $(if ($timeBudget.smokeCeilingClamped) {", "SMOKE_CEILING_TRACE = $(if ($true) {"),
+            "first trace line drops the token": ('$SmokeProcessTimeoutMs__SMOKE_CEILING_TRACE__"', '$SmokeProcessTimeoutMs"'),
         }
         for name, (old, new) in mutants.items():
             with self.subTest(name):
@@ -368,10 +356,9 @@ class ClampIsConfinedToTheCpuInformationalOwnerLeg(unittest.TestCase):
         self.assertEqual(check_unshared_job(job, out, unshared, cpu_markers_allowed=False), [])
         smoke_ms, presentmon_sec = job_timeouts(job)
         mutants = {
-            "traces a true clamp": job.replace("$SmokeCeilingClamped = $false", CLAMP_TRACE_TRUE, 1),
+            "traces a clamp": job.replace('smokeProcessTimeoutMs=$SmokeProcessTimeoutMs"', 'smokeProcessTimeoutMs=$SmokeProcessTimeoutMs smokeCeilingClamped=True appReadAllowanceSec=0"', 1),
             "smoke timeout is another budget": job.replace(f"$SmokeProcessTimeoutMs = {smoke_ms}", f"$SmokeProcessTimeoutMs = {smoke_ms + 1000}", 1),
             "PresentMon capture is another budget": job.replace(f"$PresentMonTimedSeconds = {presentmon_sec}", f"$PresentMonTimedSeconds = {presentmon_sec + 1}", 1),
-            "allowance is not the identity read": job.replace("$AppReadAllowanceSec = 0", "$AppReadAllowanceSec = 7", 1),
             "a CPU-informational marker leaks into CUDA": job + "\n# -CpuPlayPaceInformational\n",
         }
         for name, mutant in mutants.items():
@@ -382,7 +369,7 @@ class ClampIsConfinedToTheCpuInformationalOwnerLeg(unittest.TestCase):
 
     def test_mutation_a_generator_whose_cuda_job_always_traces_a_clamp_is_caught(self) -> None:
         mutant = self.mutant_generator("cuda-traces-clamp", lambda g, m: (self.replaced_once(
-            g, "SMOKE_CEILING_CLAMPED = $(if ($timeBudget.smokeCeilingClamped) { '$true' } else { '$false' })", "SMOKE_CEILING_CLAMPED = '$true'"), m))
+            g, CLAMP_TRACE_EXPRESSION, 'SMOKE_CEILING_TRACE = " smokeCeilingClamped=True appReadAllowanceSec=0"'), m))
         job, out = self.generate(mutant, "mutant-cuda-clamp.job.ps1", [])
         self.assertTrue(check_unshared_job(job, out, self.unshared_budget(40), cpu_markers_allowed=False), "(a) did not go red on a CUDA job that traces a clamp")
 
@@ -425,7 +412,7 @@ class ClampIsConfinedToTheCpuInformationalOwnerLeg(unittest.TestCase):
         for name, extra in (*CUDA_VARIANTS, ("cpu", ["-Backend", "cpu"])):
             with self.subTest(name):
                 job, out = self.generate(GENERATOR, f"confined-{name}.job.ps1", extra)
-                self.assertNotIn(CLAMP_TRACE_TRUE, job)
+                self.assertNotIn(CLAMP_TRACE, job)
                 self.assertNotIn(CLAMP_WARNING, out)
 
     def test_mutation_clamp_lines_outside_the_cpu_informational_path_are_caught(self) -> None:

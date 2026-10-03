@@ -224,8 +224,8 @@ what is left of the 3600 s (3600 - 60 - 765 - 3 - 30 = 2742 s). The job's own fu
 timeout, which is derived with the smoke timeout and the PresentMon capture ceiling from the same result. A cpu leg is refused with
 `ATTRCUDA_TIMEBUDGET_EXCEEDS_SMOKE_CEILING` only when that remainder cannot cover the re-read at the measured rate with **no** margin
 (about 4113 MB at 1.5 MB/s); `Invoke-VenueLeg` records that refusal as the typed receipt refusal `GENERATOR_REFUSED_ATTRCUDA_TIMEBUDGET_EXCEEDS_SMOKE_CEILING`,
-not an untyped `RUNNER_ERROR`. The job's first trace line records `smokeCeilingClamped` and `appReadAllowanceSec`, so a process timeout on a clamped leg is
-attributable from the evidence log. A venue's own cold-read rate is not used until one is measured on it.
+not an untyped `RUNNER_ERROR`. A clamped leg's job first trace line carries `smokeCeilingClamped=True appReadAllowanceSec=<n>` (every other leg's job is unchanged, the
+default CUDA job byte for byte), so a process timeout on a clamped leg is attributable from the evidence log. A venue's own cold-read rate is not used until one is measured on it.
 
 ## LOOK legs and contact sheets
 
