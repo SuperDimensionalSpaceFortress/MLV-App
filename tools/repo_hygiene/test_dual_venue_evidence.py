@@ -72,6 +72,9 @@ PWSH = shutil.which("pwsh")
 requires_windows_pwsh = unittest.skipIf(PWSH is None or sys.platform != "win32", "needs pwsh on Windows")
 FIXTURE_IDS = ("tiny_dual_iso", "large_dual_iso")
 OWNER_CLIP = "M16-1243"   # a consented clip ID (an id is not footage); the runner never sees a path
+# Every leg spec shipped under legs/ (DVE-CINEMATIC-LEG-SPEC-1 added the cinematic and scale-2 look legs); the tracked-spec tests loop over all of them.
+SHIPPED_LEGS = ("legs/m16-1243-speed.json", "legs/m16-1243-look.json", "legs/m16-1243-look-cinematic.json", "legs/m16-1243-look-scale2.json")
+SHIPPED_LEGS_PS = ", ".join(f"'{rel}'" for rel in SHIPPED_LEGS)
 OTHER_CLIP = "Z99-9999"
 MLV_EXT = "." + "mlv"  # never spelled as one literal token (the NA-4 gate trips on fixture basenames)
 LAUNCHER = ROOT / "tools" / "profiling" / "run-release-gui-smoke.ps1"
@@ -457,7 +460,8 @@ class RunnerHarness:
     def write_consent(self, *records: dict) -> None:
         self.consent.write_text(json.dumps(consent_file(*records)), encoding="utf-8")
 
-    def write_spec(self, card: str = "DUAL-VENUE-EVIDENCE-1", clip: str = OWNER_CLIP, leg_type: str = "speed", play_seconds: int | None = 25) -> Path:
+    def write_spec(self, card: str = "DUAL-VENUE-EVIDENCE-1", clip: str = OWNER_CLIP, leg_type: str = "speed", play_seconds: int | None = 25,
+                   flavor: str = "classic") -> Path:
         spec = {
             "schema": "mlv-app/dual-venue-leg/v1", "legId": "unit-leg", "card": card, "legType": leg_type, "clipId": clip,
             "backends": ["cuda", "cpu"], "scaleFactor": 4,
@@ -468,8 +472,9 @@ class RunnerHarness:
         if play_seconds is not None:
             spec["playSeconds"] = play_seconds
         if leg_type == "look":
-            spec["look"] = {"contactSheetFrames": 2, "lookFlavor": "classic"}
-        path = self.tmp / f"spec-{card}-{clip}-{leg_type}-{play_seconds}.json"
+            spec["look"] = {"contactSheetFrames": 2, "lookFlavor": flavor}
+        path = self.tmp / (f"spec-{card}-{clip}-{leg_type}-{play_seconds}.json" if flavor == "classic"
+                           else f"spec-{card}-{clip}-{leg_type}-{play_seconds}-{flavor}.json")
         path.write_text(json.dumps(spec), encoding="utf-8")
         return path
 
@@ -768,6 +773,39 @@ class RunnerReceiptTests(RunnerHarness, unittest.TestCase):
         call = self.generator_calls()[-1]
         for expected in ("ForceLookAssist=True", "ContactSheet=True", "LookFlavor=classic", "Backend=cpu"):
             self.assertIn(expected, call)
+
+    def test_a_cinematic_leg_never_claims_the_flavor_was_honoured_because_the_spec_asked_for_it(self) -> None:
+        """DVE-CINEMATIC-LEG-SPEC-1: the receipt's lookFlavor is what the SPEC asked for; lookFlavorHonored may only come from the app.
+        The app reports no flavor today (no reader of MLVAPP_LOOK_ASSIST_FLAVOR, no flavor field in look_assist.apply.result), so a
+        cinematic leg's receipt must stay 'unknown' -- never True, never a string that echoes the spec."""
+        self.write_artifacts(sheet=True)
+        spec = self.write_spec(leg_type="look", flavor="cinematic")
+        proc, receipt, _ = self.run_leg("ultra-magnus", spec, extra=["-Backend", "cpu"])
+        self.assertEqual(receipt["outcome"], "PASS", receipt["outcomeDetail"])
+        self.assertEqual(receipt["look"]["lookFlavor"], "cinematic")
+        self.assertEqual(receipt["look"]["lookFlavorHonored"], "unknown")
+        self.assertEqual(receipt["subject"]["lookFlavor"], "cinematic")
+        self.assertIn("LookFlavor=cinematic", self.generator_calls()[-1])
+
+    def test_the_honoured_field_is_never_assigned_from_the_spec_in_the_runner_or_the_job(self) -> None:
+        runner = (DV / "Invoke-VenueLeg.ps1").read_text(encoding="utf-8")
+        job = (ROOT / "tools" / "profiling" / "bachelor" / "playback-attr-3-cuda-job.ps1").read_text(encoding="utf-8")
+        pair = (DV / "New-VenueSheetPair.ps1").read_text(encoding="utf-8")
+        for name, text in (("Invoke-VenueLeg.ps1", runner), ("playback-attr-3-cuda-job.ps1", job), ("New-VenueSheetPair.ps1", pair)):
+            for line in text.splitlines():
+                if "lookFlavorHonored" in line and "=" in line:
+                    self.assertRegex(line, r"'unknown'|\$null", f"{name}: lookFlavorHonored must be 'unknown' (or null off a look leg), never derived from the spec: {line.strip()}")
+
+    def test_tripwire_the_app_has_no_reader_of_the_flavor_env_var_so_honoured_stays_unknown(self) -> None:
+        """If this fails, LOOK-ASSIST-FLAVORS-1 (or equivalent) landed an app-side reader: make the job record the flavor the app REPORTS
+        (a field in look_assist.apply.result / the visual-state telemetry) and set lookFlavorHonored from it, then update this test."""
+        needle = "MLVAPP_LOOK_ASSIST_FLAVOR"
+        hits = []
+        for sub in ("platform", "src"):
+            for path in (ROOT / sub).rglob("*"):
+                if path.suffix.lower() in (".cpp", ".h", ".hpp", ".cu", ".c", ".mm") and needle in path.read_text(encoding="utf-8", errors="replace"):
+                    hits.append(str(path.relative_to(ROOT)))
+        self.assertEqual(hits, [], "the app now reads the flavor env var; wire lookFlavorHonored to what it reports")
 
 
 @requires_windows_pwsh
@@ -3106,7 +3144,7 @@ class LineEndingsCannotHideACommittedFileTests(ModuleMutationMixin, unittest.Tes
     committed blob is LF, and the runner hashed the working bytes while Find-DvCommittedLegSpec hashed the blob bytes, so every committed leg spec was
     refused LEG_SPEC_NOT_COMMITTED. Both sides now hash line-ending-normalised bytes, and .gitattributes pins the three files to LF."""
 
-    FILES = ("legs/m16-1243-speed.json", "legs/m16-1243-look.json", "venue-clip-consent.json", "venues.json")
+    FILES = (*SHIPPED_LEGS, "venue-clip-consent.json", "venues.json")
 
     def checkout(self, with_attributes: bool) -> Path:
         """A temp repo holding the REAL shipped leg specs, consent file and venue table, committed (LF) and then CHECKED OUT under core.autocrlf=true."""
@@ -3137,7 +3175,7 @@ class LineEndingsCannotHideACommittedFileTests(ModuleMutationMixin, unittest.Tes
 
     def probe(self, root: Path, module: Path | None = None) -> list[str]:
         script = (f"$root = '{root}'\n$head = (git -C $root rev-parse HEAD)\n"
-                  "foreach ($rel in 'legs/m16-1243-speed.json', 'legs/m16-1243-look.json') {\n"
+                  f"foreach ($rel in {SHIPPED_LEGS_PS}) {{\n"
                   "  $bytes = [IO.File]::ReadAllBytes((Join-Path $root ('tools/profiling/dual-venue/' + $rel)))\n"
                   "  $r = Find-DvCommittedLegSpec -RepoRoot $root -Commit $head -LegSpecSha256 (Get-DvLegSpecSha256 $bytes)\n"
                   "  Write-Output ('LEG ' + $rel + ' found=' + $r.ok + ' crlf=' + ($bytes -contains 13))\n}\n"
@@ -3152,8 +3190,8 @@ class LineEndingsCannotHideACommittedFileTests(ModuleMutationMixin, unittest.Tes
     def test_the_default_windows_checkout_is_crlf_and_the_committed_specs_consent_and_table_are_still_found(self) -> None:
         root = self.checkout(with_attributes=False)
         out = self.probe(root)
-        self.assertIn("LEG legs/m16-1243-speed.json found=True crlf=True", out, "the premise: the working copy IS crlf, and the committed spec is still found")
-        self.assertIn("LEG legs/m16-1243-look.json found=True crlf=True", out)
+        for rel in SHIPPED_LEGS:
+            self.assertIn(f"LEG {rel} found=True crlf=True", out, "the premise: the working copy IS crlf, and the committed spec is still found")
         self.assertIn("FILE venue-clip-consent.json ok=True reason=", out)
         self.assertIn("FILE venues.json ok=True reason=", out)
         self.assertIn("SRC ok=True reason=", out)
@@ -3163,23 +3201,23 @@ class LineEndingsCannotHideACommittedFileTests(ModuleMutationMixin, unittest.Tes
         for rel in self.FILES:
             self.assertNotIn(b"\r", (root / "tools" / "profiling" / "dual-venue" / rel).read_bytes(), f"{rel} must check out LF even under autocrlf=true")
         out = self.probe(root)
-        self.assertIn("LEG legs/m16-1243-speed.json found=True crlf=False", out)
-        self.assertIn("LEG legs/m16-1243-look.json found=True crlf=False", out)
+        for rel in SHIPPED_LEGS:
+            self.assertIn(f"LEG {rel} found=True crlf=False", out)
         self.assertIn("SRC ok=True reason=", out)
 
     def test_each_shipped_leg_is_found_at_head_of_the_real_repo(self) -> None:
         head = subprocess.run(["git", "-C", str(ROOT), "rev-parse", "HEAD"], capture_output=True, text=True, check=True).stdout.strip()
-        for rel in ("legs/m16-1243-speed.json", "legs/m16-1243-look.json"):
+        for rel in SHIPPED_LEGS:
             tracked = subprocess.run(["git", "-C", str(ROOT), "ls-files", "--error-unmatch", "tools/profiling/dual-venue/" + rel], capture_output=True, text=True)
             self.assertEqual(tracked.returncode, 0, rel)
         proc = _ps_json(f"$root = '{ROOT}'\n"
-                        "foreach ($rel in 'legs/m16-1243-speed.json', 'legs/m16-1243-look.json') {\n"
+                        f"foreach ($rel in {SHIPPED_LEGS_PS}) {{\n"
                         "  $bytes = [IO.File]::ReadAllBytes((Join-Path $root ('tools/profiling/dual-venue/' + $rel)))\n"
                         f"  $r = Find-DvCommittedLegSpec -RepoRoot $root -Commit '{head}' -LegSpecSha256 (Get-DvLegSpecSha256 $bytes)\n"
                         "  Write-Output ('LEG ' + $rel + ' found=' + $r.ok)\n}\n", DV / "DualVenueRunner.psm1", {})
         self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
-        self.assertIn("LEG legs/m16-1243-speed.json found=True", proc.stdout)
-        self.assertIn("LEG legs/m16-1243-look.json found=True", proc.stdout)
+        for rel in SHIPPED_LEGS:
+            self.assertIn(f"LEG {rel} found=True", proc.stdout)
 
     def test_the_runner_hashes_the_spec_with_the_same_function_the_lookup_uses(self) -> None:
         runner = (DV / "Invoke-VenueLeg.ps1").read_text(encoding="utf-8")
@@ -3193,12 +3231,13 @@ class LineEndingsCannotHideACommittedFileTests(ModuleMutationMixin, unittest.Tes
         root = self.checkout(with_attributes=False)
         out = self.probe(root, module=mutated)
         self.assertIn("LEG legs/m16-1243-speed.json found=False crlf=True", out, "a raw-byte comparison refuses the committed spec -- fable's B2")
-        self.assertIn("LEG legs/m16-1243-look.json found=False crlf=True", out)
+        for rel in SHIPPED_LEGS:
+            self.assertIn(f"LEG {rel} found=False crlf=True", out)
 
 
 class GitattributesPinTheDualVenueFilesToLfTests(unittest.TestCase):
     def test_the_leg_specs_the_consent_file_and_the_venue_table_are_pinned_eol_lf(self) -> None:
-        for rel in ("tools/profiling/dual-venue/legs/m16-1243-speed.json", "tools/profiling/dual-venue/legs/m16-1243-look.json",
+        for rel in (*("tools/profiling/dual-venue/" + leg for leg in SHIPPED_LEGS),
                     "tools/profiling/dual-venue/venue-clip-consent.json", "tools/profiling/dual-venue/venues.json"):
             out = subprocess.run(["git", "-C", str(ROOT), "check-attr", "eol", "text", "--", rel], capture_output=True, text=True, check=True).stdout
             self.assertIn("eol: lf", out, rel)
@@ -3434,6 +3473,21 @@ class LegSpecSchemaTests(unittest.TestCase):
             self.assertEqual(sorted(spec["backends"]), ["cpu", "cuda"], f"{path.name} must run as cuda AND cpu")
             types.add(spec["legType"])
         self.assertEqual(types, {"speed", "look"})
+
+    def test_the_cinematic_and_scale2_look_legs_differ_from_the_classic_leg_only_where_they_must(self) -> None:
+        load = lambda name: json.loads((DV / "legs" / f"{name}.json").read_text(encoding="utf-8"))
+        classic, cinematic, scale2 = load("m16-1243-look"), load("m16-1243-look-cinematic"), load("m16-1243-look-scale2")
+        for spec in (classic, cinematic, scale2):
+            self.jsonschema.validate(spec, self.schema)
+        self.assertEqual(classic["look"]["lookFlavor"], "classic")
+        self.assertEqual(cinematic["legId"], "m16-1243-look-cinematic")
+        self.assertEqual(cinematic["look"]["lookFlavor"], "cinematic")
+        self.assertEqual(dict(cinematic, legId=classic["legId"], look=classic["look"]), classic, "the cinematic leg is the Classic leg except legId and lookFlavor")
+        self.assertEqual(scale2["legId"], "m16-1243-look-scale2")
+        self.assertEqual(scale2["scaleFactor"], 2)
+        self.assertEqual(classic["scaleFactor"], 4)
+        self.assertEqual(dict(scale2, legId=classic["legId"], scaleFactor=classic["scaleFactor"]), classic, "the scale-2 leg is the Classic leg except legId and scaleFactor")
+        self.assertEqual(len({s["legId"] for s in (classic, cinematic, scale2)}), 3)
 
     def test_no_shipped_leg_can_play_a_fixture_or_a_short_window(self) -> None:
         # ROUND 2: legs are addressed by consented clip ID, and the tracked fixtures are never a venue playback clip.
