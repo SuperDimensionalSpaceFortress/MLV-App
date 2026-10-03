@@ -6,6 +6,7 @@
 #include <QOpenGLShaderProgram>
 #include <QOpenGLTexture>
 #include <QString>
+#include <QStringList>
 #include <QVector2D>
 
 #include <cstdint>
@@ -139,6 +140,32 @@ QByteArray gpuPreviewProcessingPackLookupTextureRgba16(const QByteArray & source
  * clamped value. */
 QByteArray gpuPreviewProcessingPackMatrixLookupTextureRgba16(const QByteArray & clampedLut,
                                                              const QByteArray & rawLut);
+/* PLAYBACK-SEEK-RENDER-PARITY-1: the creative curves (pre_calc_curve_r, then
+ * gcurve_y, then gcurve_r/g/b) composed per channel into ONE RGBA16 256x256
+ * lookup texture for the display shader: R[x] = gcurve_r[gcurve_y[curve[x]]],
+ * G and B likewise. Integer table composition, so it is bit-exact with the
+ * engine's three sequential lookups (raw_processing.c, the creative-curve and
+ * gradation loops; raw_processing_8bit_kernel.inc ~339-352). Empty LUTs in the
+ * config compose as identity. */
+QByteArray gpuPreviewProcessingComposeCreativeCurvesRgba16(const GpuPreviewProcessingConfig & config);
+/* The four hue-vs / luma-vs curves (float[36000] each) packed into one RGBA32F
+ * 256x141 texture: R = hue-vs-hue, G = hue-vs-saturation, B = hue-vs-luma,
+ * A = luma-vs-saturation. */
+QByteArray gpuPreviewProcessingPackHueVsCurvesRgba32F(const GpuPreviewProcessingConfig & config);
+/* PLAYBACK-SEEK-RENDER-PARITY-1: the stages the LIVE DISPLAY shader does NOT
+ * apply although the subset (and therefore the texture route's admission gate,
+ * gpuPreviewProcessingIsSupported) accepts them. Any of these active means the
+ * display shader would show a different look than the engine, so the CUDA
+ * texture route must refuse and fall back to a route that applies them. Stable
+ * lower-case tokens, in pipeline order: "vignette", "highlight_reconstruction",
+ * "gradient", "lut", "chroma_separation", "sharpen", "median_denoise". Empty =
+ * the display shader applies every active stage. The config form reads the
+ * config's own stage flags; the processing-object form is the cheap per-frame
+ * policy predicate and is pinned against the config form by a test. */
+QStringList gpuPreviewProcessingDisplayShaderRefusedStages(const GpuPreviewProcessingConfig & config);
+QStringList gpuPreviewProcessingDisplayShaderRefusedStages(const processingObject_t * processing);
+/* "display_shader_refused_stages=<comma list>" or empty; the typed telemetry value. */
+QString gpuPreviewProcessingDisplayShaderRefusalReason(const QStringList & refusedStages);
 bool gpuPreviewProcessingRendererIsSoftware(const QString & rendererDescription);
 bool gpuPreviewProcessingIsSupported(const processingObject_t * processing,
                                      QString * reason = nullptr);
@@ -229,6 +256,13 @@ struct GpuPreviewProcessingLutTextureSet
      * (rebuilt only when config.signature changes). */
     QOpenGLTexture * contrastCurve = nullptr;
     QOpenGLTexture * shadowsHighlightsCurve = nullptr;
+    /* PLAYBACK-SEEK-RENDER-PARITY-1: the composed creative-curve LUT
+     * (gpuPreviewProcessingComposeCreativeCurvesRgba16) and the packed hue-vs
+     * curves (gpuPreviewProcessingPackHueVsCurvesRgba32F). Built only when the
+     * config applies the stage; while it does, the set is not ready without
+     * them (fail closed: never present with the stage silently dropped). */
+    QOpenGLTexture * creativeCurves = nullptr;
+    QOpenGLTexture * hueVsCurves = nullptr;
     uint64_t signature = 0;
     uint64_t rawLutSignature = 0;   /* config.rawLutSignature the matrix textures were built from */
     bool signatureValid = false;

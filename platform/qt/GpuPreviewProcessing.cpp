@@ -1127,6 +1127,21 @@ QByteArray packCurveTextureR32F(const QByteArray & curveBytes)
     return packed;
 }
 
+/* PLAYBACK-SEEK-RENDER-PARITY-1: the display shader's four hue-vs / luma-vs
+ * curves in ONE RGBA32F texture (one curve per channel), so the stage costs one
+ * sampler unit instead of four. */
+QOpenGLTexture * createHueVsCurvesTexture()
+{
+    QOpenGLTexture * texture = new QOpenGLTexture(QOpenGLTexture::Target2D);
+    texture->setFormat(QOpenGLTexture::RGBA32F);
+    texture->setSize(kHueVsCurveTextureWidth, kHueVsCurveTextureHeight);
+    texture->setMipLevels(1);
+    texture->allocateStorage(QOpenGLTexture::RGBA, QOpenGLTexture::Float32);
+    texture->setWrapMode(QOpenGLTexture::ClampToEdge);
+    texture->setMinMagFilters(QOpenGLTexture::Nearest, QOpenGLTexture::Nearest);
+    return texture;
+}
+
 /* The in-loop contrast curve has 65536 entries (16-bit luma index) = 256*256,
  * so it fills a full R32F lookup texture. A neutral (empty) curve packs to all
  * 1.0 so the multiply is inert. */
@@ -1416,6 +1431,26 @@ QByteArray gpuPreviewProcessingDisplayFragmentShaderSource(void)
         "uniform float previewShadowsHighlightsCurveIndexMask;\n"
         "uniform float previewApplyVibrance;\n"
         "uniform float previewVibrance;\n"
+        /* PLAYBACK-SEEK-RENDER-PARITY-1: the post-gamma creative chain, in the
+         * engine's order (raw_processing.c creative block; direct8 kernel
+         * ~298-369): hue-vs -> vibrance -> saturation -> toning -> creative
+         * curves (S-curve + gradation, composed) -> AgX inverse; AgX forward
+         * sits after the camera matrix / gamut compression. */
+        "uniform sampler2D creativeCurveLut;\n"
+        "uniform sampler2D hueVsCurves;\n"
+        "uniform float previewApplyCreativeCurves;\n"
+        "uniform float previewApplySaturation;\n"
+        "uniform float previewSaturation;\n"
+        "uniform float previewApplyToning;\n"
+        "uniform vec3 previewToningGain;\n"
+        "uniform float previewApplyHueVs;\n"
+        "uniform float previewApplyAgx;\n"
+        "uniform vec3 previewAgxFwd0;\n"
+        "uniform vec3 previewAgxFwd1;\n"
+        "uniform vec3 previewAgxFwd2;\n"
+        "uniform vec3 previewAgxInv0;\n"
+        "uniform vec3 previewAgxInv1;\n"
+        "uniform vec3 previewAgxInv2;\n"
         "varying vec2 vTexCoord;\n"
         "float cubicWeight(float x)\n"
         "{\n"
@@ -1547,6 +1582,76 @@ QByteArray gpuPreviewProcessingDisplayFragmentShaderSource(void)
         "    vec2 uv = (vec2(x, y) + vec2(0.5)) / vec2(256.0, 256.0);\n"
         "    return texture2D(lut, uv).r;\n"
         "}\n"
+        /* PLAYBACK-SEEK-RENDER-PARITY-1: the whole RGBA texel of a 256x256
+         * lookup at an integer 16-bit index (the composed creative curves keep
+         * one per-channel table in each of R, G, B). */
+        "vec4 sampleU16LutTexel(sampler2D lut, float index)\n"
+        "{\n"
+        "    float i = clamp(index, 0.0, 65535.0);\n"
+        "    float x = mod(i, 256.0);\n"
+        "    float y = floor(i / 256.0);\n"
+        "    vec2 uv = (vec2(x, y) + vec2(0.5)) / vec2(256.0, 256.0);\n"
+        "    return texture2D(lut, uv);\n"
+        "}\n"
+        /* hue-vs / luma-vs curves: float[36000] packed 256 x 141 (one curve per
+         * channel), read by integer index like the engine's curve[(uint16_t)x]. */
+        "vec4 sampleHueVsCurves(float idx)\n"
+        "{\n"
+        "    float i = clamp(idx, 0.0, 35999.0);\n"
+        "    float x = mod(i, 256.0);\n"
+        "    float y = floor(i / 256.0);\n"
+        "    vec2 uv = (vec2(x, y) + vec2(0.5)) / vec2(256.0, 141.0);\n"
+        "    return texture2D(hueVsCurves, uv);\n"
+        "}\n"
+        /* fromRGBtoHSV / fromHSVtoRGB of raw_processing.c, as the subset shader. */
+        "vec3 displayRGBtoHSV(vec3 rgb)\n"
+        "{\n"
+        "    float V = max(rgb.r, max(rgb.g, rgb.b));\n"
+        "    float delta = V - min(rgb.r, min(rgb.g, rgb.b));\n"
+        "    float H = 0.0;\n"
+        "    float S = 0.0;\n"
+        "    if (delta >= 1.17549435e-38)\n"
+        "    {\n"
+        "        S = delta / V;\n"
+        "        if (rgb.r >= V)\n"
+        "        {\n"
+        "            H = (rgb.g - rgb.b) / delta;\n"
+        "            if (H < 0.0) H += 6.0;\n"
+        "        }\n"
+        "        else if (rgb.g >= V)\n"
+        "        {\n"
+        "            H = 2.0 + (rgb.b - rgb.r) / delta;\n"
+        "        }\n"
+        "        else\n"
+        "        {\n"
+        "            H = 4.0 + (rgb.r - rgb.g) / delta;\n"
+        "        }\n"
+        "    }\n"
+        "    return vec3(H * 60.0, S, V);\n"
+        "}\n"
+        "vec3 displayHSVtoRGB(vec3 hsv)\n"
+        "{\n"
+        "    if (hsv.y < 1.17549435e-38)\n"
+        "    {\n"
+        "        return vec3(hsv.z);\n"
+        "    }\n"
+        "    float h = hsv.x / 60.0;\n"
+        "    float fi = floor(h);\n"
+        "    int i = int(fi);\n"
+        "    float f = h - fi;\n"
+        "    float p = hsv.z * (1.0 - hsv.y);\n"
+        "    if (mod(fi, 2.0) >= 0.5)\n"
+        "    {\n"
+        "        float q = hsv.z * (1.0 - (hsv.y * f));\n"
+        "        if (i == 1) return vec3(q, hsv.z, p);\n"
+        "        else if (i == 3) return vec3(p, q, hsv.z);\n"
+        "        return vec3(hsv.z, p, q);\n"
+        "    }\n"
+        "    float t = hsv.z * (1.0 - (hsv.y * (1.0 - f)));\n"
+        "    if (i == 0) return vec3(hsv.z, t, p);\n"
+        "    else if (i == 2) return vec3(p, hsv.z, t);\n"
+        "    return vec3(t, p, hsv.z);\n"
+        "}\n"
         "float sampleContrastCurve(sampler2D curve, float idx)\n"
         "{\n"
         "    float i = clamp(idx, 0.0, 65535.0);\n"
@@ -1646,6 +1751,14 @@ QByteArray gpuPreviewProcessingDisplayFragmentShaderSource(void)
         "            wbApplied = (wbApplied - vec3(Y)) * desaturateFactor + vec3(Y);\n"
         "        }\n"
         "        pix = wbApplied;\n"
+        /* PLAYBACK-SEEK-RENDER-PARITY-1: AgX forward, inside the camera-matrix
+         * block like the engine (raw_processing.c ~3591): clip negatives, the
+         * compressed-gamut matrix, then LIMIT16 stored to uint16. */
+        "        if (previewApplyAgx > 0.5)\n"
+        "        {\n"
+        "            vec3 av = max(pix, 0.0);\n"
+        "            pix = floor(clamp(vec3(dot(previewAgxFwd0, av), dot(previewAgxFwd1, av), dot(previewAgxFwd2, av)), 0.0, 65535.0));\n"
+        "        }\n"
         "    }\n"
         /* Clamped route: pix[i] = LIMIT16(result) stored to uint16 (truncation),
          * then pre_calc_gamma[pix[i]] (raw_processing.c ~3498, ~3555).
@@ -1663,6 +1776,34 @@ QByteArray gpuPreviewProcessingDisplayFragmentShaderSource(void)
         "                          truncated.b < 0.0 ? 65535.0 : min(truncated.b, 65535.0));\n"
         "    }\n"
         "    vec3 result = vec3(sampleU16LutIndex(gammaLut, gammaIndex.r), sampleU16LutIndex(gammaLut, gammaIndex.g), sampleU16LutIndex(gammaLut, gammaIndex.b));\n"
+        /* PLAYBACK-SEEK-RENDER-PARITY-1: hue-vs / luma-vs curves, first in the
+         * creative block (raw_processing.c, "Code for HueVs"). Works on the
+         * integer 16-bit pixel like the engine's pix[]. */
+        "    if (previewApplyHueVs > 0.5)\n"
+        "    {\n"
+        "        vec3 hp = floor(result * 65535.0 + 0.5);\n"
+        "        vec3 hsv = displayRGBtoHSV(hp / 65535.0);\n"
+        "        float hsat = 0.0;\n"
+        "        if (!(hp.r == 0.0 && hp.g == 0.0 && hp.b == 0.0))\n"
+        "        {\n"
+        "            float hbig = max(max(hp.r, hp.g), hp.b);\n"
+        "            float hsmall = min(min(hp.r, hp.g), hp.b);\n"
+        "            hsat = (hbig - hsmall) / hbig;\n"
+        "        }\n"
+        "        hsat = 2.0 * hsat / (hsat * hsat + 1.0);\n"
+        "        hsat = min(hsat, 1.0);\n"
+        "        vec4 hueCurves = sampleHueVsCurves(floor(hsv.x * 100.0));\n"
+        "        hsv.z *= 1.0 + (hueCurves.b * hsat * 2.0);\n"
+        "        hsv.z = max(hsv.z, 0.0);\n"
+        "        hsv.y *= 1.0 + (hueCurves.g * 2.0);\n"
+        "        hsv.y = max(hsv.y, 0.0);\n"
+        "        hsv.x += 60.0 * hueCurves.r;\n"
+        "        if (hsv.x < 0.0) hsv.x += 360.0;\n"
+        "        else if (hsv.x >= 360.0) hsv.x -= 360.0;\n"
+        "        hsv.y *= 1.0 + (sampleHueVsCurves(floor(hsv.z * 36000.0)).a * 2.0);\n"
+        "        hsv.y = max(hsv.y, 0.0);\n"
+        "        result = floor(clamp(displayHSVtoRGB(hsv) * 65535.0 + 0.5, 0.0, 65535.0)) / 65535.0;\n"
+        "    }\n"
         "    if (previewApplyVibrance > 0.5)\n"
         "    {\n"
         "        vec3 vv = floor(result * 65535.0 + 0.5);\n"
@@ -1681,6 +1822,33 @@ QByteArray gpuPreviewProcessingDisplayFragmentShaderSource(void)
         "        {\n"
         "            result = clamp(vpix0, 0.0, 65535.0) / 65535.0;\n"
         "        }\n"
+        "    }\n"
+        /* PLAYBACK-SEEK-RENDER-PARITY-1: saturation (pre_calc_sat: trunc((pix -
+         * Y1) * sat) + Y1, LIMIT16), toning (pix * (dry + wet), truncated), the
+         * creative curves (S-curve + lightening, then gradation Y and R/G/B, one
+         * composed per-channel table) and the AgX inverse, in engine order. */
+        "    if (previewApplySaturation > 0.5)\n"
+        "    {\n"
+        "        vec3 sv = floor(result * 65535.0 + 0.5);\n"
+        "        float satY = floor((sv.r * 4.0 + sv.g * 11.0 + sv.b) / 16.0);\n"
+        "        result = clamp(truncToZero((sv - vec3(satY)) * previewSaturation) + vec3(satY), 0.0, 65535.0) / 65535.0;\n"
+        "    }\n"
+        "    if (previewApplyToning > 0.5)\n"
+        "    {\n"
+        "        vec3 tv = floor(result * 65535.0 + 0.5);\n"
+        "        result = clamp(floor(tv * previewToningGain), 0.0, 65535.0) / 65535.0;\n"
+        "    }\n"
+        "    if (previewApplyCreativeCurves > 0.5)\n"
+        "    {\n"
+        "        vec3 cv = floor(result * 65535.0 + 0.5);\n"
+        "        result = vec3(sampleU16LutTexel(creativeCurveLut, cv.r).r,\n"
+        "                      sampleU16LutTexel(creativeCurveLut, cv.g).g,\n"
+        "                      sampleU16LutTexel(creativeCurveLut, cv.b).b);\n"
+        "    }\n"
+        "    if (previewApplyAgx > 0.5)\n"
+        "    {\n"
+        "        vec3 iv = floor(result * 65535.0 + 0.5);\n"
+        "        result = floor(clamp(vec3(dot(previewAgxInv0, iv), dot(previewAgxInv1, iv), dot(previewAgxInv2, iv)), 0.0, 65535.0)) / 65535.0;\n"
         "    }\n"
         "    return result;\n"
         "}\n"
@@ -2302,6 +2470,8 @@ void gpuPreviewProcessingDestroyLutTextureSet(GpuPreviewProcessingLutTextureSet 
     delete set.gamma;
     delete set.contrastCurve;
     delete set.shadowsHighlightsCurve;
+    delete set.creativeCurves;
+    delete set.hueVsCurves;
     set.levels = nullptr;
     set.matrixR = nullptr;
     set.matrixG = nullptr;
@@ -2309,6 +2479,8 @@ void gpuPreviewProcessingDestroyLutTextureSet(GpuPreviewProcessingLutTextureSet 
     set.gamma = nullptr;
     set.contrastCurve = nullptr;
     set.shadowsHighlightsCurve = nullptr;
+    set.creativeCurves = nullptr;
+    set.hueVsCurves = nullptr;
     set.signature = 0;
     set.rawLutSignature = 0;
     set.signatureValid = false;
@@ -2335,9 +2507,13 @@ void gpuPreviewProcessingUpdateLutTextureSet(GpuPreviewProcessingLutTextureSet &
         gpuPreviewProcessingDestroyLutTextureSet(set);
         return;
     }
+    const bool needCreativeCurves = config.applyCreativeCurves;
+    const bool needHueVs = config.applyHueVs;
     if ( gpuPreviewProcessingLutTextureSetKeyMatches(set, config)
       && set.levels && set.matrixR && set.matrixG && set.matrixB && set.gamma
-      && set.contrastCurve && set.shadowsHighlightsCurve )
+      && set.contrastCurve && set.shadowsHighlightsCurve
+      && (!needCreativeCurves || set.creativeCurves)
+      && (!needHueVs || set.hueVsCurves) )
     {
         return;
     }
@@ -2376,6 +2552,16 @@ void gpuPreviewProcessingUpdateLutTextureSet(GpuPreviewProcessingLutTextureSet &
     set.contrastCurve = createContrastCurveTexture();
     delete set.shadowsHighlightsCurve;
     set.shadowsHighlightsCurve = createContrastCurveTexture();
+    /* PLAYBACK-SEEK-RENDER-PARITY-1: only built while the stage is active, so a
+     * receipt without it costs no extra texture. */
+    delete set.creativeCurves;
+    set.creativeCurves = needCreativeCurves ? createLookupTexture() : nullptr;
+    delete set.hueVsCurves;
+    set.hueVsCurves = needHueVs ? createHueVsCurvesTexture() : nullptr;
+    const QByteArray creativeCurvesBytes = needCreativeCurves
+        ? gpuPreviewProcessingComposeCreativeCurvesRgba16(config) : QByteArray();
+    const QByteArray hueVsCurvesBytes = needHueVs
+        ? gpuPreviewProcessingPackHueVsCurvesRgba32F(config) : QByteArray();
 
     // FAIL CLOSED (GPU-TEXNR-S1-DARK-GREEN-1 round 2): a real GL allocation failure
     // (lost/recreated context, out of memory) now surfaces as a null member above
@@ -2384,7 +2570,9 @@ void gpuPreviewProcessingUpdateLutTextureSet(GpuPreviewProcessingLutTextureSet &
     // retries from scratch rather than presenting with a subset of LUTs bound.
     if ( !set.levels || !set.matrixR || !set.matrixG || !set.matrixB || !set.gamma
       || !previewProcessingTextureIsReady(set.contrastCurve)
-      || !previewProcessingTextureIsReady(set.shadowsHighlightsCurve) )
+      || !previewProcessingTextureIsReady(set.shadowsHighlightsCurve)
+      || (needCreativeCurves && !previewProcessingTextureIsReady(set.creativeCurves))
+      || (needHueVs && !previewProcessingTextureIsReady(set.hueVsCurves)) )
     {
         gpuPreviewProcessingDestroyLutTextureSet(set);
         return;
@@ -2429,6 +2617,14 @@ void gpuPreviewProcessingUpdateLutTextureSet(GpuPreviewProcessingLutTextureSet &
     set.gamma->setData(QOpenGLTexture::RGBA, QOpenGLTexture::UInt16, gammaBytes.constData());
     set.contrastCurve->setData(QOpenGLTexture::Red, QOpenGLTexture::Float32, contrastCurveBytes.constData());
     set.shadowsHighlightsCurve->setData(QOpenGLTexture::Red, QOpenGLTexture::Float32, shadowsHighlightsCurveBytes.constData());
+    if ( set.creativeCurves )
+    {
+        set.creativeCurves->setData(QOpenGLTexture::RGBA, QOpenGLTexture::UInt16, creativeCurvesBytes.constData());
+    }
+    if ( set.hueVsCurves )
+    {
+        set.hueVsCurves->setData(QOpenGLTexture::RGBA, QOpenGLTexture::Float32, hueVsCurvesBytes.constData());
+    }
 
     const GLenum uploadError = gl ? gl->glGetError() : GL_NO_ERROR;
     if ( !gl || uploadError != GL_NO_ERROR )
@@ -2458,9 +2654,14 @@ bool gpuPreviewProcessingLutTextureSetReady(const GpuPreviewProcessingLutTexture
     // GL-created and uploaded (see above) -- checking it here, not just the pointers,
     // is what makes readiness reflect actual GL success rather than "five non-null
     // C++ wrappers", which a never-created QOpenGLTexture would otherwise satisfy.
+    // PLAYBACK-SEEK-RENDER-PARITY-1: an active creative-curve / hue-vs stage is part
+    // of the look, not an optional extra -- without its texture the set is NOT ready,
+    // so a recon texture is refused rather than presented with the stage dropped.
     return config.enabled
         && set.signatureValid
-        && set.levels && set.matrixR && set.matrixG && set.matrixB && set.gamma;
+        && set.levels && set.matrixR && set.matrixG && set.matrixB && set.gamma
+        && (!config.applyCreativeCurves || previewProcessingTextureIsReady(set.creativeCurves))
+        && (!config.applyHueVs || previewProcessingTextureIsReady(set.hueVsCurves));
 }
 
 bool gpuPreviewProcessingReconTexturePresentationRefused(
@@ -2635,6 +2836,41 @@ void gpuPreviewProcessingBindDisplayUniformsAndTextures(
 
     program->setUniformValue("previewApplyVibrance", config.applyVibrance ? 1.0f : 0.0f);
     program->setUniformValue("previewVibrance", config.vibrance);
+
+    // PLAYBACK-SEEK-RENDER-PARITY-1: the post-gamma creative chain. Unlike the
+    // contrast / S-H gates above, a texture-backed stage here is never bound off
+    // while its config flag is on: gpuPreviewProcessingLutTextureSetReady() already
+    // requires its texture, so lutsReady false (the passthrough branch, refused for
+    // recon textures) is the only way it is not applied.
+    // Bound whenever present (like the contrast curve), so the release below mirrors
+    // the bind exactly; the uniform gate decides whether the stage runs.
+    const bool creativeCurvesReady = lutsReady && previewProcessingTextureIsReady(lutSet.creativeCurves);
+    program->setUniformValue("previewApplyCreativeCurves",
+                             (creativeCurvesReady && config.applyCreativeCurves) ? 1.0f : 0.0f);
+    if ( creativeCurvesReady )
+    {
+        program->setUniformValue("creativeCurveLut", 9);
+        lutSet.creativeCurves->bind(9);
+    }
+    const bool hueVsReady = lutsReady && previewProcessingTextureIsReady(lutSet.hueVsCurves);
+    program->setUniformValue("previewApplyHueVs", (hueVsReady && config.applyHueVs) ? 1.0f : 0.0f);
+    if ( hueVsReady )
+    {
+        program->setUniformValue("hueVsCurves", 10);
+        lutSet.hueVsCurves->bind(10);
+    }
+    program->setUniformValue("previewApplySaturation", config.applySaturation ? 1.0f : 0.0f);
+    program->setUniformValue("previewSaturation", config.saturation);
+    program->setUniformValue("previewApplyToning", config.applyToning ? 1.0f : 0.0f);
+    program->setUniformValue("previewToningGain",
+                             QVector3D(config.toningGain[0], config.toningGain[1], config.toningGain[2]));
+    program->setUniformValue("previewApplyAgx", config.applyAgx ? 1.0f : 0.0f);
+    program->setUniformValue("previewAgxFwd0", QVector3D(config.agxForward[0], config.agxForward[1], config.agxForward[2]));
+    program->setUniformValue("previewAgxFwd1", QVector3D(config.agxForward[3], config.agxForward[4], config.agxForward[5]));
+    program->setUniformValue("previewAgxFwd2", QVector3D(config.agxForward[6], config.agxForward[7], config.agxForward[8]));
+    program->setUniformValue("previewAgxInv0", QVector3D(config.agxInverse[0], config.agxInverse[1], config.agxInverse[2]));
+    program->setUniformValue("previewAgxInv1", QVector3D(config.agxInverse[3], config.agxInverse[4], config.agxInverse[5]));
+    program->setUniformValue("previewAgxInv2", QVector3D(config.agxInverse[6], config.agxInverse[7], config.agxInverse[8]));
 }
 
 void gpuPreviewProcessingReleaseDisplayTextures(const GpuPreviewProcessingLutTextureSet & lutSet,
@@ -2657,6 +2893,121 @@ void gpuPreviewProcessingReleaseDisplayTextures(const GpuPreviewProcessingLutTex
         lutSet.shadowsHighlightsCurve->release();
         lutSet.shadowsHighlightsBlur->release();
     }
+    if ( lutsReady && previewProcessingTextureIsReady(lutSet.creativeCurves) )
+    {
+        lutSet.creativeCurves->release();
+    }
+    if ( lutsReady && previewProcessingTextureIsReady(lutSet.hueVsCurves) )
+    {
+        lutSet.hueVsCurves->release();
+    }
+}
+
+QByteArray gpuPreviewProcessingComposeCreativeCurvesRgba16(const GpuPreviewProcessingConfig & config)
+{
+    QByteArray packed(kLutTextureEdge * kLutTextureEdge * 4 * static_cast<int>(sizeof(uint16_t)),
+                      Qt::Uninitialized);
+    const int tableBytes = static_cast<int>(65536u * sizeof(uint16_t));
+    auto table = [tableBytes](const QByteArray & bytes) -> const uint16_t *
+    {
+        return bytes.size() >= tableBytes ? reinterpret_cast<const uint16_t *>(bytes.constData()) : nullptr;
+    };
+    const uint16_t * curve = table(config.contrastCurveLut);
+    const uint16_t * gradationY = table(config.gradationLutY);
+    const uint16_t * perChannel[3] = { table(config.gradationLutR),
+                                       table(config.gradationLutG),
+                                       table(config.gradationLutB) };
+    uint16_t * dest = reinterpret_cast<uint16_t *>(packed.data());
+    for (int index = 0; index < 65536; ++index)
+    {
+        const uint16_t curved = curve ? curve[index] : static_cast<uint16_t>(index);
+        const uint16_t graded = gradationY ? gradationY[curved] : curved;
+        for (int channel = 0; channel < 3; ++channel)
+        {
+            dest[index * 4 + channel] = perChannel[channel] ? perChannel[channel][graded] : graded;
+        }
+        dest[index * 4 + 3] = 65535;
+    }
+    return packed;
+}
+
+QByteArray gpuPreviewProcessingPackHueVsCurvesRgba32F(const GpuPreviewProcessingConfig & config)
+{
+    QByteArray packed(kHueVsCurveTextureWidth * kHueVsCurveTextureHeight * 4
+                      * static_cast<int>(sizeof(float)), Qt::Uninitialized);
+    std::memset(packed.data(), 0, static_cast<size_t>(packed.size()));
+    const int curveBytes = static_cast<int>(kHueVsCurveSamples * sizeof(float));
+    const QByteArray * curves[4] = { &config.hueVsHueCurve, &config.hueVsSaturationCurve,
+                                     &config.hueVsLumaCurve, &config.lumaVsSaturationCurve };
+    float * dest = reinterpret_cast<float *>(packed.data());
+    for (int channel = 0; channel < 4; ++channel)
+    {
+        if ( curves[channel]->size() < curveBytes ) continue;
+        const float * source = reinterpret_cast<const float *>(curves[channel]->constData());
+        for (int index = 0; index < static_cast<int>(kHueVsCurveSamples); ++index)
+        {
+            dest[index * 4 + channel] = source[index];
+        }
+    }
+    return packed;
+}
+
+QStringList gpuPreviewProcessingDisplayShaderRefusedStages(const GpuPreviewProcessingConfig & config)
+{
+    QStringList stages;
+    if ( !config.enabled ) return stages;
+    if ( config.applyVignette ) stages << QStringLiteral("vignette");
+    if ( config.applyHighlightReconstruction ) stages << QStringLiteral("highlight_reconstruction");
+    if ( config.applyGradient ) stages << QStringLiteral("gradient");
+    if ( config.applyLut ) stages << QStringLiteral("lut");
+    if ( config.applyChroma ) stages << QStringLiteral("chroma_separation");
+    if ( config.applySharpen ) stages << QStringLiteral("sharpen");
+    if ( config.applyMedian ) stages << QStringLiteral("median_denoise");
+    return stages;
+}
+
+QStringList gpuPreviewProcessingDisplayShaderRefusedStages(const processingObject_t * processing)
+{
+    /* Mirrors gpuPreviewProcessingBuildConfig's stage flags term for term (pinned
+     * by GpuPreviewProcessing.DisplayShaderRefusalPredicateMatchesConfigFlags). */
+    QStringList stages;
+    if ( !processing ) return stages;
+    if ( processing->vignette_strength != 0
+      && processing->vignette_mask != NULL
+      && processing->vignette_end > processing->vignette_mask )
+    {
+        stages << QStringLiteral("vignette");
+    }
+    if ( processing->highlight_reconstruction != 0 ) stages << QStringLiteral("highlight_reconstruction");
+    const bool gradientAdjustments =
+        (processing->gradient_exposure_stops < -0.01 || processing->gradient_exposure_stops > 0.01)
+     || (processing->gradient_contrast < -0.01 || processing->gradient_contrast > 0.01);
+    if ( processing->gradient_enable != 0 && gradientAdjustments && processing->gradient_mask != NULL )
+    {
+        stages << QStringLiteral("gradient");
+    }
+    if ( processing->lut_on != 0 && processing->lut != NULL
+      && processing->lut->cube != NULL && processing->lut->dimension > 1 )
+    {
+        stages << QStringLiteral("lut");
+    }
+    if ( processing->cs_zone.use_cs != 0 ) stages << QStringLiteral("chroma_separation");
+    if ( processing->sharpen > 0.005 && processing->sh_masking == 0 && processing->cs_zone.use_cs == 0 )
+    {
+        stages << QStringLiteral("sharpen");
+    }
+    if ( processing->denoiserStrength > 0
+      && processing->denoiserWindow >= 1 && processing->denoiserWindow <= 5 )
+    {
+        stages << QStringLiteral("median_denoise");
+    }
+    return stages;
+}
+
+QString gpuPreviewProcessingDisplayShaderRefusalReason(const QStringList & refusedStages)
+{
+    if ( refusedStages.isEmpty() ) return QString();
+    return QStringLiteral("display_shader_refused_stages=") + refusedStages.join(QLatin1Char(','));
 }
 
 bool gpuPreviewProcessingRendererIsSoftware(const QString & rendererDescription)
@@ -3444,6 +3795,17 @@ bool gpuPreviewProcessingApplyDisplayGpuOffscreen(const GpuPreviewProcessingConf
             "display preview-processing GPU offscreen input/output buffers are invalid"));
     }
 
+    /* PLAYBACK-SEEK-RENDER-PARITY-1: production never presents a config with a
+     * stage the display shader does not apply (the texture route refuses), so
+     * neither does this harness -- it would only measure a dropped stage. Checked
+     * before any GL work so the refusal itself is testable without a backend. */
+    const QString refusal = gpuPreviewProcessingDisplayShaderRefusalReason(
+        gpuPreviewProcessingDisplayShaderRefusedStages(config));
+    if ( !refusal.isEmpty() )
+    {
+        return fail(refusal);
+    }
+
     if ( !config.enabled )
     {
         const int pixelCount = width * height;
@@ -3482,6 +3844,7 @@ bool gpuPreviewProcessingApplyDisplayGpuOffscreen(const GpuPreviewProcessingConf
         context.doneCurrent();
         return fail(QStringLiteral("offscreen display shader setup failed"));
     }
+
 
     GpuPreviewProcessingLutTextureSet lutSet;
     gpuPreviewProcessingUpdateLutTextureSet(lutSet, config);

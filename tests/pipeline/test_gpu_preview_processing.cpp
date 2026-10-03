@@ -648,15 +648,11 @@ struct EngineSweepCase
     double maxDiagonal; /* top of the synthetic luminance ramp, in diagonal-matrix codes */
 };
 
-/* The receipt carries a dark/light S-curve (ds/dr/ls/lr) that the ENGINE applies
- * as soon as creative adjustments are allowed. The display shader does not
- * implement the creative-curve stages (docs/cuda-playback-look-parity.md "two
- * shaders" table), so an engine-anchored comparison must switch that curve off
- * or it would measure an unported stage instead of the ones this card ports. */
-static void neutralize_unported_creative_stages(processingObject_t * processing)
-{
-    processingSetContrast(processing, 0.7, 0.0, 0.5, 0.0, 0.0);
-}
+/* PLAYBACK-SEEK-RENDER-PARITY-1: these tests used to switch the receipt's
+ * dark/light S-curve off (neutralize_unported_creative_stages) because the
+ * display shader had no creative-curve stage, which hid exactly the stage every
+ * default receipt uses. The display shader now applies it, so every
+ * engine-anchored comparison runs against the FULL engine, S-curve included. */
 
 /* Configures the fixture's processing object for one sweep case. */
 static void configure_engine_sweep_case(MlvPipelineFixture & fixture, const EngineSweepCase & sweep)
@@ -664,7 +660,6 @@ static void configure_engine_sweep_case(MlvPipelineFixture & fixture, const Engi
     configure_gpu_preview_supported_subset(fixture);
     processingObject_t * processing = fixture.processing();
     processingAllowCreativeAdjustments(processing);
-    neutralize_unported_creative_stages(processing);
     processingSetWhiteBalance(processing, sweep.kelvin, sweep.tint);
     if (sweep.contrast != 0.0)
     {
@@ -913,7 +908,6 @@ TEST(GpuPreviewProcessing, DisplayShaderContrastPivotMatchesProductionEngine)
     configure_gpu_preview_supported_subset(fixture);
     processingObject_t * processing = fixture.processing();
     processingAllowCreativeAdjustments(processing);
-    neutralize_unported_creative_stages(processing);
     const std::vector<uint16_t> neutral = fixture.renderFrame16(0, /*threads=*/1);
 
     processingSetSimpleContrast(processing, 0.14);
@@ -930,7 +924,6 @@ TEST(GpuPreviewProcessing, DisplayShaderVibranceMatchesProductionEngine)
     configure_gpu_preview_supported_subset(fixture);
     processingObject_t * processing = fixture.processing();
     processingAllowCreativeAdjustments(processing);
-    neutralize_unported_creative_stages(processing);
     const std::vector<uint16_t> neutral = fixture.renderFrame16(0, /*threads=*/1);
 
     processingSetVibrance(processing, 1.03);
@@ -949,7 +942,6 @@ TEST(GpuPreviewProcessing, DisplayShaderShadowsHighlightsMatchesProductionEngine
     configure_gpu_preview_supported_subset(fixture);
     processingObject_t * processing = fixture.processing();
     processingAllowCreativeAdjustments(processing);
-    neutralize_unported_creative_stages(processing);
     const std::vector<uint16_t> neutral = fixture.renderFrame16(0, /*threads=*/1);
 
     processingSetShadows(processing, 0.32);
@@ -969,7 +961,6 @@ TEST(GpuPreviewProcessing, DisplayShaderCombinedLookAssistPresetMatchesProductio
     configure_gpu_preview_supported_subset(fixture);
     processingObject_t * processing = fixture.processing();
     processingAllowCreativeAdjustments(processing);
-    neutralize_unported_creative_stages(processing);
     const std::vector<uint16_t> neutral = fixture.renderFrame16(0, /*threads=*/1);
 
     processingSetSimpleContrast(processing, 0.14);
@@ -1117,7 +1108,6 @@ static void configure_route_cell(MlvPipelineFixture & fixture, const RouteCell &
     if (cell.allowCreative)
     {
         processingAllowCreativeAdjustments(processing);
-        neutralize_unported_creative_stages(processing);
     }
     processingSetWhiteBalance(processing, cell.kelvin, cell.tint);
     processingSetSimpleContrast(processing, cell.contrast);
@@ -1385,7 +1375,6 @@ static void assert_real_frame_matches_direct8_render(const char * label,
     configure_gpu_preview_supported_subset(fixture);
     processingObject_t * processing = fixture.processing();
     processingAllowCreativeAdjustments(processing);
-    neutralize_unported_creative_stages(processing);
     processingSetSimpleContrast(processing, contrast);
     processingSetPivot(processing, 0.46);
     processingSetVibrance(processing, vibrance);
@@ -1433,7 +1422,6 @@ static void reset_route_state(MlvPipelineFixture & fixture)
     configure_gpu_preview_supported_subset(fixture);
     processingObject_t * processing = fixture.processing();
     processingAllowCreativeAdjustments(processing);
-    neutralize_unported_creative_stages(processing);
     processingSetSimpleContrast(processing, 0.0);
     processingSetPivot(processing, 0.5);
     processingSetShadows(processing, 0.0);
@@ -1453,10 +1441,11 @@ TEST(GpuPreviewProcessing, CpuRouteSelectionMatchesEnginePredicates)
 {
     /* The host (RenderFrameThread) asks the engine for its route through
      * gpuPreviewHostCpuRoute, which also returns the clamp flag of that route.
-     * This pins both against the engine's own predicates over states the shader
-     * cannot render
-     * (saturation, AgX, LUT, sharpen ...) -- there only the ROUTE is asserted, not
-     * pixels, because those stages are not ported. */
+     * This pins both against the engine's own predicates over many states
+     * (saturation, AgX, LUT, sharpen ...) -- only the ROUTE is asserted here, not
+     * pixels: the ported stages' pixels are EngineAnchoredCreativeChain*, and the
+     * refused ones (LUT, sharpen ...) never reach the display shader
+     * (DisplayShaderRefusalPredicateMatchesConfigFlags). */
     MlvPipelineFixture fixture;
     assert_gpu_preview_fixture_ready(fixture);
 
@@ -1956,8 +1945,9 @@ TEST(GpuPreviewProcessing, HostRouteAndTelemetryComeFromTheSingleEngineCallSite)
  * rendered by the display shader and by the engine route that helper named:
  * direct8 -> applyProcessingObject8, otherwise apply_processing_object (the
  * generic 16-bit loop). Both compared in 8-bit codes at the direct8 budget
- * (tolerance 1 / max 3 / 0.1%). The shader does not render the unported stages
- * (docs/cuda-playback-look-parity.md), so only renderable states are cells. */
+ * (tolerance 1 / max 3 / 0.1%). PLAYBACK-SEEK-RENDER-PARITY-1 ported saturation
+ * (and the rest of the post-gamma creative chain) into the display shader, so the
+ * saturation cells now compare against the FULL engine. */
 struct HostPixelCell
 {
     const char * label;
@@ -1971,12 +1961,10 @@ struct HostPixelCell
     int proxyLevel;        /* -1 Auto, 0 Full */
     bool expectDirect8;
     bool expectPreCameraClamp;
-    /* The DISPLAY shader does not render saturation (disclosed unported stage,
-     * docs/cuda-playback-look-parity.md). When set, the engine reference is the
-     * SAME route with the saturation stage neutralised -- on an in-range pixel,
-     * so the clamp cannot hide anything -- and the sat-on delta is printed as the
-     * boundary, not gated. The host's route and flag are asserted either way. */
-    bool saturationUnported = false;
+    /* Saturation cell: on an in-range pixel (the clamp cannot hide anything) the
+     * engine output with saturation must differ from the one without, so the
+     * cell provably exercises the stage the display shader now applies. */
+    bool saturationCell = false;
 };
 
 static const int kInRangeLeveled[3] = { 20000, 30000, 25000 };   /* no WB over-range at 6500 K */
@@ -1986,7 +1974,6 @@ static void run_host_pixel_cell(MlvPipelineFixture & fixture, const HostPixelCel
     reset_route_state(fixture);
     processingObject_t * processing = fixture.processing();
     processingAllowCreativeAdjustments(processing);
-    neutralize_unported_creative_stages(processing);
     processingSetWhiteBalance(processing, cell.kelvin, cell.tint);
     processingSetVibrance(processing, cell.vibrance);
     processingSetSaturation(processing, cell.saturation);
@@ -2020,15 +2007,14 @@ static void run_host_pixel_cell(MlvPipelineFixture & fixture, const HostPixelCel
             ? run_direct8_engine_on_frame(processing, frame, width, height)
             : engine16_as_8bit(run_production_engine_on_frame(processing, frame, width, height));
     };
-    std::vector<uint8_t> engine8 = engineOnRoute();
-    if (cell.saturationUnported)
+    const std::vector<uint8_t> engine8 = engineOnRoute();
+    if (cell.saturationCell)
     {
         ASSERT_EQ(size_t(0), count_wb_overrange_samples(processing, frame)); /* the clamp cannot hide the stage */
-        const DisplayVsEngine8Result boundary = compare_display_with_engine8(config, frame, engine8, width, height);
-        std::cout << "[UNPORTED-BOUNDARY] " << cell.label << " saturation stage (display shader skips it): "
-                  << boundary.summary << "\n";
         processingSetSaturation(processing, 1.0);
-        engine8 = engineOnRoute();
+        const std::vector<uint8_t> withoutSaturation = engineOnRoute();
+        processingSetSaturation(processing, cell.saturation);
+        ASSERT_TRUE(withoutSaturation != engine8);
     }
     const std::string label = std::string("host_") + cell.label + (route.direct8 ? ".direct8" : ".as16bit");
     assert_gpu_display_matches_direct8_engine(label.c_str(), config, frame, engine8, width, height);
@@ -2049,7 +2035,7 @@ TEST(GpuPreviewProcessing, HostRoutedSixteenBitPixelCellsMatchTheEngineWithinOne
         { "sol_r2_pixel_a_vibrance_6500K", 6500.0,  0.0, 1.03, 1.00, true,  kSolR2LeveledA, 0.0,      -1, false, true },
         { "vibrance_ramp_wb6500",          6500.0,  0.0, 1.03, 1.00, true,  nullptr,        130000.0, -1, false, true },
         { "vibrance_big_ramp_wb2500",      2500.0, 30.0, 1.30, 1.00, true,  nullptr,        130000.0, -1, false, true },
-        /* saturation-only: the stage itself is unported (see HostPixelCell) */
+        /* saturation-only (see HostPixelCell::saturationCell) */
         { "saturation_only_inrange_up",    6500.0,  0.0, 1.00, 1.25, true,  kInRangeLeveled, 0.0,     -1, false, true,  true },
         { "saturation_only_inrange_down",  6500.0,  0.0, 1.00, 0.70, true,  kInRangeLeveled, 0.0,     -1, false, true,  true },
         { "no_camera_matrix_vibrance",     6500.0,  0.0, 1.20, 1.00, false, nullptr,        130000.0, -1, false, true },
@@ -3248,4 +3234,423 @@ TEST(GpuPreviewProcessing, GpuOffscreenMatchesCpuReferenceForFullCreativeGrade)
     ASSERT_TRUE(config.applyInLoopContrast);
 
     assert_gpu_offscreen_matches_cpu_reference(fixture, config, "full_creative_grade");
+}
+/* ---- PLAYBACK-SEEK-RENDER-PARITY-1: the full creative chain on the live display shader ----
+ *
+ * CUDA texture playback presents through the DISPLAY shader. It used to stop at
+ * vibrance, so it dropped the receipt's dark/light S-curve (on for every default
+ * receipt) and every later creative stage: playback looked lifted ("milky")
+ * against the paused frame and the CPU route. The shader now applies hue-vs,
+ * saturation, toning, the creative curves (S-curve + gradation, composed into one
+ * per-channel table) and AgX at the engine's positions; vignette, highlight
+ * reconstruction, gradient, .cube LUT, chroma separation, sharpen and median are
+ * REFUSED instead (the texture route falls back, typed telemetry). Tolerances are
+ * the engine-anchored / direct8 budgets above, unchanged. */
+
+TEST(GpuPreviewProcessing, EngineAnchoredReceiptSCurveRealFrameMatchesEngine)
+{
+    /* The owner-visible defect: the receipt's own S-curve (ReceiptSettings defaults,
+     * ds=20 dr=70), Look Assist off, on the real fixture frame, against the whole
+     * production render. Before the port: max 11901 codes, 100% of samples out. */
+    MlvPipelineFixture fixture;
+    assert_gpu_preview_fixture_ready(fixture);
+    configure_gpu_preview_supported_subset(fixture);
+    processingObject_t * processing = fixture.processing();
+    processingAllowCreativeAdjustments(processing);
+    const std::vector<uint16_t> primed = fixture.renderFrame16(0, /*threads=*/1);
+    ASSERT_TRUE(!primed.empty());
+
+    QString reason;
+    GpuPreviewProcessingConfig config = gpuPreviewProcessingBuildConfig(processing, &reason);
+    ASSERT_TRUE(config.enabled);
+    ASSERT_TRUE(config.applyCreativeCurves);
+    ASSERT_TRUE(gpuPreviewProcessingDisplayShaderRefusedStages(config).isEmpty());
+    int nonIdentity = 0;
+    for (int index = 0; index < 65536; ++index)
+    {
+        if (std::abs(static_cast<int>(processing->pre_calc_curve_r[index]) - index) > 1) ++nonIdentity;
+    }
+    ASSERT_TRUE(nonIdentity > 1000);   /* the curve is live, not an identity table */
+    gpuPreviewProcessingApplyCpuRoute(&config, processing, /*direct8Route=*/false);
+
+    const std::vector<uint16_t> engine = fixture.renderFrame16(0, /*threads=*/1);
+    const std::vector<uint16_t> debayered = fixture.renderDebayeredFrame16(0);
+    ASSERT_EQ(debayered.size(), engine.size());
+    assert_gpu_display_matches_production_engine("receipt_scurve_real_frame", config, debayered, engine,
+                                                 fixture.width(), fixture.height());
+}
+
+struct CreativeChainCase
+{
+    const char * label;
+    std::function<void(processingObject_t *)> apply;
+    std::function<bool(const GpuPreviewProcessingConfig &)> expect;
+    /* Every ported stage stacked. Each stage alone sits inside the engine budget
+     * (above); stacked, the float32 shader's per-stage +-1 rounding against the
+     * engine's integer/double arithmetic is amplified by the steep composed curves
+     * (S-curve + gradation, then the AgX inverse matrix): measured max 27 16-bit
+     * codes, 0.6% of samples above 4, and an ablation dropping any one stage still
+     * leaves 6..28 (no single stage carries it; a misplaced or missing stage is
+     * thousands of codes). The gate is therefore the DISPLAY domain the screen
+     * shows: every sample within 1 8-bit code, plus the 16-bit max of 32. */
+    bool stacked = false;
+};
+
+static void fill_test_hue_vs_curves(processingObject_t * p)
+{
+    for (int i = 0; i < 36000; ++i)
+    {
+        const double phase = 6.283185307179586 * i / 36000.0;
+        p->hue_vs_hue[i] = static_cast<float>(0.15 * std::sin(phase));
+        p->hue_vs_saturation[i] = static_cast<float>(0.25 * std::cos(2.0 * phase));
+        p->hue_vs_luma[i] = static_cast<float>(-0.20 * std::sin(3.0 * phase));
+        p->luma_vs_saturation[i] = static_cast<float>(0.30 * std::sin(0.5 * phase));
+    }
+    p->hue_vs_hue_used = 1;
+    p->hue_vs_saturation_used = 1;
+    p->hue_vs_luma_used = 1;
+    p->luma_vs_saturation_used = 1;
+}
+
+static void set_test_gradation_curves(processingObject_t * p)
+{
+    float xs[3] = { 0.0f, 0.5f, 1.0f };
+    float ysY[3] = { 0.0f, 0.60f, 1.0f };
+    float ysR[3] = { 0.0f, 0.44f, 1.0f };
+    float ysB[3] = { 0.0f, 0.56f, 1.0f };
+    processingSetGCurve(p, 3, xs, ysY, 0);
+    processingSetGCurve(p, 3, xs, ysR, 1);
+    processingSetGCurve(p, 3, xs, ysB, 3);
+}
+
+/* One creative state against BOTH CPU routes: the generic 16-bit loop (always)
+ * and the direct8 kernel (where the receipt is direct8-eligible; toning and hue-vs
+ * are not), each with the route flag the host would set. */
+static void run_creative_chain_case(const CreativeChainCase & creative)
+{
+    MlvPipelineFixture fixture;
+    assert_gpu_preview_fixture_ready(fixture);
+    configure_gpu_preview_supported_subset(fixture);
+    processingObject_t * processing = fixture.processing();
+    processingAllowCreativeAdjustments(processing);
+    processingSetWhiteBalance(processing, 4500.0, 10.0);
+    creative.apply(processing);
+    (void)fixture.renderDebayeredFrame16(0);
+
+    QString reason;
+    ASSERT_TRUE(gpuPreviewProcessingIsSupported(processing, &reason));
+    const GpuPreviewProcessingConfig config = gpuPreviewProcessingBuildConfig(processing, &reason);
+    ASSERT_TRUE(config.enabled);
+    ASSERT_TRUE(creative.expect(config));
+    ASSERT_TRUE(gpuPreviewProcessingDisplayShaderRefusedStages(config).isEmpty());
+
+    int width = 0;
+    int height = 0;
+    const std::vector<uint16_t> frame = make_synthetic_ramp_frame(processing, 130000.0, &width, &height);
+
+    GpuPreviewProcessingConfig generic16Config = config;
+    gpuPreviewProcessingApplyCpuRoute(&generic16Config, processing, /*direct8Route=*/false);
+    const std::vector<uint16_t> engine16 = run_production_engine_on_frame(processing, frame, width, height);
+    const std::string label16 = std::string(creative.label) + ".as16bit";
+    if (!creative.stacked)
+    {
+        assert_gpu_display_matches_production_engine(label16.c_str(), generic16Config, frame, engine16, width, height);
+    }
+    else
+    {
+        std::vector<uint16_t> gpu16(frame.size(), 0);
+        (void)render_display_for_parity(generic16Config, frame.data(), gpu16.data(), width, height);
+        const frame_compare_result_t wide = compare_frames_u16(engine16.data(), gpu16.data(), width, height, 3,
+                                                               kEngineParityPerSampleTolerance);
+        std::vector<uint8_t> gpu8(gpu16.size());
+        for (size_t index = 0; index < gpu16.size(); ++index) gpu8[index] = static_cast<uint8_t>(gpu16[index] >> 8);
+        const std::vector<uint8_t> engine8 = engine16_as_8bit(engine16);
+        const frame_compare_result_t display = compare_frames_u8(engine8.data(), gpu8.data(), width, height, 3, 1);
+        std::cout << "[ENGINE-PARITY] " << label16 << " (stacked) 16-bit: " << frame_compare_summary(wide)
+                  << " | 8-bit display: " << frame_compare_summary(display) << "\n";
+        test_artifacts::record(std::string("gpu_preview_display.engine_parity.") + label16 + ".compare",
+                               frame_compare_summary(wide) + " | display8 " + frame_compare_summary(display));
+        ASSERT_TRUE(wide.max_abs_diff <= kEngineParityMaxAbsDiff);
+        ASSERT_TRUE(display.max_abs_diff <= 1);
+    }
+
+    if (processingCanUseDirect8BitOutput(processing) != 0)
+    {
+        GpuPreviewProcessingConfig direct8Config = config;
+        gpuPreviewProcessingApplyCpuRoute(&direct8Config, processing, /*direct8Route=*/true);
+        const std::vector<uint8_t> engine8 = run_direct8_engine_on_frame(processing, frame, width, height);
+        const std::string label8 = std::string(creative.label) + ".direct8";
+        assert_gpu_display_matches_direct8_engine(label8.c_str(), direct8Config, frame, engine8, width, height);
+    }
+}
+
+TEST(GpuPreviewProcessing, EngineAnchoredCreativeChainMatchesEngineOnBothCpuRoutes)
+{
+    const std::vector<CreativeChainCase> cases = {
+        { "scurve_strong_lighten",
+          [](processingObject_t * p) { processingSetContrast(p, 0.6, 0.45, 0.4, 0.35, 0.25); },
+          [](const GpuPreviewProcessingConfig & c) { return c.applyCreativeCurves; } },
+        { "gradation_y_r_b",
+          [](processingObject_t * p) { set_test_gradation_curves(p); },
+          [](const GpuPreviewProcessingConfig & c) { return c.applyCreativeCurves; } },
+        { "saturation_up",
+          [](processingObject_t * p) { processingSetSaturation(p, 1.35); },
+          [](const GpuPreviewProcessingConfig & c) { return c.applySaturation; } },
+        { "saturation_down",
+          [](processingObject_t * p) { processingSetSaturation(p, 0.60); },
+          [](const GpuPreviewProcessingConfig & c) { return c.applySaturation; } },
+        { "toning",
+          [](processingObject_t * p) { processingSetToning(p, 255, 160, 60, 45); },
+          [](const GpuPreviewProcessingConfig & c) { return c.applyToning; } },
+        { "hue_vs_curves",
+          [](processingObject_t * p) { fill_test_hue_vs_curves(p); },
+          [](const GpuPreviewProcessingConfig & c) { return c.applyHueVs; } },
+        { "agx",
+          [](processingObject_t * p) { processingEnableAgX(p); },
+          [](const GpuPreviewProcessingConfig & c) { return c.applyAgx; } },
+        { "agx_scurve_vibrance",
+          [](processingObject_t * p) {
+              processingEnableAgX(p);
+              processingSetContrast(p, 0.6, 0.45, 0.4, 0.35, 0.25);
+              processingSetVibrance(p, 1.2);
+          },
+          [](const GpuPreviewProcessingConfig & c) { return c.applyAgx && c.applyVibrance; } },
+        { "every_ported_stage_night_preset",
+          [](processingObject_t * p) {
+              processingSetContrast(p, 0.6, 0.45, 0.4, 0.35, 0.25);
+              set_test_gradation_curves(p);
+              fill_test_hue_vs_curves(p);
+              processingSetSaturation(p, 1.2);
+              processingSetToning(p, 255, 160, 60, 30);
+              processingSetSimpleContrast(p, 0.14);
+              processingSetPivot(p, 0.46);
+              processingSetVibrance(p, 1.03);
+              processingEnableAgX(p);
+          },
+          [](const GpuPreviewProcessingConfig & c) {
+              return c.applyCreativeCurves && c.applyHueVs && c.applySaturation && c.applyToning
+                  && c.applyInLoopContrast && c.applyVibrance && c.applyAgx;
+          },
+          /*stacked=*/true },
+    };
+    for (const CreativeChainCase & creative : cases)
+    {
+        run_creative_chain_case(creative);
+    }
+}
+
+TEST(GpuPreviewProcessing, DisplayShaderCreativeCurveCompositionIsBitExact)
+{
+    /* GL-free: the composed table equals the engine's three sequential lookups
+     * (pre_calc_curve_r, gcurve_y, gcurve_r/g/b) for every 16-bit input. */
+    MlvPipelineFixture fixture;
+    assert_gpu_preview_fixture_ready(fixture);
+    configure_gpu_preview_supported_subset(fixture);
+    processingObject_t * p = fixture.processing();
+    processingAllowCreativeAdjustments(p);
+    processingSetContrast(p, 0.6, 0.45, 0.4, 0.35, 0.25);
+    set_test_gradation_curves(p);
+    QString reason;
+    const GpuPreviewProcessingConfig config = gpuPreviewProcessingBuildConfig(p, &reason);
+    ASSERT_TRUE(config.enabled);
+    ASSERT_TRUE(config.applyCreativeCurves);
+
+    const QByteArray composed = gpuPreviewProcessingComposeCreativeCurvesRgba16(config);
+    ASSERT_EQ(static_cast<int>(65536u * 4u * sizeof(uint16_t)), composed.size());
+    const uint16_t * texels = reinterpret_cast<const uint16_t *>(composed.constData());
+    const uint16_t * perChannel[3] = { p->gcurve_r, p->gcurve_g, p->gcurve_b };
+    int mismatches = 0;
+    int offIdentity = 0;
+    for (int index = 0; index < 65536; ++index)
+    {
+        for (int channel = 0; channel < 3; ++channel)
+        {
+            const uint16_t expected = perChannel[channel][p->gcurve_y[p->pre_calc_curve_r[index]]];
+            if (texels[index * 4 + channel] != expected) ++mismatches;
+            if (std::abs(static_cast<int>(expected) - index) > 1) ++offIdentity;
+        }
+        ASSERT_EQ(65535, static_cast<int>(texels[index * 4 + 3]));
+    }
+    ASSERT_EQ(0, mismatches);
+    ASSERT_TRUE(offIdentity > 3000);
+
+    /* empty LUTs compose as identity */
+    const QByteArray identity = gpuPreviewProcessingComposeCreativeCurvesRgba16(GpuPreviewProcessingConfig());
+    const uint16_t * identityTexels = reinterpret_cast<const uint16_t *>(identity.constData());
+    for (int index = 0; index < 65536; index += 257)
+    {
+        ASSERT_EQ(index, static_cast<int>(identityTexels[index * 4 + 1]));
+    }
+}
+
+TEST(GpuPreviewProcessing, DisplayShaderSourceCarriesEveryPortedStage)
+{
+    /* GL-free pin: the live display shader declares every ported stage's gate, and
+     * the creative block runs in the engine's order (hue-vs, vibrance, saturation,
+     * toning, curves, AgX inverse). */
+    const QByteArray display = gpuPreviewProcessingDisplayFragmentShaderSource();
+    const char * gates[] = { "previewApplyHueVs", "previewApplyVibrance", "previewApplySaturation",
+                             "previewApplyToning", "previewApplyCreativeCurves", "previewApplyAgx",
+                             "creativeCurveLut", "hueVsCurves" };
+    for (const char * gate : gates)
+    {
+        ASSERT_TRUE(display.contains(gate));
+    }
+    const int hueVs = display.indexOf("if (previewApplyHueVs > 0.5)");
+    const int vibrance = display.indexOf("if (previewApplyVibrance > 0.5)");
+    const int saturation = display.indexOf("if (previewApplySaturation > 0.5)");
+    const int toning = display.indexOf("if (previewApplyToning > 0.5)");
+    const int curves = display.indexOf("if (previewApplyCreativeCurves > 0.5)");
+    const int agxInverse = display.lastIndexOf("if (previewApplyAgx > 0.5)");
+    const int agxForward = display.indexOf("if (previewApplyAgx > 0.5)");
+    const int gamma = display.indexOf("sampleU16LutIndex(gammaLut");
+    ASSERT_TRUE(agxForward > 0 && agxForward < gamma);
+    ASSERT_TRUE(gamma < hueVs && hueVs < vibrance && vibrance < saturation && saturation < toning
+                && toning < curves && curves < agxInverse);
+}
+
+TEST(GpuPreviewProcessing, DisplayShaderRefusalPredicateMatchesConfigFlags)
+{
+    /* GL-free. The processing-object predicate is what the per-frame policy calls;
+     * the config predicate reads the config's own flags. Every state below is
+     * accepted by the subset gate (so the texture route would reach it), and the two
+     * predicates must name the same stages. Ported stages are never refused. */
+    MlvPipelineFixture fixture;
+    assert_gpu_preview_fixture_ready(fixture);
+    static uint16_t dummyGradientMask[16] = { 0 };
+
+    struct RefusalState
+    {
+        const char * label;
+        std::function<void(MlvPipelineFixture &)> apply;
+        const char * expected; /* comma list; "" = not refused */
+    };
+    const std::vector<RefusalState> states = {
+        { "neutral", [](MlvPipelineFixture &) {}, "" },
+        { "ported_creative_chain", [](MlvPipelineFixture & f) {
+              processingObject_t * p = f.processing();
+              processingAllowCreativeAdjustments(p);
+              processingSetContrast(p, 0.6, 0.45, 0.4, 0.35, 0.25);
+              set_test_gradation_curves(p);
+              fill_test_hue_vs_curves(p);
+              processingSetSaturation(p, 1.2);
+              processingSetToning(p, 255, 160, 60, 30);
+              processingSetVibrance(p, 1.2);
+              processingSetSimpleContrast(p, 0.14);
+              processingSetShadows(p, 0.32);
+              processingEnableAgX(p);
+          }, "" },
+        { "vignette", [](MlvPipelineFixture & f) {
+              processingSetVignetteMask(f.processing(), static_cast<uint16_t>(f.width()),
+                                        static_cast<uint16_t>(f.height()), 0.5f, 0.2f, 1.0f, 1.4f);
+              processingSetVignetteStrength(f.processing(), 60);
+          }, "vignette" },
+        { "highlight_reconstruction", [](MlvPipelineFixture & f) { f.processing()->highlight_reconstruction = 1; },
+          "highlight_reconstruction" },
+        { "gradient", [](MlvPipelineFixture & f) {
+              f.processing()->gradient_enable = 1;
+              f.processing()->gradient_exposure_stops = 0.5;
+              f.processing()->gradient_mask = dummyGradientMask;
+          }, "gradient" },
+        { "lut_3d", [](MlvPipelineFixture & f) { install_test_lut(f, 17, true); }, "lut" },
+        { "chroma_separation", [](MlvPipelineFixture & f) { f.processing()->cs_zone.use_cs = 1; },
+          "chroma_separation" },
+        { "sharpen", [](MlvPipelineFixture & f) { processingSetSharpening(f.processing(), 0.5); }, "sharpen" },
+        { "median", [](MlvPipelineFixture & f) {
+              f.processing()->denoiserStrength = 50;
+              f.processing()->denoiserWindow = 3;
+          }, "median_denoise" },
+        { "lut_and_sharpen", [](MlvPipelineFixture & f) {
+              install_test_lut(f, 17, true);
+              processingSetSharpening(f.processing(), 0.5);
+          }, "lut,sharpen" },
+    };
+
+    for (const RefusalState & state : states)
+    {
+        configure_gpu_preview_supported_subset(fixture);
+        processingObject_t * p = fixture.processing();
+        p->lut_on = 0;
+        processingSetVignetteStrength(p, 0);
+        p->gradient_mask = nullptr;
+        p->gradient_enable = 0;
+        state.apply(fixture);
+
+        const std::string label(state.label);
+        QString reason;
+        if (!gpuPreviewProcessingIsSupported(p, &reason))
+        {
+            ::minitest::fail(__FILE__, __LINE__, "subset gate refused " + label, reason.toStdString());
+        }
+        const GpuPreviewProcessingConfig config = gpuPreviewProcessingBuildConfig(p, &reason);
+        ASSERT_TRUE(config.enabled);
+        const QString fromProcessing = gpuPreviewProcessingDisplayShaderRefusedStages(p).join(QLatin1Char(','));
+        const QString fromConfig = gpuPreviewProcessingDisplayShaderRefusedStages(config).join(QLatin1Char(','));
+        std::cout << "[DISPLAY-REFUSAL] " << label << " processing=" << fromProcessing.toStdString()
+                  << " config=" << fromConfig.toStdString() << "\n";
+        if (fromProcessing != QString::fromLatin1(state.expected) || fromConfig != fromProcessing)
+        {
+            ::minitest::fail(__FILE__, __LINE__, "display-shader refusal of " + label,
+                             "expected=" + std::string(state.expected) + " processing=" + fromProcessing.toStdString()
+                             + " config=" + fromConfig.toStdString());
+        }
+        const QString typed = gpuPreviewProcessingDisplayShaderRefusalReason(
+            gpuPreviewProcessingDisplayShaderRefusedStages(config));
+        if (fromConfig.isEmpty())
+        {
+            ASSERT_TRUE(typed.isEmpty());
+        }
+        else
+        {
+            ASSERT_TRUE(typed == QStringLiteral("display_shader_refused_stages=") + fromConfig);
+            /* the display harness refuses it too, before any GL work */
+            std::vector<uint16_t> in(16 * 16 * 3, 1000);
+            std::vector<uint16_t> out(in.size(), 0);
+            QString harnessReason;
+            ASSERT_TRUE(!gpuPreviewProcessingApplyDisplayGpuOffscreen(config, in.data(), out.data(), 16, 16,
+                                                                      &harnessReason));
+            ASSERT_TRUE(harnessReason == typed);
+        }
+        p->gradient_mask = nullptr;
+        p->gradient_enable = 0;
+        p->gradient_exposure_stops = 0.0;
+    }
+}
+
+TEST(GpuPreviewProcessing, PlaybackTextureRouteRefusalIsWiredIntoThePolicy)
+{
+    /* Source pins (GL-free): the texture-present routes are refused through the
+     * policy state, the scale-one clamp sees the same refusal, the fallback reason
+     * carries the typed token, and the viewport's RGB16 display-shader present is
+     * skipped for a refused stage. */
+    QFile policyFile(QStringLiteral("platform/qt/MainWindowGpuPreviewPolicy.h"));
+    ASSERT_TRUE(policyFile.open(QIODevice::ReadOnly));
+    const QString policy = QString::fromUtf8(policyFile.readAll());
+    auto functionBody = [&policy](const QString & signature) -> QString
+    {
+        const int start = policy.indexOf(signature);
+        if (start < 0) return QString();
+        const int end = policy.indexOf(QStringLiteral("\n}"), start);
+        return end < 0 ? QString() : policy.mid(start, end - start);
+    };
+    ASSERT_TRUE(functionBody(QStringLiteral("inline bool mainWindowAllowsGpuPlaybackReconTexturePresentation("))
+                    .contains(QStringLiteral("state.gpuPreviewProcessingDisplayShaderCompatible")));
+    ASSERT_TRUE(functionBody(QStringLiteral("inline bool mainWindowAllowsGpuAmazeTexturePresentation("))
+                    .contains(QStringLiteral("state.gpuPreviewProcessingDisplayShaderCompatible")));
+
+    QFile mainWindowFile(QStringLiteral("platform/qt/MainWindow.cpp"));
+    ASSERT_TRUE(mainWindowFile.open(QIODevice::ReadOnly));
+    const QString mainWindow = QString::fromUtf8(mainWindowFile.readAll());
+    ASSERT_TRUE(mainWindow.contains(QStringLiteral(
+        "renderPolicy.gpuPreviewProcessingDisplayShaderCompatible = displayShaderRefusedStages.isEmpty();")));
+    ASSERT_TRUE(mainWindow.contains(QStringLiteral(
+        "gpuPreviewProcessingDisplayShaderRefusalReason( displayShaderRefusedStages )")));
+    ASSERT_TRUE(mainWindow.contains(QStringLiteral(
+        "&& gpuPreviewProcessingDisplayShaderRefusedStages( m_pProcessingObject ).isEmpty(),")));
+    ASSERT_TRUE(mainWindow.contains(QStringLiteral("QStringLiteral(\"gpu_display_shader_refused_stages\")")));
+    /* the generic RGB16 present (the other call site is inside the AMaZE texture
+     * route, which the policy flag above already refuses) */
+    const int rgb16Present = mainWindow.lastIndexOf(QStringLiteral("GpuDisplayViewport::presentRgb16( ui->graphicsView,"));
+    ASSERT_TRUE(rgb16Present > 0);
+    ASSERT_TRUE(mainWindow.mid(rgb16Present - 200, 200).contains(QStringLiteral("presentDisplayShaderRefusedStages.isEmpty()")));
 }

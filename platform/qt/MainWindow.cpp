@@ -5573,8 +5573,22 @@ void MainWindow::presentPlaybackPreparedFrame( const PlaybackPrepResult &result 
             QStringLiteral("gpu_playback_recon_texture_present_fallback_reason"),
             task.requestContext.gpuPlaybackReconTexturePresentFallbackReason );
     }
+    // PLAYBACK-SEEK-RENDER-PARITY-1: typed, always (not only under the env request):
+    // the stages that kept this frame off the display-shader routes.
+    const QStringList presentDisplayShaderRefusedStages =
+        gpuPreviewProcessingDisplayShaderRefusedStages( task.gpuPresentationOptions.previewProcessing );
+    if( !presentDisplayShaderRefusedStages.isEmpty() )
+    {
+        readyFrame.stageTimingTelemetry.insert(
+            QStringLiteral("gpu_display_shader_refused_stages"),
+            presentDisplayShaderRefusedStages.join( QLatin1Char(',') ) );
+    }
     uint8_t underOver = result.underOver;
-    if( !framePresentedByViewport && gpu16PreviewActive && rgb16DisplaySource )
+    // The viewport's RGB16 present runs the same display shader with this config;
+    // with a refused stage active it must not (the prepared image, processed by the
+    // CPU subset reference that applies the stage, is presented instead).
+    if( !framePresentedByViewport && gpu16PreviewActive && rgb16DisplaySource
+     && presentDisplayShaderRefusedStages.isEmpty() )
     {
         framePresentedByViewport = GpuDisplayViewport::presentRgb16( ui->graphicsView,
                                                                     m_pGraphicsItem,
@@ -6034,6 +6048,13 @@ void MainWindow::drawFrame( bool updateTimecodeLabel )
     renderPolicy.gpuPreviewProcessingEnvironmentRequested =
         gpuPreviewProcessingRequestedByEnvironment();
     renderPolicy.gpuPreviewProcessingCompatible = gpuPreviewProcessingIsSupported( m_pProcessingObject );
+    // PLAYBACK-SEEK-RENDER-PARITY-1: the texture-present routes draw through the live
+    // display shader, which applies the full per-pixel chain but not these stages.
+    // While one is active those routes refuse (typed reason below), and playback
+    // stays on a route whose processing applies it, so the look cannot differ.
+    const QStringList displayShaderRefusedStages =
+        gpuPreviewProcessingDisplayShaderRefusedStages( m_pProcessingObject );
+    renderPolicy.gpuPreviewProcessingDisplayShaderCompatible = displayShaderRefusedStages.isEmpty();
     renderPolicy.gpuBilinearDebayerBackendRequest = m_gpuBilinearDebayerBackendRequest;
     renderPolicy.gpuBilinearDebayerEnvironmentRequested =
         gpuBilinearDebayerRequestedByEnvironment();
@@ -6285,7 +6306,10 @@ void MainWindow::drawFrame( bool updateTimecodeLabel )
      && !requestContext.gpuPlaybackReconTexturePresentRequested )
     {
         requestContext.gpuPlaybackReconTexturePresentFallbackReason =
-            QStringLiteral("GPU playback recon texture-present requires an experimental GL presentation surface, GPU preview processing support, scopes hidden, MLVAPP_GPU_PLAYBACK_RECON=1, Decode/Reconstruct/Process playback mode, x1 scale, and caching off");
+            !displayShaderRefusedStages.isEmpty()
+                ? gpuPreviewProcessingDisplayShaderRefusalReason( displayShaderRefusedStages )
+                  + QStringLiteral(": the live display shader does not apply these stages, so GPU playback recon texture-present is refused and playback stays on a route that applies them")
+                : QStringLiteral("GPU playback recon texture-present requires an experimental GL presentation surface, GPU preview processing support, scopes hidden, MLVAPP_GPU_PLAYBACK_RECON=1, Decode/Reconstruct/Process playback mode, x1 scale, and caching off");
     }
     requestContext.renderThreadUsingCpuPreviewProcessing = m_renderThreadUsingCpuPreviewProcessing;
     requestContext.renderThreadUsingPlaybackPreviewProcessing =
@@ -21172,7 +21196,10 @@ bool MainWindow::gpuPlaybackReconTextureRouteEligibleAtScaleOne( void ) const
         hasScopeVisualization,
         playback_recon_requested_by_environment(),
         playback_recon_texture_present_requested_by_environment(),
-        gpuPreviewProcessingIsSupported( m_pProcessingObject ),
+        // PLAYBACK-SEEK-RENDER-PARITY-1: a stage the display shader cannot apply
+        // refuses the texture route (drawFrame), so it must not clamp the scale either.
+        gpuPreviewProcessingIsSupported( m_pProcessingObject )
+            && gpuPreviewProcessingDisplayShaderRefusedStages( m_pProcessingObject ).isEmpty(),
         m_gpuPreviewProcessingBackendRequest == GpuPreviewProcessingBackendRequest::Cpu,
         requestedPhase3Mode == Phase3Mode::DecodeReconProcess,
         ui->actionCaching->isChecked() );
