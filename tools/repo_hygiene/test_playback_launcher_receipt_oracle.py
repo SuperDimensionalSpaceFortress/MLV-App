@@ -817,7 +817,8 @@ class OffscreenProbeAndParityTests(unittest.TestCase):
 
     def test_the_runners_process_budget_starts_from_the_apps_safety_net(self) -> None:
         text = RUNNER.read_text(encoding="utf-8")
-        self.assertIn("(Get-GuiSmokePlaySafetyMs -Seconds $Seconds) +", text)
+        # CPU-LOOK-LEG-PACE-ABORT-1: the same derivation, with the CPU ceiling only under the runner's own -CpuPlayPaceInformational.
+        self.assertIn("(Get-GuiSmokePlaySafetyMs -Seconds $Seconds -CpuPaceInformational:$CpuPlayPaceInformational) +", text)
 
     def test_the_rule_doc_documents_the_source_frame_class_its_tokens_and_the_launchers(self) -> None:
         doc = DOC.read_text(encoding="utf-8")

@@ -301,6 +301,12 @@ function Test-GuiSmokeEnvironmentEntries {
                 return $result
             }
             $pairKey = ($pair.Trim() -split '=', 2)[0].Trim().ToUpperInvariant()
+            if ($pairKey -eq $script:GuiSmokePaceModeEnvironment) {
+                $result.verdict = 'PASS_THROUGH_REFUSED'
+                $result.option = $pairKey
+                $result.message = "PASS_THROUGH_REFUSED (env=$pairKey reason=pace_mode_is_armed_only_by_the_cpu_switch)"
+                return $result
+            }
             if ($script:GuiSmokeRangeChangingEnvironment -contains $pairKey) {
                 $result.verdict = 'PASS_THROUGH_REFUSED'
                 $result.option = $pairKey
@@ -344,6 +350,13 @@ function Test-GuiSmokeParentEnvironment {
             $result.verdict = 'PASS_THROUGH_REFUSED'
             $result.option = $key
             $result.message = "PASS_THROUGH_REFUSED (env=$key reason=inherited_autoplay_hook_has_no_length_gate)"
+            return $result
+        }
+        if (([string]$name).ToUpperInvariant() -eq $script:GuiSmokePaceModeEnvironment) {
+            $key = ([string]$name).ToUpperInvariant()
+            $result.verdict = 'PASS_THROUGH_REFUSED'
+            $result.option = $key
+            $result.message = "PASS_THROUGH_REFUSED (env=$key reason=inherited_pace_mode_is_armed_only_by_the_cpu_switch)"
             return $result
         }
         if ($script:GuiSmokeRangeChangingEnvironment -contains ([string]$name).ToUpperInvariant()) {
@@ -718,11 +731,22 @@ function Get-GuiSmokeLoopVerdict {
 $script:GuiSmokeMinSustainedPaceFraction = 0.5
 $script:GuiSmokePlaySafetyMarginMs = 15000
 
+# CPU-LOOK-LEG-PACE-ABORT-1: mirrors platform/qt/PlaybackFrameRange.h kCpuInformationalMinPaceFraction (a parity test compares them).
+# A CPU-backend leg's pace is MEASURED and informational: the app's pace probe never ends it, and its wall budget is this CEILING
+# (25 s of footage: 25 / (1/30) + 15 s = 765 s = 12.75 min). Only the runner's -CpuPlayPaceInformational selects it.
+$script:GuiSmokeCpuInformationalMinPaceFraction = 1.0 / 30.0
+# The ONE environment variable that switches the app's pace gate to informational. The runner sets it from its switch alone; a
+# caller passing it as -ExtraEnvironment, or inheriting it from the parent process, is refused (it would switch a CUDA run's gate off).
+$script:GuiSmokePaceModeEnvironment = 'MLVAPP_PLAY_PACE_MODE'
+
 function Get-GuiSmokePlaySafetyMs {
     # The wall-clock safety net of an evidence Play of `Seconds` of footage: requested / 0.5 + 15 s. The app ends the
     # Play on its own typed failure inside this; a launcher's own process budget is this plus the open/settle time.
-    param([Parameter(Mandatory = $true)][double]$Seconds)
-    return [int64][Math]::Ceiling([Math]::Max(0.0, $Seconds) * 1000.0 / $script:GuiSmokeMinSustainedPaceFraction) + $script:GuiSmokePlaySafetyMarginMs
+    # -CpuPaceInformational: the CPU leg's ceiling instead (requested / (1/30) + 15 s); the one derivation the runner, the
+    # dual-venue job's smoke timeout and its um-run timeout all read.
+    param([Parameter(Mandatory = $true)][double]$Seconds, [switch]$CpuPaceInformational)
+    $fraction = if ($CpuPaceInformational) { $script:GuiSmokeCpuInformationalMinPaceFraction } else { $script:GuiSmokeMinSustainedPaceFraction }
+    return [int64][Math]::Ceiling([Math]::Max(0.0, $Seconds) * 1000.0 / $fraction) + $script:GuiSmokePlaySafetyMarginMs
 }
 
 function Read-GuiSmokePlaybackSummaryFromLogDir {
