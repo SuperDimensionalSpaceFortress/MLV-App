@@ -393,7 +393,8 @@ jobs:
           # the 11 together. Each runs alone in its own shard, so a shard's bound never depends
           # on how many of them sort into the same 12-name window (two windows overran 240 s).
           # Every other window keeps its membership, minus those tests.
-          $soloPattern = '^LookAssistFixtureScene\.'
+          # LookAssistFlavorsFixture (LOOK-ASSIST-FLAVORS-1) renders the same fixtures, 20-75 s each locally, so it runs alone too.
+          $soloPattern = '^(LookAssistFixtureScene|LookAssistFlavorsFixture)\.'
           $shards = @()
           for ($offset = 0; $offset -lt $testNames.Count; $offset += $testsPerShard) {
             $end = [Math]::Min($offset + $testsPerShard, $testNames.Count)

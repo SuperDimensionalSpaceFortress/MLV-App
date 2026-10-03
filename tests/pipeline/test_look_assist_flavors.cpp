@@ -133,25 +133,40 @@ QImage toImage( const Run &r )
 
 } // namespace
 
-TEST(LookAssistFlavorsFixture, ClassicIsMasterForTheTrackedFixtures)
+// Each fixture frame renders through the headless Look Assist (~19 s locally), so each spelling of "Classic" is its own
+// test: the hosted runner bounds a shard at 240 s and the three together ran 172 s locally.
+void expectClassicIsMaster( const char *mode )
 {
-    // Unset and explicit "classic" are the same run, and both are master's.
-    const char *modes[] = { nullptr, "classic", "  Classic " };
     for( const FixtureCase &c : fixtureCases() )
-        for( const char *mode : modes )
-        {
-            FlavorEnv env( mode );
-            const Run r = run( c, true );
-            ASSERT_TRUE( r.ok && r.applied );
-            BaselineRow master;
-            ASSERT_TRUE( baselineRow( r.key, &master ) );
-            ASSERT_TRUE( r.receipt == master.receipt );          // every slider, byte for byte
-            ASSERT_TRUE( r.sha256 == master.sha256 );            // the picture, byte for byte
-            ASSERT_TRUE( withoutFlavorField( r.appliedLine ) == master.applied );   // the analysis, field for field
-            // ... and the flavor is reported, always.
-            ASSERT_TRUE( r.appliedLine.endsWith( QStringLiteral(" flavor=classic") ) );
-            ASSERT_TRUE( r.flavorOnReceipt == QLatin1String( "classic" ) );
-        }
+    {
+        FlavorEnv env( mode );
+        const Run r = run( c, true );
+        ASSERT_TRUE( r.ok && r.applied );
+        BaselineRow master;
+        ASSERT_TRUE( baselineRow( r.key, &master ) );
+        ASSERT_TRUE( r.receipt == master.receipt );          // every slider, byte for byte
+        ASSERT_TRUE( r.sha256 == master.sha256 );            // the picture, byte for byte
+        ASSERT_TRUE( withoutFlavorField( r.appliedLine ) == master.applied );   // the analysis, field for field
+        // ... and the flavor is reported, always.
+        ASSERT_TRUE( r.appliedLine.endsWith( QStringLiteral(" flavor=classic") ) );
+        ASSERT_TRUE( r.flavorOnReceipt == QLatin1String( "classic" ) );
+    }
+}
+
+// Unset and explicit "classic" are the same run, and both are master's.
+TEST(LookAssistFlavorsFixture, ClassicIsMasterForTheTrackedFixturesWhenNothingIsSet)
+{
+    expectClassicIsMaster( nullptr );
+}
+
+TEST(LookAssistFlavorsFixture, ClassicIsMasterForTheTrackedFixturesWhenAskedForExplicitly)
+{
+    expectClassicIsMaster( "classic" );
+}
+
+TEST(LookAssistFlavorsFixture, ClassicIsMasterForTheTrackedFixturesWhateverTheCaseOrSpacing)
+{
+    expectClassicIsMaster( "  Classic " );
 }
 
 TEST(LookAssistFlavorsFixture, CinematicChangesOnlyTheDocumentedSlidersAndIsReported)
