@@ -15538,6 +15538,9 @@ void MainWindow::applyLookAssistToReceipt( ReceiptSettings *receipt,
     // the one master classified (daylight needs the evidence).
     const LookAssistScene scene = resolveLookAssistScene(
         &stats, s_lookAssistMasterScenePass ? LookAssistRenderFn() : LookAssistRenderFn( renderProcessed ) );
+    // Observation only: how the verdict and balance were reached, appended to look_assist.apply.result.
+    LookAssistDecisionTrace decisionTrace;
+    decisionTrace.pictureEvidenceAsked = !s_lookAssistMasterScenePass;
     const bool floorLiftedNightThumbnail =
         lookAssistIsFloorLiftedNightThumbnail( scene, stats );
     const bool processedColorWanted = lookAssistShouldAnalyzeProcessedColor( scene, stats );
@@ -15589,6 +15592,10 @@ void MainWindow::applyLookAssistToReceipt( ReceiptSettings *receipt,
             processedColorStats.balanceSamples >= minColorBalanceSamples;
     }
 
+    // Trace only (LOOK-ASSIST-DIAG-LOGGING-1): the effective scale this apply ran at, whatever it is. It decides nothing
+    // below; the meter runs at every scale, so display_meter_ran is true exactly when the meter produced samples.
+    decisionTrace.playbackScaleFactor = effectivePlaybackScaleFactorForRequest();
+
     // The display-space exposure meter runs at EVERY playback scale: it renders the clip through a private cache-free
     // clone at the analysis downscale taken from the RAW size, so the scale the viewport plays at has no say in the
     // exposure Look Assist chooses (the headless applier asks the very same function).
@@ -15603,6 +15610,7 @@ void MainWindow::applyLookAssistToReceipt( ReceiptSettings *receipt,
         &displayMeterSamples );
     if( displayStatsValidUi )
     {
+        decisionTrace.displayMeterRan = true;
         logInteractionEvent(
             QStringLiteral("look_assist.display_meter"),
             QStringLiteral("samples=%1 robust_median=%2 robust_p95=%3 robust_p99=%4 frame=%5")
@@ -16487,6 +16495,7 @@ void MainWindow::applyLookAssistToReceipt( ReceiptSettings *receipt,
             !daylightScene && ( !autoWhiteBalanceValid || useProcessedColorStats );
         if( refinePostBalance )
         {
+            decisionTrace.postWalkRan = true;
             bool lastAcceptedPostBalanceValid = false;
             double lastAcceptedPostBalanceScore = 1.0e9;
             LookAssistPreset lastAcceptedPreset = preset;
@@ -16593,6 +16602,7 @@ void MainWindow::applyLookAssistToReceipt( ReceiptSettings *receipt,
                     }
                 }
             }
+            lookAssistTraceWalkSteps( &decisionTrace, adjustedPostBalance );
             if( postColorStatsValid
              && lookAssistHasNeutralBalanceSamples( postColorStats )
              && postColorStats.greenArtifactRatio >= 0.004
@@ -16615,6 +16625,7 @@ void MainWindow::applyLookAssistToReceipt( ReceiptSettings *receipt,
                     {
                         preset.tintDelta = cleanupTintTarget;
                         adjustedPostBalance = true;
+                        lookAssistTraceWalkCleanup( &decisionTrace );
                         applyLookAssistValues();
                         postColorStatsValid = analyzePostAppliedLook();
                     }
@@ -16690,6 +16701,7 @@ void MainWindow::applyLookAssistToReceipt( ReceiptSettings *receipt,
                     const LookAssistPreset startingPreset = preset;
                     LookAssistPreset bestPreset = preset;
                     LookAssistStats bestPostColorStats = postColorStats;
+                    bool recoveryAdopted = false;
                     double bestScore = warningAwarePostBalanceScore( postColorStats );
                     const QPair<int, int> recoveryCandidates[] =
                     {
@@ -16718,10 +16730,13 @@ void MainWindow::applyLookAssistToReceipt( ReceiptSettings *receipt,
                             bestScore = candidateScore;
                             bestPreset = preset;
                             bestPostColorStats = postColorStats;
+                            recoveryAdopted = true;
                         }
                     }
                     preset = bestPreset;
                     postColorStats = bestPostColorStats;
+                    lookAssistTraceWalkRecovery( &decisionTrace, recoveryAdopted,
+                                                 preset.temperatureDelta, preset.tintDelta );
                     postColorStatsValid = true;
                     applyLookAssistValues();
                 }
@@ -17004,7 +17019,7 @@ void MainWindow::applyLookAssistToReceipt( ReceiptSettings *receipt,
 
     logInteractionEvent(
         QStringLiteral("look_assist.apply.result"),
-        QStringLiteral("analysis=raw scene=%1 median=%2 p05=%3 p95=%4 p99=%5 clip_low=%6 clip_high=%7 balance_samples=%8 preset_exp=%9 preset_contrast=%10 preset_pivot=%11 preset_shadows=%12 preset_highlights=%13 preset_vibrance=%14 preset_temp_delta=%15 preset_tint_delta=%16 final_temp=%17 final_tint=%18 thumb=%19x%20 downscale=%21 color_thumb=%22x%23 color_downscale=%24 frame=%25 last_serial=%26 last_frame=%27 next_serial=%28")
+        QStringLiteral("analysis=raw scene=%1 median=%2 p05=%3 p95=%4 p99=%5 clip_low=%6 clip_high=%7 balance_samples=%8 preset_exp=%9 preset_contrast=%10 preset_pivot=%11 preset_shadows=%12 preset_highlights=%13 preset_vibrance=%14 preset_temp_delta=%15 preset_tint_delta=%16 final_temp=%17 final_tint=%18 thumb=%19x%20 downscale=%21 color_thumb=%22x%23 color_downscale=%24 frame=%25 last_serial=%26 last_frame=%27 next_serial=%28 %29")
             .arg( m_lastLookAssistScene )
             .arg( stats.median, 0, 'f', 3 )
             .arg( stats.p05, 0, 'f', 3 )
@@ -17034,7 +17049,8 @@ void MainWindow::applyLookAssistToReceipt( ReceiptSettings *receipt,
             .arg( m_lastPresentedRequestContextValid
                   ? static_cast<int>( m_lastPresentedRequestContext.frameNumber )
                   : -1 )
-            .arg( static_cast<qulonglong>( m_nextRenderRequestSerial ) ) );
+            .arg( static_cast<qulonglong>( m_nextRenderRequestSerial ) )
+            .arg( lookAssistDecisionLogFields( stats, decisionTrace ) ) );
 }
 
 void MainWindow::syncLookAssistDerivedUiToReceipt( ReceiptSettings *receipt )
