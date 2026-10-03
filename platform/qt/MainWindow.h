@@ -27,7 +27,7 @@
 #include <QSortFilterProxyModel>
 #include <QItemSelectionModel>
 #include <QToolButton>
-namespace lookassist { enum class LookAssistFlavor; }
+#include "../../src/batch/LookAssistAnalysis.h"   // LookAssistFlavor, and the LookAssistAppliedMarker member below
 #include "SessionModel.h"
 #include "PlaybackFrameRange.h"
 #include "../../src/mlv_include.h"
@@ -974,7 +974,8 @@ private:
     // De-dupe guard: the receipt whose Auto Look Assist analysis already ran this clip-open. A second
     // setSliders/deferral must not re-run the ~3s auto-WB analysis (it derives the same look and just
     // re-freezes the UI). Keyed on the receipt pointer so different clips re-analyze naturally.
-    ReceiptSettings *m_lookAssistAppliedReceipt = nullptr;
+    // A flavor change forgets the clip (LookAssistAppliedMarker::flavorChanged), so the next analysis is not de-duped away.
+    lookassist::LookAssistAppliedMarker m_lookAssistApplied;
     // Generation counter bumped on every clip open/close. The async look-assist
     // worker captures it at dispatch; the queued apply lambda re-checks before
     // touching any UI state, ensuring stale results from a previous clip are dropped.

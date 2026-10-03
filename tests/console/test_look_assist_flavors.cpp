@@ -154,11 +154,10 @@ TEST(LookAssistFlavors, CinematicChangesOnlyTheDocumentedSlidersByTheTable)
                     ASSERT_EQ( classic.temperatureDelta, cine.temperatureDelta );
                     ASSERT_EQ( classic.tintDelta, cine.tintDelta );
 
-                    // The six sliders move by exactly the table, then the documented bounds.
-                    int expectedExposure = qBound( -180, classic.exposure + d.exposure, 380 );
-                    if( scene == LookAssistScene::BrightSun ) expectedExposure = qMin( expectedExposure, 0 );
-                    if( scene == LookAssistScene::Night ) expectedExposure = qMax( expectedExposure, 0 );
-                    ASSERT_EQ( expectedExposure, cine.exposure );
+                    // Exposure is Classic's exactly, whatever the scene limits or the display statistics make of it: the
+                    // white-balance refinement renders at the preset's exposure, so a moved exposure would move the balance.
+                    ASSERT_EQ( classic.exposure, cine.exposure );
+                    // The five tone sliders move by exactly the table, then the documented bounds.
                     ASSERT_EQ( clampInt( -100, classic.contrast + d.contrast, 100 ), cine.contrast );
                     ASSERT_EQ( clampInt( 0, classic.pivot + d.pivot, 100 ), cine.pivot );
                     ASSERT_EQ( clampInt( -100, classic.shadows + d.shadows, 100 ), cine.shadows );
@@ -176,25 +175,73 @@ TEST(LookAssistFlavors, CinematicChangesOnlyTheDocumentedSlidersByTheTable)
     ASSERT_TRUE( moved > 0 );
 }
 
-TEST(LookAssistFlavors, CinematicKeepsTheSceneLimitsOfTheSceneItGrades)
+TEST(LookAssistFlavors, CinematicNeverRestatesTheExposureAndStaysInTheSliderRange)
 {
-    // Night is a rescue lift (never below 0); BrightSun never lifts (never above 0); no flavor leaves the slider range.
+    // The scene limits (Night never below 0, BrightSun never above 0) are Classic's to apply; Cinematic must not
+    // re-clamp the exposure it was handed. BrightSun with display statistics median=50 p99=120 is the case that
+    // used to differ: Classic's exposure there is 114, which a re-clamp to <= 0 turned into 0.
+    LookAssistStats display;
+    display.median = 50.0;
+    display.p99 = 120.0;
+    const std::vector<LookAssistStats> grid = look_assist_flavor_grid::statsGrid();
+    int liftedBrightSun = 0;
+    for( const LookAssistStats &s : grid )
+        for( int sceneIndex = 0; sceneIndex < 4; ++sceneIndex )
+            for( int useDisplay = 0; useDisplay < 2; ++useDisplay )
+            {
+                const LookAssistScene scene = static_cast<LookAssistScene>( sceneIndex );
+                const LookAssistStats *disp = useDisplay ? &display : nullptr;
+                const LookAssistPreset classic = classicDefault( scene, s, nullptr, disp );
+                const LookAssistPreset p = cinematic( scene, s, nullptr, disp );
+                ASSERT_EQ( classic.exposure, p.exposure );
+                if( scene == LookAssistScene::BrightSun && classic.exposure > 0 ) ++liftedBrightSun;
+                ASSERT_TRUE( p.exposure >= -180 && p.exposure <= 380 );
+                ASSERT_TRUE( p.contrast >= -100 && p.contrast <= 100 );
+                ASSERT_TRUE( p.pivot >= 0 && p.pivot <= 100 );
+                ASSERT_TRUE( p.shadows >= -100 && p.shadows <= 100 );
+                ASSERT_TRUE( p.highlights >= -100 && p.highlights <= 100 );
+                ASSERT_TRUE( p.vibrance >= -100 && p.vibrance <= 100 );
+            }
+    // The grid really reaches the state the review found (otherwise the identity above proves nothing).
+    ASSERT_TRUE( liftedBrightSun > 0 );
+}
+
+TEST(LookAssistFlavors, ApplyingTheFlavorAfterTheClassicPresetIsTheCinematicPreset)
+{
+    // The GUI's white-balance walk renders the picture, so it runs on the CLASSIC preset and Cinematic is laid over the
+    // result afterwards. That is only the same grade if the overlay equals what the preset function makes.
+    LookAssistStats display;
+    display.median = 50.0;
+    display.p99 = 120.0;
     const std::vector<LookAssistStats> grid = look_assist_flavor_grid::statsGrid();
     for( const LookAssistStats &s : grid )
-    {
-        ASSERT_TRUE( cinematic( LookAssistScene::Night, s, nullptr, nullptr ).exposure >= 0 );
-        ASSERT_TRUE( cinematic( LookAssistScene::BrightSun, s, nullptr, nullptr ).exposure <= 0 );
         for( int sceneIndex = 0; sceneIndex < 4; ++sceneIndex )
-        {
-            const LookAssistPreset p = cinematic( static_cast<LookAssistScene>( sceneIndex ), s, nullptr, nullptr );
-            ASSERT_TRUE( p.exposure >= -180 && p.exposure <= 380 );
-            ASSERT_TRUE( p.contrast >= -100 && p.contrast <= 100 );
-            ASSERT_TRUE( p.pivot >= 0 && p.pivot <= 100 );
-            ASSERT_TRUE( p.shadows >= -100 && p.shadows <= 100 );
-            ASSERT_TRUE( p.highlights >= -100 && p.highlights <= 100 );
-            ASSERT_TRUE( p.vibrance >= -100 && p.vibrance <= 100 );
-        }
-    }
+            for( int useDisplay = 0; useDisplay < 2; ++useDisplay )
+            {
+                const LookAssistScene scene = static_cast<LookAssistScene>( sceneIndex );
+                const LookAssistStats *disp = useDisplay ? &display : nullptr;
+                const LookAssistPreset classic = classicDefault( scene, s, nullptr, disp );
+                const LookAssistPreset cine = cinematic( scene, s, nullptr, disp );
+
+                LookAssistPreset overlaid = classic;
+                lookAssistApplyFlavorDeltas( &overlaid, scene, LookAssistFlavor::Cinematic );
+                ASSERT_EQ( cine.exposure, overlaid.exposure );
+                ASSERT_EQ( cine.contrast, overlaid.contrast );
+                ASSERT_EQ( cine.pivot, overlaid.pivot );
+                ASSERT_EQ( cine.shadows, overlaid.shadows );
+                ASSERT_EQ( cine.highlights, overlaid.highlights );
+                ASSERT_EQ( cine.vibrance, overlaid.vibrance );
+                // The white balance is never the overlay's to touch.
+                ASSERT_EQ( classic.temperatureDelta, overlaid.temperatureDelta );
+                ASSERT_EQ( classic.tintDelta, overlaid.tintDelta );
+
+                // Classic is a no-op.
+                LookAssistPreset untouched = classic;
+                lookAssistApplyFlavorDeltas( &untouched, scene, LookAssistFlavor::Classic );
+                ASSERT_TRUE( untouched.exposure == classic.exposure && untouched.contrast == classic.contrast
+                          && untouched.pivot == classic.pivot && untouched.shadows == classic.shadows
+                          && untouched.highlights == classic.highlights && untouched.vibrance == classic.vibrance );
+            }
 }
 
 TEST(LookAssistFlavors, TheDocumentedTableIsTheCodeTable)
@@ -362,6 +409,72 @@ TEST(LookAssistFlavors, HeadlessApplierReadsTheEnvironmentOverTheReceiptAndRepor
     ASSERT_TRUE( applier.contains( QStringLiteral("unknown flavor '%1' from %2; using classic") ) );
 }
 
+TEST(LookAssistFlavors, ChangingTheFlavorAfterAClassicApplyReRunsTheAnalysisAndGradesCinematic)
+{
+    // The GUI sequence, on the marker class the window itself owns: a Classic apply lands, the user picks Cinematic,
+    // and the toggle's frame-ready step asks the marker whether the clip is already applied. It must not be.
+    int receiptA = 0, receiptB = 0;   // two clips: only their addresses matter
+    LookAssistAppliedMarker marker;
+    LookAssistStats stats;
+    stats.median = 90.0; stats.p05 = 30.0; stats.p95 = 160.0; stats.p99 = 190.0; stats.dynamicRange = 125.0;
+
+    // The apply that is on screen: Classic.
+    const LookAssistFlavorSelection classicSel = lookAssistSelectFlavor( QString(), QString(), QStringLiteral("classic") );
+    const LookAssistPreset applied = presetForLookAssistScene( LookAssistScene::ArtificialLights, stats, nullptr, nullptr, classicSel.flavor );
+    marker.markApplied( &receiptA );
+    ASSERT_TRUE( marker.isApplied( &receiptA ) );
+    ASSERT_FALSE( marker.isApplied( &receiptB ) );
+
+    // The user selects Cinematic with Look Assist on: the slot asks the marker, which forgets the clip.
+    const LookAssistFlavorSelection cinematicSel = lookAssistSelectFlavor( QString(), QString(), QStringLiteral("cinematic") );
+    ASSERT_TRUE( cinematicSel.flavor == LookAssistFlavor::Cinematic );
+    ASSERT_TRUE( marker.flavorChanged( &receiptA, true ) );
+    // The dedup at the toggle's frame-ready step therefore lets the analysis run again...
+    ASSERT_FALSE( marker.isApplied( &receiptA ) );
+    // ...and that second run produces the Cinematic grade under the Cinematic name, not Classic's.
+    const LookAssistPreset regraded = presetForLookAssistScene( LookAssistScene::ArtificialLights, stats, nullptr, nullptr, cinematicSel.flavor );
+    ASSERT_TRUE( lookAssistFlavorName( cinematicSel.flavor ) == QLatin1String( "cinematic" ) );
+    ASSERT_TRUE( regraded.contrast != applied.contrast );
+    ASSERT_TRUE( regraded.highlights != applied.highlights );
+    marker.markApplied( &receiptA );
+    ASSERT_TRUE( marker.isApplied( &receiptA ) );
+
+    // Look Assist off: nothing to re-run.
+    ASSERT_FALSE( marker.flavorChanged( &receiptA, false ) );
+    // A change on a clip the marker does not hold forgets nothing it holds for another clip.
+    LookAssistAppliedMarker other;
+    other.markApplied( &receiptB );
+    ASSERT_TRUE( other.flavorChanged( &receiptA, true ) );
+    ASSERT_TRUE( other.isApplied( &receiptB ) );
+}
+
+TEST(LookAssistFlavors, AnUnknownReceiptFlavorIsClassicAndWarnsNeverCinematic)
+{
+    // The GUI resolves the receipt element through the shared selector before it touches the combo box.
+    LookAssistFlavorSelection sel;
+    QString value = lookAssistSelectorValueForReceipt( QStringLiteral("cinematik"), &sel );
+    ASSERT_TRUE( value == QLatin1String( "classic" ) );
+    ASSERT_TRUE( sel.unknownValue );
+    ASSERT_TRUE( sel.rejectedValue == QLatin1String( "cinematik" ) );
+    ASSERT_TRUE( sel.flavor == LookAssistFlavor::Classic );
+    ASSERT_TRUE( sel.source == QLatin1String( "receipt" ) );
+
+    // The two real spellings, in any case and padding.
+    value = lookAssistSelectorValueForReceipt( QStringLiteral("  Cinematic "), &sel );
+    ASSERT_TRUE( value == QLatin1String( "cinematic" ) );
+    ASSERT_FALSE( sel.unknownValue );
+    value = lookAssistSelectorValueForReceipt( QStringLiteral("CLASSIC"), &sel );
+    ASSERT_TRUE( value == QLatin1String( "classic" ) );
+    ASSERT_FALSE( sel.unknownValue );
+
+    // A receipt that declares nothing leaves the selector alone: an empty answer, no warning.
+    value = lookAssistSelectorValueForReceipt( QString(), &sel );
+    ASSERT_TRUE( value.isEmpty() );
+    ASSERT_FALSE( sel.unknownValue );
+    value = lookAssistSelectorValueForReceipt( QStringLiteral("   "), nullptr );
+    ASSERT_TRUE( value.isEmpty() );
+}
+
 TEST(LookAssistFlavors, GuiSelectorAndEnvironmentBothReachTheAnalysis)
 {
     const QString window = readSource( QStringLiteral("platform/qt/MainWindow.cpp") );
@@ -382,19 +495,26 @@ TEST(LookAssistFlavors, GuiSelectorAndEnvironmentBothReachTheAnalysis)
     // Every reporting site feeds its placeholder (flavor AFTER the #240 decision fields): the sync result, the async dispatch and the venue telemetry.
     ASSERT_TRUE( window.contains( QStringLiteral(".arg( lookAssistDecisionLogFields( stats, decisionTrace ) )\n            .arg( lookAssistFlavorName( flavor ) ) );") ) );
     ASSERT_TRUE( window.contains( QStringLiteral(".arg( bool01( floorLiftedNightThumbnail ) )\n                .arg( lookAssistFlavorName( flavor ) ) );") ) );
+    // Nothing is reported as applied until an analysis lands: cleared when one starts, named only at its success site.
+    ASSERT_TRUE( window.contains( QStringLiteral("m_lastAppliedLookAssistFlavor.clear();") ) );
     ASSERT_TRUE( window.contains( QStringLiteral("m_lastAppliedLookAssistFlavor = lookAssistFlavorName( flavor );") ) );
     ASSERT_TRUE( window.contains( QStringLiteral("gpu_preview_processing_reject_reason=%47 \"\n            \"look_assist_flavor=%48\"") ) );
-    ASSERT_TRUE( window.contains( QStringLiteral(".arg( m_lastLookAssistDiagnosticsValid && !m_lastAppliedLookAssistFlavor.isEmpty()\n                  ? m_lastAppliedLookAssistFlavor") ) );
+    // The venue report names a flavor only for a look that is on screen: not after the safety fallback restored the baseline.
+    ASSERT_TRUE( window.contains( QStringLiteral(".arg( m_lastLookAssistDiagnosticsValid && !m_lastLookAssistSafetyFallback\n                  && !m_lastAppliedLookAssistFlavor.isEmpty()\n                  ? m_lastAppliedLookAssistFlavor") ) );
 
     // Changing the selector re-runs Look Assist the way switching it on does; it persists as an app setting
     // (default Classic) and a receipt that declares a flavor shows it.
     const int slotAt = window.indexOf( QStringLiteral("void MainWindow::on_comboBoxLookAssistFlavor_currentIndexChanged") );
     ASSERT_TRUE( slotAt >= 0 );
-    ASSERT_TRUE( window.mid( slotAt, 900 ).contains( QStringLiteral(
-        "    if( ui->checkBoxLookAssistEnable->isChecked() )\n        on_checkBoxLookAssistEnable_clicked( true );" ) ) );
+    ASSERT_TRUE( window.mid( slotAt, 1400 ).contains( QStringLiteral(
+        "        on_checkBoxLookAssistEnable_clicked( true );" ) ) );
     ASSERT_TRUE( window.contains( QStringLiteral("set.setValue( \"lookAssistFlavor\"") ) );
     ASSERT_TRUE( window.contains( QStringLiteral("set.value( \"lookAssistFlavor\", QString( \"classic\" ) )") ) );
-    ASSERT_TRUE( window.contains( QStringLiteral("receipt->lookAssistFlavor().trimmed().toLower()") ) );
+    ASSERT_TRUE( window.contains( QStringLiteral("lookAssistSelectorValueForReceipt( receipt->lookAssistFlavor(), &receiptFlavor )") ) );
+    ASSERT_FALSE( window.contains( QStringLiteral("findData( receipt->lookAssistFlavor()") ) );
+    // The slot goes through the marker, then the same path as switching Look Assist on.
+    ASSERT_TRUE( window.mid( slotAt, 1400 ).contains( QStringLiteral("m_lookAssistApplied.flavorChanged(") ) );
+    ASSERT_FALSE( window.contains( QStringLiteral("m_lookAssistAppliedReceipt") ) );
 }
 
 TEST(LookAssistFlavors, ReceiptElementIsWrittenOnlyForANonClassicFlavor)

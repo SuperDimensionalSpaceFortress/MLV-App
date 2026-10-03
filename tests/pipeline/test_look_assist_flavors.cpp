@@ -199,9 +199,9 @@ TEST(LookAssistFlavorsFixture, CinematicChangesOnlyTheDocumentedSlidersAndIsRepo
         ASSERT_EQ( classic.value( QStringLiteral("tint") ), cine.value( QStringLiteral("tint") ) );
         ASSERT_EQ( classic.value( QStringLiteral("chromaSmooth") ), cine.value( QStringLiteral("chromaSmooth") ) );
 
-        // The six sliders move by exactly the documented table.
+        // Exposure is Classic's exactly; the five tone sliders move by exactly the documented table.
         const LookAssistFlavorDeltas d = lookAssistCinematicDeltasForScene( sceneByName( scene ) );
-        ASSERT_EQ( clampInt( -180, classic.value( QStringLiteral("exp") ) + d.exposure, 380 ), cine.value( QStringLiteral("exp") ) );
+        ASSERT_EQ( classic.value( QStringLiteral("exp") ), cine.value( QStringLiteral("exp") ) );
         ASSERT_EQ( clampInt( -100, classic.value( QStringLiteral("contrast") ) + d.contrast, 100 ), cine.value( QStringLiteral("contrast") ) );
         ASSERT_EQ( clampInt( 0, classic.value( QStringLiteral("pivot") ) + d.pivot, 100 ), cine.value( QStringLiteral("pivot") ) );
         ASSERT_EQ( clampInt( -100, classic.value( QStringLiteral("shadows") ) + d.shadows, 100 ), cine.value( QStringLiteral("shadows") ) );

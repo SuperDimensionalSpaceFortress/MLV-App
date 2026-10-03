@@ -71,7 +71,8 @@ public:
     void setRawWhite( int value )             {m_rawWhite = value;}
     void setRawBlack( int value )             {m_rawBlack = value;}
     void setLookAssistEnabled( bool on )      {m_lookAssistEnabled = on;}
-    // "classic" / "cinematic"; empty = not recorded (Classic). Written to the receipt only when non-empty.
+    // "classic" / "cinematic"; empty = not recorded (Classic). Written to the receipt only when non-empty AND not
+    // "classic" (a Classic receipt stays byte-identical to master's; the compare is on the normalised lower-case name).
     void setLookAssistFlavor( const QString &value ) {m_lookAssistFlavor = value;}
     void setLookAssistBaselineValid( bool on ){m_lookAssistBaselineValid = on;}
     void setLookAssistBaselineExposure( int value )   {m_lookAssistBaselineExposure = value;}

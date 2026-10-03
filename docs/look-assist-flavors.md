@@ -8,19 +8,22 @@ shouldn't look raw or unprocessed with look assist active; it should have an aes
   state. It is the default.
 * **Cinematic** is the same analysis, the same scene verdict and the same white-balance decision, with one table
   of deltas laid over the same sliders. It is applied **only** through the sliders Look Assist already owns:
-  exposure, contrast, pivot, shadows, highlights, vibrance. It never touches the white balance (temperature / tint).
+  contrast, pivot, shadows, highlights, vibrance. It never touches the exposure (Classic's, exactly, including the
+  scene limits Classic applied) or the white balance (temperature / tint).
   Saturation and the tone curve are not Look Assist sliders (no preset field, no baseline to restore), so they are
   not used; the modest extra colour comes through vibrance.
 
 The code is one table, `kCinematicFlavorDeltas` in `src/batch/LookAssistAnalysis.cpp`, read through
 `lookAssistCinematicDeltasForScene()`. `presetForLookAssistScene()` takes a trailing `flavor` argument that
-defaults to Classic; Classic returns before any flavor code runs.
+defaults to Classic; Classic returns before any flavor code runs. The flavor is laid over a preset by
+`lookAssistApplyFlavorDeltas()`, which `presetForLookAssistScene()` itself ends in.
 
 ## The Cinematic table
 
-Additive deltas over the Classic preset the scene and the statistics produced (then clamped to the slider range;
-Night never goes below 0 exposure and BrightSun never above 0, as before). A test pins this table against the code
-(`LookAssistFlavors.DocsTableMatchesTheCodeTable`).
+Additive deltas over the Classic preset the scene and the statistics produced, then clamped to the slider range.
+Exposure is not re-clamped: whatever Classic's exposure is (Night's floor, BrightSun's ceiling, a display-meter
+lift), Cinematic's is that value. A test pins this table against the code
+(`LookAssistFlavors.TheDocumentedTableIsTheCodeTable`).
 
 <!-- cinematic-table:begin -->
 | Scene | Exposure | Contrast | Pivot | Shadows | Highlights | Vibrance |
@@ -42,8 +45,18 @@ Intent, column by column:
 * **Highlights -**: highlights rolled off harder than Classic: controlled, not clipped-looking.
 * **Vibrance +**: modest. Richer colour, never a saturation push.
 * **Exposure 0**: deliberately held at Classic's. The white-balance refinement renders the picture at the preset's
-  exposure, so an exposure delta would move the balance; with none, the white balance is Classic's by
+  exposure, so an exposure delta would move the balance; with none, the headless white balance is Classic's by
   construction (a test pins temperature, tint and the headless picture byte for byte).
+
+### The GUI's white-balance walk
+
+The GUI's post-balance walk renders the picture through the live processing object, so the grade the sliders
+hold would steer the temperature and tint it steps to. It therefore runs on the **Classic** preset whatever the
+flavor; only then are the flavor's tone sliders laid over the finished balance (`lookAssistApplyFlavorDeltas()`),
+and the picture the user will see is measured once more for the diagnostics and the safety guard only. The
+balance the GUI settles on is the Classic one by construction, and a test pins that the overlay is exactly the
+preset the one call makes. (The opt-in async worker, `MLVAPP_LOOK_ASSIST_ASYNC=1`, measures the picture through
+the same live object after applying a preset; it is not the default path and is not covered by this claim.)
 
 ### What it does to the tracked fixtures
 
@@ -69,12 +82,16 @@ Layers, first non-empty one wins (`lookAssistSelectFlavor()`):
 2. The receipt's `<lookAssistFlavor>` element, which the headless / batch path reads. It is **written only for a
    non-Classic flavor**, so a Classic receipt is byte-identical to what it always was; absent means Classic.
 3. The GUI's *Look Assist flavor* selector next to *Auto Look Assist*, persisted as the app setting
-   `lookAssistFlavor` (default `classic`). Changing it re-runs Look Assist the way switching it on does. A
-   receipt that declares a flavor shows it in the selector when it is loaded.
+   `lookAssistFlavor` (default `classic`). Changing it with Look Assist on **re-runs the analysis** with the new
+   flavor: the "already applied" marker (`LookAssistAppliedMarker::flavorChanged`) forgets the clip so the
+   toggle's frame-ready step does not skip it, and the result line logs `flavor=<new>`. A receipt that declares
+   a flavor shows it in the selector when it is loaded.
 
 An unknown value is **Classic**, never a fall through to a lower layer, and is logged: the headless applier prints
 `[BATCH] WARNING LOOK_ASSIST unknown flavor '<value>' from <env|receipt>; using classic`, the GUI logs
-`look_assist.flavor.unknown_value`.
+`look_assist.flavor.unknown_value` (for the environment, the app setting **and** a receipt element, through the one
+rule `lookAssistSelectorValueForReceipt()` / `lookAssistSelectFlavor()`; an unknown receipt value shows Classic in
+the selector and is corrected on the receipt).
 
 ## Reporting
 
@@ -83,7 +100,9 @@ The flavor applied is always reported, appended to the end of the existing lines
 * GUI `look_assist.apply.result`: `... next_serial=<n> <decision trace fields> flavor=<classic|cinematic>` (the trace is LOOK-ASSIST-DIAG-LOGGING-1's, `has_ev100=` .. `playback_scale=`; flavor comes after it).
 * GUI `look_assist.apply.async_dispatch`: `... floor_lifted=<0|1> flavor=<...>`.
 * Headless `[BATCH] LOOK_ASSIST applied ...`: `... initialPatchFinalChroma=<x> <decision trace fields> flavor=<...>`.
-* `gui_smoke.visual_state`: `... gpu_preview_processing_reject_reason=<r> look_assist_flavor=<...|none>`. This is
+* `gui_smoke.visual_state`: `... gpu_preview_processing_reject_reason=<r> look_assist_flavor=<...|none>`. It
+  names a flavor only for a look that is on screen: `none` until an analysis lands, and `none` again after the
+  safety fallback restored the baseline (a sheet is then never labelled with a grade it does not show). This is
   what the venue job reads: its summary carries `lookFlavorReported`, and the leg receipt's
   `look.lookFlavorHonored` is `true` only when the app's own report equals the flavor the leg asked for
   (see [dual-venue-evidence.md](dual-venue-evidence.md)).
@@ -92,10 +111,14 @@ The flavor applied is always reported, appended to the end of the existing lines
 ## Tests
 
 * `tests/console/test_look_assist_flavors.cpp`: Classic equals master's preset on a 5808-line grid (golden hash
-  dumped from an unchanged master tree); the table; Cinematic = Classic + table (clamped), deterministic, never
-  the white balance; the selector's layers and the unknown-value rule; the receipt element is read and written only
-  for a non-Classic flavor; every preset call in both consumers passes the flavor; the scene verdict stays
-  flavor-blind; the GUI selector and the environment both reach the analysis.
+  dumped from an unchanged master tree); the table; Cinematic = Classic + table (clamped), exposure exactly
+  Classic's (including a BrightSun display-meter lift), deterministic, never the white balance; laying the flavor
+  over a Classic preset is the Cinematic preset; the selector's layers and the unknown-value rule; an unknown
+  receipt value resolves to Classic plus a warning; **behavioural**: after a Classic apply, a flavor change makes
+  the marker forget the clip so the analysis runs again and grades Cinematic (a mutation that does not clear the
+  marker fails it); the receipt element is read and written only for a non-Classic flavor; every preset call in
+  both consumers passes the flavor; the scene verdict stays flavor-blind; the GUI selector and the environment
+  both reach the analysis.
 * `tests/pipeline/test_look_assist_flavors.cpp`: on the tracked fixture frames, Classic reproduces master's
   receipt sliders, applied line (but for the appended field) and rendered-picture sha256
   (`tests/fixtures/look_assist_flavor_classic_baseline.txt`); Cinematic changes only the documented sliders, keeps

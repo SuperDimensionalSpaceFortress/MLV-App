@@ -1164,6 +1164,34 @@ LookAssistFlavorSelection lookAssistSelectFlavor( const QString &environmentValu
     return selection;
 }
 
+QString lookAssistSelectorValueForReceipt( const QString &receiptValue, LookAssistFlavorSelection *selection )
+{
+    // The receipt is one layer of the shared selector: same trimming, same case rule, same unknown-value rule.
+    const LookAssistFlavorSelection resolved = lookAssistSelectFlavor( QString(), receiptValue, QString() );
+    if( selection ) *selection = resolved;
+    if( receiptValue.trimmed().isEmpty() ) return QString();
+    return lookAssistFlavorName( resolved.flavor );
+}
+
+void lookAssistApplyFlavorDeltas( LookAssistPreset *preset, LookAssistScene scene, LookAssistFlavor flavor )
+{
+    if( !preset || flavor != LookAssistFlavor::Cinematic ) return;
+    // Exposure is deliberately absent: the white-balance refinement renders the picture at the preset's exposure,
+    // and the scene limits (Night >= 0, BrightSun <= 0) are Classic's own, already applied. Re-clamping here once
+    // turned a BrightSun exposure of 114 into 0.
+    const LookAssistFlavorDeltas d = lookAssistCinematicDeltasForScene( scene );
+    preset->contrast += d.contrast;
+    preset->pivot += d.pivot;
+    preset->shadows += d.shadows;
+    preset->highlights += d.highlights;
+    preset->vibrance += d.vibrance;
+    preset->contrast = qBound( -100, preset->contrast, 100 );
+    preset->pivot = qBound( 0, preset->pivot, 100 );
+    preset->shadows = qBound( -100, preset->shadows, 100 );
+    preset->highlights = qBound( -100, preset->highlights, 100 );
+    preset->vibrance = qBound( -100, preset->vibrance, 100 );
+}
+
 LookAssistPreset presetForLookAssistScene( LookAssistScene scene,
                                            const LookAssistStats &stats,
                                            const LookAssistStats *colorStats,
@@ -1352,20 +1380,9 @@ LookAssistPreset presetForLookAssistScene( LookAssistScene scene,
                                    tintCap );
     }
 
-    if( flavor == LookAssistFlavor::Cinematic )
-    {
-        // The only flavor code in this function: Classic never enters it. Slider deltas only; the white
-        // balance deltas above are left exactly as the analysis made them.
-        const LookAssistFlavorDeltas d = lookAssistCinematicDeltasForScene( scene );
-        preset.exposure = qBound( -180, preset.exposure + d.exposure, 380 );
-        if( scene == LookAssistScene::BrightSun ) preset.exposure = qMin( preset.exposure, 0 );
-        if( scene == LookAssistScene::Night )     preset.exposure = qMax( preset.exposure, 0 );
-        preset.contrast += d.contrast;
-        preset.pivot += d.pivot;
-        preset.shadows += d.shadows;
-        preset.highlights += d.highlights;
-        preset.vibrance += d.vibrance;
-    }
+    // The only flavor code in this function: Classic never enters it. Tone sliders only; exposure and the white
+    // balance deltas above are left exactly as the analysis made them.
+    lookAssistApplyFlavorDeltas( &preset, scene, flavor );
 
     preset.contrast = qBound( -100, preset.contrast, 100 );
     preset.pivot = qBound( 0, preset.pivot, 100 );
