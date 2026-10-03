@@ -52,6 +52,36 @@ int processingRefreshShadowsHighlightsBlurFromRgb16(processingObject_t * process
                                                     int height,
                                                     int threads,
                                                     int forceExportPolicy);
+/* PLAYBACK-SH-OFF-CPU-PATH-1: quarter-res shadows/highlights frame state.
+ * Eligible only in the standard x1 playback-preview lane (preview mode on,
+ * aggressive off, scale 1, quarter-res RBF lane taken) for width and height
+ * that are multiples of 4, unless MLVAPP_DISABLE_SH_QUARTER_FRAME_STATE is set.
+ * The refresh computes, straight from the Bayer frame, exactly the RBF output
+ * that debayerBasicU16 + processingRefreshShadowsHighlightsBlurFromRgb16(.., 0)
+ * compute in that lane, and stops before the two upsample stages; it applies
+ * debayerBasicU16's in-place bitShift to bayer. Returns 0 (state untouched,
+ * use the full-res path) when not eligible. The expander runs the lane's two
+ * upsample stages, so expand(quarter) is bit-identical to the full-res blur. */
+int processingShadowsHighlightsQuarterFrameStateEligible(int width, int height);
+int processingRefreshShadowsHighlightsQuarterBlurFromBayer16(processingObject_t * processing,
+                                                             uint16_t * bayer,
+                                                             int width,
+                                                             int height,
+                                                             int threads,
+                                                             int bitShift);
+int processingGetShadowsHighlightsQuarterBlurData(const processingObject_t * processing,
+                                                  const uint16_t ** data,
+                                                  int * quarterWidth,
+                                                  int * quarterHeight,
+                                                  int * frameWidth,
+                                                  int * frameHeight);
+int processingExpandShadowsHighlightsQuarterBlur(const uint16_t * quarter,
+                                                 int quarterWidth,
+                                                 int quarterHeight,
+                                                 uint16_t * output,
+                                                 int frameWidth,
+                                                 int frameHeight,
+                                                 int threads);
 /* Test seams: process-global call counts (not timings). */
 unsigned long processingDebugFullInitCount(void);        /* initProcessingObject() calls */
 unsigned long processingDebugFinalMatrixPrintCount(void); /* processing_update_matrices printMatrix call site */
