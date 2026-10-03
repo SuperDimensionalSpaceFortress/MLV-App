@@ -4147,9 +4147,64 @@ void RenderFrameThread::drawFrame( int slotIndex,
         && slot.rawImage16.size() >= fullResPixelCountForGpuTexNr
         && m_pMlvObject
         && m_pMlvObject->processing;
+    bool gpuTexNrFastShQuarterFrameStateUsed = false;
     if( gpuTexNrFastShFrameStateEligible )
     {
         gpuTexNrFastShFrameStateAttempted = true;
+        /* PLAYBACK-SH-OFF-CPU-PATH-1: in the standard x1 preview lane the
+         * frame state is computed at quarter res straight from the Bayer frame
+         * (bit-identical RBF output, no full-res debayer, downsample, upsample
+         * or 24.6 MB copy); the display shader upsamples it exactly. The engine
+         * refuses outside that lane and the full-res path below runs instead. */
+        const int bitShift =
+            llrpHQDualIso( m_pMlvObject )
+                ? 0
+                : ( 16 - m_pMlvObject->RAWI.raw_info.bits_per_pixel );
+        const double quarterStart = mlv_stage_timing_now();
+        const int previousPreviewMode =
+            processingPlaybackPreviewModeEnabled();
+        const int previousAggressivePreviewMode =
+            processingPlaybackAggressivePreviewModeEnabled();
+        const int previousPreviewScaleFactor =
+            processingPlaybackPreviewScaleFactor();
+        processingSetPlaybackPreviewMode( 1 );
+        processingSetPlaybackAggressivePreviewMode(
+            mlvPlaybackAggressivePreviewMode() != 0 ? 1 : 0 );
+        processingSetPlaybackPreviewScaleFactor( playbackScaleFactor );
+        const int quarterRefreshed =
+            processingRefreshShadowsHighlightsQuarterBlurFromBayer16(
+                m_pMlvObject->processing,
+                slot.rawImage16.data(),
+                m_imageWidth,
+                m_imageHeight,
+                workerThreads,
+                bitShift );
+        processingSetPlaybackPreviewScaleFactor(
+            previousPreviewScaleFactor );
+        processingSetPlaybackAggressivePreviewMode(
+            previousAggressivePreviewMode );
+        processingSetPlaybackPreviewMode( previousPreviewMode );
+        if( quarterRefreshed != 0 )
+        {
+            gpuTexNrFastShQuarterFrameStateUsed = true;
+            gpuTexNrFastShDebayerMs =
+                processingGetLastShadowsHighlightsFilterQuarterresDownsampleMilliseconds();
+            gpuTexNrFastShRefreshMs =
+                ( mlv_stage_timing_now() - quarterStart ) * 1000.0
+                - gpuTexNrFastShDebayerMs;
+            gpuTexNrFastShFrameStateReady =
+                processingGetShadowsHighlightsQuarterBlurData(
+                    m_pMlvObject->processing,
+                    nullptr, nullptr, nullptr, nullptr, nullptr ) != 0;
+            if( !gpuTexNrFastShFrameStateReady )
+            {
+                gpuTexNrFastShFrameStateReason =
+                    QStringLiteral("quarter S/H frame-state refresh did not produce matching blur data");
+            }
+        }
+    }
+    if( gpuTexNrFastShFrameStateEligible && !gpuTexNrFastShQuarterFrameStateUsed )
+    {
         try
         {
             m_gpuPlaybackReconStateRgb16.resize(
@@ -4287,6 +4342,9 @@ void RenderFrameThread::drawFrame( int slotIndex,
     slot.stageTimingTelemetry.insert(
         QStringLiteral("gpu_playback_recon_amaze_texture_present_skip_gate_fast_sh_frame_state_ready"),
         gpuTexNrFastShFrameStateReady );
+    slot.stageTimingTelemetry.insert(
+        QStringLiteral("gpu_playback_recon_amaze_texture_present_skip_gate_fast_sh_quarter_frame_state_used"),
+        gpuTexNrFastShQuarterFrameStateUsed );
     slot.stageTimingTelemetry.insert(
         QStringLiteral("gpu_playback_recon_amaze_texture_present_skip_gate_fast_sh_debayer_ms"),
         gpuTexNrFastShDebayerMs );
