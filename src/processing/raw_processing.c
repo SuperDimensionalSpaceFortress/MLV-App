@@ -1458,29 +1458,18 @@ void processing_object_thread(apply_processing_parameters_t * p)
  * lifted-black tan while x8 (which never takes the quarterres lane) stayed
  * clean. applyProcessingObject8 passes 1; the 16-bit path passes 0 and
  * keeps its scale-aware preview lanes. */
-static void processing_compute_shadows_highlights_blur( processingObject_t * processing,
-                                                        uint16_t * __restrict inputImage,
-                                                        int imageX, int imageY, int threads,
-                                                        int force_export_policy )
+/* The quarter-res RBF lane decision, shared by processing_compute_shadows_highlights_blur
+ * and the quarter-only frame-state refresh so the two can never disagree about
+ * which lane a frame takes. */
+static int processing_shadows_highlights_quarterres_lane(int imageX, int imageY,
+                                                         int force_export_policy)
 {
-    g_processing_last_shadows_highlights_prep_run_count++;
-    const int shadows_highlights_probe_enabled =
-        processing_shadows_highlights_probe_mode() >= 0;
-    const int halfres_even_dimensions =
-        (imageX >= 2) && (imageY >= 2)
-     && ((imageX & 1) == 0)
-     && ((imageY & 1) == 0);
     const int preview_mode_enabled = !force_export_policy
         && processingPlaybackPreviewModeEnabled();
     const int aggressive_preview_enabled = preview_mode_enabled
         && processingPlaybackAggressivePreviewModeEnabled();
-    const int halfres_aggressive_preview_odd_height =
-        aggressive_preview_enabled
-     && (imageX >= 2) && (imageY >= 3)
-     && ((imageX & 1) == 0)
-     && ((imageY & 1) != 0);
     const int preview_scale_factor = processingPlaybackPreviewScaleFactor();
-    const int use_quarterres_rbf =
+    return
         (
             (preview_mode_enabled
              && !aggressive_preview_enabled
@@ -1504,6 +1493,66 @@ static void processing_compute_shadows_highlights_blur( processingObject_t * pro
         )
      && imageX >= 4
      && imageY >= 4;
+}
+
+/* The quarter-res RBF itself: blur_image_half_out holds the quarter_w x
+ * quarter_h input, blur_image_half_in receives the output. Shared by the
+ * legacy quarterres lane and the quarter-only frame-state refresh. */
+static void processing_shadows_highlights_quarterres_rbf(processingObject_t * processing,
+                                                         int quarter_w,
+                                                         int quarter_h)
+{
+    const float quarter_sigma_spatial = 0.0025f;
+    buffer_set_size(processing->shadows_highlights.blur_image_half_in, quarter_w, quarter_h);
+    if( processing_shadows_highlights_curve_index_mask_enabled() )
+        recursive_bf_wrap_with_curve_index_lut(
+                get_buffer(processing->shadows_highlights.blur_image_half_out),
+                get_buffer(processing->shadows_highlights.blur_image_half_in),
+                quarter_sigma_spatial,
+                0.075f+(((float)100.0-40.0f)/666.6f),
+                quarter_w,
+                quarter_h,
+                3,
+                processing->pre_calc_levels,
+                processing->pre_calc_matrix[0],
+                processing->pre_calc_matrix[4],
+                processing->pre_calc_matrix[8]);
+    else
+        recursive_bf_wrap_with_output_lut(
+                get_buffer(processing->shadows_highlights.blur_image_half_out),
+                get_buffer(processing->shadows_highlights.blur_image_half_in),
+                quarter_sigma_spatial,
+                0.075f+(((float)100.0-40.0f)/666.6f),
+                quarter_w,
+                quarter_h,
+                3,
+                processing->pre_calc_levels);
+}
+
+static void processing_compute_shadows_highlights_blur( processingObject_t * processing,
+                                                        uint16_t * __restrict inputImage,
+                                                        int imageX, int imageY, int threads,
+                                                        int force_export_policy )
+{
+    g_processing_last_shadows_highlights_prep_run_count++;
+    processing->shadows_highlights.quarter_blur_ready = 0;
+    const int shadows_highlights_probe_enabled =
+        processing_shadows_highlights_probe_mode() >= 0;
+    const int halfres_even_dimensions =
+        (imageX >= 2) && (imageY >= 2)
+     && ((imageX & 1) == 0)
+     && ((imageY & 1) == 0);
+    const int preview_mode_enabled = !force_export_policy
+        && processingPlaybackPreviewModeEnabled();
+    const int aggressive_preview_enabled = preview_mode_enabled
+        && processingPlaybackAggressivePreviewModeEnabled();
+    const int halfres_aggressive_preview_odd_height =
+        aggressive_preview_enabled
+     && (imageX >= 2) && (imageY >= 3)
+     && ((imageX & 1) == 0)
+     && ((imageY & 1) != 0);
+    const int use_quarterres_rbf =
+        processing_shadows_highlights_quarterres_lane(imageX, imageY, force_export_policy);
     g_processing_last_shadows_highlights_quarterres_path_taken = use_quarterres_rbf;
     const int use_halfres_rbf =
         halfres_even_dimensions || halfres_aggressive_preview_odd_height;
@@ -1517,7 +1566,6 @@ static void processing_compute_shadows_highlights_blur( processingObject_t * pro
         const int half_h = imageY >> 1;
         const int quarter_w = half_w >> 1;
         const int quarter_h = half_h >> 1;
-        const float quarter_sigma_spatial = 0.0025f;
         buffer_set_size(processing->shadows_highlights.blur_image, imageX, imageY);
         buffer_set_size(processing->shadows_highlights.blur_image_half_in, half_w, half_h);
         buffer_set_size(processing->shadows_highlights.blur_image_half_out, quarter_w, quarter_h);
@@ -1541,30 +1589,7 @@ static void processing_compute_shadows_highlights_blur( processingObject_t * pro
 
         const double quarterres_rbf_start =
             shadows_highlights_probe_enabled ? omp_get_wtime() : 0.0;
-        buffer_set_size(processing->shadows_highlights.blur_image_half_in, quarter_w, quarter_h);
-        if( processing_shadows_highlights_curve_index_mask_enabled() )
-            recursive_bf_wrap_with_curve_index_lut(
-                    get_buffer(processing->shadows_highlights.blur_image_half_out),
-                    get_buffer(processing->shadows_highlights.blur_image_half_in),
-                    quarter_sigma_spatial,
-                    0.075f+(((float)100.0-40.0f)/666.6f),
-                    quarter_w,
-                    quarter_h,
-                    3,
-                    processing->pre_calc_levels,
-                    processing->pre_calc_matrix[0],
-                    processing->pre_calc_matrix[4],
-                    processing->pre_calc_matrix[8]);
-        else
-            recursive_bf_wrap_with_output_lut(
-                    get_buffer(processing->shadows_highlights.blur_image_half_out),
-                    get_buffer(processing->shadows_highlights.blur_image_half_in),
-                    quarter_sigma_spatial,
-                    0.075f+(((float)100.0-40.0f)/666.6f),
-                    quarter_w,
-                    quarter_h,
-                    3,
-                    processing->pre_calc_levels);
+        processing_shadows_highlights_quarterres_rbf(processing, quarter_w, quarter_h);
         if( shadows_highlights_probe_enabled )
         {
             g_processing_last_shadows_highlights_filter_quarterres_rbf_ms +=
@@ -1722,27 +1747,8 @@ static void processing_compute_shadows_highlights_blur( processingObject_t * pro
     g_processing_last_shadows_highlights_filter_run_count++;
 }
 
-int processingRefreshShadowsHighlightsBlurFromRgb16(processingObject_t * processing,
-                                                    uint16_t * inputImage,
-                                                    int width,
-                                                    int height,
-                                                    int threads,
-                                                    int forceExportPolicy)
+static void processing_reset_last_shadows_highlights_timing(void)
 {
-    if( !processing || !inputImage || width <= 0 || height <= 0 )
-    {
-        return 0;
-    }
-
-    const int shadows_highlights_active =
-        ( processing->shadows_highlights.shadows <= -0.01 || processing->shadows_highlights.shadows >= 0.01 )
-     || ( processing->shadows_highlights.highlights <= -0.01 || processing->shadows_highlights.highlights >= 0.01 )
-     || ( processing->clarity <= -0.01 || processing->clarity >= 0.01 );
-    if( !shadows_highlights_active )
-    {
-        return 0;
-    }
-
     g_processing_last_shadows_highlights_resize_ms = 0.0;
     g_processing_last_shadows_highlights_copy_ms = 0.0;
     g_processing_last_shadows_highlights_filter_ms = 0.0;
@@ -1780,6 +1786,30 @@ int processingRefreshShadowsHighlightsBlurFromRgb16(processingObject_t * process
     g_processing_last_shadows_highlights_rbf_vertical_up_body_store_color_assign_ms = 0.0;
     g_processing_last_shadows_highlights_rbf_vertical_up_ms = 0.0;
     g_processing_last_shadows_highlights_rbf_output_ms = 0.0;
+}
+
+int processingRefreshShadowsHighlightsBlurFromRgb16(processingObject_t * processing,
+                                                    uint16_t * inputImage,
+                                                    int width,
+                                                    int height,
+                                                    int threads,
+                                                    int forceExportPolicy)
+{
+    if( !processing || !inputImage || width <= 0 || height <= 0 )
+    {
+        return 0;
+    }
+
+    const int shadows_highlights_active =
+        ( processing->shadows_highlights.shadows <= -0.01 || processing->shadows_highlights.shadows >= 0.01 )
+     || ( processing->shadows_highlights.highlights <= -0.01 || processing->shadows_highlights.highlights >= 0.01 )
+     || ( processing->clarity <= -0.01 || processing->clarity >= 0.01 );
+    if( !shadows_highlights_active )
+    {
+        return 0;
+    }
+
+    processing_reset_last_shadows_highlights_timing();
 
     const double start = omp_get_wtime();
     const double resize_start = omp_get_wtime();
@@ -1790,6 +1820,270 @@ int processingRefreshShadowsHighlightsBlurFromRgb16(processingObject_t * process
         processing, inputImage, width, height, threads, forceExportPolicy);
     g_processing_last_shadows_highlights_prep_ms =
         (omp_get_wtime() - start) * 1000.0;
+    return 1;
+}
+
+/* PLAYBACK-SH-OFF-CPU-PATH-1: one row of debayerBasicU16's output, computed
+ * straight from the Bayer data. Bit-exact to that function for even width and
+ * height: interior pixels use its 2x2-cell formulas (cells start at an odd row
+ * and column), columns 0 / width-1 copy columns 1 / width-2 (its edge fix-ups),
+ * and rows 0 / height-1 copy rows 1 / height-2 (its closing memcpys). */
+static void sh_proxy_basic_debayer_row(const uint16_t * __restrict bayer,
+                                       int width,
+                                       int height,
+                                       int y,
+                                       uint16_t * __restrict out)
+{
+    const int yc = (y <= 0) ? 1 : ((y >= height - 1) ? height - 2 : y);
+    const int cy = (yc & 1) ? yc : yc - 1;
+    const uint16_t * rm = bayer + (size_t)(cy - 1) * (size_t)width;
+    const uint16_t * r0 = rm + width;
+    const uint16_t * r1 = r0 + width;
+    const uint16_t * r2 = r1 + width;
+    if( yc == cy )
+    {
+        for( int x = 1; x < width - 1; x += 2 )
+        {
+            uint16_t * p = out + (size_t)x * 3u;
+            p[0] = (uint16_t)((uint32_t)(rm[x - 1] + rm[x + 1] + r1[x - 1] + r1[x + 1]) >> 2);
+            p[1] = (uint16_t)((uint32_t)(rm[x] + r0[x + 1] + r0[x - 1] + r1[x]) >> 2);
+            p[2] = r0[x];
+            p[3] = (uint16_t)((uint32_t)(rm[x + 1] + r1[x + 1]) >> 1);
+            p[4] = r0[x + 1];
+            p[5] = (uint16_t)((uint32_t)(r0[x] + r0[x + 2]) >> 1);
+        }
+    }
+    else
+    {
+        for( int x = 1; x < width - 1; x += 2 )
+        {
+            uint16_t * p = out + (size_t)x * 3u;
+            p[0] = (uint16_t)((uint32_t)(r1[x - 1] + r1[x + 1]) >> 1);
+            p[1] = r1[x];
+            p[2] = (uint16_t)((uint32_t)(r0[x] + r2[x]) >> 1);
+            p[3] = r1[x + 1];
+            p[4] = (uint16_t)((uint32_t)(r0[x + 1] + r1[x] + r1[x + 2] + r2[x + 1]) >> 2);
+            p[5] = (uint16_t)((uint32_t)(r0[x] + r0[x + 2] + r2[x] + r2[x + 2]) >> 2);
+        }
+    }
+    uint16_t * last = out + (size_t)(width - 1) * 3u;
+    for( int c = 0; c < 3; ++c )
+    {
+        out[c] = out[3 + c];
+        last[c] = last[c - 3];
+    }
+}
+
+/* box2(box2(debayerBasicU16(bayer))) -- the quarter-res RBF input of the
+ * standard x1 lane -- without materialising the full-res RGB frame or the
+ * half-res intermediate. Same truncating >>2 at both box stages. Requires
+ * width and height to be multiples of 4. */
+static int sh_proxy_quarter_from_bayer(const uint16_t * __restrict bayer,
+                                       int width,
+                                       int height,
+                                       uint16_t * __restrict quarter,
+                                       int threads)
+{
+    const int quarter_w = width >> 2;
+    const int quarter_h = height >> 2;
+    const size_t row_words = (size_t)width * 3u;
+    int failed = 0;
+    #pragma omp parallel if(threads > 1) num_threads(threads)
+    {
+        uint16_t * rows = (uint16_t *)malloc(row_words * 4u * sizeof(uint16_t));
+        if( !rows )
+        {
+            #pragma omp atomic write
+            failed = 1;
+        }
+        #pragma omp for schedule(static)
+        for( int qy = 0; qy < quarter_h; ++qy )
+        {
+            if( !rows ) continue;
+            for( int k = 0; k < 4; ++k )
+            {
+                sh_proxy_basic_debayer_row(bayer, width, height, qy * 4 + k, rows + (size_t)k * row_words);
+            }
+            const uint16_t * f0 = rows;
+            const uint16_t * f1 = rows + row_words;
+            const uint16_t * f2 = rows + row_words * 2u;
+            const uint16_t * f3 = rows + row_words * 3u;
+            uint16_t * q = quarter + (size_t)qy * (size_t)quarter_w * 3u;
+            for( int qx = 0; qx < quarter_w; ++qx )
+            {
+                const size_t a = (size_t)(qx * 4) * 3u;
+                for( int c = 0; c < 3; ++c )
+                {
+                    const size_t i0 = a + c;
+                    const size_t i1 = i0 + 3u;
+                    const size_t i2 = i0 + 6u;
+                    const size_t i3 = i0 + 9u;
+                    const uint32_t h00 = ((uint32_t)f0[i0] + f0[i1] + f1[i0] + f1[i1]) >> 2;
+                    const uint32_t h01 = ((uint32_t)f0[i2] + f0[i3] + f1[i2] + f1[i3]) >> 2;
+                    const uint32_t h10 = ((uint32_t)f2[i0] + f2[i1] + f3[i0] + f3[i1]) >> 2;
+                    const uint32_t h11 = ((uint32_t)f2[i2] + f2[i3] + f3[i2] + f3[i3]) >> 2;
+                    q[(size_t)qx * 3u + c] = (uint16_t)((h00 + h01 + h10 + h11) >> 2);
+                }
+            }
+        }
+        free(rows);
+    }
+    return !failed;
+}
+
+static int processing_sh_quarter_frame_state_disabled(void)
+{
+    static int initialized = 0;
+    static int disabled = 0;
+    if( !initialized )
+    {
+        disabled = processing_env_flag_enabled(getenv("MLVAPP_DISABLE_SH_QUARTER_FRAME_STATE"));
+        initialized = 1;
+    }
+    return disabled;
+}
+
+int processingShadowsHighlightsQuarterFrameStateEligible(int width, int height)
+{
+    return !processing_sh_quarter_frame_state_disabled()
+        && width >= 8 && height >= 8
+        && (width & 3) == 0 && (height & 3) == 0
+        && processingPlaybackPreviewModeEnabled()
+        && !processingPlaybackAggressivePreviewModeEnabled()
+        && processingPlaybackPreviewScaleFactor() == 1
+        && processing_shadows_highlights_quarterres_lane(width, height, 0);
+}
+
+int processingRefreshShadowsHighlightsQuarterBlurFromBayer16(processingObject_t * processing,
+                                                             uint16_t * bayer,
+                                                             int width,
+                                                             int height,
+                                                             int threads,
+                                                             int bitShift)
+{
+    if( !processing || !bayer || width <= 0 || height <= 0 )
+    {
+        return 0;
+    }
+    const int shadows_highlights_active =
+        ( processing->shadows_highlights.shadows <= -0.01 || processing->shadows_highlights.shadows >= 0.01 )
+     || ( processing->shadows_highlights.highlights <= -0.01 || processing->shadows_highlights.highlights >= 0.01 )
+     || ( processing->clarity <= -0.01 || processing->clarity >= 0.01 );
+    if( !shadows_highlights_active
+     || !processingShadowsHighlightsQuarterFrameStateEligible(width, height) )
+    {
+        return 0;
+    }
+
+    processing_reset_last_shadows_highlights_timing();
+    processing->shadows_highlights.quarter_blur_ready = 0;
+    const double start = omp_get_wtime();
+
+    /* debayerBasicU16 shifts the caller's Bayer buffer in place; keep that
+     * side effect identical for whoever reads the buffer afterwards. */
+    if( bitShift > 0 )
+    {
+        const int pixel_count = width * height;
+        #pragma omp parallel for if(threads > 1) num_threads(threads)
+        for( int i = 0; i < pixel_count; ++i )
+        {
+            bayer[i] = (uint16_t)(bayer[i] << bitShift);
+        }
+    }
+
+    const int quarter_w = width >> 2;
+    const int quarter_h = height >> 2;
+    buffer_set_size(processing->shadows_highlights.blur_image_half_out, quarter_w, quarter_h);
+    if( !sh_proxy_quarter_from_bayer(bayer, width, height,
+                                     get_buffer(processing->shadows_highlights.blur_image_half_out),
+                                     threads) )
+    {
+        return 0;
+    }
+    const double proxy_ms = (omp_get_wtime() - start) * 1000.0;
+    g_processing_last_shadows_highlights_filter_quarterres_downsample_ms = proxy_ms;
+    g_processing_last_shadows_highlights_quarterres_downsample_completed = 1;
+
+    const double rbf_start = omp_get_wtime();
+    processing_shadows_highlights_quarterres_rbf(processing, quarter_w, quarter_h);
+    g_processing_last_shadows_highlights_filter_quarterres_rbf_ms =
+        (omp_get_wtime() - rbf_start) * 1000.0;
+    g_processing_last_shadows_highlights_quarterres_rbf_completed = 1;
+    processing_capture_last_shadows_highlights_rbf_timing();
+
+    g_processing_last_shadows_highlights_quarterres_path_taken = 1;
+    g_processing_last_shadows_highlights_prep_run_count = 1;
+    g_processing_last_shadows_highlights_filter_run_count = 1;
+    g_processing_last_shadows_highlights_filter_ms = (omp_get_wtime() - start) * 1000.0;
+    g_processing_last_shadows_highlights_prep_ms = g_processing_last_shadows_highlights_filter_ms;
+
+    processing->shadows_highlights.quarter_blur_frame_width = width;
+    processing->shadows_highlights.quarter_blur_frame_height = height;
+    processing->shadows_highlights.quarter_blur_ready = 1;
+    return 1;
+}
+
+int processingGetShadowsHighlightsQuarterBlurData(const processingObject_t * processing,
+                                                  const uint16_t ** data,
+                                                  int * quarterWidth,
+                                                  int * quarterHeight,
+                                                  int * frameWidth,
+                                                  int * frameHeight)
+{
+    if( data ) *data = NULL;
+    if( quarterWidth ) *quarterWidth = 0;
+    if( quarterHeight ) *quarterHeight = 0;
+    if( frameWidth ) *frameWidth = 0;
+    if( frameHeight ) *frameHeight = 0;
+    if( !processing
+     || !processingHasShadowsHighlightsAdjustments(processing)
+     || !processing->shadows_highlights.quarter_blur_ready
+     || !processing->shadows_highlights.blur_image_half_in )
+    {
+        return 0;
+    }
+    const processing_buffer_t * buffer = processing->shadows_highlights.blur_image_half_in;
+    const int frame_w = processing->shadows_highlights.quarter_blur_frame_width;
+    const int frame_h = processing->shadows_highlights.quarter_blur_frame_height;
+    if( !buffer->image
+     || buffer->width != (frame_w >> 2)
+     || buffer->height != (frame_h >> 2)
+     || buffer->width <= 0
+     || buffer->height <= 0 )
+    {
+        return 0;
+    }
+    if( data ) *data = buffer->image;
+    if( quarterWidth ) *quarterWidth = buffer->width;
+    if( quarterHeight ) *quarterHeight = buffer->height;
+    if( frameWidth ) *frameWidth = frame_w;
+    if( frameHeight ) *frameHeight = frame_h;
+    return 1;
+}
+
+int processingExpandShadowsHighlightsQuarterBlur(const uint16_t * quarter,
+                                                 int quarterWidth,
+                                                 int quarterHeight,
+                                                 uint16_t * output,
+                                                 int frameWidth,
+                                                 int frameHeight,
+                                                 int threads)
+{
+    if( !quarter || !output || quarterWidth <= 0 || quarterHeight <= 0
+     || frameWidth != quarterWidth * 4 || frameHeight != quarterHeight * 4 )
+    {
+        return 0;
+    }
+    const int half_w = frameWidth >> 1;
+    const int half_h = frameHeight >> 1;
+    uint16_t * half = (uint16_t *)malloc((size_t)half_w * (size_t)half_h * 3u * sizeof(uint16_t));
+    if( !half ) return 0;
+    /* The legacy quarterres lane's two upsample stages, verbatim. */
+    rgb_u16_upsample_2x_bilinear_to_size(quarter, half, quarterWidth, quarterHeight,
+                                         half_w, half_h, threads);
+    rgb_u16_upsample_2x_bilinear_to_size(half, output, half_w, half_h,
+                                         frameWidth, frameHeight, threads);
+    free(half);
     return 1;
 }
 
@@ -5547,6 +5841,7 @@ static processingObject_t * processingCloneForAnalysisOnce(const processingObjec
     clone->shadows_highlights.blur_image = clone_blur_image;
     clone->shadows_highlights.blur_image_half_in = clone_blur_image_half_in;
     clone->shadows_highlights.blur_image_half_out = clone_blur_image_half_out;
+    clone->shadows_highlights.quarter_blur_ready = 0;
     clone->gradient_mask = NULL;
     clone->vignette_mask = NULL;
     clone->vignette_end = NULL;
