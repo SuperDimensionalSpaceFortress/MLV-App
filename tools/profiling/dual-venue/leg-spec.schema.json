@@ -18,7 +18,15 @@
       "items": { "enum": ["cuda", "cpu"] },
       "description": "Every playback leg runs as cuda AND cpu on EVERY venue (Amendment 1 A1). 'gl' is reserved and not yet runnable."
     },
-    "scaleFactor": { "type": "integer", "minimum": 1, "maximum": 16 },
+    "scaleFactor": { "type": "integer", "minimum": 1, "maximum": 16, "description": "The playback scale the leg REQUESTS. The receipt also records the scale the app actually rendered at (effectiveScale, read from the app's own run log); a leg whose run rendered at any other scale than the accepted one ends SCALE_NOT_HONOURED, never PASS." },
+    "acceptedEffectiveScale": {
+      "type": "object", "additionalProperties": false,
+      "properties": {
+        "cuda": { "type": "integer", "minimum": 1, "maximum": 16 },
+        "cpu": { "type": "integer", "minimum": 1, "maximum": 16 }
+      },
+      "description": "OPTIONAL, per backend: the scale that backend is KNOWN to render at when it is not scaleFactor (the CUDA texture route clamps every requested scale other than 1 to 1: MainWindowGpuPreviewPolicy.h). A run that renders at exactly this scale passes with the receipt verdict DECLARED_CLAMP and both numbers in its outcomeDetail; any other rendered scale is SCALE_NOT_HONOURED. A leg that wants its requested scale on a backend declares nothing and lists no backend that cannot render it."
+    },
     "generatorArgs": {
       "type": "object", "additionalProperties": false,
       "properties": {
