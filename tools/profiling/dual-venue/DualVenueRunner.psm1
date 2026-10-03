@@ -47,7 +47,9 @@ $script:ReceiptSchema = 'mlv-app/dual-venue-receipt/v1'
 # frames, a wrap, a foreign run, a fixture); it carries no signal, exactly like DEVICE_UNAVAILABLE.
 # VENUE_TOOLING (round 3): the leg played and its proof is sound, but the VENUE cannot do a post-capture step (a LOOK leg's
 # contact sheet needs Python + Pillow on the venue); it is a venue condition, never a product FAIL.
-$script:OutcomeEnum = @('PASS', 'FAIL', 'VENUE_UNHEALTHY', 'VENUE_NOT_QUIESCENT', 'VENUE_HOST_MISMATCH', 'DEVICE_UNAVAILABLE', 'UNRESOLVED', 'RETRACTED', 'INVALID', 'VENUE_TOOLING')
+# SCALE_NOT_HONOURED (DVE-SCALE2-LOOK-LEG-1 r2): the leg played and its proof is sound, but the app rendered at a playback scale other than the one the leg's
+# spec asked for (or declared it would get), or the scale it rendered at cannot be read: no signal, never a PASS under a scale the run did not render at.
+$script:OutcomeEnum = @('PASS', 'FAIL', 'VENUE_UNHEALTHY', 'VENUE_NOT_QUIESCENT', 'VENUE_HOST_MISMATCH', 'DEVICE_UNAVAILABLE', 'UNRESOLVED', 'RETRACTED', 'INVALID', 'VENUE_TOOLING', 'SCALE_NOT_HONOURED')
 
 function Get-DvOutcomeEnum { $script:OutcomeEnum }
 
@@ -643,6 +645,60 @@ function Get-DvPlaybackEvidence {
     $pb
 }
 
+function Get-DvScaleEvidence {
+    <#
+    .SYNOPSIS
+    The receipt's `scale` block (DVE-SCALE2-LOOK-LEG-1 r2): the playback scale the leg REQUESTED (the spec's scaleFactor), the scale the app actually RENDERED at, and the
+    verdict. The effective scale is read from the app's own run log: `scale_active_last` on the measured session's playback_smoke.summary line, else the effective= of the app's
+    one-time `playback_scale_clamped_for_gpu_texture_route` line; absent from both it is the string 'UNKNOWN' (never the request, never 1).
+
+    The CUDA texture route clamps every requested scale other than 1 to 1 (MainWindowGpuPreviewPolicy.h), so the two can differ. A leg's spec may DECLARE the effective scale a
+    backend renders at (acceptedEffectiveScale.<backend>); otherwise the accepted effective scale is the request. Verdicts:
+      HONOURED       effective == requested == accepted
+      DECLARED_CLAMP effective == accepted != requested (the spec says this backend renders at accepted; the receipt still carries both numbers)
+      NOT_HONOURED   effective is known and is not the accepted scale
+      UNKNOWN        the app's rendered scale cannot be read
+    `honoured` is true for HONOURED and DECLARED_CLAMP only. Pure and shared: the runner gates on it and Test-DvReceiptValid re-derives it from the hashed run log.
+    #>
+    param([Parameter(Mandatory)]$Spec, [Parameter(Mandatory)][string]$Backend, [AllowNull()][AllowEmptyString()][string]$LogText)
+    $requested = [int]$Spec.scaleFactor
+    $accepted = $requested
+    if ($null -ne $Spec.PSObject.Properties['acceptedEffectiveScale'] -and $null -ne $Spec.acceptedEffectiveScale -and $null -ne $Spec.acceptedEffectiveScale.PSObject.Properties[$Backend]) {
+        $accepted = [int]$Spec.acceptedEffectiveScale.$Backend
+    }
+    $effective = $null
+    $source = 'absent from the run log'
+    $appRequest = $null
+    $clampActive = $null
+    if (-not [string]::IsNullOrEmpty($LogText)) {
+        $f = (Get-DvSmokeSummaryFields -LogText $LogText).fields
+        $active = ConvertTo-DvInt64 $f['scale_active_last']
+        if ($null -ne $active -and $active -ge 1) { $effective = $active; $source = 'playback_smoke.summary scale_active_last' }
+        $appRequest = ConvertTo-DvInt64 $f['scale_request_last']
+        $clampFlag = ConvertTo-DvInt64 $f['gpu_texture_route_scale_clamp_active']
+        if ($null -ne $clampFlag) { $clampActive = ($clampFlag -ne 0) }
+        if ($null -eq $effective) {
+            foreach ($line in ($LogText -split "`r?`n")) {
+                if ($line -match 'playback_scale_clamped_for_gpu_texture_route requested=(?<r>\d+) effective=(?<e>\d+)') { $effective = [int64]$Matches['e']; $source = 'playback_scale_clamped_for_gpu_texture_route effective (clamp line)'; $clampActive = $true; break }
+            }
+        }
+    }
+    $verdict = 'NOT_HONOURED'
+    if ($null -eq $effective) { $verdict = 'UNKNOWN' }
+    elseif ($effective -eq $accepted -and $accepted -eq $requested) { $verdict = 'HONOURED' }
+    elseif ($effective -eq $accepted) { $verdict = 'DECLARED_CLAMP' }
+    [ordered]@{
+        requestedScale = $requested
+        effectiveScale = $(if ($null -eq $effective) { 'UNKNOWN' } else { [int]$effective })
+        acceptedEffectiveScale = $accepted
+        appRequestScaleLast = $appRequest
+        clampActive = $clampActive
+        effectiveScaleSource = $source
+        verdict = $verdict
+        honoured = ($verdict -in @('HONOURED', 'DECLARED_CLAMP'))
+    }
+}
+
 # --- the evidence a receipt is RE-DERIVED from (DUAL-VENUE-EVIDENCE-2 round 1) -----------------------------------------
 # CLASS: a receipt is ADVISORY (production) only when every claim in it is re-derived from a COMMITTED blob or a HASHED artifact; no field the
 # receipt asserts about itself is ever an input. The receipt names its evidence directory and the sha256 of each file in it; the
@@ -1073,6 +1129,19 @@ function Test-DvReceiptValid {
             }
         }
 
+        # ---- the SCALE the run rendered at: re-derived from the HASHED run log and the COMMITTED spec, never from a receipt field (DVE-SCALE2-LOOK-LEG-1 r2) ----
+        $scaleVerdict = $null
+        if ($production -and $null -ne $spec -and $null -ne $derivedBackend) {
+            $scaleVerdict = Get-DvScaleEvidence -Spec $spec -Backend $derivedBackend -LogText $ev.logText
+            $storedScale = Get-DvProp $Receipt 'scale'
+            if ($null -eq $storedScale) { $incomplete.Add('RECEIPT_FIELD_ABSENT: the receipt carries no scale block (requestedScale / effectiveScale)') }
+            else {
+                foreach ($f in @('requestedScale', 'effectiveScale', 'acceptedEffectiveScale')) {
+                    if (-not (Test-DvJsonEquivalent (Get-DvProp $storedScale $f) $scaleVerdict[$f])) { $invalid.Add("SCALE_NOT_FROM_EVIDENCE: scale.$f is not what the hashed run log and the committed leg spec derive") }
+                }
+            }
+        }
+
         # ---- the OUTCOME: re-derived from the job's result, its exit code, the verbatim metrics and the COMMITTED criteria -----------
         $resolved = $null
         if ($null -ne $exit) {
@@ -1103,6 +1172,8 @@ function Test-DvReceiptValid {
                     }
                 }
                 $expected = $(if (-not $sheetOk) { 'FAIL' } elseif ($verdict.pass) { 'PASS' } else { 'FAIL' })
+                # a capture that did not render at the scale the leg asked for (or declared) is no signal either way (the runner's own order: scale first)
+                if (-not $scaleVerdict.honoured) { $expected = 'SCALE_NOT_HONOURED' }
             }
             if ($expected -cne $outcome) { $invalid.Add("OUTCOME_NOT_DERIVED: the evidence and the committed criteria derive $expected but the receipt says $outcome") }
         }
@@ -1346,6 +1417,9 @@ function New-DvReceipt {
         # Round 2: the receipt oracle's verdict (source_advanced / required_source_frames / run nonce / wrap / clip id).
         # A receipt that says PASS or FAIL without a valid one is INVALID (Test-DvReceiptValid).
         playback = $null
+        # DVE-SCALE2-LOOK-LEG-1 r2: the playback scale the leg requested and the scale the app actually rendered at (Get-DvScaleEvidence). Present on EVERY receipt
+        # that names a leg spec (effectiveScale 'UNKNOWN' until a run log says); a PASS/FAIL without it is INCOMPLETE and one that misstates it is INVALID.
+        scale = $null
         look = $null
         # Retired in round 3 (no registry snapshot is taken any more: master isolates an automation run's settings store; the
         # receipt's playback.settingsIsolated is the proof). The key stays null so a reader written against round 2 still parses.
@@ -1394,6 +1468,6 @@ function Write-DvReceipt {
 Export-ModuleMember -Function Get-DvOutcomeEnum, ConvertTo-DvCanonicalJson, Get-DvSha256OfBytes, Get-DvSha256OfText, Get-DvSha256OfFile,
     ConvertTo-DvLfBytes, Get-DvLegSpecSha256, Get-DvDerivedBackend, Get-DvBackendNotDerivable, Read-DvContactFrames, Get-DvSubjectDigest, Read-DvVenueTable, ConvertFrom-DvVenueTableText, Get-DvVenueRole, Get-DvProp, Get-DvCommittedFile, Resolve-DvAdmissionSources,
     Test-DvUnderClaudeState, Read-DvClipConsent, Get-DvClipAdmission, Get-DvSmokeSummaryFields, Get-DvPlaybackProblems,
-    Get-DvPlaybackEvidence, Get-DvBlobById, Find-DvCommittedLegSpec, Read-DvEvidenceSet, Test-DvJsonEquivalent, Test-DvReceiptValid, Get-DvHealthVerdict,
+    Get-DvPlaybackEvidence, Get-DvScaleEvidence, Get-DvBlobById, Find-DvCommittedLegSpec, Read-DvEvidenceSet, Test-DvJsonEquivalent, Test-DvReceiptValid, Get-DvHealthVerdict,
     New-DvHealthProbeJobText, ConvertFrom-DvProbeStdout,
     Get-DvResultToken, Resolve-DvJobOutcome, Test-DvCriteria, Get-DvVerbatimMetrics, New-DvReceipt, Write-DvReceipt
