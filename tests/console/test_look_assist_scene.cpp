@@ -2163,38 +2163,42 @@ TEST(LookAssistScene, EveryWindowLitConjunctIsNeededOnItsOwn)
     }
 }
 
-TEST(LookAssistScene, BothConsumersRunTheWindowLitCheckOnTheirNightPath)
+TEST(LookAssistScene, BothConsumersRunTheWindowLitCheckMeasureOnly)
 {
+    // On the owner clip the accepted solve did not verify (its own patch turns amber at the solution), so both consumers
+    // run the check on COPIES and only log it: verdict, preset, balance and the sync/async routing stay master's.
     const QString applier = readRepoFile( QStringLiteral("src/batch/ReceiptApplier.cpp") );
     const QString window = readRepoFile( QStringLiteral("platform/qt/MainWindow.cpp") );
     ASSERT_FALSE( applier.isEmpty() );
     ASSERT_FALSE( window.isEmpty() );
+    const QString copies = QStringLiteral(
+        "windowLitRequest, wb, %1, &windowLitStats, &windowLitScene, &windowLitPreset," );
 
     // GUI sync: once, after the one white-balance decision and its master-pass fallback, before the values are applied.
     ASSERT_EQ( 1, window.count( QStringLiteral("resolveLookAssistWindowLitInterior(") ) );
+    ASSERT_EQ( 1, window.count( copies.arg( QStringLiteral("m_pMlvObject->processing->exposure_stops") ) ) );
+    ASSERT_EQ( 1, window.count( QStringLiteral("windowLitRequest.stats = &windowLitStats;") ) );
     const int sync = window.indexOf( QStringLiteral("// --- synchronous fallback (MLVAPP_LOOK_ASSIST_SYNC=1) ---") );
     const int syncWb = window.indexOf( QStringLiteral("const LookAssistWhiteBalanceResolution wb = resolveLookAssistWhiteBalance("), sync );
     const int masterPass = window.indexOf( QStringLiteral("applyLookAssistToReceipt( receipt, analysisFrame );"), syncWb );
     const int guiCheck = window.indexOf( QStringLiteral("resolveLookAssistWindowLitInterior("), sync );
     const int applied = window.indexOf( QStringLiteral("applyLookAssistValues();"), syncWb );
     ASSERT_TRUE( sync > 0 && syncWb > sync && masterPass > syncWb && guiCheck > masterPass && applied > guiCheck );
-    // It reads the live picture's own exposure, and the night-only flag follows the verdict it may change.
-    ASSERT_TRUE( window.mid( guiCheck, 400 ).contains( QStringLiteral("m_pMlvObject->processing->exposure_stops") ) );
-    const int flagAfter = window.indexOf( QStringLiteral("floorLiftedNightThumbnail = lookAssistIsFloorLiftedNightThumbnail( scene, stats );"), guiCheck );
-    ASSERT_TRUE( flagAfter > guiCheck && flagAfter < applied );
-    // A candidate never reaches the async worker (which has no renderer to verify on): it takes the sync path, as
-    // corroborated daylight does, so sync and async cannot disagree.
-    const int livePicture = window.indexOf( QStringLiteral(
-        "const bool daylightNeedsLivePicture = lookAssistIsDaylightScene( stats, scene ) || s_lookAssistMasterScenePass" ) );
-    ASSERT_TRUE( livePicture > 0 );
-    ASSERT_TRUE( window.mid( livePicture, 220 ).contains( QStringLiteral("|| lookAssistWindowLitInteriorCandidate( stats, scene );") ) );
+    // Nothing the live pass uses can be changed by it: the verdict and the night flag stay const, the routing is master's.
+    ASSERT_TRUE( window.contains( QStringLiteral("const LookAssistScene scene = resolveLookAssistScene(") ) );
+    ASSERT_TRUE( window.contains( QStringLiteral("const bool floorLiftedNightThumbnail =") ) );
+    ASSERT_TRUE( window.contains( QStringLiteral(
+        "const bool daylightNeedsLivePicture = lookAssistIsDaylightScene( stats, scene ) || s_lookAssistMasterScenePass;") ) );
+    ASSERT_FALSE( window.contains( QStringLiteral("lookAssistWindowLitInteriorCandidate(") ) );
 
-    // Headless: once, after its decision and its master-pass fallback, before the receipt is written.
+    // Headless: the same, after its decision and its master-pass fallback, before the receipt is written.
     ASSERT_EQ( 1, applier.count( QStringLiteral("resolveLookAssistWindowLitInterior(") ) );
+    ASSERT_EQ( 1, applier.count( copies.arg( QStringLiteral("mlvObject->processing->exposure_stops") ) ) );
+    ASSERT_EQ( 1, applier.count( QStringLiteral("windowLitRequest.stats = &windowLitStats;") ) );
+    ASSERT_TRUE( applier.contains( QStringLiteral("const LookAssistScene scene = resolveLookAssistScene(") ) );
     const int hWb = applier.indexOf( QStringLiteral("const LookAssistWhiteBalanceResolution wb = resolveLookAssistWhiteBalance(") );
     const int hMaster = applier.indexOf( QStringLiteral("return applyHeadlessLookAssist( receipt, mlvObject, processingObject, analysisFrame, true );"), hWb );
     const int hCheck = applier.indexOf( QStringLiteral("resolveLookAssistWindowLitInterior("), hWb );
     const int hWrite = applier.indexOf( QStringLiteral("receipt->setExposure( preset.exposure );"), hWb );
     ASSERT_TRUE( hWb > 0 && hMaster > hWb && hCheck > hMaster && hWrite > hCheck );
-    ASSERT_TRUE( applier.mid( hCheck, 400 ).contains( QStringLiteral("mlvObject->processing->exposure_stops") ) );
 }

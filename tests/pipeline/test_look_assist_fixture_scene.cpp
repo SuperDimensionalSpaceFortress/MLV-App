@@ -953,7 +953,7 @@ TEST(LookAssistFixtureScene, HeadlessAppliedLineSaysWhyItChoseItsScene)
         ASSERT_TRUE( runIdentityCase( kIdentityCases[2], &noMeta ) );
         ASSERT_TRUE( noMeta.scene == QStringLiteral("night") );
         const QString log = QString::fromUtf8( noMeta.log );
-        ASSERT_EQ( 1, log.count( QStringLiteral("LOOK_ASSIST window_lit_interior frame=0 evidence=false reason=") ) );
+        ASSERT_EQ( 1, log.count( QStringLiteral("LOOK_ASSIST window_lit_interior frame=0 wouldReclassify=false reason=") ) );
         ASSERT_TRUE( log.contains( QStringLiteral(" scene=night ") ) );
         ASSERT_TRUE( log.contains( QStringLiteral("expoIso=0 expoShutterUs=0 lensApertureX100=0") ) );
         IdentityRun nd;

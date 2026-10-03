@@ -425,12 +425,13 @@ bool lookAssistDaylightNeedsRenderedRefinement( const LookAssistStats &stats,
  *   - verified: the same surface, rendered at the patch picture's exposure, is near-neutral at the base balance and at
  *     the solution and no more cast there (the daylight initial-patch guard, with the base balance as the start).
  * Then stats->windowLitInteriorEvidence is set, the scene becomes the daylight class (Shade), the preset is that
- * scene's (same inputs) and the accepted balance stands, clamped into the daylight window (a no-op by the gate). */
+ * scene's (same inputs) and the accepted balance stands, clamped into the daylight window (a no-op by the gate).
+ * CONSUMERS RUN IT MEASURE-ONLY (on copies, logging window_lit_interior): on the owner clip the accepted solve did not
+ * verify (its own patch turns amber at the solution), so nothing is reclassified until the follow-ons land. */
 static const double kLookAssistWindowLitMinPatchLuma = 150.0;
 static const int    kLookAssistWindowLitMinTemperature = 7000;
 
-/* The night verdict could be a window-lit interior: legacy Night from a flat-floor RAW thumbnail, no recorded exposure.
- * Decided before the balance is solved (the GUI sends these clips down its synchronous path, as it does daylight). */
+/* The night verdict could be a window-lit interior: legacy Night from a flat-floor RAW thumbnail, no recorded exposure. */
 bool lookAssistWindowLitInteriorCandidate( const LookAssistStats &stats, LookAssistScene scene );
 
 struct LookAssistWindowLitCheck

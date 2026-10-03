@@ -750,7 +750,7 @@ bool ReceiptApplier::applyHeadlessLookAssist(ReceiptSettings *receipt,
     };
     // The master pass gives the recorded exposure no say: no picture evidence is asked for, so the scene is
     // the one master classified (daylight needs the evidence).
-    LookAssistScene scene = resolveLookAssistScene(
+    const LookAssistScene scene = resolveLookAssistScene(
         &stats, masterScenePass ? LookAssistRenderFn() : LookAssistRenderFn( renderProcessed ) );
     // Observation only: how the verdict was reached, appended to the "applied" line. The headless applier has no
     // night post-balance walk and no display meter, so those stay at their defaults.
@@ -901,14 +901,19 @@ bool ReceiptApplier::applyHeadlessLookAssist(ReceiptSettings *receipt,
             .arg( mlvObject->current_cached_frame_active ) );
         return applyHeadlessLookAssist( receipt, mlvObject, processingObject, analysisFrame, true );
     }
-    // A window-lit interior (the GUI runs the same check): the daylight class, its preset and the accepted balance.
+    // The window-lit check, MEASURED, NOT APPLIED (the GUI does the same; see there): it runs on copies and only logs.
+    LookAssistStats windowLitStats = stats;
+    LookAssistScene windowLitScene = scene;
+    LookAssistPreset windowLitPreset = preset;
+    LookAssistWhiteBalanceRequest windowLitRequest = wbRequest;
+    windowLitRequest.stats = &windowLitStats;
     const LookAssistWindowLitCheck windowLit = resolveLookAssistWindowLitInterior(
-        wbRequest, wb, mlvObject->processing->exposure_stops, &stats, &scene, &preset,
+        windowLitRequest, wb, mlvObject->processing->exposure_stops, &windowLitStats, &windowLitScene, &windowLitPreset,
         useProcessedColorStats ? &processedColorStats : nullptr );
     if( windowLit.candidate )
     {
         BatchLogger::out( QStringLiteral(
-            "[BATCH] LOOK_ASSIST window_lit_interior frame=%1 evidence=%2 reason=%3 scene=%4 baseSurfaceChroma=%5 "
+            "[BATCH] LOOK_ASSIST window_lit_interior frame=%1 wouldReclassify=%2 reason=%3 scene=%4 baseSurfaceChroma=%5 "
             "baseSurfaceBlueAmber=%6 solutionSurfaceChroma=%7 solutionSurfaceBlueAmber=%8 expoIso=%9 expoShutterUs=%10 "
             "lensApertureX100=%11\n" )
             .arg( frameIndex )

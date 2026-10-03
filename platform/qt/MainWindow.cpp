@@ -15536,12 +15536,12 @@ void MainWindow::applyLookAssistToReceipt( ReceiptSettings *receipt,
     };
     // The master pass gives the recorded exposure no say: no picture evidence is asked for, so the scene is
     // the one master classified (daylight needs the evidence).
-    LookAssistScene scene = resolveLookAssistScene(
+    const LookAssistScene scene = resolveLookAssistScene(
         &stats, s_lookAssistMasterScenePass ? LookAssistRenderFn() : LookAssistRenderFn( renderProcessed ) );
     // Observation only: how the verdict and balance were reached, appended to look_assist.apply.result.
     LookAssistDecisionTrace decisionTrace;
     decisionTrace.pictureEvidenceAsked = !s_lookAssistMasterScenePass;
-    bool floorLiftedNightThumbnail =
+    const bool floorLiftedNightThumbnail =
         lookAssistIsFloorLiftedNightThumbnail( scene, stats );
     const bool processedColorWanted = lookAssistShouldAnalyzeProcessedColor( scene, stats );
     const bool canAnalyzeProcessedColor =
@@ -15719,10 +15719,8 @@ void MainWindow::applyLookAssistToReceipt( ReceiptSettings *receipt,
     // worker and 62 live) and a slower one (8 s settle window exceeded on the large clip). And when nothing
     // backs the daylight verdict the clip is re-analysed as master analyses it (the master pass below), which
     // is a sync-path analysis too. Running the one consumer path guarantees sync and async land on the same
-    // white balance, by construction. The master pass itself stays on the sync path for the same reason. So does a
-    // possible window-lit interior: its check verifies the solve on the live picture, which the worker cannot render.
-    const bool daylightNeedsLivePicture = lookAssistIsDaylightScene( stats, scene ) || s_lookAssistMasterScenePass
-                                        || lookAssistWindowLitInteriorCandidate( stats, scene );
+    // white balance, by construction. The master pass itself stays on the sync path for the same reason.
+    const bool daylightNeedsLivePicture = lookAssistIsDaylightScene( stats, scene ) || s_lookAssistMasterScenePass;
     if( !s_syncMode && !daylightNeedsLivePicture )
     {
         // Capture slider bounds (UI-thread-only values) before dispatch.
@@ -16467,19 +16465,24 @@ void MainWindow::applyLookAssistToReceipt( ReceiptSettings *receipt,
         s_lookAssistMasterScenePass = false;
         return;
     }
-    // A night verdict from a RAW floor, with no recorded exposure, whose accepted solve is daylight and verifies on the
-    // picture it was found in, is a window-lit interior: the daylight class, its preset and the accepted balance, so
-    // the night walk below does not run (shared with the headless applier).
+    // MEASURED, NOT APPLIED (LOOK-ASSIST-WINDOW-LIT-INTERIOR-1): on the owner clip the accepted solve did not verify
+    // (re-rendered at it, its own patch turns amber), so the window-lit reclassification stays off until the verdict
+    // (EV100 bound for a missing aperture) and balance (verified-surface search) follow-ons land. The check runs on
+    // copies and only logs what it measured; this pass's verdict, preset and balance are master's (shared with headless).
+    LookAssistStats windowLitStats = stats;
+    LookAssistScene windowLitScene = scene;
+    LookAssistPreset windowLitPreset = preset;
+    LookAssistWhiteBalanceRequest windowLitRequest = wbRequest;
+    windowLitRequest.stats = &windowLitStats;
     const LookAssistWindowLitCheck windowLit = resolveLookAssistWindowLitInterior(
-        wbRequest, wb, m_pMlvObject->processing->exposure_stops, &stats, &scene, &preset,
+        windowLitRequest, wb, m_pMlvObject->processing->exposure_stops, &windowLitStats, &windowLitScene, &windowLitPreset,
         useProcessedColorStats ? &processedColorStats : nullptr,
         displayStatsValidUi ? &displayStatsUi : nullptr );
-    floorLiftedNightThumbnail = lookAssistIsFloorLiftedNightThumbnail( scene, stats );
     if( windowLit.candidate )
     {
         logInteractionEvent(
             QStringLiteral("look_assist.window_lit_interior"),
-            QStringLiteral("evidence=%1 reason=%2 scene=%3 base_surface_chroma=%4 base_surface_blue_amber=%5 "
+            QStringLiteral("would_reclassify=%1 reason=%2 scene=%3 base_surface_chroma=%4 base_surface_blue_amber=%5 "
                            "solution_surface_chroma=%6 solution_surface_blue_amber=%7 frame=%8 "
                            "expo_iso=%9 expo_shutter_us=%10 lens_aperture_x100=%11")
                 .arg( bool01( windowLit.evidence ) )
