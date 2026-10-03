@@ -111,6 +111,15 @@ param(
     # Never applies to the main checkout, and never deletes a branch ref.
     [switch]$RetireWorktree,
 
+    # Disk hygiene (2026-10-03): the gate above runs at lane exit, BEFORE this lane's PR merges, so
+    # it always answers `unmerged` and nothing asks again after the merge; lane worktrees piled up
+    # at ~10 GiB/day. So every lane exit also re-asks the SAME gate (Invoke-SweepMergedLaneWorktrees)
+    # about every OTHER linked worktree under -WorktreeSweepRoot. ON BY DEFAULT; -NoWorktreeSweep
+    # (or a -WorktreeSweepRoot inside a test's tmp dir) opts out. The outcome is the receipt's
+    # `worktreeSweep`; it can never throw or block the receipt.
+    [string]$WorktreeSweepRoot = 'C:\mlvtmp',
+    [switch]$NoWorktreeSweep,
+
     # Lane scratch. The child's TEMP/TMP point at <ScratchRoot>\<lane>-NNN, never bare
     # %TEMP% (which every project on this box shares). C:\mlvtmp is a DiskGuard-registered
     # MLV root. The run's own scratch dir is removed when the lane exits unless -KeepScratch;
@@ -1555,6 +1564,23 @@ if ($RetireWorktree) {
         $worktreeDisposition = [ordered]@{ action = 'kept'; reason = "cannot-determine: $($_.Exception.Message)" }
     }
 }
+# Sweep AFTER the block above: this lane's own worktree is -Exclude'd (it was just judged, or
+# deliberately kept), and its RunDir is protected so a receipt directory is never swept away.
+$worktreeSweep = $null
+if (-not $NoWorktreeSweep) {
+    try {
+        . (Join-Path $PSScriptRoot 'Retire-LaneWorktree.ps1')
+        $commonOut = @(& git -C $PSScriptRoot rev-parse --path-format=absolute --git-common-dir 2>$null)
+        $commonDir = if ($commonOut.Count) { [string]$commonOut[0] } else { $null }
+        if (-not $commonDir -or -not (Test-Path -LiteralPath $commonDir)) { throw 'cannot resolve board root from git common dir' }
+        $boardRoot = Split-Path -Parent ($commonDir -replace '/', '\')
+        $worktreeSweep = Invoke-SweepMergedLaneWorktrees -RepoRoot $boardRoot -Root $WorktreeSweepRoot `
+            -Exclude @($WorkDir) -ProtectPath @($RunDir) `
+            -QuarantineRoot (Join-Path $boardRoot ('.claude-state\disk-hygiene\quarantine\lane-exit\' + (Get-Date).ToUniversalTime().ToString('yyyyMMdd')))
+    } catch {
+        $worktreeSweep = [ordered]@{ error = "cannot-determine: $($_.Exception.Message)" }
+    }
+}
 # `processEnded` records that the child exited; `complete` records POSITIVE evidence that the WORK
 # finished (exit 0 and, for claude, a success envelope). Until 2026-09-14 `complete` meant only the
 # former, so an exit-1 error_max_turns run was receipted state=complete, complete=true.
@@ -1755,6 +1781,7 @@ $receipt = [ordered]@{
     containment  = $containment
     scratch      = $scratchDisposition
     worktreeDisposition = $worktreeDisposition
+    worktreeSweep = $worktreeSweep
     processEnded = $processEnded
     complete     = $workCompleted
     workEvidence = $workEvidence
