@@ -1642,7 +1642,7 @@ function Get-AttrCudaLegTimeBudget {
     $smokeCeilingClamped = $false
     if ($smokeProcessTimeoutMs -gt 3600000 -and $ShareSmokeCeiling) {
         # CPU-LEG-SMOKE-CEILING-1: the job's own FULL margined identity read ($identityReadSec) runs BEFORE the runner and stays in jobTimeoutSec below, so
-        # what the runner's 3 600 s must hold is only the app's re-read of a clip that was just read (page cache), at the ceiling's remainder. It is
+        # what the runner's 3 600 s must hold is only the app's re-read of an input that was just read (page cache), at the ceiling's remainder. It is
         # shrunk to that remainder, never below the measured worst-case read with NO margin; the margin the unclamped budget would have carried is
         # what is given up, and the result says so (smokeCeilingClamped / appReadAllowanceSec).
         $appReadAllowanceSec = 3600 - $fixedSmokeSec
