@@ -300,10 +300,38 @@ struct SourceFrameAdvanceCounter
 constexpr double kMinSustainedPaceFraction = 0.5;
 constexpr int kPlaySafetyMarginMs = 15000;
 constexpr int64_t kPaceProbeMs = 8000;   // the measured pace is only trusted after this much Play wall clock
-inline int64_t playSafetyMs( double requestedSeconds )
+
+// CPU-LOOK-LEG-PACE-ABORT-1: a CPU-backend leg's frame rate is informational (docs/dual-venue-evidence.md), so its pace
+// is MEASURED, never gated. PlayPaceMode::MeasuredInformational is armed only by the launcher's MLVAPP_PLAY_PACE_MODE
+// =informational (the dual-venue CPU job); every other run -- CUDA legs, the interactive app, every other automation --
+// is Gated and byte-for-byte what it was. Informational: the in-Play pace probe never ends the run, and the wall budget
+// is the CPU CEILING requested / kCpuInformationalMinPaceFraction + kPlaySafetyMarginMs (25 s of footage: 765 s =
+// 12.75 min). Reaching the ceiling first is the typed PLAY_SAFETY_TIMEOUT, never a hang. The 20 s window, the
+// source-frame count, no-loop / no-replay, the run nonce and settings isolation are not touched by the mode.
+// tools/profiling/gui-smoke-length-gate.ps1 mirrors the fraction (a parity test compares them).
+enum class PlayPaceMode { Gated, MeasuredInformational };
+constexpr double kCpuInformationalMinPaceFraction = 1.0 / 30.0;
+inline double minSustainedPaceFractionFor( PlayPaceMode mode )
 {
-    return static_cast<int64_t>( std::max( 0.0, requestedSeconds ) / kMinSustainedPaceFraction * 1000.0 )
+    return mode == PlayPaceMode::MeasuredInformational ? kCpuInformationalMinPaceFraction : kMinSustainedPaceFraction;
+}
+// Fail closed: only the exact word switches the gate off; unset, empty or anything else stays Gated.
+inline PlayPaceMode playPaceModeFromEnvironmentValue( const char *value )
+{
+    return value && std::string( value ) == "informational" ? PlayPaceMode::MeasuredInformational : PlayPaceMode::Gated;
+}
+inline int64_t playSafetyMs( double requestedSeconds, PlayPaceMode mode = PlayPaceMode::Gated )
+{
+    return static_cast<int64_t>( std::max( 0.0, requestedSeconds ) / minSustainedPaceFractionFor( mode ) * 1000.0 )
          + kPlaySafetyMarginMs;
+}
+
+// The pace actually measured so far: source-frame steps advanced per second of Play wall clock. 0 when not measurable
+// (fewer than two frames or no elapsed time). A CPU leg records it; nothing gates on it.
+inline double measuredPaceFps( int64_t consumed, int64_t elapsedMs )
+{
+    if( consumed < 2 || elapsedMs <= 0 ) return 0.0;
+    return static_cast<double>( consumed - 1 ) * 1000.0 / static_cast<double>( elapsedMs );
 }
 
 // True when the pace MEASURED so far (consumed frames over elapsed Play wall clock) cannot reach `required` frames
@@ -325,12 +353,16 @@ enum class PlayStopState { Continue, Reached, EndedEarly, SafetyTimeout, PaceToo
 // clock that ran out first is SafetyTimeout; a pace that cannot make it in time is PaceTooSlow. required <= 0 can
 // never be reached.
 inline PlayStopState evaluatePlayStop( int64_t consumed, int64_t required, bool playStillRunning,
-                                       int64_t elapsedMs, int64_t safetyMs )
+                                       int64_t elapsedMs, int64_t safetyMs,
+                                       PlayPaceMode mode = PlayPaceMode::Gated )
 {
     if( required > 0 && consumed >= required ) return PlayStopState::Reached;
     if( !playStillRunning ) return PlayStopState::EndedEarly;
     if( elapsedMs >= safetyMs ) return PlayStopState::SafetyTimeout;
-    if( playPaceProjectsPastBudget( consumed, required, elapsedMs, safetyMs ) ) return PlayStopState::PaceTooSlow;
+    // CPU-LOOK-LEG-PACE-ABORT-1: the pace probe is the Gated mode's only; an informational run measures its pace and
+    // runs on to the requirement or to the (ceiling) safety timeout above.
+    if( mode == PlayPaceMode::Gated
+        && playPaceProjectsPastBudget( consumed, required, elapsedMs, safetyMs ) ) return PlayStopState::PaceTooSlow;
     return PlayStopState::Continue;
 }
 
@@ -403,7 +435,8 @@ inline CutRange engineCutRangeForPlay( int cutIn, int cutOut, int totalFrames, b
 inline PlayableWindowVerdict evaluatePlayableWindow(
     int positionFrame, int cutIn, int cutOut, int totalFrames, double fps,
     double requestedSeconds, double floorSeconds = kMinPlayWindowSeconds,
-    bool collapsedRangeRepairEnabled = true, double paceFps = kPaceIsNative )
+    bool collapsedRangeRepairEnabled = true, double paceFps = kPaceIsNative,
+    PlayPaceMode paceMode = PlayPaceMode::Gated )
 {
     PlayableWindowVerdict v;
     v.requiredSeconds = std::max( floorSeconds, requestedSeconds );
@@ -433,7 +466,7 @@ inline PlayableWindowVerdict evaluatePlayableWindow(
     // Pace: the engine must be able to consume requiredFrames inside the caller's safety budget. Computed before
     // any verdict so even a refusal reports the pace the gate measured with.
     v.paceFps = paceFps == kPaceIsNative ? fps : paceFps;
-    v.wallBudgetSeconds = static_cast<double>( playSafetyMs( requestedSeconds ) ) / 1000.0;
+    v.wallBudgetSeconds = static_cast<double>( playSafetyMs( requestedSeconds, paceMode ) ) / 1000.0;
     v.wallNeededSeconds = v.paceFps > 0.0
         ? static_cast<double>( std::max<int64_t>( 0, v.requiredFrames - 1 ) ) / v.paceFps
         : 0.0;

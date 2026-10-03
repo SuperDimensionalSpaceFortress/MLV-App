@@ -99,6 +99,14 @@ static QString automationRunNonce()
     return QString::fromStdString( playback_frame_range::sanitizeRunNonce( qgetenv( "MLVAPP_RUN_NONCE" ).constData() ) );
 }
 
+// CPU-LOOK-LEG-PACE-ABORT-1: the pace mode of this process's automation Play. MLVAPP_PLAY_PACE_MODE=informational is set
+// ONLY by the smoke runner's -CpuPlayPaceInformational (the dual-venue CPU job: a CPU leg's frame rate is informational);
+// unset, empty or anything else is Gated, exactly the behaviour every other run had. See playback_frame_range::PlayPaceMode.
+static playback_frame_range::PlayPaceMode automationPlayPaceMode()
+{
+    return playback_frame_range::playPaceModeFromEnvironmentValue( qgetenv( "MLVAPP_PLAY_PACE_MODE" ).constData() );
+}
+
 // UM-DISPLAY-QT-WINDOWS-MAPPING-PROOF-1: the Windows GDI device (\\.\DISPLAYn) of a QScreen, or an
 // empty string when it cannot be established uniquely (never a guess). Measured on UM: QScreen::name()
 // is the EDID friendly name ("PA329C"), NOT the GDI name, so the device is derived from the screen's
@@ -2321,7 +2329,7 @@ MainWindow::MainWindow(int &argc, char **argv, QWidget *parent) :
                              [this, autoplayPoll, autoplayClock, autoplayExit]()
                     {
                         const playback_frame_range::PlayStopState autoplayState =
-                            programmaticPlayState( autoplayClock->elapsed(), playback_frame_range::playSafetyMs( m_playRequestedSeconds ) );
+                            programmaticPlayState( autoplayClock->elapsed(), playback_frame_range::playSafetyMs( m_playRequestedSeconds, automationPlayPaceMode() ) );
                         if( autoplayState == playback_frame_range::PlayStopState::Continue ) return;
                         autoplayPoll->stop();
                         autoplayPoll->deleteLater();
@@ -7395,7 +7403,7 @@ int MainWindow::runHeadlessPlaybackProfile(const PlaybackProfileOptions & option
             autoSettleClock.start();
             // ENFORCE-3: the settle holds Play until the engine has CONSUMED the source frames of the 20 s window
             // (programmaticPlayState), not until 20000 ms of wall clock; the wall clock is only the safety net.
-            const qint64 autoSettleSafetyMs = playback_frame_range::playSafetyMs( m_playRequestedSeconds );
+            const qint64 autoSettleSafetyMs = playback_frame_range::playSafetyMs( m_playRequestedSeconds, automationPlayPaceMode() );
             playback_frame_range::PlayStopState autoSettleState = playback_frame_range::PlayStopState::Continue;
             while( ( autoSettleState = programmaticPlayState( autoSettleClock.elapsed(), autoSettleSafetyMs ) )
                    == playback_frame_range::PlayStopState::Continue )
@@ -7756,7 +7764,7 @@ int MainWindow::runHeadlessPlaybackProfile(const PlaybackProfileOptions & option
         {
             // ENFORCE-3: hold until the engine has CONSUMED the source frames of the 20 s window; a Play the
             // engine ended first is EndedEarly and the wall clock is only the safety net (a typed failure).
-            const qint64 playActionSafetyMs = playback_frame_range::playSafetyMs( m_playRequestedSeconds );
+            const qint64 playActionSafetyMs = playback_frame_range::playSafetyMs( m_playRequestedSeconds, automationPlayPaceMode() );
             while( ( playActionState = programmaticPlayState( playActionClock.elapsed(), playActionSafetyMs ) )
                    == playback_frame_range::PlayStopState::Continue )
             {
@@ -9244,7 +9252,7 @@ int MainWindow::runGuiPlaybackSmoke(const GuiPlaybackSmokeOptions & options)
     // admitted window required (programmaticPlayState) -- NOT when --seconds of wall clock have passed. The wall
     // clock (the window it asked for + a fixed margin, plus the stress switch time when that is requested) is only
     // the safety net, and its expiry is a typed failure below, never a pass.
-    const qint64 measuredSafetyMs = playback_frame_range::playSafetyMs( m_playRequestedSeconds )
+    const qint64 measuredSafetyMs = playback_frame_range::playSafetyMs( m_playRequestedSeconds, automationPlayPaceMode() )
         + ( options.exerciseClipLifecycleStress ? qMax( 0, options.stressSwitchAtMs ) : 0 );
     playback_frame_range::PlayStopState measuredState = playback_frame_range::PlayStopState::Continue;
     for( ;; )
@@ -27353,7 +27361,7 @@ playback_frame_range::PlayableWindowVerdict MainWindow::checkPlayableWindow( con
         totalFrames, fps, requestedSeconds,
         playback_frame_range::kMinPlayWindowSeconds,
         !f3CutRangeRepairDisabledByEnvironment(),
-        enginePaceFps > 0.0 ? enginePaceFps : -1.0 );
+        enginePaceFps > 0.0 ? enginePaceFps : -1.0, automationPlayPaceMode() );
 }
 
 bool MainWindow::programmaticPlay( const char *site, double requestedSeconds )
@@ -27438,7 +27446,7 @@ bool MainWindow::programmaticPlay( const char *site, double requestedSeconds )
 
     logInteractionEvent(
         QStringLiteral("play_gate.admitted"),
-        QStringLiteral("site=%1 clip_seconds=%2 playable_seconds=%3 required_seconds=%4 position=%5 cut_in=%6 cut_out=%7 required_source_frames=%8 playable_frames=%9 pace_fps=%10")
+        QStringLiteral("site=%1 clip_seconds=%2 playable_seconds=%3 required_seconds=%4 position=%5 cut_in=%6 cut_out=%7 required_source_frames=%8 playable_frames=%9 pace_fps=%10 pace_mode=%11")
             .arg( QString::fromLatin1( site ) )
             .arg( verdict.clipSeconds, 0, 'f', 3 )
             .arg( verdict.playableSeconds, 0, 'f', 3 )
@@ -27448,7 +27456,9 @@ bool MainWindow::programmaticPlay( const char *site, double requestedSeconds )
             .arg( ui->spinBoxCutOut->value() )
             .arg( static_cast<qlonglong>( verdict.requiredFrames ) )
             .arg( verdict.playableFrames )
-            .arg( verdict.paceFps, 0, 'f', 3 ) );
+            .arg( verdict.paceFps, 0, 'f', 3 )
+            .arg( automationPlayPaceMode() == playback_frame_range::PlayPaceMode::MeasuredInformational
+                  ? QStringLiteral( "informational" ) : QStringLiteral( "gated" ) ) );
     // ENFORCE-3: the admitted Play must CONSUME verdict.requiredFrames distinct source frames; the counter is
     // reset here so it measures THIS Play (the toggled handler arms it at the effective start position).
     m_sourceAdvance = playback_frame_range::SourceFrameAdvanceCounter();
@@ -27470,7 +27480,7 @@ void MainWindow::programmaticStop( const char *site )
 playback_frame_range::PlayStopState MainWindow::programmaticPlayState( qint64 elapsedMs, qint64 safetyMs ) const
 {
     return playback_frame_range::evaluatePlayStop(
-        m_sourceAdvance.consumed(), m_playRequiredSourceFrames, ui->actionPlay->isChecked(), elapsedMs, safetyMs );
+        m_sourceAdvance.consumed(), m_playRequiredSourceFrames, ui->actionPlay->isChecked(), elapsedMs, safetyMs, automationPlayPaceMode() );
 }
 
 bool MainWindow::programmaticPlayConsumed() const
