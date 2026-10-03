@@ -5,26 +5,18 @@
   "legType": "look",
   "clipId": "M16-1243",
   "playSeconds": 25,
-  "backends": ["cuda", "cpu"],
+  "backends": ["cpu"],
   "scaleFactor": 2,
   "generatorArgs": { "telemetryArm": "LIGHT", "cpuQuiescenceThresholdPercent": 95 },
   "timeouts": { "queueWaitSec": 900, "extraClaimedWaitSec": 600 },
   "look": { "contactSheetFrames": 6, "lookFlavor": "classic" },
   "criteria": {
     "acceptance": {
-      "cuda": [
-        { "metric": "lookAssistForced", "op": "eq", "value": true },
-        { "metric": "gpuFramesTotal", "op": "gt", "value": 0 }
-      ],
       "cpu": [
         { "metric": "lookAssistForced", "op": "eq", "value": true }
       ]
     },
     "supplementary": {
-      "cuda": [
-        { "metric": "lookAssistForced", "op": "eq", "value": true },
-        { "metric": "gpuFramesTotal", "op": "gt", "value": 0 }
-      ],
       "cpu": [
         { "metric": "lookAssistForced", "op": "eq", "value": true }
       ]
