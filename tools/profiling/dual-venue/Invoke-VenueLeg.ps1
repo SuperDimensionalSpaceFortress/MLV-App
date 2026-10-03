@@ -543,7 +543,8 @@ if ($outcome -eq 'CAPTURED') {
     $criteria = $spec.criteria.$role.$Backend
     $verdictCriteria = Test-DvCriteria -Criteria $criteria -Metrics $receipt.metrics
     $sheetMissing = $isLook -and ($null -eq $receipt.look -or $null -eq $receipt.look.contactSheet)
-    if (-not $scale.honoured) {
+    # (a capture that published NO run log has no proof at all -- no rendered scale to read, no source frames -- and ends INVALID below, not here)
+    if (-not $scale.honoured -and $null -ne $runLogText) {
         $declared = $(if ([int]$scale.acceptedEffectiveScale -ne [int]$scale.requestedScale) { "the spec declares this backend renders at $($scale.acceptedEffectiveScale)" } else { 'no clamp is declared for this backend' })
         $outcome = 'SCALE_NOT_HONOURED'
         $detail = "CAPTURED but $scaleNote (read from: $($scale.effectiveScaleSource); $declared). A run that did not render at the scale this leg names is no signal under it: the leg is not passed or failed"

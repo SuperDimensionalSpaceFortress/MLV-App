@@ -1790,7 +1790,7 @@ class JobTerminalsAndHardeningTests(RunnerHarness, unittest.TestCase):
         local = self.tmp / ".claude-state" / "sheets"
         proc, receipt, _ = self.run_leg("ultra-magnus", self.write_spec(leg_type="look"), extra=["-SheetCopyDir", str(local), "-Backend", "cpu"])
         self.assertEqual(receipt["outcome"], "PASS", receipt["outcomeDetail"])
-        self.assertTrue((local / "sheet-ultra-magnus-cpu-classic.png").exists())
+        self.assertTrue((local / "sheet-unit-leg-ultra-magnus-cpu-classic.png").exists())
 
     def test_mutation_without_the_sheet_copy_guard_an_owner_sheet_is_copied_anywhere(self) -> None:
         mutated = self.mutated_runner([("Invoke-VenueLeg.ps1", "if (-not [string]::IsNullOrWhiteSpace($SheetCopyDir) -and -not (Test-DvUnderClaudeState -Path $SheetCopyDir)) {", "if ($false) {")])
@@ -3631,7 +3631,7 @@ class PlaybackScaleIsRequestedAndEffectiveTests(EvidenceFactory, ModuleMutationM
         self.assertEqual(self.two_look_legs_into_one_directory(dv), ["sheet-ultra-magnus-cpu-classic.png"])
 
     def test_mutation_without_the_runner_gate_the_clamped_run_passes(self) -> None:
-        dv = self.mutated_runner([("Invoke-VenueLeg.ps1", "if (-not $scale.honoured) {", "if ($false) {")])
+        dv = self.mutated_runner([("Invoke-VenueLeg.ps1", "if (-not $scale.honoured -and $null -ne $runLogText) {", "if ($false) {")])
         self.write_artifacts(line=CLAMPED_TO_1)
         _, receipt, _ = self.run_leg("ultra-magnus", self.write_spec(scale=2), extra=["-Backend", "cuda"], dv=dv)
         self.assertEqual(receipt["outcome"], "PASS", "with the gate removed the clamped run passes; so the gate is what stops it")
