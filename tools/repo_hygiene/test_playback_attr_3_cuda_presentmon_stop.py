@@ -123,7 +123,7 @@ class _ProbeCase(unittest.TestCase):
 
     def _functions(self) -> str:
         text = _generator_text()
-        start = text.index("function Test-PresentMonTraceReady(")
+        start = text.index("function Start-PresentMonCapture(")
         return text[start:text.index("\nfunction Get-FrameRows(", start)]
 
     def run_probe(self, body: str) -> subprocess.CompletedProcess:
@@ -134,6 +134,8 @@ class _ProbeCase(unittest.TestCase):
             "$Cache = 'C:\\no-such-cache'\n$PresentMonName = 'PresentMon-2.5.1-x64.exe'\n"
             "$ExeName = 'MLVApp.exe'\n$PresentMonTimedSeconds = 133\n$PresentMonTerminateOnProcExit = $true\n"
             "$PresentMonSessionName = ''\n"
+            # the readiness table the template creates before it calls Start-PresentMonCapture
+            "$presentMonTraceReadiness = [ordered]@{ verified = $false; readyUtc = $null; waitedMs = $null; timeoutSeconds = $null; reason = 'not recorded' }\n"
             + self._functions() + "\n" + body,
             encoding="utf-8",
         )
@@ -145,7 +147,7 @@ class StartExecutedTests(_ProbeCase):
         out = self.tmp / "args.json"
         proc = self.run_probe(
             "function Start-Sleep { }\n"
-            "function Test-PresentMonTraceReady($Proc) { [pscustomobject]@{ ready = $true; detail = 'stub' } }\n"
+            "function Test-AttrCudaPresentMonTraceReady($Proc) { [pscustomobject]@{ ready = $true; detail = 'stub' } }\n"
             "function Start-Process {\n"
             "    param($FilePath, $ArgumentList, [switch]$PassThru, $WindowStyle)\n"
             f"    $ArgumentList | ConvertTo-Json | Set-Content -LiteralPath '{out}' -Encoding UTF8\n"
@@ -192,21 +194,33 @@ class TraceReadinessStaticTests(unittest.TestCase):
     def test_the_start_function_no_longer_trusts_a_fixed_sleep_and_liveness(self) -> None:
         start = _function_body(_template(), "Start-PresentMonCapture")
         self.assertNotIn("Start-Sleep -Seconds 3", start)
-        self.assertIn("Test-PresentMonTraceReady", start)
-        self.assertIn("$script:PresentMonTraceReadiness", start)
+        self.assertIn("Test-AttrCudaPresentMonTraceReady", start)
+        self.assertIn("$presentMonTraceReadiness['readyUtc'] = $readyUtc", start)
+
+    def test_the_probe_lives_in_the_module_and_is_embedded_not_compiled_in_the_scanned_template(self) -> None:
+        # The template is write-scanned (attr3_publish_write_scan.ps1: no Add-Type, no unlisted static
+        # members); the module is the runtime helper boundary and already defines Win32 surface with Add-Type.
+        template = _template()
+        self.assertNotIn("Add-Type", _function_body(template, "Start-PresentMonCapture"))
+        self.assertIn("'Test-AttrCudaPresentMonTraceReady',", _generator_text())
+        self.assertNotIn("Stopwatch", _function_body(template, "Start-PresentMonCapture"))
+        self.assertNotIn("$script:PresentMonTraceReadiness", template)
 
     def test_the_probe_is_the_message_pump_of_the_presentmon_window_of_that_process(self) -> None:
-        probe = _function_body(_template(), "Test-PresentMonTraceReady")
-        self.assertIn("MlvPresentMonProbe", probe)
-        self.assertIn("'PresentMon'", probe)  # RegisterClassExW lpszClassName in MainThread.cpp
-        self.assertIn("'PresentMonWnd'", probe)  # CreateWindowExW title
+        module = MODULE.read_text(encoding="utf-8")
+        start = module.index("function Test-AttrCudaPresentMonTraceReady {")
+        probe = module[start:module.index("\nfunction ", start + 1)]
+        self.assertIn('"PresentMon", "PresentMonWnd"', probe)  # RegisterClassExW class / CreateWindowExW title in MainThread.cpp
         self.assertIn("SendMessageTimeoutW", probe)
+        self.assertIn("GetWindowThreadProcessId", probe)
         self.assertIn("$Proc.Id", probe)
+        self.assertIn("Test-AttrCudaPresentMonTraceReady, `", module)
 
     def test_the_bracket_late_end_is_the_verified_ready_instant_before_the_app_is_launched(self) -> None:
         template = _template()
-        late_end = template.index("$presentMonPostSpawnUtc = $presentMonTraceReadiness.readyUtc")
+        late_end = template.index("$presentMonPostSpawnUtc = $presentMonTraceReadiness['readyUtc']")
         self.assertLess(template.index("$presentMonProc = Start-PresentMonCapture $presentMonPath"), late_end)
+        self.assertLess(template.index("$presentMonTraceReadiness = [ordered]@{"), template.index("$presentMonProc = Start-PresentMonCapture $presentMonPath"))
         self.assertLess(late_end, template.index("step smoke-launch start"))
         self.assertIn("step presentmon-trace-ready verified=", template)
 
@@ -233,7 +247,7 @@ class TraceReadinessExecutedTests(_ProbeCase):
         body = (
             "$global:polls = 0\n"
             "function Start-Sleep { }\n"
-            "function Test-PresentMonTraceReady($Proc) {\n"
+            "function Test-AttrCudaPresentMonTraceReady($Proc) {\n"
             "    $global:polls++\n"
             "    [System.Threading.Thread]::Sleep(5)\n"
             "    $global:lastAnswerUtc = (Get-Date).ToUniversalTime().ToString('o')\n"
@@ -291,11 +305,11 @@ class TraceReadinessExecutedTests(_ProbeCase):
         self.assertIsNone(result["readiness"]["readyUtc"])
 
     def test_the_real_probe_on_a_process_with_no_presentmon_window_is_not_ready(self) -> None:
-        # No stubs: the real Test-PresentMonTraceReady against this very pwsh (no 'PresentMon' message window).
+        # No stubs: the real Test-AttrCudaPresentMonTraceReady against this very pwsh (no 'PresentMon' message window).
         out = self.tmp / "probe.json"
         proc = self.run_probe(
             "$p = Get-Process -Id $PID\n"
-            f"Test-PresentMonTraceReady $p | ConvertTo-Json | Set-Content -LiteralPath '{out}' -Encoding UTF8\n"
+            f"Test-AttrCudaPresentMonTraceReady $p | ConvertTo-Json | Set-Content -LiteralPath '{out}' -Encoding UTF8\n"
         )
         self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
         result = json.loads(out.read_text(encoding="utf-8-sig"))
@@ -339,18 +353,18 @@ class TraceReadinessExecutedTests(_ProbeCase):
             "try {\n"
             "    $busy = $null; $deadline = (Get-Date).AddSeconds(30)\n"
             "    while ((Get-Date) -lt $deadline) {\n"
-            "        $r = Test-PresentMonTraceReady $child\n"
+            "        $r = Test-AttrCudaPresentMonTraceReady $child\n"
             "        if ($r.detail -match 'not answering') { $busy = $r; break }\n"
             "        Start-Sleep -Milliseconds 200\n"
             "    }\n"
             f"    New-Item -ItemType File -Path '{flag}' -Force | Out-Null\n"
             "    $ready = $null; $deadline = (Get-Date).AddSeconds(30)\n"
             "    while ((Get-Date) -lt $deadline -and $null -eq $ready) {\n"
-            "        $r = Test-PresentMonTraceReady $child\n"
+            "        $r = Test-AttrCudaPresentMonTraceReady $child\n"
             "        if ($r.ready) { $ready = $r } else { Start-Sleep -Milliseconds 200 }\n"
             "    }\n"
             # another process's PresentMon window (a second capture on the host) must not make THIS pid ready
-            "    $other = Test-PresentMonTraceReady (Get-Process -Id $PID)\n"
+            "    $other = Test-AttrCudaPresentMonTraceReady (Get-Process -Id $PID)\n"
             "    [pscustomobject]@{ busy = $busy; ready = $ready; other = $other } | ConvertTo-Json -Depth 4 | "
             f"Set-Content -LiteralPath '{out}' -Encoding UTF8\n"
             "} finally { try { $child.Kill() } catch { } }\n"
