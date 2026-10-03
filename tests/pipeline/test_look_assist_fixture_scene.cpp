@@ -488,7 +488,7 @@ TEST(LookAssistFixtureScene, HeadlessRefusesABlueAtAsShotInitialPatchThroughTheR
     // Master's result for this state: the receipt's 7895 K / -12 is NOT the picture master renders (the processing
     // object holds the default 6000 K / 0 and master renders at that), and that picture has no trusted patch, so master
     // finds nothing and leaves the receipt's balance alone (night, no decision). The fallback starts from that same
-    // processing state, so it lands there; HeadlessFallbackStartsFromMastersProcessingState compares it with a fresh
+    // processing state, so it lands there; HeadlessFallbackStartsFromMastersProcessingState* compares it with a fresh
     // master-only run field for field.
     for( const FixtureClip &clip : kTrackedFixtureClips )
     {
@@ -521,23 +521,21 @@ TEST(LookAssistFixtureScene, HeadlessRefusesABlueAtAsShotInitialPatchThroughTheR
     }
 }
 
-TEST(LookAssistFixtureScene, HeadlessFallbackStartsFromMastersProcessingState)
+namespace
 {
-    // fable r2, PR #224: the daylight pass writes the receipt's base balance into the live processing object before it
-    // falls back, so master's pass used to render its picture at the RECEIPT's balance. Master renders it at the
-    // balance the object holds on entry (BatchRunner creates it at 6000 K / 0 and applyToMlv never sets one).
-    // State: receipt 7895 K / -12, processing object at its default 6000 K / 0 (staleWhiteBalance = false).
-    //
-    // Master's behaviour here is produced two ways, on a FRESH object each, and neither enters the daylight pass:
-    //  - the no-metadata run: nothing can call the clip daylight, so master's single pass is the only pass there is;
-    //  - the direct call with masterScenePass = true: the same code the fallback re-enters, from a clean start.
-    // The fallback result (switch off: always falls back; switch on with a 4800 K as-shot balance: the initial patch is
-    // refused at the as-shot base) must equal both field for field, including the balance left in the object.
+
+// One (tracked clip, arm) cell of the fable r2 / PR #224 equality below. Every headless run now also pays the display meter
+// (three full-resolution dual-ISO renders, about 9 s single-threaded on these fixtures: LOOK-ASSIST-DISPLAY-METER-ALL-SCALES-1),
+// and the whole check is 12 runs (4 of them fall back and so meter twice): about 255 s as one test, which overran its 240 s
+// solo CI shard. Each cell is 3 runs (about 75 s) and is its own test, so its own shard.
+enum FallbackArm { kArmSwitchOff = 0, kArmSwitchOnBlueAsShot = 1 };
+
+void expectFallbackIsMastersResultOnClip( const FixtureClip &clip, FallbackArm armIndex )
+{
     struct Arm { const char *name; bool switchOff; int asShotKelvin; };
     const Arm arms[] = { { "switch-off", true, 0 }, { "switch-on-blue-as-shot", false, 4800 } };
-    for( const FixtureClip &clip : kTrackedFixtureClips )
     {
-        for( const Arm &arm : arms )
+        const Arm &arm = arms[armIndex];
         {
             QString metadataFree, direct, fallback;
             QByteArray metadataFreeLog, directLog, fallbackLog;
@@ -580,6 +578,39 @@ TEST(LookAssistFixtureScene, HeadlessFallbackStartsFromMastersProcessingState)
             (void)arm.name;
         }
     }
+}
+
+} // namespace
+
+// fable r2, PR #224: the daylight pass writes the receipt's base balance into the live processing object before it
+// falls back, so master's pass used to render its picture at the RECEIPT's balance. Master renders it at the
+// balance the object holds on entry (BatchRunner creates it at 6000 K / 0 and applyToMlv never sets one).
+// State: receipt 7895 K / -12, processing object at its default 6000 K / 0 (staleWhiteBalance = false).
+//
+// Master's behaviour here is produced two ways, on a FRESH object each, and neither enters the daylight pass:
+//  - the no-metadata run: nothing can call the clip daylight, so master's single pass is the only pass there is;
+//  - the direct call with masterScenePass = true: the same code the fallback re-enters, from a clean start.
+// The fallback result (switch off: always falls back; switch on with a 4800 K as-shot balance: the initial patch is
+// refused at the as-shot base) must equal both field for field, including the balance left in the object.
+// Four tests, one per (tracked clip, arm), each the same expectFallbackIsMastersResultOnClip.
+TEST(LookAssistFixtureScene, HeadlessFallbackStartsFromMastersProcessingStateOnTheTinyFixtureSwitchOff)
+{
+    expectFallbackIsMastersResultOnClip( kTrackedFixtureClips[0], kArmSwitchOff );
+}
+
+TEST(LookAssistFixtureScene, HeadlessFallbackStartsFromMastersProcessingStateOnTheTinyFixtureBlueAsShot)
+{
+    expectFallbackIsMastersResultOnClip( kTrackedFixtureClips[0], kArmSwitchOnBlueAsShot );
+}
+
+TEST(LookAssistFixtureScene, HeadlessFallbackStartsFromMastersProcessingStateOnTheLargeFixtureSwitchOff)
+{
+    expectFallbackIsMastersResultOnClip( kTrackedFixtureClips[1], kArmSwitchOff );
+}
+
+TEST(LookAssistFixtureScene, HeadlessFallbackStartsFromMastersProcessingStateOnTheLargeFixtureBlueAsShot)
+{
+    expectFallbackIsMastersResultOnClip( kTrackedFixtureClips[1], kArmSwitchOnBlueAsShot );
 }
 
 TEST(LookAssistFixtureScene, HeadlessFallbackStartsFromMastersProcessingStateAtANonZeroEntryTint)
