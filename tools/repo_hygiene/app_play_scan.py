@@ -95,7 +95,7 @@ REVIEWED_PLAY_STOPS = {
 PINNED_STOP_STATEMENTS = {
     "MainWindow::MainWindow": (
         "const playback_frame_range::PlayStopState autoplayState = programmaticPlayState( autoplayClock->elapsed(), "
-        "playback_frame_range::playSafetyMs( m_playRequestedSeconds ) ); "
+        "playback_frame_range::playSafetyMs( m_playRequestedSeconds, automationPlayPaceMode() ) ); "
         "if( autoplayState == playback_frame_range::PlayStopState::Continue ) return; autoplayPoll->stop(); "
         "autoplayPoll->deleteLater(); if( ui->actionPlay->isChecked() ) { ui->actionPlay->setChecked( false ); "
         "on_actionPlay_triggered( false ); }",
@@ -123,7 +123,7 @@ PINNED_STOP_STATEMENTS = {
         ".arg( automationRunNonce() );",
     ),
     "MainWindow::runHeadlessPlaybackProfile": (
-        "const qint64 autoSettleSafetyMs = playback_frame_range::playSafetyMs( m_playRequestedSeconds ); "
+        "const qint64 autoSettleSafetyMs = playback_frame_range::playSafetyMs( m_playRequestedSeconds, automationPlayPaceMode() ); "
         "playback_frame_range::PlayStopState autoSettleState = playback_frame_range::PlayStopState::Continue; "
         "while( ( autoSettleState = programmaticPlayState( autoSettleClock.elapsed(), autoSettleSafetyMs ) ) "
         "== playback_frame_range::PlayStopState::Continue ) { qApp->processEvents( QEventLoop::AllEvents ); "
@@ -131,7 +131,7 @@ PINNED_STOP_STATEMENTS = {
         "if( autoSettleState != playback_frame_range::PlayStopState::Reached )",
         "&& !m_lastLookAssistDiagnosticsValid && playback_frame_range::lookAssistSettleNeedsOwnPlay( "
         "m_programmaticPlayLedger.admitted ) ) {",
-        "const qint64 playActionSafetyMs = playback_frame_range::playSafetyMs( m_playRequestedSeconds ); "
+        "const qint64 playActionSafetyMs = playback_frame_range::playSafetyMs( m_playRequestedSeconds, automationPlayPaceMode() ); "
         "while( ( playActionState = programmaticPlayState( playActionClock.elapsed(), playActionSafetyMs ) ) "
         "== playback_frame_range::PlayStopState::Continue ) { qApp->processEvents( QEventLoop::AllEvents ); "
         "QThread::msleep( 10 ); } playActionEndedEarly = playActionState == playback_frame_range::PlayStopState::EndedEarly;",
@@ -160,7 +160,7 @@ PINNED_STOP_STATEMENTS = {
         "return playback_frame_range::evaluatePlayableWindow( ui->horizontalSliderPosition->value(), "
         "ui->spinBoxCutIn->value(), ui->spinBoxCutOut->value(), totalFrames, fps, requestedSeconds, "
         "playback_frame_range::kMinPlayWindowSeconds, !f3CutRangeRepairDisabledByEnvironment(), "
-        "enginePaceFps > 0.0 ? enginePaceFps : -1.0 );",
+        "enginePaceFps > 0.0 ? enginePaceFps : -1.0, automationPlayPaceMode() );",
         "const double enginePaceFps = getFramerate();",
     ),
     "MainWindow::programmaticPlay": (
@@ -175,7 +175,7 @@ PINNED_STOP_STATEMENTS = {
     ),
     "MainWindow::programmaticPlayState": (
         "return playback_frame_range::evaluatePlayStop( m_sourceAdvance.consumed(), m_playRequiredSourceFrames, "
-        "ui->actionPlay->isChecked(), elapsedMs, safetyMs );",
+        "ui->actionPlay->isChecked(), elapsedMs, safetyMs, automationPlayPaceMode() );",
     ),
     "MainWindow::programmaticPlayConsumed": (
         "return m_playRequiredSourceFrames > 0 && m_sourceAdvance.consumed() >= m_playRequiredSourceFrames;",
