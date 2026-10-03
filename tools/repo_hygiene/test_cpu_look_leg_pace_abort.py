@@ -122,9 +122,9 @@ def check_main_window_text(text: str) -> list[str]:
         problems.append("the app does not read the pace mode")
     if text.count("playback_frame_range::playSafetyMs( m_playRequestedSeconds, automationPlayPaceMode() )") != 4:
         problems.append("a safety-net budget ignores the pace mode")
-    if "elapsedMs, safetyMs,\n        automationPlayPaceMode() );" not in lf(text):
+    if "elapsedMs, safetyMs, automationPlayPaceMode() );" not in text:
         problems.append("the stop decision ignores the pace mode")
-    if "enginePaceFps > 0.0 ? enginePaceFps : -1.0,\n        automationPlayPaceMode() );" not in lf(text):
+    if "enginePaceFps > 0.0 ? enginePaceFps : -1.0, automationPlayPaceMode() );" not in text:
         problems.append("the admission ignores the pace mode")
     return problems
 
@@ -309,7 +309,7 @@ class CpuPaceGeneratedJobs(unittest.TestCase):
             kinds = {"switch": 0, "mode": 0, "pace": 0, "smoke_timeout": 0, "presentmon_timeout": 0}
             for line in changed:
                 body = line[1:]
-                if "-CpuPlayPaceInformational" in body:
+                if "-CpuPlayPaceInformational" in body or body.startswith("$cmd = "):
                     kinds["switch"] += 1
                 elif "cpuPaceInformational" in body:
                     kinds["mode"] += 1

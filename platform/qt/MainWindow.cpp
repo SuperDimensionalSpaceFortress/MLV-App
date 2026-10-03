@@ -27405,8 +27405,7 @@ playback_frame_range::PlayableWindowVerdict MainWindow::checkPlayableWindow( con
         totalFrames, fps, requestedSeconds,
         playback_frame_range::kMinPlayWindowSeconds,
         !f3CutRangeRepairDisabledByEnvironment(),
-        enginePaceFps > 0.0 ? enginePaceFps : -1.0,
-        automationPlayPaceMode() );
+        enginePaceFps > 0.0 ? enginePaceFps : -1.0, automationPlayPaceMode() );
 }
 
 bool MainWindow::programmaticPlay( const char *site, double requestedSeconds )
@@ -27525,8 +27524,7 @@ void MainWindow::programmaticStop( const char *site )
 playback_frame_range::PlayStopState MainWindow::programmaticPlayState( qint64 elapsedMs, qint64 safetyMs ) const
 {
     return playback_frame_range::evaluatePlayStop(
-        m_sourceAdvance.consumed(), m_playRequiredSourceFrames, ui->actionPlay->isChecked(), elapsedMs, safetyMs,
-        automationPlayPaceMode() );
+        m_sourceAdvance.consumed(), m_playRequiredSourceFrames, ui->actionPlay->isChecked(), elapsedMs, safetyMs, automationPlayPaceMode() );
 }
 
 bool MainWindow::programmaticPlayConsumed() const
