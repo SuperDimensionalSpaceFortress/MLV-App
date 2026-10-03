@@ -277,8 +277,13 @@ into one `cuda | cpu` sheet, by frame index. Each receipt's `look` block carries
 path; the pair is its own record (`mlv-app/dual-venue-sheet-pair/v1`) because receipts are never edited.
 
 * `lookFlavor` (`classic` default | `cinematic`) is in the leg spec and the receipt subject and is passed
-  to the app as `MLVAPP_LOOK_ASSIST_FLAVOR`. **The app does not read it yet** (LOOK-ASSIST-FLAVORS-1), so
-  every receipt says `lookFlavorHonored: "unknown"` -- never a claim that it applied.
+  to the app as `MLVAPP_LOOK_ASSIST_FLAVOR`. The app reads it (LOOK-ASSIST-FLAVORS-1,
+  [docs/look-assist-flavors.md](look-assist-flavors.md)) and reports the flavor it applied on
+  `gui_smoke.visual_state` (`look_assist_flavor`). The job copies that report into its summary as
+  `lookFlavorReported`; the receipt's `look` block carries `lookFlavorReported` and
+  `lookFlavorHonored` = the report equals the requested flavor (`true`), anything else is `false` (another
+  flavor, or an app that reported nothing = `none`). `"unknown"` is only for a job that never ran. The sheet
+  pair's `lookFlavorHonored` is `true` only when both legs' receipts say `true`.
 * Aesthetics are **model-judged** (Amendment 2). Receipts carry `owner_verdict: null` (optional, never
   waited on, never written by the runner) and `model_verdicts: []` (filled by the judge card).
 * **Sheets of owner footage stay local under `.claude-state`** (never committed, attached to a PR, published to

@@ -2815,6 +2815,23 @@ QGroupBox::indicator:checked:disabled {
                      </property>
                     </widget>
                    </item>
+                   <item row="3" column="0" colspan="4">
+                    <widget class="QComboBox" name="comboBoxLookAssistFlavor">
+                     <property name="toolTip">
+                      <string>Look Assist flavor. Classic is the standard conservative look. Cinematic lays a gentle S-curve, controlled highlights and modest colour over the same analysis; white balance is unchanged. Takes effect on the next Look Assist.</string>
+                     </property>
+                     <item>
+                      <property name="text">
+                       <string>Classic</string>
+                      </property>
+                     </item>
+                     <item>
+                      <property name="text">
+                       <string>Cinematic</string>
+                      </property>
+                     </item>
+                    </widget>
+                   </item>
                   </layout>
                  </item>
                 </layout>

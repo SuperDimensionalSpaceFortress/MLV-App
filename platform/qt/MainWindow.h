@@ -27,6 +27,7 @@
 #include <QSortFilterProxyModel>
 #include <QItemSelectionModel>
 #include <QToolButton>
+namespace lookassist { enum class LookAssistFlavor; }
 #include "SessionModel.h"
 #include "PlaybackFrameRange.h"
 #include "../../src/mlv_include.h"
@@ -343,6 +344,7 @@ private slots:
     void on_actionExportCurrentFrame_triggered();
     void on_checkBoxHighLightReconstruction_toggled(bool checked);
     void on_checkBoxLookAssistEnable_clicked(bool checked);
+    void on_comboBoxLookAssistFlavor_currentIndexChanged(int index);
     void on_comboBoxUseCameraMatrix_currentIndexChanged(int index);
     void on_checkBoxCreativeAdjustments_toggled(bool checked);
     void on_checkBoxExrMode_toggled(bool checked);
@@ -914,6 +916,8 @@ private:
     double m_playbackQualityLastPresentedTime = 0.0;
     PlaybackQualityAutoSampler m_playbackQualitySampler;
     bool m_lastLookAssistDiagnosticsValid = false;
+    QString m_lastWarnedLookAssistFlavorValue;
+    QString m_lastAppliedLookAssistFlavor;   // "classic" / "cinematic": what the last analysis applied (telemetry)
     QString m_lastLookAssistScene;
     double m_lastLookAssistMedian = 0.0;
     double m_lastLookAssistP05 = 0.0;
@@ -1733,6 +1737,7 @@ private:
     void applyLookAssistToReceipt( ReceiptSettings *receipt,
                                    int analysisFrame = -1 );
     void syncLookAssistDerivedUiToReceipt( ReceiptSettings *receipt );
+    lookassist::LookAssistFlavor currentLookAssistFlavor();
     void setGradientMask( void );
     uint16_t autoCorrectRawBlackLevel( void );
     uint16_t autoCorrectRawWhiteLevel( void );

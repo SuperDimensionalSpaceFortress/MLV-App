@@ -316,8 +316,9 @@ param(
     [switch]$ForceLookAssist,
 
     # DUAL-VENUE-EVIDENCE-1, AMENDMENT 2: the Look Assist flavor a LOOK leg asks for. Passed to the
-    # app as MLVAPP_LOOK_ASSIST_FLAVOR. The app does not read it yet (LOOK-ASSIST-FLAVORS-1 adds
-    # that), so every receipt records lookFlavorHonored=unknown -- never a claim that it applied.
+    # app as MLVAPP_LOOK_ASSIST_FLAVOR. The app reads it (LOOK-ASSIST-FLAVORS-1) and reports the flavor it applied
+    # on gui_smoke.visual_state (look_assist_flavor); the job records that report as lookFlavorReported and
+    # lookFlavorHonored = (reported equals requested). An app that reports nothing is 'none' -> not honoured.
     # Only emitted for a LOOK leg (-ForceLookAssist); the default 'classic' adds nothing.
     [ValidateSet('classic', 'cinematic')]
     [string]$LookFlavor = 'classic',
@@ -3976,7 +3977,8 @@ if ($isVariant) {
     lookLeg = $LookLeg
     lookAssistForced = $LookLeg
     lookFlavor = $(if ($LookLeg) { $LookFlavor } else { $null })
-    lookFlavorHonored = $(if ($LookLeg) { ''unknown'' } else { $null })
+    lookFlavorReported = $(if ($LookLeg) { $lfReported = try { [string]$resultJson.log.visualState.look_assist_flavor } catch { '''' }; if ([string]::IsNullOrEmpty($lfReported)) { $lfReported = ''none'' }; $lfReported } else { $null })
+    lookFlavorHonored = $(if ($LookLeg) { $lfReported -ceq $LookFlavor } else { $null })
 ')
 }
 

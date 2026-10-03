@@ -519,9 +519,18 @@ if ($isLook -and $artifactsShare) {
         $marker = ([IO.File]::ReadAllText($composeShare) -split "`r?`n")[0]
         if ($marker -match '^CONTACT_SHEET_COMPOSE_UNAVAILABLE') { $composeUnavailable = $marker }
     }
+    # The flavor the APP says it applied (the job copies gui_smoke.visual_state look_assist_flavor into its summary): honoured only
+    # when it equals the flavor this leg asked for. No summary at all = the job never ran = 'unknown'.
+    $lookFlavorReported = $null
+    $lookFlavorHonored = 'unknown'
+    if ($null -ne $summary -and $summary.PSObject.Properties['lookFlavorReported']) {
+        $lookFlavorReported = [string]$summary.lookFlavorReported
+        $lookFlavorHonored = ($lookFlavorReported -ceq $lookFlavor)
+    }
     $receipt.look = [ordered]@{
         legType = 'look'; lookAssistForced = $true; lookFlavor = $lookFlavor
-        lookFlavorHonored = 'unknown'   # the app does not read MLVAPP_LOOK_ASSIST_FLAVOR yet (LOOK-ASSIST-FLAVORS-1)
+        lookFlavorReported = $lookFlavorReported
+        lookFlavorHonored = $lookFlavorHonored
         contactSheet = $sheetInfo
         composeStatus = $composeUnavailable
         rawFramesDir = $(if ($null -eq $sheetInfo) { $rawLocal } else { $null })

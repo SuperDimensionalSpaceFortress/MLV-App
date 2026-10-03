@@ -295,7 +295,11 @@ class GeneratorByteIdentityAndVariantTests(unittest.TestCase):
         self.assertNotIn("defaultReceiptEnabled", text)
         self.assertNotIn("reg add", text.split("# --- verifiers, embedded VERBATIM")[0])
         self.assertIn("('MLVAPP_LOOK_ASSIST_FLAVOR=' + $LookFlavor)", text)
-        self.assertIn("lookFlavorHonored = $(if ($LookLeg) { 'unknown' } else { $null })", text)
+        # LOOK-ASSIST-FLAVORS-1: the app reads the variable and reports the flavor it applied; the job records that report
+        # (gui_smoke.visual_state look_assist_flavor, via the runner's result.log.visualState) instead of a fixed 'unknown'.
+        self.assertIn("lookFlavorReported = $(if ($LookLeg) { $lfReported = try { [string]$resultJson.log.visualState.look_assist_flavor } catch { '' }", text)
+        self.assertIn("lookFlavorHonored = $(if ($LookLeg) { $lfReported -ceq $LookFlavor } else { $null })", text)
+        self.assertNotIn("lookFlavorHonored = $(if ($LookLeg) { 'unknown' } else { $null })", text)
         self.assertNotIn("--no-look-assist", text)
 
     def test_scale_and_quiescence_parameters_reach_the_job(self) -> None:
@@ -754,6 +758,19 @@ class RunnerReceiptTests(RunnerHarness, unittest.TestCase):
         self.assertEqual(um_pass["subject"]["clipContentSha256"], CLIP_CONTENT_SHA)
 
     # -- LOOK legs: flavor passthrough and the advisory model verdicts (judge harness SHELVED) ----------
+    def test_a_look_leg_records_the_flavor_the_app_reported(self) -> None:
+        # LOOK-ASSIST-FLAVORS-1: honoured = the app's own report equals the flavor the leg asked for; anything else (another
+        # flavor, or no report from the app = 'none') is False. A job that never reported at all stays 'unknown'.
+        for reported, expected_honored in (("classic", True), ("cinematic", False), ("none", False)):
+            with self.subTest(reported=reported):
+                self.write_artifacts(sheet=True, summary={"lookFlavorReported": reported, "lookFlavorHonored": expected_honored})
+                spec = self.write_spec(leg_type="look")
+                _, receipt, _ = self.run_leg("ultra-magnus", spec, extra=["-Backend", "cpu"])
+                self.assertEqual(receipt["outcome"], "PASS", receipt["outcomeDetail"])
+                self.assertEqual(receipt["look"]["lookFlavor"], "classic")
+                self.assertEqual(receipt["look"]["lookFlavorReported"], reported)
+                self.assertIs(receipt["look"]["lookFlavorHonored"], expected_honored)
+
     def test_a_look_leg_passes_the_flavor_and_leaves_the_advisory_fields_untouched(self) -> None:
         self.write_artifacts(sheet=True)
         spec = self.write_spec(leg_type="look")

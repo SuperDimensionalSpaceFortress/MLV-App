@@ -351,10 +351,64 @@ bool lookAssistDaylightNeedsRenderedRefinement( const LookAssistStats &stats,
 
 int lookAssistDisplayTargetMedianForScene( LookAssistScene scene );
 
+/* ---- Flavors: Classic | Cinematic. ----
+ * Classic is master's Look Assist, untouched: presetForLookAssistScene returns before any flavor code, so
+ * every sliders / receipt / picture it produced stays byte-identical. Cinematic is the same analysis, the
+ * same scene verdict and the same white-balance decision, with ONE table of additive deltas
+ * (kCinematicFlavorDeltas, LookAssistAnalysis.cpp) laid over the same preset sliders -- exposure, contrast,
+ * pivot, shadows, highlights, vibrance. It never touches temperatureDelta / tintDelta. Saturation and the
+ * tone curve are not Look Assist sliders (no preset field, no baseline), so they are not used. */
+enum class LookAssistFlavor
+{
+    Classic,
+    Cinematic
+};
+
+/* "classic" / "cinematic": the one spelling used in the environment, the receipt element, the app setting
+ * and every log line. */
+QString lookAssistFlavorName( LookAssistFlavor flavor );
+
+/* Where the flavor in force came from, for the log: "env", "receipt", "app" or "default". */
+struct LookAssistFlavorSelection
+{
+    LookAssistFlavor flavor = LookAssistFlavor::Classic;
+    QString source = QStringLiteral("default");
+    // The first layer that said something said something this module does not know: Classic was taken and
+    // the consumer logs a warning carrying rejectedValue.
+    bool unknownValue = false;
+    QString rejectedValue;
+};
+
+/* Pure. Layers in priority order: the environment value (MLVAPP_LOOK_ASSIST_FLAVOR, for runs) wins over the
+ * receipt's lookAssistFlavor element, which wins over the GUI's app setting; an empty layer is skipped. The
+ * first non-empty layer decides, case-insensitively and trimmed; if it is not "classic" or "cinematic" the
+ * answer is Classic with unknownValue set -- never a silent fall through to a lower layer. */
+LookAssistFlavorSelection lookAssistSelectFlavor( const QString &environmentValue,
+                                                  const QString &receiptValue,
+                                                  const QString &appSettingValue );
+
+/* The environment variable's value as the consumers read it (empty when unset). */
+QString lookAssistFlavorEnvironmentValue();
+
+/* The Cinematic deltas for a scene, exactly as the table holds them (a test pins the table through this). */
+struct LookAssistFlavorDeltas
+{
+    int exposure = 0;
+    int contrast = 0;
+    int pivot = 0;
+    int shadows = 0;
+    int highlights = 0;
+    int vibrance = 0;
+};
+LookAssistFlavorDeltas lookAssistCinematicDeltasForScene( LookAssistScene scene );
+
+/* flavor defaults to Classic, so every caller that does not pass one is master's. The scene verdict is the
+ * caller's (always the Classic classifier); the flavor only shapes the sliders. */
 LookAssistPreset presetForLookAssistScene( LookAssistScene scene,
                                            const LookAssistStats &stats,
                                            const LookAssistStats *colorStats = nullptr,
-                                           const LookAssistStats *displayStats = nullptr );
+                                           const LookAssistStats *displayStats = nullptr,
+                                           LookAssistFlavor flavor = LookAssistFlavor::Classic );
 
 } // namespace lookassist
 

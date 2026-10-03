@@ -1020,10 +1020,80 @@ int lookAssistDisplayTargetMedianForScene( LookAssistScene scene )
     return 88;
 }
 
+// The Cinematic grade: the ONE table. Additive deltas over the Classic preset the scene and the statistics
+// produced, one row per scene, in LookAssistScene order. Intent (docs/look-assist-flavors.md):
+//   contrast  + : the S-curve: denser mid-tones and a rolled-off top, a lower-key, richer picture than Classic
+//   pivot     - : gives back a little of the mid-tone brightness the contrast takes (measured on the fixtures)
+//   shadows   - : blacks not lifted as far as Classic lifts them: lifted-but-not-milky (Night keeps most of its
+//                 rescue lift, which is what makes the picture visible at all)
+//   highlights- : highlights rolled off harder than Classic (controlled)
+//   vibrance  + : richer colour, modest
+//   exposure  0 : held at Classic's. The white-balance refinement renders the picture at the preset's exposure, so
+//                 an exposure delta would move the balance; with none, the balance is provably Classic's.
+// White balance is never in this table: it is Look Assist's decision, identical in both flavors.
+static const LookAssistFlavorDeltas kCinematicFlavorDeltas[] =
+{
+    //  exposure contrast pivot shadows highlights vibrance
+    {      0,      20,     -3,   -10,     -10,        4 },   // Night
+    {      0,      32,     -5,   -14,     -12,        5 },   // ArtificialLights
+    {      0,      40,     -5,   -20,     -15,        6 },   // Shade
+    {      0,      30,     -5,   -12,     -10,        5 },   // BrightSun
+};
+
+LookAssistFlavorDeltas lookAssistCinematicDeltasForScene( LookAssistScene scene )
+{
+    const int index = static_cast<int>( scene );
+    if( index < 0 || index >= static_cast<int>( sizeof( kCinematicFlavorDeltas ) / sizeof( kCinematicFlavorDeltas[0] ) ) )
+        return LookAssistFlavorDeltas();
+    return kCinematicFlavorDeltas[index];
+}
+
+QString lookAssistFlavorName( LookAssistFlavor flavor )
+{
+    return flavor == LookAssistFlavor::Cinematic ? QStringLiteral("cinematic") : QStringLiteral("classic");
+}
+
+QString lookAssistFlavorEnvironmentValue()
+{
+    return qEnvironmentVariable( "MLVAPP_LOOK_ASSIST_FLAVOR" );
+}
+
+LookAssistFlavorSelection lookAssistSelectFlavor( const QString &environmentValue,
+                                                  const QString &receiptValue,
+                                                  const QString &appSettingValue )
+{
+    struct Layer { const QString *value; const char *source; };
+    const Layer layers[] = {
+        { &environmentValue, "env" },
+        { &receiptValue, "receipt" },
+        { &appSettingValue, "app" },
+    };
+    LookAssistFlavorSelection selection;
+    for( const Layer &layer : layers )
+    {
+        const QString value = layer.value->trimmed().toLower();
+        if( value.isEmpty() ) continue;
+        selection.source = QLatin1String( layer.source );
+        if( value == QLatin1String( "classic" ) )
+            selection.flavor = LookAssistFlavor::Classic;
+        else if( value == QLatin1String( "cinematic" ) )
+            selection.flavor = LookAssistFlavor::Cinematic;
+        else
+        {
+            selection.flavor = LookAssistFlavor::Classic;
+            selection.unknownValue = true;
+            selection.rejectedValue = layer.value->trimmed();
+        }
+        break;
+    }
+    return selection;
+}
+
 LookAssistPreset presetForLookAssistScene( LookAssistScene scene,
                                            const LookAssistStats &stats,
                                            const LookAssistStats *colorStats,
-                                           const LookAssistStats *displayStats )
+                                           const LookAssistStats *displayStats,
+                                           LookAssistFlavor flavor )
 {
     LookAssistPreset preset;
     int targetMedian = 110;
@@ -1205,6 +1275,21 @@ LookAssistPreset presetForLookAssistScene( LookAssistScene scene,
         preset.tintDelta = qBound( -tintCap,
                                    preset.tintDelta + artifactTintNudge,
                                    tintCap );
+    }
+
+    if( flavor == LookAssistFlavor::Cinematic )
+    {
+        // The only flavor code in this function: Classic never enters it. Slider deltas only; the white
+        // balance deltas above are left exactly as the analysis made them.
+        const LookAssistFlavorDeltas d = lookAssistCinematicDeltasForScene( scene );
+        preset.exposure = qBound( -180, preset.exposure + d.exposure, 380 );
+        if( scene == LookAssistScene::BrightSun ) preset.exposure = qMin( preset.exposure, 0 );
+        if( scene == LookAssistScene::Night )     preset.exposure = qMax( preset.exposure, 0 );
+        preset.contrast += d.contrast;
+        preset.pivot += d.pivot;
+        preset.shadows += d.shadows;
+        preset.highlights += d.highlights;
+        preset.vibrance += d.vibrance;
     }
 
     preset.contrast = qBound( -100, preset.contrast, 100 );

@@ -71,6 +71,8 @@ public:
     void setRawWhite( int value )             {m_rawWhite = value;}
     void setRawBlack( int value )             {m_rawBlack = value;}
     void setLookAssistEnabled( bool on )      {m_lookAssistEnabled = on;}
+    // "classic" / "cinematic"; empty = not recorded (Classic). Written to the receipt only when non-empty.
+    void setLookAssistFlavor( const QString &value ) {m_lookAssistFlavor = value;}
     void setLookAssistBaselineValid( bool on ){m_lookAssistBaselineValid = on;}
     void setLookAssistBaselineExposure( int value )   {m_lookAssistBaselineExposure = value;}
     void setLookAssistBaselineContrast( int value )    {m_lookAssistBaselineContrast = value;}
@@ -244,6 +246,7 @@ public:
     int rawWhite( void ) {return m_rawWhite;}
     int rawBlack( void ) {return m_rawBlack;}
     bool lookAssistEnabled( void ) {return m_lookAssistEnabled;}
+    QString lookAssistFlavor( void ) {return m_lookAssistFlavor;}
     bool lookAssistBaselineValid( void ) {return m_lookAssistBaselineValid;}
     int lookAssistBaselineExposure( void ) {return m_lookAssistBaselineExposure;}
     int lookAssistBaselineContrast( void ) {return m_lookAssistBaselineContrast;}
@@ -371,6 +374,7 @@ private:
     int m_rawWhite;
     int m_rawBlack;
     bool m_lookAssistEnabled;
+    QString m_lookAssistFlavor;
     bool m_lookAssistBaselineValid;
     int m_lookAssistBaselineExposure;
     int m_lookAssistBaselineContrast;
