@@ -16659,7 +16659,7 @@ void MainWindow::applyLookAssistToReceipt( ReceiptSettings *receipt,
                     }
                 }
             }
-            if( adjustedPostBalance ) decisionTrace.postWalkBranch = LookAssistPostWalkBranch::Steps;
+            lookAssistTraceWalkSteps( &decisionTrace, adjustedPostBalance );
             if( postColorStatsValid
              && lookAssistHasNeutralBalanceSamples( postColorStats )
              && postColorStats.greenArtifactRatio >= 0.004
@@ -16682,7 +16682,7 @@ void MainWindow::applyLookAssistToReceipt( ReceiptSettings *receipt,
                     {
                         preset.tintDelta = cleanupTintTarget;
                         adjustedPostBalance = true;
-                        decisionTrace.postWalkBranch = LookAssistPostWalkBranch::Cleanup;
+                        lookAssistTraceWalkCleanup( &decisionTrace );
                         applyLookAssistValues();
                         postColorStatsValid = analyzePostAppliedLook();
                     }
@@ -16758,6 +16758,7 @@ void MainWindow::applyLookAssistToReceipt( ReceiptSettings *receipt,
                     const LookAssistPreset startingPreset = preset;
                     LookAssistPreset bestPreset = preset;
                     LookAssistStats bestPostColorStats = postColorStats;
+                    bool recoveryAdopted = false;
                     double bestScore = warningAwarePostBalanceScore( postColorStats );
                     const QPair<int, int> recoveryCandidates[] =
                     {
@@ -16786,13 +16787,13 @@ void MainWindow::applyLookAssistToReceipt( ReceiptSettings *receipt,
                             bestScore = candidateScore;
                             bestPreset = preset;
                             bestPostColorStats = postColorStats;
+                            recoveryAdopted = true;
                         }
                     }
                     preset = bestPreset;
                     postColorStats = bestPostColorStats;
-                    decisionTrace.postWalkBranch = LookAssistPostWalkBranch::Recovery;
-                    decisionTrace.recoveryTemperatureDelta = preset.temperatureDelta;
-                    decisionTrace.recoveryTintDelta = preset.tintDelta;
+                    lookAssistTraceWalkRecovery( &decisionTrace, recoveryAdopted,
+                                                 preset.temperatureDelta, preset.tintDelta );
                     postColorStatsValid = true;
                     applyLookAssistValues();
                 }

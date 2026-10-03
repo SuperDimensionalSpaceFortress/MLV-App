@@ -914,10 +914,10 @@ TEST(LookAssistFixtureScene, HeadlessAppliedLineSaysWhyItChoseItsScene)
     const Expect expected[] = {
         // (a) tracked daylight: EV100 16, the rendered picture corroborates
         { "tiny-daylight",
-          "^has_ev100=1 ev100=16\\.\\d\\d daylight_gate=pass post_walk_ran=0 post_walk_branch=none post_walk_recovery=NA "
+          "^has_ev100=1 ev100=16\\.\\d\\d\\d daylight_gate=pass post_walk_ran=0 post_walk_branch=none post_walk_recovery=NA "
           "display_meter_ran=0 playback_scale=NA$" },
         { "large-daylight",
-          "^has_ev100=1 ev100=16\\.\\d\\d daylight_gate=pass post_walk_ran=0 post_walk_branch=none post_walk_recovery=NA "
+          "^has_ev100=1 ev100=16\\.\\d\\d\\d daylight_gate=pass post_walk_ran=0 post_walk_branch=none post_walk_recovery=NA "
           "display_meter_ran=0 playback_scale=NA$" },
         // (b) no metadata: nothing to record, and the first conjunct is what failed
         { "tiny-no-metadata",
@@ -925,7 +925,7 @@ TEST(LookAssistFixtureScene, HeadlessAppliedLineSaysWhyItChoseItsScene)
           "display_meter_ran=0 playback_scale=NA$" },
         // (c) a flat-floor NIGHT verdict (ND filter: EV100 8.6 over the same flat floor): metadata present, gate exposure
         { "tiny-nd-filter",
-          "^has_ev100=1 ev100=8\\.\\d\\d daylight_gate=exposure post_walk_ran=0 post_walk_branch=none "
+          "^has_ev100=1 ev100=8\\.\\d\\d\\d daylight_gate=exposure post_walk_ran=0 post_walk_branch=none "
           "post_walk_recovery=NA display_meter_ran=0 playback_scale=NA$" },
     };
     const size_t caseCount = sizeof( kIdentityCases ) / sizeof( kIdentityCases[0] );

@@ -287,6 +287,25 @@ QString lookAssistDaylightGateName( const LookAssistStats &resolved, bool pictur
     return pictureEvidenceAsked ? QStringLiteral("picture") : QStringLiteral("n/a");
 }
 
+void lookAssistTraceWalkSteps( LookAssistDecisionTrace *trace, bool stepsAdjustedBalance )
+{
+    if( trace && stepsAdjustedBalance ) trace->postWalkBranch = LookAssistPostWalkBranch::Steps;
+}
+
+void lookAssistTraceWalkCleanup( LookAssistDecisionTrace *trace )
+{
+    if( trace ) trace->postWalkBranch = LookAssistPostWalkBranch::Cleanup;
+}
+
+void lookAssistTraceWalkRecovery( LookAssistDecisionTrace *trace, bool candidateAdopted,
+                                  int temperatureDelta, int tintDelta )
+{
+    if( !trace || !candidateAdopted ) return;   // table entered, nothing adopted: the earlier branch and its pair stand
+    trace->postWalkBranch = LookAssistPostWalkBranch::Recovery;
+    trace->recoveryTemperatureDelta = temperatureDelta;
+    trace->recoveryTintDelta = tintDelta;
+}
+
 QString lookAssistDecisionLogFields( const LookAssistStats &resolved, const LookAssistDecisionTrace &trace )
 {
     QString branch = QStringLiteral("none");
@@ -308,7 +327,7 @@ QString lookAssistDecisionLogFields( const LookAssistStats &resolved, const Look
     return QStringLiteral("has_ev100=%1 ev100=%2 daylight_gate=%3 post_walk_ran=%4 post_walk_branch=%5 "
                           "post_walk_recovery=%6 display_meter_ran=%7 playback_scale=%8")
         .arg( resolved.hasSceneEv100 ? 1 : 0 )
-        .arg( resolved.hasSceneEv100 ? QString::number( resolved.sceneEv100, 'f', 2 ) : QStringLiteral("NA") )
+        .arg( resolved.hasSceneEv100 ? QString::number( floor( resolved.sceneEv100 * 1000.0 ) / 1000.0, 'f', 3 ) : QStringLiteral("NA") )
         .arg( lookAssistDaylightGateName( resolved, trace.pictureEvidenceAsked ) )
         .arg( trace.postWalkRan ? 1 : 0 )
         .arg( branch )

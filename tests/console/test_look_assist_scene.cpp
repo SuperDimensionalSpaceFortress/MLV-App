@@ -1494,7 +1494,7 @@ QString evText( double iso, double shutterUs, double apertureX100 )
 {
     double ev100 = 0.0;
     lookAssistSceneEv100( iso, shutterUs, apertureX100, &ev100 );
-    return QString::number( ev100, 'f', 2 );
+    return QString::number( floor( ev100 * 1000.0 ) / 1000.0, 'f', 3 );
 }
 
 // The keys of a "k=v k=v ..." field string, in order.
@@ -1625,6 +1625,83 @@ TEST(LookAssistScene, DecisionLogRecordsThePostBalanceWalkAndTheDisplayMeter)
         QStringLiteral("display_meter_ran=0 playback_scale=1") ) );
 }
 
+namespace {
+
+// The walk's bookkeeping exactly as MainWindow drives it: steps, then cleanup, then the recovery table.
+// stepsMoved / cleanupRaised say whether that branch changed the balance; recoveryAdopted whether the table adopted a
+// candidate (recoveryT / recoveryS is the pair the table would have adopted, or the pair left in place).
+QString walkFields( bool stepsMoved, bool cleanupRaised, bool recoveryEntered, bool recoveryAdopted,
+                    int recoveryT = 250, int recoveryS = 22 )
+{
+    LookAssistDecisionTrace trace;
+    trace.postWalkRan = true;
+    lookAssistTraceWalkSteps( &trace, stepsMoved );
+    if( cleanupRaised ) lookAssistTraceWalkCleanup( &trace );
+    if( recoveryEntered ) lookAssistTraceWalkRecovery( &trace, recoveryAdopted, recoveryT, recoveryS );
+    return lookAssistDecisionLogFields( LookAssistStats(), trace );
+}
+
+} // namespace
+
+TEST(LookAssistScene, WalkTraceRecordsOnlyTheBranchThatChangedTheBalance)
+{
+    // The GUI walk calls these same helpers (the wiring test pins that), so this is the walk's branch/pair logic.
+    // no change at all
+    ASSERT_TRUE( walkFields( false, false, false, false ).contains(
+        QStringLiteral("post_walk_ran=1 post_walk_branch=none post_walk_recovery=NA ") ) );
+    // steps only
+    ASSERT_TRUE( walkFields( true, false, false, false ).contains(
+        QStringLiteral("post_walk_branch=steps post_walk_recovery=NA ") ) );
+    // steps then the green-artifact cleanup: cleanup is the last branch that changed the balance
+    ASSERT_TRUE( walkFields( true, true, false, false ).contains(
+        QStringLiteral("post_walk_branch=cleanup post_walk_recovery=NA ") ) );
+    // cleanup without a step that moved
+    ASSERT_TRUE( walkFields( false, true, false, false ).contains(
+        QStringLiteral("post_walk_branch=cleanup post_walk_recovery=NA ") ) );
+    // the recovery table ADOPTED a candidate: recovery and that pair, over steps and cleanup
+    ASSERT_TRUE( walkFields( true, true, true, true, 250, 22 ).contains(
+        QStringLiteral("post_walk_branch=recovery post_walk_recovery=250/22 ") ) );
+    ASSERT_TRUE( walkFields( false, false, true, true, -500, -35 ).contains(
+        QStringLiteral("post_walk_branch=recovery post_walk_recovery=-500/-35 ") ) );
+
+    // The table was ENTERED but adopted nothing: whatever the walk had before stands, and the (steps/cleanup) pair is
+    // not reported as the table's, even when it equals one of the table's own entries.
+    ASSERT_TRUE( walkFields( true, false, true, false, 250, 22 ).contains(
+        QStringLiteral("post_walk_branch=steps post_walk_recovery=NA ") ) );
+    ASSERT_TRUE( walkFields( true, true, true, false, 250, 22 ).contains(
+        QStringLiteral("post_walk_branch=cleanup post_walk_recovery=NA ") ) );
+    ASSERT_TRUE( walkFields( false, false, true, false, 300, 12 ).contains(
+        QStringLiteral("post_walk_branch=none post_walk_recovery=NA ") ) );
+    ASSERT_FALSE( walkFields( true, true, true, false, 250, 22 ).contains( QStringLiteral("branch=recovery") ) );
+    ASSERT_FALSE( walkFields( true, true, true, false, 250, 22 ).contains( QStringLiteral("recovery=250/22") ) );
+
+    // A null trace is a no-op, not a crash (the formatter's own callers always pass one).
+    lookAssistTraceWalkSteps( nullptr, true );
+    lookAssistTraceWalkCleanup( nullptr );
+    lookAssistTraceWalkRecovery( nullptr, true, 1, 2 );
+}
+
+TEST(LookAssistScene, Ev100IsNeverRoundedAcrossTheDaylightThreshold)
+{
+    // ISO 100, f/4, 1/128 s (7813 us): EV100 10.9999. Rounded to 2 or 3 decimals it would print 11.0, next to
+    // daylight_gate=exposure (the gate sees 10.9999 < 11). The log truncates at three decimals instead.
+    LookAssistStats justBelow = withEv( fixtureRawStats(), 100, 7813, 400 );
+    ASSERT_TRUE( justBelow.hasSceneEv100 );
+    ASSERT_TRUE( justBelow.sceneEv100 < 11.0 && justBelow.sceneEv100 > 10.99 );
+    ASSERT_FALSE( lookAssistExposureIsDaylightBright( justBelow ) );
+    LookAssistDecisionTrace trace;
+    const QString below = lookAssistDecisionLogFields( justBelow, trace );
+    ASSERT_TRUE( below.contains( QStringLiteral("ev100=10.999 daylight_gate=exposure ") ) );
+    // At and above the threshold the printed value never reads below 11 while the gate says bright (and vice versa).
+    for( double shutterUs : { 31250.0, 31249.0, 31251.0, 7813.0, 7812.0 } )
+    {
+        const LookAssistStats s = withEv( fixtureRawStats(), 100, shutterUs, shutterUs > 10000 ? 800 : 400 );
+        const QString text = lookAssistDecisionLogFields( s, trace ).section( QLatin1Char(' '), 1, 1 );
+        const bool printedAtLeast11 = text.startsWith( QStringLiteral("ev100=11.") );
+        ASSERT_TRUE( printedAtLeast11 == lookAssistExposureIsDaylightBright( s ) );
+    }
+}
+
 TEST(LookAssistScene, DecisionLogFieldsAreTheseEightInThisOrder)
 {
     // Dropping, renaming or reordering any field fails here (and the exact-string tests above).
@@ -1717,13 +1794,26 @@ TEST(LookAssistScene, BothConsumersAppendTheDecisionFieldsAndChangeNothingElse)
     const int walk = window.indexOf( QStringLiteral("if( refinePostBalance )") );
     ASSERT_TRUE( walk > 0 );
     const int walkRan = window.indexOf( QStringLiteral("decisionTrace.postWalkRan = true;"), walk );
-    const int walkSteps = window.indexOf( QStringLiteral("decisionTrace.postWalkBranch = LookAssistPostWalkBranch::Steps;"), walk );
-    const int walkCleanup = window.indexOf( QStringLiteral("decisionTrace.postWalkBranch = LookAssistPostWalkBranch::Cleanup;"), walk );
-    const int walkRecovery = window.indexOf( QStringLiteral("decisionTrace.postWalkBranch = LookAssistPostWalkBranch::Recovery;"), walk );
+    const int walkSteps = window.indexOf( QStringLiteral("lookAssistTraceWalkSteps( &decisionTrace, adjustedPostBalance );"), walk );
+    const int walkCleanup = window.indexOf( QStringLiteral("lookAssistTraceWalkCleanup( &decisionTrace );"), walk );
+    const int walkRecovery = window.indexOf( QStringLiteral("lookAssistTraceWalkRecovery( &decisionTrace, recoveryAdopted,"), walk );
     ASSERT_TRUE( walkRan > walk && walkSteps > walkRan && walkCleanup > walkSteps && walkRecovery > walkCleanup );
     ASSERT_EQ( 1, window.count( QStringLiteral("decisionTrace.postWalkRan = true;") ) );
-    ASSERT_EQ( 1, window.count( QStringLiteral("decisionTrace.recoveryTemperatureDelta = preset.temperatureDelta;") ) );
-    ASSERT_EQ( 1, window.count( QStringLiteral("decisionTrace.recoveryTintDelta = preset.tintDelta;") ) );
+    ASSERT_EQ( 1, window.count( QStringLiteral("lookAssistTraceWalkSteps(") ) );
+    ASSERT_EQ( 1, window.count( QStringLiteral("lookAssistTraceWalkCleanup(") ) );
+    ASSERT_EQ( 1, window.count( QStringLiteral("lookAssistTraceWalkRecovery(") ) );
+    // The branch and the recovery pair are written ONLY through the helpers (whose rules the unit test below pins).
+    ASSERT_FALSE( window.contains( QStringLiteral("decisionTrace.postWalkBranch") ) );
+    ASSERT_FALSE( window.contains( QStringLiteral("decisionTrace.recoveryTemperatureDelta") ) );
+    ASSERT_FALSE( window.contains( QStringLiteral("decisionTrace.recoveryTintDelta") ) );
+    // The adoption flag is raised inside the candidate-adoption branch, once, and nowhere else: entering the table
+    // is not adopting from it.
+    ASSERT_EQ( 1, window.count( QStringLiteral("recoveryAdopted = true;") ) );
+    ASSERT_EQ( 1, window.count( QStringLiteral("bool recoveryAdopted = false;") ) );
+    const int adoption = window.indexOf( QStringLiteral("if( candidateScore + 1.0 < bestScore )"), walk );
+    const int adoptedFlag = window.indexOf( QStringLiteral("recoveryAdopted = true;"), walk );
+    ASSERT_TRUE( adoption > walk && adoptedFlag > adoption && adoptedFlag - adoption < 400 );
+    ASSERT_TRUE( walkRecovery > adoptedFlag );
     // The walk's own gate and its recovery table are untouched by this card.
     ASSERT_TRUE( window.contains( QStringLiteral("!daylightScene && ( !autoWhiteBalanceValid || useProcessedColorStats )") ) );
     ASSERT_TRUE( window.contains( QStringLiteral("qMakePair( 250, 22 ),") ) );
