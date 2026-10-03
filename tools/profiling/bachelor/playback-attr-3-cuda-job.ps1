@@ -2807,11 +2807,11 @@ if ($null -ne $smokeLaunchException -or $smokeRc -ne 0 -or -not (Test-Path -Lite
         presentMonConfirmedExited=$presentMonStop.confirmedExited
         presentMonKillError=$presentMonStop.killError
         presentMonWaitError=$presentMonStop.waitError
+        display=$displayBlock
+        displayLogRecovery=[ordered]@{ found=$failedSmokeDisplayLog.found; logPath=$failedSmokeDisplayLog.logPath; reason=$failedSmokeDisplayLog.reason }
         # UM-PRESENTMON-ORPHAN-SWEEP-1 >>>
         presentMonPostKillSessionTerminate=$presentMonStop.postKillSessionTerminate
         # UM-PRESENTMON-ORPHAN-SWEEP-1 <<<
-        display=$displayBlock
-        displayLogRecovery=[ordered]@{ found=$failedSmokeDisplayLog.found; logPath=$failedSmokeDisplayLog.logPath; reason=$failedSmokeDisplayLog.reason }
         # DVE-LEG-TERMINALS-1 >>>
         smokeEvidence=[ordered]@{
             stderrPublished = $smokeStderrPublished; stderrBytes = $smokeStderrBytes; stdoutPublished = $smokeStdoutPublished; stdoutBytes = $smokeStdoutBytes
@@ -2870,10 +2870,10 @@ try {
         presentMonConfirmedExited=$presentMonStop.confirmedExited
         presentMonKillError=$presentMonStop.killError
         presentMonWaitError=$presentMonStop.waitError
+        display=$displayBlock
         # UM-PRESENTMON-ORPHAN-SWEEP-1 >>>
         presentMonPostKillSessionTerminate=$presentMonStop.postKillSessionTerminate
         # UM-PRESENTMON-ORPHAN-SWEEP-1 <<<
-        display=$displayBlock
         sourceCommit=$SourceCommit; clipId=$ClipId; artifactRoot=$Pub
     }
     Save-Json $unavailable (Join-Path $Pub 'summary.json')

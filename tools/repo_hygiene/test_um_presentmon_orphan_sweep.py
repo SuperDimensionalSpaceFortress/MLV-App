@@ -877,14 +877,14 @@ class PostKillTerminateIsPublishedTests(SliceHarness, unittest.TestCase):
         self.assertNotIn(POSTKILL_FIELD, summary)
 
     def test_mutation_without_the_smoke_run_failed_field_the_failed_cleanup_is_unpublished_again(self) -> None:
-        mutated = mutate(TEMPLATE, "presentMonPostKillSessionTerminate=$presentMonStop.postKillSessionTerminate\n        # UM-PRESENTMON-ORPHAN-SWEEP-1 <<<\n        display=$displayBlock\n        displayLogRecovery=",
-                         "presentMonConfirmedExitedAgain=$presentMonStop.confirmedExited\n        # UM-PRESENTMON-ORPHAN-SWEEP-1 <<<\n        display=$displayBlock\n        displayLogRecovery=")
+        mutated = mutate(TEMPLATE, "presentMonPostKillSessionTerminate=$presentMonStop.postKillSessionTerminate\n        # UM-PRESENTMON-ORPHAN-SWEEP-1 <<<\n        # DVE-LEG-TERMINALS-1 >>>\n        smokeEvidence=",
+                         "presentMonConfirmedExitedAgain=$presentMonStop.confirmedExited\n        # UM-PRESENTMON-ORPHAN-SWEEP-1 <<<\n        # DVE-LEG-TERMINALS-1 >>>\n        smokeEvidence=")
         _code, summary, _trace = self.smoke_failed("mut-smoke-failed", text=mutated)
         self.assertNotIn(POSTKILL_FIELD, summary)
 
     def test_mutation_without_the_log_unavailable_field_the_failed_cleanup_is_unpublished_again(self) -> None:
-        mutated = mutate(TEMPLATE, "presentMonPostKillSessionTerminate=$presentMonStop.postKillSessionTerminate\n        # UM-PRESENTMON-ORPHAN-SWEEP-1 <<<\n        display=$displayBlock\n        sourceCommit=",
-                         "presentMonConfirmedExitedAgain=$presentMonStop.confirmedExited\n        # UM-PRESENTMON-ORPHAN-SWEEP-1 <<<\n        display=$displayBlock\n        sourceCommit=")
+        mutated = mutate(TEMPLATE, "presentMonPostKillSessionTerminate=$presentMonStop.postKillSessionTerminate\n        # UM-PRESENTMON-ORPHAN-SWEEP-1 <<<\n        sourceCommit=",
+                         "presentMonConfirmedExitedAgain=$presentMonStop.confirmedExited\n        # UM-PRESENTMON-ORPHAN-SWEEP-1 <<<\n        sourceCommit=")
         _code, summary, _trace = self.log_unavailable("mut-log-unavailable", text=mutated)
         self.assertNotIn(POSTKILL_FIELD, summary)
 
