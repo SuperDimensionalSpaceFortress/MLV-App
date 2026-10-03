@@ -275,3 +275,13 @@ same gate about every OTHER linked worktree under `-WorktreeSweepRoot` (default
 It is ON BY DEFAULT; pass `-NoWorktreeSweep` to opt out. It skips worktrees idle for
 less than six hours, stops after a 180 s budget, never throws, and records its
 outcome as `worktreeSweep` in the receipt.
+
+The sweep visits the least-recently-examined worktree first (DISK-SWEEP-FAIR-ORDER-1).
+After the gate returns for a worktree that was not retired, the sweep writes a UTC
+timestamp into `mlv-sweep-examined` in that worktree's git admin dir
+(`<common>\worktrees\<name>`); never-examined worktrees sort first. Without this a
+stable `git worktree list` order let the same long-lived unmerged head consume every
+budget and starve the tail. The gate takes one process snapshot per sweep (re-taken
+after 30 s) instead of two CIM scans per worktree. The receipt's `worktreeSweep`
+carries `examined` (gate calls), `elapsedMs` and `stampWriteFailed`; `considered`
+minus `examined` minus `young` is what the budget left unvisited.
