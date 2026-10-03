@@ -93,6 +93,12 @@ param(
     [switch]$LaunchOnlyProbe,
     [ValidateRange(0.0, 1.0)]
     [double]$MaxSkippedOrUnpresentedRatio = 0.5,
+    # CPU-LOOK-LEG-PACE-ABORT-1: a CPU-backend leg's frame rate is informational (docs/dual-venue-evidence.md), so the app's pace
+    # probe must not abort it. This switch (the dual-venue CPU job passes it; nothing else does) sets MLVAPP_PLAY_PACE_MODE=
+    # informational in the app's environment and sizes the derived process timeout from the CPU ceiling
+    # (Get-GuiSmokePlaySafetyMs -CpuPaceInformational). The 20 s of source, no-loop / no-replay, the run nonce and the
+    # settings isolation are unchanged; the measured pace is recorded (playbackFps.smokeTimelineFps, validation.cpuPaceInformational).
+    [switch]$CpuPlayPaceInformational,
     # BACHELOR-OWNER-CLIP-STAGE-STALL-1 round 1f (sol BLOCKER): the owner-clip job already read every
     # part of the clip in full ONCE, on a handle it still holds (FileShare.Read), and hashed it. It
     # hands that verified identity here -- a JSON file of {schema, parts:[{path,length,sha256}]} --
@@ -1667,6 +1673,9 @@ if (-not [string]::IsNullOrWhiteSpace($GpuPlaybackReconBackend)) {
     $launchEnv["MLVAPP_GPU_PLAYBACK_RECON_BACKEND"] = $GpuPlaybackReconBackend
 }
 Add-EnvironmentPairs -Target $launchEnv -Pairs $ExtraEnvironment
+if ($CpuPlayPaceInformational) {
+    $launchEnv[$script:GuiSmokePaceModeEnvironment] = "informational"
+}
 if (-not [string]::IsNullOrWhiteSpace($env:OMP_NUM_THREADS)) {
     $launchEnv["OMP_NUM_THREADS"] = $env:OMP_NUM_THREADS
 }
@@ -1726,7 +1735,7 @@ $effectiveExpectedVisualScaleRequest = if ($ExpectedVisualScaleRequest -eq -2) {
 # ENFORCE-3 r2: the app's own wall-clock safety net for the window is requested / 0.5 + 15 s (it ends the Play with a
 # typed failure inside it), so the runner's process budget starts from that, never from the bare window.
 $derivedProcessTimeoutMs = [Math]::Ceiling(
-    (Get-GuiSmokePlaySafetyMs -Seconds $Seconds) +
+    (Get-GuiSmokePlaySafetyMs -Seconds $Seconds -CpuPaceInformational:$CpuPlayPaceInformational) +
     [Math]::Max(0, $SettleMs) +
     [Math]::Max(0, $SettleCpuMaxMs) +
     [Math]::Max(0, $ScreenshotDelayMs) +
@@ -1887,6 +1896,9 @@ Add-EnvironmentPairs -Target $envBlock -Pairs $ExtraEnvironment
 # ENFORCE-4 r2 (sol BLOCKER): the per-run nonce the app echoes on its playback_smoke.summary (run_nonce=); the loop verdict below
 # judges only a summary that carries it. Set AFTER -ExtraEnvironment so a caller cannot choose the nonce it is judged against.
 $envBlock["MLVAPP_RUN_NONCE"] = $runNonce
+# CPU-LOOK-LEG-PACE-ABORT-1: the pace mode comes from the switch ALONE (an inherited or -ExtraEnvironment value was refused above).
+[void]$envBlock.Remove($script:GuiSmokePaceModeEnvironment)
+if ($CpuPlayPaceInformational) { $envBlock[$script:GuiSmokePaceModeEnvironment] = "informational" }
 if (-not $PreserveExperimentalEnvironment) {
     foreach ($name in $experimentalEnvironmentToClear) {
         [void]$envBlock.Remove($name)
@@ -2977,6 +2989,7 @@ $result | Add-Member -NotePropertyName validation -NotePropertyValue ([pscustomo
         [int64]$firstPresentedFrame -ne [int64]$lastPresentedFrame)
     skippedOrUnpresentedRatio = $skippedOrUnpresentedRatio
     maxSkippedOrUnpresentedRatio = $MaxSkippedOrUnpresentedRatio
+    cpuPaceInformational = [bool]$CpuPlayPaceInformational
     colorArtifactScanPassed = [bool]$colorArtifactScanPassed
     colorArtifactScanVerdict = $colorArtifactVerdict
     glOutputProof = $glOutputProof

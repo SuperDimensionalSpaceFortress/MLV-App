@@ -300,6 +300,12 @@ param(
     [ValidateRange(1, 16)]
     [int]$ScaleFactor = 4,
 
+    # DVE-SCALE2-LOOK-LEG-1 r2: the job passes -UsePersistedPlaybackSettings, which leaves the smoke runner's own scale check off (ExpectedScaleRequest -1). A caller that knows the
+    # scale the app's request will read (the CUDA texture route clamps it to 1 before the runner reads it) passes it here and the check is live. -1 (the default) emits nothing, so the
+    # default job is unchanged. -ExpectedVisualScaleRequest is pinned to -1 so only the summary-line check goes live.
+    [ValidateRange(-1, 16)]
+    [int]$ExpectedScaleRequest = -1,
+
     # DUAL-VENUE-EVIDENCE-1, AMENDMENT 1 A1. 'cuda' (default) is byte-identical to today. 'cpu'
     # omits every MLVAPP_GPU_* / MLVAPP_EXPERIMENTAL_GPU_* env (and the GL-window/viewport ones
     # that only serve the GPU path), requires CPU_FRAMES > 0 and GPU frames == 0 (a leg that
@@ -857,6 +863,16 @@ $smokeRunnerCommittedText = (& git -C $RepoRoot show "${SourceCommit}:tools/prof
 $runnerAcceptsVerifiedClipBinding = ($LASTEXITCODE -eq 0) -and
     ($smokeRunnerCommittedText -match '\[string\]\$VerifiedClipBindingPath\b') -and
     ($smokeRunnerCommittedText -match '\[string\]\$TracePath\b')
+# CPU-LOOK-LEG-PACE-ABORT-1: a cpu leg's pace is informational. The runner at -SourceCommit takes -CpuPlayPaceInformational (and the
+# app at that commit honours the variable it sets) or it does not; a runner without the switch would reject it and the leg would die at
+# launch, so it is passed only when declared, and the leg then keeps the old (gated) behaviour with the warning below.
+$runnerAcceptsCpuPlayPaceInformational = ($LASTEXITCODE -eq 0) -and
+    ($smokeRunnerCommittedText -match '\[switch\]\$CpuPlayPaceInformational\b')
+$cpuPlayPaceInformational = ($Backend -eq 'cpu') -and $runnerAcceptsCpuPlayPaceInformational
+if ($Backend -eq 'cpu' -and -not $runnerAcceptsCpuPlayPaceInformational) {
+    Write-Warning ("The smoke runner committed at $($SourceCommit.Substring(0, 12)) does not take -CpuPlayPaceInformational, so this cpu leg keeps the gated pace probe " +
+        "(PLAY_PACE_TOO_SLOW after 8 s on a slow host). Generate from a -SourceCommit that contains CPU-LOOK-LEG-PACE-ABORT-1.")
+}
 if (-not $isFixtureRehearsal -and -not $runnerAcceptsVerifiedClipBinding) {
     Write-Warning ("The smoke runner committed at $($SourceCommit.Substring(0, 12)) does not take -VerifiedClipBindingPath, so it will read the owner clip " +
         "again itself (small blocks, before the app launches). The single-read guarantee is NOT end to end for this leg, and the derived timeouts do not cover those reads. " +
@@ -921,6 +937,13 @@ if ($PostRunSeconds -gt 0) { $timeBudgetArgs['PostRunSeconds'] = $PostRunSeconds
 # PLAYBACK-CLIP-LENGTH-ENFORCE-1: the smoke-process timeout keeps the old 40 s play allowance as a
 # floor (extra slack only; the default baked timeout is unchanged) and grows with a longer -PlaySeconds.
 $timeBudgetArgs['PlaySeconds'] = [int][Math]::Max(40, $PlaySeconds)
+# CPU-LOOK-LEG-PACE-ABORT-1: a cpu leg's Play may run to the CPU ceiling (Get-GuiSmokePlaySafetyMs -CpuPaceInformational: requested / (1/30)
+# + 15 s), so the smoke-process timeout, the PresentMon capture ceiling and the um-run -TimeoutSec derived from it must cover that ceiling
+# -- one derivation (the runner's), never a second hard-coded number.
+if ($cpuPlayPaceInformational) {
+    $timeBudgetArgs['PlaySeconds'] = [int][Math]::Max($timeBudgetArgs['PlaySeconds'],
+        [Math]::Ceiling((Get-GuiSmokePlaySafetyMs -Seconds $PlaySeconds -CpuPaceInformational) / 1000.0))
+}
 $timeBudget = Get-AttrCudaLegTimeBudget -InputBytes $clipBytesForBudget @timeBudgetArgs
 
 # --- job body template (placeholders are substituted below; the body itself never
@@ -2460,7 +2483,7 @@ $envs = @(
 # default.
 $envList = "'" + ($envs -join "','") + "'"
 function ConvertTo-PsSingleQuoted([string]$Value) { "'" + $Value.Replace("'", "''") + "'" }
-$cmd = "& $(ConvertTo-PsSingleQuoted $smoke) -ExePath $(ConvertTo-PsSingleQuoted $exePath) -Input $(ConvertTo-PsSingleQuoted $clipPath) -Output $(ConvertTo-PsSingleQuoted $resultPath) -Seconds $PlaySeconds -StartFrame 0 -SettleMs 2500 -ProcessTimeoutMs $SmokeProcessTimeoutMs -ScaleFactor __SCALE_FACTOR__ -UsePersistedPlaybackSettings -RequireLookAssist:`$false -Scope none -FrameTelemetry -PreserveExperimentalEnvironment -ExtraEnvironment @($envList)"
+$cmd = "& $(ConvertTo-PsSingleQuoted $smoke) -ExePath $(ConvertTo-PsSingleQuoted $exePath) -Input $(ConvertTo-PsSingleQuoted $clipPath) -Output $(ConvertTo-PsSingleQuoted $resultPath) -Seconds $PlaySeconds -StartFrame 0 -SettleMs 2500 -ProcessTimeoutMs $SmokeProcessTimeoutMs -ScaleFactor __SCALE_FACTOR__ __EXPECTED_SCALE_ARGS__-UsePersistedPlaybackSettings -RequireLookAssist:`$false -Scope none -FrameTelemetry -PreserveExperimentalEnvironment -ExtraEnvironment @($envList)"
 if ($RunnerAcceptsVerifiedClipBinding) {
     # BACHELOR-OWNER-CLIP-STAGE-STALL-1 round 1f: the runner's own remaining reads are traced into
     # this job's trace file, and (owner run) it takes the identity verified above instead of re-reading.
@@ -3899,7 +3922,8 @@ if ($isCpuBackend) {
     # no frame, no sheet). A cpu leg passes the limit's ceiling (the ratio cannot exceed 1), so the runner never fails it on that ratio; the ratio is a measured
     # field of the success summary (below). A cuda leg's command is untouched. No other gate is relaxed: clip length, loop / replay, nonce and settings isolation
     # are enforced by the runner and the receipt oracle, and the job passes none of them as a switch.
-    $template = Edit-DualVenueTemplate $template ' -Scope none -FrameTelemetry' ' -Scope none -MaxSkippedOrUnpresentedRatio 1 -FrameTelemetry'
+    $cpuPaceSwitch = if ($cpuPlayPaceInformational) { ' -CpuPlayPaceInformational' } else { '' }
+    $template = Edit-DualVenueTemplate $template ' -Scope none -FrameTelemetry' (' -Scope none -MaxSkippedOrUnpresentedRatio 1' + $cpuPaceSwitch + ' -FrameTelemetry')
     $template = Edit-DualVenueTemplate $template 'if (-not $verdict.admitted) {' 'if ($Backend -ne ''cpu'' -and -not $verdict.admitted) {'
     $template = Edit-DualVenueTemplate $template 'if ($gpuFramesTotal -le 0) {' 'if ($Backend -ne ''cpu'' -and $gpuFramesTotal -le 0) {'
     $template = Edit-DualVenueTemplate $template 'if ($gpuSummary.cpuFrames -gt 0) {' 'if ($Backend -ne ''cpu'' -and $gpuSummary.cpuFrames -gt 0) {'
@@ -3969,6 +3993,12 @@ if ($isVariant) {
 '
     # DVE-LEG-TERMINALS-1 item 2: a cpu run records the launcher's own skipped/unpresented ratio as a measured field (it no longer gates the run).
     $cpuRatioField = if ($isCpuBackend) { '    skippedOrUnpresentedRatio = $resultJson.validation.skippedOrUnpresentedRatio' + "`n" } else { '' }
+    # CPU-LOOK-LEG-PACE-ABORT-1: the cpu leg's pace is MEASURED and informational -- the timeline fps the app's own summary reports over the
+    # whole Play, recorded beside the ratio (a leg spec's cpu criteria may read it; nothing gates on it).
+    if ($isCpuBackend) {
+        $cpuRatioField += '    cpuPaceInformational = ' + $(if ($cpuPlayPaceInformational) { '$true' } else { '$false' }) + "`n" +
+            '    cpuPaceTimelineFps = $resultJson.playbackFps.smokeTimelineFps' + "`n"
+    }
     $template = Edit-DualVenueTemplate $template '    cpuFrames = $gpuSummary.cpuFrames
 ' ('    cpuFrames = $gpuSummary.cpuFrames
 ' + $cpuRatioField + '    backend = $Backend
@@ -4024,6 +4054,7 @@ $text = Expand-AttrCudaTemplate -Template $template -Tokens ([ordered]@{
     SCRATCH_ROOT = $venueScratchRoot
     CPU_QUIESCENCE_THRESHOLD_PERCENT = $CpuQuiescenceThresholdPercent.ToString('0.0###', [Globalization.CultureInfo]::InvariantCulture)
     SCALE_FACTOR = [string]$ScaleFactor
+    EXPECTED_SCALE_ARGS = $(if ($ExpectedScaleRequest -ge 0) { "-ExpectedScaleRequest $ExpectedScaleRequest -ExpectedVisualScaleRequest -1 " } else { '' })
     # UM-PRESENTMON-STOP-1: one capture ceiling for every leg -- a fixture leg's fixed 55 s ended its capture
     # 22.9 s before playback did on Ultra-Magnus. The job stops the capture itself after the app exits.
     PRESENTMON_TIMED_SECONDS = [string][int][math]::Ceiling($timeBudget.smokeProcessTimeoutMs / 1000.0)
@@ -4075,5 +4106,7 @@ $clipContentSha256 = if ($isFixtureRehearsal) {
     smokeProcessTimeoutMs = $timeBudget.smokeProcessTimeoutMs
     # false = this SourceCommit's runner re-reads the owner clip itself (see the warning above).
     runnerVerifiedClipBinding = $runnerAcceptsVerifiedClipBinding
+    # CPU-LOOK-LEG-PACE-ABORT-1: true = this cpu leg passes -CpuPlayPaceInformational (its time budget covers the CPU ceiling).
+    cpuPlayPaceInformational = [bool]$cpuPlayPaceInformational
     timeBudget = $timeBudget
 }
