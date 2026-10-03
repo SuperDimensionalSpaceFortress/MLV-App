@@ -2201,4 +2201,35 @@ TEST(LookAssistScene, BothConsumersRunTheWindowLitCheckMeasureOnly)
     const int hCheck = applier.indexOf( QStringLiteral("resolveLookAssistWindowLitInterior("), hWb );
     const int hWrite = applier.indexOf( QStringLiteral("receipt->setExposure( preset.exposure );"), hWb );
     ASSERT_TRUE( hWb > 0 && hMaster > hWb && hCheck > hMaster && hWrite > hCheck );
+
+    // sol r1: the check's two verification renders go through the isolated, read-only renderer in BOTH consumers (the
+    // live one prepares and versions llrawproc's shared pixel maps), set after the copied request, before the check.
+    const QString assignments[] = {
+        QStringLiteral("windowLitRequest.renderBalance = ReceiptApplier::lookAssistMeasureOnlyRenderer("),
+        QStringLiteral("windowLitRequest.renderBalance = lookAssistMeasureOnlyRenderer(") };
+    const QString consumers[] = { window, applier };
+    for( int i = 0; i < 2; ++i )
+    {
+        const QString &consumer = consumers[i];
+        ASSERT_EQ( 1, consumer.count( QStringLiteral("windowLitRequest.renderBalance =") ) );
+        ASSERT_EQ( 1, consumer.count( assignments[i] ) );
+        const int copied = consumer.indexOf( QStringLiteral("LookAssistWhiteBalanceRequest windowLitRequest = wbRequest;") );
+        const int isolated = consumer.indexOf( assignments[i] );
+        const int check = consumer.indexOf( QStringLiteral("resolveLookAssistWindowLitInterior(") );
+        ASSERT_TRUE( copied > 0 && isolated > copied && check > isolated );
+        // fable r1 (LOOK-ASSIST-WINDOW-LIT-MEASURE-ONLY-RENDER-PIN-1): nothing is copied back. Each copy is declared,
+        // handed to the check and never read again, so `preset = windowLitPreset;` (or the scene / stats) fails here.
+        ASSERT_EQ( 2, consumer.count( QStringLiteral("windowLitPreset") ) );
+        ASSERT_EQ( 2, consumer.count( QStringLiteral("windowLitScene") ) );
+        ASSERT_EQ( 3, consumer.count( QStringLiteral("windowLitStats") ) );
+        ASSERT_EQ( 0, consumer.count( QRegularExpression( QStringLiteral("=\\s*windowLit(Preset|Scene|Stats)\\b") ) ) );
+    }
+    // The renderer itself: the isolated render with the llrawproc read-only switch around it, restored after.
+    const int measureOnly = applier.indexOf( QStringLiteral("LookAssistRenderBalanceFn ReceiptApplier::lookAssistMeasureOnlyRenderer(") );
+    ASSERT_TRUE( measureOnly > 0 );
+    ASSERT_TRUE( applier.indexOf( QStringLiteral("cpuCores, true );"), measureOnly ) > measureOnly );
+    ASSERT_TRUE( applier.contains( QStringLiteral(
+        "const int previousReadOnly = llrpSetIsolatedAnalysisSharedStateReadOnlyForCurrentThread( 1 );") ) );
+    ASSERT_TRUE( applier.contains( QStringLiteral(
+        "llrpSetIsolatedAnalysisSharedStateReadOnlyForCurrentThread( previousReadOnly );") ) );
 }

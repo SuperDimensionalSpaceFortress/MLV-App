@@ -66,10 +66,11 @@ public:
     /* The same processed thumbnail at an explicit exposure AND white balance (temperature in K, tint in
      * receipt units), through a private clone: the exposure at the PLANNED stops (the preset's, without the
      * display offset the live viewport adds) and the white balance under test, nothing else varied. isolated =
-     * the cache-free render a detached worker would use; no production caller passes it (a daylight scene
-     * never reaches the async worker), the cache-backed render is what the GUI sync path and the headless
-     * applier use for every other Look Assist thumbnail. The ONE renderer behind the daylight refinement
-     * for GUI sync (async is routed to sync) and headless. */
+     * the cache-free render whose raw read is ALSO read-only on llrawproc (pixel maps, their versions and
+     * status, force search, stripe one-shot go to a per-thread shadow); only measure-only analysis passes it
+     * (lookAssistMeasureOnlyRenderer). The cache-backed render is what the GUI sync path and the headless
+     * applier use for every Look Assist thumbnail that decides something. The ONE renderer behind the
+     * daylight refinement for GUI sync (async is routed to sync) and headless. */
     static bool processedThumbnailAtBalance(mlvObject_t *mlvObject,
                                             int frameIndex,
                                             int downscaleFactor,
@@ -89,6 +90,15 @@ public:
                                                                      int thumbHeight,
                                                                      int cpuCores,
                                                                      bool isolated);
+
+    /* The renderer for a MEASURE-ONLY check (the window-lit verification in both consumers): the isolated,
+     * read-only render above, so measuring cannot change any shared processing or low-level raw state. */
+    static lookassist::LookAssistRenderBalanceFn lookAssistMeasureOnlyRenderer(mlvObject_t *mlvObject,
+                                                                         int frameIndex,
+                                                                         int downscaleFactor,
+                                                                         int thumbWidth,
+                                                                         int thumbHeight,
+                                                                         int cpuCores);
 
 private:
     ReceiptApplier() = delete; /* Pure static — no instances */

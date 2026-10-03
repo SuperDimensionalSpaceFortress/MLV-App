@@ -16477,11 +16477,15 @@ void MainWindow::applyLookAssistToReceipt( ReceiptSettings *receipt,
     // (re-rendered at it, its own patch turns amber), so the window-lit reclassification stays off until the verdict
     // (EV100 bound for a missing aperture) and balance (verified-surface search) follow-ons land. The check runs on
     // copies and only logs what it measured; this pass's verdict, preset and balance are master's (shared with headless).
+    // Its verification renders use the isolated read-only renderer: no processing, cache or llrawproc state moves.
     LookAssistStats windowLitStats = stats;
     LookAssistScene windowLitScene = scene;
     LookAssistPreset windowLitPreset = preset;
     LookAssistWhiteBalanceRequest windowLitRequest = wbRequest;
     windowLitRequest.stats = &windowLitStats;
+    windowLitRequest.renderBalance = ReceiptApplier::lookAssistMeasureOnlyRenderer(
+        m_pMlvObject, analysisFrame, colorDownscaleFactor, colorWidth, colorHeight,
+        qMax( 1, mlvappEffectiveWorkerThreadCount() ) );
     const LookAssistWindowLitCheck windowLit = resolveLookAssistWindowLitInterior(
         windowLitRequest, wb, m_pMlvObject->processing->exposure_stops, &windowLitStats, &windowLitScene, &windowLitPreset,
         useProcessedColorStats ? &processedColorStats : nullptr,
