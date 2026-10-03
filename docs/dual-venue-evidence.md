@@ -245,6 +245,15 @@ seen while the launch waited for trace readiness, or exists at stop), `csvSizeAt
 error), so "the stop was clean and the CSV never appeared" is a fact in the evidence. A PresentMon that exits at startup (rc=6, ETW access denied) publishes the
 same streams from the spawn-failure summary (`presentMonStreams`).
 
+*A leftover PresentMon session cannot starve a capture (UM-PRESENTMON-ORPHAN-SWEEP-1).* On Ultra-Magnus an orphaned default-named `PresentMon` ETW session made every
+other-named session lose all of its events (15-17k "ETW events were lost" per 12 s), so no CSV was written; the per-job `--session_name` meant `--stop_existing_session` no
+longer cleared it. Before the spawn the job now terminates the default `PresentMon` session and every `MLVAttr3-*` session that `logman query -ets` lists, through the pinned
+PresentMon's own `--terminate_existing_session` (`logman stop <name> -ets` only for a session still listed afterwards) -- but only when no PresentMon process is alive on the host
+(checked before the listing and again right after it); otherwise it records that it did not run. A job-issued `Kill()` is followed by the terminate of the job's own named
+session (both stop paths). `presentmon-capture.json` carries `orphanSweep` (ran, skippedReason, live pids, listed, matching listing lines, every action with its exit code,
+what remains) and `eventsLost` (PresentMon's stderr reported lost events: message count and largest count); the failure terminals' PresentMon reason gains a typed
+`PRESENTMON_EVENTS_LOST` detail, so a recurrence reads as its cause instead of "output does not exist".
+
 *CPU legs and a PresentMon wait failure (DVE-PRESENTMON-EVIDENCE-1, hardening DVE-CPU-PRESENTMON-WAIT-GATES-1).* PresentMon is informational on a cpu leg, so a cpu job
 does **not** take the wait-failure terminal: the run continues through its own gates (backend, source frames, playback), the summary carries `presentMonStatus: "unavailable"`
 with the wait failure's reason, and the outcome comes from the leg's own gates. A cuda job is unchanged: its wait failure is still the typed `PRESENTMON_UNAVAILABLE` terminal.
