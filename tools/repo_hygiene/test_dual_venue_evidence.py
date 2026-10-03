@@ -828,7 +828,11 @@ class RunnerReceiptTests(RunnerHarness, unittest.TestCase):
         for name, text in (("Invoke-VenueLeg.ps1", runner), ("playback-attr-3-cuda-job.ps1", job), ("New-VenueSheetPair.ps1", pair)):
             for line in text.splitlines():
                 if re.match(r"\s*lookFlavorHonored\s*=", line):
-                    self.assertRegex(line, r"'unknown'|\$null", f"{name}: lookFlavorHonored must be 'unknown' (or null off a look leg), never derived from the spec: {line.strip()}")
+                    # LOOK-ASSIST-FLAVORS-1 landed the app report: a value is acceptable when it is 'unknown', null, a variable the runner
+                    # fills only from lookFlavorReported / the receipts (pinned below), or the job's reported-vs-requested comparison.
+                    self.assertRegex(line, r"'unknown'|\$null|\$lfReported -ceq|=\s*\$(lookFlavorHonored|pairHonored)\s*$", f"{name}: lookFlavorHonored must come from the app's report (or be 'unknown' / null), never from the spec: {line.strip()}")
+        # the runner's one non-literal assignment sits inside the guard that requires the app's report in the job summary
+        self.assertRegex(runner, r"if \(\$null -ne \$summary -and \$summary\.PSObject\.Properties\['lookFlavorReported'\]\) \{\s*\$lookFlavorReported = \[string\]\$summary\.lookFlavorReported\s*\$lookFlavorHonored = \(\$lookFlavorReported -ceq \$lookFlavor\)")
 
     def test_the_app_reads_the_flavor_env_var_and_the_job_records_what_it_reports(self) -> None:
         """LOOK-ASSIST-FLAVORS-1 landed the app-side reader this test used to forbid. The job must therefore take lookFlavorHonored from the
