@@ -355,7 +355,9 @@ TEST(LookAssistFlavors, HeadlessApplierReadsTheEnvironmentOverTheReceiptAndRepor
         || applier.contains( QStringLiteral(
         "lookAssistSelectFlavor(\r\n        lookAssistFlavorEnvironmentValue(), receipt->lookAssistFlavor(), QString() )" ) ) );
     // Appended, never inserted: the existing fields keep their order.
-    ASSERT_TRUE( applier.contains( QStringLiteral("initialPatchFinalChroma=%38 flavor=%39") ) );
+    ASSERT_TRUE( applier.contains( QStringLiteral("initialPatchFinalChroma=%38 %39 flavor=%40") ) );
+    ASSERT_TRUE( applier.contains( QStringLiteral(
+        ".arg( lookAssistDecisionLogFields( stats, decisionTrace ) )\n        .arg( lookAssistFlavorName( flavor ) ) );") ) );
     ASSERT_TRUE( applier.contains( QStringLiteral("receipt->setLookAssistFlavor( lookAssistFlavorName( flavor ) )") ) );
     ASSERT_TRUE( applier.contains( QStringLiteral("unknown flavor '%1' from %2; using classic") ) );
 }
@@ -375,10 +377,10 @@ TEST(LookAssistFlavors, GuiSelectorAndEnvironmentBothReachTheAnalysis)
 
     // The analysis resolves it once, right after the (flavor-blind) scene verdict, and reports it.
     ASSERT_EQ( 1, window.count( QStringLiteral("const LookAssistFlavor flavor = currentLookAssistFlavor();") ) );
-    ASSERT_TRUE( window.contains( QStringLiteral("last_frame=%27 next_serial=%28 flavor=%29") ) );
+    ASSERT_TRUE( window.contains( QStringLiteral("last_frame=%27 next_serial=%28 %29 flavor=%30") ) );
     ASSERT_TRUE( window.contains( QStringLiteral("floor_lifted=%4 flavor=%5") ) );
-    // Every reporting site feeds its placeholder: the sync result, the async dispatch and the venue telemetry.
-    ASSERT_TRUE( window.contains( QStringLiteral(".arg( static_cast<qulonglong>( m_nextRenderRequestSerial ) )\n            .arg( lookAssistFlavorName( flavor ) ) );") ) );
+    // Every reporting site feeds its placeholder (flavor AFTER the #240 decision fields): the sync result, the async dispatch and the venue telemetry.
+    ASSERT_TRUE( window.contains( QStringLiteral(".arg( lookAssistDecisionLogFields( stats, decisionTrace ) )\n            .arg( lookAssistFlavorName( flavor ) ) );") ) );
     ASSERT_TRUE( window.contains( QStringLiteral(".arg( bool01( floorLiftedNightThumbnail ) )\n                .arg( lookAssistFlavorName( flavor ) ) );") ) );
     ASSERT_TRUE( window.contains( QStringLiteral("m_lastAppliedLookAssistFlavor = lookAssistFlavorName( flavor );") ) );
     ASSERT_TRUE( window.contains( QStringLiteral("gpu_preview_processing_reject_reason=%47 \"\n            \"look_assist_flavor=%48\"") ) );

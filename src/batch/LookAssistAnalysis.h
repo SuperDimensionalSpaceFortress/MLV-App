@@ -118,6 +118,64 @@ bool lookAssistIsDaylightScene( const LookAssistStats &stats, LookAssistScene sc
  * speak), and the exposure is daylight-bright: the picture has to be consulted. */
 bool lookAssistDaylightNeedsPictureEvidence( const LookAssistStats &stats, LookAssistScene legacyScene );
 
+/* The first of the three NON-picture conjuncts of lookAssistDaylightNeedsPictureEvidence that fails, in the
+ * order they are tried (recorded exposure daylight-bright, RAW thumbnail a flat floor, legacy verdict
+ * Night / ArtificialLights); Open when all three hold and only the rendered picture is left to decide.
+ * lookAssistDaylightNeedsPictureEvidence is built on this, so the log and the decision cannot disagree. */
+enum class LookAssistDaylightGate
+{
+    Exposure,
+    FlatFloor,
+    Legacy,
+    Open
+};
+LookAssistDaylightGate lookAssistDaylightGate( const LookAssistStats &stats, LookAssistScene legacyScene );
+
+/* Observation only (LOOK-ASSIST-DIAG-LOGGING-1): which branch of the GUI's night post-balance walk produced the
+ * final balance. None = the walk made no change (or did not run). A branch is recorded only when it CHANGED the
+ * balance: the recovery table is Recovery only when it adopted a candidate, never merely because it was entered. */
+enum class LookAssistPostWalkBranch
+{
+    None,
+    Steps,
+    Cleanup,
+    Recovery
+};
+
+/* What a consumer knows about HOW the verdict and balance were reached, handed to
+ * lookAssistDecisionLogFields. Defaults are the headless applier's: no picture asked, no walk, no display meter. */
+struct LookAssistDecisionTrace
+{
+    bool pictureEvidenceAsked = false;                       // a render callback was given to resolveLookAssistScene
+    bool postWalkRan = false;                                // the night post-balance walk was entered
+    LookAssistPostWalkBranch postWalkBranch = LookAssistPostWalkBranch::None;
+    int recoveryTemperatureDelta = 0;                        // the pair the recovery table ADOPTED (Recovery only)
+    int recoveryTintDelta = 0;
+    bool displayMeterRan = false;                            // the display-space exposure meter produced samples
+    int playbackScaleFactor = 0;                             // effective playback scale (0 = not applicable)
+};
+
+/* The walk's branch bookkeeping, kept pure so the GUI walk and the unit tests run the very same code. Call in walk
+ * order. Each records its branch only when that branch changed the balance; a branch that ran and changed nothing
+ * leaves the earlier branch (and its pair) standing. */
+void lookAssistTraceWalkSteps( LookAssistDecisionTrace *trace, bool stepsAdjustedBalance );
+void lookAssistTraceWalkCleanup( LookAssistDecisionTrace *trace );   // call where the cleanup raised the tint
+void lookAssistTraceWalkRecovery( LookAssistDecisionTrace *trace, bool candidateAdopted,
+                                  int temperatureDelta, int tintDelta );
+
+/* daylight_gate value: exposure | flatfloor | legacy | picture | pass | n/a, for the stats AFTER
+ * resolveLookAssistScene. pass = the rendered picture corroborated daylight; picture = every other conjunct held
+ * and the picture did not (or could not) say so; n/a = every other conjunct held and no picture was asked for
+ * (the master pass). An earlier failing conjunct is reported whether or not a picture was asked for. */
+QString lookAssistDaylightGateName( const LookAssistStats &resolved, bool pictureEvidenceAsked );
+
+/* The fields appended to the end of the Look Assist result log lines, space separated, no leading space:
+ *   has_ev100=0|1 ev100=(3 decimals, truncated not rounded so it never reads 11 below the gate's 11.0, or NA) daylight_gate=(see above) post_walk_ran=0|1
+ *   post_walk_branch=(none, steps, cleanup or recovery) post_walk_recovery=(temp delta, slash, tint delta; NA unless
+ *   recovery) display_meter_ran=0|1 playback_scale=(n or NA)
+ * Pure; reads nothing it was not given. */
+QString lookAssistDecisionLogFields( const LookAssistStats &resolved, const LookAssistDecisionTrace &trace );
+
 /* The picture rendered at the exposure the daylight verdict would apply (the Shade preset's lift) is a
  * lit daylight picture: mostly mid-tones around a mid median, not a dark field with a small bright
  * region. The tracked fixture renders median 77-147 with 95-99 % mid-tones at its lift; a moon over a

@@ -763,6 +763,10 @@ bool ReceiptApplier::applyHeadlessLookAssist(ReceiptSettings *receipt,
     // the one master classified (daylight needs the evidence).
     const LookAssistScene scene = resolveLookAssistScene(
         &stats, masterScenePass ? LookAssistRenderFn() : LookAssistRenderFn( renderProcessed ) );
+    // Observation only: how the verdict was reached, appended to the "applied" line. The headless applier has no
+    // night post-balance walk and no display meter, so those stay at their defaults.
+    LookAssistDecisionTrace decisionTrace;
+    decisionTrace.pictureEvidenceAsked = !masterScenePass;
     const bool processedColorWanted = lookAssistShouldAnalyzeProcessedColor( scene, stats );
     const bool canAnalyzeProcessedColor =
         processedColorWanted && colorWidth > 0 && colorHeight > 0;
@@ -936,7 +940,7 @@ bool ReceiptApplier::applyHeadlessLookAssist(ReceiptSettings *receipt,
     resetMlvCachedFrame( mlvObject );
 
     BatchLogger::out( QStringLiteral(
-        "[BATCH] LOOK_ASSIST applied frame=%1 scene=%2 median=%3 p95=%4 p99=%5 exposure=%6 temperature=%7 tint=%8 autoWbValid=%9 autoWbSource=%10 autoWbDecision=%11 autoWbDamping=%12 autoWbCandidateTemp=%13 autoWbCandidateTint=%14 chromaSmoothAuto=%15 rawBlack=%16 rawWhite=%17 p05=%18 clipHigh=%19 balanceRGB=%20/%21/%22 balanceSamples=%23 patchValid=%24 patchLuma=%25 patchChroma=%26 patchBlueAmber=%27 patchGreenAxis=%28 refineRenders=%29 refineStartScore=%30 refineScore=%31 refineBlueAmber=%32 refineGreen=%33 masterScenePass=%34 initialPatchChecked=%35 initialPatchRefused=%36 initialPatchBaseChroma=%37 initialPatchFinalChroma=%38 flavor=%39\n" )
+        "[BATCH] LOOK_ASSIST applied frame=%1 scene=%2 median=%3 p95=%4 p99=%5 exposure=%6 temperature=%7 tint=%8 autoWbValid=%9 autoWbSource=%10 autoWbDecision=%11 autoWbDamping=%12 autoWbCandidateTemp=%13 autoWbCandidateTint=%14 chromaSmoothAuto=%15 rawBlack=%16 rawWhite=%17 p05=%18 clipHigh=%19 balanceRGB=%20/%21/%22 balanceSamples=%23 patchValid=%24 patchLuma=%25 patchChroma=%26 patchBlueAmber=%27 patchGreenAxis=%28 refineRenders=%29 refineStartScore=%30 refineScore=%31 refineBlueAmber=%32 refineGreen=%33 masterScenePass=%34 initialPatchChecked=%35 initialPatchRefused=%36 initialPatchBaseChroma=%37 initialPatchFinalChroma=%38 %39 flavor=%40\n" )
         .arg( frameIndex )
         .arg( lookAssistSceneName( scene ) )
         .arg( stats.median, 0, 'f', 2 )
@@ -975,6 +979,7 @@ bool ReceiptApplier::applyHeadlessLookAssist(ReceiptSettings *receipt,
         .arg( wb.initialPatchRefused ? QStringLiteral("true") : QStringLiteral("false") )
         .arg( wb.initialPatchBaseChroma, 0, 'f', 1 )
         .arg( wb.initialPatchFinalChroma, 0, 'f', 1 )
+        .arg( lookAssistDecisionLogFields( stats, decisionTrace ) )
         .arg( lookAssistFlavorName( flavor ) ) );
 
     return true;

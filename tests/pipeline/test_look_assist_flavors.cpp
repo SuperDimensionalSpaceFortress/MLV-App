@@ -98,11 +98,14 @@ QMap<QString, int> receiptFields( const QString &receiptLine )
     return fields;
 }
 
-// The applied line as master wrote it: the appended flavor field taken off.
+// The applied line as the pinned master (b5751928) wrote it: both appended tails taken off, LOOK-ASSIST-DIAG-LOGGING-1's
+// decision trace (which starts at " has_ev100=") and this card's flavor field (always last, after the trace).
 QString withoutFlavorField( const QString &appliedLine )
 {
     QString s = appliedLine;
     s.remove( QRegularExpression( QStringLiteral(" flavor=\\S+$") ) );
+    const int trace = s.indexOf( QStringLiteral(" has_ev100=") );
+    if( trace >= 0 ) s.truncate( trace );
     return s;
 }
 

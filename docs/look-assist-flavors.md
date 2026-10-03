@@ -80,9 +80,9 @@ An unknown value is **Classic**, never a fall through to a lower layer, and is l
 
 The flavor applied is always reported, appended to the end of the existing lines (never inserted):
 
-* GUI `look_assist.apply.result`: `... next_serial=<n> flavor=<classic|cinematic>`.
+* GUI `look_assist.apply.result`: `... next_serial=<n> <decision trace fields> flavor=<classic|cinematic>` (the trace is LOOK-ASSIST-DIAG-LOGGING-1's, `has_ev100=` .. `playback_scale=`; flavor comes after it).
 * GUI `look_assist.apply.async_dispatch`: `... floor_lifted=<0|1> flavor=<...>`.
-* Headless `[BATCH] LOOK_ASSIST applied ...`: `... initialPatchFinalChroma=<x> flavor=<...>`.
+* Headless `[BATCH] LOOK_ASSIST applied ...`: `... initialPatchFinalChroma=<x> <decision trace fields> flavor=<...>`.
 * `gui_smoke.visual_state`: `... gpu_preview_processing_reject_reason=<r> look_assist_flavor=<...|none>`. This is
   what the venue job reads: its summary carries `lookFlavorReported`, and the leg receipt's
   `look.lookFlavorHonored` is `true` only when the app's own report equals the flavor the leg asked for
