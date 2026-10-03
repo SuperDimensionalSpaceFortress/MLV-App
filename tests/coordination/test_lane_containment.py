@@ -236,7 +236,9 @@ def prepare(tree, mode, assignment_failure=False, editing=False, allowed_tools="
       "MLV_CODEX_MODELS_CACHE":str(default_codex_models_cache)})
     if result_json is not None:
         env["MLV_FIXTURE_RESULT_JSON"]=str(result_json_path)
-    cmd=[PWSH,"-NoLogo","-NoProfile","-NonInteractive","-ExecutionPolicy","Bypass","-File",str(script),"-Lane",lane,"-Prompt","fixture prompt","-WorkDir",str(root),"-RunDir",str(run),"-TimeoutSec","3" if mode=="timeout" else "30","-Card","FIXTURE","-ReasoningEffort","low"]
+    cmd=[PWSH,"-NoLogo","-NoProfile","-NonInteractive","-ExecutionPolicy","Bypass","-File",str(script),"-Lane",lane,"-Prompt","fixture prompt","-WorkDir",str(root),"-RunDir",str(run),"-TimeoutSec","3" if mode=="timeout" else "30","-Card","FIXTURE","-ReasoningEffort","low","-NoWorktreeSweep"]
+    # -NoWorktreeSweep: the exit sweep defaults ON against C:\mlvtmp; a fixture lane must never
+    # look at the host's real lane worktrees (Retire-LaneWorktree.ps1 is not copied here anyway).
     if editing: cmd += ["-AllowEdits","-AllowedTools",allowed_tools]
     if allow_bulk_reads: cmd += ["-AllowBulkReads"]
     return cmd,env,run/(lane+"-001.receipt.json")
@@ -321,6 +323,27 @@ def test_resolved_model_ignores_an_auxiliary_model_beside_the_lane_model(fixture
     assert q["requestedModel"]=="sonnet"
     assert q["resolvedModel"]=="claude-sonnet-5"
     assert q["auxiliaryModels"]==["claude-haiku-4-5-20251001"]
+
+
+# DISK-MERGED-WORKTREE-SWEEP-1: the exit sweep is opt-out, and its outcome is always in the receipt.
+def test_no_worktree_sweep_leaves_the_receipt_key_null(fixture_tree):
+    cmd,env,receipt=prepare(fixture_tree,"normal")
+    assert "-NoWorktreeSweep" in cmd
+    r=subprocess.run(cmd,env=env,text=True,capture_output=True,timeout=20)
+    assert r.returncode==0,(r.stdout,r.stderr)
+    q=json.loads(receipt.read_text(encoding="utf-8"))
+    assert "worktreeSweep" in q and q["worktreeSweep"] is None
+
+
+# The sweep must never block the receipt: here it cannot even load its helper (the fixture dir has
+# no Retire-LaneWorktree.ps1), and the lane still exits 0 with the failure recorded, not raised.
+def test_worktree_sweep_failure_is_recorded_and_never_blocks_the_receipt(fixture_tree):
+    cmd,env,receipt=prepare(fixture_tree,"normal")
+    cmd=[c for c in cmd if c!="-NoWorktreeSweep"]+["-WorktreeSweepRoot",str(fixture_tree["root"]/"no-lanes")]
+    r=subprocess.run(cmd,env=env,text=True,capture_output=True,timeout=20)
+    assert r.returncode==0,(r.stdout,r.stderr)
+    q=json.loads(receipt.read_text(encoding="utf-8"))
+    assert q["worktreeSweep"]["error"].startswith("cannot-determine")
 
 
 # No modelUsage entry's canonicalModel belongs to the requested alias's family (a run that
