@@ -3072,6 +3072,26 @@ if ($displayReport.status -ne 'OK' -and -not $displayAsleepOverridden) {
     # had nothing to say when it actually said "zero, confirmed". $displayReport.status itself
     # (and the typed `result`/exit code above/below) stays authoritative either way.
     $displayFailurePresentMonStatus = if ($displayReport.status -eq 'DISPLAY_ASLEEP') { 'verified_zero_displayed' } else { 'unavailable' }
+    # DVE-PRESENTMON-EVIDENCE-1 >>> (the only text this card adds to the default job's decision flow; test_dual_venue_evidence strips these regions to prove the rest is byte-identical to the pinned baseline)
+    # DVE-PRESENTMON-EVIDENCE-1 item 2: a PresentMon display report that could not be produced (Ultra-Magnus, 2026-10-03: "PresentMon output does not exist" after a clean
+    # stop) used to end here with the six contact-sheet frames the app had already written left on the venue, published by nothing. The wait-failure branch above publishes
+    # its frames; this one now does too, under the SAME counter gate (a cuda leg needs gpu frames and no cpu frame; the cpu variant swaps in the inverse) -- by this point the
+    # job's own backend gates have already passed, so the gate holds by construction and is stated again here only so the two branches cannot drift apart. Only the typed
+    # PRESENTMON_UNAVAILABLE terminal publishes (DISPLAY_ASLEEP is a verified-zero display result with its own receipt shape). Nothing measured can change: the frames were
+    # captured by the app's seek pass before PresentMon was waited on, this runs after the counters are read, and it writes only under contact-sheet\. (its own try: a frame that
+    # cannot be published must never cost the typed summary below)
+    $parseFailureCountersContradictLeg = -not ($gpuFramesTotal -gt 0 -and [int64]$gpuSummary.cpuFrames -le 0)
+    try {
+        if (-not $parseFailureCountersContradictLeg -and $displayReport.status -eq 'PRESENTMON_UNAVAILABLE') {
+            $parseFailureRawFrames = Publish-AttrCudaContactSheetRawCaptures -Enabled $ContactSheetEnabled -SourceDir $contactSheetDir -PubRoot $Pub
+            if ($null -ne $parseFailureRawFrames -and @(Get-ChildItem -LiteralPath $parseFailureRawFrames -File).Count -gt 0) {
+                [void](Publish-AttrCudaText -Path (Join-Path $Pub 'contact-sheet\compose-status.txt') -Value 'CONTACT_SHEET_COMPOSE_UNAVAILABLE PresentMon produced no usable display report after the measured playback; the raw frames are published, the sheet was not composed on this venue')
+            }
+        }
+    } catch {
+        $parseFailureRawFrames = $null
+    }
+    # DVE-PRESENTMON-EVIDENCE-1 <<<
     $displayFailure = [ordered]@{
         schema='playback-attr-3-cuda-venue.v1'; result=$displayReport.status
         fixtureRehearsal=$FixtureRehearsal
@@ -3666,6 +3686,14 @@ if ($isCpuBackend) {
     $template = Edit-DualVenueTemplate $template 'if ($gpuSummary.cpuFrames -gt 0) {' 'if ($Backend -ne ''cpu'' -and $gpuSummary.cpuFrames -gt 0) {'
     # DVE-WAIT-FAILURE-FRAMES-BACKEND-GATE-1: a cpu leg's frames are vouched by the inverse counters (cpu frames, no gpu frame).
     $template = Edit-DualVenueTemplate $template '$waitFailureCountersContradictLeg = -not ($waitFailureGpuFramesTotal -gt 0 -and [int64]$waitFailureGpuSummary.cpuFrames -le 0)' '$waitFailureCountersContradictLeg = -not ($waitFailureGpuFramesTotal -le 0 -and [int64]$waitFailureGpuSummary.cpuFrames -gt 0)'
+    # DVE-PRESENTMON-EVIDENCE-1 item 2: the display-report-failure branch states the same gate; the cpu variant swaps in the same inverse (that branch is not reached by a
+    # cpu leg today -- PresentMon is informational there, see below -- but its text must never carry the cuda rule into a cpu job).
+    $template = Edit-DualVenueTemplate $template '$parseFailureCountersContradictLeg = -not ($gpuFramesTotal -gt 0 -and [int64]$gpuSummary.cpuFrames -le 0)' '$parseFailureCountersContradictLeg = -not ($gpuFramesTotal -le 0 -and [int64]$gpuSummary.cpuFrames -gt 0)'
+    # DVE-PRESENTMON-EVIDENCE-1 item 3 (hardening DVE-CPU-PRESENTMON-WAIT-GATES-1): docs/dual-venue-evidence.md -- PresentMon is informational on cpu -- but the wait-failure
+    # branch had no cpu override, so a cpu leg whose playback passed ended FAIL PRESENTMON_UNAVAILABLE (exit 23) the moment PresentMon hung or lost its stop. A cpu job skips that
+    # terminal: the run continues through its own gates, and the non-gating override below records presentMonStatus 'unavailable' with the wait failure's reason. A cuda job
+    # keeps the terminal. The capture evidence (streams, csvEverExisted) is published before the branch either way.
+    $template = Edit-DualVenueTemplate $template 'if ($null -ne $presentMonWaitError) {' 'if ($null -ne $presentMonWaitError -and $Backend -ne ''cpu'') {'
     $template = Edit-DualVenueTemplate $template '$stats = [ordered]@{}
 ' @'
 if ($Backend -eq 'cpu' -and ($gpuSummary.cpuFrames -le 0 -or $gpuFramesTotal -gt 0)) {
@@ -3688,13 +3716,13 @@ $stats = [ordered]@{}
     # non-gating path the DISPLAY_ASLEEP override already uses, with its status left as 'unavailable'.
     # (PowerShell's -and/-or have EQUAL precedence, so the cpu clause is its own statement.)
     $template = Edit-DualVenueTemplate $template '$displayAsleepOverridden =
-    ($displayReport.status -eq ''DISPLAY_ASLEEP'') -and' '$displayAsleepOverridden = [bool]($Backend -eq ''cpu'' -and $displayReport.status -ne ''OK'')
+    ($displayReport.status -eq ''DISPLAY_ASLEEP'') -and' '$displayAsleepOverridden = [bool]($Backend -eq ''cpu'' -and ($displayReport.status -ne ''OK'' -or $null -ne $presentMonWaitError))
 if (-not $displayAsleepOverridden) { $displayAsleepOverridden =
     ($displayReport.status -eq ''DISPLAY_ASLEEP'') -and'
     $template = Edit-DualVenueTemplate $template '    $displayAsleepForegroundVerification.verified
 $displayAsleepOverride = [ordered]@{' '    $displayAsleepForegroundVerification.verified }
 $displayAsleepOverride = [ordered]@{'
-    $template = Edit-DualVenueTemplate $template '"PresentMon reported DISPLAY_ASLEEP (reason: $($displayReport.reason)) -- not trusted " +' '"PresentMon reported $($displayReport.status) (reason: $($displayReport.reason)) on the cpu backend, where PresentMon is informational and never gating. Text below is the cuda-path override note and applies only if the status is DISPLAY_ASLEEP: not trusted " +'
+    $template = Edit-DualVenueTemplate $template '"PresentMon reported DISPLAY_ASLEEP (reason: $($displayReport.reason)) -- not trusted " +' '"PresentMon reported $($displayReport.status) (reason: $($displayReport.reason))$(if ($null -ne $presentMonWaitError) { "; its stop/wait failed: $presentMonWaitError" }) on the cpu backend, where PresentMon is informational and never gating. Text below is the cuda-path override note and applies only if the status is DISPLAY_ASLEEP: not trusted " +'
 }
 if ($isCpuBackend -or $ForceLookAssist) {
     $template = Edit-DualVenueTemplate $template '$contactSheetBackendLabel = if ($FixtureRehearsal) { ''fixture'' } else { ''cuda'' }' '$contactSheetBackendLabel = if ($FixtureRehearsal) { "fixture-$Backend" } else { $Backend }'

@@ -47,6 +47,7 @@ from tools.repo_hygiene.test_dve_leg_terminals import (
 PARSE_START = "if ($displayReport.status -ne 'OK' -and -not $displayAsleepOverridden) {"
 PARSE_END = "\n$pmRows = @($displayReport.selectedChainRows)"
 OVERRIDE_START = "$displayAsleepForegroundVerification = Get-AttrCudaForegroundVerification -LogText $rawLog"
+STATUS_OVERRIDE_START = "if ($displayAsleepOverridden) {\n    $presentMonStatus = 'unavailable'"
 OVERRIDE_END = "\n$dllSha256Lower = "
 CAPTURE_JSON_START = "Save-Json ([ordered]@{\n    schema='playback-attr-3-cuda-presentmon-capture.v2'"
 CAPTURE_JSON_END = "\n# CUDA-PERF-DISPLAY-IDENTITY-HARNESS-3 (sol+fable HARDENING, direction-corrected anchor"
@@ -533,7 +534,8 @@ class CpuLegPresentMonWaitFailureIsInformationalTests(_StopHarness, unittest.Tes
             f"$presentMonWaitError = '{PM_TIMEOUT_REASON}'\n"
             "$displayReport = [pscustomobject]@{ status = 'OK'; reason = $null }\n"
             "$presentMonStatus = 'degraded'; $presentMonStatusReason = $null\n"
-            + _slice(text, OVERRIDE_START, OVERRIDE_END) + "\n"
+            + _slice(text, OVERRIDE_START, PARSE_START) + "\n"
+            + _slice(text, STATUS_OVERRIDE_START, OVERRIDE_END) + "\n"
             "Write-Output ('OVERRIDDEN=' + $displayAsleepOverridden)\nWrite-Output ('STATUS=' + $presentMonStatus)\nWrite-Output ('REASON=' + $presentMonStatusReason)\n", encoding="utf-8")
         proc = run_pwsh(["-File", str(script)])
         out = proc.stdout + proc.stderr
@@ -544,7 +546,6 @@ class CpuLegPresentMonWaitFailureIsInformationalTests(_StopHarness, unittest.Tes
 
     def test_mutation_without_the_cpu_edit_a_cpu_leg_fails_on_presentmon_again(self) -> None:
         edit = "if ($null -ne $presentMonWaitError -and $Backend -ne 'cpu') {"
-        self.assertIn(edit, GENERATOR.read_text(encoding="utf-8").replace("\r\n", "\n"), "the generator carries the cpu edit")
         text = CpuGeneratedJobs.text("cpu")
         self.assertIn(edit, text)
         mutated = text.replace(edit, "if ($null -ne $presentMonWaitError) {", 1)

@@ -381,6 +381,11 @@ WRITE_ALLOWED = {
         "the smoke child's stdout / stderr redirected into two fixed-name files under $legOut, the job's own "
         "per-leg output directory inside $Pub (created by this job a few lines above, unique per job); not a "
         "view entry and not an owner path.",
+    ("playback-attr-3-cuda-job.ps1", "$proc = Start-Process -FilePath (Join-Path $Cache $PresentMonName) -ArgumentList $pmArgs -RedirectStandardOutput $presentMonStdoutPath -RedirectStandardError $presentMonStderrPath -PassThru -WindowStyle Hidden"):
+        "DVE-PRESENTMON-EVIDENCE-1: PresentMon's own stdout / stderr redirected into two fixed-name files ('presentmon-stdout.txt', "
+        "'presentmon-stderr.txt') under $legOut, the job's own per-leg output directory (each variable is a single "
+        "Join-Path $legOut '<literal>' assignment, which the publish-write scan proves is under $Work); PresentMon is "
+        "launched with a process name and its own CSV path, never an owner path, and never opens footage.",
     ("playback-attr-3-cuda-job.ps1", "$rows | Export-Csv -LiteralPath (Join-Path $legOut 'probe-timeline.csv') -NoTypeInformation"):
         "the probe timeline CSV, a fixed-name file in $legOut -- the job's own per-leg output directory inside $Pub, "
         "created by this job and unique per job; the rows are the job's own measurements, and the path names no "
