@@ -64,6 +64,12 @@ struct GpuPreviewProcessingConfig
     bool shadowsHighlightsFrameStateReady = false;
     int shadowsHighlightsFrameWidth = 0;
     int shadowsHighlightsFrameHeight = 0;
+    /* PLAYBACK-SH-OFF-CPU-PATH-1: true when shadowsHighlightsBlur holds the
+     * quarter-res RBF output ((frame width / 4) x (frame height / 4) RGB16)
+     * instead of the full-res blur. Consumers reproduce the engine's two 2x
+     * bilinear upsample stages exactly (the display shader in GLSL, the CPU
+     * reference via gpuPreviewProcessingResolveFullResShadowsHighlightsBlur). */
+    bool shadowsHighlightsBlurQuarter = false;
     QByteArray shadowsHighlightsBlur;
     QByteArray shadowsHighlightsCurve;
     bool applyLut = false;
@@ -172,11 +178,22 @@ bool gpuPreviewProcessingHasShadowsHighlightsFrameState(
 void gpuPreviewProcessingApplyCpuRoute(GpuPreviewProcessingConfig * config,
                                        const processingObject_t * processing,
                                        bool direct8Route);
+/* Attaches the current S/H frame state: the quarter-res blur when the engine's
+ * last refresh was the quarter-only one for this width x height
+ * (processingGetShadowsHighlightsQuarterBlurData), else the full-res blur. */
 bool gpuPreviewProcessingAttachFrameState(GpuPreviewProcessingConfig * config,
                                           const processingObject_t * processing,
                                           int width,
                                           int height,
                                           QString * reason = nullptr);
+/* Returns config itself when it carries no quarter-res blur; otherwise fills
+ * *expanded with a copy whose blur is expanded to full res by the engine's own
+ * upsample stages (bit-identical to the legacy full-res blur) and returns it. */
+const GpuPreviewProcessingConfig & gpuPreviewProcessingResolveFullResShadowsHighlightsBlur(
+    const GpuPreviewProcessingConfig & config,
+    int width,
+    int height,
+    GpuPreviewProcessingConfig * expanded);
 struct GpuPreviewProcessingBackendAvailability
 {
     bool available = false;
@@ -241,6 +258,7 @@ struct GpuPreviewProcessingLutTextureSet
     int shadowsHighlightsBlurWidth = 0;
     int shadowsHighlightsBlurHeight = 0;
     bool shadowsHighlightsBlurReady = false;
+    bool shadowsHighlightsBlurQuarter = false;   /* texture holds the quarter-res blur */
 };
 
 /* A presenter route that does NOT upload a fresh per-frame shadows/highlights

@@ -1416,7 +1416,50 @@ QByteArray gpuPreviewProcessingDisplayFragmentShaderSource(void)
         "uniform float previewShadowsHighlightsCurveIndexMask;\n"
         "uniform float previewApplyVibrance;\n"
         "uniform float previewVibrance;\n"
+        "uniform float shadowsHighlightsBlurQuarter;\n"
+        "uniform vec2 shadowsHighlightsBlurSize;\n"
         "varying vec2 vTexCoord;\n"
+        /* PLAYBACK-SH-OFF-CPU-PATH-1: the quarter-res S/H frame state. The
+         * texture holds the engine's quarter-res RBF output; shBlurFullAt
+         * reproduces its two rgb_u16_upsample_2x_bilinear stages
+         * (raw_processing.c) in exact integer arithmetic: even/even copies the
+         * source texel, odd columns/rows average with the next texel (clamped
+         * to the last one) and truncate, odd/odd averages four and truncates.
+         * All values stay below 2^19, so float math is exact. */
+        "vec3 shBlurQuarterTexel(vec2 q)\n"
+        "{\n"
+        "    return floor(texture2D(shadowsHighlightsBlurTexture, (q + vec2(0.5)) / shadowsHighlightsBlurSize).rgb * 65535.0 + 0.5);\n"
+        "}\n"
+        "vec3 shBlurHalfAt(vec2 h)\n"
+        "{\n"
+        "    vec2 b = floor(h * 0.5);\n"
+        "    vec2 o = h - b * 2.0;\n"
+        "    vec2 n = min(b + vec2(1.0), shadowsHighlightsBlurSize - vec2(1.0));\n"
+        "    vec3 p00 = shBlurQuarterTexel(b);\n"
+        "    if (o.x < 0.5)\n"
+        "    {\n"
+        "        if (o.y < 0.5) return p00;\n"
+        "        return floor((p00 + shBlurQuarterTexel(vec2(b.x, n.y))) * 0.5);\n"
+        "    }\n"
+        "    vec3 p01 = shBlurQuarterTexel(vec2(n.x, b.y));\n"
+        "    if (o.y < 0.5) return floor((p00 + p01) * 0.5);\n"
+        "    return floor((p00 + p01 + shBlurQuarterTexel(vec2(b.x, n.y)) + shBlurQuarterTexel(n)) * 0.25);\n"
+        "}\n"
+        "vec3 shBlurFullAt(vec2 p)\n"
+        "{\n"
+        "    vec2 b = floor(p * 0.5);\n"
+        "    vec2 o = p - b * 2.0;\n"
+        "    vec2 n = min(b + vec2(1.0), shadowsHighlightsBlurSize * 2.0 - vec2(1.0));\n"
+        "    vec3 p00 = shBlurHalfAt(b);\n"
+        "    if (o.x < 0.5)\n"
+        "    {\n"
+        "        if (o.y < 0.5) return p00;\n"
+        "        return floor((p00 + shBlurHalfAt(vec2(b.x, n.y))) * 0.5);\n"
+        "    }\n"
+        "    vec3 p01 = shBlurHalfAt(vec2(n.x, b.y));\n"
+        "    if (o.y < 0.5) return floor((p00 + p01) * 0.5);\n"
+        "    return floor((p00 + p01 + shBlurHalfAt(vec2(b.x, n.y)) + shBlurHalfAt(n)) * 0.25);\n"
+        "}\n"
         "float cubicWeight(float x)\n"
         "{\n"
         "    x = abs(x);\n"
@@ -1591,7 +1634,9 @@ QByteArray gpuPreviewProcessingDisplayFragmentShaderSource(void)
          * data it was computed from, so it is sampled the same (unflipped)
          * way here to stay pixel-aligned with the frame this shader samples. */
         "        vec2 shfc = vTexCoord * textureSize;\n"
-        "        vec3 shBlur = floor(texture2D(shadowsHighlightsBlurTexture, (floor(shfc) + vec2(0.5)) / textureSize).rgb * 65535.0 + 0.5);\n"
+        "        vec3 shBlur = (shadowsHighlightsBlurQuarter > 0.5)\n"
+        "            ? shBlurFullAt(floor(shfc))\n"
+        "            : floor(texture2D(shadowsHighlightsBlurTexture, (floor(shfc) + vec2(0.5)) / textureSize).rgb * 65535.0 + 0.5);\n"
         "        float shBval = shBlur.r;\n"
         "        if (previewShadowsHighlightsCurveIndexMask <= 0.5)\n"
         "        {\n"
@@ -2491,19 +2536,25 @@ bool gpuPreviewProcessingUpdateShadowsHighlightsBlurTexture(
         set.shadowsHighlightsBlurWidth = 0;
         set.shadowsHighlightsBlurHeight = 0;
         set.shadowsHighlightsBlurReady = false;
+        set.shadowsHighlightsBlurQuarter = false;
         return false;
     };
 
+    /* PLAYBACK-SH-OFF-CPU-PATH-1: a quarter-res frame state uploads a
+     * (width/4) x (height/4) texture; the display shader upsamples it. */
+    const int blurWidth = config.shadowsHighlightsBlurQuarter ? width / 4 : width;
+    const int blurHeight = config.shadowsHighlightsBlurQuarter ? height / 4 : height;
     if ( !set.shadowsHighlightsBlur
       || !set.shadowsHighlightsBlur->isCreated()
-      || set.shadowsHighlightsBlurWidth != width
-      || set.shadowsHighlightsBlurHeight != height )
+      || set.shadowsHighlightsBlurWidth != blurWidth
+      || set.shadowsHighlightsBlurHeight != blurHeight )
     {
         delete set.shadowsHighlightsBlur;
-        set.shadowsHighlightsBlur = createFrameTexture(width, height);
-        set.shadowsHighlightsBlurWidth = width;
-        set.shadowsHighlightsBlurHeight = height;
+        set.shadowsHighlightsBlur = createFrameTexture(blurWidth, blurHeight);
+        set.shadowsHighlightsBlurWidth = blurWidth;
+        set.shadowsHighlightsBlurHeight = blurHeight;
     }
+    set.shadowsHighlightsBlurQuarter = config.shadowsHighlightsBlurQuarter;
     if ( !previewProcessingTextureIsReady(set.shadowsHighlightsBlur) )
     {
         return failClosed();
@@ -2511,7 +2562,7 @@ bool gpuPreviewProcessingUpdateShadowsHighlightsBlurTexture(
 
     const QByteArray packed = packRgb16Texture(
         reinterpret_cast<const uint16_t *>(config.shadowsHighlightsBlur.constData()),
-        width * height);
+        blurWidth * blurHeight);
 
     // Same FAIL CLOSED discipline as gpuPreviewProcessingUpdateLutTextureSet
     // (GPU-TEXNR-S1-DARK-GREEN-1): drain any stale GL error before the upload
@@ -2625,6 +2676,11 @@ void gpuPreviewProcessingBindDisplayUniformsAndTextures(
                              (shadowsHighlightsReady && config.applyShadowsHighlights) ? 1.0f : 0.0f);
     program->setUniformValue("previewShadowsHighlightsCurveIndexMask",
                              config.shadowsHighlightsCurveIndexMask ? 1.0f : 0.0f);
+    program->setUniformValue("shadowsHighlightsBlurQuarter",
+                             (shadowsHighlightsReady && lutSet.shadowsHighlightsBlurQuarter) ? 1.0f : 0.0f);
+    program->setUniformValue("shadowsHighlightsBlurSize",
+                             QVector2D(static_cast<float>(qMax(1, lutSet.shadowsHighlightsBlurWidth)),
+                                       static_cast<float>(qMax(1, lutSet.shadowsHighlightsBlurHeight))));
     if ( shadowsHighlightsReady )
     {
         program->setUniformValue("shadowsHighlightsCurve", 7);
@@ -3223,12 +3279,52 @@ bool gpuPreviewProcessingHasShadowsHighlightsFrameState(
     {
         return false;
     }
-    const size_t pixelCount =
-        static_cast<size_t>(width) * static_cast<size_t>(height);
+    if ( config.shadowsHighlightsBlurQuarter
+      && ( width % 4 != 0 || height % 4 != 0 ) )
+    {
+        return false;
+    }
+    const size_t pixelCount = config.shadowsHighlightsBlurQuarter
+        ? static_cast<size_t>(width / 4) * static_cast<size_t>(height / 4)
+        : static_cast<size_t>(width) * static_cast<size_t>(height);
     return config.shadowsHighlightsBlur.size()
             == static_cast<int>(pixelCount * 3u * sizeof(uint16_t))
         && config.shadowsHighlightsCurve.size()
             == static_cast<int>(65536u * sizeof(float));
+}
+
+const GpuPreviewProcessingConfig & gpuPreviewProcessingResolveFullResShadowsHighlightsBlur(
+    const GpuPreviewProcessingConfig & config,
+    int width,
+    int height,
+    GpuPreviewProcessingConfig * expanded)
+{
+    if ( !config.shadowsHighlightsBlurQuarter || !expanded )
+    {
+        return config;
+    }
+    *expanded = config;
+    expanded->shadowsHighlightsBlurQuarter = false;
+    if ( !gpuPreviewProcessingHasShadowsHighlightsFrameState(config, width, height) )
+    {
+        expanded->shadowsHighlightsFrameStateReady = false;
+        expanded->shadowsHighlightsBlur.clear();
+        return *expanded;
+    }
+    QByteArray full(static_cast<int>(static_cast<size_t>(width) * height * 3u * sizeof(uint16_t)),
+                    Qt::Uninitialized);
+    if ( !processingExpandShadowsHighlightsQuarterBlur(
+             reinterpret_cast<const uint16_t *>(config.shadowsHighlightsBlur.constData()),
+             width / 4, height / 4,
+             reinterpret_cast<uint16_t *>(full.data()),
+             width, height, 1) )
+    {
+        expanded->shadowsHighlightsFrameStateReady = false;
+        expanded->shadowsHighlightsBlur.clear();
+        return *expanded;
+    }
+    expanded->shadowsHighlightsBlur = full;
+    return *expanded;
 }
 
 void gpuPreviewProcessingApplyCpuRoute(GpuPreviewProcessingConfig * config,
@@ -3253,6 +3349,7 @@ bool gpuPreviewProcessingAttachFrameState(GpuPreviewProcessingConfig * config,
             config->shadowsHighlightsFrameStateReady = false;
             config->shadowsHighlightsFrameWidth = 0;
             config->shadowsHighlightsFrameHeight = 0;
+            config->shadowsHighlightsBlurQuarter = false;
             config->shadowsHighlightsBlur.clear();
         }
         if ( reason ) *reason = why;
@@ -3271,6 +3368,42 @@ bool gpuPreviewProcessingAttachFrameState(GpuPreviewProcessingConfig * config,
     if ( width <= 0 || height <= 0 )
     {
         return fail(QStringLiteral("shadows/highlights frame dimensions invalid"));
+    }
+
+    const uint16_t * quarterData = nullptr;
+    int quarterWidth = 0;
+    int quarterHeight = 0;
+    int quarterFrameWidth = 0;
+    int quarterFrameHeight = 0;
+    if ( processingGetShadowsHighlightsQuarterBlurData(processing,
+                                                       &quarterData,
+                                                       &quarterWidth,
+                                                       &quarterHeight,
+                                                       &quarterFrameWidth,
+                                                       &quarterFrameHeight)
+      && quarterData )
+    {
+        /* The quarter refresh is the engine's latest blur computation, so any
+         * full-res blur it holds is older: never fall back to it. */
+        if ( quarterFrameWidth != width || quarterFrameHeight != height )
+        {
+            return fail(QStringLiteral(
+                "quarter-res shadows/highlights frame state dimensions do not match render frame"));
+        }
+        int quarterCurveIndexMask = 0;
+        (void)processingGetShadowsHighlightsBlurData(processing, nullptr, nullptr, nullptr,
+                                                     &quarterCurveIndexMask);
+        config->shadowsHighlightsCurveIndexMask = quarterCurveIndexMask != 0;
+        config->shadowsHighlightsFrameWidth = width;
+        config->shadowsHighlightsFrameHeight = height;
+        config->shadowsHighlightsBlurQuarter = true;
+        config->shadowsHighlightsBlur =
+            QByteArray(reinterpret_cast<const char *>(quarterData),
+                       static_cast<int>(static_cast<size_t>(quarterWidth) * quarterHeight
+                                        * 3u * sizeof(uint16_t)));
+        config->shadowsHighlightsFrameStateReady = true;
+        if ( reason ) reason->clear();
+        return true;
     }
 
     const uint16_t * blurData = nullptr;
@@ -3303,6 +3436,7 @@ bool gpuPreviewProcessingAttachFrameState(GpuPreviewProcessingConfig * config,
     config->shadowsHighlightsCurveIndexMask = curveIndexMask != 0;
     config->shadowsHighlightsFrameWidth = width;
     config->shadowsHighlightsFrameHeight = height;
+    config->shadowsHighlightsBlurQuarter = false;
     config->shadowsHighlightsBlur =
         QByteArray(reinterpret_cast<const char *>(blurData),
                    static_cast<int>(byteCount));
@@ -3341,12 +3475,15 @@ GpuPreviewProcessingBackendAvailability gpuPreviewProcessingProbeGpuBackend(void
     return availability;
 }
 
-void gpuPreviewProcessingApplyCpuReference(const GpuPreviewProcessingConfig & config,
+void gpuPreviewProcessingApplyCpuReference(const GpuPreviewProcessingConfig & configIn,
                                            const uint16_t * inputRgb16,
                                            uint16_t * outputRgb16,
                                            int width,
                                            int height)
 {
+    GpuPreviewProcessingConfig expandedConfig;
+    const GpuPreviewProcessingConfig & config =
+        gpuPreviewProcessingResolveFullResShadowsHighlightsBlur(configIn, width, height, &expandedConfig);
     const int pixelCount = width * height;
     if ( !inputRgb16 || !outputRgb16 || pixelCount <= 0 )
     {
@@ -3561,7 +3698,7 @@ bool gpuPreviewProcessingApplyDisplayGpuOffscreen(const GpuPreviewProcessingConf
     return true;
 }
 
-bool gpuPreviewProcessingApplyGpuOffscreen(const GpuPreviewProcessingConfig & config,
+bool gpuPreviewProcessingApplyGpuOffscreen(const GpuPreviewProcessingConfig & configIn,
                                            const uint16_t * inputRgb16,
                                            uint16_t * outputRgb16,
                                            int width,
@@ -3569,6 +3706,11 @@ bool gpuPreviewProcessingApplyGpuOffscreen(const GpuPreviewProcessingConfig & co
                                            QString * reason,
                                            QString * rendererDescription)
 {
+    /* The subset shader samples a full-res blur; a quarter-res frame state is
+     * expanded on the CPU first (bit-identical to the legacy blur). */
+    GpuPreviewProcessingConfig expandedConfig;
+    const GpuPreviewProcessingConfig & config =
+        gpuPreviewProcessingResolveFullResShadowsHighlightsBlur(configIn, width, height, &expandedConfig);
     auto fail = [&](const QString & why) -> bool
     {
         if ( reason ) *reason = why;
