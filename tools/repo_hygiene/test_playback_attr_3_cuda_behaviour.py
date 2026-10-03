@@ -4152,6 +4152,9 @@ class PresentMonSpawnFailureTests(_PwshCase):
             f"Import-Module '{MODULE}' -Force\n"
             + stub + "\n"
             f"$presentMonPath = '{present_mon_path}'\n"
+            # DVE-PRESENTMON-EVIDENCE-1: the job defines PresentMon's two stream-file paths (beside its CSV) before the span this probe extracts.
+            f"$presentMonStdoutPath = '{self.tmp / 'presentmon-stdout.txt'}'\n"
+            f"$presentMonStderrPath = '{self.tmp / 'presentmon-stderr.txt'}'\n"
             "$FixtureRehearsal = $true\n"
             "$SourceCommit = ('1' * 40)\n"
             "$ClipId = 'tiny_dual_iso'\n"
