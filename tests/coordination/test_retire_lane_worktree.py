@@ -5,6 +5,7 @@ checkout's refs. Every case asserts both the action AND the reason prefix, so a 
 passes for the wrong reason fails the test.
 """
 import json
+import os
 import shutil
 import subprocess
 from pathlib import Path
@@ -149,4 +150,110 @@ def test_unresolvable_merge_target_is_cannot_determine_not_pass(repo):
     wt = _add_wt(main, tmp / "wt-badref")
     d = _retire(wt, MergeTarget="refs/heads/no-such-ref", QuarantineRoot=str(tmp / "q"))
     assert d["action"] == "kept" and d["reason"].startswith("cannot-determine")
+    assert wt.exists()
+
+
+# --- Invoke-SweepMergedLaneWorktrees: every lane exit re-asks the SAFE gate about the others ---
+# Each case asserts what was retired AND, for the kept ones, the reason prefix the gate gave
+# (kept{prefix: count}), so a sweep that keeps a worktree for the wrong reason fails too.
+
+def _ps_arg(v):
+    if isinstance(v, (list, tuple)):
+        return "@(" + ",".join(f"'{x}'" for x in v) + ")"
+    if isinstance(v, int):
+        return str(v)
+    return f"'{v}'"
+
+
+def _sweep(main, **kw):
+    args = [f"-RepoRoot '{main}'"]
+    for k, v in kw.items():
+        args.append(f"-{k}" if v is True else f"-{k} {_ps_arg(v)}")
+    script = (
+        "$ErrorActionPreference='Stop'; Set-StrictMode -Version Latest; "
+        f". '{HELPER}'; "
+        f"Invoke-SweepMergedLaneWorktrees {' '.join(args)} | ConvertTo-Json -Depth 5"
+    )
+    out = subprocess.run([PWSH, "-NoProfile", "-NonInteractive", "-Command", script],
+                         check=True, capture_output=True, text=True).stdout
+    return json.loads(out)
+
+
+def _norm(p):
+    return os.path.normcase(os.path.normpath(str(p)))
+
+
+def _swept_paths(summary):
+    return sorted(_norm(p) for p in summary["retired"])
+
+
+def test_sweep_retires_merged_clean_idle_worktree_under_root(repo):
+    tmp, main = repo
+    root = tmp / "lanes"
+    wt = _add_wt(main, root / "lane-merged")
+    s = _sweep(main, Root=str(root), MergeTarget="origin/master", MinIdleHours=0, QuarantineRoot=str(tmp / "q"))
+    assert s["schema"] == "mlv-app/merged-worktree-sweep/v1"
+    assert (s["considered"], s["young"], s["notReached"], s["error"]) == (1, 0, 0, None)
+    assert _swept_paths(s) == [_norm(wt)] and s["kept"] == {}
+    assert not wt.exists()
+
+
+def test_sweep_leaves_a_worktree_outside_root_untouched(repo):
+    tmp, main = repo
+    root = tmp / "lanes"
+    inside = _add_wt(main, root / "lane-in")
+    outside = _add_wt(main, tmp / "elsewhere" / "wt-out")
+    s = _sweep(main, Root=str(root), MergeTarget="origin/master", MinIdleHours=0, QuarantineRoot=str(tmp / "q"))
+    assert s["considered"] == 1 and _swept_paths(s) == [_norm(inside)]
+    assert outside.exists() and not inside.exists()
+
+
+def test_sweep_leaves_an_excluded_path_untouched(repo):
+    tmp, main = repo
+    root = tmp / "lanes"
+    keep = _add_wt(main, root / "lane-excluded")
+    gone = _add_wt(main, root / "lane-other")
+    s = _sweep(main, Root=str(root), MergeTarget="origin/master", MinIdleHours=0,
+               QuarantineRoot=str(tmp / "q"), Exclude=[str(keep).upper()])
+    assert s["considered"] == 1 and _swept_paths(s) == [_norm(gone)]
+    assert keep.exists() and not gone.exists()
+
+
+def test_sweep_skips_a_young_worktree_before_the_gate(repo):
+    tmp, main = repo
+    root = tmp / "lanes"
+    wt = _add_wt(main, root / "lane-young")
+    s = _sweep(main, Root=str(root), MergeTarget="origin/master", MinIdleHours=1000, QuarantineRoot=str(tmp / "q"))
+    assert (s["considered"], s["young"], s["retired"], s["kept"]) == (1, 1, [], {})
+    assert wt.exists()
+
+
+def test_sweep_keeps_an_unmerged_worktree_with_the_gate_reason(repo):
+    tmp, main = repo
+    root = tmp / "lanes"
+    wt = _add_wt(main, root / "lane-unmerged")
+    _git(wt, "-c", "user.name=t", "-c", "user.email=t@t", "commit", "--allow-empty", "-m", "side work")
+    _git(wt, "push", "-q", "origin", "HEAD:refs/heads/side")
+    s = _sweep(main, Root=str(root), MergeTarget="origin/master", MinIdleHours=0, QuarantineRoot=str(tmp / "q"))
+    assert (s["considered"], s["retired"], s["kept"]) == (1, [], {"unmerged": 1})
+    assert wt.exists()
+
+
+def test_sweep_budget_zero_reports_everything_not_reached_and_removes_nothing(repo):
+    tmp, main = repo
+    root = tmp / "lanes"
+    wts = [_add_wt(main, root / f"lane-b{i}") for i in range(2)]
+    s = _sweep(main, Root=str(root), MergeTarget="origin/master", MinIdleHours=0,
+               QuarantineRoot=str(tmp / "q"), BudgetSeconds=0)
+    assert (s["considered"], s["notReached"], s["retired"], s["young"]) == (2, 2, [], 0)
+    assert all(w.exists() for w in wts)
+
+
+def test_sweep_whatif_lists_the_worktree_but_removes_nothing(repo):
+    tmp, main = repo
+    root = tmp / "lanes"
+    wt = _add_wt(main, root / "lane-whatif")
+    s = _sweep(main, Root=str(root), MergeTarget="origin/master", MinIdleHours=0,
+               QuarantineRoot=str(tmp / "q"), WhatIf=True)
+    assert _swept_paths(s) == [_norm(wt)] and s["kept"] == {}
     assert wt.exists()
