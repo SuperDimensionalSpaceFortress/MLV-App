@@ -563,7 +563,9 @@ class CpuLegSkippedRatioIsMeasuredNotGatedTests(unittest.TestCase):
         self.assertEqual(sum(1 for token in re.findall(r"-[A-Za-z]+", smoke_line) if token == "-MaxSkippedOrUnpresentedRatio"), 1)
         # the whole cpu command differs from the default's only by the inserted argument and the cpu variant's own environment/arguments already pinned elsewhere
         default_line = next(l for l in default.splitlines() if l.startswith("$cmd = \"& $(ConvertTo-PsSingleQuoted $smoke)"))
-        self.assertEqual(smoke_line.replace(" -MaxSkippedOrUnpresentedRatio 1", ""), default_line)
+        # CPU-LOOK-LEG-PACE-ABORT-1: the one other argument a cpu command carries is the pace switch (the cpu pace is informational), exactly once.
+        self.assertEqual(smoke_line.count(" -CpuPlayPaceInformational "), 1)
+        self.assertEqual(smoke_line.replace(" -MaxSkippedOrUnpresentedRatio 1", "").replace(" -CpuPlayPaceInformational", ""), default_line)
 
     def test_a_cpu_success_summary_records_the_ratio_as_a_measured_field_and_a_cuda_one_does_not(self) -> None:
         cpu = CpuGeneratedJobs.text("cpu")
@@ -579,7 +581,7 @@ class CpuLegSkippedRatioIsMeasuredNotGatedTests(unittest.TestCase):
         self.assertIn("[ValidateRange(0.0, 1.0)]\r\n    [double]$MaxSkippedOrUnpresentedRatio = 0.5" if "\r\n" in launcher else "[ValidateRange(0.0, 1.0)]\n    [double]$MaxSkippedOrUnpresentedRatio = 0.5", launcher)
 
     def test_mutation_without_the_cpu_patch_the_limit_stays_and_the_leg_fails_again(self) -> None:
-        mutated = self.mutated_generator(("$template = Edit-DualVenueTemplate $template ' -Scope none -FrameTelemetry' ' -Scope none -MaxSkippedOrUnpresentedRatio 1 -FrameTelemetry'", "$null = 0"))
+        mutated = self.mutated_generator(("$template = Edit-DualVenueTemplate $template ' -Scope none -FrameTelemetry' (' -Scope none -MaxSkippedOrUnpresentedRatio 1' + $cpuPaceSwitch + ' -FrameTelemetry')", "$null = 0"))
         text = CpuGeneratedJobs.text("cpu", generator=mutated)
         self.assertNotIn("MaxSkippedOrUnpresentedRatio", text, "with the cpu patch removed the 50% gate is back (the UM state of 2026-10-02)")
 

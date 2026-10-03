@@ -671,14 +671,15 @@ struct EngineRun
 // cut range [cutIn, cutOut], stopping per evaluatePlayStop -- or, when legacyHoldLimit > 0, the pre-ENFORCE-3
 // rule (stop when that many ms have elapsed, whatever was consumed).
 EngineRun runEngine( int startFrame, int cutIn, int cutOut, double paceFps, int64_t required,
-                     int64_t safetyMs, int64_t legacyHoldLimit = 0, bool loopEnabled = false )
+                     int64_t safetyMs, int64_t legacyHoldLimit = 0, bool loopEnabled = false,
+                     playback_frame_range::PlayPaceMode mode = playback_frame_range::PlayPaceMode::Gated )
 {
     EngineRun run;
     SourceFrameAdvanceCounter counter;
     counter.begin( startFrame );
     double position = startFrame;
     const int tickMs = 10;
-    for( int64_t elapsed = 0; elapsed <= 600000; elapsed += tickMs )
+    for( int64_t elapsed = 0; elapsed <= 900000; elapsed += tickMs )   // past the 765 s CPU ceiling
     {
         const bool playing = position < cutOut - 1 || loopEnabled;
         if( legacyHoldLimit > 0 )
@@ -687,7 +688,7 @@ EngineRun runEngine( int startFrame, int cutIn, int cutOut, double paceFps, int6
         }
         else
         {
-            run.state = evaluatePlayStop( counter.consumed(), required, playing, elapsed, safetyMs );
+            run.state = evaluatePlayStop( counter.consumed(), required, playing, elapsed, safetyMs, mode );
             if( run.state != PlayStopState::Continue ) { run.elapsedMs = elapsed; break; }
         }
         const playback_frame_range::DropFrameTickResult tick =
@@ -1085,4 +1086,118 @@ TEST( RunNonce, UnsetOrMalformedIsTheNoNonceToken )
     ASSERT_EQ( none, playback_frame_range::sanitizeRunNonce( "quote\"injection12" ) );                            // would break the JSON
     ASSERT_EQ( none, playback_frame_range::sanitizeRunNonce( "key=value12345678" ) );                             // would forge a log field
     ASSERT_EQ( std::string( 64, 'a' ), playback_frame_range::sanitizeRunNonce( std::string( 64, 'a' ).c_str() ) ); // the 64-char ceiling
+}
+
+// ---------------------------------------------------------------------------------------------------------
+// CPU-LOOK-LEG-PACE-ABORT-1: a CPU-backend leg's pace is MEASURED and INFORMATIONAL. The in-Play pace probe never aborts
+// it; the wall budget is the CPU ceiling (requested / kCpuInformationalMinPaceFraction + margin) and running into it is
+// the typed PLAY_SAFETY_TIMEOUT. A gated (CUDA / interactive-automation) run is byte-for-byte what it was.
+// ---------------------------------------------------------------------------------------------------------
+namespace
+{
+using playback_frame_range::PlayPaceMode;
+}
+
+TEST( CpuPaceInformational, TheDefaultModeIsGatedAndTheGatedBudgetIsUnchanged )
+{
+    ASSERT_TRUE( playback_frame_range::playPaceModeFromEnvironmentValue( nullptr ) == PlayPaceMode::Gated );
+    ASSERT_TRUE( playback_frame_range::playPaceModeFromEnvironmentValue( "" ) == PlayPaceMode::Gated );
+    ASSERT_TRUE( playback_frame_range::playPaceModeFromEnvironmentValue( "gated" ) == PlayPaceMode::Gated );
+    // Anything but the exact word fails closed to the gate (a typo never switches the gate off).
+    ASSERT_TRUE( playback_frame_range::playPaceModeFromEnvironmentValue( "Informational" ) == PlayPaceMode::Gated );
+    ASSERT_TRUE( playback_frame_range::playPaceModeFromEnvironmentValue( "informational " ) == PlayPaceMode::Gated );
+    ASSERT_TRUE( playback_frame_range::playPaceModeFromEnvironmentValue( "informational" ) == PlayPaceMode::MeasuredInformational );
+    ASSERT_EQ( 65000, playSafetyMs( 25.0 ) );
+    ASSERT_EQ( 65000, playSafetyMs( 25.0, PlayPaceMode::Gated ) );
+}
+
+TEST( CpuPaceInformational, TheCpuCeilingIsStatedAndBoundedAndAboveTheGatedBudget )
+{
+    // 25 s of footage / (1/30) + 15 s = 765 s (12.75 min): the one hard ceiling of a CPU leg.
+    ASSERT_EQ( 765000, playSafetyMs( 25.0, PlayPaceMode::MeasuredInformational ) );
+    ASSERT_TRUE( playSafetyMs( 25.0, PlayPaceMode::MeasuredInformational ) > playSafetyMs( 25.0 ) );
+    ASSERT_EQ( 615000, playSafetyMs( 20.0, PlayPaceMode::MeasuredInformational ) );
+}
+
+TEST( CpuPaceInformational, ACpuRunAtFourFpsIsNotAbortedByThePaceProbeAndGetsToTheRequirement )
+{
+    // 600 source frames at 4 fps = 150 s: the gated budget (65 s) would have ended it at 8 s as PLAY_PACE_TOO_SLOW.
+    const int64_t gated = playSafetyMs( 25.0 );
+    ASSERT_TRUE( evaluatePlayStop( 34, 600, true, 8050, gated ) == PlayStopState::PaceTooSlow );   // the 10/3 UM evidence
+    const int64_t cpu = playSafetyMs( 25.0, PlayPaceMode::MeasuredInformational );
+    ASSERT_TRUE( evaluatePlayStop( 34, 600, true, 8050, cpu, PlayPaceMode::MeasuredInformational ) == PlayStopState::Continue );
+    const EngineRun run = runEngine( 0, 1, 720, 4.0, 600, cpu, 0, false, PlayPaceMode::MeasuredInformational );
+    ASSERT_TRUE( run.state == PlayStopState::Reached );
+    ASSERT_TRUE( run.consumed >= 600 );
+    ASSERT_TRUE( run.elapsedMs > 140000 && run.elapsedMs < 160000 );
+    ASSERT_FALSE( run.wrapped );
+}
+
+TEST( CpuPaceInformational, TheSameRunUnderTheGatedModeStillAbortsExactlyAsBefore )
+{
+    const int64_t gated = playSafetyMs( 25.0 );
+    const EngineRun run = runEngine( 0, 1, 720, 4.0, 600, gated );
+    ASSERT_TRUE( run.state == PlayStopState::PaceTooSlow );
+    ASSERT_TRUE( run.elapsedMs >= playback_frame_range::kPaceProbeMs && run.elapsedMs < 9000 );
+    ASSERT_TRUE( run.consumed < 600 );
+}
+
+TEST( CpuPaceInformational, ACpuRunBelowTheCeilingPaceEndsWithTheTypedSafetyTimeoutNeverAHang )
+{
+    // 0.5 fps: 600 frames would need 1200 s, past the 765 s ceiling -> PLAY_SAFETY_TIMEOUT at the ceiling, never Reached.
+    const int64_t cpu = playSafetyMs( 25.0, PlayPaceMode::MeasuredInformational );
+    const EngineRun run = runEngine( 0, 1, 720, 0.5, 600, cpu, 0, false, PlayPaceMode::MeasuredInformational );
+    ASSERT_TRUE( run.state == PlayStopState::SafetyTimeout );
+    ASSERT_EQ( cpu, run.elapsedMs );
+    ASSERT_TRUE( run.consumed < 600 );
+    ASSERT_EQ( std::string( "PLAY_SAFETY_TIMEOUT" ),
+               std::string( playback_frame_range::playStopFailureReason( run.state ) ) );
+    // A pace just under the ceiling (0.9 fps -> 667 s) still finishes.
+    const EngineRun slow = runEngine( 0, 1, 720, 0.9, 600, cpu, 0, false, PlayPaceMode::MeasuredInformational );
+    ASSERT_TRUE( slow.state == PlayStopState::Reached );
+}
+
+TEST( CpuPaceInformational, TheInformationalModeNeverRelaxesTheOtherEndsOfTheRun )
+{
+    const int64_t cpu = playSafetyMs( 25.0, PlayPaceMode::MeasuredInformational );
+    // A Play that ended first is still EndedEarly, Reached still wins, the wall ceiling still times out.
+    ASSERT_TRUE( evaluatePlayStop( 100, 600, false, 5000, cpu, PlayPaceMode::MeasuredInformational ) == PlayStopState::EndedEarly );
+    ASSERT_TRUE( evaluatePlayStop( 600, 600, true, 5000, cpu, PlayPaceMode::MeasuredInformational ) == PlayStopState::Reached );
+    ASSERT_TRUE( evaluatePlayStop( 100, 600, true, cpu, cpu, PlayPaceMode::MeasuredInformational ) == PlayStopState::SafetyTimeout );
+    // A loop never reaches the requirement by replaying footage, in either mode.
+    const EngineRun loop = runEngine( 0, 1, 100, 24.0, 600, cpu, 0, true, PlayPaceMode::MeasuredInformational );
+    ASSERT_FALSE( loop.state == PlayStopState::Reached );
+    ASSERT_TRUE( loop.consumed <= 100 );
+    ASSERT_TRUE( loop.wrapped );
+    // required <= 0 can never be reached.
+    ASSERT_FALSE( evaluatePlayStop( 5, 0, true, 100, cpu, PlayPaceMode::MeasuredInformational ) == PlayStopState::Reached );
+}
+
+TEST( CpuPaceInformational, TheMeasuredPaceIsFramesAdvancedOverPlayWallClockAndFailsClosedToZero )
+{
+    // 34 frames consumed = 33 steps in 8.05 s.
+    ASSERT_TRUE( std::abs( playback_frame_range::measuredPaceFps( 34, 8050 ) - 33.0 / 8.05 ) < 1e-9 );
+    ASSERT_EQ( 0.0, playback_frame_range::measuredPaceFps( 1, 8050 ) );
+    ASSERT_EQ( 0.0, playback_frame_range::measuredPaceFps( 0, 8050 ) );
+    ASSERT_EQ( 0.0, playback_frame_range::measuredPaceFps( 34, 0 ) );
+}
+
+TEST( CpuPaceInformational, AdmissionUsesTheModeBudgetAndStillRefusesAnUnusablePace )
+{
+    // Nominal pace 24 fps is admitted in both modes; the verdict reports the budget of ITS mode.
+    PlayableWindowVerdict g = evaluatePlayableWindow( 0, 1, 720, 720, 24.0, 25.0 );
+    ASSERT_TRUE( g.ok );
+    ASSERT_EQ( 65.0, g.wallBudgetSeconds );
+    PlayableWindowVerdict c = evaluatePlayableWindow( 0, 1, 720, 720, 24.0, 25.0, 20.0, true,
+                                                      playback_frame_range::kPaceIsNative, PlayPaceMode::MeasuredInformational );
+    ASSERT_TRUE( c.ok );
+    ASSERT_EQ( 765.0, c.wallBudgetSeconds );
+    // A nominal pace of 5 fps needs 120 s: refused under the gate, admitted under the CPU ceiling.
+    ASSERT_FALSE( evaluatePlayableWindow( 0, 1, 720, 720, 24.0, 25.0, 20.0, true, 5.0 ).ok );
+    ASSERT_TRUE( evaluatePlayableWindow( 0, 1, 720, 720, 24.0, 25.0, 20.0, true, 5.0, PlayPaceMode::MeasuredInformational ).ok );
+    // An unusable pace (<= 0) and a nominal pace past the CPU ceiling still fail closed with the typed reason.
+    const PlayableWindowVerdict z = evaluatePlayableWindow( 0, 1, 720, 720, 24.0, 25.0, 20.0, true, -1.0, PlayPaceMode::MeasuredInformational );
+    ASSERT_FALSE( z.ok );
+    ASSERT_EQ( std::string( "PLAY_PACE_TOO_SLOW" ), std::string( z.reason ) );
+    ASSERT_FALSE( evaluatePlayableWindow( 0, 1, 720, 720, 24.0, 25.0, 20.0, true, 0.5, PlayPaceMode::MeasuredInformational ).ok );
 }
