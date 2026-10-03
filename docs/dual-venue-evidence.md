@@ -13,7 +13,7 @@ its own receipt. This page is the methodology for people; the code is under
 | P1 | **Independent venues, shared subject.** A leg is defined once; "paired" means the same *subject digest*, never the same moment. No cross-venue timing is ever a verdict. | `subject.digest` in every receipt |
 | P2 | **No merged verdict.** Each receipt is judged against its own venue. A reconciler shows the two side by side and a *diagnostic* delta only when both are complete. | `Get-VenueEvidence.ps1` (DUAL-VENUE-RECONCILE-1) |
 | P3 | **Venue role is data.** `venues.json` gives each venue a role per card (`acceptance` / `supplementary`); nothing relabels a receipt afterwards. | `venues.json` + `Get-DvVenueRole` |
-| P4 | **Typed terminals, zero partial credit.** The outcome is one of `PASS FAIL VENUE_UNHEALTHY VENUE_NOT_QUIESCENT VENUE_HOST_MISMATCH DEVICE_UNAVAILABLE UNRESOLVED RETRACTED INVALID VENUE_TOOLING`. Only PASS/FAIL carry signal, and a PASS/FAIL without the receipt oracle's verdict, and the admission it was admitted on, is `INVALID` (rounds 2-3). Exit code, silence or output size are never completion evidence. | `Write-DvReceipt` rejects any other value and any proofless PASS/FAIL |
+| P4 | **Typed terminals, zero partial credit.** The outcome is one of `PASS FAIL VENUE_UNHEALTHY VENUE_NOT_QUIESCENT VENUE_HOST_MISMATCH DEVICE_UNAVAILABLE UNRESOLVED RETRACTED INVALID VENUE_TOOLING SCALE_NOT_HONOURED`. Only PASS/FAIL carry signal, and a PASS/FAIL without the receipt oracle's verdict, and the admission it was admitted on, is `INVALID` (rounds 2-3). Exit code, silence or output size are never completion evidence. | `Write-DvReceipt` rejects any other value and any proofless PASS/FAIL |
 | P5 | **Health before timing.** A bounded probe (pwsh cold start, write+hash of a fixed 4 MiB buffer, free disk, commit charge) precedes every leg; unhealthy means the leg is **not submitted**. | `Invoke-VenueLeg.ps1` step 4 |
 | P6 | **One source of truth for the venue.** The declared `-Venue` must agree with `Get-AttrCudaMeasurementVenue` on the host that runs the job, else `VENUE_HOST_MISMATCH`. | probe check + in-job guard (exit 29) |
 | P7 | **Safety unchanged.** A leg names a consented clip id and runs only on a venue the owner consented it for; every share write goes through `tools/profiling/um-run.ps1` (NA-7). | `Get-DvClipAdmission` + `Submit-VenueJob` |
@@ -279,20 +279,60 @@ path; the pair is its own record (`mlv-app/dual-venue-sheet-pair/v1`) because re
 * `lookFlavor` (`classic` default | `cinematic`) is in the leg spec and the receipt subject and is passed
   to the app as `MLVAPP_LOOK_ASSIST_FLAVOR`. **The app does not read it yet** (LOOK-ASSIST-FLAVORS-1), so
   every receipt says `lookFlavorHonored: "unknown"` -- never a claim that it applied.
+  **Audit (DVE-SCALE2-LOOK-LEG-1):** nothing in `platform/` or `src/` reads that variable, and the app's
+  `look_assist.apply.result` line carries scene / statistics / preset values but **no flavor field**
+  (the "Cinematic 1/2/3" entries in `film.h` and the main window are unrelated film filters). So a
+  `cinematic` receipt would prove the spec *asked* for that flavor and nothing more; `lookFlavorHonored` stays
+  `unknown` until the app can select a flavor and report the one it applied, at which point the job must
+  record that report (a unit test trips when the app starts reading the variable). **No cinematic leg spec
+  ships** until LOOK-ASSIST-FLAVORS-1 adds the flavor: a committed spec would produce a sheet labelled
+  cinematic that renders Classic.
+* Shipped look legs: `m16-1243-look` (Classic, requests scale 4, cuda and cpu) and `m16-1243-look-scale2` (the Classic leg at
+  `scaleFactor` 2, **cpu only**). See "Requested scale and rendered scale" below for why the scale-2 leg has no CUDA backend.
+* The sheet copy (`-SheetCopyDir`) and the pair files carry the **leg id** --
+  `sheet-<legId>-<venue>-<backend>-<flavor>.png`, `sheet-<legId>-<venue>-cuda-vs-cpu-<flavor>.png`,
+  `sheet-pair-<legId>-<venue>-<flavor>.json` -- so the scale-4 and scale-2 look legs of one venue cannot overwrite
+  or refuse each other. A pair record also carries `cudaScale` / `cpuScale` (requested and rendered) and `scalesDiffer`.
 * Aesthetics are **model-judged** (Amendment 2). Receipts carry `owner_verdict: null` (optional, never
   waited on, never written by the runner) and `model_verdicts: []` (filled by the judge card).
 * **Sheets of owner footage stay local under `.claude-state`** (never committed, attached to a PR, published to
   the bus or as an artifact) and need the per-venue owner CLIP line. Since fixtures are
   never venue playback clips, there are no fixture sheets any more.
 
+## Requested scale and rendered scale
+
+A leg's `scaleFactor` is the playback scale it **requests**. It is not necessarily the scale the app **renders** at: the CUDA texture route
+clamps every requested scale other than 1 to 1 (`platform/qt/MainWindowGpuPreviewPolicy.h`, pinned by `tests/gui/test_gui_smoke.cpp`), so a
+CUDA run of a scale-4 or scale-2 leg renders at scale 1. Three production receipts of `m16-1243-look` on CUDA show it: the app logs
+`playback_scale_clamped_for_gpu_texture_route requested=4 effective=1` and `scale_active_last=1`; the cpu runs show `scale_active_last=4`.
+
+* **Every receipt carries a `scale` block** (also on a refusal, where the rendered scale is `UNKNOWN`): `requestedScale` (the spec's), `effectiveScale`
+  (what the app rendered at, read from its own run log: `scale_active_last` on the measured session's summary line, else the effective= of the clamp
+  line, else the string `UNKNOWN` -- never the request, never 1), `acceptedEffectiveScale`, `effectiveScaleSource` and a `verdict`.
+* **A leg cannot PASS or FAIL under a scale it did not render at.** A capture whose rendered scale is not the accepted one -- or cannot be read -- ends
+  `SCALE_NOT_HONOURED` (no signal, like `INVALID`), and `outcomeDetail` says both numbers. `Test-DvReceiptValid` re-derives the same verdict from the hashed
+  run log and the committed spec, so a hand-written PASS over a clamped run is `INVALID` (`OUTCOME_NOT_DERIVED`).
+* **A spec may declare the clamp**: `acceptedEffectiveScale.<backend>` (schema: optional, per backend) names the scale that backend is known to render at when it
+  is not `scaleFactor`. `m16-1243-look` and `m16-1243-speed` declare `cuda: 1`, so their CUDA legs stay runnable: they pass only when the app rendered at exactly 1, the
+  verdict is `DECLARED_CLAMP` (never `HONOURED`), and the outcome detail reads "requested scale 4, rendered at 1". A CUDA look sheet of the scale-4 leg is therefore a scale-1 sheet,
+  labelled as such, beside a scale-4 cpu sheet; the pair record's `scalesDiffer` says so. If the route changes and cuda renders 4, the declaration is stale and the leg ends
+  `SCALE_NOT_HONOURED` until the spec is edited -- it never silently passes. (The speed leg's declaration is derived from the code and the look-leg receipts: no speed-leg
+  receipt was available to measure.)
+* **`m16-1243-look-scale2` is cpu only** and declares nothing: the owner's display-meter exposure path runs only when the *effective* playback scale is 2
+  (`MainWindow.cpp`, `effectivePlaybackScaleFactorForRequest() == 2`), which the CPU backend reaches and the CUDA texture route cannot. The leg shows the owner's scale-2 playback
+  look on the CPU backend only; it gets a CUDA backend when the CUDA route honours scale 2 (a unit test trips when the clamp is removed, so the declarations and this backend list are revisited).
+* The job is generated with `-ExpectedScaleRequest <accepted scale>` so the smoke runner's own scale check is live (`-UsePersistedPlaybackSettings` leaves it at -1 otherwise). The
+  runner compares the app's request after the clamp, so the value is the accepted *effective* scale, not the spec's request.
+
 ## How to add a leg
 
-1. Copy `legs/m16-1243-speed.json` (or `m16-1243-look.json`); give it a new `legId`, the `card` that needs the
+1. Copy `legs/m16-1243-speed.json` (or `m16-1243-look.json`, `m16-1243-look-scale2.json`); give it a new `legId`, the `card` that needs the
    evidence and a **consented clip id**. The file validates against `leg-spec.schema.json`. The id needs an
    owner-typed record for each venue that will run it (see "Long clips only").
 2. Declare the **roles before the first byte** (kernel K5): add the card to `venues.json` `roles`
    (`bachelor: acceptance`, `ultra-magnus: supplementary` for a card whose acceptance venue is Bachelor).
    A card the table does not name gets `defaultRole` (`supplementary`) on both venues.
+   A `scaleFactor` other than 1 on a `cuda` backend needs `acceptedEffectiveScale.cuda: 1` while the texture-route clamp exists (a test enforces it); otherwise list `cpu` only.
 3. Put the pass criteria per **role** and per **backend** in `criteria`: `{metric, op, value}` triples
    over the metrics copied verbatim from the job's `summary.json` (`rows`, `gpuFramesTotal`, `cpuFrames`,
    `lookAssistForced`, `presentMon*`, ...). An empty list is informational. A metric the job did not
@@ -352,6 +392,7 @@ the receipt -- the contact sheet, and, on a failed smoke run, `smoke-stderr.txt`
 | Job result | Outcome |
 |---|---|
 | `MEASUREMENT_CAPTURED` (exit 0, valid oracle verdict, the job's own `sourceFrames` block) | `PASS` or `FAIL` from the role/backend criteria |
+| `MEASUREMENT_CAPTURED` whose rendered playback scale is not the leg's accepted one, or cannot be read from the run log (checked before everything below) | `SCALE_NOT_HONOURED` (no signal; both numbers in `outcomeDetail`) |
 | `MEASUREMENT_CAPTURED` for a LOOK leg whose venue could not compose the contact sheet (`CONTACT_SHEET_COMPOSE_UNAVAILABLE`: no Python + Pillow) | `VENUE_TOOLING` (raw frames kept locally; a venue condition) |
 | `MEASUREMENT_CAPTURED` with a non-zero exit, `FIXTURE_REHEARSAL_CAPTURED`, `SOURCE_FRAMES_INVALID`, or a smoke refusal of the length class (`PLAY_WINDOW_TOO_SHORT`, `CLIP_TOO_SHORT`, `INVALID_LOOPED`, ...); or a PASS/FAIL whose receipt lacks a valid oracle verdict | `INVALID` |
 | `VENUE_NOT_QUIESCENT` | `VENUE_NOT_QUIESCENT` |

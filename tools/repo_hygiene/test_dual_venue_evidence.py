@@ -72,6 +72,9 @@ PWSH = shutil.which("pwsh")
 requires_windows_pwsh = unittest.skipIf(PWSH is None or sys.platform != "win32", "needs pwsh on Windows")
 FIXTURE_IDS = ("tiny_dual_iso", "large_dual_iso")
 OWNER_CLIP = "M16-1243"   # a consented clip ID (an id is not footage); the runner never sees a path
+# Every leg spec shipped under legs/ (DVE-SCALE2-LOOK-LEG-1 added the scale-2 look leg); the tracked-spec tests loop over all of them.
+SHIPPED_LEGS = ("legs/m16-1243-speed.json", "legs/m16-1243-look.json", "legs/m16-1243-look-scale2.json")
+SHIPPED_LEGS_PS = ", ".join(f"'{rel}'" for rel in SHIPPED_LEGS)
 OTHER_CLIP = "Z99-9999"
 MLV_EXT = "." + "mlv"  # never spelled as one literal token (the NA-4 gate trips on fixture basenames)
 LAUNCHER = ROOT / "tools" / "profiling" / "run-release-gui-smoke.ps1"
@@ -250,6 +253,18 @@ class GeneratorByteIdentityAndVariantTests(unittest.TestCase):
                                                                       "-CpuQuiescenceThresholdPercent", "20.0"])
         self.assertEqual(default.read_bytes(), explicit.read_bytes())
 
+    def test_an_expected_scale_request_arms_the_smoke_runners_scale_check_only_when_asked(self) -> None:
+        """DVE-SCALE2-LOOK-LEG-1 r2 item 1d: -UsePersistedPlaybackSettings leaves the smoke runner's ExpectedScaleRequest at -1 (no check). The runner passes the scale the
+        route is declared to render at; the job then carries -ExpectedScaleRequest (and -ExpectedVisualScaleRequest -1, so only the summary-line check goes live). Without
+        it the emitted job is the unchanged default text (the byte-identity tests above)."""
+        default = self.generate(GENERATOR, "no-expected-scale.job.ps1", []).read_text(encoding="utf-8")
+        armed = self.generate(GENERATOR, "expected-scale.job.ps1", ["-ExpectedScaleRequest", "1"])
+        self.assertEqual(self.parse_errors(armed), 0)
+        self.assertNotIn("-ExpectedScaleRequest", default)
+        self.assertIn("-ScaleFactor 4 -UsePersistedPlaybackSettings", default)
+        self.assertIn("-ScaleFactor 4 -ExpectedScaleRequest 1 -ExpectedVisualScaleRequest -1 -UsePersistedPlaybackSettings", armed.read_text(encoding="utf-8"))
+        self.assertIn("[int]$ExpectedScaleRequest = -1", GENERATOR.read_text(encoding="utf-8"))
+
     def parse_errors(self, job: Path) -> int:
         script = ("$t=$null;$e=$null;[void][System.Management.Automation.Language.Parser]::ParseFile("
                   f"'{job}',[ref]$t,[ref]$e);Write-Output $e.Count")
@@ -387,7 +402,7 @@ switch ($cfg.mainMode) {
 # The stub records every named argument it was handed (so a test can see that the runner passed a clip ID and a play
 # window, and never a path), and can be told to refuse the way the real generator does.
 STUB_GENERATOR = r"""
-param($SourceCommit,$BuildManifestSha256,$ClipId,$FixtureSha256,$OutFile,$RepoRoot,$Venue,$Backend,$ScaleFactor,$TelemetryArm,$CpuQuiescenceThresholdPercent,[switch]$ContactSheet,$ContactSheetFrames,[switch]$ForceLookAssist,$LookFlavor,$VenueTablePath,$PlaySeconds)
+param($SourceCommit,$BuildManifestSha256,$ClipId,$FixtureSha256,$OutFile,$RepoRoot,$Venue,$Backend,$ScaleFactor,$TelemetryArm,$CpuQuiescenceThresholdPercent,[switch]$ContactSheet,$ContactSheetFrames,[switch]$ForceLookAssist,$LookFlavor,$VenueTablePath,$PlaySeconds,$ExpectedScaleRequest)
 $cfg = Get-Content -LiteralPath $env:DVE_STUB -Raw | ConvertFrom-Json
 Add-Content -LiteralPath $cfg.genLog -Value (($PSBoundParameters.Keys | Sort-Object | ForEach-Object { $_ + '=' + $PSBoundParameters[$_] }) -join ';')
 if ($cfg.genRefusal) { throw $cfg.genRefusal }
@@ -457,10 +472,11 @@ class RunnerHarness:
     def write_consent(self, *records: dict) -> None:
         self.consent.write_text(json.dumps(consent_file(*records)), encoding="utf-8")
 
-    def write_spec(self, card: str = "DUAL-VENUE-EVIDENCE-1", clip: str = OWNER_CLIP, leg_type: str = "speed", play_seconds: int | None = 25) -> Path:
+    def write_spec(self, card: str = "DUAL-VENUE-EVIDENCE-1", clip: str = OWNER_CLIP, leg_type: str = "speed", play_seconds: int | None = 25,
+                   flavor: str = "classic", scale: int = 4, accepted: dict | None = None, leg_id: str = "unit-leg") -> Path:
         spec = {
-            "schema": "mlv-app/dual-venue-leg/v1", "legId": "unit-leg", "card": card, "legType": leg_type, "clipId": clip,
-            "backends": ["cuda", "cpu"], "scaleFactor": 4,
+            "schema": "mlv-app/dual-venue-leg/v1", "legId": leg_id, "card": card, "legType": leg_type, "clipId": clip,
+            "backends": ["cuda", "cpu"], "scaleFactor": scale,
             "timeouts": {"queueWaitSec": 60, "extraClaimedWaitSec": 60},
             "criteria": {"acceptance": {"cuda": [{"metric": "rows", "op": "gt", "value": 0}], "cpu": []},
                          "supplementary": {"cuda": [{"metric": "rows", "op": "gt", "value": 0}], "cpu": []}},
@@ -468,8 +484,12 @@ class RunnerHarness:
         if play_seconds is not None:
             spec["playSeconds"] = play_seconds
         if leg_type == "look":
-            spec["look"] = {"contactSheetFrames": 2, "lookFlavor": "classic"}
-        path = self.tmp / f"spec-{card}-{clip}-{leg_type}-{play_seconds}.json"
+            spec["look"] = {"contactSheetFrames": 2, "lookFlavor": flavor}
+        if accepted is not None:
+            spec["acceptedEffectiveScale"] = accepted
+        suffix = (("" if flavor == "classic" else f"-{flavor}") + ("" if scale == 4 else f"-s{scale}") + ("" if leg_id == "unit-leg" else f"-{leg_id}")
+                  + ("" if accepted is None else "-acc" + "".join(f"{k}{v}" for k, v in sorted(accepted.items()))))
+        path = self.tmp / f"spec-{card}-{clip}-{leg_type}-{play_seconds}{suffix}.json"
         path.write_text(json.dumps(spec), encoding="utf-8")
         return path
 
@@ -477,7 +497,7 @@ class RunnerHarness:
                         nonce: str | None = NONCE, sheet: bool = False, line: dict | None = None, observed_nonce: str | None | bool = True,
                         manifest_nonce: str | None | bool = True, log: bool = True, result: bool = True, isolated: str | None = "run_scoped",
                         declared_log_sha: str | None = None, compose_marker: str | None = None, raw_frames: bool = False,
-                        exact_summary: dict | None = None) -> None:
+                        exact_summary: dict | None = None, extra_log_lines: list[str] | None = None) -> None:
         """Write the job's artifacts the way master's generator does, INCLUDING the run's own records the receipt is re-derived
         from: the launcher's result.json (evidence.runNonce = the nonce it generated, the sha256 of the log snapshot) and
         logs/smoke-run.log (the app's playback_smoke.summary line carrying source_advanced / required_source_frames / native_fps /
@@ -487,7 +507,7 @@ class RunnerHarness:
         for stale in ("logs/smoke-run.log", "result.json", "contact-sheet/sheet.png", "contact-sheet/compose-status.txt"):
             (self.artifacts / stale).unlink(missing_ok=True)   # a case that omits a record must not inherit the previous case's
         fields = {"source_advanced": 960, "required_source_frames": 600, "native_fps": "23.976", "pace_fps": "23.976", "fps_override": 0,
-                  "wrapped": 0, "wrap_count": 0}
+                  "wrapped": 0, "wrap_count": 0, "scale_request_last": 4, "scale_active_last": 4}
         fields.update(line or {})
         observed = nonce if observed_nonce is True else observed_nonce
         summary_line = ("playback_smoke.summary session=3 reason=play-stop elapsed_ms=30000.000 presented_frames=900 "
@@ -497,6 +517,7 @@ class RunnerHarness:
         if isolated is not None:
             log_lines.append(f"interaction_trace event=automation.pacing_isolated site=gui-smoke-entry persisted_fps_override=0 persisted_frame_rate=24.000 drop_frame=1 settings_store={isolated}")
         # a DECOY earlier session with another nonce: the measured session (the marker) is the one that counts
+        log_lines += list(extra_log_lines or [])
         log_lines += ["playback_smoke.summary session=1 reason=warmup source_advanced=1 required_source_frames=1 native_fps=23.976 pace_fps=23.976 fps_override=0 wrapped=0 wrap_count=0 run_nonce=" + "0" * 32,
                       "playback_smoke.measured_session id=3", summary_line]
         log_bytes = ("\n".join(log_lines) + "\n").encode("utf-8")
@@ -768,6 +789,40 @@ class RunnerReceiptTests(RunnerHarness, unittest.TestCase):
         call = self.generator_calls()[-1]
         for expected in ("ForceLookAssist=True", "ContactSheet=True", "LookFlavor=classic", "Backend=cpu"):
             self.assertIn(expected, call)
+
+    def test_a_spec_asking_for_cinematic_never_claims_the_flavor_was_honoured_because_the_spec_asked_for_it(self) -> None:
+        """DVE-SCALE2-LOOK-LEG-1: the receipt's lookFlavor is what the SPEC asked for; lookFlavorHonored may only come from the app.
+        The app reports no flavor today (no reader of MLVAPP_LOOK_ASSIST_FLAVOR, no flavor field in look_assist.apply.result), so the
+        receipt of a leg asking for cinematic (a synthetic spec here; none is shipped until LOOK-ASSIST-FLAVORS-1) must stay 'unknown'
+        -- never True, never a string that echoes the spec."""
+        self.write_artifacts(sheet=True)
+        spec = self.write_spec(leg_type="look", flavor="cinematic")
+        proc, receipt, _ = self.run_leg("ultra-magnus", spec, extra=["-Backend", "cpu"])
+        self.assertEqual(receipt["outcome"], "PASS", receipt["outcomeDetail"])
+        self.assertEqual(receipt["look"]["lookFlavor"], "cinematic")
+        self.assertEqual(receipt["look"]["lookFlavorHonored"], "unknown")
+        self.assertEqual(receipt["subject"]["lookFlavor"], "cinematic")
+        self.assertIn("LookFlavor=cinematic", self.generator_calls()[-1])
+
+    def test_the_honoured_field_is_never_assigned_from_the_spec_in_the_runner_or_the_job(self) -> None:
+        runner = (DV / "Invoke-VenueLeg.ps1").read_text(encoding="utf-8")
+        job = (ROOT / "tools" / "profiling" / "bachelor" / "playback-attr-3-cuda-job.ps1").read_text(encoding="utf-8")
+        pair = (DV / "New-VenueSheetPair.ps1").read_text(encoding="utf-8")
+        for name, text in (("Invoke-VenueLeg.ps1", runner), ("playback-attr-3-cuda-job.ps1", job), ("New-VenueSheetPair.ps1", pair)):
+            for line in text.splitlines():
+                if re.match(r"\s*lookFlavorHonored\s*=", line):
+                    self.assertRegex(line, r"'unknown'|\$null", f"{name}: lookFlavorHonored must be 'unknown' (or null off a look leg), never derived from the spec: {line.strip()}")
+
+    def test_tripwire_the_app_has_no_reader_of_the_flavor_env_var_so_honoured_stays_unknown(self) -> None:
+        """If this fails, LOOK-ASSIST-FLAVORS-1 (or equivalent) landed an app-side reader: make the job record the flavor the app REPORTS
+        (a field in look_assist.apply.result / the visual-state telemetry) and set lookFlavorHonored from it, then update this test."""
+        needle = "MLVAPP_LOOK_ASSIST_FLAVOR"
+        hits = []
+        for sub in ("platform", "src"):
+            for path in (ROOT / sub).rglob("*"):
+                if path.suffix.lower() in (".cpp", ".h", ".hpp", ".cu", ".c", ".mm") and needle in path.read_text(encoding="utf-8", errors="replace"):
+                    hits.append(str(path.relative_to(ROOT)))
+        self.assertEqual(hits, [], "the app now reads the flavor env var; wire lookFlavorHonored to what it reports")
 
 
 @requires_windows_pwsh
@@ -1735,7 +1790,7 @@ class JobTerminalsAndHardeningTests(RunnerHarness, unittest.TestCase):
         local = self.tmp / ".claude-state" / "sheets"
         proc, receipt, _ = self.run_leg("ultra-magnus", self.write_spec(leg_type="look"), extra=["-SheetCopyDir", str(local), "-Backend", "cpu"])
         self.assertEqual(receipt["outcome"], "PASS", receipt["outcomeDetail"])
-        self.assertTrue((local / "sheet-ultra-magnus-cpu-classic.png").exists())
+        self.assertTrue((local / "sheet-unit-leg-ultra-magnus-cpu-classic.png").exists())
 
     def test_mutation_without_the_sheet_copy_guard_an_owner_sheet_is_copied_anywhere(self) -> None:
         mutated = self.mutated_runner([("Invoke-VenueLeg.ps1", "if (-not [string]::IsNullOrWhiteSpace($SheetCopyDir) -and -not (Test-DvUnderClaudeState -Path $SheetCopyDir)) {", "if ($false) {")])
@@ -1928,6 +1983,19 @@ class EvidenceFactory(RunnerHarness):
                 "settingsIsolated": bool(iso) and all(re.search(r"settings_store=run_scoped(\s|$)", l) for l in iso),
                 "fixtureRehearsal": summary.get("fixtureRehearsal"), "clipId": summary.get("clipId")}
 
+    @staticmethod
+    def derive_scale(ev: Path, spec_path: Path, backend: str) -> dict:
+        """An INDEPENDENT mirror of Get-DvScaleEvidence (DVE-SCALE2-LOOK-LEG-1 r2): the scale block a sound receipt carries -- what the leg asked for and what
+        the app's own summary line says it rendered at."""
+        spec = json.loads(spec_path.read_text(encoding="utf-8"))
+        lines = (ev / "logs" / "smoke-run.log").read_text(encoding="utf-8").splitlines()
+        session = next(re.search(r"measured_session id=(\d+)", l).group(1) for l in lines if "playback_smoke.measured_session" in l)
+        f = dict(re.findall(r"([A-Za-z0-9_]+)=(\S+)", [l for l in lines if re.search(rf"playback_smoke\.summary session={session}(\s|$)", l)][-1]))
+        requested = int(spec["scaleFactor"])
+        accepted = int(spec.get("acceptedEffectiveScale", {}).get(backend, requested))
+        effective = int(f["scale_active_last"]) if "scale_active_last" in f else "UNKNOWN"
+        return {"requestedScale": requested, "effectiveScale": effective, "acceptedEffectiveScale": accepted}
+
     def receipt_for(self, repo: ProductionRepo, ev: Path, venue: str = "ultra-magnus", backend: str = "cuda", outcome: str = "PASS",
                     leg_type: str = "speed", spec_path: Path | None = None) -> dict:
         spec_bytes = (spec_path or self.spec_path).read_bytes()
@@ -1948,7 +2016,7 @@ class EvidenceFactory(RunnerHarness):
         line = f"CLIP {venue}: {OWNER_CLIP}"
         receipt = {
             "schema": "mlv-app/dual-venue-receipt/v1", "receiptId": "r-" + hashlib.sha1(f"{ev}{backend}{outcome}".encode()).hexdigest()[:12],
-            "card": "DUAL-VENUE-EVIDENCE-1", "legId": "unit-leg", "subject": subject,
+            "card": "DUAL-VENUE-EVIDENCE-1", "legId": "unit-leg", "subject": subject, "scale": self.derive_scale(ev, spec_path or self.spec_path, backend),
             "venue": {"name": venue, "role": "supplementary", "declared": venue, "hostName": venue.upper(), "gpuNames": ["RTX 4090"]},
             "outcome": outcome, "outcomeDetail": "unit", "evidence": evidence, "metrics": metrics, "playback": self.derive_block(ev), "look": None,
             "admission": {"mode": "production", "consentBlobSha": repo.blob("venue-clip-consent.json"), "venueTableBlobSha": repo.blob("venues.json"),
@@ -2536,7 +2604,15 @@ class SheetPairStaysLocalTests(EvidenceFactory, unittest.TestCase):
         out = self.tmp / ".claude-state" / "sheets"
         proc = self.pair(out)
         self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
-        record = json.loads(next(out.glob("sheet-pair-*.json")).read_text(encoding="utf-8"))
+        record_path = next(out.glob("sheet-pair-*.json"))
+        record = json.loads(record_path.read_text(encoding="utf-8"))
+        # DVE-SCALE2-LOOK-LEG-1 r2 (fable H4): the pair's files carry the leg id (two Classic look legs share one venue and flavor), and the record
+        # says the scale each side asked for and rendered at (a pair of unequal scales is a scale difference, not a backend difference).
+        self.assertEqual(record_path.name, "sheet-pair-unit-leg-ultra-magnus-classic.json")
+        self.assertEqual(sorted(p.name for p in out.glob("sheet-*.png")), ["sheet-unit-leg-ultra-magnus-cuda-vs-cpu-classic.png"])
+        self.assertEqual(record["cudaScale"], {"requestedScale": 4, "effectiveScale": 4})
+        self.assertEqual(record["cpuScale"], {"requestedScale": 4, "effectiveScale": 4})
+        self.assertFalse(record["scalesDiffer"])
         self.assertTrue(record["ownerFootage"])
         self.assertTrue(record["advisory"], "production receipts are advisory, so the pair is a diagnostic sheet")
         self.assertEqual(record["evidenceStatus"], "ADVISORY")
@@ -3106,7 +3182,7 @@ class LineEndingsCannotHideACommittedFileTests(ModuleMutationMixin, unittest.Tes
     committed blob is LF, and the runner hashed the working bytes while Find-DvCommittedLegSpec hashed the blob bytes, so every committed leg spec was
     refused LEG_SPEC_NOT_COMMITTED. Both sides now hash line-ending-normalised bytes, and .gitattributes pins the three files to LF."""
 
-    FILES = ("legs/m16-1243-speed.json", "legs/m16-1243-look.json", "venue-clip-consent.json", "venues.json")
+    FILES = (*SHIPPED_LEGS, "venue-clip-consent.json", "venues.json")
 
     def checkout(self, with_attributes: bool) -> Path:
         """A temp repo holding the REAL shipped leg specs, consent file and venue table, committed (LF) and then CHECKED OUT under core.autocrlf=true."""
@@ -3137,7 +3213,7 @@ class LineEndingsCannotHideACommittedFileTests(ModuleMutationMixin, unittest.Tes
 
     def probe(self, root: Path, module: Path | None = None) -> list[str]:
         script = (f"$root = '{root}'\n$head = (git -C $root rev-parse HEAD)\n"
-                  "foreach ($rel in 'legs/m16-1243-speed.json', 'legs/m16-1243-look.json') {\n"
+                  f"foreach ($rel in {SHIPPED_LEGS_PS}) {{\n"
                   "  $bytes = [IO.File]::ReadAllBytes((Join-Path $root ('tools/profiling/dual-venue/' + $rel)))\n"
                   "  $r = Find-DvCommittedLegSpec -RepoRoot $root -Commit $head -LegSpecSha256 (Get-DvLegSpecSha256 $bytes)\n"
                   "  Write-Output ('LEG ' + $rel + ' found=' + $r.ok + ' crlf=' + ($bytes -contains 13))\n}\n"
@@ -3152,8 +3228,8 @@ class LineEndingsCannotHideACommittedFileTests(ModuleMutationMixin, unittest.Tes
     def test_the_default_windows_checkout_is_crlf_and_the_committed_specs_consent_and_table_are_still_found(self) -> None:
         root = self.checkout(with_attributes=False)
         out = self.probe(root)
-        self.assertIn("LEG legs/m16-1243-speed.json found=True crlf=True", out, "the premise: the working copy IS crlf, and the committed spec is still found")
-        self.assertIn("LEG legs/m16-1243-look.json found=True crlf=True", out)
+        for rel in SHIPPED_LEGS:
+            self.assertIn(f"LEG {rel} found=True crlf=True", out, "the premise: the working copy IS crlf, and the committed spec is still found")
         self.assertIn("FILE venue-clip-consent.json ok=True reason=", out)
         self.assertIn("FILE venues.json ok=True reason=", out)
         self.assertIn("SRC ok=True reason=", out)
@@ -3163,23 +3239,23 @@ class LineEndingsCannotHideACommittedFileTests(ModuleMutationMixin, unittest.Tes
         for rel in self.FILES:
             self.assertNotIn(b"\r", (root / "tools" / "profiling" / "dual-venue" / rel).read_bytes(), f"{rel} must check out LF even under autocrlf=true")
         out = self.probe(root)
-        self.assertIn("LEG legs/m16-1243-speed.json found=True crlf=False", out)
-        self.assertIn("LEG legs/m16-1243-look.json found=True crlf=False", out)
+        for rel in SHIPPED_LEGS:
+            self.assertIn(f"LEG {rel} found=True crlf=False", out)
         self.assertIn("SRC ok=True reason=", out)
 
     def test_each_shipped_leg_is_found_at_head_of_the_real_repo(self) -> None:
         head = subprocess.run(["git", "-C", str(ROOT), "rev-parse", "HEAD"], capture_output=True, text=True, check=True).stdout.strip()
-        for rel in ("legs/m16-1243-speed.json", "legs/m16-1243-look.json"):
+        for rel in SHIPPED_LEGS:
             tracked = subprocess.run(["git", "-C", str(ROOT), "ls-files", "--error-unmatch", "tools/profiling/dual-venue/" + rel], capture_output=True, text=True)
             self.assertEqual(tracked.returncode, 0, rel)
         proc = _ps_json(f"$root = '{ROOT}'\n"
-                        "foreach ($rel in 'legs/m16-1243-speed.json', 'legs/m16-1243-look.json') {\n"
+                        f"foreach ($rel in {SHIPPED_LEGS_PS}) {{\n"
                         "  $bytes = [IO.File]::ReadAllBytes((Join-Path $root ('tools/profiling/dual-venue/' + $rel)))\n"
                         f"  $r = Find-DvCommittedLegSpec -RepoRoot $root -Commit '{head}' -LegSpecSha256 (Get-DvLegSpecSha256 $bytes)\n"
                         "  Write-Output ('LEG ' + $rel + ' found=' + $r.ok)\n}\n", DV / "DualVenueRunner.psm1", {})
         self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
-        self.assertIn("LEG legs/m16-1243-speed.json found=True", proc.stdout)
-        self.assertIn("LEG legs/m16-1243-look.json found=True", proc.stdout)
+        for rel in SHIPPED_LEGS:
+            self.assertIn(f"LEG {rel} found=True", proc.stdout)
 
     def test_the_runner_hashes_the_spec_with_the_same_function_the_lookup_uses(self) -> None:
         runner = (DV / "Invoke-VenueLeg.ps1").read_text(encoding="utf-8")
@@ -3193,12 +3269,13 @@ class LineEndingsCannotHideACommittedFileTests(ModuleMutationMixin, unittest.Tes
         root = self.checkout(with_attributes=False)
         out = self.probe(root, module=mutated)
         self.assertIn("LEG legs/m16-1243-speed.json found=False crlf=True", out, "a raw-byte comparison refuses the committed spec -- fable's B2")
-        self.assertIn("LEG legs/m16-1243-look.json found=False crlf=True", out)
+        for rel in SHIPPED_LEGS:
+            self.assertIn(f"LEG {rel} found=False crlf=True", out)
 
 
 class GitattributesPinTheDualVenueFilesToLfTests(unittest.TestCase):
     def test_the_leg_specs_the_consent_file_and_the_venue_table_are_pinned_eol_lf(self) -> None:
-        for rel in ("tools/profiling/dual-venue/legs/m16-1243-speed.json", "tools/profiling/dual-venue/legs/m16-1243-look.json",
+        for rel in (*("tools/profiling/dual-venue/" + leg for leg in SHIPPED_LEGS),
                     "tools/profiling/dual-venue/venue-clip-consent.json", "tools/profiling/dual-venue/venues.json"):
             out = subprocess.run(["git", "-C", str(ROOT), "check-attr", "eol", "text", "--", rel], capture_output=True, text=True, check=True).stdout
             self.assertIn("eol: lf", out, rel)
@@ -3415,6 +3492,170 @@ class PairComposerReadsOnlyStagedListedFramesTests(unittest.TestCase):
 
 
 # ---------------------------------------------------------------------------------------------------
+CLAMPED_TO_1 = {"scale_request_last": 1, "scale_active_last": 1, "gpu_texture_route_scale_clamp_active": 1, "gpu_texture_route_scale_clamp_requested_scale": 2}
+CLAMP_LINE = "playback_scale_clamped_for_gpu_texture_route requested=2 effective=1"
+
+
+@requires_windows_pwsh
+class PlaybackScaleIsRequestedAndEffectiveTests(EvidenceFactory, ModuleMutationMixin, unittest.TestCase):
+    """DVE-SCALE2-LOOK-LEG-1 r2 (fable + sol r1, the SAME blocker): the CUDA texture route clamps every requested playback scale other than 1 to 1
+    (MainWindowGpuPreviewPolicy.h; pinned by tests/gui/test_gui_smoke.cpp), so a leg that names scale 2 and runs on CUDA rendered at scale 1 and still ended
+    PASS. CLASS: no venue leg can PASS under a scale it did not render at, and every receipt says the scale requested and the scale actually rendered.
+    These run the production route shape: the run log is the app's own (`scale_active_last` on its playback_smoke.summary line, the one-time
+    `playback_scale_clamped_for_gpu_texture_route` line)."""
+
+    def setUp(self) -> None:
+        self.make_harness()
+
+    def leg(self, backend: str, scale: int, line: dict | None = None, accepted: dict | None = None, extra_log_lines: list[str] | None = None,
+            leg_type: str = "speed"):
+        self.write_artifacts(line=line, extra_log_lines=extra_log_lines, sheet=(leg_type == "look"))
+        spec = self.write_spec(scale=scale, accepted=accepted, leg_type=leg_type)
+        return self.run_leg("ultra-magnus", spec, extra=["-Backend", backend])
+
+    # -- item 1b / 1e: the receipt says both numbers and the leg cannot PASS under a scale it did not render at ----------------------------
+    def test_a_cuda_run_clamped_from_scale_2_to_1_is_not_a_pass_and_the_receipt_says_both_numbers(self) -> None:
+        proc, receipt, _ = self.leg("cuda", 2, line=CLAMPED_TO_1)
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        self.assertEqual(receipt["outcome"], "SCALE_NOT_HONOURED", receipt["outcomeDetail"])
+        self.assertEqual((receipt["scale"]["requestedScale"], receipt["scale"]["effectiveScale"]), (2, 1))
+        self.assertIn("2", receipt["outcomeDetail"])
+        self.assertIn("rendered at 1", receipt["outcomeDetail"])
+        self.assertIn("DVE_OUTCOME=SCALE_NOT_HONOURED", proc.stdout)
+
+    def test_a_cpu_run_at_2_over_2_passes_and_carries_both_fields(self) -> None:
+        proc, receipt, _ = self.leg("cpu", 2, line={"scale_request_last": 2, "scale_active_last": 2})
+        self.assertEqual(receipt["outcome"], "PASS", receipt["outcomeDetail"])
+        self.assertEqual((receipt["scale"]["requestedScale"], receipt["scale"]["effectiveScale"]), (2, 2))
+        self.assertEqual(receipt["scale"]["verdict"], "HONOURED")
+
+    def test_a_declared_clamp_passes_but_is_labelled_with_both_numbers(self) -> None:
+        """The existing scale-4 look leg's CUDA backend renders at 1 (three production receipts). Its spec DECLARES that, so the leg stays runnable; the
+        receipt and the outcome detail still say requested 4 / rendered 1, and the verdict is DECLARED_CLAMP -- never HONOURED."""
+        proc, receipt, _ = self.leg("cuda", 4, line={"scale_request_last": 1, "scale_active_last": 1}, accepted={"cuda": 1})
+        self.assertEqual(receipt["outcome"], "PASS", receipt["outcomeDetail"])
+        self.assertEqual((receipt["scale"]["requestedScale"], receipt["scale"]["effectiveScale"], receipt["scale"]["acceptedEffectiveScale"]), (4, 1, 1))
+        self.assertEqual(receipt["scale"]["verdict"], "DECLARED_CLAMP")
+        self.assertIn("requested scale 4", receipt["outcomeDetail"])
+        self.assertIn("rendered at 1", receipt["outcomeDetail"])
+
+    def test_a_declaration_does_not_excuse_a_run_that_rendered_at_neither_the_request_nor_the_declared_scale(self) -> None:
+        # the declaration is a claim about the route; if the route changes (cuda now renders 4) the spec is stale and the leg stops passing until it is edited
+        _, receipt, _ = self.leg("cuda", 4, line={"scale_request_last": 4, "scale_active_last": 4}, accepted={"cuda": 1})
+        self.assertEqual(receipt["outcome"], "SCALE_NOT_HONOURED", receipt["outcomeDetail"])
+        _, receipt, _ = self.leg("cuda", 4, line={"scale_request_last": 2, "scale_active_last": 2}, accepted={"cuda": 1})
+        self.assertEqual(receipt["outcome"], "SCALE_NOT_HONOURED", receipt["outcomeDetail"])
+        # ... and the same clamp with NO declaration is not a pass either
+        _, receipt, _ = self.leg("cuda", 4, line={"scale_request_last": 1, "scale_active_last": 1})
+        self.assertEqual(receipt["outcome"], "SCALE_NOT_HONOURED", receipt["outcomeDetail"])
+
+    def test_an_unknown_effective_scale_never_passes(self) -> None:
+        _, receipt, _ = self.leg("cpu", 4, line={"scale_request_last": None, "scale_active_last": None})
+        self.assertEqual(receipt["outcome"], "SCALE_NOT_HONOURED", receipt["outcomeDetail"])
+        self.assertEqual(receipt["scale"]["effectiveScale"], "UNKNOWN")
+        self.assertEqual(receipt["scale"]["requestedScale"], 4)
+        self.assertIn("UNKNOWN", receipt["outcomeDetail"])
+
+    def test_the_clamp_line_supplies_the_effective_scale_when_the_summary_field_is_absent(self) -> None:
+        _, receipt, _ = self.leg("cuda", 2, line={"scale_request_last": None, "scale_active_last": None}, extra_log_lines=[CLAMP_LINE])
+        self.assertEqual(receipt["outcome"], "SCALE_NOT_HONOURED", receipt["outcomeDetail"])
+        self.assertEqual(receipt["scale"]["effectiveScale"], 1)
+        self.assertIn("clamp", receipt["scale"]["effectiveScaleSource"])
+
+    def test_a_look_leg_that_rendered_at_the_wrong_scale_has_no_sheet_credit(self) -> None:
+        _, receipt, _ = self.leg("cuda", 2, line=CLAMPED_TO_1, leg_type="look")
+        self.assertEqual(receipt["outcome"], "SCALE_NOT_HONOURED", receipt["outcomeDetail"])
+
+    def test_every_receipt_says_the_scale_requested_even_a_refusal_with_no_run_log(self) -> None:
+        _, receipt, _ = self.run_leg("ultra-magnus", self.write_spec(scale=2), probe=dict(HEALTHY_PROBE, pwshColdStartMs=9000))
+        self.assertEqual(receipt["outcome"], "VENUE_UNHEALTHY")
+        self.assertEqual((receipt["scale"]["requestedScale"], receipt["scale"]["effectiveScale"]), (2, "UNKNOWN"))
+
+    # -- item 1d: the smoke runner's own scale check is live where the route allows ------------------------------------------------------
+    def test_the_job_is_generated_with_the_scale_the_route_is_declared_to_render_at(self) -> None:
+        self.write_artifacts()
+        self.run_leg("ultra-magnus", self.write_spec(), extra=["-Backend", "cuda"])
+        self.assertIn("ExpectedScaleRequest=4", self.generator_calls()[-1])
+        self.run_leg("ultra-magnus", self.write_spec(accepted={"cuda": 1}), extra=["-Backend", "cuda"])
+        self.assertIn("ExpectedScaleRequest=1", self.generator_calls()[-1], "the CUDA route's request is already clamped when the smoke runner reads it")
+        self.run_leg("ultra-magnus", self.write_spec(accepted={"cuda": 1}), extra=["-Backend", "cpu"])
+        self.assertIn("ExpectedScaleRequest=4", self.generator_calls()[-1])
+
+    # -- the production validator derives the same verdict from the HASHED log, never from the receipt ---------------------------------
+    def production_receipt(self, scale: int, line: dict | None, backend: str = "cuda", accepted: dict | None = None, **ev_opts):
+        spec = self.write_spec(scale=scale, accepted=accepted)
+        repo = self.prod_repo(spec=spec)
+        ev = self.evidence("scale-" + hashlib.sha1(json.dumps([scale, line, backend, accepted]).encode()).hexdigest()[:8], backend=backend, line=line, **ev_opts)
+        return repo, ev, self.receipt_for(repo, ev, backend=backend)
+
+    def test_a_pass_receipt_for_a_clamped_cuda_run_does_not_re_derive(self) -> None:
+        repo, ev, receipt = self.production_receipt(2, CLAMPED_TO_1)
+        self.assertEqual((receipt["scale"]["requestedScale"], receipt["scale"]["effectiveScale"]), (2, 1))
+        self.assertNotValid(receipt, repo, "OUTCOME_NOT_DERIVED", status="INVALID")
+        # the same run is a valid NO_SIGNAL record when it is receipted for what it is
+        honest = dict(receipt, outcome="SCALE_NOT_HONOURED")
+        self.assertEqual(self.status(honest, repo)[:2], ("NO_SIGNAL", True))
+
+    def test_a_cpu_pass_at_2_over_2_re_derives_as_advisory(self) -> None:
+        repo, ev, receipt = self.production_receipt(2, {"scale_request_last": 2, "scale_active_last": 2}, backend="cpu")
+        self.assertAdvisory(receipt, repo)
+
+    def test_a_declared_clamp_pass_re_derives_as_advisory(self) -> None:
+        repo, ev, receipt = self.production_receipt(4, {"scale_request_last": 1, "scale_active_last": 1}, accepted={"cuda": 1})
+        self.assertAdvisory(receipt, repo)
+
+    def test_a_receipt_that_misstates_the_scale_it_names_does_not_re_derive(self) -> None:
+        repo, ev, receipt = self.production_receipt(2, CLAMPED_TO_1)
+        lying = json.loads(json.dumps(receipt))
+        lying["scale"]["effectiveScale"] = 2
+        self.assertNotValid(lying, repo, "SCALE_NOT_FROM_EVIDENCE", status="INVALID")
+        bare = json.loads(json.dumps(receipt))
+        del bare["scale"]
+        self.assertNotValid(bare, repo, "RECEIPT_FIELD_ABSENT: the receipt carries no scale block")
+
+    # -- one mutation per rule --------------------------------------------------------------------------------------------------------
+    # -- item 2 (fable H4): two look legs on one venue and backend never overwrite each other's sheet ----------------------------------------
+    def two_look_legs_into_one_directory(self, dv: Path = DV) -> list[str]:
+        out = self.tmp / ".claude-state" / "sheets"
+        self.write_artifacts(sheet=True)
+        for leg_id, scale in (("unit-look", 4), ("unit-look-scale2", 2)):
+            self.write_artifacts(sheet=True, line={"scale_request_last": scale, "scale_active_last": scale})
+            self.run_leg("ultra-magnus", self.write_spec(leg_type="look", scale=scale, leg_id=leg_id), extra=["-Backend", "cpu", "-SheetCopyDir", str(out)], dv=dv)
+        return sorted(p.name for p in out.iterdir())
+
+    def test_the_sheet_copy_name_carries_the_leg_id_so_two_look_legs_cannot_overwrite_each_other(self) -> None:
+        self.assertEqual(self.two_look_legs_into_one_directory(), ["sheet-unit-look-scale2-ultra-magnus-cpu-classic.png", "sheet-unit-look-ultra-magnus-cpu-classic.png"])
+
+    def test_mutation_without_the_leg_id_in_the_sheet_name_the_second_leg_overwrites_the_first(self) -> None:
+        dv = self.mutated_runner([("Invoke-VenueLeg.ps1", '"sheet-$($spec.legId)-$Venue-$Backend-$lookFlavor.png"', '"sheet-$Venue-$Backend-$lookFlavor.png"')])
+        self.assertEqual(self.two_look_legs_into_one_directory(dv), ["sheet-ultra-magnus-cpu-classic.png"])
+
+    def test_mutation_without_the_runner_gate_the_clamped_run_passes(self) -> None:
+        dv = self.mutated_runner([("Invoke-VenueLeg.ps1", "if (-not $scale.honoured -and $null -ne $runLogText) {", "if ($false) {")])
+        self.write_artifacts(line=CLAMPED_TO_1)
+        _, receipt, _ = self.run_leg("ultra-magnus", self.write_spec(scale=2), extra=["-Backend", "cuda"], dv=dv)
+        self.assertEqual(receipt["outcome"], "PASS", "with the gate removed the clamped run passes; so the gate is what stops it")
+
+    def test_mutation_without_the_validator_derivation_a_forged_pass_is_believed(self) -> None:
+        repo, ev, receipt = self.production_receipt(2, CLAMPED_TO_1)
+        mutated = self.mutated_module([("if (-not $scaleVerdict.honoured) { $expected = 'SCALE_NOT_HONOURED' }", "")])
+        got = self.status_batch(repo, [(receipt, ev)], module=mutated)[0]
+        self.assertEqual(got[0], "ADVISORY", "with the derivation removed the forged PASS re-derives; so the derivation is what refuses it")
+
+    def test_mutation_without_the_expected_scale_argument_the_job_carries_none(self) -> None:
+        dv = self.mutated_runner([("Invoke-VenueLeg.ps1", "$gen['ExpectedScaleRequest'] = [int]$scale.acceptedEffectiveScale", "$null = 0")])
+        self.write_artifacts()
+        self.run_leg("ultra-magnus", self.write_spec(), extra=["-Backend", "cuda"], dv=dv)
+        self.assertNotIn("ExpectedScaleRequest", self.generator_calls()[-1])
+
+    def test_mutation_without_the_unknown_rule_an_absent_scale_passes(self) -> None:
+        dv = self.mutated_runner([("DualVenueRunner.psm1", "if ($null -eq $effective) { $verdict = 'UNKNOWN' }", "if ($null -eq $effective) { $verdict = 'HONOURED' }")])
+        self.write_artifacts(line={"scale_request_last": None, "scale_active_last": None})
+        _, receipt, _ = self.run_leg("ultra-magnus", self.write_spec(), extra=["-Backend", "cpu"], dv=dv)
+        self.assertEqual(receipt["outcome"], "PASS", "with the UNKNOWN rule removed an unmeasured scale passes; so that rule is what stops it")
+
+
+# ---------------------------------------------------------------------------------------------------
 class LegSpecSchemaTests(unittest.TestCase):
     def setUp(self) -> None:
         try:
@@ -3424,16 +3665,83 @@ class LegSpecSchemaTests(unittest.TestCase):
         self.jsonschema = jsonschema
         self.schema = json.loads((DV / "leg-spec.schema.json").read_text(encoding="utf-8"))
 
-    def test_the_shipped_legs_validate_and_cover_speed_and_look_on_both_backends(self) -> None:
+    def test_the_shipped_legs_validate_and_cover_speed_and_look(self) -> None:
         legs = sorted((DV / "legs").glob("*.json"))
         self.assertGreaterEqual(len(legs), 2)
         types = set()
         for path in legs:
             spec = json.loads(path.read_text(encoding="utf-8"))
             self.jsonschema.validate(spec, self.schema)
-            self.assertEqual(sorted(spec["backends"]), ["cpu", "cuda"], f"{path.name} must run as cuda AND cpu")
+            self.assertTrue(spec["backends"], path.name)
             types.add(spec["legType"])
         self.assertEqual(types, {"speed", "look"})
+        # (the speed leg and the classic look leg still run as cuda AND cpu; the scale-2 look leg is cpu-only until the CUDA route honours scale 2)
+        for name in ("m16-1243-speed", "m16-1243-look"):
+            self.assertEqual(sorted(json.loads((DV / "legs" / f"{name}.json").read_text(encoding="utf-8"))["backends"]), ["cpu", "cuda"], name)
+
+    def test_the_hand_listed_shipped_legs_are_exactly_the_legs_directory(self) -> None:
+        self.assertEqual(sorted(SHIPPED_LEGS), sorted("legs/" + p.name for p in (DV / "legs").glob("*.json")), "SHIPPED_LEGS drifted from the legs/ directory")
+
+    def test_no_shipped_leg_asks_for_a_non_classic_flavor_whatever_its_file_name(self) -> None:
+        """The app has no reader of the flavor yet (LOOK-ASSIST-FLAVORS-1), so a spec labelled cinematic would render Classic under a cinematic label
+        (fable H1, sol hardening: the old check named one file). Every file in legs/ is checked, not one name."""
+        for path in sorted((DV / "legs").glob("*.json")):
+            spec = json.loads(path.read_text(encoding="utf-8"))
+            self.assertEqual((spec.get("look") or {}).get("lookFlavor", "classic"), "classic", f"{path.name} asks for a non-classic flavor the app cannot apply")
+            self.assertNotRegex(path.read_text(encoding="utf-8").lower(), r"cinematic", f"{path.name} mentions the cinematic flavor")
+
+    def test_the_scale2_look_leg_differs_from_the_classic_leg_only_where_it_must(self) -> None:
+        load = lambda name: json.loads((DV / "legs" / f"{name}.json").read_text(encoding="utf-8"))
+        classic, scale2 = load("m16-1243-look"), load("m16-1243-look-scale2")
+        for spec in (classic, scale2):
+            self.jsonschema.validate(spec, self.schema)
+        self.assertEqual(classic["look"]["lookFlavor"], "classic")
+        self.assertEqual(scale2["look"]["lookFlavor"], "classic", "no cinematic leg ships until the app can apply a flavor (LOOK-ASSIST-FLAVORS-1)")
+        self.assertFalse((DV / "legs" / "m16-1243-look-cinematic.json").exists(), "a cinematic spec would be labelled cinematic and render Classic")
+        self.assertEqual(scale2["legId"], "m16-1243-look-scale2")
+        self.assertEqual(scale2["scaleFactor"], 2)
+        self.assertEqual(classic["scaleFactor"], 4)
+        self.assertEqual(scale2["backends"], ["cpu"], "the CUDA texture route clamps scale 2 to 1, so the scale-2 leg is cpu-only until it honours scale 2")
+        self.assertNotIn("acceptedEffectiveScale", scale2, "a leg that wants scale 2 declares no accepted clamp: a CUDA run at 1 must not pass it")
+        self.assertEqual(sorted(scale2["criteria"]["acceptance"]), ["cpu"], "a cpu-only leg carries no criteria for a backend it cannot run")
+        classic_cpu_only = json.loads(json.dumps(classic))
+        del classic_cpu_only["acceptedEffectiveScale"]
+        for role in classic_cpu_only["criteria"].values():
+            role.pop("cuda")
+        comparable = dict(scale2, legId=classic["legId"], scaleFactor=classic["scaleFactor"], backends=classic["backends"])
+        self.assertEqual(comparable["criteria"], classic_cpu_only["criteria"])
+        comparable["criteria"] = classic["criteria"]
+        comparable["acceptedEffectiveScale"] = classic["acceptedEffectiveScale"]
+        self.assertEqual(comparable, classic, "the scale-2 leg is the Classic leg except legId, scaleFactor, backends (and the CUDA criteria and clamp declaration that go with a CUDA backend)")
+        self.assertNotEqual(classic["legId"], scale2["legId"])
+
+    def test_the_cuda_texture_route_clamp_is_declared_by_every_leg_that_runs_cuda_at_a_scale_other_than_1(self) -> None:
+        """TRIPWIRE: MainWindowGpuPreviewPolicy.h clamps every requested scale != 1 to 1 on the GPU texture route. While that is true, a leg that names scale S != 1
+        and lists cuda must DECLARE the effective scale it renders at (acceptedEffectiveScale.cuda == 1): the receipt then says requested S / rendered 1 instead of a
+        silent mismatch. If this fails because the clamp was removed, drop the declarations and let the CUDA backend of the scale-2 leg back in (and update the docs)."""
+        policy = (ROOT / "platform" / "qt" / "MainWindowGpuPreviewPolicy.h").read_text(encoding="utf-8")
+        self.assertIn("if (requestedScale != 1 && gpuPlaybackReconTextureRouteEligibleAtScaleOne)", policy, "the clamp changed: revisit the legs' acceptedEffectiveScale and the scale-2 leg's cpu-only backends")
+        for path in sorted((DV / "legs").glob("*.json")):
+            spec = json.loads(path.read_text(encoding="utf-8"))
+            if "cuda" in spec["backends"] and spec["scaleFactor"] != 1:
+                self.assertEqual(spec.get("acceptedEffectiveScale", {}).get("cuda"), 1, f"{path.name}: names scale {spec['scaleFactor']} on cuda without declaring the clamp")
+
+    def test_the_docs_make_no_scale_claim_the_cuda_route_cannot_keep_and_list_every_typed_outcome(self) -> None:
+        doc = (ROOT / "docs" / "dual-venue-evidence.md").read_text(encoding="utf-8")
+        self.assertNotIn("it is the leg that shows the owner's playback look", doc, "the scale-2 look is only reachable where the effective scale is 2 (cpu)")
+        self.assertIn("`m16-1243-look-scale2` is cpu only", doc)
+        self.assertIn("SCALE_NOT_HONOURED", doc)
+        module = (DV / "DualVenueRunner.psm1").read_text(encoding="utf-8")
+        enum = re.search(r"\$script:OutcomeEnum = @\((.+?)\)", module).group(1)
+        for token in re.findall(r"'([A-Z_]+)'", enum):
+            self.assertIn(token, re.search(r"\| P4 \|.*", doc).group(0), f"P4 in the docs does not list the typed outcome {token}")
+
+    def test_the_schema_takes_a_declared_effective_scale_per_backend_and_nothing_else(self) -> None:
+        spec = json.loads((DV / "legs" / "m16-1243-look.json").read_text(encoding="utf-8"))
+        self.jsonschema.validate(dict(spec, acceptedEffectiveScale={"cuda": 1, "cpu": 4}), self.schema)
+        for bad in ({"gl": 1}, {"cuda": 0}, {"cuda": "1"}, {"cuda": 17}, {"cuda": 1.5}):
+            with self.assertRaises(self.jsonschema.ValidationError, msg=str(bad)):
+                self.jsonschema.validate(dict(spec, acceptedEffectiveScale=bad), self.schema)
 
     def test_no_shipped_leg_can_play_a_fixture_or_a_short_window(self) -> None:
         # ROUND 2: legs are addressed by consented clip ID, and the tracked fixtures are never a venue playback clip.
