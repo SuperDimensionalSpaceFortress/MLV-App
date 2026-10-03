@@ -55,7 +55,12 @@ COMPOSER = ROOT / "tools" / "profiling" / "make-contact-sheet.py"
 # regions); it was 558143b1 (r2, before the probe moved into the module), 6567793196bf
 # (UM-PRESENTMON-STOP-2 r1), abc10451ae2c (UM-PRESENTMON-STOP-1 r2), 8c19f442603c (r1) and before that
 # PLAYBACK-CLIP-LENGTH-ENFORCE-4's merge (38ed2d8f96c2).
-BASELINE_COMMIT = "4c58c3285f91587ab83a90d7e2a14fea63f49a56"
+# DVE-PRESENTMON-EVIDENCE-1 r1 moves it again, on purpose: its item 1 (PresentMon's stdout/stderr redirected to files and published bounded, the CSV-existence record in
+# presentmon-capture.json, the spawn-failure stream record) edits baseline lines of the default job IN PLACE (the Start-Process call, the two capture-json statements, the
+# spawn-failure summary), which no bracketed region can express. The pin is therefore that card's own item-1 commit (2f91486c: the DVE-LEG-TERMINALS-1 generator plus item 1
+# and nothing else); the card's remaining default-job text (item 2) is bracketed by its own DVE-PRESENTMON-EVIDENCE-1 sentinels and counted below. Item 1 is pinned by its own
+# tests (test_dve_presentmon_evidence.py), not by byte identity; DVE-LEG-TERMINALS-1's four regions exist in the baseline too, so both sides are stripped of both families.
+BASELINE_COMMIT = "2f91486cab88a6051d98b5c5c55cf15c0b6729d4"
 
 PWSH = shutil.which("pwsh")
 requires_windows_pwsh = unittest.skipIf(PWSH is None or sys.platform != "win32", "needs pwsh on Windows")
@@ -165,37 +170,54 @@ class GeneratorByteIdentityAndVariantTests(unittest.TestCase):
     # regions are removed -- so every other byte is still master's, and a region cannot grow past its brackets unnoticed (the count and the shape are pinned below).
     LEG_TERMINALS_OPEN = "DVE-LEG-TERMINALS-1 >>>"
     LEG_TERMINALS_CLOSE = "DVE-LEG-TERMINALS-1 <<<"
+    # DVE-PRESENTMON-EVIDENCE-1: the text that card adds to the default job's decision flow beyond the baseline's in-place item 1 (one region: the display-report-failure
+    # branch's frame publish). The count is pinned so a region cannot silently multiply.
+    PRESENTMON_EVIDENCE_OPEN = "DVE-PRESENTMON-EVIDENCE-1 >>>"
+    PRESENTMON_EVIDENCE_CLOSE = "DVE-PRESENTMON-EVIDENCE-1 <<<"
+    PRESENTMON_EVIDENCE_REGIONS = 1
+
+    @classmethod
+    def strip_regions(cls, text: str) -> tuple[str, dict[str, int]]:
+        """Remove every bracketed region of either sentinel family; return the kept text and the number of regions per family."""
+        families = {"leg-terminals": (cls.LEG_TERMINALS_OPEN, cls.LEG_TERMINALS_CLOSE), "presentmon-evidence": (cls.PRESENTMON_EVIDENCE_OPEN, cls.PRESENTMON_EVIDENCE_CLOSE)}
+        kept: list[str] = []
+        inside: str | None = None
+        counts = {name: 0 for name in families}
+        for line in lf(text).split("\n"):
+            opened = next((n for n, (o, _c) in families.items() if o in line), None)
+            closed = next((n for n, (_o, c) in families.items() if c in line), None)
+            if opened is not None:
+                assert inside is None, f"nested {opened} region inside {inside}"
+                inside = opened
+                counts[opened] += 1
+                continue
+            if closed is not None:
+                assert inside == closed, f"unopened or mismatched {closed} close (inside {inside})"
+                inside = None
+                continue
+            if inside is None:
+                kept.append(line)
+        assert inside is None, f"unclosed {inside} region"
+        return "\n".join(kept), counts
 
     @classmethod
     def strip_leg_terminals_regions(cls, text: str) -> tuple[str, int]:
-        kept: list[str] = []
-        inside = False
-        regions = 0
-        for line in lf(text).split("\n"):
-            if cls.LEG_TERMINALS_OPEN in line:
-                assert not inside, "nested DVE-LEG-TERMINALS-1 region"
-                inside = True
-                regions += 1
-                continue
-            if cls.LEG_TERMINALS_CLOSE in line:
-                assert inside, "unopened DVE-LEG-TERMINALS-1 close"
-                inside = False
-                continue
-            if not inside:
-                kept.append(line)
-        assert not inside, "unclosed DVE-LEG-TERMINALS-1 region"
-        return "\n".join(kept), regions
+        stripped, counts = cls.strip_regions(text)
+        return stripped, counts["leg-terminals"]
 
     def assertByteIdenticalToBaseline(self, name: str, extra: list[str]) -> None:
         if not self.baseline_available:
             self.skipTest(f"baseline commit {BASELINE_COMMIT[:12]} is not in this clone")
         new = self.generate(GENERATOR, f"new-{name}.job.ps1", extra)
         old = self.generate(self.baseline_root / "tools" / "profiling" / "bachelor" / "playback-attr-3-cuda-job.ps1", f"old-{name}.job.ps1", extra)
-        stripped, regions = self.strip_leg_terminals_regions(new.read_text(encoding="utf-8"))
-        self.assertEqual(regions, 4, "the default job carries exactly the four bracketed DVE-LEG-TERMINALS-1 regions (the wait-failure block and its two summary fields, the smoke-failure block and its one summary field)")
-        self.assertEqual(self.strip_leg_terminals_regions(old.read_text(encoding="utf-8"))[1], 0, "the baseline has none")
-        self.assertEqual(stripped, lf(old.read_text(encoding="utf-8")),
-                         "the DEFAULT (bachelor/cuda) emitted job changed outside DVE-LEG-TERMINALS-1's bracketed regions -- it must stay byte-identical to master's")
+        stripped, new_counts = self.strip_regions(new.read_text(encoding="utf-8"))
+        old_stripped, old_counts = self.strip_regions(old.read_text(encoding="utf-8"))
+        self.assertEqual(new_counts["leg-terminals"], 4, "the default job carries exactly the four bracketed DVE-LEG-TERMINALS-1 regions (the wait-failure block and its two summary fields, the smoke-failure block and its one summary field)")
+        self.assertEqual(old_counts["leg-terminals"], 4, "the baseline carries the same four")
+        self.assertEqual(new_counts["presentmon-evidence"], self.PRESENTMON_EVIDENCE_REGIONS, "the default job carries exactly the pinned number of bracketed DVE-PRESENTMON-EVIDENCE-1 regions")
+        self.assertEqual(old_counts["presentmon-evidence"], 0, "the baseline has none")
+        self.assertEqual(stripped, old_stripped,
+                         "the DEFAULT (bachelor/cuda) emitted job changed outside the bracketed regions -- it must stay byte-identical to the pinned baseline")
 
     def test_default_arguments_emit_a_byte_identical_job(self) -> None:
         self.assertByteIdenticalToBaseline("default", [])

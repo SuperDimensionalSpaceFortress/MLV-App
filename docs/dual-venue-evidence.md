@@ -206,7 +206,7 @@ receipt oracle and refuses to believe a receipt that does not carry the oracle's
 A speed or look leg has `backends: ["cuda","cpu"]`. `-Backend cpu` omits every `MLVAPP_GPU_*` /
 `MLVAPP_EXPERIMENTAL_GPU_*` environment variable, requires `CPU_FRAMES > 0` and zero GPU frames
 (a leg that reached a GPU path is `CPU_BACKEND_PATH_MISMATCH`, exit 28), never fires the CUDA-only
-exits 13/14, and treats PresentMon as informational. **CPU frame rate is informational** -- it tracks
+exits 13/14, and treats PresentMon as informational (a PresentMon wait failure included: see *CPU legs and a PresentMon wait failure* below). **CPU frame rate is informational** -- it tracks
 cores and storage, not the product's GPU work -- and never gates a card. That includes the smoke runner's own
 playback-quality limit on the **skipped/unpresented-frame ratio** (default 50 %): on Ultra-Magnus the cpu leg of 2026-10-02 was
 failed by it (`SMOKE_RUN_FAILED`, exit 18, 56.17 % > 50 %) with no frame and no sheet. A cpu job passes the runner's own
@@ -232,7 +232,22 @@ The wait-failure branch applies the same rule to its own frames (DVE-WAIT-FAILUR
 own counters do not contradict the leg -- a cuda leg needs gpu frames and no cpu frame, a cpu leg the inverse -- so a leg that fell back (partly or wholly) never
 lists frames that `New-VenueSheetPair.ps1` would label with a backend the run did not use. Counters that are unavailable do not contradict the leg (that receipt
 is a typed `INVALID`, never a labelled PASS/FAIL).
-The display-report (parse) failure of `PRESENTMON_UNAVAILABLE` does not publish frames yet.
+*Contact frames after a display-report failure (DVE-PRESENTMON-EVIDENCE-1).* The display-report failure of `PRESENTMON_UNAVAILABLE` (PresentMon's CSV could not be
+parsed or does not exist -- Ultra-Magnus, 2026-10-03: "PresentMon output does not exist" after a clean, immediate stop) now publishes the frames the app already
+wrote, and the same `compose-status.txt` marker, under the **same counter gate** as the wait-failure branch (a cuda leg needs gpu frames and no cpu frame; the
+cpu variant the inverse). Before it, the UM-2 owner CUDA leg had six frames on the venue and none on the leg. Only the typed `PRESENTMON_UNAVAILABLE` terminal
+publishes; `DISPLAY_ASLEEP` (a verified-zero display result) keeps its own receipt shape and lists no frames.
+
+*A PresentMon failure says why (DVE-PRESENTMON-EVIDENCE-1).* PresentMon used to run hidden with no captured streams. Its stdout and stderr are now redirected to
+files beside its CSV and published with the artifacts as `presentmon-stdout.txt` / `presentmon-stderr.txt` (bounded: a stream over 64 KiB publishes its tail under
+one first line that says so; an empty stream is published empty, a missing one is reported missing). `presentmon-capture.json` records `csvEverExisted` (the CSV was
+seen while the launch waited for trace readiness, or exists at stop), `csvSizeAtStop` (null when absent) and a `streams` record (exists, bytes, published, truncated,
+error), so "the stop was clean and the CSV never appeared" is a fact in the evidence. A PresentMon that exits at startup (rc=6, ETW access denied) publishes the
+same streams from the spawn-failure summary (`presentMonStreams`).
+
+*CPU legs and a PresentMon wait failure (DVE-PRESENTMON-EVIDENCE-1, hardening DVE-CPU-PRESENTMON-WAIT-GATES-1).* PresentMon is informational on a cpu leg, so a cpu job
+does **not** take the wait-failure terminal: the run continues through its own gates (backend, source frames, playback), the summary carries `presentMonStatus: "unavailable"`
+with the wait failure's reason, and the outcome comes from the leg's own gates. A cuda job is unchanged: its wait failure is still the typed `PRESENTMON_UNAVAILABLE` terminal.
 
 A `legType: "look"` leg takes `look.contactSheetFrames` evenly spaced frames on each backend with
 **Look Assist forced on** (the smoke runner is told Look Assist is *required*, so a leg where it did not

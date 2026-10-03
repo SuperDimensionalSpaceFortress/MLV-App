@@ -49,6 +49,16 @@ DV_MODULE = DV / "DualVenueRunner.psm1"
 TEMPLATE = lf(GENERATOR.read_text(encoding="utf-8"))
 
 
+CPU_WAIT_SKIP = "if ($null -ne $presentMonWaitError -and $Backend -ne 'cpu') {"
+
+
+def cpu_job_with_wait_branch(text: str) -> str:
+    """DVE-PRESENTMON-EVIDENCE-1 item 3: a cpu job no longer enters the wait-failure branch (PresentMon is informational there). The cpu-variant edits INSIDE the branch
+    (the backend field, the inverse frame gate) are still exercised, with that one skip neutralised."""
+    assert text.count(CPU_WAIT_SKIP) == 1, "the cpu job carries the wait-failure skip exactly once"
+    return text.replace(CPU_WAIT_SKIP, "if ($null -ne $presentMonWaitError) {", 1)
+
+
 def _slice(text: str, start: str, end: str) -> str:
     i = text.index(start)
     return text[i:text.index(end, i)]
@@ -149,6 +159,9 @@ class SliceHarness:
             f"function Wait-PresentMonCapture($Proc) {{ throw '{PM_TIMEOUT_REASON}' }}\n"
             "$presentMonProc = $null\n"
             f"$presentMonPath = '{self.stmp / name / 'presentmon.csv'}'\n"
+            # DVE-PRESENTMON-EVIDENCE-1: the job defines these before it spawns PresentMon (the stream files and the readiness note the stop block reads)
+            f"$presentMonStdoutPath = '{self.stmp / name / 'presentmon-stdout.txt'}'\n$presentMonStderrPath = '{self.stmp / name / 'presentmon-stderr.txt'}'\n"
+            "$presentMonStreams = [ordered]@{ csvSeenDuringReadiness = $false }\n"
             "$presentMonCaptureStartUtc = [datetime]::UtcNow; $presentMonPreSpawnUtc = $presentMonCaptureStartUtc; $presentMonPostSpawnUtc = $presentMonCaptureStartUtc\n"
             "$presentMonProcessStartUtc = $presentMonCaptureStartUtc; $presentMonCaptureStartUncertaintyMs = 1.0\n"
             "$displayWake = [ordered]@{}\n$displayBlock = [ordered]@{ venue = 'ultra-magnus' }\n"
@@ -252,7 +265,7 @@ class PresentMonWaitFailureCarriesTheCountersTests(SliceHarness, unittest.TestCa
         self.assertEqual(self.derived_backend(summary), "cpu")
 
     def cpu_job_text(self) -> str:
-        return CpuGeneratedJobs.text("cpu")
+        return cpu_job_with_wait_branch(CpuGeneratedJobs.text("cpu"))
 
     def test_counters_that_are_genuinely_unavailable_still_end_in_a_typed_summary_not_a_crash(self) -> None:
         # a log with no playback_smoke.gpu_summary line: Get-LastGpuSummary throws. The branch must still write its typed summary and exit 23 (a raw throw
@@ -365,7 +378,7 @@ class WaitFailureFramesAreGatedOnTheLegsOwnCountersTests(SliceHarness, unittest.
             self.assert_published(pub, published, name)
 
     def test_a_cpu_leg_publishes_only_when_the_counters_are_cpu_only(self) -> None:
-        text = CpuGeneratedJobs.text("cpu")
+        text = cpu_job_with_wait_branch(CpuGeneratedJobs.text("cpu"))
         cases = {"cpu-healthy": (UM_CPU_GPU_SUMMARY_LINE, True), "cpu-reached-gpu": (UM_GPU_SUMMARY_LINE, False), "cpu-partial": (UM_PARTIAL_GPU_SUMMARY_LINE, False)}
         for name, (line, published) in cases.items():
             code, _summary, pub, out = self.run_wait_failure(name, um_run_log(line), backend="cpu", contact_frames=FRAMES, text=text)
@@ -395,7 +408,7 @@ class WaitFailureFramesAreGatedOnTheLegsOwnCountersTests(SliceHarness, unittest.
             self.assert_published(pub, True, name + " (the old behaviour: a cuda label over cpu frames)")
 
     def test_mutation_without_the_cpu_variant_edit_a_cpu_leg_is_gated_by_the_cuda_rule(self) -> None:
-        text = CpuGeneratedJobs.text("cpu")
+        text = cpu_job_with_wait_branch(CpuGeneratedJobs.text("cpu"))
         edited = "-not ($waitFailureGpuFramesTotal -le 0 -and [int64]$waitFailureGpuSummary.cpuFrames -gt 0)"
         original = "-not ($waitFailureGpuFramesTotal -gt 0 -and [int64]$waitFailureGpuSummary.cpuFrames -le 0)"
         self.assertEqual(text.count(edited), 1, "the cpu variant swaps in the inverse rule")
@@ -909,6 +922,13 @@ class DocsDoNotOverclaimTests(unittest.TestCase):
             self.assertIn(needle, doc, needle)
         row = next(r for r in doc.split("## Outcome mapping", 1)[1].splitlines() if "`SMOKE_RUN_FAILED` (the smoke runner exited non-zero" in r)
         self.assertIn("`INVALID`", row)
+
+    def test_the_parse_failure_no_longer_claims_to_publish_no_frames_and_the_new_evidence_is_documented(self) -> None:
+        doc = (ROOT / "docs" / "dual-venue-evidence.md").read_text(encoding="utf-8")
+        self.assertNotIn("does not publish frames yet", doc)
+        for needle in ("DVE-PRESENTMON-EVIDENCE-1", "presentmon-stdout.txt", "presentmon-stderr.txt", "csvEverExisted", "csvSizeAtStop", "same counter gate",
+                       "does **not** take the wait-failure terminal"):
+            self.assertIn(needle, doc, needle)
 
 
 if __name__ == "__main__":
