@@ -256,9 +256,15 @@ class CpuPaceGeneratedJobs(unittest.TestCase):
         return (int(re.search(r"(?m)^\$SmokeProcessTimeoutMs = (\d+)", text).group(1)),
                 int(re.search(r"(?m)^\$PresentMonTimedSeconds = (\d+)", text).group(1)))
 
-    @staticmethod
-    def recommended_job_timeout_sec(stdout: str) -> int:
-        return int(re.search(r"recommendedJobTimeoutSec\s*:\s*(\d+)", stdout).group(1))
+    def recommended_job_timeout_sec(self, extra: list[str], out_name: str) -> int:
+        # the generator's result object, asked for the one property by name (never parsed out of its console formatting)
+        out = self.tmp / out_name
+        args = " ".join(x if re.fullmatch(r"-[A-Za-z0-9]+", x) else "'" + x.replace("'", "''") + "'" for x in [
+            "-SourceCommit", self.head, "-BuildManifestSha256", "ab" * 32, "-ClipId", FIXTURE_IDS[0], "-FixtureSha256", "cd" * 32, "-RepoRoot", str(self.repo),
+            "-OutFile", str(out), *extra])
+        proc = run_pwsh(["-Command", f"& {_q(GENERATOR)} {args} | Select-Object -ExpandProperty recommendedJobTimeoutSec"])
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        return int(proc.stdout.strip().splitlines()[-1])
 
     def test_a_cpu_job_passes_the_switch_and_records_the_pace(self) -> None:
         job, _out = self.generate(GENERATOR, "cpu.job.ps1", ["-Backend", "cpu"])
@@ -283,7 +289,7 @@ class CpuPaceGeneratedJobs(unittest.TestCase):
         self.assertGreaterEqual(smoke_ms, ceiling_sec * 1000, "the smoke process timeout must cover the CPU Play ceiling")
         self.assertEqual(smoke_ms, (0 + 60 + ceiling_sec + 3 + 30) * 1000, "launch + ceiling + settle + runner slack (a fixture has no identity read)")
         self.assertGreaterEqual(presentmon_sec * 1000, smoke_ms, "the PresentMon capture ceiling follows the smoke timeout")
-        self.assertGreaterEqual(self.recommended_job_timeout_sec(out), smoke_ms // 1000, "the um-run -TimeoutSec covers the smoke timeout")
+        self.assertGreaterEqual(self.recommended_job_timeout_sec(["-Backend", "cpu"], "cpu-timeout.job.ps1"), smoke_ms // 1000, "the um-run -TimeoutSec covers the smoke timeout")
         # the CUDA job's budget is exactly what it was (60 + 40 + 3 + 30)
         cuda_job, cuda_out = self.generate(GENERATOR, "cuda.job.ps1", [])
         self.assertEqual(self.timeouts(cuda_job)[0], 133000)

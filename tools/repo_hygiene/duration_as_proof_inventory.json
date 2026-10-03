@@ -1836,6 +1836,16 @@
       "lines": [
         35
       ]
+    },
+    {
+      "path": "platform/qt/PlaybackFrameRange.h",
+      "anchor": "if ( consumed < 2 || elapsedMs <= 0 ) return 0.0 ;",
+      "class": "division_guard",
+      "clock": "other",
+      "justification": "CPU-LOOK-LEG-PACE-ABORT-1: measuredPaceFps() guards the (consumed-1)*1000/elapsedMs division; with fewer than two frames or a zero elapsed time it reports 0 (not measurable) rather than dividing by zero. The value is only RECORDED as a CPU leg's informational pace (cpuPaceTimelineFps); it never decides whether any stage ran, and the caller's elapsed time is a steady wall-clock delta the stop decision does not read.",
+      "lines": [
+        333
+      ]
     }
   ]
 }
