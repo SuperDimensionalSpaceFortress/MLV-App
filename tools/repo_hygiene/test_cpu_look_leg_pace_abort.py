@@ -44,6 +44,30 @@ MAIN_WINDOW = ROOT / "platform" / "qt" / "MainWindow.cpp"
 PRIOR_MASTER = "b575192806246f845dc8e353259d791bed3b8fbe"
 
 
+# CONTACT-SHEET-PLAYBACK-PARITY-1 (a later card) adds three bracketed regions to every emitted job; they are removed before the
+# byte comparisons below, so this card's pins still cover every other byte. The count is pinned so a region cannot multiply unnoticed.
+LATER_CARD_OPEN = "CONTACT-SHEET-PLAYBACK-PARITY-1 >>>"
+LATER_CARD_CLOSE = "CONTACT-SHEET-PLAYBACK-PARITY-1 <<<"
+LATER_CARD_REGIONS = 3
+
+
+def strip_later_card_regions(text: str) -> tuple[str, int]:
+    kept, inside, count = [], False, 0
+    for line in text.split("\n"):
+        if LATER_CARD_OPEN in line:
+            assert not inside, "nested CONTACT-SHEET-PLAYBACK-PARITY-1 region"
+            inside, count = True, count + 1
+            continue
+        if LATER_CARD_CLOSE in line:
+            assert inside, "unopened CONTACT-SHEET-PLAYBACK-PARITY-1 close"
+            inside = False
+            continue
+        if not inside:
+            kept.append(line)
+    assert not inside, "unclosed CONTACT-SHEET-PLAYBACK-PARITY-1 region"
+    return "\n".join(kept), count
+
+
 def _q(path: Path) -> str:
     return "'" + str(path).replace("'", "''") + "'"
 
@@ -301,7 +325,9 @@ class CpuPaceGeneratedJobs(unittest.TestCase):
         for name, extra in (("default", []), ("look", ["-ForceLookAssist", "-ContactSheet"]), ("um", ["-Venue", "ultra-magnus"]), ("play30", ["-PlaySeconds", "30"])):
             new, _ = self.generate(GENERATOR, f"new-{name}.job.ps1", extra)
             old, _ = self.generate(prior, f"old-{name}.job.ps1", extra)
-            self.assertEqual(new.read_bytes(), old.read_bytes(), f"the {name} CUDA job changed")
+            new_text, regions = strip_later_card_regions(new.read_bytes().decode("utf-8"))
+            self.assertEqual(regions, LATER_CARD_REGIONS, name)
+            self.assertEqual(new_text, old.read_bytes().decode("utf-8"), f"the {name} CUDA job changed")
 
     def test_only_the_cpu_variant_changes_and_only_in_the_card_s_lines(self) -> None:
         if not self.prior_available:
@@ -310,7 +336,9 @@ class CpuPaceGeneratedJobs(unittest.TestCase):
         for name, extra in (("cpu", ["-Backend", "cpu"]), ("um-cpu-look", ["-Backend", "cpu", "-Venue", "ultra-magnus", "-ForceLookAssist", "-ContactSheet"])):
             new, _ = self.generate(GENERATOR, f"new-{name}.job.ps1", extra)
             old, _ = self.generate(prior, f"old-{name}.job.ps1", extra)
-            changed = [line for line in difflib.unified_diff(lf(old.read_text(encoding="utf-8")).split("\n"), lf(new.read_text(encoding="utf-8")).split("\n"), lineterm="", n=0)
+            new_text, regions = strip_later_card_regions(lf(new.read_text(encoding="utf-8")))
+            self.assertEqual(regions, LATER_CARD_REGIONS, name)
+            changed = [line for line in difflib.unified_diff(lf(old.read_text(encoding="utf-8")).split("\n"), new_text.split("\n"), lineterm="", n=0)
                        if line[:1] in "+-" and not line.startswith(("+++", "---"))]
             kinds = {"switch": 0, "mode": 0, "pace": 0, "smoke_timeout": 0, "presentmon_timeout": 0}
             for line in changed:
