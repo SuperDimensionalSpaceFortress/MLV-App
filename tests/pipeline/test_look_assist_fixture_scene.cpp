@@ -6,6 +6,7 @@
 // RAW thumbnail is a flat floor at the sensor black offset, which is what made them read as NIGHT.
 // The test is on the PICTURE as well as the verdict: a correct class with a wrong balance is a
 // regression (r1: scene right, deck cast chroma 11.5 -> 22.4).
+#include "../common/hash_helpers.h"
 #include "../common/minitest.h"
 #include "../common/repo_paths.h"
 #include "mlv_pipeline_fixture.h"
@@ -16,9 +17,11 @@
 #include "../../src/batch/ReceiptApplier.h"
 
 #include <QFile>
+#include <QRegularExpression>
 #include <QString>
 #include <QTemporaryDir>
 #include <cmath>
+#include <cstdio>
 #include <cstring>
 #include <vector>
 
@@ -333,6 +336,11 @@ QString appliedLineWithoutPassFlag( const QByteArray &log )
         if( candidate.contains( "LOOK_ASSIST applied" ) ) line = QString::fromUtf8( candidate );
     line.remove( QStringLiteral(" masterScenePass=true") );
     line.remove( QStringLiteral(" masterScenePass=false") );
+    // LOOK-ASSIST-DIAG-LOGGING-1: the appended decision trace records HOW each run reached its verdict (the recorded
+    // exposure, whether a picture was asked for), which legitimately differs between the runs compared here. The
+    // analysis they compare is everything before it.
+    const int trace = line.indexOf( QStringLiteral(" has_ev100=") );
+    if( trace >= 0 ) line.truncate( trace );
     return line;
 }
 
@@ -776,4 +784,171 @@ TEST(LookAssistFixtureScene, AsShotWhiteBalanceDecoderHonoursTheWbMode)
     // Null guards.
     ASSERT_FALSE( ReceiptApplier::asShotWhiteBalanceControls( nullptr, &temperature, &tint ) );
     ASSERT_FALSE( ReceiptApplier::asShotWhiteBalanceControls( video, nullptr, &tint ) );
+}
+
+namespace
+{
+
+// LOOK-ASSIST-DIAG-LOGGING-1: the decision log is observation only. One tracked-fixture run, reduced to the three things
+// the owner sees: the verdict, the receipt, and the picture (sha256 of the 8-bit frame rendered with that receipt).
+struct IdentityRun
+{
+    QString scene;
+    QString receipt;
+    std::string pictureSha256;
+    QByteArray log;
+};
+
+struct IdentityCase
+{
+    const char *name;
+    const char *clip;
+    bool overrideExposure;   // replace the recorded exposure (ISO, shutter in microseconds, aperture * 100)
+    int iso;
+    int shutterUs;
+    int apertureX100;
+    int renderFrame;         // the frame rendered with the resulting receipt (Look Assist always analyses frame 0)
+};
+
+bool runIdentityCase( const IdentityCase &c, IdentityRun *out )
+{
+    MlvPipelineFixture fixture;
+    QString error_message;
+    if( !fixture.openClipFile( repo_file_path( QString::fromLatin1( c.clip ) ), &error_message ) ) return false;
+    if( !fixture.applyReceipt( &error_message ) ) return false;
+    if( c.overrideExposure )
+    {
+        fixture.video()->EXPO.isoValue = c.iso;
+        fixture.video()->EXPO.shutterValue = c.shutterUs;
+        fixture.video()->LENS.aperture = c.apertureX100;
+    }
+    ReceiptSettings &r = fixture.receipt();
+    r.setLookAssistEnabled( true );
+    r.setLookAssistBaselineValid( false );
+    r.setExposure( 0 );
+    r.setTemperature( -1 );
+    r.setTint( 0 );
+
+    QTemporaryDir temporary_dir;
+    const QString log_path = temporary_dir.filePath( QStringLiteral("look_assist.log") );
+    BatchLogger::init( log_path );
+    const bool applied = ReceiptApplier::applyHeadlessLookAssist( &r, fixture.video(), fixture.processing(), 0 );
+    BatchLogger::shutdown();
+    QFile log_file( log_path );
+    if( !applied || !log_file.open( QIODevice::ReadOnly | QIODevice::Text ) ) return false;
+    out->log = log_file.readAll();
+    out->receipt = receiptLine( r );
+    const QRegularExpressionMatch m =
+        QRegularExpression( QStringLiteral("LOOK_ASSIST applied frame=\\d+ scene=(\\w+)") )
+            .match( QString::fromUtf8( out->log ) );
+    out->scene = m.hasMatch() ? m.captured( 1 ) : QString();
+
+    // The picture: the receipt pushed into the pipeline exactly as the export path does, then one frame rendered.
+    if( !fixture.applyReceipt( &error_message ) ) return false;
+    const std::vector<uint8_t> frame = fixture.renderFrame8( static_cast<uint64_t>( c.renderFrame ) );
+    out->pictureSha256 = sha256_bytes( frame.data(), frame.size() );
+    return !frame.empty();
+}
+
+const IdentityCase kIdentityCases[] = {
+    { "tiny-daylight",     "tests/fixtures/clips/tiny_dual_iso.mlv",  false, 0,   0,     0,   1 },
+    { "large-daylight",    "tests/fixtures/clips/large_dual_iso.mlv", false, 0,   0,     0,   10 },
+    { "tiny-no-metadata",  "tests/fixtures/clips/tiny_dual_iso.mlv",  true,  0,   0,     0,   1 },
+    { "tiny-nd-filter",    "tests/fixtures/clips/tiny_dual_iso.mlv",  true,  100, 20000, 280, 1 },
+};
+
+// Pinned from master b5751928, BEFORE the decision log existed (see the PR). Same receipt, same verdict, same picture.
+struct IdentityPin { const char *scene; const char *receipt; const char *pictureSha256; };
+const IdentityPin kIdentityPins[] = {
+    { "shade", "exp=160 contrast=15 pivot=55 temp=6540 tint=-35 vibrance=5 shadows=12 highlights=-12 chromaSmooth=1",
+      "9a16525a28dc92ed96fe5940ccceaeec1ecd0aca5e1a74360ba9709fbf7a3e30" },
+    { "shade", "exp=160 contrast=15 pivot=55 temp=6540 tint=-35 vibrance=5 shadows=12 highlights=-12 chromaSmooth=1",
+      "f36fb58ce3680f57bd06e9d538db1e08bf74fad1963c70353049c69954f9f099" },
+    { "night", "exp=174 contrast=14 pivot=46 temp=6000 tint=0 vibrance=3 shadows=32 highlights=-26 chromaSmooth=1",
+      "4e9d6211cc6328216538224b3f9fe5be4c4f16e83343219d49984f473f49c83d" },
+    { "night", "exp=174 contrast=14 pivot=46 temp=6000 tint=0 vibrance=3 shadows=32 highlights=-26 chromaSmooth=1",
+      "4e9d6211cc6328216538224b3f9fe5be4c4f16e83343219d49984f473f49c83d" },
+};
+
+} // namespace
+
+TEST(LookAssistFixtureScene, DecisionLoggingChangesNeitherThePictureNorTheReceiptNorTheVerdict)
+{
+    const size_t caseCount = sizeof( kIdentityCases ) / sizeof( kIdentityCases[0] );
+    std::vector<IdentityRun> runs( caseCount );
+    for( size_t i = 0; i < caseCount; ++i )
+    {
+        ASSERT_TRUE( runIdentityCase( kIdentityCases[i], &runs[i] ) );
+        std::fprintf( stderr, "IDENTITY-PIN %s | scene=%s | receipt=%s | sha256=%s\n", kIdentityCases[i].name,
+                      qPrintable( runs[i].scene ), qPrintable( runs[i].receipt ), runs[i].pictureSha256.c_str() );
+    }
+    for( size_t i = 0; i < caseCount; ++i )
+    {
+        ASSERT_TRUE( runs[i].scene == QString::fromLatin1( kIdentityPins[i].scene ) );
+        ASSERT_TRUE( runs[i].receipt == QString::fromLatin1( kIdentityPins[i].receipt ) );
+        ASSERT_TRUE( runs[i].pictureSha256 == kIdentityPins[i].pictureSha256 );
+    }
+}
+
+namespace
+{
+
+// The decision fields at the end of the last "LOOK_ASSIST applied" line of a run ("" when absent).
+QString appliedLineDecisionTail( const QByteArray &log )
+{
+    QString line;
+    for( const QByteArray &candidate : log.split( '\n' ) )
+        if( candidate.contains( "LOOK_ASSIST applied" ) ) line = QString::fromUtf8( candidate ).trimmed();
+    const int at = line.indexOf( QStringLiteral(" has_ev100=") );
+    return at < 0 ? QString() : line.mid( at + 1 );
+}
+
+} // namespace
+
+TEST(LookAssistFixtureScene, HeadlessAppliedLineSaysWhyItChoseItsScene)
+{
+    // The three decisions the M16 night diagnosis could not see, through the real headless Look Assist on the tracked
+    // fixtures: the recorded exposure, which daylight conjunct decided, and that the headless path runs no night walk
+    // and no display meter. The expected tail is the WHOLE field set, so dropping or renaming any field fails here.
+    struct Expect { const char *name; const char *tail; };
+    const Expect expected[] = {
+        // (a) tracked daylight: EV100 16, the rendered picture corroborates
+        { "tiny-daylight",
+          "^has_ev100=1 ev100=16\\.\\d\\d\\d daylight_gate=pass post_walk_ran=0 post_walk_branch=none post_walk_recovery=NA "
+          "display_meter_ran=0 playback_scale=NA$" },
+        { "large-daylight",
+          "^has_ev100=1 ev100=16\\.\\d\\d\\d daylight_gate=pass post_walk_ran=0 post_walk_branch=none post_walk_recovery=NA "
+          "display_meter_ran=0 playback_scale=NA$" },
+        // (b) no metadata: nothing to record, and the first conjunct is what failed
+        { "tiny-no-metadata",
+          "^has_ev100=0 ev100=NA daylight_gate=exposure post_walk_ran=0 post_walk_branch=none post_walk_recovery=NA "
+          "display_meter_ran=0 playback_scale=NA$" },
+        // (c) a flat-floor NIGHT verdict (ND filter: EV100 8.6 over the same flat floor): metadata present, gate exposure
+        { "tiny-nd-filter",
+          "^has_ev100=1 ev100=8\\.\\d\\d\\d daylight_gate=exposure post_walk_ran=0 post_walk_branch=none "
+          "post_walk_recovery=NA display_meter_ran=0 playback_scale=NA$" },
+    };
+    const size_t caseCount = sizeof( kIdentityCases ) / sizeof( kIdentityCases[0] );
+    ASSERT_EQ( caseCount, sizeof( expected ) / sizeof( expected[0] ) );
+    for( size_t i = 0; i < caseCount; ++i )
+    {
+        ASSERT_TRUE( QString::fromLatin1( expected[i].name ) == QString::fromLatin1( kIdentityCases[i].name ) );
+        IdentityRun run;
+        ASSERT_TRUE( runIdentityCase( kIdentityCases[i], &run ) );
+        const QString tail = appliedLineDecisionTail( run.log );
+        ASSERT_FALSE( tail.isEmpty() );
+        ASSERT_TRUE( QRegularExpression( QString::fromLatin1( expected[i].tail ) ).match( tail ).hasMatch() );
+        // Appended only: the line still starts the way it always did and still carries its last original field.
+        const QString line = QString::fromUtf8( run.log );
+        ASSERT_TRUE( line.contains( QStringLiteral("LOOK_ASSIST applied frame=0 scene=") ) );
+        ASSERT_TRUE( line.contains( QStringLiteral("initialPatchFinalChroma=") ) );
+        ASSERT_TRUE( line.indexOf( QStringLiteral("initialPatchFinalChroma=") ) < line.indexOf( QStringLiteral(" has_ev100=") ) );
+    }
+
+    // The master pass asks for no picture: with every other conjunct holding, the gate is n/a rather than "picture".
+    QString receipt;
+    QByteArray log;
+    ASSERT_TRUE( runHeadlessLookAssist( "tests/fixtures/clips/tiny_dual_iso.mlv", false, &receipt, &log, true, -1, 0, 0, true ) );
+    ASSERT_TRUE( log.contains( "masterScenePass=true" ) );
+    ASSERT_TRUE( appliedLineDecisionTail( log ).contains( QStringLiteral("daylight_gate=n/a ") ) );
 }
