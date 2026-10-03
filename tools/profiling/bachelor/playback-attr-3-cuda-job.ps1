@@ -628,6 +628,9 @@ $embeddedFunctions = Get-AttrCudaEmbeddedFunctionSource -Name @(
     # this splice instead -- see its own header in AttrCudaArtifacts.psm1.
     'Publish-AttrCudaContactSheetRawCaptures',
     'Publish-AttrCudaFileCopy',
+    # DVE-PRESENTMON-EVIDENCE-1: PresentMon's captured stdout / stderr (bounded) and its CSV-existence record, published after the stop.
+    'Publish-AttrCudaBoundedTextCopy',
+    'Publish-AttrCudaPresentMonCaptureEvidence',
     'Publish-AttrCudaFileMove',
     'New-AttrCudaDirectory',
     'Assert-AttrCudaNoLinkBelowRoot',
@@ -1190,7 +1193,9 @@ function Start-PresentMonCapture([string]$CsvPath, [int]$ReadyTimeoutSeconds = 1
                 '--terminate_after_timed', '--session_name', $PresentMonSessionName, '--stop_existing_session', '--no_console_stats')
     if ($PresentMonTerminateOnProcExit) { $pmArgs += '--terminate_on_proc_exit' }
     # Direct child: inherits this job's TEMP/TMP. -PassThru so the exit code is checked.
-    $proc = Start-Process -FilePath (Join-Path $Cache $PresentMonName) -ArgumentList $pmArgs -PassThru -WindowStyle Hidden
+    # DVE-PRESENTMON-EVIDENCE-1 item 1: stdout and stderr go to files under this job's own diagnostic dir (the scan proves the targets), so a PresentMon
+    # failure keeps its own words.
+    $proc = Start-Process -FilePath (Join-Path $Cache $PresentMonName) -ArgumentList $pmArgs -RedirectStandardOutput $presentMonStdoutPath -RedirectStandardError $presentMonStderrPath -PassThru -WindowStyle Hidden
     # UM-PRESENTMON-STOP-2 r2 (sol blocker): this used to sleep 3 s and check only that the process was alive,
     # then claimed that instant bounded PresentMon's TimeInMs origin -- but the origin can be set later than
     # that. Now it waits (bounded) for VERIFIED trace readiness (Test-AttrCudaPresentMonTraceReady -- see its
@@ -1204,6 +1209,8 @@ function Start-PresentMonCapture([string]$CsvPath, [int]$ReadyTimeoutSeconds = 1
     $readyUtc = $null
     $lastDetail = $null
     while (-not $proc.HasExited) {
+        # DVE-PRESENTMON-EVIDENCE-1 item 1: note the CSV the first time it is seen, so a CSV that appeared and later vanished is not read as "never created".
+        if (Test-Path -LiteralPath $CsvPath -PathType Leaf) { $presentMonStreams['csvSeenDuringReadiness'] = $true }
         $probe = Test-AttrCudaPresentMonTraceReady $proc
         $lastDetail = $probe.detail
         if ($probe.ready) {
@@ -1213,6 +1220,8 @@ function Start-PresentMonCapture([string]$CsvPath, [int]$ReadyTimeoutSeconds = 1
         if (((Get-Date) - $waitStartedUtc).TotalSeconds -ge $ReadyTimeoutSeconds) { break }
         Start-Sleep -Milliseconds 100
     }
+    # DVE-PRESENTMON-EVIDENCE-1 item 1: once more after the last probe (readiness can answer before the loop's own check ever sees the file appear).
+    if (Test-Path -LiteralPath $CsvPath -PathType Leaf) { $presentMonStreams['csvSeenDuringReadiness'] = $true }
     $presentMonTraceReadiness['verified'] = ($null -ne $readyUtc)
     $presentMonTraceReadiness['readyUtc'] = $readyUtc
     $presentMonTraceReadiness['waitedMs'] = [int]((Get-Date) - $waitStartedUtc).TotalMilliseconds
@@ -2229,6 +2238,10 @@ $legOut = Join-Path $Work 'out\diagnostic'
 New-Item -ItemType Directory -Path $legOut -Force | Out-Null
 $resultPath = Join-Path $legOut 'result.json'
 $presentMonPath = Join-Path $legOut 'presentmon.csv'
+# DVE-PRESENTMON-EVIDENCE-1 item 1: PresentMon's own console output, captured beside its CSV (it used to run hidden with no streams, so a clean stop with no CSV
+# could not say why); published, bounded, by Publish-AttrCudaPresentMonCaptureEvidence once the capture is over.
+$presentMonStdoutPath = Join-Path $legOut 'presentmon-stdout.txt'
+$presentMonStderrPath = Join-Path $legOut 'presentmon-stderr.txt'
 $smoke = Join-Path $smokeRunnerClosureDir $SmokeRunnerName
 $telemetryArmEnvs = if ($TelemetryArm -eq 'LIGHT') {
     # Only what MLVAPP_GPU_PLAYBACK_RECON_ELIGIBILITY_DIAG and the gpu_window swap
@@ -2391,6 +2404,8 @@ $presentMonPreSpawnUtc = (Get-Date).ToUniversalTime()
 $presentMonSpawnError = $null
 # UM-PRESENTMON-STOP-2 r2: Start-PresentMonCapture records its trace-readiness observation here (see below).
 $presentMonTraceReadiness = [ordered]@{ verified = $false; readyUtc = $null; waitedMs = $null; timeoutSeconds = $null; reason = 'Start-PresentMonCapture did not record a readiness observation' }
+# DVE-PRESENTMON-EVIDENCE-1 item 1: Start-PresentMonCapture notes here (index assignment only) that it saw the CSV while waiting for readiness.
+$presentMonStreams = [ordered]@{ csvSeenDuringReadiness = $false }
 Write-JobTrace "step presentmon-spawn start session=$PresentMonSessionName"
 try {
     $presentMonProc = Start-PresentMonCapture $presentMonPath
@@ -2399,12 +2414,15 @@ try {
 }
 Write-JobTrace 'step presentmon-spawn done'
 if ($null -ne $presentMonSpawnError) {
+    # DVE-PRESENTMON-EVIDENCE-1 item 1: a PresentMon that exited at startup (rc=6, ETW access denied) said why on its own streams.
+    $presentMonSpawnEvidence = Publish-AttrCudaPresentMonCaptureEvidence -CsvPath $presentMonPath -CsvSeenDuringReadiness ([bool]$presentMonStreams['csvSeenDuringReadiness']) -StdoutPath $presentMonStdoutPath -StderrPath $presentMonStderrPath -PubRoot $Pub
     $displayFailure = [ordered]@{
         schema='playback-attr-3-cuda-venue.v1'; result='PRESENTMON_UNAVAILABLE'
         fixtureRehearsal=$FixtureRehearsal
         displayWake=$displayWake
         reason="PresentMon failed to start: $presentMonSpawnError"
         presentMonStatus='unavailable'
+        presentMonStreams=$presentMonSpawnEvidence.streams
         chains=@()
         display=$displayBlock
         sourceCommit=$SourceCommit; clipId=$ClipId; artifactRoot=$Pub
@@ -2715,6 +2733,7 @@ $earlyAppSwapTelemetry = Get-AttrCudaAppSwapTelemetry -LogText $rawLog
 $presentMonWaitError = $null
 $presentMonCleanStop = $null
 $presentMonTailTrim = $null
+$presentMonRawCsvPath = $presentMonPath
 Write-JobTrace 'step presentmon-stop start'
 try {
     $presentMonDoneResult = Wait-PresentMonCapture $presentMonProc -SessionName $PresentMonSessionName
@@ -2742,6 +2761,10 @@ try {
     $presentMonWaitError = $_.Exception.Message
 }
 Write-JobTrace "step presentmon-stop done method=$($presentMonCleanStop.stopMethod) exitedBeforeStop=$($presentMonCleanStop.exitedBeforeStop) exitCode=$($presentMonCleanStop.exitCode) terminateExitCode=$($presentMonCleanStop.terminateExitCode) killUsed=$($presentMonCleanStop.killUsed) terminateSucceeded=$($presentMonCleanStop.terminateSucceeded) stopCausedByJob=$($presentMonCleanStop.stopCausedByJob) csvTailTrimmed=$($presentMonTailTrim.trimmed) unterminatedTail=$($presentMonTailTrim.unterminatedTail) error=$presentMonWaitError"
+# DVE-PRESENTMON-EVIDENCE-1 item 1: however the stop ended (a clean stop with no CSV -- Ultra-Magnus, 2026-10-03 -- included), PresentMon's own stdout and stderr
+# are published (bounded) and the CSV's existence is recorded: a failure that says nothing is the failure this closes. Raw capture path: never the repaired copy.
+$presentMonCaptureEvidence = Publish-AttrCudaPresentMonCaptureEvidence -CsvPath $presentMonRawCsvPath -CsvSeenDuringReadiness ([bool]$presentMonStreams['csvSeenDuringReadiness']) -StdoutPath $presentMonStdoutPath -StderrPath $presentMonStderrPath -PubRoot $Pub
+Write-JobTrace "step presentmon-capture-evidence csvEverExisted=$($presentMonCaptureEvidence.csvEverExisted) csvSizeAtStop=$($presentMonCaptureEvidence.csvSizeAtStop) stdoutBytes=$($presentMonCaptureEvidence.streams.stdout.bytes) stderrBytes=$($presentMonCaptureEvidence.streams.stderr.bytes)"
 if ($null -ne $presentMonWaitError) {
     # CUDA-PERF-DISPLAY-IDENTITY-HARNESS-3 (fable HARDENING): a wait failure used to publish
     # neither the partial presentmon.csv (stable here -- Wait-PresentMonCapture kills the process
@@ -2762,6 +2785,9 @@ if ($null -ne $presentMonWaitError) {
         traceReadiness=$presentMonTraceReadiness
         stop=$presentMonCleanStop
         csvTailTrim=$presentMonTailTrim
+        csvEverExisted=$presentMonCaptureEvidence.csvEverExisted
+        csvSizeAtStop=$presentMonCaptureEvidence.csvSizeAtStop
+        streams=$presentMonCaptureEvidence.streams
     }) (Join-Path $Pub 'presentmon-capture.json')
     # DVE-LEG-TERMINALS-1 >>> (the only text this card adds to the default job; test_dual_venue_evidence strips these regions to prove the rest is byte-identical to master's)
     # DVE-LEG-TERMINALS-1 item 1 (hardening DVE-PRESENTMON-WAIT-FAILURE-UNRECEIPTABLE-1): the smoke run's own gpu summary is already in the run log
@@ -2991,6 +3017,9 @@ Save-Json ([ordered]@{
     traceReadiness=$presentMonTraceReadiness
     stop=$presentMonCleanStop
     csvTailTrim=$presentMonTailTrim
+    csvEverExisted=$presentMonCaptureEvidence.csvEverExisted
+    csvSizeAtStop=$presentMonCaptureEvidence.csvSizeAtStop
+    streams=$presentMonCaptureEvidence.streams
 }) (Join-Path $Pub 'presentmon-capture.json')
 # CUDA-PERF-DISPLAY-IDENTITY-HARNESS-3 (sol+fable HARDENING, direction-corrected anchor -- see
 # the bracket comment above): windowed under BOTH endpoints of the capture-start bracket, never

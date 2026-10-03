@@ -1925,6 +1925,96 @@ function Publish-AttrCudaFileCopy {
     return $slot
 }
 
+function Publish-AttrCudaBoundedTextCopy {
+    <#
+    .SYNOPSIS
+    Publish a captured console stream (PresentMon's stdout / stderr) at most -MaxBytes long, slot-checked like every other publish, and say what happened.
+    .DESCRIPTION
+    DVE-PRESENTMON-EVIDENCE-1: the capturing process may still hold its stream file (a PresentMon that survived even the kill fallback), so it is opened
+    with FileShare.ReadWrite. A stream longer than the bound publishes only its TAIL (the last -MaxBytes), under one first line that says so and how long
+    the capture was. An EMPTY stream is published as an empty file (an empty stderr is itself the answer); a missing one is reported missing. Never throws:
+    the result carries the error, because the caller is already on a failure path and must not lose its typed terminal to the stream copy.
+    #>
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $true)][string]$Source,
+        [Parameter(Mandatory = $true)][string]$Destination,
+        [int]$MaxBytes = 65536
+    )
+
+    $result = [ordered]@{ exists = $false; bytes = $null; published = $false; truncated = $false; error = $null }
+    try {
+        if (-not (Test-Path -LiteralPath $Source -PathType Leaf)) { return $result }
+        $result.exists = $true
+        $in = [IO.File]::Open($Source, [IO.FileMode]::Open, [IO.FileAccess]::Read, [IO.FileShare]::ReadWrite)
+        try {
+            $length = [int64]$in.Length
+            $result.bytes = $length
+            $keep = [int][math]::Min($length, [int64]$MaxBytes)
+            if ($length -gt $keep) {
+                [void]$in.Seek($length - $keep, [IO.SeekOrigin]::Begin)
+                $result.truncated = $true
+            }
+            $buffer = New-Object byte[] $keep
+            $read = 0
+            while ($read -lt $keep) {
+                $n = $in.Read($buffer, $read, $keep - $read)
+                if ($n -le 0) { break }
+                $read += $n
+            }
+        } finally {
+            $in.Dispose()
+        }
+        $text = [Text.UTF8Encoding]::new($false).GetString($buffer, 0, $read)
+        if ($result.truncated) { $text = "[truncated: $length bytes captured, the last $keep shown]" + [Environment]::NewLine + $text }
+        [void](Publish-AttrCudaText -Path $Destination -Value $text)
+        $result.published = $true
+    } catch {
+        $result.error = $_.Exception.Message
+    }
+    return $result
+}
+
+function Publish-AttrCudaPresentMonCaptureEvidence {
+    <#
+    .SYNOPSIS
+    After PresentMon's stop (or its failed start): publish its stdout / stderr beside the other artifacts and record whether its CSV ever existed.
+    .DESCRIPTION
+    DVE-PRESENTMON-EVIDENCE-1 (Ultra-Magnus, VENUE-OWNER-LEGS-UM-2 r1): a clean, immediate stop and no CSV anywhere said nothing about WHY, because PresentMon ran
+    hidden with no captured streams. csvEverExisted is true when the CSV was seen while the launch waited for trace readiness (-CsvSeenDuringReadiness) or exists
+    now; csvSizeAtStop is its size now, null when it is absent. A CSV seen early and gone at stop therefore reads (true, null) -- never the same as "never created".
+    Never throws.
+    #>
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $true)][string]$CsvPath,
+        [bool]$CsvSeenDuringReadiness = $false,
+        [Parameter(Mandatory = $true)][string]$StdoutPath,
+        [Parameter(Mandatory = $true)][string]$StderrPath,
+        [Parameter(Mandatory = $true)][string]$PubRoot
+    )
+
+    $ever = $CsvSeenDuringReadiness
+    $size = $null
+    try {
+        $item = @(Get-ChildItem -LiteralPath $CsvPath -File -ErrorAction SilentlyContinue)
+        if ($item.Count -eq 1) {
+            $ever = $true
+            $size = [int64]$item[0].Length
+        }
+    } catch {
+        $size = $null
+    }
+    [ordered]@{
+        csvEverExisted = $ever
+        csvSizeAtStop = $size
+        streams = [ordered]@{
+            stdout = Publish-AttrCudaBoundedTextCopy -Source $StdoutPath -Destination (Join-Path $PubRoot 'presentmon-stdout.txt')
+            stderr = Publish-AttrCudaBoundedTextCopy -Source $StderrPath -Destination (Join-Path $PubRoot 'presentmon-stderr.txt')
+        }
+    }
+}
+
 function Publish-AttrCudaContactSheetRawCaptures {
     <#
     .SYNOPSIS
@@ -5945,6 +6035,8 @@ Export-ModuleMember -Function `
     Publish-AttrCudaBytes, `
     Publish-AttrCudaText, `
     Publish-AttrCudaFileCopy, `
+    Publish-AttrCudaBoundedTextCopy, `
+    Publish-AttrCudaPresentMonCaptureEvidence, `
     Publish-AttrCudaFileMove, `
     Publish-AttrCudaFileMoveNonOverwriting, `
     Publish-AttrCudaDirectoryMoveNonOverwriting, `
