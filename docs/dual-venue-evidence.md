@@ -249,7 +249,9 @@ same streams from the spawn-failure summary (`presentMonStreams`).
 other-named session lose all of its events (15-17k "ETW events were lost" per 12 s), so no CSV was written; the per-job `--session_name` meant `--stop_existing_session` no
 longer cleared it. Before the spawn the job now terminates the default `PresentMon` session and every `MLVAttr3-*` session that `logman query -ets` lists, through the pinned
 PresentMon's own `--terminate_existing_session` (`logman stop <name> -ets` only for a session still listed afterwards) -- but only when no PresentMon process is alive on the host
-(checked before the listing and again right after it); otherwise it records that it did not run. A job-issued `Kill()` is followed by the terminate of the job's own named
+(checked before the listing and again right after it); otherwise it records that it did not run. "A PresentMon process" means the pinned capture executable (image name equal to
+the pinned one, case-insensitive, or the pinned cache path): the owner's always-running `PresentMonService` (Bachelor) matches only a name prefix, never skips the sweep, and is
+recorded in `orphanSweep.excludedPresentMonProcesses` (name, pid; UM-SWEEP-OWNER-PRESENTMONSERVICE-1); a process list that cannot be read stops the sweep with `error`. A job-issued `Kill()` is followed by the terminate of the job's own named
 session (both stop paths). `presentmon-capture.json` carries `orphanSweep` (ran, skippedReason, live pids, listed, matching listing lines, every action with its exit code,
 what remains) and `eventsLost` (PresentMon's stderr reported lost events: message count and largest count); the failure terminals' PresentMon reason gains a typed
 `PRESENTMON_EVENTS_LOST` detail, so a recurrence reads as its cause instead of "output does not exist".

@@ -1212,7 +1212,7 @@ function Start-PresentMonCapture([string]$CsvPath, [int]$ReadyTimeoutSeconds = 1
         $sweepResult = Invoke-PresentMonOrphanSweep
         foreach ($key in @($sweepResult.Keys)) { $presentMonOrphanSweep[$key] = $sweepResult[$key] }
         $sweepActionText = @($sweepResult['actions'] | ForEach-Object { $_.session + ':' + $_.method + ':' + $_.exitCode }) -join ';'
-        Write-JobTrace "step presentmon-orphan-sweep ran=$($sweepResult['ran']) skipped=$($sweepResult['skippedReason']) livePids=$(@($sweepResult['livePresentMonProcessIds']) -join ',') listed=$(@($sweepResult['listed']) -join ',') actions=$sweepActionText aborted=$($sweepResult['abortedReason']) abortedBefore=$($sweepResult['abortedBefore']) remaining=$(@($sweepResult['remaining']) -join ',') newlyListed=$(@($sweepResult['newlyListed']) -join ',') listError=$($sweepResult['listError']) error=$($sweepResult['error'])"
+        Write-JobTrace "step presentmon-orphan-sweep ran=$($sweepResult['ran']) skipped=$($sweepResult['skippedReason']) livePids=$(@($sweepResult['livePresentMonProcessIds']) -join ',') excluded=$(@($sweepResult['excludedPresentMonProcesses'] | Where-Object { $null -ne $_ } | ForEach-Object { $_['name'] + ':' + $_['pid'] }) -join ',') listed=$(@($sweepResult['listed']) -join ',') actions=$sweepActionText aborted=$($sweepResult['abortedReason']) abortedBefore=$($sweepResult['abortedBefore']) remaining=$(@($sweepResult['remaining']) -join ',') newlyListed=$(@($sweepResult['newlyListed']) -join ',') listError=$($sweepResult['listError']) error=$($sweepResult['error'])"
     }
     # UM-PRESENTMON-ORPHAN-SWEEP-1 <<<
     # Direct child: inherits this job's TEMP/TMP. -PassThru so the exit code is checked.
@@ -1288,9 +1288,32 @@ function Invoke-PresentMonSessionTerminate([string]$SessionName, [int]$TimeoutSe
 }
 
 # UM-PRESENTMON-ORPHAN-SWEEP-1 >>> (this card's text in the default job is bracketed like this; test_dual_venue_evidence strips every region to prove the rest is byte-identical to the pinned baseline)
+function Get-PresentMonProcessSnapshot() {
+    # UM-SWEEP-OWNER-PRESENTMONSERVICE-1 (Bachelor, 2026-10-03): the liveness check used to be `Get-Process -Name 'PresentMon*'`, which also matches the always-running PresentMonService (Intel
+    # PresentMon's service, the owner's) -- that process never owns a capture session of this harness, yet it skipped the sweep on both Bachelor legs, so the sweep could never run there.
+    # A process is a LIVE CAPTURE-MODE PresentMon only when it is the pinned executable: its image name equals the pinned one (case-insensitive, no extension, e.g.
+    # PresentMon-2.5.1-x64) or its path is the pinned cache path. Every other `PresentMon*` process is recorded in `excluded` (name, pid) and never blocks the sweep. The process list is
+    # read with -ErrorAction Stop: a host whose list cannot be read throws, and the sweep records the error and touches nothing (it never reads an unreadable list as "no capture alive").
+    $pinnedName = [System.IO.Path]::GetFileNameWithoutExtension([string]$PresentMonName)
+    $pinnedPath = [System.IO.Path]::GetFullPath((Join-Path ([string]$Cache) ([string]$PresentMonName)))
+    $live = @()
+    $excluded = @()
+    foreach ($candidate in @(Get-Process -Name 'PresentMon*' -ErrorAction Stop)) {
+        $candidatePath = $null
+        try { $candidatePath = [string]$candidate.Path } catch { $candidatePath = $null }
+        $isPinned = ([string]$candidate.Name -ieq $pinnedName) -or (-not [string]::IsNullOrEmpty($candidatePath) -and ($candidatePath -ieq $pinnedPath))
+        if ($isPinned) {
+            $live += [int]$candidate.Id
+        } else {
+            $excluded += [ordered]@{ name = [string]$candidate.Name; pid = [int]$candidate.Id }
+        }
+    }
+    return [pscustomobject]@{ live = @($live); excluded = @($excluded) }
+}
+
 function Get-PresentMonLiveProcessId() {
-    # the ids of every PresentMon process on the host (any of them may own a capture, and so a session); the sweep asks this before the scan, after it, and before each action it takes
-    return @(Get-Process -Name 'PresentMon*' -ErrorAction SilentlyContinue | ForEach-Object { [int]$_.Id })
+    # the ids of every live capture-mode PresentMon (the pinned executable) on the host -- any of them may own a capture, and so a session; the sweep asks this before the scan, after it, and before each action it takes
+    return @((Get-PresentMonProcessSnapshot).live)
 }
 
 function Get-PresentMonLogmanTimeoutSecond() {
@@ -1330,10 +1353,13 @@ function Invoke-PresentMonOrphanSweep() {
     # r2 (sol blocker 1, fable UM-SWEEP-FALLBACK-SCOPE-1): the sweep acts ONLY on the names in $listed -- the orphan list captured before the second liveness check -- never on a name a later
     # listing shows (that is another job's capture that started meanwhile, recorded in newlyListed and left alone), and liveness (no PresentMon process) is re-checked immediately before EACH
     # terminate and EACH logman stop: the first process that appears stops the sweep (abortedReason / abortedBefore) and what is left is still listed in `remaining`.
-    $record = [ordered]@{ ran = $false; skippedReason = $null; abortedReason = $null; abortedBefore = $null; livePresentMonProcessIds = @(); listed = @(); matchingListingLines = @(); listAttempts = 0; actions = @(); remaining = @(); newlyListed = @(); listError = $null; error = $null }
+    $record = [ordered]@{ ran = $false; skippedReason = $null; abortedReason = $null; abortedBefore = $null; livePresentMonProcessIds = @(); excludedPresentMonProcesses = @(); listed = @(); matchingListingLines = @(); listAttempts = 0; actions = @(); remaining = @(); newlyListed = @(); listError = $null; error = $null }
     try {
-        $live = @(Get-PresentMonLiveProcessId)
+        $snapshot = Get-PresentMonProcessSnapshot
+        $live = @($snapshot.live)
         $record['livePresentMonProcessIds'] = $live
+        # UM-SWEEP-OWNER-PRESENTMONSERVICE-1: PresentMon* processes that are not the pinned capture executable (the owner's PresentMonService) are evidence only -- they never skip the sweep
+        $record['excludedPresentMonProcesses'] = @($snapshot.excluded)
         if ($live.Count -gt 0) {
             $record['skippedReason'] = 'presentmon_process_alive'
             return $record

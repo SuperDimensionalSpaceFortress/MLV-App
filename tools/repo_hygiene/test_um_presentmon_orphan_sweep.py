@@ -58,6 +58,10 @@ def ps(path: Path) -> str:
     return str(path).replace("'", "''")
 
 
+def ps_quote(value: str) -> str:
+    return "'" + value.replace("'", "''") + "'"
+
+
 def listing(*names: str) -> str:
     # the real layout (UM, 2026-10-03, 00-logman-ets-start.txt): a name shorter than the 40-column field is padded to it; a wider one is printed in full and followed by ONE space
     return LOGMAN_HEADER + "".join(f"{n.ljust(40) if len(n) < 40 else n + ' '}Trace                         Running\n" for n in names) + LOGMAN_FOOTER
@@ -365,7 +369,8 @@ class SweepExecutedTests(SliceHarness, unittest.TestCase):
     def run_start(self, name: str, sessions: tuple[str, ...] = ("PresentMon", "MLVAttr3-old-killed-job", "Circular Kernel Context Logger"), live_pids: tuple[int, ...] = (),
                   helper_works: bool = True, logman_stop_works: bool = True, enabled: bool = True, get_process_throws: bool = False, logman_query_fails: bool = False, live_from_second_check: bool = False,
                   text: str | None = None, extra_from_query: int = 0, live_after_terminate_of: str | None = None, query_exits: dict[int, int] | None = None,
-                  logman_hangs: bool = False, logman_stop_hangs: bool = False, logman_timeout_seconds: int = 0) -> tuple[int, dict, Path, str]:
+                  logman_hangs: bool = False, logman_stop_hangs: bool = False, logman_timeout_seconds: int = 0,
+                  others: tuple[tuple[int, str, str | None], ...] = ()) -> tuple[int, dict, Path, str]:
         d = self.stmp / name
         (d / "cache").mkdir(parents=True)
         (d / "legOut").mkdir()
@@ -410,6 +415,8 @@ class SweepExecutedTests(SliceHarness, unittest.TestCase):
             "exit 0\n"))
         body = text if text is not None else TEMPLATE
         pids = ", ".join(str(p) for p in live_pids)
+        # UM-SWEEP-OWNER-PRESENTMONSERVICE-1: other processes whose name merely starts with PresentMon (the owner's PresentMonService), as (id, name, path-or-None)
+        extra = "".join(f"    [pscustomobject]@{{ Id = {i}; Name = '{n}'; Path = {('$null' if pth is None else ps_quote(pth))} }}\n" for i, n, pth in others)
         script = d / "probe.ps1"
         script.write_text(
             "$ErrorActionPreference = 'Stop'\n"
@@ -421,9 +428,10 @@ class SweepExecutedTests(SliceHarness, unittest.TestCase):
             "    [CmdletBinding()] param([string[]]$Name)\n"
             "    $global:getProcessCalls = 1 + [int]$global:getProcessCalls\n"
             + ("    throw 'stub Get-Process failure'\n" if get_process_throws else
-               f"    if (Test-Path -LiteralPath '{ps(d / 'go-live.txt')}') {{ return [pscustomobject]@{{ Id = 5151; Name = 'PresentMon-2.5.1-x64' }} }}\n"
+               f"    if (Test-Path -LiteralPath '{ps(d / 'go-live.txt')}') {{ return [pscustomobject]@{{ Id = 5151; Name = [IO.Path]::GetFileNameWithoutExtension($PresentMonName); Path = $null }} }}\n"
+               + extra
                + ("    if ($global:getProcessCalls -lt 2) { return }\n" if live_from_second_check else "")
-               + f"    foreach ($p in @({pids})) {{ [pscustomobject]@{{ Id = [int]$p; Name = 'PresentMon-2.5.1-x64' }} }}\n")
+               + f"    foreach ($p in @({pids})) {{ [pscustomobject]@{{ Id = [int]$p; Name = [IO.Path]::GetFileNameWithoutExtension($PresentMonName); Path = $null }} }}\n")
             + "}\n"
             # the sweep's wrappers run an executable (bounded by a deadline), so the stub is one: a .cmd shim around a pwsh script
             f"$presentMonLogmanPath = '{ps(logman_stub)}'\n"
@@ -484,6 +492,88 @@ class SweepExecutedTests(SliceHarness, unittest.TestCase):
         self.assertEqual(sweep["livePresentMonProcessIds"], [4242])
         self.assertEqual(sweep["actions"], [])
         self.assertIn("presentmon_process_alive", (d / "trace.log").read_text(encoding="utf-8"))
+
+    # --- UM-SWEEP-OWNER-PRESENTMONSERVICE-1: the liveness check is a live CAPTURE-MODE PresentMon (the pinned executable), never a process that merely starts with "PresentMon"
+    SERVICE = (7001, "PresentMonService", "C:\\Program Files\\Intel\\PresentMonService.exe")
+
+    def test_an_owner_presentmonservice_does_not_skip_the_sweep(self) -> None:
+        # Bachelor, 2026-10-03: the always-running PresentMonService matched `PresentMon*` and skipped the sweep on both legs
+        code, sweep, d, out = self.run_start("service-alive", others=(self.SERVICE,))
+        self.assertEqual(code, 0, out)
+        self.assertEqual(self.terminated_names(self.calls(d)), ["PresentMon", "MLVAttr3-old-killed-job"], "the orphans are swept with the service running")
+        self.assertTrue(sweep["ran"], sweep)
+        self.assertIsNone(sweep["skippedReason"])
+        self.assertEqual(sweep["livePresentMonProcessIds"], [], "the service is not a live capture")
+        self.assertEqual(sweep["excludedPresentMonProcesses"], [{"name": "PresentMonService", "pid": 7001}], "recorded as evidence, name and pid")
+        self.assertEqual(sweep["remaining"], [])
+        self.assertIn("excluded=PresentMonService:7001", (d / "trace.log").read_text(encoding="utf-8"))
+
+    def test_a_live_pinned_capture_beside_the_service_still_skips_the_sweep(self) -> None:
+        code, sweep, d, out = self.run_start("service-and-capture", live_pids=(4242,), others=(self.SERVICE,))
+        self.assertEqual(code, 0, out)
+        self.assertEqual(self.terminated_names(self.calls(d)), [])
+        self.assertFalse(sweep["ran"])
+        self.assertEqual(sweep["skippedReason"], "presentmon_process_alive")
+        self.assertEqual(sweep["livePresentMonProcessIds"], [4242], "only the pinned capture counts as live")
+        self.assertEqual(sweep["excludedPresentMonProcesses"], [{"name": "PresentMonService", "pid": 7001}])
+
+    def test_a_pinned_capture_that_appears_mid_sweep_still_stops_it_with_the_service_running(self) -> None:
+        code, sweep, d, out = self.run_start("service-mid-sweep", live_after_terminate_of="PresentMon", others=(self.SERVICE,))
+        self.assertEqual(code, 0, out)
+        self.assertEqual(self.terminated_names(self.calls(d)), ["PresentMon"])
+        self.assertEqual(sweep["abortedBefore"], "MLVAttr3-old-killed-job:presentmon_terminate")
+        self.assertEqual(sweep["livePresentMonProcessIds"], [5151])
+
+    def test_the_pinned_executable_is_matched_by_path_as_well_as_by_name(self) -> None:
+        # a renamed copy of the pinned binary is still a live capture: its image path is the pinned cache path
+        code, sweep, d, out = self.run_start("by-path", others=((4343, "renamed-capture", str(self.stmp / "by-path" / "cache" / STUB_EXE)),))
+        self.assertEqual(code, 0, out)
+        self.assertFalse(sweep["ran"])
+        self.assertEqual(sweep["livePresentMonProcessIds"], [4343])
+        self.assertEqual(self.terminated_names(self.calls(d)), [])
+
+    def test_the_image_name_is_matched_exactly_not_by_prefix_and_without_regard_to_case(self) -> None:
+        stub = Path(STUB_EXE).stem
+        code, sweep, d, out = self.run_start("exact-name", others=((4401, f"{stub}-helper", None), (4402, stub.upper(), None)))
+        self.assertEqual(code, 0, out)
+        self.assertEqual(sweep["livePresentMonProcessIds"], [4402], "an upper-case image name of the pinned executable is live")
+        self.assertEqual(sweep["excludedPresentMonProcesses"], [{"name": f"{stub}-helper", "pid": 4401}], "a longer name that merely starts with the pinned one is not")
+
+    def test_an_unreadable_process_list_still_touches_nothing(self) -> None:
+        code, sweep, d, out = self.run_start("service-list-throws", get_process_throws=True, others=(self.SERVICE,))
+        self.assertEqual(code, 0, out)
+        self.assertIn("stub Get-Process failure", sweep["error"])
+        self.assertEqual(self.terminated_names(self.calls(d)), [])
+        self.assertFalse(sweep["ran"])
+
+    def test_the_process_list_is_read_with_an_error_action_that_throws(self) -> None:
+        snapshot = _slice(TEMPLATE, "function Get-PresentMonProcessSnapshot(", "\nfunction Get-PresentMonLiveProcessId(")
+        self.assertIn("Get-Process -Name 'PresentMon*' -ErrorAction Stop", snapshot)
+        self.assertNotIn("SilentlyContinue", snapshot, "an unreadable list must never read as 'no capture alive'")
+
+    def test_mutation_a_name_prefix_match_lets_the_service_skip_the_sweep_again(self) -> None:
+        mutated = mutate(TEMPLATE, "$isPinned = ([string]$candidate.Name -ieq $pinnedName) -or", "$isPinned = ([string]$candidate.Name -like 'PresentMon*') -or")
+        _code, sweep, d, _out = self.run_start("mut-prefix", others=(self.SERVICE,), text=mutated)
+        self.assertFalse(sweep["ran"])
+        self.assertEqual(sweep["skippedReason"], "presentmon_process_alive")
+        self.assertEqual(self.terminated_names(self.calls(d)), [], "the Bachelor state: the service blocks the sweep")
+
+    def test_mutation_without_the_path_match_a_renamed_capture_reads_as_no_capture(self) -> None:
+        mutated = mutate(TEMPLATE, " -or (-not [string]::IsNullOrEmpty($candidatePath) -and ($candidatePath -ieq $pinnedPath))", "")
+        _code, sweep, d, _out = self.run_start("mut-path", others=((4343, "renamed-capture", str(self.stmp / "mut-path" / "cache" / STUB_EXE)),), text=mutated)
+        self.assertTrue(sweep["ran"], "without the path arm a live renamed capture would be swept under")
+        self.assertNotEqual(self.terminated_names(self.calls(d)), [])
+
+    def test_mutation_a_case_sensitive_name_match_misses_a_live_capture(self) -> None:
+        stub = Path(STUB_EXE).stem
+        mutated = mutate(TEMPLATE, "([string]$candidate.Name -ieq $pinnedName)", "([string]$candidate.Name -ceq $pinnedName)")
+        _code, sweep, d, _out = self.run_start("mut-case", others=((4402, stub.upper(), None),), text=mutated)
+        self.assertTrue(sweep["ran"], "the mutation sweeps under a live capture")
+
+    def test_mutation_without_the_excluded_record_the_service_leaves_no_evidence(self) -> None:
+        mutated = mutate(TEMPLATE, "$record['excludedPresentMonProcesses'] = @($snapshot.excluded)", "$null = $snapshot")
+        _code, sweep, _d, _out = self.run_start("mut-excluded", others=(self.SERVICE,), text=mutated)
+        self.assertEqual(sweep["excludedPresentMonProcesses"], [])
 
     def test_a_presentmon_that_appears_while_the_listing_runs_is_never_swept(self) -> None:
         code, sweep, d, out = self.run_start("late-live", live_pids=(4242,), live_from_second_check=True)
