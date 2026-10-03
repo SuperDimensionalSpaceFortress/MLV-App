@@ -2700,6 +2700,69 @@ function Initialize-AttrCudaFileIdNative {
     Add-Type -Namespace AttrCudaWin32 -Name FileIdNative -MemberDefinition $definition -ErrorAction Stop
 }
 
+function Test-AttrCudaPresentMonTraceReady {
+    <#
+    .SYNOPSIS
+    Has this PresentMon process finished starting its trace session? Returns an object with
+    `ready` (bool) and `detail` (string); never throws.
+    .DESCRIPTION
+    UM-PRESENTMON-STOP-2 r2 (sol blocker). PresentMon 2.5.1 fixes its TimeInMs origin at the END of
+    PMTraceSession::Start() (PresentData/PresentMonTraceSession.cpp: mStartTimestamp from QPC, after
+    EnableProviders and OpenTraceW), and creates its output CSV lazily at the first present of the
+    target process (PresentMon/CsvOutput.cpp UpdateCsvT) -- after the app is launched -- so neither the
+    CSV nor its header can say "ready" before the launch. What does: PresentMon creates its message-only
+    window (class 'PresentMon', title 'PresentMonWnd') BEFORE Start(), but its main thread only pumps
+    that window's queue once Start() has returned and the consumer and output threads are up
+    (PresentMon/MainThread.cpp). A cross-thread WM_NULL (SendMessageTimeout) to that window is therefore
+    answered only AFTER the origin was set, so an answer is a verified upper bound for it. No window of
+    that pid, or no answer within -TimeoutMs, is "not ready yet" -- never an assumption. A window of
+    ANOTHER pid (a second PresentMon on the host) never counts.
+    The Win32 surface is defined once per process (idempotent), like Initialize-AttrCudaFileIdNative.
+    #>
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)] $Proc,
+        [int]$TimeoutMs = 200
+    )
+
+    $detail = $null
+    try {
+        if (-not ('AttrCudaWin32.PresentMonProbe' -as [type])) {
+            $definition = @'
+    [System.Runtime.InteropServices.DllImport("user32.dll", CharSet = System.Runtime.InteropServices.CharSet.Unicode)]
+    public static extern System.IntPtr FindWindowExW(System.IntPtr parent, System.IntPtr after, string cls, string title);
+
+    [System.Runtime.InteropServices.DllImport("user32.dll")]
+    public static extern uint GetWindowThreadProcessId(System.IntPtr hWnd, out uint pid);
+
+    [System.Runtime.InteropServices.DllImport("user32.dll", CharSet = System.Runtime.InteropServices.CharSet.Unicode)]
+    public static extern System.IntPtr SendMessageTimeoutW(System.IntPtr hWnd, uint msg, System.IntPtr wParam, System.IntPtr lParam, uint flags, uint timeoutMs, out System.IntPtr result);
+
+    // 0 = no PresentMon message window for pid; 1 = its thread answered; 2 = window exists, no answer in time.
+    public static int Probe(uint pid, uint timeoutMs) {
+        System.IntPtr h = System.IntPtr.Zero;
+        while (true) {
+            h = FindWindowExW(new System.IntPtr(-3), h, "PresentMon", "PresentMonWnd");
+            if (h == System.IntPtr.Zero) { return 0; }
+            uint p;
+            GetWindowThreadProcessId(h, out p);
+            if (p != pid) { continue; }
+            System.IntPtr r;
+            return SendMessageTimeoutW(h, 0, System.IntPtr.Zero, System.IntPtr.Zero, 2, timeoutMs, out r) == System.IntPtr.Zero ? 2 : 1;
+        }
+    }
+'@
+            Add-Type -Namespace AttrCudaWin32 -Name PresentMonProbe -MemberDefinition $definition -ErrorAction Stop
+        }
+        $answer = [AttrCudaWin32.PresentMonProbe]::Probe([uint32]$Proc.Id, [uint32]$TimeoutMs)
+        if ($answer -eq 1) { return [pscustomobject]@{ ready = $true; detail = 'the PresentMon message pump answered' } }
+        $detail = if ($answer -eq 2) { 'the PresentMon message window exists but its main thread is not answering (trace session still starting)' } else { "no PresentMon message window for pid $($Proc.Id) yet" }
+    } catch {
+        $detail = "readiness probe failed: $($_.Exception.Message)"
+    }
+    [pscustomobject]@{ ready = $false; detail = $detail }
+}
+
 function ConvertTo-AttrCudaFileIdObject {
     <#
     .SYNOPSIS
@@ -3498,6 +3561,9 @@ function Get-AttrCudaPresentMonDisplayReport {
             windowStartMs = $windowStartMs
             windowEndMs = $windowEndMs
             windowedRows = $windowedRows
+            # UM-PRESENTMON-STOP-2: every MLVApp present (displayed or not) this endpoint admits, as its raw
+            # TimeInMs, so a job-stopped capture can be judged by POSITION against the app's swap window.
+            selectedPresentTimesMs = @($mlvAppRows | ForEach-Object { [double]$_.timeInMs })
             chains = @($chains)
             # Named targetChains, not the more obvious name built from "MLVApp" + "Chains", purely
             # so dot-accessing it below never spells a footage-extension-shaped token: tools/
@@ -3580,6 +3646,7 @@ function Get-AttrCudaPresentMonDisplayReport {
         chains = @($headlineBuild.chains)
         selectedChain = $headlineBuild.selected
         selectedChainRows = $headlineBuild.selectedChainRows
+        selectedPresentTimesMs = $headlineBuild.selectedPresentTimesMs
         clockBracket = $clockBracket
         # PRESENTMON-HARNESS-ROBUSTNESS-2 r1b: the headline endpoint's own window bounds, on the
         # same anchor as selectedChainRows' timeInMs -- see the buildWindow comment above.
@@ -5892,6 +5959,7 @@ Export-ModuleMember -Function `
     Read-AttrCudaOwnedJournal, `
     Get-AttrCudaOwnershipProof, `
     Initialize-AttrCudaFileIdNative, `
+    Test-AttrCudaPresentMonTraceReady, `
     ConvertTo-AttrCudaFileIdObject, `
     Get-AttrCudaFileId, `
     Remove-AttrCudaFileByProof, `

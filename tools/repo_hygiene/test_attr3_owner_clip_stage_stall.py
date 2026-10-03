@@ -370,10 +370,16 @@ class OwnerClipEmittedJobTests(_PwshCase):
         self.assertTrue(result["runnerVerifiedClipBinding"])
         self.assertIn("$RunnerAcceptsVerifiedClipBinding = $true", job_text)
 
-    def test_a_fixture_leg_keeps_the_fixed_presentmon_window(self) -> None:
-        job_text, _ = self._generate()
-        self.assertIn("$PresentMonTimedSeconds = 55\n", job_text.replace("\r\n", "\n"))
-        self.assertIn("$PresentMonTerminateOnProcExit = $false", job_text)
+    def test_a_fixture_leg_sizes_the_presentmon_ceiling_like_an_owner_leg(self) -> None:
+        # UM-PRESENTMON-STOP-1: the old fixed 55 s ceiling (and no proc-exit request) ended a fixture
+        # leg's capture 22.9 s before its playback did on Ultra-Magnus. Every leg now takes the ceiling
+        # derived from its smoke budget, and the job itself stops the capture after the app exits.
+        job_text, result = self._generate()
+        ceiling = -(-int(result["smokeProcessTimeoutMs"]) // 1000)
+        self.assertGreater(ceiling, 55)
+        self.assertIn(f"$PresentMonTimedSeconds = {ceiling}\n", job_text.replace("\r\n", "\n"))
+        self.assertNotIn("$PresentMonTimedSeconds = 55\n", job_text.replace("\r\n", "\n"))
+        self.assertIn("$PresentMonTerminateOnProcExit = $true", job_text)
 
     def test_the_emitted_job_is_syntactically_valid_powershell(self) -> None:
         job_text, _ = self._generate()
@@ -745,7 +751,10 @@ class RunnerAndTemplateStaticChainTests(unittest.TestCase):
         self.assertIn("$PresentMonTimedSeconds = __PRESENTMON_TIMED_SECONDS__", self.template)
         self.assertIn("if ($PresentMonTerminateOnProcExit) { $pmArgs += '--terminate_on_proc_exit' }", self.template)
         generator = ATTRIBUTION_GENERATOR.read_text(encoding="utf-8")
-        self.assertIn("PRESENTMON_TIMED_SECONDS = $(if ($isFixtureRehearsal) { '55' } else { [string][int][math]::Ceiling($timeBudget.smokeProcessTimeoutMs / 1000.0) })", generator)
+        self.assertIn("PRESENTMON_TIMED_SECONDS = [string][int][math]::Ceiling($timeBudget.smokeProcessTimeoutMs / 1000.0)", generator)
+        self.assertIn("PRESENTMON_TERMINATE_ON_PROC_EXIT = '$true'", generator)
+        # UM-PRESENTMON-STOP-1: PresentMon is also stopped by the job itself, on a per-job named session.
+        self.assertIn("'--session_name', $PresentMonSessionName", self.template)
 
     def test_the_fixed_allowances_record_where_each_number_came_from(self) -> None:
         module = MODULE.read_text(encoding="utf-8")

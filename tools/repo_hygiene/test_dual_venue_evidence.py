@@ -45,9 +45,17 @@ DV = ROOT / "tools" / "profiling" / "dual-venue"
 GENERATOR = ROOT / "tools" / "profiling" / "bachelor" / "playback-attr-3-cuda-job.ps1"
 COMPOSER = ROOT / "tools" / "profiling" / "make-contact-sheet.py"
 
-# The fork/master commit whose generator the DEFAULT emitted job must stay byte-identical to (the first master
-# that carries PLAYBACK-CLIP-LENGTH-ENFORCE-4; this card's own merge base for the generator).
-BASELINE_COMMIT = "38ed2d8f96c29df273d1de60f2dfd8a03ab6873a"
+# The commit whose generator the DEFAULT emitted job must stay byte-identical to. UM-PRESENTMON-STOP-1 changed the
+# default job on purpose (per-job PresentMon session name, clean named stop, one capture ceiling for every leg; r2:
+# content-judged CSV tail repair, job-stop sufficiency arms, failed-terminate labelling, named terminate on failure
+# paths); UM-PRESENTMON-STOP-2 changed it again on purpose (position-based job-stop sufficiency arms, alive-before-
+# terminate / alive-before-kill exit attribution; r2: the capture-start bracket bounded by verified trace readiness,
+# kill_fallback judged by .NET Kill's exit code; the probe lives in AttrCudaArtifacts.psm1), so this is that card's own
+# generator commit (4c58c328: the r2 generator on the branch BEFORE the #231 merge, so it carries none of the DVE
+# regions); it was 558143b1 (r2, before the probe moved into the module), 6567793196bf
+# (UM-PRESENTMON-STOP-2 r1), abc10451ae2c (UM-PRESENTMON-STOP-1 r2), 8c19f442603c (r1) and before that
+# PLAYBACK-CLIP-LENGTH-ENFORCE-4's merge (38ed2d8f96c2).
+BASELINE_COMMIT = "4c58c3285f91587ab83a90d7e2a14fea63f49a56"
 
 PWSH = shutil.which("pwsh")
 requires_windows_pwsh = unittest.skipIf(PWSH is None or sys.platform != "win32", "needs pwsh on Windows")
