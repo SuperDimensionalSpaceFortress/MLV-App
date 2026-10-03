@@ -263,3 +263,15 @@ The production dispatcher must use the reviewed launcher revision and the
 applicable updated execution-control receipt before resuming editing
 dispatch. This change does not enable the workstream loop or rewrite
 historical receipts.
+
+## Lane worktree retirement at lane exit
+
+`-RetireWorktree` retires the lane's own worktree through the SAFE gate in
+`tools/coordination/Retire-LaneWorktree.ps1`, but that runs before the lane's PR
+merges, so the gate answers `unmerged`. Since DISK-MERGED-WORKTREE-SWEEP-1 every
+`Invoke-Lane.ps1` exit also runs `Invoke-SweepMergedLaneWorktrees`, which re-asks the
+same gate about every OTHER linked worktree under `-WorktreeSweepRoot` (default
+`C:\mlvtmp`), so merged ones disappear and disk use is bounded by the unmerged ones.
+It is ON BY DEFAULT; pass `-NoWorktreeSweep` to opt out. It skips worktrees idle for
+less than six hours, stops after a 180 s budget, never throws, and records its
+outcome as `worktreeSweep` in the receipt.
