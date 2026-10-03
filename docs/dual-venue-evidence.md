@@ -249,7 +249,13 @@ same streams from the spawn-failure summary (`presentMonStreams`).
 other-named session lose all of its events (15-17k "ETW events were lost" per 12 s), so no CSV was written; the per-job `--session_name` meant `--stop_existing_session` no
 longer cleared it. Before the spawn the job now terminates the default `PresentMon` session and every `MLVAttr3-*` session that `logman query -ets` lists, through the pinned
 PresentMon's own `--terminate_existing_session` (`logman stop <name> -ets` only for a session still listed afterwards) -- but only when no PresentMon process is alive on the host
-(checked before the listing and again right after it); otherwise it records that it did not run. A job-issued `Kill()` is followed by the terminate of the job's own named
+(checked before the listing and again right after it); otherwise it records that it did not run. "A PresentMon process" is every `PresentMon*` process except one POSITIVELY
+identified as not a capture (UM-SWEEP-OWNER-PRESENTMONSERVICE-1): the owner's always-running `PresentMonService` (Bachelor) is recognised because its pid is the `ProcessId` of a
+registered Windows service (`Win32_Service`), and a process with a readable path that is neither the pinned image/path nor a capture image is excluded too. The pinned capture executable
+(image name equal to the pinned one, case-insensitive, or the pinned cache path), a foreign capture image, and any process whose path cannot be read and that is no registered service
+are live (the sweep is skipped, with the reason recorded in `orphanSweep.livePresentMonProcesses`: name, pid, `pathReadable`, reason). Excluded processes are recorded in
+`orphanSweep.excludedPresentMonProcesses` (name, pid, service, `pathReadable`; never a path). A process list or a service lookup that cannot be read stops the sweep with
+`error`. A job-issued `Kill()` is followed by the terminate of the job's own named
 session (both stop paths). `presentmon-capture.json` carries `orphanSweep` (ran, skippedReason, live pids, listed, matching listing lines, every action with its exit code,
 what remains) and `eventsLost` (PresentMon's stderr reported lost events: message count and largest count); the failure terminals' PresentMon reason gains a typed
 `PRESENTMON_EVENTS_LOST` detail, so a recurrence reads as its cause instead of "output does not exist".
