@@ -1291,25 +1291,43 @@ function Invoke-PresentMonSessionTerminate([string]$SessionName, [int]$TimeoutSe
 function Get-PresentMonProcessSnapshot() {
     # UM-SWEEP-OWNER-PRESENTMONSERVICE-1 (Bachelor, 2026-10-03): the liveness check used to be `Get-Process -Name 'PresentMon*'`, which also matches the always-running PresentMonService (Intel
     # PresentMon's service, the owner's) -- that process never owns a capture session of this harness, yet it skipped the sweep on both Bachelor legs, so the sweep could never run there.
-    # A process is a LIVE CAPTURE-MODE PresentMon only when it is the pinned executable: its image name equals the pinned one (case-insensitive, no extension, e.g.
-    # PresentMon-2.5.1-x64) or its path is the pinned cache path. Every other `PresentMon*` process is recorded in `excluded` (name, pid) and never blocks the sweep. The process list is
-    # read with -ErrorAction Stop: a host whose list cannot be read throws, and the sweep records the error and touches nothing (it never reads an unreadable list as "no capture alive").
-    # operators only: the publish-write scan (attr3_publish_write_scan.ps1, R4) allowlists static members, and the path is compared as written (no GetFullPath: it expands 8.3 short names, so a runner TEMP spelled RUNNER~1 would never equal the process's own path)
+    # r2 (hub ruling on sol blocker 1, fable): a `PresentMon*` process is NOT live only when it is POSITIVELY identified as something that never owns a capture: (a) its pid is the ProcessId of a
+    # registered Windows service (Win32_Service -- the owner's PresentMonService; recorded with the service name), or (b) its path is readable, it is neither the pinned image nor the pinned path,
+    # and its image name is not a capture image (PresentMon, PresentMon-<version>-x64, ...). Everything else is LIVE: the pinned executable (image name equal to the pinned one, case-insensitive,
+    # no extension, e.g. PresentMon-2.5.1-x64; or the pinned cache path), an unreadable path that is no registered service (an unidentified process may own a capture), a foreign capture image.
+    # Every candidate records pathReadable (a boolean -- never the path text). The process list and the service lookup are read with -ErrorAction Stop: a host whose list or lookup cannot be read
+    # throws, and the sweep records the error and touches nothing (it never reads an unreadable list or an unanswered lookup as "no capture alive").
+    # operators only: the publish-write scan (attr3_publish_write_scan.ps1, R4) allowlists static members, and the path is compared as written (no GetFullPath: it expands 8.3 short names, so a runner TEMP spelled RUNNER~1 would never equal the process's own path -- the image name, not the path, is what keeps the pinned capture live then)
     $pinnedName = ([string]$PresentMonName) -replace '\.[A-Za-z0-9]{1,4}$', ''
     $pinnedPath = Join-Path ([string]$Cache) ([string]$PresentMonName)
+    $captureImagePattern = '^PresentMon([-_.]?(\d|x64|x86|console|capture|cli)|$)'
     $live = @()
+    $liveDetail = @()
     $excluded = @()
     foreach ($candidate in @(Get-Process -Name 'PresentMon*' -ErrorAction Stop)) {
         $candidatePath = ''
         try { $candidatePath = [string]$candidate.Path } catch { $candidatePath = '' }
-        $isPinned = ([string]$candidate.Name -ieq $pinnedName) -or ($candidatePath -ne '' -and $candidatePath -ieq $pinnedPath)
-        if ($isPinned) {
-            $live += [int]$candidate.Id
+        $pathReadable = ($candidatePath -ne '')
+        $candidateName = [string]$candidate.Name
+        $candidateId = [int]$candidate.Id
+        $reason = $null
+        $serviceName = $null
+        if ($candidateName -ieq $pinnedName) { $reason = 'pinned_image_name' }
+        elseif ($pathReadable -and $candidatePath -ieq $pinnedPath) { $reason = 'pinned_image_path' }
+        else {
+            $registered = @(Get-CimInstance -ClassName Win32_Service -Filter "ProcessId = $candidateId" -ErrorAction Stop | Where-Object { [int]$_.ProcessId -eq $candidateId })
+            if ($registered.Count -gt 0) { $serviceName = [string]$registered[0].Name }
+            elseif (-not $pathReadable) { $reason = 'unreadable_path_not_a_registered_service' }
+            elseif ($candidateName -imatch $captureImagePattern) { $reason = 'capture_image_name' }
+        }
+        if ($null -ne $reason) {
+            $live += $candidateId
+            $liveDetail += [ordered]@{ name = $candidateName; pid = $candidateId; pathReadable = $pathReadable; reason = $reason }
         } else {
-            $excluded += [ordered]@{ name = [string]$candidate.Name; pid = [int]$candidate.Id }
+            $excluded += [ordered]@{ name = $candidateName; pid = $candidateId; service = $serviceName; pathReadable = $pathReadable }
         }
     }
-    return [pscustomobject]@{ live = @($live); excluded = @($excluded) }
+    return [pscustomobject]@{ live = @($live); liveDetail = @($liveDetail); excluded = @($excluded) }
 }
 
 function Get-PresentMonLiveProcessId() {
@@ -1346,7 +1364,7 @@ function Get-PresentMonEtsListing() {
 function Invoke-PresentMonOrphanSweep() {
     # UM-PRESENTMON-ORPHAN-SWEEP-1 item 1 (Ultra-Magnus, 2026-10-03): an orphaned default-named PresentMon ETW session made every other-named session lose all of its events, so
     # no CSV was written; the per-job session name (UM-PRESENTMON-STOP-1) meant --stop_existing_session no longer cleared it. Before a capture starts this terminates the default
-    # `PresentMon` session and every `MLVAttr3-*` session that `logman query -ets` lists -- but ONLY when no PresentMon process is alive on the host: a live one may own a capture,
+    # `PresentMon` session and every `MLVAttr3-*` session that `logman query -ets` lists -- but ONLY when no live PresentMon capture is on the host (Get-PresentMonProcessSnapshot: the owner's PresentMonService is positively recognised and does not count; an unidentified PresentMon does): a live one may own a capture,
     # and a session a live capture owns is never an orphan (the sweep then records that it did not run, and why). Each session goes through the pinned PresentMon's own
     # --terminate_existing_session (Invoke-PresentMonSessionTerminate, the helper the clean stop already uses); `logman stop <name> -ets` runs only for a session STILL listed after
     # that, because a failed helper must not leave the orphan this card exists to remove, and what remains afterwards is recorded rather than assumed gone. Never throws and never
@@ -1354,12 +1372,14 @@ function Invoke-PresentMonOrphanSweep() {
     # r2 (sol blocker 1, fable UM-SWEEP-FALLBACK-SCOPE-1): the sweep acts ONLY on the names in $listed -- the orphan list captured before the second liveness check -- never on a name a later
     # listing shows (that is another job's capture that started meanwhile, recorded in newlyListed and left alone), and liveness (no PresentMon process) is re-checked immediately before EACH
     # terminate and EACH logman stop: the first process that appears stops the sweep (abortedReason / abortedBefore) and what is left is still listed in `remaining`.
-    $record = [ordered]@{ ran = $false; skippedReason = $null; abortedReason = $null; abortedBefore = $null; livePresentMonProcessIds = @(); excludedPresentMonProcesses = @(); listed = @(); matchingListingLines = @(); listAttempts = 0; actions = @(); remaining = @(); newlyListed = @(); listError = $null; error = $null }
+    $record = [ordered]@{ ran = $false; skippedReason = $null; abortedReason = $null; abortedBefore = $null; livePresentMonProcessIds = @(); livePresentMonProcesses = @(); excludedPresentMonProcesses = @(); listed = @(); matchingListingLines = @(); listAttempts = 0; actions = @(); remaining = @(); newlyListed = @(); listError = $null; error = $null }
     try {
         $snapshot = Get-PresentMonProcessSnapshot
         $live = @($snapshot.live)
         $record['livePresentMonProcessIds'] = $live
-        # UM-SWEEP-OWNER-PRESENTMONSERVICE-1: PresentMon* processes that are not the pinned capture executable (the owner's PresentMonService) are evidence only -- they never skip the sweep
+        # UM-SWEEP-OWNER-PRESENTMONSERVICE-1: what made each process live (name, pid, pathReadable, reason) and the PresentMon* processes positively identified as not a capture (the owner's
+        # PresentMonService: name, pid, service, pathReadable) -- evidence only, never a path; the excluded ones never skip the sweep
+        $record['livePresentMonProcesses'] = @($snapshot.liveDetail)
         $record['excludedPresentMonProcesses'] = @($snapshot.excluded)
         if ($live.Count -gt 0) {
             $record['skippedReason'] = 'presentmon_process_alive'
