@@ -7,8 +7,9 @@ every OTHER-named PresentMon session lose all of its events (15-17k "ETW events 
 --session_name, so the job's own --stop_existing_session no longer cleared the orphan. The same diagnostic inferred that a kill_fallback leaves the job's own MLVAttr3-* session
 orphaned too.
 
-  1. Start-PresentMonCapture sweeps, before the spawn, the default `PresentMon` session and every `MLVAttr3-*` session that `logman query -ets` lists -- only when NO PresentMon
-     process is alive on the host (a live one may own a capture; the sweep then records that it did not run). Each termination goes through the pinned PresentMon's own
+  1. Start-PresentMonCapture sweeps, before the spawn, the default `PresentMon` session and every `MLVAttr3-*` session that `logman query -ets` lists -- only when NO live PresentMon
+     capture is on the host (a live one may own a capture; the sweep then records that it did not run). "Live" is every `PresentMon*` process except one positively identified as the
+     owner's service (UM-SWEEP-OWNER-PRESENTMONSERVICE-1: a registered Windows service's pid) or a readable-path non-capture image; an unidentified one is live. Each termination goes through the pinned PresentMon's own
      --terminate_existing_session (the job's existing helper); `logman stop <name> -ets` runs only for a session still listed after that, and what remains is recorded.
      Every action and exit code lands in presentmon-capture.json (orphanSweep) and the trace;
   2. a job-issued Kill() is followed by the terminate of the job's own named session, in both stop paths, so a killed capture cannot orphan it;
@@ -31,6 +32,7 @@ from tools.repo_hygiene.test_dve_leg_terminals import MODULE, TEMPLATE, SliceHar
 from tools.repo_hygiene.test_dve_presentmon_evidence import PARSE_END, PARSE_START, SIX_FRAMES, UM2_GPU_SUMMARY, UM2_REASON, _StopHarness
 
 STUB_EXE = "PresentMon-stub.cmd"
+UNREADABLE = "<path getter throws>"
 NEW_MODULE_FUNCTIONS = ("Get-AttrCudaPresentMonOrphanSessionName", "Get-AttrCudaEtsSessionListing", "Invoke-AttrCudaLogman", "Stop-AttrCudaEtsSession", "Get-AttrCudaTextEncodingFromHead",
                         "Get-AttrCudaPresentMonEventsLost", "Add-AttrCudaPresentMonEventsLostDetail", "Add-AttrCudaPresentMonEventsLostDetailToReport")
 OPEN = "UM-PRESENTMON-ORPHAN-SWEEP-1 >>>"
@@ -56,6 +58,10 @@ LOGMAN_FOOTER = "\nThe command completed successfully.\n"
 
 def ps(path: Path) -> str:
     return str(path).replace("'", "''")
+
+
+def ps_quote(value: str) -> str:
+    return "'" + value.replace("'", "''") + "'"
 
 
 def listing(*names: str) -> str:
@@ -365,7 +371,8 @@ class SweepExecutedTests(SliceHarness, unittest.TestCase):
     def run_start(self, name: str, sessions: tuple[str, ...] = ("PresentMon", "MLVAttr3-old-killed-job", "Circular Kernel Context Logger"), live_pids: tuple[int, ...] = (),
                   helper_works: bool = True, logman_stop_works: bool = True, enabled: bool = True, get_process_throws: bool = False, logman_query_fails: bool = False, live_from_second_check: bool = False,
                   text: str | None = None, extra_from_query: int = 0, live_after_terminate_of: str | None = None, query_exits: dict[int, int] | None = None,
-                  logman_hangs: bool = False, logman_stop_hangs: bool = False, logman_timeout_seconds: int = 0) -> tuple[int, dict, Path, str]:
+                  logman_hangs: bool = False, logman_stop_hangs: bool = False, logman_timeout_seconds: int = 0,
+                  others: tuple[tuple[int, str, str | None], ...] = (), services: tuple[tuple[int, str], ...] = (), service_lookup_fails: bool = False) -> tuple[int, dict, Path, str]:
         d = self.stmp / name
         (d / "cache").mkdir(parents=True)
         (d / "legOut").mkdir()
@@ -410,6 +417,19 @@ class SweepExecutedTests(SliceHarness, unittest.TestCase):
             "exit 0\n"))
         body = text if text is not None else TEMPLATE
         pids = ", ".join(str(p) for p in live_pids)
+        # UM-SWEEP-OWNER-PRESENTMONSERVICE-1: other processes whose name merely starts with PresentMon (the owner's PresentMonService), as (id, name, path-or-None-or-UNREADABLE).
+        # UNREADABLE is a real unreadable path: the Path getter throws, as it does for a SYSTEM process read by a non-elevated agent.
+        extra = ""
+        denied_type = ""
+        for i, n, pth in others:
+            if pth == UNREADABLE:
+                # a .NET property that throws, like Process.Path on a process the caller may not open (PowerShell reads a throwing getter as $null -- measured on pwsh 7.6 -- which is also what a real unreadable Path yields)
+                extra += f"    $all += [MlvDeniedProcess]@{{ Id = {i}; Name = '{n}' }}\n"
+                denied_type = ("Add-Type -TypeDefinition 'public class MlvDeniedProcess { public int Id; public string Name; "
+                               "public string Path { get { throw new System.UnauthorizedAccessException(\"Access is denied\"); } } }'\n")
+            else:
+                extra += f"    $all += [pscustomobject]@{{ Id = {i}; Name = '{n}'; Path = {('$null' if pth is None else ps_quote(pth))} }}\n"
+        service_rows = "; ".join(f"@{{ ProcessId = {i}; Name = '{n}' }}" for i, n in services)
         script = d / "probe.ps1"
         script.write_text(
             "$ErrorActionPreference = 'Stop'\n"
@@ -417,14 +437,30 @@ class SweepExecutedTests(SliceHarness, unittest.TestCase):
             "function Test-AttrCudaPresentMonTraceReady($Proc) { [pscustomobject]@{ ready = $true; detail = 'stub' } }\n"
             f"$traceFile = '{ps(d / 'trace.log')}'\n"
             "function Write-JobTrace([string]$Message) { Add-Content -LiteralPath $traceFile -Value $Message }\n"
+            + denied_type +
             "function Get-Process {\n"
             "    [CmdletBinding()] param([string[]]$Name)\n"
             "    $global:getProcessCalls = 1 + [int]$global:getProcessCalls\n"
             + ("    throw 'stub Get-Process failure'\n" if get_process_throws else
-               f"    if (Test-Path -LiteralPath '{ps(d / 'go-live.txt')}') {{ return [pscustomobject]@{{ Id = 5151; Name = 'PresentMon-2.5.1-x64' }} }}\n"
-               + ("    if ($global:getProcessCalls -lt 2) { return }\n" if live_from_second_check else "")
-               + f"    foreach ($p in @({pids})) {{ [pscustomobject]@{{ Id = [int]$p; Name = 'PresentMon-2.5.1-x64' }} }}\n")
+               "    $all = @()\n"
+               f"    if (Test-Path -LiteralPath '{ps(d / 'go-live.txt')}') {{ $all += [pscustomobject]@{{ Id = 5151; Name = [IO.Path]::GetFileNameWithoutExtension($PresentMonName); Path = $null }} }}\n"
+               + extra
+               + ("    if ($global:getProcessCalls -ge 2) {\n" if live_from_second_check else "    if ($true) {\n")
+               + f"        foreach ($p in @({pids})) {{ $all += [pscustomobject]@{{ Id = [int]$p; Name = [IO.Path]::GetFileNameWithoutExtension($PresentMonName); Path = $null }} }}\n"
+               "    }\n"
+               # the real cmdlet honours -Name (a wildcard on the image name): a process whose name does not match is never returned
+               "    $all | Where-Object { $p = $_; (-not $Name) -or (@($Name | Where-Object { $p.Name -like $_ }).Count -gt 0) }\n")
             + "}\n"
+            # the real cmdlet reads Win32_Service by a WQL filter; a failure is a non-terminating error that -ErrorAction Stop turns into a throw
+            "function Get-CimInstance {\n"
+            "    [CmdletBinding()] param([string]$ClassName, [string]$Filter)\n"
+            "    $global:getCimCalls = 1 + [int]$global:getCimCalls\n"
+            + ("    Write-Error 'stub Get-CimInstance failure'; return\n" if service_lookup_fails else "")
+            + "    if ($ClassName -ne 'Win32_Service') { throw \"the sweep asked CIM for $ClassName\" }\n"
+            f"    $services = @({service_rows})\n"
+            "    $want = [int]([regex]::Match($Filter, 'ProcessId\\s*=\\s*(\\d+)').Groups[1].Value)\n"
+            "    foreach ($s in $services) { if ($s.ProcessId -eq $want) { [pscustomobject]@{ Name = $s.Name; ProcessId = $s.ProcessId } } }\n"
+            "}\n"
             # the sweep's wrappers run an executable (bounded by a deadline), so the stub is one: a .cmd shim around a pwsh script
             f"$presentMonLogmanPath = '{ps(logman_stub)}'\n"
             + (f"$presentMonLogmanTimeoutSeconds = {logman_timeout_seconds}\n" if logman_timeout_seconds else "")
@@ -484,6 +520,250 @@ class SweepExecutedTests(SliceHarness, unittest.TestCase):
         self.assertEqual(sweep["livePresentMonProcessIds"], [4242])
         self.assertEqual(sweep["actions"], [])
         self.assertIn("presentmon_process_alive", (d / "trace.log").read_text(encoding="utf-8"))
+
+    # --- UM-SWEEP-OWNER-PRESENTMONSERVICE-1: the liveness check is a live CAPTURE-MODE PresentMon (the pinned executable), never a process that merely starts with "PresentMon"
+    # r2 (hub ruling on sol blocker 1 / fable): a PresentMon* process is NOT live only when it is POSITIVELY the owner's service (its pid is a registered Windows service's ProcessId) or its path is
+    # readable and it is not a capture image; an unreadable path with no service registration is live (the sweep never touches a host it cannot identify)
+    SERVICE = (7001, "PresentMonService", "C:\\Program Files\\Intel\\PresentMonService.exe")
+    SERVICE_ROW = ((7001, "PresentMonService"),)
+    SERVICE_UNREADABLE = (7001, "PresentMonService", UNREADABLE)
+
+    def test_an_owner_presentmonservice_does_not_skip_the_sweep(self) -> None:
+        # Bachelor, 2026-10-03: the always-running PresentMonService matched `PresentMon*` and skipped the sweep on both legs
+        code, sweep, d, out = self.run_start("service-alive", others=(self.SERVICE,), services=self.SERVICE_ROW)
+        self.assertEqual(code, 0, out)
+        self.assertEqual(self.terminated_names(self.calls(d)), ["PresentMon", "MLVAttr3-old-killed-job"], "the orphans are swept with the service running")
+        self.assertTrue(sweep["ran"], sweep)
+        self.assertIsNone(sweep["skippedReason"])
+        self.assertEqual(sweep["livePresentMonProcessIds"], [], "the service is not a live capture")
+        self.assertEqual(sweep["excludedPresentMonProcesses"], [{"name": "PresentMonService", "pid": 7001, "service": "PresentMonService", "pathReadable": True}], "recorded as evidence: name, pid, service, pathReadable (never the path)")
+        self.assertEqual(sweep["remaining"], [])
+        self.assertIn("excluded=PresentMonService:7001", (d / "trace.log").read_text(encoding="utf-8"))
+
+    def test_a_registered_service_with_an_unreadable_path_does_not_skip_the_sweep(self) -> None:
+        # the Bachelor shape: the non-elevated agent cannot read the SYSTEM service's path, but the pid is a registered service's pid
+        code, sweep, d, out = self.run_start("service-unreadable", others=(self.SERVICE_UNREADABLE,), services=self.SERVICE_ROW)
+        self.assertEqual(code, 0, out)
+        self.assertTrue(sweep["ran"], sweep)
+        self.assertEqual(self.terminated_names(self.calls(d)), ["PresentMon", "MLVAttr3-old-killed-job"])
+        self.assertEqual(sweep["excludedPresentMonProcesses"], [{"name": "PresentMonService", "pid": 7001, "service": "PresentMonService", "pathReadable": False}])
+
+    def test_a_service_registered_under_another_pid_does_not_excuse_a_process(self) -> None:
+        code, sweep, d, out = self.run_start("service-other-pid", others=(self.SERVICE_UNREADABLE,), services=((7002, "PresentMonService"),))
+        self.assertEqual(code, 0, out)
+        self.assertFalse(sweep["ran"], sweep)
+        self.assertEqual(sweep["livePresentMonProcessIds"], [7001])
+
+    def test_a_live_pinned_capture_beside_the_service_still_skips_the_sweep(self) -> None:
+        code, sweep, d, out = self.run_start("service-and-capture", live_pids=(4242,), others=(self.SERVICE,), services=self.SERVICE_ROW)
+        self.assertEqual(code, 0, out)
+        self.assertEqual(self.terminated_names(self.calls(d)), [])
+        self.assertFalse(sweep["ran"])
+        self.assertEqual(sweep["skippedReason"], "presentmon_process_alive")
+        self.assertEqual(sweep["livePresentMonProcessIds"], [4242], "only the pinned capture counts as live")
+        self.assertEqual(sweep["excludedPresentMonProcesses"], [{"name": "PresentMonService", "pid": 7001, "service": "PresentMonService", "pathReadable": True}])
+
+    def test_a_pinned_capture_that_appears_mid_sweep_still_stops_it_with_the_service_running(self) -> None:
+        code, sweep, d, out = self.run_start("service-mid-sweep", live_after_terminate_of="PresentMon", others=(self.SERVICE,), services=self.SERVICE_ROW)
+        self.assertEqual(code, 0, out)
+        self.assertEqual(self.terminated_names(self.calls(d)), ["PresentMon"])
+        self.assertEqual(sweep["abortedBefore"], "MLVAttr3-old-killed-job:presentmon_terminate")
+        self.assertEqual(sweep["livePresentMonProcessIds"], [5151])
+
+    # --- sol's repro: the Path getter throws access denied (or is null), the process is not a registered service -> live, NO sweep, a recorded reason
+    def test_an_unreadable_path_that_is_no_registered_service_is_live_and_blocks_the_sweep(self) -> None:
+        code, sweep, d, out = self.run_start("unreadable-no-service", others=(self.SERVICE_UNREADABLE,))
+        self.assertEqual(code, 0, out)
+        self.assertEqual(self.terminated_names(self.calls(d)), [], "an unidentifiable PresentMon may own a capture: nothing is terminated")
+        self.assertEqual((d / "stopped.txt").read_text(encoding="utf-8").strip(), "", "and logman stop is not used either")
+        self.assertFalse(sweep["ran"], sweep)
+        self.assertIsNone(sweep["error"])
+        self.assertEqual(sweep["skippedReason"], "presentmon_process_alive")
+        self.assertEqual(sweep["livePresentMonProcessIds"], [7001])
+        self.assertEqual(sweep["excludedPresentMonProcesses"], [])
+        self.assertEqual(sweep["livePresentMonProcesses"], [{"name": "PresentMonService", "pid": 7001, "pathReadable": False, "reason": "unreadable_path_not_a_registered_service"}])
+        self.assertEqual(len([c for c in self.calls(d) if "--process_name" in c]), 1, "the capture itself still starts")
+
+    def test_a_null_path_that_is_no_registered_service_is_live_and_blocks_the_sweep(self) -> None:
+        code, sweep, d, out = self.run_start("null-no-service", others=((7001, "PresentMonService", None),))
+        self.assertEqual(code, 0, out)
+        self.assertEqual(self.terminated_names(self.calls(d)), [])
+        self.assertFalse(sweep["ran"], sweep)
+        self.assertEqual(sweep["livePresentMonProcessIds"], [7001])
+        self.assertFalse(sweep["livePresentMonProcesses"][0]["pathReadable"])
+
+    def test_an_unreadable_foreign_capture_of_another_version_is_live(self) -> None:
+        code, sweep, d, out = self.run_start("foreign-unreadable", others=((4900, "PresentMon-2.4.1-x64", UNREADABLE),))
+        self.assertEqual(code, 0, out)
+        self.assertFalse(sweep["ran"], sweep)
+        self.assertEqual(sweep["livePresentMonProcessIds"], [4900])
+        self.assertEqual(self.terminated_names(self.calls(d)), [])
+
+    def test_a_readable_foreign_capture_image_that_is_no_service_is_live(self) -> None:
+        # another PresentMon version, or a plain PresentMon.exe, in a console capture: its path is readable but its image is a capture image
+        code, sweep, d, out = self.run_start("foreign-readable-capture", others=((4901, "PresentMon-2.4.1-x64", "C:\\tools\\PresentMon-2.4.1-x64.exe"), (4902, "PresentMon", "C:\\tools\\PresentMon.exe")))
+        self.assertEqual(code, 0, out)
+        self.assertFalse(sweep["ran"], sweep)
+        self.assertEqual(sweep["livePresentMonProcessIds"], [4901, 4902])
+        self.assertEqual([r["reason"] for r in sweep["livePresentMonProcesses"]], ["capture_image_name", "capture_image_name"])
+        self.assertTrue(all(r["pathReadable"] for r in sweep["livePresentMonProcesses"]))
+        self.assertEqual(self.terminated_names(self.calls(d)), [])
+
+    def test_a_readable_path_that_is_neither_a_service_nor_a_capture_image_is_excluded_and_recorded(self) -> None:
+        code, sweep, d, out = self.run_start("readable-helper", others=((4950, "PresentMonOverlayHelper", "C:\\Program Files\\Vendor\\overlay.exe"),))
+        self.assertEqual(code, 0, out)
+        self.assertTrue(sweep["ran"], sweep)
+        self.assertEqual(sweep["excludedPresentMonProcesses"], [{"name": "PresentMonOverlayHelper", "pid": 4950, "service": None, "pathReadable": True}])
+
+    def test_a_service_lookup_that_fails_touches_nothing(self) -> None:
+        code, sweep, d, out = self.run_start("lookup-fails", others=(self.SERVICE,), services=self.SERVICE_ROW, service_lookup_fails=True)
+        self.assertEqual(code, 0, out)
+        self.assertIn("stub Get-CimInstance failure", sweep["error"])
+        self.assertFalse(sweep["ran"])
+        self.assertEqual(self.terminated_names(self.calls(d)), [])
+        self.assertEqual((d / "stopped.txt").read_text(encoding="utf-8").strip(), "")
+        self.assertEqual(len([c for c in self.calls(d) if "--process_name" in c]), 1, "the capture itself still starts")
+
+    def test_the_service_lookup_is_never_asked_when_no_process_needs_identifying(self) -> None:
+        code, sweep, d, out = self.run_start("no-lookup", service_lookup_fails=True)
+        self.assertEqual(code, 0, out)
+        self.assertTrue(sweep["ran"], sweep)
+        self.assertIsNone(sweep["error"])
+
+    def test_the_pinned_executable_is_matched_by_path_as_well_as_by_name(self) -> None:
+        # a copy of the pinned binary that carries another PresentMon* name is still a live capture: its image path is the pinned cache path (the enumeration only returns PresentMon* names, so the
+        # name must start with PresentMon -- a name that does not is never returned by Get-Process -Name 'PresentMon*')
+        code, sweep, d, out = self.run_start("by-path", others=((4343, "PresentMon-renamed", str(self.stmp / "by-path" / "cache" / STUB_EXE)),))
+        self.assertEqual(code, 0, out)
+        self.assertFalse(sweep["ran"])
+        self.assertEqual(sweep["livePresentMonProcessIds"], [4343])
+        self.assertEqual(sweep["livePresentMonProcesses"][0]["reason"], "pinned_image_path")
+        self.assertEqual(self.terminated_names(self.calls(d)), [])
+
+    def test_a_process_whose_name_does_not_start_with_presentmon_is_never_examined(self) -> None:
+        # the stub honours -Name like the real cmdlet: this is the honest scope of the enumeration (sol, fable UM-SWEEP-PATH-ARM-REALISM-1)
+        code, sweep, d, out = self.run_start("not-enumerated", others=((4344, "renamed-capture", str(self.stmp / "not-enumerated" / "cache" / STUB_EXE)),))
+        self.assertEqual(code, 0, out)
+        self.assertTrue(sweep["ran"], sweep)
+        self.assertEqual((sweep["livePresentMonProcessIds"], sweep["excludedPresentMonProcesses"]), ([], []))
+
+    def test_the_pinned_name_is_live_whatever_its_path_looks_like(self) -> None:
+        # the path may read as a long name while $Cache is spelled short (8.3: RUNNER~1), or not read at all: the image name decides and the capture is live either way
+        stub = Path(STUB_EXE).stem
+        for label, path in (("long", "C:\\Users\\runneradmin\\AppData\\Local\\Temp\\cache\\" + STUB_EXE), ("unreadable", UNREADABLE), ("null", None)):
+            code, sweep, d, out = self.run_start(f"pinned-{label}", others=((4360, stub, path),))
+            self.assertEqual(code, 0, out)
+            self.assertFalse(sweep["ran"], (label, sweep))
+            self.assertEqual(sweep["livePresentMonProcessIds"], [4360], label)
+            self.assertEqual(sweep["livePresentMonProcesses"][0]["reason"], "pinned_image_name", label)
+            self.assertEqual(self.terminated_names(self.calls(d)), [], label)
+
+    def test_the_image_name_is_matched_exactly_not_by_prefix_and_without_regard_to_case(self) -> None:
+        stub = Path(STUB_EXE).stem
+        code, sweep, d, out = self.run_start("exact-name", others=((4401, f"{stub}-helper", "C:\\Vendor\\helper.exe"), (4402, stub.upper(), "C:\\Vendor\\copy.exe")))
+        self.assertEqual(code, 0, out)
+        self.assertEqual(sweep["livePresentMonProcessIds"], [4402], "an upper-case image name of the pinned executable is live")
+        self.assertEqual(sweep["excludedPresentMonProcesses"], [{"name": f"{stub}-helper", "pid": 4401, "service": None, "pathReadable": True}], "a longer name that merely starts with the pinned one is not")
+
+    def test_an_unreadable_process_list_still_touches_nothing(self) -> None:
+        code, sweep, d, out = self.run_start("service-list-throws", get_process_throws=True, others=(self.SERVICE,), services=self.SERVICE_ROW)
+        self.assertEqual(code, 0, out)
+        self.assertIn("stub Get-Process failure", sweep["error"])
+        self.assertEqual(self.terminated_names(self.calls(d)), [])
+        self.assertFalse(sweep["ran"])
+
+    def test_the_process_list_is_read_with_an_error_action_that_throws(self) -> None:
+        snapshot = _slice(TEMPLATE, "function Get-PresentMonProcessSnapshot(", "\nfunction Get-PresentMonLiveProcessId(")
+        self.assertIn("Get-Process -Name 'PresentMon*' -ErrorAction Stop", snapshot)
+        self.assertNotIn("SilentlyContinue", snapshot, "an unreadable list must never read as 'no capture alive'")
+
+    def test_the_pinned_image_name_drops_only_the_exe_extension_of_the_real_pinned_name(self) -> None:
+        # the job derives the image name by regex (the publish-write scan allowlists no static member): run the job's own pattern on the real pinned name and on an extension-less one
+        pattern = re.search(r"\$pinnedName = \(\[string\]\$PresentMonName\) -replace '([^']+)', ''", TEMPLATE)
+        self.assertIsNotNone(pattern, "the pinned image name is derived by a -replace in the snapshot function")
+        proc = run_pwsh(["-Command", f"('PresentMon-2.5.1-x64.exe' -replace '{pattern.group(1)}', '') + '|' + ('PresentMon-2.5.1-x64' -replace '{pattern.group(1)}', '')"])
+        self.assertEqual(proc.stdout.strip(), "PresentMon-2.5.1-x64|PresentMon-2.5.1-x64", proc.stdout + proc.stderr)
+
+    def test_the_snapshot_uses_no_static_member_the_publish_write_scan_would_reject(self) -> None:
+        snapshot = _slice(TEMPLATE, "function Get-PresentMonProcessSnapshot(", "\nfunction Get-PresentMonLiveProcessId(")
+        self.assertIsNone(re.search(r"\[[A-Za-z.]+\]::", snapshot), "R4 allowlists static members; the snapshot must use operators only")
+
+    def test_mutation_without_the_service_lookup_the_service_blocks_the_sweep_again(self) -> None:
+        mutated = mutate(TEMPLATE, "if ($registered.Count -gt 0) {", "if ($false) {")
+        _code, sweep, d, _out = self.run_start("mut-no-service", others=(self.SERVICE_UNREADABLE,), services=self.SERVICE_ROW, text=mutated)
+        self.assertFalse(sweep["ran"])
+        self.assertEqual(sweep["skippedReason"], "presentmon_process_alive")
+        self.assertEqual(self.terminated_names(self.calls(d)), [], "the Bachelor state: the service blocks the sweep")
+
+    def test_mutation_an_unreadable_path_read_as_not_live_sweeps_under_an_unidentified_process(self) -> None:
+        mutated = mutate(TEMPLATE, "elseif (-not $pathReadable) { $reason = 'unreadable_path_not_a_registered_service' }", "elseif (-not $pathReadable) { $serviceName = $null }")
+        _code, sweep, d, _out = self.run_start("mut-unreadable", others=(self.SERVICE_UNREADABLE,), text=mutated)
+        self.assertTrue(sweep["ran"], "sol's repro: ran=true, error=null, the sweep terminates under an unidentified PresentMon")
+        self.assertNotEqual(self.terminated_names(self.calls(d)), [])
+
+    def test_mutation_a_failing_service_lookup_read_as_no_service_is_not_fail_closed(self) -> None:
+        mutated = mutate(TEMPLATE, "Get-CimInstance -ClassName Win32_Service -Filter \"ProcessId = $candidateId\" -ErrorAction Stop", "Get-CimInstance -ClassName Win32_Service -Filter \"ProcessId = $candidateId\" -ErrorAction SilentlyContinue")
+        _code, sweep, d, _out = self.run_start("mut-lookup", others=((4950, "PresentMonOverlayHelper", "C:\\Program Files\\Vendor\\overlay.exe"),), service_lookup_fails=True, text=mutated)
+        self.assertTrue(sweep["ran"], "the mutation reads a failed lookup as 'not a service' and goes on with a readable-path process")
+        self.assertIsNone(sweep["error"])
+
+    def test_a_path_getter_that_throws_reads_as_unreadable_not_as_an_error(self) -> None:
+        # measured on pwsh 7.6: PowerShell turns a throwing .NET property getter into $null (so the job's try/catch around .Path is defence in depth and removing it changes nothing a test can see);
+        # what matters, and is pinned here, is that the unreadable path is recorded as pathReadable=false and the process stays live unless it is a registered service
+        code, sweep, d, out = self.run_start("getter-throws", others=((4361, "PresentMon-2.4.1-x64", UNREADABLE),))
+        self.assertEqual(code, 0, out)
+        self.assertIsNone(sweep["error"])
+        self.assertEqual(sweep["livePresentMonProcesses"], [{"name": "PresentMon-2.4.1-x64", "pid": 4361, "pathReadable": False, "reason": "unreadable_path_not_a_registered_service"}])
+
+    def test_mutation_a_readable_foreign_capture_image_read_as_excluded_is_swept_under(self) -> None:
+        mutated = mutate(TEMPLATE, "elseif ($candidateName -imatch $captureImagePattern) { $reason = 'capture_image_name' }", "elseif ($false) { $reason = 'capture_image_name' }")
+        _code, sweep, d, _out = self.run_start("mut-capture-image", others=((4901, "PresentMon-2.4.1-x64", "C:\\tools\\PresentMon-2.4.1-x64.exe"),), text=mutated)
+        self.assertTrue(sweep["ran"], "the mutation sweeps under a foreign console capture")
+
+    def test_mutation_a_name_prefix_match_lets_every_presentmon_star_process_be_live(self) -> None:
+        # the converse of the Bachelor bug: a registered service must not be recognised by name alone, so the name arm is the pinned name only
+        mutated = mutate(TEMPLATE, "if ($candidateName -ieq $pinnedName) {", "if ($candidateName -like 'PresentMon*') {")
+        _code, sweep, d, _out = self.run_start("mut-prefix", others=(self.SERVICE,), services=self.SERVICE_ROW, text=mutated)
+        self.assertFalse(sweep["ran"])
+        self.assertEqual(sweep["livePresentMonProcessIds"], [7001])
+
+    def test_mutation_without_the_path_match_a_pinned_path_copy_reads_as_no_capture(self) -> None:
+        mutated = mutate(TEMPLATE, "elseif ($pathReadable -and $candidatePath -ieq $pinnedPath) { $reason = 'pinned_image_path' }", "elseif ($false) { $reason = 'pinned_image_path' }")
+        _code, sweep, d, _out = self.run_start("mut-path", others=((4343, "PresentMon-renamed", str(self.stmp / "mut-path" / "cache" / STUB_EXE)),), text=mutated)
+        self.assertTrue(sweep["ran"], "without the path arm a live copy of the pinned binary would be swept under")
+        self.assertNotEqual(self.terminated_names(self.calls(d)), [])
+
+    def test_mutation_a_case_sensitive_name_match_misses_a_live_capture(self) -> None:
+        stub = Path(STUB_EXE).stem
+        mutated = mutate(TEMPLATE, "if ($candidateName -ieq $pinnedName) {", "if ($candidateName -ceq $pinnedName) {")
+        # a readable path elsewhere: with an unreadable one the fail-closed arm would keep it live and hide this mutation
+        _code, sweep, d, _out = self.run_start("mut-case", others=((4402, stub.upper(), "C:\\Vendor\\copy.exe"),), text=mutated)
+        self.assertTrue(sweep["ran"], "the mutation sweeps under a live capture")
+
+    def test_mutation_without_the_name_match_a_pinned_capture_with_an_aliased_path_reads_as_no_capture(self) -> None:
+        stub = Path(STUB_EXE).stem
+        mutated = mutate(TEMPLATE, "if ($candidateName -ieq $pinnedName) { $reason = 'pinned_image_name' }", "if ($false) { $reason = 'pinned_image_name' }")
+        _code, sweep, d, _out = self.run_start("mut-alias", others=((4360, stub, "C:\\Users\\runneradmin\\AppData\\Local\\Temp\\cache\\" + STUB_EXE),), text=mutated)
+        self.assertTrue(sweep["ran"], "the path arm alone cannot match a path spelled another way (8.3 versus long); only the name arm keeps the capture live")
+
+    def test_mutation_without_the_excluded_record_the_service_leaves_no_evidence(self) -> None:
+        mutated = mutate(TEMPLATE, "$record['excludedPresentMonProcesses'] = @($snapshot.excluded)", "$null = $snapshot")
+        _code, sweep, _d, _out = self.run_start("mut-excluded", others=(self.SERVICE,), services=self.SERVICE_ROW, text=mutated)
+        self.assertEqual(sweep["excludedPresentMonProcesses"], [])
+
+    def test_mutation_without_the_path_readable_flag_the_record_cannot_tell_an_unreadable_path(self) -> None:
+        mutated = mutate(TEMPLATE, "service = $serviceName; pathReadable = $pathReadable }", "service = $serviceName; pathReadable = $true }")
+        _code, sweep, _d, _out = self.run_start("mut-readable", others=(self.SERVICE_UNREADABLE,), services=self.SERVICE_ROW, text=mutated)
+        self.assertTrue(sweep["excludedPresentMonProcesses"][0]["pathReadable"], "the mutation reports an unreadable path as readable")
+        _code, sweep, _d, _out = self.run_start("unmut-readable", others=(self.SERVICE_UNREADABLE,), services=self.SERVICE_ROW)
+        self.assertFalse(sweep["excludedPresentMonProcesses"][0]["pathReadable"])
+
+    def test_the_candidate_record_never_carries_a_path(self) -> None:
+        _code, sweep, d, _out = self.run_start("no-path-text", others=(self.SERVICE, (4901, "PresentMon-2.4.1-x64", "C:\\tools\\PresentMon-2.4.1-x64.exe")), services=self.SERVICE_ROW)
+        text = json.dumps(sweep) + (d / "trace.log").read_text(encoding="utf-8")
+        self.assertNotIn("Program Files", text)
+        self.assertNotIn("C:\\\\tools", text)
+        self.assertNotIn("C:\\tools", text)
 
     def test_a_presentmon_that_appears_while_the_listing_runs_is_never_swept(self) -> None:
         code, sweep, d, out = self.run_start("late-live", live_pids=(4242,), live_from_second_check=True)
