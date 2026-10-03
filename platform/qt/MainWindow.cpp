@@ -23079,8 +23079,13 @@ void MainWindow::forcePlaybackSmokeWindowForeground( void )
     // SW_SHOWNORMAL below would silently undo that switch -- everything else in this
     // function (raise/activate/SetForegroundWindow) is state-preserving and safe to
     // repeat regardless.
+    // CUDA-PERF-DISPLAY-MODE-AB-1: the same holds for a --windowed leg, which
+    // placePlaybackSmokeWindowWindowed() has MAXIMIZED before the second call. Un-maximizing
+    // it here resizes the window, and resizeEvent() unchecks Play -- measured on bachelor:
+    // the windowed leg's Play stopped 37 ms after the trigger with 0 frames presented.
     const bool wasFullScreen = isFullScreen();
-    if( !wasFullScreen ) showNormal();
+    const bool keepWindowState = wasFullScreen || isMaximized();
+    if( !keepWindowState ) showNormal();
     raise();
     activateWindow();
     if( QWindow *gpuWindow = GpuDisplayWindow::activeWindow() )
@@ -23115,7 +23120,7 @@ void MainWindow::forcePlaybackSmokeWindowForeground( void )
                 attached = AttachThreadInput( myThreadId, foregroundThreadId, TRUE ) != 0;
             }
         }
-        ShowWindow( target, wasFullScreen ? SW_SHOW : SW_SHOWNORMAL );
+        ShowWindow( target, keepWindowState ? SW_SHOW : SW_SHOWNORMAL );
         // Brief HWND_TOPMOST -> HWND_NOTOPMOST: forces the z-order swap SetForegroundWindow
         // alone can be refused for, then immediately releases it -- the window must not
         // stay permanently topmost after this call returns.
