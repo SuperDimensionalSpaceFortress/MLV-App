@@ -55,7 +55,7 @@ param(
     # Where receipts go. Default: <main checkout>\.claude-state\dual-venue\receipts (gitignored). Must sit under a
     # `.claude-state` directory in production (a receipt and its evidence name an owner clip's run).
     [string]$ReceiptRoot = '',
-    # Where the LOOK sheet is copied as sheet-<venue>-<backend>-<flavor>.png (for showing the owner). It is a sheet of OWNER
+    # Where the LOOK sheet is copied as sheet-<legId>-<venue>-<backend>-<flavor>.png (for showing the owner; the leg id keeps two look legs of one venue apart). It is a sheet of OWNER
     # footage: it must sit under a `.claude-state` directory (the same guard New-VenueSheetPair.ps1 enforces).
     [string]$SheetCopyDir = '',
     # TEST SEAMS. Refused unless -OfflineTestMode (production passes none of these): the consent file, the venue table,
@@ -163,6 +163,9 @@ $receipt = New-DvReceipt -Card ([string]$spec.card) -LegId ([string]$spec.legId)
 $receipt.subject.buildManifestSha256 = $BuildManifestSha256
 $receipt.subject.legSpecSha256 = $legSpecSha256
 $receipt.subject.clipId = [string]$spec.clipId
+# DVE-SCALE2-LOOK-LEG-1 r2: EVERY receipt says the playback scale the leg asked for; the scale the app rendered at is UNKNOWN until a run log says (step 7).
+$scale = Get-DvScaleEvidence -Spec $spec -Backend $Backend -LogText $null
+$receipt.scale = $scale
 # What the leg is admitted ON: the committed consent-file and venue-table blob ids (production) -- recorded even for a refusal.
 $receipt.admission = [ordered]@{
     mode = $sources.mode
@@ -275,6 +278,9 @@ try {
         OutFile = $jobFile; RepoRoot = $RepoRoot; PlaySeconds = $playSeconds
         Venue = $Venue; Backend = $Backend; ScaleFactor = [int]$spec.scaleFactor
     }
+    # -UsePersistedPlaybackSettings leaves the smoke runner's own scale check OFF unless the job is told what to expect. The CUDA texture route clamps the request before the
+    # runner reads it, so the value is the scale this backend is accepted to render at (the request, unless the spec declares a clamp): the check is live where the route allows.
+    $gen['ExpectedScaleRequest'] = [int]$scale.acceptedEffectiveScale
     if ($OfflineTestMode -and -not [string]::IsNullOrWhiteSpace($VenueTablePath)) { $gen['VenueTablePath'] = $VenueTablePath }
     if ($null -ne $spec.PSObject.Properties['generatorArgs']) {
         if ($spec.generatorArgs.PSObject.Properties['telemetryArm']) { $gen['TelemetryArm'] = [string]$spec.generatorArgs.telemetryArm }
@@ -451,6 +457,10 @@ if ($null -ne $summary -or $null -ne $runLogText) {
     $playback = Get-DvPlaybackEvidence -Summary $summary -EvidenceManifest $manifest -ResultJson $resultJson -LogText $runLogText -LogSha256 $runLogSha -ExpectedClipId ([string]$spec.clipId)
     $receipt.playback = $playback
 }
+# The scale the app RENDERED at, from its own run log (never from the spec): the receipt carries both numbers and the leg cannot PASS under a scale it did not render at.
+$scale = Get-DvScaleEvidence -Spec $spec -Backend $Backend -LogText $runLogText
+$receipt.scale = $scale
+$scaleNote = "requested scale $($scale.requestedScale), rendered at $($scale.effectiveScale)"
 $smokeRefusalReason = $(if ($null -ne $summary -and $summary.PSObject.Properties['smokeRefusalReason']) { [string]$summary.smokeRefusalReason } else { '' })
 $resolved = Resolve-DvJobOutcome -ResultToken $token -ExitCode $exitCode -SmokeRefusalReason $smokeRefusalReason
 # A consumer of an evidence launcher ACTS on its exit code (master's consumer scan pins this statement): a job that prints a
@@ -513,7 +523,7 @@ if ($isLook -and $artifactsShare) {
         $sheetInfo = [ordered]@{ path = $sheetLocal; sha256 = (Get-DvSha256OfFile $sheetLocal); bytes = (Get-Item -LiteralPath $sheetLocal).Length; frames = [int]$spec.look.contactSheetFrames; backend = $Backend; rawFramesDir = $rawLocal }
         if (-not [string]::IsNullOrWhiteSpace($SheetCopyDir)) {
             New-Item -ItemType Directory -Force -Path $SheetCopyDir | Out-Null
-            Copy-Item -LiteralPath $sheetLocal -Destination (Join-Path $SheetCopyDir "sheet-$Venue-$Backend-$lookFlavor.png") -Force
+            Copy-Item -LiteralPath $sheetLocal -Destination (Join-Path $SheetCopyDir "sheet-$($spec.legId)-$Venue-$Backend-$lookFlavor.png") -Force
         }
     } elseif (Test-Path -LiteralPath $composeShare -PathType Leaf) {
         $marker = ([IO.File]::ReadAllText($composeShare) -split "`r?`n")[0]
@@ -542,10 +552,18 @@ if ($outcome -eq 'CAPTURED') {
     $criteria = $spec.criteria.$role.$Backend
     $verdictCriteria = Test-DvCriteria -Criteria $criteria -Metrics $receipt.metrics
     $sheetMissing = $isLook -and ($null -eq $receipt.look -or $null -eq $receipt.look.contactSheet)
-    if ($sheetMissing -and $null -ne $composeUnavailable) { $outcome = 'VENUE_TOOLING'; $detail = "CAPTURED but the venue could not compose the LOOK contact sheet ($composeUnavailable); the raw frames are kept locally for composition elsewhere. A venue condition, not a product result" }
+    # (a capture that published NO run log has no proof at all -- no rendered scale to read, no source frames -- and ends INVALID below, not here)
+    if (-not $scale.honoured -and $null -ne $runLogText) {
+        $declared = $(if ([int]$scale.acceptedEffectiveScale -ne [int]$scale.requestedScale) { "the spec declares this backend renders at $($scale.acceptedEffectiveScale)" } else { 'no clamp is declared for this backend' })
+        $outcome = 'SCALE_NOT_HONOURED'
+        $detail = "CAPTURED but $scaleNote (read from: $($scale.effectiveScaleSource); $declared). A run that did not render at the scale this leg names is no signal under it: the leg is not passed or failed"
+    }
+    elseif ($sheetMissing -and $null -ne $composeUnavailable) { $outcome = 'VENUE_TOOLING'; $detail = "CAPTURED but the venue could not compose the LOOK contact sheet ($composeUnavailable); the raw frames are kept locally for composition elsewhere. A venue condition, not a product result" }
     elseif ($sheetMissing) { $outcome = 'FAIL'; $detail = 'CAPTURED but the LOOK leg produced no contact sheet' }
     elseif (-not $verdictCriteria.pass) { $outcome = 'FAIL'; $detail = 'CAPTURED; criteria failed: ' + ($verdictCriteria.failures -join '; ') }
     else { $outcome = 'PASS'; $detail = $(if ($verdictCriteria.informational) { 'CAPTURED; no gating criteria for this role/backend (informational)' } else { 'CAPTURED; every criterion for this role/backend held' }) }
+    # A declared clamp (the CUDA texture route renders at 1 whatever the request) still passes, but never silently: the detail carries both numbers.
+    if ($outcome -in @('PASS', 'FAIL') -and $scale.verdict -ceq 'DECLARED_CLAMP') { $detail += "; $scaleNote (the spec declares this backend renders at $($scale.acceptedEffectiveScale))" }
 }
 # A signal needs its proof. A PASS or FAIL whose receipt-oracle verdict is not valid (under 20 s of source frames, a wrap,
 # a foreign run, a fixture, or the verdict simply absent) is INVALID: a FAIL on footage that cannot be shown to be long

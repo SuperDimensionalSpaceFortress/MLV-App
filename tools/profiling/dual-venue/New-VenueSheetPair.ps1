@@ -89,8 +89,10 @@ foreach ($label in 'cuda', 'cpu') {
     [IO.File]::WriteAllBytes($listingFile, [Text.UTF8Encoding]::new($false).GetBytes(([ordered]@{ files = $listing } | ConvertTo-Json -Depth 4)))
     $stageListings[$label] = $listingFile
 }
-$sheet = Join-Path $OutDir "sheet-$venue-cuda-vs-cpu-$flavor.png"
-$stats = Join-Path $OutDir "sheet-$venue-cuda-vs-cpu-$flavor.stats.json"
+# The leg id is in every file name: two look legs of one venue and flavor (scale 4 and scale 2) must never overwrite or refuse each other's pair.
+$legId = [string]$cuda.legId
+$sheet = Join-Path $OutDir "sheet-$legId-$venue-cuda-vs-cpu-$flavor.png"
+$stats = Join-Path $OutDir "sheet-$legId-$venue-cuda-vs-cpu-$flavor.stats.json"
 $composer = Join-Path $PSScriptRoot '..\make-contact-sheet.py'
 $pyArgs = @('-3', $composer, '--frames-dir', $stageDirs['cuda'], '--pair-dir', $stageDirs['cpu'],
     '--left-listed', $stageListings['cuda'], '--right-listed', $stageListings['cpu'],
@@ -119,13 +121,18 @@ $record = [ordered]@{
     unbound = @('subject.clipContentSha256', 'venue.hostName', 'venue.gpuNames')
     localOnly = 'never committed, attached to a PR, published to the bus or as an artifact'
     cudaReceiptId = $cuda.receiptId; cpuReceiptId = $cpu.receiptId
+    # The scale each side asked for and rendered at (re-derived by the validator above): a pair whose sides rendered at different scales shows a SCALE difference
+    # as well as a backend one, and says so.
+    cudaScale = [ordered]@{ requestedScale = $cuda.scale.requestedScale; effectiveScale = $cuda.scale.effectiveScale }
+    cpuScale = [ordered]@{ requestedScale = $cpu.scale.requestedScale; effectiveScale = $cpu.scale.effectiveScale }
+    scalesDiffer = ([string]$cuda.scale.effectiveScale -ne [string]$cpu.scale.effectiveScale)
     sheet = [ordered]@{ path = $sheet; sha256 = (Get-DvSha256OfFile $sheet); statsPath = $stats; statsSha256 = (Get-DvSha256OfFile $stats) }
     pairedBy = 'frame_index'
     createdUtc = [DateTime]::UtcNow.ToString('o')
     owner_verdict = $null
     model_verdicts = @()
 }
-$recordPath = Join-Path $OutDir "sheet-pair-$venue-$flavor.json"
+$recordPath = Join-Path $OutDir "sheet-pair-$legId-$venue-$flavor.json"
 $stream = [IO.File]::Open($recordPath, [IO.FileMode]::CreateNew, [IO.FileAccess]::Write)   # append-only: never overwrite
 try { $bytes = [Text.UTF8Encoding]::new($false).GetBytes(($record | ConvertTo-Json -Depth 6) + "`n"); $stream.Write($bytes, 0, $bytes.Length) } finally { $stream.Dispose() }
 Write-Output "DVE_SHEET_PAIR=$sheet"
