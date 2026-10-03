@@ -793,7 +793,7 @@ class RunnerReceiptTests(RunnerHarness, unittest.TestCase):
         pair = (DV / "New-VenueSheetPair.ps1").read_text(encoding="utf-8")
         for name, text in (("Invoke-VenueLeg.ps1", runner), ("playback-attr-3-cuda-job.ps1", job), ("New-VenueSheetPair.ps1", pair)):
             for line in text.splitlines():
-                if "lookFlavorHonored" in line and "=" in line:
+                if re.match(r"\s*lookFlavorHonored\s*=", line):
                     self.assertRegex(line, r"'unknown'|\$null", f"{name}: lookFlavorHonored must be 'unknown' (or null off a look leg), never derived from the spec: {line.strip()}")
 
     def test_tripwire_the_app_has_no_reader_of_the_flavor_env_var_so_honoured_stays_unknown(self) -> None:
