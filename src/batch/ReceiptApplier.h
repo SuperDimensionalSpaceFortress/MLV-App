@@ -63,6 +63,21 @@ public:
                                              double exposureStops,
                                              unsigned char *outBuffer);
 
+    /* The display-space exposure meter: the robust (median of three) display-referred statistics of the clip,
+     * rendered at 15 / 50 / 85 % of its frames through the cache-free processed-thumbnail primitive with the
+     * live exposure / contrast / shadows / highlights / vibrance, at the analysis downscale the caller took
+     * its RAW thumbnail at. presetForLookAssistScene aims its exposure at them. The ONE meter: the GUI
+     * (every playback scale) and the headless applier call this and nothing else, and nothing here reads
+     * the playback scale, so the same clip gets the same statistics wherever it is analysed. out->median > 0
+     * only when at least one frame rendered; false (out untouched) otherwise. validSamples, when given,
+     * receives how many of the three frames rendered. */
+    static bool lookAssistDisplayMeter(mlvObject_t *mlvObject,
+                                       int analysisFrame,
+                                       int downscaleFactor,
+                                       int cpuCores,
+                                       lookassist::LookAssistStats *out,
+                                       int *validSamples = nullptr);
+
     /* The same processed thumbnail at an explicit exposure AND white balance (temperature in K, tint in
      * receipt units), through a private clone: the exposure at the PLANNED stops (the preset's, without the
      * display offset the live viewport adds) and the white balance under test, nothing else varied. isolated =

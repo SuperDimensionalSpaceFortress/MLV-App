@@ -15589,92 +15589,28 @@ void MainWindow::applyLookAssistToReceipt( ReceiptSettings *receipt,
             processedColorStats.balanceSamples >= minColorBalanceSamples;
     }
 
+    // The display-space exposure meter runs at EVERY playback scale: it renders the clip through a private cache-free
+    // clone at the analysis downscale taken from the RAW size, so the scale the viewport plays at has no say in the
+    // exposure Look Assist chooses (the headless applier asks the very same function).
     LookAssistStats displayStatsUi;
-    bool displayStatsValidUi = false;
-    const bool useDisplayMeterExposureUi =
-        effectivePlaybackScaleFactorForRequest() == 2;
-    if( useDisplayMeterExposureUi )
+    int displayMeterSamples = 0;
+    const bool displayStatsValidUi = ReceiptApplier::lookAssistDisplayMeter(
+        m_pMlvObject,
+        analysisFrame,
+        downscaleFactor,
+        qMax( 1, mlvappEffectiveWorkerThreadCount() ),
+        &displayStatsUi,
+        &displayMeterSamples );
+    if( displayStatsValidUi )
     {
-        processingObject_t *displayClone =
-            processingCloneForAnalysis( m_pMlvObject->processing );
-        if( displayClone )
-        {
-            mlv_processed_thumbnail_settings_t displaySettings;
-            memset( &displaySettings, 0, sizeof( displaySettings ) );
-            displaySettings.flags = MLV_PROCESSED_THUMBNAIL_APPLY_EXPOSURE
-                                  | MLV_PROCESSED_THUMBNAIL_APPLY_SIMPLE_CONTRAST
-                                  | MLV_PROCESSED_THUMBNAIL_APPLY_SHADOWS
-                                  | MLV_PROCESSED_THUMBNAIL_APPLY_HIGHLIGHTS
-                                  | MLV_PROCESSED_THUMBNAIL_APPLY_VIBRANCE;
-
-            const int totalFramesForMeter =
-                static_cast<int>( getMlvFrames( m_pMlvObject ) );
-            const double samplePcts[3] = { 0.15, 0.5, 0.85 };
-            QByteArray displayThumb;
-            displayThumb.resize( width * height * 3 );
-            double medianSamples[3];
-            double p95Samples[3];
-            double p99Samples[3];
-            int validSamples = 0;
-
-            for( int s = 0; s < 3; ++s )
-            {
-                int sampleFrame = analysisFrame;
-                if( totalFramesForMeter > 1 )
-                {
-                    sampleFrame = static_cast<int>(
-                        samplePcts[s] * ( totalFramesForMeter - 1 ) );
-                    sampleFrame = qBound( 0, sampleFrame, totalFramesForMeter - 1 );
-                }
-
-                if( get_area_average_downscale_thumnail_with_processing_cachefree(
-                        m_pMlvObject,
-                        sampleFrame,
-                        downscaleFactor,
-                        qMax( 1, mlvappEffectiveWorkerThreadCount() ),
-                        displayClone,
-                        &displaySettings,
-                        reinterpret_cast<unsigned char *>( displayThumb.data() ) ) )
-                {
-                    const LookAssistStats sampleStats =
-                        analyzeLookAssistThumbnail(
-                            reinterpret_cast<const unsigned char *>(
-                                displayThumb.constData() ),
-                            width,
-                            height );
-                    if( sampleStats.median > 0.0 )
-                    {
-                        medianSamples[validSamples] = sampleStats.median;
-                        p95Samples[validSamples] = sampleStats.p95;
-                        p99Samples[validSamples] = sampleStats.p99;
-                        ++validSamples;
-                    }
-                }
-
-                if( totalFramesForMeter <= 1 ) break;
-            }
-
-            if( validSamples > 0 )
-            {
-                std::sort( medianSamples, medianSamples + validSamples );
-                std::sort( p95Samples, p95Samples + validSamples );
-                std::sort( p99Samples, p99Samples + validSamples );
-                displayStatsUi.median = medianSamples[validSamples / 2];
-                displayStatsUi.p95 = p95Samples[validSamples / 2];
-                displayStatsUi.p99 = p99Samples[validSamples / 2];
-                displayStatsUi.p05 = displayStatsUi.median;
-                displayStatsValidUi = true;
-                logInteractionEvent(
-                    QStringLiteral("look_assist.display_meter"),
-                    QStringLiteral("samples=%1 robust_median=%2 robust_p95=%3 robust_p99=%4 frame=%5")
-                        .arg( validSamples )
-                        .arg( displayStatsUi.median, 0, 'f', 1 )
-                        .arg( displayStatsUi.p95, 0, 'f', 1 )
-                        .arg( displayStatsUi.p99, 0, 'f', 1 )
-                        .arg( analysisFrame ) );
-            }
-            processingFreeClone( displayClone );
-        }
+        logInteractionEvent(
+            QStringLiteral("look_assist.display_meter"),
+            QStringLiteral("samples=%1 robust_median=%2 robust_p95=%3 robust_p99=%4 frame=%5")
+                .arg( displayMeterSamples )
+                .arg( displayStatsUi.median, 0, 'f', 1 )
+                .arg( displayStatsUi.p95, 0, 'f', 1 )
+                .arg( displayStatsUi.p99, 0, 'f', 1 )
+                .arg( analysisFrame ) );
     }
 
     // [WB-TRACE] env-gated, read-only diagnostic to pin the Look Assist per-scale WB divergence
@@ -16393,6 +16329,10 @@ void MainWindow::applyLookAssistToReceipt( ReceiptSettings *receipt,
     // damping -> as-shot prior -> clamp. Nothing here re-implements any step.
     LookAssistWhiteBalanceRequest wbRequest;
     wbRequest.stats = &stats;
+    // The colour pictures were rendered at the scene's own lift; the daylight patch gates judge them there, and the
+    // metered exposure is only what gets applied.
+    if( displayStatsValidUi )
+        wbRequest.analysisExposure = presetForLookAssistScene( scene, stats ).exposure;
     wbRequest.scene = scene;
     wbRequest.patch = autoWbPatch;
     wbRequest.solvedOnProcessedPicture = useProcessedColorStats;

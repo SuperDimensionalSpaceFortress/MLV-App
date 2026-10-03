@@ -18,7 +18,10 @@
 #include <QFile>
 #include <QString>
 #include <QTemporaryDir>
+#include <algorithm>
+#include <chrono>
 #include <cmath>
+#include <cstdio>
 #include <cstring>
 #include <vector>
 
@@ -776,4 +779,236 @@ TEST(LookAssistFixtureScene, AsShotWhiteBalanceDecoderHonoursTheWbMode)
     // Null guards.
     ASSERT_FALSE( ReceiptApplier::asShotWhiteBalanceControls( nullptr, &temperature, &tint ) );
     ASSERT_FALSE( ReceiptApplier::asShotWhiteBalanceControls( video, nullptr, &tint ) );
+}
+
+// ---- LOOK-ASSIST-DISPLAY-METER-ALL-SCALES-1: the same exposure decision at every playback scale ----
+
+namespace
+{
+
+const int kPlaybackScales[] = { 1, 2, 3, 4, 8 };
+
+int analysisDownscaleFor( const mlvObject_t *video )
+{
+    const int rawW = video->RAWI.xRes;
+    const int rawH = video->RAWI.yRes;
+    if( rawW > 4000 || rawH > 2500 ) return 12;
+    if( rawW > 2800 || rawH > 1900 ) return 10;
+    if( rawW > 1800 || rawH > 1200 ) return 8;
+    return 6;
+}
+
+// The meter exactly as d34da2b1 wrote it into MainWindow::applyLookAssistToReceipt (the block that ran at x2 only),
+// kept here verbatim as the reference the shared function must reproduce bit for bit.
+bool masterDisplayMeterAsWrittenInTheGui( mlvObject_t *video, int analysisFrame, int downscaleFactor, int cpuCores,
+                                          LookAssistStats *out )
+{
+    const int width = video->RAWI.xRes / downscaleFactor;
+    const int height = video->RAWI.yRes / downscaleFactor;
+    processingObject_t *displayClone = processingCloneForAnalysis( video->processing );
+    if( !displayClone ) return false;
+    mlv_processed_thumbnail_settings_t displaySettings;
+    memset( &displaySettings, 0, sizeof( displaySettings ) );
+    displaySettings.flags = MLV_PROCESSED_THUMBNAIL_APPLY_EXPOSURE
+                          | MLV_PROCESSED_THUMBNAIL_APPLY_SIMPLE_CONTRAST
+                          | MLV_PROCESSED_THUMBNAIL_APPLY_SHADOWS
+                          | MLV_PROCESSED_THUMBNAIL_APPLY_HIGHLIGHTS
+                          | MLV_PROCESSED_THUMBNAIL_APPLY_VIBRANCE;
+    const int totalFramesForMeter = static_cast<int>( getMlvFrames( video ) );
+    const double samplePcts[3] = { 0.15, 0.5, 0.85 };
+    std::vector<unsigned char> displayThumb( static_cast<size_t>( width ) * height * 3 );
+    double medianSamples[3], p95Samples[3], p99Samples[3];
+    int validSamples = 0;
+    for( int s = 0; s < 3; ++s )
+    {
+        int sampleFrame = analysisFrame;
+        if( totalFramesForMeter > 1 )
+        {
+            sampleFrame = static_cast<int>( samplePcts[s] * ( totalFramesForMeter - 1 ) );
+            sampleFrame = std::max( 0, std::min( sampleFrame, totalFramesForMeter - 1 ) );
+        }
+        if( get_area_average_downscale_thumnail_with_processing_cachefree(
+                video, sampleFrame, downscaleFactor, std::max( 1, cpuCores ), displayClone, &displaySettings,
+                displayThumb.data() ) )
+        {
+            const LookAssistStats sampleStats = analyzeLookAssistThumbnail( displayThumb.data(), width, height );
+            if( sampleStats.median > 0.0 )
+            {
+                medianSamples[validSamples] = sampleStats.median;
+                p95Samples[validSamples] = sampleStats.p95;
+                p99Samples[validSamples] = sampleStats.p99;
+                ++validSamples;
+            }
+        }
+        if( totalFramesForMeter <= 1 ) break;
+    }
+    bool ok = false;
+    if( validSamples > 0 )
+    {
+        std::sort( medianSamples, medianSamples + validSamples );
+        std::sort( p95Samples, p95Samples + validSamples );
+        std::sort( p99Samples, p99Samples + validSamples );
+        out->median = medianSamples[validSamples / 2];
+        out->p95 = p95Samples[validSamples / 2];
+        out->p99 = p99Samples[validSamples / 2];
+        out->p05 = out->median;
+        ok = true;
+    }
+    processingFreeClone( displayClone );
+    return ok;
+}
+
+// "scene=... exposure=..." of the headless run, the receipt, and the meter line it logged.
+struct ScaleRun
+{
+    QString receipt;
+    QString meterLine;
+    QByteArray log;
+    int exposure = 0;
+};
+
+bool headlessAtPlaybackScale( const char *clipFile, int frame, int scale, ScaleRun *run )
+{
+    MlvPipelineFixture fixture;
+    QString error_message;
+    if( !fixture.openClipFile( repo_file_path( QString::fromLatin1( clipFile ) ), &error_message ) ) return false;
+    if( !fixture.applyReceipt( &error_message ) ) return false;
+    fixture.video()->playback_scale_factor_active = static_cast<decltype( fixture.video()->playback_scale_factor_active )>( scale );
+    ReceiptSettings &r = fixture.receipt();
+    r.setLookAssistEnabled( true );
+    r.setLookAssistBaselineValid( false );
+    r.setExposure( 0 );
+    r.setTemperature( -1 );
+    r.setTint( 0 );
+    QTemporaryDir temporary_dir;
+    const QString log_path = temporary_dir.filePath( QStringLiteral("look_assist.log") );
+    BatchLogger::init( log_path );
+    const bool applied = ReceiptApplier::applyHeadlessLookAssist( &r, fixture.video(), fixture.processing(),
+                                                                 static_cast<uint32_t>( frame ) );
+    BatchLogger::shutdown();
+    QFile log_file( log_path );
+    if( !applied || !log_file.open( QIODevice::ReadOnly | QIODevice::Text ) ) return false;
+    run->log = log_file.readAll();
+    for( const QByteArray &line : run->log.split( '\n' ) )
+        if( line.contains( "LOOK_ASSIST display_meter" ) ) run->meterLine = QString::fromUtf8( line );
+    run->receipt = receiptLine( r );
+    run->exposure = r.exposure();
+    return true;
+}
+
+} // namespace
+
+TEST(LookAssistFixtureScene, DisplayMeterReproducesTheGuisX2MeterBitForBitAtEveryScaleAndCostsBoundedTime)
+{
+    // The large clip: 16 frames, so the three sample frames (15 / 50 / 85 %) are three different pictures.
+    const FixtureClip &clip = kTrackedFixtureClips[1];
+    MlvPipelineFixture fixture;
+    QString error_message;
+    ASSERT_TRUE( fixture.openClipFile( repo_file_path( QString::fromLatin1( clip.file ) ), &error_message ) );
+    ASSERT_TRUE( fixture.applyReceipt( &error_message ) );
+    const int downscale = analysisDownscaleFor( fixture.video() );
+
+    LookAssistStats master;
+    ASSERT_TRUE( masterDisplayMeterAsWrittenInTheGui( fixture.video(), 0, downscale, 1, &master ) );
+    ASSERT_TRUE( master.median > 0.0 );
+
+    for( int scale : kPlaybackScales )
+    {
+        // The viewport's scale as the playback engine holds it.
+        fixture.video()->playback_scale_factor_active = static_cast<decltype( fixture.video()->playback_scale_factor_active )>( scale );
+        LookAssistStats shared;
+        int samples = 0;
+        const auto t0 = std::chrono::steady_clock::now();
+        ASSERT_TRUE( ReceiptApplier::lookAssistDisplayMeter( fixture.video(), 0, downscale, 1, &shared, &samples ) );
+        const double ms = std::chrono::duration<double, std::milli>( std::chrono::steady_clock::now() - t0 ).count();
+        // Once per apply, three cache-free thumbnail renders: bounded, and the same at every scale. The bound is generous
+        // (single-threaded test runtime, shared CI VM); the measured time is printed for the record.
+        std::fprintf( stderr, "[LA-METER-COST] %s scale=%d meter_ms=%.1f raw=%dx%d downscale=%d samples=%d\n", clip.file, scale,
+                      ms, fixture.video()->RAWI.xRes, fixture.video()->RAWI.yRes, downscale, samples );
+        ASSERT_TRUE( ms < 30000.0 );
+        ASSERT_EQ( 3, samples );
+        ASSERT_EQ( master.median, shared.median );
+        ASSERT_EQ( master.p95, shared.p95 );
+        ASSERT_EQ( master.p99, shared.p99 );
+        ASSERT_EQ( master.p05, shared.p05 );
+    }
+
+    // The GUI feeds it its worker-thread count, the headless applier one: the statistics do not depend on it.
+    LookAssistStats threaded;
+    ASSERT_TRUE( ReceiptApplier::lookAssistDisplayMeter( fixture.video(), 0, downscale, 12, &threaded ) );
+    ASSERT_EQ( master.median, threaded.median );
+    ASSERT_EQ( master.p95, threaded.p95 );
+    ASSERT_EQ( master.p99, threaded.p99 );
+}
+
+TEST(LookAssistFixtureScene, DisplayMeterIsTheSameWhilePlaybackPreviewIsOnAtAnyScale)
+{
+    // The render threads switch the process-wide preview mode / scale on for playback and restore it; a Look Assist
+    // analysis that lands inside such a window must not see a different picture.
+    const FixtureClip &clip = kTrackedFixtureClips[1];
+    MlvPipelineFixture fixture;
+    QString error_message;
+    ASSERT_TRUE( fixture.openClipFile( repo_file_path( QString::fromLatin1( clip.file ) ), &error_message ) );
+    ASSERT_TRUE( fixture.applyReceipt( &error_message ) );
+    const int downscale = analysisDownscaleFor( fixture.video() );
+    LookAssistStats reference;
+    ASSERT_TRUE( ReceiptApplier::lookAssistDisplayMeter( fixture.video(), 0, downscale, 1, &reference ) );
+
+    const int previousMode = processingPlaybackPreviewModeEnabled();
+    const int previousScale = processingPlaybackPreviewScaleFactor();
+    for( int scale : { 1, 2, 4 } )
+    {
+        processingSetPlaybackPreviewMode( 1 );
+        processingSetPlaybackPreviewScaleFactor( scale );
+        LookAssistStats inPreview;
+        const bool ok = ReceiptApplier::lookAssistDisplayMeter( fixture.video(), 0, downscale, 1, &inPreview );
+        processingSetPlaybackPreviewScaleFactor( previousScale );
+        processingSetPlaybackPreviewMode( previousMode );
+        ASSERT_TRUE( ok );
+        ASSERT_EQ( reference.median, inPreview.median );
+        ASSERT_EQ( reference.p95, inPreview.p95 );
+        ASSERT_EQ( reference.p99, inPreview.p99 );
+    }
+}
+
+TEST(LookAssistFixtureScene, HeadlessLookAssistDecidesIdenticallyAtEveryPlaybackScaleWithTheDisplayMeteredExposure)
+{
+    // The tracked fixtures are flat-floor dual-ISO clips: their RAW thumbnail is the sensor floor, so the p95 highlight
+    // cap meters nothing and the floor-metered exposure under-exposes them. The display meter is what fixes that, and
+    // it used to run at x2 only (and never in batch). Scale 2 is the reference: it is where the fix already applied.
+    const FixtureClip &clip = kTrackedFixtureClips[0];
+    MlvPipelineFixture fixture;
+    QString error_message;
+    ASSERT_TRUE( fixture.openClipFile( repo_file_path( QString::fromLatin1( clip.file ) ), &error_message ) );
+    ASSERT_TRUE( fixture.applyReceipt( &error_message ) );
+    const LookAssistStats raw = rawThumbnailStats( fixture.video(), 0 );
+    ASSERT_TRUE( lookAssistIsFlatFloorRawThumbnail( raw ) );
+    LookAssistStats hypothesis = raw;
+    hypothesis.daylightPictureEvidence = true;
+    LookAssistStats display;
+    ASSERT_TRUE( ReceiptApplier::lookAssistDisplayMeter( fixture.video(), 0, analysisDownscaleFor( fixture.video() ), 1, &display ) );
+    const int floorMetered = presetForLookAssistScene( LookAssistScene::Shade, hypothesis ).exposure;
+    const int displayMetered = presetForLookAssistScene( LookAssistScene::Shade, hypothesis, nullptr, &display ).exposure;
+
+    ScaleRun reference;
+    ASSERT_TRUE( headlessAtPlaybackScale( clip.file, 0, 2, &reference ) );
+    // The headless applier ran the display meter (it used to have none, so batch export never got the fix) ...
+    ASSERT_FALSE( reference.meterLine.isEmpty() );
+    ASSERT_TRUE( reference.log.contains( "scene=shade" ) );
+    // ... and its exposure is the display-metered one, not the floor-metered one.
+    std::fprintf( stderr, "[LA-METER] %s floor_metered_exposure=%d display_metered_exposure=%d headless_receipt_exposure=%d\n",
+                  clip.file, floorMetered, displayMetered, reference.exposure );
+    ASSERT_EQ( displayMetered, reference.exposure );
+    ASSERT_TRUE( displayMetered != floorMetered );
+
+    for( int scale : { 1, 3, 4 } )
+    {
+        ScaleRun run;
+        ASSERT_TRUE( headlessAtPlaybackScale( clip.file, 0, scale, &run ) );
+        // Every slider of the receipt, the meter's statistics, and the whole analysis line (scene, statistics, balance).
+        ASSERT_EQ( reference.receipt.toStdString(), run.receipt.toStdString() );
+        ASSERT_EQ( reference.meterLine.toStdString(), run.meterLine.toStdString() );
+        ASSERT_EQ( appliedLineWithoutPassFlag( reference.log ).toStdString(),
+                   appliedLineWithoutPassFlag( run.log ).toStdString() );
+    }
 }
