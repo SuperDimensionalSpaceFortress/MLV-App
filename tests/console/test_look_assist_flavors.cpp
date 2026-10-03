@@ -377,12 +377,19 @@ TEST(LookAssistFlavors, GuiSelectorAndEnvironmentBothReachTheAnalysis)
     ASSERT_EQ( 1, window.count( QStringLiteral("const LookAssistFlavor flavor = currentLookAssistFlavor();") ) );
     ASSERT_TRUE( window.contains( QStringLiteral("last_frame=%27 next_serial=%28 flavor=%29") ) );
     ASSERT_TRUE( window.contains( QStringLiteral("floor_lifted=%4 flavor=%5") ) );
+    // Every reporting site feeds its placeholder: the sync result, the async dispatch and the venue telemetry.
+    ASSERT_TRUE( window.contains( QStringLiteral(".arg( static_cast<qulonglong>( m_nextRenderRequestSerial ) )\n            .arg( lookAssistFlavorName( flavor ) ) );") ) );
+    ASSERT_TRUE( window.contains( QStringLiteral(".arg( bool01( floorLiftedNightThumbnail ) )\n                .arg( lookAssistFlavorName( flavor ) ) );") ) );
+    ASSERT_TRUE( window.contains( QStringLiteral("m_lastAppliedLookAssistFlavor = lookAssistFlavorName( flavor );") ) );
+    ASSERT_TRUE( window.contains( QStringLiteral("gpu_preview_processing_reject_reason=%47 \"\n            \"look_assist_flavor=%48\"") ) );
+    ASSERT_TRUE( window.contains( QStringLiteral(".arg( m_lastLookAssistDiagnosticsValid && !m_lastAppliedLookAssistFlavor.isEmpty()\n                  ? m_lastAppliedLookAssistFlavor") ) );
 
     // Changing the selector re-runs Look Assist the way switching it on does; it persists as an app setting
     // (default Classic) and a receipt that declares a flavor shows it.
     const int slotAt = window.indexOf( QStringLiteral("void MainWindow::on_comboBoxLookAssistFlavor_currentIndexChanged") );
     ASSERT_TRUE( slotAt >= 0 );
-    ASSERT_TRUE( window.mid( slotAt, 900 ).contains( QStringLiteral("on_checkBoxLookAssistEnable_clicked( true )") ) );
+    ASSERT_TRUE( window.mid( slotAt, 900 ).contains( QStringLiteral(
+        "    if( ui->checkBoxLookAssistEnable->isChecked() )\n        on_checkBoxLookAssistEnable_clicked( true );" ) ) );
     ASSERT_TRUE( window.contains( QStringLiteral("set.setValue( \"lookAssistFlavor\"") ) );
     ASSERT_TRUE( window.contains( QStringLiteral("set.value( \"lookAssistFlavor\", QString( \"classic\" ) )") ) );
     ASSERT_TRUE( window.contains( QStringLiteral("receipt->lookAssistFlavor().trimmed().toLower()") ) );

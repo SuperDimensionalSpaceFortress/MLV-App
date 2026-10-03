@@ -2562,6 +2562,27 @@ class SheetPairStaysLocalTests(EvidenceFactory, unittest.TestCase):
         self.assertIsNone(record["owner_verdict"])
         self.assertEqual(record["model_verdicts"], [])
 
+    def test_the_pair_records_the_flavor_honoured_only_when_both_legs_say_so(self) -> None:
+        # LOOK-ASSIST-FLAVORS-1: true only when BOTH legs' receipts say the app applied the requested flavor; false when either
+        # says it did not; 'unknown' for a receipt that predates the app's report.
+        try:
+            import PIL, numpy  # noqa: F401
+        except ImportError:
+            self.skipTest("Pillow + numpy are required")
+        self.receipts_by_backend = self.build_pair_receipts("flavor", real_images=True)
+        cases = ((True, True, True), (True, False, False), (False, True, False), ("unknown", "unknown", "unknown"), (True, "unknown", "unknown"))
+        for n, (cuda_honored, cpu_honored, expected) in enumerate(cases):
+            with self.subTest(cuda=cuda_honored, cpu=cpu_honored):
+                receipts = json.loads(json.dumps(self.receipts_by_backend))
+                receipts["cuda"]["look"]["lookFlavorHonored"] = cuda_honored
+                receipts["cpu"]["look"]["lookFlavorHonored"] = cpu_honored
+                out = self.tmp / ".claude-state" / f"sheets-flavor-{n}"
+                proc = self.pair(out, receipts=receipts)
+                self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+                record = json.loads(next(out.glob("sheet-pair-*.json")).read_text(encoding="utf-8"))
+                self.assertEqual(record["lookFlavor"], "classic")
+                self.assertEqual(record["lookFlavorHonored"], expected)
+
     def test_an_unlisted_or_replaced_raw_frame_cannot_be_paired(self) -> None:
         # sol r1 B4: the reader composed whatever PNGs sat under the evidence directory; it now takes only what the hashed manifest lists
         raw = Path(self.receipts_by_backend["cuda"]["evidence"]["localEvidenceDir"]) / "contact-sheet" / "raw"
