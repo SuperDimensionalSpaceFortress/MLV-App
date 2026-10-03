@@ -750,7 +750,7 @@ bool ReceiptApplier::applyHeadlessLookAssist(ReceiptSettings *receipt,
     };
     // The master pass gives the recorded exposure no say: no picture evidence is asked for, so the scene is
     // the one master classified (daylight needs the evidence).
-    const LookAssistScene scene = resolveLookAssistScene(
+    LookAssistScene scene = resolveLookAssistScene(
         &stats, masterScenePass ? LookAssistRenderFn() : LookAssistRenderFn( renderProcessed ) );
     // Observation only: how the verdict was reached, appended to the "applied" line. The headless applier has no
     // night post-balance walk and no display meter, so those stay at their defaults.
@@ -900,6 +900,24 @@ bool ReceiptApplier::applyHeadlessLookAssist(ReceiptSettings *receipt,
             .arg( cachedFrameBefore )
             .arg( mlvObject->current_cached_frame_active ) );
         return applyHeadlessLookAssist( receipt, mlvObject, processingObject, analysisFrame, true );
+    }
+    // A window-lit interior (the GUI runs the same check): the daylight class, its preset and the accepted balance.
+    const LookAssistWindowLitCheck windowLit = resolveLookAssistWindowLitInterior(
+        wbRequest, wb, mlvObject->processing->exposure_stops, &stats, &scene, &preset,
+        useProcessedColorStats ? &processedColorStats : nullptr );
+    if( windowLit.candidate )
+    {
+        BatchLogger::out( QStringLiteral(
+            "[BATCH] LOOK_ASSIST window_lit_interior frame=%1 evidence=%2 reason=%3 scene=%4 baseSurfaceChroma=%5 "
+            "baseSurfaceBlueAmber=%6 solutionSurfaceChroma=%7 solutionSurfaceBlueAmber=%8\n" )
+            .arg( frameIndex )
+            .arg( windowLit.evidence ? QStringLiteral("true") : QStringLiteral("false") )
+            .arg( windowLit.reason )
+            .arg( lookAssistSceneName( scene ) )
+            .arg( windowLit.baseSurfaceChroma, 0, 'f', 1 )
+            .arg( windowLit.baseSurfaceBlueAmber, 0, 'f', 1 )
+            .arg( windowLit.solutionSurfaceChroma, 0, 'f', 1 )
+            .arg( windowLit.solutionSurfaceBlueAmber, 0, 'f', 1 ) );
     }
     const bool autoWhiteBalanceValid = wb.autoValid;
     const QString autoWhiteBalanceSource = wb.source;
