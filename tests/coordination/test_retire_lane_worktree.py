@@ -257,3 +257,194 @@ def test_sweep_whatif_lists_the_worktree_but_removes_nothing(repo):
                QuarantineRoot=str(tmp / "q"), WhatIf=True)
     assert _swept_paths(s) == [_norm(wt)] and s["kept"] == {}
     assert wt.exists()
+
+
+# --- DISK-SWEEP-FAIR-ORDER-1: a budgeted sweep in a STABLE order starves its tail ---
+# `git worktree list` order is stable, the SAFE gate costs ~36 s per worktree on the real host
+# (measured: ~93% is the two CIM process scans), so the 180 s budget reaches ~5-10 worktrees. The same
+# long-lived unmerged/dirty head ate every budget and a merged worktree in the tail was never retired.
+# The sweep now visits least-recently-examined first, using a stamp file in each worktree's git
+# admin dir. `-MaxExamine` caps GATE CALLS per sweep: a count is deterministic where a wall-clock
+# budget (the gate's cost varies 2x run to run) would make these tests flaky or slow.
+
+STAMP = "mlv-sweep-examined"
+
+
+def _admin_dir(main, wt):
+    # `git worktree add` names the admin dir after the worktree's leaf (no collisions in these tests).
+    return Path(main) / ".git" / "worktrees" / Path(wt).name
+
+
+def _stamped(main, wts):
+    return [Path(w).name for w in wts if (_admin_dir(main, w) / STAMP).is_file()]
+
+
+def _listed_order(main):
+    out = subprocess.run([GIT, "-C", str(main), "worktree", "list", "--porcelain"],
+                         check=True, capture_output=True, text=True).stdout
+    return [_norm(ln[len("worktree "):]) for ln in out.splitlines() if ln.startswith("worktree ")]
+
+
+def _three_kept_then_merged(repo):
+    """Two unmerged worktrees plus a MERGED one that sorts last in `git worktree list` order."""
+    tmp, main = repo
+    root = tmp / "lanes"
+    kept = []
+    for name in ("lane-a-unmerged", "lane-b-unmerged"):
+        wt = _add_wt(main, root / name)
+        _git(wt, "-c", "user.name=t", "-c", "user.email=t@t", "commit", "--allow-empty", "-m", name)
+        _git(wt, "push", "-q", "origin", f"HEAD:refs/heads/{name}")
+        kept.append(wt)
+    merged = _add_wt(main, root / "lane-z-merged")
+    assert _listed_order(main)[-1] == _norm(merged), "fixture precondition: merged worktree last in list order"
+    return root, kept, merged
+
+
+def test_sweep_with_one_gate_call_per_sweep_reaches_a_merged_worktree_placed_last(repo):
+    tmp, main = repo
+    root, kept, merged = _three_kept_then_merged(repo)
+    everyone = kept + [merged]
+    seen = []
+    for n in (1, 2, 3):
+        s = _sweep(main, Root=str(root), MergeTarget="origin/master", MinIdleHours=0,
+                   QuarantineRoot=str(tmp / "q"), MaxExamine=1)
+        assert (s["considered"], s["examined"], s["error"]) == (3, 1, None), s
+        now = [x for x in _stamped(main, everyone) if x not in seen]
+        if n < 3:
+            # a kept worktree is examined, stamped, and NOT the same one as in a previous sweep
+            assert len(now) == 1 and s["retired"] == [] and s["kept"] == {"unmerged": 1} and s["notReached"] == 2, (n, s, now)
+            seen += now
+        else:
+            # the third sweep reaches the tail: the merged worktree, never examined before, is retired
+            assert _swept_paths(s) == [_norm(merged)] and s["kept"] == {} and s["notReached"] == 2, s
+    assert seen == ["lane-a-unmerged", "lane-b-unmerged"]
+    assert not merged.exists() and all(w.exists() for w in kept)
+    # retiring removes the admin dir with the stamp in it; the survivors keep theirs
+    assert not _admin_dir(main, merged).exists()
+    assert _stamped(main, kept) == ["lane-a-unmerged", "lane-b-unmerged"]
+
+
+def test_sweep_orders_by_stamp_ascending_with_missing_oldest(repo):
+    tmp, main = repo
+    root, kept, merged = _three_kept_then_merged(repo)
+    # Pre-stamp the FIRST-listed worktree as examined far in the future: a stable order would visit it first.
+    (_admin_dir(main, kept[0]) / STAMP).write_text("2999-01-01T00:00:00.0000000Z", encoding="utf-8")
+    s = _sweep(main, Root=str(root), MergeTarget="origin/master", MinIdleHours=0,
+               QuarantineRoot=str(tmp / "q"), MaxExamine=1, WhatIf=True)
+    # the unstamped worktrees outrank it; list order breaks the tie, so lane-b is the one examined
+    assert s["examined"] == 1 and s["retired"] == [] and s["kept"] == {"unmerged": 1}, s
+    assert _stamped(main, kept) == ["lane-a-unmerged", "lane-b-unmerged"]
+    assert (_admin_dir(main, kept[0]) / STAMP).read_text(encoding="utf-8").startswith("2999-")  # untouched
+    assert not (_admin_dir(main, merged) / STAMP).exists()
+
+
+def test_sweep_stamps_a_would_retire_worktree_and_reports_examined_and_elapsed(repo):
+    tmp, main = repo
+    root = tmp / "lanes"
+    wt = _add_wt(main, root / "lane-whatif-stamp")
+    s = _sweep(main, Root=str(root), MergeTarget="origin/master", MinIdleHours=0,
+               QuarantineRoot=str(tmp / "q"), WhatIf=True)
+    assert (s["examined"], s["stampWriteFailed"]) == (1, 0) and _swept_paths(s) == [_norm(wt)]
+    assert isinstance(s["elapsedMs"], int) and s["elapsedMs"] > 0
+    stamp = (_admin_dir(main, wt) / STAMP).read_text(encoding="utf-8").strip()
+    assert stamp.endswith("Z") and stamp[:4].isdigit()  # UTC ISO-8601
+    assert not any(p.name == STAMP for p in wt.rglob("*")), "nothing is ever written into the worktree itself"
+
+
+def test_sweep_young_worktrees_never_reach_the_gate_and_are_not_stamped(repo):
+    tmp, main = repo
+    root = tmp / "lanes"
+    wt = _add_wt(main, root / "lane-young2")
+    s = _sweep(main, Root=str(root), MergeTarget="origin/master", MinIdleHours=1000, QuarantineRoot=str(tmp / "q"))
+    assert (s["young"], s["examined"]) == (1, 0)
+    assert not (_admin_dir(main, wt) / STAMP).exists()
+
+
+def test_stamp_file_never_makes_a_worktree_look_young(repo):
+    """The young guard reads worktree-dir CreationTime + <gitdir>\\HEAD + <gitdir>\\index mtimes ONLY."""
+    tmp, main = repo
+    root = tmp / "lanes"
+    wt = _add_wt(main, root / "lane-aged")
+    gdir = _admin_dir(main, wt)
+
+    def age():  # back-date the three stamps the guard reads, to 10 h ago
+        ps = ("$t=(Get-Date).ToUniversalTime().AddHours(-10); "
+              f"(Get-Item -LiteralPath '{wt}').CreationTimeUtc=$t; "
+              f"(Get-Item -LiteralPath '{gdir / 'HEAD'}').LastWriteTimeUtc=$t; "
+              f"(Get-Item -LiteralPath '{gdir / 'index'}').LastWriteTimeUtc=$t")
+        subprocess.run([PWSH, "-NoProfile", "-NonInteractive", "-Command", ps], check=True, capture_output=True)
+
+    age()
+    first = _sweep(main, Root=str(root), MergeTarget="origin/master", MinIdleHours=6,
+                   QuarantineRoot=str(tmp / "q"), WhatIf=True)
+    assert (first["young"], first["examined"]) == (0, 1), first
+    assert (gdir / STAMP).is_file()
+    age()  # the gate's own `git status` may refresh the index mtime; undo that, keep the stamp
+    second = _sweep(main, Root=str(root), MergeTarget="origin/master", MinIdleHours=6,
+                    QuarantineRoot=str(tmp / "q"), WhatIf=True)
+    assert (second["young"], second["examined"]) == (0, 1), "the stamp file made an aged worktree look young"
+
+
+def test_sweep_stamp_write_failure_is_counted_and_never_fails_the_sweep(repo):
+    tmp, main = repo
+    root = tmp / "lanes"
+    wt = _add_wt(main, root / "lane-nostamp")
+    (_admin_dir(main, wt) / STAMP).mkdir()  # a directory where the stamp file belongs: the write must fail
+    s = _sweep(main, Root=str(root), MergeTarget="origin/master", MinIdleHours=0,
+               QuarantineRoot=str(tmp / "q"), WhatIf=True)
+    assert (s["error"], s["examined"], s["stampWriteFailed"]) == (None, 1, 1), s
+    # the verdict is the gate's, untouched by the bookkeeping failure, and it is not double-counted in kept{}
+    assert _swept_paths(s) == [_norm(wt)] and s["kept"] == {}
+
+
+# --- Invoke-RetireLaneWorktree -ProcessSnapshot: one CIM scan per sweep instead of two-plus per worktree ---
+
+def _gate_with_snapshot(workdir, snapshot_expr):
+    script = (
+        "$ErrorActionPreference='Stop'; Set-StrictMode -Version Latest; "
+        f". '{HELPER}'; "
+        f"$snap = {snapshot_expr}; "
+        f"Invoke-RetireLaneWorktree -WorkDir '{workdir}' -MergeTarget 'origin/master' -WhatIf -ProcessSnapshot $snap "
+        "| ConvertTo-Json -Depth 4"
+    )
+    out = subprocess.run([PWSH, "-NoProfile", "-NonInteractive", "-Command", script],
+                         check=True, capture_output=True, text=True).stdout
+    return json.loads(out)
+
+
+def test_process_snapshot_naming_the_worktree_keeps_it_as_live_process(repo):
+    tmp, main = repo
+    wt = _add_wt(main, tmp / "wt-snap-live")
+    # pid 999999 does not exist on the host, so a live-process verdict can only come from the SNAPSHOT.
+    snap = ("[pscustomobject]@{ Procs = @([pscustomobject]@{ ProcessId = 999999; Name = 'fake-editor.exe'; "
+            f"CommandLine = 'fake-editor.exe --open {wt}' }}); SelfPids = @($PID) }}")
+    d = _gate_with_snapshot(wt, snap)
+    assert d["action"] == "kept" and d["reason"].startswith("live-process: 999999 fake-editor.exe"), d
+    assert wt.exists()
+
+
+def test_process_snapshot_matches_the_forward_slash_spelling_too(repo):
+    tmp, main = repo
+    wt = _add_wt(main, tmp / "wt-snap-slash")
+    slash = str(wt).replace("\\", "/")
+    snap = ("[pscustomobject]@{ Procs = @([pscustomobject]@{ ProcessId = 999998; Name = 'git.exe'; "
+            f"CommandLine = 'git -C {slash} status' }}); SelfPids = @($PID) }}")
+    assert _gate_with_snapshot(wt, snap)["reason"].startswith("live-process: 999998 git.exe")
+
+
+def test_process_snapshot_naming_another_path_does_not_block_retirement(repo):
+    tmp, main = repo
+    wt = _add_wt(main, tmp / "wt-snap-other")
+    snap = ("[pscustomobject]@{ Procs = @([pscustomobject]@{ ProcessId = 999997; Name = 'x.exe'; "
+            "CommandLine = 'x.exe C:\\somewhere\\else' }); SelfPids = @($PID) }")
+    d = _gate_with_snapshot(wt, snap)
+    assert (d["action"], d["reason"]) == ("would-retire", "ok")
+
+
+def test_process_snapshot_self_pids_are_excluded_from_the_live_check(repo):
+    """The caller's own ancestors name the worktree legitimately (a lane running inside it)."""
+    tmp, main = repo
+    wt = _add_wt(main, tmp / "wt-snap-self")
+    snap = ("[pscustomobject]@{ Procs = @([pscustomobject]@{ ProcessId = 999996; Name = 'pwsh.exe'; "
+            f"CommandLine = 'pwsh {wt}' }}); SelfPids = @(999996) }}")
+    assert _gate_with_snapshot(wt, snap)["action"] == "would-retire"

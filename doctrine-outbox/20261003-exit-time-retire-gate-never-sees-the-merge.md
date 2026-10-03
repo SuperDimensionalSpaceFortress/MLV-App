@@ -4,23 +4,27 @@ kind: trap
 source_commit: PENDING
 law4: attested
 ---
-### mlv-app, 2026-10-03 - a retire-if-merged gate that runs at lane exit judges the worktree before its PR merges, so it always answers unmerged and nothing asks again: re-ask the same gate about every other worktree at the next exit
+### mlv-app, 2026-10-03 - a retire-if-merged gate at lane exit runs before the PR merges, so it always answers unmerged: re-ask it about every other worktree at each exit, least-recently-examined first, or the budgeted sweep starves its tail
 
-**Symptom (measured):** lane worktrees accumulated without bound. About 0.7 GiB each, 11 to 20 created per day, and free space on the system drive fell from 89 GiB to about 53 GiB in under three weeks. Retiring 32 merged, clean, idle worktrees by hand recovered about 24 GiB; each had already been kept by the exit-time gate.
+**Symptom (measured):** lane worktrees piled up, about 0.7 GiB each; free space fell from 89 to about 53 GiB. Retiring 32 merged, clean worktrees by hand recovered about 24 GiB.
 
-**Cause:** the gate (retire only when clean, idle and merged into the merge target) is correct. Its only call site is the lane's own exit, and a lane exits before its pull request merges. So it answers `unmerged` every time, and no later event re-asks. The rule was right; the trigger was wrong.
+**Cause:** the gate (clean, idle, merged) is right, but its only call site is the lane's own exit, which precedes the merge. The trigger was wrong, not the rule.
 
 **Fix pattern (no new deletion rule):**
 
-1. At each lane exit, after the lane's own retire step, run a sweep that calls the SAME gate on every OTHER worktree under the scratch root, excluding the lane's own worktree and run directory.
-2. Young guard: skip any worktree created or checked out within N hours (default 6). A fresh worktree at the merge target is clean and "merged" before its lane starts.
-3. Time budget (default 180 s). When it runs out, stop and report how many candidates were not reached; never assume done.
-4. Record the result in the lane's exit receipt (considered, retired, young, kept by reason, not reached, error); a sweep failure is `cannot-determine` and never fails the lane.
+1. At each lane exit, run the SAME gate on every OTHER worktree under the scratch root.
+2. Young guard: skip worktrees created or checked out within N hours (default 6); a fresh one is clean and "merged".
+3. Time budget (default 180 s); on expiry report `notReached`.
+4. Receipt: considered, examined, retired, young, kept by reason, notReached, elapsedMs, error. Never fail the lane.
 
-Steady-state disk use is then bounded by unmerged worktrees, not by history. Known limit: the young guard reads the index mtime, which the gate's own status call can refresh; that only delays retirement.
+**Second trap (first real sweep: 21 candidates, 10 examined, 11 never reached):** a budgeted sweep in a STABLE order starves its tail whenever the head is permanently kept. The gate cost about 36 s per worktree, so 180 s reached about 5 to 10; the same long-lived unmerged or dirty worktrees led `git worktree list` every time, so a merged one behind them was never examined. Steps 1 to 4 alone do NOT guarantee "gone at the next exit".
 
-**Pinned by:** seven sweep cases in `tests/coordination/test_retire_lane_worktree.py`; deleting the young guard or the root filter turns a named test red.
+**Fair-order rule:** visit least-recently-examined first. After the gate returns for a worktree (anything but retired), write a UTC timestamp file into its git admin dir (`<common>/worktrees/<name>/`; git ignores it, `worktree remove` deletes it, nothing enters the worktree). Sort ascending, missing = oldest, ties in list order, no randomness. A stamp write failure is counted, never fatal. The young guard reads only creation time, HEAD and index mtimes, so the stamp cannot make a worktree look young.
 
-**Falsifier (a sibling can run it):** for each worktree from `git worktree list --porcelain` other than the main checkout, test `git merge-base --is-ancestor <worktree-HEAD> <merge-target>` and `git -C <worktree> status --porcelain`. If a worktree that is an ancestor of the merge target, clean and older than N hours still exists after several later lane exits, the retire gate has no post-merge trigger. After the fix, a worktree whose PR merged after its lane exited is gone at the next lane exit, while a young, an unmerged and a dirty one all survive.
+**Measure first:** about 93% of the gate was two process scans (a per-ancestor `Get-CimInstance -Filter` loop, 31 s; the full list, 2.4 s); ten git calls totalled 1.7 s. One shared process snapshot per sweep fixed it.
 
-General rule: a cleanup gate whose precondition only becomes true after its owning actor has exited needs a second, later trigger.
+**Pinned by:** `tests/coordination/test_retire_lane_worktree.py`: capped at one gate call per sweep, three sweeps examine three different worktrees and retire a merged one listed last; removing the sort turns two tests red.
+
+**Falsifier:** a merged, clean, old worktree surviving several sweeps means no post-merge trigger or a starved tail; compare the receipt's `examined` with `considered`. After the fix, repeated budget-limited sweeps examine different worktrees.
+
+General rule: a cleanup gate whose precondition becomes true only after its owner exits needs a later trigger, and a budgeted sweep needs a fair order.
