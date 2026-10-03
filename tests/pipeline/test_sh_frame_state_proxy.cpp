@@ -494,6 +494,14 @@ TEST(ShFrameStateProxy, DisplayShaderWithQuarterFrameStateMatchesFullResFrameSta
         {
             ::minitest::fail(__FILE__, __LINE__, "display shader failed on a working GL backend", reason.toStdString());
         }
+        /* The hosted "Display parity (software GL required, never skipped)"
+         * step sets this: there an unavailable backend is a failure, not a skip. */
+        if (qEnvironmentVariableIntValue("MLVAPP_REQUIRE_DISPLAY_PARITY_GL") != 0)
+        {
+            ::minitest::fail(__FILE__, __LINE__,
+                             "MLVAPP_REQUIRE_DISPLAY_PARITY_GL is set but the display shader cannot run",
+                             availability.reason.toStdString());
+        }
         SKIP_TEST(std::string("no GL backend: ") + availability.reason.toStdString());
     }
     ASSERT_TRUE(gpuPreviewProcessingApplyDisplayGpuOffscreen(pair.quarter, pair.frame.data(), fromQuarter.data(), w, h, &reason, &renderer));
