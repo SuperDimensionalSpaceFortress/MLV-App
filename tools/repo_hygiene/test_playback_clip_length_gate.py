@@ -1729,7 +1729,19 @@ class AppPlayGateStaticClassTests(unittest.TestCase):
             # the engine counts, the gate paces, the stop waits
             "the presented-frames stop no longer waits for the source frames": self._mutated_re(
                 r"\n\s*&& programmaticPlayConsumed\(\)\s*// ENFORCE-3: N presented frames[^\n]*", ""),
-            "the gate is not told the engine pace": self._mutated("enginePaceFps > 0.0 ? enginePaceFps : -1.0 );", "0.0 );"),
+            "the gate is not told the engine pace": self._mutated("enginePaceFps > 0.0 ? enginePaceFps : -1.0, automationPlayPaceMode() );", "0.0, automationPlayPaceMode() );"),
+            # CPU-LOOK-LEG-PACE-ABORT-1: the pace mode reaches the admission, the stop decision and every safety-net budget
+            "the admission is no longer told the pace mode": self._mutated("enginePaceFps > 0.0 ? enginePaceFps : -1.0, automationPlayPaceMode() );", "enginePaceFps > 0.0 ? enginePaceFps : -1.0 );"),
+            "the stop decision is no longer told the pace mode": self._mutated("elapsedMs, safetyMs, automationPlayPaceMode() );", "elapsedMs, safetyMs );"),
+            "the autoplay budget ignores the pace mode": self._mutated(
+                "playback_frame_range::playSafetyMs( m_playRequestedSeconds, automationPlayPaceMode() ) );\n                        if( autoplayState",
+                "playback_frame_range::playSafetyMs( m_playRequestedSeconds ) );\n                        if( autoplayState"),
+            "the settle budget ignores the pace mode": self._mutated(
+                "autoSettleSafetyMs = playback_frame_range::playSafetyMs( m_playRequestedSeconds, automationPlayPaceMode() );",
+                "autoSettleSafetyMs = playback_frame_range::playSafetyMs( m_playRequestedSeconds );"),
+            "the play-action budget ignores the pace mode": self._mutated(
+                "playActionSafetyMs = playback_frame_range::playSafetyMs( m_playRequestedSeconds, automationPlayPaceMode() );",
+                "playActionSafetyMs = playback_frame_range::playSafetyMs( m_playRequestedSeconds );"),
             "the engine tick stops feeding the counter (non-drop)":
                 self._mutated("m_sourceAdvance.noteEngineTick( sourcePositionBeforeTick,", "(void)( sourcePositionBeforeTick,"),
             "the engine tick stops feeding the counter (drop-frame)":
