@@ -15497,7 +15497,7 @@ void MainWindow::applyLookAssistToReceipt( ReceiptSettings *receipt,
                              m_pMlvObject->EXPO.isoValue,
                              static_cast<double>( m_pMlvObject->EXPO.shutterValue ),
                              m_pMlvObject->LENS.aperture,
-                             m_pMlvObject->DISO.isoValue );
+                             ReceiptApplier::lookAssistRecoveryIso( m_pMlvObject ) );
     {
         int asShotTemperature = 6000;
         int asShotTint = 0;
@@ -16523,7 +16523,7 @@ void MainWindow::applyLookAssistToReceipt( ReceiptSettings *receipt,
                 .arg( static_cast<qulonglong>( m_pMlvObject->LENS.aperture ) )
                 .arg( bool01( windowLitApplied ) )
                 .arg( bool01( windowLit.exposureBound ) )
-                .arg( static_cast<qulonglong>( m_pMlvObject->DISO.isoValue ) )
+                .arg( ReceiptApplier::lookAssistRecoveryIso( m_pMlvObject ) )
                 .arg( windowLit.search.result )
                 .arg( windowLit.search.renders )
                 .arg( windowLit.search.temperature )

@@ -505,6 +505,12 @@ void ReceiptApplier::applyToMlv(ReceiptSettings *receipt,
     resetMlvCachedFrame( mlvObject );
 }
 
+int ReceiptApplier::lookAssistRecoveryIso(mlvObject_t *mlvObject)
+{
+    if( !mlvObject || !mlvObject->llrawproc || llrpGetDualIsoValidity( mlvObject ) != DISO_VALID ) return 0;
+    return mlvObject->llrawproc->diso2;
+}
+
 bool ReceiptApplier::asShotWhiteBalanceControls(mlvObject_t *mlvObject, int *temperature, int *tint)
 {
     if( !mlvObject || !temperature || !tint ) return false;
@@ -723,7 +729,7 @@ bool ReceiptApplier::applyHeadlessLookAssist(ReceiptSettings *receipt,
                              mlvObject->EXPO.isoValue,
                              static_cast<double>( mlvObject->EXPO.shutterValue ),
                              mlvObject->LENS.aperture,
-                             mlvObject->DISO.isoValue );
+                             lookAssistRecoveryIso( mlvObject ) );
     {
         int asShotTemperature = 6000;
         int asShotTint = 0;
@@ -941,7 +947,7 @@ bool ReceiptApplier::applyHeadlessLookAssist(ReceiptSettings *receipt,
             .arg( static_cast<qulonglong>( mlvObject->LENS.aperture ) )
             .arg( windowLitApplied ? QStringLiteral("true") : QStringLiteral("false") )
             .arg( windowLit.exposureBound ? QStringLiteral("true") : QStringLiteral("false") )
-            .arg( static_cast<qulonglong>( mlvObject->DISO.isoValue ) )
+            .arg( lookAssistRecoveryIso( mlvObject ) )
             .arg( windowLit.search.result )
             .arg( windowLit.search.renders )
             .arg( windowLit.search.temperature )

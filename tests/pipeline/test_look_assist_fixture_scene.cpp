@@ -997,7 +997,10 @@ TEST(LookAssistFixtureScene, TheApertureBoundThroughTheRealHeadlessPath)
         ASSERT_TRUE( log.contains( QStringLiteral("LOOK_ASSIST window_lit_interior frame=0 wouldReclassify=") ) );
         ASSERT_TRUE( log.contains( QStringLiteral(" applied=false exposureBound=false ") ) );
     }
-    // (b) The M16 exposure with no aperture (ISO 100, 1/1357 s: bound 10.4): night is ruled out by the exposure.
+    // (b) The M16 exposure with no aperture (ISO 100, 1/1357 s: bound 10.4; the fixture's DISO block decodes to a 1600
+    //     recovery ISO, so 6.4 after the 4-stop credit): night is ruled out by the exposure, but the bound alone never
+    //     changes a verdict. Here the night path's processed picture yields no patch to verify (not-processed-solve), so
+    //     the receipt and picture are the pinned night's, bit for bit.
     {
         const IdentityCase c = { "tiny-no-aperture-m16", "tests/fixtures/clips/tiny_dual_iso.mlv", true, 100, 737, 0, 1 };
         IdentityRun run;
@@ -1008,7 +1011,13 @@ TEST(LookAssistFixtureScene, TheApertureBoundThroughTheRealHeadlessPath)
             if( line.contains( "window_lit_interior" ) || line.contains( "LOOK_ASSIST applied" ) )
                 std::fprintf( stderr, "APERTURE-BOUND %s\n", line.constData() );
         const QString tail = appliedLineDecisionTail( run.log );
-        ASSERT_TRUE( tail.contains( QStringLiteral(" ev100_bound=10.406 ev100_source=aperture_bound ") ) );
-        ASSERT_TRUE( QString::fromUtf8( run.log ).contains( QStringLiteral(" exposureBound=true ") ) );
+        ASSERT_TRUE( tail.endsWith( QStringLiteral(
+            "ev100_bound=10.406 ev100_source=aperture_bound surface_search=not-run surface_search_balance=NA") ) );
+        const QString log = QString::fromUtf8( run.log );
+        ASSERT_TRUE( log.contains( QStringLiteral("wouldReclassify=false reason=not-processed-solve ") ) );
+        ASSERT_TRUE( log.contains( QStringLiteral(" applied=false exposureBound=true recoveryIso=1600 ") ) );
+        ASSERT_TRUE( run.scene == QString::fromLatin1( kIdentityPins[2].scene ) );
+        ASSERT_TRUE( run.receipt == QString::fromLatin1( kIdentityPins[2].receipt ) );
+        ASSERT_TRUE( run.pictureSha256 == kIdentityPins[2].pictureSha256 );
     }
 }

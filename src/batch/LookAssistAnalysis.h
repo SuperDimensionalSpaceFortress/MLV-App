@@ -55,7 +55,7 @@ struct LookAssistStats
     // the scene's EV100 (a real aperture only raises it). Never set together with hasSceneEv100, which keeps its meaning.
     bool hasSceneEv100Bound = false;
     double sceneEv100Bound = 0.0;
-    // Dual ISO: stops from the recorded ISO up to the more sensitive recovery ISO (DISO block), 0 when there is none.
+    // Dual ISO: stops from the recorded ISO up to the more sensitive recovery ISO (decoded DISO), 0 when there is none.
     double sceneRecoveryStops = 0.0;
     // Fraction of pixels in the mid-tone band (luma 40..215): "a lit picture", not "a dark field
     // with a small bright region".
@@ -109,7 +109,7 @@ LookAssistStats analyzeLookAssistThumbnail( const unsigned char *rgb, int width,
 /* EV at ISO 100 = log2( N^2 / t ) - log2( ISO / 100 ), from the MLV EXPO/LENS blocks
  * (iso, shutter in microseconds, f-number * 100). False when any value is missing/zero. */
 bool lookAssistSceneEv100( double isoValue, double shutterMicroseconds, double apertureTimes100, double *ev100 );
-/* recoveryIsoValue = the DISO block's second ISO (0 = none). With no aperture but ISO and shutter recorded, the stats
+/* recoveryIsoValue = the decoded dual-ISO recovery ISO (ReceiptApplier::lookAssistRecoveryIso; 0 = none). With no aperture but ISO and shutter recorded, the stats
  * get the f/1.0 lower bound instead (hasSceneEv100Bound); the recorded EV100 is computed exactly as before. */
 void lookAssistSetSceneEv100( LookAssistStats *stats,
                               double isoValue,

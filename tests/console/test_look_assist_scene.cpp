@@ -2222,7 +2222,7 @@ TEST(LookAssistScene, BothConsumersApplyTheWindowLitCheckOnlyOnTheExposureBound)
         "                                        || lookAssistNotNightByExposureBoundCandidate( stats, scene );") ) );
     ASSERT_FALSE( window.contains( QStringLiteral("lookAssistWindowLitInteriorCandidate(") ) );
     // The recovery ISO reaches the bound.
-    ASSERT_TRUE( window.contains( QStringLiteral("m_pMlvObject->LENS.aperture,\n                             m_pMlvObject->DISO.isoValue );") ) );
+    ASSERT_TRUE( window.contains( QStringLiteral("m_pMlvObject->LENS.aperture,\n                             ReceiptApplier::lookAssistRecoveryIso( m_pMlvObject ) );") ) );
 
     // Headless: the same, after its decision and its master-pass fallback, before the receipt is written; the applied
     // balance is the check's verified one.
@@ -2242,7 +2242,7 @@ TEST(LookAssistScene, BothConsumersApplyTheWindowLitCheckOnlyOnTheExposureBound)
     ASSERT_TRUE( hWb > 0 && hMaster > hWb && hCheck > hMaster && hGate > hCheck && hAdopt > hGate );
     ASSERT_TRUE( hTemp > hAdopt && hTint > hTemp && hWrite > hTint );
     ASSERT_TRUE( applier.contains( QStringLiteral("lookAssistTraceSurfaceSearch( &decisionTrace, windowLit );") ) );
-    ASSERT_TRUE( applier.contains( QStringLiteral("mlvObject->LENS.aperture,\n                             mlvObject->DISO.isoValue );") ) );
+    ASSERT_TRUE( applier.contains( QStringLiteral("mlvObject->LENS.aperture,\n                             lookAssistRecoveryIso( mlvObject ) );") ) );
 }
 
 // ---------------------------------------------------------------------------------------------------------------
