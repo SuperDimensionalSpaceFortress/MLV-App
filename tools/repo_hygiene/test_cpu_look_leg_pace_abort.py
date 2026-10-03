@@ -42,6 +42,14 @@ GATE = ROOT / "tools" / "profiling" / "gui-smoke-length-gate.ps1"
 MAIN_WINDOW = ROOT / "platform" / "qt" / "MainWindow.cpp"
 # master immediately before this card (the CUDA job it emits is the byte-identity baseline of this card).
 PRIOR_MASTER = "b575192806246f845dc8e353259d791bed3b8fbe"
+# LOOK-ASSIST-FLAVORS-1 turned the look leg's recorded lookFlavorHonored='unknown' (the app read no flavor) into the app's own
+# report: one line becomes two (in the jobs that carry the variant fields; $null outside a look leg). Everything else is still byte for byte the prior generator.
+FLAVOR_PRIOR_LINE = "    lookFlavorHonored = $(if ($LookLeg) { 'unknown' } else { $null })"
+FLAVOR_NEW_LINES = (
+    "    lookFlavorReported = $(if ($LookLeg) { $lfReported = try { [string]$resultJson.log.visualState.look_assist_flavor } catch { '' }; "
+    "if ([string]::IsNullOrEmpty($lfReported)) { $lfReported = 'none' }; $lfReported } else { $null })",
+    "    lookFlavorHonored = $(if ($LookLeg) { $lfReported -ceq $LookFlavor } else { $null })",
+)
 
 
 def _q(path: Path) -> str:
@@ -301,7 +309,15 @@ class CpuPaceGeneratedJobs(unittest.TestCase):
         for name, extra in (("default", []), ("look", ["-ForceLookAssist", "-ContactSheet"]), ("um", ["-Venue", "ultra-magnus"]), ("play30", ["-PlaySeconds", "30"])):
             new, _ = self.generate(GENERATOR, f"new-{name}.job.ps1", extra)
             old, _ = self.generate(prior, f"old-{name}.job.ps1", extra)
-            self.assertEqual(new.read_bytes(), old.read_bytes(), f"the {name} CUDA job changed")
+            old_bytes = old.read_bytes()
+            # LOOK-ASSIST-FLAVORS-1: the one changed line, in the jobs that carry it; a job without it stays without it
+            if FLAVOR_PRIOR_LINE.encode() in old_bytes:
+                eol = b"\r\n" if b"\r\n" in old_bytes else b"\n"
+                self.assertEqual(old_bytes.count(FLAVOR_PRIOR_LINE.encode()), 1, name)
+                old_bytes = old_bytes.replace(FLAVOR_PRIOR_LINE.encode(), eol.join(x.encode() for x in FLAVOR_NEW_LINES))
+            else:
+                self.assertNotIn(b"lookFlavorHonored", new.read_bytes(), name)
+            self.assertEqual(new.read_bytes(), old_bytes, f"the {name} CUDA job changed")
 
     def test_only_the_cpu_variant_changes_and_only_in_the_card_s_lines(self) -> None:
         if not self.prior_available:
@@ -312,7 +328,7 @@ class CpuPaceGeneratedJobs(unittest.TestCase):
             old, _ = self.generate(prior, f"old-{name}.job.ps1", extra)
             changed = [line for line in difflib.unified_diff(lf(old.read_text(encoding="utf-8")).split("\n"), lf(new.read_text(encoding="utf-8")).split("\n"), lineterm="", n=0)
                        if line[:1] in "+-" and not line.startswith(("+++", "---"))]
-            kinds = {"switch": 0, "mode": 0, "pace": 0, "smoke_timeout": 0, "presentmon_timeout": 0}
+            kinds = {"switch": 0, "mode": 0, "pace": 0, "smoke_timeout": 0, "presentmon_timeout": 0, "flavor": 0}
             for line in changed:
                 body = line[1:]
                 if "-CpuPlayPaceInformational" in body or body.startswith("$cmd = "):
@@ -325,6 +341,8 @@ class CpuPaceGeneratedJobs(unittest.TestCase):
                     kinds["smoke_timeout"] += 1
                 elif body.startswith("$PresentMonTimedSeconds = "):
                     kinds["presentmon_timeout"] += 1
+                elif "lookFlavorHonored" in body or "lookFlavorReported" in body:   # LOOK-ASSIST-FLAVORS-1
+                    kinds["flavor"] += 1
                 elif "smokeProcessTimeoutMs=" in body:
                     kinds.setdefault("trace", 0)
                     kinds["trace"] += 1
@@ -336,6 +354,7 @@ class CpuPaceGeneratedJobs(unittest.TestCase):
             self.assertEqual(kinds["pace"], 1, name)
             self.assertEqual(kinds["smoke_timeout"], 2, name)
             self.assertEqual(kinds["presentmon_timeout"], 2, name)
+            self.assertEqual(kinds["flavor"], 3, name)   # LOOK-ASSIST-FLAVORS-1: the prior line out, the two new lines in
 
     def test_a_runner_without_the_switch_keeps_the_gated_behaviour_with_a_warning(self) -> None:
         # a SourceCommit whose committed runner predates the switch (committed in the clone, never in the real repo)
