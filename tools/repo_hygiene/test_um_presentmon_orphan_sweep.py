@@ -551,6 +551,17 @@ class SweepExecutedTests(SliceHarness, unittest.TestCase):
         self.assertIn("Get-Process -Name 'PresentMon*' -ErrorAction Stop", snapshot)
         self.assertNotIn("SilentlyContinue", snapshot, "an unreadable list must never read as 'no capture alive'")
 
+    def test_the_pinned_image_name_drops_only_the_exe_extension_of_the_real_pinned_name(self) -> None:
+        # the job derives the image name by regex (the publish-write scan allowlists no static member): run the job's own pattern on the real pinned name and on an extension-less one
+        pattern = re.search(r"\$pinnedName = \(\[string\]\$PresentMonName\) -replace '([^']+)', ''", TEMPLATE)
+        self.assertIsNotNone(pattern, "the pinned image name is derived by a -replace in the snapshot function")
+        proc = run_pwsh(["-Command", f"('PresentMon-2.5.1-x64.exe' -replace '{pattern.group(1)}', '') + '|' + ('PresentMon-2.5.1-x64' -replace '{pattern.group(1)}', '')"])
+        self.assertEqual(proc.stdout.strip(), "PresentMon-2.5.1-x64|PresentMon-2.5.1-x64", proc.stdout + proc.stderr)
+
+    def test_the_snapshot_uses_no_static_member_the_publish_write_scan_would_reject(self) -> None:
+        snapshot = _slice(TEMPLATE, "function Get-PresentMonProcessSnapshot(", "\nfunction Get-PresentMonLiveProcessId(")
+        self.assertIsNone(re.search(r"\[[A-Za-z.]+\]::", snapshot), "R4 allowlists static members; the snapshot must use operators only")
+
     def test_mutation_a_name_prefix_match_lets_the_service_skip_the_sweep_again(self) -> None:
         mutated = mutate(TEMPLATE, "$isPinned = ([string]$candidate.Name -ieq $pinnedName) -or", "$isPinned = ([string]$candidate.Name -like 'PresentMon*') -or")
         _code, sweep, d, _out = self.run_start("mut-prefix", others=(self.SERVICE,), text=mutated)
@@ -559,7 +570,7 @@ class SweepExecutedTests(SliceHarness, unittest.TestCase):
         self.assertEqual(self.terminated_names(self.calls(d)), [], "the Bachelor state: the service blocks the sweep")
 
     def test_mutation_without_the_path_match_a_renamed_capture_reads_as_no_capture(self) -> None:
-        mutated = mutate(TEMPLATE, " -or (-not [string]::IsNullOrEmpty($candidatePath) -and ($candidatePath -ieq $pinnedPath))", "")
+        mutated = mutate(TEMPLATE, " -or ($candidatePath -ne '' -and $candidatePath -ieq $pinnedPath)", "")
         _code, sweep, d, _out = self.run_start("mut-path", others=((4343, "renamed-capture", str(self.stmp / "mut-path" / "cache" / STUB_EXE)),), text=mutated)
         self.assertTrue(sweep["ran"], "without the path arm a live renamed capture would be swept under")
         self.assertNotEqual(self.terminated_names(self.calls(d)), [])

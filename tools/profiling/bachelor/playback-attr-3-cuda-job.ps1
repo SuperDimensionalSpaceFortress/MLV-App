@@ -1294,14 +1294,15 @@ function Get-PresentMonProcessSnapshot() {
     # A process is a LIVE CAPTURE-MODE PresentMon only when it is the pinned executable: its image name equals the pinned one (case-insensitive, no extension, e.g.
     # PresentMon-2.5.1-x64) or its path is the pinned cache path. Every other `PresentMon*` process is recorded in `excluded` (name, pid) and never blocks the sweep. The process list is
     # read with -ErrorAction Stop: a host whose list cannot be read throws, and the sweep records the error and touches nothing (it never reads an unreadable list as "no capture alive").
-    $pinnedName = [System.IO.Path]::GetFileNameWithoutExtension([string]$PresentMonName)
-    $pinnedPath = [System.IO.Path]::GetFullPath((Join-Path ([string]$Cache) ([string]$PresentMonName)))
+    # operators only: the publish-write scan (attr3_publish_write_scan.ps1, R4) allowlists static members, and the path is compared as written (no GetFullPath: it expands 8.3 short names, so a runner TEMP spelled RUNNER~1 would never equal the process's own path)
+    $pinnedName = ([string]$PresentMonName) -replace '\.[A-Za-z0-9]{1,4}$', ''
+    $pinnedPath = Join-Path ([string]$Cache) ([string]$PresentMonName)
     $live = @()
     $excluded = @()
     foreach ($candidate in @(Get-Process -Name 'PresentMon*' -ErrorAction Stop)) {
-        $candidatePath = $null
-        try { $candidatePath = [string]$candidate.Path } catch { $candidatePath = $null }
-        $isPinned = ([string]$candidate.Name -ieq $pinnedName) -or (-not [string]::IsNullOrEmpty($candidatePath) -and ($candidatePath -ieq $pinnedPath))
+        $candidatePath = ''
+        try { $candidatePath = [string]$candidate.Path } catch { $candidatePath = '' }
+        $isPinned = ([string]$candidate.Name -ieq $pinnedName) -or ($candidatePath -ne '' -and $candidatePath -ieq $pinnedPath)
         if ($isPinned) {
             $live += [int]$candidate.Id
         } else {
