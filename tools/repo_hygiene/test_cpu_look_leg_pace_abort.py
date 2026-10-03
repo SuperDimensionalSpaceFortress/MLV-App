@@ -10,7 +10,9 @@ no footage path, name or frame is read or written here.
   2. the launcher: Get-GuiSmokePlaySafetyMs -CpuPaceInformational is the C++ formula; the runner's -CpuPlayPaceInformational is the ONLY way the app's
      MLVAPP_PLAY_PACE_MODE=informational is set (an -ExtraEnvironment or inherited value is refused, an ambient one is stripped);
   3. the job: only the CPU variant passes the switch, its smoke / PresentMon / um-run timeouts are derived from the same ceiling, and its success summary
-     records cpuPaceInformational and the measured cpuPaceTimelineFps; a CUDA job is byte-identical to master's.
+     records cpuPaceInformational and the measured cpuPaceTimelineFps; a CUDA job carries none of it. That last guarantee is a STRUCTURAL invariant of the
+     CURRENT generator (CPU_PACE_MARKERS absent from every CUDA variant; the pace mode is the only delta between two CPU jobs of the same arguments), never
+     a snapshot of a past master (CPU-PACE-BYTE-IDENTITY-BASELINE-1: a frozen snapshot blocked every later legitimate change to the job generator).
 
 Every rule has a mutation test (the checks are pure functions of the file text, so a mutant of the text must turn a check red).
 """
@@ -20,6 +22,7 @@ from __future__ import annotations
 import difflib
 import math
 import re
+import shutil
 import subprocess
 import tempfile
 import unittest
@@ -40,32 +43,15 @@ from tools.repo_hygiene.test_dual_venue_evidence import (
 HEADER = ROOT / "platform" / "qt" / "PlaybackFrameRange.h"
 GATE = ROOT / "tools" / "profiling" / "gui-smoke-length-gate.ps1"
 MAIN_WINDOW = ROOT / "platform" / "qt" / "MainWindow.cpp"
-# master immediately before this card (the CUDA job it emits is the byte-identity baseline of this card).
-PRIOR_MASTER = "b575192806246f845dc8e353259d791bed3b8fbe"
-
-
-# CONTACT-SHEET-PLAYBACK-PARITY-1 (a later card) adds three bracketed regions to every emitted job; they are removed before the
-# byte comparisons below, so this card's pins still cover every other byte. The count is pinned so a region cannot multiply unnoticed.
-LATER_CARD_OPEN = "CONTACT-SHEET-PLAYBACK-PARITY-1 >>>"
-LATER_CARD_CLOSE = "CONTACT-SHEET-PLAYBACK-PARITY-1 <<<"
-LATER_CARD_REGIONS = 3
-
-
-def strip_later_card_regions(text: str) -> tuple[str, int]:
-    kept, inside, count = [], False, 0
-    for line in text.split("\n"):
-        if LATER_CARD_OPEN in line:
-            assert not inside, "nested CONTACT-SHEET-PLAYBACK-PARITY-1 region"
-            inside, count = True, count + 1
-            continue
-        if LATER_CARD_CLOSE in line:
-            assert inside, "unopened CONTACT-SHEET-PLAYBACK-PARITY-1 close"
-            inside = False
-            continue
-        if not inside:
-            kept.append(line)
-    assert not inside, "unclosed CONTACT-SHEET-PLAYBACK-PARITY-1 region"
-    return "\n".join(kept), count
+# Everything the CPU-informational mode writes into a generated job. A CUDA job (any arguments) must contain none of it.
+CPU_PACE_MARKERS = ("-CpuPlayPaceInformational", "MLVAPP_PLAY_PACE_MODE", "cpuPaceInformational", "cpuPaceTimelineFps")
+# The CUDA argument sets the invariants run over (the CPU variants are the same arguments plus -Backend cpu).
+CUDA_VARIANTS = (
+    ("default", []),
+    ("look", ["-ForceLookAssist", "-ContactSheet"]),
+    ("um", ["-Venue", "ultra-magnus"]),
+    ("play30", ["-PlaySeconds", "30"]),
+)
 
 
 def _q(path: Path) -> str:
@@ -137,6 +123,64 @@ def check_generator_text(text: str) -> list[str]:
         problems.append("the CPU summary does not record the measured pace")
     if "'    cpuPaceInformational = '" not in text:
         problems.append("the CPU summary does not record the pace mode")
+    return problems
+
+
+def job_timeouts(text: str) -> tuple[int, int]:
+    """(SmokeProcessTimeoutMs, PresentMonTimedSeconds) as a generated job declares them."""
+    return (int(re.search(r"(?m)^\$SmokeProcessTimeoutMs = (\d+)", text).group(1)),
+            int(re.search(r"(?m)^\$PresentMonTimedSeconds = (\d+)", text).group(1)))
+
+
+def check_cuda_job_text(text: str, cpu_ceiling_sec: int) -> list[str]:
+    """The structural form of 'CUDA legs are unaffected by the CPU-informational mode': a property of the job text itself, not of any past generator."""
+    problems = [f"a CUDA job carries the CPU-informational marker {marker}" for marker in CPU_PACE_MARKERS if marker in text]
+    smoke_ms, presentmon_sec = job_timeouts(text)
+    if smoke_ms >= cpu_ceiling_sec * 1000:
+        problems.append(f"a CUDA job's smoke timeout ({smoke_ms} ms) carries the extended CPU Play ceiling ({cpu_ceiling_sec} s)")
+    if presentmon_sec >= cpu_ceiling_sec:
+        problems.append(f"a CUDA job's PresentMon capture ({presentmon_sec} s) carries the extended CPU Play ceiling ({cpu_ceiling_sec} s)")
+    return problems
+
+
+def normalise_identity(text: str, *commits: str) -> str:
+    """Blank the lines that are a pure function of -SourceCommit (names, closure hash, the runner's own sha256), so two jobs generated at two commits compare."""
+    for commit in commits:
+        text = text.replace(commit, "<COMMIT>").replace(commit[:12], "<COMMIT12>")
+    text = re.sub(r"smoke-runner-[0-9a-f]{16}", "smoke-runner-<HASH>", text)
+    return re.sub(r"(name = 'run-release-gui-smoke\.ps1'; sha256 = ')[0-9a-f]{64}", r"\1<SHA256>", text)
+
+
+def changed_lines(before: str, after: str) -> list[str]:
+    return [line for line in difflib.unified_diff(lf(before).split("\n"), lf(after).split("\n"), lineterm="", n=0)
+            if line[:1] in "+-" and not line.startswith(("+++", "---"))]
+
+
+def check_pace_mode_delta(without_switch: str, with_switch: str) -> list[str]:
+    """`without_switch` and `with_switch` are the SAME arguments and backend, generated at a commit whose runner lacks / has the switch. The documented allow-list
+    is exactly: the smoke command line gains the switch; the two timeouts grow to the CPU ceiling; the mode field flips. Anything else that differs is a problem."""
+    problems = []
+    old = [line[1:] for line in changed_lines(without_switch, with_switch) if line[0] == "-"]
+    new = [line[1:] for line in changed_lines(without_switch, with_switch) if line[0] == "+"]
+    if len(old) != len(new):
+        return [f"the pace mode changed {len(old)} lines out and {len(new)} in; each change must be a one-for-one replacement"]
+    for before, after in zip(old, new):
+        if before.startswith("$cmd = "):
+            if after.replace(" -CpuPlayPaceInformational", "", 1) != before or after == before:
+                problems.append("the smoke command line differs by more than the one switch")
+        elif before.strip() == "cpuPaceInformational = $false":
+            if after.strip() != "cpuPaceInformational = $true":
+                problems.append(f"the mode field became {after.strip()[:80]}")
+        elif before.startswith("$SmokeProcessTimeoutMs = ") or before.startswith("$PresentMonTimedSeconds = "):
+            name = before.split(" = ")[0]
+            if not after.startswith(name + " = ") or int(after.split(" = ")[1]) <= int(before.split(" = ")[1]):
+                problems.append(f"{name} did not grow to the CPU ceiling")
+        else:
+            problems.append(f"an unexpected changed line: {before[:100]!r} -> {after[:100]!r}")
+    seen = {("cmd" if x.startswith("$cmd = ") else x.split(" = ")[0].strip()) for x in old}
+    for needed in ("cmd", "cpuPaceInformational", "$SmokeProcessTimeoutMs", "$PresentMonTimedSeconds"):
+        if needed not in seen:
+            problems.append(f"the pace mode did not change {needed}")
     return problems
 
 
@@ -239,6 +283,46 @@ class CpuPaceLaunchers(unittest.TestCase):
         })
 
 
+class CpuPaceJobInvariantMutations(unittest.TestCase):
+    """The two job-text invariants are pure functions of job text, so a mutant of a (synthetic) job must turn each one red."""
+
+    CUDA_JOB = "$Backend = 'cuda'\n$PresentMonTimedSeconds = 133\n$SmokeProcessTimeoutMs = 133000\n$cmd = \"& smoke -MaxSkippedOrUnpresentedRatio 1 -FrameTelemetry\"\n"
+    BEFORE = ("$Backend = 'cpu'\n$PresentMonTimedSeconds = 133\n$SmokeProcessTimeoutMs = 133000\n"
+              "$cmd = \"& smoke -MaxSkippedOrUnpresentedRatio 1 -FrameTelemetry\"\n    cpuPaceInformational = $false\n")
+    AFTER = ("$Backend = 'cpu'\n$PresentMonTimedSeconds = 858\n$SmokeProcessTimeoutMs = 858000\n"
+             "$cmd = \"& smoke -MaxSkippedOrUnpresentedRatio 1 -CpuPlayPaceInformational -FrameTelemetry\"\n    cpuPaceInformational = $true\n")
+
+    def test_the_synthetic_jobs_are_clean(self) -> None:
+        self.assertEqual(check_cuda_job_text(self.CUDA_JOB, 765), [])
+        self.assertEqual(check_pace_mode_delta(self.BEFORE, self.AFTER), [])
+
+    def test_a_cuda_job_that_gains_any_marker_or_the_extended_budget_is_caught(self) -> None:
+        for marker in CPU_PACE_MARKERS:
+            with self.subTest(marker):
+                self.assertTrue(check_cuda_job_text(self.CUDA_JOB + f"# {marker}\n", 765))
+        self.assertTrue(check_cuda_job_text(self.CUDA_JOB.replace("133000", "858000"), 765), "the extended smoke timeout")
+        self.assertTrue(check_cuda_job_text(self.CUDA_JOB.replace("= 133\n", "= 858\n"), 765), "the extended PresentMon capture")
+
+    def test_a_pace_mode_that_changes_anything_else_is_caught(self) -> None:
+        mutants = {
+            "an unrelated line changes": (self.AFTER + "$Extra = 1\n", self.BEFORE + "$Extra = 0\n"),
+            "the command changes beyond the switch": (self.AFTER.replace("-FrameTelemetry", "-FrameTelemetry -Other"), self.BEFORE),
+            "the timeouts do not grow": (self.AFTER.replace("858000", "133000").replace("= 858\n", "= 133\n"), self.BEFORE),
+            "the switch is not passed": (self.AFTER.replace(" -CpuPlayPaceInformational", ""), self.BEFORE),
+            "the mode is not recorded": (self.AFTER.replace("cpuPaceInformational = $true", "cpuPaceInformational = $false"), self.BEFORE),
+        }
+        for name, (after, before) in mutants.items():
+            with self.subTest(name):
+                self.assertTrue(check_pace_mode_delta(before, after))
+
+    def test_identity_lines_are_blanked_but_nothing_else(self) -> None:
+        a, b = "a" * 40, "b" * 40
+        first = f"$S = '{a}'\n$E = 'x-{a[:12]}.exe'\ndir smoke-runner-{'1' * 16}\n[pscustomobject]@{{ name = 'run-release-gui-smoke.ps1'; sha256 = '{'2' * 64}' }}\n$T = 1\n"
+        second = f"$S = '{b}'\n$E = 'x-{b[:12]}.exe'\ndir smoke-runner-{'3' * 16}\n[pscustomobject]@{{ name = 'run-release-gui-smoke.ps1'; sha256 = '{'4' * 64}' }}\n$T = 1\n"
+        self.assertEqual(normalise_identity(first, a), normalise_identity(second, b))
+        self.assertNotEqual(normalise_identity(first, a), normalise_identity(second.replace("$T = 1", "$T = 2"), b))
+
+
 @requires_windows_pwsh
 class CpuPaceGeneratedJobs(unittest.TestCase):
     """Runs the real generator against a sparse clone whose two fixture files are header-only ~30 s stand-ins (never real footage), the device the sibling
@@ -255,13 +339,6 @@ class CpuPaceGeneratedJobs(unittest.TestCase):
         subprocess.run(["git", "-C", str(cls.repo), "checkout", "-q", cls.head], check=True)
         for stem in FIXTURE_IDS:
             write_synthetic_mlv(cls.repo / "tests" / "fixtures" / "clips" / (stem + MLV_EXT), FRAMES_30S_AT_23976)
-        cls.prior_available = subprocess.run(["git", "-C", str(ROOT), "cat-file", "-e", f"{PRIOR_MASTER}^{{commit}}"], capture_output=True).returncode == 0
-        cls.prior_root = cls.tmp / "prior"
-        if cls.prior_available:
-            tar = cls.tmp / "prior.tar"
-            subprocess.run(["git", "-C", str(ROOT), "archive", PRIOR_MASTER, "--format=tar", "-o", str(tar), "tools/profiling", "tools/gates"], check=True)
-            cls.prior_root.mkdir()
-            subprocess.run(["tar", "-xf", str(tar), "-C", str(cls.prior_root)], check=True)
 
     @classmethod
     def tearDownClass(cls) -> None:
@@ -276,9 +353,26 @@ class CpuPaceGeneratedJobs(unittest.TestCase):
 
     @staticmethod
     def timeouts(job: Path) -> tuple[int, int]:
-        text = job.read_text(encoding="utf-8")
-        return (int(re.search(r"(?m)^\$SmokeProcessTimeoutMs = (\d+)", text).group(1)),
-                int(re.search(r"(?m)^\$PresentMonTimedSeconds = (\d+)", text).group(1)))
+        return job_timeouts(job.read_text(encoding="utf-8"))
+
+    @staticmethod
+    def cpu_ceiling_sec() -> int:
+        gate = header_constants(HEADER.read_text(encoding="utf-8"))
+        return expected_budget_ms(25, gate["cpu_fraction"], gate["margin_ms"]) // 1000          # 765 s
+
+    def generate_with_runner_lacking_the_switch(self, out_name: str, extra: list[str]) -> tuple[Path, str, str]:
+        """Generates at a SourceCommit whose committed runner predates the switch (committed in the clone, never in the real repo); returns (job, output, that commit)."""
+        runner = self.repo / "tools" / "profiling" / "run-release-gui-smoke.ps1"
+        original = runner.read_bytes()
+        try:
+            runner.write_bytes(original.replace(b"CpuPlayPaceInformational", b"CpuPlayPaceGone"))
+            subprocess.run(["git", "-C", str(self.repo), "-c", "user.name=t", "-c", "user.email=t@t", "commit", "-q", "-m", "predates the switch", "--", "tools/profiling/run-release-gui-smoke.ps1"], check=True)
+            old_head = subprocess.run(["git", "-C", str(self.repo), "rev-parse", "HEAD"], capture_output=True, text=True, check=True).stdout.strip()
+            job, out = self.generate(GENERATOR, out_name, extra, source_commit=old_head)
+            return job, out, old_head
+        finally:
+            subprocess.run(["git", "-C", str(self.repo), "reset", "-q", "--soft", self.head], check=True)
+            subprocess.run(["git", "-C", str(self.repo), "checkout", "-q", self.head, "--", "tools/profiling/run-release-gui-smoke.ps1"], check=True)
 
     def recommended_job_timeout_sec(self, extra: list[str], out_name: str) -> int:
         # the generator's result object, asked for the one property by name (never parsed out of its console formatting)
@@ -297,91 +391,57 @@ class CpuPaceGeneratedJobs(unittest.TestCase):
         self.assertIn("cpuPaceInformational = $true", text)
         self.assertIn("cpuPaceTimelineFps = $resultJson.playbackFps.smokeTimelineFps", text)
 
-    def test_a_cuda_job_has_neither_the_switch_nor_the_fields(self) -> None:
-        for name, extra in (("cuda", []), ("cuda-look", ["-ForceLookAssist", "-ContactSheet"]), ("um-cuda", ["-Venue", "ultra-magnus"])):
-            job, _out = self.generate(GENERATOR, f"{name}.job.ps1", extra)
-            text = job.read_text(encoding="utf-8")
-            self.assertNotIn("CpuPlayPaceInformational", text, name)
-            self.assertNotIn("cpuPaceTimelineFps", text, name)
-            self.assertNotIn("cpuPaceInformational", text, name)
+    def test_a_cuda_job_has_none_of_the_cpu_informational_mode(self) -> None:
+        # CLASS: CUDA legs are unaffected by the CPU-informational mode -- a property of the current generator's CUDA output, whatever else it emits.
+        for name, extra in CUDA_VARIANTS:
+            job, _out = self.generate(GENERATOR, f"cuda-{name}.job.ps1", extra)
+            self.assertEqual(check_cuda_job_text(job.read_text(encoding="utf-8"), self.cpu_ceiling_sec()), [], name)
 
     def test_the_cpu_timeouts_cover_the_cpu_ceiling_and_derive_from_it_alone(self) -> None:
-        gate = header_constants(HEADER.read_text(encoding="utf-8"))
-        ceiling_sec = expected_budget_ms(25, gate["cpu_fraction"], gate["margin_ms"]) // 1000          # 765 s
+        ceiling_sec = self.cpu_ceiling_sec()
         job, out = self.generate(GENERATOR, "cpu.job.ps1", ["-Backend", "cpu"])
         smoke_ms, presentmon_sec = self.timeouts(job)
         self.assertGreaterEqual(smoke_ms, ceiling_sec * 1000, "the smoke process timeout must cover the CPU Play ceiling")
         self.assertEqual(smoke_ms, (0 + 60 + ceiling_sec + 3 + 30) * 1000, "launch + ceiling + settle + runner slack (a fixture has no identity read)")
         self.assertGreaterEqual(presentmon_sec * 1000, smoke_ms, "the PresentMon capture ceiling follows the smoke timeout")
         self.assertGreaterEqual(self.recommended_job_timeout_sec(["-Backend", "cpu"], "cpu-timeout.job.ps1"), smoke_ms // 1000, "the um-run -TimeoutSec covers the smoke timeout")
-        # the CUDA job's budget is exactly what it was (60 + 40 + 3 + 30)
+        # a CUDA job's budget is never the extended one
         cuda_job, cuda_out = self.generate(GENERATOR, "cuda.job.ps1", [])
-        self.assertEqual(self.timeouts(cuda_job)[0], 133000)
+        self.assertLess(self.timeouts(cuda_job)[0], ceiling_sec * 1000)
 
-    def test_a_cuda_job_is_byte_identical_to_the_pre_card_generators(self) -> None:
-        if not self.prior_available:
-            self.skipTest(f"{PRIOR_MASTER[:12]} is not in this clone")
-        prior = self.prior_root / "tools" / "profiling" / "bachelor" / "playback-attr-3-cuda-job.ps1"
-        for name, extra in (("default", []), ("look", ["-ForceLookAssist", "-ContactSheet"]), ("um", ["-Venue", "ultra-magnus"]), ("play30", ["-PlaySeconds", "30"])):
-            new, _ = self.generate(GENERATOR, f"new-{name}.job.ps1", extra)
-            old, _ = self.generate(prior, f"old-{name}.job.ps1", extra)
-            new_text, regions = strip_later_card_regions(new.read_bytes().decode("utf-8"))
-            self.assertEqual(regions, LATER_CARD_REGIONS, name)
-            self.assertEqual(new_text, old.read_bytes().decode("utf-8"), f"the {name} CUDA job changed")
+    def test_mutation_a_generator_that_hands_the_switch_to_a_cuda_job_is_caught(self) -> None:
+        # the mutant generator (a copy of the real one in a copy of its tools tree) arms the mode for every backend; the invariant must go red on its CUDA job
+        mutant_root = self.tmp / "mutant"
+        shutil.copytree(ROOT / "tools" / "profiling", mutant_root / "tools" / "profiling")
+        shutil.copytree(ROOT / "tools" / "gates", mutant_root / "tools" / "gates")
+        mutant = mutant_root / "tools" / "profiling" / "bachelor" / GENERATOR.name
+        text = mutant.read_bytes().decode("utf-8")
+        old = "$cpuPlayPaceInformational = ($Backend -eq 'cpu') -and $runnerAcceptsCpuPlayPaceInformational"
+        self.assertEqual(text.count(old), 1, "mutation anchor missing or ambiguous")
+        mutant.write_bytes(text.replace(old, "$cpuPlayPaceInformational = $runnerAcceptsCpuPlayPaceInformational", 1).encode("utf-8"))
+        job, _out = self.generate(mutant, "mutant-cuda.job.ps1", [])
+        problems = check_cuda_job_text(job.read_text(encoding="utf-8"), self.cpu_ceiling_sec())
+        self.assertTrue(problems, "the CUDA invariant did not go red when a CUDA job gained the switch")
+        # the generator emits the switch and fields only inside its cpu-backend edit, so what leaks into a CUDA job is the extended budget
+        self.assertTrue(any("extended CPU Play ceiling" in p for p in problems), problems)
 
-    def test_only_the_cpu_variant_changes_and_only_in_the_card_s_lines(self) -> None:
-        if not self.prior_available:
-            self.skipTest(f"{PRIOR_MASTER[:12]} is not in this clone")
-        prior = self.prior_root / "tools" / "profiling" / "bachelor" / "playback-attr-3-cuda-job.ps1"
-        for name, extra in (("cpu", ["-Backend", "cpu"]), ("um-cpu-look", ["-Backend", "cpu", "-Venue", "ultra-magnus", "-ForceLookAssist", "-ContactSheet"])):
-            new, _ = self.generate(GENERATOR, f"new-{name}.job.ps1", extra)
-            old, _ = self.generate(prior, f"old-{name}.job.ps1", extra)
-            new_text, regions = strip_later_card_regions(lf(new.read_text(encoding="utf-8")))
-            self.assertEqual(regions, LATER_CARD_REGIONS, name)
-            changed = [line for line in difflib.unified_diff(lf(old.read_text(encoding="utf-8")).split("\n"), new_text.split("\n"), lineterm="", n=0)
-                       if line[:1] in "+-" and not line.startswith(("+++", "---"))]
-            kinds = {"switch": 0, "mode": 0, "pace": 0, "smoke_timeout": 0, "presentmon_timeout": 0}
-            for line in changed:
-                body = line[1:]
-                if "-CpuPlayPaceInformational" in body or body.startswith("$cmd = "):
-                    kinds["switch"] += 1
-                elif "cpuPaceInformational" in body:
-                    kinds["mode"] += 1
-                elif "cpuPaceTimelineFps" in body:
-                    kinds["pace"] += 1
-                elif body.startswith("$SmokeProcessTimeoutMs = "):
-                    kinds["smoke_timeout"] += 1
-                elif body.startswith("$PresentMonTimedSeconds = "):
-                    kinds["presentmon_timeout"] += 1
-                elif "smokeProcessTimeoutMs=" in body:
-                    kinds.setdefault("trace", 0)
-                    kinds["trace"] += 1
-                else:
-                    self.fail(f"{name}: an unexpected changed line in the CPU job: {line[:160]}")
-            # old line and new line each: the switch line (-/+), the two summary fields (+), the two timeouts (-/+), the trace line (-/+)
-            self.assertEqual(kinds["switch"], 2, name)
-            self.assertEqual(kinds["mode"], 1, name)
-            self.assertEqual(kinds["pace"], 1, name)
-            self.assertEqual(kinds["smoke_timeout"], 2, name)
-            self.assertEqual(kinds["presentmon_timeout"], 2, name)
+    def test_the_pace_mode_is_the_only_delta_between_two_cpu_jobs_of_the_same_arguments(self) -> None:
+        # The card's lines are found by diffing two CURRENT outputs: the same CPU arguments generated at a SourceCommit whose runner lacks the switch, and at HEAD
+        # (which has it). Backend-dependent lines are identical in both, so the allow-list is exactly the card's lines and needs no upkeep when other cards edit them.
+        for name, extra in (("cpu", ["-Backend", "cpu"]),
+                            ("um-cpu-look", ["-Backend", "cpu", "-Venue", "ultra-magnus", "-ForceLookAssist", "-ContactSheet"])):
+            without, _out, old_head = self.generate_with_runner_lacking_the_switch(f"without-{name}.job.ps1", extra)
+            with_switch, _out = self.generate(GENERATOR, f"with-{name}.job.ps1", extra)
+            self.assertEqual(check_pace_mode_delta(normalise_identity(without.read_text(encoding="utf-8"), old_head),
+                                                   normalise_identity(with_switch.read_text(encoding="utf-8"), self.head)), [], name)
 
     def test_a_runner_without_the_switch_keeps_the_gated_behaviour_with_a_warning(self) -> None:
-        # a SourceCommit whose committed runner predates the switch (committed in the clone, never in the real repo)
-        runner = self.repo / "tools" / "profiling" / "run-release-gui-smoke.ps1"
-        original = runner.read_bytes()
-        try:
-            runner.write_bytes(original.replace(b"CpuPlayPaceInformational", b"CpuPlayPaceGone"))
-            subprocess.run(["git", "-C", str(self.repo), "-c", "user.name=t", "-c", "user.email=t@t", "commit", "-q", "-m", "predates the switch", "--", "tools/profiling/run-release-gui-smoke.ps1"], check=True)
-            old_head = subprocess.run(["git", "-C", str(self.repo), "rev-parse", "HEAD"], capture_output=True, text=True, check=True).stdout.strip()
-            job, out = self.generate(GENERATOR, "cpu-old-runner.job.ps1", ["-Backend", "cpu"], source_commit=old_head)
-            text = job.read_text(encoding="utf-8")
-            self.assertNotIn("-CpuPlayPaceInformational", text)
-            self.assertIn("cpuPaceInformational = $false", text)
-            self.assertIn("does not take -CpuPlayPaceInformational", out)
-            self.assertEqual(self.timeouts(job)[0], 133000, "no switch, no extended budget")
-        finally:
-            subprocess.run(["git", "-C", str(self.repo), "reset", "-q", "--soft", self.head], check=True)
-            subprocess.run(["git", "-C", str(self.repo), "checkout", "-q", self.head, "--", "tools/profiling/run-release-gui-smoke.ps1"], check=True)
+        job, out, _old_head = self.generate_with_runner_lacking_the_switch("cpu-old-runner.job.ps1", ["-Backend", "cpu"])
+        text = job.read_text(encoding="utf-8")
+        self.assertNotIn("-CpuPlayPaceInformational", text)
+        self.assertIn("cpuPaceInformational = $false", text)
+        self.assertIn("does not take -CpuPlayPaceInformational", out)
+        self.assertLess(self.timeouts(job)[0], self.cpu_ceiling_sec() * 1000, "no switch, no extended budget")
 
 
 if __name__ == "__main__":
