@@ -219,8 +219,9 @@ subject, so a cuda receipt and a cpu receipt are different subjects.
 
 ## LOOK legs and contact sheets
 
-*Contact frames after a PresentMon wait failure (DVE-LEG-TERMINALS-1).* The app captures the contact-sheet frames in a **seek** pass
-(`--contact-sheet-seek-mode`: it never plays) inside the smoke child, after the measured session's own summary line, and PresentMon is
+*Contact frames after a PresentMon wait failure (DVE-LEG-TERMINALS-1).* The app grabs the contact-sheet frames during the measured Play
+(in-pass, `playback_path=true`, CONTACT-SHEET-PLAYBACK-PARITY-1) and writes them inside the smoke child after the measured session's own
+summary line (an optional paired seek capture, `-ContactSheetPairedSeek`, is written there too), and PresentMon is
 only waited on once that child has returned. A PresentMon wait failure therefore leaves the captured frames on the venue with nothing to
 re-run; the job now publishes them (`contact-sheet\raw`) plus a `compose-status.txt` marker (`CONTACT_SHEET_COMPOSE_UNAVAILABLE ...`: the sheet
 is not composed on the venue, whose labels need the eligibility verdict this branch exits before). The runner keeps the frames and

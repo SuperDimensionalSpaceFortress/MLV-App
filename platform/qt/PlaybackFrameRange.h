@@ -102,6 +102,29 @@ inline int contactSheetTargetFrame( int i, int frameCount, int startFrame, int e
         std::lround( fraction * static_cast<double>( endFrame - startFrame ) ) );
 }
 
+// CONTACT-SHEET-PLAYBACK-PARITY-1: the in-pass contact sheet grabs the first frame PRESENTED by the
+// measured Play at or after each target time, measured from the Play's own start. Targets are the
+// centres of frameCount equal slices of the play window, so each lies strictly inside it whatever fps
+// the leg reaches (a frame-number target past the last frame a slow leg reaches would never fire, and
+// there is no replay to catch it). 0 when frameCount <= 0.
+inline long long contactSheetInPassTargetMs( int i, int frameCount, long long windowMs )
+{
+    if( frameCount <= 0 || windowMs <= 0 ) return 0;
+    return static_cast<long long>( std::llround(
+        ( 2.0 * i + 1.0 ) * static_cast<double>( windowMs ) / ( 2.0 * frameCount ) ) );
+}
+
+// The in-pass grabs run on the GUI thread inside the measured interval. The honest companion to the
+// leg's fps is the fps with their recorded cost taken out of the elapsed time: equal to the measured
+// fps when nothing was grabbed, never lower. A grab total that swallows the interval is a broken
+// record and yields 0, never an infinite fps.
+inline double fpsExcludingGrabCost( long long presentedFrames, double elapsedMs, double grabTotalMs )
+{
+    const double usableMs = elapsedMs - std::max( 0.0, grabTotalMs );
+    if( presentedFrames <= 0 || elapsedMs <= 0.0 || usableMs <= 0.0 ) return 0.0;
+    return static_cast<double>( presentedFrames ) * 1000.0 / usableMs;
+}
+
 struct DropFrameTickResult
 {
     double position = 0.0;

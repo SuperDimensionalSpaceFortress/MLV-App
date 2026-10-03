@@ -231,6 +231,11 @@ param(
     [switch]$ContactSheet,
     [ValidateRange(1, 60)]
     [int]$ContactSheetFrames = 6,
+    # CONTACT-SHEET-PLAYBACK-PARITY-1: the -ContactSheet frames are grabbed DURING the measured Play
+    # (in-pass, playback_path=true, no replay). This switch also asks the app for a paired SEEK
+    # capture of the same frames after the Play stops (--contact-sheet-seek-dir; it never plays,
+    # playback_path=false), published apart under paired-seek\contact-sheet\raw. Off by default.
+    [switch]$ContactSheetPairedSeek,
 
     # CUDA-PLAYBACK-PRESENT-CADENCE-1 round 2 discriminating legs. HEAVY (default, unchanged
     # behavior for every existing caller) keeps every diagnostic env var PLAYBACK-ATTR-3-CUDA
@@ -486,6 +491,7 @@ $fixtureRehearsalLiteral = if ($isFixtureRehearsal) { '$true' } else { '$false' 
 # a plain bool/int literal substituted into the template, never caller text.
 $contactSheetEnabledLiteral = if ($ContactSheet) { '$true' } else { '$false' }
 $contactSheetFrameCountLiteral = [string]$ContactSheetFrames
+$contactSheetPairedSeekLiteral = if ($ContactSheet -and $ContactSheetPairedSeek) { '$true' } else { '$false' }
 
 # ATTR3-FIXTURE-STAGE-1. The compound suffix the two tracked fixtures carry is never spelled
 # as one literal token anywhere in this file: a token ending in it trips this repository's own
@@ -949,6 +955,7 @@ $FixtureRehearsal = __FIXTURE_REHEARSAL__
 $FixtureSha256 = '__FIXTURE_SHA256__'
 $ContactSheetEnabled = __CONTACT_SHEET_ENABLED__
 $ContactSheetFrameCount = __CONTACT_SHEET_FRAME_COUNT__
+$ContactSheetPairedSeek = __CONTACT_SHEET_PAIRED_SEEK__
 $ContactSheetComposerPyBase64 = '__CONTACT_SHEET_COMPOSER_PY_BASE64__'
 $ContactSheetComposerSha256 = '__CONTACT_SHEET_COMPOSER_SHA256__'
 $TelemetryArm = '__TELEMETRY_ARM__'
@@ -2484,10 +2491,15 @@ $contactSheetDir = $null
 if ($ContactSheetEnabled) {
     $contactSheetDir = Join-Path $Work 'contact-sheet'
     New-Item -ItemType Directory -Path $contactSheetDir -Force | Out-Null
-    # PLAYBACK-CLIP-LENGTH-ENFORCE-2 (owner rule 2026-09-30): ALWAYS seek mode. The app's default
-    # playback-mode contact sheet is a second Play of the measured span (a replay) and is refused
-    # (REPLAY_REFUSED); the seek capture never plays. Its sidecars record playback_path=false.
-    $contactSheetAdditionalArgs = "@('--contact-sheet-dir', $(ConvertTo-PsSingleQuoted $contactSheetDir), '--contact-sheet-frames', '$ContactSheetFrameCount', '--contact-sheet-seek-mode')"
+    # CONTACT-SHEET-PLAYBACK-PARITY-1: the app's default capture grabs the frames DURING the measured
+    # Play (in-pass, playback_path=true, no replay; its readback cost is recorded per frame), so the
+    # sheet shows what played. A seek sheet (playback_path=false: a seeked frame takes a different
+    # render path and can look different) is added only when -ContactSheetPairedSeek asks for it.
+    $contactSheetAdditionalArgs = "@('--contact-sheet-dir', $(ConvertTo-PsSingleQuoted $contactSheetDir), '--contact-sheet-frames', '$ContactSheetFrameCount')"
+    if ($ContactSheetPairedSeek) {
+        $contactSheetSeekDir = Join-Path $Work 'contact-sheet-seek'
+        $contactSheetAdditionalArgs = "@('--contact-sheet-dir', $(ConvertTo-PsSingleQuoted $contactSheetDir), '--contact-sheet-frames', '$ContactSheetFrameCount', '--contact-sheet-seek-dir', $(ConvertTo-PsSingleQuoted $contactSheetSeekDir))"
+    }
     $cmd = "$cmd -AdditionalArgs $contactSheetAdditionalArgs"
 }
 # CUDA-PERF-DISPLAY-IDENTITY-HARNESS-1/2/3 (sol BLOCKER 2 / fable HARDENING, direction corrected
@@ -3011,8 +3023,8 @@ if ($null -ne $presentMonWaitError) {
         $waitFailureGpuSummary = $null
         $waitFailureGpuFramesTotal = $null
     }
-    # DVE-LEG-TERMINALS-1 item 4: the app's contact-sheet capture is a SEEK pass inside the smoke child, run after the measured session's own summary line
-    # (--contact-sheet-seek-mode: it never plays), and PresentMon is only waited on once that child has returned -- so a wait failure leaves the captured
+    # DVE-LEG-TERMINALS-1 item 4: the app writes its contact-sheet files inside the smoke child, after the measured session's own summary line (since
+    # CONTACT-SHEET-PLAYBACK-PARITY-1 the frames are grabbed during the measured Play and written after it), and PresentMon is only waited on once that child has returned -- so a wait failure leaves the captured
     # frames in $contactSheetDir and nothing to re-run. They are published here (this branch never did, so the leg had no frame at all). Nothing measured can
     # change: this runs after the smoke child, after the run log and the counters above are read, and writes only under contact-sheet\. The sheet itself is not
     # composed here (its labels need the eligibility verdict, which this branch exits before); the marker below says so and makes the runner keep the frames.
@@ -3684,6 +3696,11 @@ Save-Json ([ordered]@{
 # artifact index below so these land in it the same way every other published file does.
 if ($ContactSheetEnabled -and $contactSheetDir -and (Test-Path -LiteralPath $contactSheetDir)) {
     $contactSheetPubDir = Publish-AttrCudaContactSheetRawCaptures -Enabled $ContactSheetEnabled -SourceDir $contactSheetDir -PubRoot $Pub
+    # CONTACT-SHEET-PLAYBACK-PARITY-1: the paired seek capture, when asked for, publishes under its own
+    # labelled root (paired-seek\contact-sheet\raw), never mixed into the in-pass frames above.
+    if ($ContactSheetPairedSeek) {
+        [void](Publish-AttrCudaContactSheetRawCaptures -Enabled $ContactSheetEnabled -SourceDir (Join-Path $Work 'contact-sheet-seek') -PubRoot (Join-Path $Pub 'paired-seek'))
+    }
     # CUDA-PLAYBACK-CONTACT-SHEET-1 r1b: compose the raw captures into one labelled sheet +
     # stats sidecar right here, in the job's publish step, so a reader gets the composed
     # artifact without running make-contact-sheet.py by hand. Pillow/numpy (and Python
@@ -4013,6 +4030,7 @@ $text = Expand-AttrCudaTemplate -Template $template -Tokens ([ordered]@{
     FIXTURE_SHA256 = $FixtureSha256
     CONTACT_SHEET_ENABLED = $contactSheetEnabledLiteral
     CONTACT_SHEET_FRAME_COUNT = $contactSheetFrameCountLiteral
+    CONTACT_SHEET_PAIRED_SEEK = $contactSheetPairedSeekLiteral
     CONTACT_SHEET_COMPOSER_PY_BASE64 = $contactSheetComposerPyBase64
     CONTACT_SHEET_COMPOSER_SHA256 = $contactSheetComposerSha256ForTemplate
     TELEMETRY_ARM = $TelemetryArm

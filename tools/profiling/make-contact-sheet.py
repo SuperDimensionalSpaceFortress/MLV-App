@@ -263,6 +263,35 @@ def channel_stats(image):
     }
 
 
+def _playback_path_token(value):
+    """'true' / 'false' for a sidecar's playback_path, 'unknown' when a sidecar predates the field."""
+    if value is True:
+        return "true"
+    if value is False:
+        return "false"
+    return "unknown"
+
+
+def tile_label(sidecar):
+    """CONTACT-SHEET-PLAYBACK-PARITY-1: every tile says whether it is a frame the playback path
+    presented (playback_path=true, in-pass) or a seek render (false), so a seek tile -- which takes a
+    different render path and can look different -- is never read as what played."""
+    return "frame {index} @ {elapsed_ms:.0f}ms (disp {display_frame}) playback_path={pp}".format(
+        index=sidecar.get("index", -1),
+        elapsed_ms=float(sidecar.get("elapsed_ms", 0.0)),
+        display_frame=sidecar.get("display_frame", -1),
+        pp=_playback_path_token(sidecar.get("playback_path")),
+    )
+
+
+def sheet_playback_path(frames):
+    """The whole sheet's playback_path: true/false when every tile agrees, else mixed (or unknown)."""
+    tokens = {_playback_path_token(f.get("playback_path")) for f in frames}
+    if len(tokens) == 1:
+        return tokens.pop()
+    return "mixed" if tokens else "unknown"
+
+
 def build_tile(image, sidecar, tile_size, font):
     thumb = image.convert("RGB").copy()
     thumb.thumbnail(tile_size, Image.LANCZOS)
@@ -271,11 +300,7 @@ def build_tile(image, sidecar, tile_size, font):
     tile.paste(thumb, offset)
 
     draw = ImageDraw.Draw(tile)
-    label = "frame {index} @ {elapsed_ms:.0f}ms (disp {display_frame})".format(
-        index=sidecar.get("index", -1),
-        elapsed_ms=float(sidecar.get("elapsed_ms", 0.0)),
-        display_frame=sidecar.get("display_frame", -1),
-    )
+    label = tile_label(sidecar)
     label_y = tile_size[1] - TILE_LABEL_HEIGHT + 4
     draw.rectangle([0, tile_size[1] - TILE_LABEL_HEIGHT, tile_size[0], tile_size[1]], fill=(0, 0, 0))
     draw.text((4, label_y), label, fill=(255, 255, 255), font=font)
@@ -329,7 +354,7 @@ def build_header_lines(args, frames):
             scale=args.scale or "unknown",
         ),
         f"look_assist: {look_assist_summary}",
-        f"render_path(majority)={_majority_render_path(frames)}",
+        f"render_path(majority)={_majority_render_path(frames)}  playback_path={sheet_playback_path(frames)}",
         f"captured_utc={capture_time}  frames={len(frames)}",
     ]
     if non_playback_count:
