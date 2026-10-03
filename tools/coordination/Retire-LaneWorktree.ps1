@@ -43,9 +43,42 @@
       budget    after -BudgetSeconds no further worktree is examined; the remainder is reported as
                 notReached, never assumed done.
     Returns one summary object (schema mlv-app/merged-worktree-sweep/v1) and never throws.
+
+    FAIR ORDER (2026-10-03, DISK-SWEEP-FAIR-ORDER-1): candidates are visited least-recently-examined
+    first. A stable `git worktree list` order let the same long-lived unmerged/dirty head eat the
+    whole budget on every exit (11 of 21 never reached). After the gate returns for a worktree
+    (anything but retired) the sweep writes a UTC stamp to <gitdir>\mlv-sweep-examined; missing =
+    oldest, ties keep list order. The stamp lives in the git admin dir, never in the worktree, and
+    the young guard reads only HEAD/index mtimes and the dir CreationTime, so it cannot age a worktree.
+    Summary adds examined (gate calls), elapsedMs, stampWriteFailed. The gate itself was ~36 s per
+    worktree, ~93% in two CIM scans, so the sweep passes ONE process snapshot (-ProcessSnapshot).
 #>
 
-$script:RetireDebrisPattern = '(^|/)(__pycache__|\.pytest_cache|\.hypothesis|build-release|build-debug|build-avx-parity|build-console)/$|\.pyc$'
+$script:SweepStampName = 'mlv-sweep-examined'
+$script:RetireDebrisPattern ='(^|/)(__pycache__|\.pytest_cache|\.hypothesis|build-release|build-debug|build-avx-parity|build-console)/$|\.pyc$'
+
+function Get-LaneProcessSnapshot {
+    # ONE Win32_Process scan, then the self/ancestor chain is walked IN MEMORY from its ParentProcessId
+    # column. Measured 2026-10-03: the old per-ancestor `Get-CimInstance -Filter "ProcessId=N"` loop cost
+    # ~31 s of a ~36 s gate call; the one full scan costs ~2.4 s. Throws when the scan fails (the caller
+    # turns that into cannot-determine, never into "no live process").
+    $all = @(Get-CimInstance Win32_Process -ErrorAction Stop)
+    $byPid = @{}
+    foreach ($p in $all) { $byPid[[int]$p.ProcessId] = $p }
+    $self = @($PID)
+    $node = $byPid[[int]$PID]
+    $pp = if ($node) { $node.ParentProcessId } else { 0 }
+    while ($pp -and $self -notcontains $pp) {
+        $self += $pp
+        $node = $byPid[[int]$pp]
+        $pp = if ($node) { $node.ParentProcessId } else { 0 }
+    }
+    [pscustomobject]@{
+        Procs       = @($all | Where-Object { $_.CommandLine -and $self -notcontains $_.ProcessId })
+        SelfPids    = $self
+        CapturedUtc = (Get-Date).ToUniversalTime()
+    }
+}
 
 function Invoke-RetireLaneWorktree {
     [CmdletBinding()]
@@ -54,6 +87,10 @@ function Invoke-RetireLaneWorktree {
         [string]$MergeTarget = 'master',
         [string]$QuarantineRoot = '',
         [string[]]$ProtectPath = @(),
+        # Optional output of Get-LaneProcessSnapshot ({Procs; SelfPids}). Without it the gate takes its
+        # own snapshot, so a lone caller behaves exactly as before; the sweep passes one so N worktrees
+        # cost one process scan instead of N.
+        [object]$ProcessSnapshot = $null,
         [switch]$WhatIf
     )
     $d = [ordered]@{
@@ -83,9 +120,9 @@ function Invoke-RetireLaneWorktree {
             if ($p -and ([IO.Path]::GetFullPath($p) + '\').StartsWith($wd + '\', [StringComparison]::OrdinalIgnoreCase)) { $d.reason = "rundir-inside: $p"; return [pscustomobject]$d }
         }
 
-        $self = @($PID)
-        try { $pp = (Get-CimInstance Win32_Process -Filter "ProcessId=$PID").ParentProcessId; while ($pp -and $self -notcontains $pp) { $self += $pp; $pp = (Get-CimInstance Win32_Process -Filter "ProcessId=$pp" -ErrorAction Stop).ParentProcessId } } catch { }
-        $procs = @(Get-CimInstance Win32_Process -ErrorAction Stop | Where-Object { $_.CommandLine -and $self -notcontains $_.ProcessId })
+        $snap = if ($null -ne $ProcessSnapshot) { $ProcessSnapshot } else { Get-LaneProcessSnapshot }
+        $self = @($snap.SelfPids)
+        $procs = @($snap.Procs | Where-Object { $_.CommandLine -and $self -notcontains $_.ProcessId })
         $slash = $wd -replace '\\', '/'
         $live = @($procs | Where-Object { $_.CommandLine.IndexOf($wd, [StringComparison]::OrdinalIgnoreCase) -ge 0 -or $_.CommandLine.IndexOf($slash, [StringComparison]::OrdinalIgnoreCase) -ge 0 })
         if ($live.Count) { $d.reason = 'live-process: ' + (($live | ForEach-Object { "$($_.ProcessId) $($_.Name)" }) -join ', '); return [pscustomobject]$d }
@@ -142,6 +179,12 @@ function Invoke-SweepMergedLaneWorktrees {
         [string[]]$ProtectPath = @(),
         [int]$MinIdleHours = 6,
         [int]$BudgetSeconds = 180,
+        # Cap on GATE CALLS this sweep (0 = no cap). A deterministic stand-in for the wall-clock budget so
+        # the fair-order tests do not depend on how slow the host's process scan happens to be.
+        [int]$MaxExamine = 0,
+        # A snapshot older than this is re-taken before the next gate call, so a process that starts
+        # naming a worktree mid-sweep is seen within this window rather than never.
+        [int]$SnapshotMaxAgeSeconds = 30,
         [switch]$WhatIf
     )
     $kept = [ordered]@{}
@@ -149,19 +192,38 @@ function Invoke-SweepMergedLaneWorktrees {
     $sum = [ordered]@{
         schema = 'mlv-app/merged-worktree-sweep/v1'; root = $Root; mergeTarget = $MergeTarget
         considered = 0; retired = @(); young = 0; kept = $kept; notReached = 0; error = $null
+        examined = 0; stampWriteFailed = 0; elapsedMs = 0
         utc = (Get-Date).ToUniversalTime().ToString('o')
     }
+    $sw = [Diagnostics.Stopwatch]::StartNew()
     function Add-Kept([string]$Reason) {
         $k = if ($Reason) { ($Reason -split ':', 2)[0].Trim() } else { 'unknown' }
         if ($kept.Contains($k)) { $kept[$k] = [int]$kept[$k] + 1 } else { $kept[$k] = 1 }
     }
     function Get-FullNoSlash([string]$P) { [IO.Path]::GetFullPath(($P -replace '/', '\')).TrimEnd('\') }
+    # The worktree's git admin dir (<common>\worktrees\<name>), from the `gitdir:` line of its .git file.
+    function Get-WorktreeGitDir([string]$Wt) {
+        $gf = Join-Path $Wt '.git'
+        $m = [regex]::Match((Get-Content -LiteralPath $gf -Raw -ErrorAction Stop), '(?m)^gitdir:\s*(.+?)\s*$')
+        if (-not $m.Success) { throw "no gitdir line in $gf" }
+        $g = $m.Groups[1].Value -replace '/', '\'
+        if (-not [IO.Path]::IsPathRooted($g)) { $g = Join-Path $Wt $g }
+        $g
+    }
+    # Last-examined stamp in UTC ticks; missing or unreadable = 0 = oldest, so a never-examined worktree
+    # is always visited before one that has been looked at.
+    function Get-ExaminedTicks([string]$Wt) {
+        try {
+            $raw = (Get-Content -LiteralPath (Join-Path (Get-WorktreeGitDir $Wt) $script:SweepStampName) -Raw -ErrorAction Stop).Trim()
+            $t = [DateTime]::Parse($raw, [Globalization.CultureInfo]::InvariantCulture, [Globalization.DateTimeStyles]::AdjustToUniversal -bor [Globalization.DateTimeStyles]::AssumeUniversal)
+            [long]$t.Ticks
+        } catch { [long]0 }
+    }
     try {
-        $sw = [Diagnostics.Stopwatch]::StartNew()
         $rootFull = Get-FullNoSlash $Root
         $excl = @($Exclude | Where-Object { $_ } | ForEach-Object { Get-FullNoSlash $_ })
         $o = @(& git.exe -C $RepoRoot worktree list --porcelain 2>&1 | ForEach-Object { "$_" })
-        if ($LASTEXITCODE -ne 0) { $sum.error = 'cannot-determine: worktree list: ' + ($o -join ' | '); return [pscustomobject]$sum }
+        if ($LASTEXITCODE -ne 0) { $sum.error = 'cannot-determine: worktree list: ' + ($o -join ' | '); $sum.elapsedMs = [int]$sw.ElapsedMilliseconds; return [pscustomobject]$sum }
 
         $cands = @()
         foreach ($line in $o) {
@@ -173,18 +235,24 @@ function Invoke-SweepMergedLaneWorktrees {
         }
         $sum.considered = $cands.Count
 
+        # FAIR ORDER: least-recently-examined first (missing stamp = oldest; ties keep `git worktree
+        # list` order). `git worktree list` order is stable, and a budgeted sweep in a stable order
+        # starves its tail whenever the head is permanently kept (long-lived unmerged or dirty
+        # worktrees): measured 2026-10-03, 11 of 21 candidates were never reached. No randomness.
+        $keyed = for ($k = 0; $k -lt $cands.Count; $k++) { [pscustomobject]@{ Path = $cands[$k]; Ticks = (Get-ExaminedTicks $cands[$k]); Idx = $k } }
+        $cands = @($keyed | Sort-Object -Property Ticks, Idx | ForEach-Object { $_.Path })
+
+        $snap = $null
         for ($i = 0; $i -lt $cands.Count; $i++) {
             $wt = $cands[$i]
-            if ($sw.Elapsed.TotalSeconds -ge $BudgetSeconds) { $sum.notReached = $cands.Count - $i; break }
+            if ($sw.Elapsed.TotalSeconds -ge $BudgetSeconds -or ($MaxExamine -gt 0 -and $sum.examined -ge $MaxExamine)) { $sum.notReached = $cands.Count - $i; break }
 
             # YOUNG guard: `git worktree add` leaves a clean tree already at the merge target that
             # no process names yet; the SAFE gate alone would retire it before its lane starts.
+            # It reads ONLY {worktree dir CreationTime, <gitdir>\HEAD mtime, <gitdir>\index mtime}: the
+            # examined stamp written below is a new file in <gitdir>, which touches none of the three.
             try {
-                $gf = Join-Path $wt '.git'
-                $m = [regex]::Match((Get-Content -LiteralPath $gf -Raw -ErrorAction Stop), '(?m)^gitdir:\s*(.+?)\s*$')
-                if (-not $m.Success) { throw "no gitdir line in $gf" }
-                $gdir = $m.Groups[1].Value -replace '/', '\'
-                if (-not [IO.Path]::IsPathRooted($gdir)) { $gdir = Join-Path $wt $gdir }
+                $gdir = Get-WorktreeGitDir $wt
                 $stamps = @(
                     (Get-Item -LiteralPath $wt -ErrorAction Stop).CreationTimeUtc,
                     (Get-Item -LiteralPath (Join-Path $gdir 'HEAD') -ErrorAction Stop).LastWriteTimeUtc,
@@ -196,17 +264,36 @@ function Invoke-SweepMergedLaneWorktrees {
             }
             if (((Get-Date).ToUniversalTime() - $newest).TotalHours -lt $MinIdleHours) { $sum.young++; continue }
 
+            $sum.examined++
+            $action = 'kept'
             try {
+                # One process scan serves many gate calls; re-taken when stale. If the scan fails,
+                # pass nothing and let the gate take its own (it reports cannot-determine, never a pass).
+                if ($null -eq $snap -or ((Get-Date).ToUniversalTime() - $snap.CapturedUtc).TotalSeconds -ge $SnapshotMaxAgeSeconds) {
+                    $snap = try { Get-LaneProcessSnapshot } catch { $null }
+                }
                 $d = Invoke-RetireLaneWorktree -WorkDir $wt -MergeTarget $MergeTarget -QuarantineRoot $QuarantineRoot `
-                    -ProtectPath $ProtectPath -WhatIf:$WhatIf
+                    -ProtectPath $ProtectPath -ProcessSnapshot $snap -WhatIf:$WhatIf
+                $action = $d.action
                 if ($d.action -in @('retired', 'would-retire')) { $retired.Add($wt) } else { Add-Kept $d.reason }
             } catch {
                 Add-Kept "cannot-determine: $($_.Exception.Message)"
+            }
+            # Stamp every examined worktree the gate did not remove (kept, skipped, would-retire, or a
+            # gate that threw: a worktree that always fails must not hog the head of the queue). A
+            # retired worktree's admin dir is gone with it. A write failure is a bookkeeping failure,
+            # not a verdict: it is counted apart from kept{} (so sum(kept) stays one reason per
+            # worktree) and never fails the sweep; the worktree merely stays "oldest" next time.
+            if ($action -ne 'retired') {
+                try {
+                    [IO.File]::WriteAllText((Join-Path (Get-WorktreeGitDir $wt) $script:SweepStampName), (Get-Date).ToUniversalTime().ToString('o'))
+                } catch { $sum.stampWriteFailed++ }
             }
         }
     } catch {
         $sum.error = "cannot-determine: $($_.Exception.Message)"
     }
     $sum.retired = @($retired)
+    $sum.elapsedMs = [int]$sw.ElapsedMilliseconds
     return [pscustomobject]$sum
 }
