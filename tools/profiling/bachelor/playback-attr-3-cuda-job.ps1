@@ -944,7 +944,7 @@ if ($cpuPlayPaceInformational) {
     $timeBudgetArgs['PlaySeconds'] = [int][Math]::Max($timeBudgetArgs['PlaySeconds'],
         [Math]::Ceiling((Get-GuiSmokePlaySafetyMs -Seconds $PlaySeconds -CpuPaceInformational) / 1000.0))
     # CPU-LEG-SMOKE-CEILING-1: the runner caps a process timeout at 3600 s, and a ~3.2 GB owner input at the measured read rate plus that 765 s ceiling does not fit it
-    # with the identity read repeated at full margin. The budget shares the 3600 s instead (see Get-AttrCudaLegTimeBudget); CUDA and fixtures never ask for it.
+    # with the identity read repeated at full margin. The budget shares the 3600 s instead (see Get-AttrCudaLegTimeBudget); CUDA never asks for it (a fixture CPU leg does, but has zero input bytes and so never clamps).
     $timeBudgetArgs['ShareSmokeCeiling'] = $true
 }
 $timeBudget = Get-AttrCudaLegTimeBudget -InputBytes $clipBytesForBudget @timeBudgetArgs
@@ -1009,6 +1009,10 @@ $PresentMonTimedSeconds = __PRESENTMON_TIMED_SECONDS__
 $PresentMonTerminateOnProcExit = __PRESENTMON_TERMINATE_ON_PROC_EXIT__
 $PresentMonSessionName = ''
 $SmokeProcessTimeoutMs = __SMOKE_PROCESS_TIMEOUT_MS__
+# CPU-LEG-SMOKE-CEILING-1: whether the smoke timeout was held at the runner's 3600 s ceiling, and the in-runner re-read allowance that left (traced at job start, so a
+# process timeout on a clamped leg is attributable from the evidence log). A leg that never asked for the shared ceiling traces false and its full identity-read allowance.
+$SmokeCeilingClamped = __SMOKE_CEILING_CLAMPED__
+$AppReadAllowanceSec = __APP_READ_ALLOWANCE_SEC__
 $PlaySeconds = __PLAY_SECONDS__
 # BACHELOR-OWNER-CLIP-STAGE-STALL-1 round 1f: true only when the smoke runner COMMITTED at this leg's
 # -SourceCommit declares -VerifiedClipBindingPath and -TracePath (decided by the generator from those
@@ -1042,7 +1046,7 @@ function Save-Json($Object, [string]$Path) {
 function Write-JobTrace([string]$Message) {
     Add-AttrCudaTraceLine -TracePath $Trace -Message $Message
 }
-Write-JobTrace "job start id=$JobId commit=$($SourceCommit.Substring(0,12)) clip=$ClipId fixture=$FixtureRehearsal smokeProcessTimeoutMs=$SmokeProcessTimeoutMs"
+Write-JobTrace "job start id=$JobId commit=$($SourceCommit.Substring(0,12)) clip=$ClipId fixture=$FixtureRehearsal smokeProcessTimeoutMs=$SmokeProcessTimeoutMs smokeCeilingClamped=$SmokeCeilingClamped appReadAllowanceSec=$AppReadAllowanceSec"
 
 # CUDA-PERF-DISPLAY-WAKE-2 round 1c: THE VERY FIRST ACTION this job takes after claim, before the
 # TEMP boundary, before $Work/$Pub are even created, before footage resolution, before package/
@@ -4055,6 +4059,8 @@ $text = Expand-AttrCudaTemplate -Template $template -Tokens ([ordered]@{
     TELEMETRY_ARM = $TelemetryArm
     DISABLE_PAINT_PER_SUBMIT = $disablePaintPerSubmitLiteral
     SMOKE_PROCESS_TIMEOUT_MS = [string]$timeBudget.smokeProcessTimeoutMs
+    SMOKE_CEILING_CLAMPED = $(if ($timeBudget.smokeCeilingClamped) { '$true' } else { '$false' })
+    APP_READ_ALLOWANCE_SEC = [string][int]$timeBudget.appReadAllowanceSec
     PLAY_SECONDS = [string]$PlaySeconds
     RUNNER_ACCEPTS_VERIFIED_CLIP_BINDING = $runnerAcceptsVerifiedClipBindingLiteral
     # DUAL-VENUE-EVIDENCE-1: each default below expands to exactly the text that was literal before.
