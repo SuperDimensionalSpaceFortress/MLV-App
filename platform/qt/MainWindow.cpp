@@ -16482,11 +16482,16 @@ void MainWindow::applyLookAssistToReceipt( ReceiptSettings *receipt,
     // a colour rule cannot tell the owner clip from a cool-white LED night). It APPLIES only when the aperture-bounded
     // exposure rules night out and a verified surface backs the balance (LOOK-ASSIST-M16-NOT-NIGHT-1): then the verdict,
     // stats and preset are the check's (shared with headless), so the night walk below does not run. Never in master's pass.
+    // Its verification and surface-search renders use the isolated read-only renderer: no processing, cache or llrawproc
+    // state moves.
     LookAssistStats windowLitStats = stats;
     LookAssistScene windowLitScene = scene;
     LookAssistPreset windowLitPreset = preset;
     LookAssistWhiteBalanceRequest windowLitRequest = wbRequest;
     windowLitRequest.stats = &windowLitStats;
+    windowLitRequest.renderBalance = ReceiptApplier::lookAssistMeasureOnlyRenderer(
+        m_pMlvObject, analysisFrame, colorDownscaleFactor, colorWidth, colorHeight,
+        qMax( 1, mlvappEffectiveWorkerThreadCount() ) );
     const LookAssistWindowLitCheck windowLit = resolveLookAssistWindowLitInterior(
         windowLitRequest, wb, m_pMlvObject->processing->exposure_stops, &windowLitStats, &windowLitScene, &windowLitPreset,
         useProcessedColorStats ? &processedColorStats : nullptr,

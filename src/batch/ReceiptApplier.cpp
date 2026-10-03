@@ -598,13 +598,33 @@ bool ReceiptApplier::processedThumbnailAtBalance(mlvObject_t *mlvObject,
     settings.white_balance_tint = tint / 10.0;
     settings.exposure_stops = exposureStops;
 
-    const int rendered = isolated
-        ? get_area_average_downscale_thumnail_with_processing_cachefree(
-              mlvObject, frameIndex, downscaleFactor, qMax( 1, cpuCores ), clone, &settings, outBuffer )
-        : get_area_average_downscale_thumnail_with_processing(
-              mlvObject, frameIndex, downscaleFactor, qMax( 1, cpuCores ), clone, &settings, outBuffer );
+    int rendered = 0;
+    if( isolated )
+    {
+        // Cache-free AND read-only on llrawproc: the raw read cannot prepare, search or version the shared pixel maps,
+        // reset the force-search state or claim the stripe one-shot (it works on a per-thread shadow instead).
+        const int previousReadOnly = llrpSetIsolatedAnalysisSharedStateReadOnlyForCurrentThread( 1 );
+        rendered = get_area_average_downscale_thumnail_with_processing_cachefree(
+            mlvObject, frameIndex, downscaleFactor, qMax( 1, cpuCores ), clone, &settings, outBuffer );
+        llrpSetIsolatedAnalysisSharedStateReadOnlyForCurrentThread( previousReadOnly );
+    }
+    else
+    {
+        rendered = get_area_average_downscale_thumnail_with_processing(
+            mlvObject, frameIndex, downscaleFactor, qMax( 1, cpuCores ), clone, &settings, outBuffer );
+    }
     processingFreeClone( clone );
     return rendered != 0;
+}
+
+LookAssistRenderBalanceFn ReceiptApplier::lookAssistMeasureOnlyRenderer(mlvObject_t *mlvObject,
+                                                                       int frameIndex,
+                                                                       int downscaleFactor,
+                                                                       int thumbWidth,
+                                                                       int thumbHeight,
+                                                                       int cpuCores)
+{
+    return lookAssistBalanceRenderer( mlvObject, frameIndex, downscaleFactor, thumbWidth, thumbHeight, cpuCores, true );
 }
 
 LookAssistRenderBalanceFn ReceiptApplier::lookAssistBalanceRenderer(mlvObject_t *mlvObject,
@@ -911,11 +931,14 @@ bool ReceiptApplier::applyHeadlessLookAssist(ReceiptSettings *receipt,
     }
     // The window-lit check runs on copies (the GUI does the same; see there): by colour alone it only logs; it APPLIES
     // when the aperture-bounded exposure rules night out and a verified surface backs the balance. Never in master's pass.
+    // Its verification and surface-search renders go through the isolated read-only renderer, so no shared state moves.
     LookAssistStats windowLitStats = stats;
     LookAssistScene windowLitScene = scene;
     LookAssistPreset windowLitPreset = preset;
     LookAssistWhiteBalanceRequest windowLitRequest = wbRequest;
     windowLitRequest.stats = &windowLitStats;
+    windowLitRequest.renderBalance = lookAssistMeasureOnlyRenderer( mlvObject, frameIndex, colorDownscaleFactor,
+                                                                    colorWidth, colorHeight, 1 );
     const LookAssistWindowLitCheck windowLit = resolveLookAssistWindowLitInterior(
         windowLitRequest, wb, mlvObject->processing->exposure_stops, &windowLitStats, &windowLitScene, &windowLitPreset,
         useProcessedColorStats ? &processedColorStats : nullptr );
