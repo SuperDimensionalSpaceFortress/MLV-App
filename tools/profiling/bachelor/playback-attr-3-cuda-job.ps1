@@ -231,6 +231,11 @@ param(
     [switch]$ContactSheet,
     [ValidateRange(1, 60)]
     [int]$ContactSheetFrames = 6,
+    # CONTACT-SHEET-PLAYBACK-PARITY-1: the -ContactSheet frames are grabbed DURING the measured Play
+    # (in-pass, playback_path=true, no replay). This switch also asks the app for a paired SEEK
+    # capture of the same frames after the Play stops (--contact-sheet-seek-dir; it never plays,
+    # playback_path=false), published apart under paired-seek\contact-sheet\raw. Off by default.
+    [switch]$ContactSheetPairedSeek,
 
     # CUDA-PLAYBACK-PRESENT-CADENCE-1 round 2 discriminating legs. HEAVY (default, unchanged
     # behavior for every existing caller) keeps every diagnostic env var PLAYBACK-ATTR-3-CUDA
@@ -492,6 +497,7 @@ $fixtureRehearsalLiteral = if ($isFixtureRehearsal) { '$true' } else { '$false' 
 # a plain bool/int literal substituted into the template, never caller text.
 $contactSheetEnabledLiteral = if ($ContactSheet) { '$true' } else { '$false' }
 $contactSheetFrameCountLiteral = [string]$ContactSheetFrames
+$contactSheetPairedSeekLiteral = if ($ContactSheet -and $ContactSheetPairedSeek) { '$true' } else { '$false' }
 
 # ATTR3-FIXTURE-STAGE-1. The compound suffix the two tracked fixtures carry is never spelled
 # as one literal token anywhere in this file: a token ending in it trips this repository's own
@@ -943,8 +949,15 @@ $timeBudgetArgs['PlaySeconds'] = [int][Math]::Max(40, $PlaySeconds)
 if ($cpuPlayPaceInformational) {
     $timeBudgetArgs['PlaySeconds'] = [int][Math]::Max($timeBudgetArgs['PlaySeconds'],
         [Math]::Ceiling((Get-GuiSmokePlaySafetyMs -Seconds $PlaySeconds -CpuPaceInformational) / 1000.0))
+    # CPU-LEG-SMOKE-CEILING-1: the runner caps a process timeout at 3600 s, and a ~3.2 GB owner input at the measured read rate plus that 765 s ceiling does not fit it
+    # with the identity read repeated at full margin. The budget shares the 3600 s instead (see Get-AttrCudaLegTimeBudget); CUDA never asks for it (a fixture CPU leg does, but has zero input bytes and so never clamps).
+    $timeBudgetArgs['ShareSmokeCeiling'] = $true
 }
 $timeBudget = Get-AttrCudaLegTimeBudget -InputBytes $clipBytesForBudget @timeBudgetArgs
+if ($timeBudget.smokeCeilingClamped) {
+    Write-Warning ("CPU-LEG-SMOKE-CEILING-1: this cpu leg's smoke timeout is held at the runner's 3600 s ceiling; the app's in-runner re-read allowance is $($timeBudget.appReadAllowanceSec) s " +
+        "(the job's own identity read keeps $($timeBudget.identityReadSec) s in the um-run timeout of $($timeBudget.jobTimeoutSec) s).")
+}
 
 # --- job body template (placeholders are substituted below; the body itself never
 #     touches this generator's variables directly, so there is no accidental capture
@@ -972,6 +985,9 @@ $FixtureRehearsal = __FIXTURE_REHEARSAL__
 $FixtureSha256 = '__FIXTURE_SHA256__'
 $ContactSheetEnabled = __CONTACT_SHEET_ENABLED__
 $ContactSheetFrameCount = __CONTACT_SHEET_FRAME_COUNT__
+# CONTACT-SHEET-PLAYBACK-PARITY-1 >>>
+$ContactSheetPairedSeek = __CONTACT_SHEET_PAIRED_SEEK__
+# CONTACT-SHEET-PLAYBACK-PARITY-1 <<<
 $ContactSheetComposerPyBase64 = '__CONTACT_SHEET_COMPOSER_PY_BASE64__'
 $ContactSheetComposerSha256 = '__CONTACT_SHEET_COMPOSER_SHA256__'
 $TelemetryArm = '__TELEMETRY_ARM__'
@@ -1035,7 +1051,7 @@ function Save-Json($Object, [string]$Path) {
 function Write-JobTrace([string]$Message) {
     Add-AttrCudaTraceLine -TracePath $Trace -Message $Message
 }
-Write-JobTrace "job start id=$JobId commit=$($SourceCommit.Substring(0,12)) clip=$ClipId fixture=$FixtureRehearsal smokeProcessTimeoutMs=$SmokeProcessTimeoutMs"
+Write-JobTrace "job start id=$JobId commit=$($SourceCommit.Substring(0,12)) clip=$ClipId fixture=$FixtureRehearsal smokeProcessTimeoutMs=$SmokeProcessTimeoutMs__SMOKE_CEILING_TRACE__"
 
 # CUDA-PERF-DISPLAY-WAKE-2 round 1c: THE VERY FIRST ACTION this job takes after claim, before the
 # TEMP boundary, before $Work/$Pub are even created, before footage resolution, before package/
@@ -2558,6 +2574,17 @@ if ($ContactSheetEnabled) {
     # playback-mode contact sheet is a second Play of the measured span (a replay) and is refused
     # (REPLAY_REFUSED); the seek capture never plays. Its sidecars record playback_path=false.
     $contactSheetAdditionalArgs = "@('--contact-sheet-dir', $(ConvertTo-PsSingleQuoted $contactSheetDir), '--contact-sheet-frames', '$ContactSheetFrameCount', '--contact-sheet-seek-mode')"
+    # CONTACT-SHEET-PLAYBACK-PARITY-1 >>>
+    # Supersedes the line above: the app's default capture now grabs the frames DURING the measured
+    # Play (in-pass, playback_path=true, no replay; its readback cost is recorded per frame), so the
+    # sheet shows what played. A seek sheet (playback_path=false: a seeked frame takes a different
+    # render path and can look different) is added only when -ContactSheetPairedSeek asks for it.
+    $contactSheetAdditionalArgs = "@('--contact-sheet-dir', $(ConvertTo-PsSingleQuoted $contactSheetDir), '--contact-sheet-frames', '$ContactSheetFrameCount')"
+    if ($ContactSheetPairedSeek) {
+        $contactSheetSeekDir = Join-Path $Work 'contact-sheet-seek'
+        $contactSheetAdditionalArgs = "@('--contact-sheet-dir', $(ConvertTo-PsSingleQuoted $contactSheetDir), '--contact-sheet-frames', '$ContactSheetFrameCount', '--contact-sheet-seek-dir', $(ConvertTo-PsSingleQuoted $contactSheetSeekDir))"
+    }
+    # CONTACT-SHEET-PLAYBACK-PARITY-1 <<<
     $cmd = "$cmd -AdditionalArgs $contactSheetAdditionalArgs"
 }
 # CUDA-PERF-DISPLAY-IDENTITY-HARNESS-1/2/3 (sol BLOCKER 2 / fable HARDENING, direction corrected
@@ -3754,6 +3781,13 @@ Save-Json ([ordered]@{
 # artifact index below so these land in it the same way every other published file does.
 if ($ContactSheetEnabled -and $contactSheetDir -and (Test-Path -LiteralPath $contactSheetDir)) {
     $contactSheetPubDir = Publish-AttrCudaContactSheetRawCaptures -Enabled $ContactSheetEnabled -SourceDir $contactSheetDir -PubRoot $Pub
+    # CONTACT-SHEET-PLAYBACK-PARITY-1 >>>
+    # The paired seek capture, when asked for, publishes under its own labelled root
+    # (paired-seek\contact-sheet\raw), never mixed into the in-pass frames above.
+    if ($ContactSheetPairedSeek) {
+        [void](Publish-AttrCudaContactSheetRawCaptures -Enabled $ContactSheetEnabled -SourceDir (Join-Path $Work 'contact-sheet-seek') -PubRoot (Join-Path $Pub 'paired-seek'))
+    }
+    # CONTACT-SHEET-PLAYBACK-PARITY-1 <<<
     # CUDA-PLAYBACK-CONTACT-SHEET-1 r1b: compose the raw captures into one labelled sheet +
     # stats sidecar right here, in the job's publish step, so a reader gets the composed
     # artifact without running make-contact-sheet.py by hand. Pillow/numpy (and Python
@@ -4090,11 +4124,15 @@ $text = Expand-AttrCudaTemplate -Template $template -Tokens ([ordered]@{
     FIXTURE_SHA256 = $FixtureSha256
     CONTACT_SHEET_ENABLED = $contactSheetEnabledLiteral
     CONTACT_SHEET_FRAME_COUNT = $contactSheetFrameCountLiteral
+    CONTACT_SHEET_PAIRED_SEEK = $contactSheetPairedSeekLiteral
     CONTACT_SHEET_COMPOSER_PY_BASE64 = $contactSheetComposerPyBase64
     CONTACT_SHEET_COMPOSER_SHA256 = $contactSheetComposerSha256ForTemplate
     TELEMETRY_ARM = $TelemetryArm
     DISABLE_PAINT_PER_SUBMIT = $disablePaintPerSubmitLiteral
     SMOKE_PROCESS_TIMEOUT_MS = [string]$timeBudget.smokeProcessTimeoutMs
+    # CPU-LEG-SMOKE-CEILING-1: only a clamped leg traces the clamp and the in-runner re-read allowance it left (so a process timeout on it is attributable from the
+    # evidence log); every other leg expands this to nothing, so its job is the text it was before the card.
+    SMOKE_CEILING_TRACE = $(if ($timeBudget.smokeCeilingClamped) { " smokeCeilingClamped=True appReadAllowanceSec=$([int]$timeBudget.appReadAllowanceSec)" } else { '' })
     PLAY_SECONDS = [string]$PlaySeconds
     RUNNER_ACCEPTS_VERIFIED_CLIP_BINDING = $runnerAcceptsVerifiedClipBindingLiteral
     # DUAL-VENUE-EVIDENCE-1: each default below expands to exactly the text that was literal before.
