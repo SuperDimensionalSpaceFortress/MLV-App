@@ -33,6 +33,18 @@ direct8-anchored test compares against the FULL engine, S-curve included
 `...DisplayShaderRefusalPredicateMatchesConfigFlags`). The "PARTIAL PARITY" list that follows
 is kept as history and no longer describes the code.
 
+**Look Assist flavors (CINEMATIC-BACKEND-PARITY-1).** A venue pair on a pre-#251 build showed
+the Cinematic flavor lifted, flat and desaturated on CUDA but dark and saturated on CPU, while
+Classic "matched". Cinematic adds no stage (it is five slider deltas, `kCinematicFlavorDeltas`).
+The Classic pair was seek against seek (the paused engine render on both backends). The Cinematic
+pair was the first in-pass pair, where CUDA presents through this display shader, which on that
+build had no creative-curve stage. The cause is the defect fixed above, not the flavor.
+`GpuPreviewProcessing.EngineAnchoredLookAssistFlavorsMatchEngineWithReceiptSCurve` pins both
+flavors with the venue's values (Night 14/46/32/-26/3 and, through the production table,
+34/43/22/-36/7, WB 6250/22), the receipt S-curve live, against both CPU routes. With the
+creative-curve uniform forced off it fails at 11907 codes, with display saturation 0.149 against
+the engine's 0.387.
+
 ## PARTIAL PARITY, NOT FULL PARITY (history: CUDA-PLAYBACK-LOOK-PARITY-1/-2)
 
 This work makes the live CUDA display shader apply **contrast+pivot, shadows/highlights and

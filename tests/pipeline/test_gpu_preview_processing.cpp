@@ -10,6 +10,7 @@
 #include "../../src/processing/raw_processing.h"
 #include "../../src/debug/StageTiming.h"
 #include "../../src/batch/WorkerThreadCount.h"
+#include "../../src/batch/LookAssistAnalysis.h"
 
 #include <QFile>
 #include <QtGlobal>
@@ -3396,6 +3397,145 @@ TEST(GpuPreviewProcessing, EngineAnchoredReceiptSCurveRealFrameMatchesEngine)
     ASSERT_EQ(debayered.size(), engine.size());
     assert_gpu_display_matches_production_engine("receipt_scurve_real_frame", config, debayered, engine,
                                                  fixture.width(), fixture.height());
+}
+
+/* ---- CINEMATIC-BACKEND-PARITY-1: both Look Assist flavors on the live display shader ----
+ *
+ * A venue pair (VENUE-OWNER-LEGS-CINEMATIC-BACHELOR-1, build 06e24c56, before #251)
+ * showed the Cinematic picture lifted, flat and desaturated on CUDA and dark and
+ * saturated on CPU, while Classic "matched". Cinematic adds no stage: it is five
+ * slider deltas (kCinematicFlavorDeltas). The Classic match was a seek-vs-seek pair
+ * (the paused engine render on both backends); the Cinematic pair was the first
+ * in-pass pair, where CUDA presents through the DISPLAY shader, which on that build
+ * had no creative-curve stage (the receipt's S-curve). This pins both flavors, with
+ * the venue's exact values pushed through the app's own slider mappings and the
+ * receipt S-curve live, against the PRODUCTION engine at the engine-anchored budget. */
+
+using lookassist::LookAssistFlavor;
+using lookassist::LookAssistPreset;
+using lookassist::LookAssistScene;
+using lookassist::lookAssistApplyFlavorDeltas;
+
+struct LookAssistSliderState
+{
+    double contrast;
+    double pivot;
+    double shadows;
+    double highlights;
+    double vibrance;
+};
+
+/* MainWindow's slider handlers (on_horizontalSlider*_valueChanged), verbatim. */
+static LookAssistSliderState look_assist_preset_as_processing_values(const LookAssistPreset & preset)
+{
+    LookAssistSliderState state;
+    state.contrast = preset.contrast / 100.0;
+    state.pivot = preset.pivot / 100.0;
+    state.shadows = preset.shadows * 1.5 / 100.0;
+    state.highlights = preset.highlights * 1.5 / 100.0;
+    state.vibrance = std::pow((preset.vibrance + 100) / 200.0 * 2.0, std::log(3.6) / std::log(2.0));
+    return state;
+}
+
+static double mean_display_saturation(const std::vector<uint16_t> & rgb)
+{
+    const size_t pixels = rgb.size() / 3u;
+    if (pixels == 0) return 0.0;
+    double sum = 0.0;
+    for (size_t index = 0; index < pixels; ++index)
+    {
+        const int r = rgb[index * 3u] >> 8;
+        const int g = rgb[index * 3u + 1u] >> 8;
+        const int b = rgb[index * 3u + 2u] >> 8;
+        const int high = std::max(r, std::max(g, b));
+        const int low = std::min(r, std::min(g, b));
+        if (high > 0) sum += static_cast<double>(high - low) / high;
+    }
+    return sum / static_cast<double>(pixels);
+}
+
+static void run_look_assist_flavor_real_frame_case(const char * label, const LookAssistPreset & preset)
+{
+    MlvPipelineFixture fixture;
+    assert_gpu_preview_fixture_ready(fixture);
+    configure_gpu_preview_supported_subset(fixture);
+    processingObject_t * processing = fixture.processing();
+    processingAllowCreativeAdjustments(processing);   /* the receipt S-curve stays live */
+    processingSetWhiteBalance(processing, 6250.0, 2.2); /* the venue pair's balance, 6250 / tint 22 */
+    const LookAssistSliderState state = look_assist_preset_as_processing_values(preset);
+    processingSetSimpleContrast(processing, state.contrast);
+    processingSetPivot(processing, state.pivot);
+    processingSetShadows(processing, state.shadows);
+    processingSetHighlights(processing, state.highlights);
+    processingSetVibrance(processing, state.vibrance);
+    const std::vector<uint16_t> primed = fixture.renderFrame16(0, /*threads=*/1);
+    ASSERT_TRUE(!primed.empty());
+
+    QString reason;
+    ASSERT_TRUE(gpuPreviewProcessingIsSupported(processing, &reason));
+    GpuPreviewProcessingConfig config = gpuPreviewProcessingBuildConfig(processing, &reason);
+    ASSERT_TRUE(config.enabled);
+    ASSERT_TRUE(config.applyCreativeCurves);
+    ASSERT_TRUE(config.applyInLoopContrast);
+    ASSERT_TRUE(config.applyShadowsHighlights);
+    ASSERT_TRUE(config.applyVibrance);
+    ASSERT_TRUE(gpuPreviewProcessingDisplayShaderRefusedStages(config).isEmpty());
+    ASSERT_TRUE(gpuPreviewProcessingAttachFrameState(
+        &config, processing, fixture.width(), fixture.height(), &reason));
+    gpuPreviewProcessingApplyCpuRoute(&config, processing, /*direct8Route=*/false);
+
+    const std::vector<uint16_t> engine = fixture.renderFrame16(0, /*threads=*/1);
+    const std::vector<uint16_t> debayered = fixture.renderDebayeredFrame16(0);
+    ASSERT_EQ(debayered.size(), engine.size());
+    std::vector<uint16_t> display(debayered.size(), 0);
+    (void)render_display_for_parity(config, debayered.data(), display.data(),
+                                    fixture.width(), fixture.height());
+    char saturation[96];
+    std::snprintf(saturation, sizeof(saturation), " saturation engine=%.3f display=%.3f",
+                  mean_display_saturation(engine), mean_display_saturation(display));
+    std::cout << "[CINEMATIC-BACKEND-PARITY] " << label << " "
+              << channel_stats_line("seek_render_engine", engine) << "\n"
+              << "[CINEMATIC-BACKEND-PARITY] " << label << " "
+              << channel_stats_line("cuda_playback_display_shader", display) << saturation << "\n";
+    assert_gpu_display_matches_production_engine(label, config, debayered, engine,
+                                                 fixture.width(), fixture.height());
+
+    /* The other CPU route: the preset is direct8-eligible, so the unscaled 8-bit
+     * render IS the direct8 kernel (see assert_real_frame_matches_direct8_render). */
+    ASSERT_TRUE(processingCanUseDirect8BitOutput(processing) != 0);
+    const std::vector<uint8_t> engine8 = fixture.renderFrame8(0, /*threads=*/1);
+    ASSERT_EQ(debayered.size(), engine8.size());
+    GpuPreviewProcessingConfig direct8Config = gpuPreviewProcessingBuildConfig(processing, &reason);
+    ASSERT_TRUE(direct8Config.enabled);
+    ASSERT_TRUE(gpuPreviewProcessingAttachFrameState(
+        &direct8Config, processing, fixture.width(), fixture.height(), &reason));
+    gpuPreviewProcessingApplyCpuRoute(&direct8Config, processing, /*direct8Route=*/true);
+    const std::string label8 = std::string(label) + ".direct8";
+    assert_gpu_display_matches_direct8_engine(label8.c_str(), direct8Config, debayered, engine8,
+                                              fixture.width(), fixture.height());
+}
+
+TEST(GpuPreviewProcessing, EngineAnchoredLookAssistFlavorsMatchEngineWithReceiptSCurve)
+{
+    /* Classic: the venue clip's Night preset (contrast 14 pivot 46 shadows 32
+     * highlights -26 vibrance 3). Cinematic: the same preset through the
+     * production flavor table, which must land on the venue's 34/43/22/-36/7. */
+    LookAssistPreset classic;
+    classic.contrast = 14;
+    classic.pivot = 46;
+    classic.shadows = 32;
+    classic.highlights = -26;
+    classic.vibrance = 3;
+    LookAssistPreset cinematic = classic;
+    lookAssistApplyFlavorDeltas(&cinematic, LookAssistScene::Night, LookAssistFlavor::Cinematic);
+    ASSERT_EQ(34, cinematic.contrast);
+    ASSERT_EQ(43, cinematic.pivot);
+    ASSERT_EQ(22, cinematic.shadows);
+    ASSERT_EQ(-36, cinematic.highlights);
+    ASSERT_EQ(7, cinematic.vibrance);
+
+    run_look_assist_flavor_real_frame_case("look_assist_cinematic_night_real_frame", cinematic);
+    run_look_assist_flavor_real_frame_case("look_assist_classic_night_real_frame", classic);   /* control */
 }
 
 struct CreativeChainCase

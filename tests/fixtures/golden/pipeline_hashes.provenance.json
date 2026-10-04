@@ -61,7 +61,7 @@
   },
   "generator": {
     "executable": "pipeline_tests.exe",
-    "source_state_commit": "3daa667c5079a3dcdc7c3759d02f93bff3833f21",
+    "source_state_commit": "0a51c0beeeb8e879c3562415fb65231dffddbfcf",
     "dependency_snapshot": {
       "complete": false,
       "scope": "listed_generator_sources_and_declared_fixture_receipt_inputs_only",
@@ -84,7 +84,7 @@
       "compiler": "MinGW 13.1",
       "evidence": {
         "path": ".github/workflows/tests.yml",
-        "sha256": "29cfc6868aba828a27a8763f17428e26237ada6128781392070c4ee85b3e546f",
+        "sha256": "028876f255ad4da5f2c69610d132f1ca50a4dea9c69b0635de39c554a96f894c",
         "hash_mode": "lf_normalized_sha256"
       }
     },
@@ -111,7 +111,7 @@
       },
       {
         "path": "tests/pipeline/test_gpu_preview_processing.cpp",
-        "sha256": "0c688b57ffa312723f1e01968d953645079ee0ec66c8b39de60f8e687739a7f4",
+        "sha256": "d30340d6a909e17e089da29eba4d0b382ec1100191b23d9a2bb8a6121169561a",
         "hash_mode": "lf_normalized_sha256"
       }
     ],
