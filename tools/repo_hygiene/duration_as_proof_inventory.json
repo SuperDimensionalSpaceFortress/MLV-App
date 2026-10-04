@@ -250,6 +250,16 @@
       ]
     },
     {
+      "path": "platform/qt/PlaybackNativePaceGuard.h",
+      "anchor": "return pacedMs > 0.0 ? frames * 1000.0 / pacedMs : 0.0 ;",
+      "class": "division_guard",
+      "clock": "qpc_stage_clock",
+      "justification": "fpsAfterFirstPresent's frames*1000/pacedMs division guard for the playback_smoke.pace_summary line; whether anything was presented is decided by the presentedFrames count on the line above, never by this interval, so a zero-length interval only reports 0 fps instead of dividing by zero.",
+      "lines": [
+        68
+      ]
+    },
+    {
       "path": "platform/qt/PlaybackQualityPolicy.h",
       "anchor": "return frameMs > 0.0 ? 1000.0 / frameMs : 0.0 ;",
       "class": "division_guard",

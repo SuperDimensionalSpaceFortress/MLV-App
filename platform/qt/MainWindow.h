@@ -1185,6 +1185,7 @@ private:
     double m_playbackSmokeStartTime = 0.0;
     double m_playbackSmokeLastPresentedTime = 0.0;
     double m_playbackSmokeFirstPresentMs = 0.0;
+    int m_playbackSmokeFirstPresentTimelineDeltaAbs = 0; // slider travel from Play, sampled at the first present
     double m_playbackSmokePresentedIntervalSumMs = 0.0;
     double m_playbackSmokePresentedIntervalMaxMs = 0.0;
     double m_playbackSmokeRenderTotalSumMs = 0.0;

@@ -55,6 +55,31 @@ inline int shapedTickTimeDiffMs( int elapsedMs, double framerate, bool predictiv
     return timeDiff;
 }
 
+/*! PLAYBACK-PACE-GUARD-THROUGHPUT-1: the rate \a frames ran at over the PACED part of a Play, from the first
+ *  present to \a elapsedMs (both measured from Play). The smoke's timeline_fps divides by the whole elapsed time,
+ *  so it also counts the wait for the first frame, which no pace governs: UM r5 (dd15567b) waited 3753 ms of a
+ *  28545 ms run, so 599 frames read 20.985 fps over the run.
+ *  \a frames must be the frames advanced AFTER the first present (see timelineFramesAfterFirstPresent), never the
+ *  whole run's: dividing the run's frames by the post-first-present time counts what the engine repaid for the wait
+ *  as paced throughput (round 1 of this card read r5 as 24.16, native; its contact sheet shows 21.3).
+ *  0 when there is no paced interval: \a presentedFrames (the count, never the first-present time) says whether
+ *  anything was presented, and an interval of zero length has no rate. */
+inline double fpsAfterFirstPresent( double frames, double elapsedMs, double firstPresentMs, int presentedFrames )
+{
+    if( presentedFrames < 1 ) return 0.0;
+    const double pacedMs = elapsedMs - firstPresentMs;
+    return pacedMs > 0.0 ? frames * 1000.0 / pacedMs : 0.0;
+}
+
+/*! The timeline (slider) frames advanced after the first present: the run's travel less the travel already made when
+ *  the first present was recorded. In drop-frame mode the first present's early advance can request the whole wait
+ *  for the first frame at once, so that jump (first_present_catchup_frames) is made before the first present is
+ *  recorded and must not count as paced throughput. Never negative. */
+inline int timelineFramesAfterFirstPresent( int timelineDeltaAbs, int timelineDeltaAbsAtFirstPresent )
+{
+    return timelineDeltaAbs > timelineDeltaAbsAtFirstPresent ? timelineDeltaAbs - timelineDeltaAbsAtFirstPresent : 0;
+}
+
 class NativePaceGuard
 {
 public:
