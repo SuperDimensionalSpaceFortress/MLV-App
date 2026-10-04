@@ -8,6 +8,7 @@
 #include "LookAssistAnalysis.h"
 
 #include <QtGlobal>
+#include <algorithm>
 #include <math.h>
 
 namespace lookassist
@@ -1216,6 +1217,70 @@ void lookAssistTraceSurfaceSearch( LookAssistDecisionTrace *trace, const LookAss
     trace->surfaceSearchTint = check.search.converged ? check.search.tint : 0;
 }
 
+// The display search neutralises ONE surface; a coloured one (a pale lavender curtain) converges just as a window does,
+// and then casts the room (sol, PR #262 r1: 6603 / 0 -> 8214 / -21 turns a neutral wall 80/80/80 into 90/85/66). Two
+// questions the surface alone cannot answer are asked of the picture before its balance is applied.
+//
+// What the surface IS at the display's levels: rendered at the receipt's base, its cast must be the cast a daylight light
+// leaves on a neutral -- bluer than the base by more than the dead band, and no more green / magenta than blue (daylight
+// moves a neutral along blue-amber; a cast that is mostly magenta or green, or amber, is the surface's own colour or a
+// light warmer than the base, and neither is the window this check is about).
+static bool lookAssistDisplaySurfaceIsDaylightLit( const LookAssistAutoWhiteBalancePatch &atBase )
+{
+    return atBase.valid
+        && atBase.blueAmberAxis >= kRefineDeadBand
+        && fabs( atBase.greenAxis ) <= atBase.blueAmberAxis;
+}
+
+// The room: the near-neutral candidates darker than the surface (the room it lights, not the highlight itself), the same
+// pixels in both pictures -- near-neutral at either balance (the patch search's own sample rule: luma 20..230, chroma at
+// most max(14, luma / 5)), so a balance cannot shed the pixels it casts. Its cast is the median B-R plus the median G axis.
+static const double kLookAssistRoomMaxLumaOfSurface = 0.75;   // a room pixel is darker than this share of the surface
+static const double kLookAssistRoomCastSlack        = 1.0;    // half the dead band: the room may not get more cast than this
+
+static bool lookAssistRoomCandidate( const unsigned char *p, double maxLuma )
+{
+    const int r = p[0];
+    const int g = p[1];
+    const int b = p[2];
+    const int luma = qBound( 0, ( 54 * r + 183 * g + 19 * b ) >> 8, 255 );
+    const int chroma = qMax( r, qMax( g, b ) ) - qMin( r, qMin( g, b ) );
+    return luma >= 20 && luma <= 230 && luma < maxLuma && chroma <= qMax( 14, luma / 5 );
+}
+
+static double lookAssistMedian( std::vector<double> &values )
+{
+    const size_t mid = values.size() / 2;
+    std::nth_element( values.begin(), values.begin() + mid, values.end() );
+    return values[mid];
+}
+
+// Returns false (no evidence) when the room has fewer samples than the balance statistics ask for (1 % of the picture).
+static bool lookAssistRoomCasts( const LookAssistRenderedPicture &before, const LookAssistRenderedPicture &after,
+                                 double surfaceLuma, int *samples, double *castBefore, double *castAfter )
+{
+    *samples = 0;
+    if( !lookAssistSamePictureGeometry( before, after ) ) return false;
+    const double maxLuma = surfaceLuma * kLookAssistRoomMaxLumaOfSurface;
+    const size_t pixels = (size_t)before.width * (size_t)before.height;
+    std::vector<double> blueAmberBefore, greenBefore, blueAmberAfter, greenAfter;
+    for( size_t i = 0; i < pixels; ++i )
+    {
+        const unsigned char *a = &before.rgb[i * 3u];
+        const unsigned char *b = &after.rgb[i * 3u];
+        if( !lookAssistRoomCandidate( a, maxLuma ) && !lookAssistRoomCandidate( b, maxLuma ) ) continue;
+        blueAmberBefore.push_back( (double)a[2] - (double)a[0] );
+        greenBefore.push_back( (double)a[1] - ( (double)a[0] + (double)a[2] ) * 0.5 );
+        blueAmberAfter.push_back( (double)b[2] - (double)b[0] );
+        greenAfter.push_back( (double)b[1] - ( (double)b[0] + (double)b[2] ) * 0.5 );
+    }
+    *samples = (int)blueAmberBefore.size();
+    if( *samples < qMax( 32, (int)( pixels / 100u ) ) ) return false;
+    *castBefore = fabs( lookAssistMedian( blueAmberBefore ) ) + fabs( lookAssistMedian( greenBefore ) );
+    *castAfter = fabs( lookAssistMedian( blueAmberAfter ) ) + fabs( lookAssistMedian( greenAfter ) );
+    return true;
+}
+
 bool lookAssistNotNightByExposureBoundCandidate( const LookAssistStats &stats, LookAssistScene scene )
 {
     return lookAssistWindowLitInteriorCandidate( stats, scene ) && lookAssistExposureBoundExcludesNight( stats );
@@ -1395,6 +1460,91 @@ LookAssistWindowLitCheck resolveLookAssistWindowLitInterior( const LookAssistWhi
         {
             check.reason = QStringLiteral("not-blue-at-gate");
             return check;
+        }
+    }
+
+    // The verdict is decided (every gate above, on the clip-level renders, exactly as before). What the balance is still
+    // asked at the DISPLAY's levels (LOOK-ASSIST-M16-CAST-1). The patch is the brightest near-neutral surface of a dark
+    // picture -- a window -- and on an HQ dual-ISO clip that is the top of the recon's range, which the clip-level
+    // judgement render clamps at the clip white: there the surface answers the balance at half its slope and reads
+    // neutral where its light is not (M16-1243: 6686 / 0 by the clamped window, the display-level solve 9930 / -33, the
+    // displayed room blue-magenta). So the same surface is rendered at the display's levels at that balance; strictly
+    // neutral there, nothing changes. Otherwise the same search neutralises it there, from that balance and the solve,
+    // inside the daylight window and never under the not-night gate. MEASURE-ONLY (round 2s): nothing here changes the
+    // balance; the clip-level one is always what is applied. Converged, the search is logged, and displayDecision says
+    // "would-apply" only when the
+    // surface is daylight-lit at the display's levels and the room is not made more cast (see
+    // lookAssistDisplaySurfaceIsDaylightLit / lookAssistRoomCasts); anything else, displayDecision says why. The room
+    // guard's relative-luma cutoff (kLookAssistRoomMaxLumaOfSurface) can miss a bright neutral wall: LOOK-ASSIST-M16-CAST-2
+    // owns that before anything is applied. Outside HQ dual-ISO both levels are the same (a no-op).
+    if( check.exposureBound && request.renderDisplayBalance )
+    {
+        LookAssistRenderedPicture shown;
+        if( request.renderDisplayBalance( patchPictureExposureStops, temperature, tint, &shown )
+         && lookAssistSamePictureGeometry( base, shown ) )
+        {
+            const LookAssistAutoWhiteBalancePatch shownSurface = lookAssistSurfaceAt( shown, patch.thumbnailX, patch.thumbnailY );
+            check.displayRendered = shownSurface.valid;
+            check.displaySurfaceBlueAmber = shownSurface.blueAmberAxis;
+            check.displaySurfaceGreen = shownSurface.greenAxis;
+            if( lookAssistSurfaceIsNeutral( shownSurface ) ) check.displayDecision = QStringLiteral("neutral");
+            LookAssistWhiteBalanceBounds displayWindow = window;
+            displayWindow.minTemperature = qMax( qMax( displayWindow.minTemperature, request.minTemperature ),
+                                                 kLookAssistNotNightMinTemperature );
+            displayWindow.maxTemperature = qMin( displayWindow.maxTemperature, request.maxTemperature );
+            displayWindow.minTint = qMax( displayWindow.minTint, request.minTint );
+            displayWindow.maxTint = qMin( displayWindow.maxTint, request.maxTint );
+            LookAssistSurfaceProbe atApplied;
+            atApplied.temperature = temperature;
+            atApplied.tint = tint;
+            atApplied.surface = shownSurface;
+            LookAssistSurfaceProbe atSolve;
+            // qMin / qMax, not qBound: the window is checked non-empty only below (fable r1 note).
+            atSolve.temperature = qMin( qMax( wb.candidateTemperature, displayWindow.minTemperature ), displayWindow.maxTemperature );
+            atSolve.tint = qMin( qMax( wb.candidateTint, displayWindow.minTint ), displayWindow.maxTint );
+            // What the surface IS at the display's levels: the same pixel at the receipt's base balance (the balance the
+            // clip-level qualification above judged it at), lit as daylight lights a neutral.
+            LookAssistRenderedPicture shownAtBase;
+            bool qualified = false;
+            if( shownSurface.valid && !lookAssistSurfaceIsNeutral( shownSurface )
+             && request.renderDisplayBalance( patchPictureExposureStops, request.baseTemperature, request.baseTint, &shownAtBase )
+             && lookAssistSamePictureGeometry( shown, shownAtBase ) )
+            {
+                const LookAssistAutoWhiteBalancePatch baseShown = lookAssistSurfaceAt( shownAtBase, patch.thumbnailX, patch.thumbnailY );
+                check.displayBaseBlueAmber = baseShown.blueAmberAxis;
+                check.displayBaseGreen = baseShown.greenAxis;
+                qualified = lookAssistDisplaySurfaceIsDaylightLit( baseShown );
+                if( !qualified ) check.displayDecision = QStringLiteral("unqualified-at-base");
+            }
+            LookAssistRenderedPicture solvePicture;
+            if( qualified
+             && displayWindow.minTemperature <= displayWindow.maxTemperature && displayWindow.minTint <= displayWindow.maxTint
+             && request.renderDisplayBalance( patchPictureExposureStops, atSolve.temperature, atSolve.tint, &solvePicture )
+             && lookAssistSamePictureGeometry( shown, solvePicture ) )
+            {
+                atSolve.surface = lookAssistSurfaceAt( solvePicture, patch.thumbnailX, patch.thumbnailY );
+                check.displaySearch = searchLookAssistNeutralSurfaceBalance( request.renderDisplayBalance, patchPictureExposureStops,
+                                                                             shown, patch.thumbnailX, patch.thumbnailY,
+                                                                             displayWindow, atApplied, atSolve );
+                check.displayDecision = QStringLiteral("not-converged");
+                // The room, at the display's levels, at the clip-level balance and at the found one: no more cast.
+                LookAssistRenderedPicture found;
+                if( check.displaySearch.converged
+                 && request.renderDisplayBalance( patchPictureExposureStops, check.displaySearch.temperature,
+                                                  check.displaySearch.tint, &found ) )
+                {
+                    if( !lookAssistRoomCasts( shown, found, shownSurface.luma, &check.displayRoomSamples,
+                                              &check.displayRoomCastBefore, &check.displayRoomCastAfter ) )
+                        check.displayDecision = QStringLiteral("no-room-evidence");
+                    else if( check.displayRoomCastAfter > check.displayRoomCastBefore + kLookAssistRoomCastSlack )
+                        check.displayDecision = QStringLiteral("room-worsened");
+                    else
+                    {
+                        // MEASURE-ONLY: the guard's verdict is logged and the clip-level balance stands (CAST-2 applies it).
+                        check.displayDecision = QStringLiteral("would-apply");
+                    }
+                }
+            }
         }
     }
 

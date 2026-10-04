@@ -99,7 +99,8 @@ public:
                                             int temperature,
                                             int tint,
                                             bool isolated,
-                                            unsigned char *outBuffer);
+                                            unsigned char *outBuffer,
+                                            bool displayLevels = false);
 
     /* processedThumbnailAtBalance + analyzeLookAssistThumbnail as the callback the shared white-balance
      * resolution asks about the picture. */
@@ -109,7 +110,8 @@ public:
                                                                      int thumbWidth,
                                                                      int thumbHeight,
                                                                      int cpuCores,
-                                                                     bool isolated);
+                                                                     bool isolated,
+                                                                     bool displayLevels = false);
 
     /* The renderer for a MEASURE-ONLY check (the window-lit verification in both consumers): the isolated,
      * read-only render above, so measuring cannot change any shared processing or low-level raw state. */
@@ -119,6 +121,16 @@ public:
                                                                          int thumbWidth,
                                                                          int thumbHeight,
                                                                          int cpuCores);
+
+    /* The same measure-only render at the DISPLAY's levels (MLV_PROCESSED_THUMBNAIL_DISPLAY_LEVELS): the window-lit
+     * check's last question, whether the balance it applies is neutral where the display shows the surface
+     * (LOOK-ASSIST-M16-CAST-1). Identical to the render above outside HQ dual-ISO. */
+    static lookassist::LookAssistRenderBalanceFn lookAssistMeasureOnlyDisplayRenderer(mlvObject_t *mlvObject,
+                                                                                int frameIndex,
+                                                                                int downscaleFactor,
+                                                                                int thumbWidth,
+                                                                                int thumbHeight,
+                                                                                int cpuCores);
 
 private:
     ReceiptApplier() = delete; /* Pure static — no instances */

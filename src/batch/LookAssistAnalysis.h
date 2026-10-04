@@ -360,6 +360,10 @@ struct LookAssistWhiteBalanceRequest
     // solver run on it, every candidate surface is also judged on the unstepped base picture, and the result
     // is verified on that same surface at the solution. Unset (or nothing acquired) = master's balance.
     LookAssistRenderBalanceFn renderBalance;
+    // The same measure-only render at the DISPLAY's levels (LOOK-ASSIST-M16-CAST-1): the levels the display shows and
+    // the neutral-patch solve reads (#259), where a window-bright surface is not clamped at the clip white. Only the
+    // window-lit check asks it, after its verdict, about the balance it applies. Unset = the clip-level answer stands.
+    LookAssistRenderBalanceFn renderDisplayBalance;
     // The exposure (in receipt units) the colour analysis pictures are rendered at when it is not the exposure that
     // gets applied: the daylight neutral-patch gates were calibrated on the picture at the scene's own lift, and the
     // display-space meter then sets the exposure that is applied (a different, usually lower, one). Unset
@@ -534,6 +538,25 @@ struct LookAssistWindowLitCheck
     double solutionSurfaceBlueAmber = 0.0;
     LookAssistSurfaceSearch search;   // run only on the live rule, when the solve is not strictly neutral
     double gateSurfaceBlueAmber = 0.0;   // live rule: the surface's B-R rendered at the 6000 K gate (0 = not rendered)
+    // Live rule, after the verdict: the same surface at the display's levels at the clip-level balance (B-R, G axis),
+    // and the search that neutralises it there when it is not strictly neutral (LOOK-ASSIST-M16-CAST-1).
+    bool displayRendered = false;
+    double displaySurfaceBlueAmber = 0.0;
+    double displaySurfaceGreen = 0.0;
+    LookAssistSurfaceSearch displaySearch;
+    // Round 2s (LOOK-ASSIST-M16-CAST-1) is MEASURE-ONLY: the display search's balance is NEVER applied; the applied
+    // balance is always the clip-level one. displayDecision logs whether the guards WOULD have applied it (the applying
+    // path is LOOK-ASSIST-M16-CAST-2). The surface is first
+    // qualified at the display's levels at the receipt's base (displayBase*: its cast must be a daylight light's), and a
+    // converged balance must not worsen the room: the median cast of the near-neutral area darker than the surface, at
+    // the display's levels, at the clip-level balance (displayRoomCastBefore) and at the found one (displayRoomCastAfter).
+    // displayDecision: not-run | neutral | unqualified-at-base | not-converged | no-room-evidence | room-worsened | would-apply
+    QString displayDecision = QStringLiteral("not-run");
+    double displayBaseBlueAmber = 0.0;
+    double displayBaseGreen = 0.0;
+    int displayRoomSamples = 0;
+    double displayRoomCastBefore = 0.0;
+    double displayRoomCastAfter = 0.0;
     int appliedTemperature = 0;       // the balance the evidence applies (0 without evidence)
     int appliedTint = 0;
 };

@@ -668,7 +668,8 @@ bool ReceiptApplier::processedThumbnailAtBalance(mlvObject_t *mlvObject,
                                                  int temperature,
                                                  int tint,
                                                  bool isolated,
-                                                 unsigned char *outBuffer)
+                                                 unsigned char *outBuffer,
+                                                 bool displayLevels)
 {
     if( !mlvObject || !mlvObject->processing || !outBuffer || downscaleFactor <= 0 ) return false;
 
@@ -683,6 +684,7 @@ bool ReceiptApplier::processedThumbnailAtBalance(mlvObject_t *mlvObject,
     memset( &settings, 0, sizeof( settings ) );
     settings.flags = MLV_PROCESSED_THUMBNAIL_APPLY_WHITE_BALANCE
                    | MLV_PROCESSED_THUMBNAIL_APPLY_EXPOSURE;
+    if( displayLevels ) settings.flags |= MLV_PROCESSED_THUMBNAIL_DISPLAY_LEVELS;
     settings.white_balance_kelvin = temperature;
     settings.white_balance_tint = tint / 10.0;
     settings.exposure_stops = exposureStops;
@@ -716,20 +718,32 @@ LookAssistRenderBalanceFn ReceiptApplier::lookAssistMeasureOnlyRenderer(mlvObjec
     return lookAssistBalanceRenderer( mlvObject, frameIndex, downscaleFactor, thumbWidth, thumbHeight, cpuCores, true );
 }
 
+LookAssistRenderBalanceFn ReceiptApplier::lookAssistMeasureOnlyDisplayRenderer(mlvObject_t *mlvObject,
+                                                                              int frameIndex,
+                                                                              int downscaleFactor,
+                                                                              int thumbWidth,
+                                                                              int thumbHeight,
+                                                                              int cpuCores)
+{
+    return lookAssistBalanceRenderer( mlvObject, frameIndex, downscaleFactor, thumbWidth, thumbHeight, cpuCores, true,
+                                      true );
+}
+
 LookAssistRenderBalanceFn ReceiptApplier::lookAssistBalanceRenderer(mlvObject_t *mlvObject,
                                                               int frameIndex,
                                                               int downscaleFactor,
                                                               int thumbWidth,
                                                               int thumbHeight,
                                                               int cpuCores,
-                                                              bool isolated)
+                                                              bool isolated,
+                                                              bool displayLevels)
 {
     return [=]( double exposureStops, int temperature, int tint, LookAssistRenderedPicture *out ) -> bool
     {
         if( !out || thumbWidth <= 0 || thumbHeight <= 0 ) return false;
         out->rgb.assign( static_cast<size_t>( thumbWidth ) * static_cast<size_t>( thumbHeight ) * 3u, 0 );
         if( !processedThumbnailAtBalance( mlvObject, frameIndex, downscaleFactor, cpuCores, exposureStops,
-                                          temperature, tint, isolated, out->rgb.data() ) )
+                                          temperature, tint, isolated, out->rgb.data(), displayLevels ) )
             return false;
         out->width = thumbWidth;
         out->height = thumbHeight;
@@ -1064,6 +1078,8 @@ bool ReceiptApplier::applyHeadlessLookAssist(ReceiptSettings *receipt,
     windowLitRequest.stats = &windowLitStats;
     windowLitRequest.renderBalance = lookAssistMeasureOnlyRenderer( mlvObject, frameIndex, colorDownscaleFactor,
                                                                     colorWidth, colorHeight, 1 );
+    windowLitRequest.renderDisplayBalance = lookAssistMeasureOnlyDisplayRenderer( mlvObject, frameIndex, colorDownscaleFactor,
+                                                                                  colorWidth, colorHeight, 1 );
     const LookAssistWindowLitCheck windowLit = resolveLookAssistWindowLitInterior(
         windowLitRequest, wb, mlvObject->processing->exposure_stops, &windowLitStats, &windowLitScene, &windowLitPreset,
         useProcessedColorStats ? &processedColorStats : nullptr,
@@ -1082,7 +1098,10 @@ bool ReceiptApplier::applyHeadlessLookAssist(ReceiptSettings *receipt,
             "[BATCH] LOOK_ASSIST window_lit_interior frame=%1 wouldReclassify=%2 reason=%3 scene=%4 baseSurfaceChroma=%5 "
             "baseSurfaceBlueAmber=%6 solutionSurfaceChroma=%7 solutionSurfaceBlueAmber=%8 expoIso=%9 expoShutterUs=%10 "
             "lensApertureX100=%11 applied=%12 exposureBound=%13 recoveryIso=%14 surfaceSearch=%15 searchRenders=%16 "
-            "searchBalance=%17/%18 appliedBalance=%19/%20 gateSurfaceBlueAmber=%21\n" )
+            "searchBalance=%17/%18 appliedBalance=%19/%20 gateSurfaceBlueAmber=%21 displaySurface=%22 "
+            "displaySurfaceBlueAmber=%23 displaySurfaceGreen=%24 displaySearch=%25 displaySearchRenders=%26 "
+            "displaySearchBalance=%27/%28 displayDecision=%29 displayBaseBlueAmber=%30 displayBaseGreen=%31 "
+            "displayRoomSamples=%32 displayRoomCast=%33/%34\n" )
             .arg( frameIndex )
             .arg( windowLit.evidence ? QStringLiteral("true") : QStringLiteral("false") )
             .arg( windowLit.reason )
@@ -1103,7 +1122,20 @@ bool ReceiptApplier::applyHeadlessLookAssist(ReceiptSettings *receipt,
             .arg( windowLit.search.tint )
             .arg( windowLit.appliedTemperature )
             .arg( windowLit.appliedTint )
-            .arg( windowLit.gateSurfaceBlueAmber, 0, 'f', 1 ) );
+            .arg( windowLit.gateSurfaceBlueAmber, 0, 'f', 1 )
+            .arg( windowLit.displayRendered ? QStringLiteral("true") : QStringLiteral("false") )
+            .arg( windowLit.displaySurfaceBlueAmber, 0, 'f', 1 )
+            .arg( windowLit.displaySurfaceGreen, 0, 'f', 1 )
+            .arg( windowLit.displaySearch.result )
+            .arg( windowLit.displaySearch.renders )
+            .arg( windowLit.displaySearch.temperature )
+            .arg( windowLit.displaySearch.tint )
+            .arg( windowLit.displayDecision )
+            .arg( windowLit.displayBaseBlueAmber, 0, 'f', 1 )
+            .arg( windowLit.displayBaseGreen, 0, 'f', 1 )
+            .arg( windowLit.displayRoomSamples )
+            .arg( windowLit.displayRoomCastBefore, 0, 'f', 1 )
+            .arg( windowLit.displayRoomCastAfter, 0, 'f', 1 ) );
     }
     const bool autoWhiteBalanceValid = wb.autoValid;
     const QString autoWhiteBalanceSource = wb.source;

@@ -1434,6 +1434,86 @@ TEST(LookAssistFixtureScene, WindowLitSurfaceSearchRendersLeaveLowLevelRawStateU
     ASSERT_FALSE( sameLlrawprocSharedState( before, llrawprocSharedState( video ) ) );
 }
 
+TEST(LookAssistFixtureScene, WindowLitDisplayLevelRendersAreTheDisplaysLevelsAndLeaveLowLevelRawStateUntouched)
+{
+    // LOOK-ASSIST-M16-CAST-1: the window-lit check's last question renders the same surface at the DISPLAY's levels. On
+    // the tracked HQ dual-ISO clip that render is the measure-only one with the display's levels: same geometry, a
+    // darker picture at the same stops (the clip-level judgement picture is the display's +1.8 EV), and -- like every
+    // measure-only render -- no low-level raw state, cached frame or stored balance moves.
+    MlvPipelineFixture fixture;
+    QString error_message;
+    ASSERT_TRUE( fixture.openClipFile( repo_file_path( QStringLiteral("tests/fixtures/clips/tiny_dual_iso.mlv") ), &error_message ) );
+    fixture.receipt().setBadPixels( 2 );
+    fixture.receipt().setBpsMethod( 1 );   // aggressive search: every live raw read re-searches and bumps the map version
+    ASSERT_TRUE( fixture.applyReceipt( &error_message ) );
+    mlvObject_t *video = fixture.video();
+    ASSERT_EQ( 2, llrpGetBadPixelMode( video ) );
+    llrpResetBpmStatus( video );
+
+    const int colorDownscale = 3;
+    const int width = video->RAWI.xRes / colorDownscale;
+    const int height = video->RAWI.yRes / colorDownscale;
+    const LookAssistRenderBalanceFn live =
+        ReceiptApplier::lookAssistBalanceRenderer( video, 0, colorDownscale, width, height, 1, false );
+    const LookAssistRenderBalanceFn measureOnly =
+        ReceiptApplier::lookAssistMeasureOnlyRenderer( video, 0, colorDownscale, width, height, 1 );
+    const LookAssistRenderBalanceFn display =
+        ReceiptApplier::lookAssistMeasureOnlyDisplayRenderer( video, 0, colorDownscale, width, height, 1 );
+
+    LookAssistRenderedPicture patchPicture;
+    ASSERT_TRUE( live( 1.74, 6000, 0, &patchPicture ) );
+    ASSERT_EQ( 1, video->llrawproc->bpm_status );
+
+    const LlrawprocSharedState before = llrawprocSharedState( video );
+    const int cachedBefore = video->current_cached_frame_active;
+    const double kelvinBefore = processingGetWhiteBalanceKelvin( video->processing );
+    const double tintBefore = processingGetWhiteBalanceTint( video->processing );
+
+    LookAssistRenderedPicture clipLevels;
+    ASSERT_TRUE( measureOnly( 1.74, 6600, 0, &clipLevels ) );
+    for( int temperature : { 6600, 8200, 9930 } )
+    {
+        LookAssistRenderedPicture shown;
+        ASSERT_TRUE( display( 1.74, temperature, temperature == 6600 ? 0 : -20, &shown ) );
+        ASSERT_EQ( clipLevels.width, shown.width );
+        ASSERT_EQ( clipLevels.height, shown.height );
+        ASSERT_EQ( clipLevels.downscaleFactor, shown.downscaleFactor );
+        std::fprintf( stderr, "DISPLAY-LEVELS %d K median clip=%.0f display=%.0f\n", temperature, clipLevels.stats.median,
+                      shown.stats.median );
+        if( temperature == 6600 )
+            ASSERT_TRUE( shown.stats.median < clipLevels.stats.median );   // the display's levels, not the clip's
+    }
+    // The diagnosis, measured (logged, not asserted): how the clip's brightest surfaces answer the balance at each level.
+    // Mean B-R of the pixels brightest in the clip-level 6000 K picture (luma >= its p95), at 6000 K and 9930 K.
+    {
+        LookAssistRenderedPicture clipWarm, clipCool, shownWarm, shownCool;
+        ASSERT_TRUE( measureOnly( 1.74, 6000, 0, &clipWarm ) && measureOnly( 1.74, 9930, 0, &clipCool ) );
+        ASSERT_TRUE( display( 1.74, 6000, 0, &shownWarm ) && display( 1.74, 9930, 0, &shownCool ) );
+        auto meanBlueAmber = [&]( const LookAssistRenderedPicture &p ) {
+            double sum = 0.0;
+            int n = 0;
+            for( size_t i = 0; i + 2 < clipWarm.rgb.size(); i += 3 )
+            {
+                const double luma = ( 54.0 * clipWarm.rgb[i] + 183.0 * clipWarm.rgb[i + 1] + 19.0 * clipWarm.rgb[i + 2] ) / 256.0;
+                if( luma < clipWarm.stats.p95 ) continue;
+                sum += double( p.rgb[i + 2] ) - double( p.rgb[i] );
+                ++n;
+            }
+            return n > 0 ? sum / n : 0.0; };
+        const double dMired = 1.0e6 / 6000.0 - 1.0e6 / 9930.0;
+        std::fprintf( stderr, "DISPLAY-LEVELS brightest(p95=%.0f) B-R clip %.1f -> %.1f (%.2f/mired) display %.1f -> %.1f (%.2f/mired)\n",
+                      clipWarm.stats.p95, meanBlueAmber( clipWarm ), meanBlueAmber( clipCool ),
+                      ( meanBlueAmber( clipWarm ) - meanBlueAmber( clipCool ) ) / dMired,
+                      meanBlueAmber( shownWarm ), meanBlueAmber( shownCool ),
+                      ( meanBlueAmber( shownWarm ) - meanBlueAmber( shownCool ) ) / dMired );
+    }
+    ASSERT_TRUE( sameLlrawprocSharedState( before, llrawprocSharedState( video ) ) );
+    ASSERT_EQ( cachedBefore, video->current_cached_frame_active );
+    ASSERT_EQ( kelvinBefore, processingGetWhiteBalanceKelvin( video->processing ) );
+    ASSERT_EQ( tintBefore, processingGetWhiteBalanceTint( video->processing ) );
+    ASSERT_EQ( 0, llrpSetIsolatedAnalysisSharedStateReadOnlyForCurrentThread( 0 ) );
+}
+
 TEST(LookAssistFixtureScene, WindowLitTraceCarriesTheRawExposureFieldsInTheirOwnSlots)
 {
     // fable r1: the EXPO/LENS mapping was pinned only for all zeros, so swapping two fields survived. The M16 state: ISO
