@@ -15797,11 +15797,14 @@ void MainWindow::applyLookAssistToReceipt( ReceiptSettings *receipt,
         {
             mlv_processed_thumbnail_settings_t displaySettings;
             memset( &displaySettings, 0, sizeof( displaySettings ) );
+            // DISPLAY_LEVELS (LOOK-ASSIST-ANALYSIS-TRUE-LEVELS-1): the meter's median IS the exposure answer, so it
+            // reads the picture the display shows, not the 1.8 EV brighter judgement calibration.
             displaySettings.flags = MLV_PROCESSED_THUMBNAIL_APPLY_EXPOSURE
                                   | MLV_PROCESSED_THUMBNAIL_APPLY_SIMPLE_CONTRAST
                                   | MLV_PROCESSED_THUMBNAIL_APPLY_SHADOWS
                                   | MLV_PROCESSED_THUMBNAIL_APPLY_HIGHLIGHTS
-                                  | MLV_PROCESSED_THUMBNAIL_APPLY_VIBRANCE;
+                                  | MLV_PROCESSED_THUMBNAIL_APPLY_VIBRANCE
+                                  | MLV_PROCESSED_THUMBNAIL_DISPLAY_LEVELS;
 
             const int totalFramesForMeter =
                 static_cast<int>( getMlvFrames( m_pMlvObject ) );

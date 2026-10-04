@@ -220,6 +220,20 @@ static int render_downscaled_processed_thumbnail_from_rgb16(
     return 1;
 }
 
+/* LOOK-ASSIST-ANALYSIS-TRUE-LEVELS-1: the display-space meter renders the picture the display shows (its
+ * brightness is the answer); every other analysis render keeps the judgement calibration (video_mlv.c). */
+static void set_analysis_processing_levels(mlvObject_t *video,
+                                           processingObject_t *analysis_processing,
+                                           const mlv_processed_thumbnail_settings_t *settings)
+{
+    if (settings && (settings->flags & MLV_PROCESSED_THUMBNAIL_DISPLAY_LEVELS)) {
+        mlvSetAnalysisProcessingDisplayLevels(video, analysis_processing);
+    }
+    else {
+        mlvSetAnalysisProcessingClipLevels(video, analysis_processing);
+    }
+}
+
 static int try_render_cachefree_scaled_processed_thumbnail(
     mlvObject_t *video,
     int frame_index,
@@ -256,6 +270,7 @@ static int try_render_cachefree_scaled_processed_thumbnail(
         int actual_w = 0;
         int actual_h = 0;
         int actual_scale = 0;
+        llrpResetLastOutputLevelsForCurrentThread();
         const int got_scaled =
             get_mlv_raw_frame_debayered_isolated_analysis_scaled(video,
                                                                  frame_index,
@@ -273,7 +288,7 @@ static int try_render_cachefree_scaled_processed_thumbnail(
                                         frame_index, raw_w, raw_h, actual_w, actual_h,
                                         actual_scale, fnv1a64_bytes(scaled_rgb,
                                                                     (size_t)actual_w * (size_t)actual_h * 3u * sizeof(uint16_t)));
-            mlvSetAnalysisProcessingClipLevels(video, analysis_processing);
+            set_analysis_processing_levels(video, analysis_processing, settings);
 
             const int result =
                 render_downscaled_processed_thumbnail_from_rgb16(frame_index,
@@ -406,8 +421,9 @@ int get_area_average_downscale_thumnail_with_processing(
         return 0;
     }
 
+    llrpResetLastOutputLevelsForCurrentThread();
     getMlvRawFrameFloat(video, frame_index, raw_frame);
-    mlvSetAnalysisProcessingClipLevels(video, analysis_processing);
+    set_analysis_processing_levels(video, analysis_processing, settings);
 
     uint16_t *debayered_raw_frame = (uint16_t *) malloc(
         (size_t)raw_w * (size_t)raw_h * 3u * sizeof(uint16_t));
@@ -487,12 +503,13 @@ int get_area_average_downscale_thumnail_with_processing_cachefree(
         return 0;
     }
 
+    llrpResetLastOutputLevelsForCurrentThread();
     get_mlv_raw_frame_debayered_isolated_analysis(video,
                                                   frame_index,
                                                   temp_frame,
                                                   debayered_raw_frame,
                                                   0);
-    mlvSetAnalysisProcessingClipLevels(video, analysis_processing);
+    set_analysis_processing_levels(video, analysis_processing, settings);
     trace_look_assist_thumbnail("processed-source-cachefree", frame_index, raw_w, raw_h, raw_w, raw_h,
                                 1, fnv1a64_bytes(debayered_raw_frame,
                                                  (size_t)raw_w * (size_t)raw_h * 3u * sizeof(uint16_t)));

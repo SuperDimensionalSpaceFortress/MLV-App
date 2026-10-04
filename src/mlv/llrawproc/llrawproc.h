@@ -60,6 +60,11 @@ void applyLLRawProcObjectWorkerIsolatedAnalysisWithChromaSmooth(mlvObject_t * vi
  * the vertical-stripe one-shot all land in a private per-thread shadow. Off by default; only measure-only analysis
  * (the Look Assist window-lit verification) turns it on. Returns the previous value. */
 int llrpSetIsolatedAnalysisSharedStateReadOnlyForCurrentThread(int enabled);
+/* The output levels (dng bit depth / black / white) of the last llrawproc run on the calling thread that completed for
+ * `video`, live or isolated: the levels its frame is at, which a display render syncs the processing object to. Returns
+ * 0 when no run completed for `video` since the last reset on this thread (e.g. the frame came from a cache). */
+void llrpResetLastOutputLevelsForCurrentThread(void);
+int llrpLastOutputLevelsForCurrentThread(const mlvObject_t * video, int * bit_depth, int * black_level, int * white_level);
 void llrpSetGpuPlaybackReconAllowedForCurrentThread(int enabled);
 void llrpSetGpuPlaybackReconTexturePresentPreferredForCurrentThread(int enabled);
 void llrpSetGpuPlaybackReconTexturePrepareOnlyForCurrentThread(int enabled);
