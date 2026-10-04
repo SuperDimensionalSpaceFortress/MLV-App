@@ -8,6 +8,7 @@
 #include "rbf.h"
 #include "rbf_wrapper.h"
 #include "RBFilterPlain.h"
+#include <atomic>
 #include <cstdlib>
 
 #ifdef __cplusplus
@@ -36,6 +37,23 @@ bool recursiveBfDetailTimingEnabled()
         envFlagEnabled(std::getenv("MLVAPP_PLAYBACK_RBF_DETAIL_TIMING"));
     return enabled;
 }
+
+// -1: follow MLVAPP_RBF_SERIAL_VERTICAL; 0: serial; 1: parallel.
+std::atomic<int> g_parallel_vertical_override(-1);
+
+bool recursiveBfParallelVerticalEnabled()
+{
+    const int override_mode = g_parallel_vertical_override.load(std::memory_order_relaxed);
+    if( override_mode >= 0 ) return override_mode != 0;
+    static const bool serial =
+        envFlagEnabled(std::getenv("MLVAPP_RBF_SERIAL_VERTICAL"));
+    return !serial;
+}
+}
+
+void recursive_bf_set_parallel_vertical_override(int mode)
+{
+    g_parallel_vertical_override.store(mode < 0 ? -1 : (mode ? 1 : 0), std::memory_order_relaxed);
 }
 
 void recursive_bf_wrap_with_curve_index_lut(uint16_t * img_in,
@@ -91,6 +109,7 @@ void recursive_bf_wrap_with_curve_index_lut(uint16_t * img_in,
         //Ming version with better right boarder
         g_rbf_filter.reserveMemory( width, height, channel );
         g_rbf_filter.setTimingEnabled( recursiveBfDetailTimingEnabled() );
+        g_rbf_filter.setParallelVertical( recursiveBfParallelVerticalEnabled() );
         g_rbf_filter.filter( img_in,
                              img_out,
                              sigma_spatial,

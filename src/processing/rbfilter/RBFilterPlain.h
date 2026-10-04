@@ -77,9 +77,31 @@ class CRBFilterPlain
 	float		m_range_table_inv_sigma = 0.0f;
 	bool		m_range_table_valid = false;
     bool        m_timing_enabled = false;
+    bool        m_parallel_vertical = true;
     RBFilterPlainTiming m_last_timing;
 
     int getDiffFactor(const uint16_t* color1, const uint16_t* color2) const;
+    void verticalDownColumns(const uint16_t* img_src, int width, int channel, bool rgb3,
+                             int down_end, int column_begin, int column_end,
+                             const float* range_table_f, float inv_alpha_f);
+    void verticalUpColumns(const uint16_t* img_src, int width, int height, int channel, bool rgb3,
+                           int up_begin, int column_begin, int column_end,
+                           const float* range_table_f, float inv_alpha_f);
+    void horizontalRow(const uint16_t* img_src, int y, int width, int height, int channel,
+                       bool rgb3, const float* range_table_f, float inv_alpha_f);
+    void outputRange(uint16_t* img_dst, int begin, int end, int channel,
+                     const uint16_t* output_lut, bool output_curve_index,
+                     const int32_t* output_curve_r,
+                     const int32_t* output_curve_g,
+                     const int32_t* output_curve_b) const;
+    void filterColumnParallel(const uint16_t* img_src, uint16_t* img_dst,
+                              int width, int height, int channel, bool rgb3,
+                              int down_end, int up_begin,
+                              const float* range_table_f, float inv_alpha_f,
+                              const uint16_t* output_lut, bool output_curve_index,
+                              const int32_t* output_curve_r,
+                              const int32_t* output_curve_g,
+                              const int32_t* output_curve_b);
 
 public:
 
@@ -101,5 +123,14 @@ public:
         const int32_t * __restrict output_curve_g = nullptr,
         const int32_t * __restrict output_curve_b = nullptr);
     void setTimingEnabled(bool enabled) { m_timing_enabled = enabled; }
+    // true (default): one parallel region, rows then column blocks, with the
+    // vertical passes column-parallel; bit-exact to the legacy passes.
+    // false: the legacy passes with the serial vertical pair (reference/rollback).
+    void setParallelVertical(bool enabled) { m_parallel_vertical = enabled; }
     RBFilterPlainTiming lastTiming() const { return m_last_timing; }
+    // Raw vertical-pass state of the last filter() call (bit-exactness tests).
+    const float* downPassColor() const { return m_down_pass_color; }
+    const float* downPassFactor() const { return m_down_pass_factor; }
+    const float* upPassColor() const { return m_up_pass_color; }
+    const float* upPassFactor() const { return m_up_pass_factor; }
 };
