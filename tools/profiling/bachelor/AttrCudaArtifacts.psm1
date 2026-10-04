@@ -1628,13 +1628,32 @@ function Get-AttrCudaLegTimeBudget {
         [ValidateRange(0, 3600)][int]$SettleSeconds = 3,
         [ValidateRange(0, 3600)][int]$RunnerSlackSeconds = 30,
         [ValidateRange(0, 7200)][int]$FixedPreLaunchSeconds = $script:AttrCudaMeasuredFixedPreLaunchSeconds,
-        [ValidateRange(0, 7200)][int]$PostRunSeconds = $script:AttrCudaAllowancePostRunSeconds
+        [ValidateRange(0, 7200)][int]$PostRunSeconds = $script:AttrCudaAllowancePostRunSeconds,
+        # CPU-LEG-SMOKE-CEILING-1: set ONLY for a CPU-informational leg (its Play may run to 765 s). See the clamp below. Never set for CUDA; a fixture CPU leg passes it but has no input bytes, so it never clamps.
+        [switch]$ShareSmokeCeiling
     )
 
     $inputMB = $InputBytes / 1048576.0
     $identityReadSec = [int][math]::Ceiling($inputMB / $ColdReadMBps * $ReadMargin)
-    $smokeSec = $identityReadSec + $LaunchSeconds + $PlaySeconds + $SettleSeconds + $RunnerSlackSeconds
+    $fixedSmokeSec = $LaunchSeconds + $PlaySeconds + $SettleSeconds + $RunnerSlackSeconds
+    $smokeSec = $identityReadSec + $fixedSmokeSec
     $smokeProcessTimeoutMs = [int64]$smokeSec * 1000
+    $appReadAllowanceSec = $identityReadSec
+    $smokeCeilingClamped = $false
+    if ($smokeProcessTimeoutMs -gt 3600000 -and $ShareSmokeCeiling) {
+        # CPU-LEG-SMOKE-CEILING-1: the job's own FULL margined identity read ($identityReadSec) runs BEFORE the runner and stays in jobTimeoutSec below, so
+        # what the runner's 3 600 s must hold is only the app's re-read of an input that was just read (page cache), at the ceiling's remainder. It is
+        # shrunk to that remainder, never below the measured worst-case read with NO margin; the margin the unclamped budget would have carried is
+        # what is given up, and the result says so (smokeCeilingClamped / appReadAllowanceSec).
+        $appReadAllowanceSec = 3600 - $fixedSmokeSec
+        $minimumReadSec = [int][math]::Ceiling($inputMB / $ColdReadMBps)
+        if ($appReadAllowanceSec -lt $minimumReadSec) {
+            throw "ATTRCUDA_TIMEBUDGET_EXCEEDS_SMOKE_CEILING the smoke ceiling of 3600 s leaves $appReadAllowanceSec s for the app to re-read the input after its $fixedSmokeSec s of launch, play, settle and slack, and the input needs $minimumReadSec s even with no margin (inputMB=$([math]::Round($inputMB)) coldReadMBps=$ColdReadMBps): the input cannot be read in a bounded leg at this rate"
+        }
+        $smokeSec = 3600
+        $smokeProcessTimeoutMs = 3600000
+        $smokeCeilingClamped = $true
+    }
     if ($smokeProcessTimeoutMs -gt 3600000) {
         # run-release-gui-smoke.ps1's own safety ceiling on a DERIVED timeout is 3 600 000 ms.
         throw "ATTRCUDA_TIMEBUDGET_EXCEEDS_SMOKE_CEILING derived smoke process timeout $smokeProcessTimeoutMs ms is over 3600000 ms (inputMB=$([math]::Round($inputMB)) coldReadMBps=$ColdReadMBps): the input cannot be read in a bounded leg at this rate"
@@ -1643,6 +1662,8 @@ function Get-AttrCudaLegTimeBudget {
         inputMB = [math]::Round($inputMB, 1)
         coldReadMBps = $ColdReadMBps
         identityReadSec = $identityReadSec
+        appReadAllowanceSec = $appReadAllowanceSec
+        smokeCeilingClamped = $smokeCeilingClamped
         smokeProcessTimeoutMs = [int]$smokeProcessTimeoutMs
         jobTimeoutSec = [int]($identityReadSec + $smokeSec + $FixedPreLaunchSeconds + $PostRunSeconds)
     }

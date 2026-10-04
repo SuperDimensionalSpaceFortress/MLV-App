@@ -191,12 +191,18 @@ class GeneratorByteIdentityAndVariantTests(unittest.TestCase):
     # 23 = 22 in the job template plus the one module-helper splice; r1 had 16 (15 + 1): r2 adds the per-action liveness helpers and listing retry (one region), the logman-path/timeout variables (inside the existing init region),
     # the PRESENTMON_TIMEOUT reason detail, and the post-Kill terminate trace + summary field at each of the three Stop call sites.
     ORPHAN_SWEEP_REGIONS = 23
+    # CONTACT-SHEET-PLAYBACK-PARITY-1: the in-pass contact sheet (the $ContactSheetPairedSeek variable, the AdditionalArgs override that drops
+    # --contact-sheet-seek-mode, and the paired-seek publish). Three regions; the baseline lines they supersede stay verbatim outside them.
+    CONTACT_SHEET_PARITY_OPEN = "CONTACT-SHEET-PLAYBACK-PARITY-1 >>>"
+    CONTACT_SHEET_PARITY_CLOSE = "CONTACT-SHEET-PLAYBACK-PARITY-1 <<<"
+    CONTACT_SHEET_PARITY_REGIONS = 3
 
     @classmethod
     def strip_regions(cls, text: str) -> tuple[str, dict[str, int]]:
         """Remove every bracketed region of either sentinel family; return the kept text and the number of regions per family."""
         families = {"leg-terminals": (cls.LEG_TERMINALS_OPEN, cls.LEG_TERMINALS_CLOSE), "presentmon-evidence": (cls.PRESENTMON_EVIDENCE_OPEN, cls.PRESENTMON_EVIDENCE_CLOSE),
-                    "orphan-sweep": (cls.ORPHAN_SWEEP_OPEN, cls.ORPHAN_SWEEP_CLOSE)}
+                    "orphan-sweep": (cls.ORPHAN_SWEEP_OPEN, cls.ORPHAN_SWEEP_CLOSE),
+                    "contact-sheet-parity": (cls.CONTACT_SHEET_PARITY_OPEN, cls.CONTACT_SHEET_PARITY_CLOSE)}
         kept: list[str] = []
         inside: str | None = None
         counts = {name: 0 for name in families}
@@ -235,6 +241,8 @@ class GeneratorByteIdentityAndVariantTests(unittest.TestCase):
         self.assertEqual(old_counts["presentmon-evidence"], self.PRESENTMON_EVIDENCE_REGIONS, "the baseline (master) carries the same bracketed DVE-PRESENTMON-EVIDENCE-1 region")
         self.assertEqual(new_counts["orphan-sweep"], self.ORPHAN_SWEEP_REGIONS, "the default job carries exactly the pinned number of bracketed UM-PRESENTMON-ORPHAN-SWEEP-1 regions")
         self.assertEqual(old_counts["orphan-sweep"], 0, "the baseline has none")
+        self.assertEqual(new_counts["contact-sheet-parity"], self.CONTACT_SHEET_PARITY_REGIONS, "the default job carries exactly the pinned number of bracketed CONTACT-SHEET-PLAYBACK-PARITY-1 regions")
+        self.assertEqual(old_counts["contact-sheet-parity"], 0, "the baseline has none")
         self.assertEqual(stripped, old_stripped,
                          "the DEFAULT (bachelor/cuda) emitted job changed outside the bracketed regions -- it must stay byte-identical to the pinned baseline")
 
@@ -1060,6 +1068,19 @@ class PerVenueConsentGateTests(RunnerHarness, unittest.TestCase):
         self.assertEqual(receipt["refusal"], "GENERATOR_REFUSED_PLAYBACK_ATTR3_OWNER_NOT_CONSENTED")
         self.assertNotIn(receipt["outcome"], ("PASS", "FAIL"))
         self.assertNotIn("the table has no such clip", json.dumps(receipt), "only the token is recorded, never the message body")
+
+    def test_an_input_too_large_for_a_bounded_leg_is_a_typed_receipt_refusal_not_a_runner_error(self) -> None:
+        # CPU-LEG-SMOKE-CEILING-1: the generator's time-budget refusal (ATTRCUDA_TIMEBUDGET_EXCEEDS_SMOKE_CEILING) is typed like every other generator refusal.
+        _, receipt, submitted = self.run_leg("ultra-magnus", self.write_spec(), gen_refusal="ATTRCUDA_TIMEBUDGET_EXCEEDS_SMOKE_CEILING the smoke ceiling of 3600 s leaves 1 s")
+        self.assertEqual(submitted, [])
+        self.assertEqual(receipt["refusal"], "GENERATOR_REFUSED_ATTRCUDA_TIMEBUDGET_EXCEEDS_SMOKE_CEILING")
+        self.assertNotIn("RUNNER_ERROR", receipt["outcomeDetail"])
+        self.assertNotIn("leaves 1 s", json.dumps(receipt), "only the token is recorded, never the message body")
+
+    def test_an_untyped_generator_failure_is_still_a_runner_error(self) -> None:
+        _, receipt, _submitted = self.run_leg("ultra-magnus", self.write_spec(), gen_refusal="SOME_OTHER_TOKEN a message")
+        self.assertIsNone(receipt.get("refusal"))
+        self.assertIn("RUNNER_ERROR", receipt["outcomeDetail"])
 
     def test_the_tracked_consent_file_is_owner_written_shape_only_and_names_no_path(self) -> None:
         tracked = json.loads((DV / "venue-clip-consent.json").read_text(encoding="utf-8"))

@@ -25,6 +25,7 @@
 #include <QTextStream>
 
 #include <cmath>
+#include <cstdio>
 #include <vector>
 
 using namespace lookassist;
@@ -1817,4 +1818,418 @@ TEST(LookAssistScene, BothConsumersAppendTheDecisionFieldsAndChangeNothingElse)
     // The walk's own gate and its recovery table are untouched by this card.
     ASSERT_TRUE( window.contains( QStringLiteral("!daylightScene && ( !autoWhiteBalanceValid || useProcessedColorStats )") ) );
     ASSERT_TRUE( window.contains( QStringLiteral("qMakePair( 250, 22 ),") ) );
+}
+
+// ---------------------------------------------------------------------------------------------------------------
+// LOOK-ASSIST-WINDOW-LIT-INTERIOR-1: a window-lit interior is not night.
+// The owner clip (M16-1243): flat-floor RAW thumbnail (median 32), no recorded exposure, night verdict; its processed
+// neutral patch (luma 208, chroma 6, B-R +6) solved 9930 K / -33, ACCEPTED undamped, and the night walk then replaced
+// it with the 250 / +22 recovery pair (blue-magenta). Synthetic here: the RAW floor is the tracked fixture's, the
+// picture is a dark room with a window whose colour follows the white balance under test.
+// ---------------------------------------------------------------------------------------------------------------
+namespace
+{
+
+struct WindowRoom
+{
+    int neutralKelvin = 9930;     // the balance at which the window surface renders exactly neutral
+    int neutralTint = -33;
+    int baseKelvin = 6000;        // the receipt's balance the patch picture was rendered at
+    int baseTint = 0;
+    double baseBlueAmber = 6.0;   // the window surface at the base balance: B-R and G-(R+B)/2 (the logged patch)
+    double baseGreen = 1.0;
+    int windowLuma = 210;
+};
+
+const int kRoomW = 96;
+const int kRoomH = 64;
+const int kRoomDownscale = 3;
+
+// The window surface at a white balance: its casts shrink linearly (in mired / tint) to zero at the neutral balance.
+std::vector<int> windowSurface( const WindowRoom &room, int kelvin, int tint )
+{
+    const double span = 1.0e6 / room.baseKelvin - 1.0e6 / room.neutralKelvin;
+    const double moved = 1.0e6 / room.baseKelvin - 1.0e6 / kelvin;
+    const double blueAmber = span == 0.0 ? room.baseBlueAmber : room.baseBlueAmber * ( 1.0 - moved / span );
+    const int tintSpan = room.neutralTint - room.baseTint;
+    const double green = tintSpan == 0 ? room.baseGreen
+                                       : room.baseGreen * ( 1.0 - (double)( tint - room.baseTint ) / tintSpan );
+    const double l = room.windowLuma;
+    return { qBound( 0, (int)qRound( l - blueAmber / 2.0 - green / 3.0 ), 255 ),
+             qBound( 0, (int)qRound( l + 2.0 * green / 3.0 ), 255 ),
+             qBound( 0, (int)qRound( l + blueAmber / 2.0 - green / 3.0 ), 255 ) };
+}
+
+// The room: luma 6..20 everywhere, a 20 x 20 window (6.5 % of the frame) at x 70..89, y 8..27.
+LookAssistRenderedPicture roomPicture( const WindowRoom &room, int kelvin, int tint )
+{
+    LookAssistRenderedPicture p;
+    p.width = kRoomW;
+    p.height = kRoomH;
+    p.downscaleFactor = kRoomDownscale;
+    p.rgb.resize( (size_t)kRoomW * kRoomH * 3 );
+    const std::vector<int> w = windowSurface( room, kelvin, tint );
+    for( int y = 0; y < kRoomH; ++y )
+        for( int x = 0; x < kRoomW; ++x )
+        {
+            const bool inWindow = x >= 70 && x < 90 && y >= 8 && y < 28;
+            const int d = 6 + ( x + 2 * y ) % 15;
+            unsigned char *px = &p.rgb[( (size_t)y * kRoomW + x ) * 3];
+            px[0] = (unsigned char)( inWindow ? w[0] : d );
+            px[1] = (unsigned char)( inWindow ? w[1] : d );
+            px[2] = (unsigned char)( inWindow ? w[2] : d + 3 );
+        }
+    p.stats = analyzeLookAssistThumbnail( p.rgb.data(), kRoomW, kRoomH );
+    return p;
+}
+
+struct WindowLitRun
+{
+    LookAssistStats stats;
+    LookAssistScene scene = LookAssistScene::Night;
+    LookAssistStats color;
+    LookAssistAutoWhiteBalancePatch patch;
+    LookAssistPreset preset;
+    LookAssistWhiteBalanceResolution wb;
+    LookAssistWindowLitCheck check;
+};
+
+enum class Renderer { Room, None, CastAtBase, OtherGeometry };
+
+// The night path exactly as the consumers run it up to the walk: scene, processed colour, patch search on the patch
+// picture, the one white-balance decision with `solved` as the solver's answer, then (applyRule) the window check.
+WindowLitRun runWindowLit( const LookAssistStats &raw, const WindowRoom &room, int solvedKelvin, int solvedTint,
+                           bool applyRule = true, bool processedSolve = true, Renderer renderer = Renderer::Room )
+{
+    WindowLitRun r;
+    r.stats = raw;
+    r.scene = resolveLookAssistScene( &r.stats, []( double, LookAssistStats *out ) {
+        *out = renderedPicture( 8, 8, []( int, int ) { return 8; } ); return true; } );
+    const LookAssistRenderedPicture patchPicture = roomPicture( room, room.baseKelvin, room.baseTint );
+    r.color = patchPicture.stats;
+    r.patch = findLookAssistAutoWhiteBalancePatch( patchPicture.rgb.data(), kRoomW, kRoomH, kRoomDownscale,
+                                                   kRoomW * kRoomDownscale, kRoomH * kRoomDownscale );
+    r.preset = presetForLookAssistScene( r.scene, r.stats, &r.color );
+    LookAssistWhiteBalanceRequest request;
+    request.stats = &r.stats;
+    request.scene = r.scene;
+    request.patch = r.patch;
+    request.solvedOnProcessedPicture = processedSolve;
+    request.baseTemperature = room.baseKelvin;
+    request.baseTint = room.baseTint;
+    request.rawWidth = kRoomW * kRoomDownscale;
+    request.rawHeight = kRoomH * kRoomDownscale;
+    WindowRoom castRoom = room;
+    castRoom.baseBlueAmber = 28.0;
+    switch( renderer )
+    {
+    case Renderer::Room:
+        request.renderBalance = [room]( double, int k, int t, LookAssistRenderedPicture *out ) {
+            *out = roomPicture( room, k, t ); return true; };
+        break;
+    case Renderer::CastAtBase:
+        request.renderBalance = [castRoom]( double, int k, int t, LookAssistRenderedPicture *out ) {
+            *out = roomPicture( castRoom, k, t ); return true; };
+        break;
+    case Renderer::OtherGeometry:
+        request.renderBalance = [room]( double, int k, int t, LookAssistRenderedPicture *out ) {
+            *out = roomPicture( room, k, t ); out->downscaleFactor = kRoomDownscale + 1; return true; };
+        break;
+    case Renderer::None:
+        break;
+    }
+    r.wb = resolveLookAssistWhiteBalance( request, [&]( int, int, int *t, int *s ) { *t = solvedKelvin; *s = solvedTint; },
+                                          &r.preset );
+    if( applyRule )
+        r.check = resolveLookAssistWindowLitInterior( request, r.wb, 1.2, &r.stats, &r.scene, &r.preset, &r.color );
+    return r;
+}
+
+WindowLitRun masterOf( const WindowRoom &room )
+{
+    return runWindowLit( fixtureRawStats(), room, 9930, -33, false );
+}
+
+bool samePreset( const LookAssistPreset &a, const LookAssistPreset &b )
+{
+    return a.exposure == b.exposure && a.contrast == b.contrast && a.pivot == b.pivot && a.shadows == b.shadows
+        && a.highlights == b.highlights && a.vibrance == b.vibrance && a.temperatureDelta == b.temperatureDelta
+        && a.tintDelta == b.tintDelta;
+}
+
+// The rule left this run exactly as master leaves it: the same verdict, stats flag, preset and balance.
+bool untouched( const WindowLitRun &r, const WindowLitRun &master )
+{
+    return !r.check.evidence && r.scene == master.scene && !r.stats.windowLitInteriorEvidence
+        && samePreset( r.preset, master.preset ) && r.wb.temperature == master.wb.temperature && r.wb.tint == master.wb.tint;
+}
+
+} // namespace
+
+TEST(LookAssistScene, AWindowLitInteriorIsNotNightAndKeepsItsOwnNeutralSolve)
+{
+    const WindowRoom room;
+    const WindowLitRun master = runWindowLit( fixtureRawStats(), room, 9930, -33, false );
+    // Master up to the walk, as logged for the owner clip: night, a window-bright neutral patch, accepted undamped.
+    ASSERT_TRUE( master.scene == LookAssistScene::Night );
+    ASSERT_FALSE( master.stats.hasSceneEv100 );
+    ASSERT_TRUE( lookAssistIsFloorLiftedNightThumbnail( master.scene, master.stats ) );
+    ASSERT_TRUE( master.patch.valid );
+    ASSERT_NEAR( 210.0, master.patch.luma, 2.0 );
+    ASSERT_NEAR( 6.0, master.patch.chroma, 0.5 );
+    ASSERT_TRUE( master.wb.autoValid );
+    ASSERT_TRUE( master.wb.decision == QStringLiteral("accepted") );
+    ASSERT_TRUE( master.wb.source == QStringLiteral("processed-neutral-patch") );
+    ASSERT_EQ( 9930, master.wb.temperature );
+    ASSERT_EQ( -33, master.wb.tint );
+    ASSERT_FALSE( lookAssistIsDaylightScene( master.stats, master.scene ) );   // master then walks it (blue-magenta)
+
+    const WindowLitRun r = runWindowLit( fixtureRawStats(), room, 9930, -33 );
+    ASSERT_TRUE( r.check.candidate );
+    ASSERT_TRUE( r.check.evidence );
+    ASSERT_TRUE( r.check.reason == QStringLiteral("pass") );
+    // Not night: the daylight class, by the window evidence (the exposure still cannot say daylight).
+    ASSERT_TRUE( r.stats.windowLitInteriorEvidence );
+    ASSERT_FALSE( r.stats.daylightPictureEvidence );
+    ASSERT_TRUE( r.scene == LookAssistScene::Shade );
+    ASSERT_TRUE( lookAssistSceneIsDaylight( r.stats ) );
+    ASSERT_TRUE( lookAssistIsDaylightScene( r.stats, r.scene ) );
+    ASSERT_FALSE( lookAssistIsFloorLiftedNightThumbnail( r.scene, r.stats ) );
+    // ... so the GUI's night walk does not run (its gate, verbatim: !daylightScene && ...).
+    const bool daylightScene = lookAssistIsDaylightScene( r.stats, r.scene );
+    ASSERT_FALSE( !daylightScene && ( !r.wb.autoValid || true ) );
+    // A neutral balance: the clip's own accepted solve, unchanged, inside the daylight window.
+    ASSERT_EQ( 9930, room.baseKelvin + r.preset.temperatureDelta );
+    ASSERT_EQ( -33, room.baseTint + r.preset.tintDelta );
+    const LookAssistWhiteBalanceBounds bounds = lookAssistWhiteBalanceBounds( r.stats, r.scene );
+    ASSERT_EQ( 4800, bounds.minTemperature );
+    ASSERT_EQ( -35, bounds.minTint );
+    ASSERT_EQ( 10, bounds.maxTint );
+    ASSERT_TRUE( r.check.solutionSurfaceChroma <= 1.0 );                  // the window is neutral at the solution
+    ASSERT_NEAR( 6.0, r.check.baseSurfaceChroma, 0.5 );
+    // The tone is the daylight class's own preset on the same inputs (no night rescue), the balance the solve.
+    LookAssistPreset shade = presetForLookAssistScene( LookAssistScene::Shade, r.stats, &r.color );
+    shade.temperatureDelta = r.preset.temperatureDelta;
+    shade.tintDelta = r.preset.tintDelta;
+    ASSERT_TRUE( samePreset( shade, r.preset ) );
+    ASSERT_TRUE( r.preset.shadows < master.preset.shadows );
+    // The log names the evidence.
+    ASSERT_TRUE( lookAssistDecisionLogFields( r.stats, LookAssistDecisionTrace() ).startsWith(
+        QStringLiteral("has_ev100=0 ev100=NA daylight_gate=window post_walk_ran=0 ") ) );
+    ASSERT_TRUE( lookAssistDaylightGateName( r.stats, true ) == QStringLiteral("window") );
+}
+
+TEST(LookAssistScene, ATrueNightClipKeepsItsVerdictPresetAndBalance)
+{
+    // The same dark room, its bright neutral surface lit by a night light source: the clip's own solve is warmer than
+    // (or too close to) the 6000 K base, so it is not daylight and master's result stands bit for bit.
+    struct Light { const char *name; int kelvin; int tint; double baseBlueAmber; };
+    const Light lights[] = {
+        { "sodium",    2100, 10, -14.0 }, { "tungsten", 3200,  4, -10.0 }, { "moonlight", 4100, 0, -6.0 },
+        { "stage-led", 5600, -5,  -2.0 }, { "cool-led", 6500,  0,   2.0 }, { "just-under", 6999, -20, 3.0 } };
+    for( const Light &l : lights )
+    {
+        WindowRoom room;
+        room.neutralKelvin = l.kelvin;
+        room.neutralTint = l.tint;
+        room.baseBlueAmber = l.baseBlueAmber;
+        const WindowLitRun master = runWindowLit( fixtureRawStats(), room, l.kelvin, l.tint, false );
+        const WindowLitRun r = runWindowLit( fixtureRawStats(), room, l.kelvin, l.tint );
+        std::fprintf( stderr, "WINDOW-LIT night=%s scene=%s reason=%s accepted=%d\n", l.name,
+                      qPrintable( lookAssistSceneName( r.scene ) ), qPrintable( r.check.reason ), r.wb.autoValid ? 1 : 0 );
+        ASSERT_TRUE( master.scene == LookAssistScene::Night );
+        ASSERT_TRUE( r.check.candidate );
+        ASSERT_TRUE( r.check.reason == QStringLiteral("not-daylight-locus") );
+        ASSERT_TRUE( untouched( r, master ) );
+        ASSERT_TRUE( lookAssistDecisionLogFields( r.stats, LookAssistDecisionTrace() ).contains(
+            QStringLiteral("daylight_gate=exposure ") ) );
+    }
+
+    // A night clip WITH a recorded exposure is never a candidate, whatever its picture says: an ND-filtered day
+    // (EV100 8.6, the existing pinned case) and a true night exposure (ISO 3200, 1/30 s, f/1.8).
+    const WindowRoom daylightWindow;
+    for( const LookAssistStats &raw : { withEv( fixtureRawStats(), 100, 20000, 280 ), withEv( fixtureRawStats(), 3200, 33333, 180 ) } )
+    {
+        const WindowLitRun master = runWindowLit( raw, daylightWindow, 9930, -33, false );
+        const WindowLitRun r = runWindowLit( raw, daylightWindow, 9930, -33 );
+        ASSERT_TRUE( master.scene == LookAssistScene::Night );
+        ASSERT_FALSE( r.check.candidate );
+        ASSERT_TRUE( r.check.reason == QStringLiteral("not-candidate") );
+        ASSERT_TRUE( untouched( r, master ) );
+    }
+}
+
+TEST(LookAssistScene, EveryWindowLitConjunctIsNeededOnItsOwn)
+{
+    // Each case breaks exactly ONE conjunct of the M16 run (which passes); the verdict must stay master's.
+    const WindowRoom room;
+
+    // Usable (non-flat) RAW thumbnail with a night verdict: the thumbnail speaks, so it is believed.
+    const LookAssistStats usable = analyzeFrame( 64, 64, []( int x, int ) {
+        return std::vector<int>{ 20 + x / 2, 20 + x / 2, 20 + x / 2 }; } );
+    ASSERT_FALSE( lookAssistIsFlatFloorRawThumbnail( usable ) );
+    ASSERT_TRUE( classifyLookAssistScene( usable ) == LookAssistScene::Night );
+    {
+        const WindowLitRun r = runWindowLit( usable, room, 9930, -33 );
+        ASSERT_TRUE( r.check.reason == QStringLiteral("not-candidate") );
+        ASSERT_TRUE( untouched( r, runWindowLit( usable, room, 9930, -33, false ) ) );
+    }
+    // A flat floor that the legacy classifier calls artificial lights (a lamp clipped in p99) is not night.
+    LookAssistStats lamp = fixtureRawStats();
+    lamp.p99 = 240;
+    ASSERT_TRUE( lookAssistIsFlatFloorRawThumbnail( lamp ) );
+    ASSERT_TRUE( classifyLookAssistScene( lamp ) == LookAssistScene::ArtificialLights );
+    {
+        const WindowLitRun r = runWindowLit( lamp, room, 9930, -33 );
+        ASSERT_TRUE( r.check.reason == QStringLiteral("not-candidate") );
+        ASSERT_TRUE( untouched( r, runWindowLit( lamp, room, 9930, -33, false ) ) );
+    }
+    // Solved on the RAW thumbnail, not the processed picture.
+    {
+        const WindowLitRun r = runWindowLit( fixtureRawStats(), room, 9930, -33, true, false );
+        ASSERT_TRUE( r.check.reason == QStringLiteral("not-processed-solve") );
+        ASSERT_TRUE( untouched( r, runWindowLit( fixtureRawStats(), room, 9930, -33, false, false ) ) );
+    }
+    // Accepted only damped (a chroma-12 patch 3930 K from base): master hedged it, so it is not believed undamped.
+    {
+        WindowRoom tinted = room;
+        tinted.baseBlueAmber = 12.0;
+        const WindowLitRun r = runWindowLit( fixtureRawStats(), tinted, 9930, -33 );
+        ASSERT_TRUE( r.wb.decision == QStringLiteral("accepted-damped") );
+        ASSERT_TRUE( r.check.reason == QStringLiteral("not-accepted-undamped") );
+        ASSERT_TRUE( untouched( r, runWindowLit( fixtureRawStats(), tinted, 9930, -33, false ) ) );
+    }
+    // A patch below window brightness (a lamp-lit wall), from a 6500 K base so no damping hides it.
+    {
+        WindowRoom dim = room;
+        dim.baseKelvin = 6500;
+        dim.neutralKelvin = 7300;
+        dim.neutralTint = -10;
+        dim.windowLuma = 140;
+        const WindowLitRun r = runWindowLit( fixtureRawStats(), dim, 7300, -10 );
+        ASSERT_TRUE( r.wb.decision == QStringLiteral("accepted") );
+        ASSERT_TRUE( r.check.reason == QStringLiteral("dim-patch") );
+        ASSERT_TRUE( untouched( r, runWindowLit( fixtureRawStats(), dim, 7300, -10, false ) ) );
+    }
+    // A patch that is too coloured to be neutral under daylight (B-R +22), again with no damping to hide it.
+    {
+        WindowRoom blue = room;
+        blue.baseKelvin = 6500;
+        blue.neutralKelvin = 7300;
+        blue.neutralTint = -10;
+        blue.baseBlueAmber = 22.0;
+        const WindowLitRun r = runWindowLit( fixtureRawStats(), blue, 7300, -10 );
+        ASSERT_TRUE( r.wb.decision == QStringLiteral("accepted") );
+        ASSERT_TRUE( r.check.reason == QStringLiteral("patch-not-neutral") );
+        ASSERT_TRUE( untouched( r, runWindowLit( fixtureRawStats(), blue, 7300, -10, false ) ) );
+    }
+    // Bluer than the base but off the daylight locus on tint (+15 > +10: a green fluorescent correction).
+    {
+        WindowRoom green = room;
+        green.neutralTint = 15;
+        const WindowLitRun r = runWindowLit( fixtureRawStats(), green, 9930, 15 );
+        ASSERT_TRUE( r.wb.decision == QStringLiteral("accepted") );
+        ASSERT_TRUE( r.check.reason == QStringLiteral("not-daylight-locus") );
+        ASSERT_TRUE( untouched( r, runWindowLit( fixtureRawStats(), green, 9930, 15, false ) ) );
+    }
+    // Nothing to verify the solve on.
+    {
+        const WindowLitRun r = runWindowLit( fixtureRawStats(), room, 9930, -33, true, true, Renderer::None );
+        ASSERT_TRUE( r.check.reason == QStringLiteral("no-renderer") );
+        ASSERT_TRUE( untouched( r, masterOf( room ) ) );
+    }
+    // The renderer's picture is not the patch picture's geometry: the surface cannot be found again.
+    {
+        const WindowLitRun r = runWindowLit( fixtureRawStats(), room, 9930, -33, true, true, Renderer::OtherGeometry );
+        ASSERT_TRUE( r.check.reason == QStringLiteral("unverifiable") );
+        ASSERT_TRUE( untouched( r, masterOf( room ) ) );
+    }
+    // The surface is not near-neutral at the base balance in the verification picture.
+    {
+        const WindowLitRun r = runWindowLit( fixtureRawStats(), room, 9930, -33, true, true, Renderer::CastAtBase );
+        ASSERT_TRUE( r.check.reason == QStringLiteral("unverified-at-base") );
+        ASSERT_TRUE( untouched( r, masterOf( room ) ) );
+    }
+    // The solver overshoots: the window is neutral at 6800 K, the solve says 9930 K and leaves it amber.
+    {
+        WindowRoom warmer = room;
+        warmer.neutralKelvin = 6800;
+        warmer.neutralTint = -33;
+        const WindowLitRun r = runWindowLit( fixtureRawStats(), warmer, 9930, -33 );
+        ASSERT_TRUE( r.wb.decision == QStringLiteral("accepted") );
+        ASSERT_TRUE( r.check.reason == QStringLiteral("unverified-at-solution") );
+        ASSERT_TRUE( r.check.solutionSurfaceChroma > r.check.baseSurfaceChroma + 0.75 );
+        ASSERT_TRUE( untouched( r, runWindowLit( fixtureRawStats(), warmer, 9930, -33, false ) ) );
+    }
+}
+
+TEST(LookAssistScene, BothConsumersRunTheWindowLitCheckMeasureOnly)
+{
+    // On the owner clip the accepted solve did not verify (its own patch turns amber at the solution), so both consumers
+    // run the check on COPIES and only log it: verdict, preset, balance and the sync/async routing stay master's.
+    const QString applier = readRepoFile( QStringLiteral("src/batch/ReceiptApplier.cpp") );
+    const QString window = readRepoFile( QStringLiteral("platform/qt/MainWindow.cpp") );
+    ASSERT_FALSE( applier.isEmpty() );
+    ASSERT_FALSE( window.isEmpty() );
+    const QString copies = QStringLiteral(
+        "windowLitRequest, wb, %1, &windowLitStats, &windowLitScene, &windowLitPreset," );
+
+    // GUI sync: once, after the one white-balance decision and its master-pass fallback, before the values are applied.
+    ASSERT_EQ( 1, window.count( QStringLiteral("resolveLookAssistWindowLitInterior(") ) );
+    ASSERT_EQ( 1, window.count( copies.arg( QStringLiteral("m_pMlvObject->processing->exposure_stops") ) ) );
+    ASSERT_EQ( 1, window.count( QStringLiteral("windowLitRequest.stats = &windowLitStats;") ) );
+    const int sync = window.indexOf( QStringLiteral("// --- synchronous fallback (MLVAPP_LOOK_ASSIST_SYNC=1) ---") );
+    const int syncWb = window.indexOf( QStringLiteral("const LookAssistWhiteBalanceResolution wb = resolveLookAssistWhiteBalance("), sync );
+    const int masterPass = window.indexOf( QStringLiteral("applyLookAssistToReceipt( receipt, analysisFrame );"), syncWb );
+    const int guiCheck = window.indexOf( QStringLiteral("resolveLookAssistWindowLitInterior("), sync );
+    const int applied = window.indexOf( QStringLiteral("applyLookAssistValues();"), syncWb );
+    ASSERT_TRUE( sync > 0 && syncWb > sync && masterPass > syncWb && guiCheck > masterPass && applied > guiCheck );
+    // Nothing the live pass uses can be changed by it: the verdict and the night flag stay const, the routing is master's.
+    ASSERT_TRUE( window.contains( QStringLiteral("const LookAssistScene scene = resolveLookAssistScene(") ) );
+    ASSERT_TRUE( window.contains( QStringLiteral("const bool floorLiftedNightThumbnail =") ) );
+    ASSERT_TRUE( window.contains( QStringLiteral(
+        "const bool daylightNeedsLivePicture = lookAssistIsDaylightScene( stats, scene ) || s_lookAssistMasterScenePass;") ) );
+    ASSERT_FALSE( window.contains( QStringLiteral("lookAssistWindowLitInteriorCandidate(") ) );
+
+    // Headless: the same, after its decision and its master-pass fallback, before the receipt is written.
+    ASSERT_EQ( 1, applier.count( QStringLiteral("resolveLookAssistWindowLitInterior(") ) );
+    ASSERT_EQ( 1, applier.count( copies.arg( QStringLiteral("mlvObject->processing->exposure_stops") ) ) );
+    ASSERT_EQ( 1, applier.count( QStringLiteral("windowLitRequest.stats = &windowLitStats;") ) );
+    ASSERT_TRUE( applier.contains( QStringLiteral("const LookAssistScene scene = resolveLookAssistScene(") ) );
+    const int hWb = applier.indexOf( QStringLiteral("const LookAssistWhiteBalanceResolution wb = resolveLookAssistWhiteBalance(") );
+    const int hMaster = applier.indexOf( QStringLiteral("return applyHeadlessLookAssist( receipt, mlvObject, processingObject, analysisFrame, true );"), hWb );
+    const int hCheck = applier.indexOf( QStringLiteral("resolveLookAssistWindowLitInterior("), hWb );
+    const int hWrite = applier.indexOf( QStringLiteral("receipt->setExposure( preset.exposure );"), hWb );
+    ASSERT_TRUE( hWb > 0 && hMaster > hWb && hCheck > hMaster && hWrite > hCheck );
+
+    // sol r1: the check's two verification renders go through the isolated, read-only renderer in BOTH consumers (the
+    // live one prepares and versions llrawproc's shared pixel maps), set after the copied request, before the check.
+    const QString assignments[] = {
+        QStringLiteral("windowLitRequest.renderBalance = ReceiptApplier::lookAssistMeasureOnlyRenderer("),
+        QStringLiteral("windowLitRequest.renderBalance = lookAssistMeasureOnlyRenderer(") };
+    const QString consumers[] = { window, applier };
+    for( int i = 0; i < 2; ++i )
+    {
+        const QString &consumer = consumers[i];
+        ASSERT_EQ( 1, consumer.count( QStringLiteral("windowLitRequest.renderBalance =") ) );
+        ASSERT_EQ( 1, consumer.count( assignments[i] ) );
+        const int copied = consumer.indexOf( QStringLiteral("LookAssistWhiteBalanceRequest windowLitRequest = wbRequest;") );
+        const int isolated = consumer.indexOf( assignments[i] );
+        const int check = consumer.indexOf( QStringLiteral("resolveLookAssistWindowLitInterior(") );
+        ASSERT_TRUE( copied > 0 && isolated > copied && check > isolated );
+        // fable r1 (LOOK-ASSIST-WINDOW-LIT-MEASURE-ONLY-RENDER-PIN-1): nothing is copied back. Each copy is declared,
+        // handed to the check and never read again, so `preset = windowLitPreset;` (or the scene / stats) fails here.
+        ASSERT_EQ( 2, consumer.count( QStringLiteral("windowLitPreset") ) );
+        ASSERT_EQ( 2, consumer.count( QStringLiteral("windowLitScene") ) );
+        ASSERT_EQ( 3, consumer.count( QStringLiteral("windowLitStats") ) );
+        ASSERT_EQ( 0, consumer.count( QRegularExpression( QStringLiteral("=\\s*windowLit(Preset|Scene|Stats)\\b") ) ) );
+    }
+    // The renderer itself: the isolated render with the llrawproc read-only switch around it, restored after.
+    const int measureOnly = applier.indexOf( QStringLiteral("LookAssistRenderBalanceFn ReceiptApplier::lookAssistMeasureOnlyRenderer(") );
+    ASSERT_TRUE( measureOnly > 0 );
+    ASSERT_TRUE( applier.indexOf( QStringLiteral("cpuCores, true );"), measureOnly ) > measureOnly );
+    ASSERT_TRUE( applier.contains( QStringLiteral(
+        "const int previousReadOnly = llrpSetIsolatedAnalysisSharedStateReadOnlyForCurrentThread( 1 );") ) );
+    ASSERT_TRUE( applier.contains( QStringLiteral(
+        "llrpSetIsolatedAnalysisSharedStateReadOnlyForCurrentThread( previousReadOnly );") ) );
 }

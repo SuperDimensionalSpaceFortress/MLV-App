@@ -286,10 +286,10 @@ class ContactSheetSwitchTests(unittest.TestCase):
         end = text.index(end_marker) + len(end_marker)
         return text[start:end]
 
-    def _eval_cmd_for(self, text: str, enabled: bool, frame_count: int) -> str:
+    def _eval_cmd_for(self, text: str, enabled: bool, frame_count: int, paired_seek: bool = False) -> str:
         snippet = self._extract_cmd_construction_snippet(text)
-        work_dir = self.tmp / f"work-eval-{enabled}-{frame_count}"
-        probe = self.tmp / f"probe-cmd-{enabled}-{frame_count}.ps1"
+        work_dir = self.tmp / f"work-eval-{enabled}-{frame_count}-{paired_seek}"
+        probe = self.tmp / f"probe-cmd-{enabled}-{frame_count}-{paired_seek}.ps1"
         probe.write_text(
             "$ErrorActionPreference = 'Stop'\n"
             f"$Work = '{work_dir}'\n"
@@ -300,6 +300,7 @@ class ContactSheetSwitchTests(unittest.TestCase):
             "$envList = \"'A=1','B=2'\"\n"
             f"$ContactSheetEnabled = ${'true' if enabled else 'false'}\n"
             f"$ContactSheetFrameCount = {frame_count}\n"
+            f"$ContactSheetPairedSeek = ${'true' if paired_seek else 'false'}\n"
             + snippet
             + "\nWrite-Output \"CMD=$cmd\"\n",
             encoding="utf-8",
@@ -329,6 +330,32 @@ class ContactSheetSwitchTests(unittest.TestCase):
         # The "off" prefix of the "on" command must still match the off command exactly --
         # AdditionalArgs is strictly appended, never interleaved or substituted in.
         self.assertTrue(cmd_on.startswith(cmd_off))
+
+    def test_default_sheet_is_the_in_pass_capture_and_a_seek_sheet_only_comes_paired_on_request(self) -> None:
+        # CONTACT-SHEET-PLAYBACK-PARITY-1: the app grabs the -ContactSheet frames DURING the measured
+        # Play (playback_path=true, no replay), so the job no longer forces --contact-sheet-seek-mode.
+        # -ContactSheetPairedSeek adds a labelled seek capture into its own dir; it never replaces it.
+        off_file = self._generate("paired-off.job.ps1", "-ContactSheet")
+        on_file = self._generate("paired-on.job.ps1", "-ContactSheet", "-ContactSheetPairedSeek")
+        off_text = off_file.read_text(encoding="utf-8")
+        on_text = on_file.read_text(encoding="utf-8")
+        self.assertIn("$ContactSheetPairedSeek = $false", off_text)
+        self.assertIn("$ContactSheetPairedSeek = $true", on_text)
+
+        cmd_default = self._eval_cmd_for(off_text, enabled=True, frame_count=6)
+        self.assertIn("--contact-sheet-dir", cmd_default)
+        self.assertNotIn("--contact-sheet-seek-mode", cmd_default)
+        self.assertNotIn("--contact-sheet-seek-dir", cmd_default)
+
+        cmd_paired = self._eval_cmd_for(on_text, enabled=True, frame_count=6, paired_seek=True)
+        self.assertIn("--contact-sheet-dir", cmd_paired)
+        self.assertIn("--contact-sheet-seek-dir", cmd_paired)
+        self.assertIn("contact-sheet-seek", cmd_paired)
+        self.assertNotIn("--contact-sheet-seek-mode", cmd_paired)
+
+        # The paired frames publish under their own labelled root, never mixed into the in-pass ones.
+        self.assertIn("-PubRoot (Join-Path $Pub 'paired-seek')", on_text)
+        self._assert_valid_powershell(on_file)
 
     def _extract_presentmon_helper_functions(self, text: str) -> str:
         """Start/Wait/Stop-PresentMonCapture -- the compose step's HARDENING fix (r1d) reuses

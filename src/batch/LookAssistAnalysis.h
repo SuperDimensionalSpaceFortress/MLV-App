@@ -58,6 +58,10 @@ struct LookAssistStats
     // resolveLookAssistScene). The recorded exposure alone is NOT proof of daylight: a night moon
     // shot at ISO 200, 1/500 s, f/7.1 records EV100 13.6 over a black sky.
     bool daylightPictureEvidence = false;
+    // A window-lit interior: a flat-floor "night" verdict with no recorded exposure whose own neutral-patch solve
+    // is daylight and verifies on the picture (set only by resolveLookAssistWindowLitInterior). Daylight evidence
+    // in its own right; see lookAssistSceneIsDaylight.
+    bool windowLitInteriorEvidence = false;
     // The clip's recorded (as-shot) white balance, mapped to the app's temperature / tint controls
     // (tint in receipt units). Only a PRIOR: used when no neutral patch can be trusted.
     bool hasAsShotWb = false;
@@ -108,7 +112,7 @@ void lookAssistSetSceneEv100( LookAssistStats *stats,
  * interiors <= ~10). NECESSARY, never sufficient: see lookAssistSceneIsDaylight. */
 bool lookAssistExposureIsDaylightBright( const LookAssistStats &stats );
 
-/* Daylight = bright recorded exposure AND the rendered picture agrees. */
+/* Daylight = bright recorded exposure AND the rendered picture agrees, or a verified window-lit interior. */
 bool lookAssistSceneIsDaylight( const LookAssistStats &stats );
 
 /* Daylight and not a scene class that excludes it. Every daylight-only rule below keys on this. */
@@ -163,8 +167,9 @@ void lookAssistTraceWalkCleanup( LookAssistDecisionTrace *trace );   // call whe
 void lookAssistTraceWalkRecovery( LookAssistDecisionTrace *trace, bool candidateAdopted,
                                   int temperatureDelta, int tintDelta );
 
-/* daylight_gate value: exposure | flatfloor | legacy | picture | pass | n/a, for the stats AFTER
- * resolveLookAssistScene. pass = the rendered picture corroborated daylight; picture = every other conjunct held
+/* daylight_gate value: window | exposure | flatfloor | legacy | picture | pass | n/a, for the stats AFTER
+ * resolveLookAssistScene (and resolveLookAssistWindowLitInterior). window = a verified window-lit interior (see there);
+ * pass = the rendered picture corroborated daylight; picture = every other conjunct held
  * and the picture did not (or could not) say so; n/a = every other conjunct held and no picture was asked for
  * (the master pass). An earlier failing conjunct is reported whether or not a picture was asked for. */
 QString lookAssistDaylightGateName( const LookAssistStats &resolved, bool pictureEvidenceAsked );
@@ -406,6 +411,51 @@ bool lookAssistDaylightNeedsRenderedRefinement( const LookAssistStats &stats,
                                                 LookAssistScene scene,
                                                 const LookAssistWhiteBalanceResolution &resolution,
                                                 bool refineEnabled );
+
+/* ---- Window-lit interior (LOOK-ASSIST-WINDOW-LIT-INTERIOR-1) ----
+ * A dual-ISO clip of a dark room with daylight windows: its RAW thumbnail is a flat floor (so the legacy classifier
+ * calls it night), it carries no recorded exposure (so the daylight gate cannot open), and the night post-balance walk
+ * then overrode its ACCEPTED daylight-locus neutral solve with a blue-magenta recovery pair. The night verdict is kept
+ * unless the clip's own solve, on the processed picture, says daylight and verifies:
+ *   - candidate: legacy Night, flat-floor RAW thumbnail, no recorded exposure (a clip WITH EV100 keeps today's gate);
+ *   - the balance was solved on the processed picture and accepted undamped;
+ *   - the patch is window-bright (luma >= 150) and neutral enough under daylight (lookAssistDaylightPatchIsNeutralEnough);
+ *   - the solve is bluer than the 6000 K base and on the daylight locus: >= 7000 K and inside the daylight window. Every
+ *     night light source (tungsten, sodium, warm or neutral LED, moonlight) solves warmer than the base;
+ *   - verified: the same surface, rendered at the patch picture's exposure, is near-neutral at the base balance and at
+ *     the solution and no more cast there (the daylight initial-patch guard, with the base balance as the start).
+ * Then stats->windowLitInteriorEvidence is set, the scene becomes the daylight class (Shade), the preset is that
+ * scene's (same inputs) and the accepted balance stands, clamped into the daylight window (a no-op by the gate).
+ * CONSUMERS RUN IT MEASURE-ONLY (on copies, logging window_lit_interior): on the owner clip the accepted solve did not
+ * verify (its own patch turns amber at the solution), so nothing is reclassified until the follow-ons land. */
+static const double kLookAssistWindowLitMinPatchLuma = 150.0;
+static const int    kLookAssistWindowLitMinTemperature = 7000;
+
+/* The night verdict could be a window-lit interior: legacy Night from a flat-floor RAW thumbnail, no recorded exposure. */
+bool lookAssistWindowLitInteriorCandidate( const LookAssistStats &stats, LookAssistScene scene );
+
+struct LookAssistWindowLitCheck
+{
+    bool candidate = false;
+    bool evidence = false;
+    QString reason = QStringLiteral("not-candidate");   // the first conjunct that failed, or "pass"
+    double baseSurfaceChroma = 0.0;
+    double baseSurfaceBlueAmber = 0.0;
+    double solutionSurfaceChroma = 0.0;
+    double solutionSurfaceBlueAmber = 0.0;
+};
+
+/* Runs after resolveLookAssistWhiteBalance on the same request. patchPictureExposureStops = the exposure (stops) of
+ * the processed picture the patch was found in, so the verification renders the same picture. On evidence it updates
+ * stats (request.stats must point at it), scene and preset as described above; otherwise it changes nothing. */
+LookAssistWindowLitCheck resolveLookAssistWindowLitInterior( const LookAssistWhiteBalanceRequest &request,
+                                                             const LookAssistWhiteBalanceResolution &wb,
+                                                             double patchPictureExposureStops,
+                                                             LookAssistStats *stats,
+                                                             LookAssistScene *scene,
+                                                             LookAssistPreset *preset,
+                                                             const LookAssistStats *colorStats = nullptr,
+                                                             const LookAssistStats *displayStats = nullptr );
 
 int lookAssistDisplayTargetMedianForScene( LookAssistScene scene );
 

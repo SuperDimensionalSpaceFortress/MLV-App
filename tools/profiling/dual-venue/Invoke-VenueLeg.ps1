@@ -296,7 +296,8 @@ try {
         # A typed generator refusal (owner id unknown / not consented / clip too short / bad argument) is a refusal
         # receipt, recorded as its TOKEN only (a message may echo a value). Anything untyped is a runner error.
         $first = ([string]$_.Exception.Message -split '\s+')[0]
-        if ($first -match '^(PLAYBACK_ATTR3|DUAL_VENUE)_[A-Z0-9_]+$') { Stop-Refused "GENERATOR_REFUSED_$first" }
+        # ATTRCUDA_TIMEBUDGET_EXCEEDS_SMOKE_CEILING (CPU-LEG-SMOKE-CEILING-1): an input too large for a bounded leg at the measured read rate is a typed refusal, not a runner error.
+        if ($first -match '^((PLAYBACK_ATTR3|DUAL_VENUE)_[A-Z0-9_]+|ATTRCUDA_TIMEBUDGET_EXCEEDS_SMOKE_CEILING)$') { Stop-Refused "GENERATOR_REFUSED_$first" }
         throw
     }
     $generated = $genOut[-1]
