@@ -435,7 +435,8 @@ jobs:
           # on how many of them sort into the same 12-name window (two windows overran 240 s).
           # Every other window keeps its membership, minus those tests.
           # LookAssistFlavorsFixture (LOOK-ASSIST-FLAVORS-1) renders the same fixtures, 20-75 s each locally, so it runs alone too.
-          $soloPattern = '^(LookAssistFixtureScene|LookAssistFlavorsFixture)\.'
+          # LookAssistAnalysisRenderRace (LOOK-ASSIST-ANALYSIS-RENDER-RACE-1) renders the HQ dual-ISO fixture before and after a level sync, 20-101 s each locally (229 s for the 4), so it runs alone too.
+          $soloPattern = '^(LookAssistFixtureScene|LookAssistFlavorsFixture|LookAssistAnalysisRenderRace)\.'
           $shards = @()
           for ($offset = 0; $offset -lt $testNames.Count; $offset += $testsPerShard) {
             $end = [Math]::Min($offset + $testsPerShard, $testNames.Count)

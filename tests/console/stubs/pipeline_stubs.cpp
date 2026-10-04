@@ -233,6 +233,16 @@ void findMlvWhiteBalance(mlvObject_t *, uint64_t, int, int, int * wbTemp, int * 
     }
 }
 
+void findMlvWhiteBalanceAtAnalysisLevels(mlvObject_t *, uint64_t, int, int, int * wbTemp, int * wbTint, int)
+{
+    if (wbTemp) {
+        *wbTemp = 6000;
+    }
+    if (wbTint) {
+        *wbTint = 0;
+    }
+}
+
 void findMlvWhiteBalanceIsolated(mlvObject_t *, uint64_t, int, int, int * wbTemp, int * wbTint, int)
 {
     if (wbTemp) {

@@ -273,6 +273,7 @@ static int try_render_cachefree_scaled_processed_thumbnail(
                                         frame_index, raw_w, raw_h, actual_w, actual_h,
                                         actual_scale, fnv1a64_bytes(scaled_rgb,
                                                                     (size_t)actual_w * (size_t)actual_h * 3u * sizeof(uint16_t)));
+            mlvSetAnalysisProcessingClipLevels(video, analysis_processing);
 
             const int result =
                 render_downscaled_processed_thumbnail_from_rgb16(frame_index,
@@ -406,6 +407,7 @@ int get_area_average_downscale_thumnail_with_processing(
     }
 
     getMlvRawFrameFloat(video, frame_index, raw_frame);
+    mlvSetAnalysisProcessingClipLevels(video, analysis_processing);
 
     uint16_t *debayered_raw_frame = (uint16_t *) malloc(
         (size_t)raw_w * (size_t)raw_h * 3u * sizeof(uint16_t));
@@ -490,6 +492,7 @@ int get_area_average_downscale_thumnail_with_processing_cachefree(
                                                   temp_frame,
                                                   debayered_raw_frame,
                                                   0);
+    mlvSetAnalysisProcessingClipLevels(video, analysis_processing);
     trace_look_assist_thumbnail("processed-source-cachefree", frame_index, raw_w, raw_h, raw_w, raw_h,
                                 1, fnv1a64_bytes(debayered_raw_frame,
                                                  (size_t)raw_w * (size_t)raw_h * 3u * sizeof(uint16_t)));

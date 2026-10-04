@@ -16628,9 +16628,10 @@ void MainWindow::applyLookAssistToReceipt( ReceiptSettings *receipt,
         [&]( int rawX, int rawY, int *solvedTemperature, int *solvedTint )
         {
             // [Jun-9 WB RESTORE] live solver (was findMlvWhiteBalanceIsolated). Same signature;
-            // this is the default path now that sync is the default apply.
-            findMlvWhiteBalance( m_pMlvObject, analysisFrame, rawX, rawY,
-                                 solvedTemperature, solvedTint, 0 );
+            // this is the default path now that sync is the default apply. Same decode, solved at the
+            // analysis (clip) levels so a render's level sync cannot move it.
+            findMlvWhiteBalanceAtAnalysisLevels( m_pMlvObject, analysisFrame, rawX, rawY,
+                                                 solvedTemperature, solvedTint, 0 );
             // [WB-TRACE] sync-path mirror of the async worker trace, so the determinism gate
             // (lookassist-wb-determinism.ps1) can measure patch + raw WB in sync mode too.
             if( qEnvironmentVariableIsSet( "MLVAPP_LOOK_ASSIST_WB_TRACE" ) )

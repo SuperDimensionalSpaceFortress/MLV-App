@@ -901,8 +901,8 @@ bool ReceiptApplier::applyHeadlessLookAssist(ReceiptSettings *receipt,
         wbRequest,
         [&]( int rawX, int rawY, int *solvedTemperature, int *solvedTint )
         {
-            findMlvWhiteBalance( mlvObject, static_cast<uint64_t>( frameIndex ), rawX, rawY,
-                                 solvedTemperature, solvedTint, 0 );
+            findMlvWhiteBalanceAtAnalysisLevels( mlvObject, static_cast<uint64_t>( frameIndex ), rawX, rawY,
+                                                 solvedTemperature, solvedTint, 0 );
         },
         &preset );
     if( wb.legacyBalance && !masterScenePass )
