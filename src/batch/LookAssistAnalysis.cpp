@@ -1470,10 +1470,13 @@ LookAssistWindowLitCheck resolveLookAssistWindowLitInterior( const LookAssistWhi
     // neutral where its light is not (M16-1243: 6686 / 0 by the clamped window, the display-level solve 9930 / -33, the
     // displayed room blue-magenta). So the same surface is rendered at the display's levels at that balance; strictly
     // neutral there, nothing changes. Otherwise the same search neutralises it there, from that balance and the solve,
-    // inside the daylight window and never under the not-night gate. Converged, its balance is applied only when the
+    // inside the daylight window and never under the not-night gate. MEASURE-ONLY (round 2s): nothing here changes the
+    // balance; the clip-level one is always what is applied. Converged, the search is logged, and displayDecision says
+    // "would-apply" only when the
     // surface is daylight-lit at the display's levels and the room is not made more cast (see
-    // lookAssistDisplaySurfaceIsDaylightLit / lookAssistRoomCasts); anything else leaves the clip-level balance standing,
-    // and displayDecision says why. Outside HQ dual-ISO both levels are the same (a no-op).
+    // lookAssistDisplaySurfaceIsDaylightLit / lookAssistRoomCasts); anything else, displayDecision says why. The room
+    // guard's relative-luma cutoff (kLookAssistRoomMaxLumaOfSurface) can miss a bright neutral wall: LOOK-ASSIST-M16-CAST-2
+    // owns that before anything is applied. Outside HQ dual-ISO both levels are the same (a no-op).
     if( check.exposureBound && request.renderDisplayBalance )
     {
         LookAssistRenderedPicture shown;
@@ -1537,9 +1540,8 @@ LookAssistWindowLitCheck resolveLookAssistWindowLitInterior( const LookAssistWhi
                         check.displayDecision = QStringLiteral("room-worsened");
                     else
                     {
-                        check.displayDecision = QStringLiteral("applied");
-                        temperature = check.displaySearch.temperature;
-                        tint = check.displaySearch.tint;
+                        // MEASURE-ONLY: the guard's verdict is logged and the clip-level balance stands (CAST-2 applies it).
+                        check.displayDecision = QStringLiteral("would-apply");
                     }
                 }
             }
