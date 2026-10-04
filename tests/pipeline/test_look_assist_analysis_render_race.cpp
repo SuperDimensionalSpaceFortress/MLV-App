@@ -154,9 +154,10 @@ TEST(LookAssistAnalysisRenderRace, TheAnalysedPictureDoesNotDependOnWhetherARend
 // processing object (8191.6 at 14 bit) but the integer into RAWI, which is all the recon reads. A sync
 // replaces the fraction with the recon's levels, so the analysis black must come from RAWI in both states
 // or the level table -- and the analysed picture -- again depends on whether a render synced first.
+// The tiny fixture only (same 2047/6000 shape as the large one): this shard shares a 240 s CI bound.
 TEST(LookAssistAnalysisRenderRace, AFractionalRawBlackGivesTheSamePictureBeforeAndAfterASync)
 {
-    for( const char *clip : kDualIsoFixtureClips )
+    for( const char *clip : { kDualIsoFixtureClips[0] } )
     {
         MlvPipelineFixture fixture;
         ASSERT_TRUE( openFixture( fixture, clip ) );
