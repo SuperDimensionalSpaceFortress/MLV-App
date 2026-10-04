@@ -114,6 +114,14 @@ typedef struct {
         /* Half-resolution scratch used for the optional half-res RBF probe */
         processing_buffer_t * blur_image_half_in;
         processing_buffer_t * blur_image_half_out;
+        /* PLAYBACK-SH-OFF-CPU-PATH-1: nonzero while blur_image_half_in holds
+         * the quarter-res RBF output of the last
+         * processingRefreshShadowsHighlightsQuarterBlurFromBayer16 call, for a
+         * quarter_blur_frame_width x quarter_blur_frame_height frame. Every
+         * other blur computation clears it. */
+        int quarter_blur_ready;
+        int quarter_blur_frame_width;
+        int quarter_blur_frame_height;
     } shadows_highlights;
 
     /* White balance */

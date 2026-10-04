@@ -52,6 +52,39 @@ extern "C" int processingGetShadowsHighlightsBlurData(
     return 0;
 }
 
+/* PLAYBACK-SH-OFF-CPU-PATH-1: quarter-res S/H frame state. No engine, so never ready. */
+extern "C" int processingGetShadowsHighlightsQuarterBlurData(
+    const processingObject_t *,
+    const uint16_t **data,
+    int *quarterWidth,
+    int *quarterHeight,
+    int *frameWidth,
+    int *frameHeight)
+{
+    if (data) {
+        *data = nullptr;
+    }
+    if (quarterWidth) {
+        *quarterWidth = 0;
+    }
+    if (quarterHeight) {
+        *quarterHeight = 0;
+    }
+    if (frameWidth) {
+        *frameWidth = 0;
+    }
+    if (frameHeight) {
+        *frameHeight = 0;
+    }
+    return 0;
+}
+
+extern "C" int processingExpandShadowsHighlightsQuarterBlur(
+    const uint16_t *, int, int, uint16_t *, int, int, int)
+{
+    return 0;
+}
+
 extern "C" int llrpGpuPlaybackReconRunGlTexture(
     const llrpGpuPlaybackReconState_t *,
     const uint16_t *,
