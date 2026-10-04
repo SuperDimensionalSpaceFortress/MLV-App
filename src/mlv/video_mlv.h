@@ -129,7 +129,7 @@ void setMlvRawCacheLimitFrames(mlvObject_t * video, uint64_t frameLimit);
 void setMlvProcessing(mlvObject_t * video, processingObject_t * processing);
 /* Function for WB Picker */
 void findMlvWhiteBalance(mlvObject_t * video, uint64_t frameIndex, int posX, int posY, int *wbTemp, int *wbTint, int mode);
-/* Look Assist's solve: a clone at the clip levels (mlvSetAnalysisProcessingClipLevels), live object untouched. */
+/* Look Assist's solve: a clone at the display levels (mlvSetAnalysisProcessingDisplayLevels), live object untouched. */
 void findMlvWhiteBalanceAtAnalysisLevels(mlvObject_t * video, uint64_t frameIndex, int posX, int posY, int *wbTemp, int *wbTint, int mode);
 void findMlvWhiteBalanceIsolated(mlvObject_t * video, uint64_t frameIndex, int posX, int posY, int *wbTemp, int *wbTint, int mode);
 
@@ -166,9 +166,16 @@ void getMlvProcessedFrame16(mlvObject_t * video, uint64_t frameIndex, uint16_t *
  * built. Check first (no mutation), then sync under a render-idle guard. */
 int mlvProcessingDualIsoBlackWhiteLevelsOutOfSync(mlvObject_t * video);
 void mlvSyncProcessingDualIsoBlackWhiteLevels(mlvObject_t * video);
-/* Analysis renders: give a caller-owned processing clone the clip (receipt) black/white
- * levels of an HQ Dual ISO clip, whatever render last synced the live object. Never
- * touches the live object. Returns 1 when it applies (HQ Dual ISO). */
+/* Analysis renders of an HQ Dual ISO clip give a caller-owned processing clone fixed levels,
+ * whatever render last synced the live object (never touching it). Both return 1 when they
+ * apply (HQ Dual ISO).
+ * DisplayLevels: the levels the display render uses for the analysed frame (its recon's output
+ * levels): the picture the display shows. Call llrpResetLastOutputLevelsForCurrentThread()
+ * before the raw read, this after it.
+ * ClipLevels: the judgement calibration -- the clip (receipt) levels, i.e. the display's picture
+ * log2(display range / clip range) EV brighter (1.82 EV on restricted-range lossless clips),
+ * which every Look Assist threshold is calibrated on. */
+int mlvSetAnalysisProcessingDisplayLevels(mlvObject_t * video, processingObject_t * analysis_processing);
 int mlvSetAnalysisProcessingClipLevels(mlvObject_t * video, processingObject_t * analysis_processing);
 
 void getMlvProcessedFrame8Scaled(mlvObject_t * video,
@@ -448,7 +455,11 @@ enum mlv_processed_thumbnail_settings_flags
     MLV_PROCESSED_THUMBNAIL_APPLY_HIGHLIGHTS      = 1u << 5,
     MLV_PROCESSED_THUMBNAIL_APPLY_VIBRANCE        = 1u << 6,
     MLV_PROCESSED_THUMBNAIL_APPLY_RAW_LEVELS      = 1u << 7,
-    MLV_PROCESSED_THUMBNAIL_APPLY_CHROMA_SMOOTH   = 1u << 8
+    MLV_PROCESSED_THUMBNAIL_APPLY_CHROMA_SMOOTH   = 1u << 8,
+    /* LOOK-ASSIST-ANALYSIS-TRUE-LEVELS-1: render at the DISPLAY's levels (mlvSetAnalysisProcessingDisplayLevels)
+     * instead of the judgement calibration (mlvSetAnalysisProcessingClipLevels). For a render whose brightness is
+     * itself the answer: the display-space exposure meter. */
+    MLV_PROCESSED_THUMBNAIL_DISPLAY_LEVELS        = 1u << 9
 };
 
 typedef struct mlv_processed_thumbnail_settings

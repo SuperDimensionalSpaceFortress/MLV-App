@@ -17,7 +17,9 @@
 #include "../../src/batch/ReceiptApplier.h"
 
 #include <algorithm>
+#include <cmath>
 #include <cstdio>
+#include <cstring>
 #include <vector>
 
 using namespace lookassist;
@@ -191,8 +193,10 @@ TEST(LookAssistAnalysisRenderRace, AFractionalRawBlackGivesTheSamePictureBeforeA
 // The neutral-patch white-balance solve. The live solver (findMlvWhiteBalance, the manual picker) runs on the
 // LIVE object, whose levels a sync changes ~2.6x, and that moves its answer where a channel reaches the 16-bit
 // clamp (tiny_dual_iso, patch 1: 10000/-37 at clip levels, 9990/-37 synced). Look Assist's solve
-// (findMlvWhiteBalanceAtAnalysisLevels) must give one answer in both states, at five patches on both fixtures,
-// and match the live solver in the clip-level state (the headless applier's, unchanged).
+// (findMlvWhiteBalanceAtAnalysisLevels) must give one answer in both states, at five patches on both fixtures.
+// LOOK-ASSIST-ANALYSIS-TRUE-LEVELS-1 changed WHICH answer: it is the live solver's in the SYNCED state (the display's
+// levels; TheWhiteBalanceSolveUsesTheDisplayLevels pins that), no longer the clip-level state's, so the per-patch
+// equality with the live solver moved from the clip-level state to the synced one below.
 TEST(LookAssistAnalysisRenderRace, TheWhiteBalanceSolveDoesNotDependOnWhetherARenderSyncedTheLevels)
 {
     int liveSolverMoved = 0;
@@ -213,8 +217,6 @@ TEST(LookAssistAnalysisRenderRace, TheWhiteBalanceSolveDoesNotDependOnWhetherARe
         {
             findMlvWhiteBalanceAtAnalysisLevels( video, 0, patches[i][0], patches[i][1], &before[i][0], &before[i][1], 0 );
             findMlvWhiteBalance( video, 0, patches[i][0], patches[i][1], &liveBefore[i][0], &liveBefore[i][1], 0 );
-            ASSERT_EQ( liveBefore[i][0], before[i][0] );
-            ASSERT_EQ( liveBefore[i][1], before[i][1] );
         }
 
         const int clipWhite = video->processing->white_level;
@@ -235,9 +237,166 @@ TEST(LookAssistAnalysisRenderRace, TheWhiteBalanceSolveDoesNotDependOnWhetherARe
             if( liveTemperature != liveBefore[i][0] || liveTint != liveBefore[i][1] ) ++liveSolverMoved;
             ASSERT_EQ( before[i][0], temperature );
             ASSERT_EQ( before[i][1], tint );
+            ASSERT_EQ( liveTemperature, temperature );   // the synced (display) state's answer
+            ASSERT_EQ( liveTint, tint );
         }
     }
     ASSERT_TRUE( liveSolverMoved > 0 ); // the injected state really moves an unprotected solve
+}
+
+namespace
+{
+
+// The picture the DISPLAY shows: the classic display render of the frame through the live object (which syncs the
+// levels to the recon output on its own), at `stops` of exposure, as luma statistics.
+LookAssistStats displayedPictureStats( MlvPipelineFixture &fixture, int frame, double stops )
+{
+    processingSetExposureStops( fixture.processing(), stops );
+    resetMlvCache( fixture.video() );
+    resetMlvCachedFrame( fixture.video() );
+    const std::vector<uint8_t> rgb = fixture.renderFrame8( static_cast<uint64_t>( frame ) );
+    return analyzeLookAssistThumbnail( rgb.data(), fixture.width(), fixture.height() );
+}
+
+bool sameMedian( double analysed, double displayed )
+{
+    // An analysis thumbnail is an area average, the display a full-size render: the medians of one picture agree to a
+    // few code values (measured: 1, at 0, 1 and 1.8 EV). The clip-level picture is 2.7x off at 0 EV (85 vs 30).
+    return std::fabs( analysed - displayed ) <= std::max( 4.0, displayed * 0.10 );
+}
+
+} // namespace
+
+// LOOK-ASSIST-ANALYSIS-TRUE-LEVELS-1, on both HQ dual-ISO restricted-range lossless fixtures, in the headless state (no
+// render has synced the live levels):
+//  - the DISPLAY METER render (MLV_PROCESSED_THUMBNAIL_DISPLAY_LEVELS) is the picture the display shows at the same
+//    exposure. Its median is the exposure answer: at #253's clip levels it read 85 where the display shows 30, so the
+//    display-space meter set the exposure log2(85/30) = 1.5 EV too low (RED on master);
+//  - every JUDGEMENT render is the display's picture at its exposure plus the stated calibration, log2(display range /
+//    clip range) = 1.82 EV here: the brighter picture every Look Assist threshold is calibrated on (not some other
+//    level mapping), and really brighter than the display at the same exposure.
+TEST(LookAssistAnalysisRenderRace, TheMeterReadsTheDisplayedPictureAndJudgementsItsStatedCalibration)
+{
+    for( const char *clip : kDualIsoFixtureClips )
+    {
+        MlvPipelineFixture fixture;
+        ASSERT_TRUE( openFixture( fixture, clip ) );
+        mlvObject_t *video = fixture.video();
+        ASSERT_TRUE( llrpHQDualIso( video ) != 0 );
+        const int cd = colorDownscaleFor( video );
+        const int w = video->RAWI.xRes / cd;
+        const int h = video->RAWI.yRes / cd;
+        const int md = thumbnailDownscaleFor( video );
+        const int mw = video->RAWI.xRes / md;
+        const int mh = video->RAWI.yRes / md;
+        const int kelvin = static_cast<int>( processingGetWhiteBalanceKelvin( video->processing ) );
+        const float clipBlack = video->processing->black_level;
+        const int clipWhite = video->processing->white_level;
+
+        for( const double stops : { 0.0, 1.0, 1.8 } )
+        {
+            // Analysis first, in the headless state: the live object still holds the clip levels.
+            processingSetBlackAndWhiteLevel( video->processing, getMlvBlackLevel( video ), getMlvWhiteLevel( video ),
+                                             getMlvBitdepth( video ) );
+            ASSERT_EQ( clipWhite, video->processing->white_level );
+            std::vector<unsigned char> atExposure( static_cast<size_t>( w ) * h * 3 );
+            std::vector<unsigned char> atBalance( atExposure.size() );
+            std::vector<unsigned char> meter( static_cast<size_t>( mw ) * mh * 3 );
+            // The meter first: on the first pass it is the clip's first raw read, so no render has published the recon's
+            // levels yet and only the levels its own (isolated, never publishing) run recorded can be the display's.
+            mlv_processed_thumbnail_settings_t meterSettings;
+            std::memset( &meterSettings, 0, sizeof( meterSettings ) );
+            meterSettings.flags = MLV_PROCESSED_THUMBNAIL_APPLY_EXPOSURE | MLV_PROCESSED_THUMBNAIL_DISPLAY_LEVELS;
+            meterSettings.exposure_stops = stops;
+            processingObject_t *meterClone = processingCloneForAnalysis( video->processing );
+            ASSERT_TRUE( meterClone != nullptr );
+            ASSERT_TRUE( get_area_average_downscale_thumnail_with_processing_cachefree(
+                             video, 0, md, 1, meterClone, &meterSettings, meter.data() ) != 0 );
+            processingFreeClone( meterClone );
+            ASSERT_TRUE( ReceiptApplier::processedThumbnailAtExposure( video, 0, cd, 1, stops, atExposure.data() ) );
+            ASSERT_TRUE( ReceiptApplier::processedThumbnailAtBalance( video, 0, cd, 1, stops, kelvin, 0, true, atBalance.data() ) );
+            ASSERT_EQ( clipWhite, video->processing->white_level );   // the analysis never syncs the live object
+
+            const LookAssistStats judged = analyzeLookAssistThumbnail( atExposure.data(), w, h );
+            const LookAssistStats balanced = analyzeLookAssistThumbnail( atBalance.data(), w, h );
+            const LookAssistStats metered = analyzeLookAssistThumbnail( meter.data(), mw, mh );
+            const LookAssistStats displayed = displayedPictureStats( fixture, 0, stops );
+            // The calibration, from the two level states the processing object itself holds (16-bit domain).
+            const double calibrationStops = std::log2( ( video->processing->white_level - video->processing->black_level )
+                                                     / static_cast<double>( clipWhite - clipBlack ) );
+            ASSERT_TRUE( calibrationStops > 1.7 && calibrationStops < 1.95 );
+            const LookAssistStats displayedCalibrated = displayedPictureStats( fixture, 0, stops + calibrationStops );
+            std::printf( "[true-levels] %s %.1f EV: display %.0f/%.0f, meter %.0f/%.0f | judgement %.0f/%.0f, at-balance "
+                         "%.0f/%.0f, display at +%.2f EV %.0f/%.0f\n", clip, stops, displayed.median, displayed.p95,
+                         metered.median, metered.p95, judged.median, judged.p95, balanced.median, balanced.p95,
+                         calibrationStops, displayedCalibrated.median, displayedCalibrated.p95 );
+            ASSERT_TRUE( sameMedian( metered.median, displayed.median ) );
+            ASSERT_TRUE( sameMedian( judged.median, displayedCalibrated.median ) );
+            ASSERT_TRUE( sameMedian( balanced.median, displayedCalibrated.median ) );
+            ASSERT_TRUE( judged.median > displayed.median * 1.6 );
+        }
+    }
+}
+
+// The neutral-patch solve at the analysis levels is the solve at the DISPLAY's levels: the live solver run once a render
+// has synced the live object (the state the picture on screen is in), at five patches on both fixtures. A RED-first
+// guard on the WB input (at the clip levels it differs where a channel reaches the clamp: 10000/-37 vs 9990/-37).
+TEST(LookAssistAnalysisRenderRace, TheWhiteBalanceSolveUsesTheDisplayLevels)
+{
+    int clipLevelsDiffer = 0;
+    for( const char *clip : kDualIsoFixtureClips )
+    {
+        MlvPipelineFixture fixture;
+        ASSERT_TRUE( openFixture( fixture, clip ) );
+        mlvObject_t *video = fixture.video();
+        const int w = getMlvWidth( video );
+        const int h = getMlvHeight( video );
+        const int patches[5][2] = { { w / 2, h / 2 }, { w / 4, h / 4 }, { 3 * w / 4, h / 4 },
+                                    { w / 4, 3 * h / 4 }, { 3 * w / 4, 3 * h / 4 } };
+        int analysis[5][2] = {};
+        int atClip[5][2] = {};
+        for( int i = 0; i < 5; ++i )
+        {
+            findMlvWhiteBalanceAtAnalysisLevels( video, 0, patches[i][0], patches[i][1], &analysis[i][0], &analysis[i][1], 0 );
+            findMlvWhiteBalance( video, 0, patches[i][0], patches[i][1], &atClip[i][0], &atClip[i][1], 0 );
+        }
+        resetMlvCache( video );
+        resetMlvCachedFrame( video );
+        (void)fixture.renderFrame8( 0 );   // the display render: syncs the live levels to the recon output
+        ASSERT_TRUE( video->processing->white_level > getMlvWhiteLevel( video ) * 2 );
+        for( int i = 0; i < 5; ++i )
+        {
+            int displayTemperature = 0, displayTint = 0;
+            findMlvWhiteBalance( video, 0, patches[i][0], patches[i][1], &displayTemperature, &displayTint, 0 );
+            std::printf( "[true-levels-wb] %s patch %d: analysis %d/%d, live at display levels %d/%d, at clip levels %d/%d\n",
+                         clip, i, analysis[i][0], analysis[i][1], displayTemperature, displayTint, atClip[i][0], atClip[i][1] );
+            ASSERT_EQ( displayTemperature, analysis[i][0] );
+            ASSERT_EQ( displayTint, analysis[i][1] );
+            if( atClip[i][0] != displayTemperature || atClip[i][1] != displayTint ) ++clipLevelsDiffer;
+        }
+    }
+    ASSERT_TRUE( clipLevelsDiffer > 0 );   // the levels really are an input of the solve on these fixtures
+}
+
+// Fail closed (sol, PR #253): with no analysis clone the solve leaves the caller's balance alone; it never falls back to
+// the live object, whose levels are the race. No processing object to clone is the one failure a test can force.
+TEST(LookAssistAnalysisRenderRace, TheWhiteBalanceSolveFailsClosedWithoutAnAnalysisClone)
+{
+    MlvPipelineFixture fixture;
+    ASSERT_TRUE( openFixture( fixture, kDualIsoFixtureClips[0] ) );
+    mlvObject_t *video = fixture.video();
+    processingObject_t *live = video->processing;
+    video->processing = nullptr;
+    int temperature = 1234, tint = -7;
+    findMlvWhiteBalanceAtAnalysisLevels( video, 0, getMlvWidth( video ) / 2, getMlvHeight( video ) / 2, &temperature, &tint, 0 );
+    int isolatedTemperature = 1234, isolatedTint = -7;
+    findMlvWhiteBalanceIsolated( video, 0, getMlvWidth( video ) / 2, getMlvHeight( video ) / 2,
+                                 &isolatedTemperature, &isolatedTint, 0 );
+    video->processing = live;
+    ASSERT_EQ( 1234, temperature );
+    ASSERT_EQ( -7, tint );
+    ASSERT_EQ( 1234, isolatedTemperature );
+    ASSERT_EQ( -7, isolatedTint );
 }
 
 // Repeat-run stability: twenty analysis passes over the same frame, alternating the injected state, give

@@ -590,11 +590,16 @@ bool ReceiptApplier::lookAssistDisplayMeter(mlvObject_t *mlvObject,
 
     mlv_processed_thumbnail_settings_t displaySettings;
     memset( &displaySettings, 0, sizeof( displaySettings ) );
+    // DISPLAY_LEVELS (LOOK-ASSIST-ANALYSIS-TRUE-LEVELS-1): the meter's median IS the exposure answer, so it reads the
+    // picture the display shows, not the judgement calibration (on HQ dual-ISO restricted-lossless clips 1.8 EV
+    // brighter: the tracked fixtures metered median 88 / 86 where the display shows 33 / 31, and got exposure 13 / 16
+    // instead of 154 / 163).
     displaySettings.flags = MLV_PROCESSED_THUMBNAIL_APPLY_EXPOSURE
                           | MLV_PROCESSED_THUMBNAIL_APPLY_SIMPLE_CONTRAST
                           | MLV_PROCESSED_THUMBNAIL_APPLY_SHADOWS
                           | MLV_PROCESSED_THUMBNAIL_APPLY_HIGHLIGHTS
-                          | MLV_PROCESSED_THUMBNAIL_APPLY_VIBRANCE;
+                          | MLV_PROCESSED_THUMBNAIL_APPLY_VIBRANCE
+                          | MLV_PROCESSED_THUMBNAIL_DISPLAY_LEVELS;
 
     const int totalFrames = static_cast<int>( getMlvFrames( mlvObject ) );
     const double samplePcts[3] = { 0.15, 0.5, 0.85 };

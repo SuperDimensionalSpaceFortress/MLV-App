@@ -92,6 +92,11 @@ static MLV_THREAD_LOCAL int g_llrawproc_analysis_chroma_smooth_override = CS_OFF
  * per thread and keeps its own pixel-map storage between calls, so an early return never leaks or frees it. */
 static MLV_THREAD_LOCAL int g_llrawproc_analysis_shared_read_only = 0;
 static MLV_THREAD_LOCAL llrawprocObject_t g_llrawproc_read_only_shadow;
+/* LOOK-ASSIST-ANALYSIS-TRUE-LEVELS-1: see llrpLastOutputLevelsForCurrentThread(). */
+static MLV_THREAD_LOCAL const mlvObject_t * g_llrawproc_last_output_levels_video = NULL;
+static MLV_THREAD_LOCAL int g_llrawproc_last_output_bit_depth = 0;
+static MLV_THREAD_LOCAL int g_llrawproc_last_output_black_level = 0;
+static MLV_THREAD_LOCAL int g_llrawproc_last_output_white_level = 0;
 
 static int llrawproc_analysis_thread_count(mlvObject_t * video, int isolated_analysis)
 {
@@ -2674,6 +2679,30 @@ static llrawproc_runtime_state_t llrawproc_capture_worker_runtime_state(const ll
     return state;
 }
 
+/* The levels this thread's last completed run left its frame at: what a live run publishes and a display render
+ * syncs the processing object to, recorded for isolated runs too (they never publish). */
+static void llrawproc_note_output_levels(const mlvObject_t * video, const llrawproc_runtime_state_t * state)
+{
+    g_llrawproc_last_output_levels_video = video;
+    g_llrawproc_last_output_bit_depth = state->dng_bit_depth;
+    g_llrawproc_last_output_black_level = state->dng_black_level;
+    g_llrawproc_last_output_white_level = state->dng_white_level;
+}
+
+void llrpResetLastOutputLevelsForCurrentThread(void)
+{
+    g_llrawproc_last_output_levels_video = NULL;
+}
+
+int llrpLastOutputLevelsForCurrentThread(const mlvObject_t * video, int * bit_depth, int * black_level, int * white_level)
+{
+    if (!video || g_llrawproc_last_output_levels_video != video) return 0;
+    if (bit_depth) *bit_depth = g_llrawproc_last_output_bit_depth;
+    if (black_level) *black_level = g_llrawproc_last_output_black_level;
+    if (white_level) *white_level = g_llrawproc_last_output_white_level;
+    return 1;
+}
+
 static void llrawproc_restore_worker_runtime_state(
     llrawprocWorkerState_t * worker,
     const llrawproc_runtime_state_t * state)
@@ -4443,6 +4472,7 @@ void applyLLRawProcObjectWorker(mlvObject_t * video,
 
     {
         const llrawproc_runtime_state_t runtime_state = llrawproc_capture_worker_runtime_state(worker);
+        llrawproc_note_output_levels(video, &runtime_state);
         const int runtime_state_changed =
             !llrawproc_runtime_state_equal(&runtime_state,
                                            &worker->seeded_runtime_state,
@@ -4979,6 +5009,7 @@ int applyLLRawProcObject_with_dims(mlvObject_t * video,
 
     {
         const llrawproc_runtime_state_t runtime_state = llrawproc_capture_worker_runtime_state(worker);
+        llrawproc_note_output_levels(video, &runtime_state);
         const int runtime_state_changed =
             !llrawproc_runtime_state_equal(&runtime_state,
                                            &worker->seeded_runtime_state,

@@ -837,7 +837,9 @@ int analysisDownscaleFor( const mlvObject_t *video )
 }
 
 // The meter exactly as d34da2b1 wrote it into MainWindow::applyLookAssistToReceipt (the block that ran at x2 only),
-// kept here verbatim as the reference the shared function must reproduce bit for bit.
+// kept here verbatim as the reference the shared function must reproduce bit for bit -- with ONE deliberate change,
+// LOOK-ASSIST-ANALYSIS-TRUE-LEVELS-1 (#259): the GUI's x2 meter declared MLV_PROCESSED_THUMBNAIL_DISPLAY_LEVELS (it
+// reads the picture the display shows, not the 1.8 EV brighter judgement calibration), and so does the shared meter.
 bool masterDisplayMeterAsWrittenInTheGui( mlvObject_t *video, int analysisFrame, int downscaleFactor, int cpuCores,
                                           LookAssistStats *out )
 {
@@ -851,7 +853,8 @@ bool masterDisplayMeterAsWrittenInTheGui( mlvObject_t *video, int analysisFrame,
                           | MLV_PROCESSED_THUMBNAIL_APPLY_SIMPLE_CONTRAST
                           | MLV_PROCESSED_THUMBNAIL_APPLY_SHADOWS
                           | MLV_PROCESSED_THUMBNAIL_APPLY_HIGHLIGHTS
-                          | MLV_PROCESSED_THUMBNAIL_APPLY_VIBRANCE;
+                          | MLV_PROCESSED_THUMBNAIL_APPLY_VIBRANCE
+                          | MLV_PROCESSED_THUMBNAIL_DISPLAY_LEVELS;
     const int totalFramesForMeter = static_cast<int>( getMlvFrames( video ) );
     const double samplePcts[3] = { 0.15, 0.5, 0.85 };
     std::vector<unsigned char> displayThumb( static_cast<size_t>( width ) * height * 3 );
@@ -1011,15 +1014,19 @@ const IdentityCase kIdentityCases[] = {
 // The receipts' exposure (and, for the two night cases, highlights) moved by LOOK-ASSIST-DISPLAY-METER-ALL-SCALES-1, not
 // by the log: batch Look Assist now runs the display-space exposure meter the GUI ran at x2 (160 -> 13 / 16 on the
 // tracked daylight clips, 174 -> -46 on the night ones). Re-pinned from the merged build.
+// LOOK-ASSIST-ANALYSIS-TRUE-LEVELS-1 (#259) moves the exposure field again, and only it: that meter now reads the
+// picture the display shows (MLV_PROCESSED_THUMBNAIL_DISPLAY_LEVELS), not the 1.8 EV brighter judgement calibration,
+// so it meters median 33 / 31 where it metered 88 / 86 (13 -> 154, 16 -> 163, -46 -> 96). With the flag off the build
+// reproduces the previous pins exactly; scene, white balance, every other slider and the picture hash do not move.
 struct IdentityPin { const char *scene; const char *receipt; const char *pictureSha256; };
 const IdentityPin kIdentityPins[] = {
-    { "shade", "exp=13 contrast=15 pivot=55 temp=6540 tint=-35 vibrance=5 shadows=12 highlights=-12 chromaSmooth=1",
+    { "shade", "exp=154 contrast=15 pivot=55 temp=6540 tint=-35 vibrance=5 shadows=12 highlights=-12 chromaSmooth=1",
       "9a16525a28dc92ed96fe5940ccceaeec1ecd0aca5e1a74360ba9709fbf7a3e30" },
-    { "shade", "exp=16 contrast=15 pivot=55 temp=6540 tint=-35 vibrance=5 shadows=12 highlights=-12 chromaSmooth=1",
+    { "shade", "exp=163 contrast=15 pivot=55 temp=6540 tint=-35 vibrance=5 shadows=12 highlights=-12 chromaSmooth=1",
       "f36fb58ce3680f57bd06e9d538db1e08bf74fad1963c70353049c69954f9f099" },
-    { "night", "exp=-46 contrast=14 pivot=46 temp=6000 tint=0 vibrance=3 shadows=32 highlights=-18 chromaSmooth=1",
+    { "night", "exp=96 contrast=14 pivot=46 temp=6000 tint=0 vibrance=3 shadows=32 highlights=-18 chromaSmooth=1",
       "4e9d6211cc6328216538224b3f9fe5be4c4f16e83343219d49984f473f49c83d" },
-    { "night", "exp=-46 contrast=14 pivot=46 temp=6000 tint=0 vibrance=3 shadows=32 highlights=-18 chromaSmooth=1",
+    { "night", "exp=96 contrast=14 pivot=46 temp=6000 tint=0 vibrance=3 shadows=32 highlights=-18 chromaSmooth=1",
       "4e9d6211cc6328216538224b3f9fe5be4c4f16e83343219d49984f473f49c83d" },
 };
 
@@ -1243,10 +1250,19 @@ TEST(LookAssistFixtureScene, HeadlessLookAssistDecidesIdenticallyAtEveryPlayback
     ASSERT_TRUE( lookAssistIsFlatFloorRawThumbnail( raw ) );
     LookAssistStats hypothesis = raw;
     hypothesis.daylightPictureEvidence = true;
+    // Meter in the state the applier meters in: on this restricted-lossless dual-ISO clip both appliers (GUI and
+    // headless) switch chroma smoothing on before the meter runs (chromaSmoothAuto=true). At the display's levels
+    // (LOOK-ASSIST-ANALYSIS-TRUE-LEVELS-1) that moves the metered median 32 -> 33, i.e. exposure 158 -> 154; at the
+    // old clip levels (median ~85) the same one code value rounded away.
+    llrpSetChromaSmoothMode( fixture.video(), 1 );
+    llrpResetFpmStatus( fixture.video() );
+    llrpResetBpmStatus( fixture.video() );
     LookAssistStats display;
     ASSERT_TRUE( ReceiptApplier::lookAssistDisplayMeter( fixture.video(), 0, analysisDownscaleFor( fixture.video() ), 1, &display ) );
     const int floorMetered = presetForLookAssistScene( LookAssistScene::Shade, hypothesis ).exposure;
     const int displayMetered = presetForLookAssistScene( LookAssistScene::Shade, hypothesis, nullptr, &display ).exposure;
+    std::fprintf( stderr, "[LA-METER] %s display_meter median=%.1f p95=%.1f p99=%.1f\n", clip.file, display.median,
+                  display.p95, display.p99 );
 
     ScaleRun reference;
     ASSERT_TRUE( headlessAtPlaybackScale( clip.file, 0, 2, &reference ) );
