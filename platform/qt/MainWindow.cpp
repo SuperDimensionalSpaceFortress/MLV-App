@@ -2517,7 +2517,8 @@ static int mlvappGpuTexNrYieldAfterEarlyAdvanceCount()
     return yieldCount;
 }
 
-static int mlvappPlaybackRenderLookaheadFrames()
+// -1 when neither variable is set; 0 is the kill switch for the texture-route default.
+static int mlvappPlaybackRenderLookaheadEnvFrames()
 {
     static const int lookaheadFrames = []() {
         bool ok = false;
@@ -2528,10 +2529,39 @@ static int mlvappPlaybackRenderLookaheadFrames()
             env = qEnvironmentVariableIntValue(
                 "MLVAPP_GPU_TEX_NR_LOOKAHEAD_FRAMES", &ok );
         }
-        if( !ok ) return 0;
-        return qBound( 0, env, 3 );
+        if( !ok ) return -1;
+        return qBound( 0, env, playback_overlap::kMaxLookaheadFrames );
     }();
     return lookaheadFrames;
+}
+
+// PLAYBACK-DECODE-RENDER-OVERLAP-1: the lookahead is on by default on the CUDA texture route only, so the
+// decode + dual-ISO of N+1 runs while N renders and presents (two frames in flight, not one).
+int MainWindow::playbackRenderLookaheadFrames() const
+{
+    return playback_overlap::effectiveLookaheadFrames( mlvappPlaybackRenderLookaheadEnvFrames(),
+                                                       m_playbackLookaheadTextureRouteAdmitted );
+}
+
+int MainWindow::currentPlaybackAdvanceTarget()
+{
+    return ui->actionDropFrameMode->isChecked()
+        ? static_cast<int>( m_newPosDropMode )
+        : ui->horizontalSliderPosition->value();
+}
+
+// The playback advance waits for the frame it asked for and for any non-speculative work, never for lookahead
+// frames rendering ahead of it: isIdle() counted those as busy, which held the timer and serialised the stages.
+bool MainWindow::renderThreadBusyForPlaybackAdvance( int activePlaybackTarget )
+{
+    if( !m_pRenderThread ) return false;
+    if( ui->actionPlay->isChecked() && playbackRenderLookaheadFrames() > 0 )
+    {
+        return !m_pRenderThread->isIdleExceptPlaybackLookahead(
+            activePlaybackTarget,
+            m_playbackPresentationGeneration.load( std::memory_order_acquire ) );
+    }
+    return !m_pRenderThread->isIdle();
 }
 
 static int mlvappStartPlaybackTimer( QObject *owner, double framerate )
@@ -3463,7 +3493,7 @@ void MainWindow::queuePlaybackLookaheadRequests(
     const RenderFrameThread::PresentationPreparationOptions &presentationPreparation,
     int requestedFrame )
 {
-    const int depth = mlvappPlaybackRenderLookaheadFrames();
+    const int depth = playbackRenderLookaheadFrames();
     if( depth <= 0 ) return;
     if( !m_pRenderThread || !m_pMlvObject || !m_fileLoaded ) return;
     if( !ui->actionPlay->isChecked() || !baseContext.playbackActive ) return;
@@ -3527,6 +3557,7 @@ void MainWindow::queuePlaybackLookaheadRequests(
                                       lookaheadContext.requestSerial,
                                       lookaheadContext,
                                       presentationPreparation );
+        ++m_playbackLookaheadRequestsIssued;
         if( interactiveTraceEnabled() )
         {
             logInteractionEvent(
@@ -4315,7 +4346,7 @@ void MainWindow::onPlaybackPrepResultReady( void )
             true );
         if( m_pRenderThread )
             m_pRenderThread->releasePresentedFrameForRequestSerial( result.task.requestSerial );
-        m_frameStillDrawing = m_pRenderThread && !m_pRenderThread->isIdle();
+        m_frameStillDrawing = renderThreadBusyForPlaybackAdvance( currentPlaybackAdvanceTarget() );
         return;
     }
     if( result.task.requestSerial != latest && interactiveTraceEnabled() )
@@ -5685,7 +5716,7 @@ void MainWindow::presentPlaybackPreparedFrame( const PlaybackPrepResult &result 
                 .arg( sanitizeLogValue( readyFrame.gpuAmazeFallbackReason ) ) );
         if( m_pRenderThread )
             m_pRenderThread->releasePresentedFrameForRequestSerial( task.requestSerial );
-        m_frameStillDrawing = m_pRenderThread && !m_pRenderThread->isIdle();
+        m_frameStillDrawing = renderThreadBusyForPlaybackAdvance( currentPlaybackAdvanceTarget() );
         return;
     }
 
@@ -5928,7 +5959,7 @@ void MainWindow::presentPlaybackPreparedFrame( const PlaybackPrepResult &result 
                           prepRegionClock,
                           prepRegionStartNs,
                           display_start );
-    m_frameStillDrawing = m_pRenderThread && !m_pRenderThread->isIdle();
+    m_frameStillDrawing = renderThreadBusyForPlaybackAdvance( currentPlaybackAdvanceTarget() );
 }
 
 void MainWindow::computeDisplaySceneGeometry( int sourceWidth,
@@ -6375,7 +6406,12 @@ void MainWindow::drawFrame( bool updateTimecodeLabel )
             phase3ModeFor( playbackQualityModeFromInt( m_playbackQualityMode ) ) );
     }
     requestContext.frameNumber = static_cast<uint32_t>( requestedFrame );
-    if( mlvappPlaybackRenderLookaheadFrames() > 0
+    m_playbackLookaheadTextureRouteAdmitted =
+        ui->actionPlay->isChecked()
+        && requestContext.gpuPlaybackReconTexturePresentRequested
+        && requestContext.gpuPlaybackReconAmazeTexturePresentAdmitted
+        && requestContext.playbackScaleFactor == 1;
+    if( playbackRenderLookaheadFrames() > 0
      && ui->actionPlay->isChecked()
      && m_pRenderThread
      && m_pMlvObject
@@ -6394,7 +6430,7 @@ void MainWindow::drawFrame( bool updateTimecodeLabel )
                     requestContext.presentationGeneration,
                     cutInFrame,
                     cutOutFrame,
-                    mlvappPlaybackRenderLookaheadFrames(),
+                    playbackRenderLookaheadFrames(),
                     ui->actionLoop->isChecked() );
             if( prunedPlaybackLookahead > 0 && interactiveTraceEnabled() )
             {
@@ -6406,7 +6442,7 @@ void MainWindow::drawFrame( bool updateTimecodeLabel )
                             requestContext.presentationGeneration ) )
                         .arg( cutInFrame )
                         .arg( cutOutFrame )
-                        .arg( mlvappPlaybackRenderLookaheadFrames() )
+                        .arg( playbackRenderLookaheadFrames() )
                         .arg( bool01( ui->actionLoop->isChecked() ) )
                         .arg( prunedPlaybackLookahead ),
                     true );
@@ -6431,6 +6467,7 @@ void MainWindow::drawFrame( bool updateTimecodeLabel )
     }
     if( playbackLookaheadCoversCurrent )
     {
+        ++m_playbackLookaheadCoveredRequests;
         const bool playbackLookaheadReady =
             m_pRenderThread->hasReadyPlaybackLookaheadFrame(
                 static_cast<uint32_t>( requestedFrame ),
@@ -23769,6 +23806,9 @@ void MainWindow::beginPlaybackSmokeTelemetry( void )
     ++m_playbackSmokeSessionId;
     if( m_playbackSmokeSessionId == 0 ) ++m_playbackSmokeSessionId;
 
+    m_playbackLookaheadRequestsIssued = 0;
+    m_playbackLookaheadCoveredRequests = 0;
+    if( m_pRenderThread ) m_pRenderThread->resetPipelineOverlapMeter();
     m_playbackSmokeActive = true;
     m_playbackSmokeFrameTelemetry = playbackSmokeFrameTelemetryEnabled();
     m_playbackSmokeFrameLogEnabled =
@@ -26813,6 +26853,42 @@ void MainWindow::finishPlaybackSmokeTelemetry( const char *reason )
                .arg( m_playbackSmokeGpuStatusTextureReadbackFrames )
                .arg( m_playbackSmokeGpuStatusTextureNoReadbackFrames );
 
+    // PLAYBACK-DECODE-RENDER-OVERLAP-1: the engagement counter. overlap_fraction_of_render is the share of
+    // render-busy time some decode/recon ran under (0 = one frame in flight, stages in series).
+    {
+        const playback_overlap::OverlapSnapshot overlap =
+            m_pRenderThread ? m_pRenderThread->pipelineOverlapSnapshot()
+                            : playback_overlap::OverlapSnapshot();
+        qInfo().noquote()
+            << QStringLiteral(
+                   "playback_smoke.overlap_summary session=%1 lookahead_depth=%2 "
+                   "lookahead_env=%3 texture_route_admitted=%4 lookahead_requests=%5 "
+                   "lookahead_covered_requests=%6 upstream_starts=%7 upstream_starts_overlapped=%8 "
+                   "upstream_engagement=%9 render_starts=%10 render_starts_with_upstream_in_flight=%11 "
+                   "upstream_busy_ms=%12 render_busy_ms=%13 overlap_ms=%14 "
+                   "overlap_fraction_of_render=%15 window_ms=%16 decode_busy_ms=%17 recon_busy_ms=%18 "
+                   "recon_starts_held_for_render=%19" )
+                   .arg( static_cast<qulonglong>( m_playbackSmokeSessionId ) )
+                   .arg( playbackRenderLookaheadFrames() )
+                   .arg( mlvappPlaybackRenderLookaheadEnvFrames() )
+                   .arg( bool01( m_playbackLookaheadTextureRouteAdmitted ) )
+                   .arg( static_cast<qulonglong>( m_playbackLookaheadRequestsIssued ) )
+                   .arg( static_cast<qulonglong>( m_playbackLookaheadCoveredRequests ) )
+                   .arg( static_cast<qulonglong>( overlap.upstreamStarts ) )
+                   .arg( static_cast<qulonglong>( overlap.upstreamStartsOverlapped ) )
+                   .arg( overlap.upstreamEngagement(), 0, 'f', 4 )
+                   .arg( static_cast<qulonglong>( overlap.renderStarts ) )
+                   .arg( static_cast<qulonglong>( overlap.renderStartsWithUpstreamInFlight ) )
+                   .arg( overlap.upstreamBusyMs, 0, 'f', 3 )
+                   .arg( overlap.renderBusyMs, 0, 'f', 3 )
+                   .arg( overlap.overlapMs, 0, 'f', 3 )
+                   .arg( overlap.overlapFractionOfRender(), 0, 'f', 4 )
+                   .arg( overlap.windowMs, 0, 'f', 3 )
+                   .arg( overlap.decodeBusyMs, 0, 'f', 3 )
+                   .arg( overlap.reconBusyMs, 0, 'f', 3 )
+                   .arg( static_cast<qulonglong>( overlap.reconStartsHeldForRender ) );
+    }
+
     if( perfFieldLogEnabled() )
     {
         QJsonObject pipelineCounts;
@@ -29474,7 +29550,7 @@ void MainWindow::finishPresentedFrame( uint64_t displayFrame,
     notePlayToFirstFramePresentation( displayFrame );
     if( m_pRenderThread && !releasePresentedFrameEarly )
         m_pRenderThread->releasePresentedFrameForRequestSerial( readyFrame.requestSerial );
-    m_frameStillDrawing = m_pRenderThread && !m_pRenderThread->isIdle();
+    m_frameStillDrawing = renderThreadBusyForPlaybackAdvance( currentPlaybackAdvanceTarget() );
     if( ui->actionPlay->isChecked() )
     {
         const bool suppressTailAdvanceAfterGpuTexNrEarlyAdvance =
@@ -29669,7 +29745,7 @@ void MainWindow::drawFrameReady()
             ? static_cast<int>( m_newPosDropMode )
             : ui->horizontalSliderPosition->value();
     const bool targetAwareLookaheadAcquire =
-        mlvappPlaybackRenderLookaheadFrames() > 0 && ui->actionPlay->isChecked();
+        playbackRenderLookaheadFrames() > 0 && ui->actionPlay->isChecked();
     int prunedPlaybackLookaheadBeforeAcquire = 0;
     if( targetAwareLookaheadAcquire && m_pRenderThread && m_pMlvObject && m_fileLoaded )
     {
@@ -29686,7 +29762,7 @@ void MainWindow::drawFrameReady()
                     activeGeneration,
                     cutInFrame,
                     cutOutFrame,
-                    mlvappPlaybackRenderLookaheadFrames(),
+                    playbackRenderLookaheadFrames(),
                     ui->actionLoop->isChecked() );
             if( prunedPlaybackLookaheadBeforeAcquire > 0 && interactiveTraceEnabled() )
             {
@@ -29697,7 +29773,7 @@ void MainWindow::drawFrameReady()
                         .arg( static_cast<qulonglong>( activeGeneration ) )
                         .arg( cutInFrame )
                         .arg( cutOutFrame )
-                        .arg( mlvappPlaybackRenderLookaheadFrames() )
+                        .arg( playbackRenderLookaheadFrames() )
                         .arg( bool01( ui->actionLoop->isChecked() ) )
                         .arg( prunedPlaybackLookaheadBeforeAcquire ),
                     true );
@@ -29778,7 +29854,7 @@ void MainWindow::drawFrameReady()
     const double drawReadyAfterAcquireStageTime = mlv_stage_timing_now();
     if( !haveReadyFrame )
     {
-        m_frameStillDrawing = m_pRenderThread && !m_pRenderThread->isIdle();
+        m_frameStillDrawing = renderThreadBusyForPlaybackAdvance( currentPlaybackAdvanceTarget() );
         if( interactiveTraceEnabled() )
         {
             logInteractionEvent(
@@ -29834,7 +29910,7 @@ void MainWindow::drawFrameReady()
         }
         if( m_pRenderThread )
             m_pRenderThread->releasePresentedFrameForRequestSerial( readyFrame.requestSerial );
-        m_frameStillDrawing = m_pRenderThread && !m_pRenderThread->isIdle();
+        m_frameStillDrawing = renderThreadBusyForPlaybackAdvance( currentPlaybackAdvanceTarget() );
         m_frameChanged = true;
         return;
     }
@@ -29873,7 +29949,7 @@ void MainWindow::drawFrameReady()
             if( m_pRenderThread )
                 m_pRenderThread->releasePresentedFrameForRequestSerial(
                     readyFrame.requestSerial );
-            m_frameStillDrawing = m_pRenderThread && !m_pRenderThread->isIdle();
+            m_frameStillDrawing = renderThreadBusyForPlaybackAdvance( currentPlaybackAdvanceTarget() );
             if( ui->actionPlay->isChecked() && m_playbackFrameAdvancePending )
             {
                 QTimer::singleShot( 0, this, [this, display_frame]()
@@ -29884,7 +29960,7 @@ void MainWindow::drawFrameReady()
                         return;
                     }
                     m_frameStillDrawing =
-                        m_pRenderThread && !m_pRenderThread->isIdle();
+                        renderThreadBusyForPlaybackAdvance( currentPlaybackAdvanceTarget() );
                     if( m_frameStillDrawing ) return;
 
                     m_skipImmediateTimecodeLabel = true;
@@ -29928,7 +30004,7 @@ void MainWindow::drawFrameReady()
         }
         if( m_pRenderThread )
             m_pRenderThread->releasePresentedFrameForRequestSerial( readyFrame.requestSerial );
-        m_frameStillDrawing = m_pRenderThread && !m_pRenderThread->isIdle();
+        m_frameStillDrawing = renderThreadBusyForPlaybackAdvance( currentPlaybackAdvanceTarget() );
         m_frameChanged = true;
         return;
     }
@@ -29975,7 +30051,7 @@ void MainWindow::drawFrameReady()
     if( ui->actionPlay->isChecked() && m_pRenderThread )
     {
         predictiveGpuTexNrEarlyAdvancePlaybackEligible = true;
-        m_frameStillDrawing = !m_pRenderThread->isIdle();
+        m_frameStillDrawing = renderThreadBusyForPlaybackAdvance( currentPlaybackAdvanceTarget() );
         predictiveGpuTexNrEarlyAdvanceRenderIdle = !m_frameStillDrawing;
         predictiveGpuTexNrEarlyAdvanceSuppressedByIsIdle =
             predictiveGpuTexNrEarlyAdvance && m_frameStillDrawing;

@@ -1848,6 +1848,16 @@
       ]
     },
     {
+      "path": "platform/qt/PlaybackDecodeRenderOverlap.h",
+      "anchor": "return renderBusyMs > 0.0 ? overlapMs / renderBusyMs : 0.0 ;",
+      "class": "division_guard",
+      "clock": "qpc_stage_clock",
+      "justification": "PLAYBACK-DECODE-RENDER-OVERLAP-1: OverlapSnapshot::overlapFractionOfRender() guards the overlapMs/renderBusyMs division; with no render-busy time (no frame rendered since the reset) it reports 0 rather than dividing by zero. The value is only logged (playback_smoke.overlap_summary overlap_fraction_of_render) beside the raw busy/overlap ms and start counts; it decides nothing.",
+      "lines": [
+        91
+      ]
+    },
+    {
       "path": "platform/qt/PlaybackFrameRange.h",
       "anchor": "if ( consumed < 2 || elapsedMs <= 0 ) return 0.0 ;",
       "class": "division_guard",

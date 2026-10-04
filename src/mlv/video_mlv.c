@@ -1371,12 +1371,61 @@ static void mlv_raw_uint16_prefetch_store_frame(mlvObject_t * video,
     pthread_mutex_unlock(&video->raw_uint16_prefetch_mutex);
 }
 
+/* PLAYBACK-DECODE-RENDER-OVERLAP-1: true while the prefetch worker is decoding frameIndex for the current generation. */
+static int mlv_raw_uint16_prefetch_frame_in_flight_locked(const mlvObject_t * video, uint64_t frameIndex)
+{
+    if (!video->raw_uint16_prefetch_worker_busy || video->raw_uint16_prefetch_stop)
+    {
+        return 0;
+    }
+    for (uint32_t slot = 0; slot < MLV_RAW_UINT16_PREFETCH_SLOTS; ++slot)
+    {
+        if (video->raw_uint16_prefetch_slot_state[slot] == MLV_RAW_UINT16_PREFETCH_DECODING
+            && video->raw_uint16_prefetch_slot_frame[slot] == frameIndex
+            && video->raw_uint16_prefetch_slot_generation[slot] == video->raw_uint16_prefetch_generation)
+        {
+            return 1;
+        }
+    }
+    return 0;
+}
+
+/* The upper bound on waiting for an in-flight prefetch of the same frame (one LJ92 decode is ~25-30 ms on Bachelor). */
+#define MLV_RAW_UINT16_PREFETCH_IN_FLIGHT_WAIT_MS 250u
+
 static int mlv_raw_uint16_prefetch_try_copy(mlvObject_t * video,
                                             uint64_t frameIndex,
                                             uint16_t * unpackedFrame)
 {
     int hit = 0;
     pthread_mutex_lock(&video->raw_uint16_prefetch_mutex);
+    /* PLAYBACK-DECODE-RENDER-OVERLAP-1: with two playback frames requested ahead, the render thread's decode worker
+     * asked for the very frame the prefetch worker was decoding, missed (only READY slots hit) and decoded it a second
+     * time: ~27 ms of duplicate LJ92 decode a frame, competing with dual-ISO and S/H for the CPU. Wait for that slot
+     * instead. The slot discipline is unchanged (a DECODING slot is never handed out); a reset (new generation), a
+     * stop, a failed decode or the bound all fall through to the caller's own decode. */
+    if (mlv_raw_uint16_prefetch_frame_in_flight_locked(video, frameIndex))
+    {
+        struct timespec deadline;
+        if (clock_gettime(CLOCK_REALTIME, &deadline) == 0)
+        {
+            deadline.tv_nsec += (long)MLV_RAW_UINT16_PREFETCH_IN_FLIGHT_WAIT_MS * 1000000L;
+            while (deadline.tv_nsec >= 1000000000L)
+            {
+                ++deadline.tv_sec;
+                deadline.tv_nsec -= 1000000000L;
+            }
+            while (mlv_raw_uint16_prefetch_frame_in_flight_locked(video, frameIndex))
+            {
+                if (pthread_cond_timedwait(&video->raw_uint16_prefetch_cond,
+                                           &video->raw_uint16_prefetch_mutex,
+                                           &deadline) == ETIMEDOUT)
+                {
+                    break;
+                }
+            }
+        }
+    }
     int slot = mlv_raw_uint16_prefetch_find_slot_locked(video, frameIndex);
     if (slot >= 0)
     {
@@ -1433,7 +1482,8 @@ static void mlv_raw_uint16_prefetch_note_request(mlvObject_t * video, uint64_t f
     video->raw_uint16_prefetch_request_frame = frameIndex;
     video->raw_uint16_prefetch_request_stride = requestStride;
     video->raw_uint16_prefetch_request_pending = 1;
-    pthread_cond_signal(&video->raw_uint16_prefetch_cond);
+    /* Broadcast: a foreground reader may also wait on this condition (mlv_raw_uint16_prefetch_try_copy). */
+    pthread_cond_broadcast(&video->raw_uint16_prefetch_cond);
     pthread_mutex_unlock(&video->raw_uint16_prefetch_mutex);
 }
 
@@ -1562,11 +1612,14 @@ static void * mlv_raw_uint16_prefetch_thread_main(void * opaque)
                     ? MLV_RAW_UINT16_PREFETCH_READY
                     : MLV_RAW_UINT16_PREFETCH_EMPTY;
             }
+            /* Wake a foreground reader waiting for this frame (mlv_raw_uint16_prefetch_try_copy). */
+            pthread_cond_broadcast(&video->raw_uint16_prefetch_cond);
             pthread_mutex_unlock(&video->raw_uint16_prefetch_mutex);
         }
 
         pthread_mutex_lock(&video->raw_uint16_prefetch_mutex);
         video->raw_uint16_prefetch_worker_busy = 0;
+        pthread_cond_broadcast(&video->raw_uint16_prefetch_cond);
         pthread_mutex_unlock(&video->raw_uint16_prefetch_mutex);
     }
 

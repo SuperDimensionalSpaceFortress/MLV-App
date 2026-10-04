@@ -1129,6 +1129,15 @@ private:
     // PLAYBACK-CUDA-NATIVE-PACE-1: the ceiling on every engine advance in playbackHandling() -- the timeline never
     // runs faster than getFramerate() (native, or the explicit fpsOverride). Reset on every Play start and stop.
     playback_native_pace::NativePaceGuard m_playbackPaceGuard;
+    // PLAYBACK-DECODE-RENDER-OVERLAP-1: the last drawFrame() request was on the CUDA texture route (play, texture
+    // present requested and admitted, scale 1), where the playback lookahead is on by default
+    // (playback_overlap::effectiveLookaheadFrames). The counters feed playback_smoke.overlap_summary.
+    bool m_playbackLookaheadTextureRouteAdmitted = false;
+    uint64_t m_playbackLookaheadRequestsIssued = 0;
+    uint64_t m_playbackLookaheadCoveredRequests = 0;
+    int playbackRenderLookaheadFrames() const;
+    int currentPlaybackAdvanceTarget();
+    bool renderThreadBusyForPlaybackAdvance( int activePlaybackTarget );
     bool m_automationPacingIsolated = false;
     // ENFORCE-4: the autoplay hook's verdict is a fail-closed LATCH (PlaybackFrameRange.h): armed failing (14) when the hook
     // is installed, cleared only by consumption (Reached). Closing the app before the poll resolves exits 14, never 0.
