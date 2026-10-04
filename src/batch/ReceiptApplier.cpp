@@ -505,6 +505,12 @@ void ReceiptApplier::applyToMlv(ReceiptSettings *receipt,
     resetMlvCachedFrame( mlvObject );
 }
 
+int ReceiptApplier::lookAssistRecoveryIso(mlvObject_t *mlvObject)
+{
+    if( !mlvObject || !mlvObject->llrawproc || llrpGetDualIsoValidity( mlvObject ) != DISO_VALID ) return 0;
+    return mlvObject->llrawproc->diso2;
+}
+
 bool ReceiptApplier::asShotWhiteBalanceControls(mlvObject_t *mlvObject, int *temperature, int *tint)
 {
     if( !mlvObject || !temperature || !tint ) return false;
@@ -753,7 +759,8 @@ bool ReceiptApplier::applyHeadlessLookAssist(ReceiptSettings *receipt,
     lookAssistSetSceneEv100( &stats,
                              mlvObject->EXPO.isoValue,
                              static_cast<double>( mlvObject->EXPO.shutterValue ),
-                             mlvObject->LENS.aperture );
+                             mlvObject->LENS.aperture,
+                             lookAssistRecoveryIso( mlvObject ) );
     {
         int asShotTemperature = 6000;
         int asShotTint = 0;
@@ -781,7 +788,8 @@ bool ReceiptApplier::applyHeadlessLookAssist(ReceiptSettings *receipt,
     };
     // The master pass gives the recorded exposure no say: no picture evidence is asked for, so the scene is
     // the one master classified (daylight needs the evidence).
-    const LookAssistScene scene = resolveLookAssistScene(
+    // Not const: the window-lit check below may make a night verdict the daylight class (the GUI does the same).
+    LookAssistScene scene = resolveLookAssistScene(
         &stats, masterScenePass ? LookAssistRenderFn() : LookAssistRenderFn( renderProcessed ) );
     // Observation only: how the verdict was reached, appended to the "applied" line. The headless applier has no
     // night post-balance walk and no display meter, so those stay at their defaults.
@@ -935,8 +943,9 @@ bool ReceiptApplier::applyHeadlessLookAssist(ReceiptSettings *receipt,
             .arg( mlvObject->current_cached_frame_active ) );
         return applyHeadlessLookAssist( receipt, mlvObject, processingObject, analysisFrame, true );
     }
-    // The window-lit check, MEASURED, NOT APPLIED (the GUI does the same; see there): it runs on copies and only logs,
-    // and its verification renders go through the isolated read-only renderer, so no shared state moves either.
+    // The window-lit check runs on copies (the GUI does the same; see there): by colour alone it only logs; it APPLIES
+    // when the aperture-bounded exposure rules night out and a verified surface backs the balance. Never in master's pass.
+    // Its verification and surface-search renders go through the isolated read-only renderer, so no shared state moves.
     LookAssistStats windowLitStats = stats;
     LookAssistScene windowLitScene = scene;
     LookAssistPreset windowLitPreset = preset;
@@ -947,12 +956,21 @@ bool ReceiptApplier::applyHeadlessLookAssist(ReceiptSettings *receipt,
     const LookAssistWindowLitCheck windowLit = resolveLookAssistWindowLitInterior(
         windowLitRequest, wb, mlvObject->processing->exposure_stops, &windowLitStats, &windowLitScene, &windowLitPreset,
         useProcessedColorStats ? &processedColorStats : nullptr );
+    const bool windowLitApplied = windowLit.applies && !masterScenePass;
+    if( windowLitApplied )
+    {
+        stats = windowLitStats;
+        scene = windowLitScene;
+        preset = windowLitPreset;
+    }
+    lookAssistTraceSurfaceSearch( &decisionTrace, windowLit );
     if( windowLit.candidate )
     {
         BatchLogger::out( QStringLiteral(
             "[BATCH] LOOK_ASSIST window_lit_interior frame=%1 wouldReclassify=%2 reason=%3 scene=%4 baseSurfaceChroma=%5 "
             "baseSurfaceBlueAmber=%6 solutionSurfaceChroma=%7 solutionSurfaceBlueAmber=%8 expoIso=%9 expoShutterUs=%10 "
-            "lensApertureX100=%11\n" )
+            "lensApertureX100=%11 applied=%12 exposureBound=%13 recoveryIso=%14 surfaceSearch=%15 searchRenders=%16 "
+            "searchBalance=%17/%18 appliedBalance=%19/%20 gateSurfaceBlueAmber=%21\n" )
             .arg( frameIndex )
             .arg( windowLit.evidence ? QStringLiteral("true") : QStringLiteral("false") )
             .arg( windowLit.reason )
@@ -963,7 +981,17 @@ bool ReceiptApplier::applyHeadlessLookAssist(ReceiptSettings *receipt,
             .arg( windowLit.solutionSurfaceBlueAmber, 0, 'f', 1 )
             .arg( static_cast<qulonglong>( mlvObject->EXPO.isoValue ) )
             .arg( static_cast<qulonglong>( mlvObject->EXPO.shutterValue ) )
-            .arg( static_cast<qulonglong>( mlvObject->LENS.aperture ) ) );
+            .arg( static_cast<qulonglong>( mlvObject->LENS.aperture ) )
+            .arg( windowLitApplied ? QStringLiteral("true") : QStringLiteral("false") )
+            .arg( windowLit.exposureBound ? QStringLiteral("true") : QStringLiteral("false") )
+            .arg( lookAssistRecoveryIso( mlvObject ) )
+            .arg( windowLit.search.result )
+            .arg( windowLit.search.renders )
+            .arg( windowLit.search.temperature )
+            .arg( windowLit.search.tint )
+            .arg( windowLit.appliedTemperature )
+            .arg( windowLit.appliedTint )
+            .arg( windowLit.gateSurfaceBlueAmber, 0, 'f', 1 ) );
     }
     const bool autoWhiteBalanceValid = wb.autoValid;
     const QString autoWhiteBalanceSource = wb.source;
@@ -971,8 +999,9 @@ bool ReceiptApplier::applyHeadlessLookAssist(ReceiptSettings *receipt,
     const double autoWhiteBalanceDamping = wb.damping;
     const int autoWhiteBalanceCandidateTemperature = wb.candidateTemperature;
     const int autoWhiteBalanceCandidateTint = wb.candidateTint;
-    const int temperature = wb.temperature;
-    const int tint = wb.tint;
+    // The applied window-lit evidence's verified balance, or the one white-balance decision's.
+    const int temperature = windowLitApplied ? windowLit.appliedTemperature : wb.temperature;
+    const int tint = windowLitApplied ? windowLit.appliedTint : wb.tint;
 
     receipt->setExposure( preset.exposure );
     receipt->setContrast( preset.contrast );

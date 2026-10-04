@@ -51,6 +51,11 @@ public:
                                            int *temperature,
                                            int *tint);
 
+    /* The dual-ISO recovery ISO Look Assist credits against the aperture-bounded EV100: the second ISO llrawproc
+     * decoded from the DISO block at clip open (its isoValue is an encoding, not an ISO), and only for a clip whose
+     * DISO block is VALID; 0 otherwise (a forced dual ISO has no recorded recovery ISO). */
+    static int lookAssistRecoveryIso(mlvObject_t *mlvObject);
+
     /* The downscaled PROCESSED thumbnail (same source and path as
      * get_area_average_downscale_thumnail) rendered at an explicit exposure, through a private clone of
      * the live processing object -- nothing shared is mutated. Look Assist judges colour on a daylight

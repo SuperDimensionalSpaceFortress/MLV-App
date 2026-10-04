@@ -20,6 +20,7 @@
 #include <QRegularExpression>
 #include <QString>
 #include <QTemporaryDir>
+#include <algorithm>
 #include <cmath>
 #include <cstdio>
 #include <cstring>
@@ -965,9 +966,13 @@ bool sameLlrawprocSharedState( const LlrawprocSharedState &a, const LlrawprocSha
 // The window-lit check reaching its two verification renders on the tracked clip: a no-metadata flat-floor night with
 // a processed, accepted, undamped solve on the daylight locus from a bright neutral patch (the patch and the solve are
 // set here; the fixture's own night path stops at not-processed-solve, before any render). rawStats is the clip's RAW
-// thumbnail, read beforehand (that read is the live raw path); renderBalance is the renderer under test.
+// thumbnail, read beforehand (that read is the live raw path); renderBalance is the renderer under test. colorStats is the
+// lit-picture evidence the aperture-bounded rule needs before it renders anything (null: the measure-only rule).
 LookAssistWindowLitCheck runWindowLitVerification( mlvObject_t *video, const LookAssistStats &rawStats,
-                                                   const LookAssistRenderBalanceFn &renderBalance, int colorDownscale )
+                                                   const LookAssistRenderBalanceFn &renderBalance, int colorDownscale,
+                                                   const LookAssistStats *colorStats = nullptr,
+                                                   int baseTemperature = 6000, int baseTint = 0,
+                                                   int candidateTemperature = 9930, int candidateTint = -33 )
 {
     LookAssistStats stats = rawStats;
     LookAssistScene scene = classifyLookAssistScene( stats );
@@ -984,17 +989,17 @@ LookAssistWindowLitCheck runWindowLitVerification( mlvObject_t *video, const Loo
     request.patch.chroma = 3.0;
     request.patch.blueAmberAxis = 2.0;
     request.solvedOnProcessedPicture = true;
-    request.baseTemperature = 6000;
-    request.baseTint = 0;
+    request.baseTemperature = baseTemperature;
+    request.baseTint = baseTint;
     request.rawWidth = video->RAWI.xRes;
     request.rawHeight = video->RAWI.yRes;
     request.renderBalance = renderBalance;
     LookAssistWhiteBalanceResolution wb;
     wb.autoValid = true;
     wb.damping = 1.0;
-    wb.candidateTemperature = 9930;
-    wb.candidateTint = -33;
-    return resolveLookAssistWindowLitInterior( request, wb, 1.74, &stats, &scene, &preset );
+    wb.candidateTemperature = candidateTemperature;
+    wb.candidateTint = candidateTint;
+    return resolveLookAssistWindowLitInterior( request, wb, 1.74, &stats, &scene, &preset, colorStats );
 }
 
 } // namespace
@@ -1051,6 +1056,98 @@ TEST(LookAssistFixtureScene, WindowLitVerificationRendersLeaveLowLevelRawStateUn
     ASSERT_TRUE( afterLive.badVersion != before.badVersion );
 }
 
+TEST(LookAssistFixtureScene, WindowLitSurfaceSearchRendersLeaveLowLevelRawStateUntouched)
+{
+    // LOOK-ASSIST-M16-NOT-NIGHT-1 on top of the test above: the aperture-bounded rule renders MORE than the two
+    // verification pictures (the verified-surface search steps the balance through up to six more). Same setup, with the
+    // M16 exposure recorded (ISO 100, 1/1357 s, no aperture: bound 10.4) and the lit-picture evidence the rule needs, so
+    // the check gets past its gates to the renders. Through the measure-only renderer the whole run, search included,
+    // moves no low-level raw state, no cached frame and no stored balance.
+    MlvPipelineFixture fixture;
+    QString error_message;
+    ASSERT_TRUE( fixture.openClipFile( repo_file_path( QStringLiteral("tests/fixtures/clips/tiny_dual_iso.mlv") ), &error_message ) );
+    fixture.receipt().setBadPixels( 2 );
+    fixture.receipt().setBpsMethod( 1 );   // aggressive search: every live raw read re-searches and bumps the map version
+    ASSERT_TRUE( fixture.applyReceipt( &error_message ) );
+    mlvObject_t *video = fixture.video();
+    video->EXPO.isoValue = 100;
+    video->EXPO.shutterValue = 737;
+    video->LENS.aperture = 0;
+    ASSERT_EQ( 2, llrpGetBadPixelMode( video ) );
+    llrpResetBpmStatus( video );
+
+    const int colorDownscale = 3;
+    const int width = video->RAWI.xRes / colorDownscale;
+    const int height = video->RAWI.yRes / colorDownscale;
+    const LookAssistRenderBalanceFn live =
+        ReceiptApplier::lookAssistBalanceRenderer( video, 0, colorDownscale, width, height, 1, false );
+    const LookAssistRenderBalanceFn measureOnly =
+        ReceiptApplier::lookAssistMeasureOnlyRenderer( video, 0, colorDownscale, width, height, 1 );
+
+    LookAssistRenderedPicture patchPicture;
+    ASSERT_TRUE( live( 1.74, 6000, 0, &patchPicture ) );
+    ASSERT_EQ( 1, video->llrawproc->bpm_status );
+
+    const LookAssistStats rawStats = rawThumbnailStats( video, 0 );
+    ASSERT_TRUE( lookAssistExposureBoundExcludesNight( rawStats ) );
+    LookAssistStats lit = rawStats;
+    lit.p95 = 255.0;   // a lit picture, as the processed one the consumers pass is
+
+    // The search is only reached when the surface is near-neutral at the base balance and NOT verified at the solution.
+    // The tracked clip's flat floor is amber at 6000 K (chroma 15), so read the real renders to find a base balance
+    // where the surface at the patch pixel IS neutral and a candidate where it is not.
+    struct Sample { int temperature; double chroma; bool neutral; };
+    std::vector<Sample> samples;
+    for( int temperature = 3000; temperature <= 9930; temperature += 1000 )
+    {
+        LookAssistRenderedPicture picture;
+        ASSERT_TRUE( measureOnly( 1.74, temperature, 0, &picture ) );
+        const unsigned char *p = &picture.rgb[( 30u * static_cast<size_t>( picture.width ) + 40u ) * 3u];
+        const double chroma = std::max( p[0], std::max( p[1], p[2] ) ) - std::min( p[0], std::min( p[1], p[2] ) );
+        const double luma = ( 54.0 * p[0] + 183.0 * p[1] + 19.0 * p[2] ) / 256.0;
+        const bool neutral = chroma <= std::max( 10.0, luma * 0.09 ) && std::fabs( double( p[2] ) - p[0] ) <= 20.0;
+        std::fprintf( stderr, "SURFACE-SEARCH-SNAPSHOT sample %d K rgb=%d,%d,%d chroma=%.1f neutral=%d\n", temperature,
+                      p[0], p[1], p[2], chroma, neutral ? 1 : 0 );
+        samples.push_back( { temperature, chroma, neutral } );
+    }
+    const Sample *base = nullptr;
+    for( const Sample &s : samples )
+        if( s.neutral && ( !base || s.chroma < base->chroma ) ) base = &s;
+    ASSERT_TRUE( base != nullptr );
+    const Sample *solution = nullptr;
+    for( const Sample &s : samples )
+        if( !( s.neutral && s.chroma <= base->chroma + 0.75 ) && ( !solution || s.chroma > solution->chroma ) ) solution = &s;
+    ASSERT_TRUE( solution != nullptr );
+
+    const LlrawprocSharedState before = llrawprocSharedState( video );
+    const int cachedBefore = video->current_cached_frame_active;
+    const double kelvinBefore = processingGetWhiteBalanceKelvin( video->processing );
+    const double tintBefore = processingGetWhiteBalanceTint( video->processing );
+
+    const LookAssistWindowLitCheck measured = runWindowLitVerification( video, rawStats, measureOnly, colorDownscale, &lit,
+        base->temperature, 0, solution->temperature, 0 );
+    std::fprintf( stderr, "SURFACE-SEARCH-SNAPSHOT reason=%s search=%s renders=%d base=%.1f solution=%.1f\n",
+                  qPrintable( measured.reason ), qPrintable( measured.search.result ), measured.search.renders,
+                  measured.baseSurfaceChroma, measured.solutionSurfaceChroma );
+    ASSERT_TRUE( measured.candidate );
+    ASSERT_TRUE( measured.exposureBound );
+    // The search itself ran: its renders are what this test is about.
+    ASSERT_TRUE( measured.search.result != QStringLiteral("not-run") );
+    ASSERT_TRUE( measured.search.renders > 0 );
+    ASSERT_TRUE( sameLlrawprocSharedState( before, llrawprocSharedState( video ) ) );
+    ASSERT_EQ( cachedBefore, video->current_cached_frame_active );
+    ASSERT_EQ( kelvinBefore, processingGetWhiteBalanceKelvin( video->processing ) );
+    ASSERT_EQ( tintBefore, processingGetWhiteBalanceTint( video->processing ) );
+    ASSERT_EQ( 0, llrpSetIsolatedAnalysisSharedStateReadOnlyForCurrentThread( 0 ) );
+
+    // The same run through the live renderer DOES move the shared state: the proof this snapshot can catch a check
+    // that renders the way master's pass does. (This run need not reach the search; its renders alone move the state.)
+    const LookAssistWindowLitCheck liveMeasured = runWindowLitVerification( video, rawStats, live, colorDownscale, &lit,
+        base->temperature, 0, solution->temperature, 0 );
+    ASSERT_TRUE( liveMeasured.candidate );
+    ASSERT_FALSE( sameLlrawprocSharedState( before, llrawprocSharedState( video ) ) );
+}
+
 TEST(LookAssistFixtureScene, WindowLitTraceCarriesTheRawExposureFieldsInTheirOwnSlots)
 {
     // fable r1: the EXPO/LENS mapping was pinned only for all zeros, so swapping two fields survived. The M16 state: ISO
@@ -1085,18 +1182,22 @@ TEST(LookAssistFixtureScene, HeadlessAppliedLineSaysWhyItChoseItsScene)
         // (a) tracked daylight: EV100 16, the rendered picture corroborates
         { "tiny-daylight",
           "^has_ev100=1 ev100=16\\.\\d\\d\\d daylight_gate=pass post_walk_ran=0 post_walk_branch=none post_walk_recovery=NA "
-          "display_meter_ran=0 playback_scale=NA flavor=classic$" },
+          "display_meter_ran=0 playback_scale=NA ev100_bound=NA ev100_source=recorded surface_search=not-run "
+          "surface_search_balance=NA flavor=classic$" },
         { "large-daylight",
           "^has_ev100=1 ev100=16\\.\\d\\d\\d daylight_gate=pass post_walk_ran=0 post_walk_branch=none post_walk_recovery=NA "
-          "display_meter_ran=0 playback_scale=NA flavor=classic$" },
+          "display_meter_ran=0 playback_scale=NA ev100_bound=NA ev100_source=recorded surface_search=not-run "
+          "surface_search_balance=NA flavor=classic$" },
         // (b) no metadata: nothing to record, and the first conjunct is what failed
         { "tiny-no-metadata",
           "^has_ev100=0 ev100=NA daylight_gate=exposure post_walk_ran=0 post_walk_branch=none post_walk_recovery=NA "
-          "display_meter_ran=0 playback_scale=NA flavor=classic$" },
+          "display_meter_ran=0 playback_scale=NA ev100_bound=NA ev100_source=none surface_search=not-run "
+          "surface_search_balance=NA flavor=classic$" },
         // (c) a flat-floor NIGHT verdict (ND filter: EV100 8.6 over the same flat floor): metadata present, gate exposure
         { "tiny-nd-filter",
           "^has_ev100=1 ev100=8\\.\\d\\d\\d daylight_gate=exposure post_walk_ran=0 post_walk_branch=none "
-          "post_walk_recovery=NA display_meter_ran=0 playback_scale=NA flavor=classic$" },
+          "post_walk_recovery=NA display_meter_ran=0 playback_scale=NA ev100_bound=NA ev100_source=recorded "
+          "surface_search=not-run surface_search_balance=NA flavor=classic$" },
     };
     const size_t caseCount = sizeof( kIdentityCases ) / sizeof( kIdentityCases[0] );
     ASSERT_EQ( caseCount, sizeof( expected ) / sizeof( expected[0] ) );
@@ -1125,7 +1226,7 @@ TEST(LookAssistFixtureScene, HeadlessAppliedLineSaysWhyItChoseItsScene)
         const QString log = QString::fromUtf8( noMeta.log );
         ASSERT_EQ( 1, log.count( QStringLiteral("LOOK_ASSIST window_lit_interior frame=0 wouldReclassify=false reason=") ) );
         ASSERT_TRUE( log.contains( QStringLiteral(" scene=night ") ) );
-        ASSERT_TRUE( log.contains( QStringLiteral("expoIso=0 expoShutterUs=0 lensApertureX100=0") ) );
+        ASSERT_TRUE( log.contains( QStringLiteral("expoIso=0 expoShutterUs=0 lensApertureX100=0 applied=false exposureBound=false") ) );
         IdentityRun nd;
         ASSERT_TRUE( runIdentityCase( kIdentityCases[3], &nd ) );
         ASSERT_TRUE( nd.scene == QStringLiteral("night") );
@@ -1138,4 +1239,54 @@ TEST(LookAssistFixtureScene, HeadlessAppliedLineSaysWhyItChoseItsScene)
     ASSERT_TRUE( runHeadlessLookAssist( "tests/fixtures/clips/tiny_dual_iso.mlv", false, &receipt, &log, true, -1, 0, 0, true ) );
     ASSERT_TRUE( log.contains( "masterScenePass=true" ) );
     ASSERT_TRUE( appliedLineDecisionTail( log ).contains( QStringLiteral("daylight_gate=n/a ") ) );
+}
+
+TEST(LookAssistFixtureScene, TheApertureBoundThroughTheRealHeadlessPath)
+{
+    // LOOK-ASSIST-M16-NOT-NIGHT-1, on the tracked fixture with its recorded exposure replaced. The fixture's RAW thumbnail
+    // is the flat floor every night verdict here comes from.
+    // (a) A NIGHT exposure with no aperture (ISO 3200, 1/50 s: bound 0.6): the bound rules nothing out, so receipt,
+    //     verdict and picture are the pinned no-metadata night's, bit for bit; only the log gains the bound.
+    {
+        const IdentityCase c = { "tiny-no-aperture-night", "tests/fixtures/clips/tiny_dual_iso.mlv", true, 3200, 20000, 0, 1 };
+        IdentityRun run;
+        ASSERT_TRUE( runIdentityCase( c, &run ) );
+        std::fprintf( stderr, "APERTURE-BOUND %s | scene=%s | receipt=%s | sha256=%s\n", c.name, qPrintable( run.scene ),
+                      qPrintable( run.receipt ), run.pictureSha256.c_str() );
+        ASSERT_TRUE( run.scene == QString::fromLatin1( kIdentityPins[2].scene ) );
+        ASSERT_TRUE( run.receipt == QString::fromLatin1( kIdentityPins[2].receipt ) );
+        ASSERT_TRUE( run.pictureSha256 == kIdentityPins[2].pictureSha256 );
+        const QString tail = appliedLineDecisionTail( run.log );
+        ASSERT_TRUE( tail.startsWith( QStringLiteral("has_ev100=0 ev100=NA daylight_gate=exposure ") ) );
+        ASSERT_TRUE( tail.endsWith( QStringLiteral(
+            "ev100_bound=0.643 ev100_source=aperture_bound surface_search=not-run surface_search_balance=NA "
+            "flavor=classic") ) );
+        const QString log = QString::fromUtf8( run.log );
+        ASSERT_TRUE( log.contains( QStringLiteral("LOOK_ASSIST window_lit_interior frame=0 wouldReclassify=") ) );
+        ASSERT_TRUE( log.contains( QStringLiteral(" applied=false exposureBound=false ") ) );
+    }
+    // (b) The M16 exposure with no aperture (ISO 100, 1/1357 s: bound 10.4; the fixture's DISO block decodes to a 1600
+    //     recovery ISO, so 6.4 after the 4-stop credit): night is ruled out by the exposure, but the bound alone never
+    //     changes a verdict. Here the night path's processed picture yields no patch to verify (not-processed-solve), so
+    //     the receipt and picture are the pinned night's, bit for bit.
+    {
+        const IdentityCase c = { "tiny-no-aperture-m16", "tests/fixtures/clips/tiny_dual_iso.mlv", true, 100, 737, 0, 1 };
+        IdentityRun run;
+        ASSERT_TRUE( runIdentityCase( c, &run ) );
+        std::fprintf( stderr, "APERTURE-BOUND %s | scene=%s | receipt=%s | sha256=%s\n", c.name, qPrintable( run.scene ),
+                      qPrintable( run.receipt ), run.pictureSha256.c_str() );
+        for( const QByteArray &line : run.log.split( '\n' ) )
+            if( line.contains( "window_lit_interior" ) || line.contains( "LOOK_ASSIST applied" ) )
+                std::fprintf( stderr, "APERTURE-BOUND %s\n", line.constData() );
+        const QString tail = appliedLineDecisionTail( run.log );
+        ASSERT_TRUE( tail.endsWith( QStringLiteral(
+            "ev100_bound=10.406 ev100_source=aperture_bound surface_search=not-run surface_search_balance=NA "
+            "flavor=classic") ) );
+        const QString log = QString::fromUtf8( run.log );
+        ASSERT_TRUE( log.contains( QStringLiteral("wouldReclassify=false reason=not-processed-solve ") ) );
+        ASSERT_TRUE( log.contains( QStringLiteral(" applied=false exposureBound=true recoveryIso=1600 ") ) );
+        ASSERT_TRUE( run.scene == QString::fromLatin1( kIdentityPins[2].scene ) );
+        ASSERT_TRUE( run.receipt == QString::fromLatin1( kIdentityPins[2].receipt ) );
+        ASSERT_TRUE( run.pictureSha256 == kIdentityPins[2].pictureSha256 );
+    }
 }
