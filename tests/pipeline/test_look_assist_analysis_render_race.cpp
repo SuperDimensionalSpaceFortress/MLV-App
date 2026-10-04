@@ -150,6 +150,95 @@ TEST(LookAssistAnalysisRenderRace, TheAnalysedPictureDoesNotDependOnWhetherARend
     }
 }
 
+// A fractional raw black (Raw Fix on, black control 2047.9): the control writes the fraction into the
+// processing object (8191.6 at 14 bit) but the integer into RAWI, which is all the recon reads. A sync
+// replaces the fraction with the recon's levels, so the analysis black must come from RAWI in both states
+// or the level table -- and the analysed picture -- again depends on whether a render synced first.
+TEST(LookAssistAnalysisRenderRace, AFractionalRawBlackGivesTheSamePictureBeforeAndAfterASync)
+{
+    for( const char *clip : kDualIsoFixtureClips )
+    {
+        MlvPipelineFixture fixture;
+        ASSERT_TRUE( openFixture( fixture, clip ) );
+        mlvObject_t *video = fixture.video();
+        ASSERT_TRUE( llrpHQDualIso( video ) != 0 );
+
+        // Exactly what the raw-black slider does (MainWindow::on_horizontalSliderRawBlack_valueChanged).
+        const double rawBlack = getMlvBlackLevel( video ) + 0.9;
+        setMlvBlackLevel( video, rawBlack );
+        processingSetBlackLevel( video->processing, rawBlack, getMlvBitdepth( video ) );
+        llrpResetFpmStatus( video );
+        llrpResetBpmStatus( video );
+        resetMlvCache( video );
+        resetMlvCachedFrame( video );
+        const float fractionalBlack = video->processing->black_level;
+        ASSERT_TRUE( fractionalBlack != static_cast<float>( static_cast<int>( fractionalBlack ) ) );
+
+        AnalysisPictures beforeSync;
+        ASSERT_TRUE( renderAnalysisPictures( video, 0, &beforeSync ) );
+        ASSERT_TRUE( video->processing->black_level == fractionalBlack ); // the live object keeps the fraction
+
+        mlvSyncProcessingDualIsoBlackWhiteLevels( video );
+        ASSERT_TRUE( video->processing->black_level != fractionalBlack );
+
+        AnalysisPictures afterSync;
+        ASSERT_TRUE( renderAnalysisPictures( video, 0, &afterSync ) );
+        assertSamePictures( beforeSync, afterSync );
+    }
+}
+
+// The neutral-patch white-balance solve. The live solver (findMlvWhiteBalance, the manual picker) runs on the
+// LIVE object, whose levels a sync changes ~2.6x, and that moves its answer where a channel reaches the 16-bit
+// clamp (tiny_dual_iso, patch 1: 10000/-37 at clip levels, 9990/-37 synced). Look Assist's solve
+// (findMlvWhiteBalanceAtAnalysisLevels) must give one answer in both states, at five patches on both fixtures,
+// and match the live solver in the clip-level state (the headless applier's, unchanged).
+TEST(LookAssistAnalysisRenderRace, TheWhiteBalanceSolveDoesNotDependOnWhetherARenderSyncedTheLevels)
+{
+    int liveSolverMoved = 0;
+    for( const char *clip : kDualIsoFixtureClips )
+    {
+        MlvPipelineFixture fixture;
+        ASSERT_TRUE( openFixture( fixture, clip ) );
+        mlvObject_t *video = fixture.video();
+        ASSERT_TRUE( llrpHQDualIso( video ) != 0 );
+        const int w = getMlvWidth( video );
+        const int h = getMlvHeight( video );
+        const int patches[5][2] = { { w / 2, h / 2 }, { w / 4, h / 4 }, { 3 * w / 4, h / 4 },
+                                    { w / 4, 3 * h / 4 }, { 3 * w / 4, 3 * h / 4 } };
+
+        int before[5][2] = {};
+        int liveBefore[5][2] = {};
+        for( int i = 0; i < 5; ++i )
+        {
+            findMlvWhiteBalanceAtAnalysisLevels( video, 0, patches[i][0], patches[i][1], &before[i][0], &before[i][1], 0 );
+            findMlvWhiteBalance( video, 0, patches[i][0], patches[i][1], &liveBefore[i][0], &liveBefore[i][1], 0 );
+            ASSERT_EQ( liveBefore[i][0], before[i][0] );
+            ASSERT_EQ( liveBefore[i][1], before[i][1] );
+        }
+
+        const int clipWhite = video->processing->white_level;
+        mlvSyncProcessingDualIsoBlackWhiteLevels( video );
+        const int syncedWhite = video->processing->white_level;
+        ASSERT_TRUE( syncedWhite > clipWhite * 2 );
+
+        for( int i = 0; i < 5; ++i )
+        {
+            int temperature = 0, tint = 0;
+            findMlvWhiteBalanceAtAnalysisLevels( video, 0, patches[i][0], patches[i][1], &temperature, &tint, 0 );
+            ASSERT_EQ( syncedWhite, video->processing->white_level ); // the live object is not touched
+            int liveTemperature = 0, liveTint = 0;
+            findMlvWhiteBalance( video, 0, patches[i][0], patches[i][1], &liveTemperature, &liveTint, 0 );
+            std::printf( "[wb-solve] %s patch %d: analysis %d/%d -> %d/%d, live %d/%d -> %d/%d\n", clip, i,
+                         before[i][0], before[i][1], temperature, tint,
+                         liveBefore[i][0], liveBefore[i][1], liveTemperature, liveTint );
+            if( liveTemperature != liveBefore[i][0] || liveTint != liveBefore[i][1] ) ++liveSolverMoved;
+            ASSERT_EQ( before[i][0], temperature );
+            ASSERT_EQ( before[i][1], tint );
+        }
+    }
+    ASSERT_TRUE( liveSolverMoved > 0 ); // the injected state really moves an unprotected solve
+}
+
 // Repeat-run stability: twenty analysis passes over the same frame, alternating the injected state, give
 // one picture and one statistics record.
 TEST(LookAssistAnalysisRenderRace, TwentyPassesAlternatingTheSyncStateGiveOnePicture)

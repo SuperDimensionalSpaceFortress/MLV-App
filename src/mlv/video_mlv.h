@@ -129,6 +129,8 @@ void setMlvRawCacheLimitFrames(mlvObject_t * video, uint64_t frameLimit);
 void setMlvProcessing(mlvObject_t * video, processingObject_t * processing);
 /* Function for WB Picker */
 void findMlvWhiteBalance(mlvObject_t * video, uint64_t frameIndex, int posX, int posY, int *wbTemp, int *wbTint, int mode);
+/* Look Assist's solve: a clone at the clip levels (mlvSetAnalysisProcessingClipLevels), live object untouched. */
+void findMlvWhiteBalanceAtAnalysisLevels(mlvObject_t * video, uint64_t frameIndex, int posX, int posY, int *wbTemp, int *wbTint, int mode);
 void findMlvWhiteBalanceIsolated(mlvObject_t * video, uint64_t frameIndex, int posX, int posY, int *wbTemp, int *wbTint, int mode);
 
 /* Functions for getting processed MLV frames - uses the 'processing' module,
