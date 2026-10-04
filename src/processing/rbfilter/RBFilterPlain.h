@@ -124,9 +124,10 @@ public:
         const int32_t * __restrict output_curve_g = nullptr,
         const int32_t * __restrict output_curve_b = nullptr);
     void setTimingEnabled(bool enabled) { m_timing_enabled = enabled; }
-    // true (default): one parallel region, rows then column blocks, with the
-    // vertical passes column-parallel; bit-exact to the legacy passes.
-    // false: the legacy passes with the serial vertical pair (reference/rollback).
+    // true: one parallel region, rows then column blocks, with the vertical
+    // passes column-parallel; bit-exact to the legacy passes.
+    // false: the legacy passes with the serial vertical pair. The class
+    // defaults to true; the product wrapper (rbf_wrapper.cpp) defaults to false.
     void setParallelVertical(bool enabled) { m_parallel_vertical = enabled; }
     // Team size cap of the parallel path (0: OpenMP's default). The result
     // does not depend on it.

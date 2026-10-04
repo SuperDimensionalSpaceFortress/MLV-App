@@ -655,6 +655,23 @@ TEST(ProcessingFilters, RbfFilterParallelVerticalMatchesSerialBitExact)
     ASSERT_TRUE(compared_runs > 100);
 }
 
+TEST(ProcessingFilters, RbfParallelFilterIsOptInByDefault)
+{
+    /* On Bachelor the parallel filter lowered render_work but lost presented
+     * fps beside the overlapped CPU decode/recon, so the product default is
+     * the legacy passes; MLVAPP_RBF_PARALLEL=1 opts in. */
+    const char * opt_in = std::getenv("MLVAPP_RBF_PARALLEL");
+    if( opt_in && *opt_in )
+    {
+        SKIP_TEST("MLVAPP_RBF_PARALLEL is set in this environment");
+    }
+    recursive_bf_set_parallel_vertical_override(-1);
+    ASSERT_EQ(0, recursive_bf_parallel_enabled());
+    recursive_bf_set_parallel_vertical_override(1);
+    ASSERT_EQ(1, recursive_bf_parallel_enabled());
+    recursive_bf_set_parallel_vertical_override(-1);
+}
+
 TEST(ProcessingFilters, RbfParallelVerticalLeavesPlaybackShBlurUnchanged)
 {
     /* Playback's S/H blur (the RBF on the standard x1 lane) must be
