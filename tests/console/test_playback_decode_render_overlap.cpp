@@ -55,7 +55,8 @@ struct PipelineRun
 {
     int presented = 0;
     bool inOrder = true;    // every present is exactly the previous one + 1
-    double firstPresentMs = -1.0;
+    bool presentedAny = false;
+    double firstPresentMs = 0.0;
     double lastPresentMs = 0.0;
     int maxInFlight = 0;
     OverlapSnapshot overlap;
@@ -192,7 +193,8 @@ PipelineRun simulatePipeline( int lookaheadDepth, Gate gate, double upstreamMs, 
             lastPresented = target;
             frames.erase( target );
             ++run.presented;
-            if( run.firstPresentMs < 0.0 ) run.firstPresentMs = now;
+            if( !run.presentedAny ) run.firstPresentMs = now;
+            run.presentedAny = true;
             run.lastPresentMs = now;
             stillDrawing = busyForAdvance();
         }
@@ -264,8 +266,7 @@ TEST(PlaybackDecodeRenderOverlapMeter, SerialStagesReportNoOverlap)
     ASSERT_EQ( s.renderStarts, 4u );
     ASSERT_NEAR( s.upstreamBusyMs, 120.0, 1e-9 );
     ASSERT_NEAR( s.renderBusyMs, 44.0, 1e-9 );
-    ASSERT_NEAR( s.overlapMs, 0.0, 1e-9 );
-    ASSERT_NEAR( s.overlapFractionOfRender(), 0.0, 1e-9 );
+   ASSERT_NEAR( s.overlapFractionOfRender(), 0.0, 1e-9 );
 }
 
 TEST(PlaybackDecodeRenderOverlapMeter, NextFrameUpstreamUnderTheRenderIsCountedAsOverlap)
@@ -319,7 +320,7 @@ TEST(PlaybackDecodeRenderOverlapPipeline, TwoFramesInFlightReachNativeInOrderWit
     ASSERT_TRUE( r.presentedFpsAfterFirst() <= kNativeFps + 0.05 ); // ...and never faster (#261)
     // At native pace the stages have slack, so they idle between frames and the render-time overlap is small; what
     // two frames in flight buy here is that each frame's upstream started a frame early (engagement), not overlap.
-    ASSERT_TRUE( r.overlap.overlapMs > 0.0 );
+    ASSERT_TRUE( r.overlap.overlapFractionOfRender() > 0.01 );
     ASSERT_TRUE( r.overlap.upstreamEngagement() > 0.9 );
 }
 
