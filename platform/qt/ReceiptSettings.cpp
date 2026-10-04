@@ -111,6 +111,7 @@ ReceiptSettings::ReceiptSettings()
     m_rawWhite = -1;
     m_rawBlack = -1;
     m_lookAssistEnabled = true;
+    m_lookAssistFlavor = QString( "" );
     m_lookAssistBaselineValid = false;
     m_lookAssistBaselineExposure = 0;
     m_lookAssistBaselineContrast = 0;

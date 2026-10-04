@@ -595,6 +595,11 @@ void ReceiptLoader::parseXmlElements(QXmlStreamReader *Rxml,
             receipt->setLookAssistEnabled( (bool)Rxml->readElementText().toInt() );
             Rxml->readNext();
         }
+        else if( Rxml->isStartElement() && Rxml->name() == QString( "lookAssistFlavor" ) )
+        {
+            receipt->setLookAssistFlavor( Rxml->readElementText().trimmed() );
+            Rxml->readNext();
+        }
         else if( Rxml->isStartElement() && Rxml->name() == QString( "lookAssistBaselineValid" ) )
         {
             receipt->setLookAssistBaselineValid( (bool)Rxml->readElementText().toInt() );
