@@ -28,6 +28,7 @@
 #include <QSortFilterProxyModel>
 #include <QItemSelectionModel>
 #include <QToolButton>
+#include "../../src/batch/LookAssistAnalysis.h"   // LookAssistFlavor, and the LookAssistAppliedMarker member below
 #include "SessionModel.h"
 #include "PlaybackFrameRange.h"
 #include "../../src/mlv_include.h"
@@ -348,6 +349,7 @@ private slots:
     void on_actionExportCurrentFrame_triggered();
     void on_checkBoxHighLightReconstruction_toggled(bool checked);
     void on_checkBoxLookAssistEnable_clicked(bool checked);
+    void on_comboBoxLookAssistFlavor_currentIndexChanged(int index);
     void on_comboBoxUseCameraMatrix_currentIndexChanged(int index);
     void on_checkBoxCreativeAdjustments_toggled(bool checked);
     void on_checkBoxExrMode_toggled(bool checked);
@@ -919,6 +921,8 @@ private:
     double m_playbackQualityLastPresentedTime = 0.0;
     PlaybackQualityAutoSampler m_playbackQualitySampler;
     bool m_lastLookAssistDiagnosticsValid = false;
+    QString m_lastWarnedLookAssistFlavorValue;
+    lookassist::LookAssistFlavorOutcome m_lookAssistFlavorOutcome;   // how the last analysis ended: telemetry and setReceipt read it
     QString m_lastLookAssistScene;
     double m_lastLookAssistMedian = 0.0;
     double m_lastLookAssistP05 = 0.0;
@@ -975,7 +979,8 @@ private:
     // De-dupe guard: the receipt whose Auto Look Assist analysis already ran this clip-open. A second
     // setSliders/deferral must not re-run the ~3s auto-WB analysis (it derives the same look and just
     // re-freezes the UI). Keyed on the receipt pointer so different clips re-analyze naturally.
-    ReceiptSettings *m_lookAssistAppliedReceipt = nullptr;
+    // A flavor change forgets the clip (LookAssistAppliedMarker::flavorChanged), so the next analysis is not de-duped away.
+    lookassist::LookAssistAppliedMarker m_lookAssistApplied;
     // Generation counter bumped on every clip open/close. The async look-assist
     // worker captures it at dispatch; the queued apply lambda re-checks before
     // touching any UI state, ensuring stale results from a previous clip are dropped.
@@ -1743,6 +1748,7 @@ private:
     void applyLookAssistToReceipt( ReceiptSettings *receipt,
                                    int analysisFrame = -1 );
     void syncLookAssistDerivedUiToReceipt( ReceiptSettings *receipt );
+    lookassist::LookAssistFlavor currentLookAssistFlavor();
     void setGradientMask( void );
     uint16_t autoCorrectRawBlackLevel( void );
     uint16_t autoCorrectRawWhiteLevel( void );

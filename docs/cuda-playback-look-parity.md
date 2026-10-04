@@ -5,7 +5,35 @@ apply path through `processingObject_t` / `GpuPreviewProcessingConfig` to whiche
 live CUDA texture-present fast path (`GpuDisplayWindow` / `GpuDisplayViewport`
 `presentGpuPlaybackReconAmazePostWbTexture*`) actually draws with, per file:line evidence.
 
-## PARTIAL PARITY, NOT FULL PARITY (read before relying on this document)
+## CURRENT STATE (PLAYBACK-SEEK-RENDER-PARITY-1, 2026-10-03) -- read this first
+
+The sections below are the history of CUDA-PLAYBACK-LOOK-PARITY-1/-2. Since
+PLAYBACK-SEEK-RENDER-PARITY-1 the live DISPLAY shader applies the **whole per-pixel chain** in
+the engine's order: levels, WB, contrast+pivot, shadows/highlights, camera matrix + gamut
+compression, **AgX forward**, gamma, **hue-vs / luma-vs curves**, vibrance, **saturation**,
+**toning**, the **creative curves** (the receipt's dark/light S-curve + lightening and the
+gradation curves Y/R/G/B, composed bit-exactly into one per-channel RGBA16 table) and the **AgX
+inverse**. The default receipt's S-curve was the owner-visible defect: CUDA playback dropped it
+and looked lifted ("milky") against the paused frame and the CPU route.
+
+Stages the display shader does **not** apply -- **vignette, highlight reconstruction, gradient,
+.cube LUT, chroma separation/blur, sharpen, median denoise** -- are **refused**, never dropped:
+`gpuPreviewProcessingDisplayShaderRefusedStages()` turns off
+`MainWindowGpuPreviewPolicyState::gpuPreviewProcessingDisplayShaderCompatible`, which refuses the
+GPU recon and AMaZE texture-present routes (and the scale-1 clamp), and the viewport's RGB16
+display-shader present is skipped, so playback stays on a route whose processing applies them.
+Telemetry: `gpu_display_shader_refused_stages=<list>` per frame, and the texture-present
+fallback reason starts with `display_shader_refused_stages=<list>`.
+
+The test-side switch `neutralize_unported_creative_stages` is gone: every engine-anchored and
+direct8-anchored test compares against the FULL engine, S-curve included
+(`GpuPreviewProcessing.EngineAnchoredReceiptSCurveRealFrameMatchesEngine`,
+`...EngineAnchoredCreativeChainMatchesEngineOnBothCpuRoutes`,
+`...DisplayShaderCreativeCurveCompositionIsBitExact`,
+`...DisplayShaderRefusalPredicateMatchesConfigFlags`). The "PARTIAL PARITY" list that follows
+is kept as history and no longer describes the code.
+
+## PARTIAL PARITY, NOT FULL PARITY (history: CUDA-PLAYBACK-LOOK-PARITY-1/-2)
 
 This work makes the live CUDA display shader apply **contrast+pivot, shadows/highlights and
 vibrance**. It does **not** make CUDA playback match CPU Look Assist in general. The live

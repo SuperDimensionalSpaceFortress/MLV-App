@@ -94,8 +94,21 @@ def _resolve_commit(repo: Path, revision: str) -> str:
     return resolved
 
 
-def build_receipt(repo: Path, base: str, head: str, *, force_real: bool = False) -> dict:
+def build_receipt(
+    repo: Path,
+    base: str,
+    head: str,
+    *,
+    force_real: bool = False,
+    merge_group: bool = False,
+) -> dict:
     repo = repo.resolve()
+    if merge_group:
+        # A merge-queue entry is the last gate before master: it always runs the real
+        # jobs and needs an exact base, never the HEAD^ fallback `main` applies.
+        force_real = True
+        if not base:
+            raise RouteError("merge_group route requires the exact merge-group base sha")
     base_sha = _resolve_commit(repo, base)
     head_sha = _resolve_commit(repo, head)
     if base_sha == head_sha:
@@ -119,7 +132,9 @@ def build_receipt(repo: Path, base: str, head: str, *, force_real: bool = False)
     paths = [_canonical_path(item.decode("utf-8", "strict")) for item in raw_paths.split(b"\0") if item]
     paths = sorted(set(paths))
     route = classify_paths(paths)
-    if force_real:
+    if merge_group:
+        route = Route(True, True, "MERGE_GROUP_RUN_REAL_ORACLES")
+    elif force_real:
         route = Route(True, True, "MANUAL_DISPATCH_RUN_REAL_ORACLES")
 
     raw_diff = _git(
@@ -195,13 +210,22 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--receipt", type=Path, required=True)
     parser.add_argument("--github-output", type=Path)
     parser.add_argument("--force-real", action="store_true")
+    parser.add_argument("--merge-group", action="store_true")
     return parser
 
 
 def main(argv: Sequence[str] | None = None) -> int:
     args = _parser().parse_args(argv)
-    base = args.base.strip() or "HEAD^"
-    receipt = build_receipt(args.repo_root, base, args.head, force_real=args.force_real)
+    base = args.base.strip()
+    if not args.merge_group:
+        base = base or "HEAD^"
+    receipt = build_receipt(
+        args.repo_root,
+        base,
+        args.head,
+        force_real=args.force_real,
+        merge_group=args.merge_group,
+    )
     _atomic_json(args.receipt, receipt)
     if args.github_output is not None:
         _write_github_output(args.github_output, receipt)

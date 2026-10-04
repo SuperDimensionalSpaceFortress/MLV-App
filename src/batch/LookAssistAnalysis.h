@@ -58,6 +58,10 @@ struct LookAssistStats
     // resolveLookAssistScene). The recorded exposure alone is NOT proof of daylight: a night moon
     // shot at ISO 200, 1/500 s, f/7.1 records EV100 13.6 over a black sky.
     bool daylightPictureEvidence = false;
+    // A window-lit interior: a flat-floor "night" verdict with no recorded exposure whose own neutral-patch solve
+    // is daylight and verifies on the picture (set only by resolveLookAssistWindowLitInterior). Daylight evidence
+    // in its own right; see lookAssistSceneIsDaylight.
+    bool windowLitInteriorEvidence = false;
     // The clip's recorded (as-shot) white balance, mapped to the app's temperature / tint controls
     // (tint in receipt units). Only a PRIOR: used when no neutral patch can be trusted.
     bool hasAsShotWb = false;
@@ -108,7 +112,7 @@ void lookAssistSetSceneEv100( LookAssistStats *stats,
  * interiors <= ~10). NECESSARY, never sufficient: see lookAssistSceneIsDaylight. */
 bool lookAssistExposureIsDaylightBright( const LookAssistStats &stats );
 
-/* Daylight = bright recorded exposure AND the rendered picture agrees. */
+/* Daylight = bright recorded exposure AND the rendered picture agrees, or a verified window-lit interior. */
 bool lookAssistSceneIsDaylight( const LookAssistStats &stats );
 
 /* Daylight and not a scene class that excludes it. Every daylight-only rule below keys on this. */
@@ -163,8 +167,9 @@ void lookAssistTraceWalkCleanup( LookAssistDecisionTrace *trace );   // call whe
 void lookAssistTraceWalkRecovery( LookAssistDecisionTrace *trace, bool candidateAdopted,
                                   int temperatureDelta, int tintDelta );
 
-/* daylight_gate value: exposure | flatfloor | legacy | picture | pass | n/a, for the stats AFTER
- * resolveLookAssistScene. pass = the rendered picture corroborated daylight; picture = every other conjunct held
+/* daylight_gate value: window | exposure | flatfloor | legacy | picture | pass | n/a, for the stats AFTER
+ * resolveLookAssistScene (and resolveLookAssistWindowLitInterior). window = a verified window-lit interior (see there);
+ * pass = the rendered picture corroborated daylight; picture = every other conjunct held
  * and the picture did not (or could not) say so; n/a = every other conjunct held and no picture was asked for
  * (the master pass). An earlier failing conjunct is reported whether or not a picture was asked for. */
 QString lookAssistDaylightGateName( const LookAssistStats &resolved, bool pictureEvidenceAsked );
@@ -407,12 +412,183 @@ bool lookAssistDaylightNeedsRenderedRefinement( const LookAssistStats &stats,
                                                 const LookAssistWhiteBalanceResolution &resolution,
                                                 bool refineEnabled );
 
+/* ---- Window-lit interior (LOOK-ASSIST-WINDOW-LIT-INTERIOR-1) ----
+ * A dual-ISO clip of a dark room with daylight windows: its RAW thumbnail is a flat floor (so the legacy classifier
+ * calls it night), it carries no recorded exposure (so the daylight gate cannot open), and the night post-balance walk
+ * then overrode its ACCEPTED daylight-locus neutral solve with a blue-magenta recovery pair. The night verdict is kept
+ * unless the clip's own solve, on the processed picture, says daylight and verifies:
+ *   - candidate: legacy Night, flat-floor RAW thumbnail, no recorded exposure (a clip WITH EV100 keeps today's gate);
+ *   - the balance was solved on the processed picture and accepted undamped;
+ *   - the patch is window-bright (luma >= 150) and neutral enough under daylight (lookAssistDaylightPatchIsNeutralEnough);
+ *   - the solve is bluer than the 6000 K base and on the daylight locus: >= 7000 K and inside the daylight window. Every
+ *     night light source (tungsten, sodium, warm or neutral LED, moonlight) solves warmer than the base;
+ *   - verified: the same surface, rendered at the patch picture's exposure, is near-neutral at the base balance and at
+ *     the solution and no more cast there (the daylight initial-patch guard, with the base balance as the start).
+ * Then stats->windowLitInteriorEvidence is set, the scene becomes the daylight class (Shade), the preset is that
+ * scene's (same inputs) and the accepted balance stands, clamped into the daylight window (a no-op by the gate).
+ * CONSUMERS RUN IT MEASURE-ONLY (on copies, logging window_lit_interior): on the owner clip the accepted solve did not
+ * verify (its own patch turns amber at the solution), so nothing is reclassified until the follow-ons land. */
+static const double kLookAssistWindowLitMinPatchLuma = 150.0;
+static const int    kLookAssistWindowLitMinTemperature = 7000;
+
+/* The night verdict could be a window-lit interior: legacy Night from a flat-floor RAW thumbnail, no recorded exposure. */
+bool lookAssistWindowLitInteriorCandidate( const LookAssistStats &stats, LookAssistScene scene );
+
+struct LookAssistWindowLitCheck
+{
+    bool candidate = false;
+    bool evidence = false;
+    QString reason = QStringLiteral("not-candidate");   // the first conjunct that failed, or "pass"
+    double baseSurfaceChroma = 0.0;
+    double baseSurfaceBlueAmber = 0.0;
+    double solutionSurfaceChroma = 0.0;
+    double solutionSurfaceBlueAmber = 0.0;
+};
+
+/* Runs after resolveLookAssistWhiteBalance on the same request. patchPictureExposureStops = the exposure (stops) of
+ * the processed picture the patch was found in, so the verification renders the same picture. On evidence it updates
+ * stats (request.stats must point at it), scene and preset as described above; otherwise it changes nothing. */
+LookAssistWindowLitCheck resolveLookAssistWindowLitInterior( const LookAssistWhiteBalanceRequest &request,
+                                                             const LookAssistWhiteBalanceResolution &wb,
+                                                             double patchPictureExposureStops,
+                                                             LookAssistStats *stats,
+                                                             LookAssistScene *scene,
+                                                             LookAssistPreset *preset,
+                                                             const LookAssistStats *colorStats = nullptr,
+                                                             const LookAssistStats *displayStats = nullptr );
+
 int lookAssistDisplayTargetMedianForScene( LookAssistScene scene );
 
+/* ---- Flavors: Classic | Cinematic. ----
+ * Classic is master's Look Assist, untouched: presetForLookAssistScene returns before any flavor code, so
+ * every sliders / receipt / picture it produced stays byte-identical. Cinematic is the same analysis, the
+ * same scene verdict and the same white-balance decision, with ONE table of additive deltas
+ * (kCinematicFlavorDeltas, LookAssistAnalysis.cpp) laid over the same preset sliders -- contrast, pivot,
+ * shadows, highlights, vibrance. It never touches exposure (Classic's, exactly) or temperatureDelta / tintDelta. Saturation and the
+ * tone curve are not Look Assist sliders (no preset field, no baseline), so they are not used. */
+enum class LookAssistFlavor
+{
+    Classic,
+    Cinematic
+};
+
+/* "classic" / "cinematic": the one spelling used in the environment, the receipt element, the app setting
+ * and every log line. */
+QString lookAssistFlavorName( LookAssistFlavor flavor );
+
+/* Where the flavor in force came from, for the log: "env", "receipt", "app" or "default". */
+struct LookAssistFlavorSelection
+{
+    LookAssistFlavor flavor = LookAssistFlavor::Classic;
+    QString source = QStringLiteral("default");
+    // The first layer that said something said something this module does not know: Classic was taken and
+    // the consumer logs a warning carrying rejectedValue.
+    bool unknownValue = false;
+    QString rejectedValue;
+};
+
+/* Pure. Layers in priority order: the environment value (MLVAPP_LOOK_ASSIST_FLAVOR, for runs) wins over the
+ * receipt's lookAssistFlavor element, which wins over the GUI's app setting; an empty layer is skipped. The
+ * first non-empty layer decides, case-insensitively and trimmed; if it is not "classic" or "cinematic" the
+ * answer is Classic with unknownValue set -- never a silent fall through to a lower layer. */
+LookAssistFlavorSelection lookAssistSelectFlavor( const QString &environmentValue,
+                                                  const QString &receiptValue,
+                                                  const QString &appSettingValue );
+
+/* The environment variable's value as the consumers read it (empty when unset). */
+QString lookAssistFlavorEnvironmentValue();
+
+/* The Cinematic deltas for a scene, exactly as the table holds them (a test pins the table through this). */
+struct LookAssistFlavorDeltas
+{
+    int exposure = 0;
+    int contrast = 0;
+    int pivot = 0;
+    int shadows = 0;
+    int highlights = 0;
+    int vibrance = 0;
+};
+LookAssistFlavorDeltas lookAssistCinematicDeltasForScene( LookAssistScene scene );
+
+/* Lays the flavor over a preset that is already Classic's: the five tone sliders (contrast, pivot, shadows,
+ * highlights, vibrance) move by the table and are clamped to their ranges. Exposure and the white-balance deltas
+ * are NEVER touched, and Classic is a no-op. presetForLookAssistScene ends in this very function, so a caller that
+ * must measure pictures on the Classic preset first (the GUI's white-balance walk renders the picture, so the walk
+ * must not see the grade) and lay the flavor over afterwards gets exactly the preset the one call would have made. */
+void lookAssistApplyFlavorDeltas( LookAssistPreset *preset, LookAssistScene scene, LookAssistFlavor flavor );
+
+/* A receipt's lookAssistFlavor element as the value the GUI's selector takes: "classic" or "cinematic" (trimmed,
+ * case-insensitive), or "" when the receipt declares nothing (the selector is then left alone). An unknown value is
+ * "classic" -- never Cinematic, never a silent skip -- and *selection (optional) says so (unknownValue /
+ * rejectedValue / source "receipt") so the caller can warn. Same rule as lookAssistSelectFlavor, one place. */
+QString lookAssistSelectorValueForReceipt( const QString &receiptValue, LookAssistFlavorSelection *selection = nullptr );
+
+/* The GUI's "Look Assist already applied to this clip" marker (the de-dupe that keeps a second setSliders / frame-ready
+ * trigger from re-running the ~3 s analysis). It names a clip by address. A flavor change is a different grade over the
+ * same clip, so it must FORGET the clip: otherwise the toggle's frame-ready step skips the analysis as already applied
+ * after the baseline was restored, and the clip is left ungraded under a receipt that names the new flavor. */
+class LookAssistAppliedMarker
+{
+public:
+    bool isApplied( const void *receipt ) const { return receipt != nullptr && m_receipt == receipt; }
+    bool empty() const { return m_receipt == nullptr; }
+    void markApplied( const void *receipt ) { m_receipt = receipt; }
+    void clear() { m_receipt = nullptr; }
+    void clearIf( const void *receipt ) { if( m_receipt == receipt ) m_receipt = nullptr; }
+    /* The flavor selector changed on `activeReceipt`. Forgets the clip and returns true when the analysis must run
+     * again (Look Assist is on); returns false, marker untouched, when it is off. */
+    bool flavorChanged( const void *activeReceipt, bool lookAssistEnabled )
+    {
+        if( !lookAssistEnabled ) return false;
+        clearIf( activeReceipt );
+        return true;
+    }
+private:
+    const void *m_receipt = nullptr;
+};
+
+/* How the last Look Assist analysis ENDED, the one source of truth for what the GUI reports as applied: the
+ * `gui_smoke.visual_state` telemetry and the flavor setReceipt writes into the receipt both read it. A receipt must
+ * name the flavor that was APPLIED, never the merely selected one: after a safety fallback restored the baseline
+ * sliders, a receipt that still said "cinematic" would export a grade it does not hold.
+ *   begin()   an analysis starts: nothing is applied until it lands.
+ *   landed()  it ended on `receipt` with `flavorName` -- applied, or (safetyFallback) restored to baseline.
+ *   clear()   Look Assist went off / the clip closed.
+ * receiptValue(): the fallback names "classic" (Classic semantics: the writer leaves the element out, so the file is
+ * byte-identical to a Classic receipt); an applied grade names the flavor applied; a clip with no recorded outcome
+ * (Look Assist off, or the analysis is pending) keeps the selector's value, which is the clip's setting. */
+class LookAssistFlavorOutcome
+{
+public:
+    void begin() { clear(); }
+    void clear() { m_receipt = nullptr; m_applied.clear(); m_fellBack = false; }
+    void landed( const void *receipt, const QString &flavorName, bool safetyFallback )
+    {
+        m_receipt = receipt;
+        m_fellBack = safetyFallback;
+        m_applied = safetyFallback ? QString() : flavorName;
+    }
+    /* The flavor on screen: empty until an analysis lands, and empty again after a safety fallback. */
+    QString appliedName() const { return m_applied; }
+    QString receiptValue( const void *receipt, const QString &selectedFlavorName ) const
+    {
+        if( receipt == nullptr || receipt != m_receipt ) return selectedFlavorName;
+        if( m_fellBack ) return QStringLiteral("classic");
+        return m_applied.isEmpty() ? selectedFlavorName : m_applied;
+    }
+private:
+    const void *m_receipt = nullptr;
+    QString m_applied;
+    bool m_fellBack = false;
+};
+
+/* flavor defaults to Classic, so every caller that does not pass one is master's. The scene verdict is the
+ * caller's (always the Classic classifier); the flavor only shapes the sliders. */
 LookAssistPreset presetForLookAssistScene( LookAssistScene scene,
                                            const LookAssistStats &stats,
                                            const LookAssistStats *colorStats = nullptr,
-                                           const LookAssistStats *displayStats = nullptr );
+                                           const LookAssistStats *displayStats = nullptr,
+                                           LookAssistFlavor flavor = LookAssistFlavor::Classic );
 
 } // namespace lookassist
 

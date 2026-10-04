@@ -6,6 +6,8 @@ on:
   push:
     branches:
       - master
+  merge_group:
+    types: [checks_requested]
 
 permissions:
   contents: read
@@ -27,7 +29,7 @@ jobs:
       tree: ${{ steps.route.outputs.tree }}
       diff_sha256: ${{ steps.route.outputs.diff_sha256 }}
     env:
-      ROUTER_BASE: ${{ github.event_name == 'pull_request' && github.event.pull_request.base.sha || (github.event_name == 'push' && github.event.before || '') }}
+      ROUTER_BASE: ${{ github.event_name == 'pull_request' && github.event.pull_request.base.sha || (github.event_name == 'push' && github.event.before || (github.event_name == 'merge_group' && github.event.merge_group.base_sha || '')) }}
       ROUTER_HEAD: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.sha || github.sha }}
 
     steps:
@@ -50,6 +52,9 @@ jobs:
           $forceReal = @()
           if ('${{ github.event_name }}' -eq 'workflow_dispatch') {
             $forceReal = @('--force-real')
+          }
+          if ('${{ github.event_name }}' -eq 'merge_group') {
+            $forceReal = @('--merge-group')
           }
           python tools/repo_hygiene/protected_check_router.py `
             --repo-root . `
@@ -288,7 +293,7 @@ jobs:
           if ($route -eq 'false' -and $reason -ne 'EXPLICIT_NA_PROVIDER_CONTROL_ONLY') {
             throw "product N/A lacks the exact provider-only reason"
           }
-          if ($route -eq 'true' -and $reason -notin @('ROUTER_CONTROL_CHANGED_RUN_REAL_ORACLES', 'UNKNOWN_OR_PRODUCT_PATH_RUN_REAL_ORACLES', 'MANUAL_DISPATCH_RUN_REAL_ORACLES')) {
+          if ($route -eq 'true' -and $reason -notin @('ROUTER_CONTROL_CHANGED_RUN_REAL_ORACLES', 'UNKNOWN_OR_PRODUCT_PATH_RUN_REAL_ORACLES', 'MANUAL_DISPATCH_RUN_REAL_ORACLES', 'MERGE_GROUP_RUN_REAL_ORACLES')) {
             throw "product run lacks a recognized fail-closed reason"
           }
 
@@ -429,7 +434,8 @@ jobs:
           # the 11 together. Each runs alone in its own shard, so a shard's bound never depends
           # on how many of them sort into the same 12-name window (two windows overran 240 s).
           # Every other window keeps its membership, minus those tests.
-          $soloPattern = '^LookAssistFixtureScene\.'
+          # LookAssistFlavorsFixture (LOOK-ASSIST-FLAVORS-1) renders the same fixtures, 20-75 s each locally, so it runs alone too.
+          $soloPattern = '^(LookAssistFixtureScene|LookAssistFlavorsFixture)\.'
           $shards = @()
           for ($offset = 0; $offset -lt $testNames.Count; $offset += $testsPerShard) {
             $end = [Math]::Min($offset + $testsPerShard, $testNames.Count)
@@ -794,7 +800,7 @@ jobs:
           if ($route -eq 'false' -and $reason -ne 'EXPLICIT_NA_PROVIDER_CONTROL_ONLY') {
             throw "GUI N/A lacks the exact provider-only reason"
           }
-          if ($route -eq 'true' -and $reason -notin @('ROUTER_CONTROL_CHANGED_RUN_REAL_ORACLES', 'UNKNOWN_OR_PRODUCT_PATH_RUN_REAL_ORACLES', 'MANUAL_DISPATCH_RUN_REAL_ORACLES')) {
+          if ($route -eq 'true' -and $reason -notin @('ROUTER_CONTROL_CHANGED_RUN_REAL_ORACLES', 'UNKNOWN_OR_PRODUCT_PATH_RUN_REAL_ORACLES', 'MANUAL_DISPATCH_RUN_REAL_ORACLES', 'MERGE_GROUP_RUN_REAL_ORACLES')) {
             throw "GUI run lacks a recognized fail-closed reason"
           }
 
