@@ -237,9 +237,12 @@ TEST(PlaybackSmokeFullscreenWiring, ForcePlaybackSmokeWindowForegroundIsFullscre
         QStringLiteral("void MainWindow::forcePlaybackSmokeWindowForeground( void )"),
         QStringLiteral("bool MainWindow::enterPlaybackSmokeFullscreen( QScreen *target )"));
     ASSERT_FALSE(body.isEmpty());
+    // CUDA-PERF-DISPLAY-MODE-AB-1: full screen is one of the two states kept (a windowed
+    // leg's maximize is the other; see GuiSmokeDisplaySelectWiring).
     ASSERT_TRUE(body.contains(QStringLiteral("const bool wasFullScreen = isFullScreen();")));
-    ASSERT_TRUE(body.contains(QStringLiteral("if( !wasFullScreen ) showNormal();")));
-    ASSERT_TRUE(body.contains(QStringLiteral("ShowWindow( target, wasFullScreen ? SW_SHOW : SW_SHOWNORMAL );")));
+    ASSERT_TRUE(body.contains(QStringLiteral("const bool keepWindowState = wasFullScreen || isMaximized();")));
+    ASSERT_TRUE(body.contains(QStringLiteral("if( !keepWindowState ) showNormal();")));
+    ASSERT_TRUE(body.contains(QStringLiteral("ShowWindow( target, keepWindowState ? SW_SHOW : SW_SHOWNORMAL );")));
 }
 
 // --- Fullscreen telemetry: gated on the existing MLVAPP_PLAYBACK_SMOKE_TELEMETRY flag,
