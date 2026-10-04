@@ -2,10 +2,11 @@
 //
 // Pinned here: (1) Classic is master's preset on a 5808-line grid (the golden hash was dumped from an UNCHANGED
 // master tree, fork/master b5751928, with the same grid header) and the default parameter is Classic; (2) Cinematic
-// changes ONLY the six documented sliders, by exactly the one table, deterministically, and never the white
+// changes ONLY the five documented sliders, by exactly the one table, deterministically, and never the white
 // balance deltas; (3) the selector's layers and its unknown-value rule; (4) the wiring: every preset call in the two
 // consumers passes the flavor, the scene verdict stays flavor-blind, the GUI selector and the environment both
-// reach the analysis, the receipt element is written only for a non-Classic flavor and is read back.
+// reach the analysis, the receipt element is written only for a non-Classic flavor and is read back; (5) the receipt
+// records the flavor that was APPLIED (LOOK-ASSIST-FLAVORS-2): a safety fallback leaves no Cinematic name behind.
 #include "../common/minitest.h"
 #include "../common/repo_paths.h"
 
@@ -475,6 +476,70 @@ TEST(LookAssistFlavors, AnUnknownReceiptFlavorIsClassicAndWarnsNeverCinematic)
     ASSERT_TRUE( value.isEmpty() );
 }
 
+TEST(LookAssistFlavors, TheReceiptRecordsTheFlavorThatWasAppliedNotTheMerelySelected)
+{
+    // The GUI sequence behind setReceipt, on the holder the window owns. Look Assist is on and the selector says
+    // Cinematic; what the receipt names depends on how the analysis ended.
+    int clipA = 0, clipB = 0;   // two clips: only their addresses matter
+    const QString selected = QStringLiteral("cinematic");
+    LookAssistFlavorOutcome outcome;
+
+    // Nothing has landed for the clip yet (Look Assist off, or the analysis is pending): the selector is the
+    // clip's setting and the receipt keeps carrying it.
+    ASSERT_TRUE( outcome.receiptValue( &clipA, selected ) == QLatin1String( "cinematic" ) );
+
+    // A normal Cinematic success: the receipt names Cinematic, and the venue telemetry reads the same holder.
+    outcome.begin();
+    outcome.landed( &clipA, QStringLiteral("cinematic"), false );
+    ASSERT_TRUE( outcome.receiptValue( &clipA, selected ) == QLatin1String( "cinematic" ) );
+    ASSERT_TRUE( outcome.appliedName() == QLatin1String( "cinematic" ) );
+
+    // The safety fallback (the global-green-cast guard says restore): the sliders are the baseline's. The receipt
+    // must not name Cinematic over them -- Classic semantics, which the writer leaves out of the file.
+    outcome.begin();
+    outcome.landed( &clipA, QStringLiteral("cinematic"), true );
+    ASSERT_TRUE( outcome.receiptValue( &clipA, selected ) == QLatin1String( "classic" ) );
+    ASSERT_TRUE( outcome.appliedName().isEmpty() );
+    // The fallback belongs to the clip it happened on: another clip still carries its own selector value.
+    ASSERT_TRUE( outcome.receiptValue( &clipB, selected ) == QLatin1String( "cinematic" ) );
+
+    // A new analysis forgets the fallback; a Classic success then names Classic even if the selector (env override
+    // gone, combo stale) still reads Cinematic: the receipt names what was applied.
+    outcome.begin();
+    ASSERT_TRUE( outcome.receiptValue( &clipA, selected ) == QLatin1String( "cinematic" ) );
+    outcome.landed( &clipA, QStringLiteral("classic"), false );
+    ASSERT_TRUE( outcome.receiptValue( &clipA, selected ) == QLatin1String( "classic" ) );
+
+    // Switching Look Assist off, or the clip closing, clears it.
+    outcome.clear();
+    ASSERT_TRUE( outcome.appliedName().isEmpty() );
+    ASSERT_TRUE( outcome.receiptValue( &clipA, selected ) == QLatin1String( "cinematic" ) );
+}
+
+TEST(LookAssistFlavors, EveryReceiptStampAndEveryAnalysisOutcomeGoesThroughTheHolder)
+{
+    const QString window = readSource( QStringLiteral("platform/qt/MainWindow.cpp") );
+
+    // setReceipt stamps through the holder, never the bare selector (the mutation that restores the selector fails here).
+    const int at = window.indexOf( QStringLiteral("void MainWindow::setReceipt( ReceiptSettings *receipt )") );
+    ASSERT_TRUE( at >= 0 );
+    const int end = window.indexOf( QStringLiteral("\n}\n"), at );
+    ASSERT_TRUE( end > at );
+    const QString body = window.mid( at, end - at );
+    ASSERT_TRUE( body.contains( QStringLiteral(
+        "receipt->setLookAssistFlavor( m_lookAssistFlavorOutcome.receiptValue(" ) ) );
+    ASSERT_FALSE( body.contains( QStringLiteral("receipt->setLookAssistFlavor( lookAssistFlavorName( currentLookAssistFlavor() ) )") ) );
+
+    // The outcome is recorded at the sync result, the sync fallback, and both async sites -- the same call the
+    // venue telemetry reads -- and it starts empty each analysis.
+    ASSERT_EQ( 1, window.count( QStringLiteral("m_lookAssistFlavorOutcome.begin();") ) );
+    ASSERT_EQ( 5, window.count( QStringLiteral("m_lookAssistFlavorOutcome.landed(") ) );   // sync x2, async x3
+    ASSERT_TRUE( window.contains( QStringLiteral("m_lookAssistFlavorOutcome.landed( receipt, lookAssistFlavorName( flavor ), true );") ) );
+    ASSERT_TRUE( window.contains( QStringLiteral("m_lookAssistFlavorOutcome.landed( receipt, lookAssistFlavorName( flavor ), false );") ) );
+    ASSERT_TRUE( window.contains( QStringLiteral("m_lookAssistFlavorOutcome.appliedName()") ) );
+    ASSERT_FALSE( window.contains( QStringLiteral("m_lastAppliedLookAssistFlavor") ) );
+}
+
 TEST(LookAssistFlavors, GuiSelectorAndEnvironmentBothReachTheAnalysis)
 {
     const QString window = readSource( QStringLiteral("platform/qt/MainWindow.cpp") );
@@ -496,11 +561,11 @@ TEST(LookAssistFlavors, GuiSelectorAndEnvironmentBothReachTheAnalysis)
     ASSERT_TRUE( window.contains( QStringLiteral(".arg( lookAssistDecisionLogFields( stats, decisionTrace ) )\n            .arg( lookAssistFlavorName( flavor ) ) );") ) );
     ASSERT_TRUE( window.contains( QStringLiteral(".arg( bool01( floorLiftedNightThumbnail ) )\n                .arg( lookAssistFlavorName( flavor ) ) );") ) );
     // Nothing is reported as applied until an analysis lands: cleared when one starts, named only at its success site.
-    ASSERT_TRUE( window.contains( QStringLiteral("m_lastAppliedLookAssistFlavor.clear();") ) );
-    ASSERT_TRUE( window.contains( QStringLiteral("m_lastAppliedLookAssistFlavor = lookAssistFlavorName( flavor );") ) );
+    ASSERT_TRUE( window.contains( QStringLiteral("m_lookAssistFlavorOutcome.begin();") ) );
+    ASSERT_TRUE( window.contains( QStringLiteral("m_lookAssistFlavorOutcome.landed( receipt, lookAssistFlavorName( flavor ), false );") ) );
     ASSERT_TRUE( window.contains( QStringLiteral("gpu_preview_processing_reject_reason=%47 \"\n            \"look_assist_flavor=%48\"") ) );
     // The venue report names a flavor only for a look that is on screen: not after the safety fallback restored the baseline.
-    ASSERT_TRUE( window.contains( QStringLiteral(".arg( m_lastLookAssistDiagnosticsValid && !m_lastLookAssistSafetyFallback\n                  && !m_lastAppliedLookAssistFlavor.isEmpty()\n                  ? m_lastAppliedLookAssistFlavor") ) );
+    ASSERT_TRUE( window.contains( QStringLiteral(".arg( m_lastLookAssistDiagnosticsValid && !m_lastLookAssistSafetyFallback\n                  && !m_lookAssistFlavorOutcome.appliedName().isEmpty()\n                  ? m_lookAssistFlavorOutcome.appliedName()") ) );
 
     // Changing the selector re-runs Look Assist the way switching it on does; it persists as an app setting
     // (default Classic) and a receipt that declares a flavor shows it.

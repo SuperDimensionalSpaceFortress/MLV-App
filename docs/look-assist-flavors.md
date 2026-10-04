@@ -106,7 +106,13 @@ The flavor applied is always reported, appended to the end of the existing lines
   what the venue job reads: its summary carries `lookFlavorReported`, and the leg receipt's
   `look.lookFlavorHonored` is `true` only when the app's own report equals the flavor the leg asked for
   (see [dual-venue-evidence.md](dual-venue-evidence.md)).
-* The receipt: `lookAssistFlavor` (non-Classic only), and the in-memory receipt always carries the flavor applied.
+* The receipt: `lookAssistFlavor` (non-Classic only). It records the flavor that was **applied**, never the
+  merely selected one: `setReceipt` and the venue telemetry read the same holder (`LookAssistFlavorOutcome`),
+  which an analysis fills when it lands. After a **safety fallback** restored the baseline sliders (for example
+  the global-green-cast guard) the receipt names Classic (the element is then left out of the file), so a
+  Cinematic selector never exports a Cinematic label over baseline sliders. A clip with no recorded outcome (Look
+  Assist off, or the analysis still pending) keeps the selector's value, which is the clip's setting. Switching
+  Look Assist off, or an analysis starting, clears the outcome.
 
 ## Tests
 
@@ -116,7 +122,9 @@ The flavor applied is always reported, appended to the end of the existing lines
   over a Classic preset is the Cinematic preset; the selector's layers and the unknown-value rule; an unknown
   receipt value resolves to Classic plus a warning; **behavioural**: after a Classic apply, a flavor change makes
   the marker forget the clip so the analysis runs again and grades Cinematic (a mutation that does not clear the
-  marker fails it); the receipt element is read and written only for a non-Classic flavor; every preset call in
+  marker fails it); **behavioural**: a Cinematic selection that ends in the safety fallback records no Cinematic
+  flavor on the receipt, a normal Cinematic success records it (a mutation that stamps the selector fails the
+  source pin on `setReceipt`; one that records a fallback as applied fails the holder test); the receipt element is read and written only for a non-Classic flavor; every preset call in
   both consumers passes the flavor; the scene verdict stays flavor-blind; the GUI selector and the environment
   both reach the analysis.
 * `tests/pipeline/test_look_assist_flavors.cpp`: on the tracked fixture frames, Classic reproduces master's

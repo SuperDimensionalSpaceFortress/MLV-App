@@ -917,7 +917,7 @@ private:
     PlaybackQualityAutoSampler m_playbackQualitySampler;
     bool m_lastLookAssistDiagnosticsValid = false;
     QString m_lastWarnedLookAssistFlavorValue;
-    QString m_lastAppliedLookAssistFlavor;   // "classic" / "cinematic": what the last analysis applied (telemetry)
+    lookassist::LookAssistFlavorOutcome m_lookAssistFlavorOutcome;   // how the last analysis ended: telemetry and setReceipt read it
     QString m_lastLookAssistScene;
     double m_lastLookAssistMedian = 0.0;
     double m_lastLookAssistP05 = 0.0;

@@ -497,6 +497,41 @@ private:
     const void *m_receipt = nullptr;
 };
 
+/* How the last Look Assist analysis ENDED, the one source of truth for what the GUI reports as applied: the
+ * `gui_smoke.visual_state` telemetry and the flavor setReceipt writes into the receipt both read it. A receipt must
+ * name the flavor that was APPLIED, never the merely selected one: after a safety fallback restored the baseline
+ * sliders, a receipt that still said "cinematic" would export a grade it does not hold.
+ *   begin()   an analysis starts: nothing is applied until it lands.
+ *   landed()  it ended on `receipt` with `flavorName` -- applied, or (safetyFallback) restored to baseline.
+ *   clear()   Look Assist went off / the clip closed.
+ * receiptValue(): the fallback names "classic" (Classic semantics: the writer leaves the element out, so the file is
+ * byte-identical to a Classic receipt); an applied grade names the flavor applied; a clip with no recorded outcome
+ * (Look Assist off, or the analysis is pending) keeps the selector's value, which is the clip's setting. */
+class LookAssistFlavorOutcome
+{
+public:
+    void begin() { clear(); }
+    void clear() { m_receipt = nullptr; m_applied.clear(); m_fellBack = false; }
+    void landed( const void *receipt, const QString &flavorName, bool safetyFallback )
+    {
+        m_receipt = receipt;
+        m_fellBack = safetyFallback;
+        m_applied = safetyFallback ? QString() : flavorName;
+    }
+    /* The flavor on screen: empty until an analysis lands, and empty again after a safety fallback. */
+    QString appliedName() const { return m_applied; }
+    QString receiptValue( const void *receipt, const QString &selectedFlavorName ) const
+    {
+        if( receipt == nullptr || receipt != m_receipt ) return selectedFlavorName;
+        if( m_fellBack ) return QStringLiteral("classic");
+        return m_applied.isEmpty() ? selectedFlavorName : m_applied;
+    }
+private:
+    const void *m_receipt = nullptr;
+    QString m_applied;
+    bool m_fellBack = false;
+};
+
 /* flavor defaults to Classic, so every caller that does not pass one is master's. The scene verdict is the
  * caller's (always the Classic classifier); the flavor only shapes the sliders. */
 LookAssistPreset presetForLookAssistScene( LookAssistScene scene,
