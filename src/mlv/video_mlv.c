@@ -6291,7 +6291,9 @@ void mlvSyncProcessingDualIsoBlackWhiteLevels(mlvObject_t * video)
  * been dispatched before the analysis ran. Every analysis render now takes the clip
  * levels explicitly: the state the headless applier always analyses (applyToMlv sets
  * them) and the GUI analysed in the usual timing, which the Look Assist thresholds
- * are calibrated on. Not HQ Dual ISO: sync and clip levels agree; left untouched.
+ * are calibrated on. Outside HQ Dual ISO the helper leaves the levels untouched, as
+ * master does; fractional Raw Black on those clips is a known pre-existing timing
+ * dependency, tracked by LOOK-ASSIST-ANALYSIS-RENDER-RACE-2.
  * Both levels always come from RAWI, the one authority in both states: the raw-black
  * control also writes a fraction (e.g. 2047.9) into the processing object, but RAWI
  * keeps the integer the recon reads, and a sync overwrites the fraction. */
