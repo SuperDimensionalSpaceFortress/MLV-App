@@ -2612,23 +2612,11 @@ void MainWindow::timerFrameEvent( bool predictivePlaybackAdvance )
     //Time measurement
     QTime nowTime = QTime::currentTime();
     timeDiff = lastTime.msecsTo( nowTime );
-    const double targetFrameMs = 1000.0 / qMax( getFramerate(), 1.0 );
-    const int targetFrameMsFloor = qMax( 1, static_cast<int>( targetFrameMs ) );
-    const int targetFrameMsCeil = qMax( 1, static_cast<int>( targetFrameMs + 0.999 ) );
-    if( predictivePlaybackAdvance
-     && ui->actionPlay->isChecked()
-     && timeDiff < targetFrameMs )
-    {
-        timeDiff = targetFrameMsCeil;
-    }
-    if( hadPendingAdvance )
-    {
-        if( timeDiff > targetFrameMs )
-        {
-            // Avoid turning a render-thread stall into one giant playback catch-up step.
-            timeDiff = predictivePlaybackAdvance ? targetFrameMsCeil : targetFrameMsFloor;
-        }
-    }
+    // An early predictive tick is rounded up to a frame period, and a render-thread stall is never one giant
+    // catch-up step. The round-up alone outran native pace on a fast GPU: playbackHandling()'s
+    // m_playbackPaceGuard is the ceiling (PlaybackNativePaceGuard.h).
+    timeDiff = playback_native_pace::shapedTickTimeDiffMs( timeDiff, getFramerate(), predictivePlaybackAdvance,
+                                                           ui->actionPlay->isChecked(), hadPendingAdvance );
 
     //Playback
     const bool frameChangedBeforePlayback = m_frameChanged;
@@ -10619,11 +10607,17 @@ void MainWindow::playbackHandling(int timeDiff)
             normalizePlaybackCutRangeForLoadedClip( "playbackHandling" );
         }
 
+        // PLAYBACK-CUDA-NATIVE-PACE-1: no advance outruns the pace fps (native, or the explicit
+        // fpsOverride), whichever path asked for it -- the 8 ms poll, or the CUDA early advance on present.
+        const double paceNowMs = mlv_stage_timing_now() * 1000.0;
+
         //when on last frame
         if( ui->horizontalSliderPosition->value() >= ui->spinBoxCutOut->value() - 1 )
         {
             if( ui->actionLoop->isChecked() )
             {
+                // The wrap to cut-in is a frame transition too: it waits for a whole frame of credit (held last frame).
+                if( !m_playbackPaceGuard.grantLoopWrap( paceNowMs, getFramerate() ) ) return;
                 const int requestedCutInFrame = ui->spinBoxCutIn->value() - 1;
                 bool cutInFrameChanged = false;
                 const int clampedCutInFrame = playback_frame_range::clampFrameIndex(
@@ -10677,9 +10671,10 @@ void MainWindow::playbackHandling(int timeDiff)
         }
             else
             {
-                //Normal mode: next frame
+                //Normal mode: next frame (held while the wall clock owes no whole frame)
                 if( !ui->actionDropFrameMode->isChecked() )
                 {
+                    if( !m_playbackPaceGuard.grantWholeFrame( paceNowMs, getFramerate() ) ) return;
                     // PLAYBACK-CLIP-LENGTH-ENFORCE-3: every source frame the engine advances is counted (the
                     // slider value AFTER setValue, so a clamp at the slider maximum is not counted as footage).
                     const double sourcePositionBeforeTick = ui->horizontalSliderPosition->value();
@@ -10700,7 +10695,8 @@ void MainWindow::playbackHandling(int timeDiff)
                 const double sourcePositionBeforeDropTick = m_newPosDropMode;
                 const playback_frame_range::DropFrameTickResult dropFrameTick =
                     playback_frame_range::advanceDropFrameTick(
-                        m_newPosDropMode, getFramerate() * (double)timeDiff / 1000.0,
+                        m_newPosDropMode,
+                        m_playbackPaceGuard.grant( getFramerate() * (double)timeDiff / 1000.0, paceNowMs, getFramerate() ),
                         ui->spinBoxCutIn->value(), ui->spinBoxCutOut->value(),
                         ui->actionLoop->isChecked() );
                 m_newPosDropMode = dropFrameTick.position;
@@ -10725,6 +10721,7 @@ void MainWindow::playbackHandling(int timeDiff)
     else
     {
         m_newPosDropMode = ui->horizontalSliderPosition->value(); //track it also when playback is off
+        m_playbackPaceGuard.reset();
     }
 }
 
@@ -27534,6 +27531,8 @@ void MainWindow::on_actionPlay_toggled(bool checked)
 {
     invalidatePlaybackPrepForDisplayChange(
         checked ? "play-start" : "play-stop" );
+    // PLAYBACK-CUDA-NATIVE-PACE-1: the pace clock re-arms at this Play's first engine tick.
+    m_playbackPaceGuard.reset();
     logInteractionEvent(
         QStringLiteral("play.toggled.begin"),
         QStringLiteral("checked=%1 file_loaded=%2 position=%3 cut_in=%4 cut_out=%5 frame_changed=%6 still_drawing=%7 pending_advance=%8")
