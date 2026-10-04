@@ -49,6 +49,24 @@ bool recursiveBfParallelVerticalEnabled()
         envFlagEnabled(std::getenv("MLVAPP_RBF_SERIAL_VERTICAL"));
     return !serial;
 }
+
+// Team size cap of the parallel filter. Playback runs it on the render thread
+// while decode and dual-ISO recon run their own OpenMP teams. Uncapped (16
+// threads) on Bachelor it cut the RBF to ~3.5 ms but tripled decode time and
+// lost presented fps, so it is capped. MLVAPP_RBF_MAX_THREADS overrides
+// (0: no cap). The picture does not depend on it.
+const int kRecursiveBfDefaultMaxThreads = 4;
+
+int recursiveBfMaxThreads()
+{
+    static const int max_threads = []() {
+        const char * value = std::getenv("MLVAPP_RBF_MAX_THREADS");
+        if( !value || !*value ) return kRecursiveBfDefaultMaxThreads;
+        const int parsed = std::atoi(value);
+        return parsed >= 0 ? parsed : kRecursiveBfDefaultMaxThreads;
+    }();
+    return max_threads;
+}
 }
 
 void recursive_bf_set_parallel_vertical_override(int mode)
@@ -110,6 +128,7 @@ void recursive_bf_wrap_with_curve_index_lut(uint16_t * img_in,
         g_rbf_filter.reserveMemory( width, height, channel );
         g_rbf_filter.setTimingEnabled( recursiveBfDetailTimingEnabled() );
         g_rbf_filter.setParallelVertical( recursiveBfParallelVerticalEnabled() );
+        g_rbf_filter.setMaxThreads( recursiveBfMaxThreads() );
         g_rbf_filter.filter( img_in,
                              img_out,
                              sigma_spatial,

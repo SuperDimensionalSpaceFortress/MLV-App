@@ -716,8 +716,8 @@ TEST(ProcessingFilters, RbfParallelVerticalBenchmarkInformational)
 {
     /* INFORMATIONAL micro-benchmark: serial vs column-parallel vertical passes
      * at the playback quarter-res S/H size (452x567, from 1808x2268) and at the
-     * export full-res size. Only measurement invariants are asserted; the
-     * numbers are host-specific (the hub VM is CPU-contended). */
+     * export full-res size. No duration is asserted; the numbers are
+     * host-specific (the hub VM is CPU-contended). */
     struct Size { int width; int height; };
     const Size sizes[] = { { 452, 567 }, { 1808, 2268 } };
 #ifdef _OPENMP
@@ -752,18 +752,20 @@ TEST(ProcessingFilters, RbfParallelVerticalBenchmarkInformational)
         };
         const int host = std::max(1, omp_get_num_procs());
         const double serial_ms = median_filter_ms(false, host);
-        char scaling[256] = { 0 };
-        int used = 0;
+        const std::string serial_hash = hash_image(output);
+        std::string scaling;
         std::vector<int> thread_counts;
         for( int threads_count = 1; threads_count < host; threads_count *= 2 ) thread_counts.push_back(threads_count);
         thread_counts.push_back(host);
         for( int threads_count : thread_counts )
         {
             const double parallel_ms = median_filter_ms(true, threads_count);
-            ASSERT_TRUE(parallel_ms > 0.0);
-            used += std::snprintf(scaling + used, sizeof(scaling) - used, " t%d=%.2f", threads_count, parallel_ms);
+            /* The timed picture is the serial picture. */
+            ASSERT_EQ(serial_hash, hash_image(output));
+            char entry[64];
+            std::snprintf(entry, sizeof(entry), " t%d=%.2f", threads_count, parallel_ms);
+            scaling += entry;
         }
-        ASSERT_TRUE(serial_ms > 0.0);
 
         /* Phase split of the parallel filter (omp_get_wtime, coarse on MinGW). */
         filter.setParallelVertical(true);
@@ -772,7 +774,7 @@ TEST(ProcessingFilters, RbfParallelVerticalBenchmarkInformational)
         const RBFilterPlainTiming timing = filter.lastTiming();
         std::printf("[RBF-VERTICAL-BENCH] %dx%d host_threads=%d filter ms (medians of %d): serial=%.2f parallel:%s | "
                     "parallel phases rows=%.1f columns(down+up+output)=%.1f\n",
-                    size.width, size.height, host, iterations, serial_ms, scaling,
+                    size.width, size.height, host, iterations, serial_ms, scaling.c_str(),
                     timing.left_ms, timing.vertical_down_ms);
     }
 }

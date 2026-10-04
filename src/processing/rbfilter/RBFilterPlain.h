@@ -78,6 +78,7 @@ class CRBFilterPlain
 	bool		m_range_table_valid = false;
     bool        m_timing_enabled = false;
     bool        m_parallel_vertical = true;
+    int         m_max_threads = 0;
     RBFilterPlainTiming m_last_timing;
 
     int getDiffFactor(const uint16_t* color1, const uint16_t* color2) const;
@@ -127,6 +128,9 @@ public:
     // vertical passes column-parallel; bit-exact to the legacy passes.
     // false: the legacy passes with the serial vertical pair (reference/rollback).
     void setParallelVertical(bool enabled) { m_parallel_vertical = enabled; }
+    // Team size cap of the parallel path (0: OpenMP's default). The result
+    // does not depend on it.
+    void setMaxThreads(int threads) { m_max_threads = threads; }
     RBFilterPlainTiming lastTiming() const { return m_last_timing; }
     // Raw vertical-pass state of the last filter() call (bit-exactness tests).
     const float* downPassColor() const { return m_down_pass_color; }

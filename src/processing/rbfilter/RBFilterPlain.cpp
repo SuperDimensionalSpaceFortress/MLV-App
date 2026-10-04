@@ -556,14 +556,15 @@ void CRBFilterPlain::filterColumnParallel(const uint16_t* img_src, uint16_t* img
     const int width_height = width * height;
     // Column blocks of a multiple of 16 pixels, about two per thread, so a
     // busy core does not hold the whole phase back.
-    const int threads = std::max(1, omp_get_max_threads());
+    int threads = std::max(1, omp_get_max_threads());
+    if (m_max_threads > 0) threads = std::min(threads, m_max_threads);
     const int block_width =
         std::max(16, ((width + threads * 2 - 1) / (threads * 2) + 15) & ~15);
     const int blocks = (width + block_width - 1) / block_width;
     const double phase_start = timing_enabled ? omp_get_wtime() : 0.0;
     double horizontal_end = 0.0;
 
-    #pragma omp parallel
+    #pragma omp parallel num_threads(threads)
     {
         #pragma omp for schedule(static)
         for (int y = 0; y < height; y++)
