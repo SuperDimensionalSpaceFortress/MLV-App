@@ -217,10 +217,21 @@ no-loop / no-replay, the run nonce, settings isolation and the backend check are
 and the job passes no switch that could loosen them. `backend` is part of the
 subject, so a cuda receipt and a cpu receipt are different subjects.
 
+*The cpu time budget (CPU-LEG-SMOKE-CEILING-1).* A cpu leg's Play may run to the CPU ceiling (765 s for the 25 s window), and the smoke runner
+caps any process timeout at 3600 s. For a ~3.2 GB owner input at the measured 1.5 MB/s that ceiling plus a margined identity read does not fit,
+so `Get-AttrCudaLegTimeBudget -ShareSmokeCeiling` (a cpu leg only; never CUDA; a fixture cpu leg passes it but reads no input, so it never clamps) lets the **in-runner** re-read allowance shrink to
+what is left of the 3600 s (3600 - 60 - 765 - 3 - 30 = 2742 s). The job's own full identity read keeps its margined allowance in the um-run
+timeout, which is derived with the smoke timeout and the PresentMon capture ceiling from the same result. A cpu leg is refused with
+`ATTRCUDA_TIMEBUDGET_EXCEEDS_SMOKE_CEILING` only when that remainder cannot cover the re-read at the measured rate with **no** margin
+(about 4113 MB at 1.5 MB/s); `Invoke-VenueLeg` records that refusal as the typed receipt refusal `GENERATOR_REFUSED_ATTRCUDA_TIMEBUDGET_EXCEEDS_SMOKE_CEILING`,
+not an untyped `RUNNER_ERROR`. A clamped leg's job first trace line carries `smokeCeilingClamped=True appReadAllowanceSec=<n>` (every other leg's job is unchanged, the
+default CUDA job byte for byte), so a process timeout on a clamped leg is attributable from the evidence log. A venue's own cold-read rate is not used until one is measured on it.
+
 ## LOOK legs and contact sheets
 
-*Contact frames after a PresentMon wait failure (DVE-LEG-TERMINALS-1).* The app captures the contact-sheet frames in a **seek** pass
-(`--contact-sheet-seek-mode`: it never plays) inside the smoke child, after the measured session's own summary line, and PresentMon is
+*Contact frames after a PresentMon wait failure (DVE-LEG-TERMINALS-1).* The app grabs the contact-sheet frames during the measured Play
+(in-pass, `playback_path=true`, CONTACT-SHEET-PLAYBACK-PARITY-1) and writes them inside the smoke child after the measured session's own
+summary line (an optional paired seek capture, `-ContactSheetPairedSeek`, is written there too), and PresentMon is
 only waited on once that child has returned. A PresentMon wait failure therefore leaves the captured frames on the venue with nothing to
 re-run; the job now publishes them (`contact-sheet\raw`) plus a `compose-status.txt` marker (`CONTACT_SHEET_COMPOSE_UNAVAILABLE ...`: the sheet
 is not composed on the venue, whose labels need the eligibility verdict this branch exits before). The runner keeps the frames and
@@ -249,7 +260,13 @@ same streams from the spawn-failure summary (`presentMonStreams`).
 other-named session lose all of its events (15-17k "ETW events were lost" per 12 s), so no CSV was written; the per-job `--session_name` meant `--stop_existing_session` no
 longer cleared it. Before the spawn the job now terminates the default `PresentMon` session and every `MLVAttr3-*` session that `logman query -ets` lists, through the pinned
 PresentMon's own `--terminate_existing_session` (`logman stop <name> -ets` only for a session still listed afterwards) -- but only when no PresentMon process is alive on the host
-(checked before the listing and again right after it); otherwise it records that it did not run. A job-issued `Kill()` is followed by the terminate of the job's own named
+(checked before the listing and again right after it); otherwise it records that it did not run. "A PresentMon process" is every `PresentMon*` process except one POSITIVELY
+identified as not a capture (UM-SWEEP-OWNER-PRESENTMONSERVICE-1): the owner's always-running `PresentMonService` (Bachelor) is recognised because its pid is the `ProcessId` of a
+registered Windows service (`Win32_Service`), and a process with a readable path that is neither the pinned image/path nor a capture image is excluded too. The pinned capture executable
+(image name equal to the pinned one, case-insensitive, or the pinned cache path), a foreign capture image, and any process whose path cannot be read and that is no registered service
+are live (the sweep is skipped, with the reason recorded in `orphanSweep.livePresentMonProcesses`: name, pid, `pathReadable`, reason). Excluded processes are recorded in
+`orphanSweep.excludedPresentMonProcesses` (name, pid, service, `pathReadable`; never a path). A process list or a service lookup that cannot be read stops the sweep with
+`error`. A job-issued `Kill()` is followed by the terminate of the job's own named
 session (both stop paths). `presentmon-capture.json` carries `orphanSweep` (ran, skippedReason, live pids, listed, matching listing lines, every action with its exit code,
 what remains) and `eventsLost` (PresentMon's stderr reported lost events: message count and largest count); the failure terminals' PresentMon reason gains a typed
 `PRESENTMON_EVENTS_LOST` detail, so a recurrence reads as its cause instead of "output does not exist".
