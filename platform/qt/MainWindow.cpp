@@ -10607,11 +10607,17 @@ void MainWindow::playbackHandling(int timeDiff)
             normalizePlaybackCutRangeForLoadedClip( "playbackHandling" );
         }
 
+        // PLAYBACK-CUDA-NATIVE-PACE-1: no advance outruns the pace fps (native, or the explicit
+        // fpsOverride), whichever path asked for it -- the 8 ms poll, or the CUDA early advance on present.
+        const double paceNowMs = mlv_stage_timing_now() * 1000.0;
+
         //when on last frame
         if( ui->horizontalSliderPosition->value() >= ui->spinBoxCutOut->value() - 1 )
         {
             if( ui->actionLoop->isChecked() )
             {
+                // The wrap to cut-in is a frame transition too: it waits for a whole frame of credit (held last frame).
+                if( !m_playbackPaceGuard.grantLoopWrap( paceNowMs, getFramerate() ) ) return;
                 const int requestedCutInFrame = ui->spinBoxCutIn->value() - 1;
                 bool cutInFrameChanged = false;
                 const int clampedCutInFrame = playback_frame_range::clampFrameIndex(
@@ -10665,9 +10671,6 @@ void MainWindow::playbackHandling(int timeDiff)
         }
             else
             {
-                // PLAYBACK-CUDA-NATIVE-PACE-1: no advance outruns the pace fps (native, or the explicit
-                // fpsOverride), whichever path asked for it -- the 8 ms poll, or the CUDA early advance on present.
-                const double paceNowMs = mlv_stage_timing_now() * 1000.0;
                 //Normal mode: next frame (held while the wall clock owes no whole frame)
                 if( !ui->actionDropFrameMode->isChecked() )
                 {

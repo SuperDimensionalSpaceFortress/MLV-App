@@ -11,12 +11,14 @@
 #include "../common/minitest.h"
 #include "../common/repo_paths.h"
 
+#include "../../platform/qt/PlaybackFrameRange.h"
 #include "../../platform/qt/PlaybackNativePaceGuard.h"
 
 #include <QFile>
 #include <QString>
 #include <QTextStream>
 
+#include <algorithm>
 #include <cmath>
 
 using playback_native_pace::NativePaceGuard;
@@ -32,20 +34,34 @@ constexpr double kPollMs = 8.0;                 // mlvappPlaybackTimerIntervalMs
 struct PaceRun
 {
     double sourceAdvanced = 0.0; // source frames the timeline advanced
+    double transitions = 0.0;    // engine frame transitions: advances plus loop wraps (drop frame: the granted share)
+    double maxLeadFrames = 0.0;  // the most transitions ever ran ahead of elapsed x fps
+    int wraps = 0;
     int presented = 0;
     double wallMs = 0.0;
     double timelineFps() const { return sourceAdvanced * 1000.0 / wallMs; } // simulatePlay always sets wallMs
+    double transitionFps() const { return transitions * 1000.0 / wallMs; }
+};
+
+// Loop on over the 1-based cut range [cutIn, cutOut] (spinBoxCutIn/spinBoxCutOut); cutOut 0 is no loop.
+// payWrap=false is 8bf07ea5: advances guarded, the wrap to cut-in free.
+struct LoopRange
+{
+    int cutIn = 0;
+    int cutOut = 0;
+    bool payWrap = true;
 };
 
 // One Play of wallMs on a renderer that takes renderMs per frame. predictiveOnPresent models the CUDA texture
 // route (drawFrameReady -> timerFrameEvent( true )); dropFrame=false is the every-frame mode. guarded=false is
 // master (no ceiling).
 PaceRun simulatePlay( double fps, double renderMs, bool predictiveOnPresent, bool dropFrame, bool guarded,
-                      double wallMs = 25000.0 )
+                      double wallMs = 25000.0, LoopRange loop = LoopRange() )
 {
     NativePaceGuard guard;
     PaceRun run;
-    double position = 0.0;     // m_newPosDropMode (drop frame) / slider value (normal)
+    const bool looping = loop.cutOut > 0;
+    double position = looping ? loop.cutIn - 1 : 0.0; // m_newPosDropMode (drop frame) / slider value (normal)
     long lastDrawn = -1;       // lastDrawnPlaybackPosition
     double lastTime = 0.0;     // timerFrameEvent's static lastTime
     double busyUntil = -1.0;   // the render in flight finishes here (-1: idle)
@@ -64,18 +80,40 @@ PaceRun simulatePlay( double fps, double renderMs, bool predictiveOnPresent, boo
         pending = false;
         const int timeDiff = shapedTickTimeDiffMs( static_cast<int>( t - lastTime ), fps, predictive, true,
                                                    hadPending );
-        if( dropFrame )
+        if( looping && std::floor( position + 1e-9 ) >= loop.cutOut - 1 ) // playbackHandling: "when on last frame"
+        {
+            if( !guarded || !loop.payWrap || guard.grantLoopWrap( t, fps ) )
+            {
+                position = loop.cutIn - 1;
+                run.transitions += 1.0;
+                ++run.wraps;
+            }
+        }
+        else if( dropFrame )
         {
             const double requested = fps * timeDiff / 1000.0;
             const double granted = guarded ? guard.grant( requested, t, fps ) : requested;
-            position += granted;
+            if( looping )
+            {
+                const playback_frame_range::DropFrameTickResult step = playback_frame_range::advanceDropFrameTick(
+                    position, granted, loop.cutIn, loop.cutOut, true );
+                position = step.position;
+                if( step.wrapped ) ++run.wraps;
+            }
+            else
+            {
+                position += granted;
+            }
             run.sourceAdvanced += granted;
+            run.transitions += granted;
         }
         else if( !guarded || guard.grantWholeFrame( t, fps ) )
         {
             position += 1.0;
             run.sourceAdvanced += 1.0;
+            run.transitions += 1.0;
         }
+        run.maxLeadFrames = std::max( run.maxLeadFrames, run.transitions - t * fps / 1000.0 );
         const long frame = static_cast<long>( std::floor( position + 1e-9 ) );
         if( frame != lastDrawn ) // a new frame: draw it (dispatch the render)
         {
@@ -238,6 +276,70 @@ TEST(PlaybackNativePace, ASlowRendererDropsOrHoldsExactlyAsBefore)
     }
 }
 
+// ---- the loop boundary: the wrap from cut-out back to cut-in is a frame transition too ---------------------
+
+namespace
+{
+constexpr double kHourMs = 3600.0 * 1000.0;
+}
+
+TEST(PlaybackNativePaceLoop, AnUnpaidWrapOutrunsNativeOnAShortLoop)
+{
+    // sol r1, reproduced: normal mode, Loop on, cut 1..24, 32 ms render. 8bf07ea5 paced the 23 advances of a lap
+    // but not the wrap, so 24 transitions took 23 frame periods: 3003 in 120 s, 25.025 fps.
+    const PaceRun unpaid = simulatePlay(kNativeFps, 32.0, false, false, true, 120000.0, LoopRange{1, 24, false});
+    ASSERT_TRUE(unpaid.wraps > 100);
+    ASSERT_TRUE(unpaid.transitionFps() > kNativeFps * 1.03);
+    ASSERT_TRUE(unpaid.transitions > 1.0 + 120000.0 * kNativeFps / 1000.0);
+}
+
+TEST(PlaybackNativePaceLoop, AShortLoopNeverOutrunsNativeForAnHourInEveryMode)
+{
+    // a fast renderer, an hour of simulated wall time, normal and drop-frame, predictive and not: the
+    // transitions (wraps included) never run more than the carried frame ahead of elapsed x pace at ANY tick,
+    // and the loop is not slowed below native either -- so there is no drift in either direction.
+    for (bool dropFrame : {false, true})
+    {
+        for (bool predictive : {true, false})
+        {
+            for (int cutOut : {2, 24})
+            {
+                const PaceRun run = simulatePlay(kNativeFps, 2.0, predictive, dropFrame, true, kHourMs,
+                                                 LoopRange{1, cutOut, true});
+                ASSERT_TRUE(run.wraps > 1000);
+                ASSERT_TRUE(run.maxLeadFrames <= kMaxCarryFrames + 1e-6);
+                ASSERT_TRUE(run.transitions <= kMaxCarryFrames + kHourMs * kNativeFps / 1000.0 + 1e-6);
+                ASSERT_TRUE(run.transitionFps() >= kNativeFps * 0.97);
+            }
+        }
+    }
+    // and the sol r1 case itself, now paid
+    const PaceRun paid = simulatePlay(kNativeFps, 32.0, false, false, true, kHourMs, LoopRange{1, 24, true});
+    ASSERT_TRUE(paid.maxLeadFrames <= kMaxCarryFrames + 1e-6);
+    ASSERT_TRUE(paid.transitionFps() >= kNativeFps * 0.97);
+}
+
+TEST(PlaybackNativePaceLoop, ASlowRendererLoopsExactlyAsBefore)
+{
+    // slower than native, the wrap's frame of credit is always there: master's loop to the frame
+    for (double renderMs : {45.0, 60.0, 90.0, 250.0})
+    {
+        for (bool dropFrame : {false, true})
+        {
+            for (bool predictive : {true, false})
+            {
+                const LoopRange range{1, 24, true};
+                const PaceRun master = simulatePlay(kNativeFps, renderMs, predictive, dropFrame, false, 120000.0, range);
+                const PaceRun guarded = simulatePlay(kNativeFps, renderMs, predictive, dropFrame, true, 120000.0, range);
+                ASSERT_TRUE(std::fabs(master.transitions - guarded.transitions) < 1e-6);
+                ASSERT_EQ(master.wraps, guarded.wraps);
+                ASSERT_EQ(master.presented, guarded.presented);
+                ASSERT_TRUE(guarded.wraps > 0);
+            }
+        }
+    }
+}
+
 // ---- wiring: MainWindow.cpp needs a full GUI build, so its source is read as text --------------------------
 
 namespace
@@ -276,6 +378,17 @@ TEST(PlaybackNativePaceWiring, EveryEngineAdvanceGoesThroughThePaceGuard)
         "ui->horizontalSliderPosition->setValue( ui->horizontalSliderPosition->value() + 1 );"));
     ASSERT_TRUE(whole >= 0);
     ASSERT_TRUE(normalAdvance > whole);
+    // the loop wrap to cut-in (either mode) spends a whole frame BEFORE it is counted or moves the slider
+    const int wrapGate = handling.indexOf(QStringLiteral(
+        "if( !m_playbackPaceGuard.grantLoopWrap( paceNowMs, getFramerate() ) ) return;"));
+    const int wrapCounted = handling.indexOf(QStringLiteral("m_playbackWrapRecorder.noteEngineWrap();"));
+    const int wrapMove = handling.indexOf(QStringLiteral("ui->horizontalSliderPosition->setValue( cutInFrame );"));
+    const int loopBranch = handling.indexOf(QStringLiteral("if( ui->actionLoop->isChecked() )"));
+    ASSERT_TRUE(loopBranch >= 0);
+    ASSERT_TRUE(wrapGate > loopBranch);
+    ASSERT_TRUE(wrapCounted > wrapGate);
+    ASSERT_TRUE(wrapMove > wrapGate);
+    ASSERT_TRUE(handling.indexOf(QStringLiteral("const double paceNowMs = mlv_stage_timing_now() * 1000.0;")) < wrapGate);
     // drop-frame mode advances by the GRANTED share, never the raw fps x timeDiff
     ASSERT_TRUE(handling.contains(QStringLiteral(
         "m_playbackPaceGuard.grant( getFramerate() * (double)timeDiff / 1000.0, paceNowMs, getFramerate() ),")));

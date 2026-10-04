@@ -94,6 +94,14 @@ public:
         return true;
     }
 
+    /*! The tick at the cut range's last frame with Loop on (either mode): going back to cut-in is a frame
+     *  transition like any other, so it spends a whole frame of credit; false holds the last frame. Unpaid,
+     *  every lap ran one frame period short (cut 1..24 at 23.976 with a 32 ms render: 25.025 fps). */
+    bool grantLoopWrap( double nowMs, double paceFps )
+    {
+        return grantWholeFrame( nowMs, paceFps );
+    }
+
 private:
     static constexpr double kEpsilonFrames = 1e-9;
 

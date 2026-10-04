@@ -137,7 +137,8 @@ The cause was the CUDA early advance on present: `timerFrameEvent( true )` round
 * **The engine never runs faster than native.** `playback_native_pace::NativePaceGuard` (`platform/qt/PlaybackNativePaceGuard.h`)
   is the ceiling on every engine advance in `playbackHandling()`. Credit accrues at the pace fps per wall second and at
   most one frame is carried. Source frames advanced are therefore at most 1 + elapsed x pace fps, on every backend and at
-  every scale. A renderer slower than native still drops or holds exactly as before.
+  every scale. The Loop wrap from cut-out back to cut-in spends a frame of credit too (`grantLoopWrap`), so a short loop
+  holds the ceiling across the boundary. A renderer slower than native still drops or holds exactly as before.
 * **Every oracle copy checks the observed rate.** An observed rate more than 2 % over native is `PLAYBACK_FASTER_THAN_NATIVE`.
   Slower than native stays informational. The venue job (`Get-AttrCudaSourceFramesVerdict`) and the dual-venue receipt
   (`Get-DvPlaybackProblems`) REQUIRE `elapsed_ms` (absent = `RECEIPT_FIELD_ABSENT`). The local gate
