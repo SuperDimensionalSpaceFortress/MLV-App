@@ -31,6 +31,7 @@ STRING_RECEIPT_MEMBERS = {
     "m_darkFrameSubtractionName",
     "m_lutName",
     "m_transferFunction",
+    "m_lookAssistFlavor",
 }
 
 BOOL_RECEIPT_MEMBERS = {

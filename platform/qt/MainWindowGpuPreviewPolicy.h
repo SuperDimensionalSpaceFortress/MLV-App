@@ -65,6 +65,11 @@ struct MainWindowGpuPreviewPolicyState
     bool gpuPlaybackReconEnvironmentRequested = false;
     bool gpuPlaybackReconTexturePresentationEnvironmentRequested = false;
     bool gpuPlaybackReconTexturePresentationCompatible = false;
+    /* PLAYBACK-SEEK-RENDER-PARITY-1: false when an active stage is one the live
+     * display shader does not apply (gpuPreviewProcessingDisplayShaderRefusedStages);
+     * the texture-present routes then refuse so the look cannot differ. Defaults
+     * to true so states built without a processing object keep their meaning. */
+    bool gpuPreviewProcessingDisplayShaderCompatible = true;
     bool histogramEnabled = false;
     bool waveformEnabled = false;
     bool paradeEnabled = false;
@@ -208,7 +213,8 @@ inline bool mainWindowAllowsGpuAmazeTexturePresentation(
     // route requires the QOpenGLWidget viewport unconditionally.
     return mainWindowUsesGpuAmazeDebayer(state)
         && state.gpuAmazeTexturePresentationEnvironmentRequested
-        && state.gpuWidgetViewportInstalled;
+        && state.gpuWidgetViewportInstalled
+        && state.gpuPreviewProcessingDisplayShaderCompatible;
 }
 
 inline bool mainWindowUsesGpuAmazeTexturePresentation(
@@ -224,7 +230,8 @@ inline bool mainWindowAllowsGpuPlaybackReconTexturePresentation(
     return mainWindowAllowsGpu16PreviewRender(state)
         && state.gpuPlaybackReconEnvironmentRequested
         && state.gpuPlaybackReconTexturePresentationEnvironmentRequested
-        && state.gpuPlaybackReconTexturePresentationCompatible;
+        && state.gpuPlaybackReconTexturePresentationCompatible
+        && state.gpuPreviewProcessingDisplayShaderCompatible;
 }
 
 inline bool mainWindowUsesGpuPlaybackReconTexturePresentation(

@@ -459,10 +459,136 @@ LookAssistWindowLitCheck resolveLookAssistWindowLitInterior( const LookAssistWhi
 
 int lookAssistDisplayTargetMedianForScene( LookAssistScene scene );
 
+/* ---- Flavors: Classic | Cinematic. ----
+ * Classic is master's Look Assist, untouched: presetForLookAssistScene returns before any flavor code, so
+ * every sliders / receipt / picture it produced stays byte-identical. Cinematic is the same analysis, the
+ * same scene verdict and the same white-balance decision, with ONE table of additive deltas
+ * (kCinematicFlavorDeltas, LookAssistAnalysis.cpp) laid over the same preset sliders -- contrast, pivot,
+ * shadows, highlights, vibrance. It never touches exposure (Classic's, exactly) or temperatureDelta / tintDelta. Saturation and the
+ * tone curve are not Look Assist sliders (no preset field, no baseline), so they are not used. */
+enum class LookAssistFlavor
+{
+    Classic,
+    Cinematic
+};
+
+/* "classic" / "cinematic": the one spelling used in the environment, the receipt element, the app setting
+ * and every log line. */
+QString lookAssistFlavorName( LookAssistFlavor flavor );
+
+/* Where the flavor in force came from, for the log: "env", "receipt", "app" or "default". */
+struct LookAssistFlavorSelection
+{
+    LookAssistFlavor flavor = LookAssistFlavor::Classic;
+    QString source = QStringLiteral("default");
+    // The first layer that said something said something this module does not know: Classic was taken and
+    // the consumer logs a warning carrying rejectedValue.
+    bool unknownValue = false;
+    QString rejectedValue;
+};
+
+/* Pure. Layers in priority order: the environment value (MLVAPP_LOOK_ASSIST_FLAVOR, for runs) wins over the
+ * receipt's lookAssistFlavor element, which wins over the GUI's app setting; an empty layer is skipped. The
+ * first non-empty layer decides, case-insensitively and trimmed; if it is not "classic" or "cinematic" the
+ * answer is Classic with unknownValue set -- never a silent fall through to a lower layer. */
+LookAssistFlavorSelection lookAssistSelectFlavor( const QString &environmentValue,
+                                                  const QString &receiptValue,
+                                                  const QString &appSettingValue );
+
+/* The environment variable's value as the consumers read it (empty when unset). */
+QString lookAssistFlavorEnvironmentValue();
+
+/* The Cinematic deltas for a scene, exactly as the table holds them (a test pins the table through this). */
+struct LookAssistFlavorDeltas
+{
+    int exposure = 0;
+    int contrast = 0;
+    int pivot = 0;
+    int shadows = 0;
+    int highlights = 0;
+    int vibrance = 0;
+};
+LookAssistFlavorDeltas lookAssistCinematicDeltasForScene( LookAssistScene scene );
+
+/* Lays the flavor over a preset that is already Classic's: the five tone sliders (contrast, pivot, shadows,
+ * highlights, vibrance) move by the table and are clamped to their ranges. Exposure and the white-balance deltas
+ * are NEVER touched, and Classic is a no-op. presetForLookAssistScene ends in this very function, so a caller that
+ * must measure pictures on the Classic preset first (the GUI's white-balance walk renders the picture, so the walk
+ * must not see the grade) and lay the flavor over afterwards gets exactly the preset the one call would have made. */
+void lookAssistApplyFlavorDeltas( LookAssistPreset *preset, LookAssistScene scene, LookAssistFlavor flavor );
+
+/* A receipt's lookAssistFlavor element as the value the GUI's selector takes: "classic" or "cinematic" (trimmed,
+ * case-insensitive), or "" when the receipt declares nothing (the selector is then left alone). An unknown value is
+ * "classic" -- never Cinematic, never a silent skip -- and *selection (optional) says so (unknownValue /
+ * rejectedValue / source "receipt") so the caller can warn. Same rule as lookAssistSelectFlavor, one place. */
+QString lookAssistSelectorValueForReceipt( const QString &receiptValue, LookAssistFlavorSelection *selection = nullptr );
+
+/* The GUI's "Look Assist already applied to this clip" marker (the de-dupe that keeps a second setSliders / frame-ready
+ * trigger from re-running the ~3 s analysis). It names a clip by address. A flavor change is a different grade over the
+ * same clip, so it must FORGET the clip: otherwise the toggle's frame-ready step skips the analysis as already applied
+ * after the baseline was restored, and the clip is left ungraded under a receipt that names the new flavor. */
+class LookAssistAppliedMarker
+{
+public:
+    bool isApplied( const void *receipt ) const { return receipt != nullptr && m_receipt == receipt; }
+    bool empty() const { return m_receipt == nullptr; }
+    void markApplied( const void *receipt ) { m_receipt = receipt; }
+    void clear() { m_receipt = nullptr; }
+    void clearIf( const void *receipt ) { if( m_receipt == receipt ) m_receipt = nullptr; }
+    /* The flavor selector changed on `activeReceipt`. Forgets the clip and returns true when the analysis must run
+     * again (Look Assist is on); returns false, marker untouched, when it is off. */
+    bool flavorChanged( const void *activeReceipt, bool lookAssistEnabled )
+    {
+        if( !lookAssistEnabled ) return false;
+        clearIf( activeReceipt );
+        return true;
+    }
+private:
+    const void *m_receipt = nullptr;
+};
+
+/* How the last Look Assist analysis ENDED, the one source of truth for what the GUI reports as applied: the
+ * `gui_smoke.visual_state` telemetry and the flavor setReceipt writes into the receipt both read it. A receipt must
+ * name the flavor that was APPLIED, never the merely selected one: after a safety fallback restored the baseline
+ * sliders, a receipt that still said "cinematic" would export a grade it does not hold.
+ *   begin()   an analysis starts: nothing is applied until it lands.
+ *   landed()  it ended on `receipt` with `flavorName` -- applied, or (safetyFallback) restored to baseline.
+ *   clear()   Look Assist went off / the clip closed.
+ * receiptValue(): the fallback names "classic" (Classic semantics: the writer leaves the element out, so the file is
+ * byte-identical to a Classic receipt); an applied grade names the flavor applied; a clip with no recorded outcome
+ * (Look Assist off, or the analysis is pending) keeps the selector's value, which is the clip's setting. */
+class LookAssistFlavorOutcome
+{
+public:
+    void begin() { clear(); }
+    void clear() { m_receipt = nullptr; m_applied.clear(); m_fellBack = false; }
+    void landed( const void *receipt, const QString &flavorName, bool safetyFallback )
+    {
+        m_receipt = receipt;
+        m_fellBack = safetyFallback;
+        m_applied = safetyFallback ? QString() : flavorName;
+    }
+    /* The flavor on screen: empty until an analysis lands, and empty again after a safety fallback. */
+    QString appliedName() const { return m_applied; }
+    QString receiptValue( const void *receipt, const QString &selectedFlavorName ) const
+    {
+        if( receipt == nullptr || receipt != m_receipt ) return selectedFlavorName;
+        if( m_fellBack ) return QStringLiteral("classic");
+        return m_applied.isEmpty() ? selectedFlavorName : m_applied;
+    }
+private:
+    const void *m_receipt = nullptr;
+    QString m_applied;
+    bool m_fellBack = false;
+};
+
+/* flavor defaults to Classic, so every caller that does not pass one is master's. The scene verdict is the
+ * caller's (always the Classic classifier); the flavor only shapes the sliders. */
 LookAssistPreset presetForLookAssistScene( LookAssistScene scene,
                                            const LookAssistStats &stats,
                                            const LookAssistStats *colorStats = nullptr,
-                                           const LookAssistStats *displayStats = nullptr );
+                                           const LookAssistStats *displayStats = nullptr,
+                                           LookAssistFlavor flavor = LookAssistFlavor::Classic );
 
 } // namespace lookassist
 

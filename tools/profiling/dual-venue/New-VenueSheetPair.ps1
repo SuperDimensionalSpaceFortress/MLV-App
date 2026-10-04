@@ -102,10 +102,18 @@ $pyArgs = @('-3', $composer, '--frames-dir', $stageDirs['cuda'], '--pair-dir', $
 & py @pyArgs
 if ($LASTEXITCODE -ne 0) { throw "PAIR_COMPOSE_FAILED make-contact-sheet.py exited $LASTEXITCODE" }
 
+# True only when both legs' own receipts say the app applied the requested flavor; false when either says it did not; 'unknown'
+# for a receipt that predates the report (no look.lookFlavorHonored boolean).
+$honoredCuda = $(if ($cuda.look -and $cuda.look.PSObject.Properties['lookFlavorHonored']) { $cuda.look.lookFlavorHonored } else { 'unknown' })
+$honoredCpu = $(if ($cpu.look -and $cpu.look.PSObject.Properties['lookFlavorHonored']) { $cpu.look.lookFlavorHonored } else { 'unknown' })
+$pairHonored = 'unknown'
+if (($honoredCuda -is [bool]) -and ($honoredCpu -is [bool])) { $pairHonored = ($honoredCuda -and $honoredCpu) }
+elseif (($honoredCuda -is [bool] -and -not $honoredCuda) -or ($honoredCpu -is [bool] -and -not $honoredCpu)) { $pairHonored = $false }
+
 $record = [ordered]@{
     schema = 'mlv-app/dual-venue-sheet-pair/v1'
     venue = $venue; card = $cuda.card; legId = $cuda.legId; lookFlavor = $flavor
-    lookFlavorHonored = 'unknown'
+    lookFlavorHonored = $pairHonored
     ownerFootage = $true
     advisory = $true
     evidenceStatus = 'ADVISORY'
