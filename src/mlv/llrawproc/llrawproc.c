@@ -88,6 +88,10 @@ static MLV_THREAD_LOCAL uint64_t g_llrawproc_debug_runtime_publish_count = 0;
 static MLV_THREAD_LOCAL int g_llrawproc_analysis_isolation_enabled = 0;
 static MLV_THREAD_LOCAL int g_llrawproc_analysis_chroma_smooth_override_enabled = 0;
 static MLV_THREAD_LOCAL int g_llrawproc_analysis_chroma_smooth_override = CS_OFF;
+/* LOOK-ASSIST-WINDOW-LIT-INTERIOR-1: see llrpSetIsolatedAnalysisSharedStateReadOnlyForCurrentThread(). The shadow is
+ * per thread and keeps its own pixel-map storage between calls, so an early return never leaks or frees it. */
+static MLV_THREAD_LOCAL int g_llrawproc_analysis_shared_read_only = 0;
+static MLV_THREAD_LOCAL llrawprocObject_t g_llrawproc_read_only_shadow;
 
 static int llrawproc_analysis_thread_count(mlvObject_t * video, int isolated_analysis)
 {
@@ -2833,6 +2837,24 @@ static void llrawproc_publish_worker_results(mlvObject_t * video,
     g_llrawproc_debug_runtime_publish_count++;
 }
 
+/* Points the worker at a private copy of the shared object: every scalar copied, the two pixel maps deep-copied into the
+ * shadow's own storage. Called with llrawproc_mutex held. Whatever the render then prepares, searches, bumps or claims
+ * (pixel maps and their versions, bpm/fpm status, the stripe one-shot) lands in the copy and is never published. */
+static llrawprocObject_t * llrawproc_read_only_shadow(llrawprocObject_t * shared)
+{
+    llrawprocObject_t * shadow = &g_llrawproc_read_only_shadow;
+    const pixel_map focus_storage = shadow->focus_pixel_map;
+    const pixel_map bad_storage = shadow->bad_pixel_map;
+    *shadow = *shared;
+    shadow->focus_pixel_map = focus_storage;
+    shadow->bad_pixel_map = bad_storage;
+    /* An allocation failure leaves that copy empty (count 0): the analysis picture interpolates fewer pixels, and
+     * nothing shared is touched either way. */
+    (void)llrawproc_worker_copy_pixel_map(&shadow->focus_pixel_map, &shared->focus_pixel_map);
+    (void)llrawproc_worker_copy_pixel_map(&shadow->bad_pixel_map, &shared->bad_pixel_map);
+    return shadow;
+}
+
 static void llrawproc_reset_force_bad_pixel_search(mlvObject_t * video, int bad_pixels)
 {
     if (!video || !video->llrawproc || bad_pixels != 2) return;
@@ -3299,6 +3321,18 @@ void applyLLRawProcObjectWorker(mlvObject_t * video,
         return;
     }
 
+    /* Read-only isolated analysis: from here on "shared" is this thread's private shadow. The worker's map versions are
+     * zeroed (0 is never a shared version) so it copies the shadow's maps; the isolated entry points pass a private
+     * worker they free afterwards. df_init() still reads the real object: a no-op once the live render that precedes
+     * any Look Assist analysis has settled the dark frame. */
+    const int shared_read_only = isolated_analysis && g_llrawproc_analysis_shared_read_only;
+    if (shared_read_only)
+    {
+        shared = llrawproc_read_only_shadow(shared);
+        worker->focus_pixel_map_version = 0;
+        worker->bad_pixel_map_version = 0;
+    }
+
     if (!df_init(video))
     {
         const double dark_frame_start = mlv_stage_timing_now();
@@ -3564,7 +3598,7 @@ void applyLLRawProcObjectWorker(mlvObject_t * video,
                                   dual_iso_mode,
                                   worker->raw2ev,
                                   worker->ev2raw);
-        if (bad_force_reset_after_interpolation)
+        if (bad_force_reset_after_interpolation && !shared_read_only)
         {
             llrawproc_reset_force_bad_pixel_search(video, bad_pixels);
         }
@@ -4300,7 +4334,7 @@ void applyLLRawProcObjectWorker(mlvObject_t * video,
                                           0,
                                           worker->raw2ev,
                                           worker->ev2raw);
-                if (bad_force_reset_after_interpolation)
+                if (bad_force_reset_after_interpolation && !shared_read_only)
                 {
                     llrawproc_reset_force_bad_pixel_search(video, bad_pixels);
                 }
@@ -4529,6 +4563,13 @@ void applyLLRawProcObjectWorkerIsolatedAnalysisWithChromaSmooth(mlvObject_t * vi
                                                        stop_before_dual_iso,
                                                        1,
                                                        chroma_smooth_method);
+}
+
+int llrpSetIsolatedAnalysisSharedStateReadOnlyForCurrentThread(int enabled)
+{
+    const int previous = g_llrawproc_analysis_shared_read_only;
+    g_llrawproc_analysis_shared_read_only = enabled ? 1 : 0;
+    return previous;
 }
 
 void applyLLRawProcObject(mlvObject_t * video, uint16_t * raw_image_buff, size_t raw_image_size)

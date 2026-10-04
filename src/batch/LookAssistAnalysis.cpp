@@ -179,7 +179,8 @@ bool lookAssistExposureIsDaylightBright( const LookAssistStats &stats )
 
 bool lookAssistSceneIsDaylight( const LookAssistStats &stats )
 {
-    return lookAssistExposureIsDaylightBright( stats ) && stats.daylightPictureEvidence;
+    return ( lookAssistExposureIsDaylightBright( stats ) && stats.daylightPictureEvidence )
+        || stats.windowLitInteriorEvidence;
 }
 
 void lookAssistSetAsShotWhiteBalance( LookAssistStats *stats, bool valid, int temperature, int tint )
@@ -271,6 +272,7 @@ bool lookAssistDaylightNeedsPictureEvidence( const LookAssistStats &stats, LookA
 
 QString lookAssistDaylightGateName( const LookAssistStats &resolved, bool pictureEvidenceAsked )
 {
+    if( resolved.windowLitInteriorEvidence ) return QStringLiteral("window");
     if( resolved.daylightPictureEvidence ) return QStringLiteral("pass");
     // No evidence was granted, so the stats classify exactly as the legacy verdict did.
     switch( lookAssistDaylightGate( resolved, classifyLookAssistScene( resolved ) ) )
@@ -356,6 +358,7 @@ LookAssistScene resolveLookAssistScene( LookAssistStats *stats, const LookAssist
 {
     if( !stats ) return LookAssistScene::Night;
     stats->daylightPictureEvidence = false;
+    stats->windowLitInteriorEvidence = false;
     LookAssistScene scene = classifyLookAssistScene( *stats );
     if( renderProcessed && lookAssistDaylightNeedsPictureEvidence( *stats, scene ) )
     {
@@ -1081,6 +1084,124 @@ void refineLookAssistDaylightWhiteBalance( const LookAssistWhiteBalanceRequest &
     if( !lookAssistDaylightNeedsRenderedRefinement( *request.stats, request.scene, *resolution, request.refineWithoutPatch ) ) return;
     refineDaylightFromRenderedPicture( request, solve, preset, resolution );
     lookAssistFinalizeWhiteBalance( request, preset, resolution );
+}
+
+bool lookAssistWindowLitInteriorCandidate( const LookAssistStats &stats, LookAssistScene scene )
+{
+    // The night verdict came from a RAW floor that carries no scene information, and nothing recorded can overrule
+    // it: a clip with a recorded exposure keeps the exposure gate exactly as it is.
+    return scene == LookAssistScene::Night
+        && lookAssistIsFlatFloorRawThumbnail( stats )
+        && !stats.hasSceneEv100;
+}
+
+LookAssistWindowLitCheck resolveLookAssistWindowLitInterior( const LookAssistWhiteBalanceRequest &request,
+                                                             const LookAssistWhiteBalanceResolution &wb,
+                                                             double patchPictureExposureStops,
+                                                             LookAssistStats *stats,
+                                                             LookAssistScene *scene,
+                                                             LookAssistPreset *preset,
+                                                             const LookAssistStats *colorStats,
+                                                             const LookAssistStats *displayStats )
+{
+    LookAssistWindowLitCheck check;
+    if( !stats || !scene || !preset || request.stats != stats ) return check;
+    check.candidate = lookAssistWindowLitInteriorCandidate( *stats, *scene ) && request.scene == *scene;
+    if( !check.candidate ) return check;
+
+    const LookAssistAutoWhiteBalancePatch &patch = request.patch;
+    if( !request.solvedOnProcessedPicture || !patch.valid )
+    {
+        check.reason = QStringLiteral("not-processed-solve");
+        return check;
+    }
+    if( !wb.autoValid )
+    {
+        check.reason = QStringLiteral("not-accepted-undamped");
+        return check;
+    }
+    // Daylight, by the clip's own solve: bluer than the base by a margin no night light source reaches, and inside the
+    // window the daylight class itself enforces (so the clamp below is a no-op).
+    LookAssistStats daylightHypothesis = *stats;
+    daylightHypothesis.windowLitInteriorEvidence = true;
+    const LookAssistScene daylightScene = classifyLookAssistScene( daylightHypothesis );
+    const LookAssistWhiteBalanceBounds window = lookAssistWhiteBalanceBounds( daylightHypothesis, daylightScene );
+    if( wb.candidateTemperature < kLookAssistWindowLitMinTemperature
+     || wb.candidateTemperature < window.minTemperature || wb.candidateTemperature > window.maxTemperature
+     || wb.candidateTint < window.minTint || wb.candidateTint > window.maxTint )
+    {
+        check.reason = QStringLiteral("not-daylight-locus");
+        return check;
+    }
+    if( wb.damping < 0.999 )
+    {
+        check.reason = QStringLiteral("not-accepted-undamped");
+        return check;
+    }
+    if( patch.luma < kLookAssistWindowLitMinPatchLuma )
+    {
+        check.reason = QStringLiteral("dim-patch");
+        return check;
+    }
+    if( !lookAssistDaylightPatchIsNeutralEnough( patch ) )
+    {
+        check.reason = QStringLiteral("patch-not-neutral");
+        return check;
+    }
+    if( !request.renderBalance )
+    {
+        check.reason = QStringLiteral("no-renderer");
+        return check;
+    }
+
+    // Verified on the picture the patch was found in: the same surface near-neutral at the base balance and at the
+    // solution, and no more cast there (the daylight initial-patch guard, started from the base balance).
+    LookAssistRenderedPicture base;
+    LookAssistRenderedPicture verify;
+    const bool rendered =
+        request.renderBalance( patchPictureExposureStops, request.baseTemperature, request.baseTint, &base )
+        && request.renderBalance( patchPictureExposureStops, wb.candidateTemperature, wb.candidateTint, &verify );
+    if( !rendered || !lookAssistSamePictureGeometry( base, verify )
+     || patch.thumbnailX < 0 || patch.thumbnailX >= base.width || patch.thumbnailY < 0 || patch.thumbnailY >= base.height
+     || patch.rawX != qBound( 0, patch.thumbnailX * base.downscaleFactor + base.downscaleFactor / 2, request.rawWidth - 1 )
+     || patch.rawY != qBound( 0, patch.thumbnailY * base.downscaleFactor + base.downscaleFactor / 2, request.rawHeight - 1 ) )
+    {
+        check.reason = QStringLiteral("unverifiable");
+        return check;
+    }
+    const LookAssistAutoWhiteBalancePatch baseSurface = lookAssistSurfaceAt( base, patch.thumbnailX, patch.thumbnailY );
+    check.baseSurfaceChroma = baseSurface.chroma;
+    check.baseSurfaceBlueAmber = baseSurface.blueAmberAxis;
+    if( !lookAssistDaylightPatchIsNeutralEnough( baseSurface ) )
+    {
+        check.reason = QStringLiteral("unverified-at-base");
+        return check;
+    }
+    const LookAssistAutoWhiteBalancePatch solutionSurface = lookAssistSurfaceAt( verify, patch.thumbnailX, patch.thumbnailY );
+    check.solutionSurfaceChroma = solutionSurface.chroma;
+    check.solutionSurfaceBlueAmber = solutionSurface.blueAmberAxis;
+    if( !lookAssistDaylightPatchIsNeutralEnough( solutionSurface )
+     || solutionSurface.chroma > baseSurface.chroma + kRefineVerifyChromaSlack )
+    {
+        check.reason = QStringLiteral("unverified-at-solution");
+        return check;
+    }
+
+    // A window-lit interior: the daylight class, its preset on the same inputs, and the accepted balance as it stands.
+    const int temperature = request.baseTemperature + preset->temperatureDelta;
+    const int tint = request.baseTint + preset->tintDelta;
+    *stats = daylightHypothesis;
+    *scene = daylightScene;
+    LookAssistPreset daylightPreset = presetForLookAssistScene( daylightScene, *stats, colorStats, displayStats );
+    int finalTemperature = temperature;
+    int finalTint = tint;
+    lookAssistClampWhiteBalance( window, &finalTemperature, &finalTint );
+    daylightPreset.temperatureDelta = finalTemperature - request.baseTemperature;
+    daylightPreset.tintDelta = finalTint - request.baseTint;
+    *preset = daylightPreset;
+    check.evidence = true;
+    check.reason = QStringLiteral("pass");
+    return check;
 }
 
 int lookAssistDisplayTargetMedianForScene( LookAssistScene scene )

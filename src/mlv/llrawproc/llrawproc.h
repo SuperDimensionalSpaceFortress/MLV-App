@@ -55,6 +55,11 @@ void applyLLRawProcObjectWorkerIsolatedAnalysisWithChromaSmooth(mlvObject_t * vi
                                                                 llrawprocWorkerState_t * worker,
                                                                 int stop_before_dual_iso,
                                                                 int chroma_smooth_method);
+/* While enabled on the calling thread, an ISOLATED analysis render (the two entry points above) reads the shared
+ * object but never writes it: focus/bad pixel map preparation, their versions and status, the force-search reset and
+ * the vertical-stripe one-shot all land in a private per-thread shadow. Off by default; only measure-only analysis
+ * (the Look Assist window-lit verification) turns it on. Returns the previous value. */
+int llrpSetIsolatedAnalysisSharedStateReadOnlyForCurrentThread(int enabled);
 void llrpSetGpuPlaybackReconAllowedForCurrentThread(int enabled);
 void llrpSetGpuPlaybackReconTexturePresentPreferredForCurrentThread(int enabled);
 void llrpSetGpuPlaybackReconTexturePrepareOnlyForCurrentThread(int enabled);

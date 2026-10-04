@@ -16598,6 +16598,43 @@ void MainWindow::applyLookAssistToReceipt( ReceiptSettings *receipt,
         s_lookAssistMasterScenePass = false;
         return;
     }
+    // MEASURED, NOT APPLIED (LOOK-ASSIST-WINDOW-LIT-INTERIOR-1): on the owner clip the accepted solve did not verify
+    // (re-rendered at it, its own patch turns amber), so the window-lit reclassification stays off until the verdict
+    // (EV100 bound for a missing aperture) and balance (verified-surface search) follow-ons land. The check runs on
+    // copies and only logs what it measured; this pass's verdict, preset and balance are master's (shared with headless).
+    // Its verification renders use the isolated read-only renderer: no processing, cache or llrawproc state moves.
+    LookAssistStats windowLitStats = stats;
+    LookAssistScene windowLitScene = scene;
+    LookAssistPreset windowLitPreset = preset;
+    LookAssistWhiteBalanceRequest windowLitRequest = wbRequest;
+    windowLitRequest.stats = &windowLitStats;
+    windowLitRequest.renderBalance = ReceiptApplier::lookAssistMeasureOnlyRenderer(
+        m_pMlvObject, analysisFrame, colorDownscaleFactor, colorWidth, colorHeight,
+        qMax( 1, mlvappEffectiveWorkerThreadCount() ) );
+    const LookAssistWindowLitCheck windowLit = resolveLookAssistWindowLitInterior(
+        windowLitRequest, wb, m_pMlvObject->processing->exposure_stops, &windowLitStats, &windowLitScene, &windowLitPreset,
+        useProcessedColorStats ? &processedColorStats : nullptr,
+        displayStatsValidUi ? &displayStatsUi : nullptr );
+    if( windowLit.candidate )
+    {
+        logInteractionEvent(
+            QStringLiteral("look_assist.window_lit_interior"),
+            QStringLiteral("would_reclassify=%1 reason=%2 scene=%3 base_surface_chroma=%4 base_surface_blue_amber=%5 "
+                           "solution_surface_chroma=%6 solution_surface_blue_amber=%7 frame=%8 "
+                           "expo_iso=%9 expo_shutter_us=%10 lens_aperture_x100=%11")
+                .arg( bool01( windowLit.evidence ) )
+                .arg( windowLit.reason )
+                .arg( lookAssistSceneName( scene ) )
+                .arg( windowLit.baseSurfaceChroma, 0, 'f', 1 )
+                .arg( windowLit.baseSurfaceBlueAmber, 0, 'f', 1 )
+                .arg( windowLit.solutionSurfaceChroma, 0, 'f', 1 )
+                .arg( windowLit.solutionSurfaceBlueAmber, 0, 'f', 1 )
+                .arg( analysisFrame )
+                // The raw EXPO / LENS fields behind has_ev100=0: which one is missing decides the follow-on.
+                .arg( static_cast<qulonglong>( m_pMlvObject->EXPO.isoValue ) )
+                .arg( static_cast<qulonglong>( m_pMlvObject->EXPO.shutterValue ) )
+                .arg( static_cast<qulonglong>( m_pMlvObject->LENS.aperture ) ) );
+    }
     const bool autoWhiteBalanceValid = wb.autoValid;
     const QString autoWhiteBalanceSource = wb.source;
     const QString autoWhiteBalanceDecision = wb.decision;

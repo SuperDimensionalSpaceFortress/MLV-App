@@ -903,7 +903,177 @@ QString appliedLineDecisionTail( const QByteArray &log )
     return at < 0 ? QString() : line.mid( at + 1 );
 }
 
+// The "LOOK_ASSIST window_lit_interior" line of a run, trimmed ("" when absent).
+QString windowLitLine( const QByteArray &log )
+{
+    for( const QByteArray &candidate : log.split( '\n' ) )
+        if( candidate.contains( "LOOK_ASSIST window_lit_interior" ) ) return QString::fromUtf8( candidate ).trimmed();
+    return QString();
+}
+
+// Everything llrawproc keeps on the shared object that a render can move: the pixel maps (status, version, contents),
+// the force-search state, the stripe one-shot and its result, and the runtime values workers publish.
+struct LlrawprocSharedState
+{
+    int fpmStatus, bpmStatus;
+    uint32_t focusVersion, badVersion;
+    std::string focusPixels, badPixels;
+    int computeStripes;
+    std::string stripes;
+    int disoPattern, disoAutoCorrection, disoBlackDelta;
+    double disoEvCorrection;
+    int dngBitDepth, dngBlackLevel, dngWhiteLevel;
+    int preDualIsoFixCompleted;
+};
+
+LlrawprocSharedState llrawprocSharedState( const mlvObject_t *video )
+{
+    const llrawprocObject_t *s = video->llrawproc;
+    LlrawprocSharedState out;
+    out.fpmStatus = s->fpm_status;
+    out.bpmStatus = s->bpm_status;
+    out.focusVersion = s->focus_pixel_map_version;
+    out.badVersion = s->bad_pixel_map_version;
+    out.focusPixels = s->focus_pixel_map.count
+        ? sha256_bytes( s->focus_pixel_map.pixels, s->focus_pixel_map.count * sizeof( pixel_xy ) ) : std::string( "empty" );
+    out.badPixels = s->bad_pixel_map.count
+        ? sha256_bytes( s->bad_pixel_map.pixels, s->bad_pixel_map.count * sizeof( pixel_xy ) ) : std::string( "empty" );
+    out.computeStripes = s->compute_stripes;
+    out.stripes = sha256_bytes( &s->stripe_corrections, sizeof( s->stripe_corrections ) );
+    out.disoPattern = s->diso_pattern;
+    out.disoAutoCorrection = s->diso_auto_correction;
+    out.disoBlackDelta = s->diso_black_delta;
+    out.disoEvCorrection = s->diso_ev_correction;
+    out.dngBitDepth = s->dng_bit_depth;
+    out.dngBlackLevel = s->dng_black_level;
+    out.dngWhiteLevel = s->dng_white_level;
+    out.preDualIsoFixCompleted = s->playback_pre_dualiso_fix_completed;
+    return out;
+}
+
+bool sameLlrawprocSharedState( const LlrawprocSharedState &a, const LlrawprocSharedState &b )
+{
+    return a.fpmStatus == b.fpmStatus && a.bpmStatus == b.bpmStatus && a.focusVersion == b.focusVersion
+        && a.badVersion == b.badVersion && a.focusPixels == b.focusPixels && a.badPixels == b.badPixels
+        && a.computeStripes == b.computeStripes && a.stripes == b.stripes && a.disoPattern == b.disoPattern
+        && a.disoAutoCorrection == b.disoAutoCorrection && a.disoBlackDelta == b.disoBlackDelta
+        && a.disoEvCorrection == b.disoEvCorrection && a.dngBitDepth == b.dngBitDepth
+        && a.dngBlackLevel == b.dngBlackLevel && a.dngWhiteLevel == b.dngWhiteLevel
+        && a.preDualIsoFixCompleted == b.preDualIsoFixCompleted;
+}
+
+// The window-lit check reaching its two verification renders on the tracked clip: a no-metadata flat-floor night with
+// a processed, accepted, undamped solve on the daylight locus from a bright neutral patch (the patch and the solve are
+// set here; the fixture's own night path stops at not-processed-solve, before any render). rawStats is the clip's RAW
+// thumbnail, read beforehand (that read is the live raw path); renderBalance is the renderer under test.
+LookAssistWindowLitCheck runWindowLitVerification( mlvObject_t *video, const LookAssistStats &rawStats,
+                                                   const LookAssistRenderBalanceFn &renderBalance, int colorDownscale )
+{
+    LookAssistStats stats = rawStats;
+    LookAssistScene scene = classifyLookAssistScene( stats );
+    LookAssistPreset preset = presetForLookAssistScene( scene, stats );
+    LookAssistWhiteBalanceRequest request;
+    request.stats = &stats;
+    request.scene = scene;
+    request.patch.valid = true;
+    request.patch.thumbnailX = 40;
+    request.patch.thumbnailY = 30;
+    request.patch.rawX = 40 * colorDownscale + colorDownscale / 2;
+    request.patch.rawY = 30 * colorDownscale + colorDownscale / 2;
+    request.patch.luma = 210.0;
+    request.patch.chroma = 3.0;
+    request.patch.blueAmberAxis = 2.0;
+    request.solvedOnProcessedPicture = true;
+    request.baseTemperature = 6000;
+    request.baseTint = 0;
+    request.rawWidth = video->RAWI.xRes;
+    request.rawHeight = video->RAWI.yRes;
+    request.renderBalance = renderBalance;
+    LookAssistWhiteBalanceResolution wb;
+    wb.autoValid = true;
+    wb.damping = 1.0;
+    wb.candidateTemperature = 9930;
+    wb.candidateTint = -33;
+    return resolveLookAssistWindowLitInterior( request, wb, 1.74, &stats, &scene, &preset );
+}
+
 } // namespace
+
+TEST(LookAssistFixtureScene, WindowLitVerificationRendersLeaveLowLevelRawStateUntouched)
+{
+    // sol r1 blocker: the measure-only check must not move shared low-level state. Force-search bad pixels (every frame)
+    // on the tracked clip, whose sensor has real hot pixels: every live raw read re-searches, bumps the shared map
+    // version, and resets the force-search state.
+    MlvPipelineFixture fixture;
+    QString error_message;
+    ASSERT_TRUE( fixture.openClipFile( repo_file_path( QStringLiteral("tests/fixtures/clips/tiny_dual_iso.mlv") ), &error_message ) );
+    fixture.receipt().setBadPixels( 2 );
+    fixture.receipt().setBpsMethod( 1 );   // aggressive search
+    ASSERT_TRUE( fixture.applyReceipt( &error_message ) );
+    mlvObject_t *video = fixture.video();
+    video->EXPO.isoValue = 0;
+    video->EXPO.shutterValue = 0;
+    video->LENS.aperture = 0;
+    ASSERT_EQ( 2, llrpGetBadPixelMode( video ) );
+    llrpResetBpmStatus( video );
+
+    const int colorDownscale = 3;   // what both consumers pick for this clip's flat floor (max(3, 10 / 3))
+    const int width = video->RAWI.xRes / colorDownscale;
+    const int height = video->RAWI.yRes / colorDownscale;
+    const LookAssistRenderBalanceFn live =
+        ReceiptApplier::lookAssistBalanceRenderer( video, 0, colorDownscale, width, height, 1, false );
+    const LookAssistRenderBalanceFn measureOnly =
+        ReceiptApplier::lookAssistMeasureOnlyRenderer( video, 0, colorDownscale, width, height, 1 );
+
+    // Master's patch picture runs first in both consumers: one live render settles the state the check then meets.
+    LookAssistRenderedPicture patchPicture;
+    ASSERT_TRUE( live( 1.74, 6000, 0, &patchPicture ) );
+    // A hot pixel WAS detected: found (status 2), interpolated, then reset for the next frame's search (status 1).
+    ASSERT_EQ( 1, video->llrawproc->bpm_status );
+
+    const LookAssistStats rawStats = rawThumbnailStats( video, 0 );
+    const LlrawprocSharedState before = llrawprocSharedState( video );
+    const LookAssistWindowLitCheck measured = runWindowLitVerification( video, rawStats, measureOnly, colorDownscale );
+    ASSERT_TRUE( measured.candidate );
+    // Both verification renders ran (every reason past "unverifiable" is decided on the rendered surfaces).
+    ASSERT_TRUE( measured.reason == QStringLiteral("unverified-at-base") || measured.reason == QStringLiteral("unverified-at-solution")
+                 || measured.reason == QStringLiteral("pass") );
+    ASSERT_TRUE( measured.baseSurfaceChroma > 0.0 );
+    ASSERT_TRUE( sameLlrawprocSharedState( before, llrawprocSharedState( video ) ) );
+    // The read-only switch is scoped to the render: off again on this thread.
+    ASSERT_EQ( 0, llrpSetIsolatedAnalysisSharedStateReadOnlyForCurrentThread( 0 ) );
+
+    // The same measurement through the live renderer DOES move it (the defect, and proof this state can catch it).
+    const LookAssistWindowLitCheck liveMeasured = runWindowLitVerification( video, rawStats, live, colorDownscale );
+    ASSERT_TRUE( liveMeasured.candidate );
+    const LlrawprocSharedState afterLive = llrawprocSharedState( video );
+    ASSERT_FALSE( sameLlrawprocSharedState( before, afterLive ) );
+    ASSERT_TRUE( afterLive.badVersion != before.badVersion );
+}
+
+TEST(LookAssistFixtureScene, WindowLitTraceCarriesTheRawExposureFieldsInTheirOwnSlots)
+{
+    // fable r1: the EXPO/LENS mapping was pinned only for all zeros, so swapping two fields survived. The M16 state: ISO
+    // 100, 1/1357 s (737 us), no aperture. Missing the aperture alone means no EV100, so on this branch it is the
+    // pinned no-metadata night exactly; the window-lit line carries the three raw fields, each in its own slot.
+    const IdentityCase m16 = { "tiny-no-aperture-m16", "tests/fixtures/clips/tiny_dual_iso.mlv", true, 100, 737, 0, 1 };
+    IdentityRun run;
+    ASSERT_TRUE( runIdentityCase( m16, &run ) );
+    ASSERT_TRUE( run.scene == QString::fromLatin1( kIdentityPins[2].scene ) );
+    ASSERT_TRUE( run.receipt == QString::fromLatin1( kIdentityPins[2].receipt ) );
+    ASSERT_TRUE( run.pictureSha256 == kIdentityPins[2].pictureSha256 );
+    const QString line = windowLitLine( run.log );
+    ASSERT_FALSE( line.isEmpty() );
+    ASSERT_TRUE( line.contains( QStringLiteral(" wouldReclassify=false reason=not-processed-solve scene=night ") ) );
+    ASSERT_TRUE( line.contains( QStringLiteral(" expoIso=100 expoShutterUs=737 lensApertureX100=0") ) );
+
+    // The all-zero state on the same line (not satisfied by the applied line).
+    IdentityRun noMeta;
+    ASSERT_TRUE( runIdentityCase( kIdentityCases[2], &noMeta ) );
+    const QString noMetaLine = windowLitLine( noMeta.log );
+    ASSERT_TRUE( noMetaLine.contains( QStringLiteral(" wouldReclassify=false reason=not-processed-solve scene=night ") ) );
+    ASSERT_TRUE( noMetaLine.contains( QStringLiteral(" expoIso=0 expoShutterUs=0 lensApertureX100=0") ) );
+}
 
 TEST(LookAssistFixtureScene, HeadlessAppliedLineSaysWhyItChoseItsScene)
 {
@@ -943,6 +1113,23 @@ TEST(LookAssistFixtureScene, HeadlessAppliedLineSaysWhyItChoseItsScene)
         ASSERT_TRUE( line.contains( QStringLiteral("LOOK_ASSIST applied frame=0 scene=") ) );
         ASSERT_TRUE( line.contains( QStringLiteral("initialPatchFinalChroma=") ) );
         ASSERT_TRUE( line.indexOf( QStringLiteral("initialPatchFinalChroma=") ) < line.indexOf( QStringLiteral(" has_ev100=") ) );
+    }
+
+    // LOOK-ASSIST-WINDOW-LIT-INTERIOR-1: the two tracked NIGHT states. Without metadata the verdict is a window-lit
+    // candidate, judged and refused (it stays night; its receipt and picture are pinned above); with metadata (ND
+    // filter) it is never a candidate.
+    {
+        IdentityRun noMeta;
+        ASSERT_TRUE( runIdentityCase( kIdentityCases[2], &noMeta ) );
+        ASSERT_TRUE( noMeta.scene == QStringLiteral("night") );
+        const QString log = QString::fromUtf8( noMeta.log );
+        ASSERT_EQ( 1, log.count( QStringLiteral("LOOK_ASSIST window_lit_interior frame=0 wouldReclassify=false reason=") ) );
+        ASSERT_TRUE( log.contains( QStringLiteral(" scene=night ") ) );
+        ASSERT_TRUE( log.contains( QStringLiteral("expoIso=0 expoShutterUs=0 lensApertureX100=0") ) );
+        IdentityRun nd;
+        ASSERT_TRUE( runIdentityCase( kIdentityCases[3], &nd ) );
+        ASSERT_TRUE( nd.scene == QStringLiteral("night") );
+        ASSERT_FALSE( nd.log.contains( "window_lit_interior" ) );
     }
 
     // The master pass asks for no picture: with every other conjunct holding, the gate is n/a rather than "picture".

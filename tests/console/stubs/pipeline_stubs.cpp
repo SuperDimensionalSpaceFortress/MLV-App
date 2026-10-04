@@ -80,6 +80,7 @@ void llrpResetDngBWLevels(mlvObject_t * video)
 }
 void llrpResetFpmStatus(mlvObject_t * video) { video->llrawproc->fpm_status = 0; }
 void llrpResetBpmStatus(mlvObject_t * video) { video->llrawproc->bpm_status = 0; }
+int llrpSetIsolatedAnalysisSharedStateReadOnlyForCurrentThread(int) { return 0; }
 void llrpInitDarkFrameExtFileName(mlvObject_t * video, char * df_filename)
 {
     if (video->llrawproc->dark_frame_filename) {

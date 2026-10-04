@@ -592,13 +592,33 @@ bool ReceiptApplier::processedThumbnailAtBalance(mlvObject_t *mlvObject,
     settings.white_balance_tint = tint / 10.0;
     settings.exposure_stops = exposureStops;
 
-    const int rendered = isolated
-        ? get_area_average_downscale_thumnail_with_processing_cachefree(
-              mlvObject, frameIndex, downscaleFactor, qMax( 1, cpuCores ), clone, &settings, outBuffer )
-        : get_area_average_downscale_thumnail_with_processing(
-              mlvObject, frameIndex, downscaleFactor, qMax( 1, cpuCores ), clone, &settings, outBuffer );
+    int rendered = 0;
+    if( isolated )
+    {
+        // Cache-free AND read-only on llrawproc: the raw read cannot prepare, search or version the shared pixel maps,
+        // reset the force-search state or claim the stripe one-shot (it works on a per-thread shadow instead).
+        const int previousReadOnly = llrpSetIsolatedAnalysisSharedStateReadOnlyForCurrentThread( 1 );
+        rendered = get_area_average_downscale_thumnail_with_processing_cachefree(
+            mlvObject, frameIndex, downscaleFactor, qMax( 1, cpuCores ), clone, &settings, outBuffer );
+        llrpSetIsolatedAnalysisSharedStateReadOnlyForCurrentThread( previousReadOnly );
+    }
+    else
+    {
+        rendered = get_area_average_downscale_thumnail_with_processing(
+            mlvObject, frameIndex, downscaleFactor, qMax( 1, cpuCores ), clone, &settings, outBuffer );
+    }
     processingFreeClone( clone );
     return rendered != 0;
+}
+
+LookAssistRenderBalanceFn ReceiptApplier::lookAssistMeasureOnlyRenderer(mlvObject_t *mlvObject,
+                                                                       int frameIndex,
+                                                                       int downscaleFactor,
+                                                                       int thumbWidth,
+                                                                       int thumbHeight,
+                                                                       int cpuCores)
+{
+    return lookAssistBalanceRenderer( mlvObject, frameIndex, downscaleFactor, thumbWidth, thumbHeight, cpuCores, true );
 }
 
 LookAssistRenderBalanceFn ReceiptApplier::lookAssistBalanceRenderer(mlvObject_t *mlvObject,
@@ -900,6 +920,36 @@ bool ReceiptApplier::applyHeadlessLookAssist(ReceiptSettings *receipt,
             .arg( cachedFrameBefore )
             .arg( mlvObject->current_cached_frame_active ) );
         return applyHeadlessLookAssist( receipt, mlvObject, processingObject, analysisFrame, true );
+    }
+    // The window-lit check, MEASURED, NOT APPLIED (the GUI does the same; see there): it runs on copies and only logs,
+    // and its verification renders go through the isolated read-only renderer, so no shared state moves either.
+    LookAssistStats windowLitStats = stats;
+    LookAssistScene windowLitScene = scene;
+    LookAssistPreset windowLitPreset = preset;
+    LookAssistWhiteBalanceRequest windowLitRequest = wbRequest;
+    windowLitRequest.stats = &windowLitStats;
+    windowLitRequest.renderBalance = lookAssistMeasureOnlyRenderer( mlvObject, frameIndex, colorDownscaleFactor,
+                                                                    colorWidth, colorHeight, 1 );
+    const LookAssistWindowLitCheck windowLit = resolveLookAssistWindowLitInterior(
+        windowLitRequest, wb, mlvObject->processing->exposure_stops, &windowLitStats, &windowLitScene, &windowLitPreset,
+        useProcessedColorStats ? &processedColorStats : nullptr );
+    if( windowLit.candidate )
+    {
+        BatchLogger::out( QStringLiteral(
+            "[BATCH] LOOK_ASSIST window_lit_interior frame=%1 wouldReclassify=%2 reason=%3 scene=%4 baseSurfaceChroma=%5 "
+            "baseSurfaceBlueAmber=%6 solutionSurfaceChroma=%7 solutionSurfaceBlueAmber=%8 expoIso=%9 expoShutterUs=%10 "
+            "lensApertureX100=%11\n" )
+            .arg( frameIndex )
+            .arg( windowLit.evidence ? QStringLiteral("true") : QStringLiteral("false") )
+            .arg( windowLit.reason )
+            .arg( lookAssistSceneName( scene ) )
+            .arg( windowLit.baseSurfaceChroma, 0, 'f', 1 )
+            .arg( windowLit.baseSurfaceBlueAmber, 0, 'f', 1 )
+            .arg( windowLit.solutionSurfaceChroma, 0, 'f', 1 )
+            .arg( windowLit.solutionSurfaceBlueAmber, 0, 'f', 1 )
+            .arg( static_cast<qulonglong>( mlvObject->EXPO.isoValue ) )
+            .arg( static_cast<qulonglong>( mlvObject->EXPO.shutterValue ) )
+            .arg( static_cast<qulonglong>( mlvObject->LENS.aperture ) ) );
     }
     const bool autoWhiteBalanceValid = wb.autoValid;
     const QString autoWhiteBalanceSource = wb.source;
