@@ -1183,21 +1183,21 @@ TEST(LookAssistFixtureScene, HeadlessAppliedLineSaysWhyItChoseItsScene)
         { "tiny-daylight",
           "^has_ev100=1 ev100=16\\.\\d\\d\\d daylight_gate=pass post_walk_ran=0 post_walk_branch=none post_walk_recovery=NA "
           "display_meter_ran=0 playback_scale=NA ev100_bound=NA ev100_source=recorded surface_search=not-run "
-          "surface_search_balance=NA$" },
+          "surface_search_balance=NA flavor=classic$" },
         { "large-daylight",
           "^has_ev100=1 ev100=16\\.\\d\\d\\d daylight_gate=pass post_walk_ran=0 post_walk_branch=none post_walk_recovery=NA "
           "display_meter_ran=0 playback_scale=NA ev100_bound=NA ev100_source=recorded surface_search=not-run "
-          "surface_search_balance=NA$" },
+          "surface_search_balance=NA flavor=classic$" },
         // (b) no metadata: nothing to record, and the first conjunct is what failed
         { "tiny-no-metadata",
           "^has_ev100=0 ev100=NA daylight_gate=exposure post_walk_ran=0 post_walk_branch=none post_walk_recovery=NA "
           "display_meter_ran=0 playback_scale=NA ev100_bound=NA ev100_source=none surface_search=not-run "
-          "surface_search_balance=NA$" },
+          "surface_search_balance=NA flavor=classic$" },
         // (c) a flat-floor NIGHT verdict (ND filter: EV100 8.6 over the same flat floor): metadata present, gate exposure
         { "tiny-nd-filter",
           "^has_ev100=1 ev100=8\\.\\d\\d\\d daylight_gate=exposure post_walk_ran=0 post_walk_branch=none "
           "post_walk_recovery=NA display_meter_ran=0 playback_scale=NA ev100_bound=NA ev100_source=recorded "
-          "surface_search=not-run surface_search_balance=NA$" },
+          "surface_search=not-run surface_search_balance=NA flavor=classic$" },
     };
     const size_t caseCount = sizeof( kIdentityCases ) / sizeof( kIdentityCases[0] );
     ASSERT_EQ( caseCount, sizeof( expected ) / sizeof( expected[0] ) );

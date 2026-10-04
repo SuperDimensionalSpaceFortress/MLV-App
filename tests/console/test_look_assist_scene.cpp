@@ -1773,7 +1773,7 @@ TEST(LookAssistScene, BothConsumersAppendTheDecisionFieldsAndChangeNothingElse)
         "analysis=raw scene=%1 median=%2 p05=%3 p95=%4 p99=%5 clip_low=%6 clip_high=%7 balance_samples=%8 preset_exp=%9 "
         "preset_contrast=%10 preset_pivot=%11 preset_shadows=%12 preset_highlights=%13 preset_vibrance=%14 "
         "preset_temp_delta=%15 preset_tint_delta=%16 final_temp=%17 final_tint=%18 thumb=%19x%20 downscale=%21 "
-        "color_thumb=%22x%23 color_downscale=%24 frame=%25 last_serial=%26 last_frame=%27 next_serial=%28 %29\")");
+        "color_thumb=%22x%23 color_downscale=%24 frame=%25 last_serial=%26 last_frame=%27 next_serial=%28 %29 flavor=%30\")");
     ASSERT_EQ( 1, window.count( guiPrefix ) );
     ASSERT_EQ( 1, window.count( QStringLiteral("lookAssistDecisionLogFields( stats, decisionTrace )") ) );
     const int guiResult = window.indexOf( QStringLiteral("QStringLiteral(\"look_assist.apply.result\")") );
@@ -1781,7 +1781,7 @@ TEST(LookAssistScene, BothConsumersAppendTheDecisionFieldsAndChangeNothingElse)
     ASSERT_TRUE( window.indexOf( QStringLiteral("lookAssistDecisionLogFields( stats, decisionTrace )"), guiResult ) > guiResult );
 
     // Headless: the "applied" line keeps its fields and gains the same shared fields at the end.
-    ASSERT_EQ( 1, applier.count( QStringLiteral("initialPatchBaseChroma=%37 initialPatchFinalChroma=%38 %39\\n\"") ) );
+    ASSERT_EQ( 1, applier.count( QStringLiteral("initialPatchBaseChroma=%37 initialPatchFinalChroma=%38 %39 flavor=%40\\n\"") ) );
     ASSERT_EQ( 1, applier.count( QStringLiteral("lookAssistDecisionLogFields( stats, decisionTrace )") ) );
     ASSERT_TRUE( applier.contains( QStringLiteral("decisionTrace.pictureEvidenceAsked = !masterScenePass;") ) );
     // The headless applier has no walk and no display meter: it must not claim either.

@@ -691,6 +691,17 @@ bool ReceiptApplier::applyHeadlessLookAssist(ReceiptSettings *receipt,
 
     applyHeadlessRawLevelsAutoFix( receipt, mlvObject, processingObject );
 
+    // The flavor: MLVAPP_LOOK_ASSIST_FLAVOR (runs) over the receipt's lookAssistFlavor element; neither = Classic.
+    // It shapes the sliders only: the scene verdict and the white-balance decision below are the same for both.
+    const LookAssistFlavorSelection flavorSelection = lookAssistSelectFlavor(
+        lookAssistFlavorEnvironmentValue(), receipt->lookAssistFlavor(), QString() );
+    const LookAssistFlavor flavor = flavorSelection.flavor;
+    if( flavorSelection.unknownValue && !masterScenePass )
+        BatchLogger::err( QStringLiteral(
+            "[BATCH] WARNING LOOK_ASSIST unknown flavor '%1' from %2; using classic\n" )
+            .arg( flavorSelection.rejectedValue )
+            .arg( flavorSelection.source ) );
+
     const int raw_w = mlvObject->RAWI.xRes;
     const int raw_h = mlvObject->RAWI.yRes;
     if( raw_w <= 0 || raw_h <= 0 )
@@ -811,7 +822,8 @@ bool ReceiptApplier::applyHeadlessLookAssist(ReceiptSettings *receipt,
         {
             // Daylight: judge colour at the exposure Look Assist is about to apply (the night
             // path keeps the receipt's current exposure, exactly as before).
-            const double presetStops = presetForLookAssistScene( scene, stats ).exposure / 100.0;
+            const double presetStops =
+                presetForLookAssistScene( scene, stats, nullptr, nullptr, flavor ).exposure / 100.0;
             renderedAtPresetExposure = processedThumbnailAtExposure(
                 mlvObject, frameIndex, colorDownscaleFactor, 1, presetStops, processedOut );
         }
@@ -837,7 +849,9 @@ bool ReceiptApplier::applyHeadlessLookAssist(ReceiptSettings *receipt,
     LookAssistPreset preset = presetForLookAssistScene(
         scene,
         stats,
-        useProcessedColorStats ? &processedColorStats : nullptr );
+        useProcessedColorStats ? &processedColorStats : nullptr,
+        nullptr,
+        flavor );
     const int baseTemperature = receipt->temperature() == -1
                               ? 6000
                               : qBound( 2000, receipt->temperature(), 10000 );
@@ -997,6 +1011,7 @@ bool ReceiptApplier::applyHeadlessLookAssist(ReceiptSettings *receipt,
     receipt->setVibrance( preset.vibrance );
     receipt->setShadows( preset.shadows );
     receipt->setHighlights( preset.highlights );
+    receipt->setLookAssistFlavor( lookAssistFlavorName( flavor ) );
     receipt->setLookAssistBaselineValid( true );
 
     processingSetWhiteBalance( processingObject, temperature, tint / 10.0 );
@@ -1004,7 +1019,7 @@ bool ReceiptApplier::applyHeadlessLookAssist(ReceiptSettings *receipt,
     resetMlvCachedFrame( mlvObject );
 
     BatchLogger::out( QStringLiteral(
-        "[BATCH] LOOK_ASSIST applied frame=%1 scene=%2 median=%3 p95=%4 p99=%5 exposure=%6 temperature=%7 tint=%8 autoWbValid=%9 autoWbSource=%10 autoWbDecision=%11 autoWbDamping=%12 autoWbCandidateTemp=%13 autoWbCandidateTint=%14 chromaSmoothAuto=%15 rawBlack=%16 rawWhite=%17 p05=%18 clipHigh=%19 balanceRGB=%20/%21/%22 balanceSamples=%23 patchValid=%24 patchLuma=%25 patchChroma=%26 patchBlueAmber=%27 patchGreenAxis=%28 refineRenders=%29 refineStartScore=%30 refineScore=%31 refineBlueAmber=%32 refineGreen=%33 masterScenePass=%34 initialPatchChecked=%35 initialPatchRefused=%36 initialPatchBaseChroma=%37 initialPatchFinalChroma=%38 %39\n" )
+        "[BATCH] LOOK_ASSIST applied frame=%1 scene=%2 median=%3 p95=%4 p99=%5 exposure=%6 temperature=%7 tint=%8 autoWbValid=%9 autoWbSource=%10 autoWbDecision=%11 autoWbDamping=%12 autoWbCandidateTemp=%13 autoWbCandidateTint=%14 chromaSmoothAuto=%15 rawBlack=%16 rawWhite=%17 p05=%18 clipHigh=%19 balanceRGB=%20/%21/%22 balanceSamples=%23 patchValid=%24 patchLuma=%25 patchChroma=%26 patchBlueAmber=%27 patchGreenAxis=%28 refineRenders=%29 refineStartScore=%30 refineScore=%31 refineBlueAmber=%32 refineGreen=%33 masterScenePass=%34 initialPatchChecked=%35 initialPatchRefused=%36 initialPatchBaseChroma=%37 initialPatchFinalChroma=%38 %39 flavor=%40\n" )
         .arg( frameIndex )
         .arg( lookAssistSceneName( scene ) )
         .arg( stats.median, 0, 'f', 2 )
@@ -1043,7 +1058,8 @@ bool ReceiptApplier::applyHeadlessLookAssist(ReceiptSettings *receipt,
         .arg( wb.initialPatchRefused ? QStringLiteral("true") : QStringLiteral("false") )
         .arg( wb.initialPatchBaseChroma, 0, 'f', 1 )
         .arg( wb.initialPatchFinalChroma, 0, 'f', 1 )
-        .arg( lookAssistDecisionLogFields( stats, decisionTrace ) ) );
+        .arg( lookAssistDecisionLogFields( stats, decisionTrace ) )
+        .arg( lookAssistFlavorName( flavor ) ) );
 
     return true;
 }

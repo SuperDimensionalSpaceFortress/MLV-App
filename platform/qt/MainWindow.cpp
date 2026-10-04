@@ -2166,6 +2166,8 @@ MainWindow::MainWindow(int &argc, char **argv, QWidget *parent) :
     QSurfaceFormat::setDefaultFormat(format);
 
     ui->setupUi(this);
+    ui->comboBoxLookAssistFlavor->setItemData( 0, lookAssistFlavorName( LookAssistFlavor::Classic ) );
+    ui->comboBoxLookAssistFlavor->setItemData( 1, lookAssistFlavorName( LookAssistFlavor::Cinematic ) );
 
     /* Wire the "Abort batch export" button in BatchPrompts QMessageBox */
     BatchPrompts::setAbortBatchCallback([this]{ exportAbort(); });
@@ -8301,7 +8303,8 @@ int MainWindow::runGuiPlaybackSmoke(const GuiPlaybackSmokeOptions & options)
         QSignalBlocker blocker( ui->checkBoxLookAssistEnable );
         ui->checkBoxLookAssistEnable->setChecked( false );
         m_lastLookAssistDiagnosticsValid = false;
-        m_lookAssistAppliedReceipt = nullptr;
+        m_lookAssistApplied.clear();
+        m_lookAssistFlavorOutcome.clear();
     };
 
     m_gpuPreviewProcessingBackendRequest = options.gpuPreviewProcessingBackend;
@@ -8676,7 +8679,8 @@ int MainWindow::runGuiPlaybackSmoke(const GuiPlaybackSmokeOptions & options)
             "does_mlv_always_use_amaze=%44 "
             "gpu16_preview_active=%45 "
             "playback_processing_reason=%46 "
-            "gpu_preview_processing_reject_reason=%47" )
+            "gpu_preview_processing_reject_reason=%47 "
+            "look_assist_flavor=%48" )
             .arg( bool01( ACTIVE_RECEIPT && ACTIVE_RECEIPT->lookAssistEnabled()
                           && ui->checkBoxLookAssistEnable->isChecked() ) )
             .arg( bool01( m_lastLookAssistDiagnosticsValid ) )
@@ -8734,7 +8738,11 @@ int MainWindow::runGuiPlaybackSmoke(const GuiPlaybackSmokeOptions & options)
             .arg( m_pMlvObject ? doesMlvAlwaysUseAmaze( m_pMlvObject ) : -1 )
             .arg( bool01( m_renderThreadUsing16BitPreview ) )
             .arg( m_lastQueuedPlaybackProcessingReason )
-            .arg( gpuPreviewProcessingRejectReason ) );
+            .arg( gpuPreviewProcessingRejectReason )
+            .arg( m_lastLookAssistDiagnosticsValid && !m_lastLookAssistSafetyFallback
+                  && !m_lookAssistFlavorOutcome.appliedName().isEmpty()
+                  ? m_lookAssistFlavorOutcome.appliedName()
+                  : QStringLiteral("none") ) );
 
     const int settleMs = qMax( 0, options.settleMs );
     const int settleCpuStableMs = qMax( 0, options.settleCpuStableMs );
@@ -11516,6 +11524,13 @@ void MainWindow::readSettings()
     if( set.value( "audioOutput", true ).toBool() ) ui->actionAudioOutput->setChecked( true );
     if( set.value( "zebras", false ).toBool() ) ui->actionShowZebras->setChecked( true );
     ui->actionFastOpen->setChecked( set.value( "fastOpen", true ).toBool() );
+    {
+        // Default Classic. A stored value this build does not know is Classic as well.
+        const QString storedFlavor = set.value( "lookAssistFlavor", QString( "classic" ) ).toString().trimmed().toLower();
+        const int storedFlavorIndex = ui->comboBoxLookAssistFlavor->findData( storedFlavor );
+        QSignalBlocker flavorBlocker( ui->comboBoxLookAssistFlavor );
+        ui->comboBoxLookAssistFlavor->setCurrentIndex( storedFlavorIndex >= 0 ? storedFlavorIndex : 0 );
+    }
     m_lastExportPath = set.value( "lastExportPath", QDir::homePath() ).toString();
     m_lastMlvOpenFileName = set.value( "lastMlvFileName", QDir::homePath() ).toString();
     m_lastSessionFileName = set.value( "lastSessionFileName", QDir::homePath() ).toString();
@@ -11621,6 +11636,7 @@ void MainWindow::writeSettings()
     set.setValue( "audioOutput", ui->actionAudioOutput->isChecked() );
     set.setValue( "zebras", ui->actionShowZebras->isChecked() );
     set.setValue( "fastOpen", ui->actionFastOpen->isChecked() );
+    set.setValue( "lookAssistFlavor", ui->comboBoxLookAssistFlavor->currentData().toString() );
     set.setValue( "lastExportPath", m_lastExportPath );
     set.setValue( "lastMlvFileName", m_lastMlvOpenFileName );
     set.setValue( "lastSessionFileName", m_lastSessionFileName );
@@ -14095,6 +14111,11 @@ void MainWindow::readXmlElementsFromFile(QXmlStreamReader *Rxml, ReceiptSettings
             receipt->setLookAssistEnabled( (bool)Rxml->readElementText().toInt() );
             Rxml->readNext();
         }
+        else if( Rxml->isStartElement() && Rxml->name() == QString( "lookAssistFlavor" ) )
+        {
+            receipt->setLookAssistFlavor( Rxml->readElementText().trimmed() );
+            Rxml->readNext();
+        }
         else if( Rxml->isStartElement() && Rxml->name() == QString( "lookAssistBaselineValid" ) )
         {
             receipt->setLookAssistBaselineValid( (bool)Rxml->readElementText().toInt() );
@@ -14366,6 +14387,10 @@ void MainWindow::writeXmlElementsToFile(QXmlStreamWriter *xmlWriter, ReceiptSett
     xmlWriter->writeTextElement( "grainLumaWeight",         QString( "%1" ).arg( receipt->grainLumaWeight() ) );
     xmlWriter->writeTextElement( "rawFixesEnabled",         QString( "%1" ).arg( receipt->rawFixesEnabled() ) );
     xmlWriter->writeTextElement( "lookAssistEnabled",       QString( "%1" ).arg( receipt->lookAssistEnabled() ) );
+    // Only a non-Classic flavor is recorded: a Classic receipt stays byte-identical to master's.
+    if( !receipt->lookAssistFlavor().isEmpty()
+     && receipt->lookAssistFlavor() != QLatin1String( "classic" ) )
+        xmlWriter->writeTextElement( "lookAssistFlavor",    receipt->lookAssistFlavor() );
     xmlWriter->writeTextElement( "lookAssistBaselineValid", QString( "%1" ).arg( receipt->lookAssistBaselineValid() ) );
     xmlWriter->writeTextElement( "lookAssistBaselineExposure", QString( "%1" ).arg( receipt->lookAssistBaselineExposure() ) );
     xmlWriter->writeTextElement( "lookAssistBaselineContrast", QString( "%1" ).arg( receipt->lookAssistBaselineContrast() ) );
@@ -15001,6 +15026,34 @@ void MainWindow::setSliders(ReceiptSettings *receipt, bool paste)
         QSignalBlocker lookAssistBlocker( ui->checkBoxLookAssistEnable );
         ui->checkBoxLookAssistEnable->setEnabled( m_fileLoaded );
         ui->checkBoxLookAssistEnable->setChecked( lookAssistEnabled );
+        {
+            // The receipt's element through the one shared rule: an unknown value is Classic plus a warning (never the
+            // selector's previous value, which could be Cinematic), and the receipt is corrected to what is applied.
+            LookAssistFlavorSelection receiptFlavor;
+            const QString receiptFlavorValue =
+                lookAssistSelectorValueForReceipt( receipt->lookAssistFlavor(), &receiptFlavor );
+            if( receiptFlavor.unknownValue )
+            {
+                if( m_lastWarnedLookAssistFlavorValue != receiptFlavor.rejectedValue )
+                {
+                    m_lastWarnedLookAssistFlavorValue = receiptFlavor.rejectedValue;
+                    logInteractionEvent(
+                        QStringLiteral("look_assist.flavor.unknown_value"),
+                        QStringLiteral("value=%1 source=%2 using=classic").arg( receiptFlavor.rejectedValue ).arg( receiptFlavor.source ) );
+                }
+            }
+            // Normalised either way ("Classic " -> "classic"), so the receipt only ever names a flavor that was applied.
+            if( !receiptFlavorValue.isEmpty() )
+                receipt->setLookAssistFlavor( receiptFlavorValue );
+            const int flavorIndex = receiptFlavorValue.isEmpty()
+                                  ? -1
+                                  : ui->comboBoxLookAssistFlavor->findData( receiptFlavorValue );
+            if( flavorIndex >= 0 )
+            {
+                QSignalBlocker flavorBlocker( ui->comboBoxLookAssistFlavor );
+                ui->comboBoxLookAssistFlavor->setCurrentIndex( flavorIndex );
+            }
+        }
         logInteractionEvent(
             QStringLiteral("look_assist.setSliders.begin"),
             QStringLiteral("enabled=%1 file_loaded=%2 baseline_valid=%3 receipt_exp=%4 receipt_contrast=%5 receipt_pivot=%6 receipt_temp=%7 receipt_tint=%8 raw_black=%9 raw_white=%10 frame=%11")
@@ -15038,10 +15091,10 @@ void MainWindow::setSliders(ReceiptSettings *receipt, bool paste)
             captureLookAssistBaseline( receipt );
 
         if( !deferLookAssistUntilBaselineFrame
-         && m_lookAssistAppliedReceipt != receipt )
+         && !m_lookAssistApplied.isApplied( receipt ) )
         {
             applyLookAssistToReceipt( receipt );
-            m_lookAssistAppliedReceipt = receipt;
+            m_lookAssistApplied.markApplied( receipt );
         }
         syncLookAssistDerivedUiToReceipt( receipt );
     }
@@ -15114,7 +15167,7 @@ void MainWindow::setSliders(ReceiptSettings *receipt, bool paste)
                 return;
             }
 
-            if( m_lookAssistAppliedReceipt == ACTIVE_RECEIPT )
+            if( m_lookAssistApplied.isApplied( ACTIVE_RECEIPT ) )
             {
                 // De-dupe: the auto-look analysis already ran for this clip this open.
                 logInteractionEvent(
@@ -15135,7 +15188,7 @@ void MainWindow::setSliders(ReceiptSettings *receipt, bool paste)
                  || !ACTIVE_RECEIPT
                  || ACTIVE_RECEIPT != activeReceiptAtLoad
                  || !ACTIVE_RECEIPT->lookAssistEnabled()
-                 || m_lookAssistAppliedReceipt == ACTIVE_RECEIPT )
+                 || m_lookAssistApplied.isApplied( ACTIVE_RECEIPT ) )
                 {
                     return;
                 }
@@ -15164,7 +15217,7 @@ void MainWindow::setSliders(ReceiptSettings *receipt, bool paste)
                     captureLookAssistBaseline( ACTIVE_RECEIPT );
 
                 applyLookAssistToReceipt( ACTIVE_RECEIPT, analysisFrame );
-                m_lookAssistAppliedReceipt = ACTIVE_RECEIPT;
+                m_lookAssistApplied.markApplied( ACTIVE_RECEIPT );
                 syncLookAssistDerivedUiToReceipt( ACTIVE_RECEIPT );
                 setReceipt( ACTIVE_RECEIPT );
                 requestFrameRefresh( true, "look-assist-baseline-frame-ready" );
@@ -15286,6 +15339,7 @@ struct LookAssistAsyncResult
 {
     // Preset to apply
     LookAssistPreset preset;
+    QString flavorName;  // the flavor the preset was made for; reported only if the apply lands
     int temperature = 0; // final clamped temperature (baseTemperature + preset.temperatureDelta)
     int tint        = 0; // final clamped tint
     // Auto-WB diagnostics
@@ -15650,6 +15704,8 @@ void MainWindow::applyLookAssistToReceipt( ReceiptSettings *receipt,
     // daylight class after the white balance (resolveLookAssistWindowLitInterior below).
     LookAssistScene scene = resolveLookAssistScene(
         &stats, s_lookAssistMasterScenePass ? LookAssistRenderFn() : LookAssistRenderFn( renderProcessed ) );
+    const LookAssistFlavor flavor = currentLookAssistFlavor();
+    m_lookAssistFlavorOutcome.begin();   // reported (telemetry, receipt) only once this analysis lands
     // Observation only: how the verdict and balance were reached, appended to look_assist.apply.result.
     LookAssistDecisionTrace decisionTrace;
     decisionTrace.pictureEvidenceAsked = !s_lookAssistMasterScenePass;
@@ -15683,7 +15739,7 @@ void MainWindow::applyLookAssistToReceipt( ReceiptSettings *receipt,
                 analysisFrame,
                 colorDownscaleFactor,
                 qMax( 1, mlvappEffectiveWorkerThreadCount() ),
-                presetForLookAssistScene( scene, stats ).exposure / 100.0,
+                presetForLookAssistScene( scene, stats, nullptr, nullptr, flavor ).exposure / 100.0,
                 reinterpret_cast<unsigned char *>( processedThumbnail.data() ) );
         }
         if( !renderedAtPresetExposure )
@@ -15861,6 +15917,7 @@ void MainWindow::applyLookAssistToReceipt( ReceiptSettings *receipt,
         LookAssistStats processedColorStatsCopy = processedColorStats;
         bool useProcessedColorStatsCopy = useProcessedColorStats;
         LookAssistScene sceneCopy = scene;
+        LookAssistFlavor flavorCopy = flavor;
         bool floorLiftedCopy = floorLiftedNightThumbnail;
         int widthCopy = width;
         int heightCopy = height;
@@ -15874,11 +15931,12 @@ void MainWindow::applyLookAssistToReceipt( ReceiptSettings *receipt,
 
         logInteractionEvent(
             QStringLiteral("look_assist.apply.async_dispatch"),
-            QStringLiteral("generation=%1 frame=%2 scene=%3 floor_lifted=%4")
+            QStringLiteral("generation=%1 frame=%2 scene=%3 floor_lifted=%4 flavor=%5")
                 .arg( dispatchGeneration )
                 .arg( analysisFrame )
                 .arg( lookAssistSceneName( scene ) )
-                .arg( bool01( floorLiftedNightThumbnail ) ) );
+                .arg( bool01( floorLiftedNightThumbnail ) )
+                .arg( lookAssistFlavorName( flavor ) ) );
 
         /* Round-4 debt block: every freeMlvObject path drains this counter
          * before freeing, so the detached worker can never read a freed
@@ -15895,6 +15953,7 @@ void MainWindow::applyLookAssistToReceipt( ReceiptSettings *receipt,
                      processedColorStatsCopy,
                      useProcessedColorStatsCopy,
                      sceneCopy,
+                     flavorCopy,
                      floorLiftedCopy,
                      widthCopy,
                      heightCopy,
@@ -15942,6 +16001,7 @@ void MainWindow::applyLookAssistToReceipt( ReceiptSettings *receipt,
             r.floorLifted          = floorLiftedCopy;
             r.useProcessedColorStats = useProcessedColorStatsCopy;
             r.scene                = lookAssistSceneName( sceneCopy );
+            r.flavorName           = lookAssistFlavorName( flavorCopy );
             r.width                = widthCopy;
             r.height               = heightCopy;
             r.downscaleFactor      = downscaleFactorCopy;
@@ -15962,7 +16022,8 @@ void MainWindow::applyLookAssistToReceipt( ReceiptSettings *receipt,
                         sceneCopy,
                         statsCopy,
                         useProcessedColorStatsCopy ? &processedColorStatsCopy : nullptr,
-                        displayStatsValidUi ? &displayStatsUi : nullptr );
+                        displayStatsValidUi ? &displayStatsUi : nullptr,
+                        flavorCopy );
 
             // Select thumbnail for WB patch search
             const unsigned char *autoWbThumbnail =
@@ -16142,16 +16203,13 @@ void MainWindow::applyLookAssistToReceipt( ReceiptSettings *receipt,
                      * blocking re-analysis for that receipt (the ~1/36
                      * "look assist never applied" race). Clear it and log so
                      * the next settle/frame-ready trigger re-dispatches. */
-                    if( m_lookAssistAppliedReceipt == receipt )
-                    {
-                        m_lookAssistAppliedReceipt = nullptr;
-                    }
+                    m_lookAssistApplied.clearIf( receipt );
                     logInteractionEvent(
                         QStringLiteral("look_assist.apply.async_dropped"),
                         QStringLiteral("generation=%1 current=%2 marker_cleared=%3")
                             .arg( dispatchGeneration )
                             .arg( m_lookAssistAsyncGeneration.load() )
-                            .arg( bool01( m_lookAssistAppliedReceipt == nullptr ) ) );
+                            .arg( bool01( m_lookAssistApplied.empty() ) ) );
                     return;
                 }
                 if( !m_fileLoaded || !m_pMlvObject )
@@ -16241,6 +16299,8 @@ void MainWindow::applyLookAssistToReceipt( ReceiptSettings *receipt,
                         r.chromaSmoothValue,
                         r.chromaSmoothAutoApplied );
                     m_lastLookAssistSafetyFallback = true;
+                    m_lookAssistFlavorOutcome.landed( activeReceipt, r.flavorName, true );
+                    activeReceipt->setLookAssistFlavor( m_lookAssistFlavorOutcome.receiptValue( activeReceipt, r.flavorName ) );
                     m_lastLookAssistExposure = activeReceipt->exposure();
                     m_lastLookAssistContrast = activeReceipt->contrast();
                     m_lastLookAssistPivot = activeReceipt->pivot();
@@ -16423,6 +16483,8 @@ void MainWindow::applyLookAssistToReceipt( ReceiptSettings *receipt,
                         r.chromaSmoothValue,
                         r.chromaSmoothAutoApplied );
                     m_lastLookAssistSafetyFallback = true;
+                    m_lookAssistFlavorOutcome.landed( activeReceipt, r.flavorName, true );
+                    activeReceipt->setLookAssistFlavor( m_lookAssistFlavorOutcome.receiptValue( activeReceipt, r.flavorName ) );
                     m_lastLookAssistExposure = activeReceipt->exposure();
                     m_lastLookAssistContrast = activeReceipt->contrast();
                     m_lastLookAssistPivot = activeReceipt->pivot();
@@ -16457,6 +16519,7 @@ void MainWindow::applyLookAssistToReceipt( ReceiptSettings *receipt,
                     return;
                 }
 
+                m_lookAssistFlavorOutcome.landed( activeReceipt, r.flavorName, false );
                 logInteractionEvent(
                     QStringLiteral("look_assist.apply.auto_wb_async_applied"),
                     QStringLiteral("generation=%1 valid=%2 source=%3 decision=%4 damping=%5 awb_temp=%6 awb_tint=%7 final_temp=%8 final_tint=%9 preset_exp=%10 frame=%11")
@@ -16484,11 +16547,18 @@ void MainWindow::applyLookAssistToReceipt( ReceiptSettings *receipt,
 
     const LookAssistStats &balanceStats =
         useProcessedColorStats ? processedColorStats : stats;
+    // The white-balance walk below RENDERS the picture through the live processing object, so whatever grade the
+    // sliders hold steers the temperature and tint it steps to. It therefore runs on the CLASSIC preset whatever the
+    // flavor, and the flavor's tone sliders are laid over the finished balance afterwards (lookAssistApplyFlavorDeltas,
+    // the same function the preset itself ends in): the balance is the Classic one by construction, here as headless.
+    const LookAssistFlavor flavorForTheWalk = LookAssistFlavor::Classic;
+    bool flavorLaidOver = false;
     LookAssistPreset preset = presetForLookAssistScene(
                 scene,
                 stats,
                 useProcessedColorStats ? &processedColorStats : nullptr,
-                displayStatsValidUi ? &displayStatsUi : nullptr );
+                displayStatsValidUi ? &displayStatsUi : nullptr,
+                flavorForTheWalk );
     const int baseTemperature = receipt->temperature() == -1
                               ? ui->horizontalSliderTemperature->value()
                               : receipt->temperature();
@@ -16980,6 +17050,28 @@ void MainWindow::applyLookAssistToReceipt( ReceiptSettings *receipt,
         }
         postTemperatureDelta = preset.temperatureDelta - initialTemperatureDelta;
         postTintDelta = preset.tintDelta - initialTintDelta;
+        if( flavor != LookAssistFlavor::Classic )
+        {
+            // The balance is final. Lay the flavor over it and measure the picture the user will actually see once,
+            // for the diagnostics and the safety guard only: no balance step follows this measurement.
+            lookAssistApplyFlavorDeltas( &preset, scene, flavor );
+            applyLookAssistValues();
+            flavorLaidOver = true;
+            const LookAssistStats walkPostColorStats = postColorStats;
+            const bool walkPostColorStatsValid = postColorStatsValid;
+            postColorStatsValid = analyzePostAppliedLook();
+            if( !postColorStatsValid && walkPostColorStatsValid )
+            {
+                postColorStats = walkPostColorStats;
+                postColorStatsValid = true;
+            }
+        }
+    }
+    if( flavor != LookAssistFlavor::Classic && !flavorLaidOver )
+    {
+        // No picture analysis to run (no processed colour): the same overlay, nothing to re-measure.
+        lookAssistApplyFlavorDeltas( &preset, scene, flavor );
+        applyLookAssistValues();
     }
 
     // [PICTURE-DUMP] env-gated, read-only evidence (MLVAPP_LOOK_ASSIST_PICTURE_DUMP=<dir>): the picture
@@ -17232,6 +17324,9 @@ void MainWindow::applyLookAssistToReceipt( ReceiptSettings *receipt,
                 .arg( m_lastLookAssistPostGreenArtifactMeanAxis, 0, 'f', 3 )
                 .arg( m_lastLookAssistPostVisibleGreenAxis, 0, 'f', 3 ) );
         m_lastLookAssistSafetyFallback = true;
+        // The baseline sliders are back: the receipt must not keep naming the selected (Cinematic) flavor over them.
+        m_lookAssistFlavorOutcome.landed( receipt, lookAssistFlavorName( flavor ), true );
+        receipt->setLookAssistFlavor( m_lookAssistFlavorOutcome.receiptValue( receipt, lookAssistFlavorName( flavor ) ) );
         m_lastLookAssistExposure = receipt->exposure();
         m_lastLookAssistContrast = receipt->contrast();
         m_lastLookAssistPivot = receipt->pivot();
@@ -17249,9 +17344,11 @@ void MainWindow::applyLookAssistToReceipt( ReceiptSettings *receipt,
         return;
     }
 
+    m_lookAssistFlavorOutcome.landed( receipt, lookAssistFlavorName( flavor ), false );
+    receipt->setLookAssistFlavor( lookAssistFlavorName( flavor ) );
     logInteractionEvent(
         QStringLiteral("look_assist.apply.result"),
-        QStringLiteral("analysis=raw scene=%1 median=%2 p05=%3 p95=%4 p99=%5 clip_low=%6 clip_high=%7 balance_samples=%8 preset_exp=%9 preset_contrast=%10 preset_pivot=%11 preset_shadows=%12 preset_highlights=%13 preset_vibrance=%14 preset_temp_delta=%15 preset_tint_delta=%16 final_temp=%17 final_tint=%18 thumb=%19x%20 downscale=%21 color_thumb=%22x%23 color_downscale=%24 frame=%25 last_serial=%26 last_frame=%27 next_serial=%28 %29")
+        QStringLiteral("analysis=raw scene=%1 median=%2 p05=%3 p95=%4 p99=%5 clip_low=%6 clip_high=%7 balance_samples=%8 preset_exp=%9 preset_contrast=%10 preset_pivot=%11 preset_shadows=%12 preset_highlights=%13 preset_vibrance=%14 preset_temp_delta=%15 preset_tint_delta=%16 final_temp=%17 final_tint=%18 thumb=%19x%20 downscale=%21 color_thumb=%22x%23 color_downscale=%24 frame=%25 last_serial=%26 last_frame=%27 next_serial=%28 %29 flavor=%30")
             .arg( m_lastLookAssistScene )
             .arg( stats.median, 0, 'f', 3 )
             .arg( stats.p05, 0, 'f', 3 )
@@ -17282,7 +17379,8 @@ void MainWindow::applyLookAssistToReceipt( ReceiptSettings *receipt,
                   ? static_cast<int>( m_lastPresentedRequestContext.frameNumber )
                   : -1 )
             .arg( static_cast<qulonglong>( m_nextRenderRequestSerial ) )
-            .arg( lookAssistDecisionLogFields( stats, decisionTrace ) ) );
+            .arg( lookAssistDecisionLogFields( stats, decisionTrace ) )
+            .arg( lookAssistFlavorName( flavor ) ) );
 }
 
 void MainWindow::syncLookAssistDerivedUiToReceipt( ReceiptSettings *receipt )
@@ -17384,6 +17482,11 @@ void MainWindow::setReceipt( ReceiptSettings *receipt )
 
     receipt->setRawFixesEnabled( ui->checkBoxRawFixEnable->isChecked() );
     receipt->setLookAssistEnabled( ui->checkBoxLookAssistEnable->isChecked() );
+    // The flavor APPLIED, not the one merely selected: after a safety fallback the sliders are the baseline's and the
+    // receipt must not name Cinematic over them. No recorded outcome for this clip (Look Assist off, analysis pending)
+    // keeps the selector's value, the clip's setting.
+    receipt->setLookAssistFlavor( m_lookAssistFlavorOutcome.receiptValue(
+        receipt, lookAssistFlavorName( currentLookAssistFlavor() ) ) );
     receipt->setVerticalStripes( toolButtonVerticalStripesCurrentIndex() );
     receipt->setFocusPixels( toolButtonFocusPixelsCurrentIndex() );
     receipt->setFpiMethod( toolButtonFocusPixelsIntMethodCurrentIndex() );
@@ -28169,6 +28272,37 @@ void MainWindow::on_checkBoxRawFixEnable_clicked(bool checked)
     applyEffectiveDualIsoPlaybackSettings();
 }
 
+// The flavor in force: MLVAPP_LOOK_ASSIST_FLAVOR (runs) over the combo box (the app setting). The scene verdict is
+// flavor-blind; the flavor only shapes the sliders. An unknown value is Classic and is warned about once per value.
+LookAssistFlavor MainWindow::currentLookAssistFlavor()
+{
+    const LookAssistFlavorSelection selection = lookAssistSelectFlavor(
+        lookAssistFlavorEnvironmentValue(), QString(), ui->comboBoxLookAssistFlavor->currentData().toString() );
+    if( selection.unknownValue && m_lastWarnedLookAssistFlavorValue != selection.rejectedValue )
+    {
+        m_lastWarnedLookAssistFlavorValue = selection.rejectedValue;
+        logInteractionEvent(
+            QStringLiteral("look_assist.flavor.unknown_value"),
+            QStringLiteral("value=%1 source=%2 using=classic").arg( selection.rejectedValue ).arg( selection.source ) );
+    }
+    return selection.flavor;
+}
+
+void MainWindow::on_comboBoxLookAssistFlavor_currentIndexChanged( int )
+{
+    if( !m_fileLoaded || !ACTIVE_RECEIPT ) return;
+    ACTIVE_RECEIPT->setLookAssistFlavor( lookAssistFlavorName( currentLookAssistFlavor() ) );
+    // A different grade over the same clip: the marker forgets it (otherwise the toggle's frame-ready step would
+    // dedup_skip the new analysis after the baseline is restored and leave the clip ungraded under a receipt that
+    // names the new flavor), then the same path as switching Look Assist on restores the baseline and analyses
+    // again. Nothing to do while Look Assist is off.
+    if( m_lookAssistApplied.flavorChanged( ACTIVE_RECEIPT, ui->checkBoxLookAssistEnable->isChecked() ) )
+    {
+        m_lookAssistFlavorOutcome.clear();   // nothing of the old grade is applied once the baseline is back
+        on_checkBoxLookAssistEnable_clicked( true );
+    }
+}
+
 void MainWindow::on_checkBoxLookAssistEnable_clicked( bool checked )
 {
     if( !m_fileLoaded || !ACTIVE_RECEIPT ) return;
@@ -28243,7 +28377,7 @@ void MainWindow::on_checkBoxLookAssistEnable_clicked( bool checked )
                 return;
             }
 
-            if( m_lookAssistAppliedReceipt == ACTIVE_RECEIPT )
+            if( m_lookAssistApplied.isApplied( ACTIVE_RECEIPT ) )
             {
                 logInteractionEvent(
                     QStringLiteral("look_assist.apply.dedup_skip"),
@@ -28276,7 +28410,7 @@ void MainWindow::on_checkBoxLookAssistEnable_clicked( bool checked )
                 captureLookAssistBaseline( ACTIVE_RECEIPT );
 
             applyLookAssistToReceipt( ACTIVE_RECEIPT, analysisFrame );
-            m_lookAssistAppliedReceipt = ACTIVE_RECEIPT;
+            m_lookAssistApplied.markApplied( ACTIVE_RECEIPT );
             syncLookAssistDerivedUiToReceipt( ACTIVE_RECEIPT );
             setReceipt( ACTIVE_RECEIPT );
             logInteractionEvent(
@@ -28338,8 +28472,8 @@ void MainWindow::on_checkBoxLookAssistEnable_clicked( bool checked )
     {
         restoreLookAssistBaseline( ACTIVE_RECEIPT );
         m_lastLookAssistDiagnosticsValid = false;
-        if( m_lookAssistAppliedReceipt == ACTIVE_RECEIPT )
-            m_lookAssistAppliedReceipt = nullptr;
+        m_lookAssistApplied.clearIf( ACTIVE_RECEIPT );
+        m_lookAssistFlavorOutcome.clear();   // the baseline is back: no grade, no fallback, only the selector's setting
     }
 
     setReceipt( ACTIVE_RECEIPT );
