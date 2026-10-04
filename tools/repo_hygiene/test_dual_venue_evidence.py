@@ -73,7 +73,7 @@ requires_windows_pwsh = unittest.skipIf(PWSH is None or sys.platform != "win32",
 FIXTURE_IDS = ("tiny_dual_iso", "large_dual_iso")
 OWNER_CLIP = "M16-1243"   # a consented clip ID (an id is not footage); the runner never sees a path
 # Every leg spec shipped under legs/ (DVE-SCALE2-LOOK-LEG-1 added the scale-2 look leg); the tracked-spec tests loop over all of them.
-SHIPPED_LEGS = ("legs/m16-1243-speed.json", "legs/m16-1243-look.json", "legs/m16-1243-look-scale2.json")
+SHIPPED_LEGS = ("legs/m16-1243-speed.json", "legs/m16-1243-look.json", "legs/m16-1243-look-scale2.json", "legs/m16-1243-look-cinematic.json")
 SHIPPED_LEGS_PS = ", ".join(f"'{rel}'" for rel in SHIPPED_LEGS)
 OTHER_CLIP = "Z99-9999"
 MLV_EXT = "." + "mlv"  # never spelled as one literal token (the NA-4 gate trips on fixture basenames)
@@ -3747,13 +3747,50 @@ class LegSpecSchemaTests(unittest.TestCase):
     def test_the_hand_listed_shipped_legs_are_exactly_the_legs_directory(self) -> None:
         self.assertEqual(sorted(SHIPPED_LEGS), sorted("legs/" + p.name for p in (DV / "legs").glob("*.json")), "SHIPPED_LEGS drifted from the legs/ directory")
 
-    def test_no_shipped_leg_asks_for_a_non_classic_flavor_whatever_its_file_name(self) -> None:
-        """The app has no reader of the flavor yet (LOOK-ASSIST-FLAVORS-1), so a spec labelled cinematic would render Classic under a cinematic label
-        (fable H1, sol hardening: the old check named one file). Every file in legs/ is checked, not one name."""
+    def test_every_non_classic_leg_gates_on_the_flavor_the_app_reports_having_applied(self) -> None:
+        """LOOK-ASSIST-FLAVORS-2 landed the flavor reader, so a cinematic leg may ship (VENUE-CINEMATIC-SPEC-1). What it may not do is PASS while the app
+        fell back to Classic (the app then reports `none` or `classic`): every non-classic look leg must carry `lookFlavorReported eq <its flavor>` in every
+        criteria list it has, and a classic or speed leg must not mention a non-classic flavor. Every file in legs/ is checked, not one name."""
+        flavored = 0
         for path in sorted((DV / "legs").glob("*.json")):
             spec = json.loads(path.read_text(encoding="utf-8"))
-            self.assertEqual((spec.get("look") or {}).get("lookFlavor", "classic"), "classic", f"{path.name} asks for a non-classic flavor the app cannot apply")
-            self.assertNotRegex(path.read_text(encoding="utf-8").lower(), r"cinematic", f"{path.name} mentions the cinematic flavor")
+            flavor = (spec.get("look") or {}).get("lookFlavor", "classic")
+            if flavor == "classic":
+                self.assertNotRegex(path.read_text(encoding="utf-8").lower(), r"cinematic", f"{path.name} is a classic/speed leg and mentions the cinematic flavor")
+                continue
+            flavored += 1
+            self.assertEqual(spec["legId"], f"m16-1243-look-{flavor}", path.name)
+            for role, per_backend in spec["criteria"].items():
+                self.assertTrue(per_backend, f"{path.name}: {role} has no criteria")
+                for backend, criteria in per_backend.items():
+                    self.assertIn({"metric": "lookFlavorReported", "op": "eq", "value": flavor}, criteria,
+                                  f"{path.name} {role}/{backend}: a {flavor} leg must gate on the applied flavor, or a fallback to Classic passes it")
+        self.assertGreaterEqual(flavored, 1, "the committed Cinematic look leg is missing")
+
+    def test_the_cinematic_look_leg_is_the_classic_leg_plus_the_flavor_and_the_applied_flavor_criterion(self) -> None:
+        load = lambda name: json.loads((DV / "legs" / f"{name}.json").read_text(encoding="utf-8"))
+        classic, cinematic = load("m16-1243-look"), load("m16-1243-look-cinematic")
+        self.jsonschema.validate(cinematic, self.schema)
+        self.assertEqual(cinematic["legId"], "m16-1243-look-cinematic")
+        self.assertEqual(cinematic["look"]["lookFlavor"], "cinematic")
+        self.assertEqual(sorted(cinematic["backends"]), ["cpu", "cuda"])
+        applied = {"metric": "lookFlavorReported", "op": "eq", "value": "cinematic"}
+        stripped = json.loads(json.dumps(cinematic))
+        for per_backend in stripped["criteria"].values():
+            for backend, criteria in per_backend.items():
+                self.assertEqual(criteria.count(applied), 1, backend)
+                criteria.remove(applied)
+        comparable = dict(stripped, legId=classic["legId"], look=dict(stripped["look"], lookFlavor="classic"))
+        self.assertEqual(comparable, classic, "the Cinematic leg is the Classic leg except legId, lookFlavor and the applied-flavor criterion")
+        self.assertNotIn(applied, [c for pb in classic["criteria"].values() for cl in pb.values() for c in cl], "the Classic leg must not gate on the cinematic flavor")
+
+    def test_the_applied_flavor_metric_the_cinematic_leg_gates_on_is_one_the_job_writes_and_the_app_withholds_on_a_fallback(self) -> None:
+        """`lookFlavorReported` is the job summary's copy of the app's visual_state look_assist_flavor, and the app reports `none` (never the requested
+        flavor) when the analysis fell back or its diagnostics are not valid; Get-DvVerbatimMetrics copies summary scalars verbatim into the receipt metrics."""
+        job = (ROOT / "tools" / "profiling" / "bachelor" / "playback-attr-3-cuda-job.ps1").read_text(encoding="utf-8")
+        self.assertIn("lookFlavorReported = $(if ($LookLeg) { $lfReported = try { [string]$resultJson.log.visualState.look_assist_flavor }", job)
+        window = (ROOT / "platform" / "qt" / "MainWindow.cpp").read_text(encoding="utf-8")
+        self.assertRegex(window, r"m_lastLookAssistDiagnosticsValid && !m_lastLookAssistSafetyFallback\s*&& !m_lookAssistFlavorOutcome\.appliedName\(\)\.isEmpty\(\)\s*\?\s*m_lookAssistFlavorOutcome\.appliedName\(\)\s*:\s*QStringLiteral\(\"none\"\)")
 
     def test_the_scale2_look_leg_differs_from_the_classic_leg_only_where_it_must(self) -> None:
         load = lambda name: json.loads((DV / "legs" / f"{name}.json").read_text(encoding="utf-8"))
@@ -3761,8 +3798,7 @@ class LegSpecSchemaTests(unittest.TestCase):
         for spec in (classic, scale2):
             self.jsonschema.validate(spec, self.schema)
         self.assertEqual(classic["look"]["lookFlavor"], "classic")
-        self.assertEqual(scale2["look"]["lookFlavor"], "classic", "no cinematic leg ships until the app can apply a flavor (LOOK-ASSIST-FLAVORS-1)")
-        self.assertFalse((DV / "legs" / "m16-1243-look-cinematic.json").exists(), "a cinematic spec would be labelled cinematic and render Classic")
+        self.assertEqual(scale2["look"]["lookFlavor"], "classic", "the scale-2 leg is a Classic leg; the Cinematic leg is m16-1243-look-cinematic")
         self.assertEqual(scale2["legId"], "m16-1243-look-scale2")
         self.assertEqual(scale2["scaleFactor"], 2)
         self.assertEqual(classic["scaleFactor"], 4)
