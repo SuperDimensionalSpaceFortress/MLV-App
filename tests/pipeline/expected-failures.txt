@@ -18,3 +18,9 @@
 # shadows/highlights blur pre-pass that ended the 16-bit/8-bit policy drift.)
 
 # --- [STALE?] dispatch/contract pins predating the 2026-06-10 baseline ---
+
+# --- [CARD] PLAYBACK-SEEK-RENDER-PARITY-1 (filed by CONTACT-SHEET-PLAYBACK-PARITY-1, 2026-10-03) ---
+# RED on purpose: the live DISPLAY shader (CUDA texture playback) has no creative-curve
+# stage, so it drops the receipt's dark/light S-curve the paused/seek engine render applies.
+# Prune this line when that card ports the stage and the test turns green.
+GpuPreviewProcessing.PlaybackSeekRenderParity1DisplayShaderMatchesEngineWithReceiptSCurve
