@@ -9,7 +9,9 @@
 
 #include <QString>
 
+#include <chrono>
 #include <cstdint>
+#include <thread>
 #include <vector>
 
 namespace
@@ -104,5 +106,45 @@ TEST(RawUint16PrefetchRing, ResetKeepsTheSlotTheWorkerIsDecoding)
 
     ASSERT_EQ( 0, getMlvRawFrameUint16( video, 3, frame.data() ) );
     ASSERT_TRUE( frame == reference );
+    mlvCancelPreviewPrefetch( video );
+}
+
+// PLAYBACK-DECODE-RENDER-OVERLAP-1: with two playback frames requested ahead, the render thread's decode worker asked
+// for the very frame the prefetch worker was decoding. Only READY slots hit, so it decoded that frame a second time
+// (~27 ms of duplicate LJ92 decode a frame on Bachelor). The reader now waits for the in-flight slot and copies it.
+TEST(RawUint16PrefetchRing, AReaderWaitsForTheFrameTheWorkerIsDecodingInsteadOfDecodingItAgain)
+{
+    MlvPipelineFixture fixture;
+    mlvObject_t *video = openLargeDualIsoWithPlainPrefetch( &fixture );
+    ASSERT_TRUE( video != nullptr );
+    ASSERT_EQ( 1, mlvRawUint16PrefetchAllowedForTesting( video ) );
+
+    const size_t words = static_cast<size_t>( fixture.width() ) * static_cast<size_t>( fixture.height() );
+    std::vector<uint16_t> reference( words );
+    std::vector<uint16_t> frame( words );
+    mlvCancelPreviewPrefetch( video );
+    ASSERT_EQ( 0, getMlvRawFrameUint16( video, 5, reference.data() ) );   // a fresh decode of frame 5
+    mlvCancelPreviewPrefetch( video );
+
+    mlvSetRawUint16PrefetchHoldBeforeDecodeForTesting( 1 );
+    ASSERT_EQ( 0, getMlvRawFrameUint16( video, 4, frame.data() ) );       // the worker claims frame 5 and parks
+    ASSERT_TRUE( holdWorkerOnItsClaimedSlot() );
+
+    std::vector<uint16_t> waited( words );
+    int readerResult = -1;
+    int readerHit = -1;
+    std::thread reader( [&]()
+    {
+        readerResult = getMlvRawFrameUint16( video, 5, waited.data() );
+        readerHit = getMlvLastRawUint16PrefetchHit();                       // thread-local: read on the reader
+    } );
+    std::this_thread::sleep_for( std::chrono::milliseconds( 40 ) );
+    mlvSetRawUint16PrefetchHoldBeforeDecodeForTesting( 0 );                 // the worker decodes frame 5
+    reader.join();
+
+    ASSERT_EQ( 0, readerResult );
+    ASSERT_EQ( 1, readerHit );               // served from the worker's slot, not decoded a second time
+    ASSERT_TRUE( waited == reference );      // and it is frame 5's own pixels
+    ASSERT_TRUE( mlvWaitForRawUint16PrefetchIdleForTesting( video, 10000 ) );
     mlvCancelPreviewPrefetch( video );
 }
