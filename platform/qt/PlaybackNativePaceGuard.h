@@ -55,6 +55,18 @@ inline int shapedTickTimeDiffMs( int elapsedMs, double framerate, bool predictiv
     return timeDiff;
 }
 
+/*! PLAYBACK-PACE-GUARD-THROUGHPUT-1: the rate \a frames ran at over the PACED part of a Play, from the first
+ *  present to \a elapsedMs (both measured from Play). The smoke's timeline_fps divides by the whole elapsed time,
+ *  so it also counts the wait for the first frame, which no pace governs: UM r5 (dd15567b) waited 3753 ms of a
+ *  28545 ms run, so 599 frames read 20.985 fps over the run but 24.16 after the first present (native 23.976).
+ *  0 when there is no paced interval (nothing presented, or nothing after it). */
+inline double fpsAfterFirstPresent( double frames, double elapsedMs, double firstPresentMs )
+{
+    const double pacedMs = elapsedMs - firstPresentMs;
+    if( !( firstPresentMs > 0.0 ) || !( pacedMs > 0.0 ) ) return 0.0;
+    return frames * 1000.0 / pacedMs;
+}
+
 class NativePaceGuard
 {
 public:

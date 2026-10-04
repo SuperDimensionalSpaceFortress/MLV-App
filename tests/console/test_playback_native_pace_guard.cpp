@@ -20,6 +20,7 @@
 
 #include <algorithm>
 #include <cmath>
+#include <vector>
 
 using playback_native_pace::NativePaceGuard;
 using playback_native_pace::kMaxCarryFrames;
@@ -340,6 +341,185 @@ TEST(PlaybackNativePaceLoop, ASlowRendererLoopsExactlyAsBefore)
     }
 }
 
+// ---- throughput, measured the way the GUI smoke measures it (PLAYBACK-PACE-GUARD-THROUGHPUT-1) ---------------
+//
+// UM r5 (dd15567b, CUDA, 23.976 clip) read timeline 20.985 / presented 17.516 fps; r2 (97e05ff3, before the
+// guard) read 31.562 on the same venue. The guard was not what slowed it. r5's log: Play 14:50:00.905, first
+// texture 14:50:04.562 (r2: 0.457 s), stop 14:50:29.450 at slider 599, so 599 frames in the 24.89 s after the
+// first frame = 24.07 fps, native. The whole-run figure also counts the 3.75 s wait for the first frame. Presented
+// fell because every frame cost more: render_work 16.38 ms (r2 8.35), llrawproc 21.41 (13.75), UI signal latency
+// 13.54 (7.54), avg present interval 49.68 ms > the 41.71 ms period, with host non-subject CPU at 100 % (r2 84 %).
+// A cycle that slow never meets the guard: it holds a renderer only while it is faster than native.
+
+namespace
+{
+
+struct SmokeRun
+{
+    double elapsedMs = 0.0;      // Play to stop (playback_smoke.summary elapsed_ms)
+    double firstPresentMs = -1.0; // first_present_ms
+    int presented = 0;
+    long timelineDelta = 0;      // the slider's advance (timeline_delta)
+    double timelineFps() const { return timelineDelta * 1000.0 / elapsedMs; }
+    double timelineFpsAfterFirstPresent() const
+    {
+        return playback_native_pace::fpsAfterFirstPresent( timelineDelta, elapsedMs, firstPresentMs );
+    }
+    double presentedFpsAfterFirstPresent() const
+    {
+        return playback_native_pace::fpsAfterFirstPresent( presented - 1, elapsedMs, firstPresentMs );
+    }
+};
+
+// One measured Play on the CUDA texture route (predictive early advance on every present). Play dispatches frame
+// 0's render, which takes firstRenderMs (r5: the CUDA backend's first use); every later render takes renderMs x
+// renderScale[i % n] from dispatch to frame-ready, and drawFrameReady runs uiMs after that (a queued signal:
+// m_frameStillDrawing stays set until it runs, so a poll in between only records a pending advance). Play stops
+// when the slider reaches requiredFrames - 1, as the smoke's source-frame oracle stops it.
+SmokeRun simulateSmokePlay( double renderMs, double uiMs, double firstRenderMs, bool dropFrame, bool guarded,
+                            const std::vector<double> & renderScale = { 1.0 }, int requiredFrames = 600 )
+{
+    NativePaceGuard guard;
+    SmokeRun run;
+    double position = 0.0;
+    long lastDrawn = 0;
+    double lastTime = 0.0;
+    bool drawing = true;               // frame 0's render, dispatched by Play
+    double presentAt = firstRenderMs + uiMs;
+    bool pending = true;
+    double nextPoll = 0.0;
+    size_t renders = 0;
+
+    const auto tick = [&]( double t, bool predictive )
+    {
+        if( drawing && !predictive )
+        {
+            pending = true;
+            return;
+        }
+        const bool hadPending = pending;
+        pending = false;
+        const int timeDiff = shapedTickTimeDiffMs( static_cast<int>( t - lastTime ), kNativeFps, predictive, true,
+                                                   hadPending );
+        if( dropFrame )
+        {
+            const double requested = kNativeFps * timeDiff / 1000.0;
+            position += guarded ? guard.grant( requested, t, kNativeFps ) : requested;
+        }
+        else if( !guarded || guard.grantWholeFrame( t, kNativeFps ) )
+        {
+            position += 1.0;
+        }
+        const long frame = static_cast<long>( std::floor( position + 1e-9 ) );
+        if( frame != lastDrawn )
+        {
+            lastDrawn = frame;
+            drawing = true;
+            presentAt = t + renderMs * renderScale[renders++ % renderScale.size()] + uiMs;
+        }
+        lastTime = t;
+    };
+
+    while( lastDrawn < requiredFrames - 1 )
+    {
+        const bool presentNext = drawing && presentAt <= nextPoll;
+        const double t = presentNext ? presentAt : nextPoll;
+        if( presentNext )
+        {
+            drawing = false;
+            if( ++run.presented == 1 ) run.firstPresentMs = t;
+            tick( t, true );
+        }
+        else
+        {
+            tick( t, false );
+            nextPoll += kPollMs;
+        }
+        run.elapsedMs = t;
+    }
+    run.timelineDelta = lastDrawn;
+    return run;
+}
+
+constexpr double kGateCeilingFps = kNativeFps * 1.02; // the venue gate: timeline <= native x 1.02 (24.455)
+
+} // namespace
+
+TEST(PlaybackNativePaceThroughput, AFastRendererReachesNativeAndPresentsEveryFrame)
+{
+    // render + UI latency under the 41.7 ms period: the guard paces the timeline to native, and every frame the
+    // timeline reaches is presented (no drop-frame skipping), in both modes
+    const double cases[][2] = { { 10.0, 0.0 }, { 10.0, 7.5 }, { 25.0, 0.0 }, { 25.06, 7.54 }, // r2's render + UI
+                                { 32.0, 0.0 }, { 32.0, 7.5 }, { 36.0, 0.0 } };
+    for( bool dropFrame : { true, false } )
+    {
+        for( const auto & c : cases )
+        {
+            const SmokeRun run = simulateSmokePlay( c[0], c[1], 500.0, dropFrame, true );
+            ASSERT_TRUE( run.timelineFpsAfterFirstPresent() >= 23.5 );
+            ASSERT_TRUE( run.timelineFpsAfterFirstPresent() <= kGateCeilingFps );
+            ASSERT_TRUE( run.presentedFpsAfterFirstPresent() >= 23.5 );
+            ASSERT_TRUE( run.timelineDelta - run.presented <= 1 );
+            // master, for contrast, ran the same renderer at its own rate
+            ASSERT_TRUE( simulateSmokePlay( c[0], c[1], 500.0, dropFrame, false ).timelineFpsAfterFirstPresent()
+                         > kGateCeilingFps );
+        }
+    }
+}
+
+TEST(PlaybackNativePaceThroughput, AJitteryFastRendererStillReachesNative)
+{
+    // a mean cycle under the period with a stall every fifth frame (25 x {0.6, 0.6, 0.6, 0.6, 2.6} + 7.5 ms: 22.5
+    // to 72.5 ms per frame): the carried frame repays a one-frame stall, so the timeline still reaches native
+    for( bool dropFrame : { true, false } )
+    {
+        const SmokeRun run = simulateSmokePlay( 25.0, 7.5, 500.0, dropFrame, true, { 0.6, 0.6, 0.6, 0.6, 2.6 } );
+        ASSERT_TRUE( run.timelineFpsAfterFirstPresent() >= 23.5 );
+        ASSERT_TRUE( run.timelineFpsAfterFirstPresent() <= kGateCeilingFps );
+    }
+}
+
+TEST(PlaybackNativePaceThroughput, TheR5TwentyOneIsTheWaitForTheFirstFrame)
+{
+    // the hub's model (a 32 ms renderer, the 8 ms poll) on dd15567b's guard reaches native once frames flow; given
+    // r5's 3.75 s first frame, the smoke's whole-run timeline_fps reads ~21 all the same
+    const SmokeRun run = simulateSmokePlay( 32.0, 7.5, 3745.0, true, true );
+    ASSERT_TRUE( run.timelineFps() > 20.5 && run.timelineFps() < 21.3 );
+    ASSERT_TRUE( run.timelineFpsAfterFirstPresent() >= 23.5 );
+    // r5's own summary line, through the pace_summary arithmetic
+    const double r5Elapsed = 28544.867, r5FirstPresent = 3752.904;
+    ASSERT_TRUE( std::fabs( 599.0 * 1000.0 / r5Elapsed - 20.985 ) < 0.001 );
+    const double r5Paced = playback_native_pace::fpsAfterFirstPresent( 599.0, r5Elapsed, r5FirstPresent );
+    ASSERT_TRUE( r5Paced > 24.15 && r5Paced < 24.17 );        // native, inside the 24.455 gate
+    ASSERT_TRUE( playback_native_pace::fpsAfterFirstPresent( 499.0, r5Elapsed, r5FirstPresent ) < 20.2 ); // 1000 / 49.68
+}
+
+TEST(PlaybackNativePaceThroughput, ASlowRendererIsTheSameWithOrWithoutTheGuard)
+{
+    // r5's cycle (render_total 41.37 + UI 13.54 ms) and slower: the guard never binds, master to the frame
+    const double cases[][2] = { { 41.37, 13.54 }, { 36.2, 13.54 }, { 45.0, 7.5 }, { 60.0, 0.0 } };
+    for( bool dropFrame : { true, false } )
+    {
+        for( const auto & c : cases )
+        {
+            const SmokeRun guarded = simulateSmokePlay( c[0], c[1], 3745.0, dropFrame, true );
+            const SmokeRun master = simulateSmokePlay( c[0], c[1], 3745.0, dropFrame, false );
+            ASSERT_EQ( master.presented, guarded.presented );
+            ASSERT_EQ( master.timelineDelta, guarded.timelineDelta );
+            ASSERT_TRUE( std::fabs( master.elapsedMs - guarded.elapsedMs ) < 1e-6 );
+            ASSERT_TRUE( guarded.presentedFpsAfterFirstPresent() < kNativeFps );
+        }
+    }
+}
+
+TEST(PlaybackNativePaceThroughput, FpsAfterFirstPresentNeedsAPacedInterval)
+{
+    ASSERT_TRUE( playback_native_pace::fpsAfterFirstPresent( 240.0, 11000.0, 1000.0 ) == 24.0 );
+    ASSERT_TRUE( playback_native_pace::fpsAfterFirstPresent( 240.0, 11000.0, 0.0 ) == 0.0 );    // nothing presented
+    ASSERT_TRUE( playback_native_pace::fpsAfterFirstPresent( 240.0, 1000.0, 1000.0 ) == 0.0 );  // no interval after it
+    ASSERT_TRUE( playback_native_pace::fpsAfterFirstPresent( 240.0, 900.0, 1000.0 ) == 0.0 );
+}
+
 // ---- wiring: MainWindow.cpp needs a full GUI build, so its source is read as text --------------------------
 
 namespace
@@ -406,4 +586,24 @@ TEST(PlaybackNativePaceWiring, EveryEngineAdvanceGoesThroughThePaceGuard)
                                         QStringLiteral("MainWindow::checkPlayableWindow("));
     ASSERT_FALSE(toggled.isEmpty());
     ASSERT_TRUE(toggled.contains(QStringLiteral("m_playbackPaceGuard.reset();")));
+}
+
+TEST(PlaybackNativePaceWiring, TheSmokeReportsThePacedRatesBesideTheWholeRun)
+{
+    const QString source = mainWindowSource();
+    const int summary = source.indexOf(QStringLiteral("\"playback_smoke.summary session=%1 reason=%2 elapsed_ms=%3 \""));
+    const int pace = source.indexOf(QStringLiteral(
+        "\"playback_smoke.pace_summary session=%1 first_present_ms=%2 paced_elapsed_ms=%3 \""));
+    const int gpu = source.indexOf(QStringLiteral("\"playback_smoke.gpu_summary session=%1 cpu_frames=%2 \""));
+    ASSERT_TRUE(summary >= 0);
+    ASSERT_TRUE(pace > summary);
+    ASSERT_TRUE(gpu > pace);
+    const QString line = source.mid(pace, gpu - pace);
+    ASSERT_TRUE(line.contains(QStringLiteral(
+        "\"timeline_fps_after_first_present=%4 presented_fps_after_first_present=%5 pace_fps=%6\" )")));
+    ASSERT_TRUE(line.contains(QStringLiteral(
+        "playback_native_pace::fpsAfterFirstPresent( timelineDeltaAbs, elapsedMs,")));
+    ASSERT_TRUE(line.contains(QStringLiteral(
+        "playback_native_pace::fpsAfterFirstPresent( qMax( 0, m_playbackSmokePresentedFrames - 1 ),")));
+    ASSERT_TRUE(line.contains(QStringLiteral(".arg( m_playPaceFps, 0, 'f', 3 );")));
 }

@@ -26754,6 +26754,21 @@ void MainWindow::finishPlaybackSmokeTelemetry( const char *reason )
                // ENFORCE-4 r2: binds this receipt to the invocation that wrote it (see automationRunNonce()).
                .arg( automationRunNonce() );
 
+    // PLAYBACK-PACE-GUARD-THROUGHPUT-1: timeline_fps above counts the wait for the first frame as playback, so a
+    // slow first present (UM r5: 3753 ms) reads as a pace below native. These are the rates the pace governs.
+    qInfo().noquote()
+        << QStringLiteral(
+               "playback_smoke.pace_summary session=%1 first_present_ms=%2 paced_elapsed_ms=%3 "
+               "timeline_fps_after_first_present=%4 presented_fps_after_first_present=%5 pace_fps=%6" )
+               .arg( static_cast<qulonglong>( m_playbackSmokeSessionId ) )
+               .arg( m_playbackSmokeFirstPresentMs, 0, 'f', 3 )
+               .arg( m_playbackSmokeFirstPresentMs > 0.0 ? elapsedMs - m_playbackSmokeFirstPresentMs : 0.0, 0, 'f', 3 )
+               .arg( playback_native_pace::fpsAfterFirstPresent( timelineDeltaAbs, elapsedMs,
+                                                                 m_playbackSmokeFirstPresentMs ), 0, 'f', 3 )
+               .arg( playback_native_pace::fpsAfterFirstPresent( qMax( 0, m_playbackSmokePresentedFrames - 1 ),
+                                                                 elapsedMs, m_playbackSmokeFirstPresentMs ), 0, 'f', 3 )
+               .arg( m_playPaceFps, 0, 'f', 3 );
+
     qInfo().noquote()
         << QStringLiteral(
                "playback_smoke.gpu_summary session=%1 cpu_frames=%2 "
