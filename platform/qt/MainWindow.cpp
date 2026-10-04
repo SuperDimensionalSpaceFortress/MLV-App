@@ -26839,7 +26839,8 @@ void MainWindow::finishPlaybackSmokeTelemetry( const char *reason )
                    "lookahead_covered_requests=%6 upstream_starts=%7 upstream_starts_overlapped=%8 "
                    "upstream_engagement=%9 render_starts=%10 render_starts_with_upstream_in_flight=%11 "
                    "upstream_busy_ms=%12 render_busy_ms=%13 overlap_ms=%14 "
-                   "overlap_fraction_of_render=%15 window_ms=%16" )
+                   "overlap_fraction_of_render=%15 window_ms=%16 decode_busy_ms=%17 recon_busy_ms=%18 "
+                   "recon_starts_held_for_render=%19" )
                    .arg( static_cast<qulonglong>( m_playbackSmokeSessionId ) )
                    .arg( playbackRenderLookaheadFrames() )
                    .arg( mlvappPlaybackRenderLookaheadEnvFrames() )
@@ -26855,7 +26856,10 @@ void MainWindow::finishPlaybackSmokeTelemetry( const char *reason )
                    .arg( overlap.renderBusyMs, 0, 'f', 3 )
                    .arg( overlap.overlapMs, 0, 'f', 3 )
                    .arg( overlap.overlapFractionOfRender(), 0, 'f', 4 )
-                   .arg( overlap.windowMs, 0, 'f', 3 );
+                   .arg( overlap.windowMs, 0, 'f', 3 )
+                   .arg( overlap.decodeBusyMs, 0, 'f', 3 )
+                   .arg( overlap.reconBusyMs, 0, 'f', 3 )
+                   .arg( static_cast<qulonglong>( overlap.reconStartsHeldForRender ) );
     }
 
     if( perfFieldLogEnabled() )

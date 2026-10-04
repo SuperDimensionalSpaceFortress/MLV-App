@@ -74,6 +74,25 @@ inline bool blocksPlaybackAdvance( const WorkItem &item,
     return item.frameNumber == activeTarget;
 }
 
+/*! RenderFrameThread's two upstream workers. */
+enum class UpstreamStage
+{
+    Decode,
+    Recon
+};
+
+/*! The exclusive recon start (default on; MLVAPP_PLAYBACK_OVERLAP_RECON_EXCLUSIVE=0 turns it
+ *  off). With two frames in flight the recon worker's CPU dual-ISO and the render thread's S/H
+ *  both run OpenMP teams across every core; running them at once slowed both (Bachelor, e9df0821:
+ *  upstream ~30 -> ~38-43 ms a frame, render 11 -> 13-14 ms), so the overlap bought little. A recon
+ *  may therefore start only when the render thread has nothing to render. Decode, the GUI hop and the
+ *  present still overlap freely, and the period becomes recon + render instead of the serial
+ *  decode + recon + render + hop. */
+inline bool reconMayStart( bool exclusive, bool renderInFlight, bool renderWorkPending )
+{
+    return !exclusive || ( !renderInFlight && !renderWorkPending );
+}
+
 struct OverlapSnapshot
 {
     uint64_t upstreamStarts = 0;           //!< decode + recon worker starts
@@ -81,6 +100,9 @@ struct OverlapSnapshot
     uint64_t renderStarts = 0;
     uint64_t renderStartsWithUpstreamInFlight = 0; //!< renders that began with another frame's decode/recon in flight
     double upstreamBusyMs = 0.0;           //!< wall time with at least one decode or recon worker busy
+    double decodeBusyMs = 0.0;             //!< wall time with the decode worker busy
+    double reconBusyMs = 0.0;              //!< wall time with the recon worker busy
+    uint64_t reconStartsHeldForRender = 0; //!< recon starts the exclusive gate delayed behind a render
     double renderBusyMs = 0.0;             //!< wall time with the render thread busy
     double overlapMs = 0.0;                //!< wall time with both busy at once
     double windowMs = 0.0;                 //!< wall time since reset
@@ -109,28 +131,40 @@ public:
         std::lock_guard<std::mutex> lock( m_mutex );
         m_snapshot = OverlapSnapshot();
         m_upstreamActive = 0;
+        m_decodeActive = 0;
+        m_reconActive = 0;
         m_renderActive = 0;
         m_resetMs = nowMs;
         m_lastMs = nowMs;
         m_armed = true;
     }
 
-    void upstreamBegin( double nowMs, bool downstreamFrameInFlight )
+    void upstreamBegin( double nowMs, bool downstreamFrameInFlight,
+                        UpstreamStage stage = UpstreamStage::Recon )
     {
         std::lock_guard<std::mutex> lock( m_mutex );
         if( !m_armed ) return;
         advanceLocked( nowMs );
         ++m_upstreamActive;
+        ++( stage == UpstreamStage::Decode ? m_decodeActive : m_reconActive );
         ++m_snapshot.upstreamStarts;
         if( downstreamFrameInFlight ) ++m_snapshot.upstreamStartsOverlapped;
     }
 
-    void upstreamEnd( double nowMs )
+    void upstreamEnd( double nowMs, UpstreamStage stage = UpstreamStage::Recon )
     {
         std::lock_guard<std::mutex> lock( m_mutex );
         if( !m_armed ) return;
         advanceLocked( nowMs );
         if( m_upstreamActive > 0 ) --m_upstreamActive;
+        int &active = stage == UpstreamStage::Decode ? m_decodeActive : m_reconActive;
+        if( active > 0 ) --active;
+    }
+
+    void noteReconHeldForRender()
+    {
+        std::lock_guard<std::mutex> lock( m_mutex );
+        if( m_armed ) ++m_snapshot.reconStartsHeldForRender;
     }
 
     void renderBegin( double nowMs, bool upstreamWorkInFlight )
@@ -164,6 +198,8 @@ private:
         if( nowMs <= m_lastMs ) return;
         const double dt = nowMs - m_lastMs;
         if( m_upstreamActive > 0 ) m_snapshot.upstreamBusyMs += dt;
+        if( m_decodeActive > 0 ) m_snapshot.decodeBusyMs += dt;
+        if( m_reconActive > 0 ) m_snapshot.reconBusyMs += dt;
         if( m_renderActive > 0 ) m_snapshot.renderBusyMs += dt;
         if( m_upstreamActive > 0 && m_renderActive > 0 ) m_snapshot.overlapMs += dt;
         m_lastMs = nowMs;
@@ -173,6 +209,8 @@ private:
     std::mutex m_mutex;
     OverlapSnapshot m_snapshot;
     int m_upstreamActive = 0;
+    int m_decodeActive = 0;
+    int m_reconActive = 0;
     int m_renderActive = 0;
     double m_resetMs = 0.0;
     double m_lastMs = 0.0;

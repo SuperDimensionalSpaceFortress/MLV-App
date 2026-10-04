@@ -68,9 +68,10 @@ struct PipelineRun
     }
 };
 
-// Every-frame mode (grantWholeFrame), Loop off, wallMs of playback.
+// Every-frame mode (grantWholeFrame), Loop off, wallMs of playback. While the upstream and the render run at once each
+// progresses at 1/contention of its speed (both are OpenMP teams over every core); exclusiveRecon is reconMayStart().
 PipelineRun simulatePipeline( int lookaheadDepth, Gate gate, double upstreamMs, double renderMs, double hopMs,
-                              double wallMs = 25000.0 )
+                              double contention = 1.0, bool exclusiveRecon = false, double wallMs = 25000.0 )
 {
     PipelineRun run;
     NativePaceGuard guard;
@@ -82,8 +83,8 @@ PipelineRun simulatePipeline( int lookaheadDepth, Gate gate, double upstreamMs, 
     std::deque<int> renderQueue;
     int upstreamBusy = -1;
     int renderBusy = -1;
-    double upstreamEnd = 0.0;
-    double renderEnd = 0.0;
+    double upstreamLeft = 0.0;          // uncontended work left, ms
+    double renderLeft = 0.0;
 
     int target = -1;                    // the frame the GUI asked for
     int lastPresented = -1;
@@ -138,24 +139,28 @@ PipelineRun simulatePipeline( int lookaheadDepth, Gate gate, double upstreamMs, 
 
     for( double now = 0.0; now <= wallMs; now += kStepMs )
     {
+        const double rate = ( upstreamBusy >= 0 && renderBusy >= 0 ) ? 1.0 / contention : 1.0;
+        if( upstreamBusy >= 0 ) upstreamLeft -= kStepMs * rate;
+        if( renderBusy >= 0 ) renderLeft -= kStepMs * rate;
         // Upstream worker (decode + dual-ISO), one frame at a time, in request order.
-        if( upstreamBusy >= 0 && now >= upstreamEnd )
+        if( upstreamBusy >= 0 && upstreamLeft <= 1e-9 )
         {
             frames[upstreamBusy].stage = 2;
             renderQueue.push_back( upstreamBusy );
             upstreamBusy = -1;
             meter.upstreamEnd( now );
         }
-        if( upstreamBusy < 0 && !upstreamQueue.empty() )
+        if( upstreamBusy < 0 && !upstreamQueue.empty()
+         && playback_overlap::reconMayStart( exclusiveRecon, renderBusy >= 0, !renderQueue.empty() ) )
         {
             upstreamBusy = upstreamQueue.front();
             upstreamQueue.pop_front();
             frames[upstreamBusy].stage = 1;
-            upstreamEnd = now + upstreamMs;
+            upstreamLeft = upstreamMs;
             meter.upstreamBegin( now, renderBusy >= 0 || presentScheduled );
         }
         // Render thread.
-        if( renderBusy >= 0 && now >= renderEnd )
+        if( renderBusy >= 0 && renderLeft <= 1e-9 )
         {
             frames[renderBusy].stage = 4;
             frames[renderBusy].doneMs = now;
@@ -178,7 +183,7 @@ PipelineRun simulatePipeline( int lookaheadDepth, Gate gate, double upstreamMs, 
             renderBusy = renderQueue.front();
             renderQueue.pop_front();
             frames[renderBusy].stage = 3;
-            renderEnd = now + renderMs;
+            renderLeft = renderMs;
             meter.renderBegin( now, upstreamBusy >= 0 || !upstreamQueue.empty() );
         }
         int inFlight = 0;
@@ -248,6 +253,31 @@ TEST(PlaybackDecodeRenderOverlapPolicy, OnlySpeculativeWorkForAnotherFrameRunsBe
     ASSERT_TRUE( blocksPlaybackAdvance( item, -1, 7 ) );  // no target: keep the old behaviour
 }
 
+TEST(PlaybackDecodeRenderOverlapPolicy, AReconStartsOnlyWhenTheRenderThreadHasNothingToRender)
+{
+    ASSERT_TRUE( playback_overlap::reconMayStart( true, false, false ) );
+    ASSERT_FALSE( playback_overlap::reconMayStart( true, true, false ) );  // a render is running
+    ASSERT_FALSE( playback_overlap::reconMayStart( true, false, true ) );  // a reconned frame waits to render
+    ASSERT_TRUE( playback_overlap::reconMayStart( false, true, true ) );   // MLVAPP_PLAYBACK_OVERLAP_RECON_EXCLUSIVE=0
+}
+
+TEST(PlaybackDecodeRenderOverlapMeter, DecodeAndReconBusyAreSplitOut)
+{
+    OverlapMeter meter;
+    meter.reset( 0.0 );
+    meter.upstreamBegin( 0.0, false, playback_overlap::UpstreamStage::Decode );
+    meter.upstreamEnd( 4.0, playback_overlap::UpstreamStage::Decode );
+    meter.upstreamBegin( 4.0, false, playback_overlap::UpstreamStage::Recon );
+    meter.upstreamBegin( 10.0, false, playback_overlap::UpstreamStage::Decode ); // next frame decodes under the recon
+    meter.upstreamEnd( 14.0, playback_overlap::UpstreamStage::Decode );
+    meter.upstreamEnd( 34.0, playback_overlap::UpstreamStage::Recon );
+    meter.noteReconHeldForRender();
+    const OverlapSnapshot s = meter.snapshot( 34.0 );
+    ASSERT_NEAR( s.decodeBusyMs, 8.0, 1e-9 );
+    ASSERT_NEAR( s.reconBusyMs, 30.0, 1e-9 );
+    ASSERT_NEAR( s.upstreamBusyMs, 34.0, 1e-9 ); // the union, not the sum
+    ASSERT_EQ( s.reconStartsHeldForRender, 1u );
+}
 TEST(PlaybackDecodeRenderOverlapMeter, SerialStagesReportNoOverlap)
 {
     OverlapMeter meter;
@@ -338,6 +368,20 @@ TEST(PlaybackDecodeRenderOverlapPipeline, ASlowUpstreamIsBoundByItsOwnStageNotTh
     ASSERT_NEAR( serial.overlap.overlapFractionOfRender(), 0.0, 1e-9 );
 }
 
+TEST(PlaybackDecodeRenderOverlapPipeline, TheExclusiveReconStartRemovesContentionAndKeepsNativeInOrder)
+{
+    // Two OpenMP teams at once each run at 1/1.6 speed. The exclusive start never runs them together, so the stages
+    // keep their own costs, frames stay in order and the timeline holds native; without it the render runs contended.
+    const PipelineRun freeOverlap = simulatePipeline( 2, Gate::ExceptLookahead, 30.0, 11.0, 6.0, 1.6, false );
+    const PipelineRun exclusive = simulatePipeline( 2, Gate::ExceptLookahead, 30.0, 11.0, 6.0, 1.6, true );
+    ASSERT_TRUE( exclusive.inOrder );
+    ASSERT_TRUE( exclusive.maxInFlight >= 2 );
+    ASSERT_NEAR( exclusive.overlap.overlapFractionOfRender(), 0.0, 1e-9 );
+    ASSERT_TRUE( freeOverlap.overlap.overlapFractionOfRender() > 0.1 );
+    ASSERT_TRUE( exclusive.overlap.renderBusyMs < freeOverlap.overlap.renderBusyMs );
+    ASSERT_TRUE( exclusive.presentedFpsAfterFirst() > 23.8 );
+    ASSERT_TRUE( exclusive.presentedFpsAfterFirst() <= kNativeFps + 0.05 );
+}
 // ---- wiring: MainWindow.cpp needs a full GUI build, so its source is read as text --------------------------
 namespace
 {
@@ -376,5 +420,9 @@ TEST(PlaybackDecodeRenderOverlapWiring, TheRenderThreadReportsEveryStageToTheMet
     ASSERT_EQ( rft.count( QStringLiteral("m_overlapMeter.upstreamEnd(") ), 2 );   // decode and recon done
     ASSERT_EQ( rft.count( QStringLiteral("m_overlapMeter.renderBegin(") ), 1 );
     ASSERT_EQ( rft.count( QStringLiteral("m_overlapMeter.renderEnd(") ), 1 );
+    ASSERT_EQ( rft.count( QStringLiteral("playback_overlap::UpstreamStage::Decode") ), 2 );
+    ASSERT_EQ( rft.count( QStringLiteral("playback_overlap::UpstreamStage::Recon") ), 2 );
+    ASSERT_TRUE( rft.contains( QStringLiteral("playback_overlap::reconMayStart(") ) );
+    ASSERT_TRUE( rft.contains( QStringLiteral("m_reconWaitCondition.wakeAll();\n        m_mutex.unlock();\n        emit frameReady();") ) );
     ASSERT_TRUE( rft.contains( QStringLiteral("playback_overlap::blocksPlaybackAdvance(") ) );
 }

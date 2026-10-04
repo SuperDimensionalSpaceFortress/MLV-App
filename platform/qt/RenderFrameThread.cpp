@@ -74,6 +74,21 @@ bool gpuTexNrOverlapTraceEnabled()
         && value != QByteArrayLiteral("no");
 }
 
+/* PLAYBACK-DECODE-RENDER-OVERLAP-1: playback_overlap::reconMayStart(). On unless
+ * MLVAPP_PLAYBACK_OVERLAP_RECON_EXCLUSIVE is 0/false/off/no. */
+bool playbackOverlapReconExclusiveEnabled()
+{
+    static const bool enabled = []() {
+        const QByteArray value =
+            qgetenv( "MLVAPP_PLAYBACK_OVERLAP_RECON_EXCLUSIVE" ).trimmed().toLower();
+        return !( value == QByteArrayLiteral("0")
+               || value == QByteArrayLiteral("false")
+               || value == QByteArrayLiteral("off")
+               || value == QByteArrayLiteral("no") );
+    }();
+    return enabled;
+}
+
 QString phase4bPathLabel( int path )
 {
     /* Phase A2 (image-pipeline-hardening): injective over ALL render-path
@@ -1977,7 +1992,8 @@ bool RenderFrameThread::takeDecodeRequestForWorker( DecodeQueueEntry *entry )
     if( entry ) *entry = m_decodeRequests.front();
     m_decodeRequests.pop_front();
     m_overlapMeter.upstreamBegin( mlv_stage_timing_now() * 1000.0,
-                                  downstreamFrameInFlightLocked( takenSlotIndex ) );
+                                  downstreamFrameInFlightLocked( takenSlotIndex ),
+                                  playback_overlap::UpstreamStage::Decode );
     return true;
 }
 
@@ -2065,7 +2081,8 @@ void RenderFrameThread::decodeFrameForWorker( const DecodeQueueEntry &entry )
 void RenderFrameThread::signalDecodeDoneFromWorker( int slotIndex )
 {
     QMutexLocker locker( &m_mutex );
-    m_overlapMeter.upstreamEnd( mlv_stage_timing_now() * 1000.0 );
+    m_overlapMeter.upstreamEnd( mlv_stage_timing_now() * 1000.0,
+                                playback_overlap::UpstreamStage::Decode );
     if( !m_stop && slotIndex >= 0 )
     {
         if( playbackSmokeTimelineTelemetryEnabled() )
@@ -2091,8 +2108,15 @@ void RenderFrameThread::signalDecodeDoneFromWorker( int slotIndex )
 bool RenderFrameThread::takeReconRequestForWorker( ReconQueueEntry *entry )
 {
     QMutexLocker locker( &m_mutex );
-    while( !m_reconWorkerStop && !m_stop && m_reconRequests.empty() )
+    const bool exclusive = playbackOverlapReconExclusiveEnabled();
+    bool heldForRender = false;
+    while( !m_reconWorkerStop && !m_stop
+        && ( m_reconRequests.empty()
+          || !playback_overlap::reconMayStart( exclusive,
+                                               m_renderingFrame,
+                                               !m_processReadySlots.empty() ) ) )
     {
+        if( !m_reconRequests.empty() ) heldForRender = true;
         m_reconWaitCondition.wait( &m_mutex );
     }
     if( m_reconWorkerStop || m_stop ) return false;
@@ -2100,8 +2124,10 @@ bool RenderFrameThread::takeReconRequestForWorker( ReconQueueEntry *entry )
     const int takenSlotIndex = m_reconRequests.front().slotIndex;
     if( entry ) *entry = m_reconRequests.front();
     m_reconRequests.pop_front();
+    if( heldForRender ) m_overlapMeter.noteReconHeldForRender();
     m_overlapMeter.upstreamBegin( mlv_stage_timing_now() * 1000.0,
-                                  downstreamFrameInFlightLocked( takenSlotIndex ) );
+                                  downstreamFrameInFlightLocked( takenSlotIndex ),
+                                  playback_overlap::UpstreamStage::Recon );
     return true;
 }
 
@@ -2509,7 +2535,8 @@ void RenderFrameThread::reconFrameForWorker( const ReconQueueEntry &entry,
 void RenderFrameThread::signalReconDoneFromWorker( int slotIndex )
 {
     QMutexLocker locker( &m_mutex );
-    m_overlapMeter.upstreamEnd( mlv_stage_timing_now() * 1000.0 );
+    m_overlapMeter.upstreamEnd( mlv_stage_timing_now() * 1000.0,
+                                playback_overlap::UpstreamStage::Recon );
     if( !m_stop && slotIndex >= 0 )
     {
         if( playbackSmokeTimelineTelemetryEnabled() )
@@ -2963,6 +2990,8 @@ void RenderFrameThread::runPhase3( void )
                                  "phase3-decoded" );
         }
         publishRenderedSlot( slotIndex, request, activePhase3Mode );
+        // The exclusive recon start (playback_overlap::reconMayStart) waits for the render to finish.
+        m_reconWaitCondition.wakeAll();
         m_mutex.unlock();
         emit frameReady();
         m_mutex.lock();
