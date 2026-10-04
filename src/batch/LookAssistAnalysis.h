@@ -544,6 +544,17 @@ struct LookAssistWindowLitCheck
     double displaySurfaceBlueAmber = 0.0;
     double displaySurfaceGreen = 0.0;
     LookAssistSurfaceSearch displaySearch;
+    // Round 2 (LOOK-ASSIST-M16-CAST-1): why the display search's balance was or was not applied. The surface is first
+    // qualified at the display's levels at the receipt's base (displayBase*: its cast must be a daylight light's), and a
+    // converged balance must not worsen the room: the median cast of the near-neutral area darker than the surface, at
+    // the display's levels, at the clip-level balance (displayRoomCastBefore) and at the found one (displayRoomCastAfter).
+    // displayDecision: not-run | neutral | unqualified-at-base | not-converged | no-room-evidence | room-worsened | applied
+    QString displayDecision = QStringLiteral("not-run");
+    double displayBaseBlueAmber = 0.0;
+    double displayBaseGreen = 0.0;
+    int displayRoomSamples = 0;
+    double displayRoomCastBefore = 0.0;
+    double displayRoomCastAfter = 0.0;
     int appliedTemperature = 0;       // the balance the evidence applies (0 without evidence)
     int appliedTint = 0;
 };

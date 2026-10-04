@@ -1100,7 +1100,8 @@ bool ReceiptApplier::applyHeadlessLookAssist(ReceiptSettings *receipt,
             "lensApertureX100=%11 applied=%12 exposureBound=%13 recoveryIso=%14 surfaceSearch=%15 searchRenders=%16 "
             "searchBalance=%17/%18 appliedBalance=%19/%20 gateSurfaceBlueAmber=%21 displaySurface=%22 "
             "displaySurfaceBlueAmber=%23 displaySurfaceGreen=%24 displaySearch=%25 displaySearchRenders=%26 "
-            "displaySearchBalance=%27/%28\n" )
+            "displaySearchBalance=%27/%28 displayDecision=%29 displayBaseBlueAmber=%30 displayBaseGreen=%31 "
+            "displayRoomSamples=%32 displayRoomCast=%33/%34\n" )
             .arg( frameIndex )
             .arg( windowLit.evidence ? QStringLiteral("true") : QStringLiteral("false") )
             .arg( windowLit.reason )
@@ -1128,7 +1129,13 @@ bool ReceiptApplier::applyHeadlessLookAssist(ReceiptSettings *receipt,
             .arg( windowLit.displaySearch.result )
             .arg( windowLit.displaySearch.renders )
             .arg( windowLit.displaySearch.temperature )
-            .arg( windowLit.displaySearch.tint ) );
+            .arg( windowLit.displaySearch.tint )
+            .arg( windowLit.displayDecision )
+            .arg( windowLit.displayBaseBlueAmber, 0, 'f', 1 )
+            .arg( windowLit.displayBaseGreen, 0, 'f', 1 )
+            .arg( windowLit.displayRoomSamples )
+            .arg( windowLit.displayRoomCastBefore, 0, 'f', 1 )
+            .arg( windowLit.displayRoomCastAfter, 0, 'f', 1 ) );
     }
     const bool autoWhiteBalanceValid = wb.autoValid;
     const QString autoWhiteBalanceSource = wb.source;

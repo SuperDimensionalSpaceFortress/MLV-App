@@ -16655,7 +16655,9 @@ void MainWindow::applyLookAssistToReceipt( ReceiptSettings *receipt,
                            "recovery_iso=%14 surface_search=%15 search_renders=%16 search_balance=%17/%18 "
                            "search_surface_chroma=%19 applied_balance=%20/%21 gate_surface_blue_amber=%22 "
                            "display_surface=%23 display_surface_blue_amber=%24 display_surface_green=%25 "
-                           "display_search=%26 display_search_renders=%27 display_search_balance=%28/%29")
+                           "display_search=%26 display_search_renders=%27 display_search_balance=%28/%29 "
+                           "display_decision=%30 display_base_blue_amber=%31 display_base_green=%32 "
+                           "display_room_samples=%33 display_room_cast=%34/%35")
                 .arg( bool01( windowLit.evidence ) )
                 .arg( windowLit.reason )
                 .arg( lookAssistSceneName( scene ) )
@@ -16685,7 +16687,13 @@ void MainWindow::applyLookAssistToReceipt( ReceiptSettings *receipt,
                 .arg( windowLit.displaySearch.result )
                 .arg( windowLit.displaySearch.renders )
                 .arg( windowLit.displaySearch.temperature )
-                .arg( windowLit.displaySearch.tint ) );
+                .arg( windowLit.displaySearch.tint )
+                .arg( windowLit.displayDecision )
+                .arg( windowLit.displayBaseBlueAmber, 0, 'f', 1 )
+                .arg( windowLit.displayBaseGreen, 0, 'f', 1 )
+                .arg( windowLit.displayRoomSamples )
+                .arg( windowLit.displayRoomCastBefore, 0, 'f', 1 )
+                .arg( windowLit.displayRoomCastAfter, 0, 'f', 1 ) );
     }
     const bool autoWhiteBalanceValid = wb.autoValid;
     const QString autoWhiteBalanceSource = wb.source;
