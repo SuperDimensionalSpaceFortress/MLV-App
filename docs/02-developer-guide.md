@@ -1014,7 +1014,7 @@ All workflows live under `.github/workflows/`.
 
 | Workflow | Trigger | What it does |
 |----------|---------|--------------|
-| [`tests.yml`](../.github/workflows/tests.yml) | `workflow_dispatch`, every `pull_request`, and `push` to `master`. **No `paths` filter** — see the note below. | Seven jobs. `protected-check-route` (ubuntu) derives a fail-closed route; `repo-hygiene-python` (ubuntu), `repo-hygiene-python-windows-shard` (five parallel windows runners) and `batch-compile` (windows) run independently of it; `repo-hygiene-python-windows` (ubuntu) is an aggregator that needs every shard and keeps the required name `Repo Hygiene Python (windows-latest)`; `windows-product-oracles` and `windows-gui-pilot` (both windows) `needs: protected-check-route` and run `console_tests`/`pipeline_tests --check-golden` and `gui_tests` respectively. `factory-bridge-regressions` lives in `factory-bridge.yml`, not here. |
+| [`tests.yml`](../.github/workflows/tests.yml) | `workflow_dispatch`, every `pull_request`, `push` to `master`, and `merge_group` (`checks_requested`, for the merge queue; the router then always runs the full route). **No `paths` filter** — see the note below. | Nine job ids. `protected-check-route` (ubuntu) derives a fail-closed route; `repo-hygiene-python-ubuntu-shard` (four parallel ubuntu runners), `repo-hygiene-python-windows-shard` (eight parallel windows runners) and `batch-compile` (windows) run independently of it; `repo-hygiene-python` and `repo-hygiene-python-windows` (ubuntu) are aggregators that need every shard of their OS and keep the required names `Repo Hygiene Python (ubuntu-latest)` and `Repo Hygiene Python (windows-latest)`; `windows-product-oracles-part` (three parallel windows runners) and `windows-gui-pilot` (windows) `needs: protected-check-route` and run `console_tests`/`pipeline_tests --check-golden` and `gui_tests` respectively; `windows-product-oracles` (ubuntu) is the aggregator that needs every part and keeps the required name `Windows Product Oracles`. `factory-bridge-regressions` lives in `factory-bridge.yml`, not here. |
 | [`Windows.yml`](../.github/workflows/Windows.yml) | `workflow_dispatch` on `master` | Release artifact. Chocolatey-installs Qt 5.15.2 + MinGW 8.1 + OpenSSL, runs `qmake` + `make` + `windeployqt`, unpacks `ffmpegWin64.zip` and `raw2mlvWin64.zip` with 7-Zip, uploads `MLVApp.Win64.zip`. |
 | [`Linux.yml`](../.github/workflows/Linux.yml) | `workflow_dispatch` on `master` | Ubuntu 22.04 runner. Installs the apt dependencies listed in [§3.4](#34-linux), runs `qmake` + `make -j8`, unpacks the bundled ffmpeg/raw2mlv, wraps it all with `linuxdeploy` + the Qt plugin to produce `MLVApp.AppImage`. |
 | [`macOS-Intel.yml`](../.github/workflows/macOS-Intel.yml) | `workflow_dispatch` on `master` | macOS 13 runner. `brew install llvm qt5 openssl` (alias to `qt@5`), `qmake -r`, `make -j8`, `macdeployqt -dmg` from `/usr/local/opt/qt@5/bin`. Artifact: `MLV App.dmg`. |
@@ -1022,10 +1022,15 @@ All workflows live under `.github/workflows/`.
 
 ### 14.1 What actually blocks a merge
 
-`tests.yml` reports more check runs than there are required checks: the Windows hygiene
-suite runs as five `Repo Hygiene Python windows shard N/5` jobs (not required by name),
-and the `Repo Hygiene Python (windows-latest)` aggregator that needs all five carries the
-required name. **Five check names are required status checks** on `master`:
+`tests.yml` reports more check runs than there are required checks: the hygiene suite
+runs as `Repo Hygiene Python ubuntu shard N/4` and `Repo Hygiene Python windows shard N/8`
+jobs, and the product oracles as `Windows Product Oracles part N/3` jobs (none required by
+name); an aggregator per required name needs every one of its shards and carries the
+required name. The unittest shards are sets of whole test classes weighted by measured
+seconds (`tools/repo_hygiene/ci_unittest_shard_weights.json`, regenerated from CI job logs
+with `tools/repo_hygiene/ci_unittest_shard_timings.py`), and every shard job proves the
+shards together hold exactly the ids `unittest discover` collects. **Five check names are
+required status checks** on `master`:
 `Repo Hygiene Python (ubuntu-latest)`, `Repo Hygiene Python (windows-latest)`,
 `Batch Compile`, `Windows Product Oracles`, `Windows GUI Pilot`. (`Factory Bridge
 Regressions` runs from `factory-bridge.yml` and is no longer required.)

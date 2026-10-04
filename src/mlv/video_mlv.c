@@ -6283,6 +6283,33 @@ void mlvSyncProcessingDualIsoBlackWhiteLevels(mlvObject_t * video)
     mlv_sync_processing_black_white_levels(video);
 }
 
+/* LOOK-ASSIST-ANALYSIS-RENDER-RACE-1: an analysis render clones the live processing
+ * object. For an HQ Dual ISO clip its black/white levels are the clip's (receipt)
+ * levels until a render syncs them to the recon output (the classic cores per frame,
+ * the GPU route at dispatch time), so the clone's levels -- and on a restricted-range
+ * lossless clip the analysed picture, by ~2.6x -- depended on whether a render had
+ * been dispatched before the analysis ran. Every analysis render now takes the clip
+ * levels explicitly: the state the headless applier always analyses (applyToMlv sets
+ * them) and the GUI analysed in the usual timing, which the Look Assist thresholds
+ * are calibrated on. Outside HQ Dual ISO the helper leaves the levels untouched, as
+ * master does; fractional Raw Black on those clips is a known pre-existing timing
+ * dependency, tracked by LOOK-ASSIST-ANALYSIS-RENDER-RACE-2.
+ * Both levels always come from RAWI, the one authority in both states: the raw-black
+ * control also writes a fraction (e.g. 2047.9) into the processing object, but RAWI
+ * keeps the integer the recon reads, and a sync overwrites the fraction. */
+int mlvSetAnalysisProcessingClipLevels(mlvObject_t * video, processingObject_t * analysis_processing)
+{
+    if (!video || !video->llrawproc || !analysis_processing || !llrpHQDualIso(video)) return 0;
+
+    const int black_level = getMlvBlackLevel(video);
+    const int white_level = getMlvWhiteLevel(video);
+    const int bit_depth = getMlvBitdepth(video);
+    if (bit_depth <= 0 || bit_depth > 16 || white_level <= black_level) return 0;
+
+    processingSetBlackAndWhiteLevel(analysis_processing, (float)black_level, white_level, bit_depth);
+    return 1;
+}
+
 static int mlv_can_use_direct_processed_frame8_path(mlvObject_t * video)
 {
     return video
@@ -10793,6 +10820,34 @@ void findMlvWhiteBalance(mlvObject_t *video, uint64_t frameIndex, int posX, int 
     free(unprocessed_frame);
 }
 
+/* LOOK-ASSIST-ANALYSIS-RENDER-RACE-1: the Look Assist neutral-patch solve. Same input as
+ * findMlvWhiteBalance, but solved on a clone at the analysis (clip) levels, so the
+ * solved balance does not depend on whether a render synced the live levels first
+ * (tiny_dual_iso: 10000/-37 vs 9990/-37). The live object is not touched. */
+void findMlvWhiteBalanceAtAnalysisLevels(mlvObject_t *video, uint64_t frameIndex, int posX, int posY, int *wbTemp, int *wbTint, int mode)
+{
+    processingObject_t * analysis_processing = processingCloneForAnalysis(video->processing);
+    uint16_t * unprocessed_frame = malloc((size_t)getMlvWidth(video) * (size_t)getMlvHeight(video) * 3u * sizeof(uint16_t));
+    if (!analysis_processing || !unprocessed_frame)
+    {
+        processingFreeClone(analysis_processing);
+        free(unprocessed_frame);
+        findMlvWhiteBalance(video, frameIndex, posX, posY, wbTemp, wbTint, mode);
+        return;
+    }
+
+    getMlvRawFrameDebayered(video, frameIndex, unprocessed_frame);
+    mlvSetAnalysisProcessingClipLevels(video, analysis_processing);
+    processingFindWhiteBalance(analysis_processing,
+                               getMlvWidth(video), getMlvHeight(video),
+                               unprocessed_frame,
+                               posX, posY,
+                               wbTemp, wbTint, mode);
+
+    processingFreeClone(analysis_processing);
+    free(unprocessed_frame);
+}
+
 void findMlvWhiteBalanceIsolated(mlvObject_t *video, uint64_t frameIndex, int posX, int posY, int *wbTemp, int *wbTint, int mode)
 {
     int width = getMlvWidth(video);
@@ -10818,6 +10873,7 @@ void findMlvWhiteBalanceIsolated(mlvObject_t *video, uint64_t frameIndex, int po
                                                   temp_frame,
                                                   unprocessed_frame,
                                                   doesMlvAlwaysUseAmaze(video));
+    mlvSetAnalysisProcessingClipLevels(video, analysis_processing);
 
     processingFindWhiteBalance(analysis_processing,
                                width, height,

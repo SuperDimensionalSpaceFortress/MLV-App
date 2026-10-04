@@ -726,8 +726,8 @@ class RepoHygieneTests(unittest.TestCase):
         bridge_workflow = (ROOT / ".github" / "workflows" / "factory-bridge.yml").read_text(
             encoding="utf-8"
         )
-        product_start = workflow.index("\n  windows-product-oracles:")
-        gui_start = workflow.index("\n  windows-gui-pilot:")
+        product_start = workflow.index("\n  windows-product-oracles-part:")
+        gui_start = workflow.index("\n  windows-product-oracles:")
         bridge_start = bridge_workflow.index("\n  factory-bridge-regressions:")
         bridge_job = bridge_workflow[bridge_start:]
         product_job = workflow[product_start:gui_start]
@@ -826,12 +826,10 @@ class RepoHygieneTests(unittest.TestCase):
             required_checks,
         )
         self.assertNotEqual(required_checks[0], required_checks[1])
-        # ubuntu is the matrix leg; the windows-latest name is the sharded-check aggregator.
-        self.assertIn("os: [ubuntu-latest]", workflow)
+        # Both hygiene names and the product-oracle name are sharded-check aggregators.
         for required_check in required_checks:
             self.assertIn(required_check, contributing)
-            workflow_name = required_check.replace(" (ubuntu-latest)", " (${{ matrix.os }})")
-            self.assertIn(f"name: {workflow_name}", workflow)
+            self.assertIn(f"\n    name: {required_check}\n", workflow.replace("\r\n", "\n"))
 
         self.assertIn("`Windows Product Oracles` runs independently", normalized_contributing)
         self.assertIn("It is a branch-protection required check", normalized_contributing)
@@ -1040,10 +1038,12 @@ class RepoHygieneTests(unittest.TestCase):
 
         expected_timeouts = {
             "protected-check-route": 10,
-            "repo-hygiene-python": 75,
+            "repo-hygiene-python-ubuntu-shard": 30,
+            "repo-hygiene-python": 5,
             "repo-hygiene-python-windows-shard": 40,
             "repo-hygiene-python-windows": 5,
-            "windows-product-oracles": 120,
+            "windows-product-oracles-part": 60,
+            "windows-product-oracles": 5,
             "windows-gui-pilot": 60,
             "batch-compile": 30,
         }
@@ -1156,8 +1156,8 @@ class RepoHygieneTests(unittest.TestCase):
             with self.assertRaises(AssertionError):
                 assert_aqt_install_is_bounded_and_fail_closed(falsified_step)
 
-        repo_start = workflow.index("\n  repo-hygiene-python:")
-        product_start = workflow.index("\n  windows-product-oracles:")
+        repo_start = workflow.index("\n  repo-hygiene-python-ubuntu-shard:")
+        product_start = workflow.index("\n  windows-product-oracles-part:")
         repo_job = workflow[repo_start:product_start]
         bridge_job = bridge_workflow[bridge_workflow.index("\n  factory-bridge-regressions:") :]
         self.assertIn("Run coordination and self-healing guardrails", repo_job)
@@ -1166,7 +1166,7 @@ class RepoHygieneTests(unittest.TestCase):
         self.assertIn("tools\\agent-bridge\\requirements-test.txt", bridge_job)
         self.assertNotRegex(bridge_job, r"pip install [\"']pytest")
 
-        product_job = workflow[product_start : workflow.index("\n  windows-gui-pilot:")]
+        product_job = workflow[product_start : workflow.index("\n  windows-product-oracles:")]
         self.assertIn("    needs: protected-check-route", product_job)
         self.assertIn("    if: ${{ always() && !cancelled() }}", product_job)
         self.assertNotRegex(product_job, r"\n    if: \$\{\{ always\(\) \}\}")
@@ -1221,7 +1221,7 @@ class RepoHygieneTests(unittest.TestCase):
         self.assertIn("MANUAL_DISPATCH_RUN_REAL_ORACLES", gui_job)
 
         required_display_names = {
-            "Repo Hygiene Python (${{ matrix.os }})",
+            "Repo Hygiene Python (ubuntu-latest)",
             "Repo Hygiene Python (windows-latest)",
             "Batch Compile",
             "Windows Product Oracles",
@@ -1239,71 +1239,135 @@ class RepoHygieneTests(unittest.TestCase):
         self.assertNotRegex(bridge_workflow, r"(?im)^\s*continue-on-error\s*:")
         self.assertIn("  pull_request:\n", bridge_workflow[: bridge_workflow.index("\npermissions:")])
 
-    def test_windows_hygiene_check_is_sharded_behind_the_required_name(self) -> None:
-        workflow = (ROOT / ".github" / "workflows" / "tests.yml").read_text(encoding="utf-8")
+    def _workflow_job(self, workflow: str, job_id: str) -> str:
         jobs_text = workflow[workflow.index("\njobs:") :]
+        match = re.search(rf"(?m)^  {re.escape(job_id)}:\r?$", jobs_text)
+        assert match is not None, job_id
+        following = re.search(r"(?m)^  [a-z0-9-]+:\r?$", jobs_text[match.end() :])
+        end = match.end() + following.start() if following else len(jobs_text)
+        return jobs_text[match.start() : end]
 
-        def job(job_id: str) -> str:
-            match = re.search(rf"(?m)^  {re.escape(job_id)}:\r?$", jobs_text)
-            assert match is not None, job_id
-            following = re.search(r"(?m)^  [a-z0-9-]+:\r?$", jobs_text[match.end() :])
-            end = match.end() + following.start() if following else len(jobs_text)
-            return jobs_text[match.start() : end]
+    def test_hygiene_checks_are_sharded_behind_the_required_names(self) -> None:
+        workflow = (ROOT / ".github" / "workflows" / "tests.yml").read_text(encoding="utf-8")
 
-        shard_job = job("repo-hygiene-python-windows-shard")
-        aggregator = job("repo-hygiene-python-windows")
-        ubuntu_job = job("repo-hygiene-python")
-
-        # The branch-protection context survives, run by an aggregator that needs every shard.
-        self.assertIn("    name: Repo Hygiene Python (windows-latest)\n", aggregator.replace("\r\n", "\n"))
-        self.assertIn("    needs: repo-hygiene-python-windows-shard", aggregator)
-        self.assertIn("needs.repo-hygiene-python-windows-shard.result", aggregator)
-        self.assertIn('test "$SHARDS_RESULT" = "success"', aggregator)
-        # `always()` alone: `!cancelled()` would condition-skip the required check on a run
-        # cancel, and GitHub treats a skipped required check as satisfied.
-        self.assertIn("    if: ${{ always() }}", aggregator.replace("\r\n", "\n"))
-        self.assertNotIn("cancelled()", re.sub(r"(?m)^\s*#.*$", "", aggregator))
+        # `always()` alone on an aggregator: `!cancelled()` would condition-skip a required
+        # check on a run cancel, and GitHub treats a skipped required check as satisfied.
         self.assertNotRegex(workflow, r"(?im)^\s*continue-on-error\s*:")
-        # The ubuntu leg keeps the required `(ubuntu-latest)` name and no longer carries a
-        # Windows leg that would collide with the aggregator's name.
-        self.assertIn("        os: [ubuntu-latest]", ubuntu_job)
+        for os_name, shard_id, aggregator_id in (
+            ("windows", "repo-hygiene-python-windows-shard", "repo-hygiene-python-windows"),
+            ("ubuntu", "repo-hygiene-python-ubuntu-shard", "repo-hygiene-python"),
+        ):
+            with self.subTest(os=os_name):
+                shard_job = self._workflow_job(workflow, shard_id)
+                aggregator = self._workflow_job(workflow, aggregator_id)
 
-        # Shard count is bound three ways: the matrix, the shard name, and `--of`.
-        matrix = re.search(r"(?m)^        shard: \[([0-9, ]+)\]\r?$", shard_job)
-        self.assertIsNotNone(matrix)
-        shard_numbers = [int(part) for part in matrix.group(1).split(",")]
-        self.assertEqual(shard_numbers, list(range(1, len(shard_numbers) + 1)))
-        self.assertIn(f"windows shard ${{{{ matrix.shard }}}}/{len(shard_numbers)}", shard_job)
-        unittest_shards = {int(n) for n in re.findall(r"ci_unittest_shard --of (\d+)", shard_job)}
-        self.assertEqual(len(unittest_shards), 1)
-        (of,) = unittest_shards
-        # shards 1..of run the unittest slices, the last shard runs the tail steps.
-        self.assertEqual(len(shard_numbers), of + 1)
-        self.assertIn(f"        if: matrix.shard <= {of}\n", shard_job.replace("\r\n", "\n"))
-        # Each unittest leg must run its own slice: a hard-coded index would run one slice
-        # several times while `--verify-partition` (which proves collection) stays green.
-        self.assertIn(f"ci_unittest_shard --of {of} --shard ${{{{ matrix.shard }}}}", shard_job)
-        self.assertNotRegex(shard_job, r"--shard\s+(?!\$\{\{ matrix\.shard \}\})")
-        self.assertIn("--of {0} --verify-partition".format(of), shard_job)
+                # The branch-protection context survives, run by an aggregator that needs every shard.
+                self.assertIn(
+                    f"    name: Repo Hygiene Python ({os_name}-latest)\n", aggregator.replace("\r\n", "\n")
+                )
+                self.assertIn(f"    needs: {shard_id}", aggregator)
+                self.assertIn(f"needs.{shard_id}.result", aggregator)
+                self.assertIn('test "$SHARDS_RESULT" = "success"', aggregator)
+                self.assertIn("    if: ${{ always() }}", aggregator.replace("\r\n", "\n"))
+                self.assertNotIn("cancelled()", re.sub(r"(?m)^\s*#.*$", "", aggregator))
+
+                # Shard count is bound three ways: the matrix, the shard name, and `--of`.
+                matrix = re.search(r"(?m)^        shard: \[([0-9, ]+)\]\r?$", shard_job)
+                self.assertIsNotNone(matrix)
+                shard_numbers = [int(part) for part in matrix.group(1).split(",")]
+                self.assertEqual(shard_numbers, list(range(1, len(shard_numbers) + 1)))
+                self.assertIn(f"{os_name} shard ${{{{ matrix.shard }}}}/{len(shard_numbers)}", shard_job)
+                unittest_shards = {
+                    int(n)
+                    for n in re.findall(rf"ci_unittest_shard --profile {os_name} --of (\d+)", shard_job)
+                }
+                self.assertEqual(len(unittest_shards), 1)
+                (of,) = unittest_shards
+                # shards 1..of run the unittest slices, the last shard runs the tail steps.
+                self.assertEqual(len(shard_numbers), of + 1)
+                self.assertIn(f"        if: matrix.shard <= {of}\n", shard_job.replace("\r\n", "\n"))
+                # Each unittest leg must run its own slice: a hard-coded index would run one slice
+                # several times while `--verify-partition` (which proves collection) stays green.
+                self.assertIn(
+                    f"ci_unittest_shard --profile {os_name} --of {of} --shard ${{{{ matrix.shard }}}}",
+                    shard_job,
+                )
+                self.assertNotRegex(shard_job, r"--shard\s+(?!\$\{\{ matrix\.shard \}\})")
+                self.assertIn(f"--profile {os_name} --of {of} --verify-partition", shard_job)
+                self.assertIn(f"- name: Run repo hygiene unittest shard ${{{{ matrix.shard }}}}/{of}", shard_job)
+                tail = shard_job[shard_job.index("- name: Run repo hygiene tail steps") :]
+                self.assertIn(f"if: matrix.shard == {of + 1}", tail.split("\n      - ")[0])
+                for command in (
+                    "tools.release.test_release_evidence",
+                    "tools.gates.test_output_budget",
+                    "pipeline_golden_provenance",
+                    "vendored_native_payloads",
+                    "hygiene.py --repo-root . verify-policy",
+                    "check_pinned_tokens.py",
+                    "k9_witness tree HEAD",
+                ):
+                    self.assertIn(command, shard_job)
+        # The windows-only steps stay on the tail shard.
+        windows_shard = self._workflow_job(workflow, "repo-hygiene-python-windows-shard")
+        windows_tail = len(re.findall(r"(?m)^        shard: \[([0-9, ]+)\]", windows_shard)[0].split(","))
         for step in (
             "Run coordination and self-healing guardrails",
             "Run demote-factory-bridge refusal-path tests",
             "Verify generated Python dependency locks",
-            "Run repo hygiene tail steps",
         ):
-            block = shard_job[shard_job.index(f"- name: {step}") :]
-            self.assertIn(f"if: matrix.shard == {of + 1}", block.split("\n      - ")[0])
-        for command in (
-            "tools.release.test_release_evidence",
-            "tools.gates.test_output_budget",
-            "pipeline_golden_provenance",
-            "vendored_native_payloads",
-            "hygiene.py --repo-root . verify-policy",
-            "check_pinned_tokens.py",
-            "k9_witness tree HEAD",
+            block = windows_shard[windows_shard.index(f"- name: {step}") :].split("\n      - ")[0]
+            self.assertIn(f"if: matrix.shard == {windows_tail}", block)
+
+    def test_product_oracles_are_split_into_parts_behind_the_required_name(self) -> None:
+        workflow = (ROOT / ".github" / "workflows" / "tests.yml").read_text(encoding="utf-8").replace("\r\n", "\n")
+        part = self._workflow_job(workflow, "windows-product-oracles-part")
+        aggregator = self._workflow_job(workflow, "windows-product-oracles")
+
+        self.assertIn("    name: Windows Product Oracles\n", aggregator)
+        self.assertIn("    needs: windows-product-oracles-part\n", aggregator)
+        self.assertIn("needs.windows-product-oracles-part.result", aggregator)
+        self.assertIn('test "$PARTS_RESULT" = "success"', aggregator)
+        self.assertIn("    if: ${{ always() }}\n", aggregator)
+        self.assertNotIn("cancelled()", re.sub(r"(?m)^\s*#.*$", "", aggregator))
+
+        # Part count is bound three ways: the matrix, the part name, and `$partCount`.
+        matrix = re.search(r"(?m)^        part: \[([0-9, ]+)\]$", part)
+        self.assertIsNotNone(matrix)
+        part_numbers = [int(number) for number in matrix.group(1).split(",")]
+        self.assertEqual(part_numbers, list(range(1, len(part_numbers) + 1)))
+        self.assertIn(f"Windows Product Oracles part ${{{{ matrix.part }}}}/{len(part_numbers)}", part)
+        self.assertEqual(re.findall(r"(?m)^\s*\$partCount = (\d+)$", part), [str(len(part_numbers))])
+        self.assertIn("$part = [int]'${{ matrix.part }}'", part)
+        seeds = re.findall(r"(?m)^\s*\$partLoad = @\(([0-9., ]+)\)$", part)
+        self.assertEqual(len(seeds), 1)
+        self.assertEqual(len(seeds[0].split(",")), len(part_numbers))
+        # Coverage: the plan is split by an assignment over the full plan, proven a disjoint
+        # cover in every part, and each part runs only its own shards.
+        self.assertIn("pipeline parts do not cover each shard exactly once", part)
+        self.assertIn("foreach ($shard in $myShards) {", part)
+        self.assertNotIn("foreach ($shard in $shards)", part)
+        # Once-per-run work stays on exactly one part each.
+        for step, owner in (
+            ("Test screenshot fresh-render provenance gate", 1),
+            ("Test color-artifact scan capture-invalid contract", 1),
+            ("Build console_tests", 1),
+            ("Run console_tests --check-golden", 1),
+            ("Display parity (software GL required, never skipped)", 2),
         ):
-            self.assertIn(command, shard_job)
-            self.assertIn(command, ubuntu_job)
+            block = part[part.index(f"- name: {step}") :].split("\n      - ")[0]
+            self.assertIn(f"matrix.part == {owner}", block, step)
+        self.assertIn("if ($part -eq 2) {", part)
+        golden_start = part.index("if ($part -eq 2) {")
+        for owned in ("GOLDEN PRODUCERS", "STRESS-COMPLETE", "$stressFilter = 'ProcessingFilters.AggressiveX*'"):
+            self.assertGreater(part.index(owned), golden_start, owned)
+        # Every part adjudicates its own output against the expected-failure manifest.
+        self.assertIn("& tools\\testing\\check-expected-failures.ps1 -SuiteOutput $suiteOutput", part)
+        self.assertGreater(
+            part.index("check-expected-failures.ps1 -SuiteOutput"),
+            part.index("STRESS-COMPLETE achieved"),
+        )
+        # upload-artifact refuses a duplicate artifact name within a run.
+        self.assertIn("pipeline-crash-forensics-part-${{ matrix.part }}", part)
 
     def test_protected_check_router_is_conservative_and_provider_specific(self) -> None:
         provider = classify_paths(

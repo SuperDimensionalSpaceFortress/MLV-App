@@ -161,12 +161,29 @@ bool lookAssistSceneEv100( double isoValue, double shutterMicroseconds, double a
 void lookAssistSetSceneEv100( LookAssistStats *stats,
                               double isoValue,
                               double shutterMicroseconds,
-                              double apertureTimes100 )
+                              double apertureTimes100,
+                              double recoveryIsoValue )
 {
     if( !stats ) return;
     double ev100 = 0.0;
     stats->hasSceneEv100 = lookAssistSceneEv100( isoValue, shutterMicroseconds, apertureTimes100, &ev100 );
     stats->sceneEv100 = stats->hasSceneEv100 ? ev100 : 0.0;
+    // Only the aperture missing: the same formula at f/1.0 (aperture x100 = 100) is a lower bound of the scene's EV100.
+    double bound = 0.0;
+    stats->hasSceneEv100Bound = !stats->hasSceneEv100 && apertureTimes100 <= 0.0
+                             && lookAssistSceneEv100( isoValue, shutterMicroseconds, 100.0, &bound );
+    stats->sceneEv100Bound = stats->hasSceneEv100Bound ? bound : 0.0;
+    stats->sceneRecoveryStops = ( isoValue > 0.0 && recoveryIsoValue > isoValue )
+                              ? log( recoveryIsoValue / isoValue ) / log( 2.0 )
+                              : 0.0;
+}
+
+bool lookAssistExposureBoundExcludesNight( const LookAssistStats &stats )
+{
+    return !stats.hasSceneEv100
+        && stats.hasSceneEv100Bound
+        && stats.sceneEv100Bound >= kLookAssistNotNightEv100
+        && stats.sceneEv100Bound - stats.sceneRecoveryStops >= kLookAssistDarkNightEv100;
 }
 
 // Open shade is ~EV100 12; a window-lit interior tops out near 10. 11 splits them with margin.
@@ -326,8 +343,13 @@ QString lookAssistDecisionLogFields( const LookAssistStats &resolved, const Look
         break;
     }
     const bool recovery = trace.postWalkBranch == LookAssistPostWalkBranch::Recovery;
+    const QString source = resolved.hasSceneEv100 ? QStringLiteral("recorded")
+                         : resolved.hasSceneEv100Bound ? QStringLiteral("aperture_bound")
+                                                       : QStringLiteral("none");
+    const bool searched = trace.surfaceSearch == QStringLiteral("converged");
     return QStringLiteral("has_ev100=%1 ev100=%2 daylight_gate=%3 post_walk_ran=%4 post_walk_branch=%5 "
-                          "post_walk_recovery=%6 display_meter_ran=%7 playback_scale=%8")
+                          "post_walk_recovery=%6 display_meter_ran=%7 playback_scale=%8 ev100_bound=%9 ev100_source=%10 "
+                          "surface_search=%11 surface_search_balance=%12")
         .arg( resolved.hasSceneEv100 ? 1 : 0 )
         .arg( resolved.hasSceneEv100 ? QString::number( floor( resolved.sceneEv100 * 1000.0 ) / 1000.0, 'f', 3 ) : QStringLiteral("NA") )
         .arg( lookAssistDaylightGateName( resolved, trace.pictureEvidenceAsked ) )
@@ -336,7 +358,13 @@ QString lookAssistDecisionLogFields( const LookAssistStats &resolved, const Look
         .arg( recovery ? QStringLiteral("%1/%2").arg( trace.recoveryTemperatureDelta ).arg( trace.recoveryTintDelta )
                        : QStringLiteral("NA") )
         .arg( trace.displayMeterRan ? 1 : 0 )
-        .arg( trace.playbackScaleFactor > 0 ? QString::number( trace.playbackScaleFactor ) : QStringLiteral("NA") );
+        .arg( trace.playbackScaleFactor > 0 ? QString::number( trace.playbackScaleFactor ) : QStringLiteral("NA") )
+        .arg( resolved.hasSceneEv100Bound ? QString::number( floor( resolved.sceneEv100Bound * 1000.0 ) / 1000.0, 'f', 3 )
+                                          : QStringLiteral("NA") )
+        .arg( source )
+        .arg( trace.surfaceSearch )
+        .arg( searched ? QStringLiteral("%1/%2").arg( trace.surfaceSearchTemperature ).arg( trace.surfaceSearchTint )
+                       : QStringLiteral("NA") );
 }
 
 bool lookAssistPictureCorroboratesDaylight( const LookAssistStats &processedAtPlannedExposure )
@@ -1086,6 +1114,109 @@ void refineLookAssistDaylightWhiteBalance( const LookAssistWhiteBalanceRequest &
     lookAssistFinalizeWhiteBalance( request, preset, resolution );
 }
 
+// How far a surface is from neutral on the two axes the white balance moves.
+static double lookAssistSurfaceCast( const LookAssistAutoWhiteBalancePatch &surface )
+{
+    return fabs( surface.blueAmberAxis ) + fabs( surface.greenAxis );
+}
+
+static bool lookAssistSurfaceIsNeutral( const LookAssistAutoWhiteBalancePatch &surface )
+{
+    return surface.valid
+        && fabs( surface.blueAmberAxis ) < kRefineDeadBand
+        && fabs( surface.greenAxis ) < kRefineDeadBand;
+}
+
+LookAssistSurfaceSearch searchLookAssistNeutralSurfaceBalance( const LookAssistRenderBalanceFn &renderBalance,
+                                                               double exposureStops,
+                                                               const LookAssistRenderedPicture &geometry,
+                                                               int x,
+                                                               int y,
+                                                               const LookAssistWhiteBalanceBounds &window,
+                                                               const LookAssistSurfaceProbe &first,
+                                                               const LookAssistSurfaceProbe &second )
+{
+    LookAssistSurfaceSearch search;
+    if( !renderBalance || !first.surface.valid || !second.surface.valid
+     || window.minTemperature > window.maxTemperature || window.minTint > window.maxTint )
+    {
+        search.result = QStringLiteral("unverifiable");
+        return search;
+    }
+    // Both measured balances steer the start: the surface's own response, B-R per mired and G per tint unit, where the
+    // two differ enough to say; the refinement's measured defaults otherwise (and wherever a fit is implausible).
+    double miredSlope = kRefineInitialMiredSlope;
+    double tintSlope = kRefineInitialTintSlope;
+    auto refit = [&]( const LookAssistSurfaceProbe &a, const LookAssistSurfaceProbe &b )
+    {
+        const double dMired = lookAssistMired( b.temperature ) - lookAssistMired( a.temperature );
+        if( fabs( dMired ) >= 3.0 )
+        {
+            const double seen = ( b.surface.blueAmberAxis - a.surface.blueAmberAxis ) / dMired;
+            if( seen > 0.05 && seen < 6.0 ) miredSlope = seen;
+        }
+        const int dTint = b.tint - a.tint;
+        if( qAbs( dTint ) >= 2 )
+        {
+            const double seen = ( b.surface.greenAxis - a.surface.greenAxis ) / (double)dTint;
+            if( seen < -0.03 && seen > -3.0 ) tintSlope = seen;
+        }
+    };
+    refit( first, second );
+    LookAssistSurfaceProbe best = lookAssistSurfaceCast( second.surface ) < lookAssistSurfaceCast( first.surface ) ? second : first;
+    double damp = 1.0;
+    search.result = QStringLiteral("not-converged");
+    while( !lookAssistSurfaceIsNeutral( best.surface ) && search.renders < kLookAssistSurfaceSearchMaxRenders )
+    {
+        const double dMired = fabs( best.surface.blueAmberAxis ) >= kRefineDeadBand
+            ? qBound( -kRefineMaxMiredStep, ( -best.surface.blueAmberAxis / miredSlope ) * damp, kRefineMaxMiredStep )
+            : 0.0;
+        const double dTint = fabs( best.surface.greenAxis ) >= kRefineDeadBand
+            ? qBound( -kRefineMaxTintStep, ( -best.surface.greenAxis / tintSlope ) * damp, kRefineMaxTintStep )
+            : 0.0;
+        LookAssistSurfaceProbe next;
+        next.temperature = qBound( window.minTemperature,
+                                   lookAssistKelvinFromMired( lookAssistMired( best.temperature ) + dMired ),
+                                   window.maxTemperature );
+        next.tint = qBound( window.minTint, best.tint + qRound( dTint ), window.maxTint );
+        if( next.temperature == best.temperature && next.tint == best.tint ) break;   // pinned on the window's edge
+
+        LookAssistRenderedPicture picture;
+        ++search.renders;
+        if( !renderBalance( exposureStops, next.temperature, next.tint, &picture )
+         || !lookAssistSamePictureGeometry( geometry, picture ) )
+        {
+            search.result = QStringLiteral("unverifiable");
+            return search;
+        }
+        next.surface = lookAssistSurfaceAt( picture, x, y );
+        refit( best, next );
+        if( lookAssistSurfaceCast( next.surface ) < lookAssistSurfaceCast( best.surface ) )
+            best = next;
+        else
+            damp *= 0.5;
+    }
+    search.temperature = best.temperature;
+    search.tint = best.tint;
+    search.surface = best.surface;
+    search.converged = lookAssistSurfaceIsNeutral( best.surface );
+    if( search.converged ) search.result = QStringLiteral("converged");
+    return search;
+}
+
+void lookAssistTraceSurfaceSearch( LookAssistDecisionTrace *trace, const LookAssistWindowLitCheck &check )
+{
+    if( !trace ) return;
+    trace->surfaceSearch = check.search.result;
+    trace->surfaceSearchTemperature = check.search.converged ? check.search.temperature : 0;
+    trace->surfaceSearchTint = check.search.converged ? check.search.tint : 0;
+}
+
+bool lookAssistNotNightByExposureBoundCandidate( const LookAssistStats &stats, LookAssistScene scene )
+{
+    return lookAssistWindowLitInteriorCandidate( stats, scene ) && lookAssistExposureBoundExcludesNight( stats );
+}
+
 bool lookAssistWindowLitInteriorCandidate( const LookAssistStats &stats, LookAssistScene scene )
 {
     // The night verdict came from a RAW floor that carries no scene information, and nothing recorded can overrule
@@ -1108,6 +1239,8 @@ LookAssistWindowLitCheck resolveLookAssistWindowLitInterior( const LookAssistWhi
     if( !stats || !scene || !preset || request.stats != stats ) return check;
     check.candidate = lookAssistWindowLitInteriorCandidate( *stats, *scene ) && request.scene == *scene;
     if( !check.candidate ) return check;
+    // The aperture bound rules night out: the exposure, not the colour, is the night guard (see the header).
+    check.exposureBound = lookAssistExposureBoundExcludesNight( *stats );
 
     const LookAssistAutoWhiteBalancePatch &patch = request.patch;
     if( !request.solvedOnProcessedPicture || !patch.valid )
@@ -1126,9 +1259,10 @@ LookAssistWindowLitCheck resolveLookAssistWindowLitInterior( const LookAssistWhi
     daylightHypothesis.windowLitInteriorEvidence = true;
     const LookAssistScene daylightScene = classifyLookAssistScene( daylightHypothesis );
     const LookAssistWhiteBalanceBounds window = lookAssistWhiteBalanceBounds( daylightHypothesis, daylightScene );
-    if( wb.candidateTemperature < kLookAssistWindowLitMinTemperature
-     || wb.candidateTemperature < window.minTemperature || wb.candidateTemperature > window.maxTemperature
-     || wb.candidateTint < window.minTint || wb.candidateTint > window.maxTint )
+    if( !check.exposureBound
+     && ( wb.candidateTemperature < kLookAssistWindowLitMinTemperature
+       || wb.candidateTemperature < window.minTemperature || wb.candidateTemperature > window.maxTemperature
+       || wb.candidateTint < window.minTint || wb.candidateTint > window.maxTint ) )
     {
         check.reason = QStringLiteral("not-daylight-locus");
         return check;
@@ -1146,6 +1280,11 @@ LookAssistWindowLitCheck resolveLookAssistWindowLitInterior( const LookAssistWhi
     if( !lookAssistDaylightPatchIsNeutralEnough( patch ) )
     {
         check.reason = QStringLiteral("patch-not-neutral");
+        return check;
+    }
+    if( check.exposureBound && ( !colorStats || colorStats->p95 < kLookAssistLitPictureMinP95 ) )
+    {
+        check.reason = QStringLiteral("not-lit-picture");
         return check;
     }
     if( !request.renderBalance )
@@ -1180,16 +1319,82 @@ LookAssistWindowLitCheck resolveLookAssistWindowLitInterior( const LookAssistWhi
     const LookAssistAutoWhiteBalancePatch solutionSurface = lookAssistSurfaceAt( verify, patch.thumbnailX, patch.thumbnailY );
     check.solutionSurfaceChroma = solutionSurface.chroma;
     check.solutionSurfaceBlueAmber = solutionSurface.blueAmberAxis;
-    if( !lookAssistDaylightPatchIsNeutralEnough( solutionSurface )
-     || solutionSurface.chroma > baseSurface.chroma + kRefineVerifyChromaSlack )
+    // A surface verifies at a balance when it is near-neutral there and no more cast than at the base balance.
+    auto verifiedAt = [&]( const LookAssistAutoWhiteBalancePatch &surface ) {
+        return lookAssistDaylightPatchIsNeutralEnough( surface )
+            && surface.chroma <= baseSurface.chroma + kRefineVerifyChromaSlack; };
+    // The accepted balance as it stands (the solve, undamped). On the live rule it is adopted only when its surface is
+    // strictly neutral there (the search's own convergence bar): the loose guard above accepts a residual cast that a
+    // solve a little bluer than a 5600 K night source still leaves (B-R -4 at 6000 K), and that balance is not the
+    // source's neutral. A solve that is not strictly neutral goes to the search, which finds where the surface is.
+    int temperature = request.baseTemperature + preset->temperatureDelta;
+    int tint = request.baseTint + preset->tintDelta;
+    if( !verifiedAt( solutionSurface ) || ( check.exposureBound && !lookAssistSurfaceIsNeutral( solutionSurface ) ) )
     {
-        check.reason = QStringLiteral("unverified-at-solution");
+        if( !check.exposureBound )
+        {
+            check.reason = QStringLiteral("unverified-at-solution");
+            return check;
+        }
+        // The solve overshot its own surface: find the balance at which that surface IS neutral, starting from the two
+        // balances it was just measured at, inside the daylight window and the controls' range.
+        LookAssistWhiteBalanceBounds searchWindow = window;
+        searchWindow.minTemperature = qMax( searchWindow.minTemperature, request.minTemperature );
+        searchWindow.maxTemperature = qMin( searchWindow.maxTemperature, request.maxTemperature );
+        searchWindow.minTint = qMax( searchWindow.minTint, request.minTint );
+        searchWindow.maxTint = qMin( searchWindow.maxTint, request.maxTint );
+        LookAssistSurfaceProbe atBase;
+        atBase.temperature = request.baseTemperature;
+        atBase.tint = request.baseTint;
+        atBase.surface = baseSurface;
+        LookAssistSurfaceProbe atSolution;
+        atSolution.temperature = wb.candidateTemperature;
+        atSolution.tint = wb.candidateTint;
+        atSolution.surface = solutionSurface;
+        check.search = searchLookAssistNeutralSurfaceBalance( request.renderBalance, patchPictureExposureStops, base,
+                                                              patch.thumbnailX, patch.thumbnailY, searchWindow,
+                                                              atBase, atSolution );
+        if( !check.search.converged || !verifiedAt( check.search.surface ) )
+        {
+            check.reason = QStringLiteral("unverified-at-solution");
+            return check;
+        }
+        temperature = check.search.temperature;
+        tint = check.search.tint;
+    }
+    // Live rule: the balance applied must itself be daylight (no night light source neutralises at 6000 K or bluer).
+    if( check.exposureBound
+     && ( temperature < kLookAssistNotNightMinTemperature
+       || temperature < window.minTemperature || temperature > window.maxTemperature
+       || tint < window.minTint || tint > window.maxTint ) )
+    {
+        check.reason = QStringLiteral("not-daylight-locus");
         return check;
     }
+    // ... and robustly so at the 6000 K boundary. A strictly neutral surface still pins its own neutral only to within the
+    // dead band (|B-R| < 2, about 5 mired on the M16 surface), so a 5900-5999 K source verifies at 6000-6100 K. The surface
+    // itself decides: rendered at the 6000 K gate (the applied tint), it must be measurably blue there (B-R >= the dead
+    // band), i.e. its neutral is bluer than 6000 K by more than that band. A night source at or under 6000 K renders
+    // neutral or amber at the gate.
+    if( check.exposureBound )
+    {
+        LookAssistRenderedPicture atGate;
+        if( !request.renderBalance( patchPictureExposureStops, kLookAssistNotNightMinTemperature, tint, &atGate )
+         || !lookAssistSamePictureGeometry( base, atGate ) )
+        {
+            check.reason = QStringLiteral("unverifiable");
+            return check;
+        }
+        const LookAssistAutoWhiteBalancePatch gateSurface = lookAssistSurfaceAt( atGate, patch.thumbnailX, patch.thumbnailY );
+        check.gateSurfaceBlueAmber = gateSurface.blueAmberAxis;
+        if( !gateSurface.valid || gateSurface.blueAmberAxis < kRefineDeadBand )
+        {
+            check.reason = QStringLiteral("not-blue-at-gate");
+            return check;
+        }
+    }
 
-    // A window-lit interior: the daylight class, its preset on the same inputs, and the accepted balance as it stands.
-    const int temperature = request.baseTemperature + preset->temperatureDelta;
-    const int tint = request.baseTint + preset->tintDelta;
+    // A window-lit interior: the daylight class, its preset on the same inputs, and the verified balance.
     *stats = daylightHypothesis;
     *scene = daylightScene;
     LookAssistPreset daylightPreset = presetForLookAssistScene( daylightScene, *stats, colorStats, displayStats );
@@ -1200,6 +1405,9 @@ LookAssistWindowLitCheck resolveLookAssistWindowLitInterior( const LookAssistWhi
     daylightPreset.tintDelta = finalTint - request.baseTint;
     *preset = daylightPreset;
     check.evidence = true;
+    check.applies = check.exposureBound;
+    check.appliedTemperature = finalTemperature;
+    check.appliedTint = finalTint;
     check.reason = QStringLiteral("pass");
     return check;
 }
