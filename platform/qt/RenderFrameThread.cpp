@@ -1152,6 +1152,87 @@ bool RenderFrameThread::isIdle()
     return !(m_renderFrame || m_renderingFrame || phase3WorkInFlightLocked());
 }
 
+bool RenderFrameThread::isIdleExceptPlaybackLookahead( int activePlaybackTarget,
+                                                       uint64_t activeGeneration )
+{
+    QMutexLocker locker(&m_mutex);
+    const auto blocks = [&]( const ReadyFrame::PresentationContext &context,
+                             uint32_t frameNumber ) -> bool
+    {
+        playback_overlap::WorkItem item;
+        item.playbackLookahead = context.playbackLookaheadRequest;
+        item.generation = context.presentationGeneration;
+        item.frameNumber = static_cast<int64_t>( frameNumber );
+        return playback_overlap::blocksPlaybackAdvance( item,
+                                                        activePlaybackTarget,
+                                                        activeGeneration );
+    };
+    for( const RenderRequest &request : m_renderRequests )
+    {
+        if( blocks( request.presentationContext, request.frameNumber ) ) return false;
+    }
+    if( m_renderingFrame
+     && blocks( m_activePresentationContext, m_activeFrameNumber ) )
+    {
+        return false;
+    }
+    for( const FrameSlot &slot : m_frameSlots )
+    {
+        const SlotState state = slot.state.load( std::memory_order_acquire );
+        if( state == SlotState::Requested
+         || state == SlotState::Decoding
+         || state == SlotState::Decoded
+         || state == SlotState::ReconReady
+         || state == SlotState::Recon
+         || state == SlotState::ProcessReady
+         || state == SlotState::Processing )
+        {
+            if( blocks( slot.presentationContext, slot.frameNumber ) ) return false;
+        }
+    }
+    return true;
+}
+
+void RenderFrameThread::resetPipelineOverlapMeter( void )
+{
+    m_overlapMeter.reset( mlv_stage_timing_now() * 1000.0 );
+}
+
+playback_overlap::OverlapSnapshot RenderFrameThread::pipelineOverlapSnapshot( void )
+{
+    return m_overlapMeter.snapshot( mlv_stage_timing_now() * 1000.0 );
+}
+
+bool RenderFrameThread::downstreamFrameInFlightLocked( int excludeSlotIndex ) const
+{
+    if( m_renderingFrame && m_renderingSlotIndex != excludeSlotIndex ) return true;
+    for( int i = 0; i < static_cast<int>( m_frameSlots.size() ); ++i )
+    {
+        if( i == excludeSlotIndex ) continue;
+        if( m_frameSlots[i].ready || m_frameSlots[i].presenting ) return true;
+    }
+    return false;
+}
+
+bool RenderFrameThread::upstreamWorkInFlightLocked( int excludeSlotIndex ) const
+{
+    for( int i = 0; i < static_cast<int>( m_frameSlots.size() ); ++i )
+    {
+        if( i == excludeSlotIndex ) continue;
+        const SlotState state = m_frameSlots[i].state.load( std::memory_order_acquire );
+        if( state == SlotState::Requested
+         || state == SlotState::Decoding
+         || state == SlotState::Decoded
+         || state == SlotState::ReconReady
+         || state == SlotState::Recon
+         || state == SlotState::ProcessReady )
+        {
+            return true;
+        }
+    }
+    return false;
+}
+
 bool RenderFrameThread::acquireLatestReadyFrame(ReadyFrame *frame)
 {
     QMutexLocker locker(&m_mutex);
@@ -1892,8 +1973,11 @@ bool RenderFrameThread::takeDecodeRequestForWorker( DecodeQueueEntry *entry )
     }
     if( m_decodeWorkerStop || m_stop ) return false;
     if( m_decodeRequests.empty() ) return false;
+    const int takenSlotIndex = m_decodeRequests.front().slotIndex;
     if( entry ) *entry = m_decodeRequests.front();
     m_decodeRequests.pop_front();
+    m_overlapMeter.upstreamBegin( mlv_stage_timing_now() * 1000.0,
+                                  downstreamFrameInFlightLocked( takenSlotIndex ) );
     return true;
 }
 
@@ -1981,6 +2065,7 @@ void RenderFrameThread::decodeFrameForWorker( const DecodeQueueEntry &entry )
 void RenderFrameThread::signalDecodeDoneFromWorker( int slotIndex )
 {
     QMutexLocker locker( &m_mutex );
+    m_overlapMeter.upstreamEnd( mlv_stage_timing_now() * 1000.0 );
     if( !m_stop && slotIndex >= 0 )
     {
         if( playbackSmokeTimelineTelemetryEnabled() )
@@ -2012,8 +2097,11 @@ bool RenderFrameThread::takeReconRequestForWorker( ReconQueueEntry *entry )
     }
     if( m_reconWorkerStop || m_stop ) return false;
     if( m_reconRequests.empty() ) return false;
+    const int takenSlotIndex = m_reconRequests.front().slotIndex;
     if( entry ) *entry = m_reconRequests.front();
     m_reconRequests.pop_front();
+    m_overlapMeter.upstreamBegin( mlv_stage_timing_now() * 1000.0,
+                                  downstreamFrameInFlightLocked( takenSlotIndex ) );
     return true;
 }
 
@@ -2421,6 +2509,7 @@ void RenderFrameThread::reconFrameForWorker( const ReconQueueEntry &entry,
 void RenderFrameThread::signalReconDoneFromWorker( int slotIndex )
 {
     QMutexLocker locker( &m_mutex );
+    m_overlapMeter.upstreamEnd( mlv_stage_timing_now() * 1000.0 );
     if( !m_stop && slotIndex >= 0 )
     {
         if( playbackSmokeTimelineTelemetryEnabled() )
@@ -2851,6 +2940,8 @@ void RenderFrameThread::runPhase3( void )
         request.phase3BeforeUnlockStageTime =
             playbackSmokeTimelineTelemetryEnabled() ? mlv_stage_timing_now() : 0.0;
         m_activeRenderRequest = request;
+        m_overlapMeter.renderBegin( mlv_stage_timing_now() * 1000.0,
+                                    upstreamWorkInFlightLocked( slotIndex ) );
 
         m_mutex.unlock();
         request.phase3AfterUnlockStageTime =
@@ -2858,6 +2949,7 @@ void RenderFrameThread::runPhase3( void )
         m_activeRenderRequest = request;
         renderDecodedSlot( slotIndex, request, activePhase3Mode );
         m_mutex.lock();
+        m_overlapMeter.renderEnd( mlv_stage_timing_now() * 1000.0 );
 
         if( activePhase3Mode != Phase3Mode::Disabled
          && m_frameSlots[slotIndex].state.load( std::memory_order_acquire ) == SlotState::Decoding )

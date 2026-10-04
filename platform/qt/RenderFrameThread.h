@@ -16,6 +16,7 @@
 #include "../../src/mlv_include.h"
 #include "MainWindowGpuPreviewPolicy.h"
 #include "Phase3Mode.h"
+#include "PlaybackDecodeRenderOverlap.h"
 #include "PlaybackScaling.h"
 
 #include <array>
@@ -341,6 +342,14 @@ public:
     void setGpuPlaybackReconTextureLutSnapshotGeneration( uint64_t generation );
     bool isFrameReady( void );
     bool isIdle( void );
+    /* PLAYBACK-DECODE-RENDER-OVERLAP-1: isIdle() for the playback advance. Speculative
+     * lookahead work for a frame other than activePlaybackTarget does not count as busy
+     * (playback_overlap::blocksPlaybackAdvance), so the timer keeps native pace while
+     * frames N+1..N+depth decode, recon and render ahead of it. */
+    bool isIdleExceptPlaybackLookahead( int activePlaybackTarget,
+                                        uint64_t activeGeneration );
+    void resetPipelineOverlapMeter( void );
+    playback_overlap::OverlapSnapshot pipelineOverlapSnapshot( void );
     bool acquireLatestReadyFrame( ReadyFrame *frame );
     bool acquireOldestGpuTextureNoReadbackReadyFrame( ReadyFrame *frame );
     bool acquireLatestGpuTextureNoReadbackReadyFrame( ReadyFrame *frame );
@@ -602,6 +611,9 @@ private:
     bool m_reconWorkerStop;
     std::deque<DecodeQueueEntry> m_decodeRequests;
     std::atomic<uint64_t> m_decodeRequestsIssuedCount{ 0 };
+    playback_overlap::OverlapMeter m_overlapMeter;
+    bool downstreamFrameInFlightLocked( int excludeSlotIndex ) const;
+    bool upstreamWorkInFlightLocked( int excludeSlotIndex ) const;
     std::deque<ReconQueueEntry> m_reconRequests;
     std::deque<int> m_decodeReadySlots;
     std::deque<int> m_processReadySlots;
