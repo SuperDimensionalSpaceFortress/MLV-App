@@ -261,6 +261,10 @@ double getMlvLastRawUint16CopyMilliseconds(void);
 int getMlvLastRawUint16PrefetchHit(void);
 uint32_t mlvRawUint16PrefetchLookaheadForTesting(const mlvObject_t * video);
 int mlvRawUint16PrefetchAllowedForTesting(const mlvObject_t * video);
+/* Parks the prefetch worker after it claims a slot, before it decodes into it (process-wide). */
+void mlvSetRawUint16PrefetchHoldBeforeDecodeForTesting(int enabled);
+int mlvWaitForRawUint16PrefetchHeldBeforeDecodeForTesting(uint32_t timeout_ms);
+int mlvWaitForRawUint16PrefetchIdleForTesting(mlvObject_t * video, uint32_t timeout_ms);
 uint64_t getMlvRawUint16PrefetchDecodeFailures(mlvObject_t * video);
 double getMlvLastLlrawprocMilliseconds(void);
 double getMlvLastRawFloatConvertMilliseconds(void);
