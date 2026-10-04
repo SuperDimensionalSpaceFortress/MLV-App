@@ -984,8 +984,10 @@ TEST(GpuPreviewProcessing, DisplayShaderCombinedLookAssistPresetMatchesProductio
  * CUDA no-readback texture route presents through has no creative-curve stage, so
  * playback shows the frame WITHOUT that curve. The default receipt is ds=20 dr=70
  * (ReceiptSettings.cpp), so every default clip is affected, Look Assist on or off.
- * The engine-anchored tests above call neutralize_unported_creative_stages to stay
- * green; the two tests below measure what that switch hides. */
+ * The engine-anchored tests above used to call neutralize_unported_creative_stages
+ * to stay green, which hid exactly this stage. The display shader now applies the
+ * curve (see the note above the engine sweep helpers), the GL-free pin that
+ * asserted its absence is retired, and the test below holds the parity. */
 
 struct ChannelStats16
 {
@@ -1057,98 +1059,12 @@ static void configure_playback_seek_parity_case(MlvPipelineFixture & fixture, bo
     }
 }
 
-TEST(GpuPreviewProcessing, PlaybackSeekRenderParityPinDisplayShaderDropsTheReceiptSCurve)
-{
-    /* GREEN pin of the CURRENT difference, GL-free so it runs on every runner.
-     * (1) The receipt's S-curve is live: the config asks for the creative curves
-     *     and the curve LUT is not the identity.
-     * (2) The DISPLAY shader has no stage that could apply it (the subset shader
-     *     does). When PLAYBACK-SEEK-RENDER-PARITY-1 ports the stage, (2) goes red
-     *     and this pin is retired in favour of the RED test below turning green.
-     * (3) The engine frame WITH the curve (what a paused/seek render shows) and
-     *     WITHOUT it (what the display shader is proven to match, see the
-     *     engine-anchored tests) differ in the direction the owner saw: the
-     *     playback-route frame has lifted shadows (higher p5 in every channel). */
-    const QByteArray displayShader = gpuPreviewProcessingDisplayFragmentShaderSource();
-    const QByteArray subsetShader = gpuPreviewProcessingSubsetFragmentShaderSource();
-    ASSERT_TRUE(subsetShader.contains("contrastCurveLut"));
-    ASSERT_TRUE(subsetShader.contains("gradationLutY"));
-    ASSERT_TRUE(!displayShader.contains("contrastCurveLut"));
-    ASSERT_TRUE(!displayShader.contains("gradationLut"));
-    ASSERT_TRUE(!displayShader.contains("previewApplyCreativeCurves"));
-
-    for (int lookAssistOn = 0; lookAssistOn <= 1; ++lookAssistOn)
-    {
-        MlvPipelineFixture fixture;
-        assert_gpu_preview_fixture_ready(fixture);
-        configure_playback_seek_parity_case(fixture, lookAssistOn != 0);
-        processingObject_t * processing = fixture.processing();
-
-        const std::vector<uint16_t> seekRender = fixture.renderFrame16(0, /*threads=*/1);
-        ASSERT_TRUE(!seekRender.empty());
-        QString reason;
-        const GpuPreviewProcessingConfig config = gpuPreviewProcessingBuildConfig(processing, &reason);
-        ASSERT_TRUE(config.enabled);
-        ASSERT_TRUE(config.applyCreativeCurves);
-        ASSERT_EQ(static_cast<int>(65536u * sizeof(uint16_t)), config.contrastCurveLut.size());
-        const uint16_t * curve = reinterpret_cast<const uint16_t *>(config.contrastCurveLut.constData());
-        int nonIdentity = 0;
-        int maxPull = 0;   /* how far below the identity the dark end of the curve sits */
-        for (int index = 0; index < 65536; ++index)
-        {
-            if (std::abs(static_cast<int>(curve[index]) - index) > 1) ++nonIdentity;
-            maxPull = std::max(maxPull, index - static_cast<int>(curve[index]));
-        }
-        ASSERT_TRUE(nonIdentity > 1000);
-        ASSERT_TRUE(maxPull > 1000);
-
-        /* The CPU route's playback (and the paused gpu_preview route) present through
-         * the subset mirror, which DOES apply the curve: it must sit with the seek render. */
-        GpuPreviewProcessingConfig subsetConfig = config;
-        if (subsetConfig.applyShadowsHighlights)
-        {
-            ASSERT_TRUE(gpuPreviewProcessingAttachFrameState(
-                &subsetConfig, processing, fixture.width(), fixture.height(), &reason));
-        }
-        const std::vector<uint16_t> cpuRoutePlayback =
-            render_gpu_preview_subset_cpu_reference(fixture, subsetConfig, 0);
-
-        neutralize_unported_creative_stages(processing);
-        const std::vector<uint16_t> playbackRender = fixture.renderFrame16(0, /*threads=*/1);
-        ASSERT_EQ(seekRender.size(), playbackRender.size());
-
-        const std::array<ChannelStats16, 3> seekStats = channel_stats_u16(seekRender);
-        const std::array<ChannelStats16, 3> playbackStats = channel_stats_u16(playbackRender);
-        const std::array<ChannelStats16, 3> cpuRouteStats = channel_stats_u16(cpuRoutePlayback);
-        const char * caseLabel = lookAssistOn ? "look_assist_on" : "look_assist_off";
-        const std::string seekLine = channel_stats_line("seek_render_engine_with_receipt_scurve", seekRender);
-        const std::string playbackLine =
-            channel_stats_line("cuda_playback_display_stage_set_engine_without_scurve", playbackRender);
-        const std::string cpuRouteLine =
-            channel_stats_line("cpu_route_playback_subset_reference", cpuRoutePlayback);
-        std::cout << "[PLAYBACK-SEEK-PARITY] " << caseLabel << " " << seekLine << "\n"
-                  << "[PLAYBACK-SEEK-PARITY] " << caseLabel << " " << playbackLine << "\n"
-                  << "[PLAYBACK-SEEK-PARITY] " << caseLabel << " " << cpuRouteLine << "\n"
-                  << "[PLAYBACK-SEEK-PARITY] " << caseLabel << " curve_non_identity=" << nonIdentity
-                  << " curve_max_pull=" << maxPull << "\n";
-        test_artifacts::record(std::string("playback_seek_parity.") + caseLabel + ".seek", seekLine);
-        test_artifacts::record(std::string("playback_seek_parity.") + caseLabel + ".playback", playbackLine);
-        for (int channel = 0; channel < 3; ++channel)
-        {
-            ASSERT_TRUE(playbackStats[channel].p5 > seekStats[channel].p5);
-            ASSERT_TRUE(playbackStats[channel].mean > seekStats[channel].mean);
-            /* CPU route: within 1/255 of the seek render's mean (rounding, not a stage). */
-            ASSERT_TRUE(std::fabs(cpuRouteStats[channel].mean - seekStats[channel].mean) < 257.0);
-        }
-    }
-}
-
 TEST(GpuPreviewProcessing, PlaybackSeekRenderParity1DisplayShaderMatchesEngineWithReceiptSCurve)
 {
-    /* RED until PLAYBACK-SEEK-RENDER-PARITY-1 lands (listed in
-     * tests/pipeline/expected-failures.txt): the live DISPLAY shader against the
-     * PRODUCTION engine on a real frame with the receipt's own S-curve left on,
-     * Look Assist off. Same tolerances as every engine-anchored test. Needs GL
+    /* Was RED until PLAYBACK-SEEK-RENDER-PARITY-1 landed (its
+     * tests/pipeline/expected-failures.txt line is pruned): the live DISPLAY shader
+     * against the PRODUCTION engine on a real frame with the receipt's own S-curve
+     * left on, Look Assist off. Same tolerances as every engine-anchored test. Needs GL
      * (render_display_for_parity's backend policy); skips on a box without it. */
     MlvPipelineFixture fixture;
     assert_gpu_preview_fixture_ready(fixture);
