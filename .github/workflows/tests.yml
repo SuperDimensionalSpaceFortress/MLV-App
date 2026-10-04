@@ -626,7 +626,7 @@ jobs:
           $glDll = Join-Path $env:QT_ROOT_DIR "bin\opengl32sw.dll"
           if (-not (Test-Path -LiteralPath $glDll)) { throw "opengl32sw.dll missing from the Qt install ($glDll); display parity cannot run" }
           Copy-Item -LiteralPath $glDll -Destination (Split-Path $exe) -Force
-          $filter = 'GpuPreviewProcessing.EngineAnchored*:GpuPreviewProcessing.DisplayShaderContrastPivotMatchesProductionEngine:GpuPreviewProcessing.DisplayShaderVibranceMatchesProductionEngine:GpuPreviewProcessing.DisplayShaderShadowsHighlightsMatchesProductionEngine:GpuPreviewProcessing.DisplayShaderCombinedLookAssistPresetMatchesProductionEngine:GpuPreviewProcessing.Direct8Anchored*:GpuPreviewProcessing.HostRoute*:GpuPreviewProcessing.ShadowsHighlightsKillSwitchBypassRestoresPreFixLook'
+          $filter = 'GpuPreviewProcessing.EngineAnchored*:GpuPreviewProcessing.DisplayShaderContrastPivotMatchesProductionEngine:GpuPreviewProcessing.DisplayShaderVibranceMatchesProductionEngine:GpuPreviewProcessing.DisplayShaderShadowsHighlightsMatchesProductionEngine:GpuPreviewProcessing.DisplayShaderCombinedLookAssistPresetMatchesProductionEngine:GpuPreviewProcessing.Direct8Anchored*:GpuPreviewProcessing.HostRoute*:GpuPreviewProcessing.ShadowsHighlightsKillSwitchBypassRestoresPreFixLook:ShFrameStateProxy.DisplayShaderWithQuarterFrameStateMatchesFullResFrameState'
           $outputPath = Join-Path $env:RUNNER_TEMP "pipeline-tests-display-parity.txt"
           $psi = [System.Diagnostics.ProcessStartInfo]::new()
           $psi.FileName = $exe

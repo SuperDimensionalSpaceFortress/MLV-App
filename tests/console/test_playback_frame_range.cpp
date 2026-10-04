@@ -153,6 +153,41 @@ int countTargetsSatisfiedInOrder(
 }
 } // namespace
 
+// CONTACT-SHEET-PLAYBACK-PARITY-1: the in-pass sheet grabs on the MEASURED Play, at the first
+// presented frame past each target time. Targets are the centres of N equal slices of the play
+// window, so every one lies strictly inside it whatever fps the leg reaches (a frame-number target
+// past the last frame a slow leg reaches would never fire, and there is no replay to catch it).
+TEST( PlaybackFrameRange, ContactSheetInPassTargetsAreSliceCentresStrictlyInsideTheWindow )
+{
+    const long long windowMs = 25000;
+    long long previous = 0;
+    for( int i = 0; i < 6; ++i )
+    {
+        const long long target = playback_frame_range::contactSheetInPassTargetMs( i, 6, windowMs );
+        ASSERT_TRUE( target > previous );
+        ASSERT_TRUE( target < windowMs );
+        previous = target;
+    }
+    ASSERT_EQ( static_cast<long long>( 2083 ), playback_frame_range::contactSheetInPassTargetMs( 0, 6, windowMs ) );
+    ASSERT_EQ( static_cast<long long>( 22917 ), playback_frame_range::contactSheetInPassTargetMs( 5, 6, windowMs ) );
+    ASSERT_EQ( static_cast<long long>( 12500 ), playback_frame_range::contactSheetInPassTargetMs( 0, 1, windowMs ) );
+    ASSERT_EQ( static_cast<long long>( 0 ), playback_frame_range::contactSheetInPassTargetMs( 0, 0, windowMs ) );
+}
+
+// The grabs run on the GUI thread inside the measured interval, so the honest figure next to the
+// leg's fps is the fps with their recorded cost taken out of the elapsed time. It can only be the
+// same or higher, and it equals the measured fps when nothing was grabbed.
+TEST( PlaybackFrameRange, FpsExcludingGrabCostRemovesOnlyTheRecordedGrabTime )
+{
+    ASSERT_NEAR( 24.0, playback_frame_range::fpsExcludingGrabCost( 600, 25000.0, 0.0 ), 1e-9 );
+    ASSERT_NEAR( 600.0 / 24.88, playback_frame_range::fpsExcludingGrabCost( 600, 25000.0, 120.0 ), 1e-9 );
+    ASSERT_TRUE( playback_frame_range::fpsExcludingGrabCost( 600, 25000.0, 120.0 )
+                 > playback_frame_range::fpsExcludingGrabCost( 600, 25000.0, 0.0 ) );
+    // A grab total that swallows the whole interval is a broken record, not an infinite fps.
+    ASSERT_NEAR( 0.0, playback_frame_range::fpsExcludingGrabCost( 600, 25000.0, 25000.0 ), 1e-9 );
+    ASSERT_NEAR( 0.0, playback_frame_range::fpsExcludingGrabCost( 600, 0.0, 0.0 ), 1e-9 );
+}
+
 TEST( PlaybackFrameRange, ContactSheetTargetFrameLastTargetEqualsTheSpanEnd )
 {
     const int sheetStartFrame = 0;

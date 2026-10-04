@@ -231,6 +231,11 @@ param(
     [switch]$ContactSheet,
     [ValidateRange(1, 60)]
     [int]$ContactSheetFrames = 6,
+    # CONTACT-SHEET-PLAYBACK-PARITY-1: the -ContactSheet frames are grabbed DURING the measured Play
+    # (in-pass, playback_path=true, no replay). This switch also asks the app for a paired SEEK
+    # capture of the same frames after the Play stops (--contact-sheet-seek-dir; it never plays,
+    # playback_path=false), published apart under paired-seek\contact-sheet\raw. Off by default.
+    [switch]$ContactSheetPairedSeek,
 
     # CUDA-PLAYBACK-PRESENT-CADENCE-1 round 2 discriminating legs. HEAVY (default, unchanged
     # behavior for every existing caller) keeps every diagnostic env var PLAYBACK-ATTR-3-CUDA
@@ -492,6 +497,7 @@ $fixtureRehearsalLiteral = if ($isFixtureRehearsal) { '$true' } else { '$false' 
 # a plain bool/int literal substituted into the template, never caller text.
 $contactSheetEnabledLiteral = if ($ContactSheet) { '$true' } else { '$false' }
 $contactSheetFrameCountLiteral = [string]$ContactSheetFrames
+$contactSheetPairedSeekLiteral = if ($ContactSheet -and $ContactSheetPairedSeek) { '$true' } else { '$false' }
 
 # ATTR3-FIXTURE-STAGE-1. The compound suffix the two tracked fixtures carry is never spelled
 # as one literal token anywhere in this file: a token ending in it trips this repository's own
@@ -943,8 +949,15 @@ $timeBudgetArgs['PlaySeconds'] = [int][Math]::Max(40, $PlaySeconds)
 if ($cpuPlayPaceInformational) {
     $timeBudgetArgs['PlaySeconds'] = [int][Math]::Max($timeBudgetArgs['PlaySeconds'],
         [Math]::Ceiling((Get-GuiSmokePlaySafetyMs -Seconds $PlaySeconds -CpuPaceInformational) / 1000.0))
+    # CPU-LEG-SMOKE-CEILING-1: the runner caps a process timeout at 3600 s, and a ~3.2 GB owner input at the measured read rate plus that 765 s ceiling does not fit it
+    # with the identity read repeated at full margin. The budget shares the 3600 s instead (see Get-AttrCudaLegTimeBudget); CUDA never asks for it (a fixture CPU leg does, but has zero input bytes and so never clamps).
+    $timeBudgetArgs['ShareSmokeCeiling'] = $true
 }
 $timeBudget = Get-AttrCudaLegTimeBudget -InputBytes $clipBytesForBudget @timeBudgetArgs
+if ($timeBudget.smokeCeilingClamped) {
+    Write-Warning ("CPU-LEG-SMOKE-CEILING-1: this cpu leg's smoke timeout is held at the runner's 3600 s ceiling; the app's in-runner re-read allowance is $($timeBudget.appReadAllowanceSec) s " +
+        "(the job's own identity read keeps $($timeBudget.identityReadSec) s in the um-run timeout of $($timeBudget.jobTimeoutSec) s).")
+}
 
 # --- job body template (placeholders are substituted below; the body itself never
 #     touches this generator's variables directly, so there is no accidental capture
@@ -972,6 +985,9 @@ $FixtureRehearsal = __FIXTURE_REHEARSAL__
 $FixtureSha256 = '__FIXTURE_SHA256__'
 $ContactSheetEnabled = __CONTACT_SHEET_ENABLED__
 $ContactSheetFrameCount = __CONTACT_SHEET_FRAME_COUNT__
+# CONTACT-SHEET-PLAYBACK-PARITY-1 >>>
+$ContactSheetPairedSeek = __CONTACT_SHEET_PAIRED_SEEK__
+# CONTACT-SHEET-PLAYBACK-PARITY-1 <<<
 $ContactSheetComposerPyBase64 = '__CONTACT_SHEET_COMPOSER_PY_BASE64__'
 $ContactSheetComposerSha256 = '__CONTACT_SHEET_COMPOSER_SHA256__'
 $TelemetryArm = '__TELEMETRY_ARM__'
@@ -1035,7 +1051,7 @@ function Save-Json($Object, [string]$Path) {
 function Write-JobTrace([string]$Message) {
     Add-AttrCudaTraceLine -TracePath $Trace -Message $Message
 }
-Write-JobTrace "job start id=$JobId commit=$($SourceCommit.Substring(0,12)) clip=$ClipId fixture=$FixtureRehearsal smokeProcessTimeoutMs=$SmokeProcessTimeoutMs"
+Write-JobTrace "job start id=$JobId commit=$($SourceCommit.Substring(0,12)) clip=$ClipId fixture=$FixtureRehearsal smokeProcessTimeoutMs=$SmokeProcessTimeoutMs__SMOKE_CEILING_TRACE__"
 
 # CUDA-PERF-DISPLAY-WAKE-2 round 1c: THE VERY FIRST ACTION this job takes after claim, before the
 # TEMP boundary, before $Work/$Pub are even created, before footage resolution, before package/
@@ -1235,7 +1251,7 @@ function Start-PresentMonCapture([string]$CsvPath, [int]$ReadyTimeoutSeconds = 1
         $sweepResult = Invoke-PresentMonOrphanSweep
         foreach ($key in @($sweepResult.Keys)) { $presentMonOrphanSweep[$key] = $sweepResult[$key] }
         $sweepActionText = @($sweepResult['actions'] | ForEach-Object { $_.session + ':' + $_.method + ':' + $_.exitCode }) -join ';'
-        Write-JobTrace "step presentmon-orphan-sweep ran=$($sweepResult['ran']) skipped=$($sweepResult['skippedReason']) livePids=$(@($sweepResult['livePresentMonProcessIds']) -join ',') listed=$(@($sweepResult['listed']) -join ',') actions=$sweepActionText aborted=$($sweepResult['abortedReason']) abortedBefore=$($sweepResult['abortedBefore']) remaining=$(@($sweepResult['remaining']) -join ',') newlyListed=$(@($sweepResult['newlyListed']) -join ',') listError=$($sweepResult['listError']) error=$($sweepResult['error'])"
+        Write-JobTrace "step presentmon-orphan-sweep ran=$($sweepResult['ran']) skipped=$($sweepResult['skippedReason']) livePids=$(@($sweepResult['livePresentMonProcessIds']) -join ',') excluded=$(@($sweepResult['excludedPresentMonProcesses'] | Where-Object { $null -ne $_ } | ForEach-Object { $_['name'] + ':' + $_['pid'] }) -join ',') listed=$(@($sweepResult['listed']) -join ',') actions=$sweepActionText aborted=$($sweepResult['abortedReason']) abortedBefore=$($sweepResult['abortedBefore']) remaining=$(@($sweepResult['remaining']) -join ',') newlyListed=$(@($sweepResult['newlyListed']) -join ',') listError=$($sweepResult['listError']) error=$($sweepResult['error'])"
     }
     # UM-PRESENTMON-ORPHAN-SWEEP-1 <<<
     # Direct child: inherits this job's TEMP/TMP. -PassThru so the exit code is checked.
@@ -1311,9 +1327,51 @@ function Invoke-PresentMonSessionTerminate([string]$SessionName, [int]$TimeoutSe
 }
 
 # UM-PRESENTMON-ORPHAN-SWEEP-1 >>> (this card's text in the default job is bracketed like this; test_dual_venue_evidence strips every region to prove the rest is byte-identical to the pinned baseline)
+function Get-PresentMonProcessSnapshot() {
+    # UM-SWEEP-OWNER-PRESENTMONSERVICE-1 (Bachelor, 2026-10-03): the liveness check used to be `Get-Process -Name 'PresentMon*'`, which also matches the always-running PresentMonService (Intel
+    # PresentMon's service, the owner's) -- that process never owns a capture session of this harness, yet it skipped the sweep on both Bachelor legs, so the sweep could never run there.
+    # r2 (hub ruling on sol blocker 1, fable): a `PresentMon*` process is NOT live only when it is POSITIVELY identified as something that never owns a capture: (a) its pid is the ProcessId of a
+    # registered Windows service (Win32_Service -- the owner's PresentMonService; recorded with the service name), or (b) its path is readable, it is neither the pinned image nor the pinned path,
+    # and its image name is not a capture image (PresentMon, PresentMon-<version>-x64, ...). Everything else is LIVE: the pinned executable (image name equal to the pinned one, case-insensitive,
+    # no extension, e.g. PresentMon-2.5.1-x64; or the pinned cache path), an unreadable path that is no registered service (an unidentified process may own a capture), a foreign capture image.
+    # Every candidate records pathReadable (a boolean -- never the path text). The process list and the service lookup are read with -ErrorAction Stop: a host whose list or lookup cannot be read
+    # throws, and the sweep records the error and touches nothing (it never reads an unreadable list or an unanswered lookup as "no capture alive").
+    # operators only: the publish-write scan (attr3_publish_write_scan.ps1, R4) allowlists static members, and the path is compared as written (no GetFullPath: it expands 8.3 short names, so a runner TEMP spelled RUNNER~1 would never equal the process's own path -- the image name, not the path, is what keeps the pinned capture live then)
+    $pinnedName = ([string]$PresentMonName) -replace '\.[A-Za-z0-9]{1,4}$', ''
+    $pinnedPath = Join-Path ([string]$Cache) ([string]$PresentMonName)
+    $captureImagePattern = '^PresentMon([-_.]?(\d|x64|x86|console|capture|cli)|$)'
+    $live = @()
+    $liveDetail = @()
+    $excluded = @()
+    foreach ($candidate in @(Get-Process -Name 'PresentMon*' -ErrorAction Stop)) {
+        $candidatePath = ''
+        try { $candidatePath = [string]$candidate.Path } catch { $candidatePath = '' }
+        $pathReadable = ($candidatePath -ne '')
+        $candidateName = [string]$candidate.Name
+        $candidateId = [int]$candidate.Id
+        $reason = $null
+        $serviceName = $null
+        if ($candidateName -ieq $pinnedName) { $reason = 'pinned_image_name' }
+        elseif ($pathReadable -and $candidatePath -ieq $pinnedPath) { $reason = 'pinned_image_path' }
+        else {
+            $registered = @(Get-CimInstance -ClassName Win32_Service -Filter "ProcessId = $candidateId" -ErrorAction Stop | Where-Object { [int]$_.ProcessId -eq $candidateId })
+            if ($registered.Count -gt 0) { $serviceName = [string]$registered[0].Name }
+            elseif (-not $pathReadable) { $reason = 'unreadable_path_not_a_registered_service' }
+            elseif ($candidateName -imatch $captureImagePattern) { $reason = 'capture_image_name' }
+        }
+        if ($null -ne $reason) {
+            $live += $candidateId
+            $liveDetail += [ordered]@{ name = $candidateName; pid = $candidateId; pathReadable = $pathReadable; reason = $reason }
+        } else {
+            $excluded += [ordered]@{ name = $candidateName; pid = $candidateId; service = $serviceName; pathReadable = $pathReadable }
+        }
+    }
+    return [pscustomobject]@{ live = @($live); liveDetail = @($liveDetail); excluded = @($excluded) }
+}
+
 function Get-PresentMonLiveProcessId() {
-    # the ids of every PresentMon process on the host (any of them may own a capture, and so a session); the sweep asks this before the scan, after it, and before each action it takes
-    return @(Get-Process -Name 'PresentMon*' -ErrorAction SilentlyContinue | ForEach-Object { [int]$_.Id })
+    # the ids of every live capture-mode PresentMon (the pinned executable) on the host -- any of them may own a capture, and so a session; the sweep asks this before the scan, after it, and before each action it takes
+    return @((Get-PresentMonProcessSnapshot).live)
 }
 
 function Get-PresentMonLogmanTimeoutSecond() {
@@ -1345,7 +1403,7 @@ function Get-PresentMonEtsListing() {
 function Invoke-PresentMonOrphanSweep() {
     # UM-PRESENTMON-ORPHAN-SWEEP-1 item 1 (Ultra-Magnus, 2026-10-03): an orphaned default-named PresentMon ETW session made every other-named session lose all of its events, so
     # no CSV was written; the per-job session name (UM-PRESENTMON-STOP-1) meant --stop_existing_session no longer cleared it. Before a capture starts this terminates the default
-    # `PresentMon` session and every `MLVAttr3-*` session that `logman query -ets` lists -- but ONLY when no PresentMon process is alive on the host: a live one may own a capture,
+    # `PresentMon` session and every `MLVAttr3-*` session that `logman query -ets` lists -- but ONLY when no live PresentMon capture is on the host (Get-PresentMonProcessSnapshot: the owner's PresentMonService is positively recognised and does not count; an unidentified PresentMon does): a live one may own a capture,
     # and a session a live capture owns is never an orphan (the sweep then records that it did not run, and why). Each session goes through the pinned PresentMon's own
     # --terminate_existing_session (Invoke-PresentMonSessionTerminate, the helper the clean stop already uses); `logman stop <name> -ets` runs only for a session STILL listed after
     # that, because a failed helper must not leave the orphan this card exists to remove, and what remains afterwards is recorded rather than assumed gone. Never throws and never
@@ -1353,10 +1411,15 @@ function Invoke-PresentMonOrphanSweep() {
     # r2 (sol blocker 1, fable UM-SWEEP-FALLBACK-SCOPE-1): the sweep acts ONLY on the names in $listed -- the orphan list captured before the second liveness check -- never on a name a later
     # listing shows (that is another job's capture that started meanwhile, recorded in newlyListed and left alone), and liveness (no PresentMon process) is re-checked immediately before EACH
     # terminate and EACH logman stop: the first process that appears stops the sweep (abortedReason / abortedBefore) and what is left is still listed in `remaining`.
-    $record = [ordered]@{ ran = $false; skippedReason = $null; abortedReason = $null; abortedBefore = $null; livePresentMonProcessIds = @(); listed = @(); matchingListingLines = @(); listAttempts = 0; actions = @(); remaining = @(); newlyListed = @(); listError = $null; error = $null }
+    $record = [ordered]@{ ran = $false; skippedReason = $null; abortedReason = $null; abortedBefore = $null; livePresentMonProcessIds = @(); livePresentMonProcesses = @(); excludedPresentMonProcesses = @(); listed = @(); matchingListingLines = @(); listAttempts = 0; actions = @(); remaining = @(); newlyListed = @(); listError = $null; error = $null }
     try {
-        $live = @(Get-PresentMonLiveProcessId)
+        $snapshot = Get-PresentMonProcessSnapshot
+        $live = @($snapshot.live)
         $record['livePresentMonProcessIds'] = $live
+        # UM-SWEEP-OWNER-PRESENTMONSERVICE-1: what made each process live (name, pid, pathReadable, reason) and the PresentMon* processes positively identified as not a capture (the owner's
+        # PresentMonService: name, pid, service, pathReadable) -- evidence only, never a path; the excluded ones never skip the sweep
+        $record['livePresentMonProcesses'] = @($snapshot.liveDetail)
+        $record['excludedPresentMonProcesses'] = @($snapshot.excluded)
         if ($live.Count -gt 0) {
             $record['skippedReason'] = 'presentmon_process_alive'
             return $record
@@ -2511,6 +2574,17 @@ if ($ContactSheetEnabled) {
     # playback-mode contact sheet is a second Play of the measured span (a replay) and is refused
     # (REPLAY_REFUSED); the seek capture never plays. Its sidecars record playback_path=false.
     $contactSheetAdditionalArgs = "@('--contact-sheet-dir', $(ConvertTo-PsSingleQuoted $contactSheetDir), '--contact-sheet-frames', '$ContactSheetFrameCount', '--contact-sheet-seek-mode')"
+    # CONTACT-SHEET-PLAYBACK-PARITY-1 >>>
+    # Supersedes the line above: the app's default capture now grabs the frames DURING the measured
+    # Play (in-pass, playback_path=true, no replay; its readback cost is recorded per frame), so the
+    # sheet shows what played. A seek sheet (playback_path=false: a seeked frame takes a different
+    # render path and can look different) is added only when -ContactSheetPairedSeek asks for it.
+    $contactSheetAdditionalArgs = "@('--contact-sheet-dir', $(ConvertTo-PsSingleQuoted $contactSheetDir), '--contact-sheet-frames', '$ContactSheetFrameCount')"
+    if ($ContactSheetPairedSeek) {
+        $contactSheetSeekDir = Join-Path $Work 'contact-sheet-seek'
+        $contactSheetAdditionalArgs = "@('--contact-sheet-dir', $(ConvertTo-PsSingleQuoted $contactSheetDir), '--contact-sheet-frames', '$ContactSheetFrameCount', '--contact-sheet-seek-dir', $(ConvertTo-PsSingleQuoted $contactSheetSeekDir))"
+    }
+    # CONTACT-SHEET-PLAYBACK-PARITY-1 <<<
     $cmd = "$cmd -AdditionalArgs $contactSheetAdditionalArgs"
 }
 # CUDA-PERF-DISPLAY-IDENTITY-HARNESS-1/2/3 (sol BLOCKER 2 / fable HARDENING, direction corrected
@@ -3707,6 +3781,13 @@ Save-Json ([ordered]@{
 # artifact index below so these land in it the same way every other published file does.
 if ($ContactSheetEnabled -and $contactSheetDir -and (Test-Path -LiteralPath $contactSheetDir)) {
     $contactSheetPubDir = Publish-AttrCudaContactSheetRawCaptures -Enabled $ContactSheetEnabled -SourceDir $contactSheetDir -PubRoot $Pub
+    # CONTACT-SHEET-PLAYBACK-PARITY-1 >>>
+    # The paired seek capture, when asked for, publishes under its own labelled root
+    # (paired-seek\contact-sheet\raw), never mixed into the in-pass frames above.
+    if ($ContactSheetPairedSeek) {
+        [void](Publish-AttrCudaContactSheetRawCaptures -Enabled $ContactSheetEnabled -SourceDir (Join-Path $Work 'contact-sheet-seek') -PubRoot (Join-Path $Pub 'paired-seek'))
+    }
+    # CONTACT-SHEET-PLAYBACK-PARITY-1 <<<
     # CUDA-PLAYBACK-CONTACT-SHEET-1 r1b: compose the raw captures into one labelled sheet +
     # stats sidecar right here, in the job's publish step, so a reader gets the composed
     # artifact without running make-contact-sheet.py by hand. Pillow/numpy (and Python
@@ -4043,11 +4124,15 @@ $text = Expand-AttrCudaTemplate -Template $template -Tokens ([ordered]@{
     FIXTURE_SHA256 = $FixtureSha256
     CONTACT_SHEET_ENABLED = $contactSheetEnabledLiteral
     CONTACT_SHEET_FRAME_COUNT = $contactSheetFrameCountLiteral
+    CONTACT_SHEET_PAIRED_SEEK = $contactSheetPairedSeekLiteral
     CONTACT_SHEET_COMPOSER_PY_BASE64 = $contactSheetComposerPyBase64
     CONTACT_SHEET_COMPOSER_SHA256 = $contactSheetComposerSha256ForTemplate
     TELEMETRY_ARM = $TelemetryArm
     DISABLE_PAINT_PER_SUBMIT = $disablePaintPerSubmitLiteral
     SMOKE_PROCESS_TIMEOUT_MS = [string]$timeBudget.smokeProcessTimeoutMs
+    # CPU-LEG-SMOKE-CEILING-1: only a clamped leg traces the clamp and the in-runner re-read allowance it left (so a process timeout on it is attributable from the
+    # evidence log); every other leg expands this to nothing, so its job is the text it was before the card.
+    SMOKE_CEILING_TRACE = $(if ($timeBudget.smokeCeilingClamped) { " smokeCeilingClamped=True appReadAllowanceSec=$([int]$timeBudget.appReadAllowanceSec)" } else { '' })
     PLAY_SECONDS = [string]$PlaySeconds
     RUNNER_ACCEPTS_VERIFIED_CLIP_BINDING = $runnerAcceptsVerifiedClipBindingLiteral
     # DUAL-VENUE-EVIDENCE-1: each default below expands to exactly the text that was literal before.

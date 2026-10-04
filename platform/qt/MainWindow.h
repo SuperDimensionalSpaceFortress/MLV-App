@@ -17,6 +17,7 @@
 #include <QThreadPool>
 #include <QProcess>
 #include <QVector>
+#include <QElapsedTimer>
 #include <QJsonObject>
 #include <QImage>
 #include <QPixmap>
@@ -156,13 +157,17 @@ public:
         QString windowScreenshotOutputPath;
         QString contactSheetDir; // --contact-sheet-dir: opt-in, default empty (off). Paired with contactSheetFrames.
         int contactSheetFrames = 0; // --contact-sheet-frames: N evenly spaced presented-frame grabs; 0 = off.
-        // --contact-sheet-seek-mode: opt-in, default off. The default capture pass replays the
-        // measured span via a genuine second (un-timed) PLAYBACK pass, so every grab comes from
-        // the real playback fast path (CUDA texture-present included) the owner is auditing --
-        // never a paused/seeked frame, which is rendered by a different, non-playback path and
-        // can show a different look. This flag keeps the OLD seek-then-grab capture available as
-        // an explicit, labelled alternative (its sidecars record playback_path=false).
+        // --contact-sheet-seek-mode: opt-in, default off. The default capture grabs N frames as the
+        // MEASURED Play presents them (CONTACT-SHEET-PLAYBACK-PARITY-1: no replay), so every grab
+        // comes from the real playback fast path (CUDA texture-present included) the owner is
+        // auditing -- never a paused/seeked frame, which is rendered by a different, non-playback
+        // path and can show a different look. This flag replaces that capture with the seek-then-
+        // grab one, an explicit, labelled alternative (its sidecars record playback_path=false).
         bool contactSheetSeekMode = false;
+        // --contact-sheet-seek-dir: opt-in, default empty. Keeps the in-pass capture AND writes a
+        // paired seek capture of the same N targets here, after the measured Play has stopped
+        // (it never plays; its sidecars record playback_path=false).
+        QString contactSheetSeekDir;
         PlaybackProfileScope scope = PlaybackProfileScope::None;
         PlaybackProfileDebayerRequest playbackDebayer =
             PlaybackProfileDebayerRequest::Auto;
@@ -1136,18 +1141,23 @@ private:
     // early-return on every presented frame). Never true outside runGuiPlaybackSmoke's own
     // contact-sheet block.
     bool m_contactSheetOptionsPresent = false;
-    QString m_contactSheetCaptureDir;
-    QVector<int> m_contactSheetCaptureTargetFrames;
+    // CONTACT-SHEET-PLAYBACK-PARITY-1: the in-pass capture's targets are times since the measured
+    // Play started (m_contactSheetCaptureClock, started with the measured playbackClock). The hook
+    // only reads the presented framebuffer back (timed) and parks the image + sidecar here; the
+    // PNG encode and every file write happen after the measured Play has stopped.
+    struct ContactSheetPendingGrab
+    {
+        QImage image;
+        QJsonObject sidecar;
+        double grabMs = 0.0;
+        qint64 grabElapsedMs = 0;
+    };
+    QElapsedTimer m_contactSheetCaptureClock;
+    QVector<qint64> m_contactSheetCaptureTargetMs;
+    QVector<ContactSheetPendingGrab> m_contactSheetPendingGrabs;
     int m_contactSheetCaptureNextTargetIndex = 0;
     int m_contactSheetCaptureStartFrame = 0;
-    // CUDA-PLAYBACK-CONTACT-SHEET-2: the measured span's end frame and whether that span was
-    // derived from a wrapped (looping) run -- recorded here purely so noteContactSheetPresentedFrame(),
-    // which only sees one presented frame at a time, can stamp each sidecar with the SAME
-    // span_start/span_end/span_wrapped values runGuiPlaybackSmoke computed once up front.
-    int m_contactSheetCaptureEndFrame = 0;
-    bool m_contactSheetCaptureWrapped = false;
     double m_contactSheetCaptureFps = 0.0;
-    int m_contactSheetCaptureFramesWritten = 0;
     QString m_contactSheetCaptureError;
     uint64_t m_dualIsoWarmupTelemetryPresentationGeneration = 0;
     int m_dualIsoWarmupTelemetryPresentedFrames = 0;
