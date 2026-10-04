@@ -1259,7 +1259,8 @@ TEST(LookAssistFixtureScene, TheApertureBoundThroughTheRealHeadlessPath)
         const QString tail = appliedLineDecisionTail( run.log );
         ASSERT_TRUE( tail.startsWith( QStringLiteral("has_ev100=0 ev100=NA daylight_gate=exposure ") ) );
         ASSERT_TRUE( tail.endsWith( QStringLiteral(
-            "ev100_bound=0.643 ev100_source=aperture_bound surface_search=not-run surface_search_balance=NA") ) );
+            "ev100_bound=0.643 ev100_source=aperture_bound surface_search=not-run surface_search_balance=NA "
+            "flavor=classic") ) );
         const QString log = QString::fromUtf8( run.log );
         ASSERT_TRUE( log.contains( QStringLiteral("LOOK_ASSIST window_lit_interior frame=0 wouldReclassify=") ) );
         ASSERT_TRUE( log.contains( QStringLiteral(" applied=false exposureBound=false ") ) );
@@ -1279,7 +1280,8 @@ TEST(LookAssistFixtureScene, TheApertureBoundThroughTheRealHeadlessPath)
                 std::fprintf( stderr, "APERTURE-BOUND %s\n", line.constData() );
         const QString tail = appliedLineDecisionTail( run.log );
         ASSERT_TRUE( tail.endsWith( QStringLiteral(
-            "ev100_bound=10.406 ev100_source=aperture_bound surface_search=not-run surface_search_balance=NA") ) );
+            "ev100_bound=10.406 ev100_source=aperture_bound surface_search=not-run surface_search_balance=NA "
+            "flavor=classic") ) );
         const QString log = QString::fromUtf8( run.log );
         ASSERT_TRUE( log.contains( QStringLiteral("wouldReclassify=false reason=not-processed-solve ") ) );
         ASSERT_TRUE( log.contains( QStringLiteral(" applied=false exposureBound=true recoveryIso=1600 ") ) );
