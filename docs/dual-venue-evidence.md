@@ -294,16 +294,15 @@ into one `cuda | cpu` sheet, by frame index. Each receipt's `look` block carries
 path; the pair is its own record (`mlv-app/dual-venue-sheet-pair/v1`) because receipts are never edited.
 
 * `lookFlavor` (`classic` default | `cinematic`) is in the leg spec and the receipt subject and is passed
-  to the app as `MLVAPP_LOOK_ASSIST_FLAVOR`. **The app does not read it yet** (LOOK-ASSIST-FLAVORS-1), so
-  every receipt says `lookFlavorHonored: "unknown"` -- never a claim that it applied.
-  **Audit (DVE-SCALE2-LOOK-LEG-1):** nothing in `platform/` or `src/` reads that variable, and the app's
-  `look_assist.apply.result` line carries scene / statistics / preset values but **no flavor field**
-  (the "Cinematic 1/2/3" entries in `film.h` and the main window are unrelated film filters). So a
-  `cinematic` receipt would prove the spec *asked* for that flavor and nothing more; `lookFlavorHonored` stays
-  `unknown` until the app can select a flavor and report the one it applied, at which point the job must
-  record that report (a unit test trips when the app starts reading the variable). **No cinematic leg spec
-  ships** until LOOK-ASSIST-FLAVORS-1 adds the flavor: a committed spec would produce a sheet labelled
-  cinematic that renders Classic.
+  to the app as `MLVAPP_LOOK_ASSIST_FLAVOR`. The app reads it (LOOK-ASSIST-FLAVORS-1,
+  [docs/look-assist-flavors.md](look-assist-flavors.md)) and reports the flavor it applied on
+  `gui_smoke.visual_state` (`look_assist_flavor`). The job copies that report into its summary as
+  `lookFlavorReported`; the receipt's `look` block carries `lookFlavorReported` and
+  `lookFlavorHonored` = the report equals the requested flavor (`true`), anything else is `false` (another
+  flavor, or an app that reported nothing = `none`). `"unknown"` is only for a job that never ran. The sheet
+  pair's `lookFlavorHonored` is `true` only when both legs' receipts say `true`.
+  **No cinematic leg spec ships yet** (DVE-SCALE2-LOOK-LEG-1 held it back until the app could select and report a flavor);
+  with the app now reporting the flavor, a cinematic leg is a follow-up spec card, not part of this change.
 * Shipped look legs: `m16-1243-look` (Classic, requests scale 4, cuda and cpu) and `m16-1243-look-scale2` (the Classic leg at
   `scaleFactor` 2, **cpu only**). See "Requested scale and rendered scale" below for why the scale-2 leg has no CUDA backend.
 * The sheet copy (`-SheetCopyDir`) and the pair files carry the **leg id** --
