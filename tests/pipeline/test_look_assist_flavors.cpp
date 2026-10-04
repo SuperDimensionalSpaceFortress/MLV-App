@@ -3,7 +3,9 @@
 //  - Classic (the environment unset, or MLVAPP_LOOK_ASSIST_FLAVOR=classic) reproduces MASTER exactly: the receipt
 //    sliders, the applied line (but for the appended flavor field) and the sha256 of the rendered frame equal
 //    tests/fixtures/look_assist_flavor_classic_baseline.txt, dumped from an UNCHANGED fork/master b5751928 tree
-//    with the same helper (look_assist_flavor_run.h).
+//    with the same helper (look_assist_flavor_run.h). LOOK-ASSIST-DISPLAY-METER-ALL-SCALES-1 deliberately moves
+//    headless Classic's exposure onto the shared display meter, so its three rows were re-dumped with that same
+//    helper from this tree (Classic, flavor unset); the console grid pin (master's preset function) is untouched.
 //  - Cinematic changes only the documented sliders, by the one table, deterministically, never the white
 //    balance, and is always reported.
 //  - An unknown environment value is Classic, with a logged warning.

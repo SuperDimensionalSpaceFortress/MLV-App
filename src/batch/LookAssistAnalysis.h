@@ -166,7 +166,8 @@ enum class LookAssistPostWalkBranch
 };
 
 /* What a consumer knows about HOW the verdict and balance were reached, handed to
- * lookAssistDecisionLogFields. Defaults are the headless applier's: no picture asked, no walk, no display meter. */
+ * lookAssistDecisionLogFields. Defaults are the headless applier's: no picture asked, no walk, no playback scale; the
+ * display meter runs at every scale in both consumers, so each sets displayMeterRan when it produced samples. */
 struct LookAssistDecisionTrace
 {
     bool pictureEvidenceAsked = false;                       // a render callback was given to resolveLookAssistScene
@@ -359,6 +360,12 @@ struct LookAssistWhiteBalanceRequest
     // solver run on it, every candidate surface is also judged on the unstepped base picture, and the result
     // is verified on that same surface at the solution. Unset (or nothing acquired) = master's balance.
     LookAssistRenderBalanceFn renderBalance;
+    // The exposure (in receipt units) the colour analysis pictures are rendered at when it is not the exposure that
+    // gets applied: the daylight neutral-patch gates were calibrated on the picture at the scene's own lift, and the
+    // display-space meter then sets the exposure that is applied (a different, usually lower, one). Unset
+    // (kLookAssistNoAnalysisExposure) = the preset's own exposure.
+    static constexpr int kLookAssistNoAnalysisExposure = -100000;
+    int analysisExposure = kLookAssistNoAnalysisExposure;
     // The narrowing switch, per request (default: lookAssistRefineDaylightWithoutPatchEnabled()).
     bool refineWithoutPatch = lookAssistRefineDaylightWithoutPatchEnabled();
 };
