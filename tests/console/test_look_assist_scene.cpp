@@ -1500,7 +1500,7 @@ TEST(LookAssistDisplayMeterWiring, TheGuiRunsTheMeterAtEveryPlaybackScaleThrough
     ASSERT_EQ( 3, window.count( QStringLiteral("displayStatsValidUi ? &displayStatsUi : nullptr") ) );
     // the colour pictures stay judged at the scene's own lift, not at the metered exposure the daylight patch gates were
     // never calibrated at (measured: at the metered exposure the tracked daylight clips fell back to the night path)
-    ASSERT_TRUE( window.contains( QStringLiteral("wbRequest.analysisExposure = presetForLookAssistScene( scene, stats ).exposure;") ) );
+    ASSERT_TRUE( window.contains( QStringLiteral("wbRequest.analysisExposure = presetForLookAssistScene( scene, stats, nullptr, nullptr, flavorForTheWalk ).exposure;") ) );
 }
 
 // ---------------------------------------------------------------------------------------------------------------
@@ -2306,7 +2306,7 @@ TEST(LookAssistDisplayMeterWiring, HeadlessRunsTheSameMeterAndThereIsOnlyOneImpl
     ASSERT_TRUE( headless.contains( QStringLiteral("lookAssistDisplayMeter(") ) );
     // the preset and the measure-only window-lit check both get the metered stats, as in the GUI
     ASSERT_EQ( 2, headless.count( QStringLiteral("displayStatsValid ? &displayStats : nullptr") ) );
-    ASSERT_TRUE( headless.contains( QStringLiteral("wbRequest.analysisExposure = presetForLookAssistScene( scene, stats ).exposure;") ) );
+    ASSERT_TRUE( headless.contains( QStringLiteral("wbRequest.analysisExposure = presetForLookAssistScene( scene, stats, nullptr, nullptr, flavor ).exposure;") ) );
     ASSERT_FALSE( headless.contains( QStringLiteral("playback_scale_factor_active") ) );
     // the meter's sample frames live in exactly one place, so GUI and batch cannot drift apart again
     ASSERT_EQ( 1, applier.count( QStringLiteral("{ 0.15, 0.5, 0.85 }") ) );

@@ -16519,7 +16519,7 @@ void MainWindow::applyLookAssistToReceipt( ReceiptSettings *receipt,
     // The colour pictures were rendered at the scene's own lift; the daylight patch gates judge them there, and the
     // metered exposure is only what gets applied.
     if( displayStatsValidUi )
-        wbRequest.analysisExposure = presetForLookAssistScene( scene, stats ).exposure;
+        wbRequest.analysisExposure = presetForLookAssistScene( scene, stats, nullptr, nullptr, flavorForTheWalk ).exposure;
     wbRequest.scene = scene;
     wbRequest.patch = autoWbPatch;
     wbRequest.solvedOnProcessedPicture = useProcessedColorStats;
