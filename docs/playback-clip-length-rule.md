@@ -126,6 +126,21 @@ FRAME:
 | `PLAY_SAFETY_TIMEOUT` (launcher kill), `PLAY_NOT_FINISHED`, `APP_EXIT_NONZERO` | `Get-GuiSmokeEvidencePlayVerdict`: the launcher had to kill the app, the app never reported an exit code, or exited non-zero | exit 43 |
 | `SOURCE_FRAMES_INVALID` | the attribution job's oracle (`Get-AttrCudaSourceFramesVerdict`) | exit 29 |
 
+### The engine never plays faster than native (PLAYBACK-CUDA-NATIVE-PACE-1)
+
+`pace_fps` is the pace the engine was TOLD. The timeline rate is `source_advanced` divided by the wall seconds of the
+measured Play (`elapsed_ms` on `playback_smoke.summary`, the same QPC clock the engine paces on). On Ultra-Magnus
+(RTX 4090, CUDA texture route, scale 1) a 23.976 clip played at 31.6 timeline fps while `pace_fps` still read 23.976.
+The cause was the CUDA early advance on present: `timerFrameEvent( true )` rounded a short tick up to a whole frame.
+
+* **The engine never runs faster than native.** `playback_native_pace::NativePaceGuard` (`platform/qt/PlaybackNativePaceGuard.h`)
+  is the ceiling on every engine advance in `playbackHandling()`. Credit accrues at the pace fps per wall second and at
+  most one frame is carried. Source frames advanced are therefore at most 1 + elapsed x pace fps, on every backend and at
+  every scale. The Loop wrap from cut-out back to cut-in spends a frame of credit too (`grantLoopWrap`), so a short loop
+  holds the ceiling across the boundary. A renderer slower than native still drops or holds exactly as before.
+* **The receipt oracles do not yet judge the observed rate.** That check is split to the successor card
+  PLAYBACK-OBSERVED-RATE-ORACLE-1.
+
 ### Pacing isolation: the venue's persisted pacing is never read
 
 `QSettings( UserScope, org, app )` is always the native store, so the app cannot be redirected from outside; every

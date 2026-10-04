@@ -31,6 +31,7 @@
 #include "../../src/batch/LookAssistAnalysis.h"   // LookAssistFlavor, and the LookAssistAppliedMarker member below
 #include "SessionModel.h"
 #include "PlaybackFrameRange.h"
+#include "PlaybackNativePaceGuard.h"
 #include "../../src/mlv_include.h"
 #include "InfoDialog.h"
 #include "StatusDialog.h"
@@ -1125,6 +1126,9 @@ private:
     int64_t m_playRequiredSourceFrames = 0;
     double m_playRequestedSeconds = 0.0;
     double m_playPaceFps = 0.0;
+    // PLAYBACK-CUDA-NATIVE-PACE-1: the ceiling on every engine advance in playbackHandling() -- the timeline never
+    // runs faster than getFramerate() (native, or the explicit fpsOverride). Reset on every Play start and stop.
+    playback_native_pace::NativePaceGuard m_playbackPaceGuard;
     bool m_automationPacingIsolated = false;
     // ENFORCE-4: the autoplay hook's verdict is a fail-closed LATCH (PlaybackFrameRange.h): armed failing (14) when the hook
     // is installed, cleared only by consumption (Reached). Closing the app before the poll resolves exits 14, never 0.
