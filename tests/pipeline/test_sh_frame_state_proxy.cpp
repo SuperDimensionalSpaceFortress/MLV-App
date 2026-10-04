@@ -5,6 +5,7 @@
 
 #include "../../platform/qt/GpuPreviewProcessing.h"
 #include "../../src/processing/raw_processing.h"
+#include "../../src/processing/rbfilter/rbf_wrapper.h"
 #include "../../src/debayer/debayer.h"
 #include "../../src/mlv/video_mlv.h"
 #include "../../src/debug/StageTiming.h"
@@ -468,6 +469,36 @@ TEST(ShFrameStateProxy, CpuReferenceWithQuarterFrameStateMatchesFullResFrameStat
     std::vector<uint16_t> noSh(pair.frame.size(), 0);
     gpuPreviewProcessingApplyCpuReference(shOff, pair.frame.data(), noSh.data(), w, h);
     ASSERT_TRUE(noSh != fromFull);
+}
+
+TEST(ShFrameStateProxy, RbfParallelVerticalLeavesFixtureExportFramesUnchanged)
+{
+    /* PLAYBACK-SH-RBF-PARALLEL-1: the processed-export path
+     * (getMlvProcessedFrame16) with the HQ receipt, Look Assist S/H and the
+     * RBF denoiser must be byte-identical with the serial vertical passes. */
+    MlvPipelineFixture fixture;
+    open_fixture(fixture);
+    processingObject_t * processing = fixture.processing();
+    auto render = [&](int mode, uint64_t frame, int luma) {
+        recursive_bf_set_parallel_vertical_override(mode);
+        processing->rbfDenoiserLuma = luma;
+        processing->rbfDenoiserChroma = luma / 2;
+        processing->rbfDenoiserRange = 55;
+        return fixture.renderFrame16(frame, host_threads());
+    };
+    for (uint64_t frame = 0; frame < 2; ++frame)
+    {
+        const std::vector<uint16_t> serial = render(0, frame, 60);
+        /* Not vacuous: the RBF denoiser and S/H each change this export frame. */
+        ASSERT_TRUE(render(0, frame, 0) != serial);
+        processingSetShadows(processing, 0.0);
+        processingSetHighlights(processing, 0.0);
+        ASSERT_TRUE(render(0, frame, 60) != serial);
+        processingSetShadows(processing, 0.32);
+        processingSetHighlights(processing, -0.26);
+        record_and_assert_exact("export_frame_serial_vs_parallel_vertical", diff_rgb16(serial, render(1, frame, 60)));
+    }
+    recursive_bf_set_parallel_vertical_override(-1);
 }
 
 TEST(ShFrameStateProxy, DisplayShaderWithQuarterFrameStateMatchesFullResFrameState)

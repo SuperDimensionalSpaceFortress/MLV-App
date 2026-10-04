@@ -655,11 +655,12 @@ TEST(ProcessingFilters, RbfFilterParallelVerticalMatchesSerialBitExact)
     ASSERT_TRUE(compared_runs > 100);
 }
 
-TEST(ProcessingFilters, RbfParallelVerticalLeavesExportAndPlaybackOutputUnchanged)
+TEST(ProcessingFilters, RbfParallelVerticalLeavesPlaybackShBlurUnchanged)
 {
-    /* The filter is shared by export (applyProcessingObject: full-res S/H blur
-     * and the RBF denoiser) and by playback (the quarter-res S/H blur). Both
-     * must be byte-identical with the serial vertical passes. */
+    /* Playback's S/H blur (the RBF on the standard x1 lane) must be
+     * byte-identical with the serial vertical passes. The export path is proven
+     * on real footage by ShFrameStateProxy.RbfParallelVerticalLeavesFixture-
+     * ExportFramesUnchanged. */
     ProcessingPlaybackPreviewModeScope playback_scope;
     processingResetShadowsHighlightsQuarterresEnvCacheForTesting();
 
@@ -667,21 +668,6 @@ TEST(ProcessingFilters, RbfParallelVerticalLeavesExportAndPlaybackOutputUnchange
     const int height = 121;
     const std::vector<uint16_t> input = make_rbf_stress_image(width, height, 3, 77u);
 
-    auto render_export = [&](int mode) {
-        recursive_bf_set_parallel_vertical_override(mode);
-        processingSetPlaybackPreviewMode(0);
-        processingObject_t * processing = initProcessingObject();
-        processingSetShadows(processing, 0.66);
-        processingSetHighlights(processing, -0.26);
-        processingSetRbfDenoiserLuma(processing, 60);
-        processingSetRbfDenoiserChroma(processing, 40);
-        processingSetRbfDenoiserRange(processing, 55);
-        std::vector<uint16_t> source = input;
-        std::vector<uint16_t> output(input.size(), 0);
-        applyProcessingObject(processing, width, height, source.data(), output.data(), 4, 1, 0);
-        freeProcessingObject(processing);
-        return output;
-    };
     auto render_playback_blur = [&](int mode) {
         recursive_bf_set_parallel_vertical_override(mode);
         processingSetPlaybackPreviewMode(1);
@@ -706,16 +692,13 @@ TEST(ProcessingFilters, RbfParallelVerticalLeavesExportAndPlaybackOutputUnchange
         return blur;
     };
 
-    std::vector<uint16_t> serial_export;
     std::vector<uint16_t> serial_blur;
     {
 #ifdef _OPENMP
         OpenMpThreadCountScope threads(4);
 #endif
-        serial_export = render_export(0);
         serial_blur = render_playback_blur(0);
     }
-    ASSERT_TRUE(count_differing(serial_export, input) > 0);
     ASSERT_TRUE(!serial_blur.empty());
 
     const int thread_counts[] = { 1, 3, 8 };
@@ -724,7 +707,6 @@ TEST(ProcessingFilters, RbfParallelVerticalLeavesExportAndPlaybackOutputUnchange
 #ifdef _OPENMP
         OpenMpThreadCountScope threads(threads_count);
 #endif
-        ASSERT_EQ(hash_image(serial_export), hash_image(render_export(1)));
         ASSERT_EQ(hash_image(serial_blur), hash_image(render_playback_blur(1)));
     }
     recursive_bf_set_parallel_vertical_override(-1);
