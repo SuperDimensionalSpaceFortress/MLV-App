@@ -1243,13 +1243,26 @@ static uint16_t * mlv_ensure_thread_scaled_input_buffer(uint64_t required_words)
 
 static int getMlvRawFrameUint16Direct(mlvObject_t * video, uint64_t frameIndex, uint16_t * unpackedFrame);
 
+/* LOOK-ASSIST-DUALISO-DETERMINISM-1: the worker decodes into its claimed slot OUTSIDE the mutex, so a DECODING
+ * slot stays reserved until the worker finishes it: a reset keeps it (the worker then sees the stale generation
+ * and marks it EMPTY), and a foreground store never reuses it. Reusing it let the worker's late write of another
+ * frame land in a slot labelled READY for the stored frame, so every later read of that frame copied a mix of
+ * both (the headless Look Assist on large_dual_iso frame 10: 6310 K or 6300 K, about 1 run in 20 under load). */
 static void mlv_reset_raw_uint16_prefetch_locked(mlvObject_t * video)
 {
     video->raw_uint16_prefetch_request_pending = 0;
     video->raw_uint16_prefetch_request_stride = 1;
-    memset(video->raw_uint16_prefetch_slot_state, 0, sizeof(video->raw_uint16_prefetch_slot_state));
-    memset(video->raw_uint16_prefetch_slot_frame, 0, sizeof(video->raw_uint16_prefetch_slot_frame));
-    memset(video->raw_uint16_prefetch_slot_generation, 0, sizeof(video->raw_uint16_prefetch_slot_generation));
+    for (uint32_t slot = 0; slot < MLV_RAW_UINT16_PREFETCH_SLOTS; ++slot)
+    {
+        if (video->raw_uint16_prefetch_worker_busy
+            && video->raw_uint16_prefetch_slot_state[slot] == MLV_RAW_UINT16_PREFETCH_DECODING)
+        {
+            continue;
+        }
+        video->raw_uint16_prefetch_slot_state[slot] = MLV_RAW_UINT16_PREFETCH_EMPTY;
+        video->raw_uint16_prefetch_slot_frame[slot] = 0;
+        video->raw_uint16_prefetch_slot_generation[slot] = 0;
+    }
     video->raw_uint16_prefetch_next_slot = 0;
 }
 
@@ -1326,11 +1339,20 @@ static void mlv_raw_uint16_prefetch_store_frame(mlvObject_t * video,
     }
 
     int slot = mlv_raw_uint16_prefetch_find_slot_locked(video, frameIndex);
-    if (slot < 0)
+    for (uint32_t tries = 0; slot < 0 && tries < MLV_RAW_UINT16_PREFETCH_SLOTS; ++tries)
     {
-        slot = (int)video->raw_uint16_prefetch_next_slot;
+        const uint32_t candidate = video->raw_uint16_prefetch_next_slot;
         video->raw_uint16_prefetch_next_slot =
             (video->raw_uint16_prefetch_next_slot + 1) % MLV_RAW_UINT16_PREFETCH_SLOTS;
+        if (video->raw_uint16_prefetch_slot_state[candidate] != MLV_RAW_UINT16_PREFETCH_DECODING)
+        {
+            slot = (int)candidate;
+        }
+    }
+    if (slot < 0)
+    {
+        pthread_mutex_unlock(&video->raw_uint16_prefetch_mutex);
+        return;
     }
 
     uint16_t * slotBuffer = mlv_raw_uint16_prefetch_slot_ptr(video, (uint32_t)slot);
@@ -1413,6 +1435,26 @@ static void mlv_raw_uint16_prefetch_note_request(mlvObject_t * video, uint64_t f
     video->raw_uint16_prefetch_request_pending = 1;
     pthread_cond_signal(&video->raw_uint16_prefetch_cond);
     pthread_mutex_unlock(&video->raw_uint16_prefetch_mutex);
+}
+
+/* Test hook: the worker parks here holding a claimed (DECODING) slot until the hold is released. */
+static pthread_mutex_t g_mlv_raw_uint16_prefetch_test_mutex = PTHREAD_MUTEX_INITIALIZER;
+static pthread_cond_t g_mlv_raw_uint16_prefetch_test_cond = PTHREAD_COND_INITIALIZER;
+static int g_mlv_raw_uint16_prefetch_test_hold = 0;
+static int g_mlv_raw_uint16_prefetch_test_held = 0;
+
+static void mlv_raw_uint16_prefetch_test_hold_point(void)
+{
+    pthread_mutex_lock(&g_mlv_raw_uint16_prefetch_test_mutex);
+    if (g_mlv_raw_uint16_prefetch_test_hold)
+    {
+        g_mlv_raw_uint16_prefetch_test_held = 1;
+        pthread_cond_broadcast(&g_mlv_raw_uint16_prefetch_test_cond);
+        while (g_mlv_raw_uint16_prefetch_test_hold)
+            pthread_cond_wait(&g_mlv_raw_uint16_prefetch_test_cond, &g_mlv_raw_uint16_prefetch_test_mutex);
+        g_mlv_raw_uint16_prefetch_test_held = 0;
+    }
+    pthread_mutex_unlock(&g_mlv_raw_uint16_prefetch_test_mutex);
 }
 
 static void * mlv_raw_uint16_prefetch_thread_main(void * opaque)
@@ -1502,6 +1544,7 @@ static void * mlv_raw_uint16_prefetch_thread_main(void * opaque)
             video->raw_uint16_prefetch_slot_generation[slot] = generation;
             pthread_mutex_unlock(&video->raw_uint16_prefetch_mutex);
 
+            mlv_raw_uint16_prefetch_test_hold_point();
             int decodeOk = (getMlvRawFrameUint16Direct(video, targetFrame, slotBuffer) == 0);
 
             pthread_mutex_lock(&video->raw_uint16_prefetch_mutex);
@@ -8114,6 +8157,41 @@ int getMlvLastRawUint16PrefetchHit(void)
 int mlvRawUint16PrefetchAllowedForTesting(const mlvObject_t * video)
 {
     return mlv_raw_uint16_prefetch_allowed_for_request(video);
+}
+
+void mlvSetRawUint16PrefetchHoldBeforeDecodeForTesting(int enabled)
+{
+    pthread_mutex_lock(&g_mlv_raw_uint16_prefetch_test_mutex);
+    g_mlv_raw_uint16_prefetch_test_hold = enabled ? 1 : 0;
+    pthread_cond_broadcast(&g_mlv_raw_uint16_prefetch_test_cond);
+    pthread_mutex_unlock(&g_mlv_raw_uint16_prefetch_test_mutex);
+}
+
+int mlvWaitForRawUint16PrefetchHeldBeforeDecodeForTesting(uint32_t timeout_ms)
+{
+    for (uint32_t waited = 0; ; waited += 1)
+    {
+        pthread_mutex_lock(&g_mlv_raw_uint16_prefetch_test_mutex);
+        const int held = g_mlv_raw_uint16_prefetch_test_held;
+        pthread_mutex_unlock(&g_mlv_raw_uint16_prefetch_test_mutex);
+        if (held) return 1;
+        if (waited >= timeout_ms) return 0;
+        usleep(1000);
+    }
+}
+
+int mlvWaitForRawUint16PrefetchIdleForTesting(mlvObject_t * video, uint32_t timeout_ms)
+{
+    if (!video) return 1;
+    for (uint32_t waited = 0; ; waited += 1)
+    {
+        pthread_mutex_lock(&video->raw_uint16_prefetch_mutex);
+        const int busy = video->raw_uint16_prefetch_worker_busy || video->raw_uint16_prefetch_request_pending;
+        pthread_mutex_unlock(&video->raw_uint16_prefetch_mutex);
+        if (!busy) return 1;
+        if (waited >= timeout_ms) return 0;
+        usleep(1000);
+    }
 }
 
 uint64_t getMlvRawUint16PrefetchDecodeFailures(mlvObject_t * video)
