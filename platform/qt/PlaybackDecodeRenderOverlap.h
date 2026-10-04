@@ -81,13 +81,12 @@ enum class UpstreamStage
     Recon
 };
 
-/*! The exclusive recon start (default on; MLVAPP_PLAYBACK_OVERLAP_RECON_EXCLUSIVE=0 turns it
- *  off). With two frames in flight the recon worker's CPU dual-ISO and the render thread's S/H
- *  both run OpenMP teams across every core; running them at once slowed both (Bachelor, e9df0821:
- *  upstream ~30 -> ~38-43 ms a frame, render 11 -> 13-14 ms), so the overlap bought little. A recon
- *  may therefore start only when the render thread has nothing to render. Decode, the GUI hop and the
- *  present still overlap freely, and the period becomes recon + render instead of the serial
- *  decode + recon + render + hop. */
+/*! The exclusive recon start, opt-in (MLVAPP_PLAYBACK_OVERLAP_RECON_EXCLUSIVE=1): a recon may start
+ *  only when the render thread has nothing to render, so the recon worker's CPU dual-ISO and the
+ *  render thread's S/H never run as two OpenMP teams at once. Decode, the GUI hop and the present
+ *  still overlap, and the period becomes recon + render. It is not the default: on Bachelor the
+ *  contention first blamed on dual-ISO vs S/H was mostly a duplicate raw decode (fixed in
+ *  video_mlv.c), and recon + render in series (30.2 + 12.9 ms) is longer than a 23.976 fps frame. */
 inline bool reconMayStart( bool exclusive, bool renderInFlight, bool renderWorkPending )
 {
     return !exclusive || ( !renderInFlight && !renderWorkPending );

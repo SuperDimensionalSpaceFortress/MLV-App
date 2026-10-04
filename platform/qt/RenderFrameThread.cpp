@@ -74,17 +74,20 @@ bool gpuTexNrOverlapTraceEnabled()
         && value != QByteArrayLiteral("no");
 }
 
-/* PLAYBACK-DECODE-RENDER-OVERLAP-1: playback_overlap::reconMayStart(). On unless
- * MLVAPP_PLAYBACK_OVERLAP_RECON_EXCLUSIVE is 0/false/off/no. */
+/* PLAYBACK-DECODE-RENDER-OVERLAP-1: playback_overlap::reconMayStart(). Off unless
+ * MLVAPP_PLAYBACK_OVERLAP_RECON_EXCLUSIVE is set to a non-0/false/off/no value: on Bachelor it held
+ * recon + render in series (30.2 + 12.9 ms, longer than the 41.7 ms native period), and once the
+ * duplicate raw decode was gone (video_mlv.c in-flight wait) free overlap was the better default. */
 bool playbackOverlapReconExclusiveEnabled()
 {
     static const bool enabled = []() {
         const QByteArray value =
             qgetenv( "MLVAPP_PLAYBACK_OVERLAP_RECON_EXCLUSIVE" ).trimmed().toLower();
-        return !( value == QByteArrayLiteral("0")
-               || value == QByteArrayLiteral("false")
-               || value == QByteArrayLiteral("off")
-               || value == QByteArrayLiteral("no") );
+        return !value.isEmpty()
+            && value != QByteArrayLiteral("0")
+            && value != QByteArrayLiteral("false")
+            && value != QByteArrayLiteral("off")
+            && value != QByteArrayLiteral("no");
     }();
     return enabled;
 }
