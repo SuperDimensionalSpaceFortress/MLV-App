@@ -318,7 +318,11 @@ class GeneratorByteIdentityAndVariantTests(unittest.TestCase):
         self.assertNotIn("defaultReceiptEnabled", text)
         self.assertNotIn("reg add", text.split("# --- verifiers, embedded VERBATIM")[0])
         self.assertIn("('MLVAPP_LOOK_ASSIST_FLAVOR=' + $LookFlavor)", text)
-        self.assertIn("lookFlavorHonored = $(if ($LookLeg) { 'unknown' } else { $null })", text)
+        # LOOK-ASSIST-FLAVORS-1: the app reads the variable and reports the flavor it applied; the job records that report
+        # (gui_smoke.visual_state look_assist_flavor, via the runner's result.log.visualState) instead of a fixed 'unknown'.
+        self.assertIn("lookFlavorReported = $(if ($LookLeg) { $lfReported = try { [string]$resultJson.log.visualState.look_assist_flavor } catch { '' }", text)
+        self.assertIn("lookFlavorHonored = $(if ($LookLeg) { $lfReported -ceq $LookFlavor } else { $null })", text)
+        self.assertNotIn("lookFlavorHonored = $(if ($LookLeg) { 'unknown' } else { $null })", text)
         self.assertNotIn("--no-look-assist", text)
 
     def test_scale_and_quiescence_parameters_reach_the_job(self) -> None:
@@ -783,6 +787,19 @@ class RunnerReceiptTests(RunnerHarness, unittest.TestCase):
         self.assertEqual(um_pass["subject"]["clipContentSha256"], CLIP_CONTENT_SHA)
 
     # -- LOOK legs: flavor passthrough and the advisory model verdicts (judge harness SHELVED) ----------
+    def test_a_look_leg_records_the_flavor_the_app_reported(self) -> None:
+        # LOOK-ASSIST-FLAVORS-1: honoured = the app's own report equals the flavor the leg asked for; anything else (another
+        # flavor, or no report from the app = 'none') is False. A job that never reported at all stays 'unknown'.
+        for reported, expected_honored in (("classic", True), ("cinematic", False), ("none", False)):
+            with self.subTest(reported=reported):
+                self.write_artifacts(sheet=True, summary={"lookFlavorReported": reported, "lookFlavorHonored": expected_honored})
+                spec = self.write_spec(leg_type="look")
+                _, receipt, _ = self.run_leg("ultra-magnus", spec, extra=["-Backend", "cpu"])
+                self.assertEqual(receipt["outcome"], "PASS", receipt["outcomeDetail"])
+                self.assertEqual(receipt["look"]["lookFlavor"], "classic")
+                self.assertEqual(receipt["look"]["lookFlavorReported"], reported)
+                self.assertIs(receipt["look"]["lookFlavorHonored"], expected_honored)
+
     def test_a_look_leg_passes_the_flavor_and_leaves_the_advisory_fields_untouched(self) -> None:
         self.write_artifacts(sheet=True)
         spec = self.write_spec(leg_type="look")
@@ -800,9 +817,9 @@ class RunnerReceiptTests(RunnerHarness, unittest.TestCase):
 
     def test_a_spec_asking_for_cinematic_never_claims_the_flavor_was_honoured_because_the_spec_asked_for_it(self) -> None:
         """DVE-SCALE2-LOOK-LEG-1: the receipt's lookFlavor is what the SPEC asked for; lookFlavorHonored may only come from the app.
-        The app reports no flavor today (no reader of MLVAPP_LOOK_ASSIST_FLAVOR, no flavor field in look_assist.apply.result), so the
-        receipt of a leg asking for cinematic (a synthetic spec here; none is shipped until LOOK-ASSIST-FLAVORS-1) must stay 'unknown'
-        -- never True, never a string that echoes the spec."""
+        The harness's artifacts carry no app report (no lookFlavorReported in the job summary), so the receipt of a leg asking for
+        cinematic (a synthetic spec here; no cinematic leg spec ships yet) must stay 'unknown' -- never True, never a string that
+        echoes the spec. The report-driven values are pinned in test_a_look_leg_records_the_flavor_the_app_reported."""
         self.write_artifacts(sheet=True)
         spec = self.write_spec(leg_type="look", flavor="cinematic")
         proc, receipt, _ = self.run_leg("ultra-magnus", spec, extra=["-Backend", "cpu"])
@@ -819,18 +836,24 @@ class RunnerReceiptTests(RunnerHarness, unittest.TestCase):
         for name, text in (("Invoke-VenueLeg.ps1", runner), ("playback-attr-3-cuda-job.ps1", job), ("New-VenueSheetPair.ps1", pair)):
             for line in text.splitlines():
                 if re.match(r"\s*lookFlavorHonored\s*=", line):
-                    self.assertRegex(line, r"'unknown'|\$null", f"{name}: lookFlavorHonored must be 'unknown' (or null off a look leg), never derived from the spec: {line.strip()}")
+                    # LOOK-ASSIST-FLAVORS-1 landed the app report: a value is acceptable when it is 'unknown', null, a variable the runner
+                    # fills only from lookFlavorReported / the receipts (pinned below), or the job's reported-vs-requested comparison.
+                    self.assertRegex(line, r"'unknown'|\$null|\$lfReported -ceq|=\s*\$(lookFlavorHonored|pairHonored)\s*$", f"{name}: lookFlavorHonored must come from the app's report (or be 'unknown' / null), never from the spec: {line.strip()}")
+        # the runner's one non-literal assignment sits inside the guard that requires the app's report in the job summary
+        self.assertRegex(runner, r"if \(\$null -ne \$summary -and \$summary\.PSObject\.Properties\['lookFlavorReported'\]\) \{\s*\$lookFlavorReported = \[string\]\$summary\.lookFlavorReported\s*\$lookFlavorHonored = \(\$lookFlavorReported -ceq \$lookFlavor\)")
 
-    def test_tripwire_the_app_has_no_reader_of_the_flavor_env_var_so_honoured_stays_unknown(self) -> None:
-        """If this fails, LOOK-ASSIST-FLAVORS-1 (or equivalent) landed an app-side reader: make the job record the flavor the app REPORTS
-        (a field in look_assist.apply.result / the visual-state telemetry) and set lookFlavorHonored from it, then update this test."""
-        needle = "MLVAPP_LOOK_ASSIST_FLAVOR"
-        hits = []
-        for sub in ("platform", "src"):
-            for path in (ROOT / sub).rglob("*"):
-                if path.suffix.lower() in (".cpp", ".h", ".hpp", ".cu", ".c", ".mm") and needle in path.read_text(encoding="utf-8", errors="replace"):
-                    hits.append(str(path.relative_to(ROOT)))
-        self.assertEqual(hits, [], "the app now reads the flavor env var; wire lookFlavorHonored to what it reports")
+    def test_the_app_reads_the_flavor_env_var_and_the_job_records_what_it_reports(self) -> None:
+        """LOOK-ASSIST-FLAVORS-1 landed the app-side reader this test used to forbid. The job must therefore take lookFlavorHonored from the
+        flavor the APP reports on gui_smoke.visual_state, never from the spec: the reader is one function, both consumers call it, and the
+        job's honoured field compares the app's report with the flavor the leg asked for."""
+        analysis = (ROOT / "src" / "batch" / "LookAssistAnalysis.cpp").read_text(encoding="utf-8", errors="replace")
+        self.assertIn('qEnvironmentVariable( "MLVAPP_LOOK_ASSIST_FLAVOR" )', analysis)
+        for consumer in ("src/batch/ReceiptApplier.cpp", "platform/qt/MainWindow.cpp"):
+            text = (ROOT / consumer).read_text(encoding="utf-8", errors="replace")
+            self.assertIn("lookAssistFlavorEnvironmentValue()", text, consumer)
+        job = (ROOT / "tools" / "profiling" / "bachelor" / "playback-attr-3-cuda-job.ps1").read_text(encoding="utf-8")
+        self.assertIn("resultJson.log.visualState.look_assist_flavor", job)
+        self.assertIn("lookFlavorHonored = $(if ($LookLeg) { $lfReported -ceq $LookFlavor } else { $null })", job)
 
 
 @requires_windows_pwsh
@@ -2641,6 +2664,27 @@ class SheetPairStaysLocalTests(EvidenceFactory, unittest.TestCase):
         self.assertIn("never committed", record["localOnly"])
         self.assertIsNone(record["owner_verdict"])
         self.assertEqual(record["model_verdicts"], [])
+
+    def test_the_pair_records_the_flavor_honoured_only_when_both_legs_say_so(self) -> None:
+        # LOOK-ASSIST-FLAVORS-1: true only when BOTH legs' receipts say the app applied the requested flavor; false when either
+        # says it did not; 'unknown' for a receipt that predates the app's report.
+        try:
+            import PIL, numpy  # noqa: F401
+        except ImportError:
+            self.skipTest("Pillow + numpy are required")
+        self.receipts_by_backend = self.build_pair_receipts("flavor", real_images=True)
+        cases = ((True, True, True), (True, False, False), (False, True, False), ("unknown", "unknown", "unknown"), (True, "unknown", "unknown"))
+        for n, (cuda_honored, cpu_honored, expected) in enumerate(cases):
+            with self.subTest(cuda=cuda_honored, cpu=cpu_honored):
+                receipts = json.loads(json.dumps(self.receipts_by_backend))
+                receipts["cuda"]["look"]["lookFlavorHonored"] = cuda_honored
+                receipts["cpu"]["look"]["lookFlavorHonored"] = cpu_honored
+                out = self.tmp / ".claude-state" / f"sheets-flavor-{n}"
+                proc = self.pair(out, receipts=receipts)
+                self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+                record = json.loads(next(out.glob("sheet-pair-*.json")).read_text(encoding="utf-8"))
+                self.assertEqual(record["lookFlavor"], "classic")
+                self.assertEqual(record["lookFlavorHonored"], expected)
 
     def test_an_unlisted_or_replaced_raw_frame_cannot_be_paired(self) -> None:
         # sol r1 B4: the reader composed whatever PNGs sat under the evidence directory; it now takes only what the hashed manifest lists
