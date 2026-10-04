@@ -363,11 +363,11 @@ struct SmokeRun
     double timelineFps() const { return timelineDelta * 1000.0 / elapsedMs; }
     double timelineFpsAfterFirstPresent() const
     {
-        return playback_native_pace::fpsAfterFirstPresent( timelineDelta, elapsedMs, firstPresentMs );
+        return playback_native_pace::fpsAfterFirstPresent( timelineDelta, elapsedMs, firstPresentMs, presented );
     }
     double presentedFpsAfterFirstPresent() const
     {
-        return playback_native_pace::fpsAfterFirstPresent( presented - 1, elapsedMs, firstPresentMs );
+        return playback_native_pace::fpsAfterFirstPresent( presented - 1, elapsedMs, firstPresentMs, presented );
     }
 };
 
@@ -489,9 +489,9 @@ TEST(PlaybackNativePaceThroughput, TheR5TwentyOneIsTheWaitForTheFirstFrame)
     // r5's own summary line, through the pace_summary arithmetic
     const double r5Elapsed = 28544.867, r5FirstPresent = 3752.904;
     ASSERT_TRUE( std::fabs( 599.0 * 1000.0 / r5Elapsed - 20.985 ) < 0.001 );
-    const double r5Paced = playback_native_pace::fpsAfterFirstPresent( 599.0, r5Elapsed, r5FirstPresent );
+    const double r5Paced = playback_native_pace::fpsAfterFirstPresent( 599.0, r5Elapsed, r5FirstPresent, 500 );
     ASSERT_TRUE( r5Paced > 24.15 && r5Paced < 24.17 );        // native, inside the 24.455 gate
-    ASSERT_TRUE( playback_native_pace::fpsAfterFirstPresent( 499.0, r5Elapsed, r5FirstPresent ) < 20.2 ); // 1000 / 49.68
+    ASSERT_TRUE( playback_native_pace::fpsAfterFirstPresent( 499.0, r5Elapsed, r5FirstPresent, 500 ) < 20.2 ); // 1000 / 49.68
 }
 
 TEST(PlaybackNativePaceThroughput, ASlowRendererIsTheSameWithOrWithoutTheGuard)
@@ -514,10 +514,11 @@ TEST(PlaybackNativePaceThroughput, ASlowRendererIsTheSameWithOrWithoutTheGuard)
 
 TEST(PlaybackNativePaceThroughput, FpsAfterFirstPresentNeedsAPacedInterval)
 {
-    ASSERT_TRUE( playback_native_pace::fpsAfterFirstPresent( 240.0, 11000.0, 1000.0 ) == 24.0 );
-    ASSERT_TRUE( playback_native_pace::fpsAfterFirstPresent( 240.0, 11000.0, 0.0 ) == 0.0 );    // nothing presented
-    ASSERT_TRUE( playback_native_pace::fpsAfterFirstPresent( 240.0, 1000.0, 1000.0 ) == 0.0 );  // no interval after it
-    ASSERT_TRUE( playback_native_pace::fpsAfterFirstPresent( 240.0, 900.0, 1000.0 ) == 0.0 );
+    ASSERT_TRUE( playback_native_pace::fpsAfterFirstPresent( 240.0, 11000.0, 1000.0, 241 ) == 24.0 );
+    ASSERT_TRUE( playback_native_pace::fpsAfterFirstPresent( 240.0, 11000.0, 1000.0, 0 ) == 0.0 );  // nothing presented
+    ASSERT_TRUE( playback_native_pace::fpsAfterFirstPresent( 240.0, 10000.0, 0.0, 1 ) == 24.0 ); // presented at 0 ms still counts
+    ASSERT_TRUE( playback_native_pace::fpsAfterFirstPresent( 240.0, 1000.0, 1000.0, 1 ) == 0.0 );  // no interval after it
+    ASSERT_TRUE( playback_native_pace::fpsAfterFirstPresent( 240.0, 900.0, 1000.0, 1 ) == 0.0 );
 }
 
 // ---- wiring: MainWindow.cpp needs a full GUI build, so its source is read as text --------------------------
@@ -603,6 +604,8 @@ TEST(PlaybackNativePaceWiring, TheSmokeReportsThePacedRatesBesideTheWholeRun)
         "\"timeline_fps_after_first_present=%4 presented_fps_after_first_present=%5 pace_fps=%6\" )")));
     ASSERT_TRUE(line.contains(QStringLiteral(
         "playback_native_pace::fpsAfterFirstPresent( timelineDeltaAbs, elapsedMs,")));
+    ASSERT_EQ(2, line.count(QStringLiteral("m_playbackSmokePresentedFrames ), 0, 'f', 3 )")));
+    ASSERT_TRUE(line.contains(QStringLiteral(".arg( m_playbackSmokePresentedFrames > 0 ? elapsedMs - m_playbackSmokeFirstPresentMs : 0.0, 0, 'f', 3 )")));
     ASSERT_TRUE(line.contains(QStringLiteral(
         "playback_native_pace::fpsAfterFirstPresent( qMax( 0, m_playbackSmokePresentedFrames - 1 ),")));
     ASSERT_TRUE(line.contains(QStringLiteral(".arg( m_playPaceFps, 0, 'f', 3 );")));

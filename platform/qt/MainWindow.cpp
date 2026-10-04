@@ -26762,11 +26762,13 @@ void MainWindow::finishPlaybackSmokeTelemetry( const char *reason )
                "timeline_fps_after_first_present=%4 presented_fps_after_first_present=%5 pace_fps=%6" )
                .arg( static_cast<qulonglong>( m_playbackSmokeSessionId ) )
                .arg( m_playbackSmokeFirstPresentMs, 0, 'f', 3 )
-               .arg( m_playbackSmokeFirstPresentMs > 0.0 ? elapsedMs - m_playbackSmokeFirstPresentMs : 0.0, 0, 'f', 3 )
+               .arg( m_playbackSmokePresentedFrames > 0 ? elapsedMs - m_playbackSmokeFirstPresentMs : 0.0, 0, 'f', 3 )
                .arg( playback_native_pace::fpsAfterFirstPresent( timelineDeltaAbs, elapsedMs,
-                                                                 m_playbackSmokeFirstPresentMs ), 0, 'f', 3 )
+                                                                 m_playbackSmokeFirstPresentMs,
+                                                                 m_playbackSmokePresentedFrames ), 0, 'f', 3 )
                .arg( playback_native_pace::fpsAfterFirstPresent( qMax( 0, m_playbackSmokePresentedFrames - 1 ),
-                                                                 elapsedMs, m_playbackSmokeFirstPresentMs ), 0, 'f', 3 )
+                                                                 elapsedMs, m_playbackSmokeFirstPresentMs,
+                                                                 m_playbackSmokePresentedFrames ), 0, 'f', 3 )
                .arg( m_playPaceFps, 0, 'f', 3 );
 
     qInfo().noquote()
