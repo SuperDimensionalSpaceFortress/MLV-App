@@ -17,6 +17,7 @@
 #include <QThreadPool>
 #include <QProcess>
 #include <QVector>
+#include <QElapsedTimer>
 #include <QJsonObject>
 #include <QImage>
 #include <QPixmap>
@@ -27,6 +28,7 @@
 #include <QSortFilterProxyModel>
 #include <QItemSelectionModel>
 #include <QToolButton>
+#include "../../src/batch/LookAssistAnalysis.h"   // LookAssistFlavor, and the LookAssistAppliedMarker member below
 #include "SessionModel.h"
 #include "PlaybackFrameRange.h"
 #include "../../src/mlv_include.h"
@@ -156,13 +158,17 @@ public:
         QString windowScreenshotOutputPath;
         QString contactSheetDir; // --contact-sheet-dir: opt-in, default empty (off). Paired with contactSheetFrames.
         int contactSheetFrames = 0; // --contact-sheet-frames: N evenly spaced presented-frame grabs; 0 = off.
-        // --contact-sheet-seek-mode: opt-in, default off. The default capture pass replays the
-        // measured span via a genuine second (un-timed) PLAYBACK pass, so every grab comes from
-        // the real playback fast path (CUDA texture-present included) the owner is auditing --
-        // never a paused/seeked frame, which is rendered by a different, non-playback path and
-        // can show a different look. This flag keeps the OLD seek-then-grab capture available as
-        // an explicit, labelled alternative (its sidecars record playback_path=false).
+        // --contact-sheet-seek-mode: opt-in, default off. The default capture grabs N frames as the
+        // MEASURED Play presents them (CONTACT-SHEET-PLAYBACK-PARITY-1: no replay), so every grab
+        // comes from the real playback fast path (CUDA texture-present included) the owner is
+        // auditing -- never a paused/seeked frame, which is rendered by a different, non-playback
+        // path and can show a different look. This flag replaces that capture with the seek-then-
+        // grab one, an explicit, labelled alternative (its sidecars record playback_path=false).
         bool contactSheetSeekMode = false;
+        // --contact-sheet-seek-dir: opt-in, default empty. Keeps the in-pass capture AND writes a
+        // paired seek capture of the same N targets here, after the measured Play has stopped
+        // (it never plays; its sidecars record playback_path=false).
+        QString contactSheetSeekDir;
         PlaybackProfileScope scope = PlaybackProfileScope::None;
         PlaybackProfileDebayerRequest playbackDebayer =
             PlaybackProfileDebayerRequest::Auto;
@@ -343,6 +349,7 @@ private slots:
     void on_actionExportCurrentFrame_triggered();
     void on_checkBoxHighLightReconstruction_toggled(bool checked);
     void on_checkBoxLookAssistEnable_clicked(bool checked);
+    void on_comboBoxLookAssistFlavor_currentIndexChanged(int index);
     void on_comboBoxUseCameraMatrix_currentIndexChanged(int index);
     void on_checkBoxCreativeAdjustments_toggled(bool checked);
     void on_checkBoxExrMode_toggled(bool checked);
@@ -914,6 +921,8 @@ private:
     double m_playbackQualityLastPresentedTime = 0.0;
     PlaybackQualityAutoSampler m_playbackQualitySampler;
     bool m_lastLookAssistDiagnosticsValid = false;
+    QString m_lastWarnedLookAssistFlavorValue;
+    lookassist::LookAssistFlavorOutcome m_lookAssistFlavorOutcome;   // how the last analysis ended: telemetry and setReceipt read it
     QString m_lastLookAssistScene;
     double m_lastLookAssistMedian = 0.0;
     double m_lastLookAssistP05 = 0.0;
@@ -970,7 +979,8 @@ private:
     // De-dupe guard: the receipt whose Auto Look Assist analysis already ran this clip-open. A second
     // setSliders/deferral must not re-run the ~3s auto-WB analysis (it derives the same look and just
     // re-freezes the UI). Keyed on the receipt pointer so different clips re-analyze naturally.
-    ReceiptSettings *m_lookAssistAppliedReceipt = nullptr;
+    // A flavor change forgets the clip (LookAssistAppliedMarker::flavorChanged), so the next analysis is not de-duped away.
+    lookassist::LookAssistAppliedMarker m_lookAssistApplied;
     // Generation counter bumped on every clip open/close. The async look-assist
     // worker captures it at dispatch; the queued apply lambda re-checks before
     // touching any UI state, ensuring stale results from a previous clip are dropped.
@@ -1136,18 +1146,23 @@ private:
     // early-return on every presented frame). Never true outside runGuiPlaybackSmoke's own
     // contact-sheet block.
     bool m_contactSheetOptionsPresent = false;
-    QString m_contactSheetCaptureDir;
-    QVector<int> m_contactSheetCaptureTargetFrames;
+    // CONTACT-SHEET-PLAYBACK-PARITY-1: the in-pass capture's targets are times since the measured
+    // Play started (m_contactSheetCaptureClock, started with the measured playbackClock). The hook
+    // only reads the presented framebuffer back (timed) and parks the image + sidecar here; the
+    // PNG encode and every file write happen after the measured Play has stopped.
+    struct ContactSheetPendingGrab
+    {
+        QImage image;
+        QJsonObject sidecar;
+        double grabMs = 0.0;
+        qint64 grabElapsedMs = 0;
+    };
+    QElapsedTimer m_contactSheetCaptureClock;
+    QVector<qint64> m_contactSheetCaptureTargetMs;
+    QVector<ContactSheetPendingGrab> m_contactSheetPendingGrabs;
     int m_contactSheetCaptureNextTargetIndex = 0;
     int m_contactSheetCaptureStartFrame = 0;
-    // CUDA-PLAYBACK-CONTACT-SHEET-2: the measured span's end frame and whether that span was
-    // derived from a wrapped (looping) run -- recorded here purely so noteContactSheetPresentedFrame(),
-    // which only sees one presented frame at a time, can stamp each sidecar with the SAME
-    // span_start/span_end/span_wrapped values runGuiPlaybackSmoke computed once up front.
-    int m_contactSheetCaptureEndFrame = 0;
-    bool m_contactSheetCaptureWrapped = false;
     double m_contactSheetCaptureFps = 0.0;
-    int m_contactSheetCaptureFramesWritten = 0;
     QString m_contactSheetCaptureError;
     uint64_t m_dualIsoWarmupTelemetryPresentationGeneration = 0;
     int m_dualIsoWarmupTelemetryPresentedFrames = 0;
@@ -1733,6 +1748,7 @@ private:
     void applyLookAssistToReceipt( ReceiptSettings *receipt,
                                    int analysisFrame = -1 );
     void syncLookAssistDerivedUiToReceipt( ReceiptSettings *receipt );
+    lookassist::LookAssistFlavor currentLookAssistFlavor();
     void setGradientMask( void );
     uint16_t autoCorrectRawBlackLevel( void );
     uint16_t autoCorrectRawWhiteLevel( void );

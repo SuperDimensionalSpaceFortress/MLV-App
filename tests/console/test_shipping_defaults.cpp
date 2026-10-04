@@ -194,6 +194,7 @@ QJsonObject actualReceiptDefaults()
     ADD_BOOL("m_exrMode", exrMode); ADD_BOOL("m_agx", agx);
     ADD_INT("m_rawWhite", rawWhite); ADD_INT("m_rawBlack", rawBlack);
     ADD_BOOL("m_lookAssistEnabled", lookAssistEnabled);
+    ADD_STRING("m_lookAssistFlavor", lookAssistFlavor);
     ADD_BOOL("m_lookAssistBaselineValid", lookAssistBaselineValid);
     ADD_INT("m_lookAssistBaselineExposure", lookAssistBaselineExposure);
     ADD_INT("m_lookAssistBaselineContrast", lookAssistBaselineContrast);

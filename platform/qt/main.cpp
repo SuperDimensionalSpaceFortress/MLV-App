@@ -1244,7 +1244,7 @@ static int runGuiPlaybackSmoke(QApplication &app)
 
     const QCommandLineOption contactSheetDirOpt(
         QStringLiteral("contact-sheet-dir"),
-        QStringLiteral("Optional directory for a contact-sheet capture pass: N evenly spaced presented frames (PNG + JSON sidecar each), grabbed after the measured playback interval. The default playback-mode pass would REPLAY the span (a second Play) and is refused (REPLAY_REFUSED, owner rule 2026-09-30): pass --contact-sheet-seek-mode. Requires --contact-sheet-frames."),
+        QStringLiteral("Optional directory for a contact sheet: N presented frames (PNG + JSON sidecar each), grabbed DURING the measured Play as it presents them (evenly spaced in its play window; no replay). Each grab's readback cost is recorded (grab_ms) and the files are written after the Play stops. Sidecars record playback_path=true. Requires --contact-sheet-frames."),
         QStringLiteral("dir"));
     parser.addOption(contactSheetDirOpt);
 
@@ -1257,8 +1257,14 @@ static int runGuiPlaybackSmoke(QApplication &app)
 
     const QCommandLineOption contactSheetSeekModeOpt(
         QStringLiteral("contact-sheet-seek-mode"),
-        QStringLiteral("The only contact-sheet capture that never plays: grabs frames by pausing/seeking after playback stops (the default capture would be a second playback pass, i.e. a replay, which is refused). A seeked frame is rendered by a different, non-playback path and can show a different look; sidecars from this mode record playback_path=false."));
+        QStringLiteral("Explicit alternative to the default in-pass contact sheet: grabs frames by pausing/seeking after playback stops. A seeked frame is rendered by a different, non-playback path and can show a different look; sidecars from this mode record playback_path=false."));
     parser.addOption(contactSheetSeekModeOpt);
+
+    const QCommandLineOption contactSheetSeekDirOpt(
+        QStringLiteral("contact-sheet-seek-dir"),
+        QStringLiteral("Keep the default in-pass contact sheet AND write a paired seek capture of the same presented frames to this directory after playback stops (never plays; its sidecars record playback_path=false). Requires --contact-sheet-dir without --contact-sheet-seek-mode."),
+        QStringLiteral("dir"));
+    parser.addOption(contactSheetSeekDirOpt);
 
     const QCommandLineOption scopeOpt(
         QStringLiteral("scope"),
@@ -1661,6 +1667,17 @@ static int runGuiPlaybackSmoke(QApplication &app)
         : QString();
     options.contactSheetFrames = contactSheetFrames;
     options.contactSheetSeekMode = parser.isSet(contactSheetSeekModeOpt);
+    if (parser.isSet(contactSheetSeekDirOpt))
+    {
+        if (!contactSheetDirSet || options.contactSheetSeekMode)
+        {
+            err << "[GUI-SMOKE] ERROR: --contact-sheet-seek-dir pairs a seek capture with the in-pass "
+                   "--contact-sheet-dir capture; it needs --contact-sheet-dir and cannot be combined "
+                   "with --contact-sheet-seek-mode.\n";
+            return 2;
+        }
+        options.contactSheetSeekDir = QFileInfo(parser.value(contactSheetSeekDirOpt)).absoluteFilePath();
+    }
     options.scope = scope;
     options.playbackDebayer = playbackDebayer;
     options.playbackProcessing = playbackProcessing;

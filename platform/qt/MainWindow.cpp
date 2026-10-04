@@ -2166,6 +2166,8 @@ MainWindow::MainWindow(int &argc, char **argv, QWidget *parent) :
     QSurfaceFormat::setDefaultFormat(format);
 
     ui->setupUi(this);
+    ui->comboBoxLookAssistFlavor->setItemData( 0, lookAssistFlavorName( LookAssistFlavor::Classic ) );
+    ui->comboBoxLookAssistFlavor->setItemData( 1, lookAssistFlavorName( LookAssistFlavor::Cinematic ) );
 
     /* Wire the "Abort batch export" button in BatchPrompts QMessageBox */
     BatchPrompts::setAbortBatchCallback([this]{ exportAbort(); });
@@ -8301,7 +8303,8 @@ int MainWindow::runGuiPlaybackSmoke(const GuiPlaybackSmokeOptions & options)
         QSignalBlocker blocker( ui->checkBoxLookAssistEnable );
         ui->checkBoxLookAssistEnable->setChecked( false );
         m_lastLookAssistDiagnosticsValid = false;
-        m_lookAssistAppliedReceipt = nullptr;
+        m_lookAssistApplied.clear();
+        m_lookAssistFlavorOutcome.clear();
     };
 
     m_gpuPreviewProcessingBackendRequest = options.gpuPreviewProcessingBackend;
@@ -8676,7 +8679,8 @@ int MainWindow::runGuiPlaybackSmoke(const GuiPlaybackSmokeOptions & options)
             "does_mlv_always_use_amaze=%44 "
             "gpu16_preview_active=%45 "
             "playback_processing_reason=%46 "
-            "gpu_preview_processing_reject_reason=%47" )
+            "gpu_preview_processing_reject_reason=%47 "
+            "look_assist_flavor=%48" )
             .arg( bool01( ACTIVE_RECEIPT && ACTIVE_RECEIPT->lookAssistEnabled()
                           && ui->checkBoxLookAssistEnable->isChecked() ) )
             .arg( bool01( m_lastLookAssistDiagnosticsValid ) )
@@ -8734,7 +8738,11 @@ int MainWindow::runGuiPlaybackSmoke(const GuiPlaybackSmokeOptions & options)
             .arg( m_pMlvObject ? doesMlvAlwaysUseAmaze( m_pMlvObject ) : -1 )
             .arg( bool01( m_renderThreadUsing16BitPreview ) )
             .arg( m_lastQueuedPlaybackProcessingReason )
-            .arg( gpuPreviewProcessingRejectReason ) );
+            .arg( gpuPreviewProcessingRejectReason )
+            .arg( m_lastLookAssistDiagnosticsValid && !m_lastLookAssistSafetyFallback
+                  && !m_lookAssistFlavorOutcome.appliedName().isEmpty()
+                  ? m_lookAssistFlavorOutcome.appliedName()
+                  : QStringLiteral("none") ) );
 
     const int settleMs = qMax( 0, options.settleMs );
     const int settleCpuStableMs = qMax( 0, options.settleCpuStableMs );
@@ -9020,6 +9028,35 @@ int MainWindow::runGuiPlaybackSmoke(const GuiPlaybackSmokeOptions & options)
     // play window is timed from NOW -- the measured Play then runs the whole requested window rather than the
     // window minus its own start-up cost. Every later wait / switch / verdict below counts from this point.
     playbackClock.restart();
+
+    // CONTACT-SHEET-PLAYBACK-PARITY-1: arm the in-pass contact sheet on THIS measured Play (owner rule:
+    // never replay). noteContactSheetPresentedFrame() grabs the first frame presented at or after each
+    // target time -- the centres of N equal slices of the requested play window, on a clock started
+    // with playbackClock -- so the sheet shows exactly what played. The hook only reads the framebuffer
+    // back (timed, reported as grab_ms); every PNG encode and file write waits for the stop below.
+    if( !options.contactSheetDir.isEmpty() && options.contactSheetFrames > 0 && !options.contactSheetSeekMode )
+    {
+        // HARDENING (default-off): the cheap gate finishPresentedFrame() checks before calling
+        // noteContactSheetPresentedFrame() at all; only ever set here.
+        m_contactSheetOptionsPresent = true;
+        const long long contactSheetWindowMs = std::llround(
+            playback_frame_range::smokePlayRequestSeconds(
+                options.durationMs, options.targetPresentedFrames, presentedTargetFps ) * 1000.0 );
+        m_contactSheetCaptureTargetMs.clear();
+        for( int i = 0; i < options.contactSheetFrames; ++i )
+        {
+            m_contactSheetCaptureTargetMs.append( static_cast<qint64>(
+                playback_frame_range::contactSheetInPassTargetMs(
+                    i, options.contactSheetFrames, contactSheetWindowMs ) ) );
+        }
+        m_contactSheetPendingGrabs.clear();
+        m_contactSheetCaptureNextTargetIndex = 0;
+        m_contactSheetCaptureStartFrame = ui->horizontalSliderPosition->value();
+        m_contactSheetCaptureFps = getFramerate();
+        m_contactSheetCaptureError.clear();
+        m_contactSheetCaptureClock.start();
+        m_contactSheetCaptureActive = true;
+    }
 
     // HARDENING (CUDA-PLAYBACK-CONTACT-SHEET-2): bind the explicit measured-session marker to
     // THIS trigger -- the one that starts the measured timed loop -- rather than to whichever
@@ -9671,36 +9708,33 @@ int MainWindow::runGuiPlaybackSmoke(const GuiPlaybackSmokeOptions & options)
     }
     m_frameStillDrawing = m_pRenderThread && !m_pRenderThread->isIdle();
 
-    // Contact-sheet capture: N evenly spaced frame positions from the just-measured
-    // playback span. Deliberately placed AFTER actionPlay was unchecked above (which
-    // already ran finishPlaybackSmokeTelemetry, closing both the playback_smoke frame
-    // counters and the GpuDisplayWindow swap-telemetry session for the MEASURED
-    // interval), so nothing below can perturb the fps/swap-cadence numbers already
-    // finalized for that interval.
+    // Contact-sheet files. Deliberately placed AFTER actionPlay was unchecked above (which already
+    // ran finishPlaybackSmokeTelemetry, closing both the playback_smoke frame counters and the
+    // GpuDisplayWindow swap-telemetry session for the MEASURED interval), so no PNG encode or file
+    // write below can perturb the fps/swap-cadence numbers already finalized for that interval.
     //
-    // DEFAULT (options.contactSheetSeekMode == false): a genuine SECOND, un-timed
-    // PLAYBACK pass -- playback is started again from the span's start frame and left
-    // running while noteContactSheetPresentedFrame() (hooked into the same real-
-    // presented-frame call site as notePlaybackSmokePresentedFrame) grabs each target
-    // frame as it is actually presented. Every grab therefore comes from the real
-    // playback fast path (CUDA texture-present included), never a paused/seeked one.
+    // DEFAULT (options.contactSheetSeekMode == false, CONTACT-SHEET-PLAYBACK-PARITY-1): the frames
+    // were grabbed DURING the measured Play by noteContactSheetPresentedFrame() (armed right after
+    // the measured Play trigger, hooked into the same real-presented-frame call site as
+    // notePlaybackSmokePresentedFrame), so every tile is a frame the playback path actually
+    // presented (CUDA texture-present included). No second Play, no replay. Their readback cost
+    // fell inside the measured interval and is reported (grab_ms per tile, grab_total_ms and
+    // fps_excluding_grabs on gui_smoke.contact_sheet) so the fps numbers stay honest.
     //
-    // --contact-sheet-seek-mode (explicit, labelled alternative): the OLD capture,
-    // pausing/seeking to each target after playback has already stopped. A seeked frame
-    // is rendered by a different, non-playback path and can show a different look, so
-    // its sidecars record playback_path=false and render_path reflects whatever path
-    // that seek actually rendered through.
+    // --contact-sheet-seek-mode (explicit, labelled alternative) replaces that with the seek capture:
+    // pausing/seeking to each target after playback has stopped. --contact-sheet-seek-dir keeps the
+    // in-pass sheet and ALSO writes that seek capture, of the same presented frames, to its own dir.
+    // A seeked frame is rendered by a different, non-playback path and can show a different look
+    // (PLAYBACK-SEEK-RENDER-PARITY-1), so its sidecars record playback_path=false.
     int contactSheetFramesWritten = 0;
+    int contactSheetSeekFramesWritten = 0;
     QString contactSheetError;
     if( !options.contactSheetDir.isEmpty() && options.contactSheetFrames > 0 )
     {
-        // HARDENING (default-off): flips the cheap gate finishPresentedFrame() checks before
-        // calling noteContactSheetPresentedFrame() at all. Only ever true inside this block,
-        // so a smoke run with the options off makes zero contact-sheet calls per presented
-        // frame, not just an early-returning one.
-        m_contactSheetOptionsPresent = true;
-        const QDir contactSheetDirInfo( options.contactSheetDir );
-        if( !contactSheetDirInfo.exists() && !QDir().mkpath( options.contactSheetDir ) )
+        // The measured Play is over: nothing more is grabbed in-pass.
+        m_contactSheetCaptureActive = false;
+        const QDir inPassDirInfo( options.contactSheetDir );
+        if( !inPassDirInfo.exists() && !QDir().mkpath( options.contactSheetDir ) )
         {
             err << "[GUI-SMOKE] ERROR: failed to create contact sheet directory: "
                 << options.contactSheetDir << "\n";
@@ -9722,8 +9756,82 @@ int MainWindow::runGuiPlaybackSmoke(const GuiPlaybackSmokeOptions & options)
                 i, options.contactSheetFrames, sheetStartFrame, sheetEndFrame ) );
         }
 
-        if( options.contactSheetSeekMode )
+        // CONTACT-SHEET-PLAYBACK-PARITY-1: write the in-pass grabs parked by noteContactSheetPresentedFrame().
+        double contactSheetGrabTotalMs = 0.0;
+        double contactSheetGrabMaxMs = 0.0;
+        int contactSheetGrabsInMeasured = 0;
+        double contactSheetFpsMeasured = 0.0;
+        double contactSheetFpsExcludingGrabs = 0.0;
+        if( !options.contactSheetSeekMode )
         {
+            QVector<int> inPassDisplayFrames;
+            for( const ContactSheetPendingGrab &grab : m_contactSheetPendingGrabs )
+            {
+                QJsonObject frameJson = grab.sidecar;
+                const int index = frameJson.value( QStringLiteral("index") ).toInt();
+                // A grab made after the measured interval's end is impossible by construction (the
+                // hook is disarmed above, after the stop); recorded per tile rather than assumed.
+                const bool inMeasuredInterval = grab.grabElapsedMs <= contactSheetMeasuredElapsedMs;
+                frameJson.insert( QStringLiteral("span_end"), sheetEndFrame );
+                frameJson.insert( QStringLiteral("span_wrapped"), contactSheetSpanWrapped );
+                frameJson.insert( QStringLiteral("grab_in_measured_interval"), inMeasuredInterval );
+                const QString pngRelativeName = frameJson.value( QStringLiteral("path") ).toString();
+                const QString pngPath = inPassDirInfo.absoluteFilePath( pngRelativeName );
+                const QString jsonPath = inPassDirInfo.absoluteFilePath(
+                    QStringLiteral("frame-%1.json").arg( index, 2, 10, QLatin1Char('0') ) );
+                bool frameOk = grab.image.save( pngPath, "PNG" );
+                frameJson.insert( QStringLiteral("saved"), frameOk );
+                if( frameOk )
+                {
+                    QFile sidecarFile( jsonPath );
+                    if( sidecarFile.open( QIODevice::WriteOnly | QIODevice::Truncate ) )
+                    {
+                        sidecarFile.write( QJsonDocument( frameJson ).toJson( QJsonDocument::Indented ) );
+                        sidecarFile.close();
+                        ++contactSheetFramesWritten;
+                    }
+                    else
+                    {
+                        frameOk = false;
+                    }
+                }
+                if( !frameOk && contactSheetError.isEmpty() )
+                    contactSheetError = QStringLiteral( "frame %1 write failed" ).arg( index );
+                contactSheetGrabTotalMs += grab.grabMs;
+                contactSheetGrabMaxMs = qMax( contactSheetGrabMaxMs, grab.grabMs );
+                if( inMeasuredInterval ) ++contactSheetGrabsInMeasured;
+                inPassDisplayFrames.append( frameJson.value( QStringLiteral("display_frame") ).toInt() );
+            }
+            if( contactSheetError.isEmpty() ) contactSheetError = m_contactSheetCaptureError;
+            if( m_contactSheetPendingGrabs.size() < options.contactSheetFrames && contactSheetError.isEmpty() )
+            {
+                contactSheetError = QStringLiteral( "only %1 of %2 in-pass targets were presented before the measured Play stopped" )
+                    .arg( m_contactSheetPendingGrabs.size() ).arg( options.contactSheetFrames );
+            }
+            m_contactSheetPendingGrabs.clear();
+            // The paired seek capture renders the SAME frames the in-pass sheet shows.
+            if( inPassDisplayFrames.size() == options.contactSheetFrames )
+                contactSheetTargetFrames = inPassDisplayFrames;
+
+            contactSheetFpsMeasured = contactSheetMeasuredElapsedMs > 0
+                ? m_playbackSmokePresentedFrames * 1000.0 / static_cast<double>( contactSheetMeasuredElapsedMs )
+                : 0.0;
+            contactSheetFpsExcludingGrabs = playback_frame_range::fpsExcludingGrabCost(
+                m_playbackSmokePresentedFrames, static_cast<double>( contactSheetMeasuredElapsedMs ),
+                contactSheetGrabTotalMs );
+        }
+
+        // CONTACT-SHEET-PLAYBACK-PARITY-1: seek capture (explicit, labelled alternative). Never plays.
+        const QString seekSheetDir = options.contactSheetSeekMode ? options.contactSheetDir : options.contactSheetSeekDir;
+        if( !seekSheetDir.isEmpty() )
+        {
+            const QDir contactSheetDirInfo( seekSheetDir );
+            if( !contactSheetDirInfo.exists() && !QDir().mkpath( seekSheetDir ) )
+            {
+                err << "[GUI-SMOKE] ERROR: failed to create contact sheet directory: "
+                    << seekSheetDir << "\n";
+                return 13;
+            }
             for( int i = 0; i < options.contactSheetFrames; ++i )
             {
                 const int targetFrame = contactSheetTargetFrames.at( i );
@@ -9813,6 +9921,7 @@ int MainWindow::runGuiPlaybackSmoke(const GuiPlaybackSmokeOptions & options)
                 frameJson.insert( QStringLiteral("texture_source"), contactFrameSource );
                 frameJson.insert( QStringLiteral("render_path"), contactFrameRenderPath );
                 frameJson.insert( QStringLiteral("playback_path"), false );
+                frameJson.insert( QStringLiteral("capture_mode"), QStringLiteral("seek") );
                 frameJson.insert( QStringLiteral("path"), pngRelativeName );
                 frameJson.insert( QStringLiteral("span_start"), sheetStartFrame );
                 frameJson.insert( QStringLiteral("span_end"), sheetEndFrame );
@@ -9851,7 +9960,7 @@ int MainWindow::runGuiPlaybackSmoke(const GuiPlaybackSmokeOptions & options)
                     {
                         sidecarFile.write( QJsonDocument( frameJson ).toJson( QJsonDocument::Indented ) );
                         sidecarFile.close();
-                        ++contactSheetFramesWritten;
+                        ++contactSheetSeekFramesWritten;
                     }
                     else
                     {
@@ -9862,30 +9971,15 @@ int MainWindow::runGuiPlaybackSmoke(const GuiPlaybackSmokeOptions & options)
                 if( !frameOk && contactSheetError.isEmpty() )
                 {
                     contactSheetError = QStringLiteral(
-                        "frame %1 capture failed (settled=%2 reason=%3)" )
+                        "seek frame %1 capture failed (settled=%2 reason=%3)" )
                         .arg( i ).arg( bool01( settled ) ).arg( contactFrameReadbackReason );
                 }
             }
-        }
-        else
-        {
-            // PLAYBACK-CLIP-LENGTH-ENFORCE-2 (owner rule 2026-09-30): the playback-mode contact sheet is a
-            // genuine SECOND Play of the measured span (up to 50 restarts) -- a replay of footage already
-            // played in this process. Replay is forbidden, so this branch REFUSES, typed, and never arms
-            // the capture or touches Play. Use --contact-sheet-seek-mode (no Play; sidecars record
-            // playback_path=false) until a capture-during-the-measured-pass path exists.
-            // (No Play is even attempted here: the gate's ledger would refuse it as REPLAY_REFUSED.)
-            contactSheetError = QStringLiteral(
-                "REPLAY_REFUSED: the playback-mode contact sheet replays the measured span (a second Play); "
-                "use --contact-sheet-seek-mode" );
-            ++m_programmaticPlayLedger.refused;
-            m_programmaticPlayLedger.lastRefusalReason = "REPLAY_REFUSED";
-            logInteractionEvent(
-                QStringLiteral("play_gate.refused"),
-                QStringLiteral("site=gui-smoke-contact-sheet-replay reason=REPLAY_REFUSED") );
-            contactSheetFramesWritten = 0;
+            if( options.contactSheetSeekMode ) contactSheetFramesWritten = contactSheetSeekFramesWritten;
         }
 
+        // playback_path: what the sheet in --contact-sheet-dir shows. The paired seek sheet, when
+        // asked for, is reported separately (seek_dir_written_frames) and is always playback_path=0.
         logInteractionEvent(
             QStringLiteral("gui_smoke.contact_sheet"),
             QStringLiteral("dir=\"%1\" requested_frames=%2 written_frames=%3 "
@@ -9899,13 +9993,28 @@ int MainWindow::runGuiPlaybackSmoke(const GuiPlaybackSmokeOptions & options)
                 .arg( contactSheetMeasuredElapsedMs )
                 .arg( options.contactSheetSeekMode
                           ? QStringLiteral("seek")
-                          : QStringLiteral("playback") )
-                .arg( contactSheetError ) );
+                          : ( options.contactSheetSeekDir.isEmpty()
+                                  ? QStringLiteral("in_pass")
+                                  : QStringLiteral("in_pass+paired_seek") ) )
+                .arg( contactSheetError )
+            + QStringLiteral(" playback_path=%1 grab_total_ms=%2 grab_max_ms=%3 grabs_in_measured_interval=%4 "
+                             "presented_frames=%5 fps_measured=%6 fps_excluding_grabs=%7 seek_dir_written_frames=%8")
+                .arg( bool01( !options.contactSheetSeekMode ) )
+                .arg( contactSheetGrabTotalMs, 0, 'f', 3 )
+                .arg( contactSheetGrabMaxMs, 0, 'f', 3 )
+                .arg( contactSheetGrabsInMeasured )
+                .arg( options.contactSheetSeekMode ? 0 : m_playbackSmokePresentedFrames )
+                .arg( contactSheetFpsMeasured, 0, 'f', 3 )
+                .arg( contactSheetFpsExcludingGrabs, 0, 'f', 3 )
+                .arg( options.contactSheetSeekMode ? 0 : contactSheetSeekFramesWritten ) );
 
-        if( contactSheetFramesWritten != options.contactSheetFrames )
+        if( contactSheetFramesWritten != options.contactSheetFrames
+         || ( !options.contactSheetSeekMode && !options.contactSheetSeekDir.isEmpty()
+              && contactSheetSeekFramesWritten != options.contactSheetFrames ) )
         {
             err << "[GUI-SMOKE] ERROR: contact sheet capture incomplete; requested="
                 << options.contactSheetFrames << " written=" << contactSheetFramesWritten
+                << " seek_written=" << contactSheetSeekFramesWritten
                 << " detail=" << contactSheetError << "\n";
             return 14;
         }
@@ -11415,6 +11524,13 @@ void MainWindow::readSettings()
     if( set.value( "audioOutput", true ).toBool() ) ui->actionAudioOutput->setChecked( true );
     if( set.value( "zebras", false ).toBool() ) ui->actionShowZebras->setChecked( true );
     ui->actionFastOpen->setChecked( set.value( "fastOpen", true ).toBool() );
+    {
+        // Default Classic. A stored value this build does not know is Classic as well.
+        const QString storedFlavor = set.value( "lookAssistFlavor", QString( "classic" ) ).toString().trimmed().toLower();
+        const int storedFlavorIndex = ui->comboBoxLookAssistFlavor->findData( storedFlavor );
+        QSignalBlocker flavorBlocker( ui->comboBoxLookAssistFlavor );
+        ui->comboBoxLookAssistFlavor->setCurrentIndex( storedFlavorIndex >= 0 ? storedFlavorIndex : 0 );
+    }
     m_lastExportPath = set.value( "lastExportPath", QDir::homePath() ).toString();
     m_lastMlvOpenFileName = set.value( "lastMlvFileName", QDir::homePath() ).toString();
     m_lastSessionFileName = set.value( "lastSessionFileName", QDir::homePath() ).toString();
@@ -11520,6 +11636,7 @@ void MainWindow::writeSettings()
     set.setValue( "audioOutput", ui->actionAudioOutput->isChecked() );
     set.setValue( "zebras", ui->actionShowZebras->isChecked() );
     set.setValue( "fastOpen", ui->actionFastOpen->isChecked() );
+    set.setValue( "lookAssistFlavor", ui->comboBoxLookAssistFlavor->currentData().toString() );
     set.setValue( "lastExportPath", m_lastExportPath );
     set.setValue( "lastMlvFileName", m_lastMlvOpenFileName );
     set.setValue( "lastSessionFileName", m_lastSessionFileName );
@@ -13994,6 +14111,11 @@ void MainWindow::readXmlElementsFromFile(QXmlStreamReader *Rxml, ReceiptSettings
             receipt->setLookAssistEnabled( (bool)Rxml->readElementText().toInt() );
             Rxml->readNext();
         }
+        else if( Rxml->isStartElement() && Rxml->name() == QString( "lookAssistFlavor" ) )
+        {
+            receipt->setLookAssistFlavor( Rxml->readElementText().trimmed() );
+            Rxml->readNext();
+        }
         else if( Rxml->isStartElement() && Rxml->name() == QString( "lookAssistBaselineValid" ) )
         {
             receipt->setLookAssistBaselineValid( (bool)Rxml->readElementText().toInt() );
@@ -14265,6 +14387,10 @@ void MainWindow::writeXmlElementsToFile(QXmlStreamWriter *xmlWriter, ReceiptSett
     xmlWriter->writeTextElement( "grainLumaWeight",         QString( "%1" ).arg( receipt->grainLumaWeight() ) );
     xmlWriter->writeTextElement( "rawFixesEnabled",         QString( "%1" ).arg( receipt->rawFixesEnabled() ) );
     xmlWriter->writeTextElement( "lookAssistEnabled",       QString( "%1" ).arg( receipt->lookAssistEnabled() ) );
+    // Only a non-Classic flavor is recorded: a Classic receipt stays byte-identical to master's.
+    if( !receipt->lookAssistFlavor().isEmpty()
+     && receipt->lookAssistFlavor() != QLatin1String( "classic" ) )
+        xmlWriter->writeTextElement( "lookAssistFlavor",    receipt->lookAssistFlavor() );
     xmlWriter->writeTextElement( "lookAssistBaselineValid", QString( "%1" ).arg( receipt->lookAssistBaselineValid() ) );
     xmlWriter->writeTextElement( "lookAssistBaselineExposure", QString( "%1" ).arg( receipt->lookAssistBaselineExposure() ) );
     xmlWriter->writeTextElement( "lookAssistBaselineContrast", QString( "%1" ).arg( receipt->lookAssistBaselineContrast() ) );
@@ -14900,6 +15026,34 @@ void MainWindow::setSliders(ReceiptSettings *receipt, bool paste)
         QSignalBlocker lookAssistBlocker( ui->checkBoxLookAssistEnable );
         ui->checkBoxLookAssistEnable->setEnabled( m_fileLoaded );
         ui->checkBoxLookAssistEnable->setChecked( lookAssistEnabled );
+        {
+            // The receipt's element through the one shared rule: an unknown value is Classic plus a warning (never the
+            // selector's previous value, which could be Cinematic), and the receipt is corrected to what is applied.
+            LookAssistFlavorSelection receiptFlavor;
+            const QString receiptFlavorValue =
+                lookAssistSelectorValueForReceipt( receipt->lookAssistFlavor(), &receiptFlavor );
+            if( receiptFlavor.unknownValue )
+            {
+                if( m_lastWarnedLookAssistFlavorValue != receiptFlavor.rejectedValue )
+                {
+                    m_lastWarnedLookAssistFlavorValue = receiptFlavor.rejectedValue;
+                    logInteractionEvent(
+                        QStringLiteral("look_assist.flavor.unknown_value"),
+                        QStringLiteral("value=%1 source=%2 using=classic").arg( receiptFlavor.rejectedValue ).arg( receiptFlavor.source ) );
+                }
+            }
+            // Normalised either way ("Classic " -> "classic"), so the receipt only ever names a flavor that was applied.
+            if( !receiptFlavorValue.isEmpty() )
+                receipt->setLookAssistFlavor( receiptFlavorValue );
+            const int flavorIndex = receiptFlavorValue.isEmpty()
+                                  ? -1
+                                  : ui->comboBoxLookAssistFlavor->findData( receiptFlavorValue );
+            if( flavorIndex >= 0 )
+            {
+                QSignalBlocker flavorBlocker( ui->comboBoxLookAssistFlavor );
+                ui->comboBoxLookAssistFlavor->setCurrentIndex( flavorIndex );
+            }
+        }
         logInteractionEvent(
             QStringLiteral("look_assist.setSliders.begin"),
             QStringLiteral("enabled=%1 file_loaded=%2 baseline_valid=%3 receipt_exp=%4 receipt_contrast=%5 receipt_pivot=%6 receipt_temp=%7 receipt_tint=%8 raw_black=%9 raw_white=%10 frame=%11")
@@ -14937,10 +15091,10 @@ void MainWindow::setSliders(ReceiptSettings *receipt, bool paste)
             captureLookAssistBaseline( receipt );
 
         if( !deferLookAssistUntilBaselineFrame
-         && m_lookAssistAppliedReceipt != receipt )
+         && !m_lookAssistApplied.isApplied( receipt ) )
         {
             applyLookAssistToReceipt( receipt );
-            m_lookAssistAppliedReceipt = receipt;
+            m_lookAssistApplied.markApplied( receipt );
         }
         syncLookAssistDerivedUiToReceipt( receipt );
     }
@@ -15013,7 +15167,7 @@ void MainWindow::setSliders(ReceiptSettings *receipt, bool paste)
                 return;
             }
 
-            if( m_lookAssistAppliedReceipt == ACTIVE_RECEIPT )
+            if( m_lookAssistApplied.isApplied( ACTIVE_RECEIPT ) )
             {
                 // De-dupe: the auto-look analysis already ran for this clip this open.
                 logInteractionEvent(
@@ -15034,7 +15188,7 @@ void MainWindow::setSliders(ReceiptSettings *receipt, bool paste)
                  || !ACTIVE_RECEIPT
                  || ACTIVE_RECEIPT != activeReceiptAtLoad
                  || !ACTIVE_RECEIPT->lookAssistEnabled()
-                 || m_lookAssistAppliedReceipt == ACTIVE_RECEIPT )
+                 || m_lookAssistApplied.isApplied( ACTIVE_RECEIPT ) )
                 {
                     return;
                 }
@@ -15063,7 +15217,7 @@ void MainWindow::setSliders(ReceiptSettings *receipt, bool paste)
                     captureLookAssistBaseline( ACTIVE_RECEIPT );
 
                 applyLookAssistToReceipt( ACTIVE_RECEIPT, analysisFrame );
-                m_lookAssistAppliedReceipt = ACTIVE_RECEIPT;
+                m_lookAssistApplied.markApplied( ACTIVE_RECEIPT );
                 syncLookAssistDerivedUiToReceipt( ACTIVE_RECEIPT );
                 setReceipt( ACTIVE_RECEIPT );
                 requestFrameRefresh( true, "look-assist-baseline-frame-ready" );
@@ -15185,6 +15339,7 @@ struct LookAssistAsyncResult
 {
     // Preset to apply
     LookAssistPreset preset;
+    QString flavorName;  // the flavor the preset was made for; reported only if the apply lands
     int temperature = 0; // final clamped temperature (baseTemperature + preset.temperatureDelta)
     int tint        = 0; // final clamped tint
     // Auto-WB diagnostics
@@ -15546,6 +15701,8 @@ void MainWindow::applyLookAssistToReceipt( ReceiptSettings *receipt,
     // the one master classified (daylight needs the evidence).
     const LookAssistScene scene = resolveLookAssistScene(
         &stats, s_lookAssistMasterScenePass ? LookAssistRenderFn() : LookAssistRenderFn( renderProcessed ) );
+    const LookAssistFlavor flavor = currentLookAssistFlavor();
+    m_lookAssistFlavorOutcome.begin();   // reported (telemetry, receipt) only once this analysis lands
     // Observation only: how the verdict and balance were reached, appended to look_assist.apply.result.
     LookAssistDecisionTrace decisionTrace;
     decisionTrace.pictureEvidenceAsked = !s_lookAssistMasterScenePass;
@@ -15579,7 +15736,7 @@ void MainWindow::applyLookAssistToReceipt( ReceiptSettings *receipt,
                 analysisFrame,
                 colorDownscaleFactor,
                 qMax( 1, mlvappEffectiveWorkerThreadCount() ),
-                presetForLookAssistScene( scene, stats ).exposure / 100.0,
+                presetForLookAssistScene( scene, stats, nullptr, nullptr, flavor ).exposure / 100.0,
                 reinterpret_cast<unsigned char *>( processedThumbnail.data() ) );
         }
         if( !renderedAtPresetExposure )
@@ -15754,6 +15911,7 @@ void MainWindow::applyLookAssistToReceipt( ReceiptSettings *receipt,
         LookAssistStats processedColorStatsCopy = processedColorStats;
         bool useProcessedColorStatsCopy = useProcessedColorStats;
         LookAssistScene sceneCopy = scene;
+        LookAssistFlavor flavorCopy = flavor;
         bool floorLiftedCopy = floorLiftedNightThumbnail;
         int widthCopy = width;
         int heightCopy = height;
@@ -15767,11 +15925,12 @@ void MainWindow::applyLookAssistToReceipt( ReceiptSettings *receipt,
 
         logInteractionEvent(
             QStringLiteral("look_assist.apply.async_dispatch"),
-            QStringLiteral("generation=%1 frame=%2 scene=%3 floor_lifted=%4")
+            QStringLiteral("generation=%1 frame=%2 scene=%3 floor_lifted=%4 flavor=%5")
                 .arg( dispatchGeneration )
                 .arg( analysisFrame )
                 .arg( lookAssistSceneName( scene ) )
-                .arg( bool01( floorLiftedNightThumbnail ) ) );
+                .arg( bool01( floorLiftedNightThumbnail ) )
+                .arg( lookAssistFlavorName( flavor ) ) );
 
         /* Round-4 debt block: every freeMlvObject path drains this counter
          * before freeing, so the detached worker can never read a freed
@@ -15788,6 +15947,7 @@ void MainWindow::applyLookAssistToReceipt( ReceiptSettings *receipt,
                      processedColorStatsCopy,
                      useProcessedColorStatsCopy,
                      sceneCopy,
+                     flavorCopy,
                      floorLiftedCopy,
                      widthCopy,
                      heightCopy,
@@ -15835,6 +15995,7 @@ void MainWindow::applyLookAssistToReceipt( ReceiptSettings *receipt,
             r.floorLifted          = floorLiftedCopy;
             r.useProcessedColorStats = useProcessedColorStatsCopy;
             r.scene                = lookAssistSceneName( sceneCopy );
+            r.flavorName           = lookAssistFlavorName( flavorCopy );
             r.width                = widthCopy;
             r.height               = heightCopy;
             r.downscaleFactor      = downscaleFactorCopy;
@@ -15855,7 +16016,8 @@ void MainWindow::applyLookAssistToReceipt( ReceiptSettings *receipt,
                         sceneCopy,
                         statsCopy,
                         useProcessedColorStatsCopy ? &processedColorStatsCopy : nullptr,
-                        displayStatsValidUi ? &displayStatsUi : nullptr );
+                        displayStatsValidUi ? &displayStatsUi : nullptr,
+                        flavorCopy );
 
             // Select thumbnail for WB patch search
             const unsigned char *autoWbThumbnail =
@@ -16035,16 +16197,13 @@ void MainWindow::applyLookAssistToReceipt( ReceiptSettings *receipt,
                      * blocking re-analysis for that receipt (the ~1/36
                      * "look assist never applied" race). Clear it and log so
                      * the next settle/frame-ready trigger re-dispatches. */
-                    if( m_lookAssistAppliedReceipt == receipt )
-                    {
-                        m_lookAssistAppliedReceipt = nullptr;
-                    }
+                    m_lookAssistApplied.clearIf( receipt );
                     logInteractionEvent(
                         QStringLiteral("look_assist.apply.async_dropped"),
                         QStringLiteral("generation=%1 current=%2 marker_cleared=%3")
                             .arg( dispatchGeneration )
                             .arg( m_lookAssistAsyncGeneration.load() )
-                            .arg( bool01( m_lookAssistAppliedReceipt == nullptr ) ) );
+                            .arg( bool01( m_lookAssistApplied.empty() ) ) );
                     return;
                 }
                 if( !m_fileLoaded || !m_pMlvObject )
@@ -16134,6 +16293,8 @@ void MainWindow::applyLookAssistToReceipt( ReceiptSettings *receipt,
                         r.chromaSmoothValue,
                         r.chromaSmoothAutoApplied );
                     m_lastLookAssistSafetyFallback = true;
+                    m_lookAssistFlavorOutcome.landed( activeReceipt, r.flavorName, true );
+                    activeReceipt->setLookAssistFlavor( m_lookAssistFlavorOutcome.receiptValue( activeReceipt, r.flavorName ) );
                     m_lastLookAssistExposure = activeReceipt->exposure();
                     m_lastLookAssistContrast = activeReceipt->contrast();
                     m_lastLookAssistPivot = activeReceipt->pivot();
@@ -16316,6 +16477,8 @@ void MainWindow::applyLookAssistToReceipt( ReceiptSettings *receipt,
                         r.chromaSmoothValue,
                         r.chromaSmoothAutoApplied );
                     m_lastLookAssistSafetyFallback = true;
+                    m_lookAssistFlavorOutcome.landed( activeReceipt, r.flavorName, true );
+                    activeReceipt->setLookAssistFlavor( m_lookAssistFlavorOutcome.receiptValue( activeReceipt, r.flavorName ) );
                     m_lastLookAssistExposure = activeReceipt->exposure();
                     m_lastLookAssistContrast = activeReceipt->contrast();
                     m_lastLookAssistPivot = activeReceipt->pivot();
@@ -16350,6 +16513,7 @@ void MainWindow::applyLookAssistToReceipt( ReceiptSettings *receipt,
                     return;
                 }
 
+                m_lookAssistFlavorOutcome.landed( activeReceipt, r.flavorName, false );
                 logInteractionEvent(
                     QStringLiteral("look_assist.apply.auto_wb_async_applied"),
                     QStringLiteral("generation=%1 valid=%2 source=%3 decision=%4 damping=%5 awb_temp=%6 awb_tint=%7 final_temp=%8 final_tint=%9 preset_exp=%10 frame=%11")
@@ -16377,11 +16541,18 @@ void MainWindow::applyLookAssistToReceipt( ReceiptSettings *receipt,
 
     const LookAssistStats &balanceStats =
         useProcessedColorStats ? processedColorStats : stats;
+    // The white-balance walk below RENDERS the picture through the live processing object, so whatever grade the
+    // sliders hold steers the temperature and tint it steps to. It therefore runs on the CLASSIC preset whatever the
+    // flavor, and the flavor's tone sliders are laid over the finished balance afterwards (lookAssistApplyFlavorDeltas,
+    // the same function the preset itself ends in): the balance is the Classic one by construction, here as headless.
+    const LookAssistFlavor flavorForTheWalk = LookAssistFlavor::Classic;
+    bool flavorLaidOver = false;
     LookAssistPreset preset = presetForLookAssistScene(
                 scene,
                 stats,
                 useProcessedColorStats ? &processedColorStats : nullptr,
-                displayStatsValidUi ? &displayStatsUi : nullptr );
+                displayStatsValidUi ? &displayStatsUi : nullptr,
+                flavorForTheWalk );
     const int baseTemperature = receipt->temperature() == -1
                               ? ui->horizontalSliderTemperature->value()
                               : receipt->temperature();
@@ -16473,6 +16644,43 @@ void MainWindow::applyLookAssistToReceipt( ReceiptSettings *receipt,
         applyLookAssistToReceipt( receipt, analysisFrame );
         s_lookAssistMasterScenePass = false;
         return;
+    }
+    // MEASURED, NOT APPLIED (LOOK-ASSIST-WINDOW-LIT-INTERIOR-1): on the owner clip the accepted solve did not verify
+    // (re-rendered at it, its own patch turns amber), so the window-lit reclassification stays off until the verdict
+    // (EV100 bound for a missing aperture) and balance (verified-surface search) follow-ons land. The check runs on
+    // copies and only logs what it measured; this pass's verdict, preset and balance are master's (shared with headless).
+    // Its verification renders use the isolated read-only renderer: no processing, cache or llrawproc state moves.
+    LookAssistStats windowLitStats = stats;
+    LookAssistScene windowLitScene = scene;
+    LookAssistPreset windowLitPreset = preset;
+    LookAssistWhiteBalanceRequest windowLitRequest = wbRequest;
+    windowLitRequest.stats = &windowLitStats;
+    windowLitRequest.renderBalance = ReceiptApplier::lookAssistMeasureOnlyRenderer(
+        m_pMlvObject, analysisFrame, colorDownscaleFactor, colorWidth, colorHeight,
+        qMax( 1, mlvappEffectiveWorkerThreadCount() ) );
+    const LookAssistWindowLitCheck windowLit = resolveLookAssistWindowLitInterior(
+        windowLitRequest, wb, m_pMlvObject->processing->exposure_stops, &windowLitStats, &windowLitScene, &windowLitPreset,
+        useProcessedColorStats ? &processedColorStats : nullptr,
+        displayStatsValidUi ? &displayStatsUi : nullptr );
+    if( windowLit.candidate )
+    {
+        logInteractionEvent(
+            QStringLiteral("look_assist.window_lit_interior"),
+            QStringLiteral("would_reclassify=%1 reason=%2 scene=%3 base_surface_chroma=%4 base_surface_blue_amber=%5 "
+                           "solution_surface_chroma=%6 solution_surface_blue_amber=%7 frame=%8 "
+                           "expo_iso=%9 expo_shutter_us=%10 lens_aperture_x100=%11")
+                .arg( bool01( windowLit.evidence ) )
+                .arg( windowLit.reason )
+                .arg( lookAssistSceneName( scene ) )
+                .arg( windowLit.baseSurfaceChroma, 0, 'f', 1 )
+                .arg( windowLit.baseSurfaceBlueAmber, 0, 'f', 1 )
+                .arg( windowLit.solutionSurfaceChroma, 0, 'f', 1 )
+                .arg( windowLit.solutionSurfaceBlueAmber, 0, 'f', 1 )
+                .arg( analysisFrame )
+                // The raw EXPO / LENS fields behind has_ev100=0: which one is missing decides the follow-on.
+                .arg( static_cast<qulonglong>( m_pMlvObject->EXPO.isoValue ) )
+                .arg( static_cast<qulonglong>( m_pMlvObject->EXPO.shutterValue ) )
+                .arg( static_cast<qulonglong>( m_pMlvObject->LENS.aperture ) ) );
     }
     const bool autoWhiteBalanceValid = wb.autoValid;
     const QString autoWhiteBalanceSource = wb.source;
@@ -16814,6 +17022,28 @@ void MainWindow::applyLookAssistToReceipt( ReceiptSettings *receipt,
         }
         postTemperatureDelta = preset.temperatureDelta - initialTemperatureDelta;
         postTintDelta = preset.tintDelta - initialTintDelta;
+        if( flavor != LookAssistFlavor::Classic )
+        {
+            // The balance is final. Lay the flavor over it and measure the picture the user will actually see once,
+            // for the diagnostics and the safety guard only: no balance step follows this measurement.
+            lookAssistApplyFlavorDeltas( &preset, scene, flavor );
+            applyLookAssistValues();
+            flavorLaidOver = true;
+            const LookAssistStats walkPostColorStats = postColorStats;
+            const bool walkPostColorStatsValid = postColorStatsValid;
+            postColorStatsValid = analyzePostAppliedLook();
+            if( !postColorStatsValid && walkPostColorStatsValid )
+            {
+                postColorStats = walkPostColorStats;
+                postColorStatsValid = true;
+            }
+        }
+    }
+    if( flavor != LookAssistFlavor::Classic && !flavorLaidOver )
+    {
+        // No picture analysis to run (no processed colour): the same overlay, nothing to re-measure.
+        lookAssistApplyFlavorDeltas( &preset, scene, flavor );
+        applyLookAssistValues();
     }
 
     // [PICTURE-DUMP] env-gated, read-only evidence (MLVAPP_LOOK_ASSIST_PICTURE_DUMP=<dir>): the picture
@@ -17066,6 +17296,9 @@ void MainWindow::applyLookAssistToReceipt( ReceiptSettings *receipt,
                 .arg( m_lastLookAssistPostGreenArtifactMeanAxis, 0, 'f', 3 )
                 .arg( m_lastLookAssistPostVisibleGreenAxis, 0, 'f', 3 ) );
         m_lastLookAssistSafetyFallback = true;
+        // The baseline sliders are back: the receipt must not keep naming the selected (Cinematic) flavor over them.
+        m_lookAssistFlavorOutcome.landed( receipt, lookAssistFlavorName( flavor ), true );
+        receipt->setLookAssistFlavor( m_lookAssistFlavorOutcome.receiptValue( receipt, lookAssistFlavorName( flavor ) ) );
         m_lastLookAssistExposure = receipt->exposure();
         m_lastLookAssistContrast = receipt->contrast();
         m_lastLookAssistPivot = receipt->pivot();
@@ -17083,9 +17316,11 @@ void MainWindow::applyLookAssistToReceipt( ReceiptSettings *receipt,
         return;
     }
 
+    m_lookAssistFlavorOutcome.landed( receipt, lookAssistFlavorName( flavor ), false );
+    receipt->setLookAssistFlavor( lookAssistFlavorName( flavor ) );
     logInteractionEvent(
         QStringLiteral("look_assist.apply.result"),
-        QStringLiteral("analysis=raw scene=%1 median=%2 p05=%3 p95=%4 p99=%5 clip_low=%6 clip_high=%7 balance_samples=%8 preset_exp=%9 preset_contrast=%10 preset_pivot=%11 preset_shadows=%12 preset_highlights=%13 preset_vibrance=%14 preset_temp_delta=%15 preset_tint_delta=%16 final_temp=%17 final_tint=%18 thumb=%19x%20 downscale=%21 color_thumb=%22x%23 color_downscale=%24 frame=%25 last_serial=%26 last_frame=%27 next_serial=%28 %29")
+        QStringLiteral("analysis=raw scene=%1 median=%2 p05=%3 p95=%4 p99=%5 clip_low=%6 clip_high=%7 balance_samples=%8 preset_exp=%9 preset_contrast=%10 preset_pivot=%11 preset_shadows=%12 preset_highlights=%13 preset_vibrance=%14 preset_temp_delta=%15 preset_tint_delta=%16 final_temp=%17 final_tint=%18 thumb=%19x%20 downscale=%21 color_thumb=%22x%23 color_downscale=%24 frame=%25 last_serial=%26 last_frame=%27 next_serial=%28 %29 flavor=%30")
             .arg( m_lastLookAssistScene )
             .arg( stats.median, 0, 'f', 3 )
             .arg( stats.p05, 0, 'f', 3 )
@@ -17116,7 +17351,8 @@ void MainWindow::applyLookAssistToReceipt( ReceiptSettings *receipt,
                   ? static_cast<int>( m_lastPresentedRequestContext.frameNumber )
                   : -1 )
             .arg( static_cast<qulonglong>( m_nextRenderRequestSerial ) )
-            .arg( lookAssistDecisionLogFields( stats, decisionTrace ) ) );
+            .arg( lookAssistDecisionLogFields( stats, decisionTrace ) )
+            .arg( lookAssistFlavorName( flavor ) ) );
 }
 
 void MainWindow::syncLookAssistDerivedUiToReceipt( ReceiptSettings *receipt )
@@ -17218,6 +17454,11 @@ void MainWindow::setReceipt( ReceiptSettings *receipt )
 
     receipt->setRawFixesEnabled( ui->checkBoxRawFixEnable->isChecked() );
     receipt->setLookAssistEnabled( ui->checkBoxLookAssistEnable->isChecked() );
+    // The flavor APPLIED, not the one merely selected: after a safety fallback the sliders are the baseline's and the
+    // receipt must not name Cinematic over them. No recorded outcome for this clip (Look Assist off, analysis pending)
+    // keeps the selector's value, the clip's setting.
+    receipt->setLookAssistFlavor( m_lookAssistFlavorOutcome.receiptValue(
+        receipt, lookAssistFlavorName( currentLookAssistFlavor() ) ) );
     receipt->setVerticalStripes( toolButtonVerticalStripesCurrentIndex() );
     receipt->setFocusPixels( toolButtonFocusPixelsCurrentIndex() );
     receipt->setFpiMethod( toolButtonFocusPixelsIntMethodCurrentIndex() );
@@ -23080,8 +23321,13 @@ void MainWindow::forcePlaybackSmokeWindowForeground( void )
     // SW_SHOWNORMAL below would silently undo that switch -- everything else in this
     // function (raise/activate/SetForegroundWindow) is state-preserving and safe to
     // repeat regardless.
+    // CUDA-PERF-DISPLAY-MODE-AB-1: the same holds for a --windowed leg, which
+    // placePlaybackSmokeWindowWindowed() has MAXIMIZED before the second call. Un-maximizing
+    // it here resizes the window, and resizeEvent() unchecks Play -- measured on bachelor:
+    // the windowed leg's Play stopped 37 ms after the trigger with 0 frames presented.
     const bool wasFullScreen = isFullScreen();
-    if( !wasFullScreen ) showNormal();
+    const bool keepWindowState = wasFullScreen || isMaximized();
+    if( !keepWindowState ) showNormal();
     raise();
     activateWindow();
     if( QWindow *gpuWindow = GpuDisplayWindow::activeWindow() )
@@ -23116,7 +23362,7 @@ void MainWindow::forcePlaybackSmokeWindowForeground( void )
                 attached = AttachThreadInput( myThreadId, foregroundThreadId, TRUE ) != 0;
             }
         }
-        ShowWindow( target, wasFullScreen ? SW_SHOW : SW_SHOWNORMAL );
+        ShowWindow( target, keepWindowState ? SW_SHOW : SW_SHOWNORMAL );
         // Brief HWND_TOPMOST -> HWND_NOTOPMOST: forces the z-order swap SetForegroundWindow
         // alone can be refused for, then immediately releases it -- the window must not
         // stay permanently topmost after this call returns.
@@ -26087,26 +26333,25 @@ void MainWindow::noteContactSheetPresentedFrame(
     const PresentationRequestContext &requestContext )
 {
     if( !m_contactSheetCaptureActive ) return;
-    // B1: this hook fires on EVERY presented frame, seeked or played -- the restart re-cue
-    // (seekAndSettleLoadedClip) runs while m_contactSheetCaptureActive is already true, and its
-    // own settle-wait pumps the event loop, so a seek-presented frame can reach here before
-    // ui->actionPlay->trigger() is ever called. Disarm on any such frame: never save a
-    // seek-presented frame as playback_path=true. Re-arms itself the moment Play is actually
-    // checked and the next genuinely-played frame presents.
+    // B1: this hook fires on EVERY presented frame. A frame presented while Play is not checked
+    // (a seek, a paused redraw) is never kept as playback_path=true.
     if( !ui->actionPlay->isChecked() ) return;
-    if( m_contactSheetCaptureNextTargetIndex >= m_contactSheetCaptureTargetFrames.size() )
+    if( m_contactSheetCaptureNextTargetIndex >= m_contactSheetCaptureTargetMs.size() )
     {
         m_contactSheetCaptureActive = false;
         return;
     }
-    // Targets are ascending and playback only moves the timeline forward, so the first
-    // presented frame at or past the next target is the capture for that target -- this
-    // never blocks waiting for an exact frame number playback happened to skip over.
-    const int targetFrame =
-        m_contactSheetCaptureTargetFrames.at( m_contactSheetCaptureNextTargetIndex );
-    if( static_cast<int>( displayFrame ) < targetFrame ) return;
+    // CONTACT-SHEET-PLAYBACK-PARITY-1: armed on the MEASURED Play. Targets are ascending times since
+    // that Play started, so the first frame presented at or after the next target is its grab --
+    // whatever fps the leg reaches, every target falls inside the play window.
+    const qint64 grabElapsedMs = m_contactSheetCaptureClock.elapsed();
+    if( grabElapsedMs < m_contactSheetCaptureTargetMs.at( m_contactSheetCaptureNextTargetIndex ) ) return;
 
     const int i = m_contactSheetCaptureNextTargetIndex;
+    // The readback below runs on the GUI thread inside the measured interval: it is timed and
+    // reported, and nothing else (no PNG encode, no file I/O) happens here.
+    QElapsedTimer grabTimer;
+    grabTimer.start();
 
     const QJsonObject &timing = readyFrame.stageTimingTelemetry;
     const GpuPlaybackPipelineStatus contactFramePipelineStatus =
@@ -26176,29 +26421,16 @@ void MainWindow::noteContactSheetPresentedFrame(
         contactFrameSource = QStringLiteral("app_internal_viewport_grab");
     }
 
-    const QDir contactSheetDirInfo( m_contactSheetCaptureDir );
-    const QString frameBaseName =
-        QStringLiteral("frame-%1").arg( i, 2, 10, QLatin1Char('0') );
-    // H3: the sidecar's own "path" field is never an absolute local path -- just the
-    // basename, relative to this capture's own directory (frames_dir). The composer resolves
-    // the image against frames_dir FIRST (never its own current working directory, which
-    // could otherwise silently pick up an unrelated same-named file sitting there -- r1d, sol
-    // pre-review #2), and always falls back to <frames_dir>/<json stem>.png otherwise (see
-    // _resolve_frame_image_path/make-contact-sheet.py), so publishing this sidecar without
-    // rewriting it never breaks composition.
-    const QString pngRelativeName = frameBaseName + QStringLiteral(".png");
-    const QString pngPath = contactSheetDirInfo.absoluteFilePath( pngRelativeName );
-    const QString jsonPath = contactSheetDirInfo.absoluteFilePath(
-        frameBaseName + QStringLiteral(".json") );
+    const double grabMs = static_cast<double>( grabTimer.nsecsElapsed() ) / 1000000.0;
+    const bool frameOk = !gpuWindowGrabFailedClosed
+        && !contactFrameImage.isNull();
 
-    bool frameOk = !gpuWindowGrabFailedClosed
-        && !contactFrameImage.isNull() && contactFrameImage.save( pngPath, "PNG" );
-
-    const double elapsedMsForFrame = m_contactSheetCaptureFps > 0.0
-        ? ( static_cast<double>(
-                static_cast<int>( displayFrame ) - m_contactSheetCaptureStartFrame )
-            / m_contactSheetCaptureFps ) * 1000.0
-        : 0.0;
+    // H3: the sidecar's own "path" field is never an absolute local path -- just the basename,
+    // relative to this capture's own directory (frames_dir). The composer resolves the image
+    // against frames_dir FIRST and falls back to <frames_dir>/<json stem>.png (see
+    // _resolve_frame_image_path/make-contact-sheet.py), so publishing this sidecar never breaks it.
+    const QString pngRelativeName =
+        QStringLiteral("frame-%1.png").arg( i, 2, 10, QLatin1Char('0') );
 
     QJsonObject frameJson;
     frameJson.insert( QStringLiteral("index"), i );
@@ -26207,14 +26439,17 @@ void MainWindow::noteContactSheetPresentedFrame(
     frameJson.insert( QStringLiteral("serial"),
         static_cast<double>( contactFramePresentedSerial ) );
     frameJson.insert( QStringLiteral("display_frame"), static_cast<int>( displayFrame ) );
-    frameJson.insert( QStringLiteral("elapsed_ms"), elapsedMsForFrame );
+    // Wall time since the measured Play started, when this frame was presented and grabbed.
+    frameJson.insert( QStringLiteral("elapsed_ms"), static_cast<double>( grabElapsedMs ) );
+    frameJson.insert( QStringLiteral("target_ms"),
+        static_cast<double>( m_contactSheetCaptureTargetMs.at( i ) ) );
     frameJson.insert( QStringLiteral("texture_source"), contactFrameSource );
     frameJson.insert( QStringLiteral("render_path"), contactFrameRenderPath );
     frameJson.insert( QStringLiteral("playback_path"), true );
+    frameJson.insert( QStringLiteral("capture_mode"), QStringLiteral("in_pass") );
+    frameJson.insert( QStringLiteral("grab_ms"), grabMs );
     frameJson.insert( QStringLiteral("path"), pngRelativeName );
     frameJson.insert( QStringLiteral("span_start"), m_contactSheetCaptureStartFrame );
-    frameJson.insert( QStringLiteral("span_end"), m_contactSheetCaptureEndFrame );
-    frameJson.insert( QStringLiteral("span_wrapped"), m_contactSheetCaptureWrapped );
     frameJson.insert( QStringLiteral("look_assist_enabled"),
         ui->checkBoxLookAssistEnable->isChecked() );
     frameJson.insert( QStringLiteral("look_assist_scene"),
@@ -26240,24 +26475,17 @@ void MainWindow::noteContactSheetPresentedFrame(
     frameJson.insert( QStringLiteral("look_assist_highlights"),
         ui->horizontalSliderHighlights->value() );
     frameJson.insert( QStringLiteral("settled"), true );
-    frameJson.insert( QStringLiteral("saved"), frameOk );
 
     if( frameOk )
     {
-        QFile sidecarFile( jsonPath );
-        if( sidecarFile.open( QIODevice::WriteOnly | QIODevice::Truncate ) )
-        {
-            sidecarFile.write( QJsonDocument( frameJson ).toJson( QJsonDocument::Indented ) );
-            sidecarFile.close();
-            ++m_contactSheetCaptureFramesWritten;
-        }
-        else
-        {
-            frameOk = false;
-        }
+        ContactSheetPendingGrab pending;
+        pending.image = contactFrameImage;
+        pending.sidecar = frameJson;
+        pending.grabMs = grabMs;
+        pending.grabElapsedMs = grabElapsedMs;
+        m_contactSheetPendingGrabs.append( pending );
     }
-
-    if( !frameOk && m_contactSheetCaptureError.isEmpty() )
+    else if( m_contactSheetCaptureError.isEmpty() )
     {
         m_contactSheetCaptureError = QStringLiteral(
             "frame %1 capture failed (reason=%2)" )
@@ -26265,7 +26493,7 @@ void MainWindow::noteContactSheetPresentedFrame(
     }
 
     ++m_contactSheetCaptureNextTargetIndex;
-    if( m_contactSheetCaptureNextTargetIndex >= m_contactSheetCaptureTargetFrames.size() )
+    if( m_contactSheetCaptureNextTargetIndex >= m_contactSheetCaptureTargetMs.size() )
         m_contactSheetCaptureActive = false;
 }
 
@@ -27360,14 +27588,10 @@ void MainWindow::on_actionPlay_toggled(bool checked)
         m_playbackDisplayRequiredActive = true;
         m_playbackScreensaverBlockedCount = 0;
         resetPlaybackQualityAutoRunState();
-        // B2 (capture-only playback mode): the contact-sheet capture pass restarts Play
-        // itself, potentially many times, strictly AFTER the measured interval's own
-        // beginPlaybackSmokeTelemetry()/finishPlaybackSmokeTelemetry() pair has already
-        // closed. Never re-open a new playback_smoke session (and never reset the GPU
-        // swap-telemetry counters) for one of those restarts: doing so would emit
-        // additional playback_smoke.frame/summary/gpu_summary lines the Bachelor job's
-        // parsers could pick up in place of (or mixed with) the measured session.
-        if( !m_contactSheetCaptureActive ) beginPlaybackSmokeTelemetry();
+        // B2: contact-sheet state never gates this. The capture used to restart Play after the
+        // measured interval and had to suppress the session; it now grabs during the measured
+        // Play itself (CONTACT-SHEET-PLAYBACK-PARITY-1), and nothing restarts Play for it.
+        beginPlaybackSmokeTelemetry();
         beginPlayToFirstFrameMeasurement();
         m_playbackScopeLastUpdateTime = 0.0;
         requestFrameRefresh( true, "play-start" );
@@ -28020,6 +28244,37 @@ void MainWindow::on_checkBoxRawFixEnable_clicked(bool checked)
     applyEffectiveDualIsoPlaybackSettings();
 }
 
+// The flavor in force: MLVAPP_LOOK_ASSIST_FLAVOR (runs) over the combo box (the app setting). The scene verdict is
+// flavor-blind; the flavor only shapes the sliders. An unknown value is Classic and is warned about once per value.
+LookAssistFlavor MainWindow::currentLookAssistFlavor()
+{
+    const LookAssistFlavorSelection selection = lookAssistSelectFlavor(
+        lookAssistFlavorEnvironmentValue(), QString(), ui->comboBoxLookAssistFlavor->currentData().toString() );
+    if( selection.unknownValue && m_lastWarnedLookAssistFlavorValue != selection.rejectedValue )
+    {
+        m_lastWarnedLookAssistFlavorValue = selection.rejectedValue;
+        logInteractionEvent(
+            QStringLiteral("look_assist.flavor.unknown_value"),
+            QStringLiteral("value=%1 source=%2 using=classic").arg( selection.rejectedValue ).arg( selection.source ) );
+    }
+    return selection.flavor;
+}
+
+void MainWindow::on_comboBoxLookAssistFlavor_currentIndexChanged( int )
+{
+    if( !m_fileLoaded || !ACTIVE_RECEIPT ) return;
+    ACTIVE_RECEIPT->setLookAssistFlavor( lookAssistFlavorName( currentLookAssistFlavor() ) );
+    // A different grade over the same clip: the marker forgets it (otherwise the toggle's frame-ready step would
+    // dedup_skip the new analysis after the baseline is restored and leave the clip ungraded under a receipt that
+    // names the new flavor), then the same path as switching Look Assist on restores the baseline and analyses
+    // again. Nothing to do while Look Assist is off.
+    if( m_lookAssistApplied.flavorChanged( ACTIVE_RECEIPT, ui->checkBoxLookAssistEnable->isChecked() ) )
+    {
+        m_lookAssistFlavorOutcome.clear();   // nothing of the old grade is applied once the baseline is back
+        on_checkBoxLookAssistEnable_clicked( true );
+    }
+}
+
 void MainWindow::on_checkBoxLookAssistEnable_clicked( bool checked )
 {
     if( !m_fileLoaded || !ACTIVE_RECEIPT ) return;
@@ -28094,7 +28349,7 @@ void MainWindow::on_checkBoxLookAssistEnable_clicked( bool checked )
                 return;
             }
 
-            if( m_lookAssistAppliedReceipt == ACTIVE_RECEIPT )
+            if( m_lookAssistApplied.isApplied( ACTIVE_RECEIPT ) )
             {
                 logInteractionEvent(
                     QStringLiteral("look_assist.apply.dedup_skip"),
@@ -28127,7 +28382,7 @@ void MainWindow::on_checkBoxLookAssistEnable_clicked( bool checked )
                 captureLookAssistBaseline( ACTIVE_RECEIPT );
 
             applyLookAssistToReceipt( ACTIVE_RECEIPT, analysisFrame );
-            m_lookAssistAppliedReceipt = ACTIVE_RECEIPT;
+            m_lookAssistApplied.markApplied( ACTIVE_RECEIPT );
             syncLookAssistDerivedUiToReceipt( ACTIVE_RECEIPT );
             setReceipt( ACTIVE_RECEIPT );
             logInteractionEvent(
@@ -28189,8 +28444,8 @@ void MainWindow::on_checkBoxLookAssistEnable_clicked( bool checked )
     {
         restoreLookAssistBaseline( ACTIVE_RECEIPT );
         m_lastLookAssistDiagnosticsValid = false;
-        if( m_lookAssistAppliedReceipt == ACTIVE_RECEIPT )
-            m_lookAssistAppliedReceipt = nullptr;
+        m_lookAssistApplied.clearIf( ACTIVE_RECEIPT );
+        m_lookAssistFlavorOutcome.clear();   // the baseline is back: no grade, no fallback, only the selector's setting
     }
 
     setReceipt( ACTIVE_RECEIPT );

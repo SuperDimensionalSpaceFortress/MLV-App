@@ -280,6 +280,32 @@ TEST(GuiSmokeDisplaySelectWiring, RunGuiPlaybackSmokePlacesBeforeForegroundAndFu
     ASSERT_TRUE(enterFullscreenAt > placeWindowedAt);
 }
 
+TEST(GuiSmokeDisplaySelectWiring, PostPlacementForegroundRequestKeepsTheWindowedMaximize)
+{
+    // CUDA-PERF-DISPLAY-MODE-AB-1: the SECOND forcePlaybackSmokeWindowForeground() call runs
+    // after placement, so on a --windowed leg the window is maximized by then. resizeEvent()
+    // stops Play on every resize, so a showNormal()/SW_SHOWNORMAL there un-maximized the
+    // window and ended the measured Play ~40 ms after the trigger (bachelor, 0 frames).
+    const QString source = readRepoFile(QStringLiteral("platform/qt/MainWindow.cpp"));
+    const QString resizeBody = functionBody(source,
+        QStringLiteral("void MainWindow::resizeEvent(QResizeEvent *event)"),
+        QStringLiteral("void MainWindow::changeEvent( QEvent *event )"));
+    ASSERT_FALSE(resizeBody.isEmpty());
+    ASSERT_TRUE(resizeBody.contains(QStringLiteral("ui->actionPlay->setChecked( false );")));
+
+    const QString body = functionBody(source,
+        QStringLiteral("void MainWindow::forcePlaybackSmokeWindowForeground( void )"),
+        QStringLiteral("bool MainWindow::enterPlaybackSmokeFullscreen( QScreen *target )"));
+    ASSERT_FALSE(body.isEmpty());
+    ASSERT_TRUE(body.contains(QStringLiteral(
+        "const bool keepWindowState = wasFullScreen || isMaximized();")));
+    ASSERT_TRUE(body.contains(QStringLiteral("if( !keepWindowState ) showNormal();")));
+    ASSERT_TRUE(body.contains(QStringLiteral(
+        "ShowWindow( target, keepWindowState ? SW_SHOW : SW_SHOWNORMAL );")));
+    ASSERT_FALSE(body.contains(QStringLiteral("if( !wasFullScreen ) showNormal();")));
+    ASSERT_FALSE(body.contains(QStringLiteral("wasFullScreen ? SW_SHOW : SW_SHOWNORMAL")));
+}
+
 TEST(GuiSmokeDisplaySelectWiring, GeometryGuardCapturesBeforeMoveAndRestoresOnDestruction)
 {
     const QString source = readRepoFile(QStringLiteral("platform/qt/MainWindow.cpp"));

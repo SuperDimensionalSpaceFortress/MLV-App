@@ -231,6 +231,11 @@ param(
     [switch]$ContactSheet,
     [ValidateRange(1, 60)]
     [int]$ContactSheetFrames = 6,
+    # CONTACT-SHEET-PLAYBACK-PARITY-1: the -ContactSheet frames are grabbed DURING the measured Play
+    # (in-pass, playback_path=true, no replay). This switch also asks the app for a paired SEEK
+    # capture of the same frames after the Play stops (--contact-sheet-seek-dir; it never plays,
+    # playback_path=false), published apart under paired-seek\contact-sheet\raw. Off by default.
+    [switch]$ContactSheetPairedSeek,
 
     # CUDA-PLAYBACK-PRESENT-CADENCE-1 round 2 discriminating legs. HEAVY (default, unchanged
     # behavior for every existing caller) keeps every diagnostic env var PLAYBACK-ATTR-3-CUDA
@@ -322,8 +327,9 @@ param(
     [switch]$ForceLookAssist,
 
     # DUAL-VENUE-EVIDENCE-1, AMENDMENT 2: the Look Assist flavor a LOOK leg asks for. Passed to the
-    # app as MLVAPP_LOOK_ASSIST_FLAVOR. The app does not read it yet (LOOK-ASSIST-FLAVORS-1 adds
-    # that), so every receipt records lookFlavorHonored=unknown -- never a claim that it applied.
+    # app as MLVAPP_LOOK_ASSIST_FLAVOR. The app reads it (LOOK-ASSIST-FLAVORS-1) and reports the flavor it applied
+    # on gui_smoke.visual_state (look_assist_flavor); the job records that report as lookFlavorReported and
+    # lookFlavorHonored = (reported equals requested). An app that reports nothing is 'none' -> not honoured.
     # Only emitted for a LOOK leg (-ForceLookAssist); the default 'classic' adds nothing.
     [ValidateSet('classic', 'cinematic')]
     [string]$LookFlavor = 'classic',
@@ -492,6 +498,7 @@ $fixtureRehearsalLiteral = if ($isFixtureRehearsal) { '$true' } else { '$false' 
 # a plain bool/int literal substituted into the template, never caller text.
 $contactSheetEnabledLiteral = if ($ContactSheet) { '$true' } else { '$false' }
 $contactSheetFrameCountLiteral = [string]$ContactSheetFrames
+$contactSheetPairedSeekLiteral = if ($ContactSheet -and $ContactSheetPairedSeek) { '$true' } else { '$false' }
 
 # ATTR3-FIXTURE-STAGE-1. The compound suffix the two tracked fixtures carry is never spelled
 # as one literal token anywhere in this file: a token ending in it trips this repository's own
@@ -979,6 +986,9 @@ $FixtureRehearsal = __FIXTURE_REHEARSAL__
 $FixtureSha256 = '__FIXTURE_SHA256__'
 $ContactSheetEnabled = __CONTACT_SHEET_ENABLED__
 $ContactSheetFrameCount = __CONTACT_SHEET_FRAME_COUNT__
+# CONTACT-SHEET-PLAYBACK-PARITY-1 >>>
+$ContactSheetPairedSeek = __CONTACT_SHEET_PAIRED_SEEK__
+# CONTACT-SHEET-PLAYBACK-PARITY-1 <<<
 $ContactSheetComposerPyBase64 = '__CONTACT_SHEET_COMPOSER_PY_BASE64__'
 $ContactSheetComposerSha256 = '__CONTACT_SHEET_COMPOSER_SHA256__'
 $TelemetryArm = '__TELEMETRY_ARM__'
@@ -2565,6 +2575,17 @@ if ($ContactSheetEnabled) {
     # playback-mode contact sheet is a second Play of the measured span (a replay) and is refused
     # (REPLAY_REFUSED); the seek capture never plays. Its sidecars record playback_path=false.
     $contactSheetAdditionalArgs = "@('--contact-sheet-dir', $(ConvertTo-PsSingleQuoted $contactSheetDir), '--contact-sheet-frames', '$ContactSheetFrameCount', '--contact-sheet-seek-mode')"
+    # CONTACT-SHEET-PLAYBACK-PARITY-1 >>>
+    # Supersedes the line above: the app's default capture now grabs the frames DURING the measured
+    # Play (in-pass, playback_path=true, no replay; its readback cost is recorded per frame), so the
+    # sheet shows what played. A seek sheet (playback_path=false: a seeked frame takes a different
+    # render path and can look different) is added only when -ContactSheetPairedSeek asks for it.
+    $contactSheetAdditionalArgs = "@('--contact-sheet-dir', $(ConvertTo-PsSingleQuoted $contactSheetDir), '--contact-sheet-frames', '$ContactSheetFrameCount')"
+    if ($ContactSheetPairedSeek) {
+        $contactSheetSeekDir = Join-Path $Work 'contact-sheet-seek'
+        $contactSheetAdditionalArgs = "@('--contact-sheet-dir', $(ConvertTo-PsSingleQuoted $contactSheetDir), '--contact-sheet-frames', '$ContactSheetFrameCount', '--contact-sheet-seek-dir', $(ConvertTo-PsSingleQuoted $contactSheetSeekDir))"
+    }
+    # CONTACT-SHEET-PLAYBACK-PARITY-1 <<<
     $cmd = "$cmd -AdditionalArgs $contactSheetAdditionalArgs"
 }
 # CUDA-PERF-DISPLAY-IDENTITY-HARNESS-1/2/3 (sol BLOCKER 2 / fable HARDENING, direction corrected
@@ -3761,6 +3782,13 @@ Save-Json ([ordered]@{
 # artifact index below so these land in it the same way every other published file does.
 if ($ContactSheetEnabled -and $contactSheetDir -and (Test-Path -LiteralPath $contactSheetDir)) {
     $contactSheetPubDir = Publish-AttrCudaContactSheetRawCaptures -Enabled $ContactSheetEnabled -SourceDir $contactSheetDir -PubRoot $Pub
+    # CONTACT-SHEET-PLAYBACK-PARITY-1 >>>
+    # The paired seek capture, when asked for, publishes under its own labelled root
+    # (paired-seek\contact-sheet\raw), never mixed into the in-pass frames above.
+    if ($ContactSheetPairedSeek) {
+        [void](Publish-AttrCudaContactSheetRawCaptures -Enabled $ContactSheetEnabled -SourceDir (Join-Path $Work 'contact-sheet-seek') -PubRoot (Join-Path $Pub 'paired-seek'))
+    }
+    # CONTACT-SHEET-PLAYBACK-PARITY-1 <<<
     # CUDA-PLAYBACK-CONTACT-SHEET-1 r1b: compose the raw captures into one labelled sheet +
     # stats sidecar right here, in the job's publish step, so a reader gets the composed
     # artifact without running make-contact-sheet.py by hand. Pillow/numpy (and Python
@@ -4060,7 +4088,8 @@ if ($isVariant) {
     lookLeg = $LookLeg
     lookAssistForced = $LookLeg
     lookFlavor = $(if ($LookLeg) { $LookFlavor } else { $null })
-    lookFlavorHonored = $(if ($LookLeg) { ''unknown'' } else { $null })
+    lookFlavorReported = $(if ($LookLeg) { $lfReported = try { [string]$resultJson.log.visualState.look_assist_flavor } catch { '''' }; if ([string]::IsNullOrEmpty($lfReported)) { $lfReported = ''none'' }; $lfReported } else { $null })
+    lookFlavorHonored = $(if ($LookLeg) { $lfReported -ceq $LookFlavor } else { $null })
 ')
 }
 
@@ -4097,6 +4126,7 @@ $text = Expand-AttrCudaTemplate -Template $template -Tokens ([ordered]@{
     FIXTURE_SHA256 = $FixtureSha256
     CONTACT_SHEET_ENABLED = $contactSheetEnabledLiteral
     CONTACT_SHEET_FRAME_COUNT = $contactSheetFrameCountLiteral
+    CONTACT_SHEET_PAIRED_SEEK = $contactSheetPairedSeekLiteral
     CONTACT_SHEET_COMPOSER_PY_BASE64 = $contactSheetComposerPyBase64
     CONTACT_SHEET_COMPOSER_SHA256 = $contactSheetComposerSha256ForTemplate
     TELEMETRY_ARM = $TelemetryArm
