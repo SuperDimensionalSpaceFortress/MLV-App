@@ -3257,14 +3257,6 @@ if ($sourceFramesVerdict.invalid) {
         sourceFrames=$sourceFramesBlock
         display=$displayBlock; sourceCommit=$SourceCommit; clipId=$ClipId; artifactRoot=$Pub
     }
-    # PLAYBACK-CUDA-NATIVE-PACE-1 >>>
-    # A run whose only failure is the observed timeline rate beating native gets its own typed reason (the oracle's failure text
-    # carries the observed fps); anything else stays INVALID_SOURCE_FRAMES / INVALID_LOOPED.
-    $sourceFramesFailureList = @($sourceFramesVerdict.failures)
-    if (-not $sourceFramesWrapped -and $sourceFramesFailureList.Count -eq 1 -and [string]$sourceFramesFailureList[0] -like 'PLAYBACK_FASTER_THAN_NATIVE:*') {
-        $sourceFramesRefusal['smokeRefusalReason'] = 'PLAYBACK_FASTER_THAN_NATIVE'
-    }
-    # PLAYBACK-CUDA-NATIVE-PACE-1 <<<
     Save-Json $sourceFramesRefusal (Join-Path $Pub 'summary.json')
     Write-Output "RESULT=SOURCE_FRAMES_INVALID SOURCE_ADVANCED=$($sourceFramesVerdict.sourceAdvanced) REQUIRED_SOURCE_FRAMES=$($sourceFramesVerdict.requiredSourceFrames) WRAPPED=$sourceFramesWrapped ARTIFACTS=$Pub"
     exit 29

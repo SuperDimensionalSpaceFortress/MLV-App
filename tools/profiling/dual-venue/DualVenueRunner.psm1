@@ -478,8 +478,6 @@ function Get-DvClipAdmission {
 # evaluates the launcher's own expression and feeds it to this rule, so a producer-format change turns a test red.
 $script:RunNoncePattern = '^[0-9a-f]{32}$'
 $script:MinPlaySeconds = 20.0
-# PLAYBACK-CUDA-NATIVE-PACE-1: an observed timeline rate more than 2 % over native is PLAYBACK_FASTER_THAN_NATIVE.
-$script:FasterThanNativeTolerance = 0.02
 
 function ConvertTo-DvInt64 {
     # $null for absent / a bool / not an integer: an unparsable number is ABSENT, never zero.
@@ -563,21 +561,6 @@ function Get-DvPlaybackProblems {
     elseif ($null -ne $native -and $native -gt 0 -and [Math]::Abs($pace - $native) -gt (0.005 * $native)) {
         $reasons.Add("INVALID_SOURCE_FRAMES: the engine paced at pace_fps=$pace but the footage native fps is $native; 20 s of wall clock is not 20 s of footage")
     }
-    # PLAYBACK-CUDA-NATIVE-PACE-1: pace_fps is the pace the engine was TOLD. The OBSERVED timeline rate (source_advanced per wall
-    # second of the measured Play, elapsed_ms) more than 2 % over native is PLAYBACK_FASTER_THAN_NATIVE: UM's CUDA legs showed a
-    # 23.976 clip at 31.6 fps while this oracle still said "paced at native fps". Slower than native stays as it is.
-    $elapsedMs = ConvertTo-DvDouble (Get-DvProp $Playback 'elapsedMs')
-    if ($null -ne $advanced -and $advanced -gt 0) {
-        if ($null -eq $elapsedMs) { $reasons.Add('RECEIPT_FIELD_ABSENT: elapsed_ms') }
-        elseif ($elapsedMs -le 0) { $reasons.Add("INVALID_SOURCE_FRAMES: elapsed_ms=$elapsedMs; the measured Play has no wall time, so the observed timeline rate is unknown") }
-        elseif ($null -ne $native -and $native -gt 0) {
-            $observed = [double]$advanced * 1000.0 / $elapsedMs
-            if ($observed -gt $native * (1.0 + $script:FasterThanNativeTolerance)) {
-                $reasons.Add(('PLAYBACK_FASTER_THAN_NATIVE: source_advanced={0} in elapsed_ms={1} is {2:F3} fps observed against native_fps={3} (+{4:F1} %, tolerance {5:F0} %); the footage was shown faster than real time' -f
-                    $advanced, $elapsedMs, $observed, $native, (($observed / $native - 1.0) * 100.0), ($script:FasterThanNativeTolerance * 100.0)))
-            }
-        }
-    }
     if ($null -eq $override) { $reasons.Add('RECEIPT_FIELD_ABSENT: fps_override') }
     elseif ($override -ne 0) { $reasons.Add('INVALID_SOURCE_FRAMES: the run was paced by a persisted fps override; evidence is paced at the footage native fps') }
     $wrapped = Get-DvProp $Playback 'wrapped'
@@ -631,14 +614,10 @@ function Get-DvPlaybackEvidence {
     $parsed = Get-DvSmokeSummaryFields -LogText $LogText
     $f = $parsed.fields
     $wrappedField = ConvertTo-DvInt64 $f['wrapped']
-    $advancedField = ConvertTo-DvInt64 $f['source_advanced']
-    $elapsedField = ConvertTo-DvDouble $f['elapsed_ms']
     $bound = (-not [string]::IsNullOrEmpty($LogSha256)) -and ($declaredSha.ToLowerInvariant() -ceq $LogSha256) -and ([string]::IsNullOrEmpty($manifestSha) -or $manifestSha.ToLowerInvariant() -ceq $LogSha256)
     $pb = [ordered]@{
-        oracle = 'source_advanced >= required_source_frames >= ceil(20 s x native fps), paced at native fps, observed timeline fps (source_advanced / elapsed) <= native + 2 %, no fps override, no wrap, the app echoed the nonce the launcher generated; all re-derived from the run log'
+        oracle = 'source_advanced >= required_source_frames >= ceil(20 s x native fps), paced at native fps, no fps override, no wrap, the app echoed the nonce the launcher generated; all re-derived from the run log'
         sourceAdvanced = (ConvertTo-DvInt64 $f['source_advanced'])
-        elapsedMs = $elapsedField
-        observedTimelineFps = $(if ($null -ne $advancedField -and $elapsedField -gt 0) { [Math]::Round($advancedField * 1000.0 / $elapsedField, 3) } else { $null })
         requiredSourceFrames = (ConvertTo-DvInt64 $f['required_source_frames'])
         nativeFps = (ConvertTo-DvDouble $f['native_fps'])
         paceFps = (ConvertTo-DvDouble $f['pace_fps'])

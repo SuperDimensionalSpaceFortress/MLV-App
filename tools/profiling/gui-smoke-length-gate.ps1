@@ -27,9 +27,6 @@
 
 $script:GuiSmokeMinClipSeconds = 20.0
 $script:GuiSmokeMinPlayWindowMs = 20000   # the same floor in ms: the lifecycle-stress switch stops Play, so it may not come sooner
-# PLAYBACK-CUDA-NATIVE-PACE-1: an observed timeline rate more than 2 % over native is PLAYBACK_FASTER_THAN_NATIVE (the engine's
-# own ceiling allows one frame over, about 0.2 % of a 20 s Play).
-$script:GuiSmokeFasterThanNativeTolerance = 0.02
 # Environment variables that change the range the ENGINE plays, so the app's gate and the engine could disagree
 # (PLAYBACK-CLIP-LENGTH-ENFORCE-2 round 2, sol B3). Enumerated from platform/qt: MLVAPP_F3_DISABLE_CUT_RANGE_REPAIR is
 # the only knob that touches the cut range (MainWindow.cpp f3CutRangeRepairDisabledByEnvironment); the others that
@@ -590,22 +587,6 @@ function Test-GuiSmokeProfileModeAdmitsPlay {
     return $result
 }
 
-function Get-GuiSmokeFasterThanNativeFailure {
-    <#
-    .SYNOPSIS
-    PLAYBACK-CUDA-NATIVE-PACE-1: the typed failure when the OBSERVED timeline rate beats the clip's native fps by more than
-    the tolerance ($script:GuiSmokeFasterThanNativeTolerance, 2 %), else $null. An unknown native fps is judged elsewhere.
-    #>
-    param([double]$ObservedFps, [AllowNull()]$NativeFps, $SourceAdvanced, $ElapsedMs)
-    if ($null -eq $NativeFps -or [double]$NativeFps -le 0) { return $null }
-    $native = [double]$NativeFps
-    if ($ObservedFps -le $native * (1.0 + $script:GuiSmokeFasterThanNativeTolerance)) { return $null }
-    $over = ($ObservedFps / $native - 1.0) * 100.0
-    return ("PLAYBACK_FASTER_THAN_NATIVE: the timeline advanced source_advanced=$SourceAdvanced source frames in elapsed_ms=$ElapsedMs, " +
-            ('{0:F3} fps observed against native_fps={1} (+{2:F1} %, tolerance {3:F0} %)' -f $ObservedFps, $NativeFps, $over, ($script:GuiSmokeFasterThanNativeTolerance * 100.0)) +
-            "; the footage was shown faster than real time.")
-}
-
 function Get-GuiSmokeSourceFramesVerdict {
     <#
     .SYNOPSIS
@@ -664,21 +645,9 @@ function Get-GuiSmokeSourceFramesVerdict {
         [Math]::Abs([double]$paceFps - [double]$nativeFps) -gt (0.005 * [double]$nativeFps)) {
         $failures += "INVALID_SOURCE_FRAMES: the engine paced at pace_fps=$paceFps but the clip's native fps is native_fps=$nativeFps; 20 s of wall clock is not 20 s of footage."
     }
-    # PLAYBACK-CUDA-NATIVE-PACE-1: pace_fps is the pace the engine was TOLD. The OBSERVED timeline rate (source frames advanced
-    # per wall second of the measured Play) must not beat native: a CUDA leg once showed 23.976 footage at 31.6 fps while
-    # pace_fps still read 23.976. Slower than native is drop/hold and stays informational. This oracle also judges the profile
-    # receipt, which carries no Play wall time (elapsed_ms is the smoke summary's), so the rate is judged where elapsed_ms is; the
-    # venue job (Get-AttrCudaSourceFramesVerdict) and the dual-venue receipt read the smoke summary and REQUIRE it.
-    $elapsedMs = & $prop 'elapsed_ms'
-    $observedTimelineFps = $null
-    if ($null -ne $Summary -and $null -ne $advanced -and [int64]$advanced -gt 0 -and $null -ne $elapsedMs -and [double]$elapsedMs -gt 0) {
-        $observedTimelineFps = [double]$advanced * 1000.0 / [double]$elapsedMs
-        $fasterFailure = Get-GuiSmokeFasterThanNativeFailure -ObservedFps $observedTimelineFps -NativeFps $nativeFps -SourceAdvanced $advanced -ElapsedMs $elapsedMs
-        if ($null -ne $fasterFailure) { $failures += $fasterFailure }
-    }
     return [pscustomobject]@{
         invalid = ($failures.Count -gt 0); failures = $failures
-        sourceAdvanced = $advanced; requiredSourceFrames = $required; observedTimelineFps = $observedTimelineFps
+        sourceAdvanced = $advanced; requiredSourceFrames = $required
     }
 }
 

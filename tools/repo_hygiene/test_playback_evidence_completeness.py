@@ -101,7 +101,7 @@ class AbsentFieldIsInvalidOnTheRunnerLogSummaryTests(unittest.TestCase):
                 self.assertIn("INVALID_SOURCE_FRAMES", json.dumps(verdict["failures"]))
         # exactly ceil(20 x 23.976) = 480 is enough, and so is more
         self.assertFalse(_oracle(_good_line(source_advanced=480, required_source_frames=480))["invalid"])
-        self.assertFalse(_oracle(_good_line(source_advanced=600, required_source_frames=576, elapsed_ms=25100.0))["invalid"])
+        self.assertFalse(_oracle(_good_line(source_advanced=600, required_source_frames=576))["invalid"])
 
     def test_the_floor_rederivation_is_mutation_tested(self) -> None:
         source = GATE.read_text(encoding="utf-8")

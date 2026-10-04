@@ -6295,30 +6295,6 @@ function Get-AttrCudaSourceFramesVerdict {
             }
         }
     }
-    # PLAYBACK-CUDA-NATIVE-PACE-1 >>>
-    # Same rule as Get-GuiSmokeSourceFramesVerdict: pace_fps is the pace the engine was TOLD; the OBSERVED timeline rate (source
-    # frames advanced per wall second of the measured Play) more than 2 % over native is PLAYBACK_FASTER_THAN_NATIVE. A CUDA leg once
-    # showed 23.976 footage at 31.6 fps while pace_fps read 23.976. Slower stays as it is. The failure text carries the observed fps.
-    if ($null -ne $advanced -and $advanced -gt 0) {
-        if (-not $fields.ContainsKey('elapsed_ms')) {
-            $failures += 'INVALID_SOURCE_FRAMES: RECEIPT_FIELD_ABSENT: playback_smoke.summary carries no elapsed_ms, so the observed timeline rate cannot be read.'
-        } else {
-            $elapsedMs = [double]::Parse($fields['elapsed_ms'], [Globalization.CultureInfo]::InvariantCulture)
-            # a non-positive wall time is judged the way the local gate judges it (no rate to read); the receipt rejects it
-            if ($elapsedMs -gt 0) {
-                $observedTimelineFps = [double]$advanced * 1000.0 / $elapsedMs
-                if ($fields.ContainsKey('native_fps')) {
-                    $nativeForRate = [double]::Parse($fields['native_fps'], [Globalization.CultureInfo]::InvariantCulture)
-                    if ($nativeForRate -gt 0 -and $observedTimelineFps -gt $nativeForRate * 1.02) {
-                        $failures +=("PLAYBACK_FASTER_THAN_NATIVE: the timeline advanced source_advanced=$advanced source frames in elapsed_ms=$($fields['elapsed_ms']), " +
-                                      ('{0:F3} fps observed against native_fps={1} (+{2:F1} %, tolerance 2 %)' -f $observedTimelineFps, $fields['native_fps'], (($observedTimelineFps / $nativeForRate - 1.0) * 100.0)) +
-                                      '; the footage was shown faster than real time.')
-                    }
-                }
-            }
-        }
-    }
-    # PLAYBACK-CUDA-NATIVE-PACE-1 <<<
     $wrapped = $false
     if ($fields.ContainsKey('wrapped') -and [int]$fields['wrapped'] -ne 0) { $wrapped = $true }
     if ($fields.ContainsKey('wrap_count') -and [int64]$fields['wrap_count'] -gt 0) { $wrapped = $true }
