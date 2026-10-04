@@ -1398,6 +1398,57 @@ LookAssistWindowLitCheck resolveLookAssistWindowLitInterior( const LookAssistWhi
         }
     }
 
+    // The verdict is decided (every gate above, on the clip-level renders, exactly as before). What the balance is still
+    // asked at the DISPLAY's levels (LOOK-ASSIST-M16-CAST-1). The patch is the brightest near-neutral surface of a dark
+    // picture -- a window -- and on an HQ dual-ISO clip that is the top of the recon's range, which the clip-level
+    // judgement render clamps at the clip white: there the surface answers the balance at half its slope and reads
+    // neutral where its light is not (M16-1243: 6686 / 0 by the clamped window, the display-level solve 9930 / -33, the
+    // displayed room blue-magenta). So the same surface is rendered at the display's levels at that balance; strictly
+    // neutral there, nothing changes. Otherwise the same search neutralises it there, from that balance and the solve,
+    // inside the daylight window and never under the not-night gate; converged, its balance is applied, and anything
+    // else leaves the clip-level balance standing. Outside HQ dual-ISO both levels are the same (a no-op).
+    if( check.exposureBound && request.renderDisplayBalance )
+    {
+        LookAssistRenderedPicture shown;
+        if( request.renderDisplayBalance( patchPictureExposureStops, temperature, tint, &shown )
+         && lookAssistSamePictureGeometry( base, shown ) )
+        {
+            const LookAssistAutoWhiteBalancePatch shownSurface = lookAssistSurfaceAt( shown, patch.thumbnailX, patch.thumbnailY );
+            check.displayRendered = shownSurface.valid;
+            check.displaySurfaceBlueAmber = shownSurface.blueAmberAxis;
+            check.displaySurfaceGreen = shownSurface.greenAxis;
+            LookAssistWhiteBalanceBounds displayWindow = window;
+            displayWindow.minTemperature = qMax( qMax( displayWindow.minTemperature, request.minTemperature ),
+                                                 kLookAssistNotNightMinTemperature );
+            displayWindow.maxTemperature = qMin( displayWindow.maxTemperature, request.maxTemperature );
+            displayWindow.minTint = qMax( displayWindow.minTint, request.minTint );
+            displayWindow.maxTint = qMin( displayWindow.maxTint, request.maxTint );
+            LookAssistSurfaceProbe atApplied;
+            atApplied.temperature = temperature;
+            atApplied.tint = tint;
+            atApplied.surface = shownSurface;
+            LookAssistSurfaceProbe atSolve;
+            atSolve.temperature = qBound( displayWindow.minTemperature, wb.candidateTemperature, displayWindow.maxTemperature );
+            atSolve.tint = qBound( displayWindow.minTint, wb.candidateTint, displayWindow.maxTint );
+            LookAssistRenderedPicture solvePicture;
+            if( shownSurface.valid && !lookAssistSurfaceIsNeutral( shownSurface )
+             && displayWindow.minTemperature <= displayWindow.maxTemperature && displayWindow.minTint <= displayWindow.maxTint
+             && request.renderDisplayBalance( patchPictureExposureStops, atSolve.temperature, atSolve.tint, &solvePicture )
+             && lookAssistSamePictureGeometry( shown, solvePicture ) )
+            {
+                atSolve.surface = lookAssistSurfaceAt( solvePicture, patch.thumbnailX, patch.thumbnailY );
+                check.displaySearch = searchLookAssistNeutralSurfaceBalance( request.renderDisplayBalance, patchPictureExposureStops,
+                                                                             shown, patch.thumbnailX, patch.thumbnailY,
+                                                                             displayWindow, atApplied, atSolve );
+                if( check.displaySearch.converged )
+                {
+                    temperature = check.displaySearch.temperature;
+                    tint = check.displaySearch.tint;
+                }
+            }
+        }
+    }
+
     // A window-lit interior: the daylight class, its preset on the same inputs, and the verified balance.
     *stats = daylightHypothesis;
     *scene = daylightScene;

@@ -16632,6 +16632,9 @@ void MainWindow::applyLookAssistToReceipt( ReceiptSettings *receipt,
     windowLitRequest.renderBalance = ReceiptApplier::lookAssistMeasureOnlyRenderer(
         m_pMlvObject, analysisFrame, colorDownscaleFactor, colorWidth, colorHeight,
         qMax( 1, mlvappEffectiveWorkerThreadCount() ) );
+    windowLitRequest.renderDisplayBalance = ReceiptApplier::lookAssistMeasureOnlyDisplayRenderer(
+        m_pMlvObject, analysisFrame, colorDownscaleFactor, colorWidth, colorHeight,
+        qMax( 1, mlvappEffectiveWorkerThreadCount() ) );
     const LookAssistWindowLitCheck windowLit = resolveLookAssistWindowLitInterior(
         windowLitRequest, wb, m_pMlvObject->processing->exposure_stops, &windowLitStats, &windowLitScene, &windowLitPreset,
         useProcessedColorStats ? &processedColorStats : nullptr,
@@ -16653,7 +16656,9 @@ void MainWindow::applyLookAssistToReceipt( ReceiptSettings *receipt,
                            "solution_surface_chroma=%6 solution_surface_blue_amber=%7 frame=%8 "
                            "expo_iso=%9 expo_shutter_us=%10 lens_aperture_x100=%11 applied=%12 exposure_bound=%13 "
                            "recovery_iso=%14 surface_search=%15 search_renders=%16 search_balance=%17/%18 "
-                           "search_surface_chroma=%19 applied_balance=%20/%21 gate_surface_blue_amber=%22")
+                           "search_surface_chroma=%19 applied_balance=%20/%21 gate_surface_blue_amber=%22 "
+                           "display_surface=%23 display_surface_blue_amber=%24 display_surface_green=%25 "
+                           "display_search=%26 display_search_renders=%27 display_search_balance=%28/%29")
                 .arg( bool01( windowLit.evidence ) )
                 .arg( windowLit.reason )
                 .arg( lookAssistSceneName( scene ) )
@@ -16676,7 +16681,14 @@ void MainWindow::applyLookAssistToReceipt( ReceiptSettings *receipt,
                 .arg( windowLit.search.surface.chroma, 0, 'f', 1 )
                 .arg( windowLit.appliedTemperature )
                 .arg( windowLit.appliedTint )
-                .arg( windowLit.gateSurfaceBlueAmber, 0, 'f', 1 ) );
+                .arg( windowLit.gateSurfaceBlueAmber, 0, 'f', 1 )
+                .arg( bool01( windowLit.displayRendered ) )
+                .arg( windowLit.displaySurfaceBlueAmber, 0, 'f', 1 )
+                .arg( windowLit.displaySurfaceGreen, 0, 'f', 1 )
+                .arg( windowLit.displaySearch.result )
+                .arg( windowLit.displaySearch.renders )
+                .arg( windowLit.displaySearch.temperature )
+                .arg( windowLit.displaySearch.tint ) );
     }
     const bool autoWhiteBalanceValid = wb.autoValid;
     const QString autoWhiteBalanceSource = wb.source;
