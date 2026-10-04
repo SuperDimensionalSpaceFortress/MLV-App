@@ -1688,12 +1688,16 @@ class VendoredNativePayloadTests(unittest.TestCase):
 
         tests_workflow = (ROOT / ".github/workflows/tests.yml").read_text(encoding="utf-8")
         # This pin exists to guarantee CI RUNS THIS FILE. It used to assert the exact
-        # per-file invocation; the workflow now uses a directory target, which runs it by
-        # construction and also catches files added later -- a named list silently omits
-        # what it forgets to name. Both halves of the mechanism are pinned, so weakening
-        # either the search root or the pattern still fails here.
-        self.assertIn("unittest discover -s tools/repo_hygiene", tests_workflow)
-        self.assertIn('-p "test_*.py"', tests_workflow)
+        # per-file invocation; CI now collects the directory through `ci_unittest_shard`
+        # (same search root and pattern, split across parallel shards, with a partition
+        # proof in every shard job), which runs it by construction and also catches files
+        # added later -- a named list silently omits what it forgets to name. The root and
+        # the pattern are pinned on the shard tool, and the proof on both OS legs.
+        from . import ci_unittest_shard
+
+        self.assertEqual("tools/repo_hygiene", ci_unittest_shard.START_DIR)
+        self.assertEqual("test_*.py", ci_unittest_shard.PATTERN)
+        self.assertEqual(2, tests_workflow.count("--verify-partition"))
         self.assertIn("python -m tools.repo_hygiene.vendored_native_payloads --repo-root .", tests_workflow)
 
     def test_macos_release_toolchains_install_before_python_and_fail_closed(self) -> None:

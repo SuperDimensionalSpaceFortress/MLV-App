@@ -65,6 +65,34 @@ def _job_names(job_body: str) -> set:
     return {template.replace(placeholder.group(0), value) for value in values}
 
 
+def _needed_jobs(job_body: str) -> set:
+    """Job ids named by a job's `needs:` (inline scalar, inline list or block list)."""
+    inline = re.search(r"^    needs:[ \t]*(.+?)[ \t]*$", job_body, re.MULTILINE)
+    if inline is not None:
+        return {item.strip() for item in inline.group(1).strip("[]").split(",") if item.strip()}
+    block = re.search(r"^    needs:[ \t]*\n((?:      - .+\n)+)", job_body, re.MULTILINE)
+    if block is None:
+        return set()
+    return {line.strip()[2:].strip() for line in block.group(1).splitlines()}
+
+
+def _producing_jobs(jobs: dict, job_id: str) -> dict:
+    """Job id -> body for `job_id` and every job it transitively needs.
+
+    A required context can be an aggregator that only reports the result of sharded
+    jobs, so the jobs that actually produce or feed it are the transitive `needs`.
+    """
+    found = {}
+    pending = [job_id]
+    while pending:
+        current = pending.pop()
+        if current in found or current not in jobs:
+            continue
+        found[current] = jobs[current]
+        pending.extend(_needed_jobs(jobs[current]))
+    return found
+
+
 def _required_check_jobs() -> dict:
     """Map required check name -> (workflow path, job id, job body)."""
     found = {}
@@ -90,12 +118,14 @@ class MergeQueueWorkflowTests(unittest.TestCase):
                 self.assertRegex(triggers, r"(?m)^    types:\s*\[checks_requested\]")
 
     def test_required_check_jobs_are_not_gated_off_merge_group(self) -> None:
-        for name, (_workflow, job_id, body) in _required_check_jobs().items():
-            job_header = body.split("\n    steps:", 1)[0]
-            for condition in re.findall(r"^    if:[ \t]*(.+)$", job_header, re.MULTILINE):
-                with self.subTest(check=name, job=job_id):
-                    self.assertNotIn("github.event_name", condition)
-                    self.assertNotIn("pull_request", condition)
+        for name, (workflow, job_id, _body) in _required_check_jobs().items():
+            producing = _producing_jobs(_jobs(_read(workflow)), job_id)
+            for producer_id, body in producing.items():
+                job_header = body.split("\n    steps:", 1)[0]
+                for condition in re.findall(r"^    if:[ \t]*(.+)$", job_header, re.MULTILINE):
+                    with self.subTest(check=name, job=producer_id):
+                        self.assertNotIn("github.event_name", condition)
+                        self.assertNotIn("pull_request", condition)
 
     def test_tests_workflow_concurrency_is_not_keyed_on_the_pull_request(self) -> None:
         text = _read(WORKFLOWS / "tests.yml")
@@ -121,9 +151,28 @@ class MergeQueueWorkflowTests(unittest.TestCase):
         self.assertIn("if ('${{ github.event_name }}' -eq 'merge_group')", text)
         self.assertIn("$forceReal = @('--merge-group')", text)
         jobs = _jobs(text)
-        for job_id in ("windows-product-oracles", "windows-gui-pilot"):
-            with self.subTest(job=job_id):
-                self.assertIn(f"'{FULL_ROUTE_REASON}'", jobs[job_id])
+        for check in ("Windows Product Oracles", "Windows GUI Pilot"):
+            workflow, job_id, _body = _required_check_jobs()[check]
+            self.assertEqual(workflow, WORKFLOWS / "tests.yml")
+            producing = _producing_jobs(jobs, job_id)
+            # The context may be an aggregator over sharded part jobs: every job that
+            # consumes the route output must accept the merge-group reason, and at least
+            # one must exist so the loop cannot pass vacuously.
+            route_consumers = {
+                producer_id: body
+                for producer_id, body in producing.items()
+                if "protected-check-route" in _needed_jobs(body)
+            }
+            self.assertTrue(route_consumers, check)
+            for producer_id, body in route_consumers.items():
+                with self.subTest(check=check, job=producer_id):
+                    self.assertIn(f"'{FULL_ROUTE_REASON}'", body)
+                    self.assertIn("recognized fail-closed reason", body)
+
+    def test_product_oracles_context_is_fed_by_the_part_jobs(self) -> None:
+        jobs = _jobs(_read(WORKFLOWS / "tests.yml"))
+        _workflow, job_id, _body = _required_check_jobs()["Windows Product Oracles"]
+        self.assertIn("windows-product-oracles-part", _producing_jobs(jobs, job_id))
 
 
 class MergeGroupRouterTests(unittest.TestCase):
