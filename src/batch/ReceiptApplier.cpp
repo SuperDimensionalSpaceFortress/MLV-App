@@ -11,6 +11,7 @@
 #include <QFileInfo>
 #include <QtGlobal>
 
+#include <algorithm>
 #include <cmath>
 #include <cstring>
 
@@ -571,6 +572,94 @@ bool ReceiptApplier::processedThumbnailAtExposure(mlvObject_t *mlvObject,
     return rendered != 0;
 }
 
+bool ReceiptApplier::lookAssistDisplayMeter(mlvObject_t *mlvObject,
+                                            int analysisFrame,
+                                            int downscaleFactor,
+                                            int cpuCores,
+                                            LookAssistStats *out,
+                                            int *validSamples)
+{
+    if( validSamples ) *validSamples = 0;
+    if( !mlvObject || !mlvObject->processing || !out || downscaleFactor <= 0 ) return false;
+    const int width = mlvObject->RAWI.xRes / downscaleFactor;
+    const int height = mlvObject->RAWI.yRes / downscaleFactor;
+    if( width <= 0 || height <= 0 ) return false;
+
+    processingObject_t *displayClone = processingCloneForAnalysis( mlvObject->processing );
+    if( !displayClone ) return false;
+
+    mlv_processed_thumbnail_settings_t displaySettings;
+    memset( &displaySettings, 0, sizeof( displaySettings ) );
+    // DISPLAY_LEVELS (LOOK-ASSIST-ANALYSIS-TRUE-LEVELS-1): the meter's median IS the exposure answer, so it reads the
+    // picture the display shows, not the judgement calibration (on HQ dual-ISO restricted-lossless clips 1.8 EV
+    // brighter: the tracked fixtures metered median 88 / 86 where the display shows 33 / 31, and got exposure 13 / 16
+    // instead of 154 / 163).
+    displaySettings.flags = MLV_PROCESSED_THUMBNAIL_APPLY_EXPOSURE
+                          | MLV_PROCESSED_THUMBNAIL_APPLY_SIMPLE_CONTRAST
+                          | MLV_PROCESSED_THUMBNAIL_APPLY_SHADOWS
+                          | MLV_PROCESSED_THUMBNAIL_APPLY_HIGHLIGHTS
+                          | MLV_PROCESSED_THUMBNAIL_APPLY_VIBRANCE
+                          | MLV_PROCESSED_THUMBNAIL_DISPLAY_LEVELS;
+
+    const int totalFrames = static_cast<int>( getMlvFrames( mlvObject ) );
+    const double samplePcts[3] = { 0.15, 0.5, 0.85 };
+    QByteArray displayThumb;
+    displayThumb.resize( width * height * 3 );
+    double medianSamples[3];
+    double p95Samples[3];
+    double p99Samples[3];
+    int valid = 0;
+
+    for( int s = 0; s < 3; ++s )
+    {
+        int sampleFrame = analysisFrame;
+        if( totalFrames > 1 )
+        {
+            sampleFrame = static_cast<int>( samplePcts[s] * ( totalFrames - 1 ) );
+            sampleFrame = qBound( 0, sampleFrame, totalFrames - 1 );
+        }
+
+        if( get_area_average_downscale_thumnail_with_processing_cachefree(
+                mlvObject,
+                sampleFrame,
+                downscaleFactor,
+                qMax( 1, cpuCores ),
+                displayClone,
+                &displaySettings,
+                reinterpret_cast<unsigned char *>( displayThumb.data() ) ) )
+        {
+            const LookAssistStats sampleStats = analyzeLookAssistThumbnail(
+                reinterpret_cast<const unsigned char *>( displayThumb.constData() ),
+                width,
+                height );
+            if( sampleStats.median > 0.0 )
+            {
+                medianSamples[valid] = sampleStats.median;
+                p95Samples[valid] = sampleStats.p95;
+                p99Samples[valid] = sampleStats.p99;
+                ++valid;
+            }
+        }
+
+        if( totalFrames <= 1 ) break;
+    }
+    processingFreeClone( displayClone );
+
+    if( validSamples ) *validSamples = valid;
+    if( valid <= 0 ) return false;
+
+    std::sort( medianSamples, medianSamples + valid );
+    std::sort( p95Samples, p95Samples + valid );
+    std::sort( p99Samples, p99Samples + valid );
+    LookAssistStats result;
+    result.median = medianSamples[valid / 2];
+    result.p95 = p95Samples[valid / 2];
+    result.p99 = p99Samples[valid / 2];
+    result.p05 = result.median;
+    *out = result;
+    return true;
+}
+
 bool ReceiptApplier::processedThumbnailAtBalance(mlvObject_t *mlvObject,
                                                  int frameIndex,
                                                  int downscaleFactor,
@@ -820,7 +909,7 @@ bool ReceiptApplier::applyHeadlessLookAssist(ReceiptSettings *receipt,
         bool renderedAtPresetExposure = false;
         if( scene != LookAssistScene::Night )
         {
-            // Daylight: judge colour at the exposure Look Assist is about to apply (the night
+            // Daylight: judge colour at the scene's own lift (the night
             // path keeps the receipt's current exposure, exactly as before).
             const double presetStops =
                 presetForLookAssistScene( scene, stats, nullptr, nullptr, flavor ).exposure / 100.0;
@@ -846,11 +935,29 @@ bool ReceiptApplier::applyHeadlessLookAssist(ReceiptSettings *receipt,
             processedColorStats.balanceSamples >= minColorBalanceSamples;
     }
 
+    // The same display-space exposure meter the GUI runs, at every playback scale: batch export lands on the
+    // exposure the app would.
+    LookAssistStats displayStats;
+    int displayMeterSamples = 0;
+    const bool displayStatsValid = lookAssistDisplayMeter(
+        mlvObject, frameIndex, downscaleFactor, 1, &displayStats, &displayMeterSamples );
+    if( displayStatsValid )
+    {
+        decisionTrace.displayMeterRan = true;   // batch has no playback, so playback_scale stays NA
+        BatchLogger::out( QStringLiteral(
+            "[BATCH] LOOK_ASSIST display_meter samples=%1 robust_median=%2 robust_p95=%3 robust_p99=%4 frame=%5\n" )
+            .arg( displayMeterSamples )
+            .arg( displayStats.median, 0, 'f', 1 )
+            .arg( displayStats.p95, 0, 'f', 1 )
+            .arg( displayStats.p99, 0, 'f', 1 )
+            .arg( frameIndex ) );
+    }
+
     LookAssistPreset preset = presetForLookAssistScene(
         scene,
         stats,
         useProcessedColorStats ? &processedColorStats : nullptr,
-        nullptr,
+        displayStatsValid ? &displayStats : nullptr,
         flavor );
     const int baseTemperature = receipt->temperature() == -1
                               ? 6000
@@ -884,6 +991,10 @@ bool ReceiptApplier::applyHeadlessLookAssist(ReceiptSettings *receipt,
     // damping -> as-shot prior -> clamp. Nothing here re-implements any step.
     LookAssistWhiteBalanceRequest wbRequest;
     wbRequest.stats = &stats;
+    // The colour pictures were rendered at the scene's own lift; the daylight patch gates judge them there, and the
+    // metered exposure is only what gets applied.
+    if( displayStatsValid )
+        wbRequest.analysisExposure = presetForLookAssistScene( scene, stats, nullptr, nullptr, flavor ).exposure;
     wbRequest.scene = scene;
     wbRequest.patch = autoWbPatch;
     wbRequest.solvedOnProcessedPicture = useProcessedColorStats;
@@ -955,7 +1066,8 @@ bool ReceiptApplier::applyHeadlessLookAssist(ReceiptSettings *receipt,
                                                                     colorWidth, colorHeight, 1 );
     const LookAssistWindowLitCheck windowLit = resolveLookAssistWindowLitInterior(
         windowLitRequest, wb, mlvObject->processing->exposure_stops, &windowLitStats, &windowLitScene, &windowLitPreset,
-        useProcessedColorStats ? &processedColorStats : nullptr );
+        useProcessedColorStats ? &processedColorStats : nullptr,
+        displayStatsValid ? &displayStats : nullptr );
     const bool windowLitApplied = windowLit.applies && !masterScenePass;
     if( windowLitApplied )
     {

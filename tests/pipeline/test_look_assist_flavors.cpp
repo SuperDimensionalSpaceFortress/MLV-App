@@ -3,7 +3,12 @@
 //  - Classic (the environment unset, or MLVAPP_LOOK_ASSIST_FLAVOR=classic) reproduces MASTER exactly: the receipt
 //    sliders, the applied line (but for the appended flavor field) and the sha256 of the rendered frame equal
 //    tests/fixtures/look_assist_flavor_classic_baseline.txt, dumped from an UNCHANGED fork/master b5751928 tree
-//    with the same helper (look_assist_flavor_run.h).
+//    with the same helper (look_assist_flavor_run.h). LOOK-ASSIST-DISPLAY-METER-ALL-SCALES-1 deliberately moves
+//    headless Classic's exposure onto the shared display meter, so its three rows were re-dumped with that same
+//    helper from this tree (Classic, flavor unset); the console grid pin (master's preset function) is untouched.
+//    LOOK-ASSIST-ANALYSIS-TRUE-LEVELS-1 (#259) moves only the exposure fields again (13 -> 154, 16 -> 163, 16 -> 163):
+//    the meter reads the display's levels (MLV_PROCESSED_THUMBNAIL_DISPLAY_LEVELS). With that flag off the tree
+//    reproduces the previous three rows byte for byte; the rows are re-dumped from the FLAVOR-BASELINE lines below.
 //  - Cinematic changes only the documented sliders, by the one table, deterministically, never the white
 //    balance, and is always reported.
 //  - An unknown environment value is Classic, with a logged warning.
@@ -142,6 +147,9 @@ void expectClassicIsMaster( const char *mode )
         FlavorEnv env( mode );
         const Run r = run( c, true );
         ASSERT_TRUE( r.ok && r.applied );
+        // The row this run would pin, in the baseline file's own format (how the rows are re-dumped).
+        std::fprintf( stderr, "FLAVOR-BASELINE %s | %s | %s | %s\n", qPrintable( r.key ), qPrintable( r.receipt ),
+                      qPrintable( r.sha256 ), qPrintable( withoutFlavorField( r.appliedLine ) ) );
         BaselineRow master;
         ASSERT_TRUE( baselineRow( r.key, &master ) );
         ASSERT_TRUE( r.receipt == master.receipt );          // every slider, byte for byte

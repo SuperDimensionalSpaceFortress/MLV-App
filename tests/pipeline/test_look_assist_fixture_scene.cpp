@@ -21,6 +21,7 @@
 #include <QString>
 #include <QTemporaryDir>
 #include <algorithm>
+#include <chrono>
 #include <cmath>
 #include <cstdio>
 #include <cstring>
@@ -487,7 +488,7 @@ TEST(LookAssistFixtureScene, HeadlessRefusesABlueAtAsShotInitialPatchThroughTheR
     // Master's result for this state: the receipt's 7895 K / -12 is NOT the picture master renders (the processing
     // object holds the default 6000 K / 0 and master renders at that), and that picture has no trusted patch, so master
     // finds nothing and leaves the receipt's balance alone (night, no decision). The fallback starts from that same
-    // processing state, so it lands there; HeadlessFallbackStartsFromMastersProcessingState compares it with a fresh
+    // processing state, so it lands there; HeadlessFallbackStartsFromMastersProcessingState* compares it with a fresh
     // master-only run field for field.
     for( const FixtureClip &clip : kTrackedFixtureClips )
     {
@@ -520,23 +521,21 @@ TEST(LookAssistFixtureScene, HeadlessRefusesABlueAtAsShotInitialPatchThroughTheR
     }
 }
 
-TEST(LookAssistFixtureScene, HeadlessFallbackStartsFromMastersProcessingState)
+namespace
 {
-    // fable r2, PR #224: the daylight pass writes the receipt's base balance into the live processing object before it
-    // falls back, so master's pass used to render its picture at the RECEIPT's balance. Master renders it at the
-    // balance the object holds on entry (BatchRunner creates it at 6000 K / 0 and applyToMlv never sets one).
-    // State: receipt 7895 K / -12, processing object at its default 6000 K / 0 (staleWhiteBalance = false).
-    //
-    // Master's behaviour here is produced two ways, on a FRESH object each, and neither enters the daylight pass:
-    //  - the no-metadata run: nothing can call the clip daylight, so master's single pass is the only pass there is;
-    //  - the direct call with masterScenePass = true: the same code the fallback re-enters, from a clean start.
-    // The fallback result (switch off: always falls back; switch on with a 4800 K as-shot balance: the initial patch is
-    // refused at the as-shot base) must equal both field for field, including the balance left in the object.
+
+// One (tracked clip, arm) cell of the fable r2 / PR #224 equality below. Every headless run now also pays the display meter
+// (three full-resolution dual-ISO renders, about 9 s single-threaded on these fixtures: LOOK-ASSIST-DISPLAY-METER-ALL-SCALES-1),
+// and the whole check is 12 runs (4 of them fall back and so meter twice): about 255 s as one test, which overran its 240 s
+// solo CI shard. Each cell is 3 runs (about 75 s) and is its own test, so its own shard.
+enum FallbackArm { kArmSwitchOff = 0, kArmSwitchOnBlueAsShot = 1 };
+
+void expectFallbackIsMastersResultOnClip( const FixtureClip &clip, FallbackArm armIndex )
+{
     struct Arm { const char *name; bool switchOff; int asShotKelvin; };
     const Arm arms[] = { { "switch-off", true, 0 }, { "switch-on-blue-as-shot", false, 4800 } };
-    for( const FixtureClip &clip : kTrackedFixtureClips )
     {
-        for( const Arm &arm : arms )
+        const Arm &arm = arms[armIndex];
         {
             QString metadataFree, direct, fallback;
             QByteArray metadataFreeLog, directLog, fallbackLog;
@@ -579,6 +578,39 @@ TEST(LookAssistFixtureScene, HeadlessFallbackStartsFromMastersProcessingState)
             (void)arm.name;
         }
     }
+}
+
+} // namespace
+
+// fable r2, PR #224: the daylight pass writes the receipt's base balance into the live processing object before it
+// falls back, so master's pass used to render its picture at the RECEIPT's balance. Master renders it at the
+// balance the object holds on entry (BatchRunner creates it at 6000 K / 0 and applyToMlv never sets one).
+// State: receipt 7895 K / -12, processing object at its default 6000 K / 0 (staleWhiteBalance = false).
+//
+// Master's behaviour here is produced two ways, on a FRESH object each, and neither enters the daylight pass:
+//  - the no-metadata run: nothing can call the clip daylight, so master's single pass is the only pass there is;
+//  - the direct call with masterScenePass = true: the same code the fallback re-enters, from a clean start.
+// The fallback result (switch off: always falls back; switch on with a 4800 K as-shot balance: the initial patch is
+// refused at the as-shot base) must equal both field for field, including the balance left in the object.
+// Four tests, one per (tracked clip, arm), each the same expectFallbackIsMastersResultOnClip.
+TEST(LookAssistFixtureScene, HeadlessFallbackStartsFromMastersProcessingStateOnTheTinyFixtureSwitchOff)
+{
+    expectFallbackIsMastersResultOnClip( kTrackedFixtureClips[0], kArmSwitchOff );
+}
+
+TEST(LookAssistFixtureScene, HeadlessFallbackStartsFromMastersProcessingStateOnTheTinyFixtureBlueAsShot)
+{
+    expectFallbackIsMastersResultOnClip( kTrackedFixtureClips[0], kArmSwitchOnBlueAsShot );
+}
+
+TEST(LookAssistFixtureScene, HeadlessFallbackStartsFromMastersProcessingStateOnTheLargeFixtureSwitchOff)
+{
+    expectFallbackIsMastersResultOnClip( kTrackedFixtureClips[1], kArmSwitchOff );
+}
+
+TEST(LookAssistFixtureScene, HeadlessFallbackStartsFromMastersProcessingStateOnTheLargeFixtureBlueAsShot)
+{
+    expectFallbackIsMastersResultOnClip( kTrackedFixtureClips[1], kArmSwitchOnBlueAsShot );
 }
 
 TEST(LookAssistFixtureScene, HeadlessFallbackStartsFromMastersProcessingStateAtANonZeroEntryTint)
@@ -787,6 +819,126 @@ TEST(LookAssistFixtureScene, AsShotWhiteBalanceDecoderHonoursTheWbMode)
     ASSERT_FALSE( ReceiptApplier::asShotWhiteBalanceControls( video, nullptr, &tint ) );
 }
 
+// ---- LOOK-ASSIST-DISPLAY-METER-ALL-SCALES-1: the same exposure decision at every playback scale ----
+
+namespace
+{
+
+const int kPlaybackScales[] = { 1, 2, 3, 4, 8 };
+
+int analysisDownscaleFor( const mlvObject_t *video )
+{
+    const int rawW = video->RAWI.xRes;
+    const int rawH = video->RAWI.yRes;
+    if( rawW > 4000 || rawH > 2500 ) return 12;
+    if( rawW > 2800 || rawH > 1900 ) return 10;
+    if( rawW > 1800 || rawH > 1200 ) return 8;
+    return 6;
+}
+
+// The meter exactly as d34da2b1 wrote it into MainWindow::applyLookAssistToReceipt (the block that ran at x2 only),
+// kept here verbatim as the reference the shared function must reproduce bit for bit -- with ONE deliberate change,
+// LOOK-ASSIST-ANALYSIS-TRUE-LEVELS-1 (#259): the GUI's x2 meter declared MLV_PROCESSED_THUMBNAIL_DISPLAY_LEVELS (it
+// reads the picture the display shows, not the 1.8 EV brighter judgement calibration), and so does the shared meter.
+bool masterDisplayMeterAsWrittenInTheGui( mlvObject_t *video, int analysisFrame, int downscaleFactor, int cpuCores,
+                                          LookAssistStats *out )
+{
+    const int width = video->RAWI.xRes / downscaleFactor;
+    const int height = video->RAWI.yRes / downscaleFactor;
+    processingObject_t *displayClone = processingCloneForAnalysis( video->processing );
+    if( !displayClone ) return false;
+    mlv_processed_thumbnail_settings_t displaySettings;
+    memset( &displaySettings, 0, sizeof( displaySettings ) );
+    displaySettings.flags = MLV_PROCESSED_THUMBNAIL_APPLY_EXPOSURE
+                          | MLV_PROCESSED_THUMBNAIL_APPLY_SIMPLE_CONTRAST
+                          | MLV_PROCESSED_THUMBNAIL_APPLY_SHADOWS
+                          | MLV_PROCESSED_THUMBNAIL_APPLY_HIGHLIGHTS
+                          | MLV_PROCESSED_THUMBNAIL_APPLY_VIBRANCE
+                          | MLV_PROCESSED_THUMBNAIL_DISPLAY_LEVELS;
+    const int totalFramesForMeter = static_cast<int>( getMlvFrames( video ) );
+    const double samplePcts[3] = { 0.15, 0.5, 0.85 };
+    std::vector<unsigned char> displayThumb( static_cast<size_t>( width ) * height * 3 );
+    double medianSamples[3], p95Samples[3], p99Samples[3];
+    int validSamples = 0;
+    for( int s = 0; s < 3; ++s )
+    {
+        int sampleFrame = analysisFrame;
+        if( totalFramesForMeter > 1 )
+        {
+            sampleFrame = static_cast<int>( samplePcts[s] * ( totalFramesForMeter - 1 ) );
+            sampleFrame = std::max( 0, std::min( sampleFrame, totalFramesForMeter - 1 ) );
+        }
+        if( get_area_average_downscale_thumnail_with_processing_cachefree(
+                video, sampleFrame, downscaleFactor, std::max( 1, cpuCores ), displayClone, &displaySettings,
+                displayThumb.data() ) )
+        {
+            const LookAssistStats sampleStats = analyzeLookAssistThumbnail( displayThumb.data(), width, height );
+            if( sampleStats.median > 0.0 )
+            {
+                medianSamples[validSamples] = sampleStats.median;
+                p95Samples[validSamples] = sampleStats.p95;
+                p99Samples[validSamples] = sampleStats.p99;
+                ++validSamples;
+            }
+        }
+        if( totalFramesForMeter <= 1 ) break;
+    }
+    bool ok = false;
+    if( validSamples > 0 )
+    {
+        std::sort( medianSamples, medianSamples + validSamples );
+        std::sort( p95Samples, p95Samples + validSamples );
+        std::sort( p99Samples, p99Samples + validSamples );
+        out->median = medianSamples[validSamples / 2];
+        out->p95 = p95Samples[validSamples / 2];
+        out->p99 = p99Samples[validSamples / 2];
+        out->p05 = out->median;
+        ok = true;
+    }
+    processingFreeClone( displayClone );
+    return ok;
+}
+
+// "scene=... exposure=..." of the headless run, the receipt, and the meter line it logged.
+struct ScaleRun
+{
+    QString receipt;
+    QString meterLine;
+    QByteArray log;
+    int exposure = 0;
+};
+
+bool headlessAtPlaybackScale( const char *clipFile, int frame, int scale, ScaleRun *run )
+{
+    MlvPipelineFixture fixture;
+    QString error_message;
+    if( !fixture.openClipFile( repo_file_path( QString::fromLatin1( clipFile ) ), &error_message ) ) return false;
+    if( !fixture.applyReceipt( &error_message ) ) return false;
+    fixture.video()->playback_scale_factor_active = static_cast<decltype( fixture.video()->playback_scale_factor_active )>( scale );
+    ReceiptSettings &r = fixture.receipt();
+    r.setLookAssistEnabled( true );
+    r.setLookAssistBaselineValid( false );
+    r.setExposure( 0 );
+    r.setTemperature( -1 );
+    r.setTint( 0 );
+    QTemporaryDir temporary_dir;
+    const QString log_path = temporary_dir.filePath( QStringLiteral("look_assist.log") );
+    BatchLogger::init( log_path );
+    const bool applied = ReceiptApplier::applyHeadlessLookAssist( &r, fixture.video(), fixture.processing(),
+                                                                 static_cast<uint32_t>( frame ) );
+    BatchLogger::shutdown();
+    QFile log_file( log_path );
+    if( !applied || !log_file.open( QIODevice::ReadOnly | QIODevice::Text ) ) return false;
+    run->log = log_file.readAll();
+    for( const QByteArray &line : run->log.split( '\n' ) )
+        if( line.contains( "LOOK_ASSIST display_meter" ) ) run->meterLine = QString::fromUtf8( line );
+    run->receipt = receiptLine( r );
+    run->exposure = r.exposure();
+    return true;
+}
+
+} // namespace
+
 namespace
 {
 
@@ -858,16 +1010,23 @@ const IdentityCase kIdentityCases[] = {
     { "tiny-nd-filter",    "tests/fixtures/clips/tiny_dual_iso.mlv",  true,  100, 20000, 280, 1 },
 };
 
-// Pinned from master b5751928, BEFORE the decision log existed (see the PR). Same receipt, same verdict, same picture.
+// Verdicts and picture hashes pinned from master b5751928, BEFORE the decision log existed (see the PR): unchanged.
+// The receipts' exposure (and, for the two night cases, highlights) moved by LOOK-ASSIST-DISPLAY-METER-ALL-SCALES-1, not
+// by the log: batch Look Assist now runs the display-space exposure meter the GUI ran at x2 (160 -> 13 / 16 on the
+// tracked daylight clips, 174 -> -46 on the night ones). Re-pinned from the merged build.
+// LOOK-ASSIST-ANALYSIS-TRUE-LEVELS-1 (#259) moves the exposure field again, and only it: that meter now reads the
+// picture the display shows (MLV_PROCESSED_THUMBNAIL_DISPLAY_LEVELS), not the 1.8 EV brighter judgement calibration,
+// so it meters median 33 / 31 where it metered 88 / 86 (13 -> 154, 16 -> 163, -46 -> 96). With the flag off the build
+// reproduces the previous pins exactly; scene, white balance, every other slider and the picture hash do not move.
 struct IdentityPin { const char *scene; const char *receipt; const char *pictureSha256; };
 const IdentityPin kIdentityPins[] = {
-    { "shade", "exp=160 contrast=15 pivot=55 temp=6540 tint=-35 vibrance=5 shadows=12 highlights=-12 chromaSmooth=1",
+    { "shade", "exp=154 contrast=15 pivot=55 temp=6540 tint=-35 vibrance=5 shadows=12 highlights=-12 chromaSmooth=1",
       "9a16525a28dc92ed96fe5940ccceaeec1ecd0aca5e1a74360ba9709fbf7a3e30" },
-    { "shade", "exp=160 contrast=15 pivot=55 temp=6540 tint=-35 vibrance=5 shadows=12 highlights=-12 chromaSmooth=1",
+    { "shade", "exp=163 contrast=15 pivot=55 temp=6540 tint=-35 vibrance=5 shadows=12 highlights=-12 chromaSmooth=1",
       "f36fb58ce3680f57bd06e9d538db1e08bf74fad1963c70353049c69954f9f099" },
-    { "night", "exp=174 contrast=14 pivot=46 temp=6000 tint=0 vibrance=3 shadows=32 highlights=-26 chromaSmooth=1",
+    { "night", "exp=96 contrast=14 pivot=46 temp=6000 tint=0 vibrance=3 shadows=32 highlights=-18 chromaSmooth=1",
       "4e9d6211cc6328216538224b3f9fe5be4c4f16e83343219d49984f473f49c83d" },
-    { "night", "exp=174 contrast=14 pivot=46 temp=6000 tint=0 vibrance=3 shadows=32 highlights=-26 chromaSmooth=1",
+    { "night", "exp=96 contrast=14 pivot=46 temp=6000 tint=0 vibrance=3 shadows=32 highlights=-18 chromaSmooth=1",
       "4e9d6211cc6328216538224b3f9fe5be4c4f16e83343219d49984f473f49c83d" },
 };
 
@@ -1003,6 +1162,133 @@ LookAssistWindowLitCheck runWindowLitVerification( mlvObject_t *video, const Loo
 }
 
 } // namespace
+
+TEST(LookAssistFixtureScene, DisplayMeterReproducesTheGuisX2MeterBitForBitAtEveryScaleAndCostsBoundedTime)
+{
+    // The large clip: 16 frames, so the three sample frames (15 / 50 / 85 %) are three different pictures.
+    const FixtureClip &clip = kTrackedFixtureClips[1];
+    MlvPipelineFixture fixture;
+    QString error_message;
+    ASSERT_TRUE( fixture.openClipFile( repo_file_path( QString::fromLatin1( clip.file ) ), &error_message ) );
+    ASSERT_TRUE( fixture.applyReceipt( &error_message ) );
+    const int downscale = analysisDownscaleFor( fixture.video() );
+
+    LookAssistStats master;
+    ASSERT_TRUE( masterDisplayMeterAsWrittenInTheGui( fixture.video(), 0, downscale, 1, &master ) );
+    ASSERT_TRUE( master.median > 0.0 );
+
+    for( int scale : kPlaybackScales )
+    {
+        // The viewport's scale as the playback engine holds it.
+        fixture.video()->playback_scale_factor_active = static_cast<decltype( fixture.video()->playback_scale_factor_active )>( scale );
+        LookAssistStats shared;
+        int samples = 0;
+        const auto t0 = std::chrono::steady_clock::now();
+        ASSERT_TRUE( ReceiptApplier::lookAssistDisplayMeter( fixture.video(), 0, downscale, 1, &shared, &samples ) );
+        const double ms = std::chrono::duration<double, std::milli>( std::chrono::steady_clock::now() - t0 ).count();
+        // Once per apply, three cache-free thumbnail renders: bounded, and the same at every scale. The bound is generous
+        // (single-threaded test runtime, shared CI VM); the measured time is printed for the record.
+        std::fprintf( stderr, "[LA-METER-COST] %s scale=%d meter_ms=%.1f raw=%dx%d downscale=%d samples=%d\n", clip.file, scale,
+                      ms, fixture.video()->RAWI.xRes, fixture.video()->RAWI.yRes, downscale, samples );
+        ASSERT_TRUE( ms < 30000.0 );
+        ASSERT_EQ( 3, samples );
+        ASSERT_EQ( master.median, shared.median );
+        ASSERT_EQ( master.p95, shared.p95 );
+        ASSERT_EQ( master.p99, shared.p99 );
+        ASSERT_EQ( master.p05, shared.p05 );
+    }
+
+    // The GUI feeds it its worker-thread count, the headless applier one: the statistics do not depend on it.
+    LookAssistStats threaded;
+    ASSERT_TRUE( ReceiptApplier::lookAssistDisplayMeter( fixture.video(), 0, downscale, 12, &threaded ) );
+    ASSERT_EQ( master.median, threaded.median );
+    ASSERT_EQ( master.p95, threaded.p95 );
+    ASSERT_EQ( master.p99, threaded.p99 );
+}
+
+TEST(LookAssistFixtureScene, DisplayMeterIsTheSameWhilePlaybackPreviewIsOnAtAnyScale)
+{
+    // The render threads switch the process-wide preview mode / scale on for playback and restore it; a Look Assist
+    // analysis that lands inside such a window must not see a different picture.
+    const FixtureClip &clip = kTrackedFixtureClips[1];
+    MlvPipelineFixture fixture;
+    QString error_message;
+    ASSERT_TRUE( fixture.openClipFile( repo_file_path( QString::fromLatin1( clip.file ) ), &error_message ) );
+    ASSERT_TRUE( fixture.applyReceipt( &error_message ) );
+    const int downscale = analysisDownscaleFor( fixture.video() );
+    LookAssistStats reference;
+    ASSERT_TRUE( ReceiptApplier::lookAssistDisplayMeter( fixture.video(), 0, downscale, 1, &reference ) );
+
+    const int previousMode = processingPlaybackPreviewModeEnabled();
+    const int previousScale = processingPlaybackPreviewScaleFactor();
+    for( int scale : { 1, 2, 4 } )
+    {
+        processingSetPlaybackPreviewMode( 1 );
+        processingSetPlaybackPreviewScaleFactor( scale );
+        LookAssistStats inPreview;
+        const bool ok = ReceiptApplier::lookAssistDisplayMeter( fixture.video(), 0, downscale, 1, &inPreview );
+        processingSetPlaybackPreviewScaleFactor( previousScale );
+        processingSetPlaybackPreviewMode( previousMode );
+        ASSERT_TRUE( ok );
+        ASSERT_EQ( reference.median, inPreview.median );
+        ASSERT_EQ( reference.p95, inPreview.p95 );
+        ASSERT_EQ( reference.p99, inPreview.p99 );
+    }
+}
+
+TEST(LookAssistFixtureScene, HeadlessLookAssistDecidesIdenticallyAtEveryPlaybackScaleWithTheDisplayMeteredExposure)
+{
+    // The tracked fixtures are flat-floor dual-ISO clips: their RAW thumbnail is the sensor floor, so the p95 highlight
+    // cap meters nothing and the floor-metered exposure under-exposes them. The display meter is what fixes that, and
+    // it used to run at x2 only (and never in batch). Scale 2 is the reference: it is where the fix already applied.
+    const FixtureClip &clip = kTrackedFixtureClips[0];
+    MlvPipelineFixture fixture;
+    QString error_message;
+    ASSERT_TRUE( fixture.openClipFile( repo_file_path( QString::fromLatin1( clip.file ) ), &error_message ) );
+    ASSERT_TRUE( fixture.applyReceipt( &error_message ) );
+    const LookAssistStats raw = rawThumbnailStats( fixture.video(), 0 );
+    ASSERT_TRUE( lookAssistIsFlatFloorRawThumbnail( raw ) );
+    LookAssistStats hypothesis = raw;
+    hypothesis.daylightPictureEvidence = true;
+    // Meter in the state the applier meters in: on this restricted-lossless dual-ISO clip both appliers (GUI and
+    // headless) switch chroma smoothing on before the meter runs (chromaSmoothAuto=true). At the display's levels
+    // (LOOK-ASSIST-ANALYSIS-TRUE-LEVELS-1) that moves the metered median 32 -> 33, i.e. exposure 158 -> 154; at the
+    // old clip levels (median ~85) the same one code value rounded away.
+    llrpSetChromaSmoothMode( fixture.video(), 1 );
+    llrpResetFpmStatus( fixture.video() );
+    llrpResetBpmStatus( fixture.video() );
+    LookAssistStats display;
+    ASSERT_TRUE( ReceiptApplier::lookAssistDisplayMeter( fixture.video(), 0, analysisDownscaleFor( fixture.video() ), 1, &display ) );
+    const int floorMetered = presetForLookAssistScene( LookAssistScene::Shade, hypothesis ).exposure;
+    const int displayMetered = presetForLookAssistScene( LookAssistScene::Shade, hypothesis, nullptr, &display ).exposure;
+    std::fprintf( stderr, "[LA-METER] %s display_meter median=%.1f p95=%.1f p99=%.1f\n", clip.file, display.median,
+                  display.p95, display.p99 );
+
+    ScaleRun reference;
+    ASSERT_TRUE( headlessAtPlaybackScale( clip.file, 0, 2, &reference ) );
+    // The headless applier ran the display meter (it used to have none, so batch export never got the fix) ...
+    ASSERT_FALSE( reference.meterLine.isEmpty() );
+    // ... and says so in the decision log (batch has no playback scale, so that field stays NA)
+    ASSERT_TRUE( reference.log.contains( "display_meter_ran=1 playback_scale=NA" ) );
+    ASSERT_TRUE( reference.log.contains( "scene=shade" ) );
+    // ... and its exposure is the display-metered one, not the floor-metered one.
+    std::fprintf( stderr, "[LA-METER] %s floor_metered_exposure=%d display_metered_exposure=%d headless_receipt_exposure=%d\n",
+                  clip.file, floorMetered, displayMetered, reference.exposure );
+    ASSERT_EQ( displayMetered, reference.exposure );
+    ASSERT_TRUE( displayMetered != floorMetered );
+
+    for( int scale : { 1, 3, 4 } )
+    {
+        ScaleRun run;
+        ASSERT_TRUE( headlessAtPlaybackScale( clip.file, 0, scale, &run ) );
+        // Every slider of the receipt, the meter's statistics, and the whole analysis line (scene, statistics, balance).
+        ASSERT_EQ( reference.receipt.toStdString(), run.receipt.toStdString() );
+        ASSERT_EQ( reference.meterLine.toStdString(), run.meterLine.toStdString() );
+        ASSERT_TRUE( run.log.contains( "display_meter_ran=1 playback_scale=NA" ) );   // 1 at scale 1, 3 and 4, not only 2
+        ASSERT_EQ( appliedLineWithoutPassFlag( reference.log ).toStdString(),
+                   appliedLineWithoutPassFlag( run.log ).toStdString() );
+    }
+}
 
 TEST(LookAssistFixtureScene, WindowLitVerificationRendersLeaveLowLevelRawStateUntouched)
 {
@@ -1176,27 +1462,27 @@ TEST(LookAssistFixtureScene, HeadlessAppliedLineSaysWhyItChoseItsScene)
 {
     // The three decisions the M16 night diagnosis could not see, through the real headless Look Assist on the tracked
     // fixtures: the recorded exposure, which daylight conjunct decided, and that the headless path runs no night walk
-    // and no display meter. The expected tail is the WHOLE field set, so dropping or renaming any field fails here.
+    // and has no playback scale, but does run the display meter (display_meter_ran=1: batch runs it at every scale). The expected tail is the WHOLE field set, so dropping or renaming any field fails here.
     struct Expect { const char *name; const char *tail; };
     const Expect expected[] = {
         // (a) tracked daylight: EV100 16, the rendered picture corroborates
         { "tiny-daylight",
           "^has_ev100=1 ev100=16\\.\\d\\d\\d daylight_gate=pass post_walk_ran=0 post_walk_branch=none post_walk_recovery=NA "
-          "display_meter_ran=0 playback_scale=NA ev100_bound=NA ev100_source=recorded surface_search=not-run "
+          "display_meter_ran=1 playback_scale=NA ev100_bound=NA ev100_source=recorded surface_search=not-run "
           "surface_search_balance=NA flavor=classic$" },
         { "large-daylight",
           "^has_ev100=1 ev100=16\\.\\d\\d\\d daylight_gate=pass post_walk_ran=0 post_walk_branch=none post_walk_recovery=NA "
-          "display_meter_ran=0 playback_scale=NA ev100_bound=NA ev100_source=recorded surface_search=not-run "
+          "display_meter_ran=1 playback_scale=NA ev100_bound=NA ev100_source=recorded surface_search=not-run "
           "surface_search_balance=NA flavor=classic$" },
         // (b) no metadata: nothing to record, and the first conjunct is what failed
         { "tiny-no-metadata",
           "^has_ev100=0 ev100=NA daylight_gate=exposure post_walk_ran=0 post_walk_branch=none post_walk_recovery=NA "
-          "display_meter_ran=0 playback_scale=NA ev100_bound=NA ev100_source=none surface_search=not-run "
+          "display_meter_ran=1 playback_scale=NA ev100_bound=NA ev100_source=none surface_search=not-run "
           "surface_search_balance=NA flavor=classic$" },
         // (c) a flat-floor NIGHT verdict (ND filter: EV100 8.6 over the same flat floor): metadata present, gate exposure
         { "tiny-nd-filter",
           "^has_ev100=1 ev100=8\\.\\d\\d\\d daylight_gate=exposure post_walk_ran=0 post_walk_branch=none "
-          "post_walk_recovery=NA display_meter_ran=0 playback_scale=NA ev100_bound=NA ev100_source=recorded "
+          "post_walk_recovery=NA display_meter_ran=1 playback_scale=NA ev100_bound=NA ev100_source=recorded "
           "surface_search=not-run surface_search_balance=NA flavor=classic$" },
     };
     const size_t caseCount = sizeof( kIdentityCases ) / sizeof( kIdentityCases[0] );

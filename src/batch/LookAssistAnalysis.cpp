@@ -748,7 +748,9 @@ static void refineDaylightFromRenderedPicture( const LookAssistWhiteBalanceReque
     window.maxTint = qMin( window.maxTint, request.maxTint );
     if( window.minTemperature > window.maxTemperature || window.minTint > window.maxTint ) return;
 
-    const double exposureStops = preset->exposure / 100.0;   // the planned exposure every picture is rendered at
+    // the planned exposure every picture is rendered at
+    const double exposureStops = ( request.analysisExposure != LookAssistWhiteBalanceRequest::kLookAssistNoAnalysisExposure
+                                   ? request.analysisExposure : preset->exposure ) / 100.0;
     const int startTemperature = qBound( window.minTemperature, request.baseTemperature + preset->temperatureDelta, window.maxTemperature );
     const int startTint = qBound( window.minTint, request.baseTint + preset->tintDelta, window.maxTint );
 
@@ -947,7 +949,9 @@ static bool initialDaylightPatchIsVerified( const LookAssistWhiteBalanceRequest 
     priorTemperature = qBound( window.minTemperature, priorTemperature, window.maxTemperature );
     priorTint = qBound( window.minTint, priorTint, window.maxTint );
 
-    const double exposureStops = preset.exposure / 100.0;   // the planned exposure the consumer's picture was rendered at
+    // the planned exposure the consumer's picture was rendered at
+    const double exposureStops = ( request.analysisExposure != LookAssistWhiteBalanceRequest::kLookAssistNoAnalysisExposure
+                                   ? request.analysisExposure : preset.exposure ) / 100.0;
     LookAssistRenderedPicture base;
     if( !request.renderBalance( exposureStops, priorTemperature, priorTint, &base ) || base.stats.median <= 0.0 ) return false;
     // The patch must be a pixel of this very picture: the thumbnail geometry is the one the patch was found in.
