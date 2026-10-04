@@ -217,6 +217,16 @@ no-loop / no-replay, the run nonce, settings isolation and the backend check are
 and the job passes no switch that could loosen them. `backend` is part of the
 subject, so a cuda receipt and a cpu receipt are different subjects.
 
+*The cpu time budget (CPU-LEG-SMOKE-CEILING-1).* A cpu leg's Play may run to the CPU ceiling (765 s for the 25 s window), and the smoke runner
+caps any process timeout at 3600 s. For a ~3.2 GB owner input at the measured 1.5 MB/s that ceiling plus a margined identity read does not fit,
+so `Get-AttrCudaLegTimeBudget -ShareSmokeCeiling` (a cpu leg only; never CUDA; a fixture cpu leg passes it but reads no input, so it never clamps) lets the **in-runner** re-read allowance shrink to
+what is left of the 3600 s (3600 - 60 - 765 - 3 - 30 = 2742 s). The job's own full identity read keeps its margined allowance in the um-run
+timeout, which is derived with the smoke timeout and the PresentMon capture ceiling from the same result. A cpu leg is refused with
+`ATTRCUDA_TIMEBUDGET_EXCEEDS_SMOKE_CEILING` only when that remainder cannot cover the re-read at the measured rate with **no** margin
+(about 4113 MB at 1.5 MB/s); `Invoke-VenueLeg` records that refusal as the typed receipt refusal `GENERATOR_REFUSED_ATTRCUDA_TIMEBUDGET_EXCEEDS_SMOKE_CEILING`,
+not an untyped `RUNNER_ERROR`. A clamped leg's job first trace line carries `smokeCeilingClamped=True appReadAllowanceSec=<n>` (every other leg's job is unchanged, the
+default CUDA job byte for byte), so a process timeout on a clamped leg is attributable from the evidence log. A venue's own cold-read rate is not used until one is measured on it.
+
 ## LOOK legs and contact sheets
 
 *Contact frames after a PresentMon wait failure (DVE-LEG-TERMINALS-1).* The app captures the contact-sheet frames in a **seek** pass

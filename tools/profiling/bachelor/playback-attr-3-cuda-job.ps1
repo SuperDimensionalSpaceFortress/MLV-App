@@ -943,8 +943,15 @@ $timeBudgetArgs['PlaySeconds'] = [int][Math]::Max(40, $PlaySeconds)
 if ($cpuPlayPaceInformational) {
     $timeBudgetArgs['PlaySeconds'] = [int][Math]::Max($timeBudgetArgs['PlaySeconds'],
         [Math]::Ceiling((Get-GuiSmokePlaySafetyMs -Seconds $PlaySeconds -CpuPaceInformational) / 1000.0))
+    # CPU-LEG-SMOKE-CEILING-1: the runner caps a process timeout at 3600 s, and a ~3.2 GB owner input at the measured read rate plus that 765 s ceiling does not fit it
+    # with the identity read repeated at full margin. The budget shares the 3600 s instead (see Get-AttrCudaLegTimeBudget); CUDA never asks for it (a fixture CPU leg does, but has zero input bytes and so never clamps).
+    $timeBudgetArgs['ShareSmokeCeiling'] = $true
 }
 $timeBudget = Get-AttrCudaLegTimeBudget -InputBytes $clipBytesForBudget @timeBudgetArgs
+if ($timeBudget.smokeCeilingClamped) {
+    Write-Warning ("CPU-LEG-SMOKE-CEILING-1: this cpu leg's smoke timeout is held at the runner's 3600 s ceiling; the app's in-runner re-read allowance is $($timeBudget.appReadAllowanceSec) s " +
+        "(the job's own identity read keeps $($timeBudget.identityReadSec) s in the um-run timeout of $($timeBudget.jobTimeoutSec) s).")
+}
 
 # --- job body template (placeholders are substituted below; the body itself never
 #     touches this generator's variables directly, so there is no accidental capture
@@ -1035,7 +1042,7 @@ function Save-Json($Object, [string]$Path) {
 function Write-JobTrace([string]$Message) {
     Add-AttrCudaTraceLine -TracePath $Trace -Message $Message
 }
-Write-JobTrace "job start id=$JobId commit=$($SourceCommit.Substring(0,12)) clip=$ClipId fixture=$FixtureRehearsal smokeProcessTimeoutMs=$SmokeProcessTimeoutMs"
+Write-JobTrace "job start id=$JobId commit=$($SourceCommit.Substring(0,12)) clip=$ClipId fixture=$FixtureRehearsal smokeProcessTimeoutMs=$SmokeProcessTimeoutMs__SMOKE_CEILING_TRACE__"
 
 # CUDA-PERF-DISPLAY-WAKE-2 round 1c: THE VERY FIRST ACTION this job takes after claim, before the
 # TEMP boundary, before $Work/$Pub are even created, before footage resolution, before package/
@@ -4095,6 +4102,9 @@ $text = Expand-AttrCudaTemplate -Template $template -Tokens ([ordered]@{
     TELEMETRY_ARM = $TelemetryArm
     DISABLE_PAINT_PER_SUBMIT = $disablePaintPerSubmitLiteral
     SMOKE_PROCESS_TIMEOUT_MS = [string]$timeBudget.smokeProcessTimeoutMs
+    # CPU-LEG-SMOKE-CEILING-1: only a clamped leg traces the clamp and the in-runner re-read allowance it left (so a process timeout on it is attributable from the
+    # evidence log); every other leg expands this to nothing, so its job is the text it was before the card.
+    SMOKE_CEILING_TRACE = $(if ($timeBudget.smokeCeilingClamped) { " smokeCeilingClamped=True appReadAllowanceSec=$([int]$timeBudget.appReadAllowanceSec)" } else { '' })
     PLAY_SECONDS = [string]$PlaySeconds
     RUNNER_ACCEPTS_VERIFIED_CLIP_BINDING = $runnerAcceptsVerifiedClipBindingLiteral
     # DUAL-VENUE-EVIDENCE-1: each default below expands to exactly the text that was literal before.
