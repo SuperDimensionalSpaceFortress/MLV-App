@@ -15731,7 +15731,8 @@ void MainWindow::applyLookAssistToReceipt( ReceiptSettings *receipt,
     // backs the daylight verdict the clip is re-analysed as master analyses it (the master pass below), which
     // is a sync-path analysis too. Running the one consumer path guarantees sync and async land on the same
     // white balance, by construction. The master pass itself stays on the sync path for the same reason. So does a night
-    // verdict the aperture-bounded exposure rules out: its check verifies (and may search) on the live picture.
+    // verdict the aperture-bounded exposure rules out: only the sync path runs its check, which verifies (and may
+    // search) on the isolated read-only render of the clip, never the live picture.
     const bool daylightNeedsLivePicture = lookAssistIsDaylightScene( stats, scene ) || s_lookAssistMasterScenePass
                                         || lookAssistNotNightByExposureBoundCandidate( stats, scene );
     if( !s_syncMode && !daylightNeedsLivePicture )
@@ -16513,7 +16514,7 @@ void MainWindow::applyLookAssistToReceipt( ReceiptSettings *receipt,
                            "solution_surface_chroma=%6 solution_surface_blue_amber=%7 frame=%8 "
                            "expo_iso=%9 expo_shutter_us=%10 lens_aperture_x100=%11 applied=%12 exposure_bound=%13 "
                            "recovery_iso=%14 surface_search=%15 search_renders=%16 search_balance=%17/%18 "
-                           "search_surface_chroma=%19 applied_balance=%20/%21")
+                           "search_surface_chroma=%19 applied_balance=%20/%21 gate_surface_blue_amber=%22")
                 .arg( bool01( windowLit.evidence ) )
                 .arg( windowLit.reason )
                 .arg( lookAssistSceneName( scene ) )
@@ -16535,7 +16536,8 @@ void MainWindow::applyLookAssistToReceipt( ReceiptSettings *receipt,
                 .arg( windowLit.search.tint )
                 .arg( windowLit.search.surface.chroma, 0, 'f', 1 )
                 .arg( windowLit.appliedTemperature )
-                .arg( windowLit.appliedTint ) );
+                .arg( windowLit.appliedTint )
+                .arg( windowLit.gateSurfaceBlueAmber, 0, 'f', 1 ) );
     }
     const bool autoWhiteBalanceValid = wb.autoValid;
     const QString autoWhiteBalanceSource = wb.source;

@@ -2216,7 +2216,8 @@ TEST(LookAssistScene, BothConsumersApplyTheWindowLitCheckOnlyOnTheExposureBound)
     ASSERT_EQ( 1, window.count( QStringLiteral("windowLit.applies") ) );
     // The night walk's own gate is untouched: a daylight verdict skips it, exactly as before.
     ASSERT_TRUE( window.contains( QStringLiteral("!daylightScene && ( !autoWhiteBalanceValid || useProcessedColorStats )") ) );
-    // Only a bound candidate is added to the synchronous routing (it renders the live picture); the rest is master's.
+    // Only a bound candidate is added to the synchronous routing (only that path runs the check, which renders the isolated
+    // read-only picture); the rest is master's.
     ASSERT_TRUE( window.contains( QStringLiteral(
         "const bool daylightNeedsLivePicture = lookAssistIsDaylightScene( stats, scene ) || s_lookAssistMasterScenePass\n"
         "                                        || lookAssistNotNightByExposureBoundCandidate( stats, scene );") ) );
@@ -2558,7 +2559,8 @@ TEST(LookAssistScene, TrueNightClipsKeepVerdictReceiptAndPictureWithOrWithoutThe
     // Every one keeps master's verdict, receipt and picture bit for bit.
     struct Light { const char *name; int kelvin; int tint; };
     const Light lights[] = { { "sodium", 2100, 10 }, { "tungsten", 3200, 4 }, { "moonlight", 4100, 0 },
-                             { "warm-led", 3000, 2 }, { "stage-led", 5600, -5 }, { "cool-led", 6500, 0 } };
+                             { "warm-led", 3000, 2 }, { "stage-led", 5600, -5 }, { "stage-led-5800", 5800, -3 },
+                             { "neutral-led-5900", 5900, 0 }, { "neutral-led-5999", 5999, -2 }, { "cool-led", 6500, 0 } };
     const LookAssistStats exposures[] = { fixtureRawStats(), withBound( fixtureRawStats(), 3200, 20000 ),
                                           withBound( fixtureRawStats(), 6400, 33333 ),
                                           withEv( fixtureRawStats(), 3200, 33333, 180 ) };
@@ -2579,8 +2581,10 @@ TEST(LookAssistScene, TrueNightClipsKeepVerdictReceiptAndPictureWithOrWithoutThe
     {
         if( l.kelvin >= kLookAssistNotNightMinTemperature ) continue;
         const WindowRoom room = roomNeutralAt( l.kelvin, l.tint );
-        // The solver answers the light's own neutral (verified as such) or overshoots it to the daylight rail.
-        for( const int solved : { l.kelvin, 9930 } )
+        // The solver answers the light's own neutral (verified as such), lands anywhere from 5600 K to just over the 6000 K
+        // gate (a mild overshoot that leaves the surface only a little cast, or one inside the strict-neutral band of a
+        // 5900-5999 K source), or overshoots it to the daylight rail.
+        for( const int solved : { l.kelvin, 5600, 5800, 5900, 5999, 6000, 6050, 6100, 9930 } )
         {
             const WindowLitRun master = runWindowLit( m16Raw(), room, solved, l.tint, false );
             const WindowLitRun r = runWindowLit( m16Raw(), room, solved, l.tint );
@@ -2590,6 +2594,33 @@ TEST(LookAssistScene, TrueNightClipsKeepVerdictReceiptAndPictureWithOrWithoutThe
             ASSERT_FALSE( r.check.evidence );
             ASSERT_TRUE( identicalToMaster( r, master, room ) );
         }
+    }
+
+    // The two boundary refusals, each by its own conjunct.
+    // A 5600 K stage LED solved to 6000 K: the surface is still a little amber there (B-R -4, chroma 4), which the loose
+    // daylight guard would accept. Only a strictly neutral surface is adopted directly; this one goes to the search,
+    // which finds the light's own neutral (warmer than 6000 K), so it stays night.
+    {
+        const WindowRoom room = roomNeutralAt( 5600, -5 );
+        const WindowLitRun r = runWindowLit( m16Raw(), room, 6000, -5 );
+        ASSERT_TRUE( std::fabs( r.check.solutionSurfaceBlueAmber ) >= 2.0 );
+        ASSERT_TRUE( r.check.search.result == QStringLiteral("converged") );
+        ASSERT_TRUE( r.check.search.temperature < kLookAssistNotNightMinTemperature );
+        ASSERT_TRUE( r.check.reason == QStringLiteral("not-daylight-locus") );
+        ASSERT_TRUE( r.scene == LookAssistScene::Night );
+        ASSERT_TRUE( identicalToMaster( r, runWindowLit( m16Raw(), room, 6000, -5, false ), room ) );
+    }
+    // A 5999 K LED solved to 6050 K: the surface IS strictly neutral there and the balance is not warmer than 6000 K, but
+    // at the 6000 K gate itself the surface is not measurably blue, so its own neutral is not shown to be bluer than the
+    // gate: it stays night.
+    {
+        const WindowRoom room = roomNeutralAt( 5999, -2 );
+        const WindowLitRun r = runWindowLit( m16Raw(), room, 6050, -2 );
+        ASSERT_TRUE( std::fabs( r.check.solutionSurfaceBlueAmber ) < 2.0 );
+        ASSERT_TRUE( r.check.search.result == QStringLiteral("not-run") );
+        ASSERT_TRUE( r.check.gateSurfaceBlueAmber < 2.0 );
+        ASSERT_TRUE( r.check.reason == QStringLiteral("not-blue-at-gate") );
+        ASSERT_TRUE( identicalToMaster( r, runWindowLit( m16Raw(), room, 6050, -2, false ), room ) );
     }
 }
 

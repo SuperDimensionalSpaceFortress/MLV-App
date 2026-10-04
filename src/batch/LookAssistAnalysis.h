@@ -457,10 +457,15 @@ bool lookAssistDaylightNeedsRenderedRefinement( const LookAssistStats &stats,
  * the exposure, not the colour, rules night out, so the >= 7000 K locus conjunct is not asked. Instead:
  *   - the patch picture is a lit picture: at least 5 % of it at luma >= 100 (p95), which a bright subject on a black
  *     field (a moon, a lamp) is not;
- *   - the balance APPLIED is the solve if its surface verifies, otherwise the balance the verified-surface search finds
- *     for that same surface (searchLookAssistNeutralSurfaceBalance); no verified balance = no evidence (today's night);
+ *   - the balance APPLIED is the solve if its surface verifies AND is strictly neutral there (|B-R| and |G| < 2, the
+ *     search's own convergence bar), otherwise the balance the verified-surface search finds for that same surface
+ *     (searchLookAssistNeutralSurfaceBalance); no verified balance = no evidence (today's night). The loose daylight
+ *     guard alone would adopt a solve a little bluer than a 5600 K source (B-R -4 at 6000 K);
  *   - that balance is daylight: inside the daylight window and no warmer than 6000 K. Every night light source (sodium,
- *     tungsten, warm / neutral LED to ~5600 K, moonlight ~4100 K) neutralises warmer than that.
+ *     tungsten, warm / neutral LED to ~5600 K, moonlight ~4100 K) neutralises warmer than that;
+ *   - robust at that boundary: rendered at 6000 K (the applied tint), the surface is measurably blue (B-R >= 2), i.e. its
+ *     own neutral is bluer than 6000 K by more than the strict-neutral band, which alone pins it to only ~5 mired
+ *     (a 5900-5999 K source verifies strictly at 6000-6100 K). Not blue there = "not-blue-at-gate", no evidence.
  * The class is the daylight Shade class: "not night, under the daylight exposure of 11" is an interior lit by daylight
  * through windows (its own verified surface says the light is daylight), the Shade preset is the one built for a lit
  * picture without sun, and its window keeps the balance on the daylight locus. A new class would need its own preset,
@@ -474,7 +479,7 @@ static const double kLookAssistLitPictureMinP95 = 100.0;
 bool lookAssistWindowLitInteriorCandidate( const LookAssistStats &stats, LookAssistScene scene );
 
 /* A candidate whose aperture bound rules night out: the check may change the verdict (consumers route it to the
- * synchronous path, as daylight, because it renders the live picture). */
+ * synchronous path, as daylight, because only that path runs the check; it renders the isolated read-only picture). */
 bool lookAssistNotNightByExposureBoundCandidate( const LookAssistStats &stats, LookAssistScene scene );
 
 /* ---- The verified-surface balance search ----
@@ -520,7 +525,8 @@ struct LookAssistWindowLitCheck
     double baseSurfaceBlueAmber = 0.0;
     double solutionSurfaceChroma = 0.0;
     double solutionSurfaceBlueAmber = 0.0;
-    LookAssistSurfaceSearch search;   // run only on the live rule, when the solve does not verify
+    LookAssistSurfaceSearch search;   // run only on the live rule, when the solve is not strictly neutral
+    double gateSurfaceBlueAmber = 0.0;   // live rule: the surface's B-R rendered at the 6000 K gate (0 = not rendered)
     int appliedTemperature = 0;       // the balance the evidence applies (0 without evidence)
     int appliedTint = 0;
 };

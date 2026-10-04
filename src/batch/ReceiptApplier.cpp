@@ -956,7 +956,7 @@ bool ReceiptApplier::applyHeadlessLookAssist(ReceiptSettings *receipt,
             "[BATCH] LOOK_ASSIST window_lit_interior frame=%1 wouldReclassify=%2 reason=%3 scene=%4 baseSurfaceChroma=%5 "
             "baseSurfaceBlueAmber=%6 solutionSurfaceChroma=%7 solutionSurfaceBlueAmber=%8 expoIso=%9 expoShutterUs=%10 "
             "lensApertureX100=%11 applied=%12 exposureBound=%13 recoveryIso=%14 surfaceSearch=%15 searchRenders=%16 "
-            "searchBalance=%17/%18 appliedBalance=%19/%20\n" )
+            "searchBalance=%17/%18 appliedBalance=%19/%20 gateSurfaceBlueAmber=%21\n" )
             .arg( frameIndex )
             .arg( windowLit.evidence ? QStringLiteral("true") : QStringLiteral("false") )
             .arg( windowLit.reason )
@@ -976,7 +976,8 @@ bool ReceiptApplier::applyHeadlessLookAssist(ReceiptSettings *receipt,
             .arg( windowLit.search.temperature )
             .arg( windowLit.search.tint )
             .arg( windowLit.appliedTemperature )
-            .arg( windowLit.appliedTint ) );
+            .arg( windowLit.appliedTint )
+            .arg( windowLit.gateSurfaceBlueAmber, 0, 'f', 1 ) );
     }
     const bool autoWhiteBalanceValid = wb.autoValid;
     const QString autoWhiteBalanceSource = wb.source;

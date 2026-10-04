@@ -1323,10 +1323,13 @@ LookAssistWindowLitCheck resolveLookAssistWindowLitInterior( const LookAssistWhi
     auto verifiedAt = [&]( const LookAssistAutoWhiteBalancePatch &surface ) {
         return lookAssistDaylightPatchIsNeutralEnough( surface )
             && surface.chroma <= baseSurface.chroma + kRefineVerifyChromaSlack; };
-    // The accepted balance as it stands (the solve, undamped).
+    // The accepted balance as it stands (the solve, undamped). On the live rule it is adopted only when its surface is
+    // strictly neutral there (the search's own convergence bar): the loose guard above accepts a residual cast that a
+    // solve a little bluer than a 5600 K night source still leaves (B-R -4 at 6000 K), and that balance is not the
+    // source's neutral. A solve that is not strictly neutral goes to the search, which finds where the surface is.
     int temperature = request.baseTemperature + preset->temperatureDelta;
     int tint = request.baseTint + preset->tintDelta;
-    if( !verifiedAt( solutionSurface ) )
+    if( !verifiedAt( solutionSurface ) || ( check.exposureBound && !lookAssistSurfaceIsNeutral( solutionSurface ) ) )
     {
         if( !check.exposureBound )
         {
@@ -1367,6 +1370,28 @@ LookAssistWindowLitCheck resolveLookAssistWindowLitInterior( const LookAssistWhi
     {
         check.reason = QStringLiteral("not-daylight-locus");
         return check;
+    }
+    // ... and robustly so at the 6000 K boundary. A strictly neutral surface still pins its own neutral only to within the
+    // dead band (|B-R| < 2, about 5 mired on the M16 surface), so a 5900-5999 K source verifies at 6000-6100 K. The surface
+    // itself decides: rendered at the 6000 K gate (the applied tint), it must be measurably blue there (B-R >= the dead
+    // band), i.e. its neutral is bluer than 6000 K by more than that band. A night source at or under 6000 K renders
+    // neutral or amber at the gate.
+    if( check.exposureBound )
+    {
+        LookAssistRenderedPicture atGate;
+        if( !request.renderBalance( patchPictureExposureStops, kLookAssistNotNightMinTemperature, tint, &atGate )
+         || !lookAssistSamePictureGeometry( base, atGate ) )
+        {
+            check.reason = QStringLiteral("unverifiable");
+            return check;
+        }
+        const LookAssistAutoWhiteBalancePatch gateSurface = lookAssistSurfaceAt( atGate, patch.thumbnailX, patch.thumbnailY );
+        check.gateSurfaceBlueAmber = gateSurface.blueAmberAxis;
+        if( !gateSurface.valid || gateSurface.blueAmberAxis < kRefineDeadBand )
+        {
+            check.reason = QStringLiteral("not-blue-at-gate");
+            return check;
+        }
     }
 
     // A window-lit interior: the daylight class, its preset on the same inputs, and the verified balance.
