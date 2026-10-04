@@ -1038,6 +1038,19 @@ class PerVenueConsentGateTests(RunnerHarness, unittest.TestCase):
         self.assertNotIn(receipt["outcome"], ("PASS", "FAIL"))
         self.assertNotIn("the table has no such clip", json.dumps(receipt), "only the token is recorded, never the message body")
 
+    def test_an_input_too_large_for_a_bounded_leg_is_a_typed_receipt_refusal_not_a_runner_error(self) -> None:
+        # CPU-LEG-SMOKE-CEILING-1: the generator's time-budget refusal (ATTRCUDA_TIMEBUDGET_EXCEEDS_SMOKE_CEILING) is typed like every other generator refusal.
+        _, receipt, submitted = self.run_leg("ultra-magnus", self.write_spec(), gen_refusal="ATTRCUDA_TIMEBUDGET_EXCEEDS_SMOKE_CEILING the smoke ceiling of 3600 s leaves 1 s")
+        self.assertEqual(submitted, [])
+        self.assertEqual(receipt["refusal"], "GENERATOR_REFUSED_ATTRCUDA_TIMEBUDGET_EXCEEDS_SMOKE_CEILING")
+        self.assertNotIn("RUNNER_ERROR", receipt["outcomeDetail"])
+        self.assertNotIn("leaves 1 s", json.dumps(receipt), "only the token is recorded, never the message body")
+
+    def test_an_untyped_generator_failure_is_still_a_runner_error(self) -> None:
+        _, receipt, _submitted = self.run_leg("ultra-magnus", self.write_spec(), gen_refusal="SOME_OTHER_TOKEN a message")
+        self.assertIsNone(receipt.get("refusal"))
+        self.assertIn("RUNNER_ERROR", receipt["outcomeDetail"])
+
     def test_the_tracked_consent_file_is_owner_written_shape_only_and_names_no_path(self) -> None:
         tracked = json.loads((DV / "venue-clip-consent.json").read_text(encoding="utf-8"))
         self.assertEqual(tracked["schema"], "mlv-app/dual-venue-clip-consent/v1")
