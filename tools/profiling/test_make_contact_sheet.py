@@ -407,3 +407,30 @@ def test_relative_or_name_falls_back_to_basename_when_relpath_is_impossible():
 
     with mock.patch("os.path.relpath", side_effect=ValueError("no common drive")):
         assert mcs._relative_or_name(Path("Z:/some/sheet.png"), Path("C:/other")) == "sheet.png"
+
+
+def test_every_tile_label_and_the_header_state_playback_path():
+    # CONTACT-SHEET-PLAYBACK-PARITY-1: an in-pass sheet says playback_path=true on every tile and in the
+    # header; a seek sheet says false; a mixture is called mixed, never silently read as playback.
+    from pathlib import Path
+
+    assert mcs.tile_label({"index": 2, "elapsed_ms": 10010.0, "display_frame": 240, "playback_path": True}) == (
+        "frame 2 @ 10010ms (disp 240) playback_path=true")
+    assert mcs.tile_label({"index": 0, "playback_path": False}).endswith("playback_path=false")
+    assert mcs.tile_label({"index": 0}).endswith("playback_path=unknown")
+
+    in_pass = Path(_make_frames_dir(n=3))  # _write_frame defaults playback_path=True
+    lines = mcs.build_header_lines(Args(), mcs.load_frames(in_pass))
+    assert any("playback_path=true" in line for line in lines)
+
+    seek = Path(tempfile.mkdtemp())
+    for i in range(2):
+        _write_frame(seek, i, (40, 40, 40), playback_path=False)
+    lines = mcs.build_header_lines(Args(), mcs.load_frames(seek))
+    assert any("playback_path=false" in line for line in lines)
+
+    mixed = Path(tempfile.mkdtemp())
+    _write_frame(mixed, 0, (40, 40, 40), playback_path=True)
+    _write_frame(mixed, 1, (40, 40, 40), playback_path=False)
+    lines = mcs.build_header_lines(Args(), mcs.load_frames(mixed))
+    assert any("playback_path=mixed" in line for line in lines)

@@ -1846,6 +1846,36 @@
       "lines": [
         333
       ]
+    },
+    {
+      "path": "platform/qt/MainWindow.cpp",
+      "anchor": "contactSheetFpsMeasured = contactSheetMeasuredElapsedMs > 0",
+      "class": "division_guard",
+      "clock": "other",
+      "justification": "CONTACT-SHEET-PLAYBACK-PARITY-1: guards the presented_frames*1000/measured_elapsed_ms division for the fps_measured field the in-pass contact sheet logs next to its recorded grab cost; a zero elapsed time reports 0 instead of dividing by zero. Display-only: whether any frame was grabbed or written is proven by the pending-grab and frames-written counters, never by this duration. The elapsed time is the measured playbackClock (QElapsedTimer).",
+      "lines": [
+        9808
+      ]
+    },
+    {
+      "path": "platform/qt/PlaybackFrameRange.h",
+      "anchor": "if ( frameCount <= 0 || windowMs <= 0 ) return 0 ;",
+      "class": "value_fallback_select",
+      "clock": "other",
+      "justification": "CONTACT-SHEET-PLAYBACK-PARITY-1: contactSheetInPassTargetMs() returns target 0 for a non-positive frame count or play window (a config value: the requested --seconds / presented-frames window), instead of computing slice centres from it. It selects a target time; it never proves that any stage ran.",
+      "lines": [
+        112
+      ]
+    },
+    {
+      "path": "platform/qt/PlaybackFrameRange.h",
+      "anchor": "if ( presentedFrames <= 0 || elapsedMs <= 0.0 || usableMs <= 0.0 ) return 0.0 ;",
+      "class": "division_guard",
+      "clock": "other",
+      "justification": "CONTACT-SHEET-PLAYBACK-PARITY-1: fpsExcludingGrabCost() guards the presentedFrames*1000/(elapsedMs - grabTotalMs) division; with no frames or no usable time it reports 0 rather than dividing by zero or reporting an infinite fps. The value is only logged (fps_excluding_grabs) beside the measured fps; it decides nothing.",
+      "lines": [
+        124
+      ]
     }
   ]
 }
