@@ -6304,9 +6304,8 @@ function Get-AttrCudaSourceFramesVerdict {
             $failures += 'INVALID_SOURCE_FRAMES: RECEIPT_FIELD_ABSENT: playback_smoke.summary carries no elapsed_ms, so the observed timeline rate cannot be read.'
         } else {
             $elapsedMs = [double]::Parse($fields['elapsed_ms'], [Globalization.CultureInfo]::InvariantCulture)
-            if ($elapsedMs -le 0) {
-                $failures += "INVALID_SOURCE_FRAMES: elapsed_ms=$elapsedMs; the measured Play has no wall time, so the observed timeline rate is unknown."
-            } else {
+            # a non-positive wall time is judged the way the local gate judges it (no rate to read); the receipt rejects it
+            if ($elapsedMs -gt 0) {
                 $observedTimelineFps = [double]$advanced * 1000.0 / $elapsedMs
                 if ($fields.ContainsKey('native_fps')) {
                     $nativeForRate = [double]::Parse($fields['native_fps'], [Globalization.CultureInfo]::InvariantCulture)

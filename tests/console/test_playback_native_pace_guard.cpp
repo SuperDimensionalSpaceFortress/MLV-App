@@ -34,7 +34,7 @@ struct PaceRun
     double sourceAdvanced = 0.0; // source frames the timeline advanced
     int presented = 0;
     double wallMs = 0.0;
-    double timelineFps() const { return wallMs > 0.0 ? sourceAdvanced * 1000.0 / wallMs : 0.0; }
+    double timelineFps() const { return sourceAdvanced * 1000.0 / wallMs; } // simulatePlay always sets wallMs
 };
 
 // One Play of wallMs on a renderer that takes renderMs per frame. predictiveOnPresent models the CUDA texture

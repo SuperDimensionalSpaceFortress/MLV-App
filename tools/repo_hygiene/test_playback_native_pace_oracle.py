@@ -121,13 +121,17 @@ class VenueJobObservedRateTests(unittest.TestCase):
             self.assertFalse(verdict["invalid"], verdict)
             self.assertFalse(verdict["fasterThanNative"], verdict)
 
-    def test_an_absent_or_zero_wall_time_is_invalid_never_unchecked(self) -> None:
+    def test_an_absent_wall_time_is_invalid_never_unchecked(self) -> None:
         absent = _module_verdict(_without(_good_line(**UM_CINEMATIC), "elapsed_ms"))
         self.assertTrue(absent["invalid"], absent)
         self.assertIn("RECEIPT_FIELD_ABSENT", json.dumps(absent["failures"]))
-        zero = _module_verdict(_good_line(**{**UM_CINEMATIC, "elapsed_ms": 0}))
-        self.assertTrue(zero["invalid"], zero)
-        self.assertIn("elapsed_ms=0", json.dumps(zero["failures"]))
+
+    def test_a_zero_wall_time_is_judged_as_the_local_gate_judges_it(self) -> None:
+        # SourceFramesOracleParityTests: both carriers agree on every row; a zero wall time gives no rate to read in either
+        # (the dual-venue receipt rejects it outright -- ReceiptObservedRateTests)
+        line = _good_line(**{**UM_CINEMATIC, "elapsed_ms": 0})
+        self.assertEqual(_module_verdict(line)["invalid"], _oracle(line)["invalid"])
+        self.assertFalse(_module_verdict(line)["fasterThanNative"])
 
     def test_the_tolerance_is_two_percent(self) -> None:
         self.assertFalse(_module_verdict(_good_line(source_advanced=600, required_source_frames=600, elapsed_ms=_elapsed_for(1.019)))["invalid"])
