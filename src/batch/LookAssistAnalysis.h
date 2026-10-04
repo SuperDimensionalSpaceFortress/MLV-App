@@ -51,6 +51,12 @@ struct LookAssistStats
     // Display statistics alone cannot tell an under-exposed daylight clip from a night scene.
     bool hasSceneEv100 = false;
     double sceneEv100 = 0.0;
+    // No aperture recorded (a manual lens: LENS.aperture = 0) but ISO and shutter are: EV100 at f/1.0, a LOWER BOUND of
+    // the scene's EV100 (a real aperture only raises it). Never set together with hasSceneEv100, which keeps its meaning.
+    bool hasSceneEv100Bound = false;
+    double sceneEv100Bound = 0.0;
+    // Dual ISO: stops from the recorded ISO up to the more sensitive recovery ISO (decoded DISO), 0 when there is none.
+    double sceneRecoveryStops = 0.0;
     // Fraction of pixels in the mid-tone band (luma 40..215): "a lit picture", not "a dark field
     // with a small bright region".
     double midtoneFraction = 0.0;
@@ -103,10 +109,23 @@ LookAssistStats analyzeLookAssistThumbnail( const unsigned char *rgb, int width,
 /* EV at ISO 100 = log2( N^2 / t ) - log2( ISO / 100 ), from the MLV EXPO/LENS blocks
  * (iso, shutter in microseconds, f-number * 100). False when any value is missing/zero. */
 bool lookAssistSceneEv100( double isoValue, double shutterMicroseconds, double apertureTimes100, double *ev100 );
+/* recoveryIsoValue = the decoded dual-ISO recovery ISO (ReceiptApplier::lookAssistRecoveryIso; 0 = none). With no aperture but ISO and shutter recorded, the stats
+ * get the f/1.0 lower bound instead (hasSceneEv100Bound); the recorded EV100 is computed exactly as before. */
 void lookAssistSetSceneEv100( LookAssistStats *stats,
                               double isoValue,
                               double shutterMicroseconds,
-                              double apertureTimes100 );
+                              double apertureTimes100,
+                              double recoveryIsoValue = 0.0 );
+
+/* ---- The aperture lower bound (LOOK-ASSIST-M16-NOT-NIGHT-1) ----
+ * Night scenes are EV100 ~0-5, lit night interiors ~5-7. A clip whose f/1.0 bound is at least 7 is therefore not
+ * night whatever lens was on it. The bound uses the RECORDED ISO, the same ISO the recorded EV100 uses for every other
+ * clip (dual ISO included). Dual ISO: the recovery rows are the same light with more gain, so a scene exposed for them
+ * could be up to the recovery stops darker; the bound minus those stops must still be above the dark-night band (>= 5).
+ * M16-1243: ISO 100, 1/1357 s -> bound 10.4; a 4-stop recovery would leave 6.4, still >= 5. */
+static const double kLookAssistNotNightEv100 = 7.0;
+static const double kLookAssistDarkNightEv100 = 5.0;
+bool lookAssistExposureBoundExcludesNight( const LookAssistStats &stats );
 
 /* The recorded exposure is bright enough for daylight (open shade ~12, overcast ~13, sun ~15; lit
  * interiors <= ~10). NECESSARY, never sufficient: see lookAssistSceneIsDaylight. */
@@ -158,6 +177,9 @@ struct LookAssistDecisionTrace
     int recoveryTintDelta = 0;
     bool displayMeterRan = false;                            // the display-space exposure meter produced samples
     int playbackScaleFactor = 0;                             // effective playback scale (0 = not applicable)
+    QString surfaceSearch = QStringLiteral("not-run");       // the verified-surface balance search (LookAssistWindowLitCheck)
+    int surfaceSearchTemperature = 0;                        // the balance it found (converged only)
+    int surfaceSearchTint = 0;
 };
 
 /* The walk's branch bookkeeping, kept pure so the GUI walk and the unit tests run the very same code. Call in walk
@@ -179,6 +201,8 @@ QString lookAssistDaylightGateName( const LookAssistStats &resolved, bool pictur
  *   has_ev100=0|1 ev100=(3 decimals, truncated not rounded so it never reads 11 below the gate's 11.0, or NA) daylight_gate=(see above) post_walk_ran=0|1
  *   post_walk_branch=(none, steps, cleanup or recovery) post_walk_recovery=(temp delta, slash, tint delta; NA unless
  *   recovery) display_meter_ran=0|1 playback_scale=(n or NA)
+ *   ev100_bound=(the f/1.0 lower bound, 3 decimals truncated, or NA) ev100_source=(recorded, aperture_bound or none)
+ *   surface_search=(not-run, converged, not-converged or unverifiable) surface_search_balance=(temp/tint, or NA)
  * Pure; reads nothing it was not given. */
 QString lookAssistDecisionLogFields( const LookAssistStats &resolved, const LookAssistDecisionTrace &trace );
 
@@ -433,28 +457,94 @@ bool lookAssistDaylightNeedsRenderedRefinement( const LookAssistStats &stats,
  *     the solution and no more cast there (the daylight initial-patch guard, with the base balance as the start).
  * Then stats->windowLitInteriorEvidence is set, the scene becomes the daylight class (Shade), the preset is that
  * scene's (same inputs) and the accepted balance stands, clamped into the daylight window (a no-op by the gate).
- * CONSUMERS RUN IT MEASURE-ONLY (on copies, logging window_lit_interior): on the owner clip the accepted solve did not
- * verify (its own patch turns amber at the solution), so nothing is reclassified until the follow-ons land. */
+ * By colour alone (no exposure bound) the check stays MEASURE-ONLY: consumers run it on copies and log it, because on the
+ * owner clip the accepted solve did not verify and a colour rule cannot tell that clip from a cool-white LED night.
+ *
+ * LIVE with the aperture bound (LOOK-ASSIST-M16-NOT-NIGHT-1, `applies`): when lookAssistExposureBoundExcludesNight holds,
+ * the exposure, not the colour, rules night out, so the >= 7000 K locus conjunct is not asked. Instead:
+ *   - the patch picture is a lit picture: at least 5 % of it at luma >= 100 (p95), which a bright subject on a black
+ *     field (a moon, a lamp) is not;
+ *   - the balance APPLIED is the solve if its surface verifies AND is strictly neutral there (|B-R| and |G| < 2, the
+ *     search's own convergence bar), otherwise the balance the verified-surface search finds for that same surface
+ *     (searchLookAssistNeutralSurfaceBalance); no verified balance = no evidence (today's night). The loose daylight
+ *     guard alone would adopt a solve a little bluer than a 5600 K source (B-R -4 at 6000 K);
+ *   - that balance is daylight: inside the daylight window and no warmer than 6000 K. Every night light source (sodium,
+ *     tungsten, warm / neutral LED to ~5600 K, moonlight ~4100 K) neutralises warmer than that;
+ *   - robust at that boundary: rendered at 6000 K (the applied tint), the surface is measurably blue (B-R >= 2), i.e. its
+ *     own neutral is bluer than 6000 K by more than the strict-neutral band, which alone pins it to only ~5 mired
+ *     (a 5900-5999 K source verifies strictly at 6000-6100 K). Not blue there = "not-blue-at-gate", no evidence.
+ * The class is the daylight Shade class: "not night, under the daylight exposure of 11" is an interior lit by daylight
+ * through windows (its own verified surface says the light is daylight), the Shade preset is the one built for a lit
+ * picture without sun, and its window keeps the balance on the daylight locus. A new class would need its own preset,
+ * bounds and receipt handling for no gain; and the night post-balance walk does not run for it (daylight rule). */
 static const double kLookAssistWindowLitMinPatchLuma = 150.0;
 static const int    kLookAssistWindowLitMinTemperature = 7000;
+static const int    kLookAssistNotNightMinTemperature = 6000;
+static const double kLookAssistLitPictureMinP95 = 100.0;
 
 /* The night verdict could be a window-lit interior: legacy Night from a flat-floor RAW thumbnail, no recorded exposure. */
 bool lookAssistWindowLitInteriorCandidate( const LookAssistStats &stats, LookAssistScene scene );
+
+/* A candidate whose aperture bound rules night out: the check may change the verdict (consumers route it to the
+ * synchronous path, as daylight, because only that path runs the check; it renders the isolated read-only picture). */
+bool lookAssistNotNightByExposureBoundCandidate( const LookAssistStats &stats, LookAssistScene scene );
+
+/* ---- The verified-surface balance search ----
+ * The processed-patch solver can overshoot (M16-1243: 9930 K / -33 leaves its own patch amber, chroma 6 -> 20). Given the
+ * surface (pixel x, y of every render, all of one geometry) measured at two balances, find the balance at which THAT
+ * surface renders neutral (|B-R| and |G-(R+B)/2| both under 2) inside `window`, by secant steps in mired and tint whose
+ * slopes are refitted from every render. Bounded: at most kLookAssistSurfaceSearchMaxRenders renders. Never guesses: a
+ * failed render or another geometry is "unverifiable", no neutral balance within the budget or the window is
+ * "not-converged"; only "converged" carries a balance. */
+static const int kLookAssistSurfaceSearchMaxRenders = 6;
+struct LookAssistSurfaceProbe
+{
+    int temperature = 0;
+    int tint = 0;
+    LookAssistAutoWhiteBalancePatch surface;   // the surface measured in the picture rendered at (temperature, tint)
+};
+struct LookAssistSurfaceSearch
+{
+    QString result = QStringLiteral("not-run");   // not-run | converged | not-converged | unverifiable
+    bool converged = false;
+    int temperature = 0;
+    int tint = 0;
+    int renders = 0;
+    LookAssistAutoWhiteBalancePatch surface;      // the surface at the best balance seen
+};
+LookAssistSurfaceSearch searchLookAssistNeutralSurfaceBalance( const LookAssistRenderBalanceFn &renderBalance,
+                                                               double exposureStops,
+                                                               const LookAssistRenderedPicture &geometry,
+                                                               int x,
+                                                               int y,
+                                                               const LookAssistWhiteBalanceBounds &window,
+                                                               const LookAssistSurfaceProbe &first,
+                                                               const LookAssistSurfaceProbe &second );
 
 struct LookAssistWindowLitCheck
 {
     bool candidate = false;
     bool evidence = false;
+    bool exposureBound = false;   // the aperture bound rules night out: the live rule
+    bool applies = false;         // evidence on the live rule: consumers adopt stats, scene and preset
     QString reason = QStringLiteral("not-candidate");   // the first conjunct that failed, or "pass"
     double baseSurfaceChroma = 0.0;
     double baseSurfaceBlueAmber = 0.0;
     double solutionSurfaceChroma = 0.0;
     double solutionSurfaceBlueAmber = 0.0;
+    LookAssistSurfaceSearch search;   // run only on the live rule, when the solve is not strictly neutral
+    double gateSurfaceBlueAmber = 0.0;   // live rule: the surface's B-R rendered at the 6000 K gate (0 = not rendered)
+    int appliedTemperature = 0;       // the balance the evidence applies (0 without evidence)
+    int appliedTint = 0;
 };
+
+/* The trace fields for the search, from the check (consumers call this; the formatter prints them). */
+void lookAssistTraceSurfaceSearch( LookAssistDecisionTrace *trace, const LookAssistWindowLitCheck &check );
 
 /* Runs after resolveLookAssistWhiteBalance on the same request. patchPictureExposureStops = the exposure (stops) of
  * the processed picture the patch was found in, so the verification renders the same picture. On evidence it updates
- * stats (request.stats must point at it), scene and preset as described above; otherwise it changes nothing. */
+ * stats (request.stats must point at it), scene and preset as described above; otherwise it changes nothing.
+ * colorStats = the patch picture's statistics (the live rule's lit-picture conjunct reads its p95). */
 LookAssistWindowLitCheck resolveLookAssistWindowLitInterior( const LookAssistWhiteBalanceRequest &request,
                                                              const LookAssistWhiteBalanceResolution &wb,
                                                              double patchPictureExposureStops,

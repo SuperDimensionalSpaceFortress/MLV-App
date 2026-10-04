@@ -1465,12 +1465,30 @@ class CandidateAcceptanceTests(unittest.TestCase):
 
         workflow = (ROOT / ".github/workflows/tests.yml").read_text(encoding="utf-8")
         # This pin exists to guarantee CI RUNS THIS FILE. It used to assert the exact
-        # per-file invocation; the workflow now uses a directory target, which runs it by
-        # construction and also catches files added later -- a named list silently omits
-        # what it forgets to name. Both halves of the mechanism are pinned, so weakening
-        # either the search root or the pattern still fails here.
-        self.assertEqual(1, workflow.count("unittest discover -s tools/repo_hygiene"))
-        self.assertIn('-p "test_*.py"', workflow)
+        # per-file invocation, then one `unittest discover` directory target; the suite is
+        # now split across parallel shards by `ci_unittest_shard`, which collects with the
+        # same directory target and pattern and proves, in every shard job, that the shards
+        # together hold exactly the ids discovery finds. A directory target runs this file
+        # by construction and also catches files added later -- a named list silently omits
+        # what it forgets to name. Every half of the mechanism is pinned, so weakening the
+        # search root, the pattern, either OS's partition proof or a shard's own slice
+        # still fails here.
+        from tools.repo_hygiene import ci_unittest_shard
+
+        self.assertEqual("tools/repo_hygiene", ci_unittest_shard.START_DIR)
+        self.assertEqual("test_*.py", ci_unittest_shard.PATTERN)
+        self.assertEqual(".", ci_unittest_shard.TOP_LEVEL_DIR)
+        for profile in ("ubuntu", "windows"):
+            self.assertEqual(
+                1,
+                len(re.findall(rf"ci_unittest_shard --profile {profile} --of \d+ --verify-partition", workflow)),
+                profile,
+            )
+            self.assertEqual(
+                1,
+                len(re.findall(rf"ci_unittest_shard --profile {profile} --of \d+ --shard \$\{{\{{ matrix\.shard \}}\}}", workflow)),
+                profile,
+            )
 
     def test_github_capture_is_exact_head_terminal_and_fail_closed(self) -> None:
         source = (ROOT / "tools/factory/capture-github-acceptance.ps1").read_text(encoding="utf-8")

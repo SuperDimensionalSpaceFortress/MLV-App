@@ -26,6 +26,7 @@
 
 #include <cmath>
 #include <cstdio>
+#include <memory>
 #include <vector>
 
 using namespace lookassist;
@@ -1543,7 +1544,8 @@ QStringList fieldKeys( const QString &fields )
 const QStringList kDecisionFieldKeys = {
     QStringLiteral("has_ev100"), QStringLiteral("ev100"), QStringLiteral("daylight_gate"), QStringLiteral("post_walk_ran"),
     QStringLiteral("post_walk_branch"), QStringLiteral("post_walk_recovery"), QStringLiteral("display_meter_ran"),
-    QStringLiteral("playback_scale") };
+    QStringLiteral("playback_scale"), QStringLiteral("ev100_bound"), QStringLiteral("ev100_source"),
+    QStringLiteral("surface_search"), QStringLiteral("surface_search_balance") };
 
 } // namespace
 
@@ -1558,7 +1560,8 @@ TEST(LookAssistScene, DecisionLogNamesTheDaylightGateAndTheExposureInputs)
     asked.pictureEvidenceAsked = true;
     ASSERT_TRUE( lookAssistDecisionLogFields( daylight, asked )
                  == QStringLiteral("has_ev100=1 ev100=%1 daylight_gate=pass post_walk_ran=0 post_walk_branch=none "
-                                   "post_walk_recovery=NA display_meter_ran=0 playback_scale=NA")
+                                   "post_walk_recovery=NA display_meter_ran=0 playback_scale=NA ev100_bound=NA "
+                                   "ev100_source=recorded surface_search=not-run surface_search_balance=NA")
                         .arg( evText( 100, 465, 560 ) ) );
     ASSERT_TRUE( evText( 100, 465, 560 ).startsWith( QStringLiteral("16.") ) );
 
@@ -1567,7 +1570,8 @@ TEST(LookAssistScene, DecisionLogNamesTheDaylightGateAndTheExposureInputs)
     ASSERT_EQ( 0, renders );
     ASSERT_TRUE( lookAssistDecisionLogFields( noMeta, asked )
                  == QStringLiteral("has_ev100=0 ev100=NA daylight_gate=exposure post_walk_ran=0 post_walk_branch=none "
-                                   "post_walk_recovery=NA display_meter_ran=0 playback_scale=NA") );
+                                   "post_walk_recovery=NA display_meter_ran=0 playback_scale=NA ev100_bound=NA "
+                                   "ev100_source=none surface_search=not-run surface_search_balance=NA") );
 
     // ND-filter daylight (EV100 8.6): the metadata is there, it is just not daylight-bright -> the same gate.
     const LookAssistStats nd = resolvedFlatFloor( withEv( fixtureRawStats(), 100, 20000, 280 ), 70, &renders );
@@ -1625,7 +1629,8 @@ TEST(LookAssistScene, DecisionLogRecordsThePostBalanceWalkAndTheDisplayMeter)
     trace.postWalkRan = true;
     ASSERT_TRUE( lookAssistDecisionLogFields( night, trace )
                  == QStringLiteral("has_ev100=0 ev100=NA daylight_gate=exposure post_walk_ran=1 post_walk_branch=none "
-                                   "post_walk_recovery=NA display_meter_ran=1 playback_scale=4") );
+                                   "post_walk_recovery=NA display_meter_ran=1 playback_scale=4 ev100_bound=NA "
+                                   "ev100_source=none surface_search=not-run surface_search_balance=NA") );
     // the step loop moved it
     trace.postWalkBranch = LookAssistPostWalkBranch::Steps;
     ASSERT_TRUE( lookAssistDecisionLogFields( night, trace ).contains(
@@ -1651,8 +1656,8 @@ TEST(LookAssistScene, DecisionLogRecordsThePostBalanceWalkAndTheDisplayMeter)
     LookAssistDecisionTrace metered;
     metered.displayMeterRan = true;
     metered.playbackScaleFactor = 2;
-    ASSERT_TRUE( lookAssistDecisionLogFields( night, metered ).endsWith(
-        QStringLiteral("display_meter_ran=1 playback_scale=2") ) );
+    ASSERT_TRUE( lookAssistDecisionLogFields( night, metered ).contains(
+        QStringLiteral("display_meter_ran=1 playback_scale=2 ev100_bound=") ) );
     // ... the meter runs at EVERY scale (LOOK-ASSIST-DISPLAY-METER-ALL-SCALES-1): a run at a scale other than 2
     // reads display_meter_ran=1 and names its own scale, never 0 and never 2
     for( const int scale : { 1, 3, 4, 8 } )
@@ -1660,18 +1665,18 @@ TEST(LookAssistScene, DecisionLogRecordsThePostBalanceWalkAndTheDisplayMeter)
         LookAssistDecisionTrace atScale;
         atScale.displayMeterRan = true;
         atScale.playbackScaleFactor = scale;
-        ASSERT_TRUE( lookAssistDecisionLogFields( night, atScale ).endsWith(
-            QStringLiteral("display_meter_ran=1 playback_scale=%1").arg( scale ) ) );
+        ASSERT_TRUE( lookAssistDecisionLogFields( night, atScale ).contains(
+            QStringLiteral("display_meter_ran=1 playback_scale=%1 ev100_bound=").arg( scale ) ) );
     }
     // ... and the flag stays 0 only when the meter produced no samples (or in no-playback batch: scale NA)
     metered.displayMeterRan = false;
     metered.playbackScaleFactor = 1;
-    ASSERT_TRUE( lookAssistDecisionLogFields( night, metered ).endsWith(
-        QStringLiteral("display_meter_ran=0 playback_scale=1") ) );
+    ASSERT_TRUE( lookAssistDecisionLogFields( night, metered ).contains(
+        QStringLiteral("display_meter_ran=0 playback_scale=1 ev100_bound=") ) );
     LookAssistDecisionTrace batch;
     batch.displayMeterRan = true;
-    ASSERT_TRUE( lookAssistDecisionLogFields( night, batch ).endsWith(
-        QStringLiteral("display_meter_ran=1 playback_scale=NA") ) );
+    ASSERT_TRUE( lookAssistDecisionLogFields( night, batch ).contains(
+        QStringLiteral("display_meter_ran=1 playback_scale=NA ev100_bound=") ) );
 }
 
 namespace {
@@ -1751,7 +1756,7 @@ TEST(LookAssistScene, Ev100IsNeverRoundedAcrossTheDaylightThreshold)
     }
 }
 
-TEST(LookAssistScene, DecisionLogFieldsAreTheseEightInThisOrder)
+TEST(LookAssistScene, DecisionLogFieldsAreTheseTwelveInThisOrder)
 {
     // Dropping, renaming or reordering any field fails here (and the exact-string tests above).
     LookAssistDecisionTrace trace;
@@ -1954,12 +1959,14 @@ struct WindowLitRun
     LookAssistWindowLitCheck check;
 };
 
-enum class Renderer { Room, None, CastAtBase, OtherGeometry };
+enum class Renderer { Room, None, CastAtBase, OtherGeometry, FailsAfterVerification };
 
 // The night path exactly as the consumers run it up to the walk: scene, processed colour, patch search on the patch
 // picture, the one white-balance decision with `solved` as the solver's answer, then (applyRule) the window check.
+// colorP95 >= 0 replaces the patch picture's p95 (the live rule's lit-picture conjunct reads it).
 WindowLitRun runWindowLit( const LookAssistStats &raw, const WindowRoom &room, int solvedKelvin, int solvedTint,
-                           bool applyRule = true, bool processedSolve = true, Renderer renderer = Renderer::Room )
+                           bool applyRule = true, bool processedSolve = true, Renderer renderer = Renderer::Room,
+                           double colorP95 = -1.0 )
 {
     WindowLitRun r;
     r.stats = raw;
@@ -1967,6 +1974,7 @@ WindowLitRun runWindowLit( const LookAssistStats &raw, const WindowRoom &room, i
         *out = renderedPicture( 8, 8, []( int, int ) { return 8; } ); return true; } );
     const LookAssistRenderedPicture patchPicture = roomPicture( room, room.baseKelvin, room.baseTint );
     r.color = patchPicture.stats;
+    if( colorP95 >= 0.0 ) r.color.p95 = colorP95;
     r.patch = findLookAssistAutoWhiteBalancePatch( patchPicture.rgb.data(), kRoomW, kRoomH, kRoomDownscale,
                                                    kRoomW * kRoomDownscale, kRoomH * kRoomDownscale );
     r.preset = presetForLookAssistScene( r.scene, r.stats, &r.color );
@@ -1995,6 +2003,15 @@ WindowLitRun runWindowLit( const LookAssistStats &raw, const WindowRoom &room, i
         request.renderBalance = [room]( double, int k, int t, LookAssistRenderedPicture *out ) {
             *out = roomPicture( room, k, t ); out->downscaleFactor = kRoomDownscale + 1; return true; };
         break;
+    case Renderer::FailsAfterVerification:
+    {
+        // The check's own two renders (base, solution) succeed; every render after them (the search) fails.
+        auto calls = std::make_shared<int>( 0 );
+        request.renderBalance = [room, calls]( double, int k, int t, LookAssistRenderedPicture *out ) {
+            if( ++*calls > 2 ) return false;
+            *out = roomPicture( room, k, t ); return true; };
+        break;
+    }
     case Renderer::None:
         break;
     }
@@ -2223,16 +2240,20 @@ TEST(LookAssistScene, EveryWindowLitConjunctIsNeededOnItsOwn)
     }
 }
 
-TEST(LookAssistScene, BothConsumersRunTheWindowLitCheckMeasureOnly)
+
+TEST(LookAssistScene, BothConsumersApplyTheWindowLitCheckOnlyOnTheExposureBound)
 {
-    // On the owner clip the accepted solve did not verify (its own patch turns amber at the solution), so both consumers
-    // run the check on COPIES and only log it: verdict, preset, balance and the sync/async routing stay master's.
+    // Both consumers run the check on COPIES. They adopt its verdict, stats and preset only when it applies (the aperture
+    // bound rules night out and a verified surface backs the balance) and never in master's pass; by colour alone it is
+    // only logged (LOOK-ASSIST-WINDOW-LIT-INTERIOR-1).
     const QString applier = readRepoFile( QStringLiteral("src/batch/ReceiptApplier.cpp") );
     const QString window = readRepoFile( QStringLiteral("platform/qt/MainWindow.cpp") );
     ASSERT_FALSE( applier.isEmpty() );
     ASSERT_FALSE( window.isEmpty() );
     const QString copies = QStringLiteral(
         "windowLitRequest, wb, %1, &windowLitStats, &windowLitScene, &windowLitPreset," );
+    const QString adopt = QStringLiteral(
+        "stats = windowLitStats;\n        scene = windowLitScene;\n        preset = windowLitPreset;" );
 
     // GUI sync: once, after the one white-balance decision and its master-pass fallback, before the values are applied.
     ASSERT_EQ( 1, window.count( QStringLiteral("resolveLookAssistWindowLitInterior(") ) );
@@ -2242,25 +2263,47 @@ TEST(LookAssistScene, BothConsumersRunTheWindowLitCheckMeasureOnly)
     const int syncWb = window.indexOf( QStringLiteral("const LookAssistWhiteBalanceResolution wb = resolveLookAssistWhiteBalance("), sync );
     const int masterPass = window.indexOf( QStringLiteral("applyLookAssistToReceipt( receipt, analysisFrame );"), syncWb );
     const int guiCheck = window.indexOf( QStringLiteral("resolveLookAssistWindowLitInterior("), sync );
+    const int guiGate = window.indexOf( QStringLiteral("const bool windowLitApplied = windowLit.applies && !s_lookAssistMasterScenePass;"), guiCheck );
+    const int guiAdopt = window.indexOf( adopt, guiGate );
+    const int guiNight = window.indexOf( QStringLiteral("floorLiftedNightThumbnail = lookAssistIsFloorLiftedNightThumbnail( scene, stats );"), guiAdopt );
+    const int guiTrace = window.indexOf( QStringLiteral("lookAssistTraceSurfaceSearch( &decisionTrace, windowLit );"), guiAdopt );
     const int applied = window.indexOf( QStringLiteral("applyLookAssistValues();"), syncWb );
-    ASSERT_TRUE( sync > 0 && syncWb > sync && masterPass > syncWb && guiCheck > masterPass && applied > guiCheck );
-    // Nothing the live pass uses can be changed by it: the verdict and the night flag stay const, the routing is master's.
-    ASSERT_TRUE( window.contains( QStringLiteral("const LookAssistScene scene = resolveLookAssistScene(") ) );
-    ASSERT_TRUE( window.contains( QStringLiteral("const bool floorLiftedNightThumbnail =") ) );
+    const int walkGate = window.indexOf( QStringLiteral("const bool daylightScene = lookAssistIsDaylightScene( stats, scene );"), syncWb );
+    ASSERT_TRUE( sync > 0 && syncWb > sync && masterPass > syncWb && guiCheck > masterPass );
+    ASSERT_TRUE( guiGate > guiCheck && guiAdopt > guiGate && guiNight > guiAdopt && guiTrace > guiAdopt );
+    ASSERT_TRUE( applied > guiNight && walkGate > applied );   // adopted before the values and the night walk's gate
+    ASSERT_EQ( 1, window.count( adopt ) );
+    ASSERT_EQ( 1, window.count( QStringLiteral("windowLit.applies") ) );
+    // The night walk's own gate is untouched: a daylight verdict skips it, exactly as before.
+    ASSERT_TRUE( window.contains( QStringLiteral("!daylightScene && ( !autoWhiteBalanceValid || useProcessedColorStats )") ) );
+    // Only a bound candidate is added to the synchronous routing (only that path runs the check, which renders the isolated
+    // read-only picture); the rest is master's.
     ASSERT_TRUE( window.contains( QStringLiteral(
-        "const bool daylightNeedsLivePicture = lookAssistIsDaylightScene( stats, scene ) || s_lookAssistMasterScenePass;") ) );
+        "const bool daylightNeedsLivePicture = lookAssistIsDaylightScene( stats, scene ) || s_lookAssistMasterScenePass\n"
+        "                                        || lookAssistNotNightByExposureBoundCandidate( stats, scene );") ) );
     ASSERT_FALSE( window.contains( QStringLiteral("lookAssistWindowLitInteriorCandidate(") ) );
+    // The recovery ISO reaches the bound.
+    ASSERT_TRUE( window.contains( QStringLiteral("m_pMlvObject->LENS.aperture,\n                             ReceiptApplier::lookAssistRecoveryIso( m_pMlvObject ) );") ) );
 
-    // Headless: the same, after its decision and its master-pass fallback, before the receipt is written.
+    // Headless: the same, after its decision and its master-pass fallback, before the receipt is written; the applied
+    // balance is the check's verified one.
     ASSERT_EQ( 1, applier.count( QStringLiteral("resolveLookAssistWindowLitInterior(") ) );
     ASSERT_EQ( 1, applier.count( copies.arg( QStringLiteral("mlvObject->processing->exposure_stops") ) ) );
     ASSERT_EQ( 1, applier.count( QStringLiteral("windowLitRequest.stats = &windowLitStats;") ) );
-    ASSERT_TRUE( applier.contains( QStringLiteral("const LookAssistScene scene = resolveLookAssistScene(") ) );
+    ASSERT_EQ( 1, applier.count( adopt ) );
+    ASSERT_EQ( 1, applier.count( QStringLiteral("windowLit.applies") ) );
     const int hWb = applier.indexOf( QStringLiteral("const LookAssistWhiteBalanceResolution wb = resolveLookAssistWhiteBalance(") );
     const int hMaster = applier.indexOf( QStringLiteral("return applyHeadlessLookAssist( receipt, mlvObject, processingObject, analysisFrame, true );"), hWb );
     const int hCheck = applier.indexOf( QStringLiteral("resolveLookAssistWindowLitInterior("), hWb );
+    const int hGate = applier.indexOf( QStringLiteral("const bool windowLitApplied = windowLit.applies && !masterScenePass;"), hCheck );
+    const int hAdopt = applier.indexOf( adopt, hGate );
+    const int hTemp = applier.indexOf( QStringLiteral("const int temperature = windowLitApplied ? windowLit.appliedTemperature : wb.temperature;"), hAdopt );
+    const int hTint = applier.indexOf( QStringLiteral("const int tint = windowLitApplied ? windowLit.appliedTint : wb.tint;"), hAdopt );
     const int hWrite = applier.indexOf( QStringLiteral("receipt->setExposure( preset.exposure );"), hWb );
-    ASSERT_TRUE( hWb > 0 && hMaster > hWb && hCheck > hMaster && hWrite > hCheck );
+    ASSERT_TRUE( hWb > 0 && hMaster > hWb && hCheck > hMaster && hGate > hCheck && hAdopt > hGate );
+    ASSERT_TRUE( hTemp > hAdopt && hTint > hTemp && hWrite > hTint );
+    ASSERT_TRUE( applier.contains( QStringLiteral("lookAssistTraceSurfaceSearch( &decisionTrace, windowLit );") ) );
+    ASSERT_TRUE( applier.contains( QStringLiteral("mlvObject->LENS.aperture,\n                             lookAssistRecoveryIso( mlvObject ) );") ) );
 
     // sol r1: the check's two verification renders go through the isolated, read-only renderer in BOTH consumers (the
     // live one prepares and versions llrawproc's shared pixel maps), set after the copied request, before the check.
@@ -2277,12 +2320,24 @@ TEST(LookAssistScene, BothConsumersRunTheWindowLitCheckMeasureOnly)
         const int isolated = consumer.indexOf( assignments[i] );
         const int check = consumer.indexOf( QStringLiteral("resolveLookAssistWindowLitInterior(") );
         ASSERT_TRUE( copied > 0 && isolated > copied && check > isolated );
-        // fable r1 (LOOK-ASSIST-WINDOW-LIT-MEASURE-ONLY-RENDER-PIN-1): nothing is copied back. Each copy is declared,
-        // handed to the check and never read again, so `preset = windowLitPreset;` (or the scene / stats) fails here.
-        ASSERT_EQ( 2, consumer.count( QStringLiteral("windowLitPreset") ) );
-        ASSERT_EQ( 2, consumer.count( QStringLiteral("windowLitScene") ) );
-        ASSERT_EQ( 3, consumer.count( QStringLiteral("windowLitStats") ) );
-        ASSERT_EQ( 0, consumer.count( QRegularExpression( QStringLiteral("=\\s*windowLit(Preset|Scene|Stats)\\b") ) ) );
+        // fable r1 (LOOK-ASSIST-WINDOW-LIT-MEASURE-ONLY-RENDER-PIN-1), as narrowed by LOOK-ASSIST-M16-NOT-NIGHT-1: each
+        // copy is declared and handed to the check, and read again ONLY by the applied branch (the aperture-bounded,
+        // surface-verified check, never master's pass). Exactly one `x = windowLitX;` per copy, all after that gate, so a
+        // copy-back anywhere else (e.g. before the gate, where a measure-only check would move the verdict) fails here.
+        ASSERT_EQ( 3, consumer.count( QStringLiteral("windowLitPreset") ) );
+        ASSERT_EQ( 3, consumer.count( QStringLiteral("windowLitScene") ) );
+        ASSERT_EQ( 4, consumer.count( QStringLiteral("windowLitStats") ) );
+        const int gate = consumer.indexOf( QStringLiteral("const bool windowLitApplied = windowLit.applies && !") );
+        ASSERT_TRUE( gate > check );
+        int copiedBack = 0;
+        QRegularExpressionMatchIterator it =
+            QRegularExpression( QStringLiteral("=\\s*windowLit(Preset|Scene|Stats)\\b") ).globalMatch( consumer );
+        while( it.hasNext() )
+        {
+            ASSERT_TRUE( it.next().capturedStart() > gate );
+            ++copiedBack;
+        }
+        ASSERT_EQ( 3, copiedBack );
     }
     // The renderer itself: the isolated render with the llrawproc read-only switch around it, restored after.
     const int measureOnly = applier.indexOf( QStringLiteral("LookAssistRenderBalanceFn ReceiptApplier::lookAssistMeasureOnlyRenderer(") );
@@ -2317,4 +2372,475 @@ TEST(LookAssistDisplayMeterWiring, HeadlessRunsTheSameMeterAndThereIsOnlyOneImpl
     const QString meter = applier.mid( meterAt, meterEnd - meterAt );
     ASSERT_FALSE( meter.contains( QStringLiteral("playback_scale") ) );
     ASSERT_FALSE( meter.contains( QStringLiteral("PlaybackPreview") ) );
+}
+
+// ---------------------------------------------------------------------------------------------------------------
+// LOOK-ASSIST-M16-NOT-NIGHT-1: aperture-bounded EV100 and a verified neutral surface.
+// M16-1243 records ISO 100 and 1/1357 s (737 us) but LENS.aperture = 0 (a manual lens), so it had no EV100 at all. At
+// f/1.0 that exposure is EV100 10.4, and any real aperture only raises it: provably not night (night ~0-5, lit night
+// interiors ~5-7). Its processed-patch solve (9930 K / -33) overshoots: re-rendered there the patch turns amber (chroma
+// 6 -> 20); the surface is neutral near 6600 K. Synthetic here, as above: the tracked RAW floor and a dark room whose
+// window follows the balance under test.
+// ---------------------------------------------------------------------------------------------------------------
+namespace
+{
+
+LookAssistStats withBound( LookAssistStats s, double iso, double shutterUs, double recoveryIso = 0.0 )
+{
+    lookAssistSetSceneEv100( &s, iso, shutterUs, 0.0, recoveryIso );
+    return s;
+}
+
+// The owner clip's recorded exposure: ISO 100, 737 us, no aperture.
+LookAssistStats m16Raw()
+{
+    return withBound( fixtureRawStats(), 100, 737 );
+}
+
+// A window whose surface is neutral at (kelvin, tint) and responds like the app's picture: B-R rises 0.39 per mired
+// (the M16 surface: +6 at 6000 K, -20 at 9930 K) and G-(R+B)/2 falls a third of a unit per tint unit.
+WindowRoom roomNeutralAt( int kelvin, int tint )
+{
+    WindowRoom room;
+    room.neutralKelvin = kelvin;
+    room.neutralTint = tint;
+    room.baseBlueAmber = 0.39 * ( 1.0e6 / room.baseKelvin - 1.0e6 / kelvin );
+    room.baseGreen = ( tint - room.baseTint ) / 3.0;
+    return room;
+}
+
+// M16-1243's window: neutral near 6600 K (the WINDOW-LIT lane's interpolation), a hair magenta at the 6000 K / 0 base.
+WindowRoom m16Room()
+{
+    return roomNeutralAt( 6600, -3 );
+}
+
+// The picture at the run's final balance: what the receipt renders.
+std::vector<unsigned char> finalPicture( const WindowLitRun &r, const WindowRoom &room )
+{
+    return roomPicture( room, room.baseKelvin + r.preset.temperatureDelta, room.baseTint + r.preset.tintDelta ).rgb;
+}
+
+// Verdict, stats flags, receipt (preset + balance) and picture are master's, bit for bit.
+bool identicalToMaster( const WindowLitRun &r, const WindowLitRun &master, const WindowRoom &room )
+{
+    return untouched( r, master ) && !r.check.applies && r.stats.hasSceneEv100 == master.stats.hasSceneEv100
+        && finalPicture( r, room ) == finalPicture( master, room );
+}
+
+LookAssistRenderBalanceFn roomRenderer( const WindowRoom &room )
+{
+    return [room]( double, int k, int t, LookAssistRenderedPicture *out ) { *out = roomPicture( room, k, t ); return true; };
+}
+
+// The window surface (the patch pixel of the M16 room's base picture; every room has the same geometry) in the picture
+// rendered at (kelvin, tint).
+LookAssistSurfaceProbe probeAt( const WindowRoom &room, int kelvin, int tint )
+{
+    LookAssistSurfaceProbe p;
+    p.temperature = kelvin;
+    p.tint = tint;
+    const LookAssistAutoWhiteBalancePatch patch = findLookAssistAutoWhiteBalancePatch(
+        roomPicture( m16Room(), 6000, 0 ).rgb.data(), kRoomW, kRoomH, kRoomDownscale,
+        kRoomW * kRoomDownscale, kRoomH * kRoomDownscale );
+    if( !patch.valid ) return p;
+    const LookAssistRenderedPicture picture = roomPicture( room, kelvin, tint );
+    const unsigned char *px = &picture.rgb[( (size_t)patch.thumbnailY * kRoomW + patch.thumbnailX ) * 3];
+    p.surface.valid = true;
+    p.surface.thumbnailX = patch.thumbnailX;
+    p.surface.thumbnailY = patch.thumbnailY;
+    p.surface.luma = ( 54.0 * px[0] + 183.0 * px[1] + 19.0 * px[2] ) / 256.0;
+    p.surface.chroma = qMax( px[0], qMax( px[1], px[2] ) ) - qMin( px[0], qMin( px[1], px[2] ) );
+    p.surface.greenAxis = px[1] - ( px[0] + px[2] ) * 0.5;
+    p.surface.blueAmberAxis = (double)px[2] - (double)px[0];
+    return p;
+}
+
+LookAssistWhiteBalanceBounds daylightWindow()
+{
+    LookAssistWhiteBalanceBounds w;
+    w.minTemperature = 4800;
+    w.maxTemperature = 10000;
+    w.minTint = -35;
+    w.maxTint = 10;
+    return w;
+}
+
+int pixelChroma( const LookAssistRenderedPicture &picture, int x, int y )
+{
+    const unsigned char *p = &picture.rgb[( (size_t)y * picture.width + x ) * 3];
+    return qMax( p[0], qMax( p[1], p[2] ) ) - qMin( p[0], qMin( p[1], p[2] ) );
+}
+
+} // namespace
+
+TEST(LookAssistScene, TheApertureBoundIsEv100AtF1OnlyWhenTheApertureIsMissing)
+{
+    const LookAssistStats m16 = m16Raw();
+    ASSERT_FALSE( m16.hasSceneEv100 );
+    ASSERT_TRUE( m16.hasSceneEv100Bound );
+    ASSERT_NEAR( 10.406, m16.sceneEv100Bound, 0.001 );
+    ASSERT_NEAR( 0.0, m16.sceneRecoveryStops, 1e-12 );
+    ASSERT_TRUE( lookAssistExposureBoundExcludesNight( m16 ) );
+    // A bound is never a recorded exposure: it never opens the daylight gate, however high it is.
+    ASSERT_FALSE( lookAssistExposureIsDaylightBright( m16 ) );
+    ASSERT_FALSE( lookAssistExposureIsDaylightBright( withBound( fixtureRawStats(), 100, 100 ) ) );   // bound 13.3
+    ASSERT_TRUE( lookAssistDaylightGate( m16, LookAssistScene::Night ) == LookAssistDaylightGate::Exposure );
+
+    // It is the recorded formula at f/1.0, and every real aperture (f/1.0 and slower) gives at least the bound.
+    double atF1 = 0.0;
+    ASSERT_TRUE( lookAssistSceneEv100( 100, 737, 100, &atF1 ) );
+    ASSERT_NEAR( atF1, m16.sceneEv100Bound, 1e-12 );
+    for( double aperture : { 100.0, 120.0, 140.0, 200.0, 280.0, 560.0, 1600.0 } )
+        ASSERT_TRUE( withEv( fixtureRawStats(), 100, 737, aperture ).sceneEv100 >= m16.sceneEv100Bound - 1e-12 );
+
+    // Identity: with an aperture the recorded EV100 is exactly what it was and no bound is set, recovery ISO or not.
+    for( double iso : { 100.0, 400.0, 3200.0 } )
+        for( double shutter : { 465.0, 20000.0, 33333.0 } )
+            for( double aperture : { 140.0, 560.0 } )
+            {
+                LookAssistStats s = fixtureRawStats();
+                lookAssistSetSceneEv100( &s, iso, shutter, aperture, 1600.0 );
+                double expected = 0.0;
+                ASSERT_TRUE( lookAssistSceneEv100( iso, shutter, aperture, &expected ) );
+                ASSERT_TRUE( s.hasSceneEv100 );
+                ASSERT_TRUE( s.sceneEv100 == expected );
+                ASSERT_FALSE( s.hasSceneEv100Bound );
+                ASSERT_FALSE( lookAssistExposureBoundExcludesNight( s ) );
+            }
+    // Nothing recorded to bound: no ISO, or no shutter.
+    ASSERT_FALSE( withBound( fixtureRawStats(), 0, 737 ).hasSceneEv100Bound );
+    ASSERT_FALSE( withBound( fixtureRawStats(), 100, 0 ).hasSceneEv100Bound );
+    ASSERT_FALSE( lookAssistExposureBoundExcludesNight( fixtureRawStats() ) );
+
+    // The threshold: EV100 7 at f/1.0 is 1/128 s at ISO 100 (7812.5 us).
+    ASSERT_TRUE( lookAssistExposureBoundExcludesNight( withBound( fixtureRawStats(), 100, 7812 ) ) );
+    ASSERT_FALSE( lookAssistExposureBoundExcludesNight( withBound( fixtureRawStats(), 100, 7813 ) ) );
+    // A night exposure without an aperture stays below it: ISO 3200 at 1/50 s is 0.6, ISO 6400 at 1/30 s is -1.1.
+    ASSERT_FALSE( lookAssistExposureBoundExcludesNight( withBound( fixtureRawStats(), 3200, 20000 ) ) );
+    ASSERT_FALSE( lookAssistExposureBoundExcludesNight( withBound( fixtureRawStats(), 6400, 33333 ) ) );
+
+    // Dual ISO: the recovery rows could have been the ones exposed for, so the bound minus their stops must stay out of the
+    // dark-night band (>= 5). M16 at a 4-stop recovery: 6.4 (still not night); at 6 stops: 4.4 (night not ruled out).
+    const LookAssistStats m16Dual = withBound( fixtureRawStats(), 100, 737, 1600 );
+    ASSERT_NEAR( 4.0, m16Dual.sceneRecoveryStops, 1e-9 );
+    ASSERT_NEAR( 10.406, m16Dual.sceneEv100Bound, 0.001 );   // the bound itself is the recorded ISO's
+    ASSERT_TRUE( lookAssistExposureBoundExcludesNight( m16Dual ) );
+    ASSERT_FALSE( lookAssistExposureBoundExcludesNight( withBound( fixtureRawStats(), 100, 737, 6400 ) ) );
+    // 1/256 s at ISO 100 is bound 8, over the 7: with a 4-stop recovery it is 4, inside the dark-night band.
+    ASSERT_TRUE( lookAssistExposureBoundExcludesNight( withBound( fixtureRawStats(), 100, 3906 ) ) );
+    ASSERT_FALSE( lookAssistExposureBoundExcludesNight( withBound( fixtureRawStats(), 100, 3906, 1600 ) ) );
+    // A DISO ISO below the recorded one is no recovery (the recorded rows are already the more sensitive ones).
+    ASSERT_NEAR( 0.0, withBound( fixtureRawStats(), 1600, 737, 100 ).sceneRecoveryStops, 1e-12 );
+
+    // The log carries the bound and its source; a recorded EV100 says so and prints no bound.
+    const QString fields = lookAssistDecisionLogFields( m16, LookAssistDecisionTrace() );
+    ASSERT_TRUE( fields.startsWith( QStringLiteral("has_ev100=0 ev100=NA daylight_gate=exposure ") ) );
+    ASSERT_TRUE( fields.endsWith( QStringLiteral(
+        "ev100_bound=10.406 ev100_source=aperture_bound surface_search=not-run surface_search_balance=NA") ) );
+    ASSERT_TRUE( lookAssistDecisionLogFields( daylightFixture(), LookAssistDecisionTrace() ).contains(
+        QStringLiteral(" ev100_bound=NA ev100_source=recorded ") ) );
+}
+
+TEST(LookAssistScene, M16LeavesNightOnTheVerifiedNeutralSurfaceBalance)
+{
+    const WindowRoom room = m16Room();
+    // Before (no bound): the colour-only check refuses exactly as the WINDOW-LIT lane logged it, the surface goes from
+    // chroma 6 to 20 at the solve, and the verdict stays night.
+    const WindowLitRun before = runWindowLit( fixtureRawStats(), room, 9930, -33 );
+    ASSERT_TRUE( before.check.candidate );
+    ASSERT_FALSE( before.check.exposureBound );
+    ASSERT_TRUE( before.check.reason == QStringLiteral("unverified-at-solution") );
+    ASSERT_NEAR( 6.0, before.check.baseSurfaceChroma, 1.0 );
+    ASSERT_NEAR( 20.0, before.check.solutionSurfaceChroma, 2.0 );
+    ASSERT_TRUE( before.check.search.result == QStringLiteral("not-run") );
+    ASSERT_TRUE( before.scene == LookAssistScene::Night );
+
+    // After: the same clip with its recorded ISO and shutter.
+    const WindowLitRun master = runWindowLit( m16Raw(), room, 9930, -33, false );
+    ASSERT_TRUE( master.scene == LookAssistScene::Night );   // the bound never touches the legacy verdict itself
+    ASSERT_TRUE( master.wb.decision == QStringLiteral("accepted") );
+    ASSERT_EQ( 9930, master.wb.temperature );
+    const WindowLitRun r = runWindowLit( m16Raw(), room, 9930, -33 );
+    std::fprintf( stderr, "M16-NOT-NIGHT scene=%s reason=%s search=%s renders=%d balance=%d/%d surface_chroma=%.1f\n",
+                  qPrintable( lookAssistSceneName( r.scene ) ), qPrintable( r.check.reason ),
+                  qPrintable( r.check.search.result ), r.check.search.renders, r.check.appliedTemperature,
+                  r.check.appliedTint, r.check.search.surface.chroma );
+    ASSERT_TRUE( r.check.candidate );
+    ASSERT_TRUE( r.check.exposureBound );
+    ASSERT_TRUE( r.check.evidence );
+    ASSERT_TRUE( r.check.applies );
+    ASSERT_TRUE( r.check.reason == QStringLiteral("pass") );
+    // The solve did not verify; the search found the balance at which that same surface is neutral.
+    ASSERT_NEAR( 20.0, r.check.solutionSurfaceChroma, 2.0 );
+    ASSERT_TRUE( r.check.search.result == QStringLiteral("converged") );
+    ASSERT_TRUE( r.check.search.converged );
+    ASSERT_TRUE( r.check.search.renders >= 1 && r.check.search.renders <= kLookAssistSurfaceSearchMaxRenders );
+    ASSERT_TRUE( std::fabs( 1.0e6 / r.check.search.temperature - 1.0e6 / 6600.0 ) <= 6.0 );   // within 6 mired
+    ASSERT_TRUE( qAbs( r.check.search.tint + 3 ) <= 6 );
+    ASSERT_TRUE( r.check.search.surface.chroma <= 3.0 );
+    ASSERT_EQ( r.check.search.temperature, r.check.appliedTemperature );
+    ASSERT_EQ( r.check.search.tint, r.check.appliedTint );
+    // Not night: the daylight class, so the night walk does not run, and the applied balance is the verified one.
+    ASSERT_TRUE( r.scene == LookAssistScene::Shade );
+    ASSERT_TRUE( r.stats.windowLitInteriorEvidence );
+    ASSERT_TRUE( lookAssistIsDaylightScene( r.stats, r.scene ) );
+    ASSERT_FALSE( lookAssistIsFloorLiftedNightThumbnail( r.scene, r.stats ) );
+    const bool daylightScene = lookAssistIsDaylightScene( r.stats, r.scene );
+    ASSERT_FALSE( !daylightScene && ( !r.wb.autoValid || true ) );
+    ASSERT_EQ( r.check.appliedTemperature, room.baseKelvin + r.preset.temperatureDelta );
+    ASSERT_EQ( r.check.appliedTint, room.baseTint + r.preset.tintDelta );
+    LookAssistPreset shade = presetForLookAssistScene( LookAssistScene::Shade, r.stats, &r.color );
+    shade.temperatureDelta = r.preset.temperatureDelta;
+    shade.tintDelta = r.preset.tintDelta;
+    ASSERT_TRUE( samePreset( shade, r.preset ) );
+    // The window renders neutral in the receipt's picture; master's solve left it amber.
+    const int x = r.patch.thumbnailX, y = r.patch.thumbnailY;
+    ASSERT_TRUE( pixelChroma( roomPicture( room, r.check.appliedTemperature, r.check.appliedTint ), x, y ) <= 3 );
+    ASSERT_TRUE( pixelChroma( roomPicture( room, 9930, -33 ), x, y ) >= 15 );
+    // The trace: the window gate, the bound and its source, and the search.
+    LookAssistDecisionTrace trace;
+    lookAssistTraceSurfaceSearch( &trace, r.check );
+    const QString fields = lookAssistDecisionLogFields( r.stats, trace );
+    ASSERT_TRUE( fields.startsWith( QStringLiteral("has_ev100=0 ev100=NA daylight_gate=window post_walk_ran=0 ") ) );
+    ASSERT_TRUE( fields.endsWith( QStringLiteral("ev100_bound=10.406 ev100_source=aperture_bound surface_search=converged "
+                                                 "surface_search_balance=%1/%2")
+                                      .arg( r.check.appliedTemperature ).arg( r.check.appliedTint ) ) );
+
+    // A solve that DOES verify on its surface is applied as it is: no search.
+    const WindowLitRun direct = runWindowLit( m16Raw(), WindowRoom(), 9930, -33 );
+    ASSERT_TRUE( direct.check.applies );
+    ASSERT_TRUE( direct.check.search.result == QStringLiteral("not-run") );
+    ASSERT_EQ( 9930, direct.check.appliedTemperature );
+    ASSERT_EQ( -33, direct.check.appliedTint );
+}
+
+TEST(LookAssistScene, ANoApertureHighShutterClipLeavesNightAndASlowOneDoesNot)
+{
+    const WindowRoom room = m16Room();
+    // ISO 400 at 1/2000 s, no aperture: bound 9.0 -> not night.
+    const WindowLitRun fast = runWindowLit( withBound( fixtureRawStats(), 400, 500 ), room, 9930, -33 );
+    ASSERT_TRUE( fast.check.applies );
+    ASSERT_TRUE( fast.scene == LookAssistScene::Shade );
+    // ISO 400 at 1/50 s (bound 3.6) and ISO 100 at 1/127.99 s (bound 6.9999, just under 7): nothing rules night out, so
+    // the colour-only check only measures and the verdict, receipt and picture are master's, bit for bit.
+    struct Exposure { double iso; double shutterUs; };
+    for( const Exposure e : { Exposure{ 400, 20000 }, Exposure{ 100, 7813 } } )
+    {
+        const LookAssistStats raw = withBound( fixtureRawStats(), e.iso, e.shutterUs );
+        const WindowLitRun master = runWindowLit( raw, room, 9930, -33, false );
+        const WindowLitRun r = runWindowLit( raw, room, 9930, -33 );
+        ASSERT_TRUE( raw.hasSceneEv100Bound );
+        ASSERT_FALSE( lookAssistExposureBoundExcludesNight( raw ) );
+        ASSERT_TRUE( r.scene == LookAssistScene::Night );
+        ASSERT_TRUE( identicalToMaster( r, master, room ) );
+    }
+}
+
+TEST(LookAssistScene, TrueNightClipsKeepVerdictReceiptAndPictureWithOrWithoutTheBound)
+{
+    // Night light sources lighting the room's bright neutral surface. Exposures: none recorded; no aperture at night
+    // settings (ISO 3200 1/50 s, ISO 6400 1/30 s: bounds 0.6 and -1.1); a recorded night EV100 (ISO 3200, 1/30 s, f/1.8).
+    // Every one keeps master's verdict, receipt and picture bit for bit.
+    struct Light { const char *name; int kelvin; int tint; };
+    const Light lights[] = { { "sodium", 2100, 10 }, { "tungsten", 3200, 4 }, { "moonlight", 4100, 0 },
+                             { "warm-led", 3000, 2 }, { "stage-led", 5600, -5 }, { "stage-led-5800", 5800, -3 },
+                             { "neutral-led-5900", 5900, 0 }, { "neutral-led-5999", 5999, -2 }, { "cool-led", 6500, 0 } };
+    const LookAssistStats exposures[] = { fixtureRawStats(), withBound( fixtureRawStats(), 3200, 20000 ),
+                                          withBound( fixtureRawStats(), 6400, 33333 ),
+                                          withEv( fixtureRawStats(), 3200, 33333, 180 ) };
+    for( const Light &l : lights )
+        for( const LookAssistStats &raw : exposures )
+        {
+            const WindowRoom room = roomNeutralAt( l.kelvin, l.tint );
+            const WindowLitRun master = runWindowLit( raw, room, l.kelvin, l.tint, false );
+            const WindowLitRun r = runWindowLit( raw, room, l.kelvin, l.tint );
+            ASSERT_TRUE( master.scene == LookAssistScene::Night );
+            ASSERT_FALSE( r.check.exposureBound );
+            ASSERT_TRUE( identicalToMaster( r, master, room ) );
+        }
+
+    // Even under the M16 bound (10.4, night ruled out by the exposure), a surface whose verified neutral balance is a
+    // night light source's -- warmer than 6000 K, or outside the daylight window altogether -- is not made daylight.
+    for( const Light &l : lights )
+    {
+        if( l.kelvin >= kLookAssistNotNightMinTemperature ) continue;
+        const WindowRoom room = roomNeutralAt( l.kelvin, l.tint );
+        // The solver answers the light's own neutral (verified as such), lands anywhere from 5600 K to just over the 6000 K
+        // gate (a mild overshoot that leaves the surface only a little cast, or one inside the strict-neutral band of a
+        // 5900-5999 K source), or overshoots it to the daylight rail.
+        for( const int solved : { l.kelvin, 5600, 5800, 5900, 5999, 6000, 6050, 6100, 9930 } )
+        {
+            const WindowLitRun master = runWindowLit( m16Raw(), room, solved, l.tint, false );
+            const WindowLitRun r = runWindowLit( m16Raw(), room, solved, l.tint );
+            std::fprintf( stderr, "M16-NOT-NIGHT night=%s solved=%d reason=%s search=%s\n", l.name, solved,
+                          qPrintable( r.check.reason ), qPrintable( r.check.search.result ) );
+            ASSERT_TRUE( r.check.exposureBound );
+            ASSERT_FALSE( r.check.evidence );
+            ASSERT_TRUE( identicalToMaster( r, master, room ) );
+        }
+    }
+
+    // The two boundary refusals, each by its own conjunct.
+    // A 5600 K stage LED solved to 6000 K: the surface is still a little amber there (B-R -4, chroma 4), which the loose
+    // daylight guard would accept. Only a strictly neutral surface is adopted directly; this one goes to the search,
+    // which finds the light's own neutral (warmer than 6000 K), so it stays night.
+    {
+        const WindowRoom room = roomNeutralAt( 5600, -5 );
+        const WindowLitRun r = runWindowLit( m16Raw(), room, 6000, -5 );
+        ASSERT_TRUE( std::fabs( r.check.solutionSurfaceBlueAmber ) >= 2.0 );
+        ASSERT_TRUE( r.check.search.result == QStringLiteral("converged") );
+        ASSERT_TRUE( r.check.search.temperature < kLookAssistNotNightMinTemperature );
+        ASSERT_TRUE( r.check.reason == QStringLiteral("not-daylight-locus") );
+        ASSERT_TRUE( r.scene == LookAssistScene::Night );
+        ASSERT_TRUE( identicalToMaster( r, runWindowLit( m16Raw(), room, 6000, -5, false ), room ) );
+    }
+    // A 5999 K LED solved to 6050 K: the surface IS strictly neutral there and the balance is not warmer than 6000 K, but
+    // at the 6000 K gate itself the surface is not measurably blue, so its own neutral is not shown to be bluer than the
+    // gate: it stays night.
+    {
+        const WindowRoom room = roomNeutralAt( 5999, -2 );
+        const WindowLitRun r = runWindowLit( m16Raw(), room, 6050, -2 );
+        ASSERT_TRUE( std::fabs( r.check.solutionSurfaceBlueAmber ) < 2.0 );
+        ASSERT_TRUE( r.check.search.result == QStringLiteral("not-run") );
+        ASSERT_TRUE( r.check.gateSurfaceBlueAmber < 2.0 );
+        ASSERT_TRUE( r.check.reason == QStringLiteral("not-blue-at-gate") );
+        ASSERT_TRUE( identicalToMaster( r, runWindowLit( m16Raw(), room, 6050, -2, false ), room ) );
+    }
+}
+
+TEST(LookAssistScene, TheSurfaceSearchConvergesToTheNeutralBalance)
+{
+    // From the base (6000 K / 0) and the solver's overshoot (9930 K / -33), wherever the surface is actually neutral.
+    struct Neutral { int kelvin; int tint; };
+    for( const Neutral n : { Neutral{ 6600, -3 }, Neutral{ 8000, -12 }, Neutral{ 5200, 4 }, Neutral{ 9500, -30 } } )
+    {
+        const WindowRoom room = roomNeutralAt( n.kelvin, n.tint );
+        const LookAssistSurfaceProbe base = probeAt( room, 6000, 0 );
+        const LookAssistSurfaceProbe solve = probeAt( room, 9930, -33 );
+        ASSERT_TRUE( base.surface.valid && solve.surface.valid );
+        const LookAssistRenderedPicture geometry = roomPicture( room, 6000, 0 );
+        const LookAssistSurfaceSearch s = searchLookAssistNeutralSurfaceBalance(
+            roomRenderer( room ), 1.2, geometry, base.surface.thumbnailX, base.surface.thumbnailY, daylightWindow(), base, solve );
+        std::fprintf( stderr, "SURFACE-SEARCH neutral=%d/%d result=%s found=%d/%d renders=%d\n", n.kelvin, n.tint,
+                      qPrintable( s.result ), s.temperature, s.tint, s.renders );
+        ASSERT_TRUE( s.result == QStringLiteral("converged") );
+        ASSERT_TRUE( s.converged );
+        ASSERT_TRUE( s.renders <= kLookAssistSurfaceSearchMaxRenders );
+        ASSERT_TRUE( std::fabs( 1.0e6 / s.temperature - 1.0e6 / n.kelvin ) <= 6.0 );
+        ASSERT_TRUE( qAbs( s.tint - n.tint ) <= 6 );
+        ASSERT_TRUE( std::fabs( s.surface.blueAmberAxis ) < 2.0 && std::fabs( s.surface.greenAxis ) < 2.0 );
+    }
+    // Already neutral at a probe: that probe is the answer, with no render at all.
+    const WindowRoom room = roomNeutralAt( 6000, 0 );
+    const LookAssistSurfaceProbe base = probeAt( room, 6000, 0 );
+    const LookAssistSurfaceSearch atBase = searchLookAssistNeutralSurfaceBalance(
+        roomRenderer( room ), 1.2, roomPicture( room, 6000, 0 ), base.surface.thumbnailX, base.surface.thumbnailY,
+        daylightWindow(), base, probeAt( room, 9930, -33 ) );
+    ASSERT_TRUE( atBase.converged );
+    ASSERT_EQ( 0, atBase.renders );
+    ASSERT_EQ( 6000, atBase.temperature );
+    ASSERT_EQ( 0, atBase.tint );
+}
+
+TEST(LookAssistScene, TheSurfaceSearchRefusesWhatItCannotVerify)
+{
+    const WindowRoom room = m16Room();
+    const LookAssistSurfaceProbe base = probeAt( room, 6000, 0 );
+    const LookAssistSurfaceProbe solve = probeAt( room, 9930, -33 );
+    const LookAssistRenderedPicture geometry = roomPicture( room, 6000, 0 );
+    const int x = base.surface.thumbnailX, y = base.surface.thumbnailY;
+    // No renderer.
+    ASSERT_TRUE( searchLookAssistNeutralSurfaceBalance( LookAssistRenderBalanceFn(), 1.2, geometry, x, y, daylightWindow(),
+                                                        base, solve ).result == QStringLiteral("unverifiable") );
+    // A render that fails.
+    const LookAssistSurfaceSearch failed = searchLookAssistNeutralSurfaceBalance(
+        []( double, int, int, LookAssistRenderedPicture * ) { return false; }, 1.2, geometry, x, y, daylightWindow(), base, solve );
+    ASSERT_TRUE( failed.result == QStringLiteral("unverifiable") );
+    ASSERT_FALSE( failed.converged );
+    ASSERT_EQ( 1, failed.renders );
+    // A render of another geometry: the pixel is not the same surface.
+    const LookAssistSurfaceSearch other = searchLookAssistNeutralSurfaceBalance(
+        [room]( double, int k, int t, LookAssistRenderedPicture *out ) {
+            *out = roomPicture( room, k, t ); out->downscaleFactor = kRoomDownscale + 1; return true; },
+        1.2, geometry, x, y, daylightWindow(), base, solve );
+    ASSERT_TRUE( other.result == QStringLiteral("unverifiable") );
+    ASSERT_FALSE( other.converged );
+    // A surface that was never measured.
+    LookAssistSurfaceProbe invalid = base;
+    invalid.surface.valid = false;
+    ASSERT_TRUE( searchLookAssistNeutralSurfaceBalance( roomRenderer( room ), 1.2, geometry, x, y, daylightWindow(),
+                                                        invalid, solve ).result == QStringLiteral("unverifiable") );
+    // A surface neutral only outside the window (tungsten, 3000 K): no neutral balance inside it, so no answer.
+    const WindowRoom tungsten = roomNeutralAt( 3000, 0 );
+    const LookAssistSurfaceSearch outside = searchLookAssistNeutralSurfaceBalance(
+        roomRenderer( tungsten ), 1.2, roomPicture( tungsten, 6000, 0 ), x, y, daylightWindow(),
+        probeAt( tungsten, 6000, 0 ), probeAt( tungsten, 9930, -33 ) );
+    ASSERT_TRUE( outside.result == QStringLiteral("not-converged") );
+    ASSERT_FALSE( outside.converged );
+    ASSERT_TRUE( outside.renders <= kLookAssistSurfaceSearchMaxRenders );
+
+    // Through the check: the search cannot verify (its renders fail), so no evidence and master's night, bit for bit.
+    const WindowLitRun master = runWindowLit( m16Raw(), room, 9930, -33, false );
+    const WindowLitRun r = runWindowLit( m16Raw(), room, 9930, -33, true, true, Renderer::FailsAfterVerification );
+    ASSERT_TRUE( r.check.exposureBound );
+    ASSERT_TRUE( r.check.search.result == QStringLiteral("unverifiable") );
+    ASSERT_TRUE( r.check.reason == QStringLiteral("unverified-at-solution") );
+    ASSERT_TRUE( identicalToMaster( r, master, room ) );
+    LookAssistDecisionTrace trace;
+    lookAssistTraceSurfaceSearch( &trace, r.check );
+    ASSERT_TRUE( lookAssistDecisionLogFields( r.stats, trace ).endsWith(
+        QStringLiteral("surface_search=unverifiable surface_search_balance=NA") ) );
+}
+
+TEST(LookAssistScene, EveryLiveNotNightConjunctIsNeededOnItsOwn)
+{
+    // Each case breaks exactly ONE conjunct of the M16 run (which applies); the verdict, receipt and picture stay master's.
+    const WindowRoom room = m16Room();
+    // The patch picture is not a lit picture (under 5 % of it at luma 100): a bright subject on a black field.
+    {
+        const WindowLitRun master = runWindowLit( m16Raw(), room, 9930, -33, false, true, Renderer::Room, 90.0 );
+        const WindowLitRun r = runWindowLit( m16Raw(), room, 9930, -33, true, true, Renderer::Room, 90.0 );
+        ASSERT_TRUE( r.check.reason == QStringLiteral("not-lit-picture") );
+        ASSERT_TRUE( identicalToMaster( r, master, room ) );
+        // ... and at the edge it holds.
+        ASSERT_TRUE( runWindowLit( m16Raw(), room, 9930, -33, true, true, Renderer::Room, 100.0 ).check.applies );
+    }
+    // The exposure does not rule night out: a dual-ISO recovery of 4 stops over a bound of 8 leaves 4.
+    {
+        const LookAssistStats raw = withBound( fixtureRawStats(), 100, 3906, 1600 );
+        const WindowLitRun r = runWindowLit( raw, room, 9930, -33 );
+        ASSERT_FALSE( r.check.exposureBound );
+        ASSERT_TRUE( r.check.reason == QStringLiteral("unverified-at-solution") );   // the colour-only check, measured
+        ASSERT_TRUE( identicalToMaster( r, runWindowLit( raw, room, 9930, -33, false ), room ) );
+    }
+    // The verified balance is warmer than 6000 K (a neutral surface under 5800 K light): not daylight.
+    {
+        const WindowRoom warm = roomNeutralAt( 5800, -3 );
+        const WindowLitRun r = runWindowLit( m16Raw(), warm, 9930, -33 );
+        ASSERT_TRUE( r.check.search.converged );
+        ASSERT_TRUE( r.check.search.temperature < kLookAssistNotNightMinTemperature );
+        ASSERT_TRUE( r.check.reason == QStringLiteral("not-daylight-locus") );
+        ASSERT_TRUE( identicalToMaster( r, runWindowLit( m16Raw(), warm, 9930, -33, false ), warm ) );
+    }
+    // The verified balance is off the daylight tint (+15: a green fluorescent correction), verified directly.
+    {
+        const WindowRoom green = roomNeutralAt( 7000, 15 );
+        const WindowLitRun r = runWindowLit( m16Raw(), green, 7000, 15 );
+        ASSERT_TRUE( r.check.reason == QStringLiteral("not-daylight-locus") );
+        ASSERT_TRUE( identicalToMaster( r, runWindowLit( m16Raw(), green, 7000, 15, false ), green ) );
+    }
+    // The solve was found on the RAW thumbnail: the check never gets to the search.
+    {
+        const WindowLitRun raw = runWindowLit( m16Raw(), room, 9930, -33, true, false );
+        ASSERT_TRUE( raw.check.reason == QStringLiteral("not-processed-solve") );
+        ASSERT_TRUE( identicalToMaster( raw, runWindowLit( m16Raw(), room, 9930, -33, false, false ), room ) );
+    }
+    // A recorded aperture: never a candidate, whatever the bound would have said.
+    {
+        const LookAssistStats recorded = withEv( fixtureRawStats(), 100, 737, 140 );   // EV100 10.9: not daylight-bright
+        const WindowLitRun r = runWindowLit( recorded, room, 9930, -33 );
+        ASSERT_FALSE( r.check.candidate );
+        ASSERT_TRUE( identicalToMaster( r, runWindowLit( recorded, room, 9930, -33, false ), room ) );
+    }
 }

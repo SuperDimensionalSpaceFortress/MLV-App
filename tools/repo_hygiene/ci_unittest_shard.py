@@ -1,98 +1,133 @@
-"""Deterministic module-level sharding of the repo-hygiene unittest suite for CI.
+"""Deterministic sharding of the repo-hygiene unittest suite for CI.
 
 ``python -m unittest discover -s tools/repo_hygiene -p "test_*.py" -t .`` ran as one
-step and took 39-61 minutes on the hosted Windows runner. This splits that same
-discovery into N shards that run on parallel runners. A shard is a set of whole test
-modules, assigned by longest-processing-time-first over the measured per-module
-seconds below, so the split is stable and a new test file is picked up automatically
-(it is weighted at ``DEFAULT_WEIGHT_SECONDS``) instead of being silently omitted.
+step: 24 minutes on the hosted ubuntu runner and 39-61 minutes on the hosted Windows
+one. This splits that same discovery into N shards that run on parallel runners.
 
-Coverage is proven, not assumed: ``--verify-partition`` loads every shard and fails
-unless the shards are disjoint, together cover every discovered module, and together
-hold exactly the number of tests that plain ``unittest discover`` collects.
+A shard is a set of whole test classes (``module.Class``), assigned by
+longest-processing-time-first over the measured seconds in
+``ci_unittest_shard_weights.json`` (one table per runner OS, derived from hosted CI
+logs by ``ci_unittest_shard_timings``). Classes, not modules, are the unit because one
+module (``test_dual_venue_evidence``) alone is about 850 s on Windows and cannot be
+balanced whole. The split is stable, and a test class the table does not know is
+weighted by its test count, so a new test file is picked up automatically instead of
+being silently omitted.
+
+Coverage is proven, not assumed: ``--verify-partition`` fails unless every shard's test
+ids, taken together, are exactly the ids plain ``unittest discover`` collects, each
+once, and no module failed to import.
 """
 
 from __future__ import annotations
 
 import argparse
+import json
+import os
 import sys
 import unittest
+from collections.abc import Iterator
 from pathlib import Path
 
 START_DIR = "tools/repo_hygiene"
 PATTERN = "test_*.py"
 TOP_LEVEL_DIR = "."
-DEFAULT_WEIGHT_SECONDS = 10
-
-# Seconds per module on hosted windows-latest (PR #225, run 36992317962). Only the
-# modules that matter for balancing are listed; the rest take DEFAULT_WEIGHT_SECONDS.
-MEASURED_SECONDS = {
-    "tools.repo_hygiene.test_dual_venue_evidence": 786,
-    "tools.repo_hygiene.test_brokered_closeout": 546,
-    "tools.repo_hygiene.test_playback_attr_3_cuda_behaviour": 468,
-    "tools.repo_hygiene.test_playback_clip_length_gate": 372,
-    "tools.repo_hygiene.test_attr3_footage_stage": 210,
-    "tools.repo_hygiene.test_playback_evidence_completeness": 126,
-    "tools.repo_hygiene.test_playback_launcher_receipt_oracle": 114,
-    "tools.repo_hygiene.test_um_run_sidefiles": 108,
-    "tools.repo_hygiene.test_playback_receipt_run_binding": 72,
-    "tools.repo_hygiene.test_playback_host_load_gate": 66,
-    "tools.repo_hygiene.test_attr3_owner_clip_stage_stall": 60,
-    "tools.repo_hygiene.test_playback_attr_3_cuda_contact_sheet": 54,
-}
+DEFAULT_TEST_SECONDS = 0.5
+PROFILES = ("windows", "ubuntu")
+WEIGHTS_PATH = Path(__file__).with_name("ci_unittest_shard_weights.json")
 
 
-def discover_modules(repo_root: Path) -> list[str]:
-    """Dotted names of the test modules ``unittest discover`` finds, sorted."""
-    start = repo_root / START_DIR
-    return sorted(
-        ".".join((*Path(START_DIR).parts, path.stem))
-        for path in start.glob(PATTERN)
-        if path.is_file()
-    )
+def load_weights(profile: str, path: Path = WEIGHTS_PATH) -> dict[str, float]:
+    """Measured seconds per ``module.Class`` for one runner OS."""
+    table = json.loads(path.read_text(encoding="utf-8"))["seconds"]
+    if profile not in table:
+        raise ValueError(f"no weight table for profile {profile!r}; have {sorted(table)}")
+    return {name: float(seconds) for name, seconds in table[profile].items()}
 
 
-def assign(modules: list[str], shards: int) -> list[list[str]]:
-    """Longest-processing-time-first split of ``modules`` into ``shards`` lists."""
+def _flatten(suite: unittest.TestSuite) -> Iterator[unittest.TestCase]:
+    for item in suite:
+        if isinstance(item, unittest.TestSuite):
+            yield from _flatten(item)
+        else:
+            yield item
+
+
+def unit_key(test: unittest.TestCase) -> str:
+    kind = type(test)
+    return f"{kind.__module__}.{kind.__qualname__}"
+
+
+def collect_tests() -> list[unittest.TestCase]:
+    """Every test ``unittest discover`` collects, in its order. Run from the repo root."""
+    suite = unittest.TestLoader().discover(START_DIR, pattern=PATTERN, top_level_dir=TOP_LEVEL_DIR)
+    return list(_flatten(suite))
+
+
+def import_failures(tests: list[unittest.TestCase]) -> list[str]:
+    """Ids of modules that failed to import; ``discover`` reports them as failing tests."""
+    return [test.id() for test in tests if type(test).__name__ == "_FailedTest"]
+
+
+def group_units(tests: list[unittest.TestCase]) -> dict[str, list[unittest.TestCase]]:
+    units: dict[str, list[unittest.TestCase]] = {}
+    for test in tests:
+        units.setdefault(unit_key(test), []).append(test)
+    return units
+
+
+def unit_weight(key: str, count: int, weights: dict[str, float]) -> float:
+    return weights.get(key, DEFAULT_TEST_SECONDS * count)
+
+
+def assign(units: dict[str, int], shards: int, weights: dict[str, float]) -> list[list[str]]:
+    """Longest-processing-time-first split of ``units`` (key -> test count) into shards."""
     if shards < 1:
         raise ValueError("shards must be at least 1")
-    ordered = sorted(
-        modules, key=lambda name: (-MEASURED_SECONDS.get(name, DEFAULT_WEIGHT_SECONDS), name)
-    )
-    loads = [0] * shards
+    ordered = sorted(units, key=lambda key: (-unit_weight(key, units[key], weights), key))
+    loads = [0.0] * shards
     buckets: list[list[str]] = [[] for _ in range(shards)]
-    for name in ordered:
+    for key in ordered:
         target = min(range(shards), key=lambda index: (loads[index], index))
-        buckets[target].append(name)
-        loads[target] += MEASURED_SECONDS.get(name, DEFAULT_WEIGHT_SECONDS)
+        buckets[target].append(key)
+        loads[target] += unit_weight(key, units[key], weights)
     return [sorted(bucket) for bucket in buckets]
 
 
-def load(names: list[str]) -> unittest.TestSuite:
-    loader = unittest.TestLoader()
-    return unittest.TestSuite(loader.loadTestsFromName(name) for name in names)
+def shard_tests(units: dict[str, list[unittest.TestCase]], bucket: list[str]) -> list[unittest.TestCase]:
+    """The bucket's tests, class-contiguous and module-contiguous so fixtures run once."""
+    return [test for key in sorted(bucket) for test in units[key]]
 
 
-def verify_partition(repo_root: Path, shards: int) -> int:
-    modules = discover_modules(repo_root)
-    buckets = assign(modules, shards)
+def plan(profile: str, shards: int) -> tuple[list[unittest.TestCase], dict[str, list[unittest.TestCase]], list[list[str]]]:
+    tests = collect_tests()
+    units = group_units(tests)
+    buckets = assign({key: len(items) for key, items in units.items()}, shards, load_weights(profile))
+    return tests, units, buckets
+
+
+def verify_partition(profile: str, shards: int) -> int:
+    tests, units, buckets = plan(profile, shards)
+    weights = load_weights(profile)
     problems: list[str] = []
-    flat = [name for bucket in buckets for name in bucket]
-    if sorted(flat) != modules:
-        problems.append("shards are not a disjoint cover of the discovered modules")
-    expected = unittest.TestLoader().discover(
-        START_DIR, pattern=PATTERN, top_level_dir=TOP_LEVEL_DIR
-    ).countTestCases()
-    total = 0
+    for failed in import_failures(tests):
+        problems.append(f"a test module failed to import: {failed}")
+    expected = sorted(test.id() for test in tests)
+    covered: list[str] = []
     for index, bucket in enumerate(buckets, start=1):
-        count = load(bucket).countTestCases()
-        total += count
-        print(f"shard {index}/{shards}: {len(bucket)} modules, {count} tests")
-        if not bucket or count == 0:
+        members = shard_tests(units, bucket)
+        covered.extend(test.id() for test in members)
+        estimate = sum(unit_weight(key, len(units[key]), weights) for key in bucket)
+        print(f"shard {index}/{shards}: {len(bucket)} classes, {len(members)} tests, ~{estimate:.0f} s estimated")
+        if not members:
             problems.append(f"shard {index} holds no tests")
-    print(f"discover: {len(modules)} modules, {expected} tests; shards total {total}")
-    if total != expected:
-        problems.append(f"shards hold {total} tests but discover collects {expected}")
+    print(f"discover: {len({unit_key(t) for t in tests})} classes, {len(expected)} tests; shards total {len(covered)}")
+    if sorted(covered) != expected:
+        missing = sorted(set(expected) - set(covered))
+        extra = sorted(set(covered) - set(expected))
+        problems.append(
+            f"shards are not an exact cover of discover: {len(missing)} missing, "
+            f"{len(extra)} extra, {len(covered) - len(set(covered))} repeated"
+        )
     for problem in problems:
         print(f"ERROR: {problem}", file=sys.stderr)
     return 1 if problems else 0
@@ -101,26 +136,39 @@ def verify_partition(repo_root: Path, shards: int) -> int:
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     parser.add_argument("--repo-root", default=".")
+    parser.add_argument("--profile", choices=PROFILES, required=True, help="runner OS weight table")
     parser.add_argument("--of", type=int, required=True, help="total number of shards")
     parser.add_argument("--shard", type=int, help="1-based shard to run")
     parser.add_argument("--verify-partition", action="store_true")
-    parser.add_argument("--list", action="store_true", help="print the shard's modules and exit")
+    parser.add_argument("--list", action="store_true", help="print the shard's classes and exit")
+    parser.add_argument("--list-tests", action="store_true", help="print the shard's test ids and exit")
     args = parser.parse_args(argv)
     repo_root = Path(args.repo_root).resolve()
+    sys.path.insert(0, str(repo_root))
+    os.chdir(repo_root)
 
     if args.verify_partition:
-        return verify_partition(repo_root, args.of)
+        return verify_partition(args.profile, args.of)
     if args.shard is None or not 1 <= args.shard <= args.of:
         parser.error("--shard must be between 1 and --of")
-    bucket = assign(discover_modules(repo_root), args.of)[args.shard - 1]
-    if not bucket:
-        print(f"ERROR: shard {args.shard}/{args.of} holds no test modules", file=sys.stderr)
+    tests, units, buckets = plan(args.profile, args.of)
+    failures = import_failures(tests)
+    if failures:
+        print("ERROR: a test module failed to import: " + ", ".join(failures), file=sys.stderr)
+        return 1
+    bucket = buckets[args.shard - 1]
+    members = shard_tests(units, bucket)
+    if not members:
+        print(f"ERROR: shard {args.shard}/{args.of} holds no tests", file=sys.stderr)
         return 1
     if args.list:
         print("\n".join(bucket))
         return 0
-    print(f"shard {args.shard}/{args.of}: {len(bucket)} modules", flush=True)
-    result = unittest.TextTestRunner(verbosity=2).run(load(bucket))
+    if args.list_tests:
+        print("\n".join(test.id() for test in members))
+        return 0
+    print(f"shard {args.shard}/{args.of}: {len(bucket)} classes, {len(members)} tests", flush=True)
+    result = unittest.TextTestRunner(verbosity=2).run(unittest.TestSuite(members))
     if result.testsRun == 0:
         print("ERROR: no tests ran", file=sys.stderr)
         return 5

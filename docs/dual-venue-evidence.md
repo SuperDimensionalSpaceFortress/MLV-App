@@ -301,10 +301,13 @@ path; the pair is its own record (`mlv-app/dual-venue-sheet-pair/v1`) because re
   `lookFlavorHonored` = the report equals the requested flavor (`true`), anything else is `false` (another
   flavor, or an app that reported nothing = `none`). `"unknown"` is only for a job that never ran. The sheet
   pair's `lookFlavorHonored` is `true` only when both legs' receipts say `true`.
-  **No cinematic leg spec ships yet** (DVE-SCALE2-LOOK-LEG-1 held it back until the app could select and report a flavor);
-  with the app now reporting the flavor, a cinematic leg is a follow-up spec card, not part of this change.
-* Shipped look legs: `m16-1243-look` (Classic, requests scale 4, cuda and cpu) and `m16-1243-look-scale2` (the Classic leg at
-  `scaleFactor` 2, **cpu only**). See "Requested scale and rendered scale" below for why the scale-2 leg has no CUDA backend.
+  The Cinematic leg ships as `m16-1243-look-cinematic` (VENUE-CINEMATIC-SPEC-1): the Classic leg with `look.lookFlavor` `cinematic` and one
+  extra criterion per list, `lookFlavorReported eq "cinematic"`. `lookFlavorReported` is the app's own **applied** flavor, and the app reports `none`
+  (never the requested flavor) when the analysis fell back to Classic or its diagnostics are not valid, so a fallback fails the leg instead of
+  passing under a Cinematic label.
+* Shipped look legs: `m16-1243-look` (Classic, requests scale 4, cuda and cpu), `m16-1243-look-cinematic` (the Classic leg asking for the
+  Cinematic flavor, cuda and cpu) and `m16-1243-look-scale2` (the Classic leg at `scaleFactor` 2, **cpu only**). See "Requested scale and
+  rendered scale" below for why the scale-2 leg has no CUDA backend.
 * The sheet copy (`-SheetCopyDir`) and the pair files carry the **leg id** --
   `sheet-<legId>-<venue>-<backend>-<flavor>.png`, `sheet-<legId>-<venue>-cuda-vs-cpu-<flavor>.png`,
   `sheet-pair-<legId>-<venue>-<flavor>.json` -- so the scale-4 and scale-2 look legs of one venue cannot overwrite

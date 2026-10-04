@@ -6,6 +6,8 @@ on:
   push:
     branches:
       - master
+  merge_group:
+    types: [checks_requested]
 
 permissions:
   contents: read
@@ -27,7 +29,7 @@ jobs:
       tree: ${{ steps.route.outputs.tree }}
       diff_sha256: ${{ steps.route.outputs.diff_sha256 }}
     env:
-      ROUTER_BASE: ${{ github.event_name == 'pull_request' && github.event.pull_request.base.sha || (github.event_name == 'push' && github.event.before || '') }}
+      ROUTER_BASE: ${{ github.event_name == 'pull_request' && github.event.pull_request.base.sha || (github.event_name == 'push' && github.event.before || (github.event_name == 'merge_group' && github.event.merge_group.base_sha || '')) }}
       ROUTER_HEAD: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.sha || github.sha }}
 
     steps:
@@ -51,6 +53,9 @@ jobs:
           if ('${{ github.event_name }}' -eq 'workflow_dispatch') {
             $forceReal = @('--force-real')
           }
+          if ('${{ github.event_name }}' -eq 'merge_group') {
+            $forceReal = @('--merge-group')
+          }
           python tools/repo_hygiene/protected_check_router.py `
             --repo-root . `
             --base "$env:ROUTER_BASE" `
@@ -67,70 +72,19 @@ jobs:
           if-no-files-found: error
           retention-days: 30
 
-  repo-hygiene-python:
-    name: Repo Hygiene Python (${{ matrix.os }})
-    runs-on: ${{ matrix.os }}
-    # ubuntu finishes in 16-24 min. The windows-latest leg of this check is the
-    # aggregator job below: the same suite on one Windows runner took 39-61 min (73.5 on
-    # PR #225), so it is sharded across parallel runners instead of sharing one cap.
-    timeout-minutes: 75
+  repo-hygiene-python-ubuntu-shard:
+    name: Repo Hygiene Python ubuntu shard ${{ matrix.shard }}/4
+    runs-on: ubuntu-latest
+    # The whole suite on one ubuntu runner took 16-24 min. Shards 1-3 each run a third of
+    # the unittest classes (about 7.5 min measured) and shard 4 runs the remaining steps,
+    # so a shard is expected at 8-10 min including setup. 30 leaves 3x for runner variance.
+    # The `Repo Hygiene Python (ubuntu-latest)` check that branch protection pins is the
+    # aggregator job below.
+    timeout-minutes: 30
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-latest]
-
-    steps:
-      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
-        with:
-          persist-credentials: false
-          fetch-depth: 0
-
-      - name: Set up Python
-        uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6
-        with:
-          python-version-file: ".python-version"
-
-      - name: Install repo hygiene test dependencies
-        shell: pwsh -NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -Command "$ErrorActionPreference = 'Stop'; $PSNativeCommandUseErrorActionPreference = $true; . '{0}'"
-        run: |
-          python -m pip install --disable-pip-version-check --no-input --only-binary=:all: --require-hashes -r .github/requirements/pip.txt
-          python -m pip install --disable-pip-version-check --no-input --only-binary=:all: --require-hashes -r .github/requirements/repo-hygiene.txt
-          python -m pip check
-
-      - name: Run repo hygiene Python tests
-        # Guarded pwsh: the default wrapper ends with only the LAST command's exit code,
-        # so a failing `unittest discover` above a passing command could stay green. The
-        # shell template fails closed on the first failing native command.
-        shell: pwsh -NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -Command "$ErrorActionPreference = 'Stop'; $PSNativeCommandUseErrorActionPreference = $true; . '{0}'"
-        run: |
-          # Directory target: a new tools/repo_hygiene/test_*.py file is collected
-          # automatically, unlike the per-file list this replaced. A named-file
-          # inclusion list silently omits every file it forgets to name.
-          python -m unittest discover -s tools/repo_hygiene -p "test_*.py" -t . -v
-          python -m unittest tools.release.test_release_evidence -v
-          python -m unittest tools.gates.test_output_budget -v
-          python -m tools.repo_hygiene.pipeline_golden_provenance --repo-root .
-          python -m tools.repo_hygiene.vendored_native_payloads --repo-root .
-          python tools/repo-hygiene/hygiene.py --repo-root . verify-policy
-
-      - name: Check pinned instruction tokens
-        run: python tools/docs/check_pinned_tokens.py
-
-      - name: K9 pushed-tree resumability witness
-        run: python -m tools.repo_hygiene.k9_witness tree HEAD
-
-  repo-hygiene-python-windows-shard:
-    name: Repo Hygiene Python windows shard ${{ matrix.shard }}/5
-    runs-on: windows-latest
-    # One Windows runner took 39-61 min for the whole suite (73.5 min on PR #225, cap 75).
-    # Shards 1-4 each run a quarter of the unittest modules (about 15 min measured) and
-    # shard 5 runs the pytest guardrails plus the remaining steps (about 13 min), so a
-    # shard is expected at 15-20 min including setup. 40 leaves 2x for runner variance.
-    timeout-minutes: 40
-    strategy:
-      fail-fast: false
-      matrix:
-        shard: [1, 2, 3, 4, 5]
+        shard: [1, 2, 3, 4]
 
     steps:
       - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
@@ -151,18 +105,97 @@ jobs:
           python -m pip check
 
       - name: Prove the unittest shards cover every discovered test
-        # Fails unless shards 1-4 are disjoint, cover every module `unittest discover`
-        # finds, and hold exactly the test count it collects.
+        # Fails unless shards 1-3 hold exactly the test ids that
+        # `unittest discover -s tools/repo_hygiene -p "test_*.py" -t .` collects, each once.
+        # A new tools/repo_hygiene/test_*.py file is collected automatically; a named-file
+        # inclusion list would silently omit every file it forgets to name.
         shell: pwsh -NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -Command "$ErrorActionPreference = 'Stop'; $PSNativeCommandUseErrorActionPreference = $true; . '{0}'"
-        run: python -m tools.repo_hygiene.ci_unittest_shard --of 4 --verify-partition
+        run: python -m tools.repo_hygiene.ci_unittest_shard --profile ubuntu --of 3 --verify-partition
 
-      - name: Run repo hygiene unittest shard ${{ matrix.shard }}/4
-        if: matrix.shard <= 4
+      - name: Run repo hygiene unittest shard ${{ matrix.shard }}/3
+        if: matrix.shard <= 3
+        # Guarded pwsh: the default wrapper ends with only the LAST command's exit code,
+        # so a failing command above a passing one could stay green. The shell template
+        # fails closed on the first failing native command.
         shell: pwsh -NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -Command "$ErrorActionPreference = 'Stop'; $PSNativeCommandUseErrorActionPreference = $true; . '{0}'"
-        run: python -m tools.repo_hygiene.ci_unittest_shard --of 4 --shard ${{ matrix.shard }}
+        run: python -m tools.repo_hygiene.ci_unittest_shard --profile ubuntu --of 3 --shard ${{ matrix.shard }}
 
       - name: Run repo hygiene tail steps
-        if: matrix.shard == 5
+        if: matrix.shard == 4
+        shell: pwsh -NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -Command "$ErrorActionPreference = 'Stop'; $PSNativeCommandUseErrorActionPreference = $true; . '{0}'"
+        run: |
+          python -m unittest tools.release.test_release_evidence -v
+          python -m unittest tools.gates.test_output_budget -v
+          python -m tools.repo_hygiene.pipeline_golden_provenance --repo-root .
+          python -m tools.repo_hygiene.vendored_native_payloads --repo-root .
+          python tools/repo-hygiene/hygiene.py --repo-root . verify-policy
+          python tools/docs/check_pinned_tokens.py
+          python -m tools.repo_hygiene.k9_witness tree HEAD
+
+  repo-hygiene-python:
+    # Keeps the required status-check name `Repo Hygiene Python (ubuntu-latest)` that branch
+    # protection pins. It succeeds only when every ubuntu shard job succeeded: a failed,
+    # timed-out, skipped or cancelled shard makes the check fail. `if: always()` (not
+    # `!cancelled()`) keeps it running when the whole run is cancelled, so a cancel leaves
+    # the required check failed rather than condition-skipped, which GitHub accepts.
+    name: Repo Hygiene Python (ubuntu-latest)
+    needs: repo-hygiene-python-ubuntu-shard
+    if: ${{ always() }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Require every ubuntu shard to have passed
+        env:
+          SHARDS_RESULT: ${{ needs.repo-hygiene-python-ubuntu-shard.result }}
+        run: |
+          echo "ubuntu shard matrix result: $SHARDS_RESULT"
+          test "$SHARDS_RESULT" = "success"
+
+  repo-hygiene-python-windows-shard:
+    name: Repo Hygiene Python windows shard ${{ matrix.shard }}/8
+    runs-on: windows-latest
+    # One Windows runner took 39-61 min for the whole suite (73.5 min on PR #225, cap 75).
+    # Shards 1-7 each run a seventh of the unittest classes, weighted by measured seconds
+    # (about 9.5 min of tests), and shard 8 runs the pytest guardrails plus the remaining
+    # steps (about 11 min), so a shard is expected at 10-12 min including setup. 40 leaves
+    # more than 3x for runner variance.
+    timeout-minutes: 40
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: [1, 2, 3, 4, 5, 6, 7, 8]
+
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+        with:
+          persist-credentials: false
+          fetch-depth: 0
+
+      - name: Set up Python
+        uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6
+        with:
+          python-version-file: ".python-version"
+
+      - name: Install repo hygiene test dependencies
+        shell: pwsh -NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -Command "$ErrorActionPreference = 'Stop'; $PSNativeCommandUseErrorActionPreference = $true; . '{0}'"
+        run: |
+          python -m pip install --disable-pip-version-check --no-input --only-binary=:all: --require-hashes -r .github/requirements/pip.txt
+          python -m pip install --disable-pip-version-check --no-input --only-binary=:all: --require-hashes -r .github/requirements/repo-hygiene.txt
+          python -m pip check
+
+      - name: Prove the unittest shards cover every discovered test
+        # Fails unless shards 1-7 hold exactly the test ids `unittest discover` collects,
+        # each once.
+        shell: pwsh -NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -Command "$ErrorActionPreference = 'Stop'; $PSNativeCommandUseErrorActionPreference = $true; . '{0}'"
+        run: python -m tools.repo_hygiene.ci_unittest_shard --profile windows --of 7 --verify-partition
+
+      - name: Run repo hygiene unittest shard ${{ matrix.shard }}/7
+        if: matrix.shard <= 7
+        shell: pwsh -NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -Command "$ErrorActionPreference = 'Stop'; $PSNativeCommandUseErrorActionPreference = $true; . '{0}'"
+        run: python -m tools.repo_hygiene.ci_unittest_shard --profile windows --of 7 --shard ${{ matrix.shard }}
+
+      - name: Run repo hygiene tail steps
+        if: matrix.shard == 8
         shell: pwsh -NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -Command "$ErrorActionPreference = 'Stop'; $PSNativeCommandUseErrorActionPreference = $true; . '{0}'"
         run: |
           python -m unittest tools.release.test_release_evidence -v
@@ -174,7 +207,7 @@ jobs:
           python -m tools.repo_hygiene.k9_witness tree HEAD
 
       - name: Run coordination and self-healing guardrails
-        if: matrix.shard == 5
+        if: matrix.shard == 8
         shell: pwsh
         run: |
           python -m pytest `
@@ -183,7 +216,7 @@ jobs:
             -q
 
       - name: Run demote-factory-bridge refusal-path tests
-        if: matrix.shard == 5
+        if: matrix.shard == 8
         shell: pwsh
         run: |
           python -m pytest `
@@ -191,7 +224,7 @@ jobs:
             -q
 
       - name: Verify generated Python dependency locks
-        if: matrix.shard == 5
+        if: matrix.shard == 8
         shell: pwsh -NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -Command "$ErrorActionPreference = 'Stop'; $PSNativeCommandUseErrorActionPreference = $true; . '{0}'"
         run: |
           python -m venv "$env:RUNNER_TEMP\python-lock-tools"
@@ -217,12 +250,20 @@ jobs:
           echo "windows shard matrix result: $SHARDS_RESULT"
           test "$SHARDS_RESULT" = "success"
 
-  windows-product-oracles:
-    name: Windows Product Oracles
+  windows-product-oracles-part:
+    name: Windows Product Oracles part ${{ matrix.part }}/3
     needs: protected-check-route
     if: ${{ always() && !cancelled() }}
     runs-on: windows-latest
-    timeout-minutes: 120
+    # The whole oracle set on one runner took about 25 min: 6 min of Qt install and builds,
+    # 16 min of sequential pipeline shards, 2 min of display parity. The three parts run
+    # in parallel (about 10-12 min each); the `Windows Product Oracles` check that branch
+    # protection pins is the aggregator job below. 60 leaves 5x for runner variance.
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        part: [1, 2, 3]
 
     defaults:
       run:
@@ -252,7 +293,7 @@ jobs:
           if ($route -eq 'false' -and $reason -ne 'EXPLICIT_NA_PROVIDER_CONTROL_ONLY') {
             throw "product N/A lacks the exact provider-only reason"
           }
-          if ($route -eq 'true' -and $reason -notin @('ROUTER_CONTROL_CHANGED_RUN_REAL_ORACLES', 'UNKNOWN_OR_PRODUCT_PATH_RUN_REAL_ORACLES', 'MANUAL_DISPATCH_RUN_REAL_ORACLES')) {
+          if ($route -eq 'true' -and $reason -notin @('ROUTER_CONTROL_CHANGED_RUN_REAL_ORACLES', 'UNKNOWN_OR_PRODUCT_PATH_RUN_REAL_ORACLES', 'MANUAL_DISPATCH_RUN_REAL_ORACLES', 'MERGE_GROUP_RUN_REAL_ORACLES')) {
             throw "product run lacks a recognized fail-closed reason"
           }
 
@@ -272,12 +313,12 @@ jobs:
           if ($actualTree -ne $expectedTree) { throw "product checkout tree mismatch" }
 
       - name: Test screenshot fresh-render provenance gate
-        if: needs.protected-check-route.outputs.product == 'true'
+        if: needs.protected-check-route.outputs.product == 'true' && matrix.part == 1
         run: |
           & tools\profiling\test-gui-smoke-screenshot-provenance.ps1
 
       - name: Test color-artifact scan capture-invalid contract
-        if: needs.protected-check-route.outputs.product == 'true'
+        if: needs.protected-check-route.outputs.product == 'true' && matrix.part == 1
         run: |
           & tools\profiling\test-gui-smoke-color-artifact-scan.ps1
 
@@ -338,7 +379,7 @@ jobs:
           Add-Content -Path $env:GITHUB_ENV -Value "MINGW_ROOT=$mingwRoot"
 
       - name: Build console_tests
-        if: needs.protected-check-route.outputs.product == 'true'
+        if: needs.protected-check-route.outputs.product == 'true' && matrix.part == 1
         shell: pwsh -NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -Command "$ErrorActionPreference = 'Stop'; $PSNativeCommandUseErrorActionPreference = $true; . '{0}'"
         run: |
           $env:PATH = "$env:QT_ROOT_DIR\bin;$env:MINGW_ROOT\bin;$env:PATH"
@@ -349,7 +390,7 @@ jobs:
           Pop-Location
 
       - name: Run console_tests --check-golden
-        if: needs.protected-check-route.outputs.product == 'true'
+        if: needs.protected-check-route.outputs.product == 'true' && matrix.part == 1
         run: |
           $env:PATH = "$env:QT_ROOT_DIR\bin;$env:MINGW_ROOT\bin;$env:PATH"
           & "tests\build-ci-console\release\console_tests.exe" --check-golden
@@ -417,6 +458,37 @@ jobs:
             throw "pipeline shards do not cover each test exactly once (tests=$($testNames.Count) sharded=$($shardedNames.Count))"
           }
           Write-Output ("pipeline shard plan: tests={0} shards={1}" -f $testNames.Count, $shards.Count)
+          # Split the plan across the parallel parts. Every part computes the same full plan
+          # and the same assignment, then runs only its own shards; the checks below prove the
+          # parts are a disjoint cover, so the union of what the parts run is the one plan
+          # above. Greedy longest-first onto the least-loaded part, seeded with the other
+          # oracle work a part carries (part 1: console_tests build and golden check; part 2:
+          # golden producers, stress, and display parity). Estimates, not bounds: the 240-second
+          # child bound below is what limits a shard.
+          $partCount = 3
+          $part = [int]'${{ matrix.part }}'
+          $partLoad = @(200.0, 140.0, 0.0)
+          $partOf = @{}
+          $planOrder = @($shards | Sort-Object @{ Expression = { if ($_.Name -match '-solo') { 0 } else { 1 } } }, @{ Expression = { $_.Name } })
+          foreach ($planned in $planOrder) {
+            $target = 0
+            for ($candidate = 1; $candidate -lt $partCount; $candidate++) {
+              if ($partLoad[$candidate] -lt $partLoad[$target]) { $target = $candidate }
+            }
+            $partOf[$planned.Name] = $target + 1
+            $partLoad[$target] += $(if ($planned.Name -match '-solo') { 30.0 } else { 17.0 })
+          }
+          $partShardCounts = @(1..$partCount | ForEach-Object { $number = $_; @($shards | Where-Object { $partOf[$_.Name] -eq $number }).Count })
+          if ($partOf.Count -ne $shards.Count -or
+              (($partShardCounts | Measure-Object -Sum).Sum) -ne $shards.Count -or
+              @($partShardCounts | Where-Object { $_ -eq 0 }).Count -ne 0) {
+            throw "pipeline parts do not cover each shard exactly once (shards=$($shards.Count) parts=$($partShardCounts -join ','))"
+          }
+          $myShards = @($shards | Where-Object { $partOf[$_.Name] -eq $part })
+          $myTestNames = @($myShards | ForEach-Object { $_.Filter -split ':' })
+          Write-Output ("PIPELINE-PART-PLAN part={0}/{1} shards={2}/{3} tests={4}/{5} estimatedSeconds={6}" -f $part, $partCount, $myShards.Count, $shards.Count, $myTestNames.Count, $testNames.Count, $partLoad[$part - 1])
+          Write-Output ("PIPELINE-PART-SHARDS part={0} {1}" -f $part, (($myShards | ForEach-Object { $_.Name }) -join ','))
+          Write-Output ("PIPELINE-PART-TESTS part={0} {1}" -f $part, ($myTestNames -join ','))
           function Invoke-BoundedPipelineShard {
             param(
               [string]$Name,
@@ -453,7 +525,7 @@ jobs:
               TimedOut = $timedOut
             }
           }
-          foreach ($shard in $shards) {
+          foreach ($shard in $myShards) {
             $shardOutput = Join-Path $env:RUNNER_TEMP ("pipeline-tests-{0}.txt" -f $shard.Name)
             Add-Content -Path $suiteOutput -Value ("===== SHARD {0} FILTER {1} =====" -f $shard.Name, $shard.Filter)
             $shardResult = Invoke-BoundedPipelineShard -Name $shard.Name -Arguments @("--gtest_filter=$($shard.Filter)") -OutputPath $shardOutput
@@ -476,132 +548,136 @@ jobs:
             }
           }
 
-          # Golden disposition B: one complete producer-only process owns the
-          # fail-closed report-all comparison. The reviewable key-to-test map is
-          # checked against the committed artifact before the filter is derived,
-          # so a key or producer cannot silently fall out of coverage.
-          $goldenKeyToProducer = [ordered]@{
-            'tiny_dual_iso.debayer.amaze.cpu.frame0' = 'BackendParametricDebayerShell.CpuRenderDebayerAmazeProducesStableHash'
-            'tiny_dual_iso.debayer.bilinear.cpu.frame0' = 'BackendParametricDebayerShell.CpuRenderDebayerBilinearProducesStableHash'
-            'tiny_dual_iso.full16.frame0' = 'DualIsoPipeline.TinyDualIsoFullFramesMatchGolden'
-            'tiny_dual_iso.full16.frame1' = 'DualIsoPipeline.TinyDualIsoFullFramesMatchGolden'
-            'tiny_dual_iso.gpu_preview_subset.exposure_0_75.frame0' = 'GpuPreviewProcessing.ExposureStopsChangesSubsetConfigAndStableOutput'
-            'tiny_dual_iso.gpu_preview_subset.exposure_0_75.signature.frame0' = 'GpuPreviewProcessing.ExposureStopsChangesSubsetConfigAndStableOutput'
-            'tiny_dual_iso.gpu_preview_subset.frame0' = 'GpuPreviewProcessing.TinyDualIsoReceiptSubsetGoldenOutputIsStable'
-            'tiny_dual_iso.gpu_preview_subset.frame1' = 'GpuPreviewProcessing.TinyDualIsoReceiptSubsetGoldenOutputIsStable'
-            'tiny_dual_iso.gpu_preview_subset.signature.frame0' = 'GpuPreviewProcessing.TinyDualIsoReceiptSubsetGoldenOutputIsStable'
-            'tiny_dual_iso.gpu_preview_subset.signature.frame1' = 'GpuPreviewProcessing.TinyDualIsoReceiptSubsetGoldenOutputIsStable'
-            'tiny_dual_iso.preview16.frame0' = 'DualIsoPipeline.TinyDualIsoPreviewFramesMatchGoldenAndStayCloseToFull'
-            'tiny_dual_iso.preview16.frame1' = 'DualIsoPipeline.TinyDualIsoPreviewFramesMatchGoldenAndStayCloseToFull'
-            'tiny_dual_iso.preview16_vs_full_psnr.frame0' = 'DualIsoPipeline.TinyDualIsoPreviewFramesMatchGoldenAndStayCloseToFull'
-            'tiny_dual_iso.preview16_vs_full_psnr.frame1' = 'DualIsoPipeline.TinyDualIsoPreviewFramesMatchGoldenAndStayCloseToFull'
-            'tiny_dual_iso.preview_processing.cpu.frame0' = 'BackendParametricShell.CpuRenderPreviewProcessingSubsetProducesStableHash'
-          }
-          $goldenPath = (Resolve-Path 'tests\fixtures\golden\pipeline_hashes.json').Path
-          $goldenExpected = Get-Content -LiteralPath $goldenPath -Raw | ConvertFrom-Json -AsHashtable
-          $expectedGoldenKeys = @($goldenExpected.Keys | Sort-Object)
-          $mappedGoldenKeys = @($goldenKeyToProducer.Keys | Sort-Object)
-          $mappingDelta = @(Compare-Object -ReferenceObject $expectedGoldenKeys -DifferenceObject $mappedGoldenKeys)
-          if ($mappingDelta.Count -ne 0) {
-            throw "golden key-to-producer coverage mismatch: $($mappingDelta | Out-String)"
-          }
-          $goldenProducerTests = @($goldenKeyToProducer.Values | Sort-Object -Unique)
-          if ($goldenProducerTests.Count -ne 7) {
-            throw "golden producer count changed: expected 7, actual $($goldenProducerTests.Count)"
-          }
-          $goldenProducerFilter = $goldenProducerTests -join ':'
-          $goldenOutput = Join-Path $env:RUNNER_TEMP 'pipeline-tests-golden-producers.txt'
-          $goldenActualOutput = Join-Path $env:RUNNER_TEMP 'pipeline-golden-actual.json'
-          $goldenResult = Invoke-BoundedPipelineShard -Name 'golden-producers' -Arguments @(
-            '--check-golden',
-            '--hash-output', $goldenActualOutput,
-            "--gtest_filter=$goldenProducerFilter"
-          ) -OutputPath $goldenOutput
-          Add-Content -Path $suiteOutput -Value ("===== GOLDEN PRODUCERS FILTER {0} EXIT {1} =====" -f $goldenProducerFilter, $goldenResult.ExitCode)
-          Add-Content -Path $suiteOutput -Value $goldenResult.Output
-          Write-Output ("===== GOLDEN PRODUCERS FILTER {0} EXIT {1} =====" -f $goldenProducerFilter, $goldenResult.ExitCode)
-          Write-Output $goldenResult.Output
-          if ($goldenResult.TimedOut) {
-            throw 'pipeline golden producer job exceeded 240 seconds (exit 124; output retained)'
-          }
-          switch ($goldenResult.ExitCode) {
-            0 { }
-            2 { throw 'pipeline golden producer job could not write its actual-key artifact (exit 2)' }
-            3 { throw 'pipeline golden producer job found a missing key, mismatch, or unexpected key (exit 3)' }
-            5 { throw 'pipeline golden producer job refused a dirty or unverifiable oracle (exit 5)' }
-            default { throw "pipeline golden producer job failed outside the golden contract (exit $($goldenResult.ExitCode))" }
-          }
-
-          # Criterion (v): exercise the hosted-like contention that exposed the
-          # AggressiveX family under contention. Historical contended incidence
-          # was 2/72 at 24-way load: N=107 gives about 95% point-estimate
-          # detection power, while its 95% Clopper-Pearson lower bound (0.00338)
-          # would require N=885. Hosted CI deliberately runs a lower-cost N=24
-          # (four separately launched six-way batches): about 49.1% power at the
-          # point estimate and 7.8% at that lower bound. Because six-way hosted
-          # load is a different stratum from the historical 24-way evidence and
-          # siblings in one batch may be correlated, this leg is a blocking
-          # regression signal at disclosed power, never a 95% acceptance claim.
-          $stressFilter = 'ProcessingFilters.AggressiveX*'
-          $stressBatchCount = 4
-          $stressBatchSize = 6
-          $stressPlannedAttempts = $stressBatchCount * $stressBatchSize
-          $stressAchievedAttempts = 0
-          $powerDisclosure = 'STRESS-PREREG targetPower=95% historicalContendedRate=2/72 historicalLoad=24-way derivedN=107 cp95Lower=0.0033819 lowerBoundN=885 ciLoad=6-way ciN=24 pointPower=49.1% lowerBoundPower=7.8% dependence=within-batch-correlated'
-          Add-Content -Path $suiteOutput -Value $powerDisclosure
-          Write-Output $powerDisclosure
-          for ($batch = 1; $batch -le $stressBatchCount; $batch++) {
-            $stressProcesses = @()
-            for ($run = 1; $run -le $stressBatchSize; $run++) {
-              $attempt = (($batch - 1) * $stressBatchSize) + $run
-              $name = "stress-b{0:D2}-r{1:D2}-a{2:D3}" -f $batch, $run, $attempt
-              $psi = [System.Diagnostics.ProcessStartInfo]::new()
-              $psi.FileName = (Resolve-Path "tests\build-ci-pipeline\release\pipeline_tests.exe").Path
-              $psi.WorkingDirectory = $env:GITHUB_WORKSPACE
-              $psi.UseShellExecute = $false
-              $psi.RedirectStandardOutput = $true
-              $psi.RedirectStandardError = $true
-              [void]$psi.ArgumentList.Add("--gtest_filter=$stressFilter")
-              $process = [System.Diagnostics.Process]::new()
-              $process.StartInfo = $psi
-              if (-not $process.Start()) { throw "failed to start stress repetition $name" }
-              $stressProcesses += [pscustomobject]@{
-                Name = $name
-                Process = $process
-                Stdout = $process.StandardOutput.ReadToEndAsync()
-                Stderr = $process.StandardError.ReadToEndAsync()
-              }
+          # Part 2 owns the golden-producer comparison and the AggressiveX contention leg:
+          # each is one whole process set that must run exactly once per workflow run.
+          if ($part -eq 2) {
+            # Golden disposition B: one complete producer-only process owns the
+            # fail-closed report-all comparison. The reviewable key-to-test map is
+            # checked against the committed artifact before the filter is derived,
+            # so a key or producer cannot silently fall out of coverage.
+            $goldenKeyToProducer = [ordered]@{
+              'tiny_dual_iso.debayer.amaze.cpu.frame0' = 'BackendParametricDebayerShell.CpuRenderDebayerAmazeProducesStableHash'
+              'tiny_dual_iso.debayer.bilinear.cpu.frame0' = 'BackendParametricDebayerShell.CpuRenderDebayerBilinearProducesStableHash'
+              'tiny_dual_iso.full16.frame0' = 'DualIsoPipeline.TinyDualIsoFullFramesMatchGolden'
+              'tiny_dual_iso.full16.frame1' = 'DualIsoPipeline.TinyDualIsoFullFramesMatchGolden'
+              'tiny_dual_iso.gpu_preview_subset.exposure_0_75.frame0' = 'GpuPreviewProcessing.ExposureStopsChangesSubsetConfigAndStableOutput'
+              'tiny_dual_iso.gpu_preview_subset.exposure_0_75.signature.frame0' = 'GpuPreviewProcessing.ExposureStopsChangesSubsetConfigAndStableOutput'
+              'tiny_dual_iso.gpu_preview_subset.frame0' = 'GpuPreviewProcessing.TinyDualIsoReceiptSubsetGoldenOutputIsStable'
+              'tiny_dual_iso.gpu_preview_subset.frame1' = 'GpuPreviewProcessing.TinyDualIsoReceiptSubsetGoldenOutputIsStable'
+              'tiny_dual_iso.gpu_preview_subset.signature.frame0' = 'GpuPreviewProcessing.TinyDualIsoReceiptSubsetGoldenOutputIsStable'
+              'tiny_dual_iso.gpu_preview_subset.signature.frame1' = 'GpuPreviewProcessing.TinyDualIsoReceiptSubsetGoldenOutputIsStable'
+              'tiny_dual_iso.preview16.frame0' = 'DualIsoPipeline.TinyDualIsoPreviewFramesMatchGoldenAndStayCloseToFull'
+              'tiny_dual_iso.preview16.frame1' = 'DualIsoPipeline.TinyDualIsoPreviewFramesMatchGoldenAndStayCloseToFull'
+              'tiny_dual_iso.preview16_vs_full_psnr.frame0' = 'DualIsoPipeline.TinyDualIsoPreviewFramesMatchGoldenAndStayCloseToFull'
+              'tiny_dual_iso.preview16_vs_full_psnr.frame1' = 'DualIsoPipeline.TinyDualIsoPreviewFramesMatchGoldenAndStayCloseToFull'
+              'tiny_dual_iso.preview_processing.cpu.frame0' = 'BackendParametricShell.CpuRenderPreviewProcessingSubsetProducesStableHash'
+            }
+            $goldenPath = (Resolve-Path 'tests\fixtures\golden\pipeline_hashes.json').Path
+            $goldenExpected = Get-Content -LiteralPath $goldenPath -Raw | ConvertFrom-Json -AsHashtable
+            $expectedGoldenKeys = @($goldenExpected.Keys | Sort-Object)
+            $mappedGoldenKeys = @($goldenKeyToProducer.Keys | Sort-Object)
+            $mappingDelta = @(Compare-Object -ReferenceObject $expectedGoldenKeys -DifferenceObject $mappedGoldenKeys)
+            if ($mappingDelta.Count -ne 0) {
+              throw "golden key-to-producer coverage mismatch: $($mappingDelta | Out-String)"
+            }
+            $goldenProducerTests = @($goldenKeyToProducer.Values | Sort-Object -Unique)
+            if ($goldenProducerTests.Count -ne 7) {
+              throw "golden producer count changed: expected 7, actual $($goldenProducerTests.Count)"
+            }
+            $goldenProducerFilter = $goldenProducerTests -join ':'
+            $goldenOutput = Join-Path $env:RUNNER_TEMP 'pipeline-tests-golden-producers.txt'
+            $goldenActualOutput = Join-Path $env:RUNNER_TEMP 'pipeline-golden-actual.json'
+            $goldenResult = Invoke-BoundedPipelineShard -Name 'golden-producers' -Arguments @(
+              '--check-golden',
+              '--hash-output', $goldenActualOutput,
+              "--gtest_filter=$goldenProducerFilter"
+            ) -OutputPath $goldenOutput
+            Add-Content -Path $suiteOutput -Value ("===== GOLDEN PRODUCERS FILTER {0} EXIT {1} =====" -f $goldenProducerFilter, $goldenResult.ExitCode)
+            Add-Content -Path $suiteOutput -Value $goldenResult.Output
+            Write-Output ("===== GOLDEN PRODUCERS FILTER {0} EXIT {1} =====" -f $goldenProducerFilter, $goldenResult.ExitCode)
+            Write-Output $goldenResult.Output
+            if ($goldenResult.TimedOut) {
+              throw 'pipeline golden producer job exceeded 240 seconds (exit 124; output retained)'
+            }
+            switch ($goldenResult.ExitCode) {
+              0 { }
+              2 { throw 'pipeline golden producer job could not write its actual-key artifact (exit 2)' }
+              3 { throw 'pipeline golden producer job found a missing key, mismatch, or unexpected key (exit 3)' }
+              5 { throw 'pipeline golden producer job refused a dirty or unverifiable oracle (exit 5)' }
+              default { throw "pipeline golden producer job failed outside the golden contract (exit $($goldenResult.ExitCode))" }
             }
 
-            $batchFailures = @()
-            foreach ($stress in $stressProcesses) {
-              $timedOut = -not $stress.Process.WaitForExit(240000)
-              if ($timedOut) {
-                try { $stress.Process.Kill($true) } catch { }
+            # Criterion (v): exercise the hosted-like contention that exposed the
+            # AggressiveX family under contention. Historical contended incidence
+            # was 2/72 at 24-way load: N=107 gives about 95% point-estimate
+            # detection power, while its 95% Clopper-Pearson lower bound (0.00338)
+            # would require N=885. Hosted CI deliberately runs a lower-cost N=24
+            # (four separately launched six-way batches): about 49.1% power at the
+            # point estimate and 7.8% at that lower bound. Because six-way hosted
+            # load is a different stratum from the historical 24-way evidence and
+            # siblings in one batch may be correlated, this leg is a blocking
+            # regression signal at disclosed power, never a 95% acceptance claim.
+            $stressFilter = 'ProcessingFilters.AggressiveX*'
+            $stressBatchCount = 4
+            $stressBatchSize = 6
+            $stressPlannedAttempts = $stressBatchCount * $stressBatchSize
+            $stressAchievedAttempts = 0
+            $powerDisclosure = 'STRESS-PREREG targetPower=95% historicalContendedRate=2/72 historicalLoad=24-way derivedN=107 cp95Lower=0.0033819 lowerBoundN=885 ciLoad=6-way ciN=24 pointPower=49.1% lowerBoundPower=7.8% dependence=within-batch-correlated'
+            Add-Content -Path $suiteOutput -Value $powerDisclosure
+            Write-Output $powerDisclosure
+            for ($batch = 1; $batch -le $stressBatchCount; $batch++) {
+              $stressProcesses = @()
+              for ($run = 1; $run -le $stressBatchSize; $run++) {
+                $attempt = (($batch - 1) * $stressBatchSize) + $run
+                $name = "stress-b{0:D2}-r{1:D2}-a{2:D3}" -f $batch, $run, $attempt
+                $psi = [System.Diagnostics.ProcessStartInfo]::new()
+                $psi.FileName = (Resolve-Path "tests\build-ci-pipeline\release\pipeline_tests.exe").Path
+                $psi.WorkingDirectory = $env:GITHUB_WORKSPACE
+                $psi.UseShellExecute = $false
+                $psi.RedirectStandardOutput = $true
+                $psi.RedirectStandardError = $true
+                [void]$psi.ArgumentList.Add("--gtest_filter=$stressFilter")
+                $process = [System.Diagnostics.Process]::new()
+                $process.StartInfo = $psi
+                if (-not $process.Start()) { throw "failed to start stress repetition $name" }
+                $stressProcesses += [pscustomobject]@{
+                  Name = $name
+                  Process = $process
+                  Stdout = $process.StandardOutput.ReadToEndAsync()
+                  Stderr = $process.StandardError.ReadToEndAsync()
+                }
               }
-              $stress.Process.WaitForExit()
-              $stressOutput = $stress.Stdout.GetAwaiter().GetResult() + $stress.Stderr.GetAwaiter().GetResult()
-              $stressExit = if ($timedOut) { 124 } else { $stress.Process.ExitCode }
-              $stressOutputPath = Join-Path $env:RUNNER_TEMP ("pipeline-tests-{0}.txt" -f $stress.Name)
-              Set-Content -Path $stressOutputPath -Value $stressOutput -Encoding utf8
-              Add-Content -Path $suiteOutput -Value ("===== STRESS {0} FILTER {1} EXIT {2} =====" -f $stress.Name, $stressFilter, $stressExit)
-              Add-Content -Path $suiteOutput -Value $stressOutput
-              Write-Output ("===== STRESS {0} FILTER {1} EXIT {2} =====" -f $stress.Name, $stressFilter, $stressExit)
-              Write-Output $stressOutput
-              $stressAchievedAttempts++
-              if ($stressExit -ne 0) {
-                $batchFailures += "$($stress.Name):$stressExit"
+
+              $batchFailures = @()
+              foreach ($stress in $stressProcesses) {
+                $timedOut = -not $stress.Process.WaitForExit(240000)
+                if ($timedOut) {
+                  try { $stress.Process.Kill($true) } catch { }
+                }
+                $stress.Process.WaitForExit()
+                $stressOutput = $stress.Stdout.GetAwaiter().GetResult() + $stress.Stderr.GetAwaiter().GetResult()
+                $stressExit = if ($timedOut) { 124 } else { $stress.Process.ExitCode }
+                $stressOutputPath = Join-Path $env:RUNNER_TEMP ("pipeline-tests-{0}.txt" -f $stress.Name)
+                Set-Content -Path $stressOutputPath -Value $stressOutput -Encoding utf8
+                Add-Content -Path $suiteOutput -Value ("===== STRESS {0} FILTER {1} EXIT {2} =====" -f $stress.Name, $stressFilter, $stressExit)
+                Add-Content -Path $suiteOutput -Value $stressOutput
+                Write-Output ("===== STRESS {0} FILTER {1} EXIT {2} =====" -f $stress.Name, $stressFilter, $stressExit)
+                Write-Output $stressOutput
+                $stressAchievedAttempts++
+                if ($stressExit -ne 0) {
+                  $batchFailures += "$($stress.Name):$stressExit"
+                }
+              }
+              if ($batchFailures.Count -ne 0) {
+                $abort = "STRESS-ABORT achieved=$stressAchievedAttempts planned=$stressPlannedAttempts failures=$($batchFailures -join ',')"
+                Add-Content -Path $suiteOutput -Value $abort
+                throw $abort
               }
             }
-            if ($batchFailures.Count -ne 0) {
-              $abort = "STRESS-ABORT achieved=$stressAchievedAttempts planned=$stressPlannedAttempts failures=$($batchFailures -join ',')"
-              Add-Content -Path $suiteOutput -Value $abort
-              throw $abort
-            }
+            $stressComplete = "STRESS-COMPLETE achieved=$stressAchievedAttempts planned=$stressPlannedAttempts failures=0"
+            Add-Content -Path $suiteOutput -Value $stressComplete
+            Write-Output $stressComplete
           }
-          $stressComplete = "STRESS-COMPLETE achieved=$stressAchievedAttempts planned=$stressPlannedAttempts failures=0"
-          Add-Content -Path $suiteOutput -Value $stressComplete
-          Write-Output $stressComplete
 
           & tools\testing\check-expected-failures.ps1 -SuiteOutput $suiteOutput
           if ($LASTEXITCODE -ne 0) {
@@ -617,7 +693,7 @@ jobs:
       # unavailable backend into a test FAILURE, then refuses any skip and any run that
       # executed too few tests.
       - name: Display parity (software GL required, never skipped)
-        if: needs.protected-check-route.outputs.product == 'true'
+        if: needs.protected-check-route.outputs.product == 'true' && matrix.part == 2
         env:
           QT_OPENGL: software
           MLVAPP_REQUIRE_DISPLAY_PARITY_GL: "1"
@@ -660,13 +736,34 @@ jobs:
         if: always() && needs.protected-check-route.outputs.product == 'true'
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
         with:
-          name: windows-product-oracles-pipeline-crash-forensics
+          name: windows-product-oracles-pipeline-crash-forensics-part-${{ matrix.part }}
           if-no-files-found: ignore
           path: |
             ${{ runner.temp }}\pipeline-crash-forensics\**
             ${{ runner.temp }}\pipeline-tests-output.txt
             ${{ runner.temp }}\pipeline-tests-*.txt
             ${{ runner.temp }}\pipeline-golden-actual.json
+
+  windows-product-oracles:
+    # Keeps the required status-check name `Windows Product Oracles` that branch protection
+    # pins. It succeeds only when every part succeeded: a failed, timed-out, skipped or
+    # cancelled part makes the check fail. `if: always()` (not `!cancelled()`) keeps it
+    # running when the whole run is cancelled, so a cancel leaves the required check failed
+    # rather than condition-skipped, which GitHub accepts. Each part adjudicates its own
+    # failures against tests/pipeline/expected-failures.txt (`[FAIL] name` lines are the
+    # only input), so a new failure in any part fails that part and therefore this check.
+    name: Windows Product Oracles
+    needs: windows-product-oracles-part
+    if: ${{ always() }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Require every product-oracle part to have passed
+        env:
+          PARTS_RESULT: ${{ needs.windows-product-oracles-part.result }}
+        run: |
+          echo "product oracle part matrix result: $PARTS_RESULT"
+          test "$PARTS_RESULT" = "success"
 
   windows-gui-pilot:
     name: Windows GUI Pilot
@@ -703,7 +800,7 @@ jobs:
           if ($route -eq 'false' -and $reason -ne 'EXPLICIT_NA_PROVIDER_CONTROL_ONLY') {
             throw "GUI N/A lacks the exact provider-only reason"
           }
-          if ($route -eq 'true' -and $reason -notin @('ROUTER_CONTROL_CHANGED_RUN_REAL_ORACLES', 'UNKNOWN_OR_PRODUCT_PATH_RUN_REAL_ORACLES', 'MANUAL_DISPATCH_RUN_REAL_ORACLES')) {
+          if ($route -eq 'true' -and $reason -notin @('ROUTER_CONTROL_CHANGED_RUN_REAL_ORACLES', 'UNKNOWN_OR_PRODUCT_PATH_RUN_REAL_ORACLES', 'MANUAL_DISPATCH_RUN_REAL_ORACLES', 'MERGE_GROUP_RUN_REAL_ORACLES')) {
             throw "GUI run lacks a recognized fail-closed reason"
           }
 
