@@ -139,9 +139,14 @@ The cause was the CUDA early advance on present: `timerFrameEvent( true )` round
   every scale. The Loop wrap from cut-out back to cut-in spends a frame of credit too (`grantLoopWrap`), so a short loop
   holds the ceiling across the boundary. A renderer slower than native still drops or holds exactly as before.
 * **The whole-run timeline rate also counts the wait for the first frame.** `playback_smoke.pace_summary` reports the
-  rates after the first present (`timeline_fps_after_first_present`, `presented_fps_after_first_present`). Those are
-  the rates the pace governs. UM r5 (dd15567b) read 20.985 timeline fps over its run but 24.16 after a 3.75 s first
-  frame. Its presented rate, 20.1, was a renderer slower than native on a host at 100 % CPU, not the guard.
+  rates after the first present (`timeline_fps_after_first_present`, `presented_fps_after_first_present`), counting
+  frames and time from the first present on. The slider travel already made when the first present is recorded is
+  reported apart as `first_present_catchup_frames`: the first present's early advance can repay the whole wait for the
+  first frame in one jump, and that jump is not paced throughput. UM r5 (dd15567b) read 20.985 timeline fps over its
+  run after a 3.75 s first frame. Its contact-sheet sidecars show the timeline at about 21.3 fps (11 % under native)
+  from display frame 125 to the stop, and its presented rate after the first present was 20.1: a renderer slower than
+  native on a host at 100 % CPU, with drop-frame mode tying the timeline to about one frame per present. Not a guard
+  defect (the guard only ever holds a fast timeline), but not a native timeline either.
 * **The receipt oracles do not yet judge the observed rate.** That check is split to the successor card
   PLAYBACK-OBSERVED-RATE-ORACLE-1.
 

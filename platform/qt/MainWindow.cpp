@@ -23805,6 +23805,7 @@ void MainWindow::beginPlaybackSmokeTelemetry( void )
     m_playbackSmokeStartTime = mlv_stage_timing_now();
     m_playbackSmokeLastPresentedTime = 0.0;
     m_playbackSmokeFirstPresentMs = 0.0;
+    m_playbackSmokeFirstPresentTimelineDeltaAbs = 0;
     m_playbackSmokePresentedIntervalSumMs = 0.0;
     m_playbackSmokePresentedIntervalMaxMs = 0.0;
     m_playbackSmokeRenderTotalSumMs = 0.0;
@@ -24107,6 +24108,11 @@ void MainWindow::notePlaybackSmokePresentedFrame(
     {
         m_playbackSmokeFirstPresentMs = elapsedMs;
         m_playbackSmokeFirstPresentedFrame = static_cast<int>( displayFrame );
+        // PLAYBACK-PACE-GUARD-THROUGHPUT-1 r2: drawFrameReady runs the first present's early advance BEFORE it
+        // gets here, so the slider already holds whatever the first-frame wait was repaid with (UM r5: a jump
+        // of dozens of frames on one tick). The paced timeline rate must not count that.
+        m_playbackSmokeFirstPresentTimelineDeltaAbs =
+            qAbs( ui->horizontalSliderPosition->value() - m_playbackSmokeStartPosition );
     }
 
     // BLOCKER fix (CUDA-PLAYBACK-CONTACT-SHEET-2): a presented frame lower than the previous
@@ -26755,21 +26761,25 @@ void MainWindow::finishPlaybackSmokeTelemetry( const char *reason )
                .arg( automationRunNonce() );
 
     // PLAYBACK-PACE-GUARD-THROUGHPUT-1: timeline_fps above counts the wait for the first frame as playback, so a
-    // slow first present (UM r5: 3753 ms) reads as a pace below native. These are the rates the pace governs.
+    // slow first present (UM r5: 3753 ms) reads as a pace below native. These are the rates the pace governs: frames
+    // and time both start at the first present, so what the first present's own advance repaid for the wait
+    // (first_present_catchup_frames, already in the slider when the first present is recorded) is not counted.
     qInfo().noquote()
         << QStringLiteral(
                "playback_smoke.pace_summary session=%1 first_present_ms=%2 paced_elapsed_ms=%3 "
-               "timeline_fps_after_first_present=%4 presented_fps_after_first_present=%5 pace_fps=%6" )
+               "timeline_fps_after_first_present=%4 presented_fps_after_first_present=%5 pace_fps=%6 "
+               "first_present_catchup_frames=%7" )
                .arg( static_cast<qulonglong>( m_playbackSmokeSessionId ) )
                .arg( m_playbackSmokeFirstPresentMs, 0, 'f', 3 )
                .arg( m_playbackSmokePresentedFrames > 0 ? elapsedMs - m_playbackSmokeFirstPresentMs : 0.0, 0, 'f', 3 )
-               .arg( playback_native_pace::fpsAfterFirstPresent( timelineDeltaAbs, elapsedMs,
-                                                                 m_playbackSmokeFirstPresentMs,
-                                                                 m_playbackSmokePresentedFrames ), 0, 'f', 3 )
-               .arg( playback_native_pace::fpsAfterFirstPresent( qMax( 0, m_playbackSmokePresentedFrames - 1 ),
-                                                                 elapsedMs, m_playbackSmokeFirstPresentMs,
-                                                                 m_playbackSmokePresentedFrames ), 0, 'f', 3 )
-               .arg( m_playPaceFps, 0, 'f', 3 );
+               .arg( playback_native_pace::fpsAfterFirstPresent(
+                         playback_native_pace::timelineFramesAfterFirstPresent( timelineDeltaAbs, m_playbackSmokeFirstPresentTimelineDeltaAbs ),
+                         elapsedMs, m_playbackSmokeFirstPresentMs, m_playbackSmokePresentedFrames ), 0, 'f', 3 )
+               .arg( playback_native_pace::fpsAfterFirstPresent(
+                         qMax( 0, m_playbackSmokePresentedFrames - 1 ),
+                         elapsedMs, m_playbackSmokeFirstPresentMs, m_playbackSmokePresentedFrames ), 0, 'f', 3 )
+               .arg( m_playPaceFps, 0, 'f', 3 )
+               .arg( m_playbackSmokeFirstPresentTimelineDeltaAbs );
 
     qInfo().noquote()
         << QStringLiteral(
