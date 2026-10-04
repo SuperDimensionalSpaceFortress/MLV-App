@@ -9021,6 +9021,35 @@ int MainWindow::runGuiPlaybackSmoke(const GuiPlaybackSmokeOptions & options)
     // window minus its own start-up cost. Every later wait / switch / verdict below counts from this point.
     playbackClock.restart();
 
+    // CONTACT-SHEET-PLAYBACK-PARITY-1: arm the in-pass contact sheet on THIS measured Play (owner rule:
+    // never replay). noteContactSheetPresentedFrame() grabs the first frame presented at or after each
+    // target time -- the centres of N equal slices of the requested play window, on a clock started
+    // with playbackClock -- so the sheet shows exactly what played. The hook only reads the framebuffer
+    // back (timed, reported as grab_ms); every PNG encode and file write waits for the stop below.
+    if( !options.contactSheetDir.isEmpty() && options.contactSheetFrames > 0 && !options.contactSheetSeekMode )
+    {
+        // HARDENING (default-off): the cheap gate finishPresentedFrame() checks before calling
+        // noteContactSheetPresentedFrame() at all; only ever set here.
+        m_contactSheetOptionsPresent = true;
+        const long long contactSheetWindowMs = std::llround(
+            playback_frame_range::smokePlayRequestSeconds(
+                options.durationMs, options.targetPresentedFrames, presentedTargetFps ) * 1000.0 );
+        m_contactSheetCaptureTargetMs.clear();
+        for( int i = 0; i < options.contactSheetFrames; ++i )
+        {
+            m_contactSheetCaptureTargetMs.append( static_cast<qint64>(
+                playback_frame_range::contactSheetInPassTargetMs(
+                    i, options.contactSheetFrames, contactSheetWindowMs ) ) );
+        }
+        m_contactSheetPendingGrabs.clear();
+        m_contactSheetCaptureNextTargetIndex = 0;
+        m_contactSheetCaptureStartFrame = ui->horizontalSliderPosition->value();
+        m_contactSheetCaptureFps = getFramerate();
+        m_contactSheetCaptureError.clear();
+        m_contactSheetCaptureClock.start();
+        m_contactSheetCaptureActive = true;
+    }
+
     // HARDENING (CUDA-PLAYBACK-CONTACT-SHEET-2): bind the explicit measured-session marker to
     // THIS trigger -- the one that starts the measured timed loop -- rather than to whichever
     // playback session happens to close first via a "play-stop". beginPlaybackSmokeTelemetry()
@@ -9671,36 +9700,33 @@ int MainWindow::runGuiPlaybackSmoke(const GuiPlaybackSmokeOptions & options)
     }
     m_frameStillDrawing = m_pRenderThread && !m_pRenderThread->isIdle();
 
-    // Contact-sheet capture: N evenly spaced frame positions from the just-measured
-    // playback span. Deliberately placed AFTER actionPlay was unchecked above (which
-    // already ran finishPlaybackSmokeTelemetry, closing both the playback_smoke frame
-    // counters and the GpuDisplayWindow swap-telemetry session for the MEASURED
-    // interval), so nothing below can perturb the fps/swap-cadence numbers already
-    // finalized for that interval.
+    // Contact-sheet files. Deliberately placed AFTER actionPlay was unchecked above (which already
+    // ran finishPlaybackSmokeTelemetry, closing both the playback_smoke frame counters and the
+    // GpuDisplayWindow swap-telemetry session for the MEASURED interval), so no PNG encode or file
+    // write below can perturb the fps/swap-cadence numbers already finalized for that interval.
     //
-    // DEFAULT (options.contactSheetSeekMode == false): a genuine SECOND, un-timed
-    // PLAYBACK pass -- playback is started again from the span's start frame and left
-    // running while noteContactSheetPresentedFrame() (hooked into the same real-
-    // presented-frame call site as notePlaybackSmokePresentedFrame) grabs each target
-    // frame as it is actually presented. Every grab therefore comes from the real
-    // playback fast path (CUDA texture-present included), never a paused/seeked one.
+    // DEFAULT (options.contactSheetSeekMode == false, CONTACT-SHEET-PLAYBACK-PARITY-1): the frames
+    // were grabbed DURING the measured Play by noteContactSheetPresentedFrame() (armed right after
+    // the measured Play trigger, hooked into the same real-presented-frame call site as
+    // notePlaybackSmokePresentedFrame), so every tile is a frame the playback path actually
+    // presented (CUDA texture-present included). No second Play, no replay. Their readback cost
+    // fell inside the measured interval and is reported (grab_ms per tile, grab_total_ms and
+    // fps_excluding_grabs on gui_smoke.contact_sheet) so the fps numbers stay honest.
     //
-    // --contact-sheet-seek-mode (explicit, labelled alternative): the OLD capture,
-    // pausing/seeking to each target after playback has already stopped. A seeked frame
-    // is rendered by a different, non-playback path and can show a different look, so
-    // its sidecars record playback_path=false and render_path reflects whatever path
-    // that seek actually rendered through.
+    // --contact-sheet-seek-mode (explicit, labelled alternative) replaces that with the seek capture:
+    // pausing/seeking to each target after playback has stopped. --contact-sheet-seek-dir keeps the
+    // in-pass sheet and ALSO writes that seek capture, of the same presented frames, to its own dir.
+    // A seeked frame is rendered by a different, non-playback path and can show a different look
+    // (PLAYBACK-SEEK-RENDER-PARITY-1), so its sidecars record playback_path=false.
     int contactSheetFramesWritten = 0;
+    int contactSheetSeekFramesWritten = 0;
     QString contactSheetError;
     if( !options.contactSheetDir.isEmpty() && options.contactSheetFrames > 0 )
     {
-        // HARDENING (default-off): flips the cheap gate finishPresentedFrame() checks before
-        // calling noteContactSheetPresentedFrame() at all. Only ever true inside this block,
-        // so a smoke run with the options off makes zero contact-sheet calls per presented
-        // frame, not just an early-returning one.
-        m_contactSheetOptionsPresent = true;
-        const QDir contactSheetDirInfo( options.contactSheetDir );
-        if( !contactSheetDirInfo.exists() && !QDir().mkpath( options.contactSheetDir ) )
+        // The measured Play is over: nothing more is grabbed in-pass.
+        m_contactSheetCaptureActive = false;
+        const QDir inPassDirInfo( options.contactSheetDir );
+        if( !inPassDirInfo.exists() && !QDir().mkpath( options.contactSheetDir ) )
         {
             err << "[GUI-SMOKE] ERROR: failed to create contact sheet directory: "
                 << options.contactSheetDir << "\n";
@@ -9722,8 +9748,82 @@ int MainWindow::runGuiPlaybackSmoke(const GuiPlaybackSmokeOptions & options)
                 i, options.contactSheetFrames, sheetStartFrame, sheetEndFrame ) );
         }
 
-        if( options.contactSheetSeekMode )
+        // CONTACT-SHEET-PLAYBACK-PARITY-1: write the in-pass grabs parked by noteContactSheetPresentedFrame().
+        double contactSheetGrabTotalMs = 0.0;
+        double contactSheetGrabMaxMs = 0.0;
+        int contactSheetGrabsInMeasured = 0;
+        double contactSheetFpsMeasured = 0.0;
+        double contactSheetFpsExcludingGrabs = 0.0;
+        if( !options.contactSheetSeekMode )
         {
+            QVector<int> inPassDisplayFrames;
+            for( const ContactSheetPendingGrab &grab : m_contactSheetPendingGrabs )
+            {
+                QJsonObject frameJson = grab.sidecar;
+                const int index = frameJson.value( QStringLiteral("index") ).toInt();
+                // A grab made after the measured interval's end is impossible by construction (the
+                // hook is disarmed above, after the stop); recorded per tile rather than assumed.
+                const bool inMeasuredInterval = grab.grabElapsedMs <= contactSheetMeasuredElapsedMs;
+                frameJson.insert( QStringLiteral("span_end"), sheetEndFrame );
+                frameJson.insert( QStringLiteral("span_wrapped"), contactSheetSpanWrapped );
+                frameJson.insert( QStringLiteral("grab_in_measured_interval"), inMeasuredInterval );
+                const QString pngRelativeName = frameJson.value( QStringLiteral("path") ).toString();
+                const QString pngPath = inPassDirInfo.absoluteFilePath( pngRelativeName );
+                const QString jsonPath = inPassDirInfo.absoluteFilePath(
+                    QStringLiteral("frame-%1.json").arg( index, 2, 10, QLatin1Char('0') ) );
+                bool frameOk = grab.image.save( pngPath, "PNG" );
+                frameJson.insert( QStringLiteral("saved"), frameOk );
+                if( frameOk )
+                {
+                    QFile sidecarFile( jsonPath );
+                    if( sidecarFile.open( QIODevice::WriteOnly | QIODevice::Truncate ) )
+                    {
+                        sidecarFile.write( QJsonDocument( frameJson ).toJson( QJsonDocument::Indented ) );
+                        sidecarFile.close();
+                        ++contactSheetFramesWritten;
+                    }
+                    else
+                    {
+                        frameOk = false;
+                    }
+                }
+                if( !frameOk && contactSheetError.isEmpty() )
+                    contactSheetError = QStringLiteral( "frame %1 write failed" ).arg( index );
+                contactSheetGrabTotalMs += grab.grabMs;
+                contactSheetGrabMaxMs = qMax( contactSheetGrabMaxMs, grab.grabMs );
+                if( inMeasuredInterval ) ++contactSheetGrabsInMeasured;
+                inPassDisplayFrames.append( frameJson.value( QStringLiteral("display_frame") ).toInt() );
+            }
+            if( contactSheetError.isEmpty() ) contactSheetError = m_contactSheetCaptureError;
+            if( m_contactSheetPendingGrabs.size() < options.contactSheetFrames && contactSheetError.isEmpty() )
+            {
+                contactSheetError = QStringLiteral( "only %1 of %2 in-pass targets were presented before the measured Play stopped" )
+                    .arg( m_contactSheetPendingGrabs.size() ).arg( options.contactSheetFrames );
+            }
+            m_contactSheetPendingGrabs.clear();
+            // The paired seek capture renders the SAME frames the in-pass sheet shows.
+            if( inPassDisplayFrames.size() == options.contactSheetFrames )
+                contactSheetTargetFrames = inPassDisplayFrames;
+
+            contactSheetFpsMeasured = contactSheetMeasuredElapsedMs > 0
+                ? m_playbackSmokePresentedFrames * 1000.0 / static_cast<double>( contactSheetMeasuredElapsedMs )
+                : 0.0;
+            contactSheetFpsExcludingGrabs = playback_frame_range::fpsExcludingGrabCost(
+                m_playbackSmokePresentedFrames, static_cast<double>( contactSheetMeasuredElapsedMs ),
+                contactSheetGrabTotalMs );
+        }
+
+        // CONTACT-SHEET-PLAYBACK-PARITY-1: seek capture (explicit, labelled alternative). Never plays.
+        const QString seekSheetDir = options.contactSheetSeekMode ? options.contactSheetDir : options.contactSheetSeekDir;
+        if( !seekSheetDir.isEmpty() )
+        {
+            const QDir contactSheetDirInfo( seekSheetDir );
+            if( !contactSheetDirInfo.exists() && !QDir().mkpath( seekSheetDir ) )
+            {
+                err << "[GUI-SMOKE] ERROR: failed to create contact sheet directory: "
+                    << seekSheetDir << "\n";
+                return 13;
+            }
             for( int i = 0; i < options.contactSheetFrames; ++i )
             {
                 const int targetFrame = contactSheetTargetFrames.at( i );
@@ -9813,6 +9913,7 @@ int MainWindow::runGuiPlaybackSmoke(const GuiPlaybackSmokeOptions & options)
                 frameJson.insert( QStringLiteral("texture_source"), contactFrameSource );
                 frameJson.insert( QStringLiteral("render_path"), contactFrameRenderPath );
                 frameJson.insert( QStringLiteral("playback_path"), false );
+                frameJson.insert( QStringLiteral("capture_mode"), QStringLiteral("seek") );
                 frameJson.insert( QStringLiteral("path"), pngRelativeName );
                 frameJson.insert( QStringLiteral("span_start"), sheetStartFrame );
                 frameJson.insert( QStringLiteral("span_end"), sheetEndFrame );
@@ -9851,7 +9952,7 @@ int MainWindow::runGuiPlaybackSmoke(const GuiPlaybackSmokeOptions & options)
                     {
                         sidecarFile.write( QJsonDocument( frameJson ).toJson( QJsonDocument::Indented ) );
                         sidecarFile.close();
-                        ++contactSheetFramesWritten;
+                        ++contactSheetSeekFramesWritten;
                     }
                     else
                     {
@@ -9862,30 +9963,15 @@ int MainWindow::runGuiPlaybackSmoke(const GuiPlaybackSmokeOptions & options)
                 if( !frameOk && contactSheetError.isEmpty() )
                 {
                     contactSheetError = QStringLiteral(
-                        "frame %1 capture failed (settled=%2 reason=%3)" )
+                        "seek frame %1 capture failed (settled=%2 reason=%3)" )
                         .arg( i ).arg( bool01( settled ) ).arg( contactFrameReadbackReason );
                 }
             }
-        }
-        else
-        {
-            // PLAYBACK-CLIP-LENGTH-ENFORCE-2 (owner rule 2026-09-30): the playback-mode contact sheet is a
-            // genuine SECOND Play of the measured span (up to 50 restarts) -- a replay of footage already
-            // played in this process. Replay is forbidden, so this branch REFUSES, typed, and never arms
-            // the capture or touches Play. Use --contact-sheet-seek-mode (no Play; sidecars record
-            // playback_path=false) until a capture-during-the-measured-pass path exists.
-            // (No Play is even attempted here: the gate's ledger would refuse it as REPLAY_REFUSED.)
-            contactSheetError = QStringLiteral(
-                "REPLAY_REFUSED: the playback-mode contact sheet replays the measured span (a second Play); "
-                "use --contact-sheet-seek-mode" );
-            ++m_programmaticPlayLedger.refused;
-            m_programmaticPlayLedger.lastRefusalReason = "REPLAY_REFUSED";
-            logInteractionEvent(
-                QStringLiteral("play_gate.refused"),
-                QStringLiteral("site=gui-smoke-contact-sheet-replay reason=REPLAY_REFUSED") );
-            contactSheetFramesWritten = 0;
+            if( options.contactSheetSeekMode ) contactSheetFramesWritten = contactSheetSeekFramesWritten;
         }
 
+        // playback_path: what the sheet in --contact-sheet-dir shows. The paired seek sheet, when
+        // asked for, is reported separately (seek_dir_written_frames) and is always playback_path=0.
         logInteractionEvent(
             QStringLiteral("gui_smoke.contact_sheet"),
             QStringLiteral("dir=\"%1\" requested_frames=%2 written_frames=%3 "
@@ -9899,13 +9985,28 @@ int MainWindow::runGuiPlaybackSmoke(const GuiPlaybackSmokeOptions & options)
                 .arg( contactSheetMeasuredElapsedMs )
                 .arg( options.contactSheetSeekMode
                           ? QStringLiteral("seek")
-                          : QStringLiteral("playback") )
-                .arg( contactSheetError ) );
+                          : ( options.contactSheetSeekDir.isEmpty()
+                                  ? QStringLiteral("in_pass")
+                                  : QStringLiteral("in_pass+paired_seek") ) )
+                .arg( contactSheetError )
+            + QStringLiteral(" playback_path=%1 grab_total_ms=%2 grab_max_ms=%3 grabs_in_measured_interval=%4 "
+                             "presented_frames=%5 fps_measured=%6 fps_excluding_grabs=%7 seek_dir_written_frames=%8")
+                .arg( bool01( !options.contactSheetSeekMode ) )
+                .arg( contactSheetGrabTotalMs, 0, 'f', 3 )
+                .arg( contactSheetGrabMaxMs, 0, 'f', 3 )
+                .arg( contactSheetGrabsInMeasured )
+                .arg( options.contactSheetSeekMode ? 0 : m_playbackSmokePresentedFrames )
+                .arg( contactSheetFpsMeasured, 0, 'f', 3 )
+                .arg( contactSheetFpsExcludingGrabs, 0, 'f', 3 )
+                .arg( options.contactSheetSeekMode ? 0 : contactSheetSeekFramesWritten ) );
 
-        if( contactSheetFramesWritten != options.contactSheetFrames )
+        if( contactSheetFramesWritten != options.contactSheetFrames
+         || ( !options.contactSheetSeekMode && !options.contactSheetSeekDir.isEmpty()
+              && contactSheetSeekFramesWritten != options.contactSheetFrames ) )
         {
             err << "[GUI-SMOKE] ERROR: contact sheet capture incomplete; requested="
                 << options.contactSheetFrames << " written=" << contactSheetFramesWritten
+                << " seek_written=" << contactSheetSeekFramesWritten
                 << " detail=" << contactSheetError << "\n";
             return 14;
         }
@@ -26086,26 +26187,25 @@ void MainWindow::noteContactSheetPresentedFrame(
     const PresentationRequestContext &requestContext )
 {
     if( !m_contactSheetCaptureActive ) return;
-    // B1: this hook fires on EVERY presented frame, seeked or played -- the restart re-cue
-    // (seekAndSettleLoadedClip) runs while m_contactSheetCaptureActive is already true, and its
-    // own settle-wait pumps the event loop, so a seek-presented frame can reach here before
-    // ui->actionPlay->trigger() is ever called. Disarm on any such frame: never save a
-    // seek-presented frame as playback_path=true. Re-arms itself the moment Play is actually
-    // checked and the next genuinely-played frame presents.
+    // B1: this hook fires on EVERY presented frame. A frame presented while Play is not checked
+    // (a seek, a paused redraw) is never kept as playback_path=true.
     if( !ui->actionPlay->isChecked() ) return;
-    if( m_contactSheetCaptureNextTargetIndex >= m_contactSheetCaptureTargetFrames.size() )
+    if( m_contactSheetCaptureNextTargetIndex >= m_contactSheetCaptureTargetMs.size() )
     {
         m_contactSheetCaptureActive = false;
         return;
     }
-    // Targets are ascending and playback only moves the timeline forward, so the first
-    // presented frame at or past the next target is the capture for that target -- this
-    // never blocks waiting for an exact frame number playback happened to skip over.
-    const int targetFrame =
-        m_contactSheetCaptureTargetFrames.at( m_contactSheetCaptureNextTargetIndex );
-    if( static_cast<int>( displayFrame ) < targetFrame ) return;
+    // CONTACT-SHEET-PLAYBACK-PARITY-1: armed on the MEASURED Play. Targets are ascending times since
+    // that Play started, so the first frame presented at or after the next target is its grab --
+    // whatever fps the leg reaches, every target falls inside the play window.
+    const qint64 grabElapsedMs = m_contactSheetCaptureClock.elapsed();
+    if( grabElapsedMs < m_contactSheetCaptureTargetMs.at( m_contactSheetCaptureNextTargetIndex ) ) return;
 
     const int i = m_contactSheetCaptureNextTargetIndex;
+    // The readback below runs on the GUI thread inside the measured interval: it is timed and
+    // reported, and nothing else (no PNG encode, no file I/O) happens here.
+    QElapsedTimer grabTimer;
+    grabTimer.start();
 
     const QJsonObject &timing = readyFrame.stageTimingTelemetry;
     const GpuPlaybackPipelineStatus contactFramePipelineStatus =
@@ -26175,29 +26275,16 @@ void MainWindow::noteContactSheetPresentedFrame(
         contactFrameSource = QStringLiteral("app_internal_viewport_grab");
     }
 
-    const QDir contactSheetDirInfo( m_contactSheetCaptureDir );
-    const QString frameBaseName =
-        QStringLiteral("frame-%1").arg( i, 2, 10, QLatin1Char('0') );
-    // H3: the sidecar's own "path" field is never an absolute local path -- just the
-    // basename, relative to this capture's own directory (frames_dir). The composer resolves
-    // the image against frames_dir FIRST (never its own current working directory, which
-    // could otherwise silently pick up an unrelated same-named file sitting there -- r1d, sol
-    // pre-review #2), and always falls back to <frames_dir>/<json stem>.png otherwise (see
-    // _resolve_frame_image_path/make-contact-sheet.py), so publishing this sidecar without
-    // rewriting it never breaks composition.
-    const QString pngRelativeName = frameBaseName + QStringLiteral(".png");
-    const QString pngPath = contactSheetDirInfo.absoluteFilePath( pngRelativeName );
-    const QString jsonPath = contactSheetDirInfo.absoluteFilePath(
-        frameBaseName + QStringLiteral(".json") );
+    const double grabMs = static_cast<double>( grabTimer.nsecsElapsed() ) / 1000000.0;
+    const bool frameOk = !gpuWindowGrabFailedClosed
+        && !contactFrameImage.isNull();
 
-    bool frameOk = !gpuWindowGrabFailedClosed
-        && !contactFrameImage.isNull() && contactFrameImage.save( pngPath, "PNG" );
-
-    const double elapsedMsForFrame = m_contactSheetCaptureFps > 0.0
-        ? ( static_cast<double>(
-                static_cast<int>( displayFrame ) - m_contactSheetCaptureStartFrame )
-            / m_contactSheetCaptureFps ) * 1000.0
-        : 0.0;
+    // H3: the sidecar's own "path" field is never an absolute local path -- just the basename,
+    // relative to this capture's own directory (frames_dir). The composer resolves the image
+    // against frames_dir FIRST and falls back to <frames_dir>/<json stem>.png (see
+    // _resolve_frame_image_path/make-contact-sheet.py), so publishing this sidecar never breaks it.
+    const QString pngRelativeName =
+        QStringLiteral("frame-%1.png").arg( i, 2, 10, QLatin1Char('0') );
 
     QJsonObject frameJson;
     frameJson.insert( QStringLiteral("index"), i );
@@ -26206,14 +26293,17 @@ void MainWindow::noteContactSheetPresentedFrame(
     frameJson.insert( QStringLiteral("serial"),
         static_cast<double>( contactFramePresentedSerial ) );
     frameJson.insert( QStringLiteral("display_frame"), static_cast<int>( displayFrame ) );
-    frameJson.insert( QStringLiteral("elapsed_ms"), elapsedMsForFrame );
+    // Wall time since the measured Play started, when this frame was presented and grabbed.
+    frameJson.insert( QStringLiteral("elapsed_ms"), static_cast<double>( grabElapsedMs ) );
+    frameJson.insert( QStringLiteral("target_ms"),
+        static_cast<double>( m_contactSheetCaptureTargetMs.at( i ) ) );
     frameJson.insert( QStringLiteral("texture_source"), contactFrameSource );
     frameJson.insert( QStringLiteral("render_path"), contactFrameRenderPath );
     frameJson.insert( QStringLiteral("playback_path"), true );
+    frameJson.insert( QStringLiteral("capture_mode"), QStringLiteral("in_pass") );
+    frameJson.insert( QStringLiteral("grab_ms"), grabMs );
     frameJson.insert( QStringLiteral("path"), pngRelativeName );
     frameJson.insert( QStringLiteral("span_start"), m_contactSheetCaptureStartFrame );
-    frameJson.insert( QStringLiteral("span_end"), m_contactSheetCaptureEndFrame );
-    frameJson.insert( QStringLiteral("span_wrapped"), m_contactSheetCaptureWrapped );
     frameJson.insert( QStringLiteral("look_assist_enabled"),
         ui->checkBoxLookAssistEnable->isChecked() );
     frameJson.insert( QStringLiteral("look_assist_scene"),
@@ -26239,24 +26329,17 @@ void MainWindow::noteContactSheetPresentedFrame(
     frameJson.insert( QStringLiteral("look_assist_highlights"),
         ui->horizontalSliderHighlights->value() );
     frameJson.insert( QStringLiteral("settled"), true );
-    frameJson.insert( QStringLiteral("saved"), frameOk );
 
     if( frameOk )
     {
-        QFile sidecarFile( jsonPath );
-        if( sidecarFile.open( QIODevice::WriteOnly | QIODevice::Truncate ) )
-        {
-            sidecarFile.write( QJsonDocument( frameJson ).toJson( QJsonDocument::Indented ) );
-            sidecarFile.close();
-            ++m_contactSheetCaptureFramesWritten;
-        }
-        else
-        {
-            frameOk = false;
-        }
+        ContactSheetPendingGrab pending;
+        pending.image = contactFrameImage;
+        pending.sidecar = frameJson;
+        pending.grabMs = grabMs;
+        pending.grabElapsedMs = grabElapsedMs;
+        m_contactSheetPendingGrabs.append( pending );
     }
-
-    if( !frameOk && m_contactSheetCaptureError.isEmpty() )
+    else if( m_contactSheetCaptureError.isEmpty() )
     {
         m_contactSheetCaptureError = QStringLiteral(
             "frame %1 capture failed (reason=%2)" )
@@ -26264,7 +26347,7 @@ void MainWindow::noteContactSheetPresentedFrame(
     }
 
     ++m_contactSheetCaptureNextTargetIndex;
-    if( m_contactSheetCaptureNextTargetIndex >= m_contactSheetCaptureTargetFrames.size() )
+    if( m_contactSheetCaptureNextTargetIndex >= m_contactSheetCaptureTargetMs.size() )
         m_contactSheetCaptureActive = false;
 }
 
@@ -27359,14 +27442,10 @@ void MainWindow::on_actionPlay_toggled(bool checked)
         m_playbackDisplayRequiredActive = true;
         m_playbackScreensaverBlockedCount = 0;
         resetPlaybackQualityAutoRunState();
-        // B2 (capture-only playback mode): the contact-sheet capture pass restarts Play
-        // itself, potentially many times, strictly AFTER the measured interval's own
-        // beginPlaybackSmokeTelemetry()/finishPlaybackSmokeTelemetry() pair has already
-        // closed. Never re-open a new playback_smoke session (and never reset the GPU
-        // swap-telemetry counters) for one of those restarts: doing so would emit
-        // additional playback_smoke.frame/summary/gpu_summary lines the Bachelor job's
-        // parsers could pick up in place of (or mixed with) the measured session.
-        if( !m_contactSheetCaptureActive ) beginPlaybackSmokeTelemetry();
+        // B2: contact-sheet state never gates this. The capture used to restart Play after the
+        // measured interval and had to suppress the session; it now grabs during the measured
+        // Play itself (CONTACT-SHEET-PLAYBACK-PARITY-1), and nothing restarts Play for it.
+        beginPlaybackSmokeTelemetry();
         beginPlayToFirstFrameMeasurement();
         m_playbackScopeLastUpdateTime = 0.0;
         requestFrameRefresh( true, "play-start" );
