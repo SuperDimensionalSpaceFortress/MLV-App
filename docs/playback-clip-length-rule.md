@@ -125,6 +125,24 @@ FRAME:
 | `INVALID_SOURCE_FRAMES`, `INVALID_LOOPED` | the runner / launchers' receipt oracle (`Get-GuiSmokeLoopVerdict`, `Get-GuiSmokeEvidencePlayVerdict`) | exit 43 |
 | `PLAY_SAFETY_TIMEOUT` (launcher kill), `PLAY_NOT_FINISHED`, `APP_EXIT_NONZERO` | `Get-GuiSmokeEvidencePlayVerdict`: the launcher had to kill the app, the app never reported an exit code, or exited non-zero | exit 43 |
 | `SOURCE_FRAMES_INVALID` | the attribution job's oracle (`Get-AttrCudaSourceFramesVerdict`) | exit 29 |
+| `PLAYBACK_FASTER_THAN_NATIVE` | every oracle copy: the OBSERVED timeline rate is more than 2 % over native (see below) | exit 43 / 29; receipt INVALID |
+
+### The observed timeline rate, not only the declared pace (PLAYBACK-CUDA-NATIVE-PACE-1)
+
+`pace_fps` is the pace the engine was TOLD. The observed rate is `source_advanced` divided by the wall seconds of the
+measured Play (`elapsed_ms` on `playback_smoke.summary`, the same QPC clock the engine paces on). On Ultra-Magnus
+(RTX 4090, CUDA texture route, scale 1) a 23.976 clip played at 31.6 timeline fps while `pace_fps` still read 23.976.
+The cause was the CUDA early advance on present: `timerFrameEvent( true )` rounded a short tick up to a whole frame.
+
+* **The engine never runs faster than native.** `playback_native_pace::NativePaceGuard` (`platform/qt/PlaybackNativePaceGuard.h`)
+  is the ceiling on every engine advance in `playbackHandling()`. Credit accrues at the pace fps per wall second and at
+  most one frame is carried. Source frames advanced are therefore at most 1 + elapsed x pace fps, on every backend and at
+  every scale. A renderer slower than native still drops or holds exactly as before.
+* **Every oracle copy checks the observed rate.** An observed rate more than 2 % over native is `PLAYBACK_FASTER_THAN_NATIVE`.
+  Slower than native stays informational. The venue job (`Get-AttrCudaSourceFramesVerdict`) and the dual-venue receipt
+  (`Get-DvPlaybackProblems`) REQUIRE `elapsed_ms` (absent = `RECEIPT_FIELD_ABSENT`). The local gate
+  (`Get-GuiSmokeSourceFramesVerdict`) also judges the profile receipt, which carries no Play wall time, so it checks the
+  rate wherever `elapsed_ms` is present.
 
 ### Pacing isolation: the venue's persisted pacing is never read
 

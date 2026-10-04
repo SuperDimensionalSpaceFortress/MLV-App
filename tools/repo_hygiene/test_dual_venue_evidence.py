@@ -120,7 +120,8 @@ def lf(text: str) -> str:
 
 def good_block(**over) -> dict:
     """A VALID receipt `playback` block (the shape Get-DvPlaybackEvidence writes), for tests of the receipt rules themselves."""
-    block = {"sourceAdvanced": 960, "requiredSourceFrames": 600, "nativeFps": 23.976, "paceFps": 23.976, "fpsOverride": 0, "wrapped": False,
+    # 960 source frames in 40.1 s of measured Play: 23.94 fps observed, under native (PLAYBACK-CUDA-NATIVE-PACE-1)
+    block = {"sourceAdvanced": 960, "elapsedMs": 40100.0, "requiredSourceFrames": 600, "nativeFps": 23.976, "paceFps": 23.976, "fpsOverride": 0, "wrapped": False,
              "wrapCount": 0, "expectedRunNonce": NONCE, "observedRunNonce": NONCE, "manifestRunNonce": NONCE, "logSha256": "ab" * 32,
              "logShaBound": True, "settingsIsolated": True, "jobSourceAdvanced": 960, "jobRequiredSourceFrames": 600, "jobFailures": [],
              "fixtureRehearsal": False, "clipId": OWNER_CLIP}
@@ -129,7 +130,7 @@ def good_block(**over) -> dict:
 
 
 # The same valid block as a PowerShell literal (for tests that build a receipt inside pwsh).
-PS_GOOD_BLOCK = ("[ordered]@{ sourceAdvanced = 960; requiredSourceFrames = 600; nativeFps = 23.976; paceFps = 23.976; fpsOverride = 0; wrapped = $false; "
+PS_GOOD_BLOCK = ("[ordered]@{ sourceAdvanced = 960; elapsedMs = 40100.0; requiredSourceFrames = 600; nativeFps = 23.976; paceFps = 23.976; fpsOverride = 0; wrapped = $false; "
                  "wrapCount = 0; expectedRunNonce = '" + NONCE + "'; observedRunNonce = '" + NONCE + "'; manifestRunNonce = '" + NONCE + "'; "
                  "logShaBound = $true; settingsIsolated = $true; jobFailures = @(); fixtureRehearsal = $false; clipId = '" + OWNER_CLIP + "' }")
 
@@ -196,13 +197,19 @@ class GeneratorByteIdentityAndVariantTests(unittest.TestCase):
     CONTACT_SHEET_PARITY_OPEN = "CONTACT-SHEET-PLAYBACK-PARITY-1 >>>"
     CONTACT_SHEET_PARITY_CLOSE = "CONTACT-SHEET-PLAYBACK-PARITY-1 <<<"
     CONTACT_SHEET_PARITY_REGIONS = 3
+    # PLAYBACK-CUDA-NATIVE-PACE-1: the observed-timeline-rate rule in the spliced Get-AttrCudaSourceFramesVerdict and the job's
+    # PLAYBACK_FASTER_THAN_NATIVE refusal reason. Two regions; the baseline lines stay verbatim outside them.
+    NATIVE_PACE_OPEN = "PLAYBACK-CUDA-NATIVE-PACE-1 >>>"
+    NATIVE_PACE_CLOSE = "PLAYBACK-CUDA-NATIVE-PACE-1 <<<"
+    NATIVE_PACE_REGIONS = 2
 
     @classmethod
     def strip_regions(cls, text: str) -> tuple[str, dict[str, int]]:
         """Remove every bracketed region of either sentinel family; return the kept text and the number of regions per family."""
         families = {"leg-terminals": (cls.LEG_TERMINALS_OPEN, cls.LEG_TERMINALS_CLOSE), "presentmon-evidence": (cls.PRESENTMON_EVIDENCE_OPEN, cls.PRESENTMON_EVIDENCE_CLOSE),
                     "orphan-sweep": (cls.ORPHAN_SWEEP_OPEN, cls.ORPHAN_SWEEP_CLOSE),
-                    "contact-sheet-parity": (cls.CONTACT_SHEET_PARITY_OPEN, cls.CONTACT_SHEET_PARITY_CLOSE)}
+                    "contact-sheet-parity": (cls.CONTACT_SHEET_PARITY_OPEN, cls.CONTACT_SHEET_PARITY_CLOSE),
+                    "native-pace": (cls.NATIVE_PACE_OPEN, cls.NATIVE_PACE_CLOSE)}
         kept: list[str] = []
         inside: str | None = None
         counts = {name: 0 for name in families}
@@ -243,6 +250,8 @@ class GeneratorByteIdentityAndVariantTests(unittest.TestCase):
         self.assertEqual(old_counts["orphan-sweep"], 0, "the baseline has none")
         self.assertEqual(new_counts["contact-sheet-parity"], self.CONTACT_SHEET_PARITY_REGIONS, "the default job carries exactly the pinned number of bracketed CONTACT-SHEET-PLAYBACK-PARITY-1 regions")
         self.assertEqual(old_counts["contact-sheet-parity"], 0, "the baseline has none")
+        self.assertEqual(new_counts["native-pace"], self.NATIVE_PACE_REGIONS, "the default job carries exactly the pinned number of bracketed PLAYBACK-CUDA-NATIVE-PACE-1 regions")
+        self.assertEqual(old_counts["native-pace"], 0, "the baseline has none")
         self.assertEqual(stripped, old_stripped,
                          "the DEFAULT (bachelor/cuda) emitted job changed outside the bracketed regions -- it must stay byte-identical to the pinned baseline")
 
@@ -522,7 +531,7 @@ class RunnerHarness:
                   "wrapped": 0, "wrap_count": 0, "scale_request_last": 4, "scale_active_last": 4}
         fields.update(line or {})
         observed = nonce if observed_nonce is True else observed_nonce
-        summary_line = ("playback_smoke.summary session=3 reason=play-stop elapsed_ms=30000.000 presented_frames=900 "
+        summary_line = ("playback_smoke.summary session=3 reason=play-stop elapsed_ms=40100.000 presented_frames=900 "
                         + " ".join(f"{k}={v}" for k, v in fields.items() if v is not None)
                         + (f" run_nonce={observed}" if observed is not None else ""))
         log_lines = []

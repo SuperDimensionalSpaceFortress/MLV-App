@@ -67,7 +67,8 @@ requires_windows = unittest.skipUnless(os.name == "nt", "the filmstrip launcher 
 
 FORTY_SECONDS_AT_23976 = 960 + 24
 GOOD_FIELDS = dict(wrapped=0, wrap_count=0, total_frames=FORTY_SECONDS_AT_23976, clip_seconds=41.04, presented_frames=900,
-                   source_advanced=480, required_source_frames=480, native_fps=23.976, pace_fps=23.976, fps_override=0)
+                   source_advanced=480, required_source_frames=480, native_fps=23.976, pace_fps=23.976, fps_override=0,
+                   elapsed_ms=20100.0)  # 480 frames in 20.1 s: 23.88 fps observed, under native (PLAYBACK-CUDA-NATIVE-PACE-1)
 SOURCE_KEYS = ("source_advanced", "required_source_frames", "native_fps", "pace_fps", "fps_override", "source_start_frame")
 
 
