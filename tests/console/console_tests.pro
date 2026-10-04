@@ -66,7 +66,8 @@ SOURCES += \
     $$REPO_ROOT/tests/console/test_playback_lookahead_loop_position_policy.cpp \
     $$REPO_ROOT/tests/console/test_playback_drop_frame_advance_policy.cpp \
     $$REPO_ROOT/tests/console/test_playback_fps_meter_policy.cpp \
-    $$REPO_ROOT/tests/console/test_playback_fps_meter_wiring.cpp
+    $$REPO_ROOT/tests/console/test_playback_fps_meter_wiring.cpp \
+    $$REPO_ROOT/tests/console/test_playback_native_pace_guard.cpp
 
 HEADERS += \
     $$REPO_ROOT/platform/qt/FpmNameValidator.h \
@@ -100,6 +101,7 @@ HEADERS += \
     $$REPO_ROOT/platform/qt/PlaybackAchievedScalePolicy.h \
     $$REPO_ROOT/platform/qt/PlaybackLookaheadLoopPositionPolicy.h \
     $$REPO_ROOT/platform/qt/PlaybackFpsMeterPolicy.h \
+    $$REPO_ROOT/platform/qt/PlaybackNativePaceGuard.h \
     $$REPO_ROOT/platform/qt/GpuTexturePresentAvailabilityPolicy.h \
     $$REPO_ROOT/platform/qt/DisplayDeviceMapping.h
 

@@ -370,6 +370,7 @@ HEADERS += MainWindow.h \
            AutomationSettings.h \
            PlaybackFrameRange.h \
            PlaybackFpsMeterPolicy.h \
+           PlaybackNativePaceGuard.h \
            DisplayDeviceMapping.h \
            PlaybackGatePolicy.h \
            Phase3Breadcrumbs.h \
