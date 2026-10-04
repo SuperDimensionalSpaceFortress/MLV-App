@@ -1118,6 +1118,16 @@ void GuiSmokeTest::mainWindowGpuPreviewPolicyRequiresWidgetViewportForAmazeTextu
     state.gpuPlaybackReconTexturePresentationCompatible = true;
     QVERIFY(mainWindowAllowsGpuAmazeTexturePresentation(state));
     QVERIFY(mainWindowUsesGpuAmazeTexturePresentation(state));
+
+    // PLAYBACK-SEEK-RENDER-PARITY-1: a stage the live display shader does not
+    // apply refuses BOTH texture-present routes, whatever else is eligible.
+    QVERIFY(mainWindowAllowsGpuPlaybackReconTexturePresentation(state));
+    state.gpuPreviewProcessingDisplayShaderCompatible = false;
+    QVERIFY(!mainWindowAllowsGpuPlaybackReconTexturePresentation(state));
+    QVERIFY(!mainWindowAllowsGpuAmazeTexturePresentation(state));
+    QVERIFY(!mainWindowUsesGpuAmazeTexturePresentation(state));
+    state.gpuPreviewProcessingDisplayShaderCompatible = true;
+    QVERIFY(mainWindowAllowsGpuPlaybackReconTexturePresentation(state));
 }
 
 void GuiSmokeTest::mainWindowGpuPreviewPolicyKeepsPlaybackReconTexturePresentExplicitAndNested()
