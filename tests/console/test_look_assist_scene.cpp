@@ -2259,12 +2259,24 @@ TEST(LookAssistScene, BothConsumersApplyTheWindowLitCheckOnlyOnTheExposureBound)
         const int isolated = consumer.indexOf( assignments[i] );
         const int check = consumer.indexOf( QStringLiteral("resolveLookAssistWindowLitInterior(") );
         ASSERT_TRUE( copied > 0 && isolated > copied && check > isolated );
-        // fable r1 (LOOK-ASSIST-WINDOW-LIT-MEASURE-ONLY-RENDER-PIN-1): nothing is copied back. Each copy is declared,
-        // handed to the check and never read again, so `preset = windowLitPreset;` (or the scene / stats) fails here.
-        ASSERT_EQ( 2, consumer.count( QStringLiteral("windowLitPreset") ) );
-        ASSERT_EQ( 2, consumer.count( QStringLiteral("windowLitScene") ) );
-        ASSERT_EQ( 3, consumer.count( QStringLiteral("windowLitStats") ) );
-        ASSERT_EQ( 0, consumer.count( QRegularExpression( QStringLiteral("=\\s*windowLit(Preset|Scene|Stats)\\b") ) ) );
+        // fable r1 (LOOK-ASSIST-WINDOW-LIT-MEASURE-ONLY-RENDER-PIN-1), as narrowed by LOOK-ASSIST-M16-NOT-NIGHT-1: each
+        // copy is declared and handed to the check, and read again ONLY by the applied branch (the aperture-bounded,
+        // surface-verified check, never master's pass). Exactly one `x = windowLitX;` per copy, all after that gate, so a
+        // copy-back anywhere else (e.g. before the gate, where a measure-only check would move the verdict) fails here.
+        ASSERT_EQ( 3, consumer.count( QStringLiteral("windowLitPreset") ) );
+        ASSERT_EQ( 3, consumer.count( QStringLiteral("windowLitScene") ) );
+        ASSERT_EQ( 4, consumer.count( QStringLiteral("windowLitStats") ) );
+        const int gate = consumer.indexOf( QStringLiteral("const bool windowLitApplied = windowLit.applies && !") );
+        ASSERT_TRUE( gate > check );
+        int copiedBack = 0;
+        QRegularExpressionMatchIterator it =
+            QRegularExpression( QStringLiteral("=\\s*windowLit(Preset|Scene|Stats)\\b") ).globalMatch( consumer );
+        while( it.hasNext() )
+        {
+            ASSERT_TRUE( it.next().capturedStart() > gate );
+            ++copiedBack;
+        }
+        ASSERT_EQ( 3, copiedBack );
     }
     // The renderer itself: the isolated render with the llrawproc read-only switch around it, restored after.
     const int measureOnly = applier.indexOf( QStringLiteral("LookAssistRenderBalanceFn ReceiptApplier::lookAssistMeasureOnlyRenderer(") );
