@@ -382,6 +382,81 @@ WORKFLOW_SOLO_CONTINUE = WORKFLOW_SOLO_BEFORE.replace(
     "      - name: Repo hygiene\n",
     "      - name: Repo hygiene\n        continue-on-error: true\n",
 )
+# Round 2 (sol r1): the repros.  One workflow carries an unconditioned inline step, a
+# conditioned block step ending in `exit $LASTEXITCODE`, an `if: always()` report step, and
+# two shorthand `- run:` steps (inline and block).
+SOL_SHARD_RUN = (
+    "        run: python -m tools.repo_hygiene.ci_unittest_shard --profile windows --of 7"
+    " --shard ${{ matrix.shard }}\n"
+)
+SOL_GATE_IF = "        if: needs.protected-check-route.outputs.product == 'true'\n"
+SOL_UNITTEST = "          python -m unittest discover -s tests\n"
+SOL_SHORT_INLINE = "      - run: python -m pytest tools/repo_hygiene\n"
+SOL_SHORT_BLOCK = "      - run: |\n          ctest --test-dir build\n"
+SOL_REPORT_RUN = "        run: python tools/report.py\n"
+WORKFLOW_SOL = (
+    "jobs:\n"
+    "  hygiene:\n"
+    "    runs-on: windows-latest\n"
+    "    steps:\n"
+    "      - name: Run repo hygiene unittest shard\n"
+    + SOL_SHARD_RUN
+    + "  pipeline:\n"
+    "    runs-on: windows-latest\n"
+    "    steps:\n"
+    "      - name: Run pipeline_tests\n"
+    + SOL_GATE_IF
+    + "        run: |\n"
+    + SOL_UNITTEST
+    + "          exit $LASTEXITCODE\n"
+    "      - name: Report\n"
+    "        if: always()\n"
+    + SOL_REPORT_RUN
+    + "  shorthand:\n"
+    "    runs-on: ubuntu-latest\n"
+    "    steps:\n"
+    + SOL_SHORT_INLINE
+    + SOL_SHORT_BLOCK
+)
+WORKFLOW_SOL_SHORTHAND_ECHO = WORKFLOW_SOL.replace(SOL_SHORT_INLINE, "      - run: echo done\n")
+WORKFLOW_SOL_MOVED_UNDER_IF = WORKFLOW_SOL.replace(SOL_SHORT_INLINE, "").replace(
+    SOL_REPORT_RUN,
+    "        run: |\n          python tools/report.py\n          python -m pytest tools/repo_hygiene\n",
+)
+ACTION_BEFORE = (
+    "name: check-suite\n"
+    "runs:\n"
+    "  using: composite\n"
+    "  steps:\n"
+    "    - shell: bash\n"
+    "      run: python -m unittest discover\n"
+)
+def _na6_row(name, tool, tool_input, expect, reason=None, fixture=None):
+    """One `na6` table row (round 2 adds many, all of one shape)."""
+    row = {"name": name, "group": "na6", "tool": tool, "input": tool_input, "expect": expect}
+    if expect == "DENY":
+        row["na"] = "NA-6"
+    if reason:
+        row["reason_contains"] = reason
+    if fixture:
+        row["fixture"] = fixture
+    return row
+
+
+def _na6_edit(name, old, new, expect, reason=None, fixture="workflow_sol",
+              path="{BOARD}/.github/workflows/tests.yml"):
+    return _na6_row(
+        name, "Edit", {"file_path": path, "old_string": old, "new_string": new},
+        expect, reason, fixture,
+    )
+
+
+SHELL_HEREDOC_WORKFLOW = (
+    "cat > .github/workflows/tests.yml <<'YAML'\n"
+    "jobs:\n  t:\n    steps:\n      - run: echo done\n"
+    "YAML"
+)
+
 # A MOVE that also edits the body: the Batch Compile step changes job AND loses its target.
 WORKFLOW_MOVED_AND_TRIMMED = WORKFLOW_MOVED.replace(
     "cmake --build build --target batch_compile", "cmake --build build"
@@ -3424,6 +3499,133 @@ CASES = [
         "reason_contains": "unreadable",
         "fixture": "workflow_unreadable",
     },
+    # --------------------------- round 2: every repro from sol's r1 report, pinned DENY
+    # B1 NEUTRALISATION -- token containment kept every word; the command did not run.
+    _na6_edit(
+        "na6 r2 B1 echo of the shard invocation",
+        SOL_SHARD_RUN, SOL_SHARD_RUN.replace("run: ", "run: echo "), "DENY", "'python -m'",
+    ),
+    _na6_edit(
+        "na6 r2 B1 early return before the test",
+        SOL_UNITTEST, "          return\n" + SOL_UNITTEST, "DENY", "`return` added before",
+    ),
+    _na6_edit(
+        "na6 r2 B1 exit LASTEXITCODE moved before the test",
+        SOL_UNITTEST + "          exit $LASTEXITCODE\n",
+        "          exit $LASTEXITCODE\n" + SOL_UNITTEST, "DENY", "`exit $lastexitcode` added",
+    ),
+    _na6_edit(
+        "na6 r2 B1 test line moved into a heredoc",
+        SOL_UNITTEST, "          cat <<'EOF'\n" + SOL_UNITTEST + "          EOF\n",
+        "DENY", "'python -m'",
+    ),
+    _na6_edit(
+        "na6 r2 B1 test line moved into a here-string",
+        SOL_UNITTEST, "          $doc = @'\n" + SOL_UNITTEST + "          '@\n",
+        "DENY", "'python -m'",
+    ),
+    _na6_edit(
+        "na6 r2 B1 echo of the test with the head count padded elsewhere",
+        SOL_UNITTEST,
+        "          echo python -m unittest discover -s tests\n          python -m pip --version\n",
+        "DENY", "`echo` neutralises",
+    ),
+    _na6_edit(
+        "na6 r2 B1 failing exit 1 before the test fails red and is allowed",
+        SOL_UNITTEST, "          exit 1\n" + SOL_UNITTEST, "ALLOW",
+    ),
+    # B2 CONDITIONS -- an added or edited `if:` skips a test that still "exists".
+    _na6_edit(
+        "na6 r2 B2 step condition narrowed to workflow_dispatch",
+        SOL_GATE_IF,
+        SOL_GATE_IF.replace("'true'\n", "'true' && github.event_name == 'workflow_dispatch'\n"),
+        "DENY", "condition was added or changed",
+    ),
+    _na6_edit(
+        "na6 r2 B2 step condition added to an unconditioned test step",
+        "      - name: Run repo hygiene unittest shard\n",
+        "      - name: Run repo hygiene unittest shard\n"
+        "        if: github.event_name == 'workflow_dispatch'\n",
+        "DENY", "condition was added or changed",
+    ),
+    _na6_edit(
+        "na6 r2 B2 job condition added above a test step",
+        "  hygiene:\n    runs-on: windows-latest\n",
+        "  hygiene:\n    if: github.event_name == 'push'\n    runs-on: windows-latest\n",
+        "DENY", "condition was added or changed",
+    ),
+    _na6_row(
+        "na6 r2 B2 test moved into a step with an if it did not have",
+        "Write",
+        {"file_path": "{BOARD}/.github/workflows/tests.yml",
+         "content": WORKFLOW_SOL_MOVED_UNDER_IF},
+        "DENY", "condition was added or changed", "workflow_sol",
+    ),
+    _na6_edit(
+        "na6 r2 B2 removing a step condition is allowed",
+        SOL_GATE_IF, "", "ALLOW",
+    ),
+    # B3 SHORTHAND -- `- run:` is a run key, inline and block.
+    _na6_row(
+        "na6 r2 B3 shorthand inline step replaced by a Write",
+        "Write",
+        {"file_path": "{BOARD}/.github/workflows/tests.yml",
+         "content": WORKFLOW_SOL_SHORTHAND_ECHO},
+        "DENY", "net removal", "workflow_sol",
+    ),
+    _na6_edit(
+        "na6 r2 B3 shorthand block step deleted",
+        SOL_SHORT_BLOCK, "", "DENY", "net removal",
+    ),
+    _na6_edit(
+        "na6 r2 B3 shorthand step gains an argument",
+        SOL_SHORT_INLINE, SOL_SHORT_INLINE.replace("repo_hygiene", "repo_hygiene -q"), "ALLOW",
+    ),
+    # Hardening (b): composite actions.
+    _na6_edit(
+        "na6 r2 composite action echo of its test",
+        "      run: python -m unittest discover\n",
+        "      run: echo python -m unittest discover\n",
+        "DENY", "'python -m'", "action_before",
+        "{BOARD}/.github/actions/check-suite/action.yml",
+    ),
+    _na6_edit(
+        "na6 r2 composite action gains an argument",
+        "      run: python -m unittest discover\n",
+        "      run: python -m unittest discover -v\n",
+        "ALLOW", None, "action_before",
+        "{BOARD}/.github/actions/check-suite/action.yml",
+    ),
+    # Hardening (c): shell writes to CI manifests never reach the comparison.
+    _na6_row(
+        "na6 r2 shell heredoc over a workflow",
+        "Bash", {"command": SHELL_HEREDOC_WORKFLOW}, "DENY", "bypasses the whole-file",
+    ),
+    _na6_row(
+        "na6 r2 shell sed -i on a workflow",
+        "Bash", {"command": "sed -i 's/pytest/true/' .github/workflows/tests.yml"},
+        "DENY", "bypasses the whole-file",
+    ),
+    _na6_row(
+        "na6 r2 shell Set-Content on a composite action",
+        "PowerShell",
+        {"command": "Set-Content -Path .github/actions/check-suite/action.yml -Value 'x'"},
+        "DENY", "bypasses the whole-file",
+    ),
+    _na6_row(
+        "na6 r2 shell Move-Item of a workflow",
+        "PowerShell",
+        {"command": "Move-Item .github/workflows/tests.yml .github/workflows/old.yml"},
+        "DENY", "bypasses the whole-file",
+    ),
+    _na6_row(
+        "na6 r2 shell read of a workflow is allowed",
+        "Bash", {"command": "cat .github/workflows/tests.yml"}, "ALLOW",
+    ),
+    _na6_row(
+        "na6 r2 shell git diff of the workflows is allowed",
+        "Bash", {"command": "git diff -- .github/workflows/tests.yml"}, "ALLOW",
+    ),
     # -------------------------------- NA-3's `claude auth` arm, bounded by the REGISTER
     #
     # `never-authorized.json` v21 NA-3 names `claude auth login|logout`, not `claude auth`.
@@ -4845,6 +5047,19 @@ def fixture_workflow_253(paths):
     return {}
 
 
+def fixture_workflow_sol(paths):
+    _write(_board_workflow(paths), WORKFLOW_SOL)
+    return {}
+
+
+def fixture_action_before(paths):
+    _write(
+        os.path.join(paths["BOARD"], ".github", "actions", "check-suite", "action.yml"),
+        ACTION_BEFORE,
+    )
+    return {}
+
+
 def fixture_workflow_unreadable(paths):
     """A workflow whose bytes are not UTF-8: the comparison cannot be made, so DENY."""
     path = _board_workflow(paths)
@@ -5689,6 +5904,8 @@ FIXTURES = {
     "workflow_solo": fixture_workflow_solo,
     "workflow_253": fixture_workflow_253,
     "workflow_unreadable": fixture_workflow_unreadable,
+    "workflow_sol": fixture_workflow_sol,
+    "action_before": fixture_action_before,
     # The UNSET half of the expansion pairs, and the unresolvable-reference rows.
     "lane_prompt_unset": fixture_lane_prompt_unset,
     "board_root_unset": fixture_board_root_unset,
@@ -8264,6 +8481,8 @@ NA6_MARKER_EXAMPLES = {
     "pytest `-k not`": "      - run: pytest -k \"not slow\"\n",
     "ctest --exclude-regex": "      - run: pytest; ctest --exclude-regex Slow\n",
     "ctest -E": "      - run: pytest; ctest --output-on-failure -E Slow\n",
+    "`if ($false)`": "      - run: pytest; if ($false) { ./t }\n",
+    "`if false`": "      - run: pytest; if false; then ./t; fi\n",
 }
 NA6_MARKER_BASE = "jobs:\n  t:\n    steps:\n      - run: pytest\n"
 
@@ -8312,14 +8531,30 @@ def _make_marker_tests(label, example):
     def allows_when_already_present(self):
         self._judge(NA6_MARKER_BASE + example, NA6_MARKER_BASE + example)
 
-    return denies, allows_when_already_present
+    # Round 2 (sol r1 hardening a): the comparison is STRICTLY greater-than.  A `!=` or
+    # `>=` mutant fails one of these three.  Asserted on the hook's own marker comparison,
+    # because removing the example's step from a whole file also removes its tokens.
+    def transitions(self):
+        added = self.module._na6_added_marker
+        self.assertIsNone(added(NA6_MARKER_BASE + example, NA6_MARKER_BASE), "removal")
+        self.assertIsNone(
+            added(NA6_MARKER_BASE + example + example, NA6_MARKER_BASE + example), "2 -> 1"
+        )
+        self.assertIsNone(added(NA6_MARKER_BASE + example, NA6_MARKER_BASE + example), "1 -> 1")
+        self.assertEqual(
+            added(NA6_MARKER_BASE + example, NA6_MARKER_BASE + example + example), label, "1 -> 2"
+        )
+        self.assertEqual(added(NA6_MARKER_BASE, NA6_MARKER_BASE + example), label, "0 -> 1")
+
+    return denies, allows_when_already_present, transitions
 
 
 for _index, (_label, _example) in enumerate(NA6_MARKER_EXAMPLES.items()):
-    _deny, _allow = _make_marker_tests(_label, _example)
+    _deny, _allow, _transitions = _make_marker_tests(_label, _example)
     _stem = "%02d_%s" % (_index, re.sub(r"[^a-z0-9]+", "_", _label.lower()).strip("_"))
     setattr(Na6WorkflowWholeFileMarkerTests, "test_marker_added_denies_" + _stem, _deny)
     setattr(Na6WorkflowWholeFileMarkerTests, "test_marker_kept_allows_" + _stem, _allow)
+    setattr(Na6WorkflowWholeFileMarkerTests, "test_marker_transitions_" + _stem, _transitions)
 
 
 def _slug(name):

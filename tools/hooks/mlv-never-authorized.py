@@ -3560,49 +3560,150 @@ def rule_na4(ctx):
 
 _ASSERT_RX = re.compile(r"\bQVERIFY\b|\bQCOMPARE\b|\bassert\b")
 _QSKIP_RX = re.compile(r"\bQSKIP\b")
-_RUN_HEAD_RX = re.compile(r"^([ \t]*)run:[ \t]*(.*)$")
+# Round 2 (B3): the list-item shorthand `- run:` is a `run:` key too.  The captured prefix
+# INCLUDES the dash, so its width is the KEY's column, which is what bounds a block scalar.
+_RUN_HEAD_RX = re.compile(r"^([ \t]*(?:-[ \t]+)?)run:[ \t]*(.*)$")
+_IF_HEAD_RX = re.compile(r"^([ \t]*(?:-[ \t]+)?)if:[ \t]*(.*)$")
+_DASH_RX = re.compile(r"^([ \t]*-[ \t]+)")
+_STEPS_KEY_RX = re.compile(r"^[ \t]*steps:[ \t]*$")
 _BLOCK_SCALAR_MARKERS = ("|", "|-", "|+", ">", ">-", ">+", "")
+_FOLDED_MARKERS = (">", ">-", ">+")
 _TEST_CPP_RX = re.compile(r"\btest_[\w./\\-]*\.cpp\b", re.I)
 WORKFLOW_TAIL = ".github/workflows"
+# Round 2 (hardening b): composite actions carry `run:` steps exactly like a workflow.
+ACTIONS_TAIL = ".github/actions"
+_ACTION_MANIFEST_NAMES = ("action.yml", "action.yaml")
 
 
 def _indent_of(line):
     return len(re.match(r"^[ \t]*", line).group(0).expandtabs(4))
 
 
-def _run_bodies(text):
-    """Every ``run:`` body in a workflow fragment, whitespace-normalised.
+def _column_of(prefix):
+    return len(prefix.expandtabs(4))
 
-    A block scalar ends at the first non-blank line indented no more than its ``run:``
-    key -- getting that boundary wrong would swallow the following job and make a MOVE
-    look like a removal (or the reverse), which is precisely the distinction NA-6's
-    exception turns on.
+
+def _yaml_indents(lines):
+    """Each line's indent, or -1 for a blank or comment-only line (computed once a file)."""
+    indents = []
+    for line in lines:
+        stripped = line.strip()
+        indents.append(-1 if not stripped or stripped.startswith("#") else _indent_of(line))
+    return indents
+
+
+def _yaml_block_end(indents, start, column):
+    """First index >= ``start`` holding a real line indented no more than ``column``."""
+    index = start
+    while index < len(indents):
+        if 0 <= indents[index] <= column:
+            return index
+        index += 1
+    return index
+
+
+def _yaml_scalar_lines(lines, indents, index, column, rest):
+    """The lines of the value of the key at ``lines[index]`` (key column ``column``).
+
+    A literal block keeps its lines; a folded block or a plain scalar that continues onto
+    more-indented lines is ONE logical line, as YAML folds it.  Returns (lines, end).
     """
-    bodies = []
-    lines = (text or "").splitlines()
+    end = _yaml_block_end(indents, index + 1, column)
+    rest = rest.strip()
+    body = [line.strip() for line in lines[index + 1 : end]]
+    if rest in _BLOCK_SCALAR_MARKERS and rest not in _FOLDED_MARKERS:
+        return body, end
+    # A plain or folded scalar carries no comments: YAML drops `#` lines and ` #` tails.
+    body = [_NA6_COMMENT_RX.sub("", line).strip() for line in body]
+    rest = _NA6_COMMENT_RX.sub("", rest).strip()
+    parts = [] if rest in _BLOCK_SCALAR_MARKERS else [rest]
+    folded = " ".join(part for part in parts + body if part)
+    return ([folded] if folded else []), end
+
+
+def _yaml_if_value(lines, indents, start, end, column, dash_ok=True):
+    """The normalised ``if:`` of the mapping whose keys sit at ``column`` in [start, end)."""
+    for index in range(start, end):
+        if indents[index] < 0 or indents[index] > column:
+            continue
+        head = _IF_HEAD_RX.match(lines[index])
+        if not head or _column_of(head.group(1)) != column:
+            continue
+        if not dash_ok and "-" in head.group(1):
+            continue
+        value, _ = _yaml_scalar_lines(lines, indents, index, column, head.group(2))
+        return re.sub(r"\s+", " ", " ".join(value)).strip()
+    return ""
+
+
+def _yaml_parent(indents, index, indent):
+    """Nearest real line above ``index`` indented less than ``indent`` (or -1)."""
+    index -= 1
+    while index >= 0 and not 0 <= indents[index] < indent:
+        index -= 1
+    return index
+
+
+def _na6_step_condition(lines, indents, run_index, column, has_dash, job_ifs):
+    """(job if, step if) governing the `run:` key at ``lines[run_index]``.
+
+    The step is the list item whose keys sit at ``column``; its job is the mapping that
+    owns the ``steps:`` sequence the item belongs to.  Anything this cannot place is the
+    empty condition, which compares EQUAL only to another unplaceable step -- so a run
+    moved under a condition it did not have is still a changed condition.
+    """
+    step_start = run_index if has_dash else None
+    if step_start is None:
+        parent = _yaml_parent(indents, run_index, column)
+        if parent >= 0:
+            dash = _DASH_RX.match(lines[parent])
+            if dash and _column_of(dash.group(1)) == column:
+                step_start = parent
+    if step_start is None:
+        return ("", "")
+    step_end = _yaml_block_end(indents, run_index + 1, column - 1)
+    step_if = _yaml_if_value(lines, indents, step_start, step_end, column)
+    steps_key = _yaml_parent(indents, step_start, indents[step_start])
+    job_if = ""
+    if steps_key >= 0 and _STEPS_KEY_RX.match(lines[steps_key]):
+        steps_indent = indents[steps_key]
+        job = _yaml_parent(indents, steps_key, steps_indent)
+        if job >= 0:
+            if job not in job_ifs:
+                job_end = _yaml_block_end(indents, job + 1, indents[job])
+                # Only the job's OWN keys: at the steps indent, and not a list item.
+                job_ifs[job] = _yaml_if_value(
+                    lines, indents, job + 1, job_end, steps_indent, dash_ok=False
+                )
+            job_if = job_ifs[job]
+    return (job_if, step_if)
+
+
+def _na6_run_steps(text):
+    """Every `run:` key in a workflow or composite action: (condition, body lines).
+
+    A block scalar ends at the first real line indented no more than its ``run:`` key --
+    getting that boundary wrong would swallow the following job and make a MOVE look like a
+    removal (or the reverse), which is precisely the distinction NA-6's exception turns on.
+    """
+    steps = []
+    lines = (text or "").split("\n")
+    indents = _yaml_indents(lines)
+    job_ifs = {}
     index = 0
     while index < len(lines):
-        head = _RUN_HEAD_RX.match(lines[index])
+        head = _RUN_HEAD_RX.match(lines[index]) if indents[index] >= 0 else None
         if not head:
             index += 1
             continue
-        indent = _indent_of(head.group(1))
-        rest = head.group(2).strip()
-        index += 1
-        if rest not in _BLOCK_SCALAR_MARKERS:
-            bodies.append(re.sub(r"\s+", " ", rest).strip())
-            continue
-        block = []
-        while index < len(lines):
-            line = lines[index]
-            if line.strip() and _indent_of(line) <= indent:
-                break
-            block.append(line.strip())
-            index += 1
-        body = re.sub(r"\s+", " ", " ".join(block)).strip()
-        if body:
-            bodies.append(body)
-    return bodies
+        column = _column_of(head.group(1))
+        body, end = _yaml_scalar_lines(lines, indents, index, column, head.group(2))
+        condition = _na6_step_condition(
+            lines, indents, index, column, "-" in head.group(1), job_ifs
+        )
+        steps.append((condition, body))
+        index = max(end, index + 1)
+    return steps
 
 
 # NA6-WORKFLOW-WHOLEFILE-1.  The workflow arm judges the WHOLE FILE, before and after, for
@@ -3620,7 +3721,40 @@ def _run_bodies(text):
 #       file (comments stripped) than in the old one.
 # The marker list is explicit and every entry has its own test row.  A file the hook
 # cannot read, or an Edit it cannot reconstruct, is refused (fail closed).
+#
+# Round 2 (sol r1 B1/B2).  Token containment does not prove EXECUTION: `echo <the test>`,
+# an early `return`, or the test moved into a heredoc keeps every token.  So, in addition:
+#   (3) every COMMAND LINE of an old run body (comments stripped, `\`/backtick continuations
+#       joined, heredoc and here-string data excluded) must survive with its command HEAD --
+#       its first two words -- intact, as a multiset.  The exact08 widening keeps
+#       `$soloPattern =`; `echo python -m ...` loses `python -m`;
+#   (4) each surviving head must run under a condition NO STRICTER than before: the job
+#       `if:` and the step `if:` are each either unchanged or removed.  An added or edited
+#       `if:`, or a move into a step or job with an `if:` it did not have, is refused;
+#   (5) a new line that starts with a printing/no-op word (`echo`, `Write-Host`, `:`, ...)
+#       followed by an old command head neutralises that command;
+#   (6) a statement-level `return`/`exit`/`break`/`continue`/`goto` placed before an old
+#       command head in the same body is refused unless that (control, head) ordering
+#       already existed.  `exit <non-zero literal>` fails red and is not a skip.
 _NA6_TOKEN_RX = re.compile(r"-{0,2}\w+")
+_NA6_HEREDOC_RX = re.compile(r"<<-?[ \t]*(['\"]?)([A-Za-z_]\w*)\1")
+_NA6_HERESTRING_RX = re.compile(r"@(['\"])\s*$")
+_NA6_NEUTRALISERS = frozenset(
+    (
+        "echo",
+        "printf",
+        "write-host",
+        "write-output",
+        "write-verbose",
+        "write-information",
+        "write-debug",
+        ":",
+        "true",
+        "rem",
+    )
+)
+_NA6_CONTROL_RX = re.compile(r"^(return|exit|break|continue|goto)\b(.*)$", re.I)
+_NA6_FAILING_EXIT_RX = re.compile(r"^\s*[1-9]\d*\s*;?\s*$")
 _NA6_COMMENT_RX = re.compile(r"(?:^|(?<=\s))#.*$")
 _NA6_WORKFLOW_MARKERS = (
     ("continue-on-error", re.compile(r"\bcontinue-on-error\b", re.I)),
@@ -3648,6 +3782,8 @@ _NA6_WORKFLOW_MARKERS = (
     ("pytest `-k not`", re.compile(r"(?<![\w-])-k\s+['\"]?not\b")),
     ("ctest --exclude-regex", re.compile(r"--exclude-regex\b")),
     ("ctest -E", re.compile(r"\bctest\b[^\n]*\s-E\b")),
+    ("`if ($false)`", re.compile(r"\bif\s*\(\s*\$false\s*\)", re.I)),
+    ("`if false`", re.compile(r"\bif\s+false\b")),
 )
 
 
@@ -3655,12 +3791,110 @@ def _na6_strip_comments(text):
     return "\n".join(_NA6_COMMENT_RX.sub("", line) for line in text.split("\n"))
 
 
-def _na6_run_tokens(text):
-    counts = {}
-    for body in _run_bodies(_na6_strip_comments(text)):
-        for token in _NA6_TOKEN_RX.findall(body):
-            counts[token] = counts.get(token, 0) + 1
-    return counts
+def _na6_head(command):
+    """A command line's HEAD: its first two words (one if it has only one)."""
+    return " ".join(command.split()[:2])
+
+
+def _na6_head_of(command, heads):
+    """The old head this command line still carries, if any: its two-word head, or -- for
+    an old one-word command such as `pytest` that has since gained arguments -- its first
+    word.  Adding or changing arguments keeps the head; renaming the command loses it."""
+    words = command.split()
+    for size in (2, 1):
+        head = " ".join(words[:size])
+        if len(words) >= size and head in heads:
+            return head
+    return None
+
+
+def _na6_command_lines(body):
+    """The executable command lines of one run body, in order (see (3) above)."""
+    commands = []
+    pending = ""
+    terminator = None
+    for raw in body:
+        line = raw.strip()
+        if terminator is not None:
+            done = line == terminator[1] if terminator[0] == "heredoc" else line.startswith(
+                terminator[1]
+            )
+            if done:
+                terminator = None
+            continue
+        line = _NA6_COMMENT_RX.sub("", line).strip()
+        if not line:
+            continue
+        pending = (pending + " " + line).strip() if pending else line
+        if pending.endswith("\\") or pending.endswith("`"):
+            pending = pending[:-1].rstrip()
+            continue
+        commands.append(re.sub(r"\s+", " ", pending))
+        pending = ""
+        heredoc = _NA6_HEREDOC_RX.search(line)
+        herestring = _NA6_HERESTRING_RX.search(line)
+        if heredoc:
+            terminator = ("heredoc", heredoc.group(2))
+        elif herestring:
+            terminator = ("herestring", herestring.group(1) + "@")
+    if pending:
+        commands.append(re.sub(r"\s+", " ", pending))
+    return commands
+
+
+def _na6_profile(text):
+    """Tokens, (command line, condition) occurrences, and per-body command lists."""
+    tokens_count = {}
+    occurrences = []
+    bodies = []
+    for condition, body in _na6_run_steps(text):
+        for line in body:
+            for token in _NA6_TOKEN_RX.findall(_NA6_COMMENT_RX.sub("", line.strip())):
+                tokens_count[token] = tokens_count.get(token, 0) + 1
+        commands = _na6_command_lines(body)
+        bodies.append(commands)
+        for command in commands:
+            occurrences.append((command, condition))
+    return tokens_count, occurrences, bodies
+
+
+def _na6_no_stricter(new_condition, old_condition):
+    return all(new in (old, "") for new, old in zip(new_condition, old_condition))
+
+
+def _na6_neutralised(bodies, heads):
+    """Multiset of (word, head): a printing/no-op word applied to an old command head."""
+    found = {}
+    for commands in bodies:
+        for command in commands:
+            parts = command.split(None, 1)
+            if len(parts) < 2 or parts[0].lower() not in _NA6_NEUTRALISERS:
+                continue
+            head = _na6_head_of(parts[1].lstrip("'\"(").rstrip("'\")"), heads)
+            if head:
+                key = (parts[0].lower(), head)
+                found[key] = found.get(key, 0) + 1
+    return found
+
+
+def _na6_control_pairs(bodies, heads):
+    """Set of (control statement, later old head) orderings within one body."""
+    pairs = set()
+    for commands in bodies:
+        for index, command in enumerate(commands):
+            control = _NA6_CONTROL_RX.match(command)
+            if not control:
+                continue
+            if control.group(1).lower() == "exit" and _NA6_FAILING_EXIT_RX.match(
+                control.group(2)
+            ):
+                continue
+            statement = command.lower()
+            for later in commands[index + 1 :]:
+                head = _na6_head_of(later, heads)
+                if head:
+                    pairs.add((statement, head))
+    return pairs
 
 
 def _workflow_whole_file(ctx, path_norm):
@@ -3716,8 +3950,8 @@ def _workflow_whole_file(ctx, path_norm):
 
 
 def _judge_workflow_whole_file(before, after, path_norm):
-    old_tokens = _na6_run_tokens(before)
-    new_tokens = _na6_run_tokens(after)
+    old_tokens, old_occurrences, old_bodies = _na6_profile(before)
+    new_tokens, new_occurrences, new_bodies = _na6_profile(after)
     for token in sorted(old_tokens):
         if new_tokens.get(token, 0) < old_tokens[token]:
             raise Deny(
@@ -3725,16 +3959,107 @@ def _judge_workflow_whole_file(before, after, path_norm):
                 "net removal of a workflow test step: run-body token %r falls from %d to %d "
                 "in %s" % (token, old_tokens[token], new_tokens.get(token, 0), path_norm),
             )
+    # (3) + (4): each old command head, under a condition no stricter than its own.
+    old_by_head = {}
+    for command, condition in old_occurrences:
+        old_by_head.setdefault(_na6_head(command), []).append(condition)
+    heads = set(old_by_head)
+    new_by_head = {}
+    for command, condition in new_occurrences:
+        head = _na6_head_of(command, heads)
+        if head:
+            new_by_head.setdefault(head, []).append(condition)
+    for head in sorted(heads):
+        olds = old_by_head[head]
+        news = list(new_by_head.get(head, ()))
+        if len(news) < len(olds):
+            raise Deny(
+                "NA-6",
+                "net removal of a workflow test step: command %r runs %d time(s) in %s, "
+                "was %d (a removed, renamed or neutralised command line)"
+                % (head, len(news), path_norm, len(olds)),
+            )
+        unmatched = []
+        for condition in olds:
+            if condition in news:
+                news.remove(condition)
+            else:
+                unmatched.append(condition)
+        for condition in unmatched:
+            match = next((new for new in news if _na6_no_stricter(new, condition)), None)
+            if match is None:
+                raise Deny(
+                    "NA-6",
+                    "a workflow condition was added or changed on a step running %r in %s "
+                    "(was job if %r, step if %r); an `if:` may only be removed"
+                    % (head, path_norm, condition[0], condition[1]),
+                )
+            news.remove(match)
+    # (5) a printing/no-op word applied to an old command.
+    old_neutral = _na6_neutralised(old_bodies, heads)
+    for key, count in sorted(_na6_neutralised(new_bodies, heads).items()):
+        if count > old_neutral.get(key, 0):
+            raise Deny(
+                "NA-6",
+                "`%s` neutralises the test command %r in %s" % (key[0], key[1], path_norm),
+            )
+    # (6) control flow placed before an old command.
+    added = sorted(_na6_control_pairs(new_bodies, heads) - _na6_control_pairs(old_bodies, heads))
+    if added:
+        raise Deny(
+            "NA-6",
+            "`%s` added before the test command %r in %s" % (added[0][0], added[0][1], path_norm),
+        )
+    label = _na6_added_marker(before, after)
+    if label:
+        raise Deny("NA-6", "%s added to %s neutralises a test" % (label, path_norm))
+
+
+def _na6_added_marker(before, after):
+    """The first marker that occurs MORE often after than before (comments stripped).
+
+    Removing a marker, or keeping its count, is never a weakening -- the comparison is
+    strictly greater-than, and the suite pins removal and 2 -> 1 as ALLOW."""
     old_plain = _na6_strip_comments(before)
     new_plain = _na6_strip_comments(after)
     for label, marker in _NA6_WORKFLOW_MARKERS:
         if len(marker.findall(new_plain)) > len(marker.findall(old_plain)):
-            raise Deny("NA-6", "%s added to %s neutralises a test" % (label, path_norm))
+            return label
+    return None
+
+
+def _na6_is_ci_manifest(path_norm):
+    if has_seg(path_norm, WORKFLOW_TAIL):
+        return True
+    return has_seg(path_norm, ACTIONS_TAIL) and path_norm.rsplit("/", 1)[-1] in (
+        _ACTION_MANIFEST_NAMES
+    )
+
+
+def _na6_shell_ci_write(command, acts):
+    """Round 2 (hardening c): a shell write, move, delete or truncation of a CI manifest
+    directory.  The whole-file comparison needs both texts, which a shell write never
+    offers, so workflow and composite-action edits go through Edit/Write only."""
+    candidates = [dest.strip("'\"") for dest in _write_destinations(command)]
+    if acts & {"delete", "move", "truncate"}:
+        candidates.extend(tokens(command))
+    for candidate in candidates:
+        path_norm = norm(candidate)
+        if has_seg(path_norm, WORKFLOW_TAIL) or has_seg(path_norm, ACTIONS_TAIL):
+            return path_norm
+    return None
 
 
 def rule_na6(ctx):
     if ctx.tool in SHELL_TOOLS:
         acts = shell_acts(ctx.command)
+        ci_target = _na6_shell_ci_write(ctx.command, acts)
+        if ci_target:
+            raise Deny(
+                "NA-6",
+                "a shell write to %s bypasses the whole-file workflow comparison; edit "
+                "workflows and composite actions with Edit/Write" % ci_target,
+            )
         if "delete" not in acts:
             return
         for token in tokens(ctx.command):
@@ -3749,7 +4074,7 @@ def rule_na6(ctx):
     new_text = ctx.new_text or ""
     old_text = ctx.old_text
 
-    if has_seg(path_norm, WORKFLOW_TAIL):
+    if _na6_is_ci_manifest(path_norm):
         if "continue-on-error" in new_text.lower():
             raise Deny("NA-6", "continue-on-error in a workflow makes a red test green")
         if ctx.tool in ("Edit", "Write"):
