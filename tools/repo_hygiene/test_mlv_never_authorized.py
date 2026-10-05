@@ -562,6 +562,38 @@ SHELL_HEREDOC_WORKFLOW = (
     "jobs:\n  t:\n    steps:\n      - run: echo done\n"
     "YAML"
 )
+# NA6-TRIPWIRES-1 shell parity rows: (name, tool, command).  Expected verdict = master's.
+NA6_SHELL_PARITY = (
+    ("heredoc over a workflow", "Bash", SHELL_HEREDOC_WORKFLOW),
+    ("echo redirect over a workflow", "Bash", "echo x > " + WF),
+    ("echo append to a workflow", "Bash", "echo x >> " + WF),
+    ("rm of a workflow", "Bash", "rm " + WF),
+    ("Remove-Item of a workflow", "PowerShell", "Remove-Item -Force " + WF),
+    ("sed -i on a workflow", "Bash", "sed -i 's/12/1/' " + WF),
+    ("mv of a workflow", "Bash", "mv " + WF + " old.yml"),
+    ("Move-Item of a workflow", "PowerShell",
+     "Move-Item " + WF + " .github/workflows/old.yml"),
+    ("cp over a workflow", "Bash", "cp other.yml " + WF),
+    ("Set-Content on a composite action", "PowerShell",
+     "Set-Content -Path .github/actions/check-suite/action.yml -Value 'x'"),
+    ("quoted redirect in a search pattern", "Bash",
+     "rg -n 'echo x > " + WF + "' tools/repo_hygiene/test_mlv_never_authorized.py"),
+    ("quoted rm in a grep pattern", "Bash", 'grep -n "rm ' + WF + '" notes.md'),
+    ("backup then redirect over the workflow", "Bash",
+     "cp " + WF + " wf.bak; echo x > " + WF),
+    ("Copy-Item backup then Set-Content", "PowerShell",
+     "Copy-Item " + WF + " wf.bak; Set-Content " + WF + " 'jobs: {}'"),
+    ("heredoc body naming mv of a workflow", "Bash",
+     "cat >> notes.md <<'EOF'\nmv " + WF + " b.yml was refused\nEOF"),
+    ("multi-line commit message naming mv", "Bash",
+     'git commit -m "subject\n\nmv ' + WF + ' old.yml is denied"'),
+    ("Set-Content whose VALUE names a workflow", "PowerShell",
+     "Set-Content -Path notes/workflow-reference.txt -Value '" + WF + "'"),
+    ("Out-File whose InputObject names a workflow", "PowerShell",
+     "Out-File -FilePath notes/workflow-reference.txt -InputObject '" + WF + "'"),
+    ("redirect inside a shell comment", "Bash",
+     "cat " + WF + " # do not run: echo x > " + WF),
+)
 
 # A MOVE that also edits the body: the Batch Compile step changes job AND loses its target.
 WORKFLOW_MOVED_AND_TRIMMED = WORKFLOW_MOVED.replace(
@@ -3409,7 +3441,7 @@ CASES = [
     #
     # These rows were written for #270 (NA6-WORKFLOW-WHOLEFILE-1, closed) and are reused as
     # the NA-6 corpus.  #270 REPLACED master's fragment predicate; NA6-TRIPWIRES-1 keeps it
-    # byte for byte and only ADDS refusals (T1 step survival, T2 marker count, T3 shell
+    # byte for byte and only ADDS refusals (T1 step survival, T2 marker count; no shell
     # target), so an expectation here follows master's verdict wherever master DENIES, and
     # the tripwires' wherever master ALLOWS.  Rows labelled LIMIT are ALLOWED exactly as on
     # master: the hook does not judge whether a test still EXECUTES (see the register).
@@ -3717,28 +3749,6 @@ CASES = [
         "DENY", "the step with run 'python -m unittest discover' runs 0", "action_before",
         "{BOARD}/.github/actions/check-suite/action.yml",
     ),
-    # Hardening (c), T3: a shell WRITE, delete or move whose TARGET is a CI manifest.
-    _na6_row(
-        "na6 r2 shell heredoc over a workflow",
-        "Bash", {"command": SHELL_HEREDOC_WORKFLOW}, "DENY", "bypasses the whole-file",
-    ),
-    _na6_row(
-        "na6 r2 shell sed -i on a workflow",
-        "Bash", {"command": "sed -i 's/pytest/true/' .github/workflows/tests.yml"},
-        "DENY", "bypasses the whole-file",
-    ),
-    _na6_row(
-        "na6 r2 shell Set-Content on a composite action",
-        "PowerShell",
-        {"command": "Set-Content -Path .github/actions/check-suite/action.yml -Value 'x'"},
-        "DENY", "bypasses the whole-file",
-    ),
-    _na6_row(
-        "na6 r2 shell Move-Item of a workflow",
-        "PowerShell",
-        {"command": "Move-Item .github/workflows/tests.yml .github/workflows/old.yml"},
-        "DENY", "bypasses the whole-file",
-    ),
     _na6_row(
         "na6 r2 shell read of a workflow is allowed",
         "Bash", {"command": "cat .github/workflows/tests.yml"}, "ALLOW",
@@ -3794,67 +3804,16 @@ CASES = [
     _na6_real_edit("LIMIT deleting the interior testsPerShard line", REAL_TPS_LINE, "", "ALLOW"),
     _na6_real("LIMIT git checkout of a workflow from a ref", "Bash",
               {"command": "git checkout HEAD~1 -- " + WF}, "ALLOW"),
-    # T3: shell acts whose TARGET is a workflow.
-    _na6_real("shell echo redirect over a workflow", "Bash",
-              {"command": "echo x > " + WF}, "DENY", "bypasses the whole-file"),
-    _na6_real("shell echo append to a workflow", "Bash",
-              {"command": "echo x >> " + WF}, "DENY", "bypasses the whole-file"),
-    _na6_real("shell rm of a workflow", "Bash",
-              {"command": "rm " + WF}, "DENY", "bypasses the whole-file"),
-    _na6_real("shell Remove-Item of a workflow", "PowerShell",
-              {"command": "Remove-Item -Force " + WF}, "DENY", "bypasses the whole-file"),
-    _na6_real("shell sed -i on a workflow", "Bash",
-              {"command": "sed -i 's/12/1/' " + WF}, "DENY", "bypasses the whole-file"),
-    _na6_real("shell mv of a workflow", "Bash",
-              {"command": "mv " + WF + " old.yml"}, "DENY", "bypasses the whole-file"),
-    _na6_real("shell cp over a workflow", "Bash",
-              {"command": "cp other.yml " + WF}, "DENY", "bypasses the whole-file"),
-    # PR #274 r1.  T3 reads UNQUOTED syntax only, one simple command at a time.
-    # sol B1: a redirect, writer or act head inside a QUOTED string is data, not an act.
-    _na6_real("r1 B1 quoted redirect in a search pattern is a read", "Bash",
-              {"command": "rg -n 'echo x > " + WF + "' "
-                          "tools/repo_hygiene/test_mlv_never_authorized.py"},
-              "ALLOW"),
-    _na6_real("r1 B1 quoted null-device redirect in a Select-String pattern is a read",
-              "PowerShell",
-              {"command": "Select-String -Path " + WF + " -Pattern 'cat " + WF + " 2>$null'"},
-              "ALLOW"),
-    _na6_real("r1 B1 quoted rm in a double-quoted grep pattern is a read", "Bash",
-              {"command": 'grep -n "rm ' + WF + '" notes.md 2>/dev/null'}, "ALLOW"),
-    _na6_real("r1 B1 a quoted DESTINATION of a real redirect is still a write", "Bash",
-              {"command": 'echo x > "' + WF + '"'}, "DENY", "bypasses the whole-file"),
-    _na6_real("r1 B1 a quoted Set-Content path is still a write", "PowerShell",
-              {"command": "Set-Content -Path '" + WF + "' -Value 'jobs: {}'"},
-              "DENY", "bypasses the whole-file"),
-    # sol B2: a copy source is excused only inside its own simple command.
-    _na6_real("r1 B2 backup then redirect over the workflow", "Bash",
-              {"command": "cp " + WF + " wf.bak; echo x > " + WF},
-              "DENY", "bypasses the whole-file"),
-    _na6_real("r1 B2 backup then sed -i on the workflow", "Bash",
-              {"command": "cp " + WF + " wf.bak; sed -i 's/--of 7/--of 1/' " + WF},
-              "DENY", "bypasses the whole-file"),
-    _na6_real("r1 B2 Copy-Item backup then Set-Content over the workflow", "PowerShell",
-              {"command": "Copy-Item " + WF + " wf.bak; Set-Content " + WF + " 'jobs: {}'"},
-              "DENY", "bypasses the whole-file"),
-    _na6_real("r1 B2 backup then redirect over a composite action", "Bash",
-              {"command": "cp .github/actions/check-suite/action.yml a.bak && "
-                          "echo x > .github/actions/check-suite/action.yml"},
-              "DENY", "bypasses the whole-file"),
-    # fable r1: heredoc and multi-line message BODIES are input, never act heads.
-    _na6_real("r1 heredoc body line starting with mv is not an act", "Bash",
-              {"command": "cat >> notes.md <<'EOF'\nmv " + WF + " b.yml was refused\nEOF"},
-              "ALLOW"),
-    _na6_real("r1 commit message heredoc naming rm of a workflow is not an act", "Bash",
-              {"command": "git commit -q -F - <<'EOF'\nsubject\n\nrm " + WF + " is denied\nEOF\n"
-                          "git log --oneline -1"},
-              "ALLOW"),
-    _na6_real("r1 multi-line quoted commit message naming mv is not an act", "Bash",
-              {"command": 'git commit -m "subject\n\nmv ' + WF + ' old.yml is denied"'}, "ALLOW"),
-    _na6_real("r1 PowerShell here-string body naming Remove-Item is not an act", "PowerShell",
-              {"command": "$m = @'\nRemove-Item " + WF + "\n'@\ngit commit -m $m"}, "ALLOW"),
-    _na6_real("r1 a real write after a heredoc is still a write", "Bash",
-              {"command": "cat > notes.md <<'EOF'\nx\nEOF\necho x > " + WF},
-              "DENY", "bypasses the whole-file"),
+    # SHELL PARITY (hub ruling, PR #274 r2).  NA6-TRIPWIRES-1 has NO shell arm: every
+    # round of the dropped T3 produced a new false positive (quoted patterns, backups,
+    # data operands, comments), so shell payloads are judged EXACTLY as on fork/master.
+    # These are T3's former DENY payloads and the false positives the reviews found;
+    # `Na6DifferentialTests` asserts each one's verdict AND stderr equal master's.
+    # Shell writes to CI manifests are card NA6-INDIRECT-SHELL-WRITERS-1 (CI-side).
+    *[
+        _na6_real("shell parity " + name, tool, {"command": command}, "ALLOW")
+        for name, tool, command in NA6_SHELL_PARITY
+    ],
     # T1: a step that existed is gone.
     _na6_real_write("Write dropping the pipeline_tests step", REAL_WITHOUT_PIPE_STEP, "DENY",
                     "the step with name 'Run pipeline_tests --check-golden (bounded shards)' "
@@ -8976,6 +8935,13 @@ class Na6DifferentialTests(unittest.TestCase):
             "LOOSENING vs %s on row %r: master %r, this hook ALLOWS"
             % (self.baseline_ref, case["name"], base.stderr.strip()),
         )
+        # No shell arm: a shell payload's verdict and line must be master's, exactly.
+        if case["tool"] in ("Bash", "PowerShell"):
+            self.assertEqual(
+                (new.returncode, new.stderr.strip()),
+                (base.returncode, base.stderr.strip()),
+                "shell row %r differs from %s" % (case["name"], self.baseline_ref),
+            )
 
 
 def _make_differential(case):

@@ -3662,7 +3662,7 @@ def rule_na6(ctx):
             )
 
 
-# ------------------------------------------------------------- NA-6 tripwires (T1-T3)
+# ------------------------------------------------------------- NA-6 tripwires (T1-T2)
 #
 # NA6-TRIPWIRES-1.  ADDITIVE ONLY, AND MONOTONE BY CONSTRUCTION.  `rule_na6` and
 # `_run_bodies` above are fork/master's, byte for byte, and still run first (RULES order).
@@ -3677,10 +3677,9 @@ def rule_na6(ctx):
 #       value (the `- run:` / `- uses:` shorthand included), for Edit AND Write;
 #   T2  no skip/neutralise marker of _NA6_WORKFLOW_MARKERS occurs more often in the new
 #       whole file (comments stripped) than in the old one;
-#   T3  a shell act WRITES, deletes or moves a path under .github/workflows or
-#       .github/actions -- judged on the act's TARGET only (a write destination, or a path
-#       argument of a delete/move command), never on every token beside a redirect.  A
-#       read naming a workflow, with any redirect to elsewhere or to a null device, passes.
+# There is NO shell arm: a text hook cannot read shell intent without new false
+# positives (three rounds on PR #274), so shell payloads are judged exactly as on master
+# and shell writes to CI manifests are card NA6-INDIRECT-SHELL-WRITERS-1.
 # The whole file is reconstructed fail-closed (from #270, NA6-WORKFLOW-WHOLEFILE-1): an
 # unreadable file, an Edit of a missing file, an absent/ambiguous `old_string` is DENY.
 #
@@ -3726,14 +3725,6 @@ _NA6_STEPS_KEY_RX = re.compile(r"^[ \t]*steps:[ \t]*(?:#.*)?$")
 _NA6_ITEM_RX = re.compile(r"^([ \t]*-[ \t]+)(\S.*)?$")
 _NA6_KEY_RX = re.compile(r"^([A-Za-z_][\w-]*):(?:[ \t]+(.*))?$")
 _NA6_BLOCK_MARKERS = ("|", "|-", "|+", ">", ">-", ">+")
-# T3: the command heads that DELETE or MOVE their path arguments (PowerShell aliases
-# included).  `git rm --cached` unstages and deletes nothing, exactly as `shell_acts` says.
-_NA6_DELETE_HEADS = frozenset(
-    ("rm", "del", "erase", "rd", "rmdir", "ri", "remove-item", "unlink", "shred")
-)
-_NA6_MOVE_HEADS = frozenset(
-    ("mv", "move", "mi", "move-item", "ren", "rni", "rename", "rename-item")
-)
 
 
 def _na6_strip_comments(text):
@@ -3919,180 +3910,10 @@ def _na6_judge_whole_file(before, after, path_norm):
         raise Deny("NA-6", "%s added to %s neutralises a test" % (label, path_norm))
 
 
-_NA6_HEREDOC_START_RX = re.compile(r"<<(-?)[ \t]*(['\"]?)([A-Za-z_][\w.-]*)\2")
-_NA6_QUOTE_MARK_RX = re.compile(r"NA6Q(\d+)/")
-
-
-def _na6_quote_end(text, start):
-    """Index just past the quoted string opening at ``text[start]`` (or ``len(text)``).
-
-    A single-quoted string has no escapes (PowerShell's doubled ``''`` simply closes and
-    reopens it); inside double quotes a backslash or a backtick escapes the next char."""
-    quote = text[start]
-    index = start + 1
-    while index < len(text):
-        char = text[index]
-        if quote == '"' and char in "\\`":
-            index += 2
-            continue
-        if char == quote:
-            return index + 1
-        index += 1
-    return len(text)
-
-
-def _na6_shell_segments(command):
-    """-> [(masked, quoted)]: the simple commands of ``command``, judged on UNQUOTED syntax.
-
-    Split at unquoted ``;``, ``&``, ``|`` and newlines.  Every quoted string and every
-    PowerShell here-string is DATA: it is replaced in ``masked`` by the placeholder
-    ``NA6Q<i>/`` (``quoted[i]`` holds its original text), so a redirect, a write cmdlet or
-    an act head written INSIDE quotes -- a search pattern, a commit message -- is never
-    read as one.  The placeholder carries a slash so a quoted OPERAND of a real writer
-    (``Set-Content -Path "<path>"``) still counts as a path.  Heredoc BODIES are dropped
-    whole: their lines are input to a command, never commands (sol/fable r1, PR #274).
-    """
-    text = command or ""
-    segments = []
-    masked = []
-    quoted = []
-    heredocs = []
-
-    def flush():
-        joined = "".join(masked)
-        if joined.strip():
-            segments.append((joined, list(quoted)))
-        del masked[:]
-        del quoted[:]
-
-    index = 0
-    while index < len(text):
-        char = text[index]
-        if char == "@" and text[index + 1 : index + 2] in ("'", '"'):
-            opener = re.match(r"@(['\"])[ \t]*\r?\n", text[index:])
-            if opener:
-                closer = text.find("\n" + opener.group(1) + "@", index)
-                end = len(text) if closer < 0 else closer + 3
-                masked.append("NA6Q%d/" % len(quoted))
-                quoted.append(text[index:end])
-                index = end
-                continue
-        if char in "'\"":
-            end = _na6_quote_end(text, index)
-            masked.append("NA6Q%d/" % len(quoted))
-            quoted.append(text[index:end])
-            index = end
-            continue
-        if char == "<" and text.startswith("<<", index) and not text.startswith("<<<", index):
-            heredoc = _NA6_HEREDOC_START_RX.match(text, index)
-            if heredoc:
-                heredocs.append(heredoc.group(3))
-                masked.append(" ")
-                index = heredoc.end()
-                continue
-        if char in ";&|":
-            flush()
-            index += 1
-            continue
-        if char == "\n":
-            flush()
-            index += 1
-            # Each pending heredoc body runs to the line that is exactly its delimiter.
-            for delimiter in heredocs:
-                while index < len(text):
-                    newline = text.find("\n", index)
-                    line_end = len(text) if newline < 0 else newline
-                    line = text[index:line_end]
-                    index = line_end + 1
-                    if line.strip() == delimiter:
-                        break
-            heredocs = []
-            continue
-        masked.append(char)
-        index += 1
-    flush()
-    return segments
-
-
-def _na6_unmask(value, quoted):
-    """A masked word with its quoted-string placeholders restored to the original text."""
-    return _NA6_QUOTE_MARK_RX.sub(
-        lambda match: quoted[int(match.group(1))] if int(match.group(1)) < len(quoted)
-        else match.group(0),
-        value,
-    )
-
-
-def _na6_copy_sources(command):
-    """The SOURCE operands of every cp/Copy-Item: copying a workflow OUT is a read."""
-    sources = set()
-    for match in _COPY_RX.finditer(command or ""):
-        words = tokens(match.group(0))[1:]
-        positional = []
-        destination_flag = False
-        named_destination = False
-        for word in words:
-            if destination_flag:
-                destination_flag = False
-                named_destination = True
-                continue
-            if word.lower() in ("-destination", "-dest", "-d"):
-                destination_flag = True
-                continue
-            if word.startswith("-"):
-                continue
-            positional.append(word)
-        sources.update(positional if named_destination else positional[:-1])
-    return sources
-
-
-def _na6_shell_ci_target(command):
-    """T3: the CI-manifest path a shell command writes, deletes or moves, if any.
-
-    Judged per simple command on its UNQUOTED syntax (``_na6_shell_segments``): a copy
-    source is excused only inside its OWN segment, so `cp <wf> wf.bak; echo x > <wf>` is
-    still a write of <wf> (sol r1 B2, PR #274)."""
-    candidates = []
-    for segment, quoted in _na6_shell_segments(command):
-        copy_sources = _na6_copy_sources(segment)
-        for dest in _write_destinations(segment):
-            if dest not in copy_sources:
-                candidates.append(_na6_unmask(dest, quoted))
-        words = [_na6_unmask(word, quoted) for word in tokens(segment)]
-        while words and words[0].lower() in ("sudo", "command", "call"):
-            words = words[1:]
-        if not words:
-            continue
-        head = words[0].lower()
-        operands = words[1:]
-        if head == "git" and len(words) > 1:
-            if words[1].lower() not in ("rm", "mv"):
-                continue
-            if words[1].lower() == "rm" and "--cached" in [w.lower() for w in words]:
-                continue
-            operands = words[2:]
-        elif head not in _NA6_DELETE_HEADS and head not in _NA6_MOVE_HEADS:
-            continue
-        candidates.extend(word for word in operands if not word.startswith("-"))
-    for candidate in candidates:
-        path_norm = norm(candidate)
-        if path_norm in NULL_DEVICE_SINKS:
-            continue
-        if has_seg(path_norm, WORKFLOW_TAIL) or has_seg(path_norm, ACTIONS_TAIL):
-            return path_norm
-    return None
-
-
 def rule_na6_tripwires(ctx):
-    if ctx.tool in SHELL_TOOLS:
-        target = _na6_shell_ci_target(ctx.command)
-        if target:
-            raise Deny(
-                "NA-6",
-                "a shell write, delete or move of %s bypasses the whole-file workflow "
-                "comparison; edit workflows and composite actions with Edit/Write" % target,
-            )
-        return
+    # No shell arm (hub ruling, PR #274 r2): every shell payload is judged exactly as on
+    # fork/master, which has none for workflows.  Shell writes to CI manifests belong to
+    # card NA6-INDIRECT-SHELL-WRITERS-1 (CI-side detection).
     if ctx.tool not in ("Edit", "Write"):
         return
     path_norm = ctx.path_norm
