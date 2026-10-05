@@ -18,6 +18,7 @@ extern "C" {
 }
 
 #include <algorithm>
+#include <chrono>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -475,6 +476,442 @@ TEST(ProcessingFilters, RbfFilterNoDetailFastPathMatchesTimedReference)
                        levels_lut.data());
 
     ASSERT_EQ(hash_image(timed_output), hash_image(fast_output));
+}
+
+namespace {
+
+/* Full 16-bit range noise over gradients and hard edges, so the range weights
+ * vary from pixel to pixel and every chain of the vertical recursion differs. */
+std::vector<uint16_t> make_rbf_stress_image(int width, int height, int channel, uint32_t seed)
+{
+    std::vector<uint16_t> image(static_cast<std::size_t>(width) * height * channel);
+    uint32_t state = seed * 2654435761u + 12345u;
+    for( int y = 0; y < height; ++y )
+    {
+        for( int x = 0; x < width; ++x )
+        {
+            for( int c = 0; c < channel; ++c )
+            {
+                state = state * 1664525u + 1013904223u;
+                const int noise = static_cast<int>(state >> 20) - 2048;
+                const int edge = ((x / 7 + y / 5 + c) & 1) ? 52000 : 6000;
+                const int gradient = (x * 65535) / std::max(1, width - 1) / 4 + (y * 65535) / std::max(1, height - 1) / 4;
+                const std::size_t index = (static_cast<std::size_t>(y) * width + x) * channel + c;
+                image[index] = limit_u16_from_i32((edge + gradient) / 2 + noise * ((x + y + c) % 3));
+            }
+        }
+    }
+    return image;
+}
+
+struct RbfRunResult
+{
+    std::vector<uint16_t> output;
+    std::vector<float> down_color;
+    std::vector<float> down_factor;
+    std::vector<float> up_color;
+    std::vector<float> up_factor;
+};
+
+RbfRunResult run_rbf_filter(bool parallel_vertical,
+                            bool timing,
+                            const std::vector<uint16_t> & input,
+                            int width,
+                            int height,
+                            int channel,
+                            const uint16_t * output_lut,
+                            const int32_t * curve,
+                            int max_threads = 0)
+{
+    std::vector<uint16_t> source = input;
+    RbfRunResult result;
+    result.output.assign(input.size(), 0);
+    CRBFilterPlain filter;
+    filter.reserveMemory(width, height, channel);
+    filter.setTimingEnabled(timing);
+    filter.setParallelVertical(parallel_vertical);
+    filter.setMaxThreads(max_threads);
+    filter.filter(source.data(),
+                  result.output.data(),
+                  0.0025f,
+                  0.165f,
+                  width,
+                  height,
+                  channel,
+                  output_lut,
+                  curve,
+                  curve ? curve + 65536 : nullptr,
+                  curve ? curve + 2 * 65536 : nullptr);
+    const std::size_t pixels = static_cast<std::size_t>(width) * height;
+    result.down_color.assign(filter.downPassColor(), filter.downPassColor() + pixels * channel);
+    result.down_factor.assign(filter.downPassFactor(), filter.downPassFactor() + pixels);
+    result.up_color.assign(filter.upPassColor(), filter.upPassColor() + pixels * channel);
+    result.up_factor.assign(filter.upPassFactor(), filter.upPassFactor() + pixels);
+    return result;
+}
+
+template <typename T>
+std::size_t count_differing(const std::vector<T> & a, const std::vector<T> & b)
+{
+    if( a.size() != b.size() ) return a.size() + b.size();
+    std::size_t differing = 0;
+    for( std::size_t i = 0; i < a.size(); ++i )
+    {
+        if( std::memcmp(&a[i], &b[i], sizeof(T)) != 0 ) ++differing;
+    }
+    return differing;
+}
+
+} // namespace
+
+TEST(ProcessingFilters, RbfFilterParallelVerticalMatchesSerialBitExact)
+{
+    /* The column-parallel vertical passes must reproduce the legacy serial
+     * passes bit for bit: the raw float state of both passes and the uint16
+     * output, on even and odd widths and heights, tall and wide shapes, both
+     * channel layouts, every output mode, several thread counts, team caps
+     * (setMaxThreads) and the timed path. */
+    struct Size { int width; int height; };
+    const Size sizes[] = {
+        { 10, 10 }, { 11, 13 }, { 13, 11 }, { 17, 10 }, { 10, 37 }, { 37, 10 },
+        { 64, 48 }, { 65, 47 }, { 223, 31 }, { 97, 129 }, { 452, 567 }, { 453, 569 },
+    };
+    std::vector<uint16_t> levels_lut(65536);
+    for( std::size_t i = 0; i < levels_lut.size(); ++i )
+    {
+        const uint32_t value = static_cast<uint32_t>(i);
+        levels_lut[i] = static_cast<uint16_t>((value * 257u + (value >> 3) + 19u) & 0xffffu);
+    }
+    std::vector<int32_t> curves(3 * 65536);
+    for( std::size_t i = 0; i < 65536; ++i )
+    {
+        curves[i] = static_cast<int32_t>(i * 3 / 4);
+        curves[65536 + i] = static_cast<int32_t>((i * 9) / 10 + 100);
+        curves[2 * 65536 + i] = static_cast<int32_t>(65535 - i / 2);
+    }
+    const int thread_counts[] = { 1, 2, 3, 4, 7, 16 };
+
+    int compared_runs = 0;
+    for( const Size & size : sizes )
+    {
+        const bool large = size.width * size.height > 50000;
+        for( int channel = 3; channel <= 4; ++channel )
+        {
+            const std::vector<uint16_t> input =
+                make_rbf_stress_image(size.width, size.height, channel,
+                                      static_cast<uint32_t>(size.width * 131 + size.height * 7 + channel));
+            for( int mode = 0; mode < 3; ++mode )
+            {
+                if( mode == 2 && channel != 3 ) continue;
+                if( large && mode == 1 ) continue;
+                const uint16_t * lut = mode == 0 ? nullptr : levels_lut.data();
+                const int32_t * curve = mode == 2 ? curves.data() : nullptr;
+
+                /* With 4 channels the legacy horizontal average indexes pixels
+                 * as i*3+c, so neighbouring pixels overlap and its result
+                 * depends on thread timing. That pass is not touched here and
+                 * every product caller uses 3 channels, so the 4-channel cases
+                 * pin one thread to keep the horizontal input deterministic. */
+                const int reference_threads = channel == 4 ? 1 : 4;
+                RbfRunResult serial;
+                {
+#ifdef _OPENMP
+                    OpenMpThreadCountScope threads(reference_threads);
+#endif
+                    serial = run_rbf_filter(false, false, input, size.width, size.height, channel, lut, curve);
+                }
+                /* Not vacuous: the filter changed the picture. */
+                ASSERT_TRUE(count_differing(serial.output, input) > 0);
+
+                for( int threads_count : thread_counts )
+                {
+                    if( large && threads_count != 1 && threads_count != 7 && threads_count != 16 ) continue;
+                    if( channel == 4 && threads_count != 1 ) continue;
+#ifdef _OPENMP
+                    OpenMpThreadCountScope threads(threads_count);
+#endif
+                    for( int timing = 0; timing < 2; ++timing )
+                    {
+                        if( timing && threads_count != 7 && channel == 3 ) continue;
+                        const RbfRunResult parallel =
+                            run_rbf_filter(true, timing != 0, input, size.width, size.height, channel, lut, curve);
+                        const std::size_t differing =
+                            count_differing(serial.output, parallel.output)
+                          + count_differing(serial.down_color, parallel.down_color)
+                          + count_differing(serial.down_factor, parallel.down_factor)
+                          + count_differing(serial.up_color, parallel.up_color)
+                          + count_differing(serial.up_factor, parallel.up_factor);
+                        if( differing != 0 )
+                        {
+                            std::fprintf(stderr,
+                                         "[RBF-PARALLEL] %dx%d ch=%d mode=%d threads=%d timing=%d differing=%zu\n",
+                                         size.width, size.height, channel, mode, threads_count, timing, differing);
+                        }
+                        ASSERT_EQ(static_cast<std::size_t>(0), differing);
+                        ++compared_runs;
+                    }
+
+                    /* A team cap changes the column-block partition. */
+                    if( channel != 3 || threads_count != 7 ) continue;
+                    const int caps[] = { 1, 2, 3 };
+                    for( int cap : caps )
+                    {
+                        const RbfRunResult capped =
+                            run_rbf_filter(true, false, input, size.width, size.height, channel, lut, curve, cap);
+                        const std::size_t differing =
+                            count_differing(serial.output, capped.output)
+                          + count_differing(serial.down_color, capped.down_color)
+                          + count_differing(serial.down_factor, capped.down_factor)
+                          + count_differing(serial.up_color, capped.up_color)
+                          + count_differing(serial.up_factor, capped.up_factor);
+                        if( differing != 0 )
+                        {
+                            std::fprintf(stderr,
+                                         "[RBF-PARALLEL] %dx%d ch=%d mode=%d threads=%d cap=%d differing=%zu\n",
+                                         size.width, size.height, channel, mode, threads_count, cap, differing);
+                        }
+                        ASSERT_EQ(static_cast<std::size_t>(0), differing);
+                        ++compared_runs;
+                    }
+                }
+            }
+        }
+    }
+    ASSERT_TRUE(compared_runs > 100);
+}
+
+namespace {
+
+/* Restores MLVAPP_RBF_PARALLEL, the wrapper's env cache and the override. */
+class RbfParallelEnvScope
+{
+public:
+    RbfParallelEnvScope()
+    {
+        const char * value = std::getenv(kName);
+        had_value_ = value != nullptr;
+        if( had_value_ ) value_ = value;
+    }
+
+    ~RbfParallelEnvScope()
+    {
+        if( had_value_ ) set_env_for_test(kName, value_.c_str());
+        else unset_env_for_test(kName);
+        recursive_bf_reset_parallel_env_cache_for_testing();
+        recursive_bf_set_parallel_vertical_override(-1);
+    }
+
+    void set(const char * value)
+    {
+        if( value ) set_env_for_test(kName, value);
+        else unset_env_for_test(kName);
+        recursive_bf_reset_parallel_env_cache_for_testing();
+        recursive_bf_set_parallel_vertical_override(-1);
+    }
+
+    static constexpr const char * kName = "MLVAPP_RBF_PARALLEL";
+
+private:
+    bool had_value_ = false;
+    std::string value_;
+};
+
+/* Runs the product wrapper once and reports the dispatch it took. */
+int rbf_wrapper_dispatch_parallel()
+{
+    const int width = 24;
+    const int height = 16; /* reserveMemory needs >= 10 */
+    std::vector<uint16_t> source = make_rbf_stress_image(width, height, 3, 11u);
+    std::vector<uint16_t> output(source.size(), 0);
+    recursive_bf_wrap(source.data(), output.data(), 0.0025f, 0.165f, width, height, 3);
+    return recursive_bf_last_filter_was_parallel();
+}
+
+} // namespace
+
+TEST(ProcessingFilters, RbfParallelEnvFlagIsExactAndCaseInsensitive)
+{
+    /* Only 1/true/yes/on (any case) opt in; "off" and malformed values such as
+     * "1garbage" must keep the legacy passes. */
+    struct Case { const char * value; int expected; };
+    const Case cases[] = {
+        { nullptr, 0 }, { "", 0 }, { "0", 0 }, { "off", 0 }, { "OFF", 0 }, { "Off", 0 },
+        { "no", 0 }, { "NO", 0 }, { "false", 0 }, { "FALSE", 0 }, { "1garbage", 0 },
+        { "trueish", 0 }, { "yess", 0 }, { "o", 0 }, { "t", 0 }, { "y", 0 }, { "2", 0 },
+        { " 1", 0 }, { "1 ", 0 }, { "garbage", 0 },
+        { "1", 1 }, { "true", 1 }, { "TRUE", 1 }, { "True", 1 }, { "yes", 1 }, { "YES", 1 },
+        { "Yes", 1 }, { "on", 1 }, { "ON", 1 }, { "On", 1 },
+    };
+    RbfParallelEnvScope env;
+    for( const Case & c : cases )
+    {
+        env.set(c.value);
+        const int enabled = recursive_bf_parallel_enabled();
+        if( enabled != c.expected )
+        {
+            std::fprintf(stderr, "[RBF-PARALLEL] MLVAPP_RBF_PARALLEL=%s -> %d, expected %d\n",
+                         c.value ? c.value : "(unset)", enabled, c.expected);
+        }
+        ASSERT_EQ(c.expected, enabled);
+    }
+}
+
+TEST(ProcessingFilters, RbfParallelFilterIsOptInByDefault)
+{
+    /* On Bachelor the parallel filter lowered render_work but lost presented
+     * fps beside the overlapped CPU decode/recon, so the product default is
+     * the legacy passes; MLVAPP_RBF_PARALLEL=1 opts in. This observes the
+     * dispatch the wrapper actually took, so losing its setParallelVertical
+     * call fails here whatever the class default is. */
+    RbfParallelEnvScope env;
+    env.set(nullptr);
+    ASSERT_EQ(0, recursive_bf_parallel_enabled());
+    ASSERT_EQ(0, rbf_wrapper_dispatch_parallel());
+    env.set("off");
+    ASSERT_EQ(0, rbf_wrapper_dispatch_parallel());
+    env.set("1");
+    ASSERT_EQ(1, rbf_wrapper_dispatch_parallel());
+    env.set(nullptr);
+    recursive_bf_set_parallel_vertical_override(1);
+    ASSERT_EQ(1, recursive_bf_parallel_enabled());
+    ASSERT_EQ(1, rbf_wrapper_dispatch_parallel());
+    recursive_bf_set_parallel_vertical_override(0);
+    ASSERT_EQ(0, rbf_wrapper_dispatch_parallel());
+
+    /* A filter that is never told to opt in runs the legacy passes. */
+    std::vector<uint16_t> source = make_rbf_stress_image(24, 16, 3, 3u);
+    std::vector<uint16_t> output(source.size(), 0);
+    CRBFilterPlain filter;
+    filter.reserveMemory(24, 16, 3);
+    filter.filter(source.data(), output.data(), 0.0025f, 0.165f, 24, 16, 3);
+    ASSERT_TRUE(!filter.lastFilterParallel());
+    filter.setParallelVertical(true);
+    filter.filter(source.data(), output.data(), 0.0025f, 0.165f, 24, 16, 3);
+    ASSERT_TRUE(filter.lastFilterParallel());
+}
+
+TEST(ProcessingFilters, RbfParallelVerticalLeavesPlaybackShBlurUnchanged)
+{
+    /* Playback's S/H blur (the RBF on the standard x1 lane) must be
+     * byte-identical with the serial vertical passes. The export path is proven
+     * on real footage by ShFrameStateProxy.RbfParallelVerticalLeavesFixture-
+     * ExportFramesUnchanged. */
+    ProcessingPlaybackPreviewModeScope playback_scope;
+    processingResetShadowsHighlightsQuarterresEnvCacheForTesting();
+
+    const int width = 182;
+    const int height = 121;
+    const std::vector<uint16_t> input = make_rbf_stress_image(width, height, 3, 77u);
+
+    auto render_playback_blur = [&](int mode) {
+        recursive_bf_set_parallel_vertical_override(mode);
+        processingSetPlaybackPreviewMode(1);
+        processingSetPlaybackAggressivePreviewMode(0);
+        processingSetPlaybackPreviewScaleFactor(1);
+        processingObject_t * processing = initProcessingObject();
+        processingSetShadows(processing, 0.66);
+        processingSetHighlights(processing, -0.26);
+        std::vector<uint16_t> blur;
+        std::vector<uint16_t> source = input;
+        if( processingRefreshShadowsHighlightsBlurFromRgb16(processing, source.data(), width - 2, height - 1, 4, 0) )
+        {
+            const uint16_t * data = nullptr;
+            int blur_width = 0;
+            int blur_height = 0;
+            if( processingGetShadowsHighlightsBlurData(processing, &data, &blur_width, &blur_height, nullptr) )
+            {
+                blur.assign(data, data + static_cast<std::size_t>(blur_width) * blur_height * 3u);
+            }
+        }
+        freeProcessingObject(processing);
+        return blur;
+    };
+
+    std::vector<uint16_t> serial_blur;
+    {
+#ifdef _OPENMP
+        OpenMpThreadCountScope threads(4);
+#endif
+        serial_blur = render_playback_blur(0);
+    }
+    ASSERT_TRUE(!serial_blur.empty());
+
+    const int thread_counts[] = { 1, 3, 8 };
+    for( int threads_count : thread_counts )
+    {
+#ifdef _OPENMP
+        OpenMpThreadCountScope threads(threads_count);
+#endif
+        ASSERT_EQ(hash_image(serial_blur), hash_image(render_playback_blur(1)));
+    }
+    recursive_bf_set_parallel_vertical_override(-1);
+}
+
+TEST(ProcessingFilters, RbfParallelVerticalBenchmarkInformational)
+{
+    /* INFORMATIONAL micro-benchmark: serial vs column-parallel vertical passes
+     * at the playback quarter-res S/H size (452x567, from 1808x2268) and at the
+     * export full-res size. No duration is asserted; the numbers are
+     * host-specific (the hub VM is CPU-contended). */
+    struct Size { int width; int height; };
+    const Size sizes[] = { { 452, 567 }, { 1808, 2268 } };
+#ifdef _OPENMP
+    /* The test runtime pins OMP_NUM_THREADS=1; measure with the host's threads. */
+    OpenMpThreadCountScope host_threads(omp_get_num_procs());
+#endif
+    for( const Size & size : sizes )
+    {
+        const std::vector<uint16_t> input = make_rbf_stress_image(size.width, size.height, 3, 5u);
+        std::vector<uint16_t> source = input;
+        std::vector<uint16_t> output(input.size(), 0);
+        CRBFilterPlain filter;
+        filter.reserveMemory(size.width, size.height, 3);
+        const int iterations = size.width > 1000 ? 5 : 15;
+        auto median_filter_ms = [&](bool parallel, int threads_count) {
+#ifdef _OPENMP
+            OpenMpThreadCountScope threads(threads_count);
+#endif
+            filter.setParallelVertical(parallel);
+            filter.setTimingEnabled(false);
+            std::vector<double> total;
+            for( int i = 0; i < iterations + 1; ++i )
+            {
+                const auto start = std::chrono::steady_clock::now();
+                filter.filter(source.data(), output.data(), 0.0025f, 0.165f, size.width, size.height, 3);
+                const double elapsed_ms = std::chrono::duration<double, std::milli>(
+                    std::chrono::steady_clock::now() - start).count();
+                if( i > 0 ) total.push_back(elapsed_ms); /* i == 0 warms up */
+            }
+            std::sort(total.begin(), total.end());
+            return total[total.size() / 2];
+        };
+        const int host = std::max(1, omp_get_num_procs());
+        const double serial_ms = median_filter_ms(false, host);
+        const std::string serial_hash = hash_image(output);
+        std::string scaling;
+        std::vector<int> thread_counts;
+        for( int threads_count = 1; threads_count < host; threads_count *= 2 ) thread_counts.push_back(threads_count);
+        thread_counts.push_back(host);
+        for( int threads_count : thread_counts )
+        {
+            const double parallel_ms = median_filter_ms(true, threads_count);
+            /* The timed picture is the serial picture. */
+            ASSERT_EQ(serial_hash, hash_image(output));
+            char entry[64];
+            std::snprintf(entry, sizeof(entry), " t%d=%.2f", threads_count, parallel_ms);
+            scaling += entry;
+        }
+
+        /* Phase split of the parallel filter (omp_get_wtime, coarse on MinGW). */
+        filter.setParallelVertical(true);
+        filter.setTimingEnabled(true);
+        filter.filter(source.data(), output.data(), 0.0025f, 0.165f, size.width, size.height, 3);
+        const RBFilterPlainTiming timing = filter.lastTiming();
+        std::printf("[RBF-VERTICAL-BENCH] %dx%d host_threads=%d filter ms (medians of %d): serial=%.2f parallel:%s | "
+                    "parallel phases rows=%.1f columns(down+up+output)=%.1f\n",
+                    size.width, size.height, host, iterations, serial_ms, scaling.c_str(),
+                    timing.left_ms, timing.vertical_down_ms);
+    }
 }
 
 TEST(ProcessingFilters, ShadowsHighlightsQuarterresBlurStableAcrossOpenMpThreadCounts)

@@ -61,6 +61,20 @@ extern void recursive_bf_wrap_with_curve_index_lut(
 
 extern void recursive_bf_get_last_timing(recursive_bf_timing_t * timing);
 
+/* MLVAPP_RBF_PARALLEL=1 opts in to the parallel filter (column-parallel
+ * vertical passes), bit-exact to the legacy passes; off by default.
+ * MLVAPP_RBF_MAX_THREADS caps its team. mode -1 follows the env var, 0 forces
+ * the legacy passes, 1 forces the parallel filter (tests and benchmarks). */
+extern void recursive_bf_set_parallel_vertical_override(int mode);
+/* Nonzero when the wrapper will run the parallel filter. Only the exact,
+ * case-insensitive values 1/true/yes/on enable MLVAPP_RBF_PARALLEL. */
+extern int recursive_bf_parallel_enabled(void);
+/* Tests: re-read MLVAPP_RBF_PARALLEL on the next query. */
+extern void recursive_bf_reset_parallel_env_cache_for_testing(void);
+/* Tests: nonzero when this thread's last wrapped filter call ran the
+ * parallel filter (the dispatch taken, not the predicate). */
+extern int recursive_bf_last_filter_was_parallel(void);
+
 #ifdef __cplusplus
 }
 #endif
