@@ -436,7 +436,12 @@ jobs:
           # Every other window keeps its membership, minus those tests.
           # LookAssistFlavorsFixture (LOOK-ASSIST-FLAVORS-1) renders the same fixtures, 20-75 s each locally, so it runs alone too.
           # LookAssistAnalysisRenderRace (LOOK-ASSIST-ANALYSIS-RENDER-RACE-1) renders the HQ dual-ISO fixture before and after a level sync, 20-101 s each locally (229 s for the 4), so it runs alone too.
-          $soloPattern = '^(LookAssistFixtureScene|LookAssistFlavorsFixture|LookAssistAnalysisRenderRace)\.'
+          # EXACT08-SHARD-BUDGET-1: two single tests dominate their windows. Measured on the same
+          # build, one process per test, so only the ratios carry: GpuExportParityMatrixMissingDllFallback
+          # IsByteInertAcrossConfigs is about 70 % of exact-08 (101 of 143 s), and DngFramePayloadMatchesSave
+          # DngFrameForPipelinePrep about 27 % of exact-05 (34 of 127 s). Each runs alone, like the fixture
+          # renders above, so the shared remainder of its window stops inheriting that cost.
+          $soloPattern = '^(LookAssistFixtureScene|LookAssistFlavorsFixture|LookAssistAnalysisRenderRace)\.|^DualIsoPipeline\.(GpuExportParityMatrixMissingDllFallbackIsByteInertAcrossConfigs|DngFramePayloadMatchesSaveDngFrameForPipelinePrep)$'
           $shards = @()
           for ($offset = 0; $offset -lt $testNames.Count; $offset += $testsPerShard) {
             $end = [Math]::Min($offset + $testsPerShard, $testNames.Count)
