@@ -2252,11 +2252,11 @@ void RenderFrameThread::reconFrameForWorker( const ReconQueueEntry &entry,
         {
             reducedReconFallbackReason = QStringLiteral("not playing");
         }
-        else if( entry.request.outputMode != OutputProcessed8
-              || !reconContext.renderThreadUsingPlaybackPreviewProcessing )
+        else if( entry.request.outputMode != OutputProcessed8 )
         {
+            /* Only the processed8 reconned-raw consumer takes a reduced Bayer. */
             reducedReconFallbackReason =
-                QStringLiteral("process stage is not the processed8 playback preview");
+                QStringLiteral("process stage is not processed8");
         }
         else if( wantsGpuPlaybackReconTextureNoReadback )
         {
