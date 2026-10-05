@@ -534,8 +534,10 @@ void CRBFilterPlain::outputRange(uint16_t* img_dst, int begin, int end, int chan
     }
 }
 
-// Default path of filter(): the same passes in one parallel region with a
-// single barrier.
+// Opt-in path of filter() (setParallelVertical(true)): the same passes in one
+// parallel region with a single barrier. Bit-exact to the legacy passes for
+// channel == 3 only, which every product caller passes; the 4-channel branches
+// keep the legacy i*3+c indexing, whose overlap is thread-order dependent.
 //  1. Rows in parallel: left pass, right pass and (3 channels) the horizontal
 //     average of each row.
 //  2. Column blocks in parallel: the down pass, the up pass and then the output
@@ -659,6 +661,7 @@ void CRBFilterPlain::filter(uint16_t* __restrict img_src, uint16_t* __restrict i
     const bool timing_enabled = m_timing_enabled;
     const double filter_start = timing_enabled ? omp_get_wtime() : 0.0;
     m_last_timing = RBFilterPlainTiming();
+    m_last_filter_parallel = false;
 
     if(!img_src) return;
     if(!img_dst) return;
@@ -747,6 +750,7 @@ void CRBFilterPlain::filter(uint16_t* __restrict img_src, uint16_t* __restrict i
 
     if (m_parallel_vertical)
     {
+        m_last_filter_parallel = true;
         filterColumnParallel(img_src, img_dst, width, height, channel, rgb3,
                              down_written_pixels, up_unwritten_pixels,
                              range_table_f, inv_alpha_f,

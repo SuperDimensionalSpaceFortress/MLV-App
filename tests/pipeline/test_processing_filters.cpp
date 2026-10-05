@@ -520,7 +520,8 @@ RbfRunResult run_rbf_filter(bool parallel_vertical,
                             int height,
                             int channel,
                             const uint16_t * output_lut,
-                            const int32_t * curve)
+                            const int32_t * curve,
+                            int max_threads = 0)
 {
     std::vector<uint16_t> source = input;
     RbfRunResult result;
@@ -529,6 +530,7 @@ RbfRunResult run_rbf_filter(bool parallel_vertical,
     filter.reserveMemory(width, height, channel);
     filter.setTimingEnabled(timing);
     filter.setParallelVertical(parallel_vertical);
+    filter.setMaxThreads(max_threads);
     filter.filter(source.data(),
                   result.output.data(),
                   0.0025f,
@@ -567,8 +569,8 @@ TEST(ProcessingFilters, RbfFilterParallelVerticalMatchesSerialBitExact)
     /* The column-parallel vertical passes must reproduce the legacy serial
      * passes bit for bit: the raw float state of both passes and the uint16
      * output, on even and odd widths and heights, tall and wide shapes, both
-     * channel layouts, every output mode, several thread counts and the
-     * timed path. */
+     * channel layouts, every output mode, several thread counts, team caps
+     * (setMaxThreads) and the timed path. */
     struct Size { int width; int height; };
     const Size sizes[] = {
         { 10, 10 }, { 11, 13 }, { 13, 11 }, { 17, 10 }, { 10, 37 }, { 37, 10 },
@@ -648,6 +650,29 @@ TEST(ProcessingFilters, RbfFilterParallelVerticalMatchesSerialBitExact)
                         ASSERT_EQ(static_cast<std::size_t>(0), differing);
                         ++compared_runs;
                     }
+
+                    /* A team cap changes the column-block partition. */
+                    if( channel != 3 || threads_count != 7 ) continue;
+                    const int caps[] = { 1, 2, 3 };
+                    for( int cap : caps )
+                    {
+                        const RbfRunResult capped =
+                            run_rbf_filter(true, false, input, size.width, size.height, channel, lut, curve, cap);
+                        const std::size_t differing =
+                            count_differing(serial.output, capped.output)
+                          + count_differing(serial.down_color, capped.down_color)
+                          + count_differing(serial.down_factor, capped.down_factor)
+                          + count_differing(serial.up_color, capped.up_color)
+                          + count_differing(serial.up_factor, capped.up_factor);
+                        if( differing != 0 )
+                        {
+                            std::fprintf(stderr,
+                                         "[RBF-PARALLEL] %dx%d ch=%d mode=%d threads=%d cap=%d differing=%zu\n",
+                                         size.width, size.height, channel, mode, threads_count, cap, differing);
+                        }
+                        ASSERT_EQ(static_cast<std::size_t>(0), differing);
+                        ++compared_runs;
+                    }
                 }
             }
         }
@@ -655,21 +680,114 @@ TEST(ProcessingFilters, RbfFilterParallelVerticalMatchesSerialBitExact)
     ASSERT_TRUE(compared_runs > 100);
 }
 
+namespace {
+
+/* Restores MLVAPP_RBF_PARALLEL, the wrapper's env cache and the override. */
+class RbfParallelEnvScope
+{
+public:
+    RbfParallelEnvScope()
+    {
+        const char * value = std::getenv(kName);
+        had_value_ = value != nullptr;
+        if( had_value_ ) value_ = value;
+    }
+
+    ~RbfParallelEnvScope()
+    {
+        if( had_value_ ) set_env_for_test(kName, value_.c_str());
+        else unset_env_for_test(kName);
+        recursive_bf_reset_parallel_env_cache_for_testing();
+        recursive_bf_set_parallel_vertical_override(-1);
+    }
+
+    void set(const char * value)
+    {
+        if( value ) set_env_for_test(kName, value);
+        else unset_env_for_test(kName);
+        recursive_bf_reset_parallel_env_cache_for_testing();
+        recursive_bf_set_parallel_vertical_override(-1);
+    }
+
+    static constexpr const char * kName = "MLVAPP_RBF_PARALLEL";
+
+private:
+    bool had_value_ = false;
+    std::string value_;
+};
+
+/* Runs the product wrapper once and reports the dispatch it took. */
+int rbf_wrapper_dispatch_parallel()
+{
+    const int width = 24;
+    const int height = 16; /* reserveMemory needs >= 10 */
+    std::vector<uint16_t> source = make_rbf_stress_image(width, height, 3, 11u);
+    std::vector<uint16_t> output(source.size(), 0);
+    recursive_bf_wrap(source.data(), output.data(), 0.0025f, 0.165f, width, height, 3);
+    return recursive_bf_last_filter_was_parallel();
+}
+
+} // namespace
+
+TEST(ProcessingFilters, RbfParallelEnvFlagIsExactAndCaseInsensitive)
+{
+    /* Only 1/true/yes/on (any case) opt in; "off" and malformed values such as
+     * "1garbage" must keep the legacy passes. */
+    struct Case { const char * value; int expected; };
+    const Case cases[] = {
+        { nullptr, 0 }, { "", 0 }, { "0", 0 }, { "off", 0 }, { "OFF", 0 }, { "Off", 0 },
+        { "no", 0 }, { "NO", 0 }, { "false", 0 }, { "FALSE", 0 }, { "1garbage", 0 },
+        { "trueish", 0 }, { "yess", 0 }, { "o", 0 }, { "t", 0 }, { "y", 0 }, { "2", 0 },
+        { " 1", 0 }, { "1 ", 0 }, { "garbage", 0 },
+        { "1", 1 }, { "true", 1 }, { "TRUE", 1 }, { "True", 1 }, { "yes", 1 }, { "YES", 1 },
+        { "Yes", 1 }, { "on", 1 }, { "ON", 1 }, { "On", 1 },
+    };
+    RbfParallelEnvScope env;
+    for( const Case & c : cases )
+    {
+        env.set(c.value);
+        const int enabled = recursive_bf_parallel_enabled();
+        if( enabled != c.expected )
+        {
+            std::fprintf(stderr, "[RBF-PARALLEL] MLVAPP_RBF_PARALLEL=%s -> %d, expected %d\n",
+                         c.value ? c.value : "(unset)", enabled, c.expected);
+        }
+        ASSERT_EQ(c.expected, enabled);
+    }
+}
+
 TEST(ProcessingFilters, RbfParallelFilterIsOptInByDefault)
 {
     /* On Bachelor the parallel filter lowered render_work but lost presented
      * fps beside the overlapped CPU decode/recon, so the product default is
-     * the legacy passes; MLVAPP_RBF_PARALLEL=1 opts in. */
-    const char * opt_in = std::getenv("MLVAPP_RBF_PARALLEL");
-    if( opt_in && *opt_in )
-    {
-        SKIP_TEST("MLVAPP_RBF_PARALLEL is set in this environment");
-    }
-    recursive_bf_set_parallel_vertical_override(-1);
+     * the legacy passes; MLVAPP_RBF_PARALLEL=1 opts in. This observes the
+     * dispatch the wrapper actually took, so losing its setParallelVertical
+     * call fails here whatever the class default is. */
+    RbfParallelEnvScope env;
+    env.set(nullptr);
     ASSERT_EQ(0, recursive_bf_parallel_enabled());
+    ASSERT_EQ(0, rbf_wrapper_dispatch_parallel());
+    env.set("off");
+    ASSERT_EQ(0, rbf_wrapper_dispatch_parallel());
+    env.set("1");
+    ASSERT_EQ(1, rbf_wrapper_dispatch_parallel());
+    env.set(nullptr);
     recursive_bf_set_parallel_vertical_override(1);
     ASSERT_EQ(1, recursive_bf_parallel_enabled());
-    recursive_bf_set_parallel_vertical_override(-1);
+    ASSERT_EQ(1, rbf_wrapper_dispatch_parallel());
+    recursive_bf_set_parallel_vertical_override(0);
+    ASSERT_EQ(0, rbf_wrapper_dispatch_parallel());
+
+    /* A filter that is never told to opt in runs the legacy passes. */
+    std::vector<uint16_t> source = make_rbf_stress_image(24, 16, 3, 3u);
+    std::vector<uint16_t> output(source.size(), 0);
+    CRBFilterPlain filter;
+    filter.reserveMemory(24, 16, 3);
+    filter.filter(source.data(), output.data(), 0.0025f, 0.165f, 24, 16, 3);
+    ASSERT_TRUE(!filter.lastFilterParallel());
+    filter.setParallelVertical(true);
+    filter.filter(source.data(), output.data(), 0.0025f, 0.165f, 24, 16, 3);
+    ASSERT_TRUE(filter.lastFilterParallel());
 }
 
 TEST(ProcessingFilters, RbfParallelVerticalLeavesPlaybackShBlurUnchanged)

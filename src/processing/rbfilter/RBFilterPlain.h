@@ -77,7 +77,8 @@ class CRBFilterPlain
 	float		m_range_table_inv_sigma = 0.0f;
 	bool		m_range_table_valid = false;
     bool        m_timing_enabled = false;
-    bool        m_parallel_vertical = true;
+    bool        m_parallel_vertical = false;
+    bool        m_last_filter_parallel = false;
     int         m_max_threads = 0;
     RBFilterPlainTiming m_last_timing;
 
@@ -125,10 +126,15 @@ public:
         const int32_t * __restrict output_curve_b = nullptr);
     void setTimingEnabled(bool enabled) { m_timing_enabled = enabled; }
     // true: one parallel region, rows then column blocks, with the vertical
-    // passes column-parallel; bit-exact to the legacy passes.
-    // false: the legacy passes with the serial vertical pair. The class
-    // defaults to true; the product wrapper (rbf_wrapper.cpp) defaults to false.
+    // passes column-parallel; bit-exact to the legacy passes for channel == 3
+    // only (every product caller passes 3). With 4 channels the legacy i*3+c
+    // average/output indexing overlaps neighbouring pixels, so neither path is
+    // deterministic across threads there.
+    // false (the default, so a caller that never opts in runs legacy): the
+    // legacy passes with the serial vertical pair.
     void setParallelVertical(bool enabled) { m_parallel_vertical = enabled; }
+    // Whether the last filter() call ran the parallel path (tests).
+    bool lastFilterParallel() const { return m_last_filter_parallel; }
     // Team size cap of the parallel path (0: OpenMP's default). The result
     // does not depend on it.
     void setMaxThreads(int threads) { m_max_threads = threads; }
