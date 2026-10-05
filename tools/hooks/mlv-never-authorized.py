@@ -3662,6 +3662,267 @@ def rule_na6(ctx):
             )
 
 
+# ------------------------------------------------------------- NA-6 tripwires (T1-T2)
+#
+# NA6-TRIPWIRES-1.  ADDITIVE ONLY, AND MONOTONE BY CONSTRUCTION.  `rule_na6` and
+# `_run_bodies` above are fork/master's, byte for byte, and still run first (RULES order).
+# `rule_na6_tripwires` is a SEPARATE rule appended LAST to RULES; `decide` returns ALLOW
+# only when no rule raises, and this rule can only raise -- so every input the old rules
+# DENY is still DENIED, with the same first line, and the only new outcomes are DENYs.
+# Nothing here is an ALLOW authority and no shared helper above was edited.
+#
+# It is a set of cheap, fail-closed TRIPWIRES on syntactic loss, not a judge of execution:
+#   T1  every old step under `steps:` that has `run:` or `uses:` survives in the new WHOLE
+#       file, as a MULTISET, keyed by `name:` or else by its normalised run body or uses
+#       value (the `- run:` / `- uses:` shorthand included), for Edit AND Write;
+#   T2  no skip/neutralise marker of _NA6_WORKFLOW_MARKERS occurs more often in the new
+#       whole file (comments stripped) than in the old one;
+# There is NO shell arm: a text hook cannot read shell intent without new false
+# positives (three rounds on PR #274), so shell payloads are judged exactly as on master
+# and shell writes to CI manifests are card NA6-INDIRECT-SHELL-WRITERS-1.
+# The whole file is reconstructed fail-closed (from #270, NA6-WORKFLOW-WHOLEFILE-1): an
+# unreadable file, an Edit of a missing file, an absent/ambiguous `old_string` is DENY.
+#
+# LIMIT (stated, not closed): this does NOT judge whether a test still EXECUTES.  An
+# interior body edit that keeps the step -- a narrowed filter, `Select-Object -First 1`, a
+# deleted body line, an uncalled-function wrap written without the `run:` header -- is
+# ALLOWED here exactly as on fork/master.  That belongs to the review keys and to a hosted
+# executed-coverage check (card NA6-CI-EXACT-COVERAGE work), which can observe execution.
+
+ACTIONS_TAIL = ".github/actions"
+_ACTION_MANIFEST_NAMES = ("action.yml", "action.yaml")
+_NA6_COMMENT_RX = re.compile(r"(?:^|(?<=\s))#.*$")
+_NA6_WORKFLOW_MARKERS = (
+    ("continue-on-error", re.compile(r"\bcontinue-on-error\b", re.I)),
+    ("`|| true`", re.compile(r"\|\|\s*true\b", re.I)),
+    ("`|| :`", re.compile(r"\|\|\s*:(?=\s|;|$)")),
+    ("`exit 0`", re.compile(r"\bexit\s+0\b", re.I)),
+    ("`[Environment]::Exit(0)`", re.compile(r"::Exit\(\s*0\s*\)", re.I)),
+    ("`$LASTEXITCODE = 0`", re.compile(r"\$(?:global:)?LASTEXITCODE\s*=\s*0\b", re.I)),
+    ("`set +e`", re.compile(r"\bset\s+\+e\b")),
+    (
+        "`$ErrorActionPreference = Continue`",
+        re.compile(r"\$ErrorActionPreference\s*=\s*['\"]?(?:Silently)?Continue\b", re.I),
+    ),
+    ("`-SkipTest`", re.compile(r"(?<![\w-])-SkipTests?\b", re.I)),
+    (
+        "a negative --gtest_filter",
+        re.compile(r"--gtest_filter[ =]['\"]?(?:[^\s'\"]*:)?-", re.I),
+    ),
+    ("GTEST_FILTER", re.compile(r"\bGTEST_FILTER\b", re.I)),
+    ("`if: false`", re.compile(
+        r"^\s*(?:-\s*)?if:\s*(?:false|0|\$\{\{\s*false\s*\}\})\s*$", re.I | re.M
+    )),
+    ("QSKIP", re.compile(r"\bQSKIP\b")),
+    ("pytest --deselect", re.compile(r"--deselect\b")),
+    ("pytest `-k not`", re.compile(r"(?<![\w-])-k\s+['\"]?not\b")),
+    ("ctest --exclude-regex", re.compile(r"--exclude-regex\b")),
+    ("ctest -E", re.compile(r"\bctest\b[^\n]*\s-E\b")),
+    ("`if ($false)`", re.compile(r"\bif\s*\(\s*\$false\s*\)", re.I)),
+    ("`if false`", re.compile(r"\bif\s+false\b")),
+)
+_NA6_STEPS_KEY_RX = re.compile(r"^[ \t]*steps:[ \t]*(?:#.*)?$")
+_NA6_ITEM_RX = re.compile(r"^([ \t]*-[ \t]+)(\S.*)?$")
+_NA6_KEY_RX = re.compile(r"^([A-Za-z_][\w-]*):(?:[ \t]+(.*))?$")
+_NA6_BLOCK_MARKERS = ("|", "|-", "|+", ">", ">-", ">+")
+
+
+def _na6_strip_comments(text):
+    return "\n".join(_NA6_COMMENT_RX.sub("", line) for line in text.split("\n"))
+
+
+def _na6_added_marker(before, after):
+    """The first marker that occurs MORE often after than before (comments stripped).
+
+    Removing a marker, or keeping its count, is never a weakening -- the comparison is
+    strictly greater-than."""
+    old_plain = _na6_strip_comments(before)
+    new_plain = _na6_strip_comments(after)
+    for label, marker in _NA6_WORKFLOW_MARKERS:
+        if len(marker.findall(new_plain)) > len(marker.findall(old_plain)):
+            return label
+    return None
+
+
+def _na6_is_ci_manifest(path_norm):
+    if has_seg(path_norm, WORKFLOW_TAIL):
+        return True
+    return has_seg(path_norm, ACTIONS_TAIL) and path_norm.rsplit("/", 1)[-1] in (
+        _ACTION_MANIFEST_NAMES
+    )
+
+
+def _workflow_whole_file(ctx, path_norm):
+    """The CI manifest before and after this Write/Edit, with LF line endings (fail closed)."""
+    path = ctx.path
+    if path and not os.path.isabs(path) and ctx.project_dir_raw:
+        path = os.path.join(ctx.project_dir_raw, path)
+    exists = bool(path) and os.path.isfile(path)
+    before = None
+    if exists:
+        try:
+            with open(path, "r", encoding="utf-8") as handle:
+                before = handle.read().replace("\r\n", "\n")
+        except Exception:
+            raise Deny(
+                "NA-6",
+                "the workflow %s is unreadable, so the whole-file test comparison cannot be "
+                "made (fail closed)" % path_norm,
+            )
+    new_text = (ctx.new_text or "").replace("\r\n", "\n")
+    if ctx.tool == "Write":
+        return before or "", new_text
+    old_string = ctx.old_text
+    if old_string is None or ctx.new_text is None:
+        raise Deny("NA-6", "an Edit of %s without old_string/new_string" % path_norm)
+    old_string = old_string.replace("\r\n", "\n")
+    if before is None:
+        if old_string == "":
+            return "", new_text  # the Edit tool's create form
+        raise Deny(
+            "NA-6",
+            "the workflow %s is not on disk, so the Edit cannot be reconstructed "
+            "(fail closed)" % path_norm,
+        )
+    if old_string == "":
+        raise Deny("NA-6", "an empty old_string against the existing %s" % path_norm)
+    occurrences = before.count(old_string)
+    if occurrences == 0:
+        raise Deny(
+            "NA-6",
+            "old_string is not in %s, so the Edit cannot be reconstructed (fail closed)"
+            % path_norm,
+        )
+    if ctx.tool_input.get("replace_all") is True:
+        return before, before.replace(old_string, new_text)
+    if occurrences > 1:
+        raise Deny(
+            "NA-6",
+            "old_string occurs %d times in %s without replace_all (fail closed)"
+            % (occurrences, path_norm),
+        )
+    return before, before.replace(old_string, new_text, 1)
+
+
+def _na6_real_indents(lines):
+    """Each line's indent, or -1 for a blank or comment-only line."""
+    indents = []
+    for line in lines:
+        stripped = line.strip()
+        indents.append(-1 if not stripped or stripped.startswith("#") else _indent_of(line))
+    return indents
+
+
+def _na6_scalar(first, lines, column):
+    """One normalised scalar: the key's inline text plus every following line indented
+    deeper than the key's ``column`` (a block scalar, or a plain scalar continued)."""
+    first = (first or "").strip()
+    block = first in _NA6_BLOCK_MARKERS
+    parts = [] if block else [_NA6_COMMENT_RX.sub("", first).strip()]
+    for line in lines:
+        if line.strip() and _indent_of(line) <= column:
+            break
+        text = line.strip()
+        parts.append(text if block else _NA6_COMMENT_RX.sub("", text).strip())
+    value = re.sub(r"\s+", " ", " ".join(part for part in parts if part)).strip()
+    if not block and len(value) >= 2 and value[0] == value[-1] and value[0] in "'\"":
+        value = value[1:-1].strip()
+    return value
+
+
+def _na6_step_keys(text):
+    """T1: the multiset of step identities in a workflow or composite action.
+
+    A step is a list item of a ``steps:`` sequence (block or compact form).  It counts only
+    when it has a ``run:`` or ``uses:`` key at its own key column -- the ``- run:`` and
+    ``- uses:`` shorthands included -- and is keyed by its ``name:``, else by its run body,
+    else by its uses value, each whitespace-normalised.
+    """
+    lines = (text or "").split("\n")
+    indents = _na6_real_indents(lines)
+    found = {}
+    index = 0
+    while index < len(lines):
+        if indents[index] < 0 or not _NA6_STEPS_KEY_RX.match(lines[index]):
+            index += 1
+            continue
+        steps_indent = indents[index]
+        cursor = index + 1
+        while cursor < len(lines) and indents[cursor] < 0:
+            cursor += 1
+        if cursor >= len(lines) or not _NA6_ITEM_RX.match(lines[cursor]):
+            index = cursor
+            continue
+        item_indent = indents[cursor]
+        if item_indent < steps_indent:
+            index = cursor
+            continue
+        while cursor < len(lines):
+            if indents[cursor] < 0:
+                cursor += 1
+                continue
+            item = _NA6_ITEM_RX.match(lines[cursor])
+            if indents[cursor] != item_indent or not item:
+                break
+            key_column = len(item.group(1).expandtabs(4))
+            end = cursor + 1
+            while end < len(lines) and (indents[end] < 0 or indents[end] > item_indent):
+                end += 1
+            keys = {}
+            entries = [(item.group(2) or "", cursor)]
+            for inner in range(cursor + 1, end):
+                if indents[inner] == key_column:
+                    entries.append((lines[inner].strip(), inner))
+            for entry, at in entries:
+                key = _NA6_KEY_RX.match(entry)
+                if key and key.group(1) in ("name", "run", "uses") and key.group(1) not in keys:
+                    keys[key.group(1)] = _na6_scalar(key.group(2), lines[at + 1 : end], key_column)
+            if "run" in keys or "uses" in keys:
+                for field in ("name", "run", "uses"):
+                    if keys.get(field):
+                        identity = (field, keys[field])
+                        found[identity] = found.get(identity, 0) + 1
+                        break
+            cursor = end
+        index = cursor
+    return found
+
+
+def _na6_judge_whole_file(before, after, path_norm):
+    old_steps = _na6_step_keys(before)
+    new_steps = _na6_step_keys(after)
+    for identity in sorted(old_steps):
+        if new_steps.get(identity, 0) < old_steps[identity]:
+            raise Deny(
+                "NA-6",
+                "net removal of a workflow test step: the step with %s %r runs %d time(s) in "
+                "%s, was %d"
+                % (
+                    identity[0],
+                    identity[1][:80],
+                    new_steps.get(identity, 0),
+                    path_norm,
+                    old_steps[identity],
+                ),
+            )
+    label = _na6_added_marker(before, after)
+    if label:
+        raise Deny("NA-6", "%s added to %s neutralises a test" % (label, path_norm))
+
+
+def rule_na6_tripwires(ctx):
+    # No shell arm (hub ruling, PR #274 r2): every shell payload is judged exactly as on
+    # fork/master, which has none for workflows.  Shell writes to CI manifests belong to
+    # card NA6-INDIRECT-SHELL-WRITERS-1 (CI-side detection).
+    if ctx.tool not in ("Edit", "Write"):
+        return
+    path_norm = ctx.path_norm
+    if not path_norm or not _na6_is_ci_manifest(path_norm):
+        return
+    before, after = _workflow_whole_file(ctx, path_norm)
+    _na6_judge_whole_file(before, after, path_norm)
+
+
 # ------------------------------------------------------------------------- NA-7
 
 FACTORY_TAIL = ".factory"
@@ -4025,6 +4286,9 @@ RULES = (
     rule_na9,
     rule_na11,
     rule_na10,
+    # NA6-TRIPWIRES-1: LAST, so every earlier rule's verdict and first line are unchanged
+    # and this rule can only turn an ALLOW into a DENY (see the NA-6 tripwires block).
+    rule_na6_tripwires,
 )
 
 
