@@ -3919,28 +3919,108 @@ def _na6_judge_whole_file(before, after, path_norm):
         raise Deny("NA-6", "%s added to %s neutralises a test" % (label, path_norm))
 
 
+_NA6_HEREDOC_START_RX = re.compile(r"<<(-?)[ \t]*(['\"]?)([A-Za-z_][\w.-]*)\2")
+_NA6_QUOTE_MARK_RX = re.compile(r"NA6Q(\d+)/")
+
+
+def _na6_quote_end(text, start):
+    """Index just past the quoted string opening at ``text[start]`` (or ``len(text)``).
+
+    A single-quoted string has no escapes (PowerShell's doubled ``''`` simply closes and
+    reopens it); inside double quotes a backslash or a backtick escapes the next char."""
+    quote = text[start]
+    index = start + 1
+    while index < len(text):
+        char = text[index]
+        if quote == '"' and char in "\\`":
+            index += 2
+            continue
+        if char == quote:
+            return index + 1
+        index += 1
+    return len(text)
+
+
 def _na6_shell_segments(command):
-    """The command split into simple commands at unquoted ``;``, ``&``, ``|`` and newlines."""
+    """-> [(masked, quoted)]: the simple commands of ``command``, judged on UNQUOTED syntax.
+
+    Split at unquoted ``;``, ``&``, ``|`` and newlines.  Every quoted string and every
+    PowerShell here-string is DATA: it is replaced in ``masked`` by the placeholder
+    ``NA6Q<i>/`` (``quoted[i]`` holds its original text), so a redirect, a write cmdlet or
+    an act head written INSIDE quotes -- a search pattern, a commit message -- is never
+    read as one.  The placeholder carries a slash so a quoted OPERAND of a real writer
+    (``Set-Content -Path "<path>"``) still counts as a path.  Heredoc BODIES are dropped
+    whole: their lines are input to a command, never commands (sol/fable r1, PR #274).
+    """
+    text = command or ""
     segments = []
-    current = []
-    quote = None
-    for char in command or "":
-        if quote:
-            current.append(char)
-            if char == quote:
-                quote = None
-            continue
+    masked = []
+    quoted = []
+    heredocs = []
+
+    def flush():
+        joined = "".join(masked)
+        if joined.strip():
+            segments.append((joined, list(quoted)))
+        del masked[:]
+        del quoted[:]
+
+    index = 0
+    while index < len(text):
+        char = text[index]
+        if char == "@" and text[index + 1 : index + 2] in ("'", '"'):
+            opener = re.match(r"@(['\"])[ \t]*\r?\n", text[index:])
+            if opener:
+                closer = text.find("\n" + opener.group(1) + "@", index)
+                end = len(text) if closer < 0 else closer + 3
+                masked.append("NA6Q%d/" % len(quoted))
+                quoted.append(text[index:end])
+                index = end
+                continue
         if char in "'\"":
-            quote = char
-            current.append(char)
+            end = _na6_quote_end(text, index)
+            masked.append("NA6Q%d/" % len(quoted))
+            quoted.append(text[index:end])
+            index = end
             continue
-        if char in ";&|\n":
-            segments.append("".join(current))
-            current = []
+        if char == "<" and text.startswith("<<", index) and not text.startswith("<<<", index):
+            heredoc = _NA6_HEREDOC_START_RX.match(text, index)
+            if heredoc:
+                heredocs.append(heredoc.group(3))
+                masked.append(" ")
+                index = heredoc.end()
+                continue
+        if char in ";&|":
+            flush()
+            index += 1
             continue
-        current.append(char)
-    segments.append("".join(current))
-    return [segment for segment in segments if segment.strip()]
+        if char == "\n":
+            flush()
+            index += 1
+            # Each pending heredoc body runs to the line that is exactly its delimiter.
+            for delimiter in heredocs:
+                while index < len(text):
+                    newline = text.find("\n", index)
+                    line_end = len(text) if newline < 0 else newline
+                    line = text[index:line_end]
+                    index = line_end + 1
+                    if line.strip() == delimiter:
+                        break
+            heredocs = []
+            continue
+        masked.append(char)
+        index += 1
+    flush()
+    return segments
+
+
+def _na6_unmask(value, quoted):
+    """A masked word with its quoted-string placeholders restored to the original text."""
+    return _NA6_QUOTE_MARK_RX.sub(
+        lambda match: quoted[int(match.group(1))] if int(match.group(1)) < len(quoted)
+        else match.group(0),
+        value,
+    )
 
 
 def _na6_copy_sources(command):
@@ -3967,15 +4047,18 @@ def _na6_copy_sources(command):
 
 
 def _na6_shell_ci_target(command):
-    """T3: the CI-manifest path a shell command writes, deletes or moves, if any."""
+    """T3: the CI-manifest path a shell command writes, deletes or moves, if any.
+
+    Judged per simple command on its UNQUOTED syntax (``_na6_shell_segments``): a copy
+    source is excused only inside its OWN segment, so `cp <wf> wf.bak; echo x > <wf>` is
+    still a write of <wf> (sol r1 B2, PR #274)."""
     candidates = []
-    copy_sources = _na6_copy_sources(command)
-    for dest in _write_destinations(command):
-        if dest in copy_sources:
-            continue
-        candidates.append(dest)
-    for segment in _na6_shell_segments(command):
-        words = tokens(segment)
+    for segment, quoted in _na6_shell_segments(command):
+        copy_sources = _na6_copy_sources(segment)
+        for dest in _write_destinations(segment):
+            if dest not in copy_sources:
+                candidates.append(_na6_unmask(dest, quoted))
+        words = [_na6_unmask(word, quoted) for word in tokens(segment)]
         while words and words[0].lower() in ("sudo", "command", "call"):
             words = words[1:]
         if not words:

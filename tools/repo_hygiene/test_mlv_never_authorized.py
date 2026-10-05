@@ -3809,6 +3809,52 @@ CASES = [
               {"command": "mv " + WF + " old.yml"}, "DENY", "bypasses the whole-file"),
     _na6_real("shell cp over a workflow", "Bash",
               {"command": "cp other.yml " + WF}, "DENY", "bypasses the whole-file"),
+    # PR #274 r1.  T3 reads UNQUOTED syntax only, one simple command at a time.
+    # sol B1: a redirect, writer or act head inside a QUOTED string is data, not an act.
+    _na6_real("r1 B1 quoted redirect in a search pattern is a read", "Bash",
+              {"command": "rg -n 'echo x > " + WF + "' "
+                          "tools/repo_hygiene/test_mlv_never_authorized.py"},
+              "ALLOW"),
+    _na6_real("r1 B1 quoted null-device redirect in a Select-String pattern is a read",
+              "PowerShell",
+              {"command": "Select-String -Path " + WF + " -Pattern 'cat " + WF + " 2>$null'"},
+              "ALLOW"),
+    _na6_real("r1 B1 quoted rm in a double-quoted grep pattern is a read", "Bash",
+              {"command": 'grep -n "rm ' + WF + '" notes.md 2>/dev/null'}, "ALLOW"),
+    _na6_real("r1 B1 a quoted DESTINATION of a real redirect is still a write", "Bash",
+              {"command": 'echo x > "' + WF + '"'}, "DENY", "bypasses the whole-file"),
+    _na6_real("r1 B1 a quoted Set-Content path is still a write", "PowerShell",
+              {"command": "Set-Content -Path '" + WF + "' -Value 'jobs: {}'"},
+              "DENY", "bypasses the whole-file"),
+    # sol B2: a copy source is excused only inside its own simple command.
+    _na6_real("r1 B2 backup then redirect over the workflow", "Bash",
+              {"command": "cp " + WF + " wf.bak; echo x > " + WF},
+              "DENY", "bypasses the whole-file"),
+    _na6_real("r1 B2 backup then sed -i on the workflow", "Bash",
+              {"command": "cp " + WF + " wf.bak; sed -i 's/--of 7/--of 1/' " + WF},
+              "DENY", "bypasses the whole-file"),
+    _na6_real("r1 B2 Copy-Item backup then Set-Content over the workflow", "PowerShell",
+              {"command": "Copy-Item " + WF + " wf.bak; Set-Content " + WF + " 'jobs: {}'"},
+              "DENY", "bypasses the whole-file"),
+    _na6_real("r1 B2 backup then redirect over a composite action", "Bash",
+              {"command": "cp .github/actions/check-suite/action.yml a.bak && "
+                          "echo x > .github/actions/check-suite/action.yml"},
+              "DENY", "bypasses the whole-file"),
+    # fable r1: heredoc and multi-line message BODIES are input, never act heads.
+    _na6_real("r1 heredoc body line starting with mv is not an act", "Bash",
+              {"command": "cat >> notes.md <<'EOF'\nmv " + WF + " b.yml was refused\nEOF"},
+              "ALLOW"),
+    _na6_real("r1 commit message heredoc naming rm of a workflow is not an act", "Bash",
+              {"command": "git commit -q -F - <<'EOF'\nsubject\n\nrm " + WF + " is denied\nEOF\n"
+                          "git log --oneline -1"},
+              "ALLOW"),
+    _na6_real("r1 multi-line quoted commit message naming mv is not an act", "Bash",
+              {"command": 'git commit -m "subject\n\nmv ' + WF + ' old.yml is denied"'}, "ALLOW"),
+    _na6_real("r1 PowerShell here-string body naming Remove-Item is not an act", "PowerShell",
+              {"command": "$m = @'\nRemove-Item " + WF + "\n'@\ngit commit -m $m"}, "ALLOW"),
+    _na6_real("r1 a real write after a heredoc is still a write", "Bash",
+              {"command": "cat > notes.md <<'EOF'\nx\nEOF\necho x > " + WF},
+              "DENY", "bypasses the whole-file"),
     # T1: a step that existed is gone.
     _na6_real_write("Write dropping the pipeline_tests step", REAL_WITHOUT_PIPE_STEP, "DENY",
                     "the step with name 'Run pipeline_tests --check-golden (bounded shards)' "
