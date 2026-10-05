@@ -2939,70 +2939,65 @@ bool sameVerdictAndTone( const WindowLitRun &r, const WindowLitRun &master )
 
 } // namespace
 
-TEST(LookAssistScene, M16TheDisplaySearchIsMeasuredAndNeverApplied)
+TEST(LookAssistScene, M16TheRoomAnchoredBalanceIsAppliedAtTheDisplayLevels)
 {
     const WindowRoom clipRoom = m16Room();
     const WindowRoom shown = m16DisplayRoom();
     const double deadBand = 2.0;   // the search's own strict-neutral bar (kRefineDeadBand)
 
-    // RED, master: no display question. Shade on the clamped window's balance; the display shows the surface cast.
+    // RED, master: no display question. Shade on the clamped window's balance; the display shows the room cast.
     const WindowLitRun master = runWindowLit( m16Raw(), clipRoom, 9930, -33 );
     ASSERT_TRUE( master.check.applies );
     ASSERT_TRUE( master.scene == LookAssistScene::Shade );
     ASSERT_TRUE( master.check.displaySearch.result == QStringLiteral("not-run") );
-    const LookAssistAutoWhiteBalancePatch masterShown = shownSurface( master, clipRoom, shown );
-    std::fprintf( stderr, "M16-CAST master balance=%d/%d shown B-R=%.1f G=%.1f\n", master.check.appliedTemperature,
-                  master.check.appliedTint, masterShown.blueAmberAxis, masterShown.greenAxis );
-    ASSERT_TRUE( std::fabs( masterShown.greenAxis ) >= deadBand );       // magenta on the display
-    ASSERT_TRUE( masterShown.greenAxis < 0.0 );
-    ASSERT_TRUE( std::fabs( masterShown.blueAmberAxis ) >= deadBand );   // and blue
-    ASSERT_TRUE( masterShown.blueAmberAxis > 0.0 );
+    const std::pair<double, double> masterFloor = shownFloor( master, clipRoom, shown );
+    std::fprintf( stderr, "M16-CAST master balance=%d/%d shown floor B-R=%.1f G=%.1f\n", master.check.appliedTemperature,
+                  master.check.appliedTint, masterFloor.first, masterFloor.second );
+    ASSERT_TRUE( masterFloor.first >= deadBand );     // blue on the display
+    ASSERT_TRUE( masterFloor.second <= -deadBand );   // and magenta
 
-    // The same run, measured at the display's levels (the display's neutral is logged, never applied).
+    // The same run with the display's levels: the room-anchored balance is APPLIED.
     const WindowLitRun r = runWindowLit( m16Raw(), clipRoom, 9930, -33, true, true, Renderer::Room, -1.0, roomRenderer( shown ) );
-    const LookAssistAutoWhiteBalancePatch fixedShown = shownSurface( r, clipRoom, shown );
-    std::fprintf( stderr, "M16-CAST fixed balance=%d/%d shown B-R=%.1f G=%.1f display_search=%s renders=%d\n",
-                  r.check.appliedTemperature, r.check.appliedTint, fixedShown.blueAmberAxis, fixedShown.greenAxis,
-                  qPrintable( r.check.displaySearch.result ), r.check.displaySearch.renders );
-    ASSERT_TRUE( sameVerdictAndTone( r, master ) );   // no scene-classification change
-    ASSERT_TRUE( r.check.displayRendered );
-    ASSERT_NEAR( masterShown.blueAmberAxis, r.check.displaySurfaceBlueAmber, 0.5 );   // measured at master's balance
-    ASSERT_NEAR( masterShown.greenAxis, r.check.displaySurfaceGreen, 0.5 );
-    ASSERT_TRUE( r.check.displaySearch.converged );
-    ASSERT_TRUE( r.check.displaySearch.renders >= 1 && r.check.displaySearch.renders <= kLookAssistSurfaceSearchMaxRenders );
-    // MEASURE-ONLY (round 2s): the logged display search finds the display's neutral (~8200 K / -18) ...
-    ASSERT_TRUE( std::fabs( 1.0e6 / r.check.displaySearch.temperature - 1.0e6 / 8200.0 ) <= 6.0 );
-    ASSERT_TRUE( qAbs( r.check.displaySearch.tint + 18 ) <= 6 );
-    // ... the guards' verdict is logged as would-apply (daylight-lit at the display's base, the room no more cast) ...
-    ASSERT_TRUE( r.check.displayDecision == QStringLiteral("would-apply") );
+    const std::pair<double, double> floor = shownFloor( r, clipRoom, shown );
+    const LookAssistAutoWhiteBalancePatch window = shownSurface( r, clipRoom, shown );
+    std::fprintf( stderr, "M16-CAST room balance=%d/%d decision=%s step=%.2f room_cast=%.1f->%.1f solve=%.1f mid=%.1f "
+                  "cells=%d worst_cell=%.1f window=%.1f floor B-R=%.1f G=%.1f display_search=%d/%d\n",
+                  r.check.appliedTemperature, r.check.appliedTint, qPrintable( r.check.displayDecision ),
+                  r.check.displayRoomStep, r.check.displayRoomCastBefore, r.check.displayRoomCastAfter,
+                  r.check.displayRoomCastSolve, r.check.displayRoomCastMid, r.check.displayRoomCells,
+                  r.check.displayRoomWorstCell, r.check.displayWindowFoundBlueAmber, floor.first, floor.second,
+                  r.check.displaySearch.temperature, r.check.displaySearch.tint );
+    ASSERT_TRUE( sameVerdictAndTone( r, master ) );   // no scene-classification change, only the balance
+    ASSERT_TRUE( r.check.displayDecision == QStringLiteral("applied") );
     ASSERT_TRUE( r.check.displayBaseBlueAmber >= deadBand );
     ASSERT_TRUE( std::fabs( r.check.displayBaseGreen ) <= r.check.displayBaseBlueAmber );
     ASSERT_TRUE( r.check.displayRoomSamples >= kRoomW * kRoomH / 100 );
-    ASSERT_TRUE( r.check.displayRoomCastAfter < r.check.displayRoomCastBefore );
-    std::fprintf( stderr, "M16-CAST measured display_search=%d/%d decision=%s room_cast=%.1f->%.1f\n",
-                  r.check.displaySearch.temperature, r.check.displaySearch.tint, qPrintable( r.check.displayDecision ),
-                  r.check.displayRoomCastBefore, r.check.displayRoomCastAfter );
-    // ... and NEVER applied: the balance, the preset deltas and the picture the display shows are master's, bit for bit.
-    ASSERT_TRUE( r.check.displaySearch.temperature != r.check.appliedTemperature );
-    ASSERT_EQ( master.check.appliedTemperature, r.check.appliedTemperature );
-    ASSERT_EQ( master.check.appliedTint, r.check.appliedTint );
-    ASSERT_EQ( master.preset.temperatureDelta, r.preset.temperatureDelta );
-    ASSERT_EQ( master.preset.tintDelta, r.preset.tintDelta );
+    ASSERT_TRUE( r.check.displayRoomCells >= 6 );
+    ASSERT_TRUE( r.check.displayRoomCastAfter + 1.0 <= r.check.displayRoomCastBefore );
+    ASSERT_TRUE( r.check.displayRoomWorstCell <= 1.0 );
+    ASSERT_TRUE( r.check.displayWindowFoundBlueAmber >= -8.0 );
+    ASSERT_TRUE( r.check.displayRoomStep > 0.0 && r.check.displayRoomStep <= 1.0 );
+    ASSERT_TRUE( r.check.displayRoomCastSolve > 0.0 && r.check.displayRoomCastMid > 0.0 );   // measured and logged
+    // The room's neutral (~8200 K / -18), on the segment from master's balance to the solve, inside the daylight window.
+    ASSERT_TRUE( std::fabs( 1.0e6 / r.check.appliedTemperature - 1.0e6 / 8200.0 ) <= 6.0 );
+    ASSERT_TRUE( qAbs( r.check.appliedTint + 18 ) <= 6 );
+    ASSERT_EQ( r.check.displayRoomTemperature, r.check.appliedTemperature );
+    ASSERT_EQ( r.check.displayRoomTint, r.check.appliedTint );
+    ASSERT_TRUE( r.check.appliedTemperature >= kLookAssistNotNightMinTemperature );
     ASSERT_EQ( r.check.appliedTemperature, clipRoom.baseKelvin + r.preset.temperatureDelta );
     ASSERT_EQ( r.check.appliedTint, clipRoom.baseTint + r.preset.tintDelta );
-    ASSERT_NEAR( masterShown.blueAmberAxis, fixedShown.blueAmberAxis, 0.01 );
-    ASSERT_NEAR( masterShown.greenAxis, fixedShown.greenAxis, 0.01 );
-    const std::pair<double, double> masterFloor = shownFloor( master, clipRoom, shown );
-    const std::pair<double, double> measuredFloor = shownFloor( r, clipRoom, shown );
-    ASSERT_NEAR( masterFloor.first, measuredFloor.first, 0.01 );
-    ASSERT_NEAR( masterFloor.second, measuredFloor.second, 0.01 );
+    // The room the display shows is neutral now, and the window is not pushed past the cap.
+    ASSERT_TRUE( std::fabs( floor.first ) < deadBand && std::fabs( floor.second ) < deadBand );
+    ASSERT_TRUE( window.blueAmberAxis >= -8.0 );
+    // The single-surface display search is still only measured (logged, never what decides).
+    ASSERT_TRUE( r.check.displaySearch.converged );
     // The clip-level search is the one master ran, and the trace still names it.
     ASSERT_TRUE( r.check.search.result == master.check.search.result );
     ASSERT_EQ( master.check.search.temperature, r.check.search.temperature );
     ASSERT_EQ( master.check.search.tint, r.check.search.tint );
 }
 
-// Measure-only pin: whatever the display question answers -- every decision it can reach -- the applied balance is the
+// Every decision the display question can reach: only "applied" changes the balance; every refusal keeps the
 // clip-level balance master applies. Each scenario reaches a different decision (or none).
 TEST(LookAssistScene, M16TheAppliedBalanceIsTheClipLevelBalanceForEveryDecision)
 {
@@ -3028,31 +3023,55 @@ TEST(LookAssistScene, M16TheAppliedBalanceIsTheClipLevelBalanceForEveryDecision)
         return true; };
     const LookAssistRenderBalanceFn fails = []( double, int, int, LookAssistRenderedPicture * ) { return false; };
 
+    WindowRoom unlitDim = unlit;
+    unlitDim.windowLuma = 15;   // the window itself under the room's luma floor: no near-neutral pixel anywhere
+    const LookAssistRenderBalanceFn none = [unlitDim]( double, int k, int t, LookAssistRenderedPicture *out ) {
+        *out = roomPicture( unlitDim, k, t );
+        for( int y = 0; y < kRoomH; ++y )
+            for( int x = 0; x < kRoomW; ++x )
+                if( !( x >= 70 && x < 90 && y >= 8 && y < 28 ) )
+                {
+                    unsigned char *px = &out->rgb[( (size_t)y * kRoomW + x ) * 3];
+                    px[0] = px[1] = px[2] = 8;
+                }
+        return true; };
+
     struct Scenario { const char *name; LookAssistRenderBalanceFn render; const char *decision; };
     const Scenario scenarios[] = {
-        { "would-apply",         roomRenderer( m16DisplayRoom() ),            "would-apply" },
-        { "room-worsened",       roomRenderer( curtain ),                     "room-worsened" },
+        { "applied",            roomRenderer( m16DisplayRoom() ),            "applied" },
+        { "curtain",             roomRenderer( curtain ),                     "room-not-improved" },
         { "unqualified-at-base", roomRenderer( m16DisplayRoom( 6300, -30 ) ), "unqualified-at-base" },
-        { "no-room-evidence",    dark,                                        "no-room-evidence" },
-        { "neutral",             roomRenderer( clipRoom ),                    "neutral" },
+        { "compact",             dark,                                        "room-compact" },
+        { "no-room-evidence",    none,                                        "no-room-evidence" },
+        { "off-segment",         roomRenderer( m16DisplayRoom( 7600, 20 ) ),  "off-segment" },
+        { "neutral",             roomRenderer( clipRoom ),                    "room-not-improved" },
         { "render-fails",        fails,                                       "not-run" },
     };
     for( const Scenario &s : scenarios )
     {
         const WindowLitRun r = runWindowLit( m16Raw(), clipRoom, 9930, -33, true, true, Renderer::Room, -1.0, s.render );
-        std::fprintf( stderr, "M16-CAST every-decision %s: decision=%s display_search=%s %d/%d applied=%d/%d\n", s.name,
-                      qPrintable( r.check.displayDecision ), qPrintable( r.check.displaySearch.result ),
+        std::fprintf( stderr, "M16-CAST every-decision %s: decision=%s display_search=%s %d/%d applied=%d/%d room=%.1f->%.1f\n",
+                      s.name, qPrintable( r.check.displayDecision ), qPrintable( r.check.displaySearch.result ),
                       r.check.displaySearch.temperature, r.check.displaySearch.tint, r.check.appliedTemperature,
-                      r.check.appliedTint );
+                      r.check.appliedTint, r.check.displayRoomCastBefore, r.check.displayRoomCastAfter );
         ASSERT_TRUE( r.check.displayDecision == QString::fromLatin1( s.decision ) );
-        ASSERT_FALSE( r.check.displayDecision == QStringLiteral("applied") );   // the label is retired
+        ASSERT_FALSE( r.check.displayDecision == QStringLiteral("would-apply") );   // the measure-only label is retired
         ASSERT_TRUE( sameVerdictAndTone( r, master ) );
+        ASSERT_EQ( clipRoom.baseKelvin + r.preset.temperatureDelta, r.check.appliedTemperature );
+        ASSERT_EQ( clipRoom.baseTint + r.preset.tintDelta, r.check.appliedTint );
+        if( r.check.displayDecision == QStringLiteral("applied") )
+        {
+            // Only "applied" moves the balance, to the room-anchored one.
+            ASSERT_TRUE( r.check.appliedTemperature != master.check.appliedTemperature );
+            ASSERT_EQ( r.check.displayRoomTemperature, r.check.appliedTemperature );
+            ASSERT_EQ( r.check.displayRoomTint, r.check.appliedTint );
+            continue;
+        }
+        ASSERT_EQ( 0, r.check.displayRoomTemperature );
         ASSERT_EQ( master.check.appliedTemperature, r.check.appliedTemperature );
         ASSERT_EQ( master.check.appliedTint, r.check.appliedTint );
         ASSERT_EQ( master.preset.temperatureDelta, r.preset.temperatureDelta );
         ASSERT_EQ( master.preset.tintDelta, r.preset.tintDelta );
-        ASSERT_EQ( clipRoom.baseKelvin + master.preset.temperatureDelta, r.check.appliedTemperature );
-        ASSERT_EQ( clipRoom.baseTint + master.preset.tintDelta, r.check.appliedTint );
     }
 }
 
@@ -3136,9 +3155,10 @@ TEST(LookAssistScene, M16DisplaySearchKeepsMasterForALavenderCurtainInANeutralRo
                   qPrintable( r.check.displayDecision ), qPrintable( r.check.displaySearch.result ),
                   r.check.displaySearch.temperature, r.check.displaySearch.tint, r.check.displayRoomCastBefore,
                   r.check.displayRoomCastAfter, r.check.appliedTemperature, r.check.appliedTint, floor.first, floor.second );
-    ASSERT_TRUE( r.check.displaySearch.converged );   // the curtain alone converges, exactly as in round 1
-    ASSERT_TRUE( r.check.displayDecision == QStringLiteral("room-worsened") );
-    ASSERT_TRUE( r.check.displayRoomCastAfter > r.check.displayRoomCastBefore + 1.0 );
+    ASSERT_TRUE( r.check.displaySearch.converged );   // the curtain alone converges, exactly as in round 1 (measured only)
+    // The room-anchored balance does not follow the curtain: the room (the neutral floor) is not cast, so nothing moves.
+    ASSERT_TRUE( r.check.displayDecision == QStringLiteral("room-not-improved") );
+    ASSERT_TRUE( r.check.displayRoomCastBefore < 1.0 );
     ASSERT_TRUE( sameVerdictAndTone( r, master ) );
     ASSERT_EQ( master.check.appliedTemperature, r.check.appliedTemperature );
     ASSERT_EQ( master.check.appliedTint, r.check.appliedTint );
@@ -3147,14 +3167,12 @@ TEST(LookAssistScene, M16DisplaySearchKeepsMasterForALavenderCurtainInANeutralRo
     ASSERT_TRUE( std::fabs( floor.first ) < 1.0 && std::fabs( floor.second ) < 1.0 );   // and the room stays neutral
 }
 
-// sol r2 blocker (the reason the applying path is split to LOOK-ASSIST-M16-CAST-2): the room guard only looks at pixels
-// darker than 0.75 x the surface's luma (kLookAssistRoomMaxLumaOfSurface), so a BRIGHT neutral wall (luma 130 against the
-// window's 150: excluded) is invisible to it, and a DIM coloured rug that answers the balance as the window does (luma 80)
-// is the only "room" it sees: the rug gets less cast at the display's neutral, the guard says would-apply, and the bright
-// wall -- neutral at master's balance -- would be cast. Measure-only, so master's balance stands trivially; what this pins
-// is that the guard's verdict is LOGGED HONESTLY. KNOWN CAST-2 BUG: "would-apply" here is wrong, and CAST-2 must flip it
-// (the room guard has to see the bright wall); it is documented, not fixed, in this PR.
-TEST(LookAssistScene, M16BrightNeutralWallAndDimRugKeepMastersBalanceAndLogTheKnownGuardGap)
+// sol r2 blocker (the reason the applying path was split to LOOK-ASSIST-M16-CAST-2): the #262 room guard only looked at
+// pixels darker than 0.75 x the surface's luma, so a BRIGHT neutral wall (luma 130 against the window's 150) was invisible
+// to it, and a DIM coloured rug that answers the balance as the window does (luma 80) was the only "room" it saw: it said
+// would-apply, and the bright wall -- neutral at master's balance -- would have been cast. CAST-2 dropped the cutoff: the
+// wall votes, its cells get more cast at any move toward the rug's neutral, and the balance is REFUSED.
+TEST(LookAssistScene, M16BrightNeutralWallAndDimRugKeepMastersBalance)
 {
     const WindowRoom clipRoom = m16Room();
     const WindowLitRun master = runWindowLit( m16Raw(), clipRoom, 9930, -33 );
@@ -3184,11 +3202,13 @@ TEST(LookAssistScene, M16BrightNeutralWallAndDimRugKeepMastersBalanceAndLogTheKn
     ASSERT_EQ( master.check.appliedTint, r.check.appliedTint );
     ASSERT_EQ( master.preset.temperatureDelta, r.preset.temperatureDelta );
     ASSERT_EQ( master.preset.tintDelta, r.preset.tintDelta );
-    // The honest verdict: the guard sees only the rug, whose cast falls, so it says would-apply (the CAST-2 bug).
+    // The refusal: the wall's cells would get more cast than the slack.
+    ASSERT_TRUE( r.check.displayDecision == QStringLiteral("region-worsened") );
+    ASSERT_TRUE( r.check.displayRoomWorstCell > 1.0 );
+    ASSERT_EQ( 0, r.check.displayRoomTemperature );
+    // ... and the harm a single-surface balance would do is real: the bright wall, neutral at master's balance, is cast at
+    // the surface's display neutral (still measured, never applied).
     ASSERT_TRUE( r.check.displaySearch.converged );
-    ASSERT_TRUE( r.check.displayDecision == QStringLiteral("would-apply") );
-    ASSERT_TRUE( r.check.displayRoomCastAfter < r.check.displayRoomCastBefore );
-    // ... and the harm that verdict would do is real: the bright wall, neutral at master's balance, is cast at the found one.
     const LookAssistRenderedPicture wallAtMaster = roomPicture( wall, master.check.appliedTemperature, master.check.appliedTint );
     const LookAssistRenderedPicture wallAtFound = roomPicture( wall, r.check.displaySearch.temperature, r.check.displaySearch.tint );
     const size_t probe = ( (size_t)50 * kRoomW + 80 ) * 3;
@@ -3225,9 +3245,9 @@ TEST(LookAssistScene, M16DisplaySearchNeedsADaylightLitSurfaceAtTheDisplayBase)
     }
 }
 
-// Round 2: a room with no near-neutral evidence darker than the surface cannot show the balance is harmless, so it would
-// not applied: the M16 display surface with every pixel off the window held below the room's luma floor (20).
-TEST(LookAssistScene, M16DisplaySearchNeedsRoomEvidence)
+// A room that lies only in the window (every pixel off the window held below the room's luma floor, 20) is compact: the
+// window is one place, not a room, so its balance is not applied.
+TEST(LookAssistScene, M16RoomAnchoredBalanceNeedsASpreadRoom)
 {
     const WindowRoom clipRoom = m16Room();
     const WindowLitRun master = runWindowLit( m16Raw(), clipRoom, 9930, -33 );
@@ -3245,7 +3265,175 @@ TEST(LookAssistScene, M16DisplaySearchNeedsRoomEvidence)
         return true; };
     const WindowLitRun r = runWindowLit( m16Raw(), clipRoom, 9930, -33, true, true, Renderer::Room, -1.0, dark );
     ASSERT_TRUE( r.check.displaySearch.converged );
-    ASSERT_TRUE( r.check.displayDecision == QStringLiteral("no-room-evidence") );
+    ASSERT_TRUE( r.check.displayDecision == QStringLiteral("room-compact") );
+    ASSERT_TRUE( r.check.displayRoomCells < 6 );
+    ASSERT_TRUE( sameVerdictAndTone( r, master ) );
+    ASSERT_EQ( master.check.appliedTemperature, r.check.appliedTemperature );
+    ASSERT_EQ( master.check.appliedTint, r.check.appliedTint );
+}
+
+// A genuinely lavender-painted room under daylight: the window is neutral at the clip's own solve, which verifies
+// directly, so the applied balance IS the solve and the segment the room-anchored move is bounded to collapses. Pixels
+// alone cannot tell a lavender floor from a cast one; the solve can. The floor stays lavender, as painted.
+TEST(LookAssistScene, M16LavenderPaintedRoomWithANeutralWindowAndSolveKeepsMaster)
+{
+    const WindowRoom clipRoom = m16Room();   // the window is neutral at 6600 / -3
+    const WindowLitRun master = runWindowLit( m16Raw(), clipRoom, 6600, -3 );
+    ASSERT_TRUE( master.check.applies );
+    ASSERT_EQ( 6600, master.check.appliedTemperature );
+    ASSERT_EQ( -3, master.check.appliedTint );
+    WindowRoom painted = m16Room();
+    painted.windowLuma = 150;
+    painted.wallLuma = 80;
+    painted.wallLitByWindow = false;
+    painted.wallKelvin = 8200;   // the floor reads as a neutral would under an 8200 K / -18 light: lavender
+    painted.wallTint = -18;
+    const WindowLitRun r = runWindowLit( m16Raw(), clipRoom, 6600, -3, true, true, Renderer::Room, -1.0,
+                                         roomRenderer( painted ) );
+    const std::pair<double, double> floor = shownFloor( r, clipRoom, painted );
+    std::fprintf( stderr, "M16-CAST lavender-painted decision=%s applied=%d/%d floor B-R=%.1f G=%.1f\n",
+                  qPrintable( r.check.displayDecision ), r.check.appliedTemperature, r.check.appliedTint, floor.first,
+                  floor.second );
+    ASSERT_TRUE( r.check.displayRendered );
+    ASSERT_TRUE( r.check.displayDecision == QStringLiteral("no-segment") );
+    ASSERT_TRUE( sameVerdictAndTone( r, master ) );
+    ASSERT_EQ( master.check.appliedTemperature, r.check.appliedTemperature );
+    ASSERT_EQ( master.check.appliedTint, r.check.appliedTint );
+    ASSERT_EQ( master.preset.temperatureDelta, r.preset.temperatureDelta );
+    ASSERT_EQ( master.preset.tintDelta, r.preset.tintDelta );
+    ASSERT_TRUE( floor.first >= 2.0 );   // still lavender
+}
+
+// Outside HQ dual-ISO the clip and the display share their levels: the display renderer IS the clip renderer, so the
+// room-anchored balance is judged on the picture the clip-level gates already judged. A window-lit interior whose room
+// is neutral at master's balance keeps that balance, its preset and its picture bit for bit.
+TEST(LookAssistScene, AWindowLitInteriorWithANeutralRoomAtOneLevelKeepsItsBalanceBitForBit)
+{
+    const WindowLitRun bare = runWindowLit( m16Raw(), m16Room(), 9930, -33 );
+    ASSERT_TRUE( bare.check.applies );
+    WindowRoom room = m16Room();
+    room.wallLuma = 80;
+    room.wallLitByWindow = false;   // a neutral floor: neutral at master's balance
+    room.wallKelvin = bare.check.appliedTemperature;
+    room.wallTint = bare.check.appliedTint;
+    const WindowLitRun master = runWindowLit( m16Raw(), room, 9930, -33 );
+    ASSERT_TRUE( master.check.applies );
+    const WindowLitRun r = runWindowLit( m16Raw(), room, 9930, -33, true, true, Renderer::Room, -1.0, roomRenderer( room ) );
+    std::fprintf( stderr, "M16-CAST one-level neutral room decision=%s room=%.1f applied=%d/%d master=%d/%d\n",
+                  qPrintable( r.check.displayDecision ), r.check.displayRoomCastBefore, r.check.appliedTemperature,
+                  r.check.appliedTint, master.check.appliedTemperature, master.check.appliedTint );
+    ASSERT_TRUE( r.check.displayRendered );
+    ASSERT_FALSE( r.check.displayDecision == QStringLiteral("applied") );
+    ASSERT_TRUE( sameVerdictAndTone( r, master ) );
+    ASSERT_EQ( master.check.appliedTemperature, r.check.appliedTemperature );
+    ASSERT_EQ( master.check.appliedTint, r.check.appliedTint );
+    ASSERT_TRUE( samePreset( r.preset, master.preset ) );
+    ASSERT_TRUE( finalPicture( r, room ) == finalPicture( master, room ) );
+}
+
+// The highlight cap: a room lit bluer than its window (the floor neutral at 8200 K / -18) while the window itself is
+// neutral at master's balance at the display's levels. Neutralising the room would turn the window amber (B-R about -12
+// at the room's neutral); the move stops where the window reaches the cap (B-R >= -8), and the room is still less cast.
+TEST(LookAssistScene, M16TheWindowIsHeldInsideTheAmberCap)
+{
+    const WindowRoom clipRoom = m16Room();
+    const WindowLitRun master = runWindowLit( m16Raw(), clipRoom, 9930, -33 );
+    ASSERT_TRUE( master.check.applies );
+    const WindowRoom floorRoom = m16DisplayRoom();
+    WindowRoom windowRoom = roomNeutralAt( master.check.appliedTemperature, master.check.appliedTint );
+    windowRoom.windowLuma = 150;
+    const LookAssistRenderBalanceFn render = [floorRoom, windowRoom]( double, int k, int t, LookAssistRenderedPicture *out ) {
+        *out = roomPicture( floorRoom, k, t );
+        const LookAssistRenderedPicture w = roomPicture( windowRoom, k, t );
+        for( int y = 8; y < 28; ++y )
+            for( int x = 70; x < 90; ++x )
+                for( int c = 0; c < 3; ++c )
+                    out->rgb[( (size_t)y * kRoomW + x ) * 3 + c] = w.rgb[( (size_t)y * kRoomW + x ) * 3 + c];
+        return true; };
+    const WindowLitRun r = runWindowLit( m16Raw(), clipRoom, 9930, -33, true, true, Renderer::Room, -1.0, render );
+    const std::pair<double, double> floor = shownFloor( r, clipRoom, floorRoom );
+    const LookAssistAutoWhiteBalancePatch window = shownSurface( r, clipRoom, windowRoom );
+    const std::pair<double, double> masterFloor = shownFloor( master, clipRoom, floorRoom );
+    std::fprintf( stderr, "M16-CAST amber-cap decision=%s step=%.2f applied=%d/%d window=%.1f (pixel %.1f) floor B-R=%.1f->%.1f "
+                  "room=%.1f->%.1f\n", qPrintable( r.check.displayDecision ), r.check.displayRoomStep,
+                  r.check.appliedTemperature, r.check.appliedTint, r.check.displayWindowFoundBlueAmber, window.blueAmberAxis,
+                  masterFloor.first, floor.first, r.check.displayRoomCastBefore, r.check.displayRoomCastAfter );
+    ASSERT_TRUE( r.check.displayDecision == QStringLiteral("applied") );
+    ASSERT_TRUE( r.check.displayWindowFoundBlueAmber >= -8.0 );
+    ASSERT_TRUE( window.blueAmberAxis >= -8.0 );
+    ASSERT_TRUE( r.check.displayRoomStep < 0.5 );                 // held short of the room's neutral (~0.58)
+    ASSERT_TRUE( floor.first >= 1.0 && floor.first < masterFloor.first - 1.0 );   // less cast, not fully neutral
+    ASSERT_TRUE( sameVerdictAndTone( r, master ) );
+}
+
+// No new clipping: the same room, but the window sits just under the top of the range (luma 246, neutral at master's
+// balance). At the capped step its red channel would reach 250; the move steps back until nothing new clips.
+TEST(LookAssistScene, M16TheRoomAnchoredBalanceAddsNoClipping)
+{
+    const WindowRoom clipRoom = m16Room();
+    const WindowLitRun master = runWindowLit( m16Raw(), clipRoom, 9930, -33 );
+    ASSERT_TRUE( master.check.applies );
+    const WindowRoom floorRoom = m16DisplayRoom();
+    WindowRoom windowRoom = roomNeutralAt( master.check.appliedTemperature, master.check.appliedTint );
+    windowRoom.windowLuma = 246;
+    const LookAssistRenderBalanceFn render = [floorRoom, windowRoom]( double, int k, int t, LookAssistRenderedPicture *out ) {
+        *out = roomPicture( floorRoom, k, t );
+        const LookAssistRenderedPicture w = roomPicture( windowRoom, k, t );
+        for( int y = 8; y < 28; ++y )
+            for( int x = 70; x < 90; ++x )
+                for( int c = 0; c < 3; ++c )
+                    out->rgb[( (size_t)y * kRoomW + x ) * 3 + c] = w.rgb[( (size_t)y * kRoomW + x ) * 3 + c];
+        return true; };
+    const WindowLitRun r = runWindowLit( m16Raw(), clipRoom, 9930, -33, true, true, Renderer::Room, -1.0, render );
+    std::fprintf( stderr, "M16-CAST no-clip decision=%s step=%.2f applied=%d/%d clipped=%.2f->%.2f window=%.1f room=%.1f->%.1f\n",
+                  qPrintable( r.check.displayDecision ), r.check.displayRoomStep, r.check.appliedTemperature,
+                  r.check.appliedTint, r.check.displayClippedBefore, r.check.displayClippedAfter,
+                  r.check.displayWindowFoundBlueAmber, r.check.displayRoomCastBefore, r.check.displayRoomCastAfter );
+    ASSERT_TRUE( r.check.displayDecision == QStringLiteral("applied") );
+    ASSERT_TRUE( r.check.displayClippedAfter <= r.check.displayClippedBefore + 0.1 );
+    LookAssistRenderedPicture picture;
+    ASSERT_TRUE( render( 1.2, r.check.appliedTemperature, r.check.appliedTint, &picture ) );
+    int clipped = 0;
+    for( size_t i = 0; i < (size_t)kRoomW * kRoomH; ++i )
+        if( qMax( picture.rgb[i * 3], qMax( picture.rgb[i * 3 + 1], picture.rgb[i * 3 + 2] ) ) >= 250 ) ++clipped;
+    ASSERT_EQ( 0, clipped );   // the picture the display shows at the applied balance has nothing at the top
+    ASSERT_TRUE( r.check.displayRoomCastAfter + 1.0 <= r.check.displayRoomCastBefore );
+    ASSERT_TRUE( sameVerdictAndTone( r, master ) );
+}
+
+// A move worth less than the slack is not made: a room only a little cast (the floor neutral at 6900 K / 0) and a window
+// that answers the balance steeply (6 B-R per mired), so the amber cap allows a step of about one mired, which takes
+// nothing measurable off the room. The picture is not worth changing for that: master's balance stands.
+TEST(LookAssistScene, M16ARoomMoveWorthLessThanTheSlackKeepsMaster)
+{
+    const WindowRoom clipRoom = m16Room();
+    const WindowLitRun master = runWindowLit( m16Raw(), clipRoom, 9930, -33 );
+    ASSERT_TRUE( master.check.applies );
+    WindowRoom floorRoom = m16DisplayRoom();
+    floorRoom.wallLitByWindow = false;
+    floorRoom.wallKelvin = 6900;
+    floorRoom.wallTint = 0;
+    WindowRoom windowRoom;
+    windowRoom.neutralKelvin = master.check.appliedTemperature;
+    windowRoom.neutralTint = master.check.appliedTint;
+    windowRoom.baseBlueAmber = 6.0 * ( 1.0e6 / windowRoom.baseKelvin - 1.0e6 / windowRoom.neutralKelvin );
+    windowRoom.baseGreen = 0.0;
+    windowRoom.windowLuma = 150;
+    const LookAssistRenderBalanceFn render = [floorRoom, windowRoom]( double, int k, int t, LookAssistRenderedPicture *out ) {
+        *out = roomPicture( floorRoom, k, t );
+        const LookAssistRenderedPicture w = roomPicture( windowRoom, k, t );
+        for( int y = 8; y < 28; ++y )
+            for( int x = 70; x < 90; ++x )
+                for( int c = 0; c < 3; ++c )
+                    out->rgb[( (size_t)y * kRoomW + x ) * 3 + c] = w.rgb[( (size_t)y * kRoomW + x ) * 3 + c];
+        return true; };
+    const WindowLitRun r = runWindowLit( m16Raw(), clipRoom, 9930, -33, true, true, Renderer::Room, -1.0, render );
+    std::fprintf( stderr, "M16-CAST small-move decision=%s step=%.3f room=%.1f->%.1f window=%.1f applied=%d/%d\n",
+                  qPrintable( r.check.displayDecision ), r.check.displayRoomStep, r.check.displayRoomCastBefore,
+                  r.check.displayRoomCastAfter, r.check.displayWindowFoundBlueAmber, r.check.appliedTemperature,
+                  r.check.appliedTint );
+    ASSERT_TRUE( r.check.displayDecision == QStringLiteral("room-not-improved") );
+    ASSERT_TRUE( r.check.displayRoomCastBefore >= 1.0 );   // the room IS cast, a little
     ASSERT_TRUE( sameVerdictAndTone( r, master ) );
     ASSERT_EQ( master.check.appliedTemperature, r.check.appliedTemperature );
     ASSERT_EQ( master.check.appliedTint, r.check.appliedTint );

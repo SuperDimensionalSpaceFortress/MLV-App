@@ -544,19 +544,32 @@ struct LookAssistWindowLitCheck
     double displaySurfaceBlueAmber = 0.0;
     double displaySurfaceGreen = 0.0;
     LookAssistSurfaceSearch displaySearch;
-    // Round 2s (LOOK-ASSIST-M16-CAST-1) is MEASURE-ONLY: the display search's balance is NEVER applied; the applied
-    // balance is always the clip-level one. displayDecision logs whether the guards WOULD have applied it (the applying
-    // path is LOOK-ASSIST-M16-CAST-2). The surface is first
-    // qualified at the display's levels at the receipt's base (displayBase*: its cast must be a daylight light's), and a
-    // converged balance must not worsen the room: the median cast of the near-neutral area darker than the surface, at
-    // the display's levels, at the clip-level balance (displayRoomCastBefore) and at the found one (displayRoomCastAfter).
-    // displayDecision: not-run | neutral | unqualified-at-base | not-converged | no-room-evidence | room-worsened | would-apply
+    // The display search's (single-surface) balance is MEASURE-ONLY and never applied (LOOK-ASSIST-M16-CAST-1 r2s).
+    // What APPLIES is the ROOM-anchored balance (LOOK-ASSIST-M16-CAST-2): the surface is first qualified at the display's
+    // levels at the receipt's base (displayBase*: its cast must be a daylight light's); the room is every pixel that is
+    // near-neutral at the applied balance or at the clip's own solve (no luma cutoff); the move is bounded to the segment
+    // from the applied balance to the solve, and is applied only when the room is spread over the frame
+    // (displayRoomCells of the 4 x 4 grid), it gets less cast (displayRoomCastBefore -> displayRoomCastAfter) on both
+    // axes, no populated cell gets more cast (displayRoomWorstCell), the window stays inside the amber cap
+    // (displayWindowFoundBlueAmber) and nothing new clips (displayClipped*). displayDecision: not-run | neutral |
+    // unqualified-at-base | no-segment | no-room-evidence | room-compact | off-segment | room-not-improved |
+    // region-worsened | highlight-cap | clipped | unverifiable | applied. Only "applied" changes the balance.
     QString displayDecision = QStringLiteral("not-run");
     double displayBaseBlueAmber = 0.0;
     double displayBaseGreen = 0.0;
     int displayRoomSamples = 0;
-    double displayRoomCastBefore = 0.0;
-    double displayRoomCastAfter = 0.0;
+    int displayRoomCells = 0;
+    double displayRoomCastBefore = 0.0;   // at the applied (clip-level) balance
+    double displayRoomCastAfter = 0.0;    // at the found balance (the last one rendered)
+    double displayRoomCastSolve = 0.0;    // at the clip's own solve
+    double displayRoomCastMid = 0.0;      // at the segment's midpoint (measure-only)
+    double displayRoomStep = 0.0;         // where along the segment the found balance is (0 = applied, 1 = solve)
+    double displayRoomWorstCell = 0.0;    // the largest per-cell cast increase at the found balance
+    double displayWindowFoundBlueAmber = 0.0;
+    double displayClippedBefore = 0.0;    // % of the picture with a channel >= 250
+    double displayClippedAfter = 0.0;
+    int displayRoomTemperature = 0;       // the applied room-anchored balance (0 = not applied)
+    int displayRoomTint = 0;
     int appliedTemperature = 0;       // the balance the evidence applies (0 without evidence)
     int appliedTint = 0;
 };

@@ -16694,7 +16694,10 @@ void MainWindow::applyLookAssistToReceipt( ReceiptSettings *receipt,
                            "display_surface=%23 display_surface_blue_amber=%24 display_surface_green=%25 "
                            "display_search=%26 display_search_renders=%27 display_search_balance=%28/%29 "
                            "display_decision=%30 display_base_blue_amber=%31 display_base_green=%32 "
-                           "display_room_samples=%33 display_room_cast=%34/%35")
+                           "display_room_samples=%33 display_room_cast=%34/%35 display_room_cells=%36 "
+                           "display_room_cast_solve=%37 display_room_cast_mid=%38 display_room_step=%39 "
+                           "display_room_worst_cell=%40 display_window_found_blue_amber=%41 display_clipped=%42/%43 "
+                           "display_room_balance=%44/%45")
                 .arg( bool01( windowLit.evidence ) )
                 .arg( windowLit.reason )
                 .arg( lookAssistSceneName( scene ) )
@@ -16730,7 +16733,17 @@ void MainWindow::applyLookAssistToReceipt( ReceiptSettings *receipt,
                 .arg( windowLit.displayBaseGreen, 0, 'f', 1 )
                 .arg( windowLit.displayRoomSamples )
                 .arg( windowLit.displayRoomCastBefore, 0, 'f', 1 )
-                .arg( windowLit.displayRoomCastAfter, 0, 'f', 1 ) );
+                .arg( windowLit.displayRoomCastAfter, 0, 'f', 1 )
+                .arg( windowLit.displayRoomCells )
+                .arg( windowLit.displayRoomCastSolve, 0, 'f', 1 )
+                .arg( windowLit.displayRoomCastMid, 0, 'f', 1 )
+                .arg( windowLit.displayRoomStep, 0, 'f', 2 )
+                .arg( windowLit.displayRoomWorstCell, 0, 'f', 1 )
+                .arg( windowLit.displayWindowFoundBlueAmber, 0, 'f', 1 )
+                .arg( windowLit.displayClippedBefore, 0, 'f', 2 )
+                .arg( windowLit.displayClippedAfter, 0, 'f', 2 )
+                .arg( windowLit.displayRoomTemperature )
+                .arg( windowLit.displayRoomTint ) );
     }
     const bool autoWhiteBalanceValid = wb.autoValid;
     const QString autoWhiteBalanceSource = wb.source;

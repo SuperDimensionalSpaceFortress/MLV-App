@@ -1232,20 +1232,27 @@ static bool lookAssistDisplaySurfaceIsDaylightLit( const LookAssistAutoWhiteBala
         && fabs( atBase.greenAxis ) <= atBase.blueAmberAxis;
 }
 
-// The room: the near-neutral candidates darker than the surface (the room it lights, not the highlight itself), the same
-// pixels in both pictures -- near-neutral at either balance (the patch search's own sample rule: luma 20..230, chroma at
-// most max(14, luma / 5)), so a balance cannot shed the pixels it casts. Its cast is the median B-R plus the median G axis.
-static const double kLookAssistRoomMaxLumaOfSurface = 0.75;   // a room pixel is darker than this share of the surface
-static const double kLookAssistRoomCastSlack        = 1.0;    // half the dead band: the room may not get more cast than this
+// The room (LOOK-ASSIST-M16-CAST-2): every pixel that is near-neutral (the patch search's own sample rule: luma 20..230,
+// chroma at most max(14, luma / 5)) at the applied balance OR at the clip's own solve, the same pixels in every picture.
+// A surface the applied balance casts strongly (the M16 floor, cyan-lavender at 6686 / 0) is near-neutral at the solve,
+// so it is admitted; a balance cannot shed the pixels it casts. No luma cutoff relative to the surface: a bright neutral
+// wall votes, and can veto (sol, PR #262 r2). Its cast is the median B-R plus the median G axis.
+static const double kLookAssistRoomCastSlack      = 1.0;    // half the dead band: no region may get more cast than this
+static const double kLookAssistRoomWindowAmberCap = -8.0;   // the window may warm, at the display's levels, to this B-R
+static const double kLookAssistRoomHighlightLuma  = 0.9;    // as bright as the window (this share of it): the cap's band
+static const double kLookAssistRoomClipSlackPct   = 0.1;    // clipped share (% of the picture) the move may add
+static const int    kLookAssistRoomGrid           = 4;      // 4 x 4 spatial cells
+static const int    kLookAssistRoomMinCells       = 6;      // a room spans at least this many populated cells
+static const int    kLookAssistRoomMaxRenders     = 3;      // the found balance, then at most two half-steps back
 
-static bool lookAssistRoomCandidate( const unsigned char *p, double maxLuma )
+static bool lookAssistRoomCandidate( const unsigned char *p )
 {
     const int r = p[0];
     const int g = p[1];
     const int b = p[2];
     const int luma = qBound( 0, ( 54 * r + 183 * g + 19 * b ) >> 8, 255 );
     const int chroma = qMax( r, qMax( g, b ) ) - qMin( r, qMin( g, b ) );
-    return luma >= 20 && luma <= 230 && luma < maxLuma && chroma <= qMax( 14, luma / 5 );
+    return luma >= 20 && luma <= 230 && chroma <= qMax( 14, luma / 5 );
 }
 
 static double lookAssistMedian( std::vector<double> &values )
@@ -1255,30 +1262,224 @@ static double lookAssistMedian( std::vector<double> &values )
     return values[mid];
 }
 
-// Returns false (no evidence) when the room has fewer samples than the balance statistics ask for (1 % of the picture).
-static bool lookAssistRoomCasts( const LookAssistRenderedPicture &before, const LookAssistRenderedPicture &after,
-                                 double surfaceLuma, int *samples, double *castBefore, double *castAfter )
+static int lookAssistRoomCell( const LookAssistRenderedPicture &picture, size_t i )
 {
-    *samples = 0;
-    if( !lookAssistSamePictureGeometry( before, after ) ) return false;
-    const double maxLuma = surfaceLuma * kLookAssistRoomMaxLumaOfSurface;
-    const size_t pixels = (size_t)before.width * (size_t)before.height;
-    std::vector<double> blueAmberBefore, greenBefore, blueAmberAfter, greenAfter;
+    const int x = (int)( i % (size_t)picture.width );
+    const int y = (int)( i / (size_t)picture.width );
+    return ( y * kLookAssistRoomGrid / picture.height ) * kLookAssistRoomGrid + x * kLookAssistRoomGrid / picture.width;
+}
+
+struct LookAssistRoomCast
+{
+    bool valid = false;
+    double blueAmber = 0.0;
+    double green = 0.0;
+    double cast = 0.0;
+};
+
+// The room mask: 0 = not room, kLookAssistRoomBody = a room pixel, kLookAssistRoomHighlight = a room pixel as bright as the
+// window (the light itself, judged by the amber cap rather than the per-region rule).
+static const unsigned char kLookAssistRoomBody      = 1;
+static const unsigned char kLookAssistRoomHighlight = 2;
+
+// The room's median cast in a picture over the pixels of the room mask in `which` (a bit set of the two kinds), in one
+// spatial cell (cell >= 0) or everywhere (cell < 0).
+static LookAssistRoomCast lookAssistRoomCastIn( const LookAssistRenderedPicture &picture, const std::vector<unsigned char> &room,
+                                                int cell, unsigned char which = kLookAssistRoomBody | kLookAssistRoomHighlight )
+{
+    LookAssistRoomCast out;
+    std::vector<double> blueAmber, green;
+    for( size_t i = 0; i < room.size(); ++i )
+    {
+        if( !( room[i] & which ) || ( cell >= 0 && lookAssistRoomCell( picture, i ) != cell ) ) continue;
+        const unsigned char *p = &picture.rgb[i * 3u];
+        blueAmber.push_back( (double)p[2] - (double)p[0] );
+        green.push_back( (double)p[1] - ( (double)p[0] + (double)p[2] ) * 0.5 );
+    }
+    if( blueAmber.empty() ) return out;
+    out.valid = true;
+    out.blueAmber = lookAssistMedian( blueAmber );
+    out.green = lookAssistMedian( green );
+    out.cast = fabs( out.blueAmber ) + fabs( out.green );
+    return out;
+}
+
+// Share of the picture (%) with a channel at the top of the range.
+static double lookAssistClippedPercent( const LookAssistRenderedPicture &picture )
+{
+    const size_t pixels = (size_t)picture.width * (size_t)picture.height;
+    if( pixels == 0 ) return 0.0;
+    size_t clipped = 0;
     for( size_t i = 0; i < pixels; ++i )
     {
-        const unsigned char *a = &before.rgb[i * 3u];
-        const unsigned char *b = &after.rgb[i * 3u];
-        if( !lookAssistRoomCandidate( a, maxLuma ) && !lookAssistRoomCandidate( b, maxLuma ) ) continue;
-        blueAmberBefore.push_back( (double)a[2] - (double)a[0] );
-        greenBefore.push_back( (double)a[1] - ( (double)a[0] + (double)a[2] ) * 0.5 );
-        blueAmberAfter.push_back( (double)b[2] - (double)b[0] );
-        greenAfter.push_back( (double)b[1] - ( (double)b[0] + (double)b[2] ) * 0.5 );
+        const unsigned char *p = &picture.rgb[i * 3u];
+        if( qMax( p[0], qMax( p[1], p[2] ) ) >= 250 ) ++clipped;
     }
-    *samples = (int)blueAmberBefore.size();
-    if( *samples < qMax( 32, (int)( pixels / 100u ) ) ) return false;
-    *castBefore = fabs( lookAssistMedian( blueAmberBefore ) ) + fabs( lookAssistMedian( greenBefore ) );
-    *castAfter = fabs( lookAssistMedian( blueAmberAfter ) ) + fabs( lookAssistMedian( greenAfter ) );
-    return true;
+    return 100.0 * (double)clipped / (double)pixels;
+}
+
+// The APPLYING room-anchored balance at the display's levels (LOOK-ASSIST-M16-CAST-2). The move is bounded to the segment
+// from the applied balance to the clip's own solve (an independent estimate: a lavender-painted room under daylight has
+// its solve on the window, so the segment collapses and nothing moves). Along it (mired and tint linear in s), the room's
+// median B-R and G are taken as linear between the two renders they were measured in, and s is where their sum is
+// least; it is then held so the window patch stays inside the amber cap. The found balance is rendered and every guard
+// is checked on that render; a region, highlight or clipping refusal steps s halfway back (at most twice). Anything else
+// keeps the applied balance, and displayDecision says why.
+static void lookAssistRoomAnchoredBalance( const LookAssistRenderBalanceFn &renderDisplay, double exposureStops,
+                                           const LookAssistRenderedPicture &shown, const LookAssistRenderedPicture &atSolve,
+                                           const LookAssistSurfaceProbe &applied, const LookAssistSurfaceProbe &solve,
+                                           const LookAssistWhiteBalanceBounds &window, int x, int y,
+                                           LookAssistWindowLitCheck *check, int *temperature, int *tint )
+{
+    if( applied.temperature == solve.temperature && applied.tint == solve.tint )
+    {
+        check->displayDecision = QStringLiteral("no-segment");
+        return;
+    }
+    const int kCells = kLookAssistRoomGrid * kLookAssistRoomGrid;
+    const size_t pixels = (size_t)shown.width * (size_t)shown.height;
+    const double highlightLuma = applied.surface.luma * kLookAssistRoomHighlightLuma;
+    std::vector<unsigned char> room( pixels, 0 );
+    int cellCount[kCells] = {};
+    int bodyCount[kCells] = {};
+    for( size_t i = 0; i < pixels; ++i )
+    {
+        const unsigned char *p = &shown.rgb[i * 3u];
+        if( !lookAssistRoomCandidate( p ) && !lookAssistRoomCandidate( &atSolve.rgb[i * 3u] ) ) continue;
+        const bool highlight = ( 54.0 * p[0] + 183.0 * p[1] + 19.0 * p[2] ) / 256.0 >= highlightLuma;
+        room[i] = highlight ? kLookAssistRoomHighlight : kLookAssistRoomBody;
+        ++check->displayRoomSamples;
+        ++cellCount[lookAssistRoomCell( shown, i )];
+        if( !highlight ) ++bodyCount[lookAssistRoomCell( shown, i )];
+    }
+    if( check->displayRoomSamples < qMax( 32, (int)( pixels / 100u ) ) )
+    {
+        check->displayDecision = QStringLiteral("no-room-evidence");
+        return;
+    }
+    // Spatial extent: floor, walls and tables spread over the frame; a rug or a curtain is compact. A region (cell) is
+    // judged by the no-worse rule on its room pixels below the window's brightness; the light itself has the amber cap.
+    const int cellFloor = qMax( 8, check->displayRoomSamples / ( 2 * kCells ) );
+    bool region[kCells] = {};
+    for( int c = 0; c < kCells; ++c )
+    {
+        if( cellCount[c] >= cellFloor ) ++check->displayRoomCells;
+        region[c] = bodyCount[c] >= cellFloor;
+    }
+    if( check->displayRoomCells < kLookAssistRoomMinCells )
+    {
+        check->displayDecision = QStringLiteral("room-compact");
+        return;
+    }
+    const LookAssistRoomCast atApplied = lookAssistRoomCastIn( shown, room, -1 );
+    const LookAssistRoomCast atSolution = lookAssistRoomCastIn( atSolve, room, -1 );
+    check->displayRoomCastBefore = atApplied.cast;
+    check->displayRoomCastSolve = atSolution.cast;
+
+    const double miredApplied = lookAssistMired( applied.temperature );
+    const double miredSolve = lookAssistMired( solve.temperature );
+    auto blueAmberAt = [&]( double s ) { return atApplied.blueAmber + s * ( atSolution.blueAmber - atApplied.blueAmber ); };
+    auto greenAt = [&]( double s ) { return atApplied.green + s * ( atSolution.green - atApplied.green ); };
+    auto balanceAt = [&]( double s, int *k, int *t ) {
+        *k = qBound( window.minTemperature, lookAssistKelvinFromMired( miredApplied + s * ( miredSolve - miredApplied ) ),
+                     window.maxTemperature );
+        *t = qBound( window.minTint, applied.tint + qRound( s * ( solve.tint - applied.tint ) ), window.maxTint ); };
+    // Measure-only: the room at the segment's midpoint (the evidence lane's ~8200 / -18 question on the clip itself).
+    {
+        int k = 0, t = 0;
+        balanceAt( 0.5, &k, &t );
+        LookAssistRenderedPicture mid;
+        if( renderDisplay( exposureStops, k, t, &mid ) && lookAssistSamePictureGeometry( shown, mid ) )
+            check->displayRoomCastMid = lookAssistRoomCastIn( mid, room, -1 ).cast;
+    }
+
+    // Where along the segment the room is least cast (each axis linear in s): the end, or where an axis crosses zero.
+    double step = 0.0;
+    double least = atApplied.cast;
+    auto consider = [&]( double s ) {
+        if( !( s > 0.0 && s <= 1.0 ) ) return;
+        const double predicted = fabs( blueAmberAt( s ) ) + fabs( greenAt( s ) );
+        if( predicted < least ) { least = predicted; step = s; } };
+    consider( 1.0 );
+    if( atSolution.blueAmber != atApplied.blueAmber ) consider( atApplied.blueAmber / ( atApplied.blueAmber - atSolution.blueAmber ) );
+    if( atSolution.green != atApplied.green ) consider( atApplied.green / ( atApplied.green - atSolution.green ) );
+    // The room's neutral is not on the segment when the least-cast point trades one axis for the other.
+    if( fabs( blueAmberAt( step ) ) > fabs( atApplied.blueAmber ) + kLookAssistRoomCastSlack
+     || fabs( greenAt( step ) ) > fabs( atApplied.green ) + kLookAssistRoomCastSlack )
+    {
+        check->displayDecision = QStringLiteral("off-segment");
+        return;
+    }
+    // The highlight cap: the window (the patch) may warm only to kLookAssistRoomWindowAmberCap at the display's levels.
+    const double windowApplied = applied.surface.blueAmberAxis;
+    const double windowSolve = solve.surface.blueAmberAxis;
+    if( windowSolve < windowApplied && windowApplied + step * ( windowSolve - windowApplied ) < kLookAssistRoomWindowAmberCap )
+        step = qMax( 0.0, ( windowApplied - kLookAssistRoomWindowAmberCap ) / ( windowApplied - windowSolve ) );
+    auto moves = [&]( double s ) {
+        return fabs( s * ( miredSolve - miredApplied ) ) >= 1.0 || fabs( s * ( solve.tint - applied.tint ) ) >= 1.0; };
+    if( !moves( step ) || least > atApplied.cast - kLookAssistRoomCastSlack )
+    {
+        check->displayDecision = QStringLiteral("room-not-improved");
+        return;
+    }
+
+    LookAssistRoomCast cellApplied[kCells];
+    for( int c = 0; c < kCells; ++c )
+        if( region[c] ) cellApplied[c] = lookAssistRoomCastIn( shown, room, c, kLookAssistRoomBody );
+    const double clippedApplied = lookAssistClippedPercent( shown );
+    check->displayClippedBefore = clippedApplied;
+    for( int renders = 0; renders < kLookAssistRoomMaxRenders; ++renders )
+    {
+        int k = 0, t = 0;
+        balanceAt( step, &k, &t );
+        LookAssistRenderedPicture found;
+        if( !renderDisplay( exposureStops, k, t, &found ) || !lookAssistSamePictureGeometry( shown, found ) )
+        {
+            check->displayDecision = QStringLiteral("unverifiable");
+            return;
+        }
+        const LookAssistRoomCast atFound = lookAssistRoomCastIn( found, room, -1 );
+        check->displayRoomStep = step;
+        check->displayRoomCastAfter = atFound.cast;
+        // The light at the found balance: the warmer of the patch and the median of everything as bright as it.
+        check->displayWindowFoundBlueAmber = qMin( lookAssistSurfaceAt( found, x, y ).blueAmberAxis,
+                                                   lookAssistRoomCastIn( found, room, -1, kLookAssistRoomHighlight ).blueAmber );
+        check->displayClippedAfter = lookAssistClippedPercent( found );
+        if( atFound.cast > atApplied.cast - kLookAssistRoomCastSlack )
+        {
+            check->displayDecision = QStringLiteral("room-not-improved");
+            return;
+        }
+        if( fabs( atFound.blueAmber ) > fabs( atApplied.blueAmber ) + kLookAssistRoomCastSlack
+         || fabs( atFound.green ) > fabs( atApplied.green ) + kLookAssistRoomCastSlack )
+        {
+            check->displayDecision = QStringLiteral("off-segment");
+            return;
+        }
+        check->displayRoomWorstCell = 0.0;
+        for( int c = 0; c < kCells; ++c )
+            if( region[c] )
+                check->displayRoomWorstCell = qMax( check->displayRoomWorstCell,
+                                                    lookAssistRoomCastIn( found, room, c, kLookAssistRoomBody ).cast
+                                                        - cellApplied[c].cast );
+        if( check->displayRoomWorstCell > kLookAssistRoomCastSlack )
+            check->displayDecision = QStringLiteral("region-worsened");
+        else if( check->displayWindowFoundBlueAmber < kLookAssistRoomWindowAmberCap )
+            check->displayDecision = QStringLiteral("highlight-cap");
+        else if( check->displayClippedAfter > clippedApplied + kLookAssistRoomClipSlackPct )
+            check->displayDecision = QStringLiteral("clipped");
+        else
+        {
+            check->displayDecision = QStringLiteral("applied");
+            check->displayRoomTemperature = k;
+            check->displayRoomTint = t;
+            *temperature = k;
+            *tint = t;
+            return;
+        }
+        step *= 0.5;
+        if( !moves( step ) ) return;
+    }
 }
 
 bool lookAssistNotNightByExposureBoundCandidate( const LookAssistStats &stats, LookAssistScene scene )
@@ -1470,13 +1671,13 @@ LookAssistWindowLitCheck resolveLookAssistWindowLitInterior( const LookAssistWhi
     // neutral where its light is not (M16-1243: 6686 / 0 by the clamped window, the display-level solve 9930 / -33, the
     // displayed room blue-magenta). So the same surface is rendered at the display's levels at that balance; strictly
     // neutral there, nothing changes. Otherwise the same search neutralises it there, from that balance and the solve,
-    // inside the daylight window and never under the not-night gate. MEASURE-ONLY (round 2s): nothing here changes the
-    // balance; the clip-level one is always what is applied. Converged, the search is logged, and displayDecision says
-    // "would-apply" only when the
-    // surface is daylight-lit at the display's levels and the room is not made more cast (see
-    // lookAssistDisplaySurfaceIsDaylightLit / lookAssistRoomCasts); anything else, displayDecision says why. The room
-    // guard's relative-luma cutoff (kLookAssistRoomMaxLumaOfSurface) can miss a bright neutral wall: LOOK-ASSIST-M16-CAST-2
-    // owns that before anything is applied. Outside HQ dual-ISO both levels are the same (a no-op).
+    // inside the daylight window and never under the not-night gate. That surface search stays MEASURE-ONLY (logged):
+    // on M16-1243 the window is already neutral at the display's levels (B-R 2, G -1 at 6686 / 0) and its search moves
+    // 149 K; the cast is the ROOM's (floor, tables, walls B-R +10..+25, G down to -16; VENUE-OWNER-LEGS-CAST-EVIDENCE-1).
+    // What APPLIES (LOOK-ASSIST-M16-CAST-2) is the room-anchored balance (lookAssistRoomAnchoredBalance): only when the
+    // surface is daylight-lit at the display's base, the room is spread over the frame, no region gets more cast, the
+    // window stays inside the amber cap and nothing new clips; anything else keeps the clip-level balance and
+    // displayDecision says why. Outside HQ dual-ISO both levels are the same, so the room is judged on the one picture.
     if( check.exposureBound && request.renderDisplayBalance )
     {
         LookAssistRenderedPicture shown;
@@ -1503,10 +1704,11 @@ LookAssistWindowLitCheck resolveLookAssistWindowLitInterior( const LookAssistWhi
             atSolve.temperature = qMin( qMax( wb.candidateTemperature, displayWindow.minTemperature ), displayWindow.maxTemperature );
             atSolve.tint = qMin( qMax( wb.candidateTint, displayWindow.minTint ), displayWindow.maxTint );
             // What the surface IS at the display's levels: the same pixel at the receipt's base balance (the balance the
-            // clip-level qualification above judged it at), lit as daylight lights a neutral.
+            // clip-level qualification above judged it at), lit as daylight lights a neutral. Asked even when the surface
+            // is neutral at the applied balance: the room can be cast where the window is not (M16-1243).
             LookAssistRenderedPicture shownAtBase;
             bool qualified = false;
-            if( shownSurface.valid && !lookAssistSurfaceIsNeutral( shownSurface )
+            if( shownSurface.valid
              && request.renderDisplayBalance( patchPictureExposureStops, request.baseTemperature, request.baseTint, &shownAtBase )
              && lookAssistSamePictureGeometry( shown, shownAtBase ) )
             {
@@ -1523,27 +1725,15 @@ LookAssistWindowLitCheck resolveLookAssistWindowLitInterior( const LookAssistWhi
              && lookAssistSamePictureGeometry( shown, solvePicture ) )
             {
                 atSolve.surface = lookAssistSurfaceAt( solvePicture, patch.thumbnailX, patch.thumbnailY );
-                check.displaySearch = searchLookAssistNeutralSurfaceBalance( request.renderDisplayBalance, patchPictureExposureStops,
-                                                                             shown, patch.thumbnailX, patch.thumbnailY,
-                                                                             displayWindow, atApplied, atSolve );
-                check.displayDecision = QStringLiteral("not-converged");
-                // The room, at the display's levels, at the clip-level balance and at the found one: no more cast.
-                LookAssistRenderedPicture found;
-                if( check.displaySearch.converged
-                 && request.renderDisplayBalance( patchPictureExposureStops, check.displaySearch.temperature,
-                                                  check.displaySearch.tint, &found ) )
-                {
-                    if( !lookAssistRoomCasts( shown, found, shownSurface.luma, &check.displayRoomSamples,
-                                              &check.displayRoomCastBefore, &check.displayRoomCastAfter ) )
-                        check.displayDecision = QStringLiteral("no-room-evidence");
-                    else if( check.displayRoomCastAfter > check.displayRoomCastBefore + kLookAssistRoomCastSlack )
-                        check.displayDecision = QStringLiteral("room-worsened");
-                    else
-                    {
-                        // MEASURE-ONLY: the guard's verdict is logged and the clip-level balance stands (CAST-2 applies it).
-                        check.displayDecision = QStringLiteral("would-apply");
-                    }
-                }
+                // The surface's own display neutral, measure-only (logged; never applied).
+                if( !lookAssistSurfaceIsNeutral( shownSurface ) )
+                    check.displaySearch = searchLookAssistNeutralSurfaceBalance( request.renderDisplayBalance,
+                                                                                 patchPictureExposureStops, shown,
+                                                                                 patch.thumbnailX, patch.thumbnailY,
+                                                                                 displayWindow, atApplied, atSolve );
+                lookAssistRoomAnchoredBalance( request.renderDisplayBalance, patchPictureExposureStops, shown, solvePicture,
+                                               atApplied, atSolve, displayWindow, patch.thumbnailX, patch.thumbnailY,
+                                               &check, &temperature, &tint );
             }
         }
     }
