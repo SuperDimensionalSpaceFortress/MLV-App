@@ -1407,6 +1407,12 @@ private:
     int m_playbackSmokeDebayerBasicU16Avx2AvailableFrames = 0;
     int m_playbackSmokeDebayerBasicU16Avx2UsedFrames = 0;
     int m_playbackSmokeProcessed8CacheHits = 0;
+    int m_playbackSmokeCpuDualIsoReducedReconFrames = 0;
+    int m_playbackSmokeCpuDualIsoFullReconFrames = 0;
+    int m_playbackSmokeCpuDualIsoReconScaleLast = 0;
+    QString m_playbackSmokeCpuDualIsoReconFallbackReasonLast;
+    double m_playbackSmokeCpuDualIsoReconFullResFixesSumMs = 0.0;
+    double m_playbackSmokeCpuDualIsoReconDownsampleSumMs = 0.0;
     int m_playbackSmokeProcessed8PrefetchHits = 0;
     int m_playbackSmokeRawPrefetchHits = 0;
     int m_playbackSmokeGpuStatusCpuFrames = 0;

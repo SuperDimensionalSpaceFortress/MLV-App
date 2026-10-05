@@ -447,6 +447,15 @@ private:
          * leaves this empty so it does not copy a proof-only full-resolution
          * oracle on every presented frame. */
         std::vector<uint16_t> gpuPlaybackReconTextureBayerFrame;
+        /* CPU-DUALISO-AT-PREVIEW-SCALE-1: when reducedReconScale > 1 the recon
+         * stage reconstructed reducedReconBayer (reducedReconWidth x
+         * reducedReconHeight) at the playback preview scale and rawImage16 holds
+         * the decoded frame, NOT a reconstruction; the process stage must
+         * consume reducedReconBayer. 1 = rawImage16 is the full-res recon. */
+        std::vector<uint16_t> reducedReconBayer;
+        int reducedReconScale = 1;
+        int reducedReconWidth = 0;
+        int reducedReconHeight = 0;
         GpuPlaybackReconTextureState gpuPlaybackReconTextureState;
         int gpuPlaybackReconTextureWidth = 0;
         int gpuPlaybackReconTextureHeight = 0;
@@ -504,6 +513,9 @@ private:
             gpuPlaybackReconTextureRetainedDeviceHeight = 0;
             gpuPlaybackReconTextureRetainedDeviceToken = 0;
             gpuPlaybackReconTextureBayerFrame.clear();
+            /* reducedRecon* deliberately survive: the process stage resets
+             * metadata before it consumes them. The decode and recon stages
+             * own them (both set reducedReconScale every frame). */
             gpuPlaybackReconTextureState = GpuPlaybackReconTextureState();
             gpuPlaybackReconTextureWidth = 0;
             gpuPlaybackReconTextureHeight = 0;
