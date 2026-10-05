@@ -285,18 +285,47 @@ class GeneratorByteIdentityAndVariantTests(unittest.TestCase):
         windowed = self.generate(GENERATOR, "dm-windowed.job.ps1", ["-ContactSheet", "-ContactSheetFrames", "4", "-DisplayMode", "windowed"])
         self.assertEqual(self.parse_errors(windowed), 0)
         text = windowed.read_text(encoding="utf-8")
-        self.assertIn("'--contact-sheet-frames', '$ContactSheetFrameCount', '--windowed')\"", text)
-        # still ONE -AdditionalArgs at run time: the only new occurrence is the no-sheet branch, which is guarded by `-not $ContactSheetEnabled` (false for this leg)
-        self.assertEqual(text.count("-AdditionalArgs"), default.read_text(encoding="utf-8").count("-AdditionalArgs") + 1)
-        self.assertIn("if (-not $ContactSheetEnabled) { $cmd = \"$cmd -AdditionalArgs @('--windowed')\" }", text)
-        # a leg with no contact sheet gets the option as an array of its own
+        # the windowed job is the default job plus exactly the added statements (the template itself is untouched)
+        self.assertEqual(lf(text).replace(self.WINDOWED_ADDITION, "").replace(self.WINDOWED_NO_SHEET, ""), lf(default.read_text(encoding="utf-8")))
         bare = self.generate(GENERATOR, "dm-windowed-bare.job.ps1", ["-DisplayMode", "windowed"])
         self.assertEqual(self.parse_errors(bare), 0)
-        self.assertIn("if (-not $ContactSheetEnabled) { $cmd = \"$cmd -AdditionalArgs @('--windowed')\" }", bare.read_text(encoding="utf-8"))
         self.assertNotIn("--windowed", self.generate(GENERATOR, "dm-bare-default.job.ps1", []).read_text(encoding="utf-8"))
-        # the template carries no unexpanded display token in any variant
-        for job in (default, windowed, bare):
-            self.assertNotIn("__DISPLAY_", job.read_text(encoding="utf-8"), job.name)
+        # RUNTIME behaviour: the real emitted statements are executed with stub inputs, and $cmd carries exactly ONE -AdditionalArgs with --windowed in it
+        on = self.eval_cmd(text, enabled=True, frames=4)
+        self.assertEqual(on.count("-AdditionalArgs"), 1, on)
+        self.assertRegex(on, r"-AdditionalArgs @\('--contact-sheet-dir', '[^']*', '--contact-sheet-frames', '4', '--windowed'\)$")
+        paired = self.eval_cmd(self.generate(GENERATOR, "dm-windowed-paired.job.ps1", ["-ContactSheet", "-ContactSheetPairedSeek", "-DisplayMode", "windowed"]).read_text(encoding="utf-8"),
+                               enabled=True, frames=4, paired_seek=True)
+        self.assertEqual(paired.count("-AdditionalArgs"), 1, paired)
+        self.assertRegex(paired, r"'--contact-sheet-seek-dir', '[^']*', '--windowed'\)$")
+        off = self.eval_cmd(text, enabled=False, frames=4)
+        self.assertTrue(off.endswith("-AdditionalArgs @('--windowed')"), off)
+        self.assertEqual(off.count("-AdditionalArgs"), 1, off)
+        self.assertEqual(self.eval_cmd(bare.read_text(encoding="utf-8"), enabled=False, frames=4).count("-AdditionalArgs"), 1)
+        # ... and the DEFAULT job, evaluated the same way, never carries it
+        self.assertNotIn("--windowed", self.eval_cmd(default.read_text(encoding="utf-8"), enabled=True, frames=4))
+        self.assertNotIn("AdditionalArgs", self.eval_cmd(default.read_text(encoding="utf-8"), enabled=False, frames=4))
+
+    # What a windowed job adds to the default job's text: one statement before the contact-sheet $cmd append, and the guarded no-sheet append after its closing brace.
+    WINDOWED_ADDITION = "    $contactSheetAdditionalArgs = $contactSheetAdditionalArgs.Substring(0, $contactSheetAdditionalArgs.Length - 1) + \", '--windowed')\"\n"
+    WINDOWED_NO_SHEET = "\nif (-not $ContactSheetEnabled) { $cmd = \"$cmd -AdditionalArgs @('--windowed')\" }"
+
+    def eval_cmd(self, job_text: str, enabled: bool, frames: int, paired_seek: bool = False) -> str:
+        """Execute the emitted job's own $cmd-construction statements (ConvertTo-PsSingleQuoted through the end of the contact-sheet / windowed append) with stub inputs."""
+        job_text = lf(job_text)
+        start = job_text.index("function ConvertTo-PsSingleQuoted")
+        tail = '$cmd = "$cmd -AdditionalArgs $contactSheetAdditionalArgs"\n}'
+        end = job_text.index(tail) + len(tail)
+        if job_text.startswith(self.WINDOWED_NO_SHEET, end):
+            end += len(self.WINDOWED_NO_SHEET)
+        work = self.tmp / f"work-eval-{enabled}-{frames}-{paired_seek}"
+        probe = self.tmp / f"probe-cmd-{enabled}-{frames}-{paired_seek}.ps1"
+        probe.write_text("$ErrorActionPreference = 'Stop'\n" f"$Work = '{work}'\n" "$smoke = 'smoke.ps1'\n$exePath = 'exe.exe'\n$clipPath = 'clip-stub'\n$resultPath = 'result.json'\n"
+                         "$envList = \"'A=1','B=2'\"\n" f"$ContactSheetEnabled = ${'true' if enabled else 'false'}\n" f"$ContactSheetFrameCount = {frames}\n"
+                         f"$ContactSheetPairedSeek = ${'true' if paired_seek else 'false'}\n" + job_text[start:end] + "\nWrite-Output \"CMD=$cmd\"\n", encoding="utf-8")
+        proc = run_pwsh(["-File", str(probe)])
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        return next(l for l in proc.stdout.splitlines() if l.startswith("CMD="))[len("CMD="):]
 
     def test_an_unknown_display_mode_is_refused_before_emitting(self) -> None:
         out = self.tmp / "dm-refused.job.ps1"
@@ -3815,7 +3844,7 @@ class DisplayModeIsRequestedAndObservedTests(EvidenceFactory, ModuleMutationMixi
     def test_the_generator_has_the_parameter_and_turns_it_into_the_apps_windowed_option(self) -> None:
         src = GENERATOR.read_text(encoding="utf-8")
         self.assertRegex(src, r"\[ValidateSet\('fullscreen', 'windowed'\)\]\s+\[string\]\$DisplayMode = 'fullscreen'")
-        self.assertIn("DISPLAY_EXTRA_ARG = $(if ($DisplayMode -eq 'windowed') { \", '--windowed'\" } else { '' })", src)
+        self.assertIn("DUAL_VENUE_DISPLAY_ANCHOR_MISSING", src, "a template refactor must fail loudly, never let a windowed leg run full screen")
         self.assertIn("'--windowed'", src)
         # the smoke runner's own argument gate lets the app's --windowed through (a refused option would end the leg before it plays)
         self.assertRegex((ROOT / "tools" / "profiling" / "gui-smoke-length-gate.ps1").read_text(encoding="utf-8"), r"'windowed' = 'allow'")

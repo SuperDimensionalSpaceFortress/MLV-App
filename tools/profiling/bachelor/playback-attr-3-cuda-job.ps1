@@ -347,7 +347,7 @@ param(
 
     # DUAL-VENUE-DISPLAY-MATRIX-1 (owner 2026-10-03 and 2026-10-05: playback benchmarks must not be full screen only): 'windowed' appends the app's own --windowed
     # (a normal maximized window with chrome; PR #248) to the smoke runner's -AdditionalArgs. 'fullscreen' (the default) adds nothing: the emitted job is the
-    # text it was before this parameter (both tokens below expand to the empty string).
+    # text it was before this parameter (the windowed statements are added to the expanded text below, only for a windowed leg).
     [ValidateSet('fullscreen', 'windowed')]
     [string]$DisplayMode = 'fullscreen'
 )
@@ -2586,14 +2586,14 @@ if ($ContactSheetEnabled) {
     # Play (in-pass, playback_path=true, no replay; its readback cost is recorded per frame), so the
     # sheet shows what played. A seek sheet (playback_path=false: a seeked frame takes a different
     # render path and can look different) is added only when -ContactSheetPairedSeek asks for it.
-    $contactSheetAdditionalArgs = "@('--contact-sheet-dir', $(ConvertTo-PsSingleQuoted $contactSheetDir), '--contact-sheet-frames', '$ContactSheetFrameCount'__DISPLAY_EXTRA_ARG__)"
+    $contactSheetAdditionalArgs = "@('--contact-sheet-dir', $(ConvertTo-PsSingleQuoted $contactSheetDir), '--contact-sheet-frames', '$ContactSheetFrameCount')"
     if ($ContactSheetPairedSeek) {
         $contactSheetSeekDir = Join-Path $Work 'contact-sheet-seek'
-        $contactSheetAdditionalArgs = "@('--contact-sheet-dir', $(ConvertTo-PsSingleQuoted $contactSheetDir), '--contact-sheet-frames', '$ContactSheetFrameCount', '--contact-sheet-seek-dir', $(ConvertTo-PsSingleQuoted $contactSheetSeekDir)__DISPLAY_EXTRA_ARG__)"
+        $contactSheetAdditionalArgs = "@('--contact-sheet-dir', $(ConvertTo-PsSingleQuoted $contactSheetDir), '--contact-sheet-frames', '$ContactSheetFrameCount', '--contact-sheet-seek-dir', $(ConvertTo-PsSingleQuoted $contactSheetSeekDir))"
     }
     # CONTACT-SHEET-PLAYBACK-PARITY-1 <<<
     $cmd = "$cmd -AdditionalArgs $contactSheetAdditionalArgs"
-}__DISPLAY_NO_SHEET_BLOCK__
+}
 # CUDA-PERF-DISPLAY-IDENTITY-HARNESS-1/2/3 (sol BLOCKER 2 / fable HARDENING, direction corrected
 # HARNESS-3): PresentMon's own TimeInMs=0 origin is its internal trace-session start, which lands
 # somewhere between process creation and the instant its trace readiness is observed (UM-PRESENTMON-STOP-2 r2:
@@ -4142,11 +4142,6 @@ $text = Expand-AttrCudaTemplate -Template $template -Tokens ([ordered]@{
     # evidence log); every other leg expands this to nothing, so its job is the text it was before the card.
     SMOKE_CEILING_TRACE = $(if ($timeBudget.smokeCeilingClamped) { " smokeCeilingClamped=True appReadAllowanceSec=$([int]$timeBudget.appReadAllowanceSec)" } else { '' })
     PLAY_SECONDS = [string]$PlaySeconds
-    # DUAL-VENUE-DISPLAY-MATRIX-1: both expand to nothing for a full-screen leg (the default), so its job is the text it was before the card. A windowed leg passes the app's
-    # --windowed through the ONE -AdditionalArgs the job emits (a second -AdditionalArgs would be a parameter-binding error): appended to the contact-sheet array when a
-    # sheet is on, else as an array of its own.
-    DISPLAY_EXTRA_ARG = $(if ($DisplayMode -eq 'windowed') { ", '--windowed'" } else { '' })
-    DISPLAY_NO_SHEET_BLOCK = $(if ($DisplayMode -eq 'windowed') { "`r`nif (-not `$ContactSheetEnabled) { `$cmd = `"`$cmd -AdditionalArgs @('--windowed')`" }" } else { '' })
     RUNNER_ACCEPTS_VERIFIED_CLIP_BINDING = $runnerAcceptsVerifiedClipBindingLiteral
     # DUAL-VENUE-EVIDENCE-1: each default below expands to exactly the text that was literal before.
     SCRATCH_ROOT = $venueScratchRoot
@@ -4159,6 +4154,22 @@ $text = Expand-AttrCudaTemplate -Template $template -Tokens ([ordered]@{
     PRESENTMON_TERMINATE_ON_PROC_EXIT = '$true'
     EMBEDDED_FUNCTIONS = $embeddedFunctions
 })
+
+# DUAL-VENUE-DISPLAY-MATRIX-1: a windowed leg passes the app's --windowed through the ONE -AdditionalArgs the job emits (a second -AdditionalArgs would be a parameter-binding
+# error): appended to the contact-sheet array when a sheet is on, else as an array of its own. Done HERE, on the expanded text, and only for a windowed leg: the template (which tests
+# slice and run) and the default job are untouched, so a full-screen job is the text it always was. The anchor must match exactly once, or the generator throws (a template refactor
+# can never silently drop --windowed and let a windowed leg run full screen).
+if ($DisplayMode -eq 'windowed') {
+    $displayAnchor = [regex]'(?<ind>[ \t]*)\$cmd = "\$cmd -AdditionalArgs \$contactSheetAdditionalArgs"(?<nl>\r?\n)\}'
+    if ($displayAnchor.Matches($text).Count -ne 1) { throw 'DUAL_VENUE_DISPLAY_ANCHOR_MISSING the job template has no single -AdditionalArgs site to add --windowed to' }
+    $text = $displayAnchor.Replace($text, [System.Text.RegularExpressions.MatchEvaluator]{
+        param($m)
+        $ind = $m.Groups['ind'].Value; $nl = $m.Groups['nl'].Value
+        $ind + '$contactSheetAdditionalArgs = $contactSheetAdditionalArgs.Substring(0, $contactSheetAdditionalArgs.Length - 1) + ", ''--windowed'')"' + $nl +
+            $ind + '$cmd = "$cmd -AdditionalArgs $contactSheetAdditionalArgs"' + $nl + '}' + $nl +
+            'if (-not $ContactSheetEnabled) { $cmd = "$cmd -AdditionalArgs @(''--windowed'')" }'
+    })
+}
 
 $outDir = Split-Path -Parent $OutFile
 if ($outDir -and -not (Test-Path -LiteralPath $outDir)) { New-Item -ItemType Directory -Path $outDir -Force | Out-Null }
