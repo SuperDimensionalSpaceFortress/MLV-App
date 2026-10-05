@@ -209,6 +209,213 @@ class DurationAsProofInventoryTests(unittest.TestCase):
         found = scan_text(seeded, source="<seeded-negative>")
         self.assertEqual(found, [], found)
 
+    # -- DURATION-AS-PROOF-GATE-HARDENING-2: each test is a mutant/repro the PREVIOUS scanner
+    # -- mis-handled (verified against fork/master a4f73c11 before the fix) ------------------
+
+    def test_raw_string_body_cannot_fake_a_site(self) -> None:
+        # (a) The old stripper had no raw-string state, so the body of an embedded
+        # shader/JSON/regex literal was read as code and a site-shaped line inside it was
+        # flagged. Blanked bodies must never trigger -- single- and multi-line, with a custom
+        # delimiter, and with the u8/L prefixes.
+        for seeded in (
+            'const char *s = R"(if (elapsed_ms > 0.0) { x(); })";',
+            'auto s = R"(\nif (elapsed_ms > 0.0) {}\n)";',
+            'auto s = R"xx(if (elapsed_ms > 0.0) {} )" still inside)xx";',
+            'auto s = u8R"(ASSERT_EQ(0, elapsed_ms);)";',
+            'auto s = LR"(0.0 < elapsed_ms)";',
+        ):
+            self.assertEqual(scan_text(seeded, source="<raw-fake>"), [], seeded)
+
+    def test_raw_string_with_comment_or_quote_inside_cannot_hide_a_site(self) -> None:
+        # (a) The old stripper ended a string at the first inner quote and opened a comment at
+        # an inner `//` or `/*`, so the REAL code after the literal was blanked (or the
+        # state machine desynced for the rest of the file) and a genuine site was missed.
+        for seeded in (
+            'auto s = R"(//)"; if (elapsed_ms > 0.0) {}',
+            'auto s = R"(/*)"; if (elapsed_ms > 0.0) {}',
+            'auto s = R"(he said " hi)"; if (elapsed_ms > 0.0) {}',
+            'auto s = R"xx(a)" /* )xx"; if (elapsed_ms > 0.0) {}',
+            'auto s = R"(\n// not a comment\n)";\nif (elapsed_ms > 0.0) {}',
+        ):
+            found = scan_text(seeded, source="<raw-hide>")
+            self.assertEqual(len(found), 1, seeded)
+            self.assertIn("ident_compare", found[0].triggers)
+
+    def test_raw_string_prefix_must_not_be_an_identifier_tail(self) -> None:
+        # `FOOR"x"` is an identifier followed by a plain string, not a raw string: the code
+        # after it must still be scanned.
+        found = scan_text('f(FOOR"(", elapsed_ms > 0.0); g(")");', source="<not-raw>")
+        self.assertEqual(len(found), 1, found)
+
+    def test_raw_string_literal_data_still_keys_the_anchor(self) -> None:
+        # The anchor view keeps raw-string bodies (only the TRIGGER view blanks them): editing
+        # a literal's data on a flagged line must still change the anchor.
+        a = scan_text('if (elapsed_ms > 0.0) { log(R"(one)"); }', source="<a>")
+        b = scan_text('if (elapsed_ms > 0.0) { log(R"(two)"); }', source="<b>")
+        self.assertEqual(len(a), 1)
+        self.assertEqual(len(b), 1)
+        self.assertNotEqual(a[0].anchor, b[0].anchor)
+
+    def test_parenthesized_operands_are_flagged(self) -> None:
+        # (b) `(elapsed_ms) > 0.0` ended the left operand in `)`, which the operand regex
+        # could not match, so a redundantly parenthesized compare slipped through.
+        for seeded in (
+            "if ((elapsed_ms) > 0.0) { run(); }",
+            "if (0.0 < (elapsed_ms)) { run(); }",
+            "if ((((x.elapsed_ms))) <= 0) { run(); }",
+            "if (0 == ( stage . durationMs )) { run(); }",
+            "if (static_cast<double>(elapsed_ms) > 0.0) { run(); }",
+            "if (0.0 < static_cast<double>(elapsed_ms)) { run(); }",
+            "if (0 < (double)elapsed_ms) { run(); }",
+            "if ((getStageMilliseconds()) > 0.0) { run(); }",
+            "EXPECT_GT((elapsed), 0);",
+            "ASSERT_EQ((0), (stage.elapsed_ms));",
+        ):
+            found = scan_text(seeded, source="<paren>")
+            self.assertEqual(len(found), 1, seeded)
+
+    def test_parenthesized_non_operands_are_not_flagged(self) -> None:
+        # The parens of a CALL WITH ARGUMENTS belong to the call: `foo(elapsed_ms) > 0` compares
+        # foo's result, and a parenthesized sum is not a bare duration operand.
+        seeded = "\n".join([
+            "if (foo(elapsed_ms) > 0.0) { a(); }",
+            "if (0.0 < foo(elapsed_ms)) { a(); }",
+            "if ((elapsed_ms + 1.0) > 0.0) { a(); }",
+            "if (0.0 < (elapsed_ms + base)) { a(); }",
+            "if ((count) > 0) { a(); }",
+        ])
+        self.assertEqual(scan_text(seeded, source="<paren-neg>"), [])
+
+    def test_multiline_macro_and_fabs_sites_are_flagged_and_keyed_by_all_lines(self) -> None:
+        # (c) sol's finding: test_receipt_applier.cpp splits `ASSERT_TRUE( std::fabs(d)` /
+        # `< 0.000001 );` over two physical lines, which a per-line matcher cannot see. The
+        # site is the whole statement; it is keyed by its joined lines, reported at its first.
+        seeded = "\n".join([
+            "void f() {",
+            "    ASSERT_TRUE( std::fabs(plan.expectedDurationSeconds)",
+            "        < 0.000001 );",
+            "    ASSERT_EQ(0.0,",
+            "        stage.durationMs);",
+            "    ASSERT_NEAR(std::fabs(",
+            "        stage_ms), 0.0, 1e-9);",
+            "    EXPECT_EQ( 0, elapsedMs ) << foo(1);",
+            "}",
+        ])
+        found = {c.lines: c for c in scan_text(seeded, source="<multiline>")}
+        self.assertEqual(sorted(found), [(2,), (4,), (6,), (8,)])
+        self.assertIn("fabs_zero", found[(2,)].triggers)
+        self.assertIn("assert_macro", found[(4,)].triggers)
+        self.assertIn("assert_macro", found[(6,)].triggers)
+        self.assertIn("assert_macro", found[(8,)].triggers)  # a trailing `<<` stream must not hide it
+        self.assertEqual(
+            found[(2,)].anchor,
+            normalize_anchor("ASSERT_TRUE( std::fabs(plan.expectedDurationSeconds) < 0.000001 );"),
+        )
+
+    def test_multiline_site_anchor_covers_the_continuation_line(self) -> None:
+        a = scan_text("ASSERT_EQ(0.0,\n    stage.durationMs);", source="<a>")
+        reflowed = scan_text("ASSERT_EQ(0.0,\n\t\t  stage . durationMs );", source="<b>")
+        edited = scan_text("ASSERT_EQ(0.0,\n    other.durationMs);", source="<c>")
+        self.assertEqual(a[0].anchor, reflowed[0].anchor)  # indentation/alignment is not identity
+        self.assertNotEqual(a[0].anchor, edited[0].anchor)  # but the continuation's text is
+
+    def test_fabs_of_a_value_comparison_is_not_a_zero_assert(self) -> None:
+        # fabs(d - 10.01) is a value comparison and a >1e-3 literal is not an epsilon; neither
+        # is `fabs(non_duration) < eps`. A bare-duration fabs vs an epsilon NAME is a zero assert.
+        negatives = "\n".join([
+            "ASSERT_TRUE( std::fabs(metadata.durationSeconds - 10.01) < 0.000001 );",
+            "ASSERT_TRUE( std::fabs(metadata.durationSeconds) < 5.0 );",
+            "ASSERT_TRUE( std::fabs(metadata.offset) < 0.000001 );",
+        ])
+        self.assertEqual(scan_text(negatives, source="<fabs-neg>"), [])
+        positive = scan_text("ASSERT_TRUE( fabs(x.elapsed_ms) < kEpsilon );", source="<fabs-pos>")
+        self.assertEqual(len(positive), 1)
+        self.assertIn("fabs_zero", positive[0].triggers)
+        mirrored = scan_text("ASSERT_TRUE( 1e-9 > std::fabs(elapsedMs) );", source="<fabs-mirror>")
+        self.assertEqual(len(mirrored), 1)
+
+    def test_comment_edits_never_rekey_a_site(self) -> None:
+        # (d) The anchor used the ORIGINAL line, so editing a trailing comment on an unchanged
+        # code line changed the key and forced a spurious reclassification. Comments (line and
+        # block) are now stripped from the anchor view; a CODE edit still re-keys.
+        base = scan_text("if (elapsed_ms > 0.0) { run(); }", source="<base>")
+        self.assertEqual(len(base), 1)
+        for variant in (
+            "if (elapsed_ms > 0.0) { run(); } // a note",
+            "if (elapsed_ms > 0.0) { run(); } // a different note",
+            "if (elapsed_ms > 0.0) { run(); } /* block */",
+            "if (elapsed_ms > 0.0) /* mid */ { run(); }",
+        ):
+            found = scan_text(variant, source="<variant>")
+            self.assertEqual(len(found), 1, variant)
+            self.assertEqual(found[0].anchor, base[0].anchor, variant)
+        edited = scan_text("if (elapsed_ms > 0.0) { runOther(); } // a note", source="<edited>")
+        self.assertNotEqual(edited[0].anchor, base[0].anchor)
+        # A `//` inside a string literal is data, not a comment: still part of the anchor.
+        with_url = scan_text('if (elapsed_ms > 0.0) { log("http://x"); }', source="<url>")
+        self.assertIn('"http://x"', with_url[0].anchor)
+
+    def test_position_names_ending_in_At_are_not_durations(self) -> None:
+        # (e) `playedMsAt` / `durationAt` / `requestedFieldAt` are INDEXES (QString::indexOf
+        # results in test_playback_smoke_fullscreen_wiring.cpp), not measured durations; a
+        # compare against zero is a "was it found" check. The old token rule flagged any name
+        # holding a unit word. A real duration name is unaffected.
+        positions = "\n".join([
+            "if (durationAt > 0) { a(); }",
+            "if (playedMsAt >= 0) { a(); }",
+            "if (requestedFieldAt == 0) { a(); }",
+            "if (elapsedAt() > 0) { a(); }",
+            "if (0 < preambleMsAt) { a(); }",
+            "if (stage_ms_at > 0) { a(); }",
+            "ASSERT_TRUE(0 < elapsedSecondsAt);",
+        ])
+        self.assertEqual(scan_text(positions, source="<positions>"), [])
+        for real in ("if (durationAtStart > 0) { a(); }", "if (atMs > 0) { a(); }",
+                     "if (elapsed_at_ms > 0) { a(); }", "if (at_elapsed > 0) { a(); }"):
+            self.assertEqual(len(scan_text(real, source="<real>")), 1, real)
+
+    def test_hardening1_items_already_closed_on_master_stay_closed(self) -> None:
+        # HARDENING-1 (fable on #173) was verified already fixed by 4B; pinned here so it
+        # cannot regress unnoticed: a bare `ms` identifier, a copied anchor surfacing as an
+        # extra occurrence (the (path, anchor, count) key changes), ASSERT_NEAR/DOUBLE_EQ.
+        bare = scan_text("if (ms > 0.0) { a(); }", source="<bare-ms>")
+        self.assertEqual(len(bare), 1)
+        dup = scan_text("if (elapsed_ms > 0.0) { a(); }\nint x;\nif (elapsed_ms > 0.0) { a(); }", source="<dup>")
+        self.assertEqual(len(dup), 1)
+        self.assertEqual(dup[0].lines, (1, 3))
+        self.assertEqual(len(scan_text("ASSERT_NEAR(0.0, elapsed_ms, 1e-9);", source="<near>")), 1)
+        self.assertEqual(len(scan_text("EXPECT_DOUBLE_EQ(0.0, elapsed_ms);", source="<deq>")), 1)
+
+    def test_gui_latency_golden_rows_are_structural_not_open_debt(self) -> None:
+        # (f) sol's "five conservative GUI-latency debt rows" are the test_clip_golden.cpp
+        # average_latency_ms / play_to_first_frame_ms (x3) / latency_ms assertions. 3b already
+        # turned them into `>= 0.0` non-negativity checks whose run-proof is carried by
+        # ASSERT_EQ(2, frames.size()) / play_to_first_frame_measured; verified against the
+        # source at HARDENING-2 time. Pin: they are five live sites, none of them open debt.
+        path = "tests/console/test_clip_golden.cpp"
+        anchors = {
+            'ASSERT_TRUE ( metadata . value ( QStringLiteral ( "average_latency_ms" ) ) . toDouble ( ) >= 0.0 ) ;': 1,
+            'ASSERT_TRUE ( metadata . value ( QStringLiteral ( "play_to_first_frame_ms" ) ) . toDouble ( ) >= 0.0 ) ;': 3,
+            'ASSERT_TRUE ( sample . value ( QStringLiteral ( "latency_ms" ) ) . toDouble ( ) >= 0.0 ) ;': 1,
+        }
+        for anchor, count in anchors.items():
+            row = self.inventory_by_key.get((path, anchor, count))
+            self.assertIsNotNone(row, (anchor, count))
+            self.assertEqual(row["class"], "not_run_proof_structural", row)
+            self.assertNotIn("status", row)
+
+    def test_multiline_fabs_zero_asserts_in_receipt_applier_are_inventoried(self) -> None:
+        # (c) the live multi-line sites sol named; each is a plan-derived (not measured) value.
+        path = "tests/console/test_receipt_applier.cpp"
+        fabs_sites = [
+            c for c in self.live_candidates if c.path == path and "fabs_zero" in c.triggers
+        ]
+        self.assertGreaterEqual(len(fabs_sites), 3, fabs_sites)
+        for c in fabs_sites:
+            row = self.inventory_by_key.get((c.path, c.anchor, len(c.lines)))
+            self.assertIsNotNone(row, c)
+            self.assertEqual(row["class"], "not_run_proof_structural", row)
+
     def test_seeded_controls_do_not_leak_into_the_real_inventory(self) -> None:
         # The seeded snippets above are synthetic sources (source="<seeded-...>"), never written
         # under src/, platform/qt/ or tests/, so they must never appear as a live repo candidate
