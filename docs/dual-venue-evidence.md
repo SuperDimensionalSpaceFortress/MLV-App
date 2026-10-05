@@ -343,6 +343,43 @@ CUDA run of a scale-4 or scale-2 leg renders at scale 1. Three production receip
 * The job is generated with `-ExpectedScaleRequest <accepted scale>` so the smoke runner's own scale check is live (`-UsePersistedPlaybackSettings` leaves it at -1 otherwise). The
   runner compares the app's request after the clamp, so the value is the accepted *effective* scale, not the spec's request.
 
+## Display matrix (standard playback benchmark)
+
+Owner (2026-10-03, again 2026-10-05): playback benchmarks must not be full screen only. A leg has an optional `displayMode` (`"fullscreen"` | `"windowed"`; absent = full screen, so every
+leg that existed before is unchanged, byte for byte and in its `legSpecSha256`). `windowed` makes the job pass the app's own `--windowed` (a normal maximized window with chrome, PR #248) through
+the generator's `-DisplayMode windowed`; `fullscreen` passes nothing, so a full-screen job is the text it always was.
+
+* **The receipt says what happened, next to the `scale` block.** `display` carries `requestedMode` (the spec's), `observedMode` (read from the app's own `gui_smoke.window_placement` line in the
+  hashed run log, through the one shared parser `gui-smoke-display-identity.ps1`; `UNKNOWN` when the line is absent), `placementVerified`, the presented window (`windowWidth` x `windowHeight`, the
+  preview area `previewWidth` x `previewHeight` inside it, and the screen `presentationPhysical*`, all as the app logs them), a `verdict` (`HONOURED` | `NOT_HONOURED` | `UNKNOWN`) and `blocks`.
+  Every receipt carries it, a refusal included (observed `UNKNOWN`).
+* **Fail closed.** A requested-windowed leg that ran full screen is **not a valid measurement**: the receipt ends `INVALID` with `DISPLAY_MODE_NOT_HONOURED` and both modes in `outcomeDetail`, never `PASS`
+  or `FAIL` (and the reverse: a full-screen leg that ran windowed). A leg whose spec **names** a mode also ends `INVALID` when the log cannot confirm it, or when the app did not verify the placement
+  (`verified=0`). A legacy spec (no `displayMode`) keeps its old behaviour when the line is absent (`UNKNOWN` does not block it). `Test-DvReceiptValid` re-derives the same verdict from the hashed log and the
+  committed spec (`DISPLAY_MODE_NOT_HONOURED`, `DISPLAY_NOT_FROM_EVIDENCE`, and `INCOMPLETE` for a named mode with no `display` block).
+* **The standard leg set** is `legsets/display-matrix.json`: the owner clip M16-1243, Look Assist Cinematic, `{fullscreen, windowed}` x `{scale 1 = full, 2 = half, 4 = quarter}` x `{cuda, cpu}` = **12 cells**.
+  Each cell is an ordinary committed leg spec (`legs/m16-1243-display-<mode>-s<scale>.json`, six specs, each listing both backends); the set only names them. Why a set file and not one matrix spec the
+  runner expands: a receipt is bound to a committed spec by its sha256 (`Find-DvCommittedLegSpec`), so a cell that is not a committed spec could never validate. The CUDA texture route clamps scales 2 and 4
+  to 1, so those specs declare `acceptedEffectiveScale.cuda: 1`: the table shows `2->1` and `4->1` for CUDA, and the three CUDA sizes are one workload until the route honours the scale.
+  Roles are declared in `venues.json` (`DUAL-VENUE-DISPLAY-MATRIX-1`: Bachelor acceptance, Ultra-Magnus supplementary).
+* **Run it** (one entry point, the same script; `-LegSet` and `-LegSpec` are different parameter sets):
+
+  ```
+  # the plan alone: no venue, commit or build needed, nothing generated or submitted
+  pwsh -NoProfile -File tools\profiling\dual-venue\Invoke-VenueLeg.ps1 -LegSet display-matrix -PlanOnly -Repeats 3
+  # the run: every cell, 3 repeats, interleaved (36 legs); -Backend cuda|cpu keeps only that backend's cells
+  pwsh -NoProfile -File tools\profiling\dual-venue\Invoke-VenueLeg.ps1 -LegSet display-matrix -Repeats 3 `
+      -Venue bachelor -SourceCommit <40-hex> -BuildManifestSha256 <64-hex>
+  ```
+
+  Repeats are **interleaved**, as the 2026-10-03 matrix was run: repeat 1 walks the cells forward, repeat 2 walks them back, repeat 3 forward again, so a drift of the host lands on both ends of every
+  comparison. Each leg runs through the single-leg runner as a child process and writes its own receipt exactly as a lone leg does (a leg that ends in any outcome is a row; the walk does not stop).
+* **One summary table** (`<main checkout>\.claude-state\dual-venue\legset-summaries\<set>-<venue>-<stamp>\summary.md`, with the rows in `summary.json`, and printed): a row per cell, aggregated over the
+  repeats: measured / ran, **presented fps** (median, min-max), **timeline fps after the first present** (`pace_summary`; the plain `timeline_fps` counts the wait for the first frame as playback),
+  **render_work ms**, **dual-ISO ms** (`cpu_summary`), requested -> **effective scale**, observed display mode and the **observed window size** (the app window, with the preview area in it), and the
+  outcomes. The numbers are read from each leg's hashed app log, only for a `PASS`/`FAIL` receipt whose log still hashes to it. Production receipts stay **advisory** (see above): the table is a benchmark
+  summary, not a verified `PASS`. The first live matrix runs belong to the next playback card; this card ships the tooling and a dry-run plan.
+
 ## How to add a leg
 
 1. Copy `legs/m16-1243-speed.json` (or `m16-1243-look.json`, `m16-1243-look-scale2.json`); give it a new `legId`, the `card` that needs the
@@ -351,6 +388,7 @@ CUDA run of a scale-4 or scale-2 leg renders at scale 1. Three production receip
 2. Declare the **roles before the first byte** (kernel K5): add the card to `venues.json` `roles`
    (`bachelor: acceptance`, `ultra-magnus: supplementary` for a card whose acceptance venue is Bachelor).
    A card the table does not name gets `defaultRole` (`supplementary`) on both venues.
+   A leg may name a `displayMode` (`fullscreen` | `windowed`; default full screen): see *Display matrix (standard playback benchmark)*, which also says how to add a leg to a leg set.
    A `scaleFactor` other than 1 on a `cuda` backend needs `acceptedEffectiveScale.cuda: 1` while the texture-route clamp exists (a test enforces it); otherwise list `cpu` only.
 3. Put the pass criteria per **role** and per **backend** in `criteria`: `{metric, op, value}` triples
    over the metrics copied verbatim from the job's `summary.json` (`rows`, `gpuFramesTotal`, `cpuFrames`,
@@ -412,6 +450,7 @@ the receipt -- the contact sheet, and, on a failed smoke run, `smoke-stderr.txt`
 |---|---|
 | `MEASUREMENT_CAPTURED` (exit 0, valid oracle verdict, the job's own `sourceFrames` block) | `PASS` or `FAIL` from the role/backend criteria |
 | `MEASUREMENT_CAPTURED` whose rendered playback scale is not the leg's accepted one, or cannot be read from the run log (checked before everything below) | `SCALE_NOT_HONOURED` (no signal; both numbers in `outcomeDetail`) |
+| a `PASS`/`FAIL` whose leg ran in a display mode other than the one it names (a requested-windowed leg that ran full screen), or names a mode the run log cannot confirm (`DISPLAY_MODE_NOT_HONOURED`; see *Display matrix*) | `INVALID` (no signal; both modes in `outcomeDetail`) |
 | `MEASUREMENT_CAPTURED` for a LOOK leg whose venue could not compose the contact sheet (`CONTACT_SHEET_COMPOSE_UNAVAILABLE`: no Python + Pillow) | `VENUE_TOOLING` (raw frames kept locally; a venue condition) |
 | `MEASUREMENT_CAPTURED` with a non-zero exit, `FIXTURE_REHEARSAL_CAPTURED`, `SOURCE_FRAMES_INVALID`, or a smoke refusal of the length class (`PLAY_WINDOW_TOO_SHORT`, `CLIP_TOO_SHORT`, `INVALID_LOOPED`, ...); or a PASS/FAIL whose receipt lacks a valid oracle verdict | `INVALID` |
 | `VENUE_NOT_QUIESCENT` | `VENUE_NOT_QUIESCENT` |

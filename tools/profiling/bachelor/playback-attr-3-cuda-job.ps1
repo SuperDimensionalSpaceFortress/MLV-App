@@ -343,7 +343,13 @@ param(
     # HERE, at generation, because both tracked fixtures are far under 20 s and are never played on
     # a venue. Floor 20: a play window under the owner's 20 s minimum is not a playback test.
     [ValidateRange(20, 3600)]
-    [int]$PlaySeconds = 25
+    [int]$PlaySeconds = 25,
+
+    # DUAL-VENUE-DISPLAY-MATRIX-1 (owner 2026-10-03 and 2026-10-05: playback benchmarks must not be full screen only): 'windowed' appends the app's own --windowed
+    # (a normal maximized window with chrome; PR #248) to the smoke runner's -AdditionalArgs. 'fullscreen' (the default) adds nothing: the emitted job is the
+    # text it was before this parameter (the windowed statements are added to the expanded text below, only for a windowed leg).
+    [ValidateSet('fullscreen', 'windowed')]
+    [string]$DisplayMode = 'fullscreen'
 )
 
 $ErrorActionPreference = 'Stop'
@@ -4149,6 +4155,22 @@ $text = Expand-AttrCudaTemplate -Template $template -Tokens ([ordered]@{
     EMBEDDED_FUNCTIONS = $embeddedFunctions
 })
 
+# DUAL-VENUE-DISPLAY-MATRIX-1: a windowed leg passes the app's --windowed through the ONE -AdditionalArgs the job emits (a second -AdditionalArgs would be a parameter-binding
+# error): appended to the contact-sheet array when a sheet is on, else as an array of its own. Done HERE, on the expanded text, and only for a windowed leg: the template (which tests
+# slice and run) and the default job are untouched, so a full-screen job is the text it always was. The anchor must match exactly once, or the generator throws (a template refactor
+# can never silently drop --windowed and let a windowed leg run full screen).
+if ($DisplayMode -eq 'windowed') {
+    $displayAnchor = [regex]'(?<ind>[ \t]*)\$cmd = "\$cmd -AdditionalArgs \$contactSheetAdditionalArgs"(?<nl>\r?\n)\}'
+    if ($displayAnchor.Matches($text).Count -ne 1) { throw 'DUAL_VENUE_DISPLAY_ANCHOR_MISSING the job template has no single -AdditionalArgs site to add --windowed to' }
+    $text = $displayAnchor.Replace($text, [System.Text.RegularExpressions.MatchEvaluator]{
+        param($m)
+        $ind = $m.Groups['ind'].Value; $nl = $m.Groups['nl'].Value
+        $ind + '$contactSheetAdditionalArgs = $contactSheetAdditionalArgs.Substring(0, $contactSheetAdditionalArgs.Length - 1) + ", ''--windowed'')"' + $nl +
+            $ind + '$cmd = "$cmd -AdditionalArgs $contactSheetAdditionalArgs"' + $nl + '}' + $nl +
+            'if (-not $ContactSheetEnabled) { $cmd = "$cmd -AdditionalArgs @(''--windowed'')" }'
+    })
+}
+
 $outDir = Split-Path -Parent $OutFile
 if ($outDir -and -not (Test-Path -LiteralPath $outDir)) { New-Item -ItemType Directory -Path $outDir -Force | Out-Null }
 [IO.File]::WriteAllText($OutFile, $text, [Text.UTF8Encoding]::new($false))
@@ -4175,6 +4197,7 @@ $clipContentSha256 = if ($isFixtureRehearsal) {
     clipContentSha256 = $clipContentSha256
     playSeconds = $PlaySeconds
     fixtureRehearsal = $isFixtureRehearsal
+    displayMode = $DisplayMode
     # DUAL-VENUE-EVIDENCE-1: what this generation was authored for (not part of the emitted job's bytes).
     venue = $Venue
     backend = $Backend

@@ -19,6 +19,7 @@
       "description": "Every playback leg runs as cuda AND cpu on EVERY venue (Amendment 1 A1). 'gl' is reserved and not yet runnable."
     },
     "scaleFactor": { "type": "integer", "minimum": 1, "maximum": 16, "description": "The playback scale the leg REQUESTS. The receipt also records the scale the app actually rendered at (effectiveScale, read from the app's own run log); a leg whose run rendered at any other scale than the accepted one ends SCALE_NOT_HONOURED, never PASS." },
+    "displayMode": { "enum": ["fullscreen", "windowed"], "description": "OPTIONAL (DUAL-VENUE-DISPLAY-MATRIX-1). The display mode the leg REQUESTS: 'fullscreen' (the default when the field is absent, so every existing leg is unchanged) or 'windowed' (the app's own --windowed: a normal maximized window with chrome). The receipt's display block carries the requested AND the observed mode (read from the app's own gui_smoke.window_placement line) and the window it presented in. FAIL CLOSED: a leg that ran in a different mode than it names (a requested-windowed leg that ran full screen), or that names a mode the run log cannot confirm, ends INVALID (DISPLAY_MODE_NOT_HONOURED), never PASS or FAIL." },
     "acceptedEffectiveScale": {
       "type": "object", "additionalProperties": false,
       "properties": {

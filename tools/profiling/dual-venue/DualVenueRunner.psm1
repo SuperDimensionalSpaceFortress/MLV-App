@@ -699,6 +699,254 @@ function Get-DvScaleEvidence {
     }
 }
 
+function Get-DvDisplayEvidence {
+    <#
+    .SYNOPSIS
+    The receipt's `display` block (DUAL-VENUE-DISPLAY-MATRIX-1): the display mode the leg REQUESTED (the spec's optional `displayMode`; a spec that names none is a
+    full-screen leg), the display mode the app actually RAN in, and the window it presented in -- all read from the app's own `gui_smoke.window_placement` line in the run log
+    (the shared parser ConvertFrom-GuiSmokeDisplayLog), never from the spec. `observedMode` is 'UNKNOWN' when the run log has no readable placement line.
+    `windowWidth/Height` is the app window and `previewWidth/Height` the preview area in it (logical pixels, as the app logs them); `presentationPhysical*` is the screen it sat on.
+
+    FAIL CLOSED: `blocks` is true when the run is not a valid measurement under the mode the leg named. A requested windowed leg that ran full screen blocks (and the reverse).
+    A leg whose spec NAMES a displayMode also blocks when the app's mode is unreadable or its placement was not verified. A legacy spec (no displayMode) keeps the behaviour it
+    had before this block existed: an unreadable placement does not block it, so no existing leg changes. Pure and shared: the runner gates on it and Test-DvReceiptValid
+    re-derives it from the hashed run log and the committed spec.
+    #>
+    param([Parameter(Mandatory)]$Spec, [AllowNull()][AllowEmptyString()][string]$LogText)
+    $named = Get-DvProp $Spec 'displayMode'
+    $explicit = ($null -ne $named)
+    $requested = $(if ($explicit) { [string]$named } else { 'fullscreen' })
+    $observed = 'UNKNOWN'
+    $verified = $null
+    $placement = $null
+    $parseFailure = $null
+    if (-not [string]::IsNullOrEmpty($LogText)) {
+        # The one parser (gui-smoke-display-identity.ps1: the smoke runner and the job use it too). Dot-sourced the way AttrCudaArtifacts does, once per call.
+        # A parser that cannot be loaded is UNKNOWN (never a throw: a leg that ran always ends in a receipt), and UNKNOWN blocks a leg that names a mode.
+        try {
+            if (-not (Get-Command ConvertFrom-GuiSmokeDisplayLog -CommandType Function -ErrorAction SilentlyContinue)) {
+                . (Join-Path $PSScriptRoot '..\gui-smoke-display-identity.ps1')
+            }
+            $placement = (ConvertFrom-GuiSmokeDisplayLog -LogText $LogText).placement
+        } catch {
+            $placement = $null
+            $parseFailure = 'the display-identity parser could not read the run log'
+        }
+        if ($null -ne $placement) {
+            if ([string]$placement.mode -cin @('fullscreen', 'windowed')) { $observed = [string]$placement.mode }
+            $verified = [bool]$placement.verified
+        }
+    }
+    $verdict = 'HONOURED'
+    $reason = $null
+    if ($observed -ceq 'UNKNOWN') {
+        $verdict = 'UNKNOWN'
+        $reason = $(if ($null -ne $parseFailure) { $parseFailure } else { 'the run log has no readable gui_smoke.window_placement line' }) + ', so the display mode the app ran in is unknown'
+    } elseif ($observed -cne $requested) {
+        $verdict = 'NOT_HONOURED'
+        $reason = "requested $requested but the app ran $observed"
+    } elseif ($explicit -and $verified -ne $true) {
+        $verdict = 'NOT_HONOURED'
+        $reason = "the app ran $observed as requested but did not verify the placement (gui_smoke.window_placement verified=0)"
+    }
+    $blocks = ($verdict -ceq 'NOT_HONOURED') -or ($verdict -ceq 'UNKNOWN' -and $explicit)
+    [ordered]@{
+        requestedMode = $requested
+        explicit = $explicit
+        observedMode = $observed
+        observedSource = $(if ($null -ne $placement) { 'gui_smoke.window_placement' } else { 'absent from the run log' })
+        placementVerified = $verified
+        windowWidth = $(if ($null -ne $placement) { $placement.windowWidth } else { $null })
+        windowHeight = $(if ($null -ne $placement) { $placement.windowHeight } else { $null })
+        previewWidth = $(if ($null -ne $placement) { $placement.previewWidth } else { $null })
+        previewHeight = $(if ($null -ne $placement) { $placement.previewHeight } else { $null })
+        presentationPhysicalWidth = $(if ($null -ne $placement) { $placement.presentationPhysicalWidth } else { $null })
+        presentationPhysicalHeight = $(if ($null -ne $placement) { $placement.presentationPhysicalHeight } else { $null })
+        verdict = $verdict
+        reason = $reason
+        blocks = $blocks
+    }
+}
+
+# --- leg sets and the display matrix (DUAL-VENUE-DISPLAY-MATRIX-1) -------------------------------------------------------
+# A LEG SET is a tracked list of committed leg specs that one run executes together. The set does not define legs: every cell is still an ordinary committed leg spec (so every receipt
+# is bound to a committed spec by its sha256, exactly as for a single leg), and the set only says which specs make up the matrix, and in what order a run walks them.
+$script:LegSetSchema = 'mlv-app/dual-venue-legset/v1'
+$script:LegSetsRelativeDir = 'tools/profiling/dual-venue/legsets'
+
+function Get-DvLegSetPlan {
+    <#
+    .SYNOPSIS
+    Expand a leg set into the planned legs of a run: one entry per (leg spec x backend the spec lists) cell and repeat. Pure: reads the set file and its specs, runs nothing.
+    .DESCRIPTION
+    Cell order is backend-major in the order backends first appear, then the set's own leg order (so a full-screen cell and its windowed twin are neighbours). The cells are INTERLEAVED
+    across repeats the way the 2026-10-03 matrix was run: repeat 1 walks the cells forward, repeat 2 walks them back, repeat 3 forward again, so a slow drift of the host (thermal, a
+    neighbour's job) lands on both ends of every comparison instead of on one arm. Every spec of a set must name the set's clip and card (fail closed: a set that mixed clips would
+    not be one matrix), and the cell ids must be unique.
+    Returns [pscustomobject]@{ legSet; card; clipId; repeats; cells (the forward list); plan (the walk, in run order) }.
+    #>
+    param([Parameter(Mandatory)][string]$LegSetPath, [ValidateRange(1, 20)][int]$Repeats = 1, [string]$Backend = '')
+    if (-not (Test-Path -LiteralPath $LegSetPath -PathType Leaf)) { throw "DVE_LEGSET_INVALID no leg set at the given path" }
+    $setDir = Split-Path -Parent (Resolve-Path -LiteralPath $LegSetPath).Path
+    $dvDir = Split-Path -Parent $setDir
+    $set = [IO.File]::ReadAllText($LegSetPath) | ConvertFrom-Json
+    if ((Get-DvProp $set 'schema') -cne $script:LegSetSchema) { throw "DVE_LEGSET_INVALID schema is not $script:LegSetSchema" }
+    $setName = [string](Get-DvProp $set 'legSet')
+    if ($setName -cnotmatch '^[a-z0-9][a-z0-9-]{1,62}$') { throw 'DVE_LEGSET_INVALID legSet is not a leg-set name' }
+    $card = [string](Get-DvProp $set 'card'); $clipId = [string](Get-DvProp $set 'clipId')
+    $legRefs = Get-DvProp $set 'legs'   # (assigned, not wrapped in @(): Get-DvProp returns an array as ONE object)
+    $legRefs = @($legRefs)
+    if ($legRefs.Count -eq 0 -or $null -eq $legRefs[0]) { throw 'DVE_LEGSET_INVALID the set lists no legs' }
+    $legsDir = [IO.Path]::GetFullPath((Join-Path $dvDir 'legs')).TrimEnd('\') + '\'
+    $specs = [System.Collections.Generic.List[object]]::new()
+    foreach ($ref in $legRefs) {
+        $full = [IO.Path]::GetFullPath((Join-Path $dvDir ([string]$ref)))
+        # a leg named by a set is always one of the committed specs under legs/ (production finds the spec a receipt names ONLY there)
+        if (-not $full.StartsWith($legsDir, [StringComparison]::OrdinalIgnoreCase) -or -not $full.EndsWith('.json') -or -not (Test-Path -LiteralPath $full -PathType Leaf)) {
+            throw "DVE_LEGSET_INVALID '$ref' is not a leg spec under legs/"
+        }
+        $spec = [IO.File]::ReadAllText($full) | ConvertFrom-Json
+        if ([string]$spec.clipId -cne $clipId -or [string]$spec.card -cne $card) { throw "DVE_LEGSET_INVALID leg '$($spec.legId)' does not name the set's clip and card" }
+        $specs.Add([pscustomobject]@{ path = $full; spec = $spec })
+    }
+    $backends = [System.Collections.Generic.List[string]]::new()
+    foreach ($s in $specs) { foreach ($b in @($s.spec.backends)) { if ($b -notin $backends) { $backends.Add([string]$b) } } }
+    $cells = [System.Collections.Generic.List[object]]::new()
+    $seen = @{}
+    foreach ($b in $backends) {
+        foreach ($s in $specs) {
+            if ($b -notin @($s.spec.backends)) { continue }
+            $mode = $(if ($null -ne (Get-DvProp $s.spec 'displayMode')) { [string]$s.spec.displayMode } else { 'fullscreen' })
+            $cellId = "$b-$mode-s$([int]$s.spec.scaleFactor)"
+            if ($seen.ContainsKey($cellId)) { throw "DVE_LEGSET_INVALID two legs of the set make the cell $cellId" }
+            $seen[$cellId] = $true
+            $cells.Add([pscustomobject]@{ cellId = $cellId; legId = [string]$s.spec.legId; specPath = $s.path; backend = $b; displayMode = $mode; scaleFactor = [int]$s.spec.scaleFactor })
+        }
+    }
+    $cellList = @($cells | Where-Object { [string]::IsNullOrEmpty($Backend) -or $_.backend -ceq $Backend })
+    if ($cellList.Count -eq 0) { throw "DVE_LEGSET_INVALID the set has no cell for backend '$Backend'" }
+    $plan = [System.Collections.Generic.List[object]]::new()
+    $seq = 0
+    for ($r = 1; $r -le $Repeats; $r++) {
+        $walk = $(if ($r % 2 -eq 1) { $cellList } else { @($cellList[($cellList.Count - 1)..0]) })
+        foreach ($c in $walk) {
+            $seq++
+            $plan.Add([pscustomobject]@{ seq = $seq; repeat = $r; cellId = $c.cellId; legId = $c.legId; specPath = $c.specPath; backend = $c.backend; displayMode = $c.displayMode; scaleFactor = $c.scaleFactor })
+        }
+    }
+    [pscustomobject]@{ legSet = $setName; card = $card; clipId = $clipId; repeats = $Repeats; cells = @($cellList); plan = @($plan) }
+}
+
+function Get-DvSmokeSessionLineFields {
+    <#
+    .SYNOPSIS
+    The key=value fields of the LAST `playback_smoke.<Marker> session=<n>` line of the MEASURED session in the app's run log (the session Get-DvSmokeSummaryFields picks),
+    or an empty table. Marker is e.g. 'pace_summary' or 'cpu_summary'.
+    #>
+    param([AllowNull()][AllowEmptyString()][string]$LogText, [Parameter(Mandatory)][ValidatePattern('^[a-z_]+$')][string]$Marker)
+    $fields = @{}
+    if ([string]::IsNullOrEmpty($LogText)) { return $fields }
+    $session = (Get-DvSmokeSummaryFields -LogText $LogText).session
+    if ($null -eq $session) { return $fields }
+    $pattern = 'playback_smoke\.' + $Marker + ' session=' + [regex]::Escape([string]$session) + '(\s|$)'
+    $found = $null
+    foreach ($line in ($LogText -split "`r?`n")) { if ($line -match $pattern) { $found = $line } }
+    if ($null -ne $found) { foreach ($m in [regex]::Matches($found, '(?<k>[A-Za-z0-9_]+)=(?<v>\S+)')) { $fields[$m.Groups['k'].Value] = $m.Groups['v'].Value } }
+    $fields
+}
+
+function Get-DvMatrixRates {
+    <#
+    .SYNOPSIS
+    The numbers one display-matrix cell reports, read from the app's own run log (the measured session): presented fps (summary presented_fps), timeline fps after the first present
+    (pace_summary timeline_fps_after_first_present; the plain timeline_fps counts the wait for the first frame as playback), render_work ms (summary avg_render_work_ms) and dual-ISO ms
+    (cpu_summary avg_llrawproc_dual_iso_ms). An absent or unparsable field is $null (never zero).
+    #>
+    param([AllowNull()][AllowEmptyString()][string]$LogText)
+    $sum = (Get-DvSmokeSummaryFields -LogText $LogText).fields
+    $pace = Get-DvSmokeSessionLineFields -LogText $LogText -Marker 'pace_summary'
+    $cpu = Get-DvSmokeSessionLineFields -LogText $LogText -Marker 'cpu_summary'
+    [ordered]@{
+        presentedFps = (ConvertTo-DvDouble $sum['presented_fps'])
+        timelineFpsAfterFirstPresent = (ConvertTo-DvDouble $pace['timeline_fps_after_first_present'])
+        renderWorkMs = (ConvertTo-DvDouble $sum['avg_render_work_ms'])
+        dualIsoMs = (ConvertTo-DvDouble $cpu['avg_llrawproc_dual_iso_ms'])
+    }
+}
+
+function Get-DvMatrixRow {
+    <#
+    .SYNOPSIS
+    One planned leg's row of the matrix summary, from the receipt the leg wrote. Rates are read only when the outcome is a measurement (PASS or FAIL: every other outcome is no signal,
+    its row carries the outcome and no numbers) AND the hashed run log still hashes to receipt.evidence.logSha256 (a swapped log is no measurement: rates stay absent and `note` says so).
+    #>
+    param([Parameter(Mandatory)]$PlanEntry, $Receipt)
+    $row = [ordered]@{
+        seq = $PlanEntry.seq; repeat = $PlanEntry.repeat; cellId = $PlanEntry.cellId; backend = $PlanEntry.backend
+        requestedDisplay = $PlanEntry.displayMode; observedDisplay = 'UNKNOWN'; requestedScale = $PlanEntry.scaleFactor; effectiveScale = 'UNKNOWN'
+        windowSize = $null; previewSize = $null; outcome = 'NO_RECEIPT'; receiptId = $null
+        presentedFps = $null; timelineFpsAfterFirstPresent = $null; renderWorkMs = $null; dualIsoMs = $null; note = $null
+    }
+    if ($null -eq $Receipt) { $row.note = 'the leg wrote no receipt'; return [pscustomobject]$row }
+    $row.outcome = [string](Get-DvProp $Receipt 'outcome'); $row.receiptId = [string](Get-DvProp $Receipt 'receiptId')
+    $display = Get-DvProp $Receipt 'display'
+    if ($null -ne $display) {
+        $row.observedDisplay = [string](Get-DvProp $display 'observedMode')
+        $w = Get-DvProp $display 'windowWidth'; $h = Get-DvProp $display 'windowHeight'
+        if ($null -ne $w -and $null -ne $h) { $row.windowSize = "${w}x${h}" }
+        $pw = Get-DvProp $display 'previewWidth'; $ph = Get-DvProp $display 'previewHeight'
+        if ($null -ne $pw -and $null -ne $ph) { $row.previewSize = "${pw}x${ph}" }
+    }
+    $scale = Get-DvProp $Receipt 'scale'
+    if ($null -ne $scale) { $row.effectiveScale = Get-DvProp $scale 'effectiveScale' }
+    if ($row.outcome -cnotin @('PASS', 'FAIL')) { $row.note = [string](Get-DvProp $Receipt 'outcomeDetail'); return [pscustomobject]$row }
+    $evidence = Get-DvProp $Receipt 'evidence'
+    $dir = [string](Get-DvProp $evidence 'localEvidenceDir'); $claimed = [string](Get-DvProp $evidence 'logSha256')
+    $logPath = $(if ($dir) { Join-Path $dir 'logs\smoke-run.log' } else { '' })
+    if (-not $logPath -or -not (Test-Path -LiteralPath $logPath -PathType Leaf)) { $row.note = 'the run log is not in the local evidence'; return [pscustomobject]$row }
+    $bytes = [IO.File]::ReadAllBytes($logPath)
+    if ((Get-DvSha256OfBytes $bytes) -cne $claimed) { $row.note = 'the run log does not hash to the receipt (not a measurement)'; return [pscustomobject]$row }
+    $rates = Get-DvMatrixRates -LogText ([Text.Encoding]::UTF8.GetString($bytes))
+    foreach ($k in $rates.Keys) { $row[$k] = $rates[$k] }
+    [pscustomobject]$row
+}
+
+function Get-DvMedian {
+    # The median of the numbers given ($null for none); an even count averages the middle two.
+    param($Values)
+    $v = @($Values | Where-Object { $null -ne $_ } | ForEach-Object { [double]$_ } | Sort-Object)
+    if ($v.Count -eq 0) { return $null }
+    if ($v.Count % 2 -eq 1) { return $v[[int](($v.Count - 1) / 2)] }
+    ($v[$v.Count / 2 - 1] + $v[$v.Count / 2]) / 2
+}
+
+function ConvertTo-DvMatrixTable {
+    <#
+    .SYNOPSIS
+    The ONE summary table of a display-matrix run (markdown): a row per cell, in the set's cell order, aggregated over the repeats: how many repeats were a valid measurement of how many
+    ran, presented fps (median, with min-max), timeline fps after the first present, render_work ms, dual-ISO ms (medians), requested -> effective scale (the CUDA clamp stays visible), the
+    observed display mode and the observed window size (the app window, with the preview area in it), and the outcomes the repeats ended in. A cell with no measurement shows dashes.
+    #>
+    param([Parameter(Mandatory)][object[]]$Rows, [Parameter(Mandatory)][object[]]$Cells)
+    $f = { param($x, $d) if ($null -eq $x) { '-' } else { ([double]$x).ToString("F$d", [Globalization.CultureInfo]::InvariantCulture) } }
+    $lines = [System.Collections.Generic.List[string]]::new()
+    $lines.Add('| cell | backend | display (requested / observed) | scale (requested -> effective) | window (preview) | measured / ran | presented fps median (min-max) | timeline fps after first present | render_work ms | dual-ISO ms | outcomes |')
+    $lines.Add('|---|---|---|---|---|---|---|---|---|---|---|')
+    foreach ($c in $Cells) {
+        $mine = @($Rows | Where-Object { $_.cellId -ceq $c.cellId })
+        $meas = @($mine | Where-Object { $_.outcome -cin @('PASS', 'FAIL') -and $null -ne $_.presentedFps })
+        $pf = @($meas | ForEach-Object { $_.presentedFps })
+        $range = $(if ($pf.Count -gt 0) { '(' + (& $f ($pf | Measure-Object -Minimum).Minimum 2) + '-' + (& $f ($pf | Measure-Object -Maximum).Maximum 2) + ')' } else { '' })
+        $presented = ((& $f (Get-DvMedian $pf) 2) + ' ' + $range).Trim()
+        $observed = @($mine | ForEach-Object { $_.observedDisplay } | Sort-Object -Unique) -join ','
+        $eff = @($mine | ForEach-Object { "$($c.scaleFactor)->$($_.effectiveScale)" } | Sort-Object -Unique) -join ','
+        $win = @($mine | Where-Object { $_.windowSize } | ForEach-Object { if ($_.previewSize) { "$($_.windowSize) ($($_.previewSize))" } else { $_.windowSize } } | Sort-Object -Unique) -join ', '
+        $outcomes = @($mine | ForEach-Object { $_.outcome } | Group-Object | Sort-Object Name | ForEach-Object { "$($_.Name) x$($_.Count)" }) -join ', '
+        $lines.Add("| $($c.cellId) | $($c.backend) | $($c.displayMode) / $(if ($observed) { $observed } else { '-' }) | $eff | $(if ($win) { $win } else { '-' }) | $($meas.Count)/$($mine.Count) | $presented | $(& $f (Get-DvMedian @($meas | ForEach-Object { $_.timelineFpsAfterFirstPresent })) 2) | $(& $f (Get-DvMedian @($meas | ForEach-Object { $_.renderWorkMs })) 1) | $(& $f (Get-DvMedian @($meas | ForEach-Object { $_.dualIsoMs })) 1) | $(if ($outcomes) { $outcomes } else { '-' }) |")
+    }
+    $lines -join "`n"
+}
+
 # --- the evidence a receipt is RE-DERIVED from (DUAL-VENUE-EVIDENCE-2 round 1) -----------------------------------------
 # CLASS: a receipt is ADVISORY (production) only when every claim in it is re-derived from a COMMITTED blob or a HASHED artifact; no field the
 # receipt asserts about itself is ever an input. The receipt names its evidence directory and the sha256 of each file in it; the
@@ -1142,6 +1390,21 @@ function Test-DvReceiptValid {
             }
         }
 
+        # ---- the DISPLAY MODE the run ran in: re-derived from the HASHED run log and the COMMITTED spec (DUAL-VENUE-DISPLAY-MATRIX-1) ----
+        # A requested-windowed leg that ran full screen (or the reverse) is not a valid measurement; neither is a leg that NAMES a mode the log cannot confirm.
+        if ($production -and $null -ne $spec) {
+            $displayVerdict = Get-DvDisplayEvidence -Spec $spec -LogText $ev.logText
+            $storedDisplay = Get-DvProp $Receipt 'display'
+            if ($null -eq $storedDisplay) {
+                if ($displayVerdict.explicit) { $incomplete.Add('RECEIPT_FIELD_ABSENT: the receipt carries no display block (requestedMode / observedMode) and its committed spec names a displayMode') }
+            } else {
+                foreach ($f in @('requestedMode', 'observedMode')) {
+                    if (-not (Test-DvJsonEquivalent (Get-DvProp $storedDisplay $f) $displayVerdict[$f])) { $invalid.Add("DISPLAY_NOT_FROM_EVIDENCE: display.$f is not what the hashed run log and the committed leg spec derive") }
+                }
+            }
+            if ($displayVerdict.blocks) { $invalid.Add("DISPLAY_MODE_NOT_HONOURED: $($displayVerdict.reason); a leg that did not run in the display mode it names is not a valid measurement") }
+        }
+
         # ---- the OUTCOME: re-derived from the job's result, its exit code, the verbatim metrics and the COMMITTED criteria -----------
         $resolved = $null
         if ($null -ne $exit) {
@@ -1420,6 +1683,9 @@ function New-DvReceipt {
         # DVE-SCALE2-LOOK-LEG-1 r2: the playback scale the leg requested and the scale the app actually rendered at (Get-DvScaleEvidence). Present on EVERY receipt
         # that names a leg spec (effectiveScale 'UNKNOWN' until a run log says); a PASS/FAIL without it is INCOMPLETE and one that misstates it is INVALID.
         scale = $null
+        # DUAL-VENUE-DISPLAY-MATRIX-1: the display mode the leg requested, the one the app ran in and the window it presented in (Get-DvDisplayEvidence), next to the scale block.
+        # Present on EVERY receipt that names a leg spec (observedMode 'UNKNOWN' until a run log says). A leg that requested a mode the app did not run in is never a PASS/FAIL.
+        display = $null
         look = $null
         # Retired in round 3 (no registry snapshot is taken any more: master isolates an automation run's settings store; the
         # receipt's playback.settingsIsolated is the proof). The key stays null so a reader written against round 2 still parses.
@@ -1468,6 +1734,6 @@ function Write-DvReceipt {
 Export-ModuleMember -Function Get-DvOutcomeEnum, ConvertTo-DvCanonicalJson, Get-DvSha256OfBytes, Get-DvSha256OfText, Get-DvSha256OfFile,
     ConvertTo-DvLfBytes, Get-DvLegSpecSha256, Get-DvDerivedBackend, Get-DvBackendNotDerivable, Read-DvContactFrames, Get-DvSubjectDigest, Read-DvVenueTable, ConvertFrom-DvVenueTableText, Get-DvVenueRole, Get-DvProp, Get-DvCommittedFile, Resolve-DvAdmissionSources,
     Test-DvUnderClaudeState, Read-DvClipConsent, Get-DvClipAdmission, Get-DvSmokeSummaryFields, Get-DvPlaybackProblems,
-    Get-DvPlaybackEvidence, Get-DvScaleEvidence, Get-DvBlobById, Find-DvCommittedLegSpec, Read-DvEvidenceSet, Test-DvJsonEquivalent, Test-DvReceiptValid, Get-DvHealthVerdict,
+    Get-DvPlaybackEvidence, Get-DvScaleEvidence, Get-DvDisplayEvidence, Get-DvLegSetPlan, Get-DvSmokeSessionLineFields, Get-DvMatrixRates, Get-DvMatrixRow, Get-DvMedian, ConvertTo-DvMatrixTable, Get-DvBlobById, Find-DvCommittedLegSpec, Read-DvEvidenceSet, Test-DvJsonEquivalent, Test-DvReceiptValid, Get-DvHealthVerdict,
     New-DvHealthProbeJobText, ConvertFrom-DvProbeStdout,
     Get-DvResultToken, Resolve-DvJobOutcome, Test-DvCriteria, Get-DvVerbatimMetrics, New-DvReceipt, Write-DvReceipt
