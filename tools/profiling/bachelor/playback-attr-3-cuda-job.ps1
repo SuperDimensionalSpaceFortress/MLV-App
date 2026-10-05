@@ -343,7 +343,13 @@ param(
     # HERE, at generation, because both tracked fixtures are far under 20 s and are never played on
     # a venue. Floor 20: a play window under the owner's 20 s minimum is not a playback test.
     [ValidateRange(20, 3600)]
-    [int]$PlaySeconds = 25
+    [int]$PlaySeconds = 25,
+
+    # DUAL-VENUE-DISPLAY-MATRIX-1 (owner 2026-10-03 and 2026-10-05: playback benchmarks must not be full screen only): 'windowed' appends the app's own --windowed
+    # (a normal maximized window with chrome; PR #248) to the smoke runner's -AdditionalArgs. 'fullscreen' (the default) adds nothing: the emitted job is the
+    # text it was before this parameter (both tokens below expand to the empty string).
+    [ValidateSet('fullscreen', 'windowed')]
+    [string]$DisplayMode = 'fullscreen'
 )
 
 $ErrorActionPreference = 'Stop'
@@ -2580,14 +2586,14 @@ if ($ContactSheetEnabled) {
     # Play (in-pass, playback_path=true, no replay; its readback cost is recorded per frame), so the
     # sheet shows what played. A seek sheet (playback_path=false: a seeked frame takes a different
     # render path and can look different) is added only when -ContactSheetPairedSeek asks for it.
-    $contactSheetAdditionalArgs = "@('--contact-sheet-dir', $(ConvertTo-PsSingleQuoted $contactSheetDir), '--contact-sheet-frames', '$ContactSheetFrameCount')"
+    $contactSheetAdditionalArgs = "@('--contact-sheet-dir', $(ConvertTo-PsSingleQuoted $contactSheetDir), '--contact-sheet-frames', '$ContactSheetFrameCount'__DISPLAY_EXTRA_ARG__)"
     if ($ContactSheetPairedSeek) {
         $contactSheetSeekDir = Join-Path $Work 'contact-sheet-seek'
-        $contactSheetAdditionalArgs = "@('--contact-sheet-dir', $(ConvertTo-PsSingleQuoted $contactSheetDir), '--contact-sheet-frames', '$ContactSheetFrameCount', '--contact-sheet-seek-dir', $(ConvertTo-PsSingleQuoted $contactSheetSeekDir))"
+        $contactSheetAdditionalArgs = "@('--contact-sheet-dir', $(ConvertTo-PsSingleQuoted $contactSheetDir), '--contact-sheet-frames', '$ContactSheetFrameCount', '--contact-sheet-seek-dir', $(ConvertTo-PsSingleQuoted $contactSheetSeekDir)__DISPLAY_EXTRA_ARG__)"
     }
     # CONTACT-SHEET-PLAYBACK-PARITY-1 <<<
     $cmd = "$cmd -AdditionalArgs $contactSheetAdditionalArgs"
-}
+}__DISPLAY_NO_SHEET_BLOCK__
 # CUDA-PERF-DISPLAY-IDENTITY-HARNESS-1/2/3 (sol BLOCKER 2 / fable HARDENING, direction corrected
 # HARNESS-3): PresentMon's own TimeInMs=0 origin is its internal trace-session start, which lands
 # somewhere between process creation and the instant its trace readiness is observed (UM-PRESENTMON-STOP-2 r2:
@@ -4136,6 +4142,11 @@ $text = Expand-AttrCudaTemplate -Template $template -Tokens ([ordered]@{
     # evidence log); every other leg expands this to nothing, so its job is the text it was before the card.
     SMOKE_CEILING_TRACE = $(if ($timeBudget.smokeCeilingClamped) { " smokeCeilingClamped=True appReadAllowanceSec=$([int]$timeBudget.appReadAllowanceSec)" } else { '' })
     PLAY_SECONDS = [string]$PlaySeconds
+    # DUAL-VENUE-DISPLAY-MATRIX-1: both expand to nothing for a full-screen leg (the default), so its job is the text it was before the card. A windowed leg passes the app's
+    # --windowed through the ONE -AdditionalArgs the job emits (a second -AdditionalArgs would be a parameter-binding error): appended to the contact-sheet array when a
+    # sheet is on, else as an array of its own.
+    DISPLAY_EXTRA_ARG = $(if ($DisplayMode -eq 'windowed') { ", '--windowed'" } else { '' })
+    DISPLAY_NO_SHEET_BLOCK = $(if ($DisplayMode -eq 'windowed') { "`r`nif (-not `$ContactSheetEnabled) { `$cmd = `"`$cmd -AdditionalArgs @('--windowed')`" }" } else { '' })
     RUNNER_ACCEPTS_VERIFIED_CLIP_BINDING = $runnerAcceptsVerifiedClipBindingLiteral
     # DUAL-VENUE-EVIDENCE-1: each default below expands to exactly the text that was literal before.
     SCRATCH_ROOT = $venueScratchRoot
@@ -4175,6 +4186,7 @@ $clipContentSha256 = if ($isFixtureRehearsal) {
     clipContentSha256 = $clipContentSha256
     playSeconds = $PlaySeconds
     fixtureRehearsal = $isFixtureRehearsal
+    displayMode = $DisplayMode
     # DUAL-VENUE-EVIDENCE-1: what this generation was authored for (not part of the emitted job's bytes).
     venue = $Venue
     backend = $Backend
