@@ -25179,15 +25179,15 @@ void MainWindow::notePlaybackSmokePresentedFrame(
         m_playbackSmokeCpuDualIsoReconDownsampleSumMs +=
             telemetryDoubleValue( timing, "cpu_dualiso_recon_downsample_ms" );
     }
-    if( timing.contains( QStringLiteral("gpu_dualiso_recon_scale") ) )
+    if( m_gpuReducedReconSessionLatched && m_gpuReducedReconSessionScale > 1 )
     {
-        /* PLAYBACK-CUDA-HONOUR-SCALE-1: honoured only when the presented frame
-         * reports the reduced scale it was reconstructed at. */
-        const int reconScale = telemetryIntValue( timing, "gpu_dualiso_recon_scale" );
-        m_playbackSmokeGpuDualIsoReconScaleLast = reconScale;
-        if( reconScale > 1
-         && telemetryIntValue( timing, "render_thread_playback_scale_factor_effective" )
-                == reconScale )
+        /* PLAYBACK-CUDA-HONOUR-SCALE-1: in an honoured session a frame counts as
+         * reduced only when it was presented as a no-readback texture AND reports
+         * the reduced scale it was reconstructed at (the recon-stage keys do not
+         * reach this presented-frame telemetry, so this reads what does). */
+        m_playbackSmokeGpuDualIsoReconScaleLast = readyFrame.playbackScaleFactorActive;
+        if( gpuPlaybackPipelineStatus == GpuPlaybackPipelineStatus::GpuTextureNoReadback
+         && readyFrame.playbackScaleFactorActive == m_gpuReducedReconSessionScale )
         {
             ++m_playbackSmokeGpuDualIsoReducedReconFrames;
         }
@@ -25195,9 +25195,9 @@ void MainWindow::notePlaybackSmokePresentedFrame(
         {
             ++m_playbackSmokeGpuDualIsoFullReconFrames;
             m_playbackSmokeGpuDualIsoReconFallbackReasonLast =
-                reconScale > 1
-                    ? QStringLiteral("reduced recon not presented as a texture")
-                    : telemetryStringValue( timing, "gpu_dualiso_recon_fallback_reason" );
+                timing.contains( QStringLiteral("gpu_dualiso_recon_fallback_reason") )
+                    ? telemetryStringValue( timing, "gpu_dualiso_recon_fallback_reason" )
+                    : QStringLiteral("frame not presented as a reduced recon texture");
         }
     }
     if( borrowedPreparedRgb8Bytes > 0.0 )
