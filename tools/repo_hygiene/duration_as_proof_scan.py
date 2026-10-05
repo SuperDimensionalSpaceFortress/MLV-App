@@ -46,7 +46,10 @@ Patterns matched (all case-sensitive, per-physical-line):
 HARDENING-2 grammar notes: an operand may be parenthesized (``(elapsed_ms) > 0.0``,
 ``0.0 < (elapsed_ms)``, ``static_cast<double>(x_ms) > 0``, ``0 < (double)x_ms``) but a call
 WITH arguments is not unwrapped (``foo(elapsed_ms) > 0`` compares foo's result). A trailing
-``At``/``_at`` word marks a POSITION (``durationAt``, ``playedMsAt``), never a duration.
+``At``/``_at`` word is NOT evidence of a position on its own (``elapsedAt = t.nsecsElapsed()`` is a
+duration): the name is exempted only when the same file proves, for every assignment of that
+plain variable, that it holds a lone ``indexOf``/``find`` result (see ``_position_idents``).
+A getter call, a member access, or any unproven name is flagged (fail closed).
 Macro and ``fabs`` sites are found by balanced-paren extraction over the whole text, so a call
 split across physical lines is ONE site, keyed by all its lines joined (see ``scan_text``).
 Comments are stripped from the anchor view too, so a comment edit never re-keys a site, and
@@ -128,7 +131,7 @@ _RE_ZERO_FULL = re.compile(rf"^{_ZERO}$")
 # must be a bare duration chain (no subtraction of a non-zero expected value: that is a value
 # comparison, e.g. `fabs(x.durationSeconds - 10.01)`).
 _RE_DURATION_OPERAND_CHAIN = re.compile(
-    r"^(?:[A-Za-z_][A-Za-z0-9_]*\s*(?:\.|->|::)\s*)*([A-Za-z_][A-Za-z0-9_]*)(\s*\(\s*\))?$"
+    r"^((?:[A-Za-z_][A-Za-z0-9_]*\s*(?:\.|->|::)\s*)*)([A-Za-z_][A-Za-z0-9_]*)(\s*\(\s*\))?$"
 )
 _EPS_LITERAL = r"(?:[0-9]+\.?[0-9]*|\.[0-9]+)(?:[eE][+-]?[0-9]+)?[fFlL]*"
 _EPS_NAME = r"[A-Za-z_][A-Za-z0-9_]*(?:[Ee]ps|[Ee]psilon|[Tt]ol|[Tt]olerance)[A-Za-z0-9_]*"
@@ -138,7 +141,19 @@ _RE_EPS_BEFORE = re.compile(rf"(?<![A-Za-z0-9_.])({_EPS_LITERAL}|{_EPS_NAME})\s*
 _MAX_EPSILON = 1e-3  # a literal above this is a value comparison, not a "is it zero" check
 
 
-def _is_duration_identifier(ident: str) -> bool:
+def _has_trailing_at(ident: str) -> bool:
+    """True for a name whose LAST word is `At`/`at` after at least one other word
+    (``durationAt``, ``playedMsAt``, ``duration_ms_at``) -- a NAME that merely suggests a
+    position. A bare ``at``/``At`` does not count."""
+    underscore_parts = ident.split("_")
+    last_part = next((p for p in reversed(underscore_parts) if p), "")
+    last_tokens = _RE_CAMEL_TOKEN.findall(last_part)
+    return bool(last_tokens) and last_tokens[-1] in ("At", "at") and (
+        len(last_tokens) > 1 or len([p for p in underscore_parts if p]) > 1)
+
+
+def _is_duration_identifier(ident: str, positions: frozenset[str] = frozenset(),
+                            qualified: bool = False, called: bool = False) -> bool:
     """True if any word of `ident` (camelCase- or snake_case-split) names a duration unit.
 
     Position-independent by design: the unit word may be the whole identifier (a bare
@@ -151,17 +166,18 @@ def _is_duration_identifier(ident: str) -> bool:
     delimited segment on their own (``elapsed_us``, or the bare identifier ``us``), not as
     a camelCase token (``Us``/``Ns``) embedded in a larger name -- those two-letter tokens
     are too generic to trust outside an explicit underscore boundary.
+
+    A trailing ``At``/``_at`` word is NEVER evidence on its own (``elapsedAt =
+    timer.nsecsElapsed()`` is a duration). Such a name is exempted only when it is in
+    `positions` -- the identifiers `_position_idents` PROVED, from every assignment in the same
+    file, to hold an ``indexOf``/``find`` result -- and only as a plain unqualified variable
+    (a call ``getDurationAt()`` or a member ``t.durationAt`` is never covered by a local proof).
+    The default for an unproven name is to FLAG it.
     """
+    if _has_trailing_at(ident) and ident in positions and not qualified and not called:
+        return False
     underscore_parts = ident.split("_")
     multi_part = len(underscore_parts) > 1
-    # A trailing `At` / `_at` word marks a POSITION (an index or offset, e.g. `durationAt`,
-    # `playedMsAt`, `requestedFieldAt`), not a measured duration, even when an earlier word
-    # is a unit word. A bare `at`/`At` is not a duration word anyway.
-    last_part = next((p for p in reversed(underscore_parts) if p), "")
-    last_tokens = _RE_CAMEL_TOKEN.findall(last_part)
-    if last_tokens and last_tokens[-1] in ("At", "at") and (
-            len(last_tokens) > 1 or len([p for p in underscore_parts if p]) > 1):
-        return False
     for part in underscore_parts:
         if not part:
             continue
@@ -174,7 +190,10 @@ def _is_duration_identifier(ident: str) -> bool:
     return False
 
 
-def _is_duration_expr(text: str) -> bool:
+_QUALIFIER_TAILS = (".", "->", "::")
+
+
+def _is_duration_expr(text: str, positions: frozenset[str] = frozenset()) -> bool:
     """True if `text` contains a duration identifier (bare or as a call), a JSON `_ms`
     read, or (recursively) a comparison already built from one of those -- used to decide
     whether a macro argument is "the duration side" of a duration-vs-zero predicate.
@@ -182,7 +201,9 @@ def _is_duration_expr(text: str) -> bool:
     if re.search(_JSON_MS, text):
         return True
     for m in _RE_IDENT.finditer(text):
-        if _is_duration_identifier(m.group(0)):
+        called = text[m.end():].lstrip().startswith("(")
+        qualified = text[:m.start()].rstrip().endswith(_QUALIFIER_TAILS)
+        if _is_duration_identifier(m.group(0), positions, qualified=qualified, called=called):
             return True
     return False
 
@@ -261,16 +282,17 @@ def _unwrap_parens(text: str) -> str:
     return text
 
 
-def _pair_is_duration_zero_predicate(a: str, b: str) -> bool:
+def _pair_is_duration_zero_predicate(a: str, b: str, positions: frozenset[str] = frozenset()) -> bool:
     a, b = _unwrap_parens(a), _unwrap_parens(b)
     a_zero, b_zero = bool(_RE_ZERO_FULL.match(a)), bool(_RE_ZERO_FULL.match(b))
-    a_dur, b_dur = _is_duration_expr(a), _is_duration_expr(b)
+    a_dur, b_dur = _is_duration_expr(a, positions), _is_duration_expr(b, positions)
     return (a_zero and b_dur) or (b_zero and a_dur)
 
 
-def _fabs_arg_is_bare_duration(arg: str) -> bool:
+def _fabs_arg_is_bare_duration(arg: str, positions: frozenset[str] = frozenset()) -> bool:
     m = _RE_DURATION_OPERAND_CHAIN.match(_unwrap_parens(arg))
-    return bool(m) and _is_duration_identifier(m.group(1))
+    return bool(m) and _is_duration_identifier(
+        m.group(2), positions, qualified=bool(m.group(1)), called=bool(m.group(3)))
 
 
 def _is_epsilon(token: str) -> bool:
@@ -280,7 +302,8 @@ def _is_epsilon(token: str) -> bool:
         return True  # an epsilon/tolerance NAME (the regex only lets those through)
 
 
-def _macro_and_fabs_sites(code_text: str) -> list[tuple[int, int, str]]:
+def _macro_and_fabs_sites(code_text: str, positions: frozenset[str] = frozenset()
+                          ) -> list[tuple[int, int, str]]:
     """(start offset, end offset, trigger) of every macro-predicate / fabs-zero site, found
     by BALANCED-paren extraction over the whole comment-stripped text rather than per
     physical line, so a call split across lines (``ASSERT_TRUE( std::fabs(x.durationSeconds)``
@@ -296,11 +319,11 @@ def _macro_and_fabs_sites(code_text: str) -> list[tuple[int, int, str]]:
             if args is None or len(args) != nargs:
                 continue
             # ASSERT_NEAR(val1, val2, abs_error) -- the tolerance is not part of the predicate.
-            if _pair_is_duration_zero_predicate(args[0], args[1]):
+            if _pair_is_duration_zero_predicate(args[0], args[1], positions):
                 sites.append((m.start(), close + 1, "assert_macro"))
     for m in _RE_FABS_OPEN.finditer(code_text):
         close = _find_matching_close(code_text, m.end() - 1)
-        if close is None or not _fabs_arg_is_bare_duration(code_text[m.end():close]):
+        if close is None or not _fabs_arg_is_bare_duration(code_text[m.end():close], positions):
             continue
         after = _RE_EPS_AFTER.match(code_text[close + 1:close + 1 + 200])
         before = _RE_EPS_BEFORE.search(code_text[max(0, m.start() - 200):m.start()])
@@ -324,15 +347,15 @@ _RE_STATIC_CAST_HEAD = re.compile(r"^\s*static_cast\s*<\s*[A-Za-z_][A-Za-z0-9_:\
 _RE_C_CAST_HEAD = re.compile(rf"^\s*\(\s*(?:{'|'.join(_CAST_TYPES)})\s*\)\s*")
 
 
-def _operand_of_group(inner: str) -> tuple[str, bool] | None:
-    """(identifier, is_niladic_call) if `inner` is a bare operand chain, looking through any
-    further redundant grouping parens; None otherwise."""
+def _operand_of_group(inner: str) -> tuple[str, bool, bool] | None:
+    """(identifier, is_niladic_call, is_qualified) if `inner` is a bare operand chain, looking
+    through any further redundant grouping parens; None otherwise."""
     inner = _unwrap_parens(inner)
     m = _RE_DURATION_OPERAND_CHAIN.match(inner)
-    return (m.group(1), bool(m.group(2))) if m else None
+    return (m.group(2), bool(m.group(3)), bool(m.group(1))) if m else None
 
 
-def _left_operand(left: str) -> tuple[str, bool] | None:
+def _left_operand(left: str) -> tuple[str, bool, bool] | None:
     """The operand ending at the end of `left`: a bare ``ident`` / ``ident()`` (as before), or
     a PARENTHESIZED operand -- ``(elapsed_ms)``, ``((elapsed_ms))``, ``static_cast<double>(x)``.
     A call with arguments (``foo(elapsed_ms) > 0``) is deliberately NOT unwrapped: the paren
@@ -340,7 +363,7 @@ def _left_operand(left: str) -> tuple[str, bool] | None:
     s = left.rstrip()
     m = _RE_LEFT_OPERAND.search(s)
     if m:
-        return m.group(1), bool(m.group(2))
+        return m.group(1), bool(m.group(2)), s[:m.start()].rstrip().endswith(_QUALIFIER_TAILS)
     if not s.endswith(")"):
         return None
     depth = 0
@@ -359,7 +382,7 @@ def _left_operand(left: str) -> tuple[str, bool] | None:
     return None
 
 
-def _right_operand(right: str) -> tuple[str, bool] | None:
+def _right_operand(right: str) -> tuple[str, bool, bool] | None:
     """Mirror of `_left_operand` for the operand starting at the start of `right`; also looks
     through a leading C-style numeric cast (``(double)elapsed_ms``)."""
     s = right.lstrip()
@@ -372,7 +395,8 @@ def _right_operand(right: str) -> tuple[str, bool] | None:
     else:
         m = _RE_RIGHT_OPERAND.match(s)
         if m:
-            return m.group(1), bool(m.group(2))
+            # Followed by `.`/`->`/`::` the matched word is only a qualifier of the real operand.
+            return m.group(1), bool(m.group(2)), s[m.end():].lstrip().startswith(_QUALIFIER_TAILS)
     if not s.startswith("("):
         return None
     close = _find_matching_close(s, 0)
@@ -381,7 +405,7 @@ def _right_operand(right: str) -> tuple[str, bool] | None:
     return _operand_of_group(s[1:close])
 
 
-def _ident_compare_trigger(line: str) -> str | None:
+def _ident_compare_trigger(line: str, positions: frozenset[str] = frozenset()) -> str | None:
     """Scan `line` for `<duration-ident>[()] OP zero` or `zero OP <duration-ident>[()]`.
 
     Returns "ident_compare" if a matching bare identifier was found, "duration_getter" if
@@ -398,12 +422,14 @@ def _ident_compare_trigger(line: str) -> str | None:
         right_op = _right_operand(right)
         zero_left = bool(_RE_ZERO_AT_END.search(left))
         zero_right = bool(_RE_ZERO_AT_START.match(right))
-        if zero_right and left_op and _is_duration_identifier(left_op[0]):
+        if zero_right and left_op and _is_duration_identifier(
+                left_op[0], positions, qualified=left_op[2], called=left_op[1]):
             if left_op[1]:
                 found_call = True
             else:
                 found_ident = True
-        if zero_left and right_op and _is_duration_identifier(right_op[0]):
+        if zero_left and right_op and _is_duration_identifier(
+                right_op[0], positions, qualified=right_op[2], called=right_op[1]):
             if right_op[1]:
                 found_call = True
             else:
@@ -415,9 +441,9 @@ def _ident_compare_trigger(line: str) -> str | None:
     return None
 
 
-def _line_triggers(line: str) -> list[str]:
+def _line_triggers(line: str, positions: frozenset[str] = frozenset()) -> list[str]:
     triggers = []
-    ident_trigger = _ident_compare_trigger(line)
+    ident_trigger = _ident_compare_trigger(line, positions)
     if ident_trigger:
         triggers.append(ident_trigger)
     if _RE_JSON_MS.search(line):
@@ -489,6 +515,13 @@ def _raw_string_at(text: str, i: int) -> re.Match[str] | None:
     return _RE_RAW_STRING_OPEN.match(text, i)
 
 
+# Every character `str.splitlines()` treats as a line boundary. scan_text splits BOTH
+# comment-stripped views with splitlines(), so blanking a raw-string body must keep these (not
+# only \r\n) or a \v/\f/\x1c-\x1e/\x85/ /  inside a body would split the anchor view
+# but not the trigger view and desynchronise their line numbers.
+_LINE_BREAKS = "\r\n\v\f\x1c\x1d\x1e\x85  "
+
+
 def _strip_comments(text: str, blank_raw_strings: bool = False) -> str:
     """Blank out `//` and `/* */` comment content (tracking string literals so a comment
     marker inside a string is not mistaken for a real one), keeping every newline in place
@@ -522,7 +555,8 @@ def _strip_comments(text: str, blank_raw_strings: bool = False) -> str:
                     body = text[raw.end():end]
                     out.append(raw.group(0))
                     out.append(
-                        "".join(c if c in "\r\n" else " " for c in body) if blank_raw_strings else body
+                        "".join(c if c in _LINE_BREAKS else " " for c in body)
+                        if blank_raw_strings else body
                     )
                     out.append(terminator)
                     i = end + len(terminator)
@@ -577,6 +611,91 @@ def _strip_comments(text: str, blank_raw_strings: bool = False) -> str:
     return "".join(out)
 
 
+# A name ending in `At` is a POSITION only if the same file shows it holding the result of one
+# of these search calls (and nothing else, and nothing timer-shaped). QString/QByteArray/
+# std::string index-returning searches; an iterator-returning `find` cannot be compared to 0.
+_POSITION_FUNCS = frozenset({
+    "indexOf", "lastIndexOf", "indexIn", "lastIndexIn",
+    "find", "rfind", "find_first_of", "find_last_of", "find_first_not_of", "find_last_not_of",
+})
+# Anything in a position's source that smells like a clock disproves it (checked on the source
+# with string literals blanked, so `indexOf("...elapsed()...")` searching FOR text is fine).
+_RE_TIMER_SOURCE = re.compile(r"elapsed|msecs|secs|nsecs|duration|timer|clock|chrono|now\s*\(", re.I)
+_RE_POSITION_CALL = re.compile(r"^((?:[A-Za-z_][A-Za-z0-9_]*\s*(?:\.|->|::)\s*)*)([A-Za-z_][A-Za-z0-9_]*)\s*\(")
+
+
+def _statement_end(text: str, i: int) -> int:
+    """Offset of the `;` (or unbalanced closer) ending the statement that runs from `text[i]`."""
+    depth = 0
+    quote = None
+    n = len(text)
+    while i < n:
+        ch = text[i]
+        if quote:
+            if ch == "\\":
+                i += 1
+            elif ch == quote:
+                quote = None
+        elif ch in ("'", '"'):
+            quote = ch
+        elif ch in "([{":
+            depth += 1
+        elif ch in ")]}":
+            depth -= 1
+            if depth < 0:
+                return i
+        elif ch == ";" and depth == 0:
+            return i
+        i += 1
+    return n
+
+
+def _is_position_source(rhs: str) -> bool:
+    """True if `rhs` is exactly ONE search call (``smokeBody.indexOf(...)``, optionally cast
+    or parenthesized) with no clock-shaped text anywhere in it. Anything else (arithmetic, a
+    ternary, a helper call, a timer) is unproven and so not a position."""
+    rhs = _RE_STRING_LITERAL.sub('""', rhs).strip()
+    while True:
+        before = rhs
+        rhs = _unwrap_parens(rhs)
+        for head in (_RE_C_CAST_HEAD, _RE_STATIC_CAST_HEAD):
+            h = head.match(rhs)
+            if h:
+                rhs = rhs[h.end():].strip()
+        if rhs == before:
+            break
+    m = _RE_POSITION_CALL.match(rhs)
+    if not m or m.group(2) not in _POSITION_FUNCS:
+        return False
+    return _find_matching_close(rhs, m.end() - 1) == len(rhs) - 1 and not _RE_TIMER_SOURCE.search(rhs)
+
+
+def _position_idents(code_text: str) -> frozenset[str]:
+    """Trailing-``At`` duration-looking names PROVED to be positions by this file: every
+    plain assignment/initialization of the name is a lone ``indexOf``/``find``-style call
+    (`_is_position_source`), there is at least one, and the name is never mutated in place,
+    taken by address/stream, passed as a parameter, or called. Anything unproven stays a
+    duration candidate (fail closed): a name alone is never evidence."""
+    proven: set[str] = set()
+    names = {m.group(0) for m in _RE_IDENT.finditer(code_text)}
+    for name in sorted(n for n in names if _has_trailing_at(n) and _is_duration_identifier(n)):
+        q = re.escape(name)
+        if re.search(
+            rf"(?:\+\+|--|&|>>)\s*{q}(?![A-Za-z0-9_])"
+            rf"|(?<![A-Za-z0-9_]){q}\s*(?:\+\+|--|[-+*/%&|^]=|<<=|>>=|\()"
+            rf"|[A-Za-z0-9_]\s+{q}\s*[,)]",
+            code_text,
+        ):
+            continue
+        sources = [
+            code_text[m.end():_statement_end(code_text, m.end())]
+            for m in re.finditer(rf"(?<![A-Za-z0-9_.>:]){q}\s*=(?!=)", code_text)
+        ]
+        if sources and all(_is_position_source(s) for s in sources):
+            proven.add(name)
+    return frozenset(proven)
+
+
 def scan_text(text: str, source: str = "<text>") -> list[Candidate]:
     """Scan already-loaded text (used directly by the positive-control tests)."""
     by_anchor: dict[str, tuple[set[str], list[int]]] = {}
@@ -586,6 +705,7 @@ def scan_text(text: str, source: str = "<text>") -> list[Candidate]:
     code_text = _strip_comments(text, blank_raw_strings=True)
     anchor_lines = _strip_comments(text).splitlines()
     code_only_lines = code_text.splitlines()
+    positions = _position_idents(code_text)
     line_starts: list[int] = []
     offset = 0
     for physical in code_text.splitlines(keepends=True):
@@ -597,8 +717,8 @@ def scan_text(text: str, source: str = "<text>") -> list[Candidate]:
 
     sites: list[tuple[int, int, str]] = []  # (first line, last line, trigger)
     for lineno, code_only in enumerate(code_only_lines, start=1):
-        sites.extend((lineno, lineno, t) for t in _line_triggers(code_only))
-    for start, end, trigger in _macro_and_fabs_sites(code_text):
+        sites.extend((lineno, lineno, t) for t in _line_triggers(code_only, positions))
+    for start, end, trigger in _macro_and_fabs_sites(code_text, positions):
         sites.append((line_of(start), line_of(max(start, end - 1)), trigger))
     sites.sort()
     for first, last, trigger in sites:

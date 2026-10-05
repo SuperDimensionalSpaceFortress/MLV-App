@@ -227,9 +227,10 @@ class DurationAsProofInventoryTests(unittest.TestCase):
             self.assertEqual(scan_text(seeded, source="<raw-fake>"), [], seeded)
 
     def test_raw_string_with_comment_or_quote_inside_cannot_hide_a_site(self) -> None:
-        # (a) The old stripper ended a string at the first inner quote and opened a comment at
-        # an inner `//` or `/*`, so the REAL code after the literal was blanked (or the
-        # state machine desynced for the rest of the file) and a genuine site was missed.
+        # (a) Only the quote-then-comment-opener shape (`R"xx(a)" /* )xx"`, `R"tag(a)" /*)tag"`)
+        # was actually HIDDEN on fork/master (0 sites; now 1). The other shapes below already
+        # flagged once on master (the string ended early but the code after it survived) and
+        # are pinned as no-regression, so none of this is claimed as a master blind spot.
         for seeded in (
             'auto s = R"(//)"; if (elapsed_ms > 0.0) {}',
             'auto s = R"(/*)"; if (elapsed_ms > 0.0) {}',
@@ -355,24 +356,99 @@ class DurationAsProofInventoryTests(unittest.TestCase):
         with_url = scan_text('if (elapsed_ms > 0.0) { log("http://x"); }', source="<url>")
         self.assertIn('"http://x"', with_url[0].anchor)
 
-    def test_position_names_ending_in_At_are_not_durations(self) -> None:
-        # (e) `playedMsAt` / `durationAt` / `requestedFieldAt` are INDEXES (QString::indexOf
-        # results in test_playback_smoke_fullscreen_wiring.cpp), not measured durations; a
-        # compare against zero is a "was it found" check. The old token rule flagged any name
-        # holding a unit word. A real duration name is unaffected.
-        positions = "\n".join([
-            "if (durationAt > 0) { a(); }",
+    def test_trailing_At_name_alone_is_never_a_position(self) -> None:
+        # (e) round-2 (sol's blocker on 207bcf77): a trailing `At`/`_at` word used to exempt
+        # a name unconditionally, which hid REAL measured durations. Each input below flags
+        # exactly once on fork/master (a4f73c11 and d3cf6850) and must keep flagging: the exemption
+        # needs same-file evidence of a position, and a name is not evidence.
+        for seeded in (
+            # sol's QElapsedTimer-backed repro, one line and split over lines
+            "const double elapsedAt = timer.nsecsElapsed() / 1000000.0; if (elapsedAt > 0.0) markRan();",
+            "QElapsedTimer timer;\nconst double elapsedAt = timer.nsecsElapsed() / 1e6;\nif (elapsedAt > 0.0) { a(); }",
+            # the macro spelling, with and without a visible timer source
+            "ASSERT_GT(duration_ms_at, 0);",
+            "QElapsedTimer t; t.start(); const double duration_ms_at = t.nsecsElapsed() / 1e6;\nASSERT_GT(duration_ms_at, 0);",
+            "EXPECT_EQ(0, durationAt);",
+            # a duration-returning getter, and a name never assigned in this file (member, param, extern)
+            "if (getElapsedAt() > 0) { markRan(); }",
+            "if (getDurationAt() > 0) { a(); }",
             "if (playedMsAt >= 0) { a(); }",
-            "if (requestedFieldAt == 0) { a(); }",
-            "if (elapsedAt() > 0) { a(); }",
-            "if (0 < preambleMsAt) { a(); }",
-            "if (stage_ms_at > 0) { a(); }",
-            "ASSERT_TRUE(0 < elapsedSecondsAt);",
-        ])
-        self.assertEqual(scan_text(positions, source="<positions>"), [])
-        for real in ("if (durationAtStart > 0) { a(); }", "if (atMs > 0) { a(); }",
-                     "if (elapsed_at_ms > 0) { a(); }", "if (at_elapsed > 0) { a(); }"):
-            self.assertEqual(len(scan_text(real, source="<real>")), 1, real)
+            "void f(double elapsedAt) { if (elapsedAt > 0) { a(); } }",
+            # names that only END in a unit word after `At`, or carry `at` mid-name, were never exempt
+            "if (elapsedAtStop > 0) { a(); }",
+            "if (durationAtEnd > 0) { a(); }",
+            "if (durationAtStart > 0) { a(); }",
+            "if (atMs > 0) { a(); }",
+            "if (elapsed_at_ms > 0) { a(); }",
+            "if (at_elapsed > 0) { a(); }",
+        ):
+            found = scan_text(seeded, source="<at-duration>")
+            self.assertEqual(len(found), 1, seeded)
+        # the near-zero spelling is covered by the new fabs matcher the same way
+        fabs = scan_text("ASSERT_TRUE(std::fabs(elapsedAt) < 1e-6);", source="<at-fabs>")
+        self.assertEqual(len(fabs), 1)
+        self.assertIn("fabs_zero", fabs[0].triggers)
+
+    def test_position_names_ending_in_At_are_exempt_only_with_same_file_proof(self) -> None:
+        # (e) `playedMsAt` / `durationAt` are INDEXES (QString::indexOf results in
+        # test_playback_smoke_fullscreen_wiring.cpp); a compare against zero there is a "was it
+        # found" check. They are exempt ONLY because every assignment in the file is a lone
+        # search call -- including a search FOR text that mentions the clock inside a string.
+        proven = (
+            "const int durationAt = s.indexOf(x);\nif (durationAt > 0) { a(); }",
+            "const int duration_at = s.lastIndexOf('x');\nASSERT_GT(duration_at, 0);",
+            "int playedMsAt = smokeBody.indexOf(\n    QStringLiteral(\"const qint64 playedMs = playbackClock.elapsed();\"), loopAt);\n"
+            "ASSERT_TRUE(playedMsAt >= 0);",
+            "const auto preambleMsAt = static_cast<int>(text.find(\"x\"));\nif (0 < preambleMsAt) { a(); }",
+            "int requestedFieldAt = (s.indexOf(k));\nif (requestedFieldAt == 0) { a(); }",
+            "int stage_ms_at = s.indexOf(a);\nstage_ms_at = s.indexOf(b, stage_ms_at);\nif (stage_ms_at > 0) { a(); }",
+            "int elapsedSecondsAt = s.indexOf(x);\nASSERT_TRUE(0 < elapsedSecondsAt);",
+        )
+        for seeded in proven:
+            self.assertEqual(scan_text(seeded, source="<proven-position>"), [], seeded)
+        # ...and each stops being exempt the moment the proof is spoiled: a timer-fed source,
+        # one non-search assignment among several, arithmetic, mutation in place, address/stream
+        # escape, a parameter shadow, a call, or a qualified member that a local proof cannot cover.
+        spoiled = (
+            "const int durationAt = timer.elapsed();\nif (durationAt > 0) { a(); }",
+            "int durationAt = s.indexOf(x);\ndurationAt = clock.elapsed();\nif (durationAt > 0) { a(); }",
+            "int durationAt = s.indexOf(x);\ndurationAt = 5;\nif (durationAt > 0) { a(); }",
+            "int durationAt = s.indexOf(x) + base;\nif (durationAt > 0) { a(); }",
+            "int durationAt = ready ? s.indexOf(x) : 0;\nif (durationAt > 0) { a(); }",
+            "int durationAt = helper(s.indexOf(x));\nif (durationAt > 0) { a(); }",
+            "int durationAt = s.indexOf(x);\ndurationAt += timer.elapsed();\nif (durationAt > 0) { a(); }",
+            "int durationAt = s.indexOf(x);\ndurationAt++;\nif (durationAt > 0) { a(); }",
+            "int durationAt = s.indexOf(x);\nfill(&durationAt);\nif (durationAt > 0) { a(); }",
+            "int durationAt = s.indexOf(x);\nin >> durationAt;\nif (durationAt > 0) { a(); }",
+            "void g(double durationAt) {}\nint durationAt = s.indexOf(x);\nif (durationAt > 0) { a(); }",
+            "int durationAt = s.indexOf(x);\nif (durationAt() > 0) { a(); }",
+            "int durationAt = s.indexOf(x);\nif (probe.durationAt > 0) { a(); }",
+            "int durationAt = s.indexOf(x);\nif (probe->durationAt > 0) { a(); }",
+            "int durationAt = s.indexOf(x);\nif (Probe::durationAt > 0) { a(); }",
+            "int durationAt = s.indexOf(x);\nif (getDurationAt() > 0) { a(); }",
+            "int durationAt = indexOfTimer.elapsed();\nif (durationAt > 0) { a(); }",
+        )
+        for seeded in spoiled:
+            found = scan_text(seeded, source="<spoiled-position>")
+            self.assertEqual(len(found), 1, seeded)
+        # the proof is per FILE: one timer-fed declaration in another function spoils the name
+        mixed = (
+            "void a() { int durationAt = s.indexOf(x); if (durationAt > 0) { r(); } }\n"
+            "void b() { double durationAt = t.nsecsElapsed() / 1e6; if (durationAt > 0) { r(); } }"
+        )
+        self.assertEqual(len(scan_text(mixed, source="<mixed>")), 2)
+
+    def test_raw_string_body_with_unicode_line_breaks_keeps_views_aligned(self) -> None:
+        # fable's note: blanking a raw body kept only \r/\n, but the anchor view (body verbatim)
+        # is split by splitlines(), which also breaks on \v \f \x1c-\x1e \x85    ; the
+        # two views then disagreed on line numbers. Both must agree, so the site after the
+        # literal is still found, keyed to its own line, with its own anchor.
+        for brk in ("\v", "\f", "\x1c", "\x85", " ", " ", "\r\n"):
+            seeded = f'auto s = R"({brk}x{brk}y)";\nif (elapsed_ms > 0.0) {{ run(); }}'
+            found = scan_text(seeded, source="<raw-brk>")
+            self.assertEqual(len(found), 1, repr(brk))
+            self.assertIn("elapsed_ms", found[0].anchor, repr(brk))
+            self.assertIn("ident_compare", found[0].triggers, repr(brk))
 
     def test_hardening1_items_already_closed_on_master_stay_closed(self) -> None:
         # HARDENING-1 (fable on #173) was verified already fixed by 4B; pinned here so it
