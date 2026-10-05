@@ -68,6 +68,24 @@ def _function_body(text: str, name: str) -> str:
     return text[start:nxt]
 
 
+def _wait_child_started(started: Path) -> str:
+    """PowerShell that blocks until the stub capture child has created `started`.
+
+    The child is a real powershell.exe whose cold start (~2-3 s idle, longer on a loaded CI shard) must not
+    count against the stop's grace: Stop-PresentMonCapture / Wait-PresentMonCapture wait a bounded time for
+    the capture to exit after the named-session terminate and Kill() only after it, so a child that has not yet
+    polled its sentinel by then is killed and the own session is terminated a second time (flake first seen
+    in merge_group run 37284740975). Stopping only once the child is running makes the exit depend on the
+    terminate alone, which is what the single-terminate assertions mean to pin.
+    """
+    return (
+        f"$startedFlag = '{started}'\n"
+        "$startedDeadline = (Get-Date).AddSeconds(120)\n"
+        "while (-not (Test-Path -LiteralPath $startedFlag) -and (Get-Date) -lt $startedDeadline) { Start-Sleep -Milliseconds 50 }\n"
+        "if (-not (Test-Path -LiteralPath $startedFlag)) { throw 'stub capture child never started' }\n"
+    )
+
+
 class StartArgumentsStaticTests(unittest.TestCase):
     def test_start_args_carry_a_per_job_session_name_before_stop_existing_session(self) -> None:
         start = _function_body(_template(), "Start-PresentMonCapture")
@@ -390,6 +408,7 @@ class CleanStopExecutedTests(_ProbeCase):
         out = self.tmp / "result.json"
         calls = self.tmp / "calls.log"
         sentinel = self.tmp / "stop.flag"
+        started = self.tmp / "started.flag"
         body = (
             f"$sentinel = '{sentinel}'\n"
             f"$callLog = '{calls}'\n"
@@ -401,8 +420,9 @@ class CleanStopExecutedTests(_ProbeCase):
             "}\n"
             + ("New-Item -ItemType File -Path $sentinel -Force | Out-Null\n" if pre_exited else "")
             + "$proc = Start-Process -FilePath 'powershell.exe' -ArgumentList @('-NoProfile','-NonInteractive','-Command', "
-            f"\"while (-not (Test-Path -LiteralPath '$sentinel')) {{ Start-Sleep -Milliseconds 100 }}; exit {capture_exit_code}\") "
+            f"\"New-Item -ItemType File -Path '{started}' -Force | Out-Null; while (-not (Test-Path -LiteralPath '$sentinel')) {{ Start-Sleep -Milliseconds 100 }}; exit {capture_exit_code}\") "
             "-PassThru -WindowStyle Hidden\n"
+            + _wait_child_started(started)
             + ("[void]$proc.WaitForExit(30000)\n" if pre_exited else "")
             + f"$r = Wait-PresentMonCapture $proc -SessionName 'MLVAttr3-test' -TimeoutSeconds {timeout}\n"
             f"$r | ConvertTo-Json -Depth 5 | Set-Content -LiteralPath '{out}' -Encoding UTF8\n"
@@ -739,6 +759,7 @@ class FailurePathStopExecutedTests(_ProbeCase):
         out = self.tmp / "stop-result.json"
         calls = self.tmp / "calls.log"
         sentinel = self.tmp / "stop.flag"
+        started = self.tmp / "started.flag"
         session_arg = f" -SessionName '{session}'" if session else ""
         body = (
             f"$sentinel = '{sentinel}'\n"
@@ -750,9 +771,10 @@ class FailurePathStopExecutedTests(_ProbeCase):
             "    [pscustomobject]@{ exitCode = 0; timedOut = $false; error = $null }\n"
             "}\n"
             "$proc = Start-Process -FilePath 'powershell.exe' -ArgumentList @('-NoProfile','-NonInteractive','-Command', "
-            "\"while (-not (Test-Path -LiteralPath '$sentinel')) { Start-Sleep -Milliseconds 100 }; exit 0\") "
+            f"\"New-Item -ItemType File -Path '{started}' -Force | Out-Null; while (-not (Test-Path -LiteralPath '$sentinel')) {{ Start-Sleep -Milliseconds 100 }}; exit 0\") "
             "-PassThru -WindowStyle Hidden\n"
-            f"$r = Stop-PresentMonCapture -Proc $proc{session_arg}\n"
+            + _wait_child_started(started)
+            + f"$r = Stop-PresentMonCapture -Proc $proc{session_arg}\n"
             f"$r | ConvertTo-Json -Depth 5 | Set-Content -LiteralPath '{out}' -Encoding UTF8\n"
         )
         proc = self.run_probe(body)
