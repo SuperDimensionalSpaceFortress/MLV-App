@@ -79,6 +79,11 @@ int llrpGpuPlaybackReconLastPrepareOnlyForTesting(void);
 #define LLRP_GPU_PLAYBACK_RECON_EV2RAW_COUNT (24u * 65536u)
 #define LLRP_GPU_PLAYBACK_RECON_RANDN05_COUNT 1024u
 #define LLRP_GPU_PLAYBACK_RECON_RC_UNSUPPORTED_STATE 3
+/* PLAYBACK-CUDA-HONOUR-SCALE-1: the run needed a clip of different dimensions
+ * while retained device outputs were still outstanding; set_clip would have
+ * freed them under a presenter, so it was refused. */
+#define LLRP_GPU_PLAYBACK_RECON_RC_CLIP_DIMS_BUSY 7
+#define LLRP_GPU_RETAINED_OUTSTANDING_MAX 32
 
 typedef struct
 {
@@ -291,6 +296,10 @@ int llrpGpuPlaybackReconRunRetainedDeviceBayer16(
 int llrpGpuPlaybackReconGetLastRetainedDeviceBayer16(
     llrpGpuPlaybackRetainedDeviceBayer16_t * retained_out);
 int llrpGpuPlaybackReconReleaseRetainedDeviceBayer16(uint64_t token);
+/* PLAYBACK-CUDA-HONOUR-SCALE-1: retained outputs not yet released, and how
+ * many runs were refused because they needed new clip dimensions meanwhile. */
+int llrpGpuPlaybackReconRetainedOutstandingCount(void);
+uint64_t llrpGpuPlaybackReconClipDimsChangeRefusals(void);
 int llrpGpuPlaybackReconCopyLastDeviceBayer16ToGlTexture(unsigned int gl_texture_id,
                                                          int * rc_out);
 int llrpGpuPlaybackReconRunCpu16Probe(const llrpGpuPlaybackReconState_t * state,
@@ -378,6 +387,14 @@ int applyLLRawProcObject_with_dims(mlvObject_t * video,
  *    llrawproc object that exports and paused frames read. */
 #define LLRP_WITH_DIMS_FULLRES_FIXES_APPLIED 0x1
 #define LLRP_WITH_DIMS_NO_PUBLISH 0x2
+/* PLAYBACK-CUDA-HONOUR-SCALE-1: instead of the CPU dual-ISO recon, run the
+ * GPU playback texture route on the reduced buffer: prepare the recon state,
+ * preupload, and reconstruct into a retained device Bayer (the same calls the
+ * full-resolution prepare-only branch of applyLLRawProcObjectWorker makes).
+ * The buffer itself ends as the prepared recon INPUT. Requires the thread's GPU
+ * playback recon, texture-present and prepare-only opt-ins; returns 0 whenever
+ * any step refuses (the buffer is then no longer a clean decode). */
+#define LLRP_WITH_DIMS_GPU_PLAYBACK_TEXTURE 0x4
 int applyLLRawProcObjectWorker_with_dims(mlvObject_t * video,
                                          uint16_t * raw_image_buff,
                                          size_t raw_image_size,

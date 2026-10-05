@@ -2047,6 +2047,7 @@ void RenderFrameThread::decodeFrameForWorker( const DecodeQueueEntry &entry )
         slot.rawImage16.resize( rawPixelCount );
     }
     slot.reducedReconScale = 1;
+    slot.reducedReconOnGpu = false;
     if( rawPixelCount > 0 && m_pMlvObject )
     {
         (void)getMlvRawFrameUint16( m_pMlvObject,
@@ -2198,10 +2199,16 @@ void RenderFrameThread::reconFrameForWorker( const ReconQueueEntry &entry,
         * static_cast<size_t>( qMax( 0, m_imageHeight ) );
     if( rawPixelCount > 0 && m_pMlvObject && slot.rawImage16.size() >= rawPixelCount )
     {
+        /* PLAYBACK-CUDA-HONOUR-SCALE-1: MainWindow admits x2/x4 to a texture-route
+         * request only for a play session it latched as honoured
+         * (mainWindowGpuTextureRouteEffectivePlaybackScale); every other session
+         * is clamped to 1 at that policy source. */
+        const int reconRequestScale =
+            entry.request.presentationContext.playbackScaleFactor;
         const bool wantsGpuPlaybackReconTextureNoReadback =
             entry.request.presentationContext.gpuPlaybackReconTexturePresentRequested
             && entry.request.presentationContext.playbackActive
-            && entry.request.presentationContext.playbackScaleFactor == 1
+            && ( reconRequestScale == 1 || reconRequestScale == 2 || reconRequestScale == 4 )
             && m_imageWidth > 0
             && m_imageHeight > 0;
         const bool allowGpuPlaybackReconTexturePrepareOnly =
@@ -2241,14 +2248,90 @@ void RenderFrameThread::reconFrameForWorker( const ReconQueueEntry &entry,
          * sensor. Anything the plan or the run rejects is reconstructed at full
          * resolution exactly as before, and the reason is recorded. */
         slot.reducedReconScale = 1;
+        slot.reducedReconOnGpu = false;
         slot.reducedReconWidth = 0;
         slot.reducedReconHeight = 0;
         double reducedReconFullResFixesMs = 0.0;
         double reducedReconDownsampleMs = 0.0;
         QString reducedReconFallbackReason;
+        QString gpuReducedReconFallbackReason;
         const ReadyFrame::PresentationContext &reconContext =
             entry.request.presentationContext;
-        if( !reconContext.playbackActive )
+        const bool gpuReducedReconRequested =
+            wantsGpuPlaybackReconTextureNoReadback && reconRequestScale > 1;
+        if( gpuReducedReconRequested )
+        {
+            /* PLAYBACK-CUDA-HONOUR-SCALE-1: the session was latched at this
+             * scale, so re-derive its dims with sessionLatched=1 (the frame size
+             * must not change mid-session), shrink on whole 4-row ISO blocks and
+             * run the existing CUDA prepare + preupload + retained-device recon
+             * at the reduced size. */
+            mlvDualIsoPreviewScaleRecon_t gpuPlan;
+            if( !allowGpuPlaybackReconTexturePrepareOnly )
+            {
+                gpuReducedReconFallbackReason =
+                    QStringLiteral("GPU texture prepare-only route not admitted");
+            }
+            else if( !mlvDualIsoGpuPreviewScaleReconPlan( m_pMlvObject,
+                                                          reconRequestScale,
+                                                          1,
+                                                          &gpuPlan )
+                  || gpuPlan.scale != reconRequestScale )
+            {
+                gpuReducedReconFallbackReason = QString::fromLatin1( gpuPlan.reason );
+            }
+            else
+            {
+                const size_t reducedWords =
+                    static_cast<size_t>( gpuPlan.reducedWidth )
+                    * static_cast<size_t>( gpuPlan.reducedHeight );
+                bool reducedBufferReady = false;
+                try
+                {
+                    slot.reducedReconBayer.resize( reducedWords );
+                    reducedBufferReady = true;
+                }
+                catch( const std::bad_alloc & )
+                {
+                    gpuReducedReconFallbackReason =
+                        QStringLiteral("reduced recon buffer allocation failed");
+                }
+                if( reducedBufferReady )
+                {
+                    const int reducedRc = mlvDualIsoGpuPreviewScaleReconRun(
+                        m_pMlvObject,
+                        &gpuPlan,
+                        slot.rawImage16.data(),
+                        slot.reducedReconBayer.data(),
+                        workerState,
+                        qMax( 1, m_pMlvObject->cpu_cores ),
+                        &reducedReconFullResFixesMs,
+                        &reducedReconDownsampleMs );
+                    if( reducedRc == 1 )
+                    {
+                        slot.reducedReconScale = gpuPlan.scale;
+                        slot.reducedReconWidth = gpuPlan.reducedWidth;
+                        slot.reducedReconHeight = gpuPlan.reducedHeight;
+                        slot.reducedReconOnGpu = true;
+                    }
+                    else
+                    {
+                        gpuReducedReconFallbackReason =
+                            QStringLiteral("GPU reduced recon refused (rc %1)")
+                                .arg( llrpGpuPlaybackReconLastRunRcForTesting() );
+                        if( reducedRc < 0 )
+                        {
+                            (void)getMlvRawFrameUint16( m_pMlvObject,
+                                                        entry.request.frameNumber,
+                                                        slot.rawImage16.data() );
+                        }
+                    }
+                }
+            }
+            reducedReconFallbackReason =
+                QStringLiteral("GPU playback recon texture route owns this frame");
+        }
+        else if( !reconContext.playbackActive )
         {
             reducedReconFallbackReason = QStringLiteral("not playing");
         }
@@ -2332,26 +2415,30 @@ void RenderFrameThread::reconFrameForWorker( const ReconQueueEntry &entry,
         }
         stampReconStage( "phase3_recon_after_apply_llrawproc_stage_time" );
         insertLlrawprocReconTimingTelemetry( slot.stageTimingTelemetry );
+        const QString reconScaleKeyPrefix = gpuReducedReconRequested
+            ? QStringLiteral("gpu_dualiso_recon_")
+            : QStringLiteral("cpu_dualiso_recon_");
         slot.stageTimingTelemetry.insert(
-            QStringLiteral("cpu_dualiso_recon_scale"),
+            reconScaleKeyPrefix + QStringLiteral("scale"),
             slot.reducedReconScale );
         slot.stageTimingTelemetry.insert(
-            QStringLiteral("cpu_dualiso_recon_width"),
+            reconScaleKeyPrefix + QStringLiteral("width"),
             slot.reducedReconScale > 1 ? slot.reducedReconWidth : m_imageWidth );
         slot.stageTimingTelemetry.insert(
-            QStringLiteral("cpu_dualiso_recon_height"),
+            reconScaleKeyPrefix + QStringLiteral("height"),
             slot.reducedReconScale > 1 ? slot.reducedReconHeight : m_imageHeight );
         slot.stageTimingTelemetry.insert(
-            QStringLiteral("cpu_dualiso_recon_fullres_fixes_ms"),
+            reconScaleKeyPrefix + QStringLiteral("fullres_fixes_ms"),
             reducedReconFullResFixesMs );
         slot.stageTimingTelemetry.insert(
-            QStringLiteral("cpu_dualiso_recon_downsample_ms"),
+            reconScaleKeyPrefix + QStringLiteral("downsample_ms"),
             reducedReconDownsampleMs );
         if( slot.reducedReconScale <= 1 )
         {
             slot.stageTimingTelemetry.insert(
-                QStringLiteral("cpu_dualiso_recon_fallback_reason"),
-                reducedReconFallbackReason );
+                reconScaleKeyPrefix + QStringLiteral("fallback_reason"),
+                gpuReducedReconRequested ? gpuReducedReconFallbackReason
+                                         : reducedReconFallbackReason );
         }
         insertGpuPlaybackReconRunTelemetry( slot.stageTimingTelemetry );
         stampReconStage( "phase3_recon_after_timing_capture_stage_time" );
@@ -2396,7 +2483,36 @@ void RenderFrameThread::reconFrameForWorker( const ReconQueueEntry &entry,
                 llrpGpuPlaybackReconLastPrepareOnlyForTesting() != 0;
             const size_t preparedInputWords =
                 llrpGpuPlaybackReconGetLastInputBayer16( nullptr, 0 );
-            if( preparedInputWords == rawPixelCount )
+            const int reconTextureWidth =
+                slot.reducedReconOnGpu ? slot.reducedReconWidth : m_imageWidth;
+            const int reconTextureHeight =
+                slot.reducedReconOnGpu ? slot.reducedReconHeight : m_imageHeight;
+            if( slot.reducedReconOnGpu )
+            {
+                /* The reduced prepared input lives in reducedReconBayer, which
+                 * the decode stage reuses; hand the presenter its own copy. */
+                try
+                {
+                    slot.gpuPlaybackReconTextureInputBayerFrame.assign(
+                        slot.reducedReconBayer.begin(),
+                        slot.reducedReconBayer.end() );
+                    slot.gpuPlaybackReconTextureInputBorrowedFromRawImage16 = false;
+                    gpuPlaybackReconTextureInputAvailable =
+                        prepareOnlyUsed
+                        && !slot.gpuPlaybackReconTextureInputBayerFrame.empty();
+                }
+                catch( const std::bad_alloc & )
+                {
+                    slot.gpuPlaybackReconTextureInputBayerFrame.clear();
+                    slot.gpuPlaybackReconTextureInputBorrowedFromRawImage16 = false;
+                }
+                if( !gpuPlaybackReconTextureInputAvailable )
+                {
+                    gpuPlaybackReconTextureNoReadbackFallbackReason =
+                        QStringLiteral("GPU reduced recon prepared input was unavailable");
+                }
+            }
+            else if( preparedInputWords == rawPixelCount )
             {
                 try
                 {
@@ -2446,8 +2562,8 @@ void RenderFrameThread::reconFrameForWorker( const ReconQueueEntry &entry,
             if( !outputValidationRequired
              && llrpGpuPlaybackReconGetLastRetainedDeviceBayer16( &retainedDevice ) != 0
              && retainedDevice.device_bayer16
-             && retainedDevice.width == m_imageWidth
-             && retainedDevice.height == m_imageHeight
+             && retainedDevice.width == reconTextureWidth
+             && retainedDevice.height == reconTextureHeight
              && retainedDevice.token != 0 )
             {
                 slot.gpuPlaybackReconTextureRetainedDeviceBayer16 =
@@ -4265,6 +4381,25 @@ void RenderFrameThread::drawFrame( int slotIndex,
     }
     if( renderedImageWidth <= 0 ) renderedImageWidth = m_imageWidth;
     if( renderedImageHeight <= 0 ) renderedImageHeight = m_imageHeight;
+    /* PLAYBACK-CUDA-HONOUR-SCALE-1: a CUDA reduced recon is presented at the
+     * dims it was reconstructed at (rows cropped to whole ISO blocks). */
+    const bool gpuReducedReconSlot =
+        slot.reducedReconOnGpu
+        && slot.reducedReconScale > 1
+        && slot.reducedReconScale == playbackScaleFactor
+        && slot.reducedReconWidth > 0
+        && slot.reducedReconHeight > 0;
+    const int gpuReconTextureWidth =
+        gpuReducedReconSlot ? slot.reducedReconWidth : m_imageWidth;
+    const int gpuReconTextureHeight =
+        gpuReducedReconSlot ? slot.reducedReconHeight : m_imageHeight;
+    const int cpuRenderedImageWidth = renderedImageWidth;
+    const int cpuRenderedImageHeight = renderedImageHeight;
+    if( gpuReducedReconSlot )
+    {
+        renderedImageWidth = gpuReconTextureWidth;
+        renderedImageHeight = gpuReconTextureHeight;
+    }
     slot.renderedImageWidth = renderedImageWidth;
     slot.renderedImageHeight = renderedImageHeight;
     slot.stageTimingTelemetry.insert(
@@ -4325,7 +4460,8 @@ void RenderFrameThread::drawFrame( int slotIndex,
     const bool gpuTexNrSkipRawAvailable = !slot.rawImage16.empty();
     const bool gpuTexNrSkipTextureRequested =
         m_activePresentationContext.gpuPlaybackReconTexturePresentRequested;
-    const bool gpuTexNrSkipScaleEligible = playbackScaleFactor == 1;
+    const bool gpuTexNrSkipScaleEligible =
+        ( playbackScaleFactor == 1 && !slot.reducedReconOnGpu ) || gpuReducedReconSlot;
     const bool gpuTexNrSkipCandidate =
         slot.gpuPlaybackReconTextureNoReadbackCandidate;
     const size_t gpuTexNrInputWords =
@@ -4336,8 +4472,8 @@ void RenderFrameThread::drawFrame( int slotIndex,
         gpuTexNrInputWords > 0;
     const bool gpuTexNrSkipStateMatches =
         slot.gpuPlaybackReconTextureState.valid
-        && slot.gpuPlaybackReconTextureState.width == m_imageWidth
-        && slot.gpuPlaybackReconTextureState.height == m_imageHeight;
+        && slot.gpuPlaybackReconTextureState.width == gpuReconTextureWidth
+        && slot.gpuPlaybackReconTextureState.height == gpuReconTextureHeight;
     const bool gpuTexNrSkipNeedsPreviewFrameState =
         gpuPreviewProcessingNeedsShadowsHighlightsFrameState(
             m_activePresentationContext.gpuPreviewProcessingConfig);
@@ -4356,17 +4492,21 @@ void RenderFrameThread::drawFrame( int slotIndex,
         && gpuPlaybackReconShadowsHighlightsFrameStateAvailable(
             m_activePresentationContext.gpuPreviewProcessingConfig,
             m_pMlvObject ? m_pMlvObject->processing : nullptr,
-            m_imageWidth,
-            m_imageHeight);
+            gpuReconTextureWidth,
+            gpuReconTextureHeight);
     bool gpuTexNrFastShFrameStateAttempted = false;
     bool gpuTexNrFastShFrameStateReady = false;
     bool gpuTexNrFastShFrameStateAllocated = false;
     QString gpuTexNrFastShFrameStateReason;
     double gpuTexNrFastShDebayerMs = 0.0;
     double gpuTexNrFastShRefreshMs = 0.0;
+    /* The S/H frame state is taken from the Bayer the texture was built from:
+     * the reduced prepared input on a CUDA reduced recon, rawImage16 otherwise. */
+    std::vector<uint16_t> &gpuTexNrShSourceBayer =
+        gpuReducedReconSlot ? slot.reducedReconBayer : slot.rawImage16;
     const size_t fullResPixelCountForGpuTexNr =
-        static_cast<size_t>( qMax( 0, m_imageWidth ) )
-        * static_cast<size_t>( qMax( 0, m_imageHeight ) );
+        static_cast<size_t>( qMax( 0, gpuReconTextureWidth ) )
+        * static_cast<size_t>( qMax( 0, gpuReconTextureHeight ) );
     const bool gpuTexNrFastShFrameStateEligible =
         gpuPlaybackReconFastShadowsHighlightsFrameStateEnabled()
         && gpuTexNrSkipNeedsPreviewFrameState
@@ -4380,7 +4520,7 @@ void RenderFrameThread::drawFrame( int slotIndex,
         && gpuTexNrSkipInputAvailable
         && gpuTexNrSkipStateMatches
         && fullResPixelCountForGpuTexNr > 0
-        && slot.rawImage16.size() >= fullResPixelCountForGpuTexNr
+        && gpuTexNrShSourceBayer.size() >= fullResPixelCountForGpuTexNr
         && m_pMlvObject
         && m_pMlvObject->processing;
     bool gpuTexNrFastShQuarterFrameStateUsed = false;
@@ -4410,9 +4550,9 @@ void RenderFrameThread::drawFrame( int slotIndex,
         const int quarterRefreshed =
             processingRefreshShadowsHighlightsQuarterBlurFromBayer16(
                 m_pMlvObject->processing,
-                slot.rawImage16.data(),
-                m_imageWidth,
-                m_imageHeight,
+                gpuTexNrShSourceBayer.data(),
+                gpuReconTextureWidth,
+                gpuReconTextureHeight,
                 workerThreads,
                 bitShift );
         processingSetPlaybackPreviewScaleFactor(
@@ -4462,9 +4602,9 @@ void RenderFrameThread::drawFrame( int slotIndex,
                     : ( 16 - m_pMlvObject->RAWI.raw_info.bits_per_pixel );
             const double debayerStart = mlv_stage_timing_now();
             debayerBasicU16( m_gpuPlaybackReconStateRgb16.data(),
-                             slot.rawImage16.data(),
-                             m_imageWidth,
-                             m_imageHeight,
+                             gpuTexNrShSourceBayer.data(),
+                             gpuReconTextureWidth,
+                             gpuReconTextureHeight,
                              workerThreads,
                              bitShift );
             gpuTexNrFastShDebayerMs =
@@ -4485,8 +4625,8 @@ void RenderFrameThread::drawFrame( int slotIndex,
                 processingRefreshShadowsHighlightsBlurFromRgb16(
                     m_pMlvObject->processing,
                     m_gpuPlaybackReconStateRgb16.data(),
-                    m_imageWidth,
-                    m_imageHeight,
+                    gpuReconTextureWidth,
+                    gpuReconTextureHeight,
                     workerThreads,
                     0 );
             processingSetPlaybackPreviewScaleFactor(
@@ -4501,8 +4641,8 @@ void RenderFrameThread::drawFrame( int slotIndex,
                 && gpuPlaybackReconShadowsHighlightsFrameStateAvailable(
                     m_activePresentationContext.gpuPreviewProcessingConfig,
                     m_pMlvObject->processing,
-                    m_imageWidth,
-                    m_imageHeight);
+                    gpuReconTextureWidth,
+                    gpuReconTextureHeight);
             if( !gpuTexNrFastShFrameStateReady )
             {
                 gpuTexNrFastShFrameStateReason =
@@ -4526,6 +4666,14 @@ void RenderFrameThread::drawFrame( int slotIndex,
     {
         skipCpuDebayerForGpuTextureNoReadback =
             r16AmazeTextureAvailability.available;
+    }
+    if( gpuReducedReconSlot && !skipCpuDebayerForGpuTextureNoReadback )
+    {
+        /* The CPU route below makes this frame at its own size. */
+        renderedImageWidth = cpuRenderedImageWidth;
+        renderedImageHeight = cpuRenderedImageHeight;
+        slot.renderedImageWidth = renderedImageWidth;
+        slot.renderedImageHeight = renderedImageHeight;
     }
     slot.stageTimingTelemetry.insert(
         QStringLiteral("gpu_playback_recon_amaze_texture_present_skip_gate_output_mode"),
@@ -4889,7 +5037,14 @@ void RenderFrameThread::drawFrame( int slotIndex,
             && playbackScaleFactor == 1
             && slot.gpuPlaybackReconTextureNoReadbackCandidate
             && slot.gpuPlaybackReconTextureState.valid;
-        if( decodedRawFrame )
+        if( decodedRawFrame && slot.reducedReconOnGpu )
+        {
+            /* PLAYBACK-CUDA-HONOUR-SCALE-1: neither rawImage16 nor
+             * reducedReconBayer is a reconstruction (the recon lives on the
+             * device); the full in-render pipeline below makes this frame. */
+            renderedFromPhase3Raw = false;
+        }
+        else if( decodedRawFrame )
         {
             if( decodedRawFrameAlreadyReconned && slot.reducedReconScale > 1 )
             {
@@ -5061,26 +5216,31 @@ void RenderFrameThread::drawFrame( int slotIndex,
         const bool outputOracleAvailable =
             !outputValidationRequired
             || slot.gpuPlaybackReconTextureBayerFrame.size() >= fullResPixelCount;
+        /* PLAYBACK-CUDA-HONOUR-SCALE-1: the texture is valid at the dims the
+         * slot was reconstructed at, not at the request scale. */
+        const size_t reconTexturePixelCount =
+            static_cast<size_t>( qMax( 0, gpuReconTextureWidth ) )
+            * static_cast<size_t>( qMax( 0, gpuReconTextureHeight ) );
         const bool noReadbackCandidate =
             m_activePresentationContext.gpuPlaybackReconTexturePresentRequested
-            && playbackScaleFactor == 1
-            && m_imageWidth > 0
-            && m_imageHeight > 0
+            && gpuTexNrSkipScaleEligible
+            && gpuReconTextureWidth > 0
+            && gpuReconTextureHeight > 0
             && slot.gpuPlaybackReconTextureNoReadbackCandidate
             && ( slot.gpuPlaybackReconTextureInputBorrowedFromRawImage16
                  ? slot.rawImage16.size()
-                 : slot.gpuPlaybackReconTextureInputBayerFrame.size() ) >= fullResPixelCount
+                 : slot.gpuPlaybackReconTextureInputBayerFrame.size() ) >= reconTexturePixelCount
             && outputOracleAvailable
             && slot.gpuPlaybackReconTextureState.valid
-            && slot.gpuPlaybackReconTextureState.width == m_imageWidth
-            && slot.gpuPlaybackReconTextureState.height == m_imageHeight;
+            && slot.gpuPlaybackReconTextureState.width == gpuReconTextureWidth
+            && slot.gpuPlaybackReconTextureState.height == gpuReconTextureHeight;
         slot.gpuPlaybackReconTextureNoReadbackCandidate = noReadbackCandidate;
         slot.gpuPlaybackReconTexturePresentCandidate =
             readbackBayerCandidate || noReadbackCandidate;
         slot.gpuPlaybackReconTextureWidth =
-            slot.gpuPlaybackReconTexturePresentCandidate ? m_imageWidth : 0;
+            slot.gpuPlaybackReconTexturePresentCandidate ? gpuReconTextureWidth : 0;
         slot.gpuPlaybackReconTextureHeight =
-            slot.gpuPlaybackReconTexturePresentCandidate ? m_imageHeight : 0;
+            slot.gpuPlaybackReconTexturePresentCandidate ? gpuReconTextureHeight : 0;
         slot.gpuPlaybackReconTextureBlackLevel =
             ( slot.gpuPlaybackReconTexturePresentCandidate && m_pMlvObject )
                 ? getMlvBlackLevel( m_pMlvObject )
@@ -5126,6 +5286,18 @@ void RenderFrameThread::drawFrame( int slotIndex,
         {
             playbackScaleFactorActive = coreActiveScale;
         }
+    }
+    if( m_activePresentationContext.gpuPlaybackReconTexturePresentRequested
+     && playbackScaleFactor > 1
+     && outputMode == OutputDebayered16 )
+    {
+        /* PLAYBACK-CUDA-HONOUR-SCALE-1: report the scale actually
+         * reconstructed, so a frame that fell back to full resolution can
+         * never read as honoured. */
+        playbackScaleFactorActive =
+            ( gpuReducedReconSlot && skipCpuDebayerForGpuTextureNoReadback )
+                ? slot.reducedReconScale
+                : 1;
     }
     slot.playbackScaleFactorActive = playbackScaleFactorActive;
     slot.stageTimingTelemetry.insert(

@@ -456,6 +456,11 @@ private:
         int reducedReconScale = 1;
         int reducedReconWidth = 0;
         int reducedReconHeight = 0;
+        /* PLAYBACK-CUDA-HONOUR-SCALE-1: the reduced recon ran on the CUDA
+         * texture route. reducedReconBayer is then the prepared recon INPUT
+         * (not a reconstruction); the reconstruction is the retained device
+         * Bayer at reducedReconWidth x reducedReconHeight. */
+        bool reducedReconOnGpu = false;
         GpuPlaybackReconTextureState gpuPlaybackReconTextureState;
         int gpuPlaybackReconTextureWidth = 0;
         int gpuPlaybackReconTextureHeight = 0;

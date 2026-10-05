@@ -256,6 +256,39 @@ int mlvDualIsoPreviewScaleReconRun(mlvObject_t * video,
                                    int threads,
                                    double * fullResFixesMs,
                                    double * downsampleMs);
+/* The first half of ...Run: seed the ISO pattern, run the planned full-res
+ * fixes in place and shrink into `reducedOut`. Returns 1 (fullRaw untouched)
+ * or 2 (fixes changed fullRaw) on success, 0 / -1 on failure as ...Run. */
+int mlvDualIsoPreviewScaleReconShrink(mlvObject_t * video,
+                                      const mlvDualIsoPreviewScaleRecon_t * plan,
+                                      uint16_t * fullRaw,
+                                      uint16_t * reducedOut,
+                                      llrawprocWorkerState_t * worker,
+                                      int threads,
+                                      double * fullResFixesMs,
+                                      double * downsampleMs);
+
+/* PLAYBACK-CUDA-HONOUR-SCALE-1: the GPU sibling. The plan admits x2/x4 only
+ * when MLVAPP_GPU_PLAYBACK_RECON is set (x8 and every CPU-plan refusal stay
+ * full resolution; kill switch MLVAPP_DISABLE_GPU_DUALISO_PREVIEW_SCALE_RECON=1).
+ * Decide it ONCE per play session (sessionLatched=0), then re-derive the dims
+ * per frame with sessionLatched=1 so the frame size never changes mid-session.
+ * ...Run shrinks as above, then runs the CUDA texture route on the reduced
+ * Bayer (LLRP_WITH_DIMS_GPU_PLAYBACK_TEXTURE): `reducedOut` ends as the
+ * prepared recon input and the reconstruction is the retained device output
+ * (llrpGpuPlaybackReconGetLastRetainedDeviceBayer16). Returns as ...Run. */
+int mlvDualIsoGpuPreviewScaleReconPlan(mlvObject_t * video,
+                                       int requestedScale,
+                                       int sessionLatched,
+                                       mlvDualIsoPreviewScaleRecon_t * plan);
+int mlvDualIsoGpuPreviewScaleReconRun(mlvObject_t * video,
+                                      const mlvDualIsoPreviewScaleRecon_t * plan,
+                                      uint16_t * fullRaw,
+                                      uint16_t * reducedOut,
+                                      llrawprocWorkerState_t * worker,
+                                      int threads,
+                                      double * fullResFixesMs,
+                                      double * downsampleMs);
 /* Process stage for a reduced recon (same envelope contract as
  * getMlvProcessedFrame8ScaledFromReconnedRaw16). The frame is published under
  * mlvReducedReconProcessedFrameSignature(), never the full-recon signature, so

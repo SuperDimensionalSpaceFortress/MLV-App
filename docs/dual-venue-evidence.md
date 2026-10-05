@@ -306,8 +306,8 @@ path; the pair is its own record (`mlv-app/dual-venue-sheet-pair/v1`) because re
   (never the requested flavor) when the analysis fell back to Classic or its diagnostics are not valid, so a fallback fails the leg instead of
   passing under a Cinematic label.
 * Shipped look legs: `m16-1243-look` (Classic, requests scale 4, cuda and cpu), `m16-1243-look-cinematic` (the Classic leg asking for the
-  Cinematic flavor, cuda and cpu) and `m16-1243-look-scale2` (the Classic leg at `scaleFactor` 2, **cpu only**). See "Requested scale and
-  rendered scale" below for why the scale-2 leg has no CUDA backend.
+  Cinematic flavor, cuda and cpu) and `m16-1243-look-scale2` (the Classic leg at `scaleFactor` 2, cuda and cpu). See "Requested scale and
+  rendered scale" below for how the CUDA backend reaches scale 2 and 4.
 * The sheet copy (`-SheetCopyDir`) and the pair files carry the **leg id** --
   `sheet-<legId>-<venue>-<backend>-<flavor>.png`, `sheet-<legId>-<venue>-cuda-vs-cpu-<flavor>.png`,
   `sheet-pair-<legId>-<venue>-<flavor>.json` -- so the scale-4 and scale-2 look legs of one venue cannot overwrite
@@ -320,10 +320,13 @@ path; the pair is its own record (`mlv-app/dual-venue-sheet-pair/v1`) because re
 
 ## Requested scale and rendered scale
 
-A leg's `scaleFactor` is the playback scale it **requests**. It is not necessarily the scale the app **renders** at: the CUDA texture route
-clamps every requested scale other than 1 to 1 (`platform/qt/MainWindowGpuPreviewPolicy.h`, pinned by `tests/gui/test_gui_smoke.cpp`), so a
-CUDA run of a scale-4 or scale-2 leg renders at scale 1. Three production receipts of `m16-1243-look` on CUDA show it: the app logs
-`playback_scale_clamped_for_gpu_texture_route requested=4 effective=1` and `scale_active_last=1`; the cpu runs show `scale_active_last=4`.
+A leg's `scaleFactor` is the playback scale it **requests**. It is not necessarily the scale the app **renders** at. Until PLAYBACK-CUDA-HONOUR-SCALE-1 the CUDA
+texture route clamped every requested scale other than 1 to 1 (three production receipts of `m16-1243-look` on CUDA logged
+`playback_scale_clamped_for_gpu_texture_route requested=4 effective=1` and `scale_active_last=1`). It now **honours 2 and 4**: the GPU reconstructs the
+dual-ISO frame at the preview size (`mlvDualIsoGpuPreviewScaleReconPlan`), decided once per play session and logged as
+`playback_scale_gpu_texture_route_session requested=<S> effective=<S or 1> reason="..."`. Scale 8 and any session the plan refuses keep the clamp
+(`platform/qt/MainWindowGpuPreviewPolicy.h`, pinned by `tests/gui/test_gui_smoke.cpp`), and `scale_active_last` reports the scale actually reconstructed, so a
+session that fell back reads 1, never the request.
 
 * **Every receipt carries a `scale` block** (also on a refusal, where the rendered scale is `UNKNOWN`): `requestedScale` (the spec's), `effectiveScale`
   (what the app rendered at, read from its own run log: `scale_active_last` on the measured session's summary line, else the effective= of the clamp
@@ -332,14 +335,12 @@ CUDA run of a scale-4 or scale-2 leg renders at scale 1. Three production receip
   `SCALE_NOT_HONOURED` (no signal, like `INVALID`), and `outcomeDetail` says both numbers. `Test-DvReceiptValid` re-derives the same verdict from the hashed
   run log and the committed spec, so a hand-written PASS over a clamped run is `INVALID` (`OUTCOME_NOT_DERIVED`).
 * **A spec may declare the clamp**: `acceptedEffectiveScale.<backend>` (schema: optional, per backend) names the scale that backend is known to render at when it
-  is not `scaleFactor`. `m16-1243-look` and `m16-1243-speed` declare `cuda: 1`, so their CUDA legs stay runnable: they pass only when the app rendered at exactly 1, the
-  verdict is `DECLARED_CLAMP` (never `HONOURED`), and the outcome detail reads "requested scale 4, rendered at 1". A CUDA look sheet of the scale-4 leg is therefore a scale-1 sheet,
-  labelled as such, beside a scale-4 cpu sheet; the pair record's `scalesDiffer` says so. If the route changes and cuda renders 4, the declaration is stale and the leg ends
-  `SCALE_NOT_HONOURED` until the spec is edited -- it never silently passes. (The speed leg's declaration is derived from the code and the look-leg receipts: no speed-leg
-  receipt was available to measure.)
-* **`m16-1243-look-scale2` is cpu only** and declares nothing: the owner's display-meter exposure path runs only when the *effective* playback scale is 2
-  (`MainWindow.cpp`, `effectivePlaybackScaleFactorForRequest() == 2`), which the CPU backend reaches and the CUDA texture route cannot. The leg shows the owner's scale-2 playback
-  look on the CPU backend only; it gets a CUDA backend when the CUDA route honours scale 2 (a unit test trips when the clamp is removed, so the declarations and this backend list are revisited).
+  is not `scaleFactor`. A declared leg passes only when the app rendered at exactly that scale, the verdict is `DECLARED_CLAMP` (never `HONOURED`), and the outcome detail
+  reads "requested scale 4, rendered at 1". Until PLAYBACK-CUDA-HONOUR-SCALE-1, `m16-1243-look`, `-look-cinematic`, `-speed` and the display-matrix scale-2/4 cells declared
+  `cuda: 1`; they now declare nothing, so a CUDA run of them that fell back to scale 1 ends `SCALE_NOT_HONOURED` -- it never silently passes. A comparison against a
+  pre-honour control runs the control from the control commit's own copy of the spec.
+* **`m16-1243-look-scale2` runs cuda and cpu** and declares nothing: the owner's display-meter exposure path runs only when the *effective* playback scale is 2
+  (`MainWindow.cpp`, `effectivePlaybackScaleFactorForRequest() == 2`), which both backends now reach.
 * The job is generated with `-ExpectedScaleRequest <accepted scale>` so the smoke runner's own scale check is live (`-UsePersistedPlaybackSettings` leaves it at -1 otherwise). The
   runner compares the app's request after the clamp, so the value is the accepted *effective* scale, not the spec's request.
 
@@ -359,8 +360,8 @@ the generator's `-DisplayMode windowed`; `fullscreen` passes nothing, so a full-
   committed spec (`DISPLAY_MODE_NOT_HONOURED`, `DISPLAY_NOT_FROM_EVIDENCE`, and `INCOMPLETE` for a named mode with no `display` block).
 * **The standard leg set** is `legsets/display-matrix.json`: the owner clip M16-1243, Look Assist Cinematic, `{fullscreen, windowed}` x `{scale 1 = full, 2 = half, 4 = quarter}` x `{cuda, cpu}` = **12 cells**.
   Each cell is an ordinary committed leg spec (`legs/m16-1243-display-<mode>-s<scale>.json`, six specs, each listing both backends); the set only names them. Why a set file and not one matrix spec the
-  runner expands: a receipt is bound to a committed spec by its sha256 (`Find-DvCommittedLegSpec`), so a cell that is not a committed spec could never validate. The CUDA texture route clamps scales 2 and 4
-  to 1, so those specs declare `acceptedEffectiveScale.cuda: 1`: the table shows `2->1` and `4->1` for CUDA, and the three CUDA sizes are one workload until the route honours the scale.
+  runner expands: a receipt is bound to a committed spec by its sha256 (`Find-DvCommittedLegSpec`), so a cell that is not a committed spec could never validate. The CUDA texture route honours scales 2 and 4
+  (PLAYBACK-CUDA-HONOUR-SCALE-1), so no cell declares a clamp: a CUDA cell that rendered at 1 reads `2->1` or `4->1` and ends `SCALE_NOT_HONOURED`.
   Roles are declared in `venues.json` (`DUAL-VENUE-DISPLAY-MATRIX-1`: Bachelor acceptance, Ultra-Magnus supplementary).
 * **Run it** (one entry point, the same script; `-LegSet` and `-LegSpec` are different parameter sets):
 
@@ -389,7 +390,7 @@ the generator's `-DisplayMode windowed`; `fullscreen` passes nothing, so a full-
    (`bachelor: acceptance`, `ultra-magnus: supplementary` for a card whose acceptance venue is Bachelor).
    A card the table does not name gets `defaultRole` (`supplementary`) on both venues.
    A leg may name a `displayMode` (`fullscreen` | `windowed`; default full screen): see *Display matrix (standard playback benchmark)*, which also says how to add a leg to a leg set.
-   A `scaleFactor` other than 1 on a `cuda` backend needs `acceptedEffectiveScale.cuda: 1` while the texture-route clamp exists (a test enforces it); otherwise list `cpu` only.
+   A `scaleFactor` of 8 on a `cuda` backend needs `acceptedEffectiveScale.cuda: 1`, because the texture route still clamps x8 (a test enforces it); scales 2 and 4 declare nothing.
 3. Put the pass criteria per **role** and per **backend** in `criteria`: `{metric, op, value}` triples
    over the metrics copied verbatim from the job's `summary.json` (`rows`, `gpuFramesTotal`, `cpuFrames`,
    `lookAssistForced`, `presentMon*`, ...). An empty list is informational. A metric the job did not

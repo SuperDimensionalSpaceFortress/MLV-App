@@ -786,6 +786,13 @@ typedef struct
     igpu_recon_clip_t configured_clip;
     int luts_configured;
     llrawprocGpuReconLutsKey_t configured_luts_key;
+    /* PLAYBACK-CUDA-HONOUR-SCALE-1: retained device outputs handed out and not
+     * yet released. igpu_recon_set_clip frees EVERY retained output, in use or
+     * not, so a clip whose dimensions differ is refused while any is
+     * outstanding (a presenter could still be reading one). */
+    uint64_t retained_outstanding_tokens[LLRP_GPU_RETAINED_OUTSTANDING_MAX];
+    int retained_outstanding_count;
+    uint64_t clip_dims_change_refusals;
 } llrawprocGpuExportBackend_t;
 
 static llrawprocGpuExportBackend_t g_llrawproc_gpu_export_backend = {0};
@@ -952,13 +959,27 @@ static const char * llrawproc_fake_gpu_backend_describe(igpu_recon_backend * b)
     return "fake-test-backend (no GPU, C-seam only)";
 }
 
+/* Mirrors igpu_recon_cuda.cu's retained slots: set_clip frees every retained
+ * output whether or not it is in use, which is the hazard the C seam guards. */
+static uint64_t g_llrawproc_fake_gpu_backend_next_token = 1;
+static int g_llrawproc_fake_gpu_backend_in_use_count = 0;
+static int g_llrawproc_fake_gpu_backend_freed_in_use = 0;
+
 static int llrawproc_fake_gpu_backend_set_clip(igpu_recon_backend * b,
                                                const igpu_recon_clip_t * clip)
 {
     (void)b;
     if(!clip) return -1;
+    g_llrawproc_fake_gpu_backend_freed_in_use += g_llrawproc_fake_gpu_backend_in_use_count;
+    g_llrawproc_fake_gpu_backend_in_use_count = 0;
     g_llrawproc_fake_gpu_backend_clip = *clip;
     return 0;
+}
+
+int llrpFakeGpuBackendFreedInUseRetainedForTesting(void);
+int llrpFakeGpuBackendFreedInUseRetainedForTesting(void)
+{
+    return g_llrawproc_fake_gpu_backend_freed_in_use;
 }
 
 static int llrawproc_fake_gpu_backend_set_luts(igpu_recon_backend * b,
@@ -1119,7 +1140,8 @@ static int llrawproc_fake_gpu_backend_retain_last_device_output(
     const int rc = llrawproc_fake_gpu_backend_last_device_output(
         b, device_bayer16, width, height);
     if(rc != 0) return rc;
-    if(token) *token = 1;
+    if(token) *token = g_llrawproc_fake_gpu_backend_next_token++;
+    ++g_llrawproc_fake_gpu_backend_in_use_count;
     return 0;
 }
 
@@ -1128,6 +1150,10 @@ static int llrawproc_fake_gpu_backend_release_retained_device_output(
 {
     (void)b;
     (void)token;
+    if(g_llrawproc_fake_gpu_backend_in_use_count > 0)
+    {
+        --g_llrawproc_fake_gpu_backend_in_use_count;
+    }
     return 0;
 }
 
@@ -1151,6 +1177,9 @@ int llrpInstallFakeGpuPlaybackReconBackendForTesting(int install)
     g_llrawproc_fake_gpu_backend_last_device_height = 0;
     memset(&g_llrawproc_fake_gpu_backend_clip, 0, sizeof(g_llrawproc_fake_gpu_backend_clip));
     memset(&g_llrawproc_fake_gpu_backend_last_status, 0, sizeof(g_llrawproc_fake_gpu_backend_last_status));
+    g_llrawproc_fake_gpu_backend_next_token = 1;
+    g_llrawproc_fake_gpu_backend_in_use_count = 0;
+    g_llrawproc_fake_gpu_backend_freed_in_use = 0;
     if(install)
     {
         g->backend = (igpu_recon_backend *)&g_llrawproc_fake_gpu_backend_sentinel;
@@ -1536,6 +1565,17 @@ static int llrawproc_gpu_recon_run_backend(const dualiso_gpu_recon_state_t * sta
     const int need_set_clip = !clip_matches;
     const int need_set_luts = need_set_clip || !luts_match;
 
+    if(need_set_clip
+     && g->clip_configured
+     && g->retained_outstanding_count > 0
+     && (g->configured_clip.width != clip.width
+      || g->configured_clip.height != clip.height))
+    {
+        ++g->clip_dims_change_refusals;
+        pthread_mutex_unlock(&g_llrawproc_gpu_recon_backend_mutex);
+        if(rc_out) *rc_out = LLRP_GPU_PLAYBACK_RECON_RC_CLIP_DIMS_BUSY;
+        return 0;
+    }
     if(need_set_clip)
     {
         rc = g->set_clip(g->backend, &clip);
@@ -1685,6 +1725,11 @@ static int llrawproc_gpu_recon_run_backend(const dualiso_gpu_recon_state_t * sta
             retained_out->width = retained_width;
             retained_out->height = retained_height;
             retained_out->token = retained_token;
+            if(g->retained_outstanding_count < LLRP_GPU_RETAINED_OUTSTANDING_MAX)
+            {
+                g->retained_outstanding_tokens[g->retained_outstanding_count++] =
+                    retained_token;
+            }
             if(device_bayer16_out) *device_bayer16_out = retained_device_bayer16;
             if(device_width_out) *device_width_out = retained_width;
             if(device_height_out) *device_height_out = retained_height;
@@ -2169,9 +2214,40 @@ int llrpGpuPlaybackReconReleaseRetainedDeviceBayer16(uint64_t token)
     {
         rc = -3;
     }
+    if(rc == 0 || rc == 1)
+    {
+        int i;
+        for(i = 0; i < g->retained_outstanding_count; ++i)
+        {
+            if(g->retained_outstanding_tokens[i] == token)
+            {
+                g->retained_outstanding_tokens[i] =
+                    g->retained_outstanding_tokens[--g->retained_outstanding_count];
+                break;
+            }
+        }
+    }
     pthread_mutex_unlock(&g_llrawproc_gpu_recon_backend_mutex);
 
     return rc == 0 || rc == 1;
+}
+
+int llrpGpuPlaybackReconRetainedOutstandingCount(void)
+{
+    int count;
+    pthread_mutex_lock(&g_llrawproc_gpu_recon_backend_mutex);
+    count = g_llrawproc_gpu_export_backend.retained_outstanding_count;
+    pthread_mutex_unlock(&g_llrawproc_gpu_recon_backend_mutex);
+    return count;
+}
+
+uint64_t llrpGpuPlaybackReconClipDimsChangeRefusals(void)
+{
+    uint64_t refusals;
+    pthread_mutex_lock(&g_llrawproc_gpu_recon_backend_mutex);
+    refusals = g_llrawproc_gpu_export_backend.clip_dims_change_refusals;
+    pthread_mutex_unlock(&g_llrawproc_gpu_recon_backend_mutex);
+    return refusals;
 }
 
 int llrpGpuPlaybackReconRunCpu16Probe(const llrpGpuPlaybackReconState_t * state,
@@ -2429,6 +2505,16 @@ int llrpGpuPlaybackReconGetBackendInfo(llrpGpuPlaybackReconBackendInfo_t * info)
 
 int llrpGpuPlaybackReconResetGlTextureResources(void);
 int llrpGpuPlaybackReconResetGlTextureResources(void)
+{
+    return 0;
+}
+
+int llrpGpuPlaybackReconRetainedOutstandingCount(void)
+{
+    return 0;
+}
+
+uint64_t llrpGpuPlaybackReconClipDimsChangeRefusals(void)
 {
     return 0;
 }
@@ -4668,6 +4754,108 @@ int applyLLRawProcObjectWorker_with_dims(mlvObject_t * video,
                                               override_w, override_h, worker, flags);
 }
 
+/* PLAYBACK-CUDA-HONOUR-SCALE-1: the full-resolution prepare-only branch of
+ * applyLLRawProcObjectWorker (prepare, preupload, retained-device recon) on a
+ * reduced raw_info. No new kernels: the backend reallocates for the reduced
+ * clip in set_clip, which the C seam refuses while retained outputs of other
+ * dimensions are outstanding. Returns 1 only with a valid retained output. */
+static int llrawproc_with_dims_gpu_playback_texture(mlvObject_t * video,
+                                                    struct raw_info raw_info,
+                                                    uint16_t * raw_image_buff,
+                                                    size_t raw_image_size,
+                                                    int dark_frame_mode,
+                                                    int diso1,
+                                                    int diso2,
+                                                    llrawprocWorkerState_t * worker,
+                                                    int * auto_correction_ptr,
+                                                    double * ev_correction_ptr,
+                                                    int * black_delta_ptr,
+                                                    int diso_averaging,
+                                                    int diso_alias_map,
+                                                    int diso_frblending,
+                                                    int chroma_smooth_mode,
+                                                    int llrawproc_threads)
+{
+    dualiso_gpu_recon_state_t gpu_playback_state;
+    llrpGpuPlaybackReconState_t public_gpu_playback_state;
+    llrpGpuPlaybackRetainedDeviceBayer16_t retained_device;
+    llrpGpuPlaybackReconTiming_t retained_timing;
+    int retained_rc = -1;
+
+    llrawproc_gpu_playback_reset_last_run_state();
+    if (!llrawproc_gpu_playback_recon_enabled()
+     || !g_llrawproc_gpu_playback_texture_prepare_only_allowed
+     || !g_llrawproc_gpu_playback_texture_present_preferred
+     || llrawproc_gpu_playback_recon_output_validation_enabled()
+     || !llrawproc_gpu_playback_retain_device_output_enabled()
+     || raw_image_size == 0)
+    {
+        return 0;
+    }
+
+    const uint64_t frame_index = mlv_pipeline_capture_get_current_frame();
+    memset(&gpu_playback_state, 0, sizeof(gpu_playback_state));
+    if (!diso_prepare_gpu_recon_state(raw_info,
+                                      raw_image_buff,
+                                      dark_frame_mode,
+                                      diso1,
+                                      diso2,
+                                      &worker->diso_pattern,
+                                      auto_correction_ptr,
+                                      ev_correction_ptr,
+                                      black_delta_ptr,
+                                      diso_averaging,
+                                      diso_alias_map,
+                                      diso_frblending,
+                                      chroma_smooth_mode,
+                                      processingPlaybackPreviewModeEnabled()
+                                          ? ((video && video->playback_scale_factor_active > 0)
+                                              ? video->playback_scale_factor_active
+                                              : processingPlaybackPreviewScaleFactor())
+                                          : 0,
+                                      llrawproc_threads,
+                                      &worker->diso_full20bit_scratch,
+                                      &gpu_playback_state))
+    {
+        return 0;
+    }
+    g_llrawproc_gpu_playback_last_state_valid = gpu_playback_state.valid ? 1 : 0;
+    g_llrawproc_gpu_playback_last_prepared_state = gpu_playback_state;
+    if (!gpu_playback_state.valid
+     || !llrawproc_gpu_playback_recon_state_matches_validated_config(&gpu_playback_state))
+    {
+        return 0;
+    }
+
+    (void)llrpGpuPlaybackReconPreuploadFrame(frame_index, raw_image_buff, raw_image_size);
+    memset(&public_gpu_playback_state, 0, sizeof(public_gpu_playback_state));
+    memset(&retained_device, 0, sizeof(retained_device));
+    memset(&retained_timing, 0, sizeof(retained_timing));
+    llrawproc_gpu_playback_public_state_from_dualiso(&gpu_playback_state,
+                                                     &public_gpu_playback_state);
+    public_gpu_playback_state.frame_id = frame_index;
+    g_llrawproc_gpu_playback_last_run_attempted = 1;
+    const int retained_ok =
+        llrpGpuPlaybackReconRunRetainedDeviceBayer16(&public_gpu_playback_state,
+                                                     raw_image_buff,
+                                                     raw_image_size,
+                                                     &retained_device,
+                                                     &retained_rc,
+                                                     &retained_timing)
+        && retained_device.valid;
+    g_llrawproc_gpu_playback_last_preupload_status = retained_timing.preupload;
+    g_llrawproc_gpu_playback_last_run_rc = retained_rc;
+    if (!retained_ok)
+    {
+        return 0;
+    }
+    g_llrawproc_gpu_playback_last_retained_device_bayer16 = retained_device;
+    g_llrawproc_gpu_playback_last_used = 1;
+    g_llrawproc_gpu_playback_last_prepare_only = 1;
+    g_llrawproc_gpu_playback_last_run_rc = 0;
+    return 1;
+}
+
 static int llrawproc_apply_with_dims_internal(mlvObject_t * video,
                                               uint16_t * raw_image_buff,
                                               size_t raw_image_size,
@@ -4967,7 +5155,25 @@ static int llrawproc_apply_with_dims_internal(mlvObject_t * video,
         publish_auto_correction = !has_explicit_auto_match;
 
         const int dual_iso_recon_ok =
-            diso_get_full20bit(raw_info,
+            (flags & LLRP_WITH_DIMS_GPU_PLAYBACK_TEXTURE)
+            ? (!isolated_analysis
+               && llrawproc_with_dims_gpu_playback_texture(video,
+                                                           raw_info,
+                                                           raw_image_buff,
+                                                           raw_image_size,
+                                                           dark_frame_mode,
+                                                           diso1,
+                                                           diso2,
+                                                           worker,
+                                                           auto_correction_ptr,
+                                                           ev_correction_ptr,
+                                                           black_delta_ptr,
+                                                           diso_averaging,
+                                                           diso_alias_map,
+                                                           diso_frblending,
+                                                           chroma_smooth_mode,
+                                                           llrawproc_threads))
+            : diso_get_full20bit(raw_info,
                                raw_image_buff,
                                dark_frame_mode,
                                diso1,

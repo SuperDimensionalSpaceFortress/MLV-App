@@ -7,7 +7,6 @@
   "playSeconds": 25,
   "backends": ["cuda", "cpu"],
   "scaleFactor": 4,
-  "acceptedEffectiveScale": { "cuda": 1 },
   "displayMode": "windowed",
   "generatorArgs": { "telemetryArm": "LIGHT", "cpuQuiescenceThresholdPercent": 95 },
   "timeouts": { "queueWaitSec": 900, "extraClaimedWaitSec": 600 },
