@@ -367,6 +367,24 @@ int applyLLRawProcObject_with_dims(mlvObject_t * video,
                                    size_t raw_image_size,
                                    int override_w,
                                    int override_h);
+
+/* CPU-DUALISO-AT-PREVIEW-SCALE-1: applyLLRawProcObject_with_dims on a caller-
+ * owned worker state (the phase-3 recon worker's), with flags:
+ *  - FULLRES_FIXES_APPLIED: the coordinate-sensitive fixes (focus, bad pixels,
+ *    vertical stripes, pattern noise) already ran on the full-resolution frame,
+ *    so their being enabled does not reject the scaled call;
+ *  - NO_PUBLISH: the dual-ISO runtime state (pattern, auto/ev correction, black
+ *    delta) estimated on the reduced buffer is never published to the shared
+ *    llrawproc object that exports and paused frames read. */
+#define LLRP_WITH_DIMS_FULLRES_FIXES_APPLIED 0x1
+#define LLRP_WITH_DIMS_NO_PUBLISH 0x2
+int applyLLRawProcObjectWorker_with_dims(mlvObject_t * video,
+                                         uint16_t * raw_image_buff,
+                                         size_t raw_image_size,
+                                         int override_w,
+                                         int override_h,
+                                         llrawprocWorkerState_t * worker,
+                                         int flags);
 double llrpGetLastSharedLockMilliseconds(void);
 double llrpGetLastDualIsoRefineLockMilliseconds(void);
 double llrpGetLastPublishLockMilliseconds(void);

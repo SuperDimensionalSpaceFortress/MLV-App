@@ -169,6 +169,7 @@ bool isGpuPlaybackReconTimingTelemetryKey( const QString &key )
 {
     return key.startsWith( QStringLiteral("llrawproc_") )
         || key.startsWith( QStringLiteral("dual_iso_full20_") )
+        || key.startsWith( QStringLiteral("cpu_dualiso_recon_") )
         || key == QStringLiteral("render_thread_recon_worker_llrawproc_total_ms")
         || key == QStringLiteral("render_thread_recon_worker_llrawproc_dual_iso_ms")
         || key == QStringLiteral("gpu_playback_recon_env_enabled")
@@ -2045,6 +2046,7 @@ void RenderFrameThread::decodeFrameForWorker( const DecodeQueueEntry &entry )
     {
         slot.rawImage16.resize( rawPixelCount );
     }
+    slot.reducedReconScale = 1;
     if( rawPixelCount > 0 && m_pMlvObject )
     {
         (void)getMlvRawFrameUint16( m_pMlvObject,
@@ -2234,13 +2236,123 @@ void RenderFrameThread::reconFrameForWorker( const ReconQueueEntry &entry,
         mlv_pipeline_capture_set_current_frame( entry.request.frameNumber );
         stampReconStage( "phase3_recon_after_capture_set_frame_stage_time" );
         stampReconStage( "phase3_recon_before_apply_llrawproc_stage_time" );
-        applyLLRawProcObjectWorker( m_pMlvObject,
-                                    slot.rawImage16.data(),
-                                    rawPixelCount * sizeof(uint16_t),
-                                    workerState,
-                                    0 );
+        /* CPU-DUALISO-AT-PREVIEW-SCALE-1: during CPU playback at preview scale
+         * 2/4/8, reconstruct the Phase-4B-shrunk Bayer instead of the full
+         * sensor. Anything the plan or the run rejects is reconstructed at full
+         * resolution exactly as before, and the reason is recorded. */
+        slot.reducedReconScale = 1;
+        slot.reducedReconWidth = 0;
+        slot.reducedReconHeight = 0;
+        double reducedReconFullResFixesMs = 0.0;
+        double reducedReconDownsampleMs = 0.0;
+        QString reducedReconFallbackReason;
+        const ReadyFrame::PresentationContext &reconContext =
+            entry.request.presentationContext;
+        if( !reconContext.playbackActive )
+        {
+            reducedReconFallbackReason = QStringLiteral("not playing");
+        }
+        else if( entry.request.outputMode != OutputProcessed8 )
+        {
+            /* Only the processed8 reconned-raw consumer takes a reduced Bayer. */
+            reducedReconFallbackReason =
+                QStringLiteral("process stage is not processed8");
+        }
+        else if( wantsGpuPlaybackReconTextureNoReadback )
+        {
+            reducedReconFallbackReason =
+                QStringLiteral("GPU playback recon texture route owns this frame");
+        }
+        else
+        {
+            mlvDualIsoPreviewScaleRecon_t reducedPlan;
+            if( mlvDualIsoPreviewScaleReconPlan( m_pMlvObject,
+                                                 reconContext.playbackScaleFactor,
+                                                 &reducedPlan ) )
+            {
+                const size_t reducedWords =
+                    static_cast<size_t>( reducedPlan.reducedWidth )
+                    * static_cast<size_t>( reducedPlan.reducedHeight );
+                bool reducedBufferReady = false;
+                try
+                {
+                    slot.reducedReconBayer.resize( reducedWords );
+                    reducedBufferReady = true;
+                }
+                catch( const std::bad_alloc & )
+                {
+                    reducedReconFallbackReason =
+                        QStringLiteral("reduced recon buffer allocation failed");
+                }
+                if( reducedBufferReady )
+                {
+                    mlv_pipeline_capture_set_current_frame( entry.request.frameNumber );
+                    const int reducedRc = mlvDualIsoPreviewScaleReconRun(
+                        m_pMlvObject,
+                        &reducedPlan,
+                        slot.rawImage16.data(),
+                        slot.reducedReconBayer.data(),
+                        workerState,
+                        qMax( 1, m_pMlvObject->cpu_cores ),
+                        &reducedReconFullResFixesMs,
+                        &reducedReconDownsampleMs );
+                    if( reducedRc == 1 )
+                    {
+                        slot.reducedReconScale = reducedPlan.scale;
+                        slot.reducedReconWidth = reducedPlan.reducedWidth;
+                        slot.reducedReconHeight = reducedPlan.reducedHeight;
+                    }
+                    else
+                    {
+                        reducedReconFallbackReason =
+                            QStringLiteral("reduced recon rejected by the scaled llrawproc subset");
+                        if( reducedRc < 0 )
+                        {
+                            /* The full-res fixes already ran in place: start the
+                             * full-resolution recon from a fresh decode. */
+                            (void)getMlvRawFrameUint16( m_pMlvObject,
+                                                        entry.request.frameNumber,
+                                                        slot.rawImage16.data() );
+                        }
+                    }
+                }
+            }
+            else
+            {
+                reducedReconFallbackReason = QString::fromLatin1( reducedPlan.reason );
+            }
+        }
+        if( slot.reducedReconScale <= 1 )
+        {
+            applyLLRawProcObjectWorker( m_pMlvObject,
+                                        slot.rawImage16.data(),
+                                        rawPixelCount * sizeof(uint16_t),
+                                        workerState,
+                                        0 );
+        }
         stampReconStage( "phase3_recon_after_apply_llrawproc_stage_time" );
         insertLlrawprocReconTimingTelemetry( slot.stageTimingTelemetry );
+        slot.stageTimingTelemetry.insert(
+            QStringLiteral("cpu_dualiso_recon_scale"),
+            slot.reducedReconScale );
+        slot.stageTimingTelemetry.insert(
+            QStringLiteral("cpu_dualiso_recon_width"),
+            slot.reducedReconScale > 1 ? slot.reducedReconWidth : m_imageWidth );
+        slot.stageTimingTelemetry.insert(
+            QStringLiteral("cpu_dualiso_recon_height"),
+            slot.reducedReconScale > 1 ? slot.reducedReconHeight : m_imageHeight );
+        slot.stageTimingTelemetry.insert(
+            QStringLiteral("cpu_dualiso_recon_fullres_fixes_ms"),
+            reducedReconFullResFixesMs );
+        slot.stageTimingTelemetry.insert(
+            QStringLiteral("cpu_dualiso_recon_downsample_ms"),
+            reducedReconDownsampleMs );
+        if( slot.reducedReconScale <= 1 )
+        {
+            slot.stageTimingTelemetry.insert(
+                QStringLiteral("cpu_dualiso_recon_fallback_reason"),
+                reducedReconFallbackReason );
+        }
         insertGpuPlaybackReconRunTelemetry( slot.stageTimingTelemetry );
         stampReconStage( "phase3_recon_after_timing_capture_stage_time" );
         bool gpuPlaybackReconTextureBayerSnapshotCopied = false;
@@ -4768,6 +4880,7 @@ void RenderFrameThread::drawFrame( int slotIndex,
     else if( !slot.rawImage8.empty() )
     {
         bool renderedFromPhase3Raw = false;
+        bool renderedFromReducedRecon = false;
         bool renderedFromGpuTextureNoReadbackStatePath = false;
         const bool allowGpuTextureNoReadbackScale1StatePath =
             decodedRawFrameAlreadyReconned
@@ -4778,7 +4891,28 @@ void RenderFrameThread::drawFrame( int slotIndex,
             && slot.gpuPlaybackReconTextureState.valid;
         if( decodedRawFrame )
         {
-            if( decodedRawFrameAlreadyReconned )
+            if( decodedRawFrameAlreadyReconned && slot.reducedReconScale > 1 )
+            {
+                /* rawImage16 is NOT a reconstruction here; only the reduced
+                 * Bayer is. A refusal falls through to the full in-render
+                 * pipeline below, which decodes and reconstructs on its own. */
+                renderedFromReducedRecon =
+                    slot.reducedReconBayer.size()
+                        >= static_cast<size_t>( slot.reducedReconWidth )
+                           * static_cast<size_t>( slot.reducedReconHeight )
+                    && getMlvProcessedFrame8ScaledFromReducedReconnedRaw16(
+                           m_pMlvObject,
+                           frameNumber,
+                           slot.reducedReconBayer.data(),
+                           slot.reducedReconWidth,
+                           slot.reducedReconHeight,
+                           slot.reducedReconScale,
+                           slot.rawImage8.data(),
+                           workerThreads,
+                           playbackScaleFactor ) != 0;
+                renderedFromPhase3Raw = renderedFromReducedRecon;
+            }
+            else if( decodedRawFrameAlreadyReconned )
             {
                 renderedFromPhase3Raw =
                     getMlvProcessedFrame8ScaledFromReconnedRaw16(
@@ -4818,6 +4952,9 @@ void RenderFrameThread::drawFrame( int slotIndex,
         slot.stageTimingTelemetry.insert(
             QStringLiteral("phase3_reconned_raw_consumed"),
             decodedRawFrame && decodedRawFrameAlreadyReconned && renderedFromPhase3Raw );
+        slot.stageTimingTelemetry.insert(
+            QStringLiteral("cpu_dualiso_reduced_recon_consumed"),
+            renderedFromReducedRecon );
         slot.stageTimingTelemetry.insert(
             QStringLiteral("gpu_playback_recon_x1_state_debayer_allowed"),
             allowGpuTextureNoReadbackScale1StatePath );

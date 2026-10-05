@@ -4634,11 +4634,47 @@ void applyLLRawProcObjectPreDualIsoFixes(mlvObject_t * video,
  * worker via llrawproc_acquire_worker_state). The shared->diso_pattern
  * field is read but not written from the scaled path — so the iso pattern
  * detection MUST have been seeded by a prior full-res render. */
+static int llrawproc_apply_with_dims_internal(mlvObject_t * video,
+                                              uint16_t * raw_image_buff,
+                                              size_t raw_image_size,
+                                              int override_w,
+                                              int override_h,
+                                              llrawprocWorkerState_t * supplied_worker,
+                                              int flags);
+
 int applyLLRawProcObject_with_dims(mlvObject_t * video,
                                    uint16_t * raw_image_buff,
                                    size_t raw_image_size,
                                    int override_w,
                                    int override_h)
+{
+    return llrawproc_apply_with_dims_internal(video, raw_image_buff, raw_image_size,
+                                              override_w, override_h, NULL, 0);
+}
+
+/* CPU-DUALISO-AT-PREVIEW-SCALE-1: the same scaled subset for the phase-3 recon
+ * worker, on the worker state that thread owns (applyLLRawProcObjectWorker's
+ * contract) instead of a pool slot keyed by thread id. flags: see
+ * LLRP_WITH_DIMS_* in llrawproc.h. */
+int applyLLRawProcObjectWorker_with_dims(mlvObject_t * video,
+                                         uint16_t * raw_image_buff,
+                                         size_t raw_image_size,
+                                         int override_w,
+                                         int override_h,
+                                         llrawprocWorkerState_t * worker,
+                                         int flags)
+{
+    return llrawproc_apply_with_dims_internal(video, raw_image_buff, raw_image_size,
+                                              override_w, override_h, worker, flags);
+}
+
+static int llrawproc_apply_with_dims_internal(mlvObject_t * video,
+                                              uint16_t * raw_image_buff,
+                                              size_t raw_image_size,
+                                              int override_w,
+                                              int override_h,
+                                              llrawprocWorkerState_t * supplied_worker,
+                                              int flags)
 {
     const double apply_start = mlv_stage_timing_now();
     llrawprocObject_t * shared = video ? video->llrawproc : NULL;
@@ -4685,8 +4721,10 @@ int applyLLRawProcObject_with_dims(mlvObject_t * video,
     /* Bail if the receipt enables features that are unsafe at scaled
      * resolution. Aggressive preview explicitly treats those stages as
      * skippable approximations; sharp/smooth playback falls back to the
-     * conservative full-res path. */
-    if (!mlvPlaybackAggressivePreviewMode())
+     * conservative full-res path. A caller that already ran them on the
+     * full-resolution frame says so with LLRP_WITH_DIMS_FULLRES_FIXES_APPLIED. */
+    if (!mlvPlaybackAggressivePreviewMode()
+        && !(flags & LLRP_WITH_DIMS_FULLRES_FIXES_APPLIED))
     {
         if (shared->focus_pixels) return 0;
         if (shared->bad_pixels) return 0;
@@ -4696,7 +4734,15 @@ int applyLLRawProcObject_with_dims(mlvObject_t * video,
 
     memset(&stack_worker, 0, sizeof(stack_worker));
     stack_worker.prev_black_level = -1;
-    worker = llrawproc_acquire_worker_state(video);
+    worker = supplied_worker;
+    if (worker && !worker->raw2ev && !worker->ev2raw && worker->prev_black_level == 0)
+    {
+        worker->prev_black_level = -1;
+    }
+    if (!worker)
+    {
+        worker = llrawproc_acquire_worker_state(video);
+    }
     if (!worker)
     {
         worker = &stack_worker;
@@ -5014,7 +5060,8 @@ int applyLLRawProcObject_with_dims(mlvObject_t * video,
             !llrawproc_runtime_state_equal(&runtime_state,
                                            &worker->seeded_runtime_state,
                                            publish_auto_correction);
-        if (!isolated_analysis && runtime_state_changed)
+        if (!isolated_analysis && runtime_state_changed
+            && !(flags & LLRP_WITH_DIMS_NO_PUBLISH))
         {
             const double publish_lock_start = mlv_stage_timing_now();
             pthread_mutex_lock(&video->llrawproc_mutex);
@@ -5022,6 +5069,13 @@ int applyLLRawProcObject_with_dims(mlvObject_t * video,
             pthread_mutex_unlock(&video->llrawproc_mutex);
             g_llrawproc_last_publish_lock_ms += (mlv_stage_timing_now() - publish_lock_start) * 1000.0;
             g_llrawproc_last_shared_lock_ms += g_llrawproc_last_publish_lock_ms;
+        }
+        else if (runtime_state_changed && (flags & LLRP_WITH_DIMS_NO_PUBLISH))
+        {
+            /* Estimates made on reduced data never reach the shared object
+             * that exports and paused frames read; the next call reseeds
+             * this worker from the shared state. */
+            llrawproc_restore_worker_runtime_state(worker, &worker->seeded_runtime_state);
         }
     }
 
