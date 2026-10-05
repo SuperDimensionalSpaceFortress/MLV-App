@@ -6718,10 +6718,18 @@ class InvokeAttrCudaBoundedProbeTests(_PwshCase):
     """Invoke-AttrCudaBoundedProbe in isolation: a fast probe's own result passes through
     untouched, and a hung probe returns $null within the bound instead of blocking."""
 
+    # CI-FLAKE-BOUNDED-PROBE-3S-1: every case that asserts a probe's RESULT (True/False, or the real
+    # production probe resolving its native dependency) passes a generous 30000 ms bound. What those
+    # cases prove is result pass-through / dependency resolution, not timing, and a 3000 ms bound
+    # lets a loaded hosted runner starve the nested Runspace into the timeout path ($null), failing
+    # "None not found in (True, False)" (merge_group run 37367073051). The timeout path itself stays
+    # pinned by the hanging-probe case (800 ms) and the unknown-function case (500 ms) below; the
+    # production 3000 ms default in AttrCudaArtifacts.psm1 is unchanged.
+
     def test_a_fast_probe_returns_its_own_result_within_the_timeout(self) -> None:
         proc = self.run_with_module(
             "function Get-AttrCudaFakeFastProbe { return $true }\n"
-            "$r = Invoke-AttrCudaBoundedProbe -FunctionName 'Get-AttrCudaFakeFastProbe' -TimeoutMilliseconds 3000\n"
+            "$r = Invoke-AttrCudaBoundedProbe -FunctionName 'Get-AttrCudaFakeFastProbe' -TimeoutMilliseconds 30000\n"
             f"[IO.File]::WriteAllText('{(self.tmp / 'r.json')}', (@{{ r = $r }} | ConvertTo-Json))\n"
         )
         self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
@@ -6733,7 +6741,7 @@ class InvokeAttrCudaBoundedProbeTests(_PwshCase):
         # one is "could not determine" ($null).
         proc = self.run_with_module(
             "function Get-AttrCudaFakeFalseProbe { return $false }\n"
-            "$r = Invoke-AttrCudaBoundedProbe -FunctionName 'Get-AttrCudaFakeFalseProbe' -TimeoutMilliseconds 3000\n"
+            "$r = Invoke-AttrCudaBoundedProbe -FunctionName 'Get-AttrCudaFakeFalseProbe' -TimeoutMilliseconds 30000\n"
             f"[IO.File]::WriteAllText('{(self.tmp / 'r.json')}', (@{{ r = $r }} | ConvertTo-Json))\n"
         )
         self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
@@ -6775,7 +6783,7 @@ class InvokeAttrCudaBoundedProbeTests(_PwshCase):
         # first was masking this, since Add-Type is AppDomain-wide and a later bounded-probe call
         # would then find the type already there regardless of its own missing dependency.
         proc = self.run_with_module(
-            "$r = Invoke-AttrCudaBoundedProbe -FunctionName 'Get-AttrCudaScreensaverRunning' -TimeoutMilliseconds 3000\n"
+            "$r = Invoke-AttrCudaBoundedProbe -FunctionName 'Get-AttrCudaScreensaverRunning' -TimeoutMilliseconds 30000\n"
             "$direct = Get-AttrCudaScreensaverRunning\n"
             f"[IO.File]::WriteAllText('{(self.tmp / 'r.json')}', (@{{ r = $r; direct = $direct }} | ConvertTo-Json))\n"
         )
@@ -6809,7 +6817,7 @@ class InvokeAttrCudaBoundedProbeTests(_PwshCase):
         probe_script = self.tmp / "extracted.ps1"
         with probe_script.open("a", encoding="utf-8") as f:
             f.write(
-                "\n$r = Invoke-AttrCudaBoundedProbe -FunctionName 'Get-AttrCudaScreensaverRunning' -TimeoutMilliseconds 3000\n"
+                "\n$r = Invoke-AttrCudaBoundedProbe -FunctionName 'Get-AttrCudaScreensaverRunning' -TimeoutMilliseconds 30000\n"
                 "$direct = Get-AttrCudaScreensaverRunning\n"
                 f"[IO.File]::WriteAllText('{(self.tmp / 'r.json')}', (@{{ r = $r; direct = $direct }} | ConvertTo-Json))\n"
             )
