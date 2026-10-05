@@ -313,6 +313,80 @@ WORKFLOW_DELETED = (
     "        run: python -m flake8 tools\n"
 )
 
+# NA6-WORKFLOW-WHOLEFILE-1.  A trimmed copy of the real `pipeline_tests` run body in
+# .github/workflows/tests.yml, so the exact08 patch (CI-EXACT08-SHARD-BUDGET-1) and the
+# ff095bae (#253) widening can be replayed against it in every tool shape.  Inlined, not
+# read from `.claude-state`, which is gitignored and absent from every hosted checkout.
+SOLO_RACE_COMMENT = (
+    "          # LookAssistAnalysisRenderRace (LOOK-ASSIST-ANALYSIS-RENDER-RACE-1) renders the HQ"
+    " dual-ISO fixture before and after a level sync, 20-101 s each locally (229 s for the 4),"
+    " so it runs alone too.\n"
+)
+SOLO_LINE_253_BEFORE = (
+    "          $soloPattern = '^(LookAssistFixtureScene|LookAssistFlavorsFixture)\\.'\n"
+)
+SOLO_LINE_EXACT08_BEFORE = (
+    "          $soloPattern = "
+    "'^(LookAssistFixtureScene|LookAssistFlavorsFixture|LookAssistAnalysisRenderRace)\\.'\n"
+)
+SOLO_LINES_EXACT08_AFTER = (
+    "          # EXACT08-SHARD-BUDGET-1: two single tests dominate their windows. Measured on"
+    " the same\n"
+    "          # build, one process per test, so only the ratios carry:"
+    " GpuExportParityMatrixMissingDllFallback\n"
+    "          # IsByteInertAcrossConfigs is about 70 % of exact-08 (101 of 143 s), and"
+    " DngFramePayloadMatchesSave\n"
+    "          # DngFrameForPipelinePrep about 27 % of exact-05 (34 of 127 s). Each runs alone,"
+    " like the fixture\n"
+    "          # renders above, so the shared remainder of its window stops inheriting that"
+    " cost.\n"
+    "          $soloPattern = "
+    "'^(LookAssistFixtureScene|LookAssistFlavorsFixture|LookAssistAnalysisRenderRace)\\.|"
+    "^DualIsoPipeline\\.(GpuExportParityMatrixMissingDllFallbackIsByteInertAcrossConfigs|"
+    "DngFramePayloadMatchesSaveDngFrameForPipelinePrep)$'\n"
+)
+SOLO_RUN_HEAD = (
+    "jobs:\n"
+    "  pipeline_tests:\n"
+    "    runs-on: windows-latest\n"
+    "    steps:\n"
+    "      - name: Pipeline tests\n"
+    "        shell: pwsh\n"
+    "        run: |\n"
+    "          $testNames = & $exe --gtest_list_tests | Where-Object { $_ }\n"
+    "          # Every other window keeps its membership, minus those tests.\n"
+)
+SOLO_RUN_TAIL = (
+    "          $shards = @()\n"
+    "          for ($offset = 0; $offset -lt $testNames.Count; $offset += $testsPerShard) {\n"
+    "            $end = [Math]::Min($offset + $testsPerShard, $testNames.Count)\n"
+    "          }\n"
+    "          & $exe --gtest_filter=$filter --gtest_brief=1\n"
+    "          if ($LASTEXITCODE -ne 0) { exit 1 }\n"
+    "  hygiene:\n"
+    "    runs-on: ubuntu-latest\n"
+    "    steps:\n"
+    "      - name: Repo hygiene\n"
+    "        run: python -m unittest discover -s tools/repo_hygiene -p \"test_*.py\" -t .\n"
+)
+WORKFLOW_SOLO_BEFORE = (
+    SOLO_RUN_HEAD + SOLO_RACE_COMMENT + SOLO_LINE_EXACT08_BEFORE + SOLO_RUN_TAIL
+)
+WORKFLOW_SOLO_AFTER = (
+    SOLO_RUN_HEAD + SOLO_RACE_COMMENT + SOLO_LINES_EXACT08_AFTER + SOLO_RUN_TAIL
+)
+WORKFLOW_253_BEFORE = SOLO_RUN_HEAD + SOLO_LINE_253_BEFORE + SOLO_RUN_TAIL
+SOLO_TEST_LINE = "          & $exe --gtest_filter=$filter --gtest_brief=1\n"
+WORKFLOW_SOLO_STEP_DROPPED = WORKFLOW_SOLO_BEFORE.split("  hygiene:\n")[0]
+WORKFLOW_SOLO_CONTINUE = WORKFLOW_SOLO_BEFORE.replace(
+    "      - name: Repo hygiene\n",
+    "      - name: Repo hygiene\n        continue-on-error: true\n",
+)
+# A MOVE that also edits the body: the Batch Compile step changes job AND loses its target.
+WORKFLOW_MOVED_AND_TRIMMED = WORKFLOW_MOVED.replace(
+    "cmake --build build --target batch_compile", "cmake --build build"
+)
+
 TEST_BEFORE = "void tst::check() {\n    QVERIFY(ok);\n    QCOMPARE(a, b);\n}\n"
 TEST_WEAKENED = "void tst::check() {\n    // disabled during triage\n    QCOMPARE(a, b);\n}\n"
 
@@ -3133,6 +3207,9 @@ CASES = [
             "new_string": WORKFLOW_MOVED,
         },
         "expect": "ALLOW",
+        # NA6-WORKFLOW-WHOLEFILE-1: the arm reconstructs the WHOLE file, so the file must
+        # BE on the tmp board; an Edit of an absent workflow is refused (row below).
+        "fixture": "workflow_before",
     },
     {
         "name": "na6 test step deleted outright",
@@ -3145,6 +3222,207 @@ CASES = [
         },
         "expect": "DENY",
         "na": "NA-6",
+        "fixture": "workflow_before",
+    },
+    # ------------------------------------- NA6-WORKFLOW-WHOLEFILE-1, the whole-file arm
+    #
+    # The fragment predicate refused any Edit whose old_string spanned a `run:` header and
+    # changed its body (the exact08 solo-pattern widening was refused although it removes
+    # nothing), and let through a fragment that omitted the header (a deleted test line, an
+    # appended `; exit 0`) and every `Write`.  The ALLOW rows replay the exact08 patch in
+    # all three tool shapes plus the ff095bae (#253) widening; the DENY rows are the holes.
+    {
+        "name": "na6 wholefile exact08 single-line Edit",
+        "group": "na6",
+        "tool": "Edit",
+        "input": {
+            "file_path": "{BOARD}/.github/workflows/tests.yml",
+            "old_string": SOLO_LINE_EXACT08_BEFORE,
+            "new_string": SOLO_LINES_EXACT08_AFTER,
+        },
+        "expect": "ALLOW",
+        "fixture": "workflow_solo",
+    },
+    {
+        "name": "na6 wholefile exact08 Edit spanning the run header",
+        "group": "na6",
+        "tool": "Edit",
+        "input": {
+            "file_path": "{BOARD}/.github/workflows/tests.yml",
+            "old_string": SOLO_RUN_HEAD + SOLO_RACE_COMMENT + SOLO_LINE_EXACT08_BEFORE,
+            "new_string": SOLO_RUN_HEAD + SOLO_RACE_COMMENT + SOLO_LINES_EXACT08_AFTER,
+        },
+        "expect": "ALLOW",
+        "fixture": "workflow_solo",
+    },
+    {
+        "name": "na6 wholefile exact08 whole-file Write",
+        "group": "na6",
+        "tool": "Write",
+        "input": {
+            "file_path": "{BOARD}/.github/workflows/tests.yml",
+            "content": WORKFLOW_SOLO_AFTER,
+        },
+        "expect": "ALLOW",
+        "fixture": "workflow_solo",
+    },
+    {
+        "name": "na6 wholefile ff095bae 253 widening spanning the run header",
+        "group": "na6",
+        "tool": "Edit",
+        "input": {
+            "file_path": "{BOARD}/.github/workflows/tests.yml",
+            "old_string": SOLO_RUN_HEAD + SOLO_LINE_253_BEFORE,
+            "new_string": SOLO_RUN_HEAD + SOLO_RACE_COMMENT + SOLO_LINE_EXACT08_BEFORE,
+        },
+        "expect": "ALLOW",
+        "fixture": "workflow_253",
+    },
+    {
+        "name": "na6 wholefile Write of a new workflow",
+        "group": "na6",
+        "tool": "Write",
+        "input": {
+            "file_path": "{BOARD}/.github/workflows/new-suite.yml",
+            "content": WORKFLOW_BEFORE,
+        },
+        "expect": "ALLOW",
+    },
+    {
+        "name": "na6 wholefile fragment Edit deleting a test-invoking line",
+        "group": "na6",
+        "tool": "Edit",
+        "input": {
+            "file_path": "{BOARD}/.github/workflows/tests.yml",
+            "old_string": SOLO_TEST_LINE,
+            "new_string": "",
+        },
+        "expect": "DENY",
+        "na": "NA-6",
+        "reason_contains": "net removal",
+        "fixture": "workflow_solo",
+    },
+    {
+        "name": "na6 wholefile fragment Edit commenting out a test-invoking line",
+        "group": "na6",
+        "tool": "Edit",
+        "input": {
+            "file_path": "{BOARD}/.github/workflows/tests.yml",
+            "old_string": SOLO_TEST_LINE,
+            "new_string": SOLO_TEST_LINE.replace("& $exe", "# & $exe"),
+        },
+        "expect": "DENY",
+        "na": "NA-6",
+        "reason_contains": "net removal",
+        "fixture": "workflow_solo",
+    },
+    {
+        "name": "na6 wholefile fragment Edit appending exit 0",
+        "group": "na6",
+        "tool": "Edit",
+        "input": {
+            "file_path": "{BOARD}/.github/workflows/tests.yml",
+            "old_string": SOLO_TEST_LINE,
+            "new_string": SOLO_TEST_LINE.replace("--gtest_brief=1", "--gtest_brief=1; exit 0"),
+        },
+        "expect": "DENY",
+        "na": "NA-6",
+        "reason_contains": "`exit 0`",
+        "fixture": "workflow_solo",
+    },
+    {
+        "name": "na6 wholefile fragment Edit appending or-true",
+        "group": "na6",
+        "tool": "Edit",
+        "input": {
+            "file_path": "{BOARD}/.github/workflows/tests.yml",
+            "old_string": SOLO_TEST_LINE,
+            "new_string": SOLO_TEST_LINE.replace("--gtest_brief=1", "--gtest_brief=1 || true"),
+        },
+        "expect": "DENY",
+        "na": "NA-6",
+        "reason_contains": "`|| true`",
+        "fixture": "workflow_solo",
+    },
+    {
+        "name": "na6 wholefile Write dropping a step",
+        "group": "na6",
+        "tool": "Write",
+        "input": {
+            "file_path": "{BOARD}/.github/workflows/tests.yml",
+            "content": WORKFLOW_SOLO_STEP_DROPPED,
+        },
+        "expect": "DENY",
+        "na": "NA-6",
+        "reason_contains": "net removal",
+        "fixture": "workflow_solo",
+    },
+    {
+        "name": "na6 wholefile Write adding continue-on-error",
+        "group": "na6",
+        "tool": "Write",
+        "input": {
+            "file_path": "{BOARD}/.github/workflows/tests.yml",
+            "content": WORKFLOW_SOLO_CONTINUE,
+        },
+        "expect": "DENY",
+        "na": "NA-6",
+        "reason_contains": "continue-on-error",
+        "fixture": "workflow_solo",
+    },
+    {
+        "name": "na6 wholefile step move that also removes a token",
+        "group": "na6",
+        "tool": "Edit",
+        "input": {
+            "file_path": "{BOARD}/.github/workflows/tests.yml",
+            "old_string": WORKFLOW_BEFORE,
+            "new_string": WORKFLOW_MOVED_AND_TRIMMED,
+        },
+        "expect": "DENY",
+        "na": "NA-6",
+        "reason_contains": "'--target'",
+        "fixture": "workflow_before",
+    },
+    {
+        "name": "na6 wholefile Edit of an absent workflow fails closed",
+        "group": "na6",
+        "tool": "Edit",
+        "input": {
+            "file_path": "{BOARD}/.github/workflows/tests.yml",
+            "old_string": SOLO_LINE_EXACT08_BEFORE,
+            "new_string": SOLO_LINES_EXACT08_AFTER,
+        },
+        "expect": "DENY",
+        "na": "NA-6",
+        "reason_contains": "not on disk",
+    },
+    {
+        "name": "na6 wholefile Edit whose old_string is not in the file fails closed",
+        "group": "na6",
+        "tool": "Edit",
+        "input": {
+            "file_path": "{BOARD}/.github/workflows/tests.yml",
+            "old_string": SOLO_LINE_253_BEFORE,
+            "new_string": SOLO_LINE_EXACT08_BEFORE,
+        },
+        "expect": "DENY",
+        "na": "NA-6",
+        "reason_contains": "old_string is not in",
+        "fixture": "workflow_solo",
+    },
+    {
+        "name": "na6 wholefile unreadable workflow fails closed",
+        "group": "na6",
+        "tool": "Write",
+        "input": {
+            "file_path": "{BOARD}/.github/workflows/tests.yml",
+            "content": WORKFLOW_SOLO_AFTER,
+        },
+        "expect": "DENY",
+        "na": "NA-6",
+        "reason_contains": "unreadable",
+        "fixture": "workflow_unreadable",
     },
     # -------------------------------- NA-3's `claude auth` arm, bounded by the REGISTER
     #
@@ -4547,6 +4825,35 @@ def fixture_existing_ledger(paths):
     return {}
 
 
+def _board_workflow(paths):
+    return os.path.join(paths["BOARD"], ".github", "workflows", "tests.yml")
+
+
+def fixture_workflow_before(paths):
+    """NA6-WORKFLOW-WHOLEFILE-1: the arm judges the whole file, so it must exist."""
+    _write(_board_workflow(paths), WORKFLOW_BEFORE)
+    return {}
+
+
+def fixture_workflow_solo(paths):
+    _write(_board_workflow(paths), WORKFLOW_SOLO_BEFORE)
+    return {}
+
+
+def fixture_workflow_253(paths):
+    _write(_board_workflow(paths), WORKFLOW_253_BEFORE)
+    return {}
+
+
+def fixture_workflow_unreadable(paths):
+    """A workflow whose bytes are not UTF-8: the comparison cannot be made, so DENY."""
+    path = _board_workflow(paths)
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    with open(path, "wb") as handle:
+        handle.write(b"jobs:\n  t:\n    steps:\n      - run: \xff\xfe\xfa pytest\n")
+    return {}
+
+
 def fixture_lane_prompt_unset(paths):
     """THE UNRESOLVABLE-REFERENCE ROWS: `MLV_LANE_PROMPT` bound to NOTHING, stated explicitly.
 
@@ -5377,6 +5684,11 @@ FIXTURES = {
     "existing_receipt": fixture_existing_receipt,
     # HOOK-FALSE-POSITIVE-1
     "existing_ledger": fixture_existing_ledger,
+    # NA6-WORKFLOW-WHOLEFILE-1
+    "workflow_before": fixture_workflow_before,
+    "workflow_solo": fixture_workflow_solo,
+    "workflow_253": fixture_workflow_253,
+    "workflow_unreadable": fixture_workflow_unreadable,
     # The UNSET half of the expansion pairs, and the unresolvable-reference rows.
     "lane_prompt_unset": fixture_lane_prompt_unset,
     "board_root_unset": fixture_board_root_unset,
@@ -7927,6 +8239,87 @@ class OwnerConsentedFootageTests(unittest.TestCase):
         self.assertIn("tools/gates/verify_consented_footage.py", self.module.NA10_GUARDED_TAILS)
         na10 = [item for item in register["items"] if item["id"] == "NA-10"]
         self.assertIn("tools/gates/verify_consented_footage.py", na10[0]["act"])
+
+
+# NA6-WORKFLOW-WHOLEFILE-1: one example per skip/neutralise marker, keyed by the hook's OWN
+# label, so a marker added to or dropped from `_NA6_WORKFLOW_MARKERS` without a row here
+# goes red (`test_every_marker_has_an_example`).
+NA6_MARKER_EXAMPLES = {
+    "continue-on-error": "      - name: t\n        continue-on-error: true\n        run: pytest\n",
+    "`|| true`": "      - run: pytest || true\n",
+    "`|| :`": "      - run: pytest || :\n",
+    "`exit 0`": "      - run: pytest; exit 0\n",
+    "`[Environment]::Exit(0)`": "      - run: pytest; [Environment]::Exit(0)\n",
+    "`$LASTEXITCODE = 0`": "      - run: |\n          pytest\n          $global:LASTEXITCODE = 0\n",
+    "`set +e`": "      - run: |\n          set +e\n          pytest\n",
+    "`$ErrorActionPreference = Continue`": (
+        "      - run: |\n          $ErrorActionPreference = 'SilentlyContinue'\n          pytest\n"
+    ),
+    "`-SkipTest`": "      - run: pytest; ./build.ps1 -SkipTests\n",
+    "a negative --gtest_filter": "      - run: pytest; ./t --gtest_filter=Suite.*:-Suite.Slow\n",
+    "GTEST_FILTER": "      - run: pytest\n        env:\n          GTEST_FILTER: Foo.*\n",
+    "`if: false`": "      - name: t\n        if: ${{ false }}\n        run: pytest\n",
+    "QSKIP": "      - run: pytest; echo QSKIP\n",
+    "pytest --deselect": "      - run: pytest --deselect tests/a.py::t\n",
+    "pytest `-k not`": "      - run: pytest -k \"not slow\"\n",
+    "ctest --exclude-regex": "      - run: pytest; ctest --exclude-regex Slow\n",
+    "ctest -E": "      - run: pytest; ctest --output-on-failure -E Slow\n",
+}
+NA6_MARKER_BASE = "jobs:\n  t:\n    steps:\n      - run: pytest\n"
+
+
+class Na6WorkflowWholeFileMarkerTests(unittest.TestCase):
+    """NA6-WORKFLOW-WHOLEFILE-1: every marker DENIES when added and ALLOWS when already there.
+
+    The predicate is a COUNT comparison on the whole file with comments stripped, so the
+    ALLOW half is the same text on both sides -- a marker that was there before is not
+    this edit's weakening -- and the comment row proves prose about a marker is not one.
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        cls.module = _load_hook_module()
+
+    def _judge(self, before, after):
+        self.module._judge_workflow_whole_file(before, after, ".github/workflows/t.yml")
+
+    def test_every_marker_has_an_example(self):
+        labels = [label for label, _ in self.module._NA6_WORKFLOW_MARKERS]
+        self.assertEqual(sorted(labels), sorted(NA6_MARKER_EXAMPLES))
+
+    def test_a_marker_named_in_a_comment_is_not_a_marker(self):
+        after = NA6_MARKER_BASE + "      # never append || true or exit 0 here\n"
+        self._judge(NA6_MARKER_BASE, after)
+
+    def test_an_added_test_is_not_a_removal(self):
+        self._judge(NA6_MARKER_BASE, NA6_MARKER_BASE.replace("pytest", "pytest tests extra"))
+
+    def test_a_reordered_body_with_the_same_tokens_is_allowed(self):
+        before = NA6_MARKER_BASE + "      - run: ctest --output-on-failure\n"
+        after = (
+            "jobs:\n  t:\n    steps:\n      - run: ctest --output-on-failure\n"
+            "      - run: pytest\n"
+        )
+        self._judge(before, after)
+
+
+def _make_marker_tests(label, example):
+    def denies(self):
+        with self.assertRaises(self.module.Deny) as caught:
+            self._judge(NA6_MARKER_BASE, NA6_MARKER_BASE + example)
+        self.assertIn(label, str(caught.exception.args))
+
+    def allows_when_already_present(self):
+        self._judge(NA6_MARKER_BASE + example, NA6_MARKER_BASE + example)
+
+    return denies, allows_when_already_present
+
+
+for _index, (_label, _example) in enumerate(NA6_MARKER_EXAMPLES.items()):
+    _deny, _allow = _make_marker_tests(_label, _example)
+    _stem = "%02d_%s" % (_index, re.sub(r"[^a-z0-9]+", "_", _label.lower()).strip("_"))
+    setattr(Na6WorkflowWholeFileMarkerTests, "test_marker_added_denies_" + _stem, _deny)
+    setattr(Na6WorkflowWholeFileMarkerTests, "test_marker_kept_allows_" + _stem, _allow)
 
 
 def _slug(name):

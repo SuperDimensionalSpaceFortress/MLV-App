@@ -3605,6 +3605,133 @@ def _run_bodies(text):
     return bodies
 
 
+# NA6-WORKFLOW-WHOLEFILE-1.  The workflow arm judges the WHOLE FILE, before and after, for
+# both `Edit` and `Write`.  Judging the edit FRAGMENT was too broad (an `old_string` spanning
+# a `run:` header was refused whenever its body changed at all, even when the change only
+# ADDED a test to a solo pattern) and blind (a fragment without the `run:` header could
+# delete a test-invoking line or append `; exit 0`, and a `Write` was never compared).
+#
+# The predicate, on the reconstructed files:
+#   (1) the MULTISET of word/flag tokens of every `run:` body, shell comments stripped, in
+#       the OLD file must be contained in the NEW file's -- a dropped invocation, filter,
+#       shard, flag or argument is a shortfall.  A step MOVED with its body intact
+#       removes nothing, so the O108 move exception holds by construction;
+#   (2) no skip/neutralise marker of _NA6_WORKFLOW_MARKERS may occur more often in the new
+#       file (comments stripped) than in the old one.
+# The marker list is explicit and every entry has its own test row.  A file the hook
+# cannot read, or an Edit it cannot reconstruct, is refused (fail closed).
+_NA6_TOKEN_RX = re.compile(r"-{0,2}\w+")
+_NA6_COMMENT_RX = re.compile(r"(?:^|(?<=\s))#.*$")
+_NA6_WORKFLOW_MARKERS = (
+    ("continue-on-error", re.compile(r"\bcontinue-on-error\b", re.I)),
+    ("`|| true`", re.compile(r"\|\|\s*true\b", re.I)),
+    ("`|| :`", re.compile(r"\|\|\s*:(?=\s|;|$)")),
+    ("`exit 0`", re.compile(r"\bexit\s+0\b", re.I)),
+    ("`[Environment]::Exit(0)`", re.compile(r"::Exit\(\s*0\s*\)", re.I)),
+    ("`$LASTEXITCODE = 0`", re.compile(r"\$(?:global:)?LASTEXITCODE\s*=\s*0\b", re.I)),
+    ("`set +e`", re.compile(r"\bset\s+\+e\b")),
+    (
+        "`$ErrorActionPreference = Continue`",
+        re.compile(r"\$ErrorActionPreference\s*=\s*['\"]?(?:Silently)?Continue\b", re.I),
+    ),
+    ("`-SkipTest`", re.compile(r"(?<![\w-])-SkipTests?\b", re.I)),
+    (
+        "a negative --gtest_filter",
+        re.compile(r"--gtest_filter[ =]['\"]?(?:[^\s'\"]*:)?-", re.I),
+    ),
+    ("GTEST_FILTER", re.compile(r"\bGTEST_FILTER\b", re.I)),
+    ("`if: false`", re.compile(
+        r"^\s*(?:-\s*)?if:\s*(?:false|0|\$\{\{\s*false\s*\}\})\s*$", re.I | re.M
+    )),
+    ("QSKIP", re.compile(r"\bQSKIP\b")),
+    ("pytest --deselect", re.compile(r"--deselect\b")),
+    ("pytest `-k not`", re.compile(r"(?<![\w-])-k\s+['\"]?not\b")),
+    ("ctest --exclude-regex", re.compile(r"--exclude-regex\b")),
+    ("ctest -E", re.compile(r"\bctest\b[^\n]*\s-E\b")),
+)
+
+
+def _na6_strip_comments(text):
+    return "\n".join(_NA6_COMMENT_RX.sub("", line) for line in text.split("\n"))
+
+
+def _na6_run_tokens(text):
+    counts = {}
+    for body in _run_bodies(_na6_strip_comments(text)):
+        for token in _NA6_TOKEN_RX.findall(body):
+            counts[token] = counts.get(token, 0) + 1
+    return counts
+
+
+def _workflow_whole_file(ctx, path_norm):
+    """The workflow file before and after this Write/Edit, with LF line endings."""
+    path = ctx.path
+    if path and not os.path.isabs(path) and ctx.project_dir_raw:
+        path = os.path.join(ctx.project_dir_raw, path)
+    exists = bool(path) and os.path.isfile(path)
+    before = None
+    if exists:
+        try:
+            with open(path, "r", encoding="utf-8") as handle:
+                before = handle.read().replace("\r\n", "\n")
+        except Exception:
+            raise Deny(
+                "NA-6",
+                "the workflow %s is unreadable, so the whole-file test comparison cannot be "
+                "made (fail closed)" % path_norm,
+            )
+    new_text = (ctx.new_text or "").replace("\r\n", "\n")
+    if ctx.tool == "Write":
+        return before or "", new_text
+    old_string = ctx.old_text
+    if old_string is None or ctx.new_text is None:
+        raise Deny("NA-6", "an Edit of %s without old_string/new_string" % path_norm)
+    old_string = old_string.replace("\r\n", "\n")
+    if before is None:
+        if old_string == "":
+            return "", new_text  # the Edit tool's create form
+        raise Deny(
+            "NA-6",
+            "the workflow %s is not on disk, so the Edit cannot be reconstructed "
+            "(fail closed)" % path_norm,
+        )
+    if old_string == "":
+        raise Deny("NA-6", "an empty old_string against the existing %s" % path_norm)
+    occurrences = before.count(old_string)
+    if occurrences == 0:
+        raise Deny(
+            "NA-6",
+            "old_string is not in %s, so the Edit cannot be reconstructed (fail closed)"
+            % path_norm,
+        )
+    if ctx.tool_input.get("replace_all") is True:
+        return before, before.replace(old_string, new_text)
+    if occurrences > 1:
+        raise Deny(
+            "NA-6",
+            "old_string occurs %d times in %s without replace_all (fail closed)"
+            % (occurrences, path_norm),
+        )
+    return before, before.replace(old_string, new_text, 1)
+
+
+def _judge_workflow_whole_file(before, after, path_norm):
+    old_tokens = _na6_run_tokens(before)
+    new_tokens = _na6_run_tokens(after)
+    for token in sorted(old_tokens):
+        if new_tokens.get(token, 0) < old_tokens[token]:
+            raise Deny(
+                "NA-6",
+                "net removal of a workflow test step: run-body token %r falls from %d to %d "
+                "in %s" % (token, old_tokens[token], new_tokens.get(token, 0), path_norm),
+            )
+    old_plain = _na6_strip_comments(before)
+    new_plain = _na6_strip_comments(after)
+    for label, marker in _NA6_WORKFLOW_MARKERS:
+        if len(marker.findall(new_plain)) > len(marker.findall(old_plain)):
+            raise Deny("NA-6", "%s added to %s neutralises a test" % (label, path_norm))
+
+
 def rule_na6(ctx):
     if ctx.tool in SHELL_TOOLS:
         acts = shell_acts(ctx.command)
@@ -3625,13 +3752,9 @@ def rule_na6(ctx):
     if has_seg(path_norm, WORKFLOW_TAIL):
         if "continue-on-error" in new_text.lower():
             raise Deny("NA-6", "continue-on-error in a workflow makes a red test green")
-        if old_text is not None:
-            # The predicate is NET removal across .github/workflows/*.yml, never per-edit:
-            # a step MOVED with a byte-identical `run:` body removes nothing (O108).
-            after = _run_bodies(new_text)
-            removed = [body for body in _run_bodies(old_text) if body not in after]
-            if removed:
-                raise Deny("NA-6", "net removal of a workflow test step: %r" % removed[0][:80])
+        if ctx.tool in ("Edit", "Write"):
+            before, after = _workflow_whole_file(ctx, path_norm)
+            _judge_workflow_whole_file(before, after, path_norm)
         return
 
     if path_norm.endswith(".pro") and old_text is not None:
