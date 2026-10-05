@@ -217,6 +217,60 @@ int getMlvProcessedFrame8ScaledFromReconnedRaw16(mlvObject_t * video,
                                                  int threads,
                                                  int scaleFactor,
                                                  int allowScale1StateDebayer);
+
+/* CPU-DUALISO-AT-PREVIEW-SCALE-1: phase-3 dual-ISO reconstruction at the
+ * playback preview scale. The recon worker reconstructs a Bayer shrunk by the
+ * Phase 4B kernels (pl_downsample_bayer_to_bayer_{2,4,8}x keep whole 4-row ISO
+ * blocks) instead of the full sensor, and the process stage debayers it at that
+ * size. Playback only: export and full-quality entries never call these. */
+typedef struct
+{
+    int scale;              /* reduced recon scale (2/4/8); 1 = full resolution */
+    int fullWidth;
+    int fullHeight;
+    int sourceHeight;       /* rows the kernel reads (height cropped to its block) */
+    int reducedWidth;
+    int reducedHeight;
+    int fullResFixes;       /* focus/bad pixel/stripes/pattern run at full res first */
+    const char * reason;    /* "none" when reduced, otherwise why full resolution */
+} mlvDualIsoPreviewScaleRecon_t;
+
+/* Decide the recon scale for `requestedScale`. Returns 1 when the reduced path
+ * may run (plan->scale > 1), 0 when the frame must be reconstructed at full
+ * resolution (plan->reason says why). Kill switch:
+ * MLVAPP_DISABLE_CPU_DUALISO_PREVIEW_SCALE_RECON=1. */
+int mlvDualIsoPreviewScaleReconPlan(mlvObject_t * video,
+                                    int requestedScale,
+                                    mlvDualIsoPreviewScaleRecon_t * plan);
+/* Run the planned reduced recon: seed the ISO pattern from `fullRaw`, apply the
+ * full-res fixes in place when planned, shrink into `reducedOut` (capacity
+ * reducedWidth*reducedHeight words) and reconstruct it on `worker` without
+ * publishing estimates to the shared llrawproc state. Returns 1 on success,
+ * 0 if it failed before touching `fullRaw` (reconstruct it at full res), -1 if
+ * it failed after the full-res fixes changed `fullRaw` (decode it again). */
+int mlvDualIsoPreviewScaleReconRun(mlvObject_t * video,
+                                   const mlvDualIsoPreviewScaleRecon_t * plan,
+                                   uint16_t * fullRaw,
+                                   uint16_t * reducedOut,
+                                   llrawprocWorkerState_t * worker,
+                                   int threads,
+                                   double * fullResFixesMs,
+                                   double * downsampleMs);
+/* Process stage for a reduced recon (same envelope contract as
+ * getMlvProcessedFrame8ScaledFromReconnedRaw16). The frame is published under
+ * mlvReducedReconProcessedFrameSignature(), never the full-recon signature, so
+ * a paused or scrubbed frame can never be served the preview recon. */
+int getMlvProcessedFrame8ScaledFromReducedReconnedRaw16(mlvObject_t * video,
+                                                        uint64_t frameIndex,
+                                                        const uint16_t * reducedReconnedRaw,
+                                                        int reducedWidth,
+                                                        int reducedHeight,
+                                                        int reconScale,
+                                                        uint8_t * outputFrame,
+                                                        int threads,
+                                                        int scaleFactor);
+uint64_t mlvReducedReconProcessedFrameSignature(uint64_t fullReconSignature, int reconScale);
+uint64_t mlvProcessedFrameSignatureWithScale(mlvObject_t * video, uint64_t frameIndex, int scaleFactor);
 void getMlvProcessedFrame16Scaled(mlvObject_t * video,
                                   uint64_t frameIndex,
                                   uint16_t * outputFrame,

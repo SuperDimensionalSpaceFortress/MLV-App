@@ -24068,6 +24068,12 @@ void MainWindow::beginPlaybackSmokeTelemetry( void )
     m_playbackSmokeDebayerBasicU16Avx2AvailableFrames = 0;
     m_playbackSmokeDebayerBasicU16Avx2UsedFrames = 0;
     m_playbackSmokeProcessed8CacheHits = 0;
+    m_playbackSmokeCpuDualIsoReducedReconFrames = 0;
+    m_playbackSmokeCpuDualIsoFullReconFrames = 0;
+    m_playbackSmokeCpuDualIsoReconScaleLast = 0;
+    m_playbackSmokeCpuDualIsoReconFallbackReasonLast.clear();
+    m_playbackSmokeCpuDualIsoReconFullResFixesSumMs = 0.0;
+    m_playbackSmokeCpuDualIsoReconDownsampleSumMs = 0.0;
     m_playbackSmokeProcessed8PrefetchHits = 0;
     m_playbackSmokeRawPrefetchHits = 0;
     m_playbackSmokeQueuedPlaybackDropSum = 0;
@@ -25065,6 +25071,28 @@ void MainWindow::notePlaybackSmokePresentedFrame(
         ++m_playbackSmokeProcessed8DirectPathFrames;
     if( telemetryBoolValue( timing, "processed8_cache_hit" ) )
         ++m_playbackSmokeProcessed8CacheHits;
+    if( timing.contains( QStringLiteral("cpu_dualiso_recon_scale") ) )
+    {
+        const int reconScale = telemetryIntValue( timing, "cpu_dualiso_recon_scale" );
+        m_playbackSmokeCpuDualIsoReconScaleLast = reconScale;
+        if( reconScale > 1
+         && telemetryBoolValue( timing, "cpu_dualiso_reduced_recon_consumed" ) )
+        {
+            ++m_playbackSmokeCpuDualIsoReducedReconFrames;
+        }
+        else
+        {
+            ++m_playbackSmokeCpuDualIsoFullReconFrames;
+            m_playbackSmokeCpuDualIsoReconFallbackReasonLast =
+                reconScale > 1
+                    ? QStringLiteral("reduced recon not consumed by the process stage")
+                    : telemetryStringValue( timing, "cpu_dualiso_recon_fallback_reason" );
+        }
+        m_playbackSmokeCpuDualIsoReconFullResFixesSumMs +=
+            telemetryDoubleValue( timing, "cpu_dualiso_recon_fullres_fixes_ms" );
+        m_playbackSmokeCpuDualIsoReconDownsampleSumMs +=
+            telemetryDoubleValue( timing, "cpu_dualiso_recon_downsample_ms" );
+    }
     if( borrowedPreparedRgb8Bytes > 0.0 )
     {
         ++m_playbackSmokeBorrowedPreparedRgb8Frames;
@@ -27288,6 +27316,22 @@ void MainWindow::finishPlaybackSmokeTelemetry( const char *reason )
                .arg( m_playbackSmokeProcessed8CacheHits )
                .arg( m_playbackSmokeProcessed8PrefetchHits )
                .arg( m_playbackSmokeProcessed8DirectPathFrames );
+
+    /* CPU-DUALISO-AT-PREVIEW-SCALE-1: which recon scale the phase-3 worker ran
+     * for the presented frames (avg_llrawproc_* in cpu_summary is the recon at
+     * that scale; the full-res fixes and the shrink are reported here). */
+    qInfo().noquote()
+        << QStringLiteral(
+               "playback_smoke.cpu_dualiso_recon_scale_summary session=%1 "
+               "reduced_recon_frames=%2 full_recon_frames=%3 recon_scale_last=%4 "
+               "avg_fullres_fixes_ms=%5 avg_downsample_ms=%6 fallback_reason_last=\"%7\"" )
+               .arg( static_cast<qulonglong>( m_playbackSmokeSessionId ) )
+               .arg( m_playbackSmokeCpuDualIsoReducedReconFrames )
+               .arg( m_playbackSmokeCpuDualIsoFullReconFrames )
+               .arg( m_playbackSmokeCpuDualIsoReconScaleLast )
+               .arg( avgSmokeMs( m_playbackSmokeCpuDualIsoReconFullResFixesSumMs ), 0, 'f', 3 )
+               .arg( avgSmokeMs( m_playbackSmokeCpuDualIsoReconDownsampleSumMs ), 0, 'f', 3 )
+               .arg( m_playbackSmokeCpuDualIsoReconFallbackReasonLast );
 
     qInfo().noquote()
         << QStringLiteral(
