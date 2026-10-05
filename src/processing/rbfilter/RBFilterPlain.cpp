@@ -748,7 +748,9 @@ void CRBFilterPlain::filter(uint16_t* __restrict img_src, uint16_t* __restrict i
         m_last_timing.range_table_ms = (omp_get_wtime() - range_table_start) * 1000.0;
     }
 
-    if (m_parallel_vertical)
+    // The parallel path is bit-exact for 3 channels only; 1 and 4 channels keep
+    // the legacy passes whatever the opt-in says.
+    if (m_parallel_vertical && rgb3)
     {
         m_last_filter_parallel = true;
         filterColumnParallel(img_src, img_dst, width, height, channel, rgb3,

@@ -611,7 +611,10 @@ TEST(ProcessingFilters, RbfFilterParallelVerticalMatchesSerialBitExact)
                  * as i*3+c, so neighbouring pixels overlap and its result
                  * depends on thread timing. That pass is not touched here and
                  * every product caller uses 3 channels, so the 4-channel cases
-                 * pin one thread to keep the horizontal input deterministic. */
+                 * pin one thread to keep the horizontal input deterministic.
+                 * filter() runs the legacy passes for 4 channels even when the
+                 * parallel filter is requested (RbfParallelFilterIsRgb3Only),
+                 * so these arms pin that equivalence, not a parallel race. */
                 const int reference_threads = channel == 4 ? 1 : 4;
                 RbfRunResult serial;
                 {
@@ -790,6 +793,127 @@ TEST(ProcessingFilters, RbfParallelFilterIsOptInByDefault)
     ASSERT_TRUE(filter.lastFilterParallel());
 }
 
+TEST(ProcessingFilters, RbfParallelOverrideBeatsEnvBothWays)
+{
+    /* The override is how the bit-exact tests get their serial arm, so it must
+     * win over MLVAPP_RBF_PARALLEL=1: mode 0 forces the legacy passes, mode 1
+     * forces the parallel filter, mode -1 (and any negative) follows the env. */
+    RbfParallelEnvScope env;
+    env.set("1");
+    ASSERT_EQ(1, recursive_bf_parallel_enabled());
+    ASSERT_EQ(1, rbf_wrapper_dispatch_parallel());
+
+    recursive_bf_set_parallel_vertical_override(0);
+    ASSERT_EQ(0, recursive_bf_parallel_enabled());
+    ASSERT_EQ(0, rbf_wrapper_dispatch_parallel());
+
+    recursive_bf_set_parallel_vertical_override(-1);
+    ASSERT_EQ(1, recursive_bf_parallel_enabled());
+    ASSERT_EQ(1, rbf_wrapper_dispatch_parallel());
+
+    recursive_bf_set_parallel_vertical_override(0);
+    recursive_bf_set_parallel_vertical_override(-7);
+    ASSERT_EQ(1, rbf_wrapper_dispatch_parallel());
+
+    /* Override 1 wins over a disabling env too. */
+    env.set("off");
+    ASSERT_EQ(0, rbf_wrapper_dispatch_parallel());
+    recursive_bf_set_parallel_vertical_override(1);
+    ASSERT_EQ(1, rbf_wrapper_dispatch_parallel());
+    recursive_bf_set_parallel_vertical_override(0);
+    ASSERT_EQ(0, rbf_wrapper_dispatch_parallel());
+}
+
+TEST(ProcessingFilters, RbfParallelFilterIsRgb3Only)
+{
+    /* The parallel filter is bit-exact for 3 channels only. With 1 or 4 the
+     * legacy indexing (i*3+c) overlaps or overruns and its result depends on
+     * thread timing, so both the filter and the wrapper must keep the legacy
+     * passes for them even when the parallel filter is enabled. */
+#ifdef _OPENMP
+    OpenMpThreadCountScope threads(1); /* the 4-channel legacy passes race */
+#endif
+    const int width = 24;
+    const int height = 16;
+    const int channels[] = { 1, 3, 4 };
+    for( int channel : channels )
+    {
+        /* Legacy non-RGB3 passes index pixel i at i*3+c, so give every buffer
+         * room for 3 floats/samples per pixel. */
+        const int slots = std::max(channel, 3);
+        std::vector<uint16_t> source = make_rbf_stress_image(width, height, slots, 5u + channel);
+        std::vector<uint16_t> output(source.size(), 0);
+        CRBFilterPlain filter;
+        filter.reserveMemory(width, height * slots / channel, channel);
+        filter.setParallelVertical(true);
+        filter.filter(source.data(), output.data(), 0.0025f, 0.165f, width, height, channel);
+        if( channel == 3 )
+        {
+            ASSERT_TRUE(filter.lastFilterParallel());
+        }
+        else
+        {
+            if( filter.lastFilterParallel() )
+            {
+                std::fprintf(stderr, "[RBF-PARALLEL] channel %d ran the parallel filter\n", channel);
+            }
+            ASSERT_TRUE(!filter.lastFilterParallel());
+        }
+    }
+
+    /* Through the wrapper with the parallel filter enabled by env and by
+     * override: RGB3 runs it, 4 channels keep the legacy passes. */
+    RbfParallelEnvScope env;
+    for( int forced = 0; forced < 2; ++forced )
+    {
+        env.set("1");
+        if( forced ) recursive_bf_set_parallel_vertical_override(1);
+        ASSERT_EQ(1, rbf_wrapper_dispatch_parallel());
+        std::vector<uint16_t> source4 = make_rbf_stress_image(width, height, 4, 21u);
+        std::vector<uint16_t> output4(source4.size(), 0);
+        recursive_bf_wrap(source4.data(), output4.data(), 0.0025f, 0.165f, width, height, 4);
+        ASSERT_EQ(0, recursive_bf_last_filter_was_parallel());
+    }
+}
+
+TEST(ProcessingFilters, RbfLegacyOutputMatchesFrozenHashes)
+{
+    /* Frozen oracle for the shipped default: the differential tests compare the
+     * legacy passes with the parallel ones, so a change to arithmetic they
+     * share (e.g. getDiffFactorRgb3) would move both references unseen. These
+     * hashes were recorded from the legacy passes at da8075d9. */
+    struct Case { int width; int height; bool lut; const char * expected; };
+    const Case cases[] = {
+        { 64, 48, false, "02bceda852799a54875685f6457f66a01de51c239b442b35e950509ea6a67433" },
+        { 65, 47, true, "891075248f1339a2313e6c521a9c6ce6051292ccf77eb7cdf6669491fdec1d15" },
+    };
+    std::vector<uint16_t> lut(65536);
+    for( std::size_t i = 0; i < lut.size(); ++i )
+    {
+        const uint32_t value = static_cast<uint32_t>(i);
+        lut[i] = static_cast<uint16_t>((value * 257u + (value >> 3) + 19u) & 0xffffu);
+    }
+    for( const Case & c : cases )
+    {
+        const std::vector<uint16_t> input =
+            make_rbf_stress_image(c.width, c.height, 3, static_cast<uint32_t>(c.width * 131 + c.height * 7 + 3));
+        RbfRunResult result;
+        {
+#ifdef _OPENMP
+            OpenMpThreadCountScope threads(1);
+#endif
+            result = run_rbf_filter(false, false, input, c.width, c.height, 3, c.lut ? lut.data() : nullptr, nullptr);
+        }
+        const std::string actual = hash_image(result.output);
+        if( actual != c.expected )
+        {
+            std::fprintf(stderr, "[RBF-LEGACY] %dx%d lut=%d hash=%s expected=%s\n",
+                         c.width, c.height, c.lut ? 1 : 0, actual.c_str(), c.expected);
+        }
+        ASSERT_EQ(std::string(c.expected), actual);
+    }
+}
+
 TEST(ProcessingFilters, RbfParallelVerticalLeavesPlaybackShBlurUnchanged)
 {
     /* Playback's S/H blur (the RBF on the standard x1 lane) must be
@@ -798,11 +922,16 @@ TEST(ProcessingFilters, RbfParallelVerticalLeavesPlaybackShBlurUnchanged)
      * ExportFramesUnchanged. */
     ProcessingPlaybackPreviewModeScope playback_scope;
     processingResetShadowsHighlightsQuarterresEnvCacheForTesting();
+    /* With MLVAPP_RBF_PARALLEL=1 exported the override must still pick the
+     * arm, or the serial arm would compare parallel against parallel. */
+    RbfParallelEnvScope env;
+    env.set("1");
 
     const int width = 182;
     const int height = 121;
     const std::vector<uint16_t> input = make_rbf_stress_image(width, height, 3, 77u);
 
+    int last_dispatch = -1;
     auto render_playback_blur = [&](int mode) {
         recursive_bf_set_parallel_vertical_override(mode);
         processingSetPlaybackPreviewMode(1);
@@ -823,6 +952,7 @@ TEST(ProcessingFilters, RbfParallelVerticalLeavesPlaybackShBlurUnchanged)
                 blur.assign(data, data + static_cast<std::size_t>(blur_width) * blur_height * 3u);
             }
         }
+        last_dispatch = recursive_bf_last_filter_was_parallel();
         freeProcessingObject(processing);
         return blur;
     };
@@ -835,6 +965,7 @@ TEST(ProcessingFilters, RbfParallelVerticalLeavesPlaybackShBlurUnchanged)
         serial_blur = render_playback_blur(0);
     }
     ASSERT_TRUE(!serial_blur.empty());
+    ASSERT_EQ(0, last_dispatch);
 
     const int thread_counts[] = { 1, 3, 8 };
     for( int threads_count : thread_counts )
@@ -843,6 +974,7 @@ TEST(ProcessingFilters, RbfParallelVerticalLeavesPlaybackShBlurUnchanged)
         OpenMpThreadCountScope threads(threads_count);
 #endif
         ASSERT_EQ(hash_image(serial_blur), hash_image(render_playback_blur(1)));
+        ASSERT_EQ(1, last_dispatch);
     }
     recursive_bf_set_parallel_vertical_override(-1);
 }
