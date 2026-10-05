@@ -64,7 +64,9 @@ extern void recursive_bf_get_last_timing(recursive_bf_timing_t * timing);
 /* MLVAPP_RBF_PARALLEL=1 opts in to the parallel filter (column-parallel
  * vertical passes), bit-exact to the legacy passes; off by default.
  * MLVAPP_RBF_MAX_THREADS caps its team. mode -1 follows the env var, 0 forces
- * the legacy passes, 1 forces the parallel filter (tests and benchmarks). */
+ * the legacy passes, 1 forces the parallel filter (tests and benchmarks).
+ * Bit-exactness holds for channel == 3 only, so images with another channel
+ * count always take the legacy passes, even when the parallel filter is on. */
 extern void recursive_bf_set_parallel_vertical_override(int mode);
 /* Nonzero when the wrapper will run the parallel filter. Only the exact,
  * case-insensitive values 1/true/yes/on enable MLVAPP_RBF_PARALLEL. */

@@ -127,9 +127,10 @@ public:
     void setTimingEnabled(bool enabled) { m_timing_enabled = enabled; }
     // true: one parallel region, rows then column blocks, with the vertical
     // passes column-parallel; bit-exact to the legacy passes for channel == 3
-    // only (every product caller passes 3). With 4 channels the legacy i*3+c
-    // average/output indexing overlaps neighbouring pixels, so neither path is
-    // deterministic across threads there.
+    // only (every product caller passes 3), so filter() runs it for 3 channels
+    // alone and keeps the legacy passes for 1 and 4 whatever this says. With 4
+    // channels the legacy i*3+c average/output indexing overlaps neighbouring
+    // pixels, so the result is not deterministic across threads there.
     // false (the default, so a caller that never opts in runs legacy): the
     // legacy passes with the serial vertical pair.
     void setParallelVertical(bool enabled) { m_parallel_vertical = enabled; }
