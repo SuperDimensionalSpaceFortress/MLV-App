@@ -6321,7 +6321,7 @@ static void mlv_compute_desired_processing_bw_levels(mlvObject_t * video,
         (int)((double)(*desired_white_level << bits_shift) * 0.993);
 }
 
-static void mlv_sync_processing_black_white_levels(mlvObject_t * video)
+static void mlv_sync_black_white_levels_into(mlvObject_t * video, processingObject_t * target)
 {
     float desired_black_level = 0.0f;
     int desired_white_level = 0;
@@ -6335,14 +6335,19 @@ static void mlv_sync_processing_black_white_levels(mlvObject_t * video)
                                              &expected_black_level,
                                              &expected_white_level);
 
-    if ((int)video->processing->black_level != expected_black_level
-     || video->processing->white_level != expected_white_level)
+    if ((int)target->black_level != expected_black_level
+     || target->white_level != expected_white_level)
     {
-        processingSetBlackAndWhiteLevel(video->processing,
+        processingSetBlackAndWhiteLevel(target,
                                         desired_black_level,
                                         desired_white_level,
                                         desired_bit_depth);
     }
+}
+
+static void mlv_sync_processing_black_white_levels(mlvObject_t * video)
+{
+    mlv_sync_black_white_levels_into(video, video->processing);
 }
 
 /* The fast/subset playback-preview path renders through the GPU-preview
@@ -6385,9 +6390,13 @@ void mlvSyncProcessingDualIsoBlackWhiteLevels(mlvObject_t * video)
  * the GPU route at dispatch time), so the clone's levels -- and on a restricted-range
  * lossless clip the analysed picture, by ~2.6x -- depended on whether a render had
  * been dispatched before the analysis ran. Every analysis render now takes fixed levels.
- * Outside HQ Dual ISO both helpers leave the levels untouched, as master does; fractional
- * Raw Black on those clips is a known pre-existing timing dependency, tracked by
- * LOOK-ASSIST-ANALYSIS-RACE-2.
+ *
+ * LOOK-ASSIST-ANALYSIS-RENDER-RACE-2: outside HQ Dual ISO the clip and display levels coincide,
+ * and both helpers give the clone the levels the display/export render takes: the per-render
+ * sync rule (mlv_sync_black_white_levels_into), applied to the clone. The rule is idempotent, so
+ * the clone's levels do not depend on whether a render already synced the live object; that
+ * includes a fractional Raw Black (the control writes e.g. 2047.9 into the processing object),
+ * which the sync rewrites to RAWI's integer unless it is under one 16-bit code, when it keeps it.
  *
  * LOOK-ASSIST-ANALYSIS-TRUE-LEVELS-1: which levels. The clip levels give the display's own
  * picture log2(display range / clip range) EV brighter, with the same clip at white (measured
@@ -6410,7 +6419,12 @@ void mlvSyncProcessingDualIsoBlackWhiteLevels(mlvObject_t * video)
  * the recon reads, and a sync overwrites the fraction). */
 int mlvSetAnalysisProcessingClipLevels(mlvObject_t * video, processingObject_t * analysis_processing)
 {
-    if (!video || !video->llrawproc || !analysis_processing || !llrpHQDualIso(video)) return 0;
+    if (!video || !video->llrawproc || !analysis_processing) return 0;
+    if (!llrpHQDualIso(video))
+    {
+        mlv_sync_black_white_levels_into(video, analysis_processing);
+        return 1;
+    }
 
     const int black_level = getMlvBlackLevel(video);
     const int white_level = getMlvWhiteLevel(video);
@@ -6423,7 +6437,12 @@ int mlvSetAnalysisProcessingClipLevels(mlvObject_t * video, processingObject_t *
 
 int mlvSetAnalysisProcessingDisplayLevels(mlvObject_t * video, processingObject_t * analysis_processing)
 {
-    if (!video || !video->llrawproc || !analysis_processing || !llrpHQDualIso(video)) return 0;
+    if (!video || !video->llrawproc || !analysis_processing) return 0;
+    if (!llrpHQDualIso(video))
+    {
+        mlv_sync_black_white_levels_into(video, analysis_processing);
+        return 1;
+    }
 
     int bit_depth = 0;
     int black_level = 0;
