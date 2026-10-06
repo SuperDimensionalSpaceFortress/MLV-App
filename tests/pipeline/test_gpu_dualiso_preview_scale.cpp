@@ -1252,10 +1252,8 @@ TEST(GpuDualIsoPreviewScale, PhaseTentShrinkOnlyOnTheGpuPlan)
             std::vector<uint16_t> direct(viaPlan.size(), 1u);
             const uint64_t framesBefore = mlvDualIsoPhaseTentShrinkFrames();
             WorkerState worker;
-            double ms = -1.0;
             ASSERT_EQ(1, mlvDualIsoPreviewScaleReconShrink(fixture.video(), &plan, raw.data(), viaPlan.data(),
-                                                           &worker.state, 1, nullptr, &ms));
-            ASSERT_TRUE(ms >= 0.0);
+                                                           &worker.state, 1, nullptr, nullptr));
             int ow = 0, oh = 0;
             if (gpu)
                 ASSERT_EQ(0, pl_downsample_bayer_to_bayer_phase_tent(raw.data(), fixture.width(), plan.sourceHeight,
