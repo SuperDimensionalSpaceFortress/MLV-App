@@ -166,9 +166,9 @@ void getMlvProcessedFrame16(mlvObject_t * video, uint64_t frameIndex, uint16_t *
  * built. Check first (no mutation), then sync under a render-idle guard. */
 int mlvProcessingDualIsoBlackWhiteLevelsOutOfSync(mlvObject_t * video);
 void mlvSyncProcessingDualIsoBlackWhiteLevels(mlvObject_t * video);
-/* Analysis renders of an HQ Dual ISO clip give a caller-owned processing clone fixed levels,
- * whatever render last synced the live object (never touching it). Both return 1 when they
- * apply (HQ Dual ISO).
+/* Analysis renders give a caller-owned processing clone fixed levels, whatever render last
+ * synced the live object (never touching it). Both return 1 when they apply. Outside HQ Dual
+ * ISO both take the levels the display render syncs to; in HQ Dual ISO they differ:
  * DisplayLevels: the levels the display render uses for the analysed frame (its recon's output
  * levels): the picture the display shows. Call llrpResetLastOutputLevelsForCurrentThread()
  * before the raw read, this after it.

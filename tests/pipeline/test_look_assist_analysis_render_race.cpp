@@ -434,3 +434,147 @@ TEST(LookAssistAnalysisRenderRace, TwentyPassesAlternatingTheSyncStateGiveOnePic
         ASSERT_EQ( firstStats.balanceSamples, stats.balanceSamples );
     }
 }
+
+namespace
+{
+
+// LOOK-ASSIST-ANALYSIS-RENDER-RACE-2: outside HQ Dual ISO. The tiny fixture with dual ISO off (Raw Fix stays on), the live
+// object at the clip's RAWI levels, then a fractional raw black applied exactly as the raw-black slider does: RAWI keeps
+// the integer, the live object the fraction, until a display render's sync rule rewrites it (or keeps it, below one LSB).
+void openNonHqWithFractionalRawBlack( MlvPipelineFixture &fixture, double fraction )
+{
+    ASSERT_TRUE( openFixture( fixture, kDualIsoFixtureClips[0] ) );
+    mlvObject_t *video = fixture.video();
+    llrpSetDualIsoMode( video, 0 );
+    processingSetBlackAndWhiteLevel( video->processing, getMlvBlackLevel( video ), getMlvWhiteLevel( video ),
+                                     getMlvBitdepth( video ) );
+    llrpResetDngBWLevels( video );
+    ASSERT_TRUE( !llrpHQDualIso( video ) );
+    ASSERT_TRUE( getMlvBitdepth( video ) < 16 );
+
+    const double rawBlack = getMlvBlackLevel( video ) + fraction;
+    setMlvBlackLevel( video, rawBlack );
+    processingSetBlackLevel( video->processing, rawBlack, getMlvBitdepth( video ) );
+    llrpResetFpmStatus( video );
+    llrpResetBpmStatus( video );
+    resetMlvCache( video );
+    resetMlvCachedFrame( video );
+}
+
+float syncedIntegerBlack( mlvObject_t *video )
+{
+    return static_cast<float>( getMlvBlackLevel( video ) * std::pow( 2.0, 16 - getMlvBitdepth( video ) ) );
+}
+
+void displayRender( MlvPipelineFixture &fixture )
+{
+    resetMlvCache( fixture.video() );
+    resetMlvCachedFrame( fixture.video() );
+    (void)fixture.renderFrame8( 0 );
+}
+
+} // namespace
+
+// Non-HQ fractional Raw Black (Sol, #253 r2: RGB16 8252 -> 253 before vs 268 after a render). The analysis clone used to
+// inherit whichever live state existed, the slider's fraction (8191.6) or the display render's synced 8188, so the analysed
+// picture, the display meter and the neutral-patch solve depended on whether a render ran first.
+TEST(LookAssistAnalysisRenderRace, ANonHqFractionalRawBlackGivesTheSameAnalysisBeforeAndAfterADisplayRender)
+{
+    MlvPipelineFixture fixture;
+    openNonHqWithFractionalRawBlack( fixture, 0.9 );
+    mlvObject_t *video = fixture.video();
+    const float fractionalBlack = video->processing->black_level;
+    ASSERT_TRUE( fractionalBlack != static_cast<float>( static_cast<int>( fractionalBlack ) ) );
+    ASSERT_EQ( 1, mlvProcessingDualIsoBlackWhiteLevelsOutOfSync( video ) ); // the state really races
+
+    const int md = thumbnailDownscaleFor( video );
+    const size_t meterBytes = static_cast<size_t>( video->RAWI.xRes / md ) * ( video->RAWI.yRes / md ) * 3;
+    const int w = getMlvWidth( video );
+    const int h = getMlvHeight( video );
+    const int patches[5][2] = { { w / 2, h / 2 }, { w / 4, h / 4 }, { 3 * w / 4, h / 4 },
+                                { w / 4, 3 * h / 4 }, { 3 * w / 4, 3 * h / 4 } };
+    auto analyse = [&]( AnalysisPictures *pictures, std::vector<unsigned char> *meter, int wb[5][2] ) {
+        ASSERT_TRUE( renderAnalysisPictures( video, 0, pictures ) );
+        mlv_processed_thumbnail_settings_t meterSettings;
+        std::memset( &meterSettings, 0, sizeof( meterSettings ) );
+        meterSettings.flags = MLV_PROCESSED_THUMBNAIL_APPLY_EXPOSURE | MLV_PROCESSED_THUMBNAIL_DISPLAY_LEVELS;
+        meter->assign( meterBytes, 0 );
+        processingObject_t *meterClone = processingCloneForAnalysis( video->processing );
+        ASSERT_TRUE( meterClone != nullptr );
+        const int metered = get_area_average_downscale_thumnail_with_processing_cachefree(
+            video, 0, md, 1, meterClone, &meterSettings, meter->data() );
+        processingFreeClone( meterClone );
+        ASSERT_TRUE( metered != 0 );
+        for( int i = 0; i < 5; ++i )
+            findMlvWhiteBalanceAtAnalysisLevels( video, 0, patches[i][0], patches[i][1], &wb[i][0], &wb[i][1], 0 );
+    };
+
+    AnalysisPictures before;
+    std::vector<unsigned char> meterBefore;
+    int wbBefore[5][2] = {};
+    analyse( &before, &meterBefore, wbBefore );
+    ASSERT_TRUE( video->processing->black_level == fractionalBlack ); // the analysis never syncs the live object
+
+    displayRender( fixture );
+    ASSERT_TRUE( video->processing->black_level == syncedIntegerBlack( video ) );
+
+    AnalysisPictures after;
+    std::vector<unsigned char> meterAfter;
+    int wbAfter[5][2] = {};
+    analyse( &after, &meterAfter, wbAfter );
+    for( int i = 0; i < 5; ++i )
+        std::printf( "[non-hq-wb] patch %d: before %d/%d, after display render %d/%d\n", i, wbBefore[i][0],
+                     wbBefore[i][1], wbAfter[i][0], wbAfter[i][1] );
+    assertSamePictures( before, after );
+    ASSERT_TRUE( meterBefore == meterAfter );
+    for( int i = 0; i < 5; ++i )
+    {
+        ASSERT_EQ( wbBefore[i][0], wbAfter[i][0] );
+        ASSERT_EQ( wbBefore[i][1], wbAfter[i][1] );
+    }
+}
+
+// Outside HQ Dual ISO the clip and display levels coincide: both analysis clones take the levels the display renders at
+// (the sync rule), including a sub-LSB fraction the sync keeps (0.1 -> 8188.4 at 14 bit) and the integer it rewrites a
+// larger one to (0.5, 0.9 -> 8188).
+TEST(LookAssistAnalysisRenderRace, NonHqAnalysisLevelsAreTheLevelsTheDisplayRenders)
+{
+    for( const double fraction : { 0.1, 0.5, 0.9 } )
+    {
+        MlvPipelineFixture fixture;
+        openNonHqWithFractionalRawBlack( fixture, fraction );
+        mlvObject_t *video = fixture.video();
+        const float sliderBlack = video->processing->black_level;
+
+        processingObject_t *clip = processingCloneForAnalysis( video->processing );
+        processingObject_t *display = processingCloneForAnalysis( video->processing );
+        ASSERT_TRUE( clip != nullptr && display != nullptr );
+        mlvSetAnalysisProcessingClipLevels( video, clip );
+        mlvSetAnalysisProcessingDisplayLevels( video, display );
+        ASSERT_TRUE( video->processing->black_level == sliderBlack ); // the live object is not touched
+
+        displayRender( fixture );
+        const processingObject_t *live = video->processing;
+        std::printf( "[non-hq-levels] fraction %.1f: slider %.2f, display %.2f/%d, clip clone %.2f/%d, display clone %.2f/%d\n",
+                     fraction, sliderBlack, live->black_level, live->white_level, clip->black_level, clip->white_level,
+                     display->black_level, display->white_level );
+        if( fraction < 0.25 )
+        {
+            ASSERT_TRUE( live->black_level == sliderBlack ); // below one LSB at 16 bit the sync keeps the fraction
+            ASSERT_TRUE( live->black_level != syncedIntegerBlack( video ) );
+        }
+        else
+        {
+            ASSERT_TRUE( live->black_level == syncedIntegerBlack( video ) );
+        }
+        for( const processingObject_t *analysis : { static_cast<const processingObject_t *>( clip ),
+                                                    static_cast<const processingObject_t *>( display ) } )
+        {
+            ASSERT_TRUE( analysis->black_level == live->black_level );
+            ASSERT_EQ( live->white_level, analysis->white_level );
+            ASSERT_TRUE( std::memcmp( analysis->pre_calc_levels, live->pre_calc_levels, sizeof( live->pre_calc_levels ) ) == 0 );
+        }
+        processingFreeClone( clip );
+        processingFreeClone( display );
+    }
+}
