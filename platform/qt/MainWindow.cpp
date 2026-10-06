@@ -27052,6 +27052,8 @@ void MainWindow::finishPlaybackSmokeTelemetry( const char *reason )
                << QStringLiteral("startup_wait_credit_frames=%1").arg( slip.startupWaitCreditFrames )
                << QStringLiteral("startup_catchup_after_first=%1").arg( slip.startupCatchupAfterFirstFrames )
                << QStringLiteral("timeline_after_first_raw=%1").arg( slip.timelineAfterFirstRawFps, 0, 'f', 3 )
+               << QStringLiteral("slips_after_gap=%1").arg( static_cast<qlonglong>( slip.slipsAfterGap ) )
+               << QStringLiteral("slip_events_after_gap=%1").arg( slip.slipEventsAfterGap )
                << QStringLiteral("wraps=%1").arg( slip.wraps )
                << QStringLiteral("repeats=%1").arg( slip.repeats )
                << QStringLiteral("grabs=%1").arg( slip.grabs )
@@ -27063,7 +27065,8 @@ void MainWindow::finishPlaybackSmokeTelemetry( const char *reason )
                 << QStringLiteral(
                        "playback_smoke.slip session=%1 frame=%2 size=%3 interval_ms=%4 class=%5 sub=%6 "
                        "decode_ms=%7 recon_ms=%8 render_ms=%9 queue_ms=%10 draw_ms=%11 ui_latency_ms=%12 "
-                       "grab_ms=%13 covered=%14 credit=%15 ready_minus_deadline_ms=%16 timeline_advanced=%17" )
+                       "grab_ms=%13 covered=%14 credit=%15 ready_minus_deadline_ms=%16 timeline_advanced=%17 "
+                       "after_gap=%18" )
                        .arg( session )
                        .arg( r.frame )
                        .arg( r.size )
@@ -27080,7 +27083,8 @@ void MainWindow::finishPlaybackSmokeTelemetry( const char *reason )
                        .arg( bool01( r.lookaheadCovered ) )
                        .arg( r.paceCreditFrames, 0, 'f', 3 )
                        .arg( ( r.readyKnown && r.deadlineKnown ) ? r.readyMs - r.deadlineMs : 0.0, 0, 'f', 3 )
-                       .arg( r.timelineAdvancedInInterval );
+                       .arg( r.timelineAdvancedInInterval )
+                       .arg( bool01( r.afterGap ) );
         }
     }
 

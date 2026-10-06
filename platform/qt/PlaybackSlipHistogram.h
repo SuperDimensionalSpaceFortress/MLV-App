@@ -148,6 +148,7 @@ struct SlipRecord
     double readyMs = 0.0;
     bool deadlineKnown = false;     // the timeline was seen moving past the skipped frame
     double deadlineMs = 0.0;
+    bool afterGap = false;          // the PREVIOUS present interval was >= kGapIntervalMs (a stall's aftermath)
     double presentMs = 0.0;
     int timelineAdvancedInInterval = 0;
 };
@@ -193,6 +194,11 @@ struct Summary
     int grabs = 0;
     double grabMsTotal = 0.0;
     int lookaheadUncoveredSlipEvents = 0;
+    // A stall's own present usually shows the next frame in order (a lookahead frame rendered before it), so the
+    // frames the stall cost are skipped one present LATER, in a short interval. Not a class (the classes are
+    // pre-registered); the slips whose previous interval was a GAP, counted beside them.
+    long long slipsAfterGap = 0;
+    int slipEventsAfterGap = 0;
     std::vector<SlipRecord> slipLines;   // the first kMaxSlipLines slips, classified
 };
 
@@ -362,6 +368,7 @@ public:
             r.deadlineKnown = deadlineOf( m_lastDisplayFrame + 1, &r.deadlineMs );
             r.presentMs = s.presentMs;
             r.timelineAdvancedInInterval = advanced;
+            r.afterGap = m_previousIntervalWasGap;
             m_slips.push_back( r );
             slipIndex = static_cast<int>( m_slips.size() ) - 1;
         }
@@ -373,6 +380,7 @@ public:
         }
         m_lastPresentMs = s.presentMs;
         m_lastDisplayFrame = s.displayFrame;
+        m_previousIntervalWasGap = intervalMs >= kGapIntervalMs;
     }
 
     /*! Classify every slip against the session medians and total the session. \a nowMs is the session end and
@@ -427,6 +435,11 @@ public:
             out.classFrames[static_cast<int>( r.cls )] += r.size;
             if( r.cls == SlipClass::UpstreamLate ) out.upstreamStageFrames[static_cast<int>( r.sub )] += r.size;
             if( !r.lookaheadCovered ) ++out.lookaheadUncoveredSlipEvents;
+            if( r.afterGap )
+            {
+                ++out.slipEventsAfterGap;
+                out.slipsAfterGap += r.size;
+            }
             if( static_cast<int>( i ) == m_maxIntervalSlipIndex ) out.maxIntervalClass = r.cls;
             if( static_cast<int>( out.slipLines.size() ) < kMaxSlipLines ) out.slipLines.push_back( r );
         }
@@ -579,6 +592,7 @@ private:
     int m_startupCatchupFrames = 0;
     int m_firstPresentJumpFrames = 0;
     int m_timelineAdvanceSincePresent = 0;
+    bool m_previousIntervalWasGap = false;
     int m_wraps = 0;
     int m_repeats = 0;
 
