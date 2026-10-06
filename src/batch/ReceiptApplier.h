@@ -139,13 +139,22 @@ public:
      * delta; nominal ev + measured black delta; measured ev + nominal black delta) and scores each with the CAST-3
      * dark-band magenta metrics over one mask fixed on the nominal render. Returns the trace fields (empty when
      * the clip is not HQ dual-ISO with two different ISOs). Both consumers log the same line. Off (empty, nothing
-     * rendered) unless MLVAPP_LOOK_ASSIST_DISO_MATCH_TRACE=1: it costs minutes of renders on a 5K clip. */
+     * rendered) unless MLVAPP_LOOK_ASSIST_DISO_MATCH_TRACE=1: it costs minutes of renders on a 5K clip.
+     * LOOK-ASSIST-M16-CAST-4 replaced the CAST-3 renders (lever (d) is retired) with a levels probe (diso_levels, no
+     * render) and the CAST-4 arms on frames {judgement, 374, 749} at the PINNED exposure / balance 3.80 EV / 6724 / 0
+     * (never the run's Look Assist output, which only gets logged): R0 today's HQ recon (fixes the mask), A1 as-shot
+     * WB, A3 the preview recon, A6 the measured bright clip, A7a/A7b dark noise x0.5/x2, A8 (only when the dark-field
+     * floor is off) the measured dark-field black, all scored DBM/PSH/BLK over R0's mask; A5 Look Assist off (exposure
+     * 0, as-shot WB, default grade) on its own mask, never graded. imageSink, when given, receives every arm render. */
+    using DualIsoTraceImageSink = std::function<void(const QString &name, int width, int height,
+                                                     const unsigned char *rgb)>;
     static QString lookAssistDualIsoMatchTrace(mlvObject_t *mlvObject,
                                                int judgementFrame,
                                                int downscaleFactor,
                                                double exposureStops,
                                                int temperature,
-                                               int tint);
+                                               int tint,
+                                               const DualIsoTraceImageSink &imageSink = DualIsoTraceImageSink());
 
 private:
     ReceiptApplier() = delete; /* Pure static — no instances */

@@ -395,6 +395,47 @@ typedef struct
 void dualiso_match_probe_reset(int stop_after_match);
 int dualiso_match_probe_get(dualiso_match_probe_t * probe);
 
+/* LOOK-ASSIST-M16-CAST-4: measure-only overrides of the HQ recon's level and noise assumptions (thread-local). Set only
+ * by llrawproc around an isolated analysis reconstruction and cleared right after it (NULL = today's recon):
+ * white_bright (14-bit, > 0) replaces the assumed bright-field clip white/2 (clamped to white); dark_noise_scale (> 0)
+ * multiplies the dark noise compute_noise found; dark_black_offset (when enabled, 14-bit codes per CFA channel R, G1,
+ * G2, B) is subtracted from the dark-field rows before the match. */
+typedef struct
+{
+    int white_bright;
+    double dark_noise_scale;
+    int dark_black_offset_enabled;
+    int dark_black_offset[4];
+} dualiso_analysis_override_t;
+void dualiso_set_analysis_override(const dualiso_analysis_override_t * override_values);
+
+/* LOOK-ASSIST-M16-CAST-4: the levels the HQ recon saw on the calling thread's last run (thread-local, measure-only):
+ * per field (0 = dark rows, 1 = bright rows, from is_bright) and CFA channel (R, G1, G2, B) the 0.1 / 1 / 99.99
+ * percentiles and the max of the 14-bit input (after restricted-range scaling), the stated levels, the bright clip the
+ * recon assumed and used, and the noise model's inputs and outputs. With stop set, diso_get_full20bit returns 0 right
+ * after recording them (the caller's failure path restores the frame). */
+typedef struct
+{
+    int valid;
+    int black;
+    int white;
+    int white_bright_default;
+    int white_bright_used;
+    int is_bright[4];
+    int active_x1, active_y1, active_x2, active_y2;
+    int has_noise_samples;
+    double noise_std[4];
+    double dark_noise;
+    double bright_noise;
+    int count[2][4];
+    int p001[2][4];
+    int p1[2][4];
+    int p9999[2][4];
+    int max[2][4];
+} dualiso_levels_probe_t;
+void dualiso_levels_probe_reset(int stop_after_levels);
+int dualiso_levels_probe_get(dualiso_levels_probe_t * probe);
+
 #ifdef __cplusplus
 }
 #endif

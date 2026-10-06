@@ -76,8 +76,9 @@ OWNER_CLIP = "M16-1243"   # a consented clip ID (an id is not footage); the runn
 # DUAL-VENUE-DISPLAY-MATRIX-1 added the six display-matrix legs ({fullscreen, windowed} x {scale 1, 2, 4}); legsets/display-matrix.json names them.
 DISPLAY_MATRIX_LEGS = tuple(f"legs/m16-1243-display-{mode}-s{scale}.json" for scale in (1, 2, 4) for mode in ("fullscreen", "windowed"))
 # LOOK-ASSIST-M16-CAST-3 added the scale-2 look leg with the paired seek capture (look.pairedSeek): pixel-aligned frames for a before/after metric.
+# LOOK-ASSIST-M16-CAST-4 added the scale-2 look leg with the measure-only dual-ISO trace (look.disoTrace).
 SHIPPED_LEGS = ("legs/m16-1243-speed.json", "legs/m16-1243-look.json", "legs/m16-1243-look-scale2.json", "legs/m16-1243-look-scale2-seek.json",
-                "legs/m16-1243-look-cinematic.json", *DISPLAY_MATRIX_LEGS)
+                "legs/m16-1243-look-scale2-trace.json", "legs/m16-1243-look-cinematic.json", *DISPLAY_MATRIX_LEGS)
 SHIPPED_LEGS_PS = ", ".join(f"'{rel}'" for rel in SHIPPED_LEGS)
 OTHER_CLIP = "Z99-9999"
 MLV_EXT = "." + "mlv"  # never spelled as one literal token (the NA-4 gate trips on fixture basenames)
@@ -4259,6 +4260,32 @@ class LegSpecSchemaTests(unittest.TestCase):
 
     def test_the_hand_listed_shipped_legs_are_exactly_the_legs_directory(self) -> None:
         self.assertEqual(sorted(SHIPPED_LEGS), sorted("legs/" + p.name for p in (DV / "legs").glob("*.json")), "SHIPPED_LEGS drifted from the legs/ directory")
+
+    def test_the_diso_trace_is_opt_in_and_only_the_trace_leg_asks_for_it(self) -> None:
+        """LOOK-ASSIST-M16-CAST-4: look.disoTrace is a boolean (default false), the trace leg is the scale-2 look leg plus that key, no
+        other leg asks for it, and the runner maps it to the generator's -LookAssistDisoTrace and nothing else."""
+        load = lambda name: json.loads((DV / "legs" / f"{name}.json").read_text(encoding="utf-8"))
+        props = self.schema["properties"]["look"]["properties"]
+        self.assertEqual(props["disoTrace"]["type"], "boolean")
+        self.assertIs(props["disoTrace"]["default"], False)
+        trace, scale2 = load("m16-1243-look-scale2-trace"), load("m16-1243-look-scale2")
+        self.jsonschema.validate(trace, self.schema)
+        self.assertIs(trace["look"]["disoTrace"], True)
+        stripped = json.loads(json.dumps(trace))
+        del stripped["look"]["disoTrace"]
+        stripped["legId"] = scale2["legId"]
+        self.assertEqual(stripped, scale2)
+        for path in sorted((DV / "legs").glob("*.json")):
+            if path.stem != "m16-1243-look-scale2-trace":
+                self.assertNotIn("disoTrace", (json.loads(path.read_text(encoding="utf-8")).get("look") or {}), path.name)
+        with self.assertRaises(self.jsonschema.ValidationError):
+            bad = json.loads(json.dumps(trace))
+            bad["look"]["disoTrace"] = "yes"
+            self.jsonschema.validate(bad, self.schema)
+        runner = (DV / "Invoke-VenueLeg.ps1").read_text(encoding="utf-8")
+        self.assertIn("if ($null -ne $spec.look.PSObject.Properties['disoTrace'] -and [bool]$spec.look.disoTrace) { $gen['LookAssistDisoTrace'] = $true }", runner)
+        self.assertEqual(runner.count("LookAssistDisoTrace"), 1)
+        self.assertIn("'diso-trace\\contact-sheet\\raw'", runner)
 
     def test_every_non_classic_leg_gates_on_the_flavor_the_app_reports_having_applied(self) -> None:
         """LOOK-ASSIST-FLAVORS-2 landed the flavor reader, so a cinematic leg may ship (VENUE-CINEMATIC-SPEC-1). What it may not do is PASS while the app

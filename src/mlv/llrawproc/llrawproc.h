@@ -72,6 +72,19 @@ int llrpSetIsolatedAnalysisDualIsoMatchForCurrentThread(int mode, double ev_corr
  * uses instead of the shared ones (interp 0 AMaZE / 1 mean23, alias map, fullres blending, chroma smoothing method).
  * -1 keeps the shared value; all -1 (the default) is today's render. */
 void llrpSetIsolatedAnalysisDualIsoReconForCurrentThread(int interp, int alias_map, int fullres, int chroma_smooth);
+/* LOOK-ASSIST-M16-CAST-4 measure-only arms for an ISOLATED, read-only analysis render on the calling thread (never a
+ * live render): dual_iso_mode 1 (HQ) / 2 (the preview recon), else -1 = the shared mode; white_bright (14-bit, > 0)
+ * replaces the HQ recon's assumed bright clip white/2; dark_noise_scale (> 0) multiplies its dark noise; a non-NULL
+ * dark_black_offset (14-bit codes per CFA channel R, G1, G2, B) is subtracted from its dark-field rows. -1 / 0 / 0.0 /
+ * NULL is today's render; the caller resets after every render. The getter reports the current arms (1 = any set). */
+void llrpSetIsolatedAnalysisDualIsoArmsForCurrentThread(int dual_iso_mode,
+                                                        int white_bright,
+                                                        double dark_noise_scale,
+                                                        const int * dark_black_offset);
+int llrpGetIsolatedAnalysisDualIsoArmsForCurrentThread(int * dual_iso_mode,
+                                                       int * white_bright,
+                                                       double * dark_noise_scale,
+                                                       int * dark_black_offset_enabled);
 /* The output levels (dng bit depth / black / white) of the last llrawproc run on the calling thread that completed for
  * `video`, live or isolated: the levels its frame is at, which a display render syncs the processing object to. Returns
  * 0 when no run completed for `video` since the last reset on this thread (e.g. the frame came from a cache). */

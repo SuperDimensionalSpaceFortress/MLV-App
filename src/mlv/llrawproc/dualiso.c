@@ -80,6 +80,82 @@ int dualiso_match_probe_get(dualiso_match_probe_t * probe)
     if (probe) *probe = g_dualiso_match_probe;
     return g_dualiso_match_probe.valid;
 }
+
+/* LOOK-ASSIST-M16-CAST-4 (measure-only, see dualiso.h). */
+static DUALISO_THREAD_LOCAL dualiso_analysis_override_t g_dualiso_analysis_override = { 0, 0.0, 0, { 0, 0, 0, 0 } };
+static DUALISO_THREAD_LOCAL dualiso_levels_probe_t g_dualiso_levels_probe = {0};
+static DUALISO_THREAD_LOCAL int g_dualiso_levels_probe_stop = 0;
+
+void dualiso_set_analysis_override(const dualiso_analysis_override_t * override_values)
+{
+    if (override_values) g_dualiso_analysis_override = *override_values;
+    else memset(&g_dualiso_analysis_override, 0, sizeof(g_dualiso_analysis_override));
+}
+
+void dualiso_levels_probe_reset(int stop_after_levels)
+{
+    memset(&g_dualiso_levels_probe, 0, sizeof(g_dualiso_levels_probe));
+    g_dualiso_levels_probe_stop = stop_after_levels ? 1 : 0;
+}
+
+int dualiso_levels_probe_get(dualiso_levels_probe_t * probe)
+{
+    if (probe) *probe = g_dualiso_levels_probe;
+    return g_dualiso_levels_probe.valid;
+}
+
+/* The k-th smallest value (0-based) of a 14-bit histogram. */
+static int dualiso_levels_hist_rank(const unsigned int * hist, long long k)
+{
+    long long seen = 0;
+    for (int v = 0; v < 16384; v++)
+    {
+        seen += hist[v];
+        if (seen > k) return v;
+    }
+    return 16383;
+}
+
+/* Per field (is_bright[y%4]) and CFA channel ((y&1)*2 + (x&1), RGGB after the gbrg row skip) over the active area. */
+static void dualiso_record_levels(struct raw_info raw_info, const uint16_t * image_data, const int * is_bright)
+{
+    unsigned int * hist = calloc((size_t)8 * 16384u, sizeof(unsigned int));
+    if (!hist) return;
+    const int x1 = MAX(raw_info.active_area.x1, 0);
+    const int y1 = MAX(raw_info.active_area.y1, 0);
+    const int x2 = MIN(raw_info.active_area.x2, raw_info.width);
+    const int y2 = MIN(raw_info.active_area.y2, raw_info.height);
+    for (int y = y1; y < y2; y++)
+    {
+        const int field = is_bright[y % 4] ? 1 : 0;
+        for (int x = x1; x < x2; x++)
+        {
+            const int channel = ((y & 1) << 1) | (x & 1);
+            hist[(size_t)(field * 4 + channel) * 16384u + (image_data[(size_t)x + (size_t)y * raw_info.width] & 16383)]++;
+        }
+    }
+    for (int field = 0; field < 2; field++)
+    {
+        for (int channel = 0; channel < 4; channel++)
+        {
+            const unsigned int * h = hist + (size_t)(field * 4 + channel) * 16384u;
+            long long n = 0;
+            int top = 0;
+            for (int v = 0; v < 16384; v++)
+            {
+                n += h[v];
+                if (h[v]) top = v;
+            }
+            g_dualiso_levels_probe.count[field][channel] = (int)MIN(n, (long long)INT_MAX);
+            if (n <= 0) continue;
+            g_dualiso_levels_probe.p001[field][channel] = dualiso_levels_hist_rank(h, (long long)(n * 0.001));
+            g_dualiso_levels_probe.p1[field][channel] = dualiso_levels_hist_rank(h, (long long)(n * 0.01));
+            g_dualiso_levels_probe.p9999[field][channel] = dualiso_levels_hist_rank(h, (long long)(n * 0.9999));
+            g_dualiso_levels_probe.max[field][channel] = top;
+        }
+    }
+    free(hist);
+}
 static DUALISO_THREAD_LOCAL dualiso_gpu_recon_state_t g_dualiso_last_gpu_recon_state = {0};
 static DUALISO_THREAD_LOCAL int g_dualiso_gpu_recon_state_capture_enabled = 0;
 static int g_dualiso_mix_chroma_probe_mode_cache = INT_MIN;
@@ -6697,12 +6773,18 @@ int diso_get_full20bit(struct raw_info raw_info, uint16_t * image_data, int dark
     int black = raw_info.black_level;
     int white = raw_info.white_level / 64;
     
-    int white_bright = white / 2;
+    const int white_bright_default = white / 2;
+    int white_bright = white_bright_default;
     //white_detect(raw_info, image_data, &white, &white_bright, is_bright);
+    /* LOOK-ASSIST-M16-CAST-4: an isolated analysis arm may replace the assumed bright clip (dualiso.h). */
+    if (g_dualiso_analysis_override.white_bright > 0)
+    {
+        white_bright = MIN(g_dualiso_analysis_override.white_bright, white);
+    }
     white *= 64;
     white_bright *= 64;
     raw_info.white_level = white;
-    
+
     double noise_std[4];
     double dark_noise, bright_noise, dark_noise_ev, bright_noise_ev;
     stage_start = mlv_stage_timing_now();
@@ -6718,6 +6800,55 @@ int diso_get_full20bit(struct raw_info raw_info, uint16_t * image_data, int dark
         || bright_noise <= 0.0)
     {
         DUALISO_FULL20_RETURN(0);
+    }
+
+    /* LOOK-ASSIST-M16-CAST-4: the levels probe (dualiso.h) records what this run sees, then stops. */
+    if (g_dualiso_levels_probe_stop)
+    {
+        g_dualiso_levels_probe.black = black / 64;
+        g_dualiso_levels_probe.white = white / 64;
+        g_dualiso_levels_probe.white_bright_default = white_bright_default;
+        g_dualiso_levels_probe.white_bright_used = white_bright / 64;
+        memcpy(g_dualiso_levels_probe.is_bright, is_bright, sizeof(g_dualiso_levels_probe.is_bright));
+        g_dualiso_levels_probe.active_x1 = raw_info.active_area.x1;
+        g_dualiso_levels_probe.active_y1 = raw_info.active_area.y1;
+        g_dualiso_levels_probe.active_x2 = raw_info.active_area.x2;
+        g_dualiso_levels_probe.active_y2 = raw_info.active_area.y2;
+        for (int y = 0; y < 4; y++)
+        {
+            /* compute_noise's own sampling predicate */
+            if (8 < raw_info.active_area.x1 - 8
+                && raw_info.active_area.y1/4*4 + 20 + y < raw_info.active_area.y2 - 20)
+            {
+                g_dualiso_levels_probe.has_noise_samples = 1;
+            }
+            g_dualiso_levels_probe.noise_std[y] = noise_std[y];
+        }
+        g_dualiso_levels_probe.dark_noise = dark_noise;
+        g_dualiso_levels_probe.bright_noise = bright_noise;
+        dualiso_record_levels(raw_info, image_data, is_bright);
+        g_dualiso_levels_probe.valid = 1;
+        DUALISO_FULL20_RETURN(0);
+    }
+
+    /* LOOK-ASSIST-M16-CAST-4: isolated analysis arms on the noise model and the dark-field black (dualiso.h). */
+    if (g_dualiso_analysis_override.dark_noise_scale > 0.0)
+    {
+        dark_noise *= g_dualiso_analysis_override.dark_noise_scale;
+        dark_noise_ev = log2(dark_noise);
+    }
+    if (g_dualiso_analysis_override.dark_black_offset_enabled)
+    {
+        for (int y = 0; y < h; y++)
+        {
+            if (is_bright[y % 4]) continue;
+            for (int x = 0; x < w; x++)
+            {
+                const int v = (int)image_data[(size_t)x + (size_t)y * w]
+                            - g_dualiso_analysis_override.dark_black_offset[((y & 1) << 1) | (x & 1)];
+                image_data[(size_t)x + (size_t)y * w] = (uint16_t)COERCE(v, 0, 16383);
+            }
+        }
     }
 
     stage_start = mlv_stage_timing_now();

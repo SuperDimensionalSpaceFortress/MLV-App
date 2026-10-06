@@ -366,6 +366,8 @@ try {
         $gen['ForceLookAssist'] = $true; $gen['LookFlavor'] = $lookFlavor
         # LOOK-ASSIST-M16-CAST-3: a spec's optional look.pairedSeek also asks for the paired SEEK capture (playback_path=false, fixed frames).
         if ($null -ne $spec.look.PSObject.Properties['pairedSeek'] -and [bool]$spec.look.pairedSeek) { $gen['ContactSheetPairedSeek'] = $true }
+        # LOOK-ASSIST-M16-CAST-4: a spec's optional look.disoTrace runs the app with the measure-only dual-ISO trace on (one env var, nothing else).
+        if ($null -ne $spec.look.PSObject.Properties['disoTrace'] -and [bool]$spec.look.disoTrace) { $gen['LookAssistDisoTrace'] = $true }
     }
     try {
         $genOut = @(& $GeneratorScript @gen)
@@ -584,6 +586,14 @@ if ($isLook -and $artifactsShare) {
         if (Test-Path -LiteralPath $seekShare -PathType Container) {
             New-Item -ItemType Directory -Force -Path (Join-Path $evidenceDir 'contact-sheet-seek') | Out-Null
             Copy-Item -LiteralPath $seekShare -Destination (Join-Path $evidenceDir 'contact-sheet-seek\raw') -Recurse
+            break
+        }
+    }
+    # LOOK-ASSIST-M16-CAST-4: the dual-ISO trace's arm renders (look.disoTrace), kept apart under diso-trace\raw; not part of the hashed sheet.
+    foreach ($traceShare in (Join-Path $artifactsShare 'artifacts\diso-trace\contact-sheet\raw'), (Join-Path $artifactsShare 'diso-trace\contact-sheet\raw')) {
+        if (Test-Path -LiteralPath $traceShare -PathType Container) {
+            New-Item -ItemType Directory -Force -Path (Join-Path $evidenceDir 'diso-trace') | Out-Null
+            Copy-Item -LiteralPath $traceShare -Destination (Join-Path $evidenceDir 'diso-trace\raw') -Recurse
             break
         }
     }

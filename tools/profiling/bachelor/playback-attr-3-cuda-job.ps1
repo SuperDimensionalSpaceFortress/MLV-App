@@ -236,6 +236,9 @@ param(
     # capture of the same frames after the Play stops (--contact-sheet-seek-dir; it never plays,
     # playback_path=false), published apart under paired-seek\contact-sheet\raw. Off by default.
     [switch]$ContactSheetPairedSeek,
+    # LOOK-ASSIST-M16-CAST-4: run the app with MLVAPP_LOOK_ASSIST_DISO_MATCH_TRACE=1 (the measure-only dual-ISO trace)
+    # and publish its arm renders (written beside the contact sheet) under diso-trace\contact-sheet\raw. Off by default.
+    [switch]$LookAssistDisoTrace,
 
     # CUDA-PLAYBACK-PRESENT-CADENCE-1 round 2 discriminating legs. HEAVY (default, unchanged
     # behavior for every existing caller) keeps every diagnostic env var PLAYBACK-ATTR-3-CUDA
@@ -505,6 +508,7 @@ $fixtureRehearsalLiteral = if ($isFixtureRehearsal) { '$true' } else { '$false' 
 $contactSheetEnabledLiteral = if ($ContactSheet) { '$true' } else { '$false' }
 $contactSheetFrameCountLiteral = [string]$ContactSheetFrames
 $contactSheetPairedSeekLiteral = if ($ContactSheet -and $ContactSheetPairedSeek) { '$true' } else { '$false' }
+$lookAssistDisoTraceLiteral = if ($LookAssistDisoTrace) { '$true' } else { '$false' }
 
 # ATTR3-FIXTURE-STAGE-1. The compound suffix the two tracked fixtures carry is never spelled
 # as one literal token anywhere in this file: a token ending in it trips this repository's own
@@ -995,6 +999,8 @@ $ContactSheetFrameCount = __CONTACT_SHEET_FRAME_COUNT__
 # CONTACT-SHEET-PLAYBACK-PARITY-1 >>>
 $ContactSheetPairedSeek = __CONTACT_SHEET_PAIRED_SEEK__
 # CONTACT-SHEET-PLAYBACK-PARITY-1 <<<
+# LOOK-ASSIST-M16-CAST-4: the measure-only dual-ISO trace (one app env var) and its arm renders.
+$LookAssistDisoTrace = __LOOK_ASSIST_DISO_TRACE__
 $ContactSheetComposerPyBase64 = '__CONTACT_SHEET_COMPOSER_PY_BASE64__'
 $ContactSheetComposerSha256 = '__CONTACT_SHEET_COMPOSER_SHA256__'
 $TelemetryArm = '__TELEMETRY_ARM__'
@@ -2546,7 +2552,7 @@ $envs = @(
     ('QT_QPA_PLATFORM_PLUGIN_PATH=' + (Join-Path $pkgDir 'platforms')),
     'QT_OPENGL=desktop',
     'QT_FORCE_STDERR_LOGGING=1'
-) + $(if ($DisablePaintPerSubmit) { @('MLVAPP_GPU_WINDOW_PAINT_PER_SUBMIT=0') } else { @() })
+) + $(if ($DisablePaintPerSubmit) { @('MLVAPP_GPU_WINDOW_PAINT_PER_SUBMIT=0') } else { @() }) + $(if ($LookAssistDisoTrace) { @('MLVAPP_LOOK_ASSIST_DISO_MATCH_TRACE=1') } else { @() })
 # Shipping default: scale factor 4. Unlike PLAYBACK-ATTR-2, no
 # MLVAPP_PLAYBACK_SCALE_FACTOR override is emitted; -ScaleFactor 4 is explicit
 # below for self-documentation even though it is run-release-gui-smoke.ps1's own
@@ -3798,6 +3804,11 @@ if ($ContactSheetEnabled -and $contactSheetDir -and (Test-Path -LiteralPath $con
         [void](Publish-AttrCudaContactSheetRawCaptures -Enabled $ContactSheetEnabled -SourceDir (Join-Path $Work 'contact-sheet-seek') -PubRoot (Join-Path $Pub 'paired-seek'))
     }
     # CONTACT-SHEET-PLAYBACK-PARITY-1 <<<
+    # LOOK-ASSIST-M16-CAST-4: the trace's arm renders (the app writes them beside the contact sheet), under their own root.
+    if ($LookAssistDisoTrace -and (Test-Path -LiteralPath (Join-Path $Work 'contact-sheet-diso-trace'))) {
+        [void](New-AttrCudaDirectory -Path (Join-Path $Pub 'diso-trace'))
+        [void](Publish-AttrCudaContactSheetRawCaptures -Enabled $ContactSheetEnabled -SourceDir (Join-Path $Work 'contact-sheet-diso-trace') -PubRoot (Join-Path $Pub 'diso-trace'))
+    }
     # CUDA-PLAYBACK-CONTACT-SHEET-1 r1b: compose the raw captures into one labelled sheet +
     # stats sidecar right here, in the job's publish step, so a reader gets the composed
     # artifact without running make-contact-sheet.py by hand. Pillow/numpy (and Python
@@ -4136,6 +4147,7 @@ $text = Expand-AttrCudaTemplate -Template $template -Tokens ([ordered]@{
     CONTACT_SHEET_ENABLED = $contactSheetEnabledLiteral
     CONTACT_SHEET_FRAME_COUNT = $contactSheetFrameCountLiteral
     CONTACT_SHEET_PAIRED_SEEK = $contactSheetPairedSeekLiteral
+    LOOK_ASSIST_DISO_TRACE = $lookAssistDisoTraceLiteral
     CONTACT_SHEET_COMPOSER_PY_BASE64 = $contactSheetComposerPyBase64
     CONTACT_SHEET_COMPOSER_SHA256 = $contactSheetComposerSha256ForTemplate
     TELEMETRY_ARM = $TelemetryArm

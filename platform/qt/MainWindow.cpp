@@ -8313,6 +8313,10 @@ int MainWindow::runGuiPlaybackSmoke(const GuiPlaybackSmokeOptions & options)
     QTextStream out(stdout);
     QTextStream err(stderr);
     m_lookAssistAutoWarmupDeferralCount = 0;
+    // LOOK-ASSIST-M16-CAST-4: the dual-ISO trace's arm renders (only written when MLVAPP_LOOK_ASSIST_DISO_MATCH_TRACE=1).
+    m_lookAssistDisoTraceDir = options.contactSheetDir.isEmpty()
+        ? QString()
+        : QDir::cleanPath( options.contactSheetDir ) + QStringLiteral( "-diso-trace" );
     // PLAYBACK-CLIP-LENGTH-ENFORCE-2: Loop is forced OFF at every automation entry, before anything else.
     forceLoopOffForAutomation( "gui-smoke-entry" );
     isolateAutomationPacing( "gui-smoke-entry" );
@@ -17405,8 +17409,20 @@ void MainWindow::applyLookAssistToReceipt( ReceiptSettings *receipt,
             .arg( lookAssistFlavorName( flavor ) ) );
 
     // LOOK-ASSIST-M16-CAST-3 step 1: the same measure-only dual-ISO match trace the headless applier logs.
+    // LOOK-ASSIST-M16-CAST-4: its arm renders go beside the smoke's contact sheet, for the leg to collect.
+    ReceiptApplier::DualIsoTraceImageSink disoImageSink;
+    if( !m_lookAssistDisoTraceDir.isEmpty() )
+    {
+        const QString traceDir = m_lookAssistDisoTraceDir;
+        disoImageSink = [traceDir]( const QString &name, int w, int h, const unsigned char *rgb )
+        {
+            if( !QDir().mkpath( traceDir ) ) return;
+            QImage( rgb, w, h, w * 3, QImage::Format_RGB888 ).save( QDir( traceDir ).filePath( name + QStringLiteral( ".png" ) ),
+                                                                    "PNG" );
+        };
+    }
     const QString disoMatch = ReceiptApplier::lookAssistDualIsoMatchTrace(
-        m_pMlvObject, analysisFrame, colorDownscaleFactor, preset.exposure / 100.0, temperature, tint );
+        m_pMlvObject, analysisFrame, colorDownscaleFactor, preset.exposure / 100.0, temperature, tint, disoImageSink );
     if( !disoMatch.isEmpty() )
         logInteractionEvent( QStringLiteral("look_assist.diso_match"),
                              QStringLiteral("frame=%1 %2").arg( analysisFrame ).arg( disoMatch ) );

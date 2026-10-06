@@ -9,6 +9,7 @@
 #include "../mlv/llrawproc/dualiso.h"
 
 #include <QByteArray>
+#include <QElapsedTimer>
 #include <QFileInfo>
 #include <QtGlobal>
 
@@ -775,22 +776,6 @@ static bool lookAssistProbeDualIsoMatch(mlvObject_t *mlvObject, int frameIndex, 
     return ran;
 }
 
-// The same isolated, read-only display-level render the window-lit check measures with, with the match seeded as asked.
-static bool lookAssistDualIsoVariantRender(mlvObject_t *mlvObject, int frameIndex, int downscaleFactor,
-                                           double exposureStops, int temperature, int tint, int mode,
-                                           double evCorrection, int blackDelta, std::vector<unsigned char> *rgb,
-                                           dualiso_match_probe_t *used)
-{
-    const int previousMode = llrpSetIsolatedAnalysisDualIsoMatchForCurrentThread( mode, evCorrection, blackDelta );
-    dualiso_match_probe_reset( 0 );
-    const bool rendered = ReceiptApplier::processedThumbnailAtBalance( mlvObject, frameIndex, downscaleFactor, 1,
-                                                                       exposureStops, temperature, tint, true,
-                                                                       rgb->data(), true );
-    dualiso_match_probe_get( used );
-    llrpSetIsolatedAnalysisDualIsoMatchForCurrentThread( previousMode, 1.0, -1 );
-    return rendered;
-}
-
 // CAST-3's PRIMARY metrics over a fixed mask: DBM = -median(G-(R+B)/2) (positive = magenta), PSH = the mask's share
 // with G-(R+B)/2 <= -8, R-G >= 8 and B-G >= 8.
 static void lookAssistDarkBandMagenta(const std::vector<unsigned char> &rgb, const std::vector<size_t> &mask,
@@ -814,12 +799,108 @@ static void lookAssistDarkBandMagenta(const std::vector<unsigned char> &rgb, con
     *psh = 100.0 * static_cast<double>( purple ) / static_cast<double>( mask.size() );
 }
 
+// The CAST-3 mask: pixels with luma (54R+183G+19B)>>8 in 20..120.
+static std::vector<size_t> lookAssistLumaBandMask(const std::vector<unsigned char> &rgb, size_t pixels)
+{
+    std::vector<size_t> mask;
+    for( size_t i = 0; i < pixels; ++i )
+    {
+        const int luma = ( 54 * rgb[i * 3] + 183 * rgb[i * 3 + 1] + 19 * rgb[i * 3 + 2] ) >> 8;
+        if( luma >= 20 && luma <= 120 ) mask.push_back( i );
+    }
+    return mask;
+}
+
+// LOOK-ASSIST-M16-CAST-4 BLK: the mask's share whose G-(R+B)/2 deviates by >= 12 from the median over the 9x9 pixels
+// around it (twice the axis, so the arithmetic stays integer).
+static double lookAssistBlotchShare(const std::vector<unsigned char> &rgb, int width, int height,
+                                    const std::vector<size_t> &mask)
+{
+    if( mask.empty() || width <= 0 || height <= 0 ) return 0.0;
+    std::vector<int> axis( static_cast<size_t>( width ) * static_cast<size_t>( height ) );
+    for( size_t i = 0; i < axis.size(); ++i )
+        axis[i] = 2 * rgb[i * 3 + 1] - rgb[i * 3] - rgb[i * 3 + 2];
+    std::vector<int> window;
+    window.reserve( 81 );
+    size_t blotch = 0;
+    for( size_t i : mask )
+    {
+        const int x = static_cast<int>( i % static_cast<size_t>( width ) );
+        const int y = static_cast<int>( i / static_cast<size_t>( width ) );
+        window.clear();
+        for( int yy = qMax( 0, y - 4 ); yy <= qMin( height - 1, y + 4 ); ++yy )
+            for( int xx = qMax( 0, x - 4 ); xx <= qMin( width - 1, x + 4 ); ++xx )
+                window.push_back( axis[static_cast<size_t>( yy ) * static_cast<size_t>( width ) + xx] );
+        std::nth_element( window.begin(), window.begin() + window.size() / 2, window.end() );
+        if( std::abs( axis[i] - window[window.size() / 2] ) >= 24 ) ++blotch;
+    }
+    return 100.0 * static_cast<double>( blotch ) / static_cast<double>( mask.size() );
+}
+
+// LOOK-ASSIST-M16-CAST-4 Step 1: what the HQ recon sees on frameIndex. No reconstruction: the probe stops it right after
+// recording (the isolated read's failure path restores the frame).
+static bool lookAssistProbeDualIsoLevels(mlvObject_t *mlvObject, int frameIndex, dualiso_levels_probe_t *out)
+{
+    const size_t pixels = static_cast<size_t>( mlvObject->RAWI.xRes ) * static_cast<size_t>( mlvObject->RAWI.yRes );
+    if( pixels == 0 ) return false;
+    std::vector<uint16_t> frame( pixels );
+    const int previousReadOnly = llrpSetIsolatedAnalysisSharedStateReadOnlyForCurrentThread( 1 );
+    dualiso_levels_probe_reset( 1 );
+    int bitShift = 0;
+    getMlvRawFrameProcessedUint16Direct( mlvObject, static_cast<uint64_t>( frameIndex ), frame.data(), &bitShift );
+    const bool ran = dualiso_levels_probe_get( out ) != 0;
+    dualiso_levels_probe_reset( 0 );
+    llrpSetIsolatedAnalysisSharedStateReadOnlyForCurrentThread( previousReadOnly );
+    return ran;
+}
+
+// One CAST-4 arm: an isolated, read-only, display-level render of frameIndex, with the arms set for this render only.
+// defaultGrade is Look Assist off: contrast, shadows, highlights and vibrance at 0 (the display meter's grade).
+static bool lookAssistDisoArmRender(mlvObject_t *mlvObject, int frameIndex, int downscaleFactor, double exposureStops,
+                                    int temperature, int tint, bool defaultGrade, int mode, int whiteBright,
+                                    double darkNoiseScale, const int *darkBlackOffset, std::vector<unsigned char> *rgb)
+{
+    llrpSetIsolatedAnalysisDualIsoArmsForCurrentThread( mode, whiteBright, darkNoiseScale, darkBlackOffset );
+    bool rendered = false;
+    if( !defaultGrade )
+    {
+        rendered = ReceiptApplier::processedThumbnailAtBalance( mlvObject, frameIndex, downscaleFactor, 1, exposureStops,
+                                                                temperature, tint, true, rgb->data(), true );
+    }
+    else if( processingObject_t *clone = processingCloneForAnalysis( mlvObject->processing ) )
+    {
+        mlv_processed_thumbnail_settings_t settings;
+        memset( &settings, 0, sizeof( settings ) );
+        settings.flags = MLV_PROCESSED_THUMBNAIL_APPLY_WHITE_BALANCE | MLV_PROCESSED_THUMBNAIL_APPLY_EXPOSURE
+                       | MLV_PROCESSED_THUMBNAIL_APPLY_SIMPLE_CONTRAST | MLV_PROCESSED_THUMBNAIL_APPLY_SHADOWS
+                       | MLV_PROCESSED_THUMBNAIL_APPLY_HIGHLIGHTS | MLV_PROCESSED_THUMBNAIL_APPLY_VIBRANCE
+                       | MLV_PROCESSED_THUMBNAIL_DISPLAY_LEVELS;
+        settings.white_balance_kelvin = temperature;
+        settings.white_balance_tint = tint / 10.0;
+        settings.exposure_stops = exposureStops;
+        const int previousReadOnly = llrpSetIsolatedAnalysisSharedStateReadOnlyForCurrentThread( 1 );
+        rendered = get_area_average_downscale_thumnail_with_processing_cachefree(
+            mlvObject, frameIndex, downscaleFactor, 1, clone, &settings, rgb->data() ) != 0;
+        llrpSetIsolatedAnalysisSharedStateReadOnlyForCurrentThread( previousReadOnly );
+        processingFreeClone( clone );
+    }
+    llrpSetIsolatedAnalysisDualIsoArmsForCurrentThread( -1, 0, 0.0, nullptr );
+    return rendered;
+}
+
+// LOOK-ASSIST-M16-CAST-4: the pinned exposure / balance every arm renders at except A1 (as-shot WB) and A5 (Look
+// Assist off). Look Assist's own decision varies run to run (6724 vs 6686 on the same build), so it is never used.
+static const double kLookAssistDisoArmExposure = 3.80;
+static const int kLookAssistDisoArmTemperature = 6724;
+static const int kLookAssistDisoArmTint = 0;
+
 QString ReceiptApplier::lookAssistDualIsoMatchTrace(mlvObject_t *mlvObject,
                                                     int judgementFrame,
                                                     int downscaleFactor,
                                                     double exposureStops,
                                                     int temperature,
-                                                    int tint)
+                                                    int tint,
+                                                    const DualIsoTraceImageSink &imageSink)
 {
     // Diagnostic only, and slow (about four minutes of isolated full-resolution renders on a 5K clip): off unless asked for.
     if( qEnvironmentVariableIntValue( "MLVAPP_LOOK_ASSIST_DISO_MATCH_TRACE" ) == 0 ) return QString();
@@ -882,98 +963,160 @@ QString ReceiptApplier::lookAssistDualIsoMatchTrace(mlvObject_t *mlvObject,
             .arg( sortedEv[sortedEv.size() / 2], 0, 'f', 3 ).arg( sortedBd[sortedBd.size() / 2], 0, 'f', 2 )
             .arg( sortedEv.back() - sortedEv.front(), 0, 'f', 3 ).arg( sortedBd.back() - sortedBd.front(), 0, 'f', 2 );
     }
-    if( judged.rc <= 0 || nominal.rc <= 0 ) return trace + QStringLiteral( " variants=none" );
+    // LOOK-ASSIST-M16-CAST-4: lever (d) is retired, so CAST-3's match variants and recon options no longer render
+    // (their numbers are in CAST-3's run); the levels probe and the CAST-4 arms do.
+    if( nominal.rc <= 0 ) return trace + QStringLiteral( " arms=none" );
+    QElapsedTimer armsClock;
+    armsClock.start();
 
-    // Four display-level variants of the judgement frame, scored over the mask fixed on the nominal render.
+    // LOOK-ASSIST-M16-CAST-4 Step 1 (no render): the levels the HQ recon sees on the judgement frame, per field and CFA
+    // channel, after restricted-range scaling. scale_restricted_range's own arithmetic (llrawproc.c) says where the
+    // RAWI white lands after scaling, against the white the recon states.
+    const int rawBlack = getMlvBlackLevel( mlvObject );
+    const int rawWhite = getMlvWhiteLevel( mlvObject );
+    const bool restricted = ( mlvObject->MLVI.videoClass & MLV_VIDEO_CLASS_FLAG_LJ92 ) && rawWhite < 15000
+                         && rawWhite > rawBlack;
+    double scaleRatio = 1.0;
+    if( restricted )
+    {
+        const int span = rawWhite - rawBlack;
+        const int bd = qBound( 0, static_cast<int>( std::ceil( std::log2( static_cast<double>( span ) ) ) ), 14 );
+        const int addBit = ( llr->diso1 != llr->diso2 && qMax( llr->diso1, llr->diso2 ) >= 6400 ) ? 1 : 0;
+        const double actualSpan = static_cast<double>( ( 1u << static_cast<unsigned>( bd + addBit ) ) - 1u );
+        const double scaledWhite = static_cast<double>( span ) * static_cast<double>( 1u << static_cast<unsigned>( 14 - bd ) );
+        scaleRatio = ( scaledWhite - rawBlack ) / actualSpan;
+    }
+    dualiso_levels_probe_t levels;
+    memset( &levels, 0, sizeof( levels ) );
+    const bool haveLevels = lookAssistProbeDualIsoLevels( mlvObject, judgementFrame, &levels );
+    const char *channelNames[4] = { "R", "G1", "G2", "B" };
+    int brightClip = 0;
+    int darkTop = 0;
+    bool darkLevelsOff = false;
+    int darkBlackOffset[4] = { 0, 0, 0, 0 };
+    QString darkFields;
+    QString brightFields;
+    QString darkFloorPre;
+    QString darkBlackPre;
+    for( int c = 0; c < 4 && haveLevels; ++c )
+    {
+        darkFields += QStringLiteral( "%1%2:%3/%4/%5/%6" ).arg( c ? QStringLiteral( "|" ) : QString() )
+            .arg( QLatin1String( channelNames[c] ) ).arg( levels.p001[0][c] ).arg( levels.p1[0][c] )
+            .arg( levels.p9999[0][c] ).arg( levels.max[0][c] );
+        brightFields += QStringLiteral( "%1%2:%3/%4/%5/%6" ).arg( c ? QStringLiteral( "|" ) : QString() )
+            .arg( QLatin1String( channelNames[c] ) ).arg( levels.p001[1][c] ).arg( levels.p1[1][c] )
+            .arg( levels.p9999[1][c] ).arg( levels.max[1][c] );
+        brightClip = qMax( brightClip, levels.p9999[1][c] );
+        darkTop = qMax( darkTop, levels.p9999[0][c] );
+        // The floor in pre-scale codes, and the black a Gaussian low tail implies (p0.1 = mu - 3.090 sigma, p1 = mu -
+        // 2.326 sigma): no optical black reaches this recon (active_area.x1 = 0), so the tail is the only witness.
+        const double floorPre = ( levels.p001[0][c] - levels.black ) / scaleRatio + levels.black;
+        const double sigma = qMax( 0.0, static_cast<double>( levels.p1[0][c] - levels.p001[0][c] ) / 0.764 );
+        const double mu = levels.p1[0][c] + 2.326 * sigma;
+        const double blackPre = ( mu - levels.black ) / scaleRatio + levels.black;
+        if( std::fabs( floorPre - rawBlack ) >= 0.5 || std::fabs( blackPre - rawBlack ) >= 0.5 ) darkLevelsOff = true;
+        darkBlackOffset[c] = qRound( mu - levels.black );
+        darkFloorPre += QStringLiteral( "%1%2:%3" ).arg( c ? QStringLiteral( "/" ) : QString() )
+            .arg( QLatin1String( channelNames[c] ) ).arg( floorPre, 0, 'f', 2 );
+        darkBlackPre += QStringLiteral( "%1%2:%3" ).arg( c ? QStringLiteral( "/" ) : QString() )
+            .arg( QLatin1String( channelNames[c] ) ).arg( blackPre, 0, 'f', 2 );
+    }
+    const int whiteHalf = levels.white / 2;
+    const double brightClipVsHalfEv = ( brightClip > levels.black && whiteHalf > levels.black )
+        ? std::log2( static_cast<double>( brightClip - levels.black ) / static_cast<double>( whiteHalf - levels.black ) )
+        : 0.0;
+    const double darkClipEv = ( darkTop > levels.black && levels.white > levels.black )
+        ? std::log2( static_cast<double>( darkTop - levels.black ) / static_cast<double>( levels.white - levels.black ) )
+        : 0.0;
+    trace += QStringLiteral( " diso_levels valid=%1 black=%2 white=%3 restricted=%4 ratio=%5 rawi_white_scaled=%6 "
+                             "white_half=%7 bright_used=%8 is_bright=%9%10%11%12 active=%13,%14,%15,%16" )
+        .arg( haveLevels ? 1 : 0 ).arg( levels.black ).arg( levels.white ).arg( restricted ? 1 : 0 )
+        .arg( scaleRatio, 0, 'f', 4 ).arg( ( rawWhite - rawBlack ) * scaleRatio + rawBlack, 0, 'f', 1 )
+        .arg( whiteHalf ).arg( levels.white_bright_used )
+        .arg( levels.is_bright[0] ).arg( levels.is_bright[1] ).arg( levels.is_bright[2] ).arg( levels.is_bright[3] )
+        .arg( levels.active_x1 ).arg( levels.active_y1 ).arg( levels.active_x2 ).arg( levels.active_y2 );
+    trace += QStringLiteral( " noise_samples=%1 noise_std=%2/%3/%4/%5 dark_noise=%6 bright_noise=%7" )
+        .arg( levels.has_noise_samples ).arg( levels.noise_std[0], 0, 'f', 2 ).arg( levels.noise_std[1], 0, 'f', 2 )
+        .arg( levels.noise_std[2], 0, 'f', 2 ).arg( levels.noise_std[3], 0, 'f', 2 )
+        .arg( levels.dark_noise, 0, 'f', 2 ).arg( levels.bright_noise, 0, 'f', 2 );
+    trace += QStringLiteral( " dark=%1 bright=%2 bright_clip=%3 bright_clip_vs_half_ev=%4 dark_clip_ev=%5 "
+                             "dark_floor_pre=%6 dark_black_pre=%7 levels_off=%8" )
+        .arg( darkFields ).arg( brightFields ).arg( brightClip ).arg( brightClipVsHalfEv, 0, 'f', 3 )
+        .arg( darkClipEv, 0, 'f', 3 ).arg( darkFloorPre ).arg( darkBlackPre ).arg( darkLevelsOff ? 1 : 0 );
+
+    // LOOK-ASSIST-M16-CAST-4 Step 2: the arms, on fixed frame indices, at the pinned exposure / balance.
     const int width = mlvObject->RAWI.xRes / downscaleFactor;
     const int height = mlvObject->RAWI.yRes / downscaleFactor;
-    if( width <= 0 || height <= 0 ) return trace + QStringLiteral( " variants=none" );
-    const int nominalBd = qRound( nominal.black_delta / 64.0 );
-    const int measuredBd = qRound( judged.black_delta / 64.0 );
-    struct Variant { const char *name; int mode; double ev; int bd; };
-    const Variant variants[4] = {
-        { "nominal",  LLRP_ANALYSIS_DISO_MATCH_SEED,     1.0,         -1 },
-        { "measured", LLRP_ANALYSIS_DISO_MATCH_EXPLICIT, -judged.ev,  measuredBd },
-        { "bd_only",  LLRP_ANALYSIS_DISO_MATCH_EXPLICIT, -nominal.ev, measuredBd },
-        { "ev_only",  LLRP_ANALYSIS_DISO_MATCH_EXPLICIT, -judged.ev,  nominalBd } };
-    std::vector<size_t> mask;
-    auto fixMask = [&]( const std::vector<unsigned char> &rgb )
+    if( width <= 0 || height <= 0 ) return trace + QStringLiteral( " arms=none" );
+    const size_t pixels = static_cast<size_t>( width ) * static_cast<size_t>( height );
+    int asShotTemperature = 6000;
+    int asShotTint = 0;
+    const bool hasAsShot = asShotWhiteBalanceControls( mlvObject, &asShotTemperature, &asShotTint );
+    const double pinExposure = kLookAssistDisoArmExposure;
+    const int pinTemperature = kLookAssistDisoArmTemperature;
+    const int pinTint = kLookAssistDisoArmTint;
+    const int lastFrame = totalFrames - 1;
+    const int armFrames[3] = { judgementFrame, qMin( 374, lastFrame ), qMin( 749, lastFrame ) };
+    trace += QStringLiteral( " arms_pin=ev%1/%2/%3 la=ev%4/%5/%6 as_shot=%7/%8/%9 arm_frames=%10,%11,%12" )
+        .arg( pinExposure, 0, 'f', 2 ).arg( pinTemperature ).arg( pinTint )
+        .arg( exposureStops, 0, 'f', 2 ).arg( temperature ).arg( tint )
+        .arg( hasAsShot ? 1 : 0 ).arg( asShotTemperature ).arg( asShotTint )
+        .arg( armFrames[0] ).arg( armFrames[1] ).arg( armFrames[2] );
+    struct Arm { const char *name; int mode; int whiteBright; double darkNoiseScale; bool darkBlack; bool asShotWb;
+                 bool lookAssistOff; };
+    const int a6White = haveLevels && brightClip > levels.black ? qMin( brightClip, levels.white ) : 0;
+    const Arm arms[8] = {
+        { "R0",  -1, 0,       0.0, false, false, false },
+        { "A1",  -1, 0,       0.0, false, true,  false },
+        { "A3",   2, 0,       0.0, false, false, false },
+        { "A6",  -1, a6White, 0.0, false, false, false },
+        { "A7a", -1, 0,       0.5, false, false, false },
+        { "A7b", -1, 0,       2.0, false, false, false },
+        { "A8",  -1, 0,       0.0, true,  false, false },
+        { "A5",  -1, 0,       0.0, false, true,  true } };
+    trace += QStringLiteral( " a6_white=%1 a8=%2" ).arg( a6White )
+        .arg( darkLevelsOff ? QStringLiteral( "%1/%2/%3/%4" ).arg( darkBlackOffset[0] ).arg( darkBlackOffset[1] )
+                                  .arg( darkBlackOffset[2] ).arg( darkBlackOffset[3] )
+                            : QStringLiteral( "skipped" ) );
+    for( int rf : armFrames )
     {
-        mask.clear();
-        for( size_t i = 0; i < static_cast<size_t>( width ) * static_cast<size_t>( height ); ++i )
+        trace += QStringLiteral( " arms@%1:" ).arg( rf );
+        std::vector<size_t> mask;
+        for( const Arm &a : arms )
         {
-            const int luma = ( 54 * rgb[i * 3] + 183 * rgb[i * 3 + 1] + 19 * rgb[i * 3 + 2] ) >> 8;
-            if( luma >= 20 && luma <= 120 ) mask.push_back( i );
-        }
-    };
-    for( const Variant &v : variants )
-    {
-        std::vector<unsigned char> rgb( static_cast<size_t>( width ) * static_cast<size_t>( height ) * 3u, 0 );
-        dualiso_match_probe_t used;
-        memset( &used, 0, sizeof( used ) );
-        if( !lookAssistDualIsoVariantRender( mlvObject, judgementFrame, downscaleFactor, exposureStops, temperature,
-                                             tint, v.mode, v.ev, v.bd, &rgb, &used ) )
-        {
-            trace += QStringLiteral( " %1=unrendered" ).arg( QLatin1String( v.name ) );
-            continue;
-        }
-        if( v.mode == LLRP_ANALYSIS_DISO_MATCH_SEED )
-        {
-            fixMask( rgb );
-            trace += QStringLiteral( " mask=%1/%2" ).arg( mask.size() ).arg( width * height );
-        }
-        double dbm = 0.0;
-        double psh = 0.0;
-        lookAssistDarkBandMagenta( rgb, mask, &dbm, &psh );
-        trace += QStringLiteral( " %1=ev%2/bd%3/dbm%4/psh%5" ).arg( QLatin1String( v.name ) )
-            .arg( used.ev, 0, 'f', 3 ).arg( used.black_delta / 64.0, 0, 'f', 2 )
-            .arg( dbm, 0, 'f', 1 ).arg( psh, 0, 'f', 1 );
-    }
-
-    // S2 follow-up (measure-only): on three frames, the per-clip median measured match and the recon options, each
-    // against that frame's nominal render (whose mask it is scored on).
-    struct Recon { const char *name; int mode; double ev; int bd; int interp; int alias; int fullres; int chroma; };
-    std::vector<double> sortedEv = evs;
-    std::vector<double> sortedBd = deltas;
-    std::sort( sortedEv.begin(), sortedEv.end() );
-    std::sort( sortedBd.begin(), sortedBd.end() );
-    const bool haveMedian = !sortedEv.empty();
-    const double medianEv = haveMedian ? sortedEv[sortedEv.size() / 2] : 0.0;
-    const int medianBd = haveMedian ? qRound( sortedBd[sortedBd.size() / 2] ) : 0;
-    const Recon recons[6] = {
-        { "base",   LLRP_ANALYSIS_DISO_MATCH_SEED,     1.0,       -1,       -1, -1, -1, -1 },
-        { "median", LLRP_ANALYSIS_DISO_MATCH_EXPLICIT, -medianEv, medianBd, -1, -1, -1, -1 },
-        { "alias1", LLRP_ANALYSIS_DISO_MATCH_SEED,     1.0,       -1,       -1,  1, -1, -1 },
-        { "mean23", LLRP_ANALYSIS_DISO_MATCH_SEED,     1.0,       -1,        1, -1, -1, -1 },
-        { "fr0",    LLRP_ANALYSIS_DISO_MATCH_SEED,     1.0,       -1,       -1, -1,  0, -1 },
-        { "cs0",    LLRP_ANALYSIS_DISO_MATCH_SEED,     1.0,       -1,       -1, -1, -1,  0 } };
-    const int reconFrames[3] = { judgementFrame, frames[3], frames[5] };
-    for( int rf : reconFrames )
-    {
-        trace += QStringLiteral( " recon@%1:" ).arg( rf );
-        for( const Recon &r : recons )
-        {
-            if( r.mode == LLRP_ANALYSIS_DISO_MATCH_EXPLICIT && !haveMedian ) continue;
-            std::vector<unsigned char> rgb( static_cast<size_t>( width ) * static_cast<size_t>( height ) * 3u, 0 );
-            dualiso_match_probe_t used;
-            memset( &used, 0, sizeof( used ) );
-            llrpSetIsolatedAnalysisDualIsoReconForCurrentThread( r.interp, r.alias, r.fullres, r.chroma );
-            const bool rendered = lookAssistDualIsoVariantRender( mlvObject, rf, downscaleFactor, exposureStops,
-                                                                  temperature, tint, r.mode, r.ev, r.bd, &rgb, &used );
-            llrpSetIsolatedAnalysisDualIsoReconForCurrentThread( -1, -1, -1, -1 );
+            if( std::strcmp( a.name, "A6" ) == 0 && a.whiteBright <= 0 ) { trace += QStringLiteral( " A6=skipped" ); continue; }
+            if( a.darkBlack && !darkLevelsOff ) continue;
+            const bool reference = std::strcmp( a.name, "R0" ) == 0;
+            if( !reference && mask.empty() ) { trace += QStringLiteral( " %1=no_mask" ).arg( QLatin1String( a.name ) ); continue; }
+            std::vector<unsigned char> rgb( pixels * 3u, 0 );
+            const bool rendered = lookAssistDisoArmRender(
+                mlvObject, rf, downscaleFactor,
+                a.lookAssistOff ? 0.0 : pinExposure,
+                a.asShotWb ? asShotTemperature : pinTemperature,
+                a.asShotWb ? asShotTint : pinTint,
+                a.lookAssistOff, a.mode, a.whiteBright, a.darkNoiseScale,
+                a.darkBlack ? darkBlackOffset : nullptr, &rgb );
             if( !rendered )
             {
-                trace += QStringLiteral( " %1=unrendered" ).arg( QLatin1String( r.name ) );
+                trace += QStringLiteral( " %1=unrendered" ).arg( QLatin1String( a.name ) );
                 continue;
             }
-            if( std::strcmp( r.name, "base" ) == 0 ) fixMask( rgb );
+            const std::vector<size_t> own = lookAssistLumaBandMask( rgb, pixels );
+            if( reference ) mask = own;
+            // Every arm but A5 is scored over R0's mask; A5 (another exposure) only over its own, and never graded.
+            const std::vector<size_t> &scored = a.lookAssistOff ? own : mask;
             double dbm = 0.0;
             double psh = 0.0;
-            lookAssistDarkBandMagenta( rgb, mask, &dbm, &psh );
-            trace += QStringLiteral( " %1=dbm%2/psh%3" ).arg( QLatin1String( r.name ) )
-                .arg( dbm, 0, 'f', 1 ).arg( psh, 0, 'f', 1 );
+            lookAssistDarkBandMagenta( rgb, scored, &dbm, &psh );
+            const double blk = lookAssistBlotchShare( rgb, width, height, scored );
+            trace += QStringLiteral( " %1=dbm%2/psh%3/blk%4/m%5/own%6" ).arg( QLatin1String( a.name ) )
+                .arg( dbm, 0, 'f', 1 ).arg( psh, 0, 'f', 2 ).arg( blk, 0, 'f', 2 )
+                .arg( scored.size() ).arg( own.size() );
+            if( imageSink )
+                imageSink( QStringLiteral( "f%1-%2" ).arg( rf ).arg( QLatin1String( a.name ) ), width, height, rgb.data() );
         }
     }
+    trace += QStringLiteral( " arms_ms=%1" ).arg( armsClock.elapsed() );
     return trace;
 }
 

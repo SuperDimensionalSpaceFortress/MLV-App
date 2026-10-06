@@ -101,6 +101,9 @@ static MLV_THREAD_LOCAL int g_llrawproc_analysis_diso_interp = -1;
 static MLV_THREAD_LOCAL int g_llrawproc_analysis_diso_alias_map = -1;
 static MLV_THREAD_LOCAL int g_llrawproc_analysis_diso_fullres = -1;
 static MLV_THREAD_LOCAL int g_llrawproc_analysis_diso_chroma_smooth = -1;
+/* LOOK-ASSIST-M16-CAST-4: see llrpSetIsolatedAnalysisDualIsoArmsForCurrentThread(). */
+static MLV_THREAD_LOCAL int g_llrawproc_analysis_diso_mode = -1;
+static MLV_THREAD_LOCAL dualiso_analysis_override_t g_llrawproc_analysis_diso_levels = { 0, 0.0, 0, { 0, 0, 0, 0 } };
 /* LOOK-ASSIST-ANALYSIS-TRUE-LEVELS-1: see llrpLastOutputLevelsForCurrentThread(). */
 static MLV_THREAD_LOCAL const mlvObject_t * g_llrawproc_last_output_levels_video = NULL;
 static MLV_THREAD_LOCAL int g_llrawproc_last_output_bit_depth = 0;
@@ -3468,6 +3471,9 @@ void applyLLRawProcObjectWorker(mlvObject_t * video,
         if (g_llrawproc_analysis_diso_alias_map >= 0) diso_alias_map = g_llrawproc_analysis_diso_alias_map;
         if (g_llrawproc_analysis_diso_fullres >= 0) diso_frblending = g_llrawproc_analysis_diso_fullres;
         if (g_llrawproc_analysis_diso_chroma_smooth >= 0) chroma_smooth_mode = g_llrawproc_analysis_diso_chroma_smooth;
+        /* LOOK-ASSIST-M16-CAST-4: the recon mode arm, read-only isolated renders only (llrpHQDualIso() agrees). */
+        if (shared_read_only && dual_iso_mode != 0 && g_llrawproc_analysis_diso_mode > 0)
+            dual_iso_mode = g_llrawproc_analysis_diso_mode;
     }
     dark_frame_mode = shared->dark_frame;
     vertical_stripes_mode = shared->vertical_stripes;
@@ -4114,6 +4120,8 @@ void applyLLRawProcObjectWorker(mlvObject_t * video,
                     || (gpu_playback_input != NULL
                      && g_llrawproc_gpu_playback_texture_present_preferred);
                 dualiso_debug_set_gpu_recon_state_capture_enabled(capture_gpu_recon_state);
+                /* LOOK-ASSIST-M16-CAST-4: the level/noise arms reach only an isolated recon, and only for its duration. */
+                if (isolated_analysis) dualiso_set_analysis_override(&g_llrawproc_analysis_diso_levels);
                 dual_iso_recon_ok =
                     diso_get_full20bit(raw_info,
                                        raw_image_buff,
@@ -4137,6 +4145,7 @@ void applyLLRawProcObjectWorker(mlvObject_t * video,
                                            : 0,
                                        llrawproc_threads,
                                        &worker->diso_full20bit_scratch);
+                if (isolated_analysis) dualiso_set_analysis_override(NULL);
             }
             /* P3 diagnostic (gated, one-shot): snapshot the RECON-ONLY bayer here --
              * raw_image_buff is the diso_get_full20bit output, BEFORE the post-recon
@@ -4633,6 +4642,40 @@ void llrpSetIsolatedAnalysisDualIsoReconForCurrentThread(int interp, int alias_m
     g_llrawproc_analysis_diso_alias_map = (alias_map == 0 || alias_map == 1) ? alias_map : -1;
     g_llrawproc_analysis_diso_fullres = (fullres == 0 || fullres == 1) ? fullres : -1;
     g_llrawproc_analysis_diso_chroma_smooth = chroma_smooth >= 0 ? llrawproc_normalize_chroma_smooth_method(chroma_smooth) : -1;
+}
+
+void llrpSetIsolatedAnalysisDualIsoArmsForCurrentThread(int dual_iso_mode,
+                                                        int white_bright,
+                                                        double dark_noise_scale,
+                                                        const int * dark_black_offset)
+{
+    g_llrawproc_analysis_diso_mode = (dual_iso_mode == 1 || dual_iso_mode == 2) ? dual_iso_mode : -1;
+    memset(&g_llrawproc_analysis_diso_levels, 0, sizeof(g_llrawproc_analysis_diso_levels));
+    g_llrawproc_analysis_diso_levels.white_bright = white_bright > 0 ? white_bright : 0;
+    g_llrawproc_analysis_diso_levels.dark_noise_scale =
+        (isfinite(dark_noise_scale) && dark_noise_scale > 0.0) ? dark_noise_scale : 0.0;
+    if (dark_black_offset)
+    {
+        g_llrawproc_analysis_diso_levels.dark_black_offset_enabled = 1;
+        memcpy(g_llrawproc_analysis_diso_levels.dark_black_offset,
+               dark_black_offset,
+               sizeof(g_llrawproc_analysis_diso_levels.dark_black_offset));
+    }
+}
+
+int llrpGetIsolatedAnalysisDualIsoArmsForCurrentThread(int * dual_iso_mode,
+                                                       int * white_bright,
+                                                       double * dark_noise_scale,
+                                                       int * dark_black_offset_enabled)
+{
+    if (dual_iso_mode) *dual_iso_mode = g_llrawproc_analysis_diso_mode;
+    if (white_bright) *white_bright = g_llrawproc_analysis_diso_levels.white_bright;
+    if (dark_noise_scale) *dark_noise_scale = g_llrawproc_analysis_diso_levels.dark_noise_scale;
+    if (dark_black_offset_enabled) *dark_black_offset_enabled = g_llrawproc_analysis_diso_levels.dark_black_offset_enabled;
+    return g_llrawproc_analysis_diso_mode > 0
+        || g_llrawproc_analysis_diso_levels.white_bright > 0
+        || g_llrawproc_analysis_diso_levels.dark_noise_scale > 0.0
+        || g_llrawproc_analysis_diso_levels.dark_black_offset_enabled;
 }
 
 /* The isolated analysis seed: nominal (-1, ev 1, black delta -1) unless this thread asked for the measured (-2) match
@@ -5544,6 +5587,10 @@ void llrpSetDualIsoValidity(mlvObject_t * video, int diso_force)
 
 int llrpHQDualIso(mlvObject_t * video)
 {
+    /* LOOK-ASSIST-M16-CAST-4: inside a read-only isolated render the recon mode arm decides (the output's bit depth
+     * follows the recon that made it); everywhere else the shared mode. */
+    if (g_llrawproc_analysis_shared_read_only && g_llrawproc_analysis_diso_mode > 0 && video->llrawproc->dual_iso != 0)
+        return (g_llrawproc_analysis_diso_mode == 1) && video->llrawproc->diso_validity && (llrpGetFixRawMode(video));
     return (video->llrawproc->dual_iso == 1) && video->llrawproc->diso_validity && (llrpGetFixRawMode(video));
 }
 

@@ -48,7 +48,8 @@
       "properties": {
         "contactSheetFrames": { "type": "integer", "minimum": 1, "maximum": 60 },
         "lookFlavor": { "enum": ["classic", "cinematic"], "default": "classic" },
-        "pairedSeek": { "type": "boolean", "default": false, "description": "Also capture the same frames by SEEK after the Play stops (playback_path=false; fetched to evidence contact-sheet-seek\\raw)." }
+        "pairedSeek": { "type": "boolean", "default": false, "description": "Also capture the same frames by SEEK after the Play stops (playback_path=false; fetched to evidence contact-sheet-seek\\raw)." },
+        "disoTrace": { "type": "boolean", "default": false, "description": "LOOK-ASSIST-M16-CAST-4: run the app with MLVAPP_LOOK_ASSIST_DISO_MATCH_TRACE=1 (the measure-only dual-ISO trace, minutes of isolated renders inside Look Assist apply); its arm renders are fetched to evidence diso-trace\\raw." }
       },
       "description": "Required when legType is 'look'. Look Assist is FORCED on for a look leg (Amendment 1 A2)."
     },
