@@ -392,7 +392,8 @@ TEST(GpuDualIsoPreviewScale, ReducedTextureRouteReconstructsTheReducedBayer)
 // the x2/x4 CUDA venue contact frames, and an open blocker of
 // PLAYBACK-CUDA-HONOUR-SCALE-1 (next lever: an ISO-period notch on the reduced
 // recon before display). The reduced recon here is the CPU one (CUDA matches it
-// bit for bit).namespace {
+// bit for bit).
+namespace {
 double rowPeriod4Energy(const std::vector<uint8_t> & rgb, int w, int h)
 {
     std::vector<double> rows(static_cast<size_t>(h), 0.0);
