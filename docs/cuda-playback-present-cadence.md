@@ -186,7 +186,11 @@ one period later), `upstream_late` (ready after that deadline, sub-tagged decode
 by the stage over 2x its session median), `clock` (two or more timeline frames in <= 1.25 periods), else
 `other`. `hist_slip` buckets slip sizes 0/1/2/3/4-7/8+ and `hist_interval` present intervals
 <=45/45-62.5/62.5-83.4/83.4-125/125-250/>250 ms. `native_equiv_presented_fps` is pace x presents /
-timeline frames after the first present. `timeline_advance_by_path` splits the session's timeline
+timeline frames after the first present. The wait for the first frame is mostly repaid a few presents
+after it (the guard banks credit while no grant runs, and one later tick spends it), so skips made while
+the timeline is still behind the wall time since Play, up to that wait's credit, count as
+`startup_catchup_frames`, not slips, and leave the paced `timeline_after_first` (and pace_summary's
+`timeline_fps_after_first_present`); `timeline_after_first_raw` keeps the old reading. `timeline_advance_by_path` splits the session's timeline
 delta by engine path (`drop_tick`, `whole_frame`, `loop_wrap`; `other` is any slider move while
 playing that no engine path made, plus whatever the paths leave unexplained) next to
 `pace_guard_granted_frames`, so a timeline faster than the pace can be traced to its path. The

@@ -10761,14 +10761,16 @@ void MainWindow::playbackHandling(int timeDiff)
                 //PlaybackFrameRange.h for the BLOCKER note on why the wrapped case can never
                 //return the range's last frame)
                 const double sourcePositionBeforeDropTick = m_newPosDropMode;
-                const double grantedDropFrames =
-                    m_playbackPaceGuard.grant( getFramerate() * (double)timeDiff / 1000.0, paceNowMs, getFramerate() );
                 const playback_frame_range::DropFrameTickResult dropFrameTick =
                     playback_frame_range::advanceDropFrameTick(
                         m_newPosDropMode,
-                        grantedDropFrames,
+                        m_playbackPaceGuard.grant( getFramerate() * (double)timeDiff / 1000.0, paceNowMs, getFramerate() ),
                         ui->spinBoxCutIn->value(), ui->spinBoxCutOut->value(),
                         ui->actionLoop->isChecked() );
+                // slip_summary: the granted share, read back from the tick (a wrap subtracted the cut range width;
+                // the clamp at the last frame without Loop reports what was actually advanced).
+                const double grantedDropFrames = dropFrameTick.position - sourcePositionBeforeDropTick
+                    + ( dropFrameTick.wrapped ? static_cast<double>( ui->spinBoxCutOut->value() - ui->spinBoxCutIn->value() ) : 0.0 );
                 m_newPosDropMode = dropFrameTick.position;
                 // PLAYBACK-CLIP-LENGTH-ENFORCE-3: the drop-frame engine's source-frame advance (dropped frames
                 // still advance the timeline; a wrap never counts).
@@ -23984,7 +23986,7 @@ void MainWindow::beginPlaybackSmokeTelemetry( void )
     m_playbackSmokeStartAudioSyncApplied = m_playbackAudioSyncAppliedCount;
     m_playbackSmokeStartAudioSyncSkipped = m_playbackAudioSyncSkippedCount;
     m_playbackSmokeStartTime = mlv_stage_timing_now();
-    m_playbackSlipHistogram.reset( m_playbackSmokeStartPosition, getFramerate() );
+    m_playbackSlipHistogram.reset( m_playbackSmokeStartPosition, getFramerate(), m_playbackSmokeStartTime * 1000.0 );
     m_playbackSmokeLastPresentedTime = 0.0;
     m_playbackSmokeFirstPresentMs = 0.0;
     m_playbackSmokeFirstPresentTimelineDeltaAbs = 0;
@@ -27025,6 +27027,14 @@ void MainWindow::finishPlaybackSmokeTelemetry( const char *reason )
                // ENFORCE-4 r2: binds this receipt to the invocation that wrote it (see automationRunNonce()).
                .arg( automationRunNonce() );
 
+    // PLAYBACK-BACHELOR-PRESENT-JITTER-1: the slip summary is taken here, before pace_summary, because the wait for the
+    // first frame is mostly repaid AFTER the first present: no grant runs while the render thread is busy, so the
+    // guard banks the wait and a later unshaped tick spends it in one burst (Bachelor x4: 23-28 frames about a
+    // second in). Sampling the catch-up at the first present alone left that burst in the paced timeline rate
+    // (timeline_fps_after_first_present 25.0-25.3 at pace 23.976). The delayed part joins the catch-up here.
+    const playback_slip::Summary slipSummary = m_playbackSlipHistogram.finish( now * 1000.0, currentPosition );
+    m_playbackSmokeFirstPresentTimelineDeltaAbs += slipSummary.startupCatchupAfterFirstFrames;
+
     // PLAYBACK-PACE-GUARD-THROUGHPUT-1: timeline_fps above counts the wait for the first frame as playback, so a
     // slow first present (UM r5: 3753 ms) reads as a pace below native. These are the rates the pace governs: frames
     // and time both start at the first present, so what the first present's own advance repaid for the wait
@@ -27100,7 +27110,7 @@ void MainWindow::finishPlaybackSmokeTelemetry( const char *reason )
     // made, plus whatever the paths do not explain), against what the pace guard granted.
     {
         using namespace playback_slip;
-        const Summary slip = m_playbackSlipHistogram.finish( now * 1000.0, currentPosition );
+        const Summary &slip = slipSummary;
         const auto joined = []( const auto &values ) -> QString
         {
             QStringList parts;
@@ -27165,6 +27175,12 @@ void MainWindow::finishPlaybackSmokeTelemetry( const char *reason )
                << QStringLiteral("pace_guard_max_lead_ms=%1").arg( slip.paceGuardMaxLeadMs, 0, 'f', 1 )
                << QStringLiteral("pace_guard_rearms=%1").arg( slip.paceGuardRearms )
                << QStringLiteral("pace_guard_fps=%1/%2").arg( slip.paceGuardFpsMin, 0, 'f', 3 ).arg( slip.paceGuardFpsMax, 0, 'f', 3 )
+               << QStringLiteral("pace_guard_max_grant_frames=%1").arg( slip.paceGuardMaxGrantFrames, 0, 'f', 3 )
+               << QStringLiteral("pace_guard_bursts=%1").arg( slip.paceGuardBursts )
+               << QStringLiteral("pace_guard_burst_frames=%1").arg( slip.paceGuardBurstFrames, 0, 'f', 3 )
+               << QStringLiteral("startup_wait_credit_frames=%1").arg( slip.startupWaitCreditFrames )
+               << QStringLiteral("startup_catchup_after_first=%1").arg( slip.startupCatchupAfterFirstFrames )
+               << QStringLiteral("timeline_after_first_raw=%1").arg( slip.timelineAfterFirstRawFps, 0, 'f', 3 )
                << QStringLiteral("wraps=%1").arg( slip.wraps )
                << QStringLiteral("repeats=%1").arg( slip.repeats )
                << QStringLiteral("grabs=%1").arg( slip.grabs )
