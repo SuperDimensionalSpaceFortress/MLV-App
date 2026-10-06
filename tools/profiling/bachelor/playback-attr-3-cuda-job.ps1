@@ -339,6 +339,10 @@ param(
     # timed Play. Judged on its speed, never on a sheet; the look itself stays the look legs' job.
     [switch]$LookPaceLeg,
 
+    # PLAYBACK-BACHELOR-PRESENT-JITTER-1: the playback render lookahead depth for a LOOK PACE leg's run (passed to the
+    # app as MLVAPP_PLAYBACK_RENDER_LOOKAHEAD_FRAMES, the lookahead A/B). -1 sets nothing, so every other job is unchanged.
+    [ValidateRange(-1, 3)][int]$PlaybackRenderLookaheadFrames = -1,
+
     # Test seam: the venue table to read instead of tools/profiling/dual-venue/venues.json.
     [string]$VenueTablePath = '',
 
@@ -3958,6 +3962,9 @@ function Edit-DualVenueTemplate([string]$Text, [string]$Old, [string]$New) {
     $Text.Substring(0, $first) + $newText + $Text.Substring($first + $oldText.Length)
 }
 
+if ($PlaybackRenderLookaheadFrames -ge 0 -and -not $LookPaceLeg) {
+    throw 'DUAL_VENUE_LOOKAHEAD_NEEDS_LOOK_PACE_LEG -PlaybackRenderLookaheadFrames is only for a -LookPaceLeg run (the lookahead A/B)'
+}
 if ($LookPaceLeg -and ($ContactSheet -or -not $ForceLookAssist)) {
     throw 'DUAL_VENUE_LOOK_PACE_LEG_SHAPE -LookPaceLeg is -ForceLookAssist WITHOUT -ContactSheet (a capture-free pace leg)'
 }
@@ -4077,6 +4084,12 @@ if ($ForceLookAssist) {
         $template = Edit-DualVenueTemplate $template "    'MLVAPP_PLAYBACK_PHASE3_UNATTENDED=1',
 " "    'MLVAPP_PLAYBACK_PHASE3_UNATTENDED=1',
     ('MLVAPP_LOOK_ASSIST_FLAVOR=' + `$LookFlavor),
+"
+    }
+    if ($LookPaceLeg -and $PlaybackRenderLookaheadFrames -ge 0) {
+        $template = Edit-DualVenueTemplate $template "    'MLVAPP_PLAYBACK_PHASE3_UNATTENDED=1',
+" "    'MLVAPP_PLAYBACK_PHASE3_UNATTENDED=1',
+    'MLVAPP_PLAYBACK_RENDER_LOOKAHEAD_FRAMES=$PlaybackRenderLookaheadFrames',
 "
     }
 }
