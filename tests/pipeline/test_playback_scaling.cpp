@@ -601,6 +601,12 @@ TEST(PlaybackScaling, ReconTexturePredicateIsReducedOnlyAtX2AndX4)
     ASSERT_TRUE(playbackReconTextureIsReducedForDisplaySize(905, 1135, 1809, 2269));
     // No display size: never reduced.
     ASSERT_FALSE(playbackReconTextureIsReducedForDisplaySize(452, 564, 0, 0));
+
+    // A reduced present without the AMaZE symbol is refused; x1 never is.
+    // Mutation: missing symbol not refused.
+    ASSERT_TRUE(playbackReducedHnyquistPresentRefused(true, false));
+    ASSERT_FALSE(playbackReducedHnyquistPresentRefused(true, true));
+    ASSERT_FALSE(playbackReducedHnyquistPresentRefused(false, false));
 }
 
 TEST(PlaybackScaling, SuppressesUniformTopMagentaBandOnly)

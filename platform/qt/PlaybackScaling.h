@@ -132,6 +132,14 @@ inline bool playbackReconTextureIsReducedForDisplaySize(int textureWidth,
                                          displayHeight / 2 + 2);
 }
 
+/* A reduced texture present on an AMaZE DLL without the H-Nyquist symbol is refused
+ * (the caller's fallback takes over), so an unfiltered reduced texture is never shown. */
+inline bool playbackReducedHnyquistPresentRefused(bool reducedTexture,
+                                                  bool hnyquistSymbolAvailable)
+{
+    return reducedTexture && !hnyquistSymbolAvailable;
+}
+
 inline bool playbackRgb8RowLooksLikeUniformTopMagentaBand(const uint8_t *row,
                                                           int width)
 {

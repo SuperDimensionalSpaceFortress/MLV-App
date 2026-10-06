@@ -689,7 +689,8 @@ bool GpuDisplayWindow::setPresentedGpuPlaybackReconAmazePostWbTexture(
      * caller's fallback takes over and an unfiltered reduced texture is never shown. */
     const bool reducedHnyquist =
         playbackReconTextureIsReducedForDisplaySize(texWidth, texHeight, displayWidth, displayHeight);
-    if ( reducedHnyquist && !gpuAmazeDebayerReducedHnyquistAvailable() )
+    if ( playbackReducedHnyquistPresentRefused(
+             reducedHnyquist, !reducedHnyquist || gpuAmazeDebayerReducedHnyquistAvailable()) )
     {
         gpuAmazeDebayerNoteReducedHnyquistRefusal();
         return fail(gpuAmazeDebayerReducedHnyquistMissingReason());
