@@ -102,6 +102,36 @@ inline PlaybackPresentationScaleResampler playbackChoosePresentationScaleResampl
     return PlaybackPresentationScaleResampler::Bilinear;
 }
 
+/* PLAYBACK-CUDA-HONOUR-SCALE-1 r3: a recon texture is the reduced (x2/x4) route's when
+ * it is smaller than the clip on both axes; x1, export, paused and scrub textures are
+ * the clip's own size. Reduced textures get the AMaZE H-Nyquist filter. */
+inline bool playbackReconTextureIsReduced(int textureWidth,
+                                          int textureHeight,
+                                          int clipWidth,
+                                          int clipHeight)
+{
+    return textureWidth > 0 && textureHeight > 0
+        && textureWidth < clipWidth && textureHeight < clipHeight;
+}
+
+/* The GPU window is handed the clip's DISPLAY size (clip x stretch, see
+ * mainWindowGpuTexturePresentDisplaySize), not the clip size. Display stretch is >= 1 on
+ * both axes (H 1-2, x3 for the 1/3 vertical setting; V 1, 1.667 or 3) and a reduced
+ * texture is at most half the clip on each axis (+1 for odd dims), so the clip-sized
+ * bound here is half the display size. A x1 clip stretched >= 2 on BOTH axes (H 2.0
+ * with V 3.0) would read as reduced. */
+inline bool playbackReconTextureIsReducedForDisplaySize(int textureWidth,
+                                                        int textureHeight,
+                                                        int displayWidth,
+                                                        int displayHeight)
+{
+    if( displayWidth <= 0 || displayHeight <= 0 ) return false;
+    return playbackReconTextureIsReduced(textureWidth,
+                                         textureHeight,
+                                         displayWidth / 2 + 2,
+                                         displayHeight / 2 + 2);
+}
+
 inline bool playbackRgb8RowLooksLikeUniformTopMagentaBand(const uint8_t *row,
                                                           int width)
 {
