@@ -83,6 +83,7 @@ void llrpResetFpmStatus(mlvObject_t * video) { video->llrawproc->fpm_status = 0;
 void llrpResetBpmStatus(mlvObject_t * video) { video->llrawproc->bpm_status = 0; }
 int llrpSetIsolatedAnalysisSharedStateReadOnlyForCurrentThread(int) { return 0; }
 int llrpSetIsolatedAnalysisDualIsoMatchForCurrentThread(int, double, int) { return 0; }
+void llrpSetIsolatedAnalysisDualIsoReconForCurrentThread(int, int, int, int) {}
 void dualiso_match_probe_reset(int) {}
 int dualiso_match_probe_get(dualiso_match_probe_t * probe)
 {

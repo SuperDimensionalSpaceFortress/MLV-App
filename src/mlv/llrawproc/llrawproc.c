@@ -97,6 +97,10 @@ static MLV_THREAD_LOCAL int g_llrawproc_analysis_diso_match_mode = LLRP_ANALYSIS
 static MLV_THREAD_LOCAL double g_llrawproc_analysis_diso_ev_correction = 1.0;
 static MLV_THREAD_LOCAL int g_llrawproc_analysis_diso_black_delta = -1;
 static void llrawproc_isolated_analysis_diso_seed(int * auto_correction, double * ev_correction, int * black_delta);
+static MLV_THREAD_LOCAL int g_llrawproc_analysis_diso_interp = -1;
+static MLV_THREAD_LOCAL int g_llrawproc_analysis_diso_alias_map = -1;
+static MLV_THREAD_LOCAL int g_llrawproc_analysis_diso_fullres = -1;
+static MLV_THREAD_LOCAL int g_llrawproc_analysis_diso_chroma_smooth = -1;
 /* LOOK-ASSIST-ANALYSIS-TRUE-LEVELS-1: see llrpLastOutputLevelsForCurrentThread(). */
 static MLV_THREAD_LOCAL const mlvObject_t * g_llrawproc_last_output_levels_video = NULL;
 static MLV_THREAD_LOCAL int g_llrawproc_last_output_bit_depth = 0;
@@ -3459,6 +3463,11 @@ void applyLLRawProcObjectWorker(mlvObject_t * video,
         analysis_seed.diso_ev_correction = worker_diso_ev_correction;
         analysis_seed.diso_black_delta = worker_diso_black_delta;
         worker->seeded_runtime_state = analysis_seed;
+        /* LOOK-ASSIST-M16-CAST-3: measure-only recon variants (see llrpSetIsolatedAnalysisDualIsoReconForCurrentThread). */
+        if (g_llrawproc_analysis_diso_interp >= 0) diso_averaging = g_llrawproc_analysis_diso_interp;
+        if (g_llrawproc_analysis_diso_alias_map >= 0) diso_alias_map = g_llrawproc_analysis_diso_alias_map;
+        if (g_llrawproc_analysis_diso_fullres >= 0) diso_frblending = g_llrawproc_analysis_diso_fullres;
+        if (g_llrawproc_analysis_diso_chroma_smooth >= 0) chroma_smooth_mode = g_llrawproc_analysis_diso_chroma_smooth;
     }
     dark_frame_mode = shared->dark_frame;
     vertical_stripes_mode = shared->vertical_stripes;
@@ -4616,6 +4625,14 @@ int llrpSetIsolatedAnalysisDualIsoMatchForCurrentThread(int mode, double ev_corr
     g_llrawproc_analysis_diso_ev_correction = ev_correction;
     g_llrawproc_analysis_diso_black_delta = black_delta;
     return previous;
+}
+
+void llrpSetIsolatedAnalysisDualIsoReconForCurrentThread(int interp, int alias_map, int fullres, int chroma_smooth)
+{
+    g_llrawproc_analysis_diso_interp = (interp == 0 || interp == 1) ? interp : -1;
+    g_llrawproc_analysis_diso_alias_map = (alias_map == 0 || alias_map == 1) ? alias_map : -1;
+    g_llrawproc_analysis_diso_fullres = (fullres == 0 || fullres == 1) ? fullres : -1;
+    g_llrawproc_analysis_diso_chroma_smooth = chroma_smooth >= 0 ? llrawproc_normalize_chroma_smooth_method(chroma_smooth) : -1;
 }
 
 /* The isolated analysis seed: nominal (-1, ev 1, black delta -1) unless this thread asked for the measured (-2) match

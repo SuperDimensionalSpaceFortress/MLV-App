@@ -68,6 +68,10 @@ int llrpSetIsolatedAnalysisSharedStateReadOnlyForCurrentThread(int enabled);
 #define LLRP_ANALYSIS_DISO_MATCH_MEASURED 1
 #define LLRP_ANALYSIS_DISO_MATCH_EXPLICIT 2
 int llrpSetIsolatedAnalysisDualIsoMatchForCurrentThread(int mode, double ev_correction, int black_delta);
+/* LOOK-ASSIST-M16-CAST-3 measure-only: the HQ dual-ISO recon options an ISOLATED analysis render on the calling thread
+ * uses instead of the shared ones (interp 0 AMaZE / 1 mean23, alias map, fullres blending, chroma smoothing method).
+ * -1 keeps the shared value; all -1 (the default) is today's render. */
+void llrpSetIsolatedAnalysisDualIsoReconForCurrentThread(int interp, int alias_map, int fullres, int chroma_smooth);
 /* The output levels (dng bit depth / black / white) of the last llrawproc run on the calling thread that completed for
  * `video`, live or isolated: the levels its frame is at, which a display render syncs the processing object to. Returns
  * 0 when no run completed for `video` since the last reset on this thread (e.g. the frame came from a cache). */

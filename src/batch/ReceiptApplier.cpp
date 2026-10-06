@@ -895,6 +895,15 @@ QString ReceiptApplier::lookAssistDualIsoMatchTrace(mlvObject_t *mlvObject,
         { "bd_only",  LLRP_ANALYSIS_DISO_MATCH_EXPLICIT, -nominal.ev, measuredBd },
         { "ev_only",  LLRP_ANALYSIS_DISO_MATCH_EXPLICIT, -judged.ev,  nominalBd } };
     std::vector<size_t> mask;
+    auto fixMask = [&]( const std::vector<unsigned char> &rgb )
+    {
+        mask.clear();
+        for( size_t i = 0; i < static_cast<size_t>( width ) * static_cast<size_t>( height ); ++i )
+        {
+            const int luma = ( 54 * rgb[i * 3] + 183 * rgb[i * 3 + 1] + 19 * rgb[i * 3 + 2] ) >> 8;
+            if( luma >= 20 && luma <= 120 ) mask.push_back( i );
+        }
+    };
     for( const Variant &v : variants )
     {
         std::vector<unsigned char> rgb( static_cast<size_t>( width ) * static_cast<size_t>( height ) * 3u, 0 );
@@ -908,11 +917,7 @@ QString ReceiptApplier::lookAssistDualIsoMatchTrace(mlvObject_t *mlvObject,
         }
         if( v.mode == LLRP_ANALYSIS_DISO_MATCH_SEED )
         {
-            for( size_t i = 0; i < static_cast<size_t>( width ) * static_cast<size_t>( height ); ++i )
-            {
-                const int luma = ( 54 * rgb[i * 3] + 183 * rgb[i * 3 + 1] + 19 * rgb[i * 3 + 2] ) >> 8;
-                if( luma >= 20 && luma <= 120 ) mask.push_back( i );
-            }
+            fixMask( rgb );
             trace += QStringLiteral( " mask=%1/%2" ).arg( mask.size() ).arg( width * height );
         }
         double dbm = 0.0;
@@ -921,6 +926,51 @@ QString ReceiptApplier::lookAssistDualIsoMatchTrace(mlvObject_t *mlvObject,
         trace += QStringLiteral( " %1=ev%2/bd%3/dbm%4/psh%5" ).arg( QLatin1String( v.name ) )
             .arg( used.ev, 0, 'f', 3 ).arg( used.black_delta / 64.0, 0, 'f', 2 )
             .arg( dbm, 0, 'f', 1 ).arg( psh, 0, 'f', 1 );
+    }
+
+    // S2 follow-up (measure-only): on three frames, the per-clip median measured match and the recon options, each
+    // against that frame's nominal render (whose mask it is scored on).
+    struct Recon { const char *name; int mode; double ev; int bd; int interp; int alias; int fullres; int chroma; };
+    std::vector<double> sortedEv = evs;
+    std::vector<double> sortedBd = deltas;
+    std::sort( sortedEv.begin(), sortedEv.end() );
+    std::sort( sortedBd.begin(), sortedBd.end() );
+    const bool haveMedian = !sortedEv.empty();
+    const double medianEv = haveMedian ? sortedEv[sortedEv.size() / 2] : 0.0;
+    const int medianBd = haveMedian ? qRound( sortedBd[sortedBd.size() / 2] ) : 0;
+    const Recon recons[6] = {
+        { "base",   LLRP_ANALYSIS_DISO_MATCH_SEED,     1.0,       -1,       -1, -1, -1, -1 },
+        { "median", LLRP_ANALYSIS_DISO_MATCH_EXPLICIT, -medianEv, medianBd, -1, -1, -1, -1 },
+        { "alias1", LLRP_ANALYSIS_DISO_MATCH_SEED,     1.0,       -1,       -1,  1, -1, -1 },
+        { "mean23", LLRP_ANALYSIS_DISO_MATCH_SEED,     1.0,       -1,        1, -1, -1, -1 },
+        { "fr0",    LLRP_ANALYSIS_DISO_MATCH_SEED,     1.0,       -1,       -1, -1,  0, -1 },
+        { "cs0",    LLRP_ANALYSIS_DISO_MATCH_SEED,     1.0,       -1,       -1, -1, -1,  0 } };
+    const int reconFrames[3] = { judgementFrame, frames[3], frames[5] };
+    for( int rf : reconFrames )
+    {
+        trace += QStringLiteral( " recon@%1:" ).arg( rf );
+        for( const Recon &r : recons )
+        {
+            if( r.mode == LLRP_ANALYSIS_DISO_MATCH_EXPLICIT && !haveMedian ) continue;
+            std::vector<unsigned char> rgb( static_cast<size_t>( width ) * static_cast<size_t>( height ) * 3u, 0 );
+            dualiso_match_probe_t used;
+            memset( &used, 0, sizeof( used ) );
+            llrpSetIsolatedAnalysisDualIsoReconForCurrentThread( r.interp, r.alias, r.fullres, r.chroma );
+            const bool rendered = lookAssistDualIsoVariantRender( mlvObject, rf, downscaleFactor, exposureStops,
+                                                                  temperature, tint, r.mode, r.ev, r.bd, &rgb, &used );
+            llrpSetIsolatedAnalysisDualIsoReconForCurrentThread( -1, -1, -1, -1 );
+            if( !rendered )
+            {
+                trace += QStringLiteral( " %1=unrendered" ).arg( QLatin1String( r.name ) );
+                continue;
+            }
+            if( std::strcmp( r.name, "base" ) == 0 ) fixMask( rgb );
+            double dbm = 0.0;
+            double psh = 0.0;
+            lookAssistDarkBandMagenta( rgb, mask, &dbm, &psh );
+            trace += QStringLiteral( " %1=dbm%2/psh%3" ).arg( QLatin1String( r.name ) )
+                .arg( dbm, 0, 'f', 1 ).arg( psh, 0, 'f', 1 );
+        }
     }
     return trace;
 }
