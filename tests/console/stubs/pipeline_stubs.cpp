@@ -90,6 +90,13 @@ int dualiso_match_probe_get(dualiso_match_probe_t * probe)
     if (probe) memset(probe, 0, sizeof(*probe));
     return 0;
 }
+void llrpSetIsolatedAnalysisDualIsoArmsForCurrentThread(int, int, double, const int *) {}
+void dualiso_levels_probe_reset(int) {}
+int dualiso_levels_probe_get(dualiso_levels_probe_t * probe)
+{
+    if (probe) memset(probe, 0, sizeof(*probe));
+    return 0;
+}
 void llrpInitDarkFrameExtFileName(mlvObject_t * video, char * df_filename)
 {
     if (video->llrawproc->dark_frame_filename) {
