@@ -471,3 +471,26 @@ TEST(PlaybackSlipHistogram, AGrantFreeStallIsRepaidInOneBurst)
     ASSERT_NEAR( burst - 1.0, s.paceGuardBurstFrames, 1e-12 );
     ASSERT_TRUE( s.paceGuardMaxLeadFrames <= 1e-9 );   // within the guard's own contract: carry + elapsed since its last grant
 }
+TEST(PlaybackSlipHistogram, TheSkipAfterAStallIsMarkedAfterGapButKeepsItsClass)
+{
+    // A 300 ms stall whose own present shows the next frame in order (a lookahead frame rendered before it), then a
+    // short-interval present that skips what the stall cost: the slip keeps its pre-registered class (its own
+    // interval is short) and is counted in slips_after_gap.
+    Driver d;
+    d.clean( 0, 10 );
+    const double stalled = d.at( 9 ) + 300.0;
+    d.move( 17, stalled );
+    d.present( 10, stalled, d.at( 9 ) + 5.0 );          // in order: no slip, a 300 ms interval
+    const double next = stalled + 40.0;
+    d.move( 18, next );
+    d.present( 17, next, next - 2.0 );                    // 6 frames skipped one present later
+    d.clean( 18, 20 );
+    const Summary s = d.h.finish( d.at( 20 ) + 300.0, d.timeline );
+    ASSERT_EQ( 6LL, s.slipsTotal );
+    ASSERT_EQ( 0LL, cls( s, SlipClass::Gap ) );
+    ASSERT_EQ( 1, s.slipEventsAfterGap );
+    ASSERT_EQ( 6LL, s.slipsAfterGap );
+    ASSERT_TRUE( s.slipLines[0].afterGap );
+    ASSERT_EQ( 10, s.maxIntervalFrame );
+    ASSERT_TRUE( s.maxIntervalClass == SlipClass::None );
+}
