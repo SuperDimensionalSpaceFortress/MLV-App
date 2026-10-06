@@ -4501,9 +4501,40 @@ void RenderFrameThread::drawFrame( int slotIndex,
     double gpuTexNrFastShDebayerMs = 0.0;
     double gpuTexNrFastShRefreshMs = 0.0;
     /* The S/H frame state is taken from the Bayer the texture was built from:
-     * the reduced prepared input on a CUDA reduced recon, rawImage16 otherwise. */
+     * rawImage16 at x1, whose quarter-res proxy averages 4x4 blocks and so mixes
+     * both ISO row pairs. On a CUDA reduced recon the engine refuses that x1 lane
+     * and debayers the reduced prepared input at full size, where the bright and
+     * dark ISO rows still alternate: the frame state then carried the 4-row ISO
+     * pattern into the display shader (the mesh the first x4 venue legs showed).
+     * Each sample is averaged with the same-colour sample two rows away, which
+     * in a 2+2 dual-ISO row pattern is always the opposite ISO. */
+    if( gpuReducedReconSlot
+     && slot.reducedReconBayer.size()
+            >= static_cast<size_t>( gpuReconTextureWidth )
+               * static_cast<size_t>( gpuReconTextureHeight ) )
+    {
+        const int w = gpuReconTextureWidth;
+        const int h = gpuReconTextureHeight;
+        m_gpuReducedShSourceBayer.resize( static_cast<size_t>( w ) * static_cast<size_t>( h ) );
+        const uint16_t *src = slot.reducedReconBayer.data();
+        uint16_t *dst = m_gpuReducedShSourceBayer.data();
+        for( int y = 0; y < h; ++y )
+        {
+            const int pair = ( ( y & 3 ) < 2 ) ? y + 2 : y - 2;
+            const uint16_t *row = src + static_cast<size_t>( y ) * w;
+            const uint16_t *other = ( pair >= 0 && pair < h )
+                ? src + static_cast<size_t>( pair ) * w
+                : row;
+            uint16_t *out = dst + static_cast<size_t>( y ) * w;
+            for( int x = 0; x < w; ++x )
+            {
+                out[x] = static_cast<uint16_t>(
+                    ( static_cast<uint32_t>( row[x] ) + other[x] + 1u ) >> 1 );
+            }
+        }
+    }
     std::vector<uint16_t> &gpuTexNrShSourceBayer =
-        gpuReducedReconSlot ? slot.reducedReconBayer : slot.rawImage16;
+        gpuReducedReconSlot ? m_gpuReducedShSourceBayer : slot.rawImage16;
     const size_t fullResPixelCountForGpuTexNr =
         static_cast<size_t>( qMax( 0, gpuReconTextureWidth ) )
         * static_cast<size_t>( qMax( 0, gpuReconTextureHeight ) );
