@@ -143,9 +143,11 @@ try {
     $StepLog['sourceArchive'] = 0
 } finally {
     $archiveBytes = [long]0
-    if (Test-Path -LiteralPath $archivePath) { $archiveBytes = [long](Get-Item -LiteralPath $archivePath -Force).Length }
+    $archiveExisted = Test-Path -LiteralPath $archivePath
+    if ($archiveExisted) { $archiveBytes = [long](Get-Item -LiteralPath $archivePath -Force).Length }
     $archiveGone = Remove-AttrCudaPartialFile -TrustedRoot $OutDir -Path $archivePath -OwnedJournal $OwnedJournal
-    if ($archiveGone) { Say "SOURCE ARCHIVE removed after consume, freed $archiveBytes bytes" } else { Say "SOURCE ARCHIVE left in place ($archiveBytes bytes): the journal did not prove it" }
+    if ($archiveGone -and -not $archiveExisted) { Say "SOURCE ARCHIVE absent: git archive produced no file, nothing to remove" }
+    elseif ($archiveGone) { Say "SOURCE ARCHIVE removed after consume, freed $archiveBytes bytes" } else { Say "SOURCE ARCHIVE left in place ($archiveBytes bytes): the journal did not prove it" }
 }
 
 # --- verify the DLL pair BEFORE it is deployed -------------------------------------------------
@@ -417,12 +419,13 @@ $publishedManifestSha256 = Get-ShaLower (Join-Path $OutDir $names.buildManifestN
 # LANE-BUILD-WORKDIR-RETENTION-1: a new head prunes the superseded .work-<sha12> trees of this run (every
 # head iteration has its own build-* dir under one lane-* run dir, hence -IncludeSiblingBuildDirs). The
 # newest tree (this one) stays whole, as does any tree written in the last two hours (a sibling leg may be
-# building into it); each older one has its evidence copied and verified first, then is dropped through
-# its build dir's ownership journal. Best effort: the package is already published, so a retention
+# building into it) and any tree whose head never published its build.json (it failed before staging or is
+# still building) or that holds a recording or an over-2-GiB file; each remaining older one has its evidence
+# copied and verified first, then is dropped through its build dir's ownership journal. Best effort: the package is already published, so a retention
 # problem is reported and never changes this job's result.
 try {
     Import-Module (Join-Path $PSScriptRoot 'AttrCudaWorkRetention.psm1') -Force
-    [void](Invoke-AttrCudaWorkRetention -BuildDir $OutDir -OwnedJournal $OwnedJournal -KeepSha $names.shortSha -IncludeSiblingBuildDirs)
+    [void](Invoke-AttrCudaWorkRetention -BuildDir $OutDir -OwnedJournal $OwnedJournal -KeepSha $names.shortSha -IncludeSiblingBuildDirs -RepoRoot $RepoRoot)
 } catch {
     Say "RETENTION skipped: $($_.Exception.Message)"
 }

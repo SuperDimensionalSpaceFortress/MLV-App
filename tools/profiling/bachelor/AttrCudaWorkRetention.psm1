@@ -10,6 +10,16 @@
 # run dir, so the keep-newest rule spans the run's build* dirs (-IncludeSiblingBuildDirs). A tree written
 # within -MinAgeMinutes (default 120) is never dropped: a sibling leg may be building into it.
 #
+# ELIGIBILITY (pr285-r2, sol blockers 1 and 2). Only a FINISHED, PUBLISHED head is a candidate: its build dir
+# must hold playback-attr-3-cuda-<sha12>-build.json (the assembler writes it LAST, after every artifact is
+# published and hash-verified) naming that sha, assembled after the tree was created. A tree with no such
+# manifest failed before staging or is still building: its binaries may exist nowhere else, so it is kept
+# whole (kept-unpublished). Before any drop, every file of a candidate is scanned (reparse points are not
+# entered): a file with recording/container magic bytes, or one over -MaxFileBytes (2 GiB), keeps the whole
+# tree (kept-guard). The one exemption is a TRACKED FIXTURE, identified by git object identity: the file sits
+# under the tree's own src\tests\fixtures\ and `git hash-object --no-filters <file>` equals the blob id of
+# `<sha12>:<path relative to src\>` in -RepoRoot. Any failed step keeps the tree.
+#
 # WHAT IT KEEPS. The newest .work-<sha12> (and the one named by -KeepSha) stays whole. For each superseded
 # tree the evidence is copied FIRST to <build dir>\evidence-<sha12>\ and the copy is VERIFIED (file count
 # and bytes) before anything is dropped; a copy that does not verify keeps the tree. Evidence = every
@@ -30,6 +40,8 @@ Set-StrictMode -Version Latest
 $script:WorkTreeNameRx = '^\.work-[0-9a-f]{12}$'
 $script:EvidenceFilePatterns = @('*.exe', '*.dll', '*.receipt.json', '*.log', '*.txt', '*.json', '*.png', '*.jpg', '*.jpeg', '*.csv', '*.etl')
 $script:EvidenceSkipTopLevel = @('src')
+# The first four bytes of the raw-video container, as bytes: this module never names a media extension.
+$script:ContainerMagic = [byte[]](0x4D, 0x4C, 0x56, 0x49)
 
 function Get-AttrCudaTreeBytes {
     # Bytes of every file under a directory, not descending into or counting a reparse point.
@@ -45,6 +57,118 @@ function Get-AttrCudaTreeBytes {
         foreach ($file in ([IO.DirectoryInfo]$Path).EnumerateFiles('*', $options)) { $sum += $file.Length }
     } catch { }
     return $sum
+}
+
+function Test-AttrCudaWorkPublished {
+    # $null when the head <sha12> of this build dir is published, otherwise the reason it is not.
+    # Published = the manifest the assembler writes last exists, parses, names this sha as its
+    # sourceCommit, and was assembled after the .work tree was created (a stale manifest of an earlier run
+    # of the same sha does not vouch for a later, failed re-run of it).
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $true)][string]$BuildDir,
+        [Parameter(Mandatory = $true)][string]$Sha,
+        [Parameter(Mandatory = $true)][DateTime]$TreeCreatedUtc
+    )
+
+    $manifestPath = Join-Path $BuildDir "playback-attr-3-cuda-$Sha-build.json"
+    if (-not (Test-Path -LiteralPath $manifestPath -PathType Leaf)) { return "no published build.json for $Sha" }
+    try {
+        $manifest = Get-Content -LiteralPath $manifestPath -Raw -ErrorAction Stop | ConvertFrom-Json -ErrorAction Stop
+        $commit = [string]$manifest.sourceCommit
+        if ($commit -notmatch '^[0-9a-f]{40}$' -or -not $commit.StartsWith($Sha, [StringComparison]::Ordinal)) {
+            return "build.json names sourceCommit '$commit', not $Sha"
+        }
+        # PowerShell 7 hands an ISO timestamp back as a [DateTime] already; Windows PowerShell 5.1 as text.
+        $stamp = $manifest.assembledAtUtc
+        if ($stamp -is [DateTime]) {
+            $assembled = $stamp.ToUniversalTime()
+        } else {
+            $styles = [Globalization.DateTimeStyles]::AssumeUniversal -bor [Globalization.DateTimeStyles]::AdjustToUniversal
+            $assembled = [DateTime]::Parse([string]$stamp, [Globalization.CultureInfo]::InvariantCulture, $styles)
+        }
+        if ($assembled -lt $TreeCreatedUtc) { return "build.json (assembled $($assembled.ToString('o'))) predates this tree" }
+    } catch {
+        return "build.json unreadable: $($_.Exception.Message)"
+    }
+    return $null
+}
+
+function Test-AttrCudaTrackedFixture {
+    # $true ONLY for a byte-identical tracked fixture; any doubt is $false (the tree stays).
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $true)][string]$Tree,
+        [Parameter(Mandatory = $true)][string]$FullName,
+        [string]$RepoRoot = ''
+    )
+
+    try {
+        if ($RepoRoot -eq '') { return $false }
+        $root = $Tree.TrimEnd('\')
+        $leaf = Split-Path -Leaf $root
+        if ($leaf -notmatch $script:WorkTreeNameRx) { return $false }
+        if (-not $FullName.StartsWith($root + '\src\tests\fixtures\', [StringComparison]::OrdinalIgnoreCase)) { return $false }
+        $sha = $leaf.Substring(6)
+        $rel = $FullName.Substring($root.Length + 5) -replace '\\', '/'
+        $blob = @(& git.exe -C $RepoRoot rev-parse --verify --quiet "${sha}:${rel}" 2>$null)
+        if ($LASTEXITCODE -ne 0 -or $blob.Count -ne 1 -or "$($blob[0])".Trim() -notmatch '^[0-9a-f]{40}([0-9a-f]{24})?$') { return $false }
+        $id = "$($blob[0])".Trim()
+        $kind = @(& git.exe -C $RepoRoot cat-file -t $id 2>$null)
+        if ($LASTEXITCODE -ne 0 -or $kind.Count -ne 1 -or "$($kind[0])".Trim() -ne 'blob') { return $false }
+        $hash = @(& git.exe -C $RepoRoot hash-object --no-filters -- $FullName 2>$null)
+        if ($LASTEXITCODE -ne 0 -or $hash.Count -ne 1) { return $false }
+        return ("$($hash[0])".Trim() -eq $id)
+    } catch { return $false }
+}
+
+function Test-AttrCudaContainerMagic {
+    # $true = the first four bytes are the container magic OR the file cannot be read (keep); reads 4 bytes only.
+    [CmdletBinding()]
+    param([Parameter(Mandatory = $true)][string]$Path)
+
+    $stream = $null
+    try {
+        $stream = [IO.FileStream]::new($Path, [IO.FileMode]::Open, [IO.FileAccess]::Read, [IO.FileShare]::ReadWrite)
+        $head = New-Object byte[] 4
+        if ($stream.Read($head, 0, 4) -lt 4) { return $false }
+        for ($k = 0; $k -lt 4; $k++) { if ($head[$k] -ne $script:ContainerMagic[$k]) { return $false } }
+        return $true
+    } catch { return $true } finally { if ($stream) { $stream.Dispose() } }
+}
+
+function Get-AttrCudaTreeGuardReason {
+    # $null when no file of the tree needs the tree kept; otherwise why it is kept. Every file is looked at
+    # whatever its name or place; reparse points are not entered.
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $true)][string]$Tree,
+        [long]$MaxFileBytes = 2GB,
+        [string]$RepoRoot = ''
+    )
+
+    $root = $Tree.TrimEnd('\')
+    $pending = [System.Collections.Generic.Stack[string]]::new()
+    $pending.Push($root)
+    while ($pending.Count -gt 0) {
+        $dir = $pending.Pop()
+        try {
+            $entries = @(([IO.DirectoryInfo]$dir).EnumerateFileSystemInfos())
+        } catch {
+            return "unreadable directory $dir"
+        }
+        foreach ($entry in $entries) {
+            if ($entry.Attributes -band [IO.FileAttributes]::ReparsePoint) { continue }
+            if ($entry.Attributes -band [IO.FileAttributes]::Directory) { $pending.Push($entry.FullName); continue }
+            if ($entry.Length -gt $MaxFileBytes) { return "file over $MaxFileBytes bytes: $($entry.FullName)" }
+            if ($entry.Length -lt 4) { continue }
+            if ((Test-AttrCudaContainerMagic -Path $entry.FullName) -and
+                -not (Test-AttrCudaTrackedFixture -Tree $root -FullName $entry.FullName -RepoRoot $RepoRoot)) {
+                return "container magic or unreadable file: $($entry.FullName)"
+            }
+        }
+    }
+    return $null
 }
 
 function Get-AttrCudaWorkEvidenceFiles {
@@ -129,7 +253,12 @@ function Invoke-AttrCudaWorkRetention {
     Each build dir's own journal is <that dir>\<leaf of -OwnedJournal>; -OwnedJournal is the proof for
     -BuildDir itself. -DryRun reports what would happen and changes nothing, not even the evidence copy.
     Returns one { Build; Sha; Action; WorkBytes; FreedBytes; EvidenceFiles; EvidenceBytes; Detail } per
-    superseded tree. Action is one of: dropped, would-drop, kept-copy-failed, kept-partial, kept-error.
+    superseded tree. Action is one of: dropped, would-drop, kept-unpublished, kept-guard,
+    kept-copy-failed, kept-partial, kept-error.
+    Only a PUBLISHED head is a candidate (Test-AttrCudaWorkPublished); an unpublished tree is kept whole
+    (kept-unpublished). A candidate whose files carry container magic, or exceed -MaxFileBytes, is kept
+    whole (kept-guard) unless the file is a tracked fixture of -RepoRoot (Test-AttrCudaTrackedFixture;
+    without -RepoRoot there is no exemption).
     The drop is Remove-AttrCudaTree -OwnedJournal: it deletes only what the journal proves, never
     recurses by pathname, and leaves the tree standing when any entry is unproven.
     #>
@@ -140,6 +269,8 @@ function Invoke-AttrCudaWorkRetention {
         [ValidatePattern('^([0-9a-f]{12})?$')][string]$KeepSha = '',
         [switch]$IncludeSiblingBuildDirs,
         [int]$MinAgeMinutes = 120,
+        [long]$MaxFileBytes = 2GB,
+        [string]$RepoRoot = '',
         [switch]$DryRun
     )
 
@@ -182,7 +313,15 @@ function Invoke-AttrCudaWorkRetention {
         $before = Get-AttrCudaTreeBytes -Path $tree.FullName
         $result = [ordered]@{ Build = (Split-Path -Leaf $treeBuildDir); Sha = $sha; Action = ''; WorkBytes = $before; FreedBytes = [long]0; EvidenceFiles = 0; EvidenceBytes = [long]0; Detail = '' }
         try {
-            if ($DryRun) {
+            $notPublished = Test-AttrCudaWorkPublished -BuildDir $treeBuildDir -Sha $sha -TreeCreatedUtc $tree.CreationTimeUtc
+            $guard = if ($notPublished) { $null } else { Get-AttrCudaTreeGuardReason -Tree $tree.FullName -MaxFileBytes $MaxFileBytes -RepoRoot $RepoRoot }
+            if ($notPublished) {
+                $result.Action = 'kept-unpublished'
+                $result.Detail = $notPublished
+            } elseif ($guard) {
+                $result.Action = 'kept-guard'
+                $result.Detail = $guard
+            } elseif ($DryRun) {
                 $planned = @(Get-AttrCudaWorkEvidenceFiles -WorkDir $tree.FullName)
                 $result.EvidenceFiles = $planned.Count
                 $result.EvidenceBytes = [long](($planned | Measure-Object -Property Length -Sum).Sum)
@@ -192,8 +331,8 @@ function Invoke-AttrCudaWorkRetention {
                 $result.EvidenceFiles = $copy.Files
                 $result.EvidenceBytes = $copy.Bytes
             }
-            if ($DryRun) {
-                # nothing is copied or dropped in a dry run
+            if ($result.Action -ne '') {
+                # decided without touching the tree: kept-unpublished, kept-guard, or a dry run's would-drop
             } elseif (-not $copy.Ok) {
                 $result.Action = 'kept-copy-failed'
                 $result.Detail = (@($copy.Missing) | Select-Object -First 3) -join '; '
@@ -221,6 +360,10 @@ function Invoke-AttrCudaWorkRetention {
 
 Export-ModuleMember -Function `
     Get-AttrCudaTreeBytes, `
+    Test-AttrCudaWorkPublished, `
+    Test-AttrCudaTrackedFixture, `
+    Test-AttrCudaContainerMagic, `
+    Get-AttrCudaTreeGuardReason, `
     Get-AttrCudaWorkEvidenceFiles, `
     Copy-AttrCudaWorkEvidence, `
     Invoke-AttrCudaWorkRetention
