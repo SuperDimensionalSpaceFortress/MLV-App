@@ -75,7 +75,10 @@ OWNER_CLIP = "M16-1243"   # a consented clip ID (an id is not footage); the runn
 # Every leg spec shipped under legs/ (DVE-SCALE2-LOOK-LEG-1 added the scale-2 look leg); the tracked-spec tests loop over all of them.
 # DUAL-VENUE-DISPLAY-MATRIX-1 added the six display-matrix legs ({fullscreen, windowed} x {scale 1, 2, 4}); legsets/display-matrix.json names them.
 DISPLAY_MATRIX_LEGS = tuple(f"legs/m16-1243-display-{mode}-s{scale}.json" for scale in (1, 2, 4) for mode in ("fullscreen", "windowed"))
-SHIPPED_LEGS = ("legs/m16-1243-speed.json", "legs/m16-1243-look.json", "legs/m16-1243-look-scale2.json", "legs/m16-1243-look-cinematic.json", *DISPLAY_MATRIX_LEGS)
+# LOOK-ASSIST-M16-CAST-3 added the scale-2 look leg with the paired seek capture (look.pairedSeek): pixel-aligned frames for a before/after metric.
+# LOOK-ASSIST-M16-CAST-4 added the scale-2 look leg with the measure-only dual-ISO trace (look.disoTrace).
+SHIPPED_LEGS = ("legs/m16-1243-speed.json", "legs/m16-1243-look.json", "legs/m16-1243-look-scale2.json", "legs/m16-1243-look-scale2-seek.json",
+                "legs/m16-1243-look-scale2-trace.json", "legs/m16-1243-look-cinematic.json", *DISPLAY_MATRIX_LEGS)
 SHIPPED_LEGS_PS = ", ".join(f"'{rel}'" for rel in SHIPPED_LEGS)
 OTHER_CLIP = "Z99-9999"
 MLV_EXT = "." + "mlv"  # never spelled as one literal token (the NA-4 gate trips on fixture basenames)
@@ -198,13 +201,18 @@ class GeneratorByteIdentityAndVariantTests(unittest.TestCase):
     CONTACT_SHEET_PARITY_OPEN = "CONTACT-SHEET-PLAYBACK-PARITY-1 >>>"
     CONTACT_SHEET_PARITY_CLOSE = "CONTACT-SHEET-PLAYBACK-PARITY-1 <<<"
     CONTACT_SHEET_PARITY_REGIONS = 3
+    # LOOK-ASSIST-M16-CAST-4: the opt-in dual-ISO trace ($LookAssistDisoTrace, its one env entry, its publish step). Three regions.
+    DISO_TRACE_OPEN = "LOOK-ASSIST-M16-CAST-4 >>>"
+    DISO_TRACE_CLOSE = "LOOK-ASSIST-M16-CAST-4 <<<"
+    DISO_TRACE_REGIONS = 3
 
     @classmethod
     def strip_regions(cls, text: str) -> tuple[str, dict[str, int]]:
         """Remove every bracketed region of either sentinel family; return the kept text and the number of regions per family."""
         families = {"leg-terminals": (cls.LEG_TERMINALS_OPEN, cls.LEG_TERMINALS_CLOSE), "presentmon-evidence": (cls.PRESENTMON_EVIDENCE_OPEN, cls.PRESENTMON_EVIDENCE_CLOSE),
                     "orphan-sweep": (cls.ORPHAN_SWEEP_OPEN, cls.ORPHAN_SWEEP_CLOSE),
-                    "contact-sheet-parity": (cls.CONTACT_SHEET_PARITY_OPEN, cls.CONTACT_SHEET_PARITY_CLOSE)}
+                    "contact-sheet-parity": (cls.CONTACT_SHEET_PARITY_OPEN, cls.CONTACT_SHEET_PARITY_CLOSE),
+                    "diso-trace": (cls.DISO_TRACE_OPEN, cls.DISO_TRACE_CLOSE)}
         kept: list[str] = []
         inside: str | None = None
         counts = {name: 0 for name in families}
@@ -245,6 +253,8 @@ class GeneratorByteIdentityAndVariantTests(unittest.TestCase):
         self.assertEqual(old_counts["orphan-sweep"], 0, "the baseline has none")
         self.assertEqual(new_counts["contact-sheet-parity"], self.CONTACT_SHEET_PARITY_REGIONS, "the default job carries exactly the pinned number of bracketed CONTACT-SHEET-PLAYBACK-PARITY-1 regions")
         self.assertEqual(old_counts["contact-sheet-parity"], 0, "the baseline has none")
+        self.assertEqual(new_counts["diso-trace"], self.DISO_TRACE_REGIONS, "the default job carries exactly the pinned number of bracketed LOOK-ASSIST-M16-CAST-4 regions")
+        self.assertEqual(old_counts["diso-trace"], 0, "the baseline has none")
         self.assertEqual(stripped, old_stripped,
                          "the DEFAULT (bachelor/cuda) emitted job changed outside the bracketed regions -- it must stay byte-identical to the pinned baseline")
 
@@ -4257,6 +4267,32 @@ class LegSpecSchemaTests(unittest.TestCase):
 
     def test_the_hand_listed_shipped_legs_are_exactly_the_legs_directory(self) -> None:
         self.assertEqual(sorted(SHIPPED_LEGS), sorted("legs/" + p.name for p in (DV / "legs").glob("*.json")), "SHIPPED_LEGS drifted from the legs/ directory")
+
+    def test_the_diso_trace_is_opt_in_and_only_the_trace_leg_asks_for_it(self) -> None:
+        """LOOK-ASSIST-M16-CAST-4: look.disoTrace is a boolean (default false), the trace leg is the scale-2 look leg plus that key, no
+        other leg asks for it, and the runner maps it to the generator's -LookAssistDisoTrace and nothing else."""
+        load = lambda name: json.loads((DV / "legs" / f"{name}.json").read_text(encoding="utf-8"))
+        props = self.schema["properties"]["look"]["properties"]
+        self.assertEqual(props["disoTrace"]["type"], "boolean")
+        self.assertIs(props["disoTrace"]["default"], False)
+        trace, scale2 = load("m16-1243-look-scale2-trace"), load("m16-1243-look-scale2")
+        self.jsonschema.validate(trace, self.schema)
+        self.assertIs(trace["look"]["disoTrace"], True)
+        stripped = json.loads(json.dumps(trace))
+        del stripped["look"]["disoTrace"]
+        stripped["legId"] = scale2["legId"]
+        self.assertEqual(stripped, scale2)
+        for path in sorted((DV / "legs").glob("*.json")):
+            if path.stem != "m16-1243-look-scale2-trace":
+                self.assertNotIn("disoTrace", (json.loads(path.read_text(encoding="utf-8")).get("look") or {}), path.name)
+        with self.assertRaises(self.jsonschema.ValidationError):
+            bad = json.loads(json.dumps(trace))
+            bad["look"]["disoTrace"] = "yes"
+            self.jsonschema.validate(bad, self.schema)
+        runner = (DV / "Invoke-VenueLeg.ps1").read_text(encoding="utf-8")
+        self.assertIn("if ($null -ne $spec.look.PSObject.Properties['disoTrace'] -and [bool]$spec.look.disoTrace) { $gen['LookAssistDisoTrace'] = $true }", runner)
+        self.assertEqual(runner.count("LookAssistDisoTrace"), 1)
+        self.assertIn("'diso-trace\\contact-sheet\\raw'", runner)
 
     def test_every_non_classic_leg_gates_on_the_flavor_the_app_reports_having_applied(self) -> None:
         """LOOK-ASSIST-FLAVORS-2 landed the flavor reader, so a cinematic leg may ship (VENUE-CINEMATIC-SPEC-1). What it may not do is PASS while the app

@@ -357,6 +357,32 @@ class ContactSheetSwitchTests(unittest.TestCase):
         self.assertIn("-PubRoot (Join-Path $Pub 'paired-seek')", on_text)
         self._assert_valid_powershell(on_file)
 
+    def test_the_diso_trace_adds_one_app_env_var_and_its_own_publish_root_only_on_request(self) -> None:
+        # LOOK-ASSIST-M16-CAST-4: -LookAssistDisoTrace sets ONLY MLVAPP_LOOK_ASSIST_DISO_MATCH_TRACE=1 for the app and
+        # publishes the arm renders under diso-trace; off (the default) it adds nothing to the app's environment.
+        off_file = self._generate("diso-off.job.ps1", "-ContactSheet")
+        on_file = self._generate("diso-on.job.ps1", "-ContactSheet", "-LookAssistDisoTrace")
+        off_text = off_file.read_text(encoding="utf-8")
+        on_text = on_file.read_text(encoding="utf-8")
+        self.assertIn("$LookAssistDisoTrace = $false", off_text)
+        self.assertIn("$LookAssistDisoTrace = $true", on_text)
+        guard = "if ($LookAssistDisoTrace) { $envs += @('MLVAPP_LOOK_ASSIST_DISO_MATCH_TRACE=1') }"
+        for text in (off_text, on_text):
+            self.assertEqual(text.count("MLVAPP_LOOK_ASSIST_DISO_MATCH_TRACE"), 1, "the env var is named once, inside its guard")
+            self.assertIn(guard, text)
+            # the guard runs after $envs is built and before $envList is joined from it
+            self.assertLess(text.index("$envs = @("), text.index(guard))
+            self.assertLess(text.index(guard), text.index("$envList = "))
+            self.assertIn("-PubRoot (Join-Path $Pub 'diso-trace')", text)
+        # The guard itself, evaluated both ways: one entry when on, nothing when off.
+        for value, expected in (("$true", "MLVAPP_LOOK_ASSIST_DISO_MATCH_TRACE=1"), ("$false", "")):
+            proc = subprocess.run(["pwsh", "-NoProfile", "-NonInteractive", "-Command",
+                                   f"$LookAssistDisoTrace = {value}; $envs = @('A=1'); {guard}; ($envs | Select-Object -Skip 1) -join ','"],
+                                  capture_output=True, text=True, timeout=120)
+            self.assertEqual(proc.returncode, 0, proc.stderr)
+            self.assertEqual(proc.stdout.strip(), expected)
+        self._assert_valid_powershell(on_file)
+
     def _extract_presentmon_helper_functions(self, text: str) -> str:
         """Start/Wait/Stop-PresentMonCapture -- the compose step's HARDENING fix (r1d) reuses
         Stop-PresentMonCapture's own already-tested Kill()+bounded-WaitForExit()+

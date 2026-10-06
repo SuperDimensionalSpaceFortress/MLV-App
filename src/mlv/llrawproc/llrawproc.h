@@ -60,6 +60,43 @@ void applyLLRawProcObjectWorkerIsolatedAnalysisWithChromaSmooth(mlvObject_t * vi
  * the vertical-stripe one-shot all land in a private per-thread shadow. Off by default; only measure-only analysis
  * (the Look Assist window-lit verification) turns it on. Returns the previous value. */
 int llrpSetIsolatedAnalysisSharedStateReadOnlyForCurrentThread(int enabled);
+/* LOOK-ASSIST-M16-CAST-3: the dual-ISO exposure match an ISOLATED analysis render on the calling thread seeds with.
+ * SEED (the default) is today's nominal seed (auto -1, ev 1, black delta -1); MEASURED runs the histogram match (-2);
+ * EXPLICIT uses ev_correction (stops, negative, the shared field's convention) and black_delta (14-bit units). Only
+ * Look Assist's dual-ISO match probe sets it, and it puts the previous mode back. Returns the previous mode. */
+#define LLRP_ANALYSIS_DISO_MATCH_SEED     0
+#define LLRP_ANALYSIS_DISO_MATCH_MEASURED 1
+#define LLRP_ANALYSIS_DISO_MATCH_EXPLICIT 2
+int llrpSetIsolatedAnalysisDualIsoMatchForCurrentThread(int mode, double ev_correction, int black_delta);
+/* LOOK-ASSIST-M16-CAST-3 measure-only: the HQ dual-ISO recon options an ISOLATED analysis render on the calling thread
+ * uses instead of the shared ones (interp 0 AMaZE / 1 mean23, alias map, fullres blending, chroma smoothing method).
+ * -1 keeps the shared value; all -1 (the default) is today's render. */
+void llrpSetIsolatedAnalysisDualIsoReconForCurrentThread(int interp, int alias_map, int fullres, int chroma_smooth);
+/* LOOK-ASSIST-M16-CAST-4 measure-only arms for an ISOLATED, read-only analysis render on the calling thread (never a
+ * live render): dual_iso_mode 1 (HQ) / 2 (the preview recon), else -1 = the shared mode; white_bright (14-bit, > 0)
+ * replaces the HQ recon's assumed bright clip white/2; dark_noise_scale (> 0) multiplies its dark noise; a non-NULL
+ * dark_black_offset (14-bit codes per CFA channel R, G1, G2, B) is subtracted from its dark-field rows. -1 / 0 / 0.0 /
+ * NULL is today's render; the caller resets after every render. The getter reports the current arms (1 = any set). */
+void llrpSetIsolatedAnalysisDualIsoArmsForCurrentThread(int dual_iso_mode,
+                                                        int white_bright,
+                                                        double dark_noise_scale,
+                                                        const int * dark_black_offset);
+int llrpGetIsolatedAnalysisDualIsoArmsForCurrentThread(int * dual_iso_mode,
+                                                       int * white_bright,
+                                                       double * dark_noise_scale,
+                                                       int * dark_black_offset_enabled);
+/* LOOK-ASSIST-M16-CAST-5 measure-only switch arms, same contract (ISOLATED analysis renders on the calling thread only,
+ * handed to the recon for its duration). Call AFTER llrpSetIsolatedAnalysisDualIsoArmsForCurrentThread, which clears
+ * them. channel_ev / channel_bd (both non-NULL and finite: per CFA channel R, G1, G2, B, stops positive and 14-bit
+ * codes) darken each bright-field channel on its own (A11); quad_coherent_switch ORs the overexposure switch across
+ * each 2x2 CFA quad (A12); capture_switch_maps records each switch site's outcome (dualiso_switch_capture_map, P1).
+ * NULL / 0 is today's render. The getter reports them (1 = any set). */
+void llrpSetIsolatedAnalysisDualIsoSwitchArmsForCurrentThread(const double * channel_ev,
+                                                              const double * channel_bd,
+                                                              int quad_coherent_switch,
+                                                              int capture_switch_maps);
+int llrpGetIsolatedAnalysisDualIsoSwitchArmsForCurrentThread(int * channel_match, int * quad_coherent_switch,
+                                                             int * capture_switch_maps);
 /* The output levels (dng bit depth / black / white) of the last llrawproc run on the calling thread that completed for
  * `video`, live or isolated: the levels its frame is at, which a display render syncs the processing object to. Returns
  * 0 when no run completed for `video` since the last reset on this thread (e.g. the frame came from a cache). */

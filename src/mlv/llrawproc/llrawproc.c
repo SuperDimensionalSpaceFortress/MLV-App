@@ -92,6 +92,18 @@ static MLV_THREAD_LOCAL int g_llrawproc_analysis_chroma_smooth_override = CS_OFF
  * per thread and keeps its own pixel-map storage between calls, so an early return never leaks or frees it. */
 static MLV_THREAD_LOCAL int g_llrawproc_analysis_shared_read_only = 0;
 static MLV_THREAD_LOCAL llrawprocObject_t g_llrawproc_read_only_shadow;
+/* LOOK-ASSIST-M16-CAST-3: see llrpSetIsolatedAnalysisDualIsoMatchForCurrentThread(). */
+static MLV_THREAD_LOCAL int g_llrawproc_analysis_diso_match_mode = LLRP_ANALYSIS_DISO_MATCH_SEED;
+static MLV_THREAD_LOCAL double g_llrawproc_analysis_diso_ev_correction = 1.0;
+static MLV_THREAD_LOCAL int g_llrawproc_analysis_diso_black_delta = -1;
+static void llrawproc_isolated_analysis_diso_seed(int * auto_correction, double * ev_correction, int * black_delta);
+static MLV_THREAD_LOCAL int g_llrawproc_analysis_diso_interp = -1;
+static MLV_THREAD_LOCAL int g_llrawproc_analysis_diso_alias_map = -1;
+static MLV_THREAD_LOCAL int g_llrawproc_analysis_diso_fullres = -1;
+static MLV_THREAD_LOCAL int g_llrawproc_analysis_diso_chroma_smooth = -1;
+/* LOOK-ASSIST-M16-CAST-4: see llrpSetIsolatedAnalysisDualIsoArmsForCurrentThread(). */
+static MLV_THREAD_LOCAL int g_llrawproc_analysis_diso_mode = -1;
+static MLV_THREAD_LOCAL dualiso_analysis_override_t g_llrawproc_analysis_diso_levels = {0};
 /* LOOK-ASSIST-ANALYSIS-TRUE-LEVELS-1: see llrpLastOutputLevelsForCurrentThread(). */
 static MLV_THREAD_LOCAL const mlvObject_t * g_llrawproc_last_output_levels_video = NULL;
 static MLV_THREAD_LOCAL int g_llrawproc_last_output_bit_depth = 0;
@@ -3447,13 +3459,21 @@ void applyLLRawProcObjectWorker(mlvObject_t * video,
     {
         llrawproc_runtime_state_t analysis_seed = { 0 };
         worker_diso_pattern = 0;
-        worker_diso_auto_correction = -1;
-        worker_diso_ev_correction = 1.0;
-        worker_diso_black_delta = -1;
-        analysis_seed.diso_auto_correction = -1;
-        analysis_seed.diso_ev_correction = 1.0;
-        analysis_seed.diso_black_delta = -1;
+        llrawproc_isolated_analysis_diso_seed(&worker_diso_auto_correction,
+                                              &worker_diso_ev_correction,
+                                              &worker_diso_black_delta);
+        analysis_seed.diso_auto_correction = worker_diso_auto_correction;
+        analysis_seed.diso_ev_correction = worker_diso_ev_correction;
+        analysis_seed.diso_black_delta = worker_diso_black_delta;
         worker->seeded_runtime_state = analysis_seed;
+        /* LOOK-ASSIST-M16-CAST-3: measure-only recon variants (see llrpSetIsolatedAnalysisDualIsoReconForCurrentThread). */
+        if (g_llrawproc_analysis_diso_interp >= 0) diso_averaging = g_llrawproc_analysis_diso_interp;
+        if (g_llrawproc_analysis_diso_alias_map >= 0) diso_alias_map = g_llrawproc_analysis_diso_alias_map;
+        if (g_llrawproc_analysis_diso_fullres >= 0) diso_frblending = g_llrawproc_analysis_diso_fullres;
+        if (g_llrawproc_analysis_diso_chroma_smooth >= 0) chroma_smooth_mode = g_llrawproc_analysis_diso_chroma_smooth;
+        /* LOOK-ASSIST-M16-CAST-4: the recon mode arm, read-only isolated renders only (llrpHQDualIso() agrees). */
+        if (shared_read_only && dual_iso_mode != 0 && g_llrawproc_analysis_diso_mode > 0)
+            dual_iso_mode = g_llrawproc_analysis_diso_mode;
     }
     dark_frame_mode = shared->dark_frame;
     vertical_stripes_mode = shared->vertical_stripes;
@@ -4100,6 +4120,8 @@ void applyLLRawProcObjectWorker(mlvObject_t * video,
                     || (gpu_playback_input != NULL
                      && g_llrawproc_gpu_playback_texture_present_preferred);
                 dualiso_debug_set_gpu_recon_state_capture_enabled(capture_gpu_recon_state);
+                /* LOOK-ASSIST-M16-CAST-4: the level/noise arms reach only an isolated recon, and only for its duration. */
+                if (isolated_analysis) dualiso_set_analysis_override(&g_llrawproc_analysis_diso_levels);
                 dual_iso_recon_ok =
                     diso_get_full20bit(raw_info,
                                        raw_image_buff,
@@ -4123,6 +4145,7 @@ void applyLLRawProcObjectWorker(mlvObject_t * video,
                                            : 0,
                                        llrawproc_threads,
                                        &worker->diso_full20bit_scratch);
+                if (isolated_analysis) dualiso_set_analysis_override(NULL);
             }
             /* P3 diagnostic (gated, one-shot): snapshot the RECON-ONLY bayer here --
              * raw_image_buff is the diso_get_full20bit output, BEFORE the post-recon
@@ -4602,6 +4625,114 @@ int llrpSetIsolatedAnalysisSharedStateReadOnlyForCurrentThread(int enabled)
     return previous;
 }
 
+int llrpSetIsolatedAnalysisDualIsoMatchForCurrentThread(int mode, double ev_correction, int black_delta)
+{
+    const int previous = g_llrawproc_analysis_diso_match_mode;
+    g_llrawproc_analysis_diso_match_mode =
+        (mode == LLRP_ANALYSIS_DISO_MATCH_MEASURED || mode == LLRP_ANALYSIS_DISO_MATCH_EXPLICIT)
+        ? mode : LLRP_ANALYSIS_DISO_MATCH_SEED;
+    g_llrawproc_analysis_diso_ev_correction = ev_correction;
+    g_llrawproc_analysis_diso_black_delta = black_delta;
+    return previous;
+}
+
+void llrpSetIsolatedAnalysisDualIsoReconForCurrentThread(int interp, int alias_map, int fullres, int chroma_smooth)
+{
+    g_llrawproc_analysis_diso_interp = (interp == 0 || interp == 1) ? interp : -1;
+    g_llrawproc_analysis_diso_alias_map = (alias_map == 0 || alias_map == 1) ? alias_map : -1;
+    g_llrawproc_analysis_diso_fullres = (fullres == 0 || fullres == 1) ? fullres : -1;
+    g_llrawproc_analysis_diso_chroma_smooth = chroma_smooth >= 0 ? llrawproc_normalize_chroma_smooth_method(chroma_smooth) : -1;
+}
+
+void llrpSetIsolatedAnalysisDualIsoArmsForCurrentThread(int dual_iso_mode,
+                                                        int white_bright,
+                                                        double dark_noise_scale,
+                                                        const int * dark_black_offset)
+{
+    g_llrawproc_analysis_diso_mode = (dual_iso_mode == 1 || dual_iso_mode == 2) ? dual_iso_mode : -1;
+    memset(&g_llrawproc_analysis_diso_levels, 0, sizeof(g_llrawproc_analysis_diso_levels));
+    g_llrawproc_analysis_diso_levels.white_bright = white_bright > 0 ? white_bright : 0;
+    g_llrawproc_analysis_diso_levels.dark_noise_scale =
+        (isfinite(dark_noise_scale) && dark_noise_scale > 0.0) ? dark_noise_scale : 0.0;
+    if (dark_black_offset)
+    {
+        g_llrawproc_analysis_diso_levels.dark_black_offset_enabled = 1;
+        memcpy(g_llrawproc_analysis_diso_levels.dark_black_offset,
+               dark_black_offset,
+               sizeof(g_llrawproc_analysis_diso_levels.dark_black_offset));
+    }
+}
+
+int llrpGetIsolatedAnalysisDualIsoArmsForCurrentThread(int * dual_iso_mode,
+                                                       int * white_bright,
+                                                       double * dark_noise_scale,
+                                                       int * dark_black_offset_enabled)
+{
+    if (dual_iso_mode) *dual_iso_mode = g_llrawproc_analysis_diso_mode;
+    if (white_bright) *white_bright = g_llrawproc_analysis_diso_levels.white_bright;
+    if (dark_noise_scale) *dark_noise_scale = g_llrawproc_analysis_diso_levels.dark_noise_scale;
+    if (dark_black_offset_enabled) *dark_black_offset_enabled = g_llrawproc_analysis_diso_levels.dark_black_offset_enabled;
+    return g_llrawproc_analysis_diso_mode > 0
+        || g_llrawproc_analysis_diso_levels.white_bright > 0
+        || g_llrawproc_analysis_diso_levels.dark_noise_scale > 0.0
+        || g_llrawproc_analysis_diso_levels.dark_black_offset_enabled
+        || g_llrawproc_analysis_diso_levels.channel_match_enabled
+        || g_llrawproc_analysis_diso_levels.quad_coherent_switch
+        || g_llrawproc_analysis_diso_levels.capture_switch_maps;
+}
+
+void llrpSetIsolatedAnalysisDualIsoSwitchArmsForCurrentThread(const double * channel_ev,
+                                                              const double * channel_bd,
+                                                              int quad_coherent_switch,
+                                                              int capture_switch_maps)
+{
+    g_llrawproc_analysis_diso_levels.channel_match_enabled = 0;
+    memset(g_llrawproc_analysis_diso_levels.channel_ev, 0, sizeof(g_llrawproc_analysis_diso_levels.channel_ev));
+    memset(g_llrawproc_analysis_diso_levels.channel_bd, 0, sizeof(g_llrawproc_analysis_diso_levels.channel_bd));
+    if (channel_ev && channel_bd)
+    {
+        int finite = 1;
+        for (int c = 0; c < 4; c++) finite = finite && isfinite(channel_ev[c]) && isfinite(channel_bd[c]);
+        if (finite)
+        {
+            g_llrawproc_analysis_diso_levels.channel_match_enabled = 1;
+            memcpy(g_llrawproc_analysis_diso_levels.channel_ev, channel_ev, sizeof(g_llrawproc_analysis_diso_levels.channel_ev));
+            memcpy(g_llrawproc_analysis_diso_levels.channel_bd, channel_bd, sizeof(g_llrawproc_analysis_diso_levels.channel_bd));
+        }
+    }
+    g_llrawproc_analysis_diso_levels.quad_coherent_switch = quad_coherent_switch ? 1 : 0;
+    g_llrawproc_analysis_diso_levels.capture_switch_maps = capture_switch_maps ? 1 : 0;
+}
+
+int llrpGetIsolatedAnalysisDualIsoSwitchArmsForCurrentThread(int * channel_match, int * quad_coherent_switch,
+                                                             int * capture_switch_maps)
+{
+    if (channel_match) *channel_match = g_llrawproc_analysis_diso_levels.channel_match_enabled;
+    if (quad_coherent_switch) *quad_coherent_switch = g_llrawproc_analysis_diso_levels.quad_coherent_switch;
+    if (capture_switch_maps) *capture_switch_maps = g_llrawproc_analysis_diso_levels.capture_switch_maps;
+    return g_llrawproc_analysis_diso_levels.channel_match_enabled
+        || g_llrawproc_analysis_diso_levels.quad_coherent_switch
+        || g_llrawproc_analysis_diso_levels.capture_switch_maps;
+}
+
+/* The isolated analysis seed: nominal (-1, ev 1, black delta -1) unless this thread asked for the measured (-2) match
+ * or explicit values. */
+static void llrawproc_isolated_analysis_diso_seed(int * auto_correction, double * ev_correction, int * black_delta)
+{
+    *auto_correction = -1;
+    *ev_correction = 1.0;
+    *black_delta = -1;
+    if (g_llrawproc_analysis_diso_match_mode == LLRP_ANALYSIS_DISO_MATCH_MEASURED)
+    {
+        *auto_correction = -2;
+    }
+    else if (g_llrawproc_analysis_diso_match_mode == LLRP_ANALYSIS_DISO_MATCH_EXPLICIT)
+    {
+        *ev_correction = g_llrawproc_analysis_diso_ev_correction;
+        *black_delta = g_llrawproc_analysis_diso_black_delta;
+    }
+}
+
 void applyLLRawProcObject(mlvObject_t * video, uint16_t * raw_image_buff, size_t raw_image_size)
 {
     applyLLRawProcObjectWorker(video, raw_image_buff, raw_image_size, NULL, 0);
@@ -4861,12 +4992,12 @@ static int llrawproc_apply_with_dims_internal(mlvObject_t * video,
     {
         llrawproc_runtime_state_t analysis_seed = { 0 };
         worker_diso_pattern = 0;
-        worker_diso_auto_correction = -1;
-        worker_diso_ev_correction = 1.0;
-        worker_diso_black_delta = -1;
-        analysis_seed.diso_auto_correction = -1;
-        analysis_seed.diso_ev_correction = 1.0;
-        analysis_seed.diso_black_delta = -1;
+        llrawproc_isolated_analysis_diso_seed(&worker_diso_auto_correction,
+                                              &worker_diso_ev_correction,
+                                              &worker_diso_black_delta);
+        analysis_seed.diso_auto_correction = worker_diso_auto_correction;
+        analysis_seed.diso_ev_correction = worker_diso_ev_correction;
+        analysis_seed.diso_black_delta = worker_diso_black_delta;
         worker->seeded_runtime_state = analysis_seed;
     }
     dark_frame_mode = shared->dark_frame;
@@ -5493,6 +5624,10 @@ void llrpSetDualIsoValidity(mlvObject_t * video, int diso_force)
 
 int llrpHQDualIso(mlvObject_t * video)
 {
+    /* LOOK-ASSIST-M16-CAST-4: inside a read-only isolated render the recon mode arm decides (the output's bit depth
+     * follows the recon that made it); everywhere else the shared mode. */
+    if (g_llrawproc_analysis_shared_read_only && g_llrawproc_analysis_diso_mode > 0 && video->llrawproc->dual_iso != 0)
+        return (g_llrawproc_analysis_diso_mode == 1) && video->llrawproc->diso_validity && (llrpGetFixRawMode(video));
     return (video->llrawproc->dual_iso == 1) && video->llrawproc->diso_validity && (llrpGetFixRawMode(video));
 }
 
