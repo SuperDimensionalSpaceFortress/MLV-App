@@ -171,3 +171,26 @@ forensics above needed and did not have (`gpu_window.present_fate`, see the code
 `playback_smoke.gpu_window_swaps` summary line) so the *next* round's forensics -- and any
 future bachelor run -- has this counted and logged **live**, rather than needing to be
 reconstructed after the fact from swap-serial gaps the way this round had to.
+
+## Slip accounting and capture-free pace legs (PLAYBACK-BACHELOR-PRESENT-JITTER-1)
+
+Every playback smoke session now also logs one `playback_smoke.slip_summary` line (after
+`overlap_summary`) plus at most 64 `playback_smoke.slip` lines, from `PlaybackSlipHistogram.h`.
+A slip is a frame the timeline passed but no present showed: `displayFrame(k) - displayFrame(k-1) - 1`
+for a forward step (a loop wrap or a repeat is never a slip; the first present and the catch-up it
+repays are `startup_catchup_frames`). Slips and class counts are in frames, so `slips_per_1000`
+(per timeline frame after the first present) reads directly against the 23.9 bar (3.2 per 1000).
+Each slip gets one class, first match wins: `capture` (a contact-sheet grab ran in the interval),
+`gap` (interval >= 250 ms), `gui_late` (ready before the skipped frame's deadline, presented more than
+one period later), `upstream_late` (ready after that deadline, sub-tagged decode/recon/render/queue/none
+by the stage over 2x its session median), `clock` (two or more timeline frames in <= 1.25 periods), else
+`other`. `hist_slip` buckets slip sizes 0/1/2/3/4-7/8+ and `hist_interval` present intervals
+<=45/45-62.5/62.5-83.4/83.4-125/125-250/>250 ms. `native_equiv_presented_fps` is pace x presents /
+timeline frames after the first present. `timeline_advance_by_path` splits the session's timeline
+delta by engine path (`drop_tick`, `whole_frame`, `loop_wrap`; `other` is any slider move while
+playing that no engine path made, plus whatever the paths leave unexplained) next to
+`pace_guard_granted_frames`, so a timeline faster than the pace can be traced to its path. The
+`m16-1243-pace-cinematic-{fullscreen-s4,fullscreen-s2,windowed-s4}` legs are their display-matrix
+cells run as SPEED legs with Look Assist forced (cinematic) through `generatorArgs.forceLookAssist`
+and no contact sheet (generator `-LookPaceLeg`), so no 30-71 ms GUI-thread framebuffer grab lands
+inside the timed Play; the look itself stays on the look and display-matrix legs.

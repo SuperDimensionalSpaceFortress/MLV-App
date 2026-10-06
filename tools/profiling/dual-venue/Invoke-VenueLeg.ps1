@@ -360,6 +360,11 @@ try {
     if ($null -ne $spec.PSObject.Properties['generatorArgs']) {
         if ($spec.generatorArgs.PSObject.Properties['telemetryArm']) { $gen['TelemetryArm'] = [string]$spec.generatorArgs.telemetryArm }
         if ($spec.generatorArgs.PSObject.Properties['cpuQuiescenceThresholdPercent']) { $gen['CpuQuiescenceThresholdPercent'] = [double]$spec.generatorArgs.cpuQuiescenceThresholdPercent }
+        # PLAYBACK-BACHELOR-PRESENT-JITTER-1: a SPEED leg may force Look Assist (a capture-free pace leg: no contact-sheet grab in the timed Play).
+        if (-not $isLook -and $spec.generatorArgs.PSObject.Properties['forceLookAssist'] -and [bool]$spec.generatorArgs.forceLookAssist) {
+            $gen['ForceLookAssist'] = $true; $gen['LookPaceLeg'] = $true
+            if ($spec.generatorArgs.PSObject.Properties['lookFlavor']) { $gen['LookFlavor'] = [string]$spec.generatorArgs.lookFlavor }
+        }
     }
     if ($isLook) {
         $gen['ContactSheet'] = $true; $gen['ContactSheetFrames'] = [int]$spec.look.contactSheetFrames

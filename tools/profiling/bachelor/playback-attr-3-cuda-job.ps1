@@ -334,6 +334,11 @@ param(
     [ValidateSet('classic', 'cinematic')]
     [string]$LookFlavor = 'classic',
 
+    # PLAYBACK-BACHELOR-PRESENT-JITTER-1: a capture-free PACE leg -- -ForceLookAssist (and -LookFlavor) without
+    # -ContactSheet, so no contact-sheet grab (a GUI-thread framebuffer readback of 30-71 ms) lands inside the
+    # timed Play. Judged on its speed, never on a sheet; the look itself stays the look legs' job.
+    [switch]$LookPaceLeg,
+
     # Test seam: the venue table to read instead of tools/profiling/dual-venue/venues.json.
     [string]$VenueTablePath = '',
 
@@ -3953,7 +3958,10 @@ function Edit-DualVenueTemplate([string]$Text, [string]$Old, [string]$New) {
     $Text.Substring(0, $first) + $newText + $Text.Substring($first + $oldText.Length)
 }
 
-if ($ForceLookAssist -and -not $ContactSheet) {
+if ($LookPaceLeg -and ($ContactSheet -or -not $ForceLookAssist)) {
+    throw 'DUAL_VENUE_LOOK_PACE_LEG_SHAPE -LookPaceLeg is -ForceLookAssist WITHOUT -ContactSheet (a capture-free pace leg)'
+}
+if ($ForceLookAssist -and -not $ContactSheet -and -not $LookPaceLeg) {
     throw 'DUAL_VENUE_LOOK_REQUIRES_CONTACT_SHEET -ForceLookAssist (a LOOK leg) needs -ContactSheet: the look is judged on the contact sheet'
 }
 $isCpuBackend = ($Backend -eq 'cpu')
