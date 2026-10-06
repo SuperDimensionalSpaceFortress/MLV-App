@@ -779,13 +779,10 @@ static uint64_t mlv_hash_lut(uint64_t hash, const lut_t * lut)
     return hash;
 }
 
-static uint64_t mlv_hash_llrawproc_state(uint64_t hash, const llrawprocObject_t * llrawproc)
+/* The llrawproc settings scalars, in the order mlv_hash_llrawproc_state has
+ * always hashed them (it calls this first, so its value is unchanged). */
+static uint64_t mlv_hash_llrawproc_settings_scalars(uint64_t hash, const llrawprocObject_t * llrawproc)
 {
-    if (!llrawproc)
-    {
-        return mlv_hash_bytes(hash, "", 1);
-    }
-
     hash = mlv_hash_bytes(hash, &llrawproc->fix_raw, sizeof(llrawproc->fix_raw));
     hash = mlv_hash_bytes(hash, &llrawproc->vertical_stripes, sizeof(llrawproc->vertical_stripes));
     hash = mlv_hash_bytes(hash, &llrawproc->compute_stripes, sizeof(llrawproc->compute_stripes));
@@ -820,6 +817,17 @@ static uint64_t mlv_hash_llrawproc_state(uint64_t hash, const llrawprocObject_t 
      * across a paused -> playing transition. */
     hash = mlv_hash_bytes(hash, &llrawproc->diso_playback_force_disable_alias_map, sizeof(llrawproc->diso_playback_force_disable_alias_map));
     hash = mlv_hash_bytes(hash, &llrawproc->dark_frame, sizeof(llrawproc->dark_frame));
+    return hash;
+}
+
+static uint64_t mlv_hash_llrawproc_state(uint64_t hash, const llrawprocObject_t * llrawproc)
+{
+    if (!llrawproc)
+    {
+        return mlv_hash_bytes(hash, "", 1);
+    }
+
+    hash = mlv_hash_llrawproc_settings_scalars(hash, llrawproc);
     /* Phase 2C: diso_pattern, diso_ev_correction, diso_black_delta and the
      * dng_* fields are auto-published per frame by Dual ISO recon (see
      * src/mlv/llrawproc/llrawproc.c:llrawproc_publish_worker_results) and
@@ -851,6 +859,35 @@ static uint64_t mlv_hash_llrawproc_state(uint64_t hash, const llrawprocObject_t 
     }
     hash = mlv_hash_pixel_map(hash, &llrawproc->focus_pixel_map);
     hash = mlv_hash_pixel_map(hash, &llrawproc->bad_pixel_map);
+    return hash;
+}
+
+uint64_t getMlvLlrawprocSettingsFingerprint(mlvObject_t * video)
+{
+    uint64_t hash = MLV_FNV1A_OFFSET_BASIS;
+    if (!video)
+    {
+        return hash;
+    }
+    hash = mlv_hash_bytes(hash, &video->RAWI.raw_info.black_level, sizeof(video->RAWI.raw_info.black_level));
+    hash = mlv_hash_bytes(hash, &video->RAWI.raw_info.white_level, sizeof(video->RAWI.raw_info.white_level));
+    hash = mlv_hash_bytes(hash, &video->RAWI.raw_info.bits_per_pixel, sizeof(video->RAWI.raw_info.bits_per_pixel));
+    llrawprocObject_t * llrawproc = video->llrawproc;
+    if (!llrawproc)
+    {
+        return mlv_hash_bytes(hash, "", 1);
+    }
+    pthread_mutex_lock(&video->llrawproc_mutex);
+    hash = mlv_hash_llrawproc_settings_scalars(hash, llrawproc);
+    /* The dark frame and the pixel maps by version (bumped on every load or
+     * rebuild), not by content: this runs three times per played frame. */
+    hash = mlv_hash_bytes(hash, &llrawproc->dark_frame_version, sizeof(llrawproc->dark_frame_version));
+    hash = mlv_hash_bytes(hash, &llrawproc->dark_frame_size, sizeof(llrawproc->dark_frame_size));
+    hash = mlv_hash_bytes(hash, &llrawproc->focus_pixel_map_version, sizeof(llrawproc->focus_pixel_map_version));
+    hash = mlv_hash_bytes(hash, &llrawproc->focus_pixel_map.count, sizeof(llrawproc->focus_pixel_map.count));
+    hash = mlv_hash_bytes(hash, &llrawproc->bad_pixel_map_version, sizeof(llrawproc->bad_pixel_map_version));
+    hash = mlv_hash_bytes(hash, &llrawproc->bad_pixel_map.count, sizeof(llrawproc->bad_pixel_map.count));
+    pthread_mutex_unlock(&video->llrawproc_mutex);
     return hash;
 }
 

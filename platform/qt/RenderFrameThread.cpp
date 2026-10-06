@@ -2048,11 +2048,18 @@ void RenderFrameThread::decodeFrameForWorker( const DecodeQueueEntry &entry )
         slot.rawImage16.resize( rawPixelCount );
     }
     slot.reducedReconScale = 1;
+    /* CPU-DEBAYERED16-REUSE-PHASE3-RECON-1 r2: record the decode status and the
+     * llrawproc settings for the debayered-16 reuse policy. Every other consumer
+     * of this slot still ignores the status, as before. */
+    slot.reconAcquisitionSucceeded = false;
+    slot.reconSettingsAtDecode =
+        m_pMlvObject ? getMlvLlrawprocSettingsFingerprint( m_pMlvObject ) : 0;
     if( rawPixelCount > 0 && m_pMlvObject )
     {
-        (void)getMlvRawFrameUint16( m_pMlvObject,
-                                    entry.request.frameNumber,
-                                    slot.rawImage16.data() );
+        slot.reconAcquisitionSucceeded =
+            getMlvRawFrameUint16( m_pMlvObject,
+                                  entry.request.frameNumber,
+                                  slot.rawImage16.data() ) == 0;
     }
     const double decodeEndStageTime = mlv_stage_timing_now();
     if( playbackSmokeTimelineTelemetryEnabled() )
@@ -2650,11 +2657,19 @@ void RenderFrameThread::reconFrameForWorker( const ReconQueueEntry &entry,
 
 void RenderFrameThread::signalReconDoneFromWorker( int slotIndex )
 {
+    /* CPU-DEBAYERED16-REUSE-PHASE3-RECON-1 r2: on the recon worker thread, right
+     * after reconFrameForWorker: the llrawproc settings now, and whether this
+     * thread's last llrawproc run used the CUDA playback recon. */
+    const uint64_t reconSettingsAtReconDone =
+        m_pMlvObject ? getMlvLlrawprocSettingsFingerprint( m_pMlvObject ) : 0;
+    const bool reconUsedGpuPlaybackRecon = llrpGpuPlaybackReconLastUsedForTesting() != 0;
     QMutexLocker locker( &m_mutex );
     m_overlapMeter.upstreamEnd( mlv_stage_timing_now() * 1000.0,
                                 playback_overlap::UpstreamStage::Recon );
     if( !m_stop && slotIndex >= 0 )
     {
+        m_frameSlots[slotIndex].reconSettingsAtReconDone = reconSettingsAtReconDone;
+        m_frameSlots[slotIndex].reconUsedGpuPlaybackRecon = reconUsedGpuPlaybackRecon;
         if( playbackSmokeTimelineTelemetryEnabled() )
         {
             m_frameSlots[slotIndex].stageTimingTelemetry.insert(
@@ -3678,6 +3693,10 @@ void RenderFrameThread::drawFrame( int slotIndex,
      * reconstructed, read before resetMetadata clears it. */
     const uint32_t reconQueuedFrameNumber = slot.queuedRequest.frameNumber;
     const uint64_t reconQueuedRequestSerial = slot.queuedRequest.requestSerial;
+    const bool reconAcquisitionSucceeded = slot.reconAcquisitionSucceeded;
+    const uint64_t reconSettingsAtDecode = slot.reconSettingsAtDecode;
+    const uint64_t reconSettingsAtReconDone = slot.reconSettingsAtReconDone;
+    const bool reconUsedGpuPlaybackRecon = slot.reconUsedGpuPlaybackRecon;
     slot.resetMetadata();
     const double prologueAfterResetMetadataStageTime =
         detailedTimelineTelemetry ? mlv_stage_timing_now() : 0.0;
@@ -4846,9 +4865,10 @@ void RenderFrameThread::drawFrame( int slotIndex,
         /* CPU-DEBAYERED16-REUSE-PHASE3-RECON-1: debayer the recon worker's
          * full-resolution reconstruction instead of decoding and reconstructing
          * the frame a second time. Whatever the policy refuses takes today's
-         * path, and the reason is recorded. */
-        bool consumedPhase3Recon = false;
-        QString phase3ReconReuseFallbackReason;
+         * path, and the reason is recorded (renderDebayered16FromSlot, shared
+         * with the tests). */
+        Debayered16ReconRefusal phase3ReconReuseOutcome =
+            Debayered16ReconRefusal::GpuDebayerRendered;
         if ( !renderedDebayeredFrame )
         {
             const size_t reconPixelCount =
@@ -4857,63 +4877,43 @@ void RenderFrameThread::drawFrame( int slotIndex,
             Debayered16ReconReuseInputs reuse;
             reuse.consumeReconnedRaw =
                 decodedRawFrame != nullptr && decodedRawFrameAlreadyReconned;
+            reuse.reconAcquisitionSucceeded = reconAcquisitionSucceeded;
             reuse.playbackActive = m_activePresentationContext.playbackActive;
             reuse.useGpuAmazeDebayer = useGpuAmazeDebayer;
             reuse.useGpuBilinearDebayer = useGpuBilinearDebayer;
             reuse.gpuPlaybackReconTexturePresentRequested =
                 m_activePresentationContext.gpuPlaybackReconTexturePresentRequested;
-            reuse.frameCacheMayServe =
-                !m_pMlvObject
-                || mlvRawDebayerCacheMayServeFrame( m_pMlvObject, frameNumber ) != 0;
+            reuse.reconUsedGpuPlaybackRecon = reconUsedGpuPlaybackRecon;
             reuse.reducedReconScale = slot.reducedReconScale;
             reuse.reconFrameNumber = reconQueuedFrameNumber;
             reuse.renderFrameNumber = frameNumber;
             reuse.reconRequestSerial = reconQueuedRequestSerial;
             reuse.renderRequestSerial = slot.requestSerial;
+            reuse.reconSettingsAtDecode = reconSettingsAtDecode;
+            reuse.reconSettingsAtReconDone = reconSettingsAtReconDone;
             reuse.reconBufferComplete =
                 m_pMlvObject
                 && reconPixelCount > 0
                 && m_imageWidth == static_cast<int>( getMlvWidth( m_pMlvObject ) )
                 && m_imageHeight == static_cast<int>( getMlvHeight( m_pMlvObject ) )
                 && slot.rawImage16.size() >= reconPixelCount * 3u;
-            const char * refusal = Debayered16ReconReusePolicy::ineligibleReason( reuse );
-            if ( !refusal )
-            {
-                try
-                {
-                    m_debayered16ReconScratch.resize( reconPixelCount );
-                }
-                catch ( const std::bad_alloc & )
-                {
-                    refusal = "recon scratch allocation failed";
-                }
-            }
-            if ( !refusal )
-            {
-                /* decodedRawFrame is slot.rawImage16, which the debayer overwrites. */
-                std::copy_n( slot.rawImage16.data(),
-                             reconPixelCount,
-                             reinterpret_cast<uint16_t *>( m_debayered16ReconScratch.data() ) );
-                consumedPhase3Recon =
-                    getMlvRawFrameDebayeredFromReconnedRaw16( m_pMlvObject,
-                                                              frameNumber,
-                                                              m_debayered16ReconScratch.data(),
-                                                              slot.rawImage16.data() ) != 0;
-                if ( !consumedPhase3Recon )
-                {
-                    refusal = "debayer of the reconstructed raw declined";
-                }
-            }
-            if ( !consumedPhase3Recon )
-            {
-                phase3ReconReuseFallbackReason = QString::fromLatin1( refusal );
-                getMlvRawFrameDebayered( m_pMlvObject, frameNumber, slot.rawImage16.data() );
-            }
+            phase3ReconReuseOutcome =
+                renderDebayered16FromSlot( m_pMlvObject,
+                                           frameNumber,
+                                           reuse,
+                                           slot.rawImage16.data(),
+                                           reconPixelCount,
+                                           m_debayered16ReconScratch,
+                                           &m_debayered16ReconReuseCounters );
         }
         else
         {
-            phase3ReconReuseFallbackReason = QStringLiteral("GPU debayer rendered the frame");
+            m_debayered16ReconReuseCounters.note( phase3ReconReuseOutcome );
         }
+        const bool consumedPhase3Recon =
+            phase3ReconReuseOutcome == Debayered16ReconRefusal::None;
+        const QString phase3ReconReuseFallbackReason =
+            QString::fromLatin1( debayered16ReconRefusalReason( phase3ReconReuseOutcome ) );
         if ( phase3ReconReuseFallbackReason != m_lastDebayered16ReconReuseFallbackReason )
         {
             qInfo().nospace()
@@ -4931,6 +4931,9 @@ void RenderFrameThread::drawFrame( int slotIndex,
         slot.stageTimingTelemetry.insert(
             QStringLiteral("debayered16_phase3_recon_fallback_reason"),
             phase3ReconReuseFallbackReason );
+        slot.stageTimingTelemetry.insert(
+            QStringLiteral("debayered16_phase3_recon_outcome"),
+            QString::fromLatin1( debayered16ReconRefusalName( phase3ReconReuseOutcome ) ) );
         slot.stageTimingTelemetry.insert(
             QStringLiteral("debayered16_recon_worker_llrawproc_total_ms"),
             preservedGpuPlaybackReconTextureTelemetry.value(

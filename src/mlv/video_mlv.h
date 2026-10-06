@@ -236,6 +236,15 @@ int getMlvRawFrameDebayeredFromReconnedRaw16(mlvObject_t * video,
 /* Nonzero when getMlvRawFrameDebayered could serve frameIndex from the AMaZE
  * frame cache: the cache is running, or this frame is already cached. */
 int mlvRawDebayerCacheMayServeFrame(mlvObject_t * video, uint64_t frameIndex);
+/* CPU-DEBAYERED16-REUSE-PHASE3-RECON-1 r2: a fingerprint of every setting that
+ * selects what llrawproc makes of a frame and the bit shift the debayer applies
+ * to its output: the raw levels and bit depth, the llrawproc settings the
+ * processed-frame cache keys on (fix_raw, dual-ISO mode and validity, chroma
+ * smooth, ...), and the dark frame and pixel maps by version. The values
+ * dual-ISO recon publishes per frame are excluded, as in that cache key. Equal
+ * fingerprints before and after a recon and at its consumption mean the recon
+ * was made under the settings the render would run llrawproc with. */
+uint64_t getMlvLlrawprocSettingsFingerprint(mlvObject_t * video);
 
 /* CPU-DUALISO-AT-PREVIEW-SCALE-1: phase-3 dual-ISO reconstruction at the
  * playback preview scale. The recon worker reconstructs a Bayer shrunk by the

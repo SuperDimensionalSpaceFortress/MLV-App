@@ -19,6 +19,7 @@
 #include <QVector>
 #include <QElapsedTimer>
 #include <QJsonObject>
+#include <QMap>
 #include <QImage>
 #include <QPixmap>
 #include <QGraphicsPixmapItem>
@@ -1418,6 +1419,11 @@ private:
     QString m_playbackSmokeDebayered16ReconFallbackReasonLast;
     double m_playbackSmokeDebayered16WorkerLlrawprocSumMs = 0.0;
     double m_playbackSmokeDebayered16RenderLlrawprocSumMs = 0.0;
+    /* r2: presented debayered-16 frames by outcome name, and the render
+     * thread's all-attempts counters at session begin. */
+    QMap<QString, int> m_playbackSmokeDebayered16OutcomeFrames;
+    std::array<uint64_t, static_cast<size_t>( Debayered16ReconRefusal::Count )>
+        m_playbackSmokeDebayered16AttemptsAtBegin{};
     int m_playbackSmokeProcessed8PrefetchHits = 0;
     int m_playbackSmokeRawPrefetchHits = 0;
     int m_playbackSmokeGpuStatusCpuFrames = 0;

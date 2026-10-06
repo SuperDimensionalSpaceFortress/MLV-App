@@ -15,6 +15,7 @@
 #include <QJsonObject>
 #include "../../src/mlv_include.h"
 #include "MainWindowGpuPreviewPolicy.h"
+#include "Debayered16ReconReusePolicy.h"
 #include "Phase3Mode.h"
 #include "PlaybackDecodeRenderOverlap.h"
 #include "PlaybackScaling.h"
@@ -39,6 +40,13 @@ public:
         OutputProcessed16,
         OutputDebayered16
     };
+
+    /* CPU-DEBAYERED16-REUSE-PHASE3-RECON-1 r2: every debayered-16 render
+     * attempt by outcome, presented or not (thread-safe reads). */
+    const Debayered16ReconReuseCounters & debayered16ReconReuseCounters( void ) const
+    {
+        return m_debayered16ReconReuseCounters;
+    }
 
     enum class SlotState : uint8_t
     {
@@ -456,6 +464,14 @@ private:
         int reducedReconScale = 1;
         int reducedReconWidth = 0;
         int reducedReconHeight = 0;
+        /* CPU-DEBAYERED16-REUSE-PHASE3-RECON-1 r2: how rawImage16's recon was
+         * made, for Debayered16ReconReusePolicy. The decode stage sets the first
+         * two, the recon-done signal the last two; resetMetadata clears all four
+         * (fail closed: a slot nobody stamped is refused). */
+        bool reconAcquisitionSucceeded = false;
+        uint64_t reconSettingsAtDecode = 0;
+        uint64_t reconSettingsAtReconDone = 0;
+        bool reconUsedGpuPlaybackRecon = false;
         GpuPlaybackReconTextureState gpuPlaybackReconTextureState;
         int gpuPlaybackReconTextureWidth = 0;
         int gpuPlaybackReconTextureHeight = 0;
@@ -516,6 +532,10 @@ private:
             /* reducedRecon* deliberately survive: the process stage resets
              * metadata before it consumes them. The decode and recon stages
              * own them (both set reducedReconScale every frame). */
+            reconAcquisitionSucceeded = false;
+            reconSettingsAtDecode = 0;
+            reconSettingsAtReconDone = 0;
+            reconUsedGpuPlaybackRecon = false;
             gpuPlaybackReconTextureState = GpuPlaybackReconTextureState();
             gpuPlaybackReconTextureWidth = 0;
             gpuPlaybackReconTextureHeight = 0;
@@ -616,6 +636,7 @@ private:
      * reconstructed Bayer from here, because the debayer writes W*H*3 into the
      * slot's rawImage16 that holds it. Float-sized: the tail converts in place. */
     std::vector<float> m_debayered16ReconScratch;
+    Debayered16ReconReuseCounters m_debayered16ReconReuseCounters;
     std::vector<uint16_t> m_gpuPlaybackReconStateRgb16;
     std::array<GpuPlaybackReconTextureState::LutCacheEntry,
                kGpuPlaybackReconTextureLutCacheSlots>
