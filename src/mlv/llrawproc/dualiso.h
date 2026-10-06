@@ -376,6 +376,21 @@ void dualiso_debug_reset_full20bit_timing(void);
 void dualiso_debug_get_full20bit_timing(dualiso_full20bit_timing_t * timing);
 int dualiso_mix_chroma_probe_mode(void);
 
+/* PLAYBACK-CUDA-HONOUR-SCALE-1 r2: same-colour vertical notch on a
+ * reconstructed Bayer16 frame. Every tap is the pixel's own Bayer colour (row
+ * offsets 0, +-2, +-4, +-6 in the same column), weights [1,-6,15,44,15,-6,1]/64:
+ * H = 1 - ((1 - cos w) / 2)^3 per colour plane, exactly zero at the 4-row
+ * dual-ISO period (plane Nyquist), 0.875 at the 8-row period (a [1,2,1]/4
+ * notch keeps only 0.5 there, which failed the lag-4 detail target). The
+ * result is clamped to the range of the pixel and its +-2 same-colour
+ * neighbours, so the negative taps never ring at edges; the period-4 residual
+ * always lies inside that range and is fully removed.
+ * Taps outside the frame mirror about y. Bit-exact reference for
+ * k_reduced_iso_period_notch (igpu_recon_cuda.cu). out and src must not alias;
+ * frames shorter than DUALISO_REDUCED_ISO_NOTCH_MIN_HEIGHT are copied unchanged. */
+#define DUALISO_REDUCED_ISO_NOTCH_MIN_HEIGHT 14
+void dualiso_reduced_iso_period_notch16(uint16_t * out, const uint16_t * src, int w, int h);
+
 #ifdef __cplusplus
 }
 #endif

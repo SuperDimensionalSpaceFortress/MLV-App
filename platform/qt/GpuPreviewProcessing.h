@@ -351,6 +351,15 @@ bool gpuPreviewProcessingUpdateShadowsHighlightsBlurTexture(
     const GpuPreviewProcessingConfig & config,
     int width,
     int height);
+/* PLAYBACK-CUDA-HONOUR-SCALE-1 r2: present-gap instrumentation (LIGHT-safe,
+ * one qInfo line per event). Presenters note each texture reallocation; the
+ * play-stop summary reads the count. The context (smoke session id and last
+ * presented frame) is set by MainWindow; gpuPresentEventLogReconLine is the
+ * llrpSetGpuReconEventLogger target for the C seam's set_clip/set_luts lines. */
+void gpuPresentEventSetContext(quint64 sessionId, qint64 lastPresentedFrame);
+void gpuPresentEventNoteTextureRealloc(const char * site, int width, int height);
+quint64 gpuPresentEventTextureReallocCount();
+void gpuPresentEventLogReconLine(const char * line);
 /* Single production decision for whether a presenter must refuse to draw a GPU-recon/
  * AMaZE texture (post-WB-undo linear camera RGB) this paint, rather than ever letting it
  * fall through to the shared shader's previewProcessingEnabled=0 passthrough-equivalent

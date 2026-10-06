@@ -2237,7 +2237,9 @@ MainWindow::MainWindow(int &argc, char **argv, QWidget *parent) :
 
     //Init the lib
     initLib();
-    
+    // PLAYBACK-CUDA-HONOUR-SCALE-1 r2: set_clip/set_luts events reach the log.
+    llrpSetGpuReconEventLogger( gpuPresentEventLogReconLine );
+
     resetSliders();
 
     //Setup Toning (has to be done after initLib())
@@ -23889,6 +23891,14 @@ void MainWindow::beginPlaybackSmokeTelemetry( void )
     ++m_playbackSmokeSessionId;
     if( m_playbackSmokeSessionId == 0 ) ++m_playbackSmokeSessionId;
 
+    // PLAYBACK-CUDA-HONOUR-SCALE-1 r2: present-gap attribution baselines.
+    gpuPresentEventSetContext( m_playbackSmokeSessionId, -1 );
+    m_playbackSmokeStartGpuSetClipCount = llrpGpuPlaybackReconSetClipCount();
+    m_playbackSmokeStartGpuSetLutsCount = llrpGpuPlaybackReconSetLutsCount();
+    m_playbackSmokeStartPresentTextureReallocs = gpuPresentEventTextureReallocCount();
+    m_playbackSmokePresentedIntervalMaxFrame = -1;
+    for( int &bucket : m_playbackSmokePresentIntervalOverBudget ) bucket = 0;
+
     m_playbackLookaheadRequestsIssued = 0;
     m_playbackLookaheadCoveredRequests = 0;
     if( m_pRenderThread ) m_pRenderThread->resetPipelineOverlapMeter();
@@ -24255,7 +24265,17 @@ void MainWindow::notePlaybackSmokePresentedFrame(
         intervalMs = ( now - m_playbackSmokeLastPresentedTime ) * 1000.0;
         m_playbackSmokePresentedIntervalSumMs += intervalMs;
         if( intervalMs > m_playbackSmokePresentedIntervalMaxMs )
+        {
             m_playbackSmokePresentedIntervalMaxMs = intervalMs;
+            m_playbackSmokePresentedIntervalMaxFrame = static_cast<qint64>( displayFrame );
+        }
+        // Intervals over 62.5 ms (1.5 frames at 24 fps): (62.5,100] (100,250] (250,500] >500.
+        if( intervalMs > 62.5 )
+        {
+            const int bucket = intervalMs <= 100.0 ? 0 : intervalMs <= 250.0 ? 1
+                             : intervalMs <= 500.0 ? 2 : 3;
+            ++m_playbackSmokePresentIntervalOverBudget[bucket];
+        }
     }
     else
     {
@@ -24267,6 +24287,7 @@ void MainWindow::notePlaybackSmokePresentedFrame(
         m_playbackSmokeFirstPresentTimelineDeltaAbs =
             qAbs( ui->horizontalSliderPosition->value() - m_playbackSmokeStartPosition );
     }
+    gpuPresentEventSetContext( m_playbackSmokeSessionId, static_cast<qint64>( displayFrame ) );
 
     // BLOCKER fix (CUDA-PLAYBACK-CONTACT-SHEET-2): a presented frame lower than the previous
     // one can only mean the Loop action wrapped (cutOut back to cutIn) -- playback otherwise
@@ -27460,6 +27481,31 @@ void MainWindow::finishPlaybackSmokeTelemetry( const char *reason )
                .arg( m_playbackSmokeGpuDualIsoReconFallbackReasonLast )
                .arg( static_cast<qulonglong>( llrpGpuPlaybackReconClipDimsChangeRefusals() ) )
                .arg( llrpGpuPlaybackReconRetainedOutstandingCount() );
+
+    /* PLAYBACK-CUDA-HONOUR-SCALE-1 r2: present-gap attribution. Counts are this
+     * session's deltas; max_present_interval_frame is the display frame whose
+     * present closed the longest interval (match it against the gpu_recon_event
+     * / gpu_present_event lines). */
+    qInfo().noquote()
+        << QStringLiteral(
+               "playback_smoke.present_gap_summary session=%1 gpu_set_clip_count=%2 "
+               "gpu_set_luts_count=%3 present_texture_reallocs=%4 "
+               "max_present_interval_ms=%5 max_present_interval_frame=%6 "
+               "present_intervals_62_100=%7 present_intervals_100_250=%8 "
+               "present_intervals_250_500=%9 present_intervals_over_500=%10" )
+               .arg( static_cast<qulonglong>( m_playbackSmokeSessionId ) )
+               .arg( static_cast<qulonglong>( llrpGpuPlaybackReconSetClipCount()
+                                              - m_playbackSmokeStartGpuSetClipCount ) )
+               .arg( static_cast<qulonglong>( llrpGpuPlaybackReconSetLutsCount()
+                                              - m_playbackSmokeStartGpuSetLutsCount ) )
+               .arg( static_cast<qulonglong>( gpuPresentEventTextureReallocCount()
+                                              - m_playbackSmokeStartPresentTextureReallocs ) )
+               .arg( m_playbackSmokePresentedIntervalMaxMs, 0, 'f', 3 )
+               .arg( m_playbackSmokePresentedIntervalMaxFrame )
+               .arg( m_playbackSmokePresentIntervalOverBudget[0] )
+               .arg( m_playbackSmokePresentIntervalOverBudget[1] )
+               .arg( m_playbackSmokePresentIntervalOverBudget[2] )
+               .arg( m_playbackSmokePresentIntervalOverBudget[3] );
 
     qInfo().noquote()
         << QStringLiteral(

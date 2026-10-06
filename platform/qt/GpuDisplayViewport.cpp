@@ -1582,6 +1582,7 @@ bool GpuDisplayViewport::setPresentedGpuPlaybackReconAmazePostWbTexture(
         m_texture->setWrapMode(QOpenGLTexture::ClampToEdge);
         m_textureIs16Bit = true;
         m_textureIsBayer16 = false;
+        gpuPresentEventNoteTextureRealloc("viewport_rgba16_texture_realloc", width, height);
     }
     if ( !m_gpuReconSourceTexture
       || m_gpuReconSourceTexture->width() != width
@@ -1594,6 +1595,7 @@ bool GpuDisplayViewport::setPresentedGpuPlaybackReconAmazePostWbTexture(
         m_gpuReconSourceTexture->setMipLevels(1);
         m_gpuReconSourceTexture->allocateStorage(QOpenGLTexture::Red, QOpenGLTexture::UInt16);
         m_gpuReconSourceTexture->setWrapMode(QOpenGLTexture::ClampToEdge);
+        gpuPresentEventNoteTextureRealloc("viewport_r16_texture_realloc", width, height);
     }
     applySamplingMode();
     setupMs = elapsedMs() - setupStartMs;

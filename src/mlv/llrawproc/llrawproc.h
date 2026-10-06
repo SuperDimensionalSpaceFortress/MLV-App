@@ -83,6 +83,9 @@ int llrpGpuPlaybackReconLastPrepareOnlyForTesting(void);
  * while retained device outputs were still outstanding; set_clip would have
  * freed them under a presenter, so it was refused. */
 #define LLRP_GPU_PLAYBACK_RECON_RC_CLIP_DIMS_BUSY 7
+/* PLAYBACK-CUDA-HONOUR-SCALE-1 r2: a reduced-dims run on a recon DLL without
+ * igpu_recon_set_reduced_iso_notch, refused so a meshy frame is never shown. */
+#define LLRP_GPU_PLAYBACK_RECON_RC_NO_REDUCED_ISO_NOTCH 8
 #define LLRP_GPU_RETAINED_OUTSTANDING_MAX 32
 
 typedef struct
@@ -300,6 +303,18 @@ int llrpGpuPlaybackReconReleaseRetainedDeviceBayer16(uint64_t token);
  * many runs were refused because they needed new clip dimensions meanwhile. */
 int llrpGpuPlaybackReconRetainedOutstandingCount(void);
 uint64_t llrpGpuPlaybackReconClipDimsChangeRefusals(void);
+/* PLAYBACK-CUDA-HONOUR-SCALE-1 r2: 1 when the loaded recon backend exports
+ * igpu_recon_set_reduced_iso_notch, 0 when a loaded backend lacks it, -1 when
+ * no backend is loaded yet (this never loads one; a reduced run on a backend
+ * without the symbol is refused by the run path either way). */
+int llrpGpuPlaybackReconReducedIsoNotchAvailable(void);
+/* Cumulative igpu_recon_set_clip / set_luts calls made by the C seam. */
+uint64_t llrpGpuPlaybackReconSetClipCount(void);
+uint64_t llrpGpuPlaybackReconSetLutsCount(void);
+/* One line per set_clip / set_luts event (frame, wall ms, dims), emitted after
+ * the backend mutex is released. NULL uninstalls. */
+typedef void (*llrpGpuReconEventLogger_t)(const char * line);
+void llrpSetGpuReconEventLogger(llrpGpuReconEventLogger_t logger);
 int llrpGpuPlaybackReconCopyLastDeviceBayer16ToGlTexture(unsigned int gl_texture_id,
                                                          int * rc_out);
 int llrpGpuPlaybackReconRunCpu16Probe(const llrpGpuPlaybackReconState_t * state,

@@ -323,7 +323,8 @@ path; the pair is its own record (`mlv-app/dual-venue-sheet-pair/v1`) because re
 A leg's `scaleFactor` is the playback scale it **requests**. It is not necessarily the scale the app **renders** at. Until PLAYBACK-CUDA-HONOUR-SCALE-1 the CUDA
 texture route clamped every requested scale other than 1 to 1 (three production receipts of `m16-1243-look` on CUDA logged
 `playback_scale_clamped_for_gpu_texture_route requested=4 effective=1` and `scale_active_last=1`). It now **honours 2 and 4**: the GPU reconstructs the
-dual-ISO frame at the preview size (`mlvDualIsoGpuPreviewScaleReconPlan`), decided once per play session and logged as
+dual-ISO frame at the preview size (`mlvDualIsoGpuPreviewScaleReconPlan`) and ends with a same-colour ISO-period notch that removes the 4-row dual-ISO mesh
+(a recon DLL without `igpu_recon_set_reduced_iso_notch` makes the plan refuse with "recon DLL lacks the reduced ISO notch"), decided once per play session and logged as
 `playback_scale_gpu_texture_route_session requested=<S> effective=<S or 1> reason="..."`. Scale 8 and any session the plan refuses keep the clamp
 (`platform/qt/MainWindowGpuPreviewPolicy.h`, pinned by `tests/gui/test_gui_smoke.cpp`), and `scale_active_last` reports the scale actually reconstructed, so a
 session that fell back reads 1, never the request.

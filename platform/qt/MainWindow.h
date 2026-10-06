@@ -1197,6 +1197,12 @@ private:
     int m_playbackSmokeFirstPresentTimelineDeltaAbs = 0; // slider travel from Play, sampled at the first present
     double m_playbackSmokePresentedIntervalSumMs = 0.0;
     double m_playbackSmokePresentedIntervalMaxMs = 0.0;
+    // PLAYBACK-CUDA-HONOUR-SCALE-1 r2: present-gap attribution (present_gap_summary).
+    qint64 m_playbackSmokePresentedIntervalMaxFrame = -1;
+    int m_playbackSmokePresentIntervalOverBudget[4] = { 0, 0, 0, 0 };
+    uint64_t m_playbackSmokeStartGpuSetClipCount = 0;
+    uint64_t m_playbackSmokeStartGpuSetLutsCount = 0;
+    quint64 m_playbackSmokeStartPresentTextureReallocs = 0;
     double m_playbackSmokeRenderTotalSumMs = 0.0;
     double m_playbackSmokeRenderTotalMaxMs = 0.0;
     double m_playbackSmokeRenderWorkSumMs = 0.0;

@@ -868,6 +868,50 @@ __global__ void k_output_vertical_mesh_stabilize(uint32_t* __restrict image,
     image[idx] = ev_to_raw20(ev2raw, corrected_ev);
 }
 
+/* PLAYBACK-CUDA-HONOUR-SCALE-1 r2: line-for-line port of
+ * dualiso_reduced_iso_period_notch16 (dualiso.c). Same-colour vertical notch,
+ * weights [1,-6,15,44,15,-6,1]/64 at row offsets 0,+-2,+-4,+-6, taps mirrored
+ * about y at the frame edges, clamped to the range of the pixel and its +-2
+ * same-colour neighbours: zero response at the 4-row dual-ISO period.
+ * Launched last, only while reduced_iso_notch == 1. */
+__device__ __forceinline__ int reduced_iso_notch_tap_row(int y, int d, int H)
+{
+    int r = y + d;
+    if (r < 0 || r >= H) r = y - d;
+    return r;
+}
+
+__global__ void k_reduced_iso_period_notch(uint16_t* __restrict out,
+                                           const uint16_t* __restrict src,
+                                           int W, int H)
+{
+    const int x = blockIdx.x * blockDim.x + threadIdx.x;
+    const int y = blockIdx.y * blockDim.y + threadIdx.y;
+    if (x >= W || y >= H) return;
+    const size_t idx = (size_t)x + (size_t)y * (size_t)W;
+    if (H < 14) { /* DUALISO_REDUCED_ISO_NOTCH_MIN_HEIGHT */
+        out[idx] = src[idx];
+        return;
+    }
+    const int u6 = src[(size_t)x + (size_t)reduced_iso_notch_tap_row(y, -6, H) * (size_t)W];
+    const int u4 = src[(size_t)x + (size_t)reduced_iso_notch_tap_row(y, -4, H) * (size_t)W];
+    const int u2 = src[(size_t)x + (size_t)reduced_iso_notch_tap_row(y, -2, H) * (size_t)W];
+    const int c0 = src[idx];
+    const int d2 = src[(size_t)x + (size_t)reduced_iso_notch_tap_row(y, 2, H) * (size_t)W];
+    const int d4 = src[(size_t)x + (size_t)reduced_iso_notch_tap_row(y, 4, H) * (size_t)W];
+    const int d6 = src[(size_t)x + (size_t)reduced_iso_notch_tap_row(y, 6, H) * (size_t)W];
+    const int s = 44 * c0 + 15 * (u2 + d2) - 6 * (u4 + d4) + (u6 + d6);
+    int v = s < 0 ? 0 : ((s + 32) >> 6);
+    int lo = c0, hi = c0;
+    if (u2 < lo) lo = u2;
+    if (d2 < lo) lo = d2;
+    if (u2 > hi) hi = u2;
+    if (d2 > hi) hi = d2;
+    if (v < lo) v = lo;
+    if (v > hi) v = hi;
+    out[idx] = (uint16_t)v;
+}
+
 __global__ void k_source_mesh_stabilize(uint32_t* __restrict plane,
                                         const uint32_t* __restrict source,
                                         const int* __restrict raw2ev,
@@ -1077,6 +1121,7 @@ struct igpu_recon_backend {
     int   is_bright[4];
     int   have_clip;
     int   have_luts;
+    int   reduced_iso_notch; /* sticky; set by igpu_recon_set_reduced_iso_notch */
 
     /* device buffers (W*H sized; allocated on set_clip) */
     uint16_t *d_in, *d_out, *d_alias, *d_aliasaux, *d_over, *d_overaux;
@@ -2055,6 +2100,13 @@ static int igpu_recon_run_internal(igpu_recon_backend* b,
         k_convert16<<<gt,bt>>>(b->d_out,b->d_raw32,W,H);
     }
 
+    if (b->reduced_iso_notch == 1) {
+        /* d_aliasaux is dead here: only k_alias_rank/k_alias_gauss read it
+         * (STAGE 7), and the next run rewrites it from d_alias before reading. */
+        CK(cudaMemcpy(b->d_aliasaux,b->d_out,n*sizeof(uint16_t),cudaMemcpyDeviceToDevice));
+        k_reduced_iso_period_notch<<<gt,bt>>>(b->d_out,b->d_aliasaux,W,H);
+    }
+
     debug_dump_recon_stages(b, frame, fullres_smooth, halfres_smooth);
 
     CK(cudaGetLastError());
@@ -2264,6 +2316,14 @@ int igpu_recon_allocated_bytes(igpu_recon_backend* b, uint64_t* bytes)
         b->retained_device_output_allocated_bytes +
         b->preupload_device_allocated_bytes;
     *bytes = tracked ? tracked + CUDA_CONTEXT_RESERVE_BYTES : 0;
+    return 0;
+}
+
+IGPU_API
+int igpu_recon_set_reduced_iso_notch(igpu_recon_backend* b, int enable)
+{
+    if (!b || (enable != 0 && enable != 1)) return -1;
+    b->reduced_iso_notch = enable;
     return 0;
 }
 

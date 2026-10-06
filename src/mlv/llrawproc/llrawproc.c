@@ -741,6 +741,7 @@ typedef int (*llrawproc_gpu_copy_last_device_output_to_gl_texture_fn)(
     unsigned int);
 typedef int (*llrawproc_gpu_allocated_bytes_fn)(igpu_recon_backend*, uint64_t*);
 typedef int (*llrawproc_gpu_reset_gl_texture_resources_fn)(igpu_recon_backend*);
+typedef int (*llrawproc_gpu_set_reduced_iso_notch_fn)(igpu_recon_backend*, int);
 
 typedef struct
 {
@@ -782,6 +783,7 @@ typedef struct
     llrawproc_gpu_copy_last_device_output_to_gl_texture_fn copy_last_device_output_to_gl_texture;
     llrawproc_gpu_allocated_bytes_fn allocated_bytes;
     llrawproc_gpu_reset_gl_texture_resources_fn reset_gl_texture_resources;
+    llrawproc_gpu_set_reduced_iso_notch_fn set_reduced_iso_notch;
     int clip_configured;
     igpu_recon_clip_t configured_clip;
     int luts_configured;
@@ -797,6 +799,11 @@ typedef struct
 
 static llrawprocGpuExportBackend_t g_llrawproc_gpu_export_backend = {0};
 static pthread_mutex_t g_llrawproc_gpu_recon_backend_mutex = PTHREAD_MUTEX_INITIALIZER;
+/* PLAYBACK-CUDA-HONOUR-SCALE-1 r2: present-gap instrumentation. Outside the
+ * backend struct so a backend release does not reset them. */
+static volatile LONG64 g_llrawproc_gpu_set_clip_count = 0;
+static volatile LONG64 g_llrawproc_gpu_set_luts_count = 0;
+static llrpGpuReconEventLogger_t g_llrawproc_gpu_recon_event_logger = NULL;
 static volatile LONG g_llrawproc_gpu_recon_run_active = 0;
 static volatile LONG g_llrawproc_gpu_preupload_bypass_active = 0;
 
@@ -931,11 +938,19 @@ static igpu_recon_preupload_status_t g_llrawproc_fake_gpu_backend_last_status = 
 static uint16_t * g_llrawproc_fake_gpu_backend_last_device_output = NULL;
 static int g_llrawproc_fake_gpu_backend_last_device_width = 0;
 static int g_llrawproc_fake_gpu_backend_last_device_height = 0;
+/* PLAYBACK-CUDA-HONOUR-SCALE-1 r2: the optional reduced-ISO-notch extension.
+ * The sticky flag mirrors the CUDA backend's; runs record what they saw. */
+static int g_llrawproc_fake_gpu_backend_reduced_iso_notch = 0;
+static int g_llrawproc_fake_gpu_backend_last_run_reduced_iso_notch = -1;
+static uint64_t g_llrawproc_fake_gpu_backend_runs_with_notch = 0;
+static uint64_t g_llrawproc_fake_gpu_backend_runs_without_notch = 0;
+static uint64_t g_llrawproc_fake_gpu_backend_notch_set_calls = 0;
 
 /* Deterministic, invertible-by-inspection stand-in for real reconstruction:
  * output[i] = input[i] + 1. Its ONLY job is to let a test tell "the fake ran
  * on THESE bytes" apart from "the fake ran on THOSE bytes" -- exact numeric
- * behavior is not the point. */
+ * behavior is not the point. With the reduced ISO notch on, the C reference
+ * notch is applied to that output, as the CUDA backend's last kernel does. */
 static void llrawproc_fake_gpu_backend_transform(const uint16_t * in,
                                                  uint16_t * out,
                                                  size_t pixel_count)
@@ -945,6 +960,28 @@ static void llrawproc_fake_gpu_backend_transform(const uint16_t * in,
     {
         out[i] = (uint16_t)(in[i] + 1u);
     }
+    if(g_llrawproc_fake_gpu_backend_reduced_iso_notch == 1)
+    {
+        const int w = g_llrawproc_fake_gpu_backend_clip.width;
+        const int h = g_llrawproc_fake_gpu_backend_clip.height;
+        uint16_t * src = (uint16_t *)malloc(pixel_count * sizeof(uint16_t));
+        if(src && (size_t)w * (size_t)h == pixel_count)
+        {
+            memcpy(src, out, pixel_count * sizeof(uint16_t));
+            dualiso_reduced_iso_period_notch16(out, src, w, h);
+        }
+        free(src);
+    }
+}
+
+static int llrawproc_fake_gpu_backend_set_reduced_iso_notch(igpu_recon_backend * b,
+                                                            int enable)
+{
+    (void)b;
+    if(enable != 0 && enable != 1) return -1;
+    g_llrawproc_fake_gpu_backend_reduced_iso_notch = enable;
+    ++g_llrawproc_fake_gpu_backend_notch_set_calls;
+    return 0;
 }
 
 static int llrawproc_fake_gpu_backend_abi_version(igpu_recon_backend * b)
@@ -982,12 +1019,77 @@ int llrpFakeGpuBackendFreedInUseRetainedForTesting(void)
     return g_llrawproc_fake_gpu_backend_freed_in_use;
 }
 
+static igpu_recon_luts_t g_llrawproc_fake_gpu_backend_luts = {0};
+
 static int llrawproc_fake_gpu_backend_set_luts(igpu_recon_backend * b,
                                                const igpu_recon_luts_t * luts)
 {
     (void)b;
-    (void)luts;
+    if(!luts) return 0;
+    if(luts->raw2ev) g_llrawproc_fake_gpu_backend_luts.raw2ev = luts->raw2ev;
+    if(luts->ev2raw) g_llrawproc_fake_gpu_backend_luts.ev2raw = luts->ev2raw;
+    if(luts->mix_curve) g_llrawproc_fake_gpu_backend_luts.mix_curve = luts->mix_curve;
+    if(luts->fullres_curve) g_llrawproc_fake_gpu_backend_luts.fullres_curve = luts->fullres_curve;
+    if(luts->randn05) g_llrawproc_fake_gpu_backend_luts.randn05 = luts->randn05;
     return 0;
+}
+
+static void llrawproc_fake_gpu_backend_dump_blob(const char * dir, const char * name,
+                                                 const void * data, size_t bytes)
+{
+    char path[1200];
+    FILE * f;
+    if(!data || bytes == 0) return;
+    snprintf(path, sizeof(path), "%s/%s", dir, name);
+    f = fopen(path, "wb");
+    if(!f) return;
+    fwrite(data, 1, bytes, f);
+    fclose(f);
+}
+
+/* PLAYBACK-CUDA-HONOUR-SCALE-1 r2 (c1): with MLVAPP_FAKE_GPU_RECON_DUMP_DIR set,
+ * each fake run writes the exact input, LUTs and scalars a real backend would
+ * have received, in tools/gpu/backend/dll_test.cpp's vectors layout, so the
+ * production DLL can be replayed on them on a CUDA venue. Test-only. */
+static void llrawproc_fake_gpu_backend_dump_vectors(const igpu_recon_frame_t * frame,
+                                                    const uint16_t * in_bayer14,
+                                                    size_t pixel_count)
+{
+    const char * dir = getenv("MLVAPP_FAKE_GPU_RECON_DUMP_DIR");
+    const igpu_recon_clip_t * c = &g_llrawproc_fake_gpu_backend_clip;
+    const igpu_recon_luts_t * l = &g_llrawproc_fake_gpu_backend_luts;
+    char path[1200];
+    FILE * f;
+    if(!dir || !*dir || !frame || !in_bayer14) return;
+    llrawproc_fake_gpu_backend_dump_blob(dir, "in.u16", in_bayer14, pixel_count * sizeof(uint16_t));
+    llrawproc_fake_gpu_backend_dump_blob(dir, "raw2ev.i32", l->raw2ev,
+                                         (size_t)LLRP_GPU_PLAYBACK_RECON_RAW2EV_COUNT * sizeof(int));
+    llrawproc_fake_gpu_backend_dump_blob(dir, "ev2raw.i32", l->ev2raw,
+                                         (size_t)LLRP_GPU_PLAYBACK_RECON_EV2RAW_COUNT * sizeof(int));
+    llrawproc_fake_gpu_backend_dump_blob(dir, "mix_curve.f64", l->mix_curve,
+                                         (size_t)LLRP_GPU_PLAYBACK_RECON_RAW2EV_COUNT * sizeof(double));
+    llrawproc_fake_gpu_backend_dump_blob(dir, "fullres_curve.f64", l->fullres_curve,
+                                         (size_t)LLRP_GPU_PLAYBACK_RECON_RAW2EV_COUNT * sizeof(double));
+    if(frame->apply_dither)
+    {
+        llrawproc_fake_gpu_backend_dump_blob(dir, "randn05.f32", l->randn05,
+                                             (size_t)LLRP_GPU_PLAYBACK_RECON_RANDN05_COUNT * sizeof(float));
+    }
+    snprintf(path, sizeof(path), "%s/scalars.txt", dir);
+    f = fopen(path, "w");
+    if(!f) return;
+    fprintf(f, "width=%d\nheight=%d\nblack_level=%d\nwhite_level=%d\n",
+            c->width, c->height, c->black_level, c->white_level);
+    fprintf(f, "is_bright=%d,%d,%d,%d\n",
+            c->is_bright[0], c->is_bright[1], c->is_bright[2], c->is_bright[3]);
+    fprintf(f, "white_darkened=%d\nblack_delta=%d\nev_correction=%.17g\ndark_noise=%.17g\n",
+            frame->white_darkened, frame->black_delta, frame->ev_correction, frame->dark_noise);
+    fprintf(f, "interp_method=%d\nuse_alias_map=%d\nuse_fullres=%d\nchroma_smooth_method=%d\n",
+            frame->interp_method, frame->use_alias_map, frame->use_fullres,
+            frame->chroma_smooth_method);
+    fprintf(f, "apply_dither=%d\nplayback_preview_scale_factor=%d\n",
+            frame->apply_dither, frame->playback_preview_scale_factor);
+    fclose(f);
 }
 
 static int llrawproc_fake_gpu_backend_run(igpu_recon_backend * b,
@@ -1000,9 +1102,15 @@ static int llrawproc_fake_gpu_backend_run(igpu_recon_backend * b,
     const size_t pixel_count = (size_t)g_llrawproc_fake_gpu_backend_clip.width
         * (size_t)g_llrawproc_fake_gpu_backend_clip.height;
     (void)b;
-    (void)frame;
     (void)gl_texture;
     if(!in_bayer14 || pixel_count == 0) return -1;
+    llrawproc_fake_gpu_backend_dump_vectors(frame, in_bayer14, pixel_count);
+    g_llrawproc_fake_gpu_backend_last_run_reduced_iso_notch =
+        g_llrawproc_fake_gpu_backend_reduced_iso_notch;
+    if(g_llrawproc_fake_gpu_backend_reduced_iso_notch == 1)
+        ++g_llrawproc_fake_gpu_backend_runs_with_notch;
+    else
+        ++g_llrawproc_fake_gpu_backend_runs_without_notch;
     if(out_kind == IGPU_OUT_CPU16)
     {
         if(!out_bayer16) return -1;
@@ -1176,10 +1284,16 @@ int llrpInstallFakeGpuPlaybackReconBackendForTesting(int install)
     g_llrawproc_fake_gpu_backend_last_device_width = 0;
     g_llrawproc_fake_gpu_backend_last_device_height = 0;
     memset(&g_llrawproc_fake_gpu_backend_clip, 0, sizeof(g_llrawproc_fake_gpu_backend_clip));
+    memset(&g_llrawproc_fake_gpu_backend_luts, 0, sizeof(g_llrawproc_fake_gpu_backend_luts));
     memset(&g_llrawproc_fake_gpu_backend_last_status, 0, sizeof(g_llrawproc_fake_gpu_backend_last_status));
     g_llrawproc_fake_gpu_backend_next_token = 1;
     g_llrawproc_fake_gpu_backend_in_use_count = 0;
     g_llrawproc_fake_gpu_backend_freed_in_use = 0;
+    g_llrawproc_fake_gpu_backend_reduced_iso_notch = 0;
+    g_llrawproc_fake_gpu_backend_last_run_reduced_iso_notch = -1;
+    g_llrawproc_fake_gpu_backend_runs_with_notch = 0;
+    g_llrawproc_fake_gpu_backend_runs_without_notch = 0;
+    g_llrawproc_fake_gpu_backend_notch_set_calls = 0;
     if(install)
     {
         g->backend = (igpu_recon_backend *)&g_llrawproc_fake_gpu_backend_sentinel;
@@ -1200,6 +1314,7 @@ int llrpInstallFakeGpuPlaybackReconBackendForTesting(int install)
         g->last_device_output = llrawproc_fake_gpu_backend_last_device_output;
         g->retain_last_device_output = llrawproc_fake_gpu_backend_retain_last_device_output;
         g->release_retained_device_output = llrawproc_fake_gpu_backend_release_retained_device_output;
+        g->set_reduced_iso_notch = llrawproc_fake_gpu_backend_set_reduced_iso_notch;
         g_llrawproc_fake_gpu_backend_installed = 1;
     }
     else
@@ -1208,6 +1323,38 @@ int llrpInstallFakeGpuPlaybackReconBackendForTesting(int install)
     }
     pthread_mutex_unlock(&g_llrawproc_gpu_recon_backend_mutex);
     return 1;
+}
+
+/* Test-only: model an older DLL (present=0) that lacks
+ * igpu_recon_set_reduced_iso_notch, or restore the symbol (present=1). */
+int llrpSetFakeGpuBackendReducedIsoNotchSymbolForTesting(int present);
+int llrpSetFakeGpuBackendReducedIsoNotchSymbolForTesting(int present)
+{
+    llrawprocGpuExportBackend_t * g = &g_llrawproc_gpu_export_backend;
+    if(!g_llrawproc_fake_gpu_backend_installed) return 0;
+    pthread_mutex_lock(&g_llrawproc_gpu_recon_backend_mutex);
+    g->set_reduced_iso_notch =
+        present ? llrawproc_fake_gpu_backend_set_reduced_iso_notch : NULL;
+    if(!present) g_llrawproc_fake_gpu_backend_reduced_iso_notch = 0;
+    pthread_mutex_unlock(&g_llrawproc_gpu_recon_backend_mutex);
+    return 1;
+}
+
+/* Test-only: the notch flag the most recent fake run saw (-1 before any run),
+ * how many runs saw 1 and 0, and how many set() calls the seam made. */
+void llrpFakeGpuBackendReducedIsoNotchStateForTesting(int * last_run_flag,
+                                                      uint64_t * runs_with_notch,
+                                                      uint64_t * runs_without_notch,
+                                                      uint64_t * set_calls);
+void llrpFakeGpuBackendReducedIsoNotchStateForTesting(int * last_run_flag,
+                                                      uint64_t * runs_with_notch,
+                                                      uint64_t * runs_without_notch,
+                                                      uint64_t * set_calls)
+{
+    if(last_run_flag) *last_run_flag = g_llrawproc_fake_gpu_backend_last_run_reduced_iso_notch;
+    if(runs_with_notch) *runs_with_notch = g_llrawproc_fake_gpu_backend_runs_with_notch;
+    if(runs_without_notch) *runs_without_notch = g_llrawproc_fake_gpu_backend_runs_without_notch;
+    if(set_calls) *set_calls = g_llrawproc_fake_gpu_backend_notch_set_calls;
 }
 
 /* Test-only hook: clear the sticky LoadLibrary result so a focused test can
@@ -1355,6 +1502,11 @@ static int llrawproc_gpu_export_backend_available(int prefer_playback_dll)
         resolved.raw = GetProcAddress(g->dll, "igpu_recon_reset_gl_texture_resources");
         g->reset_gl_texture_resources = resolved.typed;
     }
+    {
+        union { FARPROC raw; llrawproc_gpu_set_reduced_iso_notch_fn typed; } resolved;
+        resolved.raw = GetProcAddress(g->dll, "igpu_recon_set_reduced_iso_notch");
+        g->set_reduced_iso_notch = resolved.typed;
+    }
 
 #undef LLRAWPROC_GPU_RESOLVE_TYPED
 
@@ -1489,7 +1641,8 @@ static int llrawproc_gpu_recon_run_backend(const dualiso_gpu_recon_state_t * sta
                                            const uint16_t ** device_bayer16_out,
                                            int * device_width_out,
                                            int * device_height_out,
-                                           llrpGpuPlaybackRetainedDeviceBayer16_t * retained_out)
+                                           llrpGpuPlaybackRetainedDeviceBayer16_t * retained_out,
+                                           int reduced_iso_notch)
 {
     llrawprocGpuExportBackend_t * g = &g_llrawproc_gpu_export_backend;
     igpu_recon_clip_t clip;
@@ -1497,6 +1650,12 @@ static int llrawproc_gpu_recon_run_backend(const dualiso_gpu_recon_state_t * sta
     igpu_recon_frame_t frame;
     llrawprocGpuReconLutsKey_t luts_key;
     int rc = 0;
+    int set_clip_rc = 0;
+    int set_luts_rc = 0;
+    double set_clip_start_s = 0.0;
+    double set_clip_ms = -1.0;
+    double set_luts_start_s = 0.0;
+    double set_luts_ms = -1.0;
     const size_t pixel_count = raw_image_size / sizeof(uint16_t);
     if(rc_out) *rc_out = -1;
     if(allocated_bytes_out) *allocated_bytes_out = 0;
@@ -1576,9 +1735,20 @@ static int llrawproc_gpu_recon_run_backend(const dualiso_gpu_recon_state_t * sta
         if(rc_out) *rc_out = LLRP_GPU_PLAYBACK_RECON_RC_CLIP_DIMS_BUSY;
         return 0;
     }
+    if(reduced_iso_notch && !g->set_reduced_iso_notch)
+    {
+        /* An older DLL: a reduced recon without the notch shows the ISO mesh. */
+        pthread_mutex_unlock(&g_llrawproc_gpu_recon_backend_mutex);
+        if(rc_out) *rc_out = LLRP_GPU_PLAYBACK_RECON_RC_NO_REDUCED_ISO_NOTCH;
+        return 0;
+    }
     if(need_set_clip)
     {
+        set_clip_start_s = mlv_stage_timing_now();
         rc = g->set_clip(g->backend, &clip);
+        set_clip_ms = (mlv_stage_timing_now() - set_clip_start_s) * 1000.0;
+        set_clip_rc = rc;
+        InterlockedIncrement64(&g_llrawproc_gpu_set_clip_count);
         if(rc == 0)
         {
             g->configured_clip = clip;
@@ -1593,7 +1763,11 @@ static int llrawproc_gpu_recon_run_backend(const dualiso_gpu_recon_state_t * sta
     }
     if(rc == 0 && need_set_luts)
     {
+        set_luts_start_s = mlv_stage_timing_now();
         rc = g->set_luts(g->backend, &luts);
+        set_luts_ms = (mlv_stage_timing_now() - set_luts_start_s) * 1000.0;
+        set_luts_rc = rc;
+        InterlockedIncrement64(&g_llrawproc_gpu_set_luts_count);
         if(rc == 0)
         {
             g->configured_luts_key = luts_key;
@@ -1603,6 +1777,11 @@ static int llrawproc_gpu_recon_run_backend(const dualiso_gpu_recon_state_t * sta
         {
             g->luts_configured = 0;
         }
+    }
+    if(rc == 0 && g->set_reduced_iso_notch)
+    {
+        /* Sticky in the backend: set it for every run, 1 only for reduced dims. */
+        rc = g->set_reduced_iso_notch(g->backend, reduced_iso_notch ? 1 : 0);
     }
     if(rc == 0)
     {
@@ -1763,6 +1942,31 @@ static int llrawproc_gpu_recon_run_backend(const dualiso_gpu_recon_state_t * sta
     }
     pthread_mutex_unlock(&g_llrawproc_gpu_recon_backend_mutex);
 
+    if(g_llrawproc_gpu_recon_event_logger && (set_clip_ms >= 0.0 || set_luts_ms >= 0.0))
+    {
+        char line[256];
+        if(set_clip_ms >= 0.0)
+        {
+            snprintf(line, sizeof(line),
+                     "gpu_recon_event kind=set_clip frame=%llu wall_ms=%.3f dur_ms=%.3f "
+                     "width=%d height=%d rc=%d count=%lld",
+                     (unsigned long long)frame_id, set_clip_start_s * 1000.0, set_clip_ms,
+                     clip.width, clip.height, set_clip_rc,
+                     (long long)g_llrawproc_gpu_set_clip_count);
+            g_llrawproc_gpu_recon_event_logger(line);
+        }
+        if(set_luts_ms >= 0.0)
+        {
+            snprintf(line, sizeof(line),
+                     "gpu_recon_event kind=set_luts frame=%llu wall_ms=%.3f dur_ms=%.3f "
+                     "width=%d height=%d rc=%d count=%lld",
+                     (unsigned long long)frame_id, set_luts_start_s * 1000.0, set_luts_ms,
+                     clip.width, clip.height, set_luts_rc,
+                     (long long)g_llrawproc_gpu_set_luts_count);
+            g_llrawproc_gpu_recon_event_logger(line);
+        }
+    }
+
     if(rc_out) *rc_out = rc;
     return rc == 0;
 }
@@ -1807,7 +2011,8 @@ static int llrawproc_gpu_recon_run_cpu16(const dualiso_gpu_recon_state_t * state
                                            NULL,
                                            NULL,
                                            NULL,
-                                           NULL);
+                                           NULL,
+                                           0);
 }
 
 static int llrawproc_gpu_export_try_replace(uint16_t * cpu_output,
@@ -2079,7 +2284,8 @@ int llrpGpuPlaybackReconRunGlTexture(const llrpGpuPlaybackReconState_t * state,
                                            NULL,
                                            NULL,
                                            NULL,
-                                           NULL);
+                                           NULL,
+                                           0);
 }
 
 int llrpGpuPlaybackReconRunDeviceBayer16(const llrpGpuPlaybackReconState_t * state,
@@ -2125,7 +2331,8 @@ int llrpGpuPlaybackReconRunDeviceBayer16(const llrpGpuPlaybackReconState_t * sta
                                           device_bayer16_out,
                                           width_out,
                                           height_out,
-                                          NULL);
+                                          NULL,
+                                          0);
 }
 
 int llrpGpuPlaybackReconRunRetainedDeviceBayer16(
@@ -2135,6 +2342,14 @@ int llrpGpuPlaybackReconRunRetainedDeviceBayer16(
     llrpGpuPlaybackRetainedDeviceBayer16_t * retained_out,
     int * rc_out,
     llrpGpuPlaybackReconTiming_t * timing_out);
+static int llrawproc_gpu_playback_run_retained(
+    const llrpGpuPlaybackReconState_t * state,
+    const uint16_t * raw_input_bayer14,
+    size_t raw_image_size,
+    llrpGpuPlaybackRetainedDeviceBayer16_t * retained_out,
+    int * rc_out,
+    llrpGpuPlaybackReconTiming_t * timing_out,
+    int reduced_iso_notch);
 int llrpGpuPlaybackReconRunRetainedDeviceBayer16(
     const llrpGpuPlaybackReconState_t * state,
     const uint16_t * raw_input_bayer14,
@@ -2142,6 +2357,21 @@ int llrpGpuPlaybackReconRunRetainedDeviceBayer16(
     llrpGpuPlaybackRetainedDeviceBayer16_t * retained_out,
     int * rc_out,
     llrpGpuPlaybackReconTiming_t * timing_out)
+{
+    return llrawproc_gpu_playback_run_retained(state, raw_input_bayer14, raw_image_size,
+                                               retained_out, rc_out, timing_out, 0);
+}
+
+/* PLAYBACK-CUDA-HONOUR-SCALE-1 r2: reduced_iso_notch=1 only for the reduced
+ * route (llrawproc_with_dims_gpu_playback_texture). */
+static int llrawproc_gpu_playback_run_retained(
+    const llrpGpuPlaybackReconState_t * state,
+    const uint16_t * raw_input_bayer14,
+    size_t raw_image_size,
+    llrpGpuPlaybackRetainedDeviceBayer16_t * retained_out,
+    int * rc_out,
+    llrpGpuPlaybackReconTiming_t * timing_out,
+    int reduced_iso_notch)
 {
     dualiso_gpu_recon_state_t private_state;
     const uint16_t * device_bayer16 = NULL;
@@ -2170,7 +2400,8 @@ int llrpGpuPlaybackReconRunRetainedDeviceBayer16(
                                           &device_bayer16,
                                           &width,
                                           &height,
-                                          retained_out);
+                                          retained_out,
+                                          reduced_iso_notch);
 }
 
 int llrpGpuPlaybackReconCopyLastDeviceBayer16ToGlTexture(unsigned int gl_texture_id,
@@ -2250,6 +2481,34 @@ uint64_t llrpGpuPlaybackReconClipDimsChangeRefusals(void)
     return refusals;
 }
 
+int llrpGpuPlaybackReconReducedIsoNotchAvailable(void)
+{
+    llrawprocGpuExportBackend_t * g = &g_llrawproc_gpu_export_backend;
+    int available = -1;
+    pthread_mutex_lock(&g_llrawproc_gpu_recon_backend_mutex);
+    if(g->backend && !g->unavailable)
+    {
+        available = g->set_reduced_iso_notch ? 1 : 0;
+    }
+    pthread_mutex_unlock(&g_llrawproc_gpu_recon_backend_mutex);
+    return available;
+}
+
+uint64_t llrpGpuPlaybackReconSetClipCount(void)
+{
+    return (uint64_t)InterlockedCompareExchange64(&g_llrawproc_gpu_set_clip_count, 0, 0);
+}
+
+uint64_t llrpGpuPlaybackReconSetLutsCount(void)
+{
+    return (uint64_t)InterlockedCompareExchange64(&g_llrawproc_gpu_set_luts_count, 0, 0);
+}
+
+void llrpSetGpuReconEventLogger(llrpGpuReconEventLogger_t logger)
+{
+    g_llrawproc_gpu_recon_event_logger = logger;
+}
+
 int llrpGpuPlaybackReconRunCpu16Probe(const llrpGpuPlaybackReconState_t * state,
                                       const uint16_t * raw_input_bayer14,
                                       size_t raw_image_size,
@@ -2286,7 +2545,8 @@ int llrpGpuPlaybackReconRunCpu16Probe(const llrpGpuPlaybackReconState_t * state,
                                            NULL,
                                            NULL,
                                            NULL,
-                                           NULL);
+                                           NULL,
+                                           0);
 }
 #else
 static int llrawproc_gpu_export_backend_available(int prefer_playback_dll)
@@ -2517,6 +2777,40 @@ int llrpGpuPlaybackReconRetainedOutstandingCount(void)
 uint64_t llrpGpuPlaybackReconClipDimsChangeRefusals(void)
 {
     return 0;
+}
+
+static int llrawproc_gpu_playback_run_retained(
+    const llrpGpuPlaybackReconState_t * state,
+    const uint16_t * raw_input_bayer14,
+    size_t raw_image_size,
+    llrpGpuPlaybackRetainedDeviceBayer16_t * retained_out,
+    int * rc_out,
+    llrpGpuPlaybackReconTiming_t * timing_out,
+    int reduced_iso_notch)
+{
+    (void)reduced_iso_notch;
+    return llrpGpuPlaybackReconRunRetainedDeviceBayer16(state, raw_input_bayer14, raw_image_size,
+                                                        retained_out, rc_out, timing_out);
+}
+
+int llrpGpuPlaybackReconReducedIsoNotchAvailable(void)
+{
+    return -1;
+}
+
+uint64_t llrpGpuPlaybackReconSetClipCount(void)
+{
+    return 0;
+}
+
+uint64_t llrpGpuPlaybackReconSetLutsCount(void)
+{
+    return 0;
+}
+
+void llrpSetGpuReconEventLogger(llrpGpuReconEventLogger_t logger)
+{
+    (void)logger;
 }
 #endif
 
@@ -4836,13 +5130,17 @@ static int llrawproc_with_dims_gpu_playback_texture(mlvObject_t * video,
                                                      &public_gpu_playback_state);
     public_gpu_playback_state.frame_id = frame_index;
     g_llrawproc_gpu_playback_last_run_attempted = 1;
+    /* r2: the reduced run ends with the same-colour ISO-period notch (the
+     * backend refuses it, LLRP_GPU_PLAYBACK_RECON_RC_NO_REDUCED_ISO_NOTCH, on a
+     * DLL without the extension). */
     const int retained_ok =
-        llrpGpuPlaybackReconRunRetainedDeviceBayer16(&public_gpu_playback_state,
-                                                     raw_image_buff,
-                                                     raw_image_size,
-                                                     &retained_device,
-                                                     &retained_rc,
-                                                     &retained_timing)
+        llrawproc_gpu_playback_run_retained(&public_gpu_playback_state,
+                                            raw_image_buff,
+                                            raw_image_size,
+                                            &retained_device,
+                                            &retained_rc,
+                                            &retained_timing,
+                                            1)
         && retained_device.valid;
     g_llrawproc_gpu_playback_last_preupload_status = retained_timing.preupload;
     g_llrawproc_gpu_playback_last_run_rc = retained_rc;

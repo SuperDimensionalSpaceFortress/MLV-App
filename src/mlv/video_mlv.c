@@ -8142,6 +8142,14 @@ static int mlv_dualiso_preview_scale_recon_plan_internal(mlvObject_t * video,
         plan->reason = "GPU playback recon not requested";
         return 0;
     }
+    if (gpu && llrpGpuPlaybackReconReducedIsoNotchAvailable() == 0)
+    {
+        /* PLAYBACK-CUDA-HONOUR-SCALE-1 r2: without the notch a reduced recon
+         * shows the 4-row ISO mesh; stay on the full-res texture route. Not
+         * loaded yet (-1) is left to the run path, which refuses such a run. */
+        plan->reason = "recon DLL lacks the reduced ISO notch";
+        return 0;
+    }
     const int scale = mlv_effective_playback_scale_factor(video, requestedScale);
     if (gpu && scale == 8)
     {
