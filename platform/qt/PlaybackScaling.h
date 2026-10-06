@@ -132,12 +132,26 @@ inline bool playbackReconTextureIsReducedForDisplaySize(int textureWidth,
                                          displayHeight / 2 + 2);
 }
 
-/* A reduced texture present on an AMaZE DLL without the H-Nyquist symbol is refused
- * (the caller's fallback takes over), so an unfiltered reduced texture is never shown. */
-inline bool playbackReducedHnyquistPresentRefused(bool reducedTexture,
-                                                  bool hnyquistSymbolAvailable)
+/* PLAYBACK-CUDA-HONOUR-SCALE-1 r4: the reduced route now shrinks on phase-correct tent
+ * bins (pl_downsample_bayer_to_bayer_phase_tent), which removes the comb at its source,
+ * so the r3 AMaZE H-Nyquist filter is off by default. This one constant sets it for
+ * every reduced present; at 0 the live AMaZE run keeps its direct RGBA store. */
+constexpr int kReducedHnyquistOnReducedPresents = 0;
+
+inline bool playbackReducedHnyquistWanted(bool reducedTexture,
+                                          int hnyquistOn = kReducedHnyquistOnReducedPresents)
 {
-    return reducedTexture && !hnyquistSymbolAvailable;
+    return hnyquistOn != 0 && reducedTexture;
+}
+
+/* A reduced present that wants the H-Nyquist filter on an AMaZE DLL without its symbol is
+ * refused (the caller's fallback takes over), so a reduced texture is never shown without
+ * the filter it was meant to get. With the filter off no present is refused. */
+inline bool playbackReducedHnyquistPresentRefused(bool reducedTexture,
+                                                  bool hnyquistSymbolAvailable,
+                                                  int hnyquistOn = kReducedHnyquistOnReducedPresents)
+{
+    return playbackReducedHnyquistWanted(reducedTexture, hnyquistOn) && !hnyquistSymbolAvailable;
 }
 
 inline bool playbackRgb8RowLooksLikeUniformTopMagentaBand(const uint8_t *row,

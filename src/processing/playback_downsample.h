@@ -181,6 +181,24 @@ int pl_downsample_bayer_to_bayer_8x(const uint16_t * bayer_in,
                                     int * out_h,
                                     int threads);
 
+/* PLAYBACK-CUDA-HONOUR-SCALE-1 r4: phase-correct same-colour, same-ISO tent bin
+ * for the GPU reduced recon. Same output dims and divisibility as the 2x/4x
+ * kernels above (scale 2 or 4 only). Output (x, y) is centred on its own site,
+ * t = S*o + (S-1)/2 on each axis. Columns take source cols s = x (mod 2) with
+ * |s - t| < S, weight 2*(S - |s - t|); rows take source rows s = y (mod 4), so
+ * the ISO-row class is kept, with |s - t| < 2S, weight 2*(2S - |s - t|). An
+ * out-of-range tap reads the nearest in-range sample of its class. Integer, one
+ * rounding: (acc + den/2) / den, den 512 at x4 and 32 at x2. Returns 0 on
+ * success, non-zero on bad dims, scale or allocation failure. */
+int pl_downsample_bayer_to_bayer_phase_tent(const uint16_t * in,
+                                            int in_w,
+                                            int in_h,
+                                            uint16_t * out,
+                                            int scale,
+                                            int * out_w,
+                                            int * out_h,
+                                            int threads);
+
 /* Phase 4B-v2 (X-only): bayer-to-bayer 4x reduction in X only, identity
  * in Y. Used when the source height is not 16-aligned and so the
  * Y-axis-also-downsample 4x kernel would reject. Output dim:

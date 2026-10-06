@@ -8248,7 +8248,24 @@ static int mlv_dualiso_preview_scale_recon_plan_internal(mlvObject_t * video,
     plan->reducedWidth = full_w / scale;
     plan->reducedHeight = source_h / scale;
     plan->fullResFixes = fixes ? 1 : 0;
+    /* PLAYBACK-CUDA-HONOUR-SCALE-1 r4: the GPU route shrinks on correctly centred,
+     * same-ISO tent bins (the decimators' off-site Gr/Gb turn into AMaZE's column
+     * comb). The CPU route keeps its decimators byte for byte. */
+    plan->phaseTentShrink = gpu ? 1 : 0;
     return 1;
+}
+
+static uint64_t g_mlv_phase_tent_shrink_frames = 0;
+static uint64_t g_mlv_phase_tent_shrink_micros = 0;
+
+uint64_t mlvDualIsoPhaseTentShrinkFrames(void)
+{
+    return __atomic_load_n(&g_mlv_phase_tent_shrink_frames, __ATOMIC_RELAXED);
+}
+
+uint64_t mlvDualIsoPhaseTentShrinkMicros(void)
+{
+    return __atomic_load_n(&g_mlv_phase_tent_shrink_micros, __ATOMIC_RELAXED);
 }
 
 int mlvDualIsoPreviewScaleReconPlan(mlvObject_t * video,
@@ -8301,7 +8318,20 @@ int mlvDualIsoPreviewScaleReconShrink(mlvObject_t * video,
     int out_w = 0;
     int out_h = 0;
     int rc = -1;
-    if (plan->scale == 2)
+    if (plan->phaseTentShrink && (plan->scale == 2 || plan->scale == 4))
+    {
+        rc = pl_downsample_bayer_to_bayer_phase_tent(fullRaw, full_w, plan->sourceHeight,
+                                                     reducedOut, plan->scale,
+                                                     &out_w, &out_h, threads);
+        const double ms = (mlv_stage_timing_now() - downsample_start) * 1000.0;
+        if (rc == 0 && out_w == plan->reducedWidth && out_h == plan->reducedHeight)
+        {
+            __atomic_fetch_add(&g_mlv_phase_tent_shrink_frames, 1, __ATOMIC_RELAXED);
+            __atomic_fetch_add(&g_mlv_phase_tent_shrink_micros,
+                               (uint64_t)(ms * 1000.0 + 0.5), __ATOMIC_RELAXED);
+        }
+    }
+    else if (plan->scale == 2)
     {
         rc = pl_downsample_bayer_to_bayer_2x(fullRaw, full_w, plan->sourceHeight,
                                              reducedOut, &out_w, &out_h, threads);

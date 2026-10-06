@@ -1062,6 +1062,168 @@ int pl_downsample_bayer_to_bayer_8x(const uint16_t * bayer_in,
                                                   bayer_out, out_w, out_h, threads);
 }
 
+/* PLAYBACK-CUDA-HONOUR-SCALE-1 r4: phase-correct tent bin (see the header).
+ * Coordinates are doubled so every target and distance is an integer:
+ * 2t = 2*S*o + S - 1, and a tap at s has weight radius2 - |2s - 2t| for
+ * |2s - 2t| < radius2 (radius2 = 2S in columns, 4S in rows). */
+static void pl_phase_tent_clamp_class(int * s, int modulus, int limit)
+{
+    if (*s < 0)
+    {
+        *s = ((*s % modulus) + modulus) % modulus;
+    }
+    else if (*s >= limit)
+    {
+        *s = (limit - 1) - ((((limit - 1) - *s) % modulus) + modulus) % modulus;
+    }
+}
+
+static int pl_phase_tent_taps(int out_index, int scale, int modulus, int radius2,
+                              int limit, int * src, uint32_t * wt)
+{
+    const int target2 = 2 * scale * out_index + scale - 1;
+    const int cls = out_index % modulus;
+    int n = 0;
+    for (int s = (target2 - radius2) / 2 - modulus; s <= (target2 + radius2) / 2 + modulus; ++s)
+    {
+        if ((((s % modulus) + modulus) % modulus) != cls) continue;
+        const int d2 = 2 * s - target2;
+        const int ad2 = d2 < 0 ? -d2 : d2;
+        if (ad2 >= radius2) continue;
+        int clamped = s;
+        pl_phase_tent_clamp_class(&clamped, modulus, limit);
+        src[n] = clamped;
+        wt[n] = (uint32_t)(radius2 - ad2);
+        ++n;
+    }
+    return n;
+}
+
+static void pl_phase_tent_row(const uint16_t * __restrict bayer_in,
+                              int in_w,
+                              int in_h,
+                              uint16_t * __restrict bayer_out,
+                              int out_w,
+                              int y_out,
+                              int scale,
+                              const int * col_src,
+                              const uint32_t * col_wt,
+                              int col_taps,
+                              uint32_t den,
+                              uint32_t * __restrict vrow)
+{
+    int row_src[4];
+    uint32_t row_wt[4];
+    const int row_taps = pl_phase_tent_taps(y_out, scale, 4, 4 * scale, in_h, row_src, row_wt);
+
+    memset(vrow, 0, (size_t)in_w * sizeof(uint32_t));
+    for (int t = 0; t < row_taps; ++t)
+    {
+        const uint16_t * __restrict srow = bayer_in + (size_t)row_src[t] * (size_t)in_w;
+        const uint32_t w = row_wt[t];
+        for (int x = 0; x < in_w; ++x) vrow[x] += w * (uint32_t)srow[x];
+    }
+
+    uint16_t * __restrict drow = bayer_out + (size_t)y_out * (size_t)out_w;
+    for (int x_out = 0; x_out < out_w; ++x_out)
+    {
+        const int * s = col_src + (size_t)x_out * 4u;
+        const uint32_t * w = col_wt + (size_t)x_out * 4u;
+        uint32_t acc = 0;
+        for (int t = 0; t < col_taps; ++t) acc += w[t] * vrow[s[t]];
+        drow[x_out] = (uint16_t)((acc + den / 2u) / den);
+    }
+}
+
+int pl_downsample_bayer_to_bayer_phase_tent(const uint16_t * in,
+                                            int in_w,
+                                            int in_h,
+                                            uint16_t * out,
+                                            int scale,
+                                            int * out_w_p,
+                                            int * out_h_p,
+                                            int threads)
+{
+    if (!in || !out) return 1;
+    if (scale == 4)
+    {
+        if (in_w < 4 || in_h < 16 || (in_w & 3) || (in_h & 15)) return 1;
+    }
+    else if (scale == 2)
+    {
+        if (in_w < 4 || in_h < 8 || (in_w & 3) || (in_h & 7)) return 1;
+    }
+    else
+    {
+        return 1;
+    }
+
+    const int out_w = in_w / scale;
+    const int out_h = in_h / scale;
+    if (out_w_p) *out_w_p = out_w;
+    if (out_h_p) *out_h_p = out_h;
+
+    /* Column tap weights sum to S*S and row tap weights to 2*S*S: 512 at x4, 32 at x2. */
+    const uint32_t den = (uint32_t)(scale * scale) * (uint32_t)(2 * scale * scale);
+    int * col_src = (int *)malloc((size_t)out_w * 4u * sizeof(int));
+    uint32_t * col_wt = (uint32_t *)malloc((size_t)out_w * 4u * sizeof(uint32_t));
+    if (!col_src || !col_wt)
+    {
+        free(col_src);
+        free(col_wt);
+        return 1;
+    }
+    int col_taps = 0;
+    for (int x_out = 0; x_out < out_w; ++x_out)
+    {
+        col_taps = pl_phase_tent_taps(x_out, scale, 2, 2 * scale, in_w,
+                                      col_src + (size_t)x_out * 4u,
+                                      col_wt + (size_t)x_out * 4u);
+    }
+
+    int failed = 0;
+    if (threads > 1)
+    {
+        #pragma omp parallel num_threads(threads)
+        {
+            uint32_t * vrow = (uint32_t *)malloc((size_t)in_w * sizeof(uint32_t));
+            if (!vrow)
+            {
+                #pragma omp atomic write
+                failed = 1;
+            }
+            #pragma omp for
+            for (int y_out = 0; y_out < out_h; ++y_out)
+            {
+                if (!vrow) continue;
+                pl_phase_tent_row(in, in_w, in_h, out, out_w, y_out, scale,
+                                  col_src, col_wt, col_taps, den, vrow);
+            }
+            free(vrow);
+        }
+    }
+    else
+    {
+        uint32_t * vrow = (uint32_t *)malloc((size_t)in_w * sizeof(uint32_t));
+        if (!vrow)
+        {
+            failed = 1;
+        }
+        else
+        {
+            for (int y_out = 0; y_out < out_h; ++y_out)
+            {
+                pl_phase_tent_row(in, in_w, in_h, out, out_w, y_out, scale,
+                                  col_src, col_wt, col_taps, den, vrow);
+            }
+            free(vrow);
+        }
+    }
+    free(col_src);
+    free(col_wt);
+    return failed ? 1 : 0;
+}
+
 /* X-only bayer-to-bayer 4x: same per-row 2-tap same-Bayer-position
  * average as the full kernel, but iterates over ALL source rows (no
  * block stride). Y identity preserves the dual-ISO 4-row pattern

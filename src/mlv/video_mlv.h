@@ -233,7 +233,14 @@ typedef struct
     int reducedHeight;
     int fullResFixes;       /* focus/bad pixel/stripes/pattern run at full res first */
     const char * reason;    /* "none" when reduced, otherwise why full resolution */
+    int phaseTentShrink;    /* 1: shrink with pl_downsample_bayer_to_bayer_phase_tent (GPU
+                             * plan only); 0: the Phase 4B decimators (CPU plan) */
 } mlvDualIsoPreviewScaleRecon_t;
+
+/* Process-wide counters of the phase-tent shrink (successful shrinks and their summed
+ * downsample time in microseconds), for the play-stop summary. */
+uint64_t mlvDualIsoPhaseTentShrinkFrames(void);
+uint64_t mlvDualIsoPhaseTentShrinkMicros(void);
 
 /* Decide the recon scale for `requestedScale`. Returns 1 when the reduced path
  * may run (plan->scale > 1), 0 when the frame must be reconstructed at full
