@@ -32,7 +32,9 @@
       "type": "object", "additionalProperties": false,
       "properties": {
         "telemetryArm": { "enum": ["HEAVY", "LIGHT"] },
-        "cpuQuiescenceThresholdPercent": { "type": "number", "exclusiveMinimum": 0, "maximum": 100 }
+        "cpuQuiescenceThresholdPercent": { "type": "number", "exclusiveMinimum": 0, "maximum": 100 },
+        "forceLookAssist": { "type": "boolean", "description": "SPEED legs only (PLAYBACK-BACHELOR-PRESENT-JITTER-1): force Look Assist on WITHOUT a contact sheet (generator -ForceLookAssist -LookPaceLeg), so no GUI-thread framebuffer grab lands inside the timed Play. A look leg ignores it (its look block forces Look Assist)." },
+        "lookFlavor": { "enum": ["classic", "cinematic"], "description": "With forceLookAssist on a SPEED leg: the Look Assist flavor (generator -LookFlavor)." }
       },
       "description": "Generator arguments other than -Venue/-Backend/-ScaleFactor/-SourceCommit/-BuildManifestSha256/-ClipId (the runner sets those)."
     },
