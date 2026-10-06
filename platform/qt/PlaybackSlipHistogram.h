@@ -44,6 +44,8 @@
 #include <cstdlib>
 #include <vector>
 
+#include "PlaybackNativePaceGuard.h"
+
 namespace playback_slip
 {
 
@@ -112,7 +114,8 @@ struct PresentSample
 {
     int displayFrame = 0;
     double presentMs = 0.0;
-    double readyMs = -1.0;          // when the render thread signalled the frame ready (< 0: unknown)
+    bool readyKnown = false;        // the render thread's ready signal was stamped
+    double readyMs = 0.0;           // when the render thread signalled the frame ready (readyKnown)
     double decodeMs = 0.0;          // raw_uint16_ms
     double reconMs = 0.0;           // llrawproc_total_ms
     double renderMs = 0.0;          // render_thread_work_ms
@@ -141,8 +144,10 @@ struct SlipRecord
     double paceCreditFrames = 0.0;
     // classification inputs
     bool grabRan = false;
-    double readyMs = -1.0;
-    double deadlineMs = -1.0;
+    bool readyKnown = false;
+    double readyMs = 0.0;
+    bool deadlineKnown = false;     // the timeline was seen moving past the skipped frame
+    double deadlineMs = 0.0;
     double presentMs = 0.0;
     int timelineAdvancedInInterval = 0;
 };
@@ -194,17 +199,23 @@ struct Summary
 class SlipHistogram
 {
 public:
-    /*! New session: \a startPosition is the slider at Play, \a paceFps the pace (period = 1000 / pace), \a playStartMs
-     *  the Play's wall time (< 0: unknown, and then no slip after the first present is taken for startup catch-up). */
-    void reset( int startPosition, double paceFps, double playStartMs = -1.0 )
+    /*! New session: \a startPosition is the slider at Play, \a paceFps the pace (period = 1000 / pace). */
+    void reset( int startPosition, double paceFps )
     {
         *this = SlipHistogram();
         m_startPosition = startPosition;
         m_timelinePosition = startPosition;
-        m_paceFps = paceFps > 0.0 ? paceFps : 0.0;
-        m_periodMs = m_paceFps > 0.0 ? 1000.0 / m_paceFps : 0.0;
-        m_playStartMs = playStartMs;
+        m_paceKnown = paceFps > 0.0;
+        m_paceFps = m_paceKnown ? paceFps : 0.0;
+        m_periodMs = m_paceKnown ? 1000.0 / m_paceFps : 0.0;
         for( auto &d : m_deadlines ) d = Deadline();
+    }
+
+    /*! The Play's wall time. Without it no skip after the first present is taken for startup catch-up. */
+    void setPlayStart( double playStartMs )
+    {
+        m_playStartKnown = true;
+        m_playStartMs = playStartMs;
     }
 
     /*! The timeline (slider) moved to \a toPosition by \a path at \a nowMs; \a grantedFrames is what the pace
@@ -245,9 +256,9 @@ public:
     void noteGrab( double grabMs )
     {
         m_pendingGrab = true;
-        m_pendingGrabMs += grabMs > 0.0 ? grabMs : 0.0;
+        m_pendingGrabMs += std::max( 0.0, grabMs );
         ++m_grabs;
-        m_grabMsTotal += grabMs > 0.0 ? grabMs : 0.0;
+        m_grabMsTotal += std::max( 0.0, grabMs );
     }
 
     void notePresent( const PresentSample &s )
@@ -274,9 +285,9 @@ public:
             // The drop-frame engine owes the wall time since Play: what the first present's own advance did not repay
             // (the guard banks credit while no grant runs) is repaid by a burst a few presents later.
             m_waitCreditFrames = 0;
-            if( m_playStartMs >= 0.0 && s.presentMs > m_playStartMs && m_paceFps > 0.0 )
+            if( m_playStartKnown && m_paceKnown )
             {
-                const int owed = static_cast<int>( ( s.presentMs - m_playStartMs ) * m_paceFps / 1000.0 );
+                const int owed = static_cast<int>( owedFramesAt( s.presentMs ) );
                 m_waitCreditFrames = std::max( 0, owed - std::abs( s.timelinePosition - m_startPosition ) );
             }
             m_pendingGrab = false;
@@ -322,8 +333,8 @@ public:
                 m_startupCatchupFrames += catchup;
             }
         }
-        if( !m_caughtUp && m_playStartMs >= 0.0 && m_paceFps > 0.0
-         && std::abs( s.timelinePosition - m_startPosition ) + 1.0 >= ( s.presentMs - m_playStartMs ) * m_paceFps / 1000.0 )
+        if( !m_caughtUp && m_playStartKnown && m_paceKnown
+         && std::abs( s.timelinePosition - m_startPosition ) + 1.0 >= owedFramesAt( s.presentMs ) )
         {
             m_caughtUp = true;
         }
@@ -346,8 +357,9 @@ public:
             r.grabRan = grabRan;
             r.lookaheadCovered = s.lookaheadCovered;
             r.paceCreditFrames = m_lastCreditFrames;
+            r.readyKnown = s.readyKnown;
             r.readyMs = s.readyMs;
-            r.deadlineMs = deadlineOf( m_lastDisplayFrame + 1 );
+            r.deadlineKnown = deadlineOf( m_lastDisplayFrame + 1, &r.deadlineMs );
             r.presentMs = s.presentMs;
             r.timelineAdvancedInInterval = advanced;
             m_slips.push_back( r );
@@ -424,13 +436,12 @@ public:
             const int rawAfterFirst = std::max( 0, std::abs( endPosition - m_startPosition )
                                                    - std::abs( m_timelineAtFirstPresent - m_startPosition ) );
             out.timelineFramesAfterFirst = std::max( 0, rawAfterFirst - m_catchupAfterFirstFrames );
-            const double pacedMs = nowMs - m_firstPresentMs;
-            if( pacedMs > 0.0 )
-            {
-                out.timelineAfterFirstFps = out.timelineFramesAfterFirst * 1000.0 / pacedMs;
-                out.timelineAfterFirstRawFps = rawAfterFirst * 1000.0 / pacedMs;
-                out.presentedAfterFirstFps = ( m_presents - 1 ) * 1000.0 / pacedMs;
-            }
+            out.timelineAfterFirstFps = playback_native_pace::fpsAfterFirstPresent(
+                out.timelineFramesAfterFirst, nowMs, m_firstPresentMs, m_presents );
+            out.timelineAfterFirstRawFps = playback_native_pace::fpsAfterFirstPresent(
+                rawAfterFirst, nowMs, m_firstPresentMs, m_presents );
+            out.presentedAfterFirstFps = playback_native_pace::fpsAfterFirstPresent(
+                m_presents - 1, nowMs, m_firstPresentMs, m_presents );
             if( out.timelineFramesAfterFirst > 0 )
             {
                 out.nativeEquivPresentedFps =
@@ -492,22 +503,30 @@ private:
         if( q < m_guardQMin ) m_guardQMin = q;
     }
 
-    double deadlineOf( int frame ) const
+    /*! The wall time since Play at \a nowMs, in pace frames (never negative). */
+    double owedFramesAt( double nowMs ) const
+    {
+        return std::max( 0.0, nowMs - m_playStartMs ) * m_paceFps / 1000.0;
+    }
+
+    bool deadlineOf( int frame, double *deadlineMs ) const
     {
         const Deadline &d = m_deadlines[static_cast<size_t>( ( frame % kDeadlineRingSize + kDeadlineRingSize ) % kDeadlineRingSize )];
-        return d.frame == frame ? d.ms : -1.0;
+        if( d.frame != frame ) return false;
+        *deadlineMs = d.ms;
+        return true;
     }
 
     SlipClass classify( const SlipRecord &r ) const
     {
         if( r.grabRan ) return SlipClass::Capture;
         if( r.intervalMs >= kGapIntervalMs ) return SlipClass::Gap;
-        const bool known = r.readyMs >= 0.0 && r.deadlineMs >= 0.0;
-        if( known && r.readyMs <= r.deadlineMs && m_periodMs > 0.0
+        const bool known = r.readyKnown && r.deadlineKnown;
+        if( known && r.readyMs <= r.deadlineMs && m_paceKnown
          && ( r.presentMs - r.readyMs > m_periodMs || r.drawMs > m_periodMs ) )
             return SlipClass::GuiLate;
         if( known && r.readyMs > r.deadlineMs ) return SlipClass::UpstreamLate;
-        if( r.timelineAdvancedInInterval >= 2 && m_periodMs > 0.0
+        if( r.timelineAdvancedInInterval >= 2 && m_paceKnown
          && r.intervalMs <= kClockMaxIntervalPeriods * m_periodMs )
             return SlipClass::Clock;
         return SlipClass::Other;
@@ -589,7 +608,9 @@ private:
     int m_guardBursts = 0;
     double m_guardBurstFrames = 0.0;
 
-    double m_playStartMs = -1.0;
+    bool m_playStartKnown = false;
+    bool m_paceKnown = false;
+    double m_playStartMs = 0.0;
     int m_waitCreditFrames = 0;
     int m_catchupAfterFirstFrames = 0;
     bool m_caughtUp = false;
