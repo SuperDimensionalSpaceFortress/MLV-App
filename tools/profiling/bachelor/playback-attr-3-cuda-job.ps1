@@ -3970,7 +3970,7 @@ if ($isCpuBackend -and $DisablePaintPerSubmit) {
 }
 $isVariant = ($Venue -ne 'bachelor') -or $isCpuBackend -or [bool]$ForceLookAssist
 if ($isVariant) {
-    $variantVars = "`$Backend = '$Backend'`n`$LookLeg = $(if ($ForceLookAssist) { '$true' } else { '$false' })`n`$LookFlavor = '$LookFlavor'`n`$DeclaredVenue = '$Venue'`n`$ExpectedHostName = '$($venueExpectedHost.Replace("'", "''"))'"
+    $variantVars = "`$Backend = '$Backend'`n`$LookLeg = $(if ($ForceLookAssist) { '$true' } else { '$false' })`n`$LookPaceLeg = $(if ($LookPaceLeg) { '$true' } else { '$false' })`n`$LookFlavor = '$LookFlavor'`n`$DeclaredVenue = '$Venue'`n`$ExpectedHostName = '$($venueExpectedHost.Replace("'", "''"))'"
     $template = Edit-DualVenueTemplate $template '$DisablePaintPerSubmit = __DISABLE_PAINT_PER_SUBMIT__
 ' ('$DisablePaintPerSubmit = __DISABLE_PAINT_PER_SUBMIT__
 ' + $variantVars + "`n")
@@ -4099,7 +4099,7 @@ if ($isVariant) {
 ' ('    cpuFrames = $gpuSummary.cpuFrames
 ' + $cpuRatioField + '    backend = $Backend
     declaredVenue = $DeclaredVenue
-    lookLeg = $LookLeg
+    lookLeg = ($LookLeg -and -not $LookPaceLeg)
     lookAssistForced = $LookLeg
     lookFlavor = $(if ($LookLeg) { $LookFlavor } else { $null })
     lookFlavorReported = $(if ($LookLeg) { $lfReported = try { [string]$resultJson.log.visualState.look_assist_flavor } catch { '''' }; if ([string]::IsNullOrEmpty($lfReported)) { $lfReported = ''none'' }; $lfReported } else { $null })

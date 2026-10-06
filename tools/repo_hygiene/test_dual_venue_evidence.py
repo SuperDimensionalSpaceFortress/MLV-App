@@ -396,6 +396,11 @@ class GeneratorByteIdentityAndVariantTests(unittest.TestCase):
         text = job.read_text(encoding="utf-8")
         self.assertEqual(self.parse_errors(job), 0)
         self.assertIn("$LookLeg = $true", text)
+        self.assertIn("$LookPaceLeg = $true", text)
+        # a pace leg is a SPEED leg: summary.json says lookLeg false (the receipt checks it against the spec's legType) while
+        # lookAssistForced and the flavor fields still report the forced look
+        self.assertIn("lookLeg = ($LookLeg -and -not $LookPaceLeg)", text)
+        self.assertIn("lookAssistForced = $LookLeg", text)
         self.assertIn("$LookFlavor = 'cinematic'", text)
         self.assertIn("-RequireLookAssist:`$true -Scope none", text)
         self.assertIn("('MLVAPP_LOOK_ASSIST_FLAVOR=' + $LookFlavor)", text)

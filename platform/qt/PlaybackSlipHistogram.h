@@ -172,6 +172,11 @@ struct Summary
     std::array<long long, static_cast<int>( AdvancePath::Count )> advanceByPath {};
     double paceGuardGrantedFrames = 0.0;
     double paceGuardGrantedAfterFirstFrames = 0.0;
+    double paceGuardMaxLeadFrames = 0.0;   // > 0: the guard granted more than kMaxCarry + elapsed x pace over some span
+    double paceGuardMaxLeadMs = 0.0;       // when (ms after the session's first grant) that lead peaked
+    int paceGuardRearms = 0;               // grants that found the guard unarmed (the first one included)
+    double paceGuardFpsMin = 0.0;
+    double paceGuardFpsMax = 0.0;
     int wraps = 0;
     int repeats = 0;
     int grabs = 0;
@@ -195,9 +200,11 @@ public:
     }
 
     /*! The timeline (slider) moved to \a toPosition by \a path at \a nowMs; \a grantedFrames is what the pace
-     *  guard granted for it (0 for OTHER) and \a creditAfter the credit it left. One call per engine advance. */
+     *  guard granted for it (0 for OTHER) and \a creditAfter the credit it left. \a guardPaceFps is the pace the
+     *  guard was handed for this grant (0: the session pace) and \a guardRearmed says the guard was not armed
+     *  before it. One call per engine advance. */
     void noteTimelineMove( AdvancePath path, int toPosition, double nowMs, double grantedFrames = 0.0,
-                           double creditAfter = 0.0 )
+                           double creditAfter = 0.0, double guardPaceFps = 0.0, bool guardRearmed = false )
     {
         const int from = m_timelinePosition;
         const int delta = toPosition - from;
@@ -207,6 +214,7 @@ public:
             m_paceGuardGrantedFrames += grantedFrames;
             if( m_presents > 0 ) m_paceGuardGrantedAfterFirstFrames += grantedFrames;
             m_lastCreditFrames = creditAfter;
+            noteGuardGrant( nowMs, grantedFrames, guardPaceFps > 0.0 ? guardPaceFps : m_paceFps, guardRearmed );
         }
         if( delta > 0 && path != AdvancePath::LoopWrap )
         {
@@ -341,6 +349,11 @@ public:
         out.grabMsTotal = m_grabMsTotal;
         out.paceGuardGrantedFrames = m_paceGuardGrantedFrames;
         out.paceGuardGrantedAfterFirstFrames = m_paceGuardGrantedAfterFirstFrames;
+        out.paceGuardMaxLeadFrames = m_guardMaxLead;
+        out.paceGuardMaxLeadMs = m_guardMaxLeadMs;
+        out.paceGuardRearms = m_guardRearms;
+        out.paceGuardFpsMin = m_guardPaceMin;
+        out.paceGuardFpsMax = m_guardPaceMax;
         out.maxIntervalMs = m_maxIntervalMs;
         out.maxIntervalFrame = m_maxIntervalFrame;
         out.advanceByPath = m_advanceByPath;
@@ -405,6 +418,36 @@ private:
         int frame = -1;
         double ms = -1.0;
     };
+
+    /*! NativePaceGuard's contract, checked from outside: over any span of grants, granted <= kMaxCarry (1) +
+     *  elapsed x pace. With S the running granted sum and Q = S - pace x t, a span (i, j] leads its ceiling by
+     *  Q_j - min Q_i - 1 (the arm itself is the span's start at t of the first grant). A lead above 0 means the
+     *  guard granted more than its own ceiling -- a re-arm, a bypass, or a clock the smoke does not share. */
+    void noteGuardGrant( double nowMs, double grantedFrames, double paceFps, bool rearmed )
+    {
+        if( rearmed ) ++m_guardRearms;
+        if( paceFps > 0.0 )
+        {
+            if( m_guardGrants == 0 || paceFps < m_guardPaceMin ) m_guardPaceMin = paceFps;
+            if( m_guardGrants == 0 || paceFps > m_guardPaceMax ) m_guardPaceMax = paceFps;
+        }
+        const double pace = m_paceFps > 0.0 ? m_paceFps : paceFps;
+        if( m_guardGrants == 0 )
+        {
+            m_guardFirstGrantMs = nowMs;
+            m_guardQMin = -pace * nowMs / 1000.0;
+        }
+        ++m_guardGrants;
+        m_guardGrantSum += grantedFrames;
+        const double q = m_guardGrantSum - pace * nowMs / 1000.0;
+        const double lead = q - m_guardQMin - 1.0;
+        if( m_guardGrants == 1 || lead > m_guardMaxLead )
+        {
+            m_guardMaxLead = lead;
+            m_guardMaxLeadMs = nowMs - m_guardFirstGrantMs;
+        }
+        if( q < m_guardQMin ) m_guardQMin = q;
+    }
 
     double deadlineOf( int frame ) const
     {
@@ -489,6 +532,16 @@ private:
     double m_paceGuardGrantedFrames = 0.0;
     double m_paceGuardGrantedAfterFirstFrames = 0.0;
     double m_lastCreditFrames = 0.0;
+
+    long long m_guardGrants = 0;
+    int m_guardRearms = 0;
+    double m_guardGrantSum = 0.0;
+    double m_guardFirstGrantMs = 0.0;
+    double m_guardQMin = 0.0;
+    double m_guardMaxLead = 0.0;
+    double m_guardMaxLeadMs = 0.0;
+    double m_guardPaceMin = 0.0;
+    double m_guardPaceMax = 0.0;
 
     std::array<long long, kSlipBucketCount> m_histSlip {};
     std::array<long long, kIntervalBucketCount> m_histInterval {};

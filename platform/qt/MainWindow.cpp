@@ -10667,6 +10667,7 @@ void MainWindow::playbackHandling(int timeDiff)
         // PLAYBACK-CUDA-NATIVE-PACE-1: no advance outruns the pace fps (native, or the explicit
         // fpsOverride), whichever path asked for it -- the 8 ms poll, or the CUDA early advance on present.
         const double paceNowMs = mlv_stage_timing_now() * 1000.0;
+        const bool paceGuardArmedBeforeTick = m_playbackPaceGuard.armed();   // slip_summary: a re-arm mid-session
 
         //when on last frame
         if( ui->horizontalSliderPosition->value() >= ui->spinBoxCutOut->value() - 1 )
@@ -10708,7 +10709,8 @@ void MainWindow::playbackHandling(int timeDiff)
                 if( m_playbackSmokeActive )
                     m_playbackSlipHistogram.noteTimelineMove( playback_slip::AdvancePath::LoopWrap,
                                                               ui->horizontalSliderPosition->value(), paceNowMs,
-                                                              1.0, m_playbackPaceGuard.creditFrames() );
+                                                              1.0, m_playbackPaceGuard.creditFrames(),
+                                                              getFramerate(), !paceGuardArmedBeforeTick );
                 m_frameChanged = true;
                 if( ui->actionAudioOutput->isChecked()
                  || ( repairDisabled && ui->actionDropFrameMode->isChecked() ) )
@@ -10746,7 +10748,8 @@ void MainWindow::playbackHandling(int timeDiff)
                     if( m_playbackSmokeActive )
                         m_playbackSlipHistogram.noteTimelineMove( playback_slip::AdvancePath::WholeFrame,
                                                                   ui->horizontalSliderPosition->value(), paceNowMs,
-                                                                  1.0, m_playbackPaceGuard.creditFrames() );
+                                                                  1.0, m_playbackPaceGuard.creditFrames(),
+                                                                  getFramerate(), !paceGuardArmedBeforeTick );
                     m_newPosDropMode = ui->horizontalSliderPosition->value(); //track it also, for mode changing
                     m_frameChanged = true;
                 }
@@ -10786,7 +10789,8 @@ void MainWindow::playbackHandling(int timeDiff)
                         dropFrameTick.wrapped ? playback_slip::AdvancePath::LoopWrap
                                               : playback_slip::AdvancePath::DropTick,
                         ui->horizontalSliderPosition->value(), paceNowMs,
-                        grantedDropFrames, m_playbackPaceGuard.creditFrames() );
+                        grantedDropFrames, m_playbackPaceGuard.creditFrames(),
+                        getFramerate(), !paceGuardArmedBeforeTick );
                 m_frameChanged = true;
             }
         }
@@ -27157,6 +27161,10 @@ void MainWindow::finishPlaybackSmokeTelemetry( const char *reason )
                << QStringLiteral("max_interval_class=%1").arg( QLatin1String( slipClassName( slip.maxIntervalClass ) ) )
                << QStringLiteral("timeline_frames_after_first=%1").arg( slip.timelineFramesAfterFirst )
                << QStringLiteral("pace_guard_granted_after_first=%1").arg( slip.paceGuardGrantedAfterFirstFrames, 0, 'f', 3 )
+               << QStringLiteral("pace_guard_max_lead_frames=%1").arg( slip.paceGuardMaxLeadFrames, 0, 'f', 3 )
+               << QStringLiteral("pace_guard_max_lead_ms=%1").arg( slip.paceGuardMaxLeadMs, 0, 'f', 1 )
+               << QStringLiteral("pace_guard_rearms=%1").arg( slip.paceGuardRearms )
+               << QStringLiteral("pace_guard_fps=%1/%2").arg( slip.paceGuardFpsMin, 0, 'f', 3 ).arg( slip.paceGuardFpsMax, 0, 'f', 3 )
                << QStringLiteral("wraps=%1").arg( slip.wraps )
                << QStringLiteral("repeats=%1").arg( slip.repeats )
                << QStringLiteral("grabs=%1").arg( slip.grabs )
