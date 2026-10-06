@@ -8055,6 +8055,335 @@ int getMlvProcessedFrame8ScaledFromReconnedRaw16(mlvObject_t * video,
     return 1;
 }
 
+/* CPU-DUALISO-AT-PREVIEW-SCALE-1: phase-3 dual-ISO recon at preview scale.
+ * See the contract in video_mlv.h. Reuses the Phase 4B pieces (full-res ISO
+ * pattern seed, full-res pre-dual-ISO fixes, bayer-to-bayer kernels, scaled
+ * llrawproc subset, debayerBasicU16); only the entry points are new. */
+static int mlv_dualiso_preview_scale_recon_disabled_via_env(void)
+{
+    const char * v = getenv("MLVAPP_DISABLE_CPU_DUALISO_PREVIEW_SCALE_RECON");
+    return (v && *v && strcmp(v, "0") != 0 && strcmp(v, "false") != 0) ? 1 : 0;
+}
+
+uint64_t mlvProcessedFrameSignatureWithScale(mlvObject_t * video, uint64_t frameIndex, int scaleFactor)
+{
+    if (!video) return 0;
+    return mlv_processed_frame_signature_with_scale(video, frameIndex,
+                                                    mlv_effective_playback_scale_factor(video, scaleFactor));
+}
+
+uint64_t mlvReducedReconProcessedFrameSignature(uint64_t fullReconSignature, int reconScale)
+{
+    /* A full-recon lookup can never match: the tag is folded in with an odd
+     * multiplier, so the two signatures differ for every input. */
+    uint64_t sig = fullReconSignature ^ 0xC2D1A50ED0A1150Dull;
+    sig *= 0x9E3779B97F4A7C15ull;
+    sig ^= (uint64_t)(reconScale > 0 ? reconScale : 0) << 56;
+    if (sig == fullReconSignature) sig ^= 1u;
+    return sig ? sig : 1u;
+}
+
+int mlvDualIsoPreviewScaleReconPlan(mlvObject_t * video,
+                                    int requestedScale,
+                                    mlvDualIsoPreviewScaleRecon_t * plan)
+{
+    if (!plan) return 0;
+    memset(plan, 0, sizeof(*plan));
+    plan->scale = 1;
+    plan->reason = "none";
+    if (!video || !video->llrawproc)
+    {
+        plan->reason = "no clip";
+        return 0;
+    }
+    plan->fullWidth = (int)getMlvWidth(video);
+    plan->fullHeight = (int)getMlvHeight(video);
+    if (mlv_dualiso_preview_scale_recon_disabled_via_env())
+    {
+        plan->reason = "disabled by MLVAPP_DISABLE_CPU_DUALISO_PREVIEW_SCALE_RECON";
+        return 0;
+    }
+    if (!llrpHQDualIso(video))
+    {
+        plan->reason = "not HQ dual-ISO";
+        return 0;
+    }
+    {
+        /* The CUDA backend reconstructs on the GPU; this card is the CPU recon. */
+        const char * gpu = getenv("MLVAPP_GPU_PLAYBACK_RECON");
+        if (gpu && *gpu && strcmp(gpu, "0") != 0 && strcmp(gpu, "false") != 0)
+        {
+            plan->reason = "GPU playback recon requested";
+            return 0;
+        }
+    }
+    const int scale = mlv_effective_playback_scale_factor(video, requestedScale);
+    const int full_w = plan->fullWidth;
+    const int full_h = plan->fullHeight;
+    int source_h = 0;
+    if (scale == 2)
+    {
+        source_h = (full_h / 8) * 8;
+        if ((full_w % 4) != 0 || source_h < 8)
+        {
+            plan->reason = "x2 needs width % 4 and height >= 8";
+            return 0;
+        }
+    }
+    else if (scale == 4)
+    {
+        source_h = (full_h / 16) * 16;
+        if ((full_w % 4) != 0 || source_h < 16)
+        {
+            plan->reason = "x4 needs width % 4 and height >= 16";
+            return 0;
+        }
+    }
+    else if (scale == 8)
+    {
+        /* Same rule as the v4 x8 core: no cropped edge block at x8. */
+        if (!mlv_phase4bv4_x8_preview_compatible(video))
+        {
+            plan->reason = "x8 needs width % 16 and height % 32";
+            return 0;
+        }
+        source_h = full_h;
+    }
+    else
+    {
+        plan->reason = "preview scale 1 (full resolution)";
+        return 0;
+    }
+
+    llrawprocObject_t * shared = video->llrawproc;
+    pthread_mutex_lock(&video->llrawproc_mutex);
+    const int dark_frame = shared->dark_frame;
+    const int fixes = shared->focus_pixels || shared->bad_pixels
+                   || shared->vertical_stripes || shared->pattern_noise;
+    /* Histogram exposure matching (auto -2) estimates ev/black delta from the
+     * pixels it is handed. Until a full-resolution recon has settled them the
+     * estimate would depend on the preview scale, so those frames stay full. */
+    const int match_unsettled = shared->diso_auto_correction == -2
+        && (shared->diso_ev_correction == 1 || shared->diso_black_delta == -1);
+    pthread_mutex_unlock(&video->llrawproc_mutex);
+
+    if (dark_frame)
+    {
+        plan->reason = "dark frame subtraction is full-resolution only";
+        return 0;
+    }
+    if (match_unsettled)
+    {
+        plan->reason = "dual-ISO exposure match not settled at full resolution yet";
+        return 0;
+    }
+    if (fixes && video->RAWI.raw_info.bits_per_pixel < 14)
+    {
+        /* The full-res fix pass leaves the buffer lifted to 14 bit; the scaled
+         * subset would lift it again. */
+        plan->reason = "full-res raw fixes on a clip below 14 bit";
+        return 0;
+    }
+
+    plan->scale = scale;
+    plan->sourceHeight = source_h;
+    plan->reducedWidth = full_w / scale;
+    plan->reducedHeight = source_h / scale;
+    plan->fullResFixes = fixes ? 1 : 0;
+    return 1;
+}
+
+int mlvDualIsoPreviewScaleReconRun(mlvObject_t * video,
+                                   const mlvDualIsoPreviewScaleRecon_t * plan,
+                                   uint16_t * fullRaw,
+                                   uint16_t * reducedOut,
+                                   llrawprocWorkerState_t * worker,
+                                   int threads,
+                                   double * fullResFixesMs,
+                                   double * downsampleMs)
+{
+    if (fullResFixesMs) *fullResFixesMs = 0.0;
+    if (downsampleMs) *downsampleMs = 0.0;
+    if (!video || !plan || !fullRaw || !reducedOut || plan->scale <= 1) return 0;
+
+    const int full_w = plan->fullWidth;
+    const int full_h = plan->fullHeight;
+    const size_t full_bytes = (size_t)full_w * (size_t)full_h * sizeof(uint16_t);
+    int mutated = 0;
+
+    /* Detect the ISO row pattern on the full-resolution frame (no-op once
+     * seeded): on shrunk data it mis-detects (the x4 cold-pass pink). */
+    llrpEnsureDualIsoPatternSeeded(video, fullRaw, full_w, full_h);
+
+    if (plan->fullResFixes)
+    {
+        const double fixes_start = mlv_stage_timing_now();
+        applyLLRawProcObjectWorker(video, fullRaw, full_bytes, worker, 1);
+        mutated = 1;
+        if (fullResFixesMs) *fullResFixesMs = (mlv_stage_timing_now() - fixes_start) * 1000.0;
+    }
+
+    const double downsample_start = mlv_stage_timing_now();
+    int out_w = 0;
+    int out_h = 0;
+    int rc = -1;
+    if (plan->scale == 2)
+    {
+        rc = pl_downsample_bayer_to_bayer_2x(fullRaw, full_w, plan->sourceHeight,
+                                             reducedOut, &out_w, &out_h, threads);
+    }
+    else if (plan->scale == 4)
+    {
+        rc = pl_downsample_bayer_to_bayer_4x(fullRaw, full_w, plan->sourceHeight,
+                                             reducedOut, &out_w, &out_h, threads);
+    }
+    else if (plan->scale == 8)
+    {
+        rc = pl_downsample_bayer_to_bayer_8x(fullRaw, full_w, plan->sourceHeight,
+                                             reducedOut, &out_w, &out_h, threads);
+    }
+    if (downsampleMs) *downsampleMs = (mlv_stage_timing_now() - downsample_start) * 1000.0;
+    if (rc != 0 || out_w != plan->reducedWidth || out_h != plan->reducedHeight)
+    {
+        return mutated ? -1 : 0;
+    }
+
+    const size_t reduced_bytes =
+        (size_t)plan->reducedWidth * (size_t)plan->reducedHeight * sizeof(uint16_t);
+    if (!applyLLRawProcObjectWorker_with_dims(video, reducedOut, reduced_bytes,
+                                              plan->reducedWidth, plan->reducedHeight,
+                                              worker,
+                                              LLRP_WITH_DIMS_FULLRES_FIXES_APPLIED
+                                              | LLRP_WITH_DIMS_NO_PUBLISH))
+    {
+        return mutated ? -1 : 0;
+    }
+    return 1;
+}
+
+int getMlvProcessedFrame8ScaledFromReducedReconnedRaw16(mlvObject_t * video,
+                                                        uint64_t frameIndex,
+                                                        const uint16_t * reducedReconnedRaw,
+                                                        int reducedWidth,
+                                                        int reducedHeight,
+                                                        int reconScale,
+                                                        uint8_t * outputFrame,
+                                                        int threads,
+                                                        int scaleFactor)
+{
+    const double total_start = mlv_stage_timing_now();
+    const int previous_preview_mode = processingPlaybackPreviewModeEnabled();
+    const int previous_aggressive_preview_mode =
+        processingPlaybackAggressivePreviewModeEnabled();
+    mlv_reset_last_raw_stage_telemetry();
+    g_mlv_last_raw_uint16_ms = 0.0;
+    g_mlv_last_llrawproc_ms = 0.0;
+    g_mlv_last_debayered_frame_ms = 0.0;
+    g_mlv_last_processing_ms = 0.0;
+    g_mlv_last_processed16_total_ms = 0.0;
+    g_mlv_last_processed16_for_8bit_ms = 0.0;
+    g_mlv_last_processed16_to_8bit_ms = 0.0;
+    g_mlv_last_processed16_cache_store_ms = 0.0;
+    g_mlv_last_processed8_total_ms = 0.0;
+    g_mlv_last_processed8_cache_store_ms = 0.0;
+    g_mlv_last_processed8_direct_path_active = 0;
+    g_mlv_last_processed8_cache_hit = 0;
+    g_mlv_last_processed8_cache_hit_scale_factor = 0;
+    g_mlv_last_processed8_prefetch_hit = 0;
+    /* Same reason as ...FromReconnedRaw16: the recon ran on the worker thread. */
+    llrpResetLastPreDualIsoFixTelemetry();
+
+    if (!video || !reducedReconnedRaw || !outputFrame || !video->processing) return 0;
+    processingSetPlaybackAggressivePreviewMode(mlvPlaybackAggressivePreviewMode());
+
+    const int normalizedScale = mlv_effective_playback_scale_factor(video, scaleFactor);
+    video->playback_scale_factor_active = normalizedScale;
+    const int full_w = (int)getMlvWidth(video);
+    const int full_h = (int)getMlvHeight(video);
+    const int out_w = (normalizedScale > 1) ? (full_w / normalizedScale) : full_w;
+    const int out_h = (normalizedScale > 1) ? (full_h / normalizedScale) : full_h;
+    const uint64_t rgb_frame_size = (uint64_t)out_w * (uint64_t)out_h * 3u;
+    uint16_t * rgb = (normalizedScale > 1) ? mlv_ensure_thread_scaled_input_buffer(rgb_frame_size) : NULL;
+    if (!rgb
+     || normalizedScale != reconScale
+     || reducedWidth != out_w
+     || reducedHeight <= 0
+     || reducedHeight > out_h
+     || !mlv_can_use_direct_processed_frame8_path(video)
+     || !processingCanUseDirect8BitOutput(video->processing))
+    {
+        processingSetPlaybackAggressivePreviewMode(previous_aggressive_preview_mode);
+        processingSetPlaybackPreviewMode(previous_preview_mode);
+        return 0;
+    }
+
+    const double debayer_start = mlv_stage_timing_now();
+    const int bit_shift = llrpHQDualIso(video) ? 0 : (16 - video->RAWI.raw_info.bits_per_pixel);
+    debayerBasicU16(rgb, reducedReconnedRaw, reducedWidth, reducedHeight, threads, bit_shift);
+    /* Rows the kernel's block crop dropped repeat the last reconstructed row,
+     * as in the v3 core. */
+    const size_t row_words = (size_t)out_w * 3u;
+    const uint16_t * last_row = rgb + (size_t)(reducedHeight - 1) * row_words;
+    for (int y = reducedHeight; y < out_h; ++y)
+    {
+        memcpy(rgb + (size_t)y * row_words, last_row, row_words * sizeof(uint16_t));
+    }
+    g_mlv_last_debayered_frame_ms = (mlv_stage_timing_now() - debayer_start) * 1000.0;
+    mlv_stage_timing_note_elapsed("debayered_frame", frameIndex, g_mlv_last_debayered_frame_ms);
+
+    mlv_sync_processing_black_white_levels(video);
+    const double processing_start = mlv_stage_timing_now();
+    mlv_apply_processing_object8_published(video->processing,
+                                           out_w,
+                                           out_h,
+                                           rgb,
+                                           outputFrame,
+                                           rgb_frame_size,
+                                           threads,
+                                           frameIndex);
+    g_mlv_last_processing_ms = (mlv_stage_timing_now() - processing_start) * 1000.0;
+    mlv_stage_timing_note_elapsed("processing", frameIndex, g_mlv_last_processing_ms);
+    g_mlv_last_processed16_total_ms = (mlv_stage_timing_now() - debayer_start) * 1000.0;
+    g_mlv_last_processed16_for_8bit_ms = g_mlv_last_processed16_total_ms;
+    g_mlv_last_processed8_direct_path_active = 1;
+
+    const uint64_t reduced_signature =
+        mlvReducedReconProcessedFrameSignature(
+            mlv_processed_frame_signature_with_scale(video, frameIndex, normalizedScale),
+            reconScale);
+    const int skip_processed8_main_cache =
+        mlvPlaybackAggressivePreviewMode() && normalizedScale >= 2;
+    if (!skip_processed8_main_cache)
+    {
+        mlv_store_processed_frame_8bit_cache_with_scale(video,
+                                                        frameIndex,
+                                                        threads,
+                                                        reduced_signature,
+                                                        outputFrame,
+                                                        rgb_frame_size,
+                                                        1,
+                                                        0,
+                                                        normalizedScale,
+                                                        0,
+                                                        full_h - reducedHeight * normalizedScale);
+    }
+    else
+    {
+        pthread_mutex_lock(&video->processed8_prefetch_mutex);
+        video->current_processed_frame_8bit_active = 1;
+        video->current_processed_frame_8bit = frameIndex;
+        video->current_processed_frame_8bit_threads = threads;
+        video->current_processed_frame_8bit_signature = reduced_signature;
+        pthread_mutex_unlock(&video->processed8_prefetch_mutex);
+    }
+
+    g_mlv_last_processed8_total_ms = (mlv_stage_timing_now() - total_start) * 1000.0;
+    mlv_stage_timing_note_elapsed("processed8_total", frameIndex, g_mlv_last_processed8_total_ms);
+    processingSetPlaybackAggressivePreviewMode(previous_aggressive_preview_mode);
+    processingSetPlaybackPreviewMode(previous_preview_mode);
+    return 1;
+}
+
 /* Phase 4B: helper for callers that need to size their output buffer for
  * the scaled pipeline. Returns (W/scale, H/scale) when the requested
  * scale is honoured, else returns the full sensor dimensions.

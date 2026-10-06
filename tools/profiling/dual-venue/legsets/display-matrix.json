@@ -1,0 +1,15 @@
+{
+  "schema": "mlv-app/dual-venue-legset/v1",
+  "legSet": "display-matrix",
+  "card": "DUAL-VENUE-DISPLAY-MATRIX-1",
+  "clipId": "M16-1243",
+  "description": "The standard DISPLAY MATRIX playback benchmark (owner 2026-10-03 and 2026-10-05: playback benchmarks must not be full screen only): the owner clip, Look Assist Cinematic, {fullscreen, windowed} x {scale 1 = full, 2 = half, 4 = quarter} x {cuda, cpu}. Each entry is an ordinary committed leg spec under legs/; the set only says which specs make up the matrix.",
+  "legs": [
+    "legs/m16-1243-display-fullscreen-s1.json",
+    "legs/m16-1243-display-windowed-s1.json",
+    "legs/m16-1243-display-fullscreen-s2.json",
+    "legs/m16-1243-display-windowed-s2.json",
+    "legs/m16-1243-display-fullscreen-s4.json",
+    "legs/m16-1243-display-windowed-s4.json"
+  ]
+}

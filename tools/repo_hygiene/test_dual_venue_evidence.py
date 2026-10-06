@@ -73,7 +73,9 @@ requires_windows_pwsh = unittest.skipIf(PWSH is None or sys.platform != "win32",
 FIXTURE_IDS = ("tiny_dual_iso", "large_dual_iso")
 OWNER_CLIP = "M16-1243"   # a consented clip ID (an id is not footage); the runner never sees a path
 # Every leg spec shipped under legs/ (DVE-SCALE2-LOOK-LEG-1 added the scale-2 look leg); the tracked-spec tests loop over all of them.
-SHIPPED_LEGS = ("legs/m16-1243-speed.json", "legs/m16-1243-look.json", "legs/m16-1243-look-scale2.json", "legs/m16-1243-look-cinematic.json")
+# DUAL-VENUE-DISPLAY-MATRIX-1 added the six display-matrix legs ({fullscreen, windowed} x {scale 1, 2, 4}); legsets/display-matrix.json names them.
+DISPLAY_MATRIX_LEGS = tuple(f"legs/m16-1243-display-{mode}-s{scale}.json" for scale in (1, 2, 4) for mode in ("fullscreen", "windowed"))
+SHIPPED_LEGS = ("legs/m16-1243-speed.json", "legs/m16-1243-look.json", "legs/m16-1243-look-scale2.json", "legs/m16-1243-look-cinematic.json", *DISPLAY_MATRIX_LEGS)
 SHIPPED_LEGS_PS = ", ".join(f"'{rel}'" for rel in SHIPPED_LEGS)
 OTHER_CLIP = "Z99-9999"
 MLV_EXT = "." + "mlv"  # never spelled as one literal token (the NA-4 gate trips on fixture basenames)
@@ -273,6 +275,65 @@ class GeneratorByteIdentityAndVariantTests(unittest.TestCase):
         self.assertIn("-ScaleFactor 4 -ExpectedScaleRequest 1 -ExpectedVisualScaleRequest -1 -UsePersistedPlaybackSettings", armed.read_text(encoding="utf-8"))
         self.assertIn("[int]$ExpectedScaleRequest = -1", GENERATOR.read_text(encoding="utf-8"))
 
+    def test_a_windowed_leg_passes_the_apps_windowed_option_through_the_one_additional_args_and_fullscreen_changes_nothing(self) -> None:
+        """DUAL-VENUE-DISPLAY-MATRIX-1: -DisplayMode windowed appends --windowed to the smoke runner's ONE -AdditionalArgs (a second -AdditionalArgs would be a parameter-binding
+        error): inside the contact-sheet array when a sheet is on, as an array of its own when not. The default and an explicit fullscreen emit the unchanged job."""
+        default = self.generate(GENERATOR, "dm-default.job.ps1", ["-ContactSheet", "-ContactSheetFrames", "4"])
+        fullscreen = self.generate(GENERATOR, "dm-fullscreen.job.ps1", ["-ContactSheet", "-ContactSheetFrames", "4", "-DisplayMode", "fullscreen"])
+        self.assertEqual(default.read_bytes(), fullscreen.read_bytes(), "an explicit fullscreen is the default job, byte for byte")
+        self.assertNotIn("--windowed", default.read_text(encoding="utf-8"))
+        windowed = self.generate(GENERATOR, "dm-windowed.job.ps1", ["-ContactSheet", "-ContactSheetFrames", "4", "-DisplayMode", "windowed"])
+        self.assertEqual(self.parse_errors(windowed), 0)
+        text = windowed.read_text(encoding="utf-8")
+        # the windowed job is the default job plus exactly the added statements (the template itself is untouched)
+        self.assertEqual(lf(text).replace(self.WINDOWED_ADDITION, "").replace(self.WINDOWED_NO_SHEET, ""), lf(default.read_text(encoding="utf-8")))
+        bare = self.generate(GENERATOR, "dm-windowed-bare.job.ps1", ["-DisplayMode", "windowed"])
+        self.assertEqual(self.parse_errors(bare), 0)
+        self.assertNotIn("--windowed", self.generate(GENERATOR, "dm-bare-default.job.ps1", []).read_text(encoding="utf-8"))
+        # RUNTIME behaviour: the real emitted statements are executed with stub inputs, and $cmd carries exactly ONE -AdditionalArgs with --windowed in it
+        on = self.eval_cmd(text, enabled=True, frames=4)
+        self.assertEqual(on.count("-AdditionalArgs"), 1, on)
+        self.assertRegex(on, r"-AdditionalArgs @\('--contact-sheet-dir', '[^']*', '--contact-sheet-frames', '4', '--windowed'\)$")
+        paired = self.eval_cmd(self.generate(GENERATOR, "dm-windowed-paired.job.ps1", ["-ContactSheet", "-ContactSheetPairedSeek", "-DisplayMode", "windowed"]).read_text(encoding="utf-8"),
+                               enabled=True, frames=4, paired_seek=True)
+        self.assertEqual(paired.count("-AdditionalArgs"), 1, paired)
+        self.assertRegex(paired, r"'--contact-sheet-seek-dir', '[^']*', '--windowed'\)$")
+        off = self.eval_cmd(text, enabled=False, frames=4)
+        self.assertTrue(off.endswith("-AdditionalArgs @('--windowed')"), off)
+        self.assertEqual(off.count("-AdditionalArgs"), 1, off)
+        self.assertEqual(self.eval_cmd(bare.read_text(encoding="utf-8"), enabled=False, frames=4).count("-AdditionalArgs"), 1)
+        # ... and the DEFAULT job, evaluated the same way, never carries it
+        self.assertNotIn("--windowed", self.eval_cmd(default.read_text(encoding="utf-8"), enabled=True, frames=4))
+        self.assertNotIn("AdditionalArgs", self.eval_cmd(default.read_text(encoding="utf-8"), enabled=False, frames=4))
+
+    # What a windowed job adds to the default job's text: one statement before the contact-sheet $cmd append, and the guarded no-sheet append after its closing brace.
+    WINDOWED_ADDITION = "    $contactSheetAdditionalArgs = $contactSheetAdditionalArgs.Substring(0, $contactSheetAdditionalArgs.Length - 1) + \", '--windowed')\"\n"
+    WINDOWED_NO_SHEET = "\nif (-not $ContactSheetEnabled) { $cmd = \"$cmd -AdditionalArgs @('--windowed')\" }"
+
+    def eval_cmd(self, job_text: str, enabled: bool, frames: int, paired_seek: bool = False) -> str:
+        """Execute the emitted job's own $cmd-construction statements (ConvertTo-PsSingleQuoted through the end of the contact-sheet / windowed append) with stub inputs."""
+        job_text = lf(job_text)
+        start = job_text.index("function ConvertTo-PsSingleQuoted")
+        tail = '$cmd = "$cmd -AdditionalArgs $contactSheetAdditionalArgs"\n}'
+        end = job_text.index(tail) + len(tail)
+        if job_text.startswith(self.WINDOWED_NO_SHEET, end):
+            end += len(self.WINDOWED_NO_SHEET)
+        work = self.tmp / f"work-eval-{enabled}-{frames}-{paired_seek}"
+        probe = self.tmp / f"probe-cmd-{enabled}-{frames}-{paired_seek}.ps1"
+        probe.write_text("$ErrorActionPreference = 'Stop'\n" f"$Work = '{work}'\n" "$smoke = 'smoke.ps1'\n$exePath = 'exe.exe'\n$clipPath = 'clip-stub'\n$resultPath = 'result.json'\n"
+                         "$envList = \"'A=1','B=2'\"\n" f"$ContactSheetEnabled = ${'true' if enabled else 'false'}\n" f"$ContactSheetFrameCount = {frames}\n"
+                         f"$ContactSheetPairedSeek = ${'true' if paired_seek else 'false'}\n" + job_text[start:end] + "\nWrite-Output \"CMD=$cmd\"\n", encoding="utf-8")
+        proc = run_pwsh(["-File", str(probe)])
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        return next(l for l in proc.stdout.splitlines() if l.startswith("CMD="))[len("CMD="):]
+
+    def test_an_unknown_display_mode_is_refused_before_emitting(self) -> None:
+        out = self.tmp / "dm-refused.job.ps1"
+        proc = run_pwsh(["-File", str(GENERATOR), "-SourceCommit", self.head, "-BuildManifestSha256", "ab" * 32, "-ClipId", FIXTURE_IDS[0], "-FixtureSha256", "cd" * 32,
+                         "-RepoRoot", str(self.repo), "-OutFile", str(out), "-DisplayMode", "maximized"])
+        self.assertNotEqual(proc.returncode, 0)
+        self.assertFalse(out.exists())
+
     def parse_errors(self, job: Path) -> int:
         script = ("$t=$null;$e=$null;[void][System.Management.Automation.Language.Parser]::ParseFile("
                   f"'{job}',[ref]$t,[ref]$e);Write-Output $e.Count")
@@ -400,6 +461,8 @@ if ($JobId -like '*-health') {
     if ($cfg.healthMode -eq 'unresolved') { throw 'UNRESOLVED: stub health probe never returned' }
     return [pscustomobject]@{ exitCode = 0; stdout = ('DVE_PROBE=' + ($cfg.probe | ConvertTo-Json -Compress)) }
 }
+# DUAL-VENUE-DISPLAY-MATRIX-1: a leg-set run submits many legs through one stub, each with its own artifacts (artifactsByLeg: a job-id fragment -> that leg's artifacts path)
+if ($cfg.PSObject.Properties['artifactsByLeg']) { foreach ($p in $cfg.artifactsByLeg.PSObject.Properties) { if ($JobId -like ('*' + $p.Name + '*')) { $cfg.artifactsAgentPath = $p.Value } } }
 switch ($cfg.mainMode) {
     'token'      { return [pscustomobject]@{ exitCode = [int]$cfg.exitCode; stdout = ('RESULT=' + $cfg.token + ' ARTIFACTS=' + $cfg.artifactsAgentPath) } }
     'retracted'  { throw 'RETRACTED: stub queue ceiling reached; withdrawn from the inbox' }
@@ -414,7 +477,7 @@ switch ($cfg.mainMode) {
 # The stub records every named argument it was handed (so a test can see that the runner passed a clip ID and a play
 # window, and never a path), and can be told to refuse the way the real generator does.
 STUB_GENERATOR = r"""
-param($SourceCommit,$BuildManifestSha256,$ClipId,$FixtureSha256,$OutFile,$RepoRoot,$Venue,$Backend,$ScaleFactor,$TelemetryArm,$CpuQuiescenceThresholdPercent,[switch]$ContactSheet,$ContactSheetFrames,[switch]$ForceLookAssist,$LookFlavor,$VenueTablePath,$PlaySeconds,$ExpectedScaleRequest)
+param($SourceCommit,$BuildManifestSha256,$ClipId,$FixtureSha256,$OutFile,$RepoRoot,$Venue,$Backend,$ScaleFactor,$TelemetryArm,$CpuQuiescenceThresholdPercent,[switch]$ContactSheet,$ContactSheetFrames,[switch]$ForceLookAssist,$LookFlavor,$VenueTablePath,$PlaySeconds,$ExpectedScaleRequest,$DisplayMode)
 $cfg = Get-Content -LiteralPath $env:DVE_STUB -Raw | ConvertFrom-Json
 Add-Content -LiteralPath $cfg.genLog -Value (($PSBoundParameters.Keys | Sort-Object | ForEach-Object { $_ + '=' + $PSBoundParameters[$_] }) -join ';')
 if ($cfg.genRefusal) { throw $cfg.genRefusal }
@@ -485,7 +548,7 @@ class RunnerHarness:
         self.consent.write_text(json.dumps(consent_file(*records)), encoding="utf-8")
 
     def write_spec(self, card: str = "DUAL-VENUE-EVIDENCE-1", clip: str = OWNER_CLIP, leg_type: str = "speed", play_seconds: int | None = 25,
-                   flavor: str = "classic", scale: int = 4, accepted: dict | None = None, leg_id: str = "unit-leg") -> Path:
+                   flavor: str = "classic", scale: int = 4, accepted: dict | None = None, leg_id: str = "unit-leg", display_mode: str | None = None) -> Path:
         spec = {
             "schema": "mlv-app/dual-venue-leg/v1", "legId": leg_id, "card": card, "legType": leg_type, "clipId": clip,
             "backends": ["cuda", "cpu"], "scaleFactor": scale,
@@ -499,7 +562,9 @@ class RunnerHarness:
             spec["look"] = {"contactSheetFrames": 2, "lookFlavor": flavor}
         if accepted is not None:
             spec["acceptedEffectiveScale"] = accepted
-        suffix = (("" if flavor == "classic" else f"-{flavor}") + ("" if scale == 4 else f"-s{scale}") + ("" if leg_id == "unit-leg" else f"-{leg_id}")
+        if display_mode is not None:
+            spec["displayMode"] = display_mode
+        suffix = ("" if display_mode is None else f"-dm{display_mode}") + (("" if flavor == "classic" else f"-{flavor}") + ("" if scale == 4 else f"-s{scale}") + ("" if leg_id == "unit-leg" else f"-{leg_id}")
                   + ("" if accepted is None else "-acc" + "".join(f"{k}{v}" for k, v in sorted(accepted.items()))))
         path = self.tmp / f"spec-{card}-{clip}-{leg_type}-{play_seconds}{suffix}.json"
         path.write_text(json.dumps(spec), encoding="utf-8")
@@ -628,6 +693,8 @@ class RunnerHarness:
         (root / "tools" / "profiling" / "bachelor").mkdir(parents=True)
         shutil.copyfile(ROOT / "tools" / "profiling" / "bachelor" / "AttrCudaArtifacts.psm1", root / "tools" / "profiling" / "bachelor" / "AttrCudaArtifacts.psm1")
         shutil.copyfile(ROOT / "tools" / "profiling" / "gui-smoke-length-gate.ps1", root / "tools" / "profiling" / "gui-smoke-length-gate.ps1")
+        # the ONE display-identity parser the runner reads the app's window placement with (DUAL-VENUE-DISPLAY-MATRIX-1)
+        shutil.copyfile(ROOT / "tools" / "profiling" / "gui-smoke-display-identity.ps1", root / "tools" / "profiling" / "gui-smoke-display-identity.ps1")
         for name, old, new in mutations:
             path = dv / name
             text = path.read_text(encoding="utf-8")
@@ -1380,8 +1447,11 @@ class ModuleMutationMixin:
             text = text.replace(old, new)
         tmp = tempfile.TemporaryDirectory(prefix="dve-mut-")
         self.addCleanup(tmp.cleanup)
-        path = Path(tmp.name) / "DualVenueRunner.psm1"
+        # laid out like the tree (the module reads the app's display placement with ..\gui-smoke-display-identity.ps1, DUAL-VENUE-DISPLAY-MATRIX-1)
+        path = Path(tmp.name) / "tools" / "profiling" / "dual-venue" / "DualVenueRunner.psm1"
+        path.parent.mkdir(parents=True)
         path.write_text(text, encoding="utf-8")
+        shutil.copyfile(ROOT / "tools" / "profiling" / "gui-smoke-display-identity.ps1", path.parent.parent / "gui-smoke-display-identity.ps1")
         return path
 
 
@@ -1552,6 +1622,7 @@ class ProductionRepo:
         (self.dv / "venues.json").write_text(json.dumps(table, indent=2) + "\n", encoding="utf-8", newline="\n")
         self.write_consent(*records)
         shutil.copyfile(COMPOSER, self.root / "tools" / "profiling" / "make-contact-sheet.py")   # the pair script's composer (a sibling of dual-venue/)
+        shutil.copyfile(ROOT / "tools" / "profiling" / "gui-smoke-display-identity.ps1", self.root / "tools" / "profiling" / "gui-smoke-display-identity.ps1")   # the module's display-placement parser
         self.git("init", "-q")
         self.git("config", "user.email", "unit@example.invalid")
         self.git("config", "user.name", "unit")
@@ -3721,6 +3792,446 @@ class PlaybackScaleIsRequestedAndEffectiveTests(EvidenceFactory, ModuleMutationM
 
 
 # ---------------------------------------------------------------------------------------------------
+# DUAL-VENUE-DISPLAY-MATRIX-1 (owner 2026-10-03 and 2026-10-05: playback benchmarks must not be full screen only). The app's own window-placement lines, as MainWindow.cpp
+# logs them (a windowed run is the normal maximized window with chrome; a full-screen run covers the screen).
+PLACEMENT_TAIL = 'target_screen="\\\\.\\DISPLAY1" presentation_screen="\\\\.\\DISPLAY1" presentation_physical=3840x2400'
+WINDOWED_PLACEMENT = 'gui_smoke.window_placement mode=windowed screen="\\\\.\\DISPLAY1" verified=1 window=0,23 2560x1529 preview=2380x1373 ' + PLACEMENT_TAIL
+FULLSCREEN_PLACEMENT = 'gui_smoke.window_placement mode=fullscreen screen="\\\\.\\DISPLAY1" verified=1 window=0,0 2560x1600 preview=2560x1600 ' + PLACEMENT_TAIL
+UNVERIFIED_WINDOWED_PLACEMENT = WINDOWED_PLACEMENT.replace("verified=1", "verified=0")
+# the twelve cells of the standard display matrix, in the order a run walks them (backend-major; a full-screen cell and its windowed twin are neighbours)
+MATRIX_CELLS = [f"{backend}-{mode}-s{scale}" for backend in ("cuda", "cpu") for scale in (1, 2, 4) for mode in ("fullscreen", "windowed")]
+
+
+@requires_windows_pwsh
+class DisplayModeIsRequestedAndObservedTests(EvidenceFactory, ModuleMutationMixin, unittest.TestCase):
+    """A leg's optional `displayMode` (default full screen) reaches the generator as the app's --windowed, the receipt carries the display mode REQUESTED and the one the
+    app OBSERVED (its own gui_smoke.window_placement line) plus the window it presented in, and the leg FAILS CLOSED: a requested-windowed leg that ran full screen is
+    not a valid measurement. A legacy spec (no displayMode) keeps the behaviour it had, so no existing leg changes."""
+
+    def setUp(self) -> None:
+        self.make_harness()
+
+    def leg(self, display_mode: str | None, placement: str | None, backend: str = "cpu", **opts):
+        self.write_artifacts(extra_log_lines=[placement] if placement else [])
+        return self.run_leg("ultra-magnus", self.write_spec(display_mode=display_mode), extra=["-Backend", backend], **opts)
+
+    # -- the schema default -----------------------------------------------------------------------------------------------------------
+    def test_a_spec_without_a_display_mode_is_a_full_screen_leg_and_every_legacy_leg_names_none(self) -> None:
+        for name in ("m16-1243-speed", "m16-1243-look", "m16-1243-look-scale2", "m16-1243-look-cinematic"):
+            self.assertNotIn("displayMode", json.loads((DV / "legs" / f"{name}.json").read_text(encoding="utf-8")), f"{name}: an existing leg must not change")
+        _, receipt, _ = self.leg(None, FULLSCREEN_PLACEMENT)
+        self.assertEqual(receipt["outcome"], "PASS", receipt["outcomeDetail"])
+        self.assertEqual((receipt["display"]["requestedMode"], receipt["display"]["explicit"]), ("fullscreen", False))
+        self.assertNotIn("DisplayMode=", self.generator_calls()[-1], "a full-screen leg passes the generator nothing: its job is the text it always was")
+
+    def test_a_legacy_leg_whose_log_has_no_placement_line_is_unchanged_and_says_unknown(self) -> None:
+        _, receipt, _ = self.leg(None, None)
+        self.assertEqual(receipt["outcome"], "PASS", receipt["outcomeDetail"])
+        self.assertEqual((receipt["display"]["observedMode"], receipt["display"]["verdict"], receipt["display"]["blocks"]), ("UNKNOWN", "UNKNOWN", False))
+
+    def test_a_legacy_leg_that_ran_windowed_is_not_a_valid_full_screen_measurement(self) -> None:
+        _, receipt, _ = self.leg(None, WINDOWED_PLACEMENT)
+        self.assertEqual(receipt["outcome"], "INVALID", receipt["outcomeDetail"])
+        self.assertEqual(receipt["display"]["verdict"], "NOT_HONOURED")
+
+    # -- the plumbing: windowed -> --windowed -----------------------------------------------------------------------------------------
+    def test_a_windowed_leg_asks_the_generator_for_the_windowed_job_and_a_fullscreen_leg_asks_for_nothing(self) -> None:
+        self.leg("windowed", WINDOWED_PLACEMENT)
+        self.assertIn("DisplayMode=windowed", self.generator_calls()[-1])
+        self.leg("fullscreen", FULLSCREEN_PLACEMENT)
+        self.assertNotIn("DisplayMode", self.generator_calls()[-1])
+
+    def test_the_generator_has_the_parameter_and_turns_it_into_the_apps_windowed_option(self) -> None:
+        src = GENERATOR.read_text(encoding="utf-8")
+        self.assertRegex(src, r"\[ValidateSet\('fullscreen', 'windowed'\)\]\s+\[string\]\$DisplayMode = 'fullscreen'")
+        self.assertIn("DUAL_VENUE_DISPLAY_ANCHOR_MISSING", src, "a template refactor must fail loudly, never let a windowed leg run full screen")
+        self.assertIn("'--windowed'", src)
+        # the smoke runner's own argument gate lets the app's --windowed through (a refused option would end the leg before it plays)
+        self.assertRegex((ROOT / "tools" / "profiling" / "gui-smoke-length-gate.ps1").read_text(encoding="utf-8"), r"'windowed' = 'allow'")
+
+    # -- the receipt: requested, observed and the presented window --------------------------------------------------------------------
+    def test_a_windowed_leg_that_ran_windowed_passes_and_the_receipt_says_requested_observed_and_the_window(self) -> None:
+        proc, receipt, _ = self.leg("windowed", WINDOWED_PLACEMENT)
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        self.assertEqual(receipt["outcome"], "PASS", receipt["outcomeDetail"])
+        d = receipt["display"]
+        self.assertEqual((d["requestedMode"], d["explicit"], d["observedMode"], d["verdict"], d["blocks"]), ("windowed", True, "windowed", "HONOURED", False))
+        self.assertEqual((d["windowWidth"], d["windowHeight"]), (2560, 1529))
+        self.assertEqual((d["previewWidth"], d["previewHeight"]), (2380, 1373))
+        self.assertEqual((d["presentationPhysicalWidth"], d["presentationPhysicalHeight"]), (3840, 2400))
+        self.assertTrue(d["placementVerified"])
+        self.assertEqual(d["observedSource"], "gui_smoke.window_placement")
+        self.assertIn("scale", receipt, "the display block sits next to the scale block")
+        self.assertIn(receipt["scale"]["verdict"], ("HONOURED", "DECLARED_CLAMP"))
+
+    def test_a_fullscreen_leg_that_ran_full_screen_passes_and_records_the_screen_it_covered(self) -> None:
+        _, receipt, _ = self.leg("fullscreen", FULLSCREEN_PLACEMENT)
+        self.assertEqual(receipt["outcome"], "PASS", receipt["outcomeDetail"])
+        self.assertEqual((receipt["display"]["observedMode"], receipt["display"]["windowWidth"], receipt["display"]["windowHeight"]), ("fullscreen", 2560, 1600))
+
+    def test_every_receipt_says_the_display_mode_requested_even_a_refusal_with_no_run_log(self) -> None:
+        _, receipt, _ = self.run_leg("ultra-magnus", self.write_spec(display_mode="windowed"), probe=dict(HEALTHY_PROBE, pwshColdStartMs=9000))
+        self.assertEqual(receipt["outcome"], "VENUE_UNHEALTHY")
+        self.assertEqual((receipt["display"]["requestedMode"], receipt["display"]["observedMode"]), ("windowed", "UNKNOWN"))
+
+    # -- FAIL CLOSED ------------------------------------------------------------------------------------------------------------------
+    def test_a_windowed_leg_that_ran_full_screen_is_invalid_not_a_pass(self) -> None:
+        proc, receipt, _ = self.leg("windowed", FULLSCREEN_PLACEMENT)
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        self.assertEqual(receipt["outcome"], "INVALID", receipt["outcomeDetail"])
+        self.assertIn("DISPLAY_MODE_NOT_HONOURED", receipt["outcomeDetail"])
+        self.assertIn("requested windowed but the app ran fullscreen", receipt["outcomeDetail"])
+        self.assertEqual((receipt["display"]["verdict"], receipt["display"]["blocks"], receipt["display"]["observedMode"]), ("NOT_HONOURED", True, "fullscreen"))
+        self.assertIn("DVE_OUTCOME=INVALID", proc.stdout)
+
+    def test_a_fullscreen_leg_that_ran_windowed_is_invalid_too(self) -> None:
+        _, receipt, _ = self.leg("fullscreen", WINDOWED_PLACEMENT)
+        self.assertEqual(receipt["outcome"], "INVALID", receipt["outcomeDetail"])
+        self.assertIn("DISPLAY_MODE_NOT_HONOURED", receipt["outcomeDetail"])
+
+    def test_a_leg_that_names_a_mode_the_log_cannot_confirm_is_invalid(self) -> None:
+        _, receipt, _ = self.leg("windowed", None)
+        self.assertEqual(receipt["outcome"], "INVALID", receipt["outcomeDetail"])
+        self.assertEqual((receipt["display"]["observedMode"], receipt["display"]["verdict"]), ("UNKNOWN", "UNKNOWN"))
+        self.assertIn("unknown", receipt["outcomeDetail"])
+
+    def test_a_windowed_leg_whose_placement_was_not_verified_is_invalid(self) -> None:
+        _, receipt, _ = self.leg("windowed", UNVERIFIED_WINDOWED_PLACEMENT)
+        self.assertEqual(receipt["outcome"], "INVALID", receipt["outcomeDetail"])
+        self.assertIn("verified=0", receipt["outcomeDetail"])
+
+    def test_a_product_failure_of_a_leg_that_ran_in_the_wrong_mode_is_invalid_too(self) -> None:
+        self.write_artifacts(extra_log_lines=[FULLSCREEN_PLACEMENT], summary={"rows": 0})   # the spec's criteria need rows > 0 on cuda: a FAIL on a sound run
+        _, receipt, _ = self.run_leg("ultra-magnus", self.write_spec(display_mode="windowed"), extra=["-Backend", "cuda"])
+        self.assertEqual(receipt["outcome"], "INVALID", receipt["outcomeDetail"])
+        self.assertIn("job result was FAIL", receipt["outcomeDetail"])
+
+    # -- the production validator derives the same verdict from the HASHED log and the COMMITTED spec ----------------------------------
+    def production(self, display_mode: str | None, placement: str | None, with_block: bool = True):
+        spec = self.write_spec(display_mode=display_mode)
+        repo = self.prod_repo(spec=spec)
+        ev = self.evidence("dm-" + hashlib.sha1(json.dumps([display_mode, placement, with_block]).encode()).hexdigest()[:8], backend="cuda",
+                           extra_log_lines=[placement] if placement else [])
+        receipt = self.receipt_for(repo, ev, backend="cuda")
+        if with_block:
+            receipt["display"] = self.derive_display(ev, spec)
+        return repo, ev, receipt
+
+    @staticmethod
+    def derive_display(ev: Path, spec_path: Path) -> dict:
+        """An INDEPENDENT mirror of Get-DvDisplayEvidence's two compared fields (the spec's mode, else full screen; the app's own placement line, else UNKNOWN)."""
+        spec = json.loads(spec_path.read_text(encoding="utf-8"))
+        found = re.findall(r"gui_smoke\.window_placement mode=(\w+) ", (ev / "logs" / "smoke-run.log").read_text(encoding="utf-8"))
+        return {"requestedMode": spec.get("displayMode", "fullscreen"), "observedMode": found[-1] if found else "UNKNOWN"}
+
+    def test_a_windowed_pass_over_a_full_screen_run_does_not_re_derive(self) -> None:
+        repo, ev, receipt = self.production("windowed", FULLSCREEN_PLACEMENT)
+        self.assertNotValid(receipt, repo, "DISPLAY_MODE_NOT_HONOURED", status="INVALID")
+
+    def test_a_windowed_pass_over_a_windowed_run_re_derives_as_advisory(self) -> None:
+        repo, ev, receipt = self.production("windowed", WINDOWED_PLACEMENT)
+        self.assertAdvisory(receipt, repo)
+
+    def test_a_receipt_that_misstates_the_mode_the_app_ran_in_does_not_re_derive(self) -> None:
+        repo, ev, receipt = self.production("windowed", FULLSCREEN_PLACEMENT)
+        receipt["display"]["observedMode"] = "windowed"
+        self.assertNotValid(receipt, repo, "DISPLAY_NOT_FROM_EVIDENCE", status="INVALID")
+
+    def test_a_receipt_of_a_leg_that_names_a_mode_but_carries_no_display_block_is_incomplete(self) -> None:
+        repo, ev, receipt = self.production("windowed", WINDOWED_PLACEMENT, with_block=False)
+        self.assertNotValid(receipt, repo, "the receipt carries no display block", status="INCOMPLETE")
+
+    def test_a_legacy_leg_re_derives_exactly_as_before_with_or_without_a_display_block(self) -> None:
+        repo, ev, receipt = self.production(None, None, with_block=False)
+        self.assertAdvisory(receipt, repo)
+
+    # -- one mutation per rule ----------------------------------------------------------------------------------------------------------
+    def test_mutation_without_the_runner_gate_a_windowed_leg_that_ran_full_screen_passes(self) -> None:
+        dv = self.mutated_runner([("Invoke-VenueLeg.ps1", "if ($outcome -in @('PASS', 'FAIL') -and $display.blocks) {", "if ($false) {")])
+        _, receipt, _ = self.leg("windowed", FULLSCREEN_PLACEMENT, dv=dv)
+        self.assertEqual(receipt["outcome"], "PASS", "with the gate removed the wrong-mode run passes; so the gate is what stops it")
+
+    def test_mutation_without_the_plumbing_the_generator_is_never_asked_for_windowed(self) -> None:
+        dv = self.mutated_runner([("Invoke-VenueLeg.ps1", "if ($display.requestedMode -ceq 'windowed') { $gen['DisplayMode'] = 'windowed' }", "$null = 0")])
+        self.leg("windowed", WINDOWED_PLACEMENT, dv=dv)
+        self.assertNotIn("DisplayMode", self.generator_calls()[-1])
+
+    def test_mutation_without_the_unknown_rule_an_unconfirmed_mode_passes(self) -> None:
+        dv = self.mutated_runner([("DualVenueRunner.psm1", "$blocks = ($verdict -ceq 'NOT_HONOURED') -or ($verdict -ceq 'UNKNOWN' -and $explicit)", "$blocks = ($verdict -ceq 'NOT_HONOURED')")])
+        _, receipt, _ = self.leg("windowed", None, dv=dv)
+        self.assertEqual(receipt["outcome"], "PASS", "with the UNKNOWN rule removed an unconfirmed mode passes; so that rule is what stops it")
+
+    def test_mutation_without_the_validator_derivation_a_wrong_mode_pass_is_believed(self) -> None:
+        repo, ev, receipt = self.production("windowed", FULLSCREEN_PLACEMENT)
+        mutated = self.mutated_module([("if ($displayVerdict.blocks) { $invalid.Add(", "if ($false) { $invalid.Add(")])
+        self.assertEqual(self.status_batch(repo, [(receipt, ev)], module=mutated)[0][0], "ADVISORY",
+                         "with the derivation removed the forged PASS re-derives; so the derivation is what refuses it")
+
+
+def run_pwsh_json(script: str, **env: str):
+    """Run a PowerShell snippet that imports the runner module and prints one JSON document; returns (CompletedProcess, parsed)."""
+    proc = run_pwsh(["-Command", f"Import-Module '{DV / 'DualVenueRunner.psm1'}' -Force\n" + script], env_extra=env)
+    try:
+        return proc, json.loads(proc.stdout)
+    except ValueError:
+        return proc, None
+
+
+@requires_windows_pwsh
+class DisplayMatrixLegSetTests(unittest.TestCase):
+    """The standard display matrix: the shipped leg set expands to the twelve cells, interleaved across repeats, every cell is an ordinary committed leg spec, and
+    the leg set refuses what would not be one matrix."""
+
+    SET = DV / "legsets" / "display-matrix.json"
+
+    def plan(self, repeats: int = 1, backend: str = "", set_path: Path | None = None):
+        proc, plan = run_pwsh_json(f"Get-DvLegSetPlan -LegSetPath '{set_path or self.SET}' -Repeats {repeats}" + (f" -Backend {backend}" if backend else "")
+                                   + " | ConvertTo-Json -Depth 5 -Compress")
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        return plan
+
+    def test_the_six_shipped_legs_make_the_full_grid_for_the_owner_clip(self) -> None:
+        grid = set()
+        for rel in DISPLAY_MATRIX_LEGS:
+            spec = json.loads((DV / rel).read_text(encoding="utf-8"))
+            self.assertEqual((spec["card"], spec["clipId"], spec["legType"], spec["look"]["lookFlavor"]), ("DUAL-VENUE-DISPLAY-MATRIX-1", OWNER_CLIP, "look", "cinematic"), rel)
+            self.assertEqual(spec["backends"], ["cuda", "cpu"], rel)
+            self.assertEqual(spec["legId"], Path(rel).stem, rel)
+            self.assertIn(spec["displayMode"], ("fullscreen", "windowed"))
+            if spec["scaleFactor"] != 1:
+                self.assertEqual(spec["acceptedEffectiveScale"], {"cuda": 1}, f"{rel}: the CUDA texture route clamps every scale but 1 to 1; the leg declares it")
+            grid.add((spec["displayMode"], spec["scaleFactor"]))
+        self.assertEqual(grid, {(m, s) for m in ("fullscreen", "windowed") for s in (1, 2, 4)})
+
+    def test_the_shipped_set_expands_to_twelve_cells_in_the_documented_order(self) -> None:
+        plan = self.plan()
+        self.assertEqual((plan["legSet"], plan["card"], plan["clipId"], len(plan["cells"])), ("display-matrix", "DUAL-VENUE-DISPLAY-MATRIX-1", OWNER_CLIP, 12))
+        self.assertEqual([c["cellId"] for c in plan["cells"]], MATRIX_CELLS)
+        self.assertEqual([e["cellId"] for e in plan["plan"]], MATRIX_CELLS)
+        self.assertEqual([e["seq"] for e in plan["plan"]], list(range(1, 13)))
+
+    def test_repeats_are_interleaved_forward_then_back_and_every_cell_runs_once_per_repeat(self) -> None:
+        plan = self.plan(repeats=3)
+        walk = [e["cellId"] for e in plan["plan"]]
+        self.assertEqual(len(walk), 36)
+        self.assertEqual(walk[:12], MATRIX_CELLS)
+        self.assertEqual(walk[12:24], MATRIX_CELLS[::-1], "repeat 2 walks the cells back, so a drift of the host lands on both ends of every comparison")
+        self.assertEqual(walk[24:], MATRIX_CELLS)
+        self.assertEqual([e["repeat"] for e in plan["plan"]], [1] * 12 + [2] * 12 + [3] * 12)
+        for r in (1, 2, 3):
+            self.assertEqual(sorted(e["cellId"] for e in plan["plan"] if e["repeat"] == r), sorted(MATRIX_CELLS))
+
+    def test_a_backend_filter_keeps_only_that_backends_cells(self) -> None:
+        plan = self.plan(repeats=2, backend="cpu")
+        self.assertEqual([c["cellId"] for c in plan["cells"]], [c for c in MATRIX_CELLS if c.startswith("cpu-")])
+        self.assertEqual(len(plan["plan"]), 12)
+
+    def test_the_planned_legs_name_committed_specs_the_receipt_is_bound_to(self) -> None:
+        plan = self.plan()
+        for entry in plan["plan"]:
+            self.assertTrue(Path(entry["specPath"]).is_file(), entry)
+            self.assertEqual(Path(entry["specPath"]).parent, DV / "legs")
+            self.assertEqual(entry["legId"], Path(entry["specPath"]).stem)
+
+    def broken_set(self, mutate) -> Path:
+        tmp = tempfile.TemporaryDirectory(prefix="dve-set-")
+        self.addCleanup(tmp.cleanup)
+        root = Path(tmp.name) / "dual-venue"
+        shutil.copytree(DV, root)
+        doc = json.loads((root / "legsets" / "display-matrix.json").read_text(encoding="utf-8"))
+        mutate(doc, root)
+        path = root / "legsets" / "broken.json"
+        path.write_text(json.dumps(doc), encoding="utf-8")
+        return path
+
+    def assertRefused(self, set_path: Path) -> None:
+        proc, _ = run_pwsh_json(f"Get-DvLegSetPlan -LegSetPath '{set_path}' | ConvertTo-Json -Compress")
+        self.assertNotEqual(proc.returncode, 0)
+        self.assertIn("DVE_LEGSET_INVALID", proc.stdout + proc.stderr)
+
+    def test_a_set_that_would_not_be_one_matrix_is_refused(self) -> None:
+        def other_clip(doc, root):
+            spec_path = root / "legs" / "m16-1243-display-windowed-s2.json"
+            spec_path.write_text(spec_path.read_text(encoding="utf-8").replace('"clipId": "M16-1243"', '"clipId": "M16-9999"'), encoding="utf-8")
+        self.assertRefused(self.broken_set(other_clip))
+        self.assertRefused(self.broken_set(lambda doc, root: doc.update(card="SOME-OTHER-CARD-1")))
+        self.assertRefused(self.broken_set(lambda doc, root: doc["legs"].append(doc["legs"][0])))            # two legs make the cell cuda-fullscreen-s1
+        self.assertRefused(self.broken_set(lambda doc, root: doc.update(legs=[])))
+        self.assertRefused(self.broken_set(lambda doc, root: doc.update(schema="mlv-app/dual-venue-legset/v0")))
+
+    def test_a_set_may_name_only_committed_leg_specs_under_legs(self) -> None:
+        self.assertRefused(self.broken_set(lambda doc, root: doc["legs"].append("venues.json")))
+        self.assertRefused(self.broken_set(lambda doc, root: doc["legs"].append("legs/../venues.json")))
+        self.assertRefused(self.broken_set(lambda doc, root: doc["legs"].append("legs/no-such-leg.json")))
+
+    # -- the entry point: Invoke-VenueLeg -LegSet display-matrix -Repeats N ---------------------------------------------------------------
+    def test_plan_only_prints_the_planned_legs_and_needs_no_venue_commit_or_build(self) -> None:
+        proc = run_pwsh(["-File", str(DV / "Invoke-VenueLeg.ps1"), "-LegSet", "display-matrix", "-PlanOnly", "-Repeats", "2"])
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        plan_lines = [l for l in proc.stdout.splitlines() if l.startswith("DVE_PLAN ")]
+        self.assertEqual(len(plan_lines), 24)
+        self.assertIn("DVE_LEGSET=display-matrix CARD=DUAL-VENUE-DISPLAY-MATRIX-1 CLIP=M16-1243 CELLS=12 REPEATS=2 LEGS=24", proc.stdout)
+        self.assertIn("DVE_PLAN 1/24 repeat=1 cell=cuda-fullscreen-s1 leg=m16-1243-display-fullscreen-s1 backend=cuda display=fullscreen scale=1", proc.stdout)
+        self.assertIn("DVE_PLAN 2/24 repeat=1 cell=cuda-windowed-s1 leg=m16-1243-display-windowed-s1 backend=cuda display=windowed scale=1", proc.stdout)
+        self.assertNotIn("DVE_RECEIPT_PATH", proc.stdout, "a plan runs nothing: no leg, so no receipt")
+
+    def test_a_leg_set_that_runs_needs_a_venue_a_commit_and_a_build(self) -> None:
+        proc = run_pwsh(["-File", str(DV / "Invoke-VenueLeg.ps1"), "-LegSet", "display-matrix"])
+        self.assertNotEqual(proc.returncode, 0)
+        self.assertIn("DVE_LEGSET_REQUIRES_VENUE", proc.stdout + proc.stderr)
+
+    def test_a_leg_spec_and_a_leg_set_cannot_be_mixed_and_a_single_leg_still_needs_its_arguments(self) -> None:
+        proc = run_pwsh(["-File", str(DV / "Invoke-VenueLeg.ps1"), "-LegSet", "display-matrix", "-LegSpec", str(DV / "legs" / "m16-1243-look.json")])
+        self.assertNotEqual(proc.returncode, 0, "-LegSet and -LegSpec are different parameter sets")
+        proc = run_pwsh(["-File", str(DV / "Invoke-VenueLeg.ps1"), "-LegSpec", str(DV / "legs" / "m16-1243-look.json")])
+        self.assertNotEqual(proc.returncode, 0, "a single leg still needs -Venue, -SourceCommit and -BuildManifestSha256")
+
+    # -- the one summary table ------------------------------------------------------------------------------------------------------------
+    def table(self, rows: list[dict], cells: list[dict]) -> str:
+        proc = run_pwsh(["-Command", f"Import-Module '{DV / 'DualVenueRunner.psm1'}' -Force\n$rows = $env:DVE_ROWS | ConvertFrom-Json\n$cells = $env:DVE_CELLS | ConvertFrom-Json\n"
+                                    "ConvertTo-DvMatrixTable -Rows @($rows) -Cells @($cells)"], env_extra={"DVE_ROWS": json.dumps(rows), "DVE_CELLS": json.dumps(cells)})
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        return proc.stdout.replace("\r\n", "\n")
+
+    @staticmethod
+    def row(cell: str, outcome: str = "PASS", fps: float | None = 12.0, **over) -> dict:
+        backend, mode, scale = cell.split("-")
+        base = {"cellId": cell, "backend": backend, "outcome": outcome, "observedDisplay": mode, "effectiveScale": 1 if backend == "cuda" else int(scale[1:]),
+                "windowSize": "2560x1529" if mode == "windowed" else "2560x1600", "previewSize": "2380x1373" if mode == "windowed" else "2560x1600",
+                "presentedFps": fps, "timelineFpsAfterFirstPresent": 19.5, "renderWorkMs": 28.0, "dualIsoMs": 25.0}
+        base.update(over)
+        return base
+
+    def test_the_table_has_a_row_per_cell_with_the_owner_numbers_and_the_clamp_visible(self) -> None:
+        cells = [{"cellId": "cuda-windowed-s2", "backend": "cuda", "displayMode": "windowed", "scaleFactor": 2},
+                 {"cellId": "cpu-fullscreen-s4", "backend": "cpu", "displayMode": "fullscreen", "scaleFactor": 4}]
+        rows = [self.row("cuda-windowed-s2", fps=11.8, timelineFpsAfterFirstPresent=19.2, renderWorkMs=29.5, dualIsoMs=24.2),
+                self.row("cuda-windowed-s2", fps=12.1, timelineFpsAfterFirstPresent=19.6, renderWorkMs=27.5, dualIsoMs=26.0),
+                self.row("cuda-windowed-s2", fps=12.0, timelineFpsAfterFirstPresent=19.4, renderWorkMs=28.5, dualIsoMs=25.0),
+                self.row("cpu-fullscreen-s4", fps=4.0), self.row("cpu-fullscreen-s4", outcome="INVALID", fps=None, presentedFps=None)]
+        lines = self.table(rows, cells).splitlines()
+        self.assertEqual(len(lines), 2 + 2)
+        self.assertIn("presented fps median (min-max)", lines[0])
+        self.assertIn("timeline fps after first present", lines[0])
+        self.assertIn("render_work ms", lines[0])
+        self.assertIn("dual-ISO ms", lines[0])
+        windowed = lines[2]
+        self.assertTrue(windowed.startswith("| cuda-windowed-s2 | cuda | windowed / windowed | 2->1 | 2560x1529 (2380x1373) | 3/3 | 12.00 (11.80-12.10) | 19.40 | 28.5 | 25.0 | PASS x3 |"), windowed)
+        cpu = lines[3]
+        self.assertIn("| 1/2 | 4.00 (4.00-4.00) |", cpu, "one measurement of two runs; the INVALID repeat is counted in 'ran' and shows no numbers")
+        self.assertTrue(cpu.endswith("INVALID x1, PASS x1 |"), cpu)
+
+    def test_a_cell_with_no_measurement_shows_dashes_and_its_outcome(self) -> None:
+        cells = [{"cellId": "cpu-windowed-s1", "backend": "cpu", "displayMode": "windowed", "scaleFactor": 1}]
+        line = self.table([self.row("cpu-windowed-s1", outcome="INVALID", fps=None, presentedFps=None, timelineFpsAfterFirstPresent=None, renderWorkMs=None, dualIsoMs=None)], cells).splitlines()[2]
+        self.assertIn("| 0/1 | - | - | - | - | INVALID x1 |", line)
+        self.assertIn("| cpu | windowed / windowed |", line)
+
+
+@requires_windows_pwsh
+class DisplayMatrixRunTests(EvidenceFactory, unittest.TestCase):
+    """The whole entry point, offline (stub um-run and generator): Invoke-VenueLeg -LegSet display-matrix -Repeats N runs every planned leg through the single-leg runner,
+    interleaved, and writes ONE summary table from the receipts and their hashed run logs. One cell's app log says the app ran full screen where the leg asked for windowed:
+    its row is INVALID with no numbers, the rest of the matrix still runs."""
+
+    def setUp(self) -> None:
+        self.make_harness()
+
+    def cell_artifacts(self, cell: str, placement: str, fps: float) -> str:
+        """Write one cell's run artifacts (its own app log: the placement the app ran in, the scale it rendered at, the four rates) and return the agent-side path."""
+        _, mode, scale = cell.split("-")
+        eff = 1   # the CUDA texture route renders at 1 whatever the request: the shipped specs declare it
+        name = f"{cell}.artifacts"
+        saved = self.artifacts
+        self.artifacts = self.share / "outbox" / name
+        try:
+            self.write_artifacts(sheet=True, summary={"lookAssistForced": True, "lookFlavorReported": "cinematic"},
+                                 line={"scale_request_last": eff, "scale_active_last": eff, "presented_fps": fps, "avg_render_work_ms": 28.5},
+                                 extra_log_lines=[placement,
+                                                  "playback_smoke.pace_summary session=3 first_present_ms=1000.000 paced_elapsed_ms=30000.000 timeline_fps_after_first_present=19.40 presented_fps_after_first_present=12.5 pace_fps=23.976 first_present_catchup_frames=0",
+                                                  "playback_smoke.cpu_summary session=3 avg_llrawproc_total_ms=26.000 avg_llrawproc_dual_iso_ms=25.5 avg_processing_ms=5.000"])
+            self.stamp_identity("ultra-magnus", self.build_sha)
+        finally:
+            self.artifacts = saved
+        return f"X:\\stub\\agent\\outbox\\{name}"
+
+    def run_matrix(self, repeats: int, extra: list[str], placements: dict[str, str]):
+        by_leg = {}
+        for cell in (c for c in MATRIX_CELLS if c.startswith("cuda-")):
+            _, mode, scale = cell.split("-")
+            placement = placements.get(cell, WINDOWED_PLACEMENT if mode == "windowed" else FULLSCREEN_PLACEMENT)
+            by_leg[f"display-{mode}-{scale}-ultra-magnus-cuda"] = self.cell_artifacts(cell, placement, 12.0 + (0.5 if mode == "windowed" else 0.0) + 0.1 * int(scale[1:]))
+        cfg = {"log": str(self.log), "genLog": str(self.gen_log), "probe": HEALTHY_PROBE, "mainMode": "capture", "healthMode": "ok", "artifactsByLeg": by_leg,
+               "artifactsAgentPath": "X:\\stub\\agent\\outbox\\unused.artifacts", "genRefusal": None, "clipContentSha256": CLIP_CONTENT_SHA, "token": None, "exitCode": 0}
+        self.stub_cfg.write_text(json.dumps(cfg), encoding="utf-8")
+        self.log.write_text("", encoding="utf-8")
+        self.gen_log.write_text("", encoding="utf-8")
+        proc = run_pwsh(["-File", str(DV / "Invoke-VenueLeg.ps1"), "-Venue", "ultra-magnus", "-LegSet", "display-matrix", "-Repeats", str(repeats), "-SourceCommit", self.sha,
+                         "-BuildManifestSha256", self.build_sha, "-VenueTablePath", str(self.table), "-ReceiptRoot", str(self.receipts), "-OfflineTestMode",
+                         "-UmRunScript", str(self.um), "-GeneratorScript", str(self.gen), "-WorkDir", str(self.tmp / "work"), "-ConsentPath", str(self.consent),
+                         "-RepoRoot", str(ROOT), "-Actor", "unit-test", *extra], env_extra={"DVE_STUB": str(self.stub_cfg)})
+        return proc
+
+    def test_a_cuda_matrix_run_interleaves_the_cells_runs_every_leg_and_writes_one_table(self) -> None:
+        bad_cell = "cuda-windowed-s2"   # asked for windowed; the app's log says it ran full screen
+        proc = self.run_matrix(2, ["-Backend", "cuda"], {bad_cell: FULLSCREEN_PLACEMENT})
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        legs = [l for l in proc.stdout.splitlines() if l.startswith("DVE_MATRIX_LEG ")]
+        self.assertEqual(len(legs), 12, proc.stdout)
+        walked = [re.search(r"cell=(\S+)", l).group(1) for l in legs]
+        cuda_cells = [c for c in MATRIX_CELLS if c.startswith("cuda-")]
+        self.assertEqual(walked, cuda_cells + cuda_cells[::-1], "repeat 1 forward, repeat 2 back")
+        # the stub saw the same order, one health probe per leg
+        submitted = [l for l in self.log.read_text(encoding="utf-8").splitlines() if l.strip() and not l.endswith("-health")]
+        self.assertEqual(len(submitted), 12)
+        self.assertEqual([re.search(r"m16-1243-display-(\w+)-(s\d)-ultra-magnus-cuda", j).groups() for j in submitted],
+                         [(c.split("-")[1], c.split("-")[2]) for c in walked])
+        # only the windowed legs asked the generator for --windowed
+        gen = self.generator_calls()
+        self.assertEqual(sum("DisplayMode=windowed" in g for g in gen), 6)
+        # one receipt per leg, each with its own display block
+        outcomes = {}
+        for l in legs:
+            cell = re.search(r"cell=(\S+)", l).group(1); outcome = re.search(r"outcome=(\S+)", l).group(1)
+            outcomes.setdefault(cell, []).append(outcome)
+        for cell in cuda_cells:
+            want = "INVALID" if cell == bad_cell else "PASS"
+            self.assertEqual(outcomes[cell], [want, want], cell)
+        # the ONE summary table
+        summary = re.search(r"DVE_MATRIX_SUMMARY=(.+)", proc.stdout).group(1).strip()
+        text = Path(summary).read_text(encoding="utf-8")
+        self.assertEqual(len([l for l in text.splitlines() if l.startswith("| cuda-")]), 6)
+        self.assertIn("| cuda-windowed-s1 | cuda | windowed / windowed | 1->1 | 2560x1529 (2380x1373) | 2/2 | 12.60 (12.60-12.60) | 19.40 | 28.5 | 25.5 | PASS x2 |", text)
+        self.assertIn("| cuda-fullscreen-s4 | cuda | fullscreen / fullscreen | 4->1 | 2560x1600 (2560x1600) | 2/2 | 12.40 (12.40-12.40) | 19.40 | 28.5 |", text)
+        bad_row = next(l for l in text.splitlines() if l.startswith(f"| {bad_cell} "))
+        self.assertIn("| windowed / fullscreen |", bad_row)
+        self.assertIn("| 0/2 | - | - | - | - | INVALID x2 |", bad_row)
+        # the receipts the table was read from carry requested, observed and window
+        receipts = [json.loads(p.read_text(encoding="utf-8")) for p in self.receipts.rglob("*.json")]
+        self.assertEqual(len(receipts), 12)
+        windowed_ok = [r for r in receipts if r["legId"] == "m16-1243-display-windowed-s1"]
+        self.assertEqual({(r["display"]["requestedMode"], r["display"]["observedMode"], r["display"]["windowWidth"]) for r in windowed_ok}, {("windowed", "windowed", 2560)})
+        self.assertEqual({r["scale"]["verdict"] for r in windowed_ok}, {"HONOURED"})
+        clamped = [r for r in receipts if r["legId"] == "m16-1243-display-windowed-s2"]
+        self.assertEqual({(r["scale"]["requestedScale"], r["scale"]["effectiveScale"]) for r in clamped}, {(2, 1)})
+
+    def test_a_table_row_is_read_only_from_a_run_log_that_still_hashes_to_its_receipt(self) -> None:
+        proc = self.run_matrix(1, ["-Backend", "cuda"], {})
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        receipts = sorted(self.receipts.rglob("*.json"))
+        receipt = json.loads(receipts[0].read_text(encoding="utf-8"))
+        log = Path(receipt["evidence"]["localEvidenceDir"]) / "logs" / "smoke-run.log"
+        log.write_text(log.read_text(encoding="utf-8").replace("presented_fps=12", "presented_fps=99"), encoding="utf-8")   # a swapped log
+        script = (f"Import-Module '{DV / 'DualVenueRunner.psm1'}' -Force\n$r = Get-Content -LiteralPath $env:DVE_RECEIPT -Raw | ConvertFrom-Json\n"
+                  "Get-DvMatrixRow -PlanEntry ([pscustomobject]@{ seq = 1; repeat = 1; cellId = 'x'; backend = 'cuda'; displayMode = 'fullscreen'; scaleFactor = 1 }) -Receipt $r | ConvertTo-Json -Compress")
+        out = run_pwsh(["-Command", script], env_extra={"DVE_RECEIPT": str(receipts[0])})
+        self.assertEqual(out.returncode, 0, out.stdout + out.stderr)
+        row = json.loads(out.stdout)
+        self.assertIsNone(row["presentedFps"], "a log that does not hash to the receipt is no measurement")
+        self.assertIn("does not hash to the receipt", row["note"])
+
+
+# ---------------------------------------------------------------------------------------------------
 class LegSpecSchemaTests(unittest.TestCase):
     def setUp(self) -> None:
         try:
@@ -3759,7 +4270,11 @@ class LegSpecSchemaTests(unittest.TestCase):
                 self.assertNotRegex(path.read_text(encoding="utf-8").lower(), r"cinematic", f"{path.name} is a classic/speed leg and mentions the cinematic flavor")
                 continue
             flavored += 1
-            self.assertEqual(spec["legId"], f"m16-1243-look-{flavor}", path.name)
+            if spec["card"] == "DUAL-VENUE-DISPLAY-MATRIX-1":   # the display-matrix legs are cinematic look legs named by their cell (display mode and scale)
+                self.assertEqual(spec["legId"], path.stem, path.name)
+                self.assertRegex(spec["legId"], r"^m16-1243-display-(fullscreen|windowed)-s[124]$", path.name)
+            else:
+                self.assertEqual(spec["legId"], f"m16-1243-look-{flavor}", path.name)
             for role, per_backend in spec["criteria"].items():
                 self.assertTrue(per_backend, f"{path.name}: {role} has no criteria")
                 for backend, criteria in per_backend.items():
@@ -3859,6 +4374,26 @@ class LegSpecSchemaTests(unittest.TestCase):
                          {"playSeconds": 19}, {"clipPath": "C:/x"}):
             with self.assertRaises(self.jsonschema.ValidationError, msg=str(override)):
                 self.jsonschema.validate(dict(spec, **override), self.schema)
+
+    def test_the_display_mode_is_optional_and_only_fullscreen_or_windowed(self) -> None:
+        """DUAL-VENUE-DISPLAY-MATRIX-1: a spec without `displayMode` is valid (it is a full-screen leg: every existing leg is unchanged); the field takes exactly two values."""
+        spec = json.loads((DV / "legs" / "m16-1243-look.json").read_text(encoding="utf-8"))
+        self.assertNotIn("displayMode", spec)
+        self.jsonschema.validate(spec, self.schema)
+        for mode in ("fullscreen", "windowed"):
+            self.jsonschema.validate(dict(spec, displayMode=mode), self.schema)
+        for bad in ("maximized", "Windowed", "", None, 1):
+            with self.assertRaises(self.jsonschema.ValidationError, msg=repr(bad)):
+                self.jsonschema.validate(dict(spec, displayMode=bad), self.schema)
+
+    def test_the_leg_set_file_is_a_tracked_list_of_committed_specs_and_names_no_path(self) -> None:
+        doc = json.loads((DV / "legsets" / "display-matrix.json").read_text(encoding="utf-8"))
+        self.assertEqual(doc["schema"], "mlv-app/dual-venue-legset/v1")
+        self.assertEqual(sorted(doc["legs"]), sorted(DISPLAY_MATRIX_LEGS))
+        self.assertNotRegex((DV / "legsets" / "display-matrix.json").read_text(encoding="utf-8"), r"(?i)[a-z]:[\\/]|\.mlv\b")
+        self.assertIn("tools/profiling/dual-venue/legsets/*.json text eol=lf", (ROOT / ".gitattributes").read_text(encoding="utf-8"))
+        roles = json.loads((DV / "venues.json").read_text(encoding="utf-8"))["roles"]
+        self.assertEqual(roles["DUAL-VENUE-DISPLAY-MATRIX-1"], {"bachelor": "acceptance", "ultra-magnus": "supplementary"}, "the roles are declared before the first byte (kernel K5)")
 
     def test_a_look_leg_without_a_look_block_and_an_unknown_backend_are_rejected(self) -> None:
         spec = json.loads(next(iter(sorted((DV / "legs").glob("*look*.json")))).read_text(encoding="utf-8"))

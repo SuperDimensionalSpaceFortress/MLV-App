@@ -5,6 +5,11 @@
 #       -Venue ultra-magnus -LegSpec tools\profiling\dual-venue\legs\m16-1243-look.json `
 #       -SourceCommit <40-hex> -BuildManifestSha256 <64-hex> -Backend cpu
 #
+# DISPLAY MATRIX (DUAL-VENUE-DISPLAY-MATRIX-1): -LegSet <name> -Repeats N runs a tracked leg set (tools\profiling\dual-venue\legsets\<name>.json; the standard one is
+# display-matrix: {fullscreen, windowed} x {scale 1, 2, 4} x {cuda, cpu}) through this script leg by leg, interleaved across the repeats, and writes ONE summary table;
+# -PlanOnly prints the planned legs and runs nothing (docs/dual-venue-evidence.md, "Display matrix (standard playback benchmark)"). A leg's optional displayMode
+# (fullscreen | windowed) reaches the generator as the app's --windowed; the receipt carries the requested AND the observed mode and FAILS CLOSED (INVALID) when they differ.
+#
 # The flow (each step a refusal the code enforces, each refusal a receipt):
 #   1. read the leg spec (legSpecSha256 = sha256 of its bytes) and the venue table; the venue's ROLE
 #      for the leg's card comes from venues.json, never from an argument (P3). PRODUCTION reads the venue table
@@ -42,12 +47,21 @@
 # EXIT CODE IS NEVER EVIDENCE: 0 means "a receipt was written" (whatever its outcome), 2 means the
 # receipt itself could not be written. Read the receipt.
 
-[CmdletBinding()]
+[CmdletBinding(DefaultParameterSetName = 'Leg')]
 param(
-    [Parameter(Mandatory = $true)][ValidateSet('bachelor', 'ultra-magnus')][string]$Venue,
-    [Parameter(Mandatory = $true)][string]$LegSpec,
-    [Parameter(Mandatory = $true)][ValidatePattern('^[0-9a-f]{64}$')][string]$BuildManifestSha256,
-    [Parameter(Mandatory = $true)][ValidatePattern('^[0-9a-f]{40}$')][string]$SourceCommit,
+    # Two modes. 'Leg' (the default, unchanged) runs ONE leg spec. 'Set' (DUAL-VENUE-DISPLAY-MATRIX-1) runs a tracked LEG SET: every cell of it, -Repeats times, interleaved, and writes one
+    # summary table. -Venue / -SourceCommit / -BuildManifestSha256 are mandatory for a leg and for a set that runs (checked by hand in set mode, because -PlanOnly needs none).
+    [Parameter(ParameterSetName = 'Leg', Mandatory = $true)][Parameter(ParameterSetName = 'Set')][ValidateSet('bachelor', 'ultra-magnus')][string]$Venue,
+    [Parameter(ParameterSetName = 'Leg', Mandatory = $true)][string]$LegSpec,
+    # The leg set to run, by name: tools\profiling\dual-venue\legsets\<name>.json (e.g. display-matrix).
+    [Parameter(ParameterSetName = 'Set', Mandatory = $true)][ValidatePattern('^[a-z0-9][a-z0-9-]{1,62}$')][string]$LegSet,
+    # How many times the set's cells are walked (repeat 1 forward, repeat 2 back, ...: the cells are interleaved across repeats).
+    [Parameter(ParameterSetName = 'Set')][ValidateRange(1, 20)][int]$Repeats = 1,
+    # Print the planned legs and stop: nothing is generated, probed or submitted, and no venue, commit or build is needed.
+    [Parameter(ParameterSetName = 'Set')][switch]$PlanOnly,
+    [Parameter(ParameterSetName = 'Leg', Mandatory = $true)][Parameter(ParameterSetName = 'Set')][ValidatePattern('^[0-9a-f]{64}$')][string]$BuildManifestSha256,
+    [Parameter(ParameterSetName = 'Leg', Mandatory = $true)][Parameter(ParameterSetName = 'Set')][ValidatePattern('^[0-9a-f]{40}$')][string]$SourceCommit,
+    # In set mode, only the cells of this backend are run (default: every backend the set lists).
     [ValidateSet('cuda', 'cpu')][string]$Backend = '',
     # Run only the health probe (and P6) and stop: records the venue's state without running the leg.
     [switch]$HealthOnly,
@@ -91,6 +105,21 @@ if (-not [string]::IsNullOrWhiteSpace($SheetCopyDir) -and -not (Test-DvUnderClau
     throw 'DVE_SHEET_COPY_MUST_STAY_LOCAL -SheetCopyDir must be under a .claude-state directory; a sheet of owner footage is never committed, attached or published'
 }
 
+# --- SET MODE, part 1 (DUAL-VENUE-DISPLAY-MATRIX-1): expand the leg set into its planned legs and print them. -PlanOnly stops here: nothing is generated, probed or submitted. ---
+$setPlan = $null
+if ($PSCmdlet.ParameterSetName -eq 'Set') {
+    if ($HealthOnly) { throw 'DVE_LEGSET_HEALTH_ONLY_REFUSED -HealthOnly probes one venue for one leg; run it with -LegSpec' }
+    $setPlan = Get-DvLegSetPlan -LegSetPath (Join-Path $here "legsets\$LegSet.json") -Repeats $Repeats -Backend $Backend
+    Write-Output "DVE_LEGSET=$($setPlan.legSet) CARD=$($setPlan.card) CLIP=$($setPlan.clipId) CELLS=$(@($setPlan.cells).Count) REPEATS=$Repeats LEGS=$(@($setPlan.plan).Count)"
+    foreach ($entry in $setPlan.plan) {
+        Write-Output ('DVE_PLAN {0}/{1} repeat={2} cell={3} leg={4} backend={5} display={6} scale={7}' -f $entry.seq, @($setPlan.plan).Count, $entry.repeat, $entry.cellId, $entry.legId, $entry.backend, $entry.displayMode, $entry.scaleFactor)
+    }
+    if ($PlanOnly) { exit 0 }
+    foreach ($needed in 'Venue', 'SourceCommit', 'BuildManifestSha256') {
+        if (-not $PSBoundParameters.ContainsKey($needed)) { throw "DVE_LEGSET_REQUIRES_$($needed.ToUpperInvariant()) a leg set that runs needs -$needed (use -PlanOnly to print the plan alone)" }
+    }
+}
+
 if ([string]::IsNullOrWhiteSpace($RepoRoot)) { $RepoRoot = (Resolve-Path (Join-Path $here '..\..\..')).Path }
 if ([string]::IsNullOrWhiteSpace($UmRunScript)) { $UmRunScript = Join-Path $here '..\um-run.ps1' }
 if ([string]::IsNullOrWhiteSpace($GeneratorScript)) { $GeneratorScript = Join-Path $here '..\bachelor\playback-attr-3-cuda-job.ps1' }
@@ -111,6 +140,47 @@ if (-not $OfflineTestMode -and -not (Test-DvUnderClaudeState -Path $evidenceBase
 }
 if ([string]::IsNullOrWhiteSpace($Actor)) { $Actor = "dual-venue-runner@$($env:COMPUTERNAME)" }
 $runStamp = [DateTime]::UtcNow.ToString('yyyyMMddHHmmss')
+
+# --- SET MODE, part 2: run every planned leg through THIS script as a child (a leg ends in `exit`, and every leg writes its own receipt exactly as a single leg does), then read the
+# receipts back and write ONE summary table. A leg that ended in any outcome (a refusal included) is a row; the walk never stops on one, so the table says what each cell did. ---
+if ($null -ne $setPlan) {
+    $pwshExe = (Get-Process -Id $PID).Path
+    $rows = [System.Collections.Generic.List[object]]::new()
+    $total = @($setPlan.plan).Count
+    foreach ($entry in $setPlan.plan) {
+        $childArgs = @('-NoProfile', '-File', $PSCommandPath, '-Venue', $Venue, '-LegSpec', $entry.specPath, '-SourceCommit', $SourceCommit,
+            '-BuildManifestSha256', $BuildManifestSha256, '-Backend', $entry.backend, '-ReceiptRoot', $ReceiptRoot, '-Actor', $Actor)
+        if (-not [string]::IsNullOrWhiteSpace($SheetCopyDir)) { $childArgs += @('-SheetCopyDir', $SheetCopyDir) }
+        if ($OfflineTestMode) { $childArgs += '-OfflineTestMode' }
+        foreach ($seam in 'ConsentPath', 'VenueTablePath', 'RepoRoot', 'WorkDir', 'UmRunScript', 'GeneratorScript') {
+            if ($PSBoundParameters.ContainsKey($seam)) { $childArgs += @("-$seam", [string](Get-Variable -Name $seam -ValueOnly)) }
+        }
+        $childOut = @(& $pwshExe @childArgs 2>&1 | ForEach-Object { [string]$_ })
+        $receiptPath = $null
+        foreach ($childLine in $childOut) { if ($childLine -match '^DVE_RECEIPT_PATH=(?<p>.+)$') { $receiptPath = $Matches['p'].Trim() } }
+        $legReceipt = $null
+        if ($receiptPath -and (Test-Path -LiteralPath $receiptPath -PathType Leaf)) {
+            try { $legReceipt = [IO.File]::ReadAllText($receiptPath) | ConvertFrom-Json } catch { $legReceipt = $null }
+        }
+        $row = Get-DvMatrixRow -PlanEntry $entry -Receipt $legReceipt
+        $rows.Add($row)
+        Write-Output ('DVE_MATRIX_LEG {0}/{1} repeat={2} cell={3} outcome={4} receipt={5}' -f $entry.seq, $total, $entry.repeat, $entry.cellId, $row.outcome, $(if ($receiptPath) { $receiptPath } else { 'none' }))
+    }
+    $summaryDir = Join-Path (Split-Path -Parent $ReceiptRoot) "legset-summaries\$($setPlan.legSet)-$Venue-$runStamp"
+    New-Item -ItemType Directory -Force -Path $summaryDir | Out-Null
+    $table = ConvertTo-DvMatrixTable -Rows $rows.ToArray() -Cells @($setPlan.cells)
+    $measured = @($rows | Where-Object { $_.outcome -cin @('PASS', 'FAIL') }).Count
+    $head = @("# Leg set $($setPlan.legSet) on $Venue", '',
+        "card $($setPlan.card), clip $($setPlan.clipId), source $($SourceCommit.Substring(0, 12)), build manifest $($BuildManifestSha256.Substring(0, 12)), $Repeats repeat(s) of $(@($setPlan.cells).Count) cell(s) = $total leg(s), $measured measured.",
+        'Rates are read from each leg''s hashed app run log (median over the repeats). Only a PASS or FAIL receipt is a measurement; every other outcome is no signal and shows no numbers. Production receipts are ADVISORY (docs/dual-venue-evidence.md).', '')
+    $summaryPath = Join-Path $summaryDir 'summary.md'
+    [IO.File]::WriteAllText($summaryPath, (($head + $table) -join "`n") + "`n", [Text.UTF8Encoding]::new($false))
+    $rowsJson = [ordered]@{ schema = 'mlv-app/dual-venue-legset-summary/v1'; legSet = $setPlan.legSet; venue = $Venue; sourceCommit = $SourceCommit; buildManifestSha256 = $BuildManifestSha256; repeats = $Repeats; rows = $rows.ToArray() }
+    [IO.File]::WriteAllText((Join-Path $summaryDir 'summary.json'), ($rowsJson | ConvertTo-Json -Depth 6) + "`n", [Text.UTF8Encoding]::new($false))
+    Write-Output $table
+    Write-Output "DVE_MATRIX_SUMMARY=$summaryPath"
+    exit 0
+}
 
 # --- where admission reads from: the COMMITTED tracked files (production) ---------------------------
 $sources = Resolve-DvAdmissionSources -RepoRoot $RepoRoot -ConsentPath $ConsentPath -VenueTablePath $VenueTablePath -OfflineTestMode:$OfflineTestMode
@@ -166,6 +236,9 @@ $receipt.subject.clipId = [string]$spec.clipId
 # DVE-SCALE2-LOOK-LEG-1 r2: EVERY receipt says the playback scale the leg asked for; the scale the app rendered at is UNKNOWN until a run log says (step 7).
 $scale = Get-DvScaleEvidence -Spec $spec -Backend $Backend -LogText $null
 $receipt.scale = $scale
+# DUAL-VENUE-DISPLAY-MATRIX-1: EVERY receipt says the display mode the leg asked for (the spec's optional displayMode; none = full screen); the mode the app ran in is UNKNOWN until a run log says (step 7).
+$display = Get-DvDisplayEvidence -Spec $spec -LogText $null
+$receipt.display = $display
 # What the leg is admitted ON: the committed consent-file and venue-table blob ids (production) -- recorded even for a refusal.
 $receipt.admission = [ordered]@{
     mode = $sources.mode
@@ -281,6 +354,8 @@ try {
     # -UsePersistedPlaybackSettings leaves the smoke runner's own scale check OFF unless the job is told what to expect. The CUDA texture route clamps the request before the
     # runner reads it, so the value is the scale this backend is accepted to render at (the request, unless the spec declares a clamp): the check is live where the route allows.
     $gen['ExpectedScaleRequest'] = [int]$scale.acceptedEffectiveScale
+    # DUAL-VENUE-DISPLAY-MATRIX-1: a windowed leg makes the generator pass the app's --windowed. A full-screen leg passes nothing, so its job is the text it always was.
+    if ($display.requestedMode -ceq 'windowed') { $gen['DisplayMode'] = 'windowed' }
     if ($OfflineTestMode -and -not [string]::IsNullOrWhiteSpace($VenueTablePath)) { $gen['VenueTablePath'] = $VenueTablePath }
     if ($null -ne $spec.PSObject.Properties['generatorArgs']) {
         if ($spec.generatorArgs.PSObject.Properties['telemetryArm']) { $gen['TelemetryArm'] = [string]$spec.generatorArgs.telemetryArm }
@@ -462,6 +537,9 @@ if ($null -ne $summary -or $null -ne $runLogText) {
 $scale = Get-DvScaleEvidence -Spec $spec -Backend $Backend -LogText $runLogText
 $receipt.scale = $scale
 $scaleNote = "requested scale $($scale.requestedScale), rendered at $($scale.effectiveScale)"
+# The display mode the app RAN in and the window it presented in, from its own gui_smoke.window_placement line (never from the spec): the receipt carries the requested and the observed mode.
+$display = Get-DvDisplayEvidence -Spec $spec -LogText $runLogText
+$receipt.display = $display
 $smokeRefusalReason = $(if ($null -ne $summary -and $summary.PSObject.Properties['smokeRefusalReason']) { [string]$summary.smokeRefusalReason } else { '' })
 $resolved = Resolve-DvJobOutcome -ResultToken $token -ExitCode $exitCode -SmokeRefusalReason $smokeRefusalReason
 # A consumer of an evidence launcher ACTS on its exit code (master's consumer scan pins this statement): a job that prints a
@@ -565,6 +643,12 @@ if ($outcome -eq 'CAPTURED') {
     else { $outcome = 'PASS'; $detail = $(if ($verdictCriteria.informational) { 'CAPTURED; no gating criteria for this role/backend (informational)' } else { 'CAPTURED; every criterion for this role/backend held' }) }
     # A declared clamp (the CUDA texture route renders at 1 whatever the request) still passes, but never silently: the detail carries both numbers.
     if ($outcome -in @('PASS', 'FAIL') -and $scale.verdict -ceq 'DECLARED_CLAMP') { $detail += "; $scaleNote (the spec declares this backend renders at $($scale.acceptedEffectiveScale))" }
+}
+# DUAL-VENUE-DISPLAY-MATRIX-1, FAIL CLOSED: a leg that ran in a display mode other than the one it names (a requested-windowed leg that ran full screen, or the reverse), or that NAMES a mode the
+# run log cannot confirm, is not a valid measurement under that mode: a typed INVALID with the reason, never a PASS or FAIL. (A legacy spec that names no mode keeps its old behaviour.)
+if ($outcome -in @('PASS', 'FAIL') -and $display.blocks) {
+    $detail = "INVALID: the job result was $outcome ($detail) but DISPLAY_MODE_NOT_HONOURED: $($display.reason). A run that did not use the display mode the leg names is no measurement under it"
+    $outcome = 'INVALID'
 }
 # A signal needs its proof. A PASS or FAIL whose receipt-oracle verdict is not valid (under 20 s of source frames, a wrap,
 # a foreign run, a fixture, or the verdict simply absent) is INVALID: a FAIL on footage that cannot be shown to be long
