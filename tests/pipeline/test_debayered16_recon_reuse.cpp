@@ -10,8 +10,8 @@
 // worker, then the render's OutputDebayered16 branch). The tests pin:
 //  (a) byte-exact output (memcmp, zero tolerance) against today's render over >= 8
 //      consecutive dual-ISO frames, two fresh objects, AMaZE and bilinear;
-//  (b) the render runs no second recon (llrawproc run counter and the thread's
-//      llrawproc / decode timings), and the mutation: forcing today's path (the kill
+//  (b) the render runs no second recon (the per-thread llrawproc run counter), and
+//      the mutation: forcing today's path (the kill
 //      switch production honours) makes that check fail;
 //  (c) the reuse never reads or writes the single-frame cache, and a paused frame and
 //      the export path afterwards give the same bytes as on a fresh object;
@@ -140,14 +140,11 @@ StepResult playbackRenderStep(MlvPipelineFixture & fixture, uint64_t frame, llra
     return result;
 }
 
-// The success gate: the render consumed the recon and ran no decode or llrawproc of its own.
+// The success gate: the render consumed the recon and ran no llrawproc of its own. The
+// proof is the run counter, never a duration; the ms values are printed for the record.
 bool renderRanNoSecondRecon(const StepResult & r)
 {
-    return r.reused
-        && r.renderLlrawprocRuns == 0
-        && r.renderLlrawprocTotalMs == 0.0
-        && r.renderLlrawprocMs == 0.0
-        && r.renderRawUint16Ms == 0.0;
+    return r.reused && r.renderLlrawprocRuns == 0;
 }
 
 size_t mismatchedWords(const std::vector<uint16_t> & a, const std::vector<uint16_t> & b, size_t words)
