@@ -4,6 +4,7 @@
 // count every lost frame once, at the present that skipped it, with one cause.
 #include "../common/minitest.h"
 
+#include "../../platform/qt/PlaybackNativePaceGuard.h"
 #include "../../platform/qt/PlaybackSlipHistogram.h"
 
 #include <cmath>
@@ -317,4 +318,57 @@ TEST(PlaybackSlipHistogram, RatesAfterTheFirstPresent)
     ASSERT_NEAR( 598.0 * 1000.0 / 23660.0, s.timelineAfterFirstFps, 1e-9 );
     ASSERT_NEAR( 547.0 * 1000.0 / 23660.0, s.presentedAfterFirstFps, 1e-9 );
     ASSERT_NEAR( kNativeFps * 547.0 / 598.0, s.nativeEquivPresentedFps, 1e-9 );
+}
+
+namespace
+{
+
+// The drop-frame engine as playbackHandling runs it: an 8 ms poll asking for elapsed x pace, plus a predictive
+// whole-frame request on every present of a renderer that takes renderMs. resetEveryTick models a guard that is
+// re-armed mid-session (the leak the lead check exists to expose).
+Summary guardedRun( double renderMs, bool resetEveryTick )
+{
+    SlipHistogram h;
+    h.reset( 0, kNativeFps );
+    playback_native_pace::NativePaceGuard guard;
+    double position = 0.0;
+    double lastTickMs = 0.0;
+    double nextPresentMs = renderMs;
+    for( double t = 0.0; t < 25000.0; t += 8.0 )
+    {
+        double request = kNativeFps * ( t - lastTickMs ) / 1000.0;
+        if( t >= nextPresentMs )
+        {
+            request = std::max( request, 1.0 ); // the predictive advance asks for a whole frame
+            nextPresentMs = t + renderMs;
+        }
+        lastTickMs = t;
+        if( resetEveryTick ) guard.reset();
+        const bool armedBefore = guard.armed();
+        const double granted = guard.grant( request, t, kNativeFps );
+        position += granted;
+        h.noteTimelineMove( AdvancePath::DropTick, static_cast<int>( position ), t, granted, guard.creditFrames(),
+                            kNativeFps, !armedBefore );
+    }
+    return h.finish( 25000.0, static_cast<int>( position ) );
+}
+
+} // namespace
+
+TEST(PlaybackSlipHistogram, AGuardedRunNeverLeadsTheGuardCeiling)
+{
+    const Summary fast = guardedRun( 9.0, false );
+    ASSERT_TRUE( fast.paceGuardMaxLeadFrames <= 1e-9 );
+    ASSERT_EQ( 1, fast.paceGuardRearms );   // the arm at the first grant only
+    ASSERT_NEAR( kNativeFps, fast.paceGuardFpsMin, 1e-12 );
+    ASSERT_NEAR( kNativeFps, fast.paceGuardFpsMax, 1e-12 );
+    const Summary slow = guardedRun( 70.0, false );
+    ASSERT_TRUE( slow.paceGuardMaxLeadFrames <= 1e-9 );
+}
+
+TEST(PlaybackSlipHistogram, AGuardReArmedMidSessionShowsALeadAndTheReArms)
+{
+    const Summary leak = guardedRun( 9.0, true );
+    ASSERT_TRUE( leak.paceGuardRearms > 1000 );
+    ASSERT_TRUE( leak.paceGuardMaxLeadFrames > 100.0 ); // a 9 ms renderer outruns native once nothing carries over
 }
