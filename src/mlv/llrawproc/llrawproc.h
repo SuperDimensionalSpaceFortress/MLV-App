@@ -85,6 +85,18 @@ int llrpGetIsolatedAnalysisDualIsoArmsForCurrentThread(int * dual_iso_mode,
                                                        int * white_bright,
                                                        double * dark_noise_scale,
                                                        int * dark_black_offset_enabled);
+/* LOOK-ASSIST-M16-CAST-5 measure-only switch arms, same contract (ISOLATED analysis renders on the calling thread only,
+ * handed to the recon for its duration). Call AFTER llrpSetIsolatedAnalysisDualIsoArmsForCurrentThread, which clears
+ * them. channel_ev / channel_bd (both non-NULL and finite: per CFA channel R, G1, G2, B, stops positive and 14-bit
+ * codes) darken each bright-field channel on its own (A11); quad_coherent_switch ORs the overexposure switch across
+ * each 2x2 CFA quad (A12); capture_switch_maps records each switch site's outcome (dualiso_switch_capture_map, P1).
+ * NULL / 0 is today's render. The getter reports them (1 = any set). */
+void llrpSetIsolatedAnalysisDualIsoSwitchArmsForCurrentThread(const double * channel_ev,
+                                                              const double * channel_bd,
+                                                              int quad_coherent_switch,
+                                                              int capture_switch_maps);
+int llrpGetIsolatedAnalysisDualIsoSwitchArmsForCurrentThread(int * channel_match, int * quad_coherent_switch,
+                                                             int * capture_switch_maps);
 /* The output levels (dng bit depth / black / white) of the last llrawproc run on the calling thread that completed for
  * `video`, live or isolated: the levels its frame is at, which a display render syncs the processing object to. Returns
  * 0 when no run completed for `video` since the last reset on this thread (e.g. the frame came from a cache). */

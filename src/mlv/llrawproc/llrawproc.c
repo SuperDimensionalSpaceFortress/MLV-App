@@ -103,7 +103,7 @@ static MLV_THREAD_LOCAL int g_llrawproc_analysis_diso_fullres = -1;
 static MLV_THREAD_LOCAL int g_llrawproc_analysis_diso_chroma_smooth = -1;
 /* LOOK-ASSIST-M16-CAST-4: see llrpSetIsolatedAnalysisDualIsoArmsForCurrentThread(). */
 static MLV_THREAD_LOCAL int g_llrawproc_analysis_diso_mode = -1;
-static MLV_THREAD_LOCAL dualiso_analysis_override_t g_llrawproc_analysis_diso_levels = { 0, 0.0, 0, { 0, 0, 0, 0 } };
+static MLV_THREAD_LOCAL dualiso_analysis_override_t g_llrawproc_analysis_diso_levels = {0};
 /* LOOK-ASSIST-ANALYSIS-TRUE-LEVELS-1: see llrpLastOutputLevelsForCurrentThread(). */
 static MLV_THREAD_LOCAL const mlvObject_t * g_llrawproc_last_output_levels_video = NULL;
 static MLV_THREAD_LOCAL int g_llrawproc_last_output_bit_depth = 0;
@@ -4675,7 +4675,44 @@ int llrpGetIsolatedAnalysisDualIsoArmsForCurrentThread(int * dual_iso_mode,
     return g_llrawproc_analysis_diso_mode > 0
         || g_llrawproc_analysis_diso_levels.white_bright > 0
         || g_llrawproc_analysis_diso_levels.dark_noise_scale > 0.0
-        || g_llrawproc_analysis_diso_levels.dark_black_offset_enabled;
+        || g_llrawproc_analysis_diso_levels.dark_black_offset_enabled
+        || g_llrawproc_analysis_diso_levels.channel_match_enabled
+        || g_llrawproc_analysis_diso_levels.quad_coherent_switch
+        || g_llrawproc_analysis_diso_levels.capture_switch_maps;
+}
+
+void llrpSetIsolatedAnalysisDualIsoSwitchArmsForCurrentThread(const double * channel_ev,
+                                                              const double * channel_bd,
+                                                              int quad_coherent_switch,
+                                                              int capture_switch_maps)
+{
+    g_llrawproc_analysis_diso_levels.channel_match_enabled = 0;
+    memset(g_llrawproc_analysis_diso_levels.channel_ev, 0, sizeof(g_llrawproc_analysis_diso_levels.channel_ev));
+    memset(g_llrawproc_analysis_diso_levels.channel_bd, 0, sizeof(g_llrawproc_analysis_diso_levels.channel_bd));
+    if (channel_ev && channel_bd)
+    {
+        int finite = 1;
+        for (int c = 0; c < 4; c++) finite = finite && isfinite(channel_ev[c]) && isfinite(channel_bd[c]);
+        if (finite)
+        {
+            g_llrawproc_analysis_diso_levels.channel_match_enabled = 1;
+            memcpy(g_llrawproc_analysis_diso_levels.channel_ev, channel_ev, sizeof(g_llrawproc_analysis_diso_levels.channel_ev));
+            memcpy(g_llrawproc_analysis_diso_levels.channel_bd, channel_bd, sizeof(g_llrawproc_analysis_diso_levels.channel_bd));
+        }
+    }
+    g_llrawproc_analysis_diso_levels.quad_coherent_switch = quad_coherent_switch ? 1 : 0;
+    g_llrawproc_analysis_diso_levels.capture_switch_maps = capture_switch_maps ? 1 : 0;
+}
+
+int llrpGetIsolatedAnalysisDualIsoSwitchArmsForCurrentThread(int * channel_match, int * quad_coherent_switch,
+                                                             int * capture_switch_maps)
+{
+    if (channel_match) *channel_match = g_llrawproc_analysis_diso_levels.channel_match_enabled;
+    if (quad_coherent_switch) *quad_coherent_switch = g_llrawproc_analysis_diso_levels.quad_coherent_switch;
+    if (capture_switch_maps) *capture_switch_maps = g_llrawproc_analysis_diso_levels.capture_switch_maps;
+    return g_llrawproc_analysis_diso_levels.channel_match_enabled
+        || g_llrawproc_analysis_diso_levels.quad_coherent_switch
+        || g_llrawproc_analysis_diso_levels.capture_switch_maps;
 }
 
 /* The isolated analysis seed: nominal (-1, ev 1, black delta -1) unless this thread asked for the measured (-2) match

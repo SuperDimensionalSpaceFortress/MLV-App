@@ -391,6 +391,11 @@ typedef struct
     int black;
     int white;
     int white_darkened;
+    /* LOOK-ASSIST-M16-CAST-5, filled only with stop_after_match: per CFA channel (R, G1, G2, B) the mean bright-row
+     * value (20-bit) before and after the match darkened it, and the sample count. */
+    double bright_pre_mean[4];
+    double bright_post_mean[4];
+    long long bright_count[4];
 } dualiso_match_probe_t;
 void dualiso_match_probe_reset(int stop_after_match);
 int dualiso_match_probe_get(dualiso_match_probe_t * probe);
@@ -399,15 +404,38 @@ int dualiso_match_probe_get(dualiso_match_probe_t * probe);
  * by llrawproc around an isolated analysis reconstruction and cleared right after it (NULL = today's recon):
  * white_bright (14-bit, > 0) replaces the assumed bright-field clip white/2 (clamped to white); dark_noise_scale (> 0)
  * multiplies the dark noise compute_noise found; dark_black_offset (when enabled, 14-bit codes per CFA channel R, G1,
- * G2, B) is subtracted from the dark-field rows before the match. */
+ * G2, B) is subtracted from the dark-field rows before the match.
+ * LOOK-ASSIST-M16-CAST-5 adds, same contract: channel_match (when enabled) darkens each bright-field CFA channel (R, G1,
+ * G2, B) with its own ev (stops, positive) and black delta (14-bit codes) in match_exposures, the dark rows and the
+ * overexposure threshold keep the global match; quad_coherent_switch ORs the bright >= white_darkened test across each
+ * 2x2 CFA quad (x&~1, y&~1) at the three switch sites (phase-balanced fullres, fullres_reconstruction and the
+ * overexposed map, scalar and AVX2); capture_switch_maps records each site's per-pixel switch outcome (see
+ * dualiso_switch_capture_map). Clearing the override (NULL) frees the A12 test planes. */
 typedef struct
 {
     int white_bright;
     double dark_noise_scale;
     int dark_black_offset_enabled;
     int dark_black_offset[4];
+    int channel_match_enabled;
+    double channel_ev[4];
+    double channel_bd[4];
+    int quad_coherent_switch;
+    int capture_switch_maps;
 } dualiso_analysis_override_t;
 void dualiso_set_analysis_override(const dualiso_analysis_override_t * override_values);
+
+/* LOOK-ASSIST-M16-CAST-5: the switch outcome each site saw on the calling thread's last HQ recon with
+ * capture_switch_maps set (1 = that pixel took the over-white branch). Sites: 0 = mix_images' overexposed mark before
+ * the blur (bright >= white_darkened or dark >= white), 1 = fullres_reconstruction_phase_balance, 2 =
+ * fullres_reconstruction (its last call). The map stays valid until the next capture or clear on this thread; NULL
+ * when the site did not run. */
+#define DUALISO_SWITCH_SITE_OVEREXPOSED 0
+#define DUALISO_SWITCH_SITE_PHASE_BALANCE 1
+#define DUALISO_SWITCH_SITE_FULLRES 2
+#define DUALISO_SWITCH_SITES 3
+const unsigned char * dualiso_switch_capture_map(int site, int * width, int * height);
+void dualiso_switch_capture_clear(void);
 
 /* LOOK-ASSIST-M16-CAST-4: the levels the HQ recon saw on the calling thread's last run (thread-local, measure-only):
  * per field (0 = dark rows, 1 = bright rows, from is_bright) and CFA channel (R, G1, G2, B) the 0.1 / 1 / 99.99
@@ -432,6 +460,16 @@ typedef struct
     int p1[2][4];
     int p9999[2][4];
     int max[2][4];
+    /* LOOK-ASSIST-M16-CAST-5 P2, the per-channel field ratio: per CFA channel (R, G1, G2, B), a least-squares fit of
+     * the dark field interpolated onto each bright-row pixel (the mean of the same channel two rows up and down, both
+     * dark) against the native bright value, on doubly valid samples: bright < 0.9 * bright_clip and > black + 16 *
+     * bright_noise, dark > black + 8 * dark_noise (14-bit codes; bright_clip = the max over channels of the bright
+     * field's p99.99). dark - black = slope * (bright - black) + intercept, so ev = log2(1 / slope) and bd = intercept
+     * (14-bit), the match's own convention (bright - black = 2^ev * (dark - black - bd)). */
+    int fr_bright_clip;
+    long long fr_count[4];
+    double fr_ev[4];
+    double fr_bd[4];
 } dualiso_levels_probe_t;
 void dualiso_levels_probe_reset(int stop_after_levels);
 int dualiso_levels_probe_get(dualiso_levels_probe_t * probe);

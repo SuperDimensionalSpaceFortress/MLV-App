@@ -97,6 +97,9 @@ int dualiso_levels_probe_get(dualiso_levels_probe_t * probe)
     if (probe) memset(probe, 0, sizeof(*probe));
     return 0;
 }
+void llrpSetIsolatedAnalysisDualIsoSwitchArmsForCurrentThread(const double *, const double *, int, int) {}
+const unsigned char * dualiso_switch_capture_map(int, int *, int *) { return nullptr; }
+void dualiso_switch_capture_clear(void) {}
 void llrpInitDarkFrameExtFileName(mlvObject_t * video, char * df_filename)
 {
     if (video->llrawproc->dark_frame_filename) {

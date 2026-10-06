@@ -6,6 +6,8 @@
 #include "../../src/mlv_include.h"
 #include "LookAssistAnalysis.h"
 
+#include <vector>
+
 class ReceiptSettings;
 
 /* Applies parsed ReceiptSettings to the runtime mlvObject_t / processingObject_t
@@ -155,6 +157,26 @@ public:
                                                int temperature,
                                                int tint,
                                                const DualIsoTraceImageSink &imageSink = DualIsoTraceImageSink());
+
+    /* LOOK-ASSIST-M16-CAST-5 P1 (measure-only): the coincidence of a display render with a raw-resolution switch map
+     * (1 = flagged). Quads are the 2x2 CFA cells (x&~1, y&~1), flagged when any of their pixels is; display pixel
+     * (dx, dy) averages raw [factor*dx, factor*dx+factor) x [factor*dy, ...) and is flagged when any quad that block
+     * touches is. Over the render's HI mask (luma 121..235): c = the flagged share of its LAV pixels (R-G >= 8 and B-G
+     * >= 8), r = the flagged share of the rest. displayFlags, when given, receives the per-display-pixel flags. */
+    struct DisoProvenance
+    {
+        double c;
+        double r;
+        long long lav;
+        long long lavFlagged;
+        long long other;
+        long long otherFlagged;
+        long long rawFlagged;
+        long long displayFlagged;
+    };
+    static DisoProvenance lookAssistDisoProvenance(const unsigned char *rgb, int width, int height,
+                                                   const unsigned char *rawMap, int rawWidth, int rawHeight,
+                                                   int factor, std::vector<unsigned char> *displayFlags = nullptr);
 
 private:
     ReceiptApplier() = delete; /* Pure static — no instances */
