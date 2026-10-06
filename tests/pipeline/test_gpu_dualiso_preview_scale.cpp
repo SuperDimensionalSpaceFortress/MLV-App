@@ -500,7 +500,8 @@ std::vector<uint8_t> boxDownsample(const std::vector<uint8_t> & full, int fullW,
                 int s = 0;
                 for (int dy = 0; dy < scale; ++dy)
                     for (int dx = 0; dx < scale; ++dx)
-                        s += full[(static_cast<size_t>(y * scale + dy) * fullW + x * scale + dx) * 3 + c];
+                        s += full[((static_cast<size_t>(y) * scale + dy) * static_cast<size_t>(fullW)
+                                   + static_cast<size_t>(x) * scale + dx) * 3 + c];
                 out[(static_cast<size_t>(y) * w + x) * 3 + c] =
                     static_cast<uint8_t>((s + scale * scale / 2) / (scale * scale));
             }

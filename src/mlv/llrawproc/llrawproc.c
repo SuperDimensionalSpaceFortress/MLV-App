@@ -1652,10 +1652,12 @@ static int llrawproc_gpu_recon_run_backend(const dualiso_gpu_recon_state_t * sta
     int rc = 0;
     int set_clip_rc = 0;
     int set_luts_rc = 0;
+    int set_clip_called = 0;
+    int set_luts_called = 0;
     double set_clip_start_s = 0.0;
-    double set_clip_ms = -1.0;
+    double set_clip_ms = 0.0;
     double set_luts_start_s = 0.0;
-    double set_luts_ms = -1.0;
+    double set_luts_ms = 0.0;
     const size_t pixel_count = raw_image_size / sizeof(uint16_t);
     if(rc_out) *rc_out = -1;
     if(allocated_bytes_out) *allocated_bytes_out = 0;
@@ -1748,6 +1750,7 @@ static int llrawproc_gpu_recon_run_backend(const dualiso_gpu_recon_state_t * sta
         rc = g->set_clip(g->backend, &clip);
         set_clip_ms = (mlv_stage_timing_now() - set_clip_start_s) * 1000.0;
         set_clip_rc = rc;
+        set_clip_called = 1;
         InterlockedIncrement64(&g_llrawproc_gpu_set_clip_count);
         if(rc == 0)
         {
@@ -1767,6 +1770,7 @@ static int llrawproc_gpu_recon_run_backend(const dualiso_gpu_recon_state_t * sta
         rc = g->set_luts(g->backend, &luts);
         set_luts_ms = (mlv_stage_timing_now() - set_luts_start_s) * 1000.0;
         set_luts_rc = rc;
+        set_luts_called = 1;
         InterlockedIncrement64(&g_llrawproc_gpu_set_luts_count);
         if(rc == 0)
         {
@@ -1942,10 +1946,10 @@ static int llrawproc_gpu_recon_run_backend(const dualiso_gpu_recon_state_t * sta
     }
     pthread_mutex_unlock(&g_llrawproc_gpu_recon_backend_mutex);
 
-    if(g_llrawproc_gpu_recon_event_logger && (set_clip_ms >= 0.0 || set_luts_ms >= 0.0))
+    if(g_llrawproc_gpu_recon_event_logger && (set_clip_called || set_luts_called))
     {
         char line[256];
-        if(set_clip_ms >= 0.0)
+        if(set_clip_called)
         {
             snprintf(line, sizeof(line),
                      "gpu_recon_event kind=set_clip frame=%llu wall_ms=%.3f dur_ms=%.3f "
@@ -1955,7 +1959,7 @@ static int llrawproc_gpu_recon_run_backend(const dualiso_gpu_recon_state_t * sta
                      (long long)g_llrawproc_gpu_set_clip_count);
             g_llrawproc_gpu_recon_event_logger(line);
         }
-        if(set_luts_ms >= 0.0)
+        if(set_luts_called)
         {
             snprintf(line, sizeof(line),
                      "gpu_recon_event kind=set_luts frame=%llu wall_ms=%.3f dur_ms=%.3f "
