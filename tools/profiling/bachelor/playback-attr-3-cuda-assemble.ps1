@@ -115,27 +115,38 @@ $env:TEMP = $Scratch
 $env:TMP = $Scratch
 
 $archivePath = Join-Path $Scratch "$($names.shortSha)-source.zip"
-& git -C $RepoRoot archive --format=zip -o $archivePath $SourceCommit
-if ($LASTEXITCODE -ne 0 -or -not (Test-Path -LiteralPath $archivePath)) {
-    Complete-Failed 2 'sourceArchive' "git archive failed for $SourceCommit"
-}
-# Same binding the Ultra-Magnus DLL-pair job applies to its own archive, through the same
-# function (sol, PR #133 r2). The sha256 leg is a round-trip check here -- this process wrote
-# the file moments ago -- but the COMMIT leg is not: it reads back the id git stamped into the
-# zip comment and refuses an archive of anything other than $SourceCommit, which is the claim
-# every later artifact name and the injected buildinfo header rest on. The verified sha is
-# recorded in build.json, so the exe's source is auditable from the manifest alone.
-$sourceArchiveSha256 = Get-ShaLower $archivePath
-try {
-    [void](Assert-AttrCudaSourceArchive -ArchivePath $archivePath -ExpectedSha256 $sourceArchiveSha256 -ExpectedCommit $SourceCommit)
-} catch {
-    Complete-Failed 2 'sourceArchive' $_.Exception.Message
-}
-Say "SOURCE ARCHIVE bound sha256=$sourceArchiveSha256 commit=$SourceCommit"
 $SourceTree = Join-Path $Work 'src'
-New-Item -ItemType Directory -Path $SourceTree -Force | Out-Null
-Expand-Archive -LiteralPath $archivePath -DestinationPath $SourceTree -Force
-$StepLog['sourceArchive'] = 0
+# LANE-BUILD-WORKDIR-RETENTION-1: the archive is a 0.29 GiB duplicate of the source tree expanded from
+# it, and nothing reads it after Expand-Archive. It is removed in the finally below -- on success and on
+# every failure exit -- by the journal's proof (Remove-AttrCudaPartialFile: the file lies inside the fresh
+# root this run recorded and was created after it), never by a pathname guess.
+try {
+    & git -C $RepoRoot archive --format=zip -o $archivePath $SourceCommit
+    if ($LASTEXITCODE -ne 0 -or -not (Test-Path -LiteralPath $archivePath)) {
+        Complete-Failed 2 'sourceArchive' "git archive failed for $SourceCommit"
+    }
+    # Same binding the Ultra-Magnus DLL-pair job applies to its own archive, through the same
+    # function (sol, PR #133 r2). The sha256 leg is a round-trip check here -- this process wrote
+    # the file moments ago -- but the COMMIT leg is not: it reads back the id git stamped into the
+    # zip comment and refuses an archive of anything other than $SourceCommit, which is the claim
+    # every later artifact name and the injected buildinfo header rest on. The verified sha is
+    # recorded in build.json, so the exe's source is auditable from the manifest alone.
+    $sourceArchiveSha256 = Get-ShaLower $archivePath
+    try {
+        [void](Assert-AttrCudaSourceArchive -ArchivePath $archivePath -ExpectedSha256 $sourceArchiveSha256 -ExpectedCommit $SourceCommit)
+    } catch {
+        Complete-Failed 2 'sourceArchive' $_.Exception.Message
+    }
+    Say "SOURCE ARCHIVE bound sha256=$sourceArchiveSha256 commit=$SourceCommit"
+    New-Item -ItemType Directory -Path $SourceTree -Force | Out-Null
+    Expand-Archive -LiteralPath $archivePath -DestinationPath $SourceTree -Force
+    $StepLog['sourceArchive'] = 0
+} finally {
+    $archiveBytes = [long]0
+    if (Test-Path -LiteralPath $archivePath) { $archiveBytes = [long](Get-Item -LiteralPath $archivePath -Force).Length }
+    $archiveGone = Remove-AttrCudaPartialFile -TrustedRoot $OutDir -Path $archivePath -OwnedJournal $OwnedJournal
+    if ($archiveGone) { Say "SOURCE ARCHIVE removed after consume, freed $archiveBytes bytes" } else { Say "SOURCE ARCHIVE left in place ($archiveBytes bytes): the journal did not prove it" }
+}
 
 # --- verify the DLL pair BEFORE it is deployed -------------------------------------------------
 if (-not (Test-Path -LiteralPath $DllPairDir -PathType Container)) {
@@ -402,5 +413,18 @@ $StepLog['publishManifest'] = 0
 # -BuildManifestSha256; without it that job would trust whichever same-named build.json is in
 # the mutable Bachelor cache. Hashed after the atomic rename, so it describes the published file.
 $publishedManifestSha256 = Get-ShaLower (Join-Path $OutDir $names.buildManifestName)
+
+# LANE-BUILD-WORKDIR-RETENTION-1: a new head prunes the superseded .work-<sha12> trees of this run (every
+# head iteration has its own build-* dir under one lane-* run dir, hence -IncludeSiblingBuildDirs). The
+# newest tree (this one) stays whole, as does any tree written in the last two hours (a sibling leg may be
+# building into it); each older one has its evidence copied and verified first, then is dropped through
+# its build dir's ownership journal. Best effort: the package is already published, so a retention
+# problem is reported and never changes this job's result.
+try {
+    Import-Module (Join-Path $PSScriptRoot 'AttrCudaWorkRetention.psm1') -Force
+    [void](Invoke-AttrCudaWorkRetention -BuildDir $OutDir -OwnedJournal $OwnedJournal -KeepSha $names.shortSha -IncludeSiblingBuildDirs)
+} catch {
+    Say "RETENTION skipped: $($_.Exception.Message)"
+}
 Write-Output "RESULT=ASSEMBLE_OK SOURCE=$SourceCommit EXE=$($names.exeName) DLL=$($names.reconName) PKG=$($names.packageZipName) MANIFEST=$($names.buildManifestName) MANIFEST_SHA256=$publishedManifestSha256 OUT=$OutDir"
 exit 0
