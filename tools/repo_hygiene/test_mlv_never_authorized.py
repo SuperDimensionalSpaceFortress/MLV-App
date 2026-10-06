@@ -313,6 +313,293 @@ WORKFLOW_DELETED = (
     "        run: python -m flake8 tools\n"
 )
 
+# NA6-WORKFLOW-WHOLEFILE-1.  A trimmed copy of the real `pipeline_tests` run body in
+# .github/workflows/tests.yml, so the exact08 patch (CI-EXACT08-SHARD-BUDGET-1) and the
+# ff095bae (#253) widening can be replayed against it in every tool shape.  Inlined, not
+# read from `.claude-state`, which is gitignored and absent from every hosted checkout.
+SOLO_RACE_COMMENT = (
+    "          # LookAssistAnalysisRenderRace (LOOK-ASSIST-ANALYSIS-RENDER-RACE-1) renders the HQ"
+    " dual-ISO fixture before and after a level sync, 20-101 s each locally (229 s for the 4),"
+    " so it runs alone too.\n"
+)
+SOLO_LINE_253_BEFORE = (
+    "          $soloPattern = '^(LookAssistFixtureScene|LookAssistFlavorsFixture)\\.'\n"
+)
+SOLO_LINE_EXACT08_BEFORE = (
+    "          $soloPattern = "
+    "'^(LookAssistFixtureScene|LookAssistFlavorsFixture|LookAssistAnalysisRenderRace)\\.'\n"
+)
+SOLO_LINES_EXACT08_AFTER = (
+    "          # EXACT08-SHARD-BUDGET-1: two single tests dominate their windows. Measured on"
+    " the same\n"
+    "          # build, one process per test, so only the ratios carry:"
+    " GpuExportParityMatrixMissingDllFallback\n"
+    "          # IsByteInertAcrossConfigs is about 70 % of exact-08 (101 of 143 s), and"
+    " DngFramePayloadMatchesSave\n"
+    "          # DngFrameForPipelinePrep about 27 % of exact-05 (34 of 127 s). Each runs alone,"
+    " like the fixture\n"
+    "          # renders above, so the shared remainder of its window stops inheriting that"
+    " cost.\n"
+    "          $soloPattern = "
+    "'^(LookAssistFixtureScene|LookAssistFlavorsFixture|LookAssistAnalysisRenderRace)\\.|"
+    "^DualIsoPipeline\\.(GpuExportParityMatrixMissingDllFallbackIsByteInertAcrossConfigs|"
+    "DngFramePayloadMatchesSaveDngFrameForPipelinePrep)$'\n"
+)
+SOLO_RUN_HEAD = (
+    "jobs:\n"
+    "  pipeline_tests:\n"
+    "    runs-on: windows-latest\n"
+    "    steps:\n"
+    "      - name: Pipeline tests\n"
+    "        shell: pwsh\n"
+    "        run: |\n"
+    "          $testNames = & $exe --gtest_list_tests | Where-Object { $_ }\n"
+    "          # Every other window keeps its membership, minus those tests.\n"
+)
+SOLO_RUN_TAIL = (
+    "          $shards = @()\n"
+    "          for ($offset = 0; $offset -lt $testNames.Count; $offset += $testsPerShard) {\n"
+    "            $end = [Math]::Min($offset + $testsPerShard, $testNames.Count)\n"
+    "          }\n"
+    "          & $exe --gtest_filter=$filter --gtest_brief=1\n"
+    "          if ($LASTEXITCODE -ne 0) { exit 1 }\n"
+    "  hygiene:\n"
+    "    runs-on: ubuntu-latest\n"
+    "    steps:\n"
+    "      - name: Repo hygiene\n"
+    "        run: python -m unittest discover -s tools/repo_hygiene -p \"test_*.py\" -t .\n"
+)
+WORKFLOW_SOLO_BEFORE = (
+    SOLO_RUN_HEAD + SOLO_RACE_COMMENT + SOLO_LINE_EXACT08_BEFORE + SOLO_RUN_TAIL
+)
+WORKFLOW_SOLO_AFTER = (
+    SOLO_RUN_HEAD + SOLO_RACE_COMMENT + SOLO_LINES_EXACT08_AFTER + SOLO_RUN_TAIL
+)
+WORKFLOW_253_BEFORE = SOLO_RUN_HEAD + SOLO_LINE_253_BEFORE + SOLO_RUN_TAIL
+SOLO_TEST_LINE = "          & $exe --gtest_filter=$filter --gtest_brief=1\n"
+WORKFLOW_SOLO_STEP_DROPPED = WORKFLOW_SOLO_BEFORE.split("  hygiene:\n")[0]
+WORKFLOW_SOLO_CONTINUE = WORKFLOW_SOLO_BEFORE.replace(
+    "      - name: Repo hygiene\n",
+    "      - name: Repo hygiene\n        continue-on-error: true\n",
+)
+# Round 2 (sol r1): the repros.  One workflow carries an unconditioned inline step, a
+# conditioned block step ending in `exit $LASTEXITCODE`, an `if: always()` report step, and
+# two shorthand `- run:` steps (inline and block).
+SOL_SHARD_RUN = (
+    "        run: python -m tools.repo_hygiene.ci_unittest_shard --profile windows --of 7"
+    " --shard ${{ matrix.shard }}\n"
+)
+SOL_GATE_IF = "        if: needs.protected-check-route.outputs.product == 'true'\n"
+SOL_UNITTEST = "          python -m unittest discover -s tests\n"
+SOL_SHORT_INLINE = "      - run: python -m pytest tools/repo_hygiene\n"
+SOL_SHORT_BLOCK = "      - run: |\n          ctest --test-dir build\n"
+SOL_REPORT_RUN = "        run: python tools/report.py\n"
+WORKFLOW_SOL = (
+    "jobs:\n"
+    "  hygiene:\n"
+    "    runs-on: windows-latest\n"
+    "    steps:\n"
+    "      - name: Run repo hygiene unittest shard\n"
+    + SOL_SHARD_RUN
+    + "  pipeline:\n"
+    "    runs-on: windows-latest\n"
+    "    steps:\n"
+    "      - name: Run pipeline_tests\n"
+    + SOL_GATE_IF
+    + "        run: |\n"
+    + SOL_UNITTEST
+    + "          exit $LASTEXITCODE\n"
+    "      - name: Report\n"
+    "        if: always()\n"
+    + SOL_REPORT_RUN
+    + "  shorthand:\n"
+    "    runs-on: ubuntu-latest\n"
+    "    steps:\n"
+    + SOL_SHORT_INLINE
+    + SOL_SHORT_BLOCK
+)
+WORKFLOW_SOL_SHORTHAND_ECHO = WORKFLOW_SOL.replace(SOL_SHORT_INLINE, "      - run: echo done\n")
+WORKFLOW_SOL_MOVED_UNDER_IF = WORKFLOW_SOL.replace(SOL_SHORT_INLINE, "").replace(
+    SOL_REPORT_RUN,
+    "        run: |\n          python tools/report.py\n          python -m pytest tools/repo_hygiene\n",
+)
+ACTION_BEFORE = (
+    "name: check-suite\n"
+    "runs:\n"
+    "  using: composite\n"
+    "  steps:\n"
+    "    - shell: bash\n"
+    "      run: python -m unittest discover\n"
+)
+def _na6_row(name, tool, tool_input, expect, reason=None, fixture=None):
+    """One `na6` table row (round 2 adds many, all of one shape)."""
+    row = {"name": name, "group": "na6", "tool": tool, "input": tool_input, "expect": expect}
+    if expect == "DENY":
+        row["na"] = "NA-6"
+    if reason:
+        row["reason_contains"] = reason
+    if fixture:
+        row["fixture"] = fixture
+    return row
+
+
+def _na6_edit(name, old, new, expect, reason=None, fixture="workflow_sol",
+              path="{BOARD}/.github/workflows/tests.yml"):
+    return _na6_row(
+        name, "Edit", {"file_path": path, "old_string": old, "new_string": new},
+        expect, reason, fixture,
+    )
+
+
+# NA6-TRIPWIRES-1: the acceptance table is built from the REAL .github/workflows/tests.yml
+# of this checkout (tracked, so present on every hosted leg), never from a trimmed copy.
+# Every needle below is located in it; `test_na6_real_workflow_needles_resolve` fails if
+# one goes missing or ambiguous, so a DENY row can never pass on a missing needle (which
+# would be a fail-closed refusal for the WRONG reason).
+with open(
+    os.path.join(REPO_ROOT, ".github", "workflows", "tests.yml"), "r", encoding="utf-8"
+) as _handle:
+    REAL_TESTS_YML = _handle.read().replace("\r\n", "\n")
+NA6_MISSING = "<<NA6 needle missing from tests.yml: %s>>\n"
+
+
+def _real_line(fragment):
+    """The whole line (newline included) of REAL_TESTS_YML that contains ``fragment``."""
+    for line in REAL_TESTS_YML.split("\n"):
+        if fragment in line:
+            return line + "\n"
+    return NA6_MISSING % fragment
+
+
+def _real_span(start, end):
+    """REAL_TESTS_YML from the text ``start`` through the first ``end`` after it."""
+    first = REAL_TESTS_YML.find(start)
+    if first < 0:
+        return NA6_MISSING % start
+    last = REAL_TESTS_YML.find(end, first)
+    if last < 0:
+        return NA6_MISSING % end
+    return REAL_TESTS_YML[first : last + len(end)]
+
+
+def _real_item(marker):
+    """The whole list item (a step) whose first line contains ``marker``."""
+    lines = REAL_TESTS_YML.split("\n")
+    for index, line in enumerate(lines):
+        if marker in line:
+            indent = len(line) - len(line.lstrip())
+            end = index + 1
+            while end < len(lines) and (
+                not lines[end].strip() or len(lines[end]) - len(lines[end].lstrip()) > indent
+            ):
+                end += 1
+            while end > index + 1 and not lines[end - 1].strip():
+                end -= 1
+            return "\n".join(lines[index:end]) + "\n"
+    return NA6_MISSING % marker
+
+
+REAL_PIPE_STEP = "      - name: Run pipeline_tests --check-golden (bounded shards)\n"
+REAL_FILTER_LINE = _real_line('-Arguments @("--gtest_filter=$($shard.Filter)")')
+REAL_MYSHARDS_LINE = _real_line("$myShards = @($shards | Where-Object { $partOf[$_.Name] -eq $part })")
+REAL_TPS_LINE = _real_line("$testsPerShard = 12")
+REAL_FOREACH_LINE = "          foreach ($shard in $myShards) {\n"
+REAL_SOLO_LINE = _real_line("$soloPattern = '")
+REAL_EXACT08_BLOCK = _real_span("          # EXACT08-SHARD-BUDGET-1:", REAL_SOLO_LINE)
+# The #269 change (CI-EXACT08-SHARD-BUDGET-1) undone: the pre-#269 solo line, no comment.
+PRE_269_SOLO_LINE = (
+    "          $soloPattern = "
+    "'^(LookAssistFixtureScene|LookAssistFlavorsFixture|LookAssistAnalysisRenderRace)\\.'\n"
+)
+REAL_PRE_269 = REAL_TESTS_YML.replace(REAL_EXACT08_BLOCK, PRE_269_SOLO_LINE, 1)
+REAL_CHECKOUT_STEP = _real_item("      - uses: actions/checkout@")
+REAL_PIPE_STEP_ITEM = _real_item(REAL_PIPE_STEP.rstrip("\n"))
+REAL_WITHOUT_PIPE_STEP = REAL_TESTS_YML.replace(REAL_PIPE_STEP_ITEM, "", 1)
+# Header-spanning spans: from the step's `- name:` line (so `if:` and `run:` are inside)
+# through the line the edit changes -- the shape master's fragment predicate judges.
+REAL_HEAD_TO_FILTER = _real_span(REAL_PIPE_STEP, REAL_FILTER_LINE)
+REAL_HEAD_TO_MYSHARDS = _real_span(REAL_PIPE_STEP, REAL_MYSHARDS_LINE)
+# The shard loop through its own closing brace (the first `}` back at the loop's column).
+REAL_FOREACH_BLOCK = _real_span(REAL_FOREACH_LINE, "\n          }\n")
+REAL_HEAD_TO_FOREACH_END = _real_span(REAL_PIPE_STEP, REAL_FOREACH_BLOCK)
+REAL_SPLIT_FILTER = "$($shard.Filter.Split(':')[0])"
+REAL_SELECT_FIRST = "-eq $part } | Select-Object -First 1)"
+NA6_REAL_NEEDLES = (
+    REAL_PIPE_STEP,
+    REAL_FILTER_LINE,
+    REAL_MYSHARDS_LINE,
+    REAL_TPS_LINE,
+    REAL_FOREACH_LINE,
+    REAL_SOLO_LINE,
+    REAL_EXACT08_BLOCK,
+    REAL_CHECKOUT_STEP,
+    REAL_PIPE_STEP_ITEM,
+    REAL_FOREACH_BLOCK,
+)
+WF = ".github/workflows/tests.yml"
+
+
+def _na6_real(name, tool, tool_input, expect, reason=None, fixture="real_tests"):
+    return _na6_row("na6 tripwires " + name, tool, tool_input, expect, reason, fixture)
+
+
+def _na6_real_edit(name, old, new, expect, reason=None, fixture="real_tests"):
+    return _na6_real(
+        name, "Edit",
+        {"file_path": "{BOARD}/" + WF, "old_string": old, "new_string": new},
+        expect, reason, fixture,
+    )
+
+
+def _na6_real_write(name, content, expect, reason=None, fixture="real_tests"):
+    return _na6_real(
+        name, "Write", {"file_path": "{BOARD}/" + WF, "content": content}, expect, reason, fixture
+    )
+
+
+SHELL_HEREDOC_WORKFLOW = (
+    "cat > .github/workflows/tests.yml <<'YAML'\n"
+    "jobs:\n  t:\n    steps:\n      - run: echo done\n"
+    "YAML"
+)
+# NA6-TRIPWIRES-1 shell parity rows: (name, tool, command).  Expected verdict = master's.
+NA6_SHELL_PARITY = (
+    ("heredoc over a workflow", "Bash", SHELL_HEREDOC_WORKFLOW),
+    ("echo redirect over a workflow", "Bash", "echo x > " + WF),
+    ("echo append to a workflow", "Bash", "echo x >> " + WF),
+    ("rm of a workflow", "Bash", "rm " + WF),
+    ("Remove-Item of a workflow", "PowerShell", "Remove-Item -Force " + WF),
+    ("sed -i on a workflow", "Bash", "sed -i 's/12/1/' " + WF),
+    ("mv of a workflow", "Bash", "mv " + WF + " old.yml"),
+    ("Move-Item of a workflow", "PowerShell",
+     "Move-Item " + WF + " .github/workflows/old.yml"),
+    ("cp over a workflow", "Bash", "cp other.yml " + WF),
+    ("Set-Content on a composite action", "PowerShell",
+     "Set-Content -Path .github/actions/check-suite/action.yml -Value 'x'"),
+    ("quoted redirect in a search pattern", "Bash",
+     "rg -n 'echo x > " + WF + "' tools/repo_hygiene/test_mlv_never_authorized.py"),
+    ("quoted rm in a grep pattern", "Bash", 'grep -n "rm ' + WF + '" notes.md'),
+    ("backup then redirect over the workflow", "Bash",
+     "cp " + WF + " wf.bak; echo x > " + WF),
+    ("Copy-Item backup then Set-Content", "PowerShell",
+     "Copy-Item " + WF + " wf.bak; Set-Content " + WF + " 'jobs: {}'"),
+    ("heredoc body naming mv of a workflow", "Bash",
+     "cat >> notes.md <<'EOF'\nmv " + WF + " b.yml was refused\nEOF"),
+    ("multi-line commit message naming mv", "Bash",
+     'git commit -m "subject\n\nmv ' + WF + ' old.yml is denied"'),
+    ("Set-Content whose VALUE names a workflow", "PowerShell",
+     "Set-Content -Path notes/workflow-reference.txt -Value '" + WF + "'"),
+    ("Out-File whose InputObject names a workflow", "PowerShell",
+     "Out-File -FilePath notes/workflow-reference.txt -InputObject '" + WF + "'"),
+    ("redirect inside a shell comment", "Bash",
+     "cat " + WF + " # do not run: echo x > " + WF),
+)
+
+# A MOVE that also edits the body: the Batch Compile step changes job AND loses its target.
+WORKFLOW_MOVED_AND_TRIMMED = WORKFLOW_MOVED.replace(
+    "cmake --build build --target batch_compile", "cmake --build build"
+)
+
 TEST_BEFORE = "void tst::check() {\n    QVERIFY(ok);\n    QCOMPARE(a, b);\n}\n"
 TEST_WEAKENED = "void tst::check() {\n    // disabled during triage\n    QCOMPARE(a, b);\n}\n"
 
@@ -3133,6 +3420,9 @@ CASES = [
             "new_string": WORKFLOW_MOVED,
         },
         "expect": "ALLOW",
+        # NA6-WORKFLOW-WHOLEFILE-1: the arm reconstructs the WHOLE file, so the file must
+        # BE on the tmp board; an Edit of an absent workflow is refused (row below).
+        "fixture": "workflow_before",
     },
     {
         "name": "na6 test step deleted outright",
@@ -3145,7 +3435,418 @@ CASES = [
         },
         "expect": "DENY",
         "na": "NA-6",
+        "fixture": "workflow_before",
     },
+    # ------------------------------- NA6-TRIPWIRES-1, additive tripwires on master's NA-6
+    #
+    # These rows were written for #270 (NA6-WORKFLOW-WHOLEFILE-1, closed) and are reused as
+    # the NA-6 corpus.  #270 REPLACED master's fragment predicate; NA6-TRIPWIRES-1 keeps it
+    # byte for byte and only ADDS refusals (T1 step survival, T2 marker count; no shell
+    # target), so an expectation here follows master's verdict wherever master DENIES, and
+    # the tripwires' wherever master ALLOWS.  Rows labelled LIMIT are ALLOWED exactly as on
+    # master: the hook does not judge whether a test still EXECUTES (see the register).
+    # `Na6DifferentialTests` replays every `na6` row through master's hook too.
+    {
+        "name": "na6 wholefile exact08 single-line Edit",
+        "group": "na6",
+        "tool": "Edit",
+        "input": {
+            "file_path": "{BOARD}/.github/workflows/tests.yml",
+            "old_string": SOLO_LINE_EXACT08_BEFORE,
+            "new_string": SOLO_LINES_EXACT08_AFTER,
+        },
+        "expect": "ALLOW",
+        "fixture": "workflow_solo",
+    },
+    {
+        "name": "na6 wholefile exact08 Edit spanning the run header",
+        "group": "na6",
+        "tool": "Edit",
+        "input": {
+            "file_path": "{BOARD}/.github/workflows/tests.yml",
+            "old_string": SOLO_RUN_HEAD + SOLO_RACE_COMMENT + SOLO_LINE_EXACT08_BEFORE,
+            "new_string": SOLO_RUN_HEAD + SOLO_RACE_COMMENT + SOLO_LINES_EXACT08_AFTER,
+        },
+        # Master parity: the fragment spans the `run:` header and changes its body, which
+        # master's byte-identity predicate refuses.  A known false positive, kept DENY.
+        "expect": "DENY",
+        "na": "NA-6",
+        "reason_contains": "net removal of a workflow test step: '",
+        "fixture": "workflow_solo",
+    },
+    {
+        "name": "na6 wholefile exact08 whole-file Write",
+        "group": "na6",
+        "tool": "Write",
+        "input": {
+            "file_path": "{BOARD}/.github/workflows/tests.yml",
+            "content": WORKFLOW_SOLO_AFTER,
+        },
+        "expect": "ALLOW",
+        "fixture": "workflow_solo",
+    },
+    {
+        "name": "na6 wholefile ff095bae 253 widening spanning the run header",
+        "group": "na6",
+        "tool": "Edit",
+        "input": {
+            "file_path": "{BOARD}/.github/workflows/tests.yml",
+            "old_string": SOLO_RUN_HEAD + SOLO_LINE_253_BEFORE,
+            "new_string": SOLO_RUN_HEAD + SOLO_RACE_COMMENT + SOLO_LINE_EXACT08_BEFORE,
+        },
+        # Master parity, as the row above.
+        "expect": "DENY",
+        "na": "NA-6",
+        "reason_contains": "net removal of a workflow test step: '",
+        "fixture": "workflow_253",
+    },
+    {
+        "name": "na6 wholefile Write of a new workflow",
+        "group": "na6",
+        "tool": "Write",
+        "input": {
+            "file_path": "{BOARD}/.github/workflows/new-suite.yml",
+            "content": WORKFLOW_BEFORE,
+        },
+        "expect": "ALLOW",
+    },
+    {
+        # LIMIT: an interior body line, the step survives -- ALLOWED as on master.
+        "name": "na6 wholefile fragment Edit deleting a test-invoking line",
+        "group": "na6",
+        "tool": "Edit",
+        "input": {
+            "file_path": "{BOARD}/.github/workflows/tests.yml",
+            "old_string": SOLO_TEST_LINE,
+            "new_string": "",
+        },
+        "expect": "ALLOW",
+        "fixture": "workflow_solo",
+    },
+    {
+        # LIMIT, as the row above.
+        "name": "na6 wholefile fragment Edit commenting out a test-invoking line",
+        "group": "na6",
+        "tool": "Edit",
+        "input": {
+            "file_path": "{BOARD}/.github/workflows/tests.yml",
+            "old_string": SOLO_TEST_LINE,
+            "new_string": SOLO_TEST_LINE.replace("& $exe", "# & $exe"),
+        },
+        "expect": "ALLOW",
+        "fixture": "workflow_solo",
+    },
+    {
+        "name": "na6 wholefile fragment Edit appending exit 0",
+        "group": "na6",
+        "tool": "Edit",
+        "input": {
+            "file_path": "{BOARD}/.github/workflows/tests.yml",
+            "old_string": SOLO_TEST_LINE,
+            "new_string": SOLO_TEST_LINE.replace("--gtest_brief=1", "--gtest_brief=1; exit 0"),
+        },
+        "expect": "DENY",
+        "na": "NA-6",
+        "reason_contains": "`exit 0`",
+        "fixture": "workflow_solo",
+    },
+    {
+        "name": "na6 wholefile fragment Edit appending or-true",
+        "group": "na6",
+        "tool": "Edit",
+        "input": {
+            "file_path": "{BOARD}/.github/workflows/tests.yml",
+            "old_string": SOLO_TEST_LINE,
+            "new_string": SOLO_TEST_LINE.replace("--gtest_brief=1", "--gtest_brief=1 || true"),
+        },
+        "expect": "DENY",
+        "na": "NA-6",
+        "reason_contains": "`|| true`",
+        "fixture": "workflow_solo",
+    },
+    {
+        "name": "na6 wholefile Write dropping a step",
+        "group": "na6",
+        "tool": "Write",
+        "input": {
+            "file_path": "{BOARD}/.github/workflows/tests.yml",
+            "content": WORKFLOW_SOLO_STEP_DROPPED,
+        },
+        "expect": "DENY",
+        "na": "NA-6",
+        "reason_contains": "net removal",
+        "fixture": "workflow_solo",
+    },
+    {
+        "name": "na6 wholefile Write adding continue-on-error",
+        "group": "na6",
+        "tool": "Write",
+        "input": {
+            "file_path": "{BOARD}/.github/workflows/tests.yml",
+            "content": WORKFLOW_SOLO_CONTINUE,
+        },
+        "expect": "DENY",
+        "na": "NA-6",
+        "reason_contains": "continue-on-error",
+        "fixture": "workflow_solo",
+    },
+    {
+        "name": "na6 wholefile step move that also removes a token",
+        "group": "na6",
+        "tool": "Edit",
+        "input": {
+            "file_path": "{BOARD}/.github/workflows/tests.yml",
+            "old_string": WORKFLOW_BEFORE,
+            "new_string": WORKFLOW_MOVED_AND_TRIMMED,
+        },
+        "expect": "DENY",
+        "na": "NA-6",
+        # Master's fragment predicate fires first and names the lost body.
+        "reason_contains": "net removal of a workflow test step: 'cmake --build build --target",
+        "fixture": "workflow_before",
+    },
+    {
+        "name": "na6 wholefile Edit of an absent workflow fails closed",
+        "group": "na6",
+        "tool": "Edit",
+        "input": {
+            "file_path": "{BOARD}/.github/workflows/tests.yml",
+            "old_string": SOLO_LINE_EXACT08_BEFORE,
+            "new_string": SOLO_LINES_EXACT08_AFTER,
+        },
+        "expect": "DENY",
+        "na": "NA-6",
+        "reason_contains": "not on disk",
+    },
+    {
+        "name": "na6 wholefile Edit whose old_string is not in the file fails closed",
+        "group": "na6",
+        "tool": "Edit",
+        "input": {
+            "file_path": "{BOARD}/.github/workflows/tests.yml",
+            "old_string": SOLO_LINE_253_BEFORE,
+            "new_string": SOLO_LINE_EXACT08_BEFORE,
+        },
+        "expect": "DENY",
+        "na": "NA-6",
+        "reason_contains": "old_string is not in",
+        "fixture": "workflow_solo",
+    },
+    {
+        "name": "na6 wholefile unreadable workflow fails closed",
+        "group": "na6",
+        "tool": "Write",
+        "input": {
+            "file_path": "{BOARD}/.github/workflows/tests.yml",
+            "content": WORKFLOW_SOLO_AFTER,
+        },
+        "expect": "DENY",
+        "na": "NA-6",
+        "reason_contains": "unreadable",
+        "fixture": "workflow_unreadable",
+    },
+    # --------------------------- #270 round 2: sol's r1 repros, re-judged under the tripwires
+    # B1 NEUTRALISATION.  The `run:`-header shape is master's DENY; the header-less body
+    # shapes are LIMIT rows (ALLOWED as on master): the hook does not judge execution, and
+    # the command-head and control-before-test rules of #270 are deliberately NOT carried.
+    _na6_edit(
+        "na6 r2 B1 echo of the shard invocation",
+        SOL_SHARD_RUN, SOL_SHARD_RUN.replace("run: ", "run: echo "), "DENY",
+        "net removal of a workflow test step: 'python -m",
+    ),
+    _na6_edit(
+        "na6 r2 B1 early return before the test",
+        SOL_UNITTEST, "          return\n" + SOL_UNITTEST, "ALLOW",
+    ),
+    _na6_edit(
+        "na6 r2 B1 exit LASTEXITCODE moved before the test",
+        SOL_UNITTEST + "          exit $LASTEXITCODE\n",
+        "          exit $LASTEXITCODE\n" + SOL_UNITTEST, "ALLOW",
+    ),
+    _na6_edit(
+        "na6 r2 B1 test line moved into a heredoc",
+        SOL_UNITTEST, "          cat <<'EOF'\n" + SOL_UNITTEST + "          EOF\n", "ALLOW",
+    ),
+    _na6_edit(
+        "na6 r2 B1 test line moved into a here-string",
+        SOL_UNITTEST, "          $doc = @'\n" + SOL_UNITTEST + "          '@\n", "ALLOW",
+    ),
+    _na6_edit(
+        "na6 r2 B1 echo of the test with the head count padded elsewhere",
+        SOL_UNITTEST,
+        "          echo python -m unittest discover -s tests\n          python -m pip --version\n",
+        "ALLOW",
+    ),
+    _na6_edit(
+        "na6 r2 B1 failing exit 1 before the test fails red and is allowed",
+        SOL_UNITTEST, "          exit 1\n" + SOL_UNITTEST, "ALLOW",
+    ),
+    # B2 CONDITIONS.  #270's condition rule (B2) is deliberately NOT carried: LIMIT rows.
+    _na6_edit(
+        "na6 r2 B2 step condition narrowed to workflow_dispatch",
+        SOL_GATE_IF,
+        SOL_GATE_IF.replace("'true'\n", "'true' && github.event_name == 'workflow_dispatch'\n"),
+        "ALLOW",
+    ),
+    _na6_edit(
+        "na6 r2 B2 step condition added to an unconditioned test step",
+        "      - name: Run repo hygiene unittest shard\n",
+        "      - name: Run repo hygiene unittest shard\n"
+        "        if: github.event_name == 'workflow_dispatch'\n",
+        "ALLOW",
+    ),
+    _na6_edit(
+        "na6 r2 B2 job condition added above a test step",
+        "  hygiene:\n    runs-on: windows-latest\n",
+        "  hygiene:\n    if: github.event_name == 'push'\n    runs-on: windows-latest\n",
+        "ALLOW",
+    ),
+    # The unnamed `- run:` step is folded into another step's body: its identity (its run
+    # body) no longer exists as a step, so T1 refuses it.
+    _na6_row(
+        "na6 r2 B2 test moved into a step with an if it did not have",
+        "Write",
+        {"file_path": "{BOARD}/.github/workflows/tests.yml",
+         "content": WORKFLOW_SOL_MOVED_UNDER_IF},
+        "DENY", "the step with run 'python -m pytest tools/repo_hygiene' runs 0", "workflow_sol",
+    ),
+    _na6_edit(
+        "na6 r2 B2 removing a step condition is allowed",
+        SOL_GATE_IF, "", "ALLOW",
+    ),
+    # B3 SHORTHAND -- `- run:` is a run key, inline and block.
+    _na6_row(
+        "na6 r2 B3 shorthand inline step replaced by a Write",
+        "Write",
+        {"file_path": "{BOARD}/.github/workflows/tests.yml",
+         "content": WORKFLOW_SOL_SHORTHAND_ECHO},
+        "DENY", "net removal", "workflow_sol",
+    ),
+    _na6_edit(
+        "na6 r2 B3 shorthand block step deleted",
+        SOL_SHORT_BLOCK, "", "DENY", "net removal",
+    ),
+    # An UNNAMED step is keyed by its run body, so ANY edit of that body is a lost step
+    # under T1 (a cost of the spec's keying, never a loosening: master ALLOWS this row).
+    # Name the step first, in its own edit, if its body must change.
+    _na6_edit(
+        "na6 r2 B3 shorthand step gains an argument",
+        SOL_SHORT_INLINE, SOL_SHORT_INLINE.replace("repo_hygiene", "repo_hygiene -q"), "DENY",
+        "the step with run 'python -m pytest tools/repo_hygiene' runs 0",
+    ),
+    # Hardening (b): composite actions -- master has no arm here; T1 and T2 cover them.
+    _na6_edit(
+        "na6 r2 composite action echo of its test",
+        "      run: python -m unittest discover\n",
+        "      run: echo python -m unittest discover\n",
+        "DENY", "the step with run 'python -m unittest discover' runs 0", "action_before",
+        "{BOARD}/.github/actions/check-suite/action.yml",
+    ),
+    _na6_edit(
+        "na6 r2 composite action gains an argument",
+        "      run: python -m unittest discover\n",
+        "      run: python -m unittest discover -v\n",
+        "DENY", "the step with run 'python -m unittest discover' runs 0", "action_before",
+        "{BOARD}/.github/actions/check-suite/action.yml",
+    ),
+    _na6_row(
+        "na6 r2 shell read of a workflow is allowed",
+        "Bash", {"command": "cat .github/workflows/tests.yml"}, "ALLOW",
+    ),
+    _na6_row(
+        "na6 r2 shell git diff of the workflows is allowed",
+        "Bash", {"command": "git diff -- .github/workflows/tests.yml"}, "ALLOW",
+    ),
+    # ------------------- NA6-TRIPWIRES-1 acceptance table, on the REAL tests.yml
+    #
+    # READS NEVER REFUSED.  A read of a workflow beside a redirect to elsewhere, or to a
+    # null device in either shell's spelling, is the HOOK-FALSE-POSITIVE-1 class #270 broke.
+    _na6_real("read cat with stderr to dev-null", "Bash",
+              {"command": "cat " + WF + " 2>/dev/null"}, "ALLOW"),
+    _na6_real("read git show into base.yml", "Bash",
+              {"command": "git show HEAD:" + WF + " > base.yml"}, "ALLOW"),
+    _na6_real("read git diff into a patch", "Bash",
+              {"command": "git diff -- " + WF + " > wf.patch"}, "ALLOW"),
+    _na6_real("read ls workflows with stderr to dev-null", "Bash",
+              {"command": "ls .github/workflows 2>/dev/null"}, "ALLOW"),
+    _na6_real("read Get-Content piped to Out-File", "PowerShell",
+              {"command": "Get-Content " + WF + " | Out-File out.txt"}, "ALLOW"),
+    _na6_real("read cat with a PowerShell null redirect", "PowerShell",
+              {"command": "cat " + WF + " 2>$null"}, "ALLOW"),
+    _na6_real("read git show with a PowerShell null redirect", "PowerShell",
+              {"command": "git show HEAD:" + WF + " 2>$null"}, "ALLOW"),
+    _na6_real("read git diff with a PowerShell null redirect", "PowerShell",
+              {"command": "git diff -- " + WF + " > $null"}, "ALLOW"),
+    _na6_real("read ls workflows with a PowerShell null redirect", "PowerShell",
+              {"command": "ls .github/workflows 2>$null"}, "ALLOW"),
+    _na6_real("read Get-Content with a PowerShell null redirect to Out-File", "PowerShell",
+              {"command": "Get-Content " + WF + " 2>$null | Out-File out.txt"}, "ALLOW"),
+    _na6_real("read copying a workflow out", "Bash",
+              {"command": "cp " + WF + " base.yml"}, "ALLOW"),
+    _na6_real("read deleting something else beside a workflow read", "Bash",
+              {"command": "rm -f wf.patch; cat " + WF + " 2>/dev/null"}, "ALLOW"),
+    # WRITES THAT LOSE NOTHING.
+    _na6_real_write("identical Write", REAL_TESTS_YML, "ALLOW"),
+    _na6_real_write("Write adding only a comment line",
+                    "# NA6-TRIPWIRES-1 probe: a comment adds nothing\n" + REAL_TESTS_YML, "ALLOW"),
+    _na6_real_edit("exact08 single-line Edit (the 269 change)",
+                   PRE_269_SOLO_LINE, REAL_EXACT08_BLOCK, "ALLOW", fixture="real_pre269"),
+    _na6_real_write("exact08 whole-file Write (the 269 change)",
+                    REAL_TESTS_YML, "ALLOW", fixture="real_pre269"),
+    # LIMIT rows: ALLOWED exactly as on master.  The hook does not judge whether a test
+    # still executes; review keys and the hosted coverage check own these.
+    _na6_real_edit("LIMIT single-line Split filter narrowing",
+                   REAL_FILTER_LINE,
+                   REAL_FILTER_LINE.replace("$($shard.Filter)", REAL_SPLIT_FILTER), "ALLOW"),
+    _na6_real_edit("LIMIT single-line Select-Object First 1",
+                   REAL_MYSHARDS_LINE,
+                   REAL_MYSHARDS_LINE.replace("-eq $part })", REAL_SELECT_FIRST), "ALLOW"),
+    _na6_real_edit("LIMIT deleting the interior testsPerShard line", REAL_TPS_LINE, "", "ALLOW"),
+    _na6_real("LIMIT git checkout of a workflow from a ref", "Bash",
+              {"command": "git checkout HEAD~1 -- " + WF}, "ALLOW"),
+    # SHELL PARITY (hub ruling, PR #274 r2).  NA6-TRIPWIRES-1 has NO shell arm: every
+    # round of the dropped T3 produced a new false positive (quoted patterns, backups,
+    # data operands, comments), so shell payloads are judged EXACTLY as on fork/master.
+    # These are T3's former DENY payloads and the false positives the reviews found;
+    # `Na6DifferentialTests` asserts each one's verdict AND stderr equal master's.
+    # Shell writes to CI manifests are card NA6-INDIRECT-SHELL-WRITERS-1 (CI-side).
+    *[
+        _na6_real("shell parity " + name, tool, {"command": command}, "ALLOW")
+        for name, tool, command in NA6_SHELL_PARITY
+    ],
+    # T1: a step that existed is gone.
+    _na6_real_write("Write dropping the pipeline_tests step", REAL_WITHOUT_PIPE_STEP, "DENY",
+                    "the step with name 'Run pipeline_tests --check-golden (bounded shards)' "
+                    "runs 0"),
+    _na6_real_edit("Edit deleting a uses step", REAL_CHECKOUT_STEP, "", "DENY",
+                   "the step with uses 'actions/checkout@"),
+    _na6_edit("na6 tripwires Edit deleting a shorthand run step", SOL_SHORT_INLINE, "", "DENY",
+              "the step with run 'python -m pytest tools/repo_hygiene' runs 0"),
+    # T2: a skip/neutralise marker appended to an interior body line.
+    _na6_real_edit("appending exit 0 to an interior body line",
+                   REAL_FILTER_LINE, REAL_FILTER_LINE.replace("\n", "; exit 0\n"), "DENY",
+                   "`exit 0` added"),
+    _na6_real_edit("appending or-true to an interior body line",
+                   REAL_TPS_LINE, REAL_TPS_LINE.replace("\n", " || true\n"), "DENY",
+                   "`|| true` added"),
+    # MASTER PARITY: the header-spanning shapes master's fragment predicate refuses, which
+    # #270 had loosened.  Master's rule runs first, so its line is the one printed.
+    _na6_real_edit("header-spanning uncalled-function wrap",
+                   REAL_HEAD_TO_FOREACH_END,
+                   REAL_HEAD_TO_FOREACH_END.replace(
+                       REAL_FOREACH_BLOCK,
+                       "          function Invoke-SkippedShards {\n" + REAL_FOREACH_BLOCK
+                       + "          }\n",
+                   ),
+                   "DENY", "net removal of a workflow test step: '"),
+    _na6_real_edit("header-spanning Split filter narrowing",
+                   REAL_HEAD_TO_FILTER,
+                   REAL_HEAD_TO_FILTER.replace("$($shard.Filter)\")", REAL_SPLIT_FILTER + "\")"),
+                   "DENY", "net removal of a workflow test step: '"),
+    _na6_real_edit("header-spanning Select-Object First 1",
+                   REAL_HEAD_TO_MYSHARDS,
+                   REAL_HEAD_TO_MYSHARDS.replace("-eq $part })", REAL_SELECT_FIRST),
+                   "DENY", "net removal of a workflow test step: '"),
     # -------------------------------- NA-3's `claude auth` arm, bounded by the REGISTER
     #
     # `never-authorized.json` v21 NA-3 names `claude auth login|logout`, not `claude auth`.
@@ -4547,6 +5248,60 @@ def fixture_existing_ledger(paths):
     return {}
 
 
+def _board_workflow(paths):
+    return os.path.join(paths["BOARD"], ".github", "workflows", "tests.yml")
+
+
+def fixture_workflow_before(paths):
+    """NA6-WORKFLOW-WHOLEFILE-1: the arm judges the whole file, so it must exist."""
+    _write(_board_workflow(paths), WORKFLOW_BEFORE)
+    return {}
+
+
+def fixture_workflow_solo(paths):
+    _write(_board_workflow(paths), WORKFLOW_SOLO_BEFORE)
+    return {}
+
+
+def fixture_workflow_253(paths):
+    _write(_board_workflow(paths), WORKFLOW_253_BEFORE)
+    return {}
+
+
+def fixture_workflow_sol(paths):
+    _write(_board_workflow(paths), WORKFLOW_SOL)
+    return {}
+
+
+def fixture_action_before(paths):
+    _write(
+        os.path.join(paths["BOARD"], ".github", "actions", "check-suite", "action.yml"),
+        ACTION_BEFORE,
+    )
+    return {}
+
+
+def fixture_real_tests(paths):
+    """NA6-TRIPWIRES-1: this checkout's REAL tests.yml on the tmp board."""
+    _write(_board_workflow(paths), REAL_TESTS_YML)
+    return {}
+
+
+def fixture_real_pre269(paths):
+    """NA6-TRIPWIRES-1: the real tests.yml with the #269 (exact08) change undone."""
+    _write(_board_workflow(paths), REAL_PRE_269)
+    return {}
+
+
+def fixture_workflow_unreadable(paths):
+    """A workflow whose bytes are not UTF-8: the comparison cannot be made, so DENY."""
+    path = _board_workflow(paths)
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    with open(path, "wb") as handle:
+        handle.write(b"jobs:\n  t:\n    steps:\n      - run: \xff\xfe\xfa pytest\n")
+    return {}
+
+
 def fixture_lane_prompt_unset(paths):
     """THE UNRESOLVABLE-REFERENCE ROWS: `MLV_LANE_PROMPT` bound to NOTHING, stated explicitly.
 
@@ -5377,6 +6132,16 @@ FIXTURES = {
     "existing_receipt": fixture_existing_receipt,
     # HOOK-FALSE-POSITIVE-1
     "existing_ledger": fixture_existing_ledger,
+    # NA6-WORKFLOW-WHOLEFILE-1
+    "workflow_before": fixture_workflow_before,
+    "workflow_solo": fixture_workflow_solo,
+    "workflow_253": fixture_workflow_253,
+    "workflow_unreadable": fixture_workflow_unreadable,
+    "workflow_sol": fixture_workflow_sol,
+    "action_before": fixture_action_before,
+    # NA6-TRIPWIRES-1
+    "real_tests": fixture_real_tests,
+    "real_pre269": fixture_real_pre269,
     # The UNSET half of the expansion pairs, and the unresolvable-reference rows.
     "lane_prompt_unset": fixture_lane_prompt_unset,
     "board_root_unset": fixture_board_root_unset,
@@ -5633,7 +6398,7 @@ class MlvNeverAuthorizedHookTests(unittest.TestCase):
             }
         )
 
-    def _invoke(self, stdin_text, overrides):
+    def _invoke(self, stdin_text, overrides, hook=HOOK):
         env = dict(os.environ)
         for key in list(env):
             if key.startswith("MLV_"):
@@ -5658,7 +6423,7 @@ class MlvNeverAuthorizedHookTests(unittest.TestCase):
             env.pop(key, None)
         env.update(overrides)
         env["PYTHONIOENCODING"] = "utf-8"
-        argv = [sys.executable, HOOK]
+        argv = [sys.executable, hook]
         if venue is not None:
             argv += ["--project-dir", venue]
         completed = subprocess.run(
@@ -7929,6 +8694,264 @@ class OwnerConsentedFootageTests(unittest.TestCase):
         self.assertIn("tools/gates/verify_consented_footage.py", na10[0]["act"])
 
 
+# NA6-WORKFLOW-WHOLEFILE-1: one example per skip/neutralise marker, keyed by the hook's OWN
+# label, so a marker added to or dropped from `_NA6_WORKFLOW_MARKERS` without a row here
+# goes red (`test_every_marker_has_an_example`).
+NA6_MARKER_EXAMPLES = {
+    "continue-on-error": "      - name: t\n        continue-on-error: true\n        run: pytest\n",
+    "`|| true`": "      - run: pytest || true\n",
+    "`|| :`": "      - run: pytest || :\n",
+    "`exit 0`": "      - run: pytest; exit 0\n",
+    "`[Environment]::Exit(0)`": "      - run: pytest; [Environment]::Exit(0)\n",
+    "`$LASTEXITCODE = 0`": "      - run: |\n          pytest\n          $global:LASTEXITCODE = 0\n",
+    "`set +e`": "      - run: |\n          set +e\n          pytest\n",
+    "`$ErrorActionPreference = Continue`": (
+        "      - run: |\n          $ErrorActionPreference = 'SilentlyContinue'\n          pytest\n"
+    ),
+    "`-SkipTest`": "      - run: pytest; ./build.ps1 -SkipTests\n",
+    "a negative --gtest_filter": "      - run: pytest; ./t --gtest_filter=Suite.*:-Suite.Slow\n",
+    "GTEST_FILTER": "      - run: pytest\n        env:\n          GTEST_FILTER: Foo.*\n",
+    "`if: false`": "      - name: t\n        if: ${{ false }}\n        run: pytest\n",
+    "QSKIP": "      - run: pytest; echo QSKIP\n",
+    "pytest --deselect": "      - run: pytest --deselect tests/a.py::t\n",
+    "pytest `-k not`": "      - run: pytest -k \"not slow\"\n",
+    "ctest --exclude-regex": "      - run: pytest; ctest --exclude-regex Slow\n",
+    "ctest -E": "      - run: pytest; ctest --output-on-failure -E Slow\n",
+    "`if ($false)`": "      - run: pytest; if ($false) { ./t }\n",
+    "`if false`": "      - run: pytest; if false; then ./t; fi\n",
+}
+NA6_MARKER_BASE = "jobs:\n  t:\n    steps:\n      - run: pytest\n"
+
+
+class Na6WorkflowWholeFileMarkerTests(unittest.TestCase):
+    """NA6-TRIPWIRES-1 T2 (marker table from #270, NA6-WORKFLOW-WHOLEFILE-1): every marker
+    DENIES when added and ALLOWS when already there.
+
+    The predicate is a COUNT comparison on the whole file with comments stripped, so the
+    ALLOW half is the same text on both sides -- a marker that was there before is not
+    this edit's weakening -- and the comment row proves prose about a marker is not one.
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        cls.module = _load_hook_module()
+
+    def _judge(self, before, after):
+        self.module._na6_judge_whole_file(before, after, ".github/workflows/t.yml")
+
+    def test_every_marker_has_an_example(self):
+        labels = [label for label, _ in self.module._NA6_WORKFLOW_MARKERS]
+        self.assertEqual(sorted(labels), sorted(NA6_MARKER_EXAMPLES))
+
+    def test_a_marker_named_in_a_comment_is_not_a_marker(self):
+        after = NA6_MARKER_BASE + "      # never append || true or exit 0 here\n"
+        self._judge(NA6_MARKER_BASE, after)
+
+    def test_an_added_test_is_not_a_removal(self):
+        named = NA6_MARKER_BASE.replace("- run: pytest", "- name: t\n        run: pytest")
+        self._judge(named, named.replace("pytest", "pytest tests extra"))
+        self._judge(NA6_MARKER_BASE, NA6_MARKER_BASE + "      - run: ctest\n")
+
+    def test_a_reordered_body_with_the_same_tokens_is_allowed(self):
+        before = NA6_MARKER_BASE + "      - run: ctest --output-on-failure\n"
+        after = (
+            "jobs:\n  t:\n    steps:\n      - run: ctest --output-on-failure\n"
+            "      - run: pytest\n"
+        )
+        self._judge(before, after)
+
+
+def _make_marker_tests(label, example):
+    def denies(self):
+        with self.assertRaises(self.module.Deny) as caught:
+            self._judge(NA6_MARKER_BASE, NA6_MARKER_BASE + example)
+        self.assertIn(label, str(caught.exception.args))
+
+    def allows_when_already_present(self):
+        self._judge(NA6_MARKER_BASE + example, NA6_MARKER_BASE + example)
+
+    # Round 2 (sol r1 hardening a): the comparison is STRICTLY greater-than.  A `!=` or
+    # `>=` mutant fails one of these three.  Asserted on the hook's own marker comparison,
+    # because removing the example's step from a whole file also removes its tokens.
+    def transitions(self):
+        added = self.module._na6_added_marker
+        self.assertIsNone(added(NA6_MARKER_BASE + example, NA6_MARKER_BASE), "removal")
+        self.assertIsNone(
+            added(NA6_MARKER_BASE + example + example, NA6_MARKER_BASE + example), "2 -> 1"
+        )
+        self.assertIsNone(added(NA6_MARKER_BASE + example, NA6_MARKER_BASE + example), "1 -> 1")
+        self.assertEqual(
+            added(NA6_MARKER_BASE + example, NA6_MARKER_BASE + example + example), label, "1 -> 2"
+        )
+        self.assertEqual(added(NA6_MARKER_BASE, NA6_MARKER_BASE + example), label, "0 -> 1")
+
+    return denies, allows_when_already_present, transitions
+
+
+for _index, (_label, _example) in enumerate(NA6_MARKER_EXAMPLES.items()):
+    _deny, _allow, _transitions = _make_marker_tests(_label, _example)
+    _stem = "%02d_%s" % (_index, re.sub(r"[^a-z0-9]+", "_", _label.lower()).strip("_"))
+    setattr(Na6WorkflowWholeFileMarkerTests, "test_marker_added_denies_" + _stem, _deny)
+    setattr(Na6WorkflowWholeFileMarkerTests, "test_marker_kept_allows_" + _stem, _allow)
+    setattr(Na6WorkflowWholeFileMarkerTests, "test_marker_transitions_" + _stem, _transitions)
+
+
+class Na6TripwireStepKeyTests(unittest.TestCase):
+    """NA6-TRIPWIRES-1 T1: the step identities the whole-file survival check compares."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.module = _load_hook_module()
+
+    def test_na6_real_workflow_needles_resolve(self):
+        """Every needle of the acceptance table is in tests.yml, and each Edit needle is
+        unique -- so no row passes on a fail-closed refusal for the wrong reason."""
+        for needle in NA6_REAL_NEEDLES:
+            self.assertNotIn("<<NA6 needle missing", needle)
+            self.assertEqual(REAL_TESTS_YML.count(needle), 1, needle[:120])
+        self.assertNotEqual(REAL_PRE_269, REAL_TESTS_YML)
+        self.assertNotEqual(REAL_WITHOUT_PIPE_STEP, REAL_TESTS_YML)
+
+    def test_every_step_of_the_real_workflows_is_counted(self):
+        """Each `- ` item under a `steps:` key of every tracked workflow is a step with run:
+        or uses:, so the parser must count exactly as many as there are items."""
+        workflows = os.path.join(REPO_ROOT, ".github", "workflows")
+        for name in sorted(os.listdir(workflows)):
+            with open(os.path.join(workflows, name), "r", encoding="utf-8") as handle:
+                text = handle.read()
+            items = len(re.findall(r"(?m)^[ \t]+- (?:name|uses|run):", text))
+            found = sum(self.module._na6_step_keys(text).values())
+            self.assertEqual(found, items, name)
+
+    def test_keys_are_name_then_run_then_uses_as_a_multiset(self):
+        text = (
+            "jobs:\n  a:\n    steps:\n"
+            "      - uses: actions/checkout@v5\n        with:\n          fetch-depth: 0\n"
+            "      - uses: actions/checkout@v5\n"
+            "      - name: Tests\n        run: |\n          pytest\n          ctest\n"
+            "      - run: python -m flake8   # lint\n"
+            "      - shell: bash\n        run: >-\n          make\n          check\n"
+            "      - name: no step body\n        with:\n          x: 1\n"
+            "steps:\n- run: top-level compact\n"
+        )
+        self.assertEqual(
+            self.module._na6_step_keys(text),
+            {
+                ("uses", "actions/checkout@v5"): 2,
+                ("name", "Tests"): 1,
+                ("run", "python -m flake8"): 1,
+                ("run", "make check"): 1,
+                ("run", "top-level compact"): 1,
+            },
+        )
+
+    def test_a_moved_step_survives_and_a_lost_duplicate_does_not(self):
+        before = (
+            "jobs:\n  a:\n    steps:\n      - name: T\n        run: pytest\n"
+            "  b:\n    steps:\n      - uses: x/y@1\n      - uses: x/y@1\n"
+        )
+        moved = (
+            "jobs:\n  b:\n    steps:\n      - uses: x/y@1\n      - uses: x/y@1\n"
+            "  c:\n    steps:\n      - name: T\n        run: pytest -q\n"
+        )
+        self.module._na6_judge_whole_file(before, moved, "w.yml")
+        with self.assertRaises(self.module.Deny):
+            self.module._na6_judge_whole_file(
+                before, before.replace("      - uses: x/y@1\n", "", 1), "w.yml"
+            )
+
+
+def _na6_baseline_hook():
+    """-> (ref, bytes) of the BASELINE hook for the differential, or (None, None).
+
+    The baseline is master: ``MLV_NA6_BASELINE_REF`` if set, else the first of
+    ``refs/remotes/fork/master`` (the board checkout) and ``refs/remotes/origin/master``
+    (a hosted checkout, fetch-depth 0) that resolves."""
+    refs = [
+        os.environ.get("MLV_NA6_BASELINE_REF"),
+        "refs/remotes/fork/master",
+        "refs/remotes/origin/master",
+    ]
+    for ref in refs:
+        if not ref:
+            continue
+        try:
+            completed = subprocess.run(
+                ["git", "-C", REPO_ROOT, "show", ref + ":tools/hooks/mlv-never-authorized.py"],
+                capture_output=True,
+            )
+        except OSError:
+            return None, None
+        if completed.returncode == 0 and completed.stdout:
+            return ref, completed.stdout
+    return None, None
+
+
+class Na6DifferentialTests(unittest.TestCase):
+    """NA6-TRIPWIRES-1: MONOTONE AGAINST MASTER, MEASURED.  Every `na6` table row runs
+    through master's hook AND this hook via the real CLI; a row master DENIES that this
+    hook ALLOWS is a loosening and fails.  One method per row (see the module docstring)."""
+
+    maxDiff = None
+    setUp = MlvNeverAuthorizedHookTests.setUp
+    _substitute = MlvNeverAuthorizedHookTests._substitute
+    _render_content = MlvNeverAuthorizedHookTests._render_content
+    _bind_the_enable_literal = MlvNeverAuthorizedHookTests._bind_the_enable_literal
+    _invoke = MlvNeverAuthorizedHookTests._invoke
+
+    @classmethod
+    def setUpClass(cls):
+        cls.baseline_ref, text = _na6_baseline_hook()
+        cls.baseline_root = tempfile.mkdtemp(prefix="mlv-na6-base-")
+        cls.baseline_hook = os.path.join(
+            cls.baseline_root, "tools", "hooks", "mlv-never-authorized.py"
+        )
+        if text is not None:
+            os.makedirs(os.path.dirname(cls.baseline_hook))
+            with open(cls.baseline_hook, "wb") as handle:
+                handle.write(text)
+
+    @classmethod
+    def tearDownClass(cls):
+        shutil.rmtree(cls.baseline_root, True)
+
+    def _differential(self, case):
+        if self.baseline_ref is None:
+            self.skipTest("no baseline master ref resolves (set MLV_NA6_BASELINE_REF)")
+        overrides = FIXTURES[case.get("fixture", "default")](self.paths)
+        self._bind_the_enable_literal()
+        stdin_text = json.dumps(
+            {
+                "tool_name": case["tool"],
+                "tool_input": self._render_content(self._substitute(case["input"])),
+            }
+        )
+        base = self._invoke(stdin_text, overrides, hook=self.baseline_hook)
+        new = self._invoke(stdin_text, overrides)
+        self.assertIn(base.returncode, (0, 2), "baseline: %r" % base.stderr)
+        self.assertIn(new.returncode, (0, 2), "new: %r" % new.stderr)
+        self.assertFalse(
+            base.returncode == 2 and new.returncode == 0,
+            "LOOSENING vs %s on row %r: master %r, this hook ALLOWS"
+            % (self.baseline_ref, case["name"], base.stderr.strip()),
+        )
+        # No shell arm: a shell payload's verdict and line must be master's, exactly.
+        if case["tool"] in ("Bash", "PowerShell"):
+            self.assertEqual(
+                (new.returncode, new.stderr.strip()),
+                (base.returncode, base.stderr.strip()),
+                "shell row %r differs from %s" % (case["name"], self.baseline_ref),
+            )
+
+
+def _make_differential(case):
+    def method(self):
+        self._differential(case)
+
+    method.__doc__ = "%s -> never looser than master" % case["name"]
+    return method
+
+
 def _slug(name):
     return re.sub(r"[^a-z0-9]+", "_", name.lower()).strip("_")
 
@@ -7948,6 +8971,8 @@ for _case in CASES:
         raise RuntimeError("duplicate table row name: %s" % _case["name"])
     _seen.add(_name)
     setattr(MlvNeverAuthorizedHookTests, _name, _make_test(_case))
+    if _case.get("group") == "na6":
+        setattr(Na6DifferentialTests, _name, _make_differential(_case))
 
 
 if __name__ == "__main__":
