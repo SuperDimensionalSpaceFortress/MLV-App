@@ -352,6 +352,27 @@ TEST(GpuDualIsoPreviewScale, ReducedTextureRouteReconstructsTheReducedBayer)
     }
     ASSERT_EQ(0, llrpGpuPlaybackReconRetainedOutstandingCount());
     ASSERT_EQ(0, llrpFakeGpuBackendFreedInUseRetainedForTesting());
+
+    // Inside the playback preview envelope the reduced recon is prepared with the
+    // x1 playback hint (it is the x1 recon of a smaller image; the fullres mesh
+    // guard keys on hint 1), never with the preview scale: the first Bachelor
+    // leg showed the 4-row ISO mesh with the scale passed through.
+    {
+        const int previousMode = processingPlaybackPreviewModeEnabled();
+        const int previousScale = processingPlaybackPreviewScaleFactor();
+        processingSetPlaybackPreviewMode(1);
+        processingSetPlaybackPreviewScaleFactor(4);
+        fixture.video()->playback_scale_factor_active = 4;
+        GpuReducedFrame frame;
+        const bool ran = gpuReducedFrame(fixture, 1, 4, &frame);
+        llrpGpuPlaybackReconState_t prepared = {};
+        const int havePrepared = llrpGpuPlaybackReconGetLastPreparedState(&prepared);
+        processingSetPlaybackPreviewScaleFactor(previousScale);
+        processingSetPlaybackPreviewMode(previousMode);
+        ASSERT_TRUE(ran);
+        ASSERT_NE(0, havePrepared);
+        ASSERT_EQ(1, prepared.playback_preview_scale_factor);
+    }
     const SharedDualIsoState after = sharedState(fixture);
     ASSERT_EQ(settled.pattern, after.pattern);
     ASSERT_EQ(settled.autoCorrection, after.autoCorrection);

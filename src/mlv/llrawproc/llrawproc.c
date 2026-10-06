@@ -4794,6 +4794,11 @@ static int llrawproc_with_dims_gpu_playback_texture(mlvObject_t * video,
     }
 
     const uint64_t frame_index = mlv_pipeline_capture_get_current_frame();
+    /* The reduced Bayer is reconstructed at its own size and presented without a
+     * further downscale: it is the x1 recon of a smaller image, so it takes the
+     * x1 playback hint (which arms the fullres mesh guard). Passing the preview
+     * scale here left the 4-row ISO mesh in flat areas on the first venue leg. */
+    const int playback_hint = processingPlaybackPreviewModeEnabled() ? 1 : 0;
     memset(&gpu_playback_state, 0, sizeof(gpu_playback_state));
     if (!diso_prepare_gpu_recon_state(raw_info,
                                       raw_image_buff,
@@ -4808,11 +4813,7 @@ static int llrawproc_with_dims_gpu_playback_texture(mlvObject_t * video,
                                       diso_alias_map,
                                       diso_frblending,
                                       chroma_smooth_mode,
-                                      processingPlaybackPreviewModeEnabled()
-                                          ? ((video && video->playback_scale_factor_active > 0)
-                                              ? video->playback_scale_factor_active
-                                              : processingPlaybackPreviewScaleFactor())
-                                          : 0,
+                                      playback_hint,
                                       llrawproc_threads,
                                       &worker->diso_full20bit_scratch,
                                       &gpu_playback_state))
