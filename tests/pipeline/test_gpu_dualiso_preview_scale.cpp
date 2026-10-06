@@ -21,6 +21,14 @@
 // (debayer_reduced_hnyquist121_rgb16, ported line for line to the CUDA AMaZE backend,
 // switched by the optional igpu_amaze_debayer_set_reduced_hnyquist symbol); T3 emulates
 // it on the reduced presentation's RGB16 and adds L8 (column Nyquist) and L9.
+// r4: the comb's source is the shrink. The Phase 4B decimators sample off-site (x4 G
+// -0.875 px in columns, rows -0.375..-2.625 px), so Gr and Gb disagree on any vertical
+// brightness change and AMaZE renders that as a 2-column comb. The GPU plan now shrinks
+// with pl_downsample_bayer_to_bayer_phase_tent (same-colour, same-ISO-row tent bins on the
+// correct sites; T11-T13), the CPU plan keeps its decimators byte for byte, and the r3
+// filter is off (kReducedHnyquistOnReducedPresents = 0; T7-T9 keep its C reference). T3
+// grades the route (CPU AMaZE, as at the venue) against ref_bin, the full-res recon
+// tent-binned to the reduced size; the box reference's figures are reported only.
 // The pixel parity of the real CUDA kernels at reduced dims ((c1), (c2)) is a venue
 // proof; see the PR.
 #include "../common/minitest.h"
@@ -31,9 +39,12 @@
 #include "../../src/mlv/pipeline_stage_capture.h"
 #include "../../src/processing/raw_processing.h"
 #include "../../src/debayer/debayer.h"
+#include "../../src/processing/playback_downsample.h"
+#include "../../platform/qt/PlaybackScaling.h"
 
 #include <QDir>
 
+#include <algorithm>
 #include <cmath>
 #include <cstdint>
 #include <cstdio>
@@ -570,19 +581,29 @@ double lag2HorizontalLumaDetail(const std::vector<uint8_t> & rgb, int w, int h)
 // ReconnedRaw16's steps (debayerBasicU16, last-row padding, applyProcessingObject8) with
 // the reduced H-Nyquist filter on the RGB16 between debayer and processing, as the CUDA
 // AMaZE backend applies it before its WB-undo pack. Call after that function has run for
-// this frame (it syncs the processing levels); with hnyquist=false the output equals it.
+// this frame (it syncs the processing levels); with hnyquist=false and amaze=false the
+// output equals it. r4: amaze=true debayers with the CPU AMaZE, as the venue route does.
 std::vector<uint8_t> emulateReducedPresent(MlvPipelineFixture & fixture,
                                            uint64_t frame,
                                            const std::vector<uint16_t> & bayer,
                                            int reducedWidth,
                                            int reducedHeight,
                                            int outHeight,
-                                           bool hnyquist)
+                                           bool hnyquist,
+                                           bool amaze = false)
 {
     const size_t rowWords = static_cast<size_t>(reducedWidth) * 3u;
     std::vector<uint16_t> work(bayer);
     std::vector<uint16_t> rgb(rowWords * static_cast<size_t>(outHeight), 0u);
-    debayerBasicU16(rgb.data(), work.data(), reducedWidth, reducedHeight, 1, 0);
+    if (amaze)
+    {
+        std::vector<float> f(work.begin(), work.end());
+        if (debayerAmaze(rgb.data(), f.data(), reducedWidth, reducedHeight, 1, 0) != 1) return {};
+    }
+    else
+    {
+        debayerBasicU16(rgb.data(), work.data(), reducedWidth, reducedHeight, 1, 0);
+    }
     for (int y = reducedHeight; y < outHeight; ++y)
         std::memcpy(rgb.data() + static_cast<size_t>(y) * rowWords,
                     rgb.data() + static_cast<size_t>(reducedHeight - 1) * rowWords,
@@ -634,6 +655,69 @@ std::vector<uint16_t> alternatingBayer(int w, int h, int amp)
         }
     return bayer;
 }
+
+// r4 ref_bin's shrink: a same-colour tent bin of a full-res (reconstructed, so no ISO
+// rows) Bayer16, rows and columns both by class mod 2, centred on t = S*o + (S-1)/2 with
+// radius S; an out-of-range tap reads the nearest in-range sample of its class.
+std::vector<uint16_t> sameColourTentBin(const std::vector<uint16_t> & full, int fullW, int fullH,
+                                        int scale, int outW, int outH)
+{
+    auto taps = [scale](int o, int limit) {
+        std::vector<std::pair<int, double>> t;
+        const double target = scale * o + (scale - 1) / 2.0;
+        for (int s = static_cast<int>(target) - scale - 2; s <= static_cast<int>(target) + scale + 2; ++s)
+        {
+            if (((s % 2) + 2) % 2 != o % 2) continue;
+            const double d = std::fabs(s - target);
+            if (d >= scale) continue;
+            int c = s;
+            while (c < 0) c += 2;
+            while (c >= limit) c -= 2;
+            t.push_back({ c, scale - d });
+        }
+        return t;
+    };
+    std::vector<uint16_t> out(static_cast<size_t>(outW) * outH);
+    for (int y = 0; y < outH; ++y)
+    {
+        const auto ry = taps(y, fullH);
+        for (int x = 0; x < outW; ++x)
+        {
+            const auto rx = taps(x, fullW);
+            double sum = 0.0, wsum = 0.0;
+            for (const auto & ty : ry)
+                for (const auto & tx : rx)
+                {
+                    sum += ty.second * tx.second
+                         * full[static_cast<size_t>(ty.first) * fullW + static_cast<size_t>(tx.first)];
+                    wsum += ty.second * tx.second;
+                }
+            out[static_cast<size_t>(y) * outW + x] = static_cast<uint16_t>(std::lround(sum / wsum));
+        }
+    }
+    return out;
+}
+
+// The playback hint the reduced route reconstructs with (x1; see the route test above).
+struct X1PlaybackHint
+{
+    explicit X1PlaybackHint(mlvObject_t * v)
+        : video(v), mode(processingPlaybackPreviewModeEnabled()),
+          scale(processingPlaybackPreviewScaleFactor()), active(v->playback_scale_factor_active)
+    {
+        processingSetPlaybackPreviewMode(1);
+        processingSetPlaybackPreviewScaleFactor(1);
+        video->playback_scale_factor_active = 1;
+    }
+    ~X1PlaybackHint()
+    {
+        processingSetPlaybackPreviewScaleFactor(scale);
+        processingSetPlaybackPreviewMode(mode);
+        video->playback_scale_factor_active = active;
+    }
+    mlvObject_t * video;
+    int mode, scale, active;
+};
 } // namespace
 
 // T1: the notch's response at the 4-row period is exactly zero, edges included
@@ -695,12 +779,18 @@ TEST(GpuDualIsoPreviewScale, NotchKeepsColourPlanesSeparate)
     ASSERT_TRUE(out == stepWant);
 }
 
-// T3 (L1-L4, L8, L9): the CPU reduced recon (CUDA matches it, c1) plus the C reference
-// notch, presented through the reduced consumer with the C reference H-Nyquist filter on
-// its RGB16 (emulateReducedPresent), against the full-res route's output box-downsampled
-// to the same dims. Thresholds pre-registered by the r3 design review (L3 0.85 retired:
-// L3a >= 0.875 x the same route with notch and H-filter off, L3b >= 0.78 x ref). The
-// frame without the notch and filter is printed for the record.
+// T3 (r4 gates, pre-registered by the r4 design review). E, the route emulation: the CPU
+// reduced recon (CUDA matches it, c1) on the phase-tent shrink, plus the C reference notch,
+// debayered by the CPU AMaZE (as the venue's CUDA AMaZE does) and presented through the
+// reduced consumer's processing, with the C reference H-Nyquist filter on its RGB16 iff
+// kReducedHnyquistOnReducedPresents is 1. ref_bin, the ideal reduced preview: the full-res
+// CPU recon (x1 hint) tent-binned by colour (sameColourTentBin), then the same AMaZE and
+// processing. ref_box: the full-res route's output box-downsampled (the r1b-r3 reference).
+// Gated: L1 row-p4 <= 0.02; L2 col-p4 <= 3 x ref_box + 0.02; L3r lag-4 >= 0.85 x ref_bin;
+// L9r lag-2 >= 0.90 x ref_bin; L4 channel means within 0.02 of ref_bin; L8 colNyq <=
+// 2 x ref_bin + 0.002. Reported only: L3a, L3b and L9 against ref_box, the same metrics
+// through debayerBasicU16, the old decimator's route, and M-L6 (ref_bin / ref_box channel
+// means, the Jensen account of the venue's +3-4 % R).
 TEST(GpuDualIsoPreviewScale, ReducedReconWithNotchMatchesReference)
 {
     GpuReconEnv env(false);
@@ -712,75 +802,144 @@ TEST(GpuDualIsoPreviewScale, ReducedReconWithNotchMatchesReference)
     ASSERT_FALSE(fixture.renderFrame8(0).empty());
     const std::vector<uint8_t> fullFrame = fixture.renderFrame8(2);
     ASSERT_FALSE(fullFrame.empty());
+    mlvObject_t * video = fixture.video();
+
+    // The full-res CPU recon at the x1 hint, for ref_bin.
+    std::vector<uint16_t> fullRecon = decodeRaw(fixture, 2);
+    ASSERT_FALSE(fullRecon.empty());
+    {
+        const X1PlaybackHint hint(video);
+        WorkerState worker;
+        applyLLRawProcObjectWorker(video, fullRecon.data(), fullRecon.size() * sizeof(uint16_t),
+                                   &worker.state, 0);
+    }
+
     bool lookPass = true;
     for (const int scale : { 2, 4 })
     {
         mlvDualIsoPreviewScaleRecon_t plan;
-        ASSERT_EQ(1, mlvDualIsoPreviewScaleReconPlan(fixture.video(), scale, &plan));
+        ASSERT_EQ(1, mlvDualIsoPreviewScaleReconPlan(video, scale, &plan));
+        ASSERT_EQ(0, plan.phaseTentShrink);
+        mlvDualIsoPreviewScaleRecon_t tentPlan = plan;
+        tentPlan.phaseTentShrink = 1;
         int w = 0, h = 0;
-        mlvFrameOutputDimensions(fixture.video(), scale, &w, &h);
+        mlvFrameOutputDimensions(video, scale, &w, &h);
+        const int rw = plan.reducedWidth;
+        const int rh = plan.reducedHeight;
+
+        // The CPU plan's shrink is the Phase 4B decimator, byte for byte.
+        {
+            std::vector<uint16_t> raw = decodeRaw(fixture, 2);
+            std::vector<uint16_t> viaPlan(static_cast<size_t>(rw) * rh), direct(viaPlan.size());
+            WorkerState worker;
+            const int shrunk = mlvDualIsoPreviewScaleReconShrink(video, &plan, raw.data(), viaPlan.data(),
+                                                                 &worker.state, 1, nullptr, nullptr);
+            ASSERT_TRUE(shrunk == 1 || shrunk == 2); // 2: the full-res fixes ran on raw in place
+            int ow = 0, oh = 0;
+            ASSERT_EQ(0, scale == 2
+                ? pl_downsample_bayer_to_bayer_2x(raw.data(), fixture.width(), plan.sourceHeight,
+                                                  direct.data(), &ow, &oh, 1)
+                : pl_downsample_bayer_to_bayer_4x(raw.data(), fixture.width(), plan.sourceHeight,
+                                                  direct.data(), &ow, &oh, 1));
+            ASSERT_TRUE(viaPlan == direct);
+        }
+
+        std::vector<uint16_t> tentRecon(static_cast<size_t>(rw) * rh), oldRecon(tentRecon.size());
+        {
+            const X1PlaybackHint hint(video);
+            for (int pass = 0; pass < 2; ++pass)
+            {
+                std::vector<uint16_t> raw = decodeRaw(fixture, 2);
+                ASSERT_FALSE(raw.empty());
+                WorkerState worker;
+                ASSERT_EQ(1, mlvDualIsoPreviewScaleReconRun(video, pass ? &plan : &tentPlan, raw.data(),
+                                                            pass ? oldRecon.data() : tentRecon.data(),
+                                                            &worker.state, 1, nullptr, nullptr));
+            }
+        }
+        std::vector<uint16_t> bayer(tentRecon.size()), oldBayer(oldRecon.size());
+        dualiso_reduced_iso_period_notch16(bayer.data(), tentRecon.data(), rw, rh);
+        dualiso_reduced_iso_period_notch16(oldBayer.data(), oldRecon.data(), rw, rh);
+        const std::vector<uint16_t> binned =
+            sameColourTentBin(fullRecon, fixture.width(), fixture.height(), scale, rw, rh);
+
+        const bool hnyquist = playbackReducedHnyquistWanted(true);
         std::vector<uint8_t> routed(static_cast<size_t>(w) * h * 3);
-        std::vector<uint16_t> raw = decodeRaw(fixture, 2);
-        ASSERT_FALSE(raw.empty());
-        std::vector<uint16_t> recon(static_cast<size_t>(plan.reducedWidth) * plan.reducedHeight);
-        WorkerState worker;
-        ASSERT_EQ(1, mlvDualIsoPreviewScaleReconRun(fixture.video(), &plan, raw.data(), recon.data(),
-                                                    &worker.state, 1, nullptr, nullptr));
-        std::vector<uint16_t> bayer(recon.size());
-        dualiso_reduced_iso_period_notch16(bayer.data(), recon.data(),
-                                           plan.reducedWidth, plan.reducedHeight);
         const int previousMode = processingPlaybackPreviewModeEnabled();
         const int previousScale = processingPlaybackPreviewScaleFactor();
         processingSetPlaybackPreviewMode(1);
         processingSetPlaybackPreviewScaleFactor(scale);
         const int ok = getMlvProcessedFrame8ScaledFromReducedReconnedRaw16(
-            fixture.video(), 2, bayer.data(), plan.reducedWidth, plan.reducedHeight, plan.scale,
-            routed.data(), 1, scale);
-        ASSERT_EQ(1, ok);
-        // The emulation without the filter is the routed frame, byte for byte.
-        const std::vector<uint8_t> emulatedNoFilter =
-            emulateReducedPresent(fixture, 2, bayer, plan.reducedWidth, plan.reducedHeight, h, false);
-        const std::vector<uint8_t> reduced =
-            emulateReducedPresent(fixture, 2, bayer, plan.reducedWidth, plan.reducedHeight, h, true);
-        const std::vector<uint8_t> unfiltered =
-            emulateReducedPresent(fixture, 2, recon, plan.reducedWidth, plan.reducedHeight, h, false);
+            video, 2, bayer.data(), rw, rh, plan.scale, routed.data(), 1, scale);
+        // The emulation without the filter, through debayerBasicU16, is the routed frame.
+        const std::vector<uint8_t> emulatedBasic =
+            emulateReducedPresent(fixture, 2, bayer, rw, rh, h, false);
+        const std::vector<uint8_t> e = emulateReducedPresent(fixture, 2, bayer, rw, rh, h, hnyquist, true);
+        const std::vector<uint8_t> refBin = emulateReducedPresent(fixture, 2, binned, rw, rh, h, false, true);
+        const std::vector<uint8_t> unnotched =
+            emulateReducedPresent(fixture, 2, tentRecon, rw, rh, h, false, true);
+        const std::vector<uint8_t> oldRoute = emulateReducedPresent(fixture, 2, oldBayer, rw, rh, h, false, true);
+        const std::vector<uint8_t> eBasic = emulateReducedPresent(fixture, 2, bayer, rw, rh, h, hnyquist);
+        const std::vector<uint8_t> refBinBasic = emulateReducedPresent(fixture, 2, binned, rw, rh, h, false);
         processingSetPlaybackPreviewScaleFactor(previousScale);
         processingSetPlaybackPreviewMode(previousMode);
-        ASSERT_TRUE(emulatedNoFilter == routed);
-        const int rh = plan.reducedHeight;
-        const std::vector<uint8_t> ref = boxDownsample(fullFrame, fixture.width(), scale, w, rh);
-        const double l3Off = lag4VerticalLumaDetail(unfiltered, w, rh);
-        std::printf("[gpu-dualiso-preview-scale] x%d notch and H-filter off: L1 %.4f L2 %.4f L3 %.4f "
-                    "L8 %.5f L9 %.4f\n",
-                    scale, rowPeriod4Energy(unfiltered, w, rh), columnPeriod4Energy(unfiltered, w, rh),
-                    l3Off, colNyqEnergy(unfiltered, w, rh), lag2HorizontalLumaDetail(unfiltered, w, rh));
-        const double l1 = rowPeriod4Energy(reduced, w, rh);
-        const double l1Ref = rowPeriod4Energy(ref, w, rh);
-        const double l2 = columnPeriod4Energy(reduced, w, rh);
-        const double l2Ref = columnPeriod4Energy(ref, w, rh);
-        const double l3 = lag4VerticalLumaDetail(reduced, w, rh);
-        const double l3Ref = lag4VerticalLumaDetail(ref, w, rh);
-        const double l8 = colNyqEnergy(reduced, w, rh);
-        const double l8Ref = colNyqEnergy(ref, w, rh);
-        const double l9 = lag2HorizontalLumaDetail(reduced, w, rh);
-        const double l9Ref = lag2HorizontalLumaDetail(ref, w, rh);
-        std::printf("[gpu-dualiso-preview-scale] x%d L1 row-p4 %.4f (ref %.4f) L2 col-p4 %.4f "
-                    "(ref %.4f, bound %.4f) L3 lag4 %.4f (ref %.4f, L3a %.4f >= 0.875, L3b %.4f >= 0.78) "
-                    "L8 colNyq %.5f (ref %.5f, bound %.5f) L9 lag2 %.4f (ref %.4f, ratio %.4f >= 0.80)\n",
-                    scale, l1, l1Ref, l2, l2Ref, 3.0 * l2Ref + 0.02, l3, l3Ref,
-                    l3Off > 0.0 ? l3 / l3Off : 0.0, l3Ref > 0.0 ? l3 / l3Ref : 0.0,
-                    l8, l8Ref, 2.0 * l8Ref + 0.002, l9, l9Ref, l9Ref > 0.0 ? l9 / l9Ref : 0.0);
+        ASSERT_EQ(1, ok);
+        ASSERT_TRUE(emulatedBasic == routed);
+        ASSERT_FALSE(e.empty());
+        ASSERT_FALSE(refBin.empty());
+        ASSERT_FALSE(unnotched.empty());
+        ASSERT_FALSE(oldRoute.empty());
+        const std::vector<uint8_t> refBox = boxDownsample(fullFrame, fixture.width(), scale, w, rh);
+
+        auto report = [&](const char * label, const std::vector<uint8_t> & img, const std::vector<uint8_t> & rb) {
+            std::printf("[gpu-dualiso-preview-scale] x%d %s: L1 %.4f L2 %.4f L3 %.4f (/ref_bin %.4f, /ref_box %.4f) "
+                        "L8 %.5f L9 %.4f (/ref_bin %.4f, /ref_box %.4f)\n",
+                        scale, label, rowPeriod4Energy(img, w, rh), columnPeriod4Energy(img, w, rh),
+                        lag4VerticalLumaDetail(img, w, rh),
+                        lag4VerticalLumaDetail(img, w, rh) / lag4VerticalLumaDetail(rb, w, rh),
+                        lag4VerticalLumaDetail(img, w, rh) / lag4VerticalLumaDetail(refBox, w, rh),
+                        colNyqEnergy(img, w, rh), lag2HorizontalLumaDetail(img, w, rh),
+                        lag2HorizontalLumaDetail(img, w, rh) / lag2HorizontalLumaDetail(rb, w, rh),
+                        lag2HorizontalLumaDetail(img, w, rh) / lag2HorizontalLumaDetail(refBox, w, rh));
+        };
+        report("ref_bin (AMaZE)", refBin, refBin);
+        report("ref_box", refBox, refBin);
+        report("tent, notch off (AMaZE)", unnotched, refBin);
+        report("old decimator + notch (AMaZE, r2/r3 route unfiltered)", oldRoute, refBin);
+        report("E through debayerBasicU16 (report only; vs ref_bin basic)", eBasic, refBinBasic);
+        report("ref_bin through debayerBasicU16", refBinBasic, refBinBasic);
+
+        const double l1 = rowPeriod4Energy(e, w, rh);
+        const double l2 = columnPeriod4Energy(e, w, rh);
+        const double l2Box = columnPeriod4Energy(refBox, w, rh);
+        const double l3 = lag4VerticalLumaDetail(e, w, rh);
+        const double l3Bin = lag4VerticalLumaDetail(refBin, w, rh);
+        const double l3Box = lag4VerticalLumaDetail(refBox, w, rh);
+        const double l3Off = lag4VerticalLumaDetail(unnotched, w, rh);
+        const double l8 = colNyqEnergy(e, w, rh);
+        const double l8Bin = colNyqEnergy(refBin, w, rh);
+        const double l9 = lag2HorizontalLumaDetail(e, w, rh);
+        const double l9Bin = lag2HorizontalLumaDetail(refBin, w, rh);
+        const double l9Box = lag2HorizontalLumaDetail(refBox, w, rh);
+        std::printf("[gpu-dualiso-preview-scale] x%d E (hnyquist %d): L1 row-p4 %.4f <= 0.02 | L2 col-p4 %.4f "
+                    "(ref_box %.4f, bound %.4f) | L3r %.4f >= 0.85 (lag4 %.4f, ref_bin %.4f) | L9r %.4f >= 0.90 "
+                    "(lag2 %.4f, ref_bin %.4f) | L8 colNyq %.5f (ref_bin %.5f, bound %.5f) | report: L3a %.4f "
+                    "L3b %.4f L9 %.4f (ref_box lag4 %.4f lag2 %.4f)\n",
+                    scale, hnyquist ? 1 : 0, l1, l2, l2Box, 3.0 * l2Box + 0.02, l3 / l3Bin, l3, l3Bin,
+                    l9 / l9Bin, l9, l9Bin, l8, l8Bin, 2.0 * l8Bin + 0.002, l3Off > 0.0 ? l3 / l3Off : 0.0,
+                    l3 / l3Box, l9 / l9Box, l3Box, l9Box);
         lookPass = lookPass && l1 <= 0.02;
-        lookPass = lookPass && l2 <= 3.0 * l2Ref + 0.02;
-        lookPass = lookPass && l3 >= 0.875 * l3Off;
-        lookPass = lookPass && l3 >= 0.78 * l3Ref;
-        lookPass = lookPass && l8 <= 2.0 * l8Ref + 0.002;
-        lookPass = lookPass && l9 >= 0.80 * l9Ref;
+        lookPass = lookPass && l2 <= 3.0 * l2Box + 0.02;
+        lookPass = lookPass && l3 >= 0.85 * l3Bin;
+        lookPass = lookPass && l9 >= 0.90 * l9Bin;
+        lookPass = lookPass && l8 <= 2.0 * l8Bin + 0.002;
         for (int c = 0; c < 3; ++c)
         {
-            const double ratio = channelMean(reduced, w, rh, c) / channelMean(ref, w, rh, c);
-            std::printf("[gpu-dualiso-preview-scale] x%d L4 channel %d mean ratio %.4f\n",
-                        scale, c, ratio);
+            const double ratio = channelMean(e, w, rh, c) / channelMean(refBin, w, rh, c);
+            const double ml6 = channelMean(refBin, w, rh, c) / channelMean(refBox, w, rh, c);
+            const double vsBox = channelMean(e, w, rh, c) / channelMean(refBox, w, rh, c);
+            std::printf("[gpu-dualiso-preview-scale] x%d L4 channel %d E/ref_bin %.4f (within 0.02) | "
+                        "report: E/ref_box %.4f, M-L6 ref_bin/ref_box %.4f\n", scale, c, ratio, vsBox, ml6);
             lookPass = lookPass && std::fabs(ratio - 1.0) <= 0.02;
         }
     }
@@ -938,6 +1097,323 @@ TEST(GpuDualIsoPreviewScale, ReducedBandCombMatchesReference)
         ASSERT_TRUE(l8Comb > 2.0 * l8Ref + 0.002); // the band combs without the filter
         ASSERT_TRUE(l8 <= 2.0 * l8Ref + 0.002);
         ASSERT_TRUE(l9 >= 0.80 * l9Ref);
+    }
+}
+
+// T11 (r4): pl_downsample_bayer_to_bayer_phase_tent puts every output on its own site.
+// A per-plane linear ramp in x and y comes out exactly as the ramp at each target centre
+// t = S*o + (S-1)/2 (x2 and x4, all four ISO row classes, both colour columns); a field
+// constant per (ISO row class, colour column) comes out as the same constants, edges
+// included; a signal in one ISO row class or one colour plane stays there; and the weight
+// tables of the r4 design are exact.
+// Mutations: phase off by one source column, rows grouped by class mod 2, weights not
+// normalised, edge clamp crossing class.
+TEST(GpuDualIsoPreviewScale, PhaseTentSitesAndClasses)
+{
+    const int inW = 64, inH = 64;
+    auto shrink = [&](const std::vector<uint16_t> & in, int scale) {
+        std::vector<uint16_t> out(static_cast<size_t>(inW / scale) * (inH / scale), 0u);
+        int ow = 0, oh = 0;
+        if (pl_downsample_bayer_to_bayer_phase_tent(in.data(), inW, inH, out.data(), scale, &ow, &oh, 1) != 0
+            || ow != inW / scale || oh != inH / scale)
+            out.clear();
+        return out;
+    };
+    auto field = [&](auto value) {
+        std::vector<uint16_t> f(static_cast<size_t>(inW) * inH);
+        for (int y = 0; y < inH; ++y)
+            for (int x = 0; x < inW; ++x) f[static_cast<size_t>(y) * inW + x] = static_cast<uint16_t>(value(x, y));
+        return f;
+    };
+    auto base = [](int x, int y) { return 1000 + 500 * ((y % 4) * 2 + (x % 2)); };
+    for (const int scale : { 2, 4 })
+    {
+        const int ow = inW / scale, oh = inH / scale;
+        // Ramp: 2*x + 4*y on per-plane bases; 2*t_x and 4*t_y are integers.
+        const std::vector<uint16_t> ramp = shrink(field([&](int x, int y) { return base(x, y) + 2 * x + 4 * y; }), scale);
+        ASSERT_FALSE(ramp.empty());
+        for (int y = 1; y < oh - 1; ++y)
+            for (int x = 1; x < ow - 1; ++x)
+            {
+                const int want = base(x, y) + (2 * scale * x + scale - 1) + 2 * (2 * scale * y + scale - 1);
+                const int got = ramp[static_cast<size_t>(y) * ow + x];
+                if (got != want) std::printf("[phase-tent] x%d ramp (%d,%d) got %d want %d\n", scale, x, y, got, want);
+                ASSERT_EQ(want, got);
+            }
+        // Constant per class, edges included.
+        const std::vector<uint16_t> classes = shrink(field(base), scale);
+        ASSERT_FALSE(classes.empty());
+        for (int y = 0; y < oh; ++y)
+            for (int x = 0; x < ow; ++x) ASSERT_EQ(base(x, y), static_cast<int>(classes[static_cast<size_t>(y) * ow + x]));
+        const std::vector<uint16_t> flat = shrink(field([](int, int) { return 12345; }), scale);
+        for (const uint16_t v : flat) ASSERT_EQ(12345, static_cast<int>(v));
+        // One ISO row class, then one colour plane.
+        for (int r = 0; r < 4; ++r)
+        {
+            const std::vector<uint16_t> out = shrink(field([r](int, int y) { return (y % 4 == r) ? 4000 : 0; }), scale);
+            for (int y = 0; y < oh; ++y)
+                for (int x = 0; x < ow; ++x)
+                    ASSERT_EQ((y % 4 == r) ? 4000 : 0, static_cast<int>(out[static_cast<size_t>(y) * ow + x]));
+        }
+        for (int p = 0; p < 2; ++p)
+        {
+            const std::vector<uint16_t> out = shrink(field([p](int x, int) { return (x % 2 == p) ? 4000 : 0; }), scale);
+            for (int y = 0; y < oh; ++y)
+                for (int x = 0; x < ow; ++x)
+                    ASSERT_EQ((x % 2 == p) ? 4000 : 0, static_cast<int>(out[static_cast<size_t>(y) * ow + x]));
+        }
+    }
+
+    // The weight tables: an impulse column (row) of 64000 gives out = 64000 * w / colsum (rowsum).
+    struct Table { int scale; int outIndex; int src[4]; int w[4]; int n; };
+    const Table cols[] = {
+        { 4, 2, { 6, 8, 10, 12 }, { 1, 5, 7, 3 }, 4 },   // even out col 2k (k=1): 8k-2, 8k, 8k+2, 8k+4
+        { 4, 3, { 11, 13, 15, 17 }, { 3, 7, 5, 1 }, 4 }, // odd out col 2k+1: 8k+3, +5, +7, +9
+        { 2, 2, { 4, 6 }, { 3, 1 }, 2 },                 // even col: 4k, 4k+2
+        { 2, 3, { 5, 7 }, { 1, 3 }, 2 },                 // odd col: 4k+1, 4k+3
+    };
+    for (const Table & t : cols)
+    {
+        const int colsum = t.scale * t.scale;
+        const int ow = inW / t.scale;
+        int total = 0;
+        for (int i = 0; i < t.n; ++i)
+        {
+            const int s = t.src[i];
+            const std::vector<uint16_t> out = shrink(field([s](int x, int) { return x == s ? 64000 : 0; }), t.scale);
+            ASSERT_EQ(64000 / colsum * t.w[i], static_cast<int>(out[static_cast<size_t>(5) * ow + t.outIndex]));
+            total += t.w[i];
+        }
+        ASSERT_EQ(colsum, total);
+    }
+    const Table rows[] = {
+        { 4, 4, { 12, 16, 20, 24 }, { 5, 13, 11, 3 }, 4 },  // r=0, j=1: 16j-4, 16j, +4, +8
+        { 4, 5, { 17, 21, 25, 29 }, { 7, 15, 9, 1 }, 4 },   // r=1: 16j+1, +5, +9, +13
+        { 4, 6, { 18, 22, 26, 30 }, { 1, 9, 15, 7 }, 4 },   // r=2: 16j+2, +6, +10, +14
+        { 4, 7, { 23, 27, 31, 35 }, { 3, 11, 13, 5 }, 4 },  // r=3: 16j+7, +11, +15, +19
+        { 2, 4, { 8, 12 }, { 7, 1 }, 2 },                   // r=0, j=1: 8j, 8j+4
+        { 2, 5, { 9, 13 }, { 5, 3 }, 2 },                   // r=1: 8j+1, 8j+5
+        { 2, 6, { 10, 14 }, { 3, 5 }, 2 },                  // r=2: 8j+2, 8j+6
+        { 2, 7, { 11, 15 }, { 1, 7 }, 2 },                  // r=3: 8j+3, 8j+7
+    };
+    for (const Table & t : rows)
+    {
+        const int rowsum = 2 * t.scale * t.scale;
+        const int ow = inW / t.scale;
+        int total = 0;
+        for (int i = 0; i < t.n; ++i)
+        {
+            const int s = t.src[i];
+            const std::vector<uint16_t> out = shrink(field([s](int, int y) { return y == s ? 64000 : 0; }), t.scale);
+            ASSERT_EQ(64000 / rowsum * t.w[i], static_cast<int>(out[static_cast<size_t>(t.outIndex) * ow + 5]));
+            total += t.w[i];
+        }
+        ASSERT_EQ(rowsum, total);
+    }
+
+    // Same dims rules as the decimators; scale 2 or 4 only.
+    std::vector<uint16_t> in(static_cast<size_t>(64) * 72, 0u), out(in.size(), 0u);
+    int ow = 0, oh = 0;
+    ASSERT_NE(0, pl_downsample_bayer_to_bayer_phase_tent(in.data(), 64, 72, out.data(), 4, &ow, &oh, 1));
+    ASSERT_EQ(0, pl_downsample_bayer_to_bayer_phase_tent(in.data(), 64, 72, out.data(), 2, &ow, &oh, 1));
+    ASSERT_NE(0, pl_downsample_bayer_to_bayer_phase_tent(in.data(), 62, 64, out.data(), 2, &ow, &oh, 1));
+    ASSERT_NE(0, pl_downsample_bayer_to_bayer_phase_tent(in.data(), 64, 64, out.data(), 8, &ow, &oh, 1));
+    // Threaded output equals single-threaded.
+    const std::vector<uint16_t> noisy = field([](int x, int y) { return (x * 7919 + y * 104729) % 60000; });
+    for (const int scale : { 2, 4 })
+    {
+        std::vector<uint16_t> one(noisy.size() / (scale * scale)), many(one.size());
+        ASSERT_EQ(0, pl_downsample_bayer_to_bayer_phase_tent(noisy.data(), inW, inH, one.data(), scale, &ow, &oh, 1));
+        ASSERT_EQ(0, pl_downsample_bayer_to_bayer_phase_tent(noisy.data(), inW, inH, many.data(), scale, &ow, &oh, 4));
+        ASSERT_TRUE(one == many);
+    }
+}
+
+// T11b (r4): only the GPU plan shrinks with the phase tent, at x2 and x4; the CPU plan's
+// shrink stays the Phase 4B decimator byte for byte; each tent shrink is counted for the
+// play-stop summary. Mutations: tent enabled on the CPU plan, old decimator kept for x2.
+TEST(GpuDualIsoPreviewScale, PhaseTentShrinkOnlyOnTheGpuPlan)
+{
+    for (const bool gpu : { true, false })
+    {
+        GpuReconEnv env(gpu);
+        MlvPipelineFixture fixture;
+        ASSERT_TRUE(openGpuEligibleFixture(fixture));
+        ASSERT_FALSE(fixture.renderFrame8(0).empty());
+        for (const int scale : { 2, 4 })
+        {
+            mlvDualIsoPreviewScaleRecon_t plan;
+            ASSERT_EQ(1, gpu ? mlvDualIsoGpuPreviewScaleReconPlan(fixture.video(), scale, 1, &plan)
+                             : mlvDualIsoPreviewScaleReconPlan(fixture.video(), scale, &plan));
+            ASSERT_EQ(gpu ? 1 : 0, plan.phaseTentShrink);
+            std::vector<uint16_t> raw = decodeRaw(fixture, 1);
+            ASSERT_FALSE(raw.empty());
+            std::vector<uint16_t> viaPlan(static_cast<size_t>(plan.reducedWidth) * plan.reducedHeight, 0u);
+            std::vector<uint16_t> direct(viaPlan.size(), 1u);
+            const uint64_t framesBefore = mlvDualIsoPhaseTentShrinkFrames();
+            WorkerState worker;
+            double ms = -1.0;
+            ASSERT_EQ(1, mlvDualIsoPreviewScaleReconShrink(fixture.video(), &plan, raw.data(), viaPlan.data(),
+                                                           &worker.state, 1, nullptr, &ms));
+            ASSERT_TRUE(ms >= 0.0);
+            int ow = 0, oh = 0;
+            if (gpu)
+                ASSERT_EQ(0, pl_downsample_bayer_to_bayer_phase_tent(raw.data(), fixture.width(), plan.sourceHeight,
+                                                                     direct.data(), scale, &ow, &oh, 1));
+            else if (scale == 2)
+                ASSERT_EQ(0, pl_downsample_bayer_to_bayer_2x(raw.data(), fixture.width(), plan.sourceHeight,
+                                                             direct.data(), &ow, &oh, 1));
+            else
+                ASSERT_EQ(0, pl_downsample_bayer_to_bayer_4x(raw.data(), fixture.width(), plan.sourceHeight,
+                                                             direct.data(), &ow, &oh, 1));
+            ASSERT_TRUE(viaPlan == direct);
+            ASSERT_EQ(framesBefore + (gpu ? 1u : 0u), mlvDualIsoPhaseTentShrinkFrames());
+        }
+    }
+}
+
+namespace {
+// RGGB Bayer16 from a per-row brightness profile (G level), R and B at fixed fractions.
+std::vector<uint16_t> bayerFromRowProfile(int w, int h, const std::vector<double> & g)
+{
+    std::vector<uint16_t> bayer(static_cast<size_t>(w) * h);
+    for (int y = 0; y < h; ++y)
+        for (int x = 0; x < w; ++x)
+        {
+            const bool rRow = (y % 2) == 0, evenCol = (x % 2) == 0;
+            const double k = (rRow && evenCol) ? 0.55 : (!rRow && !evenCol) ? 0.45 : 1.0;
+            bayer[static_cast<size_t>(y) * w + x] = static_cast<uint16_t>(std::lround(g[static_cast<size_t>(y)] * k));
+        }
+    return bayer;
+}
+
+std::vector<uint16_t> oldDecimator(const std::vector<uint16_t> & in, int w, int h, int scale)
+{
+    std::vector<uint16_t> out(static_cast<size_t>(w / scale) * (h / scale), 0u);
+    int ow = 0, oh = 0;
+    const int rc = scale == 2 ? pl_downsample_bayer_to_bayer_2x(in.data(), w, h, out.data(), &ow, &oh, 1)
+                              : pl_downsample_bayer_to_bayer_4x(in.data(), w, h, out.data(), &ow, &oh, 1);
+    if (rc != 0) out.clear();
+    return out;
+}
+
+std::vector<uint16_t> phaseTent(const std::vector<uint16_t> & in, int w, int h, int scale)
+{
+    std::vector<uint16_t> out(static_cast<size_t>(w / scale) * (h / scale), 0u);
+    int ow = 0, oh = 0;
+    if (pl_downsample_bayer_to_bayer_phase_tent(in.data(), w, h, out.data(), scale, &ow, &oh, 1) != 0) out.clear();
+    return out;
+}
+} // namespace
+
+// T12 (r4): the comb from the old shrink's mis-phase. A synthetic full-res Bayer16 with a
+// horizontal bright band 16 reduced rows thick (16 S source rows) whose edges are vertical
+// gradients 4 reduced rows long, shrunk by the OLD decimator and by the phase tent, then
+// debayered by the CPU AMaZE at the reduced size. Over the band and its edges the tent
+// stays at colNyq <= 0.002. The pre-registered RED case (old > 0.002) did NOT hold: on an
+// x-invariant band the old shrink's Gr/Gb mismatch reads 0.00000 through AMaZE (it
+// interpolates G along the row where the vertical gradient is strong), so the comb proof
+// rests on venue L8 and L7. A band tilted by one source row per 8 columns is printed for
+// the record (not gated).
+TEST(GpuDualIsoPreviewScale, ReducedBandCombFromMisphase)
+{
+    for (const int scale : { 2, 4 })
+    for (const int tilt : { 0, 8 })
+    {
+        const int rw = 96, rhh = 64;
+        const int w = rw * scale, h = rhh * scale;
+        const double floorLevel = 8000.0, bandLevel = 40000.0;
+        const double rampLen = 4.0 * scale;
+        std::vector<uint16_t> full(static_cast<size_t>(w) * h);
+        for (int x = 0; x < w; ++x)
+        {
+            const double shift = tilt ? static_cast<double>(x / tilt) - (w / tilt) / 2.0 : 0.0;
+            const double bandTop = 24.0 * scale + shift, bandBottom = 40.0 * scale + shift; // plateau [top, bottom)
+            std::vector<double> g(static_cast<size_t>(h));
+            for (int y = 0; y < h; ++y)
+            {
+                double a = 0.0;
+                if (y >= bandTop && y < bandBottom) a = 1.0;
+                else if (y >= bandTop - rampLen && y < bandTop) a = (y - (bandTop - rampLen) + 0.5) / rampLen;
+                else if (y >= bandBottom && y < bandBottom + rampLen) a = 1.0 - (y - bandBottom + 0.5) / rampLen;
+                g[static_cast<size_t>(y)] = floorLevel + a * (bandLevel - floorLevel);
+            }
+            const std::vector<uint16_t> column = bayerFromRowProfile(w, h, g);
+            for (int y = 0; y < h; ++y)
+                full[static_cast<size_t>(y) * w + x] = column[static_cast<size_t>(y) * w + x];
+        }
+        auto colNyqOfShrink = [&](const std::vector<uint16_t> & reduced) {
+            std::vector<uint16_t> rgb(static_cast<size_t>(rw) * rhh * 3, 0u);
+            std::vector<float> f(reduced.begin(), reduced.end());
+            if (debayerAmaze(rgb.data(), f.data(), rw, rhh, 1, 0) != 1) return -1.0;
+            const std::vector<uint8_t> rgb8 = rgb16To8(rgb);
+            // Reduced rows 18..45: the band, its gradient edges and two rows of floor each side.
+            const std::vector<uint8_t> rows(rgb8.begin() + static_cast<size_t>(18) * rw * 3,
+                                            rgb8.begin() + static_cast<size_t>(46) * rw * 3);
+            return colNyqEnergy(rows, rw, 28);
+        };
+        const std::vector<uint16_t> oldReduced = oldDecimator(full, w, h, scale);
+        const std::vector<uint16_t> tentReduced = phaseTent(full, w, h, scale);
+        ASSERT_FALSE(oldReduced.empty());
+        ASSERT_FALSE(tentReduced.empty());
+        const double oldNyq = colNyqOfShrink(oldReduced);
+        const double tentNyq = colNyqOfShrink(tentReduced);
+        std::printf("[gpu-dualiso-preview-scale] T12 x%d %s colNyq through CPU AMaZE: old decimator %.5f, "
+                    "phase tent %.5f (bound 0.002)\n", scale, tilt ? "tilted band (report only)" : "band",
+                    oldNyq, tentNyq);
+        ASSERT_TRUE(oldNyq >= 0.0 && tentNyq >= 0.0);
+        if (!tilt) ASSERT_TRUE(tentNyq <= 0.002);
+    }
+}
+
+// T13 (r4): Gr/Gb balance on a vertical ramp. The site error of an output G is its value
+// minus the ramp at its own target centre t_y = S*y + (S-1)/2; the Gr/Gb mismatch of a 2x2
+// cell is the Gr error minus the Gb error. The old decimator's mismatch is proportional to
+// the slope (3 x slope at x4, 1 x slope at x2); the tent's is <= 1 LSB.
+TEST(GpuDualIsoPreviewScale, GrGbBalanceOnVerticalRamp)
+{
+    for (const int scale : { 2, 4 })
+    {
+        const int w = 64, h = 256;
+        const int ow = w / scale, oh = h / scale;
+        double oldMean[2] = { 0.0, 0.0 };
+        double tentMax = 0.0;
+        const int slopes[2] = { 2, 4 };
+        for (int si = 0; si < 2; ++si)
+        {
+            const int c = slopes[si];
+            std::vector<uint16_t> ramp(static_cast<size_t>(w) * h);
+            for (int y = 0; y < h; ++y)
+                for (int x = 0; x < w; ++x) ramp[static_cast<size_t>(y) * w + x] = static_cast<uint16_t>(1000 + c * y);
+            auto mismatch = [&](const std::vector<uint16_t> & out, double * meanAbs, double * maxAbs) {
+                double sum = 0.0, mx = 0.0;
+                int n = 0;
+                for (int y = 2; y + 3 < oh; y += 2) // Gr row y (even), Gb row y+1
+                    for (int k = 1; 2 * k + 2 < ow; ++k)
+                    {
+                        const double grSite = scale * y + (scale - 1) / 2.0;
+                        const double gbSite = scale * (y + 1) + (scale - 1) / 2.0;
+                        const double gr = out[static_cast<size_t>(y) * ow + 2 * k + 1] - (1000 + c * grSite);
+                        const double gb = out[static_cast<size_t>(y + 1) * ow + 2 * k] - (1000 + c * gbSite);
+                        const double m = std::fabs(gr - gb);
+                        sum += m;
+                        mx = std::max(mx, m);
+                        ++n;
+                    }
+                if (meanAbs) *meanAbs = n ? sum / n : 0.0;
+                if (maxAbs) *maxAbs = mx;
+            };
+            double tentMaxHere = 0.0;
+            mismatch(oldDecimator(ramp, w, h, scale), &oldMean[si], nullptr);
+            mismatch(phaseTent(ramp, w, h, scale), nullptr, &tentMaxHere);
+            tentMax = std::max(tentMax, tentMaxHere);
+            std::printf("[gpu-dualiso-preview-scale] T13 x%d slope %d: old Gr/Gb mismatch %.3f LSB, tent max %.3f LSB\n",
+                        scale, c, oldMean[si], tentMaxHere);
+        }
+        ASSERT_TRUE(oldMean[0] > 1.0);
+        ASSERT_TRUE(std::fabs(oldMean[1] / oldMean[0] - 2.0) <= 0.1);
+        ASSERT_TRUE(std::fabs(oldMean[0] - (scale == 4 ? 3.0 : 1.0) * slopes[0]) <= 0.5);
+        ASSERT_TRUE(tentMax <= 1.0);
     }
 }
 

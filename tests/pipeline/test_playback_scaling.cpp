@@ -602,11 +602,22 @@ TEST(PlaybackScaling, ReconTexturePredicateIsReducedOnlyAtX2AndX4)
     // No display size: never reduced.
     ASSERT_FALSE(playbackReconTextureIsReducedForDisplaySize(452, 564, 0, 0));
 
-    // A reduced present without the AMaZE symbol is refused; x1 never is.
-    // Mutation: missing symbol not refused.
-    ASSERT_TRUE(playbackReducedHnyquistPresentRefused(true, false));
-    ASSERT_FALSE(playbackReducedHnyquistPresentRefused(true, true));
-    ASSERT_FALSE(playbackReducedHnyquistPresentRefused(false, false));
+    // r4: the H-Nyquist filter is wanted only on a reduced present and only while
+    // kReducedHnyquistOnReducedPresents is 1 (r4 default 0: the phase-tent shrink fixes
+    // the comb at its source). Mutation: H-filter constant ignored.
+    ASSERT_FALSE(playbackReducedHnyquistWanted(true, 0));
+    ASSERT_TRUE(playbackReducedHnyquistWanted(true, 1));
+    ASSERT_FALSE(playbackReducedHnyquistWanted(false, 1));
+    ASSERT_EQ(kReducedHnyquistOnReducedPresents != 0, playbackReducedHnyquistWanted(true));
+    ASSERT_FALSE(playbackReducedHnyquistWanted(false));
+
+    // A reduced present that wants the filter without the AMaZE symbol is refused; x1
+    // never is, and with the filter off nothing is. Mutation: missing symbol not refused.
+    ASSERT_TRUE(playbackReducedHnyquistPresentRefused(true, false, 1));
+    ASSERT_FALSE(playbackReducedHnyquistPresentRefused(true, true, 1));
+    ASSERT_FALSE(playbackReducedHnyquistPresentRefused(false, false, 1));
+    ASSERT_FALSE(playbackReducedHnyquistPresentRefused(true, false, 0));
+    ASSERT_EQ(kReducedHnyquistOnReducedPresents != 0, playbackReducedHnyquistPresentRefused(true, false));
 }
 
 TEST(PlaybackScaling, SuppressesUniformTopMagentaBandOnly)
