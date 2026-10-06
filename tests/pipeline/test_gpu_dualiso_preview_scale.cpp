@@ -17,11 +17,13 @@
 // The pixel parity of the real CUDA kernels at reduced dims ((c1), (c2)) is a venue
 // proof; see the PR.
 #include "../common/minitest.h"
+#include "../common/repo_paths.h"
 #include "mlv_pipeline_fixture.h"
 #include "../../src/mlv/llrawproc/llrawproc.h"
 #include "../../src/mlv/pipeline_stage_capture.h"
 #include "../../src/processing/raw_processing.h"
 
+#include <cmath>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
@@ -380,6 +382,79 @@ TEST(GpuDualIsoPreviewScale, ReducedTextureRouteReconstructsTheReducedBayer)
     ASSERT_EQ(settled.blackDelta, after.blackDelta);
 }
 
+// The 4-row ISO residual. Dual-ISO reconstruction leaves a small level residual
+// with the ISO row period (4 rows) at ANY size; the first x4 venue legs showed it
+// magnified (4 texture rows of a 452x564 frame are ~11 display pixels, against
+// ~3 for the full-resolution frame, whose own residual measures the same). This
+// pins that the reduced recon adds none: its period-4 row energy is within 2x of
+// the full recon's at the full recon's own period. The reduced recon here is the
+// CPU one (the shrink is the GPU route's; CUDA matches the CPU recon bit for bit).
+namespace {
+double rowPeriod4Energy(const std::vector<uint8_t> & rgb, int w, int h)
+{
+    std::vector<double> rows(static_cast<size_t>(h), 0.0);
+    for (int y = 0; y < h; ++y)
+    {
+        double s = 0.0;
+        for (int x = 0; x < w * 3; ++x) s += rgb[static_cast<size_t>(y) * w * 3 + x];
+        rows[static_cast<size_t>(y)] = s / (w * 3.0);
+    }
+    // Remove the local mean (5-row box), then correlate with the period-4 basis.
+    double re = 0.0, im = 0.0;
+    int n = 0;
+    for (int y = 2; y < h - 2; ++y)
+    {
+        const double local = (rows[y - 2] + rows[y - 1] + rows[y] + rows[y + 1] + rows[y + 2]) / 5.0;
+        const double v = rows[static_cast<size_t>(y)] - local;
+        re += v * std::cos(2.0 * 3.14159265358979 * y / 4.0);
+        im += v * std::sin(2.0 * 3.14159265358979 * y / 4.0);
+        ++n;
+    }
+    return n > 0 ? std::sqrt(re * re + im * im) / n : 0.0;
+}
+} // namespace
+
+TEST(GpuDualIsoPreviewScale, ReducedReconAddsNoIsoPeriodResidual)
+{
+    GpuReconEnv env(false);
+    MlvPipelineFixture fixture;
+    QString error;
+    ASSERT_TRUE(fixture.openClipFile(repo_file_path(QStringLiteral("tests/fixtures/clips/large_dual_iso.mlv")), &error));
+    ASSERT_TRUE(fixture.loadReceipt(QStringLiteral("tests/fixtures/receipts/large_dual_iso_hq.marxml"), &error));
+    ASSERT_TRUE(fixture.applyReceipt(&error));
+    ASSERT_FALSE(fixture.renderFrame8(0).empty());
+    const std::vector<uint8_t> fullFrame = fixture.renderFrame8(2);
+    ASSERT_FALSE(fullFrame.empty());
+    const double meshFull = rowPeriod4Energy(fullFrame, fixture.width(), fixture.height());
+    for (const int scale : { 2, 4 })
+    {
+        mlvDualIsoPreviewScaleRecon_t plan;
+        ASSERT_EQ(1, mlvDualIsoPreviewScaleReconPlan(fixture.video(), scale, &plan));
+        int w = 0, h = 0;
+        mlvFrameOutputDimensions(fixture.video(), scale, &w, &h);
+        std::vector<uint8_t> reduced(static_cast<size_t>(w) * h * 3);
+        std::vector<uint16_t> raw = decodeRaw(fixture, 2);
+        ASSERT_FALSE(raw.empty());
+        std::vector<uint16_t> bayer(static_cast<size_t>(plan.reducedWidth) * plan.reducedHeight);
+        WorkerState worker;
+        ASSERT_EQ(1, mlvDualIsoPreviewScaleReconRun(fixture.video(), &plan, raw.data(), bayer.data(),
+                                                    &worker.state, 1, nullptr, nullptr));
+        const int previousMode = processingPlaybackPreviewModeEnabled();
+        const int previousScale = processingPlaybackPreviewScaleFactor();
+        processingSetPlaybackPreviewMode(1);
+        processingSetPlaybackPreviewScaleFactor(scale);
+        const int ok = getMlvProcessedFrame8ScaledFromReducedReconnedRaw16(
+            fixture.video(), 2, bayer.data(), plan.reducedWidth, plan.reducedHeight, plan.scale,
+            reduced.data(), 1, scale);
+        processingSetPlaybackPreviewScaleFactor(previousScale);
+        processingSetPlaybackPreviewMode(previousMode);
+        ASSERT_EQ(1, ok);
+        const double meshReduced = rowPeriod4Energy(reduced, w, plan.reducedHeight);
+        std::printf("[gpu-dualiso-preview-scale] x%d period-4 row energy reduced=%.4f full-res=%.4f\n",
+                    scale, meshReduced, meshFull);
+        ASSERT_TRUE(meshReduced <= meshFull * 2.0 + 0.05);
+    }
+}
 // (f) Export after a reduced CUDA playback session in this process equals a fresh
 // object's export, 8- and 16-bit.
 TEST(GpuDualIsoPreviewScale, ExportAfterReducedGpuPlaybackEqualsFreshExport)
