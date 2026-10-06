@@ -17421,8 +17421,19 @@ void MainWindow::applyLookAssistToReceipt( ReceiptSettings *receipt,
                                                                     "PNG" );
         };
     }
+    // LOOK-ASSIST-M16-CAST-6: what this balance was decided from, so each arm's LA is the same decision (Classic, as the
+    // walk above).
+    ReceiptApplier::DualIsoTraceLookAssist disoLookAssist;
+    disoLookAssist.valid = useProcessedColorStats;
+    disoLookAssist.stats = stats;
+    disoLookAssist.scene = scene;
+    disoLookAssist.flavor = flavorForTheWalk;
+    disoLookAssist.baseTemperature = baseTemperature;
+    disoLookAssist.baseTint = baseTint;
+    disoLookAssist.analysisExposure = wbRequest.analysisExposure;
     const QString disoMatch = ReceiptApplier::lookAssistDualIsoMatchTrace(
-        m_pMlvObject, analysisFrame, colorDownscaleFactor, preset.exposure / 100.0, temperature, tint, disoImageSink );
+        m_pMlvObject, analysisFrame, colorDownscaleFactor, preset.exposure / 100.0, temperature, tint, disoImageSink,
+        disoLookAssist );
     if( !disoMatch.isEmpty() )
         logInteractionEvent( QStringLiteral("look_assist.diso_match"),
                              QStringLiteral("frame=%1 %2").arg( analysisFrame ).arg( disoMatch ) );

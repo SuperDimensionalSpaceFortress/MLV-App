@@ -97,6 +97,22 @@ void llrpSetIsolatedAnalysisDualIsoSwitchArmsForCurrentThread(const double * cha
                                                               int capture_switch_maps);
 int llrpGetIsolatedAnalysisDualIsoSwitchArmsForCurrentThread(int * channel_match, int * quad_coherent_switch,
                                                              int * capture_switch_maps);
+/* LOOK-ASSIST-M16-CAST-6 measure-only, same contract; call AFTER the switch-arms setter, which clears them.
+ * channel_mask (bit c = CFA channel R, G1, G2, B) limits A11 to those channels, the others keep the global match
+ * (0 = all four); channel_bd_global gives every A11 channel the global black delta (A11s); capture_output records the HQ
+ * recon's 16-bit Bayer output (dualiso_output_capture). The getter reports them (1 = any set). */
+void llrpSetIsolatedAnalysisDualIsoChannelArmsForCurrentThread(int channel_mask, int channel_bd_global, int capture_output);
+int llrpGetIsolatedAnalysisDualIsoChannelArmsForCurrentThread(int * channel_mask, int * channel_bd_global,
+                                                              int * capture_output);
+/* LOOK-ASSIST-M16-CAST-6 X0 (ISOLATED analysis runs on the calling thread only): steps_off skips every pre-dual-ISO step
+ * (dark frame, vertical stripes, focus pixels, bad pixels, pattern noise) and tells the recon no dark frame was
+ * subtracted; record_hash hashes the buffer handed to dual ISO. Cleared by
+ * llrpSetIsolatedAnalysisDualIsoArmsForCurrentThread (set it after that call). Returns the previous steps_off. The
+ * getter reports the last isolated run on this thread: the steps enabled (bit 1 dark frame, 2 vertical stripes, 4 focus
+ * pixels, 8 bad pixels, 16 pattern noise; before X0), the steps that ran, and the hash (0 unless asked); it returns the
+ * current steps_off. */
+int llrpSetIsolatedAnalysisPreDualIsoForCurrentThread(int steps_off, int record_hash);
+int llrpGetLastPreDualIsoForCurrentThread(int * enabled_mask, int * applied_mask, unsigned long long * buffer_hash);
 /* The output levels (dng bit depth / black / white) of the last llrawproc run on the calling thread that completed for
  * `video`, live or isolated: the levels its frame is at, which a display render syncs the processing object to. Returns
  * 0 when no run completed for `video` since the last reset on this thread (e.g. the frame came from a cache). */

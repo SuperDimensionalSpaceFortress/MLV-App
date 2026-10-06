@@ -949,7 +949,24 @@ struct LookAssistDisoSwitchArms
     const double *channelBd = nullptr;
     bool quadCoherent = false;
     bool captureMaps = false;
+    // LOOK-ASSIST-M16-CAST-6: A11's channel subset (0 = all four) and global black delta (A11s), the post-recon Bayer
+    // capture, and X0 (the pre-dual-ISO steps off). Reset with the others after the render.
+    int channelMask = 0;
+    bool channelBdGlobal = false;
+    bool captureOutput = false;
+    bool preStepsOff = false;
 };
+
+// Sets / clears the CAST-5 and CAST-6 switch arms for one isolated render (the CAST-4 setter has just cleared them).
+static void lookAssistDisoSetSwitchArms(const LookAssistDisoSwitchArms &switchArms)
+{
+    llrpSetIsolatedAnalysisDualIsoSwitchArmsForCurrentThread( switchArms.channelEv, switchArms.channelBd,
+                                                              switchArms.quadCoherent ? 1 : 0,
+                                                              switchArms.captureMaps ? 1 : 0 );
+    llrpSetIsolatedAnalysisDualIsoChannelArmsForCurrentThread( switchArms.channelMask, switchArms.channelBdGlobal ? 1 : 0,
+                                                               switchArms.captureOutput ? 1 : 0 );
+    llrpSetIsolatedAnalysisPreDualIsoForCurrentThread( switchArms.preStepsOff ? 1 : 0, 0 );
+}
 
 static bool lookAssistDisoArmRender(mlvObject_t *mlvObject, int frameIndex, int downscaleFactor, double exposureStops,
                                     int temperature, int tint, bool defaultGrade, int mode, int whiteBright,
@@ -957,9 +974,7 @@ static bool lookAssistDisoArmRender(mlvObject_t *mlvObject, int frameIndex, int 
                                     const LookAssistDisoSwitchArms &switchArms = LookAssistDisoSwitchArms())
 {
     llrpSetIsolatedAnalysisDualIsoArmsForCurrentThread( mode, whiteBright, darkNoiseScale, darkBlackOffset );
-    llrpSetIsolatedAnalysisDualIsoSwitchArmsForCurrentThread( switchArms.channelEv, switchArms.channelBd,
-                                                              switchArms.quadCoherent ? 1 : 0,
-                                                              switchArms.captureMaps ? 1 : 0 );
+    lookAssistDisoSetSwitchArms( switchArms );
     const int previousMatch = llrpSetIsolatedAnalysisDualIsoMatchForCurrentThread(
         switchArms.measuredMatch ? LLRP_ANALYSIS_DISO_MATCH_MEASURED : LLRP_ANALYSIS_DISO_MATCH_SEED, 1.0, -1 );
     bool rendered = false;
@@ -991,6 +1006,278 @@ static bool lookAssistDisoArmRender(mlvObject_t *mlvObject, int frameIndex, int 
     return rendered;
 }
 
+// LOOK-ASSIST-M16-CAST-6 helpers: median / IQR of a scratch vector (reordered).
+static double lookAssistDisoQuantile(std::vector<double> &v, double q)
+{
+    if( v.empty() ) return 0.0;
+    const size_t k = qMin( v.size() - 1, static_cast<size_t>( q * static_cast<double>( v.size() - 1 ) + 0.5 ) );
+    std::nth_element( v.begin(), v.begin() + k, v.end() );
+    return v[k];
+}
+
+static double lookAssistDisoIqr(std::vector<double> &v)
+{
+    const double q1 = lookAssistDisoQuantile( v, 0.25 );
+    const double q3 = lookAssistDisoQuantile( v, 0.75 );
+    return q3 - q1;
+}
+
+ReceiptApplier::DisoQuadChroma ReceiptApplier::lookAssistDisoQuadChroma(const uint16_t *bayer, int width, int height,
+                                                                        int black16, const unsigned char *map,
+                                                                        int mapWidth, int mapHeight, int factor,
+                                                                        const int *box)
+{
+    DisoQuadChroma out;
+    if( !bayer || !map || width < 4 || height < 4 || mapWidth != width || mapHeight != height || factor <= 0 ) return out;
+    const int qw = width / 2;
+    const int qh = height / 2;
+    const size_t quads = static_cast<size_t>( qw ) * static_cast<size_t>( qh );
+    std::vector<unsigned char> flag( quads, 0 );
+    std::vector<unsigned char> valid( quads, 0 );
+    std::vector<double> lrg( quads, 0.0 );
+    std::vector<double> lbg( quads, 0.0 );
+    for( int qy = 0; qy < qh; ++qy )
+        for( int qx = 0; qx < qw; ++qx )
+        {
+            const size_t i0 = static_cast<size_t>( 2 * qy ) * width + 2 * qx;
+            const size_t i1 = i0 + width;
+            const size_t q = static_cast<size_t>( qy ) * qw + qx;
+            flag[q] = ( map[i0] | map[i0 + 1] | map[i1] | map[i1 + 1] ) ? 1 : 0;
+            const double r = static_cast<double>( bayer[i0] ) - black16;
+            const double g = 0.5 * ( static_cast<double>( bayer[i0 + 1] ) + bayer[i1] ) - black16;
+            const double b = static_cast<double>( bayer[i1 + 1] ) - black16;
+            if( r > 0.0 && g > 0.0 && b > 0.0 )
+            {
+                valid[q] = 1;
+                lrg[q] = std::log2( r / g );
+                lbg[q] = std::log2( b / g );
+            }
+        }
+    // Chessboard distance (in quads) to the nearest boundary quad (one whose flag differs from a 4-neighbour's).
+    const int kFar = 1 << 20;
+    std::vector<int> dist( quads, kFar );
+    for( int qy = 0; qy < qh; ++qy )
+        for( int qx = 0; qx < qw; ++qx )
+        {
+            const size_t q = static_cast<size_t>( qy ) * qw + qx;
+            const bool edge = ( qx > 0 && flag[q - 1] != flag[q] ) || ( qx + 1 < qw && flag[q + 1] != flag[q] )
+                           || ( qy > 0 && flag[q - qw] != flag[q] ) || ( qy + 1 < qh && flag[q + qw] != flag[q] );
+            if( edge ) dist[q] = 0;
+        }
+    for( int qy = 0; qy < qh; ++qy )
+        for( int qx = 0; qx < qw; ++qx )
+        {
+            int &d = dist[static_cast<size_t>( qy ) * qw + qx];
+            if( qx > 0 ) d = qMin( d, dist[static_cast<size_t>( qy ) * qw + qx - 1] + 1 );
+            if( qy > 0 )
+            {
+                const size_t up = static_cast<size_t>( qy - 1 ) * qw + qx;
+                d = qMin( d, dist[up] + 1 );
+                if( qx > 0 ) d = qMin( d, dist[up - 1] + 1 );
+                if( qx + 1 < qw ) d = qMin( d, dist[up + 1] + 1 );
+            }
+        }
+    for( int qy = qh - 1; qy >= 0; --qy )
+        for( int qx = qw - 1; qx >= 0; --qx )
+        {
+            int &d = dist[static_cast<size_t>( qy ) * qw + qx];
+            if( qx + 1 < qw ) d = qMin( d, dist[static_cast<size_t>( qy ) * qw + qx + 1] + 1 );
+            if( qy + 1 < qh )
+            {
+                const size_t dn = static_cast<size_t>( qy + 1 ) * qw + qx;
+                d = qMin( d, dist[dn] + 1 );
+                if( qx > 0 ) d = qMin( d, dist[dn - 1] + 1 );
+                if( qx + 1 < qw ) d = qMin( d, dist[dn + 1] + 1 );
+            }
+        }
+    // The box in quads (display px * factor / 2), clamped; empty = the whole frame.
+    int bx0 = 0, by0 = 0, bx1 = qw, by1 = qh;
+    if( box )
+    {
+        bx0 = qBound( 0, box[0] * factor / 2, qw );
+        by0 = qBound( 0, box[1] * factor / 2, qh );
+        bx1 = qBound( 0, box[2] * factor / 2, qw );
+        by1 = qBound( 0, box[3] * factor / 2, qh );
+        if( bx1 <= bx0 || by1 <= by0 ) { bx0 = 0; by0 = 0; bx1 = qw; by1 = qh; }
+    }
+    std::vector<double> inR, inB, outR, outB, flR, flB;
+    for( int qy = by0; qy < by1; ++qy )
+        for( int qx = bx0; qx < bx1; ++qx )
+        {
+            const size_t q = static_cast<size_t>( qy ) * qw + qx;
+            if( !valid[q] ) continue;
+            if( flag[q] ) { flR.push_back( lrg[q] ); flB.push_back( lbg[q] ); }
+            if( dist[q] > 16 ) continue;
+            if( flag[q] ) { inR.push_back( lrg[q] ); inB.push_back( lbg[q] ); }
+            else { outR.push_back( lrg[q] ); outB.push_back( lbg[q] ); }
+        }
+    out.ringIn = static_cast<long long>( inR.size() );
+    out.ringOut = static_cast<long long>( outR.size() );
+    out.flagged = static_cast<long long>( flR.size() );
+    if( inR.size() >= 50 && outR.size() >= 50 )
+        out.seam = std::fabs( lookAssistDisoQuantile( inR, 0.5 ) - lookAssistDisoQuantile( outR, 0.5 ) )
+                 + std::fabs( lookAssistDisoQuantile( inB, 0.5 ) - lookAssistDisoQuantile( outB, 0.5 ) );
+    if( flR.size() >= 50 ) out.block = lookAssistDisoIqr( flR ) + lookAssistDisoIqr( flB );
+    // The frame's tiles.
+    std::vector<double> tileBlocks;
+    for( int ty = 0; ty < qh; ty += 32 )
+        for( int tx = 0; tx < qw; tx += 32 )
+        {
+            std::vector<double> tR, tB;
+            for( int qy = ty; qy < qMin( qh, ty + 32 ); ++qy )
+                for( int qx = tx; qx < qMin( qw, tx + 32 ); ++qx )
+                {
+                    const size_t q = static_cast<size_t>( qy ) * qw + qx;
+                    if( valid[q] && flag[q] ) { tR.push_back( lrg[q] ); tB.push_back( lbg[q] ); }
+                }
+            if( tR.size() >= 256 ) tileBlocks.push_back( lookAssistDisoIqr( tR ) + lookAssistDisoIqr( tB ) );
+        }
+    out.tiles = static_cast<int>( tileBlocks.size() );
+    if( !tileBlocks.empty() ) out.blockTileMedian = lookAssistDisoQuantile( tileBlocks, 0.5 );
+    return out;
+}
+
+// LOOK-ASSIST-M16-CAST-6 LA: Look Assist's white-balance decision made on one arm's own render. The arm (its overrides on)
+// is rendered as the run's colour picture was (the live grade, the analysis exposure, the base balance) but isolated and
+// cache-free so the overrides reach it; the neutral-patch search runs on it, the patch is solved on the arm's isolated
+// debayer, and the one shared decision (resolveLookAssistWhiteBalance) does the rest. picture receives the render.
+struct LookAssistDisoArmBalance
+{
+    bool rendered = false;
+    bool patch = false;
+    int temperature = 0;
+    int tint = 0;
+    int candidateTemperature = 0;
+    int candidateTint = 0;
+    QString source;
+    QString decision;
+};
+
+static LookAssistDisoArmBalance lookAssistDisoArmLookAssistBalance(mlvObject_t *mlvObject, int frameIndex,
+                                                                   int downscaleFactor, int width, int height,
+                                                                   const ReceiptApplier::DualIsoTraceLookAssist &la,
+                                                                   const LookAssistDisoSwitchArms &switchArms,
+                                                                   std::vector<unsigned char> *picture)
+{
+    LookAssistDisoArmBalance out;
+    picture->assign( static_cast<size_t>( width ) * static_cast<size_t>( height ) * 3u, 0 );
+    processingObject_t *clone = processingCloneForAnalysis( mlvObject->processing );
+    if( !clone ) return out;
+    const int analysisExposure = la.analysisExposure != LookAssistWhiteBalanceRequest::kLookAssistNoAnalysisExposure
+                               ? la.analysisExposure
+                               : presetForLookAssistScene( la.scene, la.stats, nullptr, nullptr, la.flavor ).exposure;
+    processingSetExposureStops( clone, analysisExposure / 100.0 );
+    processingSetWhiteBalance( clone, la.baseTemperature, la.baseTint / 10.0 );
+    llrpSetIsolatedAnalysisDualIsoArmsForCurrentThread( -1, 0, 0.0, nullptr );
+    lookAssistDisoSetSwitchArms( switchArms );
+    const int previousReadOnly = llrpSetIsolatedAnalysisSharedStateReadOnlyForCurrentThread( 1 );
+    out.rendered = get_area_average_downscale_thumnail_with_processing_cachefree(
+        mlvObject, frameIndex, downscaleFactor, 1, clone, nullptr, picture->data() ) != 0;
+    llrpSetIsolatedAnalysisSharedStateReadOnlyForCurrentThread( previousReadOnly );
+    llrpSetIsolatedAnalysisDualIsoArmsForCurrentThread( -1, 0, 0.0, nullptr );
+    processingFreeClone( clone );
+    if( !out.rendered ) return out;
+
+    LookAssistStats processed = analyzeLookAssistThumbnail( picture->data(), width, height );
+    LookAssistPreset preset = presetForLookAssistScene( la.scene, la.stats, &processed, nullptr, la.flavor );
+    LookAssistWhiteBalanceRequest request;
+    request.stats = &la.stats;
+    request.scene = la.scene;
+    request.patch = findLookAssistAutoWhiteBalancePatch( picture->data(), width, height, downscaleFactor,
+                                                         mlvObject->RAWI.xRes, mlvObject->RAWI.yRes );
+    request.solvedOnProcessedPicture = true;
+    request.baseTemperature = la.baseTemperature;
+    request.baseTint = la.baseTint;
+    request.rawWidth = mlvObject->RAWI.xRes;
+    request.rawHeight = mlvObject->RAWI.yRes;
+    request.analysisExposure = la.analysisExposure;
+    out.patch = request.patch.valid;
+    // The solve reads the arm's own isolated debayer (the arm's overrides on for its duration only).
+    LookAssistDisoSwitchArms solveArms = switchArms;
+    solveArms.captureMaps = false;
+    solveArms.captureOutput = false;
+    const LookAssistWhiteBalanceResolution wb = resolveLookAssistWhiteBalance(
+        request,
+        [&]( int rawX, int rawY, int *solvedTemperature, int *solvedTint )
+        {
+            llrpSetIsolatedAnalysisDualIsoArmsForCurrentThread( -1, 0, 0.0, nullptr );
+            lookAssistDisoSetSwitchArms( solveArms );
+            const int previous = llrpSetIsolatedAnalysisSharedStateReadOnlyForCurrentThread( 1 );
+            findMlvWhiteBalanceIsolated( mlvObject, static_cast<uint64_t>( frameIndex ), rawX, rawY,
+                                         solvedTemperature, solvedTint, 0 );
+            llrpSetIsolatedAnalysisSharedStateReadOnlyForCurrentThread( previous );
+            llrpSetIsolatedAnalysisDualIsoArmsForCurrentThread( -1, 0, 0.0, nullptr );
+        },
+        &preset );
+    out.temperature = wb.temperature;
+    out.tint = wb.tint;
+    out.candidateTemperature = wb.candidateTemperature;
+    out.candidateTint = wb.candidateTint;
+    out.source = wb.source;
+    out.decision = wb.decision;
+    return out;
+}
+
+// LOOK-ASSIST-M16-CAST-6 display metrics on fixed masks (8-bit): OLIVE = LO share with G-B >= 12 and R-B >= 4; MEANBR =
+// mean (B-R) over LO+HI; NEUTRAL = per box mean max(|R-G|, |B-G|).
+static double lookAssistDisoOlive(const std::vector<unsigned char> &rgb, const std::vector<size_t> &lo)
+{
+    if( lo.empty() ) return 0.0;
+    size_t n = 0;
+    for( size_t i : lo )
+        if( rgb[i * 3 + 1] - rgb[i * 3 + 2] >= 12 && rgb[i * 3] - rgb[i * 3 + 2] >= 4 ) ++n;
+    return 100.0 * static_cast<double>( n ) / static_cast<double>( lo.size() );
+}
+
+static double lookAssistDisoMeanBr(const std::vector<unsigned char> &rgb, const std::vector<size_t> &lo,
+                                   const std::vector<size_t> &hi)
+{
+    double sum = 0.0;
+    for( size_t i : lo ) sum += rgb[i * 3 + 2] - rgb[i * 3];
+    for( size_t i : hi ) sum += rgb[i * 3 + 2] - rgb[i * 3];
+    const size_t n = lo.size() + hi.size();
+    return n ? sum / static_cast<double>( n ) : 0.0;
+}
+
+static QString lookAssistDisoRobustFields(const dualiso_levels_probe_t &p)
+{
+    static const char *names[4] = { "R", "G1", "G2", "B" };
+    QString s;
+    for( int c = 0; c < 4; ++c )
+    {
+        const dualiso_robust_fit_t &f = p.fr_robust[c];
+        s += QStringLiteral( "%1%2:ts%3/%4/%5" ).arg( c ? QStringLiteral( "|" ) : QString() ).arg( QLatin1String( names[c] ) )
+                 .arg( f.ts.n ).arg( f.ts.ev, 0, 'f', 3 ).arg( f.ts.bd, 0, 'f', 2 );
+        for( int b = 0; b < 3; ++b )
+            s += QStringLiteral( ",b%1:%2/%3/%4" ).arg( b + 1 ).arg( f.band[b].n ).arg( f.band[b].ev, 0, 'f', 3 )
+                     .arg( f.band[b].bd, 0, 'f', 2 );
+    }
+    return s;
+}
+
+static QString lookAssistDisoQ0Fields(const dualiso_q0_t &q)
+{
+    QString s = QStringLiteral( "n=%1/%2 m_dark=%3 m_bright=%4 a=%5 x8=" )
+        .arg( q.n[0] ).arg( q.n[1] ).arg( q.m[0], 0, 'f', 4 ).arg( q.m[1], 0, 'f', 4 ).arg( q.a, 0, 'f', 3 );
+    for( int g = 0; g < 4; ++g )
+        s += QStringLiteral( "%1%2:%3/%4/%5" ).arg( g ? QStringLiteral( "|" ) : QString() ).arg( 2 * g + 1 )
+                 .arg( q.n8[0][g] ).arg( q.n8[1][g] ).arg( q.a8[g], 0, 'f', 3 );
+    return s;
+}
+
+// LOOK-ASSIST-M16-CAST-6: M16-1243's CAST-4 floor boxes (display px at factor 3, crops.json), per arm frame; the SEAM /
+// BLOCK region. Any other frame or clip (or a box that clamps to nothing) is measured over the whole frame.
+static const int *lookAssistDisoFloorBox(int frame)
+{
+    static const int f0[4] = { 470, 320, 600, 520 };
+    static const int f374[4] = { 60, 220, 300, 440 };
+    static const int f749[4] = { 290, 440, 490, 640 };
+    if( frame == 0 ) return f0;
+    if( frame == 374 ) return f374;
+    if( frame == 749 ) return f749;
+    return nullptr;
+}
+
 // LOOK-ASSIST-M16-CAST-4: the pinned exposure / balance every arm renders at except A1 (as-shot WB) and A5 (Look
 // Assist off). Look Assist's own decision varies run to run (6724 vs 6686 on the same build), so it is never used.
 static const double kLookAssistDisoArmExposure = 3.80;
@@ -1003,7 +1290,8 @@ QString ReceiptApplier::lookAssistDualIsoMatchTrace(mlvObject_t *mlvObject,
                                                     double exposureStops,
                                                     int temperature,
                                                     int tint,
-                                                    const DualIsoTraceImageSink &imageSink)
+                                                    const DualIsoTraceImageSink &imageSink,
+                                                    const DualIsoTraceLookAssist &lookAssist)
 {
     // Diagnostic only, and slow (about four minutes of isolated full-resolution renders on a 5K clip): off unless asked for.
     if( qEnvironmentVariableIntValue( "MLVAPP_LOOK_ASSIST_DISO_MATCH_TRACE" ) == 0 ) return QString();
@@ -1164,32 +1452,63 @@ QString ReceiptApplier::lookAssistDualIsoMatchTrace(mlvObject_t *mlvObject,
         .arg( pinExposure, 0, 'f', 2 ).arg( pinTemperature ).arg( pinTint )
         .arg( exposureStops, 0, 'f', 2 ).arg( temperature ).arg( tint )
         .arg( armFrames[0] ).arg( armFrames[1] ).arg( armFrames[2] );
-    // A6 = the measured bright clip (judgement frame), A6lo = white/4; A10 = the measured (histogram) match of the
-    // rendered frame; A11 = that frame's P2 factors per channel; A12 = the quad-coherent switch.
-    struct Arm { const char *name; int whiteBright; bool measured; bool channel; bool quad; };
-    const int a6White = haveLevels && brightClip > levels.black ? qMin( brightClip, levels.white ) : 0;
-    const int a6loWhite = haveLevels ? levels.white / 4 : 0;
-    const Arm arms[6] = {
-        { "R0",   0,         false, false, false },
-        { "A6",   a6White,   false, false, false },
-        { "A6lo", a6loWhite, false, false, false },
-        { "A10",  0,         true,  false, false },
-        { "A11",  0,         false, true,  false },
-        { "A12",  0,         false, false, true } };
-    trace += QStringLiteral( " a6_white=%1 a6lo_white=%2" ).arg( a6White ).arg( a6loWhite );
+    // LOOK-ASSIST-M16-CAST-6: CAST-5's A6 / A6lo / A10 / A12 arms are retired (their numbers are in CAST-5's run). Per
+    // fixed frame: the probes (levels, P2, P2r, Q0; no render) and the same with the pre-dual-ISO steps off (X0), then
+    // the arms R0, A11 (P2's OLS factors), A11g (G1 only), A11b (B only), A11s (every slope, the global black delta),
+    // A11r (P2r's band-2 factors) and X0 (the pre-dual-ISO steps off), each at LA (Look Assist's own decision on that
+    // arm's render), PIN (3.80 / 6724 / 0) and AS (as-shot). Masks are fixed on R0 at each balance; SEAM / BLOCK come
+    // from each arm's post-recon Bayer capture over R0's overexposed map (P1).
+    int asShotTemperature = 6000;
+    int asShotTint = 0;
+    const bool haveAsShot = asShotWhiteBalanceControls( mlvObject, &asShotTemperature, &asShotTint );
+    int preEnabled = 0;
+    int preApplied = 0;
+    llrpGetLastPreDualIsoForCurrentThread( &preEnabled, &preApplied, nullptr );
+    trace += QStringLiteral( " as_shot=%1/%2/%3 pre_steps=%4 pre_applied=%5 la_ctx=%6" )
+        .arg( haveAsShot ? 1 : 0 ).arg( asShotTemperature ).arg( asShotTint ).arg( preEnabled ).arg( preApplied )
+        .arg( lookAssist.valid ? 1 : 0 );
+    if( lookAssist.valid )
+        trace += QStringLiteral( " la_scene=%1 la_base=%2/%3 la_analysis_exp=%4" )
+            .arg( lookAssistSceneName( lookAssist.scene ) ).arg( lookAssist.baseTemperature ).arg( lookAssist.baseTint )
+            .arg( lookAssist.analysisExposure );
+    // set: 0 = no channel factors, 1 = P2's OLS, 2 = P2r band B2 (Theil-Sen where B2 has no fit).
+    struct Arm { const char *name; int set; int mask; bool bdGlobal; bool preOff; };
+    const Arm arms[7] = {
+        { "R0",   0, 0, false, false },
+        { "A11",  1, 0, false, false },
+        { "A11g", 1, 2, false, false },
+        { "A11b", 1, 8, false, false },
+        { "A11s", 1, 0, true,  false },
+        { "A11r", 2, 0, false, false },
+        { "X0",   0, 0, false, true } };
+    struct Balance { const char *name; double exposure; int temperature; int tint; };
     for( int rf : armFrames )
     {
         trace += QStringLiteral( " arms@%1:" ).arg( rf );
 
-        // P2 on this frame.
+        // The probes on this frame, then the same with the pre-dual-ISO steps off (X0).
         dualiso_levels_probe_t fr;
         memset( &fr, 0, sizeof( fr ) );
         const bool haveFr = lookAssistProbeDualIsoLevels( mlvObject, rf, &fr );
+        llrpSetIsolatedAnalysisPreDualIsoForCurrentThread( 1, 0 );
+        dualiso_levels_probe_t fx;
+        memset( &fx, 0, sizeof( fx ) );
+        const bool haveFx = lookAssistProbeDualIsoLevels( mlvObject, rf, &fx );
+        int x0Enabled = 0;
+        int x0Applied = 0;
+        llrpGetLastPreDualIsoForCurrentThread( &x0Enabled, &x0Applied, nullptr );
+        llrpSetIsolatedAnalysisPreDualIsoForCurrentThread( 0, 0 );
         double channelEv[4] = { 0.0, 0.0, 0.0, 0.0 };
         double channelBd[4] = { 0.0, 0.0, 0.0, 0.0 };
+        double robustEv[4] = { 0.0, 0.0, 0.0, 0.0 };
+        double robustBd[4] = { 0.0, 0.0, 0.0, 0.0 };
         bool fitOk = haveFr;
+        bool robustOk = haveFr;
         double evLo = 0.0, evHi = 0.0, bdLo = 0.0, bdHi = 0.0;
         QString frFields;
+        QString fxFields;
+        QString fxDarkTop;
+        QString robustFrom;
         for( int c = 0; c < 4; ++c )
         {
             channelEv[c] = fr.fr_ev[c];
@@ -1202,101 +1521,172 @@ QString ReceiptApplier::lookAssistDualIsoMatchTrace(mlvObject_t *mlvObject,
             frFields += QStringLiteral( "%1%2:%3/%4/%5" ).arg( c ? QStringLiteral( "|" ) : QString() )
                 .arg( QLatin1String( channelNames[c] ) ).arg( fr.fr_count[c] )
                 .arg( fr.fr_ev[c], 0, 'f', 3 ).arg( fr.fr_bd[c], 0, 'f', 2 );
+            fxFields += QStringLiteral( "%1%2:%3/%4/%5" ).arg( c ? QStringLiteral( "|" ) : QString() )
+                .arg( QLatin1String( channelNames[c] ) ).arg( fx.fr_count[c] )
+                .arg( fx.fr_ev[c], 0, 'f', 3 ).arg( fx.fr_bd[c], 0, 'f', 2 );
+            fxDarkTop += QStringLiteral( "%1%2:%3/%4" ).arg( c ? QStringLiteral( "|" ) : QString() )
+                .arg( QLatin1String( channelNames[c] ) ).arg( fx.p9999[0][c] ).arg( fx.max[0][c] );
+            const dualiso_fit_t &b2 = fr.fr_robust[c].band[1];
+            const dualiso_fit_t &ts = fr.fr_robust[c].ts;
+            if( b2.ev > 0.0 ) { robustEv[c] = b2.ev; robustBd[c] = b2.bd; robustFrom += QStringLiteral( "B2" ); }
+            else if( ts.ev > 0.0 ) { robustEv[c] = ts.ev; robustBd[c] = ts.bd; robustFrom += QStringLiteral( "TS" ); }
+            else { robustOk = false; robustFrom += QStringLiteral( "NA" ); }
+            if( c < 3 ) robustFrom += QStringLiteral( "/" );
         }
         trace += QStringLiteral( " diso_fieldratio valid=%1 clip=%2 n/ev/bd=%3 spread_ev=%4 spread_bd=%5" )
             .arg( haveFr ? 1 : 0 ).arg( fr.fr_bright_clip ).arg( frFields )
             .arg( evHi - evLo, 0, 'f', 3 ).arg( bdHi - bdLo, 0, 'f', 2 );
+        trace += QStringLiteral( " diso_fieldratio_robust %1" ).arg( lookAssistDisoRobustFields( fr ) );
+        trace += QStringLiteral( " diso_q0 %1" ).arg( lookAssistDisoQ0Fields( fr.q0 ) );
+        trace += QStringLiteral( " x0 valid=%1 pre_steps=%2 applied=%3 dark_p9999/max=%4 n/ev/bd=%5 x0_robust %6 x0_q0 %7" )
+            .arg( haveFx ? 1 : 0 ).arg( x0Enabled ).arg( x0Applied ).arg( fxDarkTop ).arg( fxFields )
+            .arg( lookAssistDisoRobustFields( fx ) ).arg( lookAssistDisoQ0Fields( fx.q0 ) );
+        trace += QStringLiteral( " a11r_from=%1" ).arg( robustFrom );
 
-        std::vector<size_t> lo;
-        std::vector<size_t> hi;
+        const Balance pinBalance = { "PIN", pinExposure, pinTemperature, pinTint };
+        const Balance asBalance = { "AS", exposureStops, asShotTemperature, asShotTint };
+        std::vector<size_t> lo[3];
+        std::vector<size_t> hi[3];
+        std::vector<unsigned char> r0Map;
+        int mapW = 0;
+        int mapH = 0;
         for( const Arm &a : arms )
         {
             const bool reference = std::strcmp( a.name, "R0" ) == 0;
-            const bool levelArm = std::strcmp( a.name, "A6" ) == 0 || std::strcmp( a.name, "A6lo" ) == 0;
-            if( levelArm && a.whiteBright <= 0 ) { trace += QStringLiteral( " %1=skipped" ).arg( QLatin1String( a.name ) ); continue; }
-            if( a.channel && !fitOk ) { trace += QStringLiteral( " A11=no_fit" ); continue; }
-            if( !reference && lo.empty() && hi.empty() ) { trace += QStringLiteral( " %1=no_mask" ).arg( QLatin1String( a.name ) ); continue; }
+            if( a.set == 1 && !fitOk ) { trace += QStringLiteral( " %1=no_fit" ).arg( QLatin1String( a.name ) ); continue; }
+            if( a.set == 2 && !robustOk ) { trace += QStringLiteral( " %1=no_fit" ).arg( QLatin1String( a.name ) ); continue; }
+            if( !reference && lo[0].empty() && hi[0].empty() ) { trace += QStringLiteral( " %1=no_mask" ).arg( QLatin1String( a.name ) ); continue; }
             LookAssistDisoSwitchArms sw;
-            sw.measuredMatch = a.measured;
-            sw.channelEv = a.channel ? channelEv : nullptr;
-            sw.channelBd = a.channel ? channelBd : nullptr;
-            sw.quadCoherent = a.quad;
-            sw.captureMaps = reference; // P1 is R0's map, never an arm's
+            sw.channelEv = a.set == 1 ? channelEv : a.set == 2 ? robustEv : nullptr;
+            sw.channelBd = a.set == 1 ? channelBd : a.set == 2 ? robustBd : nullptr;
+            sw.channelMask = a.mask;
+            sw.channelBdGlobal = a.bdGlobal;
+            sw.preStepsOff = a.preOff;
+
+            // LA: Look Assist's decision on this arm's own render. That render also captures the arm's post-recon Bayer
+            // output (SEAM / BLOCK) and, for R0 only, the overexposed map (P1: every arm is measured on R0's map).
+            LookAssistDisoSwitchArms capture = sw;
+            capture.captureOutput = true;
+            capture.captureMaps = reference;
             if( reference ) dualiso_switch_capture_clear();
-            std::vector<unsigned char> rgb( pixels * 3u, 0 );
-            const bool rendered = lookAssistDisoArmRender( mlvObject, rf, downscaleFactor, pinExposure, pinTemperature,
-                                                           pinTint, false, -1, a.whiteBright, 0.0, nullptr, &rgb, sw );
-            if( !rendered )
-            {
-                if( reference ) dualiso_switch_capture_clear();
-                trace += QStringLiteral( " %1=unrendered" ).arg( QLatin1String( a.name ) );
-                continue;
-            }
-            const std::vector<size_t> ownLo = lookAssistLumaBandMask( rgb, pixels );
-            const std::vector<size_t> ownHi = lookAssistLumaBandMask( rgb, pixels, 121, 235 );
+            dualiso_output_capture_clear();
+            std::vector<unsigned char> picture;
+            const LookAssistDisoArmBalance balance = lookAssistDisoArmLookAssistBalance(
+                mlvObject, rf, downscaleFactor, width, height, lookAssist, capture, &picture );
+            int capW = 0;
+            int capH = 0;
+            int capBlack = 0;
+            std::vector<uint16_t> bayer;
+            if( const uint16_t *cap = dualiso_output_capture( &capW, &capH, &capBlack ) )
+                bayer.assign( cap, cap + static_cast<size_t>( capW ) * static_cast<size_t>( capH ) );
+            dualiso_output_capture_clear();
             if( reference )
             {
-                lo = ownLo;
-                hi = ownHi;
-            }
-            double dbm = 0.0;
-            double psh = 0.0;
-            lookAssistDarkBandMagenta( rgb, lo, &dbm, &psh );
-            const double blk = lookAssistBlotchShare( rgb, width, height, lo );
-            double lav = 0.0;
-            double cyn = 0.0;
-            lookAssistHiCast( rgb, hi, &lav, &cyn );
-            const double blkHi = lookAssistBlotchShare( rgb, width, height, hi );
-            trace += QStringLiteral( " %1=dbm%2/psh%3/blk%4/m%5/own%6/lav%7/cyn%8/blkhi%9/mh%10/ownh%11" )
-                .arg( QLatin1String( a.name ) )
-                .arg( dbm, 0, 'f', 1 ).arg( psh, 0, 'f', 2 ).arg( blk, 0, 'f', 2 )
-                .arg( lo.size() ).arg( ownLo.size() )
-                .arg( lav, 0, 'f', 2 ).arg( cyn, 0, 'f', 2 ).arg( blkHi, 0, 'f', 2 )
-                .arg( hi.size() ).arg( ownHi.size() );
-            if( a.channel )
-                trace += QStringLiteral( " a11_used=%1/%2/%3/%4|%5/%6/%7/%8" )
-                    .arg( channelEv[0], 0, 'f', 3 ).arg( channelEv[1], 0, 'f', 3 )
-                    .arg( channelEv[2], 0, 'f', 3 ).arg( channelEv[3], 0, 'f', 3 )
-                    .arg( channelBd[0], 0, 'f', 2 ).arg( channelBd[1], 0, 'f', 2 )
-                    .arg( channelBd[2], 0, 'f', 2 ).arg( channelBd[3], 0, 'f', 2 );
-            if( reference )
-            {
-                // P1: R0's own overexposed mark (mix_images, before the blur) against R0's display render.
-                int mapW = 0;
-                int mapH = 0;
-                const unsigned char *map = dualiso_switch_capture_map( DUALISO_SWITCH_SITE_OVEREXPOSED, &mapW, &mapH );
-                if( !map )
-                    trace += QStringLiteral( " p1=no_map" );
-                else if( mapW != mlvObject->RAWI.xRes || mapH != mlvObject->RAWI.yRes )
-                    trace += QStringLiteral( " p1=map_%1x%2_not_fullres" ).arg( mapW ).arg( mapH );
-                else
-                {
-                    std::vector<unsigned char> flags;
-                    const DisoProvenance p = lookAssistDisoProvenance( rgb.data(), width, height, map, mapW, mapH,
-                                                                       downscaleFactor, &flags );
-                    trace += QStringLiteral( " p1 map=%1x%2 factor=%3 raw_flagged=%4 display_flagged=%5 lav=%6 "
-                                             "lav_flagged=%7 other=%8 other_flagged=%9 c=%10 r=%11" )
-                        .arg( mapW ).arg( mapH ).arg( downscaleFactor ).arg( p.rawFlagged ).arg( p.displayFlagged )
-                        .arg( p.lav ).arg( p.lavFlagged ).arg( p.other ).arg( p.otherFlagged )
-                        .arg( p.c, 0, 'f', 4 ).arg( p.r, 0, 'f', 4 );
-                    if( imageSink )
-                    {
-                        // The overlay: R0 with every flagged display pixel blended half-way to yellow.
-                        std::vector<unsigned char> overlay = rgb;
-                        for( size_t i = 0; i < pixels; ++i )
-                        {
-                            if( !flags[i] ) continue;
-                            overlay[i * 3] = static_cast<unsigned char>( ( overlay[i * 3] + 255 ) / 2 );
-                            overlay[i * 3 + 1] = static_cast<unsigned char>( ( overlay[i * 3 + 1] + 255 ) / 2 );
-                            overlay[i * 3 + 2] = static_cast<unsigned char>( overlay[i * 3 + 2] / 2 );
-                        }
-                        imageSink( QStringLiteral( "f%1-P1" ).arg( rf ), width, height, overlay.data() );
-                    }
-                }
+                if( const unsigned char *m = dualiso_switch_capture_map( DUALISO_SWITCH_SITE_OVEREXPOSED, &mapW, &mapH ) )
+                    r0Map.assign( m, m + static_cast<size_t>( mapW ) * static_cast<size_t>( mapH ) );
                 dualiso_switch_capture_clear();
             }
-            if( imageSink )
-                imageSink( QStringLiteral( "f%1-%2" ).arg( rf ).arg( QLatin1String( a.name ) ), width, height, rgb.data() );
+            const bool laOwn = lookAssist.valid && balance.rendered;
+            const Balance laBalance = { "LA", exposureStops, laOwn ? balance.temperature : temperature,
+                                        laOwn ? balance.tint : tint };
+            trace += QStringLiteral( " %1:la=%2/%3 la_src=%4 la_dec=%5 la_cand=%6/%7 la_patch=%8" )
+                .arg( QLatin1String( a.name ) ).arg( laBalance.temperature ).arg( laBalance.tint )
+                .arg( laOwn ? balance.source : QStringLiteral( "run" ) )
+                .arg( laOwn ? balance.decision : QStringLiteral( "run" ) )
+                .arg( balance.candidateTemperature ).arg( balance.candidateTint ).arg( balance.patch ? 1 : 0 );
+            const DisoQuadChroma qc = ( !bayer.empty() && !r0Map.empty() )
+                ? lookAssistDisoQuadChroma( bayer.data(), capW, capH, capBlack, r0Map.data(), mapW, mapH, downscaleFactor,
+                                            lookAssistDisoFloorBox( rf ) )
+                : DisoQuadChroma();
+            trace += QStringLiteral( " seam=%1 block=%2 tilemed=%3 tiles=%4 ring=%5/%6 fl=%7 cap=%8x%9" )
+                .arg( qc.seam, 0, 'f', 4 ).arg( qc.block, 0, 'f', 4 ).arg( qc.blockTileMedian, 0, 'f', 4 )
+                .arg( qc.tiles ).arg( qc.ringIn ).arg( qc.ringOut ).arg( qc.flagged ).arg( capW ).arg( capH );
+            trace += QStringLiteral( " mapfl=%1" )
+                .arg( static_cast<long long>( std::count( r0Map.begin(), r0Map.end(), static_cast<unsigned char>( 1 ) ) ) );
+            if( a.set )
+                trace += QStringLiteral( " a11_used=%1/%2/%3/%4|%5/%6/%7/%8 mask=%9" )
+                    .arg( sw.channelEv[0], 0, 'f', 3 ).arg( sw.channelEv[1], 0, 'f', 3 )
+                    .arg( sw.channelEv[2], 0, 'f', 3 ).arg( sw.channelEv[3], 0, 'f', 3 )
+                    .arg( sw.channelBd[0], 0, 'f', 2 ).arg( sw.channelBd[1], 0, 'f', 2 )
+                    .arg( sw.channelBd[2], 0, 'f', 2 ).arg( sw.channelBd[3], 0, 'f', 2 ).arg( a.mask )
+                    + ( a.bdGlobal ? QStringLiteral( " bd=global" ) : QString() );
+
+            const Balance balances[3] = { laBalance, pinBalance, asBalance };
+            for( int k = 0; k < 3; ++k )
+            {
+                std::vector<unsigned char> rgb( pixels * 3u, 0 );
+                if( !lookAssistDisoArmRender( mlvObject, rf, downscaleFactor, balances[k].exposure, balances[k].temperature,
+                                              balances[k].tint, false, -1, 0, 0.0, nullptr, &rgb, sw ) )
+                {
+                    trace += QStringLiteral( " %1@%2=unrendered" ).arg( QLatin1String( a.name ) )
+                                 .arg( QLatin1String( balances[k].name ) );
+                    continue;
+                }
+                const std::vector<size_t> ownLo = lookAssistLumaBandMask( rgb, pixels );
+                const std::vector<size_t> ownHi = lookAssistLumaBandMask( rgb, pixels, 121, 235 );
+                if( reference )
+                {
+                    lo[k] = ownLo;
+                    hi[k] = ownHi;
+                }
+                double dbm = 0.0;
+                double psh = 0.0;
+                lookAssistDarkBandMagenta( rgb, lo[k], &dbm, &psh );
+                const double blk = lookAssistBlotchShare( rgb, width, height, lo[k] );
+                double lav = 0.0;
+                double cyn = 0.0;
+                lookAssistHiCast( rgb, hi[k], &lav, &cyn );
+                const double blkHi = lookAssistBlotchShare( rgb, width, height, hi[k] );
+                // LA keeps CAST-5's token (the arm name alone); PIN / AS are suffixed.
+                const QString tag = k == 0 ? QString::fromLatin1( a.name )
+                                           : QStringLiteral( "%1@%2" ).arg( QLatin1String( a.name ) )
+                                                 .arg( QLatin1String( balances[k].name ) );
+                trace += QStringLiteral( " %1=dbm%2/psh%3/blk%4/m%5/own%6/lav%7/cyn%8/blkhi%9/mh%10/ownh%11" )
+                    .arg( tag )
+                    .arg( dbm, 0, 'f', 1 ).arg( psh, 0, 'f', 2 ).arg( blk, 0, 'f', 2 )
+                    .arg( lo[k].size() ).arg( ownLo.size() )
+                    .arg( lav, 0, 'f', 2 ).arg( cyn, 0, 'f', 2 ).arg( blkHi, 0, 'f', 2 )
+                    .arg( hi[k].size() ).arg( ownHi.size() );
+                trace += QStringLiteral( "/olive%1/mbr%2/t%3/%4" )
+                    .arg( lookAssistDisoOlive( rgb, lo[k] ), 0, 'f', 2 )
+                    .arg( lookAssistDisoMeanBr( rgb, lo[k], hi[k] ), 0, 'f', 2 )
+                    .arg( balances[k].temperature ).arg( balances[k].tint );
+                if( reference && k == 0 && !r0Map.empty() )
+                {
+                    // P1: R0's own overexposed mark against R0's display render at LA.
+                    if( mapW != mlvObject->RAWI.xRes || mapH != mlvObject->RAWI.yRes )
+                        trace += QStringLiteral( " p1=map_%1x%2_not_fullres" ).arg( mapW ).arg( mapH );
+                    else
+                    {
+                        std::vector<unsigned char> flags;
+                        const DisoProvenance p = lookAssistDisoProvenance( rgb.data(), width, height, r0Map.data(), mapW,
+                                                                           mapH, downscaleFactor, &flags );
+                        trace += QStringLiteral( " p1 map=%1x%2 factor=%3 raw_flagged=%4 display_flagged=%5 lav=%6 "
+                                                 "lav_flagged=%7 other=%8 other_flagged=%9 c=%10 r=%11" )
+                            .arg( mapW ).arg( mapH ).arg( downscaleFactor ).arg( p.rawFlagged ).arg( p.displayFlagged )
+                            .arg( p.lav ).arg( p.lavFlagged ).arg( p.other ).arg( p.otherFlagged )
+                            .arg( p.c, 0, 'f', 4 ).arg( p.r, 0, 'f', 4 );
+                        if( imageSink )
+                        {
+                            std::vector<unsigned char> overlay = rgb;
+                            for( size_t i = 0; i < pixels; ++i )
+                            {
+                                if( !flags[i] ) continue;
+                                overlay[i * 3] = static_cast<unsigned char>( ( overlay[i * 3] + 255 ) / 2 );
+                                overlay[i * 3 + 1] = static_cast<unsigned char>( ( overlay[i * 3 + 1] + 255 ) / 2 );
+                                overlay[i * 3 + 2] = static_cast<unsigned char>( overlay[i * 3 + 2] / 2 );
+                            }
+                            imageSink( QStringLiteral( "f%1-P1" ).arg( rf ), width, height, overlay.data() );
+                        }
+                    }
+                }
+                else if( reference && k == 0 )
+                    trace += QStringLiteral( " p1=no_map" );
+                if( imageSink && k < 2 )
+                    imageSink( k == 0 ? QStringLiteral( "f%1-%2" ).arg( rf ).arg( QLatin1String( a.name ) )
+                                      : QStringLiteral( "f%1-%2-PIN" ).arg( rf ).arg( QLatin1String( a.name ) ),
+                               width, height, rgb.data() );
+            }
         }
     }
     trace += QStringLiteral( " arms_ms=%1" ).arg( armsClock.elapsed() );
@@ -1755,8 +2145,18 @@ bool ReceiptApplier::applyHeadlessLookAssist(ReceiptSettings *receipt,
         .arg( lookAssistDecisionLogFields( stats, decisionTrace ) )
         .arg( lookAssistFlavorName( flavor ) ) );
 
+    // LOOK-ASSIST-M16-CAST-6: what this run's balance was decided from, so each arm's LA is the same decision.
+    DualIsoTraceLookAssist disoLookAssist;
+    disoLookAssist.valid = useProcessedColorStats;
+    disoLookAssist.stats = stats;
+    disoLookAssist.scene = scene;
+    disoLookAssist.flavor = flavor;
+    disoLookAssist.baseTemperature = baseTemperature;
+    disoLookAssist.baseTint = baseTint;
+    disoLookAssist.analysisExposure = wbRequest.analysisExposure;
     const QString disoMatch = lookAssistDualIsoMatchTrace( mlvObject, frameIndex, colorDownscaleFactor,
-                                                           preset.exposure / 100.0, temperature, tint );
+                                                           preset.exposure / 100.0, temperature, tint,
+                                                           DualIsoTraceImageSink(), disoLookAssist );
     if( !disoMatch.isEmpty() )
         BatchLogger::out( QStringLiteral( "[BATCH] LOOK_ASSIST diso_match frame=%1 %2\n" )
                               .arg( frameIndex ).arg( disoMatch ) );

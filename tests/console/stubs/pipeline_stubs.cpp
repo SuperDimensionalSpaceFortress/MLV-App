@@ -100,6 +100,18 @@ int dualiso_levels_probe_get(dualiso_levels_probe_t * probe)
 void llrpSetIsolatedAnalysisDualIsoSwitchArmsForCurrentThread(const double *, const double *, int, int) {}
 const unsigned char * dualiso_switch_capture_map(int, int *, int *) { return nullptr; }
 void dualiso_switch_capture_clear(void) {}
+// LOOK-ASSIST-M16-CAST-6
+void llrpSetIsolatedAnalysisDualIsoChannelArmsForCurrentThread(int, int, int) {}
+int llrpSetIsolatedAnalysisPreDualIsoForCurrentThread(int, int) { return 0; }
+int llrpGetLastPreDualIsoForCurrentThread(int * enabled_mask, int * applied_mask, unsigned long long * buffer_hash)
+{
+    if (enabled_mask) *enabled_mask = 0;
+    if (applied_mask) *applied_mask = 0;
+    if (buffer_hash) *buffer_hash = 0;
+    return 0;
+}
+const uint16_t * dualiso_output_capture(int *, int *, int *) { return nullptr; }
+void dualiso_output_capture_clear(void) {}
 void llrpInitDarkFrameExtFileName(mlvObject_t * video, char * df_filename)
 {
     if (video->llrawproc->dark_frame_filename) {

@@ -330,7 +330,7 @@ TEST(LookAssistDisoLevelsProbe, ReportsTheSyntheticFloorAndClipPerField)
     }
 }
 
-namespace { bool switchArmsAreReset(); } // LOOK-ASSIST-M16-CAST-5, below
+namespace { bool switchArmsAreReset(); bool channelArmsAreReset(); } // LOOK-ASSIST-M16-CAST-5 / -6, below
 
 TEST(LookAssistDisoArms, TheTracePinsTheBalanceFixesBothMasksOnR0AndResetsEveryArm)
 {
@@ -360,8 +360,9 @@ TEST(LookAssistDisoArms, TheTracePinsTheBalanceFixesBothMasksOnR0AndResetsEveryA
     ASSERT_TRUE( switchArmsAreReset() );
     ASSERT_TRUE( before == sharedMatch( video ) );
 
+    // LOOK-ASSIST-M16-CAST-6: the arms are R0, A11, A11g, A11b, A11s, A11r and X0; the LA token is the arm name alone.
     const QRegularExpression armRe( QStringLiteral(
-        " (R0|A6lo|A6|A10|A11|A12)=dbm(-?[0-9.]+)/psh([0-9.]+)/blk([0-9.]+)/m([0-9]+)/own([0-9]+)"
+        " (R0|A11g|A11b|A11s|A11r|A11|X0)=dbm(-?[0-9.]+)/psh([0-9.]+)/blk([0-9.]+)/m([0-9]+)/own([0-9]+)"
         "/lav([0-9.]+)/cyn([0-9.]+)/blkhi([0-9.]+)/mh([0-9]+)/ownh([0-9]+)" ) );
     const QStringList blocks = trace.split( QStringLiteral( " arms@" ) );
     ASSERT_EQ( 4, blocks.size() );
@@ -399,15 +400,23 @@ TEST(LookAssistDisoArms, TheTracePinsTheBalanceFixesBothMasksOnR0AndResetsEveryA
                 if( ownHi != r0Hi ) someArmOwnsAnotherHi = true;
             }
         }
-        ASSERT_TRUE( names.join( QLatin1Char( ',' ) ) == QStringLiteral( "R0,A6,A6lo,A10,A11,A12" ) );
+        ASSERT_TRUE( names.join( QLatin1Char( ',' ) ) == QStringLiteral( "R0,A11,A11g,A11b,A11s,A11r,X0" ) );
         ASSERT_TRUE( blocks[b].contains( QStringLiteral( " p1 map=" ) ) );
         ASSERT_TRUE( blocks[b].contains( QStringLiteral( " a11_used=" ) ) );
+        ASSERT_TRUE( blocks[b].contains( QStringLiteral( " diso_fieldratio_robust R:ts" ) ) );
+        ASSERT_TRUE( blocks[b].contains( QStringLiteral( " diso_q0 n=" ) ) );
+        ASSERT_TRUE( blocks[b].contains( QStringLiteral( " x0 valid=1 " ) ) );
+        ASSERT_TRUE( blocks[b].contains( QStringLiteral( " R0@PIN=dbm" ) ) );
+        ASSERT_TRUE( blocks[b].contains( QStringLiteral( " X0@AS=dbm" ) ) );
+        ASSERT_TRUE( blocks[b].contains( QStringLiteral( "/t6724/0" ) ) ); // PIN rendered at the pinned balance
     }
     ASSERT_TRUE( someArmOwnsAnotherLo );
     ASSERT_TRUE( someArmOwnsAnotherHi );
     ASSERT_TRUE( sunk.contains( QStringLiteral( "f0-R0" ) ) );
     ASSERT_TRUE( sunk.contains( QStringLiteral( "f0-P1" ) ) );
-    ASSERT_TRUE( sunk.contains( QStringLiteral( "f0-A12" ) ) );
+    ASSERT_TRUE( sunk.contains( QStringLiteral( "f0-A11g" ) ) );
+    ASSERT_TRUE( sunk.contains( QStringLiteral( "f0-X0-PIN" ) ) );
+    ASSERT_TRUE( channelArmsAreReset() );
 }
 
 // ---------------------------------------------------------------------------------------------------------------------
@@ -764,4 +773,515 @@ TEST(LookAssistDisoFieldRatio, P2RecoversAKnownPerChannelRatio)
         ASSERT_NEAR( ev[c], levels.fr_ev[c], 0.01 );
         ASSERT_NEAR( bd[c], levels.fr_bd[c], 1.0 );
     }
+}
+
+// ---------------------------------------------------------------------------------------------------------------------
+// LOOK-ASSIST-M16-CAST-6: the split A11 arms (A11g / A11b / A11s / A11r), X0 (the pre-dual-ISO steps off), the post-recon
+// capture (SEAM / BLOCK), the per-arm Look Assist balance (LA) and the two estimators (P2r, Q0). Every arm-reaches test
+// must fail if its arm is inert.
+
+namespace
+{
+
+bool channelArmsAreReset()
+{
+    int mask = -1;
+    int bdGlobal = -1;
+    int capture = -1;
+    int enabled = 0;
+    int applied = 0;
+    return llrpGetIsolatedAnalysisDualIsoChannelArmsForCurrentThread( &mask, &bdGlobal, &capture ) == 0
+        && mask == 0 && bdGlobal == 0 && capture == 0
+        && llrpGetLastPreDualIsoForCurrentThread( &enabled, &applied, nullptr ) == 0;
+}
+
+dualiso_match_probe_t matchProbeWithChannelArms(mlvObject_t *video, const double *channelEv, const double *channelBd,
+                                                int mask, bool bdGlobal)
+{
+    llrpSetIsolatedAnalysisDualIsoArmsForCurrentThread( -1, 0, 0.0, nullptr );
+    llrpSetIsolatedAnalysisDualIsoSwitchArmsForCurrentThread( channelEv, channelBd, 0, 0 );
+    llrpSetIsolatedAnalysisDualIsoChannelArmsForCurrentThread( mask, bdGlobal ? 1 : 0, 0 );
+    const dualiso_match_probe_t p = probe( video, LLRP_ANALYSIS_DISO_MATCH_SEED, 1.0, -1, true );
+    llrpSetIsolatedAnalysisDualIsoArmsForCurrentThread( -1, 0, 0.0, nullptr );
+    return p;
+}
+
+QString traceOnFixture(mlvObject_t *video, const ReceiptApplier::DualIsoTraceLookAssist &la =
+                                               ReceiptApplier::DualIsoTraceLookAssist())
+{
+    const QByteArray previous = qgetenv( "MLVAPP_LOOK_ASSIST_DISO_MATCH_TRACE" );
+    const bool wasSet = qEnvironmentVariableIsSet( "MLVAPP_LOOK_ASSIST_DISO_MATCH_TRACE" );
+    qputenv( "MLVAPP_LOOK_ASSIST_DISO_MATCH_TRACE", "1" );
+    const QString trace = ReceiptApplier::lookAssistDualIsoMatchTrace( video, 0, 3, 0.0, 6000, 0,
+                                                                      ReceiptApplier::DualIsoTraceImageSink(), la );
+    if( wasSet ) qputenv( "MLVAPP_LOOK_ASSIST_DISO_MATCH_TRACE", previous );
+    else qunsetenv( "MLVAPP_LOOK_ASSIST_DISO_MATCH_TRACE" );
+    return trace;
+}
+
+// The 16-bit Bayer the HQ recon hands over for one isolated render of frame 0 (capture_output), and the input it saw.
+std::vector<uint16_t> capturedOutput(mlvObject_t *video, int *w, int *h, int *black16)
+{
+    llrpSetIsolatedAnalysisDualIsoArmsForCurrentThread( -1, 0, 0.0, nullptr );
+    llrpSetIsolatedAnalysisDualIsoChannelArmsForCurrentThread( 0, 0, 1 );
+    dualiso_output_capture_clear();
+    isolatedFrame( video );
+    llrpSetIsolatedAnalysisDualIsoArmsForCurrentThread( -1, 0, 0.0, nullptr );
+    std::vector<uint16_t> out;
+    if( const uint16_t *cap = dualiso_output_capture( w, h, black16 ) )
+        out.assign( cap, cap + static_cast<size_t>( *w ) * static_cast<size_t>( *h ) );
+    dualiso_output_capture_clear();
+    return out;
+}
+
+} // namespace
+
+TEST(LookAssistDisoChannelArms, A11gMovesOnlyTheGrBrightRows)
+{
+    MlvPipelineFixture fixture;
+    openHqDualIso( fixture );
+    mlvObject_t *video = fixture.video();
+    const dualiso_match_probe_t r0 = matchProbeWithArms( video, 0, nullptr, nullptr );
+    ASSERT_TRUE( r0.rc > 0 );
+    const double bd14 = r0.black_delta / 64.0;
+    const double ev[4] = { r0.ev + 0.5, r0.ev + 0.5, r0.ev + 0.5, r0.ev + 0.5 };
+    const double bd[4] = { bd14 + 4.0, bd14 + 4.0, bd14 + 4.0, bd14 + 4.0 };
+    const dualiso_match_probe_t g = matchProbeWithChannelArms( video, ev, bd, 2, false );
+    ASSERT_TRUE( g.rc > 0 );
+    for( int c = 0; c < 4; ++c )
+    {
+        if( c == 1 ) ASSERT_TRUE( std::fabs( g.bright_post_mean[c] - r0.bright_post_mean[c] ) > 4.0 );
+        else ASSERT_EQ( r0.bright_post_mean[c], g.bright_post_mean[c] ); // the global line, untouched
+    }
+    ASSERT_TRUE( channelArmsAreReset() );
+    ASSERT_TRUE( switchArmsAreReset() );
+}
+
+TEST(LookAssistDisoChannelArms, A11bMovesOnlyB)
+{
+    MlvPipelineFixture fixture;
+    openHqDualIso( fixture );
+    mlvObject_t *video = fixture.video();
+    const dualiso_match_probe_t r0 = matchProbeWithArms( video, 0, nullptr, nullptr );
+    ASSERT_TRUE( r0.rc > 0 );
+    const double bd14 = r0.black_delta / 64.0;
+    const double ev[4] = { r0.ev - 0.5, r0.ev - 0.5, r0.ev - 0.5, r0.ev - 0.5 };
+    const double bd[4] = { bd14 - 8.0, bd14 - 8.0, bd14 - 8.0, bd14 - 8.0 };
+    const dualiso_match_probe_t b = matchProbeWithChannelArms( video, ev, bd, 8, false );
+    ASSERT_TRUE( b.rc > 0 );
+    for( int c = 0; c < 4; ++c )
+    {
+        if( c == 3 ) ASSERT_TRUE( std::fabs( b.bright_post_mean[c] - r0.bright_post_mean[c] ) > 4.0 );
+        else ASSERT_EQ( r0.bright_post_mean[c], b.bright_post_mean[c] );
+    }
+    ASSERT_TRUE( channelArmsAreReset() );
+}
+
+TEST(LookAssistDisoChannelArms, A11sOffsetsEqualTheGlobalBlackDelta)
+{
+    MlvPipelineFixture fixture;
+    openHqDualIso( fixture );
+    mlvObject_t *video = fixture.video();
+    const dualiso_match_probe_t r0 = matchProbeWithArms( video, 0, nullptr, nullptr );
+    ASSERT_TRUE( r0.rc > 0 );
+    const double f = std::pow( 2.0, -r0.ev );
+    const double ev[4] = { r0.ev + 0.25, r0.ev - 0.25, r0.ev, r0.ev + 0.5 };
+    const double farBd[4] = { 300.0, -300.0, 150.0, -150.0 }; // ignored by A11s
+    const dualiso_match_probe_t s = matchProbeWithChannelArms( video, ev, farBd, 0, true );
+    ASSERT_TRUE( s.rc > 0 );
+    for( int c = 0; c < 4; ++c )
+    {
+        const double fc = std::pow( 2.0, -ev[c] );
+        const double predicted = ( s.bright_pre_mean[c] - r0.black ) * fc + r0.black + r0.black_delta
+                               - r0.black_delta * ( 1.0 - f );
+        ASSERT_NEAR( predicted, s.bright_post_mean[c], 1.0 );
+    }
+    // Channel 2 at the global ev: today's value, whatever bd was passed.
+    ASSERT_NEAR( r0.bright_post_mean[2], s.bright_post_mean[2], 1.0 );
+    ASSERT_TRUE( channelArmsAreReset() );
+}
+
+TEST(LookAssistDisoChannelArms, TheTraceArmsUseTheirFactorsAndA11rIsP2rs)
+{
+    MlvPipelineFixture fixture;
+    openHqDualIso( fixture );
+    mlvObject_t *video = fixture.video();
+    const QString trace = traceOnFixture( video );
+    const QStringList blocks = trace.split( QStringLiteral( " arms@" ) );
+    ASSERT_EQ( 4, blocks.size() );
+    const QRegularExpression robustRe( QStringLiteral(
+        " diso_fieldratio_robust (.*?) diso_q0 " ) );
+    const QRegularExpression chanRe( QStringLiteral(
+        "(R|G1|G2|B):ts([0-9]+)/(-?[0-9.]+)/(-?[0-9.]+),b1:[0-9]+/-?[0-9.]+/-?[0-9.]+,b2:([0-9]+)/(-?[0-9.]+)/(-?[0-9.]+)" ) );
+    const QRegularExpression fromRe( QStringLiteral( " a11r_from=([A-Z0-9/]+)" ) );
+    const QRegularExpression usedRe( QStringLiteral(
+        " (A11|A11g|A11b|A11s|A11r):la=.*? a11_used=(-?[0-9.]+)/(-?[0-9.]+)/(-?[0-9.]+)/(-?[0-9.]+)\\|"
+        "(-?[0-9.]+)/(-?[0-9.]+)/(-?[0-9.]+)/(-?[0-9.]+) mask=([0-9]+)( bd=global)?" ) );
+    const QRegularExpression olsRe( QStringLiteral(
+        " diso_fieldratio valid=1 clip=[0-9]+ n/ev/bd=R:[0-9]+/(-?[0-9.]+)/(-?[0-9.]+)\\|G1:[0-9]+/(-?[0-9.]+)/(-?[0-9.]+)"
+        "\\|G2:[0-9]+/(-?[0-9.]+)/(-?[0-9.]+)\\|B:[0-9]+/(-?[0-9.]+)/(-?[0-9.]+)" ) );
+    for( int b = 1; b < blocks.size(); ++b )
+    {
+        const QRegularExpressionMatch rm = robustRe.match( blocks[b] );
+        ASSERT_TRUE( rm.hasMatch() );
+        QStringList robustEv;
+        QStringList robustBd;
+        const QStringList from = fromRe.match( blocks[b] ).captured( 1 ).split( QLatin1Char( '/' ) );
+        ASSERT_EQ( 4, from.size() );
+        QRegularExpressionMatchIterator ci = chanRe.globalMatch( rm.captured( 1 ) );
+        int c = 0;
+        while( ci.hasNext() )
+        {
+            const QRegularExpressionMatch m = ci.next();
+            const bool b2 = from[c] == QStringLiteral( "B2" );
+            robustEv << ( b2 ? m.captured( 6 ) : m.captured( 3 ) );
+            robustBd << ( b2 ? m.captured( 7 ) : m.captured( 4 ) );
+            ++c;
+        }
+        ASSERT_EQ( 4, c );
+        const QRegularExpressionMatch om = olsRe.match( blocks[b] );
+        ASSERT_TRUE( om.hasMatch() );
+        QStringList olsEv;
+        QStringList olsBd;
+        for( int k = 0; k < 4; ++k )
+        {
+            olsEv << om.captured( 1 + 2 * k );
+            olsBd << om.captured( 2 + 2 * k );
+        }
+        QRegularExpressionMatchIterator ui = usedRe.globalMatch( blocks[b] );
+        QStringList seen;
+        while( ui.hasNext() )
+        {
+            const QRegularExpressionMatch m = ui.next();
+            const QString name = m.captured( 1 );
+            seen << name;
+            QStringList ev;
+            QStringList bd;
+            for( int k = 0; k < 4; ++k ) { ev << m.captured( 2 + k ); bd << m.captured( 6 + k ); }
+            if( name == QStringLiteral( "A11r" ) )
+            {
+                ASSERT_TRUE( ev == robustEv ); // P2r's band-2 (or Theil-Sen) factors, not the OLS
+                ASSERT_TRUE( bd == robustBd );
+                ASSERT_TRUE( ev != olsEv || bd != olsBd );
+            }
+            else
+            {
+                ASSERT_TRUE( ev == olsEv );
+                ASSERT_TRUE( bd == olsBd );
+            }
+            const int mask = m.captured( 10 ).toInt();
+            ASSERT_EQ( name == QStringLiteral( "A11g" ) ? 2 : name == QStringLiteral( "A11b" ) ? 8 : 0, mask );
+            ASSERT_EQ( name == QStringLiteral( "A11s" ), !m.captured( 11 ).isEmpty() );
+        }
+        ASSERT_TRUE( seen.join( QLatin1Char( ',' ) ) == QStringLiteral( "A11,A11g,A11b,A11s,A11r" ) );
+    }
+    ASSERT_TRUE( channelArmsAreReset() );
+    ASSERT_TRUE( switchArmsAreReset() );
+}
+
+TEST(LookAssistDisoX0, ThePreDualIsoStepsOffChangeTheHandedOverBufferOnlyWhenAStepIsOn)
+{
+    MlvPipelineFixture fixture;
+    openHqDualIso( fixture );
+    mlvObject_t *video = fixture.video();
+    auto handOver = [&]( bool off, int *enabled, int *applied ) -> unsigned long long
+    {
+        llrpSetIsolatedAnalysisDualIsoArmsForCurrentThread( -1, 0, 0.0, nullptr );
+        llrpSetIsolatedAnalysisPreDualIsoForCurrentThread( off ? 1 : 0, 1 );
+        isolatedFrame( video );
+        unsigned long long hash = 0;
+        llrpGetLastPreDualIsoForCurrentThread( enabled, applied, &hash );
+        llrpSetIsolatedAnalysisDualIsoArmsForCurrentThread( -1, 0, 0.0, nullptr );
+        return hash;
+    };
+    // As the receipt has it: nothing that changes this fixture's pixels is on, so X0 equals R0.
+    int e0 = -1, a0 = -1, e1 = -1, a1 = -1;
+    const unsigned long long r0 = handOver( false, &e0, &a0 );
+    const unsigned long long x0 = handOver( true, &e1, &a1 );
+    ASSERT_TRUE( r0 != 0 );
+    ASSERT_EQ( e0, e1 );   // the enabled mask is reported before X0
+    ASSERT_EQ( 0, a1 );    // X0 ran nothing
+    if( a0 == 0 ) ASSERT_EQ( r0, x0 );
+    // Turn the vertical-stripe fix on (forced: computed on every frame) and the bad-pixel fix: the steps run, and X0
+    // hands over a different buffer from R0's.
+    video->llrawproc->vertical_stripes = 2;
+    video->llrawproc->bad_pixels = 2;
+    llrpResetBpmStatus( video );
+    const unsigned long long r0on = handOver( false, &e0, &a0 );
+    const unsigned long long x0on = handOver( true, &e1, &a1 );
+    ASSERT_TRUE( ( e0 & ( 2 | 8 ) ) == ( 2 | 8 ) );
+    ASSERT_EQ( 0, a1 );
+    ASSERT_TRUE( a0 != 0 );
+    ASSERT_TRUE( r0on != x0on );
+    ASSERT_EQ( x0, x0on ); // with every step off the buffer is the same whatever the receipt enables
+    ASSERT_TRUE( channelArmsAreReset() );
+}
+
+TEST(LookAssistDisoCapture, SeamAndBlockReadThePostReconBayer)
+{
+    MlvPipelineFixture fixture;
+    openHqDualIso( fixture );
+    mlvObject_t *video = fixture.video();
+    int w = 0, h = 0, black16 = 0;
+    const std::vector<uint16_t> out = capturedOutput( video, &w, &h, &black16 );
+    ASSERT_FALSE( out.empty() );
+    ASSERT_TRUE( black16 > 0 );
+    ASSERT_TRUE( channelArmsAreReset() );
+    // The recon's output has the two fields matched: per CFA channel, the dark rows' and bright rows' black-subtracted
+    // means are within 1 EV; the input the recon saw is ~4 EV apart (ISO 100 / 1600).
+    dualiso_levels_probe_t levels;
+    memset( &levels, 0, sizeof( levels ) );
+    {
+        std::vector<uint16_t> frame( static_cast<size_t>( video->RAWI.xRes ) * video->RAWI.yRes );
+        const int previousReadOnly = llrpSetIsolatedAnalysisSharedStateReadOnlyForCurrentThread( 1 );
+        dualiso_levels_probe_reset( 1 );
+        int shift = 0;
+        getMlvRawFrameProcessedUint16Direct( video, 0, frame.data(), &shift );
+        ASSERT_EQ( 1, dualiso_levels_probe_get( &levels ) );
+        dualiso_levels_probe_reset( 0 );
+        llrpSetIsolatedAnalysisSharedStateReadOnlyForCurrentThread( previousReadOnly );
+    }
+    double sum[2] = { 0.0, 0.0 };
+    long long n[2] = { 0, 0 };
+    for( int y = 0; y < h; ++y )
+    {
+        const int field = levels.is_bright[y % 4] ? 1 : 0;
+        for( int x = 0; x < w; ++x )
+        {
+            sum[field] += static_cast<double>( out[static_cast<size_t>( y ) * w + x] ) - black16;
+            ++n[field];
+        }
+    }
+    ASSERT_TRUE( n[0] > 0 && n[1] > 0 );
+    const double outGap = std::fabs( std::log2( ( sum[1] / n[1] ) / ( sum[0] / n[0] ) ) );
+    ASSERT_TRUE( outGap < 1.0 );
+
+
+    // SEAM / BLOCK on a synthetic capture: left half flagged with R/G = 2, B/G = 1 (log 1 / 0); right half unflagged
+    // with R/G = B/G = 1 (0 / 0): SEAM = 1; BLOCK = 0 (uniform). A capture read before the recon (the fields 4 EV apart) fails the gap above.
+    const int sw = 128, shh = 64, sb = 100;
+    std::vector<uint16_t> bayer( static_cast<size_t>( sw ) * shh );
+    std::vector<unsigned char> map( bayer.size(), 0 );
+    for( int y = 0; y < shh; ++y )
+        for( int x = 0; x < sw; ++x )
+        {
+            const bool left = x < sw / 2;
+            const int c = ( ( y & 1 ) << 1 ) | ( x & 1 );
+            const int g = 400;
+            const int v = c == 0 ? ( left ? 2 * g : g ) : g;
+            bayer[static_cast<size_t>( y ) * sw + x] = static_cast<uint16_t>( sb + v );
+            map[static_cast<size_t>( y ) * sw + x] = left ? 1 : 0;
+        }
+    const ReceiptApplier::DisoQuadChroma q =
+        ReceiptApplier::lookAssistDisoQuadChroma( bayer.data(), sw, shh, sb, map.data(), sw, shh, 2, nullptr );
+    ASSERT_NEAR( 1.0, q.seam, 1e-9 );
+    ASSERT_NEAR( 0.0, q.block, 1e-9 );
+    ASSERT_TRUE( q.ringIn >= 50 && q.ringOut >= 50 );
+    // Quads farther than 16 from the boundary are not in the ring (32 quads each side here).
+    ASSERT_EQ( static_cast<long long>( 17 ) * ( shh / 2 ), q.ringIn );
+}
+
+TEST(LookAssistDisoLa, EachArmsBalanceIsDecidedOnItsOwnRender)
+{
+    MlvPipelineFixture fixture;
+    openHqDualIso( fixture );
+    mlvObject_t *video = fixture.video();
+    ReceiptApplier::DualIsoTraceLookAssist la;
+    la.valid = true;
+    la.scene = lookassist::LookAssistScene::Shade;
+    la.baseTemperature = 6000;
+    la.baseTint = 0;
+    la.analysisExposure = 0;
+    {
+        std::vector<unsigned char> thumb( static_cast<size_t>( video->RAWI.xRes / 3 ) * ( video->RAWI.yRes / 3 ) * 3u );
+        ASSERT_TRUE( ReceiptApplier::processedThumbnailAtBalance( video, 0, 3, 1, 0.0, 6000, 0, true, thumb.data(), false ) );
+        la.stats = lookassist::analyzeLookAssistThumbnail( thumb.data(), video->RAWI.xRes / 3, video->RAWI.yRes / 3 );
+    }
+    const QString trace = traceOnFixture( video, la );
+    ASSERT_TRUE( trace.contains( QStringLiteral( " la_ctx=1 " ) ) );
+    const QRegularExpression laRe( QStringLiteral(
+        " (R0|A11|A11g|A11b|A11s|A11r|X0):la=(-?[0-9]+)/(-?[0-9]+) la_src=([^ ]+) la_dec=([^ ]+) la_cand=(-?[0-9]+)/(-?[0-9]+)" ) );
+    const QStringList blocks = trace.split( QStringLiteral( " arms@" ) );
+    ASSERT_EQ( 4, blocks.size() );
+    QRegularExpressionMatchIterator it = laRe.globalMatch( blocks[1] );
+    QString r0Key;
+    QString x0Key;
+    bool someArmDiffers = false;
+    int arms = 0;
+    while( it.hasNext() )
+    {
+        const QRegularExpressionMatch m = it.next();
+        const QString key = m.captured( 2 ) + QLatin1Char( '/' ) + m.captured( 3 ) + QLatin1Char( '/' )
+                          + m.captured( 6 ) + QLatin1Char( '/' ) + m.captured( 7 );
+        ASSERT_TRUE( m.captured( 4 ) != QStringLiteral( "run" ) ); // decided here, not the run's balance
+        if( m.captured( 1 ) == QStringLiteral( "R0" ) ) r0Key = key;
+        else if( m.captured( 1 ) == QStringLiteral( "X0" ) ) x0Key = key;
+        else if( key != r0Key ) someArmDiffers = true;
+        ++arms;
+    }
+    ASSERT_EQ( 7, arms );
+    ASSERT_FALSE( r0Key.isEmpty() );
+    // Every arm's SEAM / BLOCK is read over R0's overexposed map (P1), never its own: the map each arm used holds R0's
+    // flagged count, and the A11 arms' own maps would not (CAST-5's A11 moves the mark).
+    const QRegularExpression p1Re( QStringLiteral( " p1 map=[0-9]+x[0-9]+ factor=3 raw_flagged=([0-9]+) " ) );
+    const QRegularExpressionMatch pm = p1Re.match( blocks[1] );
+    ASSERT_TRUE( pm.hasMatch() );
+    const QRegularExpression mapRe( QStringLiteral( " mapfl=([0-9]+)" ) );
+    QRegularExpressionMatchIterator mi = mapRe.globalMatch( blocks[1] );
+    int maps = 0;
+    while( mi.hasNext() )
+    {
+        ASSERT_TRUE( mi.next().captured( 1 ) == pm.captured( 1 ) );
+        ++maps;
+    }
+    ASSERT_EQ( 7, maps );
+    llrpSetIsolatedAnalysisDualIsoArmsForCurrentThread( -1, 0, 0.0, nullptr );
+    {
+        const dualiso_match_probe_t r0p = matchProbeWithArms( video, 0, nullptr, nullptr );
+        const double bd14 = r0p.black_delta / 64.0;
+        const double ev[4] = { r0p.ev + 0.5, r0p.ev + 1.0, r0p.ev, r0p.ev - 0.5 };
+        const double bd[4] = { bd14, bd14, bd14, bd14 - 40.0 };
+        const long long r0Flagged = flaggedCount( capturedRender( video, 0, nullptr, nullptr, false ).site[DUALISO_SWITCH_SITE_OVEREXPOSED] );
+        const long long a11Flagged = flaggedCount( capturedRender( video, 0, ev, bd, false ).site[DUALISO_SWITCH_SITE_OVEREXPOSED] );
+        ASSERT_TRUE( r0Flagged == pm.captured( 1 ).toLongLong() );
+        ASSERT_TRUE( a11Flagged != r0Flagged ); // so an arm's own map would show
+    }
+    ASSERT_TRUE( someArmDiffers ); // the A11 arms move the balance Look Assist decides on their own pixels
+    ASSERT_TRUE( x0Key == r0Key ); // X0 renders R0's pixels on this fixture, so it decides the same
+    // The LA token is rendered at the balance it names.
+    const QRegularExpression r0LaRe( QStringLiteral( " R0:la=(-?[0-9]+)/(-?[0-9]+) .*? R0=dbm[^ ]*/t(-?[0-9]+)/(-?[0-9]+)" ) );
+    const QRegularExpressionMatch m0 = r0LaRe.match( blocks[1] );
+    ASSERT_TRUE( m0.hasMatch() );
+    ASSERT_TRUE( m0.captured( 1 ) == m0.captured( 3 ) );
+    ASSERT_TRUE( m0.captured( 2 ) == m0.captured( 4 ) );
+    ASSERT_TRUE( channelArmsAreReset() );
+    ASSERT_TRUE( switchArmsAreReset() );
+}
+
+TEST(LookAssistDisoQ0, RecoversASyntheticGrGbFieldAsymmetryAndZeroOnASymmetricFrame)
+{
+    // 64x64 RGGB, is_bright = 0110 (rows 4k+1 / 4k+2 bright). A smooth scene S(x); bright = black + S, dark = black + S /
+    // 16, with the dark field's Gr scaled by g.
+    const int w = 64, h = 64, black = 2048;
+    const int isBright[4] = { 0, 1, 1, 0 };
+    auto build = [&]( double g, std::vector<uint16_t> *raw )
+    {
+        raw->assign( static_cast<size_t>( w ) * h, 0 );
+        for( int y = 0; y < h; ++y )
+            for( int x = 0; x < w; ++x )
+            {
+                const double s = 4000.0 + 60.0 * ( x / 2 ) + 10.0 * ( y / 4 );
+                const bool bright = isBright[y % 4] != 0;
+                const bool gr = ( y & 1 ) == 0 && ( x & 1 ) == 1;
+                const double v = bright ? s : ( s / 16.0 ) * ( gr ? g : 1.0 );
+                ( *raw )[static_cast<size_t>( y ) * w + x] = static_cast<uint16_t>( std::lround( black + v ) );
+            }
+    };
+    const int darkP99[4] = { 16000, 16000, 16000, 16000 };
+    std::vector<uint16_t> raw;
+    dualiso_q0_t q;
+    build( 1.5, &raw );
+    ASSERT_EQ( 1, dualiso_q0_estimate( raw.data(), w, h, 0, 0, w, h, isBright, black, 15000.0, darkP99, &q ) );
+    ASSERT_TRUE( q.n[0] > 100 && q.n[1] > 100 );
+    ASSERT_NEAR( std::log2( 1.5 ), q.a, 0.02 );
+    for( int g = 0; g < 4; ++g ) ASSERT_NEAR( std::log2( 1.5 ), q.a8[g], 0.02 );
+    build( 1.0, &raw );
+    ASSERT_EQ( 1, dualiso_q0_estimate( raw.data(), w, h, 0, 0, w, h, isBright, black, 15000.0, darkP99, &q ) );
+    ASSERT_TRUE( std::fabs( q.a ) < 0.02 );
+    ASSERT_NEAR( 1.0, q.m[1], 0.02 );
+}
+
+TEST(LookAssistDisoP2r, RecoversTheRatioUnderTruncationAndOutliersWhereOlsMisses)
+{
+    // dark - black = bright / 16 + 15 (ev 4, bd 15) with a deterministic +-20 wobble; samples whose dark falls below 64
+    // are dropped (P2's truncation); 1% of the samples, all in the lowest tenth of the bright range, carry a hot dark
+    // value (6000).
+    std::vector<double> bright;
+    std::vector<double> dark;
+    const int n = 60000;
+    for( int i = 0; i < n; ++i )
+    {
+        const double x = 128.0 + ( 12000.0 - 128.0 ) * ( ( i * 7919 ) % n ) / static_cast<double>( n );
+        double y = x / 16.0 + 15.0 + 20.0 * std::sin( i * 1.618 );
+        if( x < 1315.0 && ( i % 10 ) == 0 ) y = 6000.0;
+        if( y <= 64.0 ) continue;
+        bright.push_back( x );
+        dark.push_back( y );
+    }
+    long long outliers = 0;
+    for( size_t i = 0; i < dark.size(); ++i ) outliers += dark[i] == 6000.0 ? 1 : 0;
+    ASSERT_TRUE( outliers > 0 && outliers * 100 <= static_cast<long long>( dark.size() ) * 2 );
+    dualiso_robust_fit_t fit;
+    dualiso_robust_fieldratio( bright.data(), dark.data(), static_cast<long long>( bright.size() ), 12000.0, &fit );
+    ASSERT_TRUE( fit.ts.n > 1000 && fit.ts.n <= 20000 );
+    ASSERT_NEAR( 4.0, fit.ts.ev, 0.05 );
+    ASSERT_NEAR( 15.0, fit.ts.bd, 3.0 );
+    ASSERT_NEAR( 4.0, fit.band[1].ev, 0.05 );
+    ASSERT_NEAR( 4.0, fit.band[2].ev, 0.05 );
+    // P2's OLS on the same samples misses by more than 0.3 EV.
+    double sx = 0, sy = 0, sxx = 0, sxy = 0;
+    const double m = static_cast<double>( bright.size() );
+    for( size_t i = 0; i < bright.size(); ++i )
+    {
+        sx += bright[i]; sy += dark[i]; sxx += bright[i] * bright[i]; sxy += bright[i] * dark[i];
+    }
+    const double slope = ( m * sxy - sx * sy ) / ( m * sxx - sx * sx );
+    ASSERT_TRUE( slope > 0.0 );
+    ASSERT_TRUE( std::fabs( std::log2( 1.0 / slope ) - 4.0 ) > 0.3 );
+}
+
+TEST(LookAssistDisoP2r, TheLevelsProbeFillsP2rAndQ0OnTheP2Layout)
+{
+    // P2's synthetic frame (noise-free, so OLS and the robust fits agree): P2r's Theil-Sen and band fits land on the same
+    // per-channel ratio, and Q0 sees no Gr/Gb asymmetry (G1 and G2 share ev and bd... except here they differ by design,
+    // so A = log2 of the dark/bright Gr/Gb ratio implied by the construction is checked for being finite).
+    const int w = 64;
+    const int h = 64;
+    const int black = 2048;
+    const double ev[4] = { 3.8, 4.0, 4.1, 4.3 };
+    const double bd[4] = { 12.0, 15.0, 15.0, 20.0 };
+    std::vector<uint16_t> raw( static_cast<size_t>( w ) * h );
+    for( int y = 0; y < h; ++y )
+        for( int x = 0; x < w; ++x )
+        {
+            const int c = ( ( y & 1 ) << 1 ) | ( x & 1 );
+            const double dark = 2200.0 + 9.0 * x + 3.0 * c;
+            const double value = ( y % 4 ) < 2 ? dark : black + std::pow( 2.0, ev[c] ) * ( dark - black - bd[c] );
+            raw[static_cast<size_t>( y ) * w + x] = static_cast<uint16_t>( std::lround( value ) );
+        }
+    struct raw_info info;
+    memset( &info, 0, sizeof( info ) );
+    info.width = w;
+    info.height = h;
+    info.pitch = w;
+    info.bits_per_pixel = 14;
+    info.black_level = black;
+    info.white_level = 15000;
+    info.active_area.x1 = 0;
+    info.active_area.y1 = 0;
+    info.active_area.x2 = w;
+    info.active_area.y2 = h;
+    info.cfa_pattern = 0x02010100;
+    dualiso_full20bit_scratch_t scratch = {};
+    int isoPattern = 0;
+    int autoCorrection = -1;
+    double evCorrection = 1.0;
+    int blackDelta = -1;
+    dualiso_levels_probe_reset( 1 );
+    ASSERT_EQ( 0, diso_get_full20bit( info, raw.data(), 0, 100, 1600, &isoPattern, &autoCorrection, &evCorrection,
+                                      &blackDelta, 1, 0, 1, 0, 0, 1, &scratch ) );
+    dualiso_levels_probe_t levels;
+    memset( &levels, 0, sizeof( levels ) );
+    ASSERT_EQ( 1, dualiso_levels_probe_get( &levels ) );
+    dualiso_levels_probe_reset( 0 );
+    free_dualiso_full20bit_scratch( &scratch );
+    for( int c = 0; c < 4; ++c )
+    {
+        ASSERT_TRUE( levels.fr_robust[c].ts.n > 100 );
+        ASSERT_NEAR( ev[c], levels.fr_robust[c].ts.ev, 0.02 );
+        ASSERT_NEAR( bd[c], levels.fr_robust[c].ts.bd, 1.5 );
+        ASSERT_TRUE( levels.p99[0][c] > 0 );
+    }
+    ASSERT_TRUE( levels.q0.n[0] > 0 && levels.q0.n[1] > 0 );
+    ASSERT_TRUE( std::isfinite( levels.q0.a ) );
 }

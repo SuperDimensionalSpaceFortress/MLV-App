@@ -10,6 +10,21 @@
 
 class ReceiptSettings;
 
+/* LOOK-ASSIST-M16-CAST-6 (ReceiptApplier::DualIsoTraceLookAssist): what the run's own white-balance decision was made
+ * from, so the dual-ISO trace can make the same decision on each arm's render (LA): the run's raw statistics, scene and
+ * flavor, its base balance and the exposure (receipt units) its colour pictures were rendered at. valid = false: LA is
+ * the temperature / tint passed in. */
+struct ReceiptApplierDualIsoTraceLookAssist
+{
+    bool valid = false;
+    lookassist::LookAssistStats stats;
+    lookassist::LookAssistScene scene = lookassist::LookAssistScene::Shade;
+    lookassist::LookAssistFlavor flavor = lookassist::LookAssistFlavor::Classic;
+    int baseTemperature = 6000;
+    int baseTint = 0;
+    int analysisExposure = lookassist::LookAssistWhiteBalanceRequest::kLookAssistNoAnalysisExposure;
+};
+
 /* Applies parsed ReceiptSettings to the runtime mlvObject_t / processingObject_t
  * using the same C API calls the GUI's setSliders() triggers through its
  * signal chain.  This is the standalone batch-mode equivalent.
@@ -150,13 +165,36 @@ public:
      * 0, as-shot WB, default grade) on its own mask, never graded. imageSink, when given, receives every arm render. */
     using DualIsoTraceImageSink = std::function<void(const QString &name, int width, int height,
                                                      const unsigned char *rgb)>;
+    using DualIsoTraceLookAssist = ReceiptApplierDualIsoTraceLookAssist;
     static QString lookAssistDualIsoMatchTrace(mlvObject_t *mlvObject,
                                                int judgementFrame,
                                                int downscaleFactor,
                                                double exposureStops,
                                                int temperature,
                                                int tint,
-                                               const DualIsoTraceImageSink &imageSink = DualIsoTraceImageSink());
+                                               const DualIsoTraceImageSink &imageSink = DualIsoTraceImageSink(),
+                                               const DualIsoTraceLookAssist &lookAssist = DualIsoTraceLookAssist());
+
+    /* LOOK-ASSIST-M16-CAST-6 SEAM / BLOCK (measure-only, white balance cannot move them): on a 16-bit RGGB Bayer
+     * capture (black16 subtracted; quad = (x&~1, y&~1), R, G = (Gr+Gb)/2, B all > 0) and a same-size switch map (a quad
+     * is flagged when any of its pixels is). box = display pixels [x0, y0, x1, y1) at the given factor (NULL or empty
+     * after clamping = the whole frame). SEAM = |median_in - median_out| of log2(R/G) plus the same of log2(B/G), over
+     * the box's quads within 16 quads (chessboard) of a map boundary quad; BLOCK = IQR(log2 R/G) + IQR(log2 B/G) over
+     * the box's flagged quads; blockTileMedian = the median BLOCK over the frame's 32x32-quad tiles with >= 256 flagged
+     * quads. -1 = not enough quads (50 per side / 50 flagged). */
+    struct DisoQuadChroma
+    {
+        double seam = -1.0;
+        double block = -1.0;
+        double blockTileMedian = -1.0;
+        long long ringIn = 0;
+        long long ringOut = 0;
+        long long flagged = 0;
+        int tiles = 0;
+    };
+    static DisoQuadChroma lookAssistDisoQuadChroma(const uint16_t *bayer, int width, int height, int black16,
+                                                   const unsigned char *map, int mapWidth, int mapHeight, int factor,
+                                                   const int *box);
 
     /* LOOK-ASSIST-M16-CAST-5 P1 (measure-only): the coincidence of a display render with a raw-resolution switch map
      * (1 = flagged). Quads are the 2x2 CFA cells (x&~1, y&~1), flagged when any of their pixels is; display pixel

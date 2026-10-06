@@ -104,6 +104,12 @@ static MLV_THREAD_LOCAL int g_llrawproc_analysis_diso_chroma_smooth = -1;
 /* LOOK-ASSIST-M16-CAST-4: see llrpSetIsolatedAnalysisDualIsoArmsForCurrentThread(). */
 static MLV_THREAD_LOCAL int g_llrawproc_analysis_diso_mode = -1;
 static MLV_THREAD_LOCAL dualiso_analysis_override_t g_llrawproc_analysis_diso_levels = {0};
+/* LOOK-ASSIST-M16-CAST-6 X0: see llrpSetIsolatedAnalysisPreDualIsoForCurrentThread(). */
+static MLV_THREAD_LOCAL int g_llrawproc_analysis_pre_steps_off = 0;
+static MLV_THREAD_LOCAL int g_llrawproc_analysis_pre_hash = 0;
+static MLV_THREAD_LOCAL int g_llrawproc_last_pre_steps_enabled = 0;
+static MLV_THREAD_LOCAL int g_llrawproc_last_pre_steps_applied = 0;
+static MLV_THREAD_LOCAL unsigned long long g_llrawproc_last_pre_hash = 0;
 /* LOOK-ASSIST-ANALYSIS-TRUE-LEVELS-1: see llrpLastOutputLevelsForCurrentThread(). */
 static MLV_THREAD_LOCAL const mlvObject_t * g_llrawproc_last_output_levels_video = NULL;
 static MLV_THREAD_LOCAL int g_llrawproc_last_output_bit_depth = 0;
@@ -3373,8 +3379,11 @@ void applyLLRawProcObjectWorker(mlvObject_t * video,
         worker->focus_pixel_map_version = 0;
         worker->bad_pixel_map_version = 0;
     }
+    /* LOOK-ASSIST-M16-CAST-6 X0: an isolated analysis run may skip every pre-dual-ISO step (llrawproc.h). */
+    const int pre_steps_off = isolated_analysis && g_llrawproc_analysis_pre_steps_off;
+    int pre_steps_applied = 0;
 
-    if (!df_init(video))
+    if (!pre_steps_off && !df_init(video))
     {
         const double dark_frame_start = mlv_stage_timing_now();
         if (llrawproc_worker_sync_dark_frame_copy(worker, shared)
@@ -3392,6 +3401,7 @@ void applyLLRawProcObjectWorker(mlvObject_t * video,
             printf("Subtracting Dark Frame... ");
 #endif
             df_subtract(video, raw_image_buff, raw_image_size);
+            pre_steps_applied |= 1;
 #ifndef STDOUT_SILENT
             printf("Done\n\n");
 #endif
@@ -3477,6 +3487,22 @@ void applyLLRawProcObjectWorker(mlvObject_t * video,
     }
     dark_frame_mode = shared->dark_frame;
     vertical_stripes_mode = shared->vertical_stripes;
+    if (isolated_analysis)
+    {
+        g_llrawproc_last_pre_steps_enabled = (dark_frame_mode ? 1 : 0) | (vertical_stripes_mode ? 2 : 0)
+                                           | (focus_pixels ? 4 : 0) | (bad_pixels ? 8 : 0)
+                                           | ((pattern_noise_mode && !diso_validity) ? 16 : 0);
+        g_llrawproc_last_pre_steps_applied = 0;
+        g_llrawproc_last_pre_hash = 0;
+    }
+    if (pre_steps_off)
+    {
+        dark_frame_mode = 0; /* nothing was subtracted (df_init skipped above) */
+        vertical_stripes_mode = 0;
+        focus_pixels = 0;
+        bad_pixels = 0;
+        pattern_noise_mode = 0;
+    }
 
     if (vertical_stripes_mode)
     {
@@ -3604,6 +3630,7 @@ void applyLLRawProcObjectWorker(mlvObject_t * video,
                              raw_image_buff,
                              raw_image_size);
         dark_frame_ms += (mlv_stage_timing_now() - dark_frame_start) * 1000.0;
+        pre_steps_applied |= 1;
     }
 
     if (apply_vertical_stripes_outside_lock)
@@ -3616,6 +3643,7 @@ void applyLLRawProcObjectWorker(mlvObject_t * video,
                                                x_res,
                                                y_res);
         vertical_stripes_ms += (mlv_stage_timing_now() - vertical_stripes_start) * 1000.0;
+        pre_steps_applied |= 2;
     }
 
     if (focus_pixels && focus_interpolate_outside_lock && focus_status_snapshot == 2 && focus_map_for_interpolation)
@@ -3632,6 +3660,7 @@ void applyLLRawProcObjectWorker(mlvObject_t * video,
                                     worker->raw2ev,
                                     worker->ev2raw);
         focus_pixels_ms += (mlv_stage_timing_now() - focus_pixels_start) * 1000.0;
+        pre_steps_applied |= 4;
     }
 
     if (bad_pixels && bad_interpolate_outside_lock && bad_status_snapshot == 2 && bad_map_for_interpolation)
@@ -3652,6 +3681,7 @@ void applyLLRawProcObjectWorker(mlvObject_t * video,
             llrawproc_reset_force_bad_pixel_search(video, bad_pixels);
         }
         bad_pixels_ms += (mlv_stage_timing_now() - bad_pixels_start) * 1000.0;
+        pre_steps_applied |= 8;
     }
 
     if (!diso_validity && pattern_noise_mode)
@@ -3670,6 +3700,20 @@ void applyLLRawProcObjectWorker(mlvObject_t * video,
         printf("Done\n\n");
 #endif
         pattern_noise_ms += (mlv_stage_timing_now() - pattern_noise_start) * 1000.0;
+        pre_steps_applied |= 16;
+    }
+
+    /* LOOK-ASSIST-M16-CAST-6 X0: what ran before dual ISO, and (when asked) a hash of the buffer it hands over. */
+    if (isolated_analysis)
+    {
+        g_llrawproc_last_pre_steps_applied = pre_steps_applied;
+        if (g_llrawproc_analysis_pre_hash)
+        {
+            unsigned long long hash = 1469598103934665603ULL;
+            const size_t words = (size_t)x_res * (size_t)y_res;
+            for (size_t i = 0; i < words; i++) { hash ^= raw_image_buff[i]; hash *= 1099511628211ULL; }
+            g_llrawproc_last_pre_hash = hash;
+        }
     }
 
     if (stop_before_dual_iso)
@@ -4651,6 +4695,9 @@ void llrpSetIsolatedAnalysisDualIsoArmsForCurrentThread(int dual_iso_mode,
 {
     g_llrawproc_analysis_diso_mode = (dual_iso_mode == 1 || dual_iso_mode == 2) ? dual_iso_mode : -1;
     memset(&g_llrawproc_analysis_diso_levels, 0, sizeof(g_llrawproc_analysis_diso_levels));
+    /* LOOK-ASSIST-M16-CAST-6: the per-render reset clears X0 too (set it after this call). */
+    g_llrawproc_analysis_pre_steps_off = 0;
+    g_llrawproc_analysis_pre_hash = 0;
     g_llrawproc_analysis_diso_levels.white_bright = white_bright > 0 ? white_bright : 0;
     g_llrawproc_analysis_diso_levels.dark_noise_scale =
         (isfinite(dark_noise_scale) && dark_noise_scale > 0.0) ? dark_noise_scale : 0.0;
@@ -4702,6 +4749,43 @@ void llrpSetIsolatedAnalysisDualIsoSwitchArmsForCurrentThread(const double * cha
     }
     g_llrawproc_analysis_diso_levels.quad_coherent_switch = quad_coherent_switch ? 1 : 0;
     g_llrawproc_analysis_diso_levels.capture_switch_maps = capture_switch_maps ? 1 : 0;
+    g_llrawproc_analysis_diso_levels.channel_mask = 0;
+    g_llrawproc_analysis_diso_levels.channel_bd_global = 0;
+    g_llrawproc_analysis_diso_levels.capture_output = 0;
+}
+
+void llrpSetIsolatedAnalysisDualIsoChannelArmsForCurrentThread(int channel_mask, int channel_bd_global, int capture_output)
+{
+    g_llrawproc_analysis_diso_levels.channel_mask = channel_mask & 15;
+    g_llrawproc_analysis_diso_levels.channel_bd_global = channel_bd_global ? 1 : 0;
+    g_llrawproc_analysis_diso_levels.capture_output = capture_output ? 1 : 0;
+}
+
+int llrpGetIsolatedAnalysisDualIsoChannelArmsForCurrentThread(int * channel_mask, int * channel_bd_global,
+                                                              int * capture_output)
+{
+    if (channel_mask) *channel_mask = g_llrawproc_analysis_diso_levels.channel_mask;
+    if (channel_bd_global) *channel_bd_global = g_llrawproc_analysis_diso_levels.channel_bd_global;
+    if (capture_output) *capture_output = g_llrawproc_analysis_diso_levels.capture_output;
+    return g_llrawproc_analysis_diso_levels.channel_mask
+        || g_llrawproc_analysis_diso_levels.channel_bd_global
+        || g_llrawproc_analysis_diso_levels.capture_output;
+}
+
+int llrpSetIsolatedAnalysisPreDualIsoForCurrentThread(int steps_off, int record_hash)
+{
+    const int previous = g_llrawproc_analysis_pre_steps_off;
+    g_llrawproc_analysis_pre_steps_off = steps_off ? 1 : 0;
+    g_llrawproc_analysis_pre_hash = record_hash ? 1 : 0;
+    return previous;
+}
+
+int llrpGetLastPreDualIsoForCurrentThread(int * enabled_mask, int * applied_mask, unsigned long long * buffer_hash)
+{
+    if (enabled_mask) *enabled_mask = g_llrawproc_last_pre_steps_enabled;
+    if (applied_mask) *applied_mask = g_llrawproc_last_pre_steps_applied;
+    if (buffer_hash) *buffer_hash = g_llrawproc_last_pre_hash;
+    return g_llrawproc_analysis_pre_steps_off;
 }
 
 int llrpGetIsolatedAnalysisDualIsoSwitchArmsForCurrentThread(int * channel_match, int * quad_coherent_switch,

@@ -422,6 +422,13 @@ typedef struct
     double channel_bd[4];
     int quad_coherent_switch;
     int capture_switch_maps;
+    /* LOOK-ASSIST-M16-CAST-6, same contract: channel_mask (bit c = CFA channel c) limits channel_match to those
+     * channels, the others take the global match line unchanged (0 = all four, CAST-5's A11); channel_bd_global uses
+     * the global black delta for every channel instead of channel_bd (A11s); capture_output records the recon's 16-bit
+     * Bayer output (see dualiso_output_capture). */
+    int channel_mask;
+    int channel_bd_global;
+    int capture_output;
 } dualiso_analysis_override_t;
 void dualiso_set_analysis_override(const dualiso_analysis_override_t * override_values);
 
@@ -436,6 +443,43 @@ void dualiso_set_analysis_override(const dualiso_analysis_override_t * override_
 #define DUALISO_SWITCH_SITES 3
 const unsigned char * dualiso_switch_capture_map(int site, int * width, int * height);
 void dualiso_switch_capture_clear(void);
+
+/* LOOK-ASSIST-M16-CAST-6 P2r: a robust fit of dark = slope * bright + bd (both black-subtracted, 14-bit codes) over n
+ * samples. ts = Theil's split-sample estimator on every k-th sample (k = ceil(n / 20000)): the subsample sorted by
+ * bright, sample i paired with i + m/2, slope = the median pair slope, bd = the median residual. band[0..2] = binned
+ * medians in bright bands [128, 1024), [1024, 4096), [4096, band3_hi): 16 equal-width bins, per bin (>= 16 samples) the
+ * median bright and median dark, then least squares over the bin medians. ev = log2(1 / slope); n is the samples used
+ * (ts: the subsample; band: the samples in the band); ev = bd = 0 when a fit is not possible. */
+typedef struct
+{
+    long long n;
+    double ev;
+    double bd;
+} dualiso_fit_t;
+typedef struct
+{
+    dualiso_fit_t ts;
+    dualiso_fit_t band[3];
+} dualiso_robust_fit_t;
+void dualiso_robust_fieldratio(const double * bright, const double * dark, long long n, double band3_hi,
+                               dualiso_robust_fit_t * out);
+
+/* LOOK-ASSIST-M16-CAST-6 Q0, fit-free: within each hardware row pair of one field, every Gr (even y, odd x, RGGB) is
+ * paired with the Gb at (y - 1, x - 1) when that row is in the same field (else (y + 1, x - 1)); both must be in band
+ * (bright field: black + 128 < v < bright_hi; dark field: black + 64 < v < that channel's dark_p99). m[f] = the median
+ * of (Gr - black) / (Gb - black) per field (0 = dark, 1 = bright), a = log2(m[0] / m[1]); the same per Gr column
+ * x mod 8 in groups g = (x % 8) / 2 (columns 1, 3, 5, 7). Returns 1 when both fields have pairs. */
+typedef struct
+{
+    long long n[2];
+    double m[2];
+    double a;
+    long long n8[2][4];
+    double m8[2][4];
+    double a8[4];
+} dualiso_q0_t;
+int dualiso_q0_estimate(const uint16_t * image, int width, int height, int x1, int y1, int x2, int y2,
+                        const int * is_bright, int black14, double bright_hi, const int * dark_p99, dualiso_q0_t * out);
 
 /* LOOK-ASSIST-M16-CAST-4: the levels the HQ recon saw on the calling thread's last run (thread-local, measure-only):
  * per field (0 = dark rows, 1 = bright rows, from is_bright) and CFA channel (R, G1, G2, B) the 0.1 / 1 / 99.99
@@ -470,9 +514,20 @@ typedef struct
     long long fr_count[4];
     double fr_ev[4];
     double fr_bd[4];
+    /* LOOK-ASSIST-M16-CAST-6: the 99th percentile per field and channel (Q0's dark band edge), P2r (the robust fit of
+     * P2's samples, see dualiso_robust_fieldratio) and Q0 (the fit-free Gr/Gb field asymmetry, dualiso_q0_estimate). */
+    int p99[2][4];
+    dualiso_robust_fit_t fr_robust[4];
+    dualiso_q0_t q0;
 } dualiso_levels_probe_t;
 void dualiso_levels_probe_reset(int stop_after_levels);
 int dualiso_levels_probe_get(dualiso_levels_probe_t * probe);
+
+/* LOOK-ASSIST-M16-CAST-6: the HQ recon's 16-bit Bayer output on the calling thread's last isolated run with
+ * capture_output set (linear, before any white balance; RGGB-indexed in the recon's own frame, i.e. after the GBRG row
+ * skip; black16 = the 20-bit black / 16). NULL when none; valid until the next capture or clear on this thread. */
+const uint16_t * dualiso_output_capture(int * width, int * height, int * black16);
+void dualiso_output_capture_clear(void);
 
 #ifdef __cplusplus
 }
