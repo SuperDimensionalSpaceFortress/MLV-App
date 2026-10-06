@@ -103,6 +103,7 @@ SOURCES += \
     $$REPO_ROOT/tests/pipeline/backend_parametric_fixture.cpp \
     $$REPO_ROOT/tests/pipeline/test_main.cpp \
     $$REPO_ROOT/tests/pipeline/test_dual_iso_pipeline.cpp \
+    $$REPO_ROOT/tests/pipeline/test_look_assist_diso_match_probe.cpp \
     $$REPO_ROOT/tests/pipeline/test_async_preupload_pipeline.cpp \
     $$REPO_ROOT/tests/pipeline/test_gpu_preview_processing.cpp \
     $$REPO_ROOT/tests/pipeline/test_backend_parametric_shell.cpp \

@@ -821,6 +821,8 @@ QString ReceiptApplier::lookAssistDualIsoMatchTrace(mlvObject_t *mlvObject,
                                                     int temperature,
                                                     int tint)
 {
+    // Diagnostic only, and slow (about four minutes of isolated full-resolution renders on a 5K clip): off unless asked for.
+    if( qEnvironmentVariableIntValue( "MLVAPP_LOOK_ASSIST_DISO_MATCH_TRACE" ) == 0 ) return QString();
     if( !mlvObject || !mlvObject->llrawproc || downscaleFactor <= 0 ) return QString();
     const llrawprocObject_t *llr = mlvObject->llrawproc;
     if( llr->dual_iso != 1 || llr->diso_validity == DISO_INVALID || llr->diso1 == llr->diso2 ) return QString();

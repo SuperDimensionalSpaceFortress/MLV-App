@@ -138,7 +138,8 @@ public:
      * it also renders four display-level variants at the given exposure / balance (nominal; measured ev + black
      * delta; nominal ev + measured black delta; measured ev + nominal black delta) and scores each with the CAST-3
      * dark-band magenta metrics over one mask fixed on the nominal render. Returns the trace fields (empty when
-     * the clip is not HQ dual-ISO with two different ISOs). Both consumers log the same line. */
+     * the clip is not HQ dual-ISO with two different ISOs). Both consumers log the same line. Off (empty, nothing
+     * rendered) unless MLVAPP_LOOK_ASSIST_DISO_MATCH_TRACE=1: it costs minutes of renders on a 5K clip. */
     static QString lookAssistDualIsoMatchTrace(mlvObject_t *mlvObject,
                                                int judgementFrame,
                                                int downscaleFactor,
