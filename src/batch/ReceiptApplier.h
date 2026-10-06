@@ -132,6 +132,20 @@ public:
                                                                                 int thumbHeight,
                                                                                 int cpuCores);
 
+    /* LOOK-ASSIST-M16-CAST-3 step 1, MEASURE-ONLY (changes no applied value): for an HQ dual-ISO clip, the
+     * existing histogram exposure match (auto -2) run through isolated, read-only renders on the judgement frame
+     * and on six evenly spaced frames, against the nominal match (-1) the clip renders with. On the judgement frame
+     * it also renders four display-level variants at the given exposure / balance (nominal; measured ev + black
+     * delta; nominal ev + measured black delta; measured ev + nominal black delta) and scores each with the CAST-3
+     * dark-band magenta metrics over one mask fixed on the nominal render. Returns the trace fields (empty when
+     * the clip is not HQ dual-ISO with two different ISOs). Both consumers log the same line. */
+    static QString lookAssistDualIsoMatchTrace(mlvObject_t *mlvObject,
+                                               int judgementFrame,
+                                               int downscaleFactor,
+                                               double exposureStops,
+                                               int temperature,
+                                               int tint);
+
 private:
     ReceiptApplier() = delete; /* Pure static — no instances */
 };

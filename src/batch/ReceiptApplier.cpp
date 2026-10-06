@@ -6,6 +6,7 @@
 
 #include "../../platform/qt/ReceiptSettings.h"
 #include "../../platform/qt/DualIsoPatternMapping.h"
+#include "../mlv/llrawproc/dualiso.h"
 
 #include <QByteArray>
 #include <QFileInfo>
@@ -753,6 +754,177 @@ LookAssistRenderBalanceFn ReceiptApplier::lookAssistBalanceRenderer(mlvObject_t 
     };
 }
 
+// LOOK-ASSIST-M16-CAST-3: one isolated, read-only raw read of frameIndex with the dual-ISO match seeded as asked
+// (llrpSetIsolatedAnalysisDualIsoMatchForCurrentThread). stopAfterMatch skips the reconstruction: only the match's
+// numbers are wanted. False when no match ran.
+static bool lookAssistProbeDualIsoMatch(mlvObject_t *mlvObject, int frameIndex, int mode, double evCorrection,
+                                        int blackDelta, bool stopAfterMatch, dualiso_match_probe_t *out)
+{
+    const size_t pixels = static_cast<size_t>( mlvObject->RAWI.xRes ) * static_cast<size_t>( mlvObject->RAWI.yRes );
+    if( pixels == 0 ) return false;
+    std::vector<uint16_t> frame( pixels );
+    const int previousReadOnly = llrpSetIsolatedAnalysisSharedStateReadOnlyForCurrentThread( 1 );
+    const int previousMode = llrpSetIsolatedAnalysisDualIsoMatchForCurrentThread( mode, evCorrection, blackDelta );
+    dualiso_match_probe_reset( stopAfterMatch ? 1 : 0 );
+    int bitShift = 0;
+    getMlvRawFrameProcessedUint16Direct( mlvObject, static_cast<uint64_t>( frameIndex ), frame.data(), &bitShift );
+    const bool ran = dualiso_match_probe_get( out ) != 0;
+    dualiso_match_probe_reset( 0 );
+    llrpSetIsolatedAnalysisDualIsoMatchForCurrentThread( previousMode, 1.0, -1 );
+    llrpSetIsolatedAnalysisSharedStateReadOnlyForCurrentThread( previousReadOnly );
+    return ran;
+}
+
+// The same isolated, read-only display-level render the window-lit check measures with, with the match seeded as asked.
+static bool lookAssistDualIsoVariantRender(mlvObject_t *mlvObject, int frameIndex, int downscaleFactor,
+                                           double exposureStops, int temperature, int tint, int mode,
+                                           double evCorrection, int blackDelta, std::vector<unsigned char> *rgb,
+                                           dualiso_match_probe_t *used)
+{
+    const int previousMode = llrpSetIsolatedAnalysisDualIsoMatchForCurrentThread( mode, evCorrection, blackDelta );
+    dualiso_match_probe_reset( 0 );
+    const bool rendered = ReceiptApplier::processedThumbnailAtBalance( mlvObject, frameIndex, downscaleFactor, 1,
+                                                                       exposureStops, temperature, tint, true,
+                                                                       rgb->data(), true );
+    dualiso_match_probe_get( used );
+    llrpSetIsolatedAnalysisDualIsoMatchForCurrentThread( previousMode, 1.0, -1 );
+    return rendered;
+}
+
+// CAST-3's PRIMARY metrics over a fixed mask: DBM = -median(G-(R+B)/2) (positive = magenta), PSH = the mask's share
+// with G-(R+B)/2 <= -8, R-G >= 8 and B-G >= 8.
+static void lookAssistDarkBandMagenta(const std::vector<unsigned char> &rgb, const std::vector<size_t> &mask,
+                                      double *dbm, double *psh)
+{
+    *dbm = 0.0;
+    *psh = 0.0;
+    if( mask.empty() ) return;
+    std::vector<double> axis;
+    axis.reserve( mask.size() );
+    size_t purple = 0;
+    for( size_t i : mask )
+    {
+        const int r = rgb[i * 3], g = rgb[i * 3 + 1], b = rgb[i * 3 + 2];
+        const double greenAxis = g - ( r + b ) / 2.0;
+        axis.push_back( greenAxis );
+        if( greenAxis <= -8.0 && r - g >= 8 && b - g >= 8 ) ++purple;
+    }
+    std::nth_element( axis.begin(), axis.begin() + axis.size() / 2, axis.end() );
+    *dbm = -axis[axis.size() / 2];
+    *psh = 100.0 * static_cast<double>( purple ) / static_cast<double>( mask.size() );
+}
+
+QString ReceiptApplier::lookAssistDualIsoMatchTrace(mlvObject_t *mlvObject,
+                                                    int judgementFrame,
+                                                    int downscaleFactor,
+                                                    double exposureStops,
+                                                    int temperature,
+                                                    int tint)
+{
+    if( !mlvObject || !mlvObject->llrawproc || downscaleFactor <= 0 ) return QString();
+    const llrawprocObject_t *llr = mlvObject->llrawproc;
+    if( llr->dual_iso != 1 || llr->diso_validity == DISO_INVALID || llr->diso1 == llr->diso2 ) return QString();
+    const int totalFrames = static_cast<int>( getMlvFrames( mlvObject ) );
+    if( totalFrames <= 0 ) return QString();
+
+    QString trace = QStringLiteral( "dual_iso=%1 diso=%2/%3 interp=%4 alias_map=%5 fullres=%6 chroma_smooth=%7 "
+                                    "auto_correction=%8 ev_correction=%9 black_delta=%10 raw_black=%11 raw_white=%12" )
+        .arg( llr->dual_iso ).arg( llr->diso1 ).arg( llr->diso2 ).arg( llr->diso_averaging )
+        .arg( llr->diso_alias_map ).arg( llr->diso_frblending ).arg( llr->chroma_smooth )
+        .arg( llr->diso_auto_correction ).arg( llr->diso_ev_correction, 0, 'f', 3 ).arg( llr->diso_black_delta )
+        .arg( getMlvBlackLevel( mlvObject ) ).arg( getMlvWhiteLevel( mlvObject ) );
+
+    // The nominal match the clip renders with (what the reconstruction actually used, levels included).
+    dualiso_match_probe_t nominal;
+    memset( &nominal, 0, sizeof( nominal ) );
+    lookAssistProbeDualIsoMatch( mlvObject, judgementFrame, LLRP_ANALYSIS_DISO_MATCH_SEED, 1.0, -1, true, &nominal );
+    trace += QStringLiteral( " match_black20=%1 match_white20=%2 nominal_rc=%3 nominal_ev=%4 nominal_bd=%5" )
+        .arg( nominal.black ).arg( nominal.white ).arg( nominal.rc )
+        .arg( nominal.ev, 0, 'f', 3 ).arg( nominal.black_delta / 64.0, 0, 'f', 2 );
+
+    // The measured match on the judgement frame, then on the six evenly spaced frames.
+    std::vector<int> frames;
+    frames.push_back( judgementFrame );
+    for( int k = 0; k < 6; ++k )
+        frames.push_back( qRound( k * ( totalFrames - 1 ) / 5.0 ) );
+    std::vector<double> evs;
+    std::vector<double> deltas;
+    dualiso_match_probe_t judged;
+    memset( &judged, 0, sizeof( judged ) );
+    QString perFrame;
+    for( size_t f = 0; f < frames.size(); ++f )
+    {
+        dualiso_match_probe_t measured;
+        memset( &measured, 0, sizeof( measured ) );
+        lookAssistProbeDualIsoMatch( mlvObject, frames[f], LLRP_ANALYSIS_DISO_MATCH_MEASURED, 1.0, -1, true, &measured );
+        if( f == 0 ) judged = measured;
+        else if( measured.rc > 0 )
+        {
+            evs.push_back( measured.ev );
+            deltas.push_back( measured.black_delta / 64.0 );
+        }
+        perFrame += QStringLiteral( "%1%2:%3:%4:%5" ).arg( f == 0 ? QString() : QStringLiteral( "," ) )
+            .arg( frames[f] ).arg( measured.rc ).arg( measured.ev, 0, 'f', 3 )
+            .arg( measured.black_delta / 64.0, 0, 'f', 2 );
+    }
+    trace += QStringLiteral( " measured_rc=%1 measured_ev=%2 measured_bd=%3 frames=%4" )
+        .arg( judged.rc ).arg( judged.ev, 0, 'f', 3 ).arg( judged.black_delta / 64.0, 0, 'f', 2 ).arg( perFrame );
+    if( !evs.empty() )
+    {
+        std::vector<double> sortedEv = evs;
+        std::vector<double> sortedBd = deltas;
+        std::sort( sortedEv.begin(), sortedEv.end() );
+        std::sort( sortedBd.begin(), sortedBd.end() );
+        trace += QStringLiteral( " sheet_ok=%1 median_ev=%2 median_bd=%3 spread_ev=%4 spread_bd=%5" )
+            .arg( sortedEv.size() )
+            .arg( sortedEv[sortedEv.size() / 2], 0, 'f', 3 ).arg( sortedBd[sortedBd.size() / 2], 0, 'f', 2 )
+            .arg( sortedEv.back() - sortedEv.front(), 0, 'f', 3 ).arg( sortedBd.back() - sortedBd.front(), 0, 'f', 2 );
+    }
+    if( judged.rc <= 0 || nominal.rc <= 0 ) return trace + QStringLiteral( " variants=none" );
+
+    // Four display-level variants of the judgement frame, scored over the mask fixed on the nominal render.
+    const int width = mlvObject->RAWI.xRes / downscaleFactor;
+    const int height = mlvObject->RAWI.yRes / downscaleFactor;
+    if( width <= 0 || height <= 0 ) return trace + QStringLiteral( " variants=none" );
+    const int nominalBd = qRound( nominal.black_delta / 64.0 );
+    const int measuredBd = qRound( judged.black_delta / 64.0 );
+    struct Variant { const char *name; int mode; double ev; int bd; };
+    const Variant variants[4] = {
+        { "nominal",  LLRP_ANALYSIS_DISO_MATCH_SEED,     1.0,         -1 },
+        { "measured", LLRP_ANALYSIS_DISO_MATCH_EXPLICIT, -judged.ev,  measuredBd },
+        { "bd_only",  LLRP_ANALYSIS_DISO_MATCH_EXPLICIT, -nominal.ev, measuredBd },
+        { "ev_only",  LLRP_ANALYSIS_DISO_MATCH_EXPLICIT, -judged.ev,  nominalBd } };
+    std::vector<size_t> mask;
+    for( const Variant &v : variants )
+    {
+        std::vector<unsigned char> rgb( static_cast<size_t>( width ) * static_cast<size_t>( height ) * 3u, 0 );
+        dualiso_match_probe_t used;
+        memset( &used, 0, sizeof( used ) );
+        if( !lookAssistDualIsoVariantRender( mlvObject, judgementFrame, downscaleFactor, exposureStops, temperature,
+                                             tint, v.mode, v.ev, v.bd, &rgb, &used ) )
+        {
+            trace += QStringLiteral( " %1=unrendered" ).arg( QLatin1String( v.name ) );
+            continue;
+        }
+        if( v.mode == LLRP_ANALYSIS_DISO_MATCH_SEED )
+        {
+            for( size_t i = 0; i < static_cast<size_t>( width ) * static_cast<size_t>( height ); ++i )
+            {
+                const int luma = ( 54 * rgb[i * 3] + 183 * rgb[i * 3 + 1] + 19 * rgb[i * 3 + 2] ) >> 8;
+                if( luma >= 20 && luma <= 120 ) mask.push_back( i );
+            }
+            trace += QStringLiteral( " mask=%1/%2" ).arg( mask.size() ).arg( width * height );
+        }
+        double dbm = 0.0;
+        double psh = 0.0;
+        lookAssistDarkBandMagenta( rgb, mask, &dbm, &psh );
+        trace += QStringLiteral( " %1=ev%2/bd%3/dbm%4/psh%5" ).arg( QLatin1String( v.name ) )
+            .arg( used.ev, 0, 'f', 3 ).arg( used.black_delta / 64.0, 0, 'f', 2 )
+            .arg( dbm, 0, 'f', 1 ).arg( psh, 0, 'f', 1 );
+    }
+    return trace;
+}
+
 bool ReceiptApplier::applyHeadlessLookAssist(ReceiptSettings *receipt,
                                              mlvObject_t *mlvObject,
                                              processingObject_t *processingObject,
@@ -1204,6 +1376,12 @@ bool ReceiptApplier::applyHeadlessLookAssist(ReceiptSettings *receipt,
         .arg( wb.initialPatchFinalChroma, 0, 'f', 1 )
         .arg( lookAssistDecisionLogFields( stats, decisionTrace ) )
         .arg( lookAssistFlavorName( flavor ) ) );
+
+    const QString disoMatch = lookAssistDualIsoMatchTrace( mlvObject, frameIndex, colorDownscaleFactor,
+                                                           preset.exposure / 100.0, temperature, tint );
+    if( !disoMatch.isEmpty() )
+        BatchLogger::out( QStringLiteral( "[BATCH] LOOK_ASSIST diso_match frame=%1 %2\n" )
+                              .arg( frameIndex ).arg( disoMatch ) );
 
     return true;
 }

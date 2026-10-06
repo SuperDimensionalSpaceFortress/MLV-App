@@ -376,6 +376,25 @@ void dualiso_debug_reset_full20bit_timing(void);
 void dualiso_debug_get_full20bit_timing(dualiso_full20bit_timing_t * timing);
 int dualiso_mix_chroma_probe_mode(void);
 
+/* LOOK-ASSIST-M16-CAST-3: the exposure match the HQ recon last ran on the calling thread (thread-local, measure-only).
+ * rc is the match's return (<= 0 = failed); mode is the auto_correction it ran with (-1 nominal, -2 histogram, 0
+ * explicit); ev is the applied correction in stops (positive); black_delta, black, white and white_darkened are 20-bit
+ * units (64 = one 14-bit unit). With stop_after_match set, diso_get_full20bit returns 0 right after the match, so a
+ * caller that only wants the numbers skips the reconstruction (the caller's failure path restores the frame). */
+typedef struct
+{
+    int valid;
+    int rc;
+    int mode;
+    double ev;
+    int black_delta;
+    int black;
+    int white;
+    int white_darkened;
+} dualiso_match_probe_t;
+void dualiso_match_probe_reset(int stop_after_match);
+int dualiso_match_probe_get(dualiso_match_probe_t * probe);
+
 #ifdef __cplusplus
 }
 #endif

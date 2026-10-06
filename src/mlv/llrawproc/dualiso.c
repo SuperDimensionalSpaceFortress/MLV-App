@@ -66,6 +66,20 @@ static DUALISO_THREAD_LOCAL unsigned long long g_dualiso_hq_mean23_count = 0;
 static DUALISO_THREAD_LOCAL unsigned long long g_dualiso_alias_map_taken_count = 0;
 static DUALISO_THREAD_LOCAL unsigned long long g_dualiso_fullres_blend_taken_count = 0;
 DUALISO_THREAD_LOCAL dualiso_full20bit_timing_t g_dualiso_full20bit_timing = {0};
+static DUALISO_THREAD_LOCAL dualiso_match_probe_t g_dualiso_match_probe = {0};
+static DUALISO_THREAD_LOCAL int g_dualiso_match_probe_stop_after_match = 0;
+
+void dualiso_match_probe_reset(int stop_after_match)
+{
+    memset(&g_dualiso_match_probe, 0, sizeof(g_dualiso_match_probe));
+    g_dualiso_match_probe_stop_after_match = stop_after_match ? 1 : 0;
+}
+
+int dualiso_match_probe_get(dualiso_match_probe_t * probe)
+{
+    if (probe) *probe = g_dualiso_match_probe;
+    return g_dualiso_match_probe.valid;
+}
 static DUALISO_THREAD_LOCAL dualiso_gpu_recon_state_t g_dualiso_last_gpu_recon_state = {0};
 static DUALISO_THREAD_LOCAL int g_dualiso_gpu_recon_state_capture_enabled = 0;
 static int g_dualiso_mix_chroma_probe_mode_cache = INT_MIN;
@@ -2681,6 +2695,7 @@ static int match_exposures(struct raw_info raw_info,
     int h = raw_info.height;
     double applied_ev_correction = 0.0;
     int applied_black_delta = 0;
+    const int probe_mode = auto_correction ? *auto_correction : 0;
     const int scalar_rc = compute_match_exposure_scalars(raw_info,
                                                         raw_buffer_32,
                                                         dark_frame,
@@ -2695,6 +2710,14 @@ static int match_exposures(struct raw_info raw_info,
                                                         1,
                                                         &applied_ev_correction,
                                                         &applied_black_delta);
+    g_dualiso_match_probe.valid = 1;
+    g_dualiso_match_probe.rc = scalar_rc;
+    g_dualiso_match_probe.mode = probe_mode;
+    g_dualiso_match_probe.ev = scalar_rc > 0 ? applied_ev_correction : 0.0;
+    g_dualiso_match_probe.black_delta = scalar_rc > 0 ? applied_black_delta : 0;
+    g_dualiso_match_probe.black = black;
+    g_dualiso_match_probe.white = raw_info.white_level;
+    g_dualiso_match_probe.white_darkened = scalar_rc > 0 ? *white_darkened : 0;
     if (scalar_rc <= 0)
     {
         return scalar_rc;
@@ -6786,7 +6809,7 @@ int diso_get_full20bit(struct raw_info raw_info, uint16_t * image_data, int dark
                                        &white_darkened,
                                        is_bright,
                                        scratch);
-    if (expo_matched <= 0)
+    if (expo_matched <= 0 || g_dualiso_match_probe_stop_after_match)
     {
         DUALISO_FULL20_RETURN(0);
     }

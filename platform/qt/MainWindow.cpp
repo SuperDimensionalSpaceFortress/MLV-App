@@ -17403,6 +17403,13 @@ void MainWindow::applyLookAssistToReceipt( ReceiptSettings *receipt,
             .arg( static_cast<qulonglong>( m_nextRenderRequestSerial ) )
             .arg( lookAssistDecisionLogFields( stats, decisionTrace ) )
             .arg( lookAssistFlavorName( flavor ) ) );
+
+    // LOOK-ASSIST-M16-CAST-3 step 1: the same measure-only dual-ISO match trace the headless applier logs.
+    const QString disoMatch = ReceiptApplier::lookAssistDualIsoMatchTrace(
+        m_pMlvObject, analysisFrame, colorDownscaleFactor, preset.exposure / 100.0, temperature, tint );
+    if( !disoMatch.isEmpty() )
+        logInteractionEvent( QStringLiteral("look_assist.diso_match"),
+                             QStringLiteral("frame=%1 %2").arg( analysisFrame ).arg( disoMatch ) );
 }
 
 void MainWindow::syncLookAssistDerivedUiToReceipt( ReceiptSettings *receipt )

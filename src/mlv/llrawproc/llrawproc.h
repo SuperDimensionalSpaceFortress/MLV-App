@@ -60,6 +60,14 @@ void applyLLRawProcObjectWorkerIsolatedAnalysisWithChromaSmooth(mlvObject_t * vi
  * the vertical-stripe one-shot all land in a private per-thread shadow. Off by default; only measure-only analysis
  * (the Look Assist window-lit verification) turns it on. Returns the previous value. */
 int llrpSetIsolatedAnalysisSharedStateReadOnlyForCurrentThread(int enabled);
+/* LOOK-ASSIST-M16-CAST-3: the dual-ISO exposure match an ISOLATED analysis render on the calling thread seeds with.
+ * SEED (the default) is today's nominal seed (auto -1, ev 1, black delta -1); MEASURED runs the histogram match (-2);
+ * EXPLICIT uses ev_correction (stops, negative, the shared field's convention) and black_delta (14-bit units). Only
+ * Look Assist's dual-ISO match probe sets it, and it puts the previous mode back. Returns the previous mode. */
+#define LLRP_ANALYSIS_DISO_MATCH_SEED     0
+#define LLRP_ANALYSIS_DISO_MATCH_MEASURED 1
+#define LLRP_ANALYSIS_DISO_MATCH_EXPLICIT 2
+int llrpSetIsolatedAnalysisDualIsoMatchForCurrentThread(int mode, double ev_correction, int black_delta);
 /* The output levels (dng bit depth / black / white) of the last llrawproc run on the calling thread that completed for
  * `video`, live or isolated: the levels its frame is at, which a display render syncs the processing object to. Returns
  * 0 when no run completed for `video` since the last reset on this thread (e.g. the frame came from a cache). */

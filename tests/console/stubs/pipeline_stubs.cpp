@@ -2,6 +2,7 @@
 #include <cstdlib>
 
 #include "../../src/mlv_include.h"
+#include "../../src/mlv/llrawproc/dualiso.h"
 extern "C" {
 #include "../../src/debayer/wb_conversion.h"
 #include "../../src/debayer/debayer.h"
@@ -81,6 +82,13 @@ void llrpResetDngBWLevels(mlvObject_t * video)
 void llrpResetFpmStatus(mlvObject_t * video) { video->llrawproc->fpm_status = 0; }
 void llrpResetBpmStatus(mlvObject_t * video) { video->llrawproc->bpm_status = 0; }
 int llrpSetIsolatedAnalysisSharedStateReadOnlyForCurrentThread(int) { return 0; }
+int llrpSetIsolatedAnalysisDualIsoMatchForCurrentThread(int, double, int) { return 0; }
+void dualiso_match_probe_reset(int) {}
+int dualiso_match_probe_get(dualiso_match_probe_t * probe)
+{
+    if (probe) memset(probe, 0, sizeof(*probe));
+    return 0;
+}
 void llrpInitDarkFrameExtFileName(mlvObject_t * video, char * df_filename)
 {
     if (video->llrawproc->dark_frame_filename) {

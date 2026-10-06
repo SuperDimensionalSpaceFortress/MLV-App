@@ -92,6 +92,11 @@ static MLV_THREAD_LOCAL int g_llrawproc_analysis_chroma_smooth_override = CS_OFF
  * per thread and keeps its own pixel-map storage between calls, so an early return never leaks or frees it. */
 static MLV_THREAD_LOCAL int g_llrawproc_analysis_shared_read_only = 0;
 static MLV_THREAD_LOCAL llrawprocObject_t g_llrawproc_read_only_shadow;
+/* LOOK-ASSIST-M16-CAST-3: see llrpSetIsolatedAnalysisDualIsoMatchForCurrentThread(). */
+static MLV_THREAD_LOCAL int g_llrawproc_analysis_diso_match_mode = LLRP_ANALYSIS_DISO_MATCH_SEED;
+static MLV_THREAD_LOCAL double g_llrawproc_analysis_diso_ev_correction = 1.0;
+static MLV_THREAD_LOCAL int g_llrawproc_analysis_diso_black_delta = -1;
+static void llrawproc_isolated_analysis_diso_seed(int * auto_correction, double * ev_correction, int * black_delta);
 /* LOOK-ASSIST-ANALYSIS-TRUE-LEVELS-1: see llrpLastOutputLevelsForCurrentThread(). */
 static MLV_THREAD_LOCAL const mlvObject_t * g_llrawproc_last_output_levels_video = NULL;
 static MLV_THREAD_LOCAL int g_llrawproc_last_output_bit_depth = 0;
@@ -3447,12 +3452,12 @@ void applyLLRawProcObjectWorker(mlvObject_t * video,
     {
         llrawproc_runtime_state_t analysis_seed = { 0 };
         worker_diso_pattern = 0;
-        worker_diso_auto_correction = -1;
-        worker_diso_ev_correction = 1.0;
-        worker_diso_black_delta = -1;
-        analysis_seed.diso_auto_correction = -1;
-        analysis_seed.diso_ev_correction = 1.0;
-        analysis_seed.diso_black_delta = -1;
+        llrawproc_isolated_analysis_diso_seed(&worker_diso_auto_correction,
+                                              &worker_diso_ev_correction,
+                                              &worker_diso_black_delta);
+        analysis_seed.diso_auto_correction = worker_diso_auto_correction;
+        analysis_seed.diso_ev_correction = worker_diso_ev_correction;
+        analysis_seed.diso_black_delta = worker_diso_black_delta;
         worker->seeded_runtime_state = analysis_seed;
     }
     dark_frame_mode = shared->dark_frame;
@@ -4602,6 +4607,35 @@ int llrpSetIsolatedAnalysisSharedStateReadOnlyForCurrentThread(int enabled)
     return previous;
 }
 
+int llrpSetIsolatedAnalysisDualIsoMatchForCurrentThread(int mode, double ev_correction, int black_delta)
+{
+    const int previous = g_llrawproc_analysis_diso_match_mode;
+    g_llrawproc_analysis_diso_match_mode =
+        (mode == LLRP_ANALYSIS_DISO_MATCH_MEASURED || mode == LLRP_ANALYSIS_DISO_MATCH_EXPLICIT)
+        ? mode : LLRP_ANALYSIS_DISO_MATCH_SEED;
+    g_llrawproc_analysis_diso_ev_correction = ev_correction;
+    g_llrawproc_analysis_diso_black_delta = black_delta;
+    return previous;
+}
+
+/* The isolated analysis seed: nominal (-1, ev 1, black delta -1) unless this thread asked for the measured (-2) match
+ * or explicit values. */
+static void llrawproc_isolated_analysis_diso_seed(int * auto_correction, double * ev_correction, int * black_delta)
+{
+    *auto_correction = -1;
+    *ev_correction = 1.0;
+    *black_delta = -1;
+    if (g_llrawproc_analysis_diso_match_mode == LLRP_ANALYSIS_DISO_MATCH_MEASURED)
+    {
+        *auto_correction = -2;
+    }
+    else if (g_llrawproc_analysis_diso_match_mode == LLRP_ANALYSIS_DISO_MATCH_EXPLICIT)
+    {
+        *ev_correction = g_llrawproc_analysis_diso_ev_correction;
+        *black_delta = g_llrawproc_analysis_diso_black_delta;
+    }
+}
+
 void applyLLRawProcObject(mlvObject_t * video, uint16_t * raw_image_buff, size_t raw_image_size)
 {
     applyLLRawProcObjectWorker(video, raw_image_buff, raw_image_size, NULL, 0);
@@ -4861,12 +4895,12 @@ static int llrawproc_apply_with_dims_internal(mlvObject_t * video,
     {
         llrawproc_runtime_state_t analysis_seed = { 0 };
         worker_diso_pattern = 0;
-        worker_diso_auto_correction = -1;
-        worker_diso_ev_correction = 1.0;
-        worker_diso_black_delta = -1;
-        analysis_seed.diso_auto_correction = -1;
-        analysis_seed.diso_ev_correction = 1.0;
-        analysis_seed.diso_black_delta = -1;
+        llrawproc_isolated_analysis_diso_seed(&worker_diso_auto_correction,
+                                              &worker_diso_ev_correction,
+                                              &worker_diso_black_delta);
+        analysis_seed.diso_auto_correction = worker_diso_auto_correction;
+        analysis_seed.diso_ev_correction = worker_diso_ev_correction;
+        analysis_seed.diso_black_delta = worker_diso_black_delta;
         worker->seeded_runtime_state = analysis_seed;
     }
     dark_frame_mode = shared->dark_frame;
