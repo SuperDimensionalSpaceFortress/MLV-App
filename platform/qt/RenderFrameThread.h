@@ -589,6 +589,7 @@ private:
     bool m_lastFrameUsedGpuAmazeDebayer;
     QString m_lastGpuAmazeFallbackReason;
     QString m_lastGpuAmazeRendererDescription;
+    QString m_lastDebayered16ReconReuseFallbackReason;
     double m_lastDualIsoPreviewHistogramMs;
     double m_lastDualIsoPreviewRegressionMs;
     double m_lastDualIsoPreviewRowscaleMs;
@@ -611,6 +612,10 @@ private:
     CubicPlaybackScaleCache m_playbackCubicScaleCache;
     std::vector<float> m_gpuBilinearDebayerRawFrame;
     std::vector<float> m_gpuAmazeDebayerRawFrame;
+    /* CPU-DEBAYERED16-REUSE-PHASE3-RECON-1: the debayer reads the worker's
+     * reconstructed Bayer from here, because the debayer writes W*H*3 into the
+     * slot's rawImage16 that holds it. Float-sized: the tail converts in place. */
+    std::vector<float> m_debayered16ReconScratch;
     std::vector<uint16_t> m_gpuPlaybackReconStateRgb16;
     std::array<GpuPlaybackReconTextureState::LutCacheEntry,
                kGpuPlaybackReconTextureLutCacheSlots>

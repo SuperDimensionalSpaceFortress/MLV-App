@@ -1413,6 +1413,11 @@ private:
     QString m_playbackSmokeCpuDualIsoReconFallbackReasonLast;
     double m_playbackSmokeCpuDualIsoReconFullResFixesSumMs = 0.0;
     double m_playbackSmokeCpuDualIsoReconDownsampleSumMs = 0.0;
+    int m_playbackSmokeDebayered16ReconConsumedFrames = 0;
+    int m_playbackSmokeDebayered16OwnReconFrames = 0;
+    QString m_playbackSmokeDebayered16ReconFallbackReasonLast;
+    double m_playbackSmokeDebayered16WorkerLlrawprocSumMs = 0.0;
+    double m_playbackSmokeDebayered16RenderLlrawprocSumMs = 0.0;
     int m_playbackSmokeProcessed8PrefetchHits = 0;
     int m_playbackSmokeRawPrefetchHits = 0;
     int m_playbackSmokeGpuStatusCpuFrames = 0;

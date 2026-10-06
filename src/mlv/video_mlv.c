@@ -6296,6 +6296,45 @@ void getMlvRawFrameDebayered(mlvObject_t * video, uint64_t frameIndex, uint16_t 
     pthread_mutex_unlock(&video->g_mutexFind);
 }
 
+int getMlvRawFrameDebayeredFromReconnedRaw16(mlvObject_t * video,
+                                             uint64_t frameIndex,
+                                             float * reconnedRawScratch,
+                                             uint16_t * outputFrame)
+{
+    if (!video || !reconnedRawScratch || !outputFrame) return 0;
+    const int width = getMlvWidth(video);
+    const int height = getMlvHeight(video);
+    if (width <= 0 || height <= 0
+        || frameIndex >= getMlvFrames(video)
+        || (size_t)width > SIZE_MAX / (size_t)height
+        || (size_t)width * (size_t)height > SIZE_MAX / (sizeof(uint16_t) * 3u))
+    {
+        return 0;
+    }
+    if (mlvRawDebayerCacheMayServeFrame(video, frameIndex)) return 0;
+
+    /* No decode and no llrawproc run on this thread for this frame: clear the
+     * thread's last-run records so its telemetry does not report a previous
+     * frame's. */
+    mlv_reset_last_raw_stage_telemetry();
+    resetMlvLastDebayerStageMilliseconds();
+    g_mlv_last_llrawproc_ms = 0.0;
+    g_mlv_last_raw_float_convert_ms = 0.0;
+    llrpResetLastRunTimingForCurrentThread();
+
+    /* What getMlvRawFrameProcessedUint16 reports after its llrawproc run. */
+    const int bit_shift = llrpHQDualIso(video) ? 0 : (16 - video->RAWI.raw_info.bits_per_pixel);
+    return get_mlv_raw_frame_debayered_from_processed_raw_u16(
+        video,
+        frameIndex,
+        reconnedRawScratch,
+        outputFrame,
+        doesMlvAlwaysUseAmaze(video),
+        bit_shift,
+        getMlvCpuCores(video),
+        "get_mlv_raw_frame_debayered_from_reconned_raw16");
+}
+
 static void mlv_compute_desired_processing_bw_levels(mlvObject_t * video,
                                                      float * desired_black_level,
                                                      int * desired_white_level,

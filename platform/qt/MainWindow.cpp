@@ -24074,6 +24074,11 @@ void MainWindow::beginPlaybackSmokeTelemetry( void )
     m_playbackSmokeCpuDualIsoReconFallbackReasonLast.clear();
     m_playbackSmokeCpuDualIsoReconFullResFixesSumMs = 0.0;
     m_playbackSmokeCpuDualIsoReconDownsampleSumMs = 0.0;
+    m_playbackSmokeDebayered16ReconConsumedFrames = 0;
+    m_playbackSmokeDebayered16OwnReconFrames = 0;
+    m_playbackSmokeDebayered16ReconFallbackReasonLast.clear();
+    m_playbackSmokeDebayered16WorkerLlrawprocSumMs = 0.0;
+    m_playbackSmokeDebayered16RenderLlrawprocSumMs = 0.0;
     m_playbackSmokeProcessed8PrefetchHits = 0;
     m_playbackSmokeRawPrefetchHits = 0;
     m_playbackSmokeQueuedPlaybackDropSum = 0;
@@ -25092,6 +25097,23 @@ void MainWindow::notePlaybackSmokePresentedFrame(
             telemetryDoubleValue( timing, "cpu_dualiso_recon_fullres_fixes_ms" );
         m_playbackSmokeCpuDualIsoReconDownsampleSumMs +=
             telemetryDoubleValue( timing, "cpu_dualiso_recon_downsample_ms" );
+    }
+    if( timing.contains( QStringLiteral("debayered16_phase3_recon_consumed") ) )
+    {
+        if( telemetryBoolValue( timing, "debayered16_phase3_recon_consumed" ) )
+        {
+            ++m_playbackSmokeDebayered16ReconConsumedFrames;
+        }
+        else
+        {
+            ++m_playbackSmokeDebayered16OwnReconFrames;
+            m_playbackSmokeDebayered16ReconFallbackReasonLast =
+                telemetryStringValue( timing, "debayered16_phase3_recon_fallback_reason" );
+        }
+        m_playbackSmokeDebayered16WorkerLlrawprocSumMs +=
+            telemetryDoubleValue( timing, "debayered16_recon_worker_llrawproc_total_ms" );
+        m_playbackSmokeDebayered16RenderLlrawprocSumMs +=
+            telemetryDoubleValue( timing, "llrawproc_total_ms" );
     }
     if( borrowedPreparedRgb8Bytes > 0.0 )
     {
@@ -27332,6 +27354,29 @@ void MainWindow::finishPlaybackSmokeTelemetry( const char *reason )
                .arg( avgSmokeMs( m_playbackSmokeCpuDualIsoReconFullResFixesSumMs ), 0, 'f', 3 )
                .arg( avgSmokeMs( m_playbackSmokeCpuDualIsoReconDownsampleSumMs ), 0, 'f', 3 )
                .arg( m_playbackSmokeCpuDualIsoReconFallbackReasonLast );
+
+    /* CPU-DEBAYERED16-REUSE-PHASE3-RECON-1: debayered-16 frames whose render
+     * consumed the phase-3 recon (one recon per frame) versus ran its own decode
+     * + recon (two), and both threads' llrawproc ms per such frame. */
+    {
+        const int debayered16Frames =
+            m_playbackSmokeDebayered16ReconConsumedFrames + m_playbackSmokeDebayered16OwnReconFrames;
+        const auto perDebayered16Frame = [debayered16Frames]( double sumMs ) {
+            return debayered16Frames > 0 ? sumMs / debayered16Frames : 0.0;
+        };
+        qInfo().noquote()
+            << QStringLiteral(
+                   "playback_smoke.debayered16_recon_reuse_summary session=%1 "
+                   "debayered16_recon_consumed_frames=%2 debayered16_own_recon_frames=%3 "
+                   "avg_recon_worker_llrawproc_ms=%4 avg_render_llrawproc_ms=%5 "
+                   "debayered16_fallback_reason_last=\"%6\"" )
+                   .arg( static_cast<qulonglong>( m_playbackSmokeSessionId ) )
+                   .arg( m_playbackSmokeDebayered16ReconConsumedFrames )
+                   .arg( m_playbackSmokeDebayered16OwnReconFrames )
+                   .arg( perDebayered16Frame( m_playbackSmokeDebayered16WorkerLlrawprocSumMs ), 0, 'f', 3 )
+                   .arg( perDebayered16Frame( m_playbackSmokeDebayered16RenderLlrawprocSumMs ), 0, 'f', 3 )
+                   .arg( m_playbackSmokeDebayered16ReconFallbackReasonLast );
+    }
 
     qInfo().noquote()
         << QStringLiteral(
