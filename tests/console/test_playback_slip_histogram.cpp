@@ -372,3 +372,97 @@ TEST(PlaybackSlipHistogram, AGuardReArmedMidSessionShowsALeadAndTheReArms)
     ASSERT_TRUE( leak.paceGuardRearms > 1000 );
     ASSERT_TRUE( leak.paceGuardMaxLeadFrames > 100.0 ); // a 9 ms renderer outruns native once nothing carries over
 }
+TEST(PlaybackSlipHistogram, TheDelayedStartupCatchUpIsNeitherASlipNorPacedThroughput)
+{
+    // The r1b b-cin-head5-cuda1 shape: Play at 0, first present at 1427 ms with the timeline at 1 (the first present's
+    // advance repaid nothing), two slow presents, then ONE burst moves the timeline to the wall time since Play, and
+    // the rest is paced. Raw, 598 timeline frames in ~23.6 s read above 25 fps; the burst's first 33 frames are the
+    // wait for the first frame (34 owed at 1427 ms, 1 already advanced), the rest of it a real post-first stall.
+    SlipHistogram h;
+    h.reset( 0, kNativeFps, 0.0 );
+    h.noteTimelineMove( AdvancePath::DropTick, 1, 10.0, 1.0, 0.0 );
+    auto present = [&h]( int frame, double ms, int timeline )
+    {
+        PresentSample s;
+        s.displayFrame = frame;
+        s.presentMs = ms;
+        s.readyMs = ms - 1.0;
+        s.timelinePosition = timeline;
+        h.notePresent( s );
+    };
+    present( 0, 1427.0, 1 );
+    h.noteTimelineMove( AdvancePath::DropTick, 2, 1927.0, 1.0, 0.0 );
+    present( 1, 1927.0, 2 );
+    h.noteTimelineMove( AdvancePath::DropTick, 3, 2427.0, 1.0, 0.0 );
+    present( 2, 2427.0, 3 );
+    const double burstMs = 2470.0;
+    const int owed = static_cast<int>( burstMs * kNativeFps / 1000.0 );   // 59
+    h.noteTimelineMove( AdvancePath::DropTick, owed, burstMs, owed - 3, 0.0 );
+    present( owed - 1, burstMs, owed );
+    int timeline = owed;
+    double ms = burstMs;
+    while( timeline < 599 )
+    {
+        ms += kPeriodMs;
+        ++timeline;
+        h.noteTimelineMove( AdvancePath::DropTick, timeline, ms, 1.0, 0.0 );
+        present( timeline - 1, ms, timeline );
+    }
+    const Summary s = h.finish( ms, timeline );
+    const double pacedMs = ms - 1427.0;
+    ASSERT_EQ( 33, s.startupWaitCreditFrames );
+    ASSERT_EQ( 33, s.startupCatchupAfterFirstFrames );
+    ASSERT_EQ( 33, s.startupCatchupFrames );
+    ASSERT_EQ( static_cast<long long>( owed - 1 - 2 - 1 - 33 ), s.slipsTotal );    // the post-first stall only
+    ASSERT_TRUE( s.timelineAfterFirstRawFps > 25.0 );                               // the anomaly, reproduced
+    ASSERT_NEAR( 598.0 * 1000.0 / pacedMs, s.timelineAfterFirstRawFps, 1e-9 );
+    // paced: never more than the pace plus one frame over the paced interval
+    ASSERT_TRUE( s.timelineAfterFirstFps <= kNativeFps + 1000.0 / pacedMs + 1e-9 );
+    ASSERT_EQ( 598 - 33, s.timelineFramesAfterFirst );
+}
+
+TEST(PlaybackSlipHistogram, TheCatchUpNeverExceedsTheWaitAndStopsOnceCaughtUp)
+{
+    // Caught up at the second present: a later skip is a real slip, whatever credit is left.
+    SlipHistogram h;
+    h.reset( 0, kNativeFps, 0.0 );
+    PresentSample s;
+    s.displayFrame = 0; s.presentMs = 400.0; s.readyMs = 399.0; s.timelinePosition = 1;
+    h.noteTimelineMove( AdvancePath::DropTick, 1, 400.0, 1.0, 0.0 );
+    h.notePresent( s );                                                   // owes floor(400 x 23.976 / 1000) = 9: credit 8
+    h.noteTimelineMove( AdvancePath::DropTick, 12, 450.0, 11.0, 0.0 );
+    s.displayFrame = 11; s.presentMs = 450.0; s.readyMs = 449.0; s.timelinePosition = 12;
+    h.notePresent( s );                                                   // a 10-frame skip: 8 catch-up, 2 slips; caught up
+    h.noteTimelineMove( AdvancePath::DropTick, 16, 600.0, 4.0, 0.0 );
+    s.displayFrame = 15; s.presentMs = 600.0; s.readyMs = 599.0; s.timelinePosition = 16;
+    h.notePresent( s );                                                   // 3 more skipped: real slips
+    const Summary sum = h.finish( 600.0, 16 );
+    ASSERT_EQ( 8, sum.startupWaitCreditFrames );
+    ASSERT_EQ( 8, sum.startupCatchupAfterFirstFrames );
+    ASSERT_EQ( 2LL + 3LL, sum.slipsTotal );
+}
+
+TEST(PlaybackSlipHistogram, AGrantFreeStallIsRepaidInOneBurst)
+{
+    // NativePaceGuard banks credit while no grant runs; the first unshaped request after a 1 s stall takes it all.
+    SlipHistogram h;
+    h.reset( 0, kNativeFps, 0.0 );
+    playback_native_pace::NativePaceGuard guard;
+    double position = 0.0;
+    for( double t = 0.0; t <= 1000.0; t += kPeriodMs )
+    {
+        const double g = guard.grant( 1.0, t, kNativeFps );
+        position += g;
+        h.noteTimelineMove( AdvancePath::DropTick, static_cast<int>( position ), t, g, guard.creditFrames(), kNativeFps, false );
+    }
+    const double afterStall = 2000.0;
+    const double burst = guard.grant( 1000.0 * kNativeFps / 1000.0 + 1.0, afterStall, kNativeFps );
+    position += burst;
+    h.noteTimelineMove( AdvancePath::DropTick, static_cast<int>( position ), afterStall, burst, guard.creditFrames(), kNativeFps, false );
+    const Summary s = h.finish( afterStall, static_cast<int>( position ) );
+    ASSERT_TRUE( burst > 20.0 );
+    ASSERT_EQ( 1, s.paceGuardBursts );
+    ASSERT_NEAR( burst, s.paceGuardMaxGrantFrames, 1e-12 );
+    ASSERT_NEAR( burst - 1.0, s.paceGuardBurstFrames, 1e-12 );
+    ASSERT_TRUE( s.paceGuardMaxLeadFrames <= 1e-9 );   // within the guard's own contract: carry + elapsed since its last grant
+}

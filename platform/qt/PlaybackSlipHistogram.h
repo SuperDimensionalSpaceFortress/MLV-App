@@ -160,9 +160,12 @@ struct Summary
     int maxIntervalFrame = -1;
     SlipClass maxIntervalClass = SlipClass::None;
     int startupCatchupFrames = 0;
+    int startupCatchupAfterFirstFrames = 0;  // the part repaid by skips after the first present (delayed catch-up)
+    int startupWaitCreditFrames = 0;         // the wall time since Play the first present had not yet repaid, in frames
     int timelineDeltaAtFirstPresent = 0;
     int timelineFramesAfterFirst = 0;
-    double timelineAfterFirstFps = 0.0;
+    double timelineAfterFirstFps = 0.0;      // paced: the delayed startup catch-up is not counted
+    double timelineAfterFirstRawFps = 0.0;   // every timeline frame after the first present (pace_summary before this card)
     double presentedAfterFirstFps = 0.0;
     double nativeEquivPresentedFps = 0.0;
     std::array<long long, kSlipBucketCount> histSlip {};
@@ -175,6 +178,9 @@ struct Summary
     double paceGuardMaxLeadFrames = 0.0;   // > 0: the guard granted more than kMaxCarry + elapsed x pace over some span
     double paceGuardMaxLeadMs = 0.0;       // when (ms after the session's first grant) that lead peaked
     int paceGuardRearms = 0;               // grants that found the guard unarmed (the first one included)
+    double paceGuardMaxGrantFrames = 0.0;  // the largest single grant
+    int paceGuardBursts = 0;               // grants of more than 2 frames (credit banked while no grant ran)
+    double paceGuardBurstFrames = 0.0;     // what those grants gave beyond one frame each
     double paceGuardFpsMin = 0.0;
     double paceGuardFpsMax = 0.0;
     int wraps = 0;
@@ -188,14 +194,16 @@ struct Summary
 class SlipHistogram
 {
 public:
-    /*! New session: \a startPosition is the slider at Play, \a paceFps the pace (period = 1000 / pace). */
-    void reset( int startPosition, double paceFps )
+    /*! New session: \a startPosition is the slider at Play, \a paceFps the pace (period = 1000 / pace), \a playStartMs
+     *  the Play's wall time (< 0: unknown, and then no slip after the first present is taken for startup catch-up). */
+    void reset( int startPosition, double paceFps, double playStartMs = -1.0 )
     {
         *this = SlipHistogram();
         m_startPosition = startPosition;
         m_timelinePosition = startPosition;
         m_paceFps = paceFps > 0.0 ? paceFps : 0.0;
         m_periodMs = m_paceFps > 0.0 ? 1000.0 / m_paceFps : 0.0;
+        m_playStartMs = playStartMs;
         for( auto &d : m_deadlines ) d = Deadline();
     }
 
@@ -263,6 +271,14 @@ public:
             // next frame (the repaid wait for the first frame): never slips.
             m_startupCatchupFrames = std::max( 0, s.displayFrame - m_startPosition );
             m_firstPresentJumpFrames = std::max( 0, s.timelinePosition - s.displayFrame - 1 );
+            // The drop-frame engine owes the wall time since Play: what the first present's own advance did not repay
+            // (the guard banks credit while no grant runs) is repaid by a burst a few presents later.
+            m_waitCreditFrames = 0;
+            if( m_playStartMs >= 0.0 && s.presentMs > m_playStartMs && m_paceFps > 0.0 )
+            {
+                const int owed = static_cast<int>( ( s.presentMs - m_playStartMs ) * m_paceFps / 1000.0 );
+                m_waitCreditFrames = std::max( 0, owed - std::abs( s.timelinePosition - m_startPosition ) );
+            }
             m_pendingGrab = false;
             m_pendingGrabMs = 0.0;
             return;
@@ -296,6 +312,20 @@ public:
                 slip -= catchup;
                 m_startupCatchupFrames += catchup;
             }
+            // Delayed startup catch-up: while the timeline is still behind the wall time since Play, a skip repays the
+            // wait for the first frame (never more than that wait's credit in all).
+            if( slip > 0 && !m_caughtUp && m_waitCreditFrames > m_catchupAfterFirstFrames )
+            {
+                const int catchup = std::min( slip, m_waitCreditFrames - m_catchupAfterFirstFrames );
+                slip -= catchup;
+                m_catchupAfterFirstFrames += catchup;
+                m_startupCatchupFrames += catchup;
+            }
+        }
+        if( !m_caughtUp && m_playStartMs >= 0.0 && m_paceFps > 0.0
+         && std::abs( s.timelinePosition - m_startPosition ) + 1.0 >= ( s.presentMs - m_playStartMs ) * m_paceFps / 1000.0 )
+        {
+            m_caughtUp = true;
         }
         ++m_histSlip[static_cast<size_t>( slipSizeBucket( slip ) )];
 
@@ -352,6 +382,11 @@ public:
         out.paceGuardMaxLeadFrames = m_guardMaxLead;
         out.paceGuardMaxLeadMs = m_guardMaxLeadMs;
         out.paceGuardRearms = m_guardRearms;
+        out.paceGuardMaxGrantFrames = m_guardMaxGrant;
+        out.paceGuardBursts = m_guardBursts;
+        out.paceGuardBurstFrames = m_guardBurstFrames;
+        out.startupCatchupAfterFirstFrames = m_catchupAfterFirstFrames;
+        out.startupWaitCreditFrames = m_waitCreditFrames;
         out.paceGuardFpsMin = m_guardPaceMin;
         out.paceGuardFpsMax = m_guardPaceMax;
         out.maxIntervalMs = m_maxIntervalMs;
@@ -386,12 +421,14 @@ public:
 
         if( m_presents > 0 )
         {
-            out.timelineFramesAfterFirst = std::max( 0, std::abs( endPosition - m_startPosition )
-                                                        - std::abs( m_timelineAtFirstPresent - m_startPosition ) );
+            const int rawAfterFirst = std::max( 0, std::abs( endPosition - m_startPosition )
+                                                   - std::abs( m_timelineAtFirstPresent - m_startPosition ) );
+            out.timelineFramesAfterFirst = std::max( 0, rawAfterFirst - m_catchupAfterFirstFrames );
             const double pacedMs = nowMs - m_firstPresentMs;
             if( pacedMs > 0.0 )
             {
                 out.timelineAfterFirstFps = out.timelineFramesAfterFirst * 1000.0 / pacedMs;
+                out.timelineAfterFirstRawFps = rawAfterFirst * 1000.0 / pacedMs;
                 out.presentedAfterFirstFps = ( m_presents - 1 ) * 1000.0 / pacedMs;
             }
             if( out.timelineFramesAfterFirst > 0 )
@@ -426,6 +463,12 @@ private:
     void noteGuardGrant( double nowMs, double grantedFrames, double paceFps, bool rearmed )
     {
         if( rearmed ) ++m_guardRearms;
+        if( grantedFrames > m_guardMaxGrant ) m_guardMaxGrant = grantedFrames;
+        if( grantedFrames > 2.0 )
+        {
+            ++m_guardBursts;
+            m_guardBurstFrames += grantedFrames - 1.0;
+        }
         if( paceFps > 0.0 )
         {
             if( m_guardGrants == 0 || paceFps < m_guardPaceMin ) m_guardPaceMin = paceFps;
@@ -542,6 +585,14 @@ private:
     double m_guardMaxLeadMs = 0.0;
     double m_guardPaceMin = 0.0;
     double m_guardPaceMax = 0.0;
+    double m_guardMaxGrant = 0.0;
+    int m_guardBursts = 0;
+    double m_guardBurstFrames = 0.0;
+
+    double m_playStartMs = -1.0;
+    int m_waitCreditFrames = 0;
+    int m_catchupAfterFirstFrames = 0;
+    bool m_caughtUp = false;
 
     std::array<long long, kSlipBucketCount> m_histSlip {};
     std::array<long long, kIntervalBucketCount> m_histInterval {};
