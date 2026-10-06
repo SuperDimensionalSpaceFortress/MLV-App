@@ -3499,7 +3499,8 @@ void MainWindow::queuePlaybackLookaheadRequests(
     if( !ui->actionPlay->isChecked() || !baseContext.playbackActive ) return;
     if( !baseContext.gpuPlaybackReconTexturePresentRequested
      || !baseContext.gpuPlaybackReconAmazeTexturePresentAdmitted ) return;
-    if( baseContext.playbackScaleFactor != 1 ) return;
+    if( !mainWindowGpuTextureRouteAdmitsPlaybackScale(
+            baseContext.playbackScaleFactor, gpuReducedReconHonouredSessionScale() ) ) return;
 
     const int totalFrames = getMlvFrames( m_pMlvObject );
     if( totalFrames <= 1 ) return;
