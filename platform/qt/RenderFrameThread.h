@@ -456,6 +456,11 @@ private:
         int reducedReconScale = 1;
         int reducedReconWidth = 0;
         int reducedReconHeight = 0;
+        /* PLAYBACK-CUDA-HONOUR-SCALE-1: the reduced recon ran on the CUDA
+         * texture route. reducedReconBayer is then the prepared recon INPUT
+         * (not a reconstruction); the reconstruction is the retained device
+         * Bayer at reducedReconWidth x reducedReconHeight. */
+        bool reducedReconOnGpu = false;
         GpuPlaybackReconTextureState gpuPlaybackReconTextureState;
         int gpuPlaybackReconTextureWidth = 0;
         int gpuPlaybackReconTextureHeight = 0;
@@ -612,6 +617,10 @@ private:
     std::vector<float> m_gpuBilinearDebayerRawFrame;
     std::vector<float> m_gpuAmazeDebayerRawFrame;
     std::vector<uint16_t> m_gpuPlaybackReconStateRgb16;
+    /* PLAYBACK-CUDA-HONOUR-SCALE-1: the reduced prepared Bayer with each sample
+     * averaged with the same-colour sample two rows away (the opposite ISO), the
+     * source of a reduced slot's shadows/highlights frame state. */
+    std::vector<uint16_t> m_gpuReducedShSourceBayer;
     std::array<GpuPlaybackReconTextureState::LutCacheEntry,
                kGpuPlaybackReconTextureLutCacheSlots>
         m_gpuPlaybackReconTextureLutCache;

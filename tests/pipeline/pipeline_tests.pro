@@ -119,7 +119,8 @@ SOURCES += \
     $$REPO_ROOT/tests/pipeline/test_sh_frame_state_proxy.cpp \
     $$REPO_ROOT/tests/pipeline/test_look_assist_analysis_render_race.cpp \
     $$REPO_ROOT/tests/pipeline/test_raw_uint16_prefetch_ring.cpp \
-    $$REPO_ROOT/tests/pipeline/test_cpu_dualiso_preview_scale.cpp
+    $$REPO_ROOT/tests/pipeline/test_cpu_dualiso_preview_scale.cpp \
+    $$REPO_ROOT/tests/pipeline/test_gpu_dualiso_preview_scale.cpp
 
 HEADERS += \
     $$REPO_ROOT/tests/common/minitest.h \

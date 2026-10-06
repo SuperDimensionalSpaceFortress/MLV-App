@@ -1197,6 +1197,12 @@ private:
     int m_playbackSmokeFirstPresentTimelineDeltaAbs = 0; // slider travel from Play, sampled at the first present
     double m_playbackSmokePresentedIntervalSumMs = 0.0;
     double m_playbackSmokePresentedIntervalMaxMs = 0.0;
+    // PLAYBACK-CUDA-HONOUR-SCALE-1 r2: present-gap attribution (present_gap_summary).
+    qint64 m_playbackSmokePresentedIntervalMaxFrame = -1;
+    int m_playbackSmokePresentIntervalOverBudget[4] = { 0, 0, 0, 0 };
+    uint64_t m_playbackSmokeStartGpuSetClipCount = 0;
+    uint64_t m_playbackSmokeStartGpuSetLutsCount = 0;
+    quint64 m_playbackSmokeStartPresentTextureReallocs = 0;
     double m_playbackSmokeRenderTotalSumMs = 0.0;
     double m_playbackSmokeRenderTotalMaxMs = 0.0;
     double m_playbackSmokeRenderWorkSumMs = 0.0;
@@ -1437,6 +1443,16 @@ private:
     int m_playbackSmokeLastScaleActive = 1;
     mutable bool m_playbackScaleClampedForGpuTextureRouteActive = false;
     mutable int m_playbackScaleClampedForGpuTextureRouteRequestedScale = 0;
+    /* PLAYBACK-CUDA-HONOUR-SCALE-1: the texture-route scale is decided once per
+     * play session (the CUDA backend frees in-flight outputs on a size change):
+     * latched at the first playing request, released when playback stops. */
+    mutable bool m_gpuReducedReconSessionLatched = false;
+    mutable int m_gpuReducedReconSessionScale = 1;
+    mutable QString m_gpuReducedReconSessionReason;
+    int m_playbackSmokeGpuDualIsoReducedReconFrames = 0;
+    int m_playbackSmokeGpuDualIsoFullReconFrames = 0;
+    int m_playbackSmokeGpuDualIsoReconScaleLast = 0;
+    QString m_playbackSmokeGpuDualIsoReconFallbackReasonLast;
     /* CUDA-S4-TEXTURE-ROUTE-CLAMP-1 round 2: gpuPlaybackReconTextureRouteEligibleAtScaleOne()
      * touches m_pProcessingObject, which initLib() does not assign until after initGui() has
      * already run (and already called into the eligibility predicate via
@@ -1670,6 +1686,7 @@ private:
     QString activeClipPhase3Fingerprint( void ) const;
     QStringList pinnedClipFingerprintsForPhase3( void ) const;
     int  effectivePlaybackScaleFactorForRequest( void ) const;
+    int  gpuReducedReconHonouredSessionScale( void ) const;
     int  playbackScaleFactorPolicyDecision( void ) const;
     bool gpuPlaybackReconTextureRouteEligibleAtScaleOne( void ) const;
     MainWindowGpuPreviewPolicyState gpuPreviewPolicyForCurrentScopeState(

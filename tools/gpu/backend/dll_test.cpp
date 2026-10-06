@@ -118,6 +118,7 @@ struct VectorScalars
     int use_fullres = 1;
     int chroma_smooth_method = 0;
     int apply_dither = 0;
+    int playback_preview_scale_factor = 0;
     int is_bright[4] = {1, 1, 0, 0};
 };
 
@@ -150,6 +151,8 @@ static bool parse_scalars_file(const std::string& path, VectorScalars* scalars)
         else if (strcmp(key, "use_fullres") == 0) scalars->use_fullres = atoi(value);
         else if (strcmp(key, "chroma_smooth_method") == 0) scalars->chroma_smooth_method = atoi(value);
         else if (strcmp(key, "apply_dither") == 0) scalars->apply_dither = atoi(value);
+        else if (strcmp(key, "playback_preview_scale_factor") == 0)
+            scalars->playback_preview_scale_factor = atoi(value);
         else if (strcmp(key, "is_bright") == 0) {
             int b0 = 0, b1 = 0, b2 = 0, b3 = 0;
             if (sscanf(value, "%d,%d,%d,%d", &b0, &b1, &b2, &b3) == 4) {
@@ -301,10 +304,20 @@ int main(int argc, char** argv)
     std::string vdir = "G:\\Temp\\mlv-gpu-profile\\oracle\\vectors";
     std::string dllpath = "igpu_recon_cuda.dll";
     bool run_gl_texture = false;
+    /* PLAYBACK-CUDA-HONOUR-SCALE-1 r2 (c1): --reduced-iso-notch turns on the
+     * optional igpu_recon_set_reduced_iso_notch extension before the runs (the
+     * vectors' out.u16 is then the CPU recon plus the C reference notch);
+     * --dump FILE writes the CPU16 result for byte comparison across DLLs. */
+    bool reduced_iso_notch = false;
+    std::string dump_path;
     int positional = 0;
     for (int i = 1; i < argc; ++i) {
         if (strcmp(argv[i], "--gl-texture") == 0) {
             run_gl_texture = true;
+        } else if (strcmp(argv[i], "--reduced-iso-notch") == 0) {
+            reduced_iso_notch = true;
+        } else if (strcmp(argv[i], "--dump") == 0 && i + 1 < argc) {
+            dump_path = argv[++i];
         } else if (positional == 0) {
             vdir = argv[i];
             positional++;
@@ -313,7 +326,8 @@ int main(int argc, char** argv)
             positional++;
         } else {
             fprintf(stderr,
-                    "usage: dll_test.exe [--gl-texture] [vectors_dir] [dll_path]\n");
+                    "usage: dll_test.exe [--gl-texture] [--reduced-iso-notch] [--dump FILE] "
+                    "[vectors_dir] [dll_path]\n");
             return 2;
         }
     }
@@ -410,6 +424,18 @@ int main(int argc, char** argv)
     if (f_set_luts(b, &luts) != 0) { fprintf(stderr, "[dll_test] set_luts failed\n"); return 4; }
     printf("[dll_test] set_luts OK  (uploaded 4 LUTs)\n");
 
+    if (reduced_iso_notch) {
+        typedef int (*pfn_set_reduced_iso_notch)(igpu_recon_backend*, int);
+        pfn_set_reduced_iso_notch f_notch = (pfn_set_reduced_iso_notch)
+            GetProcAddress(dll, "igpu_recon_set_reduced_iso_notch");
+        if (!f_notch) {
+            fprintf(stderr, "[dll_test] DLL lacks igpu_recon_set_reduced_iso_notch\n");
+            return 4;
+        }
+        if (f_notch(b, 1) != 0) { fprintf(stderr, "[dll_test] set_reduced_iso_notch failed\n"); return 4; }
+        printf("[dll_test] reduced ISO notch ON\n");
+    }
+
     igpu_recon_frame_t frame;
     memset(&frame, 0, sizeof(frame));
     frame.ev_correction       = scalars.ev_correction;
@@ -421,6 +447,7 @@ int main(int argc, char** argv)
     frame.use_fullres         = scalars.use_fullres;
     frame.chroma_smooth_method= scalars.chroma_smooth_method;
     frame.apply_dither        = scalars.apply_dither;
+    frame.playback_preview_scale_factor = scalars.playback_preview_scale_factor;
     printf("[dll_test] frame state ev=%.6f black_delta=%d white_darkened=%d "
            "dark_noise=%.6f interp=%d alias=%d fullres=%d chroma=%d dither=%d\n",
            frame.ev_correction,
@@ -442,6 +469,16 @@ int main(int argc, char** argv)
 
     /* ---- 4. compare to oracle out.u16 ---- */
     long long maxabs = compare_to_oracle("CPU16", result, h_out, n, (size_t)clip.width);
+    if (!dump_path.empty()) {
+        FILE* df = fopen(dump_path.c_str(), "wb");
+        if (!df || fwrite(result, sizeof(uint16_t), n, df) != n) {
+            fprintf(stderr, "[dll_test] cannot write --dump %s\n", dump_path.c_str());
+            if (df) fclose(df);
+            return 4;
+        }
+        fclose(df);
+        printf("[dll_test] wrote CPU16 result to %s\n", dump_path.c_str());
+    }
 
     /* ---- 5. timing ---- */
     igpu_recon_timing_t t;

@@ -746,6 +746,7 @@ bool GpuDisplayWindow::setPresentedGpuPlaybackReconAmazePostWbTexture(
         m_texture->setMipLevels(1);
         m_texture->allocateStorage(QOpenGLTexture::RGBA, QOpenGLTexture::UInt16);
         m_texture->setWrapMode(QOpenGLTexture::ClampToEdge);
+        gpuPresentEventNoteTextureRealloc("window_rgba16_texture_realloc", texWidth, texHeight);
     }
     m_textureFromGpuRecon = true;
     if ( !m_gpuReconSourceTexture
@@ -759,6 +760,7 @@ bool GpuDisplayWindow::setPresentedGpuPlaybackReconAmazePostWbTexture(
         m_gpuReconSourceTexture->setMipLevels(1);
         m_gpuReconSourceTexture->allocateStorage(QOpenGLTexture::Red, QOpenGLTexture::UInt16);
         m_gpuReconSourceTexture->setWrapMode(QOpenGLTexture::ClampToEdge);
+        gpuPresentEventNoteTextureRealloc("window_r16_texture_realloc", texWidth, texHeight);
     }
     m_gpuReconSourceTextureCurrent = false;
     applySamplingMode(options.samplingMode);

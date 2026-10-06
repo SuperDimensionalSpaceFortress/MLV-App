@@ -1,6 +1,7 @@
 #include "GpuPreviewProcessing.h"
 
 #include "../../src/processing/raw_processing.h"
+#include "../../src/debug/StageTiming.h"
 
 #include <QGuiApplication>
 #include <QOffscreenSurface>
@@ -16,6 +17,7 @@
 #include <QtGlobal>
 
 #include <algorithm>
+#include <atomic>
 #include <cfloat>
 #include <cmath>
 #include <cstring>
@@ -2716,6 +2718,51 @@ bool gpuPreviewProcessingReconTexturePresentationRefused(
     return presentingReconTexture && !gpuPreviewProcessingLutTextureSetReady(set, config);
 }
 
+namespace
+{
+std::atomic<quint64> g_gpuPresentEventSessionId{0};
+std::atomic<qint64> g_gpuPresentEventLastPresentedFrame{-1};
+std::atomic<quint64> g_gpuPresentEventTextureReallocs{0};
+}
+
+void gpuPresentEventSetContext(quint64 sessionId, qint64 lastPresentedFrame)
+{
+    g_gpuPresentEventSessionId.store(sessionId, std::memory_order_relaxed);
+    g_gpuPresentEventLastPresentedFrame.store(lastPresentedFrame, std::memory_order_relaxed);
+}
+
+void gpuPresentEventNoteTextureRealloc(const char * site, int width, int height)
+{
+    const quint64 count =
+        g_gpuPresentEventTextureReallocs.fetch_add(1, std::memory_order_relaxed) + 1;
+    qInfo().noquote()
+        << QStringLiteral(
+               "gpu_present_event kind=%1 session=%2 last_presented_frame=%3 "
+               "wall_ms=%4 width=%5 height=%6 count=%7" )
+               .arg( QString::fromLatin1( site ) )
+               .arg( g_gpuPresentEventSessionId.load( std::memory_order_relaxed ) )
+               .arg( g_gpuPresentEventLastPresentedFrame.load( std::memory_order_relaxed ) )
+               .arg( mlv_stage_timing_now() * 1000.0, 0, 'f', 3 )
+               .arg( width )
+               .arg( height )
+               .arg( count );
+}
+
+quint64 gpuPresentEventTextureReallocCount()
+{
+    return g_gpuPresentEventTextureReallocs.load(std::memory_order_relaxed);
+}
+
+void gpuPresentEventLogReconLine(const char * line)
+{
+    if ( !line ) return;
+    qInfo().noquote()
+        << QStringLiteral( "%1 session=%2 last_presented_frame=%3" )
+               .arg( QString::fromLatin1( line ) )
+               .arg( g_gpuPresentEventSessionId.load( std::memory_order_relaxed ) )
+               .arg( g_gpuPresentEventLastPresentedFrame.load( std::memory_order_relaxed ) );
+}
+
 bool gpuPreviewProcessingUpdateShadowsHighlightsBlurTexture(
     GpuPreviewProcessingLutTextureSet & set,
     const GpuPreviewProcessingConfig & config,
@@ -2753,6 +2800,7 @@ bool gpuPreviewProcessingUpdateShadowsHighlightsBlurTexture(
         set.shadowsHighlightsBlur = createFrameTexture(blurWidth, blurHeight);
         set.shadowsHighlightsBlurWidth = blurWidth;
         set.shadowsHighlightsBlurHeight = blurHeight;
+        gpuPresentEventNoteTextureRealloc("sh_blur_texture_realloc", blurWidth, blurHeight);
     }
     set.shadowsHighlightsBlurQuarter = config.shadowsHighlightsBlurQuarter;
     if ( !previewProcessingTextureIsReady(set.shadowsHighlightsBlur) )

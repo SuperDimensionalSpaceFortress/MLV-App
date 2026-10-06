@@ -2237,7 +2237,9 @@ MainWindow::MainWindow(int &argc, char **argv, QWidget *parent) :
 
     //Init the lib
     initLib();
-    
+    // PLAYBACK-CUDA-HONOUR-SCALE-1 r2: set_clip/set_luts events reach the log.
+    llrpSetGpuReconEventLogger( gpuPresentEventLogReconLine );
+
     resetSliders();
 
     //Setup Toning (has to be done after initLib())
@@ -3499,7 +3501,8 @@ void MainWindow::queuePlaybackLookaheadRequests(
     if( !ui->actionPlay->isChecked() || !baseContext.playbackActive ) return;
     if( !baseContext.gpuPlaybackReconTexturePresentRequested
      || !baseContext.gpuPlaybackReconAmazeTexturePresentAdmitted ) return;
-    if( baseContext.playbackScaleFactor != 1 ) return;
+    if( !mainWindowGpuTextureRouteAdmitsPlaybackScale(
+            baseContext.playbackScaleFactor, gpuReducedReconHonouredSessionScale() ) ) return;
 
     const int totalFrames = getMlvFrames( m_pMlvObject );
     if( totalFrames <= 1 ) return;
@@ -4760,14 +4763,20 @@ void MainWindow::presentPlaybackPreparedFrame( const PlaybackPrepResult &result 
             gpuPlaybackReconAmazeTextureAttempted = true;
             if( gpuWindowTexturePresentActive )
             {
+                /* PLAYBACK-CUDA-HONOUR-SCALE-1: a reduced recon texture is
+                 * shown at the clip's display size, not its own. */
                 const int textureDisplaySourceWidth =
-                    task.gpuPlaybackReconTextureRetainedDeviceWidth > 0
-                        ? task.gpuPlaybackReconTextureRetainedDeviceWidth
-                        : gpuReconState.width;
+                    m_pMlvObject
+                        ? static_cast<int>( getMlvWidth( m_pMlvObject ) )
+                        : task.gpuPlaybackReconTextureRetainedDeviceWidth > 0
+                            ? task.gpuPlaybackReconTextureRetainedDeviceWidth
+                            : gpuReconState.width;
                 const int textureDisplaySourceHeight =
-                    task.gpuPlaybackReconTextureRetainedDeviceHeight > 0
-                        ? task.gpuPlaybackReconTextureRetainedDeviceHeight
-                        : gpuReconState.height;
+                    m_pMlvObject
+                        ? static_cast<int>( getMlvHeight( m_pMlvObject ) )
+                        : task.gpuPlaybackReconTextureRetainedDeviceHeight > 0
+                            ? task.gpuPlaybackReconTextureRetainedDeviceHeight
+                            : gpuReconState.height;
                 const QSize textureDisplaySize =
                     mainWindowGpuTexturePresentDisplaySize(
                         textureDisplaySourceWidth,
@@ -4854,10 +4863,17 @@ void MainWindow::presentPlaybackPreparedFrame( const PlaybackPrepResult &result 
                     QStringLiteral("cuda_gl_r16_texture");
             }
         }
+        /* The readback fallback rebuilds from full-resolution buffers; a reduced
+         * recon texture (PLAYBACK-CUDA-HONOUR-SCALE-1) has none to offer. */
+        const bool gpuReconTextureFullResolution =
+            !m_pMlvObject
+            || ( sourceWidth == static_cast<int>( getMlvWidth( m_pMlvObject ) )
+              && sourceHeight == static_cast<int>( getMlvHeight( m_pMlvObject ) ) );
         if( hasGpuReconState
          && !framePresentedByViewport
          && !gpuWindowTexturePresentActive
-         && cpuAmazeSkippedForGpuTextureNoReadback )
+         && cpuAmazeSkippedForGpuTextureNoReadback
+         && gpuReconTextureFullResolution )
         {
             const uint16_t *fallbackBayer16 = nullptr;
             size_t fallbackBayer16Words = 0;
@@ -6122,7 +6138,8 @@ void MainWindow::drawFrame( bool updateTimecodeLabel )
         && renderPolicy.gpuPreviewProcessingBackendRequest
             != GpuPreviewProcessingBackendRequest::Cpu
         && requestedPhase3Mode == Phase3Mode::DecodeReconProcess
-        && requestedPlaybackScaleFactor == 1
+        && mainWindowGpuTextureRouteAdmitsPlaybackScale(
+               requestedPlaybackScaleFactor, gpuReducedReconHonouredSessionScale() )
         && !ui->actionCaching->isChecked();
     if( gpuPlaybackReconTextureAutoEnablesGpuProcessing )
     {
@@ -6146,7 +6163,8 @@ void MainWindow::drawFrame( bool updateTimecodeLabel )
         && renderPolicy.gpuPlaybackReconEnvironmentRequested
         && m_renderThreadUsingGpuPreviewProcessing
         && requestedPhase3Mode == Phase3Mode::DecodeReconProcess
-        && requestedPlaybackScaleFactor == 1
+        && mainWindowGpuTextureRouteAdmitsPlaybackScale(
+               requestedPlaybackScaleFactor, gpuReducedReconHonouredSessionScale() )
         && !ui->actionCaching->isChecked();
     renderPolicy.renderThreadUsingGpuPlaybackReconTexturePresentation =
         mainWindowAllowsGpuPlaybackReconTexturePresentation( renderPolicy );
@@ -6289,7 +6307,8 @@ void MainWindow::drawFrame( bool updateTimecodeLabel )
                    .arg( static_cast<int>( requestedPhase3Mode ) )
                    .arg( bool01( requestedPhase3Mode == Phase3Mode::DecodeReconProcess ) )
                    .arg( requestedPlaybackScaleFactor )
-                   .arg( bool01( requestedPlaybackScaleFactor == 1 ) )
+                   .arg( bool01( mainWindowGpuTextureRouteAdmitsPlaybackScale(
+                       requestedPlaybackScaleFactor, gpuReducedReconHonouredSessionScale() ) ) )
                    .arg( bool01( !ui->actionCaching->isChecked() ) )
                    .arg( bool01( renderPolicy.gpuPlaybackReconTexturePresentationCompatible ) )
                    .arg( bool01( requestContext.gpuPlaybackReconTexturePresentRequested ) )
@@ -6410,7 +6429,8 @@ void MainWindow::drawFrame( bool updateTimecodeLabel )
         ui->actionPlay->isChecked()
         && requestContext.gpuPlaybackReconTexturePresentRequested
         && requestContext.gpuPlaybackReconAmazeTexturePresentAdmitted
-        && requestContext.playbackScaleFactor == 1;
+        && mainWindowGpuTextureRouteAdmitsPlaybackScale(
+               requestContext.playbackScaleFactor, gpuReducedReconHonouredSessionScale() );
     if( playbackRenderLookaheadFrames() > 0
      && ui->actionPlay->isChecked()
      && m_pRenderThread
@@ -21473,11 +21493,74 @@ bool MainWindow::gpuPlaybackReconTextureRouteEligibleAtScaleOne( void ) const
         ui->actionCaching->isChecked() );
 }
 
+int MainWindow::gpuReducedReconHonouredSessionScale( void ) const
+{
+    return m_gpuReducedReconSessionLatched ? m_gpuReducedReconSessionScale : 1;
+}
+
 int MainWindow::effectivePlaybackScaleFactorForRequest( void ) const
 {
     const int requestedScale = playbackScaleFactorPolicyDecision();
-    const int effectiveScale = mainWindowClampPlaybackScaleForGpuTextureRoute(
-        requestedScale, gpuPlaybackReconTextureRouteEligibleAtScaleOne() );
+    const bool textureRouteEligible = gpuPlaybackReconTextureRouteEligibleAtScaleOne();
+    const bool playbackActive = ui->actionPlay->isChecked();
+    /* PLAYBACK-CUDA-HONOUR-SCALE-1: decide the texture-route scale once per play
+     * session. igpu_recon_set_clip frees every retained device output on a size
+     * change, so the frame size must not change while frames are in flight. */
+    if( !playbackActive )
+    {
+        /* The scale/reason stay readable for the play-stop smoke summary. */
+        m_gpuReducedReconSessionLatched = false;
+    }
+    else if( textureRouteEligible && !m_gpuReducedReconSessionLatched )
+    {
+        m_gpuReducedReconSessionLatched = true;
+        m_gpuReducedReconSessionScale = 1;
+        if( requestedScale != 2 && requestedScale != 4 )
+        {
+            m_gpuReducedReconSessionReason =
+                requestedScale == 1
+                    ? QStringLiteral("preview scale 1 (full resolution)")
+                    : QStringLiteral("x%1 stays on the full-resolution texture route")
+                          .arg( requestedScale );
+        }
+        else if( playbackGpuNoReadbackOutputValidationEnabled() )
+        {
+            m_gpuReducedReconSessionReason =
+                QStringLiteral("output-validation mode stays on the full-resolution texture route");
+        }
+        else
+        {
+            mlvDualIsoPreviewScaleRecon_t plan;
+            if( m_pMlvObject
+             && mlvDualIsoGpuPreviewScaleReconPlan( m_pMlvObject, requestedScale, 0, &plan )
+             && plan.scale == requestedScale )
+            {
+                m_gpuReducedReconSessionScale = requestedScale;
+                m_gpuReducedReconSessionReason = QStringLiteral("none");
+            }
+            else
+            {
+                m_gpuReducedReconSessionReason =
+                    m_pMlvObject ? QString::fromLatin1( plan.reason )
+                                 : QStringLiteral("no clip");
+            }
+        }
+        qInfo().noquote()
+            << QStringLiteral(
+                   "playback_scale_gpu_texture_route_session requested=%1 "
+                   "effective=%2 reason=\"%3\"" )
+                   .arg( requestedScale )
+                   .arg( m_gpuReducedReconSessionScale )
+                   .arg( m_gpuReducedReconSessionReason );
+    }
+    const bool sessionHonoured =
+        textureRouteEligible && playbackActive && m_gpuReducedReconSessionLatched
+        && m_gpuReducedReconSessionScale > 1;
+    const int effectiveScale = mainWindowGpuTextureRouteEffectivePlaybackScale(
+        sessionHonoured ? m_gpuReducedReconSessionScale : requestedScale,
+        textureRouteEligible,
+        playbackActive,
+        sessionHonoured );
     if( effectiveScale != requestedScale )
     {
         static bool loggedScaleClampOnce = false;
@@ -21721,7 +21804,8 @@ MainWindowGpuPreviewPolicyState MainWindow::gpuPreviewPolicyForCurrentScopeState
         && policyState.gpuPreviewProcessingBackendRequest
             != GpuPreviewProcessingBackendRequest::Cpu
         && requestedPhase3Mode == Phase3Mode::DecodeReconProcess
-        && policyState.playbackScaleFactorActive == 1
+        && mainWindowGpuTextureRouteAdmitsPlaybackScale(
+               policyState.playbackScaleFactorActive, gpuReducedReconHonouredSessionScale() )
         && !ui->actionCaching->isChecked();
     if( texturePathCanAutoEnableGpuProcessing )
     {
@@ -21737,7 +21821,8 @@ MainWindowGpuPreviewPolicyState MainWindow::gpuPreviewPolicyForCurrentScopeState
         && policyState.gpuPlaybackReconEnvironmentRequested
         && policyState.renderThreadUsingGpuProcessingPreview
         && requestedPhase3Mode == Phase3Mode::DecodeReconProcess
-        && policyState.playbackScaleFactorActive == 1
+        && mainWindowGpuTextureRouteAdmitsPlaybackScale(
+               policyState.playbackScaleFactorActive, gpuReducedReconHonouredSessionScale() )
         && !ui->actionCaching->isChecked();
     policyState.renderThreadUsingGpuPlaybackReconTexturePresentation =
         mainWindowAllowsGpuPlaybackReconTexturePresentation( policyState );
@@ -23806,6 +23891,14 @@ void MainWindow::beginPlaybackSmokeTelemetry( void )
     ++m_playbackSmokeSessionId;
     if( m_playbackSmokeSessionId == 0 ) ++m_playbackSmokeSessionId;
 
+    // PLAYBACK-CUDA-HONOUR-SCALE-1 r2: present-gap attribution baselines.
+    gpuPresentEventSetContext( m_playbackSmokeSessionId, -1 );
+    m_playbackSmokeStartGpuSetClipCount = llrpGpuPlaybackReconSetClipCount();
+    m_playbackSmokeStartGpuSetLutsCount = llrpGpuPlaybackReconSetLutsCount();
+    m_playbackSmokeStartPresentTextureReallocs = gpuPresentEventTextureReallocCount();
+    m_playbackSmokePresentedIntervalMaxFrame = -1;
+    for( int &bucket : m_playbackSmokePresentIntervalOverBudget ) bucket = 0;
+
     m_playbackLookaheadRequestsIssued = 0;
     m_playbackLookaheadCoveredRequests = 0;
     if( m_pRenderThread ) m_pRenderThread->resetPipelineOverlapMeter();
@@ -24074,6 +24167,10 @@ void MainWindow::beginPlaybackSmokeTelemetry( void )
     m_playbackSmokeCpuDualIsoReconFallbackReasonLast.clear();
     m_playbackSmokeCpuDualIsoReconFullResFixesSumMs = 0.0;
     m_playbackSmokeCpuDualIsoReconDownsampleSumMs = 0.0;
+    m_playbackSmokeGpuDualIsoReducedReconFrames = 0;
+    m_playbackSmokeGpuDualIsoFullReconFrames = 0;
+    m_playbackSmokeGpuDualIsoReconScaleLast = 0;
+    m_playbackSmokeGpuDualIsoReconFallbackReasonLast.clear();
     m_playbackSmokeProcessed8PrefetchHits = 0;
     m_playbackSmokeRawPrefetchHits = 0;
     m_playbackSmokeQueuedPlaybackDropSum = 0;
@@ -24168,7 +24265,17 @@ void MainWindow::notePlaybackSmokePresentedFrame(
         intervalMs = ( now - m_playbackSmokeLastPresentedTime ) * 1000.0;
         m_playbackSmokePresentedIntervalSumMs += intervalMs;
         if( intervalMs > m_playbackSmokePresentedIntervalMaxMs )
+        {
             m_playbackSmokePresentedIntervalMaxMs = intervalMs;
+            m_playbackSmokePresentedIntervalMaxFrame = static_cast<qint64>( displayFrame );
+        }
+        // Intervals over 62.5 ms (1.5 frames at 24 fps): (62.5,100] (100,250] (250,500] >500.
+        if( intervalMs > 62.5 )
+        {
+            const int bucket = intervalMs <= 100.0 ? 0 : intervalMs <= 250.0 ? 1
+                             : intervalMs <= 500.0 ? 2 : 3;
+            ++m_playbackSmokePresentIntervalOverBudget[bucket];
+        }
     }
     else
     {
@@ -24180,6 +24287,7 @@ void MainWindow::notePlaybackSmokePresentedFrame(
         m_playbackSmokeFirstPresentTimelineDeltaAbs =
             qAbs( ui->horizontalSliderPosition->value() - m_playbackSmokeStartPosition );
     }
+    gpuPresentEventSetContext( m_playbackSmokeSessionId, static_cast<qint64>( displayFrame ) );
 
     // BLOCKER fix (CUDA-PLAYBACK-CONTACT-SHEET-2): a presented frame lower than the previous
     // one can only mean the Loop action wrapped (cutOut back to cutIn) -- playback otherwise
@@ -25092,6 +25200,27 @@ void MainWindow::notePlaybackSmokePresentedFrame(
             telemetryDoubleValue( timing, "cpu_dualiso_recon_fullres_fixes_ms" );
         m_playbackSmokeCpuDualIsoReconDownsampleSumMs +=
             telemetryDoubleValue( timing, "cpu_dualiso_recon_downsample_ms" );
+    }
+    if( m_gpuReducedReconSessionLatched && m_gpuReducedReconSessionScale > 1 )
+    {
+        /* PLAYBACK-CUDA-HONOUR-SCALE-1: in an honoured session a frame counts as
+         * reduced only when it was presented as a no-readback texture AND reports
+         * the reduced scale it was reconstructed at (the recon-stage keys do not
+         * reach this presented-frame telemetry, so this reads what does). */
+        m_playbackSmokeGpuDualIsoReconScaleLast = readyFrame.playbackScaleFactorActive;
+        if( gpuPlaybackPipelineStatus == GpuPlaybackPipelineStatus::GpuTextureNoReadback
+         && readyFrame.playbackScaleFactorActive == m_gpuReducedReconSessionScale )
+        {
+            ++m_playbackSmokeGpuDualIsoReducedReconFrames;
+        }
+        else
+        {
+            ++m_playbackSmokeGpuDualIsoFullReconFrames;
+            m_playbackSmokeGpuDualIsoReconFallbackReasonLast =
+                timing.contains( QStringLiteral("gpu_dualiso_recon_fallback_reason") )
+                    ? telemetryStringValue( timing, "gpu_dualiso_recon_fallback_reason" )
+                    : QStringLiteral("frame not presented as a reduced recon texture");
+        }
     }
     if( borrowedPreparedRgb8Bytes > 0.0 )
     {
@@ -27332,6 +27461,51 @@ void MainWindow::finishPlaybackSmokeTelemetry( const char *reason )
                .arg( avgSmokeMs( m_playbackSmokeCpuDualIsoReconFullResFixesSumMs ), 0, 'f', 3 )
                .arg( avgSmokeMs( m_playbackSmokeCpuDualIsoReconDownsampleSumMs ), 0, 'f', 3 )
                .arg( m_playbackSmokeCpuDualIsoReconFallbackReasonLast );
+
+    /* PLAYBACK-CUDA-HONOUR-SCALE-1: the CUDA texture route at preview scale.
+     * session_scale/session_reason are the once-per-session decision;
+     * clip_dims_busy_refusals counts runs the C seam refused because a size
+     * change would have freed retained outputs still in flight. */
+    qInfo().noquote()
+        << QStringLiteral(
+               "playback_smoke.gpu_dualiso_recon_scale_summary session=%1 "
+               "reduced_recon_frames=%2 full_recon_frames=%3 recon_scale_last=%4 "
+               "session_scale=%5 session_reason=\"%6\" fallback_reason_last=\"%7\" "
+               "clip_dims_busy_refusals=%8 retained_outstanding=%9" )
+               .arg( static_cast<qulonglong>( m_playbackSmokeSessionId ) )
+               .arg( m_playbackSmokeGpuDualIsoReducedReconFrames )
+               .arg( m_playbackSmokeGpuDualIsoFullReconFrames )
+               .arg( m_playbackSmokeGpuDualIsoReconScaleLast )
+               .arg( m_gpuReducedReconSessionScale )
+               .arg( m_gpuReducedReconSessionReason )
+               .arg( m_playbackSmokeGpuDualIsoReconFallbackReasonLast )
+               .arg( static_cast<qulonglong>( llrpGpuPlaybackReconClipDimsChangeRefusals() ) )
+               .arg( llrpGpuPlaybackReconRetainedOutstandingCount() );
+
+    /* PLAYBACK-CUDA-HONOUR-SCALE-1 r2: present-gap attribution. Counts are this
+     * session's deltas; max_present_interval_frame is the display frame whose
+     * present closed the longest interval (match it against the gpu_recon_event
+     * / gpu_present_event lines). */
+    qInfo().noquote()
+        << QStringLiteral(
+               "playback_smoke.present_gap_summary session=%1 gpu_set_clip_count=%2 "
+               "gpu_set_luts_count=%3 present_texture_reallocs=%4 "
+               "max_present_interval_ms=%5 max_present_interval_frame=%6 "
+               "present_intervals_62_100=%7 present_intervals_100_250=%8 "
+               "present_intervals_250_500=%9 present_intervals_over_500=%10" )
+               .arg( static_cast<qulonglong>( m_playbackSmokeSessionId ) )
+               .arg( static_cast<qulonglong>( llrpGpuPlaybackReconSetClipCount()
+                                              - m_playbackSmokeStartGpuSetClipCount ) )
+               .arg( static_cast<qulonglong>( llrpGpuPlaybackReconSetLutsCount()
+                                              - m_playbackSmokeStartGpuSetLutsCount ) )
+               .arg( static_cast<qulonglong>( gpuPresentEventTextureReallocCount()
+                                              - m_playbackSmokeStartPresentTextureReallocs ) )
+               .arg( m_playbackSmokePresentedIntervalMaxMs, 0, 'f', 3 )
+               .arg( m_playbackSmokePresentedIntervalMaxFrame )
+               .arg( m_playbackSmokePresentIntervalOverBudget[0] )
+               .arg( m_playbackSmokePresentIntervalOverBudget[1] )
+               .arg( m_playbackSmokePresentIntervalOverBudget[2] )
+               .arg( m_playbackSmokePresentIntervalOverBudget[3] );
 
     qInfo().noquote()
         << QStringLiteral(
