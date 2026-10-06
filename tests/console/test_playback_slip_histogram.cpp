@@ -51,6 +51,7 @@ struct Driver
         PresentSample s;
         s.displayFrame = frame;
         s.presentMs = ms;
+        s.readyKnown = true;
         s.readyMs = readyMs;
         s.decodeMs = decodeMs;
         s.reconMs = 4.0;
@@ -379,13 +380,15 @@ TEST(PlaybackSlipHistogram, TheDelayedStartupCatchUpIsNeitherASlipNorPacedThroug
     // the rest is paced. Raw, 598 timeline frames in ~23.6 s read above 25 fps; the burst's first 33 frames are the
     // wait for the first frame (34 owed at 1427 ms, 1 already advanced), the rest of it a real post-first stall.
     SlipHistogram h;
-    h.reset( 0, kNativeFps, 0.0 );
+    h.reset( 0, kNativeFps );
+    h.setPlayStart( 0.0 );
     h.noteTimelineMove( AdvancePath::DropTick, 1, 10.0, 1.0, 0.0 );
     auto present = [&h]( int frame, double ms, int timeline )
     {
         PresentSample s;
         s.displayFrame = frame;
         s.presentMs = ms;
+        s.readyKnown = true;
         s.readyMs = ms - 1.0;
         s.timelinePosition = timeline;
         h.notePresent( s );
@@ -425,7 +428,8 @@ TEST(PlaybackSlipHistogram, TheCatchUpNeverExceedsTheWaitAndStopsOnceCaughtUp)
 {
     // Caught up at the second present: a later skip is a real slip, whatever credit is left.
     SlipHistogram h;
-    h.reset( 0, kNativeFps, 0.0 );
+    h.reset( 0, kNativeFps );
+    h.setPlayStart( 0.0 );
     PresentSample s;
     s.displayFrame = 0; s.presentMs = 400.0; s.readyMs = 399.0; s.timelinePosition = 1;
     h.noteTimelineMove( AdvancePath::DropTick, 1, 400.0, 1.0, 0.0 );
@@ -446,7 +450,8 @@ TEST(PlaybackSlipHistogram, AGrantFreeStallIsRepaidInOneBurst)
 {
     // NativePaceGuard banks credit while no grant runs; the first unshaped request after a 1 s stall takes it all.
     SlipHistogram h;
-    h.reset( 0, kNativeFps, 0.0 );
+    h.reset( 0, kNativeFps );
+    h.setPlayStart( 0.0 );
     playback_native_pace::NativePaceGuard guard;
     double position = 0.0;
     for( double t = 0.0; t <= 1000.0; t += kPeriodMs )

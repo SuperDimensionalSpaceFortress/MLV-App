@@ -23986,7 +23986,8 @@ void MainWindow::beginPlaybackSmokeTelemetry( void )
     m_playbackSmokeStartAudioSyncApplied = m_playbackAudioSyncAppliedCount;
     m_playbackSmokeStartAudioSyncSkipped = m_playbackAudioSyncSkippedCount;
     m_playbackSmokeStartTime = mlv_stage_timing_now();
-    m_playbackSlipHistogram.reset( m_playbackSmokeStartPosition, getFramerate(), m_playbackSmokeStartTime * 1000.0 );
+    m_playbackSlipHistogram.reset( m_playbackSmokeStartPosition, getFramerate() );
+    m_playbackSlipHistogram.setPlayStart( m_playbackSmokeStartTime * 1000.0 );
     m_playbackSmokeLastPresentedTime = 0.0;
     m_playbackSmokeFirstPresentMs = 0.0;
     m_playbackSmokeFirstPresentTimelineDeltaAbs = 0;
@@ -24708,9 +24709,8 @@ void MainWindow::notePlaybackSmokePresentedFrame(
         playback_slip::PresentSample slipSample;
         slipSample.displayFrame = static_cast<int>( displayFrame );
         slipSample.presentMs = now * 1000.0;
-        slipSample.readyMs = readyFrame.frameReadyEmitStageTime > 0.0
-            ? readyFrame.frameReadyEmitStageTime * 1000.0
-            : -1.0;
+        slipSample.readyKnown = readyFrame.frameReadyEmitStageTime > 0.0;
+        slipSample.readyMs = readyFrame.frameReadyEmitStageTime * 1000.0;
         slipSample.decodeMs = rawUint16Ms;
         slipSample.reconMs = llrawprocTotalMs;
         slipSample.renderMs = renderWorkMs;
@@ -26690,7 +26690,7 @@ void MainWindow::noteContactSheetPresentedFrame(
     }
 
     const double grabMs = static_cast<double>( grabTimer.nsecsElapsed() ) / 1000000.0;
-    if( m_playbackSmokeActive ) m_playbackSlipHistogram.noteGrab( grabMs );
+    m_playbackSlipHistogram.noteGrab( grabMs );   // slip_summary: this grab lands in the next present's interval
     const bool frameOk = !gpuWindowGrabFailedClosed
         && !contactFrameImage.isNull();
 
@@ -27208,7 +27208,7 @@ void MainWindow::finishPlaybackSmokeTelemetry( const char *reason )
                        .arg( r.grabMs, 0, 'f', 3 )
                        .arg( bool01( r.lookaheadCovered ) )
                        .arg( r.paceCreditFrames, 0, 'f', 3 )
-                       .arg( ( r.readyMs >= 0.0 && r.deadlineMs >= 0.0 ) ? r.readyMs - r.deadlineMs : 0.0, 0, 'f', 3 )
+                       .arg( ( r.readyKnown && r.deadlineKnown ) ? r.readyMs - r.deadlineMs : 0.0, 0, 'f', 3 )
                        .arg( r.timelineAdvancedInInterval );
         }
     }
