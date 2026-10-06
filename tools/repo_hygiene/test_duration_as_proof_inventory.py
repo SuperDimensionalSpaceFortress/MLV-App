@@ -359,8 +359,8 @@ class DurationAsProofInventoryTests(unittest.TestCase):
     def test_trailing_At_name_alone_is_never_a_position(self) -> None:
         # (e) round-2 (sol's blocker on 207bcf77): a trailing `At`/`_at` word used to exempt
         # a name unconditionally, which hid REAL measured durations. Each input below flags
-        # exactly once on fork/master (a4f73c11 and d3cf6850) and must keep flagging: the exemption
-        # needs same-file evidence of a position, and a name is not evidence.
+        # exactly once on fork/master (a4f73c11 and d3cf6850) and must keep flagging: a name
+        # is not evidence of a position (and, since r3n, no same-file proof exempts it either).
         for seeded in (
             # sol's QElapsedTimer-backed repro, one line and split over lines
             "const double elapsedAt = timer.nsecsElapsed() / 1000000.0; if (elapsedAt > 0.0) markRan();",
@@ -389,54 +389,72 @@ class DurationAsProofInventoryTests(unittest.TestCase):
         self.assertEqual(len(fabs), 1)
         self.assertIn("fabs_zero", fabs[0].triggers)
 
-    def test_position_names_ending_in_At_are_exempt_only_with_same_file_proof(self) -> None:
-        # (e) `playedMsAt` / `durationAt` are INDEXES (QString::indexOf results in
-        # test_playback_smoke_fullscreen_wiring.cpp); a compare against zero there is a "was it
-        # found" check. They are exempt ONLY because every assignment in the file is a lone
-        # search call -- including a search FOR text that mentions the clock inside a string.
-        proven = (
+    def test_no_name_or_position_exemption_for_At_names(self) -> None:
+        # (e) r3n, per hub ruling: item (e) is NARROWED to master's behaviour. The r1/r2
+        # position exemption (same-file textual proof that an `...At` name holds an indexOf/find
+        # result) was escaped in both rounds -- through a macro, an alias, std::tie, a default
+        # capture, a same-name declaration in another function, a reference-output helper, a
+        # bare argument and `this->`. Every input below flags exactly once on fork/master and
+        # must keep flagging: a trailing At/_at name is never exempt, whatever the file shows.
+        # (The escape-proof design is a separate card.) This REPLACES the r2 test
+        # `test_position_names_ending_in_At_are_exempt_only_with_same_file_proof`, which asserted
+        # the exemption itself.
+        search = "int elapsedAt = s.indexOf(x);\n"
+        for seeded in (
+            # the r2 "proven position" fixtures: flagged, same as master
             "const int durationAt = s.indexOf(x);\nif (durationAt > 0) { a(); }",
-            "const int duration_at = s.lastIndexOf('x');\nASSERT_GT(duration_at, 0);",
+            "const int duration_at = s.find(x);\nASSERT_GT(duration_at, 0);",
             "int playedMsAt = smokeBody.indexOf(\n    QStringLiteral(\"const qint64 playedMs = playbackClock.elapsed();\"), loopAt);\n"
             "ASSERT_TRUE(playedMsAt >= 0);",
             "const auto preambleMsAt = static_cast<int>(text.find(\"x\"));\nif (0 < preambleMsAt) { a(); }",
-            "int requestedFieldAt = (s.indexOf(k));\nif (requestedFieldAt == 0) { a(); }",
             "int stage_ms_at = s.indexOf(a);\nstage_ms_at = s.indexOf(b, stage_ms_at);\nif (stage_ms_at > 0) { a(); }",
             "int elapsedSecondsAt = s.indexOf(x);\nASSERT_TRUE(0 < elapsedSecondsAt);",
-        )
-        for seeded in proven:
-            self.assertEqual(scan_text(seeded, source="<proven-position>"), [], seeded)
-        # ...and each stops being exempt the moment the proof is spoiled: a timer-fed source,
-        # one non-search assignment among several, arithmetic, mutation in place, address/stream
-        # escape, a parameter shadow, a call, or a qualified member that a local proof cannot cover.
-        spoiled = (
-            "const int durationAt = timer.elapsed();\nif (durationAt > 0) { a(); }",
-            "int durationAt = s.indexOf(x);\ndurationAt = clock.elapsed();\nif (durationAt > 0) { a(); }",
-            "int durationAt = s.indexOf(x);\ndurationAt = 5;\nif (durationAt > 0) { a(); }",
-            "int durationAt = s.indexOf(x) + base;\nif (durationAt > 0) { a(); }",
-            "int durationAt = ready ? s.indexOf(x) : 0;\nif (durationAt > 0) { a(); }",
-            "int durationAt = helper(s.indexOf(x));\nif (durationAt > 0) { a(); }",
-            "int durationAt = s.indexOf(x);\ndurationAt += timer.elapsed();\nif (durationAt > 0) { a(); }",
-            "int durationAt = s.indexOf(x);\ndurationAt++;\nif (durationAt > 0) { a(); }",
-            "int durationAt = s.indexOf(x);\nfill(&durationAt);\nif (durationAt > 0) { a(); }",
+            # sol r2 table (9 rows): search-valued name, then a real measured duration
+            "void f() { " + search + "STORE(elapsedAt, timer.elapsed()); if (elapsedAt > 0) markRan(); }",
+            "void f() { " + search + "auto& sample = elapsedAt; sample = timer.elapsed(); if (elapsedAt > 0) markRan(); }",
+            "void f() { " + search + "std::tie(elapsedAt, count) = std::make_tuple(timer.elapsed(), 1); if (elapsedAt > 0) markRan(); }",
+            "void f() { " + search + "auto g = [&elapsedAt, &timer]() { elapsedAt = timer.elapsed(); }; g(); if (elapsedAt > 0) markRan(); }",
+            "void f() { " + search + "auto g = [&]() { writeElapsed(elapsedAt); }; g(); if (elapsedAt > 0) markRan(); }",
+            "void verifyText(const QString& s) { const int elapsedAt = s.indexOf(\"elapsed\"); }\n"
+            "void measure() { QElapsedTimer timer; timer.start(); runStage(); const qint64 elapsedAt{timer.elapsed()}; if (elapsedAt > 0) markRan(); }",
+            "void f() { int elapsedAt = ready ? s.find(x) : timer.elapsed(); if (elapsedAt > 0) markRan(); }",
+            "void verifyText(const QString& s) { int elapsedAt = s.indexOf(x); }\n"
+            "void measure() { auto [elapsedAt, n] = measure2(); if (elapsedAt > 0) markRan(); }",
+            "void f() { " + search + "fillElapsed(elapsedAt); if (elapsedAt > 0) markRan(); }",
+            # fable r2: bare argument, reference binding, this-> write
+            "void f() { int durationAt = s.indexOf(x); consume(durationAt); if (durationAt > 0) markRan(); }",
+            "void f() { int durationAt = s.indexOf(x); int& d = durationAt; d = timer.elapsed(); if (durationAt > 0) markRan(); }",
+            "void T::f() { int durationAt = s.indexOf(x); this->durationAt = timer.elapsed(); if (durationAt > 0) markRan(); }",
+            "int durationAt = s.indexOf(x);\nmeasure(durationAt);\nif (durationAt > 0) { a(); }",
+            "int durationAt = s.indexOf(x);\nstd::tie(durationAt, ok) = probe();\nif (durationAt > 0) { a(); }",
+            # the remaining r2 spoil shapes
             "int durationAt = s.indexOf(x);\nin >> durationAt;\nif (durationAt > 0) { a(); }",
             "void g(double durationAt) {}\nint durationAt = s.indexOf(x);\nif (durationAt > 0) { a(); }",
             "int durationAt = s.indexOf(x);\nif (durationAt() > 0) { a(); }",
-            "int durationAt = s.indexOf(x);\nif (probe.durationAt > 0) { a(); }",
             "int durationAt = s.indexOf(x);\nif (probe->durationAt > 0) { a(); }",
             "int durationAt = s.indexOf(x);\nif (Probe::durationAt > 0) { a(); }",
+            # earlier spoiled shapes: still flagged, now for the plain reason that nothing exempts
+            "const int durationAt = timer.elapsed();\nif (durationAt > 0) { a(); }",
+            "int durationAt = s.indexOf(x);\ndurationAt += timer.elapsed();\nif (durationAt > 0) { a(); }",
+            "int durationAt = s.indexOf(x);\nfill(&durationAt);\nif (durationAt > 0) { a(); }",
+            "int durationAt = s.indexOf(x);\nif (probe.durationAt > 0) { a(); }",
             "int durationAt = s.indexOf(x);\nif (getDurationAt() > 0) { a(); }",
-            "int durationAt = indexOfTimer.elapsed();\nif (durationAt > 0) { a(); }",
-        )
-        for seeded in spoiled:
-            found = scan_text(seeded, source="<spoiled-position>")
+        ):
+            found = scan_text(seeded, source="<at-no-exemption>")
             self.assertEqual(len(found), 1, seeded)
-        # the proof is per FILE: one timer-fed declaration in another function spoils the name
+        # a name proven by one function and timer-fed in another is flagged at BOTH sites
         mixed = (
             "void a() { int durationAt = s.indexOf(x); if (durationAt > 0) { r(); } }\n"
             "void b() { double durationAt = t.nsecsElapsed() / 1e6; if (durationAt > 0) { r(); } }"
         )
         self.assertEqual(len(scan_text(mixed, source="<mixed>")), 2)
+        # fable r2: a this-> write in one member and a local indexOf in another flags both reads
+        member = (
+            "void P::tick() { this->durationAt = timer.elapsed(); }\n"
+            "bool P::ran() const { return durationAt > 0; }\n"
+            "void P::parse() { int durationAt = s.indexOf(x); if (durationAt >= 0) {} }"
+        )
+        self.assertEqual(len(scan_text(member, source="<member>")), 2)
 
     def test_raw_string_body_with_unicode_line_breaks_keeps_views_aligned(self) -> None:
         # fable's note: blanking a raw body kept only \r/\n, but the anchor view (body verbatim)
