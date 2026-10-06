@@ -201,13 +201,18 @@ class GeneratorByteIdentityAndVariantTests(unittest.TestCase):
     CONTACT_SHEET_PARITY_OPEN = "CONTACT-SHEET-PLAYBACK-PARITY-1 >>>"
     CONTACT_SHEET_PARITY_CLOSE = "CONTACT-SHEET-PLAYBACK-PARITY-1 <<<"
     CONTACT_SHEET_PARITY_REGIONS = 3
+    # LOOK-ASSIST-M16-CAST-4: the opt-in dual-ISO trace ($LookAssistDisoTrace, its one env entry, its publish step). Three regions.
+    DISO_TRACE_OPEN = "LOOK-ASSIST-M16-CAST-4 >>>"
+    DISO_TRACE_CLOSE = "LOOK-ASSIST-M16-CAST-4 <<<"
+    DISO_TRACE_REGIONS = 3
 
     @classmethod
     def strip_regions(cls, text: str) -> tuple[str, dict[str, int]]:
         """Remove every bracketed region of either sentinel family; return the kept text and the number of regions per family."""
         families = {"leg-terminals": (cls.LEG_TERMINALS_OPEN, cls.LEG_TERMINALS_CLOSE), "presentmon-evidence": (cls.PRESENTMON_EVIDENCE_OPEN, cls.PRESENTMON_EVIDENCE_CLOSE),
                     "orphan-sweep": (cls.ORPHAN_SWEEP_OPEN, cls.ORPHAN_SWEEP_CLOSE),
-                    "contact-sheet-parity": (cls.CONTACT_SHEET_PARITY_OPEN, cls.CONTACT_SHEET_PARITY_CLOSE)}
+                    "contact-sheet-parity": (cls.CONTACT_SHEET_PARITY_OPEN, cls.CONTACT_SHEET_PARITY_CLOSE),
+                    "diso-trace": (cls.DISO_TRACE_OPEN, cls.DISO_TRACE_CLOSE)}
         kept: list[str] = []
         inside: str | None = None
         counts = {name: 0 for name in families}
@@ -248,6 +253,8 @@ class GeneratorByteIdentityAndVariantTests(unittest.TestCase):
         self.assertEqual(old_counts["orphan-sweep"], 0, "the baseline has none")
         self.assertEqual(new_counts["contact-sheet-parity"], self.CONTACT_SHEET_PARITY_REGIONS, "the default job carries exactly the pinned number of bracketed CONTACT-SHEET-PLAYBACK-PARITY-1 regions")
         self.assertEqual(old_counts["contact-sheet-parity"], 0, "the baseline has none")
+        self.assertEqual(new_counts["diso-trace"], self.DISO_TRACE_REGIONS, "the default job carries exactly the pinned number of bracketed LOOK-ASSIST-M16-CAST-4 regions")
+        self.assertEqual(old_counts["diso-trace"], 0, "the baseline has none")
         self.assertEqual(stripped, old_stripped,
                          "the DEFAULT (bachelor/cuda) emitted job changed outside the bracketed regions -- it must stay byte-identical to the pinned baseline")
 

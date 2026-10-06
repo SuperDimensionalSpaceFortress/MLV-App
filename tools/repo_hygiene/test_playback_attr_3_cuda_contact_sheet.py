@@ -366,15 +366,18 @@ class ContactSheetSwitchTests(unittest.TestCase):
         on_text = on_file.read_text(encoding="utf-8")
         self.assertIn("$LookAssistDisoTrace = $false", off_text)
         self.assertIn("$LookAssistDisoTrace = $true", on_text)
-        guard = "$(if ($LookAssistDisoTrace) { @('MLVAPP_LOOK_ASSIST_DISO_MATCH_TRACE=1') } else { @() })"
+        guard = "if ($LookAssistDisoTrace) { $envs += @('MLVAPP_LOOK_ASSIST_DISO_MATCH_TRACE=1') }"
         for text in (off_text, on_text):
             self.assertEqual(text.count("MLVAPP_LOOK_ASSIST_DISO_MATCH_TRACE"), 1, "the env var is named once, inside its guard")
             self.assertIn(guard, text)
+            # the guard runs after $envs is built and before $envList is joined from it
+            self.assertLess(text.index("$envs = @("), text.index(guard))
+            self.assertLess(text.index(guard), text.index("$envList = "))
             self.assertIn("-PubRoot (Join-Path $Pub 'diso-trace')", text)
         # The guard itself, evaluated both ways: one entry when on, nothing when off.
         for value, expected in (("$true", "MLVAPP_LOOK_ASSIST_DISO_MATCH_TRACE=1"), ("$false", "")):
             proc = subprocess.run(["pwsh", "-NoProfile", "-NonInteractive", "-Command",
-                                   f"$LookAssistDisoTrace = {value}; $e = @('A=1') + {guard}; ($e | Select-Object -Skip 1) -join ','"],
+                                   f"$LookAssistDisoTrace = {value}; $envs = @('A=1'); {guard}; ($envs | Select-Object -Skip 1) -join ','"],
                                   capture_output=True, text=True, timeout=120)
             self.assertEqual(proc.returncode, 0, proc.stderr)
             self.assertEqual(proc.stdout.strip(), expected)
