@@ -247,6 +247,8 @@ TEST(LookAssistDisoArms, NoArmReachesALiveRender)
     for( const ArmCase &c : cases )
     {
         llrpSetIsolatedAnalysisDualIsoArmsForCurrentThread( c.mode, c.whiteBright, c.noise, c.black ? offsets : nullptr );
+        // An isolated render with the arm first: nothing it handed the recon may outlive it.
+        (void)isolatedFrame( video );
         const std::vector<float> armedRaw = fixture.renderRawFrameFloat( 0 );
         const std::vector<uint16_t> armed16 = fixture.renderFrame16( 0 );
         llrpSetIsolatedAnalysisDualIsoArmsForCurrentThread( -1, 0, 0.0, nullptr );
