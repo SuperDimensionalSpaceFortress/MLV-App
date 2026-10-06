@@ -38,22 +38,40 @@ Patterns matched (all case-sensitive, per-physical-line):
       * 3-arg ``ASSERT_NEAR``/``EXPECT_NEAR(val1, val2, abs_error)``: the same duration-vs-
         zero check applied to (val1, val2), ignoring the tolerance argument.
 
-A line can trigger more than one pattern; that does not create more than one candidate --
-candidates are per PHYSICAL LINE (a "site"), not per pattern. A negation (``!(x_ms > 0.0)``)
-or a ternary (``x_ms == 0.0 ? a : b``) is still caught because the inner comparison itself
-matches one of the shapes above; no special-casing is needed for those.
+  - FABS_ZERO (HARDENING-2): ``fabs(<bare duration operand>)`` compared to a small
+    literal/epsilon (``std::fabs(plan.expectedDurationSeconds) < 0.000001``), the
+    near-zero spelling of a zero assert. ``fabs(d - 10.01)`` (a value comparison) and a
+    literal above 1e-3 are not matched.
 
-Known, deliberate non-goals (see the inventory's own ``lower_bound_caveat``): a comparison
-split across two physical lines, a duration hidden behind an intermediate variable or a
-helper function, and shapes with zero live instances in this tree at round-4B time
-(``qFuzzyIsNull``, ``std::max(0.0, x_ms)``, a bare ``*Seconds()`` getter, chrono ``.count()``
-compares) are not matched. Broadening for a shape with no live instance would only add
-matcher surface with no coverage benefit, at the cost of harder-to-reason-about false
-positives; grep for it again before deciding to add it.
+HARDENING-2 grammar notes: an operand may be parenthesized (``(elapsed_ms) > 0.0``,
+``0.0 < (elapsed_ms)``, ``static_cast<double>(x_ms) > 0``, ``0 < (double)x_ms``) but a call
+WITH arguments is not unwrapped (``foo(elapsed_ms) > 0`` compares foo's result). A trailing
+``At``/``_at`` word is NOT evidence of a position (``elapsedAt = t.nsecsElapsed()`` is a
+duration): there is no name- or position-based exemption, so such a name is flagged exactly as
+master flags it (fail closed). An escape-proof position proof is a separate card.
+Macro and ``fabs`` sites are found by balanced-paren extraction over the whole text, so a call
+split across physical lines is ONE site, keyed by all its lines joined (see ``scan_text``).
+Comments are stripped from the anchor view too, so a comment edit never re-keys a site, and
+raw string literals (``R"delim(...)delim"``) are lexed as strings (see ``_strip_comments``).
+
+A line can trigger more than one pattern; that does not create more than one candidate --
+candidates are per site (a physical line, or the joined lines of a multi-line macro/fabs
+statement), not per pattern. A negation (``!(x_ms > 0.0)``) or a ternary
+(``x_ms == 0.0 ? a : b``) is still caught because the inner comparison itself matches one of
+the shapes above; no special-casing is needed for those.
+
+Known, deliberate non-goals (see the inventory's own ``lower_bound_caveat``): a bare
+comparison (not a macro/``fabs`` call) split across two physical lines, a duration hidden
+behind an intermediate variable or a helper function, and shapes with zero live instances in
+this tree (``qFuzzyIsNull``, ``std::max(0.0, x_ms)``, a bare ``*Seconds()`` getter, chrono
+``.count()`` compares) are not matched. Broadening for a shape with no live instance would
+only add matcher surface with no coverage benefit, at the cost of harder-to-reason-about
+false positives; grep for it again before deciding to add it.
 """
 
 from __future__ import annotations
 
+import bisect
 import re
 import subprocess
 from dataclasses import dataclass
@@ -100,11 +118,26 @@ _JSON_MS = r'"[A-Za-z0-9_]*_ms"\s*\)\s*\)\s*\.\s*to(?:Double|Int)\s*\([^()]*\)'
 _RE_JSON_MS = re.compile(
     rf"{_JSON_MS}\s*{_OP}\s*{_ZERO}|{_ZERO}\s*{_OP}\s*{_JSON_MS}"
 )
-_RE_2ARG_MACRO_CALL = re.compile(
-    r"\b(?:ASSERT|EXPECT)_(?:EQ|NE|GT|GE|LT|LE|DOUBLE_EQ|FLOAT_EQ)\s*\(([^;]*)\)\s*;"
+_RE_2ARG_MACRO_OPEN = re.compile(
+    r"\b(?:ASSERT|EXPECT)_(?:EQ|NE|GT|GE|LT|LE|DOUBLE_EQ|FLOAT_EQ)\s*\("
 )
-_RE_NEAR_MACRO_CALL = re.compile(r"\b(?:ASSERT|EXPECT)_NEAR\s*\(([^;]*)\)\s*;")
+_RE_NEAR_MACRO_OPEN = re.compile(r"\b(?:ASSERT|EXPECT)_NEAR\s*\(")
+_RE_FABS_OPEN = re.compile(r"(?<![A-Za-z0-9_])(?:std\s*::\s*)?f?abs\s*\(")
 _RE_ZERO_FULL = re.compile(rf"^{_ZERO}$")
+
+# `fabs(<bare duration operand>)` compared to a small literal/epsilon is a zero assert in
+# disguise (`ASSERT_TRUE(std::fabs(plan.expectedDurationSeconds) < 0.000001)`). The operand
+# must be a bare duration chain (no subtraction of a non-zero expected value: that is a value
+# comparison, e.g. `fabs(x.durationSeconds - 10.01)`).
+_RE_DURATION_OPERAND_CHAIN = re.compile(
+    r"^((?:[A-Za-z_][A-Za-z0-9_]*\s*(?:\.|->|::)\s*)*)([A-Za-z_][A-Za-z0-9_]*)(\s*\(\s*\))?$"
+)
+_EPS_LITERAL = r"(?:[0-9]+\.?[0-9]*|\.[0-9]+)(?:[eE][+-]?[0-9]+)?[fFlL]*"
+_EPS_NAME = r"[A-Za-z_][A-Za-z0-9_]*(?:[Ee]ps|[Ee]psilon|[Tt]ol|[Tt]olerance)[A-Za-z0-9_]*"
+# `fabs(d) < eps` / `fabs(d) == eps` and the mirrored `eps > fabs(d)` / `eps == fabs(d)`.
+_RE_EPS_AFTER = re.compile(rf"^\s*(?:<=|<|==)\s*({_EPS_LITERAL}|{_EPS_NAME})(?![A-Za-z0-9_.])")
+_RE_EPS_BEFORE = re.compile(rf"(?<![A-Za-z0-9_.])({_EPS_LITERAL}|{_EPS_NAME})\s*(?:>=|>|==)\s*$")
+_MAX_EPSILON = 1e-3  # a literal above this is a value comparison, not a "is it zero" check
 
 
 def _is_duration_identifier(ident: str) -> bool:
@@ -120,6 +153,9 @@ def _is_duration_identifier(ident: str) -> bool:
     delimited segment on their own (``elapsed_us``, or the bare identifier ``us``), not as
     a camelCase token (``Us``/``Ns``) embedded in a larger name -- those two-letter tokens
     are too generic to trust outside an explicit underscore boundary.
+
+    A trailing ``At``/``_at`` word is NEVER evidence (``elapsedAt = timer.nsecsElapsed()`` is a
+    duration): no name- or position-based exemption exists, the unit word still decides.
     """
     underscore_parts = ident.split("_")
     multi_part = len(underscore_parts) > 1
@@ -135,6 +171,9 @@ def _is_duration_identifier(ident: str) -> bool:
     return False
 
 
+_QUALIFIER_TAILS = (".", "->", "::")
+
+
 def _is_duration_expr(text: str) -> bool:
     """True if `text` contains a duration identifier (bare or as a call), a JSON `_ms`
     read, or (recursively) a comparison already built from one of those -- used to decide
@@ -142,10 +181,7 @@ def _is_duration_expr(text: str) -> bool:
     """
     if re.search(_JSON_MS, text):
         return True
-    for m in _RE_IDENT.finditer(text):
-        if _is_duration_identifier(m.group(0)):
-            return True
-    return False
+    return any(_is_duration_identifier(m.group(0)) for m in _RE_IDENT.finditer(text))
 
 
 def _split_top_level_args(arg_text: str) -> list[str] | None:
@@ -189,34 +225,158 @@ def _split_top_level_args(arg_text: str) -> list[str] | None:
     return parts
 
 
+def _find_matching_close(text: str, open_idx: int) -> int | None:
+    """Index of the `)` closing the `(` at `text[open_idx]`, string/char-literal aware and
+    spanning newlines; None if it never closes (so the caller skips rather than guesses)."""
+    depth = 0
+    quote = None
+    i, n = open_idx, len(text)
+    while i < n:
+        ch = text[i]
+        if quote:
+            if ch == "\\":
+                i += 1
+            elif ch == quote:
+                quote = None
+        elif ch in ("'", '"'):
+            quote = ch
+        elif ch in "([{":
+            depth += 1
+        elif ch in ")]}":
+            depth -= 1
+            if depth == 0:
+                return i if ch == ")" else None
+        i += 1
+    return None
+
+
+def _unwrap_parens(text: str) -> str:
+    """Strip redundant outer grouping parens: `((0))` -> `0`, `(a_ms)` -> `a_ms`."""
+    text = text.strip()
+    while text.startswith("(") and _find_matching_close(text, 0) == len(text) - 1:
+        text = text[1:-1].strip()
+    return text
+
+
 def _pair_is_duration_zero_predicate(a: str, b: str) -> bool:
-    a, b = a.strip(), b.strip()
+    a, b = _unwrap_parens(a), _unwrap_parens(b)
     a_zero, b_zero = bool(_RE_ZERO_FULL.match(a)), bool(_RE_ZERO_FULL.match(b))
     a_dur, b_dur = _is_duration_expr(a), _is_duration_expr(b)
     return (a_zero and b_dur) or (b_zero and a_dur)
 
 
-def _macro_is_duration_zero_predicate(line: str) -> bool:
-    for m in _RE_2ARG_MACRO_CALL.finditer(line):
-        args = _split_top_level_args(m.group(1))
-        if args is None or len(args) != 2:
+def _fabs_arg_is_bare_duration(arg: str) -> bool:
+    m = _RE_DURATION_OPERAND_CHAIN.match(_unwrap_parens(arg))
+    return bool(m) and _is_duration_identifier(m.group(2))
+
+
+def _is_epsilon(token: str) -> bool:
+    try:
+        return float(token.rstrip("fFlL")) <= _MAX_EPSILON
+    except ValueError:
+        return True  # an epsilon/tolerance NAME (the regex only lets those through)
+
+
+def _macro_and_fabs_sites(code_text: str) -> list[tuple[int, int, str]]:
+    """(start offset, end offset, trigger) of every macro-predicate / fabs-zero site, found
+    by BALANCED-paren extraction over the whole comment-stripped text rather than per
+    physical line, so a call split across lines (``ASSERT_TRUE( std::fabs(x.durationSeconds)``
+    / ``< 0.000001 );``) is one site, and a trailing ``<< "msg"`` stream cannot unbalance it.
+    """
+    sites: list[tuple[int, int, str]] = []
+    for rx, nargs in ((_RE_2ARG_MACRO_OPEN, 2), (_RE_NEAR_MACRO_OPEN, 3)):
+        for m in rx.finditer(code_text):
+            close = _find_matching_close(code_text, m.end() - 1)
+            if close is None:
+                continue
+            args = _split_top_level_args(code_text[m.end():close])
+            if args is None or len(args) != nargs:
+                continue
+            # ASSERT_NEAR(val1, val2, abs_error) -- the tolerance is not part of the predicate.
+            if _pair_is_duration_zero_predicate(args[0], args[1]):
+                sites.append((m.start(), close + 1, "assert_macro"))
+    for m in _RE_FABS_OPEN.finditer(code_text):
+        close = _find_matching_close(code_text, m.end() - 1)
+        if close is None or not _fabs_arg_is_bare_duration(code_text[m.end():close]):
             continue
-        if _pair_is_duration_zero_predicate(args[0], args[1]):
-            return True
-    for m in _RE_NEAR_MACRO_CALL.finditer(line):
-        args = _split_top_level_args(m.group(1))
-        if args is None or len(args) != 3:
-            continue
-        # ASSERT_NEAR(val1, val2, abs_error) -- the tolerance is not part of the predicate.
-        if _pair_is_duration_zero_predicate(args[0], args[1]):
-            return True
-    return False
+        after = _RE_EPS_AFTER.match(code_text[close + 1:close + 1 + 200])
+        before = _RE_EPS_BEFORE.search(code_text[max(0, m.start() - 200):m.start()])
+        if (after and _is_epsilon(after.group(1))) or (before and _is_epsilon(before.group(1))):
+            sites.append((m.start(), close + 1 + (after.end() if after else 0), "fabs_zero"))
+    return sites
 
 
 _RE_LEFT_OPERAND = re.compile(r"([A-Za-z_][A-Za-z0-9_]*)(\s*\(\s*\))?\s*$")
 _RE_RIGHT_OPERAND = re.compile(r"^\s*([A-Za-z_][A-Za-z0-9_]*)(\s*\(\s*\))?")
 _RE_ZERO_AT_END = re.compile(rf"{_ZERO}\s*$")
 _RE_ZERO_AT_START = re.compile(rf"^\s*{_ZERO}")
+
+
+_CAST_TYPES = (
+    "double", "float", "int", "unsigned", "long", "qreal", "qint64", "quint64",
+    "size_t", "int64_t", "uint64_t",
+)
+_RE_STATIC_CAST_TAIL = re.compile(r"static_cast\s*<\s*[A-Za-z_][A-Za-z0-9_:\s]*>\s*$")
+_RE_STATIC_CAST_HEAD = re.compile(r"^\s*static_cast\s*<\s*[A-Za-z_][A-Za-z0-9_:\s]*>\s*(?=\()")
+_RE_C_CAST_HEAD = re.compile(rf"^\s*\(\s*(?:{'|'.join(_CAST_TYPES)})\s*\)\s*")
+
+
+def _operand_of_group(inner: str) -> tuple[str, bool, bool] | None:
+    """(identifier, is_niladic_call, is_qualified) if `inner` is a bare operand chain, looking
+    through any further redundant grouping parens; None otherwise."""
+    inner = _unwrap_parens(inner)
+    m = _RE_DURATION_OPERAND_CHAIN.match(inner)
+    return (m.group(2), bool(m.group(3)), bool(m.group(1))) if m else None
+
+
+def _left_operand(left: str) -> tuple[str, bool, bool] | None:
+    """The operand ending at the end of `left`: a bare ``ident`` / ``ident()`` (as before), or
+    a PARENTHESIZED operand -- ``(elapsed_ms)``, ``((elapsed_ms))``, ``static_cast<double>(x)``.
+    A call with arguments (``foo(elapsed_ms) > 0``) is deliberately NOT unwrapped: the paren
+    there belongs to the call, so the compared value is foo's result, not the identifier."""
+    s = left.rstrip()
+    m = _RE_LEFT_OPERAND.search(s)
+    if m:
+        return m.group(1), bool(m.group(2)), s[:m.start()].rstrip().endswith(_QUALIFIER_TAILS)
+    if not s.endswith(")"):
+        return None
+    depth = 0
+    for idx in range(len(s) - 1, -1, -1):
+        if s[idx] == ")":
+            depth += 1
+        elif s[idx] == "(":
+            depth -= 1
+            if depth == 0:
+                pre = s[:idx].rstrip()
+                if pre and (pre[-1].isalnum() or pre[-1] in "_]") and not _RE_STATIC_CAST_TAIL.search(pre):
+                    return None
+                if pre.endswith(">") and not _RE_STATIC_CAST_TAIL.search(pre):
+                    return None
+                return _operand_of_group(s[idx + 1:-1])
+    return None
+
+
+def _right_operand(right: str) -> tuple[str, bool, bool] | None:
+    """Mirror of `_left_operand` for the operand starting at the start of `right`; also looks
+    through a leading C-style numeric cast (``(double)elapsed_ms``)."""
+    s = right.lstrip()
+    c = _RE_C_CAST_HEAD.match(s)
+    if c:
+        s = s[c.end():]
+    sc = _RE_STATIC_CAST_HEAD.match(s)
+    if sc:
+        s = s[sc.end():]
+    else:
+        m = _RE_RIGHT_OPERAND.match(s)
+        if m:
+            # Followed by `.`/`->`/`::` the matched word is only a qualifier of the real operand.
+            return m.group(1), bool(m.group(2)), s[m.end():].lstrip().startswith(_QUALIFIER_TAILS)
+    if not s.startswith("("):
+        return None
+    close = _find_matching_close(s, 0)
+    if close is None:
+        return None
+    return _operand_of_group(s[1:close])
 
 
 def _ident_compare_trigger(line: str) -> str | None:
@@ -232,17 +392,17 @@ def _ident_compare_trigger(line: str) -> str | None:
     for op_m in re.finditer(_OP, line):
         left = line[: op_m.start()]
         right = line[op_m.end():]
-        left_m = _RE_LEFT_OPERAND.search(left)
-        right_m = _RE_RIGHT_OPERAND.match(right)
+        left_op = _left_operand(left)
+        right_op = _right_operand(right)
         zero_left = bool(_RE_ZERO_AT_END.search(left))
         zero_right = bool(_RE_ZERO_AT_START.match(right))
-        if zero_right and left_m and _is_duration_identifier(left_m.group(1)):
-            if left_m.group(2):
+        if zero_right and left_op and _is_duration_identifier(left_op[0]):
+            if left_op[1]:
                 found_call = True
             else:
                 found_ident = True
-        if zero_left and right_m and _is_duration_identifier(right_m.group(1)):
-            if right_m.group(2):
+        if zero_left and right_op and _is_duration_identifier(right_op[0]):
+            if right_op[1]:
                 found_call = True
             else:
                 found_ident = True
@@ -260,8 +420,6 @@ def _line_triggers(line: str) -> list[str]:
         triggers.append(ident_trigger)
     if _RE_JSON_MS.search(line):
         triggers.append("json_ms_key")
-    if _macro_is_duration_zero_predicate(line):
-        triggers.append("assert_macro")
     return triggers
 
 
@@ -317,16 +475,42 @@ def _tracked_files(root: Path) -> list[str]:
     return [line for line in proc.stdout.splitlines() if line.strip()]
 
 
-def _strip_comments(text: str) -> str:
+_RE_RAW_STRING_OPEN = re.compile(r'(?:u8|u|U|L)?R"([^ ()\\\t\v\f\n\r"]{0,16})\(')
+
+
+def _raw_string_at(text: str, i: int) -> re.Match[str] | None:
+    """The raw-string opener (``R"delim(``, optionally ``u8``/``u``/``U``/``L``-prefixed)
+    whose prefix begins at `text[i]`, or None. Refuses an `R` that is merely the tail of a
+    longer identifier (``FOOR"x"`` is not a raw string)."""
+    if i > 0 and (text[i - 1].isalnum() or text[i - 1] == "_"):
+        return None
+    return _RE_RAW_STRING_OPEN.match(text, i)
+
+
+# Every character `str.splitlines()` treats as a line boundary. scan_text splits BOTH
+# comment-stripped views with splitlines(), so blanking a raw-string body must keep these (not
+# only \r\n) or a \v/\f/\x1c-\x1e/\x85/ /  inside a body would split the anchor view
+# but not the trigger view and desynchronise their line numbers.
+_LINE_BREAKS = "\r\n\v\f\x1c\x1d\x1e\x85  "
+
+
+def _strip_comments(text: str, blank_raw_strings: bool = False) -> str:
     """Blank out `//` and `/* */` comment content (tracking string literals so a comment
     marker inside a string is not mistaken for a real one), keeping every newline in place
-    so line numbers are unaffected. Used ONLY to decide whether a line triggers -- the
-    anchor for a genuine candidate is still normalize_anchor() of the ORIGINAL line, so an
-    edit to just a trailing comment on an otherwise-unchanged code line still (as before)
-    changes that line's anchor; this function's only job is to stop comment TEXT (e.g. a
-    docstring that mentions ``Milliseconds() > 0.0`` as prose) from being read as code.
+    so line numbers are unaffected. This function's job is to stop comment TEXT (e.g. a
+    docstring that mentions ``Milliseconds() > 0.0`` as prose) from being read as code, and
+    to keep a comment edit from re-keying a site: the ANCHOR of a genuine candidate is
+    normalize_anchor() of the comment-stripped line too, so changing only a trailing comment
+    on an otherwise-unchanged code line no longer changes that line's anchor.
     Deliberately spans physical lines for ``/* */`` (a same-line-only comment strip would
     miss a continuation line of a multi-line block comment).
+
+    C++ raw string literals (``R"delim( ... )delim"``) are tracked as their own state: their
+    body is not escape-processed, so a ``"``/``//``/``/*`` inside one neither ends the string
+    early nor opens a comment (which used to HIDE the real code after it), and with
+    `blank_raw_strings=True` (the TRIGGER view) the body is blanked to spaces so text inside
+    an embedded shader/regex/JSON literal cannot FAKE a site. The ANCHOR view keeps the body
+    verbatim: a change to a literal's data must still change the anchor.
     """
     out: list[str] = []
     state = "code"  # "code" | "string" | "line_comment" | "block_comment"
@@ -334,6 +518,21 @@ def _strip_comments(text: str) -> str:
     i, n = 0, len(text)
     while i < n:
         ch = text[i]
+        if state == "code" and ch in ("R", "u", "U", "L"):
+            raw = _raw_string_at(text, i)
+            if raw:
+                terminator = ")" + raw.group(1) + '"'
+                end = text.find(terminator, raw.end())
+                if end != -1:
+                    body = text[raw.end():end]
+                    out.append(raw.group(0))
+                    out.append(
+                        "".join(c if c in _LINE_BREAKS else " " for c in body)
+                        if blank_raw_strings else body
+                    )
+                    out.append(terminator)
+                    i = end + len(terminator)
+                    continue
         if state == "string":
             out.append(ch)
             if ch == "\\" and i + 1 < n and text[i + 1] != "\n":
@@ -387,16 +586,34 @@ def _strip_comments(text: str) -> str:
 def scan_text(text: str, source: str = "<text>") -> list[Candidate]:
     """Scan already-loaded text (used directly by the positive-control tests)."""
     by_anchor: dict[str, tuple[set[str], list[int]]] = {}
-    original_lines = text.splitlines()
-    code_only_lines = _strip_comments(text).splitlines()
-    for lineno, (line, code_only) in enumerate(zip(original_lines, code_only_lines), start=1):
-        triggers = _line_triggers(code_only)
-        if not triggers:
-            continue
-        anchor = normalize_anchor(line)
+    # Two comment-stripped views of the same text: the TRIGGER view also blanks raw-string
+    # bodies (so embedded non-C++ text cannot fake a site); the ANCHOR view keeps them (so a
+    # literal's data still keys the site) but drops comments (so a comment edit does not).
+    code_text = _strip_comments(text, blank_raw_strings=True)
+    anchor_lines = _strip_comments(text).splitlines()
+    code_only_lines = code_text.splitlines()
+    line_starts: list[int] = []
+    offset = 0
+    for physical in code_text.splitlines(keepends=True):
+        line_starts.append(offset)
+        offset += len(physical)
+
+    def line_of(pos: int) -> int:
+        return bisect.bisect_right(line_starts, pos)  # 1-indexed
+
+    sites: list[tuple[int, int, str]] = []  # (first line, last line, trigger)
+    for lineno, code_only in enumerate(code_only_lines, start=1):
+        sites.extend((lineno, lineno, t) for t in _line_triggers(code_only))
+    for start, end, trigger in _macro_and_fabs_sites(code_text):
+        sites.append((line_of(start), line_of(max(start, end - 1)), trigger))
+    sites.sort()
+    for first, last, trigger in sites:
+        # A site spanning several physical lines is keyed by ALL its lines, joined.
+        anchor = normalize_anchor(" ".join(anchor_lines[first - 1:last]))
         trig_set, lines = by_anchor.setdefault(anchor, (set(), []))
-        trig_set.update(triggers)
-        lines.append(lineno)
+        trig_set.add(trigger)
+        if first not in lines:
+            lines.append(first)
     return [
         Candidate(path=source, anchor=anchor, triggers=tuple(sorted(trig_set)), lines=tuple(lines))
         for anchor, (trig_set, lines) in by_anchor.items()
