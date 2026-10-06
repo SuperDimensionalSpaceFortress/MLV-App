@@ -878,6 +878,7 @@ static bool lookAssistDisoArmRender(mlvObject_t *mlvObject, int frameIndex, int 
         settings.white_balance_kelvin = temperature;
         settings.white_balance_tint = tint / 10.0;
         settings.exposure_stops = exposureStops;
+        settings.vibrance = 1.0; // the slider's 0 (a factor of 0 is greyscale)
         const int previousReadOnly = llrpSetIsolatedAnalysisSharedStateReadOnlyForCurrentThread( 1 );
         rendered = get_area_average_downscale_thumnail_with_processing_cachefree(
             mlvObject, frameIndex, downscaleFactor, 1, clone, &settings, rgb->data() ) != 0;
@@ -1062,18 +1063,21 @@ QString ReceiptApplier::lookAssistDualIsoMatchTrace(mlvObject_t *mlvObject,
         .arg( exposureStops, 0, 'f', 2 ).arg( temperature ).arg( tint )
         .arg( hasAsShot ? 1 : 0 ).arg( asShotTemperature ).arg( asShotTint )
         .arg( armFrames[0] ).arg( armFrames[1] ).arg( armFrames[2] );
+    // defaultGrade = Look Assist's grade off; exposureZero = its exposure off too (A5). A5x is A5 viewed at the pinned
+    // exposure (T6/T7 read A5 "when viewed at the same exposure"); it is scored over R0's mask for information only.
     struct Arm { const char *name; int mode; int whiteBright; double darkNoiseScale; bool darkBlack; bool asShotWb;
-                 bool lookAssistOff; };
+                 bool defaultGrade; bool exposureZero; };
     const int a6White = haveLevels && brightClip > levels.black ? qMin( brightClip, levels.white ) : 0;
-    const Arm arms[8] = {
-        { "R0",  -1, 0,       0.0, false, false, false },
-        { "A1",  -1, 0,       0.0, false, true,  false },
-        { "A3",   2, 0,       0.0, false, false, false },
-        { "A6",  -1, a6White, 0.0, false, false, false },
-        { "A7a", -1, 0,       0.5, false, false, false },
-        { "A7b", -1, 0,       2.0, false, false, false },
-        { "A8",  -1, 0,       0.0, true,  false, false },
-        { "A5",  -1, 0,       0.0, false, true,  true } };
+    const Arm arms[9] = {
+        { "R0",  -1, 0,       0.0, false, false, false, false },
+        { "A1",  -1, 0,       0.0, false, true,  false, false },
+        { "A3",   2, 0,       0.0, false, false, false, false },
+        { "A6",  -1, a6White, 0.0, false, false, false, false },
+        { "A7a", -1, 0,       0.5, false, false, false, false },
+        { "A7b", -1, 0,       2.0, false, false, false, false },
+        { "A8",  -1, 0,       0.0, true,  false, false, false },
+        { "A5",  -1, 0,       0.0, false, true,  true,  true },
+        { "A5x", -1, 0,       0.0, false, true,  true,  false } };
     trace += QStringLiteral( " a6_white=%1 a8=%2" ).arg( a6White )
         .arg( darkLevelsOff ? QStringLiteral( "%1/%2/%3/%4" ).arg( darkBlackOffset[0] ).arg( darkBlackOffset[1] )
                                   .arg( darkBlackOffset[2] ).arg( darkBlackOffset[3] )
@@ -1091,10 +1095,10 @@ QString ReceiptApplier::lookAssistDualIsoMatchTrace(mlvObject_t *mlvObject,
             std::vector<unsigned char> rgb( pixels * 3u, 0 );
             const bool rendered = lookAssistDisoArmRender(
                 mlvObject, rf, downscaleFactor,
-                a.lookAssistOff ? 0.0 : pinExposure,
+                a.exposureZero ? 0.0 : pinExposure,
                 a.asShotWb ? asShotTemperature : pinTemperature,
                 a.asShotWb ? asShotTint : pinTint,
-                a.lookAssistOff, a.mode, a.whiteBright, a.darkNoiseScale,
+                a.defaultGrade, a.mode, a.whiteBright, a.darkNoiseScale,
                 a.darkBlack ? darkBlackOffset : nullptr, &rgb );
             if( !rendered )
             {
@@ -1104,7 +1108,7 @@ QString ReceiptApplier::lookAssistDualIsoMatchTrace(mlvObject_t *mlvObject,
             const std::vector<size_t> own = lookAssistLumaBandMask( rgb, pixels );
             if( reference ) mask = own;
             // Every arm but A5 is scored over R0's mask; A5 (another exposure) only over its own, and never graded.
-            const std::vector<size_t> &scored = a.lookAssistOff ? own : mask;
+            const std::vector<size_t> &scored = a.exposureZero ? own : mask;
             double dbm = 0.0;
             double psh = 0.0;
             lookAssistDarkBandMagenta( rgb, scored, &dbm, &psh );

@@ -340,13 +340,19 @@ TEST(LookAssistDisoArms, TheTracePinsTheBalanceFixesTheMaskOnR0AndResetsEveryArm
     const SharedMatch before = sharedMatch( video );
 
     QStringList sunk;
+    bool lookAssistOffHasColour = false;
     qputenv( "MLVAPP_LOOK_ASSIST_DISO_MATCH_TRACE", "1" );
     // Look Assist's own decision (exposure 0, 6000 K) is logged, never rendered with.
     const QString trace = ReceiptApplier::lookAssistDualIsoMatchTrace(
         video, 0, 2, 0.0, 6000, 0,
-        [&sunk]( const QString &name, int w, int h, const unsigned char *rgb )
+        [&sunk, &lookAssistOffHasColour]( const QString &name, int w, int h, const unsigned char *rgb )
         {
-            if( w > 0 && h > 0 && rgb ) sunk << name;
+            if( w <= 0 || h <= 0 || !rgb ) return;
+            sunk << name;
+            // The default grade keeps colour (vibrance factor 1, never 0, which is greyscale).
+            if( name == QStringLiteral( "f0-A5x" ) )
+                for( int i = 0; i < w * h && !lookAssistOffHasColour; ++i )
+                    lookAssistOffHasColour = rgb[i * 3] != rgb[i * 3 + 1] || rgb[i * 3 + 1] != rgb[i * 3 + 2];
         } );
     if( wasSet ) qputenv( "MLVAPP_LOOK_ASSIST_DISO_MATCH_TRACE", previous );
     else qunsetenv( "MLVAPP_LOOK_ASSIST_DISO_MATCH_TRACE" );
@@ -356,7 +362,8 @@ TEST(LookAssistDisoArms, TheTracePinsTheBalanceFixesTheMaskOnR0AndResetsEveryArm
     ASSERT_TRUE( armsAreReset() );
     ASSERT_TRUE( before == sharedMatch( video ) );
 
-    const QRegularExpression armRe( QStringLiteral( " (R0|A1|A3|A6|A7a|A7b|A8|A5)=dbm(-?[0-9.]+)/psh([0-9.]+)/blk([0-9.]+)/m([0-9]+)/own([0-9]+)" ) );
+    ASSERT_TRUE( lookAssistOffHasColour );
+    const QRegularExpression armRe( QStringLiteral( " (R0|A1|A3|A6|A7a|A7b|A8|A5x|A5)=dbm(-?[0-9.]+)/psh([0-9.]+)/blk([0-9.]+)/m([0-9]+)/own([0-9]+)" ) );
     const QStringList blocks = trace.split( QStringLiteral( " arms@" ) );
     ASSERT_EQ( 4, blocks.size() );
     bool someGradedArmOwnsAnotherMask = false;
@@ -393,4 +400,5 @@ TEST(LookAssistDisoArms, TheTracePinsTheBalanceFixesTheMaskOnR0AndResetsEveryArm
     ASSERT_TRUE( someGradedArmOwnsAnotherMask );
     ASSERT_TRUE( sunk.contains( QStringLiteral( "f0-R0" ) ) );
     ASSERT_TRUE( sunk.contains( QStringLiteral( "f0-A5" ) ) );
+    ASSERT_TRUE( sunk.contains( QStringLiteral( "f0-A5x" ) ) );
 }
