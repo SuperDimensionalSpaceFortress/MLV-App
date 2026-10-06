@@ -47,7 +47,8 @@
       "type": "object", "required": ["contactSheetFrames", "lookFlavor"], "additionalProperties": false,
       "properties": {
         "contactSheetFrames": { "type": "integer", "minimum": 1, "maximum": 60 },
-        "lookFlavor": { "enum": ["classic", "cinematic"], "default": "classic" }
+        "lookFlavor": { "enum": ["classic", "cinematic"], "default": "classic" },
+        "pairedSeek": { "type": "boolean", "default": false, "description": "Also capture the same frames by SEEK after the Play stops (playback_path=false; fetched to evidence contact-sheet-seek\\raw)." }
       },
       "description": "Required when legType is 'look'. Look Assist is FORCED on for a look leg (Amendment 1 A2)."
     },

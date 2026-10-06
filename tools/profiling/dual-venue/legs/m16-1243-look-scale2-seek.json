@@ -1,0 +1,25 @@
+{
+  "schema": "mlv-app/dual-venue-leg/v1",
+  "legId": "m16-1243-look-scale2-seek",
+  "card": "DUAL-VENUE-EVIDENCE-1",
+  "legType": "look",
+  "clipId": "M16-1243",
+  "playSeconds": 25,
+  "backends": ["cpu"],
+  "scaleFactor": 2,
+  "generatorArgs": { "telemetryArm": "LIGHT", "cpuQuiescenceThresholdPercent": 95 },
+  "timeouts": { "queueWaitSec": 900, "extraClaimedWaitSec": 600 },
+  "look": { "contactSheetFrames": 6, "lookFlavor": "classic", "pairedSeek": true },
+  "criteria": {
+    "acceptance": {
+      "cpu": [
+        { "metric": "lookAssistForced", "op": "eq", "value": true }
+      ]
+    },
+    "supplementary": {
+      "cpu": [
+        { "metric": "lookAssistForced", "op": "eq", "value": true }
+      ]
+    }
+  }
+}
