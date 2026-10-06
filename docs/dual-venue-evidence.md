@@ -324,7 +324,7 @@ A leg's `scaleFactor` is the playback scale it **requests**. It is not necessari
 texture route clamped every requested scale other than 1 to 1 (three production receipts of `m16-1243-look` on CUDA logged
 `playback_scale_clamped_for_gpu_texture_route requested=4 effective=1` and `scale_active_last=1`). It now **honours 2 and 4**: the GPU reconstructs the
 dual-ISO frame at the preview size (`mlvDualIsoGpuPreviewScaleReconPlan`) and ends with a same-colour ISO-period notch that removes the 4-row dual-ISO mesh
-(a recon DLL without `igpu_recon_set_reduced_iso_notch` makes the plan refuse with "recon DLL lacks the reduced ISO notch"), decided once per play session and logged as
+(a recon DLL without `igpu_recon_set_reduced_iso_notch` makes the plan refuse with "recon DLL lacks the reduced ISO notch"); the GPU window's AMaZE then zeroes the 2-column comb with a horizontal [1,2,1]/4 filter on the reduced texture (an AMaZE DLL without `igpu_amaze_debayer_set_reduced_hnyquist` is refused with "AMaZE DLL lacks the reduced H-Nyquist filter", counted in `playback_smoke.reduced_hnyquist_summary`), decided once per play session and logged as
 `playback_scale_gpu_texture_route_session requested=<S> effective=<S or 1> reason="..."`. Scale 8 and any session the plan refuses keep the clamp
 (`platform/qt/MainWindowGpuPreviewPolicy.h`, pinned by `tests/gui/test_gui_smoke.cpp`), and `scale_active_last` reports the scale actually reconstructed, so a
 session that fell back reads 1, never the request.

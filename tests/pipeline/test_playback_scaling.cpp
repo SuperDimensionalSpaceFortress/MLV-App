@@ -573,6 +573,36 @@ TEST(PlaybackScaling, PresentationResamplerPolicySplitsSharpAndAggressive)
                   true)));
 }
 
+// T10 (PLAYBACK-CUDA-HONOUR-SCALE-1 r3): the reduced-texture predicate behind the AMaZE
+// H-Nyquist flag. M16-1243-shaped dims: clip 1808x2268, x2 904x1132/1134, x4 452x564;
+// the GPU window gets the clip's display size (clip x stretch).
+// Mutations: filter enabled on x1, never enabled.
+TEST(PlaybackScaling, ReconTexturePredicateIsReducedOnlyAtX2AndX4)
+{
+    // Clip-size form: smaller on both axes is reduced.
+    ASSERT_TRUE(playbackReconTextureIsReduced(904, 1132, 1808, 2268));
+    ASSERT_TRUE(playbackReconTextureIsReduced(452, 564, 1808, 2268));
+    ASSERT_FALSE(playbackReconTextureIsReduced(1808, 2268, 1808, 2268)); // x1, export, paused, scrub
+    ASSERT_FALSE(playbackReconTextureIsReduced(0, 0, 1808, 2268));
+    ASSERT_FALSE(playbackReconTextureIsReduced(452, 564, 0, 0));
+
+    // Display-size form (what the GPU window is handed).
+    const int stretches[][2] = { { 3, 1 }, { 1, 1 } };
+    for (const auto & s : stretches)
+    {
+        const int dw = 1808 * s[0], dh = 2268 * s[1];
+        ASSERT_TRUE(playbackReconTextureIsReducedForDisplaySize(904, 1134, dw, dh));
+        ASSERT_TRUE(playbackReconTextureIsReducedForDisplaySize(452, 564, dw, dh));
+        ASSERT_FALSE(playbackReconTextureIsReducedForDisplaySize(1808, 2268, dw, dh));
+    }
+    // x1 with the 1.667 vertical stretch and up to 2.0 horizontal stays x1.
+    ASSERT_FALSE(playbackReconTextureIsReducedForDisplaySize(1808, 2268, 3616, 3780));
+    // x2 of an odd-sized clip (texture rounded up) is still reduced.
+    ASSERT_TRUE(playbackReconTextureIsReducedForDisplaySize(905, 1135, 1809, 2269));
+    // No display size: never reduced.
+    ASSERT_FALSE(playbackReconTextureIsReducedForDisplaySize(452, 564, 0, 0));
+}
+
 TEST(PlaybackScaling, SuppressesUniformTopMagentaBandOnly)
 {
     const int width = 64;

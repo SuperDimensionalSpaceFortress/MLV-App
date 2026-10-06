@@ -17,6 +17,10 @@
 // r2: the reduced run ends with the same-colour ISO-period notch
 // (dualiso_reduced_iso_period_notch16, ported line for line to the CUDA backend's
 // last kernel), switched by the optional igpu_recon_set_reduced_iso_notch symbol.
+// r3: the reduced texture's AMaZE RGB16 then takes a horizontal [1,2,1]/4 Nyquist zero
+// (debayer_reduced_hnyquist121_rgb16, ported line for line to the CUDA AMaZE backend,
+// switched by the optional igpu_amaze_debayer_set_reduced_hnyquist symbol); T3 emulates
+// it on the reduced presentation's RGB16 and adds L8 (column Nyquist) and L9.
 // The pixel parity of the real CUDA kernels at reduced dims ((c1), (c2)) is a venue
 // proof; see the PR.
 #include "../common/minitest.h"
@@ -26,6 +30,7 @@
 #include "../../src/mlv/llrawproc/dualiso.h"
 #include "../../src/mlv/pipeline_stage_capture.h"
 #include "../../src/processing/raw_processing.h"
+#include "../../src/debayer/debayer.h"
 
 #include <QDir>
 
@@ -508,6 +513,112 @@ std::vector<uint8_t> boxDownsample(const std::vector<uint8_t> & full, int fullW,
     return out;
 }
 
+// L8 (r3): colNyqEnergy, rowPeriod4Energy's estimator along x at period 2. Per row,
+// on the per-pixel channel mean: remove the local mean (5-sample box), correlate with
+// the period-2 basis cos(pi x), take the amplitude A, normalise as (A / row mean)^2,
+// and average over rows.
+double colNyqEnergy(const std::vector<uint8_t> & rgb, int w, int h)
+{
+    double sum = 0.0;
+    int rowsUsed = 0;
+    std::vector<double> v(static_cast<size_t>(w), 0.0);
+    for (int y = 0; y < h; ++y)
+    {
+        double mean = 0.0;
+        for (int x = 0; x < w; ++x)
+        {
+            const size_t i = (static_cast<size_t>(y) * w + x) * 3;
+            v[static_cast<size_t>(x)] = (rgb[i] + rgb[i + 1] + rgb[i + 2]) / 3.0;
+            mean += v[static_cast<size_t>(x)];
+        }
+        mean /= w;
+        if (mean <= 0.0 || w < 5) continue;
+        double re = 0.0;
+        int n = 0;
+        for (int x = 2; x < w - 2; ++x)
+        {
+            const double local = (v[x - 2] + v[x - 1] + v[x] + v[x + 1] + v[x + 2]) / 5.0;
+            re += (v[static_cast<size_t>(x)] - local) * ((x % 2 == 0) ? 1.0 : -1.0);
+            ++n;
+        }
+        const double a = n > 0 ? std::fabs(re) / n : 0.0;
+        sum += (a / mean) * (a / mean);
+        ++rowsUsed;
+    }
+    return rowsUsed > 0 ? sum / rowsUsed : 0.0;
+}
+
+// L9 (r3): lag-2 horizontal luma detail, mean |L(x+2,y) - L(x,y)| (blind to period 2).
+double lag2HorizontalLumaDetail(const std::vector<uint8_t> & rgb, int w, int h)
+{
+    double sum = 0.0;
+    size_t n = 0;
+    auto luma = [&](int x, int y) {
+        const size_t i = (static_cast<size_t>(y) * w + x) * 3;
+        return 0.299 * rgb[i] + 0.587 * rgb[i + 1] + 0.114 * rgb[i + 2];
+    };
+    for (int y = 0; y < h; ++y)
+        for (int x = 0; x + 2 < w; ++x)
+        {
+            sum += std::fabs(luma(x + 2, y) - luma(x, y));
+            ++n;
+        }
+    return n ? sum / static_cast<double>(n) : 0.0;
+}
+
+// The GPU route's reduced presentation, emulated: getMlvProcessedFrame8ScaledFromReduced-
+// ReconnedRaw16's steps (debayerBasicU16, last-row padding, applyProcessingObject8) with
+// the reduced H-Nyquist filter on the RGB16 between debayer and processing, as the CUDA
+// AMaZE backend applies it before its WB-undo pack. Call after that function has run for
+// this frame (it syncs the processing levels); with hnyquist=false the output equals it.
+std::vector<uint8_t> emulateReducedPresent(MlvPipelineFixture & fixture,
+                                           uint64_t frame,
+                                           const std::vector<uint16_t> & bayer,
+                                           int reducedWidth,
+                                           int reducedHeight,
+                                           int outHeight,
+                                           bool hnyquist)
+{
+    const size_t rowWords = static_cast<size_t>(reducedWidth) * 3u;
+    std::vector<uint16_t> work(bayer);
+    std::vector<uint16_t> rgb(rowWords * static_cast<size_t>(outHeight), 0u);
+    debayerBasicU16(rgb.data(), work.data(), reducedWidth, reducedHeight, 1, 0);
+    for (int y = reducedHeight; y < outHeight; ++y)
+        std::memcpy(rgb.data() + static_cast<size_t>(y) * rowWords,
+                    rgb.data() + static_cast<size_t>(reducedHeight - 1) * rowWords,
+                    rowWords * sizeof(uint16_t));
+    if (hnyquist)
+    {
+        std::vector<uint16_t> filtered(rgb.size(), 0u);
+        debayer_reduced_hnyquist121_rgb16(filtered.data(), rgb.data(), reducedWidth, outHeight);
+        rgb.swap(filtered);
+    }
+    std::vector<uint8_t> out(rgb.size(), 0u);
+    applyProcessingObject8(fixture.processing(), reducedWidth, outHeight, rgb.data(), out.data(),
+                           1, 1, frame);
+    return out;
+}
+
+// Interleaved RGB16 field, per-channel bases.
+std::vector<uint16_t> rgb16Field(int w, int h, int r, int g, int b)
+{
+    std::vector<uint16_t> f(static_cast<size_t>(w) * h * 3);
+    for (size_t i = 0; i < f.size(); i += 3)
+    {
+        f[i] = static_cast<uint16_t>(r);
+        f[i + 1] = static_cast<uint16_t>(g);
+        f[i + 2] = static_cast<uint16_t>(b);
+    }
+    return f;
+}
+
+std::vector<uint8_t> rgb16To8(const std::vector<uint16_t> & rgb)
+{
+    std::vector<uint8_t> out(rgb.size());
+    for (size_t i = 0; i < rgb.size(); ++i) out[i] = static_cast<uint8_t>(rgb[i] >> 8);
+    return out;
+}
+
 // Synthetic RGGB Bayer16: per-colour base plus `amp` alternating in sign every
 // same-colour row (a 4-row period), i.e. the dual-ISO residual shape.
 std::vector<uint16_t> alternatingBayer(int w, int h, int amp)
@@ -584,10 +695,12 @@ TEST(GpuDualIsoPreviewScale, NotchKeepsColourPlanesSeparate)
     ASSERT_TRUE(out == stepWant);
 }
 
-// T3 (L1-L4): the CPU reduced recon (CUDA matches it, c1) plus the C reference
-// notch, presented through the reduced consumer, against the full-res route's
-// output box-downsampled to the same dims. Thresholds pre-registered by the r2
-// design review. The frame without the notch is printed for the record.
+// T3 (L1-L4, L8, L9): the CPU reduced recon (CUDA matches it, c1) plus the C reference
+// notch, presented through the reduced consumer with the C reference H-Nyquist filter on
+// its RGB16 (emulateReducedPresent), against the full-res route's output box-downsampled
+// to the same dims. Thresholds pre-registered by the r3 design review (L3 0.85 retired:
+// L3a >= 0.875 x the same route with notch and H-filter off, L3b >= 0.78 x ref). The
+// frame without the notch and filter is printed for the record.
 TEST(GpuDualIsoPreviewScale, ReducedReconWithNotchMatchesReference)
 {
     GpuReconEnv env(false);
@@ -606,7 +719,7 @@ TEST(GpuDualIsoPreviewScale, ReducedReconWithNotchMatchesReference)
         ASSERT_EQ(1, mlvDualIsoPreviewScaleReconPlan(fixture.video(), scale, &plan));
         int w = 0, h = 0;
         mlvFrameOutputDimensions(fixture.video(), scale, &w, &h);
-        std::vector<uint8_t> reduced(static_cast<size_t>(w) * h * 3);
+        std::vector<uint8_t> routed(static_cast<size_t>(w) * h * 3);
         std::vector<uint16_t> raw = decodeRaw(fixture, 2);
         ASSERT_FALSE(raw.empty());
         std::vector<uint16_t> recon(static_cast<size_t>(plan.reducedWidth) * plan.reducedHeight);
@@ -622,33 +735,47 @@ TEST(GpuDualIsoPreviewScale, ReducedReconWithNotchMatchesReference)
         processingSetPlaybackPreviewScaleFactor(scale);
         const int ok = getMlvProcessedFrame8ScaledFromReducedReconnedRaw16(
             fixture.video(), 2, bayer.data(), plan.reducedWidth, plan.reducedHeight, plan.scale,
-            reduced.data(), 1, scale);
-        std::vector<uint8_t> unnotched(reduced.size());
-        const int okUnnotched = getMlvProcessedFrame8ScaledFromReducedReconnedRaw16(
-            fixture.video(), 2, recon.data(), plan.reducedWidth, plan.reducedHeight, plan.scale,
-            unnotched.data(), 1, scale);
+            routed.data(), 1, scale);
+        ASSERT_EQ(1, ok);
+        // The emulation without the filter is the routed frame, byte for byte.
+        const std::vector<uint8_t> emulatedNoFilter =
+            emulateReducedPresent(fixture, 2, bayer, plan.reducedWidth, plan.reducedHeight, h, false);
+        const std::vector<uint8_t> reduced =
+            emulateReducedPresent(fixture, 2, bayer, plan.reducedWidth, plan.reducedHeight, h, true);
+        const std::vector<uint8_t> unfiltered =
+            emulateReducedPresent(fixture, 2, recon, plan.reducedWidth, plan.reducedHeight, h, false);
         processingSetPlaybackPreviewScaleFactor(previousScale);
         processingSetPlaybackPreviewMode(previousMode);
-        ASSERT_EQ(1, ok);
-        ASSERT_EQ(1, okUnnotched);
+        ASSERT_TRUE(emulatedNoFilter == routed);
         const int rh = plan.reducedHeight;
         const std::vector<uint8_t> ref = boxDownsample(fullFrame, fixture.width(), scale, w, rh);
-        std::printf("[gpu-dualiso-preview-scale] x%d without notch: L1 %.4f L2 %.4f L3 %.4f\n",
-                    scale, rowPeriod4Energy(unnotched, w, rh), columnPeriod4Energy(unnotched, w, rh),
-                    lag4VerticalLumaDetail(unnotched, w, rh));
+        const double l3Off = lag4VerticalLumaDetail(unfiltered, w, rh);
+        std::printf("[gpu-dualiso-preview-scale] x%d notch and H-filter off: L1 %.4f L2 %.4f L3 %.4f "
+                    "L8 %.5f L9 %.4f\n",
+                    scale, rowPeriod4Energy(unfiltered, w, rh), columnPeriod4Energy(unfiltered, w, rh),
+                    l3Off, colNyqEnergy(unfiltered, w, rh), lag2HorizontalLumaDetail(unfiltered, w, rh));
         const double l1 = rowPeriod4Energy(reduced, w, rh);
         const double l1Ref = rowPeriod4Energy(ref, w, rh);
         const double l2 = columnPeriod4Energy(reduced, w, rh);
         const double l2Ref = columnPeriod4Energy(ref, w, rh);
         const double l3 = lag4VerticalLumaDetail(reduced, w, rh);
         const double l3Ref = lag4VerticalLumaDetail(ref, w, rh);
+        const double l8 = colNyqEnergy(reduced, w, rh);
+        const double l8Ref = colNyqEnergy(ref, w, rh);
+        const double l9 = lag2HorizontalLumaDetail(reduced, w, rh);
+        const double l9Ref = lag2HorizontalLumaDetail(ref, w, rh);
         std::printf("[gpu-dualiso-preview-scale] x%d L1 row-p4 %.4f (ref %.4f) L2 col-p4 %.4f "
-                    "(ref %.4f, bound %.4f) L3 lag4 %.4f (ref %.4f, ratio %.4f)\n",
+                    "(ref %.4f, bound %.4f) L3 lag4 %.4f (ref %.4f, L3a %.4f >= 0.875, L3b %.4f >= 0.78) "
+                    "L8 colNyq %.5f (ref %.5f, bound %.5f) L9 lag2 %.4f (ref %.4f, ratio %.4f >= 0.80)\n",
                     scale, l1, l1Ref, l2, l2Ref, 3.0 * l2Ref + 0.02, l3, l3Ref,
-                    l3Ref > 0.0 ? l3 / l3Ref : 0.0);
+                    l3Off > 0.0 ? l3 / l3Off : 0.0, l3Ref > 0.0 ? l3 / l3Ref : 0.0,
+                    l8, l8Ref, 2.0 * l8Ref + 0.002, l9, l9Ref, l9Ref > 0.0 ? l9 / l9Ref : 0.0);
         lookPass = lookPass && l1 <= 0.02;
         lookPass = lookPass && l2 <= 3.0 * l2Ref + 0.02;
-        lookPass = lookPass && l3 >= 0.85 * l3Ref;
+        lookPass = lookPass && l3 >= 0.875 * l3Off;
+        lookPass = lookPass && l3 >= 0.78 * l3Ref;
+        lookPass = lookPass && l8 <= 2.0 * l8Ref + 0.002;
+        lookPass = lookPass && l9 >= 0.80 * l9Ref;
         for (int c = 0; c < 3; ++c)
         {
             const double ratio = channelMean(reduced, w, rh, c) / channelMean(ref, w, rh, c);
@@ -658,6 +785,202 @@ TEST(GpuDualIsoPreviewScale, ReducedReconWithNotchMatchesReference)
         }
     }
     ASSERT_TRUE(lookPass);
+}
+
+// T7 (r3): the reduced H-Nyquist filter's response at the 2-column period is exactly 0
+// per channel, edges included (mirrored), it keeps each channel's mean within 1 LSB,
+// and a step edge gets the exact [1,2,1]/4 values.
+// Mutations: never applied, weights [1,0,1]/2, vertical instead of horizontal,
+// applied twice, wrong edge mirroring, channel crosstalk.
+TEST(GpuDualIsoPreviewScale, HNyquistNullsColumnAlternation)
+{
+    const int base[3] = { 12000, 20000, 9000 };
+    const int amp[3] = { 600, 1000, 300 };
+    for (const int w : { 8, 9, 2 })
+    {
+        const int h = 4;
+        std::vector<uint16_t> src(static_cast<size_t>(w) * h * 3);
+        for (int y = 0; y < h; ++y)
+            for (int x = 0; x < w; ++x)
+                for (int c = 0; c < 3; ++c)
+                    src[(static_cast<size_t>(y) * w + x) * 3 + c] =
+                        static_cast<uint16_t>(base[c] + ((x % 2 == 0) ? amp[c] : -amp[c]));
+        std::vector<uint16_t> out(src.size(), 0u);
+        debayer_reduced_hnyquist121_rgb16(out.data(), src.data(), w, h);
+        for (int y = 0; y < h; ++y)
+            for (int x = 0; x < w; ++x)
+                for (int c = 0; c < 3; ++c)
+                {
+                    const uint16_t v = out[(static_cast<size_t>(y) * w + x) * 3 + c];
+                    // Interior and mirrored edges: (l + 2c + r + 2) >> 2 of +-amp is the base.
+                    if (v != base[c])
+                        std::printf("[hnyquist] w=%d x=%d y=%d c=%d out=%u want=%d\n", w, x, y, c, v, base[c]);
+                    ASSERT_EQ(base[c], static_cast<int>(v));
+                }
+    }
+
+    // Step edge 4000 -> 8000 between x=3 and x=4 in channel G only, one row.
+    const int w = 8;
+    std::vector<uint16_t> step = rgb16Field(w, 1, 5000, 4000, 7000);
+    for (int x = 4; x < w; ++x) step[static_cast<size_t>(x) * 3 + 1] = 8000;
+    std::vector<uint16_t> out(step.size(), 0u);
+    debayer_reduced_hnyquist121_rgb16(out.data(), step.data(), w, 1);
+    const int wantG[8] = { 4000, 4000, 4000, 5000, 7000, 8000, 8000, 8000 };
+    for (int x = 0; x < w; ++x)
+    {
+        ASSERT_EQ(wantG[x], static_cast<int>(out[static_cast<size_t>(x) * 3 + 1]));
+        ASSERT_EQ(5000, static_cast<int>(out[static_cast<size_t>(x) * 3 + 0]));
+        ASSERT_EQ(7000, static_cast<int>(out[static_cast<size_t>(x) * 3 + 2]));
+    }
+    // Edge mirroring is exact: x=0 takes (in[1] + 2 in[0] + in[1] + 2) >> 2.
+    std::vector<uint16_t> edge = rgb16Field(4, 1, 0, 0, 0);
+    edge[0 * 3 + 0] = 4000; // R at x=0
+    edge[1 * 3 + 0] = 8000; // R at x=1
+    debayer_reduced_hnyquist121_rgb16(out.data(), edge.data(), 4, 1);
+    ASSERT_EQ(6000, static_cast<int>(out[0]));            // (8000 + 8000 + 8000 + 2) >> 2
+    ASSERT_EQ(5000, static_cast<int>(out[1 * 3 + 0]));    // (4000 + 16000 + 0 + 2) >> 2
+    ASSERT_EQ(2000, static_cast<int>(out[2 * 3 + 0]));    // (8000 + 0 + 0 + 2) >> 2
+    ASSERT_EQ(0, static_cast<int>(out[3 * 3 + 0]));       // (0 + 0 + 0 + 2) >> 2, mirrored
+}
+
+// T8 (r3): rows and channels are independent: a signal on one row or one channel
+// leaves every other row and channel untouched.
+// Mutations: vertical instead of horizontal, channel crosstalk.
+TEST(GpuDualIsoPreviewScale, HNyquistRowsAndChannelsIndependent)
+{
+    const int w = 10, h = 6;
+    std::vector<uint16_t> src = rgb16Field(w, h, 10000, 20000, 30000);
+    for (int x = 0; x < w; ++x)
+        src[(static_cast<size_t>(3) * w + x) * 3 + 2] = static_cast<uint16_t>((x % 2) ? 40000 : 32000);
+    src[(static_cast<size_t>(1) * w + 5) * 3 + 0] = 18000; // one R impulse on row 1
+    std::vector<uint16_t> out(src.size(), 0u);
+    debayer_reduced_hnyquist121_rgb16(out.data(), src.data(), w, h);
+    for (int y = 0; y < h; ++y)
+        for (int x = 0; x < w; ++x)
+        {
+            const size_t i = (static_cast<size_t>(y) * w + x) * 3;
+            int wantR = 10000, wantB = 30000;
+            if (y == 1 && x == 5) wantR = 14000;                  // (10000 + 36000 + 10000 + 2) >> 2
+            else if (y == 1 && (x == 4 || x == 6)) wantR = 12000; // (10000 + 20000 + 18000 + 2) >> 2
+            if (y == 3) wantB = 36000;                            // alternation nulled to its mean
+            ASSERT_EQ(wantR, static_cast<int>(out[i + 0]));
+            ASSERT_EQ(20000, static_cast<int>(out[i + 1]));
+            ASSERT_EQ(wantB, static_cast<int>(out[i + 2]));
+        }
+}
+
+// T9 (r3): a synthetic reduced Bayer16 band, 16 rows thick, whose texture aliases to the
+// reduced grid's column Nyquist (bright and dark columns alternating inside the band, the
+// shrink's uneven column sampling of a bright line), with a vertical edge for horizontal
+// detail. Debayered by T3's debayerBasicU16 and by the CPU AMaZE, the band combs at the
+// 2-column period; with the H-filter it meets L8 against the same band without the
+// alias, and keeps L9. The comb without the filter is asserted too, so the band is a
+// real RED case for the filter.
+TEST(GpuDualIsoPreviewScale, ReducedBandCombMatchesReference)
+{
+    const int w = 96, h = 48;
+    auto band = [&](int alias) {
+        std::vector<uint16_t> bayer(static_cast<size_t>(w) * h);
+        for (int y = 0; y < h; ++y)
+            for (int x = 0; x < w; ++x)
+            {
+                const bool inBand = y >= 16 && y < 32;
+                int v = 9000;
+                if (inBand)
+                {
+                    v = (x < w / 2) ? 30000 : 22000; // a vertical edge inside the band
+                    v += (x % 2 == 0) ? alias : -alias;
+                }
+                bayer[static_cast<size_t>(y) * w + x] = static_cast<uint16_t>(v);
+            }
+        return bayer;
+    };
+    const std::vector<uint16_t> aliased = band(9000);
+    const std::vector<uint16_t> clean = band(0);
+    auto debayer = [&](const std::vector<uint16_t> & bayer, bool amaze) {
+        std::vector<uint16_t> rgb(static_cast<size_t>(w) * h * 3, 0u);
+        if (amaze)
+        {
+            std::vector<float> f(bayer.begin(), bayer.end());
+            ASSERT_EQ(1, debayerAmaze(rgb.data(), f.data(), w, h, 1, 0));
+        }
+        else
+        {
+            std::vector<uint16_t> work(bayer);
+            debayerBasicU16(rgb.data(), work.data(), w, h, 1, 0);
+        }
+        return rgb;
+    };
+    auto rows = [&](const std::vector<uint8_t> & rgb8) {
+        // The band interior, away from the debayer's band edges.
+        return std::vector<uint8_t>(rgb8.begin() + static_cast<size_t>(19) * w * 3,
+                                    rgb8.begin() + static_cast<size_t>(29) * w * 3);
+    };
+    for (const bool amaze : { false, true })
+    {
+        const std::vector<uint16_t> refRgb = debayer(clean, amaze);
+        const std::vector<uint16_t> combRgb = debayer(aliased, amaze);
+        std::vector<uint16_t> filtered(combRgb.size(), 0u);
+        debayer_reduced_hnyquist121_rgb16(filtered.data(), combRgb.data(), w, h);
+        const std::vector<uint8_t> ref = rows(rgb16To8(refRgb));
+        const std::vector<uint8_t> comb = rows(rgb16To8(combRgb));
+        const std::vector<uint8_t> out = rows(rgb16To8(filtered));
+        const int bh = 10;
+        const double l8Ref = colNyqEnergy(ref, w, bh);
+        const double l8Comb = colNyqEnergy(comb, w, bh);
+        const double l8 = colNyqEnergy(out, w, bh);
+        const double l9Ref = lag2HorizontalLumaDetail(ref, w, bh);
+        const double l9 = lag2HorizontalLumaDetail(out, w, bh);
+        std::printf("[gpu-dualiso-preview-scale] T9 %s: L8 comb %.5f filtered %.5f (ref %.5f, bound %.5f) "
+                    "L9 %.4f (ref %.4f, ratio %.4f)\n",
+                    amaze ? "CPU AMaZE" : "debayerBasicU16", l8Comb, l8, l8Ref, 2.0 * l8Ref + 0.002,
+                    l9, l9Ref, l9Ref > 0.0 ? l9 / l9Ref : 0.0);
+        ASSERT_TRUE(l8Comb > 2.0 * l8Ref + 0.002); // the band combs without the filter
+        ASSERT_TRUE(l8 <= 2.0 * l8Ref + 0.002);
+        ASSERT_TRUE(l9 >= 0.80 * l9Ref);
+    }
+}
+
+// c1 (opt-in, UM): MLVAPP_C1_HNYQUIST_DIR holds <case>/flag0.rgb16, flag1.rgb16 and
+// dims.txt ("w h") per case, dumped by amaze_dll_test --reduced-hnyquist --dump-dir
+// from the production AMaZE DLL. flag1 must equal debayer_reduced_hnyquist121_rgb16
+// (flag0) at 0 LSB: the CUDA kernel against the real C reference.
+TEST(GpuDualIsoPreviewScale, C1HnyquistDllParity)
+{
+    const char * dir = std::getenv("MLVAPP_C1_HNYQUIST_DIR");
+    if (!dir || !*dir)
+    {
+        std::printf("[gpu-dualiso-preview-scale] c1 H-Nyquist skipped (MLVAPP_C1_HNYQUIST_DIR unset)\n");
+        return;
+    }
+    const QDir root(QString::fromLocal8Bit(dir));
+    const QStringList cases = root.entryList(QDir::Dirs | QDir::NoDotAndDotDot, QDir::Name);
+    ASSERT_FALSE(cases.isEmpty());
+    for (const QString & c : cases)
+    {
+        const std::string base = root.filePath(c).toStdString();
+        int w = 0, h = 0;
+        FILE * dims = std::fopen((base + "/dims.txt").c_str(), "r");
+        ASSERT_TRUE(dims != nullptr);
+        ASSERT_EQ(2, std::fscanf(dims, "%d %d", &w, &h));
+        std::fclose(dims);
+        const size_t words = static_cast<size_t>(w) * h * 3;
+        std::vector<uint16_t> flag0(words), flag1(words), want(words);
+        for (const auto & f : { std::make_pair(std::string("/flag0.rgb16"), &flag0),
+                                std::make_pair(std::string("/flag1.rgb16"), &flag1) })
+        {
+            FILE * in = std::fopen((base + f.first).c_str(), "rb");
+            ASSERT_TRUE(in != nullptr);
+            ASSERT_EQ(words, std::fread(f.second->data(), sizeof(uint16_t), words, in));
+            std::fclose(in);
+        }
+        debayer_reduced_hnyquist121_rgb16(want.data(), flag0.data(), w, h);
+        size_t mismatches = 0;
+        for (size_t i = 0; i < words; ++i) mismatches += want[i] != flag1[i];
+        std::printf("[gpu-dualiso-preview-scale] c1 H-Nyquist %s %dx%d mismatches %zu / %zu\n",
+                    c.toUtf8().constData(), w, h, mismatches, words);
+        ASSERT_EQ(static_cast<size_t>(0), mismatches);
+    }
 }
 // T4: the C seam sets the notch for reduced runs only. A reduced run sees 1; a
 // full-res texture-route run (the x1 route), the CPU16 probe, the device and GL
