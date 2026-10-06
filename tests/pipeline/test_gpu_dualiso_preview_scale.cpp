@@ -382,14 +382,17 @@ TEST(GpuDualIsoPreviewScale, ReducedTextureRouteReconstructsTheReducedBayer)
     ASSERT_EQ(settled.blackDelta, after.blackDelta);
 }
 
-// The 4-row ISO residual. Dual-ISO reconstruction leaves a small level residual
-// with the ISO row period (4 rows) at ANY size; the first x4 venue legs showed it
-// magnified (4 texture rows of a 452x564 frame are ~11 display pixels, against
-// ~3 for the full-resolution frame, whose own residual measures the same). This
-// pins that the reduced recon adds none: its period-4 row energy is within 2x of
-// the full recon's at the full recon's own period. The reduced recon here is the
-// CPU one (the shrink is the GPU route's; CUDA matches the CPU recon bit for bit).
-namespace {
+// The 4-row ISO residual. Dual-ISO reconstruction leaves a level residual with the
+// ISO row period (4 rows) at ANY size. This pins only that the reduced recon adds
+// none beyond the full recon's own (period-4 row energy within 2x of the full
+// recon's at the full recon's period). It does NOT pin what the viewer sees: the
+// full-resolution route box-downsamples its recon by the preview scale, which
+// averages that residual away (0.0003 on this fixture), while the reduced route
+// presents its residual magnified (0.19). That is the visible ISO-period mesh on
+// the x2/x4 CUDA venue contact frames, and an open blocker of
+// PLAYBACK-CUDA-HONOUR-SCALE-1 (next lever: an ISO-period notch on the reduced
+// recon before display). The reduced recon here is the CPU one (CUDA matches it
+// bit for bit).namespace {
 double rowPeriod4Energy(const std::vector<uint8_t> & rgb, int w, int h)
 {
     std::vector<double> rows(static_cast<size_t>(h), 0.0);
