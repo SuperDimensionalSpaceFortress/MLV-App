@@ -1318,13 +1318,16 @@ static double lookAssistClippedPercent( const LookAssistRenderedPicture &picture
     return 100.0 * (double)clipped / (double)pixels;
 }
 
-// The APPLYING room-anchored balance at the display's levels (LOOK-ASSIST-M16-CAST-2). The move is bounded to the segment
-// from the applied balance to the clip's own solve (an independent estimate: a lavender-painted room under daylight has
-// its solve on the window, so the segment collapses and nothing moves). Along it (mired and tint linear in s), the room's
-// median B-R and G are taken as linear between the two renders they were measured in, and s is where their sum is
-// least; it is then held so the window patch stays inside the amber cap. The found balance is rendered and every guard
-// is checked on that render; a region, highlight or clipping refusal steps s halfway back (at most twice). Anything else
-// keeps the applied balance, and displayDecision says why.
+// The APPLYING room-anchored balance at the display's levels (LOOK-ASSIST-M16-CAST-2). The move is bounded by the clip's
+// own solve, an independent estimate: each axis stays between its value at the applied balance and at the solve (a
+// lavender-painted room under daylight has its solve on the window, so the bound collapses and nothing moves). The design
+// review asked for the segment between the two; on M16-1243 the room's neutral is off that segment (the solve's tint,
+// -33, overshoots the room's: room cast 16 at 6686 / 0, 8.5 at the solve, 9.0 halfway; venue r1b), so each axis is
+// bounded on its own. Inside the bound the room's median B-R and G (and the window's B-R) are taken as linear in the two
+// axis steps, fitted on three renders, and the balance is where the room is least cast without making either axis worse
+// and inside the amber cap. The found balance is rendered and every guard is checked on that render; a region, highlight
+// or clipping refusal steps halfway back toward the applied balance (at most twice). Anything else keeps the applied
+// balance, and displayDecision says why.
 static void lookAssistRoomAnchoredBalance( const LookAssistRenderBalanceFn &renderDisplay, double exposureStops,
                                            const LookAssistRenderedPicture &shown, const LookAssistRenderedPicture &atSolve,
                                            const LookAssistSurfaceProbe &applied, const LookAssistSurfaceProbe &solve,
@@ -1333,7 +1336,7 @@ static void lookAssistRoomAnchoredBalance( const LookAssistRenderBalanceFn &rend
 {
     if( applied.temperature == solve.temperature && applied.tint == solve.tint )
     {
-        check->displayDecision = QStringLiteral("no-segment");
+        check->displayDecision = QStringLiteral("no-bound");
         return;
     }
     const int kCells = kLookAssistRoomGrid * kLookAssistRoomGrid;
@@ -1375,51 +1378,80 @@ static void lookAssistRoomAnchoredBalance( const LookAssistRenderBalanceFn &rend
     const LookAssistRoomCast atSolution = lookAssistRoomCastIn( atSolve, room, -1 );
     check->displayRoomCastBefore = atApplied.cast;
     check->displayRoomCastSolve = atSolution.cast;
+    check->displayRoomAppliedBlueAmber = atApplied.blueAmber;
+    check->displayRoomAppliedGreen = atApplied.green;
+    check->displayRoomSolveBlueAmber = atSolution.blueAmber;
+    check->displayRoomSolveGreen = atSolution.green;
 
+    // The bound: each axis between its value at the applied balance and at the solve (the temperature in mired). sT and st
+    // are the steps along the two axes (0 = applied, 1 = solve).
     const double miredApplied = lookAssistMired( applied.temperature );
     const double miredSolve = lookAssistMired( solve.temperature );
-    auto blueAmberAt = [&]( double s ) { return atApplied.blueAmber + s * ( atSolution.blueAmber - atApplied.blueAmber ); };
-    auto greenAt = [&]( double s ) { return atApplied.green + s * ( atSolution.green - atApplied.green ); };
-    auto balanceAt = [&]( double s, int *k, int *t ) {
-        *k = qBound( window.minTemperature, lookAssistKelvinFromMired( miredApplied + s * ( miredSolve - miredApplied ) ),
+    auto balanceAt = [&]( double sT, double st, int *k, int *t ) {
+        *k = qBound( window.minTemperature, lookAssistKelvinFromMired( miredApplied + sT * ( miredSolve - miredApplied ) ),
                      window.maxTemperature );
-        *t = qBound( window.minTint, applied.tint + qRound( s * ( solve.tint - applied.tint ) ), window.maxTint ); };
-    // Measure-only: the room at the segment's midpoint (the evidence lane's ~8200 / -18 question on the clip itself).
+        *t = qBound( window.minTint, applied.tint + qRound( st * ( solve.tint - applied.tint ) ), window.maxTint ); };
+    // Measure-only: the room halfway on both axes (the evidence lane's ~8200 / -18 question on the clip itself).
     {
         int k = 0, t = 0;
-        balanceAt( 0.5, &k, &t );
+        balanceAt( 0.5, 0.5, &k, &t );
         LookAssistRenderedPicture mid;
         if( renderDisplay( exposureStops, k, t, &mid ) && lookAssistSamePictureGeometry( shown, mid ) )
             check->displayRoomCastMid = lookAssistRoomCastIn( mid, room, -1 ).cast;
     }
-
-    // Where along the segment the room is least cast (each axis linear in s): the end, or where an axis crosses zero.
-    double step = 0.0;
-    double least = atApplied.cast;
-    auto consider = [&]( double s ) {
-        if( !( s > 0.0 && s <= 1.0 ) ) return;
-        const double predicted = fabs( blueAmberAt( s ) ) + fabs( greenAt( s ) );
-        if( predicted < least ) { least = predicted; step = s; } };
-    consider( 1.0 );
-    if( atSolution.blueAmber != atApplied.blueAmber ) consider( atApplied.blueAmber / ( atApplied.blueAmber - atSolution.blueAmber ) );
-    if( atSolution.green != atApplied.green ) consider( atApplied.green / ( atApplied.green - atSolution.green ) );
-    // The room's neutral is not on the segment when the least-cast point trades one axis for the other.
-    if( fabs( blueAmberAt( step ) ) > fabs( atApplied.blueAmber ) + kLookAssistRoomCastSlack
-     || fabs( greenAt( step ) ) > fabs( atApplied.green ) + kLookAssistRoomCastSlack )
+    // The corner (the solve's temperature at the applied tint) separates the two axes: the room's B-R and G and the window's
+    // B-R are taken as linear in sT and st through the applied balance, the corner and the solve.
+    LookAssistRoomCast atCorner = applied.temperature == solve.temperature ? atApplied : atSolution;
+    double windowCorner = applied.temperature == solve.temperature ? applied.surface.blueAmberAxis : solve.surface.blueAmberAxis;
+    if( applied.temperature != solve.temperature && applied.tint != solve.tint )
     {
-        check->displayDecision = QStringLiteral("off-segment");
-        return;
+        LookAssistRenderedPicture corner;
+        if( !renderDisplay( exposureStops, solve.temperature, applied.tint, &corner ) || !lookAssistSamePictureGeometry( shown, corner ) )
+        {
+            check->displayDecision = QStringLiteral("unverifiable");
+            return;
+        }
+        atCorner = lookAssistRoomCastIn( corner, room, -1 );
+        windowCorner = lookAssistSurfaceAt( corner, x, y ).blueAmberAxis;
     }
-    // The highlight cap: the window (the patch) may warm only to kLookAssistRoomWindowAmberCap at the display's levels.
     const double windowApplied = applied.surface.blueAmberAxis;
     const double windowSolve = solve.surface.blueAmberAxis;
-    if( windowSolve < windowApplied && windowApplied + step * ( windowSolve - windowApplied ) < kLookAssistRoomWindowAmberCap )
-        step = qMax( 0.0, ( windowApplied - kLookAssistRoomWindowAmberCap ) / ( windowApplied - windowSolve ) );
-    auto moves = [&]( double s ) {
-        return fabs( s * ( miredSolve - miredApplied ) ) >= 1.0 || fabs( s * ( solve.tint - applied.tint ) ) >= 1.0; };
-    if( !moves( step ) || least > atApplied.cast - kLookAssistRoomCastSlack )
+    auto predicted = [&]( double at, double corner, double end, double sT, double st ) {
+        return at + sT * ( corner - at ) + st * ( end - corner ); };
+
+    // Where in the bound the room is least cast, on a 21 x 21 grid of the model, among the balances that make neither
+    // axis worse than the slack (a move that trades one axis for the other is not the room's neutral) and keep the window
+    // (the patch) inside the amber cap at the display's levels, unless they do not warm it.
+    double stepT = 0.0;
+    double stepTint = 0.0;
+    double least = atApplied.cast;
+    bool traded = false;
+    for( int i = 0; i <= 20; ++i )
+        for( int j = 0; j <= 20; ++j )
+        {
+            const double sT = i / 20.0;
+            const double st = j / 20.0;
+            const double blueAmber = predicted( atApplied.blueAmber, atCorner.blueAmber, atSolution.blueAmber, sT, st );
+            const double green = predicted( atApplied.green, atCorner.green, atSolution.green, sT, st );
+            const double windowBlueAmber = predicted( windowApplied, windowCorner, windowSolve, sT, st );
+            const double cast = fabs( blueAmber ) + fabs( green );
+            if( cast >= least ) continue;
+            if( windowBlueAmber < kLookAssistRoomWindowAmberCap && windowBlueAmber < windowApplied ) continue;
+            if( fabs( blueAmber ) > fabs( atApplied.blueAmber ) + kLookAssistRoomCastSlack
+             || fabs( green ) > fabs( atApplied.green ) + kLookAssistRoomCastSlack )
+            {
+                traded = traded || cast <= atApplied.cast - kLookAssistRoomCastSlack;
+                continue;
+            }
+            least = cast;
+            stepT = sT;
+            stepTint = st;
+        }
+    auto moves = [&]( double sT, double st ) {
+        return fabs( sT * ( miredSolve - miredApplied ) ) >= 1.0 || fabs( st * ( solve.tint - applied.tint ) ) >= 1.0; };
+    if( !moves( stepT, stepTint ) || least > atApplied.cast - kLookAssistRoomCastSlack )
     {
-        check->displayDecision = QStringLiteral("room-not-improved");
+        check->displayDecision = traded ? QStringLiteral("off-bound") : QStringLiteral("room-not-improved");
         return;
     }
 
@@ -1431,7 +1463,7 @@ static void lookAssistRoomAnchoredBalance( const LookAssistRenderBalanceFn &rend
     for( int renders = 0; renders < kLookAssistRoomMaxRenders; ++renders )
     {
         int k = 0, t = 0;
-        balanceAt( step, &k, &t );
+        balanceAt( stepT, stepTint, &k, &t );
         LookAssistRenderedPicture found;
         if( !renderDisplay( exposureStops, k, t, &found ) || !lookAssistSamePictureGeometry( shown, found ) )
         {
@@ -1439,8 +1471,11 @@ static void lookAssistRoomAnchoredBalance( const LookAssistRenderBalanceFn &rend
             return;
         }
         const LookAssistRoomCast atFound = lookAssistRoomCastIn( found, room, -1 );
-        check->displayRoomStep = step;
+        check->displayRoomStep = stepT;
+        check->displayRoomTintStep = stepTint;
         check->displayRoomCastAfter = atFound.cast;
+        check->displayRoomFoundBlueAmber = atFound.blueAmber;
+        check->displayRoomFoundGreen = atFound.green;
         // The light at the found balance: the warmer of the patch and the median of everything as bright as it.
         check->displayWindowFoundBlueAmber = qMin( lookAssistSurfaceAt( found, x, y ).blueAmberAxis,
                                                    lookAssistRoomCastIn( found, room, -1, kLookAssistRoomHighlight ).blueAmber );
@@ -1453,7 +1488,7 @@ static void lookAssistRoomAnchoredBalance( const LookAssistRenderBalanceFn &rend
         if( fabs( atFound.blueAmber ) > fabs( atApplied.blueAmber ) + kLookAssistRoomCastSlack
          || fabs( atFound.green ) > fabs( atApplied.green ) + kLookAssistRoomCastSlack )
         {
-            check->displayDecision = QStringLiteral("off-segment");
+            check->displayDecision = QStringLiteral("off-bound");
             return;
         }
         check->displayRoomWorstCell = 0.0;
@@ -1477,8 +1512,9 @@ static void lookAssistRoomAnchoredBalance( const LookAssistRenderBalanceFn &rend
             *tint = t;
             return;
         }
-        step *= 0.5;
-        if( !moves( step ) ) return;
+        stepT *= 0.5;
+        stepTint *= 0.5;
+        if( !moves( stepT, stepTint ) ) return;
     }
 }
 

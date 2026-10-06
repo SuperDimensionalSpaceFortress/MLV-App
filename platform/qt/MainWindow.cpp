@@ -16697,7 +16697,7 @@ void MainWindow::applyLookAssistToReceipt( ReceiptSettings *receipt,
                            "display_room_samples=%33 display_room_cast=%34/%35 display_room_cells=%36 "
                            "display_room_cast_solve=%37 display_room_cast_mid=%38 display_room_step=%39 "
                            "display_room_worst_cell=%40 display_window_found_blue_amber=%41 display_clipped=%42/%43 "
-                           "display_room_balance=%44/%45")
+                           "display_room_balance=%44/%45 display_room_tint_step=%46 display_room_axes=%47/%48>%49/%50>%51/%52")
                 .arg( bool01( windowLit.evidence ) )
                 .arg( windowLit.reason )
                 .arg( lookAssistSceneName( scene ) )
@@ -16743,7 +16743,14 @@ void MainWindow::applyLookAssistToReceipt( ReceiptSettings *receipt,
                 .arg( windowLit.displayClippedBefore, 0, 'f', 2 )
                 .arg( windowLit.displayClippedAfter, 0, 'f', 2 )
                 .arg( windowLit.displayRoomTemperature )
-                .arg( windowLit.displayRoomTint ) );
+                .arg( windowLit.displayRoomTint )
+                .arg( windowLit.displayRoomTintStep, 0, 'f', 2 )
+                .arg( windowLit.displayRoomAppliedBlueAmber, 0, 'f', 1 )
+                .arg( windowLit.displayRoomAppliedGreen, 0, 'f', 1 )
+                .arg( windowLit.displayRoomSolveBlueAmber, 0, 'f', 1 )
+                .arg( windowLit.displayRoomSolveGreen, 0, 'f', 1 )
+                .arg( windowLit.displayRoomFoundBlueAmber, 0, 'f', 1 )
+                .arg( windowLit.displayRoomFoundGreen, 0, 'f', 1 ) );
     }
     const bool autoWhiteBalanceValid = wb.autoValid;
     const QString autoWhiteBalanceSource = wb.source;

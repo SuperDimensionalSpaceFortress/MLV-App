@@ -1103,7 +1103,8 @@ bool ReceiptApplier::applyHeadlessLookAssist(ReceiptSettings *receipt,
             "displaySearchBalance=%27/%28 displayDecision=%29 displayBaseBlueAmber=%30 displayBaseGreen=%31 "
             "displayRoomSamples=%32 displayRoomCast=%33/%34 displayRoomCells=%35 displayRoomCastSolve=%36 "
             "displayRoomCastMid=%37 displayRoomStep=%38 displayRoomWorstCell=%39 displayWindowFoundBlueAmber=%40 "
-            "displayClipped=%41/%42 displayRoomBalance=%43/%44\n" )
+            "displayClipped=%41/%42 displayRoomBalance=%43/%44 displayRoomTintStep=%45 "
+            "displayRoomAxes=%46/%47>%48/%49>%50/%51\n" )
             .arg( frameIndex )
             .arg( windowLit.evidence ? QStringLiteral("true") : QStringLiteral("false") )
             .arg( windowLit.reason )
@@ -1147,7 +1148,14 @@ bool ReceiptApplier::applyHeadlessLookAssist(ReceiptSettings *receipt,
             .arg( windowLit.displayClippedBefore, 0, 'f', 2 )
             .arg( windowLit.displayClippedAfter, 0, 'f', 2 )
             .arg( windowLit.displayRoomTemperature )
-            .arg( windowLit.displayRoomTint ) );
+            .arg( windowLit.displayRoomTint )
+            .arg( windowLit.displayRoomTintStep, 0, 'f', 2 )
+            .arg( windowLit.displayRoomAppliedBlueAmber, 0, 'f', 1 )
+            .arg( windowLit.displayRoomAppliedGreen, 0, 'f', 1 )
+            .arg( windowLit.displayRoomSolveBlueAmber, 0, 'f', 1 )
+            .arg( windowLit.displayRoomSolveGreen, 0, 'f', 1 )
+            .arg( windowLit.displayRoomFoundBlueAmber, 0, 'f', 1 )
+            .arg( windowLit.displayRoomFoundGreen, 0, 'f', 1 ) );
     }
     const bool autoWhiteBalanceValid = wb.autoValid;
     const QString autoWhiteBalanceSource = wb.source;
