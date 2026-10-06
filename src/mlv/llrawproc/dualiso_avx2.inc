@@ -144,30 +144,42 @@ static void overexposed_blur_row_avx2(uint16_t * overexposed,
  * Branch is row-uniform (BRIGHT_ROW depends on y only), so we hoist it
  * outside the inner loop. SIMD only useful on bright rows; dark rows are
  * a memcpy.
+ * LOOK-ASSIST-M16-CAST-5: the test against white_darkened reads `test`
+ * (bright itself, or the A12 quad max); a non-NULL `decision` receives the
+ * per-pixel outcome (1 = took max(bright, dark)).
  * ====================================================================== */
 __attribute__((target("avx2,fma")))
 static void fullres_reconstruction_bright_row_avx2(uint32_t * fullres,
                                                     const uint32_t * bright,
+                                                    const uint32_t * test,
                                                     const uint32_t * dark,
                                                     uint32_t white_darkened,
-                                                    int w)
+                                                    int w,
+                                                    unsigned char * decision)
 {
     const __m256i v_white = _mm256_set1_epi32((int32_t)white_darkened);
     int x = 0;
     for (; x + 8 <= w; x += 8) {
         __m256i b = _mm256_loadu_si256((const __m256i*)(bright + x));
+        __m256i t = _mm256_loadu_si256((const __m256i*)(test + x));
         __m256i d = _mm256_loadu_si256((const __m256i*)(dark + x));
-        /* mask = b < white_darkened (signed compare safe: values < 1<<20) */
-        __m256i ge = _mm256_cmpgt_epi32(v_white, b);  /* white > b -> b < white */
-        /* if (b < white): out = b, else out = max(b, d) */
+        /* mask = t < white_darkened (signed compare safe: values < 1<<20) */
+        __m256i ge = _mm256_cmpgt_epi32(v_white, t);  /* white > t -> t < white */
+        /* if (t < white): out = b, else out = max(b, d) */
         __m256i mx = _mm256_max_epu32(b, d);
         __m256i out = _mm256_blendv_epi8(mx, b, ge);
         _mm256_storeu_si256((__m256i*)(fullres + x), out);
+        if (decision) {
+            const int keep = _mm256_movemask_ps(_mm256_castsi256_ps(ge));
+            for (int k = 0; k < 8; k++) decision[x + k] = ((keep >> k) & 1) ? 0 : 1;
+        }
     }
     for (; x < w; x++) {
         uint32_t f = bright[x];
         uint32_t dd = dark[x];
-        fullres[x] = (f < white_darkened) ? f : (f > dd ? f : dd);
+        const int over = !(test[x] < white_darkened);
+        fullres[x] = !over ? f : (f > dd ? f : dd);
+        if (decision) decision[x] = (unsigned char)over;
     }
 }
 

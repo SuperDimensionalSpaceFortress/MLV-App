@@ -66,6 +66,491 @@ static DUALISO_THREAD_LOCAL unsigned long long g_dualiso_hq_mean23_count = 0;
 static DUALISO_THREAD_LOCAL unsigned long long g_dualiso_alias_map_taken_count = 0;
 static DUALISO_THREAD_LOCAL unsigned long long g_dualiso_fullres_blend_taken_count = 0;
 DUALISO_THREAD_LOCAL dualiso_full20bit_timing_t g_dualiso_full20bit_timing = {0};
+static DUALISO_THREAD_LOCAL dualiso_match_probe_t g_dualiso_match_probe = {0};
+static DUALISO_THREAD_LOCAL int g_dualiso_match_probe_stop_after_match = 0;
+
+void dualiso_match_probe_reset(int stop_after_match)
+{
+    memset(&g_dualiso_match_probe, 0, sizeof(g_dualiso_match_probe));
+    g_dualiso_match_probe_stop_after_match = stop_after_match ? 1 : 0;
+}
+
+int dualiso_match_probe_get(dualiso_match_probe_t * probe)
+{
+    if (probe) *probe = g_dualiso_match_probe;
+    return g_dualiso_match_probe.valid;
+}
+
+/* LOOK-ASSIST-M16-CAST-4 (measure-only, see dualiso.h). */
+static DUALISO_THREAD_LOCAL dualiso_analysis_override_t g_dualiso_analysis_override = {0};
+static DUALISO_THREAD_LOCAL dualiso_levels_probe_t g_dualiso_levels_probe = {0};
+static DUALISO_THREAD_LOCAL int g_dualiso_levels_probe_stop = 0;
+/* LOOK-ASSIST-M16-CAST-5: A12's per-site test planes and the per-site switch capture (dualiso.h). */
+static DUALISO_THREAD_LOCAL uint32_t * g_dualiso_quad_test[DUALISO_SWITCH_SITES] = { NULL, NULL, NULL };
+static DUALISO_THREAD_LOCAL size_t g_dualiso_quad_test_pixels[DUALISO_SWITCH_SITES] = { 0, 0, 0 };
+static DUALISO_THREAD_LOCAL unsigned char * g_dualiso_switch_capture[DUALISO_SWITCH_SITES] = { NULL, NULL, NULL };
+static DUALISO_THREAD_LOCAL int g_dualiso_switch_capture_valid[DUALISO_SWITCH_SITES] = { 0, 0, 0 };
+static DUALISO_THREAD_LOCAL int g_dualiso_switch_capture_w = 0;
+static DUALISO_THREAD_LOCAL int g_dualiso_switch_capture_h = 0;
+
+void dualiso_set_analysis_override(const dualiso_analysis_override_t * override_values)
+{
+    if (override_values) g_dualiso_analysis_override = *override_values;
+    else
+    {
+        memset(&g_dualiso_analysis_override, 0, sizeof(g_dualiso_analysis_override));
+        for (int site = 0; site < DUALISO_SWITCH_SITES; site++)
+        {
+            free(g_dualiso_quad_test[site]);
+            g_dualiso_quad_test[site] = NULL;
+            g_dualiso_quad_test_pixels[site] = 0;
+        }
+    }
+}
+
+const unsigned char * dualiso_switch_capture_map(int site, int * width, int * height)
+{
+    if (site < 0 || site >= DUALISO_SWITCH_SITES || !g_dualiso_switch_capture_valid[site]) return NULL;
+    if (width) *width = g_dualiso_switch_capture_w;
+    if (height) *height = g_dualiso_switch_capture_h;
+    return g_dualiso_switch_capture[site];
+}
+
+void dualiso_switch_capture_clear(void)
+{
+    for (int site = 0; site < DUALISO_SWITCH_SITES; site++)
+    {
+        free(g_dualiso_switch_capture[site]);
+        g_dualiso_switch_capture[site] = NULL;
+        g_dualiso_switch_capture_valid[site] = 0;
+    }
+    g_dualiso_switch_capture_w = 0;
+    g_dualiso_switch_capture_h = 0;
+}
+
+/* The plane a switch site tests against white_darkened: bright itself, or with A12 the max of bright over each 2x2 CFA
+ * quad (max >= t is the OR of the four >= t tests). Called on the recon's own thread, outside its parallel loops. */
+static const uint32_t * dualiso_switch_test_plane(int site, const uint32_t * bright, int w, int h)
+{
+    if (!g_dualiso_analysis_override.quad_coherent_switch || !bright || w <= 0 || h <= 0) return bright;
+    const size_t pixels = (size_t)w * (size_t)h;
+    if (g_dualiso_quad_test_pixels[site] < pixels)
+    {
+        free(g_dualiso_quad_test[site]);
+        g_dualiso_quad_test[site] = malloc(pixels * sizeof(uint32_t));
+        g_dualiso_quad_test_pixels[site] = g_dualiso_quad_test[site] ? pixels : 0;
+        if (!g_dualiso_quad_test[site]) return bright;
+    }
+    uint32_t * plane = g_dualiso_quad_test[site];
+    #pragma omp parallel for
+    for (int y0 = 0; y0 < h; y0 += 2)
+    {
+        const size_t r0 = (size_t)y0 * (size_t)w;
+        const size_t r1 = (size_t)MIN(y0 + 1, h - 1) * (size_t)w;
+        for (int x0 = 0; x0 < w; x0 += 2)
+        {
+            const int x1 = MIN(x0 + 1, w - 1);
+            const uint32_t m = MAX(MAX(bright[r0 + x0], bright[r0 + x1]), MAX(bright[r1 + x0], bright[r1 + x1]));
+            plane[r0 + x0] = m;
+            plane[r0 + x1] = m;
+            plane[r1 + x0] = m;
+            plane[r1 + x1] = m;
+        }
+    }
+    return plane;
+}
+
+/* The capture plane of one site for this recon (NULL unless capture_switch_maps); the site fills every pixel. */
+static unsigned char * dualiso_switch_capture_plane(int site, int w, int h)
+{
+    if (!g_dualiso_analysis_override.capture_switch_maps || w <= 0 || h <= 0) return NULL;
+    if (g_dualiso_switch_capture_w != w || g_dualiso_switch_capture_h != h)
+    {
+        dualiso_switch_capture_clear();
+        g_dualiso_switch_capture_w = w;
+        g_dualiso_switch_capture_h = h;
+    }
+    if (!g_dualiso_switch_capture[site])
+        g_dualiso_switch_capture[site] = malloc((size_t)w * (size_t)h);
+    g_dualiso_switch_capture_valid[site] = g_dualiso_switch_capture[site] != NULL;
+    return g_dualiso_switch_capture[site];
+}
+
+/* LOOK-ASSIST-M16-CAST-6: the recon's output capture (dualiso.h). */
+static DUALISO_THREAD_LOCAL uint16_t * g_dualiso_output_capture = NULL;
+static DUALISO_THREAD_LOCAL size_t g_dualiso_output_capture_pixels = 0;
+static DUALISO_THREAD_LOCAL int g_dualiso_output_capture_valid = 0;
+static DUALISO_THREAD_LOCAL int g_dualiso_output_capture_w = 0;
+static DUALISO_THREAD_LOCAL int g_dualiso_output_capture_h = 0;
+static DUALISO_THREAD_LOCAL int g_dualiso_output_capture_black = 0;
+
+const uint16_t * dualiso_output_capture(int * width, int * height, int * black16)
+{
+    if (!g_dualiso_output_capture_valid) return NULL;
+    if (width) *width = g_dualiso_output_capture_w;
+    if (height) *height = g_dualiso_output_capture_h;
+    if (black16) *black16 = g_dualiso_output_capture_black;
+    return g_dualiso_output_capture;
+}
+
+void dualiso_output_capture_clear(void)
+{
+    free(g_dualiso_output_capture);
+    g_dualiso_output_capture = NULL;
+    g_dualiso_output_capture_pixels = 0;
+    g_dualiso_output_capture_valid = 0;
+    g_dualiso_output_capture_w = 0;
+    g_dualiso_output_capture_h = 0;
+    g_dualiso_output_capture_black = 0;
+}
+
+static void dualiso_output_capture_store(const uint16_t * image_data, int w, int h, int black16)
+{
+    const size_t pixels = (size_t)w * (size_t)h;
+    if (!image_data || w <= 0 || h <= 0) return;
+    if (g_dualiso_output_capture_pixels < pixels)
+    {
+        free(g_dualiso_output_capture);
+        g_dualiso_output_capture = malloc(pixels * sizeof(uint16_t));
+        g_dualiso_output_capture_pixels = g_dualiso_output_capture ? pixels : 0;
+        if (!g_dualiso_output_capture) { g_dualiso_output_capture_valid = 0; return; }
+    }
+    memcpy(g_dualiso_output_capture, image_data, pixels * sizeof(uint16_t));
+    g_dualiso_output_capture_w = w;
+    g_dualiso_output_capture_h = h;
+    g_dualiso_output_capture_black = black16;
+    g_dualiso_output_capture_valid = 1;
+}
+
+static int dualiso_cmp_double(const void * a, const void * b)
+{
+    const double x = *(const double *)a, y = *(const double *)b;
+    return (x > y) - (x < y);
+}
+
+/* The median of v[0..n) (sorts v). */
+static double dualiso_median_inplace(double * v, long long n)
+{
+    if (n <= 0) return 0.0;
+    qsort(v, (size_t)n, sizeof(double), dualiso_cmp_double);
+    return (n & 1) ? v[n / 2] : 0.5 * (v[n / 2 - 1] + v[n / 2]);
+}
+
+typedef struct { double x, y; } dualiso_xy_t;
+
+static int dualiso_cmp_xy_x(const void * a, const void * b)
+{
+    const double x = ((const dualiso_xy_t *)a)->x, y = ((const dualiso_xy_t *)b)->x;
+    return (x > y) - (x < y);
+}
+
+/* LOOK-ASSIST-M16-CAST-6 P2r (dualiso.h). */
+void dualiso_robust_fieldratio(const double * bright, const double * dark, long long n, double band3_hi,
+                               dualiso_robust_fit_t * out)
+{
+    if (!out) return;
+    memset(out, 0, sizeof(*out));
+    if (!bright || !dark || n < 2) return;
+
+    /* Theil-Sen (split-sample) on every k-th sample, at most 20000. */
+    const long long k = (n + 19999) / 20000;
+    const long long m = (n + k - 1) / k;
+    dualiso_xy_t * s = malloc((size_t)m * sizeof(dualiso_xy_t));
+    double * tmp = malloc((size_t)MAX(m, 1) * sizeof(double));
+    if (!s || !tmp) { free(s); free(tmp); return; }
+    long long ms = 0;
+    for (long long i = 0; i < n; i += k) { s[ms].x = bright[i]; s[ms].y = dark[i]; ms++; }
+    qsort(s, (size_t)ms, sizeof(dualiso_xy_t), dualiso_cmp_xy_x);
+    long long np = 0;
+    const long long half = ms / 2;
+    for (long long i = 0; i < half; i++)
+    {
+        const double dx = s[i + half].x - s[i].x;
+        if (dx > 0.0) tmp[np++] = (s[i + half].y - s[i].y) / dx;
+    }
+    if (np > 0)
+    {
+        const double slope = dualiso_median_inplace(tmp, np);
+        if (slope > 0.0)
+        {
+            for (long long i = 0; i < ms; i++) tmp[i] = s[i].y - slope * s[i].x;
+            out->ts.n = ms;
+            out->ts.ev = log2(1.0 / slope);
+            out->ts.bd = dualiso_median_inplace(tmp, ms);
+        }
+    }
+    free(s);
+    free(tmp);
+
+    /* Binned medians per band. */
+    const double lo[3] = { 128.0, 1024.0, 4096.0 };
+    const double hi[3] = { 1024.0, 4096.0, band3_hi };
+    enum { BINS = 16 };
+    for (int band = 0; band < 3; band++)
+    {
+        if (!(hi[band] > lo[band])) continue;
+        const double width = (hi[band] - lo[band]) / BINS;
+        long long count[BINS] = {0};
+        long long in_band = 0;
+        for (long long i = 0; i < n; i++)
+        {
+            if (!(bright[i] >= lo[band] && bright[i] < hi[band])) continue;
+            const int b = MIN((int)((bright[i] - lo[band]) / width), BINS - 1);
+            count[b]++;
+            in_band++;
+        }
+        out->band[band].n = in_band;
+        if (in_band < 2) continue;
+        double * bx = malloc((size_t)in_band * sizeof(double));
+        double * by = malloc((size_t)in_band * sizeof(double));
+        long long start[BINS];
+        long long fill[BINS];
+        if (!bx || !by) { free(bx); free(by); continue; }
+        long long acc = 0;
+        for (int b = 0; b < BINS; b++) { start[b] = acc; fill[b] = 0; acc += count[b]; }
+        for (long long i = 0; i < n; i++)
+        {
+            if (!(bright[i] >= lo[band] && bright[i] < hi[band])) continue;
+            const int b = MIN((int)((bright[i] - lo[band]) / width), BINS - 1);
+            bx[start[b] + fill[b]] = bright[i];
+            by[start[b] + fill[b]] = dark[i];
+            fill[b]++;
+        }
+        double sx = 0, sy = 0, sxx = 0, sxy = 0;
+        int used = 0;
+        for (int b = 0; b < BINS; b++)
+        {
+            if (count[b] < 16) continue;
+            const double mx = dualiso_median_inplace(bx + start[b], count[b]);
+            const double my = dualiso_median_inplace(by + start[b], count[b]);
+            sx += mx; sy += my; sxx += mx * mx; sxy += mx * my; used++;
+        }
+        free(bx);
+        free(by);
+        const double den = used * sxx - sx * sx;
+        if (used < 2 || !(den > 0.0)) continue;
+        const double slope = (used * sxy - sx * sy) / den;
+        if (!(slope > 0.0)) continue;
+        out->band[band].ev = log2(1.0 / slope);
+        out->band[band].bd = (sy - slope * sx) / used;
+    }
+}
+
+/* LOOK-ASSIST-M16-CAST-6 Q0 (dualiso.h). */
+int dualiso_q0_estimate(const uint16_t * image, int width, int height, int x1, int y1, int x2, int y2,
+                        const int * is_bright, int black14, double bright_hi, const int * dark_p99, dualiso_q0_t * out)
+{
+    if (!out) return 0;
+    memset(out, 0, sizeof(*out));
+    if (!image || !is_bright || !dark_p99 || width <= 0 || height <= 0) return 0;
+    x1 = MAX(x1, 0); y1 = MAX(y1, 0); x2 = MIN(x2, width); y2 = MIN(y2, height);
+    const size_t cap = (size_t)MAX(0, x2 - x1) * (size_t)MAX(0, y2 - y1) / 4 + 1;
+    double * r[2][4];
+    int ok = 1;
+    for (int f = 0; f < 2; f++)
+        for (int g = 0; g < 4; g++)
+        {
+            r[f][g] = malloc(cap * sizeof(double));
+            if (!r[f][g]) ok = 0;
+        }
+    if (ok)
+    {
+        for (int y = MAX(y1, 1); y < y2; y++)
+        {
+            if (y & 1) continue; /* Gr rows are even */
+            const int field = is_bright[y % 4] ? 1 : 0;
+            int yb = y - 1; /* the other row of this hardware pair */
+            if ((is_bright[yb % 4] ? 1 : 0) != field) yb = y + 1;
+            if (yb < y1 || yb >= y2 || (is_bright[yb % 4] ? 1 : 0) != field) continue;
+            const double lo = black14 + (field ? 128.0 : 64.0);
+            for (int x = MAX(x1 | 1, 1); x < x2; x += 2)
+            {
+                const double gr = image[(size_t)x + (size_t)y * width];
+                const double gb = image[(size_t)(x - 1) + (size_t)yb * width];
+                const double hi_gr = field ? bright_hi : (double)dark_p99[1];
+                const double hi_gb = field ? bright_hi : (double)dark_p99[2];
+                if (!(gr > lo && gr < hi_gr && gb > lo && gb < hi_gb)) continue;
+                const int g = (x % 8) / 2;
+                const long long k = out->n8[field][g];
+                if ((size_t)k >= cap) continue;
+                r[field][g][k] = (gr - black14) / (gb - black14);
+                out->n8[field][g] = k + 1;
+            }
+        }
+        for (int f = 0; f < 2; f++)
+        {
+            long long total = 0;
+            for (int g = 0; g < 4; g++) total += out->n8[f][g];
+            out->n[f] = total;
+            double * all = malloc((size_t)MAX(total, 1) * sizeof(double));
+            if (!all) { ok = 0; break; }
+            long long at = 0;
+            for (int g = 0; g < 4; g++)
+            {
+                memcpy(all + at, r[f][g], (size_t)out->n8[f][g] * sizeof(double));
+                at += out->n8[f][g];
+                out->m8[f][g] = dualiso_median_inplace(r[f][g], out->n8[f][g]);
+            }
+            out->m[f] = dualiso_median_inplace(all, total);
+            free(all);
+        }
+    }
+    for (int f = 0; f < 2; f++)
+        for (int g = 0; g < 4; g++) free(r[f][g]);
+    if (!ok || out->n[0] <= 0 || out->n[1] <= 0 || !(out->m[0] > 0.0) || !(out->m[1] > 0.0)) return 0;
+    out->a = log2(out->m[0] / out->m[1]);
+    for (int g = 0; g < 4; g++)
+        out->a8[g] = (out->m8[0][g] > 0.0 && out->m8[1][g] > 0.0) ? log2(out->m8[0][g] / out->m8[1][g]) : 0.0;
+    return 1;
+}
+
+/* LOOK-ASSIST-M16-CAST-5 P2 (dualiso.h): the per-channel field-ratio fit, on the 14-bit input the recon sees. */
+static void dualiso_record_fieldratio(struct raw_info raw_info, const uint16_t * image_data, const int * is_bright,
+                                      int black14, double dark_noise, double bright_noise)
+{
+    int clip = 0;
+    for (int c = 0; c < 4; c++) clip = MAX(clip, g_dualiso_levels_probe.p9999[1][c]);
+    g_dualiso_levels_probe.fr_bright_clip = clip;
+    const double bright_hi = 0.9 * clip;
+    const double bright_lo = black14 + 16.0 * bright_noise;
+    const double dark_lo = black14 + 8.0 * dark_noise;
+    const int w = raw_info.width;
+    const int x1 = MAX(raw_info.active_area.x1, 0);
+    const int y1 = MAX(raw_info.active_area.y1, 0);
+    const int x2 = MIN(raw_info.active_area.x2, raw_info.width);
+    const int y2 = MIN(raw_info.active_area.y2, raw_info.height);
+    double sx[4] = {0}, sy[4] = {0}, sxx[4] = {0}, sxy[4] = {0};
+    long long n[4] = {0};
+    for (int y = MAX(y1, 2); y < y2 - 2; y++)
+    {
+        if (!is_bright[y % 4] || is_bright[(y - 2) % 4] || is_bright[(y + 2) % 4]) continue;
+        for (int x = x1; x < x2; x++)
+        {
+            const double b = image_data[(size_t)x + (size_t)y * w];
+            const double d = 0.5 * ((double)image_data[(size_t)x + (size_t)(y - 2) * w]
+                                  + (double)image_data[(size_t)x + (size_t)(y + 2) * w]);
+            if (!(b < bright_hi && b > bright_lo && d > dark_lo)) continue;
+            const int c = ((y & 1) << 1) | (x & 1);
+            const double bx = b - black14;
+            const double dy = d - black14;
+            sx[c] += bx; sy[c] += dy; sxx[c] += bx * bx; sxy[c] += bx * dy; n[c]++;
+        }
+    }
+    for (int c = 0; c < 4; c++)
+    {
+        g_dualiso_levels_probe.fr_count[c] = n[c];
+        g_dualiso_levels_probe.fr_ev[c] = 0.0;
+        g_dualiso_levels_probe.fr_bd[c] = 0.0;
+        const double den = n[c] * sxx[c] - sx[c] * sx[c];
+        if (n[c] < 2 || !(den > 0.0)) continue;
+        const double slope = (n[c] * sxy[c] - sx[c] * sy[c]) / den;
+        if (!(slope > 0.0)) continue;
+        g_dualiso_levels_probe.fr_ev[c] = log2(1.0 / slope);
+        g_dualiso_levels_probe.fr_bd[c] = (sy[c] - slope * sx[c]) / n[c];
+    }
+
+    /* LOOK-ASSIST-M16-CAST-6 P2r: the same doubly valid samples, every j-th per channel (at most 200000), fitted robustly. */
+    double * pb[4] = { NULL, NULL, NULL, NULL };
+    double * pd[4] = { NULL, NULL, NULL, NULL };
+    long long stride[4], seen[4] = {0}, kept[4] = {0};
+    for (int c = 0; c < 4; c++)
+    {
+        memset(&g_dualiso_levels_probe.fr_robust[c], 0, sizeof(g_dualiso_levels_probe.fr_robust[c]));
+        stride[c] = MAX(1, (n[c] + 199999) / 200000);
+        const long long cap = n[c] / stride[c] + 1;
+        pb[c] = malloc((size_t)cap * sizeof(double));
+        pd[c] = malloc((size_t)cap * sizeof(double));
+    }
+    for (int y = MAX(y1, 2); y < y2 - 2; y++)
+    {
+        if (!is_bright[y % 4] || is_bright[(y - 2) % 4] || is_bright[(y + 2) % 4]) continue;
+        for (int x = x1; x < x2; x++)
+        {
+            const double b = image_data[(size_t)x + (size_t)y * w];
+            const double d = 0.5 * ((double)image_data[(size_t)x + (size_t)(y - 2) * w]
+                                  + (double)image_data[(size_t)x + (size_t)(y + 2) * w]);
+            if (!(b < bright_hi && b > bright_lo && d > dark_lo)) continue;
+            const int c = ((y & 1) << 1) | (x & 1);
+            if (seen[c]++ % stride[c] || !pb[c] || !pd[c]) continue;
+            pb[c][kept[c]] = b - black14;
+            pd[c][kept[c]] = d - black14;
+            kept[c]++;
+        }
+    }
+    for (int c = 0; c < 4; c++)
+    {
+        if (pb[c] && pd[c])
+            dualiso_robust_fieldratio(pb[c], pd[c], kept[c], bright_hi - black14, &g_dualiso_levels_probe.fr_robust[c]);
+        free(pb[c]);
+        free(pd[c]);
+    }
+}
+
+void dualiso_levels_probe_reset(int stop_after_levels)
+{
+    memset(&g_dualiso_levels_probe, 0, sizeof(g_dualiso_levels_probe));
+    g_dualiso_levels_probe_stop = stop_after_levels ? 1 : 0;
+}
+
+int dualiso_levels_probe_get(dualiso_levels_probe_t * probe)
+{
+    if (probe) *probe = g_dualiso_levels_probe;
+    return g_dualiso_levels_probe.valid;
+}
+
+/* The k-th smallest value (0-based) of a 14-bit histogram. */
+static int dualiso_levels_hist_rank(const unsigned int * hist, long long k)
+{
+    long long seen = 0;
+    for (int v = 0; v < 16384; v++)
+    {
+        seen += hist[v];
+        if (seen > k) return v;
+    }
+    return 16383;
+}
+
+/* Per field (is_bright[y%4]) and CFA channel ((y&1)*2 + (x&1), RGGB after the gbrg row skip) over the active area. */
+static void dualiso_record_levels(struct raw_info raw_info, const uint16_t * image_data, const int * is_bright)
+{
+    unsigned int * hist = calloc((size_t)8 * 16384u, sizeof(unsigned int));
+    if (!hist) return;
+    const int x1 = MAX(raw_info.active_area.x1, 0);
+    const int y1 = MAX(raw_info.active_area.y1, 0);
+    const int x2 = MIN(raw_info.active_area.x2, raw_info.width);
+    const int y2 = MIN(raw_info.active_area.y2, raw_info.height);
+    for (int y = y1; y < y2; y++)
+    {
+        const int field = is_bright[y % 4] ? 1 : 0;
+        for (int x = x1; x < x2; x++)
+        {
+            const int channel = ((y & 1) << 1) | (x & 1);
+            hist[(size_t)(field * 4 + channel) * 16384u + (image_data[(size_t)x + (size_t)y * raw_info.width] & 16383)]++;
+        }
+    }
+    for (int field = 0; field < 2; field++)
+    {
+        for (int channel = 0; channel < 4; channel++)
+        {
+            const unsigned int * h = hist + (size_t)(field * 4 + channel) * 16384u;
+            long long n = 0;
+            int top = 0;
+            for (int v = 0; v < 16384; v++)
+            {
+                n += h[v];
+                if (h[v]) top = v;
+            }
+            g_dualiso_levels_probe.count[field][channel] = (int)MIN(n, (long long)INT_MAX);
+            if (n <= 0) continue;
+            g_dualiso_levels_probe.p001[field][channel] = dualiso_levels_hist_rank(h, (long long)(n * 0.001));
+            g_dualiso_levels_probe.p1[field][channel] = dualiso_levels_hist_rank(h, (long long)(n * 0.01));
+            g_dualiso_levels_probe.p99[field][channel] = dualiso_levels_hist_rank(h, (long long)(n * 0.99));
+            g_dualiso_levels_probe.p9999[field][channel] = dualiso_levels_hist_rank(h, (long long)(n * 0.9999));
+            g_dualiso_levels_probe.max[field][channel] = top;
+        }
+    }
+    free(hist);
+}
 static DUALISO_THREAD_LOCAL dualiso_gpu_recon_state_t g_dualiso_last_gpu_recon_state = {0};
 static DUALISO_THREAD_LOCAL int g_dualiso_gpu_recon_state_capture_enabled = 0;
 static int g_dualiso_mix_chroma_probe_mode_cache = INT_MIN;
@@ -2681,6 +3166,7 @@ static int match_exposures(struct raw_info raw_info,
     int h = raw_info.height;
     double applied_ev_correction = 0.0;
     int applied_black_delta = 0;
+    const int probe_mode = auto_correction ? *auto_correction : 0;
     const int scalar_rc = compute_match_exposure_scalars(raw_info,
                                                         raw_buffer_32,
                                                         dark_frame,
@@ -2695,6 +3181,14 @@ static int match_exposures(struct raw_info raw_info,
                                                         1,
                                                         &applied_ev_correction,
                                                         &applied_black_delta);
+    g_dualiso_match_probe.valid = 1;
+    g_dualiso_match_probe.rc = scalar_rc;
+    g_dualiso_match_probe.mode = probe_mode;
+    g_dualiso_match_probe.ev = scalar_rc > 0 ? applied_ev_correction : 0.0;
+    g_dualiso_match_probe.black_delta = scalar_rc > 0 ? applied_black_delta : 0;
+    g_dualiso_match_probe.black = black;
+    g_dualiso_match_probe.white = raw_info.white_level;
+    g_dualiso_match_probe.white_darkened = scalar_rc > 0 ? *white_darkened : 0;
     if (scalar_rc <= 0)
     {
         return scalar_rc;
@@ -2703,6 +3197,45 @@ static int match_exposures(struct raw_info raw_info,
     const int _black_delta = applied_black_delta;
     const double _ev_correction = applied_ev_correction;
     double factor = pow(2, -_ev_correction);
+
+    /* LOOK-ASSIST-M16-CAST-5 A11 (dualiso.h): each bright-field CFA channel darkened with its own ev / black delta onto
+     * the dark rows' unchanged level, (p - black) * 2^-ev_c + black + bd_c - bd * (1 - 2^-ev). With every channel at
+     * the global ev / bd that is the line below. white_darkened stays the global match's. */
+    const int channel_match = g_dualiso_analysis_override.channel_match_enabled;
+    double channel_factor[4];
+    double channel_offset[4];
+    /* LOOK-ASSIST-M16-CAST-6: channel_mask limits A11 to some channels (the others take the global line below as is);
+     * channel_bd_global gives every channel the global black delta (A11s). */
+    int channel_use[4];
+    for (int c = 0; c < 4; c++)
+    {
+        channel_use[c] = g_dualiso_analysis_override.channel_mask ? ((g_dualiso_analysis_override.channel_mask >> c) & 1) : 1;
+        channel_factor[c] = pow(2, -g_dualiso_analysis_override.channel_ev[c]);
+        channel_offset[c] = (g_dualiso_analysis_override.channel_bd_global
+                             ? (double)_black_delta
+                             : g_dualiso_analysis_override.channel_bd[c] * 64.0)
+                          - _black_delta * (1.0 - factor);
+    }
+    const int rows_probe = g_dualiso_match_probe_stop_after_match;
+    if (rows_probe)
+    {
+        for (int c = 0; c < 4; c++)
+        {
+            g_dualiso_match_probe.bright_pre_mean[c] = 0.0;
+            g_dualiso_match_probe.bright_post_mean[c] = 0.0;
+            g_dualiso_match_probe.bright_count[c] = 0;
+        }
+        for (int y = 0; y < h; y ++)
+        {
+            if (!BRIGHT_ROW) continue;
+            for (int x = 0; x < w; x ++)
+            {
+                const int c = ((y & 1) << 1) | (x & 1);
+                g_dualiso_match_probe.bright_pre_mean[c] += raw_get_pixel32(x, y);
+                g_dualiso_match_probe.bright_count[c]++;
+            }
+        }
+    }
 
     #pragma omp parallel for collapse(2)
     for (int y = 0; y < h; y ++)
@@ -2713,7 +3246,12 @@ static int match_exposures(struct raw_info raw_info,
 
             if (p == 0) continue;
 
-            if (BRIGHT_ROW)
+            if (BRIGHT_ROW && channel_match && channel_use[((y & 1) << 1) | (x & 1)])
+            {
+                const int c = ((y & 1) << 1) | (x & 1);
+                p = ((p - black) * channel_factor[c]) + black + channel_offset[c];
+            }
+            else if (BRIGHT_ROW)
             {
                 p = ((p - black + _black_delta) * factor) + black;
             }
@@ -2723,6 +3261,22 @@ static int match_exposures(struct raw_info raw_info,
             }
 
             raw_set_pixel20(x, y, p);
+        }
+    }
+
+    if (rows_probe)
+    {
+        for (int y = 0; y < h; y ++)
+        {
+            if (!BRIGHT_ROW) continue;
+            for (int x = 0; x < w; x ++)
+                g_dualiso_match_probe.bright_post_mean[((y & 1) << 1) | (x & 1)] += raw_get_pixel32(x, y);
+        }
+        for (int c = 0; c < 4; c++)
+        {
+            if (g_dualiso_match_probe.bright_count[c] <= 0) continue;
+            g_dualiso_match_probe.bright_pre_mean[c] /= (double)g_dualiso_match_probe.bright_count[c];
+            g_dualiso_match_probe.bright_post_mean[c] /= (double)g_dualiso_match_probe.bright_count[c];
         }
     }
 
@@ -3750,6 +4304,9 @@ static inline void fullres_reconstruction(struct raw_info raw_info, uint32_t * f
 {
     int w = raw_info.width;
     int h = raw_info.height;
+    /* LOOK-ASSIST-M16-CAST-5: the switch tests this plane (bright, or A12's quad max); capture is NULL unless asked. */
+    const uint32_t * test = dualiso_switch_test_plane(DUALISO_SWITCH_SITE_FULLRES, bright, w, h);
+    unsigned char * capture = dualiso_switch_capture_plane(DUALISO_SWITCH_SITE_FULLRES, w, h);
 
     /* reconstruct a full-resolution image (discard interpolated fields whenever possible) */
     /* this has full detail and lowest possible aliasing, but it has high shadow noise and color artifacts when high-iso starts clipping */
@@ -3767,10 +4324,15 @@ static inline void fullres_reconstruction(struct raw_info raw_info, uint32_t * f
             if (BRIGHT_ROW) {
                 fullres_reconstruction_bright_row_avx2(&fullres[(size_t)y*w],
                                                        &bright[(size_t)y*w],
+                                                       &test[(size_t)y*w],
                                                        &dark[(size_t)y*w],
-                                                       white_darkened, w);
+                                                       white_darkened, w,
+                                                       capture ? &capture[(size_t)y*w] : NULL);
             } else {
                 memcpy(&fullres[(size_t)y*w], &dark[(size_t)y*w], (size_t)w * sizeof(uint32_t));
+                if (capture)
+                    for (int x = 0; x < w; x ++)
+                        capture[(size_t)y*w + x] = test[(size_t)y*w + x] >= white_darkened;
             }
         }
         return;
@@ -3782,11 +4344,13 @@ static inline void fullres_reconstruction(struct raw_info raw_info, uint32_t * f
     {
         for (int x = 0; x < w; x ++)
         {
+            const int over = test[x + y*w] >= white_darkened;
+            if (capture) capture[x + y*w] = (unsigned char)over;
             if (BRIGHT_ROW)
             {
                 uint32_t f = bright[x + y*w];
                 /* if the brighter copy is overexposed, the guessed pixel for sure has higher brightness */
-                fullres[x + y*w] = f < white_darkened ? f : MAX(f, dark[x + y*w]);
+                fullres[x + y*w] = !over ? f : MAX(f, dark[x + y*w]);
             }
             else
             {
@@ -3827,6 +4391,9 @@ static inline void fullres_reconstruction_phase_balance(struct raw_info raw_info
 {
     int w = raw_info.width;
     int h = raw_info.height;
+    /* LOOK-ASSIST-M16-CAST-5: the switch tests this plane (bright, or A12's quad max); capture is NULL unless asked. */
+    const uint32_t * test = dualiso_switch_test_plane(DUALISO_SWITCH_SITE_PHASE_BALANCE, bright, w, h);
+    unsigned char * capture = dualiso_switch_capture_plane(DUALISO_SWITCH_SITE_PHASE_BALANCE, w, h);
 
 #ifndef STDOUT_SILENT
     printf("Full-res phase-balanced reconstruction...\n");
@@ -3841,8 +4408,10 @@ static inline void fullres_reconstruction_phase_balance(struct raw_info raw_info
             const int bright_row = BRIGHT_ROW;
             const uint32_t native = bright_row ? bright[idx] : dark[idx];
             const uint32_t opposite = bright_row ? dark[idx] : bright[idx];
+            const int over = test[idx] >= white_darkened;
+            if (capture) capture[idx] = (unsigned char)over;
 
-            if (bright[idx] >= white_darkened)
+            if (over)
             {
                 fullres[idx] = bright_row ? MAX(native, opposite) : native;
                 continue;
@@ -5296,6 +5865,8 @@ static inline int mix_images(struct raw_info raw_info,
         return 0;
     }
 
+    /* LOOK-ASSIST-M16-CAST-5: the bright test reads this plane (bright, or A12's quad max). */
+    const uint32_t * over_test = dualiso_switch_test_plane(DUALISO_SWITCH_SITE_OVEREXPOSED, bright, w, h);
     int overexposed_avx2 = 0;
 #ifdef DUALISO_AVX2_AVAILABLE
     pthread_once(&g_dualiso_hq_dispatch_once, dualiso_hq_dispatch_init);
@@ -5306,7 +5877,7 @@ static inline int mix_images(struct raw_info raw_info,
         for (int y = 0; y < h; y ++)
         {
             overexposed_mark_row_avx2(&over_aux[(size_t)y * w],
-                                      &bright[(size_t)y * w],
+                                      &over_test[(size_t)y * w],
                                       &dark[(size_t)y * w],
                                       white_darkened,
                                       white,
@@ -5321,9 +5892,15 @@ static inline int mix_images(struct raw_info raw_info,
         {
             for (int x = 0; x < w; x ++)
             {
-                over_aux[x + y * w] = bright[x + y * w] >= white_darkened || dark[x + y * w] >= white ? 100 : 0;
+                over_aux[x + y * w] = over_test[x + y * w] >= white_darkened || dark[x + y * w] >= white ? 100 : 0;
             }
         }
+    }
+    /* LOOK-ASSIST-M16-CAST-5 P1: the mark, before the blur, as one flag per pixel. */
+    unsigned char * over_capture = dualiso_switch_capture_plane(DUALISO_SWITCH_SITE_OVEREXPOSED, w, h);
+    if (over_capture)
+    {
+        for (size_t i = 0; i < (size_t)w * (size_t)h; i++) over_capture[i] = over_aux[i] != 0;
     }
 
     if (w > 6 && h > 6)
@@ -6674,12 +7251,20 @@ int diso_get_full20bit(struct raw_info raw_info, uint16_t * image_data, int dark
     int black = raw_info.black_level;
     int white = raw_info.white_level / 64;
     
-    int white_bright = white / 2;
+    const int white_bright_default = white / 2;
+    int white_bright = white_bright_default;
     //white_detect(raw_info, image_data, &white, &white_bright, is_bright);
+    /* LOOK-ASSIST-M16-CAST-4: an isolated analysis arm may replace the assumed bright clip (dualiso.h). */
+    if (g_dualiso_analysis_override.white_bright > 0)
+    {
+        white_bright = MIN(g_dualiso_analysis_override.white_bright, white);
+    }
     white *= 64;
     white_bright *= 64;
     raw_info.white_level = white;
-    
+    /* LOOK-ASSIST-M16-CAST-5: a switch capture describes this recon only. */
+    for (int site = 0; site < DUALISO_SWITCH_SITES; site++) g_dualiso_switch_capture_valid[site] = 0;
+
     double noise_std[4];
     double dark_noise, bright_noise, dark_noise_ev, bright_noise_ev;
     stage_start = mlv_stage_timing_now();
@@ -6695,6 +7280,61 @@ int diso_get_full20bit(struct raw_info raw_info, uint16_t * image_data, int dark
         || bright_noise <= 0.0)
     {
         DUALISO_FULL20_RETURN(0);
+    }
+
+    /* LOOK-ASSIST-M16-CAST-4: the levels probe (dualiso.h) records what this run sees, then stops. */
+    if (g_dualiso_levels_probe_stop)
+    {
+        g_dualiso_levels_probe.black = black / 64;
+        g_dualiso_levels_probe.white = white / 64;
+        g_dualiso_levels_probe.white_bright_default = white_bright_default;
+        g_dualiso_levels_probe.white_bright_used = white_bright / 64;
+        memcpy(g_dualiso_levels_probe.is_bright, is_bright, sizeof(g_dualiso_levels_probe.is_bright));
+        g_dualiso_levels_probe.active_x1 = raw_info.active_area.x1;
+        g_dualiso_levels_probe.active_y1 = raw_info.active_area.y1;
+        g_dualiso_levels_probe.active_x2 = raw_info.active_area.x2;
+        g_dualiso_levels_probe.active_y2 = raw_info.active_area.y2;
+        for (int y = 0; y < 4; y++)
+        {
+            /* compute_noise's own sampling predicate */
+            if (8 < raw_info.active_area.x1 - 8
+                && raw_info.active_area.y1/4*4 + 20 + y < raw_info.active_area.y2 - 20)
+            {
+                g_dualiso_levels_probe.has_noise_samples = 1;
+            }
+            g_dualiso_levels_probe.noise_std[y] = noise_std[y];
+        }
+        g_dualiso_levels_probe.dark_noise = dark_noise;
+        g_dualiso_levels_probe.bright_noise = bright_noise;
+        dualiso_record_levels(raw_info, image_data, is_bright);
+        dualiso_record_fieldratio(raw_info, image_data, is_bright, black / 64, dark_noise, bright_noise);
+        /* LOOK-ASSIST-M16-CAST-6 Q0 (dualiso.h), on the same 14-bit input. */
+        dualiso_q0_estimate(image_data, raw_info.width, h, raw_info.active_area.x1, raw_info.active_area.y1,
+                            raw_info.active_area.x2, raw_info.active_area.y2, is_bright, black / 64,
+                            0.9 * g_dualiso_levels_probe.fr_bright_clip, g_dualiso_levels_probe.p99[0],
+                            &g_dualiso_levels_probe.q0);
+        g_dualiso_levels_probe.valid = 1;
+        DUALISO_FULL20_RETURN(0);
+    }
+
+    /* LOOK-ASSIST-M16-CAST-4: isolated analysis arms on the noise model and the dark-field black (dualiso.h). */
+    if (g_dualiso_analysis_override.dark_noise_scale > 0.0)
+    {
+        dark_noise *= g_dualiso_analysis_override.dark_noise_scale;
+        dark_noise_ev = log2(dark_noise);
+    }
+    if (g_dualiso_analysis_override.dark_black_offset_enabled)
+    {
+        for (int y = 0; y < h; y++)
+        {
+            if (is_bright[y % 4]) continue;
+            for (int x = 0; x < w; x++)
+            {
+                const int v = (int)image_data[(size_t)x + (size_t)y * w]
+                            - g_dualiso_analysis_override.dark_black_offset[((y & 1) << 1) | (x & 1)];
+                image_data[(size_t)x + (size_t)y * w] = (uint16_t)COERCE(v, 0, 16383);
+            }
+        }
     }
 
     stage_start = mlv_stage_timing_now();
@@ -6786,7 +7426,7 @@ int diso_get_full20bit(struct raw_info raw_info, uint16_t * image_data, int dark
                                        &white_darkened,
                                        is_bright,
                                        scratch);
-    if (expo_matched <= 0)
+    if (expo_matched <= 0 || g_dualiso_match_probe_stop_after_match)
     {
         DUALISO_FULL20_RETURN(0);
     }
@@ -7035,6 +7675,8 @@ int diso_get_full20bit(struct raw_info raw_info, uint16_t * image_data, int dark
         printf("Noise level     : %.02f (20-bit), ideally %.02f\n", noise_std[0], ideal_noise_std);
         printf("Dynamic range   : %.02f EV (cooked)\n", log2(white - black) - log2(noise_std[0]));
 #endif
+        /* LOOK-ASSIST-M16-CAST-6: the post-recon Bayer output, isolated analysis only (dualiso.h). */
+        if (g_dualiso_analysis_override.capture_output) dualiso_output_capture_store(image_data, w, h, black / 16);
         ret = 1;
     }
 

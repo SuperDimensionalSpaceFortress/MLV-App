@@ -2,6 +2,7 @@
 #include <cstdlib>
 
 #include "../../src/mlv_include.h"
+#include "../../src/mlv/llrawproc/dualiso.h"
 extern "C" {
 #include "../../src/debayer/wb_conversion.h"
 #include "../../src/debayer/debayer.h"
@@ -81,6 +82,36 @@ void llrpResetDngBWLevels(mlvObject_t * video)
 void llrpResetFpmStatus(mlvObject_t * video) { video->llrawproc->fpm_status = 0; }
 void llrpResetBpmStatus(mlvObject_t * video) { video->llrawproc->bpm_status = 0; }
 int llrpSetIsolatedAnalysisSharedStateReadOnlyForCurrentThread(int) { return 0; }
+int llrpSetIsolatedAnalysisDualIsoMatchForCurrentThread(int, double, int) { return 0; }
+void llrpSetIsolatedAnalysisDualIsoReconForCurrentThread(int, int, int, int) {}
+void dualiso_match_probe_reset(int) {}
+int dualiso_match_probe_get(dualiso_match_probe_t * probe)
+{
+    if (probe) memset(probe, 0, sizeof(*probe));
+    return 0;
+}
+void llrpSetIsolatedAnalysisDualIsoArmsForCurrentThread(int, int, double, const int *) {}
+void dualiso_levels_probe_reset(int) {}
+int dualiso_levels_probe_get(dualiso_levels_probe_t * probe)
+{
+    if (probe) memset(probe, 0, sizeof(*probe));
+    return 0;
+}
+void llrpSetIsolatedAnalysisDualIsoSwitchArmsForCurrentThread(const double *, const double *, int, int) {}
+const unsigned char * dualiso_switch_capture_map(int, int *, int *) { return nullptr; }
+void dualiso_switch_capture_clear(void) {}
+// LOOK-ASSIST-M16-CAST-6
+void llrpSetIsolatedAnalysisDualIsoChannelArmsForCurrentThread(int, int, int) {}
+int llrpSetIsolatedAnalysisPreDualIsoForCurrentThread(int, int) { return 0; }
+int llrpGetLastPreDualIsoForCurrentThread(int * enabled_mask, int * applied_mask, unsigned long long * buffer_hash)
+{
+    if (enabled_mask) *enabled_mask = 0;
+    if (applied_mask) *applied_mask = 0;
+    if (buffer_hash) *buffer_hash = 0;
+    return 0;
+}
+const uint16_t * dualiso_output_capture(int *, int *, int *) { return nullptr; }
+void dualiso_output_capture_clear(void) {}
 void llrpInitDarkFrameExtFileName(mlvObject_t * video, char * df_filename)
 {
     if (video->llrawproc->dark_frame_filename) {

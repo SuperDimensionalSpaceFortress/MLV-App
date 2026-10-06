@@ -376,6 +376,159 @@ void dualiso_debug_reset_full20bit_timing(void);
 void dualiso_debug_get_full20bit_timing(dualiso_full20bit_timing_t * timing);
 int dualiso_mix_chroma_probe_mode(void);
 
+/* LOOK-ASSIST-M16-CAST-3: the exposure match the HQ recon last ran on the calling thread (thread-local, measure-only).
+ * rc is the match's return (<= 0 = failed); mode is the auto_correction it ran with (-1 nominal, -2 histogram, 0
+ * explicit); ev is the applied correction in stops (positive); black_delta, black, white and white_darkened are 20-bit
+ * units (64 = one 14-bit unit). With stop_after_match set, diso_get_full20bit returns 0 right after the match, so a
+ * caller that only wants the numbers skips the reconstruction (the caller's failure path restores the frame). */
+typedef struct
+{
+    int valid;
+    int rc;
+    int mode;
+    double ev;
+    int black_delta;
+    int black;
+    int white;
+    int white_darkened;
+    /* LOOK-ASSIST-M16-CAST-5, filled only with stop_after_match: per CFA channel (R, G1, G2, B) the mean bright-row
+     * value (20-bit) before and after the match darkened it, and the sample count. */
+    double bright_pre_mean[4];
+    double bright_post_mean[4];
+    long long bright_count[4];
+} dualiso_match_probe_t;
+void dualiso_match_probe_reset(int stop_after_match);
+int dualiso_match_probe_get(dualiso_match_probe_t * probe);
+
+/* LOOK-ASSIST-M16-CAST-4: measure-only overrides of the HQ recon's level and noise assumptions (thread-local). Set only
+ * by llrawproc around an isolated analysis reconstruction and cleared right after it (NULL = today's recon):
+ * white_bright (14-bit, > 0) replaces the assumed bright-field clip white/2 (clamped to white); dark_noise_scale (> 0)
+ * multiplies the dark noise compute_noise found; dark_black_offset (when enabled, 14-bit codes per CFA channel R, G1,
+ * G2, B) is subtracted from the dark-field rows before the match.
+ * LOOK-ASSIST-M16-CAST-5 adds, same contract: channel_match (when enabled) darkens each bright-field CFA channel (R, G1,
+ * G2, B) with its own ev (stops, positive) and black delta (14-bit codes) in match_exposures, the dark rows and the
+ * overexposure threshold keep the global match; quad_coherent_switch ORs the bright >= white_darkened test across each
+ * 2x2 CFA quad (x&~1, y&~1) at the three switch sites (phase-balanced fullres, fullres_reconstruction and the
+ * overexposed map, scalar and AVX2); capture_switch_maps records each site's per-pixel switch outcome (see
+ * dualiso_switch_capture_map). Clearing the override (NULL) frees the A12 test planes. */
+typedef struct
+{
+    int white_bright;
+    double dark_noise_scale;
+    int dark_black_offset_enabled;
+    int dark_black_offset[4];
+    int channel_match_enabled;
+    double channel_ev[4];
+    double channel_bd[4];
+    int quad_coherent_switch;
+    int capture_switch_maps;
+    /* LOOK-ASSIST-M16-CAST-6, same contract: channel_mask (bit c = CFA channel c) limits channel_match to those
+     * channels, the others take the global match line unchanged (0 = all four, CAST-5's A11); channel_bd_global uses
+     * the global black delta for every channel instead of channel_bd (A11s); capture_output records the recon's 16-bit
+     * Bayer output (see dualiso_output_capture). */
+    int channel_mask;
+    int channel_bd_global;
+    int capture_output;
+} dualiso_analysis_override_t;
+void dualiso_set_analysis_override(const dualiso_analysis_override_t * override_values);
+
+/* LOOK-ASSIST-M16-CAST-5: the switch outcome each site saw on the calling thread's last HQ recon with
+ * capture_switch_maps set (1 = that pixel took the over-white branch). Sites: 0 = mix_images' overexposed mark before
+ * the blur (bright >= white_darkened or dark >= white), 1 = fullres_reconstruction_phase_balance, 2 =
+ * fullres_reconstruction (its last call). The map stays valid until the next capture or clear on this thread; NULL
+ * when the site did not run. */
+#define DUALISO_SWITCH_SITE_OVEREXPOSED 0
+#define DUALISO_SWITCH_SITE_PHASE_BALANCE 1
+#define DUALISO_SWITCH_SITE_FULLRES 2
+#define DUALISO_SWITCH_SITES 3
+const unsigned char * dualiso_switch_capture_map(int site, int * width, int * height);
+void dualiso_switch_capture_clear(void);
+
+/* LOOK-ASSIST-M16-CAST-6 P2r: a robust fit of dark = slope * bright + bd (both black-subtracted, 14-bit codes) over n
+ * samples. ts = Theil's split-sample estimator on every k-th sample (k = ceil(n / 20000)): the subsample sorted by
+ * bright, sample i paired with i + m/2, slope = the median pair slope, bd = the median residual. band[0..2] = binned
+ * medians in bright bands [128, 1024), [1024, 4096), [4096, band3_hi): 16 equal-width bins, per bin (>= 16 samples) the
+ * median bright and median dark, then least squares over the bin medians. ev = log2(1 / slope); n is the samples used
+ * (ts: the subsample; band: the samples in the band); ev = bd = 0 when a fit is not possible. */
+typedef struct
+{
+    long long n;
+    double ev;
+    double bd;
+} dualiso_fit_t;
+typedef struct
+{
+    dualiso_fit_t ts;
+    dualiso_fit_t band[3];
+} dualiso_robust_fit_t;
+void dualiso_robust_fieldratio(const double * bright, const double * dark, long long n, double band3_hi,
+                               dualiso_robust_fit_t * out);
+
+/* LOOK-ASSIST-M16-CAST-6 Q0, fit-free: within each hardware row pair of one field, every Gr (even y, odd x, RGGB) is
+ * paired with the Gb at (y - 1, x - 1) when that row is in the same field (else (y + 1, x - 1)); both must be in band
+ * (bright field: black + 128 < v < bright_hi; dark field: black + 64 < v < that channel's dark_p99). m[f] = the median
+ * of (Gr - black) / (Gb - black) per field (0 = dark, 1 = bright), a = log2(m[0] / m[1]); the same per Gr column
+ * x mod 8 in groups g = (x % 8) / 2 (columns 1, 3, 5, 7). Returns 1 when both fields have pairs. */
+typedef struct
+{
+    long long n[2];
+    double m[2];
+    double a;
+    long long n8[2][4];
+    double m8[2][4];
+    double a8[4];
+} dualiso_q0_t;
+int dualiso_q0_estimate(const uint16_t * image, int width, int height, int x1, int y1, int x2, int y2,
+                        const int * is_bright, int black14, double bright_hi, const int * dark_p99, dualiso_q0_t * out);
+
+/* LOOK-ASSIST-M16-CAST-4: the levels the HQ recon saw on the calling thread's last run (thread-local, measure-only):
+ * per field (0 = dark rows, 1 = bright rows, from is_bright) and CFA channel (R, G1, G2, B) the 0.1 / 1 / 99.99
+ * percentiles and the max of the 14-bit input (after restricted-range scaling), the stated levels, the bright clip the
+ * recon assumed and used, and the noise model's inputs and outputs. With stop set, diso_get_full20bit returns 0 right
+ * after recording them (the caller's failure path restores the frame). */
+typedef struct
+{
+    int valid;
+    int black;
+    int white;
+    int white_bright_default;
+    int white_bright_used;
+    int is_bright[4];
+    int active_x1, active_y1, active_x2, active_y2;
+    int has_noise_samples;
+    double noise_std[4];
+    double dark_noise;
+    double bright_noise;
+    int count[2][4];
+    int p001[2][4];
+    int p1[2][4];
+    int p9999[2][4];
+    int max[2][4];
+    /* LOOK-ASSIST-M16-CAST-5 P2, the per-channel field ratio: per CFA channel (R, G1, G2, B), a least-squares fit of
+     * the dark field interpolated onto each bright-row pixel (the mean of the same channel two rows up and down, both
+     * dark) against the native bright value, on doubly valid samples: bright < 0.9 * bright_clip and > black + 16 *
+     * bright_noise, dark > black + 8 * dark_noise (14-bit codes; bright_clip = the max over channels of the bright
+     * field's p99.99). dark - black = slope * (bright - black) + intercept, so ev = log2(1 / slope) and bd = intercept
+     * (14-bit), the match's own convention (bright - black = 2^ev * (dark - black - bd)). */
+    int fr_bright_clip;
+    long long fr_count[4];
+    double fr_ev[4];
+    double fr_bd[4];
+    /* LOOK-ASSIST-M16-CAST-6: the 99th percentile per field and channel (Q0's dark band edge), P2r (the robust fit of
+     * P2's samples, see dualiso_robust_fieldratio) and Q0 (the fit-free Gr/Gb field asymmetry, dualiso_q0_estimate). */
+    int p99[2][4];
+    dualiso_robust_fit_t fr_robust[4];
+    dualiso_q0_t q0;
+} dualiso_levels_probe_t;
+void dualiso_levels_probe_reset(int stop_after_levels);
+int dualiso_levels_probe_get(dualiso_levels_probe_t * probe);
+
+/* LOOK-ASSIST-M16-CAST-6: the HQ recon's 16-bit Bayer output on the calling thread's last isolated run with
+ * capture_output set (linear, before any white balance; RGGB-indexed in the recon's own frame, i.e. after the GBRG row
+ * skip; black16 = the 20-bit black / 16). NULL when none; valid until the next capture or clear on this thread. */
+const uint16_t * dualiso_output_capture(int * width, int * height, int * black16);
+void dualiso_output_capture_clear(void);
+
 #ifdef __cplusplus
 }
 #endif

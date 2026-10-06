@@ -925,6 +925,9 @@ private:
     QString m_lastWarnedLookAssistFlavorValue;
     lookassist::LookAssistFlavorOutcome m_lookAssistFlavorOutcome;   // how the last analysis ended: telemetry and setReceipt read it
     QString m_lastLookAssistScene;
+    // LOOK-ASSIST-M16-CAST-4: where the measure-only dual-ISO trace writes its arm renders (PNG); set by the GUI smoke
+    // beside its --contact-sheet-dir, empty (none written) otherwise.
+    QString m_lookAssistDisoTraceDir;
     double m_lastLookAssistMedian = 0.0;
     double m_lastLookAssistP05 = 0.0;
     double m_lastLookAssistP95 = 0.0;
