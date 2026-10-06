@@ -343,9 +343,9 @@ TEST(LookAssistDisoArms, TheTracePinsTheBalanceFixesBothMasksOnR0AndResetsEveryA
 
     QStringList sunk;
     qputenv( "MLVAPP_LOOK_ASSIST_DISO_MATCH_TRACE", "1" );
-    // Look Assist's own decision (exposure 0, 6000 K) is logged, never rendered with.
+    // Without a Look Assist context LA is the balance passed in (exposure 3.80, 6000 K): R0's masks are fixed on it.
     const QString trace = ReceiptApplier::lookAssistDualIsoMatchTrace(
-        video, 0, 3, 0.0, 6000, 0,
+        video, 0, 3, 3.8, 6000, 0,
         [&sunk]( const QString &name, int w, int h, const unsigned char *rgb )
         {
             if( w > 0 && h > 0 && rgb ) sunk << name;
@@ -354,7 +354,7 @@ TEST(LookAssistDisoArms, TheTracePinsTheBalanceFixesBothMasksOnR0AndResetsEveryA
     else qunsetenv( "MLVAPP_LOOK_ASSIST_DISO_MATCH_TRACE" );
 
     ASSERT_TRUE( trace.contains( QStringLiteral( " diso_levels valid=1 " ) ) );
-    ASSERT_TRUE( trace.contains( QStringLiteral( " arms_pin=ev3.80/6724/0 la=ev0.00/6000/0 " ) ) );
+    ASSERT_TRUE( trace.contains( QStringLiteral( " arms_pin=ev3.80/6724/0 la=ev3.80/6000/0 " ) ) );
     ASSERT_TRUE( trace.contains( QStringLiteral( " diso_fieldratio valid=1 " ) ) );
     ASSERT_TRUE( armsAreReset() );
     ASSERT_TRUE( switchArmsAreReset() );
@@ -703,7 +703,7 @@ TEST(LookAssistDisoSwitch, P1IsR0sOwnMapAndCAndRUseTheirOwnDenominators)
     std::vector<unsigned char> overlay;
     std::vector<unsigned char> r0Render;
     const QString trace = ReceiptApplier::lookAssistDualIsoMatchTrace(
-        video, 0, 3, 0.0, 6000, 0,
+        video, 0, 3, 3.8, 6000, 0,
         [&overlay, &r0Render]( const QString &name, int w2, int h2, const unsigned char *px )
         {
             const size_t n = static_cast<size_t>( w2 ) * h2 * 3;
@@ -812,7 +812,7 @@ QString traceOnFixture(mlvObject_t *video, const ReceiptApplier::DualIsoTraceLoo
     const QByteArray previous = qgetenv( "MLVAPP_LOOK_ASSIST_DISO_MATCH_TRACE" );
     const bool wasSet = qEnvironmentVariableIsSet( "MLVAPP_LOOK_ASSIST_DISO_MATCH_TRACE" );
     qputenv( "MLVAPP_LOOK_ASSIST_DISO_MATCH_TRACE", "1" );
-    const QString trace = ReceiptApplier::lookAssistDualIsoMatchTrace( video, 0, 3, 0.0, 6000, 0,
+    const QString trace = ReceiptApplier::lookAssistDualIsoMatchTrace( video, 0, 3, 3.8, 6000, 0,
                                                                       ReceiptApplier::DualIsoTraceImageSink(), la );
     if( wasSet ) qputenv( "MLVAPP_LOOK_ASSIST_DISO_MATCH_TRACE", previous );
     else qunsetenv( "MLVAPP_LOOK_ASSIST_DISO_MATCH_TRACE" );

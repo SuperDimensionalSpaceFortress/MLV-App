@@ -1151,6 +1151,14 @@ struct LookAssistDisoArmBalance
     int candidateTint = 0;
     QString source;
     QString decision;
+    // The render's captures (whichever the arms asked for), copied before the solve's own recon replaces them.
+    std::vector<uint16_t> bayer;
+    int bayerWidth = 0;
+    int bayerHeight = 0;
+    int bayerBlack = 0;
+    std::vector<unsigned char> overexposedMap;
+    int mapWidth = 0;
+    int mapHeight = 0;
 };
 
 static LookAssistDisoArmBalance lookAssistDisoArmLookAssistBalance(mlvObject_t *mlvObject, int frameIndex,
@@ -1176,6 +1184,19 @@ static LookAssistDisoArmBalance lookAssistDisoArmLookAssistBalance(mlvObject_t *
     llrpSetIsolatedAnalysisSharedStateReadOnlyForCurrentThread( previousReadOnly );
     llrpSetIsolatedAnalysisDualIsoArmsForCurrentThread( -1, 0, 0.0, nullptr );
     processingFreeClone( clone );
+    if( switchArms.captureOutput )
+    {
+        if( const uint16_t *cap = dualiso_output_capture( &out.bayerWidth, &out.bayerHeight, &out.bayerBlack ) )
+            out.bayer.assign( cap, cap + static_cast<size_t>( out.bayerWidth ) * static_cast<size_t>( out.bayerHeight ) );
+        dualiso_output_capture_clear();
+    }
+    if( switchArms.captureMaps )
+    {
+        if( const unsigned char *m = dualiso_switch_capture_map( DUALISO_SWITCH_SITE_OVEREXPOSED, &out.mapWidth,
+                                                                 &out.mapHeight ) )
+            out.overexposedMap.assign( m, m + static_cast<size_t>( out.mapWidth ) * static_cast<size_t>( out.mapHeight ) );
+        dualiso_switch_capture_clear();
+    }
     if( !out.rendered ) return out;
 
     LookAssistStats processed = analyzeLookAssistThumbnail( picture->data(), width, height );
@@ -1573,18 +1594,15 @@ QString ReceiptApplier::lookAssistDualIsoMatchTrace(mlvObject_t *mlvObject,
             std::vector<unsigned char> picture;
             const LookAssistDisoArmBalance balance = lookAssistDisoArmLookAssistBalance(
                 mlvObject, rf, downscaleFactor, width, height, lookAssist, capture, &picture );
-            int capW = 0;
-            int capH = 0;
-            int capBlack = 0;
-            std::vector<uint16_t> bayer;
-            if( const uint16_t *cap = dualiso_output_capture( &capW, &capH, &capBlack ) )
-                bayer.assign( cap, cap + static_cast<size_t>( capW ) * static_cast<size_t>( capH ) );
-            dualiso_output_capture_clear();
+            const int capW = balance.bayerWidth;
+            const int capH = balance.bayerHeight;
+            const int capBlack = balance.bayerBlack;
+            const std::vector<uint16_t> &bayer = balance.bayer;
             if( reference )
             {
-                if( const unsigned char *m = dualiso_switch_capture_map( DUALISO_SWITCH_SITE_OVEREXPOSED, &mapW, &mapH ) )
-                    r0Map.assign( m, m + static_cast<size_t>( mapW ) * static_cast<size_t>( mapH ) );
-                dualiso_switch_capture_clear();
+                r0Map = balance.overexposedMap;
+                mapW = balance.mapWidth;
+                mapH = balance.mapHeight;
             }
             const bool laOwn = lookAssist.valid && balance.rendered;
             const Balance laBalance = { "LA", exposureStops, laOwn ? balance.temperature : temperature,
