@@ -32,6 +32,7 @@
 // The pixel parity of the real CUDA kernels at reduced dims ((c1), (c2)) is a venue
 // proof; see the PR.
 #include "../common/minitest.h"
+#include "../common/hash_helpers.h"
 #include "../common/repo_paths.h"
 #include "mlv_pipeline_fixture.h"
 #include "../../src/mlv/llrawproc/llrawproc.h"
@@ -1678,6 +1679,490 @@ TEST(GpuDualIsoPreviewScale, C1DumpDllParityVectors)
     processingSetPlaybackPreviewScaleFactor(previousScale);
     processingSetPlaybackPreviewMode(previousMode);
     video->playback_scale_factor_active = previousActive;
+}
+
+// r6 receipt-config parity (opt-in: MLVAPP_C1_RECEIPT_VECTORS_DIR). c1 covered only
+// alias ON / chroma OFF; the M16-1243 playback state is alias OFF / chroma 2x2 ON /
+// fullres ON / mean23 / dither, and r5d read a per-CFA-site CUDA/CPU gain there. For
+// each cell (x2/x4 x chroma {0,1} x alias {0,1}) this writes dll_test vectors from the
+// GPU plan's reduced run (phase-tent shrink; in.u16, LUTs, scalars as the backend gets
+// them) and the CPU reference on the same bytes (the CPU plan with phaseTentShrink = 1:
+// diso_get_full20bit, then the C notch). The exposure match is seeded auto -1 / ev 1 /
+// delta -1 before the prime. A cell is the large fixture's frame 2, or, with
+// MLVAPP_C1_RECEIPT_CLIP naming a clip.txt ("<clip> <frame>", the clip resolved by ID
+// outside the test), the owner clip without a receipt. When a cell holds the CUDA DLL's
+// output (cuda_nonotch.u16 from dll_test --dump, cuda_notch.u16 with
+// --reduced-iso-notch), the parity is asserted per CFA site: median CUDA/CPU in
+// [0.995, 1.005] and r >= 0.999 over pixels >= 32 LSB above black, whole-frame max abs
+// <= 4 LSB and mismatches <= 0.5 %; the c1 config (alias ON, chroma OFF) stays at 0 LSB.
+// Without the DLL output the cell is dumped only (hosted CI has no GPU).
+namespace {
+
+struct SiteParity
+{
+    double median[4] = { 0, 0, 0, 0 };
+    double r[4] = { 0, 0, 0, 0 };
+    size_t samples[4] = { 0, 0, 0, 0 };
+    int maxAbs = 0;
+    size_t mismatches = 0;
+};
+
+SiteParity siteParity(const std::vector<uint16_t> & cuda, const std::vector<uint16_t> & cpu,
+                      int w, int h, int black16)
+{
+    SiteParity p;
+    std::vector<double> gains[4];
+    double sx[4] = { 0 }, sy[4] = { 0 }, sxx[4] = { 0 }, syy[4] = { 0 }, sxy[4] = { 0 };
+    for (int y = 0; y < h; ++y)
+        for (int x = 0; x < w; ++x)
+        {
+            const size_t i = static_cast<size_t>(y) * w + x;
+            const int d = std::abs(static_cast<int>(cuda[i]) - static_cast<int>(cpu[i]));
+            p.mismatches += d != 0;
+            p.maxAbs = std::max(p.maxAbs, d);
+            const double ref = static_cast<double>(cpu[i]) - black16;
+            if (ref < 32.0) continue;
+            const double got = static_cast<double>(cuda[i]) - black16;
+            const int site = (y & 1) * 2 + (x & 1);
+            gains[site].push_back(got / ref);
+            sx[site] += ref; sy[site] += got;
+            sxx[site] += ref * ref; syy[site] += got * got; sxy[site] += ref * got;
+        }
+    for (int s = 0; s < 4; ++s)
+    {
+        const size_t n = gains[s].size();
+        p.samples[s] = n;
+        if (n == 0) continue;
+        std::nth_element(gains[s].begin(), gains[s].begin() + n / 2, gains[s].end());
+        p.median[s] = gains[s][n / 2];
+        const double cov = sxy[s] - sx[s] * sy[s] / n;
+        const double vx = sxx[s] - sx[s] * sx[s] / n;
+        const double vy = syy[s] - sy[s] * sy[s] / n;
+        p.r[s] = (vx > 0 && vy > 0) ? cov / std::sqrt(vx * vy) : (vx == vy ? 1.0 : 0.0);
+    }
+    return p;
+}
+
+bool readU16(const std::string & path, std::vector<uint16_t> & v, size_t n)
+{
+    FILE * f = std::fopen(path.c_str(), "rb");
+    if (!f) return false;
+    v.assign(n, 0u);
+    const bool ok = std::fread(v.data(), sizeof(uint16_t), n, f) == n;
+    std::fclose(f);
+    return ok;
+}
+
+bool writeU16(const std::string & path, const std::vector<uint16_t> & v)
+{
+    FILE * f = std::fopen(path.c_str(), "wb");
+    if (!f) return false;
+    const bool ok = std::fwrite(v.data(), sizeof(uint16_t), v.size(), f) == v.size();
+    std::fclose(f);
+    return ok;
+}
+
+} // namespace
+
+TEST(GpuDualIsoPreviewScale, C1ReceiptConfigReconParity)
+{
+    const char * root = std::getenv("MLVAPP_C1_RECEIPT_VECTORS_DIR");
+    if (!root || !*root)
+    {
+        std::printf("[gpu-dualiso-preview-scale] receipt-config parity skipped (MLVAPP_C1_RECEIPT_VECTORS_DIR unset)\n");
+        return;
+    }
+    struct Source { std::string name; std::string clip; unsigned long long frame; };
+    std::vector<Source> sources = { { "large", std::string(), 2ull } };
+    if (const char * clipTxt = std::getenv("MLVAPP_C1_RECEIPT_CLIP"))
+    {
+        char path[1024] = { 0 };
+        unsigned long long frame = 0;
+        FILE * f = *clipTxt ? std::fopen(clipTxt, "r") : nullptr;
+        if (f)
+        {
+            if (std::fscanf(f, "%1023s %llu", path, &frame) == 2) sources.push_back({ "m16", path, frame });
+            std::fclose(f);
+        }
+        ASSERT_EQ(static_cast<size_t>(2), sources.size());
+    }
+    size_t failedCells = 0;
+    for (const Source & src : sources)
+        for (const int scale : { 4, 2 })
+            for (const int chroma : { CS_2x2, CS_OFF })
+                for (const int alias : { FR_OFF, FR_ON })
+                {
+                    const std::string cell = src.name + "-x" + std::to_string(scale) + "-c"
+                                           + std::to_string(chroma) + "-a" + std::to_string(alias);
+                    const std::string dir = std::string(root) + "/" + cell;
+                    QDir().mkpath(QString::fromStdString(dir));
+                    GpuReconEnv env(true);
+                    MlvPipelineFixture fixture;
+                    QString error;
+                    if (src.clip.empty())
+                    {
+                        ASSERT_TRUE(fixture.openClipFile(repo_file_path(QStringLiteral("tests/fixtures/clips/large_dual_iso.mlv")), &error));
+                        ASSERT_TRUE(fixture.loadReceipt(QStringLiteral("tests/fixtures/receipts/large_dual_iso_hq.marxml"), &error));
+                        ASSERT_TRUE(fixture.applyReceipt(&error));
+                        fixture.video()->llrawproc->focus_pixels = 0;
+                        fixture.video()->llrawproc->bad_pixels = 0;
+                        fixture.video()->llrawproc->vertical_stripes = 0;
+                    }
+                    else
+                    {
+                        // The owner shape has no receipt: HQ dual-ISO on, everything else default.
+                        ASSERT_TRUE(fixture.openClipFile(QString::fromLocal8Bit(src.clip.c_str()), &error));
+                        llrpSetFixRawMode(fixture.video(), 1);
+                        llrpSetDualIsoMode(fixture.video(), 1);
+                        // r7: the app queues the one-shot stripe solve on load (MainWindow's
+                        // llrpComputeStripesOn calls); the frame-0 prime below runs it.
+                        llrpComputeStripesOn(fixture.video());
+                    }
+                    mlvObject_t * video = fixture.video();
+                    llrpSetDualIsoPlaybackForceMean23(video, 1);
+                    llrpSetDualIsoInterpolationMethod(video, DISOI_MEAN23);
+                    llrpSetDualIsoAliasMapMode(video, alias);
+                    llrpSetDualIsoFullResBlendingMode(video, FR_ON);
+                    llrpSetChromaSmoothMode(video, chroma);
+                    video->llrawproc->diso_auto_correction = -1;
+                    video->llrawproc->diso_ev_correction = 1.0;
+                    video->llrawproc->diso_black_delta = -1;
+                    ASSERT_FALSE(fixture.renderFrame8(0).empty());
+
+                    // CUDA arm: what the backend receives on the GPU plan's reduced run.
+                    {
+                        const FakeGpuBackendScope fake;
+                        GPU_DUALISO_TEST_SETENV("MLVAPP_FAKE_GPU_RECON_DUMP_DIR", dir.c_str());
+                        const bool ran = gpuReducedFrame(fixture, src.frame, scale, nullptr);
+                        GPU_DUALISO_TEST_UNSETENV("MLVAPP_FAKE_GPU_RECON_DUMP_DIR");
+                        ASSERT_TRUE(ran);
+                    }
+
+                    // CPU arm on the same bytes: the CPU plan with the GPU plan's shrink.
+                    GPU_DUALISO_TEST_UNSETENV("MLVAPP_GPU_PLAYBACK_RECON");
+                    mlvDualIsoPreviewScaleRecon_t plan;
+                    ASSERT_EQ(1, mlvDualIsoPreviewScaleReconPlan(video, scale, &plan));
+                    plan.phaseTentShrink = 1;
+                    const int w = plan.reducedWidth, h = plan.reducedHeight;
+                    const size_t n = static_cast<size_t>(w) * h;
+                    std::vector<uint16_t> cpuIn(n, 0u), gpuIn;
+                    {
+                        std::vector<uint16_t> raw = decodeRaw(fixture, src.frame);
+                        ASSERT_FALSE(raw.empty());
+                        WorkerState worker;
+                        ASSERT_TRUE(mlvDualIsoPreviewScaleReconShrink(video, &plan, raw.data(), cpuIn.data(),
+                                                                      &worker.state, 1, nullptr, nullptr) > 0);
+                    }
+                    ASSERT_TRUE(readU16(dir + "/in.u16", gpuIn, n));
+                    ASSERT_TRUE(writeU16(dir + "/cpu_in.u16", cpuIn));
+                    // Both routes then share the with-dims prefix (llrawproc.c:5277-5437, incl.
+                    // the restricted-range rescale) before the recon, so in.u16 is that prefix
+                    // applied to this shrink; recorded, not asserted byte-equal.
+                    size_t inMismatches = 0;
+                    for (size_t i = 0; i < n; ++i) inMismatches += gpuIn[i] != cpuIn[i];
+                    std::printf("[gpu-dualiso-preview-scale] receipt parity %s in.u16 vs CPU-plan tent shrink (pre-prefix): mismatches %zu / %zu\n",
+                                cell.c_str(), inMismatches, n);
+                    std::vector<uint16_t> raw = decodeRaw(fixture, src.frame);
+                    ASSERT_FALSE(raw.empty());
+                    std::vector<uint16_t> recon(n, 0u);
+                    {
+                        WorkerState worker;
+                        ASSERT_EQ(1, mlvDualIsoPreviewScaleReconRun(video, &plan, raw.data(), recon.data(),
+                                                                    &worker.state, 1, nullptr, nullptr));
+                    }
+                    GPU_DUALISO_TEST_SETENV("MLVAPP_GPU_PLAYBACK_RECON", "1");
+                    std::vector<uint16_t> notched(n, 0u);
+                    dualiso_reduced_iso_period_notch16(notched.data(), recon.data(), w, h);
+                    ASSERT_TRUE(writeU16(dir + "/out.u16", notched));
+                    ASSERT_TRUE(writeU16(dir + "/out_without_notch.u16", recon));
+                    std::printf("[gpu-dualiso-preview-scale] receipt parity %s %dx%d vectors written\n",
+                                cell.c_str(), w, h);
+
+                    // Output black in the 16-bit domain: the 20-bit recon black / 16.
+                    int black20 = 0;
+                    {
+                        FILE * f = std::fopen((dir + "/scalars.txt").c_str(), "r");
+                        ASSERT_TRUE(f != nullptr);
+                        char line[256];
+                        while (std::fgets(line, sizeof(line), f))
+                            if (std::sscanf(line, "black_level=%d", &black20) == 1) break;
+                        std::fclose(f);
+                    }
+                    ASSERT_TRUE(black20 > 0);
+                    const int black16 = black20 / 16;
+                    for (const bool withNotch : { false, true })
+                    {
+                        std::vector<uint16_t> cuda;
+                        if (!readU16(dir + (withNotch ? "/cuda_notch.u16" : "/cuda_nonotch.u16"), cuda, n))
+                        {
+                            std::printf("[gpu-dualiso-preview-scale] receipt parity %s notch %d: no CUDA output, dumped only\n",
+                                        cell.c_str(), withNotch ? 1 : 0);
+                            continue;
+                        }
+                        const SiteParity p = siteParity(cuda, withNotch ? notched : recon, w, h, black16);
+                        const char * sites[4] = { "s00", "s01", "s10", "s11" };
+                        std::printf("[gpu-dualiso-preview-scale] receipt parity %s notch %d:", cell.c_str(),
+                                    withNotch ? 1 : 0);
+                        for (int s = 0; s < 4; ++s)
+                            std::printf(" %s med %.4f r %.5f n %zu |", sites[s], p.median[s], p.r[s], p.samples[s]);
+                        std::printf(" max abs %d mismatches %zu / %zu\n", p.maxAbs, p.mismatches, n);
+                        bool green = p.maxAbs <= 4 && p.mismatches * 200 <= n;
+                        for (int s = 0; s < 4; ++s)
+                            green = green && p.median[s] >= 0.995 && p.median[s] <= 1.005 && p.r[s] >= 0.999;
+                        if (chroma == CS_OFF && alias == FR_ON) green = green && p.maxAbs == 0;
+                        failedCells += green ? 0 : 1;
+                    }
+                }
+    ASSERT_EQ(static_cast<size_t>(0), failedCells);
+}
+
+// r8 (VSTRIPES): #295 (LOOK-ASSIST-DUALISO-VSTRIPES-1) skips the vertical-stripe solve and apply on
+// dual-ISO frames. Without it the app's one-shot solve (llrpComputeStripesOn on load) rates RG-row
+// columns against greens of the other ISO field, the odd-column coefficients clamp near 2.0, and the
+// full-res fix pass doubles every odd column above black+64 before the tent shrink: the venue's x4/x2
+// comb input (r7). The frame is #295's S-0110 (rows y%4 in {1,2} bright, {0,3} dark), which drives the
+// detector to |log2 coeff| >= 0.9 on odd columns. A (the app shape: stripes 1, solve queued) and C
+// (stripes 1, no solve) differ only in the queued solve; their reduced recon must be byte-equal at x4
+// and x2 on the GPU plan's tent shrink and on the CPU plan's decimators, with no correction stored.
+// The non-dual control (#295's S-flat, DISO_INVALID) still solves and corrects; its output hash is
+// printed so it can be compared across builds.
+namespace {
+
+int vstripesTexture(int x, int y) { return ((x * 7 + y * 3) % 17) - 8; }
+
+// #295's S-0110 (interleaved) and S-flat frames, built in 14-bit units and handed over at the clip's bit
+// depth, as the decoder does.
+std::vector<uint16_t> vstripesFrame(MlvPipelineFixture & fixture, bool interleaved)
+{
+    const mlvObject_t * video = fixture.video();
+    const int w = fixture.width();
+    const int h = fixture.height();
+    const int shift = 14 - video->RAWI.raw_info.bits_per_pixel;
+    const int black14 = video->RAWI.raw_info.black_level << shift;
+    std::vector<uint16_t> frame(static_cast<size_t>(w) * static_cast<size_t>(h));
+    for (int y = 0; y < h; ++y)
+        for (int x = 0; x < w; ++x)
+        {
+            const int level = interleaved
+                ? ((y % 4 == 1 || y % 4 == 2) ? 4800 : 300) + vstripesTexture(x, y)
+                : ((x % 8 == 3) ? 2020 : 2000);
+            frame[static_cast<size_t>(y) * w + x] = static_cast<uint16_t>((black14 + level) >> shift);
+        }
+    if (!interleaved) frame[0] = static_cast<uint16_t>((black14 + 3000) >> shift);
+    return frame;
+}
+
+void printStripeCorrection(const std::string & label, const stripes_correction & sc)
+{
+    std::printf("[gpu-dualiso-preview-scale] vstripes %s: needed %d coeffs", label.c_str(), sc.correction_needed);
+    for (int j = 0; j < 8; ++j) std::printf(" %d", sc.coeffficients[j]);
+    std::printf(" (/65536:");
+    for (int j = 0; j < 8; ++j) std::printf(" %.5f", static_cast<double>(sc.coeffficients[j]) / 65536.0);
+    std::printf(")\n");
+}
+
+struct VStripesTentArm
+{
+    std::vector<uint16_t> reduced;
+    stripes_correction after;
+    int fullResFixes = 0;
+};
+
+// One reduced run of S-0110 on a fresh HQ tiny object: the solve is one-shot and its correction
+// persists, so each arm gets its own object.
+VStripesTentArm vstripesTentArm(int scale, bool tentShrink, bool solveQueued)
+{
+    GpuReconEnv env(false);
+    MlvPipelineFixture fixture;
+    QString error;
+    ASSERT_TRUE(fixture.openTinyDualIso(&error));
+    ASSERT_TRUE(fixture.loadReceipt(QStringLiteral("tests/fixtures/receipts/tiny_dual_iso_hq.marxml"), &error));
+    ASSERT_TRUE(fixture.applyReceipt(&error));
+    mlvObject_t * video = fixture.video();
+    ASSERT_TRUE(llrpGetDualIsoValidity(video) != DISO_INVALID);
+    video->llrawproc->focus_pixels = 0;
+    video->llrawproc->bad_pixels = 0;
+    llrpSetVerticalStripeMode(video, 0);
+    ASSERT_FALSE(fixture.renderFrame8(0).empty()); // settles the exposure match and the ISO pattern
+    // Both arms leave the prime with no correction and nothing queued (the receipt queues a solve).
+    std::memset(&video->llrawproc->stripe_corrections, 0, sizeof(video->llrawproc->stripe_corrections));
+    video->llrawproc->compute_stripes = 0;
+    llrpSetVerticalStripeMode(video, 1);
+    if (solveQueued) llrpComputeStripesOn(video);
+
+    VStripesTentArm arm;
+    mlvDualIsoPreviewScaleRecon_t plan;
+    ASSERT_EQ(1, mlvDualIsoPreviewScaleReconPlan(video, scale, &plan));
+    ASSERT_EQ(scale, plan.scale);
+    plan.phaseTentShrink = tentShrink ? 1 : 0;
+    arm.fullResFixes = plan.fullResFixes;
+    std::vector<uint16_t> raw = vstripesFrame(fixture, true);
+    arm.reduced.assign(static_cast<size_t>(plan.reducedWidth) * static_cast<size_t>(plan.reducedHeight), 0u);
+    WorkerState worker;
+    ASSERT_EQ(1, mlvDualIsoPreviewScaleReconRun(video, &plan, raw.data(), arm.reduced.data(),
+                                                &worker.state, 1, nullptr, nullptr));
+    arm.after = video->llrawproc->stripe_corrections;
+    return arm;
+}
+
+size_t countMismatches(const std::vector<uint16_t> & a, const std::vector<uint16_t> & b)
+{
+    if (a.size() != b.size()) return std::max(a.size(), b.size());
+    size_t n = 0;
+    for (size_t i = 0; i < a.size(); ++i) n += a[i] != b[i];
+    return n;
+}
+
+} // namespace
+
+TEST(GpuDualIsoPreviewScale, VerticalStripesLeaveTheDualIsoTentInputAlone)
+{
+    // The non-dual control first, so its hash prints on every build.
+    {
+        MlvPipelineFixture fixture;
+        QString error;
+        ASSERT_TRUE(fixture.openTinyDualIso(&error));
+        mlvObject_t * video = fixture.video();
+        llrawprocObject_t * shared = video->llrawproc;
+        shared->fix_raw = 1;
+        shared->focus_pixels = 0;
+        shared->bad_pixels = 0;
+        shared->pattern_noise = 0;
+        shared->dark_frame = 0;
+        shared->dual_iso = 0;
+        shared->diso_validity = DISO_INVALID;
+        llrpSetVerticalStripeMode(video, 1);
+        llrpComputeStripesOn(video);
+        std::vector<uint16_t> frame = vstripesFrame(fixture, false);
+        WorkerState worker;
+        applyLLRawProcObjectWorker(video, frame.data(), frame.size() * sizeof(uint16_t), &worker.state, 0);
+        printStripeCorrection("non-dual S-flat (DISO_INVALID, mode 1, solve queued)", shared->stripe_corrections);
+        std::printf("[gpu-dualiso-preview-scale] vstripes non-dual control output sha256 %s\n",
+                    sha256_bytes(frame.data(), frame.size() * sizeof(uint16_t)).c_str());
+        ASSERT_EQ(1, shared->stripe_corrections.correction_needed);
+    }
+
+    size_t failures = 0;
+    for (const int scale : { 4, 2 })
+        for (const bool tent : { true, false })
+        {
+            const std::string label = std::string("x") + std::to_string(scale) + (tent ? " GPU plan (tent)" : " CPU plan");
+            const VStripesTentArm a = vstripesTentArm(scale, tent, true);
+            const VStripesTentArm c = vstripesTentArm(scale, tent, false);
+            ASSERT_EQ(a.fullResFixes, c.fullResFixes);
+            printStripeCorrection(label + " A (solve queued)", a.after);
+            const size_t differ = countMismatches(a.reduced, c.reduced);
+            std::printf("[gpu-dualiso-preview-scale] vstripes %s: fullResFixes %d, A vs C reduced recon %s (%zu / %zu differ)\n",
+                        label.c_str(), a.fullResFixes, differ ? "DIFFERS" : "byte-equal", differ, a.reduced.size());
+            failures += (differ != 0 ? 1 : 0) + (a.after.correction_needed != 0 ? 1 : 0);
+        }
+    ASSERT_EQ(static_cast<size_t>(0), failures);
+}
+
+// r8: the M16-1243 cell of the same proof, opt-in (MLVAPP_C1_RECEIPT_CLIP names an existing clip.txt,
+// "<clip> <frame>"). The app shape (solve queued on load, run by the frame-0 prime) and no solve must hand
+// the tent shrink byte-equal reduced input at x4 and x2, with no correction stored. r7 read odd-column
+// coefficients of 131069/65536 without #295. Report only: the x1 full-res fix pass's odd/even column gain
+// above black+64 (CAST-5's "G1 about 1 EV").
+TEST(GpuDualIsoPreviewScale, M16VerticalStripesSolveLeavesTheReducedInputAlone)
+{
+    const char * clipTxt = std::getenv("MLVAPP_C1_RECEIPT_CLIP");
+    if (!clipTxt || !*clipTxt)
+    {
+        std::printf("[gpu-dualiso-preview-scale] M16 vstripes cell skipped (MLVAPP_C1_RECEIPT_CLIP unset)\n");
+        return;
+    }
+    char path[1024] = { 0 };
+    unsigned long long frame = 0;
+    FILE * f = std::fopen(clipTxt, "r");
+    ASSERT_TRUE(f != nullptr);
+    const int fields = std::fscanf(f, "%1023s %llu", path, &frame);
+    std::fclose(f);
+    ASSERT_EQ(2, fields);
+
+    GpuReconEnv env(false);
+    MlvPipelineFixture solved;
+    MlvPipelineFixture unsolved;
+    for (const bool solve : { true, false })
+    {
+        MlvPipelineFixture & fixture = solve ? solved : unsolved;
+        QString error;
+        ASSERT_TRUE(fixture.openClipFile(QString::fromLocal8Bit(path), &error));
+        mlvObject_t * video = fixture.video();
+        // The owner shape (as C1ReceiptConfigReconParity): HQ dual-ISO, receipt playback state.
+        llrpSetFixRawMode(video, 1);
+        llrpSetDualIsoMode(video, 1);
+        if (solve) llrpComputeStripesOn(video);
+        llrpSetDualIsoPlaybackForceMean23(video, 1);
+        llrpSetDualIsoInterpolationMethod(video, DISOI_MEAN23);
+        llrpSetDualIsoAliasMapMode(video, FR_OFF);
+        llrpSetDualIsoFullResBlendingMode(video, FR_ON);
+        llrpSetChromaSmoothMode(video, CS_2x2);
+        video->llrawproc->diso_auto_correction = -1;
+        video->llrawproc->diso_ev_correction = 1.0;
+        video->llrawproc->diso_black_delta = -1;
+        ASSERT_FALSE(fixture.renderFrame8(0).empty());
+        printStripeCorrection(std::string("M16 f") + std::to_string(frame) + (solve ? " app shape (solve queued)" : " no solve"),
+                              video->llrawproc->stripe_corrections);
+    }
+
+    size_t failures = solved.video()->llrawproc->stripe_corrections.correction_needed != 0 ? 1 : 0;
+    for (const int scale : { 4, 2 })
+    {
+        std::vector<uint16_t> reduced[2];
+        for (const bool solve : { true, false })
+        {
+            MlvPipelineFixture & fixture = solve ? solved : unsolved;
+            mlvDualIsoPreviewScaleRecon_t plan;
+            ASSERT_EQ(1, mlvDualIsoPreviewScaleReconPlan(fixture.video(), scale, &plan));
+            plan.phaseTentShrink = 1;
+            std::vector<uint16_t> raw = decodeRaw(fixture, frame);
+            ASSERT_FALSE(raw.empty());
+            std::vector<uint16_t> & out = reduced[solve ? 0 : 1];
+            out.assign(static_cast<size_t>(plan.reducedWidth) * static_cast<size_t>(plan.reducedHeight), 0u);
+            WorkerState worker;
+            ASSERT_TRUE(mlvDualIsoPreviewScaleReconShrink(fixture.video(), &plan, raw.data(), out.data(),
+                                                          &worker.state, 1, nullptr, nullptr) > 0);
+        }
+        const size_t differ = countMismatches(reduced[0], reduced[1]);
+        std::printf("[gpu-dualiso-preview-scale] M16 f%llu x%d tent shrink input: app shape vs no solve %s (%zu / %zu differ)\n",
+                    frame, scale, differ ? "DIFFERS" : "byte-equal", differ, reduced[0].size());
+        failures += differ != 0 ? 1 : 0;
+    }
+
+    // Report only: x1, the full-res fix pass on this frame, gain per column parity above black+64.
+    for (const bool solve : { true, false })
+    {
+        MlvPipelineFixture & fixture = solve ? solved : unsolved;
+        mlvObject_t * video = fixture.video();
+        const int shift = 14 - video->RAWI.raw_info.bits_per_pixel;
+        const double black14 = static_cast<double>(video->RAWI.raw_info.black_level << shift);
+        std::vector<uint16_t> raw = decodeRaw(fixture, frame);
+        ASSERT_FALSE(raw.empty());
+        const std::vector<uint16_t> before = raw;
+        {
+            WorkerState worker;
+            applyLLRawProcObjectWorker(video, raw.data(), raw.size() * sizeof(uint16_t), &worker.state, 1);
+        }
+        std::vector<double> gains[2];
+        for (size_t i = 0; i < raw.size(); ++i)
+        {
+            const double pre = static_cast<double>(before[i] << shift) - black14;
+            if (pre <= 64.0) continue;
+            gains[(i % static_cast<size_t>(fixture.width())) & 1].push_back((static_cast<double>(raw[i]) - black14) / pre);
+        }
+        double median[2] = { 0.0, 0.0 };
+        for (int p = 0; p < 2; ++p)
+        {
+            if (gains[p].empty()) continue;
+            std::nth_element(gains[p].begin(), gains[p].begin() + gains[p].size() / 2, gains[p].end());
+            median[p] = gains[p][gains[p].size() / 2];
+        }
+        std::printf("[gpu-dualiso-preview-scale] M16 f%llu x1 full-res fix pass (%s): median gain even %.4f odd %.4f, odd/even %.4f\n",
+                    frame, solve ? "app shape" : "no solve", median[0], median[1],
+                    median[0] > 0.0 ? median[1] / median[0] : 0.0);
+    }
+    ASSERT_EQ(static_cast<size_t>(0), failures);
 }
 
 // (f) Export after a reduced CUDA playback session in this process equals a fresh
