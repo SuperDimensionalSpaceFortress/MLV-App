@@ -1173,18 +1173,28 @@ class HostLoadSnapshotProducerAlignmentTests(_ProbeCase):
         burn = self.SLOW_EVIDENCE_CPU_SECONDS
         proc = self.run_snippet(
             "$script:firstEntry = $null; $script:lastExit = $null\n"
+            "$script:capHit = ''; $script:cimCallsStarted = 0; $script:cimCallsCompleted = 0\n"
             "function Get-CimInstance {\n"
             "    param($ClassName, $Filter, $ErrorAction, $OperationTimeoutSec)\n"
+            "    $script:cimCallsStarted++\n"
+            "    $callNumber = $script:cimCallsStarted\n"
             "    $spinner.Refresh()\n"
             "    $entry = $spinner.TotalProcessorTime.TotalSeconds\n"
             "    if ($null -eq $script:firstEntry) { $script:firstEntry = $entry }\n"
             f"    $deadline = [datetime]::UtcNow.AddSeconds({self.SLOW_EVIDENCE_WALL_CAP_SECONDS})\n"
             f"    while ($spinner.TotalProcessorTime.TotalSeconds -lt $entry + {burn}) {{\n"
-            "        if ([datetime]::UtcNow -gt $deadline) { throw 'spinner never burned the target CPU (wall cap)' }\n"
+            # Get-HostLoadSnapshot wraps its evidence collection in its own try/catch, so a throw from
+            # here is swallowed (collected=false) and the process still exits 0. Record the cap hit in a
+            # script-scope flag, which survives that catch, so the test can fail with the cap as the reason.
+            "        if ([datetime]::UtcNow -gt $deadline) {\n"
+            "            $script:capHit = \"CIM call $callNumber\"\n"
+            "            throw 'spinner never burned the target CPU (wall cap)'\n"
+            "        }\n"
             "        Start-Sleep -Milliseconds 20\n"
             "        $spinner.Refresh()\n"
             "    }\n"
             "    $script:lastExit = $spinner.TotalProcessorTime.TotalSeconds\n"
+            "    $script:cimCallsCompleted++\n"
             "    if ($ClassName -eq 'Win32_Processor') { [pscustomobject]@{ LoadPercentage = 5 } }\n"
             "    else { [pscustomobject]@{ FreePhysicalMemory = 1024; TotalVisibleMemorySize = 2048 } }\n"
             "}\n"
@@ -1196,6 +1206,9 @@ class HostLoadSnapshotProducerAlignmentTests(_ProbeCase):
             "    $before = Get-HostLoadSnapshot -TopProcessCount 1 -SubjectProcess $spinner\n"
             "    $spinner.Refresh()\n"
             "    $actualAfterCallSeconds = $spinner.TotalProcessorTime.TotalSeconds\n"
+            "    Write-Host \"COLLECTED=$($before.collected)\"\n"
+            "    Write-Host \"CAPHIT=$script:capHit\"\n"
+            "    Write-Host \"CIM_CALLS_COMPLETED=$script:cimCallsCompleted\"\n"
             "    Write-Host \"RECORDED=$($before.subjectCpuSeconds)\"\n"
             "    Write-Host \"FIRST_CIM_ENTRY=$script:firstEntry\"\n"
             "    Write-Host \"LAST_CIM_EXIT=$script:lastExit\"\n"
@@ -1206,9 +1219,30 @@ class HostLoadSnapshotProducerAlignmentTests(_ProbeCase):
         )
         self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
 
-        def _value(name: str) -> float:
-            return float(next(l for l in proc.stdout.splitlines() if l.startswith(name + "="))[len(name) + 1:])
+        def _text(name: str) -> str:
+            return next(l for l in proc.stdout.splitlines() if l.startswith(name + "="))[len(name) + 1:].strip()
 
+        def _value(name: str) -> float:
+            return float(_text(name))
+
+        # Checked BEFORE any CPU value is parsed: a wall-cap throw inside the mocked Get-CimInstance is
+        # swallowed by Get-HostLoadSnapshot's own try/catch, so the process still exits 0. Without these
+        # three checks a cap hit on the first call dies below as a bare ValueError (empty LAST_CIM_EXIT)
+        # and a cap hit on the second call passes silently on the first call's retained LAST_CIM_EXIT.
+        cap_hit = _text("CAPHIT")
+        self.assertEqual(
+            cap_hit, "",
+            f"the mocked slow evidence collection hit its {self.SLOW_EVIDENCE_WALL_CAP_SECONDS}s wall cap "
+            f"({cap_hit}): the spinner never burned {burn} CPU-seconds inside the mock, so this run proves nothing")
+        self.assertEqual(
+            _text("COLLECTED"), "True",
+            "Get-HostLoadSnapshot did not report collected=True -- a mocked evidence call threw "
+            f"(the {self.SLOW_EVIDENCE_WALL_CAP_SECONDS}s wall cap or otherwise) and the snapshot swallowed it")
+        self.assertEqual(
+            _text("CIM_CALLS_COMPLETED"), "2",
+            "expected both mocked Get-CimInstance calls (Win32_Processor, Win32_OperatingSystem) to complete "
+            f"their {burn} CPU-second burn; a fewer count means a call hit the "
+            f"{self.SLOW_EVIDENCE_WALL_CAP_SECONDS}s wall cap and the retained LAST_CIM_EXIT is stale")
         recorded = _value("RECORDED")
         first_cim_entry = _value("FIRST_CIM_ENTRY")
         last_cim_exit = _value("LAST_CIM_EXIT")
