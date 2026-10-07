@@ -129,14 +129,15 @@ def side_branch_subjects(repo_root: Path, first_parent: str, second_parent: str)
 
 
 def changed_paths(repo_root: Path, commit_hash: str, *, limit: int = 20) -> List[str]:
-    raw = run_git(repo_root, ["diff-tree", "--no-commit-id", "--name-only", "-r", commit_hash])
-    return [line for line in raw.splitlines() if line][:limit]
+    # `-z`: without it git quotes a non-ASCII path, which no prefix test matches (bus de09cae).
+    raw = run_git(repo_root, ["diff-tree", "--no-commit-id", "--name-only", "-z", "-r", commit_hash])
+    return [part for part in raw.split("\0") if part][:limit]
 
 
 def changed_paths_for_row(repo_root: Path, row: CommitRow, *, limit: int = 40) -> List[str]:
     if len(row.parents) >= 2:
-        raw = run_git(repo_root, ["diff", "--name-only", row.parents[0], row.parents[1]])
-        paths = [line for line in raw.splitlines() if line]
+        raw = run_git(repo_root, ["diff", "--name-only", "-z", row.parents[0], row.parents[1]])
+        paths = [part for part in raw.split("\0") if part]
         if paths:
             return paths[:limit]
     return changed_paths(repo_root, row.hash, limit=limit)

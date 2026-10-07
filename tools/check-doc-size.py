@@ -157,13 +157,13 @@ def upstream_markdown(repo: Path) -> set[str]:
     if not UPSTREAM_REF:
         return set()
     proc = subprocess.run(
-        ["git", "-C", str(repo), "ls-tree", "-r", "--name-only", UPSTREAM_REF],
+        ["git", "-C", str(repo), "ls-tree", "-r", "--name-only", "-z", UPSTREAM_REF],
         capture_output=True,
         text=True,
     )
     if proc.returncode != 0:
         return set()
-    return {p for p in proc.stdout.split("\n") if p.endswith(".md")}
+    return {p for p in proc.stdout.split("\0") if p.endswith(".md")}
 
 
 def classify(path: str, upstream: frozenset[str] = frozenset()) -> str | None:

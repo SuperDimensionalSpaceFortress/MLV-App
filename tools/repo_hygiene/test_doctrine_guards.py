@@ -22,7 +22,12 @@ NON-PROMISES:
   flagged, and a file that does not parse fails the check as could-not-check.
 - Only files git tracks are checked; untracked and user-scope files are not
   (user-scope hooks must be proven to fire by a receipt).
-- Only the three traps in REGISTRY are guarded.
+- Only the traps in REGISTRY are guarded.
+- DG-GIT-PATHLIST reads Python by AST (the string constants of one list, tuple or call must
+  carry -z or core.quotepath=false) and PowerShell by one source line; a command assembled
+  from variables or one joined string is not seen. Test files are not scanned. A call that
+  needs no path text (exit code, emptiness, a count) is listed in GIT_PATHLIST_ALLOW with its
+  reason; git_paths() in tools/coordination/doctrine_outbox.py adds -z itself.
 - DG-PS-NULL-COMPARE flags only a literal ``$null`` on the RIGHT of
   -eq/-ne/-ceq/-cne/-ieq/-ine. The ``-eq $false`` tri-state form on a possibly-null
   value (tools/profiling/compare-machine-perf.ps1, run-release-cuda-playback-ab.ps1)
@@ -36,8 +41,10 @@ runner (whose images carry pwsh) a missing pwsh FAILS instead.
 
 from __future__ import annotations
 
+import ast
 import json
 import os
+import re
 import shutil
 import subprocess
 import tempfile
@@ -251,6 +258,122 @@ def check_hook_event(root: Path, rel_paths: list[str]) -> list[Violation]:
     return out
 
 
+# ---------------------------------------------------------------------------
+# DG-GIT-PATHLIST (bus de09cae): git quotes a non-ASCII path in its plain path-list output
+# (core.quotepath defaults to true), so a prefix or equality test on that output misses it.
+# ---------------------------------------------------------------------------
+# Display-only and emptiness-only call sites, by (tracked path, needle that must occur in the
+# flagged call's source text, why it is safe). Each entry is checked for staleness against the
+# live tree, so a call site that moves or is fixed leaves a failing entry behind, not a silent one.
+GIT_PATHLIST_ALLOW: tuple[tuple[str, str, str], ...] = (
+    ("tools/build-release.ps1", "$SourceRoot status --porcelain",
+     "dirty-or-clean test on 'any output'; the lines are only echoed back to the console"),
+    ("tools/coordination/Invoke-Workstream.ps1", "$existingWt status --porcelain",
+     "refuses on a non-zero count and names the lines in a message; no path is tested or opened"),
+    ("tools/coordination/Retire-LaneWorktree.ps1", "`git status --porcelain -uall` is non-empty",
+     "a comment in the script's own header block, not a call"),
+    ("tools/coordination/Retire-LaneWorktree.ps1", "'status', '--porcelain', '-uall'",
+     "refuses on a non-zero count and quotes the first line in the reason; the ignored-entry listing, "
+     "whose paths ARE tested and moved, carries core.quotepath=false"),
+    ("tools/gen-buildinfo.ps1", "GitOut @('status','--porcelain')",
+     "dirty flag from 'any output'; the text is never read as a path"),
+    ("tools/profiling/export-release-cuda-dogfood-kit.ps1", "-C $root status --porcelain",
+     "dirty flag from a count; the text is never read as a path"),
+    ("tools/release/build_stamp.py", 'git(root, "status", "--porcelain")',
+     "refuses on 'any output' and echoes it in the error; no path is tested"),
+    ("tools/repo_hygiene/brokered_closeout.py", '"status", "--porcelain=v1", "--", path',
+     "one already-known path; only 'any output' is tested, the text is never parsed"),
+    ("tools/session-checkpoint.py", '"diff", "--name-only"',
+     "the dirty-file list is written to a checkpoint for display and compared only against its own "
+     "earlier snapshot in the same quoted form; no prefix test"),
+    ("tools/session-checkpoint.py", '"ls-files", "--others"',
+     "the dirty-file list is written to a checkpoint for display and compared only against its own "
+     "earlier snapshot in the same quoted form; no prefix test"),
+)
+
+
+def is_git_pathlist_scanned(rel: str) -> bool:
+    """Python and PowerShell tool code. Test files are not scanned: they list scratch repos they
+    populate with ASCII names, and they are the guard's own fixtures' neighbours, not its subject."""
+    p = PurePosixPath(rel)
+    if p.suffix.lower() not in (".py", ".ps1", ".psm1"):
+        return False
+    name = p.name.lower()
+    is_test = ("tests" in p.parts[:-1] or name.startswith("test_") or name.endswith("_test.py")
+               or name.endswith(".tests.ps1"))
+    return not is_test
+
+
+def _git_pathlist_kind(tokens: set[str]) -> str | None:
+    """Which path-listing git command a set of argument tokens spells, or None."""
+    if "ls-files" in tokens and "--error-unmatch" not in tokens:  # --error-unmatch is read by exit code
+        return "ls-files"
+    if "ls-tree" in tokens and "--name-only" in tokens:
+        return "ls-tree --name-only"
+    if tokens & {"diff", "log", "diff-tree", "show", "stash"} and tokens & {"--name-only", "--name-status"}:
+        return "diff/log/diff-tree --name-only|--name-status"
+    if "status" in tokens and any(t.startswith("--porcelain") for t in tokens):
+        return "status --porcelain"
+    return None
+
+
+def _git_pathlist_safe(tokens: set[str]) -> bool:
+    return "-z" in tokens or any("core.quotepath=false" in t for t in tokens)
+
+
+_PS_TOKEN = re.compile(r"--?[\w=.:-]+|[\w=.:-]+")
+# Calls to these helpers add `-z` themselves (tools/coordination/doctrine_outbox.py git_paths).
+_GIT_PATHLIST_HELPERS = frozenset(("git_paths",))
+
+
+def scan_git_pathlist(root: Path, rel_paths: list[str]) -> list[tuple[Violation, str]]:
+    """Every git path-list invocation without `-z` or `core.quotepath=false`, with its source text.
+
+    Python: the string constants of one list/tuple/call spell the command, so `-z` must sit in the
+    same list or call. PowerShell: one source line spells it (comment lines are skipped)."""
+    found: list[tuple[Violation, str]] = []
+    for rel in rel_paths:
+        try:
+            text = (root / rel).read_text(encoding="utf-8")
+        except (OSError, ValueError) as exc:
+            raise CouldNotCheck(f"{rel} is not readable text: {exc}") from exc
+        if rel.lower().endswith(".py"):
+            try:
+                tree = ast.parse(text)
+            except SyntaxError as exc:
+                raise CouldNotCheck(f"{rel} does not parse as Python: {exc}") from exc
+            for node in ast.walk(tree):
+                if isinstance(node, (ast.List, ast.Tuple)):
+                    parts = node.elts
+                elif isinstance(node, ast.Call):
+                    if isinstance(node.func, ast.Name) and node.func.id in _GIT_PATHLIST_HELPERS:
+                        continue
+                    parts = node.args
+                else:
+                    continue
+                tokens = {p.value for p in parts if isinstance(p, ast.Constant) and isinstance(p.value, str)}
+                kind = _git_pathlist_kind(tokens)
+                if kind and not _git_pathlist_safe(tokens):
+                    found.append((Violation("DG-GIT-PATHLIST", rel, node.lineno,
+                                            f"{kind} without -z or core.quotepath=false"),
+                                  ast.get_source_segment(text, node) or ""))
+        else:
+            for number, line in enumerate(text.splitlines(), 1):
+                if line.lstrip().startswith("#"):
+                    continue
+                tokens = set(_PS_TOKEN.findall(line))
+                kind = _git_pathlist_kind(tokens)
+                if kind and not _git_pathlist_safe(tokens):
+                    found.append((Violation("DG-GIT-PATHLIST", rel, number,
+                                            f"{kind} without -z or core.quotepath=false"), line))
+    return found
+
+
+def check_git_pathlist(root: Path, rel_paths: list[str]) -> list[Violation]:
+    return [v for v, source in scan_git_pathlist(root, rel_paths)
+            if not any(v.path == path and needle in source for path, needle, _why in GIT_PATHLIST_ALLOW)]
+
+
 @dataclass(frozen=True)
 class Guard:
     id: str
@@ -271,6 +394,9 @@ REGISTRY: tuple[Guard, ...] = (
     Guard("PS-ONE-TRAP", "eee0f66",
           "PowerShell runs only the FIRST trap in a scope; a second one is dead code",
           is_powershell, check_ps_one_trap, True),
+    Guard("DG-GIT-PATHLIST", "de09cae",
+          "git quotes a non-ASCII path in its plain path-list output, so a path-prefix test on it misses the path",
+          is_git_pathlist_scanned, check_git_pathlist, False),
 )
 GUARDS = {g.id: g for g in REGISTRY}
 
@@ -309,6 +435,37 @@ FIXTURES: dict[str, dict[str, dict[str, str]]] = {
             ".claude/settings.json": json.dumps(
                 {"hooks": {"_comment_x": "note", "SessionStart": [], "PreToolUse": [], "Stop": []}}),
             "sub/.claude/settings.local.json": json.dumps({"permissions": {"allow": []}}),
+        },
+    },
+    "DG-GIT-PATHLIST": {
+        # Bus de09cae: `agents/caf<e-acute>.md` read as `"agents/caf\303\251.md"` and passed a prefix test.
+        "red": {
+            "tools/a.py": "import subprocess\n"
+                          "def f(repo):\n"
+                          "    subprocess.run(['git', '-C', repo, 'ls-files'])\n"
+                          "    subprocess.run(['git', 'diff-tree', '--no-commit-id', '--name-only', '-r', 'HEAD'])\n"
+                          "    git(repo, 'log', '--name-status')\n"
+                          "    run_git(repo, ['status', '--porcelain=v1'])\n"
+                          "    git(repo, 'ls-tree', '-r', '--name-only', 'HEAD')\n",
+            "tools/b.ps1": "$staged = @(& git -C $root diff --cached --name-only)\n"
+                           "$d = @(Run-Git $wd @('status', '--porcelain', '-uall'))\n",
+        },
+        "green": {
+            "tools/a.py": "import subprocess\n"
+                          "def f(repo):\n"
+                          "    subprocess.run(['git', '-C', repo, 'ls-files', '-z'])\n"
+                          "    subprocess.run(['git', '-c', 'core.quotepath=false', 'diff-tree', '--name-only', '-r', 'HEAD'])\n"
+                          "    git(repo, 'diff', '--name-only', '-z', 'a', 'b')\n"
+                          "    git_paths(repo, 'ls-tree', '-r', '--name-only', 'HEAD')\n"
+                          "    run_git(repo, ['ls-files', '--error-unmatch', '--', 'x'])\n"
+                          "    run_git(repo, ['worktree', 'list', '--porcelain'])\n"
+                          "    run_git(repo, ['blame', '--porcelain', 'f'])\n"
+                          "    run_git(repo, ['stash', 'list'])\n"
+                          "    note = 'git ls-files is only text here'\n",
+            "tools/b.ps1": "# git ls-files in a comment is not a call\n"
+                           "$a = @(& git -C $root -c core.quotepath=false status --porcelain)\n"
+                           "$b = @(& git -C $root diff --cached --name-only -z)\n"
+                           "& git -C $root worktree list --porcelain\n",
         },
     },
     "PS-ONE-TRAP": {
@@ -361,6 +518,11 @@ class RegistryTests(unittest.TestCase):
         self.assertTrue(is_claude_settings("a/b/.claude/settings.local.json"))
         self.assertFalse(is_claude_settings("tools/agent-bridge/settings.example.json"))
         self.assertFalse(is_claude_settings(".claude/hooks/settings.json"))
+        self.assertTrue(is_git_pathlist_scanned("tools/coordination/doctrine_outbox.py"))
+        self.assertTrue(is_git_pathlist_scanned("tools/dual-lane/lane-guard.ps1"))
+        self.assertFalse(is_git_pathlist_scanned("tools/repo_hygiene/test_brokered_closeout.py"))
+        self.assertFalse(is_git_pathlist_scanned("tests/coordination/test_doctrine_outbox.py"))
+        self.assertFalse(is_git_pathlist_scanned("tools/coordination/doctrine_outbox.md"))
 
     def test_untracked_files_are_not_checked(self) -> None:
         if shutil.which("git") is None:
@@ -405,6 +567,22 @@ class GuardFixtureTests(_PwshMixin, unittest.TestCase):
 
     def test_hook_event_green_passes(self) -> None:
         self._assert_green("DG-HOOK-EVENT")
+
+    def test_git_pathlist_red_fails(self) -> None:
+        self._assert_red("DG-GIT-PATHLIST", {("tools/a.py", 3), ("tools/a.py", 4), ("tools/a.py", 5),
+                                             ("tools/a.py", 6), ("tools/a.py", 7),
+                                             ("tools/b.ps1", 1), ("tools/b.ps1", 2)})
+
+    def test_git_pathlist_green_passes(self) -> None:
+        self._assert_green("DG-GIT-PATHLIST")
+
+    def test_git_pathlist_allowlist_is_keyed_by_path(self) -> None:
+        path, needle, _why = GIT_PATHLIST_ALLOW[0]
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            rels = _write_tree(root, {"tools/elsewhere.ps1": f"$x = (& git -C {needle})\n"})
+            self.assertNotEqual(rels, [path])
+            self.assertEqual(len(check_git_pathlist(root, rels)), 1)
 
     def test_ps_one_trap_red_fails(self) -> None:
         self._assert_red("PS-ONE-TRAP", {("a.ps1", 3)})
@@ -451,6 +629,16 @@ class LiveTreeTests(_PwshMixin, unittest.TestCase):
 
     def test_live_tree_ps_one_trap(self) -> None:
         self._assert_live_green("PS-ONE-TRAP")
+
+    def test_live_tree_git_pathlist(self) -> None:
+        self._assert_live_green("DG-GIT-PATHLIST")
+
+    def test_git_pathlist_allowlist_has_no_stale_entries(self) -> None:
+        rels = [p for p in tracked_files(REPO_ROOT) if is_git_pathlist_scanned(p)]
+        raw = scan_git_pathlist(REPO_ROOT, rels)
+        stale = [f"{path}: {needle}" for path, needle, _why in GIT_PATHLIST_ALLOW
+                 if not any(v.path == path and needle in source for v, source in raw)]
+        self.assertEqual(stale, [], "allowlist entries that match no call site; remove them")
 
 
 if __name__ == "__main__":
