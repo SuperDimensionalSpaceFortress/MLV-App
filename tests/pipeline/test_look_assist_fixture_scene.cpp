@@ -1018,16 +1018,23 @@ const IdentityCase kIdentityCases[] = {
 // picture the display shows (MLV_PROCESSED_THUMBNAIL_DISPLAY_LEVELS), not the 1.8 EV brighter judgement calibration,
 // so it meters median 33 / 31 where it metered 88 / 86 (13 -> 154, 16 -> 163, -46 -> 96). With the flag off the build
 // reproduces the previous pins exactly; scene, white balance, every other slider and the picture hash do not move.
+// LOOK-ASSIST-DUALISO-VSTRIPES-1 re-pins all four receipts and hashes (the verdicts do not move): the tracked fixtures are 5D3
+// dual-ISO clips, the default receipt turned the vertical-stripe fix on, and it corrupted the picture these pins encoded. Each
+// new value is what c7e51d03 produces with vertical stripes forced off (the PR's proof (c)).
 struct IdentityPin { const char *scene; const char *receipt; const char *pictureSha256; };
 const IdentityPin kIdentityPins[] = {
-    { "shade", "exp=154 contrast=15 pivot=55 temp=6540 tint=-35 vibrance=5 shadows=12 highlights=-12 chromaSmooth=1",
-      "9a16525a28dc92ed96fe5940ccceaeec1ecd0aca5e1a74360ba9709fbf7a3e30" },
-    { "shade", "exp=163 contrast=15 pivot=55 temp=6540 tint=-35 vibrance=5 shadows=12 highlights=-12 chromaSmooth=1",
-      "f36fb58ce3680f57bd06e9d538db1e08bf74fad1963c70353049c69954f9f099" },
-    { "night", "exp=96 contrast=14 pivot=46 temp=6000 tint=0 vibrance=3 shadows=32 highlights=-18 chromaSmooth=1",
-      "4e9d6211cc6328216538224b3f9fe5be4c4f16e83343219d49984f473f49c83d" },
-    { "night", "exp=96 contrast=14 pivot=46 temp=6000 tint=0 vibrance=3 shadows=32 highlights=-18 chromaSmooth=1",
-      "4e9d6211cc6328216538224b3f9fe5be4c4f16e83343219d49984f473f49c83d" },
+    // LOOK-ASSIST-DUALISO-VSTRIPES-1: was exp=154 temp=6540 tint=-35, 9a16525a...; stripes no longer run on dual-ISO frames.
+    { "shade", "exp=173 contrast=15 pivot=55 temp=5840 tint=6 vibrance=5 shadows=12 highlights=-12 chromaSmooth=1",
+      "d8d3c390730d44afce36fcd1725f3b38f167883ec0bb2c697eb762331c8ea80d" },
+    // LOOK-ASSIST-DUALISO-VSTRIPES-1: was exp=163 temp=6540 tint=-35, f36fb58c...; stripes no longer run on dual-ISO frames.
+    { "shade", "exp=178 contrast=15 pivot=55 temp=5840 tint=6 vibrance=5 shadows=12 highlights=-12 chromaSmooth=1",
+      "40ad86fed3e446e4e0fc0b8c8e20742f3a70b1f83019a0a963a0d2c3e1a65904" },
+    // LOOK-ASSIST-DUALISO-VSTRIPES-1: was exp=96 temp=6000 tint=0, 4e9d6211...; stripes no longer run on dual-ISO frames.
+    { "night", "exp=114 contrast=14 pivot=46 temp=5840 tint=6 vibrance=3 shadows=32 highlights=-18 chromaSmooth=1",
+      "d8d3c390730d44afce36fcd1725f3b38f167883ec0bb2c697eb762331c8ea80d" },
+    // LOOK-ASSIST-DUALISO-VSTRIPES-1: was exp=96 temp=6000 tint=0, 4e9d6211...; stripes no longer run on dual-ISO frames.
+    { "night", "exp=114 contrast=14 pivot=46 temp=5840 tint=6 vibrance=3 shadows=32 highlights=-18 chromaSmooth=1",
+      "d8d3c390730d44afce36fcd1725f3b38f167883ec0bb2c697eb762331c8ea80d" },
 };
 
 } // namespace
@@ -1527,14 +1534,16 @@ TEST(LookAssistFixtureScene, WindowLitTraceCarriesTheRawExposureFieldsInTheirOwn
     ASSERT_TRUE( run.pictureSha256 == kIdentityPins[2].pictureSha256 );
     const QString line = windowLitLine( run.log );
     ASSERT_FALSE( line.isEmpty() );
-    ASSERT_TRUE( line.contains( QStringLiteral(" wouldReclassify=false reason=not-processed-solve scene=night ") ) );
+    // LOOK-ASSIST-DUALISO-VSTRIPES-1: was reason=not-processed-solve; stripes no longer run on dual-ISO frames.
+    ASSERT_TRUE( line.contains( QStringLiteral(" wouldReclassify=false reason=dim-patch scene=night ") ) );
     ASSERT_TRUE( line.contains( QStringLiteral(" expoIso=100 expoShutterUs=737 lensApertureX100=0") ) );
 
     // The all-zero state on the same line (not satisfied by the applied line).
     IdentityRun noMeta;
     ASSERT_TRUE( runIdentityCase( kIdentityCases[2], &noMeta ) );
     const QString noMetaLine = windowLitLine( noMeta.log );
-    ASSERT_TRUE( noMetaLine.contains( QStringLiteral(" wouldReclassify=false reason=not-processed-solve scene=night ") ) );
+    // LOOK-ASSIST-DUALISO-VSTRIPES-1: was reason=not-processed-solve; stripes no longer run on dual-ISO frames.
+    ASSERT_TRUE( noMetaLine.contains( QStringLiteral(" wouldReclassify=false reason=not-daylight-locus scene=night ") ) );
     ASSERT_TRUE( noMetaLine.contains( QStringLiteral(" expoIso=0 expoShutterUs=0 lensApertureX100=0") ) );
 }
 
@@ -1634,7 +1643,8 @@ TEST(LookAssistFixtureScene, TheApertureBoundThroughTheRealHeadlessPath)
     // (b) The M16 exposure with no aperture (ISO 100, 1/1357 s: bound 10.4; the fixture's DISO block decodes to a 1600
     //     recovery ISO, so 6.4 after the 4-stop credit): night is ruled out by the exposure, but the bound alone never
     //     changes a verdict. Here the night path's processed picture yields no patch to verify (not-processed-solve), so
-    //     the receipt and picture are the pinned night's, bit for bit.
+    //     the receipt and picture are the pinned night's, bit for bit. (Since LOOK-ASSIST-DUALISO-VSTRIPES-1 the de-striped
+    //     picture has a patch, refused as dim-patch: the verdict, receipt and picture are still the pinned night's.)
     {
         const IdentityCase c = { "tiny-no-aperture-m16", "tests/fixtures/clips/tiny_dual_iso.mlv", true, 100, 737, 0, 1 };
         IdentityRun run;
@@ -1649,7 +1659,8 @@ TEST(LookAssistFixtureScene, TheApertureBoundThroughTheRealHeadlessPath)
             "ev100_bound=10.406 ev100_source=aperture_bound surface_search=not-run surface_search_balance=NA "
             "flavor=classic") ) );
         const QString log = QString::fromUtf8( run.log );
-        ASSERT_TRUE( log.contains( QStringLiteral("wouldReclassify=false reason=not-processed-solve ") ) );
+        // LOOK-ASSIST-DUALISO-VSTRIPES-1: was reason=not-processed-solve; stripes no longer run on dual-ISO frames.
+        ASSERT_TRUE( log.contains( QStringLiteral("wouldReclassify=false reason=dim-patch ") ) );
         ASSERT_TRUE( log.contains( QStringLiteral(" applied=false exposureBound=true recoveryIso=1600 ") ) );
         ASSERT_TRUE( run.scene == QString::fromLatin1( kIdentityPins[2].scene ) );
         ASSERT_TRUE( run.receipt == QString::fromLatin1( kIdentityPins[2].receipt ) );
