@@ -266,8 +266,9 @@ bool gpuPreviewProcessingCpuHasSpatialPostPass(const GpuPreviewProcessingConfig 
 /* CPU-PLAYBACK-PREP-WORKER-BUILD-1 D1: the byte-identical tier-1 items (row-
  * parallel box blur/chroma/sharpen/median, the parallel S/H quarter-blur
  * expansion, the fused 8-bit pass, the prep thread's persistent scratch and
- * shared avir pool) are OFF unless MLVAPP_PLAYBACK_PREP_TIER1 is set to anything
- * but "0". Read on every call. */
+ * shared avir pool) are OFF unless MLVAPP_PLAYBACK_PREP_TIER1 is exactly "1"
+ * (strict opt-in: "0", "off", "", whitespace, " 1" and "1garbage" are all off).
+ * Read on every call. */
 const char * gpuPreviewProcessingTier1SwitchName(void);
 bool gpuPreviewProcessingTier1Enabled(void);
 /* gpuPreviewProcessingApplyCpuReference with per-stage spans (spans may be null). */

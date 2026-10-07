@@ -648,6 +648,28 @@ TEST(PlaybackPrepWorkerBuild, Tier1ByteIdentityWithTheSwitchOff)
     runTier1ByteIdentity(false, false);
 }
 
+TEST(PlaybackPrepWorkerBuild, Tier1SwitchIsStrictOptIn)
+{
+    /* Only the literal "1" enables tier 1; every other value, and unset, is off. */
+    const char * name = gpuPreviewProcessingTier1SwitchName();
+    const bool had = qEnvironmentVariableIsSet(name);
+    const QByteArray previous = qgetenv(name);
+    qunsetenv(name);
+    ASSERT_FALSE(gpuPreviewProcessingTier1Enabled());
+    const char * offValues[] = { "0", "off", "OFF", "", " ", "\t", " 1", "1 ", "1garbage", "true", "2" };
+    for (const char * value : offValues)
+    {
+        qputenv(name, QByteArray(value));
+        if (gpuPreviewProcessingTier1Enabled())
+            std::fprintf(stderr, "[PREP-SWITCH] \"%s\" enabled tier 1\n", value);
+        ASSERT_FALSE(gpuPreviewProcessingTier1Enabled());
+    }
+    qputenv(name, QByteArray("1"));
+    ASSERT_TRUE(gpuPreviewProcessingTier1Enabled());
+    if (had) qputenv(name, previous);
+    else qunsetenv(name);
+}
+
 TEST(PlaybackPrepWorkerBuild, Tier1ScratchFollowsADimsChange)
 {
     Tier1Switch tier1Scope(true);

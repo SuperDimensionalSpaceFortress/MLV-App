@@ -3903,9 +3903,8 @@ const char * gpuPreviewProcessingTier1SwitchName(void)
 
 bool gpuPreviewProcessingTier1Enabled(void)
 {
-    return qEnvironmentVariableIsSet( gpuPreviewProcessingTier1SwitchName() )
-        && qEnvironmentVariable( gpuPreviewProcessingTier1SwitchName() ).trimmed()
-               != QStringLiteral("0");
+    /* Strict opt-in (PREP-WORKER-STRICT-TIER1-OPTIN-1): only the literal "1". */
+    return qgetenv( gpuPreviewProcessingTier1SwitchName() ) == QByteArrayLiteral("1");
 }
 
 static double cpuReferenceSpanMs(const QElapsedTimer & clock, qint64 startNs)
