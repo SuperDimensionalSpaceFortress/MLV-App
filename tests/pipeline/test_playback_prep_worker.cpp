@@ -11,9 +11,9 @@
 //      must, and never reduces a source twice.
 //  T6  the reduced-mask cache follows the config generation, and the workspace
 //      knows when a second thread touches it.
-// No assertion here reads a duration.
+// No assertion here reads a duration. Results are printed ([PREP-T1]/[PREP-T4]),
+// never recorded as golden artifacts.
 #include "../common/minitest.h"
-#include "../common/test_artifacts.h"
 
 #include "mlv_pipeline_fixture.h"
 #include "../common/repo_paths.h"
@@ -601,8 +601,6 @@ void runTier1ByteIdentity(bool large)
     }
     ASSERT_EQ(2, framesChecked);
     std::printf("[PREP-T1] %s frames=%d cases=%d\n", large ? "large" : "tiny", framesChecked, casesChecked);
-    test_artifacts::record(std::string("playback_prep_worker_build.t1.cases.") + (large ? "large" : "tiny"),
-                           std::to_string(casesChecked));
 }
 } // namespace
 
@@ -821,7 +819,6 @@ TEST(PlaybackPrepWorkerBuild, Tier2PointwiseStagesStayWithinTheRegisteredToleran
                 const ReducedComparison rc = compareReduced(sc, sc.frames[f], factor, workspace, 7);
                 const std::string label = std::string(stageName(stage)) + ".x" + std::to_string(factor)
                     + ".frame" + std::to_string(f);
-                test_artifacts::record("playback_prep_worker_build.t4." + label, rc.line);
                 std::printf("[PREP-T4] %s %s\n", label.c_str(), rc.line.c_str());
                 if (!rc.withinTolerance) failures += label + " ";
             }
@@ -855,7 +852,6 @@ TEST(PlaybackPrepWorkerBuild, Tier2StrongShadowsHighlightsReadsTheBlurAtTheReduc
             const ReducedComparison rc = compareReduced(sc, sc.frames[0], factor, workspace, 3);
             const std::string label = std::string(stageName(stage)) + ".strong.x" + std::to_string(factor);
             std::printf("[PREP-T4] %s %s\n", label.c_str(), rc.line.c_str());
-            test_artifacts::record("playback_prep_worker_build.t4." + label, rc.line);
             if (!rc.withinTolerance)
                 ::minitest::fail(__FILE__, __LINE__, "tier-2 tolerance (strong S/H) " + label, rc.line);
         }
@@ -875,8 +871,6 @@ TEST(PlaybackPrepWorkerBuild, Tier2RefusedStagesAreReportedAndRefused)
             const ReducedComparison rc = compareReduced(sc, sc.frames[0], factor, workspace, 5);
             const std::string label = std::string(stageName(stage)) + ".x" + std::to_string(factor);
             std::printf("[PREP-T4] %s within=%d %s\n", label.c_str(), rc.withinTolerance ? 1 : 0, rc.line.c_str());
-            test_artifacts::record("playback_prep_worker_build.t4.refused." + label,
-                                   std::string(rc.withinTolerance ? "within " : "exceeds ") + rc.line);
         }
         /* Whatever the numbers, the policy never reduces these configs. */
         PlaybackPrepReducedInputs in;
