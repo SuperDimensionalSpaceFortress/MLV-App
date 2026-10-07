@@ -193,6 +193,7 @@ SOURCES += \
     SessionModel.cpp \
     Updater/Updater.cpp \
     GpuPreviewProcessing.cpp \
+    PlaybackPrepCpuRoute.cpp \
     GpuDebayer.cpp \
     GpuDisplayViewport.cpp \
     GpuDisplayWindow.cpp \
@@ -385,6 +386,7 @@ HEADERS += MainWindow.h \
            DualIsoPatternMapping.h \
            GpuDebayer.h \
            GpuPreviewProcessing.h \
+           PlaybackPrepCpuRoute.h \
            GpuPreviewHostRoute.h \
     GpuDisplayViewport.h \
     GpuDisplayWindow.h \
