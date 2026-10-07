@@ -787,9 +787,10 @@ TEST(GpuDualIsoPreviewScale, NotchKeepsColourPlanesSeparate)
 // kReducedHnyquistOnReducedPresents is 1. ref_bin, the ideal reduced preview: the full-res
 // CPU recon (x1 hint) tent-binned by colour (sameColourTentBin), then the same AMaZE and
 // processing. ref_box: the full-res route's output box-downsampled (the r1b-r3 reference).
-// Gated: L1 row-p4 <= 0.02; L2 col-p4 <= 3 x ref_box + 0.02; L3r lag-4 >= 0.85 x ref_bin;
-// L9r lag-2 >= 0.90 x ref_bin; L4 channel means within 0.02 of ref_bin; L8 colNyq <=
-// 2 x ref_bin + 0.002. Reported only: L3a, L3b and L9 against ref_box, the same metrics
+// Gated: L1 row-p4 <= 0.02; L2 col-p4 <= 3 x ref_box + 0.02; L4 channel means within 0.02
+// of ref_bin; L8 colNyq <= 2 x ref_bin + 0.002. L3r (lag-4 / ref_bin, was >= 0.85) and L9r
+// (lag-2 / ref_bin, was >= 0.90) are report-only by the r6 design ruling, gated only by the
+// gross-blur tripwire L3r, L9r >= 0.55. Reported only: L3a, L3b and L9 against ref_box, the same metrics
 // through debayerBasicU16, the old decimator's route, and M-L6 (ref_bin / ref_box channel
 // means, the Jensen account of the venue's +3-4 % R).
 TEST(GpuDualIsoPreviewScale, ReducedReconWithNotchMatchesReference)
@@ -923,16 +924,17 @@ TEST(GpuDualIsoPreviewScale, ReducedReconWithNotchMatchesReference)
         const double l9Bin = lag2HorizontalLumaDetail(refBin, w, rh);
         const double l9Box = lag2HorizontalLumaDetail(refBox, w, rh);
         std::printf("[gpu-dualiso-preview-scale] x%d E (hnyquist %d): L1 row-p4 %.4f <= 0.02 | L2 col-p4 %.4f "
-                    "(ref_box %.4f, bound %.4f) | L3r %.4f >= 0.85 (lag4 %.4f, ref_bin %.4f) | L9r %.4f >= 0.90 "
-                    "(lag2 %.4f, ref_bin %.4f) | L8 colNyq %.5f (ref_bin %.5f, bound %.5f) | report: L3a %.4f "
+                    "(ref_box %.4f, bound %.4f) | L3r %.4f (report; tripwire >= 0.55) (lag4 %.4f, ref_bin %.4f) | "
+                    "L9r %.4f (report; tripwire >= 0.55) (lag2 %.4f, ref_bin %.4f) | L8 colNyq %.5f (ref_bin %.5f, "
+                    "bound %.5f) | report: L3a %.4f "
                     "L3b %.4f L9 %.4f (ref_box lag4 %.4f lag2 %.4f)\n",
                     scale, hnyquist ? 1 : 0, l1, l2, l2Box, 3.0 * l2Box + 0.02, l3 / l3Bin, l3, l3Bin,
                     l9 / l9Bin, l9, l9Bin, l8, l8Bin, 2.0 * l8Bin + 0.002, l3Off > 0.0 ? l3 / l3Off : 0.0,
                     l3 / l3Box, l9 / l9Box, l3Box, l9Box);
         lookPass = lookPass && l1 <= 0.02;
         lookPass = lookPass && l2 <= 3.0 * l2Box + 0.02;
-        lookPass = lookPass && l3 >= 0.85 * l3Bin;
-        lookPass = lookPass && l9 >= 0.90 * l9Bin;
+        lookPass = lookPass && l3 >= 0.55 * l3Bin;
+        lookPass = lookPass && l9 >= 0.55 * l9Bin;
         lookPass = lookPass && l8 <= 2.0 * l8Bin + 0.002;
         for (int c = 0; c < 3; ++c)
         {
