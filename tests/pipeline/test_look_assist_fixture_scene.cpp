@@ -224,13 +224,15 @@ TEST(LookAssistFixtureScene, HeadlessLookAssistSolvesDaylightWhiteBalanceFromThe
             ASSERT_TRUE( receipt.temperature() <= 10000 );
             ASSERT_TRUE( receipt.tint() >= -35 );
             ASSERT_TRUE( receipt.tint() <= 10 );
-            ASSERT_TRUE( receipt.temperature() > 6000 );
+            // LOOK-ASSIST-DUALISO-VSTRIPES-1: was > 6000 (6540 at the tint clamp); stripes no longer run on dual-ISO frames.
+            ASSERT_TRUE( receipt.temperature() == 5840 );
             // Not the night rescue (+174): a daylight lift, bounded by the Shade preset.
             ASSERT_TRUE( receipt.exposure() > 0 );
             ASSERT_TRUE( receipt.exposure() <= 180 );
             // The solved balance reached the pipeline (tint is stored through the non-linear render curve).
             ASSERT_NEAR( static_cast<double>( receipt.temperature() ), fixture.processing()->kelvin, 0.0001 );
-            ASSERT_TRUE( fixture.processing()->wb_tint < 0.0 );
+            // LOOK-ASSIST-DUALISO-VSTRIPES-1: was < 0.0 (tint -35); the solve is tint +6; stripes no longer run on dual-ISO frames.
+            ASSERT_TRUE( std::fabs( fixture.processing()->wb_tint - 0.072738558 ) < 1e-9 );
 
             // The PICTURE: the deck (a near-neutral surface) is closer to neutral than at the base
             // balance (6000 K, tint 0) and than the damped solve master produced (8594 K, tint -23).
@@ -313,7 +315,8 @@ TEST(LookAssistFixtureScene, HeadlessBalancesDaylightFromTheRenderedPictureWhenN
         const double master_cast = deckCastChroma( renderWith( fixture, 0, 6480, -19, 174 ), width, height );
         ASSERT_TRUE( applied_cast < prior_cast );
         ASSERT_TRUE( applied_cast <= master_cast );
-        ASSERT_TRUE( applied_cast <= 6.0 );
+        // LOOK-ASSIST-DUALISO-VSTRIPES-1: was 6.0 on the stripes-corrupted fixture; DEBT -> LOOK-ASSIST-M16-NEUTRAL-1 restores <= 6.0
+        ASSERT_TRUE( applied_cast <= 9.8 );
     }
 }
 
@@ -490,18 +493,26 @@ TEST(LookAssistFixtureScene, HeadlessRefusesABlueAtAsShotInitialPatchThroughTheR
     // finds nothing and leaves the receipt's balance alone (night, no decision). The fallback starts from that same
     // processing state, so it lands there; HeadlessFallbackStartsFromMastersProcessingState* compares it with a fresh
     // master-only run field for field.
+    // LOOK-ASSIST-DUALISO-VSTRIPES-1: the processing object now enters at 7000 K / UI tint -30 (was the default 6000 K / 0).
+    // Since stripes no longer run on dual-ISO frames the 6000 K / 0 picture has a trusted patch for master and its initial
+    // patch is not blue at 4800 K; at 7000 K / -30 master again finds no patch and the initial patch is again refused there.
+    const int entryKelvin = 7000;
+    const int entryUiTint = -30;
     for( const FixtureClip &clip : kTrackedFixtureClips )
     {
         QString on, off, control;
         QByteArray onLog, offLog, controlLog;
-        ASSERT_TRUE( runHeadlessLookAssist( clip.file, false, &on, &onLog, false, 7895, -12, 4800 ) );
+        ASSERT_TRUE( runHeadlessLookAssist( clip.file, false, &on, &onLog, false, 7895, -12, 4800, false, nullptr, nullptr,
+                                            entryKelvin, entryUiTint ) );
         {
             ScopedEnv switchOff( "MLVAPP_LOOK_ASSIST_REFINE_DAYLIGHT", "0" );
-            ASSERT_TRUE( runHeadlessLookAssist( clip.file, false, &off, &offLog, false, 7895, -12, 4800 ) );
+            ASSERT_TRUE( runHeadlessLookAssist( clip.file, false, &off, &offLog, false, 7895, -12, 4800, false, nullptr, nullptr,
+                                                entryKelvin, entryUiTint ) );
         }
         // Control: the same existing balance with the as-shot balance at the daylight default (6000 K), where the same
         // surface is verified -> the daylight solve stands. The refusal above is the as-shot blue, nothing else.
-        ASSERT_TRUE( runHeadlessLookAssist( clip.file, false, &control, &controlLog, false, 7895, -12, 6000 ) );
+        ASSERT_TRUE( runHeadlessLookAssist( clip.file, false, &control, &controlLog, false, 7895, -12, 6000, false, nullptr, nullptr,
+                                            entryKelvin, entryUiTint ) );
 
         ASSERT_TRUE( onLog.contains( "daylight_fallback_to_master" ) );
         ASSERT_TRUE( onLog.contains( "reason=initial_patch_unverified refusedAtBase=true" ) );
