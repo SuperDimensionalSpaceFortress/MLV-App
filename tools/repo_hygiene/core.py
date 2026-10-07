@@ -761,7 +761,9 @@ def parse_worktrees(repo_root: Path) -> List[Dict[str, Any]]:
 def parse_status(repo_root: Path, worktree_path: Optional[Path] = None) -> Dict[str, Any]:
     cwd = worktree_path or repo_root
     result = run_command(
-        ["git", "status", "--porcelain=v2", "--branch", "--untracked-files=all"],
+        # quotepath off: the v2 text format below is line-parsed, and a quoted non-ASCII path
+        # would name another path (bus de09cae).
+        ["git", "-c", "core.quotepath=false", "status", "--porcelain=v2", "--branch", "--untracked-files=all"],
         cwd=cwd,
     )
     branch: Dict[str, Any] = {}
@@ -827,7 +829,7 @@ def stash_entries(repo_root: Path) -> List[Dict[str, Any]]:
         name, sha, date, message = parts
         if not name:
             continue
-        files = run_git(repo_root, ["stash", "show", "--name-only", "--format=", name])
+        files = run_git(repo_root, ["-c", "core.quotepath=false", "stash", "show", "--name-only", "--format=", name])
         parents = run_git(repo_root, ["rev-list", "--parents", "-n", "1", sha])
         entries.append(
             {
@@ -939,10 +941,11 @@ def dirty_recommendation(path: str, config: Dict[str, Any], recent_files: Sequen
 
 
 def recent_commit_files(repo_root: Path, limit: int = 10) -> List[str]:
-    result = run_git(repo_root, ["diff-tree", "--no-commit-id", "--name-only", "-r", f"HEAD~{limit}..HEAD"])
+    # `-z`: without it git quotes a non-ASCII path, which no prefix test matches (bus de09cae).
+    result = run_git(repo_root, ["diff-tree", "--no-commit-id", "--name-only", "-z", "-r", f"HEAD~{limit}..HEAD"])
     if result.returncode != 0:
-        result = run_git(repo_root, ["diff-tree", "--no-commit-id", "--name-only", "-r", "HEAD"])
-    return [normalize_rel(line) for line in result.stdout.splitlines() if line.strip()]
+        result = run_git(repo_root, ["diff-tree", "--no-commit-id", "--name-only", "-z", "-r", "HEAD"])
+    return [normalize_rel(part) for part in result.stdout.split("\0") if part.strip()]
 
 
 def build_dirty_candidates(repo_root: Path, config: Dict[str, Any], status: Dict[str, Any]) -> List[Dict[str, Any]]:
@@ -1788,10 +1791,10 @@ def verify_policy(repo_root_arg: Path) -> Dict[str, Any]:
     for required_root in [".claude", ".claude-state", ".claude/worktrees", "tools/repo_hygiene", "tools/repo-hygiene"]:
         if required_root not in root_registry:
             failures.append(f"root registry missing {required_root}")
-    tracked_ignored = run_git(repo_root, ["ls-files", "-ci", "--exclude-standard"])
+    tracked_ignored = run_git(repo_root, ["ls-files", "-z", "-ci", "--exclude-standard"])
     if tracked_ignored.returncode == 0:
         allowlist = {normalize_rel(item) for item in config.get("tracked_ignored_allowlist", [])}
-        for line in tracked_ignored.stdout.splitlines():
+        for line in tracked_ignored.stdout.split("\0"):
             path = normalize_rel(line)
             if path and path not in allowlist:
                 failures.append(f"tracked ignored file is not allowlisted: {path}")

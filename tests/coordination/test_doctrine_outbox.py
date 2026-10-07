@@ -911,6 +911,52 @@ def test_a_finding_path_commit_without_a_trailer_fails(tmp_path, path):
     assert [p for ps in failures.values() for p in ps][0].startswith("MISSING_DOCTRINE_EXPORT")
 
 
+def _quotepath_repo(tmp_path):
+    """A scratch repo with git's DEFAULT path quoting pinned on, whatever the host's global config says."""
+    src, base = _range_repo(tmp_path)
+    git(src, "config", "core.quotepath", "true")
+    return src, base
+
+
+@pytest.mark.parametrize("path", ["agents/café.md", "tools/coordination/日本.ps1", ".claude/naïve.json"])
+def test_a_non_ascii_finding_path_commit_without_a_trailer_fails(tmp_path, path):
+    """git prints `agents/caf\\303\\251.md` quoted by default, which matches no prefix: bus de09cae."""
+    src, base = _quotepath_repo(tmp_path)
+    _commit(src, {path: "x\n"}, "touch a non-ASCII finding path")
+    failures = ob.check_commits(src, f"{base}..HEAD", [])
+    assert [p for ps in failures.values() for p in ps][0].startswith("MISSING_DOCTRINE_EXPORT")
+
+
+def test_the_ascii_control_for_the_non_ascii_finding_path_fails_too(tmp_path):
+    src, base = _quotepath_repo(tmp_path)
+    _commit(src, {"agents/cafe.md": "x\n"}, "touch an ASCII finding path")
+    failures = ob.check_commits(src, f"{base}..HEAD", [])
+    assert [p for ps in failures.values() for p in ps][0].startswith("MISSING_DOCTRINE_EXPORT: touches agents/cafe.md")
+
+
+def test_the_missing_trailer_message_names_the_real_non_ascii_path(tmp_path):
+    src, base = _quotepath_repo(tmp_path)
+    _commit(src, {"agents/café.md": "x\n"}, "touch a non-ASCII finding path")
+    failures = ob.check_commits(src, f"{base}..HEAD", [])
+    assert [p for ps in failures.values() for p in ps][0] == "MISSING_DOCTRINE_EXPORT: touches agents/café.md"
+
+
+def test_a_non_ascii_outbox_item_name_is_refused_not_silently_skipped(tmp_path):
+    """The quoted form began with a `"`, so the drain's prefix test dropped the item without a word."""
+    src = init_source(tmp_path)
+    git(src, "config", "core.quotepath", "true")
+    _commit(src, {"doctrine-outbox/20260929-café-item.md": item_text()}, "add a non-ASCII item name")
+    items = ob.load_outbox_items(src, "HEAD")
+    assert [i["name"] for i in items] == ["20260929-café-item.md"]
+    assert items[0]["error"].startswith("ITEM_BAD_FILENAME")
+
+
+def test_a_non_ascii_outbox_item_added_in_range_is_seen_by_the_range_scan(tmp_path):
+    src, base = _quotepath_repo(tmp_path)
+    _commit(src, {"doctrine-outbox/20260929-café-item.md": item_text()}, "add a non-ASCII item name")
+    assert ob.range_added_items(src, f"{base}..HEAD") == {"doctrine-outbox/20260929-café-item.md"}
+
+
 def test_a_non_finding_path_commit_needs_no_trailer(tmp_path):
     src, base = _range_repo(tmp_path)
     _commit(src, {"src/foo.cpp": "x\n", "docs/y.md": "y\n"}, "ordinary product commit")

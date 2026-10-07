@@ -194,6 +194,16 @@ def git_try(repo: pathlib.Path, *args: str, extra_env: dict[str, str] | None = N
     return proc.returncode, proc.stdout.strip(), proc.stderr.strip()
 
 
+def git_paths(repo: pathlib.Path, *args: str) -> list[str]:
+    """The paths a git path-list command prints, NUL-separated (`-z`). Without it git quotes a
+    non-ASCII path (`"agents/caf\\303\\251.md"`, core.quotepath), which matches no prefix or set
+    entry, so a path test on the plain output silently misses it (bus de09cae)."""
+    proc = _run_git(repo, [args[0], "-z", *args[1:]])  # before any `--`, or git reads -z as a pathspec
+    if proc.returncode != 0:
+        raise GitError(f"git {' '.join(args)} (in {repo}): {proc.stderr.strip()}")
+    return [p for p in proc.stdout.split("\0") if p]
+
+
 def cat_file_blob(repo: pathlib.Path, ref: str, path: str) -> bytes:
     """The raw bytes of `path` at `ref`, or b"" if it does not exist there (a target
     missing at the tip counts as empty)."""
@@ -348,7 +358,7 @@ def require_tool_at_ref(repo: pathlib.Path, ref: str) -> None:
     rc, _out, _err = git_try(repo, "cat-file", "-e", f"{ref}:{TOOL_REL}")
     if rc != 0:
         raise Unknown("TOOL_ABSENT_AT_REF", f"{TOOL_REL} is not at {ref}")
-    rc, out, _err = git_try(repo, "ls-tree", "--name-only", ref, "--", f"{OUTBOX_DIR}/")
+    rc, out, _err = git_try(repo, "ls-tree", "--name-only", "-z", ref, "--", f"{OUTBOX_DIR}/")
     if rc != 0 or not out:
         raise Unknown("TOOL_ABSENT_AT_REF", f"{OUTBOX_DIR}/ is not at {ref}")
 
@@ -362,10 +372,8 @@ def added_in(repo: pathlib.Path, ref: str, path: str) -> str | None:
 def load_outbox_items(repo: pathlib.Path, ref: str) -> list[dict]:
     """Items committed on `ref` under OUTBOX_DIR. Worktree-only files are invisible on
     purpose: drain and debt both publish/report committed bytes."""
-    out = git(repo, "ls-tree", "-r", "--name-only", ref, "--", OUTBOX_DIR)
     items: list[dict] = []
-    for p in out.splitlines():
-        p = p.strip()
+    for p in git_paths(repo, "ls-tree", "-r", "--name-only", ref, "--", OUTBOX_DIR):
         if not p or "/" not in p or not p.startswith(OUTBOX_DIR + "/") or p.startswith(KERNEL_DIR + "/"):
             continue
         name = p.rsplit("/", 1)[-1]
@@ -797,7 +805,7 @@ def load_kernel_filings(repo: pathlib.Path, ref: str) -> list[dict]:
     """One entry per `KERNEL_DIR/<yyyymmdd>/` committed on `ref`. A date dir holding anything but
     the two fixed source names, or lacking the filing, is refused whole."""
     by_date: dict[str, list[str]] = {}
-    for p in git(repo, "ls-tree", "-r", "--name-only", ref, "--", KERNEL_DIR).splitlines():
+    for p in git_paths(repo, "ls-tree", "-r", "--name-only", ref, "--", KERNEL_DIR):
         if p.startswith(KERNEL_DIR + "/"):
             date, _sep, rest = p[len(KERNEL_DIR) + 1:].partition("/")
             by_date.setdefault(date, []).append(rest)
@@ -944,7 +952,7 @@ def publish_kernel_filing(bus_repo: pathlib.Path, filing: dict, ledger: pathlib.
                     append_ledger_rows(ledger, [_kernel_row(filing, tip, remote)])
                 return
             head = git_commit(wt, filing["message"])
-            touched = set(git(wt, "diff", "--name-only", base, head).splitlines())
+            touched = set(git_paths(wt, "diff", "--name-only", base, head))
             if not touched <= allowed:
                 raise Refusal("KERNEL_FILING_PATH_REFUSED", ", ".join(sorted(touched - allowed)))
             if cat_file_blob(wt, "HEAD", KERNEL_FILING_DEST) != filing["filing"]:
@@ -1230,14 +1238,13 @@ def is_finding_path(path: str) -> bool:
 
 
 def range_added_items(repo: pathlib.Path, rev_range: str) -> set[str]:
-    out = git(repo, "log", "--no-merges", "--diff-filter=A", "--name-only", "--format=", rev_range, "--", OUTBOX_DIR)
-    return {p.strip() for p in out.splitlines() if p.strip()}
+    return set(git_paths(repo, "log", "--no-merges", "--diff-filter=A", "--name-only", "--format=", rev_range, "--", OUTBOX_DIR))
 
 
 def check_commit(repo: pathlib.Path, sha: str, added_items: set[str],
                  deny_terms: list[tuple[str, str]]) -> list[str]:
     """Problems with one commit's `Doctrine-Export:` trailers; empty means it passes."""
-    files = git(repo, "diff-tree", "--no-commit-id", "--name-only", "-r", "--root", sha).splitlines()
+    files = git_paths(repo, "diff-tree", "--no-commit-id", "--name-only", "-r", "--root", sha)
     touches = [f for f in files if is_finding_path(f)]
     message = git(repo, "show", "-s", "--format=%B", sha)
     trailers = TRAILER_RE.findall(message)
