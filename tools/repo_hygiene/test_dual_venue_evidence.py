@@ -3354,6 +3354,56 @@ class ContactFramesAreHashListedTests(EvidenceFactory, ModuleMutationMixin, unit
 
 
 @requires_windows_pwsh
+class NonAsciiLegSpecNameIsFoundTests(ModuleMutationMixin, unittest.TestCase):
+    """DG-GIT-PATHLIST-LSTREE-LONGFORM-1: `ls-tree -r` (long form) prints a non-ASCII path quoted under the default core.quotepath=true, so the
+    path ended in a quote, failed EndsWith('.json'), and a committed `legs/caf<e-acute>.json` was never found (a silent refusal)."""
+
+    NAME = "café.json"
+    SPEC = b'{"legId": "cafe-probe"}\n'
+
+    def commit_leg(self) -> tuple[Path, str]:
+        tmp = tempfile.TemporaryDirectory(prefix="dve-quotepath-")
+        self.addCleanup(tmp.cleanup)
+        root = Path(tmp.name) / "repo"
+        legs = root / "tools" / "profiling" / "dual-venue" / "legs"
+        legs.mkdir(parents=True)
+        (legs / self.NAME).write_bytes(self.SPEC)
+
+        def git(*args: str) -> str:
+            return subprocess.run(["git", "-C", str(root), *args], capture_output=True, text=True, check=True).stdout
+        git("init", "-q")
+        git("config", "user.email", "unit@example.invalid")
+        git("config", "user.name", "unit")
+        git("config", "core.quotepath", "true")
+        git("add", "tools")
+        git("commit", "-q", "-m", "committed")
+        self.assertIn("\\303\\251", git("ls-tree", "-r", "--name-only", "HEAD"), "the premise: git prints this name quoted by default")
+        return root, git("rev-parse", "HEAD").strip()
+
+    def probe(self, root: Path, head: str, module: Path | None = None) -> list[str]:
+        script = (f"$root = '{root}'\n"
+                  f"$sha = Get-DvLegSpecSha256 ([byte[]]({','.join(str(b) for b in self.SPEC)}))\n"
+                  f"$r = Find-DvCommittedLegSpec -RepoRoot $root -Commit '{head}' -LegSpecSha256 $sha\n"
+                  "Write-Output ('FOUND ' + $r.ok)\n"
+                  "if ($r.ok) { Write-Output ('PATH ' + [BitConverter]::ToString([Text.Encoding]::UTF8.GetBytes($r.relativePath))) }\n")
+        proc = _ps_json(script, module or DV / "DualVenueRunner.psm1", {})
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        return [l.strip() for l in proc.stdout.splitlines() if l.strip()]
+
+    def test_a_committed_leg_spec_with_a_non_ascii_name_is_found_by_its_hash(self) -> None:
+        root, head = self.commit_leg()
+        out = self.probe(root, head)
+        want = "tools/profiling/dual-venue/legs/" + self.NAME
+        self.assertEqual(out, ["FOUND True", "PATH " + "-".join(f"{b:02X}" for b in want.encode("utf-8"))])
+
+    def test_mutation_listing_without_z_loses_the_non_ascii_spec(self) -> None:
+        mutated = self.mutated_module([("'ls-tree', '-r', '-z', $Commit", "'ls-tree', '-r', $Commit"),
+                                       ('-split "`0"', '-split "`n"')])
+        root, head = self.commit_leg()
+        self.assertEqual(self.probe(root, head, module=mutated), ["FOUND False"], "the quoted name fails EndsWith('.json'): the old, silent refusal")
+
+
+@requires_windows_pwsh
 class LineEndingsCannotHideACommittedFileTests(ModuleMutationMixin, unittest.TestCase):
     """fable r1 B2: on this VM's default checkout (system git core.autocrlf=true) the working copy of every tracked text file is CRLF while the
     committed blob is LF, and the runner hashed the working bytes while Find-DvCommittedLegSpec hashed the blob bytes, so every committed leg spec was
