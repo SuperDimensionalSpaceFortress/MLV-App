@@ -69,6 +69,7 @@ SOURCES += \
     $$REPO_ROOT/tests/console/test_playback_fps_meter_policy.cpp \
     $$REPO_ROOT/tests/console/test_playback_fps_meter_wiring.cpp \
     $$REPO_ROOT/tests/console/test_playback_native_pace_guard.cpp \
+    $$REPO_ROOT/tests/console/test_playback_slip_histogram.cpp \
     $$REPO_ROOT/tests/console/test_playback_decode_render_overlap.cpp
 
 HEADERS += \
@@ -105,6 +106,7 @@ HEADERS += \
     $$REPO_ROOT/platform/qt/PlaybackFpsMeterPolicy.h \
     $$REPO_ROOT/platform/qt/PlaybackDecodeRenderOverlap.h \
     $$REPO_ROOT/platform/qt/PlaybackNativePaceGuard.h \
+    $$REPO_ROOT/platform/qt/PlaybackSlipHistogram.h \
     $$REPO_ROOT/platform/qt/GpuTexturePresentAvailabilityPolicy.h \
     $$REPO_ROOT/platform/qt/DisplayDeviceMapping.h
 
