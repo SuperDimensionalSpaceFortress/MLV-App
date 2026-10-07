@@ -155,7 +155,7 @@ foreach ($N in @(1,2,4)) {
     Start-Sleep -Milliseconds 600
     $perProc = @()
     foreach ($pp in $procs) { $perProc += (Parse-ProbeOut $pp.out).frameTotalMs }
-    $valid = $perProc | Where-Object { $_ -ne $null }
+    $valid = $perProc | Where-Object { $null -ne $_ }
     $avgMs = if ($valid.Count) { [math]::Round((($valid | Measure-Object -Average).Average),3) } else { $null }
     $concGlobalDelta = $peakGpuMem - $idle.memUsedMB
     $concRows += [pscustomobject]@{
