@@ -1928,6 +1928,16 @@
       "lines": [
         124
       ]
+    },
+    {
+      "path": "platform/qt/MainWindow.cpp",
+      "anchor": "const double spanCoverage = m_playbackSmokePrepWorkerBuildSumMs > 0.0",
+      "class": "division_guard",
+      "clock": "qpc_stage_clock",
+      "justification": "CPU-PLAYBACK-PREP-WORKER-BUILD-1: span_coverage on the playback_smoke.prep_summary line divides the summed per-span build times by the summed playback_prep_worker_build_ms (mlv_stage_timing_now spans); with no build time it reports 0 instead of dividing by zero. A logged attribution ratio; it gates nothing.",
+      "lines": [
+        27496
+      ]
     }
   ]
 }
