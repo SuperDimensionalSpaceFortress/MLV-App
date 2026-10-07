@@ -344,8 +344,9 @@ void cpuBoxBlur(uint16_t * img, int width, int height, int radius, bool doR, boo
     std::vector<uint16_t> temp(static_cast<size_t>(width) * height * 3u);
     /* Rows are independent in each pass (pass 1 reads img, writes temp; pass 2
      * reads temp, writes img), so both run row-parallel with unchanged
-     * arithmetic (CPU-PLAYBACK-PREP-WORKER-BUILD-1). */
-    #pragma omp parallel for schedule(static) if(height >= 2)
+     * arithmetic (CPU-PLAYBACK-PREP-WORKER-BUILD-1; tier 1, behind its switch). */
+    const bool parallel = gpuPreviewProcessingTier1Enabled();
+    #pragma omp parallel for schedule(static) if(parallel && height >= 2)
     for (int y = 0; y < height; ++y)
         for (int x = 0; x < width; ++x)
             for (int c = 0; c < 3; ++c)
@@ -366,7 +367,7 @@ void cpuBoxBlur(uint16_t * img, int width, int height, int radius, bool doR, boo
                     temp[(y * width + x) * 3 + c] = img[(y * width + x) * 3 + c];
                 }
             }
-    #pragma omp parallel for schedule(static) if(height >= 2)
+    #pragma omp parallel for schedule(static) if(parallel && height >= 2)
     for (int y = 0; y < height; ++y)
         for (int x = 0; x < width; ++x)
             for (int c = 0; c < 3; ++c)
@@ -402,7 +403,8 @@ inline int chromaClamp16(int v)
 void cpuChromaPostPass(uint16_t * img, int width, int height, int radius)
 {
     const int n = width * height;
-    #pragma omp parallel for schedule(static) if(n >= 2048)
+    const bool parallel = gpuPreviewProcessingTier1Enabled();
+    #pragma omp parallel for schedule(static) if(parallel && n >= 2048)
     for (int i = 0; i < n; ++i)
     {
         const int R = img[i * 3 + 0];
@@ -423,7 +425,7 @@ void cpuChromaPostPass(uint16_t * img, int width, int height, int radius)
     {
         cpuBoxBlur(img, width, height, radius, false, true, true);
     }
-    #pragma omp parallel for schedule(static) if(n >= 2048)
+    #pragma omp parallel for schedule(static) if(parallel && n >= 2048)
     for (int i = 0; i < n; ++i)
     {
         const int Y  = img[i * 3 + 0];
@@ -453,7 +455,8 @@ void cpuSharpenPostPass(uint16_t * img, int width, int height, double a, double 
     auto kx = [&](int v) -> int { int t = static_cast<int>(static_cast<double>(v) * x); return t < 0 ? 0 : (t > 65535 ? 65535 : t); };
     auto ky = [&](int v) -> int { int t = static_cast<int>(static_cast<double>(v) * y); return t < 0 ? 0 : (t > 65535 ? 65535 : t); };
     /* Reads only the src copy, writes disjoint rows of img: row-parallel. */
-    #pragma omp parallel for schedule(static) if(height >= 2)
+    const bool parallel = gpuPreviewProcessingTier1Enabled();
+    #pragma omp parallel for schedule(static) if(parallel && height >= 2)
     for (int yy = 0; yy < height; ++yy)
     {
         const int up = (yy == 0) ? 0 : yy - 1;
@@ -496,7 +499,8 @@ void cpuMedianPostPass(uint16_t * img, int width, int height, int window, int st
     /* Every output pixel reads only the noisy copy, so the window scan runs
      * row-parallel (rows outer, per-thread windows); the order statistic and
      * the blend are unchanged. */
-    #pragma omp parallel for schedule(static) if(height - 2 * edge >= 2)
+    const bool parallel = gpuPreviewProcessingTier1Enabled();
+    #pragma omp parallel for schedule(static) if(parallel && height - 2 * edge >= 2)
     for (int y = edge; y < height - edge; ++y)
     {
         std::vector<int> winR(winSize), winG(winSize), winB(winSize);
@@ -3708,7 +3712,7 @@ const GpuPreviewProcessingConfig & gpuPreviewProcessingResolveFullResShadowsHigh
              reinterpret_cast<const uint16_t *>(config.shadowsHighlightsBlur.constData()),
              width / 4, height / 4,
              reinterpret_cast<uint16_t *>(full.data()),
-             width, height, omp_get_max_threads()) )
+             width, height, gpuPreviewProcessingTier1Enabled() ? omp_get_max_threads() : 1) )
     {
         expanded->shadowsHighlightsFrameStateReady = false;
         expanded->shadowsHighlightsBlur.clear();
@@ -3892,6 +3896,18 @@ bool gpuPreviewProcessingCpuHasSpatialPostPass(const GpuPreviewProcessingConfig 
         && ( config.applyChroma || config.applySharpen || config.applyMedian );
 }
 
+const char * gpuPreviewProcessingTier1SwitchName(void)
+{
+    return "MLVAPP_PLAYBACK_PREP_TIER1";
+}
+
+bool gpuPreviewProcessingTier1Enabled(void)
+{
+    return qEnvironmentVariableIsSet( gpuPreviewProcessingTier1SwitchName() )
+        && qEnvironmentVariable( gpuPreviewProcessingTier1SwitchName() ).trimmed()
+               != QStringLiteral("0");
+}
+
 static double cpuReferenceSpanMs(const QElapsedTimer & clock, qint64 startNs)
 {
     return static_cast<double>(clock.nsecsElapsed() - startNs) / 1000000.0;
@@ -3991,7 +4007,10 @@ void gpuPreviewProcessingApplyCpuReferenceTo8(const GpuPreviewProcessingConfig &
     }
     QElapsedTimer clock;
     clock.start();
-    if ( !configIn.enabled || gpuPreviewProcessingCpuHasSpatialPostPass(configIn) )
+    /* Tier 1 off (MLVAPP_PLAYBACK_PREP_TIER1): the pre-card order, 16-bit pass
+     * into the caller's buffer, then the conversion. */
+    if ( !configIn.enabled || gpuPreviewProcessingCpuHasSpatialPostPass(configIn)
+      || ( scratch16 && !gpuPreviewProcessingTier1Enabled() ) )
     {
         if ( !scratch16 )
         {

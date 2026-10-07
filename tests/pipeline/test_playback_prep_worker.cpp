@@ -3,7 +3,8 @@
 //      entry and the persistent scratch reproduce the pre-card serial
 //      ApplyCpuReference + >> 8 (a verbatim copy of the old post-pass code below
 //      is the oracle) on every stage of the matrix, at OMP 1, 2 and max threads,
-//      and across a dims change of the scratch.
+//      with MLVAPP_PLAYBACK_PREP_TIER1 on and off (default off after D1), and
+//      across a dims change of the scratch.
 //  T4  tier 2 (reduced-scale processing) stays within the pre-registered
 //      tolerance of the box-reduced full-size result on the pointwise stages; the
 //      spatial post-pass stages are reported and the policy refuses them.
@@ -254,6 +255,25 @@ struct OmpThreads
     explicit OmpThreads(int n) : previous(omp_get_max_threads()) { omp_set_num_threads(n); }
     ~OmpThreads() { omp_set_num_threads(previous); }
     int previous;
+};
+
+/* MLVAPP_PLAYBACK_PREP_TIER1 for one scope (tier 1 is off by default after D1). */
+struct Tier1Switch
+{
+    explicit Tier1Switch(bool on)
+        : had(qEnvironmentVariableIsSet(gpuPreviewProcessingTier1SwitchName())),
+          previous(qgetenv(gpuPreviewProcessingTier1SwitchName()))
+    {
+        if (on) qputenv(gpuPreviewProcessingTier1SwitchName(), QByteArray("1"));
+        else qunsetenv(gpuPreviewProcessingTier1SwitchName());
+    }
+    ~Tier1Switch()
+    {
+        if (had) qputenv(gpuPreviewProcessingTier1SwitchName(), previous);
+        else qunsetenv(gpuPreviewProcessingTier1SwitchName());
+    }
+    bool had;
+    QByteArray previous;
 };
 
 /* Both dual-ISO fixture clips: tiny (2 frames) and large. */
@@ -550,10 +570,13 @@ PlaybackPrepReducedDecision reducedDecision(int factor)
 // ---------------------------------------------------------------------------
 namespace {
 /* Every stage of the matrix on the first two frames of one dual-ISO fixture clip,
- * at OMP 1, 2 and max threads. The two TESTs below cover both clips: four
- * dual-ISO fixture frames over two frame sizes. */
-void runTier1ByteIdentity(bool large)
+ * at OMP 1, 2 and max threads (max only with the switch off), with
+ * MLVAPP_PLAYBACK_PREP_TIER1 on or off. The
+ * TESTs below cover both clips with tier 1 on (four dual-ISO fixture frames over
+ * two frame sizes) and the tiny clip with it off. */
+void runTier1ByteIdentity(bool large, bool tier1)
 {
+    Tier1Switch tier1Scope(tier1);
     int casesChecked = 0;
     int framesChecked = 0;
     {
@@ -572,7 +595,11 @@ void runTier1ByteIdentity(bool large)
                 oracle16 = legacyReference16(sc.config, frame, sc.width, sc.height);
             }
             const std::vector<uint8_t> oracle8 = legacyConvert(oracle16);
-            for (int threads : threadCounts())
+            /* Switch off: the post-passes and the S/H expansion are serial, so
+             * one (max) thread count covers it and keeps the CI shard budget. */
+            const std::vector<int> counts =
+                tier1 ? threadCounts() : std::vector<int>{ std::max(2, omp_get_num_procs()) };
+            for (int threads : counts)
             {
                 OmpThreads scope(threads);
                 const std::string label = std::string(stageName(stage)) + ".frame" + std::to_string(f)
@@ -593,29 +620,37 @@ void runTier1ByteIdentity(bool large)
                 ASSERT_EQ(oracle8.size(), new8.size());
                 if (!bytesEqual(new8.data(), oracle8.data(), new8.size()))
                     ::minitest::fail(__FILE__, __LINE__, "8-bit route == pre-card reference + >> 8", label);
-                ASSERT_EQ(gpuPreviewProcessingCpuHasSpatialPostPass(sc.config), !route.spans.fused8);
+                ASSERT_EQ(tier1 && !gpuPreviewProcessingCpuHasSpatialPostPass(sc.config),
+                          route.spans.fused8);
                 ++casesChecked;
             }
         }
     }
     }
     ASSERT_EQ(2, framesChecked);
-    std::printf("[PREP-T1] %s frames=%d cases=%d\n", large ? "large" : "tiny", framesChecked, casesChecked);
+    std::printf("[PREP-T1] %s tier1=%d frames=%d cases=%d\n", large ? "large" : "tiny",
+                tier1 ? 1 : 0, framesChecked, casesChecked);
 }
 } // namespace
 
 TEST(PlaybackPrepWorkerBuild, Tier1ByteIdentityAcrossTheStageMatrixAndThreadCounts)
 {
-    runTier1ByteIdentity(false);
+    runTier1ByteIdentity(false, true);
 }
 
 TEST(PlaybackPrepWorkerBuild, Tier1ByteIdentityOnTheLargeDualIsoClip)
 {
-    runTier1ByteIdentity(true);
+    runTier1ByteIdentity(true, true);
+}
+
+TEST(PlaybackPrepWorkerBuild, Tier1ByteIdentityWithTheSwitchOff)
+{
+    runTier1ByteIdentity(false, false);
 }
 
 TEST(PlaybackPrepWorkerBuild, Tier1ScratchFollowsADimsChange)
 {
+    Tier1Switch tier1Scope(true);
     MlvPipelineFixture fixture;
     openFixture(fixture);
     const StageCase sc = buildStageCase(fixture, Stage::Sharpen, 1);
@@ -637,6 +672,10 @@ TEST(PlaybackPrepWorkerBuild, Tier1ScratchFollowsADimsChange)
             oracle16 = legacyReference16(sc.config, *pass.input, pass.w, pass.h);
         }
         const std::vector<uint8_t> oracle8 = legacyConvert(oracle16);
+        /* Size check before the route writes into the scratch, so an un-resized
+         * scratch fails here by assertion instead of being overrun. */
+        (void)workspace.scratch16(pass.w, pass.h);
+        ASSERT_EQ(static_cast<size_t>(pass.w) * pass.h * 3u, workspace.scratch16Words());
         std::vector<uint8_t> out8;
         (void)playbackPrepCpuRouteRun(workspace, sc.config, 1, pass.input->data(), pass.w, pass.h,
                                       fullDecision(), &out8);
@@ -657,6 +696,7 @@ TEST(PlaybackPrepWorkerBuild, Tier1FusedEightBitIsTruncationOfTheSixteenBitValue
     /* The fused path must be exactly v >> 8 of the 16-bit value: not rounded,
      * not >> 7. A config whose 16-bit output holds values with low bytes >= 0x80
      * separates all three. */
+    Tier1Switch tier1Scope(true);
     MlvPipelineFixture fixture;
     openFixture(fixture);
     const StageCase sc = buildStageCase(fixture, Stage::Pointwise, 1);

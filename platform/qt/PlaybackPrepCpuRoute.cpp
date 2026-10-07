@@ -329,8 +329,20 @@ PlaybackPrepCpuRouteResult playbackPrepCpuRouteRun(PlaybackPrepCpuWorkspace & wo
     result.processedHeight = height;
     if ( !out8 || width <= 0 || height <= 0 ) return result;
 
+    /* Tier 1 off (the default): every frame gets the pre-card value-initialised
+     * 16-bit buffer and the unfused 16-bit pass; tier 1 on: the workspace's
+     * persistent scratch, and only when a post-pass needs the 16-bit result. */
+    const bool tier1 = gpuPreviewProcessingTier1Enabled();
     const bool scratchNeeded =
-        !config.enabled || gpuPreviewProcessingCpuHasSpatialPostPass(config);
+        !tier1 || !config.enabled || gpuPreviewProcessingCpuHasSpatialPostPass(config);
+    std::vector<uint16_t> frameBuffer16;
+    auto scratchFor = [&](int w, int h) -> uint16_t *
+    {
+        if ( !scratchNeeded ) return nullptr;
+        if ( tier1 ) return workspace.scratch16(w, h);
+        frameBuffer16.assign(static_cast<size_t>(w) * static_cast<size_t>(h) * 3u, 0);
+        return frameBuffer16.data();
+    };
     const int factor = decision.factor;
     if ( factor > 1 && input16
       && width % factor == 0 && height % factor == 0 )
@@ -340,7 +352,7 @@ PlaybackPrepCpuRouteResult playbackPrepCpuRouteRun(PlaybackPrepCpuWorkspace & wo
         qint64 startNs = clock.nsecsElapsed();
         out8->resize(static_cast<size_t>(rw) * rh * 3u);
         uint16_t * reducedInput = workspace.reducedInput(static_cast<size_t>(rw) * rh * 3u);
-        uint16_t * scratch = scratchNeeded ? workspace.scratch16(rw, rh) : nullptr;
+        uint16_t * scratch = scratchFor(rw, rh);
         result.allocMs = spanMs(clock, startNs);
 
         startNs = clock.nsecsElapsed();
@@ -364,7 +376,7 @@ PlaybackPrepCpuRouteResult playbackPrepCpuRouteRun(PlaybackPrepCpuWorkspace & wo
 
     qint64 startNs = clock.nsecsElapsed();
     out8->resize(static_cast<size_t>(width) * height * 3u);
-    uint16_t * scratch = scratchNeeded ? workspace.scratch16(width, height) : nullptr;
+    uint16_t * scratch = scratchFor(width, height);
     result.allocMs = spanMs(clock, startNs);
     if ( input16 )
     {

@@ -263,6 +263,13 @@ uint32_t gpuPreviewProcessingCpuStageMask(const GpuPreviewProcessingConfig & con
 /* Chroma, sharpen or median: the stages that read neighbouring pixels after
  * the pointwise pass. */
 bool gpuPreviewProcessingCpuHasSpatialPostPass(const GpuPreviewProcessingConfig & config);
+/* CPU-PLAYBACK-PREP-WORKER-BUILD-1 D1: the byte-identical tier-1 items (row-
+ * parallel box blur/chroma/sharpen/median, the parallel S/H quarter-blur
+ * expansion, the fused 8-bit pass, the prep thread's persistent scratch and
+ * shared avir pool) are OFF unless MLVAPP_PLAYBACK_PREP_TIER1 is set to anything
+ * but "0". Read on every call. */
+const char * gpuPreviewProcessingTier1SwitchName(void);
+bool gpuPreviewProcessingTier1Enabled(void);
 /* gpuPreviewProcessingApplyCpuReference with per-stage spans (spans may be null). */
 void gpuPreviewProcessingApplyCpuReferenceTimed(const GpuPreviewProcessingConfig & config,
                                                 const uint16_t * inputRgb16,
@@ -274,7 +281,8 @@ void gpuPreviewProcessingApplyCpuReferenceTimed(const GpuPreviewProcessingConfig
  * gpuPreviewProcessingApplyCpuReference followed by a per-sample >> 8. With no
  * spatial post-pass the >> 8 is fused into the pointwise loop and scratch16 is
  * not touched; otherwise the 16-bit passes run in scratch16 (width*height*3
- * words, caller-owned, contents ignored) and are then converted. */
+ * words, caller-owned, contents ignored) and are then converted. With tier 1
+ * off and a scratch16 given, the 16-bit route is taken even without a post-pass. */
 void gpuPreviewProcessingApplyCpuReferenceTo8(const GpuPreviewProcessingConfig & config,
                                               const uint16_t * inputRgb16,
                                               uint16_t * scratch16,

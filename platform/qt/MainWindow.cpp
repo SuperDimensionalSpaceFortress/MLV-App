@@ -3756,6 +3756,12 @@ void MainWindow::freeActiveMlvObjectAfterLifecycleBarrier( const char *reason )
 // CPU route's scratch, reduced-input buffer and reduced-mask cache, and one avir
 // thread pool instead of one per frame. Callers without it (the inline GUI-thread
 // prep) get per-call temporaries, the pre-card behaviour.
+// D1 (r2): the tier-1 uses of this object -- the persistent full-size scratch
+// and the shared avir pool -- follow MLVAPP_PLAYBACK_PREP_TIER1 (default off).
+// The object itself is always built: tier 2 cannot run without it. Its
+// reduced-input buffer and reduced-mask cache live in `cpu`, and tier 2 is
+// eligible only when it exists (reducedInputs.playbackActive below requires
+// threadState != nullptr).
 struct MainWindow::PlaybackPrepThreadState
 {
     PlaybackPrepCpuWorkspace cpu;
@@ -3783,6 +3789,7 @@ MainWindow::PlaybackPrepResult MainWindow::buildPlaybackPrepResult( const Playba
     {
         return static_cast<double>( prepSpanClock.nsecsElapsed() - startNs ) / 1000000.0;
     };
+    const bool prepTier1 = gpuPreviewProcessingTier1Enabled();
 
     const int sourceWidth = task.sourceWidth;
     const int sourceHeight = task.sourceHeight;
@@ -3922,9 +3929,9 @@ MainWindow::PlaybackPrepResult MainWindow::buildPlaybackPrepResult( const Playba
     else if( cpuPreviewProcessingActive && playbackProcessingSubsetActive )
     {
         // CPU-PLAYBACK-PREP-WORKER-BUILD-1: tier 1 (persistent scratch, fused
-        // 8-bit, parallel post-passes) is byte-identical to the old
-        // ApplyCpuReference + convert_rgb16_to_rgb8; tier 2 processes a
-        // box-reduced frame when the requested scale is still owed.
+        // 8-bit, parallel post-passes; off unless MLVAPP_PLAYBACK_PREP_TIER1) is
+        // byte-identical to the old ApplyCpuReference + convert_rgb16_to_rgb8;
+        // tier 2 processes a box-reduced frame when the requested scale is still owed.
         PlaybackPrepCpuWorkspace inlineWorkspace;
         PlaybackPrepCpuWorkspace &cpuWorkspace =
             threadState ? threadState->cpu : inlineWorkspace;
@@ -4091,10 +4098,11 @@ MainWindow::PlaybackPrepResult MainWindow::buildPlaybackPrepResult( const Playba
             const int alignedBpl = ( ( hqTargetWidth * 3 ) + 3 ) & ~3;
             std::vector<uint8_t> packed(
                 static_cast<size_t>(hqTargetWidth) * static_cast<size_t>(hqTargetHeight) * 3u );
+            const bool sharedPool = threadState && prepTier1;
             std::unique_ptr<avir_scale_thread_pool> frameScalingPool;
-            if( !threadState ) frameScalingPool.reset( new avir_scale_thread_pool() );
+            if( !sharedPool ) frameScalingPool.reset( new avir_scale_thread_pool() );
             avir_scale_thread_pool &scaling_pool =
-                threadState ? threadState->scalingPool() : *frameScalingPool;
+                sharedPool ? threadState->scalingPool() : *frameScalingPool;
             avir::CImageResizerParamsUltra roptions;
             avir::CImageResizer<> image_resizer( 8, 0, roptions );
             avir::CImageResizerVars vars; vars.ThreadPool = &scaling_pool;
@@ -4159,10 +4167,11 @@ MainWindow::PlaybackPrepResult MainWindow::buildPlaybackPrepResult( const Playba
         else if( mode == Qt::SmoothTransformation && betterResizerEnabled )
         {
             downscaleBranch = "stretch_avir";
+            const bool sharedPool = threadState && prepTier1;
             std::unique_ptr<avir_scale_thread_pool> frameScalingPool;
-            if( !threadState ) frameScalingPool.reset( new avir_scale_thread_pool() );
+            if( !sharedPool ) frameScalingPool.reset( new avir_scale_thread_pool() );
             avir_scale_thread_pool &scaling_pool =
-                threadState ? threadState->scalingPool() : *frameScalingPool;
+                sharedPool ? threadState->scalingPool() : *frameScalingPool;
             avir::CImageResizerParamsUltra roptions;
             avir::CImageResizer<> image_resizer( 8, 0, roptions );
             displayImageBacking.resize( static_cast<size_t>(sceneWidth) * static_cast<size_t>(sceneHeight) * 3u );
