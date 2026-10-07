@@ -95,6 +95,43 @@ def _run_windows_acl_probe(test: unittest.TestCase, what: str, command: list[str
     return completed
 
 
+# The production trust probe is bounded at 30 s and fails closed with exit 124 when the host stalls
+# PowerShell (merge_group 37675956805: a trivial fixture probe took 124 s in the same shard). The
+# module-shadowing test must still drive the REAL probe process, so a stalled first attempt is
+# retried ONCE under a wider bound against the same real runner. Nothing is faked and nothing is
+# skipped; a second stall is the same typed UNKNOWN as every other stalled ACL probe.
+CURL_TRUST_PROBE_STALL_MARKER = "system curl trust verification failed with exit 124"
+CURL_TRUST_PROBE_RETRY_TIMEOUT_MS = WINDOWS_ACL_PROBE_TIMEOUT_SECONDS * 1000
+
+
+def _run_production_trust_probe(config: dict, client: Path) -> dict:
+    from tools.repo_hygiene import brokered_closeout
+    from tools.repo_hygiene.candidate_acceptance import _windows_curl_trust_probe
+
+    try:
+        return _windows_curl_trust_probe(ROOT, config, client)
+    except HygieneError as exc:
+        if CURL_TRUST_PROBE_STALL_MARKER not in str(exc):
+            raise
+        first_attempt = str(exc)
+    runner = brokered_closeout.run_bounded_closeout_process
+
+    def widened(*args, **kwargs):
+        kwargs["timeout_ms"] = max(int(kwargs.get("timeout_ms") or 0), CURL_TRUST_PROBE_RETRY_TIMEOUT_MS)
+        return runner(*args, **kwargs)
+
+    print(f"[curl-trust] production probe stalled ({first_attempt!r}); retrying once with a "
+          f"{CURL_TRUST_PROBE_RETRY_TIMEOUT_MS} ms bound", file=sys.stderr)
+    try:
+        with mock.patch.object(brokered_closeout, "run_bounded_closeout_process", widened):
+            return _windows_curl_trust_probe(ROOT, config, client)
+    except HygieneError as exc:
+        raise WindowsAclProbeUnknown(
+            f"UNKNOWN: the production curl trust probe stalled twice; the module-pinning property it "
+            f"guards was NOT checked. first attempt={first_attempt!r} retry={str(exc)!r}"
+        ) from exc
+
+
 class CandidateAcceptanceTests(unittest.TestCase):
     def setUp(self) -> None:
         self.provider_temp = tempfile.TemporaryDirectory()
@@ -935,7 +972,7 @@ class CandidateAcceptanceTests(unittest.TestCase):
 
     @unittest.skipUnless(os.name == "nt", "Windows protected-module bootstrap")
     def test_windows_system_curl_trust_rejects_user_module_shadowing(self) -> None:
-        from tools.repo_hygiene.candidate_acceptance import _windows_curl_trust_probe, _system_curl_path
+        from tools.repo_hygiene.candidate_acceptance import _system_curl_path
 
         powershell = Path(r"C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe")
         with tempfile.TemporaryDirectory() as temp:
@@ -959,7 +996,7 @@ class CandidateAcceptanceTests(unittest.TestCase):
             # host's real curl chain is asserted separately (host_verdict_is_explained_by_the_token),
             # so this defence is exercised on every host, elevated or not.
             with mock.patch.dict(os.environ, {"PSModulePath": str(attacker_root)}):
-                trust = _windows_curl_trust_probe(ROOT, self.config, _system_curl_path())
+                trust = _run_production_trust_probe(self.config, _system_curl_path())
             self.assertNotIn(str(attacker_root).casefold(), trust["modulePath"].casefold())
             protected_modules = "c:\\windows\\system32\\windowspowershell\\v1.0\\modules\\"
             self.assertTrue(all(str(path).casefold().startswith(protected_modules) for path in trust["loadedModulePaths"]))
@@ -1715,6 +1752,68 @@ class WindowsAclProbeTimeoutTests(unittest.TestCase):
             if ALLOW_UNKNOWN_ACL_PROBE_ENV in path.read_text(encoding="utf-8")
         ]
         self.assertEqual([], offenders, "CI must never enable the UNKNOWN-probe skip")
+
+
+@unittest.skipUnless(os.name == "nt", "Windows trust probe needs the system powershell.exe")
+class CurlTrustProbeStallRetryTests(unittest.TestCase):
+    """CI-01: one stalled (exit 124) production trust probe is retried once; two stalls are UNKNOWN."""
+
+    STALL = {"returncode": 124, "timedOut": True, "outputCapped": False, "cpuStalled": False, "stdout": "", "stderr": ""}
+    ROOT_MODULES = r"C:\Windows\System32\WindowsPowerShell\v1.0\Modules"
+
+    def _clean(self) -> dict:
+        return {
+            "returncode": 0, "timedOut": False, "outputCapped": False, "cpuStalled": False, "stderr": "",
+            "stdout": json.dumps({
+                "modulePath": r"C:\Program Files\WindowsPowerShell\Modules;" + self.ROOT_MODULES,
+                "loadedModulePaths": [self.ROOT_MODULES + r"\Microsoft.PowerShell.Security\x.psd1"],
+                "pathTrust": [{"path": p} for p in ("C:\\", "C:\\Windows", "C:\\Windows\\curl.exe")],
+            }),
+        }
+
+    def _drive(self, completions: list) -> tuple:
+        timeouts: list = []
+        queue = list(completions)
+
+        def runner(*args, **kwargs):
+            timeouts.append(kwargs["timeout_ms"])
+            return queue.pop(0)
+
+        with mock.patch("tools.repo_hygiene.brokered_closeout.run_bounded_closeout_process", runner), \
+                mock.patch("sys.stderr", io.StringIO()):
+            try:
+                return _run_production_trust_probe({}, Path(r"C:\Windows\curl.exe")), timeouts
+            except AssertionError as exc:
+                return exc, timeouts
+
+    def test_a_single_exit_124_is_retried_once_under_the_wider_bound_and_the_evidence_is_returned(self) -> None:
+        trust, timeouts = self._drive([self.STALL, self._clean()])
+        self.assertEqual([30000, CURL_TRUST_PROBE_RETRY_TIMEOUT_MS], timeouts)
+        self.assertEqual(3, len(trust["pathTrust"]))
+        self.assertIn(self.ROOT_MODULES.casefold(), trust["modulePath"].casefold())
+
+    def test_two_stalls_are_typed_unknown_naming_both_attempts_never_a_pass_or_skip(self) -> None:
+        error, timeouts = self._drive([self.STALL, self.STALL])
+        self.assertIsInstance(error, WindowsAclProbeUnknown)
+        self.assertNotIsInstance(error, unittest.SkipTest)
+        self.assertEqual(2, len(timeouts))
+        message = str(error)
+        self.assertIn("UNKNOWN", message)
+        self.assertEqual(2, message.count(CURL_TRUST_PROBE_STALL_MARKER), message)
+
+    def test_a_probe_that_did_not_stall_is_not_retried_and_other_failures_are_not_masked(self) -> None:
+        trust, timeouts = self._drive([self._clean()])
+        self.assertEqual([30000], timeouts)
+        self.assertTrue(trust["loadedModulePaths"])
+        tampered = dict(self._clean(), returncode=1, stderr="forged")
+        with self.assertRaisesRegex(HygieneError, "failed with exit 1: forged"):
+            queue = [tampered]
+            with mock.patch(
+                "tools.repo_hygiene.brokered_closeout.run_bounded_closeout_process",
+                lambda *a, **k: queue.pop(0),
+            ):
+                _run_production_trust_probe({}, Path(r"C:\Windows\curl.exe"))
+        self.assertEqual([], queue, "the non-124 failure must be raised after exactly one runner call")
 
 
 if __name__ == "__main__":
