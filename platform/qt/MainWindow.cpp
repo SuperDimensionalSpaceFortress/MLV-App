@@ -3929,10 +3929,10 @@ MainWindow::PlaybackPrepResult MainWindow::buildPlaybackPrepResult( const Playba
         PlaybackPrepCpuWorkspace &cpuWorkspace =
             threadState ? threadState->cpu : inlineWorkspace;
         PlaybackPrepReducedInputs reducedInputs;
-        // H1 arm: tier 2 is wired in the next commit; until then every frame
-        // stays full size, counted under the kill-switch refusal.
         reducedInputs.killSwitch =
-            true;
+            qEnvironmentVariableIsSet( playbackPrepReducedKillSwitchName() )
+            && qEnvironmentVariable( playbackPrepReducedKillSwitchName() ).trimmed()
+                   != QStringLiteral("0");
         reducedInputs.playbackActive = playbackPolicyActive && threadState != nullptr;
         reducedInputs.scopesVisible =
             mainWindowHasScopeVisualization( task.requestContext.gpuPreviewPolicy );
