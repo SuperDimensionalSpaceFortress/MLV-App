@@ -16,7 +16,9 @@ Usage:
     py -3 tools/doctrine/doctrine_recall.py [--bus PATH] [--project-memory PATH] [--top N]
         [--json] "<symptom words or a pasted log tail>"      (use - to read the query from stdin)
 
-Exit codes: 0 for every search (hits or none); 2 for a usage error or a missing bus.
+Exit codes: 0 for every search (hits or none); 2 for a usage error, a missing bus, or a bus
+directory with no corpus (none of TRAPS.md / RECEIPTS.md / RULINGS.md, or no entries parsed).
+Writes nothing to disk: bus commit lookups read git blame through a pipe under one deadline.
 """
 
 from __future__ import annotations
@@ -27,7 +29,6 @@ import math
 import re
 import subprocess
 import sys
-import tempfile
 import time
 from collections import Counter
 from concurrent.futures import ThreadPoolExecutor
@@ -41,8 +42,12 @@ CONSUMER_DOC = REPO_ROOT / "agents" / "doctrine-consumer.md"
 BUS_FILES = ("TRAPS.md", "RECEIPTS.md", "RULINGS.md")
 DEFAULT_TOP = 5
 MAX_QUERY_TERMS = 30
-# The brief allows 5 s for blame; 4 s keeps the whole run (about 0.4 s of search) under 5 s.
+# The brief allows 5 s for blame. Blame's worst case is this budget plus KILL_GRACE_S of cleanup
+# (4.5 s), so with about 0.4 s of search the whole run stays under 5 s. The oldest real-bus hit
+# (TRAPS.md line 8336) needs about 2.8 s of blame on its own, which is why the budget is not lower.
 BLAME_BUDGET_S = 4.0
+KILL_GRACE_S = 0.5  # past the deadline: taskkill plus the final communicate, together
+KILL_TASKKILL_S = 0.3
 MAX_ENTRY_CHARS = 6000
 CHUNK_CHARS = 3000
 EXTRACT_MAX_CHARS = 240
@@ -306,68 +311,97 @@ def rank(entries: list[Entry], query: str, today: date, top: int) -> tuple[list[
     return terms, [(score, entries[index]) for score, index in scored[:top]]
 
 
-def _run_git(args: list[str], deadline: float) -> str | None:
-    """Run git with stdout in a temp file, never a pipe.
+def _kill_tree(proc: subprocess.Popen) -> None:
+    """Kill git and, on Windows, the inner git its launcher spawned (bounded to KILL_TASKKILL_S)."""
+    if sys.platform == "win32":
+        try:
+            subprocess.run(
+                ["taskkill", "/T", "/F", "/PID", str(proc.pid)],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                timeout=KILL_TASKKILL_S,
+            )
+        except (OSError, subprocess.SubprocessError):
+            pass
+    try:
+        proc.kill()
+    except OSError:
+        pass
 
-    A pipe plus a kill can hang forever on Windows: git.exe is a launcher, so killing it leaves
-    the inner git holding the pipe (fleet TRAPS: "Async pipe reads plus WaitForExit hang git").
-    On timeout the whole tree is killed with taskkill /T.
+
+def _git_output(args: list[str], deadline: float) -> tuple[str | None, str]:
+    """Run git with stdout on a pipe; return (stdout, status), status "ok" | "timeout" | "error".
+
+    No filesystem writes. Everything is bounded by ONE shared monotonic deadline: communicate()
+    waits at most until it; on expiry the process tree is killed and one more communicate() waits
+    at most KILL_GRACE_S past the deadline (taskkill's own timeout is inside that grace, so the
+    worst case is the budget plus KILL_GRACE_S, 4.5 s by default). If the
+    inner git still holds the pipe after that, the lookup is abandoned as a timeout rather than
+    waited for: nothing in here blocks without a timeout.
     """
     remaining = deadline - time.monotonic()
     if remaining <= 0:
-        return None
-    with tempfile.TemporaryFile() as sink:
+        return None, "timeout"
+    try:
+        proc = subprocess.Popen(
+            ["git", *args], stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, stdin=subprocess.DEVNULL
+        )
+    except OSError:
+        return None, "error"
+    try:
+        stdout, _ = proc.communicate(timeout=remaining)
+    except subprocess.TimeoutExpired:
+        _kill_tree(proc)
         try:
-            proc = subprocess.Popen(
-                ["git", *args], stdout=sink, stderr=subprocess.DEVNULL, stdin=subprocess.DEVNULL
-            )
-        except OSError:
-            return None
-        try:
-            code = proc.wait(timeout=remaining)
+            proc.communicate(timeout=max(deadline + KILL_GRACE_S - time.monotonic(), 0.05))
         except subprocess.TimeoutExpired:
-            if sys.platform == "win32":
-                subprocess.run(
-                    ["taskkill", "/T", "/F", "/PID", str(proc.pid)],
-                    stdout=subprocess.DEVNULL,
-                    stderr=subprocess.DEVNULL,
-                    timeout=3,
-                )
-            proc.kill()
-            proc.wait()
-            return None
-        if code != 0:
-            return None
-        sink.seek(0)
-        return sink.read().decode("utf-8", errors="replace")
+            pass
+        return None, "timeout"
+    if proc.returncode != 0:
+        return None, "error"
+    return stdout.decode("utf-8", errors="replace"), "ok"
+
+
+def _run_git(args: list[str], deadline: float) -> str | None:
+    return _git_output(args, deadline)[0]
+
+
+def blame_lookup(bus: Path, file: str, line: int, deadline: float) -> tuple[dict | None, str]:
+    out, status = _git_output(["-C", str(bus), "blame", "--porcelain", "-L", f"{line},{line}", "--", file], deadline)
+    if status != "ok":
+        return None, status
+    first = out.splitlines()[0].split() if out else []
+    if not first or not re.fullmatch(r"[0-9a-f]{40}", first[0]):
+        return None, "error"
+    summary = next((ln[len("summary "):] for ln in out.splitlines() if ln.startswith("summary ")), "")
+    return {"sha": first[0][:7], "summary": summary}, "ok"
 
 
 def blame_commit(bus: Path, file: str, line: int, deadline: float) -> dict | None:
-    out = _run_git(["-C", str(bus), "blame", "--porcelain", "-L", f"{line},{line}", "--", file], deadline)
-    if not out:
-        return None
-    first = out.splitlines()[0].split()
-    if not first or not re.fullmatch(r"[0-9a-f]{40}", first[0]):
-        return None
-    summary = next((ln[len("summary "):] for ln in out.splitlines() if ln.startswith("summary ")), "")
-    return {"sha": first[0][:7], "summary": summary}
+    return blame_lookup(bus, file, line, deadline)[0]
 
 
 def attach_commits(bus: Path, hits: list[dict], budget_s: float) -> None:
-    """One blame call per bus hit, in parallel, all sharing one deadline; failures are skipped."""
-    if not (bus / ".git").exists():
-        return
-    deadline = time.monotonic() + budget_s
+    """One blame call per bus hit, in parallel, all sharing one deadline; every outcome is labelled.
+
+    commit_status is "ok", "timeout", "error" or "no-git" (the bus is not a git checkout), so a
+    missing commit is never mistaken for a bus that simply has none.
+    """
     targets = [hit for hit in hits if hit["source"] == "bus"]
     if not targets:
         return
+    if not (bus / ".git").exists():
+        for hit in targets:
+            hit["commit_status"] = "no-git"
+        return
+    deadline = time.monotonic() + budget_s
     with ThreadPoolExecutor(max_workers=len(targets)) as pool:
-        futures = [pool.submit(blame_commit, bus, hit["file"], hit["line"], deadline) for hit in targets]
+        futures = [pool.submit(blame_lookup, bus, hit["file"], hit["line"], deadline) for hit in targets]
         for hit, future in zip(targets, futures):
             try:
-                hit["commit"] = future.result()
+                hit["commit"], hit["commit_status"] = future.result()
             except Exception:  # noqa: BLE001 - a blame failure must never fail a search
-                hit["commit"] = None
+                hit["commit"], hit["commit_status"] = None, "error"
 
 
 def resolve_bus(explicit: str | None, consumer_doc: Path = CONSUMER_DOC) -> Path:
@@ -403,7 +437,12 @@ def hit_record(rank_no: int, score: float, entry: Entry, today: date) -> dict:
         "extracts": extracts,
         "snippet": snippet,
         "commit": None,
+        "commit_status": "not-requested",
     }
+
+
+class CorpusUnavailable(Exception):
+    """The bus directory exists but yielded no bus entries, so a search would prove nothing."""
 
 
 def search(
@@ -417,6 +456,8 @@ def search(
     started = time.monotonic()
     today = today or date.today()
     entries = load_entries(bus, project_memory)
+    if bus is not None and not any(entry.source == "bus" for entry in entries):
+        raise CorpusUnavailable(bus)
     terms, ranked = rank(entries, query, today, top)
     hits = [hit_record(i, score, entry, today) for i, (score, entry) in enumerate(ranked, 1)]
     if bus is not None and hits and blame_budget_s > 0:
@@ -445,6 +486,8 @@ def render(result: dict) -> str:
         lines.append(f"    {hit['heading']}")
         if hit.get("commit"):
             lines.append(f"    bus commit {hit['commit']['sha']}: {_truncate(hit['commit']['summary'], 100)}")
+        elif hit.get("commit_status") in ("timeout", "error", "no-git"):
+            lines.append(f"    bus commit: unavailable ({hit['commit_status']})")
         for extract in hit["extracts"]:
             lines.append(f"    {extract}")
         if hit["snippet"]:
@@ -484,7 +527,13 @@ def main(argv: list[str] | None = None) -> int:
         print(f"doctrine-recall: bus not found: {bus} (pass --bus PATH)", file=sys.stderr)
         return 2
     memory = Path(args.project_memory) if args.project_memory else REPO_ROOT / ".claude-state" / "project-memory"
-    result = search(query, bus, memory if memory.is_dir() else None, args.top, blame_budget_s=args.blame_timeout)
+    try:
+        result = search(query, bus, memory if memory.is_dir() else None, args.top, blame_budget_s=args.blame_timeout)
+    except CorpusUnavailable:
+        found = [name for name in BUS_FILES if (bus / name).is_file()]
+        reason = "no TRAPS.md/RECEIPTS.md/RULINGS.md" if not found else f"no entries parsed from {', '.join(found)}"
+        print(f"doctrine-recall: corpus unavailable at {bus} ({reason})", file=sys.stderr)
+        return 2
     print(json.dumps(result, indent=2, ensure_ascii=False) if args.json else render(result))
     return 0
 

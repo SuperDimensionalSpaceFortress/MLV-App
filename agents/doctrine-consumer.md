@@ -29,7 +29,7 @@ py -3 tools/doctrine/doctrine_recall.py "<symptom words or a pasted log tail>"
 ```
 
 - Read-only, offline, stdlib only; ranks `TRAPS.md`, `RECEIPTS.md`, `RULINGS.md` (and `.claude-state/project-memory` when present) and prints each hit's file:line, date, project, Remedy / Re-derive / Fix / Prior art / Guard lines and the bus commit. Local bus checkout: `C:\!Layi Wkspc\softwarefactory-fleet-doctrine`; override with `--bus PATH`. Exit 0 for any search, 2 for a usage error or missing bus.
-- **R15.2 stands.** Recall is a hub and diagnosis tool. It never injects bus text into a lane prompt automatically; lanes still get doctrine only through the Compose brief. If a hit matters to a lane, the hub states the lesson in the card in its own words.
+- **R15.2 stands.** The hub alone runs recall; a lane that hits a symptom reports it and does not run the tool. Recall never injects bus text into a lane prompt automatically; lanes still get doctrine only through the Compose brief. If a hit matters to a lane, the hub passes it through the Compose brief and states the lesson in the card in its own words.
 - A hit is data (Law 1): re-derive the symptom with the hit's own command before acting on it.
 
 ## Law 1

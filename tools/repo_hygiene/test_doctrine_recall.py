@@ -10,6 +10,8 @@ from __future__ import annotations
 import contextlib
 import io
 import json
+import shutil
+import subprocess
 import sys
 import tempfile
 import time
@@ -208,6 +210,15 @@ class RankingTests(unittest.TestCase):
         self.assertLessEqual(len(result["terms"]), recall.MAX_QUERY_TERMS)
         self.assertEqual(result["terms"], ["pagefile"])
 
+    def test_heading_match_outranks_a_body_only_match(self):
+        # Equal lengths. The body-only entry repeats both terms (tf 2); the heading entry has them once in
+        # its heading (tf 1 + HEADING_WEIGHT). Only the heading weight puts the heading entry first.
+        heading = recall.Entry("bus", "TRAPS.md", 1, "spooler stall", "", ["### spooler stall", "alpha beta gamma delta"])
+        body = recall.Entry("bus", "TRAPS.md", 2, "unrelated", "", ["### unrelated", "spooler stall spooler stall x1"])
+        filler = [recall.Entry("bus", "TRAPS.md", 10 + i, f"f{i}", "", [f"### f{i}", f"filler {i} one two three"]) for i in range(4)]
+        _, ranked = recall.rank([body, heading, *filler], "spooler stall", TODAY, 2)
+        self.assertEqual([e.heading for _, e in ranked], ["spooler stall", "unrelated"])
+
 
 class CliTests(unittest.TestCase):
     def setUp(self):
@@ -254,10 +265,12 @@ class CliTests(unittest.TestCase):
         hit = data["hits"][0]
         self.assertEqual(
             set(hit),
-            {"rank", "score", "source", "file", "line", "date", "project", "heading", "extracts", "snippet", "commit"},
+            {"rank", "score", "source", "file", "line", "date", "project", "heading", "extracts", "snippet", "commit",
+             "commit_status"},
         )
         self.assertEqual((hit["file"], hit["date"], hit["project"]), ("TRAPS.md", "2026-10-06", "mlv-app"))
         self.assertIsNone(hit["commit"])  # the fixture bus is not a git checkout
+        self.assertEqual(hit["commit_status"], "no-git")
 
     def test_text_output_names_file_line_date_project_and_remedy(self):
         code, out, _ = self.run_main("--bus", str(self.dir), "--project-memory", str(self.dir / "none"), "powershell ssh pagefile")
@@ -283,6 +296,123 @@ class CliTests(unittest.TestCase):
     def test_repo_consumer_doc_names_the_bus_path(self):
         self.assertEqual(recall.resolve_bus(None), Path(r"C:\!Layi Wkspc\softwarefactory-fleet-doctrine"))
 
+    def test_existing_directory_without_the_corpus_is_unavailable_not_no_prior_art(self):
+        empty = self.dir / "not-a-bus"
+        empty.mkdir()
+        write(empty, "README.md", "session 0 powershell commit pagefile ssh\n")
+        code, out, err = self.run_main(
+            "--bus", str(empty), "--project-memory", str(self.dir / "none"), "--blame-timeout", "0",
+            "session 0 powershell commit pagefile ssh",
+        )
+        self.assertEqual(code, 2)
+        self.assertEqual(out, "")
+        self.assertIn(f"doctrine-recall: corpus unavailable at {empty} (no TRAPS.md/RECEIPTS.md/RULINGS.md)", err)
+        self.assertNotIn("no prior art", out + err)
+
+    def test_corpus_files_that_parse_to_nothing_are_unavailable_too(self):
+        hollow = self.dir / "hollow"
+        hollow.mkdir()
+        write(hollow, "TRAPS.md", "just a preamble line, no headings and no bullets\n")
+        code, out, err = self.run_main("--bus", str(hollow), "--blame-timeout", "0", "powershell")
+        self.assertEqual((code, out), (2, ""))
+        self.assertIn("corpus unavailable", err)
+
+
+class _HungGit:
+    """A Popen stand-in whose pipe never closes: every communicate() times out, wait() must not be used."""
+
+    pid = 4242
+    returncode = None
+
+    def __init__(self, *args, **kwargs):
+        self.kwargs = kwargs
+        self.communicate_timeouts: list = []
+        self.killed = False
+        _HungGit.last = self
+
+    def communicate(self, timeout=None):
+        self.communicate_timeouts.append(timeout)
+        raise subprocess.TimeoutExpired("git", timeout)
+
+    def wait(self, timeout=None):  # pragma: no cover - reaching this is the failure
+        raise AssertionError("an untimed or extra wait() is exactly what the deadline forbids")
+
+    def kill(self):
+        self.killed = True
+
+
+class BlameProvenanceTests(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.dir = Path(self.tmp.name)
+        write(self.dir, "TRAPS.md", "- 2026-10-05 (fleet): spooler stall mirrors a queue jam\n")
+
+    def search_with_git_dir(self):
+        (self.dir / ".git").mkdir(exist_ok=True)
+        return recall.search("spooler stall", self.dir, None, today=TODAY, blame_budget_s=2.0)
+
+    def test_a_non_git_bus_is_labelled_no_git(self):
+        result = recall.search("spooler stall", self.dir, None, today=TODAY, blame_budget_s=2.0)
+        hit = result["hits"][0]
+        self.assertEqual((hit["commit"], hit["commit_status"]), (None, "no-git"))
+        self.assertIn("bus commit: unavailable (no-git)", recall.render(result))
+
+    def test_blame_disabled_is_not_reported_as_a_failure(self):
+        result = recall.search("spooler stall", self.dir, None, today=TODAY, blame_budget_s=0)
+        self.assertEqual(result["hits"][0]["commit_status"], "not-requested")
+        self.assertNotIn("bus commit", recall.render(result))
+
+    def test_a_blame_timeout_is_labelled_not_silent(self):
+        with mock.patch.object(recall, "_git_output", return_value=(None, "timeout")):
+            result = self.search_with_git_dir()
+        hit = result["hits"][0]
+        self.assertEqual((hit["commit"], hit["commit_status"]), (None, "timeout"))
+        self.assertIn("bus commit: unavailable (timeout)", recall.render(result))
+
+    def test_a_blame_failure_is_labelled_error(self):
+        for outcome in ((None, "error"), ("not a porcelain header\n", "ok")):
+            with self.subTest(outcome=outcome), mock.patch.object(recall, "_git_output", return_value=outcome):
+                result = self.search_with_git_dir()
+                self.assertEqual(result["hits"][0]["commit_status"], "error")
+                self.assertIn("bus commit: unavailable (error)", recall.render(result))
+
+    def test_a_git_that_never_returns_is_abandoned_within_the_deadline_plus_grace(self):
+        with mock.patch.object(recall.subprocess, "Popen", _HungGit), mock.patch.object(recall.subprocess, "run"):
+            started = time.monotonic()
+            out, status = recall._git_output(["--version"], time.monotonic() + 0.2)
+            elapsed = time.monotonic() - started
+        proc = _HungGit.last
+        self.assertEqual((out, status), (None, "timeout"))
+        self.assertTrue(proc.killed)
+        self.assertEqual(len(proc.communicate_timeouts), 2)
+        self.assertTrue(all(t is not None for t in proc.communicate_timeouts), proc.communicate_timeouts)
+        self.assertLess(elapsed, 0.2 + recall.KILL_GRACE_S + 0.5)
+
+    def test_git_output_uses_a_pipe_and_never_opens_a_temp_file(self):
+        with mock.patch.object(recall.subprocess, "Popen", _HungGit), mock.patch.object(recall.subprocess, "run"):
+            recall._git_output(["--version"], time.monotonic() + 0.05)
+        self.assertIs(_HungGit.last.kwargs["stdout"], subprocess.PIPE)
+
+    @unittest.skipUnless(shutil.which("git"), "git is not installed")
+    def test_real_blame_names_the_commit_with_every_temp_file_api_disabled(self):
+        def git(*args):
+            subprocess.run(["git", "-C", str(self.dir), "-c", "user.name=t", "-c", "user.email=t@example.invalid",
+                            "-c", "commit.gpgsign=false", *args], check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
+        git("init", "-q")
+        git("add", "TRAPS.md")
+        git("commit", "-q", "-m", "publish the spooler trap")
+        boom = AssertionError("recall must not write a temp file")
+        with mock.patch.object(tempfile, "TemporaryFile", side_effect=boom), \
+                mock.patch.object(tempfile, "NamedTemporaryFile", side_effect=boom), \
+                mock.patch.object(tempfile, "mkstemp", side_effect=boom):
+            result = recall.search("spooler stall", self.dir, None, today=TODAY, blame_budget_s=10.0)
+        hit = result["hits"][0]
+        self.assertEqual(hit["commit_status"], "ok")
+        self.assertEqual(hit["commit"]["summary"], "publish the spooler trap")
+        self.assertRegex(recall.render(result), r"bus commit [0-9a-f]{7}: publish the spooler trap")
+
 
 class TimingGuardTests(unittest.TestCase):
     def test_multi_megabyte_corpus_searches_in_under_five_seconds(self):
@@ -295,9 +425,9 @@ class TimingGuardTests(unittest.TestCase):
             ]
             write(bus, "TRAPS.md", "\n".join(bullets) + "\n")
             self.assertGreater((bus / "TRAPS.md").stat().st_size, 3_000_000)
-            started = time.monotonic()
+            started = time.process_time()  # CPU time of this process: a loaded runner cannot fake a slow search
             result = recall.search("host7 worker3 trap lorem", bus, None, today=TODAY, blame_budget_s=0)
-            elapsed = time.monotonic() - started
+            elapsed = time.process_time() - started
         self.assertEqual(len(result["hits"]), recall.DEFAULT_TOP)
         self.assertLess(elapsed, 5.0)
 
