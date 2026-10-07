@@ -91,13 +91,16 @@ sections 4-5) is not an item. Commit it as `doctrine-outbox/kernel-filing/<yyyym
 `adjudications-factory-kernel-mlv-app.md` (the whole filing) and, optionally, `specs-mlv-app-block.md` (a
 block for the project's own spec). `kernel-filing --bus <clone>` publishes them to bus branch
 `review/mlv-app-kernel-<YYYY-MM-DD>`: it rewrites `adjudications/factory-kernel/mlv-app.md` wholesale and
-appends the block, with an `outbox:<key>` marker, to `specs/mlv-app.md`. It writes no other path. The
-branch comes from the date directory, and no parameter can name a branch or a path. The branch is created
-from bus master, or fast-forwarded when every commit on it is this outbox's (else
-`KERNEL_BRANCH_NOT_OURS`). Any other file in the date directory is `KERNEL_FILING_EXTRA_PATH`. Every
-Law-4 class and deny term is screened, with no word cap, because a filing is wholesale. The push is proven
-by `ls-remote` equal to the local tip (R7) and recorded in the sent ledger with `route: kernel-filing`.
-A re-run is a no-op, by the ledger or, on a fresh clone, by the bytes already on the branch.
+appends the block, with an `outbox:<key>` marker, to `specs/mlv-app.md`. A revised block for the same
+date replaces the earlier one: the spec is rebuilt from where the branch left bus master. It writes no
+other path. The branch comes from the date directory, and no parameter can name a branch or a path. The
+branch is created from bus master, or fast-forwarded when every commit on it is this outbox's (else
+`KERNEL_BRANCH_NOT_OURS`). Any other file in the date directory is `KERNEL_FILING_EXTRA_PATH`; an empty or
+whitespace-only filing or block is `KERNEL_FILING_EMPTY`. Every Law-4 class and deny term is screened,
+with no word cap, because a filing is wholesale. Every success (a push, a lost-ack recovery, a no-op) is
+proven by `ls-remote` equal to the certified commit (R7), else `PUSH_VERIFY_FAILED` with no ledger row,
+and recorded in the sent ledger with `route: kernel-filing`. The key covers the bytes only, never the
+source commit. A re-run is a no-op, by the ledger or, on a fresh clone, by the bytes already on the branch.
 
 ## Entries already on the bus: `published_as`
 

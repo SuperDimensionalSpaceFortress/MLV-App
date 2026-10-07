@@ -1545,9 +1545,9 @@ def test_kernel_filing_refuses_a_write_outside_the_two_paths(tmp_path, monkeypat
     before = remote_heads(bare)
     real_write = ob.write_kernel_files
 
-    def sneaky_write(wt, filing):
+    def sneaky_write(wt, *args):
         (wt / "RULINGS.md").write_text("# rewritten\n", encoding="utf-8")
-        return real_write(wt, filing)
+        return real_write(wt, *args)
 
     monkeypatch.setattr(ob, "write_kernel_files", sneaky_write)
     with pytest.raises(ob.Refusal) as excinfo:
@@ -1745,14 +1745,182 @@ def test_kernel_filing_subtree_is_not_an_outbox_item(tmp_path):
     assert [w["path"] for w in report["would_push"]] == ["doctrine-outbox/20260925-example.md"]
 
 
-def test_shipped_kernel_filings_are_well_formed_and_screen_clean():
-    """Every kernel filing committed in this checkout has the fixed shape and passes the Law-4
-    screen, so the first kernel-filing drain cannot refuse it."""
-    root = REPO_ROOT / "doctrine-outbox" / "kernel-filing"
-    for d in (sorted(root.iterdir()) if root.is_dir() else []):
+def assert_shipped_kernel_filings(root: Path) -> None:
+    dates = sorted(root.iterdir()) if root.is_dir() else []
+    assert dates, f"no kernel filing shipped under {root}"
+    for d in dates:
         ob.kernel_branch(d.name)
         names = sorted(p.relative_to(d).as_posix() for p in d.rglob("*") if p.is_file())
         assert "adjudications-factory-kernel-mlv-app.md" in names, names
         assert set(names) <= {"adjudications-factory-kernel-mlv-app.md", "specs-mlv-app-block.md"}, names
         for name in names:
-            ob.screen_law4((d / name).read_text(encoding="utf-8"), [], word_cap=None)
+            text = (d / name).read_text(encoding="utf-8")
+            assert text.strip(), f"{d.name}/{name} is empty"
+            ob.screen_law4(text, [], word_cap=None)
+
+
+def test_shipped_kernel_filings_are_well_formed_and_screen_clean():
+    """Every kernel filing committed in this checkout has the fixed shape and passes the Law-4
+    screen, so the first kernel-filing drain cannot refuse it."""
+    assert_shipped_kernel_filings(REPO_ROOT / "doctrine-outbox" / "kernel-filing")
+
+
+@pytest.mark.parametrize("layout", ["absent", "empty"])
+def test_shipped_kernel_filing_guard_fails_when_the_payload_is_missing(tmp_path, layout):
+    root = tmp_path / "kernel-filing"
+    if layout == "empty":
+        root.mkdir()
+    with pytest.raises(AssertionError):
+        assert_shipped_kernel_filings(root)
+
+
+@pytest.mark.parametrize("filing,block,empty", [
+    ("", KF_BLOCK, "adjudications-factory-kernel-mlv-app.md"),
+    (" \n\t\n", KF_BLOCK, "adjudications-factory-kernel-mlv-app.md"),
+    (KF_FILING, "\n\n", "specs-mlv-app-block.md"),
+])
+def test_kernel_filing_refuses_an_empty_filing_or_block_before_any_write(tmp_path, monkeypatch, filing, block, empty):
+    """An empty committed filing would rewrite the bus adjudication wholesale to zero bytes."""
+    bare, clone = init_kernel_bus(tmp_path)
+    src = init_source(tmp_path)
+    add_kernel_filing(src, filing=filing, block=block)
+    ledger = tmp_path / "sent.jsonl"
+    before = remote_heads(bare)
+    monkeypatch.setattr(ob, "make_temp_worktree", lambda *a: pytest.fail("no worktree for an empty filing"))
+
+    report = ob.drain_kernel_filing(src, clone, "HEAD", ledger, [], push=True)
+
+    assert report["refused"] == [{"path": f"doctrine-outbox/kernel-filing/{KF_DATE}",
+                                  "code": "KERNEL_FILING_EMPTY", "detail": empty}]
+    assert report["published"] == [] and report["pushed"] is False
+    assert remote_heads(bare) == before and not ledger.exists()
+
+
+def test_write_kernel_files_refuses_an_empty_filing_at_the_sink(tmp_path):
+    """The one function that writes the bus adjudication refuses blank bytes on its own."""
+    dest = tmp_path / ob.KERNEL_FILING_DEST
+    dest.parent.mkdir(parents=True)
+    dest.write_bytes(b"existing adjudication\n")
+    with pytest.raises(ob.Refusal) as excinfo:
+        ob.write_kernel_files(tmp_path, {"filing": b" \r\n", "block": None, "block_key": None}, b"")
+    assert excinfo.value.code == "KERNEL_FILING_EMPTY"
+    assert dest.read_bytes() == b"existing adjudication\n"
+
+
+def _rival_push(bare: Path, tmp_path: Path, text: str) -> str:
+    """Another run of this outbox lands commit C on the review branch."""
+    rival = tmp_path / f"rival-{len(list(tmp_path.glob('rival-*')))}"
+    subprocess.run(["git", "clone", "-c", "core.autocrlf=false", str(bare), str(rival)],
+                   check=True, capture_output=True, text=True)
+    git(rival, "checkout", "-q", "-b", "k", f"origin/{KF_BRANCH}")
+    (rival / "adjudications" / "factory-kernel" / "mlv-app.md").write_text(text, encoding="utf-8")
+    git(rival, "add", "adjudications/factory-kernel/mlv-app.md")
+    git(rival, "commit", "-m", "rival", env=OUTBOX_ENV)
+    git(rival, "push", "origin", f"HEAD:refs/heads/{KF_BRANCH}")
+    return git(rival, "rev-parse", "HEAD")
+
+
+def _lossy_push(monkeypatch):
+    """Every push lands but reports failure: the acknowledgement is lost."""
+    real_git_try = ob.git_try
+
+    def lossy(repo, *args, **kw):
+        rc, out, err = real_git_try(repo, *args, **kw)
+        if args and args[0] == "push" and rc == 0:
+            return 1, out, "fatal: the remote end hung up unexpectedly"
+        return rc, out, err
+    monkeypatch.setattr(ob, "git_try", lossy)
+
+
+def test_kernel_filing_lost_ack_that_landed_is_published_after_ls_remote(tmp_path, monkeypatch):
+    bare, clone = init_kernel_bus(tmp_path)
+    src = init_source(tmp_path)
+    add_kernel_filing(src)
+    ledger = tmp_path / "sent.jsonl"
+    _lossy_push(monkeypatch)
+
+    report = ob.drain_kernel_filing(src, clone, "HEAD", ledger, [], push=True)
+
+    tip = git(bare, "rev-parse", f"refs/heads/{KF_BRANCH}")
+    assert report["pushed"] is True and [p["bus_commit"] for p in report["published"]] == [tip]
+    assert [(r["bus_commit"], r["ls_remote"]) for r in _ledger_rows(ledger)] == [(tip, tip)]
+
+
+def test_kernel_filing_lost_ack_then_a_rival_tip_is_refused_with_no_sent_row(tmp_path, monkeypatch):
+    """B lands but its ack is lost; the retry fetches B; C lands before the no-change branch
+    certifies B. Publication of B must not be claimed: ls-remote is C."""
+    bare, clone = init_kernel_bus(tmp_path)
+    src = init_source(tmp_path)
+    add_kernel_filing(src)
+    ledger = tmp_path / "sent.jsonl"
+    _lossy_push(monkeypatch)
+    real_write, calls, rival = ob.write_kernel_files, {"n": 0}, {}
+
+    def write_then_race(*args):
+        calls["n"] += 1
+        changed = real_write(*args)
+        if calls["n"] == 2:  # the retry, on fetched B
+            assert changed is False
+            rival["c"] = _rival_push(bare, tmp_path, "rival revision C\n")
+        return changed
+
+    monkeypatch.setattr(ob, "write_kernel_files", write_then_race)
+    with pytest.raises(ob.Refusal) as excinfo:
+        ob.drain_kernel_filing(src, clone, "HEAD", ledger, [], push=True)
+
+    assert excinfo.value.code == "PUSH_VERIFY_FAILED"
+    assert rival["c"] in excinfo.value.detail
+    assert git(bare, "rev-parse", f"refs/heads/{KF_BRANCH}") == rival["c"]
+    assert not ledger.exists()
+
+
+def test_kernel_filing_bus_branch_noop_is_refused_when_the_tip_moves(tmp_path, monkeypatch):
+    """The no-change branch on a fresh clone (lost ledger) also ends with ls-remote equality."""
+    bare, clone = init_kernel_bus(tmp_path)
+    src = init_source(tmp_path)
+    add_kernel_filing(src)
+    ob.drain_kernel_filing(src, clone, "HEAD", tmp_path / "sent-a.jsonl", [], push=True)
+    real_write = ob.write_kernel_files
+
+    def write_then_race(*args):
+        changed = real_write(*args)
+        _rival_push(bare, tmp_path, "rival revision C\n")
+        return changed
+
+    monkeypatch.setattr(ob, "write_kernel_files", write_then_race)
+    lost = tmp_path / "sent-lost.jsonl"
+    with pytest.raises(ob.Refusal) as excinfo:
+        ob.drain_kernel_filing(src, clone, "HEAD", lost, [], push=True)
+    assert excinfo.value.code == "PUSH_VERIFY_FAILED"
+    assert not lost.exists()
+
+
+def test_kernel_filing_key_is_content_only_not_source_commit(tmp_path):
+    """Identical filing and block bytes under different source commits are the same filing."""
+    a = init_source(tmp_path, name="source-a")
+    add_kernel_filing(a)
+    b = init_source(tmp_path, name="source-b")
+    git(b, "commit", "--allow-empty", "-m", "an unrelated commit first")
+    add_kernel_filing(b)
+    fa, fb = ob.load_kernel_filings(a, "HEAD")[0], ob.load_kernel_filings(b, "HEAD")[0]
+    assert fa["src"] != fb["src"]
+    assert fa["key"] == fb["key"] and fa["block_key"] == fb["block_key"]
+
+
+def test_kernel_filing_same_date_block_revision_replaces_the_block(tmp_path):
+    bare, clone = init_kernel_bus(tmp_path)
+    src = init_source(tmp_path)
+    add_kernel_filing(src)
+    first = ob.drain_kernel_filing(src, clone, "HEAD", tmp_path / "sent.jsonl", [], push=True)
+    old_tip = first["published"][0]["bus_commit"]
+    revised = KF_BLOCK.replace("A block", "A revised block")
+    add_kernel_filing(src, block=revised)
+
+    second = ob.drain_kernel_filing(src, clone, "HEAD", tmp_path / "sent.jsonl", [], push=True)
+
+    new_tip = second["published"][0]["bus_commit"]
+    assert git(bare, "rev-parse", f"{new_tip}^") == old_tip
+    assert git(bare, "diff", "--name-only", old_tip, new_tip).splitlines() == ["specs/mlv-app.md"]
+    spec = git_raw(bare, "show", f"{new_tip}:specs/mlv-app.md").decode("utf-8")
+    assert spec.startswith(KF_SPEC_SEED + "\n" + revised)
+    assert "A block for" not in spec and spec.count("<!-- outbox:") == 1

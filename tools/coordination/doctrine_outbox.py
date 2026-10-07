@@ -42,9 +42,11 @@ WHAT IS DIFFERENT HERE (MLV-App's checkout shape drove every change)
    `kernel-filing` publishes `doctrine-outbox/kernel-filing/<yyyymmdd>/` on `--ref` to bus branch
    `review/mlv-app-kernel-<YYYY-MM-DD>`, never master. It rewrites
    `adjudications/factory-kernel/mlv-app.md` wholesale and appends an optional block to
-   `specs/mlv-app.md`; no other path, and no CLI parameter can name a branch or a path. The branch
-   is created from bus master, or fast-forwarded when every commit on it is this outbox's. The
-   push is proven by `ls-remote` equal to the local tip (R7) and recorded in the sent ledger.
+   `specs/mlv-app.md` (a revised block for the same date replaces the earlier one); no other path,
+   and no CLI parameter can name a branch or a path. An empty filing or block is refused. The
+   branch is created from bus master, or fast-forwarded when every commit on it is this outbox's.
+   Every success, including a no-op and a lost-ack recovery, is proven by `ls-remote` equal to
+   the certified commit (R7) and recorded in the sent ledger.
 
 Wiring (OS drain task, Stop hook, heartbeat debt) is card DOCTRINE-OUTBOX-ADOPT-MLV-1b and
 installs against this CLI. Nothing here runs itself.
@@ -814,22 +816,27 @@ def load_kernel_filings(repo: pathlib.Path, ref: str) -> list[dict]:
                 texts = {n: b.decode("utf-8") for n, b in blobs.items()}
             except UnicodeDecodeError:
                 raise Refusal("KERNEL_FILING_NOT_UTF8", path) from None
+            # The filing is a wholesale rewrite: an empty one would erase the bus adjudication.
+            empty = sorted(n for n, t in texts.items() if not t.strip())
+            if empty:
+                raise Refusal("KERNEL_FILING_EMPTY", ", ".join(empty))
         except Refusal as e:
             filings.append({"path": path, "error": e})
             continue
         src = git(repo, "log", "-n", "1", "--format=%H", ref, "--", path)
-        block = texts.get(KERNEL_SPEC_BLOCK_SRC)
-        block_key = None
-        if block is not None:
-            block = block.strip("\n") + "\n"
-            block_key = idempotency_key(date, KERNEL_SPEC_DEST, block)
-            block += f"<!-- outbox:{block_key} {PROJECT}:{src[:12]} -->\n"
+        raw_block = texts.get(KERNEL_SPEC_BLOCK_SRC)
+        block = block_key = None
+        if raw_block is not None:
+            raw_block = raw_block.strip("\n") + "\n"
+            block_key = idempotency_key(date, KERNEL_SPEC_DEST, raw_block)
+            block = raw_block + f"<!-- outbox:{block_key} {PROJECT}:{src[:12]} -->\n"
         filings.append({
             "path": path, "date": date, "branch": branch, "src": src,
             "filing": blobs[KERNEL_FILING_SRC], "filing_text": texts[KERNEL_FILING_SRC],
             "block": block, "block_key": block_key,
-            # Content-keyed, not commit-keyed: a squash merge re-lands the same bytes under a new sha.
-            "key": idempotency_key(date, branch, texts[KERNEL_FILING_SRC] + "\0" + (block or "")),
+            # Content-keyed, not commit-keyed: a squash merge re-lands the same bytes under a new sha,
+            # so the key covers the block before its sha-bearing marker.
+            "key": idempotency_key(date, branch, texts[KERNEL_FILING_SRC] + "\0" + (raw_block or "")),
             "message": f"kernel({PROJECT}): factory-kernel filing {date} -> {branch}\n\nDoctrine-Export: outbox\n",
         })
     return filings
@@ -864,8 +871,12 @@ def kernel_branch_foreign(bus_repo: pathlib.Path, master: str, tip: str) -> str 
     return None
 
 
-def write_kernel_files(wt: pathlib.Path, filing: dict) -> bool:
-    """Rewrite the filing wholesale and append the spec block once; True if anything changed."""
+def write_kernel_files(wt: pathlib.Path, filing: dict, spec_base: bytes) -> bool:
+    """Rewrite the filing wholesale; the spec becomes `spec_base` (the spec where the branch left
+    bus master) plus this filing's block, so a revised same-date block replaces the one before it.
+    True if anything changed."""
+    if not filing["filing"].strip():
+        raise Refusal("KERNEL_FILING_EMPTY", KERNEL_FILING_SRC)
     changed = False
     dest = wt / KERNEL_FILING_DEST
     if not dest.is_file() or dest.read_bytes() != filing["filing"]:
@@ -877,9 +888,19 @@ def write_kernel_files(wt: pathlib.Path, filing: dict) -> bool:
         old = spec.read_bytes().decode("utf-8", errors="replace") if spec.is_file() else ""
         if f"outbox:{filing['block_key']}" not in old:
             spec.parent.mkdir(parents=True, exist_ok=True)
+            spec.write_bytes(spec_base)
             append_block_to_file(spec, filing["block"])
             changed = True
     return changed
+
+
+def kernel_verify_tip(bus_repo: pathlib.Path, branch: str, sha: str | None) -> str | None:
+    """R7: every success path ends here. The branch has a single writer, so the proof is
+    ls-remote equal to the commit being certified, not ancestry."""
+    remote = remote_branch_sha(bus_repo, branch)
+    if remote != sha:
+        raise Refusal("PUSH_VERIFY_FAILED", f"ls-remote={remote!r} certified={sha!r}")
+    return remote
 
 
 def _kernel_row(filing: dict, bus_commit: str, remote: str) -> dict:
@@ -904,16 +925,23 @@ def publish_kernel_filing(bus_repo: pathlib.Path, filing: dict, ledger: pathlib.
                 report["refused"].append({"path": filing["path"], "code": "KERNEL_BRANCH_NOT_OURS", "detail": why})
                 return
         base = tip or master
+        # Where the branch left bus master: every commit past it is ours, so the spec there is the
+        # prefix every revision of this date's block must keep.
+        fork = git(bus_repo, "merge-base", master, tip) if tip is not None else master
         wt = make_temp_worktree(bus_repo, base)
         try:
-            if not write_kernel_files(wt, filing):
+            spec_base = cat_file_blob(wt, fork, KERNEL_SPEC_DEST)
+            if not write_kernel_files(wt, filing, spec_base):
+                # No change: the bytes are already on the branch, from a push whose ack was lost
+                # (`ours`) or from an earlier run whose ledger is gone. Certified only by ls-remote.
+                remote = kernel_verify_tip(bus_repo, branch, tip)
                 if tip in ours:
                     report["published"].append({**entry, "bus_commit": tip})
                     report["pushed"] = True
                 else:
                     report["already_sent"].append({**entry, "via": "bus_branch"})
                 if push:
-                    append_ledger_rows(ledger, [_kernel_row(filing, tip, tip)])
+                    append_ledger_rows(ledger, [_kernel_row(filing, tip, remote)])
                 return
             head = git_commit(wt, filing["message"])
             touched = set(git(wt, "diff", "--name-only", base, head).splitlines())
@@ -921,7 +949,7 @@ def publish_kernel_filing(bus_repo: pathlib.Path, filing: dict, ledger: pathlib.
                 raise Refusal("KERNEL_FILING_PATH_REFUSED", ", ".join(sorted(touched - allowed)))
             if cat_file_blob(wt, "HEAD", KERNEL_FILING_DEST) != filing["filing"]:
                 raise Refusal("KERNEL_FILING_BYTES_CHANGED", KERNEL_FILING_DEST)
-            if not cat_file_blob(wt, "HEAD", KERNEL_SPEC_DEST).startswith(cat_file_blob(wt, base, KERNEL_SPEC_DEST)):
+            if not cat_file_blob(wt, "HEAD", KERNEL_SPEC_DEST).startswith(spec_base):
                 raise Refusal("PREFIX_BROKEN", KERNEL_SPEC_DEST)
             if not push:
                 report["would_push"].append({**entry, "bus_commit": head, "base": base})
@@ -932,10 +960,7 @@ def publish_kernel_filing(bus_repo: pathlib.Path, filing: dict, ledger: pathlib.
             remove_temp_worktree(bus_repo, wt)
 
         if rc == 0:
-            # R7: the branch has a single writer, so the proof is equality, not ancestry.
-            remote = remote_branch_sha(bus_repo, branch)
-            if remote != head:
-                raise Refusal("PUSH_VERIFY_FAILED", f"ls-remote={remote!r} head={head!r}")
+            remote = kernel_verify_tip(bus_repo, branch, head)
             append_ledger_rows(ledger, [_kernel_row(filing, head, remote)])
             report["published"].append({**entry, "bus_commit": head})
             report["pushed"] = True
