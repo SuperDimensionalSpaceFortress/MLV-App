@@ -2051,12 +2051,12 @@ void RenderFrameThread::decodeFrameForWorker( const DecodeQueueEntry &entry )
     /* CPU-DEBAYERED16-REUSE-PHASE3-RECON-1 r2: record the decode status and the
      * llrawproc settings for the debayered-16 reuse policy. Every other consumer
      * of this slot still ignores the status, as before. */
-    slot.reconAcquisitionSucceeded = false;
-    slot.reconSettingsAtDecode =
+    slot.reconProvenance.acquisitionSucceeded = false;
+    slot.reconProvenance.settingsAtDecode =
         m_pMlvObject ? getMlvLlrawprocSettingsFingerprint( m_pMlvObject ) : 0;
     if( rawPixelCount > 0 && m_pMlvObject )
     {
-        slot.reconAcquisitionSucceeded =
+        slot.reconProvenance.acquisitionSucceeded =
             getMlvRawFrameUint16( m_pMlvObject,
                                   entry.request.frameNumber,
                                   slot.rawImage16.data() ) == 0;
@@ -2657,19 +2657,17 @@ void RenderFrameThread::reconFrameForWorker( const ReconQueueEntry &entry,
 
 void RenderFrameThread::signalReconDoneFromWorker( int slotIndex )
 {
-    /* CPU-DEBAYERED16-REUSE-PHASE3-RECON-1 r2: on the recon worker thread, right
-     * after reconFrameForWorker: the llrawproc settings now, and whether this
-     * thread's last llrawproc run used the CUDA playback recon. */
-    const uint64_t reconSettingsAtReconDone =
-        m_pMlvObject ? getMlvLlrawprocSettingsFingerprint( m_pMlvObject ) : 0;
-    const bool reconUsedGpuPlaybackRecon = llrpGpuPlaybackReconLastUsedForTesting() != 0;
+    /* CPU-DEBAYERED16-REUSE-PHASE3-RECON-1 r2/r3: on the recon worker thread,
+     * right after reconFrameForWorker: the HQ dual-ISO state and llrawproc
+     * settings now, and whether this thread's last llrawproc run used the CUDA
+     * playback recon (debayered16ReconDoneStamp, shared with the tests). */
+    const Debayered16ReconDoneStamp reconDone = debayered16ReconDoneStamp( m_pMlvObject );
     QMutexLocker locker( &m_mutex );
     m_overlapMeter.upstreamEnd( mlv_stage_timing_now() * 1000.0,
                                 playback_overlap::UpstreamStage::Recon );
     if( !m_stop && slotIndex >= 0 )
     {
-        m_frameSlots[slotIndex].reconSettingsAtReconDone = reconSettingsAtReconDone;
-        m_frameSlots[slotIndex].reconUsedGpuPlaybackRecon = reconUsedGpuPlaybackRecon;
+        m_frameSlots[slotIndex].reconProvenance.done = reconDone;
         if( playbackSmokeTimelineTelemetryEnabled() )
         {
             m_frameSlots[slotIndex].stageTimingTelemetry.insert(
@@ -3693,10 +3691,7 @@ void RenderFrameThread::drawFrame( int slotIndex,
      * reconstructed, read before resetMetadata clears it. */
     const uint32_t reconQueuedFrameNumber = slot.queuedRequest.frameNumber;
     const uint64_t reconQueuedRequestSerial = slot.queuedRequest.requestSerial;
-    const bool reconAcquisitionSucceeded = slot.reconAcquisitionSucceeded;
-    const uint64_t reconSettingsAtDecode = slot.reconSettingsAtDecode;
-    const uint64_t reconSettingsAtReconDone = slot.reconSettingsAtReconDone;
-    const bool reconUsedGpuPlaybackRecon = slot.reconUsedGpuPlaybackRecon;
+    const Debayered16ReconProvenance reconProvenance = slot.reconProvenance;
     slot.resetMetadata();
     const double prologueAfterResetMetadataStageTime =
         detailedTimelineTelemetry ? mlv_stage_timing_now() : 0.0;
@@ -4877,20 +4872,17 @@ void RenderFrameThread::drawFrame( int slotIndex,
             Debayered16ReconReuseInputs reuse;
             reuse.consumeReconnedRaw =
                 decodedRawFrame != nullptr && decodedRawFrameAlreadyReconned;
-            reuse.reconAcquisitionSucceeded = reconAcquisitionSucceeded;
+            applyDebayered16ReconProvenance( reconProvenance, reuse );
             reuse.playbackActive = m_activePresentationContext.playbackActive;
             reuse.useGpuAmazeDebayer = useGpuAmazeDebayer;
             reuse.useGpuBilinearDebayer = useGpuBilinearDebayer;
             reuse.gpuPlaybackReconTexturePresentRequested =
                 m_activePresentationContext.gpuPlaybackReconTexturePresentRequested;
-            reuse.reconUsedGpuPlaybackRecon = reconUsedGpuPlaybackRecon;
             reuse.reducedReconScale = slot.reducedReconScale;
             reuse.reconFrameNumber = reconQueuedFrameNumber;
             reuse.renderFrameNumber = frameNumber;
             reuse.reconRequestSerial = reconQueuedRequestSerial;
             reuse.renderRequestSerial = slot.requestSerial;
-            reuse.reconSettingsAtDecode = reconSettingsAtDecode;
-            reuse.reconSettingsAtReconDone = reconSettingsAtReconDone;
             reuse.reconBufferComplete =
                 m_pMlvObject
                 && reconPixelCount > 0

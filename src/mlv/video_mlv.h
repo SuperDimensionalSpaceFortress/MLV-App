@@ -228,11 +228,14 @@ int getMlvProcessedFrame8ScaledFromReconnedRaw16(mlvObject_t * video,
  * and no llrawproc, and never reads or writes the single-frame or AMaZE frame
  * caches (export, the WB picker and Look Assist's WB solve read those). Returns
  * 1 on success, 0 (nothing written) when the arguments are invalid or a frame
- * cache could serve this frame (mlvRawDebayerCacheMayServeFrame). */
+ * cache could serve this frame (mlvRawDebayerCacheMayServeFrame).
+ * reconHqDualIso is llrpHQDualIso as the recon worker ran (r3): it selects the
+ * bit shift, and is never re-read from the live object here. */
 int getMlvRawFrameDebayeredFromReconnedRaw16(mlvObject_t * video,
                                              uint64_t frameIndex,
                                              float * reconnedRawScratch,
-                                             uint16_t * outputFrame);
+                                             uint16_t * outputFrame,
+                                             int reconHqDualIso);
 /* Nonzero when getMlvRawFrameDebayered could serve frameIndex from the AMaZE
  * frame cache: the cache is running, or this frame is already cached. */
 int mlvRawDebayerCacheMayServeFrame(mlvObject_t * video, uint64_t frameIndex);
@@ -240,8 +243,10 @@ int mlvRawDebayerCacheMayServeFrame(mlvObject_t * video, uint64_t frameIndex);
  * selects what llrawproc makes of a frame and the bit shift the debayer applies
  * to its output: the raw levels and bit depth, the llrawproc settings the
  * processed-frame cache keys on (fix_raw, dual-ISO mode and validity, chroma
- * smooth, ...), and the dark frame and pixel maps by version. The values
- * dual-ISO recon publishes per frame are excluded, as in that cache key. Equal
+ * smooth, ...), the dual-ISO pattern, EV correction and black delta (r3; recon
+ * inputs that recon also publishes, so a clip's first recon may move them), and
+ * the dark frame and pixel maps by version. The dng_* levels recon publishes are
+ * excluded. Equal
  * fingerprints before and after a recon and at its consumption mean the recon
  * was made under the settings the render would run llrawproc with. */
 uint64_t getMlvLlrawprocSettingsFingerprint(mlvObject_t * video);

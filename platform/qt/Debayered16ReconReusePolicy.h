@@ -147,9 +147,52 @@ struct Debayered16ReconReuseInputs
     uint64_t reconSettingsAtDecode = 0;
     uint64_t reconSettingsAtReconDone = 0;
     uint64_t renderSettings = 0;
+    /*! llrpHQDualIso as the recon ran (r3): the bit shift the reconned debayer applies. */
+    bool reconHqDualIso = false;
     /*! rawImage16 holds at least Width * Height words. */
     bool reconBufferComplete = false;
 };
+
+/*! What the recon worker records when a recon finishes, on the recon thread. */
+struct Debayered16ReconDoneStamp
+{
+    uint64_t settings = 0;
+    bool usedGpuPlaybackRecon = false;
+    bool hqDualIso = false;
+};
+
+/*! How a slot's recon was made. The decode stage sets the first two fields, the
+ *  recon-done signal the stamp; a slot nobody stamped is refused (fail closed). */
+struct Debayered16ReconProvenance
+{
+    bool acquisitionSucceeded = false;
+    uint64_t settingsAtDecode = 0;
+    Debayered16ReconDoneStamp done;
+};
+
+/*! The recon-done stamp, read on the recon worker thread right after the recon
+ *  (RenderFrameThread::signalReconDoneFromWorker). r3 (sol r2 B1): the HQ flag is
+ *  read here, BEFORE the settings fingerprint, so a fingerprint equal to the
+ *  decode stamp also covers it: the render applies this flag, never the live one. */
+inline Debayered16ReconDoneStamp debayered16ReconDoneStamp( mlvObject_t * video )
+{
+    Debayered16ReconDoneStamp stamp;
+    stamp.hqDualIso = video && llrpHQDualIso( video ) != 0;
+    stamp.settings = video ? getMlvLlrawprocSettingsFingerprint( video ) : 0;
+    stamp.usedGpuPlaybackRecon = llrpGpuPlaybackReconLastUsedForTesting() != 0;
+    return stamp;
+}
+
+/*! The render's copy of a slot's provenance into the policy inputs. */
+inline void applyDebayered16ReconProvenance( const Debayered16ReconProvenance & provenance,
+                                             Debayered16ReconReuseInputs & in )
+{
+    in.reconAcquisitionSucceeded = provenance.acquisitionSucceeded;
+    in.reconSettingsAtDecode = provenance.settingsAtDecode;
+    in.reconSettingsAtReconDone = provenance.done.settings;
+    in.reconUsedGpuPlaybackRecon = provenance.done.usedGpuPlaybackRecon;
+    in.reconHqDualIso = provenance.done.hqDualIso;
+}
 
 class Debayered16ReconReusePolicy
 {
@@ -220,19 +263,27 @@ struct Debayered16ReconReuseCounters
     }
 };
 
+/*! Test seam: runs after the policy admitted the recon and before the reconned
+ *  debayer, the window sol r2 B1 names. Production passes none. */
+typedef void (*Debayered16AfterAdmissionHook)( mlvObject_t * video, void * context );
+
 /*! The render's OutputDebayered16 CPU branch for one frame. On entry the first
  *  pixelCount words of slotRawImage16 hold the slot's recon (when there is one);
  *  on return it holds the debayered frame (pixelCount * 3 words), from the recon
  *  when the policy admits it, else from today's getMlvRawFrameDebayered. The
  *  caller fills every input except frameCacheMayServe and renderSettings, which
- *  are read here from the live object at the moment of the decision. */
+ *  are read here from the live object at the moment of the decision. After the
+ *  decision nothing here re-reads a setting the fingerprint covers: the bit shift
+ *  comes from the slot's reconHqDualIso (r3). */
 inline Debayered16ReconRefusal renderDebayered16FromSlot( mlvObject_t * video,
                                                           uint32_t frameNumber,
                                                           Debayered16ReconReuseInputs reuse,
                                                           uint16_t * slotRawImage16,
                                                           size_t pixelCount,
                                                           std::vector<float> & scratch,
-                                                          Debayered16ReconReuseCounters * counters )
+                                                          Debayered16ReconReuseCounters * counters,
+                                                          Debayered16AfterAdmissionHook afterAdmissionForTesting = nullptr,
+                                                          void * afterAdmissionContext = nullptr )
 {
     reuse.frameCacheMayServe =
         !video || mlvRawDebayerCacheMayServeFrame( video, frameNumber ) != 0;
@@ -251,9 +302,11 @@ inline Debayered16ReconRefusal renderDebayered16FromSlot( mlvObject_t * video,
     }
     if( outcome == Debayered16ReconRefusal::None )
     {
+        if( afterAdmissionForTesting ) afterAdmissionForTesting( video, afterAdmissionContext );
         /* The debayer writes pixelCount * 3 words over slotRawImage16. */
         std::copy_n( slotRawImage16, pixelCount, reinterpret_cast<uint16_t *>( scratch.data() ) );
-        if( !getMlvRawFrameDebayeredFromReconnedRaw16( video, frameNumber, scratch.data(), slotRawImage16 ) )
+        if( !getMlvRawFrameDebayeredFromReconnedRaw16( video, frameNumber, scratch.data(), slotRawImage16,
+                                                       reuse.reconHqDualIso ? 1 : 0 ) )
         {
             outcome = Debayered16ReconRefusal::DebayerDeclined;
         }

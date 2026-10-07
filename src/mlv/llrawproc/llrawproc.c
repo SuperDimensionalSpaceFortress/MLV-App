@@ -514,6 +514,15 @@ int llrpGpuPlaybackReconLastUsedForTesting(void)
     return g_llrawproc_gpu_playback_last_used;
 }
 
+/* CPU-DEBAYERED16-REUSE-PHASE3-RECON-1 r3: stands in for a CUDA playback recon
+ * on this thread, so the recon-provenance handoff can be tested on a host with
+ * no CUDA device. */
+void llrpSetGpuPlaybackReconLastUsedForTesting(int used);
+void llrpSetGpuPlaybackReconLastUsedForTesting(int used)
+{
+    g_llrawproc_gpu_playback_last_used = used ? 1 : 0;
+}
+
 int llrpGpuPlaybackReconLastStateValidForTesting(void);
 int llrpGpuPlaybackReconLastStateValidForTesting(void)
 {

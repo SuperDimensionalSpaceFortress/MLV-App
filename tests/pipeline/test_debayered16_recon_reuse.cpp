@@ -27,7 +27,11 @@
 //      consumption is refused and counted; the frame equals today's path, and
 //      consuming the stale recon would not have;
 //  (g) r2: a failed worker decode (truncated LJ92 payload) is refused and counted; the
-//      frame is today's zero-filled failure output, and consuming would not have been.
+//      frame is today's zero-filled failure output, and consuming would not have been;
+//  (h) r3: Raw Fix off after the policy admitted the recon and before its debayer: the
+//      bit shift is the recon-time HQ state, so the frame is still byte-exact;
+//  (i) r3: what the decode and recon-done stamps catch, and the A -> B -> A limit;
+//  (j) r3: the CUDA-recon provenance handoff from the recon-done stamp to the policy.
 #include "../common/minitest.h"
 #include "../common/repo_paths.h"
 #include "mlv_pipeline_fixture.h"
@@ -35,6 +39,7 @@
 #include "../../src/mlv/llrawproc/llrawproc.h"
 
 #include <algorithm>
+#include <array>
 #include <cstddef>
 #include <cstdio>
 #include <cstdlib>
@@ -114,11 +119,24 @@ struct Slot
 {
     std::vector<uint16_t> rawImage16;  // W*H*3, like FrameSlot::rawImage16
     std::vector<float> scratch;        // RenderFrameThread::m_debayered16ReconScratch
-    bool reconAcquisitionSucceeded = false;
-    uint64_t reconSettingsAtDecode = 0;
-    uint64_t reconSettingsAtReconDone = 0;
-    bool reconUsedGpuPlaybackRecon = false;
+    Debayered16ReconProvenance provenance;  // FrameSlot::reconProvenance
 };
+
+using SettingsChange = std::function<void(mlvObject_t *)>;
+
+// Where a test changes settings around one frame's recon and render (r3 temporal tests).
+struct FrameHooks
+{
+    SettingsChange beforeRecon;     // after the decode stamp and the decode, before llrawproc
+    SettingsChange afterRecon;      // after llrawproc, before the recon-done stamp
+    SettingsChange afterAdmission;  // inside the production dispatch: admitted, not yet debayered
+};
+
+void runAfterAdmission(mlvObject_t * video, void * context)
+{
+    const SettingsChange * change = static_cast<const SettingsChange *>(context);
+    if (change && *change) (*change)(video);
+}
 
 struct StepResult
 {
@@ -135,41 +153,44 @@ struct StepResult
 // decodeFrameForWorker (settings stamp; the decode, its status recorded into the slot,
 // which keeps whatever it held before when the decode fails), reconFrameForWorker's
 // full-res llrawproc on the persistent worker state (flags 0), then
-// signalReconDoneFromWorker's stamps.
-void reconWorkerStep(MlvPipelineFixture & fixture, uint64_t frame, llrawprocWorkerState_t * worker, Slot & slot)
+// signalReconDoneFromWorker's stamp (the production debayered16ReconDoneStamp).
+void reconWorkerStep(MlvPipelineFixture & fixture, uint64_t frame, llrawprocWorkerState_t * worker, Slot & slot,
+                     const FrameHooks & hooks = FrameHooks())
 {
     const size_t n = pixels(fixture);
     if (slot.rawImage16.size() < n * 3u) slot.rawImage16.resize(n * 3u);
-    slot.reconSettingsAtDecode = getMlvLlrawprocSettingsFingerprint(fixture.video());
-    slot.reconAcquisitionSucceeded = getMlvRawFrameUint16(fixture.video(), frame, slot.rawImage16.data()) == 0;
+    slot.provenance.settingsAtDecode = getMlvLlrawprocSettingsFingerprint(fixture.video());
+    slot.provenance.acquisitionSucceeded =
+        getMlvRawFrameUint16(fixture.video(), frame, slot.rawImage16.data()) == 0;
+    if (hooks.beforeRecon) hooks.beforeRecon(fixture.video());
     applyLLRawProcObjectWorker(fixture.video(), slot.rawImage16.data(), n * sizeof(uint16_t), worker, 0);
-    slot.reconSettingsAtReconDone = getMlvLlrawprocSettingsFingerprint(fixture.video());
-    slot.reconUsedGpuPlaybackRecon = llrpGpuPlaybackReconLastUsedForTesting() != 0;
+    if (hooks.afterRecon) hooks.afterRecon(fixture.video());
+    slot.provenance.done = debayered16ReconDoneStamp(fixture.video());
 }
 
-// The render's OutputDebayered16 branch for one frame: the production dispatch.
+// The render's OutputDebayered16 branch for one frame: the production handoff
+// (applyDebayered16ReconProvenance) and dispatch.
 StepResult renderStep(MlvPipelineFixture & fixture, uint64_t frame, Slot & slot, bool playing,
-                      Debayered16ReconReuseCounters * counters)
+                      Debayered16ReconReuseCounters * counters, const SettingsChange & afterAdmission = nullptr)
 {
     const size_t n = pixels(fixture);
     Debayered16ReconReuseInputs reuse;
     reuse.consumeReconnedRaw = true;
-    reuse.reconAcquisitionSucceeded = slot.reconAcquisitionSucceeded;
+    applyDebayered16ReconProvenance(slot.provenance, reuse);
     reuse.playbackActive = playing;
-    reuse.reconUsedGpuPlaybackRecon = slot.reconUsedGpuPlaybackRecon;
     reuse.reducedReconScale = 1;
     reuse.reconFrameNumber = static_cast<uint32_t>(frame);
     reuse.renderFrameNumber = static_cast<uint32_t>(frame);
     reuse.reconRequestSerial = 7;
     reuse.renderRequestSerial = 7;
-    reuse.reconSettingsAtDecode = slot.reconSettingsAtDecode;
-    reuse.reconSettingsAtReconDone = slot.reconSettingsAtReconDone;
     reuse.reconBufferComplete = slot.rawImage16.size() >= n * 3u;
 
     StepResult result;
     llrpResetDebugRunCount();
     result.outcome = renderDebayered16FromSlot(fixture.video(), static_cast<uint32_t>(frame), reuse,
-                                               slot.rawImage16.data(), n, slot.scratch, counters);
+                                               slot.rawImage16.data(), n, slot.scratch, counters,
+                                               afterAdmission ? &runAfterAdmission : nullptr,
+                                               const_cast<SettingsChange *>(&afterAdmission));
     result.reused = result.outcome == Debayered16ReconRefusal::None;
     result.refusal = debayered16ReconRefusalReason(result.outcome);
     result.renderLlrawprocRuns = llrpGetDebugRunCount();
@@ -229,6 +250,39 @@ void assertRealPicture(const uint16_t * rgb, size_t words, const char * label)
     ASSERT_TRUE(distinct.size() >= 256);
 }
 
+// r3 (fable r2 H4): the first frame's refusal cause, asserted. The recon loaded the
+// focus pixel map status (0 -> nonzero, version bumped once) and may have published
+// the clip's first dual-ISO pattern / EV / black delta; putting exactly those fields
+// back gives the decode stamp again, so nothing else changed during that recon.
+void assertFirstFrameRefusalIsTheFirstRunLoad(mlvObject_t * video, const llrawprocObject_t & before,
+                                              const Debayered16ReconProvenance & provenance, const char * label)
+{
+    llrawprocObject_t * live = video->llrawproc;
+    const llrawprocObject_t now = *live;
+    std::printf("[debayered16-recon-reuse] %s frame 0 cause: fpm_status %d->%d fpm_ver %u->%u "
+                "diso_pattern %d->%d diso_ev %.6f->%.6f diso_black_delta %d->%d\n",
+                label, before.fpm_status, now.fpm_status, before.focus_pixel_map_version,
+                now.focus_pixel_map_version, before.diso_pattern, now.diso_pattern, before.diso_ev_correction,
+                now.diso_ev_correction, before.diso_black_delta, now.diso_black_delta);
+    ASSERT_EQ(0, before.fpm_status);
+    ASSERT_TRUE(now.fpm_status != 0);
+    ASSERT_EQ(before.focus_pixel_map_version + 1u, now.focus_pixel_map_version);
+    ASSERT_TRUE(provenance.settingsAtDecode != provenance.done.settings);
+    ASSERT_EQ(provenance.done.settings, getMlvLlrawprocSettingsFingerprint(video));
+    live->fpm_status = before.fpm_status;
+    live->focus_pixel_map_version = before.focus_pixel_map_version;
+    live->diso_pattern = before.diso_pattern;
+    live->diso_ev_correction = before.diso_ev_correction;
+    live->diso_black_delta = before.diso_black_delta;
+    const uint64_t reverted = getMlvLlrawprocSettingsFingerprint(video);
+    live->fpm_status = now.fpm_status;
+    live->focus_pixel_map_version = now.focus_pixel_map_version;
+    live->diso_pattern = now.diso_pattern;
+    live->diso_ev_correction = now.diso_ev_correction;
+    live->diso_black_delta = now.diso_black_delta;
+    ASSERT_EQ(provenance.settingsAtDecode, reverted);
+}
+
 struct ExactnessLeg
 {
     const char * label;
@@ -286,9 +340,14 @@ void runExactnessSequence(const ExactnessLeg & leg)
         // that reason; the app's paused render at clip open does that load before
         // playback. Every later frame is consumed.
         if (f == 0 && !step.reused)
+        {
             ASSERT_TRUE(step.outcome == Debayered16ReconRefusal::SettingsChangedDuringRecon);
+            assertFirstFrameRefusalIsTheFirstRunLoad(reused.video(), before, slot.provenance, leg.label);
+        }
         else
+        {
             ASSERT_TRUE(step.reused);
+        }
         ASSERT_EQ(static_cast<size_t>(0), mismatched);
         ASSERT_EQ(0, std::memcmp(expected.data(), slot.rawImage16.data(), words * sizeof(uint16_t)));
         if (f == 0 || f + 1 == frames) assertRealPicture(expected.data(), words, leg.label);
@@ -298,22 +357,38 @@ void runExactnessSequence(const ExactnessLeg & leg)
     ASSERT_EQ(counters.count(Debayered16ReconRefusal::SettingsChangedDuringRecon), counters.ownRecon());
 }
 
-// Plays frames 0..k-1, then lets the worker reconstruct frame k, applies `change`
-// before the render consumes it, and renders frame k.
+// The slot's recon debayered as the consumer would: with an explicit HQ flag.
+std::vector<uint16_t> debayerRecon(MlvPipelineFixture & fixture, uint64_t frame, const Slot & slot, bool hqDualIso)
+{
+    const size_t n = pixels(fixture);
+    std::vector<float> scratch(n);
+    std::copy_n(slot.rawImage16.data(), n, reinterpret_cast<uint16_t *>(scratch.data()));
+    std::vector<uint16_t> out(n * 3u, 0u);
+    (void)getMlvRawFrameDebayeredFromReconnedRaw16(fixture.video(), frame, scratch.data(), out.data(), hqDualIso ? 1 : 0);
+    return out;
+}
+
+// Plays frames 0..k-1, then lets the worker reconstruct frame k with `hooks` around
+// the recon, applies `beforeRender` after the recon-done stamp, and renders frame k
+// through the production dispatch (with hooks.afterAdmission inside it).
 struct TransitionRun
 {
     bool opened = false;
     std::vector<uint16_t> frameK;
-    std::vector<uint16_t> staleReuseK;  // the stale recon, debayered: what consuming it would show
+    std::vector<uint16_t> staleReuseK;     // the recon debayered with its stamped HQ flag: what consuming it shows
+    std::vector<uint16_t> liveFlagReuseK;  // r3: the recon debayered with the live HQ flag after admission
+    bool liveHqAfterAdmission = false;
+    Debayered16ReconProvenance provenanceK;
     StepResult stepK;
     uint64_t consumedBeforeK = 0;
     uint64_t ownReconBeforeK = 0;
     uint64_t consumed = 0;
     uint64_t ownRecon = 0;
-    uint64_t refusedSince = 0;
+    uint64_t outcomeKCount = 0;  // attempts counted under stepK's outcome at frame k (the delta)
 };
 
-TransitionRun runSettingsTransition(bool killSwitch, uint64_t k, const std::function<void(mlvObject_t *)> & change)
+TransitionRun runSettingsTransition(bool killSwitch, uint64_t k, const SettingsChange & beforeRender,
+                                    const FrameHooks & hooks = FrameHooks())
 {
     setKillSwitch(killSwitch);
     TransitionRun run;
@@ -325,29 +400,42 @@ TransitionRun runSettingsTransition(bool killSwitch, uint64_t k, const std::func
     Slot slot;
     Debayered16ReconReuseCounters counters;
     for (uint64_t f = 0; f < k; ++f) (void)playbackRenderStep(fixture, f, &worker.state, slot, true, &counters);
-    reconWorkerStep(fixture, k, &worker.state, slot);
-    change(fixture.video());
-    std::vector<float> staleScratch(n);
-    std::copy_n(slot.rawImage16.data(), n, reinterpret_cast<uint16_t *>(staleScratch.data()));
-    run.staleReuseK.assign(n * 3u, 0u);
-    (void)getMlvRawFrameDebayeredFromReconnedRaw16(fixture.video(), k, staleScratch.data(), run.staleReuseK.data());
+    reconWorkerStep(fixture, k, &worker.state, slot, hooks);
+    if (beforeRender) beforeRender(fixture.video());
+    run.provenanceK = slot.provenance;
+    run.staleReuseK = debayerRecon(fixture, k, slot, slot.provenance.done.hqDualIso);
+    SettingsChange afterAdmission;
+    if (hooks.afterAdmission)
+    {
+        afterAdmission = [&](mlvObject_t * video) {
+            hooks.afterAdmission(video);
+            run.liveHqAfterAdmission = llrpHQDualIso(video) != 0;
+            run.liveFlagReuseK = debayerRecon(fixture, k, slot, run.liveHqAfterAdmission);
+        };
+    }
     run.consumedBeforeK = counters.consumed();
     run.ownReconBeforeK = counters.ownRecon();
-    run.stepK = renderStep(fixture, k, slot, true, &counters);
+    std::array<uint64_t, static_cast<size_t>(Debayered16ReconRefusal::Count)> before{};
+    for (size_t i = 0; i < before.size(); ++i) before[i] = counters.byOutcome[i].load();
+    run.stepK = renderStep(fixture, k, slot, true, &counters, afterAdmission);
     run.frameK.assign(slot.rawImage16.begin(), slot.rawImage16.begin() + static_cast<std::ptrdiff_t>(n * 3u));
     run.consumed = counters.consumed();
     run.ownRecon = counters.ownRecon();
-    run.refusedSince = counters.count(Debayered16ReconRefusal::SettingsChangedSinceRecon);
+    run.outcomeKCount = counters.count(run.stepK.outcome) - before[static_cast<size_t>(run.stepK.outcome)];
     setKillSwitch(false);
     return run;
 }
 
-void runTransitionCase(const char * label, const std::function<void(mlvObject_t *)> & change)
+// Frame k is refused for `expected`, counted, equals the old path (kill switch, same
+// changes) byte-for-byte, and (when staleDiffers) consuming the recon would not have.
+void runTransitionCase(const char * label, const SettingsChange & beforeRender, const FrameHooks & hooks = FrameHooks(),
+                       Debayered16ReconRefusal expected = Debayered16ReconRefusal::SettingsChangedSinceRecon,
+                       bool staleDiffers = true)
 {
     KillSwitchGuard guard;
     const uint64_t k = 3;
-    const TransitionRun oldPath = runSettingsTransition(true, k, change);
-    const TransitionRun reuse = runSettingsTransition(false, k, change);
+    const TransitionRun oldPath = runSettingsTransition(true, k, beforeRender, hooks);
+    const TransitionRun reuse = runSettingsTransition(false, k, beforeRender, hooks);
     ASSERT_TRUE(oldPath.opened);
     ASSERT_TRUE(reuse.opened);
     const size_t words = oldPath.frameK.size();
@@ -356,23 +444,61 @@ void runTransitionCase(const char * label, const std::function<void(mlvObject_t 
     const size_t mismatched = mismatchedWords(oldPath.frameK, reuse.frameK, words);
     const size_t staleMismatched = mismatchedWords(oldPath.frameK, reuse.staleReuseK, words);
     std::printf("[debayered16-recon-reuse] %s: outcome=%s consumed=%llu own_recon=%llu "
-                "refused_settings_changed_since_recon=%llu mismatched_vs_old_path=%zu stale_reuse_mismatched=%zu of %zu\n",
+                "refused_%s=%llu mismatched_vs_old_path=%zu stale_reuse_mismatched=%zu of %zu\n",
                 label, debayered16ReconRefusalName(reuse.stepK.outcome),
                 static_cast<unsigned long long>(reuse.consumed), static_cast<unsigned long long>(reuse.ownRecon),
-                static_cast<unsigned long long>(reuse.refusedSince), mismatched, staleMismatched, words);
+                debayered16ReconRefusalName(expected), static_cast<unsigned long long>(reuse.outcomeKCount),
+                mismatched, staleMismatched, words);
     // Refused, counted as a fallback, and the frame is today's path byte-for-byte.
-    ASSERT_TRUE(reuse.stepK.outcome == Debayered16ReconRefusal::SettingsChangedSinceRecon);
+    ASSERT_TRUE(reuse.stepK.outcome == expected);
     ASSERT_FALSE(reuse.stepK.reused);
     ASSERT_TRUE(reuse.consumedBeforeK >= k - 1);  // steady play before the change (see runExactnessSequence)
     ASSERT_EQ(reuse.consumedBeforeK, reuse.consumed);
     ASSERT_EQ(reuse.ownReconBeforeK + 1, reuse.ownRecon);
-    ASSERT_EQ(static_cast<uint64_t>(1), reuse.refusedSince);
+    ASSERT_EQ(static_cast<uint64_t>(1), reuse.outcomeKCount);
     ASSERT_TRUE(oldPath.stepK.outcome == Debayered16ReconRefusal::KillSwitch);
     ASSERT_EQ(static_cast<size_t>(0), mismatched);
     ASSERT_EQ(0, std::memcmp(oldPath.frameK.data(), reuse.frameK.data(), words * sizeof(uint16_t)));
     assertRealPicture(reuse.frameK.data(), words, label);
     // Sensitivity: consuming the stale recon would have shown a different frame.
-    ASSERT_TRUE(staleMismatched > words / 100);
+    if (staleDiffers) ASSERT_TRUE(staleMismatched > words / 100);
+}
+
+// Frame k is consumed (counted as consumed, no second recon) and compared with the old
+// path run under the settings the recon ran under (kill switch, no change at all).
+struct ConsumedCase
+{
+    TransitionRun oldPath;
+    TransitionRun reuse;
+    size_t words = 0;
+    size_t mismatched = 0;
+};
+
+ConsumedCase runConsumedCase(const char * label, const FrameHooks & hooks)
+{
+    KillSwitchGuard guard;
+    const uint64_t k = 3;
+    ConsumedCase c;
+    c.oldPath = runSettingsTransition(true, k, nullptr);
+    c.reuse = runSettingsTransition(false, k, nullptr, hooks);
+    ASSERT_TRUE(c.oldPath.opened);
+    ASSERT_TRUE(c.reuse.opened);
+    c.words = c.oldPath.frameK.size();
+    ASSERT_TRUE(c.words > 0);
+    ASSERT_EQ(c.words, c.reuse.frameK.size());
+    c.mismatched = mismatchedWords(c.oldPath.frameK, c.reuse.frameK, c.words);
+    std::printf("[debayered16-recon-reuse] %s: outcome=%s consumed=%llu own_recon=%llu stamped_hq=%d "
+                "mismatched_vs_old_path_at_recon_settings=%zu of %zu\n",
+                label, debayered16ReconRefusalName(c.reuse.stepK.outcome),
+                static_cast<unsigned long long>(c.reuse.consumed), static_cast<unsigned long long>(c.reuse.ownRecon),
+                c.reuse.provenanceK.done.hqDualIso ? 1 : 0, c.mismatched, c.words);
+    ASSERT_TRUE(c.oldPath.stepK.outcome == Debayered16ReconRefusal::KillSwitch);
+    ASSERT_TRUE(c.reuse.stepK.outcome == Debayered16ReconRefusal::None);
+    ASSERT_TRUE(c.reuse.stepK.reused);
+    ASSERT_EQ(static_cast<uint64_t>(0), c.reuse.stepK.renderLlrawprocRuns);
+    ASSERT_EQ(c.reuse.consumedBeforeK + 1, c.reuse.consumed);
+    ASSERT_EQ(c.reuse.ownReconBeforeK, c.reuse.ownRecon);
+    return c;
 }
 
 } // namespace
@@ -503,7 +629,7 @@ TEST(Debayered16ReconReuse, FrameCacheThatMayServeMakesEntryDecline)
 
     std::vector<float> scratch(n, 0.0f);
     std::vector<uint16_t> out(n * 3u, 0xABCDu);
-    ASSERT_EQ(0, getMlvRawFrameDebayeredFromReconnedRaw16(fixture.video(), 1, scratch.data(), out.data()));
+    ASSERT_EQ(0, getMlvRawFrameDebayeredFromReconnedRaw16(fixture.video(), 1, scratch.data(), out.data(), 1));
     ASSERT_TRUE(std::all_of(out.begin(), out.end(), [](uint16_t v) { return v == 0xABCDu; }));
 
     mlvCacheSetStop(fixture.video(), 1);
@@ -561,8 +687,9 @@ TEST(Debayered16ReconReuse, PolicyAdmitsOnlyFullResPlaybackRecon)
     ASSERT_TRUE(why(ok) == Debayered16ReconRefusal::None);
 }
 
-// (e) The settings fingerprint moves with every setting the r2 blockers name, and with
-// nothing dual-ISO recon publishes per frame.
+// (e) The settings fingerprint moves with every setting the r2 blockers name and (r3,
+// fable r2 H1) with the dual-ISO pattern, EV correction and black delta, which are recon
+// inputs, but not with the DNG levels recon publishes.
 TEST(Debayered16ReconReuse, SettingsFingerprintTracksRawFixDualIsoAndChromaSmooth)
 {
     MlvPipelineFixture fixture;
@@ -587,11 +714,25 @@ TEST(Debayered16ReconReuse, SettingsFingerprintTracksRawFixDualIsoAndChromaSmoot
     llrpSetChromaSmoothMode(video, chroma);
     ASSERT_EQ(base, getMlvLlrawprocSettingsFingerprint(video));
 
-    // Values dual-ISO recon publishes every frame do not move it.
-    video->llrawproc->diso_pattern = -4;
-    video->llrawproc->diso_ev_correction = 0.5;
-    video->llrawproc->diso_black_delta = 7;
-    video->llrawproc->dng_white_level = 12345;
+    // Manual dual-ISO exposure matching and pattern (what the GUI handlers write).
+    llrawprocObject_t * llrawproc = video->llrawproc;
+    const int pattern = llrawproc->diso_pattern;
+    const double ev = llrawproc->diso_ev_correction;
+    const int blackDelta = llrawproc->diso_black_delta;
+    llrawproc->diso_pattern = pattern == -4 ? 3 : -4;
+    ASSERT_TRUE(getMlvLlrawprocSettingsFingerprint(video) != base);
+    llrawproc->diso_pattern = pattern;
+    llrawproc->diso_ev_correction = ev == -2.5 ? -3.0 : -2.5;
+    ASSERT_TRUE(getMlvLlrawprocSettingsFingerprint(video) != base);
+    llrawproc->diso_ev_correction = ev;
+    llrawproc->diso_black_delta = blackDelta == 7 ? 8 : 7;
+    ASSERT_TRUE(getMlvLlrawprocSettingsFingerprint(video) != base);
+    llrawproc->diso_black_delta = blackDelta;
+    ASSERT_EQ(base, getMlvLlrawprocSettingsFingerprint(video));
+
+    // The DNG levels recon publishes do not move it.
+    llrawproc->dng_white_level = 12345;
+    llrawproc->dng_black_level = 321;
     ASSERT_EQ(base, getMlvLlrawprocSettingsFingerprint(video));
 }
 
@@ -650,12 +791,8 @@ TEST(Debayered16ReconReuse, FailedWorkerDecodeIsRefusedAndZeroFilledLikeOldPath)
         Debayered16ReconReuseCounters counters;
         for (uint64_t f = 0; f < damaged; ++f) (void)playbackRenderStep(fixture, f, &worker.state, slot, true, &counters);
         reconWorkerStep(fixture, damaged, &worker.state, slot);
-        run.acquisitionSucceeded = slot.reconAcquisitionSucceeded;
-        std::vector<float> scratch(n);
-        std::copy_n(slot.rawImage16.data(), n, reinterpret_cast<uint16_t *>(scratch.data()));
-        run.retainedReuse.assign(n * 3u, 0u);
-        (void)getMlvRawFrameDebayeredFromReconnedRaw16(fixture.video(), damaged, scratch.data(),
-                                                       run.retainedReuse.data());
+        run.acquisitionSucceeded = slot.provenance.acquisitionSucceeded;
+        run.retainedReuse = debayerRecon(fixture, damaged, slot, slot.provenance.done.hqDualIso);
         run.consumedBefore = counters.consumed();
         run.ownReconBefore = counters.ownRecon();
         run.step = renderStep(fixture, damaged, slot, true, &counters);
@@ -693,4 +830,91 @@ TEST(Debayered16ReconReuse, FailedWorkerDecodeIsRefusedAndZeroFilledLikeOldPath)
     ASSERT_EQ(0, std::memcmp(oldPath.frame.data(), reuse.frame.data(), words * sizeof(uint16_t)));
     // Sensitivity: the retained bytes debayer to a real, nonzero frame.
     ASSERT_TRUE(retainedNonzero > words / 2);
+}
+
+// (h) r3 (sol r2 B1): Raw Fix unchecked AFTER the policy admitted the recon and before
+// the reconned debayer (the handler sets fix_raw before its idle wait). The bit shift
+// comes from the HQ state the recon ran under (the recon-done stamp), never the live
+// object, so the frame is the old path run under the recon's settings byte-for-byte and
+// is counted as consumed. Mutation M6 (the consumer reads the live HQ flag again) shifts
+// the HQ recon by 16 - bpp bits and fails here.
+TEST(Debayered16ReconReuse, RawFixOffAfterAdmissionUsesReconTimeHqState)
+{
+    FrameHooks hooks;
+    hooks.afterAdmission = [](mlvObject_t * video) { llrpSetFixRawMode(video, 0); };
+    const ConsumedCase c = runConsumedCase("raw fix off after admission", hooks);
+    const size_t liveMismatched = mismatchedWords(c.oldPath.frameK, c.reuse.liveFlagReuseK, c.words);
+    std::printf("[debayered16-recon-reuse] raw fix off after admission: live_hq=%d live_flag_mismatched=%zu of %zu\n",
+                c.reuse.liveHqAfterAdmission ? 1 : 0, liveMismatched, c.words);
+    ASSERT_TRUE(c.reuse.provenanceK.done.hqDualIso);
+    ASSERT_FALSE(c.reuse.liveHqAfterAdmission);  // the change landed inside the window
+    ASSERT_EQ(static_cast<size_t>(0), c.mismatched);
+    ASSERT_EQ(0, std::memcmp(c.oldPath.frameK.data(), c.reuse.frameK.data(), c.words * sizeof(uint16_t)));
+    assertRealPicture(c.reuse.frameK.data(), c.words, "raw fix off after admission");
+    // Sensitivity: the live flag would have shifted the HQ recon.
+    ASSERT_TRUE(liveMismatched > c.words / 100);
+}
+
+// (i) r3 (sol r2 H4): what the decode and recon-done stamps catch. Settings changed
+// away and back BEFORE the recon reads them: the recon ran under the original settings,
+// the stamps agree, and consuming it is byte-exact (there is nothing to catch).
+TEST(Debayered16ReconReuse, SettingsAwayAndBackBeforeReconIsConsumedByteExact)
+{
+    FrameHooks hooks;
+    hooks.beforeRecon = [](mlvObject_t * video) {
+        llrpSetFixRawMode(video, 0);
+        llrpSetFixRawMode(video, 1);
+    };
+    const ConsumedCase c = runConsumedCase("raw fix away and back before recon", hooks);
+    ASSERT_EQ(c.reuse.provenanceK.settingsAtDecode, c.reuse.provenanceK.done.settings);
+    ASSERT_EQ(static_cast<size_t>(0), c.mismatched);
+    ASSERT_EQ(0, std::memcmp(c.oldPath.frameK.data(), c.reuse.frameK.data(), c.words * sizeof(uint16_t)));
+}
+
+// (i) A change during the recon that is still in place at the recon-done stamp: the
+// stamps differ, the frame is refused as changed during the recon and equals the old
+// path; the HQ recon under the new (non-HQ) bit shift would not have.
+TEST(Debayered16ReconReuse, SettingsChangedDuringReconIsRefusedAndMatchesOldPath)
+{
+    FrameHooks hooks;
+    hooks.afterRecon = [](mlvObject_t * video) { llrpSetFixRawMode(video, 0); };
+    runTransitionCase("raw fix off during recon", nullptr, hooks, Debayered16ReconRefusal::SettingsChangedDuringRecon);
+}
+
+// (i) The documented limit: a change made before the recon reads the settings and undone
+// before the recon-done stamp (A -> B -> A spanning the recon). Both stamps read A, so the
+// recon made under B is admitted and consumed; the two stamps cannot see it. The old path
+// has the same exposure (its own llrawproc run reads the settings once, its bit shift
+// later). Pinned so a change to this behaviour is a visible decision.
+TEST(Debayered16ReconReuse, SettingsAwayAndBackSpanningReconIsTheDocumentedLimit)
+{
+    FrameHooks hooks;
+    hooks.beforeRecon = [](mlvObject_t * video) { llrpSetFixRawMode(video, 0); };
+    hooks.afterRecon = [](mlvObject_t * video) { llrpSetFixRawMode(video, 1); };
+    const ConsumedCase c = runConsumedCase("raw fix away and back spanning recon (limit)", hooks);
+    ASSERT_EQ(c.reuse.provenanceK.settingsAtDecode, c.reuse.provenanceK.done.settings);
+    ASSERT_TRUE(c.mismatched > 0);
+}
+
+// (j) r3 (DEBAYERED16-REUSE-GPU-RECON-GATE-TEST-1, sol r2 H2 / fable r2 H3): the CUDA
+// recon provenance travels from the recon thread's stamp (debayered16ReconDoneStamp,
+// which signalReconDoneFromWorker calls) through the slot to the policy inputs
+// (applyDebayered16ReconProvenance, which drawFrame calls), and the frame is refused,
+// counted, and equals the old path. No CUDA device is needed: after the CPU recon the
+// test sets the thread's "last llrawproc run used the CUDA playback recon" flag, which a
+// real CUDA recon sets. Mutation M5 (the handoff dropped at either end) consumes the
+// frame and fails here; the call sites in RenderFrameThread.cpp are pinned by the
+// console test Debayered16ReconProvenanceWiring.
+TEST(Debayered16ReconReuse, CudaReconProvenanceIsCarriedToThePolicyAndRefused)
+{
+    FrameHooks hooks;
+    hooks.afterRecon = [](mlvObject_t *) { llrpSetGpuPlaybackReconLastUsedForTesting(1); };
+    // The consumed recon is the correct CPU recon, so it would not differ: staleDiffers=false.
+    runTransitionCase("cuda recon provenance", nullptr, hooks, Debayered16ReconRefusal::GpuPlaybackRecon, false);
+    llrpSetGpuPlaybackReconLastUsedForTesting(0);
+
+    // Control: the same frame without the flag is consumed.
+    const ConsumedCase c = runConsumedCase("cuda recon provenance control", FrameHooks());
+    ASSERT_FALSE(c.reuse.provenanceK.done.usedGpuPlaybackRecon);
+    ASSERT_EQ(static_cast<size_t>(0), c.mismatched);
 }

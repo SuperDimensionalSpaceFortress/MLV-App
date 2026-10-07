@@ -72,6 +72,7 @@ int llrpResetGpuPlaybackReconRunForTesting(void);
 int llrpGpuPlaybackReconLastRunAttemptedForTesting(void);
 int llrpGpuPlaybackReconLastRunRcForTesting(void);
 int llrpGpuPlaybackReconLastUsedForTesting(void);
+void llrpSetGpuPlaybackReconLastUsedForTesting(int used);
 int llrpGpuPlaybackReconLastStateValidForTesting(void);
 int llrpGpuPlaybackReconLastPrepareOnlyForTesting(void);
 

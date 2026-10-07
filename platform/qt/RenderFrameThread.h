@@ -464,14 +464,11 @@ private:
         int reducedReconScale = 1;
         int reducedReconWidth = 0;
         int reducedReconHeight = 0;
-        /* CPU-DEBAYERED16-REUSE-PHASE3-RECON-1 r2: how rawImage16's recon was
-         * made, for Debayered16ReconReusePolicy. The decode stage sets the first
-         * two, the recon-done signal the last two; resetMetadata clears all four
-         * (fail closed: a slot nobody stamped is refused). */
-        bool reconAcquisitionSucceeded = false;
-        uint64_t reconSettingsAtDecode = 0;
-        uint64_t reconSettingsAtReconDone = 0;
-        bool reconUsedGpuPlaybackRecon = false;
+        /* CPU-DEBAYERED16-REUSE-PHASE3-RECON-1 r2/r3: how rawImage16's recon was
+         * made, for Debayered16ReconReusePolicy. The decode stage sets the decode
+         * status and settings, the recon-done signal the done stamp;
+         * resetMetadata clears it (fail closed: a slot nobody stamped is refused). */
+        Debayered16ReconProvenance reconProvenance;
         GpuPlaybackReconTextureState gpuPlaybackReconTextureState;
         int gpuPlaybackReconTextureWidth = 0;
         int gpuPlaybackReconTextureHeight = 0;
@@ -532,10 +529,7 @@ private:
             /* reducedRecon* deliberately survive: the process stage resets
              * metadata before it consumes them. The decode and recon stages
              * own them (both set reducedReconScale every frame). */
-            reconAcquisitionSucceeded = false;
-            reconSettingsAtDecode = 0;
-            reconSettingsAtReconDone = 0;
-            reconUsedGpuPlaybackRecon = false;
+            reconProvenance = Debayered16ReconProvenance();
             gpuPlaybackReconTextureState = GpuPlaybackReconTextureState();
             gpuPlaybackReconTextureWidth = 0;
             gpuPlaybackReconTextureHeight = 0;

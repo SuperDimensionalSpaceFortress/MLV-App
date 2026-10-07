@@ -879,6 +879,15 @@ uint64_t getMlvLlrawprocSettingsFingerprint(mlvObject_t * video)
     }
     pthread_mutex_lock(&video->llrawproc_mutex);
     hash = mlv_hash_llrawproc_settings_scalars(hash, llrawproc);
+    /* r3 (fable r2 H1): the dual-ISO pattern and exposure matching are recon
+     * inputs (manual EV, black delta and pattern; dualiso.c uses any value other
+     * than 1 / -1 as given). The processed-frame cache key leaves them out because
+     * recon publishes them; it publishes only when they change
+     * (llrawproc_runtime_state_equal), so after a clip's first recon they hold
+     * still, and a recon that does change them is refused as changed during it. */
+    hash = mlv_hash_bytes(hash, &llrawproc->diso_pattern, sizeof(llrawproc->diso_pattern));
+    hash = mlv_hash_bytes(hash, &llrawproc->diso_ev_correction, sizeof(llrawproc->diso_ev_correction));
+    hash = mlv_hash_bytes(hash, &llrawproc->diso_black_delta, sizeof(llrawproc->diso_black_delta));
     /* The dark frame and the pixel maps by version (bumped on every load or
      * rebuild), not by content: this runs three times per played frame. */
     hash = mlv_hash_bytes(hash, &llrawproc->dark_frame_version, sizeof(llrawproc->dark_frame_version));
@@ -6336,7 +6345,8 @@ void getMlvRawFrameDebayered(mlvObject_t * video, uint64_t frameIndex, uint16_t 
 int getMlvRawFrameDebayeredFromReconnedRaw16(mlvObject_t * video,
                                              uint64_t frameIndex,
                                              float * reconnedRawScratch,
-                                             uint16_t * outputFrame)
+                                             uint16_t * outputFrame,
+                                             int reconHqDualIso)
 {
     if (!video || !reconnedRawScratch || !outputFrame) return 0;
     const int width = getMlvWidth(video);
@@ -6359,8 +6369,10 @@ int getMlvRawFrameDebayeredFromReconnedRaw16(mlvObject_t * video,
     g_mlv_last_raw_float_convert_ms = 0.0;
     llrpResetLastRunTimingForCurrentThread();
 
-    /* What getMlvRawFrameProcessedUint16 reports after its llrawproc run. */
-    const int bit_shift = llrpHQDualIso(video) ? 0 : (16 - video->RAWI.raw_info.bits_per_pixel);
+    /* What getMlvRawFrameProcessedUint16 reports after its llrawproc run, from
+     * the HQ dual-ISO state the recon ran under (r3: never the live object,
+     * whose settings may have changed since the caller's admission check). */
+    const int bit_shift = reconHqDualIso ? 0 : (16 - video->RAWI.raw_info.bits_per_pixel);
     return get_mlv_raw_frame_debayered_from_processed_raw_u16(
         video,
         frameIndex,
