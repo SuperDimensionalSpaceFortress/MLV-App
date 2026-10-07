@@ -75,7 +75,13 @@ OWNER_CLIP = "M16-1243"   # a consented clip ID (an id is not footage); the runn
 # Every leg spec shipped under legs/ (DVE-SCALE2-LOOK-LEG-1 added the scale-2 look leg); the tracked-spec tests loop over all of them.
 # DUAL-VENUE-DISPLAY-MATRIX-1 added the six display-matrix legs ({fullscreen, windowed} x {scale 1, 2, 4}); legsets/display-matrix.json names them.
 DISPLAY_MATRIX_LEGS = tuple(f"legs/m16-1243-display-{mode}-s{scale}.json" for scale in (1, 2, 4) for mode in ("fullscreen", "windowed"))
-SHIPPED_LEGS = ("legs/m16-1243-speed.json", "legs/m16-1243-look.json", "legs/m16-1243-look-scale2.json", "legs/m16-1243-look-cinematic.json", *DISPLAY_MATRIX_LEGS)
+# PLAYBACK-BACHELOR-PRESENT-JITTER-1 added three capture-free PACE legs: speed legs that force Look Assist (cinematic) through generatorArgs and take no
+# contact sheet, so no GUI-thread framebuffer grab lands inside the timed Play.
+PACE_LEGS = ("legs/m16-1243-pace-cinematic-fullscreen-s4.json", "legs/m16-1243-pace-cinematic-fullscreen-s2.json", "legs/m16-1243-pace-cinematic-windowed-s4.json")
+# ... and the lookahead A/B arm: the owner-shape pace leg at MLVAPP_PLAYBACK_RENDER_LOOKAHEAD_FRAMES=3 (the other arm is the pace leg itself, unset).
+LOOKAHEAD_LEGS = ("legs/m16-1243-pace-cinematic-fullscreen-s4-la3.json",)
+SHIPPED_LEGS = ("legs/m16-1243-speed.json", "legs/m16-1243-look.json", "legs/m16-1243-look-scale2.json", "legs/m16-1243-look-cinematic.json", *DISPLAY_MATRIX_LEGS, *PACE_LEGS,
+                *LOOKAHEAD_LEGS)
 SHIPPED_LEGS_PS = ", ".join(f"'{rel}'" for rel in SHIPPED_LEGS)
 OTHER_CLIP = "Z99-9999"
 MLV_EXT = "." + "mlv"  # never spelled as one literal token (the NA-4 gate trips on fixture basenames)
@@ -386,6 +392,38 @@ class GeneratorByteIdentityAndVariantTests(unittest.TestCase):
         self.assertNotIn("lookFlavorHonored = $(if ($LookLeg) { 'unknown' } else { $null })", text)
         self.assertNotIn("--no-look-assist", text)
 
+    def test_a_look_pace_leg_forces_look_assist_without_a_contact_sheet(self) -> None:
+        """PLAYBACK-BACHELOR-PRESENT-JITTER-1: -ForceLookAssist -LookPaceLeg is the look leg's Look Assist and flavor with NO contact sheet, so no
+        GUI-thread framebuffer grab lands inside the timed Play."""
+        job = self.generate(GENERATOR, "pace.job.ps1", ["-ForceLookAssist", "-LookPaceLeg", "-LookFlavor", "cinematic"])
+        text = job.read_text(encoding="utf-8")
+        self.assertEqual(self.parse_errors(job), 0)
+        self.assertIn("$LookLeg = $true", text)
+        self.assertIn("$LookPaceLeg = $true", text)
+        # a pace leg is a SPEED leg: summary.json says lookLeg false (the receipt checks it against the spec's legType) while
+        # lookAssistForced and the flavor fields still report the forced look
+        self.assertIn("lookLeg = ($LookLeg -and -not $LookPaceLeg)", text)
+        self.assertIn("lookAssistForced = $LookLeg", text)
+        self.assertIn("$LookFlavor = 'cinematic'", text)
+        self.assertIn("-RequireLookAssist:`$true -Scope none", text)
+        self.assertIn("('MLVAPP_LOOK_ASSIST_FLAVOR=' + $LookFlavor)", text)
+        self.assertIn("$ContactSheetEnabled = $false", text)
+        look = self.generate(GENERATOR, "look2.job.ps1", ["-ForceLookAssist", "-ContactSheet", "-LookFlavor", "cinematic"]).read_text(encoding="utf-8")
+        self.assertIn("$ContactSheetEnabled = $true", look)
+        # the lookahead A/B arm: only a pace leg passes the depth to the app; without it the job sets nothing
+        self.assertNotIn("MLVAPP_PLAYBACK_RENDER_LOOKAHEAD_FRAMES", text)
+        la3 = self.generate(GENERATOR, "pace-la3.job.ps1", ["-ForceLookAssist", "-LookPaceLeg", "-LookFlavor", "cinematic",
+                                                            "-PlaybackRenderLookaheadFrames", "3"])
+        self.assertEqual(self.parse_errors(la3), 0)
+        self.assertIn("'MLVAPP_PLAYBACK_RENDER_LOOKAHEAD_FRAMES=3',", la3.read_text(encoding="utf-8"))
+
+    def test_the_runner_passes_a_speed_legs_forced_look_to_the_generator(self) -> None:
+        runner = (DV / "Invoke-VenueLeg.ps1").read_text(encoding="utf-8")
+        self.assertIn("if (-not $isLook -and $spec.generatorArgs.PSObject.Properties['forceLookAssist'] -and [bool]$spec.generatorArgs.forceLookAssist) {", runner)
+        self.assertIn("$gen['ForceLookAssist'] = $true; $gen['LookPaceLeg'] = $true", runner)
+        self.assertIn("if ($spec.generatorArgs.PSObject.Properties['lookFlavor']) { $gen['LookFlavor'] = [string]$spec.generatorArgs.lookFlavor }", runner)
+        self.assertIn("if ($spec.generatorArgs.PSObject.Properties['playbackRenderLookaheadFrames']) { $gen['PlaybackRenderLookaheadFrames'] = [int]$spec.generatorArgs.playbackRenderLookaheadFrames }", runner)
+
     def test_scale_and_quiescence_parameters_reach_the_job(self) -> None:
         text = self.generate(GENERATOR, "scale.job.ps1", ["-ScaleFactor", "1", "-CpuQuiescenceThresholdPercent", "35.5"]).read_text(encoding="utf-8")
         self.assertIn("-ScaleFactor 1 -UsePersistedPlaybackSettings", text)
@@ -398,7 +436,10 @@ class GeneratorByteIdentityAndVariantTests(unittest.TestCase):
 
     def test_refused_combinations_throw_before_emitting(self) -> None:
         for extra, token in ((["-Backend", "cpu", "-DisablePaintPerSubmit"], "DUAL_VENUE_CPU_BACKEND_CONFLICT"),
-                             (["-ForceLookAssist"], "DUAL_VENUE_LOOK_REQUIRES_CONTACT_SHEET")):
+                             (["-ForceLookAssist"], "DUAL_VENUE_LOOK_REQUIRES_CONTACT_SHEET"),
+                             (["-LookPaceLeg"], "DUAL_VENUE_LOOK_PACE_LEG_SHAPE"),
+                             (["-ForceLookAssist", "-ContactSheet", "-LookPaceLeg"], "DUAL_VENUE_LOOK_PACE_LEG_SHAPE"),
+                             (["-PlaybackRenderLookaheadFrames", "3"], "DUAL_VENUE_LOOKAHEAD_NEEDS_LOOK_PACE_LEG")):
             out = self.tmp / "refused.job.ps1"
             proc = run_pwsh(["-File", str(GENERATOR), "-SourceCommit", self.head, "-BuildManifestSha256", "ab" * 32,
                              "-ClipId", FIXTURE_IDS[0], "-FixtureSha256", "cd" * 32, "-RepoRoot", str(self.repo), "-OutFile", str(out), *extra])
@@ -4255,6 +4296,32 @@ class LegSpecSchemaTests(unittest.TestCase):
         for name in ("m16-1243-speed", "m16-1243-look"):
             self.assertEqual(sorted(json.loads((DV / "legs" / f"{name}.json").read_text(encoding="utf-8"))["backends"]), ["cpu", "cuda"], name)
 
+    def test_each_pace_leg_is_its_display_matrix_cell_without_the_contact_sheet(self) -> None:
+        """PLAYBACK-BACHELOR-PRESENT-JITTER-1: a pace leg runs its display-matrix cell (same display mode and scale, Look Assist forced, cinematic,
+        LIGHT, same quiescence gate and criteria) as a SPEED leg, so it takes no contact sheet inside the timed Play."""
+        for rel in PACE_LEGS:
+            pace = json.loads((DV / rel).read_text(encoding="utf-8"))
+            self.jsonschema.validate(pace, self.schema)
+            cell = json.loads((DV / "legs" / f"m16-1243-display-{pace['displayMode']}-s{pace['scaleFactor']}.json").read_text(encoding="utf-8"))
+            self.assertEqual(pace["legType"], "speed", rel)
+            self.assertNotIn("look", pace, rel)
+            self.assertEqual(pace["generatorArgs"], dict(cell["generatorArgs"], forceLookAssist=True, lookFlavor=cell["look"]["lookFlavor"]), rel)
+            for key in ("clipId", "playSeconds", "backends", "scaleFactor", "displayMode", "timeouts", "criteria"):
+                self.assertEqual(pace[key], cell[key], f"{rel}: {key}")
+            self.assertEqual(pace.get("acceptedEffectiveScale"), cell.get("acceptedEffectiveScale"), f"{rel}: declares its cell's CUDA texture-route clamp")
+        self.assertEqual(sorted(json.loads((DV / rel).read_text(encoding="utf-8"))["legId"] for rel in PACE_LEGS),
+                         sorted(["m16-1243-pace-cinematic-fullscreen-s4", "m16-1243-pace-cinematic-fullscreen-s2", "m16-1243-pace-cinematic-windowed-s4"]))
+
+    def test_the_lookahead_leg_is_the_owner_shape_pace_leg_at_depth_3(self) -> None:
+        """PLAYBACK-BACHELOR-PRESENT-JITTER-1: the lookahead A/B's depth-3 arm differs from the owner-shape pace leg only in its legId and
+        generatorArgs.playbackRenderLookaheadFrames."""
+        for rel in LOOKAHEAD_LEGS:
+            arm = json.loads((DV / rel).read_text(encoding="utf-8"))
+            self.jsonschema.validate(arm, self.schema)
+            base = json.loads((DV / "legs" / "m16-1243-pace-cinematic-fullscreen-s4.json").read_text(encoding="utf-8"))
+            self.assertEqual(arm["generatorArgs"].pop("playbackRenderLookaheadFrames"), 3, rel)
+            self.assertEqual(dict(arm, legId=base["legId"]), base, rel)
+
     def test_the_hand_listed_shipped_legs_are_exactly_the_legs_directory(self) -> None:
         self.assertEqual(sorted(SHIPPED_LEGS), sorted("legs/" + p.name for p in (DV / "legs").glob("*.json")), "SHIPPED_LEGS drifted from the legs/ directory")
 
@@ -4266,6 +4333,9 @@ class LegSpecSchemaTests(unittest.TestCase):
         for path in sorted((DV / "legs").glob("*.json")):
             spec = json.loads(path.read_text(encoding="utf-8"))
             flavor = (spec.get("look") or {}).get("lookFlavor", "classic")
+            gen_args = spec.get("generatorArgs") or {}
+            if spec["legType"] == "speed" and gen_args.get("forceLookAssist"):   # a capture-free pace leg forces its flavor through generatorArgs
+                flavor = gen_args.get("lookFlavor", "classic")
             if flavor == "classic":
                 self.assertNotRegex(path.read_text(encoding="utf-8").lower(), r"cinematic", f"{path.name} is a classic/speed leg and mentions the cinematic flavor")
                 continue
@@ -4273,6 +4343,9 @@ class LegSpecSchemaTests(unittest.TestCase):
             if spec["card"] == "DUAL-VENUE-DISPLAY-MATRIX-1":   # the display-matrix legs are cinematic look legs named by their cell (display mode and scale)
                 self.assertEqual(spec["legId"], path.stem, path.name)
                 self.assertRegex(spec["legId"], r"^m16-1243-display-(fullscreen|windowed)-s[124]$", path.name)
+            elif spec["card"] == "PLAYBACK-BACHELOR-PRESENT-JITTER-1":   # the capture-free pace legs, named by flavor and cell
+                self.assertEqual(spec["legId"], path.stem, path.name)
+                self.assertRegex(spec["legId"], rf"^m16-1243-pace-{flavor}-(fullscreen|windowed)-s[124](-la[0-3])?$", path.name)
             else:
                 self.assertEqual(spec["legId"], f"m16-1243-look-{flavor}", path.name)
             for role, per_backend in spec["criteria"].items():

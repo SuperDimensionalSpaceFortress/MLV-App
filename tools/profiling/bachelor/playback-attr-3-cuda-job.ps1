@@ -334,6 +334,15 @@ param(
     [ValidateSet('classic', 'cinematic')]
     [string]$LookFlavor = 'classic',
 
+    # PLAYBACK-BACHELOR-PRESENT-JITTER-1: a capture-free PACE leg -- -ForceLookAssist (and -LookFlavor) without
+    # -ContactSheet, so no contact-sheet grab (a GUI-thread framebuffer readback of 30-71 ms) lands inside the
+    # timed Play. Judged on its speed, never on a sheet; the look itself stays the look legs' job.
+    [switch]$LookPaceLeg,
+
+    # PLAYBACK-BACHELOR-PRESENT-JITTER-1: the playback render lookahead depth for a LOOK PACE leg's run (passed to the
+    # app as MLVAPP_PLAYBACK_RENDER_LOOKAHEAD_FRAMES, the lookahead A/B). -1 sets nothing, so every other job is unchanged.
+    [ValidateRange(-1, 3)][int]$PlaybackRenderLookaheadFrames = -1,
+
     # Test seam: the venue table to read instead of tools/profiling/dual-venue/venues.json.
     [string]$VenueTablePath = '',
 
@@ -3953,7 +3962,13 @@ function Edit-DualVenueTemplate([string]$Text, [string]$Old, [string]$New) {
     $Text.Substring(0, $first) + $newText + $Text.Substring($first + $oldText.Length)
 }
 
-if ($ForceLookAssist -and -not $ContactSheet) {
+if ($PlaybackRenderLookaheadFrames -ge 0 -and -not $LookPaceLeg) {
+    throw 'DUAL_VENUE_LOOKAHEAD_NEEDS_LOOK_PACE_LEG -PlaybackRenderLookaheadFrames is only for a -LookPaceLeg run (the lookahead A/B)'
+}
+if ($LookPaceLeg -and ($ContactSheet -or -not $ForceLookAssist)) {
+    throw 'DUAL_VENUE_LOOK_PACE_LEG_SHAPE -LookPaceLeg is -ForceLookAssist WITHOUT -ContactSheet (a capture-free pace leg)'
+}
+if ($ForceLookAssist -and -not $ContactSheet -and -not $LookPaceLeg) {
     throw 'DUAL_VENUE_LOOK_REQUIRES_CONTACT_SHEET -ForceLookAssist (a LOOK leg) needs -ContactSheet: the look is judged on the contact sheet'
 }
 $isCpuBackend = ($Backend -eq 'cpu')
@@ -3962,7 +3977,7 @@ if ($isCpuBackend -and $DisablePaintPerSubmit) {
 }
 $isVariant = ($Venue -ne 'bachelor') -or $isCpuBackend -or [bool]$ForceLookAssist
 if ($isVariant) {
-    $variantVars = "`$Backend = '$Backend'`n`$LookLeg = $(if ($ForceLookAssist) { '$true' } else { '$false' })`n`$LookFlavor = '$LookFlavor'`n`$DeclaredVenue = '$Venue'`n`$ExpectedHostName = '$($venueExpectedHost.Replace("'", "''"))'"
+    $variantVars = "`$Backend = '$Backend'`n`$LookLeg = $(if ($ForceLookAssist) { '$true' } else { '$false' })`n`$LookPaceLeg = $(if ($LookPaceLeg) { '$true' } else { '$false' })`n`$LookFlavor = '$LookFlavor'`n`$DeclaredVenue = '$Venue'`n`$ExpectedHostName = '$($venueExpectedHost.Replace("'", "''"))'"
     $template = Edit-DualVenueTemplate $template '$DisablePaintPerSubmit = __DISABLE_PAINT_PER_SUBMIT__
 ' ('$DisablePaintPerSubmit = __DISABLE_PAINT_PER_SUBMIT__
 ' + $variantVars + "`n")
@@ -4071,6 +4086,12 @@ if ($ForceLookAssist) {
     ('MLVAPP_LOOK_ASSIST_FLAVOR=' + `$LookFlavor),
 "
     }
+    if ($LookPaceLeg -and $PlaybackRenderLookaheadFrames -ge 0) {
+        $template = Edit-DualVenueTemplate $template "    'MLVAPP_PLAYBACK_PHASE3_UNATTENDED=1',
+" "    'MLVAPP_PLAYBACK_PHASE3_UNATTENDED=1',
+    'MLVAPP_PLAYBACK_RENDER_LOOKAHEAD_FRAMES=$PlaybackRenderLookaheadFrames',
+"
+    }
 }
 if ($isVariant) {
     # DVE-LEG-TERMINALS-1 item 1: a variant's PresentMon wait-failure summary states its backend like every other variant summary (a cpu run's backend is read from
@@ -4091,7 +4112,7 @@ if ($isVariant) {
 ' ('    cpuFrames = $gpuSummary.cpuFrames
 ' + $cpuRatioField + '    backend = $Backend
     declaredVenue = $DeclaredVenue
-    lookLeg = $LookLeg
+    lookLeg = ($LookLeg -and -not $LookPaceLeg)
     lookAssistForced = $LookLeg
     lookFlavor = $(if ($LookLeg) { $LookFlavor } else { $null })
     lookFlavorReported = $(if ($LookLeg) { $lfReported = try { [string]$resultJson.log.visualState.look_assist_flavor } catch { '''' }; if ([string]::IsNullOrEmpty($lfReported)) { $lfReported = ''none'' }; $lfReported } else { $null })

@@ -24,3 +24,4 @@ tools/profiling/dual-venue/legs/*.json text eol=lf
 tools/profiling/dual-venue/legsets/*.json text eol=lf
 tools/profiling/dual-venue/venue-clip-consent.json text eol=lf
 tools/profiling/dual-venue/venues.json text eol=lf
+tests/coordination/fixtures/bus-validate-cards/*.mjs text eol=lf

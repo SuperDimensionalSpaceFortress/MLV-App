@@ -9,6 +9,10 @@
 //    LOOK-ASSIST-ANALYSIS-TRUE-LEVELS-1 (#259) moves only the exposure fields again (13 -> 154, 16 -> 163, 16 -> 163):
 //    the meter reads the display's levels (MLV_PROCESSED_THUMBNAIL_DISPLAY_LEVELS). With that flag off the tree
 //    reproduces the previous three rows byte for byte; the rows are re-dumped from the FLAVOR-BASELINE lines below.
+//    LOOK-ASSIST-DUALISO-VSTRIPES-1 re-dumps all three rows, in file order, from c7e51d03 with vertical stripes forced off:
+//      row 1 was exp=154 temp=6540 tint=-35, 81b7eafc...; stripes no longer run on dual-ISO frames.
+//      row 2 was exp=163 temp=6540 tint=-35, 81b7eafc...; stripes no longer run on dual-ISO frames.
+//      row 3 was shade exp=163 temp=6310 tint=-21, d7544133... (now night); stripes no longer run on dual-ISO frames.
 //  - Cinematic changes only the documented sliders, by the one table, deterministically, never the white
 //    balance, and is always reported.
 //  - An unknown environment value is Classic, with a logged warning.

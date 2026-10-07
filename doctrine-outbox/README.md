@@ -1,7 +1,7 @@
 # doctrine-outbox
 
-Findings that belong on the fleet doctrine bus (`TRAPS.md`, `RECEIPTS.md`, `RULINGS.md`) leave this
-repo by FILE, never by a session's memory. This directory plus `tools/coordination/doctrine_outbox.py`
+Findings that belong on the fleet doctrine bus (trap cards in `specs/mlv-app/cards.md`, `RECEIPTS.md`,
+`RULINGS.md`) leave this repo by FILE, never by a session's memory. This directory plus `tools/coordination/doctrine_outbox.py`
 is the mechanism, ported from agent-bridge's port of the bus's own reference outbox. Nothing here runs
 itself: the unattended drain, the capture hook and the heartbeat debt line are card
 DOCTRINE-OUTBOX-ADOPT-MLV-1b and install against this CLI.
@@ -12,6 +12,7 @@ DOCTRINE-OUTBOX-ADOPT-MLV-1b and install against this CLI.
 python tools/coordination/doctrine_outbox.py debt                       # unsent items on refs/remotes/fork/master; exit 1 = debt, 2 = UNKNOWN
 python tools/coordination/doctrine_outbox.py debt --json --bus <clone>  # machine form, also checks markers and published_as on the bus
 python tools/coordination/doctrine_outbox.py drain --bus <clone>        # DRY RUN by default; --push publishes
+python tools/coordination/doctrine_outbox.py kernel-filing --bus <clone> # kernel filing to its review branch; DRY RUN unless --push
 python tools/coordination/doctrine_outbox.py check-ledger               # every finding needs a disposition; exit 1 = undisposed
 python tools/coordination/doctrine_outbox.py check-commits              # fork/master..HEAD: finding paths need a trailer
 ```
@@ -31,7 +32,7 @@ change that teaches it.
 
 ```markdown
 ---
-target: TRAPS.md          # RECEIPTS.md | TRAPS.md | RULINGS.md (specs are steward-owned)
+target: TRAPS.md          # RECEIPTS.md | TRAPS.md | RULINGS.md | specs/mlv-app/cards.md (other specs are steward-owned)
 kind: trap                # receipt | trap | ruling
 source_commit: PENDING    # PENDING = the commit that adds this file; or an explicit sha
 law4: attested            # required, then SCREENED, never trusted
@@ -51,6 +52,55 @@ if they carry an email address, an account or org uuid, a lane wire path, `HUB.m
 pattern, a user-home path, this host's name or account name, or anything in an optional deny file. MLV
 adds its own deny terms: `.claude-state`, `subject-ledger`, `fleet-runs`, `HUB_RUN_WAL`, `dual-lane`, and
 the name of the GPU host. A refusal names the class, never the matched value.
+
+## Traps are cards (bus R14.1)
+
+From the bus commit that landed `tools/validate-cards.mjs` (R14 packet 2), a new trap filing is a card in
+`specs/mlv-app/cards.md`, not a `TRAPS.md` entry. The drain keys this on the fetched bus tip, never on a
+date: when the tip carries the validator, an unsent `target: TRAPS.md` item is refused
+(`R14_1_TRAP_FILING_IS_A_CARD`, exit 1) and nothing is appended. An entry already on the bus stays sent.
+Receipts and rulings keep their targets.
+
+```markdown
+---
+target: specs/mlv-app/cards.md
+kind: trap                # cards take trap items only
+source_commit: PENDING
+law4: attested
+---
+## mlv-app/<id>
+rule: <the rule>
+mechanism: <why it happens>
+applies: <comma-separated fleet members; omit for every board>
+check: <a command, or a law-6 pointer to a pushed harness>
+supersedes: none
+evidence: measured
+```
+
+The bus validator's header is the format contract (bold-bullet `- **Rule:** ...` fields are accepted too).
+A card is at most 15 lines and 2,000 bytes, and the drain adds one line to it, the marker
+`- **Outbox:** outbox:<key> mlv-app:<sha12>`. The first card creates the file with a one-line title. Before
+any push, the drain runs the tip's own `validate-cards.mjs` with node over the would-be file in its temp
+worktree; a rejection refuses the publish (`CARD_INVALID`), and a missing validator or node refuses the card
+(`CARD_VALIDATOR_ABSENT`, `CARD_VALIDATOR_NODE_ABSENT`). `validate` checks the heading only, not the fields.
+
+## Kernel filings go to a review branch, never master
+
+A factory-kernel filing (bus kernel K12 and section 4, `adjudications/factory-kernel/README.md`, PROMPT-K
+sections 4-5) is not an item. Commit it as `doctrine-outbox/kernel-filing/<yyyymmdd>/`, holding exactly
+`adjudications-factory-kernel-mlv-app.md` (the whole filing) and, optionally, `specs-mlv-app-block.md` (a
+block for the project's own spec). `kernel-filing --bus <clone>` publishes them to bus branch
+`review/mlv-app-kernel-<YYYY-MM-DD>`: it rewrites `adjudications/factory-kernel/mlv-app.md` wholesale and
+appends the block, with an `outbox:<key>` marker, to `specs/mlv-app.md`. A revised block for the same
+date replaces the earlier one: the spec is rebuilt from where the branch left bus master. It writes no
+other path. The branch comes from the date directory, and no parameter can name a branch or a path. The
+branch is created from bus master, or fast-forwarded when every commit on it is this outbox's (else
+`KERNEL_BRANCH_NOT_OURS`). Any other file in the date directory is `KERNEL_FILING_EXTRA_PATH`; an empty or
+whitespace-only filing or block is `KERNEL_FILING_EMPTY`. Every Law-4 class and deny term is screened,
+with no word cap, because a filing is wholesale. Every success (a push, a lost-ack recovery, a no-op) is
+proven by `ls-remote` equal to the certified commit (R7), else `PUSH_VERIFY_FAILED` with no ledger row,
+and recorded in the sent ledger with `route: kernel-filing`. The key covers the bytes only, never the
+source commit. A re-run is a no-op, by the ledger or, on a fresh clone, by the bytes already on the branch.
 
 ## Entries already on the bus: `published_as`
 

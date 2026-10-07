@@ -2087,6 +2087,46 @@ int processingExpandShadowsHighlightsQuarterBlur(const uint16_t * quarter,
     return 1;
 }
 
+int processingRgbU16BoxDownsample(const uint16_t * src,
+                                  uint16_t * dst,
+                                  int src_w,
+                                  int src_h,
+                                  int factor,
+                                  int threads)
+{
+    if( !src || !dst || src_w <= 0 || src_h <= 0
+     || (factor != 2 && factor != 4)
+     || (src_w % factor) != 0 || (src_h % factor) != 0 )
+    {
+        return 0;
+    }
+    if( factor == 2 )
+    {
+        rgb_u16_downsample_2x_box(src, dst, src_w, src_h, threads);
+    }
+    else
+    {
+        rgb_u16_downsample_4x_two_stage_box(src, dst, src_w, src_h, threads);
+    }
+    return 1;
+}
+
+int processingRgbU16Upsample2xBilinear(const uint16_t * src,
+                                       int src_w,
+                                       int src_h,
+                                       uint16_t * dst,
+                                       int dst_w,
+                                       int dst_h,
+                                       int threads)
+{
+    if( !src || !dst || src_w <= 0 || src_h <= 0 || dst_w <= 0 || dst_h <= 0 )
+    {
+        return 0;
+    }
+    rgb_u16_upsample_2x_bilinear_to_size(src, dst, src_w, src_h, dst_w, dst_h, threads);
+    return 1;
+}
+
 /* Apply it with multiple threads */
 void applyProcessingObject( processingObject_t * processing,
                             int imageX, int imageY,

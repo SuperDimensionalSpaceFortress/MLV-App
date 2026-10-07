@@ -32,7 +32,7 @@ $root = (& git rev-parse --show-toplevel).Trim()
 $ownerOf = Join-Path $PSScriptRoot 'owner-of.ps1'
 
 # every dirty path (tracked-modified + untracked)
-$dirty = @(& git -C $root status --porcelain --untracked-files=all |
+$dirty = @(& git -C $root -c core.quotepath=false status --porcelain --untracked-files=all |
     ForEach-Object { ($_ -replace '^..\s','').Trim() } | Where-Object { $_ })
 
 $mine = @(); $foreign = @(); $shared = @(); $unknown = @()
@@ -62,7 +62,7 @@ if (-not $Message)  { Write-Host "  -Message is required to commit (use -DryRun 
 foreach ($f in $mine) { & git -C $root add -- $f }
 
 # paranoia: prove nothing foreign slipped into the index
-foreach ($s in @(& git -C $root diff --cached --name-only)) {
+foreach ($s in @(& git -C $root -c core.quotepath=false diff --cached --name-only)) {
     $o = (& pwsh -NoProfile -File $ownerOf -Path $s).Trim()
     if ($o -ne $Lane) {
         Write-Host "  ABORT: staged '$s' resolves to '$o' not '$Lane'; unstaging all." -ForegroundColor Red

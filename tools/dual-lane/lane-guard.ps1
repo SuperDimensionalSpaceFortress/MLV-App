@@ -8,7 +8,7 @@ $ErrorActionPreference = 'Stop'
 $root = (& git rev-parse --show-toplevel).Trim()
 $ownerOf = Join-Path $root 'tools/dual-lane/owner-of.ps1'
 
-$staged = @(& git -C $root diff --cached --name-only | Where-Object { $_ })
+$staged = @(& git -C $root -c core.quotepath=false diff --cached --name-only | Where-Object { $_ })
 if ($staged.Count -eq 0) { exit 0 }
 
 if ($env:GIT_DUAL_LANE_OVERRIDE -eq '1') {

@@ -85,6 +85,8 @@ static double g_llrawproc_last_preview_rowscale_ms = 0.0;
 static MLV_THREAD_LOCAL uint64_t g_llrawproc_debug_pixel_map_copy_count = 0;
 static MLV_THREAD_LOCAL uint64_t g_llrawproc_debug_dark_frame_copy_count = 0;
 static MLV_THREAD_LOCAL uint64_t g_llrawproc_debug_runtime_publish_count = 0;
+/* Full-resolution llrawproc runs (applyLLRawProcObjectWorker past its fix_raw gate) on this thread. */
+static MLV_THREAD_LOCAL uint64_t g_llrawproc_debug_run_count = 0;
 static MLV_THREAD_LOCAL int g_llrawproc_analysis_isolation_enabled = 0;
 static MLV_THREAD_LOCAL int g_llrawproc_analysis_chroma_smooth_override_enabled = 0;
 static MLV_THREAD_LOCAL int g_llrawproc_analysis_chroma_smooth_override = CS_OFF;
@@ -510,6 +512,15 @@ int llrpGpuPlaybackReconLastUsedForTesting(void);
 int llrpGpuPlaybackReconLastUsedForTesting(void)
 {
     return g_llrawproc_gpu_playback_last_used;
+}
+
+/* CPU-DEBAYERED16-REUSE-PHASE3-RECON-1 r3: stands in for a CUDA playback recon
+ * on this thread, so the recon-provenance handoff can be tested on a host with
+ * no CUDA device. */
+void llrpSetGpuPlaybackReconLastUsedForTesting(int used);
+void llrpSetGpuPlaybackReconLastUsedForTesting(int used)
+{
+    g_llrawproc_gpu_playback_last_used = used ? 1 : 0;
 }
 
 int llrpGpuPlaybackReconLastStateValidForTesting(void);
@@ -3636,6 +3647,7 @@ void applyLLRawProcObjectWorker(mlvObject_t * video,
         g_llrawproc_last_total_ms = (mlv_stage_timing_now() - apply_start) * 1000.0;
         return;
     }
+    g_llrawproc_debug_run_count++;
 
     double dark_frame_ms = 0.0;
     double vertical_stripes_ms = 0.0;
@@ -3842,6 +3854,11 @@ void applyLLRawProcObjectWorker(mlvObject_t * video,
     dark_frame_mode = shared->dark_frame;
     vertical_stripes_mode = shared->vertical_stripes;
 
+    /* LOOK-ASSIST-DUALISO-VSTRIPES-1: no vertical-stripe fix on a dual-ISO frame. The detector (stripes.c) rates the
+     * RG row's columns against a green of the next row; with the ISO fields interleaved in row pairs that row can be the
+     * other field, so the odd-column coefficients measure the field gap (clamped near 2^+-1) and the apply pass scales
+     * Gr and B by about 1 EV, mostly in the bright field. Pattern noise is skipped the same way below. */
+    if (diso_validity) vertical_stripes_mode = 0;
     if (vertical_stripes_mode)
     {
         stripe_correction_snapshot = shared->stripe_corrections;
@@ -5668,6 +5685,26 @@ void llrpResetLastPreDualIsoFixTelemetry(void)
     g_llrawproc_last_pre_dualiso_fix_completed = 0;
 }
 
+/* CPU-DEBAYERED16-REUSE-PHASE3-RECON-1: a render that consumes another thread's
+ * llrawproc output runs none here, so it clears this thread's last-run stage
+ * timings (the per-stage getters below) instead of reporting an earlier frame's. */
+void llrpResetLastRunTimingForCurrentThread(void)
+{
+    g_llrawproc_last_shared_lock_ms = 0.0;
+    g_llrawproc_last_dualiso_refine_lock_ms = 0.0;
+    g_llrawproc_last_publish_lock_ms = 0.0;
+    g_llrawproc_last_total_ms = 0.0;
+    g_llrawproc_last_dark_frame_ms = 0.0;
+    g_llrawproc_last_vertical_stripes_ms = 0.0;
+    g_llrawproc_last_focus_pixels_ms = 0.0;
+    g_llrawproc_last_bad_pixels_ms = 0.0;
+    g_llrawproc_last_pattern_noise_ms = 0.0;
+    g_llrawproc_last_dual_iso_ms = 0.0;
+    g_llrawproc_last_chroma_smooth_ms = 0.0;
+    llrawproc_reset_dual_iso_full20bit_timing();
+    llrpResetLastPreDualIsoFixTelemetry();
+}
+
 double llrpGetLastDualIsoMilliseconds(void)
 {
     return g_llrawproc_last_dual_iso_ms;
@@ -5707,6 +5744,16 @@ void llrpResetDebugPixelMapCopyCount(void)
 uint64_t llrpGetDebugPixelMapCopyCount(void)
 {
     return g_llrawproc_debug_pixel_map_copy_count;
+}
+
+void llrpResetDebugRunCount(void)
+{
+    g_llrawproc_debug_run_count = 0;
+}
+
+uint64_t llrpGetDebugRunCount(void)
+{
+    return g_llrawproc_debug_run_count;
 }
 
 void llrpResetDebugDarkFrameCopyCount(void)

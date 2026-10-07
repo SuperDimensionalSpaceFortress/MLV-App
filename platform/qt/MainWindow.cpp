@@ -1532,6 +1532,7 @@ static bool lookAssistProcessedFloorLiftedPostInvalidShouldFailClosed(
 #include "FpmInstaller.h"
 #include "ScopesLabel.h"
 #include "avir/avirthreadpool.h"
+#include "PlaybackPrepCpuRoute.h"
 #include "MoveToTrash.h"
 #include "OverwriteListDialog.h"
 #include "PixelMapListDialog.h"
@@ -3753,13 +3754,45 @@ void MainWindow::freeActiveMlvObjectAfterLifecycleBarrier( const char *reason )
     freeMlvObject( m_pMlvObject );
 }
 
-MainWindow::PlaybackPrepResult MainWindow::buildPlaybackPrepResult( const PlaybackPrepTask &task )
+// CPU-PLAYBACK-PREP-WORKER-BUILD-1: what the prep thread keeps across frames
+// (a local of playbackPrepThreadLoop, so only that thread ever touches it): the
+// CPU route's scratch, reduced-input buffer and reduced-mask cache, and one avir
+// thread pool instead of one per frame. Callers without it (the inline GUI-thread
+// prep) get per-call temporaries, the pre-card behaviour.
+// D1 (r2): the tier-1 uses of this object -- the persistent full-size scratch
+// and the shared avir pool -- follow MLVAPP_PLAYBACK_PREP_TIER1 (default off).
+// The object itself is always built: tier 2 cannot run without it. Its
+// reduced-input buffer and reduced-mask cache live in `cpu`, and tier 2 is
+// eligible only when it exists (reducedInputs.playbackActive below requires
+// threadState != nullptr).
+struct MainWindow::PlaybackPrepThreadState
+{
+    PlaybackPrepCpuWorkspace cpu;
+    std::unique_ptr<avir_scale_thread_pool> avirPool;
+    avir_scale_thread_pool &scalingPool()
+    {
+        if( !avirPool ) avirPool.reset( new avir_scale_thread_pool() );
+        return *avirPool;
+    }
+};
+
+MainWindow::PlaybackPrepResult MainWindow::buildPlaybackPrepResult( const PlaybackPrepTask &task,
+                                                                    PlaybackPrepThreadState *threadState )
 {
     PlaybackPrepResult result;
     result.task = task;
     result.task.rebindOwnedImagePointers();
 
     const double image_start = mlv_stage_timing_now();
+    // Per-span attribution of imageBuildMs (QElapsedTimer ns, like the present
+    // region below); the session averages land on playback_smoke.prep_summary.
+    QElapsedTimer prepSpanClock;
+    prepSpanClock.start();
+    const auto prepSpanMs = [&prepSpanClock]( qint64 startNs )
+    {
+        return static_cast<double>( prepSpanClock.nsecsElapsed() - startNs ) / 1000000.0;
+    };
+    const bool prepTier1 = gpuPreviewProcessingTier1Enabled();
 
     const int sourceWidth = task.sourceWidth;
     const int sourceHeight = task.sourceHeight;
@@ -3863,6 +3896,11 @@ MainWindow::PlaybackPrepResult MainWindow::buildPlaybackPrepResult( const Playba
     bool displayImageOwnsData = false;
     std::vector<uint8_t> displayImageBacking;
     uint8_t underOver = 0;
+    // Dims of rgb8DisplaySource: the source dims, or the reduced dims when the
+    // CPU route processed a box-reduced frame. Everything below that reads
+    // rgb8DisplaySource uses these.
+    int displaySourceWidth = sourceWidth;
+    int displaySourceHeight = sourceHeight;
 
     if( gpu16PreviewActive && rgb16DisplaySource )
     {
@@ -3893,23 +3931,76 @@ MainWindow::PlaybackPrepResult MainWindow::buildPlaybackPrepResult( const Playba
     }
     else if( cpuPreviewProcessingActive && playbackProcessingSubsetActive )
     {
-        const size_t pixelCount = static_cast<size_t>( sourceWidth ) * static_cast<size_t>( sourceHeight );
-        std::vector<uint16_t> cpuPreviewProcessed;
+        // CPU-PLAYBACK-PREP-WORKER-BUILD-1: tier 1 (persistent scratch, fused
+        // 8-bit, parallel post-passes; off unless MLVAPP_PLAYBACK_PREP_TIER1) is
+        // byte-identical to the old ApplyCpuReference + convert_rgb16_to_rgb8;
+        // tier 2 processes a box-reduced frame when the requested scale is still owed.
+        PlaybackPrepCpuWorkspace inlineWorkspace;
+        PlaybackPrepCpuWorkspace &cpuWorkspace =
+            threadState ? threadState->cpu : inlineWorkspace;
+        PlaybackPrepReducedInputs reducedInputs;
+        reducedInputs.killSwitch =
+            qEnvironmentVariableIsSet( playbackPrepReducedKillSwitchName() )
+            && qEnvironmentVariable( playbackPrepReducedKillSwitchName() ).trimmed()
+                   != QStringLiteral("0");
+        reducedInputs.playbackActive = playbackPolicyActive && threadState != nullptr;
+        reducedInputs.scopesVisible =
+            mainWindowHasScopeVisualization( task.requestContext.gpuPreviewPolicy );
+        reducedInputs.zebrasEnabled = zebrasEnabled;
+        reducedInputs.pipelineCaptureActive = mlv_pipeline_capture_enabled() != 0;
+        reducedInputs.gpuImagePresentation = useGpuImagePresentation;
+        reducedInputs.zoomFit = zoomFitEnabled;
+        reducedInputs.spatialPostPass =
+            gpuPreviewProcessingCpuHasSpatialPostPass( gpuPreviewProcessingConfig );
+        reducedInputs.highlightReconExact =
+            gpuPreviewProcessingConfig.applyHighlightReconstruction
+            && !gpuPreviewProcessingConfig.highlightReconDualIso;
+        reducedInputs.shQuarterBlur =
+            gpuPreviewProcessingConfig.applyShadowsHighlights
+            && gpuPreviewProcessingConfig.shadowsHighlightsBlurQuarter;
+        reducedInputs.requestedScale = task.requestContext.playbackScaleFactor;
+        reducedInputs.sourceWidth = sourceWidth;
+        reducedInputs.sourceHeight = sourceHeight;
+        reducedInputs.mlvWidth = task.mlvWidth;
+        reducedInputs.mlvHeight = task.mlvHeight;
+        const PlaybackPrepReducedDecision reducedDecision =
+            playbackPrepDecideReduced( reducedInputs );
         std::vector<uint8_t> cpuPreviewRgb8;
-        cpuPreviewProcessed.resize( pixelCount * 3u );
-        cpuPreviewRgb8.resize( pixelCount * 3u );
-        gpuPreviewProcessingApplyCpuReference( gpuPreviewProcessingConfig,
-                                               rgb16DisplaySource,
-                                               cpuPreviewProcessed.data(),
-                                               sourceWidth,
-                                               sourceHeight );
-        convert_rgb16_to_rgb8( cpuPreviewProcessed.data(),
-                               cpuPreviewRgb8.data(),
-                               sourceWidth * sourceHeight );
+        const PlaybackPrepCpuRouteResult cpuRoute =
+            playbackPrepCpuRouteRun( cpuWorkspace,
+                                     gpuPreviewProcessingConfig,
+                                     task.requestContext.gpuPreviewProcessingConfigGeneration,
+                                     rgb16DisplaySource,
+                                     sourceWidth,
+                                     sourceHeight,
+                                     reducedDecision,
+                                     &cpuPreviewRgb8 );
+        displaySourceWidth = cpuRoute.processedWidth;
+        displaySourceHeight = cpuRoute.processedHeight;
+        result.processedWidth = displaySourceWidth;
+        result.processedHeight = displaySourceHeight;
+        const size_t processedBytes = cpuPreviewRgb8.size();
         result.scopeSourceImage = std::move( cpuPreviewRgb8 );
         result.task.scopeSourceImage = result.scopeSourceImage.data();
-        result.task.scopeSourceImageSize = pixelCount * 3u;
+        result.task.scopeSourceImageSize = processedBytes;
         rgb8DisplaySource = result.task.scopeSourceImage;
+
+        QJsonObject &spanTelemetry = result.task.readyFrame.stageTimingTelemetry;
+        spanTelemetry.insert( QStringLiteral("playback_prep_cpu_route_active"), true );
+        spanTelemetry.insert( QStringLiteral("playback_prep_alloc_ms"), cpuRoute.allocMs );
+        spanTelemetry.insert( QStringLiteral("playback_prep_reduce_ms"), cpuRoute.reduceMs );
+        spanTelemetry.insert( QStringLiteral("playback_prep_sh_expand_ms"), cpuRoute.spans.shExpandMs );
+        spanTelemetry.insert( QStringLiteral("playback_prep_pointwise_ms"), cpuRoute.spans.pointwiseMs );
+        spanTelemetry.insert( QStringLiteral("playback_prep_chroma_ms"), cpuRoute.spans.chromaMs );
+        spanTelemetry.insert( QStringLiteral("playback_prep_sharpen_ms"), cpuRoute.spans.sharpenMs );
+        spanTelemetry.insert( QStringLiteral("playback_prep_median_ms"), cpuRoute.spans.medianMs );
+        spanTelemetry.insert( QStringLiteral("playback_prep_rgb16to8_ms"), cpuRoute.spans.rgb16to8Ms );
+        spanTelemetry.insert( QStringLiteral("playback_prep_fused8"), cpuRoute.spans.fused8 );
+        spanTelemetry.insert( QStringLiteral("playback_prep_stage_mask"),
+                              static_cast<qint64>( gpuPreviewProcessingCpuStageMask( gpuPreviewProcessingConfig ) ) );
+        spanTelemetry.insert( QStringLiteral("playback_prep_reduced_factor"), cpuRoute.reducedFactor );
+        spanTelemetry.insert( QStringLiteral("playback_prep_reduced_refusal_reason"),
+                              QString::fromLatin1( playbackPrepReducedRefusalName( cpuRoute.refusal ) ) );
     }
 
     if( preScaledPlaybackImageAvailable )
@@ -3934,9 +4025,9 @@ MainWindow::PlaybackPrepResult MainWindow::buildPlaybackPrepResult( const Playba
         meta.stage = MLV_PIPELINE_STAGE_S6_DISPLAYSOURCE;
         meta.format = MLV_PIPELINE_FORMAT_UINT8_RGB;
         meta.format_label = "uint8_rgb_displaySource_pre_scale";
-        meta.width = sourceWidth;
-        meta.height = sourceHeight;
-        meta.bytes_per_line = sourceWidth * 3;
+        meta.width = displaySourceWidth;
+        meta.height = displaySourceHeight;
+        meta.bytes_per_line = displaySourceWidth * 3;
         meta.bytes_per_pixel = 3;
         meta.channels = 3;
         meta.bit_depth = 8;
@@ -3950,6 +4041,8 @@ MainWindow::PlaybackPrepResult MainWindow::buildPlaybackPrepResult( const Playba
                               &meta );
     }
 
+    const qint64 downscaleStartNs = prepSpanClock.nsecsElapsed();
+    const char *downscaleBranch = preScaledPlaybackImageAvailable ? "prescaled" : "none";
     if( displayImage.isNull() )
     {
         const bool playbackFastScalingActive =
@@ -3965,7 +4058,7 @@ MainWindow::PlaybackPrepResult MainWindow::buildPlaybackPrepResult( const Playba
          * filter and beat it to period-4 -- empirically only a wide-support Lanczos-class
          * low-pass kills it (NN/box/bilinear do not), and avir CImageResizer is the
          * in-tree equivalent. Scope: playback only, and ONLY when the target is a
-         * horizontal REDUCTION of the source (hqTargetWidth < sourceWidth) -- so x2/x4
+         * horizontal REDUCTION of the source (hqTargetWidth < displaySourceWidth) -- so x2/x4
          * proxy lanes that upscale-to-fit are untouched (no FPS cost there), and this
          * fires on the x1 full-res downscale where the striping lives. This is a preview
          * mitigation, NOT the root fix (the period-3 originates upstream in raw/recon).
@@ -3978,21 +4071,23 @@ MainWindow::PlaybackPrepResult MainWindow::buildPlaybackPrepResult( const Playba
             playbackPolicyActive
             && !useGpuImagePresentation
             && rgb8DisplaySource
-            && sourceWidth > 0 && sourceHeight > 0
+            && displaySourceWidth > 0 && displaySourceHeight > 0
             && hqTargetWidth > 0 && hqTargetHeight > 0
-            && hqTargetWidth < sourceWidth
+            && hqTargetWidth < displaySourceWidth
             && !( qEnvironmentVariableIsSet( "MLVAPP_DISABLE_PLAYBACK_HQ_DOWNSCALE" )
                   && qEnvironmentVariable( "MLVAPP_DISABLE_PLAYBACK_HQ_DOWNSCALE" ).trimmed()
                        != QStringLiteral("0") );
         if( useGpuImagePresentation )
         {
+            downscaleBranch = "gpu_wrap";
             displayImage = playbackWrapRgb8Image( const_cast<uint8_t *>( rgb8DisplaySource ),
-                                                  sourceWidth,
-                                                  sourceHeight );
+                                                  displaySourceWidth,
+                                                  displaySourceHeight );
             displayImageOwnsData = false;
         }
         else if( hqPlaybackDownscale )
         {
+            downscaleBranch = "hq_avir";
             /* avir::resizeImage has NO destination-stride parameter -- it writes the
              * output TIGHTLY PACKED (NewWidth*3 bytes/row). A QImage::Format_RGB888
              * built straight from that packed buffer is mis-stridden: Qt rounds the
@@ -4006,13 +4101,17 @@ MainWindow::PlaybackPrepResult MainWindow::buildPlaybackPrepResult( const Playba
             const int alignedBpl = ( ( hqTargetWidth * 3 ) + 3 ) & ~3;
             std::vector<uint8_t> packed(
                 static_cast<size_t>(hqTargetWidth) * static_cast<size_t>(hqTargetHeight) * 3u );
-            avir_scale_thread_pool scaling_pool;
+            const bool sharedPool = threadState && prepTier1;
+            std::unique_ptr<avir_scale_thread_pool> frameScalingPool;
+            if( !sharedPool ) frameScalingPool.reset( new avir_scale_thread_pool() );
+            avir_scale_thread_pool &scaling_pool =
+                sharedPool ? threadState->scalingPool() : *frameScalingPool;
             avir::CImageResizerParamsUltra roptions;
             avir::CImageResizer<> image_resizer( 8, 0, roptions );
             avir::CImageResizerVars vars; vars.ThreadPool = &scaling_pool;
             image_resizer.resizeImage( rgb8DisplaySource,
-                                       sourceWidth,
-                                       sourceHeight, 0,
+                                       displaySourceWidth,
+                                       displaySourceHeight, 0,
                                        packed.data(),
                                        hqTargetWidth,
                                        hqTargetHeight,
@@ -4035,14 +4134,15 @@ MainWindow::PlaybackPrepResult MainWindow::buildPlaybackPrepResult( const Playba
         }
         else if( zoomFitEnabled && playbackFastScalingActive )
         {
+            downscaleBranch = "fast";
             const int scaledWidth =
                 std::max( 1, qRound( sceneWidth * devicePixelRatio ) );
             const int scaledHeight =
                 std::max( 1, qRound( sceneHeight * devicePixelRatio ) );
             const int scaledBytesPerLine = ((scaledWidth * 3) + 3) & ~3;
             displayImage = build_fast_playback_scaled_image( rgb8DisplaySource,
-                                                             sourceWidth,
-                                                             sourceHeight,
+                                                             displaySourceWidth,
+                                                             displaySourceHeight,
                                                              scaledWidth,
                                                              scaledHeight,
                                                              displayImageBacking,
@@ -4051,9 +4151,10 @@ MainWindow::PlaybackPrepResult MainWindow::buildPlaybackPrepResult( const Playba
         }
         else if( zoomFitEnabled )
         {
+            downscaleBranch = "qt_scaled";
             displayImage = playbackWrapRgb8Image( const_cast<uint8_t *>( rgb8DisplaySource ),
-                                                  sourceWidth,
-                                                  sourceHeight )
+                                                  displaySourceWidth,
+                                                  displaySourceHeight )
                                .scaled( sceneWidth * devicePixelRatio,
                                         sceneHeight * devicePixelRatio,
                                         Qt::IgnoreAspectRatio, mode);
@@ -4062,20 +4163,25 @@ MainWindow::PlaybackPrepResult MainWindow::buildPlaybackPrepResult( const Playba
         else if( stretchY == 1.0 && stretchX == 1.0 )
         {
             displayImage = playbackWrapRgb8Image( const_cast<uint8_t *>( rgb8DisplaySource ),
-                                                  sourceWidth,
-                                                  sourceHeight );
+                                                  displaySourceWidth,
+                                                  displaySourceHeight );
             displayImageOwnsData = false;
         }
         else if( mode == Qt::SmoothTransformation && betterResizerEnabled )
         {
-            avir_scale_thread_pool scaling_pool;
+            downscaleBranch = "stretch_avir";
+            const bool sharedPool = threadState && prepTier1;
+            std::unique_ptr<avir_scale_thread_pool> frameScalingPool;
+            if( !sharedPool ) frameScalingPool.reset( new avir_scale_thread_pool() );
+            avir_scale_thread_pool &scaling_pool =
+                sharedPool ? threadState->scalingPool() : *frameScalingPool;
             avir::CImageResizerParamsUltra roptions;
             avir::CImageResizer<> image_resizer( 8, 0, roptions );
             displayImageBacking.resize( static_cast<size_t>(sceneWidth) * static_cast<size_t>(sceneHeight) * 3u );
             avir::CImageResizerVars vars; vars.ThreadPool = &scaling_pool;
             image_resizer.resizeImage( rgb8DisplaySource,
-                                       sourceWidth,
-                                       sourceHeight, 0,
+                                       displaySourceWidth,
+                                       displaySourceHeight, 0,
                                        displayImageBacking.data(),
                                        sceneWidth,
                                        sceneHeight,
@@ -4088,16 +4194,19 @@ MainWindow::PlaybackPrepResult MainWindow::buildPlaybackPrepResult( const Playba
         }
         else
         {
+            downscaleBranch = "qt_scaled";
             displayImage = playbackWrapRgb8Image( const_cast<uint8_t *>( rgb8DisplaySource ),
-                                                  sourceWidth,
-                                                  sourceHeight )
+                                                  displaySourceWidth,
+                                                  displaySourceHeight )
                                .scaled( sceneWidth,
                                         sceneHeight,
                                         Qt::IgnoreAspectRatio, mode);
             displayImageOwnsData = true;
         }
     }
+    const double downscaleMs = prepSpanMs( downscaleStartNs );
 
+    const qint64 postStartNs = prepSpanClock.nsecsElapsed();
     int suppressedTopMagentaBandRows = 0;
     if( playbackPolicyActive
      && !displayImage.isNull()
@@ -4116,7 +4225,7 @@ MainWindow::PlaybackPrepResult MainWindow::buildPlaybackPrepResult( const Playba
 
     if( useGpuImagePresentation && useGpuShaderZebras )
     {
-        underOver = scanZebrasRgb8( rgb8DisplaySource, sourceWidth, sourceHeight );
+        underOver = scanZebrasRgb8( rgb8DisplaySource, displaySourceWidth, displaySourceHeight );
     }
     else if( zebrasEnabled && !displayImage.isNull() && !displayImageOwnsData )
     {
@@ -4205,6 +4314,16 @@ MainWindow::PlaybackPrepResult MainWindow::buildPlaybackPrepResult( const Playba
             qimagePreparedBytes );
     }
     result.underOver = underOver;
+    {
+        const double postMs = prepSpanMs( postStartNs );
+        QJsonObject &spanTelemetry = result.task.readyFrame.stageTimingTelemetry;
+        spanTelemetry.insert( QStringLiteral("playback_prep_downscale_ms"), downscaleMs );
+        spanTelemetry.insert( QStringLiteral("playback_prep_downscale_branch"),
+                              QString::fromLatin1( downscaleBranch ) );
+        spanTelemetry.insert( QStringLiteral("playback_prep_post_ms"), postMs );
+        spanTelemetry.insert( QStringLiteral("playback_prep_span_build_ms"),
+                              prepSpanMs( 0 ) );
+    }
     result.imageBuildMs = (mlv_stage_timing_now() - image_start) * 1000.0;
 
     if( result.task.scopeSourceImage == nullptr )
@@ -4219,7 +4338,7 @@ MainWindow::PlaybackPrepResult MainWindow::buildPlaybackPrepResult( const Playba
         }
     }
     else if( result.task.scopeSourceImageSize !=
-             static_cast<size_t>(sourceWidth) * static_cast<size_t>(sourceHeight) * 3u )
+             static_cast<size_t>(displaySourceWidth) * static_cast<size_t>(displaySourceHeight) * 3u )
     {
         result.task.scopeSourceImage = nullptr;
         result.task.scopeSourceImageSize = 0;
@@ -4230,6 +4349,8 @@ MainWindow::PlaybackPrepResult MainWindow::buildPlaybackPrepResult( const Playba
 
 void MainWindow::playbackPrepThreadLoop( void )
 {
+    // Lives exactly as long as this thread: nothing else can reach it.
+    PlaybackPrepThreadState threadState;
     for( ;; )
     {
         PlaybackPrepTask task;
@@ -4269,7 +4390,7 @@ void MainWindow::playbackPrepThreadLoop( void )
             continue;
         }
 
-        PlaybackPrepResult result = buildPlaybackPrepResult( task );
+        PlaybackPrepResult result = buildPlaybackPrepResult( task, &threadState );
         result.workerQueueMs = task.workerQueueMs;
         result.workerTotalMs = ( mlv_stage_timing_now() - workerStart ) * 1000.0;
 
@@ -5935,9 +6056,13 @@ void MainWindow::presentPlaybackPreparedFrame( const PlaybackPrepResult &result 
         scopeSourceImage = result.scopeSourceImage.data();
         scopeSourceImageSize = result.scopeSourceImage.size();
     }
+    // The developed frame may be reduced (CPU route tier 2): scopes and the
+    // presented-colour analysis read it at its own dims, never the source's.
+    const int scopeSourceWidth = result.processedWidth > 0 ? result.processedWidth : sourceWidth;
+    const int scopeSourceHeight = result.processedHeight > 0 ? result.processedHeight : sourceHeight;
     const bool useScopeSourceImage =
         scopeSourceImage != nullptr
-        && scopeSourceImageSize >= static_cast<size_t>( sourceWidth ) * static_cast<size_t>( sourceHeight ) * 3u;
+        && scopeSourceImageSize >= static_cast<size_t>( scopeSourceWidth ) * static_cast<size_t>( scopeSourceHeight ) * 3u;
 
     readyFrame.stageTimingTelemetry.insert( QStringLiteral("prep_stale_drops"),
                                            static_cast<double>( m_playbackPrepStaleDropCount.load(
@@ -5974,7 +6099,9 @@ void MainWindow::presentPlaybackPreparedFrame( const PlaybackPrepResult &result 
                           releasePresentedFrameEarly,
                           prepRegionClock,
                           prepRegionStartNs,
-                          display_start );
+                          display_start,
+                          useScopeSourceImage ? scopeSourceWidth : 0,
+                          useScopeSourceImage ? scopeSourceHeight : 0 );
     m_frameStillDrawing = renderThreadBusyForPlaybackAdvance( currentPlaybackAdvanceTarget() );
 }
 
@@ -10667,6 +10794,7 @@ void MainWindow::playbackHandling(int timeDiff)
         // PLAYBACK-CUDA-NATIVE-PACE-1: no advance outruns the pace fps (native, or the explicit
         // fpsOverride), whichever path asked for it -- the 8 ms poll, or the CUDA early advance on present.
         const double paceNowMs = mlv_stage_timing_now() * 1000.0;
+        const bool paceGuardArmedBeforeTick = m_playbackPaceGuard.armed();   // slip_summary: a re-arm mid-session
 
         //when on last frame
         if( ui->horizontalSliderPosition->value() >= ui->spinBoxCutOut->value() - 1 )
@@ -10705,6 +10833,11 @@ void MainWindow::playbackHandling(int timeDiff)
                 m_playbackInternalSliderAdvance = true;
                 ui->horizontalSliderPosition->setValue( cutInFrame );
                 m_playbackInternalSliderAdvance = false;
+                if( m_playbackSmokeActive )
+                    m_playbackSlipHistogram.noteTimelineMove( playback_slip::AdvancePath::LoopWrap,
+                                                              ui->horizontalSliderPosition->value(), paceNowMs,
+                                                              1.0, m_playbackPaceGuard.creditFrames(),
+                                                              getFramerate(), !paceGuardArmedBeforeTick );
                 m_frameChanged = true;
                 if( ui->actionAudioOutput->isChecked()
                  || ( repairDisabled && ui->actionDropFrameMode->isChecked() ) )
@@ -10739,6 +10872,11 @@ void MainWindow::playbackHandling(int timeDiff)
                     ui->horizontalSliderPosition->setValue( ui->horizontalSliderPosition->value() + 1 );
                     m_playbackInternalSliderAdvance = false;
                     m_sourceAdvance.noteEngineTick( sourcePositionBeforeTick, ui->horizontalSliderPosition->value(), false );
+                    if( m_playbackSmokeActive )
+                        m_playbackSlipHistogram.noteTimelineMove( playback_slip::AdvancePath::WholeFrame,
+                                                                  ui->horizontalSliderPosition->value(), paceNowMs,
+                                                                  1.0, m_playbackPaceGuard.creditFrames(),
+                                                                  getFramerate(), !paceGuardArmedBeforeTick );
                     m_newPosDropMode = ui->horizontalSliderPosition->value(); //track it also, for mode changing
                     m_frameChanged = true;
                 }
@@ -10756,6 +10894,10 @@ void MainWindow::playbackHandling(int timeDiff)
                         m_playbackPaceGuard.grant( getFramerate() * (double)timeDiff / 1000.0, paceNowMs, getFramerate() ),
                         ui->spinBoxCutIn->value(), ui->spinBoxCutOut->value(),
                         ui->actionLoop->isChecked() );
+                // slip_summary: the granted share, read back from the tick (a wrap subtracted the cut range width;
+                // the clamp at the last frame without Loop reports what was actually advanced).
+                const double grantedDropFrames = dropFrameTick.position - sourcePositionBeforeDropTick
+                    + ( dropFrameTick.wrapped ? static_cast<double>( ui->spinBoxCutOut->value() - ui->spinBoxCutIn->value() ) : 0.0 );
                 m_newPosDropMode = dropFrameTick.position;
                 // PLAYBACK-CLIP-LENGTH-ENFORCE-3: the drop-frame engine's source-frame advance (dropped frames
                 // still advance the timeline; a wrap never counts).
@@ -10771,6 +10913,13 @@ void MainWindow::playbackHandling(int timeDiff)
                 ui->horizontalSliderPosition->blockSignals( true );
                 ui->horizontalSliderPosition->setValue( m_newPosDropMode );
                 ui->horizontalSliderPosition->blockSignals( false );
+                if( m_playbackSmokeActive )
+                    m_playbackSlipHistogram.noteTimelineMove(
+                        dropFrameTick.wrapped ? playback_slip::AdvancePath::LoopWrap
+                                              : playback_slip::AdvancePath::DropTick,
+                        ui->horizontalSliderPosition->value(), paceNowMs,
+                        grantedDropFrames, m_playbackPaceGuard.creditFrames(),
+                        getFramerate(), !paceGuardArmedBeforeTick );
                 m_frameChanged = true;
             }
         }
@@ -18968,6 +19117,14 @@ void MainWindow::on_horizontalSliderPosition_valueChanged(int position)
         invalidateGpuPreviewProcessingConfigCache();
     }
 
+    // PLAYBACK-BACHELOR-PRESENT-JITTER-1: a slider move while playing that no engine path made (playbackHandling
+    // marks its own whole-frame and wrap moves internal, and blocks signals for the drop-frame tick).
+    if( m_playbackSmokeActive && ui->actionPlay->isChecked() && !m_playbackInternalSliderAdvance )
+    {
+        m_playbackSlipHistogram.noteTimelineMove( playback_slip::AdvancePath::Other, position,
+                                                  mlv_stage_timing_now() * 1000.0 );
+    }
+
     //Enable jumping while drop frame mode playback is active
     if( ui->actionPlay->isChecked() && ui->actionDropFrameMode->isChecked() )
     {
@@ -23956,6 +24113,8 @@ void MainWindow::beginPlaybackSmokeTelemetry( void )
     m_playbackSmokeStartAudioSyncApplied = m_playbackAudioSyncAppliedCount;
     m_playbackSmokeStartAudioSyncSkipped = m_playbackAudioSyncSkippedCount;
     m_playbackSmokeStartTime = mlv_stage_timing_now();
+    m_playbackSlipHistogram.reset( m_playbackSmokeStartPosition, getFramerate() );
+    m_playbackSlipHistogram.setPlayStart( m_playbackSmokeStartTime * 1000.0 );
     m_playbackSmokeLastPresentedTime = 0.0;
     m_playbackSmokeFirstPresentMs = 0.0;
     m_playbackSmokeFirstPresentTimelineDeltaAbs = 0;
@@ -24125,6 +24284,7 @@ void MainWindow::beginPlaybackSmokeTelemetry( void )
     m_playbackSmokePrepPreEnqueueSumMs = 0.0;
     m_playbackSmokePrepWorkerQueueSumMs = 0.0;
     m_playbackSmokePrepWorkerBuildSumMs = 0.0;
+    m_playbackSmokePrepSpans = PlaybackSmokePrepSpanTotals();
     m_playbackSmokePrepWorkerTotalSumMs = 0.0;
     m_playbackSmokePrepResultQueueSumMs = 0.0;
     m_playbackSmokePrepTotalBeforeFinishSumMs = 0.0;
@@ -24171,6 +24331,18 @@ void MainWindow::beginPlaybackSmokeTelemetry( void )
     m_playbackSmokeGpuDualIsoFullReconFrames = 0;
     m_playbackSmokeGpuDualIsoReconScaleLast = 0;
     m_playbackSmokeGpuDualIsoReconFallbackReasonLast.clear();
+    m_playbackSmokeDebayered16ReconConsumedFrames = 0;
+    m_playbackSmokeDebayered16OwnReconFrames = 0;
+    m_playbackSmokeDebayered16ReconFallbackReasonLast.clear();
+    m_playbackSmokeDebayered16WorkerLlrawprocSumMs = 0.0;
+    m_playbackSmokeDebayered16RenderLlrawprocSumMs = 0.0;
+    m_playbackSmokeDebayered16OutcomeFrames.clear();
+    for( size_t i = 0; i < m_playbackSmokeDebayered16AttemptsAtBegin.size(); ++i )
+    {
+        m_playbackSmokeDebayered16AttemptsAtBegin[i] = m_pRenderThread
+            ? m_pRenderThread->debayered16ReconReuseCounters().count( static_cast<Debayered16ReconRefusal>( i ) )
+            : 0;
+    }
     m_playbackSmokeProcessed8PrefetchHits = 0;
     m_playbackSmokeRawPrefetchHits = 0;
     m_playbackSmokeQueuedPlaybackDropSum = 0;
@@ -24672,6 +24844,23 @@ void MainWindow::notePlaybackSmokePresentedFrame(
     const double presentIntervalMinusRenderTotalMs =
         qMax( 0.0, intervalMs - renderTotalMs );
     const double presentUiSignalLatencyMs = m_lastDrawFrameReadyQueueMs;
+    // PLAYBACK-BACHELOR-PRESENT-JITTER-1: the one slip-histogram call per present (summary only, no per-frame log).
+    {
+        playback_slip::PresentSample slipSample;
+        slipSample.displayFrame = static_cast<int>( displayFrame );
+        slipSample.presentMs = now * 1000.0;
+        slipSample.readyKnown = readyFrame.frameReadyEmitStageTime > 0.0;
+        slipSample.readyMs = readyFrame.frameReadyEmitStageTime * 1000.0;
+        slipSample.decodeMs = rawUint16Ms;
+        slipSample.reconMs = llrawprocTotalMs;
+        slipSample.renderMs = renderWorkMs;
+        slipSample.queueMs = queueWaitMs;
+        slipSample.drawMs = drawTotalMs;
+        slipSample.uiLatencyMs = presentUiSignalLatencyMs;
+        slipSample.timelinePosition = ui->horizontalSliderPosition->value();
+        slipSample.lookaheadCovered = requestContext.playbackLookaheadDepth > 0;
+        m_playbackSlipHistogram.notePresent( slipSample );
+    }
     const double presentDrawPresentMs = drawImageMs + drawPresentMs;
     const double presentOverlaysScopesMs = drawScopesMs + drawOverlayMs;
     const double presentRenderSlotReleaseMs = drawAdvanceMs;
@@ -25170,6 +25359,38 @@ void MainWindow::notePlaybackSmokePresentedFrame(
     m_playbackSmokePrepPreEnqueueSumMs += prepPreEnqueueMs;
     m_playbackSmokePrepWorkerQueueSumMs += prepWorkerQueueMs;
     m_playbackSmokePrepWorkerBuildSumMs += prepWorkerBuildMs;
+    {
+        PlaybackSmokePrepSpanTotals &spans = m_playbackSmokePrepSpans;
+        spans.allocMs += telemetryDoubleValue( timing, "playback_prep_alloc_ms" );
+        spans.reduceMs += telemetryDoubleValue( timing, "playback_prep_reduce_ms" );
+        spans.shExpandMs += telemetryDoubleValue( timing, "playback_prep_sh_expand_ms" );
+        spans.pointwiseMs += telemetryDoubleValue( timing, "playback_prep_pointwise_ms" );
+        spans.chromaMs += telemetryDoubleValue( timing, "playback_prep_chroma_ms" );
+        spans.sharpenMs += telemetryDoubleValue( timing, "playback_prep_sharpen_ms" );
+        spans.medianMs += telemetryDoubleValue( timing, "playback_prep_median_ms" );
+        spans.rgb16to8Ms += telemetryDoubleValue( timing, "playback_prep_rgb16to8_ms" );
+        spans.downscaleMs += telemetryDoubleValue( timing, "playback_prep_downscale_ms" );
+        spans.postMs += telemetryDoubleValue( timing, "playback_prep_post_ms" );
+        spans.spanBuildMs += telemetryDoubleValue( timing, "playback_prep_span_build_ms" );
+        if( timing.contains( QStringLiteral("playback_prep_downscale_branch") ) )
+        {
+            spans.downscaleBranchLast =
+                telemetryStringValue( timing, "playback_prep_downscale_branch" );
+            ++spans.downscaleBranchCounts[spans.downscaleBranchLast];
+        }
+        if( telemetryBoolValue( timing, "playback_prep_cpu_route_active" ) )
+        {
+            ++spans.cpuRouteFrames;
+            if( telemetryBoolValue( timing, "playback_prep_fused8" ) ) ++spans.fused8Frames;
+            spans.stageMaskLast = static_cast<qint64>(
+                telemetryDoubleValue( timing, "playback_prep_stage_mask" ) );
+            spans.reducedFactorLast = telemetryIntValue( timing, "playback_prep_reduced_factor" );
+            if( spans.reducedFactorLast > 1 ) ++spans.reducedFrames;
+            spans.refusalLast =
+                telemetryStringValue( timing, "playback_prep_reduced_refusal_reason" );
+            ++spans.refusalCounts[spans.refusalLast];
+        }
+    }
     m_playbackSmokePrepWorkerTotalSumMs += prepWorkerTotalMs;
     m_playbackSmokePrepResultQueueSumMs += prepResultQueueMs;
     m_playbackSmokePrepTotalBeforeFinishSumMs += prepTotalBeforeFinishMs;
@@ -25221,6 +25442,25 @@ void MainWindow::notePlaybackSmokePresentedFrame(
                     ? telemetryStringValue( timing, "gpu_dualiso_recon_fallback_reason" )
                     : QStringLiteral("frame not presented as a reduced recon texture");
         }
+    }
+    if( timing.contains( QStringLiteral("debayered16_phase3_recon_consumed") ) )
+    {
+        if( telemetryBoolValue( timing, "debayered16_phase3_recon_consumed" ) )
+        {
+            ++m_playbackSmokeDebayered16ReconConsumedFrames;
+        }
+        else
+        {
+            ++m_playbackSmokeDebayered16OwnReconFrames;
+            m_playbackSmokeDebayered16ReconFallbackReasonLast =
+                telemetryStringValue( timing, "debayered16_phase3_recon_fallback_reason" );
+        }
+        ++m_playbackSmokeDebayered16OutcomeFrames[
+            telemetryStringValue( timing, "debayered16_phase3_recon_outcome" )];
+        m_playbackSmokeDebayered16WorkerLlrawprocSumMs +=
+            telemetryDoubleValue( timing, "debayered16_recon_worker_llrawproc_total_ms" );
+        m_playbackSmokeDebayered16RenderLlrawprocSumMs +=
+            telemetryDoubleValue( timing, "llrawproc_total_ms" );
     }
     if( borrowedPreparedRgb8Bytes > 0.0 )
     {
@@ -26641,6 +26881,7 @@ void MainWindow::noteContactSheetPresentedFrame(
     }
 
     const double grabMs = static_cast<double>( grabTimer.nsecsElapsed() ) / 1000000.0;
+    m_playbackSlipHistogram.noteGrab( grabMs );   // slip_summary: this grab lands in the next present's interval
     const bool frameOk = !gpuWindowGrabFailedClosed
         && !contactFrameImage.isNull();
 
@@ -26977,6 +27218,14 @@ void MainWindow::finishPlaybackSmokeTelemetry( const char *reason )
                // ENFORCE-4 r2: binds this receipt to the invocation that wrote it (see automationRunNonce()).
                .arg( automationRunNonce() );
 
+    // PLAYBACK-BACHELOR-PRESENT-JITTER-1: the slip summary is taken here, before pace_summary, because the wait for the
+    // first frame is mostly repaid AFTER the first present: no grant runs while the render thread is busy, so the
+    // guard banks the wait and a later unshaped tick spends it in one burst (Bachelor x4: 23-28 frames about a
+    // second in). Sampling the catch-up at the first present alone left that burst in the paced timeline rate
+    // (timeline_fps_after_first_present 25.0-25.3 at pace 23.976). The delayed part joins the catch-up here.
+    const playback_slip::Summary slipSummary = m_playbackSlipHistogram.finish( now * 1000.0, currentPosition );
+    m_playbackSmokeFirstPresentTimelineDeltaAbs += slipSummary.startupCatchupAfterFirstFrames;
+
     // PLAYBACK-PACE-GUARD-THROUGHPUT-1: timeline_fps above counts the wait for the first frame as playback, so a
     // slow first present (UM r5: 3753 ms) reads as a pace below native. These are the rates the pace governs: frames
     // and time both start at the first present, so what the first present's own advance repaid for the wait
@@ -27044,6 +27293,119 @@ void MainWindow::finishPlaybackSmokeTelemetry( const char *reason )
                    .arg( overlap.decodeBusyMs, 0, 'f', 3 )
                    .arg( overlap.reconBusyMs, 0, 'f', 3 )
                    .arg( static_cast<qulonglong>( overlap.reconStartsHeldForRender ) );
+    }
+
+    // PLAYBACK-BACHELOR-PRESENT-JITTER-1: where the lost frames went (PlaybackSlipHistogram.h). Slips and class
+    // counts are in frames; slips_per_1000 is per timeline frame after the first present. timeline_advance_by_path
+    // splits the session's timeline delta by the engine path that made it (other = any slider move no engine path
+    // made, plus whatever the paths do not explain), against what the pace guard granted.
+    {
+        using namespace playback_slip;
+        const Summary &slip = slipSummary;
+        const auto joined = []( const auto &values ) -> QString
+        {
+            QStringList parts;
+            for( const auto v : values ) parts << QString::number( static_cast<qlonglong>( v ) );
+            return parts.join( QLatin1Char('/') );
+        };
+        const auto clsFrames = [&slip]( SlipClass c ) -> qlonglong
+        {
+            return static_cast<qlonglong>( slip.classFrames[static_cast<int>( c )] );
+        };
+        const auto stageFrames = [&slip]( UpstreamStage s ) -> qlonglong
+        {
+            return static_cast<qlonglong>( slip.upstreamStageFrames[static_cast<int>( s )] );
+        };
+        const auto pathFrames = [&slip]( AdvancePath p ) -> qlonglong
+        {
+            return static_cast<qlonglong>( slip.advanceByPath[static_cast<int>( p )] );
+        };
+        const QString session = QString::number( static_cast<qulonglong>( m_playbackSmokeSessionId ) );
+        QStringList fields;
+        fields << QStringLiteral("playback_smoke.slip_summary session=%1").arg( session )
+               << QStringLiteral("presents=%1").arg( slip.presents )
+               << QStringLiteral("slips_total=%1").arg( static_cast<qlonglong>( slip.slipsTotal ) )
+               << QStringLiteral("slips_per_1000=%1").arg( slip.slipsPer1000, 0, 'f', 3 )
+               << QStringLiteral("max_slip=%1").arg( slip.maxSlip )
+               << QStringLiteral("max_interval_ms=%1").arg( slip.maxIntervalMs, 0, 'f', 3 )
+               << QStringLiteral("max_interval_frame=%1").arg( slip.maxIntervalFrame )
+               << QStringLiteral("startup_catchup_frames=%1").arg( slip.startupCatchupFrames )
+               << QStringLiteral("timeline_after_first=%1").arg( slip.timelineAfterFirstFps, 0, 'f', 3 )
+               << QStringLiteral("presented_after_first=%1").arg( slip.presentedAfterFirstFps, 0, 'f', 3 )
+               << QStringLiteral("native_equiv_presented_fps=%1").arg( slip.nativeEquivPresentedFps, 0, 'f', 3 )
+               << QStringLiteral("hist_slip=%1").arg( joined( slip.histSlip ) )
+               << QStringLiteral("hist_interval=%1").arg( joined( slip.histInterval ) )
+               << QStringLiteral("cls_capture=%1").arg( clsFrames( SlipClass::Capture ) )
+               << QStringLiteral("cls_gap=%1").arg( clsFrames( SlipClass::Gap ) )
+               << QStringLiteral("cls_gui_late=%1").arg( clsFrames( SlipClass::GuiLate ) )
+               << QStringLiteral("cls_upstream_late=%1(decode:%2/recon:%3/render:%4/queue:%5/none:%6)")
+                      .arg( clsFrames( SlipClass::UpstreamLate ) )
+                      .arg( stageFrames( UpstreamStage::Decode ) )
+                      .arg( stageFrames( UpstreamStage::Recon ) )
+                      .arg( stageFrames( UpstreamStage::Render ) )
+                      .arg( stageFrames( UpstreamStage::Queue ) )
+                      .arg( stageFrames( UpstreamStage::None ) )
+               << QStringLiteral("cls_clock=%1").arg( clsFrames( SlipClass::Clock ) )
+               << QStringLiteral("grab_ms_total=%1").arg( slip.grabMsTotal, 0, 'f', 3 )
+               << QStringLiteral("pace_guard_granted_frames=%1").arg( slip.paceGuardGrantedFrames, 0, 'f', 3 )
+               << QStringLiteral("timeline_advance_by_path=drop_tick:%1/whole_frame:%2/loop_wrap:%3/other:%4")
+                      .arg( pathFrames( AdvancePath::DropTick ) )
+                      .arg( pathFrames( AdvancePath::WholeFrame ) )
+                      .arg( pathFrames( AdvancePath::LoopWrap ) )
+                      .arg( pathFrames( AdvancePath::Other ) )
+               << QStringLiteral("timeline_delta_at_first_present=%1").arg( slip.timelineDeltaAtFirstPresent )
+               // Beyond the card's field list: what the counts above need to add up and to be read.
+               << QStringLiteral("cls_other=%1").arg( clsFrames( SlipClass::Other ) )
+               << QStringLiteral("slip_events=%1").arg( slip.slipEvents )
+               << QStringLiteral("non_capture_per_1000=%1").arg( slip.nonCapturePer1000, 0, 'f', 3 )
+               << QStringLiteral("non_capture_non_gap_per_1000=%1").arg( slip.nonCaptureNonGapPer1000, 0, 'f', 3 )
+               << QStringLiteral("max_interval_class=%1").arg( QLatin1String( slipClassName( slip.maxIntervalClass ) ) )
+               << QStringLiteral("timeline_frames_after_first=%1").arg( slip.timelineFramesAfterFirst )
+               << QStringLiteral("pace_guard_granted_after_first=%1").arg( slip.paceGuardGrantedAfterFirstFrames, 0, 'f', 3 )
+               << QStringLiteral("pace_guard_max_lead_frames=%1").arg( slip.paceGuardMaxLeadFrames, 0, 'f', 3 )
+               << QStringLiteral("pace_guard_max_lead_ms=%1").arg( slip.paceGuardMaxLeadMs, 0, 'f', 1 )
+               << QStringLiteral("pace_guard_rearms=%1").arg( slip.paceGuardRearms )
+               << QStringLiteral("pace_guard_fps=%1/%2").arg( slip.paceGuardFpsMin, 0, 'f', 3 ).arg( slip.paceGuardFpsMax, 0, 'f', 3 )
+               << QStringLiteral("pace_guard_max_grant_frames=%1").arg( slip.paceGuardMaxGrantFrames, 0, 'f', 3 )
+               << QStringLiteral("pace_guard_bursts=%1").arg( slip.paceGuardBursts )
+               << QStringLiteral("pace_guard_burst_frames=%1").arg( slip.paceGuardBurstFrames, 0, 'f', 3 )
+               << QStringLiteral("startup_wait_credit_frames=%1").arg( slip.startupWaitCreditFrames )
+               << QStringLiteral("startup_catchup_after_first=%1").arg( slip.startupCatchupAfterFirstFrames )
+               << QStringLiteral("timeline_after_first_raw=%1").arg( slip.timelineAfterFirstRawFps, 0, 'f', 3 )
+               << QStringLiteral("slips_after_gap=%1").arg( static_cast<qlonglong>( slip.slipsAfterGap ) )
+               << QStringLiteral("slip_events_after_gap=%1").arg( slip.slipEventsAfterGap )
+               << QStringLiteral("wraps=%1").arg( slip.wraps )
+               << QStringLiteral("repeats=%1").arg( slip.repeats )
+               << QStringLiteral("grabs=%1").arg( slip.grabs )
+               << QStringLiteral("lookahead_uncovered_slip_events=%1").arg( slip.lookaheadUncoveredSlipEvents );
+        qInfo().noquote() << fields.join( QLatin1Char(' ') );
+        for( const SlipRecord &r : slip.slipLines )
+        {
+            qInfo().noquote()
+                << QStringLiteral(
+                       "playback_smoke.slip session=%1 frame=%2 size=%3 interval_ms=%4 class=%5 sub=%6 "
+                       "decode_ms=%7 recon_ms=%8 render_ms=%9 queue_ms=%10 draw_ms=%11 ui_latency_ms=%12 "
+                       "grab_ms=%13 covered=%14 credit=%15 ready_minus_deadline_ms=%16 timeline_advanced=%17 "
+                       "after_gap=%18" )
+                       .arg( session )
+                       .arg( r.frame )
+                       .arg( r.size )
+                       .arg( r.intervalMs, 0, 'f', 3 )
+                       .arg( QLatin1String( slipClassName( r.cls ) ) )
+                       .arg( QLatin1String( upstreamStageName( r.sub ) ) )
+                       .arg( r.decodeMs, 0, 'f', 3 )
+                       .arg( r.reconMs, 0, 'f', 3 )
+                       .arg( r.renderMs, 0, 'f', 3 )
+                       .arg( r.queueMs, 0, 'f', 3 )
+                       .arg( r.drawMs, 0, 'f', 3 )
+                       .arg( r.uiLatencyMs, 0, 'f', 3 )
+                       .arg( r.grabMs, 0, 'f', 3 )
+                       .arg( bool01( r.lookaheadCovered ) )
+                       .arg( r.paceCreditFrames, 0, 'f', 3 )
+                       .arg( ( r.readyKnown && r.deadlineKnown ) ? r.readyMs - r.deadlineMs : 0.0, 0, 'f', 3 )
+                       .arg( r.timelineAdvancedInInterval )
+                       .arg( bool01( r.afterGap ) );
+        }
     }
 
     if( perfFieldLogEnabled() )
@@ -27506,6 +27868,133 @@ void MainWindow::finishPlaybackSmokeTelemetry( const char *reason )
                .arg( m_playbackSmokePresentIntervalOverBudget[1] )
                .arg( m_playbackSmokePresentIntervalOverBudget[2] )
                .arg( m_playbackSmokePresentIntervalOverBudget[3] );
+
+    /* CPU-PLAYBACK-PREP-WORKER-BUILD-1: where playback_prep_worker_build_ms goes.
+     * Its own line (the playback_smoke.summary format string is not touched);
+     * span_coverage = sum of the span averages / avg build. Values carry no
+     * spaces so the dual-venue key=value parser reads every field. */
+    {
+        const PlaybackSmokePrepSpanTotals &spans = m_playbackSmokePrepSpans;
+        const double spanSum = spans.allocMs + spans.reduceMs + spans.shExpandMs
+            + spans.pointwiseMs + spans.chromaMs + spans.sharpenMs + spans.medianMs
+            + spans.rgb16to8Ms + spans.downscaleMs + spans.postMs;
+        const double spanCoverage = m_playbackSmokePrepWorkerBuildSumMs > 0.0
+            ? spanSum / m_playbackSmokePrepWorkerBuildSumMs : 0.0;
+        const auto joinCounts = []( const QMap<QString, quint64> &counts )
+        {
+            QStringList parts;
+            for( auto it = counts.constBegin(); it != counts.constEnd(); ++it )
+                parts << QStringLiteral("%1:%2").arg( it.key().isEmpty() ? QStringLiteral("unset") : it.key() )
+                                                .arg( it.value() );
+            return parts.isEmpty() ? QStringLiteral("none") : parts.join( QLatin1Char(',') );
+        };
+        qInfo().noquote()
+            << QStringLiteral(
+                   "playback_smoke.prep_summary session=%1 frames=%2 cpu_route_frames=%3 "
+                   "avg_playback_prep_worker_build_ms=%4 avg_playback_prep_alloc_ms=%5 "
+                   "avg_playback_prep_reduce_ms=%6 avg_playback_prep_sh_expand_ms=%7 "
+                   "avg_playback_prep_pointwise_ms=%8 avg_playback_prep_chroma_ms=%9 "
+                   "avg_playback_prep_sharpen_ms=%10 avg_playback_prep_median_ms=%11 "
+                   "avg_playback_prep_rgb16to8_ms=%12 avg_playback_prep_downscale_ms=%13 "
+                   "avg_playback_prep_post_ms=%14 avg_playback_prep_span_build_ms=%15 "
+                   "span_coverage=%16 fused8_frames=%17 reduced_frames=%18 "
+                   "playback_prep_reduced_factor=%19 playback_prep_reduced_refusal_reason=%20 "
+                   "refusal_counts=%21 playback_prep_downscale_branch=%22 downscale_branch_counts=%23 "
+                   "playback_prep_stage_mask=%24" )
+                   .arg( static_cast<qulonglong>( m_playbackSmokeSessionId ) )
+                   .arg( m_playbackSmokePresentedFrames )
+                   .arg( spans.cpuRouteFrames )
+                   .arg( avgSmokeMs( m_playbackSmokePrepWorkerBuildSumMs ), 0, 'f', 3 )
+                   .arg( avgSmokeMs( spans.allocMs ), 0, 'f', 3 )
+                   .arg( avgSmokeMs( spans.reduceMs ), 0, 'f', 3 )
+                   .arg( avgSmokeMs( spans.shExpandMs ), 0, 'f', 3 )
+                   .arg( avgSmokeMs( spans.pointwiseMs ), 0, 'f', 3 )
+                   .arg( avgSmokeMs( spans.chromaMs ), 0, 'f', 3 )
+                   .arg( avgSmokeMs( spans.sharpenMs ), 0, 'f', 3 )
+                   .arg( avgSmokeMs( spans.medianMs ), 0, 'f', 3 )
+                   .arg( avgSmokeMs( spans.rgb16to8Ms ), 0, 'f', 3 )
+                   .arg( avgSmokeMs( spans.downscaleMs ), 0, 'f', 3 )
+                   .arg( avgSmokeMs( spans.postMs ), 0, 'f', 3 )
+                   .arg( avgSmokeMs( spans.spanBuildMs ), 0, 'f', 3 )
+                   .arg( spanCoverage, 0, 'f', 3 )
+                   .arg( spans.fused8Frames )
+                   .arg( spans.reducedFrames )
+                   .arg( spans.reducedFactorLast )
+                   .arg( spans.refusalLast.isEmpty() ? QStringLiteral("unset") : spans.refusalLast )
+                   .arg( joinCounts( spans.refusalCounts ) )
+                   .arg( spans.downscaleBranchLast.isEmpty() ? QStringLiteral("unset") : spans.downscaleBranchLast )
+                   .arg( joinCounts( spans.downscaleBranchCounts ) )
+                   .arg( spans.stageMaskLast );
+    }
+
+    /* CPU-DEBAYERED16-REUSE-PHASE3-RECON-1: debayered-16 frames whose render
+     * consumed the phase-3 recon (one recon per frame) versus ran its own decode
+     * + recon (two), and both threads' llrawproc ms per such frame. */
+    {
+        const int debayered16Frames =
+            m_playbackSmokeDebayered16ReconConsumedFrames + m_playbackSmokeDebayered16OwnReconFrames;
+        const auto perDebayered16Frame = [debayered16Frames]( double sumMs ) {
+            return debayered16Frames > 0 ? sumMs / debayered16Frames : 0.0;
+        };
+        const auto presentedOutcome = [this]( Debayered16ReconRefusal outcome ) {
+            return m_playbackSmokeDebayered16OutcomeFrames.value(
+                QString::fromLatin1( debayered16ReconRefusalName( outcome ) ), 0 );
+        };
+        qInfo().noquote()
+            << QStringLiteral(
+                   "playback_smoke.debayered16_recon_reuse_summary session=%1 "
+                   "scope=presented_frames "
+                   "debayered16_recon_consumed_frames=%2 debayered16_own_recon_frames=%3 "
+                   "avg_recon_worker_llrawproc_ms=%4 avg_render_llrawproc_ms=%5 "
+                   "debayered16_fallback_reason_last=\"%6\" "
+                   "refused_acquisition_failed=%7 refused_gpu_playback_recon=%8 "
+                   "refused_settings_changed_during_recon=%9 "
+                   "refused_settings_changed_since_recon=%10" )
+                   .arg( static_cast<qulonglong>( m_playbackSmokeSessionId ) )
+                   .arg( m_playbackSmokeDebayered16ReconConsumedFrames )
+                   .arg( m_playbackSmokeDebayered16OwnReconFrames )
+                   .arg( perDebayered16Frame( m_playbackSmokeDebayered16WorkerLlrawprocSumMs ), 0, 'f', 3 )
+                   .arg( perDebayered16Frame( m_playbackSmokeDebayered16RenderLlrawprocSumMs ), 0, 'f', 3 )
+                   .arg( m_playbackSmokeDebayered16ReconFallbackReasonLast )
+                   .arg( presentedOutcome( Debayered16ReconRefusal::AcquisitionFailed ) )
+                   .arg( presentedOutcome( Debayered16ReconRefusal::GpuPlaybackRecon ) )
+                   .arg( presentedOutcome( Debayered16ReconRefusal::SettingsChangedDuringRecon ) )
+                   .arg( presentedOutcome( Debayered16ReconRefusal::SettingsChangedSinceRecon ) );
+
+        /* Every render attempt in the session, presented or not (Sol H3): the
+         * render thread's counters minus their value at session begin. */
+        if( m_pRenderThread )
+        {
+            const Debayered16ReconReuseCounters &counters =
+                m_pRenderThread->debayered16ReconReuseCounters();
+            qulonglong attemptsConsumed = 0;
+            qulonglong attemptsOwnRecon = 0;
+            QString byOutcome;
+            for( size_t i = 0; i < m_playbackSmokeDebayered16AttemptsAtBegin.size(); ++i )
+            {
+                const Debayered16ReconRefusal outcome = static_cast<Debayered16ReconRefusal>( i );
+                const qulonglong attempts = static_cast<qulonglong>(
+                    counters.count( outcome ) - m_playbackSmokeDebayered16AttemptsAtBegin[i] );
+                if( outcome == Debayered16ReconRefusal::None ) attemptsConsumed = attempts;
+                else attemptsOwnRecon += attempts;
+                byOutcome += QStringLiteral(" attempts_%1=%2")
+                                 .arg( QString::fromLatin1( debayered16ReconRefusalName( outcome ) ) )
+                                 .arg( attempts );
+            }
+            const qlonglong presented =
+                m_playbackSmokeDebayered16ReconConsumedFrames + m_playbackSmokeDebayered16OwnReconFrames;
+            qInfo().noquote()
+                << QStringLiteral(
+                       "playback_smoke.debayered16_recon_reuse_attempts session=%1 "
+                       "scope=render_attempts attempts_total=%2 attempts_own_recon_total=%3 "
+                       "attempts_minus_presented=%4%5" )
+                       .arg( static_cast<qulonglong>( m_playbackSmokeSessionId ) )
+                       .arg( attemptsConsumed + attemptsOwnRecon )
+                       .arg( attemptsOwnRecon )
+                       .arg( static_cast<qlonglong>( attemptsConsumed + attemptsOwnRecon ) - presented )
+                       .arg( byOutcome );
+        }
+    }
 
     qInfo().noquote()
         << QStringLiteral(
@@ -29317,8 +29806,14 @@ void MainWindow::finishPresentedFrame( uint64_t displayFrame,
                                        bool releasePresentedFrameEarly,
                                        QElapsedTimer &prepRegionClock,
                                        qint64 prepRegionStartNs,
-                                       double displayStart )
+                                       double displayStart,
+                                       int rgb8DisplaySourceWidth,
+                                       int rgb8DisplaySourceHeight )
 {
+    const int displaySourceWidth = rgb8DisplaySourceWidth > 0
+        ? rgb8DisplaySourceWidth : readyFrame.renderedImageWidth;
+    const int displaySourceHeight = rgb8DisplaySourceHeight > 0
+        ? rgb8DisplaySourceHeight : readyFrame.renderedImageHeight;
     const qint64 prepRegionFinishStartNs = prepRegionClock.nsecsElapsed();
     if( dualIsoWarmupInstrumentationEnabled() )
     {
@@ -29367,14 +29862,14 @@ void MainWindow::finishPresentedFrame( uint64_t displayFrame,
     double headlessPresentedColorAnalysisMs = 0.0;
     if( m_headlessPlaybackProfileActive
      && rgb8DisplaySource
-     && readyFrame.renderedImageWidth > 0
-     && readyFrame.renderedImageHeight > 0 )
+     && displaySourceWidth > 0
+     && displaySourceHeight > 0 )
     {
         const double colorAnalysisStart = mlv_stage_timing_now();
         const LookAssistStats frameStats =
             analyzeLookAssistThumbnail( rgb8DisplaySource,
-                                        readyFrame.renderedImageWidth,
-                                        readyFrame.renderedImageHeight );
+                                        displaySourceWidth,
+                                        displaySourceHeight );
         headlessPresentedColorAnalysisMs =
             ( mlv_stage_timing_now() - colorAnalysisStart ) * 1000.0;
         const double visibleGreenAxis =
@@ -29446,8 +29941,8 @@ void MainWindow::finishPresentedFrame( uint64_t displayFrame,
             if( ui->actionShowHistogram->isChecked() )
             {
                 ui->labelScope->setScope( const_cast<uint8_t *>( rgb8DisplaySource ),
-                                          readyFrame.renderedImageWidth,
-                                          readyFrame.renderedImageHeight,
+                                          displaySourceWidth,
+                                          displaySourceHeight,
                                           under,
                                           over,
                                           ScopesLabel::ScopeHistogram );
@@ -29455,8 +29950,8 @@ void MainWindow::finishPresentedFrame( uint64_t displayFrame,
             else if( ui->actionShowWaveFormMonitor->isChecked() )
             {
                 ui->labelScope->setScope( const_cast<uint8_t *>( rgb8DisplaySource ),
-                                          readyFrame.renderedImageWidth,
-                                          readyFrame.renderedImageHeight,
+                                          displaySourceWidth,
+                                          displaySourceHeight,
                                           under,
                                           over,
                                           ScopesLabel::ScopeWaveForm );
@@ -29464,8 +29959,8 @@ void MainWindow::finishPresentedFrame( uint64_t displayFrame,
             else if( ui->actionShowParade->isChecked() )
             {
                 ui->labelScope->setScope( const_cast<uint8_t *>( rgb8DisplaySource ),
-                                          readyFrame.renderedImageWidth,
-                                          readyFrame.renderedImageHeight,
+                                          displaySourceWidth,
+                                          displaySourceHeight,
                                           under,
                                           over,
                                           ScopesLabel::ScopeRgbParade);
@@ -29473,8 +29968,8 @@ void MainWindow::finishPresentedFrame( uint64_t displayFrame,
             else if( ui->actionShowVectorScope->isChecked() )
             {
                 ui->labelScope->setScope( const_cast<uint8_t *>( rgb8DisplaySource ),
-                                          readyFrame.renderedImageWidth,
-                                          readyFrame.renderedImageHeight,
+                                          displaySourceWidth,
+                                          displaySourceHeight,
                                           under,
                                           over,
                                           ScopesLabel::ScopeVectorScope );
@@ -30632,6 +31127,8 @@ void MainWindow::drawFrameReady()
     task.sourceImage16Size = readyFrameRawImage16Bytes;
     task.sourceWidth = sourceWidth;
     task.sourceHeight = sourceHeight;
+    task.mlvWidth = m_pMlvObject ? getMlvWidth( m_pMlvObject ) : 0;
+    task.mlvHeight = m_pMlvObject ? getMlvHeight( m_pMlvObject ) : 0;
     task.sceneWidth = sceneWidth;
     task.sceneHeight = sceneHeight;
     task.transformationMode = transformationMode;
