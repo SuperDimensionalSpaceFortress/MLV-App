@@ -14,6 +14,7 @@ from __future__ import annotations
 import importlib.util
 import json
 import os
+import shutil
 import subprocess
 import sys
 import time
@@ -55,14 +56,16 @@ def init_bus(tmp_path: Path, crlf_target: str | None = None, name: str = "bus",
     clone = tmp_path / f"{name}-clone"
     subprocess.run(["git", "init", "--bare", "-b", "master", str(bare)], check=True, capture_output=True, text=True)
     subprocess.run(["git", "clone", str(bare), str(clone)], check=True, capture_output=True, text=True)
-    for target in ob.TARGETS:
+    # The root log files only: a project's cards file is created by its first card filing.
+    seeded = [t for t in ob.TARGETS if "/" not in t]
+    for target in seeded:
         content = f"# {target}\n\n"
         if target == "TRAPS.md" and traps is not None:
             content = traps
         if crlf_target == target:
             content = content.replace("\n", "\r\n")
         (clone / target).write_bytes(content.encode("utf-8"))
-    git(clone, "add", *ob.TARGETS)
+    git(clone, "add", *seeded)
     git(clone, "commit", "-m", "seed bus files")
     git(clone, "push", "origin", "HEAD:refs/heads/master")
     return bare, clone
@@ -1202,3 +1205,202 @@ def test_law4_refusal_does_not_echo_a_home_path_or_a_token():
         with pytest.raises(ob.Refusal) as excinfo:
             ob.screen_law4(body)
         assert leaked not in str(excinfo.value)
+
+
+# ---------- R14.1: a new trap filing is a card (bus RULINGS.md R14, packet 2 at 0c78890) ----------
+#
+# Named mutations for this block (each turns the named test red, then is reverted):
+#   M6  make card_validator_on_bus() always return False  -> test_r14_trap_to_traps_md_is_refused_once_the_bus_carries_the_validator
+#   M7  skip validate_cards_file() in drain                -> test_r14_card_the_validator_rejects_is_never_pushed
+
+CARDS = "specs/mlv-app/cards.md"
+FIXTURE_DIR = Path(__file__).resolve().parent / "fixtures" / "bus-validate-cards"
+CARD_BODY = ("## mlv-app/example-card\n"
+             "rule: the rule\n"
+             "mechanism: the mechanism\n"
+             "check: py -3 -m pytest tests/coordination -q\n"
+             "supersedes: none\n"
+             "evidence: measured\n")
+needs_node = pytest.mark.skipif(shutil.which("node") is None, reason="node is not on PATH")
+
+
+def add_validator(clone: Path) -> str:
+    """Land R14 packet 2 on the fixture bus: tools/validate-cards.mjs (a byte copy of the bus's own)
+    and a specs/mlv-app.md, so mlv-app is a fleet member on the validator's roster."""
+    git(clone, "fetch", "-q", "origin")
+    git(clone, "checkout", "-q", "--detach", "origin/master")
+    (clone / "tools").mkdir(exist_ok=True)
+    for name in ("validate-cards.mjs", "fleet-membership.mjs"):
+        shutil.copyfile(FIXTURE_DIR / name, clone / "tools" / name)
+    (clone / "specs").mkdir(exist_ok=True)
+    (clone / "specs" / "mlv-app.md").write_text("# mlv-app\n", encoding="utf-8")
+    git(clone, "add", "tools", "specs")
+    git(clone, "commit", "-m", "R14 packet 2: card validator")
+    git(clone, "push", "origin", "HEAD:refs/heads/master")
+    return git(clone, "rev-parse", "HEAD")
+
+
+def run_validator(checkout: Path) -> subprocess.CompletedProcess:
+    return subprocess.run(["node", str(checkout / "tools" / "validate-cards.mjs"), "--bus", str(checkout),
+                           "--file", str(checkout / CARDS), "--project", "mlv-app"],
+                          capture_output=True, text=True, timeout=60)
+
+
+def test_vendored_validator_is_byte_identical_to_the_bus_blobs():
+    assert git(REPO_ROOT, "hash-object", str(FIXTURE_DIR / "validate-cards.mjs")) == "14c50e976cab9eb8faa9ca7e65a9f9d7bbee0fd3"
+    assert git(REPO_ROOT, "hash-object", str(FIXTURE_DIR / "fleet-membership.mjs")) == "e325e616d2b0ddcb16da42a7fe2d1d1c6a9b8cf0"
+
+
+def test_r14_cards_target_is_the_projects_own_cards_file_and_takes_only_a_card():
+    assert ob.CARDS_TARGET == CARDS and CARDS in ob.TARGETS
+    item = ob.parse_item(item_text(target=CARDS, body=CARD_BODY))
+    assert ob.item_heading(item) == "## mlv-app/example-card"
+    with pytest.raises(ob.Refusal) as excinfo:
+        ob.parse_item(item_text(target=CARDS, body="### A TRAPS.md-style entry\nbody\n"))
+    assert excinfo.value.code == "ITEM_BODY_NOT_A_CARD"
+    with pytest.raises(ob.Refusal) as excinfo:
+        ob.parse_item(item_text(target=CARDS, body=CARD_BODY.replace("## mlv-app/", "## agent-bridge/")))
+    assert excinfo.value.code == "ITEM_BODY_NOT_A_CARD"
+
+
+def test_r14_trap_to_traps_md_is_refused_once_the_bus_carries_the_validator(tmp_path, capsys):
+    """M6. R14.1 took effect at the bus commit that landed tools/validate-cards.mjs: a new trap
+    filing to TRAPS.md is refused, by name, and nothing reaches the bus."""
+    bare, clone = init_bus(tmp_path)
+    add_validator(clone)
+    src = init_source(tmp_path)
+    add_item(src, "20261007-example.md")
+    ledger = tmp_path / "sent.jsonl"
+    before = git(bare, "rev-parse", "master")
+
+    report = ob.drain(src, clone, "HEAD", ledger, [], push=True)
+
+    assert [(r["path"], r["code"]) for r in report["refused"]] == [
+        ("doctrine-outbox/20261007-example.md", "R14_1_TRAP_FILING_IS_A_CARD")]
+    assert "R14.1" in report["refused"][0]["detail"] and CARDS in report["refused"][0]["detail"]
+    assert report["published"] == [] and report["pushed"] is False
+    assert git(bare, "rev-parse", "master") == before
+    assert not ledger.exists()
+
+    rc = ob.main(["--repo", str(src), "drain", "--bus", str(clone), "--ref", "HEAD", "--ledger", str(ledger), "--push"])
+    err = capsys.readouterr().err
+    assert rc == 1
+    assert "R14_1_TRAP_FILING_IS_A_CARD" in err and "R14.1" in err
+    assert git(bare, "rev-parse", "master") == before
+
+
+def test_r14_guard_is_keyed_on_the_bus_ref_not_the_clock(tmp_path):
+    """The same kind of item, at the same wall-clock time: published to TRAPS.md while the bus
+    ref lacks the validator (today's behaviour), refused once the bus ref carries it. An entry
+    already on the bus stays already-sent, never refused, even with a lost ledger."""
+    bare, clone = init_bus(tmp_path)
+    src = init_source(tmp_path)
+    add_item(src, "20261007-before.md", body="### Before the validator\nbody one\n")
+
+    first = ob.drain(src, clone, "HEAD", tmp_path / "sent.jsonl", [], push=True)
+    assert first["refused"] == []
+    assert [p["target"] for p in first["published"]] == ["TRAPS.md"]
+
+    add_validator(clone)
+    add_item(src, "20261007-after.md", body="### After the validator\nbody two\n")
+    second = ob.drain(src, clone, "HEAD", tmp_path / "sent-lost.jsonl", [], push=True)
+
+    assert [(a["path"], a["via"]) for a in second["already_sent"]] == [("doctrine-outbox/20261007-before.md", "bus_tip")]
+    assert [(r["path"], r["code"]) for r in second["refused"]] == [
+        ("doctrine-outbox/20261007-after.md", "R14_1_TRAP_FILING_IS_A_CARD")]
+    assert b"After the validator" not in git_raw(clone, "show", "origin/master:TRAPS.md")
+
+
+@needs_node
+def test_r14_trap_card_is_rendered_in_the_validator_format_and_published(tmp_path):
+    bare, clone = init_bus(tmp_path)
+    add_validator(clone)
+    src = init_source(tmp_path)
+    add_item(src, "20261007-card-one.md", target=CARDS, body=CARD_BODY)
+    add_item(src, "20261007-card-two.md", target=CARDS,
+             body=CARD_BODY.replace("example-card", "second-card").replace("rule: the rule", "- **Rule:** a bold-bullet rule"))
+    traps_before = git_raw(clone, "show", "origin/master:TRAPS.md")
+
+    report = ob.drain(src, clone, "HEAD", tmp_path / "sent.jsonl", [], push=True)
+
+    assert report["refused"] == []
+    assert [p["target"] for p in report["published"]] == [CARDS, CARDS]
+    text = git_raw(clone, "show", f"{report['commit']}:{CARDS}").decode("utf-8")
+    assert text.startswith("# mlv-app cards (R14.1; written only by mlv-app)\n\n## mlv-app/example-card\n")
+    for p in report["published"]:
+        assert text.count(f"- **Outbox:** outbox:{p['key']} mlv-app:") == 1
+    assert "-->" not in text, "an HTML marker line is not a card field and the validator refuses it"
+    assert git_raw(clone, "show", f"{report['commit']}:TRAPS.md") == traps_before
+    assert not (clone / CARDS).exists(), "the bus clone's own working tree is never written"
+
+    check = tmp_path / "check"
+    subprocess.run(["git", "clone", "-q", str(bare), str(check)], check=True, capture_output=True, text=True)
+    result = run_validator(check)
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert "2 card(s), 0 no-card line(s), 0 problem(s)" in result.stdout
+
+    again = ob.drain(src, clone, "HEAD", tmp_path / "sent-lost.jsonl", [], push=True)
+    assert again["published"] == [] and [a["via"] for a in again["already_sent"]] == ["bus_tip", "bus_tip"]
+
+
+@needs_node
+def test_r14_card_the_validator_rejects_is_never_pushed(tmp_path):
+    """M7. The would-be cards file is validated by the bus tip's validate-cards.mjs in the drain's
+    temp worktree before any push; a rejection refuses the publish."""
+    bare, clone = init_bus(tmp_path)
+    add_validator(clone)
+    src = init_source(tmp_path)
+    add_item(src, "20261007-bad-card.md", target=CARDS, body=CARD_BODY.replace("evidence: measured\n", ""))
+    before = git(bare, "rev-parse", "master")
+
+    with pytest.raises(ob.Refusal) as excinfo:
+        ob.drain(src, clone, "HEAD", tmp_path / "sent.jsonl", [], push=True)
+
+    assert excinfo.value.code == "CARD_INVALID"
+    assert "missing field 'evidence'" in excinfo.value.detail
+    assert git(bare, "rev-parse", "master") == before
+
+
+def test_r14_card_without_a_validator_on_the_bus_is_refused_fail_closed(tmp_path):
+    bare, clone = init_bus(tmp_path)
+    src = init_source(tmp_path)
+    add_item(src, "20261007-card.md", target=CARDS, body=CARD_BODY)
+    before = git(bare, "rev-parse", "master")
+
+    report = ob.drain(src, clone, "HEAD", tmp_path / "sent.jsonl", [], push=True)
+
+    assert [r["code"] for r in report["refused"]] == ["CARD_VALIDATOR_ABSENT"]
+    assert "tools/validate-cards.mjs" in report["refused"][0]["detail"]
+    assert report["published"] == [] and git(bare, "rev-parse", "master") == before
+
+
+def test_r14_card_without_node_is_refused_fail_closed(tmp_path, monkeypatch):
+    bare, clone = init_bus(tmp_path)
+    add_validator(clone)
+    src = init_source(tmp_path)
+    add_item(src, "20261007-card.md", target=CARDS, body=CARD_BODY)
+    before = git(bare, "rev-parse", "master")
+    monkeypatch.setattr(ob, "find_node", lambda: None)
+
+    report = ob.drain(src, clone, "HEAD", tmp_path / "sent.jsonl", [], push=True)
+
+    assert [r["code"] for r in report["refused"]] == ["CARD_VALIDATOR_NODE_ABSENT"]
+    assert report["published"] == [] and git(bare, "rev-parse", "master") == before
+
+
+def test_r14_receipts_and_rulings_keep_their_targets(tmp_path):
+    bare, clone = init_bus(tmp_path)
+    add_validator(clone)
+    src = init_source(tmp_path)
+    add_item(src, "20261007-receipt.md", target="RECEIPTS.md", kind="receipt", body="### A receipt\nbody\n")
+    add_item(src, "20261007-ruling.md", target="RULINGS.md", kind="ruling", ratified_by="RULINGS.md#r14",
+             body="### A ruling\nbody\n")
+
+    report = ob.drain(src, clone, "HEAD", tmp_path / "sent.jsonl", [], push=True)
+
+    assert report["refused"] == []
+    assert sorted(p["target"] for p in report["published"]) == ["RECEIPTS.md", "RULINGS.md"]
+    for kind in ("receipt", "ruling"):
+        with pytest.raises(ob.Refusal) as excinfo:
+            ob.parse_item(item_text(target=CARDS, kind=kind, ratified_by="RULINGS.md#r14", body=CARD_BODY))
+        assert excinfo.value.code == "ITEM_CARD_NOT_A_TRAP"
