@@ -27,7 +27,9 @@ NON-PROMISES:
   carry -z or core.quotepath=false) and PowerShell by one source line; a command assembled
   from variables or one joined string is not seen. Test files are not scanned. A call that
   needs no path text (exit code, emptiness, a count) is listed in GIT_PATHLIST_ALLOW with its
-  reason; git_paths() in tools/coordination/doctrine_outbox.py adds -z itself.
+  reason; git_paths() in tools/coordination/doctrine_outbox.py adds -z itself. Every ls-tree
+  form (long form `ls-tree -r` included; only --object-only is exempt) and `status --short|-s|-sb`
+  count, as well as --name-only, --name-status and --porcelain.
 - DG-PS-NULL-COMPARE flags only a literal ``$null`` on the RIGHT of
   -eq/-ne/-ceq/-cne/-ieq/-ine. The ``-eq $false`` tri-state form on a possibly-null
   value (tools/profiling/compare-machine-perf.ps1, run-release-cuda-playback-ab.ps1)
@@ -279,6 +281,16 @@ GIT_PATHLIST_ALLOW: tuple[tuple[str, str, str], ...] = (
      "dirty flag from 'any output'; the text is never read as a path"),
     ("tools/profiling/export-release-cuda-dogfood-kit.ps1", "-C $root status --porcelain",
      "dirty flag from a count; the text is never read as a path"),
+    ("tools/profiling/export-release-cuda-dogfood-kit.ps1", "-C $root status --short --branch",
+     "the lines are echoed into the kit manifest as display text; no path is tested or opened"),
+    ("tools/profiling/invoke-ultramagnus-cdng-export-evidence.ps1", "-C $repo status --short --branch",
+     "only the '## ' branch-line prefix is tested to tell dirty from clean; the lines are echoed in the refusal and the evidence"),
+    ("tools/profiling/invoke-ultramagnus-p3-evidence.ps1", "-C $repo status --short --branch",
+     "only the '## ' branch-line prefix is tested to tell dirty from clean; the lines are echoed in the refusal and the evidence"),
+    ("tools/profiling/package-local-cuda-proof-result.ps1", "-C $Repo status --short --branch",
+     "the lines are echoed into the packaged result as display text; no path is tested or opened"),
+    ("tools/profiling/run-ultramagnus-p3-validation.ps1", "-C $Repo status --short --branch",
+     "the lines are recorded as evidence text and only the '## ' branch-line prefix is tested; no path is tested or opened"),
     ("tools/release/build_stamp.py", 'git(root, "status", "--porcelain")',
      "refuses on 'any output' and echoes it in the error; no path is tested"),
     ("tools/repo_hygiene/brokered_closeout.py", '"status", "--porcelain=v1", "--", path',
@@ -304,16 +316,20 @@ def is_git_pathlist_scanned(rel: str) -> bool:
     return not is_test
 
 
+_GIT_STATUS_SHORT = frozenset(("--short", "-s", "-sb", "-bs"))
+
+
 def _git_pathlist_kind(tokens: set[str]) -> str | None:
     """Which path-listing git command a set of argument tokens spells, or None."""
     if "ls-files" in tokens and "--error-unmatch" not in tokens:  # --error-unmatch is read by exit code
         return "ls-files"
-    if "ls-tree" in tokens and "--name-only" in tokens:
-        return "ls-tree --name-only"
+    # Every ls-tree form prints a path (long form: `<mode> <type> <id> TAB <path>`) unless it prints ids only.
+    if "ls-tree" in tokens and "--object-only" not in tokens:
+        return "ls-tree"
     if tokens & {"diff", "log", "diff-tree", "show", "stash"} and tokens & {"--name-only", "--name-status"}:
         return "diff/log/diff-tree --name-only|--name-status"
-    if "status" in tokens and any(t.startswith("--porcelain") for t in tokens):
-        return "status --porcelain"
+    if "status" in tokens and (tokens & _GIT_STATUS_SHORT or any(t.startswith("--porcelain") for t in tokens)):
+        return "status --short|--porcelain"
     return None
 
 
@@ -446,9 +462,15 @@ FIXTURES: dict[str, dict[str, dict[str, str]]] = {
                           "    subprocess.run(['git', 'diff-tree', '--no-commit-id', '--name-only', '-r', 'HEAD'])\n"
                           "    git(repo, 'log', '--name-status')\n"
                           "    run_git(repo, ['status', '--porcelain=v1'])\n"
-                          "    git(repo, 'ls-tree', '-r', '--name-only', 'HEAD')\n",
+                          "    git(repo, 'ls-tree', '-r', '--name-only', 'HEAD')\n"
+                          "    git(repo, 'ls-tree', '-r', 'HEAD', '--', 'legs')\n"
+                          "    git(repo, 'ls-tree', '--full-tree', '-r', 'HEAD')\n"
+                          "    git(repo, 'status', '--short')\n"
+                          "    run_git(repo, ['status', '-sb'])\n",
             "tools/b.ps1": "$staged = @(& git -C $root diff --cached --name-only)\n"
-                           "$d = @(Run-Git $wd @('status', '--porcelain', '-uall'))\n",
+                           "$d = @(Run-Git $wd @('status', '--porcelain', '-uall'))\n"
+                           "$t = Invoke-Git -GitArgs @('ls-tree', '-r', $commit, '--', $dir)\n"
+                           "$s = @(& git -C $root status --short --branch 2>$null)\n",
         },
         "green": {
             "tools/a.py": "import subprocess\n"
@@ -461,11 +483,17 @@ FIXTURES: dict[str, dict[str, dict[str, str]]] = {
                           "    run_git(repo, ['worktree', 'list', '--porcelain'])\n"
                           "    run_git(repo, ['blame', '--porcelain', 'f'])\n"
                           "    run_git(repo, ['stash', 'list'])\n"
-                          "    note = 'git ls-files is only text here'\n",
+                          "    note = 'git ls-files is only text here'\n"
+                          "    git(repo, 'ls-tree', '-r', '-z', 'HEAD', '--', 'legs')\n"
+                          "    git(repo, 'ls-tree', '--object-only', 'HEAD', 'legs/x.json')\n"
+                          "    git(repo, 'status', '--short', '-z')\n"
+                          "    run_git(repo, ['-c', 'core.quotepath=false', 'status', '-sb'])\n",
             "tools/b.ps1": "# git ls-files in a comment is not a call\n"
                            "$a = @(& git -C $root -c core.quotepath=false status --porcelain)\n"
                            "$b = @(& git -C $root diff --cached --name-only -z)\n"
-                           "& git -C $root worktree list --porcelain\n",
+                           "& git -C $root worktree list --porcelain\n"
+                           "$t = Invoke-Git -GitArgs @('ls-tree', '-r', '-z', $commit, '--', $dir)\n"
+                           "$s = @(& git -C $root -c core.quotepath=false status --short --branch 2>$null)\n",
         },
     },
     "PS-ONE-TRAP": {
@@ -570,8 +598,10 @@ class GuardFixtureTests(_PwshMixin, unittest.TestCase):
 
     def test_git_pathlist_red_fails(self) -> None:
         self._assert_red("DG-GIT-PATHLIST", {("tools/a.py", 3), ("tools/a.py", 4), ("tools/a.py", 5),
-                                             ("tools/a.py", 6), ("tools/a.py", 7),
-                                             ("tools/b.ps1", 1), ("tools/b.ps1", 2)})
+                                             ("tools/a.py", 6), ("tools/a.py", 7), ("tools/a.py", 8),
+                                             ("tools/a.py", 9), ("tools/a.py", 10), ("tools/a.py", 11),
+                                             ("tools/b.ps1", 1), ("tools/b.ps1", 2),
+                                             ("tools/b.ps1", 3), ("tools/b.ps1", 4)})
 
     def test_git_pathlist_green_passes(self) -> None:
         self._assert_green("DG-GIT-PATHLIST")
