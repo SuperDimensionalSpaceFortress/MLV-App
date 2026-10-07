@@ -8,7 +8,7 @@ law4: attested
 
 **Trap:** a census of the system drive's root attributed the largest single directory (about 126 GiB, a shared temp root) to two owners. About 47 GiB was the owner's source footage, which must never be touched. About 79 GiB was scratch, temporary and worktree directories written by one other fleet project (AirMyPC), the newest written within the hour of the census, so it was live. The drive had fallen to about 27.6 GiB free, below MLV's build-admission floor, so work was held while the biggest reclaimable pile belonged to someone else.
 
-**Wrong remedies, rejected:** deleting by age from the shared root would have deleted a live neighbour's data, and could not tell footage from scratch by location. Clearing shared tool caches (package caches of three tools, about 17 GiB together) was also refused: another project's .NET builds were restoring at the time, and clearing a global package folder mid-restore breaks them.
+**Wrong remedies, rejected:** deleting by age from the shared root would have deleted a live neighbour's data, and could not tell footage from scratch by location. Clearing shared tool caches (package caches of two tools in three folders, about 17 GiB together) was also refused: another project's .NET builds were restoring at the time, and clearing a global package folder mid-restore breaks them.
 
 **Rule:** a project must not delete another project's data. Space on a shared drive is reclaimed by its writer: each project keeps retention for the scratch it writes, age-bounded, keep-newest and liveness-checked (nothing written recently, nothing held by a live process). The fleet adds a census that attributes system-drive space to its owning project, so the ask reaches the owner instead of guesswork.
 
