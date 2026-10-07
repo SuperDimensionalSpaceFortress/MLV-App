@@ -370,6 +370,7 @@ HEADERS += MainWindow.h \
            AutomationSettings.h \
            PlaybackFrameRange.h \
            PlaybackFpsMeterPolicy.h \
+           Debayered16ReconReusePolicy.h \
            PlaybackDecodeRenderOverlap.h \
            PlaybackNativePaceGuard.h \
            DisplayDeviceMapping.h \

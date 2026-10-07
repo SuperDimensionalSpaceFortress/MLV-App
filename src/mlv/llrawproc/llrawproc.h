@@ -72,6 +72,7 @@ int llrpResetGpuPlaybackReconRunForTesting(void);
 int llrpGpuPlaybackReconLastRunAttemptedForTesting(void);
 int llrpGpuPlaybackReconLastRunRcForTesting(void);
 int llrpGpuPlaybackReconLastUsedForTesting(void);
+void llrpSetGpuPlaybackReconLastUsedForTesting(int used);
 int llrpGpuPlaybackReconLastStateValidForTesting(void);
 int llrpGpuPlaybackReconLastPrepareOnlyForTesting(void);
 
@@ -397,6 +398,7 @@ double llrpGetLastPatternNoiseMilliseconds(void);
 double llrpGetLastPreDualIsoFixMilliseconds(void);
 int llrpGetLastPreDualIsoFixCompleted(void);
 void llrpResetLastPreDualIsoFixTelemetry(void);
+void llrpResetLastRunTimingForCurrentThread(void);
 double llrpGetLastDualIsoMilliseconds(void);
 double llrpGetLastChromaSmoothMilliseconds(void);
 void llrpGetLastDualIsoFull20bitTiming(dualiso_full20bit_timing_t * timing);
@@ -409,6 +411,8 @@ void llrpResetDebugDarkFrameCopyCount(void);
 uint64_t llrpGetDebugDarkFrameCopyCount(void);
 void llrpResetDebugRuntimePublishCount(void);
 uint64_t llrpGetDebugRuntimePublishCount(void);
+void llrpResetDebugRunCount(void);
+uint64_t llrpGetDebugRunCount(void);
 
 /* Detect focus dot fix mode according to RAWC block info (binning + skipping) and camera ID
    Return value 0 = off, 1 = On, 2 = CropRec */
