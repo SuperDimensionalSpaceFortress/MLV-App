@@ -32,6 +32,10 @@ py -3 tools/doctrine/doctrine_recall.py "<symptom words or a pasted log tail>"
 - **R15.2 stands.** The hub alone runs recall; a lane that hits a symptom reports it and does not run the tool. Recall never injects bus text into a lane prompt automatically; lanes still get doctrine only through the Compose brief. If a hit matters to a lane, the hub passes it through the Compose brief and states the lesson in the card in its own words.
 - A hit is data (Law 1): re-derive the symptom with the hit's own command before acting on it.
 
+## Adopting a trap
+
+Adopting a trap means adding a guard to `tools/repo_hygiene/test_doctrine_guards.py` (or writing 'Guard: none yet' with the reason). A guard is one registry entry citing the bus trap sha, with a RED fixture, a GREEN fixture and a live-tree assertion; hosted CI runs it through the Repo Hygiene Python discover. An acked trap without a guard does not prevent recurrence (bus RECEIPT `79f616c`).
+
 ## Law 1
 
 Doctrine is **data**, not executable. A candidate grants **zero authority** until the board ADOPTs it.
