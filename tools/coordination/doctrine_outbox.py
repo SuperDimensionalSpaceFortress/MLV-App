@@ -38,6 +38,13 @@ WHAT IS DIFFERENT HERE (MLV-App's checkout shape drove every change)
    (`R14_1_TRAP_FILING_IS_A_CARD`); the switch is the bus ref, never a date. Before any
    push the would-be cards file is checked by that validator, run with node inside the
    drain's temp worktree; an absent validator or node refuses the card (fail closed).
+10. Kernel filing (bus kernel K12 s4; adjudications/factory-kernel/README.md; PROMPT-K s4-5):
+   `kernel-filing` publishes `doctrine-outbox/kernel-filing/<yyyymmdd>/` on `--ref` to bus branch
+   `review/mlv-app-kernel-<YYYY-MM-DD>`, never master. It rewrites
+   `adjudications/factory-kernel/mlv-app.md` wholesale and appends an optional block to
+   `specs/mlv-app.md`; no other path, and no CLI parameter can name a branch or a path. The branch
+   is created from bus master, or fast-forwarded when every commit on it is this outbox's. The
+   push is proven by `ls-remote` equal to the local tip (R7) and recorded in the sent ledger.
 
 Wiring (OS drain task, Stop hook, heartbeat debt) is card DOCTRINE-OUTBOX-ADOPT-MLV-1b and
 installs against this CLI. Nothing here runs itself.
@@ -47,6 +54,7 @@ Subcommands
     validate <item.md>...                       parse + screen item files
     debt [--ref R] [--ledger P] [--bus PATH] [--json]
     drain --bus PATH [--ref R] [--push] [--ledger P] [--deny-file P]
+    kernel-filing --bus PATH [--ref R] [--push] [--ledger P] [--deny-file P]
     check-ledger [--ledger P] [--watermark P] [--advance | --baseline]
     check-commits [--range A..B]
 
@@ -84,6 +92,15 @@ WORD_CAP = 450
 ITEM_NAME_RE = re.compile(r"^\d{8}-[a-z0-9][a-z0-9-]{2,60}\.md$")
 SHA_RE = re.compile(r"^[0-9a-f]{7,40}$")
 STALE_HOURS = 24
+
+# Kernel filing: fixed source names map to fixed bus paths; the branch is derived from the date dir.
+KERNEL_DIR = f"{OUTBOX_DIR}/kernel-filing"
+KERNEL_FILING_SRC = f"adjudications-factory-kernel-{PROJECT}.md"
+KERNEL_SPEC_BLOCK_SRC = f"specs-{PROJECT}-block.md"
+KERNEL_FILING_DEST = f"adjudications/factory-kernel/{PROJECT}.md"
+KERNEL_SPEC_DEST = f"specs/{PROJECT}.md"
+KERNEL_SOURCES = {KERNEL_FILING_SRC: KERNEL_FILING_DEST, KERNEL_SPEC_BLOCK_SRC: KERNEL_SPEC_DEST}
+KERNEL_BRANCH_RE = re.compile(r"review/" + re.escape(PROJECT) + r"-kernel-[0-9]{4}-[0-9]{2}-[0-9]{2}")  # fullmatch only
 
 # Fixed, non-personal identity for every bus commit this tool makes. Pinned both via
 # `-c user.name=`/`-c user.email=` on the commit invocation AND via GIT_AUTHOR_*/
@@ -282,10 +299,10 @@ def gather_deny_terms(deny_file: pathlib.Path | None) -> list[tuple[str, str]]:
     return result
 
 
-def screen_law4(body: str, deny_terms: list[tuple[str, str]] = ()) -> None:
+def screen_law4(body: str, deny_terms: list[tuple[str, str]] = (), word_cap: int | None = WORD_CAP) -> None:
     words = len(body.split())
-    if words > WORD_CAP:
-        raise Refusal("LAW4_OVER_CAP", f"{words} words > {WORD_CAP}")
+    if word_cap is not None and words > word_cap:
+        raise Refusal("LAW4_OVER_CAP", f"{words} words > {word_cap}")
     for name, rx in LAW4:
         if rx.search(body):
             # Name the CLASS only: the matched text is exactly what must not leave the machine.
@@ -347,7 +364,7 @@ def load_outbox_items(repo: pathlib.Path, ref: str) -> list[dict]:
     items: list[dict] = []
     for p in out.splitlines():
         p = p.strip()
-        if not p or "/" not in p or not p.startswith(OUTBOX_DIR + "/"):
+        if not p or "/" not in p or not p.startswith(OUTBOX_DIR + "/") or p.startswith(KERNEL_DIR + "/"):
             continue
         name = p.rsplit("/", 1)[-1]
         if name == "README.md" and p == f"{OUTBOX_DIR}/README.md":
@@ -753,6 +770,206 @@ def drain(repo: pathlib.Path, bus_repo: pathlib.Path, ref: str, ledger: pathlib.
         # landed one of our exact keys is skipped rather than double-appended.
 
 
+# ---------- kernel filing: review/<project>-kernel-<date>, never master ----------
+
+def assert_kernel_branch(branch: str) -> str:
+    """The only bus branch shape this route may push. Checked when the branch is derived and
+    again on the push refspec, so master/main or another project's branch is unreachable."""
+    if not KERNEL_BRANCH_RE.fullmatch(branch):
+        raise Refusal("KERNEL_BRANCH_REFUSED", branch)
+    return branch
+
+
+def kernel_branch(date: str) -> str:
+    """`<yyyymmdd>` -> `review/<project>-kernel-<YYYY-MM-DD>`, the bus README's branch grammar."""
+    try:
+        if not re.fullmatch(r"[0-9]{8}", date):
+            raise ValueError(date)
+        day = datetime.strptime(date, "%Y%m%d")
+    except ValueError:
+        raise Refusal("KERNEL_FILING_BAD_DATE", date) from None
+    return assert_kernel_branch(f"review/{PROJECT}-kernel-{day:%Y-%m-%d}")
+
+
+def load_kernel_filings(repo: pathlib.Path, ref: str) -> list[dict]:
+    """One entry per `KERNEL_DIR/<yyyymmdd>/` committed on `ref`. A date dir holding anything but
+    the two fixed source names, or lacking the filing, is refused whole."""
+    by_date: dict[str, list[str]] = {}
+    for p in git(repo, "ls-tree", "-r", "--name-only", ref, "--", KERNEL_DIR).splitlines():
+        if p.startswith(KERNEL_DIR + "/"):
+            date, _sep, rest = p[len(KERNEL_DIR) + 1:].partition("/")
+            by_date.setdefault(date, []).append(rest)
+    filings: list[dict] = []
+    for date, names in sorted(by_date.items()):
+        path = f"{KERNEL_DIR}/{date}"
+        try:
+            branch = kernel_branch(date)
+            extra = sorted(n for n in names if n not in KERNEL_SOURCES)
+            if extra:
+                raise Refusal("KERNEL_FILING_EXTRA_PATH", ", ".join(extra))
+            if KERNEL_FILING_SRC not in names:
+                raise Refusal("KERNEL_FILING_MISSING", KERNEL_FILING_SRC)
+            blobs = {n: cat_file_blob(repo, ref, f"{path}/{n}") for n in names}
+            try:
+                texts = {n: b.decode("utf-8") for n, b in blobs.items()}
+            except UnicodeDecodeError:
+                raise Refusal("KERNEL_FILING_NOT_UTF8", path) from None
+        except Refusal as e:
+            filings.append({"path": path, "error": e})
+            continue
+        src = git(repo, "log", "-n", "1", "--format=%H", ref, "--", path)
+        block = texts.get(KERNEL_SPEC_BLOCK_SRC)
+        block_key = None
+        if block is not None:
+            block = block.strip("\n") + "\n"
+            block_key = idempotency_key(date, KERNEL_SPEC_DEST, block)
+            block += f"<!-- outbox:{block_key} {PROJECT}:{src[:12]} -->\n"
+        filings.append({
+            "path": path, "date": date, "branch": branch, "src": src,
+            "filing": blobs[KERNEL_FILING_SRC], "filing_text": texts[KERNEL_FILING_SRC],
+            "block": block, "block_key": block_key,
+            # Content-keyed, not commit-keyed: a squash merge re-lands the same bytes under a new sha.
+            "key": idempotency_key(date, branch, texts[KERNEL_FILING_SRC] + "\0" + (block or "")),
+            "message": f"kernel({PROJECT}): factory-kernel filing {date} -> {branch}\n\nDoctrine-Export: outbox\n",
+        })
+    return filings
+
+
+def remote_branch_sha(bus_repo: pathlib.Path, branch: str) -> str | None:
+    rc, out, err = git_try(bus_repo, "ls-remote", "origin", f"refs/heads/{branch}")
+    if rc != 0:
+        raise GitError(f"git ls-remote origin refs/heads/{branch}: {err}")
+    for line in out.splitlines():
+        sha, _tab, name = line.partition("\t")
+        if name == f"refs/heads/{branch}":
+            return sha
+    return None
+
+
+def kernel_bus_fetch(bus_repo: pathlib.Path, branch: str) -> tuple[str, str | None]:
+    """(bus master tip, review branch tip or None when the branch does not exist yet)."""
+    master = bus_fetch(bus_repo)
+    if remote_branch_sha(bus_repo, branch) is None:
+        return master, None
+    git(bus_repo, "fetch", "--quiet", "origin", f"+refs/heads/{branch}:refs/remotes/origin/{branch}")
+    return master, git(bus_repo, "rev-parse", f"refs/remotes/origin/{branch}")
+
+
+def kernel_branch_foreign(bus_repo: pathlib.Path, master: str, tip: str) -> str | None:
+    """None when every commit on the branch past bus master is this outbox's; else which is not."""
+    for line in git(bus_repo, "log", "--format=%H %ae %ce", f"{master}..{tip}").splitlines():
+        sha, author, committer = line.split(" ", 2)
+        if author != OUTBOX_IDENTITY_EMAIL or committer != OUTBOX_IDENTITY_EMAIL:
+            return f"{sha[:12]} on the branch is not this outbox's commit"
+    return None
+
+
+def write_kernel_files(wt: pathlib.Path, filing: dict) -> bool:
+    """Rewrite the filing wholesale and append the spec block once; True if anything changed."""
+    changed = False
+    dest = wt / KERNEL_FILING_DEST
+    if not dest.is_file() or dest.read_bytes() != filing["filing"]:
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        dest.write_bytes(filing["filing"])
+        changed = True
+    if filing["block"] is not None:
+        spec = wt / KERNEL_SPEC_DEST
+        old = spec.read_bytes().decode("utf-8", errors="replace") if spec.is_file() else ""
+        if f"outbox:{filing['block_key']}" not in old:
+            spec.parent.mkdir(parents=True, exist_ok=True)
+            append_block_to_file(spec, filing["block"])
+            changed = True
+    return changed
+
+
+def _kernel_row(filing: dict, bus_commit: str, remote: str) -> dict:
+    return {"key": filing["key"], "route": "kernel-filing", "target": filing["branch"],
+            "item": f"kernel-filing/{filing['date']}", "source_commit": filing["src"],
+            "bus_commit": bus_commit, "ls_remote": remote, "ts": _now_iso()}
+
+
+def publish_kernel_filing(bus_repo: pathlib.Path, filing: dict, ledger: pathlib.Path, push: bool,
+                          report: dict, max_attempts: int = 3) -> None:
+    branch = assert_kernel_branch(filing["branch"])
+    entry = {"path": filing["path"], "branch": branch, "key": filing["key"]}
+    allowed = {KERNEL_FILING_DEST} | ({KERNEL_SPEC_DEST} if filing["block"] is not None else set())
+    ours: set[str] = set()  # commits we pushed; one on the refetched tip is a landed push whose ack was lost
+    attempt = 0
+    while True:
+        attempt += 1
+        master, tip = kernel_bus_fetch(bus_repo, branch)
+        if tip is not None:
+            why = kernel_branch_foreign(bus_repo, master, tip)
+            if why is not None:
+                report["refused"].append({"path": filing["path"], "code": "KERNEL_BRANCH_NOT_OURS", "detail": why})
+                return
+        base = tip or master
+        wt = make_temp_worktree(bus_repo, base)
+        try:
+            if not write_kernel_files(wt, filing):
+                if tip in ours:
+                    report["published"].append({**entry, "bus_commit": tip})
+                    report["pushed"] = True
+                else:
+                    report["already_sent"].append({**entry, "via": "bus_branch"})
+                if push:
+                    append_ledger_rows(ledger, [_kernel_row(filing, tip, tip)])
+                return
+            head = git_commit(wt, filing["message"])
+            touched = set(git(wt, "diff", "--name-only", base, head).splitlines())
+            if not touched <= allowed:
+                raise Refusal("KERNEL_FILING_PATH_REFUSED", ", ".join(sorted(touched - allowed)))
+            if cat_file_blob(wt, "HEAD", KERNEL_FILING_DEST) != filing["filing"]:
+                raise Refusal("KERNEL_FILING_BYTES_CHANGED", KERNEL_FILING_DEST)
+            if not cat_file_blob(wt, "HEAD", KERNEL_SPEC_DEST).startswith(cat_file_blob(wt, base, KERNEL_SPEC_DEST)):
+                raise Refusal("PREFIX_BROKEN", KERNEL_SPEC_DEST)
+            if not push:
+                report["would_push"].append({**entry, "bus_commit": head, "base": base})
+                return
+            rc, _out, err = git_try(wt, "push", "origin", f"HEAD:refs/heads/{assert_kernel_branch(branch)}")
+            ours.add(head)
+        finally:
+            remove_temp_worktree(bus_repo, wt)
+
+        if rc == 0:
+            # R7: the branch has a single writer, so the proof is equality, not ancestry.
+            remote = remote_branch_sha(bus_repo, branch)
+            if remote != head:
+                raise Refusal("PUSH_VERIFY_FAILED", f"ls-remote={remote!r} head={head!r}")
+            append_ledger_rows(ledger, [_kernel_row(filing, head, remote)])
+            report["published"].append({**entry, "bus_commit": head})
+            report["pushed"] = True
+            return
+        if attempt >= max_attempts:
+            raise Refusal("PUSH_REJECTED", err[:200])
+
+
+def drain_kernel_filing(repo: pathlib.Path, bus_repo: pathlib.Path, ref: str, ledger: pathlib.Path,
+                        deny_terms: list[tuple[str, str]], push: bool, max_attempts: int = 3) -> dict:
+    require_tool_at_ref(repo, ref)
+    report: dict = {"push": push, "published": [], "already_sent": [], "refused": [], "would_push": [], "pushed": False}
+    ledger_keys = read_ledger_keys(ledger)
+    for filing in load_kernel_filings(repo, ref):
+        if "error" in filing:
+            e = filing["error"]
+            report["refused"].append({"path": filing["path"], "code": e.code, "detail": e.detail})
+            continue
+        try:
+            # A kernel filing is wholesale by kernel s4, so the 450-word item cap does not apply;
+            # every Law-4 class and deny term still does.
+            for text in (filing["filing_text"], filing["block"] or "", filing["message"]):
+                screen_law4(text, deny_terms, word_cap=None)
+        except Refusal as e:
+            report["refused"].append({"path": filing["path"], "code": e.code, "detail": e.detail})
+            continue
+        if filing["key"] in ledger_keys:
+            report["already_sent"].append({"path": filing["path"], "branch": filing["branch"],
+                                           "key": filing["key"], "via": "ledger"})
+            continue
+        publish_kernel_filing(bus_repo, filing, ledger, push, report, max_attempts)
+    return report
+
+
 # ---------- debt ----------
 
 def compute_debt(repo: pathlib.Path, ref: str, ledger: pathlib.Path, bus_repo: pathlib.Path | None = None,
@@ -1112,6 +1329,14 @@ def build_parser() -> argparse.ArgumentParser:
     drain_p.add_argument("--ledger", type=pathlib.Path, default=None, help="the SENT ledger (sent.jsonl)")
     drain_p.add_argument("--deny-file", type=pathlib.Path, default=None)
 
+    kernel_p = sub.add_parser("kernel-filing", help=f"publish {KERNEL_DIR}/<yyyymmdd>/ to review/{PROJECT}-kernel-<date> "
+                                                     "(dry run unless --push); no branch or path parameter exists")
+    kernel_p.add_argument("--bus", required=True, type=pathlib.Path)
+    kernel_p.add_argument("--ref", default=DEFAULT_REF)
+    kernel_p.add_argument("--push", action="store_true")
+    kernel_p.add_argument("--ledger", type=pathlib.Path, default=None, help="the SENT ledger (sent.jsonl)")
+    kernel_p.add_argument("--deny-file", type=pathlib.Path, default=None)
+
     ledger_p = sub.add_parser("check-ledger", help="every structured finding needs a Doctrine-Export disposition")
     ledger_p.add_argument("--ledger", type=pathlib.Path, default=None,
                           help=f"the SUBJECT ledger to scan (env {SUBJECT_LEDGER_ENV})")
@@ -1139,10 +1364,11 @@ def main(argv: list[str] | None = None) -> int:
             ledger = resolve_ledger(repo, args.ledger)
             bus = args.bus.resolve() if args.bus is not None else None
             return cmd_debt(repo, args.ref, ledger, bus, args.json)
-        if args.cmd == "drain":
+        if args.cmd in ("drain", "kernel-filing"):
             ledger = resolve_ledger(repo, args.ledger)
             deny_terms = gather_deny_terms(resolve_deny_file(repo, args.deny_file))
-            report = drain(repo, args.bus.resolve(), args.ref, ledger, deny_terms, args.push)
+            route = drain if args.cmd == "drain" else drain_kernel_filing
+            report = route(repo, args.bus.resolve(), args.ref, ledger, deny_terms, args.push)
             print(json.dumps(report, indent=2, sort_keys=True))
             for r in report["refused"]:
                 print(f"[doctrine-outbox] REFUSED {r['path']}: {r['code']}: {r['detail']}", file=sys.stderr)

@@ -12,6 +12,7 @@ DOCTRINE-OUTBOX-ADOPT-MLV-1b and install against this CLI.
 python tools/coordination/doctrine_outbox.py debt                       # unsent items on refs/remotes/fork/master; exit 1 = debt, 2 = UNKNOWN
 python tools/coordination/doctrine_outbox.py debt --json --bus <clone>  # machine form, also checks markers and published_as on the bus
 python tools/coordination/doctrine_outbox.py drain --bus <clone>        # DRY RUN by default; --push publishes
+python tools/coordination/doctrine_outbox.py kernel-filing --bus <clone> # kernel filing to its review branch; DRY RUN unless --push
 python tools/coordination/doctrine_outbox.py check-ledger               # every finding needs a disposition; exit 1 = undisposed
 python tools/coordination/doctrine_outbox.py check-commits              # fork/master..HEAD: finding paths need a trailer
 ```
@@ -82,6 +83,21 @@ A card is at most 15 lines and 2,000 bytes, and the drain adds one line to it, t
 any push, the drain runs the tip's own `validate-cards.mjs` with node over the would-be file in its temp
 worktree; a rejection refuses the publish (`CARD_INVALID`), and a missing validator or node refuses the card
 (`CARD_VALIDATOR_ABSENT`, `CARD_VALIDATOR_NODE_ABSENT`). `validate` checks the heading only, not the fields.
+
+## Kernel filings go to a review branch, never master
+
+A factory-kernel filing (bus kernel K12 and section 4, `adjudications/factory-kernel/README.md`, PROMPT-K
+sections 4-5) is not an item. Commit it as `doctrine-outbox/kernel-filing/<yyyymmdd>/`, holding exactly
+`adjudications-factory-kernel-mlv-app.md` (the whole filing) and, optionally, `specs-mlv-app-block.md` (a
+block for the project's own spec). `kernel-filing --bus <clone>` publishes them to bus branch
+`review/mlv-app-kernel-<YYYY-MM-DD>`: it rewrites `adjudications/factory-kernel/mlv-app.md` wholesale and
+appends the block, with an `outbox:<key>` marker, to `specs/mlv-app.md`. It writes no other path. The
+branch comes from the date directory, and no parameter can name a branch or a path. The branch is created
+from bus master, or fast-forwarded when every commit on it is this outbox's (else
+`KERNEL_BRANCH_NOT_OURS`). Any other file in the date directory is `KERNEL_FILING_EXTRA_PATH`. Every
+Law-4 class and deny term is screened, with no word cap, because a filing is wholesale. The push is proven
+by `ls-remote` equal to the local tip (R7) and recorded in the sent ledger with `route: kernel-filing`.
+A re-run is a no-op, by the ledger or, on a fresh clone, by the bytes already on the branch.
 
 ## Entries already on the bus: `published_as`
 
