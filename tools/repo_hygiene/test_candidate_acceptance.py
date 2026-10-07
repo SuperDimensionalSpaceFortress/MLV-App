@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import ctypes
 import hashlib
 import io
 import json
@@ -879,24 +878,60 @@ class CandidateAcceptanceTests(unittest.TestCase):
 
     @unittest.skipUnless(os.name == "nt", "Windows token-explained host verdict")
     def test_windows_system_curl_host_verdict_is_explained_by_the_token(self) -> None:
-        # The REAL host chain is refused exactly when the current token is an elevated admin (the
+        # The host chain is refused exactly when the current token is an elevated admin (the
         # default Administrators ACEs on C:\ and C:\Windows carry Delete). A hosted runner token is
         # elevated; a normal developer session is not. Any refusal that the elevated-Administrators
         # grant does not explain -- a broad principal, a NULL DACL, another failure -- stays a failure.
+        # The probe completion is FAKED in both token shapes: the live probe is a 30 s bounded
+        # PowerShell run, and a stalled hosted runner turned its fail-closed exit 124 into a red
+        # verdict test (merge_group 37675956805). The live probe stays covered by the module-shadowing
+        # test; this test owns only the verdict explanation, so it runs on every runner.
         from tools.repo_hygiene.candidate_acceptance import _trusted_system_curl_identity
 
-        elevated = bool(ctypes.windll.shell32.IsUserAnAdmin())
-        try:
-            _trusted_system_curl_identity(ROOT, self.config)
-        except HygieneError as exc:
-            message = str(exc)
-            self.assertIn("grants replacement authority", message, message)
-            flagged = set(re.findall(r": (S-1-[\d-]+|NULL_DACL) ", message))
-            self.assertTrue(flagged, message)
-            self.assertTrue(elevated, "refused on a NON-elevated token: " + message)
-            self.assertEqual({"S-1-5-32-544"}, flagged, message)
-        else:
-            print(f"[curl-trust] host verdict: clean (elevated={elevated})", file=sys.stderr)
+        root = r"C:\Windows\System32\WindowsPowerShell\v1.0\Modules"
+        admin_grant = [{"sid": "S-1-5-32-544", "rights": "FullControl"}]
+        for elevated in (True, False):
+            with self.subTest(elevated=elevated), tempfile.TemporaryDirectory() as temp:
+                client = Path(temp) / "curl.exe"
+                client.write_bytes(b"x")
+                chain = [
+                    {"path": p, "ownerSid": "S-1-5-18", "ownerTrusted": True, "daclPresent": True,
+                     "daclNull": False, "unsafeWriteGrants": grants if elevated else []}
+                    for p, grants in (
+                        ("C:\\", admin_grant),
+                        ("C:\\Windows", [{"sid": "S-1-5-32-544", "rights": "Modify, Synchronize"}]),
+                        ("C:\\Windows\\System32", []),
+                        (str(client), []),
+                    )
+                ]
+                completed = {
+                    "returncode": 0, "timedOut": False, "outputCapped": False, "cpuStalled": False, "stderr": "",
+                    "stdout": json.dumps({
+                        "modulePath": r"C:\Program Files\WindowsPowerShell\Modules;" + root,
+                        "loadedModulePaths": [root + r"\Microsoft.PowerShell.Security\Microsoft.PowerShell.Security.psd1"],
+                        "signatureStatus": "Valid",
+                        "signerSubject": "CN=Microsoft Windows, O=Microsoft Corporation",
+                        "signerThumbprint": "A" * 40,
+                        "pathTrust": chain,
+                    }),
+                }
+                try:
+                    with mock.patch(
+                        "tools.repo_hygiene.candidate_acceptance._system_curl_path", return_value=client
+                    ), mock.patch(
+                        "tools.repo_hygiene.brokered_closeout.run_bounded_closeout_process", return_value=completed,
+                    ):
+                        _trusted_system_curl_identity(ROOT, self.config)
+                except HygieneError as exc:
+                    message = str(exc)
+                    self.assertIn("grants replacement authority", message, message)
+                    flagged = set(re.findall(r": (S-1-[\d-]+|NULL_DACL) ", message))
+                    self.assertTrue(flagged, message)
+                    self.assertTrue(elevated, "refused on a NON-elevated token: " + message)
+                    self.assertEqual({"S-1-5-32-544"}, flagged, message)
+                else:
+                    self.assertFalse(elevated, "clean verdict on an ELEVATED token")
+                    print(f"[curl-trust] host verdict: clean (elevated={elevated})", file=sys.stderr)
 
     @unittest.skipUnless(os.name == "nt", "Windows protected-module bootstrap")
     def test_windows_system_curl_trust_rejects_user_module_shadowing(self) -> None:
