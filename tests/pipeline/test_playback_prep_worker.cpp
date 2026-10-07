@@ -375,8 +375,10 @@ const Stage kRefusedStages[] = {
     Stage::HlRecon
 };
 
-/* A frame, cropped to dims divisible by 4, and the config of one stage of the
- * matrix built for exactly those dims. The S/H blur is the engine's own
+/* A frame, cropped to dims divisible by 4 (and, when maxWidth/maxHeight are set,
+ * to at most that size: T1's byte identity does not depend on the content, and
+ * the hosted CI caps a pipeline shard at 240 s), and the config of one stage of
+ * the matrix built for exactly those dims. The tolerance tests use the whole frame. The S/H blur is the engine's own
  * frame state (full res), cropped; the quarter variant is its 4x box. */
 struct StageCase
 {
@@ -387,13 +389,14 @@ struct StageCase
 };
 
 StageCase buildStageCase(MlvPipelineFixture & fixture, Stage stage, int frameCount,
-                         double shadows = 0.32, double highlights = -0.26)
+                         double shadows = 0.32, double highlights = -0.26,
+                         int maxWidth = 1 << 20, int maxHeight = 1 << 20)
 {
     StageCase sc;
     const int fw = fixture.width();
     const int fh = fixture.height();
-    sc.width = fw & ~3;
-    sc.height = fh & ~3;
+    sc.width = std::min(fw, maxWidth) & ~3;
+    sc.height = std::min(fh, maxHeight) & ~3;
     ASSERT_TRUE(sc.width >= 16 && sc.height >= 16);
     processingObject_t * p = fixture.processing();
     ASSERT_TRUE(p != nullptr);
@@ -545,19 +548,20 @@ PlaybackPrepReducedDecision reducedDecision(int factor)
 // ---------------------------------------------------------------------------
 // T1
 // ---------------------------------------------------------------------------
-TEST(PlaybackPrepWorkerBuild, Tier1ByteIdentityAcrossTheStageMatrixAndThreadCounts)
+namespace {
+/* Every stage of the matrix on the first two frames of one dual-ISO fixture clip,
+ * at OMP 1, 2 and max threads. The two TESTs below cover both clips: four
+ * dual-ISO fixture frames over two frame sizes. */
+void runTier1ByteIdentity(bool large)
 {
-    /* Every frame of the tiny dual-ISO fixture plus the first frames of the large
-     * one: at least three dual-ISO fixture frames over two frame sizes. */
     int casesChecked = 0;
     int framesChecked = 0;
-    for (bool large : { false, true })
     {
     MlvPipelineFixture fixture;
     openFixture(fixture, large);
     for (Stage stage : kAllStages)
     {
-        const StageCase sc = buildStageCase(fixture, stage, 2);
+        const StageCase sc = buildStageCase(fixture, stage, 2, 0.32, -0.26, 512, 384);
         if (stage == Stage::Pointwise) framesChecked += static_cast<int>(sc.frames.size());
         for (size_t f = 0; f < sc.frames.size(); ++f)
         {
@@ -595,9 +599,21 @@ TEST(PlaybackPrepWorkerBuild, Tier1ByteIdentityAcrossTheStageMatrixAndThreadCoun
         }
     }
     }
-    ASSERT_TRUE(framesChecked >= 3);
-    std::printf("[PREP-T1] frames=%d cases=%d\n", framesChecked, casesChecked);
-    test_artifacts::record("playback_prep_worker_build.t1.cases", std::to_string(casesChecked));
+    ASSERT_EQ(2, framesChecked);
+    std::printf("[PREP-T1] %s frames=%d cases=%d\n", large ? "large" : "tiny", framesChecked, casesChecked);
+    test_artifacts::record(std::string("playback_prep_worker_build.t1.cases.") + (large ? "large" : "tiny"),
+                           std::to_string(casesChecked));
+}
+} // namespace
+
+TEST(PlaybackPrepWorkerBuild, Tier1ByteIdentityAcrossTheStageMatrixAndThreadCounts)
+{
+    runTier1ByteIdentity(false);
+}
+
+TEST(PlaybackPrepWorkerBuild, Tier1ByteIdentityOnTheLargeDualIsoClip)
+{
+    runTier1ByteIdentity(true);
 }
 
 TEST(PlaybackPrepWorkerBuild, Tier1ScratchFollowsADimsChange)
