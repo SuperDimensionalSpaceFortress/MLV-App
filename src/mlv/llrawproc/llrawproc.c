@@ -3470,6 +3470,11 @@ void applyLLRawProcObjectWorker(mlvObject_t * video,
     dark_frame_mode = shared->dark_frame;
     vertical_stripes_mode = shared->vertical_stripes;
 
+    /* LOOK-ASSIST-DUALISO-VSTRIPES-1: no vertical-stripe fix on a dual-ISO frame. The detector (stripes.c) rates the
+     * RG row's columns against a green of the next row; with the ISO fields interleaved in row pairs that row can be the
+     * other field, so the odd-column coefficients measure the field gap (clamped near 2^+-1) and the apply pass scales
+     * Gr and B by about 1 EV, mostly in the bright field. Pattern noise is skipped the same way below. */
+    if (diso_validity) vertical_stripes_mode = 0;
     if (vertical_stripes_mode)
     {
         stripe_correction_snapshot = shared->stripe_corrections;
