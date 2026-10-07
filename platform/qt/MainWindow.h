@@ -19,6 +19,7 @@
 #include <QVector>
 #include <QElapsedTimer>
 #include <QJsonObject>
+#include <QMap>
 #include <QImage>
 #include <QPixmap>
 #include <QGraphicsPixmapItem>
@@ -32,6 +33,7 @@
 #include "SessionModel.h"
 #include "PlaybackFrameRange.h"
 #include "PlaybackNativePaceGuard.h"
+#include "PlaybackSlipHistogram.h"
 #include "../../src/mlv_include.h"
 #include "InfoDialog.h"
 #include "StatusDialog.h"
@@ -1138,6 +1140,9 @@ private:
     // PLAYBACK-CUDA-NATIVE-PACE-1: the ceiling on every engine advance in playbackHandling() -- the timeline never
     // runs faster than getFramerate() (native, or the explicit fpsOverride). Reset on every Play start and stop.
     playback_native_pace::NativePaceGuard m_playbackPaceGuard;
+    // PLAYBACK-BACHELOR-PRESENT-JITTER-1: per-present slip accounting and timeline-path reconciliation for the
+    // smoke session (playback_smoke.slip_summary); fed only while m_playbackSmokeActive.
+    playback_slip::SlipHistogram m_playbackSlipHistogram;
     // PLAYBACK-DECODE-RENDER-OVERLAP-1: the last drawFrame() request was on the CUDA texture route (play, texture
     // present requested and admitted, scale 1), where the playback lookahead is on by default
     // (playback_overlap::effectiveLookaheadFrames). The counters feed playback_smoke.overlap_summary.
@@ -1448,6 +1453,16 @@ private:
     QString m_playbackSmokeCpuDualIsoReconFallbackReasonLast;
     double m_playbackSmokeCpuDualIsoReconFullResFixesSumMs = 0.0;
     double m_playbackSmokeCpuDualIsoReconDownsampleSumMs = 0.0;
+    int m_playbackSmokeDebayered16ReconConsumedFrames = 0;
+    int m_playbackSmokeDebayered16OwnReconFrames = 0;
+    QString m_playbackSmokeDebayered16ReconFallbackReasonLast;
+    double m_playbackSmokeDebayered16WorkerLlrawprocSumMs = 0.0;
+    double m_playbackSmokeDebayered16RenderLlrawprocSumMs = 0.0;
+    /* r2: presented debayered-16 frames by outcome name, and the render
+     * thread's all-attempts counters at session begin. */
+    QMap<QString, int> m_playbackSmokeDebayered16OutcomeFrames;
+    std::array<uint64_t, static_cast<size_t>( Debayered16ReconRefusal::Count )>
+        m_playbackSmokeDebayered16AttemptsAtBegin{};
     int m_playbackSmokeProcessed8PrefetchHits = 0;
     int m_playbackSmokeRawPrefetchHits = 0;
     int m_playbackSmokeGpuStatusCpuFrames = 0;

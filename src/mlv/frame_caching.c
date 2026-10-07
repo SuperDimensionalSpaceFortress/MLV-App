@@ -1093,62 +1093,29 @@ static void run_mlv_cache_thread(mlvObject_t * video, int counter_already_claime
     mlv_cache_worker_count_release(video);
 }
 
-/* Gets a freshly debayered frame every time ( temp memory should be Width * Height * sizeof(float) ) */
-static int get_mlv_raw_frame_float_checked(mlvObject_t * video,
-                                           uint64_t frame_index,
-                                           float * output_frame,
-                                           int isolated_analysis)
+/* Post-acquisition tail of the debayered-16 render. On entry the first
+ * Width * Height uint16 words of temp_memory hold the llrawproc'd Bayer (the
+ * bit_shift widening not yet applied); temp_memory must be Width * Height *
+ * sizeof(float). Writes Width * Height * 3 uint16 to output_frame, which must
+ * not overlap temp_memory. Shared by get_mlv_raw_frame_debayered_checked and
+ * getMlvRawFrameDebayeredFromReconnedRaw16 so the two cannot drift; it reads and
+ * writes no frame cache. */
+int get_mlv_raw_frame_debayered_from_processed_raw_u16( mlvObject_t * video,
+                                                        uint64_t frame_index,
+                                                        float * temp_memory,
+                                                        uint16_t * output_frame,
+                                                        int debayer_type,
+                                                        int bit_shift,
+                                                        int debayer_threads,
+                                                        const char * capture_path_label )
 {
     int width = getMlvWidth(video);
     int height = getMlvHeight(video);
     const size_t frame_pixels = (size_t)width * (size_t)height;
-    uint16_t * raw_frame_u16 = (uint16_t *)output_frame;
-    int bit_shift = 0;
-
-    const int raw_failed = g_mlv_cache_raw_acquisition_failure_for_testing
-        || (isolated_analysis
-            ? getMlvRawFrameProcessedUint16Direct(video, frame_index, raw_frame_u16, &bit_shift)
-            : getMlvRawFrameProcessedUint16(video, frame_index, raw_frame_u16, &bit_shift));
-    if (raw_failed)
-    {
-        memset(output_frame, 0, frame_pixels * sizeof(float));
-        return 1;
-    }
-
-    for (int64_t i = (int64_t)frame_pixels - 1; i >= 0; --i)
-    {
-        output_frame[i] = (float)((uint32_t)raw_frame_u16[i] << bit_shift);
-    }
-
-    return 0;
-}
-
-static int get_mlv_raw_frame_debayered_checked( mlvObject_t * video,
-                                                uint64_t frame_index,
-                                                float * temp_memory,
-                                                uint16_t * output_frame,
-                                                int debayer_type,
-                                                int isolated_analysis ) /* 0=bilinear 1=amaze ... */
-{
-    int width = getMlvWidth(video);
-    int height = getMlvHeight(video);
-    const size_t frame_pixels = (size_t)width * (size_t)height;
-    const int debayer_threads = isolated_analysis ? 1 : getMlvCpuCores(video);
 
     if( debayer_type == 0 )
     {
         uint16_t * raw_frame_u16 = (uint16_t *)temp_memory;
-        int bit_shift = 0;
-        const int raw_failed = g_mlv_cache_raw_acquisition_failure_for_testing
-            || (isolated_analysis
-                ? getMlvRawFrameProcessedUint16Direct(video, frame_index, raw_frame_u16, &bit_shift)
-                : getMlvRawFrameProcessedUint16(video, frame_index, raw_frame_u16, &bit_shift));
-        if (raw_failed)
-        {
-            memset(output_frame, 0, frame_pixels * 3u * sizeof(uint16_t));
-            return 0;
-        }
-
         const double debayer_kernel_start = mlv_debayer_timing_now_seconds();
         debayerBasicU16(output_frame,
                         raw_frame_u16,
@@ -1163,17 +1130,6 @@ static int get_mlv_raw_frame_debayered_checked( mlvObject_t * video,
     if( debayer_type == 2 )
     {
         uint16_t * raw_frame_u16 = (uint16_t *)temp_memory;
-        int bit_shift = 0;
-        const int raw_failed = g_mlv_cache_raw_acquisition_failure_for_testing
-            || (isolated_analysis
-                ? getMlvRawFrameProcessedUint16Direct(video, frame_index, raw_frame_u16, &bit_shift)
-                : getMlvRawFrameProcessedUint16(video, frame_index, raw_frame_u16, &bit_shift));
-        if (raw_failed)
-        {
-            memset(output_frame, 0, frame_pixels * 3u * sizeof(uint16_t));
-            return 0;
-        }
-
         const double debayer_kernel_start = mlv_debayer_timing_now_seconds();
         debayerNoneU16(output_frame,
                        raw_frame_u16,
@@ -1185,17 +1141,13 @@ static int get_mlv_raw_frame_debayered_checked( mlvObject_t * video,
         return 1;
     }
 
-    /* Get the raw data in B&W and preserve acquisition failure as status.
-     * The public void wrapper historically zero-fills on failure, which is
-     * not sufficient for a cache publisher: AMaZE can successfully debayer
-     * zeros and make a failed decode look cacheable. */
-    if (get_mlv_raw_frame_float_checked(video,
-                                        frame_index,
-                                        temp_memory,
-                                        isolated_analysis))
+    /* uint16 -> float in place, from the end so no word is overwritten before it is read. */
     {
-        memset(output_frame, 0, frame_pixels * 3u * sizeof(uint16_t));
-        return 0;
+        const uint16_t * raw_frame_u16 = (const uint16_t *)temp_memory;
+        for (int64_t i = (int64_t)frame_pixels - 1; i >= 0; --i)
+        {
+            temp_memory[i] = (float)((uint32_t)raw_frame_u16[i] << bit_shift);
+        }
     }
 
     wb_convert_info_t wb_info;
@@ -1307,12 +1259,68 @@ static int get_mlv_raw_frame_debayered_checked( mlvObject_t * video,
         meta.dual_iso_mode = NULL;
         meta.debayer_mode = debayer_label;
         meta.scaler = "none";
-        meta.path_label = isolated_analysis
-            ? "get_mlv_raw_frame_debayered_isolated_analysis"
-            : "get_mlv_raw_frame_debayered";
+        meta.path_label = capture_path_label;
         mlv_pipeline_capture(frame_index, output_frame, &meta);
     }
     return 1;
+}
+
+static int get_mlv_raw_frame_debayered_checked( mlvObject_t * video,
+                                                uint64_t frame_index,
+                                                float * temp_memory,
+                                                uint16_t * output_frame,
+                                                int debayer_type,
+                                                int isolated_analysis ) /* 0=bilinear 1=amaze ... */
+{
+    int width = getMlvWidth(video);
+    int height = getMlvHeight(video);
+    const size_t frame_pixels = (size_t)width * (size_t)height;
+    uint16_t * raw_frame_u16 = (uint16_t *)temp_memory;
+    int bit_shift = 0;
+
+    /* Get the raw data in B&W and preserve acquisition failure as status.
+     * The public void wrapper historically zero-fills on failure, which is
+     * not sufficient for a cache publisher: AMaZE can successfully debayer
+     * zeros and make a failed decode look cacheable. */
+    const int raw_failed = g_mlv_cache_raw_acquisition_failure_for_testing
+        || (isolated_analysis
+            ? getMlvRawFrameProcessedUint16Direct(video, frame_index, raw_frame_u16, &bit_shift)
+            : getMlvRawFrameProcessedUint16(video, frame_index, raw_frame_u16, &bit_shift));
+    if (raw_failed)
+    {
+        if (debayer_type != 0 && debayer_type != 2)
+        {
+            memset(temp_memory, 0, frame_pixels * sizeof(float));
+        }
+        memset(output_frame, 0, frame_pixels * 3u * sizeof(uint16_t));
+        return 0;
+    }
+
+    return get_mlv_raw_frame_debayered_from_processed_raw_u16(
+        video,
+        frame_index,
+        temp_memory,
+        output_frame,
+        debayer_type,
+        bit_shift,
+        isolated_analysis ? 1 : getMlvCpuCores(video),
+        isolated_analysis
+            ? "get_mlv_raw_frame_debayered_isolated_analysis"
+            : "get_mlv_raw_frame_debayered");
+}
+
+int mlvRawDebayerCacheMayServeFrame( mlvObject_t * video, uint64_t frame_index )
+{
+    if (!video) return 1;
+    if (mlvCacheWorkerCount(video) > 0) return 1;
+    const int cache_running = !mlvCacheShouldStop(video);
+    pthread_mutex_lock(&video->g_mutexFind);
+    const int cache_sized = video->cache_limit_frames > 0;
+    const int frame_cached = frame_index < getMlvFrames(video)
+        && video->cached_frames
+        && video->cached_frames[frame_index] == MLV_FRAME_IS_CACHED;
+    pthread_mutex_unlock(&video->g_mutexFind);
+    return (cache_running && cache_sized) || frame_cached;
 }
 
 void get_mlv_raw_frame_debayered( mlvObject_t * video,

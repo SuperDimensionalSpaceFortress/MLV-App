@@ -10765,6 +10765,7 @@ void MainWindow::playbackHandling(int timeDiff)
         // PLAYBACK-CUDA-NATIVE-PACE-1: no advance outruns the pace fps (native, or the explicit
         // fpsOverride), whichever path asked for it -- the 8 ms poll, or the CUDA early advance on present.
         const double paceNowMs = mlv_stage_timing_now() * 1000.0;
+        const bool paceGuardArmedBeforeTick = m_playbackPaceGuard.armed();   // slip_summary: a re-arm mid-session
 
         //when on last frame
         if( ui->horizontalSliderPosition->value() >= ui->spinBoxCutOut->value() - 1 )
@@ -10803,6 +10804,11 @@ void MainWindow::playbackHandling(int timeDiff)
                 m_playbackInternalSliderAdvance = true;
                 ui->horizontalSliderPosition->setValue( cutInFrame );
                 m_playbackInternalSliderAdvance = false;
+                if( m_playbackSmokeActive )
+                    m_playbackSlipHistogram.noteTimelineMove( playback_slip::AdvancePath::LoopWrap,
+                                                              ui->horizontalSliderPosition->value(), paceNowMs,
+                                                              1.0, m_playbackPaceGuard.creditFrames(),
+                                                              getFramerate(), !paceGuardArmedBeforeTick );
                 m_frameChanged = true;
                 if( ui->actionAudioOutput->isChecked()
                  || ( repairDisabled && ui->actionDropFrameMode->isChecked() ) )
@@ -10837,6 +10843,11 @@ void MainWindow::playbackHandling(int timeDiff)
                     ui->horizontalSliderPosition->setValue( ui->horizontalSliderPosition->value() + 1 );
                     m_playbackInternalSliderAdvance = false;
                     m_sourceAdvance.noteEngineTick( sourcePositionBeforeTick, ui->horizontalSliderPosition->value(), false );
+                    if( m_playbackSmokeActive )
+                        m_playbackSlipHistogram.noteTimelineMove( playback_slip::AdvancePath::WholeFrame,
+                                                                  ui->horizontalSliderPosition->value(), paceNowMs,
+                                                                  1.0, m_playbackPaceGuard.creditFrames(),
+                                                                  getFramerate(), !paceGuardArmedBeforeTick );
                     m_newPosDropMode = ui->horizontalSliderPosition->value(); //track it also, for mode changing
                     m_frameChanged = true;
                 }
@@ -10854,6 +10865,10 @@ void MainWindow::playbackHandling(int timeDiff)
                         m_playbackPaceGuard.grant( getFramerate() * (double)timeDiff / 1000.0, paceNowMs, getFramerate() ),
                         ui->spinBoxCutIn->value(), ui->spinBoxCutOut->value(),
                         ui->actionLoop->isChecked() );
+                // slip_summary: the granted share, read back from the tick (a wrap subtracted the cut range width;
+                // the clamp at the last frame without Loop reports what was actually advanced).
+                const double grantedDropFrames = dropFrameTick.position - sourcePositionBeforeDropTick
+                    + ( dropFrameTick.wrapped ? static_cast<double>( ui->spinBoxCutOut->value() - ui->spinBoxCutIn->value() ) : 0.0 );
                 m_newPosDropMode = dropFrameTick.position;
                 // PLAYBACK-CLIP-LENGTH-ENFORCE-3: the drop-frame engine's source-frame advance (dropped frames
                 // still advance the timeline; a wrap never counts).
@@ -10869,6 +10884,13 @@ void MainWindow::playbackHandling(int timeDiff)
                 ui->horizontalSliderPosition->blockSignals( true );
                 ui->horizontalSliderPosition->setValue( m_newPosDropMode );
                 ui->horizontalSliderPosition->blockSignals( false );
+                if( m_playbackSmokeActive )
+                    m_playbackSlipHistogram.noteTimelineMove(
+                        dropFrameTick.wrapped ? playback_slip::AdvancePath::LoopWrap
+                                              : playback_slip::AdvancePath::DropTick,
+                        ui->horizontalSliderPosition->value(), paceNowMs,
+                        grantedDropFrames, m_playbackPaceGuard.creditFrames(),
+                        getFramerate(), !paceGuardArmedBeforeTick );
                 m_frameChanged = true;
             }
         }
@@ -19066,6 +19088,14 @@ void MainWindow::on_horizontalSliderPosition_valueChanged(int position)
         invalidateGpuPreviewProcessingConfigCache();
     }
 
+    // PLAYBACK-BACHELOR-PRESENT-JITTER-1: a slider move while playing that no engine path made (playbackHandling
+    // marks its own whole-frame and wrap moves internal, and blocks signals for the drop-frame tick).
+    if( m_playbackSmokeActive && ui->actionPlay->isChecked() && !m_playbackInternalSliderAdvance )
+    {
+        m_playbackSlipHistogram.noteTimelineMove( playback_slip::AdvancePath::Other, position,
+                                                  mlv_stage_timing_now() * 1000.0 );
+    }
+
     //Enable jumping while drop frame mode playback is active
     if( ui->actionPlay->isChecked() && ui->actionDropFrameMode->isChecked() )
     {
@@ -23981,6 +24011,8 @@ void MainWindow::beginPlaybackSmokeTelemetry( void )
     m_playbackSmokeStartAudioSyncApplied = m_playbackAudioSyncAppliedCount;
     m_playbackSmokeStartAudioSyncSkipped = m_playbackAudioSyncSkippedCount;
     m_playbackSmokeStartTime = mlv_stage_timing_now();
+    m_playbackSlipHistogram.reset( m_playbackSmokeStartPosition, getFramerate() );
+    m_playbackSlipHistogram.setPlayStart( m_playbackSmokeStartTime * 1000.0 );
     m_playbackSmokeLastPresentedTime = 0.0;
     m_playbackSmokeFirstPresentMs = 0.0;
     m_playbackSmokeFirstPresentTimelineDeltaAbs = 0;
@@ -24193,6 +24225,18 @@ void MainWindow::beginPlaybackSmokeTelemetry( void )
     m_playbackSmokeCpuDualIsoReconFallbackReasonLast.clear();
     m_playbackSmokeCpuDualIsoReconFullResFixesSumMs = 0.0;
     m_playbackSmokeCpuDualIsoReconDownsampleSumMs = 0.0;
+    m_playbackSmokeDebayered16ReconConsumedFrames = 0;
+    m_playbackSmokeDebayered16OwnReconFrames = 0;
+    m_playbackSmokeDebayered16ReconFallbackReasonLast.clear();
+    m_playbackSmokeDebayered16WorkerLlrawprocSumMs = 0.0;
+    m_playbackSmokeDebayered16RenderLlrawprocSumMs = 0.0;
+    m_playbackSmokeDebayered16OutcomeFrames.clear();
+    for( size_t i = 0; i < m_playbackSmokeDebayered16AttemptsAtBegin.size(); ++i )
+    {
+        m_playbackSmokeDebayered16AttemptsAtBegin[i] = m_pRenderThread
+            ? m_pRenderThread->debayered16ReconReuseCounters().count( static_cast<Debayered16ReconRefusal>( i ) )
+            : 0;
+    }
     m_playbackSmokeProcessed8PrefetchHits = 0;
     m_playbackSmokeRawPrefetchHits = 0;
     m_playbackSmokeQueuedPlaybackDropSum = 0;
@@ -24683,6 +24727,23 @@ void MainWindow::notePlaybackSmokePresentedFrame(
     const double presentIntervalMinusRenderTotalMs =
         qMax( 0.0, intervalMs - renderTotalMs );
     const double presentUiSignalLatencyMs = m_lastDrawFrameReadyQueueMs;
+    // PLAYBACK-BACHELOR-PRESENT-JITTER-1: the one slip-histogram call per present (summary only, no per-frame log).
+    {
+        playback_slip::PresentSample slipSample;
+        slipSample.displayFrame = static_cast<int>( displayFrame );
+        slipSample.presentMs = now * 1000.0;
+        slipSample.readyKnown = readyFrame.frameReadyEmitStageTime > 0.0;
+        slipSample.readyMs = readyFrame.frameReadyEmitStageTime * 1000.0;
+        slipSample.decodeMs = rawUint16Ms;
+        slipSample.reconMs = llrawprocTotalMs;
+        slipSample.renderMs = renderWorkMs;
+        slipSample.queueMs = queueWaitMs;
+        slipSample.drawMs = drawTotalMs;
+        slipSample.uiLatencyMs = presentUiSignalLatencyMs;
+        slipSample.timelinePosition = ui->horizontalSliderPosition->value();
+        slipSample.lookaheadCovered = requestContext.playbackLookaheadDepth > 0;
+        m_playbackSlipHistogram.notePresent( slipSample );
+    }
     const double presentDrawPresentMs = drawImageMs + drawPresentMs;
     const double presentOverlaysScopesMs = drawScopesMs + drawOverlayMs;
     const double presentRenderSlotReleaseMs = drawAdvanceMs;
@@ -25243,6 +25304,25 @@ void MainWindow::notePlaybackSmokePresentedFrame(
             telemetryDoubleValue( timing, "cpu_dualiso_recon_fullres_fixes_ms" );
         m_playbackSmokeCpuDualIsoReconDownsampleSumMs +=
             telemetryDoubleValue( timing, "cpu_dualiso_recon_downsample_ms" );
+    }
+    if( timing.contains( QStringLiteral("debayered16_phase3_recon_consumed") ) )
+    {
+        if( telemetryBoolValue( timing, "debayered16_phase3_recon_consumed" ) )
+        {
+            ++m_playbackSmokeDebayered16ReconConsumedFrames;
+        }
+        else
+        {
+            ++m_playbackSmokeDebayered16OwnReconFrames;
+            m_playbackSmokeDebayered16ReconFallbackReasonLast =
+                telemetryStringValue( timing, "debayered16_phase3_recon_fallback_reason" );
+        }
+        ++m_playbackSmokeDebayered16OutcomeFrames[
+            telemetryStringValue( timing, "debayered16_phase3_recon_outcome" )];
+        m_playbackSmokeDebayered16WorkerLlrawprocSumMs +=
+            telemetryDoubleValue( timing, "debayered16_recon_worker_llrawproc_total_ms" );
+        m_playbackSmokeDebayered16RenderLlrawprocSumMs +=
+            telemetryDoubleValue( timing, "llrawproc_total_ms" );
     }
     if( borrowedPreparedRgb8Bytes > 0.0 )
     {
@@ -26663,6 +26743,7 @@ void MainWindow::noteContactSheetPresentedFrame(
     }
 
     const double grabMs = static_cast<double>( grabTimer.nsecsElapsed() ) / 1000000.0;
+    m_playbackSlipHistogram.noteGrab( grabMs );   // slip_summary: this grab lands in the next present's interval
     const bool frameOk = !gpuWindowGrabFailedClosed
         && !contactFrameImage.isNull();
 
@@ -26999,6 +27080,14 @@ void MainWindow::finishPlaybackSmokeTelemetry( const char *reason )
                // ENFORCE-4 r2: binds this receipt to the invocation that wrote it (see automationRunNonce()).
                .arg( automationRunNonce() );
 
+    // PLAYBACK-BACHELOR-PRESENT-JITTER-1: the slip summary is taken here, before pace_summary, because the wait for the
+    // first frame is mostly repaid AFTER the first present: no grant runs while the render thread is busy, so the
+    // guard banks the wait and a later unshaped tick spends it in one burst (Bachelor x4: 23-28 frames about a
+    // second in). Sampling the catch-up at the first present alone left that burst in the paced timeline rate
+    // (timeline_fps_after_first_present 25.0-25.3 at pace 23.976). The delayed part joins the catch-up here.
+    const playback_slip::Summary slipSummary = m_playbackSlipHistogram.finish( now * 1000.0, currentPosition );
+    m_playbackSmokeFirstPresentTimelineDeltaAbs += slipSummary.startupCatchupAfterFirstFrames;
+
     // PLAYBACK-PACE-GUARD-THROUGHPUT-1: timeline_fps above counts the wait for the first frame as playback, so a
     // slow first present (UM r5: 3753 ms) reads as a pace below native. These are the rates the pace governs: frames
     // and time both start at the first present, so what the first present's own advance repaid for the wait
@@ -27066,6 +27155,119 @@ void MainWindow::finishPlaybackSmokeTelemetry( const char *reason )
                    .arg( overlap.decodeBusyMs, 0, 'f', 3 )
                    .arg( overlap.reconBusyMs, 0, 'f', 3 )
                    .arg( static_cast<qulonglong>( overlap.reconStartsHeldForRender ) );
+    }
+
+    // PLAYBACK-BACHELOR-PRESENT-JITTER-1: where the lost frames went (PlaybackSlipHistogram.h). Slips and class
+    // counts are in frames; slips_per_1000 is per timeline frame after the first present. timeline_advance_by_path
+    // splits the session's timeline delta by the engine path that made it (other = any slider move no engine path
+    // made, plus whatever the paths do not explain), against what the pace guard granted.
+    {
+        using namespace playback_slip;
+        const Summary &slip = slipSummary;
+        const auto joined = []( const auto &values ) -> QString
+        {
+            QStringList parts;
+            for( const auto v : values ) parts << QString::number( static_cast<qlonglong>( v ) );
+            return parts.join( QLatin1Char('/') );
+        };
+        const auto clsFrames = [&slip]( SlipClass c ) -> qlonglong
+        {
+            return static_cast<qlonglong>( slip.classFrames[static_cast<int>( c )] );
+        };
+        const auto stageFrames = [&slip]( UpstreamStage s ) -> qlonglong
+        {
+            return static_cast<qlonglong>( slip.upstreamStageFrames[static_cast<int>( s )] );
+        };
+        const auto pathFrames = [&slip]( AdvancePath p ) -> qlonglong
+        {
+            return static_cast<qlonglong>( slip.advanceByPath[static_cast<int>( p )] );
+        };
+        const QString session = QString::number( static_cast<qulonglong>( m_playbackSmokeSessionId ) );
+        QStringList fields;
+        fields << QStringLiteral("playback_smoke.slip_summary session=%1").arg( session )
+               << QStringLiteral("presents=%1").arg( slip.presents )
+               << QStringLiteral("slips_total=%1").arg( static_cast<qlonglong>( slip.slipsTotal ) )
+               << QStringLiteral("slips_per_1000=%1").arg( slip.slipsPer1000, 0, 'f', 3 )
+               << QStringLiteral("max_slip=%1").arg( slip.maxSlip )
+               << QStringLiteral("max_interval_ms=%1").arg( slip.maxIntervalMs, 0, 'f', 3 )
+               << QStringLiteral("max_interval_frame=%1").arg( slip.maxIntervalFrame )
+               << QStringLiteral("startup_catchup_frames=%1").arg( slip.startupCatchupFrames )
+               << QStringLiteral("timeline_after_first=%1").arg( slip.timelineAfterFirstFps, 0, 'f', 3 )
+               << QStringLiteral("presented_after_first=%1").arg( slip.presentedAfterFirstFps, 0, 'f', 3 )
+               << QStringLiteral("native_equiv_presented_fps=%1").arg( slip.nativeEquivPresentedFps, 0, 'f', 3 )
+               << QStringLiteral("hist_slip=%1").arg( joined( slip.histSlip ) )
+               << QStringLiteral("hist_interval=%1").arg( joined( slip.histInterval ) )
+               << QStringLiteral("cls_capture=%1").arg( clsFrames( SlipClass::Capture ) )
+               << QStringLiteral("cls_gap=%1").arg( clsFrames( SlipClass::Gap ) )
+               << QStringLiteral("cls_gui_late=%1").arg( clsFrames( SlipClass::GuiLate ) )
+               << QStringLiteral("cls_upstream_late=%1(decode:%2/recon:%3/render:%4/queue:%5/none:%6)")
+                      .arg( clsFrames( SlipClass::UpstreamLate ) )
+                      .arg( stageFrames( UpstreamStage::Decode ) )
+                      .arg( stageFrames( UpstreamStage::Recon ) )
+                      .arg( stageFrames( UpstreamStage::Render ) )
+                      .arg( stageFrames( UpstreamStage::Queue ) )
+                      .arg( stageFrames( UpstreamStage::None ) )
+               << QStringLiteral("cls_clock=%1").arg( clsFrames( SlipClass::Clock ) )
+               << QStringLiteral("grab_ms_total=%1").arg( slip.grabMsTotal, 0, 'f', 3 )
+               << QStringLiteral("pace_guard_granted_frames=%1").arg( slip.paceGuardGrantedFrames, 0, 'f', 3 )
+               << QStringLiteral("timeline_advance_by_path=drop_tick:%1/whole_frame:%2/loop_wrap:%3/other:%4")
+                      .arg( pathFrames( AdvancePath::DropTick ) )
+                      .arg( pathFrames( AdvancePath::WholeFrame ) )
+                      .arg( pathFrames( AdvancePath::LoopWrap ) )
+                      .arg( pathFrames( AdvancePath::Other ) )
+               << QStringLiteral("timeline_delta_at_first_present=%1").arg( slip.timelineDeltaAtFirstPresent )
+               // Beyond the card's field list: what the counts above need to add up and to be read.
+               << QStringLiteral("cls_other=%1").arg( clsFrames( SlipClass::Other ) )
+               << QStringLiteral("slip_events=%1").arg( slip.slipEvents )
+               << QStringLiteral("non_capture_per_1000=%1").arg( slip.nonCapturePer1000, 0, 'f', 3 )
+               << QStringLiteral("non_capture_non_gap_per_1000=%1").arg( slip.nonCaptureNonGapPer1000, 0, 'f', 3 )
+               << QStringLiteral("max_interval_class=%1").arg( QLatin1String( slipClassName( slip.maxIntervalClass ) ) )
+               << QStringLiteral("timeline_frames_after_first=%1").arg( slip.timelineFramesAfterFirst )
+               << QStringLiteral("pace_guard_granted_after_first=%1").arg( slip.paceGuardGrantedAfterFirstFrames, 0, 'f', 3 )
+               << QStringLiteral("pace_guard_max_lead_frames=%1").arg( slip.paceGuardMaxLeadFrames, 0, 'f', 3 )
+               << QStringLiteral("pace_guard_max_lead_ms=%1").arg( slip.paceGuardMaxLeadMs, 0, 'f', 1 )
+               << QStringLiteral("pace_guard_rearms=%1").arg( slip.paceGuardRearms )
+               << QStringLiteral("pace_guard_fps=%1/%2").arg( slip.paceGuardFpsMin, 0, 'f', 3 ).arg( slip.paceGuardFpsMax, 0, 'f', 3 )
+               << QStringLiteral("pace_guard_max_grant_frames=%1").arg( slip.paceGuardMaxGrantFrames, 0, 'f', 3 )
+               << QStringLiteral("pace_guard_bursts=%1").arg( slip.paceGuardBursts )
+               << QStringLiteral("pace_guard_burst_frames=%1").arg( slip.paceGuardBurstFrames, 0, 'f', 3 )
+               << QStringLiteral("startup_wait_credit_frames=%1").arg( slip.startupWaitCreditFrames )
+               << QStringLiteral("startup_catchup_after_first=%1").arg( slip.startupCatchupAfterFirstFrames )
+               << QStringLiteral("timeline_after_first_raw=%1").arg( slip.timelineAfterFirstRawFps, 0, 'f', 3 )
+               << QStringLiteral("slips_after_gap=%1").arg( static_cast<qlonglong>( slip.slipsAfterGap ) )
+               << QStringLiteral("slip_events_after_gap=%1").arg( slip.slipEventsAfterGap )
+               << QStringLiteral("wraps=%1").arg( slip.wraps )
+               << QStringLiteral("repeats=%1").arg( slip.repeats )
+               << QStringLiteral("grabs=%1").arg( slip.grabs )
+               << QStringLiteral("lookahead_uncovered_slip_events=%1").arg( slip.lookaheadUncoveredSlipEvents );
+        qInfo().noquote() << fields.join( QLatin1Char(' ') );
+        for( const SlipRecord &r : slip.slipLines )
+        {
+            qInfo().noquote()
+                << QStringLiteral(
+                       "playback_smoke.slip session=%1 frame=%2 size=%3 interval_ms=%4 class=%5 sub=%6 "
+                       "decode_ms=%7 recon_ms=%8 render_ms=%9 queue_ms=%10 draw_ms=%11 ui_latency_ms=%12 "
+                       "grab_ms=%13 covered=%14 credit=%15 ready_minus_deadline_ms=%16 timeline_advanced=%17 "
+                       "after_gap=%18" )
+                       .arg( session )
+                       .arg( r.frame )
+                       .arg( r.size )
+                       .arg( r.intervalMs, 0, 'f', 3 )
+                       .arg( QLatin1String( slipClassName( r.cls ) ) )
+                       .arg( QLatin1String( upstreamStageName( r.sub ) ) )
+                       .arg( r.decodeMs, 0, 'f', 3 )
+                       .arg( r.reconMs, 0, 'f', 3 )
+                       .arg( r.renderMs, 0, 'f', 3 )
+                       .arg( r.queueMs, 0, 'f', 3 )
+                       .arg( r.drawMs, 0, 'f', 3 )
+                       .arg( r.uiLatencyMs, 0, 'f', 3 )
+                       .arg( r.grabMs, 0, 'f', 3 )
+                       .arg( bool01( r.lookaheadCovered ) )
+                       .arg( r.paceCreditFrames, 0, 'f', 3 )
+                       .arg( ( r.readyKnown && r.deadlineKnown ) ? r.readyMs - r.deadlineMs : 0.0, 0, 'f', 3 )
+                       .arg( r.timelineAdvancedInInterval )
+                       .arg( bool01( r.afterGap ) );
+        }
     }
 
     if( perfFieldLogEnabled() )
@@ -27540,6 +27742,75 @@ void MainWindow::finishPlaybackSmokeTelemetry( const char *reason )
                    .arg( spans.downscaleBranchLast.isEmpty() ? QStringLiteral("unset") : spans.downscaleBranchLast )
                    .arg( joinCounts( spans.downscaleBranchCounts ) )
                    .arg( spans.stageMaskLast );
+    }
+
+    /* CPU-DEBAYERED16-REUSE-PHASE3-RECON-1: debayered-16 frames whose render
+     * consumed the phase-3 recon (one recon per frame) versus ran its own decode
+     * + recon (two), and both threads' llrawproc ms per such frame. */
+    {
+        const int debayered16Frames =
+            m_playbackSmokeDebayered16ReconConsumedFrames + m_playbackSmokeDebayered16OwnReconFrames;
+        const auto perDebayered16Frame = [debayered16Frames]( double sumMs ) {
+            return debayered16Frames > 0 ? sumMs / debayered16Frames : 0.0;
+        };
+        const auto presentedOutcome = [this]( Debayered16ReconRefusal outcome ) {
+            return m_playbackSmokeDebayered16OutcomeFrames.value(
+                QString::fromLatin1( debayered16ReconRefusalName( outcome ) ), 0 );
+        };
+        qInfo().noquote()
+            << QStringLiteral(
+                   "playback_smoke.debayered16_recon_reuse_summary session=%1 "
+                   "scope=presented_frames "
+                   "debayered16_recon_consumed_frames=%2 debayered16_own_recon_frames=%3 "
+                   "avg_recon_worker_llrawproc_ms=%4 avg_render_llrawproc_ms=%5 "
+                   "debayered16_fallback_reason_last=\"%6\" "
+                   "refused_acquisition_failed=%7 refused_gpu_playback_recon=%8 "
+                   "refused_settings_changed_during_recon=%9 "
+                   "refused_settings_changed_since_recon=%10" )
+                   .arg( static_cast<qulonglong>( m_playbackSmokeSessionId ) )
+                   .arg( m_playbackSmokeDebayered16ReconConsumedFrames )
+                   .arg( m_playbackSmokeDebayered16OwnReconFrames )
+                   .arg( perDebayered16Frame( m_playbackSmokeDebayered16WorkerLlrawprocSumMs ), 0, 'f', 3 )
+                   .arg( perDebayered16Frame( m_playbackSmokeDebayered16RenderLlrawprocSumMs ), 0, 'f', 3 )
+                   .arg( m_playbackSmokeDebayered16ReconFallbackReasonLast )
+                   .arg( presentedOutcome( Debayered16ReconRefusal::AcquisitionFailed ) )
+                   .arg( presentedOutcome( Debayered16ReconRefusal::GpuPlaybackRecon ) )
+                   .arg( presentedOutcome( Debayered16ReconRefusal::SettingsChangedDuringRecon ) )
+                   .arg( presentedOutcome( Debayered16ReconRefusal::SettingsChangedSinceRecon ) );
+
+        /* Every render attempt in the session, presented or not (Sol H3): the
+         * render thread's counters minus their value at session begin. */
+        if( m_pRenderThread )
+        {
+            const Debayered16ReconReuseCounters &counters =
+                m_pRenderThread->debayered16ReconReuseCounters();
+            qulonglong attemptsConsumed = 0;
+            qulonglong attemptsOwnRecon = 0;
+            QString byOutcome;
+            for( size_t i = 0; i < m_playbackSmokeDebayered16AttemptsAtBegin.size(); ++i )
+            {
+                const Debayered16ReconRefusal outcome = static_cast<Debayered16ReconRefusal>( i );
+                const qulonglong attempts = static_cast<qulonglong>(
+                    counters.count( outcome ) - m_playbackSmokeDebayered16AttemptsAtBegin[i] );
+                if( outcome == Debayered16ReconRefusal::None ) attemptsConsumed = attempts;
+                else attemptsOwnRecon += attempts;
+                byOutcome += QStringLiteral(" attempts_%1=%2")
+                                 .arg( QString::fromLatin1( debayered16ReconRefusalName( outcome ) ) )
+                                 .arg( attempts );
+            }
+            const qlonglong presented =
+                m_playbackSmokeDebayered16ReconConsumedFrames + m_playbackSmokeDebayered16OwnReconFrames;
+            qInfo().noquote()
+                << QStringLiteral(
+                       "playback_smoke.debayered16_recon_reuse_attempts session=%1 "
+                       "scope=render_attempts attempts_total=%2 attempts_own_recon_total=%3 "
+                       "attempts_minus_presented=%4%5" )
+                       .arg( static_cast<qulonglong>( m_playbackSmokeSessionId ) )
+                       .arg( attemptsConsumed + attemptsOwnRecon )
+                       .arg( attemptsOwnRecon )
+                       .arg( static_cast<qlonglong>( attemptsConsumed + attemptsOwnRecon ) - presented )
+                       .arg( byOutcome );
+        }
     }
 
     qInfo().noquote()

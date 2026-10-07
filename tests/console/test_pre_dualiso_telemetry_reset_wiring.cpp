@@ -72,7 +72,11 @@ TEST(PreDualIsoTelemetryResetWiring, ResetPrecedesEveryRenderPathIncludingTheGpu
         // CPU render entries, all output modes.
         QStringLiteral("getMlvProcessedFrame16Scaled("),
         QStringLiteral("getMlvRawFrameFloat("),
-        QStringLiteral("getMlvRawFrameDebayered("),
+        // OutputDebayered16: CPU-DEBAYERED16-REUSE-PHASE3-RECON-1 r2 moved its
+        // getMlvRawFrameDebayered call into this shared dispatch
+        // (Debayered16ReconReusePolicy.h); any direct call left in drawFrame is
+        // pinned after the reset below.
+        QStringLiteral("renderDebayered16FromSlot("),
         QStringLiteral("getMlvProcessedFrame8ScaledFromReconnedRaw16("),
         QStringLiteral("getMlvProcessedFrame8ScaledFromRaw16("),
         QStringLiteral("getMlvProcessedFrame8Scaled(") };
@@ -80,6 +84,11 @@ TEST(PreDualIsoTelemetryResetWiring, ResetPrecedesEveryRenderPathIncludingTheGpu
         const int siteAt = body.indexOf(site);
         ASSERT_TRUE(siteAt >= 0);
         ASSERT_TRUE(resetAt < siteAt);
+    }
+    const QString directDebayered = QStringLiteral("getMlvRawFrameDebayered(");
+    for (int from = 0, at = body.indexOf(directDebayered); at >= 0; at = body.indexOf(directDebayered, from)) {
+        ASSERT_TRUE(resetAt < at);
+        from = at + directDebayered.length();
     }
 }
 

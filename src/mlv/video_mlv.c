@@ -779,13 +779,10 @@ static uint64_t mlv_hash_lut(uint64_t hash, const lut_t * lut)
     return hash;
 }
 
-static uint64_t mlv_hash_llrawproc_state(uint64_t hash, const llrawprocObject_t * llrawproc)
+/* The llrawproc settings scalars, in the order mlv_hash_llrawproc_state has
+ * always hashed them (it calls this first, so its value is unchanged). */
+static uint64_t mlv_hash_llrawproc_settings_scalars(uint64_t hash, const llrawprocObject_t * llrawproc)
 {
-    if (!llrawproc)
-    {
-        return mlv_hash_bytes(hash, "", 1);
-    }
-
     hash = mlv_hash_bytes(hash, &llrawproc->fix_raw, sizeof(llrawproc->fix_raw));
     hash = mlv_hash_bytes(hash, &llrawproc->vertical_stripes, sizeof(llrawproc->vertical_stripes));
     hash = mlv_hash_bytes(hash, &llrawproc->compute_stripes, sizeof(llrawproc->compute_stripes));
@@ -820,6 +817,17 @@ static uint64_t mlv_hash_llrawproc_state(uint64_t hash, const llrawprocObject_t 
      * across a paused -> playing transition. */
     hash = mlv_hash_bytes(hash, &llrawproc->diso_playback_force_disable_alias_map, sizeof(llrawproc->diso_playback_force_disable_alias_map));
     hash = mlv_hash_bytes(hash, &llrawproc->dark_frame, sizeof(llrawproc->dark_frame));
+    return hash;
+}
+
+static uint64_t mlv_hash_llrawproc_state(uint64_t hash, const llrawprocObject_t * llrawproc)
+{
+    if (!llrawproc)
+    {
+        return mlv_hash_bytes(hash, "", 1);
+    }
+
+    hash = mlv_hash_llrawproc_settings_scalars(hash, llrawproc);
     /* Phase 2C: diso_pattern, diso_ev_correction, diso_black_delta and the
      * dng_* fields are auto-published per frame by Dual ISO recon (see
      * src/mlv/llrawproc/llrawproc.c:llrawproc_publish_worker_results) and
@@ -851,6 +859,44 @@ static uint64_t mlv_hash_llrawproc_state(uint64_t hash, const llrawprocObject_t 
     }
     hash = mlv_hash_pixel_map(hash, &llrawproc->focus_pixel_map);
     hash = mlv_hash_pixel_map(hash, &llrawproc->bad_pixel_map);
+    return hash;
+}
+
+uint64_t getMlvLlrawprocSettingsFingerprint(mlvObject_t * video)
+{
+    uint64_t hash = MLV_FNV1A_OFFSET_BASIS;
+    if (!video)
+    {
+        return hash;
+    }
+    hash = mlv_hash_bytes(hash, &video->RAWI.raw_info.black_level, sizeof(video->RAWI.raw_info.black_level));
+    hash = mlv_hash_bytes(hash, &video->RAWI.raw_info.white_level, sizeof(video->RAWI.raw_info.white_level));
+    hash = mlv_hash_bytes(hash, &video->RAWI.raw_info.bits_per_pixel, sizeof(video->RAWI.raw_info.bits_per_pixel));
+    llrawprocObject_t * llrawproc = video->llrawproc;
+    if (!llrawproc)
+    {
+        return mlv_hash_bytes(hash, "", 1);
+    }
+    pthread_mutex_lock(&video->llrawproc_mutex);
+    hash = mlv_hash_llrawproc_settings_scalars(hash, llrawproc);
+    /* r3 (fable r2 H1): the dual-ISO pattern and exposure matching are recon
+     * inputs (manual EV, black delta and pattern; dualiso.c uses any value other
+     * than 1 / -1 as given). The processed-frame cache key leaves them out because
+     * recon publishes them; it publishes only when they change
+     * (llrawproc_runtime_state_equal), so after a clip's first recon they hold
+     * still, and a recon that does change them is refused as changed during it. */
+    hash = mlv_hash_bytes(hash, &llrawproc->diso_pattern, sizeof(llrawproc->diso_pattern));
+    hash = mlv_hash_bytes(hash, &llrawproc->diso_ev_correction, sizeof(llrawproc->diso_ev_correction));
+    hash = mlv_hash_bytes(hash, &llrawproc->diso_black_delta, sizeof(llrawproc->diso_black_delta));
+    /* The dark frame and the pixel maps by version (bumped on every load or
+     * rebuild), not by content: this runs three times per played frame. */
+    hash = mlv_hash_bytes(hash, &llrawproc->dark_frame_version, sizeof(llrawproc->dark_frame_version));
+    hash = mlv_hash_bytes(hash, &llrawproc->dark_frame_size, sizeof(llrawproc->dark_frame_size));
+    hash = mlv_hash_bytes(hash, &llrawproc->focus_pixel_map_version, sizeof(llrawproc->focus_pixel_map_version));
+    hash = mlv_hash_bytes(hash, &llrawproc->focus_pixel_map.count, sizeof(llrawproc->focus_pixel_map.count));
+    hash = mlv_hash_bytes(hash, &llrawproc->bad_pixel_map_version, sizeof(llrawproc->bad_pixel_map_version));
+    hash = mlv_hash_bytes(hash, &llrawproc->bad_pixel_map.count, sizeof(llrawproc->bad_pixel_map.count));
+    pthread_mutex_unlock(&video->llrawproc_mutex);
     return hash;
 }
 
@@ -6294,6 +6340,48 @@ void getMlvRawFrameDebayered(mlvObject_t * video, uint64_t frameIndex, uint16_t 
     video->current_cached_frame_active = 1;
     video->current_cached_frame = frameIndex;
     pthread_mutex_unlock(&video->g_mutexFind);
+}
+
+int getMlvRawFrameDebayeredFromReconnedRaw16(mlvObject_t * video,
+                                             uint64_t frameIndex,
+                                             float * reconnedRawScratch,
+                                             uint16_t * outputFrame,
+                                             int reconHqDualIso)
+{
+    if (!video || !reconnedRawScratch || !outputFrame) return 0;
+    const int width = getMlvWidth(video);
+    const int height = getMlvHeight(video);
+    if (width <= 0 || height <= 0
+        || frameIndex >= getMlvFrames(video)
+        || (size_t)width > SIZE_MAX / (size_t)height
+        || (size_t)width * (size_t)height > SIZE_MAX / (sizeof(uint16_t) * 3u))
+    {
+        return 0;
+    }
+    if (mlvRawDebayerCacheMayServeFrame(video, frameIndex)) return 0;
+
+    /* No decode and no llrawproc run on this thread for this frame: clear the
+     * thread's last-run records so its telemetry does not report a previous
+     * frame's. */
+    mlv_reset_last_raw_stage_telemetry();
+    resetMlvLastDebayerStageMilliseconds();
+    g_mlv_last_llrawproc_ms = 0.0;
+    g_mlv_last_raw_float_convert_ms = 0.0;
+    llrpResetLastRunTimingForCurrentThread();
+
+    /* What getMlvRawFrameProcessedUint16 reports after its llrawproc run, from
+     * the HQ dual-ISO state the recon ran under (r3: never the live object,
+     * whose settings may have changed since the caller's admission check). */
+    const int bit_shift = reconHqDualIso ? 0 : (16 - video->RAWI.raw_info.bits_per_pixel);
+    return get_mlv_raw_frame_debayered_from_processed_raw_u16(
+        video,
+        frameIndex,
+        reconnedRawScratch,
+        outputFrame,
+        doesMlvAlwaysUseAmaze(video),
+        bit_shift,
+        getMlvCpuCores(video),
+        "get_mlv_raw_frame_debayered_from_reconned_raw16");
 }
 
 static void mlv_compute_desired_processing_bw_levels(mlvObject_t * video,
