@@ -20,7 +20,9 @@ a ``-split`` / a ``Verb-...Array...`` helper (never a name that merely contains 
 or aliases one of those. A split clears the parameter only in one of two whitelisted forms (``is_normalised``); every
 other shape is flagged. TEMP/DIRECT: ``$X = $P -split ','`` or ``$X = $P[0].Split(',')`` (``$X`` may be ``$P``), with
 ``$X`` later read as a bare token. STAGE: ``$P | ForEach-Object { $_ -split ',' }`` (or ``%``), whose block is that
-one split expression and nothing else (or exactly ``if (Test-Path -LiteralPath $_) { $_ } else { <that split> }``), assigned back to ``$P``, assigned to a variable read later, or piped on. Every
+one split expression and nothing else (or exactly ``if (Test-Path -LiteralPath $_) { $_ } else { <that split> }``), assigned back to ``$P``, assigned to a variable read later, or piped on
+(never into ``Out-Null`` or ``> $null``; a ``$null`` or ``[void]`` target never counts). Only top-level script code
+counts: a split or a read inside a ``function`` / ``filter`` definition (name, parameter list, body) is ignored. Every
 comment and string literal (both quote kinds, both here-string kinds) is blanked first, so neither a split nor a read
 inside a string counts. A ``[ValidateSet]`` on a top-level ``[string[]]`` parameter is never cleared by a split (it
 rejects the joined element at bind time), so a comma-list caller is flagged.
@@ -281,8 +283,8 @@ def _statements(body: str) -> list[str]:
 
 @functools.lru_cache(maxsize=8)
 def _body_statements(text: str, block_end: int) -> tuple[str, ...]:
-    """Statements after the param block; cached because every parameter of a script reads the same body."""
-    return tuple(_statements(_blank_comments(text, literals=True)[block_end:]))
+    """Top-level statements after the param block; cached because every parameter of a script reads the same body."""
+    return tuple(_statements(_blank_functions(_blank_comments(text, literals=True)[block_end:])))
 
 
 # The r4 whitelist. Statements reach these patterns with every string literal blanked to spaces, so ``_LIT`` only
@@ -337,6 +339,38 @@ def _matching(text: str, i: int) -> int:
     return n
 
 
+_DEFINITION = re.compile(r"(?<![\w$.`-])(?:function|filter)\s+[A-Za-z_$][\w:$-]*", re.I)
+
+
+def _blank_functions(text: str) -> str:
+    """Blank every ``function`` / ``filter`` definition (keyword, name, parameter list, param() block and body).
+
+    Code in a definition runs only if called, in its own scope, so neither a split nor a read there counts for the
+    script parameter (no call graph is followed). A definition with no body brace, or one that never closes, is
+    blanked to the end of the text. Newlines are kept, so the length never changes.
+    """
+    parts: list[str] = []
+    pos, n = 0, len(text)
+    while (m := _DEFINITION.search(text, pos)) is not None:
+        i = m.end()
+        while i < n and text[i].isspace():
+            i += 1
+        if i < n and text[i] == "(":
+            i = _matching(text, i) + 1
+            while i < n and text[i].isspace():
+                i += 1
+        end = min(n, _matching(text, i) + 1) if i < n and text[i] == "{" else n
+        parts.append(text[pos:m.start()])
+        parts.append("".join(ch if ch in "\r\n" else " " for ch in text[m.start():end]))
+        pos = end
+    parts.append(text[pos:])
+    return "".join(parts)
+
+
+# A split result that is thrown away: piped into Out-Null or redirected to $null anywhere after the stage.
+_DISCARDED = re.compile(r"\|\s*Out-Null\b|>\s*\$null\b", re.I)
+
+
 def _stage_split(expr: str, source: re.Pattern[str]) -> int:
     """End offset (just past ``}``) of a whitelisted split stage at the start of ``expr``, else -1.
 
@@ -348,7 +382,7 @@ def _stage_split(expr: str, source: re.Pattern[str]) -> int:
     if not m:
         return -1
     close = _matching(expr, m.end() - 1)
-    if close >= len(expr) or not _STAGE_BODY.fullmatch(expr, m.end(), close):
+    if close >= len(expr) or not _STAGE_BODY.fullmatch(expr, m.end(), close) or _DISCARDED.search(expr, close + 1):
         return -1
     return close + 1
 
@@ -357,7 +391,9 @@ def is_normalised(text: str, name: str, block_end: int) -> bool:
     """True only when a split of ``$name`` matches one of the two whitelisted forms; every other shape fails closed.
 
     Statements are read with every comment and string literal blanked, so neither a split nor a read inside a
-    string ever counts.
+    string ever counts, and with every ``function`` / ``filter`` definition blanked, so only top-level script code
+    counts as a split or a read. A split assigned to ``$null`` or under a ``[void]`` cast, or whose stage output is
+    piped into ``Out-Null`` or redirected to ``$null``, is never credited.
 
     1. TEMP/DIRECT: ``$X = $Name -split '<lit>'`` / ``$X = $Name[0].Split(...)`` (optionally inside ``@( )``), with
        ``$X`` either another variable or ``$Name`` itself, and ``$X`` later read as a bare (not backtick-escaped)
@@ -374,6 +410,7 @@ def is_normalised(text: str, name: str, block_end: int) -> bool:
     stage_stmt = re.compile(var + r"\s*\|\s*(?:ForEach-Object|%)\s*\{", re.I)
     helper = re.compile(r"Resolve-[\w-]+.*" + var, re.I)
     assign = re.compile(r"^(?:\[[^\]]*\]\s*)*\$(\w+)\s*=\s*(.*)$", re.I)
+    void_cast = re.compile(r"^(?:\[[^\]]*\]\s*)*\[void\]", re.I)
 
     def read_before_overwrite(target: str, later: tuple[str, ...]) -> bool:
         mention = re.compile(r"(?<!`)\$" + re.escape(target) + r"\b", re.I)
@@ -390,7 +427,7 @@ def is_normalised(text: str, name: str, block_end: int) -> bool:
         m = assign.match(stmt)
         if m:
             target, rhs = m.group(1), m.group(2)
-            if target.lower() == "null":
+            if target.lower() == "null" or void_cast.match(stmt):
                 continue
             if target.lower() == name.lower() and (_stage_split(rhs, stage_rhs) >= 0 or helper.match(rhs)):
                 return True
@@ -890,6 +927,57 @@ class PwshStringArrayFileParams(unittest.TestCase):
             "$parts = $Dirs | ForEach-Object {\n    $_ -split ','\n}\n$parts | ForEach-Object { $_ }\n",
         ):
             self.assertEqual([], self._flag_body(body), body)
+
+    def test_red_split_temporary_mentioned_only_inside_a_function_does_not_clear_it(self):
+        # sol r5 SPLIT-DATAFLOW-FUNCTION-SCOPE-1: a function's name, parameter list, param() block and body are not reads.
+        split = "$parts = $Dirs[0].Split(',')\n"
+        tail = "$Dirs | ForEach-Object { $_ }\n"
+        for function in (
+            "function Write-Parts([string[]]$parts) { $parts }\n",
+            "function Write-Parts {\n    param([string[]]$parts)\n    $parts\n}\n",
+            "function Show-Parts { Write-Host $parts }\n",
+            "filter Show-Parts { $parts }\n",
+            "function $parts { 1 }\n",
+        ):
+            body = split + function + tail
+            self.assertEqual([("tools/x/trace.ps1", "Dirs")], self._flag_body(body), body)
+        # a top-level read still counts with a function defined beside it
+        body = split + "function Show-Parts { Write-Host $parts }\nWrite-Verbose $parts\n" + tail
+        self.assertEqual([], self._flag_body(body), body)
+
+    def test_red_split_wholly_inside_an_uncalled_function_does_not_clear_it(self):
+        # sol r5 SPLIT-DATAFLOW-FUNCTION-SCOPE-1, second variant: a split inside a definition never normalises the parameter.
+        tail = "$Dirs | ForEach-Object { $_ }\n"
+        for function in (
+            "function Get-Parts {\n    $parts = $Dirs[0].Split(',')\n    $parts\n}\n",
+            "function Get-Parts { $Dirs = $Dirs -split ','\n$Dirs | ForEach-Object { $_ } }\n",
+            "function Get-Parts([string[]]$Dirs) { $Dirs = @($Dirs | ForEach-Object { $_ -split ',' }) }\n",
+            "filter Get-Parts { $Dirs | ForEach-Object { $_ -split ',' } | ForEach-Object { $_ } }\n",
+        ):
+            body = function + tail
+            self.assertEqual([("tools/x/trace.ps1", "Dirs")], self._flag_body(body), body)
+        body = "$Dirs = $Dirs -split ','\nfunction Get-Parts { 1 }\n" + tail
+        self.assertEqual([], self._flag_body(body), body)
+
+    def test_red_split_assigned_to_null_is_never_credited(self):
+        # fable r5 NULL-TARGET-SKIP-UNTESTED-1: a later `$null` mention must not read a split discarded into $null.
+        body = "$null = $Dirs -split ','\n$x = $null\n$Dirs | ForEach-Object { $_ }\n"
+        self.assertEqual([("tools/x/trace.ps1", "Dirs")], self._flag_body(body), body)
+
+    def test_red_split_stage_whose_output_is_discarded_does_not_clear_it(self):
+        # fable r5 STAGE-PIPED-TO-OUT-NULL-CREDITED-1: a stage piped into Out-Null, assigned to $null or cast to
+        # [void] discards the split result.
+        for body in (
+            "$Dirs | ForEach-Object { $_ -split ',' } | Out-Null\n",
+            "$Dirs | % { $_ -split ',' } | ForEach-Object { $_.Trim() } | Out-Null\n",
+            "$Dirs | ForEach-Object { $_ -split ',' } | ForEach-Object { $_ } > $null\n",
+            "$Dirs = $Dirs | ForEach-Object { $_ -split ',' } | Out-Null\n$Dirs | ForEach-Object { $_ }\n",
+            "$parts = $Dirs | ForEach-Object { $_ -split ',' } | Out-Null\n$parts | ForEach-Object { $_ }\n",
+            "$null = $Dirs | ForEach-Object { $_ -split ',' }\n$x = $null\n$Dirs | ForEach-Object { $_ }\n",
+            "[void]($Dirs | ForEach-Object { $_ -split ',' })\n$Dirs | ForEach-Object { $_ }\n",
+            "[void]$parts = $Dirs -split ','\n$parts | ForEach-Object { $_ }\n",
+        ):
+            self.assertEqual([("tools/x/trace.ps1", "Dirs")], self._flag_body(body), body)
 
     def test_red_dotnet_split_array_variable_to_file_child_is_flagged(self):
         script = {"tools/x/trace.ps1": self._split_fixed()}
