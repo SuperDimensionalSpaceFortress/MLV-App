@@ -32,6 +32,8 @@
 #include <QDir>
 #include <QXmlStreamWriter>
 
+#include <algorithm>
+#include <cmath>
 #include <cstdio>
 #include <cstdlib>
 #include <QFile>
@@ -414,6 +416,16 @@ QString tablesSha256( const GradationTables &t )
 
 int tableIndex( double x ) { return static_cast<int>( x * 65535.0 + 0.5 ); }
 
+// The green-magenta axis G - (R+B)/2 of one display-referred pixel after the engine's gradation stage, in 8-bit code
+// values (16-bit / 257). The stage as every kernel applies it: each channel through Y, then through its own table.
+double gradedGreenAxis8( const GradationTables &t, double r, double g, double b )
+{
+    const double R = t.r[t.y[tableIndex( r )]];
+    const double G = t.g[t.y[tableIndex( g )]];
+    const double B = t.b[t.y[tableIndex( b )]];
+    return ( G - ( R + B ) / 2.0 ) / 257.0;
+}
+
 const LookAssistScene kFilmScenes[] = { LookAssistScene::Night, LookAssistScene::ArtificialLights,
                                         LookAssistScene::Shade, LookAssistScene::BrightSun };
 
@@ -502,8 +514,10 @@ bool openFirstFixture( MlvPipelineFixture &fixture )
 
 TEST(LookAssistFilmGrade, FilmCurveIsBlueAmberOnly)
 {
-    // Y and G are exactly the default receipt's tables; R and B move by equal and opposite amounts, so the green-magenta
-    // axis G - (R+B)/2 is untouched on every entry (the spline is linear in y; only rounding is left).
+    // Y and G are exactly the default receipt's tables; R and B move by equal and opposite amounts, so r + b == 2g on every
+    // table entry (the spline is linear in y; only rounding is left). That is a property of the tables at equal indices:
+    // per pixel it keeps the green-magenta axis G - (R+B)/2 only on a neutral pixel. A coloured pixel indexes different
+    // entries per channel and its axis moves (FilmMovesTheGreenAxisOnlyOnColouredPixelsWithinTheDocumentedBound).
     const GradationTables def = gradationTables( defaultCurve() );
     ASSERT_EQ( 65536, static_cast<int>( def.g.size() ) );
     for( LookAssistScene scene : kFilmScenes )
@@ -519,6 +533,76 @@ TEST(LookAssistFilmGrade, FilmCurveIsBlueAmberOnly)
         }
         std::fprintf( stderr, "FILM-CURVE scene=%s max|r+b-2g|=%d\n", qPrintable( lookAssistSceneName( scene ) ), worst );
         ASSERT_TRUE( worst <= 2 );
+    }
+}
+
+TEST(LookAssistFilmGrade, FilmMovesTheGreenAxisOnlyOnColouredPixelsWithinTheDocumentedBound)
+{
+    // Per pixel, through the engine's own tables at each Film strength: a neutral pixel keeps G - (R+B)/2 (all three
+    // channels index the same entry); a coloured pixel indexes different R and B entries, so its axis moves by
+    // -(dR(R) - dR(B))/2: (a + b)/2 in 8-bit code values on the knots, within 2% of that on any pixel, a warm-highlight /
+    // cool-shadow (amber) pixel toward magenta, its mirror (teal) toward green. The card's no-magenta tolerance is judged on the venue picture mean, not per
+    // saturated pixel (docs/look-assist-flavors.md, "What it does to the green-magenta axis").
+    const GradationTables def = gradationTables( defaultCurve() );
+    struct Coloured { const char *name; double r, g, b; int sign; };
+    const Coloured coloured[] = {
+        { "amber", 0.72, 0.45, 0.18, -1 },   // sol r3's repro: R at the highlight knot, B at the shadow knot
+        { "teal", 0.18, 0.45, 0.72, +1 },    // its mirror
+        { "skin", 0.80, 0.55, 0.35, -1 },
+        { "sky", 0.30, 0.55, 0.85, +1 },
+        { "sodium", 0.90, 0.50, 0.10, -1 },
+        { "cyan", 0.10, 0.50, 0.90, +1 },
+    };
+    for( LookAssistScene scene : kFilmScenes )
+    {
+        const LookAssistFilmGrade grade = lookAssistFilmGradeForScene( scene );
+        const GradationTables film = gradationTables( lookAssistFilmGradationCurve( scene ) );
+        // The documented bounds, plus the tables' own rounding (|r + b - 2g| <= 2 per entry, one 16-bit step per channel):
+        // (a + b)/2 for a pixel whose R and B sit within the knots' reach, and 2% more for any pixel at all, because the
+        // natural spline dips about 3% past the 0.18 knot between knots (measured: Night peak dR -745 against a = 721).
+        const double knots = ( grade.shadowOffset + grade.highlightOffset ) / 2.0 * 255.0;
+        const double bound = knots + 2.0 / 257.0;
+        const double anyPixelBound = knots * 1.02 + 2.0 / 257.0;
+
+        // (a) Neutral: every grey level, dGA == 0 within the tables' rounding.
+        double worstNeutral = 0.0;
+        for( int v = 0; v < 65536; ++v )
+        {
+            const double x = v / 65535.0;
+            const double dGA = gradedGreenAxis8( film, x, x, x ) - gradedGreenAxis8( def, x, x, x );
+            worstNeutral = std::max( worstNeutral, std::abs( dGA ) );
+        }
+
+        // The whole table: the largest R offset up and down, so a bound holds for every input, not only the set below.
+        int peakUp = 0, peakDown = 0;
+        for( int v = 0; v < 65536; ++v )
+        {
+            const int dR = static_cast<int>( film.r[v] ) - static_cast<int>( def.r[v] );
+            peakUp = std::max( peakUp, dR );
+            peakDown = std::min( peakDown, dR );
+        }
+        const double worstAnyPixel = ( peakUp - peakDown ) / 2.0 / 257.0;
+
+        std::fprintf( stderr, "FILM-GREEN-AXIS scene=%s s=%.2f bound=%.4f any_pixel_bound=%.4f neutral_max|dGA|=%.4f"
+                      " any_pixel_max|dGA|=%.4f peak_dR=+%d/%d (a=%d b=%d)\n", qPrintable( lookAssistSceneName( scene ) ),
+                      grade.strength, bound, anyPixelBound, worstNeutral, worstAnyPixel, peakUp, peakDown,
+                      static_cast<int>( grade.shadowOffset * 65535.0 + 0.5 ), static_cast<int>( grade.highlightOffset * 65535.0 + 0.5 ) );
+        ASSERT_TRUE( worstNeutral <= 1.0 / 257.0 + 1e-9 );
+        ASSERT_TRUE( worstAnyPixel <= anyPixelBound );
+
+        // (b) Coloured: the documented bound and the documented direction.
+        for( const Coloured &c : coloured )
+        {
+            const double dGA = gradedGreenAxis8( film, c.r, c.g, c.b ) - gradedGreenAxis8( def, c.r, c.g, c.b );
+            std::fprintf( stderr, "FILM-GREEN-AXIS scene=%s input=%s rgb=%.2f/%.2f/%.2f dGA=%+.4f bound=%.4f\n",
+                          qPrintable( lookAssistSceneName( scene ) ), c.name, c.r, c.g, c.b, dGA, bound );
+            ASSERT_TRUE( std::abs( dGA ) <= bound );
+            ASSERT_TRUE( dGA * c.sign > 0.0 );
+        }
+
+        // The bound is reached, not slack: amber sits on both knots, so it moves by (a + b)/2 to within rounding.
+        const double amber = gradedGreenAxis8( film, 0.72, 0.45, 0.18 ) - gradedGreenAxis8( def, 0.72, 0.45, 0.18 );
+        ASSERT_NEAR( -( grade.shadowOffset + grade.highlightOffset ) / 2.0 * 255.0, amber, 2.0 / 257.0 );
     }
 }
 

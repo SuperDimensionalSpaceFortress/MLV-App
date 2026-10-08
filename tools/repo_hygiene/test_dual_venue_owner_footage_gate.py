@@ -177,8 +177,9 @@ ROUTE_DELETE_ALLOWED = {
         "quarantine rename of a rejected receipt/screenshot to <name>.INVALID<ext> in its own directory; same output-only paths.",
     ("New-VenueFlavorPair.ps1", "Remove-Item -LiteralPath (Join-Path $OutDir $markerName) -Force"):
         "removes the one fixed-name file $markerName (= .pair-in-progress.json, the attempt marker look-flavor-diff.py created in -OutDir for this run), "
-        "non-recursive and without a wildcard, on the line after the pair record is written; a footage name cannot equal it, and the pair's -OutDir holds only "
-        "derived sheets (never a clip). test_look_flavor_pair_hardening pins that the marker is gone after a finished pair and kept after a crash.",
+        "non-recursive and without a wildcard, on the line after the pair record (or, second site sharing the line, the trio record) is written; a footage "
+        "name cannot equal it, and the pair's -OutDir holds only derived sheets (never a clip). test_look_flavor_pair_hardening pins that the marker is gone "
+        "after a finished pair or trio and kept after a crash.",
 }
 
 TRAILING_COMMENT = re.compile(r"\s+#\s.*$")

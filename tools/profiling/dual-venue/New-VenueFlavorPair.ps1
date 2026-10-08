@@ -40,8 +40,10 @@
 # LOOK-ASSIST-FILM-FLAVOR-1: an optional third receipt, -FilmReceipt (lookFlavor `film`), makes it a TRIO: the same equality checks across all
 # three, the composer's three-side mode (sheet-classic-cinematic-film.png, metrics v2), and its own record mlv-app/dual-venue-flavor-trio/v1
 # (flavor-trio-*.json, CreateNew). Without -FilmReceipt everything above is the two-side pair, unchanged. The trio shares the staging-beside-OutDir
-# rule, the footage-root refusal (18) and the append-only guards (16); the three-side composer writes NO attempt marker (so a trio never leaves one),
-# hence -RecoverIncomplete is refused with -FilmReceipt, and a marker found in -OutDir is still the typed exit 17.
+# rule, the footage-root refusal (18), the append-only guards (16) and the ATTEMPT MARKER (FILM-TRIO-INCOMPLETE-ATTEMPT-MARKER-1): the three-side
+# composer creates it before its first output and (--keep-marker) leaves it until the trio record is written, so a trio that dies in between, the record
+# write included, is the typed exit 17 with the half record named, never PAIR_RECORD_EXISTS. -RecoverIncomplete is refused with -FilmReceipt (the
+# composer quarantines only the pair's outputs), so a dead trio's way forward is a new -OutDir.
 [CmdletBinding()]
 param(
     [Parameter(Mandatory = $true)][string]$ClassicReceipt,
@@ -51,7 +53,7 @@ param(
     [switch]$RecoverIncomplete
 )
 $trio = -not [string]::IsNullOrWhiteSpace($FilmReceipt)
-if ($trio -and $RecoverIncomplete) { throw 'PAIR_RECOVER_NOT_FOR_TRIO -RecoverIncomplete applies to the two-side pair only: the three-side composer writes no attempt marker, so there is nothing for it to recover' }
+if ($trio -and $RecoverIncomplete) { throw 'PAIR_RECOVER_NOT_FOR_TRIO -RecoverIncomplete applies to the two-side pair only: the composer quarantines only the pair''s outputs, so a dead trio attempt (exit 17) is left as it is; use a new -OutDir' }
 $ErrorActionPreference = 'Stop'
 Import-Module (Join-Path $PSScriptRoot 'DualVenueRunner.psm1') -Force
 
@@ -117,7 +119,8 @@ if (Test-Path -LiteralPath $outFull -PathType Container) {
         # An unfinished attempt (no record). Without -RecoverIncomplete: the typed diagnosis. With it: the composer moves the unrecorded files aside.
         if (-not $RecoverIncomplete) {
             $left = @(Get-ChildItem -LiteralPath $outFull -File -ErrorAction Stop | Where-Object { $_.Name -ne $markerName } | ForEach-Object { $_.Name })
-            [Console]::Error.WriteLine("PAIR_INCOMPLETE_ATTEMPT ${outFull} holds $markerName from an attempt that did not finish; it left $(if ($left.Count) { $left -join ', ' } else { 'no outputs' }), none of it recorded evidence. Nothing was changed. Use a new -OutDir, or re-run with -RecoverIncomplete to MOVE the marker and those files into incomplete-<utc>\ (nothing is deleted) -- only when no composer is still running there")
+            $way = $(if ($trio) { 'Use a new -OutDir (a trio is not recovered in place)' } else { 'Use a new -OutDir, or re-run with -RecoverIncomplete to MOVE the marker and those files into incomplete-<utc>\ (nothing is deleted) -- only when no composer is still running there' })
+            [Console]::Error.WriteLine("PAIR_INCOMPLETE_ATTEMPT ${outFull} holds $markerName from an attempt that did not finish; it left $(if ($left.Count) { $left -join ', ' } else { 'no outputs' }), none of it recorded evidence. Nothing was changed. $way")
             exit 17
         }
     } else {
@@ -262,9 +265,9 @@ $pyArgs = @('-3', $composer,
     '--clip-id', [string]$classic.subject.clipId, '--venue', [string]$classic.venue.name,
     '--build-sha', ([string]$classic.subject.buildManifestSha256).Substring(0, 12), '--out-dir', $OutDir)
 if ($trio) {
-    # The three-side composer takes no marker flags (it writes no marker); the pair path keeps #317's --keep-marker / --recover-incomplete.
+    # The three-side composer keeps the attempt marker for this script's trio record, as the pair does; it has no --recover-incomplete.
     $pyArgs += @('--film-frames', $stageDirs['film'], '--film-listed', $stageListings['film'], '--film-sliders', $sliderFiles['film'],
-        '--film-flavor-reported', $reported['film'], '--film-receipt-id', [string]$film.receiptId)
+        '--film-flavor-reported', $reported['film'], '--film-receipt-id', [string]$film.receiptId, '--keep-marker')
 } else {
     $pyArgs += '--keep-marker'
     if ($RecoverIncomplete) { $pyArgs += '--recover-incomplete' }
@@ -315,6 +318,8 @@ if ($trio) {
     $recordPath = Join-Path $OutDir "flavor-trio-$($classic.legId)-$($cinematic.legId)-$($film.legId)-$($classic.venue.name).json"
     $stream = [IO.File]::Open($recordPath, [IO.FileMode]::CreateNew, [IO.FileAccess]::Write)   # append-only: never overwrite
     try { $bytes = $utf8.GetBytes(($record | ConvertTo-Json -Depth 8) + "`n"); $stream.Write($bytes, 0, $bytes.Length); $stream.Flush($true) } finally { $stream.Dispose() }
+    # The trio record is written: the attempt is complete. (A crash before this line leaves the marker, and the staging, in place.)
+    Remove-Item -LiteralPath (Join-Path $OutDir $markerName) -Force
     Write-Output "DVE_FLAVOR_TRIO=$sheet"
     Write-Output "DVE_FLAVOR_TRIO_RECORD=$recordPath"
     exit 0

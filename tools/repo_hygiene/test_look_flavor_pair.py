@@ -27,6 +27,7 @@ W, H = 64, 40
 CLASSIC = {"scene": "shade", "presetExposure": 380, "presetContrast": 15, "presetPivot": 55, "presetShadows": 12, "presetHighlights": -28,
            "presetVibrance": 5, "presetTemperatureDelta": 485, "presetTintDelta": -12, "finalTemperature": 6485, "finalTint": -12}
 CINEMATIC = dict(CLASSIC, presetContrast=22, presetPivot=50, presetShadows=4, presetHighlights=-40, presetVibrance=-6)
+OMIT = object()  # a display_frames value: the sidecar carries no display_frame key at all
 
 
 def tile(seed, letterbox=0):
@@ -72,9 +73,11 @@ class FlavorDiffHarness(unittest.TestCase):
             else:
                 from PIL import Image
                 Image.fromarray(arr).save(d / f"frame-{i:02d}.png")
-            (d / f"frame-{i:02d}.json").write_text(json.dumps({
-                "index": i, "saved": True, "display_frame": (display_frames or {}).get(i, 30 + 40 * i), "elapsed_ms": 2000.0 + 4000 * i,
-                "path": f"frame-{i:02d}.png", "playback_path": True}), encoding="utf-8")
+            sidecar = {"index": i, "saved": True, "display_frame": (display_frames or {}).get(i, 30 + 40 * i), "elapsed_ms": 2000.0 + 4000 * i,
+                       "path": f"frame-{i:02d}.png", "playback_path": True}
+            if sidecar["display_frame"] is OMIT:
+                del sidecar["display_frame"]
+            (d / f"frame-{i:02d}.json").write_text(json.dumps(sidecar), encoding="utf-8")
         listing = base / f"{name}.listed.json"
         listing.write_text(json.dumps({"files": [{"name": p.name, "sha256": hashlib.sha256(p.read_bytes()).hexdigest()} for p in sorted(d.iterdir())]}),
                            encoding="utf-8")
@@ -295,14 +298,15 @@ def graded(arr):
 
 
 class FlavorTrioHarness(FlavorDiffHarness):
-    def run_trio(self, tiles: dict, *, film_sliders=FILM, film_reported="film", out_dir: Path | None = None, tool: Path = TOOL):
-        """tiles: {"classic": {i: arr}, "cinematic": {...}, "film": {...}}."""
+    def run_trio(self, tiles: dict, *, film_sliders=FILM, film_reported="film", out_dir: Path | None = None, tool: Path = TOOL,
+                 frames: dict | None = None):
+        """tiles: {"classic": {i: arr}, "cinematic": {...}, "film": {...}}; frames: {side: {i: display_frame or OMIT}}."""
         self.runs += 1
         run = self.tmp / f"trio{self.runs}"
         stage = run / ".claude-state" / "stage"
         args = [sys.executable, str(tool)]
         for side, doc, reported in (("classic", CLASSIC, "classic"), ("cinematic", CINEMATIC, "cinematic"), ("film", film_sliders, film_reported)):
-            d, listed = self.make_side(stage, side, tiles[side], None)
+            d, listed = self.make_side(stage, side, tiles[side], (frames or {}).get(side))
             sliders = stage / f"sliders-{side}.json"
             sliders.write_text(json.dumps(doc), encoding="utf-8")
             args += [f"--{side}-frames", str(d), f"--{side}-listed", str(listed), f"--{side}-sliders", str(sliders),
@@ -396,6 +400,30 @@ class FlavorTrioComposeTests(FlavorTrioHarness):
                 proc, out = self.run_trio(tiles, out_dir=shared)
                 self.assertEqual(proc.returncode, 16, proc.stdout + proc.stderr)
                 self.assertEqual(sorted(p.name for p in out.iterdir()), [name])
+
+    def test_a_sidecar_without_display_frame_is_unknown_frame_matching_as_on_the_pair_path(self) -> None:
+        # FILM-TRIO-MISSING-FRAME-TYPED-REFUSAL-1: the pair path reports a missing display_frame as unknown frame matching
+        # (maxFrameDelta null, NOT FRAME-MATCHED); the trio must do the same, not raise TypeError from abs(None).
+        tiles = {s: {0: tile(60), 1: tile(61)} for s in ("classic", "cinematic")}
+        tiles["film"] = {0: graded(tile(60)), 1: graded(tile(61))}
+        for side in ("cinematic", "film", "classic"):
+            with self.subTest(missing_on=side):
+                proc, out = self.run_trio(tiles, frames={side: {1: OMIT}})
+                self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+                self.assertNotIn("Traceback", proc.stderr)
+                self.assertIn("LOOK_FLAVOR_DIFF_OK", proc.stdout)
+                self.assertIn("frameMatched=false maxFrameDelta=None", proc.stdout)
+                m = json.loads((out / "metrics.json").read_text(encoding="utf-8"))
+                self.assertEqual((m["frameMatched"], m["maxFrameDelta"]), (False, None))
+                self.assertIsNone(m["tiles"][1][side]["display_frame"])
+                self.assertTrue(all("NOT FRAME-MATCHED" in t["label"] for t in m["tiles"]))
+                self.assertTrue((out / "sheet-classic-cinematic-film.png").exists())
+                self.assertIn("max |d frame|=None", (out / "table.md").read_text(encoding="utf-8"))
+        # the pair path, for the same missing sidecar key
+        proc, out = self.run_tool({0: tile(60), 1: tile(61)}, {0: tile(62), 1: tile(63)}, cinematic_frames={1: OMIT})
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        m = json.loads((out / "metrics.json").read_text(encoding="utf-8"))
+        self.assertEqual((m["frameMatched"], m["maxFrameDelta"]), (False, None))
 
     def test_the_two_side_outputs_are_byte_identical_to_the_base_commits_tool(self) -> None:
         """The same fixed synthetic pair through this tool and through the tool as it was at the base commit (with ITS make-contact-sheet.py)."""

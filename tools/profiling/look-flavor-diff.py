@@ -522,6 +522,7 @@ def compose_trio(args):
     indices = sorted(by["classic"])
 
     out = Path(args.out_dir)
+    refuse_if_incomplete(out, False)   # a dead attempt's marker is the typed 17; the trio is never recovered in place
     existing = [n for n in trio_output_names(indices) if (out / n).exists()]
     if existing:
         raise Refusal(EXIT_OUTPUT_EXISTS, "PAIR_OUTPUT_EXISTS " + ", ".join(existing) + f" already in {out}: an earlier pair's evidence is never "
@@ -580,8 +581,9 @@ def compose_trio(args):
         if not matched:
             worst = max((abs(v) for v in d.values() if v is not None), default=None)
             t["label"] += f"  NOT FRAME-MATCHED (d={worst})"
-    all_deltas = [abs(v) for t in tiles for v in t["display_frame_delta"].values()]
-    max_delta = max(all_deltas) if all(v is not None for t in tiles for v in t["display_frame_delta"].values()) else None
+    # The None guard comes before abs(), as on the pair path: a sidecar without display_frame is unknown frame matching, not a TypeError.
+    all_deltas = [t["display_frame_delta"][s] for t in tiles for s in ("cinematic", "film")]
+    max_delta = max(abs(v) for v in all_deltas) if all(v is not None for v in all_deltas) else None
 
     tile_h = panels[0][1][0].height
     sheet = Image.new("RGB", (SHEET_WIDTH, HEADER_HEIGHT + len(panels) * (ROW_LABEL_HEIGHT + tile_h)), (8, 8, 8))
@@ -601,8 +603,18 @@ def compose_trio(args):
         for c, panel in enumerate(cols):
             sheet.paste(panel.crop((0, 0, SHEET_COLUMN, tile_h)), (c * SHEET_COLUMN, y + ROW_LABEL_HEIGHT))
     sheet_path = out / TRIO_SHEET_NAME
+    # FILM-TRIO-INCOMPLETE-ATTEMPT-MARKER-1: the pair's attempt marker, created first and exclusively, kept until the last output (or, with
+    # --keep-marker, until the driver's trio record), so a trio that dies in between is recognisable (17) instead of a silent PAIR_OUTPUT_EXISTS.
     out.mkdir(parents=True, exist_ok=True)
-    write_new(sheet_path, png_bytes(sheet))
+    marker_path = out / MARKER_NAME
+    write_new(marker_path, json.dumps({"schema": SCHEMA_MARKER, "pid": os.getpid(), "startedUtc": datetime.now(timezone.utc).isoformat(),
+                                       **{f"{s}ReceiptId": getattr(args, f"{s}_receipt_id") for s in TRIO_SIDES},
+                                       "keptForCaller": bool(args.keep_marker)}, indent=2).encode("utf-8"))
+    try:
+        write_new(sheet_path, png_bytes(sheet))
+    except Refusal:
+        marker_path.unlink(missing_ok=True)   # this composer lost the race for the sheet: nothing of ITS attempt may remain
+        raise
 
     def mean_of(get):
         return float(np.mean([get(t) for t in tiles]))
@@ -645,6 +657,8 @@ def compose_trio(args):
         write_new(out / f"row-{index:02d}.png", png_bytes(row_images[index]))
         write_new(out / f"heat-film-vs-classic-{index:02d}.png", png_bytes(heat_images[index]["classic"]))
         write_new(out / f"heat-film-vs-cinematic-{index:02d}.png", png_bytes(heat_images[index]["cinematic"]))
+    if not args.keep_marker:
+        marker_path.unlink()
     print(f"LOOK_FLAVOR_DIFF_OK sheet={sheet_path} tiles={len(tiles)} frameMatched={str(matched).lower()} maxFrameDelta={max_delta} "
           f"dSGap={means['dSGapFilmMinusCinematic']:.3f} MADfilmCinematic={means['MAD']['film_cinematic']:.3f}")
     return 0

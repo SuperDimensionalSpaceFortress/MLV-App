@@ -104,10 +104,23 @@ Curves widget's own format, so a widget round trip is byte-stable. A test pins t
 | BrightSun | 0.9 | 0.1602 | 0.1998 | 0.747 | 0.693 |
 <!-- film-table:end -->
 
-**Why it cannot tint magenta.** R and B move by equal and opposite amounts at every knot, and the engine's spline
-(`tk::spline`, natural cubic, `src/processing/interpolation/spline_helper.cpp`) is linear in y, so
-`gcurve_r[v] + gcurve_b[v] == 2 * gcurve_g[v]` to within rounding: the green-magenta axis `G - (R+B)/2` is untouched.
-A test pins this on all 65536 entries.
+**What it does to the green-magenta axis.** R and B move by equal and opposite amounts at every knot, and the
+engine's spline (`tk::spline`, natural cubic, `src/processing/interpolation/spline_helper.cpp`) is linear in y, so
+`gcurve_r[v] + gcurve_b[v] == 2 * gcurve_g[v]` to within rounding on every table entry (a test pins this on all 65536).
+That is a property of the tables at **equal indices**, so per pixel it holds only for a **neutral** pixel (R = G = B):
+there the green-magenta axis `G - (R+B)/2` is untouched. A coloured pixel indexes a different entry per channel, and
+its axis moves by `-(dR(R) - dR(B)) / 2`, where `dR` is the R offset curve:
+
+* at most `(a + b) / 2` in 8-bit code values while R and B sit within the knots' reach, reached exactly by a pixel on
+  both knots: amber (0.72, 0.45, 0.18) at Shade moves by -6.63; Night 3.32, ArtificialLights 4.97, BrightSun 5.97;
+* within 2% of that on any pixel at all, because the natural spline dips about 3% past the 0.18 knot between knots
+  (largest measured: Shade 6.73);
+* amber (warm highlights in R, cool shadows in B) moves **toward magenta**, teal (its mirror) **toward green**.
+
+This is the inherent behaviour of a per-channel split tone; the grade was not changed for it. The card's no-magenta
+tolerance is judged on the **venue picture mean** (over the mid-luma band of real footage, where it held: +0.28 Film
+against -0.03 Cinematic), not per saturated pixel. `LookAssistFilmGrade.FilmMovesTheGreenAxisOnlyOnColouredPixelsWithinTheDocumentedBound`
+pins the neutral zero, the bounds and the directions on the engine's own tables at every Film strength.
 
 **Why it costs nothing per pixel.** The gradation curves are applied unconditionally on every route (identity
 tables when unused): the CPU 16-bit loop, both direct8 kernels, and the CUDA display shader, which composes them
@@ -199,7 +212,8 @@ The flavor applied is always reported, appended to the end of the existing lines
   deferred (not shipped); Film's fixture picture is covered by `FilmIsADifferentGradedPictureFromCinematic` instead.
 * Film grade: the documented table is the code's and Film's tone is Cinematic's; the selector accepts `film`; the
   curve built through `processingSetGCurve` leaves Y and G exactly default and keeps `|r + b - 2g| <= 2` on every
-  entry; the four tables are pinned by sha256 and sampled values; a user curve is kept and reported; the baseline
+  entry; per pixel, a neutral pixel keeps its green-magenta axis and a coloured one moves within the documented bound,
+  amber toward magenta and teal toward green; the four tables are pinned by sha256 and sampled values; a user curve is kept and reported; the baseline
   round trip leaves a re-run-as-Classic receipt identical to a Classic-only one; a user's edit of the laid curve
   survives a Classic re-run and Look Assist off, with the element gone (`AUserEditOfTheFilmCurveIsKeptAndRetiresFilmsOwnership`,
   `AUserEditAfterTheFilmGradeIsKeptByAClassicReRunAndByLookAssistOff`); Look Assist off changes nothing;

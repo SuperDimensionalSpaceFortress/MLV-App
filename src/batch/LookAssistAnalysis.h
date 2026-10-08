@@ -647,8 +647,9 @@ void lookAssistApplyFlavorDeltas( LookAssistPreset *preset, LookAssistScene scen
  *   R: (1e-5,1e-5) (0.18, 0.18 - a) (0.45, 0.45) (0.72, 0.72 + b) (1,1)
  *   B: (1e-5,1e-5) (0.18, 0.18 + a) (0.45, 0.45) (0.72, 0.72 - b) (1,1)
  *   Y, G: the default two points.
- * R and B move by equal and opposite amounts at every knot and the engine's spline is linear in y, so R + B == 2 G and
- * the green-magenta axis is untouched. */
+ * R and B move by equal and opposite amounts at every knot and the engine's spline is linear in y, so r[v] + b[v] == 2 g[v]
+ * on every table entry: a neutral pixel keeps its green-magenta axis. A coloured pixel indexes different entries per
+ * channel, so its axis moves by up to about (a + b)/2 (amber toward magenta, teal toward green; see the docs). */
 struct LookAssistFilmGrade
 {
     double strength = 0.0;          // s
