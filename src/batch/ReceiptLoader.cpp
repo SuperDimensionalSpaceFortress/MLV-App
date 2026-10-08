@@ -665,6 +665,11 @@ void ReceiptLoader::parseXmlElements(QXmlStreamReader *Rxml,
             receipt->setLookAssistBaselineStretchY( Rxml->readElementText().toDouble() );
             Rxml->readNext();
         }
+        else if( Rxml->isStartElement() && Rxml->name() == QString( "lookAssistBaselineGradationCurve" ) )
+        {
+            receipt->setLookAssistBaselineGradationCurve( Rxml->readElementText() );
+            Rxml->readNext();
+        }
         else if( Rxml->isStartElement() && Rxml->name() == QString( "tone" ) )
         {
             receipt->setTone( Rxml->readElementText().toInt() );

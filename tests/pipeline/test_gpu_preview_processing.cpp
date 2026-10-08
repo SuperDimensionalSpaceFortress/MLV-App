@@ -4,6 +4,7 @@
 #include "../common/frame_compare.h"
 
 #include "mlv_pipeline_fixture.h"
+#include "look_assist_gradation_curve.h"
 
 #include "../../platform/qt/GpuPreviewProcessing.h"
 #include "../../platform/qt/GpuPreviewHostRoute.h"
@@ -3503,7 +3504,10 @@ static double mean_display_saturation(const std::vector<uint16_t> & rgb)
     return sum / static_cast<double>(pixels);
 }
 
-static void run_look_assist_flavor_real_frame_case(const char * label, const LookAssistPreset & preset)
+/* gradationCurve: a receipt gradationCurve string pushed as the Curves widget pushes it (empty = the fixture's own
+ * curves, untouched: the Classic and Cinematic cases). LOOK-ASSIST-FILM-FLAVOR-1 passes the Film grade's. */
+static void run_look_assist_flavor_real_frame_case(const char * label, const LookAssistPreset & preset,
+                                                   const QString & gradationCurve = QString())
 {
     MlvPipelineFixture fixture;
     assert_gpu_preview_fixture_ready(fixture);
@@ -3517,6 +3521,16 @@ static void run_look_assist_flavor_real_frame_case(const char * label, const Loo
     processingSetShadows(processing, state.shadows);
     processingSetHighlights(processing, state.highlights);
     processingSetVibrance(processing, state.vibrance);
+    if (!gradationCurve.isEmpty())
+    {
+        lookAssistTestApplyGradationCurve(processing, gradationCurve);
+        int split = 0;   /* the grade is live: R and B really leave G */
+        for (int index = 0; index < 65536; ++index)
+        {
+            if (std::abs(static_cast<int>(processing->gcurve_r[index]) - static_cast<int>(processing->gcurve_g[index])) > 200) ++split;
+        }
+        ASSERT_TRUE(split > 10000);
+    }
     const std::vector<uint16_t> primed = fixture.renderFrame16(0, /*threads=*/1);
     ASSERT_TRUE(!primed.empty());
 
@@ -3585,6 +3599,19 @@ TEST(GpuPreviewProcessing, EngineAnchoredLookAssistFlavorsMatchEngineWithReceipt
 
     run_look_assist_flavor_real_frame_case("look_assist_cinematic_night_real_frame", cinematic);
     run_look_assist_flavor_real_frame_case("look_assist_classic_night_real_frame", classic);   /* control */
+
+    /* LOOK-ASSIST-FILM-FLAVOR-1: Film = the Cinematic preset (the same table) + the Night split curves. The display
+     * shader takes them (no refused stage), the preset stays direct8-eligible, and both CPU routes match the shader at
+     * the same budgets. */
+    LookAssistPreset film = classic;
+    lookAssistApplyFlavorDeltas(&film, LookAssistScene::Night, LookAssistFlavor::Film);
+    ASSERT_EQ(cinematic.contrast, film.contrast);
+    ASSERT_EQ(cinematic.pivot, film.pivot);
+    ASSERT_EQ(cinematic.shadows, film.shadows);
+    ASSERT_EQ(cinematic.highlights, film.highlights);
+    ASSERT_EQ(cinematic.vibrance, film.vibrance);
+    run_look_assist_flavor_real_frame_case("look_assist_film_night_real_frame", film,
+                                           lookassist::lookAssistFilmGradationCurve(LookAssistScene::Night));
 }
 
 struct CreativeChainCase

@@ -88,6 +88,8 @@ public:
     void setLookAssistBaselineChromaSmooth( int value ) {m_lookAssistBaselineChromaSmooth = value;}
     void setLookAssistBaselineStretchX( double value )  {m_lookAssistBaselineStretchX = value;}
     void setLookAssistBaselineStretchY( double value )  {m_lookAssistBaselineStretchY = value;}
+    // The gradation curve the Film grade replaced; empty = the Film grade did not replace it (written only when non-empty).
+    void setLookAssistBaselineGradationCurve( const QString &value ) {m_lookAssistBaselineGradationCurve = value;}
     void setTone( uint8_t value )             {m_tone = value;}
     void setToningStrength( uint8_t value )   {m_toningStrength = value;}
     void setFileName( QString fileName )      {m_fileName = fileName;}
@@ -262,6 +264,7 @@ public:
     int lookAssistBaselineChromaSmooth( void ) {return m_lookAssistBaselineChromaSmooth;}
     double lookAssistBaselineStretchX( void ) {return m_lookAssistBaselineStretchX;}
     double lookAssistBaselineStretchY( void ) {return m_lookAssistBaselineStretchY;}
+    QString lookAssistBaselineGradationCurve( void ) {return m_lookAssistBaselineGradationCurve;}
     uint8_t tone( void ) {return m_tone;}
     uint8_t toningStrength( void ){return m_toningStrength;}
     QString fileName( void ){return m_fileName;}
@@ -390,6 +393,7 @@ private:
     int m_lookAssistBaselineChromaSmooth;
     double m_lookAssistBaselineStretchX;
     double m_lookAssistBaselineStretchY;
+    QString m_lookAssistBaselineGradationCurve;
     uint8_t m_tone;
     uint8_t m_toningStrength;
     QString m_fileName;

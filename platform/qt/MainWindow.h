@@ -1836,6 +1836,9 @@ private:
     void setWhiteBalanceFromMlv( ReceiptSettings *sliders );
     void captureLookAssistBaseline( ReceiptSettings *receipt );
     void restoreLookAssistBaseline( ReceiptSettings *receipt );
+    void restoreLookAssistBaselineGradationCurve( ReceiptSettings *receipt );
+    QString applyLookAssistFilmGrade( ReceiptSettings *receipt, lookassist::LookAssistScene scene,
+                                      lookassist::LookAssistFlavor flavor );
     void applyLookAssistToReceipt( ReceiptSettings *receipt,
                                    int analysisFrame = -1 );
     void syncLookAssistDerivedUiToReceipt( ReceiptSettings *receipt );

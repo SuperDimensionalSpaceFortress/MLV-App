@@ -32,6 +32,7 @@ STRING_RECEIPT_MEMBERS = {
     "m_lutName",
     "m_transferFunction",
     "m_lookAssistFlavor",
+    "m_lookAssistBaselineGradationCurve",
 }
 
 BOOL_RECEIPT_MEMBERS = {

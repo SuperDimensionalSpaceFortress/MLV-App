@@ -209,6 +209,7 @@ QJsonObject actualReceiptDefaults()
     ADD_INT("m_lookAssistBaselineChromaSmooth", lookAssistBaselineChromaSmooth);
     ADD_DOUBLE("m_lookAssistBaselineStretchX", lookAssistBaselineStretchX);
     ADD_DOUBLE("m_lookAssistBaselineStretchY", lookAssistBaselineStretchY);
+    ADD_STRING("m_lookAssistBaselineGradationCurve", lookAssistBaselineGradationCurve);
     ADD_INT("m_tone", tone); ADD_INT("m_toningStrength", toningStrength);
     ADD_INT("m_cutIn", cutIn); ADD_INT("m_cutOut", cutOut);
     actual.insert(QStringLiteral("m_debayer"), enumValue("amaze", static_cast<int>(receipt.debayer())));

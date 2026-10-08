@@ -1,8 +1,9 @@
-# Look Assist flavors: Classic | Cinematic
+# Look Assist flavors: Classic | Cinematic | Film grade
 
 Look Assist analyses a clip (scene verdict, exposure, white balance) and writes a handful of receipt sliders.
-Since LOOK-ASSIST-FLAVORS-1 it can do so in one of two flavors. The owner's directive (2026-09-26): *video
-shouldn't look raw or unprocessed with look assist active; it should have an aesthetic cinematic color grade.*
+Since LOOK-ASSIST-FLAVORS-1 it can do so in one of two flavors, and since LOOK-ASSIST-FILM-FLAVOR-1 in a third
+(Film grade, below). The owner's directive (2026-09-26): *video shouldn't look raw or unprocessed with look
+assist active; it should have an aesthetic cinematic color grade.*
 
 * **Classic** is Look Assist exactly as it was: the same sliders, the same receipt, the same picture, in every
   state. It is the default.
@@ -74,11 +75,82 @@ percentiles over the frame; the fixture is a flat, dim dual-ISO test clip, so th
 The contrast, shadows and highlights sliders move the picture less than their numbers suggest (the app's curve is
 gentle), which is why the deltas are larger than the Classic presets they sit on.
 
+## Film grade
+
+The owner (2026-10-08): Classic and Cinematic look too similar; a third flavor should read as a colour-graded,
+big-studio film look. **Film = Cinematic's tone (the same table, reused) + a blue-amber split-tone in the R and B
+gradation curves.** There is no new engine stage, no LUT, no hue curve, no toning and no profile change; Y and G
+stay identity. Cool, slightly teal shadows and warm highlights, with the mid-tones pinned at 0.45 (about Look
+Assist's display median). The selector label is *Film grade*, not *Film*: the Profile preset *Film* is a different
+thing.
+
+Control points, display-referred 0..1, per scene strength `s`, with `a = 0.022 s` and `b = 0.030 s`:
+
+* R: (1e-5,1e-5) (0.18, 0.18 - a) (0.45, 0.45) (0.72, 0.72 + b) (1,1)
+* B: (1e-5,1e-5) (0.18, 0.18 + a) (0.45, 0.45) (0.72, 0.72 - b) (1,1)
+* Y and G: the default two points (1e-5,1e-5) (1,1).
+
+The code is one table, `kFilmGradeStrength` in `src/batch/LookAssistAnalysis.cpp`, read through
+`lookAssistFilmGradeForScene()`; `lookAssistFilmGradationCurve()` writes the receipt's `gradationCurve` string in the
+Curves widget's own format, so a widget round trip is byte-stable. A test pins this table against the code
+(`LookAssistFlavors.TheDocumentedFilmTableIsTheCodeTable`).
+
+<!-- film-table:begin -->
+| Scene | s | R@0.18 | B@0.18 | R@0.72 | B@0.72 |
+|---|---|---|---|---|---|
+| Night | 0.5 | 0.169 | 0.191 | 0.735 | 0.705 |
+| ArtificialLights | 0.75 | 0.1635 | 0.1965 | 0.7425 | 0.6975 |
+| Shade | 1.0 | 0.158 | 0.202 | 0.750 | 0.690 |
+| BrightSun | 0.9 | 0.1602 | 0.1998 | 0.747 | 0.693 |
+<!-- film-table:end -->
+
+**What it does to the green-magenta axis.** R and B move by equal and opposite amounts at every knot, and the
+engine's spline (`tk::spline`, natural cubic, `src/processing/interpolation/spline_helper.cpp`) is linear in y, so
+`gcurve_r[v] + gcurve_b[v] == 2 * gcurve_g[v]` to within rounding on every table entry (a test pins this on all 65536).
+That is a property of the tables at **equal indices**, so per pixel it holds only for a **neutral** pixel (R = G = B):
+there the green-magenta axis `G - (R+B)/2` is untouched. A coloured pixel indexes a different entry per channel, and
+its axis moves by `-(dR(R) - dR(B)) / 2`, where `dR` is the R offset curve:
+
+* at most `(a + b) / 2` in 8-bit code values while R and B sit within the knots' reach, reached exactly by a pixel on
+  both knots: amber (0.72, 0.45, 0.18) at Shade moves by -6.63; Night 3.32, ArtificialLights 4.97, BrightSun 5.97;
+* within 2% of that on any pixel at all, because the natural spline dips about 3% past the 0.18 knot between knots
+  (largest measured: Shade 6.73);
+* amber (warm highlights in R, cool shadows in B) moves **toward magenta**, teal (its mirror) **toward green**.
+
+This is the inherent behaviour of a per-channel split tone; the grade was not changed for it. The card's no-magenta
+tolerance is judged on the **venue picture mean** (over the mid-luma band of real footage, where it held: +0.28 Film
+against -0.03 Cinematic), not per saturated pixel. `LookAssistFilmGrade.FilmMovesTheGreenAxisOnlyOnColouredPixelsWithinTheDocumentedBound`
+pins the neutral zero, the bounds and the directions on the engine's own tables at every Film strength.
+
+**Why it costs nothing per pixel.** The gradation curves are applied unconditionally on every route (identity
+tables when unused): the CPU 16-bit loop, both direct8 kernels, and the CUDA display shader, which composes them
+into its one creative-curve texture. Direct8 eligibility and the display shader's refused stages do not look at
+them. A Film grade is a one-time spline rebuild and one texture upload when it is applied.
+
+**The user's curve wins.** If the receipt's gradation curve is not the default (numerically: four lines, each
+exactly the two identity points within 1e-6; an empty string counts as default), Film does **not** overwrite it: it
+lays the tone deltas only and reports `grade=skipped_user_curve`.
+
+**The baseline.** The curve Film replaced is kept in the receipt element `lookAssistBaselineGradationCurve`, written
+**only while it is non-empty** (a Classic or Cinematic receipt is byte-identical to before). Look Assist's baseline
+restore (GUI `restoreLookAssistBaseline`, the safety fallback, headless `restoreHeadlessLookAssistBaseline`) puts
+that curve back and clears the element, so every analysis measures at the user's own curve; capturing a fresh
+baseline does the same first. Switching Look Assist off, or re-running as Classic or Cinematic, therefore leaves no
+trace of the grade. The curve goes back only while Film still **owns** it, that is while it is, point for point
+(within 1e-6), the curve Film lays for one of the scenes (`lookAssistFilmOwnsGradationCurve`). If the user edited
+the laid curve (say, added a Y point), the edit is the user's curve: the restore keeps it and still clears the
+element, which retires Film's ownership, and a later Film run reports `grade=skipped_user_curve` over it. The GUI
+judges ownership on the curve the widget shows, headless on the receipt's. The white balance stays Classic's by construction, as for Cinematic. Headless batch exports
+CDNG (raw), so the grade never reaches a CDNG; headless only keeps the receipt consistent.
+
+Licence: the control points are original and are evaluated by the already-vendored `tk::spline`; no third-party
+LUT or colour-science maths is borrowed.
+
 ## Choosing the flavor
 
 Layers, first non-empty one wins (`lookAssistSelectFlavor()`):
 
-1. `MLVAPP_LOOK_ASSIST_FLAVOR=classic|cinematic`: for runs (the venue legs set it). Case and whitespace do not matter.
+1. `MLVAPP_LOOK_ASSIST_FLAVOR=classic|cinematic|film`: for runs (the venue legs set it). Case and whitespace do not matter.
 2. The receipt's `<lookAssistFlavor>` element, which the headless / batch path reads. It is **written only for a
    non-Classic flavor**, so a Classic receipt is byte-identical to what it always was; absent means Classic.
 3. The GUI's *Look Assist flavor* selector next to *Auto Look Assist*, persisted as the app setting
@@ -97,9 +169,12 @@ the selector and is corrected on the receipt).
 
 The flavor applied is always reported, appended to the end of the existing lines (never inserted):
 
-* GUI `look_assist.apply.result`: `... next_serial=<n> <decision trace fields> flavor=<classic|cinematic>` (the trace is LOOK-ASSIST-DIAG-LOGGING-1's, `has_ev100=` .. `playback_scale=`; flavor comes after it).
+* GUI `look_assist.apply.result`: `... next_serial=<n> <decision trace fields> flavor=<classic|cinematic|film>` (the trace is LOOK-ASSIST-DIAG-LOGGING-1's, `has_ev100=` .. `playback_scale=`; flavor comes after it).
 * GUI `look_assist.apply.async_dispatch`: `... floor_lifted=<0|1> flavor=<...>`.
 * Headless `[BATCH] LOOK_ASSIST applied ...`: `... initialPatchFinalChroma=<x> <decision trace fields> flavor=<...>`.
+* On those three lines a Film apply appends ` grade=<film-v1|skipped_user_curve|none>` after `flavor=`; Classic and
+  Cinematic lines carry no `grade=` field (they stay byte-identical), and a reader takes its absence as `none`. The
+  venue's GUI-smoke result carries it as `visualQuality.lookAssist.presetGrade`.
 * `gui_smoke.visual_state`: `... gpu_preview_processing_reject_reason=<r> look_assist_flavor=<...|none>`. It
   names a flavor only for a look that is on screen: `none` until an analysis lands, and `none` again after the
   safety fallback restored the baseline (a sheet is then never labelled with a grade it does not show). This is
@@ -133,4 +208,14 @@ The flavor applied is always reported, appended to the end of the existing lines
   the white balance and the headless picture, and is a different, deterministic picture once the sliders are
   applied; an unknown environment value is Classic with a warning; the receipt element sits below the
   environment. With `MLVAPP_FLAVOR_SHEET_DIR` set, `LookAssistFlavorsFixture.ContactSheets` writes raw | classic |
-  cinematic renders of the tracked fixtures (fixture renders only) for model judging.
+  cinematic renders of the tracked fixtures (fixture renders only) for model judging. A Film column there was
+  deferred (not shipped); Film's fixture picture is covered by `FilmIsADifferentGradedPictureFromCinematic` instead.
+* Film grade: the documented table is the code's and Film's tone is Cinematic's; the selector accepts `film`; the
+  curve built through `processingSetGCurve` leaves Y and G exactly default and keeps `|r + b - 2g| <= 2` on every
+  entry; per pixel, a neutral pixel keeps its green-magenta axis and a coloured one moves within the documented bound,
+  amber toward magenta and teal toward green; the four tables are pinned by sha256 and sampled values; a user curve is kept and reported; the baseline
+  round trip leaves a re-run-as-Classic receipt identical to a Classic-only one; a user's edit of the laid curve
+  survives a Classic re-run and Look Assist off, with the element gone (`AUserEditOfTheFilmCurveIsKeptAndRetiresFilmsOwnership`,
+  `AUserEditAfterTheFilmGradeIsKeptByAClassicReRunAndByLookAssistOff`); Look Assist off changes nothing;
+  the white balance is Classic's on the fixtures; the CUDA display shader and the CPU direct8 route both take the
+  Film curves (`EngineAnchoredLookAssistFlavorsMatchEngineWithReceiptSCurve`, case `look_assist_film_night_real_frame`).

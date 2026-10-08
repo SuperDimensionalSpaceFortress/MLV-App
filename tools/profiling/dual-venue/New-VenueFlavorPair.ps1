@@ -36,13 +36,24 @@
 # renamed into place: the owner-footage route guards allow no move primitive in this script, so the half record is detected instead.)
 # OWNER FOOTAGE ROOT (exit 18, PAIR_OUTDIR_HOLDS_OWNER_FOOTAGE): -OutDir, anything under it, or an ancestor up to the nearest .claude-state directory that holds
 # a clip (or a numbered continuation part) is refused before anything is staged, written or deleted -- the marker delete never runs inside a footage root.
+#
+# LOOK-ASSIST-FILM-FLAVOR-1: an optional third receipt, -FilmReceipt (lookFlavor `film`), makes it a TRIO: the same equality checks across all
+# three, the composer's three-side mode (sheet-classic-cinematic-film.png, metrics v2), and its own record mlv-app/dual-venue-flavor-trio/v1
+# (flavor-trio-*.json, CreateNew). Without -FilmReceipt everything above is the two-side pair, unchanged. The trio shares the staging-beside-OutDir
+# rule, the footage-root refusal (18), the append-only guards (16) and the ATTEMPT MARKER (FILM-TRIO-INCOMPLETE-ATTEMPT-MARKER-1): the three-side
+# composer creates it before its first output and (--keep-marker) leaves it until the trio record is written, so a trio that dies in between, the record
+# write included, is the typed exit 17 with the half record named, never PAIR_RECORD_EXISTS. -RecoverIncomplete is refused with -FilmReceipt (the
+# composer quarantines only the pair's outputs), so a dead trio's way forward is a new -OutDir.
 [CmdletBinding()]
 param(
     [Parameter(Mandatory = $true)][string]$ClassicReceipt,
     [Parameter(Mandatory = $true)][string]$CinematicReceipt,
+    [string]$FilmReceipt = '',
     [Parameter(Mandatory = $true)][string]$OutDir,
     [switch]$RecoverIncomplete
 )
+$trio = -not [string]::IsNullOrWhiteSpace($FilmReceipt)
+if ($trio -and $RecoverIncomplete) { throw 'PAIR_RECOVER_NOT_FOR_TRIO -RecoverIncomplete applies to the two-side pair only: the composer quarantines only the pair''s outputs, so a dead trio attempt (exit 17) is left as it is; use a new -OutDir' }
 $ErrorActionPreference = 'Stop'
 Import-Module (Join-Path $PSScriptRoot 'DualVenueRunner.psm1') -Force
 
@@ -89,6 +100,7 @@ function Test-PairRecordComplete([string]$Path) {
 }
 if (Test-Path -LiteralPath $outFull -PathType Container) {
     $recordsHere = @(Get-ChildItem -LiteralPath $outFull -Filter 'flavor-pair-*.json' -File -ErrorAction Stop)
+    if ($trio) { $recordsHere += @(Get-ChildItem -LiteralPath $outFull -Filter 'flavor-trio-*.json' -File -ErrorAction Stop) }
     if ($recordsHere.Count -gt 0) {
         # A marker beside a record that does not parse as a JSON object is an attempt that died while the record was being written (it is created
         # exclusively, then filled): the incomplete diagnosis, with the half record's bytes untouched. -RecoverIncomplete does not apply to it -- a record
@@ -107,11 +119,14 @@ if (Test-Path -LiteralPath $outFull -PathType Container) {
         # An unfinished attempt (no record). Without -RecoverIncomplete: the typed diagnosis. With it: the composer moves the unrecorded files aside.
         if (-not $RecoverIncomplete) {
             $left = @(Get-ChildItem -LiteralPath $outFull -File -ErrorAction Stop | Where-Object { $_.Name -ne $markerName } | ForEach-Object { $_.Name })
-            [Console]::Error.WriteLine("PAIR_INCOMPLETE_ATTEMPT ${outFull} holds $markerName from an attempt that did not finish; it left $(if ($left.Count) { $left -join ', ' } else { 'no outputs' }), none of it recorded evidence. Nothing was changed. Use a new -OutDir, or re-run with -RecoverIncomplete to MOVE the marker and those files into incomplete-<utc>\ (nothing is deleted) -- only when no composer is still running there")
+            $way = $(if ($trio) { 'Use a new -OutDir (a trio is not recovered in place)' } else { 'Use a new -OutDir, or re-run with -RecoverIncomplete to MOVE the marker and those files into incomplete-<utc>\ (nothing is deleted) -- only when no composer is still running there' })
+            [Console]::Error.WriteLine("PAIR_INCOMPLETE_ATTEMPT ${outFull} holds $markerName from an attempt that did not finish; it left $(if ($left.Count) { $left -join ', ' } else { 'no outputs' }), none of it recorded evidence. Nothing was changed. $way")
             exit 17
         }
     } else {
-        foreach ($name in 'sheet-classic-vs-cinematic.png', 'metrics.json', 'table.md') {
+        $guarded = @('sheet-classic-vs-cinematic.png', 'metrics.json', 'table.md')
+        if ($trio) { $guarded += 'sheet-classic-cinematic-film.png' }
+        foreach ($name in $guarded) {
             if (Test-Path -LiteralPath (Join-Path $outFull $name)) {
                 [Console]::Error.WriteLine("PAIR_OUTPUT_EXISTS $name is already in ${outFull}: an earlier pair's evidence is never overwritten; use a new -OutDir")
                 exit 16
@@ -137,6 +152,17 @@ if ([string]$classic.subject.backend -cne 'cpu') { throw "PAIR_BACKEND_NOT_CPU t
 if ([string]$classic.metrics.sourceCommit -cne [string]$cinematic.metrics.sourceCommit) { throw 'PAIR_SUBJECT_DIFFERS the receipts differ in metrics.sourceCommit' }
 if ([string]$classic.venue.name -cne [string]$cinematic.venue.name -or [string]$classic.card -cne [string]$cinematic.card) { throw 'PAIR_VENUE_OR_CARD_DIFFERS the receipts are not the same venue/card' }
 if ([string]$classic.scale.effectiveScale -cne [string]$cinematic.scale.effectiveScale) { throw "PAIR_SCALE_DIFFERS the receipts rendered at different effective scales ($($classic.scale.effectiveScale) vs $($cinematic.scale.effectiveScale))" }
+$film = $null
+if ($trio) {
+    $film = [IO.File]::ReadAllText((Resolve-Path -LiteralPath $FilmReceipt).Path) | ConvertFrom-Json
+    if ([string]$film.subject.lookFlavor -cne 'film') { throw "PAIR_FLAVORS_WRONG the third receipt must be the film flavor (got '$($film.subject.lookFlavor)')" }
+    foreach ($f in 'buildManifestSha256', 'clipId', 'backend') {
+        if ([string]$classic.subject.$f -cne [string]$film.subject.$f) { throw "PAIR_SUBJECT_DIFFERS the film receipt differs in subject.$f" }
+    }
+    if ([string]$classic.metrics.sourceCommit -cne [string]$film.metrics.sourceCommit) { throw 'PAIR_SUBJECT_DIFFERS the film receipt differs in metrics.sourceCommit' }
+    if ([string]$classic.venue.name -cne [string]$film.venue.name -or [string]$classic.card -cne [string]$film.card) { throw 'PAIR_VENUE_OR_CARD_DIFFERS the film receipt is not the same venue/card' }
+    if ([string]$classic.scale.effectiveScale -cne [string]$film.scale.effectiveScale) { throw "PAIR_SCALE_DIFFERS the film receipt rendered at a different effective scale ($($classic.scale.effectiveScale) vs $($film.scale.effectiveScale))" }
+}
 
 # The repo whose COMMITTED consent and venue table a receipt is verified against is the one this script lives in (never a caller's).
 $repoRoot = (Resolve-Path (Join-Path $PSScriptRoot '..\..\..')).Path
@@ -164,6 +190,8 @@ function Read-Sliders($Receipt, [string]$EvDir) {
     if ($complete) {
         $out.source = 'result.json visualQuality.lookAssist'
         foreach ($k in $sliderNames.Keys) { $out[$k] = $la.$k }
+        # LOOK-ASSIST-FILM-FLAVOR-1: the Film grade the apply laid; a build before it (or a Classic / Cinematic apply) has none.
+        if ($trio) { $out.presetGrade = $(if ([string]::IsNullOrEmpty([string]$la.presetGrade)) { 'none' } else { [string]$la.presetGrade }) }
         return $out
     }
     # Fallback: the hashed run log's last look_assist.apply.result line (the line result.json's block is built from).
@@ -178,10 +206,12 @@ function Read-Sliders($Receipt, [string]$EvDir) {
         $n = 0
         $out[$k] = $(if ($null -eq $v) { $null } elseif ($k -ne 'scene' -and [int]::TryParse($v, [ref]$n)) { $n } else { $v })
     }
+    if ($trio) { $out.presetGrade = $(if ([string]::IsNullOrEmpty([string]$kv['grade'])) { 'none' } else { [string]$kv['grade'] }) }
     $out
 }
 
 $sides = [ordered]@{ classic = $classic; cinematic = $cinematic }
+if ($trio) { $sides.film = $film }
 $evidenceDirs = @{}
 $listedFrames = @{}
 $sliders = @{}
@@ -204,6 +234,7 @@ foreach ($label in $sides.Keys) {
     $reported[$label] = $(if ($null -ne $summary.lookFlavorReported) { [string]$summary.lookFlavorReported } else { 'none' })
 }
 if ($evidenceDirs['classic'] -ceq $evidenceDirs['cinematic']) { throw 'PAIR_SHARED_EVIDENCE the two receipts name one evidence directory; two legs have separate evidence' }
+if ($trio -and ($evidenceDirs['film'] -ceq $evidenceDirs['classic'] -or $evidenceDirs['film'] -ceq $evidenceDirs['cinematic'])) { throw 'PAIR_SHARED_EVIDENCE the film receipt shares an evidence directory with another leg; three legs have separate evidence' }
 
 $utf8 = [Text.UTF8Encoding]::new($false)
 # Stage exactly the bytes that were hashed, one fresh directory per pair, OUTSIDE OutDir; the listings sit beside the staging directories, never inside them.
@@ -232,12 +263,20 @@ $pyArgs = @('-3', $composer,
     '--cinematic-frames', $stageDirs['cinematic'], '--cinematic-listed', $stageListings['cinematic'], '--cinematic-sliders', $sliderFiles['cinematic'],
     '--cinematic-flavor-reported', $reported['cinematic'], '--cinematic-receipt-id', [string]$cinematic.receiptId,
     '--clip-id', [string]$classic.subject.clipId, '--venue', [string]$classic.venue.name,
-    '--build-sha', ([string]$classic.subject.buildManifestSha256).Substring(0, 12), '--out-dir', $OutDir, '--keep-marker')
-if ($RecoverIncomplete) { $pyArgs += '--recover-incomplete' }
+    '--build-sha', ([string]$classic.subject.buildManifestSha256).Substring(0, 12), '--out-dir', $OutDir)
+if ($trio) {
+    # The three-side composer keeps the attempt marker for this script's trio record, as the pair does; it has no --recover-incomplete.
+    $pyArgs += @('--film-frames', $stageDirs['film'], '--film-listed', $stageListings['film'], '--film-sliders', $sliderFiles['film'],
+        '--film-flavor-reported', $reported['film'], '--film-receipt-id', [string]$film.receiptId, '--keep-marker')
+} else {
+    $pyArgs += '--keep-marker'
+    if ($RecoverIncomplete) { $pyArgs += '--recover-incomplete' }
+}
 & py @pyArgs
 $code = $LASTEXITCODE
 # The staging directory is never deleted here: it stays beside OutDir after every outcome (10 names its slider files in the message). Refusals 11-17 are
 # raised by the composer before it writes anything into OutDir; an exit it does not define (a crash) also keeps whatever marker the composer left.
+if ($code -eq 10 -and $trio) { throw "PAIR_FLAVOR_INERT look-flavor-diff.py refused (FLAVOR_INERT): the cinematic or film flavor was not honoured; sliders in $($sliderFiles['film']), $($sliderFiles['cinematic']) and $($sliderFiles['classic'])" }
 if ($code -eq 10) { throw "PAIR_FLAVOR_INERT look-flavor-diff.py refused (FLAVOR_INERT): the cinematic flavor was not honoured; sliders in $($sliderFiles['cinematic']) and $($sliderFiles['classic'])" }
 if ($code -eq 16 -or $code -eq 17) {
     $what = $(if ($code -eq 17) { 'PAIR_INCOMPLETE_ATTEMPT look-flavor-diff.py refused (an unfinished attempt owns this -OutDir)' } else { 'PAIR_OUTPUT_EXISTS look-flavor-diff.py refused (another composer or an earlier pair owns this -OutDir)' })
@@ -248,6 +287,43 @@ if ($code -ne 0) { throw "PAIR_COMPOSE_FAILED look-flavor-diff.py exited $code" 
 
 $metricsPath = Join-Path $OutDir 'metrics.json'
 $metrics = [IO.File]::ReadAllText($metricsPath) | ConvertFrom-Json
+if ($trio) {
+    $sheet = Join-Path $OutDir 'sheet-classic-cinematic-film.png'
+    $scaleOf = { param($r) [ordered]@{ requestedScale = $r.scale.requestedScale; effectiveScale = $r.scale.effectiveScale; verdict = $r.scale.verdict } }
+    $record = [ordered]@{
+        schema = 'mlv-app/dual-venue-flavor-trio/v1'
+        venue = [string]$classic.venue.name; card = $classic.card
+        legIds = [ordered]@{ classic = $classic.legId; cinematic = $cinematic.legId; film = $film.legId }
+        receiptIds = [ordered]@{ classic = $classic.receiptId; cinematic = $cinematic.receiptId; film = $film.receiptId }
+        buildManifestSha256 = $classic.subject.buildManifestSha256; sourceCommit = $classic.metrics.sourceCommit
+        sameBuild = $true
+        scale = [ordered]@{ classic = (& $scaleOf $classic); cinematic = (& $scaleOf $cinematic); film = (& $scaleOf $film) }
+        lookFlavorReported = [ordered]@{ classic = $reported['classic']; cinematic = $reported['cinematic']; film = $reported['film'] }
+        lookFlavorHonored = [ordered]@{ classic = $classic.look.lookFlavorHonored; cinematic = $cinematic.look.lookFlavorHonored; film = $film.look.lookFlavorHonored }
+        presetGrade = [ordered]@{ classic = $sliders['classic'].presetGrade; cinematic = $sliders['cinematic'].presetGrade; film = $sliders['film'].presetGrade }
+        flavorLive = [bool]$metrics.flavorLive; filmLive = [bool]$metrics.filmLive
+        frameMatched = [bool]$metrics.frameMatched; maxFrameDelta = $metrics.maxFrameDelta
+        means = $metrics.means
+        ownerFootage = $true
+        advisory = $true
+        evidenceStatus = 'ADVISORY'
+        advisoryNote = 'all three receipts re-derive from committed consent and hashed run evidence, but no venue-held anchor exists (VENUE_ANCHOR_ABSENT): a diagnostic sheet, never a PASS'
+        localOnly = 'never committed, attached to a PR, published to the bus or as an artifact'
+        sheet = [ordered]@{ path = $sheet; sha256 = (Get-DvSha256OfFile $sheet); metricsPath = $metricsPath; metricsSha256 = (Get-DvSha256OfFile $metricsPath) }
+        pairedBy = 'tile_index'
+        createdUtc = [DateTime]::UtcNow.ToString('o')
+        owner_verdict = $null
+        model_verdicts = @()
+    }
+    $recordPath = Join-Path $OutDir "flavor-trio-$($classic.legId)-$($cinematic.legId)-$($film.legId)-$($classic.venue.name).json"
+    $stream = [IO.File]::Open($recordPath, [IO.FileMode]::CreateNew, [IO.FileAccess]::Write)   # append-only: never overwrite
+    try { $bytes = $utf8.GetBytes(($record | ConvertTo-Json -Depth 8) + "`n"); $stream.Write($bytes, 0, $bytes.Length); $stream.Flush($true) } finally { $stream.Dispose() }
+    # The trio record is written: the attempt is complete. (A crash before this line leaves the marker, and the staging, in place.)
+    Remove-Item -LiteralPath (Join-Path $OutDir $markerName) -Force
+    Write-Output "DVE_FLAVOR_TRIO=$sheet"
+    Write-Output "DVE_FLAVOR_TRIO_RECORD=$recordPath"
+    exit 0
+}
 $sheet = Join-Path $OutDir 'sheet-classic-vs-cinematic.png'
 $record = [ordered]@{
     schema = 'mlv-app/dual-venue-flavor-pair/v1'
