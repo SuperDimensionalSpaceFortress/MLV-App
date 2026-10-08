@@ -42,6 +42,8 @@
 #include <array>
 #include <cstddef>
 #include <cstdlib>
+#include <string>
+#include <utility>
 #include <vector>
 
 #include "PlaybackNativePaceGuard.h"
@@ -106,6 +108,52 @@ inline const char *upstreamStageName( UpstreamStage s )
     case UpstreamStage::Queue: return "queue";
     default: return "none";
     }
+}
+
+/*! PLAYBACK-GL-PRESENT-SETUP-STALL-1: the parts of one GUI-thread texture-present setup block
+ *  (GpuPresentSetupTiming), plus UNTIMED = setup total minus the timed parts. */
+inline constexpr double kPresentSetupStallMs = 50.0;   // present_setup_over_50ms counts setup > this (strict)
+enum class SetupPart { Program = 0, Lut, BlurDrain, BlurUpload, BlurCheck, Realloc, Sampling, Untimed, Count };
+
+inline const char *setupPartName( SetupPart p )
+{
+    switch( p )
+    {
+    case SetupPart::Program: return "program";
+    case SetupPart::Lut: return "lut";
+    case SetupPart::BlurDrain: return "blur_drain";
+    case SetupPart::BlurUpload: return "blur_upload";
+    case SetupPart::BlurCheck: return "blur_check";
+    case SetupPart::Realloc: return "realloc";
+    case SetupPart::Sampling: return "sampling";
+    case SetupPart::Untimed: return "untimed";
+    default: return "none";
+    }
+}
+
+/*! One texture-present setup block. partsMs is indexed by SetupPart up to (not including) Untimed. */
+struct PresentSetupSample
+{
+    double totalMs = 0.0;
+    std::array<double, static_cast<int>( SetupPart::Untimed )> partsMs {};
+    bool lutRebuilt = false;
+    const char *lutMiss = "none";   // the group the rebuild names (static string)
+};
+
+/*! The part that took the most of \a s: the largest timed part, or UNTIMED when what no part timed is larger.
+ *  Ties go to the earlier part. */
+inline SetupPart presentSetupMaxPart( const PresentSetupSample &s )
+{
+    double timed = 0.0;
+    int best = 0;
+    for( int i = 0; i < static_cast<int>( SetupPart::Untimed ); ++i )
+    {
+        timed += s.partsMs[static_cast<size_t>( i )];
+        if( s.partsMs[static_cast<size_t>( i )] > s.partsMs[static_cast<size_t>( best )] ) best = i;
+    }
+    const double untimed = s.totalMs - timed;
+    if( untimed > s.partsMs[static_cast<size_t>( best )] ) return SetupPart::Untimed;
+    return static_cast<SetupPart>( best );
 }
 
 /*! One presented frame, as notePlaybackSmokePresentedFrame sees it. Times are wall ms on the same
@@ -200,6 +248,16 @@ struct Summary
     long long slipsAfterGap = 0;
     int slipEventsAfterGap = 0;
     std::vector<SlipRecord> slipLines;   // the first kMaxSlipLines slips, classified
+    // PLAYBACK-GL-PRESENT-SETUP-STALL-1: the texture-present setup blocks. The session's first one (its one-time
+    // allocation) is reported apart and excluded from every other count.
+    bool presentSetupFirstKnown = false;
+    double presentSetupFirstMs = 0.0;
+    int presentSetupSamplesAfterFirst = 0;
+    int presentSetupOver50 = 0;                        // setup total > kPresentSetupStallMs
+    double presentSetupMaxMs = 0.0;
+    SetupPart presentSetupMaxPart = SetupPart::Count;  // of the max-setup present; Count = none
+    int lutRebuildsAfterFirst = 0;
+    std::vector<std::pair<std::string, long long>> lutMissFields;   // group -> rebuilds, in first-seen order
 };
 
 class SlipHistogram
@@ -383,6 +441,41 @@ public:
         m_previousIntervalWasGap = intervalMs >= kGapIntervalMs;
     }
 
+    /*! PLAYBACK-GL-PRESENT-SETUP-STALL-1: one texture-present setup block (a present that ran a presenter). The
+     *  session's first is its one-time allocation: kept apart as present_setup_first_ms, counted nowhere else. */
+    void notePresentSetup( const PresentSetupSample &s )
+    {
+        if( !m_setupFirstKnown )
+        {
+            m_setupFirstKnown = true;
+            m_setupFirstMs = s.totalMs;
+            return;
+        }
+        ++m_setupSamples;
+        if( s.totalMs > kPresentSetupStallMs ) ++m_setupOver50;
+        if( m_setupSamples == 1 || s.totalMs > m_setupMaxMs )
+        {
+            m_setupMaxMs = s.totalMs;
+            m_setupMaxPart = presentSetupMaxPart( s );
+        }
+        if( s.lutRebuilt )
+        {
+            ++m_lutRebuilds;
+            const std::string miss = s.lutMiss ? s.lutMiss : "none";
+            bool found = false;
+            for( auto &entry : m_lutMissFields )
+            {
+                if( entry.first == miss )
+                {
+                    ++entry.second;
+                    found = true;
+                    break;
+                }
+            }
+            if( !found ) m_lutMissFields.emplace_back( miss, 1 );
+        }
+    }
+
     /*! Classify every slip against the session medians and total the session. \a nowMs is the session end and
      *  \a endPosition the slider then; whatever the advance paths did not explain is folded into OTHER. */
     Summary finish( double nowMs, int endPosition ) const
@@ -411,6 +504,14 @@ public:
         out.paceGuardFpsMax = m_guardPaceMax;
         out.maxIntervalMs = m_maxIntervalMs;
         out.maxIntervalFrame = m_maxIntervalFrame;
+        out.presentSetupFirstKnown = m_setupFirstKnown;
+        out.presentSetupFirstMs = m_setupFirstMs;
+        out.presentSetupSamplesAfterFirst = m_setupSamples;
+        out.presentSetupOver50 = m_setupOver50;
+        out.presentSetupMaxMs = m_setupMaxMs;
+        out.presentSetupMaxPart = m_setupSamples > 0 ? m_setupMaxPart : SetupPart::Count;
+        out.lutRebuildsAfterFirst = m_lutRebuilds;
+        out.lutMissFields = m_lutMissFields;
         out.advanceByPath = m_advanceByPath;
         long long explained = 0;
         for( long long v : m_advanceByPath ) explained += v;
@@ -628,6 +729,15 @@ private:
     int m_waitCreditFrames = 0;
     int m_catchupAfterFirstFrames = 0;
     bool m_caughtUp = false;
+
+    bool m_setupFirstKnown = false;
+    double m_setupFirstMs = 0.0;
+    int m_setupSamples = 0;
+    int m_setupOver50 = 0;
+    double m_setupMaxMs = 0.0;
+    SetupPart m_setupMaxPart = SetupPart::Count;
+    int m_lutRebuilds = 0;
+    std::vector<std::pair<std::string, long long>> m_lutMissFields;
 
     std::array<long long, kSlipBucketCount> m_histSlip {};
     std::array<long long, kIntervalBucketCount> m_histInterval {};

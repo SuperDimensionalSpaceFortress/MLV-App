@@ -8,6 +8,7 @@
 #include "../../platform/qt/PlaybackSlipHistogram.h"
 
 #include <cmath>
+#include <string>
 
 using playback_slip::AdvancePath;
 using playback_slip::PresentSample;
@@ -493,4 +494,91 @@ TEST(PlaybackSlipHistogram, TheSkipAfterAStallIsMarkedAfterGapButKeepsItsClass)
     ASSERT_TRUE( s.slipLines[0].afterGap );
     ASSERT_EQ( 10, s.maxIntervalFrame );
     ASSERT_TRUE( s.maxIntervalClass == SlipClass::None );
+}
+// PLAYBACK-GL-PRESENT-SETUP-STALL-1: the texture-present setup counters behind slip_summary's present_setup_* and
+// lut_* fields. The first setup block is the session's one-time allocation: reported apart, counted nowhere else.
+namespace
+{
+playback_slip::PresentSetupSample setupSample( double totalMs, double lutMs = 0.0, double drainMs = 0.0,
+                                              bool rebuilt = false, const char *miss = "none" )
+{
+    using playback_slip::SetupPart;
+    playback_slip::PresentSetupSample s;
+    s.totalMs = totalMs;
+    s.partsMs[static_cast<size_t>( SetupPart::Program )] = 0.01;
+    s.partsMs[static_cast<size_t>( SetupPart::Lut )] = lutMs;
+    s.partsMs[static_cast<size_t>( SetupPart::BlurDrain )] = drainMs;
+    s.lutRebuilt = rebuilt;
+    s.lutMiss = miss;
+    return s;
+}
+}
+
+TEST(PlaybackSlipHistogram, PresentSetupFirstIsExcludedAndTheStallThresholdIsStrict)
+{
+    using playback_slip::SetupPart;
+    SlipHistogram h;
+    h.reset( 0, kNativeFps );
+    h.notePresentSetup( setupSample( 400.0, 390.0, 0.0, true, "unbuilt" ) );   // first: allocation, apart
+    h.notePresentSetup( setupSample( 50.0, 0.0, 49.0 ) );                     // exactly 50: not over
+    h.notePresentSetup( setupSample( 50.001, 0.0, 49.0 ) );                   // over
+    h.notePresentSetup( setupSample( 1.5, 0.2, 0.3 ) );
+    const Summary s = h.finish( 1000.0, 0 );
+    ASSERT_TRUE( s.presentSetupFirstKnown );
+    ASSERT_NEAR( 400.0, s.presentSetupFirstMs, 1e-12 );
+    ASSERT_EQ( 3, s.presentSetupSamplesAfterFirst );
+    ASSERT_EQ( 1, s.presentSetupOver50 );
+    ASSERT_NEAR( 50.001, s.presentSetupMaxMs, 1e-12 );
+    ASSERT_TRUE( s.presentSetupMaxPart == SetupPart::BlurDrain );
+    ASSERT_EQ( 0, s.lutRebuildsAfterFirst );                                   // the first present's rebuild is not counted
+    ASSERT_TRUE( s.lutMissFields.empty() );
+}
+
+TEST(PlaybackSlipHistogram, PresentSetupMaxPartIsAttributedIncludingUntimed)
+{
+    using playback_slip::SetupPart;
+    ASSERT_TRUE( playback_slip::presentSetupMaxPart( setupSample( 210.0, 5.0, 200.0 ) ) == SetupPart::BlurDrain );
+    ASSERT_TRUE( playback_slip::presentSetupMaxPart( setupSample( 210.0, 200.0, 5.0 ) ) == SetupPart::Lut );
+    // 210 - (0.01 + 5 + 5) of the block no part timed: UNTIMED.
+    ASSERT_TRUE( playback_slip::presentSetupMaxPart( setupSample( 210.0, 5.0, 5.0 ) ) == SetupPart::Untimed );
+    ASSERT_EQ( std::string( "untimed" ), std::string( playback_slip::setupPartName( SetupPart::Untimed ) ) );
+    ASSERT_EQ( std::string( "none" ), std::string( playback_slip::setupPartName( SetupPart::Count ) ) );
+
+    // The session's max part is the max-setup present's own, not the session's largest part anywhere.
+    SlipHistogram h;
+    h.reset( 0, kNativeFps );
+    h.notePresentSetup( setupSample( 2.0 ) );
+    h.notePresentSetup( setupSample( 120.0, 110.0, 1.0 ) );
+    h.notePresentSetup( setupSample( 230.0, 1.0, 220.0 ) );
+    h.notePresentSetup( setupSample( 90.0, 85.0, 1.0 ) );
+    const Summary s = h.finish( 1000.0, 0 );
+    ASSERT_EQ( 3, s.presentSetupOver50 );
+    ASSERT_NEAR( 230.0, s.presentSetupMaxMs, 1e-12 );
+    ASSERT_TRUE( s.presentSetupMaxPart == SetupPart::BlurDrain );
+}
+
+TEST(PlaybackSlipHistogram, PresentSetupLutMissFieldsTallyRebuildsByGroupInFirstSeenOrder)
+{
+    SlipHistogram h;
+    h.reset( 0, kNativeFps );
+    h.notePresentSetup( setupSample( 30.0, 29.0, 0.0, true, "unbuilt" ) );   // first: excluded
+    h.notePresentSetup( setupSample( 60.0, 59.0, 0.0, true, "highest_green_diso" ) );
+    h.notePresentSetup( setupSample( 1.0 ) );
+    h.notePresentSetup( setupSample( 61.0, 60.0, 0.0, true, "levels" ) );
+    h.notePresentSetup( setupSample( 62.0, 61.0, 0.0, true, "highest_green_diso" ) );
+    const Summary s = h.finish( 1000.0, 0 );
+    ASSERT_EQ( 3, s.lutRebuildsAfterFirst );
+    ASSERT_EQ( static_cast<size_t>( 2 ), s.lutMissFields.size() );
+    ASSERT_EQ( std::string( "highest_green_diso" ), s.lutMissFields[0].first );
+    ASSERT_EQ( 2LL, s.lutMissFields[0].second );
+    ASSERT_EQ( std::string( "levels" ), s.lutMissFields[1].first );
+    ASSERT_EQ( 1LL, s.lutMissFields[1].second );
+
+    // A session with no setup block reports none.
+    SlipHistogram empty;
+    empty.reset( 0, kNativeFps );
+    const Summary e = empty.finish( 1000.0, 0 );
+    ASSERT_FALSE( e.presentSetupFirstKnown );
+    ASSERT_EQ( 0, e.presentSetupOver50 );
+    ASSERT_TRUE( e.presentSetupMaxPart == playback_slip::SetupPart::Count );
 }
