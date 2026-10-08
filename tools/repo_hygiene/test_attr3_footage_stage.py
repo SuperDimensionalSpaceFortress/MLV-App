@@ -1544,7 +1544,10 @@ class SameJobIdRulingPremiseTests(unittest.TestCase):
     # against this ruling: every submission carries a fresh JobId (a per-run UTC stamp plus a
     # -health/-regsnap/-regrestore/leg suffix), it never resubmits a JobId, and um-run's claim-first
     # ownership (above) makes a collision safe by construction anyway.
-    KNOWN_PRODUCTION_CALLERS = {GENERATOR, ROOT / "tools" / "profiling" / "dual-venue" / "Invoke-VenueLeg.ps1"}
+    # LOOK-ASSIST-CINEMATIC-BENCH-PAIR-1: Wait-VenueQuiet.ps1 (the read-only cooldown probe) is the third. Re-examined the same way: every probe
+    # submission carries a fresh JobId (venue-quiet-probe-<UTC to the millisecond>), it never resubmits one, and claim-first ownership holds anyway.
+    KNOWN_PRODUCTION_CALLERS = {GENERATOR, ROOT / "tools" / "profiling" / "dual-venue" / "Invoke-VenueLeg.ps1",
+                                ROOT / "tools" / "profiling" / "dual-venue" / "Wait-VenueQuiet.ps1"}
 
     def _production_um_run_references(self) -> set[Path]:
         proc = subprocess.run(
