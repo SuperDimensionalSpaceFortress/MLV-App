@@ -11,6 +11,49 @@
 
 #include <cstdint>
 
+/* PLAYBACK-GL-PRESENT-SETUP-STALL-1: the config fields `signature` hashes, split into
+ * groups so a LUT texture-set rebuild can name what moved (the first group whose digest
+ * differs from the one the set was built from). The first nine are texture content; the
+ * last four reach the display shader only as uniforms. The digests are computed next to
+ * `signature` in gpuPreviewProcessingBuildConfig and never change it. */
+enum GpuPreviewProcessingLutGroup
+{
+    GpuPreviewLutGroupLevels = 0,
+    GpuPreviewLutGroupMatrix,
+    GpuPreviewLutGroupMatrixRaw,
+    GpuPreviewLutGroupGamma,
+    GpuPreviewLutGroupContrastCurve,
+    GpuPreviewLutGroupShCurve,
+    GpuPreviewLutGroupCreative,
+    GpuPreviewLutGroupHueVs,
+    GpuPreviewLutGroupLut3d,
+    GpuPreviewLutGroupHighestGreen,
+    GpuPreviewLutGroupHighestGreenDiso,
+    GpuPreviewLutGroupWbMatrix,
+    GpuPreviewLutGroupOtherUniforms,
+    GpuPreviewLutGroupCount
+};
+/* Static lower-case group name ("levels", ..., "other_uniforms"); "unknown" out of range. */
+const char * gpuPreviewProcessingLutGroupName(int group);
+
+/* PLAYBACK-GL-PRESENT-SETUP-STALL-1: where one GUI-thread texture-present setup block
+ * (GpuDisplayWindow / GpuDisplayViewport setupMs) spent its wall time. CPU wall time only
+ * (QElapsedTimer reads, no GL query or fence). lut_miss is a static string: "none" when
+ * the LUT set was not rebuilt, else the first differing group, "unbuilt" when the set
+ * had no valid key, or "unknown" when every group digest matched. */
+struct GpuPresentSetupTiming
+{
+    double program_ms = 0.0;
+    double lut_ms = 0.0;
+    bool lut_rebuilt = false;
+    const char * lut_miss = "none";
+    double blur_drain_ms = 0.0;
+    double blur_upload_ms = 0.0;
+    double blur_check_ms = 0.0;
+    double realloc_ms = 0.0;
+    double sampling_ms = 0.0;
+};
+
 struct GpuPreviewProcessingConfig
 {
     bool enabled = false;
@@ -127,6 +170,9 @@ struct GpuPreviewProcessingConfig
      * pinned golden signatures never move), so the TEXTURE caches key on this
      * second hash as well; see gpuPreviewProcessingRawLutSignature. */
     uint64_t rawLutSignature = 0;
+    /* PLAYBACK-GL-PRESENT-SETUP-STALL-1: per-group digests (GpuPreviewProcessingLutGroup),
+     * for naming a LUT-set rebuild only. Zero on hand-built configs. */
+    uint64_t lutGroupDigests[GpuPreviewLutGroupCount] = { 0 };
 };
 
 /* Hash of the three unclamped matrix LUTs, always (not gated like `signature`). */
@@ -341,6 +387,8 @@ struct GpuPreviewProcessingLutTextureSet
     uint64_t signature = 0;
     uint64_t rawLutSignature = 0;   /* config.rawLutSignature the matrix textures were built from */
     bool signatureValid = false;
+    /* config.lutGroupDigests the set was built from (names the group on the next miss). */
+    uint64_t lutGroupDigests[GpuPreviewLutGroupCount] = { 0 };
     /* The shadows/highlights BLUR texture is per-FRAME content (the spatial
      * low-pass of the current frame), not per-settings-signature, so it is
      * tracked and re-uploaded separately every frame by
@@ -385,13 +433,20 @@ QOpenGLTexture * gpuPreviewProcessingCreateOrResizeLookupTexture(QOpenGLTexture 
 void gpuPreviewProcessingDestroyLutTextureSet(GpuPreviewProcessingLutTextureSet & set);
 /* Rebuilds/uploads the 5 LUT textures from config when its signature changed (dirty-
  * tracked via config.signature); destroys them and no-ops when config.enabled is
- * false. Safe to call every frame. */
+ * false. Safe to call every frame. setupTiming (optional) gets lut_rebuilt and lut_miss
+ * (PLAYBACK-GL-PRESENT-SETUP-STALL-1); the group comparison runs on a miss only. */
 void gpuPreviewProcessingUpdateLutTextureSet(GpuPreviewProcessingLutTextureSet & set,
-                                             const GpuPreviewProcessingConfig & config);
+                                             const GpuPreviewProcessingConfig & config,
+                                             GpuPresentSetupTiming * setupTiming = nullptr);
 /* True when the set was built from exactly this config's LUT content: both
  * `signature` and `rawLutSignature` match (the texture cache key). */
 bool gpuPreviewProcessingLutTextureSetKeyMatches(const GpuPreviewProcessingLutTextureSet & set,
                                                  const GpuPreviewProcessingConfig & config);
+/* PLAYBACK-GL-PRESENT-SETUP-STALL-1 (GL-free): the lut_miss name for a rebuild of `set`
+ * from `config` -- "unbuilt" when the set has no valid key, else the first group whose
+ * digest differs, else "unknown". */
+const char * gpuPreviewProcessingLutTextureSetMissGroup(const GpuPreviewProcessingLutTextureSet & set,
+                                                        const GpuPreviewProcessingConfig & config);
 bool gpuPreviewProcessingLutTextureSetReady(const GpuPreviewProcessingLutTextureSet & set,
                                             const GpuPreviewProcessingConfig & config);
 /* CUDA-PLAYBACK-LOOK-PARITY-1: uploads/refreshes the per-frame shadows/
@@ -403,12 +458,15 @@ bool gpuPreviewProcessingLutTextureSetReady(const GpuPreviewProcessingLutTexture
  * false) when S/H is not requested or the frame-state bytes do not match
  * width*height*3 uint16 -- the caller then binds previewApplyShadowsHighlights
  * = 0 for this frame and must record the drop via telemetry (round-1 v2.1
- * disclosed-open contract: no silent drop). Safe to call every paint. */
+ * disclosed-open contract: no silent drop). Safe to call every paint. setupTiming
+ * (optional, PLAYBACK-GL-PRESENT-SETUP-STALL-1) gets the glGetError drain, the setData
+ * upload and the glGetError check as separate wall spans, and any blur realloc. */
 bool gpuPreviewProcessingUpdateShadowsHighlightsBlurTexture(
     GpuPreviewProcessingLutTextureSet & set,
     const GpuPreviewProcessingConfig & config,
     int width,
-    int height);
+    int height,
+    GpuPresentSetupTiming * setupTiming = nullptr);
 /* PLAYBACK-CUDA-HONOUR-SCALE-1 r2: present-gap instrumentation (LIGHT-safe,
  * one qInfo line per event). Presenters note each texture reallocation; the
  * play-stop summary reads the count. The context (smoke session id and last

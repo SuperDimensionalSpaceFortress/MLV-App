@@ -625,8 +625,10 @@ TEST(GpuWindowPresentInvariants, LutGate2SubmitRefusesWhenTheLutTextureUploadIsN
     const QString body = reconSubmitBody(source);
     ASSERT_FALSE(body.isEmpty());
 
+    // PLAYBACK-GL-PRESENT-SETUP-STALL-1: the upload now also reports whether the set was rebuilt
+    // (and which group moved) into the present's setup split; same call, same order.
     const int uploadAt = body.indexOf(
-        QStringLiteral("gpuPreviewProcessingUpdateLutTextureSet(m_lutSet, previewProcessing);"));
+        QStringLiteral("gpuPreviewProcessingUpdateLutTextureSet(m_lutSet, previewProcessing, &setupTiming);"));
     ASSERT_TRUE(uploadAt >= 0);
     const int gateAt = body.indexOf(
         QStringLiteral("if ( !gpuPreviewProcessingLutTextureSetReady(m_lutSet, previewProcessing) )"), uploadAt);

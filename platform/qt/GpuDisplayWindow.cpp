@@ -495,6 +495,13 @@ bool GpuDisplayWindow::presentGpuPlaybackReconAmazePostWbTextureIfActive(
         presentationSerial);
 }
 
+GpuPresentSetupTiming GpuDisplayWindow::lastPresentSetupTimingIfActive()
+{
+    QMutexLocker lock(&g_activeMutex);
+    GpuDisplayWindow *win = g_activeWindow.load(std::memory_order_acquire);
+    return win ? win->lastPresentSetupTiming() : GpuPresentSetupTiming();
+}
+
 bool GpuDisplayWindow::readGpuReconSourceBayer16TextureIfActive(
     QByteArray *textureBytes,
     int *width,
@@ -668,6 +675,8 @@ bool GpuDisplayWindow::setPresentedGpuPlaybackReconAmazePostWbTexture(
         m_texturePresentationActive = false;
         return false;
     };
+    // PLAYBACK-GL-PRESENT-SETUP-STALL-1: this call's setup split; never a previous call's.
+    m_lastPresentSetupTiming = GpuPresentSetupTiming();
 
     if ( !state || !state->valid || state->width <= 0 || state->height <= 0 || !wbMultipliers )
     {
@@ -764,21 +773,28 @@ bool GpuDisplayWindow::setPresentedGpuPlaybackReconAmazePostWbTexture(
     const bool madeCurrent = needsCurrent ? (makeCurrent(), true) : false;
     contextMs = elapsedMs() - contextStartMs;
 
+    // PLAYBACK-GL-PRESENT-SETUP-STALL-1: the setupMs block split into parts (wall time
+    // only, no GL query or fence); MainWindow reads it via lastPresentSetupTiming().
+    GpuPresentSetupTiming &setupTiming = m_lastPresentSetupTiming;
     const double setupStartMs = elapsedMs();
     ensurePreviewProcessingProgram();
+    double partStartMs = elapsedMs();
+    setupTiming.program_ms = partStartMs - setupStartMs;
     if ( !m_previewProcessingProgram )
     {
         if ( madeCurrent ) doneCurrent();
         return fail(QStringLiteral("GPU window texture-present shader setup failed"));
     }
-    gpuPreviewProcessingUpdateLutTextureSet(m_lutSet, previewProcessing);
+    gpuPreviewProcessingUpdateLutTextureSet(m_lutSet, previewProcessing, &setupTiming);
     if ( !gpuPreviewProcessingLutTextureSetReady(m_lutSet, previewProcessing) )
     {
+        setupTiming.lut_ms = elapsedMs() - partStartMs;
         if ( madeCurrent ) doneCurrent();
         return fail(QStringLiteral(
             "GPU window playback recon texture-present refused: LUT texture upload failed "
             "for a linear post-WB-undo texture (trace=gpu_window_recon_lut_upload_failed)"));
     }
+    setupTiming.lut_ms = elapsedMs() - partStartMs;
     // CUDA-PLAYBACK-LOOK-PARITY-1: refresh the per-frame shadows/highlights blur
     // texture every present call (its content changes every frame, unlike the
     // signature-cached LUTs above). A miss here (frame-state not ready, or the
@@ -786,8 +802,9 @@ bool GpuDisplayWindow::setPresentedGpuPlaybackReconAmazePostWbTexture(
     // is bound false for this frame by gpuPreviewProcessingBindDisplayUniformsAndTextures
     // rather than refusing the whole recon presentation.
     gpuPreviewProcessingUpdateShadowsHighlightsBlurTexture(
-        m_lutSet, previewProcessing, texWidth, texHeight );
+        m_lutSet, previewProcessing, texWidth, texHeight, &setupTiming );
 
+    partStartMs = elapsedMs();
     if ( !m_texture
       || m_texture->width() != texWidth
       || m_texture->height() != texHeight
@@ -817,8 +834,11 @@ bool GpuDisplayWindow::setPresentedGpuPlaybackReconAmazePostWbTexture(
         gpuPresentEventNoteTextureRealloc("window_r16_texture_realloc", texWidth, texHeight);
     }
     m_gpuReconSourceTextureCurrent = false;
+    const double samplingStartMs = elapsedMs();
+    setupTiming.realloc_ms += samplingStartMs - partStartMs;
     applySamplingMode(options.samplingMode);
     setupMs = elapsedMs() - setupStartMs;
+    setupTiming.sampling_ms = setupStartMs + setupMs - samplingStartMs;
 
     int rc = -1;
     llrpGpuPlaybackReconTiming_t reconTiming;

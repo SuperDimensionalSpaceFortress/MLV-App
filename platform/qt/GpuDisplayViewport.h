@@ -129,6 +129,12 @@ public:
                                           GpuAmazeDebayerBackendTiming *timing = nullptr);
     static void clearPresentedImage(QGraphicsView *view,
                                     QGraphicsPixmapItem *fallbackItem = nullptr);
+    /* PLAYBACK-GL-PRESENT-SETUP-STALL-1: the viewport's lastPresentSetupTiming() (a default
+     * value when none is installed). Read it right after a presentGpuPlaybackRecon* call. */
+    static GpuPresentSetupTiming lastPresentSetupTimingFor(const QGraphicsView *view);
+    /* Where the last GPU-recon texture-present call's setup block spent its time (reset at
+     * the start of every such call). */
+    const GpuPresentSetupTiming &lastPresentSetupTiming(void) const { return m_lastPresentSetupTiming; }
 
 protected:
     bool eventFilter(QObject *watched, QEvent *event) override;
@@ -176,7 +182,7 @@ private:
                                         GpuAmazeDebayerBackendTiming *timing);
     void clearPresentedImage(void);
     void updateTextureIfNeeded(void);
-    void updateProcessingTexturesIfNeeded(void);
+    void updateProcessingTexturesIfNeeded(GpuPresentSetupTiming *setupTiming = nullptr);
     void ensureProgram(void);
     void destroyTexture(void);
     void destroyProcessingTextures(void);
@@ -215,6 +221,7 @@ private:
     // Shared with GpuDisplayWindow (GpuPreviewProcessing.h) so both routes draw
     // through the identical display shader and LUT upload/bind path.
     GpuPreviewProcessingLutTextureSet m_lutSet;
+    GpuPresentSetupTiming m_lastPresentSetupTiming;
 };
 
 #endif // GPUDISPLAYVIEWPORT_H

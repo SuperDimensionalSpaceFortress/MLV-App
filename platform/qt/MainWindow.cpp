@@ -4849,6 +4849,9 @@ void MainWindow::presentPlaybackPreparedFrame( const PlaybackPrepResult &result 
         QString texturePresentReason;
         llrpGpuPlaybackReconTiming_t texturePresentTiming;
         memset( &texturePresentTiming, 0, sizeof( texturePresentTiming ) );
+        // PLAYBACK-GL-PRESENT-SETUP-STALL-1: the setup split of the last presenter call below.
+        GpuPresentSetupTiming texturePresentSetupTiming;
+        bool texturePresentSetupTimingKnown = false;
         const GpuAmazeDebayerBackendAvailability r16AmazeAvailability =
             gpuAmazeDebayerProbeR16TextureBackend();
         const bool gpuPlaybackReconAmazeTextureExtensionAvailable =
@@ -4922,6 +4925,9 @@ void MainWindow::presentPlaybackPreparedFrame( const PlaybackPrepResult &result 
                         textureDisplaySize.width(),
                         textureDisplaySize.height(),
                         task.requestSerial );
+                texturePresentSetupTiming =
+                    GpuDisplayWindow::lastPresentSetupTimingIfActive();
+                texturePresentSetupTimingKnown = true;
                 gpuPlaybackReconAmazeTexturePresentedByWindow =
                     framePresentedByViewport;
             }
@@ -4944,6 +4950,9 @@ void MainWindow::presentPlaybackPreparedFrame( const PlaybackPrepResult &result 
                         task.gpuPlaybackReconTextureRetainedDeviceBayer16,
                         task.gpuPlaybackReconTextureRetainedDeviceWidth,
                         task.gpuPlaybackReconTextureRetainedDeviceHeight );
+                texturePresentSetupTiming =
+                    GpuDisplayViewport::lastPresentSetupTimingFor( ui->graphicsView );
+                texturePresentSetupTimingKnown = true;
             }
             gpuPlaybackReconAmazeTextureActive = framePresentedByViewport;
             if( framePresentedByViewport )
@@ -4975,6 +4984,9 @@ void MainWindow::presentPlaybackPreparedFrame( const PlaybackPrepResult &result 
                     task.gpuPresentationOptions,
                     &texturePresentReason,
                     &texturePresentTiming );
+            texturePresentSetupTiming =
+                GpuDisplayViewport::lastPresentSetupTimingFor( ui->graphicsView );
+            texturePresentSetupTimingKnown = true;
             if( framePresentedByViewport )
             {
                 gpuPlaybackReconNoReadbackPresented = true;
@@ -5196,6 +5208,30 @@ void MainWindow::presentPlaybackPreparedFrame( const PlaybackPrepResult &result 
         readyFrame.stageTimingTelemetry.insert(
             QStringLiteral("gpu_playback_recon_texture_present_setup_ms"),
             texturePresentTiming.setup_ms );
+        // PLAYBACK-GL-PRESENT-SETUP-STALL-1: where setup_ms went (absent when no presenter ran).
+        if( texturePresentSetupTimingKnown )
+        {
+            const GpuPresentSetupTiming &st = texturePresentSetupTiming;
+            readyFrame.stageTimingTelemetry.insert(
+                QStringLiteral("gpu_playback_recon_texture_present_setup_program_ms"), st.program_ms );
+            readyFrame.stageTimingTelemetry.insert(
+                QStringLiteral("gpu_playback_recon_texture_present_setup_lut_ms"), st.lut_ms );
+            readyFrame.stageTimingTelemetry.insert(
+                QStringLiteral("gpu_playback_recon_texture_present_setup_blur_drain_ms"), st.blur_drain_ms );
+            readyFrame.stageTimingTelemetry.insert(
+                QStringLiteral("gpu_playback_recon_texture_present_setup_blur_upload_ms"), st.blur_upload_ms );
+            readyFrame.stageTimingTelemetry.insert(
+                QStringLiteral("gpu_playback_recon_texture_present_setup_blur_check_ms"), st.blur_check_ms );
+            readyFrame.stageTimingTelemetry.insert(
+                QStringLiteral("gpu_playback_recon_texture_present_setup_realloc_ms"), st.realloc_ms );
+            readyFrame.stageTimingTelemetry.insert(
+                QStringLiteral("gpu_playback_recon_texture_present_setup_sampling_ms"), st.sampling_ms );
+            readyFrame.stageTimingTelemetry.insert(
+                QStringLiteral("gpu_playback_recon_texture_present_setup_lut_rebuilt"), st.lut_rebuilt );
+            readyFrame.stageTimingTelemetry.insert(
+                QStringLiteral("gpu_playback_recon_texture_present_setup_lut_miss"),
+                QString::fromLatin1( st.lut_miss ? st.lut_miss : "none" ) );
+        }
         readyFrame.stageTimingTelemetry.insert(
             QStringLiteral("gpu_playback_recon_texture_present_recon_wall_ms"),
             texturePresentTiming.recon_wall_ms );
@@ -24860,6 +24896,29 @@ void MainWindow::notePlaybackSmokePresentedFrame(
         slipSample.timelinePosition = ui->horizontalSliderPosition->value();
         slipSample.lookaheadCovered = requestContext.playbackLookaheadDepth > 0;
         m_playbackSlipHistogram.notePresent( slipSample );
+        // PLAYBACK-GL-PRESENT-SETUP-STALL-1: the texture-present setup split, only for a present a presenter ran.
+        if( timing.contains( QStringLiteral("gpu_playback_recon_texture_present_setup_program_ms") ) )
+        {
+            using playback_slip::SetupPart;
+            playback_slip::PresentSetupSample setupSample;
+            setupSample.totalMs = telemetryDoubleValue( timing, "gpu_playback_recon_texture_present_setup_ms" );
+            const auto part = [&setupSample]( SetupPart p ) -> double &
+            {
+                return setupSample.partsMs[static_cast<size_t>( p )];
+            };
+            part( SetupPart::Program ) = telemetryDoubleValue( timing, "gpu_playback_recon_texture_present_setup_program_ms" );
+            part( SetupPart::Lut ) = telemetryDoubleValue( timing, "gpu_playback_recon_texture_present_setup_lut_ms" );
+            part( SetupPart::BlurDrain ) = telemetryDoubleValue( timing, "gpu_playback_recon_texture_present_setup_blur_drain_ms" );
+            part( SetupPart::BlurUpload ) = telemetryDoubleValue( timing, "gpu_playback_recon_texture_present_setup_blur_upload_ms" );
+            part( SetupPart::BlurCheck ) = telemetryDoubleValue( timing, "gpu_playback_recon_texture_present_setup_blur_check_ms" );
+            part( SetupPart::Realloc ) = telemetryDoubleValue( timing, "gpu_playback_recon_texture_present_setup_realloc_ms" );
+            part( SetupPart::Sampling ) = telemetryDoubleValue( timing, "gpu_playback_recon_texture_present_setup_sampling_ms" );
+            setupSample.lutRebuilt = telemetryBoolValue( timing, "gpu_playback_recon_texture_present_setup_lut_rebuilt" );
+            const QByteArray lutMiss = timing.value(
+                QStringLiteral("gpu_playback_recon_texture_present_setup_lut_miss") ).toString().toLatin1();
+            setupSample.lutMiss = lutMiss.constData();   // copied by notePresentSetup before lutMiss goes away
+            m_playbackSlipHistogram.notePresentSetup( setupSample );
+        }
     }
     const double presentDrawPresentMs = drawImageMs + drawPresentMs;
     const double presentOverlaysScopesMs = drawScopesMs + drawOverlayMs;
@@ -26374,7 +26433,10 @@ void MainWindow::notePlaybackSmokePresentedFrame(
                     "gpu_playback_recon_async_h2d_ready_before_run=%59 "
                     "gpu_playback_recon_async_h2d_host_staging_ms=%60 "
                     "gpu_playback_recon_async_h2d_upload_ms=%61 "
-                    "gpu_playback_recon_async_h2d_upload_wait_ms=%62" )
+                    "gpu_playback_recon_async_h2d_upload_wait_ms=%62 "
+                    "setup_program_ms=%63 setup_lut_ms=%64 setup_lut_rebuilt=%65 "
+                    "setup_lut_miss=%66 setup_blur_drain_ms=%67 setup_blur_upload_ms=%68 "
+                    "setup_blur_check_ms=%69 setup_realloc_ms=%70 setup_sampling_ms=%71" )
                    .arg( static_cast<qulonglong>( m_playbackSmokeSessionId ) )
                    .arg( m_playbackSmokePresentedFrames )
                    .arg( QString::fromLatin1(
@@ -26515,6 +26577,32 @@ void MainWindow::notePlaybackSmokePresentedFrame(
                         0, 'f', 3 )
                     .arg( telemetryDoubleValue(
                         timing, "gpu_playback_recon_async_h2d_upload_wait_ms" ),
+                        0, 'f', 3 )
+                    .arg( telemetryDoubleValue(
+                        timing, "gpu_playback_recon_texture_present_setup_program_ms" ),
+                        0, 'f', 3 )
+                    .arg( telemetryDoubleValue(
+                        timing, "gpu_playback_recon_texture_present_setup_lut_ms" ),
+                        0, 'f', 3 )
+                    .arg( bool01( telemetryBoolValue(
+                        timing, "gpu_playback_recon_texture_present_setup_lut_rebuilt" ) ) )
+                    .arg( timing.value(
+                        QStringLiteral("gpu_playback_recon_texture_present_setup_lut_miss") )
+                        .toString( QStringLiteral("none") ) )
+                    .arg( telemetryDoubleValue(
+                        timing, "gpu_playback_recon_texture_present_setup_blur_drain_ms" ),
+                        0, 'f', 3 )
+                    .arg( telemetryDoubleValue(
+                        timing, "gpu_playback_recon_texture_present_setup_blur_upload_ms" ),
+                        0, 'f', 3 )
+                    .arg( telemetryDoubleValue(
+                        timing, "gpu_playback_recon_texture_present_setup_blur_check_ms" ),
+                        0, 'f', 3 )
+                    .arg( telemetryDoubleValue(
+                        timing, "gpu_playback_recon_texture_present_setup_realloc_ms" ),
+                        0, 'f', 3 )
+                    .arg( telemetryDoubleValue(
+                        timing, "gpu_playback_recon_texture_present_setup_sampling_ms" ),
                         0, 'f', 3 );
         qInfo().noquote()
             << QStringLiteral(
@@ -27378,6 +27466,21 @@ void MainWindow::finishPlaybackSmokeTelemetry( const char *reason )
                << QStringLiteral("repeats=%1").arg( slip.repeats )
                << QStringLiteral("grabs=%1").arg( slip.grabs )
                << QStringLiteral("lookahead_uncovered_slip_events=%1").arg( slip.lookaheadUncoveredSlipEvents );
+        // PLAYBACK-GL-PRESENT-SETUP-STALL-1: the GUI-thread texture-present setup blocks, first one excluded.
+        QStringList missFields;
+        for( const auto &entry : slip.lutMissFields )
+        {
+            missFields << QStringLiteral("%1:%2").arg( QString::fromStdString( entry.first ) )
+                                                 .arg( static_cast<qlonglong>( entry.second ) );
+        }
+        fields << QStringLiteral("present_setup_over_50ms=%1").arg( slip.presentSetupOver50 )
+               << QStringLiteral("present_setup_max_ms=%1").arg( slip.presentSetupMaxMs, 0, 'f', 3 )
+               << QStringLiteral("present_setup_max_part=%1").arg( QLatin1String( setupPartName( slip.presentSetupMaxPart ) ) )
+               << QStringLiteral("lut_rebuilds_after_first=%1").arg( slip.lutRebuildsAfterFirst )
+               << QStringLiteral("lut_miss_fields=%1").arg( missFields.isEmpty()
+                                                                ? QStringLiteral("none")
+                                                                : missFields.join( QLatin1Char(',') ) )
+               << QStringLiteral("present_setup_first_ms=%1").arg( slip.presentSetupFirstMs, 0, 'f', 3 );
         qInfo().noquote() << fields.join( QLatin1Char(' ') );
         for( const SlipRecord &r : slip.slipLines )
         {

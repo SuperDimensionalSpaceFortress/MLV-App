@@ -63,6 +63,144 @@ uint64_t fnv1a64_append(uint64_t hash, const void * data, size_t size)
     return hash;
 }
 
+/* PLAYBACK-GL-PRESENT-SETUP-STALL-1: the per-group LUT digests only need to tell "moved"
+ * from "did not move", so they take 8 bytes per step (about 8x cheaper than the
+ * byte-wise FNV `signature` uses) and never feed `signature`. */
+uint64_t lutGroupDigestAppend(uint64_t hash, const void * data, size_t size)
+{
+    const uint8_t * bytes = static_cast<const uint8_t *>(data);
+    size_t index = 0;
+    for (; index + sizeof(uint64_t) <= size; index += sizeof(uint64_t))
+    {
+        uint64_t word = 0;
+        std::memcpy(&word, bytes + index, sizeof(word));
+        hash = (hash ^ word) * 0x9E3779B97F4A7C15ull;
+        hash ^= hash >> 32;
+    }
+    for (; index < size; ++index)
+    {
+        hash = (hash ^ bytes[index]) * 1099511628211ull;
+    }
+    /* Fold the length in, so an empty table and a missing one stay distinct from a
+     * table of zeros. */
+    hash = (hash ^ static_cast<uint64_t>(size)) * 0x9E3779B97F4A7C15ull;
+    return hash ^ (hash >> 29);
+}
+
+uint64_t lutGroupDigestAppend(uint64_t hash, const QByteArray & bytes)
+{
+    return lutGroupDigestAppend(hash, bytes.constData(), static_cast<size_t>(bytes.size()));
+}
+
+template <typename T>
+uint64_t lutGroupDigestAppendValue(uint64_t hash, const T & value)
+{
+    return lutGroupDigestAppend(hash, &value, sizeof(value));
+}
+
+void computeLutGroupDigests(GpuPreviewProcessingConfig & config)
+{
+    const uint64_t seed = 1469598103934665603ull;
+    uint64_t * d = config.lutGroupDigests;
+    for (int group = 0; group < GpuPreviewLutGroupCount; ++group) d[group] = seed;
+
+    d[GpuPreviewLutGroupLevels] = lutGroupDigestAppend(d[GpuPreviewLutGroupLevels], config.levelsLut);
+
+    uint64_t & matrix = d[GpuPreviewLutGroupMatrix];
+    matrix = lutGroupDigestAppend(matrix, config.matrixLutR);
+    matrix = lutGroupDigestAppend(matrix, config.matrixLutG);
+    matrix = lutGroupDigestAppend(matrix, config.matrixLutB);
+
+    uint64_t & matrixRaw = d[GpuPreviewLutGroupMatrixRaw];
+    matrixRaw = lutGroupDigestAppend(matrixRaw, config.matrixLutRawR);
+    matrixRaw = lutGroupDigestAppend(matrixRaw, config.matrixLutRawG);
+    matrixRaw = lutGroupDigestAppend(matrixRaw, config.matrixLutRawB);
+
+    d[GpuPreviewLutGroupGamma] = lutGroupDigestAppend(d[GpuPreviewLutGroupGamma], config.gammaLut);
+
+    uint64_t & contrast = d[GpuPreviewLutGroupContrastCurve];
+    contrast = lutGroupDigestAppendValue(contrast, config.applyInLoopContrast);
+    contrast = lutGroupDigestAppend(contrast, config.inLoopContrastCurve);
+
+    uint64_t & shCurve = d[GpuPreviewLutGroupShCurve];
+    shCurve = lutGroupDigestAppendValue(shCurve, config.applyShadowsHighlights);
+    shCurve = lutGroupDigestAppend(shCurve, config.shadowsHighlightsCurve);
+
+    uint64_t & creative = d[GpuPreviewLutGroupCreative];
+    creative = lutGroupDigestAppendValue(creative, config.applyCreativeCurves);
+    creative = lutGroupDigestAppend(creative, config.contrastCurveLut);
+    creative = lutGroupDigestAppend(creative, config.gradationLutY);
+    creative = lutGroupDigestAppend(creative, config.gradationLutR);
+    creative = lutGroupDigestAppend(creative, config.gradationLutG);
+    creative = lutGroupDigestAppend(creative, config.gradationLutB);
+
+    uint64_t & hueVs = d[GpuPreviewLutGroupHueVs];
+    hueVs = lutGroupDigestAppendValue(hueVs, config.applyHueVs);
+    hueVs = lutGroupDigestAppend(hueVs, config.hueVsHueCurve);
+    hueVs = lutGroupDigestAppend(hueVs, config.hueVsSaturationCurve);
+    hueVs = lutGroupDigestAppend(hueVs, config.hueVsLumaCurve);
+    hueVs = lutGroupDigestAppend(hueVs, config.lumaVsSaturationCurve);
+
+    uint64_t & lut3d = d[GpuPreviewLutGroupLut3d];
+    lut3d = lutGroupDigestAppendValue(lut3d, config.applyLut);
+    lut3d = lutGroupDigestAppendValue(lut3d, config.lut3d);
+    lut3d = lutGroupDigestAppendValue(lut3d, config.lutDimension);
+    lut3d = lutGroupDigestAppend(lut3d, config.lutDomainMin, sizeof(config.lutDomainMin));
+    lut3d = lutGroupDigestAppend(lut3d, config.lutDomainMax, sizeof(config.lutDomainMax));
+    lut3d = lutGroupDigestAppend(lut3d, config.lutCube);
+
+    uint64_t & highestGreen = d[GpuPreviewLutGroupHighestGreen];
+    highestGreen = lutGroupDigestAppendValue(highestGreen, config.highestGreen);
+    highestGreen = lutGroupDigestAppendValue(highestGreen, config.gradientHighestGreen);
+
+    uint64_t & highestGreenDiso = d[GpuPreviewLutGroupHighestGreenDiso];
+    highestGreenDiso = lutGroupDigestAppendValue(highestGreenDiso, config.highestGreenDiso);
+    highestGreenDiso = lutGroupDigestAppendValue(highestGreenDiso, config.gradientHighestGreenDiso);
+
+    d[GpuPreviewLutGroupWbMatrix] = lutGroupDigestAppend(
+        d[GpuPreviewLutGroupWbMatrix], config.properWbMatrix, sizeof(config.properWbMatrix));
+
+    /* Everything else `signature` hashes. */
+    uint64_t & other = d[GpuPreviewLutGroupOtherUniforms];
+    other = lutGroupDigestAppendValue(other, config.useCameraMatrix);
+    other = lutGroupDigestAppendValue(other, config.applyGamutCompression);
+    other = lutGroupDigestAppendValue(other, config.sourceExposureStops);
+    other = lutGroupDigestAppend(other, config.rgbToY, sizeof(config.rgbToY));
+    other = lutGroupDigestAppendValue(other, config.applyToning);
+    other = lutGroupDigestAppend(other, config.toningGain, sizeof(config.toningGain));
+    other = lutGroupDigestAppendValue(other, config.applyVibrance);
+    other = lutGroupDigestAppendValue(other, config.vibrance);
+    other = lutGroupDigestAppendValue(other, config.applySaturation);
+    other = lutGroupDigestAppendValue(other, config.saturation);
+    other = lutGroupDigestAppendValue(other, config.sourceContrast);
+    other = lutGroupDigestAppendValue(other, config.applyAgx);
+    other = lutGroupDigestAppend(other, config.agxForward, sizeof(config.agxForward));
+    other = lutGroupDigestAppend(other, config.agxInverse, sizeof(config.agxInverse));
+    other = lutGroupDigestAppendValue(other, config.applyVignette);
+    other = lutGroupDigestAppendValue(other, config.vignetteStrength);
+    other = lutGroupDigestAppend(other, config.vignetteMask);
+    other = lutGroupDigestAppendValue(other, config.shadowsHighlightsCurveIndexMask);
+    other = lutGroupDigestAppendValue(other, config.lutIntensity);
+    other = lutGroupDigestAppendValue(other, config.applyHighlightReconstruction);
+    other = lutGroupDigestAppendValue(other, config.highlightReconDualIso);
+    other = lutGroupDigestAppendValue(other, config.applyGradient);
+    other = lutGroupDigestAppendValue(other, config.applyGradientContrast);
+    other = lutGroupDigestAppend(other, config.gradientMatrixLutR);
+    other = lutGroupDigestAppend(other, config.gradientMatrixLutG);
+    other = lutGroupDigestAppend(other, config.gradientMatrixLutB);
+    other = lutGroupDigestAppend(other, config.gradientGammaLut);
+    other = lutGroupDigestAppend(other, config.gradientContrastCurve);
+    other = lutGroupDigestAppendValue(other, config.applyChroma);
+    other = lutGroupDigestAppendValue(other, config.chromaBlurRadius);
+    other = lutGroupDigestAppendValue(other, config.applySharpen);
+    other = lutGroupDigestAppendValue(other, config.sharpenA);
+    other = lutGroupDigestAppendValue(other, config.sharpenX);
+    other = lutGroupDigestAppendValue(other, config.sharpenY);
+    other = lutGroupDigestAppendValue(other, config.applyMedian);
+    other = lutGroupDigestAppendValue(other, config.medianWindow);
+    other = lutGroupDigestAppendValue(other, config.medianStrength);
+}
+
 float clamp01(float value)
 {
     return std::max(0.0f, std::min(1.0f, value));
@@ -2566,7 +2704,8 @@ void gpuPreviewProcessingMarkShadowsHighlightsBlurStale(GpuPreviewProcessingLutT
 }
 
 void gpuPreviewProcessingUpdateLutTextureSet(GpuPreviewProcessingLutTextureSet & set,
-                                             const GpuPreviewProcessingConfig & config)
+                                             const GpuPreviewProcessingConfig & config,
+                                             GpuPresentSetupTiming * setupTiming)
 {
     if ( !config.enabled )
     {
@@ -2582,6 +2721,13 @@ void gpuPreviewProcessingUpdateLutTextureSet(GpuPreviewProcessingLutTextureSet &
       && (!needHueVs || set.hueVsCurves) )
     {
         return;
+    }
+    /* PLAYBACK-GL-PRESENT-SETUP-STALL-1: a rebuild from here on (including one the
+     * readiness checks below abandon); name the group that moved. */
+    if ( setupTiming )
+    {
+        setupTiming->lut_rebuilt = true;
+        setupTiming->lut_miss = gpuPreviewProcessingLutTextureSetMissGroup(set, config);
     }
     if ( config.levelsLut.size() < static_cast<int>(65536u * sizeof(uint16_t))
       || config.matrixLutR.size() < static_cast<int>(65536u * sizeof(uint16_t))
@@ -2701,6 +2847,7 @@ void gpuPreviewProcessingUpdateLutTextureSet(GpuPreviewProcessingLutTextureSet &
 
     set.signature = config.signature;
     set.rawLutSignature = config.rawLutSignature;
+    std::memcpy(set.lutGroupDigests, config.lutGroupDigests, sizeof(set.lutGroupDigests));
     set.signatureValid = true;
 }
 
@@ -2710,6 +2857,30 @@ bool gpuPreviewProcessingLutTextureSetKeyMatches(const GpuPreviewProcessingLutTe
     return set.signatureValid
         && set.signature == config.signature
         && set.rawLutSignature == config.rawLutSignature;
+}
+
+const char * gpuPreviewProcessingLutGroupName(int group)
+{
+    static const char * const kNames[GpuPreviewLutGroupCount] = {
+        "levels", "matrix", "matrix_raw", "gamma", "contrast_curve", "sh_curve",
+        "creative", "hue_vs", "lut3d", "highest_green", "highest_green_diso",
+        "wb_matrix", "other_uniforms"
+    };
+    return (group >= 0 && group < GpuPreviewLutGroupCount) ? kNames[group] : "unknown";
+}
+
+const char * gpuPreviewProcessingLutTextureSetMissGroup(const GpuPreviewProcessingLutTextureSet & set,
+                                                        const GpuPreviewProcessingConfig & config)
+{
+    if ( !set.signatureValid ) return "unbuilt";
+    for (int group = 0; group < GpuPreviewLutGroupCount; ++group)
+    {
+        if ( set.lutGroupDigests[group] != config.lutGroupDigests[group] )
+        {
+            return gpuPreviewProcessingLutGroupName(group);
+        }
+    }
+    return "unknown";
 }
 
 bool gpuPreviewProcessingLutTextureSetReady(const GpuPreviewProcessingLutTextureSet & set,
@@ -2787,7 +2958,8 @@ bool gpuPreviewProcessingUpdateShadowsHighlightsBlurTexture(
     GpuPreviewProcessingLutTextureSet & set,
     const GpuPreviewProcessingConfig & config,
     int width,
-    int height)
+    int height,
+    GpuPresentSetupTiming * setupTiming)
 {
     if ( !config.enabled || !config.applyShadowsHighlights || width <= 0 || height <= 0
       || !gpuPreviewProcessingHasShadowsHighlightsFrameState(config, width, height) )
@@ -2795,6 +2967,15 @@ bool gpuPreviewProcessingUpdateShadowsHighlightsBlurTexture(
         set.shadowsHighlightsBlurReady = false;
         return false;
     }
+
+    /* PLAYBACK-GL-PRESENT-SETUP-STALL-1: wall spans only (nsecsElapsed reads, no GL query
+     * or fence), so the drain / upload / check split costs nothing the GPU can see. */
+    QElapsedTimer spanTimer;
+    if ( setupTiming ) spanTimer.start();
+    auto spanMs = [&spanTimer, setupTiming]() -> double
+    {
+        return setupTiming ? static_cast<double>(spanTimer.nsecsElapsed()) / 1000000.0 : 0.0;
+    };
 
     auto failClosed = [&]() -> bool
     {
@@ -2816,11 +2997,13 @@ bool gpuPreviewProcessingUpdateShadowsHighlightsBlurTexture(
       || set.shadowsHighlightsBlurWidth != blurWidth
       || set.shadowsHighlightsBlurHeight != blurHeight )
     {
+        const double reallocStartMs = spanMs();
         delete set.shadowsHighlightsBlur;
         set.shadowsHighlightsBlur = createFrameTexture(blurWidth, blurHeight);
         set.shadowsHighlightsBlurWidth = blurWidth;
         set.shadowsHighlightsBlurHeight = blurHeight;
         gpuPresentEventNoteTextureRealloc("sh_blur_texture_realloc", blurWidth, blurHeight);
+        if ( setupTiming ) setupTiming->realloc_ms += spanMs() - reallocStartMs;
     }
     set.shadowsHighlightsBlurQuarter = config.shadowsHighlightsBlurQuarter;
     if ( !previewProcessingTextureIsReady(set.shadowsHighlightsBlur) )
@@ -2838,6 +3021,7 @@ bool gpuPreviewProcessingUpdateShadowsHighlightsBlurTexture(
     // succeeded rather than trusting setData()'s void return.
     QOpenGLContext * currentContext = QOpenGLContext::currentContext();
     QOpenGLFunctions * gl = currentContext ? currentContext->functions() : nullptr;
+    const double drainStartMs = spanMs();
     if ( gl )
     {
         constexpr GLenum kGlContextLost = 0x0507;
@@ -2847,15 +3031,21 @@ bool gpuPreviewProcessingUpdateShadowsHighlightsBlurTexture(
         {
             if ( drainedError == kGlContextLost )
             {
+                if ( setupTiming ) setupTiming->blur_drain_ms += spanMs() - drainStartMs;
                 return failClosed();
             }
             ++drainIterations;
         }
     }
+    const double uploadStartMs = spanMs();
+    if ( setupTiming ) setupTiming->blur_drain_ms += uploadStartMs - drainStartMs;
 
     set.shadowsHighlightsBlur->setData(QOpenGLTexture::RGBA, QOpenGLTexture::UInt16, packed.constData());
 
+    const double checkStartMs = spanMs();
+    if ( setupTiming ) setupTiming->blur_upload_ms += checkStartMs - uploadStartMs;
     const GLenum uploadError = gl ? gl->glGetError() : GL_NO_ERROR;
+    if ( setupTiming ) setupTiming->blur_check_ms += spanMs() - checkStartMs;
     if ( !gl || uploadError != GL_NO_ERROR )
     {
         return failClosed();
@@ -3653,6 +3843,7 @@ GpuPreviewProcessingConfig gpuPreviewProcessingBuildConfig(
     hash = fnv1a64_append(hash, config.gradationLutB.constData(), static_cast<size_t>(config.gradationLutB.size()));
     config.signature = hash;
     config.rawLutSignature = gpuPreviewProcessingRawLutSignature(config);
+    computeLutGroupDigests(config);
     return config;
 }
 
