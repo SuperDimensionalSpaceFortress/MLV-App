@@ -357,11 +357,12 @@ def embedded_launchers(text: str) -> list[str]:
     return re.findall(r"@'\r?\n(\s*(?:\[CmdletBinding\(\)\]\s*)?param\(.*?)\r?\n'@", text, re.S | re.I)
 
 
-def validateset_string_arrays(script: str) -> list[str]:
+def validateset_string_arrays(script: str, params: list[tuple[str, int, int]] | None = None) -> list[str]:
     """``[string[]]`` parameters guarded by ``[ValidateSet(...)]``: validation runs on the one joined element
     (``-P a,b``) before any in-script split can run, so a comma list is rejected at bind time."""
     names = []
-    params = script_string_array_params(script)
+    if params is None:
+        params = script_string_array_params(script)
     clean = _blank_comments(script) if params else ""
     for name, _line, end in params:
         decl = clean[max(0, end - 4000):end]
@@ -416,11 +417,14 @@ def find_violations(files: dict[str, str]) -> list[Violation]:
         if not path.lower().endswith(".ps1"):
             continue
         # A top-level [ValidateSet] rejects the joined element at bind time, so no in-script split can clear it.
-        guarded = {name.lower() for name in validateset_string_arrays(text)}
+        declared = script_string_array_params(text)
+        if not declared:
+            continue
+        guarded = {name.lower() for name in validateset_string_arrays(text, declared)}
         validated.update((path, name.lower()) for name in guarded)
         params = [
             (name, name.lower() not in guarded and is_normalised(text, name, end))
-            for name, _line, end in script_string_array_params(text)
+            for name, _line, end in declared
         ]
         if params:
             scripts[path] = params
