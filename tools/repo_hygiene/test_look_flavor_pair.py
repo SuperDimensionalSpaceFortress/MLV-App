@@ -263,6 +263,174 @@ class FlavorDiffComposeTests(FlavorDiffHarness):
         self.assertEqual(self.pngs(out), [])
 
 
+# LOOK-ASSIST-FILM-FLAVOR-1: the three-side mode (Classic | Cinematic | Film) ------------------------------------------------------------
+FILM = dict(CINEMATIC, presetGrade="film-v1")
+BASE_COMMIT = "1581f29e57d5a636fc84656400f778f63ec9a406"
+
+
+def independent_split_and_green(arr):
+    import numpy as np
+    f = arr.reshape(-1, 3).astype(np.float64)
+    y = 0.299 * f[:, 0] + 0.587 * f[:, 1] + 0.114 * f[:, 2]
+    p05, p30, p70, p95 = np.percentile(y, [5, 30, 70, 95])
+    ba, ga = f[:, 2] - f[:, 0], f[:, 1] - (f[:, 0] + f[:, 2]) / 2.0
+    s = ba[(y >= p05) & (y <= p30)].mean() - ba[(y >= p70) & (y <= p95)].mean()
+    return float(s), float(ga[(y >= p30) & (y <= p70)].mean())
+
+
+def independent_mad(x, y):
+    import numpy as np
+    d = np.abs(x.astype(np.float64) - y.astype(np.float64))
+    return float((d[:, :, 0].mean() + d[:, :, 1].mean() + d[:, :, 2].mean()) / 3.0)
+
+
+def graded(arr):
+    """A blue-amber split laid over a tile: blue up in the dark half of the pixels, red up in the bright half."""
+    import numpy as np
+    f = arr.astype(np.int32)
+    dark = independent_luma(arr) < 128
+    f[..., 2] = np.where(dark, f[..., 2] + 9, f[..., 2] - 9)
+    f[..., 0] = np.where(dark, f[..., 0] - 9, f[..., 0] + 9)
+    return np.clip(f, 0, 255).astype(np.uint8)
+
+
+class FlavorTrioHarness(FlavorDiffHarness):
+    def run_trio(self, tiles: dict, *, film_sliders=FILM, film_reported="film", out_dir: Path | None = None, tool: Path = TOOL):
+        """tiles: {"classic": {i: arr}, "cinematic": {...}, "film": {...}}."""
+        self.runs += 1
+        run = self.tmp / f"trio{self.runs}"
+        stage = run / ".claude-state" / "stage"
+        args = [sys.executable, str(tool)]
+        for side, doc, reported in (("classic", CLASSIC, "classic"), ("cinematic", CINEMATIC, "cinematic"), ("film", film_sliders, film_reported)):
+            d, listed = self.make_side(stage, side, tiles[side], None)
+            sliders = stage / f"sliders-{side}.json"
+            sliders.write_text(json.dumps(doc), encoding="utf-8")
+            args += [f"--{side}-frames", str(d), f"--{side}-listed", str(listed), f"--{side}-sliders", str(sliders),
+                     f"--{side}-flavor-reported", reported, f"--{side}-receipt-id", f"r-{side}"]
+        out = out_dir if out_dir is not None else run / ".claude-state" / "trio"
+        args += ["--clip-id", "M16-1243", "--venue", "bachelor", "--build-sha", "0123456789ab", "--out-dir", str(out)]
+        return subprocess.run(args, capture_output=True, text=True, timeout=300), out
+
+
+class FlavorTrioRefusalTests(FlavorTrioHarness):
+    def test_a_film_side_without_its_grade_or_its_name_is_refused_as_inert(self) -> None:
+        cases = ((dict(FILM, presetGrade="none"), "film"), (dict(FILM, presetGrade="skipped_user_curve"), "film"),
+                 ({k: v for k, v in FILM.items() if k != "presetGrade"}, "film"), (FILM, "cinematic"), (FILM, "none"))
+        for sliders, reported in cases:
+            with self.subTest(grade=sliders.get("presetGrade"), reported=reported):
+                proc, out = self.run_trio({s: {0: None} for s in ("classic", "cinematic", "film")}, film_sliders=sliders, film_reported=reported)
+                self.assertEqual(proc.returncode, 10, proc.stdout + proc.stderr)
+                self.assertTrue(proc.stderr.startswith("FLAVOR_INERT"), proc.stderr)
+                self.assertEqual(self.pngs(out), [])
+
+    def test_a_partial_set_of_film_arguments_is_a_usage_error(self) -> None:
+        proc = subprocess.run([sys.executable, str(TOOL), "--classic-frames", "a", "--classic-listed", "a", "--classic-sliders", "a",
+                               "--classic-flavor-reported", "classic", "--cinematic-frames", "a", "--cinematic-listed", "a",
+                               "--cinematic-sliders", "a", "--cinematic-flavor-reported", "cinematic", "--film-frames", "a",
+                               "--out-dir", str(self.tmp / ".claude-state" / "x")], capture_output=True, text=True, timeout=60)
+        self.assertEqual(proc.returncode, 2, proc.stdout + proc.stderr)
+
+
+@requires_imaging
+class FlavorTrioComposeTests(FlavorTrioHarness):
+    def test_a_live_trio_writes_the_sheet_rows_heatmaps_and_the_metrics_numpy_recomputes(self) -> None:
+        import numpy as np
+        from PIL import Image
+        cla = {0: tile(40), 1: tile(41)}
+        cin = {0: tile(42), 1: tile(43)}
+        fil = {i: graded(a) for i, a in cin.items()}
+        proc, out = self.run_trio({"classic": cla, "cinematic": cin, "film": fil})
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        self.assertIn("LOOK_FLAVOR_DIFF_OK", proc.stdout)
+        tile_h = round(1280 * H / W)
+        with Image.open(out / "sheet-classic-cinematic-film.png") as sheet:
+            self.assertEqual(sheet.size, (3840, 220 + 2 * (44 + tile_h)))
+        for i in (0, 1):
+            with Image.open(out / f"row-{i:02d}.png") as row:
+                self.assertEqual(row.size, (3840, 44 + tile_h))
+            for kind in ("heat-film-vs-classic", "heat-film-vs-cinematic"):
+                with Image.open(out / f"{kind}-{i:02d}.png") as heat:
+                    self.assertEqual(heat.size, (W, H + 64))
+        self.assertFalse((out / "sheet-classic-vs-cinematic.png").exists())
+
+        m = json.loads((out / "metrics.json").read_text(encoding="utf-8"))
+        self.assertEqual(m["schema"], "mlv-app/look-flavor-diff-metrics/v2")
+        self.assertIs(m["flavorLive"], True)
+        self.assertIs(m["filmLive"], True)
+        self.assertEqual(m["presetGrade"], {"classic": "none", "cinematic": "none", "film": "film-v1"})
+        want = {"MAD": {"cinematic_classic": [], "film_classic": [], "film_cinematic": []}, "dS": {"cinematic": [], "film": []},
+                "dGA": {"cinematic": [], "film": []}}
+        for t, i in zip(m["tiles"], (0, 1)):
+            s_cla, ga_cla = independent_split_and_green(cla[i])
+            s_cin, ga_cin = independent_split_and_green(cin[i])
+            s_fil, ga_fil = independent_split_and_green(fil[i])
+            for side, s, ga in (("classic", s_cla, ga_cla), ("cinematic", s_cin, ga_cin), ("film", s_fil, ga_fil)):
+                self.assertAlmostEqual(t[side]["S"], s, delta=1e-6, msg=f"S {side}")
+                self.assertAlmostEqual(t[side]["GA"], ga, delta=1e-6, msg=f"GA {side}")
+            expected = {"cinematic_classic": independent_mad(cin[i], cla[i]), "film_classic": independent_mad(fil[i], cla[i]),
+                        "film_cinematic": independent_mad(fil[i], cin[i])}
+            for k, v in expected.items():
+                self.assertAlmostEqual(t["MAD"][k], v, delta=1e-6, msg=f"MAD {k}")
+                want["MAD"][k].append(v)
+            self.assertAlmostEqual(t["dS"]["film"], s_fil - s_cla, delta=1e-6)
+            self.assertAlmostEqual(t["dS"]["cinematic"], s_cin - s_cla, delta=1e-6)
+            self.assertAlmostEqual(t["dGA"]["film"], ga_fil - ga_cla, delta=1e-6)
+            want["dS"]["film"].append(s_fil - s_cla); want["dS"]["cinematic"].append(s_cin - s_cla)
+            want["dGA"]["film"].append(ga_fil - ga_cla); want["dGA"]["cinematic"].append(ga_cin - ga_cla)
+        for group, keys in want.items():
+            for k, vals in keys.items():
+                self.assertAlmostEqual(m["means"][group][k], float(np.mean(vals)), delta=1e-6, msg=f"mean {group} {k}")
+        self.assertAlmostEqual(m["means"]["dSGapFilmMinusCinematic"], float(np.mean(want["dS"]["film"]) - np.mean(want["dS"]["cinematic"])), delta=1e-6)
+        # The synthetic grade really is a split (blue up in the shadows, red up in the highlights), so S rises.
+        self.assertGreater(m["means"]["dSGapFilmMinusCinematic"], 4.0)
+        self.assertIn("| presetGrade | none | none | film-v1 |", (out / "table.md").read_text(encoding="utf-8"))
+
+    def test_a_trio_into_an_occupied_out_dir_is_refused(self) -> None:
+        for name in ("sheet-classic-cinematic-film.png", "heat-film-vs-cinematic-01.png", "metrics.json"):
+            with self.subTest(existing=name):
+                shared = self.tmp / name / ".claude-state" / "trio"
+                shared.mkdir(parents=True)
+                (shared / name).write_bytes(b"earlier evidence")
+                tiles = {s: {0: tile(1), 1: tile(2)} for s in ("classic", "cinematic")}
+                tiles["film"] = {0: graded(tile(1)), 1: graded(tile(2))}
+                proc, out = self.run_trio(tiles, out_dir=shared)
+                self.assertEqual(proc.returncode, 16, proc.stdout + proc.stderr)
+                self.assertEqual(sorted(p.name for p in out.iterdir()), [name])
+
+    def test_the_two_side_outputs_are_byte_identical_to_the_base_commits_tool(self) -> None:
+        """The same fixed synthetic pair through this tool and through the tool as it was at the base commit (with ITS make-contact-sheet.py)."""
+        base_dir = self.tmp / "base-tool"
+        base_dir.mkdir()
+        for rel in ("tools/profiling/look-flavor-diff.py", "tools/profiling/make-contact-sheet.py"):
+            show = subprocess.run(["git", "-C", str(ROOT), "show", f"{BASE_COMMIT}:{rel}"], capture_output=True, timeout=60)
+            if show.returncode != 0:
+                self.skipTest(f"base commit {BASE_COMMIT[:12]} is not in this clone (shallow checkout)")
+            (base_dir / Path(rel).name).write_bytes(show.stdout)
+        outputs = []
+        for tool in (TOOL, base_dir / "look-flavor-diff.py"):
+            self.runs += 1
+            run = self.tmp / f"twoside{self.runs}"
+            stage = run / ".claude-state" / "stage"
+            cla_dir, cla_list = self.make_side(stage, "classic", {0: tile(50), 1: tile(51, letterbox=4)}, {0: 30, 1: 75})
+            cin_dir, cin_list = self.make_side(stage, "cinematic", {0: tile(52), 1: tile(53, letterbox=4)}, {0: 31, 1: 70})
+            sliders = {}
+            for side, doc in (("classic", CLASSIC), ("cinematic", CINEMATIC)):
+                sliders[side] = stage / f"sliders-{side}.json"
+                sliders[side].write_text(json.dumps(doc), encoding="utf-8")
+            out = run / ".claude-state" / "pair"
+            proc = subprocess.run([sys.executable, str(tool),
+                                   "--classic-frames", str(cla_dir), "--classic-listed", str(cla_list), "--classic-sliders", str(sliders["classic"]),
+                                   "--classic-flavor-reported", "classic", "--classic-receipt-id", "r-classic",
+                                   "--cinematic-frames", str(cin_dir), "--cinematic-listed", str(cin_list), "--cinematic-sliders", str(sliders["cinematic"]),
+                                   "--cinematic-flavor-reported", "cinematic", "--cinematic-receipt-id", "r-cinematic",
+                                   "--clip-id", "M16-1243", "--venue", "bachelor", "--build-sha", "0123456789ab", "--out-dir", str(out)],
+                                  capture_output=True, text=True, timeout=300)
+            self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+            outputs.append((proc.stdout.replace(str(out), "<OUT>"), FlavorDiffComposeTests.tree_hashes(out)))
+        self.assertEqual(outputs[0][1], outputs[1][1], "every two-side output file is byte-identical to the base commit's tool")
+        self.assertEqual(outputs[0][0], outputs[1][0])
+
+
 # the pair driver and the cooldown gate (pwsh) ----------------------------------------------------------------------------------------------
 def synthetic_receipt(flavor, manifest="a" * 64):
     return {"receiptId": f"r-{flavor}", "card": "DUAL-VENUE-EVIDENCE-1", "legId": f"leg-{flavor}", "outcome": "PASS",
@@ -340,6 +508,35 @@ class FlavorPairDriverTests(unittest.TestCase):
                 self.assertEqual(proc.returncode, 16, proc.stdout + proc.stderr)
                 self.assertIn(f"PAIR_OUTPUT_EXISTS {name}", proc.stdout + proc.stderr)
                 self.assertEqual(sorted(p.name for p in out.iterdir()), [name])
+
+    # LOOK-ASSIST-FILM-FLAVOR-1: -FilmReceipt makes it a trio; the same equality checks hold across all three.
+    def trio(self, classic, cinematic, film, out: Path | None = None):
+        paths = []
+        for name, doc in (("classic", classic), ("cinematic", cinematic), ("film", film)):
+            p = self.tmp / f"{name}.receipt.json"
+            p.write_text(json.dumps(doc), encoding="utf-8")
+            paths.append(p)
+        return subprocess.run([PWSH, "-NoLogo", "-NoProfile", "-NonInteractive", "-File", str(DV / "New-VenueFlavorPair.ps1"),
+                               "-ClassicReceipt", str(paths[0]), "-CinematicReceipt", str(paths[1]), "-FilmReceipt", str(paths[2]),
+                               "-OutDir", str(out or self.tmp / ".claude-state" / "trio")], capture_output=True, text=True, timeout=300)
+
+    def test_a_third_receipt_that_is_not_film_is_refused(self) -> None:
+        proc = self.trio(synthetic_receipt("classic"), synthetic_receipt("cinematic"), synthetic_receipt("cinematic"))
+        self.assertNotEqual(proc.returncode, 0)
+        self.assertIn("PAIR_FLAVORS_WRONG the third receipt must be the film flavor", proc.stdout + proc.stderr)
+
+    def test_a_film_receipt_of_another_build_is_refused(self) -> None:
+        proc = self.trio(synthetic_receipt("classic"), synthetic_receipt("cinematic"), synthetic_receipt("film", manifest="b" * 64))
+        self.assertNotEqual(proc.returncode, 0)
+        self.assertIn("PAIR_SUBJECT_DIFFERS the film receipt differs in subject.buildManifestSha256", proc.stdout + proc.stderr)
+
+    def test_an_out_dir_that_holds_a_trio_record_is_refused(self) -> None:
+        out = self.tmp / ".claude-state" / "occupied-trio"
+        out.mkdir(parents=True)
+        (out / "flavor-trio-a-b-c-bachelor.json").write_bytes(b'{"record":1}\n')
+        proc = self.trio(synthetic_receipt("classic"), synthetic_receipt("cinematic"), synthetic_receipt("film"), out=out)
+        self.assertEqual(proc.returncode, 16, proc.stdout + proc.stderr)
+        self.assertIn("PAIR_RECORD_EXISTS", proc.stdout + proc.stderr)
 
 
 @requires_windows_pwsh

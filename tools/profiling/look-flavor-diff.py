@@ -381,6 +381,236 @@ def compose(args):
     return 0
 
 
+# ---- Three-side mode (LOOK-ASSIST-FILM-FLAVOR-1): Classic | Cinematic | Film ----
+# Reached only when the --film-* arguments are given; without them the tool above is byte-for-byte the two-side tool.
+
+TRIO_SHEET_NAME = "sheet-classic-cinematic-film.png"
+SCHEMA_METRICS_TRIO = "mlv-app/look-flavor-diff-metrics/v2"
+FILM_GRADE_ID = "film-v1"
+TRIO_SIDES = ("classic", "cinematic", "film")
+
+
+def film_live(film_sliders, film_reported):
+    """(live, reasons). The Film side must report `film` AND carry presetGrade film-v1 (its colour grade was laid)."""
+    reasons = []
+    if film_reported != "film":
+        reasons.append(f"the Film side reported lookFlavorReported={film_reported!r}, not 'film' (the app fell back)")
+    grade = film_sliders.get("presetGrade") or "none"
+    if grade != FILM_GRADE_ID:
+        reasons.append(f"the Film side's presetGrade={grade!r}, not {FILM_GRADE_ID!r} (no colour grade was laid)")
+    return (not reasons), reasons
+
+
+def trio_output_names(indices):
+    return [TRIO_SHEET_NAME, "metrics.json", "table.md"] + [
+        f"{kind}-{i:02d}.png" for i in indices for kind in ("row", "heat-film-vs-classic", "heat-film-vs-cinematic")]
+
+
+def mad(x, y):
+    """MAD(X,Y): mean over channels of mean |X - Y| (rows already letterbox-filtered)."""
+    d = np.abs(x.astype(np.float64) - y.astype(np.float64))
+    return float(np.mean([d[..., c].mean() for c in range(3)]))
+
+
+def split_and_green(kept):
+    """S = BA(shadows) - BA(highlights), BA = mean(B - R); shadows = luma in [p05, p30], highlights = [p70, p95];
+    GA = mean(G - (R+B)/2) over the mid band [p30, p70]. Luma is BT.601 on the 8-bit pixels, ranked per image."""
+    f = kept.reshape(-1, 3).astype(np.float64)
+    y = 0.299 * f[:, 0] + 0.587 * f[:, 1] + 0.114 * f[:, 2]
+    p05, p30, p70, p95 = np.percentile(y, [5, 30, 70, 95])
+    ba = f[:, 2] - f[:, 0]
+    ga = f[:, 1] - (f[:, 0] + f[:, 2]) / 2.0
+    sh = (y >= p05) & (y <= p30)
+    hi = (y >= p70) & (y <= p95)
+    mid = (y >= p30) & (y <= p70)
+    return {"BA_shadows": float(ba[sh].mean()), "BA_highlights": float(ba[hi].mean()),
+            "S": float(ba[sh].mean() - ba[hi].mean()), "GA": float(ga[mid].mean()),
+            "luma_p05": float(p05), "luma_p30": float(p30), "luma_p70": float(p70), "luma_p95": float(p95)}
+
+
+def heat_image_with_legend(abs_dy, small):
+    heat = heat_rgb(abs_dy)
+    image = Image.new("RGB", (heat.shape[1], heat.shape[0] + LEGEND_HEIGHT), (16, 16, 16))
+    image.paste(Image.fromarray(heat), (0, 0))
+    image.paste(legend_strip(heat.shape[1], small), (0, heat.shape[0]))
+    return image
+
+
+def compose_trio(args):
+    require_local(args.out_dir)
+    sliders = {s: load_sliders(getattr(args, f"{s}_sliders"), s.capitalize()) for s in TRIO_SIDES}
+    reported = {s: getattr(args, f"{s}_flavor_reported") for s in TRIO_SIDES}
+    live, reasons = flavor_live(sliders["classic"], sliders["cinematic"], reported["classic"], reported["cinematic"])
+    flive, freasons = film_live(sliders["film"], reported["film"])
+    if not (live and flive):
+        raise Refusal(EXIT_FLAVOR_INERT, "FLAVOR_INERT " + "; ".join(reasons + freasons))
+
+    _load_imaging()
+    staged, by = {}, {}
+    for s in TRIO_SIDES:
+        staged[s], frames = load_side(getattr(args, f"{s}_frames"), getattr(args, f"{s}_listed"), s.capitalize())
+        by[s] = {f.get("index"): f for f in frames}
+    if not (sorted(by["classic"]) == sorted(by["cinematic"]) == sorted(by["film"])):
+        raise Refusal(EXIT_TILE_COUNT, "PAIR_TILE_COUNT_DIFFERS Classic holds tiles {}, Cinematic {}, Film {}".format(
+            sorted(by["classic"]), sorted(by["cinematic"]), sorted(by["film"])))
+    indices = sorted(by["classic"])
+
+    out = Path(args.out_dir)
+    existing = [n for n in trio_output_names(indices) if (out / n).exists()]
+    if existing:
+        raise Refusal(EXIT_OUTPUT_EXISTS, "PAIR_OUTPUT_EXISTS " + ", ".join(existing) + f" already in {out}: an earlier pair's evidence is never "
+                                          "overwritten; compose into a new directory")
+    font = mcs._load_font(22)
+    small = mcs._load_font(16)
+    tiles, panels, row_images, heat_images = [], [], {}, {}
+    for index in indices:
+        arr = {s: read_rgb(staged[s], by[s][index], s.capitalize()) for s in TRIO_SIDES}
+        if not (arr["classic"].shape == arr["cinematic"].shape == arr["film"].shape):
+            raise Refusal(EXIT_TILE_SIZE, f"PAIR_TILE_SIZE_DIFFERS tile {index}: " + ", ".join(
+                f"{s} {arr[s].shape[1]}x{arr[s].shape[0]}" for s in TRIO_SIDES))
+        lum = {s: luma_of(arr[s]) for s in TRIO_SIDES}
+        keep = ~np.logical_and.reduce([lum[s].max(axis=1) <= LETTERBOX_MAX_LUMA for s in TRIO_SIDES])
+        if not keep.any():
+            keep = np.ones_like(keep)
+        kept = {s: arr[s][keep] for s in TRIO_SIDES}
+        side = {s: side_metrics(arr[s], keep, by[s][index]) for s in TRIO_SIDES}
+        for s in TRIO_SIDES:
+            side[s].update(split_and_green(kept[s]))
+        frame_delta = {}
+        for s in ("cinematic", "film"):
+            da, db = side["classic"]["display_frame"], side[s]["display_frame"]
+            frame_delta[s] = (db - da) if isinstance(da, int) and isinstance(db, int) else None
+        tile = {
+            "index": index,
+            **{s: side[s] for s in TRIO_SIDES},
+            "MAD": {"cinematic_classic": mad(kept["cinematic"], kept["classic"]),
+                    "film_classic": mad(kept["film"], kept["classic"]),
+                    "film_cinematic": mad(kept["film"], kept["cinematic"])},
+            "dS": {s: side[s]["S"] - side["classic"]["S"] for s in ("cinematic", "film")},
+            "dGA": {s: side[s]["GA"] - side["classic"]["GA"] for s in ("cinematic", "film")},
+            "display_frame_delta": frame_delta,
+            "frame_matched": {s: frame_delta[s] is not None and abs(frame_delta[s]) <= FRAME_MATCH_TOLERANCE for s in ("cinematic", "film")},
+            "rows_used": int(keep.sum()),
+            "rows_excluded_letterbox": int((~keep).sum()),
+            "size": [int(arr["classic"].shape[1]), int(arr["classic"].shape[0])],
+        }
+        tiles.append(tile)
+        heat_images[index] = {
+            "classic": heat_image_with_legend(np.abs(lum["film"] - lum["classic"]), small),
+            "cinematic": heat_image_with_legend(np.abs(lum["film"] - lum["cinematic"]), small),
+        }
+        cols = [fit(arr[s], SHEET_COLUMN) for s in TRIO_SIDES]
+        row = Image.new("RGB", (SHEET_WIDTH, ROW_LABEL_HEIGHT + cols[0].height), (8, 8, 8))
+        for c, panel in enumerate(cols):
+            row.paste(panel, (c * SHEET_COLUMN, ROW_LABEL_HEIGHT))
+        row_images[index] = row
+        panels.append((tile, cols))
+
+    matched = all(all(t["frame_matched"].values()) for t in tiles)
+    for t in tiles:
+        d = t["display_frame_delta"]
+        t["label"] = (f"tile {t['index']:02d}  classic disp {t['classic']['display_frame']}  cinematic disp {t['cinematic']['display_frame']} "
+                      f"(d={d['cinematic']})  film disp {t['film']['display_frame']} (d={d['film']})")
+        if not matched:
+            worst = max((abs(v) for v in d.values() if v is not None), default=None)
+            t["label"] += f"  NOT FRAME-MATCHED (d={worst})"
+    all_deltas = [abs(v) for t in tiles for v in t["display_frame_delta"].values()]
+    max_delta = max(all_deltas) if all(v is not None for t in tiles for v in t["display_frame_delta"].values()) else None
+
+    tile_h = panels[0][1][0].height
+    sheet = Image.new("RGB", (SHEET_WIDTH, HEADER_HEIGHT + len(panels) * (ROW_LABEL_HEIGHT + tile_h)), (8, 8, 8))
+    draw = ImageDraw.Draw(sheet)
+    header = [
+        f"clip={args.clip_id}  venue={args.venue}  build={args.build_sha}  LEFT=Classic  MIDDLE=Cinematic  RIGHT=Film grade",
+        f"flavors reported: classic={reported['classic']}  cinematic={reported['cinematic']}  film={reported['film']}  "
+        f"presetGrade: classic={sliders['classic'].get('presetGrade') or 'none'}  cinematic={sliders['cinematic'].get('presetGrade') or 'none'}  "
+        f"film={sliders['film'].get('presetGrade') or 'none'}",
+        f"receipts: classic={args.classic_receipt_id}  cinematic={args.cinematic_receipt_id}  film={args.film_receipt_id}",
+    ] + [f"sliders {s}: " + "  ".join(f"{k}={sliders[s].get(k)}" for k in SLIDER_FIELDS) for s in TRIO_SIDES]
+    for i, text in enumerate(header):
+        draw.text((10, 8 + i * 34), text, fill=(255, 255, 255), font=font)
+    for n, (tile, cols) in enumerate(panels):
+        y = HEADER_HEIGHT + n * (ROW_LABEL_HEIGHT + tile_h)
+        draw.text((10, y + 10), tile["label"], fill=(255, 255, 255) if matched else (255, 120, 120), font=font)
+        for c, panel in enumerate(cols):
+            sheet.paste(panel.crop((0, 0, SHEET_COLUMN, tile_h)), (c * SHEET_COLUMN, y + ROW_LABEL_HEIGHT))
+    sheet_path = out / TRIO_SHEET_NAME
+    out.mkdir(parents=True, exist_ok=True)
+    write_new(sheet_path, png_bytes(sheet))
+
+    def mean_of(get):
+        return float(np.mean([get(t) for t in tiles]))
+    means = {
+        "MAD": {k: mean_of(lambda t, k=k: t["MAD"][k]) for k in ("cinematic_classic", "film_classic", "film_cinematic")},
+        "S": {s: mean_of(lambda t, s=s: t[s]["S"]) for s in TRIO_SIDES},
+        "GA": {s: mean_of(lambda t, s=s: t[s]["GA"]) for s in TRIO_SIDES},
+        "dS": {s: mean_of(lambda t, s=s: t["dS"][s]) for s in ("cinematic", "film")},
+        "dGA": {s: mean_of(lambda t, s=s: t["dGA"][s]) for s in ("cinematic", "film")},
+        "luma_p50": {s: mean_of(lambda t, s=s: t[s]["luma_p50"]) for s in TRIO_SIDES},
+        "mean_saturation": {s: mean_of(lambda t, s=s: t[s]["mean_saturation"]) for s in TRIO_SIDES},
+    }
+    means["dSGapFilmMinusCinematic"] = means["dS"]["film"] - means["dS"]["cinematic"]
+    doc = {
+        "schema": SCHEMA_METRICS_TRIO,
+        "clipId": args.clip_id, "venue": args.venue, "buildSha12": args.build_sha,
+        "receiptIds": {s: getattr(args, f"{s}_receipt_id") for s in TRIO_SIDES},
+        "lookFlavorReported": reported,
+        "presetGrade": {s: sliders[s].get("presetGrade") or "none" for s in TRIO_SIDES},
+        "sliders": {s: {k: sliders[s].get(k) for k in SLIDER_FIELDS} for s in TRIO_SIDES},
+        "flavorOwnedFields": list(FLAVOR_OWNED_FIELDS),
+        "flavorLive": live, "filmLive": flive,
+        "frameMatchTolerance": FRAME_MATCH_TOLERANCE,
+        "frameMatched": matched, "maxFrameDelta": max_delta,
+        "letterboxMaxLuma": LETTERBOX_MAX_LUMA, "heatScaleMax": HEAT_SCALE_MAX,
+        "metricDefinitions": {
+            "MAD": "mean over channels of mean |X - Y|, letterbox rows excluded",
+            "S": "BA(luma in [p05,p30]) - BA(luma in [p70,p95]), BA = mean(B - R), BT.601 luma ranked per image",
+            "GA": "mean(G - (R+B)/2) over luma in [p30,p70]",
+            "dS": "S(F) - S(classic)", "dGA": "GA(F) - GA(classic)",
+        },
+        "tiles": tiles, "means": means,
+        "sheet": sheet_path.name,
+    }
+    write_new(out / "metrics.json", json.dumps(doc, indent=2).encode("utf-8"))
+    write_new(out / "table.md", render_trio_table(doc).encode("utf-8"))
+    for index in indices:
+        label = next(t["label"] for t in tiles if t["index"] == index)
+        ImageDraw.Draw(row_images[index]).text((10, 10), f"CLASSIC | CINEMATIC | FILM GRADE   {label}", fill=(255, 255, 255), font=font)
+        write_new(out / f"row-{index:02d}.png", png_bytes(row_images[index]))
+        write_new(out / f"heat-film-vs-classic-{index:02d}.png", png_bytes(heat_images[index]["classic"]))
+        write_new(out / f"heat-film-vs-cinematic-{index:02d}.png", png_bytes(heat_images[index]["cinematic"]))
+    print(f"LOOK_FLAVOR_DIFF_OK sheet={sheet_path} tiles={len(tiles)} frameMatched={str(matched).lower()} maxFrameDelta={max_delta} "
+          f"dSGap={means['dSGapFilmMinusCinematic']:.3f} MADfilmCinematic={means['MAD']['film_cinematic']:.3f}")
+    return 0
+
+
+def render_trio_table(doc):
+    lines = ["### Look Assist sliders (flavor-owned fields marked *)", "", "| field | Classic | Cinematic | Film |", "|---|---|---|---|"]
+    for k in SLIDER_FIELDS:
+        vals = [doc["sliders"][s].get(k) for s in TRIO_SIDES]
+        lines.append(f"| {k}{' *' if k in FLAVOR_OWNED_FIELDS else ''} | " + " | ".join(_num(v) for v in vals) + " |")
+    lines.append("| presetGrade | " + " | ".join(doc["presetGrade"][s] for s in TRIO_SIDES) + " |")
+    lines += ["", "lookFlavorReported: " + ", ".join(f"{s}={doc['lookFlavorReported'][s]}" for s in TRIO_SIDES)
+              + f"; flavorLive={str(doc['flavorLive']).lower()} filmLive={str(doc['filmLive']).lower()}", "",
+              f"### Per tile (letterbox rows excluded; FRAME-MATCHED = |d frame| <= {doc['frameMatchTolerance']} against Classic)", "",
+              "| tile | disp cla / cin / film | d cin / film | MAD cin-cla | MAD film-cla | MAD film-cin | S cla / cin / film | dS cin / film | GA cla / cin / film | dGA cin / film |",
+              "|---|---|---|---|---|---|---|---|---|---|"]
+    for t in doc["tiles"]:
+        d = t["display_frame_delta"]
+        lines.append(f"| {t['index']:02d} | {t['classic']['display_frame']} / {t['cinematic']['display_frame']} / {t['film']['display_frame']} | "
+                     f"{_num(d['cinematic'])} / {_num(d['film'])} | {t['MAD']['cinematic_classic']:.2f} | {t['MAD']['film_classic']:.2f} | "
+                     f"{t['MAD']['film_cinematic']:.2f} | {t['classic']['S']:.2f} / {t['cinematic']['S']:.2f} / {t['film']['S']:.2f} | "
+                     f"{t['dS']['cinematic']:.2f} / {t['dS']['film']:.2f} | {t['classic']['GA']:.2f} / {t['cinematic']['GA']:.2f} / {t['film']['GA']:.2f} | "
+                     f"{t['dGA']['cinematic']:.2f} / {t['dGA']['film']:.2f} |")
+    m = doc["means"]
+    lines.append(f"| mean | | | {m['MAD']['cinematic_classic']:.2f} | {m['MAD']['film_classic']:.2f} | {m['MAD']['film_cinematic']:.2f} | "
+                 f"{m['S']['classic']:.2f} / {m['S']['cinematic']:.2f} / {m['S']['film']:.2f} | {m['dS']['cinematic']:.2f} / {m['dS']['film']:.2f} | "
+                 f"{m['GA']['classic']:.2f} / {m['GA']['cinematic']:.2f} / {m['GA']['film']:.2f} | {m['dGA']['cinematic']:.2f} / {m['dGA']['film']:.2f} |")
+    lines += ["", f"dS(film) - dS(cinematic) = {m['dSGapFilmMinusCinematic']:.3f}  FRAME-MATCHED={str(doc['frameMatched']).lower()}  "
+                  f"max |d frame|={doc['maxFrameDelta']}", ""]
+    return "\n".join(lines)
+
+
 def _num(v, nd=2):
     return "-" if v is None else (f"{v:.{nd}f}" if isinstance(v, float) else str(v))
 
@@ -422,12 +652,23 @@ def main(argv=None):
         p.add_argument(f"--{side}-sliders", required=True, type=Path)
         p.add_argument(f"--{side}-flavor-reported", required=True)
         p.add_argument(f"--{side}-receipt-id", default="")
+    # Three-side mode (LOOK-ASSIST-FILM-FLAVOR-1): all four --film-* inputs, or none.
+    p.add_argument("--film-frames", type=Path, default=None)
+    p.add_argument("--film-listed", type=Path, default=None)
+    p.add_argument("--film-sliders", type=Path, default=None)
+    p.add_argument("--film-flavor-reported", default=None)
+    p.add_argument("--film-receipt-id", default="")
     p.add_argument("--clip-id", default="")
     p.add_argument("--venue", default="")
     p.add_argument("--build-sha", default="")
     p.add_argument("--out-dir", required=True, type=Path)
     args = p.parse_args(argv)
+    film_inputs = [args.film_frames, args.film_listed, args.film_sliders, args.film_flavor_reported]
+    if any(v is not None for v in film_inputs) and not all(v is not None for v in film_inputs):
+        p.error("three-side mode needs all of --film-frames, --film-listed, --film-sliders and --film-flavor-reported")
     try:
+        if all(v is not None for v in film_inputs):
+            return compose_trio(args)
         return compose(args)
     except Refusal as exc:
         print(str(exc), file=sys.stderr)

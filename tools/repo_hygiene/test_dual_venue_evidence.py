@@ -82,7 +82,7 @@ PACE_LEGS = ("legs/m16-1243-pace-cinematic-fullscreen-s4.json", "legs/m16-1243-p
 LOOKAHEAD_LEGS = ("legs/m16-1243-pace-cinematic-fullscreen-s4-la3.json",)
 # LOOK-ASSIST-CINEMATIC-BENCH-PAIR-1 added the scale-2 Cinematic twin of the scale-2 look leg (the Bachelor CPU Classic | Cinematic look pair).
 SHIPPED_LEGS = ("legs/m16-1243-speed.json", "legs/m16-1243-look.json", "legs/m16-1243-look-scale2.json", "legs/m16-1243-look-cinematic.json", *DISPLAY_MATRIX_LEGS, *PACE_LEGS,
-                *LOOKAHEAD_LEGS, "legs/m16-1243-look-scale2-cinematic.json")
+                *LOOKAHEAD_LEGS, "legs/m16-1243-look-scale2-cinematic.json", "legs/m16-1243-look-film.json", "legs/m16-1243-look-scale2-film.json")
 SHIPPED_LEGS_PS = ", ".join(f"'{rel}'" for rel in SHIPPED_LEGS)
 OTHER_CLIP = "Z99-9999"
 MLV_EXT = "." + "mlv"  # never spelled as one literal token (the NA-4 gate trips on fixture basenames)
@@ -3911,7 +3911,8 @@ class DisplayModeIsRequestedAndObservedTests(EvidenceFactory, ModuleMutationMixi
 
     # -- the schema default -----------------------------------------------------------------------------------------------------------
     def test_a_spec_without_a_display_mode_is_a_full_screen_leg_and_every_legacy_leg_names_none(self) -> None:
-        for name in ("m16-1243-speed", "m16-1243-look", "m16-1243-look-scale2", "m16-1243-look-cinematic", "m16-1243-look-scale2-cinematic"):
+        for name in ("m16-1243-speed", "m16-1243-look", "m16-1243-look-scale2", "m16-1243-look-cinematic", "m16-1243-look-scale2-cinematic",
+                     "m16-1243-look-film", "m16-1243-look-scale2-film"):
             self.assertNotIn("displayMode", json.loads((DV / "legs" / f"{name}.json").read_text(encoding="utf-8")), f"{name}: an existing leg must not change")
         _, receipt, _ = self.leg(None, FULLSCREEN_PLACEMENT)
         self.assertEqual(receipt["outcome"], "PASS", receipt["outcomeDetail"])
@@ -4445,6 +4446,39 @@ class LegSpecSchemaTests(unittest.TestCase):
         comparable = dict(stripped, legId=classic["legId"], look=dict(stripped["look"], lookFlavor="classic"))
         self.assertEqual(comparable, classic, "the scale-2 Cinematic leg is the scale-2 leg except legId, lookFlavor and the applied-flavor criterion")
         self.assertEqual(list(cinematic), list(classic), "same keys in the same order: the twin is the same leg byte-for-byte in shape")
+
+    def test_each_film_look_leg_is_its_cinematic_twin_except_legId_flavor_and_the_applied_flavor_criterion(self) -> None:
+        """LOOK-ASSIST-FILM-FLAVOR-1: the Film legs are the Cinematic legs (the scale-2 CPU trio leg and the scale-4 owner-shape CUDA cost leg) except
+        legId, look.lookFlavor and the applied-flavor criterion, which names `film` in the same place in every criteria list."""
+        load = lambda name: json.loads((DV / "legs" / f"{name}.json").read_text(encoding="utf-8"))
+        for cine_id, film_id in (("m16-1243-look-scale2-cinematic", "m16-1243-look-scale2-film"), ("m16-1243-look-cinematic", "m16-1243-look-film")):
+            with self.subTest(leg=film_id):
+                cinematic, film = load(cine_id), load(film_id)
+                self.jsonschema.validate(film, self.schema)
+                self.assertEqual(film["legId"], film_id)
+                self.assertEqual(film["look"]["lookFlavor"], "film")
+                applied_cine = {"metric": "lookFlavorReported", "op": "eq", "value": "cinematic"}
+                applied_film = {"metric": "lookFlavorReported", "op": "eq", "value": "film"}
+                swapped = json.loads(json.dumps(film))
+                for per_backend in swapped["criteria"].values():
+                    for backend, criteria in per_backend.items():
+                        self.assertEqual(criteria.count(applied_film), 1, backend)
+                        self.assertNotIn(applied_cine, criteria, backend)
+                        criteria[criteria.index(applied_film)] = applied_cine
+                comparable = dict(swapped, legId=cinematic["legId"], look=dict(swapped["look"], lookFlavor="cinematic"))
+                self.assertEqual(comparable, cinematic, f"{film_id} is {cine_id} except legId, lookFlavor and the applied-flavor criterion")
+                self.assertEqual(list(film), list(cinematic), "same keys in the same order")
+
+    def test_the_schema_takes_the_film_flavor_in_both_flavor_enums_and_nothing_misspelt(self) -> None:
+        look = json.loads((DV / "legs" / "m16-1243-look-scale2.json").read_text(encoding="utf-8"))
+        self.jsonschema.validate(dict(look, look=dict(look["look"], lookFlavor="film")), self.schema)
+        pace = json.loads((DV / "legs" / "m16-1243-pace-cinematic-fullscreen-s4.json").read_text(encoding="utf-8"))
+        self.jsonschema.validate(dict(pace, generatorArgs=dict(pace["generatorArgs"], lookFlavor="film")), self.schema)
+        for bad in ("filmm", "Film", "film-v1"):
+            with self.assertRaises(self.jsonschema.ValidationError, msg=bad):
+                self.jsonschema.validate(dict(look, look=dict(look["look"], lookFlavor=bad)), self.schema)
+            with self.assertRaises(self.jsonschema.ValidationError, msg=bad):
+                self.jsonschema.validate(dict(pace, generatorArgs=dict(pace["generatorArgs"], lookFlavor=bad)), self.schema)
 
     def test_the_applied_flavor_metric_the_cinematic_leg_gates_on_is_one_the_job_writes_and_the_app_withholds_on_a_fallback(self) -> None:
         """`lookFlavorReported` is the job summary's copy of the app's visual_state look_assist_flavor, and the app reports `none` (never the requested
