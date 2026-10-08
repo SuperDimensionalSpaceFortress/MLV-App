@@ -209,13 +209,19 @@ class GeneratorByteIdentityAndVariantTests(unittest.TestCase):
     CONTACT_SHEET_PARITY_OPEN = "CONTACT-SHEET-PLAYBACK-PARITY-1 >>>"
     CONTACT_SHEET_PARITY_CLOSE = "CONTACT-SHEET-PLAYBACK-PARITY-1 <<<"
     CONTACT_SHEET_PARITY_REGIONS = 3
+    # CI-FLAKE-KEEPALIVE-HUNG-PROBE-SLEEP-1: the one line (and its comment) that card adds to Stop-AttrCudaDisplayWakeKeepAlive, which the generator splices into the default job
+    # verbatim: after a timed-out wait the stuck pipeline's handle is dropped so the baseline's Dispose/Close lines (left verbatim outside the brackets) become a no-op. One region.
+    KEEPALIVE_HUNG_PROBE_OPEN = "CI-FLAKE-KEEPALIVE-HUNG-PROBE-SLEEP-1 >>>"
+    KEEPALIVE_HUNG_PROBE_CLOSE = "CI-FLAKE-KEEPALIVE-HUNG-PROBE-SLEEP-1 <<<"
+    KEEPALIVE_HUNG_PROBE_REGIONS = 1
 
     @classmethod
     def strip_regions(cls, text: str) -> tuple[str, dict[str, int]]:
         """Remove every bracketed region of either sentinel family; return the kept text and the number of regions per family."""
         families = {"leg-terminals": (cls.LEG_TERMINALS_OPEN, cls.LEG_TERMINALS_CLOSE), "presentmon-evidence": (cls.PRESENTMON_EVIDENCE_OPEN, cls.PRESENTMON_EVIDENCE_CLOSE),
                     "orphan-sweep": (cls.ORPHAN_SWEEP_OPEN, cls.ORPHAN_SWEEP_CLOSE),
-                    "contact-sheet-parity": (cls.CONTACT_SHEET_PARITY_OPEN, cls.CONTACT_SHEET_PARITY_CLOSE)}
+                    "contact-sheet-parity": (cls.CONTACT_SHEET_PARITY_OPEN, cls.CONTACT_SHEET_PARITY_CLOSE),
+                    "keepalive-hung-probe": (cls.KEEPALIVE_HUNG_PROBE_OPEN, cls.KEEPALIVE_HUNG_PROBE_CLOSE)}
         kept: list[str] = []
         inside: str | None = None
         counts = {name: 0 for name in families}
@@ -256,6 +262,8 @@ class GeneratorByteIdentityAndVariantTests(unittest.TestCase):
         self.assertEqual(old_counts["orphan-sweep"], 0, "the baseline has none")
         self.assertEqual(new_counts["contact-sheet-parity"], self.CONTACT_SHEET_PARITY_REGIONS, "the default job carries exactly the pinned number of bracketed CONTACT-SHEET-PLAYBACK-PARITY-1 regions")
         self.assertEqual(old_counts["contact-sheet-parity"], 0, "the baseline has none")
+        self.assertEqual(new_counts["keepalive-hung-probe"], self.KEEPALIVE_HUNG_PROBE_REGIONS, "the default job carries exactly the pinned number of bracketed CI-FLAKE-KEEPALIVE-HUNG-PROBE-SLEEP-1 regions")
+        self.assertEqual(old_counts["keepalive-hung-probe"], 0, "the baseline has none")
         self.assertEqual(stripped, old_stripped,
                          "the DEFAULT (bachelor/cuda) emitted job changed outside the bracketed regions -- it must stay byte-identical to the pinned baseline")
 
