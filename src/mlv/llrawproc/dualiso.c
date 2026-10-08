@@ -199,6 +199,51 @@ int dualiso_debug_get_last_gpu_recon_state(dualiso_gpu_recon_state_t * state)
     return state->valid != 0;
 }
 
+/* Same-colour tap row for offset d (even): mirrored about y at the frame edges. */
+static int dualiso_notch_tap_row(int y, int d, int h)
+{
+    int r = y + d;
+    if (r < 0 || r >= h) r = y - d;
+    return r;
+}
+
+void dualiso_reduced_iso_period_notch16(uint16_t * out, const uint16_t * src, int w, int h)
+{
+    if (!out || !src || w <= 0 || h <= 0) return;
+    if (h < DUALISO_REDUCED_ISO_NOTCH_MIN_HEIGHT)
+    {
+        memcpy(out, src, (size_t)w * (size_t)h * sizeof(uint16_t));
+        return;
+    }
+    for (int y = 0; y < h; y++)
+    {
+        const uint16_t * u6 = src + (size_t)dualiso_notch_tap_row(y, -6, h) * (size_t)w;
+        const uint16_t * u4 = src + (size_t)dualiso_notch_tap_row(y, -4, h) * (size_t)w;
+        const uint16_t * u2 = src + (size_t)dualiso_notch_tap_row(y, -2, h) * (size_t)w;
+        const uint16_t * c0 = src + (size_t)y * (size_t)w;
+        const uint16_t * d2 = src + (size_t)dualiso_notch_tap_row(y, 2, h) * (size_t)w;
+        const uint16_t * d4 = src + (size_t)dualiso_notch_tap_row(y, 4, h) * (size_t)w;
+        const uint16_t * d6 = src + (size_t)dualiso_notch_tap_row(y, 6, h) * (size_t)w;
+        uint16_t * dst = out + (size_t)y * (size_t)w;
+        for (int x = 0; x < w; x++)
+        {
+            const int32_t s = 44 * (int32_t)c0[x]
+                            + 15 * ((int32_t)u2[x] + (int32_t)d2[x])
+                            - 6 * ((int32_t)u4[x] + (int32_t)d4[x])
+                            + ((int32_t)u6[x] + (int32_t)d6[x]);
+            int32_t v = s < 0 ? 0 : ((s + 32) >> 6);
+            int32_t lo = c0[x], hi = c0[x];
+            if (u2[x] < lo) lo = u2[x];
+            if (d2[x] < lo) lo = d2[x];
+            if (u2[x] > hi) hi = u2[x];
+            if (d2[x] > hi) hi = d2[x];
+            if (v < lo) v = lo;
+            if (v > hi) v = hi;
+            dst[x] = (uint16_t)v;
+        }
+    }
+}
+
 static void dualiso_debug_set_full20bit_path(int path_kind,
                                              struct raw_info raw_info,
                                              int interp_method,

@@ -118,6 +118,7 @@ $required = @(
     'igpu_amaze_debayer_run_post_wb_gl_texture_from_r16_gl_texture',
     'igpu_amaze_debayer_run_post_wb_gl_texture_from_device_bayer16',
     'igpu_amaze_debayer_reset_live_gl_texture_resources',
+    'igpu_amaze_debayer_set_reduced_hnyquist',
     'igpu_amaze_debayer_last_timing'
 )
 $missing = @()

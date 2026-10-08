@@ -100,6 +100,17 @@ int igpu_amaze_debayer_run_post_wb_gl_texture_from_device_bayer16(
 int igpu_amaze_debayer_reset_live_gl_texture_resources(
     igpu_amaze_debayer_backend * backend);
 
+/* Optional reduced-texture extension (PLAYBACK-CUDA-HONOUR-SCALE-1 r3). While enable
+ * is 1 (sticky), every run applies a horizontal [1,2,1]/4 Nyquist zero to the AMaZE
+ * RGB16 output, per channel with mirrored edge columns, before the WB-undo pack; the
+ * C reference is debayer_reduced_hnyquist121_rgb16 (src/debayer/debayer.h). Callers
+ * set 1 only for a reduced (x2/x4) recon texture and 0 otherwise. Returns 0, or -1
+ * for a null backend or an enable other than 0/1. Older DLLs omit this symbol; a
+ * caller must then refuse a reduced present rather than show it unfiltered.
+ */
+int igpu_amaze_debayer_set_reduced_hnyquist(igpu_amaze_debayer_backend * backend,
+                                            int enable);
+
 int igpu_amaze_debayer_last_timing(igpu_amaze_debayer_backend * backend,
                                    igpu_amaze_debayer_timing_t * timing);
 

@@ -258,6 +258,40 @@ inline int mainWindowClampPlaybackScaleForGpuTextureRoute(
     return requestedScale;
 }
 
+// PLAYBACK-CUDA-HONOUR-SCALE-1: the texture route now honours x2/x4 by
+// reconstructing a reduced Bayer on the GPU, but only for a play session whose
+// scale was latched as honourable (reducedReconHonourable: the GPU reduced-recon
+// plan admitted it when the session began). Everything else keeps the clamp
+// above: x8, paused/scrubbed frames, and any refused session.
+inline int mainWindowGpuTextureRouteEffectivePlaybackScale(
+    int requestedScale,
+    bool gpuPlaybackReconTextureRouteEligibleAtScaleOne,
+    bool playbackActive,
+    bool reducedReconHonourable)
+{
+    if (gpuPlaybackReconTextureRouteEligibleAtScaleOne
+        && playbackActive
+        && reducedReconHonourable
+        && (requestedScale == 2 || requestedScale == 4))
+    {
+        return requestedScale;
+    }
+    return mainWindowClampPlaybackScaleForGpuTextureRoute(
+        requestedScale, gpuPlaybackReconTextureRouteEligibleAtScaleOne);
+}
+
+// PLAYBACK-CUDA-HONOUR-SCALE-1: replaces the policy builders' 'scale == 1'
+// texture-route gates. honouredSessionScale is the latched session scale (1 when
+// the session was clamped).
+inline bool mainWindowGpuTextureRouteAdmitsPlaybackScale(
+    int playbackScale,
+    int honouredSessionScale)
+{
+    return playbackScale == 1
+        || ((playbackScale == 2 || playbackScale == 4)
+            && playbackScale == honouredSessionScale);
+}
+
 // CUDA-S4-TEXTURE-ROUTE-CLAMP-1 round 2: pure decision table backing
 // MainWindow::gpuPlaybackReconTextureRouteEligibleAtScaleOne(), pulled out so it
 // can be unit-tested without a live MainWindow/processing library. libraryReady

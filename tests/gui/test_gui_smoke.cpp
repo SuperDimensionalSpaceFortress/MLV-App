@@ -641,6 +641,7 @@ private slots:
     void mainWindowGpuPreviewPolicyRequiresWidgetViewportForAmazeTexturePresentAtAllScales();
     void mainWindowGpuPreviewPolicyKeepsPlaybackReconTexturePresentExplicitAndNested();
     void mainWindowClampsPlaybackScaleForGpuTextureRouteDecisionTable();
+    void mainWindowHonoursGpuTextureRoutePreviewScaleForLatchedSession();
     void mainWindowGpuPlaybackReconTextureRouteEligibleAtScaleOneRequiresLibraryReadyFirst();
     void mainWindowGpuPreviewPolicyClassifiesPlaybackPipelineStatus();
     void mainWindowGpuPreviewPolicyLabelsVisibleScopeCpuFallback();
@@ -1178,6 +1179,35 @@ void GuiSmokeTest::mainWindowClampsPlaybackScaleForGpuTextureRouteDecisionTable(
     QCOMPARE( mainWindowClampPlaybackScaleForGpuTextureRoute( 2, false ), 2 );
     QCOMPARE( mainWindowClampPlaybackScaleForGpuTextureRoute( 4, false ), 4 );
     QCOMPARE( mainWindowClampPlaybackScaleForGpuTextureRoute( 8, false ), 8 );
+}
+
+void GuiSmokeTest::mainWindowHonoursGpuTextureRoutePreviewScaleForLatchedSession()
+{
+    // PLAYBACK-CUDA-HONOUR-SCALE-1 (b): with the texture route eligible, a play
+    // session latched as honourable keeps x2/x4 instead of clamping to 1.
+    QCOMPARE( mainWindowGpuTextureRouteEffectivePlaybackScale( 2, true, true, true ), 2 );
+    QCOMPARE( mainWindowGpuTextureRouteEffectivePlaybackScale( 4, true, true, true ), 4 );
+    // (d) the mutation guard: restoring the unconditional clamp turns the two
+    // lines above red. Everything outside an honoured session keeps the clamp:
+    // a refused session, x8, scale 1, and paused/scrubbed requests (e).
+    QCOMPARE( mainWindowGpuTextureRouteEffectivePlaybackScale( 2, true, true, false ), 1 );
+    QCOMPARE( mainWindowGpuTextureRouteEffectivePlaybackScale( 4, true, true, false ), 1 );
+    QCOMPARE( mainWindowGpuTextureRouteEffectivePlaybackScale( 8, true, true, true ), 1 );
+    QCOMPARE( mainWindowGpuTextureRouteEffectivePlaybackScale( 1, true, true, true ), 1 );
+    QCOMPARE( mainWindowGpuTextureRouteEffectivePlaybackScale( 2, true, false, true ), 1 );
+    QCOMPARE( mainWindowGpuTextureRouteEffectivePlaybackScale( 4, true, false, true ), 1 );
+    // Texture route not eligible: the request passes through, as before.
+    QCOMPARE( mainWindowGpuTextureRouteEffectivePlaybackScale( 2, false, true, false ), 2 );
+    QCOMPARE( mainWindowGpuTextureRouteEffectivePlaybackScale( 8, false, true, false ), 8 );
+
+    // The policy builders' former 'scale == 1' gates: x2/x4 admit the texture
+    // route only at the latched session scale.
+    QVERIFY( mainWindowGpuTextureRouteAdmitsPlaybackScale( 1, 1 ) );
+    QVERIFY( mainWindowGpuTextureRouteAdmitsPlaybackScale( 2, 2 ) );
+    QVERIFY( mainWindowGpuTextureRouteAdmitsPlaybackScale( 4, 4 ) );
+    QVERIFY( !mainWindowGpuTextureRouteAdmitsPlaybackScale( 2, 1 ) );
+    QVERIFY( !mainWindowGpuTextureRouteAdmitsPlaybackScale( 4, 2 ) );
+    QVERIFY( !mainWindowGpuTextureRouteAdmitsPlaybackScale( 8, 8 ) );
 }
 
 void GuiSmokeTest::mainWindowGpuPlaybackReconTextureRouteEligibleAtScaleOneRequiresLibraryReadyFirst()

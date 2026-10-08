@@ -16,6 +16,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <sstream>
+#include <utility>
 #include <vector>
 #ifdef _WIN32
 #ifndef WIN32_LEAN_AND_MEAN
@@ -50,6 +51,11 @@ struct igpu_amaze_debayer_backend
     float * liveRawFloat = nullptr;
     uint16_t * liveRgb16 = nullptr;
     uint16_t * liveRgba16 = nullptr;
+    /* PLAYBACK-CUDA-HONOUR-SCALE-1 r3: the reduced H-Nyquist filter's output,
+     * sized with liveRgb16 in ensure_live_texture_buffers. */
+    uint16_t * liveRgb16Hnyquist = nullptr;
+    /* Sticky; igpu_amaze_debayer_set_reduced_hnyquist. */
+    int reducedHnyquist = 0;
     DeviceBuffers liveDeviceBuffers;
     std::vector<DeviceBuffers> liveTileDeviceBuffers;
     std::vector<cudaStream_t> liveTileStreams;
@@ -269,6 +275,39 @@ __global__ void k_pack_rgb16_to_rgba16(const uint16_t * rgb,
     rgba[pixel * 4u + 3u] = 65535u;
 }
 
+/* PLAYBACK-CUDA-HONOUR-SCALE-1 r3: line-for-line port of
+ * debayer_reduced_hnyquist121_rgb16 (src/debayer/debayer.c). One thread per pixel;
+ * out and in never alias. */
+__global__ void k_reduced_hnyquist121(const uint16_t * in,
+                                      uint16_t * out,
+                                      int w,
+                                      int h)
+{
+    const int x = blockIdx.x * blockDim.x + threadIdx.x;
+    const int y = blockIdx.y * blockDim.y + threadIdx.y;
+    if (x >= w || y >= h) return;
+
+    const uint16_t * src = in + static_cast<std::size_t>(y) * static_cast<std::size_t>(w) * 3u;
+    uint16_t * dst = out + static_cast<std::size_t>(y) * static_cast<std::size_t>(w) * 3u;
+    const int xl = (x > 0) ? x - 1 : ((w > 1) ? x + 1 : x);
+    const int xr = (x < w - 1) ? x + 1 : ((w > 1) ? x - 1 : x);
+    for (int c = 0; c < 3; ++c)
+    {
+        const uint32_t l = src[static_cast<std::size_t>(xl) * 3u + static_cast<std::size_t>(c)];
+        const uint32_t m = src[static_cast<std::size_t>(x) * 3u + static_cast<std::size_t>(c)];
+        const uint32_t r = src[static_cast<std::size_t>(xr) * 3u + static_cast<std::size_t>(c)];
+        dst[static_cast<std::size_t>(x) * 3u + static_cast<std::size_t>(c)] =
+            static_cast<uint16_t>((l + 2u * m + r + 2u) >> 2);
+    }
+}
+
+void launch_reduced_hnyquist121(const uint16_t * in, uint16_t * out, int w, int h)
+{
+    const dim3 block(32, 8);
+    const dim3 grid((w + block.x - 1) / block.x, (h + block.y - 1) / block.y);
+    k_reduced_hnyquist121<<<grid, block>>>(in, out, w, h);
+}
+
 __device__ __forceinline__ uint16_t clamp_double_to_u16(double value)
 {
     if (value <= 0.0) return 0u;
@@ -417,6 +456,8 @@ void free_live_texture_buffers(igpu_amaze_debayer_backend * backend)
     cudaFree(backend->liveRawFloat);
     cudaFree(backend->liveRgb16);
     cudaFree(backend->liveRgba16);
+    cudaFree(backend->liveRgb16Hnyquist);
+    backend->liveRgb16Hnyquist = nullptr;
     backend->liveReconBayer16 = nullptr;
     backend->liveRawFloat = nullptr;
     backend->liveRgb16 = nullptr;
@@ -461,6 +502,7 @@ void ensure_live_texture_buffers(igpu_amaze_debayer_backend * backend,
         && backend->liveRawFloat
         && backend->liveRgb16
         && backend->liveRgba16
+        && backend->liveRgb16Hnyquist
         && backend->liveDeviceBuffersAllocated
         && backend->livePixelCount == pixelCount
         && backend->liveWidth == width
@@ -475,6 +517,7 @@ void ensure_live_texture_buffers(igpu_amaze_debayer_backend * backend,
     CK(cudaMalloc(&backend->liveRawFloat, pixelCount * sizeof(float)));
     CK(cudaMalloc(&backend->liveRgb16, pixelCount * 3u * sizeof(uint16_t)));
     CK(cudaMalloc(&backend->liveRgba16, pixelCount * 4u * sizeof(uint16_t)));
+    CK(cudaMalloc(&backend->liveRgb16Hnyquist, pixelCount * 3u * sizeof(uint16_t)));
     allocate_device(&backend->liveDeviceBuffers, 1);
     backend->liveTileDeviceBuffers.resize(static_cast<std::size_t>(streamCount));
     backend->liveTileStreams.resize(static_cast<std::size_t>(streamCount), nullptr);
@@ -1454,6 +1497,7 @@ extern "C" int igpu_amaze_debayer_run(igpu_amaze_debayer_backend * backend,
 
     float * dRaw = nullptr;
     uint16_t * dRgb16 = nullptr;
+    uint16_t * dRgb16Hnyquist = nullptr;
     DeviceBuffers d;
     const std::size_t pixelCount =
         static_cast<std::size_t>(width) * static_cast<std::size_t>(height);
@@ -1466,6 +1510,7 @@ extern "C" int igpu_amaze_debayer_run(igpu_amaze_debayer_backend * backend,
     {
         CK(cudaMalloc(&dRaw, rawBytes));
         CK(cudaMalloc(&dRgb16, rgbBytes));
+        if (backend->reducedHnyquist) CK(cudaMalloc(&dRgb16Hnyquist, rgbBytes));
         allocate_device(&d, 1);
         const double uploadStart = now_ms();
         CK(cudaMemcpy(dRaw, in_raw_float, rawBytes, cudaMemcpyHostToDevice));
@@ -1474,6 +1519,12 @@ extern "C" int igpu_amaze_debayer_run(igpu_amaze_debayer_backend * backend,
 
         const double kernelStart = now_ms();
         run_frame_to_device_rgb16(dRaw, dRgb16, d, width, height);
+        if (backend->reducedHnyquist)
+        {
+            launch_reduced_hnyquist121(dRgb16, dRgb16Hnyquist, width, height);
+            CK(cudaGetLastError());
+            std::swap(dRgb16, dRgb16Hnyquist);
+        }
         CK(cudaDeviceSynchronize());
         backend->lastTiming.kernel_ms = now_ms() - kernelStart;
 
@@ -1486,6 +1537,7 @@ extern "C" int igpu_amaze_debayer_run(igpu_amaze_debayer_backend * backend,
         free_device(&d);
         cudaFree(dRaw);
         cudaFree(dRgb16);
+        cudaFree(dRgb16Hnyquist);
         return 0;
     }
     catch (const CudaStageProbeError & error)
@@ -1494,6 +1546,7 @@ extern "C" int igpu_amaze_debayer_run(igpu_amaze_debayer_backend * backend,
         free_device(&d);
         cudaFree(dRaw);
         cudaFree(dRgb16);
+        cudaFree(dRgb16Hnyquist);
         backend->lastTiming.total_ms = now_ms() - totalStart;
         return -2;
     }
@@ -1512,6 +1565,7 @@ extern "C" int igpu_amaze_debayer_run_gl_texture(igpu_amaze_debayer_backend * ba
 
     float * dRaw = nullptr;
     uint16_t * dRgb16 = nullptr;
+    uint16_t * dRgb16Hnyquist = nullptr;
     DeviceBuffers d;
     const std::size_t pixelCount =
         static_cast<std::size_t>(width) * static_cast<std::size_t>(height);
@@ -1524,6 +1578,7 @@ extern "C" int igpu_amaze_debayer_run_gl_texture(igpu_amaze_debayer_backend * ba
     {
         CK(cudaMalloc(&dRaw, rawBytes));
         CK(cudaMalloc(&dRgb16, rgbBytes));
+        if (backend->reducedHnyquist) CK(cudaMalloc(&dRgb16Hnyquist, rgbBytes));
         allocate_device(&d, 1);
         const double uploadStart = now_ms();
         CK(cudaMemcpy(dRaw, in_raw_float, rawBytes, cudaMemcpyHostToDevice));
@@ -1532,6 +1587,12 @@ extern "C" int igpu_amaze_debayer_run_gl_texture(igpu_amaze_debayer_backend * ba
 
         const double kernelStart = now_ms();
         run_frame_to_device_rgb16(dRaw, dRgb16, d, width, height);
+        if (backend->reducedHnyquist)
+        {
+            launch_reduced_hnyquist121(dRgb16, dRgb16Hnyquist, width, height);
+            CK(cudaGetLastError());
+            std::swap(dRgb16, dRgb16Hnyquist);
+        }
         CK(cudaDeviceSynchronize());
         backend->lastTiming.kernel_ms = now_ms() - kernelStart;
 
@@ -1544,6 +1605,7 @@ extern "C" int igpu_amaze_debayer_run_gl_texture(igpu_amaze_debayer_backend * ba
         free_device(&d);
         cudaFree(dRaw);
         cudaFree(dRgb16);
+        cudaFree(dRgb16Hnyquist);
         return rc;
     }
     catch (const CudaStageProbeError & error)
@@ -1552,6 +1614,7 @@ extern "C" int igpu_amaze_debayer_run_gl_texture(igpu_amaze_debayer_backend * ba
         free_device(&d);
         cudaFree(dRaw);
         cudaFree(dRgb16);
+        cudaFree(dRgb16Hnyquist);
         backend->lastTiming.total_ms = now_ms() - totalStart;
         return -2;
     }
@@ -1575,6 +1638,7 @@ extern "C" int igpu_amaze_debayer_run_post_wb_gl_texture(igpu_amaze_debayer_back
 
     float * dRaw = nullptr;
     uint16_t * dRgb16 = nullptr;
+    uint16_t * dRgb16Hnyquist = nullptr;
     DeviceBuffers d;
     const std::size_t pixelCount =
         static_cast<std::size_t>(width) * static_cast<std::size_t>(height);
@@ -1587,6 +1651,7 @@ extern "C" int igpu_amaze_debayer_run_post_wb_gl_texture(igpu_amaze_debayer_back
     {
         CK(cudaMalloc(&dRaw, rawBytes));
         CK(cudaMalloc(&dRgb16, rgbBytes));
+        if (backend->reducedHnyquist) CK(cudaMalloc(&dRgb16Hnyquist, rgbBytes));
         allocate_device(&d, 1);
         const double uploadStart = now_ms();
         CK(cudaMemcpy(dRaw, in_raw_float, rawBytes, cudaMemcpyHostToDevice));
@@ -1595,6 +1660,12 @@ extern "C" int igpu_amaze_debayer_run_post_wb_gl_texture(igpu_amaze_debayer_back
 
         const double kernelStart = now_ms();
         run_frame_to_device_rgb16(dRaw, dRgb16, d, width, height);
+        if (backend->reducedHnyquist)
+        {
+            launch_reduced_hnyquist121(dRgb16, dRgb16Hnyquist, width, height);
+            CK(cudaGetLastError());
+            std::swap(dRgb16, dRgb16Hnyquist);
+        }
         CK(cudaDeviceSynchronize());
         backend->lastTiming.kernel_ms = now_ms() - kernelStart;
 
@@ -1615,6 +1686,7 @@ extern "C" int igpu_amaze_debayer_run_post_wb_gl_texture(igpu_amaze_debayer_back
         free_device(&d);
         cudaFree(dRaw);
         cudaFree(dRgb16);
+        cudaFree(dRgb16Hnyquist);
         return rc;
     }
     catch (const CudaStageProbeError & error)
@@ -1623,6 +1695,7 @@ extern "C" int igpu_amaze_debayer_run_post_wb_gl_texture(igpu_amaze_debayer_back
         free_device(&d);
         cudaFree(dRaw);
         cudaFree(dRgb16);
+        cudaFree(dRgb16Hnyquist);
         backend->lastTiming.total_ms = now_ms() - totalStart;
         return -2;
     }
@@ -1664,7 +1737,10 @@ extern "C" int igpu_amaze_debayer_run_post_wb_gl_texture_from_r16_gl_texture(
         backend->lastTiming.upload_ms = now_ms() - uploadStart;
 
         const double kernelStart = now_ms();
-        const bool directRgbaStore = live_direct_rgba_store_from_env();
+        /* r3: the reduced H-Nyquist filter works on device RGB16 before the WB-undo
+         * pack, so a reduced run never stores tiles straight to RGBA16. */
+        const bool hnyquist = backend->reducedHnyquist != 0;
+        const bool directRgbaStore = !hnyquist && live_direct_rgba_store_from_env();
         run_frame_to_device_rgb16_bayer16_post_wb_batched(
             backend->liveReconBayer16,
             directRgbaStore ? nullptr : backend->liveRgb16,
@@ -1678,6 +1754,16 @@ extern "C" int igpu_amaze_debayer_run_post_wb_gl_texture_from_r16_gl_texture(
             wb_multiplier_g,
             wb_multiplier_b,
             live_fast_launch_checks_from_env());
+        const uint16_t * packRgb16 = backend->liveRgb16;
+        if (hnyquist)
+        {
+            launch_reduced_hnyquist121(backend->liveRgb16,
+                                       backend->liveRgb16Hnyquist,
+                                       width,
+                                       height);
+            CK(cudaGetLastError());
+            packRgb16 = backend->liveRgb16Hnyquist;
+        }
         backend->lastTiming.kernel_ms = now_ms() - kernelStart;
 
         const double handoffStart = now_ms();
@@ -1690,7 +1776,7 @@ extern "C" int igpu_amaze_debayer_run_post_wb_gl_texture_from_r16_gl_texture(
                     out_rgba16_gl_texture,
                     &backend->liveOutputRgba16Resource)
                 : copy_rgb16_to_gl_rgba16_texture_post_wb_undo(
-                    backend->liveRgb16,
+                    packRgb16,
                     width,
                     height,
                     out_rgba16_gl_texture,
@@ -1741,7 +1827,10 @@ extern "C" int igpu_amaze_debayer_run_post_wb_gl_texture_from_device_bayer16(
         backend->lastTiming.upload_ms = 0.0;
 
         const double kernelStart = now_ms();
-        const bool directRgbaStore = live_direct_rgba_store_from_env();
+        /* r3: the reduced H-Nyquist filter works on device RGB16 before the WB-undo
+         * pack, so a reduced run never stores tiles straight to RGBA16. */
+        const bool hnyquist = backend->reducedHnyquist != 0;
+        const bool directRgbaStore = !hnyquist && live_direct_rgba_store_from_env();
         run_frame_to_device_rgb16_bayer16_post_wb_batched(
             device_bayer16,
             directRgbaStore ? nullptr : backend->liveRgb16,
@@ -1755,6 +1844,16 @@ extern "C" int igpu_amaze_debayer_run_post_wb_gl_texture_from_device_bayer16(
             wb_multiplier_g,
             wb_multiplier_b,
             live_fast_launch_checks_from_env());
+        const uint16_t * packRgb16 = backend->liveRgb16;
+        if (hnyquist)
+        {
+            launch_reduced_hnyquist121(backend->liveRgb16,
+                                       backend->liveRgb16Hnyquist,
+                                       width,
+                                       height);
+            CK(cudaGetLastError());
+            packRgb16 = backend->liveRgb16Hnyquist;
+        }
         backend->lastTiming.kernel_ms = now_ms() - kernelStart;
 
         const double handoffStart = now_ms();
@@ -1767,7 +1866,7 @@ extern "C" int igpu_amaze_debayer_run_post_wb_gl_texture_from_device_bayer16(
                     out_rgba16_gl_texture,
                     &backend->liveOutputRgba16Resource)
                 : copy_rgb16_to_gl_rgba16_texture_post_wb_undo(
-                    backend->liveRgb16,
+                    packRgb16,
                     width,
                     height,
                     out_rgba16_gl_texture,
@@ -1787,6 +1886,14 @@ extern "C" int igpu_amaze_debayer_run_post_wb_gl_texture_from_device_bayer16(
         backend->lastTiming.total_ms = now_ms() - totalStart;
         return -2;
     }
+}
+
+extern "C" int igpu_amaze_debayer_set_reduced_hnyquist(igpu_amaze_debayer_backend * backend,
+                                                       int enable)
+{
+    if (!backend || (enable != 0 && enable != 1)) return -1;
+    backend->reducedHnyquist = enable;
+    return 0;
 }
 
 extern "C" int igpu_amaze_debayer_reset_live_gl_texture_resources(igpu_amaze_debayer_backend * backend)
