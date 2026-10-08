@@ -233,6 +233,64 @@ void gpuPreviewProcessingApplyCpuReference(const GpuPreviewProcessingConfig & co
                                            uint16_t * outputRgb16,
                                            int width,
                                            int height);
+/* CPU-PLAYBACK-PREP-WORKER-BUILD-1: per-stage attribution of one CPU reference
+ * run (QElapsedTimer ns spans, reported in ms) and the active-stage bitmask. */
+enum GpuPreviewProcessingCpuStageBit : uint32_t
+{
+    GpuPreviewCpuStageVignette                = 1u << 0,
+    GpuPreviewCpuStageShadowsHighlights       = 1u << 1,
+    GpuPreviewCpuStageShadowsHighlightsQuarter = 1u << 2,
+    GpuPreviewCpuStageGradient                = 1u << 3,
+    GpuPreviewCpuStageLut                     = 1u << 4,
+    GpuPreviewCpuStageHighlightRecon          = 1u << 5,
+    GpuPreviewCpuStageChroma                  = 1u << 6,
+    GpuPreviewCpuStageSharpen                 = 1u << 7,
+    GpuPreviewCpuStageMedian                  = 1u << 8
+};
+struct GpuPreviewProcessingCpuSpans
+{
+    double shExpandMs = 0.0;
+    double pointwiseMs = 0.0;
+    double chromaMs = 0.0;
+    double sharpenMs = 0.0;
+    double medianMs = 0.0;
+    double rgb16to8Ms = 0.0;
+    uint32_t stageMask = 0;
+    /* true when >>8 ran inside the pointwise loop (no spatial post-pass). */
+    bool fused8 = false;
+};
+uint32_t gpuPreviewProcessingCpuStageMask(const GpuPreviewProcessingConfig & config);
+/* Chroma, sharpen or median: the stages that read neighbouring pixels after
+ * the pointwise pass. */
+bool gpuPreviewProcessingCpuHasSpatialPostPass(const GpuPreviewProcessingConfig & config);
+/* CPU-PLAYBACK-PREP-WORKER-BUILD-1 D1: the byte-identical tier-1 items (row-
+ * parallel box blur/chroma/sharpen/median, the parallel S/H quarter-blur
+ * expansion, the fused 8-bit pass, the prep thread's persistent scratch and
+ * shared avir pool) are OFF unless MLVAPP_PLAYBACK_PREP_TIER1 is exactly "1"
+ * (strict opt-in: "0", "off", "", whitespace, " 1" and "1garbage" are all off).
+ * Read on every call. */
+const char * gpuPreviewProcessingTier1SwitchName(void);
+bool gpuPreviewProcessingTier1Enabled(void);
+/* gpuPreviewProcessingApplyCpuReference with per-stage spans (spans may be null). */
+void gpuPreviewProcessingApplyCpuReferenceTimed(const GpuPreviewProcessingConfig & config,
+                                                const uint16_t * inputRgb16,
+                                                uint16_t * outputRgb16,
+                                                int width,
+                                                int height,
+                                                GpuPreviewProcessingCpuSpans * spans);
+/* The CPU reference straight to 8-bit, byte-identical to
+ * gpuPreviewProcessingApplyCpuReference followed by a per-sample >> 8. With no
+ * spatial post-pass the >> 8 is fused into the pointwise loop and scratch16 is
+ * not touched; otherwise the 16-bit passes run in scratch16 (width*height*3
+ * words, caller-owned, contents ignored) and are then converted. With tier 1
+ * off and a scratch16 given, the 16-bit route is taken even without a post-pass. */
+void gpuPreviewProcessingApplyCpuReferenceTo8(const GpuPreviewProcessingConfig & config,
+                                              const uint16_t * inputRgb16,
+                                              uint16_t * scratch16,
+                                              uint8_t * outputRgb8,
+                                              int width,
+                                              int height,
+                                              GpuPreviewProcessingCpuSpans * spans);
 bool gpuPreviewProcessingApplyGpuOffscreen(const GpuPreviewProcessingConfig & config,
                                            const uint16_t * inputRgb16,
                                            uint16_t * outputRgb16,

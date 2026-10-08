@@ -29,6 +29,7 @@ SOURCES += \
     $$REPO_ROOT/src/debug/StageTimingCsvSink.cpp \
     $$REPO_ROOT/platform/qt/GpuDebayer.cpp \
     $$REPO_ROOT/platform/qt/GpuPreviewProcessing.cpp \
+    $$REPO_ROOT/platform/qt/PlaybackPrepCpuRoute.cpp \
     $$REPO_ROOT/platform/qt/ReceiptSettings.cpp \
     $$REPO_ROOT/src/debayer/amaze_demosaic.c \
     $$REPO_ROOT/src/debayer/debayer.c \
@@ -117,12 +118,14 @@ SOURCES += \
     $$REPO_ROOT/tests/pipeline/test_cdng_sequence_export.cpp \
     $$REPO_ROOT/tests/pipeline/test_look_assist_fixture_scene.cpp \
     $$REPO_ROOT/tests/pipeline/test_look_assist_wb_gate_probe.cpp \
+    $$REPO_ROOT/tests/pipeline/test_look_assist_fixture_neutral_probe.cpp \
     $$REPO_ROOT/tests/pipeline/test_look_assist_flavors.cpp \
     $$REPO_ROOT/tests/pipeline/test_sh_frame_state_proxy.cpp \
     $$REPO_ROOT/tests/pipeline/test_look_assist_analysis_render_race.cpp \
     $$REPO_ROOT/tests/pipeline/test_raw_uint16_prefetch_ring.cpp \
     $$REPO_ROOT/tests/pipeline/test_cpu_dualiso_preview_scale.cpp \
-    $$REPO_ROOT/tests/pipeline/test_debayered16_recon_reuse.cpp
+    $$REPO_ROOT/tests/pipeline/test_debayered16_recon_reuse.cpp \
+    $$REPO_ROOT/tests/pipeline/test_playback_prep_worker.cpp
 
 HEADERS += \
     $$REPO_ROOT/platform/qt/Debayered16ReconReusePolicy.h \
@@ -142,6 +145,7 @@ HEADERS += \
     $$REPO_ROOT/src/debug/StageTimingCsvSink.h \
     $$REPO_ROOT/platform/qt/GpuDebayer.h \
     $$REPO_ROOT/platform/qt/GpuPreviewProcessing.h \
+    $$REPO_ROOT/platform/qt/PlaybackPrepCpuRoute.h \
     $$REPO_ROOT/platform/qt/GpuPreviewHostRoute.h \
     $$REPO_ROOT/tests/pipeline/ojph_decoder_test_stub.h \
     $$REPO_ROOT/tests/pipeline/mlv_pipeline_fixture.h \

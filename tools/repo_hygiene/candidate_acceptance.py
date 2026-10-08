@@ -409,15 +409,22 @@ def _provider_findings(selected: Sequence[Dict[str, Any]]) -> List[Dict[str, Any
 
 _WINDOWS_CURL_TRUST_SCRIPT = r"""
 $ErrorActionPreference = 'Stop'
+# The stage lines are diagnostic only: they go to stderr, which the verdict never reads, so a stalled
+# probe's partial stderr says which statement it was inside.
+[Console]::Error.WriteLine('stage start')
 $ClientPath = $env:MLVAPP_SYSTEM_CURL_PATH
 if ([string]::IsNullOrWhiteSpace($ClientPath)) { throw 'system curl path is missing' }
 $moduleRoot = "$PSHOME\Modules"
+[Console]::Error.WriteLine('stage import-management')
 Microsoft.PowerShell.Core\Import-Module -Name "$moduleRoot\Microsoft.PowerShell.Management\Microsoft.PowerShell.Management.psd1" -Force -ErrorAction Stop
+[Console]::Error.WriteLine('stage import-security')
 Microsoft.PowerShell.Core\Import-Module -Name "$moduleRoot\Microsoft.PowerShell.Security\Microsoft.PowerShell.Security.psd1" -Force -ErrorAction Stop
+[Console]::Error.WriteLine('stage import-utility')
 Microsoft.PowerShell.Core\Import-Module -Name "$moduleRoot\Microsoft.PowerShell.Utility\Microsoft.PowerShell.Utility.psd1" -Force -ErrorAction Stop
 $PSModuleAutoLoadingPreference = 'None'
+[Console]::Error.WriteLine('stage identity')
 $clientItem = Microsoft.PowerShell.Management\Get-Item -LiteralPath $ClientPath -Force
-$identity = [System.Security.Principal.WindowsIdentity]::GetCurrent()
+$identity =[System.Security.Principal.WindowsIdentity]::GetCurrent()
 $principal = [System.Security.Principal.WindowsPrincipal]::new($identity)
 $currentSid = $identity.User.Value
 $broadSids = @('S-1-1-0', 'S-1-5-4', 'S-1-5-11', 'S-1-5-32-545')
@@ -434,6 +441,7 @@ $directoryReplaceMask = [int64]([System.Security.AccessControl.FileSystemRights]
     [System.Security.AccessControl.FileSystemRights]::Delete -bor
     [System.Security.AccessControl.FileSystemRights]::ChangePermissions -bor
     [System.Security.AccessControl.FileSystemRights]::TakeOwnership)
+[Console]::Error.WriteLine('stage chain')
 $chain = [System.Collections.Generic.List[object]]::new()
 $cursor = $clientItem.Directory
 while ($null -ne $cursor) {
@@ -446,6 +454,7 @@ foreach ($pathItem in $chain) {
     if ($pathItem.Attributes -band [System.IO.FileAttributes]::ReparsePoint) {
         throw "system curl trust path must not contain a reparse point: $($pathItem.FullName)"
     }
+    [Console]::Error.WriteLine('stage get-acl' + ' ' + $pathItem.FullName)
     $acl = Microsoft.PowerShell.Security\Get-Acl -LiteralPath $pathItem.FullName
     $ownerSid = ([System.Security.Principal.NTAccount]$acl.Owner).Translate([System.Security.Principal.SecurityIdentifier]).Value
     $unsafeWriteGrants = @()
@@ -482,7 +491,9 @@ foreach ($pathItem in $chain) {
         unsafeWriteGrants = @($unsafeWriteGrants)
     }
 }
+[Console]::Error.WriteLine('stage signature')
 $signature = Microsoft.PowerShell.Security\Get-AuthenticodeSignature -LiteralPath $ClientPath
+[Console]::Error.WriteLine('stage emit')
 [ordered]@{
     modulePath = [string]$env:PSModulePath
     loadedModulePaths = @(Microsoft.PowerShell.Core\Get-Module | Microsoft.PowerShell.Core\ForEach-Object { $_.Path })

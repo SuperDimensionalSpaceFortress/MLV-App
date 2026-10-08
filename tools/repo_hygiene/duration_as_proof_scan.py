@@ -469,10 +469,10 @@ class Candidate:
 
 def _tracked_files(root: Path) -> list[str]:
     proc = subprocess.run(
-        ["git", "-C", str(root), "ls-files", *SCAN_GLOBS],
+        ["git", "-C", str(root), "ls-files", "-z", *SCAN_GLOBS],
         capture_output=True, text=True, check=True,
     )
-    return [line for line in proc.stdout.splitlines() if line.strip()]
+    return [part for part in proc.stdout.split("\0") if part.strip()]
 
 
 _RE_RAW_STRING_OPEN = re.compile(r'(?:u8|u|U|L)?R"([^ ()\\\t\v\f\n\r"]{0,16})\(')

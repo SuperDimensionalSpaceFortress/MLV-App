@@ -668,6 +668,10 @@ private:
         size_t sourceImageSize = 0;
         int sourceWidth = 0;
         int sourceHeight = 0;
+        // The clip's full size (getMlvWidth/Height), so the prep worker can tell
+        // how much of the requested playback scale the source already honours.
+        int mlvWidth = 0;
+        int mlvHeight = 0;
         int sceneWidth = 0;
         int sceneHeight = 0;
         int transformationMode = 0;
@@ -770,6 +774,11 @@ private:
         // by up to one row inside qt_convert_rgb888_to_rgb32_ssse3 and
         // segfaults — see the 2026-04-24 crash investigation).
         int preparedBytesPerLine = 0;
+        // Dims of the developed 8-bit frame (scopeSourceImage). Equal to the
+        // task's source dims unless the CPU route processed a reduced frame
+        // (CPU-PLAYBACK-PREP-WORKER-BUILD-1 tier 2); 0 = the source dims.
+        int processedWidth = 0;
+        int processedHeight = 0;
         const uint8_t *preparedBorrowedImage = nullptr;
         size_t preparedBorrowedImageSize = 0;
         bool preparedImageMoved = false;
@@ -1388,6 +1397,32 @@ private:
     double m_playbackSmokePrepPreEnqueueSumMs = 0.0;
     double m_playbackSmokePrepWorkerQueueSumMs = 0.0;
     double m_playbackSmokePrepWorkerBuildSumMs = 0.0;
+    // CPU-PLAYBACK-PREP-WORKER-BUILD-1: per-span sums of the prep worker's build
+    // (playback_smoke.prep_summary).
+    struct PlaybackSmokePrepSpanTotals
+    {
+        double allocMs = 0.0;
+        double reduceMs = 0.0;
+        double shExpandMs = 0.0;
+        double pointwiseMs = 0.0;
+        double chromaMs = 0.0;
+        double sharpenMs = 0.0;
+        double medianMs = 0.0;
+        double rgb16to8Ms = 0.0;
+        double downscaleMs = 0.0;
+        double postMs = 0.0;
+        double spanBuildMs = 0.0;
+        quint64 cpuRouteFrames = 0;
+        quint64 fused8Frames = 0;
+        quint64 reducedFrames = 0;
+        qint64 stageMaskLast = -1;
+        int reducedFactorLast = 0;
+        QString refusalLast;
+        QString downscaleBranchLast;
+        QMap<QString, quint64> refusalCounts;
+        QMap<QString, quint64> downscaleBranchCounts;
+    };
+    PlaybackSmokePrepSpanTotals m_playbackSmokePrepSpans;
     double m_playbackSmokePrepWorkerTotalSumMs = 0.0;
     double m_playbackSmokePrepResultQueueSumMs = 0.0;
     double m_playbackSmokePrepTotalBeforeFinishSumMs = 0.0;
@@ -1617,7 +1652,9 @@ private:
     void enqueuePlaybackPrepTask( const PlaybackPrepTask &task );
     void invalidatePlaybackPrepForDisplayChange( const char *reason );
     void waitForRenderThreadIdleBeforeCoreMutation( const char *reason );
-    PlaybackPrepResult buildPlaybackPrepResult( const PlaybackPrepTask &task );
+    struct PlaybackPrepThreadState;
+    PlaybackPrepResult buildPlaybackPrepResult( const PlaybackPrepTask &task,
+                                                PlaybackPrepThreadState *threadState = nullptr );
     void playbackPrepThreadLoop( void );
     void presentPlaybackPreparedFrame( const PlaybackPrepResult &result );
     void finishPresentedFrame( uint64_t displayFrame,
@@ -1628,7 +1665,9 @@ private:
                                bool releasePresentedFrameEarly,
                                QElapsedTimer &prepRegionClock,
                                qint64 prepRegionStartNs,
-                               double displayStart );
+                               double displayStart,
+                               int rgb8DisplaySourceWidth = 0,
+                               int rgb8DisplaySourceHeight = 0 );
     void setBadPixelCrosshairVisibility( bool visible, bool force = false );
     bool playbackPolicyActive( void ) const;
     void applyPlaybackDebayerSelection( void );
