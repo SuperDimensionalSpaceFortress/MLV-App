@@ -15,17 +15,25 @@ A caller that hands an ARRAY to a ``-File`` child is flagged whether or not the 
 ``-P @(...)`` and the quoted ArgumentList form ``'-File', 'x.ps1', '-P', $arr`` expand to separate tokens, so
 only the first element binds (export-release-cuda-dogfood-kit.ps1 and invoke-ultramagnus-p3-evidence.ps1 were
 this shape). Fix the caller with ``($arr -join ',')`` and split in the script. A variable counts as an array
-when the caller's file declares it ``[string[]]`` / ``[array]``, assigns it ``@(...)`` / a comma list / a
-``-split`` / an ``...Array...`` helper, or aliases one of those. A split counts as normalisation only when it
-is applied to the parameter itself (``$P -split``, ``$P[0].Split(``, ``$P | ... -split``) or assigned back to it.
+when the caller's file declares it ``[string[]]`` / ``[array]``, assigns it ``@(...)`` / a cast / a comma list /
+a ``-split`` / a ``Verb-...Array...`` helper (never a name that merely contains "array", like ``$arrayCount``),
+or aliases one of those. A split clears the parameter only in one of two whitelisted forms (``is_normalised``); every
+other shape is flagged. TEMP/DIRECT: ``$X = $P -split ','`` or ``$X = $P[0].Split(',')`` (``$X`` may be ``$P``), with
+``$X`` later read as a bare token. STAGE: ``$P | ForEach-Object { $_ -split ',' }`` (or ``%``), whose block is that
+one split expression and nothing else (or exactly ``if (Test-Path -LiteralPath $_) { $_ } else { <that split> }``), assigned back to ``$P``, assigned to a variable read later, or piped on
+(never into ``Out-Null`` or ``> $null``; a ``$null`` or ``[void]`` target never counts). Only top-level script code
+counts: a split or a read inside a ``function`` / ``filter`` definition (name, parameter list, body) is ignored. Every
+comment and string literal (both quote kinds, both here-string kinds) is blanked first, so neither a split nor a read
+inside a string counts. A ``[ValidateSet]`` on a top-level ``[string[]]`` parameter is never cleared by a split (it
+rejects the joined element at bind time), so a comma-list caller is flagged.
 
 NON-PROMISES (what this does NOT see):
 - Regex over text, no PowerShell AST and no pwsh process. A comma list assembled at run time
   (``-join ','`` into a variable) is not seen; a variable of unknown type (``-P $x``) is not flagged;
   a caller that only appears in prose (docs/playback-attr-3-cuda.md names ``-CudaArchitectures
   sm_86,compute_86`` with no ``-File`` on the line) is not seen, so the dll-job split has no live-tree
-  revert test. A ``[ValidateSet]`` on a top-level ``[string[]]`` parameter (it rejects the joined element at
-  bind time, before any split) is checked only for scripts embedded as here-strings.
+  revert test. A flow of the split result through a function call or a property (``$x = Normalise $P``, with the
+  split inside the function) is not followed, so only the ``Resolve-...`` helper shape is recognised.
 - Only the first column-0 ``param(`` of a file is read, so a function-level parameter is out of
   scope, and so is a script that nests its real param block in a here-string.
 - Pass-through parameters (``-AdditionalArgs`` and friends) cannot be fixed by splitting on a
@@ -41,6 +49,7 @@ from __future__ import annotations
 import functools
 import re
 import subprocess
+import time
 import unittest
 from dataclasses import dataclass
 from pathlib import Path
@@ -59,13 +68,18 @@ MAX_COMMA_JOIN = 60
 # Each entry is asserted to STILL be a violation: fix the script or its caller, then delete it.
 KNOWN_OPEN: dict[tuple[str, str], str] = {
     ("tools/profiling/run-release-gui-smoke.ps1", "ExtraEnvironment"): (
-        "docs/04-external-auditor-guide.md:496 documents `-ExtraEnvironment @(...)`. A PowerShell caller expands the "
-        "array into separate tokens, so only the first binds. Pass-through values may hold commas, so a comma split "
-        "is not the fix; follow-up PWSH-FILE-ARRAY-PASSTHRU-1 (proposed in PR #311): fail loud or pass base64 JSON."
+        "docs/04-external-auditor-guide.md:504 documents `-ExtraEnvironment @('KEY=VALUE')` with ONE element, which "
+        "expands to one token and binds correctly; the guard flags the `@(...)` literal because it cannot count "
+        "elements. With two or more, the extra tokens land in $UnrecognizedArguments (ValueFromRemainingArguments) "
+        "and the script throws, so that failure is loud. Pass-through values may hold commas, so a comma split is "
+        "not the fix; follow-up PWSH-FILE-ARRAY-PASSTHRU-1 (queued in the hub card queue): fail loud or pass base64 JSON."
     ),
     ("tools/profiling/run-release-playback-profile.ps1", "AdditionalArgs"): (
-        "docs/14-performance-benchmarking.md:544 documents `-AdditionalArgs @('--a', 'b')`; same expansion, same "
-        "reason, same follow-up PWSH-FILE-ARRAY-PASSTHRU-1."
+        "docs/14-performance-benchmarking.md:544-551 documents `-AdditionalArgs @('--stage-log', ..., '--raw-cache-mb', "
+        "...)`, six elements. PowerShell expands them to six tokens; only the first binds to -AdditionalArgs and the "
+        "rest bind positionally to unbound parameters (no [CmdletBinding()], so ExePath takes the stage-log path first "
+        "and fails at path resolution). That example fails visibly, but a pass-through value that happens to suit the "
+        "next parameter would bind silently. Same follow-up PWSH-FILE-ARRAY-PASSTHRU-1."
     ),
 }
 
@@ -82,26 +96,49 @@ class Violation:
         return f"{self.script} -{self.param}: {self.caller}:{self.line}: {self.detail}"
 
 
-def _blank_comments(text: str) -> str:
-    """Return text with PowerShell comments replaced by spaces (newlines kept so line numbers hold)."""
+_HERE_OPEN = re.compile(r"@(['\"])[ \t]*\r?\n")
+
+
+def _blank_comments(text: str, literals: bool = False) -> str:
+    """Return text with PowerShell comments replaced by spaces (newlines kept so line numbers hold).
+
+    ``literals=True`` also blanks the inside of every string literal: single- and double-quoted strings and both
+    here-string kinds (the delimiters stay). Text inside a string is never a read and never a split, even where
+    PowerShell interpolates it. The length never changes, so offsets still line up.
+    """
     out: list[str] = []
     i, n = 0, len(text)
     quote = ""
     while i < n:
         c = text[i]
         if quote:
-            out.append(c)
             if quote == '"' and c == "`" and i + 1 < n:
-                out.append(text[i + 1])
+                nxt = text[i + 1]
+                out.append(" " if literals else c)
+                out.append(" " if literals and nxt not in "\r\n" else nxt)
                 i += 2
                 continue
             if c == quote:
-                if quote == "'" and i + 1 < n and text[i + 1] == "'":
-                    out.append("'")
+                if i + 1 < n and text[i + 1] == quote:
+                    out.append("  " if literals else quote * 2)
                     i += 2
                     continue
+                out.append(c)
                 quote = ""
+            else:
+                out.append(" " if literals and c not in "\r\n" else c)
             i += 1
+            continue
+        here = _HERE_OPEN.match(text, i) if literals and c == "@" else None
+        if here:
+            q = here.group(1)
+            close = text.find("\n" + q + "@", here.end() - 1)
+            end = n if close < 0 else close + 3
+            inner_end = n if close < 0 else max(close, here.end())
+            out.append(text[i:here.end()])
+            out.append("".join(ch if ch in "\r\n" else " " for ch in text[here.end():inner_end]))
+            out.append(text[inner_end:end])
+            i = end
             continue
         if c in ("'", '"'):
             quote = c
@@ -166,64 +203,79 @@ def _statements(body: str) -> list[str]:
     cur: list[str] = []
     braces: list[bool] = []
     depth, quote, i, n = 0, "", 0, len(body)
+    # Linear scan: the statement's last significant character and "has a pipe" are tracked as it is built, and
+    # the next non-blank character is found once per whitespace run, so no step re-reads the text around it.
+    last, piped, ahead_at = "", False, 0
+
+    def add(piece: str) -> None:
+        nonlocal last, piped
+        cur.append(piece)
+        if "|" in piece:
+            piped = True
+        if piece.strip():
+            last = piece.rstrip()[-1]
 
     def flush() -> None:
+        nonlocal last, piped
         stmt = " ".join("".join(cur).split())
         if stmt:
             out.append(stmt)
         cur.clear()
+        last, piped = "", False
 
     while i < n:
         c = body[i]
         if quote:
-            cur.append(c)
+            add(c)
             if quote == '"' and c == "`" and i + 1 < n:
-                cur.append(body[i + 1])
+                add(body[i + 1])
                 i += 2
                 continue
             if c == quote:
                 if quote == "'" and i + 1 < n and body[i + 1] == "'":
-                    cur.append("'")
+                    add("'")
                     i += 2
                     continue
                 quote = ""
         elif c in ("'", '"'):
             quote = c
-            cur.append(c)
+            add(c)
         elif c == "`" and i + 1 < n and body[i + 1] in "\r\n":
-            cur.append(" ")
+            add(" ")
             i += 2
             continue
         elif c in "([":
             depth += 1
-            cur.append(c)
+            add(c)
         elif c in ")]":
             depth = max(0, depth - 1)
-            cur.append(c)
+            add(c)
         elif c == "{":
-            counted = "|" in "".join(cur)
+            counted = piped
             braces.append(counted)
             depth += 1 if counted else 0
-            cur.append(c)
+            add(c)
             if not counted and depth == 0:
                 flush()
         elif c == "}":
             counted = braces.pop() if braces else False
             depth = max(0, depth - (1 if counted else 0))
-            cur.append(c)
+            add(c)
             if not counted and depth == 0:
                 flush()
         elif c == ";" and depth == 0:
             flush()
         elif c == "\n":
-            tail = "".join(cur).rstrip()
-            ahead = body[i + 1:].lstrip()
-            if depth or tail.endswith(("|", ",")) or ahead.startswith("|"):
-                cur.append(" ")
+            if ahead_at <= i:
+                ahead_at = i + 1
+                while ahead_at < n and body[ahead_at].isspace():
+                    ahead_at += 1
+            if depth or last in ("|", ",") or (ahead_at < n and body[ahead_at] == "|"):
+                add(" ")
             else:
                 flush()
         else:
-            cur.append(c)
+            add(c)
         i += 1
     flush()
     return out
@@ -231,24 +283,161 @@ def _statements(body: str) -> list[str]:
 
 @functools.lru_cache(maxsize=8)
 def _body_statements(text: str, block_end: int) -> tuple[str, ...]:
-    """Statements after the param block; cached because every parameter of a script reads the same body."""
-    return tuple(_statements(_blank_comments(text)[block_end:]))
+    """Top-level statements after the param block; cached because every parameter of a script reads the same body."""
+    return tuple(_statements(_blank_functions(_blank_comments(text, literals=True)[block_end:])))
+
+
+# The r4 whitelist. Statements reach these patterns with every string literal blanked to spaces, so ``_LIT`` only
+# has to match the delimiters. A split expression is ``<x> -split '<lit>'[, n]``, ``(<x> -split '<lit>').Trim()``
+# or ``<x>.Split(<literal args>)[.Trim()]``, and it must be the WHOLE right-hand side or stage body.
+_ITEM = r"(?:\$_\b|\$PSItem\b|\(\s*\[string\]\s*(?:\$_|\$PSItem)\s*\))"
+_LIT = r"(?:'[^']*'|\"[^\"]*\")"
+_TRIM = r"(?:\.Trim\(\))?"
+
+
+def _split_of(operand: str) -> str:
+    by_op = operand + r"\s*-split\s*" + _LIT + r"(?:\s*,\s*\d+)?"
+    return r"(?:" + by_op + r"|\(\s*" + by_op + r"\s*\)" + _TRIM + r"|" + operand + r"\.Split\(\s*[^(){}$;|]*\)" + _TRIM + r")"
+
+
+# The one guarded variant: an existing path passes through whole, anything else is split (a path may hold a comma).
+_STAGE_BODY = re.compile(
+    r"\s*(?:" + _split_of(_ITEM) + r"|if\s*\(\s*Test-Path\s+-LiteralPath\s+" + _ITEM + r"\s*\)\s*\{\s*" + _ITEM
+    + r"\s*\}\s*else\s*\{\s*" + _split_of(_ITEM) + r"\s*\})\s*",
+    re.I,
+)
+_CLOSERS = {"(": ")", "[": "]", "{": "}"}
+
+
+def _skip_quoted(text: str, i: int) -> int:
+    """Index just past the quoted string that opens at ``i`` (an unterminated one runs to the end)."""
+    q, i = text[i], i + 1
+    while i < len(text):
+        if q == '"' and text[i] == "`":
+            i += 1
+        elif text[i] == q:
+            return i + 1
+        i += 1
+    return len(text)
+
+
+def _matching(text: str, i: int) -> int:
+    """Index of the bracket that closes the opener at ``i`` (``len(text)`` when it never closes)."""
+    depth, n = 0, len(text)
+    while i < n:
+        c = text[i]
+        if c in "'\"":
+            i = _skip_quoted(text, i)
+            continue
+        if c in _CLOSERS:
+            depth += 1
+        elif c in ")]}":
+            depth -= 1
+            if depth == 0:
+                return i
+        i += 1
+    return n
+
+
+_DEFINITION = re.compile(r"(?<![\w$.`-])(?:function|filter)\s+[A-Za-z_$][\w:$-]*", re.I)
+
+
+def _blank_functions(text: str) -> str:
+    """Blank every ``function`` / ``filter`` definition (keyword, name, parameter list, param() block and body).
+
+    Code in a definition runs only if called, in its own scope, so neither a split nor a read there counts for the
+    script parameter (no call graph is followed). A definition with no body brace, or one that never closes, is
+    blanked to the end of the text. Newlines are kept, so the length never changes.
+    """
+    parts: list[str] = []
+    pos, n = 0, len(text)
+    while (m := _DEFINITION.search(text, pos)) is not None:
+        i = m.end()
+        while i < n and text[i].isspace():
+            i += 1
+        if i < n and text[i] == "(":
+            i = _matching(text, i) + 1
+            while i < n and text[i].isspace():
+                i += 1
+        end = min(n, _matching(text, i) + 1) if i < n and text[i] == "{" else n
+        parts.append(text[pos:m.start()])
+        parts.append("".join(ch if ch in "\r\n" else " " for ch in text[m.start():end]))
+        pos = end
+    parts.append(text[pos:])
+    return "".join(parts)
+
+
+# A split result that is thrown away: piped into Out-Null or redirected to $null anywhere after the stage.
+_DISCARDED = re.compile(r"\|\s*Out-Null\b|>\s*\$null\b", re.I)
+
+
+def _stage_split(expr: str, source: re.Pattern[str]) -> int:
+    """End offset (just past ``}``) of a whitelisted split stage at the start of ``expr``, else -1.
+
+    ``source`` matches the pipeline head up to the stage block's ``{``: the parameter piped straight into
+    ``ForEach-Object`` / ``%`` with nothing in between. The block body must be exactly one split expression on
+    ``$_`` / ``$PSItem`` (``_STAGE_BODY``), so a second statement, an assignment or a nested stage refuses it.
+    """
+    m = source.match(expr)
+    if not m:
+        return -1
+    close = _matching(expr, m.end() - 1)
+    if close >= len(expr) or not _STAGE_BODY.fullmatch(expr, m.end(), close) or _DISCARDED.search(expr, close + 1):
+        return -1
+    return close + 1
 
 
 def is_normalised(text: str, name: str, block_end: int) -> bool:
-    """True when a statement after the param block splits ``$name`` itself, not merely something near it.
+    """True only when a split of ``$name`` matches one of the two whitelisted forms; every other shape fails closed.
 
-    Bound means one of: ``$Name -split`` / ``$Name[0].Split(`` (the split is applied to the parameter), a
-    pipeline that starts at ``$Name`` and splits downstream, or ``$Name = Resolve-... $Name``.
+    Statements are read with every comment and string literal blanked, so neither a split nor a read inside a
+    string ever counts, and with every ``function`` / ``filter`` definition blanked, so only top-level script code
+    counts as a split or a read. A split assigned to ``$null`` or under a ``[void]`` cast, or whose stage output is
+    piped into ``Out-Null`` or redirected to ``$null``, is never credited.
+
+    1. TEMP/DIRECT: ``$X = $Name -split '<lit>'`` / ``$X = $Name[0].Split(...)`` (optionally inside ``@( )``), with
+       ``$X`` either another variable or ``$Name`` itself, and ``$X`` later read as a bare (not backtick-escaped)
+       token before it is overwritten.
+    2. STAGE: ``$Name | ForEach-Object { <split of $_> }`` (or ``%``), whose block is that one split expression and
+       nothing else, or exactly ``if (Test-Path -LiteralPath $_) { $_ } else { <split of $_> }``. Its result must flow on: assigned back to ``$Name``, assigned to a variable read later as in
+       form 1, or piped into a further stage.
+
+    ``$Name = Resolve-... $Name`` still counts as a normalising helper.
     """
     var = r"\$" + re.escape(name) + r"\b"
-    split = r"(?:-split\b|\.Split\s*\()"
-    bound = (
-        re.compile(var + r"(?:\[[^\]]*\])?\s*" + split, re.I),
-        re.compile(var + r"[^|]*\|.*?" + split, re.I),
-        re.compile(r"^" + var + r"\s*=\s*Resolve-[\w-]+.*" + var, re.I),
-    )
-    return any(rx.search(stmt) for stmt in _body_statements(text, block_end) for rx in bound)
+    direct = re.compile(r"(?:@\(\s*)?" + _split_of(var + r"(?:\[[^\]]*\])?") + r"(?:\s*\))?", re.I)
+    stage_rhs = re.compile(r"(?:@?\(\s*)?" + var + r"\s*\|\s*(?:ForEach-Object|%)\s*\{", re.I)
+    stage_stmt = re.compile(var + r"\s*\|\s*(?:ForEach-Object|%)\s*\{", re.I)
+    helper = re.compile(r"Resolve-[\w-]+.*" + var, re.I)
+    assign = re.compile(r"^(?:\[[^\]]*\]\s*)*\$(\w+)\s*=\s*(.*)$", re.I)
+    void_cast = re.compile(r"^(?:\[[^\]]*\]\s*)*\[void\]", re.I)
+
+    def read_before_overwrite(target: str, later: tuple[str, ...]) -> bool:
+        mention = re.compile(r"(?<!`)\$" + re.escape(target) + r"\b", re.I)
+        for stmt in later:
+            m = assign.match(stmt)
+            if m and m.group(1).lower() == target.lower():
+                return mention.search(m.group(2)) is not None
+            if mention.search(stmt):
+                return True
+        return False
+
+    stmts = _body_statements(text, block_end)
+    for k, stmt in enumerate(stmts):
+        m = assign.match(stmt)
+        if m:
+            target, rhs = m.group(1), m.group(2)
+            if target.lower() == "null" or void_cast.match(stmt):
+                continue
+            if target.lower() == name.lower() and (_stage_split(rhs, stage_rhs) >= 0 or helper.match(rhs)):
+                return True
+            if (direct.fullmatch(rhs) or _stage_split(rhs, stage_rhs) >= 0) and read_before_overwrite(target, stmts[k + 1:]):
+                return True
+        else:
+            end = _stage_split(stmt, stage_stmt)
+            if end >= 0 and stmt[end:].lstrip().startswith("|") and not stmt[end:].lstrip().startswith("||"):
+                return True
+    return False
 
 
 def _logical_commands(text: str) -> list[tuple[int, str]]:
@@ -283,7 +472,15 @@ def _array_variable_names(text: str) -> frozenset[str]:
     for m in re.finditer(r"\[(?:string\[\]|object\[\]|array)\]\s*`?\$(\w+)", text, re.I):
         names.add(m.group(1).lower())
     assigns = re.findall(r"`?\$(\w+)\s*\+?=\s*([^\r\n]*)", text)
-    arrayish = re.compile(r"^(?:@\(|.*Array|.*-split\b|(?:'[^']*'|\"[^\"]*\"|`?\$\w+)\s*,)", re.I)
+    # An array value: @(...), a cast, a -split or .Split( (unless its result is indexed down to one element), a
+    # comma list, or a cmdlet/helper whose NAME says Array (never a variable or member that merely contains the
+    # word, such as $arrayCount).
+    arrayish = re.compile(
+        r"^(?:@\(|\[(?:string\[\]|object\[\]|array)\]|.*-split\b|.*\.Split\s*\([^)]*\)(?!\s*\[)"
+        r"|&?\s*[A-Za-z]+-[\w-]*Array[\w-]*(?:\s|$)"
+        r"|(?:'[^']*'|\"[^\"]*\"|`?\$\w+)\s*,)",
+        re.I,
+    )
     for lhs, rhs in assigns:
         if arrayish.match(rhs.strip()):
             names.add(lhs.lower())
@@ -297,9 +494,9 @@ def _array_variable_names(text: str) -> frozenset[str]:
 
 def _comma_value(cmd: str, name: str) -> str | None:
     item = r"(?:'[^']*'|\"[^\"]*\"|[^\s`|),]+)"
-    m = re.search(r"(?<![\w-])-" + re.escape(name) + r"(?:\s+|:)(" + item + r"(?:," + item + r")*)", cmd, re.I)
-    if m and "," in m.group(1):
-        return m.group(1)
+    for m in re.finditer(r"(?<![\w-])-" + re.escape(name) + r"(?:\s+|:)(" + item + r"(?:," + item + r")*)", cmd, re.I):
+        if "," in m.group(1):
+            return m.group(1)
     return None
 
 
@@ -308,12 +505,15 @@ def embedded_launchers(text: str) -> list[str]:
     return re.findall(r"@'\r?\n(\s*(?:\[CmdletBinding\(\)\]\s*)?param\(.*?)\r?\n'@", text, re.S | re.I)
 
 
-def validateset_string_arrays(script: str) -> list[str]:
+def validateset_string_arrays(script: str, params: list[tuple[str, int, int]] | None = None) -> list[str]:
     """``[string[]]`` parameters guarded by ``[ValidateSet(...)]``: validation runs on the one joined element
     (``-P a,b``) before any in-script split can run, so a comma list is rejected at bind time."""
     names = []
-    for name, _line, end in script_string_array_params(script):
-        decl = _blank_comments(script)[max(0, end - 4000):end]
+    if params is None:
+        params = script_string_array_params(script)
+    clean = _blank_comments(script) if params else ""
+    for name, _line, end in params:
+        decl = clean[max(0, end - 4000):end]
         if re.search(r"\[ValidateSet\([^)]*\)\]\s*(?:\[[^\]]*\]\s*)*\[string\[\]\]\s*\$" + re.escape(name) + r"\b", decl, re.I):
             names.append(name)
     return names
@@ -360,10 +560,20 @@ def _caller_commands(text: str) -> list[tuple[int, str, str, bool]]:
 def find_violations(files: dict[str, str]) -> list[Violation]:
     """files maps a repo-relative posix path to its text."""
     scripts: dict[str, list[tuple[str, bool]]] = {}
+    validated: set[tuple[str, str]] = set()
     for path, text in files.items():
         if not path.lower().endswith(".ps1"):
             continue
-        params = [(name, is_normalised(text, name, end)) for name, _line, end in script_string_array_params(text)]
+        # A top-level [ValidateSet] rejects the joined element at bind time, so no in-script split can clear it.
+        declared = script_string_array_params(text)
+        if not declared:
+            continue
+        guarded = {name.lower() for name in validateset_string_arrays(text, declared)}
+        validated.update((path, name.lower()) for name in guarded)
+        params = [
+            (name, name.lower() not in guarded and is_normalised(text, name, end))
+            for name, _line, end in declared
+        ]
         if params:
             scripts[path] = params
     out: list[Violation] = []
@@ -386,7 +596,12 @@ def find_violations(files: dict[str, str]) -> list[Violation]:
                             continue
                         value = _comma_value(cmd, name) or _quoted_comma_token(cmd, name)
                         if value is not None:
-                            out.append(Violation(script, name, path, lineno, f"comma list {value[:60]!r} reaches a [string[]] with no split"))
+                            why = (
+                                "a [ValidateSet] rejects the joined element at bind time, before any split"
+                                if (script, name.lower()) in validated
+                                else "with no split"
+                            )
+                            out.append(Violation(script, name, path, lineno, f"comma list {value[:60]!r} reaches a [string[]] {why}"))
                 if names_script or token_file:
                     for name, _normalised in params:
                         if "-" + name.lower() not in cmd_lower:
@@ -449,7 +664,7 @@ class PwshStringArrayFileParams(unittest.TestCase):
         self.assertEqual([], find_violations(files))
 
     def test_green_dotnet_split_and_resolve_helper_clear_it(self):
-        dot = self.RED_SCRIPT.replace("$Dirs | ForEach", "$parts = $Dirs[0].Split(',')\n$Dirs | ForEach")
+        dot = self.RED_SCRIPT.replace("$Dirs | ForEach", "$Dirs = @($Dirs[0].Split(','))\n$Dirs | ForEach")
         helper = self.RED_SCRIPT.replace("$Dirs | ForEach", "$Dirs = Resolve-Dirs -Dirs $Dirs\n$Dirs | ForEach")
         for text in (dot, helper):
             files = {"tools/x/trace.ps1": text, "docs/how.md": "pwsh -File tools/x/trace.ps1 -Dirs a,b\n"}
@@ -539,6 +754,300 @@ class PwshStringArrayFileParams(unittest.TestCase):
         ):
             files = {"tools/x/trace.ps1": self.RED_SCRIPT.replace("$Dirs | ForEach", fixed), **callers}
             self.assertEqual([], self._flagged(files), fixed)
+
+    def test_red_split_on_something_else_or_never_used_does_not_clear_it(self):
+        callers = {"docs/how.md": "pwsh -File tools/x/trace.ps1 -Dirs a,b\n"}
+        for unrelated in (
+            "$Dirs | ForEach-Object { $y = $z -split ',' }\n",
+            "$Dirs = @($Dirs | ForEach-Object { $z -split ',' })\n",
+            "$Dirs | ForEach-Object { $z -split ',' } | ForEach-Object { $_ }\n",
+            "$parts = $Dirs[0].Split(',')\n$Dirs | ForEach-Object { $_ }\n",
+            "$Dirs | ForEach-Object { $_ }\n$other = $z -split ','\n",
+        ):
+            files = {"tools/x/trace.ps1": self.RED_SCRIPT.split("$Dirs | ForEach")[0] + unrelated, **callers}
+            self.assertEqual([("tools/x/trace.ps1", "Dirs")], self._flagged(files), unrelated)
+
+    def test_green_split_result_that_flows_to_a_later_use_clears_it(self):
+        callers = {"docs/how.md": "pwsh -File tools/x/trace.ps1 -Dirs a,b\n"}
+        head = self.RED_SCRIPT.split("$Dirs | ForEach")[0]
+        for fixed in (
+            "$Dirs = @($Dirs[0].Split(','))\n$Dirs | ForEach-Object { $_ }\n",
+            "$parts = $Dirs[0].Split(',')\n$parts | ForEach-Object { $_ }\n",
+            "$Dirs | ForEach-Object { ([string]$_) -split ',' } | ForEach-Object { $_.Trim() }\n",
+        ):
+            self.assertEqual([], self._flagged({"tools/x/trace.ps1": head + fixed, **callers}), fixed)
+
+    def test_red_split_temporary_overwritten_before_any_read_does_not_clear_it(self):
+        callers = {"docs/how.md": "pwsh -File tools/x/trace.ps1 -Dirs a,b\n"}
+        head = self.RED_SCRIPT.split("$Dirs | ForEach")[0]
+        for unread in (
+            "$parts = $Dirs[0].Split(',')\n$parts = @()\n$Dirs | ForEach-Object { $_ }\n",
+            "$parts = $Dirs | ForEach-Object { $_ -split ',' }\n$parts = $null\n$Dirs | ForEach-Object { $_ }\n",
+        ):
+            self.assertEqual([("tools/x/trace.ps1", "Dirs")], self._flagged({"tools/x/trace.ps1": head + unread, **callers}), unread)
+        for read in (
+            "$parts = $Dirs[0].Split(',')\nWrite-Host $parts\n$parts = @()\n$Dirs | ForEach-Object { $_ }\n",
+            "$parts = $Dirs[0].Split(',')\n$parts = @($parts | Where-Object { $_ })\n$parts | ForEach-Object { $_ }\n",
+        ):
+            self.assertEqual([], self._flagged({"tools/x/trace.ps1": head + read, **callers}), read)
+
+    def test_red_split_on_an_inner_pipelines_item_does_not_clear_the_outer_parameter(self):
+        callers = {"docs/how.md": "pwsh -File tools/x/trace.ps1 -Dirs a,b\n"}
+        head = self.RED_SCRIPT.split("$Dirs | ForEach")[0]
+        for nested in (
+            "$Dirs | ForEach-Object { 'png,jpg' | ForEach-Object { $_ -split ',' } | Out-Null; $_ } | ForEach-Object { $_ }\n",
+            "$Dirs | ForEach-Object { $ext | ForEach-Object { $_.Split(',') } | Out-Null\n $_ } | ForEach-Object { $_ }\n",
+        ):
+            self.assertEqual([("tools/x/trace.ps1", "Dirs")], self._flagged({"tools/x/trace.ps1": head + nested, **callers}), nested)
+
+    def test_red_any_nested_pipeline_in_the_consuming_stage_refuses_the_credit(self):
+        callers = {"docs/how.md": "pwsh -File tools/x/trace.ps1 -Dirs a,b\n"}
+        head = self.RED_SCRIPT.split("$Dirs | ForEach")[0]
+        tail = " | ForEach-Object { $_ }\n"
+        for nested in (
+            # a valued switch or an explicit InputObject on the inner stage
+            "$Dirs | ForEach-Object { 'png,jpg' | ForEach-Object -ErrorAction Stop { $_ -split ',' } | Out-Null; $_ }" + tail,
+            "$Dirs | ForEach-Object { ForEach-Object -InputObject 'png,jpg' { $_ -split ',' } | Out-Null; $_ }" + tail,
+            "$Dirs | ForEach-Object { 'png,jpg' | % { $_ -split ',' } | Out-Null; $_ }" + tail,
+            "$Dirs | ForEach-Object { 'png,jpg' | Where-Object { $_.Split(',') } | Out-Null; $_ }" + tail,
+            "$Dirs | ForEach-Object { 'png,jpg'.ForEach({ $_ -split ',' }) | Out-Null; $_ }" + tail,
+            # the split is outside the nested pipeline, but the stage block still nests one: refused, not resolved
+            "$Dirs | ForEach-Object { 'png' | Out-Null; $_ -split ',' }" + tail,
+            "$Dirs | ForEach-Object { 'x' | ForEach-Object { $_ }; $_ -split ',' }" + tail,
+            # other constructs that rebind $_
+            "$Dirs | ForEach-Object { switch ('png') { default { $_ -split ',' } } ; $_ }" + tail,
+            "$Dirs | ForEach-Object { try { 1 } catch { $_ -split ',' } ; $_ }" + tail,
+        ):
+            self.assertEqual([("tools/x/trace.ps1", "Dirs")], self._flagged({"tools/x/trace.ps1": head + nested, **callers}), nested)
+        # r4 whitelist: these cleared the parameter through r3 and are flagged now (moved here, not deleted). A
+        # stage earns credit only when its block is one statement that is the split itself, and only when it takes
+        # the parameter directly; a temporary earns it only when read as a bare token outside every string.
+        for outside in (
+            # was the green `bound` case of the inner-pipeline test: the split sits in an if/else branch
+            "$Dirs | ForEach-Object { if ($_) { $_ -split ',' } else { $_ } }" + tail,
+            # was the green `passthrough` case of the downstream test: a stage sits between $Dirs and the split
+            "$Dirs | ForEach-Object { $_.Trim() } | ForEach-Object { $_ -split ',' }" + tail,
+            # was the green double-quoted `read` case of the literal test: the only read is inside "..."
+            "$parts = $Dirs[0].Split(',')\nWrite-Verbose \"Split result is in $parts\"\n$parts = @()\n$Dirs | ForEach-Object { $_ }\n",
+        ):
+            self.assertEqual([("tools/x/trace.ps1", "Dirs")], self._flagged({"tools/x/trace.ps1": head + outside, **callers}), outside)
+        clean = "$Dirs | ForEach-Object { if (Test-Path -LiteralPath $_) { $_ } else { $_ -split ',' } }" + tail
+        self.assertEqual([], self._flagged({"tools/x/trace.ps1": head + clean, **callers}), clean)
+        for guarded_other in (
+            "$Dirs | ForEach-Object { if (Test-Path -LiteralPath $_) { $_ -split ',' } else { $_ } }" + tail,
+            "$Dirs | ForEach-Object { if (Test-Path -LiteralPath $z) { $_ } else { $_ -split ',' } }" + tail,
+            "$Dirs | ForEach-Object { if (Test-Path -LiteralPath $_) { $_ } else { $parts = $_ -split ','; $_ } }" + tail,
+        ):
+            self.assertEqual([("tools/x/trace.ps1", "Dirs")], self._flagged({"tools/x/trace.ps1": head + guarded_other, **callers}), guarded_other)
+
+    def test_red_variable_mentioned_only_in_a_literal_is_not_a_read(self):
+        callers = {"docs/how.md": "pwsh -File tools/x/trace.ps1 -Dirs a,b\n"}
+        head = self.RED_SCRIPT.split("$Dirs | ForEach")[0]
+        overwrite = "$parts = @()\n$Dirs | ForEach-Object { $_ }\n"
+        split = "$parts = $Dirs[0].Split(',')\n"
+        for mention in (
+            "Write-Verbose 'Split result is in $parts'\n",
+            "$note = @'\nSplit result is in $parts\n'@\n",
+            "# Split result is in $parts\n",
+            "<# Split result is in $parts #>\n",
+            "Write-Verbose 'it''s in $parts'\n",
+        ):
+            text = split + mention + overwrite
+            self.assertEqual([("tools/x/trace.ps1", "Dirs")], self._flagged({"tools/x/trace.ps1": head + text, **callers}), text)
+        for fake in (
+            "$Dirs | ForEach-Object { 'x $_ -split y' }\n",
+            "$Dirs = 'a $Dirs -split b'\n$Dirs | ForEach-Object { $_ }\n",
+        ):
+            self.assertEqual([("tools/x/trace.ps1", "Dirs")], self._flagged({"tools/x/trace.ps1": head + fake, **callers}), fake)
+
+    def test_red_item_split_downstream_of_an_unrelated_split_does_not_clear_it(self):
+        callers = {"docs/how.md": "pwsh -File tools/x/trace.ps1 -Dirs a,b\n"}
+        head = self.RED_SCRIPT.split("$Dirs | ForEach")[0]
+        unrelated = "$Dirs | ForEach-Object { $z -split ',' } | ForEach-Object { $_ -split ';' } | ForEach-Object { $_ }\n"
+        self.assertEqual([("tools/x/trace.ps1", "Dirs")], self._flagged({"tools/x/trace.ps1": head + unrelated, **callers}), unrelated)
+
+    def _flag_body(self, body: str) -> list[tuple[str, str]]:
+        head = self.RED_SCRIPT.split("$Dirs | ForEach")[0]
+        return self._flagged({"tools/x/trace.ps1": head + body, "docs/how.md": "pwsh -File tools/x/trace.ps1 -Dirs a,b\n"})
+
+    def test_red_split_stage_with_a_second_statement_does_not_clear_it(self):
+        # sol r3 SPLIT-DATAFLOW-STAGE-UNUSED-1: the stage splits into an unread local and emits the item unchanged.
+        for body in (
+            "$Dirs | ForEach-Object { $parts = $_ -split ','; $_ } | ForEach-Object { $_ }\n",
+            "$Dirs | ForEach-Object {\n    $parts = $_ -split ','\n    $_\n} | ForEach-Object { $_ }\n",
+        ):
+            self.assertEqual([("tools/x/trace.ps1", "Dirs")], self._flag_body(body), body)
+
+    def test_red_split_temporary_read_only_inside_a_string_does_not_clear_it(self):
+        # sol r3 SPLIT-DATAFLOW-ESCAPED-READ-1: a backtick-escaped mention in "..." is text, not a read.
+        body = "$parts = $Dirs[0].Split(',')\nWrite-Verbose \"Split result is in `$parts\"\n$parts = @()\n$Dirs | ForEach-Object { $_ }\n"
+        self.assertEqual([("tools/x/trace.ps1", "Dirs")], self._flag_body(body), body)
+
+    def test_red_parenless_intrinsic_foreach_in_the_stage_does_not_clear_it(self):
+        # fable r3 NESTED-PARENLESS-INTRINSIC-METHOD-1: .ForEach{ } / .Where{ } rebind $_ with no pipe or cmdlet.
+        for body in (
+            "$Dirs | ForEach-Object { $null = 'png,jpg'.ForEach{ $_ -split ',' }; $_ } | ForEach-Object { $_ }\n",
+            "$Dirs | ForEach-Object { $null = 'png,jpg'.Where{ $_ -split ',' }; $_ } | ForEach-Object { $_ }\n",
+        ):
+            self.assertEqual([("tools/x/trace.ps1", "Dirs")], self._flag_body(body), body)
+
+    def test_red_where_object_stage_split_does_not_clear_it(self):
+        # fable r3 WHERE-STAGE-SPLIT-CREDITED-1: a filter discards the split result; only ForEach-Object / % count.
+        for body in (
+            "$Dirs | Where-Object { $_ -split ',' } | ForEach-Object { $_ }\n",
+            "$Dirs | ? { $_ -split ',' } | ForEach-Object { $_ }\n",
+            "$Dirs | Sort-Object { $_ -split ',' } | ForEach-Object { $_ }\n",
+        ):
+            self.assertEqual([("tools/x/trace.ps1", "Dirs")], self._flag_body(body), body)
+
+    def test_red_split_text_in_a_double_quoted_string_does_not_clear_it(self):
+        # fable r3 hardening DOUBLE-QUOTED-SPLIT-TEXT-CREDITED-1: split text inside "..." is not a split.
+        for body in (
+            "$Dirs = \"a $Dirs -split b\"\n$Dirs | ForEach-Object { $_ }\n",
+            "$Dirs | ForEach-Object { Write-Host \"$_ -split ','\"; $_ } | ForEach-Object { $_ }\n",
+            "$Dirs = @\"\n$Dirs -split ','\n\"@\n$Dirs | ForEach-Object { $_ }\n",
+        ):
+            self.assertEqual([("tools/x/trace.ps1", "Dirs")], self._flag_body(body), body)
+
+    def test_red_blockless_stage_before_the_split_does_not_clear_it(self):
+        # fable r3 hardening STREAM-CARRY-BLOCKLESS-STAGE-1: the split stage must take the parameter directly.
+        for body in (
+            "$parts = $Dirs | Get-Item | ForEach-Object { $_ -split ',' }\n$parts | Out-Null\n",
+            "$Dirs | Select-Object -First 1 | ForEach-Object { $_ -split ',' } | ForEach-Object { $_ }\n",
+        ):
+            self.assertEqual([("tools/x/trace.ps1", "Dirs")], self._flag_body(body), body)
+
+    def test_green_each_whitelisted_form_clears_it(self):
+        for body in (
+            # TEMP/DIRECT form: split of the parameter, then a bare read outside any string
+            "$parts = $Dirs[0].Split(',')\nWrite-Verbose $parts\n$parts = @()\n$Dirs | ForEach-Object { $_ }\n",
+            "$Dirs = $Dirs -split ','\n$Dirs | ForEach-Object { $_ }\n",
+            # STAGE form: the parameter piped straight into a one-statement split block
+            "$Dirs | % { $PSItem.Split(',').Trim() } | ForEach-Object { $_ }\n",
+            "$parts = $Dirs | ForEach-Object {\n    $_ -split ','\n}\n$parts | ForEach-Object { $_ }\n",
+        ):
+            self.assertEqual([], self._flag_body(body), body)
+
+    def test_red_split_temporary_mentioned_only_inside_a_function_does_not_clear_it(self):
+        # sol r5 SPLIT-DATAFLOW-FUNCTION-SCOPE-1: a function's name, parameter list, param() block and body are not reads.
+        split = "$parts = $Dirs[0].Split(',')\n"
+        tail = "$Dirs | ForEach-Object { $_ }\n"
+        for function in (
+            "function Write-Parts([string[]]$parts) { $parts }\n",
+            "function Write-Parts {\n    param([string[]]$parts)\n    $parts\n}\n",
+            "function Show-Parts { Write-Host $parts }\n",
+            "filter Show-Parts { $parts }\n",
+            "function $parts { 1 }\n",
+        ):
+            body = split + function + tail
+            self.assertEqual([("tools/x/trace.ps1", "Dirs")], self._flag_body(body), body)
+        # a top-level read still counts with a function defined beside it
+        body = split + "function Show-Parts { Write-Host $parts }\nWrite-Verbose $parts\n" + tail
+        self.assertEqual([], self._flag_body(body), body)
+
+    def test_red_split_wholly_inside_an_uncalled_function_does_not_clear_it(self):
+        # sol r5 SPLIT-DATAFLOW-FUNCTION-SCOPE-1, second variant: a split inside a definition never normalises the parameter.
+        tail = "$Dirs | ForEach-Object { $_ }\n"
+        for function in (
+            "function Get-Parts {\n    $parts = $Dirs[0].Split(',')\n    $parts\n}\n",
+            "function Get-Parts { $Dirs = $Dirs -split ','\n$Dirs | ForEach-Object { $_ } }\n",
+            "function Get-Parts([string[]]$Dirs) { $Dirs = @($Dirs | ForEach-Object { $_ -split ',' }) }\n",
+            "filter Get-Parts { $Dirs | ForEach-Object { $_ -split ',' } | ForEach-Object { $_ } }\n",
+        ):
+            body = function + tail
+            self.assertEqual([("tools/x/trace.ps1", "Dirs")], self._flag_body(body), body)
+        body = "$Dirs = $Dirs -split ','\nfunction Get-Parts { 1 }\n" + tail
+        self.assertEqual([], self._flag_body(body), body)
+
+    def test_red_split_assigned_to_null_is_never_credited(self):
+        # fable r5 NULL-TARGET-SKIP-UNTESTED-1: a later `$null` mention must not read a split discarded into $null.
+        body = "$null = $Dirs -split ','\n$x = $null\n$Dirs | ForEach-Object { $_ }\n"
+        self.assertEqual([("tools/x/trace.ps1", "Dirs")], self._flag_body(body), body)
+
+    def test_red_split_stage_whose_output_is_discarded_does_not_clear_it(self):
+        # fable r5 STAGE-PIPED-TO-OUT-NULL-CREDITED-1: a stage piped into Out-Null, assigned to $null or cast to
+        # [void] discards the split result.
+        for body in (
+            "$Dirs | ForEach-Object { $_ -split ',' } | Out-Null\n",
+            "$Dirs | % { $_ -split ',' } | ForEach-Object { $_.Trim() } | Out-Null\n",
+            "$Dirs | ForEach-Object { $_ -split ',' } | ForEach-Object { $_ } > $null\n",
+            "$Dirs = $Dirs | ForEach-Object { $_ -split ',' } | Out-Null\n$Dirs | ForEach-Object { $_ }\n",
+            "$parts = $Dirs | ForEach-Object { $_ -split ',' } | Out-Null\n$parts | ForEach-Object { $_ }\n",
+            "$null = $Dirs | ForEach-Object { $_ -split ',' }\n$x = $null\n$Dirs | ForEach-Object { $_ }\n",
+            "[void]($Dirs | ForEach-Object { $_ -split ',' })\n$Dirs | ForEach-Object { $_ }\n",
+            "[void]$parts = $Dirs -split ','\n$parts | ForEach-Object { $_ }\n",
+        ):
+            self.assertEqual([("tools/x/trace.ps1", "Dirs")], self._flag_body(body), body)
+
+    def test_red_dotnet_split_array_variable_to_file_child_is_flagged(self):
+        script = {"tools/x/trace.ps1": self._split_fixed()}
+        call = "& pwsh -File tools\\x\\trace.ps1 -Dirs $n\n"
+        for assign in ("$n = $raw.Split(',')\n", "$n = 'a,b'.Split(',', 2)\n"):
+            self.assertEqual([("tools/x/trace.ps1", "Dirs")], self._flagged({**script, "tools/x/run.ps1": assign + call}), assign)
+        for scalar in ("$n = $raw.Split(',')[0]\n", "$n = $raw.Trim()\n"):
+            self.assertEqual([], self._flagged({**script, "tools/x/run.ps1": scalar + call}), scalar)
+
+    def test_red_array_named_scalar_is_not_an_array_but_an_array_helper_is(self):
+        script = {"tools/x/trace.ps1": self._split_fixed()}
+        call = "& pwsh -File tools\\x\\trace.ps1 -Dirs $n\n"
+        for assign in ("$n = $arrayCount\n", "$n = $myArray.Count\n", "$n = $rawArrayText\n"):
+            self.assertEqual([], self._flagged({**script, "tools/x/run.ps1": assign + call}), assign)
+        for assign in (
+            "$n = Convert-ToPowerShellArrayLiteral $raw\n",
+            "$n = [string[]]$raw\n",
+            "$n = 'a', 'b'\n",
+            "$n = @($raw)\n",
+        ):
+            self.assertEqual([("tools/x/trace.ps1", "Dirs")], self._flagged({**script, "tools/x/run.ps1": assign + call}), assign)
+
+    def test_red_later_comma_list_is_not_masked_by_an_earlier_mention(self):
+        two = "param(\n    [string[]]$Dirs,\n    [string[]]$Names\n)\n$Dirs | ForEach-Object { $_ }\n$Names | ForEach-Object { $_ }\n"
+        for text in (
+            "pwsh -File tools/x/two.ps1 -Dirs one -Names a,b\n",
+            "see -Dirs one,\npwsh -File tools/x/two.ps1 -Dirs a,b\n",
+            "pwsh -File tools/x/two.ps1 -Dirs one -Dirs a,b\n",
+        ):
+            found = self._flagged({"tools/x/two.ps1": two, "docs/how.md": text})
+            self.assertEqual(1, len(found), text)
+
+    def test_red_top_level_validateset_on_a_string_array_flags_a_comma_list_caller(self):
+        script = "param(\n    [ValidateSet('a', 'b')]\n    [string[]]$Codecs = @('a')\n)\n$Codecs = @($Codecs | ForEach-Object { $_ -split ',' })\n"
+        files = {"tools/x/enc.ps1": script, "docs/how.md": "pwsh -File tools/x/enc.ps1 -Codecs a,b\n"}
+        self.assertEqual([("tools/x/enc.ps1", "Codecs")], self._flagged(files))
+        self.assertIn("ValidateSet", find_violations(files)[0].detail)
+        files["docs/how.md"] = "pwsh -File tools/x/enc.ps1 -Codecs a\n"
+        self.assertEqual([], self._flagged(files))
+        plain = script.replace("    [ValidateSet('a', 'b')]\n", "")
+        files = {"tools/x/enc.ps1": plain, "docs/how.md": "pwsh -File tools/x/enc.ps1 -Codecs a,b\n"}
+        self.assertEqual([], self._flagged(files))
+
+    def test_known_open_reasons_describe_what_the_callee_really_does(self):
+        files = _live_files()
+        gui, profile = (KNOWN_OPEN[("tools/profiling/" + n, p)] for n, p in (
+            ("run-release-gui-smoke.ps1", "ExtraEnvironment"), ("run-release-playback-profile.ps1", "AdditionalArgs")))
+        self.assertIn("ONE element", gui)
+        self.assertIn("ValueFromRemainingArguments", files["tools/profiling/run-release-gui-smoke.ps1"])
+        self.assertIn("positionally", profile)
+        self.assertNotIn("CmdletBinding", files["tools/profiling/run-release-playback-profile.ps1"])
+        for reason in KNOWN_OPEN.values():
+            self.assertIn("PWSH-FILE-ARRAY-PASSTHRU-1", reason)
+
+    def test_live_top_level_validateset_script_is_seen(self):
+        path = "tools/profiling/invoke-ultramagnus-cdng-export-evidence.ps1"
+        self.assertEqual(["CdngCodecs"], validateset_string_arrays(_live_files()[path]))
+
+    def test_statement_splitter_scales_linearly(self):
+        def best(lines: int) -> float:
+            body = "Write-Host $x\n" * lines
+            runs = []
+            for _ in range(3):
+                t0 = time.perf_counter()
+                _statements(body)
+                runs.append(time.perf_counter() - t0)
+            return min(runs)
+
+        small, large = best(20_000), best(80_000)
+        self.assertLess(large, small * 9, f"4x the lines took {large / small:.1f}x the time (quadratic is ~16x)")
 
     def test_reverting_each_guarded_311_fix_in_memory_is_flagged(self):
         files = _live_files()
