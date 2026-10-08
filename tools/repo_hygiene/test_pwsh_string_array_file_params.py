@@ -259,37 +259,162 @@ def _body_statements(text: str, block_end: int) -> tuple[str, ...]:
     return tuple(_statements(_blank_comments(text)[block_end:]))
 
 
+_ITEM = r"(?:\$_|\$PSItem)\b"
+_SPLIT = r"(?:-split\b|\.Split\s*\()"
+_ITEM_SPLIT = re.compile(_ITEM + r"[\w.\[\]()\s]*?" + _SPLIT, re.I)
+_ITEM_USE = re.compile(_ITEM, re.I)
+# What may sit between a ``|`` and the ``{`` of the stage it feeds: a command name and its switches.
+_STAGE_HEAD = re.compile(r"\s*[\w.%?-]+(?:\s+-[\w-]+)*\s*")
+_CLOSERS = {"(": ")", "[": "]", "{": "}"}
+
+
+def _skip_quoted(text: str, i: int) -> int:
+    """Index just past the quoted string that opens at ``i`` (an unterminated one runs to the end)."""
+    q, i = text[i], i + 1
+    while i < len(text):
+        if q == '"' and text[i] == "`":
+            i += 1
+        elif text[i] == q:
+            return i + 1
+        i += 1
+    return len(text)
+
+
+def _matching(text: str, i: int) -> int:
+    """Index of the bracket that closes the opener at ``i`` (``len(text)`` when it never closes)."""
+    depth, n = 0, len(text)
+    while i < n:
+        c = text[i]
+        if c in "'\"":
+            i = _skip_quoted(text, i)
+            continue
+        if c in _CLOSERS:
+            depth += 1
+        elif c in ")]}":
+            depth -= 1
+            if depth == 0:
+                return i
+        i += 1
+    return n
+
+
+def _own_item_scope(block: str) -> str:
+    """``block`` with every nested pipeline stage blanked: ``$_`` there is bound to the inner pipeline's source.
+
+    A nested ``{ }`` that follows ``| Command`` is a stage script block and rebinds ``$_``; ``if`` / ``else`` /
+    ``foreach`` bodies do not, so a ``$_`` inside them still belongs to the stream being consumed.
+    """
+    out, last_pipe, i, n = [], [-1], 0, len(block)
+    while i < n:
+        c = block[i]
+        if c in "'\"":
+            j = _skip_quoted(block, i)
+            out.append(block[i:j])
+            i = j
+            continue
+        if c == "{" and last_pipe[-1] >= 0 and _STAGE_HEAD.fullmatch(block[last_pipe[-1] + 1:i]):
+            j = min(_matching(block, i) + 1, n)
+            out.append(" " * (j - i))
+            i = j
+            continue
+        if c in _CLOSERS:
+            last_pipe.append(-1)
+        elif c in ")]}":
+            if len(last_pipe) > 1:
+                last_pipe.pop()
+        elif c == "|" and block[i + 1:i + 2] != "|":
+            last_pipe[-1] = i
+        elif c == ";":
+            last_pipe[-1] = -1
+        out.append(c)
+        i += 1
+    return "".join(out)
+
+
+def _stream_item_split(tail: str) -> int:
+    """For the text after ``$Name``: the end offset of the stage that splits the parameter's items, else -1.
+
+    The parameter feeds the first stage of the pipeline, so ``$_`` in that stage's script block is a
+    parameter item. It stays one for a later stage only while every stage before it read ``$_`` (a stage that
+    ignores ``$_`` emits something unrelated to the parameter). ``$_`` inside a nested stage belongs to that
+    inner pipeline's own source and never counts.
+    """
+    segments: list[list[str]] = [[]]
+    ends: list[int] = []
+    i, n = 0, len(tail)
+    while i < n:
+        c = tail[i]
+        if c in "'\"":
+            i = _skip_quoted(tail, i)
+            continue
+        if c == "{":
+            j = _matching(tail, i)
+            segments[-1].append(_own_item_scope(tail[i + 1:j]))
+            i = j + 1
+            continue
+        if c in "([":
+            i = _matching(tail, i) + 1
+            continue
+        if c in ")]};" or (c == "|" and tail[i + 1:i + 2] == "|"):
+            break
+        if c == "|":
+            ends.append(i)
+            segments.append([])
+        i += 1
+    ends.append(min(i, n))
+    carried = True
+    for k, blocks in enumerate(segments[1:], 1):
+        if carried and any(_ITEM_SPLIT.search(b) for b in blocks):
+            return ends[k]
+        if blocks and not any(_ITEM_USE.search(b) for b in blocks):
+            carried = False
+    return -1
+
+
 def is_normalised(text: str, name: str, block_end: int) -> bool:
     """True when the split is applied to ``$name`` itself AND its result flows to a use of the parameter.
 
     Applied to the parameter: ``$Name -split`` / ``$Name[0].Split(``, or a pipeline that starts at ``$Name`` and
     splits the pipeline item (``$_`` / ``$PSItem``) downstream; ``$Name = Resolve-... $Name`` counts as a helper
     that does both. Flows to a use: the statement assigns it back to ``$Name``, assigns it to another variable
-    that a later statement reads, or keeps piping it into a further stage. A split of some other variable
-    (``$z -split``) or a split whose result nothing reads does not clear it.
+    that a later statement reads before overwriting it, or keeps piping it into a further stage. A split of some
+    other variable (``$z -split``), of an inner pipeline's item, or whose result nothing reads does not clear it.
     """
-    var = r"\$" + re.escape(name) + r"\b"
-    split = r"(?:-split\b|\.Split\s*\()"
-    item = r"(?:\$_|\$PSItem)\b[\w.\[\]()\s]*?"
-    direct = re.compile(var + r"(?:\[[^\]]*\])?\s*" + split, re.I)
-    piped = re.compile(var + r"[^|]*\|.*?" + item + split, re.I)
-    helper = re.compile(r"Resolve-[\w-]+.*" + var, re.I)
+    var = re.compile(r"\$" + re.escape(name) + r"\b", re.I)
+    direct = re.compile(var.pattern + r"(?:\[[^\]]*\])?\s*" + _SPLIT, re.I)
+    helper = re.compile(r"Resolve-[\w-]+.*" + var.pattern, re.I)
     assign = re.compile(r"^(?:\[[^\]]*\]\s*)*\$(\w+)\s*=\s*(.*)$", re.I)
+
+    def stream_split(stmt: str) -> int:
+        for m in var.finditer(stmt):
+            end = _stream_item_split(stmt[m.end():])
+            if end >= 0:
+                return m.end() + end
+        return -1
+
+    def read_before_overwrite(target: str, later: tuple[str, ...]) -> bool:
+        mention = re.compile(r"\$" + re.escape(target) + r"\b", re.I)
+        for stmt in later:
+            m = assign.match(stmt)
+            if m and m.group(1).lower() == target.lower():
+                return mention.search(m.group(2)) is not None
+            if mention.search(stmt):
+                return True
+        return False
+
     stmts = _body_statements(text, block_end)
     for k, stmt in enumerate(stmts):
         m = assign.match(stmt)
         if m:
             target, rhs = m.group(1), m.group(2)
             if target.lower() == name.lower():
-                if direct.search(rhs) or piped.search(rhs) or helper.match(rhs):
+                if direct.search(rhs) or stream_split(rhs) >= 0 or helper.match(rhs):
                     return True
-            elif (direct.search(rhs) or piped.search(rhs)) and any(
-                re.search(r"\$" + re.escape(target) + r"\b", later, re.I) for later in stmts[k + 1:]
-            ):
+            elif (direct.search(rhs) or stream_split(rhs) >= 0) and read_before_overwrite(target, stmts[k + 1:]):
                 return True
         else:
-            pm = piped.search(stmt)
-            if pm and "|" in stmt[pm.end():]:
+            end = stream_split(stmt)
+            if end >= 0 and "|" in stmt[end:]:
                 return True
     return False
 
@@ -326,10 +451,12 @@ def _array_variable_names(text: str) -> frozenset[str]:
     for m in re.finditer(r"\[(?:string\[\]|object\[\]|array)\]\s*`?\$(\w+)", text, re.I):
         names.add(m.group(1).lower())
     assigns = re.findall(r"`?\$(\w+)\s*\+?=\s*([^\r\n]*)", text)
-    # An array value: @(...), a cast, a -split, a comma list, or a cmdlet/helper whose NAME says Array (never a
-    # variable or member that merely contains the word, such as $arrayCount).
+    # An array value: @(...), a cast, a -split or .Split( (unless its result is indexed down to one element), a
+    # comma list, or a cmdlet/helper whose NAME says Array (never a variable or member that merely contains the
+    # word, such as $arrayCount).
     arrayish = re.compile(
-        r"^(?:@\(|\[(?:string\[\]|object\[\]|array)\]|.*-split\b|&?\s*[A-Za-z]+-[\w-]*Array[\w-]*(?:\s|$)"
+        r"^(?:@\(|\[(?:string\[\]|object\[\]|array)\]|.*-split\b|.*\.Split\s*\([^)]*\)(?!\s*\[)"
+        r"|&?\s*[A-Za-z]+-[\w-]*Array[\w-]*(?:\s|$)"
         r"|(?:'[^']*'|\"[^\"]*\"|`?\$\w+)\s*,)",
         re.I,
     )
@@ -628,6 +755,51 @@ class PwshStringArrayFileParams(unittest.TestCase):
             "$Dirs | ForEach-Object { ([string]$_) -split ',' } | ForEach-Object { $_.Trim() }\n",
         ):
             self.assertEqual([], self._flagged({"tools/x/trace.ps1": head + fixed, **callers}), fixed)
+
+    def test_red_split_temporary_overwritten_before_any_read_does_not_clear_it(self):
+        callers = {"docs/how.md": "pwsh -File tools/x/trace.ps1 -Dirs a,b\n"}
+        head = self.RED_SCRIPT.split("$Dirs | ForEach")[0]
+        for unread in (
+            "$parts = $Dirs[0].Split(',')\n$parts = @()\n$Dirs | ForEach-Object { $_ }\n",
+            "$parts = $Dirs | ForEach-Object { $_ -split ',' }\n$parts = $null\n$Dirs | ForEach-Object { $_ }\n",
+        ):
+            self.assertEqual([("tools/x/trace.ps1", "Dirs")], self._flagged({"tools/x/trace.ps1": head + unread, **callers}), unread)
+        for read in (
+            "$parts = $Dirs[0].Split(',')\nWrite-Host $parts\n$parts = @()\n$Dirs | ForEach-Object { $_ }\n",
+            "$parts = $Dirs[0].Split(',')\n$parts = @($parts | Where-Object { $_ })\n$parts | ForEach-Object { $_ }\n",
+        ):
+            self.assertEqual([], self._flagged({"tools/x/trace.ps1": head + read, **callers}), read)
+
+    def test_red_split_on_an_inner_pipelines_item_does_not_clear_the_outer_parameter(self):
+        callers = {"docs/how.md": "pwsh -File tools/x/trace.ps1 -Dirs a,b\n"}
+        head = self.RED_SCRIPT.split("$Dirs | ForEach")[0]
+        for nested in (
+            "$Dirs | ForEach-Object { 'png,jpg' | ForEach-Object { $_ -split ',' } | Out-Null; $_ } | ForEach-Object { $_ }\n",
+            "$Dirs | ForEach-Object { $ext | ForEach-Object { $_.Split(',') } | Out-Null\n $_ } | ForEach-Object { $_ }\n",
+        ):
+            self.assertEqual([("tools/x/trace.ps1", "Dirs")], self._flagged({"tools/x/trace.ps1": head + nested, **callers}), nested)
+        for bound in (
+            "$Dirs | ForEach-Object { 'png' | Out-Null; $_ -split ',' } | ForEach-Object { $_ }\n",
+            "$Dirs | ForEach-Object { if ($_) { $_ -split ',' } else { $_ } } | ForEach-Object { $_ }\n",
+            "$Dirs | ForEach-Object { 'x' | ForEach-Object { $_ }; $_ -split ',' } | ForEach-Object { $_ }\n",
+        ):
+            self.assertEqual([], self._flagged({"tools/x/trace.ps1": head + bound, **callers}), bound)
+
+    def test_red_item_split_downstream_of_an_unrelated_split_does_not_clear_it(self):
+        callers = {"docs/how.md": "pwsh -File tools/x/trace.ps1 -Dirs a,b\n"}
+        head = self.RED_SCRIPT.split("$Dirs | ForEach")[0]
+        unrelated = "$Dirs | ForEach-Object { $z -split ',' } | ForEach-Object { $_ -split ';' } | ForEach-Object { $_ }\n"
+        self.assertEqual([("tools/x/trace.ps1", "Dirs")], self._flagged({"tools/x/trace.ps1": head + unrelated, **callers}), unrelated)
+        passthrough = "$Dirs | ForEach-Object { $_.Trim() } | ForEach-Object { $_ -split ',' } | ForEach-Object { $_ }\n"
+        self.assertEqual([], self._flagged({"tools/x/trace.ps1": head + passthrough, **callers}), passthrough)
+
+    def test_red_dotnet_split_array_variable_to_file_child_is_flagged(self):
+        script = {"tools/x/trace.ps1": self._split_fixed()}
+        call = "& pwsh -File tools\\x\\trace.ps1 -Dirs $n\n"
+        for assign in ("$n = $raw.Split(',')\n", "$n = 'a,b'.Split(',', 2)\n"):
+            self.assertEqual([("tools/x/trace.ps1", "Dirs")], self._flagged({**script, "tools/x/run.ps1": assign + call}), assign)
+        for scalar in ("$n = $raw.Split(',')[0]\n", "$n = $raw.Trim()\n"):
+            self.assertEqual([], self._flagged({**script, "tools/x/run.ps1": scalar + call}), scalar)
 
     def test_red_array_named_scalar_is_not_an_array_but_an_array_helper_is(self):
         script = {"tools/x/trace.ps1": self._split_fixed()}
