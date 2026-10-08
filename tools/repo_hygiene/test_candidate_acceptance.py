@@ -101,7 +101,40 @@ def _run_windows_acl_probe(test: unittest.TestCase, what: str, command: list[str
 # retried ONCE under a wider bound against the same real runner. Nothing is faked and nothing is
 # skipped; a second stall is the same typed UNKNOWN as every other stalled ACL probe.
 CURL_TRUST_PROBE_STALL_MARKER = "system curl trust verification failed with exit 124"
+# The bounded runner's other stall verdict (cpuStalled, BOUNDED_RUNNER_EXIT_CODE_DEFAULTS["cpuStall"])
+# is the same host condition seen through the CPU watchdog, so it takes the same single retry.
+CURL_TRUST_PROBE_CPU_STALL_MARKER = "system curl trust verification failed with exit 126"
+CURL_TRUST_PROBE_STALL_MARKERS = (CURL_TRUST_PROBE_STALL_MARKER, CURL_TRUST_PROBE_CPU_STALL_MARKER)
 CURL_TRUST_PROBE_RETRY_TIMEOUT_MS = WINDOWS_ACL_PROBE_TIMEOUT_SECONDS * 1000
+# Stable token a shard log / run summary can be searched for: it names an UNKNOWN (the probe never
+# finished, twice), which is a different diagnosis from a real trust failure.
+CURL_TRUST_UNKNOWN_TOKEN = "CURL-TRUST-UNKNOWN"
+_CURL_TRUST_STAGE_PATTERN = re.compile(r"(?m)(?:^|(?<=: ))stage ([a-z-]+)(?: ([^\r\n]+))?")
+
+
+class CurlTrustSustainedStall(WindowsAclProbeUnknown):
+    """The production curl trust probe stalled on both attempts: the check did not run, twice."""
+
+
+def _is_curl_trust_stall(error: Exception) -> bool:
+    return any(marker in str(error) for marker in CURL_TRUST_PROBE_STALL_MARKERS)
+
+
+def _last_probe_stage(error_text: str) -> str:
+    """The last stderr stage marker the production script wrote before it stalled."""
+
+    stages = _CURL_TRUST_STAGE_PATTERN.findall(error_text)
+    if not stages:
+        return "no stage marker reached"
+    name, detail = stages[-1]
+    return f"stage {name}" + (f" {detail.strip()}" if detail.strip() else "")
+
+
+def _report_sustained_curl_trust_stall(summary: str) -> None:
+    print(f"[curl-trust] {CURL_TRUST_UNKNOWN_TOKEN}: {summary}", file=sys.stderr)
+    if os.environ.get("GITHUB_ACTIONS") == "true":
+        text = summary.replace("%", "%25").replace("\r", "%0D").replace("\n", "%0A")
+        print(f"::error title={CURL_TRUST_UNKNOWN_TOKEN} (not a trust failure)::{text}", file=sys.stderr)
 
 
 def _run_production_trust_probe(config: dict, client: Path) -> dict:
@@ -111,7 +144,7 @@ def _run_production_trust_probe(config: dict, client: Path) -> dict:
     try:
         return _windows_curl_trust_probe(ROOT, config, client)
     except HygieneError as exc:
-        if CURL_TRUST_PROBE_STALL_MARKER not in str(exc):
+        if not _is_curl_trust_stall(exc):
             raise
         first_attempt = str(exc)
     runner = brokered_closeout.run_bounded_closeout_process
@@ -126,9 +159,19 @@ def _run_production_trust_probe(config: dict, client: Path) -> dict:
         with mock.patch.object(brokered_closeout, "run_bounded_closeout_process", widened):
             return _windows_curl_trust_probe(ROOT, config, client)
     except HygieneError as exc:
-        raise WindowsAclProbeUnknown(
-            f"UNKNOWN: the production curl trust probe stalled twice; the module-pinning property it "
-            f"guards was NOT checked. first attempt={first_attempt!r} retry={str(exc)!r}"
+        if not _is_curl_trust_stall(exc):
+            raise HygieneError(
+                f"system curl trust probe retry failed with a definite non-stall error; the first attempt "
+                f"stalled ({first_attempt!r}). retry: {exc}"
+            ) from exc
+        summary = (
+            f"the production curl trust probe stalled twice (sustained bounded-runner stall, NOT a trust "
+            f"failure); the trust property was NOT checked. last stage: first "
+            f"attempt: {_last_probe_stage(first_attempt)}; retry: {_last_probe_stage(str(exc))}"
+        )
+        _report_sustained_curl_trust_stall(summary)
+        raise CurlTrustSustainedStall(
+            f"{CURL_TRUST_UNKNOWN_TOKEN}: {summary}. first attempt={first_attempt!r} retry={str(exc)!r}"
         ) from exc
 
 
@@ -1759,6 +1802,7 @@ class CurlTrustProbeStallRetryTests(unittest.TestCase):
     """CI-01: one stalled (exit 124) production trust probe is retried once; two stalls are UNKNOWN."""
 
     STALL = {"returncode": 124, "timedOut": True, "outputCapped": False, "cpuStalled": False, "stdout": "", "stderr": ""}
+    CPU_STALL = dict(STALL, returncode=126, timedOut=False, cpuStalled=True)
     ROOT_MODULES = r"C:\Windows\System32\WindowsPowerShell\v1.0\Modules"
 
     def _clean(self) -> dict:
@@ -1779,12 +1823,19 @@ class CurlTrustProbeStallRetryTests(unittest.TestCase):
             timeouts.append(kwargs["timeout_ms"])
             return queue.pop(0)
 
-        with mock.patch("tools.repo_hygiene.brokered_closeout.run_bounded_closeout_process", runner), \
-                mock.patch("sys.stderr", io.StringIO()):
-            try:
-                return _run_production_trust_probe({}, Path(r"C:\Windows\curl.exe")), timeouts
-            except AssertionError as exc:
-                return exc, timeouts
+        log = io.StringIO()
+        try:
+            with mock.patch("tools.repo_hygiene.brokered_closeout.run_bounded_closeout_process", runner), \
+                    mock.patch("sys.stderr", log):
+                try:
+                    return _run_production_trust_probe({}, Path(r"C:\Windows\curl.exe")), timeouts
+                except unittest.SkipTest as exc:
+                    # A skip would hide a stalled probe as "not run"; the probe must fail closed.
+                    self.fail(f"the production trust probe raised SkipTest instead of failing closed: {exc}")
+                except (AssertionError, HygieneError) as exc:
+                    return exc, timeouts
+        finally:
+            self.driven_stderr = log.getvalue()
 
     def test_a_single_exit_124_is_retried_once_under_the_wider_bound_and_the_evidence_is_returned(self) -> None:
         trust, timeouts = self._drive([self.STALL, self._clean()])
@@ -1814,6 +1865,77 @@ class CurlTrustProbeStallRetryTests(unittest.TestCase):
             ):
                 _run_production_trust_probe({}, Path(r"C:\Windows\curl.exe"))
         self.assertEqual([], queue, "the non-124 failure must be raised after exactly one runner call")
+
+    def test_a_single_exit_126_cpu_stall_is_retried_once_like_a_124(self) -> None:
+        trust, timeouts = self._drive([self.CPU_STALL, self._clean()])
+        self.assertEqual([30000, CURL_TRUST_PROBE_RETRY_TIMEOUT_MS], timeouts)
+        self.assertEqual(3, len(trust["pathTrust"]))
+
+    def test_a_124_then_a_126_is_still_a_sustained_stall_and_two_126s_too(self) -> None:
+        for first, second in ((self.STALL, self.CPU_STALL), (self.CPU_STALL, self.CPU_STALL)):
+            with self.subTest(first=first["returncode"], second=second["returncode"]):
+                error, timeouts = self._drive([first, second])
+                self.assertIsInstance(error, WindowsAclProbeUnknown)
+                self.assertIn("CURL-TRUST-UNKNOWN", str(error))
+                self.assertEqual(2, len(timeouts))
+
+    def test_other_nonzero_exits_are_never_retried(self) -> None:
+        for code in (1, 125, 127):
+            with self.subTest(exit=code):
+                error, timeouts = self._drive([dict(self._clean(), returncode=code, stderr="boom")])
+                self.assertIsInstance(error, HygieneError)
+                self.assertNotIsInstance(error, WindowsAclProbeUnknown)
+                self.assertEqual([30000], timeouts)
+
+    def test_a_sustained_stall_is_reported_distinctly_from_a_trust_failure(self) -> None:
+        stalled = dict(self.STALL, stderr="stage import-security\nstage get-acl C:\\Windows\n")
+        error, _ = self._drive([stalled, stalled])
+        message = str(error)
+        self.assertIsInstance(error, WindowsAclProbeUnknown)
+        self.assertNotIsInstance(error, unittest.SkipTest)
+        self.assertTrue(message.startswith("CURL-TRUST-UNKNOWN"), message)
+        self.assertIn("NOT a trust failure", message)
+        self.assertIn("the trust property was NOT checked", message)
+        self.assertIn("get-acl C:\\Windows", message, "the last stage reached is named")
+        self.assertIn("CURL-TRUST-UNKNOWN", self.driven_stderr, "the shard log carries the marker line")
+
+    def test_a_sustained_stall_marker_is_a_github_annotation_only_on_hosted_runners(self) -> None:
+        with mock.patch.dict(os.environ, {"GITHUB_ACTIONS": ""}):
+            self._drive([self.STALL, self.STALL])
+        self.assertNotIn("::error", self.driven_stderr)
+        with mock.patch.dict(os.environ, {"GITHUB_ACTIONS": "true"}):
+            self._drive([self.STALL, self.STALL])
+        self.assertRegex(self.driven_stderr, r"(?m)^::error title=CURL-TRUST-UNKNOWN[^:]*::")
+
+    def test_a_stall_with_no_stage_marker_says_so(self) -> None:
+        error, _ = self._drive([self.STALL, self.STALL])
+        self.assertIn("no stage marker reached", str(error))
+
+    def test_a_nonstall_failure_on_the_retry_is_not_reported_as_stalled_twice(self) -> None:
+        tampered = dict(self._clean(), returncode=1, stderr="forged")
+        empty = dict(self._clean(), stdout="")
+        for retry, expected in ((tampered, "failed with exit 1: forged"), (empty, "evidence is malformed")):
+            with self.subTest(expected=expected):
+                error, timeouts = self._drive([self.STALL, retry])
+                self.assertIsInstance(error, HygieneError)
+                self.assertNotIsInstance(error, WindowsAclProbeUnknown)
+                self.assertNotIn("stalled twice", str(error))
+                self.assertNotIn("CURL-TRUST-UNKNOWN", str(error))
+                self.assertIn(expected, str(error))
+                self.assertIn("first attempt stalled", str(error))
+                self.assertEqual(2, len(timeouts))
+
+    def test_the_production_trust_script_carries_diagnostic_only_stage_markers(self) -> None:
+        names = re.findall(r"\[Console\]::Error\.WriteLine\('stage ([a-z-]+)'", _WINDOWS_CURL_TRUST_SCRIPT)
+        self.assertEqual(
+            ["start", "import-management", "import-security", "import-utility", "identity", "chain", "get-acl", "signature", "emit"],
+            names,
+        )
+        # Diagnostic only: a marker statement writes to stderr and does nothing else, so the stdout
+        # JSON (the only thing the verdict reads) still comes from the one trailing pipeline.
+        for line in _WINDOWS_CURL_TRUST_SCRIPT.splitlines():
+            if "Console]::Error" in line:
+                self.assertRegex(line.strip(), r"^\[Console\]::Error\.WriteLine\('stage [a-z-]+'( \+ ' ' \+ \$pathItem\.FullName)?\)$")
 
 
 if __name__ == "__main__":
