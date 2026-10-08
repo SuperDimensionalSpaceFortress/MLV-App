@@ -5949,6 +5949,7 @@ function Stop-AttrCudaDisplayWakeKeepAlive {
     $lastError = $null
     $lastFailureUtc = $null
     $setupError = $null
+    $pipelineStillRunning = $false
     if ($Handle) {
         $setupError = $Handle.setupError
         if ($Handle.nudgeState) {
@@ -5969,22 +5970,32 @@ function Stop-AttrCudaDisplayWakeKeepAlive {
                 if ($Handle.asyncResult.AsyncWaitHandle.WaitOne([int]$TimeoutMilliseconds)) {
                     [void]$Handle.powershell.EndInvoke($Handle.asyncResult)
                 } else {
+                    $pipelineStillRunning = $true
                     $stopError = "ATTRCUDA_KEEPALIVE_STOP_TIMEOUT background pipeline did not complete within ${TimeoutMilliseconds}ms of the stop request"
                 }
             }
         } catch {
             $stopError = $_.Exception.Message
         }
-        try { if ($Handle.powershell) { $Handle.powershell.Dispose() } } catch {
-        }
-        try { if ($Handle.stopEvent) { $Handle.stopEvent.Dispose() } } catch {
-        }
-        try {
-            if ($Handle.runspace) {
-                $Handle.runspace.Close()
-                $Handle.runspace.Dispose()
+        # CI-FLAKE-KEEPALIVE-HUNG-PROBE-SLEEP-1: PowerShell.Dispose()/Runspace.Close() on a pipeline
+        # that is STILL RUNNING block until it stops -- i.e. until the stuck tick's bounded probe
+        # returns -- so after the timed-out wait above this call used to take ~ the probe bound
+        # (measured 12000ms for -ProbeTimeoutMilliseconds 12000, -TimeoutMilliseconds 300), making
+        # -TimeoutMilliseconds a lie. Same leak-on-purpose choice Invoke-AttrCudaBoundedProbe makes
+        # for the same reason: a still-running pipeline (and the stop event it is still waiting on,
+        # already Set above) is abandoned rather than torn down.
+        if (-not $pipelineStillRunning) {
+            try { if ($Handle.powershell) { $Handle.powershell.Dispose() } } catch {
             }
-        } catch {
+            try { if ($Handle.stopEvent) { $Handle.stopEvent.Dispose() } } catch {
+            }
+            try {
+                if ($Handle.runspace) {
+                    $Handle.runspace.Close()
+                    $Handle.runspace.Dispose()
+                }
+            } catch {
+            }
         }
     }
     [ordered]@{
