@@ -44,6 +44,8 @@ param(
 )
 
 $ErrorActionPreference = "Stop"
+# -File passes ONE string per argument, so the evidence job sends the status lines newline-joined; split them back.
+$EvidenceGitStatus = @($EvidenceGitStatus | ForEach-Object { ([string]$_) -split "`r?`n" } | Where-Object { $_ })
 
 # Build tool fallback order:
 #   1. explicit -QtBin / -MingwBin
