@@ -7888,6 +7888,9 @@ _CLAIM_CARRIERS_PINNED = (
     "tools/profiling/bachelor/playback-attr-3-cuda-job.ps1",
     "tools/profiling/dual-venue/DualVenueRunner.psm1",
     "tools/profiling/dual-venue/Invoke-VenueLeg.ps1",
+    # LOOK-ASSIST-CINEMATIC-BENCH-PAIR-1: the Classic | Cinematic pair driver refuses a non-consented clip id exactly as
+    # New-VenueSheetPair.ps1 does.  Read: it asserts no exclusivity claim (the needle below runs clean over it).
+    "tools/profiling/dual-venue/New-VenueFlavorPair.ps1",
     "tools/profiling/dual-venue/New-VenueSheetPair.ps1",
     "tools/profiling/dual-venue/leg-spec.schema.json",
     "tools/repo_hygiene/test_attr3_footage_presence_job.py",

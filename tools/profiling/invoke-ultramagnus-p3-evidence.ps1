@@ -705,7 +705,7 @@ try {
         '-EvidenceBranch',
         `$evidenceBranch,
         '-EvidenceGitStatus',
-        `$evidenceGitStatus,
+        (@(`$evidenceGitStatus) -join [string][char]10),
         '-Seconds',
         '$( [string]$Seconds )',
         '-SettleMs',

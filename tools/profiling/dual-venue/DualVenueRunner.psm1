@@ -320,9 +320,10 @@ function Find-DvCommittedLegSpec {
     if ($Commit -cnotmatch '^[0-9a-f]{40}$' -or $LegSpecSha256 -cnotmatch '^[0-9a-f]{64}$') { return $none }
     if ((Invoke-DvGit -RepoRoot $RepoRoot -GitArgs @('cat-file', '-t', $Commit)).exitCode -ne 0) { return $none }
     # `ls-tree -r` names every blob of the directory with its object id: one git call for the listing instead of three per file.
-    $tree = Invoke-DvGit -RepoRoot $RepoRoot -GitArgs @('ls-tree', '-r', $Commit, '--', $script:LegsRelativeDir)
+    # `-z` ends each record with NUL and leaves the path unquoted: without it core.quotepath (default true) prints a non-ASCII name as "caf\303\251.json", which fails the EndsWith('.json') test below.
+    $tree = Invoke-DvGit -RepoRoot $RepoRoot -GitArgs @('ls-tree', '-r', '-z', $Commit, '--', $script:LegsRelativeDir)
     if ($tree.exitCode -ne 0) { return $none }
-    foreach ($row in ([Text.Encoding]::UTF8.GetString($tree.bytes) -split "`n" | Where-Object { $_.Trim() -ne '' })) {
+    foreach ($row in ([Text.Encoding]::UTF8.GetString($tree.bytes) -split "`0" | Where-Object { $_.Trim() -ne '' })) {
         # <mode> SP <type> SP <object> TAB <path>
         if ($row -cnotmatch '^[0-7]{6} blob (?<id>[0-9a-f]{40})\t(?<path>.+)$') { continue }
         $id = $Matches['id']; $path = $Matches['path'].Trim()

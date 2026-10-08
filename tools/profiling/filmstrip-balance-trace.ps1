@@ -10,6 +10,8 @@ param(
 )
 $ErrorActionPreference = 'Stop'
 Add-Type -AssemblyName System.Drawing
+# -File hands '-Dirs a,b' over as ONE string; split it unless the whole value is itself a real directory.
+$Dirs = @($Dirs | ForEach-Object { if (Test-Path -LiteralPath $_) { $_ } else { $_ -split ',' } } | ForEach-Object { $_.Trim() } | Where-Object { $_ })
 
 function Get-FrameBalance([string]$path, [int]$top, [int]$left, [int]$stride) {
     $bmp = [System.Drawing.Bitmap]::FromFile($path)
