@@ -24,8 +24,9 @@
 # One pair per OutDir, append-only: an OutDir already holding a flavor-pair-*.json record (PAIR_RECORD_EXISTS) or a sheet / metrics / table
 # (PAIR_OUTPUT_EXISTS) is refused with exit code 16 before anything is staged or composed; every other refusal stays a thrown error (exit 1).
 # STAGING lives OUTSIDE OutDir, in a sibling .pair-staging-<guid> directory (still under .claude-state: it holds owner footage), so a refused attempt
-# really does write nothing into OutDir. It is removed once the record is written and after a refusal that wrote nothing; a FLAVOR_INERT refusal keeps
-# it, because its message names the slider files in it.
+# really does write nothing into OutDir. It is never deleted by this script (no delete primitive is allowed on the owner-leg route beyond the one marker
+# line): each attempt leaves its own fresh-GUID directory beside OutDir, inert, for the run's owner to retire; a FLAVOR_INERT refusal's message names the
+# slider files in it.
 # ATTEMPT MARKER: look-flavor-diff.py creates OutDir\.pair-in-progress.json before its first output and (--keep-marker) leaves it until this script has
 # written the record. An attempt that dies in between leaves a marker, and a retry into that directory exits 17 (PAIR_INCOMPLETE_ATTEMPT) with the
 # diagnosis instead of the silent PAIR_OUTPUT_EXISTS block. -RecoverIncomplete moves the dead attempt's marker and unrecorded outputs into
@@ -161,12 +162,6 @@ if ($evidenceDirs['classic'] -ceq $evidenceDirs['cinematic']) { throw 'PAIR_SHAR
 $utf8 = [Text.UTF8Encoding]::new($false)
 # Stage exactly the bytes that were hashed, one fresh directory per pair, OUTSIDE OutDir; the listings sit beside the staging directories, never inside them.
 $stageRoot = Join-Path $stageParent ('.pair-staging-' + [guid]::NewGuid().ToString('N'))
-function Remove-StageRoot {
-    # Only the directory this run created (the guarded name), and only its own tree.
-    if ((Split-Path -Leaf $stageRoot) -cmatch '^\.pair-staging-[0-9a-f]{32}$' -and (Test-Path -LiteralPath $stageRoot -PathType Container)) {
-        Remove-Item -LiteralPath $stageRoot -Recurse -Force
-    }
-}
 $stageDirs = @{}; $stageListings = @{}; $sliderFiles = @{}
 foreach ($label in $sides.Keys) {
     $dir = Join-Path $stageRoot $label
@@ -195,16 +190,14 @@ $pyArgs = @('-3', $composer,
 if ($RecoverIncomplete) { $pyArgs += '--recover-incomplete' }
 & py @pyArgs
 $code = $LASTEXITCODE
-# 10 keeps the staging directory (its message names the slider files). Every other refusal (11-17) is raised by the composer before it writes anything,
-# so the staging is removed; an exit it does not define (a crash) keeps both the staging and whatever marker the composer left.
+# The staging directory is never deleted here: it stays beside OutDir after every outcome (10 names its slider files in the message). Refusals 11-17 are
+# raised by the composer before it writes anything into OutDir; an exit it does not define (a crash) also keeps whatever marker the composer left.
 if ($code -eq 10) { throw "PAIR_FLAVOR_INERT look-flavor-diff.py refused (FLAVOR_INERT): the cinematic flavor was not honoured; sliders in $($sliderFiles['cinematic']) and $($sliderFiles['classic'])" }
 if ($code -eq 16 -or $code -eq 17) {
-    Remove-StageRoot
     $what = $(if ($code -eq 17) { 'PAIR_INCOMPLETE_ATTEMPT look-flavor-diff.py refused (an unfinished attempt owns this -OutDir)' } else { 'PAIR_OUTPUT_EXISTS look-flavor-diff.py refused (another composer or an earlier pair owns this -OutDir)' })
     [Console]::Error.WriteLine("$what; nothing of this attempt was written there")
     exit $code
 }
-if ($code -ge 11 -and $code -le 15) { Remove-StageRoot }
 if ($code -ne 0) { throw "PAIR_COMPOSE_FAILED look-flavor-diff.py exited $code" }
 
 $metricsPath = Join-Path $OutDir 'metrics.json'
@@ -241,6 +234,5 @@ $stream = [IO.File]::Open($recordPath, [IO.FileMode]::CreateNew, [IO.FileAccess]
 try { $bytes = $utf8.GetBytes(($record | ConvertTo-Json -Depth 6) + "`n"); $stream.Write($bytes, 0, $bytes.Length) } finally { $stream.Dispose() }
 # The record is written: the attempt is complete. (A crash before this line leaves the marker, and the staging, in place.)
 Remove-Item -LiteralPath (Join-Path $OutDir $markerName) -Force
-Remove-StageRoot
 Write-Output "DVE_FLAVOR_PAIR=$sheet"
 Write-Output "DVE_FLAVOR_PAIR_RECORD=$recordPath"

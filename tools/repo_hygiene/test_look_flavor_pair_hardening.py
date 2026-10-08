@@ -226,6 +226,10 @@ class DriverStagingAndMarkerTests(unittest.TestCase):
     def names(self, root: Path) -> list:
         return sorted(p.name for p in root.iterdir())
 
+    def staging_dirs(self) -> list:
+        """The .pair-staging-<guid> directories beside the out dir. The driver never deletes them (the owner-footage route guards allow no recursive delete)."""
+        return [p for p in self.parent.iterdir() if p.name.startswith(".pair-staging-") and p.is_dir()]
+
     def test_a_composer_refusal_exit_16_leaves_nothing_of_the_attempt_in_the_out_dir_or_beside_it(self) -> None:
         # row-00.png is not in the driver's own up-front list (sheet / metrics / table / record), so this attempt reaches the composer and is refused THERE.
         self.out.mkdir(parents=True)
@@ -234,7 +238,8 @@ class DriverStagingAndMarkerTests(unittest.TestCase):
         self.assertEqual(proc.returncode, 16, proc.stdout + proc.stderr)
         self.assertIn("nothing of this attempt was written there", proc.stdout + proc.stderr)
         self.assertEqual(self.names(self.out), ["row-00.png"], "the claim is true: no staging directory, no marker, nothing")
-        self.assertEqual(self.names(self.parent), ["pair"], "and no staging directory was left beside it either")
+        self.assertEqual(self.names(self.parent), sorted(["pair"] + [p.name for p in self.staging_dirs()]), "beside it there is only the out dir and the inert staging directories")
+        self.assertEqual(len(self.staging_dirs()), 1, "the attempt's own staging directory is kept, not deleted (and it is not inside the out dir)")
 
     def test_a_finished_pair_leaves_the_record_and_composer_outputs_only(self) -> None:
         proc = self.pair()
@@ -244,7 +249,8 @@ class DriverStagingAndMarkerTests(unittest.TestCase):
         self.assertIn("sheet-classic-vs-cinematic.png", names)
         self.assertNotIn(".pair-staging", names, "staging is not part of the pair's evidence directory")
         self.assertNotIn(MARKER, names, "the record is written, so the attempt is complete")
-        self.assertEqual(self.names(self.parent), ["pair"], "the staging directory is removed once the record is written")
+        self.assertEqual(len(self.staging_dirs()), 1, "the staging directory sits beside the out dir and is not deleted (the route guards allow no recursive delete)")
+        self.assertEqual(self.names(self.parent), sorted(["pair", self.staging_dirs()[0].name]), "nothing else is beside the out dir")
 
     def test_an_inert_refusal_keeps_its_slider_files_outside_the_out_dir_and_the_message_names_them(self) -> None:
         self.cinematic = self.receipt("cinematic", base.CLASSIC, 20, tag="-inert")   # the flavor-owned sliders are identical: FLAVOR_INERT (exit 10)
