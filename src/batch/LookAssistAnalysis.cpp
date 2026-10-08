@@ -1608,6 +1608,7 @@ LookAssistFlavorDeltas lookAssistCinematicDeltasForScene( LookAssistScene scene 
 
 QString lookAssistFlavorName( LookAssistFlavor flavor )
 {
+    if( flavor == LookAssistFlavor::Film ) return QStringLiteral("film");
     return flavor == LookAssistFlavor::Cinematic ? QStringLiteral("cinematic") : QStringLiteral("classic");
 }
 
@@ -1636,6 +1637,8 @@ LookAssistFlavorSelection lookAssistSelectFlavor( const QString &environmentValu
             selection.flavor = LookAssistFlavor::Classic;
         else if( value == QLatin1String( "cinematic" ) )
             selection.flavor = LookAssistFlavor::Cinematic;
+        else if( value == QLatin1String( "film" ) )
+            selection.flavor = LookAssistFlavor::Film;
         else
         {
             selection.flavor = LookAssistFlavor::Classic;
@@ -1658,10 +1661,11 @@ QString lookAssistSelectorValueForReceipt( const QString &receiptValue, LookAssi
 
 void lookAssistApplyFlavorDeltas( LookAssistPreset *preset, LookAssistScene scene, LookAssistFlavor flavor )
 {
-    if( !preset || flavor != LookAssistFlavor::Cinematic ) return;
+    if( !preset || flavor == LookAssistFlavor::Classic ) return;
     // Exposure is deliberately absent: the white-balance refinement renders the picture at the preset's exposure,
     // and the scene limits (Night >= 0, BrightSun <= 0) are Classic's own, already applied. Re-clamping here once
     // turned a BrightSun exposure of 114 into 0.
+    // Film's tone is Cinematic's: the same table, reused (its grade is the gradation curve, not a slider).
     const LookAssistFlavorDeltas d = lookAssistCinematicDeltasForScene( scene );
     preset->contrast += d.contrast;
     preset->pivot += d.pivot;
@@ -1673,6 +1677,108 @@ void lookAssistApplyFlavorDeltas( LookAssistPreset *preset, LookAssistScene scen
     preset->shadows = qBound( -100, preset->shadows, 100 );
     preset->highlights = qBound( -100, preset->highlights, 100 );
     preset->vibrance = qBound( -100, preset->vibrance, 100 );
+}
+
+// The Film grade: the ONE strength table, one row per scene in LookAssistScene order (docs/look-assist-flavors.md,
+// between the film-table markers). Night is the lightest (the picture is rescued from the dark and a strong split there
+// reads as a tint); Shade, which has the most neutral daylight to grade against, is the full grade.
+static const double kFilmGradeStrength[] =
+{
+    0.5,    // Night
+    0.75,   // ArtificialLights
+    1.0,    // Shade
+    0.9,    // BrightSun
+};
+static const double kFilmShadowOffsetAtFullStrength = 0.022;      // a / s, at x = 0.18
+static const double kFilmHighlightOffsetAtFullStrength = 0.030;   // b / s, at x = 0.72
+
+LookAssistFilmGrade lookAssistFilmGradeForScene( LookAssistScene scene )
+{
+    LookAssistFilmGrade grade;
+    const int index = static_cast<int>( scene );
+    if( index < 0 || index >= static_cast<int>( sizeof( kFilmGradeStrength ) / sizeof( kFilmGradeStrength[0] ) ) )
+        return grade;
+    grade.strength = kFilmGradeStrength[index];
+    grade.shadowOffset = kFilmShadowOffsetAtFullStrength * grade.strength;
+    grade.highlightOffset = kFilmHighlightOffsetAtFullStrength * grade.strength;
+    return grade;
+}
+
+QString lookAssistFilmGradeId()
+{
+    return QStringLiteral("film-v1");
+}
+
+namespace
+{
+// One curve line as Curves::configuration writes it: "x;y;" per point, each number via QString("%1").arg(double).
+QString filmCurveLine( const double *xs, const double *ys, int count )
+{
+    QString line;
+    for( int i = 0; i < count; ++i )
+        line.append( QString( "%1;%2;" ).arg( xs[i] ).arg( ys[i] ) );
+    return line;
+}
+} // namespace
+
+QString lookAssistFilmGradationCurve( LookAssistScene scene )
+{
+    const LookAssistFilmGrade g = lookAssistFilmGradeForScene( scene );
+    const double identityX[] = { 1e-5, 1.0 };
+    const double knotX[] = { 1e-5, 0.18, 0.45, 0.72, 1.0 };
+    const double redY[] = { 1e-5, 0.18 - g.shadowOffset, 0.45, 0.72 + g.highlightOffset, 1.0 };
+    const double blueY[] = { 1e-5, 0.18 + g.shadowOffset, 0.45, 0.72 - g.highlightOffset, 1.0 };
+    const QString identity = filmCurveLine( identityX, identityX, 2 );
+    return identity + QStringLiteral("?") + filmCurveLine( knotX, redY, 5 ) + QStringLiteral("?")
+         + identity + QStringLiteral("?") + filmCurveLine( knotX, blueY, 5 );
+}
+
+int lookAssistParseGradationCurve( const QString &curve, std::vector<LookAssistGradationPoint> lines[4] )
+{
+    // The same walk as Curves::setConfiguration: a line ends at '?', a value at ';', numbers by toFloat.
+    QString config = curve;
+    int read = 0;
+    for( int i = 0; i < 4; ++i )
+    {
+        lines[i].clear();
+        if( config.size() <= 0 ) break;
+        while( config.size() > 0 && !config.startsWith( QLatin1Char('?') ) )
+        {
+            const int xEnd = config.indexOf( QLatin1Char(';') );
+            if( xEnd < 0 ) { config.clear(); break; }   // malformed tail: the widget would spin on it
+            LookAssistGradationPoint point;
+            point.x = config.left( xEnd ).toFloat();
+            config.remove( 0, xEnd + 1 );
+            const int yEnd = config.indexOf( QLatin1Char(';') );
+            if( yEnd < 0 ) { config.clear(); break; }
+            point.y = config.left( yEnd ).toFloat();
+            config.remove( 0, yEnd + 1 );
+            lines[i].push_back( point );
+        }
+        config.remove( 0, 1 );   // the '?'
+        ++read;
+    }
+    return read;
+}
+
+bool lookAssistIsDefaultGradationCurve( const QString &curve )
+{
+    if( curve.trimmed().isEmpty() ) return true;
+    std::vector<LookAssistGradationPoint> lines[4];
+    if( lookAssistParseGradationCurve( curve, lines ) != 4 ) return false;
+    for( const std::vector<LookAssistGradationPoint> &line : lines )
+    {
+        if( line.size() != 2 ) return false;
+        if( fabs( line[0].x - 1e-5 ) > 1e-6 || fabs( line[0].y - 1e-5 ) > 1e-6 ) return false;
+        if( fabs( line[1].x - 1.0 ) > 1e-6 || fabs( line[1].y - 1.0 ) > 1e-6 ) return false;
+    }
+    return true;
+}
+
+QString lookAssistFilmGradeDecision( LookAssistFlavor flavor, const QString &currentCurve )
+{
+    if( flavor != LookAssistFlavor::Film ) return QStringLiteral("none");
+    return lookAssistIsDefaultGradationCurve( currentCurve ) ? lookAssistFilmGradeId() : QStringLiteral("skipped_user_curve");
 }
 
 LookAssistPreset presetForLookAssistScene( LookAssistScene scene,

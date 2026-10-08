@@ -579,20 +579,24 @@ LookAssistWindowLitCheck resolveLookAssistWindowLitInterior( const LookAssistWhi
 
 int lookAssistDisplayTargetMedianForScene( LookAssistScene scene );
 
-/* ---- Flavors: Classic | Cinematic. ----
+/* ---- Flavors: Classic | Cinematic | Film grade. ----
  * Classic is master's Look Assist, untouched: presetForLookAssistScene returns before any flavor code, so
  * every sliders / receipt / picture it produced stays byte-identical. Cinematic is the same analysis, the
  * same scene verdict and the same white-balance decision, with ONE table of additive deltas
  * (kCinematicFlavorDeltas, LookAssistAnalysis.cpp) laid over the same preset sliders -- contrast, pivot,
  * shadows, highlights, vibrance. It never touches exposure (Classic's, exactly) or temperatureDelta / tintDelta. Saturation and the
- * tone curve are not Look Assist sliders (no preset field, no baseline), so they are not used. */
+ * tone curve are not Look Assist sliders (no preset field, no baseline), so they are not used.
+ * Film is Cinematic's tone (the same table) plus a colour grade: a blue-amber split in the receipt's R and B gradation
+ * curves (lookAssistFilmGradationCurve), which every route already applies. The preset is Cinematic's; the curve is
+ * laid by the consumers (GUI, headless) and only over a default curve. */
 enum class LookAssistFlavor
 {
     Classic,
-    Cinematic
+    Cinematic,
+    Film
 };
 
-/* "classic" / "cinematic": the one spelling used in the environment, the receipt element, the app setting
+/* "classic" / "cinematic" / "film": the one spelling used in the environment, the receipt element, the app setting
  * and every log line. */
 QString lookAssistFlavorName( LookAssistFlavor flavor );
 
@@ -609,7 +613,7 @@ struct LookAssistFlavorSelection
 
 /* Pure. Layers in priority order: the environment value (MLVAPP_LOOK_ASSIST_FLAVOR, for runs) wins over the
  * receipt's lookAssistFlavor element, which wins over the GUI's app setting; an empty layer is skipped. The
- * first non-empty layer decides, case-insensitively and trimmed; if it is not "classic" or "cinematic" the
+ * first non-empty layer decides, case-insensitively and trimmed; if it is not "classic", "cinematic" or "film" the
  * answer is Classic with unknownValue set -- never a silent fall through to a lower layer. */
 LookAssistFlavorSelection lookAssistSelectFlavor( const QString &environmentValue,
                                                   const QString &receiptValue,
@@ -634,8 +638,49 @@ LookAssistFlavorDeltas lookAssistCinematicDeltasForScene( LookAssistScene scene 
  * highlights, vibrance) move by the table and are clamped to their ranges. Exposure and the white-balance deltas
  * are NEVER touched, and Classic is a no-op. presetForLookAssistScene ends in this very function, so a caller that
  * must measure pictures on the Classic preset first (the GUI's white-balance walk renders the picture, so the walk
- * must not see the grade) and lay the flavor over afterwards gets exactly the preset the one call would have made. */
+ * must not see the grade) and lay the flavor over afterwards gets exactly the preset the one call would have made.
+ * Film lays Cinematic's table (its tone IS Cinematic's); its colour grade is the gradation curve below. */
 void lookAssistApplyFlavorDeltas( LookAssistPreset *preset, LookAssistScene scene, LookAssistFlavor flavor );
+
+/* ---- The Film grade: a blue-amber split in the R and B gradation curves (docs/look-assist-flavors.md). ----
+ * Per scene strength s (kFilmGradeStrength, the ONE table), a = shadowOffset = 0.022 s, b = highlightOffset = 0.030 s:
+ *   R: (1e-5,1e-5) (0.18, 0.18 - a) (0.45, 0.45) (0.72, 0.72 + b) (1,1)
+ *   B: (1e-5,1e-5) (0.18, 0.18 + a) (0.45, 0.45) (0.72, 0.72 - b) (1,1)
+ *   Y, G: the default two points.
+ * R and B move by equal and opposite amounts at every knot and the engine's spline is linear in y, so R + B == 2 G and
+ * the green-magenta axis is untouched. */
+struct LookAssistFilmGrade
+{
+    double strength = 0.0;          // s
+    double shadowOffset = 0.0;      // a: R down / B up at 0.18
+    double highlightOffset = 0.0;   // b: R up / B down at 0.72
+};
+LookAssistFilmGrade lookAssistFilmGradeForScene( LookAssistScene scene );
+
+/* The grade's id, reported as grade=... and as the venue's presetGrade. */
+QString lookAssistFilmGradeId();
+
+/* The receipt's gradationCurve string for the scene, in Curves::configuration's format (four lines Y?R?G?B, each
+ * "x;y;x;y;...", every number as QString("%1").arg(double) writes it), so a widget round trip is byte-stable. */
+QString lookAssistFilmGradationCurve( LookAssistScene scene );
+
+/* One gradation-curve string parsed the way Curves::setConfiguration parses it: up to four lines (Y, R, G, B) split on
+ * '?', each a list of x;y pairs split on ';', every number read by QString::toFloat. Returns the number of lines read. */
+struct LookAssistGradationPoint
+{
+    float x = 0.0f;
+    float y = 0.0f;
+};
+int lookAssistParseGradationCurve( const QString &curve, std::vector<LookAssistGradationPoint> lines[4] );
+
+/* True for the default curve (ReceiptSettings' default, or the widget's rewrite of it): four lines, each exactly the
+ * two identity points (1e-5,1e-5) (1,1) within 1e-6. An empty string counts as default. The Film grade is laid only
+ * over a default curve; a user's curve is never overwritten. */
+bool lookAssistIsDefaultGradationCurve( const QString &curve );
+
+/* The Film grade decision for one apply, as reported in grade=...: "film-v1" (the curve is laid), "skipped_user_curve"
+ * (Film, but the receipt holds a user curve) or "none" (not Film). */
+QString lookAssistFilmGradeDecision( LookAssistFlavor flavor, const QString &currentCurve );
 
 /* A receipt's lookAssistFlavor element as the value the GUI's selector takes: "classic" or "cinematic" (trimmed,
  * case-insensitive), or "" when the receipt declares nothing (the selector is then left alone). An unknown value is

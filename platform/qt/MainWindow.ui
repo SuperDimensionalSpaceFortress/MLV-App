@@ -2830,6 +2830,11 @@ QGroupBox::indicator:checked:disabled {
                        <string>Cinematic</string>
                       </property>
                      </item>
+                     <item>
+                      <property name="text">
+                       <string>Film grade</string>
+                      </property>
+                     </item>
                     </widget>
                    </item>
                   </layout>

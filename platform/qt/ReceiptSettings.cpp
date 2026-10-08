@@ -126,6 +126,7 @@ ReceiptSettings::ReceiptSettings()
     m_lookAssistBaselineChromaSmooth = 0;
     m_lookAssistBaselineStretchX = 1.0;
     m_lookAssistBaselineStretchY = 1.0;
+    m_lookAssistBaselineGradationCurve = QString( "" );
     m_tone = 0;
     m_toningStrength = 0;
     m_cutIn = 1;
