@@ -55,6 +55,51 @@ typedef int (*pfn_run_post_wb_gl_texture)(igpu_amaze_debayer_backend *,
                                           double);
 typedef int (*pfn_last_timing)(igpu_amaze_debayer_backend *,
                                igpu_amaze_debayer_timing_t *);
+typedef int (*pfn_set_reduced_hnyquist)(igpu_amaze_debayer_backend *, int);
+
+/* PLAYBACK-CUDA-HONOUR-SCALE-1 r3 c1: a verbatim copy of
+ * debayer_reduced_hnyquist121_rgb16 (src/debayer/debayer.c), which this MSVC
+ * harness cannot link. --dump-dir writes both DLL outputs so the opt-in pipeline
+ * test GpuDualIsoPreviewScale.C1HnyquistDllParity re-checks them against the real
+ * C function. */
+static void hnyquist121_reference(uint16_t * out, const uint16_t * in, int w, int h)
+{
+    for (int y = 0; y < h; ++y)
+    {
+        const uint16_t * src = in + (size_t)y * (size_t)w * 3u;
+        uint16_t * dst = out + (size_t)y * (size_t)w * 3u;
+        for (int x = 0; x < w; ++x)
+        {
+            const int xl = (x > 0) ? x - 1 : ((w > 1) ? x + 1 : x);
+            const int xr = (x < w - 1) ? x + 1 : ((w > 1) ? x - 1 : x);
+            for (int c = 0; c < 3; ++c)
+            {
+                const uint32_t l = src[(size_t)xl * 3u + (size_t)c];
+                const uint32_t m = src[(size_t)x * 3u + (size_t)c];
+                const uint32_t r = src[(size_t)xr * 3u + (size_t)c];
+                dst[(size_t)x * 3u + (size_t)c] = (uint16_t)((l + 2u * m + r + 2u) >> 2);
+            }
+        }
+    }
+}
+
+static bool write_file(const std::string & path, const void * data, size_t bytes)
+{
+    FILE * f = std::fopen(path.c_str(), "wb");
+    if (!f) return false;
+    const bool ok = std::fwrite(data, 1, bytes, f) == bytes;
+    std::fclose(f);
+    return ok;
+}
+
+static bool read_u16_file(const std::string & path, std::vector<uint16_t> * out)
+{
+    FILE * f = std::fopen(path.c_str(), "rb");
+    if (!f) return false;
+    const size_t got = std::fread(out->data(), sizeof(uint16_t), out->size(), f);
+    std::fclose(f);
+    return got == out->size();
+}
 
 struct HiddenGlContext
 {
@@ -312,12 +357,36 @@ int main(int argc, char ** argv)
     bool runGlTexture = false;
     int width = 192;
     int height = 160;
+    /* r3 c1: --reduced-hnyquist runs run() with the flag at 0 and at 1 and requires
+     * flag 1 == hnyquist121_reference(flag 0) at 0 LSB. --input-u16 FILE (with
+     * --size) feeds a Bayer16 vector as float(max(0, v - black)); --dump-dir DIR
+     * writes flag0.rgb16 (and flag1.rgb16 when the DLL has the symbol). */
+    bool reducedHnyquist = false;
+    std::string inputU16Path;
+    std::string dumpDir;
+    int inputBlack = 0;
 
     for (int i = 1; i < argc; ++i)
     {
         if (std::strcmp(argv[i], "--gl-texture") == 0)
         {
             runGlTexture = true;
+        }
+        else if (std::strcmp(argv[i], "--reduced-hnyquist") == 0)
+        {
+            reducedHnyquist = true;
+        }
+        else if (std::strcmp(argv[i], "--input-u16") == 0 && i + 1 < argc)
+        {
+            inputU16Path = argv[++i];
+        }
+        else if (std::strcmp(argv[i], "--black") == 0 && i + 1 < argc)
+        {
+            inputBlack = std::atoi(argv[++i]);
+        }
+        else if (std::strcmp(argv[i], "--dump-dir") == 0 && i + 1 < argc)
+        {
+            dumpDir = argv[++i];
         }
         else if (std::strcmp(argv[i], "--size") == 0 && i + 2 < argc)
         {
@@ -388,6 +457,97 @@ int main(int argc, char ** argv)
 
     std::vector<float> raw = make_raw_frame(width, height);
     const size_t pixelCount = (size_t)width * (size_t)height;
+    if (!inputU16Path.empty())
+    {
+        std::vector<uint16_t> bayer(pixelCount, 0u);
+        if (!read_u16_file(inputU16Path, &bayer))
+        {
+            std::fprintf(stderr, "[amaze_dll_test] cannot read %zu words from %s\n",
+                         pixelCount, inputU16Path.c_str());
+            return 2;
+        }
+        for (size_t i = 0; i < pixelCount; ++i)
+        {
+            const int v = (int)bayer[i] - inputBlack;
+            raw[i] = (float)(v > 0 ? v : 0);
+        }
+        std::printf("[amaze_dll_test] input u16  : %s black=%d\n", inputU16Path.c_str(), inputBlack);
+    }
+    if (reducedHnyquist)
+    {
+        pfn_set_reduced_hnyquist f_set = (pfn_set_reduced_hnyquist)
+            GetProcAddress(dll, "igpu_amaze_debayer_set_reduced_hnyquist");
+        std::vector<uint16_t> flag0(pixelCount * 3u, 0u);
+        std::vector<uint16_t> flag1(pixelCount * 3u, 0u);
+        if (f_set && f_set(backend, 0) != 0)
+        {
+            std::fprintf(stderr, "[amaze_dll_test] set_reduced_hnyquist(0) failed\n");
+            return 4;
+        }
+        if (f_run(backend, raw.data(), flag0.data(), width, height) != 0)
+        {
+            std::fprintf(stderr, "[amaze_dll_test] run(flag 0) failed\n");
+            return 4;
+        }
+        std::printf("[amaze_dll_test] flag0 RGB16 FNV1A64 = %016llx\n",
+                    (unsigned long long)fnv1a64(flag0.data(), flag0.size() * sizeof(uint16_t)));
+        if (!dumpDir.empty()
+            && !write_file(dumpDir + "\\flag0.rgb16", flag0.data(), flag0.size() * sizeof(uint16_t)))
+        {
+            std::fprintf(stderr, "[amaze_dll_test] dump flag0 failed\n");
+            return 4;
+        }
+        if (!f_set)
+        {
+            std::printf("[amaze_dll_test] DLL lacks igpu_amaze_debayer_set_reduced_hnyquist (flag-0 output only)\n");
+            std::printf("\n[amaze_dll_test] RESULT: PASS (flag 0 only)\n");
+            f_destroy(backend);
+            FreeLibrary(dll);
+            return 0;
+        }
+        if (f_set(backend, 2) != -1 || f_set(NULL, 1) != -1)
+        {
+            std::fprintf(stderr, "[amaze_dll_test] set_reduced_hnyquist accepted an invalid call\n");
+            return 4;
+        }
+        if (f_set(backend, 1) != 0
+            || f_run(backend, raw.data(), flag1.data(), width, height) != 0)
+        {
+            std::fprintf(stderr, "[amaze_dll_test] run(flag 1) failed\n");
+            return 4;
+        }
+        std::vector<uint16_t> reference(pixelCount * 3u, 0u);
+        hnyquist121_reference(reference.data(), flag0.data(), width, height);
+        long long maxAbs = 0;
+        size_t mismatches = 0;
+        for (size_t i = 0; i < reference.size(); ++i)
+        {
+            const long long d = (long long)flag1[i] - (long long)reference[i];
+            const long long a = d < 0 ? -d : d;
+            if (a > maxAbs) maxAbs = a;
+            if (a) ++mismatches;
+        }
+        /* The flag is sticky: back at 0 the output is flag 0's again. */
+        std::vector<uint16_t> again(pixelCount * 3u, 0u);
+        const bool againOk = f_set(backend, 0) == 0
+            && f_run(backend, raw.data(), again.data(), width, height) == 0
+            && again == flag0;
+        std::printf("[amaze_dll_test] flag1 RGB16 FNV1A64 = %016llx\n",
+                    (unsigned long long)fnv1a64(flag1.data(), flag1.size() * sizeof(uint16_t)));
+        std::printf("[amaze_dll_test] reduced H-Nyquist flag1 vs C ref(flag0): max abs diff = %lld LSB, mismatches = %zu / %zu; flag0 again identical=%d\n",
+                    maxAbs, mismatches, reference.size(), againOk ? 1 : 0);
+        if (!dumpDir.empty()
+            && !write_file(dumpDir + "\\flag1.rgb16", flag1.data(), flag1.size() * sizeof(uint16_t)))
+        {
+            std::fprintf(stderr, "[amaze_dll_test] dump flag1 failed\n");
+            return 4;
+        }
+        const bool hnyquistPass = maxAbs == 0 && mismatches == 0 && againOk;
+        std::printf("\n[amaze_dll_test] RESULT: %s (reduced H-Nyquist)\n", hnyquistPass ? "PASS" : "FAIL");
+        f_destroy(backend);
+        FreeLibrary(dll);
+        return hnyquistPass ? 0 : 1;
+    }
     std::vector<uint16_t> hostRgb(pixelCount * 3u, 0u);
     int rc = f_run(backend, raw.data(), hostRgb.data(), width, height);
     if (rc != 0)

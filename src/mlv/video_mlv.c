@@ -8190,9 +8190,27 @@ uint64_t mlvReducedReconProcessedFrameSignature(uint64_t fullReconSignature, int
     return sig ? sig : 1u;
 }
 
-int mlvDualIsoPreviewScaleReconPlan(mlvObject_t * video,
-                                    int requestedScale,
-                                    mlvDualIsoPreviewScaleRecon_t * plan)
+static int mlv_gpu_playback_recon_requested_via_env(void)
+{
+    const char * gpu = getenv("MLVAPP_GPU_PLAYBACK_RECON");
+    return (gpu && *gpu && strcmp(gpu, "0") != 0 && strcmp(gpu, "false") != 0) ? 1 : 0;
+}
+
+static int mlv_dualiso_gpu_preview_scale_recon_disabled_via_env(void)
+{
+    const char * v = getenv("MLVAPP_DISABLE_GPU_DUALISO_PREVIEW_SCALE_RECON");
+    return (v && *v && strcmp(v, "0") != 0 && strcmp(v, "false") != 0) ? 1 : 0;
+}
+
+/* gpu: plan for the CUDA texture route (PLAYBACK-CUDA-HONOUR-SCALE-1) instead
+ * of the CPU recon. sessionLatched: the caller decided this scale at the start
+ * of the play session, so a state that only gates the DECISION (the exposure
+ * match settling) no longer flips the frame size mid-session. */
+static int mlv_dualiso_preview_scale_recon_plan_internal(mlvObject_t * video,
+                                                         int requestedScale,
+                                                         int gpu,
+                                                         int sessionLatched,
+                                                         mlvDualIsoPreviewScaleRecon_t * plan)
 {
     if (!plan) return 0;
     memset(plan, 0, sizeof(*plan));
@@ -8205,9 +8223,14 @@ int mlvDualIsoPreviewScaleReconPlan(mlvObject_t * video,
     }
     plan->fullWidth = (int)getMlvWidth(video);
     plan->fullHeight = (int)getMlvHeight(video);
-    if (mlv_dualiso_preview_scale_recon_disabled_via_env())
+    if (!gpu && mlv_dualiso_preview_scale_recon_disabled_via_env())
     {
         plan->reason = "disabled by MLVAPP_DISABLE_CPU_DUALISO_PREVIEW_SCALE_RECON";
+        return 0;
+    }
+    if (gpu && mlv_dualiso_gpu_preview_scale_recon_disabled_via_env())
+    {
+        plan->reason = "disabled by MLVAPP_DISABLE_GPU_DUALISO_PREVIEW_SCALE_RECON";
         return 0;
     }
     if (!llrpHQDualIso(video))
@@ -8215,16 +8238,32 @@ int mlvDualIsoPreviewScaleReconPlan(mlvObject_t * video,
         plan->reason = "not HQ dual-ISO";
         return 0;
     }
+    if (!gpu && mlv_gpu_playback_recon_requested_via_env())
     {
         /* The CUDA backend reconstructs on the GPU; this card is the CPU recon. */
-        const char * gpu = getenv("MLVAPP_GPU_PLAYBACK_RECON");
-        if (gpu && *gpu && strcmp(gpu, "0") != 0 && strcmp(gpu, "false") != 0)
-        {
-            plan->reason = "GPU playback recon requested";
-            return 0;
-        }
+        plan->reason = "GPU playback recon requested";
+        return 0;
+    }
+    if (gpu && !mlv_gpu_playback_recon_requested_via_env())
+    {
+        plan->reason = "GPU playback recon not requested";
+        return 0;
+    }
+    if (gpu && llrpGpuPlaybackReconReducedIsoNotchAvailable() == 0)
+    {
+        /* PLAYBACK-CUDA-HONOUR-SCALE-1 r2: without the notch a reduced recon
+         * shows the 4-row ISO mesh; stay on the full-res texture route. Not
+         * loaded yet (-1) is left to the run path, which refuses such a run. */
+        plan->reason = "recon DLL lacks the reduced ISO notch";
+        return 0;
     }
     const int scale = mlv_effective_playback_scale_factor(video, requestedScale);
+    if (gpu && scale == 8)
+    {
+        /* 2268-row clips are not a multiple of 32; x8 stays on the clamp. */
+        plan->reason = "x8 stays on the full-resolution texture route";
+        return 0;
+    }
     const int full_w = plan->fullWidth;
     const int full_h = plan->fullHeight;
     int source_h = 0;
@@ -8279,7 +8318,7 @@ int mlvDualIsoPreviewScaleReconPlan(mlvObject_t * video,
         plan->reason = "dark frame subtraction is full-resolution only";
         return 0;
     }
-    if (match_unsettled)
+    if (match_unsettled && !sessionLatched)
     {
         plan->reason = "dual-ISO exposure match not settled at full resolution yet";
         return 0;
@@ -8297,17 +8336,50 @@ int mlvDualIsoPreviewScaleReconPlan(mlvObject_t * video,
     plan->reducedWidth = full_w / scale;
     plan->reducedHeight = source_h / scale;
     plan->fullResFixes = fixes ? 1 : 0;
+    /* PLAYBACK-CUDA-HONOUR-SCALE-1 r4: the GPU route shrinks on correctly centred,
+     * same-ISO tent bins (the decimators' off-site Gr/Gb turn into AMaZE's column
+     * comb). The CPU route keeps its decimators byte for byte. */
+    plan->phaseTentShrink = gpu ? 1 : 0;
     return 1;
 }
 
-int mlvDualIsoPreviewScaleReconRun(mlvObject_t * video,
-                                   const mlvDualIsoPreviewScaleRecon_t * plan,
-                                   uint16_t * fullRaw,
-                                   uint16_t * reducedOut,
-                                   llrawprocWorkerState_t * worker,
-                                   int threads,
-                                   double * fullResFixesMs,
-                                   double * downsampleMs)
+static uint64_t g_mlv_phase_tent_shrink_frames = 0;
+static uint64_t g_mlv_phase_tent_shrink_micros = 0;
+
+uint64_t mlvDualIsoPhaseTentShrinkFrames(void)
+{
+    return __atomic_load_n(&g_mlv_phase_tent_shrink_frames, __ATOMIC_RELAXED);
+}
+
+uint64_t mlvDualIsoPhaseTentShrinkMicros(void)
+{
+    return __atomic_load_n(&g_mlv_phase_tent_shrink_micros, __ATOMIC_RELAXED);
+}
+
+int mlvDualIsoPreviewScaleReconPlan(mlvObject_t * video,
+                                    int requestedScale,
+                                    mlvDualIsoPreviewScaleRecon_t * plan)
+{
+    return mlv_dualiso_preview_scale_recon_plan_internal(video, requestedScale, 0, 0, plan);
+}
+
+int mlvDualIsoGpuPreviewScaleReconPlan(mlvObject_t * video,
+                                       int requestedScale,
+                                       int sessionLatched,
+                                       mlvDualIsoPreviewScaleRecon_t * plan)
+{
+    return mlv_dualiso_preview_scale_recon_plan_internal(video, requestedScale, 1,
+                                                         sessionLatched, plan);
+}
+
+int mlvDualIsoPreviewScaleReconShrink(mlvObject_t * video,
+                                      const mlvDualIsoPreviewScaleRecon_t * plan,
+                                      uint16_t * fullRaw,
+                                      uint16_t * reducedOut,
+                                      llrawprocWorkerState_t * worker,
+                                      int threads,
+                                      double * fullResFixesMs,
+                                      double * downsampleMs)
 {
     if (fullResFixesMs) *fullResFixesMs = 0.0;
     if (downsampleMs) *downsampleMs = 0.0;
@@ -8334,7 +8406,20 @@ int mlvDualIsoPreviewScaleReconRun(mlvObject_t * video,
     int out_w = 0;
     int out_h = 0;
     int rc = -1;
-    if (plan->scale == 2)
+    if (plan->phaseTentShrink && (plan->scale == 2 || plan->scale == 4))
+    {
+        rc = pl_downsample_bayer_to_bayer_phase_tent(fullRaw, full_w, plan->sourceHeight,
+                                                     reducedOut, plan->scale,
+                                                     &out_w, &out_h, threads);
+        const double ms = (mlv_stage_timing_now() - downsample_start) * 1000.0;
+        if (rc == 0 && out_w == plan->reducedWidth && out_h == plan->reducedHeight)
+        {
+            __atomic_fetch_add(&g_mlv_phase_tent_shrink_frames, 1, __ATOMIC_RELAXED);
+            __atomic_fetch_add(&g_mlv_phase_tent_shrink_micros,
+                               (uint64_t)(ms * 1000.0 + 0.5), __ATOMIC_RELAXED);
+        }
+    }
+    else if (plan->scale == 2)
     {
         rc = pl_downsample_bayer_to_bayer_2x(fullRaw, full_w, plan->sourceHeight,
                                              reducedOut, &out_w, &out_h, threads);
@@ -8354,6 +8439,24 @@ int mlvDualIsoPreviewScaleReconRun(mlvObject_t * video,
     {
         return mutated ? -1 : 0;
     }
+    return mutated ? 2 : 1;
+}
+
+static int mlv_dualiso_preview_scale_recon_run_internal(mlvObject_t * video,
+                                                        const mlvDualIsoPreviewScaleRecon_t * plan,
+                                                        uint16_t * fullRaw,
+                                                        uint16_t * reducedOut,
+                                                        llrawprocWorkerState_t * worker,
+                                                        int threads,
+                                                        double * fullResFixesMs,
+                                                        double * downsampleMs,
+                                                        int extraFlags)
+{
+    const int shrunk = mlvDualIsoPreviewScaleReconShrink(video, plan, fullRaw, reducedOut,
+                                                         worker, threads,
+                                                         fullResFixesMs, downsampleMs);
+    if (shrunk <= 0) return shrunk;
+    const int mutated = shrunk == 2;
 
     const size_t reduced_bytes =
         (size_t)plan->reducedWidth * (size_t)plan->reducedHeight * sizeof(uint16_t);
@@ -8361,11 +8464,41 @@ int mlvDualIsoPreviewScaleReconRun(mlvObject_t * video,
                                               plan->reducedWidth, plan->reducedHeight,
                                               worker,
                                               LLRP_WITH_DIMS_FULLRES_FIXES_APPLIED
-                                              | LLRP_WITH_DIMS_NO_PUBLISH))
+                                              | LLRP_WITH_DIMS_NO_PUBLISH
+                                              | extraFlags))
     {
         return mutated ? -1 : 0;
     }
     return 1;
+}
+
+int mlvDualIsoPreviewScaleReconRun(mlvObject_t * video,
+                                   const mlvDualIsoPreviewScaleRecon_t * plan,
+                                   uint16_t * fullRaw,
+                                   uint16_t * reducedOut,
+                                   llrawprocWorkerState_t * worker,
+                                   int threads,
+                                   double * fullResFixesMs,
+                                   double * downsampleMs)
+{
+    return mlv_dualiso_preview_scale_recon_run_internal(video, plan, fullRaw, reducedOut,
+                                                        worker, threads,
+                                                        fullResFixesMs, downsampleMs, 0);
+}
+
+int mlvDualIsoGpuPreviewScaleReconRun(mlvObject_t * video,
+                                      const mlvDualIsoPreviewScaleRecon_t * plan,
+                                      uint16_t * fullRaw,
+                                      uint16_t * reducedOut,
+                                      llrawprocWorkerState_t * worker,
+                                      int threads,
+                                      double * fullResFixesMs,
+                                      double * downsampleMs)
+{
+    return mlv_dualiso_preview_scale_recon_run_internal(video, plan, fullRaw, reducedOut,
+                                                        worker, threads,
+                                                        fullResFixesMs, downsampleMs,
+                                                        LLRP_WITH_DIMS_GPU_PLAYBACK_TEXTURE);
 }
 
 int getMlvProcessedFrame8ScaledFromReducedReconnedRaw16(mlvObject_t * video,

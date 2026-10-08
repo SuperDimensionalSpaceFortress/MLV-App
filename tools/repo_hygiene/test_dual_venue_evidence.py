@@ -4093,7 +4093,7 @@ class DisplayMatrixLegSetTests(unittest.TestCase):
             self.assertEqual(spec["legId"], Path(rel).stem, rel)
             self.assertIn(spec["displayMode"], ("fullscreen", "windowed"))
             if spec["scaleFactor"] != 1:
-                self.assertEqual(spec["acceptedEffectiveScale"], {"cuda": 1}, f"{rel}: the CUDA texture route clamps every scale but 1 to 1; the leg declares it")
+                self.assertNotIn("acceptedEffectiveScale", spec, f"{rel}: the CUDA texture route honours scales 2 and 4 (PLAYBACK-CUDA-HONOUR-SCALE-1); a CUDA cell at 1 must not pass")
             grid.add((spec["displayMode"], spec["scaleFactor"]))
         self.assertEqual(grid, {(m, s) for m in ("fullscreen", "windowed") for s in (1, 2, 4)})
 
@@ -4234,7 +4234,7 @@ class DisplayMatrixRunTests(EvidenceFactory, unittest.TestCase):
     def cell_artifacts(self, cell: str, placement: str, fps: float) -> str:
         """Write one cell's run artifacts (its own app log: the placement the app ran in, the scale it rendered at, the four rates) and return the agent-side path."""
         _, mode, scale = cell.split("-")
-        eff = 1   # the CUDA texture route renders at 1 whatever the request: the shipped specs declare it
+        eff = int(scale[1:])   # the CUDA texture route renders at the requested 1, 2 or 4 (PLAYBACK-CUDA-HONOUR-SCALE-1)
         name = f"{cell}.artifacts"
         saved = self.artifacts
         self.artifacts = self.share / "outbox" / name
@@ -4296,7 +4296,7 @@ class DisplayMatrixRunTests(EvidenceFactory, unittest.TestCase):
         text = Path(summary).read_text(encoding="utf-8")
         self.assertEqual(len([l for l in text.splitlines() if l.startswith("| cuda-")]), 6)
         self.assertIn("| cuda-windowed-s1 | cuda | windowed / windowed | 1->1 | 2560x1529 (2380x1373) | 2/2 | 12.60 (12.60-12.60) | 19.40 | 28.5 | 25.5 | PASS x2 |", text)
-        self.assertIn("| cuda-fullscreen-s4 | cuda | fullscreen / fullscreen | 4->1 | 2560x1600 (2560x1600) | 2/2 | 12.40 (12.40-12.40) | 19.40 | 28.5 |", text)
+        self.assertIn("| cuda-fullscreen-s4 | cuda | fullscreen / fullscreen | 4->4 | 2560x1600 (2560x1600) | 2/2 | 12.40 (12.40-12.40) | 19.40 | 28.5 |", text)
         bad_row = next(l for l in text.splitlines() if l.startswith(f"| {bad_cell} "))
         self.assertIn("| windowed / fullscreen |", bad_row)
         self.assertIn("| 0/2 | - | - | - | - | INVALID x2 |", bad_row)
@@ -4306,8 +4306,8 @@ class DisplayMatrixRunTests(EvidenceFactory, unittest.TestCase):
         windowed_ok = [r for r in receipts if r["legId"] == "m16-1243-display-windowed-s1"]
         self.assertEqual({(r["display"]["requestedMode"], r["display"]["observedMode"], r["display"]["windowWidth"]) for r in windowed_ok}, {("windowed", "windowed", 2560)})
         self.assertEqual({r["scale"]["verdict"] for r in windowed_ok}, {"HONOURED"})
-        clamped = [r for r in receipts if r["legId"] == "m16-1243-display-windowed-s2"]
-        self.assertEqual({(r["scale"]["requestedScale"], r["scale"]["effectiveScale"]) for r in clamped}, {(2, 1)})
+        honoured = [r for r in receipts if r["legId"] == "m16-1243-display-fullscreen-s2"]
+        self.assertEqual({(r["scale"]["requestedScale"], r["scale"]["effectiveScale"], r["scale"]["verdict"]) for r in honoured}, {(2, 2, "HONOURED")})
 
     def test_a_table_row_is_read_only_from_a_run_log_that_still_hashes_to_its_receipt(self) -> None:
         proc = self.run_matrix(1, ["-Backend", "cuda"], {})
@@ -4464,35 +4464,33 @@ class LegSpecSchemaTests(unittest.TestCase):
         self.assertEqual(scale2["legId"], "m16-1243-look-scale2")
         self.assertEqual(scale2["scaleFactor"], 2)
         self.assertEqual(classic["scaleFactor"], 4)
-        self.assertEqual(scale2["backends"], ["cpu"], "the CUDA texture route clamps scale 2 to 1, so the scale-2 leg is cpu-only until it honours scale 2")
+        self.assertEqual(scale2["backends"], ["cuda", "cpu"], "the CUDA texture route honours scale 2 (PLAYBACK-CUDA-HONOUR-SCALE-1), so the scale-2 leg runs both backends")
         self.assertNotIn("acceptedEffectiveScale", scale2, "a leg that wants scale 2 declares no accepted clamp: a CUDA run at 1 must not pass it")
-        self.assertEqual(sorted(scale2["criteria"]["acceptance"]), ["cpu"], "a cpu-only leg carries no criteria for a backend it cannot run")
-        classic_cpu_only = json.loads(json.dumps(classic))
-        del classic_cpu_only["acceptedEffectiveScale"]
-        for role in classic_cpu_only["criteria"].values():
-            role.pop("cuda")
-        comparable = dict(scale2, legId=classic["legId"], scaleFactor=classic["scaleFactor"], backends=classic["backends"])
-        self.assertEqual(comparable["criteria"], classic_cpu_only["criteria"])
-        comparable["criteria"] = classic["criteria"]
-        comparable["acceptedEffectiveScale"] = classic["acceptedEffectiveScale"]
-        self.assertEqual(comparable, classic, "the scale-2 leg is the Classic leg except legId, scaleFactor, backends (and the CUDA criteria and clamp declaration that go with a CUDA backend)")
+        self.assertNotIn("acceptedEffectiveScale", classic, "the scale-4 leg declares no clamp either: CUDA honours scale 4")
+        comparable = dict(scale2, legId=classic["legId"], scaleFactor=classic["scaleFactor"])
+        self.assertEqual(comparable, classic, "the scale-2 leg is the Classic leg except legId and scaleFactor")
         self.assertNotEqual(classic["legId"], scale2["legId"])
 
-    def test_the_cuda_texture_route_clamp_is_declared_by_every_leg_that_runs_cuda_at_a_scale_other_than_1(self) -> None:
-        """TRIPWIRE: MainWindowGpuPreviewPolicy.h clamps every requested scale != 1 to 1 on the GPU texture route. While that is true, a leg that names scale S != 1
-        and lists cuda must DECLARE the effective scale it renders at (acceptedEffectiveScale.cuda == 1): the receipt then says requested S / rendered 1 instead of a
-        silent mismatch. If this fails because the clamp was removed, drop the declarations and let the CUDA backend of the scale-2 leg back in (and update the docs)."""
+    def test_the_cuda_texture_route_clamp_is_declared_only_where_the_route_still_clamps(self) -> None:
+        """TRIPWIRE: since PLAYBACK-CUDA-HONOUR-SCALE-1 the GPU texture route honours scales 2 and 4 for a play session the GPU reduced-recon plan admits
+        (mainWindowGpuTextureRouteEffectivePlaybackScale) and still clamps x8 to 1. A cuda leg at 2 or 4 must therefore declare NO clamp (a fallback to 1 ends
+        SCALE_NOT_HONOURED), and a cuda leg at 8 must declare acceptedEffectiveScale.cuda == 1. If the policy changes again, revisit the legs and the docs."""
         policy = (ROOT / "platform" / "qt" / "MainWindowGpuPreviewPolicy.h").read_text(encoding="utf-8")
-        self.assertIn("if (requestedScale != 1 && gpuPlaybackReconTextureRouteEligibleAtScaleOne)", policy, "the clamp changed: revisit the legs' acceptedEffectiveScale and the scale-2 leg's cpu-only backends")
+        self.assertIn("if (requestedScale != 1 && gpuPlaybackReconTextureRouteEligibleAtScaleOne)", policy, "the clamp changed: revisit the legs' acceptedEffectiveScale")
+        self.assertIn("&& (requestedScale == 2 || requestedScale == 4))", policy, "the honoured scales changed: revisit the legs' acceptedEffectiveScale")
         for path in sorted((DV / "legs").glob("*.json")):
             spec = json.loads(path.read_text(encoding="utf-8"))
-            if "cuda" in spec["backends"] and spec["scaleFactor"] != 1:
-                self.assertEqual(spec.get("acceptedEffectiveScale", {}).get("cuda"), 1, f"{path.name}: names scale {spec['scaleFactor']} on cuda without declaring the clamp")
+            if "cuda" not in spec["backends"]:
+                continue
+            if spec["scaleFactor"] in (2, 4):
+                self.assertNotIn("cuda", spec.get("acceptedEffectiveScale", {}), f"{path.name}: declares a CUDA clamp at an honoured scale {spec['scaleFactor']}")
+            elif spec["scaleFactor"] == 8:
+                self.assertEqual(spec.get("acceptedEffectiveScale", {}).get("cuda"), 1, f"{path.name}: names scale 8 on cuda without declaring the clamp")
 
     def test_the_docs_make_no_scale_claim_the_cuda_route_cannot_keep_and_list_every_typed_outcome(self) -> None:
         doc = (ROOT / "docs" / "dual-venue-evidence.md").read_text(encoding="utf-8")
         self.assertNotIn("it is the leg that shows the owner's playback look", doc, "the scale-2 look is only reachable where the effective scale is 2 (cpu)")
-        self.assertIn("`m16-1243-look-scale2` is cpu only", doc)
+        self.assertIn("`m16-1243-look-scale2` runs cuda and cpu", doc)
         self.assertIn("SCALE_NOT_HONOURED", doc)
         module = (DV / "DualVenueRunner.psm1").read_text(encoding="utf-8")
         enum = re.search(r"\$script:OutcomeEnum = @\((.+?)\)", module).group(1)

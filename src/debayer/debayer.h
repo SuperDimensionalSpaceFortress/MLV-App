@@ -22,6 +22,10 @@ void debayerBasicU16(uint16_t * __restrict debayerto,
  * (CPU supports avx2+fma, MLVAPP_DISABLE_AVX2 / MLVAPP_DISABLE_AVX2_DEBAYER
  * not set). Latches via pthread_once on first call. */
 int debayerBasicU16Avx2Active(void);
+/* PLAYBACK-CUDA-HONOUR-SCALE-1 r3: [1,2,1]/4 along x per channel of interleaved
+ * RGB16, mirrored edge columns; the reduced texture route's horizontal Nyquist zero.
+ * out and in must not alias. */
+void debayer_reduced_hnyquist121_rgb16(uint16_t *out, const uint16_t *in, int w, int h);
 /* Quite quick bilinear debayer, floating point sadly; threads argument is unused */
 void debayerBasic(uint16_t * __restrict debayerto, float * __restrict bayerdata, int width, int height, int threads);
 /* More useable amaze, threads number should be the number of cores(or threads if >= i7) your cpu has */

@@ -36,10 +36,13 @@ NON-PROMISES:
   The ``-eq $false`` tri-state form on a possibly-null
   value (tools/profiling/compare-machine-perf.ps1, run-release-cuda-playback-ab.ps1)
   cannot be decided statically and is out of scope; review it by hand.
-- PS-ONE-TRAP counts untyped (catch-all) TrapStatementAst nodes per enclosing block (the
-  script's begin/process/end, or an if/foreach/try body), and flags a block with more than
-  one. A typed trap and a trap in another block are other scopes and are not counted;
-  traps inside a function or script block are not searched.
+- PS-ONE-TRAP counts catch-all TrapStatementAst nodes per enclosing block (the script's
+  begin/process/end, or an if/foreach/try body) and flags EVERY block holding more than
+  one. A catch-all is an untyped trap or one typed [System.Exception] or
+  [System.Management.Automation.RuntimeException] (the System. prefix is optional). A trap
+  of any other type and a trap in another block are other scopes and are not counted, so two
+  traps of the same specific type (trap [IOException] twice) are not flagged; traps inside a
+  function or script block are not searched.
 
 If pwsh is not on PATH the AST guards SKIP with a reason; on a GitHub Actions
 runner (whose images carry pwsh) a missing pwsh FAILS instead.
@@ -96,7 +99,7 @@ class Violation:
 # ---------------------------------------------------------------------------
 # PowerShell AST scan: ONE pwsh process for any number of files.
 # Reads a JSON list of absolute paths from -InPath and writes one
-# {path, errors, nullRight, topTraps} object per path to -OutPath.
+# {path, errors, nullRight, trapBlocks} object per path to -OutPath.
 # ---------------------------------------------------------------------------
 _PS_SCAN = r"""
 param([Parameter(Mandatory)][string]$InPath, [Parameter(Mandatory)][string]$OutPath)
@@ -105,6 +108,7 @@ Set-StrictMode -Version Latest
 $enc = New-Object System.Text.UTF8Encoding($false)
 $paths = @([IO.File]::ReadAllText($InPath, $enc) | ConvertFrom-Json)
 $ops = @('Ieq', 'Ine', 'Ceq', 'Cne')
+$catchAll = @('exception', 'management.automation.runtimeexception')
 $nullName = '^(?:(?:global|script|local|private):)?null$'
 function Unwrap($e) {
     while ($true) {
@@ -137,14 +141,19 @@ foreach ($p in $paths) {
         }
     }
     # PowerShell runs only the first catch-all trap per scope (bus eee0f66). A scope is one statement
-    # block (named block or if/foreach/try body), so count untyped traps per parent block and keep the
-    # busiest block; a typed trap is a different dispatch, and a function or script block is not entered.
+    # block (named block or if/foreach/try body), so count catch-all traps per parent block and report
+    # EVERY block holding more than one; a catch-all is an untyped trap or one typed with $catchAll, a
+    # trap of any other type is a different dispatch, and a function or script block is not entered.
     $traps = @($ast.FindAll({
         param($n)
-        $n -is [System.Management.Automation.Language.TrapStatementAst] -and $null -eq $n.TrapType
-    }, $false) | Group-Object { $_.Parent.Extent.StartOffset } | Sort-Object Count -Descending |
-        Select-Object -First 1 | ForEach-Object { $_.Group | ForEach-Object { $_.Extent.StartLineNumber } })
-    $results.Add([ordered]@{ path = [string]$p; errors = @($errs); nullRight = @($nulls); topTraps = @($traps) })
+        $n -is [System.Management.Automation.Language.TrapStatementAst] -and
+            ($null -eq $n.TrapType -or $catchAll -contains ($n.TrapType.TypeName.FullName.ToLowerInvariant() -replace '^system\.', ''))
+    }, $false) | Group-Object { $_.Parent.Extent.StartOffset } | Where-Object { $_.Count -gt 1 } |
+        ForEach-Object {
+            $lines = @($_.Group | ForEach-Object { $_.Extent.StartLineNumber } | Sort-Object)
+            [ordered]@{ count = $lines.Count; line = [int]$lines[1] }
+        })
+    $results.Add([ordered]@{ path = [string]$p; errors = @($errs); nullRight = @($nulls); trapBlocks = @($traps) })
 }
 [IO.File]::WriteAllText($OutPath, (ConvertTo-Json -InputObject $results.ToArray() -Depth 6 -Compress), $enc)
 """
@@ -200,7 +209,7 @@ def _ast_scan_uncached(root: Path, rel_paths: list[str]) -> dict[str, dict]:
         results = [results]
     by_abs = {}
     for res in results if isinstance(results, list) else []:
-        if isinstance(res, dict) and set(res) == {"path", "errors", "nullRight", "topTraps"}:
+        if isinstance(res, dict) and set(res) == {"path", "errors", "nullRight", "trapBlocks"}:
             by_abs[res["path"]] = res
     out: dict[str, dict] = {}
     for rel, absolute in abs_by_rel.items():
@@ -246,10 +255,9 @@ def check_ps_one_trap(root: Path, rel_paths: list[str]) -> list[Violation]:
     scan = ast_scan(root, rel_paths)
     out = []
     for rel in rel_paths:
-        traps = scan[rel]["topTraps"]
-        if len(traps) > 1:
-            out.append(Violation("PS-ONE-TRAP", rel, traps[1],
-                                 f"{len(traps)} catch-all traps in one block; PowerShell runs only the first"))
+        for block in scan[rel]["trapBlocks"]:
+            out.append(Violation("PS-ONE-TRAP", rel, block["line"],
+                                 f"{block['count']} catch-all traps in one block; PowerShell runs only the first"))
     return out
 
 
@@ -420,7 +428,7 @@ REGISTRY: tuple[Guard, ...] = (
           "a hook registered under a misspelt event name never runs and raises no error",
           is_claude_settings, check_hook_event, False),
     Guard("PS-ONE-TRAP", "eee0f66",
-          "PowerShell runs only the FIRST trap in a scope; a second one is dead code",
+          "PowerShell runs only the FIRST catch-all trap (untyped, [System.Exception] or [RuntimeException]) in a block; a second one is dead code",
           is_powershell, check_ps_one_trap, True),
     Guard("DG-GIT-PATHLIST", "de09cae",
           "git quotes a non-ASCII path in its plain path-list output, so a path-prefix test on it misses the path",
@@ -516,6 +524,13 @@ FIXTURES: dict[str, dict[str, dict[str, str]]] = {
             "b.ps1": "trap { 'first catch-all' }\ntrap [System.IO.IOException] { 'typed, legal' }\ntrap { 'second catch-all, dead' }\n",
             "c.ps1": "param($p)\nbegin {\n    trap { 'first' }\n    trap { 'second, dead' }\n}\n",
             "d.ps1": "if ($true) {\n    trap { 'first' }\n    trap { 'second, dead' }\n    1\n}\n",
+            # Two offending blocks in one file: both are reported, not only the busiest.
+            "e.ps1": "param($p)\nbegin {\n    trap { 'b1' }\n    trap { 'b2, dead' }\n}\n"
+                     "process {\n    trap { 'p1' }\n    trap { 'p2, dead' }\n}\n",
+            # A typed catch-all matches before an untyped trap, whichever is written first.
+            "f.ps1": "trap { 'untyped, dead' }\ntrap [System.Exception] { 'typed catch-all wins' }\n",
+            "g.ps1": "trap [System.Exception] { 'first' }\ntrap [System.Management.Automation.RuntimeException] { 'second, dead' }\n",
+            "h.ps1": "trap [Exception] { 'short form' }\ntrap { 'untyped, dead' }\n",
         },
         "green": {
             "a.ps1": "trap { Write-Error 'only'; break }\nfunction F {\n    trap { 'own scope'; continue }\n    1\n}\n"
@@ -528,6 +543,9 @@ FIXTURES: dict[str, dict[str, dict[str, str]]] = {
             "e.ps1": "trap { 'script scope'; continue }\nif ($true) {\n    trap { 'if-block scope'; continue }\n    1\n}\n"
                      "foreach ($i in 1) { trap { 'foreach scope'; continue }; $i }\n",
             "f.ps1": "param($p)\nbegin { trap { 'begin scope' }; 1 }\nprocess { trap { 'process scope' }; 2 }\n",
+            # One typed catch-all beside specific typed traps, and one in another block, are each legal.
+            "g.ps1": "trap [System.Exception] { 'catch-all'; continue }\ntrap [System.IO.IOException] { 'io'; continue }\n"
+                     "if ($true) {\n    trap { 'if-block scope'; continue }\n    1\n}\n",
         },
     },
 }
@@ -641,7 +659,8 @@ class GuardFixtureTests(_PwshMixin, unittest.TestCase):
 
     def test_ps_one_trap_red_fails(self) -> None:
         self._assert_red("PS-ONE-TRAP", {("a.ps1", 3), ("b.ps1", 3), ("c.ps1", 4),
-                                          ("d.ps1", 3)})
+                                          ("d.ps1", 3), ("e.ps1", 4), ("e.ps1", 8),
+                                          ("f.ps1", 2), ("g.ps1", 2), ("h.ps1", 2)})
 
     def test_ps_one_trap_green_passes(self) -> None:
         self._assert_green("PS-ONE-TRAP")
