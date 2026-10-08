@@ -11,6 +11,13 @@ DOC = ROOT / "docs" / "lane-containment.md"
 pytestmark = pytest.mark.skipif(sys.platform != "win32", reason="Windows Job Object contract")
 PWSH = "pwsh.exe"
 
+# CI-FLAKE-LANE-CONTAINMENT-PROBE-TIMEOUT-1: the helper probes below each start a COLD `pwsh -NoProfile` just to
+# read or end one process, and a fixed 5 s bound there is a pwsh cold-start race, not a property under test
+# (merge_group run 37852625704, #323: subprocess.TimeoutExpired in identity() on windows shard 8/8, 1 failed / 616
+# passed). The bound is generous because a healthy probe returns in well under a second -- it only ever binds on a
+# loaded host -- and matches the 30 s per-run allowance the #316 startup-budget fixtures give a cold pwsh.
+PWSH_PROBE_TIMEOUT_SEC = 30
+
 # PR #105 round 4: Invoke-Lane.ps1 classifies containment.ownerAbsentReason into a
 # CLOSED set of fixed tokens, chosen by WHERE a failure happened rather than by what
 # its raw exception message said -- free text is not admissible evidence about a
@@ -82,7 +89,12 @@ def identity(pid):
     # no process to look up in that case, so return None instead of int(None).
     if pid is None: return None
     q=f"$p=Get-Process -Id {int(pid)} -ErrorAction SilentlyContinue;if($null-eq $p){{exit 3}};$p.StartTime.ToUniversalTime().ToString('o')"
-    r=subprocess.run([PWSH,"-NoProfile","-NonInteractive","-Command",q],text=True,capture_output=True,timeout=5)
+    try:
+        r=subprocess.run([PWSH,"-NoProfile","-NonInteractive","-Command",q],text=True,capture_output=True,timeout=PWSH_PROBE_TIMEOUT_SEC)
+    except subprocess.TimeoutExpired:
+        # Never read a timed-out probe as "process absent": that would silently pass wait_absent / stop_exact.
+        pytest.fail(f"StartTime probe for pid {int(pid)} did not answer within {PWSH_PROBE_TIMEOUT_SEC} s "
+                    "(cold pwsh start); the process identity is UNKNOWN, not absent")
     return r.stdout.strip() if r.returncode==0 else None
 
 
@@ -96,7 +108,7 @@ def wait_absent(item, seconds=10):
 
 def stop_exact(item):
     if identity(item["pid"]) == item["createdUtc"]:
-        subprocess.run([PWSH,"-NoProfile","-NonInteractive","-Command",f"Stop-Process -Id {int(item['pid'])} -Force"],timeout=5,check=False)
+        subprocess.run([PWSH,"-NoProfile","-NonInteractive","-Command",f"Stop-Process -Id {int(item['pid'])} -Force"],timeout=PWSH_PROBE_TIMEOUT_SEC,check=False)
 
 
 @pytest.fixture
@@ -1433,7 +1445,7 @@ def test_pre_assignment_kill_failure_is_recorded_not_swallowed(fixture_tree):
     assert owner_pid is not None
     subprocess.run([PWSH,"-NoProfile","-NonInteractive","-Command",
                      f"Stop-Process -Id {int(owner_pid)} -Force -ErrorAction SilentlyContinue"],
-                    timeout=5, check=False)
+                    timeout=PWSH_PROBE_TIMEOUT_SEC, check=False)
 
 
 def test_pre_assignment_kill_wait_timeout_is_recorded_not_killed(fixture_tree):
@@ -1494,7 +1506,7 @@ def test_pre_assignment_kill_wait_timeout_is_recorded_not_killed(fixture_tree):
     assert owner_pid is not None
     subprocess.run([PWSH,"-NoProfile","-NonInteractive","-Command",
                      f"Stop-Process -Id {int(owner_pid)} -Force -ErrorAction SilentlyContinue"],
-                    timeout=5, check=False)
+                    timeout=PWSH_PROBE_TIMEOUT_SEC, check=False)
 
 
 def test_kill_outcome_token_set_matches_producer_constants():
