@@ -198,3 +198,6 @@ playing that no engine path made, plus whatever the paths leave unexplained) nex
 cells run as SPEED legs with Look Assist forced (cinematic) through `generatorArgs.forceLookAssist`
 and no contact sheet (generator `-LookPaceLeg`), so no 30-71 ms GUI-thread framebuffer grab lands
 inside the timed Play; the look itself stays on the look and display-matrix legs.
+`m16-1243-pace-cinematic-fullscreen-s4-heavy` is the owner-shape pace leg at `telemetryArm` HEAVY, which
+keeps the per-frame `playback_smoke.frame` log that LIGHT turns off, so the present that ends a >= 250 ms
+interval shows its own queue wait, render, draw and UI latency. It is a stall diagnostic, never a pace number.
