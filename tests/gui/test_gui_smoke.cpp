@@ -2729,6 +2729,8 @@ void GuiSmokeTest::gpuPreviewProcessingLutSetReportsRebuildsAndBlurUploadsKeepTh
     blurConfig.shadowsHighlightsFrameStateReady = true;
     blurConfig.shadowsHighlightsFrameWidth = width;
     blurConfig.shadowsHighlightsFrameHeight = height;
+    // gpuPreviewProcessingHasShadowsHighlightsFrameState also requires the full S/H curve.
+    blurConfig.shadowsHighlightsCurve = QByteArray(static_cast<int>(65536u * sizeof(float)), '\0');
     const uint16_t seeds[3] = { 11, 4099, 30001 };
     GLuint allocatedId = 0;
     for (int round = 0; round < 3; ++round) {
