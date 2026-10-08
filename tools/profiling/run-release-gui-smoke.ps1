@@ -2818,6 +2818,9 @@ $result = [pscustomobject]@{
             presetTintDelta = Get-ObjectPropertyValue $lookAssistApply "preset_tint_delta"
             finalTemperature = Get-ObjectPropertyValue $lookAssistApply "final_temp"
             finalTint = Get-ObjectPropertyValue $lookAssistApply "final_tint"
+            # LOOK-ASSIST-FILM-FLAVOR-1: the Film grade the apply laid (grade=film-v1|skipped_user_curve). Classic and
+            # Cinematic lines carry no grade= field: absent is "none".
+            presetGrade = $(if ($null -eq $lookAssistApply) { $null } else { $laGrade = [string](Get-ObjectPropertyValue $lookAssistApply "grade"); if ([string]::IsNullOrEmpty($laGrade)) { 'none' } else { $laGrade } })
         }
         clipLifecycleStress = [pscustomobject]@{
             requested = [bool]$ExerciseClipLifecycleStress

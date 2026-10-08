@@ -8,6 +8,9 @@
 
 #include "../common/repo_paths.h"
 #include "mlv_pipeline_fixture.h"
+#ifdef LOOK_FLAVOR_RUN_HAS_FILM_GRADE
+#include "look_assist_gradation_curve.h"
+#endif
 
 #include "../../platform/qt/ReceiptSettings.h"
 #include "../../src/batch/BatchLogger.h"
@@ -52,6 +55,7 @@ struct Run
     QString appliedLine;    // the last "[BATCH] LOOK_ASSIST applied ..." line, newline-free
     QString sha256;         // of the 8-bit frame rendered with that receipt applied
     QString flavorOnReceipt;
+    QString gradationCurve;  // the receipt's after the run
     QByteArray log;
     std::vector<uint8_t> rgb;
     int width = 0;
@@ -99,6 +103,7 @@ inline Run run( const FixtureCase &fixtureCase, bool lookAssist, bool gradeLikeG
 #ifdef LOOK_FLAVOR_RUN_HAS_RECEIPT_FLAVOR   // defined by the flavor test; master's ReceiptSettings has no flavor
     out.flavorOnReceipt = receipt.lookAssistFlavor();
 #endif
+    out.gradationCurve = receipt.gradationCurve();
     out.exposure = receipt.exposure();
     out.contrast = receipt.contrast();
     out.pivot = receipt.pivot();
@@ -121,6 +126,12 @@ inline Run run( const FixtureCase &fixtureCase, bool lookAssist, bool gradeLikeG
         processingSetVibrance( proc, std::pow( ( receipt.vibrance() + 100 ) / 200.0 * 2.0, std::log( 3.6 ) / std::log( 2.0 ) ) );
         processingSetShadows( proc, receipt.shadows() * 1.5 / 100.0 );
         processingSetHighlights( proc, receipt.highlights() * 1.5 / 100.0 );
+#ifdef LOOK_FLAVOR_RUN_HAS_FILM_GRADE   // defined by the flavor test; master has no Film grade
+        // ... and the gradation curve the way the Curves widget pushes it, when Look Assist laid one (the Film grade):
+        // a default curve is left alone, so Classic and Cinematic render exactly as before.
+        if( !lookassist::lookAssistIsDefaultGradationCurve( receipt.gradationCurve() ) )
+            lookAssistTestApplyGradationCurve( proc, receipt.gradationCurve() );
+#endif
     }
     resetMlvCache( fixture.video() );
     resetMlvCachedFrame( fixture.video() );

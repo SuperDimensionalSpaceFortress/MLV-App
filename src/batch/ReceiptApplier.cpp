@@ -103,11 +103,39 @@ static uint16_t headlessRestrictedLosslessDualIsoOutputWhiteLevel( ReceiptSettin
     return static_cast<uint16_t>( qBound( 0, qMax( originalWhite, scaledWhite ), 16383 ) );
 }
 
+// The Film grade's curve baseline: non-empty only while the Film grade replaced the receipt's (default) curve. Restoring
+// puts that curve back and clears the field, so every analysis starts from the user's own curve and a receipt that is
+// later graded Classic (or has Look Assist switched off) carries no trace of the Film grade. The curve goes back only
+// while Film still owns it; a user's edit of the laid curve is kept and the cleared field retires Film's ownership.
+static void restoreHeadlessLookAssistGradationCurve( ReceiptSettings *receipt )
+{
+    if( !receipt || receipt->lookAssistBaselineGradationCurve().isEmpty() ) return;
+    receipt->setGradationCurve( lookAssistGradationCurveAfterFilmRestore( receipt->gradationCurve(),
+                                                                          receipt->lookAssistBaselineGradationCurve() ) );
+    receipt->setLookAssistBaselineGradationCurve( QString() );
+}
+
+// Lays the Film grade's curve over a default curve (never over a user's) and returns the grade=... decision.
+static QString applyHeadlessLookAssistFilmGrade( ReceiptSettings *receipt, LookAssistScene scene, LookAssistFlavor flavor )
+{
+    const QString decision = lookAssistFilmGradeDecision( flavor, receipt->gradationCurve() );
+    if( decision != lookAssistFilmGradeId() ) return decision;
+    if( receipt->lookAssistBaselineGradationCurve().isEmpty() )
+        receipt->setLookAssistBaselineGradationCurve( receipt->gradationCurve().trimmed().isEmpty()
+                                                      ? ReceiptSettings().gradationCurve()
+                                                      : receipt->gradationCurve() );
+    receipt->setGradationCurve( lookAssistFilmGradationCurve( scene ) );
+    return decision;
+}
+
 static void captureHeadlessLookAssistBaseline( ReceiptSettings *receipt,
                                                mlvObject_t *mlvObject )
 {
     if( !receipt ) return;
 
+    // A fresh baseline starts with no Film curve on record (a recorded one is put back first, so it is never mistaken
+    // for the user's curve).
+    restoreHeadlessLookAssistGradationCurve( receipt );
     receipt->setLookAssistBaselineExposure( receipt->exposure() );
     receipt->setLookAssistBaselineContrast( receipt->contrast() );
     receipt->setLookAssistBaselinePivot( receipt->pivot() );
@@ -158,6 +186,7 @@ static void restoreHeadlessLookAssistBaseline( ReceiptSettings *receipt )
     receipt->setRawBlack( receipt->lookAssistBaselineRawBlack() );
     receipt->setRawWhite( receipt->lookAssistBaselineRawWhite() );
     receipt->setChromaSmooth( qBound( 0, receipt->lookAssistBaselineChromaSmooth(), 3 ) );
+    restoreHeadlessLookAssistGradationCurve( receipt );
 }
 
 static void applyHeadlessRawLevelsAutoFix( ReceiptSettings *receipt,
@@ -765,6 +794,9 @@ bool ReceiptApplier::applyHeadlessLookAssist(ReceiptSettings *receipt,
     {
         if( receipt )
             receipt->setLookAssistBaselineValid( false );
+        // Look Assist is off for this receipt: a Film curve it laid earlier is not a grade anyone asked for now.
+        if( receipt && !receipt->lookAssistEnabled() )
+            restoreHeadlessLookAssistGradationCurve( receipt );
         BatchLogger::out( QStringLiteral(
             "[BATCH] LOOK_ASSIST skip env_disabled=%1 receipt=%2 mlv=%3 enabled=%4\n" )
             .arg( s_noLookAssist ? QStringLiteral("true") : QStringLiteral("false") )
@@ -1157,6 +1189,11 @@ bool ReceiptApplier::applyHeadlessLookAssist(ReceiptSettings *receipt,
     receipt->setHighlights( preset.highlights );
     receipt->setLookAssistFlavor( lookAssistFlavorName( flavor ) );
     receipt->setLookAssistBaselineValid( true );
+    // Film's colour grade, after the preset (its tone is already in the sliders above). The baseline restore at the top of
+    // this pass put the user's curve back, so the decision is made against the user's own curve.
+    const QString filmGrade = applyHeadlessLookAssistFilmGrade( receipt, scene, flavor );
+    // Appended after flavor=, and only for Film, so a Classic or Cinematic line stays byte-identical. No '%' in it.
+    const QString filmGradeLogTail = flavor == LookAssistFlavor::Film ? QStringLiteral(" grade=") + filmGrade : QString();
 
     processingSetWhiteBalance( processingObject, temperature, tint / 10.0 );
     resetMlvCache( mlvObject );
@@ -1164,6 +1201,7 @@ bool ReceiptApplier::applyHeadlessLookAssist(ReceiptSettings *receipt,
 
     BatchLogger::out( QStringLiteral(
         "[BATCH] LOOK_ASSIST applied frame=%1 scene=%2 median=%3 p95=%4 p99=%5 exposure=%6 temperature=%7 tint=%8 autoWbValid=%9 autoWbSource=%10 autoWbDecision=%11 autoWbDamping=%12 autoWbCandidateTemp=%13 autoWbCandidateTint=%14 chromaSmoothAuto=%15 rawBlack=%16 rawWhite=%17 p05=%18 clipHigh=%19 balanceRGB=%20/%21/%22 balanceSamples=%23 patchValid=%24 patchLuma=%25 patchChroma=%26 patchBlueAmber=%27 patchGreenAxis=%28 refineRenders=%29 refineStartScore=%30 refineScore=%31 refineBlueAmber=%32 refineGreen=%33 masterScenePass=%34 initialPatchChecked=%35 initialPatchRefused=%36 initialPatchBaseChroma=%37 initialPatchFinalChroma=%38 %39 flavor=%40\n" )
+        .replace( QLatin1Char('\n'), filmGradeLogTail + QLatin1Char('\n') )
         .arg( frameIndex )
         .arg( lookAssistSceneName( scene ) )
         .arg( stats.median, 0, 'f', 2 )

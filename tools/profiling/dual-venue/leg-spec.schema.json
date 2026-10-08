@@ -34,7 +34,7 @@
         "telemetryArm": { "enum": ["HEAVY", "LIGHT"] },
         "cpuQuiescenceThresholdPercent": { "type": "number", "exclusiveMinimum": 0, "maximum": 100 },
         "forceLookAssist": { "type": "boolean", "description": "SPEED legs only (PLAYBACK-BACHELOR-PRESENT-JITTER-1): force Look Assist on WITHOUT a contact sheet (generator -ForceLookAssist -LookPaceLeg), so no GUI-thread framebuffer grab lands inside the timed Play. A look leg ignores it (its look block forces Look Assist)." },
-        "lookFlavor": { "enum": ["classic", "cinematic"], "description": "With forceLookAssist on a SPEED leg: the Look Assist flavor (generator -LookFlavor)." },
+        "lookFlavor": { "enum": ["classic", "cinematic", "film"], "description": "With forceLookAssist on a SPEED leg: the Look Assist flavor (generator -LookFlavor)." },
         "playbackRenderLookaheadFrames": { "type": "integer", "minimum": 0, "maximum": 3, "description": "With forceLookAssist on a SPEED leg: the playback render lookahead depth the app runs at (MLVAPP_PLAYBACK_RENDER_LOOKAHEAD_FRAMES; generator -PlaybackRenderLookaheadFrames). Absent: the app's default." }
       },
       "description": "Generator arguments other than -Venue/-Backend/-ScaleFactor/-SourceCommit/-BuildManifestSha256/-ClipId (the runner sets those)."
@@ -50,7 +50,7 @@
       "type": "object", "required": ["contactSheetFrames", "lookFlavor"], "additionalProperties": false,
       "properties": {
         "contactSheetFrames": { "type": "integer", "minimum": 1, "maximum": 60 },
-        "lookFlavor": { "enum": ["classic", "cinematic"], "default": "classic" }
+        "lookFlavor": { "enum": ["classic", "cinematic", "film"], "default": "classic" }
       },
       "description": "Required when legType is 'look'. Look Assist is FORCED on for a look leg (Amendment 1 A2)."
     },

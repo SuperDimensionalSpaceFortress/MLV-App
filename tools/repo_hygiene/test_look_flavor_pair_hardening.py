@@ -364,6 +364,46 @@ class DriverStagingAndMarkerTests(unittest.TestCase):
         self.assertEqual(proc.returncode, 16, proc.stdout + proc.stderr)
         self.assertEqual(tree_hashes(self.out), {self.RECORD_NAME: hashlib.sha256(b"").hexdigest()})
 
+    # FILM-TRIO-INCOMPLETE-ATTEMPT-MARKER-1: the trio carries the pair's attempt marker up to its own record --------------------------------------
+    TRIO_RECORD_NAME = "flavor-trio-leg-classic-leg-cinematic-leg-film-bachelor.json"
+
+    def trio(self, *extra) -> subprocess.CompletedProcess:
+        if not hasattr(self, "film"):
+            self.film = self.receipt("film", base.FILM, 30)
+        return self.pair("-FilmReceipt", str(self.film), *extra)
+
+    def test_a_finished_trio_leaves_the_record_and_no_marker(self) -> None:
+        proc = self.trio()
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        names = self.names(self.out)
+        self.assertIn(self.TRIO_RECORD_NAME, names)
+        self.assertIn("sheet-classic-cinematic-film.png", names)
+        self.assertNotIn(MARKER, names, "the trio record is written, so the attempt is complete")
+
+    def test_an_interrupted_trio_is_the_incomplete_attempt_17_not_record_exists_16(self) -> None:
+        # A directory where the trio record goes: the composer finishes, the record's exclusive create fails -- the trio died before its record.
+        self.out.mkdir(parents=True)
+        (self.out / self.TRIO_RECORD_NAME).mkdir()
+        proc = self.trio()
+        self.assertNotEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        self.assertTrue((self.out / "sheet-classic-cinematic-film.png").exists())
+        self.assertTrue((self.out / MARKER).exists(), "a trio that dies before its record leaves the attempt marker, as the pair does")
+        (self.out / self.TRIO_RECORD_NAME).rmdir()
+        for label, content in (("no record", None), ("empty record", b""), ("truncated record", b'{"schema": "mlv-app/dual-venue-flavor-trio/v1", "ven')):
+            with self.subTest(state=label):
+                if content is not None:
+                    (self.out / self.TRIO_RECORD_NAME).write_bytes(content)   # the state an interrupted record write leaves
+                before = tree_hashes(self.out)
+                proc = self.trio()
+                text = proc.stdout + proc.stderr
+                self.assertEqual(proc.returncode, 17, text)
+                self.assertIn("PAIR_INCOMPLETE_ATTEMPT", text)
+                self.assertNotIn("PAIR_RECORD_EXISTS", text)
+                self.assertNotIn("-RecoverIncomplete to MOVE", text, "the trio is not recoverable in place; the diagnosis must not offer it")
+                if content is not None:
+                    self.assertIn(self.TRIO_RECORD_NAME, text, "the diagnosis names the half record")
+                self.assertEqual(tree_hashes(self.out), before, "the dead trio's bytes are preserved")
+
     # r3 blocker 1: the marker-delete exception never runs inside an owner-footage root --------------------------------------------------------
     def test_an_out_dir_that_holds_or_sits_under_owner_footage_is_refused_before_anything_is_written_or_deleted(self) -> None:
         clip = b"unrelated owner clip bytes"

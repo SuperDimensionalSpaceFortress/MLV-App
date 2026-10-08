@@ -19,13 +19,23 @@
 //  - With MLVAPP_FLAVOR_SHEET_DIR set, the ContactSheets test writes raw | classic | cinematic renders of the
 //    tracked fixtures for the hub's judges; without it that test does nothing.
 #define LOOK_FLAVOR_RUN_HAS_RECEIPT_FLAVOR 1
+#define LOOK_FLAVOR_RUN_HAS_FILM_GRADE 1
 #include "../common/minitest.h"
 #include "../common/repo_paths.h"
 #include "look_assist_flavor_run.h"
+#include "look_assist_gradation_curve.h"
 
 #include "../../src/batch/LookAssistAnalysis.h"
 
+#include <QBuffer>
+#include <QCryptographicHash>
 #include <QDir>
+#include <QXmlStreamWriter>
+
+#include <algorithm>
+#include <cmath>
+#include <cstdio>
+#include <cstdlib>
 #include <QFile>
 #include <QImage>
 #include <QMap>
@@ -369,4 +379,480 @@ TEST(LookAssistFlavorsFixture, ContactSheets)
     ASSERT_TRUE( out.open( QIODevice::WriteOnly | QIODevice::Text ) );
     QTextStream stream( &out );
     stream << manifest.join( QLatin1Char('\n') ) << "\n";
+}
+
+// ---- LOOK-ASSIST-FILM-FLAVOR-1: the Film grade (Cinematic's tone + a blue-amber split in the R and B curves) ----
+
+namespace
+{
+
+struct GradationTables
+{
+    std::vector<uint16_t> y, r, g, b;
+};
+
+// The engine's four tables for a receipt curve string, built the way the Curves widget builds them.
+GradationTables gradationTables( const QString &curve )
+{
+    GradationTables t;
+    processingObject_t *processing = initProcessingObject();
+    if( !processing ) return t;
+    lookAssistTestApplyGradationCurve( processing, curve );
+    t.y.assign( processing->gcurve_y, processing->gcurve_y + 65536 );
+    t.r.assign( processing->gcurve_r, processing->gcurve_r + 65536 );
+    t.g.assign( processing->gcurve_g, processing->gcurve_g + 65536 );
+    t.b.assign( processing->gcurve_b, processing->gcurve_b + 65536 );
+    freeProcessingObject( processing );
+    return t;
+}
+
+QString tablesSha256( const GradationTables &t )
+{
+    QCryptographicHash hash( QCryptographicHash::Sha256 );
+    for( const std::vector<uint16_t> *table : { &t.y, &t.r, &t.g, &t.b } )
+        hash.addData( QByteArray( reinterpret_cast<const char *>( table->data() ), static_cast<int>( table->size() * sizeof( uint16_t ) ) ) );
+    return QString::fromLatin1( hash.result().toHex() );
+}
+
+int tableIndex( double x ) { return static_cast<int>( x * 65535.0 + 0.5 ); }
+
+// The green-magenta axis G - (R+B)/2 of one display-referred pixel after the engine's gradation stage, in 8-bit code
+// values (16-bit / 257). The stage as every kernel applies it: each channel through Y, then through its own table.
+double gradedGreenAxis8( const GradationTables &t, double r, double g, double b )
+{
+    const double R = t.r[t.y[tableIndex( r )]];
+    const double G = t.g[t.y[tableIndex( g )]];
+    const double B = t.b[t.y[tableIndex( b )]];
+    return ( G - ( R + B ) / 2.0 ) / 257.0;
+}
+
+const LookAssistScene kFilmScenes[] = { LookAssistScene::Night, LookAssistScene::ArtificialLights,
+                                        LookAssistScene::Shade, LookAssistScene::BrightSun };
+
+QString defaultCurve() { return ReceiptSettings().gradationCurve(); }
+
+// The receipt elements the Look Assist path can touch, serialised with the GUI writer's rules (writeXmlElementsToFile:
+// "%1" numbers, lookAssistFlavor only when non-empty and not "classic", lookAssistBaselineGradationCurve only when
+// non-empty). MainWindow is not linked into this binary; LookAssistFlavors.TheFilmBaselineElementIsWrittenOnlyWhileSet
+// pins the writer's two guards, so these bytes are the writer's bytes for these elements.
+QByteArray lookAssistReceiptXml( ReceiptSettings &r )
+{
+    QByteArray bytes;
+    QBuffer buffer( &bytes );
+    buffer.open( QIODevice::WriteOnly );
+    QXmlStreamWriter xml( &buffer );
+    xml.setAutoFormatting( true );
+    xml.writeStartDocument();
+    xml.writeStartElement( QStringLiteral("receipt") );
+    xml.writeTextElement( "exposure", QString( "%1" ).arg( r.exposure() ) );
+    xml.writeTextElement( "contrast", QString( "%1" ).arg( r.contrast() ) );
+    xml.writeTextElement( "pivot", QString( "%1" ).arg( r.pivot() ) );
+    xml.writeTextElement( "temperature", QString( "%1" ).arg( r.temperature() ) );
+    xml.writeTextElement( "tint", QString( "%1" ).arg( r.tint() ) );
+    xml.writeTextElement( "vibrance", QString( "%1" ).arg( r.vibrance() ) );
+    xml.writeTextElement( "shadows", QString( "%1" ).arg( r.shadows() ) );
+    xml.writeTextElement( "highlights", QString( "%1" ).arg( r.highlights() ) );
+    xml.writeTextElement( "gradationCurve", QString( "%1" ).arg( r.gradationCurve() ) );
+    xml.writeTextElement( "lookAssistEnabled", QString( "%1" ).arg( r.lookAssistEnabled() ) );
+    if( !r.lookAssistFlavor().isEmpty() && r.lookAssistFlavor() != QLatin1String( "classic" ) )
+        xml.writeTextElement( "lookAssistFlavor", r.lookAssistFlavor() );
+    xml.writeTextElement( "lookAssistBaselineValid", QString( "%1" ).arg( r.lookAssistBaselineValid() ) );
+    xml.writeTextElement( "lookAssistBaselineExposure", QString( "%1" ).arg( r.lookAssistBaselineExposure() ) );
+    xml.writeTextElement( "lookAssistBaselineContrast", QString( "%1" ).arg( r.lookAssistBaselineContrast() ) );
+    xml.writeTextElement( "lookAssistBaselinePivot", QString( "%1" ).arg( r.lookAssistBaselinePivot() ) );
+    xml.writeTextElement( "lookAssistBaselineTemperature", QString( "%1" ).arg( r.lookAssistBaselineTemperature() ) );
+    xml.writeTextElement( "lookAssistBaselineTint", QString( "%1" ).arg( r.lookAssistBaselineTint() ) );
+    xml.writeTextElement( "lookAssistBaselineVibrance", QString( "%1" ).arg( r.lookAssistBaselineVibrance() ) );
+    xml.writeTextElement( "lookAssistBaselineShadows", QString( "%1" ).arg( r.lookAssistBaselineShadows() ) );
+    xml.writeTextElement( "lookAssistBaselineHighlights", QString( "%1" ).arg( r.lookAssistBaselineHighlights() ) );
+    xml.writeTextElement( "lookAssistBaselineRawBlack", QString( "%1" ).arg( r.lookAssistBaselineRawBlack() ) );
+    xml.writeTextElement( "lookAssistBaselineRawWhite", QString( "%1" ).arg( r.lookAssistBaselineRawWhite() ) );
+    xml.writeTextElement( "lookAssistBaselineChromaSmooth", QString( "%1" ).arg( r.lookAssistBaselineChromaSmooth() ) );
+    if( !r.lookAssistBaselineGradationCurve().isEmpty() )
+        xml.writeTextElement( "lookAssistBaselineGradationCurve", r.lookAssistBaselineGradationCurve() );
+    xml.writeTextElement( "chromaSmooth", QString( "%1" ).arg( r.chromaSmooth() ) );
+    xml.writeTextElement( "rawBlack", QString( "%1" ).arg( r.rawBlack() ) );
+    xml.writeTextElement( "rawWhite", QString( "%1" ).arg( r.rawWhite() ) );
+    xml.writeTextElement( "lookAssistBaselineStretchX", QString( "%1" ).arg( r.lookAssistBaselineStretchX() ) );
+    xml.writeTextElement( "lookAssistBaselineStretchY", QString( "%1" ).arg( r.lookAssistBaselineStretchY() ) );
+    xml.writeEndElement();
+    xml.writeEndDocument();
+    return bytes;
+}
+
+// One headless Look Assist pass on the fixture's own receipt, capturing the applied line.
+bool applyCapturingLine( MlvPipelineFixture &fixture, ReceiptSettings &receipt, QString *appliedLine )
+{
+    QTemporaryDir temporary_dir;
+    const QString log_path = temporary_dir.filePath( QStringLiteral("look_assist.log") );
+    BatchLogger::init( log_path );
+    const bool applied = ReceiptApplier::applyHeadlessLookAssist( &receipt, fixture.video(), fixture.processing(), 0 );
+    BatchLogger::shutdown();
+    QFile log_file( log_path );
+    if( appliedLine ) appliedLine->clear();
+    if( appliedLine && log_file.open( QIODevice::ReadOnly | QIODevice::Text ) )
+        for( const QString &line : QString::fromUtf8( log_file.readAll() ).split( QLatin1Char('\n') ) )
+            if( line.contains( QLatin1String( "LOOK_ASSIST applied " ) ) ) *appliedLine = line.trimmed();
+    return applied;
+}
+
+bool openFirstFixture( MlvPipelineFixture &fixture )
+{
+    QString error_message;
+    if( !fixture.openClipFile( repo_file_path( QString::fromLatin1( fixtureCases().front().file ) ), &error_message ) ) return false;
+    if( !fixture.applyReceipt( &error_message ) ) return false;
+    ReceiptSettings &receipt = fixture.receipt();
+    receipt.setLookAssistEnabled( true );
+    receipt.setLookAssistBaselineValid( false );
+    receipt.setExposure( 0 );
+    receipt.setTemperature( -1 );
+    receipt.setTint( 0 );
+    return true;
+}
+
+} // namespace
+
+TEST(LookAssistFilmGrade, FilmCurveIsBlueAmberOnly)
+{
+    // Y and G are exactly the default receipt's tables; R and B move by equal and opposite amounts, so r + b == 2g on every
+    // table entry (the spline is linear in y; only rounding is left). That is a property of the tables at equal indices:
+    // per pixel it keeps the green-magenta axis G - (R+B)/2 only on a neutral pixel. A coloured pixel indexes different
+    // entries per channel and its axis moves (FilmMovesTheGreenAxisOnlyOnColouredPixelsWithinTheDocumentedBound).
+    const GradationTables def = gradationTables( defaultCurve() );
+    ASSERT_EQ( 65536, static_cast<int>( def.g.size() ) );
+    for( LookAssistScene scene : kFilmScenes )
+    {
+        const GradationTables film = gradationTables( lookAssistFilmGradationCurve( scene ) );
+        ASSERT_TRUE( film.y == def.y );
+        ASSERT_TRUE( film.g == def.g );
+        int worst = 0;
+        for( int v = 0; v < 65536; ++v )
+        {
+            const int deviation = std::abs( static_cast<int>( film.r[v] ) + static_cast<int>( film.b[v] ) - 2 * static_cast<int>( film.g[v] ) );
+            if( deviation > worst ) worst = deviation;
+        }
+        std::fprintf( stderr, "FILM-CURVE scene=%s max|r+b-2g|=%d\n", qPrintable( lookAssistSceneName( scene ) ), worst );
+        ASSERT_TRUE( worst <= 2 );
+    }
+}
+
+TEST(LookAssistFilmGrade, FilmMovesTheGreenAxisOnlyOnColouredPixelsWithinTheDocumentedBound)
+{
+    // Per pixel, through the engine's own tables at each Film strength: a neutral pixel keeps G - (R+B)/2 (all three
+    // channels index the same entry); a coloured pixel indexes different R and B entries, so its axis moves by
+    // -(dR(R) - dR(B))/2: (a + b)/2 in 8-bit code values on the knots, within 2% of that on any pixel, a warm-highlight /
+    // cool-shadow (amber) pixel toward magenta, its mirror (teal) toward green. The card's no-magenta tolerance is judged on the venue picture mean, not per
+    // saturated pixel (docs/look-assist-flavors.md, "What it does to the green-magenta axis").
+    const GradationTables def = gradationTables( defaultCurve() );
+    struct Coloured { const char *name; double r, g, b; int sign; };
+    const Coloured coloured[] = {
+        { "amber", 0.72, 0.45, 0.18, -1 },   // sol r3's repro: R at the highlight knot, B at the shadow knot
+        { "teal", 0.18, 0.45, 0.72, +1 },    // its mirror
+        { "skin", 0.80, 0.55, 0.35, -1 },
+        { "sky", 0.30, 0.55, 0.85, +1 },
+        { "sodium", 0.90, 0.50, 0.10, -1 },
+        { "cyan", 0.10, 0.50, 0.90, +1 },
+    };
+    for( LookAssistScene scene : kFilmScenes )
+    {
+        const LookAssistFilmGrade grade = lookAssistFilmGradeForScene( scene );
+        const GradationTables film = gradationTables( lookAssistFilmGradationCurve( scene ) );
+        // The documented bounds, plus the tables' own rounding (|r + b - 2g| <= 2 per entry, one 16-bit step per channel):
+        // (a + b)/2 for a pixel whose R and B sit within the knots' reach, and 2% more for any pixel at all, because the
+        // natural spline dips about 3% past the 0.18 knot between knots (measured: Night peak dR -745 against a = 721).
+        const double knots = ( grade.shadowOffset + grade.highlightOffset ) / 2.0 * 255.0;
+        const double bound = knots + 2.0 / 257.0;
+        const double anyPixelBound = knots * 1.02 + 2.0 / 257.0;
+
+        // (a) Neutral: every grey level, dGA == 0 within the tables' rounding.
+        double worstNeutral = 0.0;
+        for( int v = 0; v < 65536; ++v )
+        {
+            const double x = v / 65535.0;
+            const double dGA = gradedGreenAxis8( film, x, x, x ) - gradedGreenAxis8( def, x, x, x );
+            worstNeutral = std::max( worstNeutral, std::abs( dGA ) );
+        }
+
+        // The whole table: the largest R offset up and down, so a bound holds for every input, not only the set below.
+        int peakUp = 0, peakDown = 0;
+        for( int v = 0; v < 65536; ++v )
+        {
+            const int dR = static_cast<int>( film.r[v] ) - static_cast<int>( def.r[v] );
+            peakUp = std::max( peakUp, dR );
+            peakDown = std::min( peakDown, dR );
+        }
+        const double worstAnyPixel = ( peakUp - peakDown ) / 2.0 / 257.0;
+
+        std::fprintf( stderr, "FILM-GREEN-AXIS scene=%s s=%.2f bound=%.4f any_pixel_bound=%.4f neutral_max|dGA|=%.4f"
+                      " any_pixel_max|dGA|=%.4f peak_dR=+%d/%d (a=%d b=%d)\n", qPrintable( lookAssistSceneName( scene ) ),
+                      grade.strength, bound, anyPixelBound, worstNeutral, worstAnyPixel, peakUp, peakDown,
+                      static_cast<int>( grade.shadowOffset * 65535.0 + 0.5 ), static_cast<int>( grade.highlightOffset * 65535.0 + 0.5 ) );
+        ASSERT_TRUE( worstNeutral <= 1.0 / 257.0 + 1e-9 );
+        ASSERT_TRUE( worstAnyPixel <= anyPixelBound );
+
+        // (b) Coloured: the documented bound and the documented direction.
+        for( const Coloured &c : coloured )
+        {
+            const double dGA = gradedGreenAxis8( film, c.r, c.g, c.b ) - gradedGreenAxis8( def, c.r, c.g, c.b );
+            std::fprintf( stderr, "FILM-GREEN-AXIS scene=%s input=%s rgb=%.2f/%.2f/%.2f dGA=%+.4f bound=%.4f\n",
+                          qPrintable( lookAssistSceneName( scene ) ), c.name, c.r, c.g, c.b, dGA, bound );
+            ASSERT_TRUE( std::abs( dGA ) <= bound );
+            ASSERT_TRUE( dGA * c.sign > 0.0 );
+        }
+
+        // The bound is reached, not slack: amber sits on both knots, so it moves by (a + b)/2 to within rounding.
+        const double amber = gradedGreenAxis8( film, 0.72, 0.45, 0.18 ) - gradedGreenAxis8( def, 0.72, 0.45, 0.18 );
+        ASSERT_NEAR( -( grade.shadowOffset + grade.highlightOffset ) / 2.0 * 255.0, amber, 2.0 / 257.0 );
+    }
+}
+
+TEST(LookAssistFilmGrade, FilmCurveIsPinned)
+{
+    // The four 65536-entry tables per scene by sha256, and sampled values, as the engine built them at this commit.
+    struct Pin { LookAssistScene scene; const char *sha256; int r[5]; int g[5]; int b[5]; };
+    const Pin pins[] = {
+        { LookAssistScene::Night, "8f3fc3f0939a4457168298d264076410733d90276c72a2b29dbf4b11caf8518a",
+          { 6064, 11074, 29490, 48167, 59495 }, { 6553, 11795, 29490, 47184, 58981 }, { 7043, 12516, 29490, 46201, 58466 } },
+        { LookAssistScene::ArtificialLights, "1aaf1f775dca41a4f025a2db2cb55e71b1876156cd104f566484787c09066cac",
+          { 5819, 10714, 29490, 48658, 59752 }, { 6553, 11795, 29490, 47184, 58981 }, { 7288, 12877, 29490, 45709, 58209 } },
+        { LookAssistScene::Shade, "c247cc0504315fb524e0e5b09823f9096fc6fdcb1e1cebb74e24d160ec78fb4f",
+          { 5574, 10354, 29490, 49150, 60010 }, { 6553, 11795, 29490, 47184, 58981 }, { 7533, 13237, 29490, 45218, 57951 } },
+        { LookAssistScene::BrightSun, "33ecb6beea2ad3e70d07c1a024a4e502eadf18709e3eb9d2bf8a51be46811724",
+          { 5672, 10498, 29490, 48953, 59907 }, { 6553, 11795, 29490, 47184, 58981 }, { 7435, 13093, 29490, 45414, 58054 } },
+    };
+    const double xs[5] = { 0.10, 0.18, 0.45, 0.72, 0.90 };
+    for( const Pin &pin : pins )   // every scene's line first, so a re-pin reads all four from one run
+    {
+        const GradationTables film = gradationTables( lookAssistFilmGradationCurve( pin.scene ) );
+        QString samples;
+        for( int i = 0; i < 5; ++i )
+        {
+            const int v = tableIndex( xs[i] );
+            samples += QStringLiteral(" x=%1 r=%2 g=%3 b=%4").arg( xs[i] ).arg( film.r[v] ).arg( film.g[v] ).arg( film.b[v] );
+        }
+        std::fprintf( stderr, "FILM-CURVE-PIN scene=%s sha256=%s%s\n", qPrintable( lookAssistSceneName( pin.scene ) ),
+                      qPrintable( tablesSha256( film ) ), qPrintable( samples ) );
+    }
+    for( const Pin &pin : pins )
+    {
+        const GradationTables film = gradationTables( lookAssistFilmGradationCurve( pin.scene ) );
+        const QString sha = tablesSha256( film );
+        ASSERT_TRUE( sha == QLatin1String( pin.sha256 ) );
+        for( int i = 0; i < 5; ++i )
+        {
+            const int v = tableIndex( xs[i] );
+            ASSERT_EQ( pin.r[i], static_cast<int>( film.r[v] ) );
+            ASSERT_EQ( pin.g[i], static_cast<int>( film.g[v] ) );
+            ASSERT_EQ( pin.b[i], static_cast<int>( film.b[v] ) );
+        }
+    }
+}
+
+TEST(LookAssistFilmGrade, FilmIsAGradeNotATone)
+{
+    // The inert kill: Shade's split is far outside rounding at both knots, the right way round.
+    const GradationTables film = gradationTables( lookAssistFilmGradationCurve( LookAssistScene::Shade ) );
+    const int lo = tableIndex( 0.18 );
+    const int hi = tableIndex( 0.72 );
+    ASSERT_TRUE( static_cast<int>( film.r[lo] ) <= static_cast<int>( film.g[lo] ) - 1000 );
+    ASSERT_TRUE( static_cast<int>( film.b[lo] ) >= static_cast<int>( film.g[lo] ) + 1000 );
+    ASSERT_TRUE( static_cast<int>( film.r[hi] ) >= static_cast<int>( film.g[hi] ) + 1400 );
+    ASSERT_TRUE( static_cast<int>( film.b[hi] ) <= static_cast<int>( film.g[hi] ) - 1400 );
+    ASSERT_TRUE( lookAssistFilmGradationCurve( LookAssistScene::Shade ) != defaultCurve() );
+    ASSERT_FALSE( lookAssistIsDefaultGradationCurve( lookAssistFilmGradationCurve( LookAssistScene::Shade ) ) );
+}
+
+TEST(LookAssistFilmGrade, FilmKeepsTheBalanceAndCinematicsToneOnTheFixtures)
+{
+    // Same analysis, same scene verdict, same white balance and exposure as Classic (master's rows); the five tone
+    // sliders are Cinematic's (Classic + the one table); the receipt carries the scene's Film curve; the headless (CDNG)
+    // picture is master's byte for byte (headless never pushes the curve); reported on the applied line and receipt.
+    FlavorEnv env( "film" );
+    for( const FixtureCase &c : fixtureCases() )
+    {
+        const Run r = run( c, true );
+        ASSERT_TRUE( r.ok && r.applied );
+        BaselineRow master;
+        ASSERT_TRUE( baselineRow( r.key, &master ) );
+        const QMap<QString, int> classic = receiptFields( master.receipt );
+        const QMap<QString, int> film = receiptFields( r.receipt );
+        ASSERT_TRUE( r.appliedLine.endsWith( QStringLiteral(" flavor=film grade=film-v1") ) );
+        ASSERT_TRUE( r.flavorOnReceipt == QLatin1String( "film" ) );
+        const QString scene = appliedField( r.appliedLine, QStringLiteral("scene") );
+        ASSERT_TRUE( scene == appliedField( master.applied, QStringLiteral("scene") ) );
+        ASSERT_TRUE( withoutFlavorField( r.appliedLine ) == master.applied );
+        ASSERT_EQ( classic.value( QStringLiteral("temp") ), film.value( QStringLiteral("temp") ) );
+        ASSERT_EQ( classic.value( QStringLiteral("tint") ), film.value( QStringLiteral("tint") ) );
+        ASSERT_EQ( classic.value( QStringLiteral("exp") ), film.value( QStringLiteral("exp") ) );
+        ASSERT_EQ( classic.value( QStringLiteral("chromaSmooth") ), film.value( QStringLiteral("chromaSmooth") ) );
+        const LookAssistFlavorDeltas d = lookAssistCinematicDeltasForScene( sceneByName( scene ) );
+        ASSERT_EQ( clampInt( -100, classic.value( QStringLiteral("contrast") ) + d.contrast, 100 ), film.value( QStringLiteral("contrast") ) );
+        ASSERT_EQ( clampInt( 0, classic.value( QStringLiteral("pivot") ) + d.pivot, 100 ), film.value( QStringLiteral("pivot") ) );
+        ASSERT_EQ( clampInt( -100, classic.value( QStringLiteral("shadows") ) + d.shadows, 100 ), film.value( QStringLiteral("shadows") ) );
+        ASSERT_EQ( clampInt( -100, classic.value( QStringLiteral("highlights") ) + d.highlights, 100 ), film.value( QStringLiteral("highlights") ) );
+        ASSERT_EQ( clampInt( -100, classic.value( QStringLiteral("vibrance") ) + d.vibrance, 100 ), film.value( QStringLiteral("vibrance") ) );
+        ASSERT_TRUE( r.gradationCurve == lookAssistFilmGradationCurve( sceneByName( scene ) ) );
+        ASSERT_TRUE( r.sha256 == master.sha256 );
+    }
+}
+
+TEST(LookAssistFilmGrade, AUserCurveIsKeptAndReported)
+{
+    FlavorEnv env( "film" );
+    MlvPipelineFixture fixture;
+    ASSERT_TRUE( openFirstFixture( fixture ) );
+    ReceiptSettings &receipt = fixture.receipt();
+    const QString userCurve = QStringLiteral("1e-05;1e-05;0.5;0.56;1;1;?1e-05;1e-05;1;1;?1e-05;1e-05;1;1;?1e-05;1e-05;1;1;");
+    ASSERT_FALSE( lookAssistIsDefaultGradationCurve( userCurve ) );
+    receipt.setGradationCurve( userCurve );
+    QString line;
+    ASSERT_TRUE( applyCapturingLine( fixture, receipt, &line ) );
+    ASSERT_TRUE( receipt.gradationCurve() == userCurve );
+    ASSERT_TRUE( receipt.lookAssistBaselineGradationCurve().isEmpty() );
+    ASSERT_TRUE( receipt.lookAssistFlavor() == QLatin1String( "film" ) );
+    ASSERT_TRUE( line.endsWith( QStringLiteral(" flavor=film grade=skipped_user_curve") ) );
+}
+
+TEST(LookAssistFilmGrade, TheBaselineRoundTripLeavesNoTraceOfTheGrade)
+{
+    // Film, then a re-run as Classic, on one receipt; against a receipt that only ever ran Classic (twice, so both went
+    // through the same capture-then-restore sequence).
+    QByteArray filmThenClassic, filmXml, classicOnly;
+    QString filmScene;
+    {
+        MlvPipelineFixture fixture;
+        ASSERT_TRUE( openFirstFixture( fixture ) );
+        ReceiptSettings &receipt = fixture.receipt();
+        const QString before = receipt.gradationCurve();
+        ASSERT_TRUE( lookAssistIsDefaultGradationCurve( before ) );
+        QString line;
+        {
+            FlavorEnv env( "film" );
+            ASSERT_TRUE( applyCapturingLine( fixture, receipt, &line ) );
+        }
+        filmScene = appliedField( line, QStringLiteral("scene") );
+        ASSERT_TRUE( line.endsWith( QStringLiteral(" flavor=film grade=film-v1") ) );
+        ASSERT_TRUE( receipt.gradationCurve() == lookAssistFilmGradationCurve( sceneByName( filmScene ) ) );
+        ASSERT_TRUE( receipt.lookAssistBaselineGradationCurve() == before );   // the default it replaced
+        filmXml = lookAssistReceiptXml( receipt );
+        ASSERT_TRUE( filmXml.contains( "<lookAssistBaselineGradationCurve>" ) );
+        {
+            FlavorEnv env( "classic" );
+            ASSERT_TRUE( applyCapturingLine( fixture, receipt, &line ) );
+        }
+        ASSERT_TRUE( line.endsWith( QStringLiteral(" flavor=classic") ) );
+        ASSERT_TRUE( receipt.gradationCurve() == before );
+        ASSERT_TRUE( receipt.lookAssistBaselineGradationCurve().isEmpty() );
+        filmThenClassic = lookAssistReceiptXml( receipt );
+    }
+    {
+        FlavorEnv env( "classic" );
+        MlvPipelineFixture fixture;
+        ASSERT_TRUE( openFirstFixture( fixture ) );
+        ReceiptSettings &receipt = fixture.receipt();
+        ASSERT_TRUE( applyCapturingLine( fixture, receipt, nullptr ) );
+        ASSERT_FALSE( lookAssistReceiptXml( receipt ).contains( "lookAssistBaselineGradationCurve" ) );
+        ASSERT_TRUE( applyCapturingLine( fixture, receipt, nullptr ) );
+        classicOnly = lookAssistReceiptXml( receipt );
+    }
+    ASSERT_FALSE( classicOnly.contains( "lookAssistBaselineGradationCurve" ) );
+    ASSERT_TRUE( filmThenClassic == classicOnly );
+    {
+        // Cinematic never records the element either.
+        FlavorEnv env( "cinematic" );
+        MlvPipelineFixture fixture;
+        ASSERT_TRUE( openFirstFixture( fixture ) );
+        ReceiptSettings &receipt = fixture.receipt();
+        const QString before = receipt.gradationCurve();
+        ASSERT_TRUE( applyCapturingLine( fixture, receipt, nullptr ) );
+        ASSERT_TRUE( receipt.gradationCurve() == before );
+        ASSERT_FALSE( lookAssistReceiptXml( receipt ).contains( "lookAssistBaselineGradationCurve" ) );
+    }
+    {
+        // Film, then Look Assist switched off: the curve goes back, the element goes away.
+        MlvPipelineFixture fixture;
+        ASSERT_TRUE( openFirstFixture( fixture ) );
+        ReceiptSettings &receipt = fixture.receipt();
+        const QString before = receipt.gradationCurve();
+        {
+            FlavorEnv env( "film" );
+            ASSERT_TRUE( applyCapturingLine( fixture, receipt, nullptr ) );
+        }
+        ASSERT_FALSE( lookAssistIsDefaultGradationCurve( receipt.gradationCurve() ) );
+        receipt.setLookAssistEnabled( false );
+        ASSERT_FALSE( applyCapturingLine( fixture, receipt, nullptr ) );
+        ASSERT_TRUE( receipt.gradationCurve() == before );
+        ASSERT_TRUE( receipt.lookAssistBaselineGradationCurve().isEmpty() );
+    }
+}
+
+TEST(LookAssistFilmGrade, AUserEditAfterTheFilmGradeIsKeptByAClassicReRunAndByLookAssistOff)
+{
+    // Film laid over the default curve -> the user adds a Y point (0.5,0.56) to the laid curve -> a re-run as Classic, or
+    // Look Assist switched off. The edit is the user's curve: it is kept, and the baseline goes (Film's ownership is
+    // retired), so a later Film run reports skipped_user_curve instead of laying over it.
+    const auto userEdit = []( const QString &laid ) {
+        QStringList lines = laid.split( QLatin1Char('?') );
+        lines[0] = QStringLiteral("1e-05;1e-05;0.5;0.56;1;1;");
+        return lines.join( QLatin1Char('?') );
+    };
+    for( int offAfterEdit = 0; offAfterEdit < 2; ++offAfterEdit )
+    {
+        MlvPipelineFixture fixture;
+        ASSERT_TRUE( openFirstFixture( fixture ) );
+        ReceiptSettings &receipt = fixture.receipt();
+        ASSERT_TRUE( lookAssistIsDefaultGradationCurve( receipt.gradationCurve() ) );
+        QString line;
+        {
+            FlavorEnv env( "film" );
+            ASSERT_TRUE( applyCapturingLine( fixture, receipt, &line ) );
+        }
+        ASSERT_TRUE( line.endsWith( QStringLiteral(" flavor=film grade=film-v1") ) );
+        ASSERT_FALSE( receipt.lookAssistBaselineGradationCurve().isEmpty() );
+        const QString edited = userEdit( receipt.gradationCurve() );
+        ASSERT_FALSE( lookAssistIsDefaultGradationCurve( edited ) );
+        receipt.setGradationCurve( edited );
+        if( offAfterEdit )
+        {
+            receipt.setLookAssistEnabled( false );
+            ASSERT_FALSE( applyCapturingLine( fixture, receipt, nullptr ) );
+        }
+        else
+        {
+            FlavorEnv env( "classic" );
+            ASSERT_TRUE( applyCapturingLine( fixture, receipt, &line ) );
+            ASSERT_TRUE( line.endsWith( QStringLiteral(" flavor=classic") ) );
+        }
+        ASSERT_TRUE( receipt.gradationCurve() == edited );
+        ASSERT_TRUE( receipt.lookAssistBaselineGradationCurve().isEmpty() );
+        ASSERT_FALSE( lookAssistReceiptXml( receipt ).contains( "lookAssistBaselineGradationCurve" ) );
+        if( !offAfterEdit )
+        {
+            FlavorEnv env( "film" );
+            ASSERT_TRUE( applyCapturingLine( fixture, receipt, &line ) );
+            ASSERT_TRUE( line.endsWith( QStringLiteral(" flavor=film grade=skipped_user_curve") ) );
+            ASSERT_TRUE( receipt.gradationCurve() == edited );
+            ASSERT_TRUE( receipt.lookAssistBaselineGradationCurve().isEmpty() );
+        }
+    }
+}
+
+TEST(LookAssistFilmGrade, FilmIsADifferentGradedPictureFromCinematic)
+{
+    // With the sliders and the curve applied the way the app applies them, Film is a different, deterministic picture.
+    const FixtureCase &c = fixtureCases().front();
+    Run cine, film, filmAgain;
+    {
+        FlavorEnv env( "cinematic" );
+        cine = run( c, true, true );
+    }
+    {
+        FlavorEnv env( "film" );
+        film = run( c, true, true );
+        filmAgain = run( c, true, true );
+    }
+    ASSERT_TRUE( cine.ok && film.ok && filmAgain.ok );
+    ASSERT_TRUE( film.receipt == cine.receipt );            // the same sliders: the difference is the grade
+    ASSERT_TRUE( film.sha256 != cine.sha256 );
+    ASSERT_TRUE( film.sha256 == filmAgain.sha256 );
 }

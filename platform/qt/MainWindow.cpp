@@ -2169,6 +2169,9 @@ MainWindow::MainWindow(int &argc, char **argv, QWidget *parent) :
     ui->setupUi(this);
     ui->comboBoxLookAssistFlavor->setItemData( 0, lookAssistFlavorName( LookAssistFlavor::Classic ) );
     ui->comboBoxLookAssistFlavor->setItemData( 1, lookAssistFlavorName( LookAssistFlavor::Cinematic ) );
+    // "Film grade", not "Film": the Profile preset "Film" is a different thing.
+    ui->comboBoxLookAssistFlavor->setItemData( 2, lookAssistFlavorName( LookAssistFlavor::Film ) );
+    ui->comboBoxLookAssistFlavor->setItemData( 2, tr( "Colour-graded look: cool shadows, warm highlights" ), Qt::ToolTipRole );
 
     /* Wire the "Abort batch export" button in BatchPrompts QMessageBox */
     BatchPrompts::setAbortBatchCallback([this]{ exportAbort(); });
@@ -14413,6 +14416,11 @@ void MainWindow::readXmlElementsFromFile(QXmlStreamReader *Rxml, ReceiptSettings
             receipt->setLookAssistBaselineStretchY( Rxml->readElementText().toDouble() );
             Rxml->readNext();
         }
+        else if( Rxml->isStartElement() && Rxml->name() == QString( "lookAssistBaselineGradationCurve" ) )
+        {
+            receipt->setLookAssistBaselineGradationCurve( Rxml->readElementText() );
+            Rxml->readNext();
+        }
         else if( Rxml->isStartElement() && Rxml->name() == QString( "tone" ) )
         {
             receipt->setTone( Rxml->readElementText().toInt() );
@@ -14630,7 +14638,10 @@ void MainWindow::writeXmlElementsToFile(QXmlStreamWriter *xmlWriter, ReceiptSett
     xmlWriter->writeTextElement( "lookAssistBaselineRawBlack", QString( "%1" ).arg( receipt->lookAssistBaselineRawBlack() ) );
     xmlWriter->writeTextElement( "lookAssistBaselineRawWhite", QString( "%1" ).arg( receipt->lookAssistBaselineRawWhite() ) );
     xmlWriter->writeTextElement( "lookAssistBaselineChromaSmooth", QString( "%1" ).arg( receipt->lookAssistBaselineChromaSmooth() ) );
-    xmlWriter->writeTextElement( "verticalStripes",         QString( "%1" ).arg( receipt->verticalStripes() ) );
+    // Only while the Film grade holds the curve: a Classic or Cinematic receipt stays byte-identical to master's.
+    if( !receipt->lookAssistBaselineGradationCurve().isEmpty() )
+        xmlWriter->writeTextElement( "lookAssistBaselineGradationCurve", receipt->lookAssistBaselineGradationCurve() );
+    xmlWriter->writeTextElement( "verticalStripes",        QString( "%1" ).arg( receipt->verticalStripes() ) );
     xmlWriter->writeTextElement( "focusPixels",             QString( "%1" ).arg( receipt->focusPixels() ) );
     xmlWriter->writeTextElement( "fpiMethod",               QString( "%1" ).arg( receipt->fpiMethod() ) );
     xmlWriter->writeTextElement( "badPixels",               QString( "%1" ).arg( receipt->badPixels() ) );
@@ -15498,6 +15509,9 @@ void MainWindow::captureLookAssistBaseline( ReceiptSettings *receipt )
 {
     if( !receipt ) return;
 
+    // A fresh baseline starts with no Film curve on record (a recorded one is put back first, so it is never mistaken
+    // for the user's curve).
+    restoreLookAssistBaselineGradationCurve( receipt );
     receipt->setLookAssistBaselineExposure( receipt->exposure() );
     receipt->setLookAssistBaselineContrast( receipt->contrast() );
     receipt->setLookAssistBaselinePivot( receipt->pivot() );
@@ -15557,6 +15571,38 @@ void MainWindow::restoreLookAssistBaseline( ReceiptSettings *receipt )
         ui->horizontalSliderRawWhite->setValue( receipt->rawWhite() );
     setToolButtonChromaSmooth( receipt->chromaSmooth() );
     toolButtonChromaSmoothChanged();
+    restoreLookAssistBaselineGradationCurve( receipt );
+}
+
+// The Film grade's curve baseline: non-empty only while the Film grade replaced the user's (default) curve. Putting it back
+// clears it, so every analysis measures at the user's own curve and a later Classic / Cinematic grade carries no trace.
+// The baseline goes back only while Film still owns the curve the widget shows; a user's edit of the laid curve is kept
+// (and Film's ownership retired with the cleared field), as the user-curve rule keeps any other user curve.
+void MainWindow::restoreLookAssistBaselineGradationCurve( ReceiptSettings *receipt )
+{
+    if( !receipt || receipt->lookAssistBaselineGradationCurve().isEmpty() ) return;
+    const QString curve = lookAssistGradationCurveAfterFilmRestore( ui->labelCurves->configuration(),
+                                                                    receipt->lookAssistBaselineGradationCurve() );
+    receipt->setGradationCurve( curve );
+    receipt->setLookAssistBaselineGradationCurve( QString() );
+    ui->labelCurves->setConfiguration( curve );
+}
+
+// Lays the Film grade's curve over the finished balance, on the receipt and on the curve widget (which pushes it to the
+// live processing object), and only over a default curve: a user's curve is kept. Classic and Cinematic return "none"
+// untouched. The widget is what the user sees (the receipt's copy can lag an edit), so the decision is made on it.
+QString MainWindow::applyLookAssistFilmGrade( ReceiptSettings *receipt, LookAssistScene scene, LookAssistFlavor flavor )
+{
+    if( !receipt || flavor != LookAssistFlavor::Film ) return QStringLiteral("none");
+    const QString current = ui->labelCurves->configuration();
+    const QString decision = lookAssistFilmGradeDecision( flavor, current );
+    if( decision != lookAssistFilmGradeId() ) return decision;
+    if( receipt->lookAssistBaselineGradationCurve().isEmpty() )
+        receipt->setLookAssistBaselineGradationCurve( current.trimmed().isEmpty() ? ReceiptSettings().gradationCurve() : current );
+    const QString film = lookAssistFilmGradationCurve( scene );
+    receipt->setGradationCurve( film );
+    ui->labelCurves->setConfiguration( film );
+    return decision;
 }
 
 // Plain-old-data result from the pure-compute phase of the auto look analysis.
@@ -15567,6 +15613,8 @@ struct LookAssistAsyncResult
     // Preset to apply
     LookAssistPreset preset;
     QString flavorName;  // the flavor the preset was made for; reported only if the apply lands
+    LookAssistFlavor flavor = LookAssistFlavor::Classic;   // the same, for the Film grade laid at the apply
+    LookAssistScene sceneId = LookAssistScene::Night;
     int temperature = 0; // final clamped temperature (baseTemperature + preset.temperatureDelta)
     int tint        = 0; // final clamped tint
     // Auto-WB diagnostics
@@ -15702,6 +15750,7 @@ void MainWindow::applyLookAssistToReceipt( ReceiptSettings *receipt,
         targetReceipt->setHighlights( targetReceipt->lookAssistBaselineHighlights() );
         targetReceipt->setRawBlack( targetReceipt->lookAssistBaselineRawBlack() );
         targetReceipt->setRawWhite( targetReceipt->lookAssistBaselineRawWhite() );
+        restoreLookAssistBaselineGradationCurve( targetReceipt );   // the Film grade goes with the sliders
 
         ui->horizontalSliderExposure->setValue( targetReceipt->exposure() );
         ui->horizontalSliderContrast->setValue( targetReceipt->contrast() );
@@ -16095,9 +16144,13 @@ void MainWindow::applyLookAssistToReceipt( ReceiptSettings *receipt,
         int raw_w_copy = raw_w;
         int raw_h_copy = raw_h;
 
+        // The Film grade this apply will lay (the receipt's baseline restore already ran): appended only for Film.
+        const QString dispatchFilmGradeLogTail = flavor == LookAssistFlavor::Film
+            ? QStringLiteral(" grade=") + lookAssistFilmGradeDecision( flavor, ui->labelCurves->configuration() )
+            : QString();
         logInteractionEvent(
             QStringLiteral("look_assist.apply.async_dispatch"),
-            QStringLiteral("generation=%1 frame=%2 scene=%3 floor_lifted=%4 flavor=%5")
+            ( QStringLiteral("generation=%1 frame=%2 scene=%3 floor_lifted=%4 flavor=%5") + dispatchFilmGradeLogTail )
                 .arg( dispatchGeneration )
                 .arg( analysisFrame )
                 .arg( lookAssistSceneName( scene ) )
@@ -16168,6 +16221,8 @@ void MainWindow::applyLookAssistToReceipt( ReceiptSettings *receipt,
             r.useProcessedColorStats = useProcessedColorStatsCopy;
             r.scene                = lookAssistSceneName( sceneCopy );
             r.flavorName           = lookAssistFlavorName( flavorCopy );
+            r.flavor               = flavorCopy;
+            r.sceneId              = sceneCopy;
             r.width                = widthCopy;
             r.height               = heightCopy;
             r.downscaleFactor      = downscaleFactorCopy;
@@ -16513,6 +16568,8 @@ void MainWindow::applyLookAssistToReceipt( ReceiptSettings *receipt,
                 ui->horizontalSliderVibrance    ->setValue( r.preset.vibrance );
                 ui->horizontalSliderShadows     ->setValue( r.preset.shadows );
                 ui->horizontalSliderHighlights  ->setValue( r.preset.highlights );
+                // Film's colour grade with the preset (its tone is already in it), before the post-apply measurement.
+                applyLookAssistFilmGrade( activeReceipt, r.sceneId, r.flavor );
 
                 LookAssistStats asyncPostColorStats;
                 bool asyncPostColorStatsValid = false;
@@ -16719,6 +16776,8 @@ void MainWindow::applyLookAssistToReceipt( ReceiptSettings *receipt,
     // the same function the preset itself ends in): the balance is the Classic one by construction, here as headless.
     const LookAssistFlavor flavorForTheWalk = LookAssistFlavor::Classic;
     bool flavorLaidOver = false;
+    // Film's colour grade (the R/B split curves), laid with the tone overlay below; "none" for Classic and Cinematic.
+    QString filmGrade = QStringLiteral("none");
     LookAssistPreset preset = presetForLookAssistScene(
                 scene,
                 stats,
@@ -17246,6 +17305,7 @@ void MainWindow::applyLookAssistToReceipt( ReceiptSettings *receipt,
             // The balance is final. Lay the flavor over it and measure the picture the user will actually see once,
             // for the diagnostics and the safety guard only: no balance step follows this measurement.
             lookAssistApplyFlavorDeltas( &preset, scene, flavor );
+            filmGrade = applyLookAssistFilmGrade( receipt, scene, flavor );
             applyLookAssistValues();
             flavorLaidOver = true;
             const LookAssistStats walkPostColorStats = postColorStats;
@@ -17262,6 +17322,7 @@ void MainWindow::applyLookAssistToReceipt( ReceiptSettings *receipt,
     {
         // No picture analysis to run (no processed colour): the same overlay, nothing to re-measure.
         lookAssistApplyFlavorDeltas( &preset, scene, flavor );
+        filmGrade = applyLookAssistFilmGrade( receipt, scene, flavor );
         applyLookAssistValues();
     }
 
@@ -17537,9 +17598,11 @@ void MainWindow::applyLookAssistToReceipt( ReceiptSettings *receipt,
 
     m_lookAssistFlavorOutcome.landed( receipt, lookAssistFlavorName( flavor ), false );
     receipt->setLookAssistFlavor( lookAssistFlavorName( flavor ) );
+    // grade= is appended after flavor=, and only for Film, so a Classic or Cinematic line stays byte-identical. No '%' in it.
+    const QString filmGradeLogTail = flavor == LookAssistFlavor::Film ? QStringLiteral(" grade=") + filmGrade : QString();
     logInteractionEvent(
         QStringLiteral("look_assist.apply.result"),
-        QStringLiteral("analysis=raw scene=%1 median=%2 p05=%3 p95=%4 p99=%5 clip_low=%6 clip_high=%7 balance_samples=%8 preset_exp=%9 preset_contrast=%10 preset_pivot=%11 preset_shadows=%12 preset_highlights=%13 preset_vibrance=%14 preset_temp_delta=%15 preset_tint_delta=%16 final_temp=%17 final_tint=%18 thumb=%19x%20 downscale=%21 color_thumb=%22x%23 color_downscale=%24 frame=%25 last_serial=%26 last_frame=%27 next_serial=%28 %29 flavor=%30")
+        ( QStringLiteral("analysis=raw scene=%1 median=%2 p05=%3 p95=%4 p99=%5 clip_low=%6 clip_high=%7 balance_samples=%8 preset_exp=%9 preset_contrast=%10 preset_pivot=%11 preset_shadows=%12 preset_highlights=%13 preset_vibrance=%14 preset_temp_delta=%15 preset_tint_delta=%16 final_temp=%17 final_tint=%18 thumb=%19x%20 downscale=%21 color_thumb=%22x%23 color_downscale=%24 frame=%25 last_serial=%26 last_frame=%27 next_serial=%28 %29 flavor=%30") + filmGradeLogTail )
             .arg( m_lastLookAssistScene )
             .arg( stats.median, 0, 'f', 3 )
             .arg( stats.p05, 0, 'f', 3 )
@@ -17761,6 +17824,8 @@ void MainWindow::replaceReceipt(ReceiptSettings *receiptTarget, ReceiptSettings 
     if( paste && cdui->checkBoxCurve->isChecked() )      receiptTarget->setLr( receiptSource->lr() );
     if( paste && cdui->checkBoxCurve->isChecked() )      receiptTarget->setLightening( receiptSource->lightening() );
     if( paste && cdui->checkBoxGradationCurve->isChecked() ) receiptTarget->setGradationCurve( receiptSource->gradationCurve() );
+    // The Film grade's record of the curve it replaced travels with the curve it describes.
+    if( paste && cdui->checkBoxGradationCurve->isChecked() ) receiptTarget->setLookAssistBaselineGradationCurve( receiptSource->lookAssistBaselineGradationCurve() );
     if( paste && cdui->checkBoxHslCurves->isChecked() )  receiptTarget->setHueVsHue( receiptSource->hueVsHue() );
     if( paste && cdui->checkBoxHslCurves->isChecked() )  receiptTarget->setHueVsSaturation( receiptSource->hueVsSaturation() );
     if( paste && cdui->checkBoxHslCurves->isChecked() )  receiptTarget->setHueVsLuminance( receiptSource->hueVsLuminance() );
@@ -22305,6 +22370,7 @@ void MainWindow::on_actionResetReceipt_triggered()
     ACTIVE_RECEIPT->setLookAssistBaselineRawWhite( receipt->lookAssistBaselineRawWhite() );
     ACTIVE_RECEIPT->setLookAssistBaselineStretchX( receipt->lookAssistBaselineStretchX() );
     ACTIVE_RECEIPT->setLookAssistBaselineStretchY( receipt->lookAssistBaselineStretchY() );
+    ACTIVE_RECEIPT->setLookAssistBaselineGradationCurve( receipt->lookAssistBaselineGradationCurve() );
     setReceipt( ACTIVE_RECEIPT );
     ACTIVE_RECEIPT->setLookAssistEnabled( resetLookAssistEnabled );
     if( resetLookAssistEnabled )

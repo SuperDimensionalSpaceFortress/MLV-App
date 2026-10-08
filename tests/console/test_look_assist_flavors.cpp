@@ -15,6 +15,9 @@
 #include "../../platform/qt/ReceiptSettings.h"
 #include "../../src/batch/LookAssistAnalysis.h"
 #include "../../src/batch/ReceiptLoader.h"
+#include "../../src/batch/ReceiptApplier.h"
+
+#include <cmath>
 
 #include <QByteArray>
 #include <QCryptographicHash>
@@ -591,4 +594,322 @@ TEST(LookAssistFlavors, ReceiptElementIsWrittenOnlyForANonClassicFlavor)
     ASSERT_TRUE( guard.contains( QStringLiteral("!receipt->lookAssistFlavor().isEmpty()") ) );
     ASSERT_TRUE( guard.contains( QStringLiteral("receipt->lookAssistFlavor() != QLatin1String( \"classic\" )") ) );
     ASSERT_EQ( 1, window.count( QStringLiteral("writeTextElement( \"lookAssistFlavor\"") ) );
+}
+
+// ---- LOOK-ASSIST-FILM-FLAVOR-1: the Film grade ----
+
+namespace
+{
+
+LookAssistPreset film( LookAssistScene scene, const LookAssistStats &s,
+                       const LookAssistStats *c, const LookAssistStats *d )
+{
+    return presetForLookAssistScene( scene, s, c, d, LookAssistFlavor::Film );
+}
+
+const struct { const char *name; LookAssistScene scene; } kSceneNames[] = {
+    { "Night", LookAssistScene::Night }, { "ArtificialLights", LookAssistScene::ArtificialLights },
+    { "Shade", LookAssistScene::Shade }, { "BrightSun", LookAssistScene::BrightSun } };
+
+// Curves::configuration's own formatting of a parsed curve (QPointF holds the toFloat values as doubles).
+QString widgetConfiguration( const QString &curve )
+{
+    std::vector<LookAssistGradationPoint> lines[4];
+    lookAssistParseGradationCurve( curve, lines );
+    QString config;
+    for( int i = 0; i < 4; ++i )
+    {
+        if( i > 0 ) config.append( QStringLiteral("?") );
+        for( const LookAssistGradationPoint &p : lines[i] )
+            config.append( QString( "%1;%2;" ).arg( static_cast<double>( p.x ) ).arg( static_cast<double>( p.y ) ) );
+    }
+    return config;
+}
+
+} // namespace
+
+TEST(LookAssistFlavors, TheDocumentedFilmTableIsTheCodeTable)
+{
+    const QString doc = readSource( QStringLiteral("docs/look-assist-flavors.md") );
+    const int begin = doc.indexOf( QStringLiteral("<!-- film-table:begin -->") );
+    const int end = doc.indexOf( QStringLiteral("<!-- film-table:end -->") );
+    ASSERT_TRUE( begin >= 0 && end > begin );
+    const QString block = doc.mid( begin, end - begin );
+    int rows = 0;
+    for( const auto &s : kSceneNames )
+    {
+        const QString number = QStringLiteral("\\s*([0-9.]+)\\s*\\|");
+        const QRegularExpression row( QStringLiteral("^\\|\\s*%1\\s*\\|").arg( QLatin1String( s.name ) )
+                                      + number + number + number + number + number + QStringLiteral("\\s*$"),
+                                      QRegularExpression::MultilineOption );
+        const QRegularExpressionMatch m = row.match( block );
+        ASSERT_TRUE( m.hasMatch() );
+        const LookAssistFilmGrade g = lookAssistFilmGradeForScene( s.scene );
+        ASSERT_TRUE( std::fabs( g.strength - m.captured( 1 ).toDouble() ) < 1e-9 );
+        ASSERT_TRUE( std::fabs( ( 0.18 - g.shadowOffset ) - m.captured( 2 ).toDouble() ) < 1e-9 );
+        ASSERT_TRUE( std::fabs( ( 0.18 + g.shadowOffset ) - m.captured( 3 ).toDouble() ) < 1e-9 );
+        ASSERT_TRUE( std::fabs( ( 0.72 + g.highlightOffset ) - m.captured( 4 ).toDouble() ) < 1e-9 );
+        ASSERT_TRUE( std::fabs( ( 0.72 - g.highlightOffset ) - m.captured( 5 ).toDouble() ) < 1e-9 );
+        // a = 0.022 s, b = 0.030 s: the recipe, not just the table.
+        ASSERT_TRUE( std::fabs( g.shadowOffset - 0.022 * g.strength ) < 1e-12 );
+        ASSERT_TRUE( std::fabs( g.highlightOffset - 0.030 * g.strength ) < 1e-12 );
+        ++rows;
+    }
+    ASSERT_EQ( 4, rows );
+    ASSERT_TRUE( lookAssistFilmGradeId() == QLatin1String( "film-v1" ) );
+}
+
+TEST(LookAssistFlavors, FilmsToneIsCinematicsToneOnTheWholeGrid)
+{
+    LookAssistStats display;
+    display.median = 50.0;
+    display.p99 = 120.0;
+    const std::vector<LookAssistStats> grid = look_assist_flavor_grid::statsGrid();
+    for( const LookAssistStats &s : grid )
+        for( int sceneIndex = 0; sceneIndex < 4; ++sceneIndex )
+            for( int useDisplay = 0; useDisplay < 2; ++useDisplay )
+            {
+                const LookAssistScene scene = static_cast<LookAssistScene>( sceneIndex );
+                const LookAssistStats *disp = useDisplay ? &display : nullptr;
+                const LookAssistPreset cine = cinematic( scene, s, &s, disp );
+                const LookAssistPreset f = film( scene, s, &s, disp );
+                ASSERT_TRUE( f.exposure == cine.exposure && f.contrast == cine.contrast && f.pivot == cine.pivot
+                          && f.shadows == cine.shadows && f.highlights == cine.highlights && f.vibrance == cine.vibrance
+                          && f.temperatureDelta == cine.temperatureDelta && f.tintDelta == cine.tintDelta );
+                LookAssistPreset overlaid = classicDefault( scene, s, &s, disp );
+                lookAssistApplyFlavorDeltas( &overlaid, scene, LookAssistFlavor::Film );
+                ASSERT_TRUE( overlaid.contrast == cine.contrast && overlaid.highlights == cine.highlights
+                          && overlaid.vibrance == cine.vibrance && overlaid.exposure == cine.exposure );
+            }
+}
+
+TEST(LookAssistFlavors, FilmIsOneMoreSpellingOfTheSameSelector)
+{
+    ASSERT_TRUE( lookAssistFlavorName( LookAssistFlavor::Film ) == QLatin1String( "film" ) );
+    LookAssistFlavorSelection s = lookAssistSelectFlavor( QStringLiteral("film"), QString(), QString() );
+    ASSERT_TRUE( s.flavor == LookAssistFlavor::Film && s.source == QLatin1String( "env" ) );
+    s = lookAssistSelectFlavor( QString(), QStringLiteral("film"), QString() );
+    ASSERT_TRUE( s.flavor == LookAssistFlavor::Film && s.source == QLatin1String( "receipt" ) );
+    s = lookAssistSelectFlavor( QString(), QString(), QStringLiteral("film") );
+    ASSERT_TRUE( s.flavor == LookAssistFlavor::Film && s.source == QLatin1String( "app" ) );
+    s = lookAssistSelectFlavor( QStringLiteral("  FILM "), QStringLiteral("cinematic"), QString() );
+    ASSERT_TRUE( s.flavor == LookAssistFlavor::Film && !s.unknownValue );
+    s = lookAssistSelectFlavor( QStringLiteral("filmm"), QStringLiteral("film"), QStringLiteral("film") );
+    ASSERT_TRUE( s.flavor == LookAssistFlavor::Classic && s.unknownValue && s.rejectedValue == QLatin1String( "filmm" ) );
+    LookAssistFlavorSelection sel;
+    ASSERT_TRUE( lookAssistSelectorValueForReceipt( QStringLiteral(" Film "), &sel ) == QLatin1String( "film" ) );
+    ASSERT_FALSE( sel.unknownValue );
+    ASSERT_TRUE( lookAssistSelectorValueForReceipt( QStringLiteral("film grade"), &sel ) == QLatin1String( "classic" ) );
+    ASSERT_TRUE( sel.unknownValue );
+
+    // The receipt element round-trips "film" (written: a non-Classic flavor; read back by the loader).
+    QTemporaryDir tempDir;
+    ASSERT_TRUE( tempDir.isValid() );
+    const QString path = tempDir.filePath( QStringLiteral("film.marxml") );
+    QFile file( path );
+    ASSERT_TRUE( file.open( QIODevice::WriteOnly | QIODevice::Text ) );
+    QTextStream out( &file );
+    out << "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<receipt version=\"4\" mlvapp=\"test\">\n"
+        << "  <lookAssistEnabled>1</lookAssistEnabled>\n  <lookAssistFlavor>film</lookAssistFlavor>\n"
+        << "  <lookAssistBaselineGradationCurve>1e-05;1e-05;1;1;?1e-05;1e-05;1;1;?1e-05;1e-05;1;1;?1e-05;1e-05;1;1;</lookAssistBaselineGradationCurve>\n"
+        << "</receipt>\n";
+    file.close();
+    ReceiptSettings receipt;
+    QString error;
+    ASSERT_TRUE( ReceiptLoader::loadFromFile( path, &receipt, &error ) );
+    ASSERT_TRUE( receipt.lookAssistFlavor() == QLatin1String( "film" ) );
+    ASSERT_TRUE( lookAssistSelectFlavor( QString(), receipt.lookAssistFlavor(), QString() ).flavor == LookAssistFlavor::Film );
+    ASSERT_TRUE( receipt.lookAssistBaselineGradationCurve()
+                 == QLatin1String( "1e-05;1e-05;1;1;?1e-05;1e-05;1;1;?1e-05;1e-05;1;1;?1e-05;1e-05;1;1;" ) );
+    ASSERT_TRUE( ReceiptSettings().lookAssistBaselineGradationCurve().isEmpty() );
+}
+
+TEST(LookAssistFlavors, TheFilmCurveStringRoundTripsThroughTheWidgetFormat)
+{
+    for( const auto &s : kSceneNames )
+    {
+        const QString curve = lookAssistFilmGradationCurve( s.scene );
+        ASSERT_TRUE( widgetConfiguration( curve ) == curve );
+        ASSERT_TRUE( widgetConfiguration( widgetConfiguration( curve ) ) == curve );
+        std::vector<LookAssistGradationPoint> lines[4];
+        ASSERT_EQ( 4, lookAssistParseGradationCurve( curve, lines ) );
+        ASSERT_EQ( 2, static_cast<int>( lines[0].size() ) );   // Y identity
+        ASSERT_EQ( 5, static_cast<int>( lines[1].size() ) );   // R split
+        ASSERT_EQ( 2, static_cast<int>( lines[2].size() ) );   // G identity
+        ASSERT_EQ( 5, static_cast<int>( lines[3].size() ) );   // B split
+        const LookAssistFilmGrade g = lookAssistFilmGradeForScene( s.scene );
+        ASSERT_TRUE( std::fabs( lines[1][1].y - ( 0.18 - g.shadowOffset ) ) < 1e-6 );
+        ASSERT_TRUE( std::fabs( lines[3][1].y - ( 0.18 + g.shadowOffset ) ) < 1e-6 );
+        ASSERT_TRUE( std::fabs( lines[1][2].y - 0.45 ) < 1e-6 && std::fabs( lines[3][2].y - 0.45 ) < 1e-6 );
+        ASSERT_TRUE( std::fabs( lines[1][3].y - ( 0.72 + g.highlightOffset ) ) < 1e-6 );
+        ASSERT_TRUE( std::fabs( lines[3][3].y - ( 0.72 - g.highlightOffset ) ) < 1e-6 );
+        ASSERT_FALSE( lookAssistIsDefaultGradationCurve( curve ) );
+    }
+    // The shape the widget writes, exactly (Shade).
+    ASSERT_TRUE( lookAssistFilmGradationCurve( LookAssistScene::Shade ) == QLatin1String(
+        "1e-05;1e-05;1;1;?1e-05;1e-05;0.18;0.158;0.45;0.45;0.72;0.75;1;1;?1e-05;1e-05;1;1;?1e-05;1e-05;0.18;0.202;0.45;0.45;0.72;0.69;1;1;" ) );
+    // Default: the receipt default, the widget's rewrite of it, and empty; not three lines, not a moved point.
+    ASSERT_TRUE( lookAssistIsDefaultGradationCurve( ReceiptSettings().gradationCurve() ) );
+    ASSERT_TRUE( lookAssistIsDefaultGradationCurve( widgetConfiguration( ReceiptSettings().gradationCurve() ) ) );
+    ASSERT_TRUE( lookAssistIsDefaultGradationCurve( QString() ) );
+    ASSERT_FALSE( lookAssistIsDefaultGradationCurve( QStringLiteral("1e-5;1e-5;1;1;?1e-5;1e-5;1;1;?1e-5;1e-5;1;1;") ) );
+    ASSERT_FALSE( lookAssistIsDefaultGradationCurve( QStringLiteral("1e-5;1e-5;1;0.98;?1e-5;1e-5;1;1;?1e-5;1e-5;1;1;?1e-5;1e-5;1;1;") ) );
+
+    // The parse is the widget's: a line ends at '?', a value at ';', numbers by toFloat.
+    const QString curves = readSource( QStringLiteral("platform/qt/Curves.cpp") );
+    const int at = curves.indexOf( QStringLiteral("void Curves::setConfiguration(QString config)") );
+    ASSERT_TRUE( at >= 0 );
+    const QString body = curves.mid( at, 1100 );
+    ASSERT_TRUE( body.contains( QStringLiteral("!config.startsWith( \"?\" )") ) );
+    ASSERT_TRUE( body.contains( QStringLiteral("config.indexOf( \";\" )") ) );
+    ASSERT_TRUE( body.contains( QStringLiteral("val.toFloat()") ) );
+    ASSERT_TRUE( curves.contains( QStringLiteral("QString( \"%1;%2;\" ).arg(") ) );
+    const QString analysis = readSource( QStringLiteral("src/batch/LookAssistAnalysis.cpp") );
+    const int parseAt = analysis.indexOf( QStringLiteral("int lookAssistParseGradationCurve(") );
+    ASSERT_TRUE( parseAt >= 0 );
+    const QString parse = analysis.mid( parseAt, 1300 );
+    ASSERT_TRUE( parse.contains( QStringLiteral("startsWith( QLatin1Char('?') )") ) );
+    ASSERT_TRUE( parse.contains( QStringLiteral("indexOf( QLatin1Char(';') )") ) );
+    ASSERT_TRUE( parse.contains( QStringLiteral(".toFloat()") ) );
+}
+
+TEST(LookAssistFlavors, TheFilmGradeIsLaidOnlyOverADefaultCurve)
+{
+    const QString user = QStringLiteral("1e-05;1e-05;0.5;0.56;1;1;?1e-05;1e-05;1;1;?1e-05;1e-05;1;1;?1e-05;1e-05;1;1;");
+    ASSERT_TRUE( lookAssistFilmGradeDecision( LookAssistFlavor::Film, ReceiptSettings().gradationCurve() ) == QLatin1String( "film-v1" ) );
+    ASSERT_TRUE( lookAssistFilmGradeDecision( LookAssistFlavor::Film, QString() ) == QLatin1String( "film-v1" ) );
+    ASSERT_TRUE( lookAssistFilmGradeDecision( LookAssistFlavor::Film, user ) == QLatin1String( "skipped_user_curve" ) );
+    // A Film curve already on the receipt is not "default": a stale one is never re-laid over itself as the user's.
+    ASSERT_TRUE( lookAssistFilmGradeDecision( LookAssistFlavor::Film, lookAssistFilmGradationCurve( LookAssistScene::Night ) )
+                 == QLatin1String( "skipped_user_curve" ) );
+    ASSERT_TRUE( lookAssistFilmGradeDecision( LookAssistFlavor::Cinematic, ReceiptSettings().gradationCurve() ) == QLatin1String( "none" ) );
+    ASSERT_TRUE( lookAssistFilmGradeDecision( LookAssistFlavor::Classic, user ) == QLatin1String( "none" ) );
+}
+
+TEST(LookAssistFlavors, LookAssistOffLeavesAFilmSettingUntouchedAndPutsALaidCurveBack)
+{
+    FlavorEnvGuard guard;
+    qputenv( "MLVAPP_LOOK_ASSIST_FLAVOR", "film" );
+    // Off, Film selected, nothing laid: the receipt is unchanged (the applier never reaches the grade).
+    ReceiptSettings off;
+    off.setLookAssistEnabled( false );
+    off.setLookAssistFlavor( QStringLiteral("film") );
+    const QString curveBefore = off.gradationCurve();
+    const int contrastBefore = off.contrast();
+    ASSERT_FALSE( ReceiptApplier::applyHeadlessLookAssist( &off, nullptr, nullptr, 0 ) );
+    ASSERT_TRUE( off.gradationCurve() == curveBefore );
+    ASSERT_TRUE( off.lookAssistBaselineGradationCurve().isEmpty() );
+    ASSERT_TRUE( off.lookAssistFlavor() == QLatin1String( "film" ) );
+    ASSERT_EQ( contrastBefore, off.contrast() );
+
+    // Off after a Film grade was laid: the curve it replaced comes back and the element goes away.
+    ReceiptSettings graded;
+    graded.setLookAssistEnabled( false );
+    graded.setGradationCurve( lookAssistFilmGradationCurve( LookAssistScene::Shade ) );
+    graded.setLookAssistBaselineGradationCurve( ReceiptSettings().gradationCurve() );
+    ASSERT_FALSE( ReceiptApplier::applyHeadlessLookAssist( &graded, nullptr, nullptr, 0 ) );
+    ASSERT_TRUE( graded.gradationCurve() == ReceiptSettings().gradationCurve() );
+    ASSERT_TRUE( graded.lookAssistBaselineGradationCurve().isEmpty() );
+}
+
+TEST(LookAssistFlavors, AUserEditOfTheFilmCurveIsKeptAndRetiresFilmsOwnership)
+{
+    // Film laid over the default curve, then the user adds a Y point (0.5,0.56) to it. The edit is the user's curve now:
+    // putting the baseline back (Look Assist off, here; a Classic re-run takes the same helper) keeps the edit and drops
+    // the baseline, so Film no longer owns the curve. An untouched Film curve still goes back to the baseline.
+    QStringList lines = lookAssistFilmGradationCurve( LookAssistScene::Shade ).split( QLatin1Char('?') );
+    ASSERT_EQ( 4, lines.size() );
+    lines[0] = QStringLiteral("1e-05;1e-05;0.5;0.56;1;1;");
+    const QString edited = lines.join( QLatin1Char('?') );
+    const QString base = ReceiptSettings().gradationCurve();
+    for( int s = 0; s < 4; ++s )
+        ASSERT_TRUE( lookAssistFilmOwnsGradationCurve( lookAssistFilmGradationCurve( static_cast<LookAssistScene>( s ) ) ) );
+    ASSERT_FALSE( lookAssistFilmOwnsGradationCurve( edited ) );
+    ASSERT_FALSE( lookAssistFilmOwnsGradationCurve( base ) );
+    ASSERT_FALSE( lookAssistFilmOwnsGradationCurve( QString() ) );
+    ASSERT_TRUE( lookAssistGradationCurveAfterFilmRestore( lookAssistFilmGradationCurve( LookAssistScene::Night ), base ) == base );
+    ASSERT_TRUE( lookAssistGradationCurveAfterFilmRestore( edited, base ) == edited );
+
+    FlavorEnvGuard guard;
+    qputenv( "MLVAPP_LOOK_ASSIST_FLAVOR", "classic" );
+    ReceiptSettings receipt;
+    receipt.setLookAssistEnabled( false );
+    receipt.setGradationCurve( edited );
+    receipt.setLookAssistBaselineGradationCurve( base );
+    ASSERT_FALSE( ReceiptApplier::applyHeadlessLookAssist( &receipt, nullptr, nullptr, 0 ) );
+    ASSERT_TRUE( receipt.gradationCurve() == edited );
+    ASSERT_TRUE( receipt.lookAssistBaselineGradationCurve().isEmpty() );
+
+    // The GUI helper takes the same rule, on the curve the widget shows.
+    const QString window = readSource( QStringLiteral("platform/qt/MainWindow.cpp") );
+    const int at = window.indexOf( QStringLiteral("void MainWindow::restoreLookAssistBaselineGradationCurve( ReceiptSettings *receipt )") );
+    ASSERT_TRUE( at >= 0 );
+    ASSERT_TRUE( window.mid( at, 900 ).contains( QStringLiteral("lookAssistGradationCurveAfterFilmRestore( ui->labelCurves->configuration(),") ) );
+    const QString applier = readSource( QStringLiteral("src/batch/ReceiptApplier.cpp") );
+    const int headlessAt = applier.indexOf( QStringLiteral("static void restoreHeadlessLookAssistGradationCurve( ReceiptSettings *receipt )") );
+    ASSERT_TRUE( headlessAt >= 0 );
+    ASSERT_TRUE( applier.mid( headlessAt, 600 ).contains( QStringLiteral("lookAssistGradationCurveAfterFilmRestore( receipt->gradationCurve(),") ) );
+}
+
+TEST(LookAssistFlavors, NoGradeIsLoggedAfterTheSyncSafetyFallback)
+{
+    // LOOK-ASSIST-FILM-GRADE-LOG-AFTER-FALLBACK-1: the sync safety fallback puts the curve back after the grade was laid,
+    // so its block must return before look_assist.apply.result (the one line that appends grade=filmGrade) is logged.
+    const QString window = readSource( QStringLiteral("platform/qt/MainWindow.cpp") );
+    const int fallbackAt = window.indexOf( QStringLiteral("restoreLookAssistSafetyBaseline( receipt, safeChromaSmooth, safeChromaSmoothAuto );") );
+    ASSERT_TRUE( fallbackAt >= 0 );
+    const int resultAt = window.indexOf( QStringLiteral("QStringLiteral(\"look_assist.apply.result\")"), fallbackAt );
+    ASSERT_TRUE( resultAt > fallbackAt );
+    const int returnAt = window.indexOf( QStringLiteral("return;"), fallbackAt );
+    ASSERT_TRUE( returnAt > fallbackAt && returnAt < resultAt );
+    ASSERT_TRUE( window.indexOf( QStringLiteral("filmGradeLogTail"), fallbackAt ) > returnAt );
+}
+
+TEST(LookAssistFlavors, TheFilmBaselineElementIsWrittenOnlyWhileSet)
+{
+    const QString window = readSource( QStringLiteral("platform/qt/MainWindow.cpp") );
+    const QString loader = readSource( QStringLiteral("src/batch/ReceiptLoader.cpp") );
+    const int at = window.indexOf( QStringLiteral("writeTextElement( \"lookAssistBaselineGradationCurve\"") );
+    ASSERT_TRUE( at >= 0 );
+    ASSERT_TRUE( window.mid( qMax( 0, at - 120 ), 120 ).contains( QStringLiteral("if( !receipt->lookAssistBaselineGradationCurve().isEmpty() )") ) );
+    ASSERT_EQ( 1, window.count( QStringLiteral("writeTextElement( \"lookAssistBaselineGradationCurve\"") ) );
+    // Read by both readers; carried with the curve on paste and cleared on reset.
+    ASSERT_TRUE( window.contains( QStringLiteral("Rxml->name() == QString( \"lookAssistBaselineGradationCurve\" )") ) );
+    ASSERT_TRUE( loader.contains( QStringLiteral("Rxml->name() == QString( \"lookAssistBaselineGradationCurve\" )") ) );
+    ASSERT_TRUE( window.contains( QStringLiteral("if( paste && cdui->checkBoxGradationCurve->isChecked() ) receiptTarget->setLookAssistBaselineGradationCurve( receiptSource->lookAssistBaselineGradationCurve() );") ) );
+    ASSERT_TRUE( window.contains( QStringLiteral("ACTIVE_RECEIPT->setLookAssistBaselineGradationCurve( receipt->lookAssistBaselineGradationCurve() );") ) );
+}
+
+TEST(LookAssistFlavors, TheFilmGradeIsLaidAndPutBackAtEverySite)
+{
+    const QString window = readSource( QStringLiteral("platform/qt/MainWindow.cpp") );
+    const QString applier = readSource( QStringLiteral("src/batch/ReceiptApplier.cpp") );
+    const QString ui = readSource( QStringLiteral("platform/qt/MainWindow.ui") );
+
+    // GUI: laid with the tone overlay at both sync sites and at the async apply; put back by the baseline restore, a fresh
+    // capture and the safety fallback.
+    ASSERT_EQ( 2, window.count( QStringLiteral("filmGrade = applyLookAssistFilmGrade( receipt, scene, flavor );") ) );
+    ASSERT_EQ( 1, window.count( QStringLiteral("applyLookAssistFilmGrade( activeReceipt, r.sceneId, r.flavor );") ) );
+    ASSERT_TRUE( window.count( QStringLiteral("restoreLookAssistBaselineGradationCurve( receipt );") ) >= 2 );
+    ASSERT_EQ( 1, window.count( QStringLiteral("restoreLookAssistBaselineGradationCurve( targetReceipt );") ) );
+    const int restoreAt = window.indexOf( QStringLiteral("void MainWindow::restoreLookAssistBaseline( ReceiptSettings *receipt )") );
+    const int restoreEnd = window.indexOf( QStringLiteral("\n}"), restoreAt );
+    ASSERT_TRUE( window.mid( restoreAt, restoreEnd - restoreAt ).contains( QStringLiteral("restoreLookAssistBaselineGradationCurve( receipt );") ) );
+    const int captureAt = window.indexOf( QStringLiteral("void MainWindow::captureLookAssistBaseline( ReceiptSettings *receipt )") );
+    ASSERT_TRUE( window.mid( captureAt, 400 ).contains( QStringLiteral("restoreLookAssistBaselineGradationCurve( receipt );") ) );
+    // grade= is appended only for Film (Classic / Cinematic lines are byte-identical).
+    ASSERT_EQ( 1, window.count( QStringLiteral("flavor == LookAssistFlavor::Film ? QStringLiteral(\" grade=\") + filmGrade : QString();") ) );
+    ASSERT_TRUE( window.contains( QStringLiteral("flavor=%30\") + filmGradeLogTail )") ) );
+    ASSERT_TRUE( window.contains( QStringLiteral("floor_lifted=%4 flavor=%5\") + dispatchFilmGradeLogTail )") ) );
+
+    // Headless: restored at the top of a pass, by a fresh capture and with Look Assist off; laid after the preset.
+    ASSERT_TRUE( applier.count( QStringLiteral("restoreHeadlessLookAssistGradationCurve( receipt );") ) >= 3 );
+    ASSERT_EQ( 1, applier.count( QStringLiteral("applyHeadlessLookAssistFilmGrade( receipt, scene, flavor );") ) );
+    ASSERT_TRUE( applier.contains( QStringLiteral(".replace( QLatin1Char('\\n'), filmGradeLogTail + QLatin1Char('\\n') )") ) );
+    ASSERT_TRUE( applier.contains( QStringLiteral("flavor == LookAssistFlavor::Film ? QStringLiteral(\" grade=\") + filmGrade : QString();") ) );
+
+    // The selector: item 2 is "Film grade" (not "Film": the Profile preset is a different thing) with its tooltip.
+    ASSERT_TRUE( ui.contains( QStringLiteral("<string>Film grade</string>") ) );
+    ASSERT_TRUE( window.contains( QStringLiteral("setItemData( 2, lookAssistFlavorName( LookAssistFlavor::Film ) );") ) );
+    ASSERT_TRUE( window.contains( QStringLiteral("tr( \"Colour-graded look: cool shadows, warm highlights\" ), Qt::ToolTipRole );") ) );
 }
