@@ -35,7 +35,19 @@ REFUSALS (exit codes; the token is the first word on stderr)
     15  PAIR_TILE_SIZE_DIFFERS             tile i is not the same pixel size on both sides (no per-pixel difference is defined).
     16  PAIR_OUTPUT_EXISTS                 --out-dir already holds the sheet, metrics.json, table.md or a row-NN / heat-NN png. Outputs are
                                            append-only: checked before anything is written, and every file is created exclusively (the
-                                           sheet first), so a second or concurrent composer changes nothing of the first one's evidence.
+                                           attempt marker, then the sheet), so a second or concurrent composer changes nothing of the first
+                                           one's evidence.
+    17  PAIR_INCOMPLETE_ATTEMPT            --out-dir holds .pair-in-progress.json: an earlier attempt wrote its marker and did not finish
+                                           (a crash between the sheet and the metrics, or before the driver's record). What it left is NOT
+                                           recorded evidence. Nothing is changed. Compose into a new directory, or re-run with
+                                           --recover-incomplete, which MOVES the marker and the unrecorded outputs into incomplete-<utc>/
+                                           (nothing is deleted) and composes again -- only when no composer is still running there.
+
+ATTEMPT MARKER
+    Before the first output the composer creates .pair-in-progress.json exclusively (pid, start time, receipt ids) and removes it after the last
+    one. Exactly one composer can hold it, so it doubles as the directory's reservation. --keep-marker leaves it for the caller (the pair driver
+    removes it after its own record is written, so the window between the sheet and the record is marked too). A composer that loses the race
+    removes nothing of the winner's and leaves no marker of its own.
 
 OUTPUT (in --out-dir)
     sheet-classic-vs-cinematic.png   3840 px wide. A HEADER_HEIGHT header (clip, venue, build, flavors, receipt ids, claims), then per tile a
@@ -65,7 +77,10 @@ import argparse
 import importlib.util
 import io
 import json
+import os
+import re
 import sys
+from datetime import datetime, timezone
 from pathlib import Path
 
 np = Image = ImageDraw = mcs = None
@@ -77,8 +92,12 @@ EXIT_NOT_LOCAL = 13
 EXIT_INPUT_INVALID = 14
 EXIT_TILE_SIZE = 15
 EXIT_OUTPUT_EXISTS = 16
+EXIT_INCOMPLETE = 17
 
 SHEET_NAME = "sheet-classic-vs-cinematic.png"
+MARKER_NAME = ".pair-in-progress.json"
+SCHEMA_MARKER = "mlv-app/look-flavor-diff-in-progress/v1"
+_OUTPUT_NAME = re.compile(r"^(?:sheet-classic-vs-cinematic\.png|metrics\.json|table\.md|(?:row|heat)-\d{2}\.png)$")
 SCHEMA_METRICS = "mlv-app/look-flavor-diff-metrics/v1"
 FLAVOR_OWNED_FIELDS = ("presetContrast", "presetPivot", "presetShadows", "presetHighlights", "presetVibrance")
 SLIDER_FIELDS = ("scene", "presetExposure", *FLAVOR_OWNED_FIELDS, "presetTemperatureDelta", "presetTintDelta", "finalTemperature", "finalTint")
@@ -231,6 +250,38 @@ def refuse_if_occupied(out, indices):
                                           "overwritten; compose into a new directory")
 
 
+def refuse_if_incomplete(out, recover):
+    """True when `out` holds an earlier attempt's marker and the caller asked to recover it; exit 17 when it did not."""
+    marker = out / MARKER_NAME
+    if not marker.exists():
+        return False
+    if recover:
+        # FLAVOR-DIFF-RECOVER-RECORD-GUARD-1: a pair record names the sheet by hash, so a directory that holds one is never recovered (nothing is moved).
+        records = sorted(p.name for p in out.glob("flavor-pair-*.json") if p.is_file())
+        if records:
+            raise Refusal(EXIT_OUTPUT_EXISTS, f"PAIR_RECORD_EXISTS {records[0]} is already in {out}: its sheet is named by hash, so --recover-incomplete "
+                                              "will not move anything here; compose into a new directory")
+        return True
+    try:
+        started = json.loads(marker.read_text(encoding="utf-8")).get("startedUtc", "unknown time")
+    except (OSError, ValueError, AttributeError):
+        started = "unknown time"
+    left = sorted(p.name for p in out.iterdir() if p.is_file() and _OUTPUT_NAME.match(p.name))
+    raise Refusal(EXIT_INCOMPLETE, f"PAIR_INCOMPLETE_ATTEMPT {out} holds {MARKER_NAME} (an attempt started {started} and did not finish); it left "
+                                   f"{', '.join(left) if left else 'no outputs'}, none of it recorded evidence. Nothing was changed. Compose into a new directory, or "
+                                   "re-run with --recover-incomplete to MOVE the marker and those files into incomplete-<utc>/ (nothing is deleted) -- only "
+                                   "when no composer is still running there")
+
+
+def quarantine_incomplete(out):
+    """Move the dead attempt's marker and unrecorded outputs into incomplete-<utc>/ beside them. Moves only; a pair record is never touched."""
+    dest = out / ("incomplete-" + datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S%fZ"))
+    dest.mkdir()
+    for path in sorted(out.iterdir()):
+        if path.is_file() and (path.name == MARKER_NAME or _OUTPUT_NAME.match(path.name)):
+            path.rename(dest / path.name)
+
+
 def write_new(path, data):
     """Create `path` exclusively. A composer that lost a race for the directory fails here, on the first (sheet) write, with nothing of its own written."""
     try:
@@ -270,8 +321,10 @@ def compose(args):
         raise Refusal(EXIT_TILE_COUNT, f"PAIR_TILE_COUNT_DIFFERS Classic holds tiles {sorted(classic_by)}, Cinematic {sorted(cinematic_by)}")
 
     out = Path(args.out_dir)
-    refuse_if_occupied(out, sorted(classic_by))
-    font = mcs._load_font(22)
+    recovering = refuse_if_incomplete(out, args.recover_incomplete)
+    if not recovering:   # (a recovered directory's files are about to be moved aside, so they are not an obstacle)
+        refuse_if_occupied(out, sorted(classic_by))
+    font =mcs._load_font(22)
     small = mcs._load_font(16)
     tiles, panels, row_images, heat_images = [], [], {}, {}
     for index in sorted(classic_by):
@@ -343,9 +396,20 @@ def compose(args):
         for col, panel in enumerate((pa, pb, ph)):
             sheet.paste(panel.crop((0, 0, SHEET_COLUMN, tile_h)), (col * SHEET_COLUMN, y + ROW_LABEL_HEIGHT))
     sheet_path = out / SHEET_NAME
-    # Nothing has been written yet. The sheet is created first and exclusively: it is this directory's reservation (see write_new).
+    # Nothing has been written yet. The attempt marker is created first and exclusively: it is this directory's reservation (see write_new), and it
+    # stays until the last output (or, with --keep-marker, until the caller's own record) so an attempt that dies in between is recognisable.
     out.mkdir(parents=True, exist_ok=True)
-    write_new(sheet_path, png_bytes(sheet))
+    if recovering:
+        quarantine_incomplete(out)
+    marker_path = out / MARKER_NAME
+    write_new(marker_path, json.dumps({"schema": SCHEMA_MARKER, "pid": os.getpid(), "startedUtc": datetime.now(timezone.utc).isoformat(),
+                                       "classicReceiptId": args.classic_receipt_id, "cinematicReceiptId": args.cinematic_receipt_id,
+                                       "keptForCaller": bool(args.keep_marker)}, indent=2).encode("utf-8"))
+    try:
+        write_new(sheet_path, png_bytes(sheet))
+    except Refusal:
+        marker_path.unlink(missing_ok=True)   # this composer lost the race for the sheet: nothing of ITS attempt may remain
+        raise
 
     numeric = ("luma_p50", "mean_saturation", "mean_r", "mean_g", "mean_b")
     means = {
@@ -376,6 +440,8 @@ def compose(args):
         ImageDraw.Draw(row_images[index]).text((10, 10), f"CLASSIC | CINEMATIC   {label}", fill=(255, 255, 255), font=font)
         write_new(out / f"row-{index:02d}.png", png_bytes(row_images[index]))
         write_new(out / f"heat-{index:02d}.png", png_bytes(heat_images[index]))
+    if not args.keep_marker:
+        marker_path.unlink()
     print(f"LOOK_FLAVOR_DIFF_OK sheet={sheet_path} tiles={len(tiles)} frameMatched={str(matched).lower()} "
           f"sameFrames={str(same_frames).lower()} maxFrameDelta={max_delta}")
     return 0
@@ -662,6 +728,9 @@ def main(argv=None):
     p.add_argument("--venue", default="")
     p.add_argument("--build-sha", default="")
     p.add_argument("--out-dir", required=True, type=Path)
+    p.add_argument("--keep-marker", action="store_true", help="leave .pair-in-progress.json for the caller to remove after its own record")
+    p.add_argument("--recover-incomplete", action="store_true",
+                   help="move an earlier unfinished attempt's marker and unrecorded outputs into incomplete-<utc>/ and compose again")
     args = p.parse_args(argv)
     film_inputs = [args.film_frames, args.film_listed, args.film_sliders, args.film_flavor_reported]
     if any(v is not None for v in film_inputs) and not all(v is not None for v in film_inputs):
