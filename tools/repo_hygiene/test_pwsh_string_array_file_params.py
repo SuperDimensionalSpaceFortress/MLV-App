@@ -17,14 +17,13 @@ only the first element binds (export-release-cuda-dogfood-kit.ps1 and invoke-ult
 this shape). Fix the caller with ``($arr -join ',')`` and split in the script. A variable counts as an array
 when the caller's file declares it ``[string[]]`` / ``[array]``, assigns it ``@(...)`` / a cast / a comma list /
 a ``-split`` / a ``Verb-...Array...`` helper (never a name that merely contains "array", like ``$arrayCount``),
-or aliases one of those. A split counts as normalisation only when it is applied to the parameter itself
-(``$P -split``, ``$P[0].Split(``, ``$P | ... { $_ -split }``) AND its result flows to a use: assigned back to ``$P``,
-assigned to a variable a later statement reads, or piped on. A ``[ValidateSet]`` on a top-level ``[string[]]``
-parameter is never cleared by a split (it rejects the joined element at bind time), so a comma-list caller is flagged.
-The guard fails closed: it credits only the narrow forms above and flags everything else. A mention inside a
-comment or a single-quoted string / here-string is not a read, and a ``$_`` split inside a stage script block that
-holds any nested pipeline (``|``, ``ForEach-Object``, ``%``, ``?``, ``Where-Object``, ``.ForEach(``, ``.Where(``,
-``-InputObject``, ``switch``, ``catch``, ``trap``) is not credited.
+or aliases one of those. A split clears the parameter only in one of two whitelisted forms (``is_normalised``); every
+other shape is flagged. TEMP/DIRECT: ``$X = $P -split ','`` or ``$X = $P[0].Split(',')`` (``$X`` may be ``$P``), with
+``$X`` later read as a bare token. STAGE: ``$P | ForEach-Object { $_ -split ',' }`` (or ``%``), whose block is that
+one split expression and nothing else (or exactly ``if (Test-Path -LiteralPath $_) { $_ } else { <that split> }``), assigned back to ``$P``, assigned to a variable read later, or piped on. Every
+comment and string literal (both quote kinds, both here-string kinds) is blanked first, so neither a split nor a read
+inside a string counts. A ``[ValidateSet]`` on a top-level ``[string[]]`` parameter is never cleared by a split (it
+rejects the joined element at bind time), so a comma-list caller is flagged.
 
 NON-PROMISES (what this does NOT see):
 - Regex over text, no PowerShell AST and no pwsh process. A comma list assembled at run time
@@ -101,9 +100,9 @@ _HERE_OPEN = re.compile(r"@(['\"])[ \t]*\r?\n")
 def _blank_comments(text: str, literals: bool = False) -> str:
     """Return text with PowerShell comments replaced by spaces (newlines kept so line numbers hold).
 
-    ``literals=True`` also blanks the inside of single-quoted strings and single-quoted here-strings (the
-    delimiters stay): PowerShell does not expand ``$x`` there, so a mention of a variable in one is not a read.
-    Double-quoted strings stay because they interpolate. The length never changes, so offsets still line up.
+    ``literals=True`` also blanks the inside of every string literal: single- and double-quoted strings and both
+    here-string kinds (the delimiters stay). Text inside a string is never a read and never a split, even where
+    PowerShell interpolates it. The length never changes, so offsets still line up.
     """
     out: list[str] = []
     i, n = 0, len(text)
@@ -112,19 +111,20 @@ def _blank_comments(text: str, literals: bool = False) -> str:
         c = text[i]
         if quote:
             if quote == '"' and c == "`" and i + 1 < n:
-                out.append(c)
-                out.append(text[i + 1])
+                nxt = text[i + 1]
+                out.append(" " if literals else c)
+                out.append(" " if literals and nxt not in "\r\n" else nxt)
                 i += 2
                 continue
             if c == quote:
-                if quote == "'" and i + 1 < n and text[i + 1] == "'":
-                    out.append("  " if literals else "''")
+                if i + 1 < n and text[i + 1] == quote:
+                    out.append("  " if literals else quote * 2)
                     i += 2
                     continue
                 out.append(c)
                 quote = ""
             else:
-                out.append(" " if literals and quote == "'" and c not in "\r\n" else c)
+                out.append(" " if literals and c not in "\r\n" else c)
             i += 1
             continue
         here = _HERE_OPEN.match(text, i) if literals and c == "@" else None
@@ -134,7 +134,7 @@ def _blank_comments(text: str, literals: bool = False) -> str:
             end = n if close < 0 else close + 3
             inner_end = n if close < 0 else max(close, here.end())
             out.append(text[i:here.end()])
-            out.append("".join(ch if ch in "\r\n" or q == '"' else " " for ch in text[here.end():inner_end]))
+            out.append("".join(ch if ch in "\r\n" else " " for ch in text[here.end():inner_end]))
             out.append(text[inner_end:end])
             i = end
             continue
@@ -285,15 +285,24 @@ def _body_statements(text: str, block_end: int) -> tuple[str, ...]:
     return tuple(_statements(_blank_comments(text, literals=True)[block_end:]))
 
 
-_ITEM = r"(?:\$_|\$PSItem)\b"
-_SPLIT = r"(?:-split\b|\.Split\s*\()"
-_ITEM_SPLIT = re.compile(_ITEM + r"[\w.\[\]()\s]*?" + _SPLIT, re.I)
-_ITEM_USE = re.compile(_ITEM, re.I)
-# Anything that can start a nested pipeline or rebind ``$_`` inside a stage script block: a pipe, the
-# ForEach / Where / ``%`` / ``?`` stage commands and methods, ``-InputObject``, ``switch``, ``catch`` and ``trap``.
-# Seeing one anywhere in the block is enough to refuse credit; which ``$_`` it binds is never resolved.
-_NESTED = re.compile(
-    r"\||\?|%|-InputObject\b|\b(?:ForEach-Object|Where-Object|switch|catch|trap)\b|\.(?:ForEach|Where)\s*\(", re.I
+# The r4 whitelist. Statements reach these patterns with every string literal blanked to spaces, so ``_LIT`` only
+# has to match the delimiters. A split expression is ``<x> -split '<lit>'[, n]``, ``(<x> -split '<lit>').Trim()``
+# or ``<x>.Split(<literal args>)[.Trim()]``, and it must be the WHOLE right-hand side or stage body.
+_ITEM = r"(?:\$_\b|\$PSItem\b|\(\s*\[string\]\s*(?:\$_|\$PSItem)\s*\))"
+_LIT = r"(?:'[^']*'|\"[^\"]*\")"
+_TRIM = r"(?:\.Trim\(\))?"
+
+
+def _split_of(operand: str) -> str:
+    by_op = operand + r"\s*-split\s*" + _LIT + r"(?:\s*,\s*\d+)?"
+    return r"(?:" + by_op + r"|\(\s*" + by_op + r"\s*\)" + _TRIM + r"|" + operand + r"\.Split\(\s*[^(){}$;|]*\)" + _TRIM + r")"
+
+
+# The one guarded variant: an existing path passes through whole, anything else is split (a path may hold a comma).
+_STAGE_BODY = re.compile(
+    r"\s*(?:" + _split_of(_ITEM) + r"|if\s*\(\s*Test-Path\s+-LiteralPath\s+" + _ITEM + r"\s*\)\s*\{\s*" + _ITEM
+    + r"\s*\}\s*else\s*\{\s*" + _split_of(_ITEM) + r"\s*\})\s*",
+    re.I,
 )
 _CLOSERS = {"(": ")", "[": "]", "{": "}"}
 
@@ -328,71 +337,46 @@ def _matching(text: str, i: int) -> int:
     return n
 
 
-def _stream_item_split(tail: str) -> int:
-    """For the text after ``$Name``: the end offset of the stage that splits the parameter's items, else -1.
+def _stage_split(expr: str, source: re.Pattern[str]) -> int:
+    """End offset (just past ``}``) of a whitelisted split stage at the start of ``expr``, else -1.
 
-    The parameter feeds the first stage of the pipeline, so ``$_`` in that stage's script block is a
-    parameter item. It stays one for a later stage only while every stage before it read ``$_`` (a stage that
-    ignores ``$_`` emits something unrelated to the parameter). Fails closed: a stage script block that holds
-    any nested pipeline construct (``_NESTED``) earns no credit and carries nothing on, because which ``$_`` the
-    inner stage binds is not worked out.
+    ``source`` matches the pipeline head up to the stage block's ``{``: the parameter piped straight into
+    ``ForEach-Object`` / ``%`` with nothing in between. The block body must be exactly one split expression on
+    ``$_`` / ``$PSItem`` (``_STAGE_BODY``), so a second statement, an assignment or a nested stage refuses it.
     """
-    segments: list[list[str]] = [[]]
-    ends: list[int] = []
-    i, n = 0, len(tail)
-    while i < n:
-        c = tail[i]
-        if c in "'\"":
-            i = _skip_quoted(tail, i)
-            continue
-        if c == "{":
-            j = _matching(tail, i)
-            block = tail[i + 1:j]
-            segments[-1].append("" if _NESTED.search(block) else block)
-            i = j + 1
-            continue
-        if c in "([":
-            i = _matching(tail, i) + 1
-            continue
-        if c in ")]};" or (c == "|" and tail[i + 1:i + 2] == "|"):
-            break
-        if c == "|":
-            ends.append(i)
-            segments.append([])
-        i += 1
-    ends.append(min(i, n))
-    carried = True
-    for k, blocks in enumerate(segments[1:], 1):
-        if carried and any(_ITEM_SPLIT.search(b) for b in blocks):
-            return ends[k]
-        if blocks and not any(_ITEM_USE.search(b) for b in blocks):
-            carried = False
-    return -1
+    m = source.match(expr)
+    if not m:
+        return -1
+    close = _matching(expr, m.end() - 1)
+    if close >= len(expr) or not _STAGE_BODY.fullmatch(expr, m.end(), close):
+        return -1
+    return close + 1
 
 
 def is_normalised(text: str, name: str, block_end: int) -> bool:
-    """True when the split is applied to ``$name`` itself AND its result flows to a use of the parameter.
+    """True only when a split of ``$name`` matches one of the two whitelisted forms; every other shape fails closed.
 
-    Applied to the parameter: ``$Name -split`` / ``$Name[0].Split(``, or a pipeline that starts at ``$Name`` and
-    splits the pipeline item (``$_`` / ``$PSItem``) downstream; ``$Name = Resolve-... $Name`` counts as a helper
-    that does both. Flows to a use: the statement assigns it back to ``$Name``, assigns it to another variable
-    that a later statement reads before overwriting it, or keeps piping it into a further stage. A split of some
-    other variable (``$z -split``), of an inner pipeline's item, or whose result nothing reads does not clear it.
+    Statements are read with every comment and string literal blanked, so neither a split nor a read inside a
+    string ever counts.
+
+    1. TEMP/DIRECT: ``$X = $Name -split '<lit>'`` / ``$X = $Name[0].Split(...)`` (optionally inside ``@( )``), with
+       ``$X`` either another variable or ``$Name`` itself, and ``$X`` later read as a bare (not backtick-escaped)
+       token before it is overwritten.
+    2. STAGE: ``$Name | ForEach-Object { <split of $_> }`` (or ``%``), whose block is that one split expression and
+       nothing else, or exactly ``if (Test-Path -LiteralPath $_) { $_ } else { <split of $_> }``. Its result must flow on: assigned back to ``$Name``, assigned to a variable read later as in
+       form 1, or piped into a further stage.
+
+    ``$Name = Resolve-... $Name`` still counts as a normalising helper.
     """
-    var = re.compile(r"\$" + re.escape(name) + r"\b", re.I)
-    direct = re.compile(var.pattern + r"(?:\[[^\]]*\])?\s*" + _SPLIT, re.I)
-    helper = re.compile(r"Resolve-[\w-]+.*" + var.pattern, re.I)
+    var = r"\$" + re.escape(name) + r"\b"
+    direct = re.compile(r"(?:@\(\s*)?" + _split_of(var + r"(?:\[[^\]]*\])?") + r"(?:\s*\))?", re.I)
+    stage_rhs = re.compile(r"(?:@?\(\s*)?" + var + r"\s*\|\s*(?:ForEach-Object|%)\s*\{", re.I)
+    stage_stmt = re.compile(var + r"\s*\|\s*(?:ForEach-Object|%)\s*\{", re.I)
+    helper = re.compile(r"Resolve-[\w-]+.*" + var, re.I)
     assign = re.compile(r"^(?:\[[^\]]*\]\s*)*\$(\w+)\s*=\s*(.*)$", re.I)
 
-    def stream_split(stmt: str) -> int:
-        for m in var.finditer(stmt):
-            end = _stream_item_split(stmt[m.end():])
-            if end >= 0:
-                return m.end() + end
-        return -1
-
     def read_before_overwrite(target: str, later: tuple[str, ...]) -> bool:
-        mention = re.compile(r"\$" + re.escape(target) + r"\b", re.I)
+        mention = re.compile(r"(?<!`)\$" + re.escape(target) + r"\b", re.I)
         for stmt in later:
             m = assign.match(stmt)
             if m and m.group(1).lower() == target.lower():
@@ -406,14 +390,15 @@ def is_normalised(text: str, name: str, block_end: int) -> bool:
         m = assign.match(stmt)
         if m:
             target, rhs = m.group(1), m.group(2)
-            if target.lower() == name.lower():
-                if direct.search(rhs) or stream_split(rhs) >= 0 or helper.match(rhs):
-                    return True
-            elif (direct.search(rhs) or stream_split(rhs) >= 0) and read_before_overwrite(target, stmts[k + 1:]):
+            if target.lower() == "null":
+                continue
+            if target.lower() == name.lower() and (_stage_split(rhs, stage_rhs) >= 0 or helper.match(rhs)):
+                return True
+            if (direct.fullmatch(rhs) or _stage_split(rhs, stage_rhs) >= 0) and read_before_overwrite(target, stmts[k + 1:]):
                 return True
         else:
-            end = stream_split(stmt)
-            if end >= 0 and "|" in stmt[end:]:
+            end = _stage_split(stmt, stage_stmt)
+            if end >= 0 and stmt[end:].lstrip().startswith("|") and not stmt[end:].lstrip().startswith("||"):
                 return True
     return False
 
@@ -777,10 +762,6 @@ class PwshStringArrayFileParams(unittest.TestCase):
             "$Dirs | ForEach-Object { $ext | ForEach-Object { $_.Split(',') } | Out-Null\n $_ } | ForEach-Object { $_ }\n",
         ):
             self.assertEqual([("tools/x/trace.ps1", "Dirs")], self._flagged({"tools/x/trace.ps1": head + nested, **callers}), nested)
-        for bound in (
-            "$Dirs | ForEach-Object { if ($_) { $_ -split ',' } else { $_ } } | ForEach-Object { $_ }\n",
-        ):
-            self.assertEqual([], self._flagged({"tools/x/trace.ps1": head + bound, **callers}), bound)
 
     def test_red_any_nested_pipeline_in_the_consuming_stage_refuses_the_credit(self):
         callers = {"docs/how.md": "pwsh -File tools/x/trace.ps1 -Dirs a,b\n"}
@@ -801,8 +782,26 @@ class PwshStringArrayFileParams(unittest.TestCase):
             "$Dirs | ForEach-Object { try { 1 } catch { $_ -split ',' } ; $_ }" + tail,
         ):
             self.assertEqual([("tools/x/trace.ps1", "Dirs")], self._flagged({"tools/x/trace.ps1": head + nested, **callers}), nested)
+        # r4 whitelist: these cleared the parameter through r3 and are flagged now (moved here, not deleted). A
+        # stage earns credit only when its block is one statement that is the split itself, and only when it takes
+        # the parameter directly; a temporary earns it only when read as a bare token outside every string.
+        for outside in (
+            # was the green `bound` case of the inner-pipeline test: the split sits in an if/else branch
+            "$Dirs | ForEach-Object { if ($_) { $_ -split ',' } else { $_ } }" + tail,
+            # was the green `passthrough` case of the downstream test: a stage sits between $Dirs and the split
+            "$Dirs | ForEach-Object { $_.Trim() } | ForEach-Object { $_ -split ',' }" + tail,
+            # was the green double-quoted `read` case of the literal test: the only read is inside "..."
+            "$parts = $Dirs[0].Split(',')\nWrite-Verbose \"Split result is in $parts\"\n$parts = @()\n$Dirs | ForEach-Object { $_ }\n",
+        ):
+            self.assertEqual([("tools/x/trace.ps1", "Dirs")], self._flagged({"tools/x/trace.ps1": head + outside, **callers}), outside)
         clean = "$Dirs | ForEach-Object { if (Test-Path -LiteralPath $_) { $_ } else { $_ -split ',' } }" + tail
         self.assertEqual([], self._flagged({"tools/x/trace.ps1": head + clean, **callers}), clean)
+        for guarded_other in (
+            "$Dirs | ForEach-Object { if (Test-Path -LiteralPath $_) { $_ -split ',' } else { $_ } }" + tail,
+            "$Dirs | ForEach-Object { if (Test-Path -LiteralPath $z) { $_ } else { $_ -split ',' } }" + tail,
+            "$Dirs | ForEach-Object { if (Test-Path -LiteralPath $_) { $_ } else { $parts = $_ -split ','; $_ } }" + tail,
+        ):
+            self.assertEqual([("tools/x/trace.ps1", "Dirs")], self._flagged({"tools/x/trace.ps1": head + guarded_other, **callers}), guarded_other)
 
     def test_red_variable_mentioned_only_in_a_literal_is_not_a_read(self):
         callers = {"docs/how.md": "pwsh -File tools/x/trace.ps1 -Dirs a,b\n"}
@@ -818,8 +817,6 @@ class PwshStringArrayFileParams(unittest.TestCase):
         ):
             text = split + mention + overwrite
             self.assertEqual([("tools/x/trace.ps1", "Dirs")], self._flagged({"tools/x/trace.ps1": head + text, **callers}), text)
-        read = split + 'Write-Verbose "Split result is in $parts"\n' + overwrite
-        self.assertEqual([], self._flagged({"tools/x/trace.ps1": head + read, **callers}), read)
         for fake in (
             "$Dirs | ForEach-Object { 'x $_ -split y' }\n",
             "$Dirs = 'a $Dirs -split b'\n$Dirs | ForEach-Object { $_ }\n",
@@ -831,8 +828,68 @@ class PwshStringArrayFileParams(unittest.TestCase):
         head = self.RED_SCRIPT.split("$Dirs | ForEach")[0]
         unrelated = "$Dirs | ForEach-Object { $z -split ',' } | ForEach-Object { $_ -split ';' } | ForEach-Object { $_ }\n"
         self.assertEqual([("tools/x/trace.ps1", "Dirs")], self._flagged({"tools/x/trace.ps1": head + unrelated, **callers}), unrelated)
-        passthrough = "$Dirs | ForEach-Object { $_.Trim() } | ForEach-Object { $_ -split ',' } | ForEach-Object { $_ }\n"
-        self.assertEqual([], self._flagged({"tools/x/trace.ps1": head + passthrough, **callers}), passthrough)
+
+    def _flag_body(self, body: str) -> list[tuple[str, str]]:
+        head = self.RED_SCRIPT.split("$Dirs | ForEach")[0]
+        return self._flagged({"tools/x/trace.ps1": head + body, "docs/how.md": "pwsh -File tools/x/trace.ps1 -Dirs a,b\n"})
+
+    def test_red_split_stage_with_a_second_statement_does_not_clear_it(self):
+        # sol r3 SPLIT-DATAFLOW-STAGE-UNUSED-1: the stage splits into an unread local and emits the item unchanged.
+        for body in (
+            "$Dirs | ForEach-Object { $parts = $_ -split ','; $_ } | ForEach-Object { $_ }\n",
+            "$Dirs | ForEach-Object {\n    $parts = $_ -split ','\n    $_\n} | ForEach-Object { $_ }\n",
+        ):
+            self.assertEqual([("tools/x/trace.ps1", "Dirs")], self._flag_body(body), body)
+
+    def test_red_split_temporary_read_only_inside_a_string_does_not_clear_it(self):
+        # sol r3 SPLIT-DATAFLOW-ESCAPED-READ-1: a backtick-escaped mention in "..." is text, not a read.
+        body = "$parts = $Dirs[0].Split(',')\nWrite-Verbose \"Split result is in `$parts\"\n$parts = @()\n$Dirs | ForEach-Object { $_ }\n"
+        self.assertEqual([("tools/x/trace.ps1", "Dirs")], self._flag_body(body), body)
+
+    def test_red_parenless_intrinsic_foreach_in_the_stage_does_not_clear_it(self):
+        # fable r3 NESTED-PARENLESS-INTRINSIC-METHOD-1: .ForEach{ } / .Where{ } rebind $_ with no pipe or cmdlet.
+        for body in (
+            "$Dirs | ForEach-Object { $null = 'png,jpg'.ForEach{ $_ -split ',' }; $_ } | ForEach-Object { $_ }\n",
+            "$Dirs | ForEach-Object { $null = 'png,jpg'.Where{ $_ -split ',' }; $_ } | ForEach-Object { $_ }\n",
+        ):
+            self.assertEqual([("tools/x/trace.ps1", "Dirs")], self._flag_body(body), body)
+
+    def test_red_where_object_stage_split_does_not_clear_it(self):
+        # fable r3 WHERE-STAGE-SPLIT-CREDITED-1: a filter discards the split result; only ForEach-Object / % count.
+        for body in (
+            "$Dirs | Where-Object { $_ -split ',' } | ForEach-Object { $_ }\n",
+            "$Dirs | ? { $_ -split ',' } | ForEach-Object { $_ }\n",
+            "$Dirs | Sort-Object { $_ -split ',' } | ForEach-Object { $_ }\n",
+        ):
+            self.assertEqual([("tools/x/trace.ps1", "Dirs")], self._flag_body(body), body)
+
+    def test_red_split_text_in_a_double_quoted_string_does_not_clear_it(self):
+        # fable r3 hardening DOUBLE-QUOTED-SPLIT-TEXT-CREDITED-1: split text inside "..." is not a split.
+        for body in (
+            "$Dirs = \"a $Dirs -split b\"\n$Dirs | ForEach-Object { $_ }\n",
+            "$Dirs | ForEach-Object { Write-Host \"$_ -split ','\"; $_ } | ForEach-Object { $_ }\n",
+            "$Dirs = @\"\n$Dirs -split ','\n\"@\n$Dirs | ForEach-Object { $_ }\n",
+        ):
+            self.assertEqual([("tools/x/trace.ps1", "Dirs")], self._flag_body(body), body)
+
+    def test_red_blockless_stage_before_the_split_does_not_clear_it(self):
+        # fable r3 hardening STREAM-CARRY-BLOCKLESS-STAGE-1: the split stage must take the parameter directly.
+        for body in (
+            "$parts = $Dirs | Get-Item | ForEach-Object { $_ -split ',' }\n$parts | Out-Null\n",
+            "$Dirs | Select-Object -First 1 | ForEach-Object { $_ -split ',' } | ForEach-Object { $_ }\n",
+        ):
+            self.assertEqual([("tools/x/trace.ps1", "Dirs")], self._flag_body(body), body)
+
+    def test_green_each_whitelisted_form_clears_it(self):
+        for body in (
+            # TEMP/DIRECT form: split of the parameter, then a bare read outside any string
+            "$parts = $Dirs[0].Split(',')\nWrite-Verbose $parts\n$parts = @()\n$Dirs | ForEach-Object { $_ }\n",
+            "$Dirs = $Dirs -split ','\n$Dirs | ForEach-Object { $_ }\n",
+            # STAGE form: the parameter piped straight into a one-statement split block
+            "$Dirs | % { $PSItem.Split(',').Trim() } | ForEach-Object { $_ }\n",
+            "$parts = $Dirs | ForEach-Object {\n    $_ -split ','\n}\n$parts | ForEach-Object { $_ }\n",
+        ):
+            self.assertEqual([], self._flag_body(body), body)
 
     def test_red_dotnet_split_array_variable_to_file_child_is_flagged(self):
         script = {"tools/x/trace.ps1": self._split_fixed()}
