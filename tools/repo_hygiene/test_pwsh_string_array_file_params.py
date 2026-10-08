@@ -15,17 +15,20 @@ A caller that hands an ARRAY to a ``-File`` child is flagged whether or not the 
 ``-P @(...)`` and the quoted ArgumentList form ``'-File', 'x.ps1', '-P', $arr`` expand to separate tokens, so
 only the first element binds (export-release-cuda-dogfood-kit.ps1 and invoke-ultramagnus-p3-evidence.ps1 were
 this shape). Fix the caller with ``($arr -join ',')`` and split in the script. A variable counts as an array
-when the caller's file declares it ``[string[]]`` / ``[array]``, assigns it ``@(...)`` / a comma list / a
-``-split`` / an ``...Array...`` helper, or aliases one of those. A split counts as normalisation only when it
-is applied to the parameter itself (``$P -split``, ``$P[0].Split(``, ``$P | ... -split``) or assigned back to it.
+when the caller's file declares it ``[string[]]`` / ``[array]``, assigns it ``@(...)`` / a cast / a comma list /
+a ``-split`` / a ``Verb-...Array...`` helper (never a name that merely contains "array", like ``$arrayCount``),
+or aliases one of those. A split counts as normalisation only when it is applied to the parameter itself
+(``$P -split``, ``$P[0].Split(``, ``$P | ... { $_ -split }``) AND its result flows to a use: assigned back to ``$P``,
+assigned to a variable a later statement reads, or piped on. A ``[ValidateSet]`` on a top-level ``[string[]]``
+parameter is never cleared by a split (it rejects the joined element at bind time), so a comma-list caller is flagged.
 
 NON-PROMISES (what this does NOT see):
 - Regex over text, no PowerShell AST and no pwsh process. A comma list assembled at run time
   (``-join ','`` into a variable) is not seen; a variable of unknown type (``-P $x``) is not flagged;
   a caller that only appears in prose (docs/playback-attr-3-cuda.md names ``-CudaArchitectures
   sm_86,compute_86`` with no ``-File`` on the line) is not seen, so the dll-job split has no live-tree
-  revert test. A ``[ValidateSet]`` on a top-level ``[string[]]`` parameter (it rejects the joined element at
-  bind time, before any split) is checked only for scripts embedded as here-strings.
+  revert test. A flow of the split result through a function call or a property (``$x = Normalise $P``, with the
+  split inside the function) is not followed, so only the ``Resolve-...`` helper shape is recognised.
 - Only the first column-0 ``param(`` of a file is read, so a function-level parameter is out of
   scope, and so is a script that nests its real param block in a here-string.
 - Pass-through parameters (``-AdditionalArgs`` and friends) cannot be fixed by splitting on a
@@ -41,6 +44,7 @@ from __future__ import annotations
 import functools
 import re
 import subprocess
+import time
 import unittest
 from dataclasses import dataclass
 from pathlib import Path
@@ -59,13 +63,18 @@ MAX_COMMA_JOIN = 60
 # Each entry is asserted to STILL be a violation: fix the script or its caller, then delete it.
 KNOWN_OPEN: dict[tuple[str, str], str] = {
     ("tools/profiling/run-release-gui-smoke.ps1", "ExtraEnvironment"): (
-        "docs/04-external-auditor-guide.md:496 documents `-ExtraEnvironment @(...)`. A PowerShell caller expands the "
-        "array into separate tokens, so only the first binds. Pass-through values may hold commas, so a comma split "
-        "is not the fix; follow-up PWSH-FILE-ARRAY-PASSTHRU-1 (proposed in PR #311): fail loud or pass base64 JSON."
+        "docs/04-external-auditor-guide.md:504 documents `-ExtraEnvironment @('KEY=VALUE')` with ONE element, which "
+        "expands to one token and binds correctly; the guard flags the `@(...)` literal because it cannot count "
+        "elements. With two or more, the extra tokens land in $UnrecognizedArguments (ValueFromRemainingArguments) "
+        "and the script throws, so that failure is loud. Pass-through values may hold commas, so a comma split is "
+        "not the fix; follow-up PWSH-FILE-ARRAY-PASSTHRU-1 (queued in the hub card queue): fail loud or pass base64 JSON."
     ),
     ("tools/profiling/run-release-playback-profile.ps1", "AdditionalArgs"): (
-        "docs/14-performance-benchmarking.md:544 documents `-AdditionalArgs @('--a', 'b')`; same expansion, same "
-        "reason, same follow-up PWSH-FILE-ARRAY-PASSTHRU-1."
+        "docs/14-performance-benchmarking.md:544-551 documents `-AdditionalArgs @('--stage-log', ..., '--raw-cache-mb', "
+        "...)`, six elements. PowerShell expands them to six tokens; only the first binds to -AdditionalArgs and the "
+        "rest bind positionally to unbound parameters (no [CmdletBinding()], so ExePath takes the stage-log path first "
+        "and fails at path resolution). That example fails visibly, but a pass-through value that happens to suit the "
+        "next parameter would bind silently. Same follow-up PWSH-FILE-ARRAY-PASSTHRU-1."
     ),
 }
 
@@ -166,64 +175,79 @@ def _statements(body: str) -> list[str]:
     cur: list[str] = []
     braces: list[bool] = []
     depth, quote, i, n = 0, "", 0, len(body)
+    # Linear scan: the statement's last significant character and "has a pipe" are tracked as it is built, and
+    # the next non-blank character is found once per whitespace run, so no step re-reads the text around it.
+    last, piped, ahead_at = "", False, 0
+
+    def add(piece: str) -> None:
+        nonlocal last, piped
+        cur.append(piece)
+        if "|" in piece:
+            piped = True
+        if piece.strip():
+            last = piece.rstrip()[-1]
 
     def flush() -> None:
+        nonlocal last, piped
         stmt = " ".join("".join(cur).split())
         if stmt:
             out.append(stmt)
         cur.clear()
+        last, piped = "", False
 
     while i < n:
         c = body[i]
         if quote:
-            cur.append(c)
+            add(c)
             if quote == '"' and c == "`" and i + 1 < n:
-                cur.append(body[i + 1])
+                add(body[i + 1])
                 i += 2
                 continue
             if c == quote:
                 if quote == "'" and i + 1 < n and body[i + 1] == "'":
-                    cur.append("'")
+                    add("'")
                     i += 2
                     continue
                 quote = ""
         elif c in ("'", '"'):
             quote = c
-            cur.append(c)
+            add(c)
         elif c == "`" and i + 1 < n and body[i + 1] in "\r\n":
-            cur.append(" ")
+            add(" ")
             i += 2
             continue
         elif c in "([":
             depth += 1
-            cur.append(c)
+            add(c)
         elif c in ")]":
             depth = max(0, depth - 1)
-            cur.append(c)
+            add(c)
         elif c == "{":
-            counted = "|" in "".join(cur)
+            counted = piped
             braces.append(counted)
             depth += 1 if counted else 0
-            cur.append(c)
+            add(c)
             if not counted and depth == 0:
                 flush()
         elif c == "}":
             counted = braces.pop() if braces else False
             depth = max(0, depth - (1 if counted else 0))
-            cur.append(c)
+            add(c)
             if not counted and depth == 0:
                 flush()
         elif c == ";" and depth == 0:
             flush()
         elif c == "\n":
-            tail = "".join(cur).rstrip()
-            ahead = body[i + 1:].lstrip()
-            if depth or tail.endswith(("|", ",")) or ahead.startswith("|"):
-                cur.append(" ")
+            if ahead_at <= i:
+                ahead_at = i + 1
+                while ahead_at < n and body[ahead_at].isspace():
+                    ahead_at += 1
+            if depth or last in ("|", ",") or (ahead_at < n and body[ahead_at] == "|"):
+                add(" ")
             else:
                 flush()
         else:
-            cur.append(c)
+            add(c)
         i += 1
     flush()
     return out
@@ -236,19 +260,38 @@ def _body_statements(text: str, block_end: int) -> tuple[str, ...]:
 
 
 def is_normalised(text: str, name: str, block_end: int) -> bool:
-    """True when a statement after the param block splits ``$name`` itself, not merely something near it.
+    """True when the split is applied to ``$name`` itself AND its result flows to a use of the parameter.
 
-    Bound means one of: ``$Name -split`` / ``$Name[0].Split(`` (the split is applied to the parameter), a
-    pipeline that starts at ``$Name`` and splits downstream, or ``$Name = Resolve-... $Name``.
+    Applied to the parameter: ``$Name -split`` / ``$Name[0].Split(``, or a pipeline that starts at ``$Name`` and
+    splits the pipeline item (``$_`` / ``$PSItem``) downstream; ``$Name = Resolve-... $Name`` counts as a helper
+    that does both. Flows to a use: the statement assigns it back to ``$Name``, assigns it to another variable
+    that a later statement reads, or keeps piping it into a further stage. A split of some other variable
+    (``$z -split``) or a split whose result nothing reads does not clear it.
     """
     var = r"\$" + re.escape(name) + r"\b"
     split = r"(?:-split\b|\.Split\s*\()"
-    bound = (
-        re.compile(var + r"(?:\[[^\]]*\])?\s*" + split, re.I),
-        re.compile(var + r"[^|]*\|.*?" + split, re.I),
-        re.compile(r"^" + var + r"\s*=\s*Resolve-[\w-]+.*" + var, re.I),
-    )
-    return any(rx.search(stmt) for stmt in _body_statements(text, block_end) for rx in bound)
+    item = r"(?:\$_|\$PSItem)\b[\w.\[\]()\s]*?"
+    direct = re.compile(var + r"(?:\[[^\]]*\])?\s*" + split, re.I)
+    piped = re.compile(var + r"[^|]*\|.*?" + item + split, re.I)
+    helper = re.compile(r"Resolve-[\w-]+.*" + var, re.I)
+    assign = re.compile(r"^(?:\[[^\]]*\]\s*)*\$(\w+)\s*=\s*(.*)$", re.I)
+    stmts = _body_statements(text, block_end)
+    for k, stmt in enumerate(stmts):
+        m = assign.match(stmt)
+        if m:
+            target, rhs = m.group(1), m.group(2)
+            if target.lower() == name.lower():
+                if direct.search(rhs) or piped.search(rhs) or helper.match(rhs):
+                    return True
+            elif (direct.search(rhs) or piped.search(rhs)) and any(
+                re.search(r"\$" + re.escape(target) + r"\b", later, re.I) for later in stmts[k + 1:]
+            ):
+                return True
+        else:
+            pm = piped.search(stmt)
+            if pm and "|" in stmt[pm.end():]:
+                return True
+    return False
 
 
 def _logical_commands(text: str) -> list[tuple[int, str]]:
@@ -283,7 +326,13 @@ def _array_variable_names(text: str) -> frozenset[str]:
     for m in re.finditer(r"\[(?:string\[\]|object\[\]|array)\]\s*`?\$(\w+)", text, re.I):
         names.add(m.group(1).lower())
     assigns = re.findall(r"`?\$(\w+)\s*\+?=\s*([^\r\n]*)", text)
-    arrayish = re.compile(r"^(?:@\(|.*Array|.*-split\b|(?:'[^']*'|\"[^\"]*\"|`?\$\w+)\s*,)", re.I)
+    # An array value: @(...), a cast, a -split, a comma list, or a cmdlet/helper whose NAME says Array (never a
+    # variable or member that merely contains the word, such as $arrayCount).
+    arrayish = re.compile(
+        r"^(?:@\(|\[(?:string\[\]|object\[\]|array)\]|.*-split\b|&?\s*[A-Za-z]+-[\w-]*Array[\w-]*(?:\s|$)"
+        r"|(?:'[^']*'|\"[^\"]*\"|`?\$\w+)\s*,)",
+        re.I,
+    )
     for lhs, rhs in assigns:
         if arrayish.match(rhs.strip()):
             names.add(lhs.lower())
@@ -297,9 +346,9 @@ def _array_variable_names(text: str) -> frozenset[str]:
 
 def _comma_value(cmd: str, name: str) -> str | None:
     item = r"(?:'[^']*'|\"[^\"]*\"|[^\s`|),]+)"
-    m = re.search(r"(?<![\w-])-" + re.escape(name) + r"(?:\s+|:)(" + item + r"(?:," + item + r")*)", cmd, re.I)
-    if m and "," in m.group(1):
-        return m.group(1)
+    for m in re.finditer(r"(?<![\w-])-" + re.escape(name) + r"(?:\s+|:)(" + item + r"(?:," + item + r")*)", cmd, re.I):
+        if "," in m.group(1):
+            return m.group(1)
     return None
 
 
@@ -312,8 +361,10 @@ def validateset_string_arrays(script: str) -> list[str]:
     """``[string[]]`` parameters guarded by ``[ValidateSet(...)]``: validation runs on the one joined element
     (``-P a,b``) before any in-script split can run, so a comma list is rejected at bind time."""
     names = []
-    for name, _line, end in script_string_array_params(script):
-        decl = _blank_comments(script)[max(0, end - 4000):end]
+    params = script_string_array_params(script)
+    clean = _blank_comments(script) if params else ""
+    for name, _line, end in params:
+        decl = clean[max(0, end - 4000):end]
         if re.search(r"\[ValidateSet\([^)]*\)\]\s*(?:\[[^\]]*\]\s*)*\[string\[\]\]\s*\$" + re.escape(name) + r"\b", decl, re.I):
             names.append(name)
     return names
@@ -360,10 +411,17 @@ def _caller_commands(text: str) -> list[tuple[int, str, str, bool]]:
 def find_violations(files: dict[str, str]) -> list[Violation]:
     """files maps a repo-relative posix path to its text."""
     scripts: dict[str, list[tuple[str, bool]]] = {}
+    validated: set[tuple[str, str]] = set()
     for path, text in files.items():
         if not path.lower().endswith(".ps1"):
             continue
-        params = [(name, is_normalised(text, name, end)) for name, _line, end in script_string_array_params(text)]
+        # A top-level [ValidateSet] rejects the joined element at bind time, so no in-script split can clear it.
+        guarded = {name.lower() for name in validateset_string_arrays(text)}
+        validated.update((path, name.lower()) for name in guarded)
+        params = [
+            (name, name.lower() not in guarded and is_normalised(text, name, end))
+            for name, _line, end in script_string_array_params(text)
+        ]
         if params:
             scripts[path] = params
     out: list[Violation] = []
@@ -386,7 +444,12 @@ def find_violations(files: dict[str, str]) -> list[Violation]:
                             continue
                         value = _comma_value(cmd, name) or _quoted_comma_token(cmd, name)
                         if value is not None:
-                            out.append(Violation(script, name, path, lineno, f"comma list {value[:60]!r} reaches a [string[]] with no split"))
+                            why = (
+                                "a [ValidateSet] rejects the joined element at bind time, before any split"
+                                if (script, name.lower()) in validated
+                                else "with no split"
+                            )
+                            out.append(Violation(script, name, path, lineno, f"comma list {value[:60]!r} reaches a [string[]] {why}"))
                 if names_script or token_file:
                     for name, _normalised in params:
                         if "-" + name.lower() not in cmd_lower:
@@ -449,7 +512,7 @@ class PwshStringArrayFileParams(unittest.TestCase):
         self.assertEqual([], find_violations(files))
 
     def test_green_dotnet_split_and_resolve_helper_clear_it(self):
-        dot = self.RED_SCRIPT.replace("$Dirs | ForEach", "$parts = $Dirs[0].Split(',')\n$Dirs | ForEach")
+        dot = self.RED_SCRIPT.replace("$Dirs | ForEach", "$Dirs = @($Dirs[0].Split(','))\n$Dirs | ForEach")
         helper = self.RED_SCRIPT.replace("$Dirs | ForEach", "$Dirs = Resolve-Dirs -Dirs $Dirs\n$Dirs | ForEach")
         for text in (dot, helper):
             files = {"tools/x/trace.ps1": text, "docs/how.md": "pwsh -File tools/x/trace.ps1 -Dirs a,b\n"}
@@ -539,6 +602,90 @@ class PwshStringArrayFileParams(unittest.TestCase):
         ):
             files = {"tools/x/trace.ps1": self.RED_SCRIPT.replace("$Dirs | ForEach", fixed), **callers}
             self.assertEqual([], self._flagged(files), fixed)
+
+    def test_red_split_on_something_else_or_never_used_does_not_clear_it(self):
+        callers = {"docs/how.md": "pwsh -File tools/x/trace.ps1 -Dirs a,b\n"}
+        for unrelated in (
+            "$Dirs | ForEach-Object { $y = $z -split ',' }\n",
+            "$Dirs = @($Dirs | ForEach-Object { $z -split ',' })\n",
+            "$Dirs | ForEach-Object { $z -split ',' } | ForEach-Object { $_ }\n",
+            "$parts = $Dirs[0].Split(',')\n$Dirs | ForEach-Object { $_ }\n",
+            "$Dirs | ForEach-Object { $_ }\n$other = $z -split ','\n",
+        ):
+            files = {"tools/x/trace.ps1": self.RED_SCRIPT.split("$Dirs | ForEach")[0] + unrelated, **callers}
+            self.assertEqual([("tools/x/trace.ps1", "Dirs")], self._flagged(files), unrelated)
+
+    def test_green_split_result_that_flows_to_a_later_use_clears_it(self):
+        callers = {"docs/how.md": "pwsh -File tools/x/trace.ps1 -Dirs a,b\n"}
+        head = self.RED_SCRIPT.split("$Dirs | ForEach")[0]
+        for fixed in (
+            "$Dirs = @($Dirs[0].Split(','))\n$Dirs | ForEach-Object { $_ }\n",
+            "$parts = $Dirs[0].Split(',')\n$parts | ForEach-Object { $_ }\n",
+            "$Dirs | ForEach-Object { ([string]$_) -split ',' } | ForEach-Object { $_.Trim() }\n",
+        ):
+            self.assertEqual([], self._flagged({"tools/x/trace.ps1": head + fixed, **callers}), fixed)
+
+    def test_red_array_named_scalar_is_not_an_array_but_an_array_helper_is(self):
+        script = {"tools/x/trace.ps1": self._split_fixed()}
+        call = "& pwsh -File tools\\x\\trace.ps1 -Dirs $n\n"
+        for assign in ("$n = $arrayCount\n", "$n = $myArray.Count\n", "$n = $rawArrayText\n"):
+            self.assertEqual([], self._flagged({**script, "tools/x/run.ps1": assign + call}), assign)
+        for assign in (
+            "$n = Convert-ToPowerShellArrayLiteral $raw\n",
+            "$n = [string[]]$raw\n",
+            "$n = 'a', 'b'\n",
+            "$n = @($raw)\n",
+        ):
+            self.assertEqual([("tools/x/trace.ps1", "Dirs")], self._flagged({**script, "tools/x/run.ps1": assign + call}), assign)
+
+    def test_red_later_comma_list_is_not_masked_by_an_earlier_mention(self):
+        two = "param(\n    [string[]]$Dirs,\n    [string[]]$Names\n)\n$Dirs | ForEach-Object { $_ }\n$Names | ForEach-Object { $_ }\n"
+        for text in (
+            "pwsh -File tools/x/two.ps1 -Dirs one -Names a,b\n",
+            "see -Dirs one,\npwsh -File tools/x/two.ps1 -Dirs a,b\n",
+            "pwsh -File tools/x/two.ps1 -Dirs one -Dirs a,b\n",
+        ):
+            found = self._flagged({"tools/x/two.ps1": two, "docs/how.md": text})
+            self.assertEqual(1, len(found), text)
+
+    def test_red_top_level_validateset_on_a_string_array_flags_a_comma_list_caller(self):
+        script = "param(\n    [ValidateSet('a', 'b')]\n    [string[]]$Codecs = @('a')\n)\n$Codecs = @($Codecs | ForEach-Object { $_ -split ',' })\n"
+        files = {"tools/x/enc.ps1": script, "docs/how.md": "pwsh -File tools/x/enc.ps1 -Codecs a,b\n"}
+        self.assertEqual([("tools/x/enc.ps1", "Codecs")], self._flagged(files))
+        self.assertIn("ValidateSet", find_violations(files)[0].detail)
+        files["docs/how.md"] = "pwsh -File tools/x/enc.ps1 -Codecs a\n"
+        self.assertEqual([], self._flagged(files))
+        plain = script.replace("    [ValidateSet('a', 'b')]\n", "")
+        files = {"tools/x/enc.ps1": plain, "docs/how.md": "pwsh -File tools/x/enc.ps1 -Codecs a,b\n"}
+        self.assertEqual([], self._flagged(files))
+
+    def test_known_open_reasons_describe_what_the_callee_really_does(self):
+        files = _live_files()
+        gui, profile = (KNOWN_OPEN[("tools/profiling/" + n, p)] for n, p in (
+            ("run-release-gui-smoke.ps1", "ExtraEnvironment"), ("run-release-playback-profile.ps1", "AdditionalArgs")))
+        self.assertIn("ONE element", gui)
+        self.assertIn("ValueFromRemainingArguments", files["tools/profiling/run-release-gui-smoke.ps1"])
+        self.assertIn("positionally", profile)
+        self.assertNotIn("CmdletBinding", files["tools/profiling/run-release-playback-profile.ps1"])
+        for reason in KNOWN_OPEN.values():
+            self.assertIn("PWSH-FILE-ARRAY-PASSTHRU-1", reason)
+
+    def test_live_top_level_validateset_script_is_seen(self):
+        path = "tools/profiling/invoke-ultramagnus-cdng-export-evidence.ps1"
+        self.assertEqual(["CdngCodecs"], validateset_string_arrays(_live_files()[path]))
+
+    def test_statement_splitter_scales_linearly(self):
+        def best(lines: int) -> float:
+            body = "Write-Host $x\n" * lines
+            runs = []
+            for _ in range(3):
+                t0 = time.perf_counter()
+                _statements(body)
+                runs.append(time.perf_counter() - t0)
+            return min(runs)
+
+        small, large = best(20_000), best(80_000)
+        self.assertLess(large, small * 9, f"4x the lines took {large / small:.1f}x the time (quadratic is ~16x)")
 
     def test_reverting_each_guarded_311_fix_in_memory_is_flagged(self):
         files = _live_files()
