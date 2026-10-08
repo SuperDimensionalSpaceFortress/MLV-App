@@ -21,6 +21,7 @@
 
 #include "../../tools/gpu/igpu_amaze_debayer.h"
 
+#include <atomic>
 #include <cstring>
 
 namespace
@@ -321,6 +322,7 @@ typedef int (*GpuAmazeRunPostWbGlTextureFromDeviceBayer16Fn)(
     double,
     double);
 typedef int (*GpuAmazeResetLiveGlTextureResourcesFn)(igpu_amaze_debayer_backend *);
+typedef int (*GpuAmazeSetReducedHnyquistFn)(igpu_amaze_debayer_backend *, int);
 typedef int (*GpuAmazeLastTimingFn)(igpu_amaze_debayer_backend *,
                                     igpu_amaze_debayer_timing_t *);
 
@@ -336,6 +338,7 @@ struct GpuAmazeDebayerRuntime
     GpuAmazeRunPostWbGlTextureFromR16GlTextureFn runPostWbGlTextureFromR16GlTexture = nullptr;
     GpuAmazeRunPostWbGlTextureFromDeviceBayer16Fn runPostWbGlTextureFromDeviceBayer16 = nullptr;
     GpuAmazeResetLiveGlTextureResourcesFn resetLiveGlTextureResources = nullptr;
+    GpuAmazeSetReducedHnyquistFn setReducedHnyquist = nullptr;
     GpuAmazeLastTimingFn lastTiming = nullptr;
 };
 
@@ -523,6 +526,11 @@ struct GpuAmazeDebayerLiveTextureRuntime
         runtime.runPostWbGlTextureFromDeviceBayer16 =
             reinterpret_cast<GpuAmazeRunPostWbGlTextureFromDeviceBayer16Fn>(
                 runtime.library.resolve("igpu_amaze_debayer_run_post_wb_gl_texture_from_device_bayer16"));
+        /* PLAYBACK-CUDA-HONOUR-SCALE-1 r3: optional; without it a reduced texture
+         * present is refused (gpuAmazeDebayerReducedHnyquistAvailable). */
+        runtime.setReducedHnyquist =
+            reinterpret_cast<GpuAmazeSetReducedHnyquistFn>(
+                runtime.library.resolve("igpu_amaze_debayer_set_reduced_hnyquist"));
 
         backend = runtime.create("cuda");
         if ( !backend )
@@ -557,6 +565,63 @@ GpuAmazeDebayerLiveTextureRuntime & liveAmazeTextureRuntime()
     static GpuAmazeDebayerLiveTextureRuntime runtime;
     return runtime;
 }
+
+std::atomic<quint64> g_reducedHnyquistFrames{0};
+std::atomic<quint64> g_reducedHnyquistRefusals{0};
+
+/* Sets the sticky flag immediately before a live run (caller holds live.mutex). A
+ * reduced run on a DLL without the symbol is refused; 0 on such a DLL is a no-op,
+ * since that DLL cannot filter. */
+bool setLiveReducedHnyquist(GpuAmazeDebayerLiveTextureRuntime & live,
+                            bool reducedHnyquist,
+                            QString * why)
+{
+    if ( !live.runtime.setReducedHnyquist )
+    {
+        if ( reducedHnyquist && why ) *why = gpuAmazeDebayerReducedHnyquistMissingReason();
+        return !reducedHnyquist;
+    }
+    if ( live.runtime.setReducedHnyquist(live.backend, reducedHnyquist ? 1 : 0) != 0 )
+    {
+        if ( why ) *why = QStringLiteral("GPU AMaZE set_reduced_hnyquist(%1) failed")
+            .arg(reducedHnyquist ? 1 : 0);
+        return false;
+    }
+    return true;
+}
+}
+
+QString gpuAmazeDebayerReducedHnyquistMissingReason(void)
+{
+    return QStringLiteral("AMaZE DLL lacks the reduced H-Nyquist filter");
+}
+
+bool gpuAmazeDebayerReducedHnyquistAvailable(void)
+{
+    GpuAmazeDebayerLiveTextureRuntime & live = liveAmazeTextureRuntime();
+    if ( !live.ensure() ) return false;
+    QMutexLocker locker(&live.mutex);
+    return live.runtime.setReducedHnyquist != nullptr;
+}
+
+void gpuAmazeDebayerNoteReducedHnyquistFrame(void)
+{
+    g_reducedHnyquistFrames.fetch_add(1, std::memory_order_relaxed);
+}
+
+void gpuAmazeDebayerNoteReducedHnyquistRefusal(void)
+{
+    g_reducedHnyquistRefusals.fetch_add(1, std::memory_order_relaxed);
+}
+
+quint64 gpuAmazeDebayerReducedHnyquistFrames(void)
+{
+    return g_reducedHnyquistFrames.load(std::memory_order_relaxed);
+}
+
+quint64 gpuAmazeDebayerReducedHnyquistRefusals(void)
+{
+    return g_reducedHnyquistRefusals.load(std::memory_order_relaxed);
 }
 
 const char * gpuBilinearDebayerEnvironmentVariableName(void)
@@ -946,7 +1011,8 @@ bool gpuAmazeDebayerRenderPostWbGlTextureFromR16GlTexture(
     const double wbMultipliers[3],
     QString * reason,
     QString * rendererDescription,
-    GpuAmazeDebayerBackendTiming * timing)
+    GpuAmazeDebayerBackendTiming * timing,
+    bool reducedHnyquist)
 {
     auto fail = [&](const QString & why) -> bool
     {
@@ -975,6 +1041,11 @@ bool gpuAmazeDebayerRenderPostWbGlTextureFromR16GlTexture(
     }
 
     QMutexLocker locker(&live.mutex);
+    QString hnyquistReason;
+    if ( !setLiveReducedHnyquist(live, reducedHnyquist, &hnyquistReason) )
+    {
+        return fail(hnyquistReason);
+    }
     const int rc =
         live.runtime.runPostWbGlTextureFromR16GlTexture(
             live.backend,
@@ -1010,7 +1081,8 @@ bool gpuAmazeDebayerRenderPostWbGlTextureFromDeviceBayer16(
     const double wbMultipliers[3],
     QString * reason,
     QString * rendererDescription,
-    GpuAmazeDebayerBackendTiming * timing)
+    GpuAmazeDebayerBackendTiming * timing,
+    bool reducedHnyquist)
 {
     auto fail = [&](const QString & why) -> bool
     {
@@ -1042,6 +1114,11 @@ bool gpuAmazeDebayerRenderPostWbGlTextureFromDeviceBayer16(
     if ( !live.runtime.runPostWbGlTextureFromDeviceBayer16 )
     {
         return fail(QStringLiteral("GPU AMaZE direct device texture-present symbol is unavailable"));
+    }
+    QString hnyquistReason;
+    if ( !setLiveReducedHnyquist(live, reducedHnyquist, &hnyquistReason) )
+    {
+        return fail(hnyquistReason);
     }
 
     const int rc =

@@ -500,6 +500,34 @@ void debayerBasicU16(uint16_t * __restrict debayerto,
     memcpy(debayerto + (width * (height - 1) * 3), debayerto + (width * (height - 2) * 3), width * 3 * sizeof(uint16_t));
 }
 
+/* PLAYBACK-CUDA-HONOUR-SCALE-1 r3: horizontal Nyquist zero on a reduced recon's
+ * debayered RGB16. Per channel, out = (l + 2c + r + 2) >> 2 along the row, with the
+ * edge columns mirrored (x-1 -> x+1 at x=0, x+1 -> x-1 at x=w-1). The response is 0
+ * at the 2-column period and 1 at DC. Rows and channels are independent; out and in
+ * must not alias. The CUDA AMaZE backend's k_reduced_hnyquist121 is a line-for-line
+ * port. */
+void debayer_reduced_hnyquist121_rgb16(uint16_t *out, const uint16_t *in, int w, int h)
+{
+    if (!out || !in || w <= 0 || h <= 0) return;
+    for (int y = 0; y < h; ++y)
+    {
+        const uint16_t *src = in + (size_t)y * (size_t)w * 3u;
+        uint16_t *dst = out + (size_t)y * (size_t)w * 3u;
+        for (int x = 0; x < w; ++x)
+        {
+            const int xl = (x > 0) ? x - 1 : ((w > 1) ? x + 1 : x);
+            const int xr = (x < w - 1) ? x + 1 : ((w > 1) ? x - 1 : x);
+            for (int c = 0; c < 3; ++c)
+            {
+                const uint32_t l = src[(size_t)xl * 3u + (size_t)c];
+                const uint32_t m = src[(size_t)x * 3u + (size_t)c];
+                const uint32_t r = src[(size_t)xr * 3u + (size_t)c];
+                dst[(size_t)x * 3u + (size_t)c] = (uint16_t)((l + 2u * m + r + 2u) >> 2);
+            }
+        }
+    }
+}
+
 typedef struct
 {
     amazeinfo_t * info;

@@ -31,11 +31,15 @@ NON-PROMISES:
   form (long form `ls-tree -r` included; only --object-only is exempt) and `status --short|-s|-sb`
   count, as well as --name-only, --name-status and --porcelain.
 - DG-PS-NULL-COMPARE flags only a literal ``$null`` on the RIGHT of
-  -eq/-ne/-ceq/-cne/-ieq/-ine. The ``-eq $false`` tri-state form on a possibly-null
+  -eq/-ne/-ceq/-cne/-ieq/-ine, seen through parentheses and a one-statement ``$( )``
+  (``$x -eq $(${null})``); a null reached through a variable, a call or a longer ``$( )`` is not seen.
+  The ``-eq $false`` tri-state form on a possibly-null
   value (tools/profiling/compare-machine-perf.ps1, run-release-cuda-playback-ab.ps1)
   cannot be decided statically and is out of scope; review it by hand.
-- PS-ONE-TRAP counts every top-level TrapStatementAst (typed or catch-all) in a
-  file's own scope; traps inside functions or script blocks are not counted.
+- PS-ONE-TRAP counts untyped (catch-all) TrapStatementAst nodes per enclosing block (the
+  script's begin/process/end, or an if/foreach/try body), and flags a block with more than
+  one. A typed trap and a trap in another block are other scopes and are not counted;
+  traps inside a function or script block are not searched.
 
 If pwsh is not on PATH the AST guards SKIP with a reason; on a GitHub Actions
 runner (whose images carry pwsh) a missing pwsh FAILS instead.
@@ -109,6 +113,9 @@ function Unwrap($e) {
             $e = $e.PipelineElements[0]; continue
         }
         if ($e -is [System.Management.Automation.Language.CommandExpressionAst]) { $e = $e.Expression; continue }
+        if ($e -is [System.Management.Automation.Language.SubExpressionAst] -and $e.SubExpression.Statements.Count -eq 1) {
+            $e = $e.SubExpression.Statements[0]; continue
+        }
         return $e
     }
 }
@@ -129,9 +136,14 @@ foreach ($p in $paths) {
             $nulls += $h.ErrorPosition.StartLineNumber
         }
     }
+    # PowerShell runs only the first catch-all trap per scope (bus eee0f66). A scope is one statement
+    # block (named block or if/foreach/try body), so count untyped traps per parent block and keep the
+    # busiest block; a typed trap is a different dispatch, and a function or script block is not entered.
     $traps = @($ast.FindAll({
-        param($n) $n -is [System.Management.Automation.Language.TrapStatementAst]
-    }, $false) | ForEach-Object { $_.Extent.StartLineNumber })
+        param($n)
+        $n -is [System.Management.Automation.Language.TrapStatementAst] -and $null -eq $n.TrapType
+    }, $false) | Group-Object { $_.Parent.Extent.StartOffset } | Sort-Object Count -Descending |
+        Select-Object -First 1 | ForEach-Object { $_.Group | ForEach-Object { $_.Extent.StartLineNumber } })
     $results.Add([ordered]@{ path = [string]$p; errors = @($errs); nullRight = @($nulls); topTraps = @($traps) })
 }
 [IO.File]::WriteAllText($OutPath, (ConvertTo-Json -InputObject $results.ToArray() -Depth 6 -Compress), $enc)
@@ -237,7 +249,7 @@ def check_ps_one_trap(root: Path, rel_paths: list[str]) -> list[Violation]:
         traps = scan[rel]["topTraps"]
         if len(traps) > 1:
             out.append(Violation("PS-ONE-TRAP", rel, traps[1],
-                                 f"{len(traps)} top-level traps; PowerShell runs only the first"))
+                                 f"{len(traps)} catch-all traps in one block; PowerShell runs only the first"))
     return out
 
 
@@ -433,6 +445,7 @@ FIXTURES: dict[str, dict[str, dict[str, str]]] = {
             "a.ps1": "$x = @(1, $null)\nif ($x -eq $null) { 'n' }\n",
             "b.ps1": "$v = @(1) | Where-Object { $_ -ne $null }\n",
             "c.psm1": "function F($y) {\n    if ($y -cne ($null)) { 1 }\n    if ($y -ieq $script:null) { 2 }\n}\n",
+            "d.ps1": "if ($x -eq $(${null})) { 1 }\nif ($x -ne $($null)) { 2 }\nif ($x -ieq $(($null))) { 3 }\n",
         },
         "green": {
             "a.ps1": "$x = @(1, $null)\nif ($null -eq $x) { 'n' }\n$v = @(1) | Where-Object { $null -ne $_ }\n",
@@ -440,6 +453,7 @@ FIXTURES: dict[str, dict[str, dict[str, str]]] = {
                      "$h = @'\n$y -eq $null\n'@\n",
             "c.ps1": "$ok = $true\nif ($ok -eq $false) { 'tri-state form is out of scope' }\n"
                      "$nullish = 0\nif ($ok -ne $nullish) { 1 }\n",
+            "d.ps1": "$x = @(1)\nif ($x -eq $($y)) { 1 }\nif ($null -eq $(${x})) { 2 }\n",
         },
     },
     "DG-HOOK-EVENT": {
@@ -499,11 +513,21 @@ FIXTURES: dict[str, dict[str, dict[str, str]]] = {
     "PS-ONE-TRAP": {
         "red": {
             "a.ps1": "trap { Write-Error 'first'; break }\n'body'\ntrap { 'second, never runs'; break }\n",
+            "b.ps1": "trap { 'first catch-all' }\ntrap [System.IO.IOException] { 'typed, legal' }\ntrap { 'second catch-all, dead' }\n",
+            "c.ps1": "param($p)\nbegin {\n    trap { 'first' }\n    trap { 'second, dead' }\n}\n",
+            "d.ps1": "if ($true) {\n    trap { 'first' }\n    trap { 'second, dead' }\n    1\n}\n",
         },
         "green": {
             "a.ps1": "trap { Write-Error 'only'; break }\nfunction F {\n    trap { 'own scope'; continue }\n    1\n}\n"
                      "$sb = { trap { continue }; 2 }\n",
             "b.ps1": "'no trap at all'\n",
+            # One catch-all plus typed traps: legal, and not the bus trap eee0f66 (two catch-alls).
+            "c.ps1": "trap { 'catch-all'; continue }\ntrap [System.IO.IOException] { 'typed'; continue }\n",
+            "d.ps1": "trap [System.IO.IOException] { 'io'; continue }\ntrap [System.ArgumentException] { 'arg'; continue }\n",
+            # A trap in an if/foreach/try body is that statement block's own scope, not the script's.
+            "e.ps1": "trap { 'script scope'; continue }\nif ($true) {\n    trap { 'if-block scope'; continue }\n    1\n}\n"
+                     "foreach ($i in 1) { trap { 'foreach scope'; continue }; $i }\n",
+            "f.ps1": "param($p)\nbegin { trap { 'begin scope' }; 1 }\nprocess { trap { 'process scope' }; 2 }\n",
         },
     },
 }
@@ -581,7 +605,8 @@ class GuardFixtureTests(_PwshMixin, unittest.TestCase):
         self.assertEqual(found, [], "\n".join(v.render() for v in found))
 
     def test_ps_null_compare_red_fails(self) -> None:
-        self._assert_red("DG-PS-NULL-COMPARE", {("a.ps1", 2), ("b.ps1", 1), ("c.psm1", 2), ("c.psm1", 3)})
+        self._assert_red("DG-PS-NULL-COMPARE", {("a.ps1", 2), ("b.ps1", 1), ("c.psm1", 2), ("c.psm1", 3),
+                                                ("d.ps1", 1), ("d.ps1", 2), ("d.ps1", 3)})
 
     def test_ps_null_compare_green_passes(self) -> None:
         self._assert_green("DG-PS-NULL-COMPARE")
@@ -615,7 +640,8 @@ class GuardFixtureTests(_PwshMixin, unittest.TestCase):
             self.assertEqual(len(check_git_pathlist(root, rels)), 1)
 
     def test_ps_one_trap_red_fails(self) -> None:
-        self._assert_red("PS-ONE-TRAP", {("a.ps1", 3)})
+        self._assert_red("PS-ONE-TRAP", {("a.ps1", 3), ("b.ps1", 3), ("c.ps1", 4),
+                                          ("d.ps1", 3)})
 
     def test_ps_one_trap_green_passes(self) -> None:
         self._assert_green("PS-ONE-TRAP")

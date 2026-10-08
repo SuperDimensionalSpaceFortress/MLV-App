@@ -424,7 +424,7 @@ Microsoft.PowerShell.Core\Import-Module -Name "$moduleRoot\Microsoft.PowerShell.
 $PSModuleAutoLoadingPreference = 'None'
 [Console]::Error.WriteLine('stage identity')
 $clientItem = Microsoft.PowerShell.Management\Get-Item -LiteralPath $ClientPath -Force
-$identity =[System.Security.Principal.WindowsIdentity]::GetCurrent()
+$identity = [System.Security.Principal.WindowsIdentity]::GetCurrent()
 $principal = [System.Security.Principal.WindowsPrincipal]::new($identity)
 $currentSid = $identity.User.Value
 $broadSids = @('S-1-1-0', 'S-1-5-4', 'S-1-5-11', 'S-1-5-32-545')

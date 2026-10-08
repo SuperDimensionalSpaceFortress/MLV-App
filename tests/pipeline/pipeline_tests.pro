@@ -117,12 +117,14 @@ SOURCES += \
     $$REPO_ROOT/tests/pipeline/test_phase3_parity.cpp \
     $$REPO_ROOT/tests/pipeline/test_cdng_sequence_export.cpp \
     $$REPO_ROOT/tests/pipeline/test_look_assist_fixture_scene.cpp \
+    $$REPO_ROOT/tests/pipeline/test_look_assist_wb_gate_probe.cpp \
     $$REPO_ROOT/tests/pipeline/test_look_assist_fixture_neutral_probe.cpp \
     $$REPO_ROOT/tests/pipeline/test_look_assist_flavors.cpp \
     $$REPO_ROOT/tests/pipeline/test_sh_frame_state_proxy.cpp \
     $$REPO_ROOT/tests/pipeline/test_look_assist_analysis_render_race.cpp \
     $$REPO_ROOT/tests/pipeline/test_raw_uint16_prefetch_ring.cpp \
     $$REPO_ROOT/tests/pipeline/test_cpu_dualiso_preview_scale.cpp \
+    $$REPO_ROOT/tests/pipeline/test_gpu_dualiso_preview_scale.cpp \
     $$REPO_ROOT/tests/pipeline/test_debayered16_recon_reuse.cpp \
     $$REPO_ROOT/tests/pipeline/test_playback_prep_worker.cpp
 
