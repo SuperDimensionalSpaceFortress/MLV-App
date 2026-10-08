@@ -3138,7 +3138,17 @@ def kill_process_tree(pid: int) -> Dict[str, Any]:
             capture_output=True,
         )
         text = "%s\n%s" % (completed.stdout or "", completed.stderr or "")
-        killed = sorted({int(value) for value in re.findall(r"PID\s+(\d+)", text) if int(value) != pid})
+        # Only the pid right after "The process with PID" on a SUCCESS line was terminated; the "(child process of
+        # PID n)" pid is that process's parent and may be alive (the root's parent is the caller's own ancestor).
+        killed = sorted(
+            {
+                int(value)
+                for value in re.findall(
+                    r"^\s*SUCCESS:\s+The process(?:\s+\"[^\"]*\")?\s+with\s+PID\s+(\d+)", text, re.MULTILINE
+                )
+                if int(value) != pid
+            }
+        )
         return {
             "processTreeKillAttempted": True,
             "method": "taskkill",
