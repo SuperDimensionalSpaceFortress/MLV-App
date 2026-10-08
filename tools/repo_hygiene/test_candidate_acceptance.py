@@ -117,7 +117,10 @@ class CurlTrustSustainedStall(WindowsAclProbeUnknown):
 
 
 def _is_curl_trust_stall(error: Exception) -> bool:
-    return any(marker in str(error) for marker in CURL_TRUST_PROBE_STALL_MARKERS)
+    # Anchored on the probe's own message head ("<marker>: <stderr tail>"): the stderr tail is
+    # embedded in the text, so a substring test would let a non-stall exit that merely echoes a
+    # stall marker be retried or reported as a sustained stall.
+    return any(str(error).startswith(marker + ":") for marker in CURL_TRUST_PROBE_STALL_MARKERS)
 
 
 def _last_probe_stage(error_text: str) -> str:
@@ -125,7 +128,7 @@ def _last_probe_stage(error_text: str) -> str:
 
     stages = _CURL_TRUST_STAGE_PATTERN.findall(error_text)
     if not stages:
-        return "no stage marker reached"
+        return "no stage marker in the captured stderr tail"
     name, detail = stages[-1]
     return f"stage {name}" + (f" {detail.strip()}" if detail.strip() else "")
 
@@ -1887,6 +1890,29 @@ class CurlTrustProbeStallRetryTests(unittest.TestCase):
                 self.assertNotIsInstance(error, WindowsAclProbeUnknown)
                 self.assertEqual([30000], timeouts)
 
+    def test_a_stderr_that_echoes_the_stall_marker_does_not_make_a_nonstall_exit_a_stall(self) -> None:
+        for marker in CURL_TRUST_PROBE_STALL_MARKERS:
+            echo = dict(self._clean(), returncode=1, stderr=marker)
+            with self.subTest(case="first attempt", marker=marker):
+                error, timeouts = self._drive([echo])
+                self.assertIsInstance(error, HygieneError)
+                self.assertNotIsInstance(error, WindowsAclProbeUnknown)
+                self.assertEqual([30000], timeouts, "an echoed marker on a definite failure is not retried")
+            with self.subTest(case="retry", marker=marker):
+                error, timeouts = self._drive([self.STALL, echo])
+                self.assertIsInstance(error, HygieneError)
+                self.assertNotIsInstance(error, WindowsAclProbeUnknown)
+                self.assertNotIn("CURL-TRUST-UNKNOWN", str(error))
+                self.assertIn("failed with exit 1", str(error))
+                self.assertEqual(2, len(timeouts))
+
+    def test_only_the_probes_own_stall_message_classifies_as_a_stall(self) -> None:
+        for code, marker in ((124, CURL_TRUST_PROBE_STALL_MARKER), (126, CURL_TRUST_PROBE_CPU_STALL_MARKER)):
+            with self.subTest(exit=code):
+                self.assertTrue(_is_curl_trust_stall(HygieneError(f"{marker}: partial stderr")))
+                self.assertFalse(_is_curl_trust_stall(HygieneError(f"system curl trust verification failed with exit 1: {marker}")))
+                self.assertFalse(_is_curl_trust_stall(HygieneError(f"retry failed: {marker}")))
+
     def test_a_sustained_stall_is_reported_distinctly_from_a_trust_failure(self) -> None:
         stalled = dict(self.STALL, stderr="stage import-security\nstage get-acl C:\\Windows\n")
         error, _ = self._drive([stalled, stalled])
@@ -1909,7 +1935,7 @@ class CurlTrustProbeStallRetryTests(unittest.TestCase):
 
     def test_a_stall_with_no_stage_marker_says_so(self) -> None:
         error, _ = self._drive([self.STALL, self.STALL])
-        self.assertIn("no stage marker reached", str(error))
+        self.assertIn("no stage marker in the captured stderr tail", str(error))
 
     def test_a_nonstall_failure_on_the_retry_is_not_reported_as_stalled_twice(self) -> None:
         tampered = dict(self._clean(), returncode=1, stderr="forged")
