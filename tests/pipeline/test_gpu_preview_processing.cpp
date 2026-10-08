@@ -3561,8 +3561,28 @@ TEST(GpuPreviewProcessing, EngineAnchoredLookAssistFlavorsMatchEngineWithReceipt
     ASSERT_EQ(cinematic.shadows, film.shadows);
     ASSERT_EQ(cinematic.highlights, film.highlights);
     ASSERT_EQ(cinematic.vibrance, film.vibrance);
-    run_look_assist_flavor_real_frame_case("look_assist_film_night_real_frame", film,
-                                           lookassist::lookAssistFilmGradationCurve(LookAssistScene::Night));
+    /* LOOK-ASSIST-FILM-FLAVOR-2: film-v2 is the first Film case with a non-identity Y line (black lift, shoulder) and a
+     * non-identity G table, both through the shader's one composed creative-curve texture. Night and the full-strength
+     * Shade curves, on the same preset. */
+    for (const LookAssistScene scene : { LookAssistScene::Night, LookAssistScene::Shade })
+    {
+        const QString curve = lookassist::lookAssistFilmGradationCurve(scene);
+        processingObject_t * probe = initProcessingObject();
+        ASSERT_TRUE(probe != nullptr);
+        lookAssistTestApplyGradationCurve(probe, curve);
+        int yMoved = 0, gMoved = 0;
+        for (int index = 0; index < 65536; ++index)
+        {
+            if (std::abs(static_cast<int>(probe->gcurve_y[index]) - index) > 200) ++yMoved;
+            if (std::abs(static_cast<int>(probe->gcurve_g[index]) - index) > 100) ++gMoved;
+        }
+        freeProcessingObject(probe);
+        ASSERT_TRUE(yMoved > 1000);
+        ASSERT_TRUE(gMoved > 1000);
+        run_look_assist_flavor_real_frame_case(scene == LookAssistScene::Night ? "look_assist_film_v2_night_real_frame"
+                                                                             : "look_assist_film_v2_shade_real_frame",
+                                               film, curve);
+    }
 }
 
 struct CreativeChainCase

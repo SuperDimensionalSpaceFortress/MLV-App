@@ -638,25 +638,36 @@ TEST(LookAssistFlavors, TheDocumentedFilmTableIsTheCodeTable)
     int rows = 0;
     for( const auto &s : kSceneNames )
     {
+        // | Scene | s | R@0.10 | G@0.10 | B@0.10 | R@0.52 | G@0.52 | B@0.52 | Y@0 | Y@0.80 | Y@1 |
         const QString number = QStringLiteral("\\s*([0-9.]+)\\s*\\|");
-        const QRegularExpression row( QStringLiteral("^\\|\\s*%1\\s*\\|").arg( QLatin1String( s.name ) )
-                                      + number + number + number + number + number + QStringLiteral("\\s*$"),
-                                      QRegularExpression::MultilineOption );
+        QString pattern = QStringLiteral("^\\|\\s*%1\\s*\\|").arg( QLatin1String( s.name ) );
+        for( int column = 0; column < 10; ++column ) pattern += number;
+        const QRegularExpression row( pattern + QStringLiteral("\\s*$"), QRegularExpression::MultilineOption );
         const QRegularExpressionMatch m = row.match( block );
         ASSERT_TRUE( m.hasMatch() );
         const LookAssistFilmGrade g = lookAssistFilmGradeForScene( s.scene );
-        ASSERT_TRUE( std::fabs( g.strength - m.captured( 1 ).toDouble() ) < 1e-9 );
-        ASSERT_TRUE( std::fabs( ( 0.18 - g.shadowOffset ) - m.captured( 2 ).toDouble() ) < 1e-9 );
-        ASSERT_TRUE( std::fabs( ( 0.18 + g.shadowOffset ) - m.captured( 3 ).toDouble() ) < 1e-9 );
-        ASSERT_TRUE( std::fabs( ( 0.72 + g.highlightOffset ) - m.captured( 4 ).toDouble() ) < 1e-9 );
-        ASSERT_TRUE( std::fabs( ( 0.72 - g.highlightOffset ) - m.captured( 5 ).toDouble() ) < 1e-9 );
-        // a = 0.022 s, b = 0.030 s: the recipe, not just the table.
-        ASSERT_TRUE( std::fabs( g.shadowOffset - 0.022 * g.strength ) < 1e-12 );
-        ASSERT_TRUE( std::fabs( g.highlightOffset - 0.030 * g.strength ) < 1e-12 );
+        const double expected[10] = { g.strength,
+                                      0.10 - g.tealOffset, 0.10 + g.greenShare * g.tealOffset, 0.10 + g.tealOffset,
+                                      0.52 + g.warmOffset, 0.52 + g.greenShare * g.warmOffset, 0.52 - g.warmOffset,
+                                      g.blackLift, 0.80 - g.shoulderOffset, 1.0 - g.whiteRoll };
+        for( int column = 0; column < 10; ++column )
+            ASSERT_TRUE( std::fabs( expected[column] - m.captured( column + 1 ).toDouble() ) < 1e-9 );
+        // t = 0.035 s, w = 0.045 s, k = 0.15, L = 0.020 s, h = 0.010 s, c = 0.030 s: the recipe, not just the table.
+        ASSERT_TRUE( std::fabs( g.tealOffset - 0.035 * g.strength ) < 1e-12 );
+        ASSERT_TRUE( std::fabs( g.warmOffset - 0.045 * g.strength ) < 1e-12 );
+        ASSERT_TRUE( std::fabs( g.greenShare - 0.15 ) < 1e-12 );
+        ASSERT_TRUE( std::fabs( g.blackLift - 0.020 * g.strength ) < 1e-12 );
+        ASSERT_TRUE( std::fabs( g.shoulderOffset - 0.010 * g.strength ) < 1e-12 );
+        ASSERT_TRUE( std::fabs( g.whiteRoll - 0.030 * g.strength ) < 1e-12 );
+        // The legacy v1 recipe is unchanged: a = 0.022 s, b = 0.030 s on the same strength table.
+        const LookAssistFilmGradeV1 v1 = lookAssistFilmGradeV1ForScene( s.scene );
+        ASSERT_TRUE( std::fabs( v1.strength - g.strength ) < 1e-12 );
+        ASSERT_TRUE( std::fabs( v1.shadowOffset - 0.022 * v1.strength ) < 1e-12 );
+        ASSERT_TRUE( std::fabs( v1.highlightOffset - 0.030 * v1.strength ) < 1e-12 );
         ++rows;
     }
     ASSERT_EQ( 4, rows );
-    ASSERT_TRUE( lookAssistFilmGradeId() == QLatin1String( "film-v1" ) );
+    ASSERT_TRUE( lookAssistFilmGradeId() == QLatin1String( "film-v2" ) );
 }
 
 TEST(LookAssistFlavors, FilmsToneIsCinematicsToneOnTheWholeGrid)
@@ -733,20 +744,42 @@ TEST(LookAssistFlavors, TheFilmCurveStringRoundTripsThroughTheWidgetFormat)
         ASSERT_TRUE( widgetConfiguration( widgetConfiguration( curve ) ) == curve );
         std::vector<LookAssistGradationPoint> lines[4];
         ASSERT_EQ( 4, lookAssistParseGradationCurve( curve, lines ) );
-        ASSERT_EQ( 2, static_cast<int>( lines[0].size() ) );   // Y identity
-        ASSERT_EQ( 5, static_cast<int>( lines[1].size() ) );   // R split
-        ASSERT_EQ( 2, static_cast<int>( lines[2].size() ) );   // G identity
-        ASSERT_EQ( 5, static_cast<int>( lines[3].size() ) );   // B split
+        ASSERT_EQ( 4, static_cast<int>( lines[0].size() ) );   // Y: lift, mid-point, shoulder, white roll
+        ASSERT_EQ( 7, static_cast<int>( lines[1].size() ) );   // R split
+        ASSERT_EQ( 7, static_cast<int>( lines[2].size() ) );   // G share
+        ASSERT_EQ( 7, static_cast<int>( lines[3].size() ) );   // B split
         const LookAssistFilmGrade g = lookAssistFilmGradeForScene( s.scene );
-        ASSERT_TRUE( std::fabs( lines[1][1].y - ( 0.18 - g.shadowOffset ) ) < 1e-6 );
-        ASSERT_TRUE( std::fabs( lines[3][1].y - ( 0.18 + g.shadowOffset ) ) < 1e-6 );
-        ASSERT_TRUE( std::fabs( lines[1][2].y - 0.45 ) < 1e-6 && std::fabs( lines[3][2].y - 0.45 ) < 1e-6 );
-        ASSERT_TRUE( std::fabs( lines[1][3].y - ( 0.72 + g.highlightOffset ) ) < 1e-6 );
-        ASSERT_TRUE( std::fabs( lines[3][3].y - ( 0.72 - g.highlightOffset ) ) < 1e-6 );
+        ASSERT_TRUE( std::fabs( lines[0][0].y - g.blackLift ) < 1e-6 );
+        ASSERT_TRUE( std::fabs( lines[0][1].y - 0.50 ) < 1e-6 );
+        ASSERT_TRUE( std::fabs( lines[0][2].y - ( 0.80 - g.shoulderOffset ) ) < 1e-6 );
+        ASSERT_TRUE( std::fabs( lines[0][3].y - ( 1.0 - g.whiteRoll ) ) < 1e-6 );
+        ASSERT_TRUE( std::fabs( lines[1][1].y - ( 0.10 - g.tealOffset ) ) < 1e-6 );
+        ASSERT_TRUE( std::fabs( lines[2][1].y - ( 0.10 + g.greenShare * g.tealOffset ) ) < 1e-6 );
+        ASSERT_TRUE( std::fabs( lines[3][1].y - ( 0.10 + g.tealOffset ) ) < 1e-6 );
+        for( int channel = 1; channel <= 3; ++channel )   // the teal zero and the neutral zone's end
+        {
+            ASSERT_TRUE( std::fabs( lines[channel][2].x - 0.20 ) < 1e-6 && std::fabs( lines[channel][2].y - 0.20 ) < 1e-6 );
+            ASSERT_TRUE( std::fabs( lines[channel][3].x - 0.26 ) < 1e-6 && std::fabs( lines[channel][3].y - 0.26 ) < 1e-6 );
+        }
+        ASSERT_TRUE( std::fabs( lines[1][4].y - ( 0.52 + g.warmOffset ) ) < 1e-6 );
+        ASSERT_TRUE( std::fabs( lines[2][4].y - ( 0.52 + g.greenShare * g.warmOffset ) ) < 1e-6 );
+        ASSERT_TRUE( std::fabs( lines[3][4].y - ( 0.52 - g.warmOffset ) ) < 1e-6 );
+        ASSERT_TRUE( std::fabs( lines[1][5].y - ( 0.85 + 0.3 * g.warmOffset ) ) < 1e-6 );
+        ASSERT_TRUE( std::fabs( lines[2][5].y - ( 0.85 + 0.3 * g.greenShare * g.warmOffset ) ) < 1e-6 );
+        ASSERT_TRUE( std::fabs( lines[3][5].y - ( 0.85 - 0.3 * g.warmOffset ) ) < 1e-6 );
         ASSERT_FALSE( lookAssistIsDefaultGradationCurve( curve ) );
+        // The legacy v1 curve round-trips too (it is still recognised on old receipts).
+        const QString v1 = lookAssistFilmGradationCurveV1( s.scene );
+        ASSERT_TRUE( widgetConfiguration( v1 ) == v1 );
+        ASSERT_FALSE( lookAssistIsDefaultGradationCurve( v1 ) );
     }
-    // The shape the widget writes, exactly (Shade).
+    // The shape the widget writes, exactly (Shade): film-v2, and the legacy v1 byte for byte as #319 laid it.
     ASSERT_TRUE( lookAssistFilmGradationCurve( LookAssistScene::Shade ) == QLatin1String(
+        "1e-05;0.02;0.5;0.5;0.8;0.79;1;0.97;"
+        "?1e-05;1e-05;0.1;0.065;0.2;0.2;0.26;0.26;0.52;0.565;0.85;0.8635;1;1;"
+        "?1e-05;1e-05;0.1;0.10525;0.2;0.2;0.26;0.26;0.52;0.52675;0.85;0.852025;1;1;"
+        "?1e-05;1e-05;0.1;0.135;0.2;0.2;0.26;0.26;0.52;0.475;0.85;0.8365;1;1;" ) );
+    ASSERT_TRUE( lookAssistFilmGradationCurveV1( LookAssistScene::Shade ) == QLatin1String(
         "1e-05;1e-05;1;1;?1e-05;1e-05;0.18;0.158;0.45;0.45;0.72;0.75;1;1;?1e-05;1e-05;1;1;?1e-05;1e-05;0.18;0.202;0.45;0.45;0.72;0.69;1;1;" ) );
     // Default: the receipt default, the widget's rewrite of it, and empty; not three lines, not a moved point.
     ASSERT_TRUE( lookAssistIsDefaultGradationCurve( ReceiptSettings().gradationCurve() ) );
@@ -776,11 +809,14 @@ TEST(LookAssistFlavors, TheFilmCurveStringRoundTripsThroughTheWidgetFormat)
 TEST(LookAssistFlavors, TheFilmGradeIsLaidOnlyOverADefaultCurve)
 {
     const QString user = QStringLiteral("1e-05;1e-05;0.5;0.56;1;1;?1e-05;1e-05;1;1;?1e-05;1e-05;1;1;?1e-05;1e-05;1;1;");
-    ASSERT_TRUE( lookAssistFilmGradeDecision( LookAssistFlavor::Film, ReceiptSettings().gradationCurve() ) == QLatin1String( "film-v1" ) );
-    ASSERT_TRUE( lookAssistFilmGradeDecision( LookAssistFlavor::Film, QString() ) == QLatin1String( "film-v1" ) );
+    ASSERT_TRUE( lookAssistFilmGradeDecision( LookAssistFlavor::Film, ReceiptSettings().gradationCurve() ) == QLatin1String( "film-v2" ) );
+    ASSERT_TRUE( lookAssistFilmGradeDecision( LookAssistFlavor::Film, QString() ) == QLatin1String( "film-v2" ) );
     ASSERT_TRUE( lookAssistFilmGradeDecision( LookAssistFlavor::Film, user ) == QLatin1String( "skipped_user_curve" ) );
-    // A Film curve already on the receipt is not "default": a stale one is never re-laid over itself as the user's.
+    // A Film curve already on the receipt is not "default": a stale one is never re-laid over itself as the user's. (The
+    // consumers put a curve Film owns back to its baseline before they ask, so this is only reached for a bare curve.)
     ASSERT_TRUE( lookAssistFilmGradeDecision( LookAssistFlavor::Film, lookAssistFilmGradationCurve( LookAssistScene::Night ) )
+                 == QLatin1String( "skipped_user_curve" ) );
+    ASSERT_TRUE( lookAssistFilmGradeDecision( LookAssistFlavor::Film, lookAssistFilmGradationCurveV1( LookAssistScene::Night ) )
                  == QLatin1String( "skipped_user_curve" ) );
     ASSERT_TRUE( lookAssistFilmGradeDecision( LookAssistFlavor::Cinematic, ReceiptSettings().gradationCurve() ) == QLatin1String( "none" ) );
     ASSERT_TRUE( lookAssistFilmGradeDecision( LookAssistFlavor::Classic, user ) == QLatin1String( "none" ) );
@@ -825,6 +861,9 @@ TEST(LookAssistFlavors, AUserEditOfTheFilmCurveIsKeptAndRetiresFilmsOwnership)
     for( int s = 0; s < 4; ++s )
         ASSERT_TRUE( lookAssistFilmOwnsGradationCurve( lookAssistFilmGradationCurve( static_cast<LookAssistScene>( s ) ) ) );
     ASSERT_FALSE( lookAssistFilmOwnsGradationCurve( edited ) );
+    QStringList v1Lines = lookAssistFilmGradationCurveV1( LookAssistScene::Shade ).split( QLatin1Char('?') );
+    v1Lines[0] = QStringLiteral("1e-05;1e-05;0.5;0.56;1;1;");
+    ASSERT_FALSE( lookAssistFilmOwnsGradationCurve( v1Lines.join( QLatin1Char('?') ) ) );   // an edit of a v1 curve too
     ASSERT_FALSE( lookAssistFilmOwnsGradationCurve( base ) );
     ASSERT_FALSE( lookAssistFilmOwnsGradationCurve( QString() ) );
     ASSERT_TRUE( lookAssistGradationCurveAfterFilmRestore( lookAssistFilmGradationCurve( LookAssistScene::Night ), base ) == base );
@@ -849,6 +888,32 @@ TEST(LookAssistFlavors, AUserEditOfTheFilmCurveIsKeptAndRetiresFilmsOwnership)
     const int headlessAt = applier.indexOf( QStringLiteral("static void restoreHeadlessLookAssistGradationCurve( ReceiptSettings *receipt )") );
     ASSERT_TRUE( headlessAt >= 0 );
     ASSERT_TRUE( applier.mid( headlessAt, 600 ).contains( QStringLiteral("lookAssistGradationCurveAfterFilmRestore( receipt->gradationCurve(),") ) );
+}
+
+TEST(LookAssistFlavors, AV1LaidCurveIsStillRestoredByLookAssistOff)
+{
+    // A receipt saved under #319 holds a film-v1 curve and the default as lookAssistBaselineGradationCurve. film-v2
+    // replaced v1, but Film still owns every v1 curve (8 curves in all), so Look Assist off puts the default back --
+    // headless, and through the GUI's shared helper -- instead of keeping the v1 curve as if the user had drawn it.
+    const QString base = ReceiptSettings().gradationCurve();
+    for( int s = 0; s < 4; ++s )
+    {
+        const LookAssistScene scene = static_cast<LookAssistScene>( s );
+        const QString v1 = lookAssistFilmGradationCurveV1( scene );
+        ASSERT_TRUE( v1 != lookAssistFilmGradationCurve( scene ) );
+        ASSERT_TRUE( lookAssistFilmOwnsGradationCurve( v1 ) );
+        ASSERT_TRUE( lookAssistGradationCurveAfterFilmRestore( v1, base ) == base );   // the GUI's and headless's helper
+    }
+
+    FlavorEnvGuard guard;
+    qputenv( "MLVAPP_LOOK_ASSIST_FLAVOR", "film" );
+    ReceiptSettings receipt;
+    receipt.setLookAssistEnabled( false );
+    receipt.setGradationCurve( lookAssistFilmGradationCurveV1( LookAssistScene::Shade ) );
+    receipt.setLookAssistBaselineGradationCurve( base );
+    ASSERT_FALSE( ReceiptApplier::applyHeadlessLookAssist( &receipt, nullptr, nullptr, 0 ) );
+    ASSERT_TRUE( receipt.gradationCurve() == base );
+    ASSERT_TRUE( receipt.lookAssistBaselineGradationCurve().isEmpty() );
 }
 
 TEST(LookAssistFlavors, NoGradeIsLoggedAfterTheSyncSafetyFallback)
