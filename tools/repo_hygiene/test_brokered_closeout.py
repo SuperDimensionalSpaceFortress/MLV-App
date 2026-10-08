@@ -2406,6 +2406,96 @@ class BrokeredCloseoutTests(unittest.TestCase):
         self.assertNotIn(stale.name, after)
         self.assertIn("worktree ", after)
 
+    def assert_descendants_dead(self, pid_path: Path, killed_descendants: list, diagnostic: object) -> None:
+        # Prefer the pid the child published; if it never published (loaded host), fall back to the pids the
+        # runner's own kill reported. Skip only when neither source names a descendant.
+        if pid_path.is_file():
+            pids = [int(pid_path.read_text(encoding="utf-8"))]
+        else:
+            # kill_process_tree parses every "PID n" in taskkill's output, so the root's parent (this test
+            # process) is listed beside the real descendants; it is alive by definition and is not one.
+            pids = [int(pid) for pid in killed_descendants if int(pid) != os.getpid()]
+        if not pids:
+            self.skipTest(
+                "no descendant pid to check: the child never published %s and result['killedDescendants'] is empty"
+                % pid_path.name
+            )
+        for pid in pids:
+            for _ in range(30):
+                if not process_is_running(pid):
+                    break
+                time.sleep(0.1)
+            self.assertFalse(process_is_running(pid), diagnostic)
+
+    def test_descendant_liveness_fallback_asserts_killed_descendants_dead(self) -> None:
+        pid_path = self.tempdir / "never-published.pid"
+        live = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(60)"])
+        try:
+            with self.assertRaises(AssertionError):
+                self.assert_descendants_dead(pid_path, [live.pid], "live descendant must fail the fallback")
+        finally:
+            live.kill()
+            live.wait(timeout=10)
+        # Once it is dead the same fallback passes.
+        self.assert_descendants_dead(pid_path, [live.pid, os.getpid()], "dead descendant passes; own pid is ignored")
+
+    def test_bounded_runner_ready_file_never_ready_child_is_still_killed_within_bounds(self) -> None:
+        repo = self.init_repo()
+        config = load_closeout_config(repo)
+        ready_path = repo / ".claude-state" / "closeout" / "never-ready.flag"
+        ready_path.parent.mkdir(parents=True, exist_ok=True)
+
+        started = time.monotonic()
+        result = run_bounded_closeout_process(
+            repo,
+            config,
+            [sys.executable, "-c", "import time; time.sleep(60)"],
+            timeout_ms=500,
+            max_output_bytes=8192,
+            recovery_command="rerun finalize",
+            closeout_args=["finalize"],
+            ready_file=ready_path,
+            ready_wait_ms=500,
+        )
+        elapsed = time.monotonic() - started
+
+        self.assertEqual(result["status"], "timeout", result)
+        self.assertTrue(result["timedOut"], result)
+        self.assertTrue(result["killedProcessTree"], result)
+        self.assertFalse(result["readyHandshake"]["readyObserved"], result)
+        self.assertGreaterEqual(elapsed, 0.9, result)
+        # ready-wait (0.5 s) + timeout (0.5 s) plus a generous allowance for the taskkill/wait on a loaded host.
+        self.assertLess(elapsed, 15.0, result)
+        self.assertFalse(process_is_running(result["pid"]), result)
+
+    def test_bounded_runner_ready_file_starts_the_timeout_clock_after_ready(self) -> None:
+        repo = self.init_repo()
+        config = load_closeout_config(repo)
+        ready_path = repo / ".claude-state" / "closeout" / "slow-ready.flag"
+        ready_path.parent.mkdir(parents=True, exist_ok=True)
+        child_code = (
+            "import time\n"
+            "time.sleep(1.5)\n"  # simulated slow host: ready arrives after the whole 500 ms timeout
+            f"open({str(ready_path)!r}, 'w').close()\n"
+            "time.sleep(60)\n"
+        )
+
+        result = run_bounded_closeout_process(
+            repo,
+            config,
+            [sys.executable, "-c", child_code],
+            timeout_ms=500,
+            max_output_bytes=8192,
+            recovery_command="rerun finalize",
+            closeout_args=["finalize"],
+            ready_file=ready_path,
+            ready_wait_ms=15000,
+        )
+
+        self.assertEqual(result["status"], "timeout", result)
+        self.assertTrue(result["readyHandshake"]["readyObserved"], result)
+        self.assertTrue(ready_path.is_file(), result)
+
     def test_bounded_runner_kills_hung_finalize_child_with_descendants(self) -> None:
         repo = self.init_repo()
         config = load_closeout_config(repo)
@@ -2426,12 +2516,13 @@ class BrokeredCloseoutTests(unittest.TestCase):
             repo,
             config,
             [sys.executable, "-c", child_code],
-            # The runner's clock starts at launch and cannot be held from the test, so give the child
-            # headroom to publish its descendant pid first; the kill is then asserted on every realistic host.
-            timeout_ms=5000,
+            timeout_ms=1000,
             max_output_bytes=8192,
             recovery_command="rerun finalize",
             closeout_args=["finalize"],
+            # The pid file is published atomically, so its appearance means the descendant exists; the
+            # runner's clock starts then, and the kill is asserted on every realistic host.
+            ready_file=pid_path,
         )
 
         self.assertEqual(result["status"], "timeout", result)
@@ -2439,16 +2530,7 @@ class BrokeredCloseoutTests(unittest.TestCase):
         self.assertEqual(result["exitCodePolicy"], bounded_runner_exit_codes(config), result)
         self.assertTrue(result["killedProcessTree"], result)
         with self.subTest("descendant liveness"):
-            if not pid_path.is_file():
-                # Only a host stalled past the whole timeout reaches here: the child was killed before it
-                # published the pid. Nothing to check then, and a present file is complete (atomic publish).
-                self.skipTest("child was killed before it published the descendant pid")
-            descendant_pid = int(pid_path.read_text(encoding="utf-8"))
-            for _ in range(30):
-                if not process_is_running(descendant_pid):
-                    break
-                time.sleep(0.1)
-            self.assertFalse(process_is_running(descendant_pid), result)
+            self.assert_descendants_dead(pid_path, result["killedDescendants"], result)
         self.assertIn("bounded_runner_timeout", self.audit_types(repo))
         self.assertIn("bounded_runner_process_tree_killed", self.audit_types(repo))
 
@@ -2680,29 +2762,27 @@ class BrokeredCloseoutTests(unittest.TestCase):
         )
         config = load_closeout_config(repo)
 
-        results = run_validations(
-            repo,
-            config,
-            repo,
-            changed_paths=["tools/repo_hygiene/brokered_closeout.py"],
-            work_block_id="wb-bounded-validation",
-        )
+        real_runner = run_bounded_closeout_process
+
+        def runner_with_ready_file(*args: object, **kwargs: object) -> dict:
+            # run_validations does not expose the handshake, so the test adds it for this one call.
+            return real_runner(*args, ready_file=pid_path, **kwargs)
+
+        with mock.patch("tools.repo_hygiene.brokered_closeout.run_bounded_closeout_process", side_effect=runner_with_ready_file):
+            results = run_validations(
+                repo,
+                config,
+                repo,
+                changed_paths=["tools/repo_hygiene/brokered_closeout.py"],
+                work_block_id="wb-bounded-validation",
+            )
 
         self.assertEqual(len(results), 1, results)
         self.assertEqual(results[0]["returncode"], 124, results)
         self.assertTrue(results[0]["timedOut"], results)
         self.assertTrue(results[0]["killedProcessTree"], results)
         with self.subTest("descendant liveness"):
-            if not pid_path.is_file():
-                # The child can be killed between the temp write and the replace; the pid is published
-                # atomically, so a present file is complete and an absent one means nothing to check.
-                self.skipTest("child was killed before it published the descendant pid")
-            descendant_pid = int(pid_path.read_text(encoding="utf-8"))
-            for _ in range(30):
-                if not process_is_running(descendant_pid):
-                    break
-                time.sleep(0.1)
-            self.assertFalse(process_is_running(descendant_pid), results)
+            self.assert_descendants_dead(pid_path, results[0]["killedDescendants"], results)
         self.assertIn("bounded_runner_timeout", self.audit_types(repo))
         self.assertIn("bounded_runner_process_tree_killed", self.audit_types(repo))
 
