@@ -365,7 +365,8 @@ class VenueQuietDecisionTests(unittest.TestCase):
         self.addCleanup(shutil.rmtree, work, ignore_errors=True)
         gate_log = work / "gate.log"
         proc = subprocess.run([PWSH, "-NoLogo", "-NoProfile", "-NonInteractive", "-File", str(DV / "Wait-VenueQuiet.ps1"), "-WorkDir", str(work / "w"),
-                               "-AgentShare", str(work / "no-such-share"), "-GateLog", str(gate_log)], capture_output=True, text=True, timeout=120)
+                               "-AgentShare", str(work / "no-such-share"), "-AllowShareOverride", "-ReadBackoffSec", "0", "-GateLog", str(gate_log)],
+                              capture_output=True, text=True, timeout=120)
         out = proc.stdout + proc.stderr
         self.assertEqual(proc.returncode, 4, out)
         self.assertIn("GATE_UNREADABLE quiet-probe bachelor", out)
@@ -384,7 +385,7 @@ class VenueQuietDecisionTests(unittest.TestCase):
         (work / "share" / "running").mkdir()
         (work / "share" / "inbox" / "earlier.job.ps1").write_text("# queued", encoding="utf-8")
         proc = subprocess.run([PWSH, "-NoLogo", "-NoProfile", "-NonInteractive", "-File", str(DV / "Wait-VenueQuiet.ps1"), "-WorkDir", str(work / "w"),
-                               "-AgentShare", str(work / "share"), "-MaxGateSec", "0"], capture_output=True, text=True, timeout=120)
+                               "-AgentShare", str(work / "share"), "-AllowShareOverride", "-MaxGateSec", "0"], capture_output=True, text=True, timeout=120)
         self.assertEqual(proc.returncode, 3, proc.stdout + proc.stderr)
         self.assertIn("queued=1 running=0", proc.stdout)
         self.assertIn("GATE_BUSY quiet-probe", proc.stdout)
