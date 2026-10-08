@@ -23,11 +23,25 @@
 # Cheap structural checks (backend, flavor, subject equality) run before the evidence validation, so a mismatched pair is refused without reading evidence.
 # One pair per OutDir, append-only: an OutDir already holding a flavor-pair-*.json record (PAIR_RECORD_EXISTS) or a sheet / metrics / table
 # (PAIR_OUTPUT_EXISTS) is refused with exit code 16 before anything is staged or composed; every other refusal stays a thrown error (exit 1).
+# STAGING lives OUTSIDE OutDir, in a sibling .pair-staging-<guid> directory (still under .claude-state: it holds owner footage), so a refused attempt
+# really does write nothing into OutDir. It is never deleted by this script (no delete primitive is allowed on the owner-leg route beyond the one marker
+# line): each attempt leaves its own fresh-GUID directory beside OutDir, inert, for the run's owner to retire; a FLAVOR_INERT refusal's message names the
+# slider files in it.
+# ATTEMPT MARKER: look-flavor-diff.py creates OutDir\.pair-in-progress.json before its first output and (--keep-marker) leaves it until this script has
+# written the record. An attempt that dies in between leaves a marker, and a retry into that directory exits 17 (PAIR_INCOMPLETE_ATTEMPT) with the
+# diagnosis instead of the silent PAIR_OUTPUT_EXISTS block. -RecoverIncomplete moves the dead attempt's marker and unrecorded outputs into
+# OutDir\incomplete-<utc>\ (nothing is deleted) and pairs again; a directory that holds a pair record is never recovered (16). The record is created
+# exclusively and then written, so a crash can leave a marker beside an empty / truncated record: that is the same incomplete attempt (17, the half record
+# named and its bytes untouched; -RecoverIncomplete does not move a record), never PAIR_RECORD_EXISTS. (The record is not written under a temporary name and
+# renamed into place: the owner-footage route guards allow no move primitive in this script, so the half record is detected instead.)
+# OWNER FOOTAGE ROOT (exit 18, PAIR_OUTDIR_HOLDS_OWNER_FOOTAGE): -OutDir, anything under it, or an ancestor up to the nearest .claude-state directory that holds
+# a clip (or a numbered continuation part) is refused before anything is staged, written or deleted -- the marker delete never runs inside a footage root.
 [CmdletBinding()]
 param(
     [Parameter(Mandatory = $true)][string]$ClassicReceipt,
     [Parameter(Mandatory = $true)][string]$CinematicReceipt,
-    [Parameter(Mandatory = $true)][string]$OutDir
+    [Parameter(Mandatory = $true)][string]$OutDir,
+    [switch]$RecoverIncomplete
 )
 $ErrorActionPreference = 'Stop'
 Import-Module (Join-Path $PSScriptRoot 'DualVenueRunner.psm1') -Force
@@ -38,21 +52,77 @@ if (@($outFull.Split([char[]]@('\', '/')) | Where-Object { $_ -ceq '.claude-stat
     throw 'PAIR_OWNER_SHEET_MUST_STAY_LOCAL -OutDir must be under a .claude-state directory; a sheet of owner footage is never committed, attached or published'
 }
 
+# -OutDir is caller-controlled, and the one delete this script owns (the attempt marker, at the end) must never run inside a directory that holds owner footage.
+# Decided before ANY write, stage or delete: -OutDir (and everything under it) and every ancestor up to and including the nearest .claude-state directory are
+# scanned for an owner-footage NAME -- the clip's composed base extension and its numbered continuation parts, the rule Get-AttrCudaOwnerFootageNeutralName
+# (tools\profiling\bachelor\AttrCudaOwnerFootage.psm1) and DualVenueRunner.psm1 compose. The extension is composed, never spelled as one token (NA-4).
+function Test-OwnerFootageName([string]$Name) {
+    $ext = [IO.Path]::GetExtension($Name)
+    ($ext -ieq ('.' + 'mlv')) -or ($ext -imatch '^\.m\d{2}$')
+}
+$footageScan = $outFull.TrimEnd('\', '/')
+$footageHolder = $null
+while ($footageScan -and -not $footageHolder) {
+    if (Test-Path -LiteralPath $footageScan -PathType Container) {
+        $isOutDir = ($footageScan -ceq $outFull.TrimEnd('\', '/'))
+        $clipHere = @(Get-ChildItem -LiteralPath $footageScan -File -Force -Recurse:$isOutDir -ErrorAction Stop | Where-Object { Test-OwnerFootageName $_.Name } | Select-Object -First 1)
+        if ($clipHere.Count -gt 0) { $footageHolder = $footageScan }
+    }
+    if ([IO.Path]::GetFileName($footageScan) -ceq '.claude-state') { break }
+    $footageScan = [IO.Path]::GetDirectoryName($footageScan)
+}
+if ($footageHolder) {
+    [Console]::Error.WriteLine("PAIR_OUTDIR_HOLDS_OWNER_FOOTAGE ${footageHolder} holds an owner-footage file and is -OutDir or an ancestor of it (up to .claude-state): refused before anything was staged, written or removed; use an -OutDir under a .claude-state directory that holds no clips")
+    exit 18
+}
+
 # Append-only, decided BEFORE anything is read, staged or composed: an OutDir that already holds a pair record, a sheet, metrics or a table belongs to an
 # earlier pair, and writing a different pair beside it would overwrite the evidence that record names. Refused with its own exit code (16); compose into a
 # new directory. look-flavor-diff.py repeats the check and creates every output exclusively, so a concurrent composer cannot slip past this one.
+$markerName = '.pair-in-progress.json'   # look-flavor-diff.py's MARKER_NAME
+function Test-PairRecordComplete([string]$Path) {
+    # A finished record is one JSON object. An empty file, a truncated one or anything unreadable is a half-written record (fail toward "incomplete").
+    try {
+        $parsed = [IO.File]::ReadAllText($Path) | ConvertFrom-Json -ErrorAction Stop
+        return ($null -ne $parsed -and $parsed -is [pscustomobject])
+    } catch { return $false }
+}
 if (Test-Path -LiteralPath $outFull -PathType Container) {
     $recordsHere = @(Get-ChildItem -LiteralPath $outFull -Filter 'flavor-pair-*.json' -File -ErrorAction Stop)
     if ($recordsHere.Count -gt 0) {
+        # A marker beside a record that does not parse as a JSON object is an attempt that died while the record was being written (it is created
+        # exclusively, then filled): the incomplete diagnosis, with the half record's bytes untouched. -RecoverIncomplete does not apply to it -- a record
+        # file is never moved aside -- so the way forward is a new -OutDir. A complete record beside a marker, or any record with no marker, is still 16.
+        if (Test-Path -LiteralPath (Join-Path $outFull $markerName) -PathType Leaf) {
+            $halfRecords = @($recordsHere | Where-Object { -not (Test-PairRecordComplete $_.FullName) })
+            if ($halfRecords.Count -gt 0) {
+                [Console]::Error.WriteLine("PAIR_INCOMPLETE_ATTEMPT ${outFull} holds $markerName and a pair record that is not complete ($(@($halfRecords | ForEach-Object { $_.Name }) -join ', ')): the attempt died while the record was being written. Nothing was changed, the record's bytes are preserved, and -RecoverIncomplete does not apply (a record file is never moved aside). Use a new -OutDir")
+                exit 17
+            }
+        }
         [Console]::Error.WriteLine("PAIR_RECORD_EXISTS $($recordsHere[0].Name) is already in ${outFull}: an earlier pair's record and evidence are never overwritten; use a new -OutDir")
         exit 16
     }
-    foreach ($name in 'sheet-classic-vs-cinematic.png', 'metrics.json', 'table.md') {
-        if (Test-Path -LiteralPath (Join-Path $outFull $name)) {
-            [Console]::Error.WriteLine("PAIR_OUTPUT_EXISTS $name is already in ${outFull}: an earlier pair's evidence is never overwritten; use a new -OutDir")
-            exit 16
+    if (Test-Path -LiteralPath (Join-Path $outFull $markerName) -PathType Leaf) {
+        # An unfinished attempt (no record). Without -RecoverIncomplete: the typed diagnosis. With it: the composer moves the unrecorded files aside.
+        if (-not $RecoverIncomplete) {
+            $left = @(Get-ChildItem -LiteralPath $outFull -File -ErrorAction Stop | Where-Object { $_.Name -ne $markerName } | ForEach-Object { $_.Name })
+            [Console]::Error.WriteLine("PAIR_INCOMPLETE_ATTEMPT ${outFull} holds $markerName from an attempt that did not finish; it left $(if ($left.Count) { $left -join ', ' } else { 'no outputs' }), none of it recorded evidence. Nothing was changed. Use a new -OutDir, or re-run with -RecoverIncomplete to MOVE the marker and those files into incomplete-<utc>\ (nothing is deleted) -- only when no composer is still running there")
+            exit 17
+        }
+    } else {
+        foreach ($name in 'sheet-classic-vs-cinematic.png', 'metrics.json', 'table.md') {
+            if (Test-Path -LiteralPath (Join-Path $outFull $name)) {
+                [Console]::Error.WriteLine("PAIR_OUTPUT_EXISTS $name is already in ${outFull}: an earlier pair's evidence is never overwritten; use a new -OutDir")
+                exit 16
+            }
         }
     }
+}
+# Staging sits beside OutDir, never in it; it holds owner footage, so its parent must be under .claude-state too.
+$stageParent = [IO.Path]::GetDirectoryName($outFull.TrimEnd('\', '/'))
+if (-not $stageParent -or @($stageParent.Split([char[]]@('\', '/')) | Where-Object { $_ -ceq '.claude-state' }).Count -eq 0) {
+    throw 'PAIR_OUTDIR_NEEDS_LOCAL_PARENT -OutDir must be a subdirectory of a .claude-state path (its staging is a sibling directory, and owner footage stays local)'
 }
 $classic = [IO.File]::ReadAllText((Resolve-Path -LiteralPath $ClassicReceipt).Path) | ConvertFrom-Json
 $cinematic = [IO.File]::ReadAllText((Resolve-Path -LiteralPath $CinematicReceipt).Path) | ConvertFrom-Json
@@ -135,10 +205,9 @@ foreach ($label in $sides.Keys) {
 }
 if ($evidenceDirs['classic'] -ceq $evidenceDirs['cinematic']) { throw 'PAIR_SHARED_EVIDENCE the two receipts name one evidence directory; two legs have separate evidence' }
 
-New-Item -ItemType Directory -Force -Path $OutDir | Out-Null
 $utf8 = [Text.UTF8Encoding]::new($false)
-# Stage exactly the bytes that were hashed, one fresh directory per pair; the listings sit beside the staging directories, never inside them.
-$stageRoot = Join-Path (Join-Path $OutDir '.pair-staging') ([guid]::NewGuid().ToString('N'))
+# Stage exactly the bytes that were hashed, one fresh directory per pair, OUTSIDE OutDir; the listings sit beside the staging directories, never inside them.
+$stageRoot = Join-Path $stageParent ('.pair-staging-' + [guid]::NewGuid().ToString('N'))
 $stageDirs = @{}; $stageListings = @{}; $sliderFiles = @{}
 foreach ($label in $sides.Keys) {
     $dir = Join-Path $stageRoot $label
@@ -149,7 +218,7 @@ foreach ($label in $sides.Keys) {
     $stageListings[$label] = Join-Path $stageRoot "$label.listed.json"
     [IO.File]::WriteAllBytes($stageListings[$label], $utf8.GetBytes(([ordered]@{ files = $listing } | ConvertTo-Json -Depth 4)))
     # The sliders as read from the validated evidence: kept in this attempt's own staging directory (a fresh GUID, so no other pair's file is ever
-    # overwritten), inside OutDir, so an INERT refusal still leaves its evidence.
+    # overwritten), beside OutDir; an INERT refusal keeps the directory, so its message names files that exist.
     $sliderFiles[$label] = Join-Path $stageRoot "sliders-$label.json"
     $sliderDoc = [ordered]@{ receiptId = $sides[$label].receiptId; lookFlavorReported = $reported[$label] }
     foreach ($k in $sliders[$label].Keys) { $sliderDoc[$k] = $sliders[$label][$k] }
@@ -163,11 +232,18 @@ $pyArgs = @('-3', $composer,
     '--cinematic-frames', $stageDirs['cinematic'], '--cinematic-listed', $stageListings['cinematic'], '--cinematic-sliders', $sliderFiles['cinematic'],
     '--cinematic-flavor-reported', $reported['cinematic'], '--cinematic-receipt-id', [string]$cinematic.receiptId,
     '--clip-id', [string]$classic.subject.clipId, '--venue', [string]$classic.venue.name,
-    '--build-sha', ([string]$classic.subject.buildManifestSha256).Substring(0, 12), '--out-dir', $OutDir)
+    '--build-sha', ([string]$classic.subject.buildManifestSha256).Substring(0, 12), '--out-dir', $OutDir, '--keep-marker')
+if ($RecoverIncomplete) { $pyArgs += '--recover-incomplete' }
 & py @pyArgs
 $code = $LASTEXITCODE
+# The staging directory is never deleted here: it stays beside OutDir after every outcome (10 names its slider files in the message). Refusals 11-17 are
+# raised by the composer before it writes anything into OutDir; an exit it does not define (a crash) also keeps whatever marker the composer left.
 if ($code -eq 10) { throw "PAIR_FLAVOR_INERT look-flavor-diff.py refused (FLAVOR_INERT): the cinematic flavor was not honoured; sliders in $($sliderFiles['cinematic']) and $($sliderFiles['classic'])" }
-if ($code -eq 16) { [Console]::Error.WriteLine('PAIR_OUTPUT_EXISTS look-flavor-diff.py refused (another composer or an earlier pair owns this -OutDir); nothing of this attempt was written there'); exit 16 }
+if ($code -eq 16 -or $code -eq 17) {
+    $what = $(if ($code -eq 17) { 'PAIR_INCOMPLETE_ATTEMPT look-flavor-diff.py refused (an unfinished attempt owns this -OutDir)' } else { 'PAIR_OUTPUT_EXISTS look-flavor-diff.py refused (another composer or an earlier pair owns this -OutDir)' })
+    [Console]::Error.WriteLine("$what; nothing of this attempt was written there")
+    exit $code
+}
 if ($code -ne 0) { throw "PAIR_COMPOSE_FAILED look-flavor-diff.py exited $code" }
 
 $metricsPath = Join-Path $OutDir 'metrics.json'
@@ -201,6 +277,8 @@ $record = [ordered]@{
 }
 $recordPath = Join-Path $OutDir "flavor-pair-$($classic.legId)-vs-$($cinematic.legId)-$($classic.venue.name).json"
 $stream = [IO.File]::Open($recordPath, [IO.FileMode]::CreateNew, [IO.FileAccess]::Write)   # append-only: never overwrite
-try { $bytes = $utf8.GetBytes(($record | ConvertTo-Json -Depth 6) + "`n"); $stream.Write($bytes, 0, $bytes.Length) } finally { $stream.Dispose() }
+try { $bytes = $utf8.GetBytes(($record | ConvertTo-Json -Depth 6) + "`n"); $stream.Write($bytes, 0, $bytes.Length); $stream.Flush($true) } finally { $stream.Dispose() }
+# The record is written: the attempt is complete. (A crash before this line leaves the marker, and the staging, in place.)
+Remove-Item -LiteralPath (Join-Path $OutDir $markerName) -Force
 Write-Output "DVE_FLAVOR_PAIR=$sheet"
 Write-Output "DVE_FLAVOR_PAIR_RECORD=$recordPath"
