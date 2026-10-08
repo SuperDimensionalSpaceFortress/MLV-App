@@ -22,9 +22,13 @@
 # another venue's share is SHARE_VENUE_MISMATCH and a share that is no venue's own is SHARE_NOT_VENUE_OWN unless -AllowShareOverride says the caller
 # means it (tests); -WorkDir inside any venue's share or agent root is WORKDIR_IN_VENUE_SHARE (um-run.ps1 is the only writer to a venue share). All three
 # exit 2 before anything is created, read or submitted, so a verdict can never be printed for a venue other than the one measured.
+# -GateLog is bound the same way: GATELOG_IN_VENUE_SHARE (inside any venue's storage) or GATELOG_OUT_OF_SCOPE (neither under -WorkDir nor a .claude-state
+# directory) are exit 2 before anything is created. HOST ECHO: the probe job reports $env:COMPUTERNAME; if it is not the venue's expectedHost in venues.json
+# (case-insensitive; a missing host counts) the gate prints `HOST_MISMATCH ...` and exits 5 BEFORE any QUIET / COOLDOWN_UNMET line, so an alias of another
+# host's share (acknowledged with -AllowShareOverride) can never yield a verdict for the named venue.
 # Exit codes: 0 QUIET or COOLDOWN_UNMET (read stdout); 3 GATE_BUSY (the queue never cleared); 4 GATE_UNREADABLE (the agent share could not be
-# read -- typed line `GATE_UNREADABLE ...` then `DECISION UNKNOWN`, never an empty-queue line; no probe is submitted); 2 a usage error (including a
-# -SamplesJson that is not JSON).
+# read -- typed line `GATE_UNREADABLE ...` then `DECISION UNKNOWN`, never an empty-queue line; no probe is submitted); 5 HOST_MISMATCH (the probe was
+# answered by a host that is not the venue's); 2 a usage error (including a -SamplesJson that is not JSON).
 [CmdletBinding(DefaultParameterSetName = 'Live')]
 param(
     [Parameter(ParameterSetName = 'Live')][ValidateSet('bachelor', 'ultra-magnus')][string]$Venue = 'bachelor',
@@ -102,6 +106,18 @@ $workKey = ConvertTo-PathKey $WorkDir
 foreach ($k in $otherKeys.Keys) {
     if (Test-UnderOrEqual $workKey $k) { Stop-Usage "WORKDIR_IN_VENUE_SHARE -WorkDir '$WorkDir' is inside venue '$($otherKeys[$k])' agent storage; um-run.ps1 is the only writer to a venue share" }
 }
+# -GateLog is appended to by this script, so it is bound too: never inside a venue's agent storage (um-run.ps1 is the only writer there), and only under the
+# run's own -WorkDir or a .claude-state directory.
+if ($GateLog) {
+    $logKey = ConvertTo-PathKey $GateLog
+    foreach ($k in $otherKeys.Keys) {
+        if (Test-UnderOrEqual $logKey $k) { Stop-Usage "GATELOG_IN_VENUE_SHARE -GateLog '$GateLog' is inside venue '$($otherKeys[$k])' agent storage; um-run.ps1 is the only writer to a venue share" }
+    }
+    $logInScope = (Test-UnderOrEqual $logKey $workKey) -or (@($logKey.Split([char[]]@('\', '/')) | Where-Object { $_ -ceq '.claude-state' }).Count -gt 0)
+    if (-not $logInScope) { Stop-Usage "GATELOG_OUT_OF_SCOPE -GateLog '$GateLog' is neither under -WorkDir nor under a .claude-state directory" }
+}
+$expectedHost = [string]$table.venues.$Venue.expectedHost
+if (-not $expectedHost) { Stop-Usage "VENUE_HOST_UNKNOWN venues.json names no expectedHost for '$Venue': a probe answer could not be attributed to it" }
 $umRun = Join-Path $here '..\um-run.ps1'
 New-Item -ItemType Directory -Force -Path $WorkDir | Out-Null
 
@@ -200,8 +216,14 @@ while ($true) {
         $line = @(([string]$r.stdout) -split "`r?`n" | Where-Object { $_ -like 'VENUE_QUIET=*' }) | Select-Object -Last 1
         if ($line) { $probe = $line.Substring('VENUE_QUIET='.Length) | ConvertFrom-Json } else { $why = "no VENUE_QUIET line (exit $($r.exitCode))" }
     } catch { $why = [string]$_.Exception.Message }
+    # HOST ECHO: the probe reports the machine it ran on. An acknowledged alias of ANOTHER host's share (or any share that is not this venue's) would measure that
+    # host, so the answer must come from this venue's expectedHost (case-insensitive) before any verdict is printed for it.
+    if ($null -ne $probe -and [string]$probe.host -ne $expectedHost) {
+        Write-Gate "HOST_MISMATCH $jobId $Venue probe host='$([string]$probe.host)' is not expectedHost '$expectedHost': no verdict is printed for '$Venue' $([DateTime]::UtcNow.ToString('HH:mm:ssZ'))"
+        exit 5
+    }
     $samples = $(if ($null -ne $probe) { @($probe.samples) } else { @() })
-    $d = Get-VenueQuietDecision -Samples $samples -Threshold $ThresholdPercent
+    $d =Get-VenueQuietDecision -Samples $samples -Threshold $ThresholdPercent
     $last = [pscustomobject]@{ decision = $d; probe = $probe }
     $sampleText = $(if ($samples.Count) { ($samples | ForEach-Object { if ($null -eq $_) { 'null' } else { '{0:0.0}' -f [double]$_ } }) -join '/' } else { 'none' })
     Write-Gate "PROBE $jobId $Venue samples=$sampleText mean=$(Format-Mean $d.mean) state=$($d.state)$(if ($why) { " note=$why" }) $([DateTime]::UtcNow.ToString('HH:mm:ssZ'))"

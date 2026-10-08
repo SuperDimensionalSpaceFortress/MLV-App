@@ -24,6 +24,7 @@ import unittest
 from pathlib import Path
 
 from . import test_look_flavor_pair as base
+from .synthetic_mlv import MLV_EXTENSION
 
 ROOT = base.ROOT
 DV = base.DV
@@ -130,6 +131,17 @@ class ComposerAttemptMarkerTests(base.FlavorDiffHarness):
         proc = self.compose(out, "--recover-incomplete")
         self.assertEqual(proc.returncode, 16, proc.stdout + proc.stderr)
         self.assertEqual(tree_hashes(out), {"metrics.json": hashlib.sha256(b"earlier evidence").hexdigest()})
+
+    def test_recover_incomplete_refuses_a_directory_that_holds_a_pair_record_and_moves_nothing(self) -> None:
+        # FLAVOR-DIFF-RECOVER-RECORD-GUARD-1: the record names the sheet by hash; moving the sheet aside would leave that hash stale.
+        out = self.half_record()
+        (out / "flavor-pair-leg-a-vs-leg-b-bachelor.json").write_bytes(b'{"record":1}\n')
+        before = tree_hashes(out)
+        proc = self.compose(out, "--recover-incomplete", seed=41)
+        self.assertEqual(proc.returncode, 16, proc.stdout + proc.stderr)
+        self.assertIn("PAIR_RECORD_EXISTS", proc.stderr)
+        self.assertEqual(tree_hashes(out), before, "nothing was moved, written or removed")
+        self.assertEqual([p.name for p in out.iterdir() if p.is_dir()], [], "no incomplete-<utc> directory was made")
 
     def test_a_crash_between_the_sheet_and_the_metrics_leaves_a_marker_and_the_next_retry_is_refused_with_it(self) -> None:
         mod = load_tool()
@@ -312,13 +324,78 @@ class DriverStagingAndMarkerTests(unittest.TestCase):
             self.assertIn("PAIR_RECORD_EXISTS", proc.stdout + proc.stderr)
             self.assertEqual(tree_hashes(self.out), before)
 
+    # r3 blocker 3: a record that died half-written must not mask the marker --------------------------------------------------------------------
+    RECORD_NAME = "flavor-pair-leg-classic-vs-leg-cinematic-bachelor.json"
+
+    def half_written_record(self, content: bytes) -> None:
+        """The state a crash leaves between the exclusive create of the record and the end of its write: outputs, the marker and a bad record."""
+        self.crash_before_the_record()
+        (self.out / self.RECORD_NAME).write_bytes(content)
+
+    def test_a_marker_with_outputs_and_an_empty_or_truncated_record_is_the_incomplete_diagnosis_not_record_exists(self) -> None:
+        for label, content in (("empty", b""), ("truncated", b'{"schema": "mlv-app/dual-venue-flavor-pair/v1", "venue": "bachel')):
+            with self.subTest(record=label):
+                if self.out.exists():
+                    shutil.rmtree(self.out)
+                self.half_written_record(content)
+                before = tree_hashes(self.out)
+                for extra in ((), ("-RecoverIncomplete",)):
+                    proc = self.pair(*extra)
+                    text = proc.stdout + proc.stderr
+                    self.assertEqual(proc.returncode, 17, text)
+                    self.assertIn("PAIR_INCOMPLETE_ATTEMPT", text)
+                    self.assertNotIn("PAIR_RECORD_EXISTS", text)
+                    self.assertIn(self.RECORD_NAME, text, "the diagnosis names the half record")
+                    self.assertEqual(tree_hashes(self.out), before, "the half record's bytes, the sheet and the marker are all preserved")
+
+    def test_a_complete_record_beside_a_marker_keeps_exit_16(self) -> None:
+        self.half_written_record(b'{"schema": "mlv-app/dual-venue-flavor-pair/v1", "venue": "bachelor"}\n')
+        before = tree_hashes(self.out)
+        for extra in ((), ("-RecoverIncomplete",)):
+            proc = self.pair(*extra)
+            self.assertEqual(proc.returncode, 16, proc.stdout + proc.stderr)
+            self.assertIn("PAIR_RECORD_EXISTS", proc.stdout + proc.stderr)
+            self.assertEqual(tree_hashes(self.out), before)
+
+    def test_a_half_record_with_no_marker_is_still_record_exists(self) -> None:
+        self.out.mkdir(parents=True)
+        (self.out / self.RECORD_NAME).write_bytes(b"")
+        proc = self.pair()
+        self.assertEqual(proc.returncode, 16, proc.stdout + proc.stderr)
+        self.assertEqual(tree_hashes(self.out), {self.RECORD_NAME: hashlib.sha256(b"").hexdigest()})
+
+    # r3 blocker 1: the marker-delete exception never runs inside an owner-footage root --------------------------------------------------------
+    def test_an_out_dir_that_holds_or_sits_under_owner_footage_is_refused_before_anything_is_written_or_deleted(self) -> None:
+        clip = b"unrelated owner clip bytes"
+        cases = {
+            "clip in the out dir": (self.out / ("owner-unrelated" + MLV_EXTENSION)),
+            "continuation part in the out dir": (self.out / "owner-unrelated.M00"),
+            "clip in a subdirectory of the out dir": (self.out / "sub" / ("owner-unrelated" + MLV_EXTENSION)),
+            "clip in the parent .claude-state directory": (self.parent / ("owner-unrelated" + MLV_EXTENSION)),
+        }
+        for label, path in cases.items():
+            with self.subTest(case=label):
+                if self.parent.exists():
+                    shutil.rmtree(self.parent)
+                self.out.mkdir(parents=True)
+                path.parent.mkdir(parents=True, exist_ok=True)
+                path.write_bytes(clip)
+                (self.out / MARKER).write_text('{"schema": "x"}', encoding="utf-8")   # (the marker a finished pair would delete)
+                before = tree_hashes(self.parent)
+                proc = self.pair()
+                text = proc.stdout + proc.stderr
+                self.assertEqual(proc.returncode, 18, text)
+                self.assertIn("PAIR_OUTDIR_HOLDS_OWNER_FOOTAGE", text)
+                self.assertEqual(tree_hashes(self.parent), before, "nothing was written, staged or deleted; the clip is byte-identical")
+                self.assertEqual(path.read_bytes(), clip)
+
 
 # c + d + e + f: the cooldown gate ----------------------------------------------------------------------------------------------------------------
 STUB_UM_RUN = r"""param([string]$ScriptPath, [string]$JobId, [string]$AgentShare, [int]$TimeoutSec, [int]$MaxQueueWaitSec, [int]$MaxClaimedWaitSec)
 # test stub for tools\profiling\um-run.ps1: records the share it was aimed at, optionally leaves a foreign queued job behind, returns canned samples
 Add-Content -LiteralPath $env:UMSTUB_LOG -Value "$JobId $AgentShare"
 if ($env:UMSTUB_FOREIGN -eq '1') { New-Item -ItemType Directory -Force -Path (Join-Path $AgentShare 'inbox') | Out-Null; Set-Content -LiteralPath (Join-Path $AgentShare 'inbox\foreign.job.ps1') -Value '# queued by someone else' }
-$probe = [ordered]@{ schema = 'mlv-app/venue-quiet-probe/v1'; host = 'STUB'; samples = @($env:UMSTUB_SAMPLES | ConvertFrom-Json); top = @() }
+$probe = [ordered]@{ schema = 'mlv-app/venue-quiet-probe/v1'; host = $(if ($env:UMSTUB_HOST) { $env:UMSTUB_HOST } else { 'STUB' }); samples = @($env:UMSTUB_SAMPLES | ConvertFrom-Json); top = @() }
 [pscustomobject]@{ exitCode = 0; stdout = 'VENUE_QUIET=' + ($probe | ConvertTo-Json -Compress -Depth 4) }
 """
 
@@ -345,8 +422,8 @@ class VenueQuietGateTests(unittest.TestCase):
         self.log = self.tmp / "um.log"
         self.log.write_text("", encoding="utf-8")
 
-    def env(self, samples="[5, 5, 5]", foreign=False) -> dict:
-        return dict(os.environ, UMSTUB_LOG=str(self.log), UMSTUB_SAMPLES=samples, UMSTUB_FOREIGN="1" if foreign else "0")
+    def env(self, samples="[5, 5, 5]", foreign=False, host="BACHELOR") -> dict:
+        return dict(os.environ, UMSTUB_LOG=str(self.log), UMSTUB_SAMPLES=samples, UMSTUB_FOREIGN="1" if foreign else "0", UMSTUB_HOST=host)
 
     def gate_args(self, *extra, venue="bachelor", work: Path | None = None) -> list:
         return [PWSH, "-NoLogo", "-NoProfile", "-NonInteractive", "-File", str(self.dv / "Wait-VenueQuiet.ps1"), "-Venue", venue,
@@ -391,6 +468,49 @@ class VenueQuietGateTests(unittest.TestCase):
         self.assertIn("WORKDIR_IN_VENUE_SHARE", proc.stdout + proc.stderr)
         self.assertFalse((self.share["ultra-magnus"] / "inbox" / "w").exists())
 
+    # r3 blocker 2 (WAIT-VENUE-QUIET-HOST-ECHO-1): the host that answered must be the venue's own ----------------------------------------------------
+    def test_a_probe_answered_by_another_host_is_a_host_mismatch_never_a_quiet_verdict(self) -> None:
+        # an acknowledged alias that is not either venue's configured storage, but is served by the OTHER venue's host
+        alias = self.tmp / "alias-of-ultra-magnus"
+        (alias / "inbox").mkdir(parents=True)
+        (alias / "running").mkdir()
+        proc = self.run_gate("-AgentShare", str(alias), "-AllowShareOverride", env=self.env("[5, 5, 5]", host="ULTRA-MAGNUS"))
+        text = proc.stdout + proc.stderr
+        self.assertEqual(proc.returncode, 5, text)
+        self.assertIn("HOST_MISMATCH", text)
+        self.assertNotIn("QUIET mean", text)
+        self.assertNotIn("COOLDOWN_UNMET", text)
+
+    def test_the_probe_host_is_compared_case_insensitively_and_a_missing_host_is_a_mismatch(self) -> None:
+        proc = self.run_gate(env=self.env(host="bachelor"))
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        self.assertIn("QUIET mean=5.0%", proc.stdout)
+        proc = self.run_gate(env=self.env(host=""))   # (the stub falls back to host 'STUB')
+        self.assertEqual(proc.returncode, 5, proc.stdout + proc.stderr)
+
+    def test_a_gate_log_inside_any_venue_share_is_refused_before_anything_is_created_or_submitted(self) -> None:
+        for venue in ("bachelor", "ultra-magnus"):
+            with self.subTest(venue=venue):
+                target = self.share[venue] / "inbox" / "gate.log"
+                proc = self.run_gate("-GateLog", str(target))
+                self.assertEqual(proc.returncode, 2, proc.stdout + proc.stderr)
+                self.assertIn("GATELOG_IN_VENUE_SHARE", proc.stdout + proc.stderr)
+                self.assertFalse(target.exists())
+                self.assertEqual(self.log.read_text(encoding="utf-8"), "", "no probe was submitted")
+
+    def test_a_gate_log_outside_the_work_dir_and_any_claude_state_directory_is_refused(self) -> None:
+        stray = self.tmp / "elsewhere" / "gate.log"
+        proc = self.run_gate("-GateLog", str(stray))
+        self.assertEqual(proc.returncode, 2, proc.stdout + proc.stderr)
+        self.assertIn("GATELOG_OUT_OF_SCOPE", proc.stdout + proc.stderr)
+        self.assertFalse(stray.parent.exists())
+        for allowed in (self.work / "gate.log", self.tmp / ".claude-state" / "gate.log"):
+            with self.subTest(allowed=str(allowed.relative_to(self.tmp))):
+                allowed.parent.mkdir(parents=True, exist_ok=True)
+                proc = self.run_gate("-GateLog", str(allowed))
+                self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+                self.assertIn("QUIET mean=5.0%", allowed.read_text(encoding="utf-8"))
+
     # d --------------------------------------------------------------------------------------------------------------------------------------------
     def test_max_wait_sec_bounds_the_whole_wait_even_when_every_reprobe_meets_a_busy_queue(self) -> None:
         # Probe 1 leaves a foreign job in the inbox (the venue is busy again); the old code then gave the SECOND queue gate a fresh MaxGateSec clock.
@@ -413,7 +533,7 @@ class VenueQuietGateTests(unittest.TestCase):
     # e --------------------------------------------------------------------------------------------------------------------------------------------
     def test_one_transient_inbox_read_failure_is_retried_inside_the_deadline_not_exit_4(self) -> None:
         gone = self.tmp / "share-appears-late"
-        gate_log = self.tmp / "gate.log"
+        gate_log = self.work / "gate.log"
         proc = subprocess.Popen(self.gate_args("-AgentShare", str(gone), "-AllowShareOverride", "-GateLog", str(gate_log), "-ReadBackoffSec", "1", "-MaxWaitSec", "120"),
                                 stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, env=self.env())
 

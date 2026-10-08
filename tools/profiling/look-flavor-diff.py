@@ -256,6 +256,11 @@ def refuse_if_incomplete(out, recover):
     if not marker.exists():
         return False
     if recover:
+        # FLAVOR-DIFF-RECOVER-RECORD-GUARD-1: a pair record names the sheet by hash, so a directory that holds one is never recovered (nothing is moved).
+        records = sorted(p.name for p in out.glob("flavor-pair-*.json") if p.is_file())
+        if records:
+            raise Refusal(EXIT_OUTPUT_EXISTS, f"PAIR_RECORD_EXISTS {records[0]} is already in {out}: its sheet is named by hash, so --recover-incomplete "
+                                              "will not move anything here; compose into a new directory")
         return True
     try:
         started = json.loads(marker.read_text(encoding="utf-8")).get("startedUtc", "unknown time")

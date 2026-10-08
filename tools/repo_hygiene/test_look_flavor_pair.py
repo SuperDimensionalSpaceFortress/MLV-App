@@ -363,7 +363,7 @@ class VenueQuietDecisionTests(unittest.TestCase):
     def test_an_unreachable_agent_share_is_a_typed_gate_unreadable_never_an_empty_queue(self) -> None:
         work = Path(tempfile.mkdtemp(prefix="venue-quiet-gate-"))
         self.addCleanup(shutil.rmtree, work, ignore_errors=True)
-        gate_log = work / "gate.log"
+        gate_log = work / "w" / "gate.log"   # (-GateLog is bound to the run's -WorkDir or a .claude-state directory)
         proc = subprocess.run([PWSH, "-NoLogo", "-NoProfile", "-NonInteractive", "-File", str(DV / "Wait-VenueQuiet.ps1"), "-WorkDir", str(work / "w"),
                                "-AgentShare", str(work / "no-such-share"), "-AllowShareOverride", "-ReadBackoffSec", "0", "-GateLog", str(gate_log)],
                               capture_output=True, text=True, timeout=120)
