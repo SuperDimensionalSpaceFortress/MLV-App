@@ -27,6 +27,7 @@
 #include <QMap>
 #include <QOffscreenSurface>
 #include <QOpenGLContext>
+#include <QOpenGLFunctions>
 #include <QPalette>
 #include <QPaintEvent>
 #include <QScopeGuard>
@@ -653,6 +654,7 @@ private slots:
     void gpuViewportPreviewProcessingWithZebrasMatchesCpuReference();
     void gpuPreviewProcessingLutReadinessReflectsSignatureNotJustPointers();
     void gpuPreviewProcessingLutTextureSetFailsClosedOnMissingUploadAndContextLoss();
+    void gpuPreviewProcessingLutSetReportsRebuildsAndBlurUploadsKeepTheirBytes();
     void gpuPreviewProcessingReconRefusalMatchesForBothPresentersOnInjectedUploadFailure();
     void gpuViewportRefusesReconTextureDrawWhenLutReadinessIsFalse();
     void gpuDisplayWindowRecoversRetainedQImageAfterContextLossTeardown();
@@ -2616,6 +2618,140 @@ void GuiSmokeTest::gpuPreviewProcessingLutTextureSetFailsClosedOnMissingUploadAn
 
     gpuPreviewProcessingUpdateLutTextureSet(set, validConfig);
     QVERIFY(gpuPreviewProcessingLutTextureSetReady(set, validConfig));
+
+    gpuPreviewProcessingDestroyLutTextureSet(set);
+    context.doneCurrent();
+}
+
+namespace {
+/* Reads an RGBA16 texture back through a framebuffer attachment (desktop GL accepts
+ * GL_UNSIGNED_SHORT here). Empty on any framebuffer failure. */
+QByteArray read_rgba16_texture(QOpenGLFunctions *gl, GLuint textureId, int width, int height)
+{
+    GLuint fbo = 0;
+    gl->glGenFramebuffers(1, &fbo);
+    gl->glBindFramebuffer(GL_FRAMEBUFFER, fbo);
+    gl->glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, textureId, 0);
+    QByteArray bytes;
+    if (gl->glCheckFramebufferStatus(GL_FRAMEBUFFER) == GL_FRAMEBUFFER_COMPLETE) {
+        bytes.resize(width * height * 4 * static_cast<int>(sizeof(uint16_t)));
+        gl->glPixelStorei(GL_PACK_ALIGNMENT, 1);
+        gl->glReadPixels(0, 0, width, height, GL_RGBA, GL_UNSIGNED_SHORT, bytes.data());
+    }
+    gl->glBindFramebuffer(GL_FRAMEBUFFER, 0);
+    gl->glDeleteFramebuffers(1, &fbo);
+    return bytes;
+}
+
+QByteArray make_rgb16_blur_bytes(int width, int height, uint16_t seed)
+{
+    QByteArray bytes(width * height * 3 * static_cast<int>(sizeof(uint16_t)), Qt::Uninitialized);
+    uint16_t *values = reinterpret_cast<uint16_t *>(bytes.data());
+    for (int index = 0; index < width * height * 3; ++index) {
+        values[index] = static_cast<uint16_t>(seed + index * 257);
+    }
+    return bytes;
+}
+
+QByteArray expected_rgba16(const QByteArray &rgb16, int pixelCount)
+{
+    QByteArray rgba(pixelCount * 4 * static_cast<int>(sizeof(uint16_t)), Qt::Uninitialized);
+    const uint16_t *source = reinterpret_cast<const uint16_t *>(rgb16.constData());
+    uint16_t *dest = reinterpret_cast<uint16_t *>(rgba.data());
+    for (int pixel = 0; pixel < pixelCount; ++pixel) {
+        dest[pixel * 4 + 0] = source[pixel * 3 + 0];
+        dest[pixel * 4 + 1] = source[pixel * 3 + 1];
+        dest[pixel * 4 + 2] = source[pixel * 3 + 2];
+        dest[pixel * 4 + 3] = 65535;
+    }
+    return rgba;
+}
+} // namespace
+
+void GuiSmokeTest::gpuPreviewProcessingLutSetReportsRebuildsAndBlurUploadsKeepTheirBytes()
+{
+    // PLAYBACK-GL-PRESENT-SETUP-STALL-1 (T2): against a live GL context, (1) the LUT set's
+    // setup out-param reports a rebuild only when the key moves, and names the group that
+    // moved; (2) the per-frame shadows/highlights blur texture holds exactly the uploaded
+    // bytes on BOTH the allocation upload (drained + checked) and the steady-state upload
+    // (row R3: no glGetError), so dropping the glGetError pair cannot change a pixel.
+    MLV_SKIP_OR_FAIL_IF_OFFSCREEN("GPU LUT texture set upload needs a platform plugin that can create an OpenGL context");
+
+    QOffscreenSurface surface;
+    surface.setFormat(QSurfaceFormat::defaultFormat());
+    surface.create();
+    if (!surface.isValid()) {
+        MLV_SKIP_OR_FAIL_IF_READBACK_FAILED("QOffscreenSurface creation failed in this environment");
+    }
+    QOpenGLContext context;
+    context.setFormat(surface.requestedFormat());
+    if (!context.create() || !context.makeCurrent(&surface)) {
+        MLV_SKIP_OR_FAIL_IF_READBACK_FAILED("QOpenGLContext creation/makeCurrent failed in this environment");
+    }
+    QOpenGLFunctions *gl = context.functions();
+
+    GpuPreviewProcessingLutTextureSet set;
+    const GpuPreviewProcessingConfig config = make_synthetic_preview_processing_config();
+
+    GpuPresentSetupTiming first;
+    gpuPreviewProcessingUpdateLutTextureSet(set, config, &first);
+    QVERIFY(gpuPreviewProcessingLutTextureSetReady(set, config));
+    QVERIFY(first.lut_rebuilt);
+    QCOMPARE(QString::fromLatin1(first.lut_miss), QStringLiteral("unbuilt"));
+
+    // An equal config: no rebuild, and the out-param says so.
+    const GpuPreviewProcessingConfig same = config;
+    GpuPresentSetupTiming second;
+    gpuPreviewProcessingUpdateLutTextureSet(set, same, &second);
+    QVERIFY(!second.lut_rebuilt);
+    QCOMPARE(QString::fromLatin1(second.lut_miss), QStringLiteral("none"));
+    QVERIFY(gpuPreviewProcessingLutTextureSetReady(set, same));
+
+    // A texture-content change rebuilds once and names its group; the next equal call does not.
+    GpuPreviewProcessingConfig moved = config;
+    moved.levelsLut = make_scaled_lut_bytes(0.90f);
+    moved.signature = config.signature + 1;
+    moved.lutGroupDigests[GpuPreviewLutGroupLevels] = config.lutGroupDigests[GpuPreviewLutGroupLevels] + 1;
+    GpuPresentSetupTiming third;
+    gpuPreviewProcessingUpdateLutTextureSet(set, moved, &third);
+    QVERIFY(third.lut_rebuilt);
+    QCOMPARE(QString::fromLatin1(third.lut_miss), QStringLiteral("levels"));
+    QVERIFY(gpuPreviewProcessingLutTextureSetReady(set, moved));
+    GpuPresentSetupTiming fourth;
+    gpuPreviewProcessingUpdateLutTextureSet(set, moved, &fourth);
+    QVERIFY(!fourth.lut_rebuilt);
+
+    // The blur: an allocation upload, then two steady-state uploads of new content.
+    const int width = 16;
+    const int height = 8;
+    GpuPreviewProcessingConfig blurConfig = moved;
+    blurConfig.applyShadowsHighlights = true;
+    blurConfig.shadowsHighlightsFrameStateReady = true;
+    blurConfig.shadowsHighlightsFrameWidth = width;
+    blurConfig.shadowsHighlightsFrameHeight = height;
+    const uint16_t seeds[3] = { 11, 4099, 30001 };
+    GLuint allocatedId = 0;
+    for (int round = 0; round < 3; ++round) {
+        blurConfig.shadowsHighlightsBlur = make_rgb16_blur_bytes(width, height, seeds[round]);
+        GpuPresentSetupTiming timing;
+        QVERIFY(gpuPreviewProcessingUpdateShadowsHighlightsBlurTexture(set, blurConfig, width, height, &timing));
+        QVERIFY(set.shadowsHighlightsBlurReady);
+        QVERIFY(set.shadowsHighlightsBlur != nullptr);
+        if (round == 0) {
+            allocatedId = set.shadowsHighlightsBlur->textureId();
+        } else {
+            // Steady state: the same texture, no drain, no check.
+            QCOMPARE(set.shadowsHighlightsBlur->textureId(), allocatedId);
+            QCOMPARE(timing.blur_drain_ms, 0.0);
+            QCOMPARE(timing.blur_check_ms, 0.0);
+        }
+        const QByteArray readback = read_rgba16_texture(gl, set.shadowsHighlightsBlur->textureId(), width, height);
+        if (readback.isEmpty()) {
+            MLV_SKIP_OR_FAIL_IF_READBACK_FAILED("RGBA16 framebuffer attachment readback is not supported here");
+        }
+        QCOMPARE(readback, expected_rgba16(blurConfig.shadowsHighlightsBlur, width * height));
+    }
+    QCOMPARE(gl->glGetError(), static_cast<GLenum>(GL_NO_ERROR));
 
     gpuPreviewProcessingDestroyLutTextureSet(set);
     context.doneCurrent();

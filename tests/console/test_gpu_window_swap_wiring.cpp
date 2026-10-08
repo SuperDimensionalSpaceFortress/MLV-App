@@ -673,3 +673,46 @@ TEST(GpuWindowPresentInvariants, LutGate3PaintGlRefusesAReconTextureWhoseLutsAre
     ASSERT_TRUE(body.contains(QStringLiteral(
         "displayUniforms, reconLutsReady);")));
 }
+
+// PLAYBACK-GL-PRESENT-SETUP-STALL-1 (row R3, T4): the HEAVY pace legs charged every >= 50 ms texture-present
+// setup to the glGetError drain in front of the per-frame shadows/highlights blur upload (the GUI thread waits
+// there for the driver thread). The steady-state upload -- into a texture an earlier call created at this exact
+// size -- must take no glGetError; the (re)allocation upload keeps its drain and its post-upload check.
+TEST(GpuPresentSetupStall, SteadyStateBlurUploadTakesNoGlGetErrorButTheAllocationUploadIsDrainedAndChecked)
+{
+    const QString source = readRepoFile(QStringLiteral("platform/qt/GpuPreviewProcessing.cpp"));
+    const QString body = functionBody(source,
+        QStringLiteral("bool gpuPreviewProcessingUpdateShadowsHighlightsBlurTexture("),
+        QStringLiteral("void gpuPreviewProcessingBindDisplayUniformsAndTextures("));
+    ASSERT_FALSE(body.isEmpty());
+    const QString glGetErrorCall = QStringLiteral("gl->glGetError()");
+    const QString upload = QStringLiteral(
+        "set.shadowsHighlightsBlur->setData(QOpenGLTexture::RGBA, QOpenGLTexture::UInt16, packed.constData());");
+
+    // A (re)allocation marks the call; the steady-state branch follows it and returns on its own.
+    const int allocatedAt = body.indexOf(QStringLiteral("allocatedThisCall = true;"));
+    ASSERT_TRUE(allocatedAt >= 0);
+    const int steadyAt = body.indexOf(QStringLiteral("if ( !allocatedThisCall )"));
+    ASSERT_TRUE(steadyAt > allocatedAt);
+    const int steadyReturnAt = body.indexOf(QStringLiteral("return true;"), steadyAt);
+    ASSERT_TRUE(steadyReturnAt > steadyAt);
+    const QString steady = body.mid(steadyAt, steadyReturnAt - steadyAt);
+    ASSERT_EQ(1, countOccurrences(steady, upload));
+    ASSERT_TRUE(steady.contains(QStringLiteral("set.shadowsHighlightsBlurReady = true;")));
+    ASSERT_EQ(0, countOccurrences(steady, glGetErrorCall));
+    ASSERT_EQ(0, countOccurrences(steady, QStringLiteral("glGetError(")));
+
+    // Nothing before the steady branch syncs either.
+    ASSERT_EQ(0, countOccurrences(body.left(steadyAt), glGetErrorCall));
+
+    // The allocation upload: drain, upload, check, in that order.
+    const QString allocation = body.mid(steadyReturnAt);
+    ASSERT_EQ(2, countOccurrences(allocation, glGetErrorCall));
+    const int drainAt = allocation.indexOf(glGetErrorCall);
+    const int allocationUploadAt = allocation.indexOf(upload);
+    const int checkAt = allocation.indexOf(glGetErrorCall, drainAt + glGetErrorCall.size());
+    ASSERT_TRUE(drainAt >= 0);
+    ASSERT_TRUE(allocationUploadAt > drainAt);
+    ASSERT_TRUE(checkAt > allocationUploadAt);
+    ASSERT_TRUE(allocation.mid(checkAt).contains(QStringLiteral("return failClosed();")));
+}

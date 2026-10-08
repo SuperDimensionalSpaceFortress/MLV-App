@@ -2992,11 +2992,13 @@ bool gpuPreviewProcessingUpdateShadowsHighlightsBlurTexture(
      * (width/4) x (height/4) texture; the display shader upsamples it. */
     const int blurWidth = config.shadowsHighlightsBlurQuarter ? width / 4 : width;
     const int blurHeight = config.shadowsHighlightsBlurQuarter ? height / 4 : height;
+    bool allocatedThisCall = false;
     if ( !set.shadowsHighlightsBlur
       || !set.shadowsHighlightsBlur->isCreated()
       || set.shadowsHighlightsBlurWidth != blurWidth
       || set.shadowsHighlightsBlurHeight != blurHeight )
     {
+        allocatedThisCall = true;
         const double reallocStartMs = spanMs();
         delete set.shadowsHighlightsBlur;
         set.shadowsHighlightsBlur = createFrameTexture(blurWidth, blurHeight);
@@ -3015,10 +3017,28 @@ bool gpuPreviewProcessingUpdateShadowsHighlightsBlurTexture(
         reinterpret_cast<const uint16_t *>(config.shadowsHighlightsBlur.constData()),
         blurWidth * blurHeight);
 
-    // Same FAIL CLOSED discipline as gpuPreviewProcessingUpdateLutTextureSet
-    // (GPU-TEXNR-S1-DARK-GREEN-1): drain any stale GL error before the upload
-    // so it is never misattributed, then confirm the upload actually
-    // succeeded rather than trusting setData()'s void return.
+    // PLAYBACK-GL-PRESENT-SETUP-STALL-1 (row R3, F-c1): the steady-state upload, into the
+    // texture an earlier call created at this exact size and format, takes no glGetError.
+    // With the NVIDIA driver's threaded optimisation glGetError makes the GUI thread wait
+    // for the driver thread, and this pair ran on every present: the HEAVY pace legs
+    // charged 136-421 ms stalls to the drain alone. A same-size, same-format
+    // glTexSubImage2D into a created texture can only fail on context loss or out of
+    // memory, and context loss already routes through aboutToBeDestroyed ->
+    // cleanupGLResources, which destroys this texture so the next call is an allocation
+    // upload again (drained and checked below).
+    if ( !allocatedThisCall )
+    {
+        const double steadyUploadStartMs = spanMs();
+        set.shadowsHighlightsBlur->setData(QOpenGLTexture::RGBA, QOpenGLTexture::UInt16, packed.constData());
+        if ( setupTiming ) setupTiming->blur_upload_ms += spanMs() - steadyUploadStartMs;
+        set.shadowsHighlightsBlurReady = true;
+        return true;
+    }
+
+    // The (re)allocation upload keeps the FAIL CLOSED discipline of
+    // gpuPreviewProcessingUpdateLutTextureSet (GPU-TEXNR-S1-DARK-GREEN-1): drain any
+    // stale GL error before the upload so it is never misattributed, then confirm the
+    // upload actually succeeded rather than trusting setData()'s void return.
     QOpenGLContext * currentContext = QOpenGLContext::currentContext();
     QOpenGLFunctions * gl = currentContext ? currentContext->functions() : nullptr;
     const double drainStartMs = spanMs();
