@@ -5,19 +5,23 @@
 #   2. submits ONE probe job through tools\profiling\um-run.ps1 (the only writer to a venue share), with a unique JobId venue-quiet-probe-<utc>.
 #      The job reads 3 samples of \Processor(_Total)\% Processor Time, 12 s apart -- the counter and cadence of the attribution job's own
 #      quiescence gate (playback-attr-3-cuda-job.ps1, Get-AttrCudaQuiescenceSample) -- plus the top 5 processes by CPU-seconds over that window;
-#   3. decides: QUIET when the mean of the 3 samples is <= -ThresholdPercent. A failed counter read makes the check UNKNOWN, never quiet.
+#   3. decides: QUIET when the UNROUNDED mean of the 3 samples is <= -ThresholdPercent (the printed mean is rounded to 0.1 for display only). A
+#      failed counter read makes the check UNKNOWN, never quiet.
 #   4. re-probes every -RecheckSec until QUIET or -MaxWaitSec, then prints `QUIET mean=<x>` or `COOLDOWN_UNMET mean=<x>` and the top processes.
 # COOLDOWN_UNMET is recorded and the caller proceeds: it decides nothing. The probe never kills, stops or changes any process.
 #
 #   pwsh -NoProfile -File tools\profiling\dual-venue\Wait-VenueQuiet.ps1 -Venue bachelor -WorkDir <dir> [-GateLog <file>]
 #   pwsh -NoProfile -File tools\profiling\dual-venue\Wait-VenueQuiet.ps1 -SamplesJson '[12.5, 18.0, 21.0]'     # offline: the decision only
 #
-# Exit codes: 0 QUIET or COOLDOWN_UNMET (read stdout); 3 GATE_BUSY (the queue never cleared); 2 a usage error.
+# -AgentShare overrides the venue table's share (tests; a share that is not the venue's own is the caller's responsibility).
+# Exit codes: 0 QUIET or COOLDOWN_UNMET (read stdout); 3 GATE_BUSY (the queue never cleared); 4 GATE_UNREADABLE (the agent share could not be
+# read -- typed line `GATE_UNREADABLE ...` then `DECISION UNKNOWN`, never an empty-queue line; no probe is submitted); 2 a usage error.
 [CmdletBinding(DefaultParameterSetName = 'Live')]
 param(
     [Parameter(ParameterSetName = 'Live')][ValidateSet('bachelor', 'ultra-magnus')][string]$Venue = 'bachelor',
     [Parameter(ParameterSetName = 'Live', Mandatory = $true)][string]$WorkDir,
     [Parameter(ParameterSetName = 'Live')][string]$GateLog = '',
+    [Parameter(ParameterSetName = 'Live')][string]$AgentShare = '',
     [Parameter(ParameterSetName = 'Live')][int]$RecheckSec = 90,
     [Parameter(ParameterSetName = 'Live')][int]$MaxWaitSec = 1800,
     [Parameter(ParameterSetName = 'Live')][int]$MaxGateSec = 2400,
@@ -37,7 +41,8 @@ function Get-VenueQuietDecision {
         if (-not [double]::IsFinite($d) -or $d -lt 0.0 -or $d -gt 100.0) { $ok = $false }
     }
     if (-not $ok) { return [pscustomobject]@{ state = 'UNKNOWN'; mean = $null } }
-    $mean = [math]::Round((($vals | ForEach-Object { [double]$_ }) | Measure-Object -Average).Average, 1)
+    # The UNROUNDED mean decides; Format-Mean rounds for display only (three 20.04% samples are BUSY at 20 although they print as 20.0%).
+    $mean = (($vals | ForEach-Object { [double]$_ }) | Measure-Object -Average).Average
     [pscustomobject]@{ state = $(if ($mean -le $Threshold) { 'QUIET' } else { 'BUSY' }); mean = $mean }
 }
 
@@ -53,7 +58,7 @@ if ($PSCmdlet.ParameterSetName -eq 'Offline') {
 
 $here = $PSScriptRoot
 $table = [IO.File]::ReadAllText((Join-Path $here 'venues.json')) | ConvertFrom-Json
-$agentShare = [string]$table.venues.$Venue.agentShare
+$agentShare = $(if ($AgentShare) { $AgentShare } else { [string]$table.venues.$Venue.agentShare })
 $umRun = Join-Path $here '..\um-run.ps1'
 New-Item -ItemType Directory -Force -Path $WorkDir | Out-Null
 
@@ -62,14 +67,33 @@ function Write-Gate([string]$Line) {
     if ($GateLog) { $Line | Add-Content -LiteralPath $GateLog }
 }
 
+# One directory count, or $null when the directory cannot be read: an unreachable share is NOT an empty queue. The inbox must exist; running\ may
+# legitimately be absent while the share itself is readable (nothing has run), so only a read error on an existing running\ is unreadable.
+function Get-GateCount([string]$Dir, [string]$Filter, [bool]$MustExist) {
+    if (-not (Test-Path -LiteralPath $Dir -PathType Container)) {
+        if ($MustExist -or -not (Test-Path -LiteralPath $agentShare -PathType Container)) { return $null }
+        return 0
+    }
+    try {
+        if ($Filter) { return @(Get-ChildItem -LiteralPath $Dir -Filter $Filter -ErrorAction Stop).Count }
+        return @(Get-ChildItem -LiteralPath $Dir -ErrorAction Stop).Count
+    } catch { return $null }
+}
+
+# Sets $script:GateState to 'CLEAR', 'BUSY' (the queue never cleared) or 'UNREADABLE' (the share could not be read: nothing is known, the decision
+# is UNKNOWN). The state is not the function's output: its GATE lines are written to the pipeline and must reach stdout.
 function Wait-QueueGate([string]$Name) {
     $t0 = Get-Date
     while ($true) {
-        $q = @(Get-ChildItem -LiteralPath "$agentShare\inbox" -Filter '*.job.ps1' -ErrorAction SilentlyContinue).Count
-        $r = @(Get-ChildItem -LiteralPath "$agentShare\running" -ErrorAction SilentlyContinue).Count
+        $q = Get-GateCount "$agentShare\inbox" '*.job.ps1' $true
+        $r = Get-GateCount "$agentShare\running" '' $false
+        if ($null -eq $q -or $null -eq $r) {
+            Write-Gate "GATE_UNREADABLE $Name $Venue share=$agentShare inboxReadable=$($null -ne $q) runningReadable=$($null -ne $r) $([DateTime]::UtcNow.ToString('HH:mm:ssZ'))"
+            $script:GateState = 'UNREADABLE'; return
+        }
         Write-Gate "GATE $Name $Venue queued=$q running=$r $([DateTime]::UtcNow.ToString('HH:mm:ssZ'))"
-        if ($q -eq 0 -and $r -eq 0) { return $true }
-        if (((Get-Date) - $t0).TotalSeconds -gt $MaxGateSec) { Write-Gate "GATE_BUSY $Name"; return $false }
+        if ($q -eq 0 -and $r -eq 0) { $script:GateState = 'CLEAR'; return }
+        if (((Get-Date) - $t0).TotalSeconds -gt $MaxGateSec) { Write-Gate "GATE_BUSY $Name"; $script:GateState = 'BUSY'; return }
         Start-Sleep -Seconds 30
     }
 }
@@ -84,7 +108,7 @@ function Get-TimeSample {
         if ($null -eq $st -or ($st.Value -ne 0 -and $st.Value -ne 1) -or $null -eq $s.CookedValue) { return $null }
         $v = [double]$s.CookedValue
         if (-not [double]::IsFinite($v) -or $v -lt 0 -or $v -gt 100) { return $null }
-        return [math]::Round($v, 2)
+        return $v
     } catch { return $null }
 }
 function Get-CpuSnapshot { $h = @{}; foreach ($p in @(Get-Process -ErrorAction SilentlyContinue)) { try { if ($p.TotalProcessorTime) { $h[$p.Id] = @($p.Name, $p.TotalProcessorTime.TotalSeconds) } } catch { } }; $h }
@@ -100,7 +124,9 @@ Write-Output ('VENUE_QUIET=' + ([ordered]@{ schema = 'mlv-app/venue-quiet-probe/
 $t0 = Get-Date
 $last = $null
 while ($true) {
-    if (-not (Wait-QueueGate 'quiet-probe')) { exit 3 }
+    Wait-QueueGate 'quiet-probe'
+    if ($script:GateState -ceq 'UNREADABLE') { Write-Gate 'DECISION UNKNOWN mean=UNKNOWN'; exit 4 }
+    if ($script:GateState -cne 'CLEAR') { exit 3 }
     $jobId = 'venue-quiet-probe-' + [DateTime]::UtcNow.ToString('yyyyMMddTHHmmssfffZ')
     $jobFile = Join-Path $WorkDir "$jobId.job.ps1"
     [IO.File]::WriteAllText($jobFile, $probeText, [Text.UTF8Encoding]::new($false))

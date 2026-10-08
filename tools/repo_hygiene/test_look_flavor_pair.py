@@ -38,6 +38,12 @@ def tile(seed, letterbox=0):
     return arr
 
 
+def independent_luma(arr):
+    import numpy as np
+    f = arr.astype(np.float64)
+    return 0.299 * f[:, :, 0] + 0.587 * f[:, :, 1] + 0.114 * f[:, :, 2]
+
+
 def independent_stats(arr):
     import numpy as np
     f = arr.astype(np.float64)
@@ -166,6 +172,13 @@ class FlavorDiffComposeTests(FlavorDiffHarness):
             d = np.abs(b.astype(np.float64) - a.astype(np.float64))
             for c, ch in zip("rgb", range(3)):
                 self.assertAlmostEqual(t["mean_abs_delta"][c], float(d[:, :, ch].mean()), delta=1e-6)
+        # PIN-FLAVOR-DIFF-P95-1: p95 |dY| against a value computed here from the test's own luma, so a percentile replaced by 0.0 (or by the
+        # mean) cannot pass. No tile in this test has letterbox rows, so every row is used.
+        expected_p95 = [float(np.percentile(np.abs(independent_luma(b) - independent_luma(a)), 95)) for a, b in ((a0, b0), (a1, b1))]
+        for t, want in zip(metrics["tiles"], expected_p95):
+            self.assertGreater(want, 1.0, "the synthetic pair must give a non-trivial p95")
+            self.assertAlmostEqual(t["p95_abs_delta_y"], want, delta=1e-6)
+        self.assertAlmostEqual(metrics["means"]["p95_abs_delta_y"], sum(expected_p95) / 2, delta=1e-6)
 
         with Image.open(out / "heat-00.png") as heat:
             h = np.asarray(heat.convert("RGB"))
@@ -191,7 +204,8 @@ class FlavorDiffComposeTests(FlavorDiffHarness):
         m = json.loads((out / "metrics.json").read_text(encoding="utf-8"))
         self.assertEqual((m["frameMatched"], m["sameFrames"], m["maxFrameDelta"]), (False, False, 13))
         self.assertEqual([t["display_frame_delta"] for t in m["tiles"]], [0, 13])
-        self.assertNotIn("NOT FRAME-MATCHED", m["tiles"][0]["label"])
+        # the aggregate FRAME-MATCHED is false, so EVERY row says so -- including tile 0, whose own offset (d=0) is within tolerance
+        self.assertIn("NOT FRAME-MATCHED (d=0)", m["tiles"][0]["label"])
         self.assertIn("NOT FRAME-MATCHED (d=13)", m["tiles"][1]["label"])
         self.assertIn("NOT FRAME-MATCHED (d=13)", (out / "table.md").read_text(encoding="utf-8"))
 
@@ -200,6 +214,34 @@ class FlavorDiffComposeTests(FlavorDiffHarness):
         self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
         m = json.loads((out / "metrics.json").read_text(encoding="utf-8"))
         self.assertEqual((m["frameMatched"], m["sameFrames"], m["maxFrameDelta"]), (True, True, 0))
+        self.assertTrue(all("NOT FRAME-MATCHED" not in t["label"] for t in m["tiles"]), "a frame-matched pair labels no row")
+
+    @staticmethod
+    def tree_hashes(root: Path) -> dict:
+        return {str(p.relative_to(root)): hashlib.sha256(p.read_bytes()).hexdigest() for p in sorted(root.rglob("*")) if p.is_file()}
+
+    def test_a_second_composition_into_an_occupied_out_dir_is_refused_and_leaves_the_first_byte_identical(self) -> None:
+        shared = self.tmp / "shared" / ".claude-state" / "pair"
+        proc, out = self.run_tool({0: tile(1), 1: tile(2)}, {0: tile(3), 1: tile(4)}, out_dir=shared)
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        before = self.tree_hashes(out)
+        self.assertIn("sheet-classic-vs-cinematic.png", before)
+        self.assertIn("metrics.json", before)
+        proc2, _ = self.run_tool({0: tile(31), 1: tile(32)}, {0: tile(33), 1: tile(34)}, out_dir=shared)
+        self.assertEqual(proc2.returncode, 16, proc2.stdout + proc2.stderr)
+        self.assertTrue(proc2.stderr.startswith("PAIR_OUTPUT_EXISTS"), proc2.stderr)
+        self.assertEqual(self.tree_hashes(out), before, "the first run's sheet, rows, heatmaps, metrics and table are byte-identical")
+
+    def test_any_one_existing_artifact_refuses_before_anything_is_written(self) -> None:
+        for name in ("table.md", "metrics.json", "sheet-classic-vs-cinematic.png", "row-00.png", "heat-01.png"):
+            with self.subTest(existing=name):
+                shared = self.tmp / name / ".claude-state" / "pair"
+                shared.mkdir(parents=True)
+                (shared / name).write_bytes(b"earlier evidence")
+                proc, out = self.run_tool({0: tile(1), 1: tile(2)}, {0: tile(3), 1: tile(4)}, out_dir=shared)
+                self.assertEqual(proc.returncode, 16, proc.stdout + proc.stderr)
+                self.assertIn(name, proc.stderr)
+                self.assertEqual(self.tree_hashes(out), {name: hashlib.sha256(b"earlier evidence").hexdigest()})
 
     def test_an_unlisted_file_in_a_staging_dir_is_refused(self) -> None:
         from PIL import Image
@@ -269,6 +311,37 @@ class FlavorPairDriverTests(unittest.TestCase):
         self.assertIn("PAIR_OWNER_SHEET_MUST_STAY_LOCAL", proc.stdout + proc.stderr)
 
 
+    @staticmethod
+    def tree_hashes(root: Path) -> dict:
+        return {str(p.relative_to(root)): hashlib.sha256(p.read_bytes()).hexdigest() for p in sorted(root.rglob("*")) if p.is_file()}
+
+    def test_an_out_dir_that_holds_a_pair_record_is_refused_before_any_artifact_changes(self) -> None:
+        # A DIFFERENT valid-looking pair (other leg ids) aimed at the occupied directory: refused with its own exit code, nothing touched.
+        out = self.tmp / ".claude-state" / "occupied"
+        out.mkdir(parents=True)
+        for name, data in (("flavor-pair-leg-old-vs-leg-old2-bachelor.json", b'{"record":1}\n'), ("sheet-classic-vs-cinematic.png", b"sheet"),
+                           ("metrics.json", b"{}")):
+            (out / name).write_bytes(data)
+        before = self.tree_hashes(out)
+        classic, cinematic = synthetic_receipt("classic"), synthetic_receipt("cinematic")
+        classic["legId"], cinematic["legId"] = "leg-new-classic", "leg-new-cinematic"
+        proc = self.pair(classic, cinematic, out=out)
+        self.assertEqual(proc.returncode, 16, proc.stdout + proc.stderr)
+        self.assertIn("PAIR_RECORD_EXISTS", proc.stdout + proc.stderr)
+        self.assertEqual(self.tree_hashes(out), before)
+
+    def test_an_out_dir_that_holds_a_sheet_metrics_or_table_is_refused(self) -> None:
+        for name in ("sheet-classic-vs-cinematic.png", "metrics.json", "table.md"):
+            with self.subTest(existing=name):
+                out = self.tmp / name / ".claude-state" / "pair"
+                out.mkdir(parents=True)
+                (out / name).write_bytes(b"earlier evidence")
+                proc = self.pair(synthetic_receipt("classic"), synthetic_receipt("cinematic"), out=out)
+                self.assertEqual(proc.returncode, 16, proc.stdout + proc.stderr)
+                self.assertIn(f"PAIR_OUTPUT_EXISTS {name}", proc.stdout + proc.stderr)
+                self.assertEqual(sorted(p.name for p in out.iterdir()), [name])
+
+
 @requires_windows_pwsh
 class VenueQuietDecisionTests(unittest.TestCase):
     def test_the_decision_is_the_mean_of_three_samples_and_a_failed_read_is_never_quiet(self) -> None:
@@ -276,12 +349,45 @@ class VenueQuietDecisionTests(unittest.TestCase):
                                   ("[30.5, 18.0, 22.0]", "DECISION BUSY mean=23.5%"),
                                   ("[10, null, 5]", "DECISION UNKNOWN mean=UNKNOWN"),
                                   ("[10, 5]", "DECISION UNKNOWN mean=UNKNOWN"),
-                                  ("[10, 5, 140]", "DECISION UNKNOWN mean=UNKNOWN")):
+                                  ("[10, 5, 140]", "DECISION UNKNOWN mean=UNKNOWN"),
+                                  # the comparison is on the UNROUNDED mean: three 20.04% samples are above a threshold of 20 and print as 20.0%
+                                  ("[20.04, 20.04, 20.04]", "DECISION BUSY mean=20.0%"),
+                                  ("[20, 20, 20.01]", "DECISION BUSY mean=20.0%"),
+                                  ("[19.96, 19.96, 19.96]", "DECISION QUIET mean=20.0%")):
             with self.subTest(samples=samples):
                 proc = subprocess.run([PWSH, "-NoLogo", "-NoProfile", "-NonInteractive", "-File", str(DV / "Wait-VenueQuiet.ps1"),
                                        "-SamplesJson", samples], capture_output=True, text=True, timeout=120)
                 self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
                 self.assertEqual(proc.stdout.strip(), decision)
+
+    def test_an_unreachable_agent_share_is_a_typed_gate_unreadable_never_an_empty_queue(self) -> None:
+        work = Path(tempfile.mkdtemp(prefix="venue-quiet-gate-"))
+        self.addCleanup(shutil.rmtree, work, ignore_errors=True)
+        gate_log = work / "gate.log"
+        proc = subprocess.run([PWSH, "-NoLogo", "-NoProfile", "-NonInteractive", "-File", str(DV / "Wait-VenueQuiet.ps1"), "-WorkDir", str(work / "w"),
+                               "-AgentShare", str(work / "no-such-share"), "-GateLog", str(gate_log)], capture_output=True, text=True, timeout=120)
+        out = proc.stdout + proc.stderr
+        self.assertEqual(proc.returncode, 4, out)
+        self.assertIn("GATE_UNREADABLE quiet-probe bachelor", out)
+        self.assertIn("DECISION UNKNOWN mean=UNKNOWN", out)
+        self.assertNotIn("queued=0 running=0", out, "an unreadable share must never print as an empty queue")
+        self.assertNotIn("PROBE ", out, "no probe job is submitted through an unreadable share")
+        log = gate_log.read_text(encoding="utf-8")
+        self.assertIn("GATE_UNREADABLE", log)
+        self.assertNotIn("queued=0", log)
+
+    def test_a_queue_that_never_clears_is_gate_busy_with_its_gate_lines_on_stdout(self) -> None:
+        # Wait-QueueGate used to be consumed as a boolean while its GATE lines went down the same pipeline, so a busy queue read as truthy.
+        work = Path(tempfile.mkdtemp(prefix="venue-quiet-busy-"))
+        self.addCleanup(shutil.rmtree, work, ignore_errors=True)
+        (work / "share" / "inbox").mkdir(parents=True)
+        (work / "share" / "running").mkdir()
+        (work / "share" / "inbox" / "earlier.job.ps1").write_text("# queued", encoding="utf-8")
+        proc = subprocess.run([PWSH, "-NoLogo", "-NoProfile", "-NonInteractive", "-File", str(DV / "Wait-VenueQuiet.ps1"), "-WorkDir", str(work / "w"),
+                               "-AgentShare", str(work / "share"), "-MaxGateSec", "0"], capture_output=True, text=True, timeout=120)
+        self.assertEqual(proc.returncode, 3, proc.stdout + proc.stderr)
+        self.assertIn("queued=1 running=0", proc.stdout)
+        self.assertIn("GATE_BUSY quiet-probe", proc.stdout)
 
 
 if __name__ == "__main__":

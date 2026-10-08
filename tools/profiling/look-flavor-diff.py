@@ -33,11 +33,14 @@ REFUSALS (exit codes; the token is the first word on stderr)
     13  PAIR_OWNER_SHEET_MUST_STAY_LOCAL   --out-dir has no `.claude-state` segment.
     14  PAIR_INPUT_INVALID                 a slider file is unreadable or lacks a flavor-owned field, or a side has no saved frame.
     15  PAIR_TILE_SIZE_DIFFERS             tile i is not the same pixel size on both sides (no per-pixel difference is defined).
+    16  PAIR_OUTPUT_EXISTS                 --out-dir already holds the sheet, metrics.json, table.md or a row-NN / heat-NN png. Outputs are
+                                           append-only: checked before anything is written, and every file is created exclusively (the
+                                           sheet first), so a second or concurrent composer changes nothing of the first one's evidence.
 
 OUTPUT (in --out-dir)
     sheet-classic-vs-cinematic.png   3840 px wide. A HEADER_HEIGHT header (clip, venue, build, flavors, receipt ids, claims), then per tile a
-                                     ROW_LABEL_HEIGHT label band (tile index, both display_frames, delta, `NOT FRAME-MATCHED (d=k)` when
-                                     |d| > FRAME_MATCH_TOLERANCE) over [Classic | Cinematic | |dY| heatmap] at 1280 px each, aspect kept.
+                                     ROW_LABEL_HEIGHT label band (tile index, both display_frames, delta, `NOT FRAME-MATCHED (d=k)` on EVERY
+                                     row once the pair's FRAME-MATCHED is false, i.e. when any |d| > FRAME_MATCH_TOLERANCE) over [Classic | Cinematic | |dY| heatmap] at 1280 px each, aspect kept.
                                      Height = HEADER_HEIGHT + tiles * (ROW_LABEL_HEIGHT + round(1280 * h / w)).
     row-NN.png                       Classic | Cinematic at 1920 px each (3840 wide), under a ROW_LABEL_HEIGHT label band.
     heat-NN.png                      |dY| at full resolution on a FIXED 0..HEAT_SCALE_MAX code-value scale (black -> red -> yellow -> white;
@@ -60,6 +63,7 @@ METRICS (on the full-resolution tiles)
 """
 import argparse
 import importlib.util
+import io
 import json
 import sys
 from pathlib import Path
@@ -72,7 +76,9 @@ EXIT_NOT_LISTED = 12
 EXIT_NOT_LOCAL = 13
 EXIT_INPUT_INVALID = 14
 EXIT_TILE_SIZE = 15
+EXIT_OUTPUT_EXISTS = 16
 
+SHEET_NAME = "sheet-classic-vs-cinematic.png"
 SCHEMA_METRICS = "mlv-app/look-flavor-diff-metrics/v1"
 FLAVOR_OWNED_FIELDS = ("presetContrast", "presetPivot", "presetShadows", "presetHighlights", "presetVibrance")
 SLIDER_FIELDS = ("scene", "presetExposure", *FLAVOR_OWNED_FIELDS, "presetTemperatureDelta", "presetTintDelta", "finalTemperature", "finalTint")
@@ -203,13 +209,42 @@ def legend_strip(width, font):
     return strip
 
 
-def row_label(tile):
+def row_label(tile, pair_matched):
+    """The row's label. When the pair as a whole is NOT frame-matched every row says so (not only the rows past the tolerance)."""
     d = tile["display_frame_delta"]
     text = (f"tile {tile['index']:02d}  classic disp {tile['classic']['display_frame']}  cinematic disp {tile['cinematic']['display_frame']}  "
             f"d={d:+d}" if isinstance(d, int) else f"tile {tile['index']:02d}  display_frame unknown")
-    if not tile["frame_matched"]:
+    if not (tile["frame_matched"] and pair_matched):
         text += f"  NOT FRAME-MATCHED (d={d})"
     return text
+
+
+def output_names(indices):
+    return [SHEET_NAME, "metrics.json", "table.md"] + [f"{kind}-{i:02d}.png" for i in indices for kind in ("row", "heat")]
+
+
+def refuse_if_occupied(out, indices):
+    """Every output is append-only: a name already in --out-dir is refused BEFORE anything is written into it (exit 16)."""
+    existing = [n for n in output_names(indices) if (out / n).exists()]
+    if existing:
+        raise Refusal(EXIT_OUTPUT_EXISTS, "PAIR_OUTPUT_EXISTS " + ", ".join(existing) + f" already in {out}: an earlier pair's evidence is never "
+                                          "overwritten; compose into a new directory")
+
+
+def write_new(path, data):
+    """Create `path` exclusively. A composer that lost a race for the directory fails here, on the first (sheet) write, with nothing of its own written."""
+    try:
+        with open(path, "xb") as handle:
+            handle.write(data)
+    except FileExistsError as exc:
+        raise Refusal(EXIT_OUTPUT_EXISTS, f"PAIR_OUTPUT_EXISTS {Path(path).name} already in {Path(path).parent}: an earlier pair's evidence is never "
+                                          "overwritten") from exc
+
+
+def png_bytes(image):
+    buf = io.BytesIO()
+    image.save(buf, "PNG")
+    return buf.getvalue()
 
 
 def fit(arr, width):
@@ -235,10 +270,10 @@ def compose(args):
         raise Refusal(EXIT_TILE_COUNT, f"PAIR_TILE_COUNT_DIFFERS Classic holds tiles {sorted(classic_by)}, Cinematic {sorted(cinematic_by)}")
 
     out = Path(args.out_dir)
-    out.mkdir(parents=True, exist_ok=True)
+    refuse_if_occupied(out, sorted(classic_by))
     font = mcs._load_font(22)
     small = mcs._load_font(16)
-    tiles, panels = [], []
+    tiles, panels, row_images, heat_images = [], [], {}, {}
     for index in sorted(classic_by):
         a = read_rgb(classic_staged, classic_by[index], "Classic")
         b = read_rgb(cinematic_staged, cinematic_by[index], "Cinematic")
@@ -266,24 +301,24 @@ def compose(args):
             "rows_excluded_letterbox": int((~keep).sum()),
             "size": [int(a.shape[1]), int(a.shape[0])],
         }
-        tile["label"] = row_label(tile)
         tiles.append(tile)
 
         heat = heat_rgb(abs_dy)
         heat_image = Image.new("RGB", (heat.shape[1], heat.shape[0] + LEGEND_HEIGHT), (16, 16, 16))
         heat_image.paste(Image.fromarray(heat), (0, 0))
         heat_image.paste(legend_strip(heat.shape[1], small), (0, heat.shape[0]))
-        heat_image.save(out / f"heat-{index:02d}.png", "PNG")
+        heat_images[index] = heat_image
 
         ra, rb = fit(a, ROW_COLUMN), fit(b, ROW_COLUMN)
         row = Image.new("RGB", (SHEET_WIDTH, ROW_LABEL_HEIGHT + ra.height), (8, 8, 8))
-        ImageDraw.Draw(row).text((10, 10), f"CLASSIC | CINEMATIC   {tile['label']}", fill=(255, 255, 255), font=font)
         row.paste(ra, (0, ROW_LABEL_HEIGHT))
         row.paste(rb, (ROW_COLUMN, ROW_LABEL_HEIGHT))
-        row.save(out / f"row-{index:02d}.png", "PNG")
+        row_images[index] = row
         panels.append((tile, fit(a, SHEET_COLUMN), fit(b, SHEET_COLUMN), fit(heat, SHEET_COLUMN)))
 
     matched = all(t["frame_matched"] for t in tiles)
+    for t in tiles:
+        t["label"] = row_label(t, matched)
     same_frames = all(t["display_frame_delta"] == 0 for t in tiles)
     deltas = [abs(t["display_frame_delta"]) for t in tiles if t["display_frame_delta"] is not None]
     max_delta = max(deltas) if len(deltas) == len(tiles) else None
@@ -303,12 +338,14 @@ def compose(args):
         draw.text((10, 8 + i * 34), text, fill=(255, 255, 255), font=font)
     for n, (tile, pa, pb, ph) in enumerate(panels):
         y = HEADER_HEIGHT + n * (ROW_LABEL_HEIGHT + tile_h)
-        colour = (255, 255, 255) if tile["frame_matched"] else (255, 120, 120)
+        colour = (255, 255, 255) if matched else (255, 120, 120)
         draw.text((10, y + 10), tile["label"], fill=colour, font=font)
         for col, panel in enumerate((pa, pb, ph)):
             sheet.paste(panel.crop((0, 0, SHEET_COLUMN, tile_h)), (col * SHEET_COLUMN, y + ROW_LABEL_HEIGHT))
-    sheet_path = out / "sheet-classic-vs-cinematic.png"
-    sheet.save(sheet_path, "PNG")
+    sheet_path = out / SHEET_NAME
+    # Nothing has been written yet. The sheet is created first and exclusively: it is this directory's reservation (see write_new).
+    out.mkdir(parents=True, exist_ok=True)
+    write_new(sheet_path, png_bytes(sheet))
 
     numeric = ("luma_p50", "mean_saturation", "mean_r", "mean_g", "mean_b")
     means = {
@@ -332,8 +369,13 @@ def compose(args):
         "tiles": tiles, "means": means,
         "sheet": sheet_path.name,
     }
-    (out / "metrics.json").write_text(json.dumps(doc, indent=2), encoding="utf-8")
-    (out / "table.md").write_text(render_table(doc), encoding="utf-8")
+    write_new(out / "metrics.json", json.dumps(doc, indent=2).encode("utf-8"))
+    write_new(out / "table.md", render_table(doc).encode("utf-8"))
+    for index in sorted(row_images):
+        label = next(t["label"] for t in tiles if t["index"] == index)
+        ImageDraw.Draw(row_images[index]).text((10, 10), f"CLASSIC | CINEMATIC   {label}", fill=(255, 255, 255), font=font)
+        write_new(out / f"row-{index:02d}.png", png_bytes(row_images[index]))
+        write_new(out / f"heat-{index:02d}.png", png_bytes(heat_images[index]))
     print(f"LOOK_FLAVOR_DIFF_OK sheet={sheet_path} tiles={len(tiles)} frameMatched={str(matched).lower()} "
           f"sameFrames={str(same_frames).lower()} maxFrameDelta={max_delta}")
     return 0
@@ -357,7 +399,7 @@ def render_table(doc):
               "|---|---|---|---|---|---|---|---|---|---|---|---|"]
     for t in doc["tiles"]:
         a, b, m = t["classic"], t["cinematic"], t["mean_abs_delta"]
-        match = "yes" if t["frame_matched"] else f"NOT FRAME-MATCHED (d={t['display_frame_delta']})"
+        match = "yes" if (t["frame_matched"] and doc["frameMatched"]) else f"NOT FRAME-MATCHED (d={t['display_frame_delta']})"
         lines.append(f"| {t['index']:02d} | {a['display_frame']} | {b['display_frame']} | {_num(t['display_frame_delta'])} | {match} | "
                      f"{a['luma_p50']:.1f} / {b['luma_p50']:.1f} | {a['mean_saturation']:.4f} / {b['mean_saturation']:.4f} | "
                      f"{a['mean_r']:.2f} / {b['mean_r']:.2f} | {a['mean_g']:.2f} / {b['mean_g']:.2f} | {a['mean_b']:.2f} / {b['mean_b']:.2f} | "

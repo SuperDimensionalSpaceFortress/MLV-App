@@ -21,6 +21,8 @@
 #   summary.json.
 # The two legs' specs differ (legId, flavor, the applied-flavor criterion), so subject.legSpecSha256 is NOT compared; subject.lookFlavor is, and must differ.
 # Cheap structural checks (backend, flavor, subject equality) run before the evidence validation, so a mismatched pair is refused without reading evidence.
+# One pair per OutDir, append-only: an OutDir already holding a flavor-pair-*.json record (PAIR_RECORD_EXISTS) or a sheet / metrics / table
+# (PAIR_OUTPUT_EXISTS) is refused with exit code 16 before anything is staged or composed; every other refusal stays a thrown error (exit 1).
 [CmdletBinding()]
 param(
     [Parameter(Mandatory = $true)][string]$ClassicReceipt,
@@ -34,6 +36,23 @@ Import-Module (Join-Path $PSScriptRoot 'DualVenueRunner.psm1') -Force
 $outFull = [IO.Path]::GetFullPath($OutDir)
 if (@($outFull.Split([char[]]@('\', '/')) | Where-Object { $_ -ceq '.claude-state' }).Count -eq 0) {
     throw 'PAIR_OWNER_SHEET_MUST_STAY_LOCAL -OutDir must be under a .claude-state directory; a sheet of owner footage is never committed, attached or published'
+}
+
+# Append-only, decided BEFORE anything is read, staged or composed: an OutDir that already holds a pair record, a sheet, metrics or a table belongs to an
+# earlier pair, and writing a different pair beside it would overwrite the evidence that record names. Refused with its own exit code (16); compose into a
+# new directory. look-flavor-diff.py repeats the check and creates every output exclusively, so a concurrent composer cannot slip past this one.
+if (Test-Path -LiteralPath $outFull -PathType Container) {
+    $recordsHere = @(Get-ChildItem -LiteralPath $outFull -Filter 'flavor-pair-*.json' -File -ErrorAction Stop)
+    if ($recordsHere.Count -gt 0) {
+        [Console]::Error.WriteLine("PAIR_RECORD_EXISTS $($recordsHere[0].Name) is already in ${outFull}: an earlier pair's record and evidence are never overwritten; use a new -OutDir")
+        exit 16
+    }
+    foreach ($name in 'sheet-classic-vs-cinematic.png', 'metrics.json', 'table.md') {
+        if (Test-Path -LiteralPath (Join-Path $outFull $name)) {
+            [Console]::Error.WriteLine("PAIR_OUTPUT_EXISTS $name is already in ${outFull}: an earlier pair's evidence is never overwritten; use a new -OutDir")
+            exit 16
+        }
+    }
 }
 $classic = [IO.File]::ReadAllText((Resolve-Path -LiteralPath $ClassicReceipt).Path) | ConvertFrom-Json
 $cinematic = [IO.File]::ReadAllText((Resolve-Path -LiteralPath $CinematicReceipt).Path) | ConvertFrom-Json
@@ -129,8 +148,9 @@ foreach ($label in $sides.Keys) {
     $listing = @($listedFrames[$label].files | ForEach-Object { [ordered]@{ name = $_.name; sha256 = $_.sha256 } })
     $stageListings[$label] = Join-Path $stageRoot "$label.listed.json"
     [IO.File]::WriteAllBytes($stageListings[$label], $utf8.GetBytes(([ordered]@{ files = $listing } | ConvertTo-Json -Depth 4)))
-    # The sliders as read from the validated evidence: kept beside the sheet, so an INERT refusal still leaves its evidence.
-    $sliderFiles[$label] = Join-Path $OutDir "sliders-$label.json"
+    # The sliders as read from the validated evidence: kept in this attempt's own staging directory (a fresh GUID, so no other pair's file is ever
+    # overwritten), inside OutDir, so an INERT refusal still leaves its evidence.
+    $sliderFiles[$label] = Join-Path $stageRoot "sliders-$label.json"
     $sliderDoc = [ordered]@{ receiptId = $sides[$label].receiptId; lookFlavorReported = $reported[$label] }
     foreach ($k in $sliders[$label].Keys) { $sliderDoc[$k] = $sliders[$label][$k] }
     [IO.File]::WriteAllBytes($sliderFiles[$label], $utf8.GetBytes(($sliderDoc | ConvertTo-Json -Depth 4)))
@@ -147,6 +167,7 @@ $pyArgs = @('-3', $composer,
 & py @pyArgs
 $code = $LASTEXITCODE
 if ($code -eq 10) { throw "PAIR_FLAVOR_INERT look-flavor-diff.py refused (FLAVOR_INERT): the cinematic flavor was not honoured; sliders in $($sliderFiles['cinematic']) and $($sliderFiles['classic'])" }
+if ($code -eq 16) { [Console]::Error.WriteLine('PAIR_OUTPUT_EXISTS look-flavor-diff.py refused (another composer or an earlier pair owns this -OutDir); nothing of this attempt was written there'); exit 16 }
 if ($code -ne 0) { throw "PAIR_COMPOSE_FAILED look-flavor-diff.py exited $code" }
 
 $metricsPath = Join-Path $OutDir 'metrics.json'
