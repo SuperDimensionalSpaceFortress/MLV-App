@@ -338,7 +338,7 @@ if ($DngOnly) {
     -Input $ClipPath `
     -Receipt $Receipt `
     -OutputRoot (Join-Path $OutputRoot "proof") `
-    -CdngCodecs $DngCodecs `
+    -CdngCodecs ($DngCodecs -join ',') `
     @proofOverlapArgs `
     @dryArgs
 $proofExit = $LASTEXITCODE
