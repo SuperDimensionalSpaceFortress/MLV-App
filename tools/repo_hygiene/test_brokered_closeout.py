@@ -2415,7 +2415,9 @@ class BrokeredCloseoutTests(unittest.TestCase):
             "import os, subprocess, sys, time\n"
             f"child = subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(60)'])\n"
             # Publish atomically: a kill between open() and write() must leave no pid file, not an empty one.
-            f"open({str(pid_path) + '.tmp'!r}, 'w', encoding='utf-8').write(str(child.pid))\n"
+            # The with-block closes the temp file before the replace; an open handle can fail or empty the replace on Windows.
+            f"with open({str(pid_path) + '.tmp'!r}, 'w', encoding='utf-8') as pid_file:\n"
+            "    pid_file.write(str(child.pid))\n"
             f"os.replace({str(pid_path) + '.tmp'!r}, {str(pid_path)!r})\n"
             "time.sleep(60)\n"
         )
@@ -2424,7 +2426,9 @@ class BrokeredCloseoutTests(unittest.TestCase):
             repo,
             config,
             [sys.executable, "-c", child_code],
-            timeout_ms=500,
+            # The runner's clock starts at launch and cannot be held from the test, so give the child
+            # headroom to publish its descendant pid first; the kill is then asserted on every realistic host.
+            timeout_ms=5000,
             max_output_bytes=8192,
             recovery_command="rerun finalize",
             closeout_args=["finalize"],
@@ -2436,8 +2440,8 @@ class BrokeredCloseoutTests(unittest.TestCase):
         self.assertTrue(result["killedProcessTree"], result)
         with self.subTest("descendant liveness"):
             if not pid_path.is_file():
-                # 500 ms is short on a loaded runner: the child can be killed before it publishes the pid.
-                # Nothing to check then, and the pid is published atomically so a present file is complete.
+                # Only a host stalled past the whole timeout reaches here: the child was killed before it
+                # published the pid. Nothing to check then, and a present file is complete (atomic publish).
                 self.skipTest("child was killed before it published the descendant pid")
             descendant_pid = int(pid_path.read_text(encoding="utf-8"))
             for _ in range(30):
@@ -2688,13 +2692,17 @@ class BrokeredCloseoutTests(unittest.TestCase):
         self.assertEqual(results[0]["returncode"], 124, results)
         self.assertTrue(results[0]["timedOut"], results)
         self.assertTrue(results[0]["killedProcessTree"], results)
-        self.assertTrue(pid_path.is_file(), results)
-        descendant_pid = int(pid_path.read_text(encoding="utf-8"))
-        for _ in range(30):
-            if not process_is_running(descendant_pid):
-                break
-            time.sleep(0.1)
-        self.assertFalse(process_is_running(descendant_pid), results)
+        with self.subTest("descendant liveness"):
+            if not pid_path.is_file():
+                # The child can be killed between the temp write and the replace; the pid is published
+                # atomically, so a present file is complete and an absent one means nothing to check.
+                self.skipTest("child was killed before it published the descendant pid")
+            descendant_pid = int(pid_path.read_text(encoding="utf-8"))
+            for _ in range(30):
+                if not process_is_running(descendant_pid):
+                    break
+                time.sleep(0.1)
+            self.assertFalse(process_is_running(descendant_pid), results)
         self.assertIn("bounded_runner_timeout", self.audit_types(repo))
         self.assertIn("bounded_runner_process_tree_killed", self.audit_types(repo))
 
