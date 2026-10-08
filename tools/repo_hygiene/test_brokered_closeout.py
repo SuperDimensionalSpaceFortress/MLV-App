@@ -55,6 +55,7 @@ from .brokered_closeout import (
     finalize_retry_decision,
     finalize_work_block,
     guard_closeout_hook,
+    kill_process_tree,
     load_closeout_config,
     load_manifest,
     file_content_hash,
@@ -2412,8 +2413,8 @@ class BrokeredCloseoutTests(unittest.TestCase):
         if pid_path.is_file():
             pids = [int(pid_path.read_text(encoding="utf-8"))]
         else:
-            # kill_process_tree parses every "PID n" in taskkill's output, so the root's parent (this test
-            # process) is listed beside the real descendants; it is alive by definition and is not one.
+            # kill_process_tree lists only the pids taskkill terminated; this test process is never one. The filter
+            # stays so a regression that names the root's parent cannot make this assertion fail on a live pid.
             pids = [int(pid) for pid in killed_descendants if int(pid) != os.getpid()]
         if not pids:
             self.skipTest(
@@ -2438,6 +2439,48 @@ class BrokeredCloseoutTests(unittest.TestCase):
             live.wait(timeout=10)
         # Once it is dead the same fallback passes.
         self.assert_descendants_dead(pid_path, [live.pid, os.getpid()], "dead descendant passes; own pid is ignored")
+
+    def killed_descendants_from_taskkill(self, root_pid: int, stdout: str, stderr: str = "") -> list:
+        # Mock the subprocess so no real process is killed; only the output parsing is under test.
+        completed = subprocess.CompletedProcess(["taskkill"], 0, stdout=stdout, stderr=stderr)
+        with mock.patch("tools.repo_hygiene.brokered_closeout.os.name", "nt"), mock.patch(
+            "tools.repo_hygiene.brokered_closeout.subprocess.run", return_value=completed
+        ):
+            return kill_process_tree(root_pid)["killedDescendants"]
+
+    def test_kill_process_tree_killed_descendants_never_names_the_roots_parent(self) -> None:
+        # Real taskkill output captured by BOUNDED-RUNNER-LIVENESS-PROOF-UNDER-LOAD-1: 34172 is the root's parent
+        # and was never terminated; only the PID after "The process with PID" was killed.
+        stdout = (
+            "SUCCESS: The process with PID 42568 (child process of PID 26568) has been terminated.\n"
+            "SUCCESS: The process with PID 26568 (child process of PID 34172) has been terminated.\n"
+        )
+        killed = self.killed_descendants_from_taskkill(26568, stdout)
+        self.assertEqual(killed, [42568])
+        self.assertNotIn(34172, killed)
+        self.assertNotIn(26568, killed)
+
+    def test_kill_process_tree_killed_descendants_ignores_non_success_lines(self) -> None:
+        stdout = (
+            "SUCCESS: The process with PID 42568 (child process of PID 26568) has been terminated.\n"
+            "SUCCESS: The process with PID 26568 (child process of PID 34172) has been terminated.\n"
+        )
+        stderr = (
+            "ERROR: The process with PID 777 (child process of PID 26568) could not be terminated.\n"
+            'ERROR: The process "ghost.exe" with PID 888 not found.\n'
+        )
+        killed = self.killed_descendants_from_taskkill(26568, stdout, stderr)
+        self.assertEqual(killed, [42568])
+
+    def test_kill_process_tree_killed_descendants_tolerates_extra_whitespace_and_crlf(self) -> None:
+        stdout = (
+            "  SUCCESS:  The process with PID   42568   (child process of PID  26568) has been terminated.\r\n"
+            "SUCCESS: The process with PID 51000 (child process of PID 42568) has been terminated.\r\n"
+            "SUCCESS: The process with PID 26568 (child process of PID 34172) has been terminated.\r\n"
+        )
+        killed = self.killed_descendants_from_taskkill(26568, stdout)
+        self.assertEqual(killed, [42568, 51000])
+        self.assertTrue(all(isinstance(value, int) for value in killed))
 
     def test_bounded_runner_ready_file_never_ready_child_is_still_killed_within_bounds(self) -> None:
         repo = self.init_repo()

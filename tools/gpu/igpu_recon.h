@@ -181,6 +181,16 @@ int igpu_recon_copy_last_device_output_to_gl_texture(igpu_recon_backend* b,
  * reserve; older DLLs may omit this symbol and callers must treat it as unknown. */
 int igpu_recon_allocated_bytes(igpu_recon_backend* b, uint64_t* bytes);
 
+/* Optional extension, resolved by name by MLVApp and outside the required
+ * ABI-v2 symbol set (PLAYBACK-CUDA-HONOUR-SCALE-1 r2). A sticky flag: while it
+ * is 1, every run ends with a same-colour vertical ISO-period notch on the
+ * Bayer16 output (bit-exact port of dualiso_reduced_iso_period_notch16), which
+ * removes the 4-row dual-ISO residual a reduced-size recon shows magnified.
+ * Default 0; with 0 the kernel is never launched. MLVApp sets 1 only for
+ * reduced-dims playback runs and refuses the reduced route when a DLL lacks
+ * this symbol. Returns 0 on success. */
+int igpu_recon_set_reduced_iso_notch(igpu_recon_backend* b, int enable);
+
 #ifdef __cplusplus
 } /* extern "C" */
 #endif

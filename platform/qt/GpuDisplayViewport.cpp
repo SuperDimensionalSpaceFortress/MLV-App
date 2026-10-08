@@ -1485,6 +1485,11 @@ bool GpuDisplayViewport::setPresentedGpuPlaybackReconAmazePostWbTexture(
 
     const int width = state->width;
     const int height = state->height;
+    /* PLAYBACK-CUDA-HONOUR-SCALE-1 r3: the reduced H-Nyquist filter needs the clip
+     * size (playbackReconTextureIsReduced). MainWindow hands it only to the GPU window's
+     * call (GpuDisplayWindow::setPresentedGpuPlaybackReconAmazePostWbTexture), so this
+     * route runs AMaZE with the flag at 0 until its caller passes the clip size. */
+    const bool reducedHnyquist = false;
     /* Same shared gate as the public entry point above (see
      * llrpGpuPlaybackReconRetainedDeviceBufferValid(), llrawproc.h): a
      * mismatched frame's compare-and-reject leaves state->frame_id unarmed
@@ -1582,6 +1587,7 @@ bool GpuDisplayViewport::setPresentedGpuPlaybackReconAmazePostWbTexture(
         m_texture->setWrapMode(QOpenGLTexture::ClampToEdge);
         m_textureIs16Bit = true;
         m_textureIsBayer16 = false;
+        gpuPresentEventNoteTextureRealloc("viewport_rgba16_texture_realloc", width, height);
     }
     if ( !m_gpuReconSourceTexture
       || m_gpuReconSourceTexture->width() != width
@@ -1594,6 +1600,7 @@ bool GpuDisplayViewport::setPresentedGpuPlaybackReconAmazePostWbTexture(
         m_gpuReconSourceTexture->setMipLevels(1);
         m_gpuReconSourceTexture->allocateStorage(QOpenGLTexture::Red, QOpenGLTexture::UInt16);
         m_gpuReconSourceTexture->setWrapMode(QOpenGLTexture::ClampToEdge);
+        gpuPresentEventNoteTextureRealloc("viewport_r16_texture_realloc", width, height);
     }
     applySamplingMode();
     setupMs = elapsedMs() - setupStartMs;
@@ -1659,7 +1666,8 @@ bool GpuDisplayViewport::setPresentedGpuPlaybackReconAmazePostWbTexture(
                     wbMultipliers,
                     &directAmazeReason,
                     &directAmazeRenderer,
-                    &directAmazeTiming);
+                    &directAmazeTiming,
+                    reducedHnyquist);
             const double directAmazeWallMs = elapsedMs() - directAmazeStartMs;
             if ( directAmazeOk )
             {
@@ -1737,7 +1745,8 @@ bool GpuDisplayViewport::setPresentedGpuPlaybackReconAmazePostWbTexture(
                 wbMultipliers,
                 &amazeReason,
                 &amazeRenderer,
-                &amazeTiming);
+                &amazeTiming,
+                reducedHnyquist);
         amazeWallMs = elapsedMs() - amazeStartMs;
         if ( reconOk && amazeOk )
         {

@@ -464,6 +464,11 @@ private:
         int reducedReconScale = 1;
         int reducedReconWidth = 0;
         int reducedReconHeight = 0;
+        /* PLAYBACK-CUDA-HONOUR-SCALE-1: the reduced recon ran on the CUDA
+         * texture route. reducedReconBayer is then the prepared recon INPUT
+         * (not a reconstruction); the reconstruction is the retained device
+         * Bayer at reducedReconWidth x reducedReconHeight. */
+        bool reducedReconOnGpu = false;
         /* CPU-DEBAYERED16-REUSE-PHASE3-RECON-1 r2/r3: how rawImage16's recon was
          * made, for Debayered16ReconReusePolicy. The decode stage sets the decode
          * status and settings, the recon-done signal the done stamp;
@@ -632,6 +637,10 @@ private:
     std::vector<float> m_debayered16ReconScratch;
     Debayered16ReconReuseCounters m_debayered16ReconReuseCounters;
     std::vector<uint16_t> m_gpuPlaybackReconStateRgb16;
+    /* PLAYBACK-CUDA-HONOUR-SCALE-1: the reduced prepared Bayer with each sample
+     * averaged with the same-colour sample two rows away (the opposite ISO), the
+     * source of a reduced slot's shadows/highlights frame state. */
+    std::vector<uint16_t> m_gpuReducedShSourceBayer;
     std::array<GpuPlaybackReconTextureState::LutCacheEntry,
                kGpuPlaybackReconTextureLutCacheSlots>
         m_gpuPlaybackReconTextureLutCache;
