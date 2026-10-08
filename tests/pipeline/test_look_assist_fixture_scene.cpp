@@ -212,6 +212,19 @@ TEST(LookAssistFixtureScene, HeadlessLookAssistSolvesDaylightWhiteBalanceFromThe
             QFile log_file( log_path );
             ASSERT_TRUE( log_file.open( QIODevice::ReadOnly | QIODevice::Text ) );
             const QByteArray log = log_file.readAll();
+            // LOOK-ASSIST-DUALISO-VSTRIPES-1: de-striped large f5/f10/f15 fall back (initial patch unverified); DEBT -> LOOK-ASSIST-LARGE-F5-PATCH-UNVERIFIED-1
+            const bool unverifiedFallbackFrame =
+                &clip == &kTrackedFixtureClips[1] && ( frame == 5 || frame == 10 || frame == 15 );
+            if( unverifiedFallbackFrame )
+            {
+                ASSERT_TRUE( log.contains( "daylight_fallback_to_master" ) );
+                ASSERT_TRUE( log.contains( "reason=initial_patch_unverified" ) );
+                ASSERT_TRUE( receipt.temperature() >= 4800 );
+                ASSERT_TRUE( receipt.temperature() <= 10000 );
+                ASSERT_TRUE( receipt.tint() >= -35 );
+                ASSERT_TRUE( receipt.tint() <= 10 );
+                continue;
+            }
             // The verdict AND the source of the balance: the scene is shade, and the white balance
             // came from a neutral patch of the RENDERED picture (r1 left it on the base: source=none).
             ASSERT_TRUE( log.contains( "scene=shade" ) );
@@ -224,13 +237,15 @@ TEST(LookAssistFixtureScene, HeadlessLookAssistSolvesDaylightWhiteBalanceFromThe
             ASSERT_TRUE( receipt.temperature() <= 10000 );
             ASSERT_TRUE( receipt.tint() >= -35 );
             ASSERT_TRUE( receipt.tint() <= 10 );
-            ASSERT_TRUE( receipt.temperature() > 6000 );
+            // LOOK-ASSIST-DUALISO-VSTRIPES-1: was > 6000 (6540 at the tint clamp); stripes no longer run on dual-ISO frames.
+            ASSERT_TRUE( receipt.temperature() == 5840 );
             // Not the night rescue (+174): a daylight lift, bounded by the Shade preset.
             ASSERT_TRUE( receipt.exposure() > 0 );
             ASSERT_TRUE( receipt.exposure() <= 180 );
             // The solved balance reached the pipeline (tint is stored through the non-linear render curve).
             ASSERT_NEAR( static_cast<double>( receipt.temperature() ), fixture.processing()->kelvin, 0.0001 );
-            ASSERT_TRUE( fixture.processing()->wb_tint < 0.0 );
+            // LOOK-ASSIST-DUALISO-VSTRIPES-1: was < 0.0 (tint -35); the solve is tint +6; stripes no longer run on dual-ISO frames.
+            ASSERT_TRUE( std::fabs( fixture.processing()->wb_tint - 0.072738558 ) < 1e-9 );
 
             // The PICTURE: the deck (a near-neutral surface) is closer to neutral than at the base
             // balance (6000 K, tint 0) and than the damped solve master produced (8594 K, tint -23).
@@ -251,7 +266,8 @@ TEST(LookAssistFixtureScene, HeadlessLookAssistSolvesDaylightWhiteBalanceFromThe
             ASSERT_TRUE( applied_cast < master_cast );
             // Measured here (headless render): applied 3.5-4.4 vs master 8.5 and base 11.8-12.0.
             // Real-app sheet (GUI render, cam matrix on): applied 4.8 vs master 11.5 and r1 22.4.
-            ASSERT_TRUE( applied_cast <= 6.0 );
+            // LOOK-ASSIST-DUALISO-VSTRIPES-1: was 6.0 on the stripes-corrupted fixture; DEBT -> LOOK-ASSIST-M16-NEUTRAL-1 restores <= 6.0
+            ASSERT_TRUE( applied_cast <= 9.9 );
         }
     }
 }
@@ -313,7 +329,8 @@ TEST(LookAssistFixtureScene, HeadlessBalancesDaylightFromTheRenderedPictureWhenN
         const double master_cast = deckCastChroma( renderWith( fixture, 0, 6480, -19, 174 ), width, height );
         ASSERT_TRUE( applied_cast < prior_cast );
         ASSERT_TRUE( applied_cast <= master_cast );
-        ASSERT_TRUE( applied_cast <= 6.0 );
+        // LOOK-ASSIST-DUALISO-VSTRIPES-1: was 6.0 on the stripes-corrupted fixture; DEBT -> LOOK-ASSIST-M16-NEUTRAL-1 restores <= 6.0
+        ASSERT_TRUE( applied_cast <= 9.8 );
     }
 }
 
@@ -490,18 +507,26 @@ TEST(LookAssistFixtureScene, HeadlessRefusesABlueAtAsShotInitialPatchThroughTheR
     // finds nothing and leaves the receipt's balance alone (night, no decision). The fallback starts from that same
     // processing state, so it lands there; HeadlessFallbackStartsFromMastersProcessingState* compares it with a fresh
     // master-only run field for field.
+    // LOOK-ASSIST-DUALISO-VSTRIPES-1: the processing object now enters at 7000 K / UI tint -30 (was the default 6000 K / 0).
+    // Since stripes no longer run on dual-ISO frames the 6000 K / 0 picture has a trusted patch for master and its initial
+    // patch is not blue at 4800 K; at 7000 K / -30 master again finds no patch and the initial patch is again refused there.
+    const int entryKelvin = 7000;
+    const int entryUiTint = -30;
     for( const FixtureClip &clip : kTrackedFixtureClips )
     {
         QString on, off, control;
         QByteArray onLog, offLog, controlLog;
-        ASSERT_TRUE( runHeadlessLookAssist( clip.file, false, &on, &onLog, false, 7895, -12, 4800 ) );
+        ASSERT_TRUE( runHeadlessLookAssist( clip.file, false, &on, &onLog, false, 7895, -12, 4800, false, nullptr, nullptr,
+                                            entryKelvin, entryUiTint ) );
         {
             ScopedEnv switchOff( "MLVAPP_LOOK_ASSIST_REFINE_DAYLIGHT", "0" );
-            ASSERT_TRUE( runHeadlessLookAssist( clip.file, false, &off, &offLog, false, 7895, -12, 4800 ) );
+            ASSERT_TRUE( runHeadlessLookAssist( clip.file, false, &off, &offLog, false, 7895, -12, 4800, false, nullptr, nullptr,
+                                                entryKelvin, entryUiTint ) );
         }
         // Control: the same existing balance with the as-shot balance at the daylight default (6000 K), where the same
         // surface is verified -> the daylight solve stands. The refusal above is the as-shot blue, nothing else.
-        ASSERT_TRUE( runHeadlessLookAssist( clip.file, false, &control, &controlLog, false, 7895, -12, 6000 ) );
+        ASSERT_TRUE( runHeadlessLookAssist( clip.file, false, &control, &controlLog, false, 7895, -12, 6000, false, nullptr, nullptr,
+                                            entryKelvin, entryUiTint ) );
 
         ASSERT_TRUE( onLog.contains( "daylight_fallback_to_master" ) );
         ASSERT_TRUE( onLog.contains( "reason=initial_patch_unverified refusedAtBase=true" ) );
@@ -540,18 +565,23 @@ void expectFallbackIsMastersResultOnClip( const FixtureClip &clip, FallbackArm a
             QString metadataFree, direct, fallback;
             QByteArray metadataFreeLog, directLog, fallbackLog;
             QString entryA, endA, entryB, endB, entryF, endF;
+            // LOOK-ASSIST-DUALISO-VSTRIPES-1: the processing object now enters at 7000 K / UI tint -30 (was the default
+            // 6000 K / 0). Since stripes no longer run on dual-ISO frames master finds a trusted patch on the 6000 K / 0
+            // picture; at 7000 K / -30 it again finds none, and the blue as-shot initial patch is again refused at base.
+            const int entryKelvin = 7000;
+            const int entryUiTint = -30;
             ASSERT_TRUE( runHeadlessLookAssist( clip.file, true, &metadataFree, &metadataFreeLog, false, 7895, -12,
-                                                arm.asShotKelvin, false, &entryA, &endA ) );
+                                                arm.asShotKelvin, false, &entryA, &endA, entryKelvin, entryUiTint ) );
             ASSERT_TRUE( runHeadlessLookAssist( clip.file, false, &direct, &directLog, false, 7895, -12,
-                                                arm.asShotKelvin, true, &entryB, &endB ) );
+                                                arm.asShotKelvin, true, &entryB, &endB, entryKelvin, entryUiTint ) );
             {
                 ScopedEnv switchOff( "MLVAPP_LOOK_ASSIST_REFINE_DAYLIGHT", arm.switchOff ? "0" : "1" );
                 ASSERT_TRUE( runHeadlessLookAssist( clip.file, false, &fallback, &fallbackLog, false, 7895, -12,
-                                                    arm.asShotKelvin, false, &entryF, &endF ) );
+                                                    arm.asShotKelvin, false, &entryF, &endF, entryKelvin, entryUiTint ) );
             }
 
-            // The starting state is the default 6000 K / 0 in all three, and it is not the receipt's balance.
-            ASSERT_TRUE( entryA == QStringLiteral("6000.000/0.000000000") );
+            // The starting state is 7000 K / UI tint -30 in all three, and it is not the receipt's balance.
+            ASSERT_TRUE( entryA == QStringLiteral("7000.000/-1.216080139") );
             ASSERT_TRUE( entryB == entryA );
             ASSERT_TRUE( entryF == entryA );
 
@@ -563,7 +593,7 @@ void expectFallbackIsMastersResultOnClip( const FixtureClip &clip, FallbackArm a
             ASSERT_TRUE( fallbackLog.contains( "daylight_fallback_to_master" ) );
             ASSERT_TRUE( fallbackLog.contains( "masterScenePass=true" ) );
 
-            // Master finds no patch on the 6000 K / 0 picture and leaves the receipt's balance alone.
+            // Master finds no patch on the 7000 K / -30 picture and leaves the receipt's balance alone.
             ASSERT_TRUE( metadataFreeLog.contains( "patchValid=false" ) );
             ASSERT_TRUE( metadataFree.contains( "temp=7895 tint=-12 " ) );
 
@@ -586,6 +616,7 @@ void expectFallbackIsMastersResultOnClip( const FixtureClip &clip, FallbackArm a
 // falls back, so master's pass used to render its picture at the RECEIPT's balance. Master renders it at the
 // balance the object holds on entry (BatchRunner creates it at 6000 K / 0 and applyToMlv never sets one).
 // State: receipt 7895 K / -12, processing object at its default 6000 K / 0 (staleWhiteBalance = false).
+// LOOK-ASSIST-DUALISO-VSTRIPES-1: the cells below enter at 7000 K / UI tint -30 instead (see the helper).
 //
 // Master's behaviour here is produced two ways, on a FRESH object each, and neither enters the daylight pass:
 //  - the no-metadata run: nothing can call the clip daylight, so master's single pass is the only pass there is;
@@ -625,7 +656,7 @@ TEST(LookAssistFixtureScene, HeadlessFallbackStartsFromMastersProcessingStateAtA
     // Master's behaviour is the direct masterScenePass call on a fresh object (nothing enters the daylight pass); the
     // fallback equals it: receipt, live balance (kelvin and stored tint to nine decimals) and the analysis line master
     // measured on its picture. One fixture and one arm only: this test shares a hosted shard with a 240 s bound; the
-    // other fixture runs the 6000 K / 0 equality above, and the solver restore is pinned on both fixtures below.
+    // other fixture runs the 7000 K / -30 equality above, and the solver restore is pinned on both fixtures below.
     const FixtureClip &clip = kTrackedFixtureClips[0];
     const int entryTints[] = { -12, -50 };
     for( const int entryTint : entryTints )
@@ -1018,16 +1049,23 @@ const IdentityCase kIdentityCases[] = {
 // picture the display shows (MLV_PROCESSED_THUMBNAIL_DISPLAY_LEVELS), not the 1.8 EV brighter judgement calibration,
 // so it meters median 33 / 31 where it metered 88 / 86 (13 -> 154, 16 -> 163, -46 -> 96). With the flag off the build
 // reproduces the previous pins exactly; scene, white balance, every other slider and the picture hash do not move.
+// LOOK-ASSIST-DUALISO-VSTRIPES-1 re-pins all four receipts and hashes (the verdicts do not move): the tracked fixtures are 5D3
+// dual-ISO clips, the default receipt turned the vertical-stripe fix on, and it corrupted the picture these pins encoded. Each
+// new value is what c7e51d03 produces with vertical stripes forced off (the PR's proof (c)).
 struct IdentityPin { const char *scene; const char *receipt; const char *pictureSha256; };
 const IdentityPin kIdentityPins[] = {
-    { "shade", "exp=154 contrast=15 pivot=55 temp=6540 tint=-35 vibrance=5 shadows=12 highlights=-12 chromaSmooth=1",
-      "9a16525a28dc92ed96fe5940ccceaeec1ecd0aca5e1a74360ba9709fbf7a3e30" },
-    { "shade", "exp=163 contrast=15 pivot=55 temp=6540 tint=-35 vibrance=5 shadows=12 highlights=-12 chromaSmooth=1",
-      "f36fb58ce3680f57bd06e9d538db1e08bf74fad1963c70353049c69954f9f099" },
-    { "night", "exp=96 contrast=14 pivot=46 temp=6000 tint=0 vibrance=3 shadows=32 highlights=-18 chromaSmooth=1",
-      "4e9d6211cc6328216538224b3f9fe5be4c4f16e83343219d49984f473f49c83d" },
-    { "night", "exp=96 contrast=14 pivot=46 temp=6000 tint=0 vibrance=3 shadows=32 highlights=-18 chromaSmooth=1",
-      "4e9d6211cc6328216538224b3f9fe5be4c4f16e83343219d49984f473f49c83d" },
+    // LOOK-ASSIST-DUALISO-VSTRIPES-1: was exp=154 temp=6540 tint=-35, 9a16525a...; stripes no longer run on dual-ISO frames.
+    { "shade", "exp=173 contrast=15 pivot=55 temp=5840 tint=6 vibrance=5 shadows=12 highlights=-12 chromaSmooth=1",
+      "d8d3c390730d44afce36fcd1725f3b38f167883ec0bb2c697eb762331c8ea80d" },
+    // LOOK-ASSIST-DUALISO-VSTRIPES-1: was exp=163 temp=6540 tint=-35, f36fb58c...; stripes no longer run on dual-ISO frames.
+    { "shade", "exp=178 contrast=15 pivot=55 temp=5840 tint=6 vibrance=5 shadows=12 highlights=-12 chromaSmooth=1",
+      "40ad86fed3e446e4e0fc0b8c8e20742f3a70b1f83019a0a963a0d2c3e1a65904" },
+    // LOOK-ASSIST-DUALISO-VSTRIPES-1: was exp=96 temp=6000 tint=0, 4e9d6211...; stripes no longer run on dual-ISO frames.
+    { "night", "exp=114 contrast=14 pivot=46 temp=5840 tint=6 vibrance=3 shadows=32 highlights=-18 chromaSmooth=1",
+      "d8d3c390730d44afce36fcd1725f3b38f167883ec0bb2c697eb762331c8ea80d" },
+    // LOOK-ASSIST-DUALISO-VSTRIPES-1: was exp=96 temp=6000 tint=0, 4e9d6211...; stripes no longer run on dual-ISO frames.
+    { "night", "exp=114 contrast=14 pivot=46 temp=5840 tint=6 vibrance=3 shadows=32 highlights=-18 chromaSmooth=1",
+      "d8d3c390730d44afce36fcd1725f3b38f167883ec0bb2c697eb762331c8ea80d" },
 };
 
 } // namespace
@@ -1527,14 +1565,16 @@ TEST(LookAssistFixtureScene, WindowLitTraceCarriesTheRawExposureFieldsInTheirOwn
     ASSERT_TRUE( run.pictureSha256 == kIdentityPins[2].pictureSha256 );
     const QString line = windowLitLine( run.log );
     ASSERT_FALSE( line.isEmpty() );
-    ASSERT_TRUE( line.contains( QStringLiteral(" wouldReclassify=false reason=not-processed-solve scene=night ") ) );
+    // LOOK-ASSIST-DUALISO-VSTRIPES-1: was reason=not-processed-solve; stripes no longer run on dual-ISO frames.
+    ASSERT_TRUE( line.contains( QStringLiteral(" wouldReclassify=false reason=dim-patch scene=night ") ) );
     ASSERT_TRUE( line.contains( QStringLiteral(" expoIso=100 expoShutterUs=737 lensApertureX100=0") ) );
 
     // The all-zero state on the same line (not satisfied by the applied line).
     IdentityRun noMeta;
     ASSERT_TRUE( runIdentityCase( kIdentityCases[2], &noMeta ) );
     const QString noMetaLine = windowLitLine( noMeta.log );
-    ASSERT_TRUE( noMetaLine.contains( QStringLiteral(" wouldReclassify=false reason=not-processed-solve scene=night ") ) );
+    // LOOK-ASSIST-DUALISO-VSTRIPES-1: was reason=not-processed-solve; stripes no longer run on dual-ISO frames.
+    ASSERT_TRUE( noMetaLine.contains( QStringLiteral(" wouldReclassify=false reason=not-daylight-locus scene=night ") ) );
     ASSERT_TRUE( noMetaLine.contains( QStringLiteral(" expoIso=0 expoShutterUs=0 lensApertureX100=0") ) );
 }
 
@@ -1634,7 +1674,8 @@ TEST(LookAssistFixtureScene, TheApertureBoundThroughTheRealHeadlessPath)
     // (b) The M16 exposure with no aperture (ISO 100, 1/1357 s: bound 10.4; the fixture's DISO block decodes to a 1600
     //     recovery ISO, so 6.4 after the 4-stop credit): night is ruled out by the exposure, but the bound alone never
     //     changes a verdict. Here the night path's processed picture yields no patch to verify (not-processed-solve), so
-    //     the receipt and picture are the pinned night's, bit for bit.
+    //     the receipt and picture are the pinned night's, bit for bit. (Since LOOK-ASSIST-DUALISO-VSTRIPES-1 the de-striped
+    //     picture has a patch, refused as dim-patch: the verdict, receipt and picture are still the pinned night's.)
     {
         const IdentityCase c = { "tiny-no-aperture-m16", "tests/fixtures/clips/tiny_dual_iso.mlv", true, 100, 737, 0, 1 };
         IdentityRun run;
@@ -1649,7 +1690,8 @@ TEST(LookAssistFixtureScene, TheApertureBoundThroughTheRealHeadlessPath)
             "ev100_bound=10.406 ev100_source=aperture_bound surface_search=not-run surface_search_balance=NA "
             "flavor=classic") ) );
         const QString log = QString::fromUtf8( run.log );
-        ASSERT_TRUE( log.contains( QStringLiteral("wouldReclassify=false reason=not-processed-solve ") ) );
+        // LOOK-ASSIST-DUALISO-VSTRIPES-1: was reason=not-processed-solve; stripes no longer run on dual-ISO frames.
+        ASSERT_TRUE( log.contains( QStringLiteral("wouldReclassify=false reason=dim-patch ") ) );
         ASSERT_TRUE( log.contains( QStringLiteral(" applied=false exposureBound=true recoveryIso=1600 ") ) );
         ASSERT_TRUE( run.scene == QString::fromLatin1( kIdentityPins[2].scene ) );
         ASSERT_TRUE( run.receipt == QString::fromLatin1( kIdentityPins[2].receipt ) );

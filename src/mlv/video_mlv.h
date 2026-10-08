@@ -218,6 +218,39 @@ int getMlvProcessedFrame8ScaledFromReconnedRaw16(mlvObject_t * video,
                                                  int scaleFactor,
                                                  int allowScale1StateDebayer);
 
+/* CPU-DEBAYERED16-REUSE-PHASE3-RECON-1: the debayered-16 render of a frame whose
+ * full-resolution llrawproc (dual-ISO recon included) the phase-3 recon worker
+ * already ran. On entry the first Width * Height uint16 words of
+ * reconnedRawScratch hold that reconstructed Bayer; the buffer must be Width *
+ * Height * sizeof(float) and is clobbered. Writes Width * Height * 3 uint16 to
+ * outputFrame, which must not overlap the scratch. Runs exactly the debayer tail
+ * getMlvRawFrameDebayered runs after its own decode + llrawproc, with no decode
+ * and no llrawproc, and never reads or writes the single-frame or AMaZE frame
+ * caches (export, the WB picker and Look Assist's WB solve read those). Returns
+ * 1 on success, 0 (nothing written) when the arguments are invalid or a frame
+ * cache could serve this frame (mlvRawDebayerCacheMayServeFrame).
+ * reconHqDualIso is llrpHQDualIso as the recon worker ran (r3): it selects the
+ * bit shift, and is never re-read from the live object here. */
+int getMlvRawFrameDebayeredFromReconnedRaw16(mlvObject_t * video,
+                                             uint64_t frameIndex,
+                                             float * reconnedRawScratch,
+                                             uint16_t * outputFrame,
+                                             int reconHqDualIso);
+/* Nonzero when getMlvRawFrameDebayered could serve frameIndex from the AMaZE
+ * frame cache: the cache is running, or this frame is already cached. */
+int mlvRawDebayerCacheMayServeFrame(mlvObject_t * video, uint64_t frameIndex);
+/* CPU-DEBAYERED16-REUSE-PHASE3-RECON-1 r2: a fingerprint of every setting that
+ * selects what llrawproc makes of a frame and the bit shift the debayer applies
+ * to its output: the raw levels and bit depth, the llrawproc settings the
+ * processed-frame cache keys on (fix_raw, dual-ISO mode and validity, chroma
+ * smooth, ...), the dual-ISO pattern, EV correction and black delta (r3; recon
+ * inputs that recon also publishes, so a clip's first recon may move them), and
+ * the dark frame and pixel maps by version. The dng_* levels recon publishes are
+ * excluded. Equal
+ * fingerprints before and after a recon and at its consumption mean the recon
+ * was made under the settings the render would run llrawproc with. */
+uint64_t getMlvLlrawprocSettingsFingerprint(mlvObject_t * video);
+
 /* CPU-DUALISO-AT-PREVIEW-SCALE-1: phase-3 dual-ISO reconstruction at the
  * playback preview scale. The recon worker reconstructs a Bayer shrunk by the
  * Phase 4B kernels (pl_downsample_bayer_to_bayer_{2,4,8}x keep whole 4-row ISO
@@ -233,7 +266,14 @@ typedef struct
     int reducedHeight;
     int fullResFixes;       /* focus/bad pixel/stripes/pattern run at full res first */
     const char * reason;    /* "none" when reduced, otherwise why full resolution */
+    int phaseTentShrink;    /* 1: shrink with pl_downsample_bayer_to_bayer_phase_tent (GPU
+                             * plan only); 0: the Phase 4B decimators (CPU plan) */
 } mlvDualIsoPreviewScaleRecon_t;
+
+/* Process-wide counters of the phase-tent shrink (successful shrinks and their summed
+ * downsample time in microseconds), for the play-stop summary. */
+uint64_t mlvDualIsoPhaseTentShrinkFrames(void);
+uint64_t mlvDualIsoPhaseTentShrinkMicros(void);
 
 /* Decide the recon scale for `requestedScale`. Returns 1 when the reduced path
  * may run (plan->scale > 1), 0 when the frame must be reconstructed at full
@@ -514,6 +554,15 @@ void get_mlv_raw_frame_debayered_isolated_analysis(mlvObject_t * video,
                                                    float * temp_memory,
                                                    uint16_t * output_frame,
                                                    int debayer_type ); /* Debayer type: 0=bilinear 1=amaze */
+/* The tail both of the above run after their decode + llrawproc (see frame_caching.c). */
+int get_mlv_raw_frame_debayered_from_processed_raw_u16(mlvObject_t * video,
+                                                       uint64_t frame_index,
+                                                       float * temp_memory,
+                                                       uint16_t * output_frame,
+                                                       int debayer_type,
+                                                       int bit_shift,
+                                                       int debayer_threads,
+                                                       const char * capture_path_label);
 /* Cache-free isolated-analysis source for reduced thumbnails. This decodes and
  * runs llrawproc at full resolution through the direct path, then emits a
  * reduced RGB16 frame via Bayer->RGB block averaging. Returns 1 on success. */

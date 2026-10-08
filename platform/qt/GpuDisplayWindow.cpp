@@ -7,7 +7,9 @@
 
 #include "GpuDisplayWindow.h"
 #include "GpuDebayer.h"
+#include "PlaybackScaling.h"
 #include "debug/StageTiming.h"
+#include "../../src/mlv_include.h"
 
 #include <QGraphicsView>
 #include <QWidget>
@@ -156,8 +158,25 @@ QSize GpuDisplayWindow::displaySize()
     return win ? win->size() : QSize();
 }
 
+namespace
+{
+// PLAYBACK-CUDA-HONOUR-SCALE-1 r3: the play-stop reduced H-Nyquist summary's session
+// and its counter baselines (GpuDebayer's counters are process-wide).
+quint64 g_reducedHnyquistSessionId = 0;
+quint64 g_reducedHnyquistFramesAtBegin = 0;
+quint64 g_reducedHnyquistRefusalsAtBegin = 0;
+// r4: the phase-tent shrink's counters (video_mlv.c, process-wide) at session begin.
+quint64 g_phaseTentFramesAtBegin = 0;
+quint64 g_phaseTentMicrosAtBegin = 0;
+}
+
 void GpuDisplayWindow::resetSwapTelemetry(quint64 sessionId)
 {
+    g_reducedHnyquistSessionId = sessionId;
+    g_reducedHnyquistFramesAtBegin = gpuAmazeDebayerReducedHnyquistFrames();
+    g_reducedHnyquistRefusalsAtBegin = gpuAmazeDebayerReducedHnyquistRefusals();
+    g_phaseTentFramesAtBegin = mlvDualIsoPhaseTentShrinkFrames();
+    g_phaseTentMicrosAtBegin = mlvDualIsoPhaseTentShrinkMicros();
     // Telemetry off: no clock sample, no state change -- the instrument does no work at all
     // (CUDA-PERF-DISPLAY-IDENTITY-3, sol on #161).
     if ( !swapTelemetryEnabled() ) return;
@@ -175,6 +194,26 @@ void GpuDisplayWindow::resetSwapTelemetry(quint64 sessionId)
 
 GpuWindowSwapTelemetrySnapshot GpuDisplayWindow::swapTelemetrySnapshot()
 {
+    // PLAYBACK-CUDA-HONOUR-SCALE-1 r3: called once at play stop by the smoke summary,
+    // for the window and the viewport routes alike, whatever the swap telemetry does.
+    qInfo().noquote()
+        << QStringLiteral(
+               "playback_smoke.reduced_hnyquist_summary session=%1 "
+               "reduced_hnyquist_frames=%2 reduced_hnyquist_refusals=%3" )
+               .arg( g_reducedHnyquistSessionId )
+               .arg( gpuAmazeDebayerReducedHnyquistFrames() - g_reducedHnyquistFramesAtBegin )
+               .arg( gpuAmazeDebayerReducedHnyquistRefusals() - g_reducedHnyquistRefusalsAtBegin );
+    // r4: a new line, so no parsed format string changes.
+    const quint64 tentFrames = mlvDualIsoPhaseTentShrinkFrames() - g_phaseTentFramesAtBegin;
+    const quint64 tentMicros = mlvDualIsoPhaseTentShrinkMicros() - g_phaseTentMicrosAtBegin;
+    qInfo().noquote()
+        << QStringLiteral(
+               "playback_smoke.reduced_phase_tent_summary session=%1 "
+               "reduced_phase_tent_frames=%2 reduced_shrink_ms=%3 hnyquist_on=%4" )
+               .arg( g_reducedHnyquistSessionId )
+               .arg( tentFrames )
+               .arg( tentFrames ? double(tentMicros) / 1000.0 / double(tentFrames) : 0.0, 0, 'f', 3 )
+               .arg( kReducedHnyquistOnReducedPresents );
     // Telemetry off: return the default (telemetryEnabled=false) snapshot before any clock sample
     // or state change; no session was ever opened by resetSwapTelemetry either.
     if ( !swapTelemetryEnabled() ) return GpuWindowSwapTelemetrySnapshot();
@@ -660,6 +699,21 @@ bool GpuDisplayWindow::setPresentedGpuPlaybackReconAmazePostWbTexture(
 
     const int texWidth = state->width;
     const int texHeight = state->height;
+    /* PLAYBACK-CUDA-HONOUR-SCALE-1 r3: a reduced (x2/x4) recon texture gets AMaZE's
+     * horizontal Nyquist zero while kReducedHnyquistOnReducedPresents is 1 (r4: 0, the
+     * phase-tent shrink fixes the comb at its source). MainWindow hands this window the
+     * clip's display size, so the reduced test is the display-size form of
+     * playbackReconTextureIsReduced. A present that wants the filter without the AMaZE
+     * symbol is refused before any GL work, so the caller's fallback takes over. */
+    const bool reducedTexture =
+        playbackReconTextureIsReducedForDisplaySize(texWidth, texHeight, displayWidth, displayHeight);
+    const bool reducedHnyquist = playbackReducedHnyquistWanted(reducedTexture);
+    if ( playbackReducedHnyquistPresentRefused(
+             reducedTexture, !reducedHnyquist || gpuAmazeDebayerReducedHnyquistAvailable()) )
+    {
+        gpuAmazeDebayerNoteReducedHnyquistRefusal();
+        return fail(gpuAmazeDebayerReducedHnyquistMissingReason());
+    }
     /* Shared with GpuDisplayViewport's equivalent gate and unit-tested
      * without a GUI harness -- see llrpGpuPlaybackReconRetainedDeviceBufferValid()
      * (llrawproc.h). Rejects the retained device buffer on a frame-id
@@ -827,7 +881,8 @@ bool GpuDisplayWindow::setPresentedGpuPlaybackReconAmazePostWbTexture(
                     wbMultipliers,
                     &directAmazeReason,
                     &directAmazeRenderer,
-                    &directAmazeTiming);
+                    &directAmazeTiming,
+                    reducedHnyquist);
             const double directAmazeWallMs = elapsedMs() - directAmazeStartMs;
             if ( directAmazeOk )
             {
@@ -907,7 +962,8 @@ bool GpuDisplayWindow::setPresentedGpuPlaybackReconAmazePostWbTexture(
                 wbMultipliers,
                 &amazeReason,
                 &amazeRenderer,
-                &amazeTiming);
+                &amazeTiming,
+                reducedHnyquist);
         amazeWallMs = elapsedMs() - amazeStartMs;
         if ( reconOk && amazeOk )
         {
@@ -944,6 +1000,7 @@ bool GpuDisplayWindow::setPresentedGpuPlaybackReconAmazePostWbTexture(
             "GPU window playback recon AMaZE texture handoff failed (recon_rc=%1)").arg(rc));
     }
 
+    if ( reducedHnyquist ) gpuAmazeDebayerNoteReducedHnyquistFrame();
     const double postStartMs = elapsedMs();
     if ( swapTelemetryEnabled() ) noteSupersededBeforePaint(presentationSerial);
     m_pendingImage = QImage();

@@ -102,6 +102,58 @@ inline PlaybackPresentationScaleResampler playbackChoosePresentationScaleResampl
     return PlaybackPresentationScaleResampler::Bilinear;
 }
 
+/* PLAYBACK-CUDA-HONOUR-SCALE-1 r3: a recon texture is the reduced (x2/x4) route's when
+ * it is smaller than the clip on both axes; x1, export, paused and scrub textures are
+ * the clip's own size. Reduced textures get the AMaZE H-Nyquist filter. */
+inline bool playbackReconTextureIsReduced(int textureWidth,
+                                          int textureHeight,
+                                          int clipWidth,
+                                          int clipHeight)
+{
+    return textureWidth > 0 && textureHeight > 0
+        && textureWidth < clipWidth && textureHeight < clipHeight;
+}
+
+/* The GPU window is handed the clip's DISPLAY size (clip x stretch, see
+ * mainWindowGpuTexturePresentDisplaySize), not the clip size. Display stretch is >= 1 on
+ * both axes (H 1-2, x3 for the 1/3 vertical setting; V 1, 1.667 or 3) and a reduced
+ * texture is at most half the clip on each axis (+1 for odd dims), so the clip-sized
+ * bound here is half the display size. A x1 clip stretched >= 2 on BOTH axes (H 2.0
+ * with V 3.0) would read as reduced. */
+inline bool playbackReconTextureIsReducedForDisplaySize(int textureWidth,
+                                                        int textureHeight,
+                                                        int displayWidth,
+                                                        int displayHeight)
+{
+    if( displayWidth <= 0 || displayHeight <= 0 ) return false;
+    return playbackReconTextureIsReduced(textureWidth,
+                                         textureHeight,
+                                         displayWidth / 2 + 2,
+                                         displayHeight / 2 + 2);
+}
+
+/* PLAYBACK-CUDA-HONOUR-SCALE-1 r4: the reduced route now shrinks on phase-correct tent
+ * bins (pl_downsample_bayer_to_bayer_phase_tent), which removes the comb at its source,
+ * so the r3 AMaZE H-Nyquist filter is off by default. This one constant sets it for
+ * every reduced present; at 0 the live AMaZE run keeps its direct RGBA store. */
+constexpr int kReducedHnyquistOnReducedPresents = 0;
+
+inline bool playbackReducedHnyquistWanted(bool reducedTexture,
+                                          int hnyquistOn = kReducedHnyquistOnReducedPresents)
+{
+    return hnyquistOn != 0 && reducedTexture;
+}
+
+/* A reduced present that wants the H-Nyquist filter on an AMaZE DLL without its symbol is
+ * refused (the caller's fallback takes over), so a reduced texture is never shown without
+ * the filter it was meant to get. With the filter off no present is refused. */
+inline bool playbackReducedHnyquistPresentRefused(bool reducedTexture,
+                                                  bool hnyquistSymbolAvailable,
+                                                  int hnyquistOn = kReducedHnyquistOnReducedPresents)
+{
+    return playbackReducedHnyquistWanted(reducedTexture, hnyquistOn) && !hnyquistSymbolAvailable;
+}
+
 inline bool playbackRgb8RowLooksLikeUniformTopMagentaBand(const uint8_t *row,
                                                           int width)
 {

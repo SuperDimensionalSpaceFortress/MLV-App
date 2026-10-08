@@ -214,7 +214,7 @@ try {
 # overall: declared seated-unleased is intentional; mismatched or undeclared stale seats degrade.
 $adopted = $laneStates | Where-Object { $_.registered }
 $anyDark = [bool]($adopted | Where-Object { $_.state -in @('MISSING','DARK','DISPLACED','LEASE-UNPARSEABLE') })
-$freshest = ($journalAges.Values | Where-Object { $_ -ne $null } | Measure-Object -Minimum).Minimum
+$freshest = ($journalAges.Values | Where-Object { $null -ne $_ } | Measure-Object -Minimum).Minimum
 $silentWhileOthersMove = [bool]($laneStates | Where-Object {
     $_.journalAgeMin -gt 90 -and
     $freshest -lt 30 -and

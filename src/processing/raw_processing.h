@@ -82,6 +82,26 @@ int processingExpandShadowsHighlightsQuarterBlur(const uint16_t * quarter,
                                                  int frameWidth,
                                                  int frameHeight,
                                                  int threads);
+/* CPU-PLAYBACK-PREP-WORKER-BUILD-1: the shadows/highlights quarter lane's own
+ * integer RGB16 box reduction (factor 2: one 2x2 box; factor 4: two 2x2 box
+ * stages), exported for the CPU playback prep worker's reduced-scale path.
+ * dst is (src_w / factor) x (src_h / factor). Returns 0 for any other factor
+ * or for dims not divisible by it. */
+int processingRgbU16BoxDownsample(const uint16_t * src,
+                                  uint16_t * dst,
+                                  int src_w,
+                                  int src_h,
+                                  int factor,
+                                  int threads);
+/* One 2x bilinear upsample stage of processingExpandShadowsHighlightsQuarterBlur
+ * (the same function, not a copy): quarter -> half for the x2 reduced path. */
+int processingRgbU16Upsample2xBilinear(const uint16_t * src,
+                                       int src_w,
+                                       int src_h,
+                                       uint16_t * dst,
+                                       int dst_w,
+                                       int dst_h,
+                                       int threads);
 /* Test seams: process-global call counts (not timings). */
 unsigned long processingDebugFullInitCount(void);        /* initProcessingObject() calls */
 unsigned long processingDebugFinalMatrixPrintCount(void); /* processing_update_matrices printMatrix call site */

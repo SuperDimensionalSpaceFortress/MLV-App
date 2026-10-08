@@ -63,6 +63,17 @@ validation and commit. Append subsequent decisions or create a new round; never
 rewrite a failed receipt into success. Promote reusable prevention into tracked
 instructions, tests, or workflow documentation in the same work block.
 
+## Recall before diagnosis
+
+Before diagnosing a failure, stall, flake or host symptom, the hub alone runs
+`py -3 tools/doctrine/doctrine_recall.py "<symptom words or a pasted log tail>"` and cites the
+top hit in the incident note, or writes `recall: no prior art`. A remediation lane that hits a
+symptom reports it and does not run the tool; the hub runs recall and passes any hit to the
+lane through the Compose brief. A hit counts as one repair hypothesis only after its own
+Re-derive command reproduces the symptom here. Lanes get doctrine only through the Compose
+brief (R15.2), and recall output is never pasted into a lane prompt automatically. See
+[doctrine-consumer.md](doctrine-consumer.md#recall-before-diagnosis).
+
 ## Authority and evidence remain gates
 
 Remediation must satisfy existing gates. It never authorizes skipping tests,

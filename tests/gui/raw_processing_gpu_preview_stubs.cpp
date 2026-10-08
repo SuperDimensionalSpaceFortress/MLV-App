@@ -144,3 +144,15 @@ extern "C" int llrpGpuPlaybackReconCopyLastDeviceBayer16ToGlTexture(
     }
     return 0;
 }
+
+/* PLAYBACK-CUDA-HONOUR-SCALE-1 r4: GpuDisplayWindow.cpp's play-stop summary reads the phase-tent
+ * shrink counters (video_mlv.c); the GUI harness links no engine, so no shrink ever ran. */
+extern "C" uint64_t mlvDualIsoPhaseTentShrinkFrames(void)
+{
+    return 0;
+}
+
+extern "C" uint64_t mlvDualIsoPhaseTentShrinkMicros(void)
+{
+    return 0;
+}

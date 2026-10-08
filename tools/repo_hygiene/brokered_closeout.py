@@ -191,11 +191,17 @@ def work_block_commit_subject(manifest: Optional[Dict[str, Any]]) -> str:
     return ""
 
 
+def nul_separated_paths(stdout: str) -> List[str]:
+    """Paths from a git path-list command run with `-z`. Without `-z` git quotes a non-ASCII path
+    (core.quotepath), so a prefix or equality test on the plain output misses it (bus de09cae)."""
+    return [normalize_rel(part) for part in stdout.split("\0") if normalize_rel(part)]
+
+
 def commit_changed_paths(repo_root: Path, commit_hash: str) -> List[str]:
-    result = run_git(repo_root, ["diff-tree", "--no-commit-id", "--name-only", "-r", commit_hash])
+    result = run_git(repo_root, ["diff-tree", "--no-commit-id", "--name-only", "-z", "-r", commit_hash])
     if result.returncode != 0:
         return []
-    return sorted({normalize_rel(line) for line in result.stdout.splitlines() if normalize_rel(line)})
+    return sorted(set(nul_separated_paths(result.stdout)))
 
 
 def closeout_evidence_paths_only(paths: Sequence[str]) -> bool:
@@ -1872,8 +1878,8 @@ def baseline_dirty_recovery_command(paths: Sequence[str]) -> str:
 
 def changed_paths_between(repo_root: Path, target_ref: str, feature_head: str) -> List[str]:
     base = git_stdout(repo_root, ["merge-base", target_ref, feature_head])
-    result = run_git(repo_root, ["diff", "--name-only", f"{base}..{feature_head}"], check=True)
-    return sorted({normalize_rel(line) for line in result.stdout.splitlines() if normalize_rel(line)})
+    result = run_git(repo_root, ["diff", "--name-only", "-z", f"{base}..{feature_head}"], check=True)
+    return sorted(set(nul_separated_paths(result.stdout)))
 
 
 def load_manifest(repo_root: Path, config: Dict[str, Any], work_block_id: str) -> Dict[str, Any]:
@@ -3190,6 +3196,8 @@ def run_bounded_closeout_process(
     env: Optional[Dict[str, str]] = None,
     cwd: Optional[Path] = None,
     resource_overrides: Optional[Dict[str, Any]] = None,
+    ready_file: Optional[Path] = None,
+    ready_wait_ms: int = 30000,
 ) -> Dict[str, Any]:
     repo_root = resolve_repo_root(repo_root_arg)
     process_cwd = cwd or repo_root
@@ -3227,6 +3235,26 @@ def run_bounded_closeout_process(
     for thread in threads:
         thread.start()
     reason: Optional[str] = None
+    ready_info: Optional[Dict[str, Any]] = None
+    if ready_file is not None:
+        # Opt-in start-after-ready: the timeout clock starts when ready_file appears, or when the bounded
+        # ready-wait expires, whichever is first. The wait also ends if the child exits or hits the output cap.
+        ready_wait_s = positive_int(ready_wait_ms, 30000) / 1000.0
+        ready_started = time.monotonic()
+        ready_deadline = ready_started + ready_wait_s
+        while (
+            process.poll() is None
+            and not stop_event.is_set()
+            and not ready_file.exists()
+            and time.monotonic() < ready_deadline
+        ):
+            time.sleep(0.02)
+        ready_info = {
+            "readyFile": str(ready_file),
+            "readyWaitMs": int(ready_wait_s * 1000),
+            "readyObserved": ready_file.exists(),
+            "readyWaitedSeconds": round(time.monotonic() - ready_started, 3),
+        }
     deadline = time.monotonic() + (timeout_ms / 1000.0)
     watchdog_policy = dict(resource_policy.get("cpuWatchdog") or {})
     cpu_watchdog_state: Dict[str, Any] = {
@@ -3342,6 +3370,8 @@ def run_bounded_closeout_process(
         "kill": kill_info,
         "recoveryCommand": recovery_command,
     }
+    if ready_info is not None:
+        base_result["readyHandshake"] = ready_info
     normalized = normalize_closeout_child_status(
         repo_root,
         config,
@@ -4120,15 +4150,15 @@ def evidence_missing_or_dirty(repo_root: Path, config: Dict[str, Any], work_bloc
     parent = git_stdout(repo_root, ["rev-parse", "HEAD^"], required=False)
     if not head or not parent:
         return paths
-    head_paths = {
-        normalize_rel(line)
-        for line in git_stdout(
-            repo_root,
-            ["diff-tree", "--no-commit-id", "--name-only", "-r", "HEAD"],
-            required=False,
-        ).splitlines()
-        if normalize_rel(line)
-    }
+    head_paths = set(
+        nul_separated_paths(
+            git_stdout(
+                repo_root,
+                ["diff-tree", "--no-commit-id", "--name-only", "-z", "-r", "HEAD"],
+                required=False,
+            )
+        )
+    )
     if head_paths != set(paths):
         return paths
     for path in paths:
@@ -7317,8 +7347,8 @@ def plan_checkpoint_owned_dirty_candidate(repo_root: Path, config: Dict[str, Any
 
 
 def staged_path_set(repo_root: Path) -> set[str]:
-    result = run_git(repo_root, ["diff", "--cached", "--name-only", "--"], check=True)
-    return {normalize_rel(line) for line in result.stdout.splitlines() if normalize_rel(line)}
+    result = run_git(repo_root, ["diff", "--cached", "--name-only", "-z", "--"], check=True)
+    return set(nul_separated_paths(result.stdout))
 
 
 def checkpoint_owned_work(repo_root_arg: Path, *, work_block_id: Optional[str] = None, message: str = "brokered closeout checkpoint") -> Dict[str, Any]:
@@ -7978,10 +8008,10 @@ def remediation_proof(config: Dict[str, Any], *, recommended_action: str, action
 
 
 def ref_delta_paths(repo_root: Path, left_ref: str, right_ref: str) -> List[str]:
-    result = run_git(repo_root, ["diff", "--name-only", f"{left_ref}..{right_ref}"])
+    result = run_git(repo_root, ["diff", "--name-only", "-z", f"{left_ref}..{right_ref}"])
     if result.returncode != 0:
         return []
-    return sorted({normalize_rel(line) for line in result.stdout.splitlines() if normalize_rel(line)})
+    return sorted(set(nul_separated_paths(result.stdout)))
 
 
 def merge_conflict_paths(stdout: str, stderr: str) -> List[str]:

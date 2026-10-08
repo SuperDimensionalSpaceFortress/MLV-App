@@ -454,7 +454,19 @@ function Write-Utf8NoBomAtomic([string]$Path, [string]$Content) {
     $tmp = "$Path.$([guid]::NewGuid().ToString('N')).tmp"
     try {
         [IO.File]::WriteAllText($tmp, $Content, [Text.UTF8Encoding]::new($false))
-        [IO.File]::Move($tmp, $Path, $true)
+        # CI-FLAKE-LANE-CONTAINMENT-OWNER-LOSS-MOVE-1: replacing a file that another process holds open
+        # without FILE_SHARE_DELETE (a polling reader such as Python's open(), an AV scan, the indexer)
+        # throws "Access to the path is denied" for as long as that handle lives. The lock is transient, and
+        # one unretried throw turned a healthy lane into exitCode -999 / state=failed (PR #232, #272, #289).
+        # Retry with a short bounded backoff; the final attempt's exception still propagates unchanged.
+        $retry = [Diagnostics.Stopwatch]::StartNew(); $delayMs = 10
+        while ($true) {
+            try { [IO.File]::Move($tmp, $Path, $true); break }
+            catch [UnauthorizedAccessException], [IO.IOException] {
+                if ($retry.ElapsedMilliseconds -ge 2000) { throw }
+                Start-Sleep -Milliseconds $delayMs; $delayMs = [Math]::Min($delayMs * 2, 200)
+            }
+        }
     } finally {
         if (Test-Path -LiteralPath $tmp) { Remove-Item -LiteralPath $tmp -Force }
     }

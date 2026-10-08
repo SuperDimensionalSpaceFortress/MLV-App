@@ -70,6 +70,12 @@ DELETE_CAPABLE_FUNCTIONS = {
     ("AttrCudaArtifacts.psm1", "New-AttrCudaOwnedRoot"): "takes -OwnedJournal (mandatory); an unproven standing tree is MOVED, not deleted",
     ("AttrCudaArtifacts.psm1", "Remove-AttrCudaFileByProof"): "the one function that sets a delete disposition; every parameter set makes a proof mandatory",
     ("AttrCudaArtifacts.psm1", "Remove-AttrCudaFileById"): "takes -FileId (mandatory): creator-recorded identity",
+    ("AttrCudaWorkRetention.psm1", "Invoke-AttrCudaWorkRetention"):
+        "takes -OwnedJournal (mandatory); a superseded sibling .work-<sha12> is touched only when its head published a "
+        "build.json and no file in it carries container magic or exceeds 2 GiB (a tracked fixture, matched by git blob id, "
+        "is the one exemption), and then only through Remove-AttrCudaTree with that build dir's own journal "
+        "(<sibling build dir>\\<leaf of -OwnedJournal>): no pathname or recursive delete, an unproven name is LEFT, and the "
+        "directory stands unless every entry was proven",
     ("AttrCudaOwnerFootage.psm1", "Send-AttrCudaOwnerFootagePartToStaging"):
         "deletes only the partial it created, by the identity read off its own CreateNew handle",
     ("AttrCudaOwnerFootage.psm1", "Test-AttrCudaSymlinkCapability"):

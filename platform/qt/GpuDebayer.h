@@ -60,6 +60,11 @@ bool gpuAmazeDebayerRenderPostWbGlTexture(const float * inputRawFrame,
                                           GpuAmazeDebayerBackendTiming * timing = nullptr);
 GpuAmazeDebayerBackendAvailability gpuAmazeDebayerProbeR16TextureBackend(void);
 void gpuAmazeDebayerResetR16TextureBackendResources(void);
+/* The two live runs below take reducedHnyquist: true for a reduced (x2/x4) recon
+ * texture (playbackReconTextureIsReduced, PlaybackScaling.h), false otherwise. The
+ * sticky AMaZE flag is set to it immediately before each run; true on a DLL without
+ * igpu_amaze_debayer_set_reduced_hnyquist fails with
+ * gpuAmazeDebayerReducedHnyquistMissingReason(). */
 bool gpuAmazeDebayerRenderPostWbGlTextureFromR16GlTexture(unsigned int inputR16GlTexture,
                                                           unsigned int outputRgba16GlTexture,
                                                           int width,
@@ -68,7 +73,8 @@ bool gpuAmazeDebayerRenderPostWbGlTextureFromR16GlTexture(unsigned int inputR16G
                                                           const double wbMultipliers[3],
                                                           QString * reason = nullptr,
                                                           QString * rendererDescription = nullptr,
-                                                          GpuAmazeDebayerBackendTiming * timing = nullptr);
+                                                          GpuAmazeDebayerBackendTiming * timing = nullptr,
+                                                          bool reducedHnyquist = false);
 bool gpuAmazeDebayerRenderPostWbGlTextureFromDeviceBayer16(const uint16_t *deviceBayer16,
                                                            unsigned int outputRgba16GlTexture,
                                                            int width,
@@ -77,7 +83,18 @@ bool gpuAmazeDebayerRenderPostWbGlTextureFromDeviceBayer16(const uint16_t *devic
                                                            const double wbMultipliers[3],
                                                            QString * reason = nullptr,
                                                            QString * rendererDescription = nullptr,
-                                                           GpuAmazeDebayerBackendTiming * timing = nullptr);
+                                                           GpuAmazeDebayerBackendTiming * timing = nullptr,
+                                                           bool reducedHnyquist = false);
+/* PLAYBACK-CUDA-HONOUR-SCALE-1 r3: the live AMaZE DLL exports the optional
+ * reduced H-Nyquist symbol. Presenters refuse a reduced texture present when it does
+ * not, with gpuAmazeDebayerReducedHnyquistMissingReason(). Process-wide counters for
+ * the play-stop smoke summary. */
+QString gpuAmazeDebayerReducedHnyquistMissingReason(void);
+bool gpuAmazeDebayerReducedHnyquistAvailable(void);
+void gpuAmazeDebayerNoteReducedHnyquistFrame(void);
+void gpuAmazeDebayerNoteReducedHnyquistRefusal(void);
+quint64 gpuAmazeDebayerReducedHnyquistFrames(void);
+quint64 gpuAmazeDebayerReducedHnyquistRefusals(void);
 bool gpuAmazeDebayerApplyGpuOffscreenPostWb(const float * inputRawFrame,
                                            uint16_t * outputRgb16,
                                            int width,

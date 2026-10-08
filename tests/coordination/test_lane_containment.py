@@ -1,4 +1,4 @@
-import hashlib, importlib.util, json, os, re, subprocess, sys, time
+import hashlib, importlib.util, json, os, re, subprocess, sys, threading, time
 from datetime import datetime
 from pathlib import Path
 
@@ -62,11 +62,13 @@ def assert_owner_absence_is_legitimate(containment, context):
                 f"absence) or it is unrecognised entirely: {context}")
 
 
-def wait_json(path, pred=lambda x: True, seconds=12):
+def wait_json(path, pred=lambda x: True, seconds=12, encoding="utf-8"):
+    # Polls for a PARSEABLE document: a file another process is still writing reads as empty or
+    # partial (JSONDecodeError at char 0), and that is "not yet", not a failure -- the deadline still is.
     end=time.monotonic()+seconds; last=None
     while time.monotonic()<end:
         try:
-            last=json.loads(path.read_text(encoding="utf-8"))
+            last=json.loads(path.read_text(encoding=encoding))
             if pred(last): return last
         except (FileNotFoundError,PermissionError,json.JSONDecodeError): pass
         time.sleep(.05)
@@ -100,10 +102,12 @@ def stop_exact(item):
 @pytest.fixture
 def fixture_tree(tmp_path):
     grand=tmp_path/"grand.ps1"; child=tmp_path/"child.ps1"; shim=tmp_path/"fake-claude.cmd"
-    grand.write_text("$me=Get-Process -Id $PID;@{pid=$PID;createdUtc=$me.StartTime.ToUniversalTime().ToString('o')}|ConvertTo-Json|Set-Content -Encoding utf8NoBOM $env:MLV_FIXTURE_GRAND;Start-Sleep -Seconds 60\n",encoding="ascii")
+    # State files (child.json / grand.json) appear only once COMPLETE: temp + move. Set-Content creates the file EMPTY before its first byte, so a reader -- or a lane timeout that kills the writer in that window -- saw a zero-length file (CI-FLAKE-LANE-CONTAINMENT-OWNER-LOSS-MOVE-1: JSONDecodeError at char 0).
+    # MLV_FIXTURE_GRAND_START_DELAY_MS (test-only, unset = no-op) stands in for a loaded host's slow pwsh cold start.
+    grand.write_text("if($env:MLV_FIXTURE_GRAND_START_DELAY_MS){Start-Sleep -Milliseconds ([int]$env:MLV_FIXTURE_GRAND_START_DELAY_MS)};$me=Get-Process -Id $PID;$t=$env:MLV_FIXTURE_GRAND+'.tmp';@{pid=$PID;createdUtc=$me.StartTime.ToUniversalTime().ToString('o')}|ConvertTo-Json|Set-Content -Encoding utf8NoBOM $t;Move-Item -LiteralPath $t -Destination $env:MLV_FIXTURE_GRAND;Start-Sleep -Seconds 60\n",encoding="ascii")
     child.write_text(r'''$ErrorActionPreference='Stop'
 $me=Get-Process -Id $PID
-@{pid=$PID;createdUtc=$me.StartTime.ToUniversalTime().ToString('o')}|ConvertTo-Json|Set-Content -Encoding utf8NoBOM $env:MLV_FIXTURE_CHILD
+$t=$env:MLV_FIXTURE_CHILD+'.tmp';@{pid=$PID;createdUtc=$me.StartTime.ToUniversalTime().ToString('o')}|ConvertTo-Json|Set-Content -Encoding utf8NoBOM $t;Move-Item -LiteralPath $t -Destination $env:MLV_FIXTURE_CHILD
 $args|ConvertTo-Json|Set-Content -Encoding utf8NoBOM $env:MLV_FIXTURE_ARGS
 $env:CLAUDE_CODE_EFFORT_LEVEL|Set-Content -Encoding utf8NoBOM $env:MLV_FIXTURE_EFFORT
 $env:CLAUDE_CODE_DISABLE_BACKGROUND_TASKS|Set-Content -Encoding utf8NoBOM $env:MLV_FIXTURE_BGTASKS
@@ -1072,14 +1076,14 @@ def test_post_run_tamper_check_reports_both_hook_copy_and_interpreter_tamper_tog
 
 
 def test_timeout_kills_owned_child_and_grandchild(fixture_tree):
-    cmd,env,receipt=prepare(fixture_tree,"timeout")
+    cmd,env,receipt=prepare_timeout_after_ready(fixture_tree)
     r=subprocess.run(cmd,env=env,text=True,capture_output=True,timeout=20)
     assert r.returncode==124,(r.stdout,r.stderr)
     # A timed-out run ENDED but did not complete its work (2026-09-14: complete means work evidence).
     q=json.loads(receipt.read_text(encoding="utf-8")); assert q["state"]=="ended-incomplete" and q["timedOut"]
     assert q["processEnded"] is True and q["complete"] is False
-    wait_absent(json.loads((fixture_tree["root"]/"child.json").read_text(encoding="utf-8-sig")))
-    wait_absent(json.loads((fixture_tree["root"]/"grand.json").read_text(encoding="utf-8-sig")))
+    wait_absent(wait_json(fixture_tree["root"]/"child.json",encoding="utf-8-sig"))
+    wait_absent(wait_json(fixture_tree["root"]/"grand.json",encoding="utf-8-sig"))
 
 
 def test_owner_loss_closes_job(fixture_tree):
@@ -1092,6 +1096,47 @@ def test_owner_loss_closes_job(fixture_tree):
     stop_exact(outer_identity); outer.wait(timeout=8)
     wait_absent(child); wait_absent(grand)
     q=json.loads(receipt.read_text(encoding="utf-8")); assert q["state"]=="running" and not q["complete"]
+
+
+# CI-FLAKE-LANE-CONTAINMENT-OWNER-LOSS-MOVE-1: a reader that holds the receipt open without
+# FILE_SHARE_DELETE (Python's open(), an AV scan, the indexer) makes [IO.File]::Move(tmp, dest, overwrite)
+# throw "Access to the path is denied" for as long as the handle lives. Unretried, that one throw became
+# exitCode -999 / state=failed on a healthy lane (PR #232, #272, #289). The hold is injected deterministically
+# just after the temp name is chosen, so it is live at the first Move attempt of EVERY receipt write, and a
+# timer thread releases it after 700 ms -- well inside the 2 s retry budget.
+_HOLD_RECEIPT_DESTINATION = (
+    "if ($Path -like '*.receipt.json' -and (Test-Path -LiteralPath $Path)) {\n"
+    "    if (-not ('MlvFixtureHold' -as [type])) { Add-Type -TypeDefinition 'using System; using System.IO; using System.Threading; "
+    "public class MlvFixtureHold { static readonly System.Collections.ArrayList Keep = new System.Collections.ArrayList(); "
+    "FileStream fs; Timer t; public MlvFixtureHold(string p, int ms) { fs = new FileStream(p, FileMode.Open, FileAccess.Read, FileShare.ReadWrite); "
+    "t = new Timer(delegate { fs.Dispose(); }, null, ms, Timeout.Infinite); lock (Keep) { Keep.Add(this); } } }' }\n"
+    "    [void][MlvFixtureHold]::new($Path, 700)\n"
+    "    [IO.File]::AppendAllText($env:MLV_FIXTURE_HOLD_LOG, \"held`n\")\n"
+    "}\n"
+)
+
+
+def test_receipt_write_retries_through_a_transient_destination_lock(fixture_tree):
+    def hold_destination(text):
+        anchor="    $tmp = \"$Path.$([guid]::NewGuid().ToString('N')).tmp\"\n"
+        assert text.count(anchor)==1
+        return text.replace(anchor,anchor+_HOLD_RECEIPT_DESTINATION)
+    cmd,env,receipt=prepare(fixture_tree,"normal",mutation=hold_destination)
+    hold_log=fixture_tree["root"]/"hold.log"; env["MLV_FIXTURE_HOLD_LOG"]=str(hold_log)
+    r=subprocess.run(cmd,env=env,text=True,capture_output=True,timeout=40)
+    assert r.returncode==0,(r.stdout,r.stderr)
+    # The injection really engaged on the running (x2) and final receipt writes, so a pass is not vacuous.
+    assert hold_log.read_text(encoding="utf-8").count("held")>=3
+    q=json.loads(receipt.read_text(encoding="utf-8"))
+    assert q["state"]=="complete" and q["exitCode"]==0 and q["complete"] is True
+
+
+def test_wait_json_waits_out_a_file_that_is_still_empty(tmp_path):
+    # The reader half: a not-yet-written (zero-length) document is "not yet", never a JSONDecodeError.
+    target=tmp_path/"state.json"; target.write_bytes(b"")
+    with pytest.raises(json.JSONDecodeError): json.loads(target.read_text(encoding="utf-8"))
+    threading.Timer(.4,lambda: target.write_text('{"pid": 7}',encoding="utf-8")).start()
+    assert wait_json(target,seconds=5)=={"pid":7}
 
 
 def test_assignment_failure_starts_no_provider(fixture_tree):
@@ -1510,18 +1555,56 @@ def test_setup_origin_and_expired_budget_are_deterministic(fixture_tree, elapsed
         assert not (fixture_tree["root"] / "child.json").exists()
 
 
-def test_final_receipt_io_failure_cannot_keep_descendants_alive(fixture_tree):
-    def fail_final_write(text):
-        old='Write-Utf8NoBomAtomic $rcptPath (($receipt | ConvertTo-Json -Depth 6))'
-        assert text.count(old)==1
-        return text.replace(old,"throw 'fixture-final-receipt-write-failed'")
-    cmd,env,receipt=prepare(fixture_tree,"timeout",mutation=fail_final_write)
+def _fail_final_receipt_write(text):
+    old='Write-Utf8NoBomAtomic $rcptPath (($receipt | ConvertTo-Json -Depth 6))'
+    assert text.count(old)==1
+    return text.replace(old,"throw 'fixture-final-receipt-write-failed'")
+
+
+# CI-FLAKE-LANE-CONTAINMENT-STARTUP-BUDGET-1: a fixed 3 s lane deadline also had to cover two nested pwsh cold
+# starts, so a loaded host killed the tree before the grandchild wrote grand.json and the test timed out
+# waiting for evidence that never existed (PR #303 run 37726495793). The deadline is now started by READINESS:
+# the copy of the launcher waits (bounded) for the grandchild's own state file, then lets a 1.5 s deadline run
+# out through the unchanged WaitForExit -> $timedOut -> job-close -> final-write path.
+def _deadline_after_descendants_ready(text):
+    old='$remainingMs = [math]::Max(0, [math]::Floor(($TimeoutSec * 1000.0) - $sw.Elapsed.TotalMilliseconds))'
+    assert text.count(old)==1
+    ready=("$readyWatch = [Diagnostics.Stopwatch]::StartNew(); "
+           "while (-not (Test-Path -LiteralPath $env:MLV_FIXTURE_GRAND) -and $readyWatch.Elapsed.TotalSeconds -lt 15) { Start-Sleep -Milliseconds 20 }\n"
+           "$remainingMs = 1500")
+    return text.replace(old,ready)
+
+
+def prepare_timeout_after_ready(tree, *extra_mutations):
+    def mutate(text):
+        for m in (_deadline_after_descendants_ready,)+extra_mutations: text=m(text)
+        return text
+    cmd,env,receipt=prepare(tree,"timeout",mutation=mutate)
+    # The wall-clock budget is no longer what triggers the timeout, only the launcher's own pre-wait gates
+    # (child start, prompt delivery) read it, so give those the same room every non-timeout fixture run has.
+    cmd[cmd.index("-TimeoutSec")+1]="30"
+    return cmd,env,receipt
+
+
+def _final_receipt_io_failure_run(fixture_tree, grand_start_delay_ms=None):
+    cmd,env,receipt=prepare_timeout_after_ready(fixture_tree,_fail_final_receipt_write)
+    if grand_start_delay_ms is not None: env["MLV_FIXTURE_GRAND_START_DELAY_MS"]=str(grand_start_delay_ms)
     r=subprocess.run(cmd,env=env,text=True,capture_output=True,timeout=20)
     assert r.returncode!=0 and 'fixture-final-receipt-write-failed' in r.stderr
     q=json.loads(receipt.read_text(encoding="utf-8"))
     assert q['state']=='running' and not q['complete']
-    wait_absent(json.loads((fixture_tree["root"]/"child.json").read_text(encoding="utf-8-sig")))
-    wait_absent(json.loads((fixture_tree["root"]/"grand.json").read_text(encoding="utf-8-sig")))
+    wait_absent(wait_json(fixture_tree["root"]/"child.json",encoding="utf-8-sig"))
+    wait_absent(wait_json(fixture_tree["root"]/"grand.json",encoding="utf-8-sig"))
+
+
+def test_final_receipt_io_failure_cannot_keep_descendants_alive(fixture_tree):
+    _final_receipt_io_failure_run(fixture_tree)
+
+
+# CI-FLAKE-LANE-CONTAINMENT-STARTUP-BUDGET-1: the grandchild's start is delayed past the old fixed 3 s lane
+# deadline, exactly what a loaded hosted runner's pwsh cold start does.
+def test_final_receipt_io_failure_cannot_keep_descendants_alive_when_descendant_start_is_slow(fixture_tree):
+    _final_receipt_io_failure_run(fixture_tree, grand_start_delay_ms=5000)
 
 
 def ledger_rows(root):

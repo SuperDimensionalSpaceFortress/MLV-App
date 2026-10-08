@@ -80,8 +80,9 @@ DISPLAY_MATRIX_LEGS = tuple(f"legs/m16-1243-display-{mode}-s{scale}.json" for sc
 PACE_LEGS = ("legs/m16-1243-pace-cinematic-fullscreen-s4.json", "legs/m16-1243-pace-cinematic-fullscreen-s2.json", "legs/m16-1243-pace-cinematic-windowed-s4.json")
 # ... and the lookahead A/B arm: the owner-shape pace leg at MLVAPP_PLAYBACK_RENDER_LOOKAHEAD_FRAMES=3 (the other arm is the pace leg itself, unset).
 LOOKAHEAD_LEGS = ("legs/m16-1243-pace-cinematic-fullscreen-s4-la3.json",)
+# LOOK-ASSIST-CINEMATIC-BENCH-PAIR-1 added the scale-2 Cinematic twin of the scale-2 look leg (the Bachelor CPU Classic | Cinematic look pair).
 SHIPPED_LEGS = ("legs/m16-1243-speed.json", "legs/m16-1243-look.json", "legs/m16-1243-look-scale2.json", "legs/m16-1243-look-cinematic.json", *DISPLAY_MATRIX_LEGS, *PACE_LEGS,
-                *LOOKAHEAD_LEGS)
+                *LOOKAHEAD_LEGS, "legs/m16-1243-look-scale2-cinematic.json")
 SHIPPED_LEGS_PS = ", ".join(f"'{rel}'" for rel in SHIPPED_LEGS)
 OTHER_CLIP = "Z99-9999"
 MLV_EXT = "." + "mlv"  # never spelled as one literal token (the NA-4 gate trips on fixture basenames)
@@ -2582,7 +2583,9 @@ class EvidenceBoundReceiptTests(EvidenceFactory, ModuleMutationMixin, unittest.T
         tracked = subprocess.run(["git", "-C", str(ROOT), "ls-files", "*.ps1", "*.psm1", "*.py"], capture_output=True, text=True, check=True).stdout.split()
         texts = {name: (ROOT / name).read_text(encoding="utf-8", errors="replace") for name in tracked if (ROOT / name).is_file()}
         callers = {n for n, t in texts.items() if re.search(r"Test-DvReceiptValid\s+-", t) and n != "tools/repo_hygiene/test_dual_venue_evidence.py"}
-        self.assertEqual(callers, {"tools/profiling/dual-venue/DualVenueRunner.psm1", "tools/profiling/dual-venue/New-VenueSheetPair.ps1"})
+        # LOOK-ASSIST-CINEMATIC-BENCH-PAIR-1 added New-VenueFlavorPair.ps1 (the Classic | Cinematic pair), which validates both receipts the same way.
+        self.assertEqual(callers, {"tools/profiling/dual-venue/DualVenueRunner.psm1", "tools/profiling/dual-venue/New-VenueSheetPair.ps1",
+                                   "tools/profiling/dual-venue/New-VenueFlavorPair.ps1"})
         self.assertEqual(self.readers_without_repo_root({n: texts[n] for n in callers}), [])
         # nothing else in the tree reads a receipt file: a new reader must call the validator (and be added to this list in review)
         readers = {n for n, t in texts.items() if ("dual-venue-receipt/v1" in t or "dual-venue\\receipts" in t or "dual-venue/receipts" in t)
@@ -3354,6 +3357,56 @@ class ContactFramesAreHashListedTests(EvidenceFactory, ModuleMutationMixin, unit
 
 
 @requires_windows_pwsh
+class NonAsciiLegSpecNameIsFoundTests(ModuleMutationMixin, unittest.TestCase):
+    """DG-GIT-PATHLIST-LSTREE-LONGFORM-1: `ls-tree -r` (long form) prints a non-ASCII path quoted under the default core.quotepath=true, so the
+    path ended in a quote, failed EndsWith('.json'), and a committed `legs/caf<e-acute>.json` was never found (a silent refusal)."""
+
+    NAME = "café.json"
+    SPEC = b'{"legId": "cafe-probe"}\n'
+
+    def commit_leg(self) -> tuple[Path, str]:
+        tmp = tempfile.TemporaryDirectory(prefix="dve-quotepath-")
+        self.addCleanup(tmp.cleanup)
+        root = Path(tmp.name) / "repo"
+        legs = root / "tools" / "profiling" / "dual-venue" / "legs"
+        legs.mkdir(parents=True)
+        (legs / self.NAME).write_bytes(self.SPEC)
+
+        def git(*args: str) -> str:
+            return subprocess.run(["git", "-C", str(root), *args], capture_output=True, text=True, check=True).stdout
+        git("init", "-q")
+        git("config", "user.email", "unit@example.invalid")
+        git("config", "user.name", "unit")
+        git("config", "core.quotepath", "true")
+        git("add", "tools")
+        git("commit", "-q", "-m", "committed")
+        self.assertIn("\\303\\251", git("ls-tree", "-r", "--name-only", "HEAD"), "the premise: git prints this name quoted by default")
+        return root, git("rev-parse", "HEAD").strip()
+
+    def probe(self, root: Path, head: str, module: Path | None = None) -> list[str]:
+        script = (f"$root = '{root}'\n"
+                  f"$sha = Get-DvLegSpecSha256 ([byte[]]({','.join(str(b) for b in self.SPEC)}))\n"
+                  f"$r = Find-DvCommittedLegSpec -RepoRoot $root -Commit '{head}' -LegSpecSha256 $sha\n"
+                  "Write-Output ('FOUND ' + $r.ok)\n"
+                  "if ($r.ok) { Write-Output ('PATH ' + [BitConverter]::ToString([Text.Encoding]::UTF8.GetBytes($r.relativePath))) }\n")
+        proc = _ps_json(script, module or DV / "DualVenueRunner.psm1", {})
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        return [l.strip() for l in proc.stdout.splitlines() if l.strip()]
+
+    def test_a_committed_leg_spec_with_a_non_ascii_name_is_found_by_its_hash(self) -> None:
+        root, head = self.commit_leg()
+        out = self.probe(root, head)
+        want = "tools/profiling/dual-venue/legs/" + self.NAME
+        self.assertEqual(out, ["FOUND True", "PATH " + "-".join(f"{b:02X}" for b in want.encode("utf-8"))])
+
+    def test_mutation_listing_without_z_loses_the_non_ascii_spec(self) -> None:
+        mutated = self.mutated_module([("'ls-tree', '-r', '-z', $Commit", "'ls-tree', '-r', $Commit"),
+                                       ('-split "`0"', '-split "`n"')])
+        root, head = self.commit_leg()
+        self.assertEqual(self.probe(root, head, module=mutated), ["FOUND False"], "the quoted name fails EndsWith('.json'): the old, silent refusal")
+
+
+@requires_windows_pwsh
 class LineEndingsCannotHideACommittedFileTests(ModuleMutationMixin, unittest.TestCase):
     """fable r1 B2: on this VM's default checkout (system git core.autocrlf=true) the working copy of every tracked text file is CRLF while the
     committed blob is LF, and the runner hashed the working bytes while Find-DvCommittedLegSpec hashed the blob bytes, so every committed leg spec was
@@ -3858,7 +3911,7 @@ class DisplayModeIsRequestedAndObservedTests(EvidenceFactory, ModuleMutationMixi
 
     # -- the schema default -----------------------------------------------------------------------------------------------------------
     def test_a_spec_without_a_display_mode_is_a_full_screen_leg_and_every_legacy_leg_names_none(self) -> None:
-        for name in ("m16-1243-speed", "m16-1243-look", "m16-1243-look-scale2", "m16-1243-look-cinematic"):
+        for name in ("m16-1243-speed", "m16-1243-look", "m16-1243-look-scale2", "m16-1243-look-cinematic", "m16-1243-look-scale2-cinematic"):
             self.assertNotIn("displayMode", json.loads((DV / "legs" / f"{name}.json").read_text(encoding="utf-8")), f"{name}: an existing leg must not change")
         _, receipt, _ = self.leg(None, FULLSCREEN_PLACEMENT)
         self.assertEqual(receipt["outcome"], "PASS", receipt["outcomeDetail"])
@@ -4308,6 +4361,7 @@ class LegSpecSchemaTests(unittest.TestCase):
             self.assertEqual(pace["generatorArgs"], dict(cell["generatorArgs"], forceLookAssist=True, lookFlavor=cell["look"]["lookFlavor"]), rel)
             for key in ("clipId", "playSeconds", "backends", "scaleFactor", "displayMode", "timeouts", "criteria"):
                 self.assertEqual(pace[key], cell[key], f"{rel}: {key}")
+            self.assertEqual(pace.get("acceptedEffectiveScale"), cell.get("acceptedEffectiveScale"), f"{rel}: declares its cell's CUDA texture-route clamp")
         self.assertEqual(sorted(json.loads((DV / rel).read_text(encoding="utf-8"))["legId"] for rel in PACE_LEGS),
                          sorted(["m16-1243-pace-cinematic-fullscreen-s4", "m16-1243-pace-cinematic-fullscreen-s2", "m16-1243-pace-cinematic-windowed-s4"]))
 
@@ -4345,8 +4399,9 @@ class LegSpecSchemaTests(unittest.TestCase):
             elif spec["card"] == "PLAYBACK-BACHELOR-PRESENT-JITTER-1":   # the capture-free pace legs, named by flavor and cell
                 self.assertEqual(spec["legId"], path.stem, path.name)
                 self.assertRegex(spec["legId"], rf"^m16-1243-pace-{flavor}-(fullscreen|windowed)-s[124](-la[0-3])?$", path.name)
-            else:
-                self.assertEqual(spec["legId"], f"m16-1243-look-{flavor}", path.name)
+            else:   # the scale-4 flavored look leg, or its scale-2 twin (LOOK-ASSIST-CINEMATIC-BENCH-PAIR-1)
+                self.assertIn(spec["legId"], (f"m16-1243-look-{flavor}", f"m16-1243-look-scale2-{flavor}"), path.name)
+                self.assertEqual(spec["legId"], path.stem, path.name)
             for role, per_backend in spec["criteria"].items():
                 self.assertTrue(per_backend, f"{path.name}: {role} has no criteria")
                 for backend, criteria in per_backend.items():
@@ -4370,6 +4425,26 @@ class LegSpecSchemaTests(unittest.TestCase):
         comparable = dict(stripped, legId=classic["legId"], look=dict(stripped["look"], lookFlavor="classic"))
         self.assertEqual(comparable, classic, "the Cinematic leg is the Classic leg except legId, lookFlavor and the applied-flavor criterion")
         self.assertNotIn(applied, [c for pb in classic["criteria"].values() for cl in pb.values() for c in cl], "the Classic leg must not gate on the cinematic flavor")
+
+    def test_the_scale2_cinematic_look_leg_is_the_scale2_leg_plus_the_flavor_and_the_applied_flavor_criterion(self) -> None:
+        """LOOK-ASSIST-CINEMATIC-BENCH-PAIR-1: the Bachelor CPU look pair runs THE SAME leg twice, Classic then Cinematic. The Cinematic leg is
+        m16-1243-look-scale2.json except legId, look.lookFlavor and the applied-flavor criterion appended to every criteria list -- a pinned fact."""
+        load = lambda name: json.loads((DV / "legs" / f"{name}.json").read_text(encoding="utf-8"))
+        classic, cinematic = load("m16-1243-look-scale2"), load("m16-1243-look-scale2-cinematic")
+        self.jsonschema.validate(cinematic, self.schema)
+        self.assertEqual(cinematic["legId"], "m16-1243-look-scale2-cinematic")
+        self.assertEqual(cinematic["look"]["lookFlavor"], "cinematic")
+        self.assertNotIn("displayMode", cinematic, "the pair is the legacy full-screen look leg, not a display-matrix cell")
+        applied = {"metric": "lookFlavorReported", "op": "eq", "value": "cinematic"}
+        stripped = json.loads(json.dumps(cinematic))
+        for per_backend in stripped["criteria"].values():
+            for backend, criteria in per_backend.items():
+                self.assertEqual(criteria[-1], applied, f"{backend}: the applied-flavor criterion is appended")
+                self.assertEqual(criteria.count(applied), 1, backend)
+                criteria.remove(applied)
+        comparable = dict(stripped, legId=classic["legId"], look=dict(stripped["look"], lookFlavor="classic"))
+        self.assertEqual(comparable, classic, "the scale-2 Cinematic leg is the scale-2 leg except legId, lookFlavor and the applied-flavor criterion")
+        self.assertEqual(list(cinematic), list(classic), "same keys in the same order: the twin is the same leg byte-for-byte in shape")
 
     def test_the_applied_flavor_metric_the_cinematic_leg_gates_on_is_one_the_job_writes_and_the_app_withholds_on_a_fallback(self) -> None:
         """`lookFlavorReported` is the job summary's copy of the app's visual_state look_assist_flavor, and the app reports `none` (never the requested

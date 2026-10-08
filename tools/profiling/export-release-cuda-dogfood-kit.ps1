@@ -239,7 +239,6 @@ param(
     [Alias("Input")]
     [string]$ClipPath,
     [string]$Receipt = "receipts\FastProxy.marxml",
-    [ValidateSet("uncompressed", "lossless", "fast-pass")]
     [string[]]$DngCodecs = @("uncompressed", "lossless"),
     [string]$OutputRoot = "",
     [string]$SummaryPath = "",
@@ -257,6 +256,17 @@ param(
 )
 
 $ErrorActionPreference = "Stop"
+# -File hands '-DngCodecs uncompressed,lossless' over as ONE string, and a ValidateSet attribute would reject that
+# joined element at bind time. So split first, then validate each codec here.
+$DngCodecs = @($DngCodecs | ForEach-Object { ([string]$_) -split "," } | ForEach-Object { $_.Trim() } | Where-Object { $_ })
+if ($DngCodecs.Count -eq 0) {
+    throw "-DngCodecs needs at least one of uncompressed, lossless or fast-pass."
+}
+foreach ($dngCodec in $DngCodecs) {
+    if (@("uncompressed", "lossless", "fast-pass") -notcontains $dngCodec) {
+        throw "Invalid -DngCodecs value '$dngCodec'. Use uncompressed, lossless or fast-pass (comma separated)."
+    }
+}
 $repoRoot = $PSScriptRoot
 if ([string]::IsNullOrWhiteSpace($OutputRoot)) {
     $stamp = (Get-Date).ToUniversalTime().ToString("yyyyMMdd-HHmmss")
@@ -338,7 +348,7 @@ if ($DngOnly) {
     -Input $ClipPath `
     -Receipt $Receipt `
     -OutputRoot (Join-Path $OutputRoot "proof") `
-    -CdngCodecs $DngCodecs `
+    -CdngCodecs ($DngCodecs -join ',') `
     @proofOverlapArgs `
     @dryArgs
 $proofExit = $LASTEXITCODE

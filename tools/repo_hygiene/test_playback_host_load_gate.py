@@ -963,6 +963,13 @@ class HostLoadSnapshotProducerAlignmentTests(_ProbeCase):
     script = SMOKE_SCRIPT
     functions = ["Get-HostLoadSystemTimes", "Get-HostLoadSnapshot"]
 
+    # CPU-seconds the spinner must burn inside EACH mocked CIM call of the real-subject test below (two
+    # calls per snapshot), and the wall-clock cap that turns a never-scheduled spinner into a clear error
+    # rather than a hang. The assertion margin is 0.3, so 0.4 leaves 0.1 CPU-s of slack on a counter that
+    # advances in ~15.6ms scheduler ticks.
+    SLOW_EVIDENCE_CPU_SECONDS = 0.4
+    SLOW_EVIDENCE_WALL_CAP_SECONDS = 120
+
     def test_snapshot_wires_system_times_and_subject_cpu_from_get_host_load_system_times_verbatim(self) -> None:
         # Overrides Get-HostLoadSystemTimes (the SAME redefine-after-dot-source technique the
         # existing Get-CimInstance/Get-Process mocks already use) to return a sentinel object whose
@@ -1148,10 +1155,46 @@ class HostLoadSnapshotProducerAlignmentTests(_ProbeCase):
         # immediately after the syscall, before evidence collection even starts, so the recorded
         # value must be far below what a SEPARATE reading taken right after the call returns (which
         # necessarily includes the full 900ms of spin) would show.
+        #
+        # De-flake (CI-FLAKE-HOST-LOAD-GATE-SLOW-EVIDENCE-1): the mocked "slow evidence collection" is
+        # driven by the spinner's CONSUMED CPU TIME, not by a wall-clock sleep. The old shape slept a fixed
+        # 900ms per CIM call and then required the spinner to have burned > 0.3 CPU-seconds in that
+        # wall-clock window -- an unstated assumption that the spinner gets >= ~17% of a core. On a loaded
+        # shared runner the spinner is starved (merge_group 37531801692: 0.421875 vs 0.425; 7 of 8 runs
+        # fail with 32 busy loops on 16 cores) and the margin shrinks to nothing with correct production
+        # code. Now each mocked CIM call waits (polling, hard wall-clock cap) until the spinner's own
+        # TotalProcessorTime has advanced by SLOW_EVIDENCE_CPU_SECONDS past the value at that call's entry, so
+        # "evidence collection took long enough for the subject to burn N CPU-seconds" is true by
+        # construction at any load. The invariants are then exact comparisons on the same monotonic
+        # counter, with no timer-granularity term: recorded <= cpu_at_first_cim_entry (the subject read
+        # precedes all evidence work) and cpu_at_last_cim_exit - recorded >= SLOW_EVIDENCE_CPU_SECONDS.
+        # Reverting to the round-8 ordering (subject read AFTER evidence) makes recorded >= the exit value
+        # and fails both.
+        burn = self.SLOW_EVIDENCE_CPU_SECONDS
         proc = self.run_snippet(
+            "$script:firstEntry = $null; $script:lastExit = $null\n"
+            "$script:capHit = ''; $script:cimCallsStarted = 0; $script:cimCallsCompleted = 0\n"
             "function Get-CimInstance {\n"
             "    param($ClassName, $Filter, $ErrorAction, $OperationTimeoutSec)\n"
-            "    Start-Sleep -Milliseconds 900\n"
+            "    $script:cimCallsStarted++\n"
+            "    $callNumber = $script:cimCallsStarted\n"
+            "    $spinner.Refresh()\n"
+            "    $entry = $spinner.TotalProcessorTime.TotalSeconds\n"
+            "    if ($null -eq $script:firstEntry) { $script:firstEntry = $entry }\n"
+            f"    $deadline = [datetime]::UtcNow.AddSeconds({self.SLOW_EVIDENCE_WALL_CAP_SECONDS})\n"
+            f"    while ($spinner.TotalProcessorTime.TotalSeconds -lt $entry + {burn}) {{\n"
+            # Get-HostLoadSnapshot wraps its evidence collection in its own try/catch, so a throw from
+            # here is swallowed (collected=false) and the process still exits 0. Record the cap hit in a
+            # script-scope flag, which survives that catch, so the test can fail with the cap as the reason.
+            "        if ([datetime]::UtcNow -gt $deadline) {\n"
+            "            $script:capHit = \"CIM call $callNumber\"\n"
+            "            throw 'spinner never burned the target CPU (wall cap)'\n"
+            "        }\n"
+            "        Start-Sleep -Milliseconds 20\n"
+            "        $spinner.Refresh()\n"
+            "    }\n"
+            "    $script:lastExit = $spinner.TotalProcessorTime.TotalSeconds\n"
+            "    $script:cimCallsCompleted++\n"
             "    if ($ClassName -eq 'Win32_Processor') { [pscustomobject]@{ LoadPercentage = 5 } }\n"
             "    else { [pscustomobject]@{ FreePhysicalMemory = 1024; TotalVisibleMemorySize = 2048 } }\n"
             "}\n"
@@ -1160,25 +1203,66 @@ class HostLoadSnapshotProducerAlignmentTests(_ProbeCase):
             "'-NoProfile','-NonInteractive','-Command','while ($true) { [Math]::Sqrt(12345) | Out-Null }' "
             "-PassThru\n"
             "try {\n"
-            "    Start-Sleep -Milliseconds 250\n"
             "    $before = Get-HostLoadSnapshot -TopProcessCount 1 -SubjectProcess $spinner\n"
             "    $spinner.Refresh()\n"
             "    $actualAfterCallSeconds = $spinner.TotalProcessorTime.TotalSeconds\n"
+            "    Write-Host \"COLLECTED=$($before.collected)\"\n"
+            "    Write-Host \"CAPHIT=$script:capHit\"\n"
+            "    Write-Host \"CIM_CALLS_COMPLETED=$script:cimCallsCompleted\"\n"
             "    Write-Host \"RECORDED=$($before.subjectCpuSeconds)\"\n"
+            "    Write-Host \"FIRST_CIM_ENTRY=$script:firstEntry\"\n"
+            "    Write-Host \"LAST_CIM_EXIT=$script:lastExit\"\n"
             "    Write-Host \"ACTUAL_AFTER_CALL=$actualAfterCallSeconds\"\n"
             "} finally {\n"
             "    $spinner | Stop-Process -Force -ErrorAction SilentlyContinue\n"
             "}\n"
         )
         self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
-        recorded = float(next(l for l in proc.stdout.splitlines() if l.startswith("RECORDED="))[len("RECORDED="):])
-        actual_after_call = float(
-            next(l for l in proc.stdout.splitlines() if l.startswith("ACTUAL_AFTER_CALL="))[len("ACTUAL_AFTER_CALL="):])
+
+        def _text(name: str) -> str:
+            return next(l for l in proc.stdout.splitlines() if l.startswith(name + "="))[len(name) + 1:].strip()
+
+        def _value(name: str) -> float:
+            return float(_text(name))
+
+        # Checked BEFORE any CPU value is parsed: a wall-cap throw inside the mocked Get-CimInstance is
+        # swallowed by Get-HostLoadSnapshot's own try/catch, so the process still exits 0. Without these
+        # three checks a cap hit on the first call dies below as a bare ValueError (empty LAST_CIM_EXIT)
+        # and a cap hit on the second call passes silently on the first call's retained LAST_CIM_EXIT.
+        cap_hit = _text("CAPHIT")
+        self.assertEqual(
+            cap_hit, "",
+            f"the mocked slow evidence collection hit its {self.SLOW_EVIDENCE_WALL_CAP_SECONDS}s wall cap "
+            f"({cap_hit}): the spinner never burned {burn} CPU-seconds inside the mock, so this run proves nothing")
+        self.assertEqual(
+            _text("COLLECTED"), "True",
+            "Get-HostLoadSnapshot did not report collected=True -- a mocked evidence call threw "
+            f"(the {self.SLOW_EVIDENCE_WALL_CAP_SECONDS}s wall cap or otherwise) and the snapshot swallowed it")
+        self.assertEqual(
+            _text("CIM_CALLS_COMPLETED"), "2",
+            "expected both mocked Get-CimInstance calls (Win32_Processor, Win32_OperatingSystem) to complete "
+            f"their {burn} CPU-second burn; a fewer count means a call hit the "
+            f"{self.SLOW_EVIDENCE_WALL_CAP_SECONDS}s wall cap and the retained LAST_CIM_EXIT is stale")
+        recorded = _value("RECORDED")
+        first_cim_entry = _value("FIRST_CIM_ENTRY")
+        last_cim_exit = _value("LAST_CIM_EXIT")
+        actual_after_call = _value("ACTUAL_AFTER_CALL")
+        # The mock really ran (not vacuous) and the spinner really burned the target CPU inside it.
+        self.assertGreaterEqual(
+            last_cim_exit - first_cim_entry, burn,
+            "the mocked slow evidence collection did not span the target subject CPU time")
+        self.assertGreaterEqual(actual_after_call, last_cim_exit)
+        # The subject read precedes all evidence collection ...
+        self.assertLessEqual(
+            recorded, first_cim_entry,
+            f"recorded subjectCpuSeconds ({recorded}) is above the subject's CPU at the start of evidence "
+            f"collection ({first_cim_entry}) -- the subject read happened after evidence collection began")
+        # ... so none of the CPU burned during it is in the recorded value.
         self.assertGreater(
-            actual_after_call, recorded + 0.3,
-            f"recorded subjectCpuSeconds ({recorded}) is too close to a post-call reading "
-            f"({actual_after_call}) -- the subject read is not happening before the slow evidence "
-            "collection, so it is picking up CPU the spinner burned during the mocked delay",
+            last_cim_exit, recorded + 0.3,
+            f"recorded subjectCpuSeconds ({recorded}) is too close to the subject's CPU at the end of "
+            f"evidence collection ({last_cim_exit}) -- the subject read is not happening before the slow "
+            "evidence collection, so it is picking up CPU the spinner burned during the mocked delay",
         )
 
 
