@@ -3196,6 +3196,8 @@ def run_bounded_closeout_process(
     env: Optional[Dict[str, str]] = None,
     cwd: Optional[Path] = None,
     resource_overrides: Optional[Dict[str, Any]] = None,
+    ready_file: Optional[Path] = None,
+    ready_wait_ms: int = 30000,
 ) -> Dict[str, Any]:
     repo_root = resolve_repo_root(repo_root_arg)
     process_cwd = cwd or repo_root
@@ -3233,6 +3235,26 @@ def run_bounded_closeout_process(
     for thread in threads:
         thread.start()
     reason: Optional[str] = None
+    ready_info: Optional[Dict[str, Any]] = None
+    if ready_file is not None:
+        # Opt-in start-after-ready: the timeout clock starts when ready_file appears, or when the bounded
+        # ready-wait expires, whichever is first. The wait also ends if the child exits or hits the output cap.
+        ready_wait_s = positive_int(ready_wait_ms, 30000) / 1000.0
+        ready_started = time.monotonic()
+        ready_deadline = ready_started + ready_wait_s
+        while (
+            process.poll() is None
+            and not stop_event.is_set()
+            and not ready_file.exists()
+            and time.monotonic() < ready_deadline
+        ):
+            time.sleep(0.02)
+        ready_info = {
+            "readyFile": str(ready_file),
+            "readyWaitMs": int(ready_wait_s * 1000),
+            "readyObserved": ready_file.exists(),
+            "readyWaitedSeconds": round(time.monotonic() - ready_started, 3),
+        }
     deadline = time.monotonic() + (timeout_ms / 1000.0)
     watchdog_policy = dict(resource_policy.get("cpuWatchdog") or {})
     cpu_watchdog_state: Dict[str, Any] = {
@@ -3348,6 +3370,8 @@ def run_bounded_closeout_process(
         "kill": kill_info,
         "recoveryCommand": recovery_command,
     }
+    if ready_info is not None:
+        base_result["readyHandshake"] = ready_info
     normalized = normalize_closeout_child_status(
         repo_root,
         config,
