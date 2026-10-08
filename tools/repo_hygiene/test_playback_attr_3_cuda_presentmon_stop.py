@@ -86,6 +86,23 @@ def _wait_child_started(started: Path) -> str:
     )
 
 
+def _stub_capture_command(started: Path, sentinel: Path, exit_code: int, exit_delay_seconds: int) -> str:
+    """The -Command text of the stub capture child: signal `started`, poll for `sentinel`, then (after an optional
+    delay standing in for a slow shutdown) exit with `exit_code`."""
+    delay = f" Start-Sleep -Seconds {exit_delay_seconds};" if exit_delay_seconds else ""
+    return (
+        f"New-Item -ItemType File -Path '{started}' -Force | Out-Null; "
+        f"while (-not (Test-Path -LiteralPath '{sentinel}')) {{ Start-Sleep -Milliseconds 100 }};{delay} exit {exit_code}"
+    )
+
+
+# The stubbed session terminate stands in for the real helper, which returns only after PresentMon's session is
+# stopped. When the stub is meant to end the capture it therefore returns only once the stub child has EXITED
+# (bounded), so the stop's grace never races the child's wake-up and shutdown latency on a loaded shard. That
+# latency, not the product, produced the second 'terminate' in merge_group runs 37725803931 and 37743688226.
+_TERMINATE_WAITS_FOR_EXIT = "if ($terminateWaitsForExit) { [void]$proc.WaitForExit(120000) }"
+
+
 class StartArgumentsStaticTests(unittest.TestCase):
     def test_start_args_carry_a_per_job_session_name_before_stop_existing_session(self) -> None:
         start = _function_body(_template(), "Start-PresentMonCapture")
@@ -404,6 +421,7 @@ class CleanStopExecutedTests(_ProbeCase):
     def _probe(
         self, *, terminate_stops_capture: bool, timeout: int = 5, pre_exited: bool = False,
         terminate_exit_code: int = 0, capture_exit_code: int = 0,
+        exit_delay_seconds: int = 0, terminate_waits_for_exit: bool = True,
     ) -> tuple[dict, list[str]]:
         out = self.tmp / "result.json"
         calls = self.tmp / "calls.log"
@@ -413,14 +431,16 @@ class CleanStopExecutedTests(_ProbeCase):
             f"$sentinel = '{sentinel}'\n"
             f"$callLog = '{calls}'\n"
             f"$terminateStopsCapture = ${str(terminate_stops_capture).lower()}\n"
+            f"$terminateWaitsForExit = ${str(terminate_waits_for_exit).lower()}\n"
             "function Invoke-PresentMonSessionTerminate([string]$SessionName, [int]$TimeoutSeconds = 10) {\n"
             "    Add-Content -LiteralPath $callLog -Value \"terminate $SessionName\"\n"
-            "    if ($terminateStopsCapture) { New-Item -ItemType File -Path $sentinel -Force | Out-Null }\n"
+            "    if ($terminateStopsCapture) { New-Item -ItemType File -Path $sentinel -Force | Out-Null; "
+            + _TERMINATE_WAITS_FOR_EXIT + " }\n"
             f"    [pscustomobject]@{{ exitCode = {terminate_exit_code}; timedOut = $false; error = $null }}\n"
             "}\n"
             + ("New-Item -ItemType File -Path $sentinel -Force | Out-Null\n" if pre_exited else "")
             + "$proc = Start-Process -FilePath 'powershell.exe' -ArgumentList @('-NoProfile','-NonInteractive','-Command', "
-            f"\"New-Item -ItemType File -Path '{started}' -Force | Out-Null; while (-not (Test-Path -LiteralPath '$sentinel')) {{ Start-Sleep -Milliseconds 100 }}; exit {capture_exit_code}\") "
+            f"\"{_stub_capture_command(started, sentinel, capture_exit_code, exit_delay_seconds)}\") "
             "-PassThru -WindowStyle Hidden\n"
             + _wait_child_started(started)
             + ("[void]$proc.WaitForExit(30000)\n" if pre_exited else "")
@@ -453,6 +473,24 @@ class CleanStopExecutedTests(_ProbeCase):
         self.assertIsNone(result["waitError"])
         # Both stamps are ISO-8601 'o' strings in UTC, so they order lexically.
         self.assertLess(result["terminateIssuedUtc"], result["killIssuedUtc"])
+
+    def test_a_capture_still_alive_when_the_grace_ends_is_killed_and_the_session_terminated_again(self) -> None:
+        # The exact signature of the hosted-runner flake, forced: the terminate returns at once (it does not wait for
+        # the child) and the child needs longer than the grace to exit, so the stop Kills it and terminates again.
+        result, log = self._probe(
+            terminate_stops_capture=True, timeout=1, exit_delay_seconds=4, terminate_waits_for_exit=False,
+        )
+        self.assertEqual(log, ["terminate MLVAttr3-test", "terminate MLVAttr3-test"])
+        self.assertEqual(result["stopMethod"], "kill_fallback")
+        self.assertTrue(result["killUsed"])
+
+    def test_a_slow_shutdown_after_the_terminate_does_not_cost_a_second_terminate(self) -> None:
+        # Deterministic form of the same window: the child exits 7 s after the terminate, longer than the 5 s grace.
+        # The stubbed terminate returns only once the child has exited, so the grace never races the child.
+        result, log = self._probe(terminate_stops_capture=True, exit_delay_seconds=7)
+        self.assertEqual(log, ["terminate MLVAttr3-test"])
+        self.assertEqual(result["stopMethod"], "session_terminate")
+        self.assertFalse(result["killUsed"])
 
     def test_a_capture_that_already_exited_is_not_sent_a_terminate(self) -> None:
         result, log = self._probe(terminate_stops_capture=True, pre_exited=True)
@@ -755,7 +793,10 @@ class CsvTailRepairExecutedTests(_ProbeCase):
 class FailurePathStopExecutedTests(_ProbeCase):
     """fable r1 hardening 1: a failure-path stop terminates the job's NAMED session before any Kill()."""
 
-    def _stop(self, *, terminate_stops_capture: bool, session: str = "MLVAttr3-test") -> tuple[dict, list[str]]:
+    def _stop(
+        self, *, terminate_stops_capture: bool, session: str = "MLVAttr3-test",
+        exit_delay_seconds: int = 0, terminate_waits_for_exit: bool = True,
+    ) -> tuple[dict, list[str]]:
         out = self.tmp / "stop-result.json"
         calls = self.tmp / "calls.log"
         sentinel = self.tmp / "stop.flag"
@@ -765,13 +806,15 @@ class FailurePathStopExecutedTests(_ProbeCase):
             f"$sentinel = '{sentinel}'\n"
             f"$callLog = '{calls}'\n"
             f"$terminateStopsCapture = ${str(terminate_stops_capture).lower()}\n"
+            f"$terminateWaitsForExit = ${str(terminate_waits_for_exit).lower()}\n"
             "function Invoke-PresentMonSessionTerminate([string]$SessionName, [int]$TimeoutSeconds = 10) {\n"
             "    Add-Content -LiteralPath $callLog -Value \"terminate $SessionName\"\n"
-            "    if ($terminateStopsCapture) { New-Item -ItemType File -Path $sentinel -Force | Out-Null }\n"
+            "    if ($terminateStopsCapture) { New-Item -ItemType File -Path $sentinel -Force | Out-Null; "
+            + _TERMINATE_WAITS_FOR_EXIT + " }\n"
             "    [pscustomobject]@{ exitCode = 0; timedOut = $false; error = $null }\n"
             "}\n"
             "$proc = Start-Process -FilePath 'powershell.exe' -ArgumentList @('-NoProfile','-NonInteractive','-Command', "
-            f"\"New-Item -ItemType File -Path '{started}' -Force | Out-Null; while (-not (Test-Path -LiteralPath '$sentinel')) {{ Start-Sleep -Milliseconds 100 }}; exit 0\") "
+            f"\"{_stub_capture_command(started, sentinel, 0, exit_delay_seconds)}\") "
             "-PassThru -WindowStyle Hidden\n"
             + _wait_child_started(started)
             + f"$r = Stop-PresentMonCapture -Proc $proc{session_arg}\n"
@@ -784,6 +827,19 @@ class FailurePathStopExecutedTests(_ProbeCase):
 
     def test_a_failure_path_stop_terminates_the_named_session_and_needs_no_kill(self) -> None:
         result, log = self._stop(terminate_stops_capture=True)
+        self.assertEqual(log, ["terminate MLVAttr3-test"])
+        self.assertTrue(result["confirmedExited"])
+        self.assertIsNone(result["killError"])
+
+    def test_a_failure_path_stop_of_a_capture_slower_than_the_grace_is_killed_and_terminated_again(self) -> None:
+        # The hosted-runner flake signature, forced: the terminate returns at once and the child exits 8 s later,
+        # past the stop's 5 s grace.
+        result, log = self._stop(terminate_stops_capture=True, exit_delay_seconds=8, terminate_waits_for_exit=False)
+        self.assertEqual(log, ["terminate MLVAttr3-test", "terminate MLVAttr3-test"])
+        self.assertTrue(result["confirmedExited"])
+
+    def test_a_slow_shutdown_after_the_failure_path_terminate_does_not_cost_a_second_terminate(self) -> None:
+        result, log = self._stop(terminate_stops_capture=True, exit_delay_seconds=8)
         self.assertEqual(log, ["terminate MLVAttr3-test"])
         self.assertTrue(result["confirmedExited"])
         self.assertIsNone(result["killError"])
