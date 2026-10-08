@@ -88,6 +88,8 @@ param(
 )
 
 $ErrorActionPreference = 'Stop'
+# -File hands '-CudaArchitectures sm_86,compute_86' over as ONE string; split it so both shapes bind alike.
+$CudaArchitectures = @($CudaArchitectures | ForEach-Object { ([string]$_) -split ',' } | ForEach-Object { $_.Trim() } | Where-Object { $_ })
 # The shared module lives beside the Bachelor scripts; this generator reaches across for the ONE
 # definition of the verification functions rather than restating them.
 Import-Module (Join-Path $PSScriptRoot '..\bachelor\AttrCudaArtifacts.psm1') -Force
