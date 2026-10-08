@@ -1166,6 +1166,15 @@ if ($cfg.engine -eq 'claude' -and $cfg.effort) {
     # not decided by this PR. Do not remove or change this assignment to "fix" NA-3 here.
     $psi.Environment['CLAUDE_CODE_EFFORT_LEVEL'] = $cfg.effort
 }
+# KEY-VERDICT-OVERWRITTEN-BY-ROTATION-CHECKPOINT-1: mark the claude child as a bounded fleet lane.
+# The user-level Stop hook usage-guard.py blocks the first stop of a session at plan level prep/hold so
+# an interactive session writes a rotation checkpoint; in a headless `-p` lane that extra turn becomes
+# the whole `result` of --output-format json, so <lane>-NNN.last.txt held the checkpoint and the verdict
+# was lost. The hook skips its Stop block when this variable is set. Not an ANTHROPIC_/OPENAI_/CLAUDE_CODE_
+# name (NA-3). The contained host inherits it from $psi and starts the provider without an override.
+if ($cfg.engine -eq 'claude') {
+    $psi.Environment['MLV_FLEET_LANE'] = '1'
+}
 # LANE-NO-BACKGROUND-END-TURN-1 round 2 (hub ruling): a CLAUDE_CODE_DISABLE_BACKGROUND_TASKS
 # child-environment flag was here through round 1. docs/never-authorized.json NA-3 prohibits
 # assigning ANY CLAUDE_CODE_* variable, and widening that rule is an authority change the hub
