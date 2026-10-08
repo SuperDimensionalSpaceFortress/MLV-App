@@ -123,7 +123,11 @@ lays the tone deltas only and reports `grade=skipped_user_curve`.
 restore (GUI `restoreLookAssistBaseline`, the safety fallback, headless `restoreHeadlessLookAssistBaseline`) puts
 that curve back and clears the element, so every analysis measures at the user's own curve; capturing a fresh
 baseline does the same first. Switching Look Assist off, or re-running as Classic or Cinematic, therefore leaves no
-trace of the grade. The white balance stays Classic's by construction, as for Cinematic. Headless batch exports
+trace of the grade. The curve goes back only while Film still **owns** it, that is while it is, point for point
+(within 1e-6), the curve Film lays for one of the scenes (`lookAssistFilmOwnsGradationCurve`). If the user edited
+the laid curve (say, added a Y point), the edit is the user's curve: the restore keeps it and still clears the
+element, which retires Film's ownership, and a later Film run reports `grade=skipped_user_curve` over it. The GUI
+judges ownership on the curve the widget shows, headless on the receipt's. The white balance stays Classic's by construction, as for Cinematic. Headless batch exports
 CDNG (raw), so the grade never reaches a CDNG; headless only keeps the receipt consistent.
 
 Licence: the control points are original and are evaluated by the already-vendored `tk::spline`; no third-party
@@ -191,10 +195,13 @@ The flavor applied is always reported, appended to the end of the existing lines
   the white balance and the headless picture, and is a different, deterministic picture once the sliders are
   applied; an unknown environment value is Classic with a warning; the receipt element sits below the
   environment. With `MLVAPP_FLAVOR_SHEET_DIR` set, `LookAssistFlavorsFixture.ContactSheets` writes raw | classic |
-  cinematic | film renders of the tracked fixtures (fixture renders only) for model judging.
+  cinematic renders of the tracked fixtures (fixture renders only) for model judging. A Film column there was
+  deferred (not shipped); Film's fixture picture is covered by `FilmIsADifferentGradedPictureFromCinematic` instead.
 * Film grade: the documented table is the code's and Film's tone is Cinematic's; the selector accepts `film`; the
   curve built through `processingSetGCurve` leaves Y and G exactly default and keeps `|r + b - 2g| <= 2` on every
   entry; the four tables are pinned by sha256 and sampled values; a user curve is kept and reported; the baseline
-  round trip leaves a re-run-as-Classic receipt identical to a Classic-only one; Look Assist off changes nothing;
+  round trip leaves a re-run-as-Classic receipt identical to a Classic-only one; a user's edit of the laid curve
+  survives a Classic re-run and Look Assist off, with the element gone (`AUserEditOfTheFilmCurveIsKeptAndRetiresFilmsOwnership`,
+  `AUserEditAfterTheFilmGradeIsKeptByAClassicReRunAndByLookAssistOff`); Look Assist off changes nothing;
   the white balance is Classic's on the fixtures; the CUDA display shader and the CPU direct8 route both take the
   Film curves (`EngineAnchoredLookAssistFlavorsMatchEngineWithReceiptSCurve`, case `look_assist_film_night_real_frame`).

@@ -15576,12 +15576,16 @@ void MainWindow::restoreLookAssistBaseline( ReceiptSettings *receipt )
 
 // The Film grade's curve baseline: non-empty only while the Film grade replaced the user's (default) curve. Putting it back
 // clears it, so every analysis measures at the user's own curve and a later Classic / Cinematic grade carries no trace.
+// The baseline goes back only while Film still owns the curve the widget shows; a user's edit of the laid curve is kept
+// (and Film's ownership retired with the cleared field), as the user-curve rule keeps any other user curve.
 void MainWindow::restoreLookAssistBaselineGradationCurve( ReceiptSettings *receipt )
 {
     if( !receipt || receipt->lookAssistBaselineGradationCurve().isEmpty() ) return;
-    receipt->setGradationCurve( receipt->lookAssistBaselineGradationCurve() );
+    const QString curve = lookAssistGradationCurveAfterFilmRestore( ui->labelCurves->configuration(),
+                                                                    receipt->lookAssistBaselineGradationCurve() );
+    receipt->setGradationCurve( curve );
     receipt->setLookAssistBaselineGradationCurve( QString() );
-    ui->labelCurves->setConfiguration( receipt->gradationCurve() );
+    ui->labelCurves->setConfiguration( curve );
 }
 
 // Lays the Film grade's curve over the finished balance, on the receipt and on the curve widget (which pushes it to the

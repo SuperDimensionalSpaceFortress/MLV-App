@@ -812,6 +812,59 @@ TEST(LookAssistFlavors, LookAssistOffLeavesAFilmSettingUntouchedAndPutsALaidCurv
     ASSERT_TRUE( graded.lookAssistBaselineGradationCurve().isEmpty() );
 }
 
+TEST(LookAssistFlavors, AUserEditOfTheFilmCurveIsKeptAndRetiresFilmsOwnership)
+{
+    // Film laid over the default curve, then the user adds a Y point (0.5,0.56) to it. The edit is the user's curve now:
+    // putting the baseline back (Look Assist off, here; a Classic re-run takes the same helper) keeps the edit and drops
+    // the baseline, so Film no longer owns the curve. An untouched Film curve still goes back to the baseline.
+    QStringList lines = lookAssistFilmGradationCurve( LookAssistScene::Shade ).split( QLatin1Char('?') );
+    ASSERT_EQ( 4, lines.size() );
+    lines[0] = QStringLiteral("1e-05;1e-05;0.5;0.56;1;1;");
+    const QString edited = lines.join( QLatin1Char('?') );
+    const QString base = ReceiptSettings().gradationCurve();
+    for( int s = 0; s < 4; ++s )
+        ASSERT_TRUE( lookAssistFilmOwnsGradationCurve( lookAssistFilmGradationCurve( static_cast<LookAssistScene>( s ) ) ) );
+    ASSERT_FALSE( lookAssistFilmOwnsGradationCurve( edited ) );
+    ASSERT_FALSE( lookAssistFilmOwnsGradationCurve( base ) );
+    ASSERT_FALSE( lookAssistFilmOwnsGradationCurve( QString() ) );
+    ASSERT_TRUE( lookAssistGradationCurveAfterFilmRestore( lookAssistFilmGradationCurve( LookAssistScene::Night ), base ) == base );
+    ASSERT_TRUE( lookAssistGradationCurveAfterFilmRestore( edited, base ) == edited );
+
+    FlavorEnvGuard guard;
+    qputenv( "MLVAPP_LOOK_ASSIST_FLAVOR", "classic" );
+    ReceiptSettings receipt;
+    receipt.setLookAssistEnabled( false );
+    receipt.setGradationCurve( edited );
+    receipt.setLookAssistBaselineGradationCurve( base );
+    ASSERT_FALSE( ReceiptApplier::applyHeadlessLookAssist( &receipt, nullptr, nullptr, 0 ) );
+    ASSERT_TRUE( receipt.gradationCurve() == edited );
+    ASSERT_TRUE( receipt.lookAssistBaselineGradationCurve().isEmpty() );
+
+    // The GUI helper takes the same rule, on the curve the widget shows.
+    const QString window = readSource( QStringLiteral("platform/qt/MainWindow.cpp") );
+    const int at = window.indexOf( QStringLiteral("void MainWindow::restoreLookAssistBaselineGradationCurve( ReceiptSettings *receipt )") );
+    ASSERT_TRUE( at >= 0 );
+    ASSERT_TRUE( window.mid( at, 900 ).contains( QStringLiteral("lookAssistGradationCurveAfterFilmRestore( ui->labelCurves->configuration(),") ) );
+    const QString applier = readSource( QStringLiteral("src/batch/ReceiptApplier.cpp") );
+    const int headlessAt = applier.indexOf( QStringLiteral("static void restoreHeadlessLookAssistGradationCurve( ReceiptSettings *receipt )") );
+    ASSERT_TRUE( headlessAt >= 0 );
+    ASSERT_TRUE( applier.mid( headlessAt, 600 ).contains( QStringLiteral("lookAssistGradationCurveAfterFilmRestore( receipt->gradationCurve(),") ) );
+}
+
+TEST(LookAssistFlavors, NoGradeIsLoggedAfterTheSyncSafetyFallback)
+{
+    // LOOK-ASSIST-FILM-GRADE-LOG-AFTER-FALLBACK-1: the sync safety fallback puts the curve back after the grade was laid,
+    // so its block must return before look_assist.apply.result (the one line that appends grade=filmGrade) is logged.
+    const QString window = readSource( QStringLiteral("platform/qt/MainWindow.cpp") );
+    const int fallbackAt = window.indexOf( QStringLiteral("restoreLookAssistSafetyBaseline( receipt, safeChromaSmooth, safeChromaSmoothAuto );") );
+    ASSERT_TRUE( fallbackAt >= 0 );
+    const int resultAt = window.indexOf( QStringLiteral("QStringLiteral(\"look_assist.apply.result\")"), fallbackAt );
+    ASSERT_TRUE( resultAt > fallbackAt );
+    const int returnAt = window.indexOf( QStringLiteral("return;"), fallbackAt );
+    ASSERT_TRUE( returnAt > fallbackAt && returnAt < resultAt );
+    ASSERT_TRUE( window.indexOf( QStringLiteral("filmGradeLogTail"), fallbackAt ) > returnAt );
+}
+
 TEST(LookAssistFlavors, TheFilmBaselineElementIsWrittenOnlyWhileSet)
 {
     const QString window = readSource( QStringLiteral("platform/qt/MainWindow.cpp") );

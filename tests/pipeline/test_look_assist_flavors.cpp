@@ -702,6 +702,57 @@ TEST(LookAssistFilmGrade, TheBaselineRoundTripLeavesNoTraceOfTheGrade)
     }
 }
 
+TEST(LookAssistFilmGrade, AUserEditAfterTheFilmGradeIsKeptByAClassicReRunAndByLookAssistOff)
+{
+    // Film laid over the default curve -> the user adds a Y point (0.5,0.56) to the laid curve -> a re-run as Classic, or
+    // Look Assist switched off. The edit is the user's curve: it is kept, and the baseline goes (Film's ownership is
+    // retired), so a later Film run reports skipped_user_curve instead of laying over it.
+    const auto userEdit = []( const QString &laid ) {
+        QStringList lines = laid.split( QLatin1Char('?') );
+        lines[0] = QStringLiteral("1e-05;1e-05;0.5;0.56;1;1;");
+        return lines.join( QLatin1Char('?') );
+    };
+    for( int offAfterEdit = 0; offAfterEdit < 2; ++offAfterEdit )
+    {
+        MlvPipelineFixture fixture;
+        ASSERT_TRUE( openFirstFixture( fixture ) );
+        ReceiptSettings &receipt = fixture.receipt();
+        ASSERT_TRUE( lookAssistIsDefaultGradationCurve( receipt.gradationCurve() ) );
+        QString line;
+        {
+            FlavorEnv env( "film" );
+            ASSERT_TRUE( applyCapturingLine( fixture, receipt, &line ) );
+        }
+        ASSERT_TRUE( line.endsWith( QStringLiteral(" flavor=film grade=film-v1") ) );
+        ASSERT_FALSE( receipt.lookAssistBaselineGradationCurve().isEmpty() );
+        const QString edited = userEdit( receipt.gradationCurve() );
+        ASSERT_FALSE( lookAssistIsDefaultGradationCurve( edited ) );
+        receipt.setGradationCurve( edited );
+        if( offAfterEdit )
+        {
+            receipt.setLookAssistEnabled( false );
+            ASSERT_FALSE( applyCapturingLine( fixture, receipt, nullptr ) );
+        }
+        else
+        {
+            FlavorEnv env( "classic" );
+            ASSERT_TRUE( applyCapturingLine( fixture, receipt, &line ) );
+            ASSERT_TRUE( line.endsWith( QStringLiteral(" flavor=classic") ) );
+        }
+        ASSERT_TRUE( receipt.gradationCurve() == edited );
+        ASSERT_TRUE( receipt.lookAssistBaselineGradationCurve().isEmpty() );
+        ASSERT_FALSE( lookAssistReceiptXml( receipt ).contains( "lookAssistBaselineGradationCurve" ) );
+        if( !offAfterEdit )
+        {
+            FlavorEnv env( "film" );
+            ASSERT_TRUE( applyCapturingLine( fixture, receipt, &line ) );
+            ASSERT_TRUE( line.endsWith( QStringLiteral(" flavor=film grade=skipped_user_curve") ) );
+            ASSERT_TRUE( receipt.gradationCurve() == edited );
+            ASSERT_TRUE( receipt.lookAssistBaselineGradationCurve().isEmpty() );
+        }
+    }
+}
+
 TEST(LookAssistFilmGrade, FilmIsADifferentGradedPictureFromCinematic)
 {
     // With the sliders and the curve applied the way the app applies them, Film is a different, deterministic picture.

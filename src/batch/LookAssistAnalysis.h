@@ -682,6 +682,15 @@ bool lookAssistIsDefaultGradationCurve( const QString &curve );
  * (Film, but the receipt holds a user curve) or "none" (not Film). */
 QString lookAssistFilmGradeDecision( LookAssistFlavor flavor, const QString &currentCurve );
 
+/* True while the Film grade still owns the curve: it is, point for point (within 1e-6, as parsed by
+ * lookAssistParseGradationCurve), the curve Film lays for one of the scenes. A user's edit of a laid curve is not. */
+bool lookAssistFilmOwnsGradationCurve( const QString &curve );
+
+/* The curve to keep when the Film grade's recorded baseline is put back: the baseline while Film still owns the current
+ * curve, otherwise the current curve (the user edited it after the grade was laid; the edit is kept, and the caller
+ * clears the baseline either way, so Film's ownership is retired). */
+QString lookAssistGradationCurveAfterFilmRestore( const QString &currentCurve, const QString &baselineCurve );
+
 /* A receipt's lookAssistFlavor element as the value the GUI's selector takes: "classic" or "cinematic" (trimmed,
  * case-insensitive), or "" when the receipt declares nothing (the selector is then left alone). An unknown value is
  * "classic" -- never Cinematic, never a silent skip -- and *selection (optional) says so (unknownValue /

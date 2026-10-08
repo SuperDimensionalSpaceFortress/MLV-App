@@ -1781,6 +1781,32 @@ QString lookAssistFilmGradeDecision( LookAssistFlavor flavor, const QString &cur
     return lookAssistIsDefaultGradationCurve( currentCurve ) ? lookAssistFilmGradeId() : QStringLiteral("skipped_user_curve");
 }
 
+bool lookAssistFilmOwnsGradationCurve( const QString &curve )
+{
+    std::vector<LookAssistGradationPoint> current[4];
+    if( lookAssistParseGradationCurve( curve, current ) != 4 ) return false;
+    const int scenes = static_cast<int>( sizeof( kFilmGradeStrength ) / sizeof( kFilmGradeStrength[0] ) );
+    for( int s = 0; s < scenes; ++s )
+    {
+        std::vector<LookAssistGradationPoint> film[4];
+        lookAssistParseGradationCurve( lookAssistFilmGradationCurve( static_cast<LookAssistScene>( s ) ), film );
+        bool same = true;
+        for( int i = 0; i < 4 && same; ++i )
+        {
+            same = current[i].size() == film[i].size();
+            for( size_t p = 0; p < film[i].size() && same; ++p )
+                same = fabs( current[i][p].x - film[i][p].x ) <= 1e-6 && fabs( current[i][p].y - film[i][p].y ) <= 1e-6;
+        }
+        if( same ) return true;
+    }
+    return false;
+}
+
+QString lookAssistGradationCurveAfterFilmRestore( const QString &currentCurve, const QString &baselineCurve )
+{
+    return lookAssistFilmOwnsGradationCurve( currentCurve ) ? baselineCurve : currentCurve;
+}
+
 LookAssistPreset presetForLookAssistScene( LookAssistScene scene,
                                            const LookAssistStats &stats,
                                            const LookAssistStats *colorStats,

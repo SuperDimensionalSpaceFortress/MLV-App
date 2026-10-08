@@ -105,11 +105,13 @@ static uint16_t headlessRestrictedLosslessDualIsoOutputWhiteLevel( ReceiptSettin
 
 // The Film grade's curve baseline: non-empty only while the Film grade replaced the receipt's (default) curve. Restoring
 // puts that curve back and clears the field, so every analysis starts from the user's own curve and a receipt that is
-// later graded Classic (or has Look Assist switched off) carries no trace of the Film grade.
+// later graded Classic (or has Look Assist switched off) carries no trace of the Film grade. The curve goes back only
+// while Film still owns it; a user's edit of the laid curve is kept and the cleared field retires Film's ownership.
 static void restoreHeadlessLookAssistGradationCurve( ReceiptSettings *receipt )
 {
     if( !receipt || receipt->lookAssistBaselineGradationCurve().isEmpty() ) return;
-    receipt->setGradationCurve( receipt->lookAssistBaselineGradationCurve() );
+    receipt->setGradationCurve( lookAssistGradationCurveAfterFilmRestore( receipt->gradationCurve(),
+                                                                          receipt->lookAssistBaselineGradationCurve() ) );
     receipt->setLookAssistBaselineGradationCurve( QString() );
 }
 
