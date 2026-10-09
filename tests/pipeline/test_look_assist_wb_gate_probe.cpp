@@ -20,6 +20,13 @@
 // Public API only. The static verification (initialDaylightPatchIsVerified, :928-983) and lookAssistSurfaceAt (:710) are
 // file-static in LookAssistAnalysis.cpp, so they are replicated here; deckCastChroma / renderWith and S1's setup are copied
 // from test_look_assist_fixture_scene.cpp (that file is not edited by this card).
+//
+// WB-GATE-PROBE-HARDEN-1: the decision replica models every branch of the patch decision (undamped / damped, unstable,
+// refused, prior not asked, the request's control range), not only the undamped daylight one the tracked states take. The
+// product's own resolveLookAssistWhiteBalance is replayed on the replica's request and both are held to the log, which is
+// also how a fallback state's patch and candidate are bound (its line names neither). The DecisionReplica* tests below are
+// NOT gated: they drive the product decision on synthetic one-surface pictures, one branch each, and fail naming the branch
+// when the product no longer takes it.
 #include "../common/minitest.h"
 #include "../common/repo_paths.h"
 #include "mlv_pipeline_fixture.h"
@@ -36,6 +43,7 @@
 #include <algorithm>
 #include <cmath>
 #include <cstdio>
+#include <utility>
 #include <vector>
 
 using namespace lookassist;
@@ -138,6 +146,284 @@ LookAssistAutoWhiteBalancePatch patchAt( const std::vector<unsigned char> &rgb, 
     p.greenAxis = static_cast<double>( g ) - ( ( static_cast<double>( r ) + b ) * 0.5 );
     p.blueAmberAxis = static_cast<double>( b ) - static_cast<double>( r );
     return p;
+}
+
+// One request to the decision, as the headless applier builds it (ReceiptApplier.cpp :1038-1054).
+struct DecisionInputs
+{
+    LookAssistStats stats;
+    LookAssistScene scene = LookAssistScene::Shade;
+    LookAssistAutoWhiteBalancePatch patch;
+    bool solvedOnProcessedPicture = false;
+    int baseT = 6000;
+    int baseTint = 0;
+    int minT = kLookAssistTemperatureMin;   // the request's control range (:1009-1010, :941-944)
+    int maxT = kLookAssistTemperatureMax;
+    int minTint = kLookAssistTintMin;
+    int maxTint = kLookAssistTintMax;
+    int rawW = 0;
+    int rawH = 0;
+    int analysisExposure = 0;               // receipt units: what the verification pictures are rendered at (:954-955)
+    bool refineWithoutPatch = true;
+    LookAssistRenderBalanceFn render;
+    LookAssistWhiteBalanceSolveFn solve;
+};
+
+// The verification window (:940-945): the scene's window intersected with the request's control range.
+LookAssistWhiteBalanceBounds verificationWindow( const DecisionInputs &in )
+{
+    LookAssistWhiteBalanceBounds window = lookAssistWhiteBalanceBounds( in.stats, in.scene );
+    window.minTemperature = std::max( window.minTemperature, in.minT );
+    window.maxTemperature = std::min( window.maxTemperature, in.maxT );
+    window.minTint = std::max( window.minTint, in.minTint );
+    window.maxTint = std::min( window.maxTint, in.maxTint );
+    return window;
+}
+
+// initialDaylightPatchIsVerified (:928-983), step for step. `exit` names where it returned. The chroma fields are what it
+// leaves in the resolution: 0.0 (the struct's default) where it never measured, never a sentinel.
+struct VerificationReplica
+{
+    QString exit = QStringLiteral( "not-called" );
+    bool priorAsked = false;
+    int priorT = 0;
+    int priorTint = 0;
+    double baseChroma = 0.0;
+    double baseBlueAmber = 0.0;
+    bool refusedAtBase = false;
+    int appliedT = 0;
+    int appliedTint = 0;
+    double finalChroma = 0.0;
+    bool verified = false;
+};
+
+VerificationReplica replicateVerification( const DecisionInputs &in, int solvedT, int solvedTint )
+{
+    VerificationReplica v;
+    const LookAssistAutoWhiteBalancePatch &patch = in.patch;
+    if( !in.refineWithoutPatch || !in.render || in.rawW <= 0 || in.rawH <= 0 )
+    {
+        v.exit = QStringLiteral( "cannot-ask" );
+        return v;
+    }
+    const LookAssistWhiteBalanceBounds window = verificationWindow( in );
+    if( window.minTemperature > window.maxTemperature || window.minTint > window.maxTint )
+    {
+        v.exit = QStringLiteral( "window-empty" );
+        return v;
+    }
+    v.priorT = in.baseT;
+    v.priorTint = in.baseTint;
+    v.priorAsked = lookAssistAsShotPrior( in.stats, in.scene, &v.priorT, &v.priorTint );
+    if( !v.priorAsked )
+    {
+        v.exit = QStringLiteral( "no-prior" );
+        return v;
+    }
+    v.priorT = std::max( window.minTemperature, std::min( v.priorT, window.maxTemperature ) );
+    v.priorTint = std::max( window.minTint, std::min( v.priorTint, window.maxTint ) );
+
+    const double stops = in.analysisExposure / 100.0;
+    LookAssistRenderedPicture base;
+    if( !in.render( stops, v.priorT, v.priorTint, &base ) || base.stats.median <= 0.0 )
+    {
+        v.exit = QStringLiteral( "base-render" );
+        return v;
+    }
+    if( base.width <= 0 || base.height <= 0 || base.downscaleFactor <= 0
+     || base.rgb.size() < static_cast<size_t>( base.width ) * base.height * 3
+     || patch.thumbnailX < 0 || patch.thumbnailX >= base.width || patch.thumbnailY < 0 || patch.thumbnailY >= base.height
+     || patch.rawX != std::max( 0, std::min( patch.thumbnailX * base.downscaleFactor + base.downscaleFactor / 2, in.rawW - 1 ) )
+     || patch.rawY != std::max( 0, std::min( patch.thumbnailY * base.downscaleFactor + base.downscaleFactor / 2, in.rawH - 1 ) ) )
+    {
+        v.exit = QStringLiteral( "not-a-pixel" );
+        return v;
+    }
+    const LookAssistAutoWhiteBalancePatch atBase =
+        patchAt( base.rgb, base.width, base.height, patch.thumbnailX, patch.thumbnailY, base.downscaleFactor, in.rawW, in.rawH );
+    v.baseChroma = atBase.chroma;
+    v.baseBlueAmber = atBase.blueAmberAxis;
+    if( !lookAssistDaylightPatchIsNeutralEnough( atBase ) )
+    {
+        v.refusedAtBase = true;
+        v.exit = QStringLiteral( "refused-at-base" );
+        return v;
+    }
+
+    v.appliedT = std::max( window.minTemperature, std::min( solvedT, window.maxTemperature ) );
+    v.appliedTint = std::max( window.minTint, std::min( solvedTint, window.maxTint ) );
+    LookAssistRenderedPicture verify;
+    // lookAssistSamePictureGeometry (:732-737).
+    if( !in.render( stops, v.appliedT, v.appliedTint, &verify ) || verify.width != base.width || verify.height != base.height
+     || verify.downscaleFactor != base.downscaleFactor
+     || verify.rgb.size() < static_cast<size_t>( verify.width ) * verify.height * 3 )
+    {
+        v.exit = QStringLiteral( "verify-render" );
+        return v;
+    }
+    const LookAssistAutoWhiteBalancePatch atSolution =
+        patchAt( verify.rgb, verify.width, verify.height, patch.thumbnailX, patch.thumbnailY, base.downscaleFactor, in.rawW, in.rawH );
+    v.finalChroma = atSolution.valid ? atSolution.chroma : 0.0;
+    v.verified = atSolution.valid && lookAssistDaylightPatchIsNeutralEnough( atSolution )
+              && atSolution.chroma <= patch.chroma + kVerifyChromaSlack;
+    v.exit = v.verified ? QStringLiteral( "verified" ) : QStringLiteral( "unverified-at-solution" );
+    return v;
+}
+
+// resolveLookAssistWhiteBalance's patch branch (:1003-1057), and what the applier LOGS for it (ReceiptApplier.cpp
+// :1065-1073): corroborated daylight with nothing accepted falls back to master's pass and names the reason there.
+struct DecisionReplica
+{
+    QString branch = QStringLiteral( "none" );  // accepted | accepted-damped | rejected-unverified | rejected-unstable | none
+    QString logged;                             // autoWbDecision on the applied line, or the fallback line's reason
+    bool fallback = false;
+    // Daylight, nothing accepted and nothing refused: the refinement walk runs (:1064-1080). The replica does not model the
+    // walk; it predicts the fallback the walk ends in when it acquires no surface.
+    bool walkUnmodelled = false;
+    bool undamped = false;
+    bool stable = false;
+    double damping = 1.0;
+    int candT = 0;
+    int candTint = 0;
+    int solvedT = 0;
+    int solvedTint = 0;
+    bool verificationRan = false;               // the product's initialPatchChecked
+    VerificationReplica verification;
+};
+
+DecisionReplica replicateDecision( const DecisionInputs &in )
+{
+    DecisionReplica r;
+    const bool daylight = lookAssistIsDaylightScene( in.stats, in.scene );
+    r.undamped = in.solvedOnProcessedPicture && daylight;   // lookAssistDaylightSolveIsUndamped (:232-235)
+    bool accepted = false;
+    bool refused = false;
+    if( in.patch.valid )
+    {
+        int t = in.baseT;
+        int tint = in.baseTint;
+        if( in.solve ) in.solve( in.patch.rawX, in.patch.rawY, &t, &tint );
+        r.candT = std::max( in.minT, std::min( t, in.maxT ) );
+        r.candTint = std::max( in.minTint, std::min( tint, in.maxTint ) );
+        r.candTint = std::max( kSolverMinTint, std::min( r.candTint, kSolverMaxTint ) );
+        r.solvedT = r.candT;
+        r.solvedTint = r.candTint;
+        r.stable = lookAssistAutoWhiteBalanceSolutionIsStable( in.patch, in.baseT, in.baseTint, r.candT, r.candTint, r.undamped );
+        // Only an undamped stable solve is verified (:1018-1019); a damped one never is.
+        if( r.stable && r.undamped )
+        {
+            r.verificationRan = true;
+            r.verification = replicateVerification( in, r.candT, r.candTint );
+            refused = !r.verification.verified;
+        }
+        if( refused )
+        {
+            r.branch = QStringLiteral( "rejected-unverified" );
+        }
+        else if( r.stable )
+        {
+            r.damping = r.undamped ? 1.0
+                : lookAssistAutoWhiteBalanceDampingFactor( in.patch, in.baseT, in.baseTint, r.candT, r.candTint, in.scene );
+            if( r.damping < 0.999 )
+            {
+                r.solvedT = std::max( in.minT, std::min( in.baseT + qRound( ( r.candT - in.baseT ) * r.damping ), in.maxT ) );
+                r.solvedTint = std::max( in.minTint, std::min( in.baseTint + qRound( ( r.candTint - in.baseTint ) * r.damping ),
+                                                               in.maxTint ) );
+                r.branch = QStringLiteral( "accepted-damped" );
+            }
+            else
+            {
+                r.branch = QStringLiteral( "accepted" );
+            }
+            accepted = true;
+        }
+        else
+        {
+            r.branch = QStringLiteral( "rejected-unstable" );
+        }
+    }
+    if( !accepted && daylight )
+    {
+        r.fallback = true;
+        r.walkUnmodelled = !refused && in.refineWithoutPatch && static_cast<bool>( in.render );
+        r.logged = refused ? QStringLiteral( "initial_patch_unverified" ) : QStringLiteral( "no_verified_surface" );
+    }
+    else
+    {
+        r.logged = r.branch;
+    }
+    return r;
+}
+
+// ReceiptApplier.cpp :1070: the reason the applier logs when the daylight pass falls back to master's.
+QString applierFallbackReason( const LookAssistWhiteBalanceResolution &wb )
+{
+    return wb.initialPatchRefused ? QStringLiteral( "initial_patch_unverified" ) : QStringLiteral( "no_verified_surface" );
+}
+
+// The product's own decision on the same request, with every balance it asked the renderer for.
+struct ProductRun
+{
+    LookAssistWhiteBalanceResolution wb;
+    std::vector<std::pair<int, int>> renders;
+    bool fallback = false;   // ReceiptApplier.cpp :1065 (the daylight pass)
+    QString logged;
+};
+
+ProductRun runProduct( const DecisionInputs &in )
+{
+    ProductRun run;
+    LookAssistWhiteBalanceRequest request;
+    request.stats = &in.stats;
+    request.scene = in.scene;
+    request.patch = in.patch;
+    request.solvedOnProcessedPicture = in.solvedOnProcessedPicture;
+    request.baseTemperature = in.baseT;
+    request.baseTint = in.baseTint;
+    request.minTemperature = in.minT;
+    request.maxTemperature = in.maxT;
+    request.minTint = in.minTint;
+    request.maxTint = in.maxTint;
+    request.rawWidth = in.rawW;
+    request.rawHeight = in.rawH;
+    request.analysisExposure = in.analysisExposure;
+    request.refineWithoutPatch = in.refineWithoutPatch;
+    if( in.render )
+    {
+        request.renderBalance = [&run, &in]( double stops, int temperature, int tint, LookAssistRenderedPicture *picture )
+        {
+            run.renders.emplace_back( temperature, tint );
+            return in.render( stops, temperature, tint, picture );
+        };
+    }
+    LookAssistPreset preset;
+    run.wb = resolveLookAssistWhiteBalance( request, in.solve, &preset );
+    run.fallback = run.wb.legacyBalance;
+    run.logged = run.fallback ? applierFallbackReason( run.wb ) : run.wb.decision;
+    return run;
+}
+
+// The replica held to the product, field by field: everything the applier logs or the decision turns on.
+bool replicaMatchesProduct( const char *tag, const DecisionReplica &r, const ProductRun &p )
+{
+    const bool logged = r.logged == p.logged;
+    const bool fallback = r.fallback == p.fallback;
+    const bool verification = r.verificationRan == p.wb.initialPatchChecked;
+    const bool candidate = r.candT == p.wb.candidateTemperature && r.candTint == p.wb.candidateTint;
+    const bool solved = r.solvedT == p.wb.solvedTemperature && r.solvedTint == p.wb.solvedTint;
+    const bool damping = r.damping == p.wb.damping;
+    const bool chroma = r.verification.baseChroma == p.wb.initialPatchBaseChroma
+                     && r.verification.finalChroma == p.wb.initialPatchFinalChroma;
+    const bool refusedAtBase = r.verification.refusedAtBase == p.wb.initialPatchRefusedAtBase;
+    std::printf( "WB_GATE %s replica_vs_product logged=%d(%s/%s) fallback=%d verification=%d(%s) candidate=%d(%d/%d vs %d/%d) "
+                 "solved=%d damping=%d(%.3f vs %.3f) chroma=%d(%.1f/%.1f vs %.1f/%.1f) refusedAtBase=%d\n",
+                 tag, logged ? 1 : 0, r.logged.toUtf8().constData(), p.logged.toUtf8().constData(), fallback ? 1 : 0,
+                 verification ? 1 : 0, r.verification.exit.toUtf8().constData(), candidate ? 1 : 0, r.candT, r.candTint,
+                 p.wb.candidateTemperature, p.wb.candidateTint, solved ? 1 : 0, damping ? 1 : 0, r.damping, p.wb.damping,
+                 chroma ? 1 : 0, r.verification.baseChroma, r.verification.finalChroma, p.wb.initialPatchBaseChroma,
+                 p.wb.initialPatchFinalChroma, refusedAtBase ? 1 : 0 );
+    std::fflush( stdout );
+    return logged && fallback && verification && candidate && solved && damping && chroma && refusedAtBase;
 }
 
 // The analysis the headless applier ran on this frame, replicated on the fixture as the run left it
@@ -244,16 +530,41 @@ struct GateTrace
     double finalChroma = -1.0;
     bool g4Neutral = false, g4 = false;
     bool g5T = false, g5Tint = false;
-    QString decision;                             // accepted | rejected-unstable | initial_patch_unverified
+    DecisionReplica decision;                     // what the product decides for this surface, and what the applier logs
     QString firstRefusing;                        // g1 | g2 | g3 | g4 | none
 };
 
-GateTrace traceGates( MlvPipelineFixture &fixture, int frame, const Analysis &a, const LookAssistAutoWhiteBalancePatch &surface )
+// The request the headless applier builds for `surface` on this frame: the live solver at the base balance (:1016, :1059-1063)
+// and the live renderer (:1053-1054).
+DecisionInputs decisionInputs( MlvPipelineFixture &fixture, int frame, const Analysis &a,
+                               const LookAssistAutoWhiteBalancePatch &surface )
+{
+    mlvObject_t *video = fixture.video();
+    processingObject_t *processing = fixture.processing();
+    DecisionInputs in;
+    in.stats = a.stats;
+    in.scene = a.scene;
+    in.patch = surface;
+    in.solvedOnProcessedPicture = a.processed;
+    in.rawW = a.rawW;
+    in.rawH = a.rawH;
+    in.analysisExposure = a.analysisExposure;
+    in.refineWithoutPatch = lookAssistRefineDaylightWithoutPatchEnabled();
+    in.render = ReceiptApplier::lookAssistBalanceRenderer( video, frame, a.colorDownscale, a.cw, a.ch, 1, false );
+    const int baseT = in.baseT, baseTint = in.baseTint;
+    in.solve = [video, processing, frame, baseT, baseTint]( int rawX, int rawY, int *temperature, int *tint )
+    {
+        processingSetWhiteBalance( processing, baseT, baseTint / 10.0 );
+        findMlvWhiteBalanceAtAnalysisLevels( video, static_cast<uint64_t>( frame ), rawX, rawY, temperature, tint, 0 );
+    };
+    return in;
+}
+
+GateTrace traceGates( const Analysis &a, const DecisionInputs &in )
 {
     GateTrace t;
-    t.surface = surface;
-    mlvObject_t *video = fixture.video();
-    const LookAssistAutoWhiteBalancePatch &p = surface;
+    t.surface = in.patch;
+    const LookAssistAutoWhiteBalancePatch &p = in.patch;
 
     // g1: the patch-search filters (:489-490 edge, :503-509).
     const int edgeX = std::max( 1, a.cw / 80 );
@@ -267,27 +578,28 @@ GateTrace traceGates( MlvPipelineFixture &fixture, int frame, const Analysis &a,
     t.score = p.luma * 0.75 - p.chroma * 1.6 - std::max( 0.0, p.greenAxis ) * 2.8 - std::fabs( p.blueAmberAxis ) * 0.4;
 
     // The solve, as the headless applier runs it: the live object at the base balance (:984), the live solver (:1029).
-    const int baseT = 6000, baseTint = 0;
-    processingSetWhiteBalance( fixture.processing(), baseT, baseTint / 10.0 );
+    const int baseT = in.baseT, baseTint = in.baseTint;
     t.rawSolveT = baseT;
     t.rawSolveTint = baseTint;
-    findMlvWhiteBalanceAtAnalysisLevels( video, static_cast<uint64_t>( frame ), p.rawX, p.rawY, &t.rawSolveT, &t.rawSolveTint, 0 );
-    t.candT = std::max( kLookAssistTemperatureMin, std::min( t.rawSolveT, kLookAssistTemperatureMax ) );
-    t.candTint = std::max( kLookAssistTintMin, std::min( t.rawSolveTint, kLookAssistTintMax ) );
+    in.solve( p.rawX, p.rawY, &t.rawSolveT, &t.rawSolveTint );
+    t.candT = std::max( in.minT, std::min( t.rawSolveT, in.maxT ) );
+    t.candTint = std::max( in.minTint, std::min( t.rawSolveTint, in.maxTint ) );
     t.candTint = std::max( kSolverMinTint, std::min( t.candTint, kSolverMaxTint ) );
 
     // g2: stability, daylight solve.
     t.g2NeutralEnough = lookAssistDaylightPatchIsNeutralEnough( p );
     t.g2 = lookAssistAutoWhiteBalanceSolutionIsStable( p, baseT, baseTint, t.candT, t.candTint, true );
 
-    // g3: the same pixel at the as-shot prior, clamped into the window (:940-951, :967-970).
-    const LookAssistWhiteBalanceBounds window = lookAssistWhiteBalanceBounds( a.stats, a.scene );
+    // g3: the same pixel at the as-shot prior, clamped into the window (:940-951, :967-970). Measured whatever g2 says (this is
+    // the trace; what the product does is the decision replica below).
+    const LookAssistWhiteBalanceBounds window = verificationWindow( in );
     const double stops = a.analysisExposure / 100.0;
-    const LookAssistRenderBalanceFn render =
-        ReceiptApplier::lookAssistBalanceRenderer( video, frame, a.colorDownscale, a.cw, a.ch, 1, false );
+    const LookAssistRenderBalanceFn &render = in.render;
     t.priorT = baseT;
     t.priorTint = baseTint;
     t.priorAsked = lookAssistAsShotPrior( a.stats, a.scene, &t.priorT, &t.priorTint );
+    t.priorT = std::max( window.minTemperature, std::min( t.priorT, window.maxTemperature ) );
+    t.priorTint = std::max( window.minTint, std::min( t.priorTint, window.maxTint ) );
     if( t.priorAsked )
     {
         LookAssistRenderedPicture base;
@@ -316,10 +628,8 @@ GateTrace traceGates( MlvPipelineFixture &fixture, int frame, const Analysis &a,
         t.g4 = t.g4Neutral && s.chroma <= p.chroma + kVerifyChromaSlack;
     }
 
-    // The decision (:1014-1025): unstable -> rejected; stable but unverified (g3 or g4) -> master's fallback.
-    if( !t.g2 ) t.decision = QStringLiteral( "rejected-unstable" );
-    else if( !t.priorAsked || !t.g3 || !t.g4 ) t.decision = QStringLiteral( "initial_patch_unverified" );
-    else t.decision = QStringLiteral( "accepted" );
+    // The decision (:1003-1090), every branch, as the applier logs it.
+    t.decision = replicateDecision( in );
     t.firstRefusing = !t.g1 ? QStringLiteral( "g1" ) : !t.g2 ? QStringLiteral( "g2" ) : !t.g3 ? QStringLiteral( "g3" )
                     : !t.g4 ? QStringLiteral( "g4" ) : QStringLiteral( "none" );
     return t;
@@ -344,8 +654,10 @@ void printTrace( const char *tag, const char *which, const GateTrace &t )
                  kVerifyChromaSlack, t.g4Neutral ? 1 : 0 );
     std::printf( "WB_GATE %s %s g5 binds=%d temperature=%d tint=%d\n", tag, which, ( t.g5T || t.g5Tint ) ? 1 : 0,
                  t.g5T ? 1 : 0, t.g5Tint ? 1 : 0 );
-    std::printf( "WB_GATE %s %s decision=%s first_refusing=%s\n", tag, which, t.decision.toUtf8().constData(),
-                 t.firstRefusing.toUtf8().constData() );
+    std::printf( "WB_GATE %s %s decision=%s first_refusing=%s branch=%s undamped=%d verification=%s walk_unmodelled=%d\n", tag,
+                 which, t.decision.logged.toUtf8().constData(), t.firstRefusing.toUtf8().constData(),
+                 t.decision.branch.toUtf8().constData(), t.decision.undamped ? 1 : 0,
+                 t.decision.verification.exit.toUtf8().constData(), t.decision.walkUnmodelled ? 1 : 0 );
     std::fflush( stdout );
 }
 
@@ -411,40 +723,72 @@ void probeState( const char *tag, const char *clip, int frame )
     const LookAssistAutoWhiteBalancePatch laPatch = a.patch;
 
     // (i) Look Assist's own patch.
-    const GateTrace la = traceGates( fixture, frame, a, laPatch );
+    const DecisionInputs laInputs = decisionInputs( fixture, frame, a, laPatch );
+    const GateTrace la = traceGates( a, laInputs );
     printTrace( tag, "la", la );
+    const DecisionReplica &replica = la.decision;
+    // The product's own decision on the replica's request (same patch, the live solver and renderer).
+    const ProductRun replay = runProduct( laInputs );
 
     // PREMISES, against the applier's own log of this run.
+    // The replica stops at the refinement walk; a walk that acquired a surface is a branch it does not replicate.
+    const bool branchReplicated = !replica.walkUnmodelled || fallback;
+    std::printf( "WB_GATE %s premise branch_replicated=%d (branch %s, walk_unmodelled=%d, logged fallback=%d)\n", tag,
+                 branchReplicated ? 1 : 0, replica.branch.toUtf8().constData(), replica.walkUnmodelled ? 1 : 0, fallback ? 1 : 0 );
+    std::fflush( stdout );
+    ASSERT_TRUE( branchReplicated );
+    const QString &chromaLine = fallback ? fallbackLine : appliedLine;
+    const QString loggedDecision = fallback
+        ? field( fallbackLine, "reason" )
+        : field( appliedLine, "autoWbDecision" );
+    // The replayed decision reproduces every field the applier logged for its own run. A fallback line names no patch and no
+    // candidate (ReceiptApplier.cpp :1068-1073), so for a fallback state this is the binding the log affords for both: the
+    // patch and candidate the replica found, through the product's own decision, give the logged reason, refusedAtBase and
+    // base / final chroma (WB-GATE-FALLBACK-PREMISE-COVERAGE-1).
+    const bool replayMatchesLog = replay.fallback == fallback && replay.logged == loggedDecision
+        && field( chromaLine, "initialPatchBaseChroma" ).toUtf8() == f1( replay.wb.initialPatchBaseChroma )
+        && field( chromaLine, "initialPatchFinalChroma" ).toUtf8() == f1( replay.wb.initialPatchFinalChroma )
+        && ( fallback
+             ? field( fallbackLine, "refusedAtBase" )
+                   == ( ( replay.wb.refineRefusedAtBase || replay.wb.initialPatchRefusedAtBase ) ? QStringLiteral( "true" )
+                                                                                                 : QStringLiteral( "false" ) )
+             : field( appliedLine, "autoWbCandidateTemp" ) == QString::number( replay.wb.candidateTemperature )
+                   && field( appliedLine, "autoWbCandidateTint" ) == QString::number( replay.wb.candidateTint ) );
+    bool patchMatches = false;
+    bool candidateMatches = false;
     if( !fallback )
     {
-        const bool patchMatches = field( appliedLine, "patchValid" ) == QStringLiteral( "true" )
+        patchMatches = field( appliedLine, "patchValid" ) == QStringLiteral( "true" )
             && field( appliedLine, "patchLuma" ).toUtf8() == f1( laPatch.luma )
             && field( appliedLine, "patchChroma" ).toUtf8() == f1( laPatch.chroma )
             && field( appliedLine, "patchBlueAmber" ).toUtf8() == f1( laPatch.blueAmberAxis )
             && field( appliedLine, "patchGreenAxis" ).toUtf8() == f1( laPatch.greenAxis );
-        const bool candidateMatches = field( appliedLine, "autoWbCandidateTemp" ) == QString::number( la.candT )
+        candidateMatches = field( appliedLine, "autoWbCandidateTemp" ) == QString::number( la.candT )
             && field( appliedLine, "autoWbCandidateTint" ) == QString::number( la.candTint );
-        std::printf( "WB_GATE %s premise patch=%d candidate=%d\n", tag, patchMatches ? 1 : 0, candidateMatches ? 1 : 0 );
-        std::fflush( stdout );
-        ASSERT_TRUE( patchMatches );
-        ASSERT_TRUE( candidateMatches );
     }
-    // What the decision logs: nothing (0.0) past a gate that returned early (unstable: never checked, :1018-1019;
-    // refused at base: no verification render, :970).
-    const QString &chromaLine = fallback ? fallbackLine : appliedLine;
-    const double expectBase = la.g2 ? la.baseChroma : 0.0;
-    const double expectFinal = ( la.g2 && la.g3 ) ? la.finalChroma : 0.0;
-    const bool chromaMatches = field( chromaLine, "initialPatchBaseChroma" ).toUtf8() == f1( expectBase )
-        && field( chromaLine, "initialPatchFinalChroma" ).toUtf8() == f1( expectFinal );
-    const QString loggedDecision = fallback
-        ? field( fallbackLine, "reason" )
-        : field( appliedLine, "autoWbDecision" );
-    const bool decisionMatches = loggedDecision == la.decision;
+    else
+    {
+        patchMatches = replayMatchesLog;
+        candidateMatches = la.candT == replay.wb.candidateTemperature && la.candTint == replay.wb.candidateTint
+            && replica.candT == la.candT && replica.candTint == la.candTint;
+    }
+    std::printf( "WB_GATE %s premise patch=%d candidate=%d bound_by=%s replay_vs_log=%d\n", tag, patchMatches ? 1 : 0,
+                 candidateMatches ? 1 : 0, fallback ? "replayed-decision" : "applied-line", replayMatchesLog ? 1 : 0 );
+    std::fflush( stdout );
+    ASSERT_TRUE( patchMatches );
+    ASSERT_TRUE( candidateMatches );
+    ASSERT_TRUE( replayMatchesLog );
+    // What the decision logs: nothing (0.0) past a gate that returned early (unstable or damped: never checked, :1018-1019;
+    // no prior / empty window: :945, :949; refused at base: no verification render, :970).
+    const bool chromaMatches = field( chromaLine, "initialPatchBaseChroma" ).toUtf8() == f1( replica.verification.baseChroma )
+        && field( chromaLine, "initialPatchFinalChroma" ).toUtf8() == f1( replica.verification.finalChroma );
+    const bool decisionMatches = loggedDecision == replica.logged;
     std::printf( "WB_GATE %s premise g3g4_chroma=%d decision=%d (logged %s, replicated %s)\n", tag, chromaMatches ? 1 : 0,
-                 decisionMatches ? 1 : 0, loggedDecision.toUtf8().constData(), la.decision.toUtf8().constData() );
+                 decisionMatches ? 1 : 0, loggedDecision.toUtf8().constData(), replica.logged.toUtf8().constData() );
     std::fflush( stdout );
     ASSERT_TRUE( chromaMatches );
     ASSERT_TRUE( decisionMatches );
+    ASSERT_TRUE( replicaMatchesProduct( tag, replica, replay ) );
 
     // (ii) The deck box centre (r1 Phase B's deck region, in RAW / render coordinates), as a thumbnail pixel.
     const int width = fixture.width();
@@ -454,7 +798,7 @@ void probeState( const char *tag, const char *clip, int frame )
     const LookAssistAutoWhiteBalancePatch deckPatch = patchAt( a.consumer, a.cw, a.ch, deckCx / a.colorDownscale,
                                                                deckCy / a.colorDownscale, a.colorDownscale, a.rawW, a.rawH );
     std::printf( "WB_GATE %s deck centre=%d,%d render=%dx%d raw=%dx%d\n", tag, deckCx, deckCy, width, height, a.rawW, a.rawH );
-    const GateTrace deck = traceGates( fixture, frame, a, deckPatch );
+    const GateTrace deck = traceGates( a, decisionInputs( fixture, frame, a, deckPatch ) );
     printTrace( tag, "deck", deck );
     // The search keeps the highest-scoring filtered pixel (:516): a deck that passes g1 still loses to a higher score.
     std::printf( "WB_GATE %s deck rank score=%.2f la_score=%.2f loses_ranking=%d\n", tag, deck.score, la.score,
@@ -481,6 +825,107 @@ void probeState( const char *tag, const char *clip, int frame )
     std::fflush( stdout );
 }
 
+// ---- Decision-replica fixtures (WB-GATE-PROBE-HARDEN-1) ----
+// The five tracked states all take the undamped daylight path with the as-shot prior asked and the default control range, so
+// the replica was only ever held to that branch there. These drive the product decision on synthetic requests, one branch
+// each, and hold the replica to it.
+const int kSynWidth = 16;
+const int kSynHeight = 16;
+const int kSynDownscale = 4;
+
+// Every pixel is one surface, neutral when rendered at (neutralT, neutralTint): B-R moves one unit per 100 K and the green
+// axis one unit per 2 receipt tint units away from there. It has no neutral samples (balanceSamples 0), so the refinement
+// walk acquires nothing on it.
+LookAssistRenderBalanceFn syntheticRenderer( int neutralT, int neutralTint )
+{
+    return [neutralT, neutralTint]( double, int temperature, int tint, LookAssistRenderedPicture *picture ) -> bool
+    {
+        const int blueAmber = ( temperature - neutralT ) / 100;
+        const int green = ( neutralTint - tint ) / 2;
+        const int r = 150 - blueAmber / 2;
+        const int b = r + blueAmber;
+        const int g = ( r + b ) / 2 + green;
+        picture->width = kSynWidth;
+        picture->height = kSynHeight;
+        picture->downscaleFactor = kSynDownscale;
+        picture->stats = LookAssistStats();
+        picture->stats.median = 128.0;
+        picture->rgb.assign( static_cast<size_t>( kSynWidth ) * kSynHeight * 3, 0 );
+        for( size_t i = 0; i < picture->rgb.size(); i += 3 )
+        {
+            picture->rgb[i] = static_cast<unsigned char>( std::max( 0, std::min( r, 255 ) ) );
+            picture->rgb[i + 1] = static_cast<unsigned char>( std::max( 0, std::min( g, 255 ) ) );
+            picture->rgb[i + 2] = static_cast<unsigned char>( std::max( 0, std::min( b, 255 ) ) );
+        }
+        return true;
+    };
+}
+
+// Corroborated daylight (a bright recorded exposure that the rendered picture agrees with), as-shot 5600 K / 0 if asked.
+LookAssistStats syntheticDaylightStats( bool hasAsShot )
+{
+    LookAssistStats stats;
+    stats.median = 128.0;
+    stats.hasSceneEv100 = true;
+    stats.sceneEv100 = 14.0;
+    stats.daylightPictureEvidence = true;
+    lookAssistSetAsShotWhiteBalance( &stats, hasAsShot, 5600, 0 );
+    return stats;
+}
+
+LookAssistAutoWhiteBalancePatch syntheticPatch( double luma, double chroma, double blueAmber )
+{
+    LookAssistAutoWhiteBalancePatch p;
+    p.valid = true;
+    p.thumbnailX = kSynWidth / 2;
+    p.thumbnailY = kSynHeight / 2;
+    p.rawX = p.thumbnailX * kSynDownscale + kSynDownscale / 2;
+    p.rawY = p.thumbnailY * kSynDownscale + kSynDownscale / 2;
+    p.luma = luma;
+    p.chroma = chroma;
+    p.blueAmberAxis = blueAmber;
+    p.greenAxis = 0.0;
+    return p;
+}
+
+DecisionInputs syntheticInputs( const LookAssistStats &stats, LookAssistScene scene, const LookAssistAutoWhiteBalancePatch &patch,
+                                bool processed, int solveT, int solveTint, int neutralT )
+{
+    DecisionInputs in;
+    in.stats = stats;
+    in.scene = scene;
+    in.patch = patch;
+    in.solvedOnProcessedPicture = processed;
+    in.rawW = kSynWidth * kSynDownscale;
+    in.rawH = kSynHeight * kSynDownscale;
+    in.analysisExposure = 120;
+    in.refineWithoutPatch = true;
+    in.render = syntheticRenderer( neutralT, 0 );
+    in.solve = [solveT, solveTint]( int, int, int *temperature, int *tint )
+    {
+        *temperature = solveT;
+        *tint = solveTint;
+    };
+    return in;
+}
+
+const LookAssistAutoWhiteBalancePatch kNeutralPatch = syntheticPatch( 150.0, 4.0, -4.0 );
+
+// A fixture's premise: the product took the branch the fixture is about. Fails naming the branch.
+void requireBranch( const char *fixture, const char *branch, bool taken, const ProductRun &run )
+{
+    std::printf( "WB_GATE fixture %s premise branch=%s taken=%d (product decision=%s source=%s checked=%d refused=%d "
+                 "refusedAtBase=%d legacy=%d refineAttempted=%d renders=%d first_render=%d/%d)\n",
+                 fixture, branch, taken ? 1 : 0, run.wb.decision.toUtf8().constData(), run.wb.source.toUtf8().constData(),
+                 run.wb.initialPatchChecked ? 1 : 0, run.wb.initialPatchRefused ? 1 : 0, run.wb.initialPatchRefusedAtBase ? 1 : 0,
+                 run.wb.legacyBalance ? 1 : 0, run.wb.refineAttempted ? 1 : 0, static_cast<int>( run.renders.size() ),
+                 run.renders.empty() ? 0 : run.renders.front().first, run.renders.empty() ? 0 : run.renders.front().second );
+    std::fflush( stdout );
+    if( !taken )
+        ::minitest::fail( __FILE__, __LINE__, std::string( "premise: the product takes branch " ) + branch,
+                          std::string( "fixture " ) + fixture + " is about that branch and the product did not take it" );
+}
+
 } // namespace
 
 TEST(LookAssistWbGateProbe, GateTraceOnTheTrackedFixtures)
@@ -492,4 +937,99 @@ TEST(LookAssistWbGateProbe, GateTraceOnTheTrackedFixtures)
     probeState( "large-f5", kLargeClip, 5 );
     probeState( "large-f10", kLargeClip, 10 );
     probeState( "large-f15", kLargeClip, 15 );
+}
+
+// The control: the branch the tracked states take (undamped daylight, prior asked, verified).
+TEST(LookAssistWbGateProbe, DecisionReplicaUndampedAcceptedFixture)
+{
+    const DecisionInputs in = syntheticInputs( syntheticDaylightStats( true ), LookAssistScene::Shade, kNeutralPatch, true,
+                                               5600, 0, 5600 );
+    const ProductRun run = runProduct( in );
+    requireBranch( "undamped-accepted", "accepted (undamped, verified)",
+                   run.wb.decision == QStringLiteral( "accepted" ) && run.wb.initialPatchChecked && !run.fallback, run );
+    ASSERT_TRUE( replicaMatchesProduct( "fixture undamped-accepted", replicateDecision( in ), run ) );
+}
+
+// A daylight frame whose solve is damped (solved on the RAW thumbnail, not the processed picture): accepted-damped, and the
+// product never asks initialDaylightPatchIsVerified (initialPatchChecked stays false, nothing is rendered).
+TEST(LookAssistWbGateProbe, DecisionReplicaAcceptedDampedFixture)
+{
+    const DecisionInputs in = syntheticInputs( syntheticDaylightStats( true ), LookAssistScene::Shade,
+                                               syntheticPatch( 150.0, 14.0, 10.0 ), false, 7500, 0, 5600 );
+    const ProductRun run = runProduct( in );
+    requireBranch( "accepted-damped", "accepted-damped (verification never called)",
+                   run.wb.decision == QStringLiteral( "accepted-damped" ) && !run.wb.initialPatchChecked && run.renders.empty()
+                       && !run.fallback,
+                   run );
+    ASSERT_TRUE( replicaMatchesProduct( "fixture accepted-damped", replicateDecision( in ), run ) );
+}
+
+// Daylight, an unstable solve (a blue-locus patch): rejected-unstable, then the refinement walk acquires nothing and the
+// applier falls back naming no_verified_surface, never rejected-unstable.
+TEST(LookAssistWbGateProbe, DecisionReplicaRejectedUnstableDaylightFixture)
+{
+    const DecisionInputs in = syntheticInputs( syntheticDaylightStats( true ), LookAssistScene::Shade,
+                                               syntheticPatch( 150.0, 9.0, 25.0 ), true, 6500, 0, 5600 );
+    const ProductRun run = runProduct( in );
+    requireBranch( "rejected-unstable-daylight", "rejected-unstable, then a refinement walk that acquired nothing",
+                   run.fallback && !run.wb.initialPatchChecked && !run.wb.initialPatchRefused && run.wb.refineAttempted
+                       && run.wb.candidateTemperature == 6500,
+                   run );
+    ASSERT_TRUE( replicaMatchesProduct( "fixture rejected-unstable-daylight", replicateDecision( in ), run ) );
+}
+
+// Not daylight, an unstable solve: rejected-unstable is what the applied line logs (no fallback).
+TEST(LookAssistWbGateProbe, DecisionReplicaRejectedUnstableOffDaylightFixture)
+{
+    const DecisionInputs in = syntheticInputs( LookAssistStats(), LookAssistScene::Night, syntheticPatch( 205.0, 12.0, 14.0 ),
+                                               true, 4000, -35, 5600 );
+    const ProductRun run = runProduct( in );
+    requireBranch( "rejected-unstable-off-daylight", "rejected-unstable (not daylight, no fallback)",
+                   run.wb.decision == QStringLiteral( "rejected-unstable" ) && !run.fallback, run );
+    ASSERT_TRUE( replicaMatchesProduct( "fixture rejected-unstable-off-daylight", replicateDecision( in ), run ) );
+}
+
+// Daylight, no as-shot balance to ask: the verification returns before any render, so the logged base chroma is 0.0
+// (the resolution's default), not a "not measured" sentinel.
+TEST(LookAssistWbGateProbe, DecisionReplicaPriorUnavailableFixture)
+{
+    const DecisionInputs in = syntheticInputs( syntheticDaylightStats( false ), LookAssistScene::Shade, kNeutralPatch, true,
+                                               5600, 0, 5600 );
+    const ProductRun run = runProduct( in );
+    requireBranch( "prior-unavailable", "rejected-unverified at the as-shot prior (none to ask, nothing rendered)",
+                   run.wb.initialPatchChecked && run.wb.initialPatchRefused && !run.wb.initialPatchRefusedAtBase
+                       && run.renders.empty() && run.fallback,
+                   run );
+    ASSERT_TRUE( replicaMatchesProduct( "fixture prior-unavailable", replicateDecision( in ), run ) );
+}
+
+// The request's control range is narrower than the daylight window: the candidate, the prior and the verification balance are
+// clamped into the intersection (:1009-1010, :941-951), so the prior is asked at 6500 K, not at the as-shot 5600 K.
+TEST(LookAssistWbGateProbe, DecisionReplicaClampToRequestRangeFixture)
+{
+    DecisionInputs in = syntheticInputs( syntheticDaylightStats( true ), LookAssistScene::Shade, kNeutralPatch, true, 6000, 0,
+                                         6500 );
+    in.minT = 6500;
+    const ProductRun run = runProduct( in );
+    const bool windowAloneAsksTheAsShot = lookAssistWhiteBalanceBounds( in.stats, in.scene ).minTemperature <= 5600;
+    requireBranch( "clamp-to-request-range", "the request range binds the prior (asked at 6500, the window alone: 5600)",
+                   windowAloneAsksTheAsShot && !run.renders.empty() && run.renders.front() == std::make_pair( 6500, 0 )
+                       && run.wb.initialPatchChecked,
+                   run );
+    ASSERT_TRUE( replicaMatchesProduct( "fixture clamp-to-request-range", replicateDecision( in ), run ) );
+}
+
+// The request's control range lies outside the daylight window: the verification returns before the prior (:945).
+TEST(LookAssistWbGateProbe, DecisionReplicaRequestRangeOutsideWindowFixture)
+{
+    DecisionInputs in = syntheticInputs( syntheticDaylightStats( true ), LookAssistScene::Shade, kNeutralPatch, true, 4300, 0,
+                                         4300 );
+    in.maxT = 4500;
+    const ProductRun run = runProduct( in );
+    const bool windowAndRangeDisjoint = lookAssistWhiteBalanceBounds( in.stats, in.scene ).minTemperature > in.maxT;
+    requireBranch( "request-range-outside-window", "rejected-unverified at the empty window (nothing rendered)",
+                   windowAndRangeDisjoint && run.wb.initialPatchChecked && run.wb.initialPatchRefused && run.renders.empty()
+                       && run.fallback,
+                   run );
+    ASSERT_TRUE( replicaMatchesProduct( "fixture request-range-outside-window", replicateDecision( in ), run ) );
 }

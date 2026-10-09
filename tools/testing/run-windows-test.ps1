@@ -113,6 +113,13 @@ $root = (Resolve-Path -LiteralPath $RepoRoot -ErrorAction Stop).Path
 $exe = Resolve-TestExe -Root $root -SuiteName $Suite -RequestedExePath $ExePath
 $exeDir = Split-Path -Parent $exe
 
+# SUITE-RUNNER-REPO-ROOT-PIN-1: an explicit -RepoRoot is the checkout the test reads its fixtures from. The exe refuses it
+# (exit 86, "[repo_paths] REFUSED REPO_ROOT_MISMATCH ...") when it was built from a different checkout; tests/common/repo_paths.h.
+if ($PSBoundParameters.ContainsKey('RepoRoot')) {
+    $env:MLVAPP_TEST_REPO_ROOT = $root
+    Write-Host ("[run-windows-test] repo_root_pin={0}" -f $root)
+}
+
 Enable-NoPopupErrorMode
 
 $pathDirs = @()

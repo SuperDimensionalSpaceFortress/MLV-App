@@ -118,6 +118,7 @@ SOURCES += \
     $$REPO_ROOT/tests/pipeline/test_cdng_sequence_export.cpp \
     $$REPO_ROOT/tests/pipeline/test_look_assist_fixture_scene.cpp \
     $$REPO_ROOT/tests/pipeline/test_look_assist_wb_gate_probe.cpp \
+    $$REPO_ROOT/tests/pipeline/test_repo_root_pin.cpp \
     $$REPO_ROOT/tests/pipeline/test_look_assist_fixture_neutral_probe.cpp \
     $$REPO_ROOT/tests/pipeline/test_look_assist_flavors.cpp \
     $$REPO_ROOT/tests/pipeline/test_sh_frame_state_proxy.cpp \
