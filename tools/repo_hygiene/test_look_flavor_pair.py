@@ -665,6 +665,99 @@ class FlavorRegradeComposeTests(FlavorRegradeHarness):
         self.assertEqual(sorted(p.name for p in out.iterdir()), ["regrade-metrics.json"])
 
 
+# LOOK-ASSIST-WARMTH-MEASURE-1: the warm-cool (blue-amber) lean, mean((R + G) / 2 - B) on [0, 1] code values -------------------------------
+def flat(rgb, rows=H):
+    import numpy as np
+    return np.tile(np.asarray(rgb, dtype=np.uint8), (rows, W, 1))
+
+
+def constant_y_tables(dr, dg, db):
+    """Y sends every code to 32768 (so a channel table applied BEFORE Y would read 0); each channel then adds a constant: every neutral input
+    leaves as (32768 + dr, 32768 + dg, 32768 + db), lean ((dr + dg) / 2 - db) / 65535 exactly."""
+    import numpy as np
+    v = np.arange(65536)
+    return table_bytes(np.full(65536, 32768), np.clip(v + dr, 0, 65535), np.clip(v + dg, 0, 65535), np.clip(v + db, 0, 65535))
+
+
+def split_tables(step):
+    """Identity Y, G and B; R up by `step` below mid-code and down by `step` above: the neutral lean is +step/2 in the low half, -step/2 in the
+    high half, so the ramp lean is 0 and only a histogram that favours one half sees a lean."""
+    import numpy as np
+    v = np.arange(65536)
+    return table_bytes(v, np.clip(v + np.where(v < 32768, step, -step), 0, 65535), v, v)
+
+
+class WarmCoolHarness(FlavorDiffHarness):
+    def run_warmcool(self, tables: dict, tiles: dict | None = None):
+        self.runs += 1
+        stage = self.tmp / f"warmcool{self.runs}" / ".claude-state" / "stage"
+        stage.mkdir(parents=True)
+        args = [sys.executable, str(TOOL), "warmcool"]
+        for name, data in tables.items():
+            path = stage / f"{name}.u16"
+            path.write_bytes(data)
+            args += ["--table", f"{name}={path}"]
+        if tiles is not None:
+            frames, listing = self.make_side(stage, "capture", tiles, None)
+            args += ["--frames", str(frames), "--listed", str(listing)]
+        return subprocess.run(args, capture_output=True, text=True, timeout=300)
+
+    def lean_doc(self, tables: dict, tiles: dict | None = None):
+        proc = self.run_warmcool(tables, tiles)
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        return json.loads(proc.stdout)
+
+
+class WarmCoolRefusalTests(WarmCoolHarness):
+    def test_a_short_table_is_a_typed_refusal_and_no_input_is_a_usage_error(self) -> None:
+        proc = self.run_warmcool({"bad": b"\0" * 100})
+        self.assertEqual(proc.returncode, 19, proc.stdout + proc.stderr)
+        self.assertTrue(proc.stderr.startswith("REGRADE_TABLE_INVALID"), proc.stderr)
+        self.assertNotIn("Traceback", proc.stderr)
+        self.assertEqual(self.run_warmcool({}).returncode, 2)
+
+
+@requires_imaging
+class WarmCoolMetricTests(WarmCoolHarness):
+    def test_neutral_grey_is_zero_amber_is_positive_and_blue_is_negative(self) -> None:
+        for rgb, expected in (((128, 128, 128), 0.0), ((150, 150, 100), 50 / 255), ((100, 100, 150), -50 / 255), ((160, 120, 100), 40 / 255)):
+            with self.subTest(rgb=rgb):
+                cap = self.lean_doc({}, {0: flat(rgb), 1: flat(rgb)})["capture"]
+                self.assertAlmostEqual(cap["meanLean"], expected, delta=1e-12)
+                self.assertEqual([t["lean"] for t in cap["tiles"]], [cap["meanLean"]] * 2)
+
+    def test_a_table_ramp_lean_is_the_known_offset_and_y_runs_first(self) -> None:
+        doc = self.lean_doc({"ident": identity_tables(), "amber": constant_y_tables(2570, 2570, -2570), "blue": constant_y_tables(-2570, -2570, 2570),
+                             "redonly": constant_y_tables(1000, 0, 0)})["tables"]
+        self.assertEqual(doc["ident"]["rampLean"], 0.0)
+        self.assertAlmostEqual(doc["amber"]["rampLean"], 2 * 2570 / 65535, delta=1e-12)
+        self.assertAlmostEqual(doc["blue"]["rampLean"], -2 * 2570 / 65535, delta=1e-12)
+        self.assertAlmostEqual(doc["redonly"]["rampLean"], 500 / 65535, delta=1e-12)
+        self.assertNotIn("histogramLean", doc["amber"], "no capture, no histogram")
+
+    def test_the_histogram_lean_weights_the_neutral_curve_by_the_capture_and_dlean_is_the_regrade(self) -> None:
+        import numpy as np
+        tile0 = np.concatenate([flat((50, 50, 50), rows=30), flat((200, 200, 200), rows=10)])   # 3/4 of the pixels in the low half
+        doc = self.lean_doc({"split": split_tables(2570)}, {0: tile0})
+        t = doc["tables"]["split"]
+        self.assertAlmostEqual(t["rampLean"], 0.0, delta=1e-12)
+        self.assertAlmostEqual(t["histogramLean"], (0.75 - 0.25) * 1285 / 65535, delta=1e-12)
+        cap = doc["capture"]
+        self.assertEqual(cap["meanLean"], 0.0)
+        # re-graded: 50 -> R 60, 200 -> R 190 (+-2570 / 257 = 10), so the pixel lean is +5 / 255 on 3/4 of the pixels and -5 / 255 on 1/4
+        self.assertAlmostEqual(cap["meanRegradedLean"]["split"], (0.75 * 5 - 0.25 * 5) / 255, delta=1e-12)
+        self.assertAlmostEqual(cap["meanDLean"]["split"], cap["meanRegradedLean"]["split"] - cap["meanLean"], delta=1e-15)
+
+    def test_letterbox_rows_are_excluded_from_the_capture_lean(self) -> None:
+        import numpy as np
+        tile0 = flat((150, 150, 100))
+        tile0[:4] = 0
+        tile0[-4:] = 0
+        cap = self.lean_doc({}, {0: tile0})["capture"]
+        self.assertAlmostEqual(cap["meanLean"], 50 / 255, delta=1e-12)
+        self.assertEqual(cap["tiles"][0]["rows_used"], H - 8)
+
+
 # the pair driver and the cooldown gate (pwsh) ----------------------------------------------------------------------------------------------
 def synthetic_receipt(flavor, manifest="a" * 64):
     return {"receiptId": f"r-{flavor}", "card": "DUAL-VENUE-EVIDENCE-1", "legId": f"leg-{flavor}", "outcome": "PASS",

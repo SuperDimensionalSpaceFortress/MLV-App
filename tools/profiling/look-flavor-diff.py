@@ -76,6 +76,11 @@ METRICS (on the full-resolution tiles)
 RE-GRADE MODE (LOOK-ASSIST-FILM-FLAVOR-2)
     `look-flavor-diff.py regrade ...` lays two engine-built Film tables (film-v1, film-v2) over ONE Cinematic capture: a frame-locked
     Cinematic | v1 | v2 strip. See `look-flavor-diff.py regrade --help`.
+
+WARM-COOL MODE (LOOK-ASSIST-WARMTH-MEASURE-1)
+    `look-flavor-diff.py warmcool ...` measures the blue-amber lean, mean((R + G) / 2 - B) on [0, 1] code values, of engine grade tables
+    (over a neutral ramp, and weighted by a capture's luma histogram) and of a capture before and after each table. Numbers only, on stdout.
+    See `look-flavor-diff.py warmcool --help`.
 """
 import argparse
 import hashlib
@@ -953,10 +958,117 @@ def regrade_main(argv):
         return exc.code
 
 
+# ---- Warm-cool mode (LOOK-ASSIST-WARMTH-MEASURE-1): the blue-amber lean of grade tables and captures ----
+# Reached only through `look-flavor-diff.py warmcool ...`; it writes nothing, so every other mode's outputs are untouched by it.
+WARMCOOL_USAGE = """look-flavor-diff.py warmcool: the blue-amber (warm-cool) lean of engine grade tables and, optionally, of one staged capture.
+
+WHY
+    S and GA (the trio and regrade metrics) are a per-band split and a green axis; neither says whether a look is warm or cool overall.
+    This is that number, defined once and used the same way for a table, a capture and a re-grade.
+
+METRIC
+    lean = mean over pixels of ((R + G) / 2 - B), code values normalized to [0, 1] (8-bit / 255, table / 65535).
+    Positive = amber (warm), negative = blue (cool), exactly 0 on any neutral grey. A grade's lean is lean(graded) - lean(ungraded).
+
+INPUT
+    --table NAME=PATH     repeatable: 4 x 65536 uint16 little-endian, Y R G B (the regrade mode's tables)
+    --frames / --listed   optional: one staged capture (hash-verified, as above)
+
+OUTPUT (stdout, JSON; nothing is written)
+    per table:    rampLean = the lean of the neutral ramp R = G = B = i / 65535 over every 16-bit code, through Y then the channel table.
+    with a capture, per table: histogramLean = that neutral lean weighted by the capture's BT.601 luma histogram (8-bit level c read at
+                  index c * 257, as the re-grade reads it);
+    and per tile and as a mean over tiles: the capture's own lean, the lean of the capture re-graded through each table (as the regrade
+                  mode re-grades), and dLean = the re-graded lean minus the capture's. Letterbox rows are excluded, as everywhere here.
+
+REFUSALS: 12, 14 as above, and 19 REGRADE_TABLE_INVALID (a table is missing, unreadable or not 4 x 65536 uint16).
+"""
+SCHEMA_WARMCOOL = "mlv-app/look-flavor-warmcool/v1"
+WARMCOOL_DEFINITION = "mean((R + G) / 2 - B) on code values normalized to [0, 1]; positive = amber, negative = blue, 0 on neutral grey"
+
+
+def warmcool_lean(pixels, full_scale):
+    """The blue-amber lean of an (..., 3) array of code values on a 0..full_scale scale."""
+    f = np.asarray(pixels, dtype=np.float64).reshape(-1, 3) / float(full_scale)
+    return float(((f[:, 0] + f[:, 1]) / 2.0 - f[:, 2]).mean())
+
+
+def warmcool_neutral_curve(tables):
+    """Per 16-bit code i, the lean of the neutral pixel R = G = B = i after the grade (Y first, then each channel's table)."""
+    y = tables[0]
+    return ((tables[1][y] + tables[2][y]) / 2.0 - tables[3][y]) / 65535.0
+
+
+def compose_warmcool(named, frames_dir, listed):
+    table_bytes = {name: read_regrade_table(path, name) for name, path in named}
+    _load_imaging()
+    tables = {name: regrade_tables(data) for name, data in table_bytes.items()}
+    curves = {name: warmcool_neutral_curve(t) for name, t in tables.items()}
+    doc = {
+        "schema": SCHEMA_WARMCOOL, "definition": WARMCOOL_DEFINITION, "letterboxMaxLuma": LETTERBOX_MAX_LUMA,
+        "tables": {name: {"path": str(path), "sha256": hashlib.sha256(table_bytes[name]).hexdigest(), "rampLean": float(curves[name].mean())}
+                   for name, path in named},
+    }
+    if frames_dir is None:
+        return doc
+    staged, frames = load_side(frames_dir, listed, "capture")
+    hist = np.zeros(256, dtype=np.float64)
+    tiles = []
+    for sidecar in sorted(frames, key=lambda f: f.get("index")):
+        arr = read_rgb(staged, sidecar, "capture")
+        keep = ~(luma_of(arr).max(axis=1) <= LETTERBOX_MAX_LUMA)
+        if not keep.any():
+            keep = np.ones_like(keep)
+        kept = arr[keep]
+        hist += np.bincount(np.clip(np.rint(luma_of(kept)), 0, 255).astype(np.int64).ravel(), minlength=256)
+        lean = warmcool_lean(kept, 255)
+        graded = {name: warmcool_lean(regrade(kept, t), 255) for name, t in tables.items()}
+        tiles.append({"index": sidecar.get("index"), "display_frame": sidecar.get("display_frame"), "rows_used": int(keep.sum()),
+                      "lean": lean, "regradedLean": graded, "dLean": {name: v - lean for name, v in graded.items()}})
+    level = np.arange(256) * 257
+    for name in tables:
+        doc["tables"][name]["histogramLean"] = float((hist / hist.sum() * curves[name][level]).sum())
+    doc["capture"] = {
+        "frames": str(frames_dir), "tiles": tiles,
+        "meanLean": float(np.mean([t["lean"] for t in tiles])),
+        "meanRegradedLean": {name: float(np.mean([t["regradedLean"][name] for t in tiles])) for name in tables},
+        "meanDLean": {name: float(np.mean([t["dLean"][name] for t in tiles])) for name in tables},
+    }
+    return doc
+
+
+def warmcool_main(argv):
+    p = argparse.ArgumentParser(prog="look-flavor-diff.py warmcool", description=WARMCOOL_USAGE, formatter_class=argparse.RawDescriptionHelpFormatter)
+    p.add_argument("--table", action="append", default=[], metavar="NAME=PATH")
+    p.add_argument("--frames", type=Path, default=None)
+    p.add_argument("--listed", type=Path, default=None)
+    args = p.parse_args(argv)
+    if (args.frames is None) != (args.listed is None):
+        p.error("a capture needs both --frames and --listed, or neither")
+    named = []
+    for spec in args.table:
+        name, sep, path = spec.partition("=")
+        if not sep or not name or not path:
+            p.error(f"--table wants NAME=PATH, got {spec!r}")
+        named.append((name, Path(path)))
+    if not named and args.frames is None:
+        p.error("give at least one --table, or a capture")
+    if len({name for name, _ in named}) != len(named):
+        p.error("--table names must be unique")
+    try:
+        print(json.dumps(compose_warmcool(named, args.frames, args.listed), indent=2))
+        return 0
+    except Refusal as exc:
+        print(str(exc), file=sys.stderr)
+        return exc.code
+
+
 def main(argv=None):
     argv = sys.argv[1:] if argv is None else argv
     if argv and argv[0] == "regrade":
         return regrade_main(argv[1:])
+    if argv and argv[0] == "warmcool":
+        return warmcool_main(argv[1:])
     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     for side in ("classic", "cinematic"):
         p.add_argument(f"--{side}-frames", required=True, type=Path)
