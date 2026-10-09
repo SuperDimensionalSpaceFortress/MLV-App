@@ -646,11 +646,109 @@ class VenueChainRunnerTests(unittest.TestCase):
         self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
         self.assertEqual(([l["status"] for l in res["legs"]], res["stopReason"], self.started()), (["RAN"] * 6, None, 6))
         self.assertFalse([l for l in log if " CHAIN_STOP " in l])
-        # 0 is off for the owner-only details too
+        # r1 of VENUE-CHAIN-STREAK-DETAIL-NORMALISE-1: 0 switches off the COUNT rule only; the owner-only first-occurrence stop still applies
+        # (test_owner_only_first_occurrence_stops_even_with_the_count_rule_off)
+
+    # ---------------------------------------------------------------- r1: VENUE-CHAIN-STREAK-DETAIL-NORMALISE-1
+    DISK = "VENUE_UNHEALTHY:leg not submitted: freeDiskGiB {} < 50"
+    COLD = "VENUE_UNHEALTHY:leg not submitted: pwshColdStartMs {} > 800"
+    DISK_KEY = "leg not submitted: freeDiskGiB # < #"
+
+    def reset_legs(self) -> None:
         self.leg_log.unlink(missing_ok=True)
         (self.case / "fake-leg-outcome-count.txt").unlink(missing_ok=True)
-        r, res, _, _ = self.streak_chain("lane-OFF-O", ["VENUE_UNHEALTHY:SESSION_LOCKED"] * 3, "-UnhealthyStreakStop", "0")
+
+    def test_probe_details_that_differ_only_in_a_measured_number_form_one_streak(self) -> None:
+        d = [self.DISK.format(v) for v in ("42.4", "41.9", "41.7")] + [self.DISK.format("41.5")] * 3
+        r, res, log, _ = self.streak_chain("lane-NUM", d)
+        self.assertEqual(r.returncode, 8, r.stdout + r.stderr)
+        self.assertEqual((res["exitCode"], res["stopReason"], res["ran"], res["notRun"]), (8, "VENUE_UNHEALTHY_STREAK", 3, 3))
+        self.assertEqual(self.started(), 3, "a leg ran after the streak stop")
+        # the legs and the stop keep the newest RAW detail, plus the key
+        self.assertEqual([l["outcomeDetail"] for l in res["legs"][:3]], [self.DISK.split(":", 1)[1].format(v) for v in ("42.4", "41.9", "41.7")])
+        stop = [l for l in log if " CHAIN_STOP " in l]
+        self.assertEqual(len(stop), 1, stop)
+        self.assertIn("detail=leg not submitted: freeDiskGiB 41.7 < 50 n=3 threshold=3 receipts=rcpt-1,rcpt-2,rcpt-3", stop[0])
+        self.assertTrue(stop[0].endswith(f" key=[{self.DISK_KEY}]"), stop[0])
+        us = res["unhealthyStop"]
+        self.assertEqual((us["detail"], us["key"], us["n"], us["threshold"], us["ownerOnly"]), ("leg not submitted: freeDiskGiB 41.7 < 50", self.DISK_KEY, 3, 3, False))
+
+    def test_two_different_probe_reasons_never_stop(self) -> None:
+        alt = [self.DISK.format("42.4"), self.COLD.format("1234")] * 3
+        r, res, log, _ = self.streak_chain("lane-REASONS", alt)
+        self.assertEqual((r.returncode, [l["status"] for l in res["legs"]], res["stopReason"]), (0, ["RAN"] * 6, None), r.stdout + r.stderr)
+        self.assertFalse([l for l in log if " CHAIN_STOP " in l])
+        # two of one reason then another: the count restarts at 1, never reaching 3 (3 outcomes = the 3 specs; a longer list would repeat its last item)
+        self.reset_legs()
+        r, res, log, _ = self.streak_chain("lane-REASONS2", [self.DISK.format("42.4"), self.DISK.format("41.0"), self.COLD.format("1234")])
+        self.assertEqual((r.returncode, res["stopReason"], self.started()), (0, None, 3), r.stdout + r.stderr)
+
+    def test_the_key_rule_on_the_shapes_the_emitters_print(self) -> None:
+        # (details that must share a key) -> a streak of 3 at default N; (details that must not) -> no stop
+        same = {
+            "timeout-with-number": ["health probe ended TIMEOUT: waited 120 s", "health probe ended TIMEOUT: waited 118 s", "health probe ended TIMEOUT: waited 7 s"],
+            "decimal-and-signed": ["leg not submitted: commit used 12.5 of 32 GiB exceeds fraction 0.3", "leg not submitted: commit used -1 of 32.25 GiB exceeds fraction 0.3",
+                                   "leg not submitted: commit used 1e3 of 31 GiB exceeds fraction 0.3"],
+            "reason-token-then-text": ["KEEPALIVE_FAILED: attempt 1", "KEEPALIVE_FAILED: attempt 2", "KEEPALIVE_FAILED"],
+        }
+        for name, details in same.items():
+            with self.subTest(shape=name):
+                self.reset_legs()
+                r, res, _, _ = self.streak_chain(f"lane-S-{name}", [f"VENUE_UNHEALTHY:{x}" for x in details] * 2)
+                self.assertEqual((r.returncode, res["ran"]), (8, 3), r.stdout + r.stderr)
+        self.reset_legs()
+        # the same words with a different non-numeric part are different faults, whatever the numbers
+        r, res, _, _ = self.streak_chain("lane-S-diff", [f"VENUE_UNHEALTHY:{x}" for x in (
+            "leg not submitted: freeDiskGiB 42.4 < 50", "leg not submitted: smallHashMs 42.4 > 50", "leg not submitted: freeDiskGiB unknown")] * 2)
+        self.assertEqual((r.returncode, res["stopReason"]), (0, None), r.stdout + r.stderr)
+
+    def test_owner_only_first_occurrence_stops_even_with_the_count_rule_off(self) -> None:
+        for detail in ("SCREENSAVER_SECURE_OWNER_ONLY", "SESSION_LOCKED", "SESSION_LOCKED_OWNER_ONLY"):
+            with self.subTest(detail=detail):
+                self.reset_legs()
+                r, res, log, _ = self.streak_chain(f"lane-O0-{detail}", [f"VENUE_UNHEALTHY:{detail}"] * 3, "-UnhealthyStreakStop", "0")
+                self.assertEqual(r.returncode, 8, r.stdout + r.stderr)
+                self.assertEqual(([l["status"] for l in res["legs"]], self.started(), res["stopReason"]), (["RAN", "NOT_RUN", "NOT_RUN"], 1, "VENUE_UNHEALTHY_STREAK"))
+                stop = [l for l in log if " CHAIN_STOP " in l]
+                self.assertEqual(len(stop), 1, stop)
+                self.assertIn(f"detail={detail} n=1 threshold=0 receipts=rcpt-1 ownerOnly=1", stop[0])
+        # owner-only matching stays exact on the token: a different token that merely starts with one is not owner-only
+        self.reset_legs()
+        r, res, _, _ = self.streak_chain("lane-O0-near", ["VENUE_UNHEALTHY:SESSION_LOCKED_SOON"] * 3, "-UnhealthyStreakStop", "0")
         self.assertEqual((r.returncode, [l["status"] for l in res["legs"]]), (0, ["RAN"] * 3), r.stdout)
+
+    def test_count_rule_off_with_numeric_only_differences_does_not_stop(self) -> None:
+        d = [self.DISK.format(v) for v in ("42.4", "41.9", "41.7", "41.5", "41.1", "40.9")]
+        r, res, log, _ = self.streak_chain("lane-NUM0", d, "-UnhealthyStreakStop", "0")
+        self.assertEqual((r.returncode, [l["status"] for l in res["legs"]], res["stopReason"], self.started()), (0, ["RAN"] * 6, None, 6), r.stdout + r.stderr)
+        self.assertNotIn("unhealthyStop", res)
+        self.assertFalse([l for l in log if " CHAIN_STOP " in l])
+
+    def test_owner_only_list_is_pinned_to_the_tokens_the_emitters_print(self) -> None:
+        runner = RUNNER.read_text(encoding="utf-8")
+        m = re.search(r"\$ownerOnlyDetails = @\(([^)]*)\)", runner)
+        self.assertTrue(m, "the runner's $ownerOnlyDetails list is gone")
+        listed = set(re.findall(r"'([A-Z0-9_]+)'", m.group(1)))
+        # the emitters' own source: the VENUE_UNHEALTHY result tokens (DualVenueRunner.psm1 Resolve-DvJobOutcome via $script:VenueConditionResults) and the job /
+        # artifact module that print them. An owner-only token is one the emitters name *_OWNER_ONLY.
+        dv = (DV / "DualVenueRunner.psm1").read_text(encoding="utf-8")
+        cond = re.search(r"\$script:VenueConditionResults = @\(([^)]*)\)", dv)
+        self.assertTrue(cond, "DualVenueRunner.psm1 no longer defines $script:VenueConditionResults")
+        emitted = set(re.findall(r"'([A-Z0-9_]+)'", cond.group(1)))
+        job = (ROOT / "tools" / "profiling" / "bachelor" / "playback-attr-3-cuda-job.ps1").read_text(encoding="utf-8")
+        art = (ROOT / "tools" / "profiling" / "bachelor" / "AttrCudaArtifacts.psm1").read_text(encoding="utf-8")
+        printed = set(re.findall(r"RESULT=([A-Z0-9_]+OWNER_ONLY)\b", job))
+        self.assertTrue(printed, "the job no longer prints an *_OWNER_ONLY RESULT token")
+        owner_emitted = {t for t in emitted | printed if t.endswith("OWNER_ONLY")}
+        self.assertIn("SCREENSAVER_SECURE_OWNER_ONLY", owner_emitted)
+        self.assertTrue(printed <= emitted, f"the job prints {printed - emitted}, which Resolve-DvJobOutcome does not map to VENUE_UNHEALTHY")
+        self.assertTrue(owner_emitted <= listed, f"emitted owner-only tokens missing from the chain's $ownerOnlyDetails: {owner_emitted - listed}")
+        # Every listed token either has an emitter in the source above, or is OWED to a peer change not yet on master. SESSION_LOCKED /
+        # SESSION_LOCKED_OWNER_ONLY are owed to VENUE-SESSION-LOCKED-REFUSAL-1 (PR #345). Once #345 merges its emitter appears in the sources and this set shrinks to empty.
+        owed = {"SESSION_LOCKED", "SESSION_LOCKED_OWNER_ONLY"}
+        sources = dv + job + art
+        unemitted = {t for t in listed if t not in sources}
+        self.assertTrue(unemitted <= owed, f"owner-only tokens listed in the chain but printed by no emitter: {unemitted - owed}")
 
     def test_leg_failed_and_not_run_legs_neither_count_nor_reset(self) -> None:
         extra_spec = self.case / "fx-d.json"
