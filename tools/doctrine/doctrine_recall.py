@@ -576,7 +576,7 @@ def fold_debt(bus: Path, since: str, own: str, budget_s: float = FOLD_DEBT_BUDGE
     head_out, head_status = _git_output(["-C", str(bus), "rev-parse", "HEAD"], deadline)
     log_out, log_status = _git_output(
         [
-            "-C", str(bus), "log", "--name-only", "--no-renames", "--format=%x1e%H%x1f%cI%x1f%s",
+            "-C", str(bus), "log", "-z", "--name-only", "--no-renames", "--format=%x1e%H%x1f%cI%x1f%s",
             f"{resolved}..HEAD", "--", *BUS_FILES, CARDS_GLOB,
         ],
         deadline,
@@ -587,11 +587,12 @@ def fold_debt(bus: Path, since: str, own: str, budget_s: float = FOLD_DEBT_BUDGE
     for record in log_out.split("\x1e"):
         if not record.strip():
             continue
-        header, _, names = record.partition("\n")
+        # -z: the header ends at a NUL, then one newline, then each path ends at a NUL (never quoted).
+        header, _, names = record.partition("\0")
         parts = header.split("\x1f")
         if len(parts) != 3:
             continue
-        counted = _fold_debt_files([n.strip() for n in names.splitlines() if n.strip()], own)
+        counted = _fold_debt_files([n for n in names.removeprefix("\n").split("\0") if n], own)
         if counted:
             commits.append({"sha": parts[0], "date": parts[1], "files": counted, "subject": parts[2]})
     return {

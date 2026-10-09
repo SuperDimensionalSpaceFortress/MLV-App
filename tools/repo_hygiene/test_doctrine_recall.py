@@ -483,6 +483,19 @@ class FoldDebtTests(unittest.TestCase):
         self.assertEqual(code, 0)
         self.assertEqual([(c["sha"], c["files"]) for c in result["commits"]], [(both, ["specs/other/cards.md"])])
 
+    def test_a_card_path_with_a_space_and_a_non_ascii_letter_is_counted_unquoted(self):
+        # DG-GIT-PATHLIST (bus de09cae): without -z git prints "specs/caf\303\251 two/cards.md" quoted,
+        # which CARDS_PATH_RE does not match, so the commit would silently count as no debt.
+        cursor = self.commit("cursor", {"README.md": "x\n"})
+        odd = "specs/café two/cards.md"
+        sibling = self.commit("odd sibling card", {odd: "## café two/a\nrule: a.\n", "TRAPS.md": "- t\n"})
+        result, code, _ = recall.fold_debt(self.bus, cursor, "mlv-app")
+        self.assertEqual(code, 0)
+        self.assertEqual([(c["sha"], c["files"]) for c in result["commits"]], [(sibling, ["TRAPS.md", odd])])
+        own = self.commit("own odd card", {"specs/café own/cards.md": OWN_CARD})
+        result, _, _ = recall.fold_debt(self.bus, cursor, "café own")
+        self.assertNotIn(own, [c["sha"] for c in result["commits"]])
+
     def test_an_unknown_sha_is_a_typed_refusal(self):
         self.build()
         for bad in ("deadbeef", "not-a-sha", "--output=x"):
