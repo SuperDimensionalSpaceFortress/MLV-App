@@ -19,7 +19,12 @@
                                        measure chain named only its run dir; the worktree sat in a dot-sourced arms.ps1).
                                        One `REFUSED ... pid=N` line per holder goes to stderr; the check is repeated on a
                                        fresh scan right before anything is moved or deleted.
-      kept     dirty                   `git status --porcelain -uall` is non-empty
+      kept     cwd-probe-unavailable   (r2) the current-directory probe cannot run here (Add-Type failed, ConstrainedLanguage,
+                                       32-bit host), so a holder whose only link is its cwd cannot be seen. Fail closed.
+      kept     cwd-unknown             (r2) a live process that could hold the path has a current directory the probe could
+                                       not read (other user, elevated, protected), or runs a relative script path with
+                                       an unknown cwd. Fail closed. Fields: disposition.cwdProbe, disposition.cwdUnknown.
+      kept     dirty                  `git status --porcelain -uall` is non-empty
       kept     unpushed                HEAD has commits not on any remote
       kept     unmerged                HEAD is on a remote but not an ancestor of -MergeTarget
       kept     stash                   the repository stash list is non-empty
@@ -29,6 +34,19 @@
       retired  ok                      ignored NON-debris entries moved to -QuarantineRoot,
                                        `git clean -fdX`, then `git worktree remove` (never --force)
       kept     remove-failed:<why>     removal was refused; nothing further attempted
+
+    CWD PROBE IS LOUD (r2, 2026-10-09, WORKTREE-REMOVED-UNDER-LIVE-CHAIN-1): an unreadable current directory is never
+    folded into "not a holder". Order: a positive hit (live-process) is reported first; otherwise, if the probe cannot
+    run, the result is kept / cwd-probe-unavailable; if it runs but cannot read a candidate holder, kept / cwd-unknown
+    naming the pids. A would-retire (-WhatIf) is therefore a verdict the probe actually backed. Candidate holder = any
+    live process outside this caller's own chain, except a Windows session-0 service/system process (SessionId 0), whose
+    cwd is not a lane's; a session-0 process still counts when it runs a relative script path (next rule). 64-bit and
+    32-bit (WOW64) processes of the caller's user are both read; a pid that exited since the snapshot is not a candidate.
+
+    RELATIVE SCRIPT PATHS (r2): a script path on a holder's command line (-File, dot-source in -Command, positional)
+    is resolved against THAT holder's current directory, taken from the cwd index, when it is relative or quoted-relative,
+    then followed into the transitive corpus exactly like an absolute one. If the holder's cwd is unknown the path cannot
+    be followed, so the holder is treated as possibly naming the worktree (cwd-unknown), not skipped.
 
     Branch refs are NEVER deleted, so every retirement is undoable with `git worktree add`.
     ASCII-only by project convention.
@@ -68,7 +86,8 @@ $script:HolderMaxDepth = 3
 
 if (-not ('MlvProcCwd' -as [type])) {
     # Current directory of another process: Win32_Process does not expose it. Reads PEB->ProcessParameters->CurrentDirectory
-    # of a 64-bit process the caller may open. Anything unreadable (other user, protected, 32-bit) returns null.
+    # of a 64-bit process, or the PEB32 copy of a 32-bit (WOW64) one, that the caller may open. Anything unreadable
+    # (other user, elevated, protected) returns null; the caller turns that into cwd-unknown, never into "not a holder".
     try {
         Add-Type -ErrorAction Stop -TypeDefinition @'
 using System;
@@ -86,12 +105,30 @@ public static class MlvProcCwd {
         if (h == IntPtr.Zero) return null;
         try {
             bool wow;
-            if (!IsWow64Process(h, out wow) || wow) return null;
+            if (!IsWow64Process(h, out wow)) return null;
+            IntPtr rd; byte[] b8 = new byte[8];
+            if (wow) {
+                // 32-bit process: PEB32 address (class 26), PEB32+0x10 = ProcessParameters32, +0x24 = CurrentDirectory.DosPath
+                byte[] w = new byte[8]; int wl;
+                if (NtQueryInformationProcess(h, 26, w, 8, out wl) != 0) return null;
+                long peb32 = BitConverter.ToInt64(w, 0);
+                if (peb32 == 0) return null;
+                byte[] b4 = new byte[4];
+                if (!ReadProcessMemory(h, new IntPtr(peb32 + 0x10), b4, (IntPtr)4, out rd)) return null;
+                long pp32 = BitConverter.ToUInt32(b4, 0);
+                if (pp32 == 0) return null;
+                byte[] us32 = new byte[8];
+                if (!ReadProcessMemory(h, new IntPtr(pp32 + 0x24), us32, (IntPtr)8, out rd)) return null;
+                int len32 = BitConverter.ToUInt16(us32, 0); long buf32 = BitConverter.ToUInt32(us32, 4);
+                if (len32 <= 0 || buf32 == 0) return null;
+                byte[] sb32 = new byte[len32];
+                if (!ReadProcessMemory(h, new IntPtr(buf32), sb32, (IntPtr)len32, out rd)) return null;
+                return Encoding.Unicode.GetString(sb32);
+            }
             byte[] pbi = new byte[48]; int rl;
             if (NtQueryInformationProcess(h, 0, pbi, 48, out rl) != 0) return null;
             long peb = BitConverter.ToInt64(pbi, 8);
             if (peb == 0) return null;
-            IntPtr rd; byte[] b8 = new byte[8];
             if (!ReadProcessMemory(h, new IntPtr(peb + 0x20), b8, (IntPtr)8, out rd)) return null;
             long pp = BitConverter.ToInt64(b8, 0);
             if (pp == 0) return null;
@@ -107,6 +144,12 @@ public static class MlvProcCwd {
 }
 '@
     } catch { }
+}
+
+function Test-CwdProbeAvailable {
+    # False when the compiled reader is absent (Add-Type failed, ConstrainedLanguage) or this host is not a 64-bit process.
+    # A seam too: a test redefines this function to force the unavailable path.
+    return [bool](('MlvProcCwd' -as [type]) -and [Environment]::Is64BitProcess)
 }
 
 function Get-ProcessCurrentDirectory {
@@ -138,15 +181,33 @@ function Get-LaneProcessSnapshot {
     }
 }
 
+function Resolve-HolderScriptPath {
+    # A script path from a holder's command line, made absolute against THAT holder's current directory when it is
+    # relative (or drive-relative, like \x.ps1). Returns $null when it is relative and the holder's cwd is unknown.
+    param([string]$Raw, [string]$HolderCwd)
+    $p = $Raw -replace '/', '\'
+    if ($p -match '^[A-Za-z]:\\' -or $p.StartsWith('\\')) { return $p }
+    if (-not $HolderCwd) { return $null }
+    if ($p.StartsWith('\')) { $p = $HolderCwd.Substring(0, 2) + $p }
+    elseif ($p -match '^[A-Za-z]:') { return $null }
+    return [IO.Path]::GetFullPath([IO.Path]::Combine($HolderCwd, $p))
+}
+
 function Get-ScriptCorpus {
     # The text a live script process can load: the script on its command line plus, transitively (same directory,
     # or an absolute path written in the text), the scripts it names. A chain whose command line names only its RUN
     # DIR still reaches the worktree through a dot-sourced arms.ps1 (2026-10-09). Bounded by file count, size and depth.
-    param([string]$CommandLine, [hashtable]$FileCache)
+    # r2: a relative script path on the command line (quoted or not) is resolved against the HOLDER's cwd; if that is
+    # unknown the path cannot be followed and RelativeUnresolved is set so the caller fails closed.
+    param([string]$CommandLine, [hashtable]$FileCache, [string]$HolderCwd = '')
     $ext = $script:HolderScriptExt
     $queue = New-Object System.Collections.Generic.Queue[object]
-    foreach ($m in [regex]::Matches($CommandLine, "(?i)`"([^`"]+\.(?:$ext))`"|([A-Za-z]:[\\/][^\s`"]+\.(?:$ext))")) {
-        $first = if ($m.Groups[1].Success) { $m.Groups[1].Value } else { $m.Groups[2].Value }
+    $unresolved = $false
+    $rx = "(?i)`"([^`"]+\.(?:$ext))`"|([A-Za-z]:[\\/][^\s`"]+\.(?:$ext))|(?<![\w:\\/.\-])((?:[\w.\-]+[\\/])*[\w.\-]+\.(?:$ext))(?![\w\\/])"
+    foreach ($m in [regex]::Matches($CommandLine, $rx)) {
+        $raw = if ($m.Groups[1].Success) { $m.Groups[1].Value } elseif ($m.Groups[2].Success) { $m.Groups[2].Value } else { $m.Groups[3].Value }
+        $first = Resolve-HolderScriptPath -Raw $raw -HolderCwd $HolderCwd
+        if ($null -eq $first) { $unresolved = $true; continue }
         $queue.Enqueue(@($first, 0))
     }
     $seen = @{}
@@ -174,7 +235,7 @@ function Get-ScriptCorpus {
             $queue.Enqueue(@($cand, ([int]$item[1] + 1)))
         }
     }
-    return $out.ToArray()
+    return [pscustomobject]@{ Files = $out.ToArray(); RelativeUnresolved = $unresolved }
 }
 
 function Get-LaneHolderIndex {
@@ -186,25 +247,45 @@ function Get-LaneHolderIndex {
     if ($prop -and $null -ne $prop.Value) { return $prop.Value }
     $cwd = @{}
     $scripts = New-Object System.Collections.Generic.List[object]
+    $unknown = New-Object System.Collections.Generic.List[object]
     $fileCache = @{}
     $scriptRunner = '(?i)^(pwsh|powershell|python|pythonw|py|node|cmd|cscript|wscript)(\.exe)?$'
+    $probeOk = [bool](Test-CwdProbeAvailable)
+    $selfPids = @($Snapshot.SelfPids)
     foreach ($proc in @($Snapshot.Procs)) {
         $procId = [int]$proc.ProcessId
-        $own = $proc.PSObject.Properties['CurrentDirectory']
-        $c = if ($own) { [string]$own.Value } else { Get-ProcessCurrentDirectory -ProcessId $procId }
-        if ($c) { $cwd[$procId] = (($c -replace '/', '\').TrimEnd('\')) }
+        if ($selfPids -contains $procId) { continue }   # the caller's own chain legitimately sits in the worktree
+        $own =$proc.PSObject.Properties['CurrentDirectory']
+        $c = if ($own -and [string]$own.Value) { [string]$own.Value } elseif ($probeOk) { Get-ProcessCurrentDirectory -ProcessId $procId } else { $null }
+        $c = if ($c) { (([string]$c -replace '/', '\').TrimEnd('\')) } else { $null }
+        if ($c) { $cwd[$procId] = $c }
+        $relUnresolved = $false
         if ([string]$proc.Name -match $scriptRunner) {
-            foreach ($f in @(Get-ScriptCorpus -CommandLine ([string]$proc.CommandLine) -FileCache $fileCache)) {
+            $corpus = Get-ScriptCorpus -CommandLine ([string]$proc.CommandLine) -FileCache $fileCache -HolderCwd ([string]$c)
+            $relUnresolved = [bool]$corpus.RelativeUnresolved
+            foreach ($f in @($corpus.Files)) {
                 $scripts.Add([pscustomobject]@{ ProcessId = $procId; File = $f.File; Text = $f.Text })
             }
         }
+        if ($c) { continue }
+        # cwd unknown. A pid that exited since the snapshot holds nothing; a session-0 (service/system) process is not a
+        # lane's cwd unless it runs a relative script path it could not be followed from. Everything else is a candidate.
+        if (-not (Get-Process -Id $procId -ErrorAction SilentlyContinue)) { continue }
+        $sess = $proc.PSObject.Properties['SessionId']
+        $isSystem = [bool]($sess -and $null -ne $sess.Value -and [int]$sess.Value -eq 0)
+        $why = if (-not $isSystem) { if ($probeOk) { 'cwd-unreadable' } else { 'cwd-probe-unavailable' } }
+               elseif ($relUnresolved) { 'relative-script-unresolved' } else { $null }
+        if ($why) { $unknown.Add([pscustomobject]@{ ProcessId = $procId; Name = [string]$proc.Name; Why = $why }) }
     }
     $byPid = @{}
     foreach ($s in $scripts) {
         if (-not $byPid.ContainsKey($s.ProcessId)) { $byPid[$s.ProcessId] = New-Object System.Collections.Generic.List[object] }
         $byPid[$s.ProcessId].Add($s)
     }
-    $idx = [pscustomobject]@{ Cwd = $cwd; Scripts = $scripts.ToArray(); ScriptsByPid = $byPid }
+    $idx = [pscustomobject]@{
+        Cwd = $cwd; Scripts = $scripts.ToArray(); ScriptsByPid = $byPid
+        CwdProbe = $(if ($probeOk) { 'ok' } else { 'unavailable' }); CwdUnknown = $unknown.ToArray()
+    }
     $Snapshot | Add-Member -NotePropertyName HolderIndex -NotePropertyValue $idx -Force
     return $idx
 }
@@ -246,6 +327,21 @@ function Find-WorktreeHolders {
     return $rows.ToArray()
 }
 
+function Get-CwdUnknownRefusal {
+    # r2: the cwd probe's own verdict for this snapshot. $null when every candidate holder's cwd was read; otherwise
+    # {Probe; Reason; Rows} for a kept / cwd-probe-unavailable | cwd-unknown result. Never a would-retire.
+    param([object]$Snapshot)
+    $idx = Get-LaneHolderIndex -Snapshot $Snapshot
+    $unk = @($idx.CwdUnknown)
+    if (-not $unk.Count) { return $null }
+    $first = ($unk | Select-Object -First 5 | ForEach-Object { "$($_.ProcessId) $($_.Name) ($($_.Why))" }) -join ', '
+    $reason = if ($idx.CwdProbe -ne 'ok') { "cwd-probe-unavailable: the current-directory probe cannot run, so $($unk.Count) process(es) cannot be ruled out as holders, first: $first" }
+              else { "cwd-unknown: $($unk.Count) process(es) with an unreadable current directory cannot be ruled out as holders, first: $first" }
+    $via = if ($idx.CwdProbe -ne 'ok') { 'cwd-probe-unavailable' } else { 'cwd-unknown' }
+    $rows = @($unk | Select-Object -First 20 | ForEach-Object { [pscustomobject]@{ ProcessId = $_.ProcessId; Name = $_.Name; Via = $via } })
+    return [pscustomobject]@{ Probe = [string]$idx.CwdProbe; Reason = $reason; Rows = $rows; Unknown = @($unk | ForEach-Object { "$($_.ProcessId) $($_.Name) $($_.Why)" }) }
+}
+
 function Write-RefusedHolders {
     # One REFUSED line per holder pid, on stderr (stdout carries the caller's pipeline objects).
     param([string]$WorktreePath, [object[]]$Holders)
@@ -269,7 +365,18 @@ function Invoke-RetireLaneWorktree {
     )
     $d = [ordered]@{
         schema = 'mlv-app/lane-worktree-disposition/v1'; workDir = $WorkDir; action = 'kept'; reason = $null
-        head = $null; branch = $null; quarantined = @(); holders = @(); utc = (Get-Date).ToUniversalTime().ToString('o')
+        head = $null; branch = $null; quarantined = @(); holders = @(); cwdProbe = $null; cwdUnknown = @()
+        utc = (Get-Date).ToUniversalTime().ToString('o')
+    }
+    # Fail closed on the cwd probe's own blind spots (see CWD PROBE IS LOUD): true = refused, disposition filled in.
+    function Test-CwdRefusal([object]$Sn) {
+        $r = Get-CwdUnknownRefusal -Snapshot $Sn
+        $d.cwdProbe = [string](Get-LaneHolderIndex -Snapshot $Sn).CwdProbe
+        if ($null -eq $r) { return $false }
+        $d.cwdUnknown = $r.Unknown
+        Write-RefusedHolders -WorktreePath $wd -Holders $r.Rows
+        $d.reason = $r.Reason
+        return $true
     }
     function Run-Git([string]$C, [string[]]$A) {
         $o = & git.exe -C $C @A 2>&1
@@ -296,6 +403,7 @@ function Invoke-RetireLaneWorktree {
 
         $snap = if ($null -ne $ProcessSnapshot) { $ProcessSnapshot } else { Get-LaneProcessSnapshot }
         $live = @(Find-WorktreeHolders -WorktreePath $wd -Snapshot $snap)
+        $d.cwdProbe = [string](Get-LaneHolderIndex -Snapshot $snap).CwdProbe
         if ($live.Count) {
             $d.holders = @($live | ForEach-Object { "$($_.ProcessId) $($_.Name) $($_.Via)" })
             Write-RefusedHolders -WorktreePath $wd -Holders $live
@@ -323,6 +431,7 @@ function Invoke-RetireLaneWorktree {
         $ign = Run-Git $wd @('-c', 'core.quotepath=false', 'status', '--porcelain', '--ignored', '-unormal'); if ($ign.code) { $d.reason = 'cannot-determine: ignored listing'; return [pscustomobject]$d }
         $keep = @($ign.out | Where-Object { $_ -like '!!*' } | ForEach-Object { $_.Substring(3) } | Where-Object { $_ -notmatch $script:RetireDebrisPattern })
         if ($keep.Count -and -not $QuarantineRoot) { $d.reason = "cannot-determine: $($keep.Count) ignored non-debris entr(y/ies) and no -QuarantineRoot"; return [pscustomobject]$d }
+        if (Test-CwdRefusal $snap) { return [pscustomobject]$d }
         if ($WhatIf) { $d.action = 'would-retire'; $d.reason = 'ok'; $d.quarantined = $keep; return [pscustomobject]$d }
 
         # Last look before anything is moved or deleted, on a FRESH scan: the gate above took seconds (a sweep reuses a
@@ -336,6 +445,7 @@ function Invoke-RetireLaneWorktree {
             $d.reason = 'live-process: ' + (($live | ForEach-Object { "$($_.ProcessId) $($_.Name) [$($_.Via)]" }) -join ', ')
             return [pscustomobject]$d
         }
+        if (Test-CwdRefusal $fresh) { return [pscustomobject]$d }
 
         # <leaf>-<utc stamp>: two same-named worktrees retired the same day must not nest into each other.
         $qDir = Join-Path $QuarantineRoot ('{0}-{1}' -f (Split-Path $wd -Leaf), (Get-Date).ToUniversalTime().ToString('yyyyMMddTHHmmssfffZ'))

@@ -399,10 +399,10 @@ def test_sweep_stamp_write_failure_is_counted_and_never_fails_the_sweep(repo):
 
 # --- Invoke-RetireLaneWorktree -ProcessSnapshot: one CIM scan per sweep instead of two-plus per worktree ---
 
-def _gate_with_snapshot(workdir, snapshot_expr):
+def _gate_with_snapshot(workdir, snapshot_expr, prelude=""):
     script = (
         "$ErrorActionPreference='Stop'; Set-StrictMode -Version Latest; "
-        f". '{HELPER}'; "
+        f". '{HELPER}'; {prelude} "
         f"$snap = {snapshot_expr}; "
         f"Invoke-RetireLaneWorktree -WorkDir '{workdir}' -MergeTarget 'origin/master' -WhatIf -ProcessSnapshot $snap "
         "| ConvertTo-Json -Depth 4"
@@ -467,12 +467,12 @@ def _stop(p):
     p.wait(timeout=30)
 
 
-def _gate_real(workdir, *, whatif=True):
-    """Gate with the REAL process snapshot. Returns (disposition, stderr)."""
+def _gate_real(workdir, *, whatif=True, prelude=""):
+    """Gate with the REAL process snapshot. Returns (disposition, stderr). `prelude` runs after the helper is dot-sourced."""
     quarantine = Path(workdir).parent / "q"
     script = (
         "$ErrorActionPreference='Stop'; Set-StrictMode -Version Latest; "
-        f". '{HELPER}'; "
+        f". '{HELPER}'; {prelude} "
         f"Invoke-RetireLaneWorktree -WorkDir '{workdir}' -MergeTarget 'origin/master' -QuarantineRoot '{quarantine}'"
         f"{' -WhatIf' if whatif else ''} | ConvertTo-Json -Depth 4"
     )
@@ -598,3 +598,175 @@ def test_sweep_keeps_a_worktree_held_only_by_a_process_cwd(repo):
         _stop(p)
     assert _swept_paths(s) == [_norm(free)] and s["kept"] == {"live-process": 1}, s
     assert held.exists() and not free.exists()
+
+
+# --- r2 (WORKTREE-REMOVED-UNDER-LIVE-CHAIN-1 hub ruling B + C): the cwd probe is LOUD, and relative script paths are followed ---
+# Ruling B: when the cwd probe cannot run, or cannot read a candidate holder, the answer is `kept` naming
+# cwd-probe-unavailable / cwd-unknown, never a plain would-retire with holders=[].
+# Ruling C: a script path on a holder's command line is resolved against THAT holder's cwd when relative.
+
+FORCE_PROBE_UNAVAILABLE = "function Test-CwdProbeAvailable { $false };"
+CWD_UNREADABLE_FOR_EVERY_PID = "function Get-ProcessCurrentDirectory { param([int]$ProcessId) return $null };"
+
+
+def _cwd_unreadable_for(*pids):
+    """Prelude: Get-ProcessCurrentDirectory returns $null for these pids and reads the real cwd for every other."""
+    ids = ",".join(str(p) for p in pids)
+    return ("$orig = ${function:Get-ProcessCurrentDirectory}; "
+            "function Get-ProcessCurrentDirectory { param([int]$ProcessId) "
+            f"if (@({ids}) -contains $ProcessId) {{ return $null }}; & $orig -ProcessId $ProcessId }};")
+
+
+def _fake_row(pid_expr, cmd="shell.exe", session=1, name="shell.exe", self_pids="@(1)"):
+    return ("[pscustomobject]@{ Procs = @([pscustomobject]@{ ProcessId = " + pid_expr + "; Name = '" + name + "'; "
+            "CommandLine = '" + cmd + "'; SessionId = " + str(session) + " }); SelfPids = " + self_pids + " }")
+
+
+def test_healthy_cwd_probe_is_reported_ok_and_backs_the_would_retire(repo):
+    tmp, main = repo
+    wt = _add_wt(main, tmp / "wt-probe-ok")
+    d, _ = _gate_real(wt)
+    assert (d["action"], d["reason"]) == ("would-retire", "ok"), d
+    assert d["cwdProbe"] == "ok" and d["cwdUnknown"] == [], d
+
+
+def test_probe_unavailable_with_a_cwd_only_holder_is_refused_not_would_retire(repo):
+    tmp, main = repo
+    wt = _add_wt(main, tmp / "wt-probe-off")
+    p = _spawn(["-Command", "Start-Sleep -Seconds 120"], cwd=wt)   # its ONLY link to the worktree is its cwd
+    try:
+        d, err = _gate_real(wt, prelude=FORCE_PROBE_UNAVAILABLE)
+    finally:
+        _stop(p)
+    assert d["action"] == "kept" and d["reason"].startswith("cwd-probe-unavailable"), d
+    assert d["cwdProbe"] == "unavailable" and any(u.startswith(f"{p.pid} ") for u in d["cwdUnknown"]), d
+    assert "REFUSED" in err and "via=cwd-probe-unavailable" in err, err
+    assert wt.exists()
+
+
+def test_probe_unavailable_refusal_holds_on_a_real_removal_too(repo):
+    tmp, main = repo
+    wt = _add_wt(main, tmp / "wt-probe-off-real")
+    d, _ = _gate_real(wt, whatif=False, prelude=FORCE_PROBE_UNAVAILABLE)
+    assert d["action"] == "kept" and d["reason"].startswith("cwd-probe-unavailable"), d
+    assert wt.exists()
+
+
+def test_a_pid_whose_cwd_read_fails_is_refused_as_cwd_unknown(repo):
+    tmp, main = repo
+    wt = _add_wt(main, tmp / "wt-cwd-unknown")
+    p = _spawn(["-Command", "Start-Sleep -Seconds 120"], cwd=tmp)   # does not hold the worktree, but the gate cannot tell
+    try:
+        d, err = _gate_real(wt, prelude=_cwd_unreadable_for(p.pid))
+        control, _ = _gate_real(wt)                                  # same process, cwd readable: no refusal for it
+    finally:
+        _stop(p)
+    assert d["action"] == "kept" and d["reason"].startswith("cwd-unknown"), d
+    assert d["cwdProbe"] == "ok" and any(u.startswith(f"{p.pid} ") for u in d["cwdUnknown"]), d
+    assert f"pid={p.pid}" in err and "via=cwd-unknown" in err, err
+    assert not any(u.startswith(f"{p.pid} ") for u in control["cwdUnknown"]), control
+    assert wt.exists()
+
+
+def test_a_named_holder_is_reported_as_live_process_when_the_probe_works(repo):
+    """Same holder as the probe-unavailable case: with a working probe it is NAMED (live-process), not just doubted."""
+    tmp, main = repo
+    wt = _add_wt(main, tmp / "wt-named")
+    holder = _spawn(["-Command", "Start-Sleep -Seconds 120"], cwd=wt)
+    try:
+        d, _ = _gate_real(wt)
+    finally:
+        _stop(holder)
+    assert d["reason"].startswith(f"live-process: {holder.pid} ") and d["cwdProbe"] == "ok", d
+
+
+def test_snapshot_pid_that_has_exited_is_not_a_candidate_holder(repo):
+    tmp, main = repo
+    wt = _add_wt(main, tmp / "wt-vanished")
+    d = _gate_with_snapshot(wt, _fake_row("999993"))               # no such pid: nothing left to hold the path
+    assert (d["action"], d["reason"]) == ("would-retire", "ok"), d
+
+
+def test_snapshot_user_session_process_with_unreadable_cwd_is_cwd_unknown(repo):
+    tmp, main = repo
+    wt = _add_wt(main, tmp / "wt-sess1")
+    d = _gate_with_snapshot(wt, _fake_row("$PID"), prelude=CWD_UNREADABLE_FOR_EVERY_PID)
+    assert d["action"] == "kept" and d["reason"].startswith("cwd-unknown"), d
+
+
+def test_snapshot_session0_process_with_unreadable_cwd_is_not_a_candidate(repo):
+    tmp, main = repo
+    wt = _add_wt(main, tmp / "wt-sess0")
+    d = _gate_with_snapshot(wt, _fake_row("$PID", session=0), prelude=CWD_UNREADABLE_FOR_EVERY_PID)
+    assert (d["action"], d["reason"]) == ("would-retire", "ok"), d
+
+
+def test_snapshot_self_chain_with_unreadable_cwd_is_not_cwd_unknown(repo):
+    """r1 self-pid exclusion still holds under the loud probe."""
+    tmp, main = repo
+    wt = _add_wt(main, tmp / "wt-self-cwd")
+    d = _gate_with_snapshot(wt, _fake_row("$PID", self_pids="@($PID)"), prelude=CWD_UNREADABLE_FOR_EVERY_PID)
+    assert (d["action"], d["reason"]) == ("would-retire", "ok"), d
+
+
+def test_snapshot_cwd_that_is_a_sibling_prefix_is_still_not_a_hit_under_the_loud_probe(repo):
+    """r1 sibling-prefix exclusion still holds: <wt>2 is a known cwd outside the worktree, so neither a hit nor unknown."""
+    tmp, main = repo
+    wt = _add_wt(main, tmp / "wt-sib")
+    row = ("[pscustomobject]@{ Procs = @([pscustomobject]@{ ProcessId = $PID; Name = 'shell.exe'; CommandLine = 'shell.exe'; "
+           f"SessionId = 1; CurrentDirectory = '{wt}2' }}); SelfPids = @(1) }}")
+    d = _gate_with_snapshot(wt, row, prelude=CWD_UNREADABLE_FOR_EVERY_PID)
+    assert (d["action"], d["reason"]) == ("would-retire", "ok"), d
+
+
+def test_session0_process_running_a_relative_script_with_unknown_cwd_is_cwd_unknown(repo):
+    """Ruling C: a relative script path cannot be followed without the holder's cwd, so the holder may name the worktree."""
+    tmp, main = repo
+    wt = _add_wt(main, tmp / "wt-rel-unknown")
+    row = _fake_row("$PID", cmd="pwsh.exe -File tools\\quiet.ps1", session=0, name="pwsh.exe")
+    d = _gate_with_snapshot(wt, row, prelude=CWD_UNREADABLE_FOR_EVERY_PID)
+    assert d["action"] == "kept" and d["reason"].startswith("cwd-unknown"), d
+    assert any("relative-script-unresolved" in u for u in d["cwdUnknown"]), d
+    # control: the same session-0 process without a relative script path is not a candidate
+    ctl = _gate_with_snapshot(wt, _fake_row("$PID", cmd="pwsh.exe -Command Start-Sleep", session=0, name="pwsh.exe"),
+                              prelude=CWD_UNREADABLE_FOR_EVERY_PID)
+    assert (ctl["action"], ctl["reason"]) == ("would-retire", "ok"), ctl
+
+
+def _relative_chain(tmp, wt_text, dirname):
+    """<tmp>/relrun/<dirname>/quiet.ps1 dot-sources arms.ps1; only arms.ps1 names the worktree."""
+    base = tmp / "relrun"
+    sd = base / dirname
+    sd.mkdir(parents=True)
+    (sd / "arms.ps1").write_text(f"$script:Wt = '{wt_text}'\n", encoding="utf-8")
+    (sd / "quiet.ps1").write_text('. "$PSScriptRoot\\arms.ps1"\nStart-Sleep -Seconds 120\n', encoding="utf-8")
+    return base
+
+
+@pytest.mark.parametrize("dirname", ["tools", "chain tools"], ids=["unquoted-relative", "quoted-relative"])
+def test_relative_script_path_is_resolved_against_the_holders_cwd(repo, dirname):
+    """`pwsh -File tools\\quiet.ps1` (cwd = run dir). A directory with a space makes the OS command line quote the path."""
+    tmp, main = repo
+    wt = _add_wt(main, tmp / "wt-rel-script")
+    base = _relative_chain(tmp, str(wt), dirname)
+    p = _spawn(["-File", f"{dirname}\\quiet.ps1"], cwd=base)    # the gate runs from elsewhere, where this relative path does not exist
+    try:
+        d, err = _gate_real(wt)
+    finally:
+        _stop(p)
+    assert d["action"] == "kept" and d["reason"].startswith(f"live-process: {p.pid} "), d
+    assert "script:arms.ps1" in d["reason"] and f"pid={p.pid}" in err, (d, err)
+    assert wt.exists()
+
+
+@pytest.mark.parametrize("dirname", ["tools", "chain tools"], ids=["unquoted-relative", "quoted-relative"])
+def test_relative_script_path_that_does_not_name_the_worktree_does_not_block(repo, dirname):
+    tmp, main = repo
+    wt = _add_wt(main, tmp / "wt-rel-other")
+    base = _relative_chain(tmp, str(tmp / "some-other-place"), dirname)
+    p = _spawn(["-File", f"{dirname}\\quiet.ps1"], cwd=base)
+    try:
+        d, _ = _gate_real(wt)
+    finally:
+        _stop(p)
+    assert (d["action"], d["reason"]) == ("would-retire", "ok"), d
