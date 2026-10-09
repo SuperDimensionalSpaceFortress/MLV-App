@@ -18,11 +18,12 @@ this shape). Fix the caller with ``($arr -join ',')`` and split in the script. A
 when the caller's file declares it ``[string[]]`` / ``[array]``, assigns it ``@(...)`` / a cast / a comma list /
 a ``-split`` / a ``Verb-...Array...`` helper (never a name that merely contains "array", like ``$arrayCount``),
 or aliases one of those. A split clears the parameter only in one of two whitelisted forms (``is_normalised``), and
-only when it splits ON A COMMA: the ``-split`` delimiter must be exactly ``','`` or a regex that names a comma and
-splits ``a,b`` into ``a`` and ``b`` (``'[,;]'``, ``'\s*,\s*'``), with a limit that is absent, 0 or at least 2; a
-``.Split(...)`` must name the exact ``','`` literal and carry no count of 0 or 1. A ``';'``, newline, ``', '``, empty or
-interpolated delimiter, or a limit of 1, leaves ``-P a,b`` as one element and is flagged (NON_COMMA_LISTS names the
-live scripts that split on something else on purpose). Every other shape is flagged. TEMP/DIRECT: ``$X = $P -split ','`` or ``$X = $P[0].Split(',')`` (``$X`` may be ``$P``), with
+only when it splits ON A COMMA, and the credit is a whitelist of exact shapes: the ``-split`` delimiter must be ``','``
+or ``','`` padded by ``\\s*`` / `` *`` on either side, with a limit that is absent or the literal 0; a ``.Split(...)``
+must take exactly one comma (``','``, ``[char]','``, ``@(',')``, ``[char[]]','``) and no count, option or second
+separator. A ``';'``, newline, ``', '``, empty or interpolated delimiter, a lookaround, alternation, class or
+escape, or any positive limit leaves ``-P a,b`` (or ``-P a,b,c``) whole or partly joined and is flagged
+(NON_COMMA_LISTS names the live scripts that split on something else on purpose). Every other shape is flagged. TEMP/DIRECT: ``$X = $P -split ','`` or ``$X = $P[0].Split(',')`` (``$X`` may be ``$P``), with
 ``$X`` later read as a bare token. STAGE: ``$P | ForEach-Object { $_ -split ',' }`` (or ``%``), whose block is that
 one split expression and nothing else (or exactly ``if (Test-Path -LiteralPath $_) { $_ } else { <that split> }``), assigned back to ``$P``, assigned to a variable read later, or piped on
 (never into ``Out-Null`` or ``> $null``; a ``$null`` or ``[void]`` target never counts). Only top-level script code
@@ -39,10 +40,10 @@ NON-PROMISES (what this does NOT see):
   revert test. A flow of the split result through a function call or a property (``$x = Normalise $P``, with the
   split inside the function) is not followed, so only the ``Resolve-...`` helper shape is recognised.
 - The delimiter is judged as a literal: a separator held in a variable (``-split $sep``), built by ``-f`` or ``[char]44``,
-  or any ``-split`` option beyond the limit is not credited (fail closed). A regex is tried with Python ``re`` against
-  ``a,b`` and ``a,b,c`` and must also spell a comma (or ``\x2c`` / ``,``), so ``\W`` is not credited and a dialect
-  .NET reads differently is judged by Python. A limit of 2 or more is accepted although it leaves a longer list
-  partly joined.
+  or any ``-split`` option beyond the limit is not credited (fail closed). The delimiter is matched against the
+  whitelist text, never run as a regex, so a spelling .NET reads as a comma (``'\\,'``, ``'\\x2c'``, ``'[,]'``) is
+  refused too. A positive limit is refused because the caller's list length is unknown: ``-split ',',2`` leaves the
+  tail of ``a,b,c`` joined.
 - Only the first column-0 ``param(`` of a file is read, so a function-level parameter is out of
   scope, and so is a script that nests its real param block in a here-string.
 - Pass-through parameters (``-AdditionalArgs`` and friends) cannot be fixed by splitting on a
@@ -94,7 +95,7 @@ KNOWN_OPEN: dict[tuple[str, str], str] = {
 
 # (script path, parameter) -> why the parameter is a list that is deliberately NOT comma-joined, so its split is
 # not a comma split and the guard no longer credits it (SPLIT-DELIMITER-NOT-CHECKED-1). Not violations: no tracked
-# caller hands either a comma list. Each entry is asserted to STILL be uncredited and unflagged, so it cannot go stale;
+# caller hands any of them a comma list. Each entry is asserted to STILL be uncredited and unflagged, so it cannot go stale;
 # if a caller ever passes `-P a,b` the guard flags it and the callee must then split on a comma.
 NON_COMMA_LISTS: dict[tuple[str, str], str] = {
     ("tools/profiling/run-ultramagnus-p3-validation.ps1", "EvidenceGitStatus"): (
@@ -103,7 +104,8 @@ NON_COMMA_LISTS: dict[tuple[str, str], str] = {
     ),
     ("tools/repo_hygiene/attr3_publish_write_scan.ps1", "GeneratorPath"): (
         "splits on ';' (header comment: `pwsh -File` cannot pass an array, so ';'-separated lists are accepted); paths "
-        "may hold a comma, and no tracked caller passes the parameter."
+        "may hold a comma, and no tracked caller passes a comma list (test_playback_attr_3_cuda_behaviour.py:4672 passes "
+        "';'-joined values)."
     ),
     ("tools/repo_hygiene/attr3_publish_write_scan.ps1", "TemplateFile"): "Same ';' path list as GeneratorPath.",
     ("tools/repo_hygiene/attr3_publish_write_scan.ps1", "ModulePath"): "Same ';' path list as GeneratorPath.",
@@ -126,32 +128,24 @@ _HERE_OPEN = re.compile(r"@(['\"])[ \t]*\r?\n")
 
 
 _COMMA_EXACT = "\x02"  # a blanked literal that is exactly ','
-_COMMA_CLASS = "\x01"  # a blanked literal that is a regex splitting "a,b" into a and b (',' with context, '[,;]', ...)
+_COMMA_CLASS = "\x01"  # a blanked literal that is ',' padded by '\s*' / ' *' on one or both sides
+# The r2 whitelist: the only regex spellings of "one comma and nothing else" that are credited. Native: each splits
+# `-Dirs a,b,c` into three elements. `\s+` is NOT on it: `'\s+,\s+'` needs whitespace around the comma, so it leaves
+# `a,b,c` whole. A lookaround, alternation, class, group, anchor, escape, quantifier on the comma or any other text
+# is not credited, however it behaves on one sample.
+_COMMA_DELIM = re.compile(r"(?:\\s\*| \*)?,(?:\\s\*| \*)?")
 
 
-@functools.lru_cache(maxsize=512)
-def _comma_fill(content: str, quote: str) -> str:
+def _comma_fill(content: str) -> str:
     """What a blanked string literal keeps so a split can still be judged by its delimiter, else ``""``.
 
-    A literal that is exactly ``,`` becomes one ``_COMMA_EXACT``; a regex that must name a comma (a ``,`` or a
-    ``\\x2c`` / ``\\u002c`` escape) and that splits ``a,b`` and ``a,b,c`` into their elements becomes
-    ``_COMMA_CLASS`` repeated to the same length. Anything else (``;``, a newline, ``', '``, ``''``, an
-    interpolated ``"$sep"``) is blanked as before, so a split on it is never credited. Regex dialect differences
-    between Python and .NET fail closed: a pattern Python rejects is not credited.
+    A literal that is exactly ``,`` becomes one ``_COMMA_EXACT``; ``,`` with ``\\s*`` or `` *`` on either side
+    becomes ``_COMMA_CLASS`` repeated to the same length. Anything else (``;``, a newline, ``', '``, ``''``, an
+    interpolated ``"$sep"``, ``'[,;]'``, ``',(?=[a-z])'``) is blanked as before, so a split on it is never credited.
     """
     if content == ",":
         return _COMMA_EXACT
-    if not content or len(content) > 64 or "\r" in content or "\n" in content:
-        return ""
-    if (quote == "'" and "'" in content) or (quote == '"' and any(ch in content for ch in '`$"')):
-        return ""
-    if "," not in content and re.search(r"\\(?:x2c|u002c)", content, re.I) is None:
-        return ""
-    try:
-        ok = re.split(content, "a,b") == ["a", "b"] and re.split(content, "a,b,c") == ["a", "b", "c"]
-    except (re.error, RecursionError, OverflowError):
-        return ""
-    return _COMMA_CLASS * len(content) if ok else ""
+    return _COMMA_CLASS * len(content) if _COMMA_DELIM.fullmatch(content) else ""
 
 
 def _blank_comments(text: str, literals: bool = False) -> str:
@@ -182,7 +176,7 @@ def _blank_comments(text: str, literals: bool = False) -> str:
                     i += 2
                     continue
                 out.append(c)
-                if literals and (fill := _comma_fill(text[lit_start:i], quote)):
+                if literals and (fill := _comma_fill(text[lit_start:i])):
                     out[lit_out:-1] = [fill]
                 quote = ""
             else:
@@ -348,25 +342,26 @@ def _body_statements(text: str, block_end: int) -> tuple[str, ...]:
     return tuple(_statements(_blank_functions(_blank_comments(text, literals=True)[block_end:])))
 
 
-# The r4 whitelist. Statements reach these patterns with every string literal blanked to spaces, except that a
-# literal which splits a comma-joined element keeps a marker (``_comma_fill``), so ``_COMMA_LIT`` accepts only a
-# comma delimiter. A split expression is ``<x> -split '<comma>'[, n]``, ``(<x> -split '<comma>').Trim()`` or
-# ``<x>.Split(<args naming ','>)[.Trim()]``, and it must be the WHOLE right-hand side or stage body. A limit of
-# 1 returns the element whole, so only an absent limit, 0 (unlimited) or 2 and up is accepted.
+# The r2 whitelist of exact shapes; everything else fails closed. Statements reach these patterns with every string
+# literal blanked to spaces, except that a comma delimiter keeps a marker (``_comma_fill``). A split expression is
+# ``<x> -split '<comma>'[, 0]``, ``(<x> -split '<comma>').Trim()`` or ``<x>.Split(<one comma>)[.Trim()]``, and it must
+# be the WHOLE right-hand side or stage body. A positive -split limit is refused (the caller's list length is unknown,
+# so `-split ',',2` on `a,b,c` leaves `b,c` joined); so is any option string (`-split ',',0,'SimpleMatch'` works
+# natively but is not credited) and any `.Split` count, option or second separator (`.Split('x', ',')` throws natively).
 _ITEM = r"(?:\$_\b|\$PSItem\b|\(\s*\[string\]\s*(?:\$_|\$PSItem)\s*\))"
 _COMMA_LIT = r"(?:'[\x01\x02]+'|\"[\x01\x02]+\")"
-_SPLIT_LIMIT = r"(?:\s*,\s*(?:0+|0*[2-9]\d*|0*1\d+)(?![\w.]))?"
-# A .Split() argument list that names the exact ',' literal and carries no bare count of 0 or 1 (count 1 returns the
-# string whole; count 0 returns nothing).
-_SPLIT_ARGS = (
-    r"(?=[^(){}$;|]*(?:'\x02'|\"\x02\"))(?![^(){}$;|]*(?<![\w.])(?:0+|0*1)(?![\w.]))[^(){}$;|]*"
-)
+_SPLIT_LIMIT = r"(?:\s*,\s*0(?![\w.]))?"
+# A .Split() argument list that is exactly one comma: ``','``, ``[char]','``, ``@(',')`` or ``[char[]]`` over either.
+_SPLIT_LIT = r"(?:'\x02'|\"\x02\")"
+_SPLIT_CHAR = r"(?:\[char\]\s*)?" + _SPLIT_LIT
+_SPLIT_ARR = r"@\(\s*" + _SPLIT_CHAR + r"\s*\)"
+_SPLIT_ARGS = r"\s*(?:" + _SPLIT_CHAR + r"|" + _SPLIT_ARR + r"|\[char\[\]\]\s*(?:" + _SPLIT_LIT + r"|" + _SPLIT_ARR + r"))\s*"
 _TRIM = r"(?:\.Trim\(\))?"
 
 
 def _split_of(operand: str) -> str:
     by_op = operand + r"\s*-split\s*" + _COMMA_LIT + _SPLIT_LIMIT
-    return r"(?:" + by_op + r"|\(\s*" + by_op + r"\s*\)" + _TRIM + r"|" + operand + r"\.Split\(\s*" + _SPLIT_ARGS + r"\)" + _TRIM + r")"
+    return r"(?:" + by_op + r"|\(\s*" + by_op + r"\s*\)" + _TRIM + r"|" + operand + r"\.Split\(" + _SPLIT_ARGS + r"\)" + _TRIM + r")"
 
 
 # The one guarded variant: an existing path passes through whole, anything else is split (a path may hold a comma).
@@ -1018,20 +1013,79 @@ class PwshStringArrayFileParams(unittest.TestCase):
             with self.subTest(body=body):
                 self.assertEqual([("tools/x/trace.ps1", "Dirs")], self._flag_body(body), body)
 
-    def test_green_split_on_a_comma_class_or_regex_with_a_real_limit_clears_it(self):
-        # the delimiter may be any regex that splits the joined element; a limit of 0 is unlimited, 2 or more splits.
+    def test_green_split_on_exactly_one_comma_clears_it(self):
+        # r2 whitelist: ',' (optionally padded by \s* / ' *'), limit absent or 0; .Split with exactly one comma and
+        # nothing else. Every row was run natively in pwsh and splits `-Dirs a,b,c` into three elements.
         for body in (
-            "$Dirs = $Dirs -split '[,;]'\n$Dirs | ForEach-Object { $_ }\n",
             "$Dirs = $Dirs -split '\\s*,\\s*'\n$Dirs | ForEach-Object { $_ }\n",
-            "$Dirs = $Dirs -split \"\\,\"\n$Dirs | ForEach-Object { $_ }\n",
+            "$Dirs = $Dirs -split ' *, *'\n$Dirs | ForEach-Object { $_ }\n",
+            "$Dirs = $Dirs -split '\\s*,'\n$Dirs | ForEach-Object { $_ }\n",
+            "$Dirs = $Dirs -split \",\"\n$Dirs | ForEach-Object { $_ }\n",
             "$Dirs = $Dirs -split ',',0\n$Dirs | ForEach-Object { $_ }\n",
-            "$Dirs = $Dirs -split ',',2\n$Dirs | ForEach-Object { $_ }\n",
-            "$Dirs = $Dirs[0].Split(';', ',')\n$Dirs | ForEach-Object { $_ }\n",
-            "$Dirs = $Dirs[0].Split(',', 3)\n$Dirs | ForEach-Object { $_ }\n",
-            "$Dirs | ForEach-Object { $_ -split '[,;]' } | ForEach-Object { $_ }\n",
+            "$Dirs = $Dirs[0].Split([char]',')\n$Dirs | ForEach-Object { $_ }\n",
+            "$Dirs = $Dirs[0].Split(@(','))\n$Dirs | ForEach-Object { $_ }\n",
+            "$Dirs = $Dirs[0].Split([char[]]',')\n$Dirs | ForEach-Object { $_ }\n",
+            "$Dirs = $Dirs[0].Split([char[]]@(','))\n$Dirs | ForEach-Object { $_ }\n",
+            "$Dirs = $Dirs[0].Split(@([char]','))\n$Dirs | ForEach-Object { $_ }\n",
+            "$Dirs | ForEach-Object { $_ -split '\\s*,\\s*' } | ForEach-Object { $_ }\n",
+            "$Dirs | ForEach-Object { $_.Split([char]',') } | ForEach-Object { $_ }\n",
         ):
             with self.subTest(body=body):
                 self.assertEqual([], self._flag_body(body), body)
+
+    def test_red_conditional_or_non_comma_regex_does_not_clear_it(self):
+        # SPLIT-DELIMITER-NOT-CHECKED-1 r2 (sol r1): `',(?=[a-z])'` splits `a,b` but leaves `a,1` whole (native Count=1),
+        # so a regex earns no credit because it behaves on one sample. Only ',' padded by \s* / ' *' is credited.
+        for body in (
+            "$Dirs = $Dirs -split ',(?=[a-z])'\n$Dirs | ForEach-Object { $_ }\n",
+            "$Dirs = $Dirs -split ',(?![0-9])'\n$Dirs | ForEach-Object { $_ }\n",
+            "$Dirs = $Dirs -split ',|;'\n$Dirs | ForEach-Object { $_ }\n",
+            "$Dirs = $Dirs -split '[,;]'\n$Dirs | ForEach-Object { $_ }\n",
+            "$Dirs = $Dirs -split '[,]'\n$Dirs | ForEach-Object { $_ }\n",
+            "$Dirs = $Dirs -split '(,)'\n$Dirs | ForEach-Object { $_ }\n",
+            "$Dirs = $Dirs -split '^,'\n$Dirs | ForEach-Object { $_ }\n",
+            "$Dirs = $Dirs -split ',+'\n$Dirs | ForEach-Object { $_ }\n",
+            "$Dirs = $Dirs -split '\\s+,\\s+'\n$Dirs | ForEach-Object { $_ }\n",
+            "$Dirs = $Dirs -split '\\,'\n$Dirs | ForEach-Object { $_ }\n",
+            "$Dirs = $Dirs -split \"\\,\"\n$Dirs | ForEach-Object { $_ }\n",
+            "$Dirs = $Dirs -split '\\x2c'\n$Dirs | ForEach-Object { $_ }\n",
+            "$Dirs = $Dirs -split ',',0,'SimpleMatch'\n$Dirs | ForEach-Object { $_ }\n",
+            "$Dirs | ForEach-Object { $_ -split ',(?=[a-z])' } | ForEach-Object { $_ }\n",
+            "$Dirs | ForEach-Object { $_ -split '[,;]' } | ForEach-Object { $_ }\n",
+        ):
+            with self.subTest(body=body):
+                self.assertEqual([("tools/x/trace.ps1", "Dirs")], self._flag_body(body), body)
+
+    def test_red_positive_split_limit_does_not_clear_it(self):
+        # fable r1 SPLIT-LIMIT-PARTIAL-JOIN-1: `-split ',',2` on `-Dirs a,b,c` gives Count=2, [a][b,c] (native). The
+        # caller's list length is unknown, so only an absent limit or 0 is credited.
+        for body in (
+            "$Dirs = $Dirs -split ',',2\n$Dirs | ForEach-Object { $_ }\n",
+            "$Dirs = $Dirs -split ',',3\n$Dirs | ForEach-Object { $_ }\n",
+            "$Dirs = $Dirs -split ',',10\n$Dirs | ForEach-Object { $_ }\n",
+            "$Dirs = $Dirs -split ',',-1\n$Dirs | ForEach-Object { $_ }\n",
+            "$Dirs | ForEach-Object { $_ -split ',',2 } | ForEach-Object { $_ }\n",
+            "$Dirs = $Dirs -split '\\s*,\\s*',2\n$Dirs | ForEach-Object { $_ }\n",
+        ):
+            with self.subTest(body=body):
+                self.assertEqual([("tools/x/trace.ps1", "Dirs")], self._flag_body(body), body)
+
+    def test_red_dotnet_split_with_extra_arguments_does_not_clear_it(self):
+        # fable r1 DOTNET-SPLIT-EXTRA-SEPARATORS-1 / sol r1 DOTNET-SPLIT-NATIVE-OVERLOAD-1: `.Split('x', ',')` and
+        # `.Split(';', ',')` throw natively (the second argument converts to Int32), so they were never a comma split.
+        # Only a Split whose single argument is one comma is credited; a count or an option is refused.
+        for body in (
+            "$Dirs = $Dirs[0].Split('x', ',')\n$Dirs | ForEach-Object { $_ }\n",
+            "$Dirs = $Dirs[0].Split(';', ',')\n$Dirs | ForEach-Object { $_ }\n",
+            "$Dirs = $Dirs[0].Split(',', 3)\n$Dirs | ForEach-Object { $_ }\n",
+            "$Dirs = $Dirs[0].Split(',', [StringSplitOptions]::RemoveEmptyEntries)\n$Dirs | ForEach-Object { $_ }\n",
+            "$Dirs = $Dirs[0].Split(@(',', ';'))\n$Dirs | ForEach-Object { $_ }\n",
+            "$Dirs = $Dirs[0].Split(',', ';')\n$Dirs | ForEach-Object { $_ }\n",
+            "$Dirs = $Dirs[0].Split([char[]]@(',', 'x'))\n$Dirs | ForEach-Object { $_ }\n",
+            "$Dirs | ForEach-Object { $_.Split('x', ',') } | ForEach-Object { $_ }\n",
+        ):
+            with self.subTest(body=body):
+                self.assertEqual([("tools/x/trace.ps1", "Dirs")], self._flag_body(body), body)
 
     def test_red_split_temporary_mentioned_only_inside_a_function_does_not_clear_it(self):
         # sol r5 SPLIT-DATAFLOW-FUNCTION-SCOPE-1: a function's name, parameter list, param() block and body are not reads.
