@@ -24,8 +24,13 @@ NON-PROMISES:
   (user-scope hooks must be proven to fire by a receipt).
 - Only the traps in REGISTRY are guarded.
 - DG-GIT-PATHLIST reads Python by AST (the string constants of one list, tuple or call must
-  carry -z or core.quotepath=false) and PowerShell by one source line; a command assembled
-  from variables or one joined string is not seen. Test files are not scanned. A call that
+  carry -z or core.quotepath=false) and PowerShell by one source line with its comment tokens
+  blanked first (the PowerShell tokenizer decides what a comment is: a -z or core.quotepath=false
+  that sits only in a `#` or `<# #>` comment does not count, and a `#` inside a string is not a
+  comment, including one inside the `$( )` of an expandable string or here-string at any depth; the
+  remaining text is still split into words by a regex, so a path-list command that
+  is not spelled on one source line, and a command assembled from variables or one joined string,
+  are not seen). A script that does not parse cannot be tokenized and fails as could-not-check. Test files are not scanned. A call that
   needs no path text (exit code, emptiness, a count) is listed in GIT_PATHLIST_ALLOW with its
   reason; git_paths() in tools/coordination/doctrine_outbox.py adds -z itself. Every ls-tree
   form (long form `ls-tree -r` included; only --object-only is exempt) and `status --short|-s|-sb`
@@ -42,7 +47,14 @@ NON-PROMISES:
 - PS-ONE-TRAP counts catch-all TrapStatementAst nodes per enclosing block (the script's
   begin/process/end, or an if/foreach/try body) and flags EVERY block holding more than
   one. A catch-all is an untyped trap or one typed [System.Exception] or
-  [System.Management.Automation.RuntimeException] (the System. prefix is optional). A trap
+  [System.Management.Automation.RuntimeException]. A type name is resolved as written, under
+  the implicit System. and under every `using namespace` of the script (so [Exception],
+  [Management.Automation.RuntimeException], and [RuntimeException] beside
+  `using namespace System.Management.Automation` are catch-alls); it counts when ANY of those
+  candidates is a catch-all, so an ambiguous name is over-flagged, never under-flagged.
+  No type is loaded and no alias beyond `using namespace` is followed; a name that no
+  namespace in the script completes to a catch-all (pwsh itself refuses it: Unable to find
+  type) is not counted. A trap
   of any other type and a trap in another block are other scopes and are not counted, so two
   traps of the same specific type (trap [IOException] twice) are not flagged; traps inside a
   function or script block are not searched.
@@ -102,7 +114,7 @@ class Violation:
 # ---------------------------------------------------------------------------
 # PowerShell AST scan: ONE pwsh process for any number of files.
 # Reads a JSON list of absolute paths from -InPath and writes one
-# {path, errors, nullRight, trapBlocks} object per path to -OutPath.
+# {path, errors, nullRight, trapBlocks, comments} object per path to -OutPath.
 # ---------------------------------------------------------------------------
 _PS_SCAN = r"""
 param([Parameter(Mandatory)][string]$InPath, [Parameter(Mandatory)][string]$OutPath)
@@ -111,7 +123,7 @@ Set-StrictMode -Version Latest
 $enc = New-Object System.Text.UTF8Encoding($false)
 $paths = @([IO.File]::ReadAllText($InPath, $enc) | ConvertFrom-Json)
 $ops = @('Ieq', 'Ine', 'Ceq', 'Cne')
-$catchAll = @('exception', 'management.automation.runtimeexception')
+$catchAll = @('system.exception', 'system.management.automation.runtimeexception')
 $nullName = '^(?:(?:global|script|local|private):)?null$'
 function Unwrap($e) {
     while ($true) {
@@ -124,6 +136,21 @@ function Unwrap($e) {
             $e = $e.SubExpression.Statements[0]; continue
         }
         return $e
+    }
+}
+function IsCatchAllType([string]$name, $prefixes) {
+    foreach ($prefix in $prefixes) { if ($catchAll -contains ($prefix + $name)) { return $true } }
+    return $false
+}
+function CommentTokens($toks) {
+    foreach ($t in @($toks)) {
+        if ($t.Kind -eq [System.Management.Automation.Language.TokenKind]::Comment) {
+            [ordered]@{ sl = $t.Extent.StartLineNumber; sc = $t.Extent.StartColumnNumber
+                        el = $t.Extent.EndLineNumber; ec = $t.Extent.EndColumnNumber }
+        }
+        if ($t -is [System.Management.Automation.Language.StringExpandableToken] -and $null -ne $t.NestedTokens) {
+            CommentTokens $t.NestedTokens
+        }
     }
 }
 $results = New-Object System.Collections.Generic.List[object]
@@ -147,16 +174,26 @@ foreach ($p in $paths) {
     # block (named block or if/foreach/try body), so count catch-all traps per parent block and report
     # EVERY block holding more than one; a catch-all is an untyped trap or one typed with $catchAll, a
     # trap of any other type is a different dispatch, and a function or script block is not entered.
+    # A trap type is resolved as native pwsh does: the name as written, under the implicit System. and
+    # under every `using namespace`; it is a catch-all when ANY of those candidates is one (fail closed).
+    $prefixes = @('', 'system.') + @($ast.UsingStatements | Where-Object { $_.UsingStatementKind -eq 'Namespace' } |
+        ForEach-Object { $_.Name.Value.ToLowerInvariant() + '.' })
     $traps = @($ast.FindAll({
         param($n)
         $n -is [System.Management.Automation.Language.TrapStatementAst] -and
-            ($null -eq $n.TrapType -or $catchAll -contains ($n.TrapType.TypeName.FullName.ToLowerInvariant() -replace '^system\.', ''))
+            ($null -eq $n.TrapType -or (IsCatchAllType $n.TrapType.TypeName.FullName.ToLowerInvariant() $prefixes))
     }, $false) | Group-Object { $_.Parent.Extent.StartOffset } | Where-Object { $_.Count -gt 1 } |
         ForEach-Object {
             $lines = @($_.Group | ForEach-Object { $_.Extent.StartLineNumber } | Sort-Object)
             [ordered]@{ count = $lines.Count; line = [int]$lines[1] }
         })
-    $results.Add([ordered]@{ path = [string]$p; errors = @($errs); nullRight = @($nulls); trapBlocks = @($traps) })
+    # Comment tokens, so a caller can blank them: (start line, start column, end line, end column), 1-based,
+    # columns in UTF-16 units, end column exclusive. A comment inside "$( ... )" of an expandable string or
+    # here-string lives only in that string token's NestedTokens (the one token type that carries any), at
+    # any depth, so the walk recurses; nested extents are file-absolute like the top-level ones.
+    $comments = @(CommentTokens $tokens)
+    $results.Add([ordered]@{ path = [string]$p; errors = @($errs); nullRight = @($nulls); trapBlocks = @($traps)
+                             comments = @($comments) })
 }
 [IO.File]::WriteAllText($OutPath, (ConvertTo-Json -InputObject $results.ToArray() -Depth 6 -Compress), $enc)
 """
@@ -212,7 +249,7 @@ def _ast_scan_uncached(root: Path, rel_paths: list[str]) -> dict[str, dict]:
         results = [results]
     by_abs = {}
     for res in results if isinstance(results, list) else []:
-        if isinstance(res, dict) and set(res) == {"path", "errors", "nullRight", "trapBlocks"}:
+        if isinstance(res, dict) and set(res) == {"path", "errors", "nullRight", "trapBlocks", "comments"}:
             by_abs[res["path"]] = res
     out: dict[str, dict] = {}
     for rel, absolute in abs_by_rel.items():
@@ -295,8 +332,6 @@ GIT_PATHLIST_ALLOW: tuple[tuple[str, str, str], ...] = (
      "dirty-or-clean test on 'any output'; the lines are only echoed back to the console"),
     ("tools/coordination/Invoke-Workstream.ps1", "$existingWt status --porcelain",
      "refuses on a non-zero count and names the lines in a message; no path is tested or opened"),
-    ("tools/coordination/Retire-LaneWorktree.ps1", "`git status --porcelain -uall` is non-empty",
-     "a comment in the script's own header block, not a call"),
     ("tools/coordination/Retire-LaneWorktree.ps1", "'status', '--porcelain', '-uall'",
      "refuses on a non-zero count and quotes the first line in the reason; the ignored-entry listing, "
      "whose paths ARE tested and moved, carries core.quotepath=false"),
@@ -342,6 +377,9 @@ def is_git_pathlist_scanned(rel: str) -> bool:
 _GIT_STATUS_SHORT = frozenset(("--short", "-s", "-sb", "-bs"))
 
 
+_PATHLIST_NEGATIVE = frozenset(("--error-unmatch", "--object-only"))
+
+
 def _git_pathlist_kind(tokens: set[str]) -> str | None:
     """Which path-listing git command a set of argument tokens spells, or None."""
     if "ls-files" in tokens and "--error-unmatch" not in tokens:  # --error-unmatch is read by exit code
@@ -365,17 +403,60 @@ _PS_TOKEN = re.compile(r"--?[\w=.:-]+|[\w=.:-]+")
 _GIT_PATHLIST_HELPERS = frozenset(("git_paths",))
 
 
+_PS_NEWLINE = re.compile(r"\r\n|\n|\r")
+_UTF16_SPACE = " ".encode("utf-16-le")
+_BOM = chr(0xFEFF)
+
+
+def _ps_source_lines(text: str) -> list[str]:
+    """Split as the PowerShell tokenizer numbers lines (CRLF, LF or CR); the BOM is not part of line 1."""
+    return _PS_NEWLINE.split(text[1:] if text.startswith(_BOM) else text)
+
+
+def _ps_code_lines(rel: str, text: str, comments: list[dict]) -> list[str]:
+    """The script's source lines with every PowerShell comment token blanked to spaces.
+
+    `comments` are the tokenizer's Comment extents (1-based lines, UTF-16 columns, end exclusive), so a
+    `#` inside a string or here-string is not a comment, and a block comment may span lines. A position
+    that does not start a comment means the lines disagree with the tokenizer: could-not-check."""
+    lines = _ps_source_lines(text)
+    for c in comments:
+        for number in range(c["sl"], c["el"] + 1):
+            if not 1 <= number <= len(lines):
+                raise CouldNotCheck(f"{rel}: comment token line {number} is outside the file")
+            units = lines[number - 1].encode("utf-16-le", "surrogatepass")
+            begin = (c["sc"] - 1) * 2 if number == c["sl"] else 0
+            end = min((c["ec"] - 1) * 2, len(units)) if number == c["el"] else len(units)
+            if number == c["sl"] and units[begin:begin + 2] not in ("#".encode("utf-16-le"), "<".encode("utf-16-le")):
+                raise CouldNotCheck(f"{rel}:{number}: comment token does not start at a '#' or '<#'")
+            units = units[:begin] + _UTF16_SPACE * ((end - begin) // 2) + units[end:]
+            lines[number - 1] = units.decode("utf-16-le", "surrogatepass")
+    return lines
+
+
 def scan_git_pathlist(root: Path, rel_paths: list[str]) -> list[tuple[Violation, str]]:
     """Every git path-list invocation without `-z` or `core.quotepath=false`, with its source text.
 
     Python: the string constants of one list/tuple/call spell the command, so `-z` must sit in the
-    same list or call. PowerShell: one source line spells it (comment lines are skipped)."""
+    same list or call. PowerShell: one source line spells it, read with its comment tokens blanked
+    (the PowerShell tokenizer decides what a comment is, see _ps_code_lines)."""
     found: list[tuple[Violation, str]] = []
+    texts: dict[str, str] = {}
     for rel in rel_paths:
         try:
-            text = (root / rel).read_text(encoding="utf-8")
+            texts[rel] = (root / rel).read_text(encoding="utf-8")
         except (OSError, ValueError) as exc:
             raise CouldNotCheck(f"{rel} is not readable text: {exc}") from exc
+    # Only a script that holds a '#' (every comment has one) and a line spelling a path-list command needs
+    # the tokenizer (a block comment's inner lines carry no '#' of their own); one pwsh process then
+    # tokenizes all of them.
+    # A negative token (--error-unmatch, --object-only) may itself sit in a comment, so it is left out here.
+    needs_tokens = [rel for rel, text in texts.items() if not rel.lower().endswith(".py") and "#" in text
+                    and any(_git_pathlist_kind(set(_PS_TOKEN.findall(line)) - _PATHLIST_NEGATIVE)
+                            for line in _ps_source_lines(text))]
+    comments = ast_scan(root, needs_tokens) if needs_tokens else {}
+    for rel in rel_paths:
+        text = texts[rel]
         if rel.lower().endswith(".py"):
             try:
                 tree = ast.parse(text)
@@ -397,14 +478,14 @@ def scan_git_pathlist(root: Path, rel_paths: list[str]) -> list[tuple[Violation,
                                             f"{kind} without -z or core.quotepath=false"),
                                   ast.get_source_segment(text, node) or ""))
         else:
-            for number, line in enumerate(text.splitlines(), 1):
-                if line.lstrip().startswith("#"):
-                    continue
+            source = _ps_source_lines(text)
+            code = _ps_code_lines(rel, text, comments[rel]["comments"]) if rel in comments else source
+            for number, line in enumerate(code, 1):
                 tokens = set(_PS_TOKEN.findall(line))
                 kind = _git_pathlist_kind(tokens)
                 if kind and not _git_pathlist_safe(tokens):
                     found.append((Violation("DG-GIT-PATHLIST", rel, number,
-                                            f"{kind} without -z or core.quotepath=false"), line))
+                                            f"{kind} without -z or core.quotepath=false"), source[number - 1]))
     return found
 
 
@@ -472,7 +553,7 @@ REGISTRY: tuple[Guard, ...] = (
           is_powershell, check_ps_one_trap, True),
     Guard("DG-GIT-PATHLIST", "de09cae",
           "git quotes a non-ASCII path in its plain path-list output, so a path-prefix test on it misses the path",
-          is_git_pathlist_scanned, check_git_pathlist, False),
+          is_git_pathlist_scanned, check_git_pathlist, True),
 )
 GUARDS = {g.id: g for g in REGISTRY}
 
@@ -532,7 +613,28 @@ FIXTURES: dict[str, dict[str, dict[str, str]]] = {
             "tools/b.ps1": "$staged = @(& git -C $root diff --cached --name-only)\n"
                            "$d = @(Run-Git $wd @('status', '--porcelain', '-uall'))\n"
                            "$t = Invoke-Git -GitArgs @('ls-tree', '-r', $commit, '--', $dir)\n"
-                           "$s = @(& git -C $root status --short --branch 2>$null)\n",
+                           "$s = @(& git -C $root status --short --branch 2>$null)\n"
+                           # DG-GIT-PATHLIST-PS-COMMENT-TOKEN-1: a -z or core.quotepath=false that sits in a comment is not an argument.
+                           "& git -C $root diff --name-only # add -z later\n"
+                           "$q = & git -C $root ls-files # core.quotepath=false\n"
+                           "& git -C $root diff --name-only <# -z #>\n"
+                           "& git -C $root diff --name-only <# multi-line\n"
+                           "-z #>\n"
+                           # DG-GIT-PATHLIST-NESTED-COMMENT-1: a comment inside "$( )" of an expandable string or
+                           # here-string is a nested token, at any depth; its -z is not an argument either.
+                           "$paths = \"$(& git -C $root diff --name-only # add -z later\n"
+                           ")\"\n"
+                           "$d2 = \"$(& git -C $root diff --name-only \"$(1 # -z\n"
+                           ")\")\"\n"
+                           "$hs = @\"\n"
+                           "$(& git -C $root diff --name-only # -z\n"
+                           ")\n"
+                           "\"@\n"
+                           # A `#` inside a string is not a comment: blanking from it would hide this command.
+                           "$h2 = \"a # b\"; & git -C $root diff --name-only\n",
+            # DG-GIT-PATHLIST-PREFILTER-NEGATIVE-TOKEN-1: the only line that spells a path-list command also
+            # carries a negative token (--error-unmatch) in its comment, so it still has to be tokenized.
+            "tools/d.ps1": "$f = & git -C $root ls-files # --error-unmatch\n",
             # DURATION-SCAN-UTF8-PATHS-1: -z is present, but text=True decodes the UTF-8 paths with the locale codec.
             "tools/repo_hygiene/c.py": "import subprocess\n"
                                        "def f(repo):\n"
@@ -561,7 +663,19 @@ FIXTURES: dict[str, dict[str, dict[str, str]]] = {
                            "$b = @(& git -C $root diff --cached --name-only -z)\n"
                            "& git -C $root worktree list --porcelain\n"
                            "$t = Invoke-Git -GitArgs @('ls-tree', '-r', '-z', $commit, '--', $dir)\n"
-                           "$s = @(& git -C $root -c core.quotepath=false status --short --branch 2>$null)\n",
+                           "$s = @(& git -C $root -c core.quotepath=false status --short --branch 2>$null)\n"
+                           "& git -C $root diff --name-only -z # the comment may say anything, -z is a real argument\n"
+                           "$h = \"a # b\"; & git -C $root diff --name-only -z\n"
+                           "$p = @(& git -C $root ls-files -z <# inline #> )\n"
+                           "<#\n& git -C $root diff --name-only\n#>\n"
+                           # A real -z inside "$( )" still counts, with or without a comment after it.
+                           "$np = \"$(& git -C $root diff --name-only -z)\"\n"
+                           "$nm = \"$(& git -C $root diff --name-only -z # note\n"
+                           ")\"\n"
+                           "$hz = @\"\n"
+                           "$(& git -C $root ls-files -z # kept\n"
+                           ")\n"
+                           "\"@\n",
             "tools/repo_hygiene/c.py": "import subprocess\n"
                                        "def f(repo):\n"
                                        "    subprocess.run(['git', '-C', repo, 'ls-files', '-z'], capture_output=True, text=True, encoding='utf-8', errors='surrogateescape')\n"
@@ -585,6 +699,16 @@ FIXTURES: dict[str, dict[str, dict[str, str]]] = {
             "f.ps1": "trap { 'untyped, dead' }\ntrap [System.Exception] { 'typed catch-all wins' }\n",
             "g.ps1": "trap [System.Exception] { 'first' }\ntrap [System.Management.Automation.RuntimeException] { 'second, dead' }\n",
             "h.ps1": "trap [Exception] { 'short form' }\ntrap { 'untyped, dead' }\n",
+            # DG-TRAP-NAMESPACE-RESOLVED-1: native pwsh resolves a short name through `using namespace`
+            # (RD native-trap.txt: only the first trap runs), so the guard must resolve it the same way.
+            "i.ps1": "using namespace System.Management.Automation\ntrap [RuntimeException] { 'first' }\n"
+                     "trap { 'untyped, dead' }\n",
+            "j.ps1": "using namespace System.Management\ntrap [Automation.RuntimeException] { 'first' }\n"
+                     "trap [Exception] { 'second, dead' }\n",
+            "k.ps1": "using namespace System\ntrap [Exception] { 'first' }\ntrap { 'untyped, dead' }\n",
+            "l.ps1": "using namespace System.IO\nusing namespace System.Management.Automation\n"
+                     "trap [IOException] { 'typed, legal' }\ntrap [RuntimeException] { 'first' }\n"
+                     "trap { 'untyped, dead' }\n",
         },
         "green": {
             "a.ps1": "trap { Write-Error 'only'; break }\nfunction F {\n    trap { 'own scope'; continue }\n    1\n}\n"
@@ -600,6 +724,14 @@ FIXTURES: dict[str, dict[str, dict[str, str]]] = {
             # One typed catch-all beside specific typed traps, and one in another block, are each legal.
             "g.ps1": "trap [System.Exception] { 'catch-all'; continue }\ntrap [System.IO.IOException] { 'io'; continue }\n"
                      "if ($true) {\n    trap { 'if-block scope'; continue }\n    1\n}\n",
+            # A namespace that does not hold a catch-all type leaves the typed trap specific (native: the
+            # IOException trap is skipped for a string throw and the untyped one runs).
+            "h.ps1": "using namespace System.IO\ntrap [IOException] { 'io'; continue }\ntrap { 'catch-all'; continue }\n",
+            "i.ps1": "using namespace System.Management.Automation\ntrap [RuntimeException] { 'only catch-all'; continue }\n"
+                     "trap [System.IO.IOException] { 'io'; continue }\n",
+            # No candidate resolution of [RuntimeException] is a catch-all without the namespace
+            # (native pwsh refuses the script: Unable to find type), so it is not counted.
+            "j.ps1": "trap [RuntimeException] { 'unresolvable' }\ntrap { 'untyped' }\n",
         },
     },
 }
@@ -699,6 +831,11 @@ class GuardFixtureTests(_PwshMixin, unittest.TestCase):
                                              ("tools/a.py", 9), ("tools/a.py", 10), ("tools/a.py", 11),
                                              ("tools/b.ps1", 1), ("tools/b.ps1", 2),
                                              ("tools/b.ps1", 3), ("tools/b.ps1", 4),
+                                             ("tools/b.ps1", 5), ("tools/b.ps1", 6),
+                                             ("tools/b.ps1", 7), ("tools/b.ps1", 8),
+                                             ("tools/b.ps1", 10), ("tools/b.ps1", 12),
+                                             ("tools/b.ps1", 15), ("tools/b.ps1", 18),
+                                             ("tools/d.ps1", 1),
                                              ("tools/repo_hygiene/c.py", 3), ("tools/repo_hygiene/c.py", 4),
                                              ("tools/repo_hygiene/c.py", 5)})
 
@@ -716,7 +853,8 @@ class GuardFixtureTests(_PwshMixin, unittest.TestCase):
     def test_ps_one_trap_red_fails(self) -> None:
         self._assert_red("PS-ONE-TRAP", {("a.ps1", 3), ("b.ps1", 3), ("c.ps1", 4),
                                           ("d.ps1", 3), ("e.ps1", 4), ("e.ps1", 8),
-                                          ("f.ps1", 2), ("g.ps1", 2), ("h.ps1", 2)})
+                                          ("f.ps1", 2), ("g.ps1", 2), ("h.ps1", 2),
+                                          ("i.ps1", 3), ("j.ps1", 3), ("k.ps1", 3), ("l.ps1", 5)})
 
     def test_ps_one_trap_green_passes(self) -> None:
         self._assert_green("PS-ONE-TRAP")
@@ -765,6 +903,7 @@ class LiveTreeTests(_PwshMixin, unittest.TestCase):
         self._assert_live_green("DG-GIT-PATHLIST")
 
     def test_git_pathlist_allowlist_has_no_stale_entries(self) -> None:
+        self.require(GUARDS["DG-GIT-PATHLIST"])
         rels = [p for p in tracked_files(REPO_ROOT) if is_git_pathlist_scanned(p)]
         raw = scan_git_pathlist(REPO_ROOT, rels)
         stale = [f"{path}: {needle}" for path, needle, _why in GIT_PATHLIST_ALLOW
