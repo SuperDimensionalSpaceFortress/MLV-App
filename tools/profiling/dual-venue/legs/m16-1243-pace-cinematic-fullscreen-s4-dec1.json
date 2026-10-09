@@ -1,0 +1,37 @@
+{
+  "schema": "mlv-app/dual-venue-leg/v1",
+  "legId": "m16-1243-pace-cinematic-fullscreen-s4-dec1",
+  "card": "PLAYBACK-BACHELOR-PRESENT-JITTER-1",
+  "legType": "speed",
+  "clipId": "M16-1243",
+  "playSeconds": 25,
+  "backends": ["cuda", "cpu"],
+  "scaleFactor": 4,
+  "displayMode": "fullscreen",
+  "generatorArgs": { "telemetryArm": "LIGHT", "cpuQuiescenceThresholdPercent": 95, "forceLookAssist": true, "lookFlavor": "cinematic", "rawPrefetchDecoders": 1 },
+  "timeouts": { "queueWaitSec": 900, "extraClaimedWaitSec": 600 },
+  "criteria": {
+    "acceptance": {
+      "cuda": [
+        { "metric": "lookAssistForced", "op": "eq", "value": true },
+        { "metric": "gpuFramesTotal", "op": "gt", "value": 0 },
+        { "metric": "lookFlavorReported", "op": "eq", "value": "cinematic" }
+      ],
+      "cpu": [
+        { "metric": "lookAssistForced", "op": "eq", "value": true },
+        { "metric": "lookFlavorReported", "op": "eq", "value": "cinematic" }
+      ]
+    },
+    "supplementary": {
+      "cuda": [
+        { "metric": "lookAssistForced", "op": "eq", "value": true },
+        { "metric": "gpuFramesTotal", "op": "gt", "value": 0 },
+        { "metric": "lookFlavorReported", "op": "eq", "value": "cinematic" }
+      ],
+      "cpu": [
+        { "metric": "lookAssistForced", "op": "eq", "value": true },
+        { "metric": "lookFlavorReported", "op": "eq", "value": "cinematic" }
+      ]
+    }
+  }
+}
