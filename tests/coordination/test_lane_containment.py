@@ -125,6 +125,14 @@ if($args.Count -ge 2 -and $args[0] -eq 'mcp' -and $args[1] -eq 'list'){
   $args|ConvertTo-Json|Set-Content -Encoding utf8NoBOM $env:MLV_FIXTURE_MCP_ARGS
   if($env:MLV_FIXTURE_MCP_LIST_OUTPUT){[Console]::Out.Write((Get-Content -LiteralPath $env:MLV_FIXTURE_MCP_LIST_OUTPUT -Raw))}
   else{[Console]::Out.Write('[{"name":"agent_bridge","enabled":true},{"name":"node_repl","enabled":true}]')}
+  # MCP-LIST-STREAM-BOUND-1: MLV_FIXTURE_MCP_LIST_HOLD_PIPE_SECONDS (test-only, unset = no-op) leaves a
+  # descendant that inherited the redirected stdout/stderr alive for that long AFTER this process exits.
+  if($env:MLV_FIXTURE_MCP_LIST_HOLD_PIPE_SECONDS){
+    $hp=[System.Diagnostics.ProcessStartInfo]::new([Environment]::ProcessPath); $hp.UseShellExecute=$false
+    foreach($x in @('-NoProfile','-NonInteractive','-Command',"Set-Content -LiteralPath '$env:MLV_FIXTURE_MCP_HOLD_PID' -Value `$PID; Start-Sleep -Seconds $env:MLV_FIXTURE_MCP_LIST_HOLD_PIPE_SECONDS")){[void]$hp.ArgumentList.Add($x)}
+    [void][System.Diagnostics.Process]::Start($hp)
+    $end=(Get-Date).AddSeconds(30); while(-not (Test-Path -LiteralPath $env:MLV_FIXTURE_MCP_HOLD_PID) -and (Get-Date) -lt $end){Start-Sleep -Milliseconds 100}
+  }
   exit ([int]$env:MLV_FIXTURE_MCP_LIST_EXIT)
 }
 # CODEX-KEY-PRIVATE-PIN-1: answers the launcher's `codex --version` stamp the same way (version
@@ -1423,6 +1431,49 @@ def test_codex_read_only_lane_refuses_launch_when_mcp_list_is_unreadable(fixture
     q=json.loads(receipt.read_text(encoding="utf-8"))
     assert q["state"]=="failed"
     assert "codex-mcp-list-unreadable" in (q["failure"] or ""), q["failure"]
+    assert not (fixture_tree["root"]/"args.json").exists(), "the codex exec lane must never start"
+
+
+# MCP-LIST-STREAM-BOUND-1: the list probe's stream reads share ONE deadline with its exit wait, and each
+# stream is capped. (a) the wrapper exits 0 while a descendant keeps the inherited stdout open for far
+# longer than the probe budget -> a named stream refusal inside budget plus margin, not an unbounded wait.
+def test_codex_read_only_lane_refuses_when_a_descendant_holds_the_mcp_list_pipe(fixture_tree):
+    cmd,env,receipt=prepare(fixture_tree,"normal",lane="sol")
+    budget_sec=10; hold_sec=40
+    cmd[cmd.index("-TimeoutSec")+1]=str(budget_sec)
+    hold_pid=fixture_tree["root"]/"hold.pid"
+    env["MLV_FIXTURE_MCP_LIST_HOLD_PIPE_SECONDS"]=str(hold_sec); env["MLV_FIXTURE_MCP_HOLD_PID"]=str(hold_pid)
+    # Files, not pipes: the lingering descendant may inherit the launcher's own handles, and only the
+    # launcher's exit time is under test (as in the Promote-CodexPin orphan test).
+    out=fixture_tree["root"]/"launcher.out.txt"
+    started=time.monotonic()
+    try:
+        with open(out,"wb") as f:
+            r=subprocess.run(cmd,env=env,stdout=f,stderr=subprocess.STDOUT,timeout=hold_sec+30)
+    finally:
+        if hold_pid.exists():
+            subprocess.run(["taskkill","/F","/PID",hold_pid.read_text(encoding="utf-8-sig").strip()],capture_output=True,check=False)
+    elapsed=time.monotonic()-started
+    assert r.returncode!=0,out.read_text(encoding="utf-8",errors="replace")
+    q=json.loads(receipt.read_text(encoding="utf-8"))
+    assert q["state"]=="failed"
+    assert "codex-mcp-list-unreadable: output streams did not close within" in (q["failure"] or ""), q["failure"]
+    assert "a descendant may hold the pipe" in q["failure"], q["failure"]
+    assert elapsed<budget_sec+10, f"refusal took {elapsed:.1f}s against a {budget_sec}s probe budget (descendant held the pipe {hold_sec}s)"
+    assert not (fixture_tree["root"]/"args.json").exists(), "the codex exec lane must never start"
+
+
+# (b) a stream larger than the 1 MiB-character cap is refused by name, never truncated and parsed.
+def test_codex_read_only_lane_refuses_launch_when_mcp_list_output_exceeds_the_cap(fixture_tree):
+    cmd,env,receipt=prepare(fixture_tree,"normal",lane="sol")
+    listing=fixture_tree["root"]/"mcp-list.json"
+    listing.write_text("["+" "*(1048576+1024)+"]",encoding="utf-8")   # valid JSON array, but over the cap
+    env["MLV_FIXTURE_MCP_LIST_OUTPUT"]=str(listing); env["MLV_FIXTURE_MCP_LIST_EXIT"]="0"
+    r=subprocess.run(cmd,env=env,text=True,capture_output=True,timeout=60)
+    assert r.returncode!=0,(r.stdout,r.stderr)
+    q=json.loads(receipt.read_text(encoding="utf-8"))
+    assert q["state"]=="failed"
+    assert "codex-mcp-list-unreadable: 'codex mcp list --json' stdout exceeded the 1048576 character cap" in (q["failure"] or ""), q["failure"]
     assert not (fixture_tree["root"]/"args.json").exists(), "the codex exec lane must never start"
 
 

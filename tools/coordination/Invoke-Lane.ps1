@@ -304,6 +304,10 @@ function Resolve-CodexModelTier {
 # `codex mcp list --json` at call time -- never a hard-coded list -- and the launch FAILS CLOSED
 # (throws 'codex-mcp-list-unreadable') when that list cannot be read. Bounded by $TimeoutMs.
 $CODEX_MCP_DISABLED_FEATURES = @('plugins', 'apps')
+# MCP-LIST-STREAM-BOUND-1: per-stream cap on what the list probe will read, in decoded characters.
+# `codex mcp list --json` is one small object per configured server (a few KB); 1 MiB sits ~2 orders
+# of magnitude above any real list yet keeps a runaway stream's memory bounded.
+$CODEX_MCP_LIST_STREAM_CAP_CHARS = 1048576
 function Get-CodexMcpDisableArgs {
     param(
         [Parameter(Mandatory = $true)][string]$CodexExe,
@@ -322,18 +326,52 @@ function Get-CodexMcpDisableArgs {
     $listPsi.RedirectStandardOutput = $true
     $listPsi.RedirectStandardError = $true
     try {
+        # MCP-LIST-STREAM-BOUND-1: ONE shared deadline from the probe start covers the exit wait AND
+        # the stream drain (the drain gets what is LEFT of $TimeoutMs, never a fresh timeout, and the
+        # budget itself is not shrunk to make room for it). A descendant that keeps the redirected
+        # pipe open after the wrapper exits can no longer block the launch in an unbounded
+        # `.Result`, and each stream is capped as it arrives; overflow refuses, never truncates.
+        $probeBudgetMs = [math]::Max(1, $TimeoutMs)
+        $probeSw = [System.Diagnostics.Stopwatch]::StartNew()
         $listProc = [System.Diagnostics.Process]::Start($listPsi)
         $listProc.StandardInput.Close()
-        $listOut = $listProc.StandardOutput.ReadToEndAsync()
-        $listErr = $listProc.StandardError.ReadToEndAsync()
-        if (-not $listProc.WaitForExit([math]::Max(1, $TimeoutMs))) {
-            try { $listProc.Kill($true) } catch { }
-            throw "codex-mcp-list-unreadable: 'codex mcp list --json' did not exit within $TimeoutMs ms"
+        $pipes = @(
+            @{ Name = 'stdout'; Reader = $listProc.StandardOutput; Task = $null; Eof = $false; Buf = [char[]]::new(4096); Text = [System.Text.StringBuilder]::new() },
+            @{ Name = 'stderr'; Reader = $listProc.StandardError; Task = $null; Eof = $false; Buf = [char[]]::new(4096); Text = [System.Text.StringBuilder]::new() }
+        )
+        while ($true) {
+            foreach ($pipe in $pipes) {
+                if ($pipe.Eof) { continue }
+                if ($null -ne $pipe.Task -and $pipe.Task.IsCompleted) {
+                    $got = $pipe.Task.Result
+                    $pipe.Task = $null
+                    if ($got -le 0) { $pipe.Eof = $true; continue }
+                    if ($pipe.Text.Length + $got -gt $CODEX_MCP_LIST_STREAM_CAP_CHARS) {
+                        try { $listProc.Kill($true) } catch { }
+                        throw "codex-mcp-list-unreadable: 'codex mcp list --json' $($pipe.Name) exceeded the $CODEX_MCP_LIST_STREAM_CAP_CHARS character cap"
+                    }
+                    [void]$pipe.Text.Append($pipe.Buf, 0, $got)
+                }
+                if (-not $pipe.Eof -and $null -eq $pipe.Task) { $pipe.Task = $pipe.Reader.ReadAsync($pipe.Buf, 0, $pipe.Buf.Length) }
+            }
+            $listExited = $listProc.HasExited
+            if ($listExited -and $pipes[0].Eof -and $pipes[1].Eof) { break }
+            if ($probeSw.ElapsedMilliseconds -ge $probeBudgetMs) {
+                if (-not $listExited) {
+                    try { $listProc.Kill($true) } catch { }
+                    throw "codex-mcp-list-unreadable: 'codex mcp list --json' did not exit within $TimeoutMs ms"
+                }
+                throw "codex-mcp-list-unreadable: output streams did not close within $TimeoutMs ms (a descendant may hold the pipe)"
+            }
+            $pending = @($pipes | Where-Object { -not $_.Eof -and $null -ne $_.Task } | ForEach-Object { $_.Task })
+            $napMs = [int][math]::Max(1, [math]::Min(25, $probeBudgetMs - $probeSw.ElapsedMilliseconds))
+            if ($pending.Count -gt 0) { [void][System.Threading.Tasks.Task]::WaitAny([System.Threading.Tasks.Task[]]$pending, $napMs) }
+            else { Start-Sleep -Milliseconds $napMs }
         }
         $listProc.WaitForExit()
         $listExit = $listProc.ExitCode
-        $listText = $listOut.Result
-        $listErrText = $listErr.Result
+        $listText = $pipes[0].Text.ToString()
+        $listErrText = $pipes[1].Text.ToString()
     } catch {
         if ($_.Exception.Message -like 'codex-mcp-list-unreadable:*') { throw }
         throw "codex-mcp-list-unreadable: could not run 'codex mcp list --json': $($_.Exception.Message)"
