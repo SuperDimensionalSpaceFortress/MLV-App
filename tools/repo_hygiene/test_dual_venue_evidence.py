@@ -4810,6 +4810,41 @@ class VenueQuietValidSampleTests(unittest.TestCase):
         self.assertEqual(p["process_active_percent"], 6.67)
         self.assertNotIn("process_active_dropped_samples", p["notes"])
 
+    # VENUE-QUIET-PROCESS-ACTIVE-NEGATIVE-1 r2 (hosted CI, PR #342 merge_group run 37931263307, shard 6/8: unattributed_kernel_percent=-0.16): unattributedKernel is
+    # Processor(_Total) minus Process active, two different counter sets, so it can be negative on skew even when process_active_percent is not. Rule: computed per sample set
+    # from the one Get-Counter call; a negative per-sample value is INVALID (excluded from the mean, never clamped); none valid -> null with a notes reason.
+    # attribution_gap_points is |processActive - attributed| and cannot be negative; every other percent field is a direct counter mean or a sum of non-negative means.
+    def test_a_negative_unattributed_kernel_sample_is_excluded_from_the_mean_never_averaged_in_or_clamped(self) -> None:
+        # 4 CPUs: Process active 20 in every sample; Processor(_Total) 30, 15, 30 -> per-sample kernel 10, -5 (invalid), 10
+        mk = lambda cpu: _flat([_cs("processor", "_total", "% processor time", cpu)], _proc("_total", 0, 160), _proc("idle", 0, 80), _proc("a", 1, 40), _proc("b", 2, 20))
+        p = self.probe([mk(30), mk(15), mk(30)])
+        self.assertEqual(p["process_active_percent"], 20.0, "every active sample is valid")
+        self.assertEqual(p["processor"]["total_percent"], 25.0, "the processor mean is the unfiltered counter mean")
+        self.assertEqual(p["unattributed_kernel_percent"], 10.0, "the old processor.total - process_active gives 5.0; averaging -5 in gives 5.0; clamping it to 0 gives 6.67")
+        self.assertGreaterEqual(p["unattributed_kernel_percent"], 0)
+        self.assertRegex(p["notes"]["unattributed_kernel_dropped_samples"], r"^1 of 3 sample sets")
+        self.assertNotIn("unattributed_kernel_percent", p["notes"], "a field that has a value carries no null reason")
+        self.assertEqual(p["attribution_gap_points"], 5.0)
+
+    def test_when_every_unattributed_kernel_sample_is_negative_the_field_is_null_with_a_reason(self) -> None:
+        # this is the shape of the hosted flake: processor 20 against Process active 20.16 -> -0.16 in every sample (4 CPUs: raw 160 - 79.36 = 80.64 -> 20.16)
+        sk = lambda: _flat([_cs("processor", "_total", "% processor time", 20)], _proc("_total", 0, 160), _proc("idle", 0, 79.36), _proc("a", 1, 40), _proc("b", 2, 20))
+        p = self.probe([sk(), sk(), sk()])
+        self.assertEqual(p["process_active_percent"], 20.16)
+        self.assertIsNone(p["unattributed_kernel_percent"])
+        self.assertIn("3 of 3", p["notes"]["unattributed_kernel_percent"])
+        self.assertNotIn("unattributed_kernel_dropped_samples", p["notes"])
+        self.assertEqual(p["attribution_gap_points"], 5.16, "the gap is unaffected")
+        for k in ("process_active_percent", "attribution_gap_points", "unattributed_kernel_percent", "attributed_percent"):
+            self.assertTrue(p[k] is None or p[k] >= 0, f"{k}={p[k]!r}")
+
+    def test_a_zero_unattributed_kernel_sample_is_valid_and_kept(self) -> None:
+        # Processor(_Total) == Process active is a legitimate 0, not a skew
+        mk = lambda cpu: _flat([_cs("processor", "_total", "% processor time", cpu)], _proc("_total", 0, 160), _proc("idle", 0, 80), _proc("a", 1, 40))
+        p = self.probe([mk(20), mk(30), mk(20)])
+        self.assertEqual(p["unattributed_kernel_percent"], 3.33)
+        self.assertNotIn("unattributed_kernel_dropped_samples", p["notes"])
+
     def test_the_header_documents_the_valid_sample_mean_the_pid_keying_and_the_gap(self) -> None:
         header = (DV / "Wait-VenueQuiet.ps1").read_text(encoding="utf-8").split("[CmdletBinding", 1)[0]
         for needle in ("VALID-SAMPLE MEAN", "never zero-filled", "PID-KEYED", "(instance name, ID Process)", "processActive", "unattributedKernel", "|processActive - attributed|", "RAW RETENTION"):
