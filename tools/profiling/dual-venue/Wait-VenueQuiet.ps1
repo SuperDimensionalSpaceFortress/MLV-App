@@ -324,7 +324,7 @@ foreach ($k in $cpuNames.Keys) {
 $nSets = $sets.Count
 $acc = @{}; $seen = @{}; $keyed = @{}; $noPid = @{}
 $specialSum = @{}; $specialN = @{}
-$activeSum = 0.0; $activeN = 0
+$activeSum = 0.0; $activeN = 0; $activeNeg = 0
 foreach ($set in $sets) {
     foreach ($k in $set.proc.Keys) {
         $v = $set.proc[$k]
@@ -341,7 +341,12 @@ foreach ($set in $sets) {
         $acc[$key].sum += $v; $acc[$key].n++
         $keyed[$k] = $true
     }
-    if ($null -ne $set.proc['_total'] -and $null -ne $set.proc['idle']) { $activeSum += $set.proc['_total'] - $set.proc['idle']; $activeN++ }
+    if ($null -ne $set.proc['_total'] -and $null -ne $set.proc['idle']) {
+        # VENUE-QUIET-PROCESS-ACTIVE-NEGATIVE-1: Process(_Total) and Process(Idle) are read at slightly different instants, so on a near-idle host (_Total - Idle) can be negative for a sample.
+        # A negative sample is INVALID (excluded from the mean and counted in $activeNeg, never clamped to 0 and never averaged in); no valid sample left -> null with a reason.
+        $d = $set.proc['_total'] - $set.proc['idle']
+        if ($d -ge 0) { $activeSum += $d; $activeN++ } else { $activeNeg++ }
+    }
 }
 function Get-SpecialMean([string]$Name) { if ($specialN.ContainsKey($Name)) { $specialSum[$Name] / $specialN[$Name] / $cpuCount } else { $null } }
 $rows = @($acc.Values | ForEach-Object { [pscustomobject]@{ instance = $_.instance; pid = $_.pid; mean = $_.sum / $_.n / $cpuCount; validSamples = $_.n; totalSamples = $nSets; incomplete = ($_.n -lt $nSets) } } |
@@ -369,7 +374,8 @@ if ($specialN.Count -gt 0 -or $rows.Count -gt 0) {
     if ($null -eq $pIdle) { $notes['idle_percent'] = 'no valid idle sample in the process counters' }
     if ($null -eq $pSystem) { $notes['system_percent'] = 'no valid system sample in the process counters' }
     if ($null -eq $attributed) { $notes['attributed_percent'] = 'no process row had a valid sample' }
-    if ($null -eq $pActive) { $notes['process_active_percent'] = 'no sample had a valid Process(_Total) and Process(Idle) together' }
+    if ($null -eq $pActive) { $notes['process_active_percent'] = $(if ($activeNeg -gt 0) { "no non-negative sample: Process(Idle) read above Process(_Total) in $activeNeg of $nSets sample sets, which are invalid and not clamped" } else { 'no sample had a valid Process(_Total) and Process(Idle) together' }) }
+    elseif ($activeNeg -gt 0) { $notes['process_active_dropped_samples'] = "$activeNeg of $nSets sample sets read Process(Idle) above Process(_Total) and are excluded from process_active_percent (mean of the other $activeN)" }
     if ($null -eq $gap) { $notes['attribution_gap_points'] = 'needs both process_active_percent and attributed_percent' }
     if ($null -eq $unattrKernel) { $notes['unattributed_kernel_percent'] = 'needs both process_active_percent and processor.total_percent' }
 } else {

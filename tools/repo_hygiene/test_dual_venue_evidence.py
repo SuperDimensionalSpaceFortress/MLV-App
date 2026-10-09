@@ -4772,6 +4772,44 @@ class VenueQuietValidSampleTests(unittest.TestCase):
         self.assertEqual(p["attribution_gap_points"], 5.0, "the gap is |processActive - attributed|")
         self.assertEqual(p["unattributed_kernel_percent"], 20.0)
 
+    # VENUE-QUIET-PROCESS-ACTIVE-NEGATIVE-1 (hosted CI flake, run 37927671797: process_active_percent=-12.05): Process(_Total) and Process(Idle) are read at slightly different
+    # instants, so (_Total - Idle) can be negative for a sample on a near-idle host. Rule: a negative per-sample value is INVALID -- excluded from the mean (never clamped, never
+    # averaged in); with no valid sample left the field is null with a notes reason, and the derived gap / unattributedKernel follow (null with their own reason).
+    def test_a_negative_active_sample_is_excluded_from_the_mean_never_averaged_in_or_clamped(self) -> None:
+        # 4 CPUs: Processor(_Total)=30; samples 1 and 3 have _Total raw 160 (40) and Idle raw 80 (20) -> active 20; sample 2 has Idle above _Total (raw 100 - 120 = -20 -> -5)
+        good = lambda: _flat([_cs("processor", "_total", "% processor time", 30)], _proc("_total", 0, 160), _proc("idle", 0, 80), _proc("a", 1, 40), _proc("b", 2, 20))
+        skew = _flat([_cs("processor", "_total", "% processor time", 30)], _proc("_total", 0, 100), _proc("idle", 0, 120), _proc("a", 1, 40), _proc("b", 2, 20))
+        p = self.probe([good(), skew, good()])
+        self.assertEqual(p["process_active_percent"], 20.0, "-5.0 in the mean would give 11.67; clamping the sample to 0 would give 13.33")
+        self.assertGreaterEqual(p["process_active_percent"], 0)
+        self.assertEqual(p["attributed_percent"], 15.0)
+        self.assertEqual(p["attribution_gap_points"], 5.0, "the gap follows the excluded-sample mean")
+        self.assertEqual(p["unattributed_kernel_percent"], 10.0, "unattributedKernel follows the excluded-sample mean")
+        self.assertRegex(p["notes"]["process_active_dropped_samples"], r"^1 of 3 sample sets")
+        self.assertNotIn("process_active_percent", p["notes"], "a field that has a value carries no null reason")
+        self.assertEqual((p["process_total_percent"], p["idle_percent"]), (35.0, 23.33), "the _Total / Idle means are the unfiltered counter means, unchanged")
+
+    def test_when_every_active_sample_is_negative_the_field_is_null_with_a_reason_and_the_derived_fields_follow(self) -> None:
+        skew = lambda: _flat([_cs("processor", "_total", "% processor time", 30)], _proc("_total", 0, 100), _proc("idle", 0, 120), _proc("a", 1, 40), _proc("b", 2, 20))
+        p = self.probe([skew(), skew(), skew()])
+        self.assertIsNone(p["process_active_percent"])
+        self.assertIsNone(p["attribution_gap_points"])
+        self.assertIsNone(p["unattributed_kernel_percent"])
+        self.assertIn("3 of 3", p["notes"]["process_active_percent"])
+        for k in ("attribution_gap_points", "unattributed_kernel_percent"):
+            self.assertTrue(isinstance(p["notes"].get(k), str) and p["notes"][k], f"{k} is null without a reason")
+        self.assertNotIn("process_active_dropped_samples", p["notes"])
+        self.assertEqual(p["attributed_percent"], 15.0, "the attribution itself is unaffected")
+        for k in ("process_active_percent", "attribution_gap_points", "unattributed_kernel_percent", "attributed_percent"):
+            self.assertTrue(p[k] is None or p[k] >= 0, f"{k}={p[k]!r}")
+
+    def test_a_zero_active_sample_is_valid_and_kept(self) -> None:
+        # _Total == Idle is a legitimate fully-idle sample (0), not a skew: it stays in the mean
+        flat = lambda tot, idle: _flat([_cs("processor", "_total", "% processor time", 30)], _proc("_total", 0, tot), _proc("idle", 0, idle), _proc("a", 1, 40))
+        p = self.probe([flat(80, 80), flat(160, 80), flat(80, 80)])
+        self.assertEqual(p["process_active_percent"], 6.67)
+        self.assertNotIn("process_active_dropped_samples", p["notes"])
+
     def test_the_header_documents_the_valid_sample_mean_the_pid_keying_and_the_gap(self) -> None:
         header = (DV / "Wait-VenueQuiet.ps1").read_text(encoding="utf-8").split("[CmdletBinding", 1)[0]
         for needle in ("VALID-SAMPLE MEAN", "never zero-filled", "PID-KEYED", "(instance name, ID Process)", "processActive", "unattributedKernel", "|processActive - attributed|", "RAW RETENTION"):
