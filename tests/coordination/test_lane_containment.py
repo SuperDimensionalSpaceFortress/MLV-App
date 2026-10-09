@@ -118,6 +118,15 @@ def fixture_tree(tmp_path):
     # MLV_FIXTURE_GRAND_START_DELAY_MS (test-only, unset = no-op) stands in for a loaded host's slow pwsh cold start.
     grand.write_text("if($env:MLV_FIXTURE_GRAND_START_DELAY_MS){Start-Sleep -Milliseconds ([int]$env:MLV_FIXTURE_GRAND_START_DELAY_MS)};$me=Get-Process -Id $PID;$t=$env:MLV_FIXTURE_GRAND+'.tmp';@{pid=$PID;createdUtc=$me.StartTime.ToUniversalTime().ToString('o')}|ConvertTo-Json|Set-Content -Encoding utf8NoBOM $t;Move-Item -LiteralPath $t -Destination $env:MLV_FIXTURE_GRAND;Start-Sleep -Seconds 60\n",encoding="ascii")
     child.write_text(r'''$ErrorActionPreference='Stop'
+# CODEX-KEY-MCP-ESCAPE-1: answers the launcher's pre-launch `codex mcp list --json` probe and
+# exits BEFORE the child.json/args.json writes below, so it never stands in for the lane itself.
+# MLV_FIXTURE_MCP_LIST_OUTPUT / MLV_FIXTURE_MCP_LIST_EXIT (test-only, unset = a readable 2-server list).
+if($args.Count -ge 2 -and $args[0] -eq 'mcp' -and $args[1] -eq 'list'){
+  $args|ConvertTo-Json|Set-Content -Encoding utf8NoBOM $env:MLV_FIXTURE_MCP_ARGS
+  if($env:MLV_FIXTURE_MCP_LIST_OUTPUT){[Console]::Out.Write((Get-Content -LiteralPath $env:MLV_FIXTURE_MCP_LIST_OUTPUT -Raw))}
+  else{[Console]::Out.Write('[{"name":"agent_bridge","enabled":true},{"name":"node_repl","enabled":true}]')}
+  exit ([int]$env:MLV_FIXTURE_MCP_LIST_EXIT)
+}
 $me=Get-Process -Id $PID
 $t=$env:MLV_FIXTURE_CHILD+'.tmp';@{pid=$PID;createdUtc=$me.StartTime.ToUniversalTime().ToString('o')}|ConvertTo-Json|Set-Content -Encoding utf8NoBOM $t;Move-Item -LiteralPath $t -Destination $env:MLV_FIXTURE_CHILD
 $args|ConvertTo-Json|Set-Content -Encoding utf8NoBOM $env:MLV_FIXTURE_ARGS
@@ -235,7 +244,7 @@ def prepare(tree, mode, assignment_failure=False, editing=False, allowed_tools="
       "MLV_FIXTURE_CHILD":str(root/"child.json"),"MLV_FIXTURE_GRAND":str(root/"grand.json"),
       "MLV_FIXTURE_GRAND_SCRIPT":str(tree["grand"]),"MLV_FIXTURE_ARGS":str(root/"args.json"),
       "MLV_FIXTURE_PROMPT":str(root/"prompt.txt"),"MLV_FIXTURE_EFFORT":str(root/"effort.txt"),
-      "MLV_FIXTURE_BGTASKS":str(root/"bgtasks.txt"),
+      "MLV_FIXTURE_BGTASKS":str(root/"bgtasks.txt"),"MLV_FIXTURE_MCP_ARGS":str(root/"mcp-args.json"),
       # Round 10 (sol major 1b): pinned here, not left to whatever Python the launcher's own
       # known-locations/PATH search happens to find on the machine running this suite -- this
       # test process's OWN interpreter is by definition present and working, so every fixture
@@ -1327,6 +1336,87 @@ def test_codex_workspace_write_lane_keeps_default_windows_sandbox(fixture_tree):
     q=json.loads(receipt.read_text(encoding="utf-8"))
     assert q["authority"]["sandbox"]=="workspace-write"
     assert q["authority"]["windowsSandbox"]=="default"
+
+
+# CODEX-KEY-MCP-ESCAPE-1 (HUB RULING wf_d36c1040-11d): MCP tools (node_repl, ...) run OUTSIDE
+# the codex sandbox, so a read-only codex lane gets none. Measured on codex-cli 0.160.1:
+# -c features.plugins=false drops plugin-provided servers, -c features.apps=false drops the
+# codex_apps connector, and every server left in `codex mcp list --json` (read at call time,
+# never a hard-coded list) gets -c mcp_servers.<name>.enabled=false.
+def _mcp_overrides(argv):
+    return [argv[i+1] for i,a in enumerate(argv[:-1])
+            if a=="-c" and (argv[i+1].startswith("mcp_servers") or argv[i+1].startswith("features."))]
+
+
+def _bypass_codex_never_edits(text):
+    old = ("if ($AllowEdits -and $LANES[$Lane].engine -eq 'codex') {\n"
+           "    throw \"codex-lane-never-edits: -Lane $Lane with -AllowEdits "
+           "(no Claude hook is visible to codex exec)\"\n"
+           "}")
+    assert text.count(old) == 1
+    return text.replace(old, "# fixture: codex-never-edits neutralised for this test only")
+
+
+def test_codex_read_only_lane_disables_every_mcp_server(fixture_tree):
+    cmd,env,receipt=prepare(fixture_tree,"normal",lane="sol")
+    r=subprocess.run(cmd,env=env,text=True,capture_output=True,timeout=20)
+    assert r.returncode==0,(r.stdout,r.stderr)
+    listed=json.loads((fixture_tree["root"]/"mcp-args.json").read_text(encoding="utf-8-sig"))
+    assert listed[:3]==["mcp","list","--json"] and "features.plugins=false" in listed, listed
+    argv=json.loads((fixture_tree["root"]/"args.json").read_text(encoding="utf-8-sig"))
+    assert argv[0]=="exec" and argv[argv.index("-s")+1]=="read-only"
+    assert _mcp_overrides(argv)==["features.plugins=false","features.apps=false",
+                                  "mcp_servers.agent_bridge.enabled=false",
+                                  "mcp_servers.node_repl.enabled=false"], argv
+    assert argv[-1]=="-", argv
+    q=json.loads(receipt.read_text(encoding="utf-8"))
+    assert q["authority"]["mcpServers"]=="disabled"
+    assert q["authority"]["mcpDisabledServers"]==["agent_bridge","node_repl"]
+    assert q["authority"]["mcpDisabledFeatures"]==["plugins","apps"]
+
+
+def test_codex_read_only_lane_with_no_listed_mcp_server_still_disables_plugins_and_apps(fixture_tree):
+    cmd,env,receipt=prepare(fixture_tree,"normal",lane="sol")
+    listing=fixture_tree["root"]/"mcp-list.json"; listing.write_text("[]",encoding="utf-8")
+    env["MLV_FIXTURE_MCP_LIST_OUTPUT"]=str(listing)
+    r=subprocess.run(cmd,env=env,text=True,capture_output=True,timeout=20)
+    assert r.returncode==0,(r.stdout,r.stderr)
+    argv=json.loads((fixture_tree["root"]/"args.json").read_text(encoding="utf-8-sig"))
+    assert _mcp_overrides(argv)==["features.plugins=false","features.apps=false"], argv
+    q=json.loads(receipt.read_text(encoding="utf-8"))
+    assert q["authority"]["mcpServers"]=="disabled" and q["authority"]["mcpDisabledServers"]==[]
+
+
+def test_codex_workspace_write_lane_keeps_mcp_servers_unchanged(fixture_tree):
+    cmd,env,receipt=prepare(fixture_tree,"normal",editing=True,allowed_tools="Read,Write",
+                             lane="sol",mutation=_bypass_codex_never_edits)
+    r=subprocess.run(cmd,env=env,text=True,capture_output=True,timeout=20)
+    assert r.returncode==0,(r.stdout,r.stderr)
+    assert not (fixture_tree["root"]/"mcp-args.json").exists(), "workspace-write must not probe mcp list"
+    argv=json.loads((fixture_tree["root"]/"args.json").read_text(encoding="utf-8-sig"))
+    assert argv[argv.index("-s")+1]=="workspace-write"
+    assert _mcp_overrides(argv)==[], argv
+    q=json.loads(receipt.read_text(encoding="utf-8"))
+    assert q["authority"]["mcpServers"]=="default"
+
+
+@pytest.mark.parametrize("output,exit_code", [
+    ('[{"name":"node_repl","enabled":true}]', "1"),     # list command failed
+    ("Error: failed to load configuration", "0"),       # not JSON
+    ('{"name":"node_repl"}', "0"),                      # not a JSON array
+    ('[{"enabled":true}]', "0"),                        # entry without a name
+    ('[{"name":"a.b","enabled":true}]', "0"),           # name unsafe in a dotted -c key
+], ids=["exit-nonzero","unparseable","not-an-array","nameless-entry","unsafe-name"])
+def test_codex_read_only_lane_refuses_launch_when_mcp_list_is_unreadable(fixture_tree, output, exit_code):
+    cmd,env,receipt=prepare(fixture_tree,"normal",lane="sol")
+    listing=fixture_tree["root"]/"mcp-list.json"; listing.write_text(output,encoding="utf-8")
+    env["MLV_FIXTURE_MCP_LIST_OUTPUT"]=str(listing); env["MLV_FIXTURE_MCP_LIST_EXIT"]=exit_code
+    r=subprocess.run(cmd,env=env,text=True,capture_output=True,timeout=20)
+    assert r.returncode!=0,(r.stdout,r.stderr)
+    q=json.loads(receipt.read_text(encoding="utf-8"))
+    assert q["state"]=="failed"
+    assert "codex-mcp-list-unreadable" in (q["failure"] or ""), q["failure"]
+    assert not (fixture_tree["root"]/"args.json").exists(), "the codex exec lane must never start"
 
 
 def test_startup_consumes_same_deadline_without_starting_provider(fixture_tree):
